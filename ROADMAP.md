@@ -1,349 +1,392 @@
 # ROADMAP — Hieu Louis (HLS)
 
-> Lộ trình 20 giai đoạn đưa Hieu Louis từ hạt nhân tự dịch v0.1 thành một ngôn ngữ
-> lập trình **bảo mật cực mạnh, hiệu năng cao, hoàn chỉnh v1.0** — toàn bộ chuỗi công cụ
-> được viết bằng chính Hieu Louis.
+> A 20-stage roadmap that takes Hieu Louis from a self-hosting v0.1 core to a
+> **highly secure, high-performance, complete v1.0 language** — with the entire
+> toolchain written in Hieu Louis itself.
 
-**Chú giải trạng thái:** ✅ hoàn thành · 🔄 đang thực hiện · ⬜ chưa bắt đầu
-**Nguyên tắc xuyên suốt:** mỗi giai đoạn chỉ được đóng khi đạt **100% tiêu chí nghiệm thu**
-và bộ kiểm thử vi sai (thông dịch ↔ native) vẫn xanh.
-
----
-
-## TỔNG QUAN
-
-| # | Giai đoạn | Trạng thái | Thời lượng ước tính |
-|---|-----------|:----------:|:-------------------:|
-| 1 | Đặc tả & thiết kế hạt nhân | ✅ | (xong) |
-| 2 | Hạt giống bootstrap Stage-0 | ✅ | (xong) |
-| 3 | Trình biên dịch tự viết — front-end | ✅ | (xong) |
-| 4 | Backend HLS → C + runtime C | ✅ | (xong) |
-| 5 | Tự dịch hoàn toàn (fixed-point) | ✅ | (xong) |
-| 6 | Hệ thống module & thư viện chuẩn | ⬜ | 6–8 tuần |
-| 7 | Hệ thống kiểu nâng cao: enum, Option/Result, generics | ⬜ | 8–12 tuần |
-| 8 | Sở hữu & borrow checking (kết thúc arena) | ⬜ | 10–14 tuần |
-| 9 | Hệ thống effects chi tiết + capability | ⬜ | 6–8 tuần |
-| 10 | Taint tracking & sandbox | ⬜ | 8–10 tuần |
-| 11 | IR SSA + tối ưu hoá | ⬜ | 10–14 tuần |
-| 12 | Backend LLVM native | ⬜ | 10–14 tuần |
-| 13 | Trình quản lý gói `hls-pkg` | ⬜ | 6–8 tuần |
-| 14 | Bộ công cụ: LSP, formatter, linter | ⬜ | 6–8 tuần |
-| 15 | FFI an toàn với C | ⬜ | 4–6 tuần |
-| 16 | Đồng thời & async (data-race freedom) | ⬜ | 12–16 tuần |
-| 17 | Kiểm chứng hình thức & hợp đồng | ⬜ | 10–14 tuần |
-| 18 | Hệ sinh thái kiểm thử & fuzzing | ⬜ | 4–6 tuần |
-| 19 | Tài liệu, sách, playground | ⬜ | 6 tuần |
-| 20 | HLS v1.0 — đóng băng API, LTS, bootstrap thuần HLS | ⬜ | 4 tuần |
-
-Tổng thời lượng dự kiến: ~24–30 tháng (đội nhỏ 2–4 người toàn thời gian).
+**Status legend:** ✅ complete · 🔄 in progress · ⬜ not started
+**Standing principle:** every stage closes only when **100% of its acceptance
+criteria** are met and the differential test suite (interpreter ↔ native)
+remains green.
 
 ---
 
-## GIAI ĐOẠN 1 — Đặc tả & thiết kế hạt nhân ✅
+## OVERVIEW
 
-**Mục tiêu:** định hình triết lý và "hiến pháp" của ngôn ngữ.
+| # | Stage | Status | Estimated effort |
+|---|-------|:------:|:----------------:|
+| 1 | Specification & core design | ✅ | (done) |
+| 2 | Bootstrap seed Stage-0 | ✅ | (done) |
+| 3 | Self-hosted compiler — front-end | ✅ | (done) |
+| 4 | Backend HLS → C + C runtime | ✅ | (done) |
+| 5 | Full self-compilation (fixed-point) | ✅ | (done) |
+| 6 | Module system & standard library | ✅ | (done) |
+| 7 | Advanced type system: enum, Option/Result, generics | ⬜ | 8–12 weeks |
+| 8 | Ownership & borrow checking (end of arena) | ⬜ | 10–14 weeks |
+| 9 | Fine-grained effects & capabilities | ⬜ | 6–8 weeks |
+| 10 | Taint tracking & sandbox | ⬜ | 8–10 weeks |
+| 11 | SSA IR + optimisation | ⬜ | 10–14 weeks |
+| 12 | Native LLVM backend | ⬜ | 10–14 weeks |
+| 13 | Package manager `hls-pkg` | ⬜ | 6–8 weeks |
+| 14 | Tooling: LSP, formatter, linter | ⬜ | 6–8 weeks |
+| 15 | Safe C FFI | ⬜ | 4–6 weeks |
+| 16 | Concurrency & async (data-race freedom) | ⬜ | 12–16 weeks |
+| 17 | Formal verification & contracts | ⬜ | 10–14 weeks |
+| 18 | Testing ecosystem & fuzzing | ⬜ | 4–6 weeks |
+| 19 | Documentation, book, playground | ⬜ | 6 weeks |
+| 20 | HLS v1.0 — API freeze, LTS, pure-HLS bootstrap | ⬜ | 4 weeks |
 
-**Công việc:**
-- Triết lý: an toàn mặc định, tường minh để kiểm toán, I/O là hiệu ứng, không null,
-  hiệu năng bằng AOT.
-- Đặc tả đầy đủ v0.1: từ vựng, kiểu, câu lệnh, biểu thức, builtin, effects, ngữ nghĩa
-  kiểm tra, mô hình bộ nhớ, mô hình lỗi (`SPEC.md`).
-- Quyết định có chủ đích những gì v0.1 KHÔNG có (enum, generics, ownership...) để hạt
-  nhân nhỏ và kiểm chứng được.
+Estimated total duration: ~24–30 months (small team of 2–4 full-time).
 
-**Tiêu chí nghiệm thu:** đặc tả đủ chặt để hai bản triển khai độc lập (thông dịch &
-biên dịch) cho cùng kết quả trên mọi chương trình.
+---
 
-**Kết quả:** `SPEC.md` v0.1.1 hoàn chỉnh.
+## STAGE 1 — Specification & core design ✅
 
-## GIAI ĐOẠN 2 — Hạt giống bootstrap Stage-0 ✅
+**Goal:** shape the philosophy and "constitution" of the language.
 
-**Mục tiêu:** trình thông dịch tham chiếu chạy được HLS ngay, để làm mốc so sánh ngữ nghĩa.
+**Work:**
+- Philosophy: safety by default, explicitness for auditability, I/O as an
+  effect, no null, performance via AOT.
+- Full v0.1 specification: lexing, types, statements, expressions, builtins,
+  effects, type-checking semantics, memory model, error model (`SPEC.md`).
+- Deliberately deciding what v0.1 does NOT have (enum, generics, ownership…)
+  so the core stays small and verifiable.
 
-**Công việc:**
-- `boot/`: lexer → parser → kiểm tra kiểu → phân tích effects → evaluator (~1.400 dòng
-  Python thuần, không phụ thuộc ngoài).
-- Ngữ nghĩa byte-chính-xác: chuỗi là byte, số học int64 kiểm tra tràn, chia 0 dừng an
-  toàn, map giữ thứ tự chèn, `%.6f` cho float.
+**Acceptance criteria:** spec tight enough that two independent implementations
+(interpreter & compiler) produce the same result on every program.
+
+**Result:** `SPEC.md` v0.1.1 complete.
+
+## STAGE 2 — Bootstrap seed Stage-0 ✅
+
+**Goal:** a reference interpreter that can run HLS right now, serving as a
+semantic baseline for comparison.
+
+**Work:**
+- `boot/`: lexer → parser → type checker → effects analyzer → evaluator
+  (~1,400 lines of pure Python, no external dependencies).
+- Byte-precise semantics: strings are bytes, int64 arithmetic with overflow
+  checks, divide-by-zero halts safely, maps preserve insertion order, `%.6f`
+  for floats.
 - CLI: `boot.py [--check] file.hls [args...]`.
 
-**Tiêu chí nghiệm thu:** chạy được tập kiểm thử ok/fail với thông báo lỗi tiếng Việt
-chính xác kèm số dòng.
+**Acceptance criteria:** the ok/fail test suite runs with accurate English
+error messages including line numbers.
 
-**Kết quả:** 14 ok + 22 fail đạt 100%.
+**Result:** 14 ok + 22 fail at 100%.
 
-## GIAI ĐOẠN 3 — Trình biên dịch tự viết: front-end ✅
+## STAGE 3 — Self-hosted compiler: front-end ✅
 
-**Mục tiêu:** lexer + parser + checker của `hlc` được viết 100% bằng HLS.
+**Goal:** lexer + parser + checker of `hlc` written 100% in HLS.
 
-**Công việc:**
-- Bộ AST dạng "pool chỉ số" (không cần con trỏ/null — hợp triết lý ngôn ngữ).
-- Mọi trạng thái truyền tường minh qua `Ctx` — không có biến toàn cục ẩn.
-- Kiểm tra kiểu đầy đủ + phân tích effects bất động điểm — **bắt chước 100% thông báo
-  lỗi của Stage-0**.
+**Work:**
+- AST represented as an "index pool" (no need for pointers/null — fits the
+  language's philosophy).
+- All state passed explicitly through `Ctx` — no hidden globals.
+- Full type checking + fixpoint effects analysis — **reproduces 100% of
+  Stage-0's error messages**.
 
-**Tiêu chí nghiệm thu:** 22/22 chương trình lỗi bị từ chối với đúng thông điệp.
+**Acceptance criteria:** 22/22 invalid programs rejected with the correct
+message.
 
-**Kết quả:** `src/hlc.hls` phần lex/parse/check (~1.800 dòng HLS).
+**Result:** `src/hlc.hls` lex/parse/check sections (~1,800 lines of HLS).
 
-## GIAI ĐOẠN 4 — Backend HLS → C + runtime C ✅
+## STAGE 4 — Backend HLS → C + C runtime ✅
 
-**Mục tiêu:** sinh mã C biên dịch được bằng gcc/clang, ngữ nghĩa trùng khớp Stage-0.
+**Goal:** emit C code that compiles with gcc/clang, semantics matching Stage-0.
 
-**Công việc:**
-- Runtime C nhúng: chuỗi kiểm tra biên, danh sách box, map băm giữ thứ tự chèn,
-  số học `__builtin_*_overflow`, I/O, `panic` mã 101.
-- Sinh mã: kiểu HLS → kiểu C, boxing theo kiểu tĩnh, literal danh sách thành hàm
-  helper, unique tên biến cục bộ, checked arithmetic.
-- Mô hình cấp phát arena v0.1 (không `free` → không thể use-after-free về cấu trúc).
+**Work:**
+- Embedded C runtime: bounds-checked strings, boxed lists, insertion-ordered
+  hash maps, `__builtin_*_overflow` arithmetic, I/O, `panic` with exit code 101.
+- Code generation: HLS type → C type, boxing by static type, list literals as
+  helper functions, unique local variable names, checked arithmetic.
+- Arena allocation model for v0.1 (no `free` → structurally impossible to
+  use-after-free).
 
-**Tiêu chí nghiệm thu:** 14/14 kiểm thử vi sai (thông dịch ↔ native) — stdout và mã
-thoát giống hệt nhau, kể cả panic.
+**Acceptance criteria:** 14/14 differential tests (interpreter ↔ native) —
+identical stdout and exit code, including panics.
 
-**Kết quả:** runtime 425 dòng C nhúng + codegen ~700 dòng HLS.
+**Result:** 425-line embedded C runtime + ~700 lines of HLS codegen.
 
-## GIAI ĐOẠN 5 — Tự dịch hoàn toàn (fixed-point) ✅
+## STAGE 5 — Full self-compilation (fixed-point) ✅
 
-**Mục tiêu:** bằng chứng tối thượng của self-hosting.
+**Goal:** the ultimate proof of self-hosting.
 
-**Chuỗi nghiệm thu:**
+**Acceptance chain:**
 ```
-boot.py chạy hlc.hls  →  hlc.c  (lần 1)  →  gcc  →  hlc (native)
-hlc native chạy hlc.hls  →  hlc.c  (lần 2)
-diff hlc.c(lần 1) hlc.c(lần 2)  →  GIỐNG HỆT NHAU
+boot.py runs hlc.hls  →  hlc.c  (pass 1)  →  gcc  →  hlc (native)
+hlc native runs hlc.hls  →  hlc.c  (pass 2)
+diff hlc.c(pass 1) hlc.c(pass 2)  →  IDENTICAL
 ```
 
-**Kết quả:** `make bootstrap` xác nhận quá trình tự dịch **xác định** (deterministic);
-56/56 kiểm thử tổng PASS. Từ đây, mọi thay đổi của ngôn ngữ đều được thực hiện
-bằng chính ngôn ngữ đó.
+**Result:** `make bootstrap` confirms the self-compilation process is
+**deterministic**; 56/56 total tests PASS. From here on, every change to the
+language is made in the language itself.
 
-## GIAI ĐOẠN 6 — Hệ thống module & thư viện chuẩn ⬜
+## STAGE 6 — Module system & standard library ✅
 
-**Mục tiêu:** tổ chức mã quy mô lớn mà vẫn kiểm toán được.
+**Goal:** organise large-scale code while remaining auditable.
 
-**Công việc:**
-- Cú pháp `import` với đường dẫn mô-đun, biên dịch theo biểu đồ phụ thuộc.
-- Thư viện chuẩn dạng gói: `std.io`, `std.str`, `std.fs`, `std.math` (toán bit kiểm tra
-  tràn: `<<`/`>>` kiểm tra phạm vi, `&`/`|`/`^` cho int), `std.time`, `std.env`.
-- Hiệu ứng chi tiết hơn cho từng nhóm: đọc/ghi tệp tách khỏi in màn hình.
-- Unicode: chuỗi UTF-8 với API rune rõ ràng (byte string vẫn giữ cho hệ thống).
+**Work:**
+- `import "path"` syntax with module paths; compile according to the
+  dependency graph. Cycles are detected and rejected. Both Stage-0 and
+  the self-hosted `hlc` support imports with identical semantics.
+- Standard library as packages: `std.str`, `std.math`, `std.json`,
+  `std.url`, `std.html`. Each is pure HLS (no `uses IO`) so it can be
+  used in any context — including inside the compiler itself.
+- **Web-focused modules:** `std.json` (full parser + serialiser with
+  \uXXXX UTF-8 decoding), `std.url` (RFC 3986 URL parser + query string
+  parsing + percent encoding/decoding), `std.html` (HTML escaping for
+  XSS-safe rendering).
+- New builtin `file_exists(path: str) -> bool` (IO effect) used by the
+  compiler to resolve imports.
+- Bug fixes: `never`-typed expressions are now allowed as arguments and
+  assignments (e.g. `let x: int = panic()` type-checks); dead `mapnew`
+  AST branches removed; bare `panic` in `parse_impl` replaced with
+  `perr_at` for source locations.
 
-**Nghiệm thu:** `hlc` tự dịch được khi nguồn chia nhiều tệp; thư viện chuẩn có kiểm thử
-vi sai riêng.
+**Acceptance:** `hlc` self-compiles deterministically with the new import
+system; 60/60 tests pass (the original 56 plus 2 new module/stdlib tests
+plus 2 new differential tests for the same).
 
-**Rủi ro:** thiết kế module sai sớm rất tốn sửa về sau → quyết định bằng văn bản
-thiết kế (RFC) trước khi code.
+**Result:** Imports work in both Stage-0 and native hlc. The standard
+library is the first customer of the import system (e.g. `std.url`
+imports `std.str`).
 
-## GIAI ĐOẠN 7 — Hệ thống kiểu nâng cao ⬜
+## STAGE 7 — Advanced type system ⬜
 
-**Mục tiêu:** tính minh bạch của kiểu đặt bảng + sự an toàn của kiểu đại diện.
+**Goal:** the transparency of a nominal type table + the safety of sum types.
 
-**Công việc:**
-- `enum` + `match` cảm tính đầy đủ (exhaustiveness checking).
-- `Option[T]`/`Result[T, E]` trong thư viện chuẩn; `?` lan truyền lỗi; **bỏ `panic`
-  cho lỗi dự kiến được** — panic chỉ còn cho lỗi lập trình.
-- Generics đơn hình hoá (monomorphization) — mỗi bản dựng kiểu sinh mã riêng, hiệu
-  năng như code viết tay.
-- Suy luận kiểu cục bộ (gợi ý kiểu tại literal) — kiểu vẫn bắt buộc ở ranh giới hàm.
-- Struct có giá trị mặc định cho trường.
+**Work:**
+- `enum` + full-featured `match` (exhaustiveness checking).
+- `Option[T]`/`Result[T, E]` in the standard library; `?` for error
+  propagation; **`panic` no longer used for expected errors** — panic is
+  reserved for programming bugs.
+- Monomorphising generics — each type instance gets its own generated code,
+  performance equal to hand-written code.
+- Local type inference (literal type hints) — types still required at function
+  boundaries.
+- Struct fields with default values.
 
-**Nghiệm thu:** viết lại `hlc` dùng Option/Result cho mọi thao tác I/O; loại bỏ toàn
-bộ panic dự kiến trong compiler.
+**Acceptance:** rewrite `hlc` to use Option/Result for all I/O; eliminate all
+expected panics from the compiler.
 
-## GIAI ĐOẠN 8 — Sở hữu & borrow checking ⬜
+## STAGE 8 — Ownership & borrow checking ⬜
 
-**Mục tiêu:** memory safety KHÔNG GC và kết thúc mô hình arena.
+**Goal:** memory safety WITHOUT GC, ending the arena model.
 
-**Công việc:**
-- Ngữ dịch chuyển (move) mặc định; mượn (borrow) có kiểm tra: một mượn biến đổi HOẶC
-  nhiều mượn chỉ đọc.
-- `free` chính xác khi ra khỏi phạm vi; kiểm chứng không use-after-free/double-free
-  bằng chính hệ thống kiểu.
-- Vùng sống (lifetime) tối giản: không cú pháp lifetime — suy luận toàn bộ, chỉ báo
-  lỗi khi không suy luận được.
-- Runtime C mới thay arena: alloca stack + malloc heap có giờ giải phóng tĩnh.
+**Work:**
+- Move semantics by default; checked borrows: one mutable borrow OR many
+  read-only borrows.
+- Exact `free` when leaving scope; statically prove no use-after-free /
+  double-free through the type system itself.
+- Minimal lifetimes: no lifetime syntax — infer everything, only report errors
+  when inference fails.
+- New C runtime replacing arena: stack `alloca` + heap `malloc` with static
+  free timing.
 
-**Nghiệm thu:** chương trình đột biến bộ nhớ (web server chạy 24h) không tăng RSS;
-đo kiểm tra Valgrind/ASan sạch.
+**Acceptance:** a memory-stress program (web server running 24h) does not
+increase RSS; Valgrind/ASan clean.
 
-**Rủi ro cao nhất của cả roadmap** — dự phòng 30% thời lượng; có thể hạ mức
-"ref-counting + vòng phân tích sở hữu" nếu borrow-check đầy đủ quá tốn.
+**Highest risk in the entire roadmap** — budget 30% extra time; may downgrade
+to "ref-counting + ownership analysis pass" if full borrow-checking is too
+costly.
 
-## GIAI ĐOẠN 9 — Hệ thống effects chi tiết + capability ⬜
+## STAGE 9 — Fine-grained effects & capabilities ⬜
 
-**Mục tiêu:** mỗi hiệu ứng được khai báo riêng và kiểm chứng tĩnh.
+**Goal:** every effect declared individually and statically verified.
 
-**Công việc:**
-- Tách effects: `uses IO`, `uses Net`, `uses Fs`, `uses Clock`, `uses Rand`, `uses Proc`.
-- Capability token: mở tệp/network phải cầm capability do `main` cấp — không thể
-  "lén" đọc tệp trong thư viện sâu.
-- Hàm thuần được đánh dấu & bảo đảm tĩnh → eligible cho memoization/biên dịch lúc chạy.
-- Từ chối (deny) mặc định ở mức biên dịch khi thiếu khai báo.
+**Work:**
+- Split effects: `uses IO`, `uses Net`, `uses Fs`, `uses Clock`, `uses Rand`,
+  `uses Proc`.
+- Capability tokens: opening a file/network must hold a capability granted by
+  `main` — impossible to "sneak" a file read deep inside a library.
+- Pure functions explicitly marked & statically guaranteed → eligible for
+  memoisation / JIT compilation.
+- Default-deny at compile time when a declaration is missing.
 
-**Nghiệm thu:** một chương trình không khai báo `uses Net` không THỂ gọi socket dù
-qua 5 lớp hàm — lỗi biên dịch chỉ rõ chuỗi lời gọi.
+**Acceptance:** a program that doesn't declare `uses Net` CANNOT call a socket
+even through 5 function layers — the compile error points to the exact call
+chain.
 
-## GIAI ĐOẠN 10 — Taint tracking & sandbox ⬜
+## STAGE 10 — Taint tracking & sandbox ⬜
 
-**Mục tiêu:** chống lỗ hổng đầu vào (injection, XSS, path traversal) ngay tại kiểu.
+**Goal:** stop input-driven vulnerabilities (injection, XSS, path traversal)
+at the type level.
 
-**Công việc:**
-- Kiểu `tainted[T]`: dữ liệu từ đầu vào tự động `tainted`; chỉ được dùng sau `sanitize`.
-- Bộ lọc chuẩn hoá cho SQL/HTML/đường dẫn/lệnh; khớp với库 sentinel chuẩn.
-- Chế độ sandbox biên dịch: chương trình chỉ chạy trong thư mục/cầu nối được cấp.
-- Báo cáo phân tích taint trong trình biên dịch (`hlc --audit`).
+**Work:**
+- `tainted[T]` type: data from inputs is automatically `tainted`; only usable
+  after `sanitize`.
+- Standard normalising filters for SQL/HTML/paths/commands; matches the
+  standard sentinel library.
+- Sandboxed compile mode: a program only runs inside a granted directory /
+  socket set.
+- Taint analysis report from the compiler (`hlc --audit`).
 
-**Nghiệm thu:** cố tình dùng đầu vào người dùng trong câu SQL không qua sanitize →
-lỗi biên dịch với đường lan truyền taint.
+**Acceptance:** deliberately using user input in an SQL statement without
+sanitising → compile error showing the taint propagation path.
 
-## GIAI ĐOẠN 11 — IR SSA + tối ưu hoá ⬜
+## STAGE 11 — SSA IR + optimisation ⬜
 
-**Mục tiêu:** hiệu năng ngang hệ C/Rust ở mức -O2.
+**Goal:** performance on par with C/Rust at `-O2`.
 
-**Công việc:**
-- IR mức trung dạng SSA (HLIR) viết bằng HLS; HLS→HLIR→C.
-- Tối ưu: inlining, constant folding, DCE, copy propagation, escape analysis, loop-
-  invariant code motion, strength reduction.
-- Chế độ `-O fast` bỏ kiểm tra **chỉ khi chứng minh được** giá trị an toàn (biên ngoài
-  phạm vi không thể, phép cộng không tràn) — hoặc khi người dùng ký nhận rủi ro.
-- Thông tin vị trí trong panic (file:dòng) nhờ debug info IR.
+**Work:**
+- Mid-level SSA IR (HLIR) written in HLS; HLS→HLIR→C.
+- Optimisations: inlining, constant folding, DCE, copy propagation, escape
+  analysis, loop-invariant code motion, strength reduction.
+- `-O fast` mode skips checks **only when** safety is provable (out-of-bounds
+  is impossible, addition cannot overflow) — or when the user signs off on the
+  risk.
+- Position info in panics (file:line) thanks to IR debug info.
 
-**Nghiệm thu:** benchmark chuẩn (sieve, json parse, matrix) đạt ≥ 95% hiệu năng `gcc -O2`
-trên mã C tương đương; kiểm thử vi sai vẫn 100% sau tối ưu.
+**Acceptance:** standard benchmarks (sieve, json parse, matrix) reach ≥ 95% of
+`gcc -O2` performance on equivalent C code; differential tests still 100%
+after optimisation.
 
-## GIAI ĐOẠN 12 — Backend LLVM native ⬜
+## STAGE 12 — Native LLVM backend ⬜
 
-**Mục tiêu:** bỏ trung gian C, sinh mã máy trực tiếp.
+**Goal:** drop the C intermediate, emit machine code directly.
 
-**Công việc:**
-- HLIR → LLVM IR (qua C++ binding hoặc sinh văn bản `.ll`).
-- Đa nền tảng: x86-64, AArch64; cross-compile (`--target aarch64-linux`).
-- Hỗ trợ stack probe (đệ quy sâu không còn segfault), hot/cold attribute,
-  PGO (profile-guided optimization).
-- Backend C giữ làm fallback và cho nền phức tạp.
+**Work:**
+- HLIR → LLVM IR (via C++ binding or by emitting `.ll` text).
+- Multi-platform: x86-64, AArch64; cross-compile (`--target aarch64-linux`).
+- Stack probes (deep recursion no longer segfaults), hot/cold attributes,
+  PGO (profile-guided optimisation).
+- C backend kept as a fallback and for exotic platforms.
 
-**Nghiệm thu:** boot bootstrap thrice-clean: HLS→LLVM→native→tự dịch chính nó, so
-khớp output với backend C.
+**Acceptance:** thrice-clean bootstrap: HLS→LLVM→native→self-compile, with
+output matching the C backend.
 
-## GIAI ĐOẠN 13 — Trình quản lý gói `hls-pkg` ⬜
+## STAGE 13 — Package manager `hls-pkg` ⬜
 
-**Mục tiêu:** tái sử dụng mã nguồn có kiểm chứng nguồn gốc.
+**Goal:** reuse code with verified provenance.
 
-**Công việc:**
-- `hls-pkg.toml` + khoá nội dung (content-addressed lockfile): mỗi gói định danh bằng
-  băm SHA-256 của nội dung + bảng hiệu ứng của gói.
-- Cài đặt các hiệu ứng của gói: gói thư viện thuần KHÔNG THỂ khai báo `uses Net`.
-- Registry phi tập trung (git-based) + bản ghi minh bạch.
-- `hls-pkg audit`: in tổng các capability/effects của toàn bộ cây phụ thuộc.
+**Work:**
+- `hls-pkg.toml` + content-addressed lockfile: each package identified by the
+  SHA-256 of its content + its effect table.
+- Enforce package effects: a pure library package CANNOT declare `uses Net`.
+- Decentralised (git-based) registry + transparency log.
+- `hls-pkg audit`: print the total capabilities/effects of the entire
+  dependency tree.
 
-**Nghiệm thu:** cài một gói của bên thứ ba, xem báo cáo hiệu ứng, build tái lập được
-bit-for-bit từ lockfile.
+**Acceptance:** install a third-party package, view its effect report, build
+bit-for-bit reproducibly from the lockfile.
 
-## GIAI ĐOẠN 14 — Bộ công cụ: LSP, formatter, linter ⬜
+## STAGE 14 — Tooling: LSP, formatter, linter ⬜
 
-**Mục tiêu:** trải nghiệm nhà phát triển hạng nhất.
+**Goal:** first-class developer experience.
 
-**Công việc:**
-- `hls-lsp`: máy chủ ngôn ngữ (định nghĩa, hoàn thành, đổi tên, chẩn đoán kiểu/effects
-  thời gian thực).
-- `hlfmt`: formatter quyết định (như gofmt) — hết tranh cãi style.
-- `hllint`: quy tắc an toàn (phát hiện bỏ qua Result, unwrap trống, hiệu ứng lan
-  rộng không cần thiết).
-- Cả ba viết bằng HLS, phát hành dạng binary native.
+**Work:**
+- `hls-lsp`: language server (go-to-definition, completion, rename, real-time
+  type/effects diagnostics).
+- `hlfmt`: opinionated formatter (like gofmt) — ends style debates.
+- `hllint`: safety rules (detect ignored Result, empty unwrap, unnecessary
+  effect propagation).
+- All three written in HLS, shipped as native binaries.
 
-**Nghiệm thu:** plugin VS Code + Neovim; formatter idempotent (chạy 2 lần = 1 lần).
+**Acceptance:** VS Code + Neovim plugins; formatter idempotent (running twice
+= running once).
 
-## GIAI ĐOẠN 15 — FFI an toàn với C ⬜
+## STAGE 15 — Safe C FFI ⬜
 
-**Mục tiêu:** tái sử dụng hệ sinh thái C mà không phá特区 an toàn.
+**Goal:** reuse the C ecosystem without breaking the safety enclave.
 
-**Công việc:**
-- `extern "C"` với bảng kiểu tường minh; biên dịch sinh header kiểm tra tương thích ABI.
-- Quy tắc sở hữu qua biên giới: dữ liệu truyền vào FFI bị đóng băng (freeze) hoặc sao
-  chép; kết quả về phải qua lớp kiểm tra null/biên.
-- `bindgen`: sinh khai báo HLS từ header C kèm chú thích hiệu ứng thủ công.
-- Hàng rào: mọi lời gọi FFI tự động mang hiệu ứng `IO` (an toàn mặc định).
+**Work:**
+- `extern "C"` with explicit type table; compiler emits an ABI-compatibility
+  checking header.
+- Ownership rules across the boundary: data passed into FFI is frozen or
+  copied; results must pass through a null/bounds-check layer.
+- `bindgen`: emit HLS declarations from C headers with manual effect
+  annotations.
+- Fence: every FFI call automatically carries the `IO` effect (safe by
+  default).
 
-**Nghiệm thu:** gọi `libcurl` từ HLS qua lớp bindgen; ASan không phát hiện lỗi ở mã
-glue.
+**Acceptance:** call `libcurl` from HLS via the bindgen layer; ASan detects
+no errors in the glue code.
 
-## GIAI ĐOẠN 16 — Đồng thời & async (data-race freedom) ⬜
+## STAGE 16 — Concurrency & async (data-race freedom) ⬜
 
-**Mục tiêu:** tận dụng đa lõi mà không có data race — bằng hệ thống kiểu.
+**Goal:** leverage multi-core without data races — through the type system.
 
-**Công việc:**
-- Trait `Send`/`Sync` tương đương (kiểu có thể chuyển lõi / chia sẻ an toàn) áp lên
-  hệ thống sở hữu của Giai đoạn 8.
-- `spawn` tạo tác vụ; kênh truyền thông điệp (channel) làm nguyên thuỷ chính.
-- `async/await` với bộ định thời任务的 (work-stealing scheduler) viết bằng HLS.
-- Actor model cho trạng thái chia sẻ; API `select` cho kênh.
+**Work:**
+- `Send`/`Sync` equivalent traits (types that can move between cores / share
+  safely) layered on the Stage 8 ownership system.
+- `spawn` to create tasks; message-passing channels as the primary primitive.
+- `async/await` with a work-stealing scheduler written in HLS.
+- Actor model for shared state; `select` API for channels.
 
-**Nghiệm thu:** chương trình chia sẻ biến không qua kênh → lỗi biên dịch; benchmark
-đồng thời (web server) scale tuyến tính tới 8 lõi.
+**Acceptance:** a program sharing a variable outside a channel → compile error;
+concurrency benchmark (web server) scales linearly to 8 cores.
 
-## GIAI ĐOẠN 17 — Kiểm chứng hình thức & hợp đồng ⬜
+## STAGE 17 — Formal verification & contracts ⬜
 
-**Mục tiêu:** "bảo mật cực mạnh" được chứng minh, không chỉ tuyên bố.
+**Goal:** "extremely high security" is proven, not just claimed.
 
-**Công việc:**
-- Hợp đồng: `requires`/`ensures` trên hàm; kiểm tra tĩnh cho tập con (SMT solver
-  z3 qua cầu nối sinh ra từ HLS).
-- Mô hình kiểm tra (model checking) cho trạng thái hữu hạn: enum trạng thái máy.
-- Chế độ `-O fast` mở khoá bằng chứng minh: bỏ kiểm tra tràn khi chứng minh được
-  phạm vi số học.
-- Bộ quy tắc suy luận tự động cho vòng lặp (loop invariant gợi ý).
+**Work:**
+- Contracts: `requires`/`ensures` on functions; static checking for subsets
+  (SMT solver z3 via a bridge generated from HLS).
+- Model checking for finite state: state-machine enums.
+- `-O fast` unlocks via proof: skip overflow checks when arithmetic range is
+  proven.
+- Automatic inference rule set for loops (loop invariant suggestions).
 
-**Nghiệm thu:** một mô-đun crypto cốt lõi (ví dụ HMAC) được chứng minh hoàn toàn
-bằng hợp đồng HLS, không cần panic kiểm tra nào.
+**Acceptance:** a core crypto module (e.g. HMAC) fully proven by HLS contracts,
+no panic checks needed.
 
-## GIAI ĐOẠN 18 — Hệ sinh thái kiểm thử & fuzzing ⬜
+## STAGE 18 — Testing ecosystem & fuzzing ⬜
 
-**Mục việc:**
-- `hltest`: unit test trong ngôn ngữ (`test` khối, `assert_eq`), chạy song song.
-- Property-based testing (tương tự quickcheck) tích hợp sẵn.
-- `hls-fuzz`: fuzzing mức AST — sinh chương trình HLS ngẫu nhiên, chạy differential
-  thông dịch ↔ biên dịch, tự thu gọn chương trình gây khác biệt.
-- Theo dõi độ bao phủ (coverage) từ HLIR.
+**Work:**
+- `hltest`: in-language unit tests (`test` blocks, `assert_eq`), running in
+  parallel.
+- Property-based testing (quickcheck-style) integrated.
+- `hls-fuzz`: AST-level fuzzing — generate random HLS programs, run
+  differential interpreter ↔ compiler, auto-minimise divergent cases.
+- Coverage tracking from HLIR.
 
-**Nghiệm thu:** fuzzer chạy 1 giờ không tìm thấy khác biệt ngữ nghĩa nào giữa hai
-bản triển khai; CI hàng ngày.
+**Acceptance:** fuzzer runs for 1 hour without finding any semantic
+discrepancy between the two implementations; daily CI.
 
-## GIAI ĐOẠN 19 — Tài liệu, sách, playground ⬜
+## STAGE 19 — Documentation, book, playground ⬜
 
-**Công việc:**
-- "The Hieu Louis Book" — giáo trình tiếng Việt + tiếng Anh, từ nhập môn đến sở hữu/
-  hiệu ứng/kiểm chứng.
-- Trang web + playground chạy native trong trình duyệt (WebAssembly backend).
-- Ví dụ thật: web server, CLI tool, chương trình phân tích dữ liệu.
-- Chuỗi hướng dẫn "viết trình biên dịch bằng HLS" — dùng chính hlc làm giáo án.
+**Work:**
+- "The Hieu Louis Book" — a bilingual (Vietnamese + English) textbook, from
+  intro to ownership/effects/verification.
+- Website + playground running native in the browser (WebAssembly backend).
+- Real-world examples: web server, CLI tool, data analysis program.
+- Tutorial series "write a compiler in HLS" — using `hlc` itself as the
+  teaching material.
 
-**Nghiệm thu:** người mới cài đặt đến "hello world native" trong < 10 phút, không
-rời tài liệu chính thức.
+**Acceptance:** newcomer goes from install to "native hello world" in < 10
+minutes without leaving the official docs.
 
-## GIAI ĐOẠN 20 — HLS v1.0 — đóng băng API, LTS, bootstrap thuần HLS ⬜
+## STAGE 20 — HLS v1.0 — API freeze, LTS, pure-HLS bootstrap ⬜
 
-**Mục tiêu:** phát hành ổn định dài hạn.
+**Goal:** stable long-term release.
 
-**Công việc:**
-- Đóng băng cú pháp + thư viện chuẩn (semver: đổi chỉ trong major).
-- **Loại bỏ hoàn toàn `boot/`** — bootstrap chỉ còn HLS: mỗi bản phát hành được dựng
-  bằng binary hlc của bản trước (bootstrap chain tái lập được bit-for-bit).
-- Audit bảo mật độc lập (bên thứ ba) toàn bộ runtime + chuỗi bootstrap.
-- Chính sách hỗ trợ: 3 năm vá lỗi cho v1.x.
+**Work:**
+- Freeze syntax + standard library (semver: changes only in major versions).
+- **Fully remove `boot/`** — bootstrap is pure HLS: every release is built by
+  the previous release's `hlc` binary (bit-for-bit reproducible bootstrap
+  chain).
+- Independent third-party security audit of the entire runtime + bootstrap
+  chain.
+- Support policy: 3 years of bug fixes for v1.x.
 
-**Nghiệm thu:** dựng v1.0 từ hai đường độc lập (từ binary phát hành trước + từ boot
-Stage-0) cho cùng một binary — reproducible build.
+**Acceptance:** build v1.0 from two independent paths (from previous release
+binary + from Stage-0 boot) producing the same binary — reproducible build.
 
 ---
 
-## NGUYÊN TẮC ƯU TIÊN KHI XUNG ĐỘT
+## CONFLICT-RESOLUTION PRINCIPLES
 
-1. **An toàn > hiệu năng > tiện dụng.** Không bao giờ thêm "chế độ nhanh tắt kiểm tra"
-   không có chứng minh (chỉ mở bằng hợp đồng — Giai đoạn 17).
-2. **Hạt nhân nhỏ, kiểm chứng được.** Ưa mở rộng bằng thư viện chuẩn hơn là thêm cú pháp.
-3. **Mọi tính năng phải tự dịch được.** hlc luôn là chương trình HLS lớn nhất và là
-   khách hàng đầu tiên của mọi tính năng mới (dogfooding bắt buộc).
-4. **Không phá ngữ nghĩa hiện có.** Thay đổi hành vi chỉ được qua phiên bản major với
-   công cụ migraion tự động.
-5. **Hai bản triển khai, một sự thật.** Kiểm thử vi sai là cửa ải cuối của mọi PR —
-   khác biệt nào giữa thông dịch và biên dịch đều là lỗi, không có ngoại lệ.
+1. **Safety > performance > convenience.** Never add a "fast mode that skips
+   checks" without proof (only unlock via contracts — Stage 17).
+2. **Small, verifiable core.** Prefer extending via the standard library
+   rather than adding syntax.
+3. **Every feature must self-compile.** `hlc` is always the largest HLS
+   program and the first customer of every new feature (mandatory dogfooding).
+4. **Never break existing semantics.** Behaviour changes only happen in major
+   versions with automated migration tooling.
+5. **Two implementations, one truth.** Differential testing is the final gate
+   of every PR — any discrepancy between interpreter and compiler is a bug,
+   no exceptions.

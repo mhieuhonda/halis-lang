@@ -1,20 +1,20 @@
 # ============================================================================
-# hlc — TRÌNH BIÊN DỊCH HIEU LOUIS (HLS -> C)
+# hlc — THE HIEU LOUIS COMPILER (HLS -> C)
 # ----------------------------------------------------------------------------
-# Toan bo trinh bien dich nay duoc viet 100% bang chinh Hieu Louis.
-# Day la buoc tu dich (self-hosting) cua ngon ngu: compiler cua ngon ngu
-# duoc viet bang ngon ngu do.
+# This compiler is written 100% in Hieu Louis itself.
+# This is the self-hosting step of the language: the language's compiler
+# is written in that language.
 #
-# Chuoi bootstrap:
+# Bootstrap chain:
 #   python3 boot/boot.py src/hlc.hls <vao.hls> <ra.c>
-#   gcc -O2 -o <chuong_trinh> <ra.c>
+#   gcc -O2 -o <program> <output.c>
 #
-# Cau truc: LEXER -> PARSER -> CHECKER (kieu + effects) -> CODEGEN (C)
-# Moi trang thai duoc truyen dien ro qua Ctx — khong co bien toan cuc.
+# Structure: LEXER -> PARSER -> CHECKER (types + effects) -> CODEGEN (C)
+# All state is passed explicitly through Ctx — no global variables.
 # ============================================================================
 
 # ----------------------------------------------------------------------------
-# 1. CAU TRUC DU LIEU
+# 1. DATA STRUCTURES
 # ----------------------------------------------------------------------------
 
 struct Tok {
@@ -99,7 +99,11 @@ struct Ctx {
     gen_locals: map[str, str],
     gen_counts: map[str, int],
     tmp: int,
-    edges: map[str, list[str]]
+    edges: map[str, list[str]],
+    imports: list[str],
+    loaded_files: list[str],
+    entry_dir: str,
+    repo_root: str
 }
 
 fn new_ctx(src: str) -> Ctx {
@@ -110,11 +114,13 @@ fn new_ctx(src: str) -> Ctx {
         methods_of: map_new(),
         out: [], lit_helpers: [], lit_count: 0,
         gen_locals: map_new(), gen_counts: map_new(), tmp: 0,
-        edges: map_new()
+        edges: map_new(),
+        imports: [], loaded_files: [],
+        entry_dir: "", repo_root: ""
     }
 }
 
-# ---Ham dung chung---
+# --- Common helpers ---
 
 fn join(parts: list[str], sep: str) -> str {
     let mut acc: str = ""
@@ -148,7 +154,7 @@ fn is_digit(c: int) -> bool {
     return c >= 48 && c <= 57
 }
 
-# Loc bo gach duoi trong so: "1_000" -> "1000"
+# Strip underscores from numbers: "1_000" -> "1000"
 fn filter_us(s: str) -> str {
     let parts: list[str] = []
     let mut i: int = 0
@@ -170,7 +176,7 @@ fn mk_tok(kind: str, value: str, line: int, col: int) -> Tok {
 }
 
 fn lex_err(msg: str, line: int, col: int) -> void {
-    panic("loi tu vung: " + msg + " (dong " + line.to_str() + ":" + col.to_str() + ")")
+    panic("lex error: " + msg + " (dong " + line.to_str() + ":" + col.to_str() + ")")
 }
 
 fn lex(ctx: Ctx) -> void {
@@ -181,7 +187,7 @@ fn lex(ctx: Ctx) -> void {
     let mut col: int = 1
     while i < n {
         let c: int = src.byte_at(i)
-        # ky tu trang
+        # whitespace
         if c == 32 || c == 9 || c == 13 {
             col = col + 1
             i = i + 1
@@ -190,7 +196,7 @@ fn lex(ctx: Ctx) -> void {
             col = 1
             i = i + 1
         } else if c == 35 {
-            # ghi chu # ... het dong
+            # comment: # to end of line
             while i < n && src.byte_at(i) != 10 {
                 i = i + 1
             }
@@ -229,7 +235,7 @@ fn lex(ctx: Ctx) -> void {
             col = col + (j - i)
             i = j
         } else if c == 34 {
-            # chuoi
+            # string
             let ln: int = line
             let cl: int = col
             i = i + 1
@@ -246,7 +252,7 @@ fn lex(ctx: Ctx) -> void {
                 }
                 if ch == 92 {
                     if i + 1 >= n {
-                        lex_err("chuoi khong dong", ln, cl)
+                        lex_err("unterminated string", ln, cl)
                     }
                     let mut e: int = src.byte_at(i + 1)
                     if e == 110 {
@@ -258,13 +264,13 @@ fn lex(ctx: Ctx) -> void {
                     } else if e == 34 {
                         parts.push(chr(34))
                     } else {
-                        lex_err("ky hieu thoat khong hop le", ln, cl)
+                        lex_err("invalid escape sequence", ln, cl)
                     }
                     i = i + 2
                     col = col + 2
                 } else {
                     if ch < 32 {
-                        lex_err("chuoi chua ky tu dieu khien", ln, cl)
+                        lex_err("string contains invalid control character", ln, cl)
                     }
                     parts.push(src.slice(i, i + 1))
                     col = col + 1
@@ -272,11 +278,11 @@ fn lex(ctx: Ctx) -> void {
                 }
             }
             if !closed {
-                lex_err("chuoi khong dong", ln, cl)
+                lex_err("unterminated string", ln, cl)
             }
             ctx.toks.push(mk_tok("str", join(parts, ""), ln, cl))
         } else {
-            # toan tu / ky hieu
+            # operator / symbol
             let mut two: str = ""
             if i + 2 <= n {
                 two = src.slice(i, i + 2)
@@ -290,7 +296,7 @@ fn lex(ctx: Ctx) -> void {
                 i = i + 1
                 col = col + 1
             } else {
-                lex_err("ky tu khong hop le", line, col)
+                lex_err("invalid character", line, col)
             }
         }
     }
@@ -323,17 +329,17 @@ fn nx_stmt(ctx: Ctx, kind: str, line: int) -> int {
 
 fn perr(ctx: Ctx, msg: str) -> void {
     let t: Tok = ctx.toks.get(ctx.pos)
-    panic("loi cu phap: " + msg + " (dong " + t.line.to_str() + ":" + t.col.to_str() + ")")
+    panic("syntax error: " + msg + " (dong " + t.line.to_str() + ":" + t.col.to_str() + ")")
 }
 
 fn perr_at(ctx: Ctx, msg: str, t: Tok) -> void {
-    panic("loi cu phap: " + msg + " (dong " + t.line.to_str() + ":" + t.col.to_str() + ")")
+    panic("syntax error: " + msg + " (dong " + t.line.to_str() + ":" + t.col.to_str() + ")")
 }
 
 fn tok_desc(ctx: Ctx) -> str {
     let t: Tok = ctx.toks.get(ctx.pos)
     if t.kind == "eof" {
-        return "cuoi tep"
+        return "end of file"
     }
     return "'" + t.value + "'"
 }
@@ -350,14 +356,14 @@ fn at_kw(ctx: Ctx, v: str) -> bool {
 
 fn eat_sym(ctx: Ctx, v: str) -> void {
     if !at_sym(ctx, v) {
-        perr(ctx, "mong doi ky hieu '" + v + "' nhung gap " + tok_desc(ctx))
+        perr(ctx, "expected symbol '" + v + "' but got " + tok_desc(ctx))
     }
     ctx.pos = ctx.pos + 1
 }
 
 fn eat_kw(ctx: Ctx, v: str) -> void {
     if !at_kw(ctx, v) {
-        perr(ctx, "mong doi tu khoa '" + v + "' nhung gap " + tok_desc(ctx))
+        perr(ctx, "expected keyword '" + v + "' but got " + tok_desc(ctx))
     }
     ctx.pos = ctx.pos + 1
 }
@@ -365,7 +371,7 @@ fn eat_kw(ctx: Ctx, v: str) -> void {
 fn eat_ident(ctx: Ctx) -> str {
     let t: Tok = ctx.toks.get(ctx.pos)
     if t.kind != "ident" {
-        perr(ctx, "mong doi dinh danh nhung gap " + tok_desc(ctx))
+        perr(ctx, "expected identifier but got " + tok_desc(ctx))
     }
     ctx.pos = ctx.pos + 1
     return t.value
@@ -379,12 +385,12 @@ fn peek2_is(ctx: Ctx, v: str) -> bool {
     return t.kind == "sym" && t.value == v
 }
 
-# --- Phan tich kieu: tra ve chuoi kieu chuan hoa ---
+# --- Type parsing: returns a canonical type string ---
 
 fn parse_type(ctx: Ctx, allow_void: bool) -> str {
     let t: Tok = ctx.toks.get(ctx.pos)
     if t.kind != "ident" {
-        perr(ctx, "mong doi kieu nhung gap " + tok_desc(ctx))
+        perr(ctx, "expected type but got " + tok_desc(ctx))
     }
     let base: str = t.value
     ctx.pos = ctx.pos + 1
@@ -398,7 +404,7 @@ fn parse_type(ctx: Ctx, allow_void: bool) -> str {
         eat_sym(ctx, "[")
         let kt: str = eat_ident(ctx)
         if kt != "str" {
-            perr_at(ctx, "khoa map trong v0.1 chi duoc la 'str'", t)
+            perr_at(ctx, "map key in v0.2 must be 'str'", t)
         }
         eat_sym(ctx, ",")
         let vt: str = parse_type(ctx, false)
@@ -410,14 +416,14 @@ fn parse_type(ctx: Ctx, allow_void: bool) -> str {
     }
     if base == "void" {
         if !allow_void {
-            perr_at(ctx, "void chi dung lam kieu tra ve", t)
+            perr_at(ctx, "void expects only be used as a return type", t)
         }
         return "void"
     }
     return base
 }
 
-# --- Phan tich chuong trinh ---
+# --- Program parsing ---
 
 fn parse_program(ctx: Ctx) -> void {
     while ctx.toks.get(ctx.pos).kind != "eof" {
@@ -425,7 +431,7 @@ fn parse_program(ctx: Ctx) -> void {
         if t.kind == "kw" && t.value == "struct" {
             let st: StructInfo = parse_struct(ctx)
             if ctx.structs.has(st.name) {
-                perr_at(ctx, "struct trung ten: " + st.name, t)
+                perr_at(ctx, "duplicate struct name: " + st.name, t)
             }
             ctx.structs.set(st.name, st)
         } else if t.kind == "kw" && t.value == "impl" {
@@ -433,14 +439,21 @@ fn parse_program(ctx: Ctx) -> void {
         } else if t.kind == "kw" && t.value == "fn" {
             let f: FnInfo = parse_fn(ctx, "")
             if ctx.fns.has(f.name) {
-                perr_at(ctx, "ham trung ten: " + f.name, t)
+                perr_at(ctx, "duplicate function name: " + f.name, t)
             }
             ctx.fns.set(f.name, f)
             ctx.fn_order.push(f.name)
         } else if t.kind == "kw" && t.value == "import" {
-            perr_at(ctx, "import chua duoc ho tro trong v0.1 (Giai doan 6)", t)
+            eat_kw(ctx, "import")
+            # import expects a string literal
+            let pt: Tok = ctx.toks.get(ctx.pos)
+            if pt.kind != "str" {
+                perr_at(ctx, "import expects a string path", pt)
+            }
+            ctx.pos = ctx.pos + 1
+            ctx.imports.push(pt.value)
         } else {
-            perr_at(ctx, "chi duoc khai bao struct/impl/fn o muc dinh", t)
+            perr_at(ctx, "only struct/impl/fn/import declarations allowed at top level", t)
         }
     }
 }
@@ -461,12 +474,12 @@ fn parse_struct(ctx: Ctx) -> StructInfo {
         if at_sym(ctx, ",") {
             ctx.pos = ctx.pos + 1
         } else if !at_sym(ctx, "}") {
-            perr(ctx, "mong doi ',' hoac '}' trong dinh nghia struct")
+            perr(ctx, "expected ',' or '}' in struct definition")
         }
     }
     eat_sym(ctx, "}")
     if fields.len() == 0 {
-        perr_at(ctx, "struct phai co it nhat mot truong", t0)
+        perr_at(ctx, "struct must have at least one field", t0)
     }
     return StructInfo { name: name, fields: fields, ftypes: ftypes, line: t0.line }
 }
@@ -477,12 +490,13 @@ fn parse_impl(ctx: Ctx) -> void {
     eat_sym(ctx, "{")
     while !at_sym(ctx, "}") {
         if !at_kw(ctx, "fn") {
-            perr(ctx, "trong impl chi duoc dinh nghia fn")
+            perr(ctx, "only fn definitions allowed inside impl")
         }
+        let fn_t0: Tok = ctx.toks.get(ctx.pos)
         let f: FnInfo = parse_fn(ctx, sname)
-        let mut key: str = sname + "." + f.name
+        let key: str = sname + "." + f.name
         if ctx.fns.has(key) {
-            panic("loi cu phap: phuong thuc trung ten: " + key)
+            perr_at(ctx, "duplicate method name: " + key, fn_t0)
         }
         ctx.fns.set(key, f)
         ctx.fn_order.push(key)
@@ -517,7 +531,7 @@ fn parse_fn(ctx: Ctx, impl_struct: str) -> FnInfo {
         if at_sym(ctx, ",") {
             ctx.pos = ctx.pos + 1
         } else if !at_sym(ctx, ")") {
-            perr(ctx, "mong doi ',' hoac ')' trong tham so")
+            perr(ctx, "expected ',' or ')' in parameters")
         }
     }
     eat_sym(ctx, ")")
@@ -531,7 +545,7 @@ fn parse_fn(ctx: Ctx, impl_struct: str) -> FnInfo {
         ctx.pos = ctx.pos + 1
         let io: str = eat_ident(ctx)
         if io != "IO" {
-            perr(ctx, "hieu ung duy nhat trong v0.1 la 'uses IO'")
+            perr(ctx, "the only effect in v0.2 is 'uses IO'")
         }
         uses_io = true
     }
@@ -553,7 +567,7 @@ fn parse_block(ctx: Ctx) -> list[int] {
     return out
 }
 
-# --- Phan tich cau lenh ---
+# --- Statement parsing ---
 
 fn parse_stmt(ctx: Ctx) -> int {
     let t: Tok = ctx.toks.get(ctx.pos)
@@ -607,17 +621,17 @@ fn parse_stmt(ctx: Ctx) -> int {
             return nx_stmt(ctx, "continue", t.line)
         }
         if t.value == "struct" || t.value == "impl" || t.value == "fn" {
-            perr_at(ctx, "khai bao " + t.value + " chi duoc o muc dinh", t)
+            perr_at(ctx, "declaration of " + t.value + " only allowed at top level", t)
         }
-        perr_at(ctx, "tu khoa khong the bat dau cau lenh: " + t.value, t)
+        perr_at(ctx, "keyword cannot start a statement: " + t.value, t)
     }
-    # bieu thuc / phep gan
+    # expression / assignment
     let mut e: int = parse_expr(ctx, true)
     if at_sym(ctx, "=") {
         let eq: Tok = ctx.toks.get(ctx.pos)
         ctx.pos = ctx.pos + 1
         if ctx.exprs[e].kind != "ident" && ctx.exprs[e].kind != "field" && ctx.exprs[e].kind != "index" {
-            perr_at(ctx, "ve trai cua phep gan phai la bien/truong/chi so", eq)
+            perr_at(ctx, "left side of assignment must be variable/field/index", eq)
         }
         if ctx.exprs[e].kind == "field" || ctx.exprs[e].kind == "index" {
             require_ident_root(ctx, e)
@@ -629,7 +643,7 @@ fn parse_stmt(ctx: Ctx) -> int {
         return idx
     }
     if ctx.exprs[e].kind != "call" && ctx.exprs[e].kind != "method" {
-        perr(ctx, "bieu thuc lam cau lenh phai la loi goi ham/phuong thuc")
+        perr(ctx, "expression as statement must be a function/method call")
     }
     let idx: int = nx_stmt(ctx, "expr", ctx.exprs[e].line)
     ctx.stmts[idx].e = e
@@ -641,7 +655,7 @@ fn require_ident_root(ctx: Ctx, e: int) -> void {
     if k == "field" || k == "index" {
         require_ident_root(ctx, ctx.exprs[e].left)
     } else if k != "ident" {
-        perr(ctx, "ve trai cua phep gan phai bat dau tu bien")
+        perr(ctx, "left side of assignment must start from a variable")
     }
 }
 
@@ -687,7 +701,7 @@ fn parse_if(ctx: Ctx) -> int {
     return idx
 }
 
-# --- Phan tich bieu thuc ---
+# --- Expression parsing ---
 
 fn parse_expr(ctx: Ctx, allow_struct: bool) -> int {
     return parse_bin(ctx, 0, allow_struct)
@@ -742,7 +756,7 @@ fn parse_unary(ctx: Ctx, allow_struct: bool) -> int {
         ctx.pos = ctx.pos + 1
         let mut e: int = parse_unary(ctx, allow_struct)
         if t.value == "-" && ctx.exprs[e].kind == "int" && ctx.exprs[e].op == "big" {
-            # gap -9223372036854775808 thanh INT64_MIN
+            # fold -9223372036854775808 into INT64_MIN
             ctx.exprs[e].op = ""
             return e
         }
@@ -810,7 +824,7 @@ fn parse_args(ctx: Ctx) -> list[int] {
         if at_sym(ctx, ",") {
             ctx.pos = ctx.pos + 1
         } else if !at_sym(ctx, ")") {
-            perr(ctx, "mong doi ',' hoac ')' trong doi so")
+            perr(ctx, "expected ',' or ')' in arguments")
         }
     }
     eat_sym(ctx, ")")
@@ -823,11 +837,11 @@ fn parse_primary(ctx: Ctx, allow_struct: bool) -> int {
         ctx.pos = ctx.pos + 1
         let idx: int = nx_expr(ctx, "int", t.line)
         if t.value.len() > 19 {
-            perr_at(ctx, "so nguyen qua lon (vuot int64)", t)
+            perr_at(ctx, "integer literal too large (exceeds int64)", t)
         } else if t.value.len() == 19 && t.value > "9223372036854775808" {
-            perr_at(ctx, "so nguyen qua lon (vuot int64)", t)
+            perr_at(ctx, "integer literal too large (exceeds int64)", t)
         } else if t.value.len() == 19 && t.value == "9223372036854775808" {
-            # 2^63: chi hop le khi gap voi dau tru thanh INT64_MIN
+            # 2^63: only valid when folded with minus sign into INT64_MIN
             ctx.exprs[idx].ival = -9223372036854775808
             ctx.exprs[idx].op = "big"
         } else {
@@ -876,7 +890,7 @@ fn parse_primary(ctx: Ctx, allow_struct: bool) -> int {
             if at_sym(ctx, ",") {
                 ctx.pos = ctx.pos + 1
             } else if !at_sym(ctx, "]") {
-                perr(ctx, "mong doi ',' hoac ']' trong literal danh sach")
+                perr(ctx, "expected ',' or ']' in list literal")
             }
         }
         eat_sym(ctx, "]")
@@ -884,7 +898,7 @@ fn parse_primary(ctx: Ctx, allow_struct: bool) -> int {
         ctx.exprs[idx].args = items
         return idx
     }
-    perr(ctx, "mong doi bieu thuc nhung gap " + tok_desc(ctx))
+    perr(ctx, "expected expression but got " + tok_desc(ctx))
     return -1
 }
 
@@ -903,7 +917,7 @@ fn parse_struct_lit(ctx: Ctx) -> int {
         if at_sym(ctx, ",") {
             ctx.pos = ctx.pos + 1
         } else if !at_sym(ctx, "}") {
-            perr(ctx, "mong doi ',' hoac '}' trong literal struct")
+            perr(ctx, "expected ',' or '}' in struct literal")
         }
     }
     eat_sym(ctx, "}")
@@ -915,11 +929,11 @@ fn parse_struct_lit(ctx: Ctx) -> int {
 }
 
 # ----------------------------------------------------------------------------
-# 4. CHECKER — kiem tra kieu + phan tich effects (trai tim bao mat)
+# 4. CHECKER — type check + effects analysis (the security heart)
 # ----------------------------------------------------------------------------
 
 fn cerr(line: int, msg: str) -> void {
-    panic("loi kieu: " + msg + " (dong " + line.to_str() + ")")
+    panic("type error: " + msg + " (dong " + line.to_str() + ")")
 }
 
 fn is_list_t(t: str) -> bool {
@@ -943,6 +957,7 @@ fn is_builtin_fn(n: str) -> bool {
         || n == "str" || n == "int" || n == "len" || n == "range"
         || n == "map_new" || n == "read_file" || n == "write_file"
         || n == "args" || n == "clock_ms" || n == "chr"
+        || n == "file_exists"
 }
 
 fn type_exists(ctx: Ctx, t: str) -> bool {
@@ -960,10 +975,10 @@ fn type_exists(ctx: Ctx, t: str) -> bool {
 
 fn require_type(ctx: Ctx, t: str, line: int, what: str) -> void {
     if t == "void" {
-        cerr(line, "khong the dung 'void' lam " + what)
+        cerr(line, "cannot use 'void' as " + what)
     }
     if !type_exists(ctx, t) {
-        cerr(line, "kieu khong ton tai: " + t)
+        cerr(line, "type does not exist: " + t)
     }
 }
 
@@ -1000,74 +1015,74 @@ fn add_edge(ctx: Ctx, cur: str, callee: str) -> void {
     ctx.edges.get_or(cur, []).push(callee)
 }
 
-# --- Vong doi checker ---
+# --- Checker lifecycle ---
 
 fn check_program(ctx: Ctx) -> void {
-    # 1. kiem tra khai bao
+    # 1. check declarations
     let mut i: int = 0
     while i < ctx.fn_order.len() {
         let mut key: str = ctx.fn_order.get(i)
         let f: FnInfo = ctx.fns.get_or(key, dummy_fn())
         if !f.is_method {
             if is_builtin_fn(f.name) {
-                cerr(f.line, "khong the dinh nghia lai ham builtin: " + f.name)
+                cerr(f.line, "cannot redefine builtin function: " + f.name)
             }
         } else {
             if !ctx.structs.has(f.struct_of) {
-                cerr(f.line, "impl cho struct khong ton tai: " + f.struct_of)
+                cerr(f.line, "impl for non-existent struct: " + f.struct_of)
             }
             if f.params.len() == 0 {
-                cerr(f.line, "phuong thuc phai co tham so 'self' dau tien")
+                cerr(f.line, "method must have 'self' as first parameter")
             }
             if f.params.get(0) != "self" || f.ptypes.get(0) != f.struct_of {
-                cerr(f.line, "phuong thuc phai co tham so dau la 'self: " + f.struct_of + "'")
+                cerr(f.line, "method must have first parameter 'self: " + f.struct_of + "'")
             }
         }
         let mut j: int = 0
         while j < f.params.len() {
-            require_type(ctx, f.ptypes.get(j), f.line, "kieu tham so")
+            require_type(ctx, f.ptypes.get(j), f.line, "parameter type")
             j = j + 1
         }
         if f.ret != "void" {
             if !type_exists(ctx, f.ret) {
-                cerr(f.line, "kieu tra ve khong ton tai: " + f.ret)
+                cerr(f.line, "return type does not exist: " + f.ret)
             }
         }
         i = i + 1
     }
-    # 2. struct: kieu truong
+    # 2. struct: field types
     let keys_s: list[str] = ctx.structs.keys()
     let mut si: int = 0
     while si < keys_s.len() {
         let st: StructInfo = ctx.structs.get_or(keys_s.get(si), ctx.structs.get_or(keys_s.get(0), dummy_struct()))
         let mut fi: int = 0
         while fi < st.ftypes.len() {
-            require_type(ctx, st.ftypes.get(fi), st.line, "kieu truong struct")
+            require_type(ctx, st.ftypes.get(fi), st.line, "struct field type")
             fi = fi + 1
         }
         si = si + 1
     }
     # 3. main
     if !ctx.fns.has("main") {
-        cerr(1, "thieu ham main")
+        cerr(1, "missing main function")
     }
     let mf: FnInfo = ctx.fns.get_or("main", dummy_fn())
     if mf.is_method {
-        cerr(mf.line, "main khong duoc la phuong thuc")
+        cerr(mf.line, "main cannot be a method")
     }
     if mf.params.len() > 0 {
-        cerr(mf.line, "main khong duoc co tham so")
+        cerr(mf.line, "main cannot have parameters")
     }
     if mf.ret != "int" && mf.ret != "void" {
-        cerr(mf.line, "main phai tra ve 'int' hoac khong co kieu tra ve")
+        cerr(mf.line, "main must return 'int' or have no return type")
     }
-    # 4. kiem tra than ham
+    # 4. check function bodies
     let mut bi: int = 0
     while bi < ctx.fn_order.len() {
         check_fn_body(ctx, ctx.fn_order.get(bi))
         bi = bi + 1
     }
-    # 5. phan tich effects
+    # 5. effects analysis
     check_effects(ctx)
 }
 
@@ -1098,7 +1113,7 @@ fn check_fn_body(ctx: Ctx, key: str) -> void {
         while i < f.params.len() {
             let pn: str = f.params.get(i)
             if scope0.has(pn) {
-                cerr(f.line, "tham so trung ten: " + pn)
+                cerr(f.line, "duplicate parameter name: " + pn)
             }
             scope0.set(pn, Binding { t: f.ptypes.get(i), is_mut: f.pmuts.get(i) })
             i = i + 1
@@ -1108,7 +1123,7 @@ fn check_fn_body(ctx: Ctx, key: str) -> void {
     check_stmts(ctx, env, key, f, f.body, false)
     if f.ret != "void" {
         if !all_return(ctx, f.body) {
-            cerr(f.line, "ham '" + f.name + "' khong tra ve tren moi duong di")
+            cerr(f.line, "function '" + f.name + "' does not return on all paths")
         }
     }
 }
@@ -1144,16 +1159,16 @@ fn check_stmts(ctx: Ctx, env: list[map[str, Binding]], cur: str, f: FnInfo, stmt
 fn check_stmt(ctx: Ctx, env: list[map[str, Binding]], cur: str, f: FnInfo, sidx: int, in_loop: bool) -> void {
     let s: StmtN = ctx.stmts[sidx]
     if s.kind == "let" {
-        require_type(ctx, s.vtype, s.line, "kieu bien")
+        require_type(ctx, s.vtype, s.line, "variable type")
         if lookup_exists(env, s.name) {
-            cerr(s.line, "che khuat ten khong duoc phep: " + s.name)
+            cerr(s.line, "shadowing not allowed: " + s.name)
         }
         let vt: str = check_expr(ctx, env, cur, s.value, s.vtype)
         if vt == "never" {
-            cerr(s.line, "khong the gan bieu thuc khong bao gio tra ve")
+            cerr(s.line, "cannot assign never-returning expression")
         }
         if vt != s.vtype {
-            cerr(s.line, "kieu khong khop: khai bao " + s.vtype + " nhung nhan " + vt)
+            cerr(s.line, "type mismatch: declared " + s.vtype + " but got " + vt)
         }
         env.get(env.len() - 1).set(s.name, Binding { t: s.vtype, is_mut: s.is_mut })
     } else if s.kind == "assign" {
@@ -1161,7 +1176,7 @@ fn check_stmt(ctx: Ctx, env: list[map[str, Binding]], cur: str, f: FnInfo, sidx:
     } else if s.kind == "if" {
         let ct: str = check_expr(ctx, env, cur, s.cond, "")
         if ct != "bool" {
-            cerr(s.line, "dieu kien if phai la bool, nhan " + ct)
+            cerr(s.line, "if condition must be bool, got " + ct)
         }
         env.push(map_new())
         check_stmts(ctx, env, cur, f, s.body, in_loop)
@@ -1174,7 +1189,7 @@ fn check_stmt(ctx: Ctx, env: list[map[str, Binding]], cur: str, f: FnInfo, sidx:
     } else if s.kind == "while" {
         let ct: str = check_expr(ctx, env, cur, s.cond, "")
         if ct != "bool" {
-            cerr(s.line, "dieu kien while phai la bool, nhan " + ct)
+            cerr(s.line, "while condition must be bool, got " + ct)
         }
         env.push(map_new())
         check_stmts(ctx, env, cur, f, s.body, true)
@@ -1182,11 +1197,11 @@ fn check_stmt(ctx: Ctx, env: list[map[str, Binding]], cur: str, f: FnInfo, sidx:
     } else if s.kind == "for" {
         let it: str = check_expr(ctx, env, cur, s.iter, "")
         if !is_list_t(it) {
-            cerr(s.line, "bieu thuc for-in phai la danh sach, nhan " + it)
+            cerr(s.line, "for-in expression must be a list, got " + it)
         }
         let mut elem: str = list_elem_t(it)
         if s.vtype != elem {
-            cerr(s.line, "kieu bien lap " + s.vtype + " khong khop phan tu " + elem)
+            cerr(s.line, "variable type lap " + s.vtype + " does not match element " + elem)
         }
         env.push(map_new())
         env.get(env.len() - 1).set(s.name, Binding { t: elem, is_mut: false })
@@ -1195,54 +1210,54 @@ fn check_stmt(ctx: Ctx, env: list[map[str, Binding]], cur: str, f: FnInfo, sidx:
     } else if s.kind == "return" {
         if f.ret == "void" {
             if s.value != -1 {
-                cerr(s.line, "ham tra ve void khong duoc return gia tri")
+                cerr(s.line, "void function cannot return a value")
             }
         } else {
             if s.value == -1 {
-                cerr(s.line, "ham tra ve " + f.ret + " phai return gia tri")
+                cerr(s.line, "function returning " + f.ret + " must return a value")
             }
             let vt: str = check_expr(ctx, env, cur, s.value, f.ret)
             if vt != f.ret && vt != "never" {
-                cerr(s.line, "kieu return khong khop: can " + f.ret + ", nhan " + vt)
+                cerr(s.line, "return type mismatch: expected " + f.ret + ", got " + vt)
             }
         }
     } else if s.kind == "break" {
         if !in_loop {
-            cerr(s.line, "break chi dung trong vong lap")
+            cerr(s.line, "break only allowed inside a loop")
         }
     } else if s.kind == "continue" {
         if !in_loop {
-            cerr(s.line, "continue chi dung trong vong lap")
+            cerr(s.line, "continue only allowed inside a loop")
         }
     } else if s.kind == "expr" {
         check_expr(ctx, env, cur, s.e, "")
     } else {
-        cerr(s.line, "cau lenh khong xac dinh: " + s.kind)
+        cerr(s.line, "unknown statement: " + s.kind)
     }
 }
 
 fn check_assign(ctx: Ctx, env: list[map[str, Binding]], cur: str, s: StmtN) -> void {
     let tgt: int = s.target
-    # tim lien ket goc
+    # find the root binding
     let mut root: int = tgt
     while ctx.exprs[root].kind == "field" || ctx.exprs[root].kind == "index" {
         root = ctx.exprs[root].left
     }
     let b: Binding = lookup_binding(env, ctx.exprs[root].name)
     if b.t == "" {
-        cerr(s.line, "bien khong ton tai: " + ctx.exprs[root].name)
+        cerr(s.line, "variable does not exist: " + ctx.exprs[root].name)
     }
-    # 'mut' chi quan triet viec gan lai lien ket (name = v)
+    # 'mut' only governs REASSIGNMENT of the binding (name = v)
     if ctx.exprs[tgt].kind == "ident" && !b.is_mut {
-        cerr(s.line, "khong the gan lai bien khong kha bien: " + ctx.exprs[root].name)
+        cerr(s.line, "cannot reassign immutable variable: " + ctx.exprs[root].name)
     }
     let tt: str = check_lvalue(ctx, env, cur, tgt)
     let vt: str = check_expr(ctx, env, cur, s.value, tt)
     if vt == "never" {
-        cerr(s.line, "khong the gan bieu thuc khong bao gio tra ve")
+        cerr(s.line, "cannot assign never-returning expression")
     }
     if vt != tt {
-        cerr(s.line, "kieu khong khop khi gan: can " + tt + ", nhan " + vt)
+        cerr(s.line, "type mismatch on assignment: expected " + tt + ", got " + vt)
     }
 }
 
@@ -1253,22 +1268,22 @@ fn check_lvalue(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int) -> str
     if ctx.exprs[e].kind == "field" {
         let bt: str = check_expr(ctx, env, cur, ctx.exprs[e].left, "")
         if !ctx.structs.has(bt) {
-            cerr(ctx.exprs[e].line, "khong the truy cap truong tren kieu " + bt)
+            cerr(ctx.exprs[e].line, "cannot access field on type " + bt)
         }
         return field_type(ctx, bt, ctx.exprs[e].name, ctx.exprs[e].line)
     }
     if ctx.exprs[e].kind == "index" {
         let tt: str = check_expr(ctx, env, cur, ctx.exprs[e].left, "")
         if !is_list_t(tt) {
-            cerr(ctx.exprs[e].line, "khong the dung chi so tren kieu " + tt)
+            cerr(ctx.exprs[e].line, "cannot use index on type " + tt)
         }
         let it: str = check_expr(ctx, env, cur, ctx.exprs[e].right, "")
         if it != "int" {
-            cerr(ctx.exprs[e].line, "chi so phai la int, nhan " + it)
+            cerr(ctx.exprs[e].line, "index must be int, got " + it)
         }
         return list_elem_t(tt)
     }
-    cerr(ctx.exprs[e].line, "ve trai khong hop le")
+    cerr(ctx.exprs[e].line, "invalid lvalue")
     return ""
 }
 
@@ -1281,7 +1296,7 @@ fn field_type(ctx: Ctx, sname: str, fname: str, line: int) -> str {
         }
         i = i + 1
     }
-    cerr(line, "struct " + sname + " khong co truong " + fname)
+    cerr(line, "struct " + sname + "  has no field " + fname)
     return ""
 }
 
@@ -1289,7 +1304,7 @@ fn check_expr(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, expected
     let mut k: str = ctx.exprs[e].kind
     if k == "int" {
         if ctx.exprs[e].op == "big" {
-            cerr(ctx.exprs[e].line, "so nguyen qua lon (vuot int64)")
+            cerr(ctx.exprs[e].line, "integer literal too large (exceeds int64)")
         }
         ctx.exprs[e].t = "int"
     } else if k == "float" {
@@ -1301,7 +1316,7 @@ fn check_expr(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, expected
     } else if k == "ident" {
         let b: Binding = lookup_binding(env, ctx.exprs[e].name)
         if b.t == "" {
-            cerr(ctx.exprs[e].line, "bien khong ton tai: " + ctx.exprs[e].name)
+            cerr(ctx.exprs[e].line, "variable does not exist: " + ctx.exprs[e].name)
         }
         ctx.exprs[e].t = b.t
     } else if k == "bin" {
@@ -1310,35 +1325,35 @@ fn check_expr(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, expected
         let vt: str = check_expr(ctx, env, cur, ctx.exprs[e].left, "")
         if ctx.exprs[e].op == "!" {
             if vt != "bool" {
-                cerr(ctx.exprs[e].line, "toan tu ! can bool, nhan " + vt)
+                cerr(ctx.exprs[e].line, "operator ! expects bool, got " + vt)
             }
             ctx.exprs[e].t = "bool"
         } else {
             if vt != "int" && vt != "float" {
-                cerr(ctx.exprs[e].line, "toan tu - can int/float, nhan " + vt)
+                cerr(ctx.exprs[e].line, "operator - expects int/float, got " + vt)
             }
             ctx.exprs[e].t = vt
         }
     } else if k == "index" {
         let tt: str = check_expr(ctx, env, cur, ctx.exprs[e].left, "")
         if tt == "never" {
-            cerr(ctx.exprs[e].line, "gia tri khong the dung trong bieu thuc")
+            cerr(ctx.exprs[e].line, "never value cannot be used in expression")
         }
         if !is_list_t(tt) {
-            cerr(ctx.exprs[e].line, "khong the dung chi so tren kieu " + tt)
+            cerr(ctx.exprs[e].line, "cannot use index on type " + tt)
         }
         let it: str = check_expr(ctx, env, cur, ctx.exprs[e].right, "")
         if it != "int" {
-            cerr(ctx.exprs[e].line, "chi so phai la int, nhan " + it)
+            cerr(ctx.exprs[e].line, "index must be int, got " + it)
         }
         ctx.exprs[e].t = list_elem_t(tt)
     } else if k == "field" {
         let tt: str = check_expr(ctx, env, cur, ctx.exprs[e].left, "")
         if tt == "never" {
-            cerr(ctx.exprs[e].line, "gia tri khong the dung trong bieu thuc")
+            cerr(ctx.exprs[e].line, "never value cannot be used in expression")
         }
         if !ctx.structs.has(tt) {
-            cerr(ctx.exprs[e].line, "khong the truy cap truong tren kieu " + tt)
+            cerr(ctx.exprs[e].line, "cannot access field on type " + tt)
         }
         ctx.exprs[e].t = field_type(ctx, tt, ctx.exprs[e].name, ctx.exprs[e].line)
     } else if k == "call" {
@@ -1351,11 +1366,11 @@ fn check_expr(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, expected
         ctx.exprs[e].t = check_structlit(ctx, env, cur, e)
     } else if k == "mapnew" {
         if expected == "" || !is_map_t(expected) {
-            cerr(ctx.exprs[e].line, "map_new() can kieu 'map[str, T]' duoc khai bao o ngu canh")
+            cerr(ctx.exprs[e].line, "map_new() requires a 'map[str, T]' type in the surrounding context")
         }
         ctx.exprs[e].t = expected
     } else {
-        cerr(ctx.exprs[e].line, "bieu thuc khong xac dinh: " + k)
+        cerr(ctx.exprs[e].line, "unknown expression: " + k)
     }
     return ctx.exprs[e].t
 }
@@ -1365,24 +1380,24 @@ fn check_bin(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int) -> str {
     let lt: str = check_expr(ctx, env, cur, ctx.exprs[e].left, "")
     let rt: str = check_expr(ctx, env, cur, ctx.exprs[e].right, "")
     if lt == "never" || rt == "never" {
-        cerr(line, "gia tri khong the dung trong bieu thuc")
+        cerr(line, "never value cannot be used in expression")
     }
     let op: str = ctx.exprs[e].op
     if op == "||" || op == "&&" {
         if lt != "bool" || rt != "bool" {
-            cerr(line, "toan tu " + op + " can bool, nhan " + lt + " va " + rt)
+            cerr(line, "operator " + op + " expects bool, got " + lt + " and " + rt)
         }
         return "bool"
     }
     if op == "==" || op == "!=" {
         if lt != rt || (lt != "int" && lt != "float" && lt != "bool" && lt != "str") {
-            cerr(line, "khong the so sanh == giua " + lt + " va " + rt)
+            cerr(line, "cannot compare == between " + lt + " and " + rt)
         }
         return "bool"
     }
     if op == "<" || op == "<=" || op == ">" || op == ">=" {
         if lt != rt || (lt != "int" && lt != "float" && lt != "str") {
-            cerr(line, "khong the so sanh thu tu giua " + lt + " va " + rt)
+            cerr(line, "cannot compare ordering between " + lt + " and " + rt)
         }
         return "bool"
     }
@@ -1396,7 +1411,7 @@ fn check_bin(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int) -> str {
         if lt == "str" && rt == "str" {
             return "str"
         }
-        cerr(line, "toan tu + khong ho tro " + lt + " va " + rt)
+        cerr(line, "operator + does not support " + lt + " and " + rt)
     }
     if op == "-" || op == "*" || op == "/" || op == "%" {
         if lt == "int" && rt == "int" {
@@ -1405,9 +1420,9 @@ fn check_bin(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int) -> str {
         if lt == "float" && rt == "float" {
             return "float"
         }
-        cerr(line, "toan tu " + op + " khong ho tro " + lt + " va " + rt)
+        cerr(line, "operator " + op + " does not support " + lt + " and " + rt)
     }
-    cerr(line, "toan tu khong xac dinh: " + op)
+    cerr(line, "unknown operator: " + op)
     return ""
 }
 
@@ -1418,18 +1433,18 @@ fn check_listlit(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, expec
     }
     if elem == "" {
         if ctx.exprs[e].args.len() == 0 {
-            cerr(ctx.exprs[e].line, "literal danh sach rong can kieu duoc khai bao o ngu canh")
+            cerr(ctx.exprs[e].line, "empty list literal requires a type in the surrounding context")
         }
         elem = check_expr(ctx, env, cur, ctx.exprs[e].args.get(0), "")
         if elem == "void" || elem == "never" {
-            cerr(ctx.exprs[e].line, "phan tu danh sach khong the co kieu " + elem)
+            cerr(ctx.exprs[e].line, "list element cannot have type " + elem)
         }
     }
     let mut i: int = 0
     while i < ctx.exprs[e].args.len() {
         let vt: str = check_expr(ctx, env, cur, ctx.exprs[e].args.get(i), elem)
         if vt != elem {
-            cerr(ctx.exprs[e].line, "phan tu danh sach khong khop: can " + elem + ", nhan " + vt)
+            cerr(ctx.exprs[e].line, "list element mismatch: expected " + elem + ", got " + vt)
         }
         i = i + 1
     }
@@ -1440,20 +1455,20 @@ fn check_structlit(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int) -> 
     let name: str = ctx.exprs[e].name
     let mut line: int = ctx.exprs[e].line
     if !ctx.structs.has(name) {
-        cerr(line, "struct khong ton tai: " + name)
+        cerr(line, "struct does not exist: " + name)
     }
     let st: StructInfo = ctx.structs.get_or(name, dummy_struct())
     if ctx.exprs[e].ffields.len() != st.fields.len() {
-        cerr(line, "literal struct " + name + " can dung " + st.fields.len().to_str() + " truong, nhan " + ctx.exprs[e].ffields.len().to_str())
+        cerr(line, "struct literal " + name + " requires exactly " + st.fields.len().to_str() + " fields, got " + ctx.exprs[e].ffields.len().to_str())
     }
     let mut i: int = 0
     while i < st.fields.len() {
         if ctx.exprs[e].ffields.get(i) != st.fields.get(i) {
-            cerr(line, "thu tu truong khong dung: mong doi '" + st.fields.get(i) + "', nhan '" + ctx.exprs[e].ffields.get(i) + "'")
+            cerr(line, "field order mismatch: expected '" + st.fields.get(i) + "', got '" + ctx.exprs[e].ffields.get(i) + "'")
         }
         let vt: str = check_expr(ctx, env, cur, ctx.exprs[e].args.get(i), st.ftypes.get(i))
         if vt != st.ftypes.get(i) {
-            cerr(line, "kieu truong " + st.fields.get(i) + " khong khop: can " + st.ftypes.get(i) + ", nhan " + vt)
+            cerr(line, "field type " + st.fields.get(i) + " mismatch: expected " + st.ftypes.get(i) + ", got " + vt)
         }
         i = i + 1
     }
@@ -1471,25 +1486,25 @@ fn check_call(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, expected
     if ctx.fns.has(name) {
         let f: FnInfo = ctx.fns.get_or(name, dummy_fn())
         if f.is_method {
-            cerr(line, "phuong thuc phai duoc goi qua doi tuong: " + name)
+            cerr(line, "method must be called through an object: " + name)
         }
         ctx.exprs[e].muser = true
         ctx.exprs[e].mkey = name
         add_edge(ctx, cur, name)
         if ctx.exprs[e].args.len() != f.params.len() {
-            cerr(line, "ham " + name + " can " + f.params.len().to_str() + " doi so, nhan " + ctx.exprs[e].args.len().to_str())
+            cerr(line, "function " + name + " expects " + f.params.len().to_str() + " arguments, got " + ctx.exprs[e].args.len().to_str())
         }
         let mut i: int = 0
         while i < ctx.exprs[e].args.len() {
             let at: str = check_expr(ctx, env, cur, ctx.exprs[e].args.get(i), f.ptypes.get(i))
             if at != f.ptypes.get(i) {
-                cerr(line, "doi so '" + f.params.get(i) + "' cua " + name + " can " + f.ptypes.get(i) + ", nhan " + at)
+                cerr(line, "argument '" + f.params.get(i) + "' of " + name + " expects " + f.ptypes.get(i) + ", got " + at)
             }
             i = i + 1
         }
         return f.ret
     }
-    cerr(line, "ham khong ton tai: " + name)
+    cerr(line, "function does not exist: " + name)
     return ""
 }
 
@@ -1505,106 +1520,113 @@ fn check_builtin_call(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, 
     let mut j: int = 0
     while j < nargs {
         if argt.get(j) == "never" {
-            cerr(line, "gia tri khong the dung lam doi so")
+            cerr(line, "never value cannot be used as an argument")
         }
         j = j + 1
     }
     if name == "print" || name == "println" {
         if nargs != 1 || argt.get(0) != "str" {
-            cerr(line, name + " can 1 doi so str")
+            cerr(line, name + " expects 1 str argument")
         }
         add_edge(ctx, cur, "b:print")
         return "void"
     }
     if name == "panic" {
         if nargs != 1 || argt.get(0) != "str" {
-            cerr(line, "panic can 1 doi so str")
+            cerr(line, "panic expects 1 str argument")
         }
         return "never"
     }
     if name == "exit" {
         if nargs != 1 || argt.get(0) != "int" {
-            cerr(line, "exit can 1 doi so int")
+            cerr(line, "exit expects 1 int argument")
         }
         add_edge(ctx, cur, "b:exit")
         return "never"
     }
     if name == "str" {
         if nargs != 1 {
-            cerr(line, "str() can 1 doi so")
+            cerr(line, "str() expects 1 argument")
         }
         let a0: str = argt.get(0)
         if a0 != "int" && a0 != "float" && a0 != "bool" && a0 != "str" {
-            cerr(line, "str() khong ho tro kieu " + a0)
+            cerr(line, "str() does not support type " + a0)
         }
         return "str"
     }
     if name == "int" {
         if nargs != 1 || argt.get(0) != "str" {
-            cerr(line, "int() can 1 doi so str")
+            cerr(line, "int() expects 1 str argument")
         }
         return "int"
     }
     if name == "len" {
         if nargs != 1 {
-            cerr(line, "len() can 1 doi so")
+            cerr(line, "len() expects 1 argument")
         }
         let a0: str = argt.get(0)
         if a0 != "str" && !is_list_t(a0) && !is_map_t(a0) {
-            cerr(line, "len() khong ho tro kieu " + a0)
+            cerr(line, "len() does not support type " + a0)
         }
         return "int"
     }
     if name == "range" {
         if nargs != 2 || argt.get(0) != "int" || argt.get(1) != "int" {
-            cerr(line, "range() can 2 doi so int")
+            cerr(line, "range() expects 2 int arguments")
         }
         return "list[int]"
     }
     if name == "map_new" {
         if nargs != 0 {
-            cerr(line, "map_new() khong co doi so")
+            cerr(line, "map_new() takes no arguments")
         }
         if expected == "" || !is_map_t(expected) {
-            cerr(line, "map_new() can kieu 'map[str, T]' duoc khai bao o ngu canh")
+            cerr(line, "map_new() requires a 'map[str, T]' type in the surrounding context")
         }
         return expected
     }
     if name == "read_file" {
         if nargs != 1 || argt.get(0) != "str" {
-            cerr(line, "read_file() can 1 doi so str")
+            cerr(line, "read_file() expects 1 str argument")
         }
         add_edge(ctx, cur, "b:read_file")
         return "str"
     }
     if name == "write_file" {
         if nargs != 2 || argt.get(0) != "str" || argt.get(1) != "str" {
-            cerr(line, "write_file() can 2 doi so str")
+            cerr(line, "write_file() expects 2 str arguments")
         }
         add_edge(ctx, cur, "b:write_file")
         return "void"
     }
     if name == "args" {
         if nargs != 0 {
-            cerr(line, "args() khong co doi so")
+            cerr(line, "args() takes no arguments")
         }
         add_edge(ctx, cur, "b:args")
         return "list[str]"
     }
     if name == "clock_ms" {
         if nargs != 0 {
-            cerr(line, "clock_ms() khong co doi so")
+            cerr(line, "clock_ms() takes no arguments")
         }
         add_edge(ctx, cur, "b:clock_ms")
         return "int"
     }
     if name == "chr" {
         if nargs != 1 || argt.get(0) != "int" {
-            cerr(line, "chr() can 1 doi so int")
+            cerr(line, "chr() expects 1 int argument")
         }
         return "str"
     }
-    cerr(line, "ham builtin khong xac dinh: " + name)
+    if name == "file_exists" {
+        if nargs != 1 || argt.get(0) != "str" {
+            cerr(line, "file_exists() expects 1 str argument")
+        }
+        add_edge(ctx, cur, "b:file_exists")
+        return "bool"
+    }
+    cerr(line, "unknown builtin function: " + name)
     return ""
 }
 
@@ -1613,11 +1635,11 @@ fn check_method(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int) -> str
     let mut line: int = ctx.exprs[e].line
     let tt: str = check_expr(ctx, env, cur, ctx.exprs[e].left, "")
     if tt == "never" {
-        cerr(line, "gia tri khong the dung trong bieu thuc")
+        cerr(line, "never value cannot be used in expression")
     }
     let nargs: int = ctx.exprs[e].args.len()
     if ctx.structs.has(tt) {
-        # phuong thuc cua struct (nguoi dung dinh nghia)
+        # user-defined struct method
         let cands: list[str] = ctx.methods_of.get_or(tt, [])
         let mut key: str = ""
         let mut i: int = 0
@@ -1629,7 +1651,7 @@ fn check_method(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int) -> str
             i = i + 1
         }
         if key == "" {
-            cerr(line, "struct " + tt + " khong co phuong thuc " + name)
+            cerr(line, "struct " + tt + " has no method " + name)
         }
         ctx.exprs[e].muser = true
         ctx.exprs[e].mkey = key
@@ -1637,19 +1659,19 @@ fn check_method(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int) -> str
         let f: FnInfo = ctx.fns.get_or(key, dummy_fn())
         let np: int = f.params.len() - 1
         if nargs != np {
-            cerr(line, tt + "." + name + " can " + np.to_str() + " doi so, nhan " + nargs.to_str())
+            cerr(line, tt + "." + name + " expects " + np.to_str() + " arguments, got " + nargs.to_str())
         }
         let mut mi: int = 0
         while mi < nargs {
             let at: str = check_expr(ctx, env, cur, ctx.exprs[e].args.get(mi), f.ptypes.get(mi + 1))
             if at != f.ptypes.get(mi + 1) {
-                cerr(line, "doi so '" + f.params.get(mi + 1) + "' cua " + tt + "." + name + " can " + f.ptypes.get(mi + 1) + ", nhan " + at)
+                cerr(line, "argument '" + f.params.get(mi + 1) + "' of " + tt + "." + name + " expects " + f.ptypes.get(mi + 1) + ", got " + at)
             }
             mi = mi + 1
         }
         return f.ret
     }
-    # phuong thuc builtin: bang ptypes + ret theo kieu doi tuong
+    # builtin method: ptypes + ret table by target type
     let ptypes: list[str] = []
     let mut ret: str = ""
     if tt == "str" {
@@ -1687,23 +1709,23 @@ fn check_method(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int) -> str
         else if name == "to_int" { ret = "int" }
         else if name == "to_float" { ret = "float" }
         else if name == "to_str" { ret = "str" }
-        else { cerr(line, "str khong co phuong thuc " + name) }
+        else { cerr(line, "str has no method " + name) }
         ctx.exprs[e].mop = "str." + name
     } else if tt == "int" {
         if name == "to_str" { ret = "str" }
         else if name == "to_float" { ret = "float" }
         else if name == "abs" { ret = "int" }
-        else { cerr(line, "int khong co phuong thuc " + name) }
+        else { cerr(line, "int has no method " + name) }
         ctx.exprs[e].mop = "int." + name
     } else if tt == "float" {
         if name == "to_str" { ret = "str" }
         else if name == "to_int" { ret = "int" }
         else if name == "abs" { ret = "float" }
-        else { cerr(line, "float khong co phuong thuc " + name) }
+        else { cerr(line, "float has no method " + name) }
         ctx.exprs[e].mop = "float." + name
     } else if tt == "bool" {
         if name == "to_str" { ret = "str" }
-        else { cerr(line, "bool khong co phuong thuc " + name) }
+        else { cerr(line, "bool has no method " + name) }
         ctx.exprs[e].mop = "bool." + name
     } else if is_list_t(tt) {
         let mut elem: str = list_elem_t(tt)
@@ -1722,7 +1744,7 @@ fn check_method(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int) -> str
         ret = "void"
     }
         else if name == "pop" { ret = elem }
-        else { cerr(line, "list khong co phuong thuc " + name) }
+        else { cerr(line, "list has no method " + name) }
         ctx.exprs[e].mop = "list." + name
     } else if is_map_t(tt) {
         let vt: str = map_val_t(tt)
@@ -1742,20 +1764,20 @@ fn check_method(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int) -> str
         ret = "bool"
     }
         else if name == "keys" { ret = "list[str]" }
-        else { cerr(line, "map khong co phuong thuc " + name) }
+        else { cerr(line, "map has no method " + name) }
         ctx.exprs[e].mop = "map." + name
     } else {
-        cerr(line, "khong the goi phuong thuc tren kieu " + tt)
+        cerr(line, "cannot call method on type " + tt)
     }
     ctx.exprs[e].muser = false
     if nargs != ptypes.len() {
-        cerr(line, tt + "." + name + " can " + ptypes.len().to_str() + " doi so, nhan " + nargs.to_str())
+        cerr(line, tt + "." + name + " expects " + ptypes.len().to_str() + " arguments, got " + nargs.to_str())
     }
     let mut i: int = 0
     while i < nargs {
         let at: str = check_expr(ctx, env, cur, ctx.exprs[e].args.get(i), ptypes.get(i))
         if at != ptypes.get(i) {
-            cerr(line, "doi so cua " + tt + "." + name + " can " + ptypes.get(i) + ", nhan " + at)
+            cerr(line, "argument of " + tt + "." + name + " expects " + ptypes.get(i) + ", got " + at)
         }
         i = i + 1
     }
@@ -1797,7 +1819,7 @@ fn check_effects(ctx: Ctx) -> void {
             i2 = i2 + 1
         }
     }
-    # bao cao vi pham
+    # report violations
     let mut i3: int = 0
     while i3 < ctx.fn_order.len() {
         let mut key: str = ctx.fn_order.get(i3)
@@ -1812,7 +1834,7 @@ fn check_effects(ctx: Ctx) -> void {
                     if c.starts_with("b:") {
                         nm = c.slice(2, c.len())
                     }
-                    cerr(f.line, "ham '" + f.name + "' goi '" + nm + "' (IO) nhung khong khai bao 'uses IO'")
+                    cerr(f.line, "function '" + f.name + "' calls '" + nm + "' (IO) but does not declare 'uses IO'")
                 }
                 j = j + 1
             }
@@ -1822,7 +1844,7 @@ fn check_effects(ctx: Ctx) -> void {
 }
 
 # ------------------------------------------------------------------------
-# 4b. RUNTIME C (nhung truc tiep — phat sinh tuh runtime da kiem thu)
+# 4b. C RUNTIME (embedded directly — generated from the tested runtime)
 # ------------------------------------------------------------------------
 
 fn runtime_lines() -> list[str] {
@@ -1835,12 +1857,13 @@ fn runtime_lines() -> list[str] {
     r.push("#include <inttypes.h>")
     r.push("#include <time.h>")
     r.push("#include <math.h>")
+    r.push("#include <sys/stat.h>")
     r.push("")
     r.push("typedef struct { int64_t len; char* data; } hl_str;")
     r.push("typedef struct { int64_t len; int64_t cap; void** items; } hl_list;")
     r.push("typedef struct { int64_t len; int64_t cap; hl_str** slots; void** vals; hl_list* order; } hl_map;")
     r.push("")
-    r.push("// Chuỗi (byte string) có kiểm tra — dùng cho runtime HLS")
+    r.push("// Checked byte string — used by the HLS runtime")
     r.push("static void hl_die(const char* msg) {")
     r.push("    fflush(stdout);")
     r.push("    fprintf(stderr, \"panic: %s\\n\", msg);")
@@ -1849,10 +1872,10 @@ fn runtime_lines() -> list[str] {
     r.push("")
     r.push("static hl_str* hl_str_alloc(int64_t len) {")
     r.push("    hl_str* s = (hl_str*)malloc(sizeof(hl_str));")
-    r.push("    if (!s) hl_die(\"het bo nho\");")
+    r.push("    if (!s) hl_die(\"out of memory\");")
     r.push("    s->len = len;")
     r.push("    s->data = (char*)malloc((size_t)len + 1);")
-    r.push("    if (!s->data) hl_die(\"het bo nho\");")
+    r.push("    if (!s->data) hl_die(\"out of memory\");")
     r.push("    s->data[len] = 0;")
     r.push("    return s;")
     r.push("}")
@@ -1887,12 +1910,12 @@ fn runtime_lines() -> list[str] {
     r.push("static int64_t hl_str_len(hl_str* s) { return s->len; }")
     r.push("")
     r.push("static int64_t hl_str_byte_at(hl_str* s, int64_t i) {")
-    r.push("    if (i < 0 || i >= s->len) hl_die(\"truy cap chuoi ngoai pham vi\");")
+    r.push("    if (i < 0 || i >= s->len) hl_die(\"string access out of bounds\");")
     r.push("    return (unsigned char)s->data[i];")
     r.push("}")
     r.push("")
     r.push("static hl_str* hl_str_slice(hl_str* s, int64_t a, int64_t b) {")
-    r.push("    if (a < 0 || b < a || b > s->len) hl_die(\"slice chuoi khong hop le\");")
+    r.push("    if (a < 0 || b < a || b > s->len) hl_die(\"invalid string slice\");")
     r.push("    return hl_str_from(s->data + a, b - a);")
     r.push("}")
     r.push("")
@@ -1926,22 +1949,22 @@ fn runtime_lines() -> list[str] {
     r.push("    int64_t i = 0;")
     r.push("    uint64_t uv = 0;")
     r.push("    bool neg = false;")
-    r.push("    if (s->len == 0) hl_die(\"khong the doi chuoi thanh int\");")
+    r.push("    if (s->len == 0) hl_die(\"cannot convert string to int\");")
     r.push("    if (s->data[0] == '-') { neg = true; i = 1; }")
-    r.push("    if (i >= s->len) hl_die(\"khong the doi chuoi thanh int\");")
+    r.push("    if (i >= s->len) hl_die(\"cannot convert string to int\");")
     r.push("    for (; i < s->len; i++) {")
     r.push("        char c = s->data[i];")
-    r.push("        if (c < '0' || c > '9') hl_die(\"khong the doi chuoi thanh int\");")
+    r.push("        if (c < '0' || c > '9') hl_die(\"cannot convert string to int\");")
     r.push("        if (uv > (UINT64_C(9223372036854775808) - (uint64_t)(c - '0')) / 10) {")
-    r.push("            hl_die(\"so nguyen qua lon khi doi chuoi\");")
+    r.push("            hl_die(\"integer too large when converting string\");")
     r.push("        }")
     r.push("        uv = uv * 10 + (uint64_t)(c - '0');")
     r.push("    }")
     r.push("    if (neg) {")
-    r.push("        if (uv > UINT64_C(9223372036854775808)) hl_die(\"so nguyen qua lon khi doi chuoi\");")
+    r.push("        if (uv > UINT64_C(9223372036854775808)) hl_die(\"integer too large when converting string\");")
     r.push("        return (int64_t)(-(int64_t)(uv - 1) - 1);")
     r.push("    }")
-    r.push("    if (uv > (uint64_t)INT64_MAX) hl_die(\"so nguyen qua lon khi doi chuoi\");")
+    r.push("    if (uv > (uint64_t)INT64_MAX) hl_die(\"integer too large when converting string\");")
     r.push("    return (int64_t)uv;")
     r.push("}")
     r.push("")
@@ -1962,11 +1985,11 @@ fn runtime_lines() -> list[str] {
     r.push("    return v ? hl_str_from(\"true\", 4) : hl_str_from(\"false\", 5);")
     r.push("}")
     r.push("")
-    r.push("// Danh sách động (box giá trị), bảng băm map[str,T] giữ thứ tự chèn,")
-    r.push("// số học int64 kiểm tra tràn, và I/O")
+    r.push("// Dynamic list (boxed values), insertion-ordered map[str,T] hash table,")
+    r.push("// checked int64 arithmetic, and I/O")
     r.push("static void* hl_box_i64(int64_t v) {")
     r.push("    int64_t* p = (int64_t*)malloc(sizeof(int64_t));")
-    r.push("    if (!p) hl_die(\"het bo nho\");")
+    r.push("    if (!p) hl_die(\"out of memory\");")
     r.push("    *p = v;")
     r.push("    return p;")
     r.push("}")
@@ -1974,7 +1997,7 @@ fn runtime_lines() -> list[str] {
     r.push("")
     r.push("static void* hl_box_f64(double v) {")
     r.push("    double* p = (double*)malloc(sizeof(double));")
-    r.push("    if (!p) hl_die(\"het bo nho\");")
+    r.push("    if (!p) hl_die(\"out of memory\");")
     r.push("    *p = v;")
     r.push("    return p;")
     r.push("}")
@@ -1982,7 +2005,7 @@ fn runtime_lines() -> list[str] {
     r.push("")
     r.push("static void* hl_box_bool(bool v) {")
     r.push("    bool* p = (bool*)malloc(sizeof(bool));")
-    r.push("    if (!p) hl_die(\"het bo nho\");")
+    r.push("    if (!p) hl_die(\"out of memory\");")
     r.push("    *p = v;")
     r.push("    return p;")
     r.push("}")
@@ -1993,11 +2016,11 @@ fn runtime_lines() -> list[str] {
     r.push("")
     r.push("static hl_list* hl_list_new(void) {")
     r.push("    hl_list* l = (hl_list*)malloc(sizeof(hl_list));")
-    r.push("    if (!l) hl_die(\"het bo nho\");")
+    r.push("    if (!l) hl_die(\"out of memory\");")
     r.push("    l->len = 0;")
     r.push("    l->cap = 8;")
     r.push("    l->items = (void**)malloc((size_t)l->cap * sizeof(void*));")
-    r.push("    if (!l->items) hl_die(\"het bo nho\");")
+    r.push("    if (!l->items) hl_die(\"out of memory\");")
     r.push("    return l;")
     r.push("}")
     r.push("")
@@ -2005,7 +2028,7 @@ fn runtime_lines() -> list[str] {
     r.push("    if (l->len == l->cap) {")
     r.push("        l->cap *= 2;")
     r.push("        l->items = (void**)realloc(l->items, (size_t)l->cap * sizeof(void*));")
-    r.push("        if (!l->items) hl_die(\"het bo nho\");")
+    r.push("        if (!l->items) hl_die(\"out of memory\");")
     r.push("    }")
     r.push("    l->items[l->len] = v;")
     r.push("    l->len++;")
@@ -2014,12 +2037,12 @@ fn runtime_lines() -> list[str] {
     r.push("static int64_t hl_list_len(hl_list* l) { return l->len; }")
     r.push("")
     r.push("static void* hl_list_get(hl_list* l, int64_t i) {")
-    r.push("    if (i < 0 || i >= l->len) hl_die(\"truy cap mang ngoai pham vi\");")
+    r.push("    if (i < 0 || i >= l->len) hl_die(\"array access out of bounds\");")
     r.push("    return l->items[i];")
     r.push("}")
     r.push("")
     r.push("static void hl_list_set(hl_list* l, int64_t i, void* v) {")
-    r.push("    if (i < 0 || i >= l->len) hl_die(\"truy cap mang ngoai pham vi\");")
+    r.push("    if (i < 0 || i >= l->len) hl_die(\"array access out of bounds\");")
     r.push("    l->items[i] = v;")
     r.push("}")
     r.push("")
@@ -2029,7 +2052,7 @@ fn runtime_lines() -> list[str] {
     r.push("    return l;")
     r.push("}")
     r.push("")
-    r.push("// ---- map[str, T]: bảng băm tuyến tính + danh sách thứ tự chèn ----")
+    r.push("// ---- map[str, T]: linear-probing hash table + insertion-order list ----")
     r.push("static uint64_t hl_str_hash(hl_str* s) {")
     r.push("    uint64_t h = 1469598103934665603ULL;")
     r.push("    for (int64_t i = 0; i < s->len; i++) {")
@@ -2041,12 +2064,12 @@ fn runtime_lines() -> list[str] {
     r.push("")
     r.push("static hl_map* hl_map_new(void) {")
     r.push("    hl_map* m = (hl_map*)malloc(sizeof(hl_map));")
-    r.push("    if (!m) hl_die(\"het bo nho\");")
+    r.push("    if (!m) hl_die(\"out of memory\");")
     r.push("    m->len = 0;")
     r.push("    m->cap = 16;")
     r.push("    m->slots = (hl_str**)calloc((size_t)m->cap, sizeof(hl_str*));")
     r.push("    m->vals = (void**)malloc((size_t)m->cap * sizeof(void*));")
-    r.push("    if (!m->slots || !m->vals) hl_die(\"het bo nho\");")
+    r.push("    if (!m->slots || !m->vals) hl_die(\"out of memory\");")
     r.push("    m->order = hl_list_new();")
     r.push("    return m;")
     r.push("}")
@@ -2056,7 +2079,7 @@ fn runtime_lines() -> list[str] {
     r.push("        int64_t ncap = m->cap * 2;")
     r.push("        hl_str** nslots = (hl_str**)calloc((size_t)ncap, sizeof(hl_str*));")
     r.push("        void** nvals = (void**)malloc((size_t)ncap * sizeof(void*));")
-    r.push("        if (!nslots || !nvals) hl_die(\"het bo nho\");")
+    r.push("        if (!nslots || !nvals) hl_die(\"out of memory\");")
     r.push("        for (int64_t i = 0; i < m->cap; i++) {")
     r.push("            if (m->slots[i] != NULL) {")
     r.push("                uint64_t idx = hl_str_hash(m->slots[i]) & (uint64_t)(ncap - 1);")
@@ -2104,38 +2127,38 @@ fn runtime_lines() -> list[str] {
     r.push("    return r;")
     r.push("}")
     r.push("")
-    r.push("// ---- số học int64 kiểm tra tràn ----")
+    r.push("// ---- checked int64 arithmetic ----")
     r.push("static int64_t hl_add_i64(int64_t a, int64_t b) {")
     r.push("    int64_t r;")
-    r.push("    if (__builtin_add_overflow(a, b, &r)) hl_die(\"tran so nguyen (overflow)\");")
+    r.push("    if (__builtin_add_overflow(a, b, &r)) hl_die(\"integer overflow\");")
     r.push("    return r;")
     r.push("}")
     r.push("static int64_t hl_sub_i64(int64_t a, int64_t b) {")
     r.push("    int64_t r;")
-    r.push("    if (__builtin_sub_overflow(a, b, &r)) hl_die(\"tran so nguyen (overflow)\");")
+    r.push("    if (__builtin_sub_overflow(a, b, &r)) hl_die(\"integer overflow\");")
     r.push("    return r;")
     r.push("}")
     r.push("static int64_t hl_mul_i64(int64_t a, int64_t b) {")
     r.push("    int64_t r;")
-    r.push("    if (__builtin_mul_overflow(a, b, &r)) hl_die(\"tran so nguyen (overflow)\");")
+    r.push("    if (__builtin_mul_overflow(a, b, &r)) hl_die(\"integer overflow\");")
     r.push("    return r;")
     r.push("}")
     r.push("static int64_t hl_neg_i64(int64_t a) {")
-    r.push("    if (a == INT64_MIN) hl_die(\"tran so nguyen (overflow)\");")
+    r.push("    if (a == INT64_MIN) hl_die(\"integer overflow\");")
     r.push("    return -a;")
     r.push("}")
     r.push("static int64_t hl_abs_i64(int64_t a) {")
-    r.push("    if (a == INT64_MIN) hl_die(\"tran so nguyen (overflow)\");")
+    r.push("    if (a == INT64_MIN) hl_die(\"integer overflow\");")
     r.push("    return a < 0 ? -a : a;")
     r.push("}")
     r.push("static int64_t hl_div_i64(int64_t a, int64_t b) {")
-    r.push("    if (b == 0) hl_die(\"chia cho 0\");")
-    r.push("    if (a == INT64_MIN && b == -1) hl_die(\"tran so nguyen (overflow)\");")
+    r.push("    if (b == 0) hl_die(\"division by zero\");")
+    r.push("    if (a == INT64_MIN && b == -1) hl_die(\"integer overflow\");")
     r.push("    return a / b;")
     r.push("}")
     r.push("static int64_t hl_mod_i64(int64_t a, int64_t b) {")
-    r.push("    if (b == 0) hl_die(\"chia cho 0\");")
-    r.push("    if (a == INT64_MIN && b == -1) hl_die(\"tran so nguyen (overflow)\");")
+    r.push("    if (b == 0) hl_die(\"division by zero\");")
+    r.push("    if (a == INT64_MIN && b == -1) hl_die(\"integer overflow\");")
     r.push("    return a % b;")
     r.push("}")
     r.push("")
@@ -2160,25 +2183,25 @@ fn runtime_lines() -> list[str] {
     r.push("")
     r.push("static hl_str* hl_read_file(hl_str* path) {")
     r.push("    FILE* f = fopen(path->data, \"rb\");")
-    r.push("    if (!f) hl_die(\"khong the mo tep\");")
-    r.push("    if (fseek(f, 0, SEEK_END) != 0) hl_die(\"khong the mo tep\");")
+    r.push("    if (!f) hl_die(\"cannot open file\");")
+    r.push("    if (fseek(f, 0, SEEK_END) != 0) hl_die(\"cannot open file\");")
     r.push("    long sz = ftell(f);")
-    r.push("    if (sz < 0) hl_die(\"khong the mo tep\");")
+    r.push("    if (sz < 0) hl_die(\"cannot open file\");")
     r.push("    rewind(f);")
     r.push("    char* buf = (char*)malloc((size_t)sz + 1);")
-    r.push("    if (!buf) hl_die(\"het bo nho\");")
-    r.push("    if (sz > 0 && fread(buf, 1, (size_t)sz, f) != (size_t)sz) hl_die(\"khong the mo tep\");")
+    r.push("    if (!buf) hl_die(\"out of memory\");")
+    r.push("    if (sz > 0 && fread(buf, 1, (size_t)sz, f) != (size_t)sz) hl_die(\"cannot open file\");")
     r.push("    fclose(f);")
     r.push("    return hl_str_from(buf, sz);")
     r.push("}")
     r.push("")
     r.push("static void hl_write_file(hl_str* path, hl_str* content) {")
     r.push("    FILE* f = fopen(path->data, \"wb\");")
-    r.push("    if (!f) hl_die(\"khong the ghi tep\");")
+    r.push("    if (!f) hl_die(\"cannot write file\");")
     r.push("    if (content->len > 0 && fwrite(content->data, 1, (size_t)content->len, f) != (size_t)content->len) {")
-    r.push("        hl_die(\"khong the ghi tep\");")
+    r.push("        hl_die(\"cannot write file\");")
     r.push("    }")
-    r.push("    if (fclose(f) != 0) hl_die(\"khong the ghi tep\");")
+    r.push("    if (fclose(f) != 0) hl_die(\"cannot write file\");")
     r.push("}")
     r.push("")
     r.push("static int64_t hl_clock_ms(void) {")
@@ -2198,9 +2221,9 @@ fn runtime_lines() -> list[str] {
     r.push("    exit((int)code);")
     r.push("}")
     r.push("")
-    r.push("// Danh sách tách chuỗi (đặt cuối vì phụ thuộc hl_list)")
+    r.push("// String split helper (placed last because it depends on hl_list)")
     r.push("static hl_list* hl_str_split(hl_str* s, hl_str* sep) {")
-    r.push("    if (sep->len == 0) hl_die(\"phan tach chuoi rong khong hop le\");")
+    r.push("    if (sep->len == 0) hl_die(\"empty separator not allowed\");")
     r.push("    hl_list* out = hl_list_new();")
     r.push("    if (s->len == 0) {")
     r.push("        hl_list_push(out, hl_box_ptr(hl_str_from(\"\", 0)));")
@@ -2221,9 +2244,9 @@ fn runtime_lines() -> list[str] {
     r.push("    return out;")
     r.push("}")
     r.push("")
-    r.push("// ---- bổ sung cho v0.1.1: pop, float, chr, fmod ----")
+    r.push("// ---- v0.2 additions: pop, float, chr, fmod ----")
     r.push("static void* hl_list_pop(hl_list* l) {")
-    r.push("    if (l->len == 0) hl_die(\"truy cap mang ngoai pham vi\");")
+    r.push("    if (l->len == 0) hl_die(\"array access out of bounds\");")
     r.push("    l->len--;")
     r.push("    return l->items[l->len];")
     r.push("}")
@@ -2231,26 +2254,32 @@ fn runtime_lines() -> list[str] {
     r.push("static double hl_str_to_double(hl_str* s) {")
     r.push("    int64_t i = 0;")
     r.push("    int64_t dots = 0;")
-    r.push("    if (s->len == 0) hl_die(\"khong the doi chuoi thanh float\");")
+    r.push("    if (s->len == 0) hl_die(\"cannot convert string to float\");")
     r.push("    if (s->data[0] == '-') i = 1;")
-    r.push("    if (i >= s->len) hl_die(\"khong the doi chuoi thanh float\");")
+    r.push("    if (i >= s->len) hl_die(\"cannot convert string to float\");")
     r.push("    for (; i < s->len; i++) {")
     r.push("        char c = s->data[i];")
     r.push("        if (c == '.') { dots++; continue; }")
-    r.push("        if (c < '0' || c > '9') hl_die(\"khong the doi chuoi thanh float\");")
+    r.push("        if (c < '0' || c > '9') hl_die(\"cannot convert string to float\");")
     r.push("    }")
-    r.push("    if (dots > 1) hl_die(\"khong the doi chuoi thanh float\");")
+    r.push("    if (dots > 1) hl_die(\"cannot convert string to float\");")
     r.push("    return strtod(s->data, NULL);")
     r.push("}")
     r.push("")
     r.push("static hl_str* hl_chr(int64_t c) {")
-    r.push("    if (c < 0 || c > 255) hl_die(\"chr ngoai pham vi 0..255\");")
+    r.push("    if (c < 0 || c > 255) hl_die(\"chr out of range 0..255\");")
     r.push("    char b = (char)c;")
     r.push("    return hl_str_from(&b, 1);")
     r.push("}")
     r.push("")
     r.push("static double hl_fmod(double a, double b) {")
     r.push("    return fmod(a, b);")
+    r.push("}")
+    r.push("")
+    r.push("// file_exists: returns true if the path is a regular file")
+    r.push("static bool hl_file_exists(hl_str* path) {")
+    r.push("    struct stat st;")
+    r.push("    return stat(path->data, &st) == 0 && S_ISREG(st.st_mode);")
     r.push("}")
     r.push("")
     return r
@@ -2384,7 +2413,7 @@ fn fresh_tmp(ctx: Ctx, base: str) -> str {
 fn local_c(ctx: Ctx, name: str) -> str {
     let cn: str = ctx.gen_locals.get_or(name, "")
     if cn == "" {
-        panic("loi noi bo codegen: khong tim thay bien " + name)
+        panic("internal codegen error: variable not found " + name)
     }
     return cn
 }
@@ -2397,7 +2426,7 @@ fn concat_lines(dst: list[str], src: list[str]) -> void {
     }
 }
 
-# --- Sinh bieu thuc C ---
+# --- C expression generation ---
 
 fn gen_expr(ctx: Ctx, e: int) -> str {
     let mut k: str = ctx.exprs[e].kind
@@ -2465,13 +2494,13 @@ fn gen_expr(ctx: Ctx, e: int) -> str {
     if k == "mapnew" {
         return "hl_map_new()"
     }
-    panic("loi noi bo codegen: bieu thuc khong xac dinh " + k)
+    panic("internal codegen error: unknown expression " + k)
     return ""
 }
 
 fn gen_bin(ctx: Ctx, e: int) -> str {
     let op: str = ctx.exprs[e].op
-    # LUU Y: dispatch theo kieu TOAN HANG TRAI (khong phai kieu ket qua!)
+    # NOTE: dispatch on the LEFT OPERAND type (not the result type!)
     let t: str = ctx.exprs[ctx.exprs[e].left].t
     let a: str = gen_expr(ctx, ctx.exprs[e].left)
     let b: str = gen_expr(ctx, ctx.exprs[e].right)
@@ -2529,7 +2558,7 @@ fn gen_bin(ctx: Ctx, e: int) -> str {
         }
         return "hl_fmod(" + a + ", " + b + ")"
     }
-    panic("loi noi bo codegen: toan tu khong xac dinh " + op)
+    panic("internal codegen error: unknown operator " + op)
     return ""
 }
 
@@ -2608,7 +2637,10 @@ fn gen_call(ctx: Ctx, e: int) -> str {
     if name == "chr" {
         return "hl_chr(" + args + ")"
     }
-    panic("loi noi bo codegen: ham builtin khong xac dinh " + name)
+    if name == "file_exists" {
+        return "hl_file_exists(" + args + ")"
+    }
+    panic("internal codegen error: unknown builtin function " + name)
     return ""
 }
 
@@ -2721,7 +2753,7 @@ fn gen_method(ctx: Ctx, e: int) -> str {
     if op == "map.keys" {
         return "hl_map_keys(" + t0 + ")"
     }
-    panic("loi noi bo codegen: phuong thuc khong xac dinh " + op)
+    panic("internal codegen error: unknown method " + op)
     return ""
 }
 
@@ -2729,8 +2761,8 @@ fn gen_listlit(ctx: Ctx, e: int) -> str {
     ctx.lit_count = ctx.lit_count + 1
     let fname: str = "hl_lit_" + ctx.lit_count.to_str()
     let elem: str = list_elem_t(ctx.exprs[e].t)
-    # SINH GIA TRI PHAN TU TRUOC — helper cua literal long nhau phai
-    # nam hoan chinh truoc helper ngoai (thu tu khai bao C).
+    # EMIT ELEMENT VALUES FIRST — nested-literal helpers must
+    # appear completely before outer helpers (C declaration order).
     let vals: list[str] = []
     let mut i: int = 0
     while i < ctx.exprs[e].args.len() {
@@ -2750,7 +2782,7 @@ fn gen_listlit(ctx: Ctx, e: int) -> str {
     return fname + "()"
 }
 
-# --- Sinh cau lenh C ---
+# --- C statement generation ---
 
 fn gen_stmt(ctx: Ctx, sidx: int, ind: str) -> void {
     let s: StmtN = ctx.stmts[sidx]
@@ -2775,7 +2807,7 @@ fn gen_stmt(ctx: Ctx, sidx: int, ind: str) -> void {
         gen_stmts(ctx, s.body, ind + "    ")
         ctx.out.push(ind + "}")
     } else if s.kind == "for" {
-        # chup do dai mot lan (ngu van SPEC muc 5)
+        # snapshot length once (per SPEC section 5)
         let it_c: str = gen_expr(ctx, s.iter)
         let itn: str = fresh_tmp(ctx, "hlc_it")
         let itn_len: str = fresh_tmp(ctx, "hlc_n")
@@ -2805,7 +2837,7 @@ fn gen_stmt(ctx: Ctx, sidx: int, ind: str) -> void {
     } else if s.kind == "expr" {
         ctx.out.push(ind + gen_expr(ctx, s.e) + ";")
     } else {
-        panic("loi noi bo codegen: cau lenh khong xac dinh " + s.kind)
+        panic("internal codegen error: unknown statement " + s.kind)
     }
 }
 
@@ -2827,7 +2859,7 @@ fn gen_assign(ctx: Ctx, s: StmtN, ind: str) -> void {
         let base: str = gen_expr(ctx, ctx.exprs[tgt].left)
         ctx.out.push(ind + "(" + base + ")->" + ctx.exprs[tgt].name + " = " + v + ";")
     } else {
-        # gan chi so: hl_list_set(list, i, box(v))
+        # index assignment: hl_list_set(list, i, box(v))
         let lst: str = gen_expr(ctx, ctx.exprs[tgt].left)
         let idx: str = gen_expr(ctx, ctx.exprs[tgt].right)
         let mut elem: str = list_elem_t(ctx.exprs[ctx.exprs[tgt].left].t)
@@ -2835,7 +2867,7 @@ fn gen_assign(ctx: Ctx, s: StmtN, ind: str) -> void {
     }
 }
 
-# --- Sinh ham ---
+# --- Function generation ---
 
 fn gen_reset_fn(ctx: Ctx) -> void {
     ctx.gen_locals = map_new()
@@ -2878,7 +2910,7 @@ fn gen_struct_lines(ctx: Ctx) -> list[str] {
         }
         out.push("} " + st.name + ";")
         out.push("")
-        # ham dung
+        # constructor
         let ptypes_c: list[str] = []
         let assigns: list[str] = []
         let mut j2: int = 0
@@ -2889,7 +2921,7 @@ fn gen_struct_lines(ctx: Ctx) -> list[str] {
         }
         out.push("static " + st.name + "* usf_new_" + st.name + "(" + join(ptypes_c, ", ") + ") {")
         out.push("    " + st.name + "* p = (" + st.name + "*)malloc(sizeof(" + st.name + "));")
-        out.push("    if (!p) hl_die(\"het bo nho\");")
+        out.push("    if (!p) hl_die(\"out of memory\");")
         let mut k: int = 0
         while k < assigns.len() {
             out.push(assigns.get(k))
@@ -2929,7 +2961,7 @@ fn gen_proto_lines(ctx: Ctx) -> list[str] {
 }
 
 fn gen_program(ctx: Ctx) -> list[str] {
-    # 1. sinh than ham truoc (phat sinh cac ham ho tro literal danh sach)
+    # 1. emit function bodies first (produces list-literal helpers)
     ctx.out = []
     ctx.lit_helpers = []
     ctx.lit_count = 0
@@ -2940,11 +2972,11 @@ fn gen_program(ctx: Ctx) -> list[str] {
         i = i + 1
     }
     let bodies: list[str] = ctx.out
-    # 2. gop theo thu tu: header -> runtime -> struct -> proto -> lit -> body -> main
+    # 2. concatenate in order: header -> runtime -> struct -> proto -> lit -> body -> main
     let final: list[str] = []
     final.push("// =============================================================")
-    final.push("// Ma C duoc sinh BOI hlc — trinh bien dich Hieu Louis (HLS)")
-    final.push("// Nguon HLS duoc bien dich boi chinh hlc (tu dich).")
+    final.push("// C code generated BY hlc — the Hieu Louis compiler (HLS)")
+    final.push("// The HLS source is compiled by hlc itself (self-hosted).")
     final.push("// =============================================================")
     final.push("")
     concat_lines(final, runtime_lines())
@@ -2969,19 +3001,178 @@ fn gen_program(ctx: Ctx) -> list[str] {
 
 # ----------------------------------------------------------------------------
 # ----------------------------------------------------------------------------
-# 6. MAIN — pipeline day du: LEX -> PARSE -> CHECK -> GEN -> GHI RA C
+# 6. MAIN — full pipeline: LEX -> PARSE -> CHECK -> GEN -> WRITE C
 # ----------------------------------------------------------------------------
+
+# dir_of(path) returns the directory component of a path (everything before
+# the last '/'), or "." if the path has no slash.
+fn dir_of(path: str) -> str {
+    let mut i: int = path.len() - 1
+    while i >= 0 {
+        if path.byte_at(i) == 47 {
+            if i == 0 {
+                return "/"
+            }
+            return path.slice(0, i)
+        }
+        i = i - 1
+    }
+    return "."
+}
+
+# join_path(dir, rel) joins a directory and a relative path with a single
+# slash. Does NOT handle ".." — uses string concatenation.
+fn join_path(dir: str, rel: str) -> str {
+    if dir == "." {
+        return rel
+    }
+    if dir.len() == 0 {
+        return rel
+    }
+    if dir.byte_at(dir.len() - 1) == 47 {
+        return dir + rel
+    }
+    return dir + "/" + rel
+}
+
+# parent_dir(dir) returns the parent directory of dir.
+fn parent_dir(dir: str) -> str {
+    let mut i: int = dir.len() - 1
+    while i >= 0 {
+        if dir.byte_at(i) == 47 {
+            if i == 0 {
+                return "/"
+            }
+            return dir.slice(0, i)
+        }
+        i = i - 1
+    }
+    return "."
+}
+
+# resolve_import_path(imp, entry_dir, repo_root) returns the resolved file
+# path for an import, or "" if not found.
+# - "std.X" → searches several candidate locations for std/X.hls:
+#     <entry_dir>/std/X.hls
+#     <entry_dir>/../std/X.hls
+#     <entry_dir>/../../std/X.hls
+#     <entry_dir>/../../../std/X.hls
+#     <repo_root>/std/X.hls
+# - other  → relative to entry_dir
+fn resolve_import_path(imp: str, entry_dir: str, repo_root: str) -> str uses IO {
+    if imp.starts_with("std.") {
+        let module_name: str = imp.slice(4, imp.len())
+        let rel: str = "std/" + module_name + ".hls"
+        # Try walking up from entry_dir.
+        let mut d: str = entry_dir
+        let mut tries: int = 0
+        while tries < 5 {
+            let candidate: str = join_path(d, rel)
+            if file_exists(candidate) {
+                return candidate
+            }
+            let parent: str = parent_dir(d)
+            if parent == d {
+                break
+            }
+            d = parent
+            tries = tries + 1
+        }
+        # Fall back to repo_root.
+        let fallback: str = join_path(repo_root, rel)
+        if file_exists(fallback) {
+            return fallback
+        }
+        return ""
+    }
+    let direct: str = join_path(entry_dir, imp)
+    if file_exists(direct) {
+        return direct
+    }
+    return ""
+}
+
+# already_loaded(ctx, path) returns true if path has already been loaded.
+fn already_loaded(ctx: Ctx, path: str) -> bool {
+    let mut i: int = 0
+    while i < ctx.loaded_files.len() {
+        if ctx.loaded_files.get(i) == path {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+# load_file_into(ctx, abs_path) reads, lexes and parses abs_path into ctx.
+# Records the file as loaded to prevent cycles. Recursively processes the
+# imported file's own imports before its declarations are merged.
+fn load_file_into(ctx: Ctx, abs_path: str) -> void uses IO {
+    if already_loaded(ctx, abs_path) {
+        return
+    }
+    ctx.loaded_files.push(abs_path)
+    let file_dir: str = dir_of(abs_path)
+    let saved_src: str = ctx.src
+    let saved_toks: list[Tok] = ctx.toks
+    let saved_pos: int = ctx.pos
+    let saved_imports: list[str] = ctx.imports
+    ctx.src = read_file(abs_path)
+    ctx.toks = []
+    ctx.pos = 0
+    ctx.imports = []
+    lex(ctx)
+    parse_program(ctx)
+    # Process this file's imports recursively (depth-first).
+    let my_imports: list[str] = ctx.imports
+    let mut i: int = 0
+    while i < my_imports.len() {
+        let imp: str = my_imports.get(i)
+        let resolved: str = resolve_import_path(imp, file_dir, ctx.repo_root)
+        if resolved == "" {
+            panic("module not found: " + imp)
+        }
+        load_file_into(ctx, resolved)
+        i = i + 1
+    }
+    # Restore caller's lex state (structs/fns persist across files).
+    ctx.src = saved_src
+    ctx.toks = saved_toks
+    ctx.pos = saved_pos
+    ctx.imports = saved_imports
+}
 
 fn main() -> int uses IO {
     let a: list[str] = args()
     if a.len() < 3 {
-        println("cach dung: hlc <vao.hls> <ra.c | ->")
+        println("usage: hlc <input.hls> <output.c | ->")
         return 1
     }
-    let src: str = read_file(a.get(1))
+    let entry_path: str = a.get(1)
+    let src: str = read_file(entry_path)
     let ctx: Ctx = new_ctx(src)
+    ctx.entry_dir = dir_of(entry_path)
+    # The repo root is the parent of the entry file's directory when the
+    # entry file lives in src/, examples/, tests/, or boot/; otherwise it
+    # is the entry directory itself. We probe a few candidate paths.
+    ctx.repo_root = parent_dir(ctx.entry_dir)
+    # Lex + parse the entry file.
     lex(ctx)
     parse_program(ctx)
+    # Process the entry file's imports (recursively loads transitive deps).
+    let entry_imports: list[str] = ctx.imports
+    let mut i: int = 0
+    while i < entry_imports.len() {
+        let imp: str = entry_imports.get(i)
+        let resolved: str = resolve_import_path(imp, ctx.entry_dir, ctx.repo_root)
+        if resolved == "" {
+            println("error: module not found: " + imp)
+            return 1
+        }
+        load_file_into(ctx, resolved)
+        i = i + 1
+    }
+    # Mark the entry file as loaded too (for completeness).
     check_program(ctx)
     let lines: list[str] = gen_program(ctx)
     let code: str = join(lines, "\n")
@@ -2995,4 +3186,4 @@ fn main() -> int uses IO {
     return 0
 }
 
-# --- HET ---
+# --- END ---

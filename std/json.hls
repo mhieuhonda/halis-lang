@@ -1,0 +1,570 @@
+# ============================================================================
+# std/json.hls — A small JSON parser and serialiser for Hieu Louis
+# ----------------------------------------------------------------------------
+# Supports the full JSON data model: null, bool, int (in int64 range), float,
+# string, array, object. Strings are byte strings; \uXXXX escapes are decoded
+# to UTF-8 bytes. Encoder emits compact JSON.
+#
+# The JsonValue struct is a tagged union: kind is one of
+#   "null", "bool", "int", "float", "str", "array", "object"
+# and the corresponding field holds the value.
+# ============================================================================
+
+struct JsonValue {
+    kind: str,
+    bval: bool,
+    ival: int,
+    fval: float,
+    sval: str,
+    arr: list[JsonValue],
+    obj_keys: list[str],
+    obj_vals: list[JsonValue]
+}
+
+# ---- constructors ----
+
+fn json_null() -> JsonValue {
+    return JsonValue {
+        kind: "null", bval: false, ival: 0, fval: 0.0, sval: "",
+        arr: [], obj_keys: [], obj_vals: []
+    }
+}
+
+fn json_bool(v: bool) -> JsonValue {
+    return JsonValue {
+        kind: "bool", bval: v, ival: 0, fval: 0.0, sval: "",
+        arr: [], obj_keys: [], obj_vals: []
+    }
+}
+
+fn json_int(v: int) -> JsonValue {
+    return JsonValue {
+        kind: "int", bval: false, ival: v, fval: 0.0, sval: "",
+        arr: [], obj_keys: [], obj_vals: []
+    }
+}
+
+fn json_float(v: float) -> JsonValue {
+    return JsonValue {
+        kind: "float", bval: false, ival: 0, fval: v, sval: "",
+        arr: [], obj_keys: [], obj_vals: []
+    }
+}
+
+fn json_str(v: str) -> JsonValue {
+    return JsonValue {
+        kind: "str", bval: false, ival: 0, fval: 0.0, sval: v,
+        arr: [], obj_keys: [], obj_vals: []
+    }
+}
+
+fn json_array(items: list[JsonValue]) -> JsonValue {
+    return JsonValue {
+        kind: "array", bval: false, ival: 0, fval: 0.0, sval: "",
+        arr: items, obj_keys: [], obj_vals: []
+    }
+}
+
+fn json_object(keys: list[str], vals: list[JsonValue]) -> JsonValue {
+    return JsonValue {
+        kind: "object", bval: false, ival: 0, fval: 0.0, sval: "",
+        arr: [], obj_keys: keys, obj_vals: vals
+    }
+}
+
+# ---- helpers ----
+
+fn json_is_null(v: JsonValue) -> bool { return v.kind == "null" }
+fn json_is_bool(v: JsonValue) -> bool { return v.kind == "bool" }
+fn json_is_int(v: JsonValue) -> bool { return v.kind == "int" }
+fn json_is_float(v: JsonValue) -> bool { return v.kind == "float" }
+fn json_is_str(v: JsonValue) -> bool { return v.kind == "str" }
+fn json_is_array(v: JsonValue) -> bool { return v.kind == "array" }
+fn json_is_object(v: JsonValue) -> bool { return v.kind == "object" }
+
+# object_get(obj, key) returns the value for key, or null if absent.
+fn json_object_get(obj: JsonValue, key: str) -> JsonValue {
+    let mut i: int = 0
+    while i < obj.obj_keys.len() {
+        if obj.obj_keys.get(i) == key {
+            return obj.obj_vals.get(i)
+        }
+        i = i + 1
+    }
+    return json_null()
+}
+
+fn json_object_has(obj: JsonValue, key: str) -> bool {
+    let mut i: int = 0
+    while i < obj.obj_keys.len() {
+        if obj.obj_keys.get(i) == key {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+# ============================================================================
+# Parser
+# ============================================================================
+
+struct JsonParser {
+    src: str,
+    pos: int,
+    line: int
+}
+
+fn jsonp_err(p: JsonParser, msg: str) -> void {
+    panic("json parse error: " + msg + " (at line " + p.line.to_str() + ", offset " + p.pos.to_str() + ")")
+}
+
+fn jsonp_skip_ws(p: JsonParser) -> void {
+    let n: int = p.src.len()
+    while p.pos < n {
+        let b: int = p.src.byte_at(p.pos)
+        if b == 32 || b == 9 || b == 13 || b == 10 {
+            if b == 10 {
+                p.line = p.line + 1
+            }
+            p.pos = p.pos + 1
+        } else {
+            return
+        }
+    }
+}
+
+fn jsonp_parse_value(p: JsonParser) -> JsonValue {
+    jsonp_skip_ws(p)
+    let n: int = p.src.len()
+    if p.pos >= n {
+        jsonp_err(p, "unexpected end of input")
+    }
+    let c: int = p.src.byte_at(p.pos)
+    # double-quoted string
+    if c == 34 {
+        return jsonp_parse_string(p)
+    }
+    # object
+    if c == 123 {
+        return jsonp_parse_object(p)
+    }
+    # array
+    if c == 91 {
+        return jsonp_parse_array(p)
+    }
+    # number
+    if c == 45 || (c >= 48 && c <= 57) {
+        return jsonp_parse_number(p)
+    }
+    # keyword: true/false/null
+    if c == 116 {
+        return jsonp_parse_keyword(p, "true", json_bool(true))
+    }
+    if c == 102 {
+        return jsonp_parse_keyword(p, "false", json_bool(false))
+    }
+    if c == 110 {
+        return jsonp_parse_keyword(p, "null", json_null())
+    }
+    jsonp_err(p, "unexpected character")
+    return json_null()
+}
+
+fn jsonp_parse_keyword(p: JsonParser, word: str, val: JsonValue) -> JsonValue {
+    let n: int = word.len()
+    if p.pos + n > p.src.len() {
+        jsonp_err(p, "expected keyword '" + word + "'")
+    }
+    let s: str = p.src.slice(p.pos, p.pos + n)
+    if s != word {
+        jsonp_err(p, "expected keyword '" + word + "'")
+    }
+    p.pos = p.pos + n
+    return val
+}
+
+fn json_hex_digit(b: int) -> int {
+    if b >= 48 && b <= 57 {
+        return b - 48
+    }
+    if b >= 65 && b <= 70 {
+        return b - 55
+    }
+    if b >= 97 && b <= 102 {
+        return b - 87
+    }
+    return -1
+}
+
+# encode a unicode codepoint (0..65535) as UTF-8 bytes appended to chars.
+# HLS v0.2 has no bitwise operators, so we use arithmetic equivalents:
+#   x & 63   ->  x % 64
+#   x & 15   ->  x % 16
+#   x >> n   ->  x / (2^n)
+#   prefix | suffix  ->  prefix + suffix   (when prefix's low bits are 0)
+fn jsonp_push_utf8(chars: list[str], cp: int) -> void {
+    if cp < 128 {
+        chars.push(chr(cp))
+    } else if cp < 2048 {
+        chars.push(chr(192 + cp / 64))
+        chars.push(chr(128 + cp % 64))
+    } else {
+        chars.push(chr(224 + cp / 4096))
+        chars.push(chr(128 + (cp / 64) % 64))
+        chars.push(chr(128 + cp % 64))
+    }
+}
+
+fn jsonp_parse_string(p: JsonParser) -> JsonValue {
+    # consume opening quote
+    p.pos = p.pos + 1
+    let chars: list[str] = []
+    let n: int = p.src.len()
+    while p.pos < n {
+        let c: int = p.src.byte_at(p.pos)
+        if c == 34 {
+            p.pos = p.pos + 1
+            let parts: list[str] = []
+            let mut i: int = 0
+            let mut out: str = ""
+            while i < chars.len() {
+                out = out + chars.get(i)
+                i = i + 1
+            }
+            return json_str(out)
+        }
+        if c == 92 {
+            # escape
+            p.pos = p.pos + 1
+            if p.pos >= n {
+                jsonp_err(p, "unterminated string escape")
+            }
+            let e: int = p.src.byte_at(p.pos)
+            if e == 110 {
+                chars.push(chr(10))
+            } else if e == 116 {
+                chars.push(chr(9))
+            } else if e == 114 {
+                chars.push(chr(13))
+            } else if e == 34 {
+                chars.push(chr(34))
+            } else if e == 92 {
+                chars.push(chr(92))
+            } else if e == 47 {
+                chars.push(chr(47))
+            } else if e == 98 {
+                chars.push(chr(8))
+            } else if e == 102 {
+                chars.push(chr(12))
+            } else if e == 117 {
+                # \uXXXX
+                let mut code: int = 0
+                let mut k: int = 0
+                while k < 4 {
+                    p.pos = p.pos + 1
+                    if p.pos >= n {
+                        jsonp_err(p, "incomplete \\u escape")
+                    }
+                    let hd: int = json_hex_digit(p.src.byte_at(p.pos))
+                    if hd < 0 {
+                        jsonp_err(p, "invalid hex digit in \\u escape")
+                    }
+                    code = code * 16 + hd
+                    k = k + 1
+                }
+                jsonp_push_utf8(chars, code)
+            } else {
+                jsonp_err(p, "invalid escape sequence")
+            }
+            p.pos = p.pos + 1
+        } else {
+            if c < 32 {
+                jsonp_err(p, "unescaped control character in string")
+            }
+            chars.push(p.src.slice(p.pos, p.pos + 1))
+            p.pos = p.pos + 1
+        }
+    }
+    jsonp_err(p, "unterminated string")
+    return json_null()
+}
+
+fn jsonp_parse_number(p: JsonParser) -> JsonValue {
+    let start: int = p.pos
+    let n: int = p.src.len()
+    let mut is_float: bool = false
+    if p.pos < n && p.src.byte_at(p.pos) == 45 {
+        p.pos = p.pos + 1
+    }
+    while p.pos < n {
+        let c: int = p.src.byte_at(p.pos)
+        if c >= 48 && c <= 57 {
+            p.pos = p.pos + 1
+        } else {
+            break
+        }
+    }
+    if p.pos < n && p.src.byte_at(p.pos) == 46 {
+        is_float = true
+        p.pos = p.pos + 1
+        while p.pos < n {
+            let c: int = p.src.byte_at(p.pos)
+            if c >= 48 && c <= 57 {
+                p.pos = p.pos + 1
+            } else {
+                break
+            }
+        }
+    }
+    # exponent
+    if p.pos < n {
+        let c: int = p.src.byte_at(p.pos)
+        if c == 101 || c == 69 {
+            is_float = true
+            p.pos = p.pos + 1
+            if p.pos < n {
+                let s: int = p.src.byte_at(p.pos)
+                if s == 43 || s == 45 {
+                    p.pos = p.pos + 1
+                }
+            }
+            while p.pos < n {
+                let c2: int = p.src.byte_at(p.pos)
+                if c2 >= 48 && c2 <= 57 {
+                    p.pos = p.pos + 1
+                } else {
+                    break
+                }
+            }
+        }
+    }
+    let text: str = p.src.slice(start, p.pos)
+    if is_float {
+        return json_float(text.to_float())
+    }
+    return json_int(text.to_int())
+}
+
+fn jsonp_parse_array(p: JsonParser) -> JsonValue {
+    p.pos = p.pos + 1   # consume [
+    let items: list[JsonValue] = []
+    jsonp_skip_ws(p)
+    if p.pos < p.src.len() && p.src.byte_at(p.pos) == 93 {
+        p.pos = p.pos + 1
+        return json_array(items)
+    }
+    while true {
+        let v: JsonValue = jsonp_parse_value(p)
+        items.push(v)
+        jsonp_skip_ws(p)
+        if p.pos >= p.src.len() {
+            jsonp_err(p, "unterminated array")
+        }
+        let c: int = p.src.byte_at(p.pos)
+        if c == 44 {
+            p.pos = p.pos + 1
+        } else if c == 93 {
+            p.pos = p.pos + 1
+            return json_array(items)
+        } else {
+            jsonp_err(p, "expected ',' or ']' in array")
+        }
+    }
+    return json_array(items)
+}
+
+fn jsonp_parse_object(p: JsonParser) -> JsonValue {
+    p.pos = p.pos + 1   # consume {
+    let keys: list[str] = []
+    let vals: list[JsonValue] = []
+    jsonp_skip_ws(p)
+    if p.pos < p.src.len() && p.src.byte_at(p.pos) == 125 {
+        p.pos = p.pos + 1
+        return json_object(keys, vals)
+    }
+    while true {
+        jsonp_skip_ws(p)
+        if p.pos >= p.src.len() {
+            jsonp_err(p, "unterminated object")
+        }
+        if p.src.byte_at(p.pos) != 34 {
+            jsonp_err(p, "expected string key in object")
+        }
+        let key_val: JsonValue = jsonp_parse_string(p)
+        let key: str = key_val.sval
+        jsonp_skip_ws(p)
+        if p.pos >= p.src.len() || p.src.byte_at(p.pos) != 58 {
+            jsonp_err(p, "expected ':' after object key")
+        }
+        p.pos = p.pos + 1
+        let v: JsonValue = jsonp_parse_value(p)
+        keys.push(key)
+        vals.push(v)
+        jsonp_skip_ws(p)
+        if p.pos >= p.src.len() {
+            jsonp_err(p, "unterminated object")
+        }
+        let c: int = p.src.byte_at(p.pos)
+        if c == 44 {
+            p.pos = p.pos + 1
+        } else if c == 125 {
+            p.pos = p.pos + 1
+            return json_object(keys, vals)
+        } else {
+            jsonp_err(p, "expected ',' or '}' in object")
+        }
+    }
+    return json_object(keys, vals)
+}
+
+# json_parse(src) parses a JSON document and returns the root JsonValue.
+fn json_parse(src: str) -> JsonValue {
+    let p: JsonParser = JsonParser { src: src, pos: 0, line: 1 }
+    let v: JsonValue = jsonp_parse_value(p)
+    jsonp_skip_ws(p)
+    if p.pos != p.src.len() {
+        jsonp_err(p, "trailing data after JSON value")
+    }
+    return v
+}
+
+# ============================================================================
+# Serialiser
+# ============================================================================
+
+# jsonp_hex_digit(n) -> "0".."9","a".."f"
+fn jsonp_hex_digit(n: int) -> str {
+    if n < 10 {
+        return chr(48 + n)
+    }
+    return chr(97 + (n - 10))
+}
+
+# encode_json_string(s) returns s as a quoted JSON string literal.
+fn jsonp_encode_string(s: str) -> str {
+    let out: list[str] = []
+    out.push(chr(34))   # "
+    let n: int = s.len()
+    let mut i: int = 0
+    while i < n {
+        let b: int = s.byte_at(i)
+        if b == 34 {
+            out.push(chr(92))
+            out.push(chr(34))
+        } else if b == 92 {
+            out.push(chr(92))
+            out.push(chr(92))
+        } else if b == 10 {
+            out.push(chr(92))
+            out.push(chr(110))
+        } else if b == 9 {
+            out.push(chr(92))
+            out.push(chr(116))
+        } else if b == 13 {
+            out.push(chr(92))
+            out.push(chr(114))
+        } else if b == 8 {
+            out.push(chr(92))
+            out.push(chr(98))
+        } else if b == 12 {
+            out.push(chr(92))
+            out.push(chr(102))
+        } else if b < 32 {
+            # \u00XX
+            out.push(chr(92))
+            out.push(chr(117))
+            out.push(chr(48))
+            out.push(chr(48))
+            out.push(jsonp_hex_digit(b / 16))
+            out.push(jsonp_hex_digit(b % 16))
+        } else {
+            out.push(s.slice(i, i + 1))
+        }
+        i = i + 1
+    }
+    out.push(chr(34))
+    let mut r: str = ""
+    let mut j: int = 0
+    while j < out.len() {
+        r = r + out.get(j)
+        j = j + 1
+    }
+    return r
+}
+
+# json_stringify(v) returns the compact JSON representation of v.
+fn json_stringify(v: JsonValue) -> str {
+    if v.kind == "null" {
+        return "null"
+    }
+    if v.kind == "bool" {
+        if v.bval {
+            return "true"
+        }
+        return "false"
+    }
+    if v.kind == "int" {
+        return v.ival.to_str()
+    }
+    if v.kind == "float" {
+        # Trim trailing zeros from %.6f to look like JSON numbers when possible.
+        let raw: str = v.fval.to_str()
+        if raw.contains(".") {
+            # strip trailing zeros but keep at least one digit after the dot
+            let mut end: int = raw.len()
+            while end > 1 && raw.byte_at(end - 1) == 48 {
+                end = end - 1
+            }
+            if end > 0 && raw.byte_at(end - 1) == 46 {
+                # was "X.000000" → keep one zero after the dot
+                return raw.slice(0, end) + "0"
+            }
+            return raw.slice(0, end)
+        }
+        return raw
+    }
+    if v.kind == "str" {
+        return jsonp_encode_string(v.sval)
+    }
+    if v.kind == "array" {
+        let parts: list[str] = []
+        let mut i: int = 0
+        while i < v.arr.len() {
+            parts.push(json_stringify(v.arr.get(i)))
+            i = i + 1
+        }
+        let mut out: str = "["
+        let mut j: int = 0
+        while j < parts.len() {
+            if j > 0 {
+                out = out + ","
+            }
+            out = out + parts.get(j)
+            j = j + 1
+        }
+        out = out + "]"
+        return out
+    }
+    if v.kind == "object" {
+        let parts: list[str] = []
+        let mut i: int = 0
+        while i < v.obj_keys.len() {
+            parts.push(jsonp_encode_string(v.obj_keys.get(i)) + ":" + json_stringify(v.obj_vals.get(i)))
+            i = i + 1
+        }
+        let mut out: str = "{"
+        let mut j: int = 0
+        while j < parts.len() {
+            if j > 0 {
+                out = out + ","
+            }
+            out = out + parts.get(j)
+            j = j + 1
+        }
+        out = out + "}"
+        return out
+    }
+    panic("json_stringify: unknown kind")
+    return ""
+}

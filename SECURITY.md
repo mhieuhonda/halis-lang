@@ -1,38 +1,44 @@
-# Chính sách bảo mật — Hieu Louis (HLS)
+# Security policy — Hieu Louis (HLS)
 
-## Mô hình bảo mật của ngôn ngữ (v0.1)
+## Security model of the language (v0.2)
 
-Hieu Louis được thiết kế để **an toàn là trạng thái mặc định**. Ba lớp bảo vệ:
+Hieu Louis is designed so that **safety is the default state**. Three layers
+of defence:
 
-### Lớp 1 — Thời điểm biên dịch (tĩnh)
-- **Hệ thống hiệu ứng:** hàm không khai báo `uses IO` được *bảo đảm* không thể
-  thực hiện I/O (in, đọc/ghi tệp, tham số dòng lệnh, thoát, đồng hồ). Phân tích
-  bất động điểm trên đồ thị lời gọi tĩnh — không có đường lách qua gọi gián tiếp.
-- **Kiểu tĩnh tuyệt đối:** không ép kiểu ngầm, không suy luận lỏng, no shadowing,
-  điều kiện phải là `bool`, mọi liên kết khai báo kiểu.
-- **Không null / không chưa khởi tạo:** mọi biến gán ngay khi khai báo.
+### Layer 1 — Compile time (static)
+- **Effects system:** a function that does not declare `uses IO` is
+  *guaranteed* to be unable to perform I/O (print, file read/write,
+  command-line args, exit, clock). The analysis is a fixpoint over the static
+  call graph — there is no escape through indirect calls.
+- **Absolute static typing:** no implicit casts, no loose inference, no
+  shadowing, conditions must be `bool`, every binding has a declared type.
+- **No null / no uninitialised:** every variable is assigned at declaration.
 
-### Lớp 2 — Thời điểm chạy (động)
-- Số học `int` 64-bit kiểm tra tràn: `+ - * / %` và phủ định đều kiểm tra.
-- Truy cập mảng/chuỗi kiểm tra biên; chia cho 0 dừng an toàn.
-- Lỗi chạy là `panic` có kiểm soát: thoát mã 101, không có undefined behavior.
+### Layer 2 — Runtime (dynamic)
+- 64-bit `int` arithmetic with overflow checks: `+ - * / %` and unary negation
+  are all checked.
+- Array/string access is bounds-checked; divide-by-zero halts safely.
+- Runtime errors are controlled `panic`s: exit code 101, no undefined
+  behaviour.
 
-### Lớp 3 — Cấu trúc (kiến trúc)
-- Mô hình cấp phát arena v0.1: **không tồn tại lệnh free** → không thể
-  use-after-free / double-free về mặt cấu trúc. (Ownership chính xác: Giai đoạn 8.)
-- Trình biên dịch không đọc/ghi gì ngoài tệp vào/ra được chỉ định rõ.
+### Layer 3 — Structural (architecture)
+- v0.2 arena allocation model: **there is no free instruction** → use-after-
+  free / double-free are structurally impossible. (Exact ownership: Stage 8.)
+- The compiler reads/writes nothing beyond the explicitly named input/output
+  files.
 
-## Những gì v0.1 CHƯA bảo vệ được (trung thực)
-- Chưa có taint tracking / sandbox (Giai đoạn 10).
-- Chưa có capability tokens chi tiết (Giai đoạn 9).
-- Đệ quy rất sâu có thể tràn stack native (Giai đoạn 11: stack probes).
-- Chưa ký số học của chuỗi công cụ (Giai đoạn 13: content-addressed packages).
+## What v0.2 does NOT yet protect (honesty)
+- No taint tracking / sandbox yet (Stage 10).
+- No fine-grained capability tokens yet (Stage 9).
+- Very deep recursion can overflow the native stack (Stage 11: stack probes).
+- The toolchain is not yet signed (Stage 13: content-addressed packages).
 
-## Báo cáo lỗ hổng
-Tìm thấy lỗi khiến hai bản triển khai (Stage-0 vs native) cho kết quả khác nhau,
-hoặc sinh mã C không an toàn? Đó là lỗi nghiêm trọng. Vui lòng mở issue với nhãn
-`security` kèm chương trình tái hiện nhỏ nhất.
+## Reporting a vulnerability
+Found a bug that makes the two implementations (Stage-0 vs native) produce
+different results, or that emits unsafe C code? That is a serious bug. Please
+open an issue with the `security` label and a minimal reproducer.
 
-## Phạm vi
-Chính sách này áp dụng cho chính công cụ (`boot/`, `src/hlc.hls`, runtime sinh ra).
-Các chương trình người dùng viết bằng HLS chịu trách nhiệm theo mô hình trên.
+## Scope
+This policy applies to the toolchain itself (`boot/`, `src/hlc.hls`, the
+generated runtime). User programs written in HLS are governed by the model
+above.

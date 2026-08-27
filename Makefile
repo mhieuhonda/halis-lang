@@ -9,41 +9,41 @@ BIN     = bin
 
 .PHONY: all stage0 bootstrap test examples clean run check
 
-# Muc tieu chinh: dung chuoi bootstrap day du de tao trinh bien dich native
+# Main goal: use the full bootstrap chain to build the native compiler
 all: bootstrap
 
-# Chay Stage-0 truc tiep (thong dich HLS)
+# Run Stage-0 directly (interpret HLS)
 stage0:
 	$(PYTHON) boot/boot.py --help 2>/dev/null || true
-	@echo "Vi du: $(PYTHON) boot/boot.py examples/hello.hls"
+	@echo "Example: $(PYTHON) boot/boot.py examples/hello.hls"
 
-# BOOTSTRAP DAY DU:
-#   1. Stage-0 chay hlc.hls de bien dich chinh no -> hlc.c
-#   2. gcc bien dich thanh hlc native
-#   3. hlc native tu bien dich lai -> kiem tra xac dinh
+# FULL BOOTSTRAP:
+#   1. Stage-0 runs hlc.hls to compile itself -> hlc.c
+#   2. gcc compiles to native hlc
+#   3. native hlc re-compiles itself -> check determinism
 bootstrap:
 	@mkdir -p $(BIN)
-	@echo "[1/4] Stage-0: hlc.hls tu dich chinh no..."
+	@echo "[1/4] Stage-0: hlc.hls self-compiles..."
 	@$(PYTHON) boot/boot.py $(HLC) $(HLC) $(BIN)/hlc.c
-	@echo "[2/4] gcc: bien dich hlc native..."
+	@echo "[2/4] gcc: compiling native hlc..."
 	@$(CC) $(CFLAGS) -o $(BIN)/hlc $(BIN)/hlc.c -lm
-	@echo "[3/4] hlc native tu bien dich lai..."
+	@echo "[3/4] native hlc re-compiles itself..."
 	@$(BIN)/hlc $(HLC) $(BIN)/hlc2.c
-	@echo "[4/4] So sanh 2 lan sinh ma..."
-	@diff $(BIN)/hlc.c $(BIN)/hlc2.c && echo "BOOTSTRAP OK: qua trinh tu dich xac dinh"
+	@echo "[4/4] Comparing two passes of code generation..."
+	@diff $(BIN)/hlc.c $(BIN)/hlc2.c && echo "BOOTSTRAP OK: self-compilation is deterministic"
 	@rm -f $(BIN)/hlc2.c
-	@echo "Trinh bien dich native: $(BIN)/hlc"
+	@echo "Native compiler: $(BIN)/hlc"
 
-# Bien dich va chay mot chuong trinh HLS: make run F=examples/hello.hls
+# Compile and run an HLS program: make run F=examples/hello.hls
 run:
 	@test -x $(BIN)/hlc || $(MAKE) bootstrap
 	@$(BIN)/hlc $(F) /tmp/hls_out.c && $(CC) $(CFLAGS) -o /tmp/hls_out /tmp/hls_out.c -lm && /tmp/hls_out
 
-# Chi kiem tra kieu + effects (khong chay)
+# Only check types + effects (no execution)
 check:
 	$(PYTHON) boot/boot.py --check $(F)
 
-# Bo kiem thu day du
+# Full test suite
 test:
 	bash tests/run_tests.sh
 

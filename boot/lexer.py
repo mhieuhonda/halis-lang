@@ -1,4 +1,4 @@
-"""Bộ từ vựng (lexer) Stage-0 cho Hieu Louis (HLS). Chuẩn theo SPEC.md mục 2."""
+"""Stage-0 lexer for Hieu Louis (HLS). Conforms to SPEC.md section 2."""
 
 KEYWORDS = {
     "fn", "let", "mut", "return", "if", "else", "while", "for", "in",
@@ -10,7 +10,7 @@ ONE_CHAR = set("(){}[],:.<>+-*/%!=")
 
 
 class HLError(Exception):
-    """Lỗi biên dịch của HLS (kèm vị trí dòng:cột)."""
+    """HLS compile error (with line:col location)."""
 
     def __init__(self, msg, line, col):
         super().__init__(msg)
@@ -19,7 +19,7 @@ class HLError(Exception):
         self.col = col
 
     def __str__(self):
-        return "%s (dong %d:%d)" % (self.msg, self.line, self.col)
+        return "%s (line %d:%d)" % (self.msg, self.line, self.col)
 
 
 def _is_ident_start(c):
@@ -33,8 +33,8 @@ def _is_ident_char(c):
 def tokenize(src):
     """src: bytes -> list[dict] token {k, v, line, col}.
 
-    k trong: kw | ident | int | float | str | sym | eof
-    v: str (kw/ident/sym), int, float, bytes (str)
+    k is one of: kw | ident | int | float | str | sym | eof
+    v is: str (kw/ident/sym), int, float, or bytes (str)
     """
     toks = []
     i, n = 0, len(src)
@@ -45,7 +45,7 @@ def tokenize(src):
 
     while i < n:
         c = src[i]
-        # ký tự trắng
+        # whitespace
         if c in (32, 9, 13, 10):
             if c == 10:
                 line += 1
@@ -54,12 +54,12 @@ def tokenize(src):
                 col += 1
             i += 1
             continue
-        # ghi chú # ... hết dòng
+        # comment: # to end of line
         if c == 35:  # '#'
             while i < n and src[i] != 10:
                 i += 1
             continue
-        # định danh / từ khoá
+        # identifier / keyword
         if _is_ident_start(c):
             j = i
             while j < n and _is_ident_char(src[j]):
@@ -72,7 +72,7 @@ def tokenize(src):
             col += j - i
             i = j
             continue
-        # số
+        # number
         if 48 <= c <= 57:
             j = i
             while j < n and (48 <= src[j] <= 57 or src[j] == 95):  # '_'
@@ -91,7 +91,7 @@ def tokenize(src):
             col += j - i
             i = j
             continue
-        # chuỗi
+        # string
         if c == 34:  # '"'
             ln, cl = line, col
             i += 1
@@ -99,7 +99,7 @@ def tokenize(src):
             out = bytearray()
             while True:
                 if i >= n:
-                    raise HLError("chuoi khong dong", ln, cl)
+                    raise HLError("unterminated string", ln, cl)
                 ch = src[i]
                 if ch == 34:
                     i += 1
@@ -107,7 +107,7 @@ def tokenize(src):
                     break
                 if ch == 92:  # '\\'
                     if i + 1 >= n:
-                        raise HLError("chuoi khong dong", ln, cl)
+                        raise HLError("unterminated string", ln, cl)
                     e = src[i + 1]
                     if e == 110:
                         out.append(10)
@@ -118,12 +118,12 @@ def tokenize(src):
                     elif e == 34:
                         out.append(34)
                     else:
-                        err("ky hieu thoat khong hop le: \\%s" % chr(e))
+                        err("invalid escape sequence: \\%s" % chr(e))
                     i += 2
                     col += 2
                     continue
                 if ch < 32:
-                    err("chuoi chua ky tu dieu khien khong hop le")
+                    err("string contains invalid control character")
                 out.append(ch)
                 if ch == 10:
                     line += 1
@@ -133,7 +133,7 @@ def tokenize(src):
                 i += 1
             toks.append({"k": "str", "v": bytes(out), "line": ln, "col": cl})
             continue
-        # toán tử / ký hiệu
+        # operator / symbol
         two = src[i:i + 2].decode("latin-1")
         if two in TWO_CHAR:
             toks.append({"k": "sym", "v": two, "line": line, "col": col})
@@ -145,6 +145,6 @@ def tokenize(src):
             i += 1
             col += 1
             continue
-        err("ky tu khong hop le: %r" % chr(c))
+        err("invalid character: %r" % chr(c))
     toks.append({"k": "eof", "v": "", "line": line, "col": col})
     return toks

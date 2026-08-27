@@ -1,112 +1,121 @@
-# Đặc tả ngôn ngữ Hieu Louis (HLS) — v0.1.0
+# Hieu Louis language specification (HLS) — v0.2.0
 
-> **Hieu Louis** là ngôn ngữ lập trình bảo mật cao, biên dịchnative, được thiết kế theo
-> triết lý: **an toàn tuyệt đối theo mặc định, tường minh để kiểm toán, hiệu năng bằng
-> biên dịch AOT**. Phiên bản v0.1.0 là hạt nhân tối thiểu nhưng **hoàn chỉnh và chạy thật**:
-> mọi phép toán đều được kiểm tra, mọi I/O đều bị theo dõi tĩnh, không có null, không có
-> hành vi không xác định (undefined behavior).
+> **Hieu Louis** is a high-security, native-compiled programming language
+> designed around the philosophy: **safety by default, explicitness for
+> auditability, performance via AOT compilation**. Version v0.2.0 is the
+> minimal core that is **complete and runs for real**: every operation is
+> checked, every I/O is statically tracked, no null, no undefined behaviour.
 
-- Tệp nguồn: `*.hls`
-- Trình biên dịch tự viết: `src/hlc.hls` (HLS → C → native)
-- Hạt giống bootstrap: `boot/` (Stage-0, dùng để khởi động chu trình tự dịch)
-- Quy ước phiên bản: `MAJOR.MINOR.PATCH`, ngôn ngữ đóng băng khi đạt v1.0 (xem `ROADMAP.md`)
-
----
-
-## 1. Triết lý thiết kế
-
-1. **An toàn là mặc định, không phải tuỳ chọn.** Số học kiểm tra tràn, mảng kiểm tra
-   biên, chia cho 0 dừng an toàn. Trong v0.1 **không tồn tại chế độ tắt kiểm tra** —
-   chế độ "nhanh không kiểm tra" chỉ được mở khoá bằng chứng minh hình thức (Giai đoạn 17).
-2. **Tường minh để kiểm toán được.** Mọi biến phải khai báo kiểu. Không có kiểu suy luận
-   ngầm, không có ép kiểu ngầm, không có biến toàn cục ẩn, không có trạng thái ẩn.
-   Một người kiểm toán có thể đọc từng dòng và biết chính xác điều gì xảy ra.
-3. **I/O là hiệu ứng, hiệu ứng phải khai báo.** Chỉ cần đọc một dòng lệnh `fn` không có
-   `uses IO` thì trình biên dịch **bảo đảm** (bằng phân tích tĩnh) hàm đó thuần tuý —
-   không ghi đĩa, không in ra, không đọc mạng môi trường.
-4. **Không có null.** Không tồn tại tham chiếu rỗng. Vùng dữ liệu chưa khởi tạo không
-   tồn tại (không khai báo biến mà không gán).
-5. **Hiệu năng bằng biên dịch AOT.** HLS biên dịch sang C rồi sang mã máy native.
-   Không máy ảo, không GC trong hạt nhân v0.1 (mô hình bộ nhớ: xem mục 11).
+- Source files: `*.hls`
+- Self-hosted compiler: `src/hlc.hls` (HLS → C → native)
+- Bootstrap seed: `boot/` (Stage-0, used to bootstrap the self-hosting cycle)
+- Versioning: `MAJOR.MINOR.PATCH`; the language freezes at v1.0 (see `ROADMAP.md`)
 
 ---
 
-## 2. Quy tắc từ vựng (Lexing)
+## 1. Design philosophy
 
-### 2.1. Mã nguồn
-- Tệp nguồn là chuỗi byte UTF-8. Bộ từ vựng của v0.1 hoạt động trên **byte**.
-- Chuỗi trong HLS v0.1 là **chuỗi byte** (byte string); API Unicode đầy đủ nằm ở Giai đoạn 6.
+1. **Safety is the default, not an option.** Overflow-checked arithmetic,
+   bounds-checked arrays, safe-halt on divide-by-zero. In v0.2 there is **no
+   switch to disable checks** — the "fast unchecked mode" is only unlocked by
+   formal proof (Stage 17).
+2. **Explicitness for auditability.** Every variable must have a declared
+   type. No implicit type inference, no implicit casts, no hidden globals, no
+   hidden state. An auditor can read line by line and know exactly what
+   happens.
+3. **I/O is an effect, effects must be declared.** Reading a single line of a
+   `fn` that lacks `uses IO` lets the compiler **guarantee** (via static
+   analysis) that the function is pure — no disk writes, no screen output, no
+   network or environment reads.
+4. **No null.** No null references exist. Uninitialised data does not exist
+   (no declaring a variable without assigning it).
+5. **Performance via AOT.** HLS compiles to C and then to native machine code.
+   No VM, no GC in the v0.2 core (memory model: see section 11).
 
-### 2.2. Ký tự trắng & dòng mới
-- Khoảng trắng, tab, CR, LF đều là ký tự trắng. **Dòng mới không có ý nghĩa ngữ pháp.**
-- Quy tắc chống mơ hồ: một *câu lệnh mới* không được bắt đầu bằng `(`, `[`, `.` hoặc
-  một toán tử. Nếu gặp các ký hiệu đó ở vị trí bắt đầu câu lệnh, bộ phân tích coi chúng
-  là phần tiếp tục của biểu thức phía trước. Vì vậy các câu lệnh dạng
-  `(x);` `[1,2];` `-x;` luôn là lỗi cú pháp (chúng vô nghĩa).
+---
 
-### 2.3. Ghi chú (comment)
-- `#` đến hết dòng. Không có ghi chú khối trong v0.1.
+## 2. Lexical rules
 
-### 2.4. Định danh
-- `[A-Za-z_][A-Za-z0-9_]*`. Quy ước: hàm/biến `snake_case`, struct `PascalCase`.
-- Không được trùng từ khoá. Từ khoá (17): `fn let mut return if else while for in
-  break continue struct impl import uses true false`.
+### 2.1. Source code
+- Source files are UTF-8 byte strings. The v0.2 lexer works on **bytes**.
+- Strings in HLS v0.2 are **byte strings**; full Unicode API lands in Stage 6.
 
-### 2.5. Từ khoá dự kiến (chưa dùng, báo lỗi nếu gặp): `import`, `secure`, `match`, `enum`, `trait`
+### 2.2. Whitespace & newlines
+- Space, tab, CR, LF are all whitespace. **Newlines are not grammatically
+  significant.**
+- Anti-ambiguity rule: a *new statement* cannot start with `(`, `[`, `.` or a
+  unary operator. If those tokens appear in statement position, the parser
+  treats them as a continuation of the previous expression. So statements like
+  `(x);` `[1,2];` `-x;` are always syntax errors (they are meaningless).
 
-### 2.6. Số
-- Số nguyên: `[0-9][0-9_]*` (gạch dưới cho dễ đọc: `1_000_000`). Kiểu `int` — bù hai,
-  64 bit có dấu. Giới hạn: −9 223 372 036 854 775 808 … 9 223 372 036 854 775 807.
-  Hằng `-9223372036854775808` (INT64_MIN) là hợp lệ (bộ phân tích gộp dấu trừ);
-  hằng dương vượt INT64_MAX là lỗi biên dịch.
-- Số thực: `[0-9][0-9_]* . [0-9][0-9_]*` (bắt buộc có chữ số hai bên dấu chấm).
-  Kiểu `float` — IEEE 754 dual (64 bit). Không có ký hiệu khoa học trong v0.1.
+### 2.3. Comments
+- `#` to end of line. No block comments in v0.2.
 
-### 2.7. Chuỗi
-- `"..."`, thoát: `\n` `\t` `\\` `\"`. Escape khác là lỗi cú pháp.
-- Chuỗi thô chứa dấu xuống dòng là lỗi. Chuỗi rỗng `""` hợp lệ.
+### 2.4. Identifiers
+- `[A-Za-z_][A-Za-z0-9_]*`. Convention: functions/variables `snake_case`,
+  structs `PascalCase`.
+- Cannot clash with keywords. Keywords (17): `fn let mut return if else while
+  for in break continue struct impl import uses true false`.
 
-### 2.8. Toán tử & ký hiệu
+### 2.5. Reserved keywords (unused, error if encountered): `secure`, `match`, `enum`, `trait`
+
+### 2.6. Numbers
+- Integer: `[0-9][0-9_]*` (underscores for readability: `1_000_000`). Type
+  `int` — two's complement, signed 64-bit. Range: −9,223,372,036,854,775,808 …
+  9,223,372,036,854,775,807. The literal `-9223372036854775808` (INT64_MIN) is
+  valid (the parser folds the minus sign); a positive literal exceeding
+  INT64_MAX is a compile error.
+- Float: `[0-9][0-9_]* . [0-9][0-9_]*` (digits required on both sides of the
+  dot). Type `float` — IEEE 754 binary64. No scientific notation in v0.2.
+
+### 2.7. Strings
+- `"..."`, escapes: `\n` `\t` `\\` `\"`. Any other escape is a syntax error.
+- Strings containing raw newlines are an error. The empty string `""` is
+  valid.
+
+### 2.8. Operators & symbols
 ```
 ->  ==  !=  <=  >=  <  >  =  +  -  *  /  %  !  &&  ||
 (  )  {  }  [  ]  ,  :  .
 ```
-`&` và `|` đơn lẻ là lỗi từ vựng. Không có toán tử bit trong v0.1 (mỗi toán tử bit sẽ
-được đưa vào với ngữ nghĩa kiểm tra tràn riêng — Giai đoạn 7).
+Lone `&` and `|` are lexical errors. No bitwise operators in v0.2 (each
+bitwise operator will be added with its own checked semantics — Stage 7).
 
 ---
 
-## 3. Kiểu dữ liệu
+## 3. Types
 
-| Kiểu      | Ý nghĩa                                   | Biểu diễn C (backend) |
-|-----------|-------------------------------------------|-----------------------|
-| `int`     | số nguyên 64 bit có dấu, **kiểm tra tràn**| `int64_t`             |
-| `float`   | số thực 64 bit IEEE 754                   | `double`              |
-| `bool`    | `true` / `false`                          | `bool`                |
-| `str`     | chuỗi byte, độ dài tường minh             | `hl_str*`             |
-| `list[T]` | mảng động các phần tử kiểu `T`            | `hl_list*`            |
-| `map[str, T]` | bảng băm khoá là `str`, giá trị `T`  | `hl_map*`             |
-| `void`    | chỉ dùng làm kiểu trả về (rỗng)           | —                     |
-| `Name`    | struct do người dùng định nghĩa (tham chiếu) | `Name*`            |
+| Type      | Meaning                                  | C representation (backend) |
+|-----------|------------------------------------------|----------------------------|
+| `int`     | signed 64-bit integer, **overflow-checked** | `int64_t`               |
+| `float`   | 64-bit IEEE 754 float                    | `double`                   |
+| `bool`    | `true` / `false`                         | `bool`                     |
+| `str`     | byte string, explicit length            | `hl_str*`                  |
+| `list[T]` | dynamic array of `T`                    | `hl_list*`                 |
+| `map[str, T]` | hash map with `str` keys, `T` values | `hl_map*`               |
+| `void`    | only used as a return type (empty)      | —                          |
+| `Name`    | user-defined struct (reference semantics) | `Name*`                  |
 
-Quy tắc:
-- **Không có ép kiểu ngầm.** `int → float` phải dùng `x.to_float()`, ngược lại `x.to_int()`.
-- Kiểu struct mang **ngữ nghĩa tham chiếu** (như con trỏ có kiểm tra); gán struct là
-  gán tham chiếu. Ngữ dịch chuyển (move) & sở hữu xuất hiện ở Giai đoạn 8.
-- `map` trong v0.1 chỉ có khoá `str` (hỗ trợ khoá tổng quát: Giai đoạn 7).
-- So sánh `==`/`!=` chỉ áp dụng cho: `int`, `float`, `bool`, `str`. `list`, `map`,
-  struct **không** so sánh được bằng `==` trong v0.1.
-- So sánh thứ tự `< <= > >=` áp dụng cho: `int`, `float` (số học) và `str` (theo byte,
-  như `memcmp`).
+Rules:
+- **No implicit casts.** `int → float` requires `x.to_float()`, the reverse
+  `x.to_int()`.
+- Structs have **reference semantics** (like a checked pointer); assigning a
+  struct assigns the reference. Move semantics & ownership arrive in Stage 8.
+- `map` in v0.2 only has `str` keys (general key support: Stage 7).
+- `==`/`!=` comparison only applies to: `int`, `float`, `bool`, `str`. `list`,
+  `map`, structs **cannot** be compared with `==` in v0.2.
+- Ordering comparison `< <= > >=` applies to: `int`, `float` (numeric) and
+  `str` (bytewise, like `memcmp`).
 
 ---
 
-## 4. Cấu trúc chương trình
+## 4. Program structure
 
-Một tệp `.hls` là chuỗi các khai báo **top-level** (thứ tự tuỳ ý, tham chiếu chéo được):
+A `.hls` file is a sequence of **top-level** declarations (any order, forward
+references allowed):
 
 ```
-program     := (structdef | impl | fndef)*
+program     := (structdef | impl | fndef | import)*
 structdef   := "struct" Ident "{" field ("," field)* ","? "}"
 field       := Ident ":" type
 impl        := "impl" Ident "{" fndef* "}"
@@ -116,21 +125,36 @@ param       := "mut"? Ident ":" type
 type        := "int" | "float" | "bool" | "str" | "void"
              | "list" "[" type "]"
              | "map" "[" "str" "," type "]"
-             | Ident                      # tên struct
+             | Ident                      # struct name
+import      := "import" string-literal
 block       := "{" stmt* "}"
 ```
 
-- **Hàm `main`** bắt buộc: `fn main() -> int` hoặc `fn main()`; không có tham số.
-  Giá trị trả về là mã thoát của tiến trình; `main` rỗng trả về 0.
-- Không có biến toàn cục, không có hằng toàn cục, không có import trong v0.1
-  (mọi hàm builtin sẵn có; hệ thống module: Giai đoạn 6).
-- Tên trùng lặp (hàm–hàm, struct–struct, phương thức trùng trong một `impl`) là lỗi.
-- Struct phải có ít nhất 1 trường. Trường struct không được có giá trị mặc định (v0.1);
-  khởi tạo struct luôn liệt kê đủ mọi trường.
+- **The `main` function** is required: `fn main() -> int` or `fn main()`; it
+  has no parameters. The return value is the process exit code; a void `main`
+  returns 0.
+- No globals, no global constants. Imports load other `.hls` files (Stage 6).
+- Duplicate names (function–function, struct–struct, duplicate methods inside
+  one `impl`) are errors.
+- Structs must have at least 1 field. Struct fields cannot have default values
+  in v0.2; struct literals must list every field.
+
+### 4.1. Imports (Stage 6)
+
+```
+import "path/to/file.hls"     # relative path
+import "std.str"              # standard library module
+```
+
+- Imports are resolved relative to the importing file's directory, except for
+  `std.*` modules which are resolved by the compiler.
+- Each `.hls` file is compiled once per program; circular imports are an error.
+- Imported top-level declarations (structs, functions, methods) become visible
+  in the importing file. Duplicate names across files are an error.
 
 ---
 
-## 5. Câu lệnh (statement)
+## 5. Statements
 
 ```
 stmt := let | assign | "if" ... | "while" ... | "for" ... | "return" ...
@@ -143,218 +167,232 @@ if      := "if" expr block ("else" (if | block))?
 while   := "while" expr block
 for     := "for" Ident ":" type "in" expr block
 return  := "return" expr?
-callstmt:= call-expression          # câu lệnh biểu thức phải là lời gọi hàm/phương thức
+callstmt:= call-expression          # expression-statements must be function/method calls
 ```
 
-Quy tắc:
-- `let` khai báo một liên kết (binding). **`mut` quản trị việc GÁN LẠI LIÊN KẾT**: chỉ có
-  `let mut x` (hoặc tham số `mut x`) mới được viết `x = giá_trị_mới`.
-- Gán trường (`p.x = v`) và gán chỉ số (`xs[i] = v`) là thay đổi **nội dung** của dữ liệu
-  qua tham chiếu — được phép trên mọi liên kết (nhất quán với `xs.push(v)`).
-- **Cấm che khuất tên (no shadowing):** khai báo tên đã nhìn thấy ở phạm vi bao là lỗi.
-  Các phạm vi anh em (hai vòng lặp khác nhau cùng đặt tên `i`) thì hợp lệ.
-- `if`/`while`: điều kiện **phải là `bool`** — không có "truthiness". Trong vị trí điều
-  kiện và biểu thức lặp `for` (vị trí đứng ngay trước khối `{`), literal struct phải bọc
-  trong cặp ngoặc để tách khỏi khối lệnh.
-- `for x: T in expr`: `expr` phải là `list[T]`. Độ dài danh sách được **chụp lại một lần**
-  khi vào vòng lặp; phần tử thêm vào trong lúc lặp không được duyệt. Biến lặp `x` là
-  bất biến và chỉ tồn tại trong thân vòng lặp.
-- `return` không giá trị chỉ dùng trong hàm trả về `void`. Với hàm có kiểu trả về,
-  **mọi đường đi đều phải return** (phân tích luồng bảo thủ; `while` không được tính là
-  đường return).
-- `break`/`continue` chỉ hợp lệ trong thân vòng lặp.
-- Câu lệnh biểu thức phải là **lời gọi** (hàm hoặc phương thức). `x + 1;` là lỗi
-  "biểu thức không có tác dụng".
+Rules:
+- `let` declares a binding. **`mut` governs REASSIGNMENT of the binding**:
+  only `let mut x` (or a `mut x` parameter) may write `x = new_value`.
+- Field assignment (`p.x = v`) and index assignment (`xs[i] = v`) mutate the
+  **contents** of data through a reference — allowed on any binding
+  (consistent with `xs.push(v)`).
+- **No shadowing:** declaring a name already visible in an enclosing scope is
+  an error. Sibling scopes (two different loops both naming `i`) are fine.
+- `if`/`while`: the condition **must be `bool`** — no "truthiness". In
+  condition position and the `for` iterable position (the position directly
+  before a `{` block), struct literals must be wrapped in parentheses to
+  disambiguate from the block.
+- `for x: T in expr`: `expr` must be `list[T]`. The list length is
+  **snapshotted once** on entry; elements appended during iteration are not
+  visited. The loop variable `x` is immutable and only exists inside the loop
+  body.
+- `return` without a value is only for `void`-returning functions. For
+  functions with a return type, **every path must return** (conservative
+  flow analysis; `while` is not considered a return path).
+- `break`/`continue` are only valid inside a loop body.
+- An expression-statement must be a **call** (function or method). `x + 1;` is
+  an "expression has no effect" error.
 
 ---
 
-## 6. Biểu thức & độ ưu tiên
+## 6. Expressions & precedence
 
-Từ thấp đến cao:
+From lowest to highest:
 
-| Độ ưu tiên | Toán tử            | Ghi chú |
+| Precedence | Operator          | Notes |
 |-----------|--------------------|---------|
-| 1 (thấp)  | `\|\|`             | ngắn mạch |
-| 2         | `&&`               | ngắn mạch |
-| 3         | `==` `!=`          | theo kiểu (mục 3) |
+| 1 (low)   | `\|\|`             | short-circuit |
+| 2         | `&&`               | short-circuit |
+| 3         | `==` `!=`          | type-dependent (section 3) |
 | 4         | `<` `<=` `>` `>=`  | int/float/str |
-| 5         | `+` `-`            | `+` với str là nối chuỗi |
-| 6         | `*` `/` `%`        | int: kiểm tra; float: IEEE |
-| 7         | `!` `-` (đơn)     | phủ định / đảo dấu kiểm tra |
-| 8 (cao)   | `.` `[` `(`        | hậu tố: trường, chỉ số, lời gọi |
+| 5         | `+` `-`            | `+` on str is concatenation |
+| 6         | `*` `/` `%`        | int: checked; float: IEEE |
+| 7         | `!` `-` (unary)   | negation / checked unary minus |
+| 8 (high)  | `.` `[` `(`        | postfix: field, index, call |
 
-Toán hạng:
-- Literal: `int`, `float`, `true`, `false`, `str`.
-- `Ident` — biến/tham số (kiểu từ khai báo).
-- `(expr)` — nhóm.
-- `[e1, e2, ...]` — literal danh sách. Kiểu phần tử suy từ ngữ cảnh (kiểu khai báo ở
-  `let`, kiểu tham số, kiểu trả về, phần tử của literal bao quanh). Literal rỗng `[]`
-  bắt buộc phải có ngữ cảnh kiểu. Tất cả phần tử phải cùng kiểu chính xác.
-- `Name { f1: e1, f2: e2, ... }` — literal struct: **đầy đủ mọi trường, đúng thứ tự
-  khai báo** (tên trường viết tường minh để dễ kiểm toán). Chỉ dùng được ở nơi ngữ cảnh
-  cho phép (không dùng trực tiếp làm điều kiện `if`/`while`).
-- Lời gọi hàm `f(a, b)`, lời gọi phương thức `x.m(a, b)`, truy cập trường `x.f`,
-  truy cập chỉ số `xs[i]` (chỉ `list`; `i` phải là `int`, kiểm tra biên khi chạy).
-- Toán hạng của `&&`/`||` phải là `bool`.
+Operands:
+- Literals: `int`, `float`, `true`, `false`, `str`.
+- `Ident` — variable/parameter (type from declaration).
+- `(expr)` — grouping.
+- `[e1, e2, ...]` — list literal. Element type inferred from context (declared
+  type at `let`, parameter type, return type, element type of an enclosing
+  literal). The empty literal `[]` requires a contextual type. All elements
+  must have the exact same type.
+- `Name { f1: e1, f2: e2, ... }` — struct literal: **all fields, in declared
+  order** (field names written explicitly for auditability). Only allowed
+  where context permits (not directly as an `if`/`while` condition).
+- Function call `f(a, b)`, method call `x.m(a, b)`, field access `x.f`,
+  index access `xs[i]` (only `list`; `i` must be `int`, runtime bounds check).
+- Operands of `&&`/`||` must be `bool`.
 
 ---
 
-## 7. Ngữ nghĩa số học — "mọi phép toán đều được kiểm tra"
+## 7. Arithmetic semantics — "every operation is checked"
 
-| Phép toán | Ngữ nghĩa |
+| Operation | Semantics |
 |-----------|-----------|
-| `a + b` (int) | cộng 64-bit; tràn → `panic "tran so nguyen"` |
-| `a - b`, `a * b` (int) | tương tự — tràn là panic |
-| `-a` (int) | `-INT64_MIN` là panic |
-| `a / b` (int) | `b == 0` → panic; `INT64_MIN / -1` → panic (tràn) |
-| `a % b` (int) | dấu phần dư theo **số bị chia** (như C); kiểm tra như phép chia |
-| `a / b` (float) | IEEE 754 (chia 0 cho `inf`/`nan` — không panic) |
-| `xs[i]` | `0 <= i < len` — ngoài phạm vi → `panic "truy cap mang ngoai pham vi"` |
-| `s.byte_at(i)` | kiểm tra biên như trên |
-| `s.slice(a, b)` | yêu cầu `0 <= a <= b <= len` — vi phạm là panic |
+| `a + b` (int) | 64-bit add; overflow → `panic "integer overflow"` |
+| `a - b`, `a * b` (int) | same — overflow is a panic |
+| `-a` (int) | `-INT64_MIN` is a panic |
+| `a / b` (int) | `b == 0` → panic; `INT64_MIN / -1` → panic (overflow) |
+| `a % b` (int) | remainder sign follows the **dividend** (like C); checked like division |
+| `a / b` (float) | IEEE 754 (divide-by-0 → `inf`/`nan` — no panic) |
+| `xs[i]` | `0 <= i < len` — out of range → `panic "array access out of bounds"` |
+| `s.byte_at(i)` | bounds check as above |
+| `s.slice(a, b)` | requires `0 <= a <= b <= len` — violation is a panic |
 
-Số học `float` theo IEEE 754, không có kiểm tra. In số float dùng định dạng `%.6f`.
+`float` arithmetic follows IEEE 754, no checks. Printing a float uses the
+`%.6f` format.
 
 ---
 
-## 8. Hàm builtin (mức toàn cục)
+## 8. Builtin functions (global)
 
-| Hàm | Kiểu | Hiệu ứng | Ghi chú |
+| Function | Type | Effect | Notes |
 |-----|------|----------|---------|
-| `print(s: str)` | `void` | IO | in không xuống dòng |
-| `println(s: str)` | `void` | IO | in có xuống dòng |
-| `panic(msg: str)` | không trả về | — | dừng chương trình, mã 101 |
-| `exit(code: int)` | không trả về | IO | thoát với mã `code` |
+| `print(s: str)` | `void` | IO | print without newline |
+| `println(s: str)` | `void` | IO | print with newline |
+| `panic(msg: str)` | never returns | — | halt program, exit code 101 |
+| `exit(code: int)` | never returns | IO | exit with `code` |
 | `str(x)` | `str` | — | `x ∈ {int, float, bool, str}` |
-| `int(s: str)` | `int` | — | lỗi nếu chuỗi không phải số nguyên hợp lệ |
-| `len(x)` | `int` | — | `str` (số byte), `list`, `map` |
-| `range(a: int, b: int)` | `list[int]` | — | `[a, b)` — `a >= b` → rỗng |
-| `map_new()` | `map[str, T]` | — | kiểu `T` lấy từ ngữ cảnh khai báo |
-| `read_file(path: str)` | `str` | IO | đọc toàn bộ tệp; lỗi I/O → panic |
-| `write_file(path: str, content: str)` | `void` | IO | ghi toàn bộ tệp; lỗi → panic |
-| `args()` | `list[str]` | IO | tham số dòng lệnh; `args()[0]` là chương trình |
-| `clock_ms()` | `int` | IO | mili-giây (đồng hồ đơn điệu) |
-| `chr(i: int)` | `str` | — | chuỗi 1 byte; `i` ngoài 0..255 → panic |
+| `int(s: str)` | `int` | — | error if string is not a valid integer literal |
+| `len(x)` | `int` | — | `str` (byte count), `list`, `map` |
+| `range(a: int, b: int)` | `list[int]` | — | `[a, b)` — `a >= b` → empty |
+| `map_new()` | `map[str, T]` | — | `T` taken from the surrounding context |
+| `read_file(path: str)` | `str` | IO | read entire file; I/O error → panic |
+| `write_file(path: str, content: str)` | `void` | IO | write entire file; error → panic |
+| `args()` | `list[str]` | IO | command-line arguments; `args()[0]` is the program |
+| `clock_ms()` | `int` | IO | milliseconds (monotonic clock) |
+| `chr(i: int)` | `str` | — | 1-byte string; `i` outside 0..255 → panic |
+| `file_exists(path: str)` | `bool` | IO | returns `true` if `path` is a regular file |
 
-`int(s)`: cho phép dấu trừ ở đầu, chỉ chấp nhận chữ số 0–9, giá trị phải nằm trong
-phạm vi `int` 64-bit, ngược lại panic "khong the doi chuoi thanh int".
+`int(s)`: allows a leading minus sign, only accepts digits 0–9, value must
+fit in int64 range, otherwise panics with "cannot convert string to int".
 
-## 8b. Phương thức builtin
+## 8b. Builtin methods
 
 **str:** `len() -> int`, `byte_at(i: int) -> int`, `slice(a: int, b: int) -> str`,
-`find(sub: str) -> int` (−1 nếu không thấy), `contains(sub: str) -> bool`,
+`find(sub: str) -> int` (−1 if not found), `contains(sub: str) -> bool`,
 `starts_with(p: str) -> bool`, `ends_with(p: str) -> bool`,
-`split(sep: str) -> list[str]` (sep rỗng → panic), `trim() -> str` (cắt byte ≤ 0x20 hai đầu),
-`to_int() -> int`, `to_float() -> float` (chuỗi không hợp lệ → panic), `to_str() -> str`.
+`split(sep: str) -> list[str]` (empty sep → panic), `trim() -> str` (strip
+bytes ≤ 0x20 from both ends), `to_int() -> int`, `to_float() -> float`
+(invalid string → panic), `to_str() -> str`.
 
-**int:** `to_str() -> str`, `to_float() -> float`, `abs() -> int` (`abs(INT64_MIN)` → panic).
+**int:** `to_str() -> str`, `to_float() -> float`, `abs() -> int`
+(`abs(INT64_MIN)` → panic).
 
-**float:** `to_str() -> str` (`%.6f`), `to_int() -> int` (cắt về 0), `abs() -> float`.
+**float:** `to_str() -> str` (`%.6f`), `to_int() -> int` (truncate towards 0),
+`abs() -> float`.
 
 **bool:** `to_str() -> str`.
 
-**list[T]:** `len() -> int`, `push(v: T)`, `get(i: int) -> T` (kiểm tra biên),
-`set(i: int, v: T)`, `pop() -> T` (rỗng → panic).
+**list[T]:** `len() -> int`, `push(v: T)`, `get(i: int) -> T` (bounds check),
+`set(i: int, v: T)`, `pop() -> T` (empty → panic).
 
 **map[str, T]:** `len() -> int`, `set(k: str, v: T)`, `get_or(k: str, dflt: T) -> T`,
-`has(k: str) -> bool`, `keys() -> list[str]` (**thứ tự chèn**).
+`has(k: str) -> bool`, `keys() -> list[str]` (**insertion order**).
 
-**struct:** phương thức do người dùng định nghĩa qua `impl`. Phương thức bắt buộc có
-tham số đầu tên `self` (kiểu struct đó): `fn get_x(self: Point) -> int { ... }`.
-Muốn thay đổi trường: khai báo `mut self: Point`.
+**struct:** user-defined methods via `impl`. Methods must have a first
+parameter named `self` of that struct type: `fn get_x(self: Point) -> int { ... }`.
+To mutate fields: declare `mut self: Point`.
 
 ---
 
-## 9. Hệ thống hiệu ứng (effects) — trái tim bảo mật của v0.1
+## 9. The effects system — v0.2's security heart
 
-- Hiệu ứng duy nhất trong v0.1: **IO** (in/đọc/ghi tệp, tham số dòng lệnh, thoát, đồng hồ).
-- Một hàm gọi (trực tiếp hoặc gián tiếp qua chuỗi lời gọi tĩnh) bất kỳ hàm/Phương thức
-  builtin nào mang hiệu ứng IO **phải khai báo** `uses IO`.
-- Phân tích là **bất động điểm trên đồ thị lời gọi tĩnh** (mọi lời gọi đều tĩnh trong v0.1).
-- Vi phạm → lỗi biên dịch, chỉ rõ hàm và chuỗi lời gọi vi phạm.
-- Hệ quả: mọi hàm không có `uses IO` được **bảo đảm thuần tuý** (không thể có tác dụng
-  I/O). Đây là cơ sở cho tối ưu hoá & kiểm chứng ở các giai đoạn sau.
+- The only effect in v0.2: **IO** (print/file read-write, command-line args,
+  exit, clock).
+- A function that (directly or indirectly through a static call chain) calls
+  any builtin function/method with the IO effect **must declare** `uses IO`.
+- The analysis is a **fixpoint on the static call graph** (every call is
+  static in v0.2).
+- Violations → compile error, naming the function and the violating call chain.
+- Consequence: every function without `uses IO` is **guaranteed pure** (no
+  possible I/O side effect). This is the foundation for later optimisations
+  and verification.
 
-Ví dụ:
+Example:
 
 ```hls
-fn doi(x: int) -> int {          # THUẦN TUÝ — bảo đảm bởi trình biên dịch
+fn double(x: int) -> int {          # PURE — guaranteed by the compiler
     return x * 2
 }
 
-fn chao(ten: str) -> int uses IO {
-    println("Xin chao " + ten)   # IO phải được khai báo
+fn greet(name: str) -> int uses IO {
+    println("Hello " + name)        # IO must be declared
     return 0
 }
 ```
 
 ---
 
-## 10. Mô hình bộ nhớ v0.1 (trung thực & có chủ đích)
+## 10. The v0.2 memory model (honest & deliberate)
 
-- v0.1 dùng **cấp phát vùng (arena)**: mọi chuỗi/danh sách/bản đồ/struct được cấp phát
-  và **không thu hồi** trong thời gian sống của tiến trình. Chương trình ngắn (CLI,
-  trình biên dịch) không bao giờ gặp vấn đề.
-- Đây là quyết định có chủ đích để hạt nhân v0.1 nhỏ, kiểm chứng được, không có
-  use-after-free, không có double-free **về mặt cấu trúc** (không có `free`!).
-- Sở hữu/borrow-checker và thu hồi bộ nhớ chính xác: **Giai đoạn 8** của ROADMAP.
-- Đệ quy sâu: v0.1 chưa có kiểm tra tràn stack (Giai đoạn 11).
+- v0.2 uses **arena allocation**: every string/list/map/struct is allocated
+  and **never freed** during the process lifetime. Short programs (CLIs,
+  the compiler itself) never have a problem.
+- This is a deliberate decision to keep the v0.2 core small, verifiable, with
+  no use-after-free, no double-free **structurally** (there is no `free`!).
+- Ownership / borrow checker and exact memory reclamation: **Stage 8** of the
+  roadmap.
+- Deep recursion: v0.2 has no stack overflow check yet (Stage 11).
 
-## 11. Lỗi & panic
+## 11. Errors & panics
 
-- Lỗi biên dịch (kiểu, hiệu ứng, cú pháp): dừng ở thời điểm biên dịch, có số dòng.
-- `panic(msg)`: in `panic: <msg>` (kèm vị trí khi chạy trên Stage-0) ra stderr,
-  thoát mã **101**. v0.1 không có cơ chế bắt panic (bắt lỗi có kiểm soát: `Result`
-  ở Giai đoạn 7).
+- Compile errors (type, effect, syntax): halt at compile time, with line
+  numbers.
+- `panic(msg)`: prints `panic: <msg>` (with location when running on Stage-0)
+  to stderr, exits with code **101**. v0.2 has no panic-catch mechanism
+  (controlled error handling: `Result` in Stage 7).
 
-## 12. Những gì v0.1 cố ý KHÔNG có
+## 12. What v0.2 deliberately does NOT have
 
-| Tính năng | Giai đoạn |
-|-----------|-----------|
-| `enum`, `Option`, `Result`, generics, suy luận kiểu | 7 |
-| Toán tử bit (`&` `\|` `^` `<<` `>>`) với ngữ nghĩa kiểm tra | 7 |
-| Sở hữu (ownership) & borrow checking | 8 |
-| Effects chi tiết (`Net`, `Fs`, `Clock`, `Rand`), capability, taint | 9–10 |
-| IR SSA + tối ưu hoá | 11 |
-| Backend LLVM trực tiếp | 12 |
-| Hệ thống module/import, thư viện chuẩn dạng gói | 6 |
-| `match`, closure, con trỏ hàm, async | 7, 16 |
-| Bắt panic / `Result` | 7 |
+| Feature | Stage |
+|---------|-------|
+| `enum`, `Option`, `Result`, generics, type inference | 7 |
+| Bitwise operators (`&` `\|` `^` `<<` `>>`) with checked semantics | 7 |
+| Ownership & borrow checking | 8 |
+| Fine-grained effects (`Net`, `Fs`, `Clock`, `Rand`), capabilities, taint | 9–10 |
+| SSA IR + optimisation | 11 |
+| Direct LLVM backend | 12 |
+| Module/import system, package-form standard library | 6 |
+| `match`, closures, function pointers, async | 7, 16 |
+| Catching panics / `Result` | 7 |
 
 ---
 
-## 13. Chương trình mẫu đầy đủ
+## 13. Complete example program
 
 ```hls
-# primes.hls — sàng Eratosthenes, thể hiện kiểu, vòng lặp, danh sách
-fn sang(n: int) -> list[int] {
+# primes.hls — Sieve of Eratosthenes, demonstrating types, loops, lists
+fn sieve(n: int) -> list[int] {
     let flags: list[bool] = []
     let i: int = 0
     while i < n {
         flags.push(i >= 2)
         i = i + 1
     }
-    let kq: list[int] = []
+    let result: list[int] = []
     let p: int = 2
     while p < n {
         if flags.get(p) {
-            kq.push(p)
-            let boi: int = p * p
-            while boi < n {
-                flags.set(boi, false)
-                boi = boi + p
+            result.push(p)
+            let multiple: int = p * p
+            while multiple < n {
+                flags.set(multiple, false)
+                multiple = multiple + p
             }
         }
         p = p + 1
     }
-    return kq
+    return result
 }
 
 fn main() -> int uses IO {
-    let cac_so: list[int] = sang(100)
+    let primes: list[int] = sieve(100)
     let i: int = 0
-    while i < cac_so.len() {
-        print(cac_so.get(i).to_str() + " ")
+    while i < primes.len() {
+        print(primes.get(i).to_str() + " ")
         i = i + 1
     }
     println("")
@@ -362,10 +400,10 @@ fn main() -> int uses IO {
 }
 ```
 
-## 14. Bảng tương thích ngữ nghĩa Stage-0 vs native
+## 14. Stage-0 vs native semantic compatibility
 
-Hai bản triển khai (trình thông dịch tham chiếu `boot/` và trình biên dịch tự viết
-`src/hlc.hls`) phải cho **kết quả đầu ra giống hệt nhau** trên cùng một chương trình
-(kiểm thử vi sai — differential testing, xem `tests/run_tests.sh`). Điểm khác biệt
-duy nhất được phép: thông báo panic trên Stage-0 kèm vị trí dòng, còn bản native thì
-không (thông tin gỡ lỗi: Giai đoạn 11).
+The two implementations (the reference interpreter `boot/` and the
+self-hosted compiler `src/hlc.hls`) must produce **identical output** on the
+same program (differential testing — see `tests/run_tests.sh`). The only
+allowed difference: panic messages on Stage-0 include the line location, the
+native version does not (debug info: Stage 11).

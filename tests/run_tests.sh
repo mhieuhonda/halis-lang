@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # ============================================================================
-# run_tests.sh — Bo kiem thu tong cua Hieu Louis (HLS)
-#  1. Stage-0: chay cac chuong trinh ok (so sanh snapshot neu co)
-#  2. Stage-0: tu choi cac chuong trinh fail (ky vong thong bao loi)
-#  3. Tu dich: hlc.hls (via Stage-0) bien dich moi chuong trinh ok -> C
-#     -> gcc -> chay native -> SO SANH VOI KET QUA THONG DICH (vi sai)
-#  4. Bootstrap: hlc tu dich chinh no 2 lan -> 2 ban C phai giong het nhau
+# run_tests.sh — Full test suite for Hieu Louis (HLS)
+#  1. Stage-0: run the ok programs (compare to snapshot if present)
+#  2. Stage-0: reject the fail programs (expect compile errors)
+#  3. Self-compile: hlc.hls (via Stage-0) compiles each ok program -> C
+#     -> gcc -> run native -> COMPARE TO INTERPRETER OUTPUT (differential)
+#  4. Bootstrap: hlc self-compiles twice -> the two C outputs must be identical
 # ============================================================================
 set -u
 cd "$(dirname "$0")/.."
@@ -17,14 +17,14 @@ trap 'rm -rf "$TMP"' EXIT
 ok()   { PASS=$((PASS+1)); echo "  [PASS] $1"; }
 bad()  { FAIL=$((FAIL+1)); echo "  [FAIL] $1"; }
 
-echo "=== 1. Stage-0: chuong trinh hop le ==="
+echo "=== 1. Stage-0: valid programs ==="
 for f in tests/ok/*.hls; do
     name=$(basename "$f" .hls)
     out=$(python3 boot/boot.py "$f" 2>/dev/null); code=$?
     if [ $code -eq 0 ] || [ $code -eq 101 ]; then
         snap="tests/snapshots/$name.txt"
         if [ -f "$snap" ] && [ "$out" != "$(cat "$snap")" ]; then
-            bad "$name (khac snapshot)"
+            bad "$name (differs from snapshot)"
         else
             ok "$name"
         fi
@@ -33,39 +33,39 @@ for f in tests/ok/*.hls; do
     fi
 done
 
-echo "=== 2. Stage-0: chuong trinh KY VONG LOI ==="
+echo "=== 2. Stage-0: programs EXPECTED TO FAIL ==="
 for f in tests/fail/*.hls; do
     name=$(basename "$f" .hls)
     err=$(python3 boot/boot.py --check "$f" 2>&1 >/dev/null); code=$?
     if [ $code -eq 1 ]; then
         ok "$name -> $err"
     else
-        bad "$name (phai bi tu choi nhung exit=$code)"
+        bad "$name (should be rejected but exit=$code)"
     fi
 done
 
-echo "=== 3. Tu dich + kiem thu vi sai (interpreter vs native) ==="
+echo "=== 3. Self-compile + differential testing (interpreter vs native) ==="
 for f in tests/ok/*.hls; do
     name=$(basename "$f" .hls)
     interp_out=$(python3 boot/boot.py "$f" 2>/dev/null); interp_code=$?
     if ! python3 boot/boot.py src/hlc.hls "$f" "$TMP/$name.c" >/dev/null 2>&1; then
-        bad "$name (hlc bien dich that bai)"
+        bad "$name (hlc compile failed)"
         continue
     fi
     if ! gcc -O2 -o "$TMP/$name.bin" "$TMP/$name.c" -lm 2>"$TMP/$name.gcc"; then
-        bad "$name (gcc loi)"
+        bad "$name (gcc error)"
         continue
     fi
     nat_out=$("$TMP/$name.bin" 2>/dev/null); nat_code=$?
     if [ "$interp_out" == "$nat_out" ] && [ "$interp_code" == "$nat_code" ]; then
-        ok "$name (native giong het interpreter)"
+        ok "$name (native matches interpreter)"
     else
         bad "$name (interp=$interp_code nat=$nat_code)"
         diff <(echo "$interp_out") <(echo "$nat_out") | head -4
     fi
 done
 
-echo "=== 4. Vi sai cho examples (co du lieu) ==="
+echo "=== 4. Differential test for examples (with data file) ==="
 python3 boot/boot.py examples/wordcount.hls examples/data.txt > "$TMP/wc_interp.txt" 2>/dev/null
 python3 boot/boot.py src/hlc.hls examples/wordcount.hls "$TMP/wc.c" >/dev/null 2>&1
 gcc -O2 -o "$TMP/wc.bin" "$TMP/wc.c" -lm 2>/dev/null
@@ -76,44 +76,44 @@ else
     bad "wordcount"
 fi
 
-echo "=== 5. BOOTSTRAP: hlc tu dich chinh no (fixed-point) ==="
-echo "  [5.1] Stage-0 chay hlc.hls de bien dich chinh hlc.hls..."
+echo "=== 5. BOOTSTRAP: hlc self-compiles (fixed-point) ==="
+echo "  [5.1] Stage-0 runs hlc.hls to compile hlc.hls itself..."
 if python3 boot/boot.py src/hlc.hls src/hlc.hls "$TMP/hlc_s1.c" >/dev/null 2>&1; then
-    ok "hlc.hls tu dich qua Stage-0"
+    ok "hlc.hls self-compiles via Stage-0"
 else
-    bad "hlc.hls tu dich qua Stage-0"
+    bad "hlc.hls self-compiles via Stage-0"
 fi
-echo "  [5.2] Bien dich ban C dau tien thanh hlc native..."
+echo "  [5.2] Compile the first C pass into native hlc..."
 if gcc -O2 -o "$TMP/hlc1" "$TMP/hlc_s1.c" -lm 2>/dev/null; then
-    ok "gcc bien dich hlc native"
+    ok "gcc compiles native hlc"
 else
-    bad "gcc bien dich hlc native"
+    bad "gcc compiles native hlc"
 fi
-echo "  [5.3] hlc native tu bien dich hlc.hls lan 2..."
+echo "  [5.3] Native hlc re-compiles hlc.hls (pass 2)..."
 "$TMP/hlc1" src/hlc.hls "$TMP/hlc_s2.c" 2>/dev/null
 if [ $? -eq 0 ]; then
-    ok "hlc native bien dich hlc.hls"
+    ok "native hlc compiles hlc.hls"
 else
-    bad "hlc native bien dich hlc.hls"
+    bad "native hlc compiles hlc.hls"
 fi
 if diff -q "$TMP/hlc_s1.c" "$TMP/hlc_s2.c" >/dev/null 2>&1; then
-    ok "BOOTSTRAP XAC DINH: 2 lan sinh ma giong het nhau"
+    ok "BOOTSTRAP DETERMINISTIC: two passes produce identical output"
 else
-    bad "2 lan sinh ma khac nhau!"
+    bad "two passes produce different output!"
 fi
-echo "  [5.4] hlc native bien dich chuong trinh thu..."
+echo "  [5.4] Native hlc compiles a sample program..."
 "$TMP/hlc1" examples/fibonacci.hls "$TMP/fib.c" >/dev/null 2>&1 \
     && gcc -O2 -o "$TMP/fib" "$TMP/fib.c" -lm 2>/dev/null \
     && nat=$("$TMP/fib" 2>/dev/null) \
     && interp=$(python3 boot/boot.py examples/fibonacci.hls 2>/dev/null)
 if [ "$nat" == "$interp" ]; then
-    ok "hlc native bien dich + chay fibonacci dung"
+    ok "native hlc compiles + runs fibonacci correctly"
 else
-    bad "hlc native bien dich fibonacci"
+    bad "native hlc compiles fibonacci"
 fi
 
 echo ""
 echo "=========================================="
-echo "KET QUA: $PASS PASS / $FAIL FAIL"
+echo "RESULT: $PASS PASS / $FAIL FAIL"
 echo "=========================================="
 [ $FAIL -eq 0 ]

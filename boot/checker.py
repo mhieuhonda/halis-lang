@@ -1,10 +1,10 @@
-"""Bộ kiểm tra kiểu & hiệu ứng Stage-0 cho HLS. Chuẩn theo SPEC.md mục 3-9.
+"""Stage-0 type checker & effects analyzer for HLS. Conforms to SPEC.md sections 3-9.
 
-Sản phẩm phụ: chú thích (annotation) lên AST để evaluator chạy nhanh:
-  - moi bieu thuc co e['t'] = kieu (hoac 'never')
-  - e['rc'] = ('user', key) | ('builtin', ten) voi loi goi ham
-  - e['rm'] = ('user', key) | ('builtin', op) voi loi goi phuong thuc
-  - program['edges'] = {fn_key: tap(calieu)} cho phan tich effects
+Side effect: annotates the AST so the evaluator can run quickly:
+  - every expression has e['t'] = type (or 'never')
+  - e['rc'] = ('user', key) | ('builtin', name) for function calls
+  - e['rm'] = ('user', key) | ('builtin', op) for method calls
+  - program['edges'] = {fn_key: set(callees)} for effects analysis
 """
 from .lexer import HLError
 
@@ -30,8 +30,9 @@ def map_val(t):
 BUILTIN_FNS = {
     "print", "println", "panic", "exit", "str", "int", "len", "range",
     "map_new", "read_file", "write_file", "args", "clock_ms", "chr",
+    "file_exists",
 }
-IO_BUILTINS = {"print", "println", "read_file", "write_file", "exit", "args", "clock_ms"}
+IO_BUILTINS = {"print", "println", "read_file", "write_file", "exit", "args", "clock_ms", "file_exists"}
 
 STR_M = {
     "len": ([], "int"), "byte_at": (["int"], "int"),
@@ -55,7 +56,7 @@ class Checker:
         self.methods = {}  # struct -> {meth: key}
         self.cur_fn = None
 
-    # ---------- tiện ích ----------
+    # ---------- utilities ----------
     def err(self, msg, node):
         raise HLError(msg, node.get("line", 0), 0)
 
@@ -70,55 +71,55 @@ class Checker:
 
     def require_type(self, t, node, what):
         if t == "void":
-            self.err("khong the dung 'void' lam %s" % what, node)
+            self.err("cannot use 'void' as %s" % what, node)
         if not self.type_exists(t, node):
-            self.err("kieu khong ton tai: %s" % t, node)
+            self.err("type does not exist: %s" % t, node)
 
-    # ---------- vòng đời ----------
+    # ---------- lifecycle ----------
     def check(self):
-        # 1. gom phương thức theo struct
+        # 1. group methods by struct
         for key, fn in self.fns.items():
             if fn["struct"] is not None:
                 m = self.methods.setdefault(fn["struct"], {})
                 m[fn["name"]] = key
-        # 2. kiểm tra khai báo
+        # 2. check declarations
         for name, st in self.structs.items():
             for fname, ftype in st["fields"]:
-                self.require_type(ftype, st, "kieu truong struct")
+                self.require_type(ftype, st, "struct field type")
         for key, fn in self.fns.items():
             if fn["struct"] is None:
                 if fn["name"] in BUILTIN_FNS:
-                    self.err("khong the dinh nghia lai ham builtin: %s" % fn["name"], fn)
+                    self.err("cannot redefine builtin function: %s" % fn["name"], fn)
             else:
                 if fn["struct"] not in self.structs:
-                    self.err("impl cho struct khong ton tai: %s" % fn["struct"], fn)
+                    self.err("impl for non-existent struct: %s" % fn["struct"], fn)
                 if not fn["params"]:
-                    self.err("phuong thuc phai co tham so 'self' dau tien", fn)
+                    self.err("method must have 'self' as first parameter", fn)
                 sname, stype, _ = fn["params"][0]
                 if sname != "self" or stype != fn["struct"]:
-                    self.err("phuong thuc phai co tham so dau la 'self: %s'"
+                    self.err("method must have first parameter 'self: %s'"
                              % fn["struct"], fn)
             for pn, pt, _ in fn["params"]:
-                self.require_type(pt, fn, "kieu tham so")
+                self.require_type(pt, fn, "parameter type")
             if fn["ret"] != "void" and not self.type_exists(fn["ret"], fn):
-                self.err("kieu tra ve khong ton tai: %s" % fn["ret"], fn)
+                self.err("return type does not exist: %s" % fn["ret"], fn)
             self.edges[key] = set()
         if "main" not in self.fns:
-            self.err("thieu ham main", {"line": 1})
+            self.err("missing main function", {"line": 1})
         mainf = self.fns["main"]
         if mainf["struct"] is not None:
-            self.err("main khong duoc la phuong thuc", mainf)
+            self.err("main cannot be a method", mainf)
         if mainf["params"]:
-            self.err("main khong duoc co tham so", mainf)
+            self.err("main cannot have parameters", mainf)
         if mainf["ret"] not in ("int", "void"):
-            self.err("main phai tra ve 'int' hoac khong co kieu tra ve", mainf)
-        # 3. kiểm tra thân hàm
+            self.err("main must return 'int' or have no return type", mainf)
+        # 3. check function bodies
         for key, fn in self.fns.items():
             self.check_fn(key, fn)
-        # 4. phân tích hiệu ứng (bất động điểm trên đồ thị lời gọi)
+        # 4. effects analysis (fixpoint on the call graph)
         self.check_effects()
 
-    # ---------- môi trường ----------
+    # ---------- environment ----------
     def new_env(self, fn):
         env = [{}]
         if fn["struct"] is not None:
@@ -129,7 +130,7 @@ class Checker:
             params = fn["params"]
         for pn, pt, pm in params:
             if pn in env[0]:
-                self.err("tham so trung ten: %s" % pn, fn)
+                self.err("duplicate parameter name: %s" % pn, fn)
             env[0][pn] = [pt, pm]
         return env
 
@@ -144,7 +145,7 @@ class Checker:
         env = self.new_env(fn)
         self.check_stmts(fn["body"], env, fn, False)
         if fn["ret"] != "void" and not self.all_return(fn["body"]):
-            self.err("ham '%s' khong tra ve tren moi duong di" % fn["name"], fn)
+            self.err("function '%s' does not return on all paths" % fn["name"], fn)
 
     def all_return(self, stmts):
         if not stmts:
@@ -166,18 +167,21 @@ class Checker:
         env.append({})
         return env
 
-    # ---------- câu lệnh ----------
+    # ---------- statements ----------
     def check_stmt(self, s, env, fn, in_loop):
         k = s["k"]
         if k == "let":
-            self.require_type(s["t"], s, "kieu bien")
+            self.require_type(s["t"], s, "variable type")
             if self.lookup(env, s["name"]) is not None:
-                self.err("che khuat ten khong duoc phep: %s" % s["name"], s)
+                self.err("shadowing not allowed: %s" % s["name"], s)
             vt = self.check_expr(s["value"], env, s["t"])
             if vt == "never":
-                self.err("khong the gan bieu thuc khong bao gio tra ve", s)
+                # `let x: T = panic()` is sound: x is unreachable.
+                # Mark binding with the declared type so later references type-check.
+                env[-1][s["name"]] = [s["t"], s["mut"]]
+                return
             if vt != s["t"]:
-                self.err("kieu khong khop: khai bao %s nhung nhan %s"
+                self.err("type mismatch: declared %s but got %s"
                          % (s["t"], vt), s)
             env[-1][s["name"]] = [s["t"], s["mut"]]
         elif k == "assign":
@@ -185,7 +189,7 @@ class Checker:
         elif k == "if":
             ct = self.check_expr(s["cond"], env, None)
             if ct != "bool":
-                self.err("dieu kien if phai la bool, nhan %s" % ct, s)
+                self.err("if condition must be bool, got %s" % ct, s)
             self.child(env)
             self.check_stmts(s["then"], env, fn, in_loop)
             env.pop()
@@ -196,17 +200,17 @@ class Checker:
         elif k == "while":
             ct = self.check_expr(s["cond"], env, None)
             if ct != "bool":
-                self.err("dieu kien while phai la bool, nhan %s" % ct, s)
+                self.err("while condition must be bool, got %s" % ct, s)
             self.child(env)
             self.check_stmts(s["body"], env, fn, True)
             env.pop()
         elif k == "for":
             it = self.check_expr(s["iter"], env, None)
             if not is_list(it):
-                self.err("bieu thuc for-in phai la danh sach, nhan %s" % it, s)
+                self.err("for-in expression must be a list, got %s" % it, s)
             elem = list_elem(it)
             if s["vtype"] != elem:
-                self.err("kieu bien lap %s khong khop phan tu %s"
+                self.err("loop variable type %s does not match element %s"
                          % (s["vtype"], elem), s)
             self.child(env)
             env[-1][s["var"]] = [elem, False]
@@ -215,44 +219,45 @@ class Checker:
         elif k == "return":
             if fn["ret"] == "void":
                 if s["value"] is not None:
-                    self.err("ham tra ve void khong duoc return gia tri", s)
+                    self.err("void function cannot return a value", s)
             else:
                 if s["value"] is None:
-                    self.err("ham tra ve %s phai return gia tri" % fn["ret"], s)
+                    self.err("function returning %s must return a value" % fn["ret"], s)
                 vt = self.check_expr(s["value"], env, fn["ret"])
                 if vt != fn["ret"] and vt != "never":
-                    self.err("kieu return khong khop: can %s, nhan %s"
+                    self.err("return type mismatch: expected %s, got %s"
                              % (fn["ret"], vt), s)
         elif k == "break":
             if not in_loop:
-                self.err("break chi dung trong vong lap", s)
+                self.err("break only allowed inside a loop", s)
         elif k == "continue":
             if not in_loop:
-                self.err("continue chi dung trong vong lap", s)
+                self.err("continue only allowed inside a loop", s)
         elif k == "expr":
             self.check_expr(s["e"], env, None)
         else:
-            self.err("cau lenh khong xac dinh: %s" % k, s)
+            self.err("unknown statement: %s" % k, s)
 
     def check_assign(self, s, env):
         tgt = s["target"]
-        # tìm liên kết gốc
+        # find root binding
         root = tgt
         while root["k"] in ("field", "index"):
             root = root["target"]
         binding = self.lookup(env, root["name"])
         if binding is None:
-            self.err("bien khong ton tai: %s" % root["name"], s)
-        # 'mut' chỉ quản trị VIỆC GÁN LẠI LIÊN KẾT (name = v).
-        # Gán trường / chỉ số là thay đổi NỘI DUNG qua tham chiếu — không cần mut.
+            self.err("variable does not exist: %s" % root["name"], s)
+        # 'mut' only governs REASSIGNMENT of the binding (name = v).
+        # Field/index assignment mutates CONTENTS through a reference — no mut needed.
         if tgt["k"] == "ident" and not binding[1]:
-            self.err("khong the gan lai bien khong kha bien: %s" % root["name"], s)
+            self.err("cannot reassign immutable variable: %s" % root["name"], s)
         tt = self.check_lvalue(tgt, env)
         vt = self.check_expr(s["value"], env, tt)
         if vt == "never":
-            self.err("khong the gan bieu thuc khong bao gio tra ve", s)
+            # `x = panic()` is sound: unreachable. Treat as no-op for type checking.
+            return
         if vt != tt:
-            self.err("kieu khong khop khi gan: can %s, nhan %s" % (tt, vt), s)
+            self.err("type mismatch on assignment: expected %s, got %s" % (tt, vt), s)
 
     def check_lvalue(self, e, env):
         if e["k"] == "ident":
@@ -261,27 +266,27 @@ class Checker:
         if e["k"] == "field":
             bt = self.check_expr(e["target"], env, None)
             if bt not in self.structs:
-                self.err("khong the truy cap truong tren kieu %s" % bt, e)
+                self.err("cannot access field on type %s" % bt, e)
             for fname, ftype in self.structs[bt]["fields"]:
                 if fname == e["name"]:
                     return ftype
-            self.err("struct %s khong co truong %s" % (bt, e["name"]), e)
+            self.err("struct %s has no field %s" % (bt, e["name"]), e)
         if e["k"] == "index":
             tt = self.check_expr(e["target"], env, None)
             if not is_list(tt):
-                self.err("khong the dung chi so tren kieu %s" % tt, e)
+                self.err("cannot use index on type %s" % tt, e)
             it = self.check_expr(e["idx"], env, None)
             if it != "int":
-                self.err("chi so phai la int, nhan %s" % it, e)
+                self.err("index must be int, got %s" % it, e)
             return list_elem(tt)
-        self.err("ve trai khong hop le", e)
+        self.err("invalid lvalue", e)
 
-    # ---------- biểu thức ----------
+    # ---------- expressions ----------
     def check_expr(self, e, env, expected):
         k = e["k"]
         if k == "int":
             if e["v"] > INT64_MAX:
-                self.err("so nguyen qua lon (vuot int64)", e)
+                self.err("integer literal too large (exceeds int64)", e)
             e["t"] = "int"
         elif k == "float":
             e["t"] = "float"
@@ -292,7 +297,7 @@ class Checker:
         elif k == "ident":
             b = self.lookup(env, e["name"])
             if b is None:
-                self.err("bien khong ton tai: %s" % e["name"], e)
+                self.err("variable does not exist: %s" % e["name"], e)
             e["t"] = b[0]
         elif k == "bin":
             e["t"] = self.check_bin(e, env)
@@ -300,35 +305,35 @@ class Checker:
             vt = self.check_expr(e["e"], env, None)
             if e["op"] == "!":
                 if vt != "bool":
-                    self.err("toan tu ! can bool, nhan %s" % vt, e)
+                    self.err("! operator requires bool, got %s" % vt, e)
                 e["t"] = "bool"
             else:
                 if vt not in ("int", "float"):
-                    self.err("toan tu - can int/float, nhan %s" % vt, e)
+                    self.err("- operator requires int/float, got %s" % vt, e)
                 e["t"] = vt
         elif k == "index":
             tt = self.check_expr(e["target"], env, None)
             if tt == "never":
-                self.err("gia tri khong the dung trong bieu thuc", e)
+                self.err("never value cannot be used in expression", e)
             if not is_list(tt):
-                self.err("khong the dung chi so tren kieu %s" % tt, e)
+                self.err("cannot use index on type %s" % tt, e)
             it = self.check_expr(e["idx"], env, None)
             if it != "int":
-                self.err("chi so phai la int, nhan %s" % it, e)
+                self.err("index must be int, got %s" % it, e)
             e["t"] = list_elem(tt)
         elif k == "field":
             tt = self.check_expr(e["target"], env, None)
             if tt == "never":
-                self.err("gia tri khong the dung trong bieu thuc", e)
+                self.err("never value cannot be used in expression", e)
             if tt not in self.structs:
-                self.err("khong the truy cap truong tren kieu %s" % tt, e)
+                self.err("cannot access field on type %s" % tt, e)
             e["t"] = None
             for fname, ftype in self.structs[tt]["fields"]:
                 if fname == e["name"]:
                     e["t"] = ftype
                     break
             if e["t"] is None:
-                self.err("struct %s khong co truong %s" % (tt, e["name"]), e)
+                self.err("struct %s has no field %s" % (tt, e["name"]), e)
         elif k == "call":
             e["t"] = self.check_call(e, env, expected)
         elif k == "method":
@@ -339,29 +344,29 @@ class Checker:
             e["t"] = self.check_structlit(e, env)
         elif k == "mapnew":
             if expected is None or not is_map(expected):
-                self.err("map_new() can kieu 'map[str, T]' duoc khai bao o ngu canh", e)
+                self.err("map_new() requires a 'map[str, T]' type in the surrounding context", e)
             e["t"] = expected
         else:
-            self.err("bieu thuc khong xac dinh: %s" % k, e)
+            self.err("unknown expression: %s" % k, e)
         return e["t"]
 
     def check_bin(self, e, env):
         lt = self.check_expr(e["l"], env, None)
         rt = self.check_expr(e["r"], env, None)
         if lt == "never" or rt == "never":
-            self.err("gia tri khong the dung trong bieu thuc", e)
+            self.err("never value cannot be used in expression", e)
         op = e["op"]
         if op in ("||", "&&"):
             if lt != "bool" or rt != "bool":
-                self.err("toan tu %s can bool, nhan %s va %s" % (op, lt, rt), e)
+                self.err("%s operator requires bool, got %s and %s" % (op, lt, rt), e)
             return "bool"
         if op in ("==", "!="):
             if lt != rt or lt not in ("int", "float", "bool", "str"):
-                self.err("khong the so sanh == giua %s va %s" % (lt, rt), e)
+                self.err("cannot compare == between %s and %s" % (lt, rt), e)
             return "bool"
         if op in ("<", "<=", ">", ">="):
             if lt != rt or lt not in ("int", "float", "str"):
-                self.err("khong the so sanh thu tu giua %s va %s" % (lt, rt), e)
+                self.err("cannot compare ordering between %s and %s" % (lt, rt), e)
             return "bool"
         if op == "+":
             if lt == "int" and rt == "int":
@@ -370,14 +375,14 @@ class Checker:
                 return "float"
             if lt == "str" and rt == "str":
                 return "str"
-            self.err("toan tu + khong ho tro %s va %s" % (lt, rt), e)
+            self.err("+ operator does not support %s and %s" % (lt, rt), e)
         if op in ("-", "*", "/", "%"):
             if lt == "int" and rt == "int":
                 return "int"
             if lt == "float" and rt == "float":
                 return "float"
-            self.err("toan tu %s khong ho tro %s va %s" % (op, lt, rt), e)
-        self.err("toan tu khong xac dinh: %s" % op, e)
+            self.err("%s operator does not support %s and %s" % (op, lt, rt), e)
+        self.err("unknown operator: %s" % op, e)
 
     def check_listlit(self, e, env, expected):
         elem = None
@@ -385,32 +390,32 @@ class Checker:
             elem = list_elem(expected)
         if elem is None:
             if not e["items"]:
-                self.err("literal danh sach rong can kieu duoc khai bao o ngu canh", e)
+                self.err("empty list literal requires a type in the surrounding context", e)
             elem = self.check_expr(e["items"][0], env, None)
             if elem in ("void", "never"):
-                self.err("phan tu danh sach khong the co kieu %s" % elem, e)
+                self.err("list element cannot have type %s" % elem, e)
         for it in e["items"]:
             vt = self.check_expr(it, env, elem)
             if vt != elem:
-                self.err("phan tu danh sach khong khop: can %s, nhan %s"
+                self.err("list element mismatch: expected %s, got %s"
                          % (elem, vt), it)
         return "list[%s]" % elem
 
     def check_structlit(self, e, env):
         name = e["name"]
         if name not in self.structs:
-            self.err("struct khong ton tai: %s" % name, e)
+            self.err("struct does not exist: %s" % name, e)
         fields = self.structs[name]["fields"]
         if len(e["fields"]) != len(fields):
-            self.err("literal struct %s can dung %d truong, nhan %d"
+            self.err("struct literal %s requires exactly %d fields, got %d"
                      % (name, len(fields), len(e["fields"])), e)
         for (lfname, lfe), (fname, ftype) in zip(e["fields"], fields):
             if lfname != fname:
-                self.err("thu tu truong khong dung: mong doi '%s', nhan '%s'"
+                self.err("field order mismatch: expected '%s', got '%s'"
                          % (fname, lfname), e)
             vt = self.check_expr(lfe, env, ftype)
             if vt != ftype:
-                self.err("kiep truong %s khong khop: can %s, nhan %s"
+                self.err("field type %s mismatch: expected %s, got %s"
                          % (fname, ftype, vt), e)
         return name
 
@@ -423,33 +428,36 @@ class Checker:
         if name in self.fns:
             fn = self.fns[name]
             if fn["struct"] is not None:
-                self.err("phuong thuc phai duoc goi qua doi tuong: %s" % name, e)
+                self.err("method must be called through an object: %s" % name, e)
             e["rc"] = ("user", name)
             self.edges[self.cur_fn].add(name)
             if len(args) != len(fn["params"]):
-                self.err("ham %s can %d doi so, nhan %d"
+                self.err("function %s expects %d arguments, got %d"
                          % (name, len(fn["params"]), len(args)), e)
             for a, (pn, pt, _) in zip(args, fn["params"]):
                 at = self.check_expr(a, env, pt)
+                if at == "never":
+                    # `foo(panic())` is sound: argument is unreachable.
+                    continue
                 if at != pt:
-                    self.err("doi so '%s' cua %s can %s, nhan %s"
+                    self.err("argument '%s' of %s expects %s, got %s"
                              % (pn, name, pt, at), a)
             return fn["ret"]
-        self.err("ham khong ton tai: %s" % name, e)
+        self.err("function does not exist: %s" % name, e)
 
     def check_builtin_call(self, name, e, env, expected):
         args = e["args"]
 
         def need(n):
             if len(args) != n:
-                self.err("%s can %d doi so, nhan %d" % (name, n, len(args)), e)
+                self.err("%s expects %d arguments, got %d" % (name, n, len(args)), e)
 
         def argt(i, want):
             at = self.check_expr(args[i], env, want if want is not None else None)
             if at == "never":
-                self.err("gia tri khong the dung lam doi so", e)
+                self.err("never value cannot be used as an argument", e)
             if want is not None and at != want:
-                self.err("%s can doi so %s, nhan %s" % (name, want, at), e)
+                self.err("%s expects argument %s, got %s" % (name, want, at), e)
             return at
 
         if name in ("print", "println"):
@@ -470,7 +478,7 @@ class Checker:
             need(1)
             at = argt(0, None)
             if at not in ("int", "float", "bool", "str"):
-                self.err("str() khong ho tro kieu %s" % at, e)
+                self.err("str() does not support type %s" % at, e)
             return "str"
         if name == "int":
             need(1)
@@ -480,7 +488,7 @@ class Checker:
             need(1)
             at = argt(0, None)
             if at not in ("str",) and not is_list(at) and not is_map(at):
-                self.err("len() khong ho tro kieu %s" % at, e)
+                self.err("len() does not support type %s" % at, e)
             return "int"
         if name == "range":
             need(2)
@@ -490,7 +498,7 @@ class Checker:
         if name == "map_new":
             need(0)
             if expected is None or not is_map(expected):
-                self.err("map_new() can kieu 'map[str, T]' duoc khai bao o ngu canh", e)
+                self.err("map_new() requires a 'map[str, T]' type in the surrounding context", e)
             return expected
         if name == "read_file":
             need(1)
@@ -515,49 +523,56 @@ class Checker:
             need(0)
             self.edges[self.cur_fn].add("b:clock_ms")
             return "int"
-        self.err("ham builtin khong xac dinh: %s" % name, e)
+        if name == "file_exists":
+            need(1)
+            argt(0, "str")
+            self.edges[self.cur_fn].add("b:file_exists")
+            return "bool"
+        self.err("unknown builtin function: %s" % name, e)
 
     def check_method(self, e, env):
         tt = self.check_expr(e["target"], env, None)
         if tt == "never":
-            self.err("gia tri khong the dung trong bieu thuc", e)
+            self.err("never value cannot be used in expression", e)
         name = e["name"]
         args = e["args"]
         if tt in self.structs:
             m = self.methods.get(tt, {})
             if name not in m:
-                self.err("struct %s khong co phuong thuc %s" % (tt, name), e)
+                self.err("struct %s has no method %s" % (tt, name), e)
             key = m[name]
             e["rm"] = ("user", key)
             fn = self.fns[key]
             params = fn["params"][1:]
             if len(args) != len(params):
-                self.err("%s.%s can %d doi so, nhan %d"
+                self.err("%s.%s expects %d arguments, got %d"
                          % (tt, name, len(params), len(args)), e)
             for a, (pn, pt, _) in zip(args, params):
                 at = self.check_expr(a, env, pt)
+                if at == "never":
+                    continue
                 if at != pt:
-                    self.err("doi so '%s' cua %s.%s can %s, nhan %s"
+                    self.err("argument '%s' of %s.%s expects %s, got %s"
                              % (pn, tt, name, pt, at), a)
             return fn["ret"]
         if tt == "str":
             if name not in STR_M:
-                self.err("str khong co phuong thuc %s" % name, e)
+                self.err("str has no method %s" % name, e)
             ptypes, ret = STR_M[name]
             e["rm"] = ("builtin", "str." + name)
         elif tt == "int":
             if name not in INT_M:
-                self.err("int khong co phuong thuc %s" % name, e)
+                self.err("int has no method %s" % name, e)
             ptypes, ret = ([], INT_M[name]) if isinstance(INT_M[name], str) else INT_M[name]
             e["rm"] = ("builtin", "int." + name)
         elif tt == "float":
             if name not in FLOAT_M:
-                self.err("float khong co phuong thuc %s" % name, e)
+                self.err("float has no method %s" % name, e)
             ptypes, ret = ([], FLOAT_M[name])
             e["rm"] = ("builtin", "float." + name)
         elif tt == "bool":
             if name not in BOOL_M:
-                self.err("bool khong co phuong thuc %s" % name, e)
+                self.err("bool has no method %s" % name, e)
             ptypes, ret = ([], BOOL_M[name])
             e["rm"] = ("builtin", "bool." + name)
         elif is_list(tt):
@@ -570,7 +585,7 @@ class Checker:
                 "pop": ([], elem),
             }
             if name not in tbl:
-                self.err("list khong co phuong thuc %s" % name, e)
+                self.err("list has no method %s" % name, e)
             ptypes, ret = tbl[name]
             e["rm"] = ("builtin", "list." + name)
         elif is_map(tt):
@@ -583,21 +598,23 @@ class Checker:
                 "keys": ([], "list[str]"),
             }
             if name not in tbl:
-                self.err("map khong co phuong thuc %s" % name, e)
+                self.err("map has no method %s" % name, e)
             ptypes, ret = tbl[name]
             e["rm"] = ("builtin", "map." + name)
         else:
-            self.err("khong the goi phuong thuc tren kieu %s" % tt, e)
+            self.err("cannot call method on type %s" % tt, e)
         if len(args) != len(ptypes):
-            self.err("%s.%s can %d doi so, nhan %d"
+            self.err("%s.%s expects %d arguments, got %d"
                      % (tt, name, len(ptypes), len(args)), e)
         for a, pt in zip(args, ptypes):
             at = self.check_expr(a, env, pt)
+            if at == "never":
+                continue
             if at != pt:
-                self.err("doi so cua %s.%s can %s, nhan %s" % (tt, name, pt, at), a)
+                self.err("argument of %s.%s expects %s, got %s" % (tt, name, pt, at), a)
         return ret
 
-    # ---------- hiệu ứng ----------
+    # ---------- effects ----------
     def check_effects(self):
         eff = {}
         for key, fn in self.fns.items():
@@ -619,9 +636,9 @@ class Checker:
                         break
         for key, fn in self.fns.items():
             if eff[key] and not fn["uses_io"]:
-                for c in self.edges.get(key, ()):  # tìm một cạnh vi phạm để báo cáo
+                for c in self.edges.get(key, ()):  # find a violating edge to report
                     if c.startswith("b:") or eff.get(c):
-                        self.err("ham '%s' goi '%s' (IO) nhung khong khai bao 'uses IO'"
+                        self.err("function '%s' calls '%s' (IO) but does not declare 'uses IO'"
                                  % (fn["name"], c[2:] if c.startswith("b:") else c), fn)
 
 

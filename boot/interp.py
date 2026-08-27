@@ -1,9 +1,10 @@
-"""Trình đánh giá (evaluator) Stage-0 cho HLS.
+"""Stage-0 evaluator for HLS.
 
-Giá trị runtime:
-  int -> int (Python, luôn giữ trong phạm vi int64 nhờ phép toán kiểm tra)
+Runtime values:
+  int   -> int (Python, kept within int64 range by checked arithmetic)
   float -> float, bool -> bool, str -> bytes
-  list[T] -> list, map[str,T] -> dict (thứ tự chèn), struct -> dict {trường: giá trị}
+  list[T]      -> list
+  map[str,T]   -> dict (insertion-ordered), struct -> dict {field: value}
 """
 import math
 import sys
@@ -11,7 +12,7 @@ import time
 
 INT64_MIN = -(2 ** 63)
 INT64_MAX = 2 ** 63 - 1
-B_LOW = bytes(range(0x21))  # các byte <= 0x20 dùng cho trim
+B_LOW = bytes(range(0x21))  # bytes <= 0x20 used by trim
 
 
 class HLPanic(Exception):
@@ -34,48 +35,48 @@ class ContinueSig(Exception):
     pass
 
 
-# ---------- số học int64 kiểm tra ----------
+# ---------- int64 checked arithmetic ----------
 def i64_add(a, b, line):
     r = a + b
     if r < INT64_MIN or r > INT64_MAX:
-        raise HLPanic("tran so nguyen (overflow)", line)
+        raise HLPanic("integer overflow", line)
     return r
 
 
 def i64_sub(a, b, line):
     r = a - b
     if r < INT64_MIN or r > INT64_MAX:
-        raise HLPanic("tran so nguyen (overflow)", line)
+        raise HLPanic("integer overflow", line)
     return r
 
 
 def i64_mul(a, b, line):
     r = a * b
     if r < INT64_MIN or r > INT64_MAX:
-        raise HLPanic("tran so nguyen (overflow)", line)
+        raise HLPanic("integer overflow", line)
     return r
 
 
 def i64_neg(a, line):
     if a == INT64_MIN:
-        raise HLPanic("tran so nguyen (overflow)", line)
+        raise HLPanic("integer overflow", line)
     return -a
 
 
 def i64_div(a, b, line):
     if b == 0:
-        raise HLPanic("chia cho 0", line)
+        raise HLPanic("division by zero", line)
     if a == INT64_MIN and b == -1:
-        raise HLPanic("tran so nguyen (overflow)", line)
+        raise HLPanic("integer overflow", line)
     q = abs(a) // abs(b)
     return q if (a < 0) == (b < 0) else -q
 
 
 def i64_mod(a, b, line):
     if b == 0:
-        raise HLPanic("chia cho 0", line)
+        raise HLPanic("division by zero", line)
     if a == INT64_MIN and b == -1:
-        raise HLPanic("tran so nguyen (overflow)", line)
+        raise HLPanic("integer overflow", line)
     r = abs(a) % abs(b)
     return r if a >= 0 else -r
 
@@ -97,7 +98,7 @@ def f64_mod(a, b):
 
 
 def parse_int(s, line):
-    """Đổi bytes -> int, đúng ngữ nghĩa C của hàm builtin int()/to_int()."""
+    """Convert bytes -> int, matching the C semantics of builtin int()/to_int()."""
     n = len(s)
     i = 0
     neg = False
@@ -105,20 +106,20 @@ def parse_int(s, line):
         neg = True
         i = 1
     if i >= n:
-        raise HLPanic("khong the doi chuoi thanh int", line)
+        raise HLPanic("cannot convert string to int", line)
     v = 0
     while i < n:
         c = s[i]
         if c < 48 or c > 57:
-            raise HLPanic("khong the doi chuoi thanh int", line)
+            raise HLPanic("cannot convert string to int", line)
         v = v * 10 + (c - 48)
         if v > 2 ** 63:
-            raise HLPanic("so nguyen qua lon khi doi chuoi", line)
+            raise HLPanic("integer too large when converting string", line)
         i += 1
     if neg:
         return -v
     if v > INT64_MAX:
-        raise HLPanic("so nguyen qua lon khi doi chuoi", line)
+        raise HLPanic("integer too large when converting string", line)
     return v
 
 
@@ -140,14 +141,14 @@ class Interp:
         self.out = out
         self.line = 0
 
-    # ---------- vòng đời ----------
+    # ---------- lifecycle ----------
     def run(self):
-        """Chạy main(); trả về mã thoát."""
+        """Run main(); return exit code."""
         try:
             r = self.call_fn("main", [])
         except HLPanic as ex:
             self.out.flush()
-            sys.stderr.write("panic: %s (tai dong %d)\n" % (to_display(ex.msg), ex.line))
+            sys.stderr.write("panic: %s (at line %d)\n" % (to_display(ex.msg), ex.line))
             return 101
         if r is None:
             return 0
@@ -171,7 +172,7 @@ class Interp:
             return r.value
         return None
 
-    # ---------- câu lệnh ----------
+    # ---------- statements ----------
     def exec_stmts(self, stmts, env):
         for s in stmts:
             self.exec_stmt(s, env)
@@ -209,7 +210,7 @@ class Interp:
                     env.pop()
         elif k == "for":
             lst = self.eval_expr(s["iter"], env)
-            n = len(lst)  # chụp độ dài một lần (SPEC mục 5)
+            n = len(lst)  # snapshot length once (SPEC section 5)
             i = 0
             while i < n:
                 env.append({s["var"]: [lst[i], False]})
@@ -231,7 +232,7 @@ class Interp:
         elif k == "expr":
             self.eval_expr(s["e"], env)
         else:
-            raise HLPanic("cau lenh khong xac dinh: %s" % k, self.line)
+            raise HLPanic("unknown statement: %s" % k, self.line)
 
     def exec_assign(self, s, env):
         val = self.eval_expr(s["value"], env)
@@ -241,19 +242,19 @@ class Interp:
                 if t["name"] in scope:
                     scope[t["name"]][0] = val
                     return
-            raise HLPanic("bien khong ton tai: %s" % t["name"], self.line)
+            raise HLPanic("variable does not exist: %s" % t["name"], self.line)
         base = self.eval_expr(t["target"], env)
         if t["k"] == "field":
             base[t["name"]] = val
         elif t["k"] == "index":
             i = self.eval_expr(t["idx"], env)
             if i < 0 or i >= len(base):
-                raise HLPanic("truy cap mang ngoai pham vi", self.line)
+                raise HLPanic("array access out of bounds", self.line)
             base[i] = val
         else:
-            raise HLPanic("ve trai khong hop le", self.line)
+            raise HLPanic("invalid lvalue", self.line)
 
-    # ---------- biểu thức ----------
+    # ---------- expressions ----------
     def eval_expr(self, e, env):
         k = e["k"]
         if k == "ident":
@@ -261,7 +262,7 @@ class Interp:
             for scope in reversed(env):
                 if name in scope:
                     return scope[name][0]
-            raise HLPanic("bien khong ton tai: %s" % name, self.line)
+            raise HLPanic("variable does not exist: %s" % name, self.line)
         if k == "bin":
             return self.eval_bin(e, env)
         if k == "int" or k == "float" or k == "bool" or k == "str":
@@ -285,7 +286,7 @@ class Interp:
             lst = self.eval_expr(e["target"], env)
             i = self.eval_expr(e["idx"], env)
             if i < 0 or i >= len(lst):
-                raise HLPanic("truy cap mang ngoai pham vi", self.line)
+                raise HLPanic("array access out of bounds", self.line)
             return lst[i]
         if k == "un":
             v = self.eval_expr(e["e"], env)
@@ -300,7 +301,7 @@ class Interp:
             return {fname: self.eval_expr(fe, env) for fname, fe in e["fields"]}
         if k == "mapnew":
             return {}
-        raise HLPanic("bieu thuc khong xac dinh: %s" % k, self.line)
+        raise HLPanic("unknown expression: %s" % k, self.line)
 
     def eval_bin(self, e, env):
         op = e["op"]
@@ -329,7 +330,7 @@ class Interp:
         if op == "+":
             if type(a) is int:
                 return i64_add(a, b, self.line)
-            return a + b  # float hoặc str
+            return a + b  # float or str
         if op == "-":
             if type(a) is int:
                 return i64_sub(a, b, self.line)
@@ -346,9 +347,9 @@ class Interp:
             if type(a) is int:
                 return i64_mod(a, b, self.line)
             return f64_mod(a, b)
-        raise HLPanic("toan tu khong xac dinh: %s" % op, self.line)
+        raise HLPanic("unknown operator: %s" % op, self.line)
 
-    # ---------- builtin ----------
+    # ---------- builtins ----------
     def builtin(self, name, args):
         line = self.line
         if name == "print":
@@ -384,23 +385,26 @@ class Interp:
                 with open(args[0], "rb") as f:
                     return f.read()
             except OSError:
-                raise HLPanic("khong the mo tep: %s" % to_display(args[0]), line)
+                raise HLPanic("cannot open file: %s" % to_display(args[0]), line)
         if name == "write_file":
             try:
                 with open(args[0], "wb") as f:
                     f.write(args[1])
                 return None
             except OSError:
-                raise HLPanic("khong the ghi tep: %s" % to_display(args[0]), line)
+                raise HLPanic("cannot write file: %s" % to_display(args[0]), line)
         if name == "args":
             return list(self.argv)
         if name == "chr":
             if args[0] < 0 or args[0] > 255:
-                raise HLPanic("chr ngoai pham vi 0..255", line)
+                raise HLPanic("chr out of range 0..255", line)
             return bytes([args[0]])
         if name == "clock_ms":
             return int(time.monotonic() * 1000)
-        raise HLPanic("ham builtin khong xac dinh: %s" % name, line)
+        if name == "file_exists":
+            import os
+            return os.path.isfile(args[0].decode("utf-8", "replace"))
+        raise HLPanic("unknown builtin function: %s" % name, line)
 
     def builtin_method(self, op, t, args):
         line = self.line
@@ -408,12 +412,12 @@ class Interp:
             return len(t)
         if op == "str.byte_at":
             if args[0] < 0 or args[0] >= len(t):
-                raise HLPanic("truy cap chuoi ngoai pham vi", line)
+                raise HLPanic("string access out of bounds", line)
             return t[args[0]]
         if op == "str.slice":
             a, b = args
             if a < 0 or b < a or b > len(t):
-                raise HLPanic("slice chuoi khong hop le", line)
+                raise HLPanic("invalid string slice", line)
             return t[a:b]
         if op == "str.find":
             return t.find(args[0])
@@ -425,29 +429,29 @@ class Interp:
             return t.endswith(args[0])
         if op == "str.split":
             if len(args[0]) == 0:
-                raise HLPanic("phan tach chuoi rong khong hop le", line)
+                raise HLPanic("empty separator not allowed", line)
             return t.split(args[0])
         if op == "str.trim":
             return t.strip(B_LOW)
         if op == "str.to_int":
             return parse_int(t, line)
         if op == "str.to_float":
-            # nghiêm ngặt: ^-?[0-9]+(\.[0-9]+)?$ — giống hệt bản C
+            # strict: ^-?[0-9]+(\.[0-9]+)?$ — matches the C version exactly
             i = 0
             if t[0:1] == b"-":
                 i = 1
             if i >= len(t):
-                raise HLPanic("khong the doi chuoi thanh float", line)
+                raise HLPanic("cannot convert string to float", line)
             dots = 0
             while i < len(t):
                 c = t[i]
                 if c == 46:
                     dots += 1
                 elif not (48 <= c <= 57):
-                    raise HLPanic("khong the doi chuoi thanh float", line)
+                    raise HLPanic("cannot convert string to float", line)
                 i += 1
             if dots > 1:
-                raise HLPanic("khong the doi chuoi thanh float", line)
+                raise HLPanic("cannot convert string to float", line)
             return float(t)
         if op == "str.to_str":
             return t
@@ -472,15 +476,15 @@ class Interp:
             return None
         if op == "list.get":
             if args[0] < 0 or args[0] >= len(t):
-                raise HLPanic("truy cap mang ngoai pham vi", line)
+                raise HLPanic("array access out of bounds", line)
             return t[args[0]]
         if op == "list.pop":
             if len(t) == 0:
-                raise HLPanic("truy cap mang ngoai pham vi", line)
+                raise HLPanic("array access out of bounds", line)
             return t.pop()
         if op == "list.set":
             if args[0] < 0 or args[0] >= len(t):
-                raise HLPanic("truy cap mang ngoai pham vi", line)
+                raise HLPanic("array access out of bounds", line)
             t[args[0]] = args[1]
             return None
         if op == "map.len":
@@ -495,4 +499,4 @@ class Interp:
             return args[0] in t
         if op == "map.keys":
             return list(t.keys())
-        raise HLPanic("phuong thuc builtin khong xac dinh: %s" % op, line)
+        raise HLPanic("unknown builtin method: %s" % op, line)
