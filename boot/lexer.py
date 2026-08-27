@@ -1,0 +1,150 @@
+"""Bộ từ vựng (lexer) Stage-0 cho Hieu Louis (HLS). Chuẩn theo SPEC.md mục 2."""
+
+KEYWORDS = {
+    "fn", "let", "mut", "return", "if", "else", "while", "for", "in",
+    "break", "continue", "struct", "impl", "import", "uses", "true", "false",
+}
+
+TWO_CHAR = ("->", "==", "!=", "<=", ">=", "&&", "||")
+ONE_CHAR = set("(){}[],:.<>+-*/%!=")
+
+
+class HLError(Exception):
+    """Lỗi biên dịch của HLS (kèm vị trí dòng:cột)."""
+
+    def __init__(self, msg, line, col):
+        super().__init__(msg)
+        self.msg = msg
+        self.line = line
+        self.col = col
+
+    def __str__(self):
+        return "%s (dong %d:%d)" % (self.msg, self.line, self.col)
+
+
+def _is_ident_start(c):
+    return (65 <= c <= 90) or (97 <= c <= 122) or c == 95
+
+
+def _is_ident_char(c):
+    return _is_ident_start(c) or (48 <= c <= 57)
+
+
+def tokenize(src):
+    """src: bytes -> list[dict] token {k, v, line, col}.
+
+    k trong: kw | ident | int | float | str | sym | eof
+    v: str (kw/ident/sym), int, float, bytes (str)
+    """
+    toks = []
+    i, n = 0, len(src)
+    line, col = 1, 1
+
+    def err(msg):
+        raise HLError(msg, line, col)
+
+    while i < n:
+        c = src[i]
+        # ký tự trắng
+        if c in (32, 9, 13, 10):
+            if c == 10:
+                line += 1
+                col = 1
+            else:
+                col += 1
+            i += 1
+            continue
+        # ghi chú # ... hết dòng
+        if c == 35:  # '#'
+            while i < n and src[i] != 10:
+                i += 1
+            continue
+        # định danh / từ khoá
+        if _is_ident_start(c):
+            j = i
+            while j < n and _is_ident_char(src[j]):
+                j += 1
+            word = src[i:j].decode("ascii")
+            if word in KEYWORDS:
+                toks.append({"k": "kw", "v": word, "line": line, "col": col})
+            else:
+                toks.append({"k": "ident", "v": word, "line": line, "col": col})
+            col += j - i
+            i = j
+            continue
+        # số
+        if 48 <= c <= 57:
+            j = i
+            while j < n and (48 <= src[j] <= 57 or src[j] == 95):  # '_'
+                j += 1
+            is_float = False
+            if j < n and src[j] == 46 and j + 1 < n and 48 <= src[j + 1] <= 57:
+                is_float = True
+                j += 1
+                while j < n and (48 <= src[j] <= 57 or src[j] == 95):
+                    j += 1
+            text = src[i:j].decode("ascii").replace("_", "")
+            if is_float:
+                toks.append({"k": "float", "v": float(text), "line": line, "col": col})
+            else:
+                toks.append({"k": "int", "v": int(text), "line": line, "col": col})
+            col += j - i
+            i = j
+            continue
+        # chuỗi
+        if c == 34:  # '"'
+            ln, cl = line, col
+            i += 1
+            col += 1
+            out = bytearray()
+            while True:
+                if i >= n:
+                    raise HLError("chuoi khong dong", ln, cl)
+                ch = src[i]
+                if ch == 34:
+                    i += 1
+                    col += 1
+                    break
+                if ch == 92:  # '\\'
+                    if i + 1 >= n:
+                        raise HLError("chuoi khong dong", ln, cl)
+                    e = src[i + 1]
+                    if e == 110:
+                        out.append(10)
+                    elif e == 116:
+                        out.append(9)
+                    elif e == 92:
+                        out.append(92)
+                    elif e == 34:
+                        out.append(34)
+                    else:
+                        err("ky hieu thoat khong hop le: \\%s" % chr(e))
+                    i += 2
+                    col += 2
+                    continue
+                if ch < 32:
+                    err("chuoi chua ky tu dieu khien khong hop le")
+                out.append(ch)
+                if ch == 10:
+                    line += 1
+                    col = 1
+                else:
+                    col += 1
+                i += 1
+            toks.append({"k": "str", "v": bytes(out), "line": ln, "col": cl})
+            continue
+        # toán tử / ký hiệu
+        two = src[i:i + 2].decode("latin-1")
+        if two in TWO_CHAR:
+            toks.append({"k": "sym", "v": two, "line": line, "col": col})
+            i += 2
+            col += 2
+            continue
+        if chr(c) in ONE_CHAR:
+            toks.append({"k": "sym", "v": chr(c), "line": line, "col": col})
+            i += 1
+            col += 1
+            continue
+        err("ky tu khong hop le: %r" % chr(c))
+    toks.append({"k": "eof", "v": "", "line": line, "col": col})
+    return toks

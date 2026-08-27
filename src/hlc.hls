@@ -1,0 +1,2998 @@
+# ============================================================================
+# hlc — TRÌNH BIÊN DỊCH HIEU LOUIS (HLS -> C)
+# ----------------------------------------------------------------------------
+# Toan bo trinh bien dich nay duoc viet 100% bang chinh Hieu Louis.
+# Day la buoc tu dich (self-hosting) cua ngon ngu: compiler cua ngon ngu
+# duoc viet bang ngon ngu do.
+#
+# Chuoi bootstrap:
+#   python3 boot/boot.py src/hlc.hls <vao.hls> <ra.c>
+#   gcc -O2 -o <chuong_trinh> <ra.c>
+#
+# Cau truc: LEXER -> PARSER -> CHECKER (kieu + effects) -> CODEGEN (C)
+# Moi trang thai duoc truyen dien ro qua Ctx — khong co bien toan cuc.
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# 1. CAU TRUC DU LIEU
+# ----------------------------------------------------------------------------
+
+struct Tok {
+    kind: str,
+    value: str,
+    line: int,
+    col: int
+}
+
+struct Binding {
+    t: str,
+    is_mut: bool
+}
+
+struct StructInfo {
+    name: str,
+    fields: list[str],
+    ftypes: list[str],
+    line: int
+}
+
+struct FnInfo {
+    name: str,
+    params: list[str],
+    ptypes: list[str],
+    pmuts: list[bool],
+    ret: str,
+    uses_io: bool,
+    body: list[int],
+    is_method: bool,
+    struct_of: str,
+    line: int
+}
+
+struct ExprN {
+    kind: str,
+    op: str,
+    name: str,
+    sval: str,
+    ival: int,
+    fval: float,
+    bval: bool,
+    left: int,
+    right: int,
+    args: list[int],
+    ffields: list[str],
+    t: str,
+    muser: bool,
+    mkey: str,
+    mop: str,
+    line: int
+}
+
+struct StmtN {
+    kind: str,
+    name: str,
+    vtype: str,
+    is_mut: bool,
+    value: int,
+    target: int,
+    cond: int,
+    body: list[int],
+    else_body: list[int],
+    iter: int,
+    e: int,
+    line: int
+}
+
+struct Ctx {
+    src: str,
+    toks: list[Tok],
+    pos: int,
+    exprs: list[ExprN],
+    stmts: list[StmtN],
+    structs: map[str, StructInfo],
+    fns: map[str, FnInfo],
+    fn_order: list[str],
+    methods_of: map[str, list[str]],
+    out: list[str],
+    lit_helpers: list[str],
+    lit_count: int,
+    gen_locals: map[str, str],
+    gen_counts: map[str, int],
+    tmp: int,
+    edges: map[str, list[str]]
+}
+
+fn new_ctx(src: str) -> Ctx {
+    return Ctx {
+        src: src, toks: [], pos: 0,
+        exprs: [], stmts: [],
+        structs: map_new(), fns: map_new(), fn_order: [],
+        methods_of: map_new(),
+        out: [], lit_helpers: [], lit_count: 0,
+        gen_locals: map_new(), gen_counts: map_new(), tmp: 0,
+        edges: map_new()
+    }
+}
+
+# ---Ham dung chung---
+
+fn join(parts: list[str], sep: str) -> str {
+    let mut acc: str = ""
+    let mut i: int = 0
+    while i < parts.len() {
+        if i > 0 {
+            acc = acc + sep
+        }
+        acc = acc + parts.get(i)
+        i = i + 1
+    }
+    return acc
+}
+
+fn is_keyword(w: str) -> bool {
+    return w == "fn" || w == "let" || w == "mut" || w == "return" || w == "if"
+        || w == "else" || w == "while" || w == "for" || w == "in"
+        || w == "break" || w == "continue" || w == "struct" || w == "impl"
+        || w == "import" || w == "uses" || w == "true" || w == "false"
+}
+
+fn is_ident_start(c: int) -> bool {
+    return (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95
+}
+
+fn is_ident_char(c: int) -> bool {
+    return is_ident_start(c) || (c >= 48 && c <= 57)
+}
+
+fn is_digit(c: int) -> bool {
+    return c >= 48 && c <= 57
+}
+
+# Loc bo gach duoi trong so: "1_000" -> "1000"
+fn filter_us(s: str) -> str {
+    let parts: list[str] = []
+    let mut i: int = 0
+    while i < s.len() {
+        if s.byte_at(i) != 95 {
+            parts.push(s.slice(i, i + 1))
+        }
+        i = i + 1
+    }
+    return join(parts, "")
+}
+
+# ----------------------------------------------------------------------------
+# 2. LEXER
+# ----------------------------------------------------------------------------
+
+fn mk_tok(kind: str, value: str, line: int, col: int) -> Tok {
+    return Tok { kind: kind, value: value, line: line, col: col }
+}
+
+fn lex_err(msg: str, line: int, col: int) -> void {
+    panic("loi tu vung: " + msg + " (dong " + line.to_str() + ":" + col.to_str() + ")")
+}
+
+fn lex(ctx: Ctx) -> void {
+    let src: str = ctx.src
+    let n: int = src.len()
+    let mut i: int = 0
+    let mut line: int = 1
+    let mut col: int = 1
+    while i < n {
+        let c: int = src.byte_at(i)
+        # ky tu trang
+        if c == 32 || c == 9 || c == 13 {
+            col = col + 1
+            i = i + 1
+        } else if c == 10 {
+            line = line + 1
+            col = 1
+            i = i + 1
+        } else if c == 35 {
+            # ghi chu # ... het dong
+            while i < n && src.byte_at(i) != 10 {
+                i = i + 1
+            }
+        } else if is_ident_start(c) {
+            let mut j: int = i
+            while j < n && is_ident_char(src.byte_at(j)) {
+                j = j + 1
+            }
+            let word: str = src.slice(i, j)
+            if is_keyword(word) {
+                ctx.toks.push(mk_tok("kw", word, line, col))
+            } else {
+                ctx.toks.push(mk_tok("ident", word, line, col))
+            }
+            col = col + (j - i)
+            i = j
+        } else if is_digit(c) {
+            let mut j: int = i
+            while j < n && (is_digit(src.byte_at(j)) || src.byte_at(j) == 95) {
+                j = j + 1
+            }
+            let mut is_f: bool = false
+            if j < n && src.byte_at(j) == 46 && j + 1 < n && is_digit(src.byte_at(j + 1)) {
+                is_f = true
+                j = j + 1
+                while j < n && (is_digit(src.byte_at(j)) || src.byte_at(j) == 95) {
+                    j = j + 1
+                }
+            }
+            let text: str = filter_us(src.slice(i, j))
+            if is_f {
+                ctx.toks.push(mk_tok("float", text, line, col))
+            } else {
+                ctx.toks.push(mk_tok("int", text, line, col))
+            }
+            col = col + (j - i)
+            i = j
+        } else if c == 34 {
+            # chuoi
+            let ln: int = line
+            let cl: int = col
+            i = i + 1
+            col = col + 1
+            let parts: list[str] = []
+            let mut closed: bool = false
+            while i < n {
+                let ch: int = src.byte_at(i)
+                if ch == 34 {
+                    i = i + 1
+                    col = col + 1
+                    closed = true
+                    break
+                }
+                if ch == 92 {
+                    if i + 1 >= n {
+                        lex_err("chuoi khong dong", ln, cl)
+                    }
+                    let mut e: int = src.byte_at(i + 1)
+                    if e == 110 {
+                        parts.push(chr(10))
+                    } else if e == 116 {
+                        parts.push(chr(9))
+                    } else if e == 92 {
+                        parts.push(chr(92))
+                    } else if e == 34 {
+                        parts.push(chr(34))
+                    } else {
+                        lex_err("ky hieu thoat khong hop le", ln, cl)
+                    }
+                    i = i + 2
+                    col = col + 2
+                } else {
+                    if ch < 32 {
+                        lex_err("chuoi chua ky tu dieu khien", ln, cl)
+                    }
+                    parts.push(src.slice(i, i + 1))
+                    col = col + 1
+                    i = i + 1
+                }
+            }
+            if !closed {
+                lex_err("chuoi khong dong", ln, cl)
+            }
+            ctx.toks.push(mk_tok("str", join(parts, ""), ln, cl))
+        } else {
+            # toan tu / ky hieu
+            let mut two: str = ""
+            if i + 2 <= n {
+                two = src.slice(i, i + 2)
+            }
+            if two == "->" || two == "==" || two == "!=" || two == "<=" || two == ">=" || two == "&&" || two == "||" {
+                ctx.toks.push(mk_tok("sym", two, line, col))
+                i = i + 2
+                col = col + 2
+            } else if c == 40 || c == 41 || c == 123 || c == 125 || c == 91 || c == 93 || c == 44 || c == 58 || c == 46 || c == 60 || c == 62 || c == 43 || c == 45 || c == 42 || c == 47 || c == 37 || c == 33 || c == 61 {
+                ctx.toks.push(mk_tok("sym", chr(c), line, col))
+                i = i + 1
+                col = col + 1
+            } else {
+                lex_err("ky tu khong hop le", line, col)
+            }
+        }
+    }
+    ctx.toks.push(mk_tok("eof", "", line, col))
+}
+
+# ----------------------------------------------------------------------------
+# 3. PARSER
+# ----------------------------------------------------------------------------
+
+fn nx_expr(ctx: Ctx, kind: str, line: int) -> int {
+    let mut e: ExprN = ExprN {
+        kind: kind, op: "", name: "", sval: "", ival: 0, fval: 0.0,
+        bval: false, left: -1, right: -1, args: [], ffields: [], t: "",
+        muser: false, mkey: "", mop: "", line: line
+    }
+    ctx.exprs.push(e)
+    return ctx.exprs.len() - 1
+}
+
+fn nx_stmt(ctx: Ctx, kind: str, line: int) -> int {
+    let s: StmtN = StmtN {
+        kind: kind, name: "", vtype: "", is_mut: false, value: -1,
+        target: -1, cond: -1, body: [], else_body: [], iter: -1, e: -1,
+        line: line
+    }
+    ctx.stmts.push(s)
+    return ctx.stmts.len() - 1
+}
+
+fn perr(ctx: Ctx, msg: str) -> void {
+    let t: Tok = ctx.toks.get(ctx.pos)
+    panic("loi cu phap: " + msg + " (dong " + t.line.to_str() + ":" + t.col.to_str() + ")")
+}
+
+fn perr_at(ctx: Ctx, msg: str, t: Tok) -> void {
+    panic("loi cu phap: " + msg + " (dong " + t.line.to_str() + ":" + t.col.to_str() + ")")
+}
+
+fn tok_desc(ctx: Ctx) -> str {
+    let t: Tok = ctx.toks.get(ctx.pos)
+    if t.kind == "eof" {
+        return "cuoi tep"
+    }
+    return "'" + t.value + "'"
+}
+
+fn at_sym(ctx: Ctx, v: str) -> bool {
+    let t: Tok = ctx.toks.get(ctx.pos)
+    return t.kind == "sym" && t.value == v
+}
+
+fn at_kw(ctx: Ctx, v: str) -> bool {
+    let t: Tok = ctx.toks.get(ctx.pos)
+    return t.kind == "kw" && t.value == v
+}
+
+fn eat_sym(ctx: Ctx, v: str) -> void {
+    if !at_sym(ctx, v) {
+        perr(ctx, "mong doi ky hieu '" + v + "' nhung gap " + tok_desc(ctx))
+    }
+    ctx.pos = ctx.pos + 1
+}
+
+fn eat_kw(ctx: Ctx, v: str) -> void {
+    if !at_kw(ctx, v) {
+        perr(ctx, "mong doi tu khoa '" + v + "' nhung gap " + tok_desc(ctx))
+    }
+    ctx.pos = ctx.pos + 1
+}
+
+fn eat_ident(ctx: Ctx) -> str {
+    let t: Tok = ctx.toks.get(ctx.pos)
+    if t.kind != "ident" {
+        perr(ctx, "mong doi dinh danh nhung gap " + tok_desc(ctx))
+    }
+    ctx.pos = ctx.pos + 1
+    return t.value
+}
+
+fn peek2_is(ctx: Ctx, v: str) -> bool {
+    if ctx.pos + 1 >= ctx.toks.len() {
+        return false
+    }
+    let t: Tok = ctx.toks.get(ctx.pos + 1)
+    return t.kind == "sym" && t.value == v
+}
+
+# --- Phan tich kieu: tra ve chuoi kieu chuan hoa ---
+
+fn parse_type(ctx: Ctx, allow_void: bool) -> str {
+    let t: Tok = ctx.toks.get(ctx.pos)
+    if t.kind != "ident" {
+        perr(ctx, "mong doi kieu nhung gap " + tok_desc(ctx))
+    }
+    let base: str = t.value
+    ctx.pos = ctx.pos + 1
+    if base == "list" {
+        eat_sym(ctx, "[")
+        let inner: str = parse_type(ctx, false)
+        eat_sym(ctx, "]")
+        return "list[" + inner + "]"
+    }
+    if base == "map" {
+        eat_sym(ctx, "[")
+        let kt: str = eat_ident(ctx)
+        if kt != "str" {
+            perr_at(ctx, "khoa map trong v0.1 chi duoc la 'str'", t)
+        }
+        eat_sym(ctx, ",")
+        let vt: str = parse_type(ctx, false)
+        eat_sym(ctx, "]")
+        return "map[str, " + vt + "]"
+    }
+    if base == "int" || base == "float" || base == "bool" || base == "str" {
+        return base
+    }
+    if base == "void" {
+        if !allow_void {
+            perr_at(ctx, "void chi dung lam kieu tra ve", t)
+        }
+        return "void"
+    }
+    return base
+}
+
+# --- Phan tich chuong trinh ---
+
+fn parse_program(ctx: Ctx) -> void {
+    while ctx.toks.get(ctx.pos).kind != "eof" {
+        let t: Tok = ctx.toks.get(ctx.pos)
+        if t.kind == "kw" && t.value == "struct" {
+            let st: StructInfo = parse_struct(ctx)
+            if ctx.structs.has(st.name) {
+                perr_at(ctx, "struct trung ten: " + st.name, t)
+            }
+            ctx.structs.set(st.name, st)
+        } else if t.kind == "kw" && t.value == "impl" {
+            parse_impl(ctx)
+        } else if t.kind == "kw" && t.value == "fn" {
+            let f: FnInfo = parse_fn(ctx, "")
+            if ctx.fns.has(f.name) {
+                perr_at(ctx, "ham trung ten: " + f.name, t)
+            }
+            ctx.fns.set(f.name, f)
+            ctx.fn_order.push(f.name)
+        } else if t.kind == "kw" && t.value == "import" {
+            perr_at(ctx, "import chua duoc ho tro trong v0.1 (Giai doan 6)", t)
+        } else {
+            perr_at(ctx, "chi duoc khai bao struct/impl/fn o muc dinh", t)
+        }
+    }
+}
+
+fn parse_struct(ctx: Ctx) -> StructInfo {
+    let t0: Tok = ctx.toks.get(ctx.pos)
+    eat_kw(ctx, "struct")
+    let name: str = eat_ident(ctx)
+    eat_sym(ctx, "{")
+    let fields: list[str] = []
+    let ftypes: list[str] = []
+    while !at_sym(ctx, "}") {
+        let ft: str = eat_ident(ctx)
+        eat_sym(ctx, ":")
+        let ty: str = parse_type(ctx, false)
+        fields.push(ft)
+        ftypes.push(ty)
+        if at_sym(ctx, ",") {
+            ctx.pos = ctx.pos + 1
+        } else if !at_sym(ctx, "}") {
+            perr(ctx, "mong doi ',' hoac '}' trong dinh nghia struct")
+        }
+    }
+    eat_sym(ctx, "}")
+    if fields.len() == 0 {
+        perr_at(ctx, "struct phai co it nhat mot truong", t0)
+    }
+    return StructInfo { name: name, fields: fields, ftypes: ftypes, line: t0.line }
+}
+
+fn parse_impl(ctx: Ctx) -> void {
+    eat_kw(ctx, "impl")
+    let sname: str = eat_ident(ctx)
+    eat_sym(ctx, "{")
+    while !at_sym(ctx, "}") {
+        if !at_kw(ctx, "fn") {
+            perr(ctx, "trong impl chi duoc dinh nghia fn")
+        }
+        let f: FnInfo = parse_fn(ctx, sname)
+        let mut key: str = sname + "." + f.name
+        if ctx.fns.has(key) {
+            panic("loi cu phap: phuong thuc trung ten: " + key)
+        }
+        ctx.fns.set(key, f)
+        ctx.fn_order.push(key)
+        if !ctx.methods_of.has(sname) {
+            ctx.methods_of.set(sname, [])
+        }
+        ctx.methods_of.get_or(sname, []).push(key)
+    }
+    eat_sym(ctx, "}")
+}
+
+fn parse_fn(ctx: Ctx, impl_struct: str) -> FnInfo {
+    let t0: Tok = ctx.toks.get(ctx.pos)
+    eat_kw(ctx, "fn")
+    let name: str = eat_ident(ctx)
+    eat_sym(ctx, "(")
+    let params: list[str] = []
+    let ptypes: list[str] = []
+    let pmuts: list[bool] = []
+    while !at_sym(ctx, ")") {
+        let mut is_mut: bool = false
+        if at_kw(ctx, "mut") {
+            ctx.pos = ctx.pos + 1
+            is_mut = true
+        }
+        let pn: str = eat_ident(ctx)
+        eat_sym(ctx, ":")
+        let pt: str = parse_type(ctx, false)
+        params.push(pn)
+        ptypes.push(pt)
+        pmuts.push(is_mut)
+        if at_sym(ctx, ",") {
+            ctx.pos = ctx.pos + 1
+        } else if !at_sym(ctx, ")") {
+            perr(ctx, "mong doi ',' hoac ')' trong tham so")
+        }
+    }
+    eat_sym(ctx, ")")
+    let mut ret: str = "void"
+    if at_sym(ctx, "->") {
+        ctx.pos = ctx.pos + 1
+        ret = parse_type(ctx, true)
+    }
+    let mut uses_io: bool = false
+    if at_kw(ctx, "uses") {
+        ctx.pos = ctx.pos + 1
+        let io: str = eat_ident(ctx)
+        if io != "IO" {
+            perr(ctx, "hieu ung duy nhat trong v0.1 la 'uses IO'")
+        }
+        uses_io = true
+    }
+    let body: list[int] = parse_block(ctx)
+    return FnInfo {
+        name: name, params: params, ptypes: ptypes, pmuts: pmuts,
+        ret: ret, uses_io: uses_io, body: body,
+        is_method: impl_struct != "", struct_of: impl_struct, line: t0.line
+    }
+}
+
+fn parse_block(ctx: Ctx) -> list[int] {
+    eat_sym(ctx, "{")
+    let mut out: list[int] = []
+    while !at_sym(ctx, "}") {
+        out.push(parse_stmt(ctx))
+    }
+    eat_sym(ctx, "}")
+    return out
+}
+
+# --- Phan tich cau lenh ---
+
+fn parse_stmt(ctx: Ctx) -> int {
+    let t: Tok = ctx.toks.get(ctx.pos)
+    if t.kind == "kw" {
+        if t.value == "let" {
+            return parse_let(ctx)
+        }
+        if t.value == "return" {
+            ctx.pos = ctx.pos + 1
+            let idx: int = nx_stmt(ctx, "return", t.line)
+            if at_sym(ctx, "}") {
+                ctx.stmts[idx].value = -1
+            } else {
+                ctx.stmts[idx].value = parse_expr(ctx, true)
+            }
+            return idx
+        }
+        if t.value == "if" {
+            return parse_if(ctx)
+        }
+        if t.value == "while" {
+            ctx.pos = ctx.pos + 1
+            let cond: int = parse_expr(ctx, false)
+            let body: list[int] = parse_block(ctx)
+            let idx: int = nx_stmt(ctx, "while", t.line)
+            ctx.stmts[idx].cond = cond
+            ctx.stmts[idx].body = body
+            return idx
+        }
+        if t.value == "for" {
+            ctx.pos = ctx.pos + 1
+            let vn: str = eat_ident(ctx)
+            eat_sym(ctx, ":")
+            let vt: str = parse_type(ctx, false)
+            eat_kw(ctx, "in")
+            let it: int = parse_expr(ctx, false)
+            let body: list[int] = parse_block(ctx)
+            let idx: int = nx_stmt(ctx, "for", t.line)
+            ctx.stmts[idx].name = vn
+            ctx.stmts[idx].vtype = vt
+            ctx.stmts[idx].iter = it
+            ctx.stmts[idx].body = body
+            return idx
+        }
+        if t.value == "break" {
+            ctx.pos = ctx.pos + 1
+            return nx_stmt(ctx, "break", t.line)
+        }
+        if t.value == "continue" {
+            ctx.pos = ctx.pos + 1
+            return nx_stmt(ctx, "continue", t.line)
+        }
+        if t.value == "struct" || t.value == "impl" || t.value == "fn" {
+            perr_at(ctx, "khai bao " + t.value + " chi duoc o muc dinh", t)
+        }
+        perr_at(ctx, "tu khoa khong the bat dau cau lenh: " + t.value, t)
+    }
+    # bieu thuc / phep gan
+    let mut e: int = parse_expr(ctx, true)
+    if at_sym(ctx, "=") {
+        let eq: Tok = ctx.toks.get(ctx.pos)
+        ctx.pos = ctx.pos + 1
+        if ctx.exprs[e].kind != "ident" && ctx.exprs[e].kind != "field" && ctx.exprs[e].kind != "index" {
+            perr_at(ctx, "ve trai cua phep gan phai la bien/truong/chi so", eq)
+        }
+        if ctx.exprs[e].kind == "field" || ctx.exprs[e].kind == "index" {
+            require_ident_root(ctx, e)
+        }
+        let val: int = parse_expr(ctx, true)
+        let idx: int = nx_stmt(ctx, "assign", eq.line)
+        ctx.stmts[idx].target = e
+        ctx.stmts[idx].value = val
+        return idx
+    }
+    if ctx.exprs[e].kind != "call" && ctx.exprs[e].kind != "method" {
+        perr(ctx, "bieu thuc lam cau lenh phai la loi goi ham/phuong thuc")
+    }
+    let idx: int = nx_stmt(ctx, "expr", ctx.exprs[e].line)
+    ctx.stmts[idx].e = e
+    return idx
+}
+
+fn require_ident_root(ctx: Ctx, e: int) -> void {
+    let mut k: str = ctx.exprs[e].kind
+    if k == "field" || k == "index" {
+        require_ident_root(ctx, ctx.exprs[e].left)
+    } else if k != "ident" {
+        perr(ctx, "ve trai cua phep gan phai bat dau tu bien")
+    }
+}
+
+fn parse_let(ctx: Ctx) -> int {
+    let t: Tok = ctx.toks.get(ctx.pos)
+    ctx.pos = ctx.pos + 1
+    let mut is_mut: bool = false
+    if at_kw(ctx, "mut") {
+        ctx.pos = ctx.pos + 1
+        is_mut = true
+    }
+    let name: str = eat_ident(ctx)
+    eat_sym(ctx, ":")
+    let ty: str = parse_type(ctx, false)
+    eat_sym(ctx, "=")
+    let val: int = parse_expr(ctx, true)
+    let idx: int = nx_stmt(ctx, "let", t.line)
+    ctx.stmts[idx].name = name
+    ctx.stmts[idx].vtype = ty
+    ctx.stmts[idx].is_mut = is_mut
+    ctx.stmts[idx].value = val
+    return idx
+}
+
+fn parse_if(ctx: Ctx) -> int {
+    let t: Tok = ctx.toks.get(ctx.pos)
+    ctx.pos = ctx.pos + 1
+    let cond: int = parse_expr(ctx, false)
+    let then_b: list[int] = parse_block(ctx)
+    let mut else_b: list[int] = []
+    if at_kw(ctx, "else") {
+        ctx.pos = ctx.pos + 1
+        if at_kw(ctx, "if") {
+            else_b.push(parse_if(ctx))
+        } else {
+            else_b = parse_block(ctx)
+        }
+    }
+    let idx: int = nx_stmt(ctx, "if", t.line)
+    ctx.stmts[idx].cond = cond
+    ctx.stmts[idx].body = then_b
+    ctx.stmts[idx].else_body = else_b
+    return idx
+}
+
+# --- Phan tich bieu thuc ---
+
+fn parse_expr(ctx: Ctx, allow_struct: bool) -> int {
+    return parse_bin(ctx, 0, allow_struct)
+}
+
+fn op_at_level(level: int, op: str) -> bool {
+    if level == 0 {
+        return op == "||"
+    }
+    if level == 1 {
+        return op == "&&"
+    }
+    if level == 2 {
+        return op == "==" || op == "!="
+    }
+    if level == 3 {
+        return op == "<" || op == "<=" || op == ">" || op == ">="
+    }
+    if level == 4 {
+        return op == "+" || op == "-"
+    }
+    return op == "*" || op == "/" || op == "%"
+}
+
+fn parse_bin(ctx: Ctx, level: int, allow_struct: bool) -> int {
+    if level >= 6 {
+        return parse_unary(ctx, allow_struct)
+    }
+    let mut left: int = parse_bin(ctx, level + 1, allow_struct)
+    while true {
+        let t: Tok = ctx.toks.get(ctx.pos)
+        if t.kind != "sym" {
+            break
+        }
+        if !op_at_level(level, t.value) {
+            break
+        }
+        ctx.pos = ctx.pos + 1
+        let right: int = parse_bin(ctx, level + 1, allow_struct)
+        let idx: int = nx_expr(ctx, "bin", t.line)
+        ctx.exprs[idx].op = t.value
+        ctx.exprs[idx].left = left
+        ctx.exprs[idx].right = right
+        left = idx
+    }
+    return left
+}
+
+fn parse_unary(ctx: Ctx, allow_struct: bool) -> int {
+    let t: Tok = ctx.toks.get(ctx.pos)
+    if t.kind == "sym" && (t.value == "!" || t.value == "-") {
+        ctx.pos = ctx.pos + 1
+        let mut e: int = parse_unary(ctx, allow_struct)
+        if t.value == "-" && ctx.exprs[e].kind == "int" && ctx.exprs[e].op == "big" {
+            # gap -9223372036854775808 thanh INT64_MIN
+            ctx.exprs[e].op = ""
+            return e
+        }
+        let idx: int = nx_expr(ctx, "un", t.line)
+        ctx.exprs[idx].op = t.value
+        ctx.exprs[idx].left = e
+        return idx
+    }
+    return parse_postfix(ctx, allow_struct)
+}
+
+fn can_index(k: str) -> bool {
+    return k == "ident" || k == "field" || k == "index" || k == "call" || k == "method"
+}
+
+fn parse_postfix(ctx: Ctx, allow_struct: bool) -> int {
+    let mut e: int = parse_primary(ctx, allow_struct)
+    while true {
+        let t: Tok = ctx.toks.get(ctx.pos)
+        if t.kind != "sym" {
+            break
+        }
+        if t.value == "." {
+            ctx.pos = ctx.pos + 1
+            let name: str = eat_ident(ctx)
+            if at_sym(ctx, "(") {
+                let args: list[int] = parse_args(ctx)
+                let idx: int = nx_expr(ctx, "method", t.line)
+                ctx.exprs[idx].name = name
+                ctx.exprs[idx].left = e
+                ctx.exprs[idx].args = args
+                e = idx
+            } else {
+                let idx: int = nx_expr(ctx, "field", t.line)
+                ctx.exprs[idx].name = name
+                ctx.exprs[idx].left = e
+                e = idx
+            }
+        } else if t.value == "[" && can_index(ctx.exprs[e].kind) {
+            ctx.pos = ctx.pos + 1
+            let idx_e: int = parse_expr(ctx, true)
+            eat_sym(ctx, "]")
+            let idx: int = nx_expr(ctx, "index", t.line)
+            ctx.exprs[idx].left = e
+            ctx.exprs[idx].right = idx_e
+            e = idx
+        } else if t.value == "(" && ctx.exprs[e].kind == "ident" {
+            let args: list[int] = parse_args(ctx)
+            let idx: int = nx_expr(ctx, "call", ctx.exprs[e].line)
+            ctx.exprs[idx].name = ctx.exprs[e].name
+            ctx.exprs[idx].args = args
+            e = idx
+        } else {
+            break
+        }
+    }
+    return e
+}
+
+fn parse_args(ctx: Ctx) -> list[int] {
+    eat_sym(ctx, "(")
+    let mut out: list[int] = []
+    while !at_sym(ctx, ")") {
+        out.push(parse_expr(ctx, true))
+        if at_sym(ctx, ",") {
+            ctx.pos = ctx.pos + 1
+        } else if !at_sym(ctx, ")") {
+            perr(ctx, "mong doi ',' hoac ')' trong doi so")
+        }
+    }
+    eat_sym(ctx, ")")
+    return out
+}
+
+fn parse_primary(ctx: Ctx, allow_struct: bool) -> int {
+    let t: Tok = ctx.toks.get(ctx.pos)
+    if t.kind == "int" {
+        ctx.pos = ctx.pos + 1
+        let idx: int = nx_expr(ctx, "int", t.line)
+        if t.value.len() > 19 {
+            perr_at(ctx, "so nguyen qua lon (vuot int64)", t)
+        } else if t.value.len() == 19 && t.value > "9223372036854775808" {
+            perr_at(ctx, "so nguyen qua lon (vuot int64)", t)
+        } else if t.value.len() == 19 && t.value == "9223372036854775808" {
+            # 2^63: chi hop le khi gap voi dau tru thanh INT64_MIN
+            ctx.exprs[idx].ival = -9223372036854775808
+            ctx.exprs[idx].op = "big"
+        } else {
+            ctx.exprs[idx].ival = t.value.to_int()
+        }
+        return idx
+    }
+    if t.kind == "float" {
+        ctx.pos = ctx.pos + 1
+        let idx: int = nx_expr(ctx, "float", t.line)
+        ctx.exprs[idx].fval = t.value.to_float()
+        return idx
+    }
+    if t.kind == "str" {
+        ctx.pos = ctx.pos + 1
+        let idx: int = nx_expr(ctx, "str", t.line)
+        ctx.exprs[idx].sval = t.value
+        return idx
+    }
+    if t.kind == "kw" && (t.value == "true" || t.value == "false") {
+        ctx.pos = ctx.pos + 1
+        let idx: int = nx_expr(ctx, "bool", t.line)
+        ctx.exprs[idx].bval = t.value == "true"
+        return idx
+    }
+    if t.kind == "ident" {
+        if allow_struct && peek2_is(ctx, "{") {
+            return parse_struct_lit(ctx)
+        }
+        ctx.pos = ctx.pos + 1
+        let idx: int = nx_expr(ctx, "ident", t.line)
+        ctx.exprs[idx].name = t.value
+        return idx
+    }
+    if t.kind == "sym" && t.value == "(" {
+        ctx.pos = ctx.pos + 1
+        let mut e: int = parse_expr(ctx, true)
+        eat_sym(ctx, ")")
+        return e
+    }
+    if t.kind == "sym" && t.value == "[" {
+        ctx.pos = ctx.pos + 1
+        let items: list[int] = []
+        while !at_sym(ctx, "]") {
+            items.push(parse_expr(ctx, true))
+            if at_sym(ctx, ",") {
+                ctx.pos = ctx.pos + 1
+            } else if !at_sym(ctx, "]") {
+                perr(ctx, "mong doi ',' hoac ']' trong literal danh sach")
+            }
+        }
+        eat_sym(ctx, "]")
+        let idx: int = nx_expr(ctx, "listlit", t.line)
+        ctx.exprs[idx].args = items
+        return idx
+    }
+    perr(ctx, "mong doi bieu thuc nhung gap " + tok_desc(ctx))
+    return -1
+}
+
+fn parse_struct_lit(ctx: Ctx) -> int {
+    let t: Tok = ctx.toks.get(ctx.pos)
+    let name: str = t.value
+    ctx.pos = ctx.pos + 1
+    eat_sym(ctx, "{")
+    let fnames: list[str] = []
+    let fexprs: list[int] = []
+    while !at_sym(ctx, "}") {
+        let fname: str = eat_ident(ctx)
+        eat_sym(ctx, ":")
+        fnames.push(fname)
+        fexprs.push(parse_expr(ctx, true))
+        if at_sym(ctx, ",") {
+            ctx.pos = ctx.pos + 1
+        } else if !at_sym(ctx, "}") {
+            perr(ctx, "mong doi ',' hoac '}' trong literal struct")
+        }
+    }
+    eat_sym(ctx, "}")
+    let idx: int = nx_expr(ctx, "structlit", t.line)
+    ctx.exprs[idx].name = name
+    ctx.exprs[idx].ffields = fnames
+    ctx.exprs[idx].args = fexprs
+    return idx
+}
+
+# ----------------------------------------------------------------------------
+# 4. CHECKER — kiem tra kieu + phan tich effects (trai tim bao mat)
+# ----------------------------------------------------------------------------
+
+fn cerr(line: int, msg: str) -> void {
+    panic("loi kieu: " + msg + " (dong " + line.to_str() + ")")
+}
+
+fn is_list_t(t: str) -> bool {
+    return t.starts_with("list[")
+}
+
+fn list_elem_t(t: str) -> str {
+    return t.slice(5, t.len() - 1)
+}
+
+fn is_map_t(t: str) -> bool {
+    return t.starts_with("map[str, ")
+}
+
+fn map_val_t(t: str) -> str {
+    return t.slice(9, t.len() - 1)
+}
+
+fn is_builtin_fn(n: str) -> bool {
+    return n == "print" || n == "println" || n == "panic" || n == "exit"
+        || n == "str" || n == "int" || n == "len" || n == "range"
+        || n == "map_new" || n == "read_file" || n == "write_file"
+        || n == "args" || n == "clock_ms" || n == "chr"
+}
+
+fn type_exists(ctx: Ctx, t: str) -> bool {
+    if t == "int" || t == "float" || t == "bool" || t == "str" {
+        return true
+    }
+    if is_list_t(t) {
+        return type_exists(ctx, list_elem_t(t))
+    }
+    if is_map_t(t) {
+        return type_exists(ctx, map_val_t(t))
+    }
+    return ctx.structs.has(t)
+}
+
+fn require_type(ctx: Ctx, t: str, line: int, what: str) -> void {
+    if t == "void" {
+        cerr(line, "khong the dung 'void' lam " + what)
+    }
+    if !type_exists(ctx, t) {
+        cerr(line, "kieu khong ton tai: " + t)
+    }
+}
+
+fn dummy_binding() -> Binding {
+    return Binding { t: "", is_mut: false }
+}
+
+fn lookup_binding(env: list[map[str, Binding]], name: str) -> Binding {
+    let mut i: int = env.len() - 1
+    while i >= 0 {
+        if env.get(i).has(name) {
+            return env.get(i).get_or(name, dummy_binding())
+        }
+        i = i - 1
+    }
+    return dummy_binding()
+}
+
+fn lookup_exists(env: list[map[str, Binding]], name: str) -> bool {
+    let mut i: int = env.len() - 1
+    while i >= 0 {
+        if env.get(i).has(name) {
+            return true
+        }
+        i = i - 1
+    }
+    return false
+}
+
+fn add_edge(ctx: Ctx, cur: str, callee: str) -> void {
+    if !ctx.edges.has(cur) {
+        ctx.edges.set(cur, [])
+    }
+    ctx.edges.get_or(cur, []).push(callee)
+}
+
+# --- Vong doi checker ---
+
+fn check_program(ctx: Ctx) -> void {
+    # 1. kiem tra khai bao
+    let mut i: int = 0
+    while i < ctx.fn_order.len() {
+        let mut key: str = ctx.fn_order.get(i)
+        let f: FnInfo = ctx.fns.get_or(key, dummy_fn())
+        if !f.is_method {
+            if is_builtin_fn(f.name) {
+                cerr(f.line, "khong the dinh nghia lai ham builtin: " + f.name)
+            }
+        } else {
+            if !ctx.structs.has(f.struct_of) {
+                cerr(f.line, "impl cho struct khong ton tai: " + f.struct_of)
+            }
+            if f.params.len() == 0 {
+                cerr(f.line, "phuong thuc phai co tham so 'self' dau tien")
+            }
+            if f.params.get(0) != "self" || f.ptypes.get(0) != f.struct_of {
+                cerr(f.line, "phuong thuc phai co tham so dau la 'self: " + f.struct_of + "'")
+            }
+        }
+        let mut j: int = 0
+        while j < f.params.len() {
+            require_type(ctx, f.ptypes.get(j), f.line, "kieu tham so")
+            j = j + 1
+        }
+        if f.ret != "void" {
+            if !type_exists(ctx, f.ret) {
+                cerr(f.line, "kieu tra ve khong ton tai: " + f.ret)
+            }
+        }
+        i = i + 1
+    }
+    # 2. struct: kieu truong
+    let keys_s: list[str] = ctx.structs.keys()
+    let mut si: int = 0
+    while si < keys_s.len() {
+        let st: StructInfo = ctx.structs.get_or(keys_s.get(si), ctx.structs.get_or(keys_s.get(0), dummy_struct()))
+        let mut fi: int = 0
+        while fi < st.ftypes.len() {
+            require_type(ctx, st.ftypes.get(fi), st.line, "kieu truong struct")
+            fi = fi + 1
+        }
+        si = si + 1
+    }
+    # 3. main
+    if !ctx.fns.has("main") {
+        cerr(1, "thieu ham main")
+    }
+    let mf: FnInfo = ctx.fns.get_or("main", dummy_fn())
+    if mf.is_method {
+        cerr(mf.line, "main khong duoc la phuong thuc")
+    }
+    if mf.params.len() > 0 {
+        cerr(mf.line, "main khong duoc co tham so")
+    }
+    if mf.ret != "int" && mf.ret != "void" {
+        cerr(mf.line, "main phai tra ve 'int' hoac khong co kieu tra ve")
+    }
+    # 4. kiem tra than ham
+    let mut bi: int = 0
+    while bi < ctx.fn_order.len() {
+        check_fn_body(ctx, ctx.fn_order.get(bi))
+        bi = bi + 1
+    }
+    # 5. phan tich effects
+    check_effects(ctx)
+}
+
+fn dummy_struct() -> StructInfo {
+    return StructInfo { name: "", fields: [], ftypes: [], line: 0 }
+}
+
+fn dummy_fn() -> FnInfo {
+    return FnInfo {
+        name: "", params: [], ptypes: [], pmuts: [], ret: "void",
+        uses_io: false, body: [], is_method: false, struct_of: "", line: 0
+    }
+}
+
+fn check_fn_body(ctx: Ctx, key: str) -> void {
+    let f: FnInfo = ctx.fns.get_or(key, dummy_fn())
+    let env: list[map[str, Binding]] = []
+    let scope0: map[str, Binding] = map_new()
+    if f.is_method {
+        scope0.set(f.params.get(0), Binding { t: f.ptypes.get(0), is_mut: f.pmuts.get(0) })
+        let mut i: int = 1
+        while i < f.params.len() {
+            scope0.set(f.params.get(i), Binding { t: f.ptypes.get(i), is_mut: f.pmuts.get(i) })
+            i = i + 1
+        }
+    } else {
+        let mut i: int = 0
+        while i < f.params.len() {
+            let pn: str = f.params.get(i)
+            if scope0.has(pn) {
+                cerr(f.line, "tham so trung ten: " + pn)
+            }
+            scope0.set(pn, Binding { t: f.ptypes.get(i), is_mut: f.pmuts.get(i) })
+            i = i + 1
+        }
+    }
+    env.push(scope0)
+    check_stmts(ctx, env, key, f, f.body, false)
+    if f.ret != "void" {
+        if !all_return(ctx, f.body) {
+            cerr(f.line, "ham '" + f.name + "' khong tra ve tren moi duong di")
+        }
+    }
+}
+
+fn all_return(ctx: Ctx, stmts: list[int]) -> bool {
+    if stmts.len() == 0 {
+        return false
+    }
+    let last: int = stmts.get(stmts.len() - 1)
+    let mut k: str = ctx.stmts[last].kind
+    if k == "return" {
+        return true
+    }
+    if k == "expr" && ctx.exprs[ctx.stmts[last].e].t == "never" {
+        return true
+    }
+    if k == "if" {
+        if ctx.stmts[last].else_body.len() > 0 {
+            return all_return(ctx, ctx.stmts[last].body) && all_return(ctx, ctx.stmts[last].else_body)
+        }
+    }
+    return false
+}
+
+fn check_stmts(ctx: Ctx, env: list[map[str, Binding]], cur: str, f: FnInfo, stmts: list[int], in_loop: bool) -> void {
+    let mut i: int = 0
+    while i < stmts.len() {
+        check_stmt(ctx, env, cur, f, stmts.get(i), in_loop)
+        i = i + 1
+    }
+}
+
+fn check_stmt(ctx: Ctx, env: list[map[str, Binding]], cur: str, f: FnInfo, sidx: int, in_loop: bool) -> void {
+    let s: StmtN = ctx.stmts[sidx]
+    if s.kind == "let" {
+        require_type(ctx, s.vtype, s.line, "kieu bien")
+        if lookup_exists(env, s.name) {
+            cerr(s.line, "che khuat ten khong duoc phep: " + s.name)
+        }
+        let vt: str = check_expr(ctx, env, cur, s.value, s.vtype)
+        if vt == "never" {
+            cerr(s.line, "khong the gan bieu thuc khong bao gio tra ve")
+        }
+        if vt != s.vtype {
+            cerr(s.line, "kieu khong khop: khai bao " + s.vtype + " nhung nhan " + vt)
+        }
+        env.get(env.len() - 1).set(s.name, Binding { t: s.vtype, is_mut: s.is_mut })
+    } else if s.kind == "assign" {
+        check_assign(ctx, env, cur, s)
+    } else if s.kind == "if" {
+        let ct: str = check_expr(ctx, env, cur, s.cond, "")
+        if ct != "bool" {
+            cerr(s.line, "dieu kien if phai la bool, nhan " + ct)
+        }
+        env.push(map_new())
+        check_stmts(ctx, env, cur, f, s.body, in_loop)
+        env.pop()
+        if s.else_body.len() > 0 {
+            env.push(map_new())
+            check_stmts(ctx, env, cur, f, s.else_body, in_loop)
+            env.pop()
+        }
+    } else if s.kind == "while" {
+        let ct: str = check_expr(ctx, env, cur, s.cond, "")
+        if ct != "bool" {
+            cerr(s.line, "dieu kien while phai la bool, nhan " + ct)
+        }
+        env.push(map_new())
+        check_stmts(ctx, env, cur, f, s.body, true)
+        env.pop()
+    } else if s.kind == "for" {
+        let it: str = check_expr(ctx, env, cur, s.iter, "")
+        if !is_list_t(it) {
+            cerr(s.line, "bieu thuc for-in phai la danh sach, nhan " + it)
+        }
+        let mut elem: str = list_elem_t(it)
+        if s.vtype != elem {
+            cerr(s.line, "kieu bien lap " + s.vtype + " khong khop phan tu " + elem)
+        }
+        env.push(map_new())
+        env.get(env.len() - 1).set(s.name, Binding { t: elem, is_mut: false })
+        check_stmts(ctx, env, cur, f, s.body, true)
+        env.pop()
+    } else if s.kind == "return" {
+        if f.ret == "void" {
+            if s.value != -1 {
+                cerr(s.line, "ham tra ve void khong duoc return gia tri")
+            }
+        } else {
+            if s.value == -1 {
+                cerr(s.line, "ham tra ve " + f.ret + " phai return gia tri")
+            }
+            let vt: str = check_expr(ctx, env, cur, s.value, f.ret)
+            if vt != f.ret && vt != "never" {
+                cerr(s.line, "kieu return khong khop: can " + f.ret + ", nhan " + vt)
+            }
+        }
+    } else if s.kind == "break" {
+        if !in_loop {
+            cerr(s.line, "break chi dung trong vong lap")
+        }
+    } else if s.kind == "continue" {
+        if !in_loop {
+            cerr(s.line, "continue chi dung trong vong lap")
+        }
+    } else if s.kind == "expr" {
+        check_expr(ctx, env, cur, s.e, "")
+    } else {
+        cerr(s.line, "cau lenh khong xac dinh: " + s.kind)
+    }
+}
+
+fn check_assign(ctx: Ctx, env: list[map[str, Binding]], cur: str, s: StmtN) -> void {
+    let tgt: int = s.target
+    # tim lien ket goc
+    let mut root: int = tgt
+    while ctx.exprs[root].kind == "field" || ctx.exprs[root].kind == "index" {
+        root = ctx.exprs[root].left
+    }
+    let b: Binding = lookup_binding(env, ctx.exprs[root].name)
+    if b.t == "" {
+        cerr(s.line, "bien khong ton tai: " + ctx.exprs[root].name)
+    }
+    # 'mut' chi quan triet viec gan lai lien ket (name = v)
+    if ctx.exprs[tgt].kind == "ident" && !b.is_mut {
+        cerr(s.line, "khong the gan lai bien khong kha bien: " + ctx.exprs[root].name)
+    }
+    let tt: str = check_lvalue(ctx, env, cur, tgt)
+    let vt: str = check_expr(ctx, env, cur, s.value, tt)
+    if vt == "never" {
+        cerr(s.line, "khong the gan bieu thuc khong bao gio tra ve")
+    }
+    if vt != tt {
+        cerr(s.line, "kieu khong khop khi gan: can " + tt + ", nhan " + vt)
+    }
+}
+
+fn check_lvalue(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int) -> str {
+    if ctx.exprs[e].kind == "ident" {
+        return lookup_binding(env, ctx.exprs[e].name).t
+    }
+    if ctx.exprs[e].kind == "field" {
+        let bt: str = check_expr(ctx, env, cur, ctx.exprs[e].left, "")
+        if !ctx.structs.has(bt) {
+            cerr(ctx.exprs[e].line, "khong the truy cap truong tren kieu " + bt)
+        }
+        return field_type(ctx, bt, ctx.exprs[e].name, ctx.exprs[e].line)
+    }
+    if ctx.exprs[e].kind == "index" {
+        let tt: str = check_expr(ctx, env, cur, ctx.exprs[e].left, "")
+        if !is_list_t(tt) {
+            cerr(ctx.exprs[e].line, "khong the dung chi so tren kieu " + tt)
+        }
+        let it: str = check_expr(ctx, env, cur, ctx.exprs[e].right, "")
+        if it != "int" {
+            cerr(ctx.exprs[e].line, "chi so phai la int, nhan " + it)
+        }
+        return list_elem_t(tt)
+    }
+    cerr(ctx.exprs[e].line, "ve trai khong hop le")
+    return ""
+}
+
+fn field_type(ctx: Ctx, sname: str, fname: str, line: int) -> str {
+    let st: StructInfo = ctx.structs.get_or(sname, dummy_struct())
+    let mut i: int = 0
+    while i < st.fields.len() {
+        if st.fields.get(i) == fname {
+            return st.ftypes.get(i)
+        }
+        i = i + 1
+    }
+    cerr(line, "struct " + sname + " khong co truong " + fname)
+    return ""
+}
+
+fn check_expr(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, expected: str) -> str {
+    let mut k: str = ctx.exprs[e].kind
+    if k == "int" {
+        if ctx.exprs[e].op == "big" {
+            cerr(ctx.exprs[e].line, "so nguyen qua lon (vuot int64)")
+        }
+        ctx.exprs[e].t = "int"
+    } else if k == "float" {
+        ctx.exprs[e].t = "float"
+    } else if k == "bool" {
+        ctx.exprs[e].t = "bool"
+    } else if k == "str" {
+        ctx.exprs[e].t = "str"
+    } else if k == "ident" {
+        let b: Binding = lookup_binding(env, ctx.exprs[e].name)
+        if b.t == "" {
+            cerr(ctx.exprs[e].line, "bien khong ton tai: " + ctx.exprs[e].name)
+        }
+        ctx.exprs[e].t = b.t
+    } else if k == "bin" {
+        ctx.exprs[e].t = check_bin(ctx, env, cur, e)
+    } else if k == "un" {
+        let vt: str = check_expr(ctx, env, cur, ctx.exprs[e].left, "")
+        if ctx.exprs[e].op == "!" {
+            if vt != "bool" {
+                cerr(ctx.exprs[e].line, "toan tu ! can bool, nhan " + vt)
+            }
+            ctx.exprs[e].t = "bool"
+        } else {
+            if vt != "int" && vt != "float" {
+                cerr(ctx.exprs[e].line, "toan tu - can int/float, nhan " + vt)
+            }
+            ctx.exprs[e].t = vt
+        }
+    } else if k == "index" {
+        let tt: str = check_expr(ctx, env, cur, ctx.exprs[e].left, "")
+        if tt == "never" {
+            cerr(ctx.exprs[e].line, "gia tri khong the dung trong bieu thuc")
+        }
+        if !is_list_t(tt) {
+            cerr(ctx.exprs[e].line, "khong the dung chi so tren kieu " + tt)
+        }
+        let it: str = check_expr(ctx, env, cur, ctx.exprs[e].right, "")
+        if it != "int" {
+            cerr(ctx.exprs[e].line, "chi so phai la int, nhan " + it)
+        }
+        ctx.exprs[e].t = list_elem_t(tt)
+    } else if k == "field" {
+        let tt: str = check_expr(ctx, env, cur, ctx.exprs[e].left, "")
+        if tt == "never" {
+            cerr(ctx.exprs[e].line, "gia tri khong the dung trong bieu thuc")
+        }
+        if !ctx.structs.has(tt) {
+            cerr(ctx.exprs[e].line, "khong the truy cap truong tren kieu " + tt)
+        }
+        ctx.exprs[e].t = field_type(ctx, tt, ctx.exprs[e].name, ctx.exprs[e].line)
+    } else if k == "call" {
+        ctx.exprs[e].t = check_call(ctx, env, cur, e, expected)
+    } else if k == "method" {
+        ctx.exprs[e].t = check_method(ctx, env, cur, e)
+    } else if k == "listlit" {
+        ctx.exprs[e].t = check_listlit(ctx, env, cur, e, expected)
+    } else if k == "structlit" {
+        ctx.exprs[e].t = check_structlit(ctx, env, cur, e)
+    } else if k == "mapnew" {
+        if expected == "" || !is_map_t(expected) {
+            cerr(ctx.exprs[e].line, "map_new() can kieu 'map[str, T]' duoc khai bao o ngu canh")
+        }
+        ctx.exprs[e].t = expected
+    } else {
+        cerr(ctx.exprs[e].line, "bieu thuc khong xac dinh: " + k)
+    }
+    return ctx.exprs[e].t
+}
+
+fn check_bin(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int) -> str {
+    let mut line: int = ctx.exprs[e].line
+    let lt: str = check_expr(ctx, env, cur, ctx.exprs[e].left, "")
+    let rt: str = check_expr(ctx, env, cur, ctx.exprs[e].right, "")
+    if lt == "never" || rt == "never" {
+        cerr(line, "gia tri khong the dung trong bieu thuc")
+    }
+    let op: str = ctx.exprs[e].op
+    if op == "||" || op == "&&" {
+        if lt != "bool" || rt != "bool" {
+            cerr(line, "toan tu " + op + " can bool, nhan " + lt + " va " + rt)
+        }
+        return "bool"
+    }
+    if op == "==" || op == "!=" {
+        if lt != rt || (lt != "int" && lt != "float" && lt != "bool" && lt != "str") {
+            cerr(line, "khong the so sanh == giua " + lt + " va " + rt)
+        }
+        return "bool"
+    }
+    if op == "<" || op == "<=" || op == ">" || op == ">=" {
+        if lt != rt || (lt != "int" && lt != "float" && lt != "str") {
+            cerr(line, "khong the so sanh thu tu giua " + lt + " va " + rt)
+        }
+        return "bool"
+    }
+    if op == "+" {
+        if lt == "int" && rt == "int" {
+            return "int"
+        }
+        if lt == "float" && rt == "float" {
+            return "float"
+        }
+        if lt == "str" && rt == "str" {
+            return "str"
+        }
+        cerr(line, "toan tu + khong ho tro " + lt + " va " + rt)
+    }
+    if op == "-" || op == "*" || op == "/" || op == "%" {
+        if lt == "int" && rt == "int" {
+            return "int"
+        }
+        if lt == "float" && rt == "float" {
+            return "float"
+        }
+        cerr(line, "toan tu " + op + " khong ho tro " + lt + " va " + rt)
+    }
+    cerr(line, "toan tu khong xac dinh: " + op)
+    return ""
+}
+
+fn check_listlit(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, expected: str) -> str {
+    let mut elem: str = ""
+    if is_list_t(expected) {
+        elem = list_elem_t(expected)
+    }
+    if elem == "" {
+        if ctx.exprs[e].args.len() == 0 {
+            cerr(ctx.exprs[e].line, "literal danh sach rong can kieu duoc khai bao o ngu canh")
+        }
+        elem = check_expr(ctx, env, cur, ctx.exprs[e].args.get(0), "")
+        if elem == "void" || elem == "never" {
+            cerr(ctx.exprs[e].line, "phan tu danh sach khong the co kieu " + elem)
+        }
+    }
+    let mut i: int = 0
+    while i < ctx.exprs[e].args.len() {
+        let vt: str = check_expr(ctx, env, cur, ctx.exprs[e].args.get(i), elem)
+        if vt != elem {
+            cerr(ctx.exprs[e].line, "phan tu danh sach khong khop: can " + elem + ", nhan " + vt)
+        }
+        i = i + 1
+    }
+    return "list[" + elem + "]"
+}
+
+fn check_structlit(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int) -> str {
+    let name: str = ctx.exprs[e].name
+    let mut line: int = ctx.exprs[e].line
+    if !ctx.structs.has(name) {
+        cerr(line, "struct khong ton tai: " + name)
+    }
+    let st: StructInfo = ctx.structs.get_or(name, dummy_struct())
+    if ctx.exprs[e].ffields.len() != st.fields.len() {
+        cerr(line, "literal struct " + name + " can dung " + st.fields.len().to_str() + " truong, nhan " + ctx.exprs[e].ffields.len().to_str())
+    }
+    let mut i: int = 0
+    while i < st.fields.len() {
+        if ctx.exprs[e].ffields.get(i) != st.fields.get(i) {
+            cerr(line, "thu tu truong khong dung: mong doi '" + st.fields.get(i) + "', nhan '" + ctx.exprs[e].ffields.get(i) + "'")
+        }
+        let vt: str = check_expr(ctx, env, cur, ctx.exprs[e].args.get(i), st.ftypes.get(i))
+        if vt != st.ftypes.get(i) {
+            cerr(line, "kieu truong " + st.fields.get(i) + " khong khop: can " + st.ftypes.get(i) + ", nhan " + vt)
+        }
+        i = i + 1
+    }
+    return name
+}
+
+fn check_call(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, expected: str) -> str {
+    let name: str = ctx.exprs[e].name
+    let mut line: int = ctx.exprs[e].line
+    if is_builtin_fn(name) {
+        ctx.exprs[e].muser = false
+        ctx.exprs[e].mkey = name
+        return check_builtin_call(ctx, env, cur, e, name, expected)
+    }
+    if ctx.fns.has(name) {
+        let f: FnInfo = ctx.fns.get_or(name, dummy_fn())
+        if f.is_method {
+            cerr(line, "phuong thuc phai duoc goi qua doi tuong: " + name)
+        }
+        ctx.exprs[e].muser = true
+        ctx.exprs[e].mkey = name
+        add_edge(ctx, cur, name)
+        if ctx.exprs[e].args.len() != f.params.len() {
+            cerr(line, "ham " + name + " can " + f.params.len().to_str() + " doi so, nhan " + ctx.exprs[e].args.len().to_str())
+        }
+        let mut i: int = 0
+        while i < ctx.exprs[e].args.len() {
+            let at: str = check_expr(ctx, env, cur, ctx.exprs[e].args.get(i), f.ptypes.get(i))
+            if at != f.ptypes.get(i) {
+                cerr(line, "doi so '" + f.params.get(i) + "' cua " + name + " can " + f.ptypes.get(i) + ", nhan " + at)
+            }
+            i = i + 1
+        }
+        return f.ret
+    }
+    cerr(line, "ham khong ton tai: " + name)
+    return ""
+}
+
+fn check_builtin_call(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, name: str, expected: str) -> str {
+    let mut line: int = ctx.exprs[e].line
+    let nargs: int = ctx.exprs[e].args.len()
+    let argt: list[str] = []
+    let mut i: int = 0
+    while i < nargs {
+        argt.push(check_expr(ctx, env, cur, ctx.exprs[e].args.get(i), ""))
+        i = i + 1
+    }
+    let mut j: int = 0
+    while j < nargs {
+        if argt.get(j) == "never" {
+            cerr(line, "gia tri khong the dung lam doi so")
+        }
+        j = j + 1
+    }
+    if name == "print" || name == "println" {
+        if nargs != 1 || argt.get(0) != "str" {
+            cerr(line, name + " can 1 doi so str")
+        }
+        add_edge(ctx, cur, "b:print")
+        return "void"
+    }
+    if name == "panic" {
+        if nargs != 1 || argt.get(0) != "str" {
+            cerr(line, "panic can 1 doi so str")
+        }
+        return "never"
+    }
+    if name == "exit" {
+        if nargs != 1 || argt.get(0) != "int" {
+            cerr(line, "exit can 1 doi so int")
+        }
+        add_edge(ctx, cur, "b:exit")
+        return "never"
+    }
+    if name == "str" {
+        if nargs != 1 {
+            cerr(line, "str() can 1 doi so")
+        }
+        let a0: str = argt.get(0)
+        if a0 != "int" && a0 != "float" && a0 != "bool" && a0 != "str" {
+            cerr(line, "str() khong ho tro kieu " + a0)
+        }
+        return "str"
+    }
+    if name == "int" {
+        if nargs != 1 || argt.get(0) != "str" {
+            cerr(line, "int() can 1 doi so str")
+        }
+        return "int"
+    }
+    if name == "len" {
+        if nargs != 1 {
+            cerr(line, "len() can 1 doi so")
+        }
+        let a0: str = argt.get(0)
+        if a0 != "str" && !is_list_t(a0) && !is_map_t(a0) {
+            cerr(line, "len() khong ho tro kieu " + a0)
+        }
+        return "int"
+    }
+    if name == "range" {
+        if nargs != 2 || argt.get(0) != "int" || argt.get(1) != "int" {
+            cerr(line, "range() can 2 doi so int")
+        }
+        return "list[int]"
+    }
+    if name == "map_new" {
+        if nargs != 0 {
+            cerr(line, "map_new() khong co doi so")
+        }
+        if expected == "" || !is_map_t(expected) {
+            cerr(line, "map_new() can kieu 'map[str, T]' duoc khai bao o ngu canh")
+        }
+        return expected
+    }
+    if name == "read_file" {
+        if nargs != 1 || argt.get(0) != "str" {
+            cerr(line, "read_file() can 1 doi so str")
+        }
+        add_edge(ctx, cur, "b:read_file")
+        return "str"
+    }
+    if name == "write_file" {
+        if nargs != 2 || argt.get(0) != "str" || argt.get(1) != "str" {
+            cerr(line, "write_file() can 2 doi so str")
+        }
+        add_edge(ctx, cur, "b:write_file")
+        return "void"
+    }
+    if name == "args" {
+        if nargs != 0 {
+            cerr(line, "args() khong co doi so")
+        }
+        add_edge(ctx, cur, "b:args")
+        return "list[str]"
+    }
+    if name == "clock_ms" {
+        if nargs != 0 {
+            cerr(line, "clock_ms() khong co doi so")
+        }
+        add_edge(ctx, cur, "b:clock_ms")
+        return "int"
+    }
+    if name == "chr" {
+        if nargs != 1 || argt.get(0) != "int" {
+            cerr(line, "chr() can 1 doi so int")
+        }
+        return "str"
+    }
+    cerr(line, "ham builtin khong xac dinh: " + name)
+    return ""
+}
+
+fn check_method(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int) -> str {
+    let name: str = ctx.exprs[e].name
+    let mut line: int = ctx.exprs[e].line
+    let tt: str = check_expr(ctx, env, cur, ctx.exprs[e].left, "")
+    if tt == "never" {
+        cerr(line, "gia tri khong the dung trong bieu thuc")
+    }
+    let nargs: int = ctx.exprs[e].args.len()
+    if ctx.structs.has(tt) {
+        # phuong thuc cua struct (nguoi dung dinh nghia)
+        let cands: list[str] = ctx.methods_of.get_or(tt, [])
+        let mut key: str = ""
+        let mut i: int = 0
+        while i < cands.len() {
+            let mut k: str = cands.get(i)
+            if ctx.fns.get_or(k, dummy_fn()).name == name {
+                key = k
+            }
+            i = i + 1
+        }
+        if key == "" {
+            cerr(line, "struct " + tt + " khong co phuong thuc " + name)
+        }
+        ctx.exprs[e].muser = true
+        ctx.exprs[e].mkey = key
+        add_edge(ctx, cur, key)
+        let f: FnInfo = ctx.fns.get_or(key, dummy_fn())
+        let np: int = f.params.len() - 1
+        if nargs != np {
+            cerr(line, tt + "." + name + " can " + np.to_str() + " doi so, nhan " + nargs.to_str())
+        }
+        let mut mi: int = 0
+        while mi < nargs {
+            let at: str = check_expr(ctx, env, cur, ctx.exprs[e].args.get(mi), f.ptypes.get(mi + 1))
+            if at != f.ptypes.get(mi + 1) {
+                cerr(line, "doi so '" + f.params.get(mi + 1) + "' cua " + tt + "." + name + " can " + f.ptypes.get(mi + 1) + ", nhan " + at)
+            }
+            mi = mi + 1
+        }
+        return f.ret
+    }
+    # phuong thuc builtin: bang ptypes + ret theo kieu doi tuong
+    let ptypes: list[str] = []
+    let mut ret: str = ""
+    if tt == "str" {
+        if name == "len" { ret = "int" }
+        else if name == "byte_at"  {
+        ptypes.push("int")
+        ret = "int"
+    }
+        else if name == "slice"  {
+        ptypes.push("int")
+        ptypes.push("int")
+        ret = "str"
+    }
+        else if name == "find"  {
+        ptypes.push("str")
+        ret = "int"
+    }
+        else if name == "contains"  {
+        ptypes.push("str")
+        ret = "bool"
+    }
+        else if name == "starts_with"  {
+        ptypes.push("str")
+        ret = "bool"
+    }
+        else if name == "ends_with"  {
+        ptypes.push("str")
+        ret = "bool"
+    }
+        else if name == "split"  {
+        ptypes.push("str")
+        ret = "list[str]"
+    }
+        else if name == "trim" { ret = "str" }
+        else if name == "to_int" { ret = "int" }
+        else if name == "to_float" { ret = "float" }
+        else if name == "to_str" { ret = "str" }
+        else { cerr(line, "str khong co phuong thuc " + name) }
+        ctx.exprs[e].mop = "str." + name
+    } else if tt == "int" {
+        if name == "to_str" { ret = "str" }
+        else if name == "to_float" { ret = "float" }
+        else if name == "abs" { ret = "int" }
+        else { cerr(line, "int khong co phuong thuc " + name) }
+        ctx.exprs[e].mop = "int." + name
+    } else if tt == "float" {
+        if name == "to_str" { ret = "str" }
+        else if name == "to_int" { ret = "int" }
+        else if name == "abs" { ret = "float" }
+        else { cerr(line, "float khong co phuong thuc " + name) }
+        ctx.exprs[e].mop = "float." + name
+    } else if tt == "bool" {
+        if name == "to_str" { ret = "str" }
+        else { cerr(line, "bool khong co phuong thuc " + name) }
+        ctx.exprs[e].mop = "bool." + name
+    } else if is_list_t(tt) {
+        let mut elem: str = list_elem_t(tt)
+        if name == "len" { ret = "int" }
+        else if name == "push"  {
+        ptypes.push(elem)
+        ret = "void"
+    }
+        else if name == "get"  {
+        ptypes.push("int")
+        ret = elem
+    }
+        else if name == "set"  {
+        ptypes.push("int")
+        ptypes.push(elem)
+        ret = "void"
+    }
+        else if name == "pop" { ret = elem }
+        else { cerr(line, "list khong co phuong thuc " + name) }
+        ctx.exprs[e].mop = "list." + name
+    } else if is_map_t(tt) {
+        let vt: str = map_val_t(tt)
+        if name == "len" { ret = "int" }
+        else if name == "set"  {
+        ptypes.push("str")
+        ptypes.push(vt)
+        ret = "void"
+    }
+        else if name == "get_or"  {
+        ptypes.push("str")
+        ptypes.push(vt)
+        ret = vt
+    }
+        else if name == "has"  {
+        ptypes.push("str")
+        ret = "bool"
+    }
+        else if name == "keys" { ret = "list[str]" }
+        else { cerr(line, "map khong co phuong thuc " + name) }
+        ctx.exprs[e].mop = "map." + name
+    } else {
+        cerr(line, "khong the goi phuong thuc tren kieu " + tt)
+    }
+    ctx.exprs[e].muser = false
+    if nargs != ptypes.len() {
+        cerr(line, tt + "." + name + " can " + ptypes.len().to_str() + " doi so, nhan " + nargs.to_str())
+    }
+    let mut i: int = 0
+    while i < nargs {
+        let at: str = check_expr(ctx, env, cur, ctx.exprs[e].args.get(i), ptypes.get(i))
+        if at != ptypes.get(i) {
+            cerr(line, "doi so cua " + tt + "." + name + " can " + ptypes.get(i) + ", nhan " + at)
+        }
+        i = i + 1
+    }
+    return ret
+}
+
+fn check_effects(ctx: Ctx) -> void {
+    let eff: map[str, bool] = map_new()
+    let mut i: int = 0
+    while i < ctx.fn_order.len() {
+        let mut key: str = ctx.fn_order.get(i)
+        eff.set(key, ctx.fns.get_or(key, dummy_fn()).uses_io)
+        i = i + 1
+    }
+    let mut changed: bool = true
+    while changed {
+        changed = false
+        let mut i2: int = 0
+        while i2 < ctx.fn_order.len() {
+            let mut key: str = ctx.fn_order.get(i2)
+            if !eff.get_or(key, false) {
+                let edges: list[str] = ctx.edges.get_or(key, [])
+                let mut j: int = 0
+                while j < edges.len() {
+                    let c: str = edges.get(j)
+                    if c.starts_with("b:") {
+                        eff.set(key, true)
+                        changed = true
+                        break
+                    }
+                    if eff.get_or(c, false) {
+                        eff.set(key, true)
+                        changed = true
+                        break
+                    }
+                    j = j + 1
+                }
+            }
+            i2 = i2 + 1
+        }
+    }
+    # bao cao vi pham
+    let mut i3: int = 0
+    while i3 < ctx.fn_order.len() {
+        let mut key: str = ctx.fn_order.get(i3)
+        let f: FnInfo = ctx.fns.get_or(key, dummy_fn())
+        if eff.get_or(key, false) && !f.uses_io {
+            let edges: list[str] = ctx.edges.get_or(key, [])
+            let mut j: int = 0
+            while j < edges.len() {
+                let c: str = edges.get(j)
+                if c.starts_with("b:") || eff.get_or(c, false) {
+                    let mut nm: str = c
+                    if c.starts_with("b:") {
+                        nm = c.slice(2, c.len())
+                    }
+                    cerr(f.line, "ham '" + f.name + "' goi '" + nm + "' (IO) nhung khong khai bao 'uses IO'")
+                }
+                j = j + 1
+            }
+        }
+        i3 = i3 + 1
+    }
+}
+
+# ------------------------------------------------------------------------
+# 4b. RUNTIME C (nhung truc tiep — phat sinh tuh runtime da kiem thu)
+# ------------------------------------------------------------------------
+
+fn runtime_lines() -> list[str] {
+    let r: list[str] = []
+    r.push("#include <stdio.h>")
+    r.push("#include <stdlib.h>")
+    r.push("#include <string.h>")
+    r.push("#include <stdint.h>")
+    r.push("#include <stdbool.h>")
+    r.push("#include <inttypes.h>")
+    r.push("#include <time.h>")
+    r.push("#include <math.h>")
+    r.push("")
+    r.push("typedef struct { int64_t len; char* data; } hl_str;")
+    r.push("typedef struct { int64_t len; int64_t cap; void** items; } hl_list;")
+    r.push("typedef struct { int64_t len; int64_t cap; hl_str** slots; void** vals; hl_list* order; } hl_map;")
+    r.push("")
+    r.push("// Chuỗi (byte string) có kiểm tra — dùng cho runtime HLS")
+    r.push("static void hl_die(const char* msg) {")
+    r.push("    fflush(stdout);")
+    r.push("    fprintf(stderr, \"panic: %s\\n\", msg);")
+    r.push("    exit(101);")
+    r.push("}")
+    r.push("")
+    r.push("static hl_str* hl_str_alloc(int64_t len) {")
+    r.push("    hl_str* s = (hl_str*)malloc(sizeof(hl_str));")
+    r.push("    if (!s) hl_die(\"het bo nho\");")
+    r.push("    s->len = len;")
+    r.push("    s->data = (char*)malloc((size_t)len + 1);")
+    r.push("    if (!s->data) hl_die(\"het bo nho\");")
+    r.push("    s->data[len] = 0;")
+    r.push("    return s;")
+    r.push("}")
+    r.push("")
+    r.push("static hl_str* hl_str_from(const char* c, int64_t len) {")
+    r.push("    hl_str* s = hl_str_alloc(len);")
+    r.push("    if (len > 0) memcpy(s->data, c, (size_t)len);")
+    r.push("    return s;")
+    r.push("}")
+    r.push("")
+    r.push("static hl_str* hl_str_concat(hl_str* a, hl_str* b) {")
+    r.push("    hl_str* s = hl_str_alloc(a->len + b->len);")
+    r.push("    if (a->len > 0) memcpy(s->data, a->data, (size_t)a->len);")
+    r.push("    if (b->len > 0) memcpy(s->data + a->len, b->data, (size_t)b->len);")
+    r.push("    return s;")
+    r.push("}")
+    r.push("")
+    r.push("static bool hl_str_eq(hl_str* a, hl_str* b) {")
+    r.push("    return a->len == b->len && (a->len == 0 || memcmp(a->data, b->data, (size_t)a->len) == 0);")
+    r.push("}")
+    r.push("")
+    r.push("static int64_t hl_str_cmp(hl_str* a, hl_str* b) {")
+    r.push("    int64_t n = a->len < b->len ? a->len : b->len;")
+    r.push("    if (n > 0) {")
+    r.push("        int r = memcmp(a->data, b->data, (size_t)n);")
+    r.push("        if (r != 0) return r < 0 ? -1 : 1;")
+    r.push("    }")
+    r.push("    if (a->len == b->len) return 0;")
+    r.push("    return a->len < b->len ? -1 : 1;")
+    r.push("}")
+    r.push("")
+    r.push("static int64_t hl_str_len(hl_str* s) { return s->len; }")
+    r.push("")
+    r.push("static int64_t hl_str_byte_at(hl_str* s, int64_t i) {")
+    r.push("    if (i < 0 || i >= s->len) hl_die(\"truy cap chuoi ngoai pham vi\");")
+    r.push("    return (unsigned char)s->data[i];")
+    r.push("}")
+    r.push("")
+    r.push("static hl_str* hl_str_slice(hl_str* s, int64_t a, int64_t b) {")
+    r.push("    if (a < 0 || b < a || b > s->len) hl_die(\"slice chuoi khong hop le\");")
+    r.push("    return hl_str_from(s->data + a, b - a);")
+    r.push("}")
+    r.push("")
+    r.push("static int64_t hl_str_find(hl_str* s, hl_str* sub) {")
+    r.push("    if (sub->len == 0) return 0;")
+    r.push("    if (sub->len > s->len) return -1;")
+    r.push("    for (int64_t i = 0; i + sub->len <= s->len; i++) {")
+    r.push("        if (memcmp(s->data + i, sub->data, (size_t)sub->len) == 0) return i;")
+    r.push("    }")
+    r.push("    return -1;")
+    r.push("}")
+    r.push("")
+    r.push("static bool hl_str_contains(hl_str* s, hl_str* sub) { return hl_str_find(s, sub) >= 0; }")
+    r.push("")
+    r.push("static bool hl_str_starts_with(hl_str* s, hl_str* p) {")
+    r.push("    return s->len >= p->len && (p->len == 0 || memcmp(s->data, p->data, (size_t)p->len) == 0);")
+    r.push("}")
+    r.push("")
+    r.push("static bool hl_str_ends_with(hl_str* s, hl_str* p) {")
+    r.push("    return s->len >= p->len && (p->len == 0 || memcmp(s->data + s->len - p->len, p->data, (size_t)p->len) == 0);")
+    r.push("}")
+    r.push("")
+    r.push("static hl_str* hl_str_trim(hl_str* s) {")
+    r.push("    int64_t a = 0, b = s->len;")
+    r.push("    while (a < b && (unsigned char)s->data[a] <= 0x20) a++;")
+    r.push("    while (b > a && (unsigned char)s->data[b - 1] <= 0x20) b--;")
+    r.push("    return hl_str_from(s->data + a, b - a);")
+    r.push("}")
+    r.push("")
+    r.push("static int64_t hl_str_to_int(hl_str* s) {")
+    r.push("    int64_t i = 0;")
+    r.push("    uint64_t uv = 0;")
+    r.push("    bool neg = false;")
+    r.push("    if (s->len == 0) hl_die(\"khong the doi chuoi thanh int\");")
+    r.push("    if (s->data[0] == '-') { neg = true; i = 1; }")
+    r.push("    if (i >= s->len) hl_die(\"khong the doi chuoi thanh int\");")
+    r.push("    for (; i < s->len; i++) {")
+    r.push("        char c = s->data[i];")
+    r.push("        if (c < '0' || c > '9') hl_die(\"khong the doi chuoi thanh int\");")
+    r.push("        if (uv > (UINT64_C(9223372036854775808) - (uint64_t)(c - '0')) / 10) {")
+    r.push("            hl_die(\"so nguyen qua lon khi doi chuoi\");")
+    r.push("        }")
+    r.push("        uv = uv * 10 + (uint64_t)(c - '0');")
+    r.push("    }")
+    r.push("    if (neg) {")
+    r.push("        if (uv > UINT64_C(9223372036854775808)) hl_die(\"so nguyen qua lon khi doi chuoi\");")
+    r.push("        return (int64_t)(-(int64_t)(uv - 1) - 1);")
+    r.push("    }")
+    r.push("    if (uv > (uint64_t)INT64_MAX) hl_die(\"so nguyen qua lon khi doi chuoi\");")
+    r.push("    return (int64_t)uv;")
+    r.push("}")
+    r.push("")
+    r.push("static hl_str* hl_str_from_int64(int64_t v) {")
+    r.push("    char buf[32];")
+    r.push("    int n = snprintf(buf, sizeof buf, \"%\" PRId64, v);")
+    r.push("    return hl_str_from(buf, (int64_t)n);")
+    r.push("}")
+    r.push("")
+    r.push("static hl_str* hl_str_from_double(double v) {")
+    r.push("    char buf[64];")
+    r.push("    int n = snprintf(buf, sizeof buf, \"%.6f\", v);")
+    r.push("    return hl_str_from(buf, (int64_t)n);")
+    r.push("}")
+    r.push("")
+    r.push("static hl_str* hl_cstr(const char* c) { return hl_str_from(c, (int64_t)strlen(c)); }")
+    r.push("static hl_str* hl_str_from_bool(bool v) {")
+    r.push("    return v ? hl_str_from(\"true\", 4) : hl_str_from(\"false\", 5);")
+    r.push("}")
+    r.push("")
+    r.push("// Danh sách động (box giá trị), bảng băm map[str,T] giữ thứ tự chèn,")
+    r.push("// số học int64 kiểm tra tràn, và I/O")
+    r.push("static void* hl_box_i64(int64_t v) {")
+    r.push("    int64_t* p = (int64_t*)malloc(sizeof(int64_t));")
+    r.push("    if (!p) hl_die(\"het bo nho\");")
+    r.push("    *p = v;")
+    r.push("    return p;")
+    r.push("}")
+    r.push("static int64_t hl_unbox_i64(void* p) { return *(int64_t*)p; }")
+    r.push("")
+    r.push("static void* hl_box_f64(double v) {")
+    r.push("    double* p = (double*)malloc(sizeof(double));")
+    r.push("    if (!p) hl_die(\"het bo nho\");")
+    r.push("    *p = v;")
+    r.push("    return p;")
+    r.push("}")
+    r.push("static double hl_unbox_f64(void* p) { return *(double*)p; }")
+    r.push("")
+    r.push("static void* hl_box_bool(bool v) {")
+    r.push("    bool* p = (bool*)malloc(sizeof(bool));")
+    r.push("    if (!p) hl_die(\"het bo nho\");")
+    r.push("    *p = v;")
+    r.push("    return p;")
+    r.push("}")
+    r.push("static bool hl_unbox_bool(void* p) { return *(bool*)p; }")
+    r.push("")
+    r.push("static void* hl_box_ptr(void* p) { return p; }")
+    r.push("static void* hl_unbox_ptr(void* p) { return p; }")
+    r.push("")
+    r.push("static hl_list* hl_list_new(void) {")
+    r.push("    hl_list* l = (hl_list*)malloc(sizeof(hl_list));")
+    r.push("    if (!l) hl_die(\"het bo nho\");")
+    r.push("    l->len = 0;")
+    r.push("    l->cap = 8;")
+    r.push("    l->items = (void**)malloc((size_t)l->cap * sizeof(void*));")
+    r.push("    if (!l->items) hl_die(\"het bo nho\");")
+    r.push("    return l;")
+    r.push("}")
+    r.push("")
+    r.push("static void hl_list_push(hl_list* l, void* v) {")
+    r.push("    if (l->len == l->cap) {")
+    r.push("        l->cap *= 2;")
+    r.push("        l->items = (void**)realloc(l->items, (size_t)l->cap * sizeof(void*));")
+    r.push("        if (!l->items) hl_die(\"het bo nho\");")
+    r.push("    }")
+    r.push("    l->items[l->len] = v;")
+    r.push("    l->len++;")
+    r.push("}")
+    r.push("")
+    r.push("static int64_t hl_list_len(hl_list* l) { return l->len; }")
+    r.push("")
+    r.push("static void* hl_list_get(hl_list* l, int64_t i) {")
+    r.push("    if (i < 0 || i >= l->len) hl_die(\"truy cap mang ngoai pham vi\");")
+    r.push("    return l->items[i];")
+    r.push("}")
+    r.push("")
+    r.push("static void hl_list_set(hl_list* l, int64_t i, void* v) {")
+    r.push("    if (i < 0 || i >= l->len) hl_die(\"truy cap mang ngoai pham vi\");")
+    r.push("    l->items[i] = v;")
+    r.push("}")
+    r.push("")
+    r.push("static hl_list* hl_range(int64_t a, int64_t b) {")
+    r.push("    hl_list* l = hl_list_new();")
+    r.push("    for (int64_t i = a; i < b; i++) hl_list_push(l, hl_box_i64(i));")
+    r.push("    return l;")
+    r.push("}")
+    r.push("")
+    r.push("// ---- map[str, T]: bảng băm tuyến tính + danh sách thứ tự chèn ----")
+    r.push("static uint64_t hl_str_hash(hl_str* s) {")
+    r.push("    uint64_t h = 1469598103934665603ULL;")
+    r.push("    for (int64_t i = 0; i < s->len; i++) {")
+    r.push("        h ^= (uint8_t)s->data[i];")
+    r.push("        h *= 1099511628211ULL;")
+    r.push("    }")
+    r.push("    return h;")
+    r.push("}")
+    r.push("")
+    r.push("static hl_map* hl_map_new(void) {")
+    r.push("    hl_map* m = (hl_map*)malloc(sizeof(hl_map));")
+    r.push("    if (!m) hl_die(\"het bo nho\");")
+    r.push("    m->len = 0;")
+    r.push("    m->cap = 16;")
+    r.push("    m->slots = (hl_str**)calloc((size_t)m->cap, sizeof(hl_str*));")
+    r.push("    m->vals = (void**)malloc((size_t)m->cap * sizeof(void*));")
+    r.push("    if (!m->slots || !m->vals) hl_die(\"het bo nho\");")
+    r.push("    m->order = hl_list_new();")
+    r.push("    return m;")
+    r.push("}")
+    r.push("")
+    r.push("static void hl_map_set(hl_map* m, hl_str* k, void* v) {")
+    r.push("    if ((m->len + 1) * 10 >= m->cap * 7) {")
+    r.push("        int64_t ncap = m->cap * 2;")
+    r.push("        hl_str** nslots = (hl_str**)calloc((size_t)ncap, sizeof(hl_str*));")
+    r.push("        void** nvals = (void**)malloc((size_t)ncap * sizeof(void*));")
+    r.push("        if (!nslots || !nvals) hl_die(\"het bo nho\");")
+    r.push("        for (int64_t i = 0; i < m->cap; i++) {")
+    r.push("            if (m->slots[i] != NULL) {")
+    r.push("                uint64_t idx = hl_str_hash(m->slots[i]) & (uint64_t)(ncap - 1);")
+    r.push("                while (nslots[idx] != NULL) idx = (idx + 1) & (uint64_t)(ncap - 1);")
+    r.push("                nslots[idx] = m->slots[i];")
+    r.push("                nvals[idx] = m->vals[i];")
+    r.push("            }")
+    r.push("        }")
+    r.push("        free(m->slots);")
+    r.push("        free(m->vals);")
+    r.push("        m->slots = nslots;")
+    r.push("        m->vals = nvals;")
+    r.push("        m->cap = ncap;")
+    r.push("    }")
+    r.push("    uint64_t idx = hl_str_hash(k) & (uint64_t)(m->cap - 1);")
+    r.push("    while (m->slots[idx] != NULL) {")
+    r.push("        if (hl_str_eq(m->slots[idx], k)) {")
+    r.push("            m->vals[idx] = v;")
+    r.push("            return;")
+    r.push("        }")
+    r.push("        idx = (idx + 1) & (uint64_t)(m->cap - 1);")
+    r.push("    }")
+    r.push("    m->slots[idx] = k;")
+    r.push("    m->vals[idx] = v;")
+    r.push("    m->len++;")
+    r.push("    hl_list_push(m->order, hl_box_ptr(k));")
+    r.push("}")
+    r.push("")
+    r.push("static void* hl_map_get(hl_map* m, hl_str* k, void* dflt) {")
+    r.push("    uint64_t idx = hl_str_hash(k) & (uint64_t)(m->cap - 1);")
+    r.push("    while (m->slots[idx] != NULL) {")
+    r.push("        if (hl_str_eq(m->slots[idx], k)) return m->vals[idx];")
+    r.push("        idx = (idx + 1) & (uint64_t)(m->cap - 1);")
+    r.push("    }")
+    r.push("    return dflt;")
+    r.push("}")
+    r.push("")
+    r.push("static bool hl_map_has(hl_map* m, hl_str* k) { return hl_map_get(m, k, NULL) != NULL; }")
+    r.push("")
+    r.push("static int64_t hl_map_len(hl_map* m) { return m->len; }")
+    r.push("")
+    r.push("static hl_list* hl_map_keys(hl_map* m) {")
+    r.push("    hl_list* r = hl_list_new();")
+    r.push("    for (int64_t i = 0; i < m->order->len; i++) hl_list_push(r, m->order->items[i]);")
+    r.push("    return r;")
+    r.push("}")
+    r.push("")
+    r.push("// ---- số học int64 kiểm tra tràn ----")
+    r.push("static int64_t hl_add_i64(int64_t a, int64_t b) {")
+    r.push("    int64_t r;")
+    r.push("    if (__builtin_add_overflow(a, b, &r)) hl_die(\"tran so nguyen (overflow)\");")
+    r.push("    return r;")
+    r.push("}")
+    r.push("static int64_t hl_sub_i64(int64_t a, int64_t b) {")
+    r.push("    int64_t r;")
+    r.push("    if (__builtin_sub_overflow(a, b, &r)) hl_die(\"tran so nguyen (overflow)\");")
+    r.push("    return r;")
+    r.push("}")
+    r.push("static int64_t hl_mul_i64(int64_t a, int64_t b) {")
+    r.push("    int64_t r;")
+    r.push("    if (__builtin_mul_overflow(a, b, &r)) hl_die(\"tran so nguyen (overflow)\");")
+    r.push("    return r;")
+    r.push("}")
+    r.push("static int64_t hl_neg_i64(int64_t a) {")
+    r.push("    if (a == INT64_MIN) hl_die(\"tran so nguyen (overflow)\");")
+    r.push("    return -a;")
+    r.push("}")
+    r.push("static int64_t hl_abs_i64(int64_t a) {")
+    r.push("    if (a == INT64_MIN) hl_die(\"tran so nguyen (overflow)\");")
+    r.push("    return a < 0 ? -a : a;")
+    r.push("}")
+    r.push("static int64_t hl_div_i64(int64_t a, int64_t b) {")
+    r.push("    if (b == 0) hl_die(\"chia cho 0\");")
+    r.push("    if (a == INT64_MIN && b == -1) hl_die(\"tran so nguyen (overflow)\");")
+    r.push("    return a / b;")
+    r.push("}")
+    r.push("static int64_t hl_mod_i64(int64_t a, int64_t b) {")
+    r.push("    if (b == 0) hl_die(\"chia cho 0\");")
+    r.push("    if (a == INT64_MIN && b == -1) hl_die(\"tran so nguyen (overflow)\");")
+    r.push("    return a % b;")
+    r.push("}")
+    r.push("")
+    r.push("// ---- I/O ----")
+    r.push("static hl_list* g_hl_args = NULL;")
+    r.push("")
+    r.push("static void hl_init_args(int argc, char** argv) {")
+    r.push("    g_hl_args = hl_list_new();")
+    r.push("    for (int i = 0; i < argc; i++) {")
+    r.push("        hl_list_push(g_hl_args, hl_str_from(argv[i], (int64_t)strlen(argv[i])));")
+    r.push("    }")
+    r.push("}")
+    r.push("")
+    r.push("static hl_list* hl_args(void) { return g_hl_args; }")
+    r.push("")
+    r.push("static void hl_print(hl_str* s) { fwrite(s->data, 1, (size_t)s->len, stdout); }")
+    r.push("")
+    r.push("static void hl_println(hl_str* s) {")
+    r.push("    fwrite(s->data, 1, (size_t)s->len, stdout);")
+    r.push("    fputc('\\n', stdout);")
+    r.push("}")
+    r.push("")
+    r.push("static hl_str* hl_read_file(hl_str* path) {")
+    r.push("    FILE* f = fopen(path->data, \"rb\");")
+    r.push("    if (!f) hl_die(\"khong the mo tep\");")
+    r.push("    if (fseek(f, 0, SEEK_END) != 0) hl_die(\"khong the mo tep\");")
+    r.push("    long sz = ftell(f);")
+    r.push("    if (sz < 0) hl_die(\"khong the mo tep\");")
+    r.push("    rewind(f);")
+    r.push("    char* buf = (char*)malloc((size_t)sz + 1);")
+    r.push("    if (!buf) hl_die(\"het bo nho\");")
+    r.push("    if (sz > 0 && fread(buf, 1, (size_t)sz, f) != (size_t)sz) hl_die(\"khong the mo tep\");")
+    r.push("    fclose(f);")
+    r.push("    return hl_str_from(buf, sz);")
+    r.push("}")
+    r.push("")
+    r.push("static void hl_write_file(hl_str* path, hl_str* content) {")
+    r.push("    FILE* f = fopen(path->data, \"wb\");")
+    r.push("    if (!f) hl_die(\"khong the ghi tep\");")
+    r.push("    if (content->len > 0 && fwrite(content->data, 1, (size_t)content->len, f) != (size_t)content->len) {")
+    r.push("        hl_die(\"khong the ghi tep\");")
+    r.push("    }")
+    r.push("    if (fclose(f) != 0) hl_die(\"khong the ghi tep\");")
+    r.push("}")
+    r.push("")
+    r.push("static int64_t hl_clock_ms(void) {")
+    r.push("    struct timespec ts;")
+    r.push("    clock_gettime(CLOCK_MONOTONIC, &ts);")
+    r.push("    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;")
+    r.push("}")
+    r.push("")
+    r.push("static void hl_panic(hl_str* msg) {")
+    r.push("    fflush(stdout);")
+    r.push("    fprintf(stderr, \"panic: %s\\n\", msg->data);")
+    r.push("    exit(101);")
+    r.push("}")
+    r.push("")
+    r.push("static void hl_exit(int64_t code) {")
+    r.push("    fflush(stdout);")
+    r.push("    exit((int)code);")
+    r.push("}")
+    r.push("")
+    r.push("// Danh sách tách chuỗi (đặt cuối vì phụ thuộc hl_list)")
+    r.push("static hl_list* hl_str_split(hl_str* s, hl_str* sep) {")
+    r.push("    if (sep->len == 0) hl_die(\"phan tach chuoi rong khong hop le\");")
+    r.push("    hl_list* out = hl_list_new();")
+    r.push("    if (s->len == 0) {")
+    r.push("        hl_list_push(out, hl_box_ptr(hl_str_from(\"\", 0)));")
+    r.push("        return out;")
+    r.push("    }")
+    r.push("    int64_t start = 0;")
+    r.push("    int64_t i = 0;")
+    r.push("    while (i + sep->len <= s->len) {")
+    r.push("        if (memcmp(s->data + i, sep->data, (size_t)sep->len) == 0) {")
+    r.push("            hl_list_push(out, hl_box_ptr(hl_str_from(s->data + start, i - start)));")
+    r.push("            i += sep->len;")
+    r.push("            start = i;")
+    r.push("        } else {")
+    r.push("            i++;")
+    r.push("        }")
+    r.push("    }")
+    r.push("    hl_list_push(out, hl_box_ptr(hl_str_from(s->data + start, s->len - start)));")
+    r.push("    return out;")
+    r.push("}")
+    r.push("")
+    r.push("// ---- bổ sung cho v0.1.1: pop, float, chr, fmod ----")
+    r.push("static void* hl_list_pop(hl_list* l) {")
+    r.push("    if (l->len == 0) hl_die(\"truy cap mang ngoai pham vi\");")
+    r.push("    l->len--;")
+    r.push("    return l->items[l->len];")
+    r.push("}")
+    r.push("")
+    r.push("static double hl_str_to_double(hl_str* s) {")
+    r.push("    int64_t i = 0;")
+    r.push("    int64_t dots = 0;")
+    r.push("    if (s->len == 0) hl_die(\"khong the doi chuoi thanh float\");")
+    r.push("    if (s->data[0] == '-') i = 1;")
+    r.push("    if (i >= s->len) hl_die(\"khong the doi chuoi thanh float\");")
+    r.push("    for (; i < s->len; i++) {")
+    r.push("        char c = s->data[i];")
+    r.push("        if (c == '.') { dots++; continue; }")
+    r.push("        if (c < '0' || c > '9') hl_die(\"khong the doi chuoi thanh float\");")
+    r.push("    }")
+    r.push("    if (dots > 1) hl_die(\"khong the doi chuoi thanh float\");")
+    r.push("    return strtod(s->data, NULL);")
+    r.push("}")
+    r.push("")
+    r.push("static hl_str* hl_chr(int64_t c) {")
+    r.push("    if (c < 0 || c > 255) hl_die(\"chr ngoai pham vi 0..255\");")
+    r.push("    char b = (char)c;")
+    r.push("    return hl_str_from(&b, 1);")
+    r.push("}")
+    r.push("")
+    r.push("static double hl_fmod(double a, double b) {")
+    r.push("    return fmod(a, b);")
+    r.push("}")
+    r.push("")
+    return r
+}
+
+# ----------------------------------------------------------------------------
+# 5. CODEGEN — HLS -> C
+# ----------------------------------------------------------------------------
+
+fn c_type(ctx: Ctx, t: str) -> str {
+    if t == "int" {
+        return "int64_t"
+    }
+    if t == "float" {
+        return "double"
+    }
+    if t == "bool" {
+        return "bool"
+    }
+    if t == "str" {
+        return "hl_str*"
+    }
+    if t == "void" {
+        return "void"
+    }
+    if is_list_t(t) {
+        return "hl_list*"
+    }
+    if is_map_t(t) {
+        return "hl_map*"
+    }
+    return t + "*"
+}
+
+fn is_ptr_type(t: str) -> bool {
+    if t == "int" || t == "float" || t == "bool" || t == "void" {
+        return false
+    }
+    return true
+}
+
+fn box_fn_for(t: str) -> str {
+    if t == "int" {
+        return "hl_box_i64"
+    }
+    if t == "float" {
+        return "hl_box_f64"
+    }
+    if t == "bool" {
+        return "hl_box_bool"
+    }
+    return "hl_box_ptr"
+}
+
+fn gen_unbox(ctx: Ctx, t: str, cexpr: str) -> str {
+    if t == "int" {
+        return "hl_unbox_i64(" + cexpr + ")"
+    }
+    if t == "float" {
+        return "hl_unbox_f64(" + cexpr + ")"
+    }
+    if t == "bool" {
+        return "hl_unbox_bool(" + cexpr + ")"
+    }
+    return "(" + c_type(ctx, t) + ")hl_unbox_ptr(" + cexpr + ")"
+}
+
+fn box_val(t: str, cexpr: str) -> str {
+    return box_fn_for(t) + "(" + cexpr + ")"
+}
+
+fn c_fn_name(key: str) -> str {
+    let parts: list[str] = []
+    let mut i: int = 0
+    while i < key.len() {
+        if key.byte_at(i) == 46 {
+            parts.push("_")
+        } else {
+            parts.push(key.slice(i, i + 1))
+        }
+        i = i + 1
+    }
+    return join(parts, "")
+}
+
+fn c_str_lit(s: str) -> str {
+    let mut out: str = "hl_cstr(\""
+    let mut i: int = 0
+    while i < s.len() {
+        let b: int = s.byte_at(i)
+        if b == 34 {
+            out = out + "\\\""
+        } else if b == 92 {
+            out = out + "\\\\"
+        } else if b == 10 {
+            out = out + "\\n"
+        } else if b == 9 {
+            out = out + "\\t"
+        } else if b >= 32 && b <= 126 {
+            out = out + s.slice(i, i + 1)
+        } else {
+            let o: int = b
+            let d1: int = o / 64
+            let d2: int = (o / 8) % 8
+            let d3: int = o % 8
+            out = out + "\\" + chr(48 + d1) + chr(48 + d2) + chr(48 + d3)
+        }
+        i = i + 1
+    }
+    return out + "\")"
+}
+
+fn fresh_local(ctx: Ctx, name: str) -> str {
+    if !ctx.gen_counts.has(name) {
+        ctx.gen_counts.set(name, 1)
+        ctx.gen_locals.set(name, "u_" + name)
+        return "u_" + name
+    }
+    let n: int = ctx.gen_counts.get_or(name, 1)
+    ctx.gen_counts.set(name, n + 1)
+    let cname: str = "u_" + name + "_" + (n + 1).to_str()
+    ctx.gen_locals.set(name, cname)
+    return cname
+}
+
+fn fresh_tmp(ctx: Ctx, base: str) -> str {
+    ctx.tmp = ctx.tmp + 1
+    return base + "_" + ctx.tmp.to_str()
+}
+
+fn local_c(ctx: Ctx, name: str) -> str {
+    let cn: str = ctx.gen_locals.get_or(name, "")
+    if cn == "" {
+        panic("loi noi bo codegen: khong tim thay bien " + name)
+    }
+    return cn
+}
+
+fn concat_lines(dst: list[str], src: list[str]) -> void {
+    let mut i: int = 0
+    while i < src.len() {
+        dst.push(src.get(i))
+        i = i + 1
+    }
+}
+
+# --- Sinh bieu thuc C ---
+
+fn gen_expr(ctx: Ctx, e: int) -> str {
+    let mut k: str = ctx.exprs[e].kind
+    if k == "int" {
+        if ctx.exprs[e].ival == -9223372036854775808 {
+            # INT64_MIN: dung idiom C chuan de tranh canh bao literal
+            return "(-9223372036854775807LL - 1)"
+        }
+        return ctx.exprs[e].ival.to_str()
+    }
+    if k == "float" {
+        return ctx.exprs[e].fval.to_str()
+    }
+    if k == "bool" {
+        if ctx.exprs[e].bval {
+            return "true"
+        }
+        return "false"
+    }
+    if k == "str" {
+        return c_str_lit(ctx.exprs[e].sval)
+    }
+    if k == "ident" {
+        return local_c(ctx, ctx.exprs[e].name)
+    }
+    if k == "bin" {
+        return gen_bin(ctx, e)
+    }
+    if k == "un" {
+        let sub: str = gen_expr(ctx, ctx.exprs[e].left)
+        if ctx.exprs[e].op == "!" {
+            return "(!" + sub + ")"
+        }
+        if ctx.exprs[e].t == "int" {
+            return "hl_neg_i64(" + sub + ")"
+        }
+        return "(-" + sub + ")"
+    }
+    if k == "index" {
+        let lst: str = gen_expr(ctx, ctx.exprs[e].left)
+        let idx: str = gen_expr(ctx, ctx.exprs[e].right)
+        return gen_unbox(ctx, ctx.exprs[e].t, "hl_list_get(" + lst + ", " + idx + ")")
+    }
+    if k == "field" {
+        return "(" + gen_expr(ctx, ctx.exprs[e].left) + ")->" + ctx.exprs[e].name
+    }
+    if k == "call" {
+        return gen_call(ctx, e)
+    }
+    if k == "method" {
+        return gen_method(ctx, e)
+    }
+    if k == "listlit" {
+        return gen_listlit(ctx, e)
+    }
+    if k == "structlit" {
+        let parts: list[str] = []
+        let mut i: int = 0
+        while i < ctx.exprs[e].args.len() {
+            parts.push(gen_expr(ctx, ctx.exprs[e].args.get(i)))
+            i = i + 1
+        }
+        return "usf_new_" + ctx.exprs[e].name + "(" + join(parts, ", ") + ")"
+    }
+    if k == "mapnew" {
+        return "hl_map_new()"
+    }
+    panic("loi noi bo codegen: bieu thuc khong xac dinh " + k)
+    return ""
+}
+
+fn gen_bin(ctx: Ctx, e: int) -> str {
+    let op: str = ctx.exprs[e].op
+    # LUU Y: dispatch theo kieu TOAN HANG TRAI (khong phai kieu ket qua!)
+    let t: str = ctx.exprs[ctx.exprs[e].left].t
+    let a: str = gen_expr(ctx, ctx.exprs[e].left)
+    let b: str = gen_expr(ctx, ctx.exprs[e].right)
+    if op == "||" || op == "&&" {
+        return "(" + a + " " + op + " " + b + ")"
+    }
+    if op == "==" {
+        if t == "str" {
+            return "hl_str_eq(" + a + ", " + b + ")"
+        }
+        return "(" + a + " == " + b + ")"
+    }
+    if op == "!=" {
+        if t == "str" {
+            return "(!hl_str_eq(" + a + ", " + b + "))"
+        }
+        return "(" + a + " != " + b + ")"
+    }
+    if op == "<" || op == "<=" || op == ">" || op == ">=" {
+        if t == "str" {
+            return "(hl_str_cmp(" + a + ", " + b + ") " + op + " 0)"
+        }
+        return "(" + a + " " + op + " " + b + ")"
+    }
+    if op == "+" {
+        if t == "int" {
+            return "hl_add_i64(" + a + ", " + b + ")"
+        }
+        if t == "str" {
+            return "hl_str_concat(" + a + ", " + b + ")"
+        }
+        return "(" + a + " + " + b + ")"
+    }
+    if op == "-" {
+        if t == "int" {
+            return "hl_sub_i64(" + a + ", " + b + ")"
+        }
+        return "(" + a + " - " + b + ")"
+    }
+    if op == "*" {
+        if t == "int" {
+            return "hl_mul_i64(" + a + ", " + b + ")"
+        }
+        return "(" + a + " * " + b + ")"
+    }
+    if op == "/" {
+        if t == "int" {
+            return "hl_div_i64(" + a + ", " + b + ")"
+        }
+        return "(" + a + " / " + b + ")"
+    }
+    if op == "%" {
+        if t == "int" {
+            return "hl_mod_i64(" + a + ", " + b + ")"
+        }
+        return "hl_fmod(" + a + ", " + b + ")"
+    }
+    panic("loi noi bo codegen: toan tu khong xac dinh " + op)
+    return ""
+}
+
+fn gen_args_c(ctx: Ctx, e: int) -> str {
+    let parts: list[str] = []
+    let mut i: int = 0
+    while i < ctx.exprs[e].args.len() {
+        parts.push(gen_expr(ctx, ctx.exprs[e].args.get(i)))
+        i = i + 1
+    }
+    return join(parts, ", ")
+}
+
+fn gen_call(ctx: Ctx, e: int) -> str {
+    if ctx.exprs[e].muser {
+        return "usf_" + c_fn_name(ctx.exprs[e].mkey) + "(" + gen_args_c(ctx, e) + ")"
+    }
+    let name: str = ctx.exprs[e].mkey
+    let args: str = gen_args_c(ctx, e)
+    if name == "print" {
+        return "hl_print(" + args + ")"
+    }
+    if name == "println" {
+        return "hl_println(" + args + ")"
+    }
+    if name == "panic" {
+        return "hl_panic(" + args + ")"
+    }
+    if name == "exit" {
+        return "hl_exit(" + args + ")"
+    }
+    if name == "str" {
+        let at: str = ctx.exprs[ctx.exprs[e].args.get(0)].t
+        if at == "int" {
+            return "hl_str_from_int64(" + args + ")"
+        }
+        if at == "float" {
+            return "hl_str_from_double(" + args + ")"
+        }
+        if at == "bool" {
+            return "hl_str_from_bool(" + args + ")"
+        }
+        return args
+    }
+    if name == "int" {
+        return "hl_str_to_int(" + args + ")"
+    }
+    if name == "len" {
+        let at: str = ctx.exprs[ctx.exprs[e].args.get(0)].t
+        if at == "str" {
+            return "hl_str_len(" + args + ")"
+        }
+        if is_list_t(at) {
+            return "hl_list_len(" + args + ")"
+        }
+        return "hl_map_len(" + args + ")"
+    }
+    if name == "range" {
+        return "hl_range(" + args + ")"
+    }
+    if name == "map_new" {
+        return "hl_map_new()"
+    }
+    if name == "read_file" {
+        return "hl_read_file(" + args + ")"
+    }
+    if name == "write_file" {
+        return "hl_write_file(" + args + ")"
+    }
+    if name == "args" {
+        return "hl_args()"
+    }
+    if name == "clock_ms" {
+        return "hl_clock_ms()"
+    }
+    if name == "chr" {
+        return "hl_chr(" + args + ")"
+    }
+    panic("loi noi bo codegen: ham builtin khong xac dinh " + name)
+    return ""
+}
+
+fn gen_method(ctx: Ctx, e: int) -> str {
+    if ctx.exprs[e].muser {
+        let t0: str = gen_expr(ctx, ctx.exprs[e].left)
+        let rest: str = gen_args_c(ctx, e)
+        if ctx.exprs[e].args.len() == 0 {
+            return "usf_" + c_fn_name(ctx.exprs[e].mkey) + "(" + t0 + ")"
+        }
+        return "usf_" + c_fn_name(ctx.exprs[e].mkey) + "(" + t0 + ", " + rest + ")"
+    }
+    let op: str = ctx.exprs[e].mop
+    let t0: str = gen_expr(ctx, ctx.exprs[e].left)
+    let args: str = gen_args_c(ctx, e)
+    if op == "str.len" {
+        return "hl_str_len(" + t0 + ")"
+    }
+    if op == "str.byte_at" {
+        return "hl_str_byte_at(" + t0 + ", " + args + ")"
+    }
+    if op == "str.slice" {
+        return "hl_str_slice(" + t0 + ", " + args + ")"
+    }
+    if op == "str.find" {
+        return "hl_str_find(" + t0 + ", " + args + ")"
+    }
+    if op == "str.contains" {
+        return "hl_str_contains(" + t0 + ", " + args + ")"
+    }
+    if op == "str.starts_with" {
+        return "hl_str_starts_with(" + t0 + ", " + args + ")"
+    }
+    if op == "str.ends_with" {
+        return "hl_str_ends_with(" + t0 + ", " + args + ")"
+    }
+    if op == "str.split" {
+        return "hl_str_split(" + t0 + ", " + args + ")"
+    }
+    if op == "str.trim" {
+        return "hl_str_trim(" + t0 + ")"
+    }
+    if op == "str.to_int" {
+        return "hl_str_to_int(" + t0 + ")"
+    }
+    if op == "str.to_float" {
+        return "hl_str_to_double(" + t0 + ")"
+    }
+    if op == "str.to_str" {
+        return t0
+    }
+    if op == "int.to_str" {
+        return "hl_str_from_int64(" + t0 + ")"
+    }
+    if op == "int.to_float" {
+        return "((double)(" + t0 + "))"
+    }
+    if op == "int.abs" {
+        return "hl_abs_i64(" + t0 + ")"
+    }
+    if op == "float.to_str" {
+        return "hl_str_from_double(" + t0 + ")"
+    }
+    if op == "float.to_int" {
+        return "((int64_t)(" + t0 + "))"
+    }
+    if op == "float.abs" {
+        return "(((" + t0 + ") < 0) ? -(" + t0 + ") : (" + t0 + "))"
+    }
+    if op == "bool.to_str" {
+        return "hl_str_from_bool(" + t0 + ")"
+    }
+    if op == "list.len" {
+        return "hl_list_len(" + t0 + ")"
+    }
+    if op == "list.push" {
+        let et: str = list_elem_t(ctx.exprs[ctx.exprs[e].left].t)
+        return "hl_list_push(" + t0 + ", " + box_val(et, args) + ")"
+    }
+    if op == "list.get" {
+        return gen_unbox(ctx, ctx.exprs[e].t, "hl_list_get(" + t0 + ", " + args + ")")
+    }
+    if op == "list.set" {
+        let et: str = list_elem_t(ctx.exprs[ctx.exprs[e].left].t)
+        let ai: str = gen_expr(ctx, ctx.exprs[e].args.get(0))
+        let av: str = gen_expr(ctx, ctx.exprs[e].args.get(1))
+        return "hl_list_set(" + t0 + ", " + ai + ", " + box_val(et, av) + ")"
+    }
+    if op == "list.pop" {
+        return gen_unbox(ctx, ctx.exprs[e].t, "hl_list_pop(" + t0 + ")")
+    }
+    if op == "map.len" {
+        return "hl_map_len(" + t0 + ")"
+    }
+    if op == "map.set" {
+        let vt: str = map_val_t(ctx.exprs[ctx.exprs[e].left].t)
+        let ak: str = gen_expr(ctx, ctx.exprs[e].args.get(0))
+        let av: str = gen_expr(ctx, ctx.exprs[e].args.get(1))
+        return "hl_map_set(" + t0 + ", " + ak + ", " + box_val(vt, av) + ")"
+    }
+    if op == "map.get_or" {
+        let vt: str = map_val_t(ctx.exprs[ctx.exprs[e].left].t)
+        let ak: str = gen_expr(ctx, ctx.exprs[e].args.get(0))
+        let ad: str = gen_expr(ctx, ctx.exprs[e].args.get(1))
+        return gen_unbox(ctx, vt, "hl_map_get(" + t0 + ", " + ak + ", " + box_val(vt, ad) + ")")
+    }
+    if op == "map.has" {
+        return "hl_map_has(" + t0 + ", " + args + ")"
+    }
+    if op == "map.keys" {
+        return "hl_map_keys(" + t0 + ")"
+    }
+    panic("loi noi bo codegen: phuong thuc khong xac dinh " + op)
+    return ""
+}
+
+fn gen_listlit(ctx: Ctx, e: int) -> str {
+    ctx.lit_count = ctx.lit_count + 1
+    let fname: str = "hl_lit_" + ctx.lit_count.to_str()
+    let elem: str = list_elem_t(ctx.exprs[e].t)
+    # SINH GIA TRI PHAN TU TRUOC — helper cua literal long nhau phai
+    # nam hoan chinh truoc helper ngoai (thu tu khai bao C).
+    let vals: list[str] = []
+    let mut i: int = 0
+    while i < ctx.exprs[e].args.len() {
+        vals.push(gen_expr(ctx, ctx.exprs[e].args.get(i)))
+        i = i + 1
+    }
+    ctx.lit_helpers.push("static hl_list* " + fname + "(void) {")
+    ctx.lit_helpers.push("    hl_list* l = hl_list_new();")
+    let mut j: int = 0
+    while j < vals.len() {
+        ctx.lit_helpers.push("    hl_list_push(l, " + box_val(elem, vals.get(j)) + ");")
+        j = j + 1
+    }
+    ctx.lit_helpers.push("    return l;")
+    ctx.lit_helpers.push("}")
+    ctx.lit_helpers.push("")
+    return fname + "()"
+}
+
+# --- Sinh cau lenh C ---
+
+fn gen_stmt(ctx: Ctx, sidx: int, ind: str) -> void {
+    let s: StmtN = ctx.stmts[sidx]
+    if s.kind == "let" {
+        let cn: str = fresh_local(ctx, s.name)
+        let v: str = gen_expr(ctx, s.value)
+        ctx.out.push(ind + c_type(ctx, s.vtype) + " " + cn + " = " + v + ";")
+    } else if s.kind == "assign" {
+        gen_assign(ctx, s, ind)
+    } else if s.kind == "if" {
+        let c: str = gen_expr(ctx, s.cond)
+        ctx.out.push(ind + "if (" + c + ") {")
+        gen_stmts(ctx, s.body, ind + "    ")
+        if s.else_body.len() > 0 {
+            ctx.out.push(ind + "} else {")
+            gen_stmts(ctx, s.else_body, ind + "    ")
+        }
+        ctx.out.push(ind + "}")
+    } else if s.kind == "while" {
+        let c: str = gen_expr(ctx, s.cond)
+        ctx.out.push(ind + "while (" + c + ") {")
+        gen_stmts(ctx, s.body, ind + "    ")
+        ctx.out.push(ind + "}")
+    } else if s.kind == "for" {
+        # chup do dai mot lan (ngu van SPEC muc 5)
+        let it_c: str = gen_expr(ctx, s.iter)
+        let itn: str = fresh_tmp(ctx, "hlc_it")
+        let itn_len: str = fresh_tmp(ctx, "hlc_n")
+        let iv: str = fresh_tmp(ctx, "hlc_i")
+        ctx.out.push(ind + "{")
+        ctx.out.push(ind + "    hl_list* " + itn + " = " + it_c + ";")
+        ctx.out.push(ind + "    int64_t " + itn_len + " = hl_list_len(" + itn + ");")
+        ctx.out.push(ind + "    int64_t " + iv + ";")
+        ctx.out.push(ind + "    for (" + iv + " = 0; " + iv + " < " + itn_len + "; " + iv + "++) {")
+        let cn: str = fresh_local(ctx, s.name)
+        let mut elem: str = s.vtype
+        ctx.out.push(ind + "        " + c_type(ctx, elem) + " " + cn
+            + " = " + gen_unbox(ctx, elem, "hl_list_get(" + itn + ", " + iv + ")") + ";")
+        gen_stmts(ctx, s.body, ind + "        ")
+        ctx.out.push(ind + "    }")
+        ctx.out.push(ind + "}")
+    } else if s.kind == "return" {
+        if s.value == -1 {
+            ctx.out.push(ind + "return;")
+        } else {
+            ctx.out.push(ind + "return " + gen_expr(ctx, s.value) + ";")
+        }
+    } else if s.kind == "break" {
+        ctx.out.push(ind + "break;")
+    } else if s.kind == "continue" {
+        ctx.out.push(ind + "continue;")
+    } else if s.kind == "expr" {
+        ctx.out.push(ind + gen_expr(ctx, s.e) + ";")
+    } else {
+        panic("loi noi bo codegen: cau lenh khong xac dinh " + s.kind)
+    }
+}
+
+fn gen_stmts(ctx: Ctx, stmts: list[int], ind: str) -> void {
+    let mut i: int = 0
+    while i < stmts.len() {
+        gen_stmt(ctx, stmts.get(i), ind)
+        i = i + 1
+    }
+}
+
+fn gen_assign(ctx: Ctx, s: StmtN, ind: str) -> void {
+    let tgt: int = s.target
+    let v: str = gen_expr(ctx, s.value)
+    if ctx.exprs[tgt].kind == "ident" {
+        let cn: str = local_c(ctx, ctx.exprs[tgt].name)
+        ctx.out.push(ind + cn + " = " + v + ";")
+    } else if ctx.exprs[tgt].kind == "field" {
+        let base: str = gen_expr(ctx, ctx.exprs[tgt].left)
+        ctx.out.push(ind + "(" + base + ")->" + ctx.exprs[tgt].name + " = " + v + ";")
+    } else {
+        # gan chi so: hl_list_set(list, i, box(v))
+        let lst: str = gen_expr(ctx, ctx.exprs[tgt].left)
+        let idx: str = gen_expr(ctx, ctx.exprs[tgt].right)
+        let mut elem: str = list_elem_t(ctx.exprs[ctx.exprs[tgt].left].t)
+        ctx.out.push(ind + "hl_list_set(" + lst + ", " + idx + ", " + box_val(elem, v) + ");")
+    }
+}
+
+# --- Sinh ham ---
+
+fn gen_reset_fn(ctx: Ctx) -> void {
+    ctx.gen_locals = map_new()
+    ctx.gen_counts = map_new()
+}
+
+fn gen_fn_body(ctx: Ctx, key: str) -> void {
+    let f: FnInfo = ctx.fns.get_or(key, dummy_fn())
+    gen_reset_fn(ctx)
+    let ptypes_c: list[str] = []
+    let mut i: int = 0
+    while i < f.params.len() {
+        let cn: str = fresh_local(ctx, f.params.get(i))
+        ptypes_c.push(c_type(ctx, f.ptypes.get(i)) + " " + cn)
+        i = i + 1
+    }
+    let mut sig: str = c_type(ctx, f.ret) + " usf_" + c_fn_name(key) + "("
+    if ptypes_c.len() == 0 {
+        sig = sig + "void)"
+    } else {
+        sig = sig + join(ptypes_c, ", ") + ")"
+    }
+    ctx.out.push(sig + " {")
+    gen_stmts(ctx, f.body, "    ")
+    ctx.out.push("}")
+    ctx.out.push("")
+}
+
+fn gen_struct_lines(ctx: Ctx) -> list[str] {
+    let mut out: list[str] = []
+    let names: list[str] = ctx.structs.keys()
+    let mut i: int = 0
+    while i < names.len() {
+        let st: StructInfo = ctx.structs.get_or(names.get(i), dummy_struct())
+        out.push("typedef struct " + st.name + " {")
+        let mut j: int = 0
+        while j < st.fields.len() {
+            out.push("    " + c_type(ctx, st.ftypes.get(j)) + " " + st.fields.get(j) + ";")
+            j = j + 1
+        }
+        out.push("} " + st.name + ";")
+        out.push("")
+        # ham dung
+        let ptypes_c: list[str] = []
+        let assigns: list[str] = []
+        let mut j2: int = 0
+        while j2 < st.fields.len() {
+            ptypes_c.push(c_type(ctx, st.ftypes.get(j2)) + " " + st.fields.get(j2))
+            assigns.push("    p->" + st.fields.get(j2) + " = " + st.fields.get(j2) + ";")
+            j2 = j2 + 1
+        }
+        out.push("static " + st.name + "* usf_new_" + st.name + "(" + join(ptypes_c, ", ") + ") {")
+        out.push("    " + st.name + "* p = (" + st.name + "*)malloc(sizeof(" + st.name + "));")
+        out.push("    if (!p) hl_die(\"het bo nho\");")
+        let mut k: int = 0
+        while k < assigns.len() {
+            out.push(assigns.get(k))
+            k = k + 1
+        }
+        out.push("    return p;")
+        out.push("}")
+        out.push("")
+        i = i + 1
+    }
+    return out
+}
+
+fn gen_proto_lines(ctx: Ctx) -> list[str] {
+    let mut out: list[str] = []
+    let mut i: int = 0
+    while i < ctx.fn_order.len() {
+        let mut key: str = ctx.fn_order.get(i)
+        let f: FnInfo = ctx.fns.get_or(key, dummy_fn())
+        let ptypes_c: list[str] = []
+        let mut j: int = 0
+        while j < f.params.len() {
+            ptypes_c.push(c_type(ctx, f.ptypes.get(j)))
+            j = j + 1
+        }
+        let mut sig: str = c_type(ctx, f.ret) + " usf_" + c_fn_name(key) + "("
+        if ptypes_c.len() == 0 {
+            sig = sig + "void)"
+        } else {
+            sig = sig + join(ptypes_c, ", ") + ")"
+        }
+        out.push(sig + ";")
+        i = i + 1
+    }
+    out.push("")
+    return out
+}
+
+fn gen_program(ctx: Ctx) -> list[str] {
+    # 1. sinh than ham truoc (phat sinh cac ham ho tro literal danh sach)
+    ctx.out = []
+    ctx.lit_helpers = []
+    ctx.lit_count = 0
+    ctx.tmp = 0
+    let mut i: int = 0
+    while i < ctx.fn_order.len() {
+        gen_fn_body(ctx, ctx.fn_order.get(i))
+        i = i + 1
+    }
+    let bodies: list[str] = ctx.out
+    # 2. gop theo thu tu: header -> runtime -> struct -> proto -> lit -> body -> main
+    let final: list[str] = []
+    final.push("// =============================================================")
+    final.push("// Ma C duoc sinh BOI hlc — trinh bien dich Hieu Louis (HLS)")
+    final.push("// Nguon HLS duoc bien dich boi chinh hlc (tu dich).")
+    final.push("// =============================================================")
+    final.push("")
+    concat_lines(final, runtime_lines())
+    final.push("")
+    concat_lines(final, gen_struct_lines(ctx))
+    concat_lines(final, gen_proto_lines(ctx))
+    concat_lines(final, ctx.lit_helpers)
+    concat_lines(final, bodies)
+    # 3. main wrapper
+    let mf: FnInfo = ctx.fns.get_or("main", dummy_fn())
+    final.push("int main(int argc, char** argv) {")
+    final.push("    hl_init_args(argc, argv);")
+    if mf.ret == "int" {
+        final.push("    return (int)(usf_main());")
+    } else {
+        final.push("    usf_main();")
+        final.push("    return 0;")
+    }
+    final.push("}")
+    return final
+}
+
+# ----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
+# 6. MAIN — pipeline day du: LEX -> PARSE -> CHECK -> GEN -> GHI RA C
+# ----------------------------------------------------------------------------
+
+fn main() -> int uses IO {
+    let a: list[str] = args()
+    if a.len() < 3 {
+        println("cach dung: hlc <vao.hls> <ra.c | ->")
+        return 1
+    }
+    let src: str = read_file(a.get(1))
+    let ctx: Ctx = new_ctx(src)
+    lex(ctx)
+    parse_program(ctx)
+    check_program(ctx)
+    let lines: list[str] = gen_program(ctx)
+    let code: str = join(lines, "\n")
+    let out_path: str = a.get(2)
+    if out_path == "-" {
+        print(code)
+        println("")
+    } else {
+        write_file(out_path, code)
+    }
+    return 0
+}
+
+# --- HET ---
