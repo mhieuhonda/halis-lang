@@ -131,12 +131,15 @@ fn main() -> int uses IO {
 ```
 
 See also: [examples/](examples/) — including `secure_demo.hls` demonstrating
-safe panics on integer overflow, `wordcount.hls` reading a real file, and
-`web_demo.hls` showing URL parsing, JSON handling and HTML escaping.
+safe panics on integer overflow, `wordcount.hls` reading a real file,
+`web_demo.hls` showing URL parsing, JSON handling and HTML escaping, and
+`enum_demo.hls` / `option_demo.hls` / `result_demo.hls` demonstrating Stage 7
+features (enums, match, `?` operator, Option/Result).
 
-## Standard library (Stage 6)
+## Standard library (Stage 6 + Stage 7)
 
-HLS ships with a small pure-HLS standard library focused on web programming:
+HLS ships with a small pure-HLS standard library focused on web programming
+and error handling:
 
 | Module | What it provides |
 |--------|------------------|
@@ -145,9 +148,11 @@ HLS ships with a small pure-HLS standard library focused on web programming:
 | `std.json` | `json_parse(src) -> JsonValue`, `json_stringify(v) -> str`, plus constructors (`json_null/bool/int/float/str/array/object`) and accessors (`json_object_get`, `json_object_has`, `json_is_*`) |
 | `std.url` | `url_parse(s) -> Url`, `url_stringify(u) -> str`, `url_query_parse(qs) -> map[str,str]`, `url_query_stringify(m) -> str`, `url_encode(s)`, `url_decode(s)` |
 | `std.html` | `html_escape(s)`, `html_escape_attr(s)`, `html_unescape(s)`, `html_tag(name, attrs, content)`, `html_text(s)` |
+| `std.option` (Stage 7) | `enum Option[T] { Some(T), None }`, `option_unwrap`, `option_unwrap_or`, `option_is_some`, `option_is_none` |
+| `std.result` (Stage 7) | `enum Result[T, E] { Ok(T), Err(E) }`, `result_unwrap`, `result_unwrap_or`, `result_err_or`, `result_is_ok`, `result_is_err`, `int_parse(s) -> Result[int, str]`, `float_parse(s) -> Result[float, str]` |
 
 Each module is written in HLS itself and can be used inside `hlc` (the
-compiler) or any user program. Import with `import "std.json"` (or whichever
+compiler) or any user program. Import with `import "std.option"` (or whichever
 module you need).
 
 ## Repository layout
@@ -193,15 +198,19 @@ Full details: [SPEC.md](SPEC.md) · Stage-by-stage roadmap:
 
 ## Status
 
-**v0.2.0 — Stages 1–6 complete** (see ROADMAP):
+**v0.3.0 — Stages 1–7 complete** (see ROADMAP):
 
 - ✅ Complete core specification
 - ✅ Stage-0 reference (interpreted, with type + effects checking)
 - ✅ Self-hosted compiler `hlc.hls` (front-end + C backend)
-- ✅ Self-compiling fixed-point; 60/60 tests PASS
-- ✅ Module system & standard library (Stage 6): `import`, `std.str`,
-  `std.math`, `std.json`, `std.url`, `std.html`
-- ⬜ enum/generics, ownership, LLVM, concurrency...
+- ✅ Self-compiling fixed-point; 78/78 tests PASS
+- ✅ Module system & standard library (Stage 6): `std.str`, `std.math`,
+  `std.json`, `std.url`, `std.html`
+- ✅ **Stage 7 — Advanced type system**: `enum` + `match` (with
+  exhaustiveness checking), `Option[T]`/`Result[T, E]` in stdlib,
+  `?` error-propagation operator, monomorphising generics on functions /
+  structs / enums, struct default field values, recursive enums
+- ⬜ ownership/borrow, fine-grained effects, SSA IR, LLVM, concurrency...
 
 ## Contributing
 

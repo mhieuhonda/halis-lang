@@ -1,4 +1,4 @@
-"""Stage-0 parser for HLS. Conforms to SPEC.md sections 4-6."""
+"""Stage-0 parser for HLS. Conforms to SPEC.md sections 4-6, 11b-12 (v0.3)."""
 from .lexer import HLError
 
 INT64_MAX = 9223372036854775807
@@ -67,14 +67,20 @@ class Parser:
     # ---------- program ----------
     def parse_program(self):
         structs = {}   # name -> struct
+        enums = {}      # name -> enum
         fns = {}       # key -> fn  (key = function name or "Struct.method")
-        imports = []   # list of import paths (Phase 6)
+        imports = []   # list of import paths
         while self.peek()["k"] != "eof":
             if self.at_kw("struct"):
                 st = self.parse_struct()
-                if st["name"] in structs:
-                    self.err("duplicate struct name: %s" % st["name"])
+                if st["name"] in structs or st["name"] in enums:
+                    self.err("duplicate type name: %s" % st["name"])
                 structs[st["name"]] = st
+            elif self.at_kw("enum"):
+                en = self.parse_enum()
+                if en["name"] in enums or en["name"] in structs:
+                    self.err("duplicate type name: %s" % en["name"])
+                enums[en["name"]] = en
             elif self.at_kw("impl"):
                 self.parse_impl(fns)
             elif self.at_kw("fn"):
@@ -86,13 +92,11 @@ class Parser:
                 imp = self.parse_import()
                 imports.append(imp)
             else:
-                self.err("only struct/impl/fn/import declarations allowed at top level")
-        return {"structs": structs, "fns": fns, "imports": imports}
+                self.err("only struct/enum/impl/fn/import declarations allowed at top level")
+        return {"structs": structs, "enums": enums, "fns": fns, "imports": imports}
 
     def parse_import(self):
         t0 = self.eat_kw("import")
-        # import "path/to/mod.hls"
-        # or: import "std.str"
         path_tok = self.peek()
         if path_tok["k"] != "str":
             self.err("import expects a string path", path_tok)
@@ -100,16 +104,37 @@ class Parser:
         path = path_tok["v"].decode("latin-1")
         return {"path": path, "line": t0["line"]}
 
+    def parse_typeparams(self):
+        """Parse `[T, U, ...]` — list of type parameter names."""
+        tps = []
+        if not self.at_sym("["):
+            return tps
+        self.next()
+        while not self.at_sym("]"):
+            t = self.eat_ident()
+            tps.append(t["v"])
+            if self.at_sym(","):
+                self.next()
+            elif not self.at_sym("]"):
+                self.err("expected ',' or ']' in type parameters")
+        self.eat_sym("]")
+        return tps
+
     def parse_struct(self):
         t0 = self.eat_kw("struct")
         name = self.eat_ident()["v"]
+        typeparams = self.parse_typeparams()
         self.eat_sym("{")
-        fields = []
+        fields = []  # list of (name, type, default_expr_or_None)
         while not self.at_sym("}"):
             ft = self.eat_ident()
             self.eat_sym(":")
             ty = self.parse_type()
-            fields.append((ft["v"], ty))
+            default = None
+            if self.at_sym("="):
+                self.next()
+                default = self.parse_expr()
+            fields.append((ft["v"], ty, default))
             if self.at_sym(","):
                 self.next()
             elif not self.at_sym("}"):
@@ -117,7 +142,49 @@ class Parser:
         self.eat_sym("}")
         if not fields:
             self.err("struct must have at least one field", t0)
-        return {"name": name, "fields": fields, "line": t0["line"]}
+        # Enforce: defaulted fields must come after non-defaulted ones.
+        seen_default = False
+        for fname, ftype, fdefault in fields:
+            if fdefault is not None:
+                seen_default = True
+            elif seen_default:
+                self.err("struct field '%s' without default cannot follow a defaulted field"
+                         % fname, t0)
+        return {"name": name, "typeparams": typeparams, "fields": fields,
+                "line": t0["line"]}
+
+    def parse_enum(self):
+        t0 = self.eat_kw("enum")
+        name = self.eat_ident()["v"]
+        typeparams = self.parse_typeparams()
+        self.eat_sym("{")
+        variants = []  # list of (variant_name, [payload_types])
+        seen = set()
+        while not self.at_sym("}"):
+            vt = self.eat_ident()
+            if vt["v"] in seen:
+                self.err("duplicate variant name in enum: %s" % vt["v"], vt)
+            seen.add(vt["v"])
+            payloads = []
+            if self.at_sym("("):
+                self.next()
+                while not self.at_sym(")"):
+                    payloads.append(self.parse_type())
+                    if self.at_sym(","):
+                        self.next()
+                    elif not self.at_sym(")"):
+                        self.err("expected ',' or ')' in variant payloads")
+                self.eat_sym(")")
+            variants.append((vt["v"], payloads))
+            if self.at_sym(","):
+                self.next()
+            elif not self.at_sym("}"):
+                self.err("expected ',' or '}' in enum definition")
+        self.eat_sym("}")
+        if not variants:
+            self.err("enum must have at least one variant", t0)
+        return {"name": name, "typeparams": typeparams, "variants": variants,
+                "line": t0["line"]}
 
     def parse_impl(self, fns):
         t0 = self.eat_kw("impl")
@@ -137,6 +204,7 @@ class Parser:
     def parse_fn(self, impl_struct):
         t0 = self.eat_kw("fn")
         name = self.eat_ident()["v"]
+        typeparams = self.parse_typeparams()
         self.eat_sym("(")
         params = []  # (name, type, mut)
         while not self.at_sym(")"):
@@ -162,12 +230,13 @@ class Parser:
             self.next()
             io = self.eat_ident()
             if io["v"] != "IO":
-                self.err("the only effect in v0.2 is 'uses IO'", io)
+                self.err("the only effect in v0.3 is 'uses IO'", io)
             uses_io = True
         body = self.parse_block()
         return {
-            "name": name, "params": params, "ret": ret, "uses_io": uses_io,
-            "body": body, "line": t0["line"], "struct": impl_struct,
+            "name": name, "typeparams": typeparams, "params": params, "ret": ret,
+            "uses_io": uses_io, "body": body, "line": t0["line"],
+            "struct": impl_struct,
         }
 
     # ---------- types ----------
@@ -185,7 +254,7 @@ class Parser:
             self.eat_sym("[")
             kt = self.eat_ident()
             if kt["v"] != "str":
-                self.err("map key in v0.2 must be 'str'", kt)
+                self.err("map key in v0.3 must be 'str'", kt)
             self.eat_sym(",")
             vt = self.parse_type()
             self.eat_sym("]")
@@ -194,7 +263,19 @@ class Parser:
             if base == "void" and not allow_void:
                 self.err("void can only be used as a return type", t)
             return base
-        return base  # struct name — checker will verify
+        # User-defined type — could be generic instantiation: Name[T1, T2, ...]
+        if self.at_sym("["):
+            self.next()
+            args = []
+            while not self.at_sym("]"):
+                args.append(self.parse_type())
+                if self.at_sym(","):
+                    self.next()
+                elif not self.at_sym("]"):
+                    self.err("expected ',' or ']' in type arguments")
+            self.eat_sym("]")
+            return "%s[%s]" % (base, ", ".join(args))
+        return base  # struct/enum name — checker will verify
 
     # ---------- statements ----------
     def parse_block(self):
@@ -240,7 +321,14 @@ class Parser:
             if v == "continue":
                 self.next()
                 return {"k": "continue", "line": t["line"]}
-            if v in ("struct", "impl", "fn"):
+            if v == "match":
+                # match can be a statement (expression-statement)
+                e = self.parse_match()
+                # In statement position, a match is just an expression.
+                # The checker will allow it as a call-equivalent (it has side effects
+                # only through its arms; we permit it as a statement).
+                return {"k": "expr", "e": e, "line": e["line"]}
+            if v in ("struct", "impl", "enum", "fn"):
                 self.err("%s declaration only allowed at top level" % v)
             self.err("keyword cannot start a statement: %s" % v)
         # expression / assignment
@@ -253,7 +341,7 @@ class Parser:
                 self._require_ident_root(e)
             val = self.parse_expr()
             return {"k": "assign", "target": e, "value": val, "line": eq["line"]}
-        if e["k"] not in ("call", "method"):
+        if e["k"] not in ("call", "method", "fieldcall", "match"):
             self.err("expression as statement must be a function/method call")
         return {"k": "expr", "e": e, "line": e["line"]}
 
@@ -326,13 +414,15 @@ class Parser:
                 dot = self.next()
                 name = self.eat_ident()
                 if self.at_sym("("):
+                    # `target.name(args)` — either a method call or an enum
+                    # variant constructor. Defer disambiguation to the checker.
                     args = self.parse_args()
-                    e = {"k": "method", "target": e, "name": name["v"],
+                    e = {"k": "fieldcall", "target": e, "name": name["v"],
                          "args": args, "line": dot["line"]}
                 else:
                     e = {"k": "field", "target": e, "name": name["v"],
                          "line": dot["line"]}
-            elif self.at_sym("[") and e["k"] in ("ident", "field", "index", "call", "method"):
+            elif self.at_sym("[") and e["k"] in ("ident", "field", "index", "call", "method", "fieldcall"):
                 lb = self.next()
                 idx = self.parse_expr()
                 self.eat_sym("]")
@@ -341,6 +431,9 @@ class Parser:
                 args = self.parse_args()
                 e = {"k": "call", "name": e["name"], "args": args,
                      "line": e["line"]}
+            elif self.at_sym("?"):
+                q = self.next()
+                e = {"k": "qmark", "e": e, "line": q["line"]}
             else:
                 return e
 
@@ -356,11 +449,64 @@ class Parser:
         self.eat_sym(")")
         return args
 
+    def parse_match(self):
+        t0 = self.eat_kw("match")
+        scrut = self.parse_expr(allow_struct=False)
+        self.eat_sym("{")
+        arms = []
+        while not self.at_sym("}"):
+            arm = self.parse_arm()
+            arms.append(arm)
+            if self.at_sym(","):
+                self.next()
+            elif not self.at_sym("}"):
+                self.err("expected ',' or '}' in match arms")
+        self.eat_sym("}")
+        return {"k": "match", "scrut": scrut, "arms": arms, "line": t0["line"]}
+
+    def parse_arm(self):
+        # pattern: _ | _Ident (wildcard with optional bind, only `_` here)
+        #        | Name.Variant
+        #        | Name.Variant(Ident, Ident, ...)   (with payload bindings)
+        #        | Name.Variant(_)                    (payload ignored)
+        if self.at_sym("_"):
+            self.next()
+            pattern = {"k": "wildcard"}
+        else:
+            # `Name.Variant` or `Name.Variant(bindings)` — Name is the enum
+            # type name. (We require the enum name to be present — no bare
+            # `Variant` patterns, for auditability.)
+            ename_tok = self.eat_ident()
+            ename = ename_tok["v"]
+            self.eat_sym(".")
+            vname = self.eat_ident()["v"]
+            bindings = []
+            has_paren = False
+            if self.at_sym("("):
+                has_paren = True
+                self.next()
+                while not self.at_sym(")"):
+                    if self.at_sym("_"):
+                        self.next()
+                        bindings.append("_")  # wildcard — payload ignored
+                    else:
+                        b = self.eat_ident()
+                        bindings.append(b["v"])
+                    if self.at_sym(","):
+                        self.next()
+                    elif not self.at_sym(")"):
+                        self.err("expected ',' or ')' in variant pattern")
+                self.eat_sym(")")
+            pattern = {"k": "variant", "enum": ename, "variant": vname,
+                       "bindings": bindings, "has_paren": has_paren}
+        self.eat_sym("=>")
+        body = self.parse_expr()
+        return {"pattern": pattern, "body": body, "line": self.peek()["line"]}
+
     def parse_primary(self, allow_struct):
         t = self.peek()
         if t["k"] == "int":
             if t["v"] > 2 ** 63:
-                # 2^63 is only valid when combined with minus sign to form INT64_MIN
                 self.err("integer literal too large (exceeds int64)")
             self.next()
             return {"k": "int", "v": t["v"], "line": t["line"]}
@@ -373,6 +519,8 @@ class Parser:
         if t["k"] == "kw" and t["v"] in ("true", "false"):
             self.next()
             return {"k": "bool", "v": t["v"] == "true", "line": t["line"]}
+        if t["k"] == "kw" and t["v"] == "match":
+            return self.parse_match()
         if t["k"] == "ident":
             name = t["v"]
             nxt = self.toks[self.pos + 1] if self.pos + 1 < len(self.toks) else None

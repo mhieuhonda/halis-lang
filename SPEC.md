@@ -1,10 +1,13 @@
-# Hieu Louis language specification (HLS) — v0.2.0
+# Hieu Louis language specification (HLS) — v0.3.0
 
 > **Hieu Louis** is a high-security, native-compiled programming language
 > designed around the philosophy: **safety by default, explicitness for
-> auditability, performance via AOT compilation**. Version v0.2.0 is the
-> minimal core that is **complete and runs for real**: every operation is
-> checked, every I/O is statically tracked, no null, no undefined behaviour.
+> auditability, performance via AOT compilation**. Version v0.3.0 extends the
+> v0.2 core with **sum types (`enum`), pattern matching (`match`), generic
+> types via monomorphisation, the `?` error-propagation operator, and struct
+> default field values** — bringing controlled error handling to the
+> language. Every operation is still checked, every I/O is statically
+> tracked, no null, no undefined behaviour.
 
 - Source files: `*.hls`
 - Self-hosted compiler: `src/hlc.hls` (HLS → C → native)
@@ -54,10 +57,10 @@
 ### 2.4. Identifiers
 - `[A-Za-z_][A-Za-z0-9_]*`. Convention: functions/variables `snake_case`,
   structs `PascalCase`.
-- Cannot clash with keywords. Keywords (17): `fn let mut return if else while
-  for in break continue struct impl import uses true false`.
+- Cannot clash with keywords. Keywords (19): `fn let mut return if else while
+  for in break continue struct impl import uses true false enum match`.
 
-### 2.5. Reserved keywords (unused, error if encountered): `secure`, `match`, `enum`, `trait`
+### 2.5. Reserved keywords (unused, error if encountered): `secure`, `trait`
 
 ### 2.6. Numbers
 - Integer: `[0-9][0-9_]*` (underscores for readability: `1_000_000`). Type
@@ -75,11 +78,12 @@
 
 ### 2.8. Operators & symbols
 ```
-->  ==  !=  <=  >=  <  >  =  +  -  *  /  %  !  &&  ||
-(  )  {  }  [  ]  ,  :  .
+->  ==  !=  <=  >=  <  >  =  +  -  *  /  %  !  &&  ||  ?
+(  )  {  }  [  ]  ,  :  . 
 ```
-Lone `&` and `|` are lexical errors. No bitwise operators in v0.2 (each
-bitwise operator will be added with its own checked semantics — Stage 7).
+Lone `&` and `|` are lexical errors. No bitwise operators in v0.3 (each
+bitwise operator will be added with its own checked semantics — later stage).
+The `?` postfix operator is the error-propagation operator (section 12).
 
 ---
 
@@ -95,17 +99,24 @@ bitwise operator will be added with its own checked semantics — Stage 7).
 | `map[str, T]` | hash map with `str` keys, `T` values | `hl_map*`               |
 | `void`    | only used as a return type (empty)      | —                          |
 | `Name`    | user-defined struct (reference semantics) | `Name*`                  |
+| `Name`    | user-defined enum (sum type, reference semantics) | `Name*`       |
+| `Name[T1, T2, ...]` | generic instantiation of a struct/enum | mangled name |
 
 Rules:
 - **No implicit casts.** `int → float` requires `x.to_float()`, the reverse
   `x.to_int()`.
 - Structs have **reference semantics** (like a checked pointer); assigning a
   struct assigns the reference. Move semantics & ownership arrive in Stage 8.
-- `map` in v0.2 only has `str` keys (general key support: Stage 7).
-- `==`/`!=` comparison only applies to: `int`, `float`, `bool`, `str`. `list`,
-  `map`, structs **cannot** be compared with `==` in v0.2.
+- Enums have **reference semantics** too — variant values are heap-allocated
+  tagged unions. (See section 11b for the memory model.)
+- `map` in v0.3 only has `str` keys (general key support: later stage).
+- `==`/`!=` comparison applies to: `int`, `float`, `bool`, `str`. `list`,
+  `map`, structs, enums **cannot** be compared with `==` in v0.3.
 - Ordering comparison `< <= > >=` applies to: `int`, `float` (numeric) and
   `str` (bytewise, like `memcmp`).
+- Generic types are **monomorphised**: each instantiation produces its own
+  C type/function (no boxing, no virtual dispatch — performance equal to
+  hand-written code).
 
 ---
 
@@ -115,29 +126,53 @@ A `.hls` file is a sequence of **top-level** declarations (any order, forward
 references allowed):
 
 ```
-program     := (structdef | impl | fndef | import)*
-structdef   := "struct" Ident "{" field ("," field)* ","? "}"
-field       := Ident ":" type
-impl        := "impl" Ident "{" fndef* "}"
-fndef       := "fn" Ident "(" params? ")" ("->" type)? ("uses" "IO")? block
-params      := param ("," param)* ","?
-param       := "mut"? Ident ":" type
-type        := "int" | "float" | "bool" | "str" | "void"
-             | "list" "[" type "]"
-             | "map" "[" "str" "," type "]"
-             | Ident                      # struct name
-import      := "import" string-literal
-block       := "{" stmt* "}"
+program        := (structdef | enumdef | impl | fndef | import)*
+structdef      := "struct" Ident typeparams? "{" field ("," field)* ","? "}"
+field          := Ident ":" type ("=" expr)?          # default value is optional (Stage 7)
+enumdef        := "enum" Ident typeparams? "{" variant ("," variant)* ","? "}"
+variant        := Ident ("(" type ("," type)* ","? ")")?
+typeparams     := "[" Ident ("," Ident)* "]"
+impl           := "impl" Ident "{" fndef* "}"
+fndef          := "fn" Ident typeparams? "(" params? ")" ("->" type)? ("uses" "IO")? block
+params         := param ("," param)* ","?
+param          := "mut"? Ident ":" type
+type           := "int" | "float" | "bool" | "str" | "void"
+                | "list" "[" type "]"
+                | "map" "[" "str" "," type "]"
+                | Ident typeargs?                      # struct/enum name, optionally generic
+typeargs       := "[" type ("," type)* "]"
+import         := "import" string-literal
+block          := "{" stmt* "}"
 ```
 
 - **The `main` function** is required: `fn main() -> int` or `fn main()`; it
   has no parameters. The return value is the process exit code; a void `main`
   returns 0.
 - No globals, no global constants. Imports load other `.hls` files (Stage 6).
-- Duplicate names (function–function, struct–struct, duplicate methods inside
-  one `impl`) are errors.
-- Structs must have at least 1 field. Struct fields cannot have default values
-  in v0.2; struct literals must list every field.
+- Duplicate names (function–function, struct–struct, enum–enum, duplicate
+  methods inside one `impl`) are errors. A struct and an enum cannot share a
+  name.
+- Structs must have at least 1 field. **Struct fields may have default
+  values** (Stage 7): `struct Point { x: int, y: int = 0 }`. When a struct
+  literal omits a field that has a default, the default is used. Fields with
+  defaults must come **after** fields without defaults (so the syntactic
+  order is still well-defined).
+- **Enums (Stage 7)** declare a sum type. Each variant has 0 or more
+  payload types. Example:
+  ```
+  enum Color { Red, Green, Blue }
+  enum Shape {
+      Circle(float),
+      Rect(float, float),
+      Point
+  }
+  enum Option[T] { Some(T), None }
+  enum Result[T, E] { Ok(T), Err(E) }
+  ```
+- **Type parameters** (generics) appear in `[...]` right after the name. They
+  are uppercase by convention but the language does not enforce this.
+  Generic functions, structs and enums are monomorphised at the call site /
+  use site — every distinct instantiation gets its own generated code.
 
 ### 4.1. Imports (Stage 6)
 
@@ -158,7 +193,7 @@ import "std.str"              # standard library module
 
 ```
 stmt := let | assign | "if" ... | "while" ... | "for" ... | "return" ...
-      | "break" | "continue" | callstmt
+      | "break" | "continue" | "match" ... | callstmt
 
 let     := "let" "mut"? Ident ":" type "=" expr
 assign  := lvalue "=" expr
@@ -167,6 +202,10 @@ if      := "if" expr block ("else" (if | block))?
 while   := "while" expr block
 for     := "for" Ident ":" type "in" expr block
 return  := "return" expr?
+match   := "match" expr "{" arm ("," arm)* ","? "}"     # Stage 7
+arm     := pattern "=>" expr
+pattern := (Ident ".")? Ident ("(" Ident ("," Ident)* ")")?  # constructor pattern
+        | "_"                                            # wildcard
 callstmt:= call-expression          # expression-statements must be function/method calls
 ```
 
@@ -178,6 +217,10 @@ Rules:
   (consistent with `xs.push(v)`).
 - **No shadowing:** declaring a name already visible in an enclosing scope is
   an error. Sibling scopes (two different loops both naming `i`) are fine.
+  **Pattern bindings in `match` arms** introduce a new scope: each arm's
+  bindings shadow the outer scope for the duration of that arm only — this
+  is the one and only shadowing exception, and it is safe because arms are
+  mutually exclusive.
 - `if`/`while`: the condition **must be `bool`** — no "truthiness". In
   condition position and the `for` iterable position (the position directly
   before a `{` block), struct literals must be wrapped in parentheses to
@@ -188,10 +231,19 @@ Rules:
   body.
 - `return` without a value is only for `void`-returning functions. For
   functions with a return type, **every path must return** (conservative
-  flow analysis; `while` is not considered a return path).
+  flow analysis; `while` is not considered a return path). A `match` is
+  considered a return path iff it is exhaustive and every arm returns.
 - `break`/`continue` are only valid inside a loop body.
 - An expression-statement must be a **call** (function or method). `x + 1;` is
   an "expression has no effect" error.
+- `match` (Stage 7): the scrutinee expression must have an enum type. Arms
+  are checked for **exhaustiveness** — either every variant is covered, or a
+  wildcard `_ =>` arm is present. Every arm's expression must have the same
+  type, which becomes the type of the `match` expression. A `match` is
+  itself an expression and can appear wherever expressions can (with the
+  usual caveat that in condition / iterable position, struct literals
+  inside arms are unaffected because the `{` of the match is the
+  delimiter).
 
 ---
 
@@ -208,7 +260,8 @@ From lowest to highest:
 | 5         | `+` `-`            | `+` on str is concatenation |
 | 6         | `*` `/` `%`        | int: checked; float: IEEE |
 | 7         | `!` `-` (unary)   | negation / checked unary minus |
-| 8 (high)  | `.` `[` `(`        | postfix: field, index, call |
+| 8         | `?` (postfix)      | error-propagation (Stage 7, section 12) |
+| 9 (high)  | `.` `[` `(`        | postfix: field, index, call |
 
 Operands:
 - Literals: `int`, `float`, `true`, `false`, `str`.
@@ -218,11 +271,21 @@ Operands:
   type at `let`, parameter type, return type, element type of an enclosing
   literal). The empty literal `[]` requires a contextual type. All elements
   must have the exact same type.
-- `Name { f1: e1, f2: e2, ... }` — struct literal: **all fields, in declared
-  order** (field names written explicitly for auditability). Only allowed
-  where context permits (not directly as an `if`/`while` condition).
+- `Name { f1: e1, f2: e2, ... }` — struct literal: **all non-defaulted fields,
+  in declared order** (field names written explicitly for auditability).
+  Fields with default values may be omitted. Only allowed where context
+  permits (not directly as an `if`/`while` condition).
+- `Name.Variant` — enum variant with no payload. (Stage 7)
+- `Name.Variant(a1, a2, ...)` — enum variant with payload(s). (Stage 7)
+- `match scrutinee { arm, arm, ... }` — match expression (Stage 7, section 5).
 - Function call `f(a, b)`, method call `x.m(a, b)`, field access `x.f`,
   index access `xs[i]` (only `list`; `i` must be `int`, runtime bounds check).
+- `expr?` — error-propagation operator (Stage 7, section 12). The operand
+  must have an enum type with an `Err` variant (one payload) or a `None`
+  variant (no payload). The expression yields the unwrapped success value.
+  On the error variant, the enclosing function immediately returns the
+  error value (which must be assignable to the enclosing function's return
+  type).
 - Operands of `&&`/`||` must be `bool`.
 
 ---
@@ -298,14 +361,14 @@ To mutate fields: declare `mut self: Point`.
 
 ---
 
-## 9. The effects system — v0.2's security heart
+## 9. The effects system — v0.3's security heart
 
-- The only effect in v0.2: **IO** (print/file read-write, command-line args,
+- The only effect in v0.3: **IO** (print/file read-write, command-line args,
   exit, clock).
 - A function that (directly or indirectly through a static call chain) calls
   any builtin function/method with the IO effect **must declare** `uses IO`.
 - The analysis is a **fixpoint on the static call graph** (every call is
-  static in v0.2).
+  static in v0.3).
 - Violations → compile error, naming the function and the violating call chain.
 - Consequence: every function without `uses IO` is **guaranteed pure** (no
   possible I/O side effect). This is the foundation for later optimisations
@@ -326,42 +389,109 @@ fn greet(name: str) -> int uses IO {
 
 ---
 
-## 10. The v0.2 memory model (honest & deliberate)
+## 10. The v0.3 memory model (honest & deliberate)
 
-- v0.2 uses **arena allocation**: every string/list/map/struct is allocated
-  and **never freed** during the process lifetime. Short programs (CLIs,
-  the compiler itself) never have a problem.
-- This is a deliberate decision to keep the v0.2 core small, verifiable, with
+- v0.3 uses **arena allocation**: every string/list/map/struct/enum/variant
+  is allocated and **never freed** during the process lifetime. Short
+  programs (CLIs, the compiler itself) never have a problem.
+- This is a deliberate decision to keep the v0.3 core small, verifiable, with
   no use-after-free, no double-free **structurally** (there is no `free`!).
 - Ownership / borrow checker and exact memory reclamation: **Stage 8** of the
   roadmap.
-- Deep recursion: v0.2 has no stack overflow check yet (Stage 11).
+- Deep recursion: v0.3 has no stack overflow check yet (Stage 11).
 
 ## 11. Errors & panics
 
 - Compile errors (type, effect, syntax): halt at compile time, with line
   numbers.
 - `panic(msg)`: prints `panic: <msg>` (with location when running on Stage-0)
-  to stderr, exits with code **101**. v0.2 has no panic-catch mechanism
-  (controlled error handling: `Result` in Stage 7).
+  to stderr, exits with code **101**.
+- v0.3 introduces **controlled error handling** via `Result[T, E]` and the
+  `?` operator (section 12). `panic` is now **reserved for programming bugs**
+  — invariant violations, impossible states. Expected failures (file not
+  found, parse error, invalid input) must be reported via `Result`, not
+  `panic`.
 
-## 12. What v0.2 deliberately does NOT have
+## 11b. Enum values & memory layout
+
+- An enum value is a heap-allocated tagged union: a tag identifying the
+  variant, plus (optional) a payload slot.
+- Variants with no payload (`None`, `Red`, `Point`) carry no payload —
+  the value is still heap-allocated for uniform reference semantics.
+- Variants with one or more payloads carry the payload values inline in the
+  union. Payloads use the same C representation as ordinary values (so a
+  `str` payload is a `hl_str*`, a `list[T]` payload is a `hl_list*`, an `int`
+  payload is an `int64_t`, a nested enum/struct payload is a pointer).
+- The C backend generates a `typedef struct { int tag; union { ... } data; } Name;`
+  per enum, and a `Name*` constructor per variant. Constructors of
+  zero-payload variants return the same shared singleton (or a fresh
+  allocation — the choice is invisible to the program because enums are
+  compared by tag, not by pointer equality).
+- The interpreter represents an enum value as a Python dict
+  `{"enum": "Color", "var": "Red", "data": [...]}`.
+
+## 12. The `?` error-propagation operator (Stage 7)
+
+`expr?` is a postfix operator that **propagates errors**.
+
+- The operand `expr` must have an enum type. The enum must have either:
+  - an `Err` variant with exactly one payload (the error type), or
+  - a `None` variant with no payload (treating absence as the "error").
+- For `Result[T, E]`: `expr?` checks the tag. If `Ok(v)`, the expression
+  yields `v` (type `T`). If `Err(e)`, the enclosing function **immediately
+  returns `Result.Err(e)`** — the enclosing function's return type must be
+  assignable from `Result.Err(e)` (usually it must return `Result[_, E]`).
+- For `Option[T]`: `expr?` checks the tag. If `Some(v)`, yields `v`. If
+  `None`, the enclosing function immediately returns `Option.None` (the
+  enclosing function must return some `Option[_]`).
+- The `?` operator cannot be used in `main` (main has no return type to
+  propagate into — use `match` or `panic` in main).
+- Inside an arm of a `match`, `?` propagates out of the enclosing function,
+  not out of the `match` (this matches Rust's semantics).
+
+Example:
+
+```hls
+import "std.result"
+import "std.option"
+
+fn parse_pos(s: str) -> Result[int, str] {
+    # int_parse returns Result[int, str]; ? propagates Err early.
+    let n: int = int_parse(s)?
+    if n < 0 {
+        return Result.Err("negative")
+    }
+    return Result.Ok(n)
+}
+
+fn first(xs: list[int]) -> Option[int] {
+    if xs.len() == 0 {
+        return Option.None
+    }
+    return Option.Some(xs.get(0))
+}
+
+fn use_first(xs: list[int]) -> Option[int] {
+    let v: int = first(xs)?       # returns Option.None if first() returned None
+    return Option.Some(v + 1)
+}
+```
+
+## 13. What v0.3 deliberately does NOT have
 
 | Feature | Stage |
 |---------|-------|
-| `enum`, `Option`, `Result`, generics, type inference | 7 |
-| Bitwise operators (`&` `\|` `^` `<<` `>>`) with checked semantics | 7 |
+| Bitwise operators (`&` `\|` `^` `<<` `>>`) with checked semantics | later |
 | Ownership & borrow checking | 8 |
 | Fine-grained effects (`Net`, `Fs`, `Clock`, `Rand`), capabilities, taint | 9–10 |
 | SSA IR + optimisation | 11 |
 | Direct LLVM backend | 12 |
-| Module/import system, package-form standard library | 6 |
-| `match`, closures, function pointers, async | 7, 16 |
-| Catching panics / `Result` | 7 |
+| Closures, function pointers, async | 16 |
+| Catching panics | not planned (panic = bug, by design) |
 
 ---
 
-## 13. Complete example program
+## 14. Complete example program
 
 ```hls
 # primes.hls — Sieve of Eratosthenes, demonstrating types, loops, lists
@@ -400,7 +530,46 @@ fn main() -> int uses IO {
 }
 ```
 
-## 14. Stage-0 vs native semantic compatibility
+## 14b. Stage-7 example — enum + match + `?`
+
+```hls
+import "std.result"
+import "std.option"
+
+enum Tree {
+    Leaf,
+    Node(int, Tree, Tree)
+}
+
+fn sum(t: Tree) -> int {
+    return match t {
+        Tree.Leaf => 0,
+        Tree.Node(v, l, r) => v + sum(l) + sum(r)
+    }
+}
+
+fn parse_pair(s: str) -> Result[int, str] {
+    let parts: list[str] = s.split(",")
+    if parts.len() != 2 {
+        return Result.Err("expected two parts")
+    }
+    let a: int = int_parse(parts.get(0))?
+    let b: int = int_parse(parts.get(1))?
+    return Result.Ok(a + b)
+}
+
+fn main() -> int uses IO {
+    let t: Tree = Tree.Node(1, Tree.Node(2, Tree.Leaf, Tree.Leaf), Tree.Leaf)
+    println("sum = " + sum(t).to_str())        # sum = 3
+    let r: Result[int, str] = parse_pair("3,4")
+    return match r {
+        Result.Ok(v) => v,
+        Result.Err(_) => 1
+    }
+}
+```
+
+## 15. Stage-0 vs native semantic compatibility
 
 The two implementations (the reference interpreter `boot/` and the
 self-hosted compiler `src/hlc.hls`) must produce **identical output** on the

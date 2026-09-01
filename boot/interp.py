@@ -1,10 +1,11 @@
-"""Stage-0 evaluator for HLS.
+"""Stage-0 evaluator for HLS (v0.3) — adds enum, match, `?` operator.
 
 Runtime values:
   int   -> int (Python, kept within int64 range by checked arithmetic)
   float -> float, bool -> bool, str -> bytes
   list[T]      -> list
   map[str,T]   -> dict (insertion-ordered), struct -> dict {field: value}
+  enum         -> dict {"enum": <name>, "var": <variant>, "data": [payloads]}
 """
 import math
 import sys
@@ -137,6 +138,8 @@ class Interp:
     def __init__(self, program, argv, out):
         self.p = program
         self.fns = program["fns"]
+        self.structs = program["structs"]
+        self.enums = program.get("enums", {})
         self.argv = argv  # list[bytes]
         self.out = out
         self.line = 0
@@ -298,10 +301,91 @@ class Interp:
         if k == "listlit":
             return [self.eval_expr(it, env) for it in e["items"]]
         if k == "structlit":
-            return {fname: self.eval_expr(fe, env) for fname, fe in e["fields"]}
+            return self.eval_structlit(e, env)
+        if k == "enumlit":
+            return self.eval_enumlit(e, env)
+        if k == "match":
+            return self.eval_match(e, env)
+        if k == "qmark":
+            return self.eval_qmark(e, env)
         if k == "mapnew":
             return {}
         raise HLPanic("unknown expression: %s" % k, self.line)
+
+    def eval_structlit(self, e, env):
+        name = e["name"]
+        # In case of a generic struct, the parser keeps the base name; we use
+        # the type from `e["t"]` which has the instantiation. But the field
+        # values are determined by `e["fields"]` (in declaration order, may
+        # omit defaulted trailing fields). We fill defaults from the struct
+        # definition.
+        st = self.structs[name]
+        decl_fields = st["fields"]  # [(name, type, default_expr_or_None)]
+        result = {}
+        # Map provided field names → values.
+        provided = {}
+        for fname, fe in e["fields"]:
+            provided[fname] = self.eval_expr(fe, env)
+        # Iterate declared fields in order; use provided value or default.
+        for fname, ftype, fdefault in decl_fields:
+            if fname in provided:
+                result[fname] = provided[fname]
+            elif fdefault is not None:
+                # Evaluate default expression in the calling environment.
+                result[fname] = self.eval_expr(fdefault, env)
+            else:
+                # Should have been caught by the checker.
+                raise HLPanic("struct literal missing required field: %s" % fname,
+                              self.line)
+        return result
+
+    def eval_enumlit(self, e, env):
+        # e["enum_name"], e["variant"], e["args"]
+        args = [self.eval_expr(a, env) for a in e.get("args", [])]
+        return {"enum": e["enum_name"], "var": e["variant"], "data": args}
+
+    def eval_match(self, e, env):
+        scrut = self.eval_expr(e["scrut"], env)
+        if not isinstance(scrut, dict) or "enum" not in scrut:
+            raise HLPanic("match on non-enum value", self.line)
+        s_enum = scrut["enum"]
+        s_var = scrut["var"]
+        s_data = scrut["data"]
+        for arm in e["arms"]:
+            pat = arm["pattern"]
+            if pat["k"] == "wildcard":
+                return self.eval_expr(arm["body"], env)
+            if pat["enum"] != s_enum:
+                continue
+            if pat["variant"] != s_var:
+                continue
+            # Bind payload values.
+            env.append({})
+            try:
+                for i, bname in enumerate(pat["bindings"]):
+                    if bname == "_":
+                        continue
+                    env[-1][bname] = [s_data[i] if i < len(s_data) else None, False]
+                return self.eval_expr(arm["body"], env)
+            finally:
+                env.pop()
+        # No arm matched (shouldn't happen if exhaustive).
+        raise HLPanic("match: no arm matched (non-exhaustive?)", self.line)
+
+    def eval_qmark(self, e, env):
+        v = self.eval_expr(e["e"], env)
+        if not isinstance(v, dict) or "enum" not in v:
+            raise HLPanic("? on non-enum value", self.line)
+        if v["var"] == e["ok_variant"]:
+            # Success — yield the single payload value.
+            if len(v["data"]) != 1:
+                raise HLPanic("? operator: success variant must have exactly one payload",
+                              self.line)
+            return v["data"][0]
+        if v["var"] == e["err_variant"]:
+            # Propagate the error: re-wrap and return from the enclosing fn.
+            raise ReturnSig(v)
+        raise HLPanic("? operator: enum value matched neither ok nor err variant", self.line)
 
     def eval_bin(self, e, env):
         op = e["op"]

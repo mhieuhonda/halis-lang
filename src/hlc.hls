@@ -5,9 +5,16 @@
 # This is the self-hosting step of the language: the language's compiler
 # is written in that language.
 #
+# v0.3 (Stage 7) supports:
+#   - enum declarations (generic + non-generic)
+#   - match expressions (with exhaustiveness checking)
+#   - the `?` error-propagation operator
+#   - generic functions / structs / enums (monomorphisation)
+#   - struct default field values
+#
 # Bootstrap chain:
-#   python3 boot/boot.py src/hlc.hls <vao.hls> <ra.c>
-#   gcc -O2 -o <program> <output.c>
+#   python3 boot/boot.py src/hlc.hls <input.hls> <output.c>
+#   gcc -O2 -o <program> <output.c> -lm
 #
 # Structure: LEXER -> PARSER -> CHECKER (types + effects) -> CODEGEN (C)
 # All state is passed explicitly through Ctx — no global variables.
@@ -33,6 +40,16 @@ struct StructInfo {
     name: str,
     fields: list[str],
     ftypes: list[str],
+    fdefaults: list[int],   # indices of default-value exprs, -1 if none
+    typeparams: list[str],
+    line: int
+}
+
+struct EnumInfo {
+    name: str,
+    variants: list[str],            # variant names
+    payloads: list[list[str]],      # payload types per variant (parallel to variants)
+    typeparams: list[str],
     line: int
 }
 
@@ -46,6 +63,18 @@ struct FnInfo {
     body: list[int],
     is_method: bool,
     struct_of: str,
+    typeparams: list[str],
+    line: int
+}
+
+struct MatchArm {
+    pat_kind: str,           # "wildcard" or "variant"
+    enum_name: str,
+    variant: str,
+    bindings: list[str],
+    has_paren: bool,
+    body: int,               # body expression index
+    body_t: str,             # body type, set during check
     line: int
 }
 
@@ -57,14 +86,19 @@ struct ExprN {
     ival: int,
     fval: float,
     bval: bool,
-    left: int,
+    left: int,               # also used as scrutinee index for match
     right: int,
-    args: list[int],
+    args: list[int],         # also used as arm indices for match
     ffields: list[str],
     t: str,
     muser: bool,
-    mkey: str,
+    mkey: str,               # for user fn call: the (possibly mangled) C name
     mop: str,
+    enum_name: str,          # for enumlit (after check)
+    variant: str,           # for enumlit / match arm variant
+    err_variant: str,       # for qmark
+    ok_variant: str,        # for qmark
+    inst_targs: list[str],  # for generic call: inferred type args (concrete)
     line: int
 }
 
@@ -89,7 +123,9 @@ struct Ctx {
     pos: int,
     exprs: list[ExprN],
     stmts: list[StmtN],
+    match_arms: list[MatchArm],
     structs: map[str, StructInfo],
+    enums: map[str, EnumInfo],
     fns: map[str, FnInfo],
     fn_order: list[str],
     methods_of: map[str, list[str]],
@@ -103,20 +139,28 @@ struct Ctx {
     imports: list[str],
     loaded_files: list[str],
     entry_dir: str,
-    repo_root: str
+    repo_root: str,
+    cur_fn_ret: str,
+    cur_typeparams: list[str],
+    cur_targs: list[str],
+    fn_insts: list[str],
+    struct_insts: list[str],
+    enum_insts: list[str]
 }
 
 fn new_ctx(src: str) -> Ctx {
     return Ctx {
         src: src, toks: [], pos: 0,
-        exprs: [], stmts: [],
-        structs: map_new(), fns: map_new(), fn_order: [],
+        exprs: [], stmts: [], match_arms: [],
+        structs: map_new(), enums: map_new(), fns: map_new(), fn_order: [],
         methods_of: map_new(),
         out: [], lit_helpers: [], lit_count: 0,
         gen_locals: map_new(), gen_counts: map_new(), tmp: 0,
         edges: map_new(),
         imports: [], loaded_files: [],
-        entry_dir: "", repo_root: ""
+        entry_dir: "", repo_root: "",
+        cur_fn_ret: "void", cur_typeparams: [], cur_targs: [],
+        fn_insts: [], struct_insts: [], enum_insts: []
     }
 }
 
@@ -140,6 +184,7 @@ fn is_keyword(w: str) -> bool {
         || w == "else" || w == "while" || w == "for" || w == "in"
         || w == "break" || w == "continue" || w == "struct" || w == "impl"
         || w == "import" || w == "uses" || w == "true" || w == "false"
+        || w == "enum" || w == "match"
 }
 
 fn is_ident_start(c: int) -> bool {
@@ -154,6 +199,18 @@ fn is_digit(c: int) -> bool {
     return c >= 48 && c <= 57
 }
 
+# list_slice_from(list, start) returns a new list with elements from index
+# `start` to the end.
+fn list_slice_from(xs: list[str], start: int) -> list[str] {
+    let out: list[str] = []
+    let mut i: int = start
+    while i < xs.len() {
+        out.push(xs.get(i))
+        i = i + 1
+    }
+    return out
+}
+
 # Strip underscores from numbers: "1_000" -> "1000"
 fn filter_us(s: str) -> str {
     let parts: list[str] = []
@@ -165,6 +222,172 @@ fn filter_us(s: str) -> str {
         i = i + 1
     }
     return join(parts, "")
+}
+
+# --- Type string helpers (mirrors the checker's helpers) ---
+
+fn is_list_t(t: str) -> bool {
+    return t.starts_with("list[")
+}
+
+fn list_elem_t(t: str) -> str {
+    return t.slice(5, t.len() - 1)
+}
+
+fn is_map_t(t: str) -> bool {
+    return t.starts_with("map[str, ")
+}
+
+fn map_val_t(t: str) -> str {
+    return t.slice(9, t.len() - 1)
+}
+
+# type_base(t) returns the head identifier (before any `[`).
+fn type_base(t: str) -> str {
+    let mut i: int = 0
+    while i < t.len() {
+        if t.byte_at(i) == 91 {
+            return t.slice(0, i)
+        }
+        i = i + 1
+    }
+    return t
+}
+
+# trim_spaces(s) returns s with leading/trailing ASCII spaces removed.
+fn trim_spaces(s: str) -> str {
+    let mut start: int = 0
+    let mut end: int = s.len()
+    while start < end && s.byte_at(start) == 32 {
+        start = start + 1
+    }
+    while end > start && s.byte_at(end - 1) == 32 {
+        end = end - 1
+    }
+    return s.slice(start, end)
+}
+
+# type_args(t) returns a list of type-arg strings, splitting on commas at depth 0.
+fn type_args(t: str) -> list[str] {
+    let out: list[str] = []
+    let mut i: int = 0
+    let mut base_start: int = -1
+    # Find the first '[' that opens the outermost arg list.
+    while i < t.len() {
+        if t.byte_at(i) == 91 {
+            base_start = i + 1
+            break
+        }
+        i = i + 1
+    }
+    if base_start < 0 {
+        return out
+    }
+    # Now parse args from base_start until the matching ']' (last char).
+    let mut depth: int = 0
+    let mut start: int = base_start
+    let mut j: int = base_start
+    while j < t.len() - 1 {
+        let c: int = t.byte_at(j)
+        if c == 91 {
+            depth = depth + 1
+        } else if c == 93 {
+            depth = depth - 1
+        } else if c == 44 && depth == 0 {
+            out.push(trim_spaces(t.slice(start, j)))
+            start = j + 1
+        }
+        j = j + 1
+    }
+    # Last arg (we stop at len - 1 to skip the closing ']').
+    if start < t.len() - 1 {
+        out.push(trim_spaces(t.slice(start, t.len() - 1)))
+    }
+    return out
+}
+
+# split_args_str(s) splits a comma-separated list of types, respecting nested [ ].
+fn split_args_str(s: str) -> list[str] {
+    let out: list[str] = []
+    if s == "" {
+        return out
+    }
+    let mut depth: int = 0
+    let mut start: int = 0
+    let mut i: int = 0
+    while i < s.len() {
+        let c: int = s.byte_at(i)
+        if c == 91 {
+            depth = depth + 1
+        } else if c == 93 {
+            depth = depth - 1
+        } else if c == 44 && depth == 0 {
+            out.push(trim_spaces(s.slice(start, i)))
+            start = i + 1
+        }
+        i = i + 1
+    }
+    out.push(trim_spaces(s.slice(start, s.len())))
+    return out
+}
+
+# strip a single leading/trailing space from a type string (used by type_args
+# because we put a space after the comma in "map[str, T]" etc.)
+# (Currently unused; kept here in case future code needs it.)
+fn trim_one_space(s: str) -> str {
+    let mut out: str = s
+    if out.len() == 0 {
+        return out
+    }
+    if out.byte_at(0) == 32 {
+        out = out.slice(1, out.len())
+    }
+    if out.len() > 0 && out.byte_at(out.len() - 1) == 32 {
+        out = out.slice(0, out.len() - 1)
+    }
+    return out
+}
+
+# instantiate_type(t, typeparams, typeargs) substitutes each type param in `t`
+# with the corresponding concrete type from `typeargs`.
+fn instantiate_type(t: str, tps: list[str], targs: list[str]) -> str {
+    # First: if t is exactly a type param, substitute.
+    let mut i: int = 0
+    while i < tps.len() {
+        if t == tps.get(i) {
+            return targs.get(i)
+        }
+        i = i + 1
+    }
+    if t == "int" || t == "float" || t == "bool" || t == "str" || t == "void" {
+        return t
+    }
+    if is_list_t(t) {
+        let inner: str = list_elem_t(t)
+        let new_inner: str = instantiate_type(inner, tps, targs)
+        return "list[" + new_inner + "]"
+    }
+    if is_map_t(t) {
+        let val: str = map_val_t(t)
+        let new_val: str = instantiate_type(val, tps, targs)
+        return "map[str, " + new_val + "]"
+    }
+    # User-defined type with possible type args
+    let base: str = type_base(t)
+    if base == t {
+        # No type args — could be a non-generic user type or an unsubstituted
+        # type param used as a base (rare; we already handled the exact-match
+        # case above). Return as-is.
+        return t
+    }
+    let args: list[str] = type_args(t)
+    let new_args: list[str] = []
+    let mut j: int = 0
+    while j < args.len() {
+        new_args.push(instantiate_type(args.get(j), tps, targs))
+        j = j + 1
+    }
+    return base + "[" + join(new_args, ", ") + "]"
 }
 
 # ----------------------------------------------------------------------------
@@ -282,16 +505,16 @@ fn lex(ctx: Ctx) -> void {
             }
             ctx.toks.push(mk_tok("str", join(parts, ""), ln, cl))
         } else {
-            # operator / symbol
+            # operator / symbol — try two-char first
             let mut two: str = ""
             if i + 2 <= n {
                 two = src.slice(i, i + 2)
             }
-            if two == "->" || two == "==" || two == "!=" || two == "<=" || two == ">=" || two == "&&" || two == "||" {
+            if two == "->" || two == "==" || two == "!=" || two == "<=" || two == ">=" || two == "&&" || two == "||" || two == "=>" {
                 ctx.toks.push(mk_tok("sym", two, line, col))
                 i = i + 2
                 col = col + 2
-            } else if c == 40 || c == 41 || c == 123 || c == 125 || c == 91 || c == 93 || c == 44 || c == 58 || c == 46 || c == 60 || c == 62 || c == 43 || c == 45 || c == 42 || c == 47 || c == 37 || c == 33 || c == 61 {
+            } else if c == 40 || c == 41 || c == 123 || c == 125 || c == 91 || c == 93 || c == 44 || c == 58 || c == 46 || c == 60 || c == 62 || c == 43 || c == 45 || c == 42 || c == 47 || c == 37 || c == 33 || c == 61 || c == 63 {
                 ctx.toks.push(mk_tok("sym", chr(c), line, col))
                 i = i + 1
                 col = col + 1
@@ -311,7 +534,8 @@ fn nx_expr(ctx: Ctx, kind: str, line: int) -> int {
     let mut e: ExprN = ExprN {
         kind: kind, op: "", name: "", sval: "", ival: 0, fval: 0.0,
         bval: false, left: -1, right: -1, args: [], ffields: [], t: "",
-        muser: false, mkey: "", mop: "", line: line
+        muser: false, mkey: "", mop: "", enum_name: "", variant: "",
+        err_variant: "", ok_variant: "", inst_targs: [], line: line
     }
     ctx.exprs.push(e)
     return ctx.exprs.len() - 1
@@ -325,6 +549,17 @@ fn nx_stmt(ctx: Ctx, kind: str, line: int) -> int {
     }
     ctx.stmts.push(s)
     return ctx.stmts.len() - 1
+}
+
+fn nx_match_arm(ctx: Ctx, pat_kind: str, enum_name: str, variant: str,
+                bindings: list[str], has_paren: bool, body: int, line: int) -> int {
+    let arm: MatchArm = MatchArm {
+        pat_kind: pat_kind, enum_name: enum_name, variant: variant,
+        bindings: bindings, has_paren: has_paren, body: body, body_t: "",
+        line: line
+    }
+    ctx.match_arms.push(arm)
+    return ctx.match_arms.len() - 1
 }
 
 fn perr(ctx: Ctx, msg: str) -> void {
@@ -404,7 +639,7 @@ fn parse_type(ctx: Ctx, allow_void: bool) -> str {
         eat_sym(ctx, "[")
         let kt: str = eat_ident(ctx)
         if kt != "str" {
-            perr_at(ctx, "map key in v0.2 must be 'str'", t)
+            perr_at(ctx, "map key in v0.3 must be 'str'", t)
         }
         eat_sym(ctx, ",")
         let vt: str = parse_type(ctx, false)
@@ -416,11 +651,51 @@ fn parse_type(ctx: Ctx, allow_void: bool) -> str {
     }
     if base == "void" {
         if !allow_void {
-            perr_at(ctx, "void expects only be used as a return type", t)
+            perr_at(ctx, "void can only be used as a return type", t)
         }
         return "void"
     }
+    # User-defined type — could be generic instantiation: Name[T1, T2, ...]
+    if at_sym(ctx, "[") {
+        eat_sym(ctx, "[")
+        let args: list[str] = []
+        while !at_sym(ctx, "]") {
+            args.push(parse_type(ctx, false))
+            if at_sym(ctx, ",") {
+                ctx.pos = ctx.pos + 1
+            } else if !at_sym(ctx, "]") {
+                perr(ctx, "expected ',' or ']' in type arguments")
+            }
+        }
+        eat_sym(ctx, "]")
+        return base + "[" + join(args, ", ") + "]"
+    }
     return base
+}
+
+# Parse `[T, U, ...]` after a function/struct/enum name — returns the list of
+# type parameter names. If the next token is not `[`, returns an empty list.
+fn parse_typeparams(ctx: Ctx) -> list[str] {
+    let out: list[str] = []
+    if !at_sym(ctx, "[") {
+        return out
+    }
+    eat_sym(ctx, "[")
+    while !at_sym(ctx, "]") {
+        let t: Tok = ctx.toks.get(ctx.pos)
+        if t.kind != "ident" {
+            perr(ctx, "expected type parameter name but got " + tok_desc(ctx))
+        }
+        ctx.pos = ctx.pos + 1
+        out.push(t.value)
+        if at_sym(ctx, ",") {
+            ctx.pos = ctx.pos + 1
+        } else if !at_sym(ctx, "]") {
+            perr(ctx, "expected ',' or ']' in type parameters")
+        }
+    }
+    eat_sym(ctx, "]")
+    return out
 }
 
 # --- Program parsing ---
@@ -430,10 +705,16 @@ fn parse_program(ctx: Ctx) -> void {
         let t: Tok = ctx.toks.get(ctx.pos)
         if t.kind == "kw" && t.value == "struct" {
             let st: StructInfo = parse_struct(ctx)
-            if ctx.structs.has(st.name) {
-                perr_at(ctx, "duplicate struct name: " + st.name, t)
+            if ctx.structs.has(st.name) || ctx.enums.has(st.name) {
+                perr_at(ctx, "duplicate type name: " + st.name, t)
             }
             ctx.structs.set(st.name, st)
+        } else if t.kind == "kw" && t.value == "enum" {
+            let en: EnumInfo = parse_enum(ctx)
+            if ctx.enums.has(en.name) || ctx.structs.has(en.name) {
+                perr_at(ctx, "duplicate type name: " + en.name, t)
+            }
+            ctx.enums.set(en.name, en)
         } else if t.kind == "kw" && t.value == "impl" {
             parse_impl(ctx)
         } else if t.kind == "kw" && t.value == "fn" {
@@ -445,7 +726,6 @@ fn parse_program(ctx: Ctx) -> void {
             ctx.fn_order.push(f.name)
         } else if t.kind == "kw" && t.value == "import" {
             eat_kw(ctx, "import")
-            # import expects a string literal
             let pt: Tok = ctx.toks.get(ctx.pos)
             if pt.kind != "str" {
                 perr_at(ctx, "import expects a string path", pt)
@@ -453,7 +733,7 @@ fn parse_program(ctx: Ctx) -> void {
             ctx.pos = ctx.pos + 1
             ctx.imports.push(pt.value)
         } else {
-            perr_at(ctx, "only struct/impl/fn/import declarations allowed at top level", t)
+            perr_at(ctx, "only struct/enum/impl/fn/import declarations allowed at top level", t)
         }
     }
 }
@@ -462,15 +742,27 @@ fn parse_struct(ctx: Ctx) -> StructInfo {
     let t0: Tok = ctx.toks.get(ctx.pos)
     eat_kw(ctx, "struct")
     let name: str = eat_ident(ctx)
+    let typeparams: list[str] = parse_typeparams(ctx)
     eat_sym(ctx, "{")
     let fields: list[str] = []
     let ftypes: list[str] = []
+    let fdefaults: list[int] = []
+    let mut seen_default: bool = false
     while !at_sym(ctx, "}") {
         let ft: str = eat_ident(ctx)
         eat_sym(ctx, ":")
         let ty: str = parse_type(ctx, false)
+        let mut dflt_idx: int = -1
+        if at_sym(ctx, "=") {
+            ctx.pos = ctx.pos + 1
+            dflt_idx = parse_expr(ctx, true)
+            seen_default = true
+        } else if seen_default {
+            perr_at(ctx, "struct field without default cannot follow a defaulted field: " + ft, t0)
+        }
         fields.push(ft)
         ftypes.push(ty)
+        fdefaults.push(dflt_idx)
         if at_sym(ctx, ",") {
             ctx.pos = ctx.pos + 1
         } else if !at_sym(ctx, "}") {
@@ -481,10 +773,65 @@ fn parse_struct(ctx: Ctx) -> StructInfo {
     if fields.len() == 0 {
         perr_at(ctx, "struct must have at least one field", t0)
     }
-    return StructInfo { name: name, fields: fields, ftypes: ftypes, line: t0.line }
+    return StructInfo {
+        name: name, fields: fields, ftypes: ftypes, fdefaults: fdefaults,
+        typeparams: typeparams, line: t0.line
+    }
+}
+
+fn parse_enum(ctx: Ctx) -> EnumInfo {
+    let t0: Tok = ctx.toks.get(ctx.pos)
+    eat_kw(ctx, "enum")
+    let name: str = eat_ident(ctx)
+    let typeparams: list[str] = parse_typeparams(ctx)
+    eat_sym(ctx, "{")
+    let variants: list[str] = []
+    let payloads: list[list[str]] = []
+    let mut seen: map[str, bool] = map_new()
+    while !at_sym(ctx, "}") {
+        let vt: Tok = ctx.toks.get(ctx.pos)
+        if vt.kind != "ident" {
+            perr_at(ctx, "expected variant name but got " + tok_desc(ctx), vt)
+        }
+        ctx.pos = ctx.pos + 1
+        let vname: str = vt.value
+        if seen.has(vname) {
+            perr_at(ctx, "duplicate variant name in enum: " + vname, vt)
+        }
+        seen.set(vname, true)
+        let mut pl: list[str] = []
+        if at_sym(ctx, "(") {
+            eat_sym(ctx, "(")
+            while !at_sym(ctx, ")") {
+                pl.push(parse_type(ctx, false))
+                if at_sym(ctx, ",") {
+                    ctx.pos = ctx.pos + 1
+                } else if !at_sym(ctx, ")") {
+                    perr(ctx, "expected ',' or ')' in variant payloads")
+                }
+            }
+            eat_sym(ctx, ")")
+        }
+        variants.push(vname)
+        payloads.push(pl)
+        if at_sym(ctx, ",") {
+            ctx.pos = ctx.pos + 1
+        } else if !at_sym(ctx, "}") {
+            perr(ctx, "expected ',' or '}' in enum definition")
+        }
+    }
+    eat_sym(ctx, "}")
+    if variants.len() == 0 {
+        perr_at(ctx, "enum must have at least one variant", t0)
+    }
+    return EnumInfo {
+        name: name, variants: variants, payloads: payloads,
+        typeparams: typeparams, line: t0.line
+    }
 }
 
 fn parse_impl(ctx: Ctx) -> void {
+    let t0: Tok = ctx.toks.get(ctx.pos)
     eat_kw(ctx, "impl")
     let sname: str = eat_ident(ctx)
     eat_sym(ctx, "{")
@@ -512,6 +859,7 @@ fn parse_fn(ctx: Ctx, impl_struct: str) -> FnInfo {
     let t0: Tok = ctx.toks.get(ctx.pos)
     eat_kw(ctx, "fn")
     let name: str = eat_ident(ctx)
+    let typeparams: list[str] = parse_typeparams(ctx)
     eat_sym(ctx, "(")
     let params: list[str] = []
     let ptypes: list[str] = []
@@ -545,7 +893,7 @@ fn parse_fn(ctx: Ctx, impl_struct: str) -> FnInfo {
         ctx.pos = ctx.pos + 1
         let io: str = eat_ident(ctx)
         if io != "IO" {
-            perr(ctx, "the only effect in v0.2 is 'uses IO'")
+            perr(ctx, "the only effect in v0.3 is 'uses IO'")
         }
         uses_io = true
     }
@@ -553,7 +901,8 @@ fn parse_fn(ctx: Ctx, impl_struct: str) -> FnInfo {
     return FnInfo {
         name: name, params: params, ptypes: ptypes, pmuts: pmuts,
         ret: ret, uses_io: uses_io, body: body,
-        is_method: impl_struct != "", struct_of: impl_struct, line: t0.line
+        is_method: impl_struct != "", struct_of: impl_struct,
+        typeparams: typeparams, line: t0.line
     }
 }
 
@@ -620,7 +969,14 @@ fn parse_stmt(ctx: Ctx) -> int {
             ctx.pos = ctx.pos + 1
             return nx_stmt(ctx, "continue", t.line)
         }
-        if t.value == "struct" || t.value == "impl" || t.value == "fn" {
+        if t.value == "match" {
+            # match as an expression statement
+            let e: int = parse_match(ctx)
+            let idx: int = nx_stmt(ctx, "expr", t.line)
+            ctx.stmts[idx].e = e
+            return idx
+        }
+        if t.value == "struct" || t.value == "impl" || t.value == "enum" || t.value == "fn" {
             perr_at(ctx, "declaration of " + t.value + " only allowed at top level", t)
         }
         perr_at(ctx, "keyword cannot start a statement: " + t.value, t)
@@ -630,10 +986,11 @@ fn parse_stmt(ctx: Ctx) -> int {
     if at_sym(ctx, "=") {
         let eq: Tok = ctx.toks.get(ctx.pos)
         ctx.pos = ctx.pos + 1
-        if ctx.exprs[e].kind != "ident" && ctx.exprs[e].kind != "field" && ctx.exprs[e].kind != "index" {
+        let ek: str = ctx.exprs[e].kind
+        if ek != "ident" && ek != "field" && ek != "index" {
             perr_at(ctx, "left side of assignment must be variable/field/index", eq)
         }
-        if ctx.exprs[e].kind == "field" || ctx.exprs[e].kind == "index" {
+        if ek == "field" || ek == "index" {
             require_ident_root(ctx, e)
         }
         let val: int = parse_expr(ctx, true)
@@ -642,7 +999,8 @@ fn parse_stmt(ctx: Ctx) -> int {
         ctx.stmts[idx].value = val
         return idx
     }
-    if ctx.exprs[e].kind != "call" && ctx.exprs[e].kind != "method" {
+    let ek2: str = ctx.exprs[e].kind
+    if ek2 != "call" && ek2 != "method" && ek2 != "fieldcall" && ek2 != "match" {
         perr(ctx, "expression as statement must be a function/method call")
     }
     let idx: int = nx_stmt(ctx, "expr", ctx.exprs[e].line)
@@ -756,7 +1114,6 @@ fn parse_unary(ctx: Ctx, allow_struct: bool) -> int {
         ctx.pos = ctx.pos + 1
         let mut e: int = parse_unary(ctx, allow_struct)
         if t.value == "-" && ctx.exprs[e].kind == "int" && ctx.exprs[e].op == "big" {
-            # fold -9223372036854775808 into INT64_MIN
             ctx.exprs[e].op = ""
             return e
         }
@@ -769,7 +1126,7 @@ fn parse_unary(ctx: Ctx, allow_struct: bool) -> int {
 }
 
 fn can_index(k: str) -> bool {
-    return k == "ident" || k == "field" || k == "index" || k == "call" || k == "method"
+    return k == "ident" || k == "field" || k == "index" || k == "call" || k == "method" || k == "fieldcall"
 }
 
 fn parse_postfix(ctx: Ctx, allow_struct: bool) -> int {
@@ -784,7 +1141,7 @@ fn parse_postfix(ctx: Ctx, allow_struct: bool) -> int {
             let name: str = eat_ident(ctx)
             if at_sym(ctx, "(") {
                 let args: list[int] = parse_args(ctx)
-                let idx: int = nx_expr(ctx, "method", t.line)
+                let idx: int = nx_expr(ctx, "fieldcall", t.line)
                 ctx.exprs[idx].name = name
                 ctx.exprs[idx].left = e
                 ctx.exprs[idx].args = args
@@ -809,6 +1166,11 @@ fn parse_postfix(ctx: Ctx, allow_struct: bool) -> int {
             ctx.exprs[idx].name = ctx.exprs[e].name
             ctx.exprs[idx].args = args
             e = idx
+        } else if t.value == "?" {
+            ctx.pos = ctx.pos + 1
+            let idx: int = nx_expr(ctx, "qmark", t.line)
+            ctx.exprs[idx].left = e
+            e = idx
         } else {
             break
         }
@@ -831,6 +1193,64 @@ fn parse_args(ctx: Ctx) -> list[int] {
     return out
 }
 
+fn parse_match(ctx: Ctx) -> int {
+    let t: Tok = ctx.toks.get(ctx.pos)
+    eat_kw(ctx, "match")
+    let scrut: int = parse_expr(ctx, false)
+    eat_sym(ctx, "{")
+    let arm_idxs: list[int] = []
+    while !at_sym(ctx, "}") {
+        let arm_line_tok: Tok = ctx.toks.get(ctx.pos)
+        let mut pat_kind: str = ""
+        let mut enum_name: str = ""
+        let mut variant: str = ""
+        let mut bindings: list[str] = []
+        let mut has_paren: bool = false
+        if at_sym(ctx, "_") {
+            ctx.pos = ctx.pos + 1
+            pat_kind = "wildcard"
+        } else {
+            pat_kind = "variant"
+            enum_name = eat_ident(ctx)
+            eat_sym(ctx, ".")
+            variant = eat_ident(ctx)
+            if at_sym(ctx, "(") {
+                has_paren = true
+                eat_sym(ctx, "(")
+                while !at_sym(ctx, ")") {
+                    if at_sym(ctx, "_") {
+                        ctx.pos = ctx.pos + 1
+                        bindings.push("_")
+                    } else {
+                        bindings.push(eat_ident(ctx))
+                    }
+                    if at_sym(ctx, ",") {
+                        ctx.pos = ctx.pos + 1
+                    } else if !at_sym(ctx, ")") {
+                        perr(ctx, "expected ',' or ')' in variant pattern")
+                    }
+                }
+                eat_sym(ctx, ")")
+            }
+        }
+        eat_sym(ctx, "=>")
+        let body: int = parse_expr(ctx, true)
+        let arm_idx: int = nx_match_arm(ctx, pat_kind, enum_name, variant, bindings,
+                                       has_paren, body, arm_line_tok.line)
+        arm_idxs.push(arm_idx)
+        if at_sym(ctx, ",") {
+            ctx.pos = ctx.pos + 1
+        } else if !at_sym(ctx, "}") {
+            perr(ctx, "expected ',' or '}' in match arms")
+        }
+    }
+    eat_sym(ctx, "}")
+    let idx: int = nx_expr(ctx, "match", t.line)
+    ctx.exprs[idx].left = scrut
+    ctx.exprs[idx].args = arm_idxs
+    return idx
+}
+
 fn parse_primary(ctx: Ctx, allow_struct: bool) -> int {
     let t: Tok = ctx.toks.get(ctx.pos)
     if t.kind == "int" {
@@ -841,7 +1261,6 @@ fn parse_primary(ctx: Ctx, allow_struct: bool) -> int {
         } else if t.value.len() == 19 && t.value > "9223372036854775808" {
             perr_at(ctx, "integer literal too large (exceeds int64)", t)
         } else if t.value.len() == 19 && t.value == "9223372036854775808" {
-            # 2^63: only valid when folded with minus sign into INT64_MIN
             ctx.exprs[idx].ival = -9223372036854775808
             ctx.exprs[idx].op = "big"
         } else {
@@ -866,6 +1285,9 @@ fn parse_primary(ctx: Ctx, allow_struct: bool) -> int {
         let idx: int = nx_expr(ctx, "bool", t.line)
         ctx.exprs[idx].bval = t.value == "true"
         return idx
+    }
+    if t.kind == "kw" && t.value == "match" {
+        return parse_match(ctx)
     }
     if t.kind == "ident" {
         if allow_struct && peek2_is(ctx, "{") {
@@ -936,22 +1358,6 @@ fn cerr(line: int, msg: str) -> void {
     panic("type error: " + msg + " (dong " + line.to_str() + ")")
 }
 
-fn is_list_t(t: str) -> bool {
-    return t.starts_with("list[")
-}
-
-fn list_elem_t(t: str) -> str {
-    return t.slice(5, t.len() - 1)
-}
-
-fn is_map_t(t: str) -> bool {
-    return t.starts_with("map[str, ")
-}
-
-fn map_val_t(t: str) -> str {
-    return t.slice(9, t.len() - 1)
-}
-
 fn is_builtin_fn(n: str) -> bool {
     return n == "print" || n == "println" || n == "panic" || n == "exit"
         || n == "str" || n == "int" || n == "len" || n == "range"
@@ -960,8 +1366,22 @@ fn is_builtin_fn(n: str) -> bool {
         || n == "file_exists"
 }
 
+fn list_has(list: list[str], x: str) -> bool {
+    let mut i: int = 0
+    while i < list.len() {
+        if list.get(i) == x {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
 fn type_exists(ctx: Ctx, t: str) -> bool {
     if t == "int" || t == "float" || t == "bool" || t == "str" {
+        return true
+    }
+    if list_has(ctx.cur_typeparams, t) {
         return true
     }
     if is_list_t(t) {
@@ -970,7 +1390,37 @@ fn type_exists(ctx: Ctx, t: str) -> bool {
     if is_map_t(t) {
         return type_exists(ctx, map_val_t(t))
     }
-    return ctx.structs.has(t)
+    let base: str = type_base(t)
+    let args: list[str] = type_args(t)
+    if ctx.structs.has(base) {
+        let st: StructInfo = ctx.structs.get_or(base, dummy_struct())
+        if st.typeparams.len() != args.len() {
+            return false
+        }
+        let mut i: int = 0
+        while i < args.len() {
+            if !type_exists(ctx, args.get(i)) {
+                return false
+            }
+            i = i + 1
+        }
+        return true
+    }
+    if ctx.enums.has(base) {
+        let en: EnumInfo = ctx.enums.get_or(base, dummy_enum())
+        if en.typeparams.len() != args.len() {
+            return false
+        }
+        let mut i: int = 0
+        while i < args.len() {
+            if !type_exists(ctx, args.get(i)) {
+                return false
+            }
+            i = i + 1
+        }
+        return true
+    }
+    return false
 }
 
 fn require_type(ctx: Ctx, t: str, line: int, what: str) -> void {
@@ -981,6 +1431,45 @@ fn require_type(ctx: Ctx, t: str, line: int, what: str) -> void {
         cerr(line, "type does not exist: " + t)
     }
 }
+
+# resolve_struct(ctx, t) returns the (StructInfo, type_map) if t is a
+# (possibly generic) struct type. Otherwise returns a struct whose name is "".
+fn resolve_struct(ctx: Ctx, t: str) -> StructInfo {
+    let base: str = type_base(t)
+    if !ctx.structs.has(base) {
+        return dummy_struct()
+    }
+    let st: StructInfo = ctx.structs.get_or(base, dummy_struct())
+    let args: list[str] = type_args(t)
+    if st.typeparams.len() != args.len() {
+        return dummy_struct()
+    }
+    # If non-generic, just return the struct (no type map).
+    if st.typeparams.len() == 0 {
+        return st
+    }
+    # For generic struct, return the struct; the caller will need to know
+    # the type args (it can extract them from `t`).
+    return st
+}
+
+# resolve_enum(ctx, t) — same for enums.
+fn resolve_enum(ctx: Ctx, t: str) -> EnumInfo {
+    let base: str = type_base(t)
+    if !ctx.enums.has(base) {
+        return dummy_enum()
+    }
+    let en: EnumInfo = ctx.enums.get_or(base, dummy_enum())
+    let args: list[str] = type_args(t)
+    if en.typeparams.len() != args.len() {
+        return dummy_enum()
+    }
+    return en
+}
+
+# build_type_map(ctx, typeparams, args) — returns a parallel list of typeargs
+# corresponding to typeparams (used by callers that need to instantiate).
+# (We use lists since HLS has no map of str->str.)
 
 fn dummy_binding() -> Binding {
     return Binding { t: "", is_mut: false }
@@ -1015,14 +1504,109 @@ fn add_edge(ctx: Ctx, cur: str, callee: str) -> void {
     ctx.edges.get_or(cur, []).push(callee)
 }
 
+# --- unify: try to match a parameter type `pt` against an argument type `at`,
+# binding type params from `tps` to concrete types in `targs_out` (parallel to
+# `tps`). Returns true if unification succeeded for any type params.
+# targs_out is a parallel list: targs_out[i] is the inferred type for tps[i]
+# (or "" if not yet inferred).
+# ---
+
+fn unify_into(ctx: Ctx, pt: str, at: str, tps: list[str], targs_out: list[str]) -> void {
+    # Exact-match case: pt is a type param.
+    let mut i: int = 0
+    while i < tps.len() {
+        if pt == tps.get(i) {
+            # If already bound, prefer the existing binding (the first one wins
+            # for simplicity; conflicts will be caught by the arg type check).
+            if targs_out.get(i) == "" {
+                targs_out.set(i, at)
+            }
+            return
+        }
+        i = i + 1
+    }
+    if is_list_t(pt) && is_list_t(at) {
+        unify_into(ctx, list_elem_t(pt), list_elem_t(at), tps, targs_out)
+        return
+    }
+    if is_map_t(pt) && is_map_t(at) {
+        unify_into(ctx, map_val_t(pt), map_val_t(at), tps, targs_out)
+        return
+    }
+    # Same base name — recurse into args.
+    let pb: str = type_base(pt)
+    let ab: str = type_base(at)
+    # Both must have type args (i.e., be generic instantiations), and the
+    # base names must match.
+    if pb == ab && pt != pb && at != ab {
+        # Both are generic instantiations of the same user type.
+        let pa: list[str] = type_args(pt)
+        let aa: list[str] = type_args(at)
+        if pa.len() == aa.len() {
+            let mut j: int = 0
+            while j < pa.len() {
+                unify_into(ctx, pa.get(j), aa.get(j), tps, targs_out)
+                j = j + 1
+            }
+        }
+    }
+}
+
 # --- Checker lifecycle ---
 
 fn check_program(ctx: Ctx) -> void {
-    # 1. check declarations
+    # 1. struct: field types
+    let keys_s: list[str] = ctx.structs.keys()
+    let mut si: int = 0
+    while si < keys_s.len() {
+        let st: StructInfo = ctx.structs.get_or(keys_s.get(si), dummy_struct())
+        ctx.cur_typeparams = st.typeparams
+        let mut fi: int = 0
+        while fi < st.ftypes.len() {
+            require_type(ctx, st.ftypes.get(fi), st.line, "struct field type")
+            fi = fi + 1
+        }
+        # Also check default-value expressions (must be of the declared type).
+        let mut di: int = 0
+        while di < st.fdefaults.len() {
+            if st.fdefaults.get(di) != -1 {
+                let env: list[map[str, Binding]] = []
+                env.push(map_new())
+                let vt: str = check_expr(ctx, env, "", st.fdefaults.get(di), st.ftypes.get(di))
+                if vt != "never" && vt != st.ftypes.get(di) {
+                    cerr(st.line, "default value of field " + st.fields.get(di) + " expects " + st.ftypes.get(di) + ", got " + vt)
+                }
+            }
+            di = di + 1
+        }
+        ctx.cur_typeparams = []
+        si = si + 1
+    }
+    # 2. enum: variant payload types
+    let keys_e: list[str] = ctx.enums.keys()
+    let mut ei: int = 0
+    while ei < keys_e.len() {
+        let en: EnumInfo = ctx.enums.get_or(keys_e.get(ei), dummy_enum())
+        ctx.cur_typeparams = en.typeparams
+        let mut vi: int = 0
+        while vi < en.variants.len() {
+            let pl: list[str] = en.payloads.get(vi)
+            let mut pi: int = 0
+            while pi < pl.len() {
+                require_type(ctx, pl.get(pi), en.line, "variant payload type")
+                pi = pi + 1
+            }
+            vi = vi + 1
+        }
+        ctx.cur_typeparams = []
+        ei = ei + 1
+    }
+    # 3. function declarations
     let mut i: int = 0
     while i < ctx.fn_order.len() {
         let mut key: str = ctx.fn_order.get(i)
         let f: FnInfo = ctx.fns.get_or(key, dummy_fn())
+        ctx.cur_typeparams = f.typeparams
         if !f.is_method {
             if is_builtin_fn(f.name) {
                 cerr(f.line, "cannot redefine builtin function: " + f.name)
@@ -1048,21 +1632,10 @@ fn check_program(ctx: Ctx) -> void {
                 cerr(f.line, "return type does not exist: " + f.ret)
             }
         }
+        ctx.cur_typeparams = []
         i = i + 1
     }
-    # 2. struct: field types
-    let keys_s: list[str] = ctx.structs.keys()
-    let mut si: int = 0
-    while si < keys_s.len() {
-        let st: StructInfo = ctx.structs.get_or(keys_s.get(si), ctx.structs.get_or(keys_s.get(0), dummy_struct()))
-        let mut fi: int = 0
-        while fi < st.ftypes.len() {
-            require_type(ctx, st.ftypes.get(fi), st.line, "struct field type")
-            fi = fi + 1
-        }
-        si = si + 1
-    }
-    # 3. main
+    # 4. main
     if !ctx.fns.has("main") {
         cerr(1, "missing main function")
     }
@@ -1076,29 +1649,183 @@ fn check_program(ctx: Ctx) -> void {
     if mf.ret != "int" && mf.ret != "void" {
         cerr(mf.line, "main must return 'int' or have no return type")
     }
-    # 4. check function bodies
+    # 5. check function bodies
     let mut bi: int = 0
     while bi < ctx.fn_order.len() {
         check_fn_body(ctx, ctx.fn_order.get(bi))
         bi = bi + 1
     }
-    # 5. effects analysis
+    # 6. effects analysis
     check_effects(ctx)
+    # 7. collect all generic struct/enum instantiations used anywhere in
+    # the program (signatures, let bindings, expression types) so the codegen
+    # emits the corresponding C types.
+    collect_all_insts(ctx)
+}
+
+# collect_insts walks a single type string and records any generic struct /
+# enum instantiations it finds. Skips types that contain type parameters
+# (they're abstract, not instantiated).
+fn collect_insts(ctx: Ctx, t: str) -> void {
+    if t == "" || t == "int" || t == "float" || t == "bool" || t == "str" || t == "void" || t == "never" {
+        return
+    }
+    if is_list_t(t) {
+        collect_insts(ctx, list_elem_t(t))
+        return
+    }
+    if is_map_t(t) {
+        collect_insts(ctx, map_val_t(t))
+        return
+    }
+    let base: str = type_base(t)
+    let args: list[str] = type_args(t)
+    # Skip if the base isn't a known struct/enum — it's a type param.
+    if !ctx.structs.has(base) && !ctx.enums.has(base) {
+        return
+    }
+    # Skip if any arg is not concrete (contains a type param).
+    let mut i: int = 0
+    while i < args.len() {
+        if !type_is_concrete(ctx, args.get(i)) {
+            return
+        }
+        i = i + 1
+    }
+    if ctx.structs.has(base) {
+        let st: StructInfo = ctx.structs.get_or(base, dummy_struct())
+        if st.typeparams.len() > 0 && args.len() == st.typeparams.len() {
+            if !list_has(ctx.struct_insts, t) {
+                ctx.struct_insts.push(t)
+            }
+        }
+    } else if ctx.enums.has(base) {
+        let en: EnumInfo = ctx.enums.get_or(base, dummy_enum())
+        if en.typeparams.len() > 0 && args.len() == en.typeparams.len() {
+            if !list_has(ctx.enum_insts, t) {
+                ctx.enum_insts.push(t)
+            }
+        }
+    }
+    # Recurse into args.
+    let mut j: int = 0
+    while j < args.len() {
+        collect_insts(ctx, args.get(j))
+        j = j + 1
+    }
+}
+
+# type_is_concrete returns true if `t` doesn't contain any type parameters.
+fn type_is_concrete(ctx: Ctx, t: str) -> bool {
+    if t == "" {
+        return false
+    }
+    if t == "int" || t == "float" || t == "bool" || t == "str" || t == "void" || t == "never" {
+        return true
+    }
+    if is_list_t(t) {
+        return type_is_concrete(ctx, list_elem_t(t))
+    }
+    if is_map_t(t) {
+        return type_is_concrete(ctx, map_val_t(t))
+    }
+    let base: str = type_base(t)
+    let args: list[str] = type_args(t)
+    if !ctx.structs.has(base) && !ctx.enums.has(base) {
+        return false
+    }
+    let mut i: int = 0
+    while i < args.len() {
+        if !type_is_concrete(ctx, args.get(i)) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn collect_all_insts(ctx: Ctx) -> void {
+    # Function signatures.
+    let mut i: int = 0
+    while i < ctx.fn_order.len() {
+        let f: FnInfo = ctx.fns.get_or(ctx.fn_order.get(i), dummy_fn())
+        let mut j: int = 0
+        while j < f.ptypes.len() {
+            collect_insts(ctx, f.ptypes.get(j))
+            j = j + 1
+        }
+        collect_insts(ctx, f.ret)
+        i = i + 1
+    }
+    # Struct fields.
+    let sk: list[str] = ctx.structs.keys()
+    let mut si: int = 0
+    while si < sk.len() {
+        let st: StructInfo = ctx.structs.get_or(sk.get(si), dummy_struct())
+        let mut fi: int = 0
+        while fi < st.ftypes.len() {
+            collect_insts(ctx, st.ftypes.get(fi))
+            fi = fi + 1
+        }
+        si = si + 1
+    }
+    # Enum payloads.
+    let ek: list[str] = ctx.enums.keys()
+    let mut ei: int = 0
+    while ei < ek.len() {
+        let en: EnumInfo = ctx.enums.get_or(ek.get(ei), dummy_enum())
+        let mut vi: int = 0
+        while vi < en.variants.len() {
+            let pl: list[str] = en.payloads.get(vi)
+            let mut pi: int = 0
+            while pi < pl.len() {
+                collect_insts(ctx, pl.get(pi))
+                pi = pi + 1
+            }
+            vi = vi + 1
+        }
+        ei = ei + 1
+    }
+    # All expression types (after check).
+    let mut xi: int = 0
+    while xi < ctx.exprs.len() {
+        if ctx.exprs[xi].t != "" && ctx.exprs[xi].t != "never" {
+            collect_insts(ctx, ctx.exprs[xi].t)
+        }
+        xi = xi + 1
+    }
+    # All let vtypes + for vtypes.
+    let mut ssi: int = 0
+    while ssi < ctx.stmts.len() {
+        if ctx.stmts[ssi].vtype != "" {
+            collect_insts(ctx, ctx.stmts[ssi].vtype)
+        }
+        ssi = ssi + 1
+    }
 }
 
 fn dummy_struct() -> StructInfo {
-    return StructInfo { name: "", fields: [], ftypes: [], line: 0 }
+    return StructInfo { name: "", fields: [], ftypes: [], fdefaults: [], typeparams: [], line: 0 }
+}
+
+fn dummy_enum() -> EnumInfo {
+    return EnumInfo { name: "", variants: [], payloads: [], typeparams: [], line: 0 }
 }
 
 fn dummy_fn() -> FnInfo {
     return FnInfo {
         name: "", params: [], ptypes: [], pmuts: [], ret: "void",
-        uses_io: false, body: [], is_method: false, struct_of: "", line: 0
+        uses_io: false, body: [], is_method: false, struct_of: "",
+        typeparams: [], line: 0
     }
 }
 
 fn check_fn_body(ctx: Ctx, key: str) -> void {
     let f: FnInfo = ctx.fns.get_or(key, dummy_fn())
+    let saved_ret: str = ctx.cur_fn_ret
+    let saved_tp: list[str] = ctx.cur_typeparams
+    ctx.cur_fn_ret = f.ret
+    ctx.cur_typeparams = f.typeparams
     let env: list[map[str, Binding]] = []
     let scope0: map[str, Binding] = map_new()
     if f.is_method {
@@ -1126,6 +1853,8 @@ fn check_fn_body(ctx: Ctx, key: str) -> void {
             cerr(f.line, "function '" + f.name + "' does not return on all paths")
         }
     }
+    ctx.cur_fn_ret = saved_ret
+    ctx.cur_typeparams = saved_tp
 }
 
 fn all_return(ctx: Ctx, stmts: list[int]) -> bool {
@@ -1145,7 +1874,33 @@ fn all_return(ctx: Ctx, stmts: list[int]) -> bool {
             return all_return(ctx, ctx.stmts[last].body) && all_return(ctx, ctx.stmts[last].else_body)
         }
     }
+    if k == "expr" && ctx.exprs[ctx.stmts[last].e].kind == "match" {
+        if match_all_return(ctx, ctx.stmts[last].e) {
+            return true
+        }
+    }
     return false
+}
+
+fn match_all_return(ctx: Ctx, e: int) -> bool {
+    let mut i: int = 0
+    while i < ctx.exprs[e].args.len() {
+        let arm_idx: int = ctx.exprs[e].args.get(i)
+        let arm: MatchArm = ctx.match_arms.get(arm_idx)
+        let body_k: str = ctx.stmts[0].kind
+        # arm.body is an expression index; we check if it's a return wrapped
+        # in an expression-statement. But arms are expressions — they don't
+        # contain return statements directly. So a match can only be a
+        # "return on all paths" if all arms are `never`-typed (e.g., all arms
+        # are calls to `panic()`). Otherwise we cannot prove it returns.
+        # For simplicity, treat all arms that have body_t == "never" as
+        # returning.
+        if arm.body_t != "never" {
+            return false
+        }
+        i = i + 1
+    }
+    return ctx.exprs[e].args.len() > 0
 }
 
 fn check_stmts(ctx: Ctx, env: list[map[str, Binding]], cur: str, f: FnInfo, stmts: list[int], in_loop: bool) -> void {
@@ -1165,7 +1920,9 @@ fn check_stmt(ctx: Ctx, env: list[map[str, Binding]], cur: str, f: FnInfo, sidx:
         }
         let vt: str = check_expr(ctx, env, cur, s.value, s.vtype)
         if vt == "never" {
-            cerr(s.line, "cannot assign never-returning expression")
+            # `let x: T = panic()` is sound: x is unreachable.
+            env.get(env.len() - 1).set(s.name, Binding { t: s.vtype, is_mut: s.is_mut })
+            return
         }
         if vt != s.vtype {
             cerr(s.line, "type mismatch: declared " + s.vtype + " but got " + vt)
@@ -1201,7 +1958,7 @@ fn check_stmt(ctx: Ctx, env: list[map[str, Binding]], cur: str, f: FnInfo, sidx:
         }
         let mut elem: str = list_elem_t(it)
         if s.vtype != elem {
-            cerr(s.line, "variable type lap " + s.vtype + " does not match element " + elem)
+            cerr(s.line, "variable type " + s.vtype + " does not match element " + elem)
         }
         env.push(map_new())
         env.get(env.len() - 1).set(s.name, Binding { t: elem, is_mut: false })
@@ -1238,7 +1995,6 @@ fn check_stmt(ctx: Ctx, env: list[map[str, Binding]], cur: str, f: FnInfo, sidx:
 
 fn check_assign(ctx: Ctx, env: list[map[str, Binding]], cur: str, s: StmtN) -> void {
     let tgt: int = s.target
-    # find the root binding
     let mut root: int = tgt
     while ctx.exprs[root].kind == "field" || ctx.exprs[root].kind == "index" {
         root = ctx.exprs[root].left
@@ -1247,14 +2003,13 @@ fn check_assign(ctx: Ctx, env: list[map[str, Binding]], cur: str, s: StmtN) -> v
     if b.t == "" {
         cerr(s.line, "variable does not exist: " + ctx.exprs[root].name)
     }
-    # 'mut' only governs REASSIGNMENT of the binding (name = v)
     if ctx.exprs[tgt].kind == "ident" && !b.is_mut {
         cerr(s.line, "cannot reassign immutable variable: " + ctx.exprs[root].name)
     }
     let tt: str = check_lvalue(ctx, env, cur, tgt)
     let vt: str = check_expr(ctx, env, cur, s.value, tt)
     if vt == "never" {
-        cerr(s.line, "cannot assign never-returning expression")
+        return
     }
     if vt != tt {
         cerr(s.line, "type mismatch on assignment: expected " + tt + ", got " + vt)
@@ -1267,10 +2022,23 @@ fn check_lvalue(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int) -> str
     }
     if ctx.exprs[e].kind == "field" {
         let bt: str = check_expr(ctx, env, cur, ctx.exprs[e].left, "")
-        if !ctx.structs.has(bt) {
+        let st: StructInfo = resolve_struct(ctx, bt)
+        if st.name == "" {
             cerr(ctx.exprs[e].line, "cannot access field on type " + bt)
         }
-        return field_type(ctx, bt, ctx.exprs[e].name, ctx.exprs[e].line)
+        let mut i: int = 0
+        while i < st.fields.len() {
+            if st.fields.get(i) == ctx.exprs[e].name {
+                # If the struct is generic, instantiate the field type.
+                if st.typeparams.len() > 0 {
+                    let targs: list[str] = type_args(bt)
+                    return instantiate_type(st.ftypes.get(i), st.typeparams, targs)
+                }
+                return st.ftypes.get(i)
+            }
+            i = i + 1
+        }
+        cerr(ctx.exprs[e].line, "struct " + st.name + " has no field " + ctx.exprs[e].name)
     }
     if ctx.exprs[e].kind == "index" {
         let tt: str = check_expr(ctx, env, cur, ctx.exprs[e].left, "")
@@ -1284,19 +2052,6 @@ fn check_lvalue(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int) -> str
         return list_elem_t(tt)
     }
     cerr(ctx.exprs[e].line, "invalid lvalue")
-    return ""
-}
-
-fn field_type(ctx: Ctx, sname: str, fname: str, line: int) -> str {
-    let st: StructInfo = ctx.structs.get_or(sname, dummy_struct())
-    let mut i: int = 0
-    while i < st.fields.len() {
-        if st.fields.get(i) == fname {
-            return st.ftypes.get(i)
-        }
-        i = i + 1
-    }
-    cerr(line, "struct " + sname + "  has no field " + fname)
     return ""
 }
 
@@ -1315,10 +2070,15 @@ fn check_expr(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, expected
         ctx.exprs[e].t = "str"
     } else if k == "ident" {
         let b: Binding = lookup_binding(env, ctx.exprs[e].name)
-        if b.t == "" {
+        if b.t != "" {
+            ctx.exprs[e].t = b.t
+        } else if ctx.enums.has(ctx.exprs[e].name) {
+            cerr(ctx.exprs[e].line, "enum name '" + ctx.exprs[e].name + "' cannot be used as a value")
+        } else if ctx.structs.has(ctx.exprs[e].name) {
+            cerr(ctx.exprs[e].line, "struct name '" + ctx.exprs[e].name + "' cannot be used as a value")
+        } else {
             cerr(ctx.exprs[e].line, "variable does not exist: " + ctx.exprs[e].name)
         }
-        ctx.exprs[e].t = b.t
     } else if k == "bin" {
         ctx.exprs[e].t = check_bin(ctx, env, cur, e)
     } else if k == "un" {
@@ -1348,27 +2108,71 @@ fn check_expr(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, expected
         }
         ctx.exprs[e].t = list_elem_t(tt)
     } else if k == "field" {
-        let tt: str = check_expr(ctx, env, cur, ctx.exprs[e].left, "")
-        if tt == "never" {
-            cerr(ctx.exprs[e].line, "never value cannot be used in expression")
+        # Disambiguate: if target is `ident` matching an enum name (and no
+        # variable with that name), this is an enum variant with no payload.
+        if ctx.exprs[ctx.exprs[e].left].kind == "ident" && ctx.enums.has(ctx.exprs[ctx.exprs[e].left].name) && !lookup_exists(env, ctx.exprs[ctx.exprs[e].left].name) {
+            check_enum_variant(ctx, env, cur, e, expected, false)
+        } else {
+            let tt: str = check_expr(ctx, env, cur, ctx.exprs[e].left, "")
+            if tt == "never" {
+                cerr(ctx.exprs[e].line, "never value cannot be used in expression")
+            }
+            let st: StructInfo = resolve_struct(ctx, tt)
+            if st.name == "" {
+                cerr(ctx.exprs[e].line, "cannot access field on type " + tt)
+            }
+            let mut i: int = 0
+            while i < st.fields.len() {
+                if st.fields.get(i) == ctx.exprs[e].name {
+                    if st.typeparams.len() > 0 {
+                        let targs: list[str] = type_args(tt)
+                        ctx.exprs[e].t = instantiate_type(st.ftypes.get(i), st.typeparams, targs)
+                    } else {
+                        ctx.exprs[e].t = st.ftypes.get(i)
+                    }
+                    break
+                }
+                i = i + 1
+            }
+            if ctx.exprs[e].t == "" {
+                cerr(ctx.exprs[e].line, "struct " + st.name + " has no field " + ctx.exprs[e].name)
+            }
         }
-        if !ctx.structs.has(tt) {
-            cerr(ctx.exprs[e].line, "cannot access field on type " + tt)
+    } else if k == "fieldcall" {
+        # Disambiguate: enum variant with payload OR method call.
+        if ctx.exprs[ctx.exprs[e].left].kind == "ident" && ctx.enums.has(ctx.exprs[ctx.exprs[e].left].name) && !lookup_exists(env, ctx.exprs[ctx.exprs[e].left].name) {
+            check_enum_variant(ctx, env, cur, e, expected, true)
+        } else {
+            # Rewrite as a method call.
+            ctx.exprs[e].kind = "method"
+            ctx.exprs[e].t = check_method(ctx, env, cur, e)
         }
-        ctx.exprs[e].t = field_type(ctx, tt, ctx.exprs[e].name, ctx.exprs[e].line)
-    } else if k == "call" {
-        ctx.exprs[e].t = check_call(ctx, env, cur, e, expected)
     } else if k == "method" {
         ctx.exprs[e].t = check_method(ctx, env, cur, e)
+    } else if k == "call" {
+        ctx.exprs[e].t = check_call(ctx, env, cur, e, expected)
     } else if k == "listlit" {
         ctx.exprs[e].t = check_listlit(ctx, env, cur, e, expected)
     } else if k == "structlit" {
-        ctx.exprs[e].t = check_structlit(ctx, env, cur, e)
-    } else if k == "mapnew" {
-        if expected == "" || !is_map_t(expected) {
-            cerr(ctx.exprs[e].line, "map_new() requires a 'map[str, T]' type in the surrounding context")
+        ctx.exprs[e].t = check_structlit(ctx, env, cur, e, expected)
+    } else if k == "match" {
+        ctx.exprs[e].t = check_match(ctx, env, cur, e, expected)
+    } else if k == "qmark" {
+        ctx.exprs[e].t = check_qmark(ctx, env, cur, e, expected)
+    } else if k == "enumlit" {
+        # Already rewritten during a previous visit.
+        # Re-derive the type from the stored enum_name + variant.
+        let en: EnumInfo = ctx.enums.get_or(ctx.exprs[e].enum_name, dummy_enum())
+        if en.name == "" {
+            cerr(ctx.exprs[e].line, "enum does not exist: " + ctx.exprs[e].enum_name)
         }
-        ctx.exprs[e].t = expected
+        # We need the contextual type to recover the instantiation. Try
+        # `expected` first.
+        if expected != "" && type_base(expected) == en.name {
+            ctx.exprs[e].t = expected
+        } else {
+            ctx.exprs[e].t = ctx.exprs[e].enum_name
+        }
     } else {
         cerr(ctx.exprs[e].line, "unknown expression: " + k)
     }
@@ -1451,26 +2255,95 @@ fn check_listlit(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, expec
     return "list[" + elem + "]"
 }
 
-fn check_structlit(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int) -> str {
+fn check_structlit(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, expected: str) -> str {
     let name: str = ctx.exprs[e].name
     let mut line: int = ctx.exprs[e].line
     if !ctx.structs.has(name) {
         cerr(line, "struct does not exist: " + name)
     }
     let st: StructInfo = ctx.structs.get_or(name, dummy_struct())
-    if ctx.exprs[e].ffields.len() != st.fields.len() {
-        cerr(line, "struct literal " + name + " requires exactly " + st.fields.len().to_str() + " fields, got " + ctx.exprs[e].ffields.len().to_str())
-    }
+    let typeparams: list[str] = st.typeparams
+    # Build the type_map for generic instantiation (if applicable).
+    let targs: list[str] = []
     let mut i: int = 0
-    while i < st.fields.len() {
-        if ctx.exprs[e].ffields.get(i) != st.fields.get(i) {
-            cerr(line, "field order mismatch: expected '" + st.fields.get(i) + "', got '" + ctx.exprs[e].ffields.get(i) + "'")
-        }
-        let vt: str = check_expr(ctx, env, cur, ctx.exprs[e].args.get(i), st.ftypes.get(i))
-        if vt != st.ftypes.get(i) {
-            cerr(line, "field type " + st.fields.get(i) + " mismatch: expected " + st.ftypes.get(i) + ", got " + vt)
-        }
+    while i < typeparams.len() {
+        targs.push("")
         i = i + 1
+    }
+    if typeparams.len() > 0 && expected != "" && type_base(expected) == name {
+        let eargs: list[str] = type_args(expected)
+        if eargs.len() == typeparams.len() {
+            let mut j: int = 0
+            while j < eargs.len() {
+                targs.set(j, eargs.get(j))
+                j = j + 1
+            }
+        }
+    }
+    # Validate field names match declared order (and required fields present).
+    let provided: list[str] = ctx.exprs[e].ffields
+    let declared: list[str] = st.fields
+    let mut pi: int = 0
+    while pi < provided.len() {
+        if pi >= declared.len() || declared.get(pi) != provided.get(pi) {
+            let mut want: str = "<end>"
+            if pi < declared.len() {
+                want = declared.get(pi)
+            }
+            cerr(line, "struct literal field order mismatch at position " + pi.to_str() + ": expected '" + want + "', got '" + provided.get(pi) + "'")
+        }
+        pi = pi + 1
+    }
+    if provided.len() > declared.len() {
+        cerr(line, "struct literal " + name + " has too many fields")
+    }
+    # Required (non-defaulted) fields must be present.
+    let mut di: int = 0
+    while di < declared.len() {
+        let has_default: bool = st.fdefaults.get(di) != -1
+        let is_required: bool = !has_default
+        let is_provided: bool = di < provided.len()
+        if is_required && !is_provided {
+            cerr(line, "struct literal missing required field '" + declared.get(di) + "'")
+        }
+        di = di + 1
+    }
+    # Type-check each provided field against the instantiated declared type.
+    let mut fi: int = 0
+    while fi < provided.len() {
+        let decl_ftype: str = st.ftypes.get(fi)
+        let mut inst_ftype: str = ""
+        if typeparams.len() > 0 {
+            inst_ftype = instantiate_type(decl_ftype, typeparams, targs)
+        } else {
+            inst_ftype = decl_ftype
+        }
+        let vt: str = check_expr(ctx, env, cur, ctx.exprs[e].args.get(fi), inst_ftype)
+        if vt != inst_ftype {
+            cerr(line, "field type " + st.fields.get(fi) + " mismatch: expected " + inst_ftype + ", got " + vt)
+        }
+        # If generic, try to infer type args from provided field values.
+        if typeparams.len() > 0 {
+            unify_into(ctx, decl_ftype, vt, typeparams, targs)
+        }
+        fi = fi + 1
+    }
+    # If generic and any type arg is still unbound, error.
+    if typeparams.len() > 0 {
+        let mut ti: int = 0
+        while ti < typeparams.len() {
+            if targs.get(ti) == "" {
+                cerr(line, "cannot infer type argument for struct " + name + "; provide a contextual type")
+            }
+            ti = ti + 1
+        }
+        let inst_t: str = name + "[" + join(targs, ", ") + "]"
+        # Record this struct instantiation for codegen — only if all type
+        # args are concrete (not type params of an enclosing generic).
+        if type_is_concrete(ctx, inst_t) && !list_has(ctx.struct_insts, inst_t) {
+            ctx.struct_insts.push(inst_t)
+        }
+        return inst_t
     }
     return name
 }
@@ -1494,13 +2367,64 @@ fn check_call(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, expected
         if ctx.exprs[e].args.len() != f.params.len() {
             cerr(line, "function " + name + " expects " + f.params.len().to_str() + " arguments, got " + ctx.exprs[e].args.len().to_str())
         }
+        # Generic function: infer type args from argument types.
+        let typeparams: list[str] = f.typeparams
+        let targs: list[str] = []
+        let mut ti: int = 0
+        while ti < typeparams.len() {
+            targs.push("")
+            ti = ti + 1
+        }
+        if typeparams.len() > 0 {
+            let mut ai: int = 0
+            while ai < ctx.exprs[e].args.len() {
+                let at: str = check_expr(ctx, env, cur, ctx.exprs[e].args.get(ai), "")
+                if at != "never" {
+                    unify_into(ctx, f.ptypes.get(ai), at, typeparams, targs)
+                }
+                ai = ai + 1
+            }
+            let mut ti2: int = 0
+            while ti2 < typeparams.len() {
+                if targs.get(ti2) == "" {
+                    cerr(line, "cannot infer type argument for " + name)
+                }
+                ti2 = ti2 + 1
+            }
+            # Record this generic function instantiation for codegen.
+            let inst_str: str = name + "|" + join(targs, ",")
+            if !list_has(ctx.fn_insts, inst_str) {
+                ctx.fn_insts.push(inst_str)
+            }
+            # Store the inferred concrete type args on the call node so the
+            # codegen can use the mangled function name.
+            ctx.exprs[e].inst_targs = targs
+            # Also set mkey to the mangled name so gen_call uses the right name.
+            ctx.exprs[e].mkey = c_mangled_fn_name(name, typeparams, targs)
+        } else {
+            ctx.exprs[e].mkey = name
+        }
+        # Type-check arguments against instantiated parameter types.
         let mut i: int = 0
         while i < ctx.exprs[e].args.len() {
-            let at: str = check_expr(ctx, env, cur, ctx.exprs[e].args.get(i), f.ptypes.get(i))
-            if at != f.ptypes.get(i) {
-                cerr(line, "argument '" + f.params.get(i) + "' of " + name + " expects " + f.ptypes.get(i) + ", got " + at)
+            let mut inst_pt: str = ""
+            if typeparams.len() > 0 {
+                inst_pt = instantiate_type(f.ptypes.get(i), typeparams, targs)
+            } else {
+                inst_pt = f.ptypes.get(i)
+            }
+            let at: str = check_expr(ctx, env, cur, ctx.exprs[e].args.get(i), inst_pt)
+            if at == "never" {
+                i = i + 1
+                continue
+            }
+            if at != inst_pt {
+                cerr(line, "argument '" + f.params.get(i) + "' of " + name + " expects " + inst_pt + ", got " + at)
             }
             i = i + 1
+        }
+        if typeparams.len() > 0 {
+            return instantiate_type(f.ret, typeparams, targs)
         }
         return f.ret
     }
@@ -1638,40 +2562,95 @@ fn check_method(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int) -> str
         cerr(line, "never value cannot be used in expression")
     }
     let nargs: int = ctx.exprs[e].args.len()
-    if ctx.structs.has(tt) {
-        # user-defined struct method
-        let cands: list[str] = ctx.methods_of.get_or(tt, [])
-        let mut key: str = ""
-        let mut i: int = 0
-        while i < cands.len() {
-            let mut k: str = cands.get(i)
-            if ctx.fns.get_or(k, dummy_fn()).name == name {
-                key = k
+    # User-defined struct method (resolve via base name).
+    let st: StructInfo = resolve_struct(ctx, tt)
+    if st.name != "" {
+        let tt_base: str = type_base(tt)
+        if ctx.methods_of.has(tt_base) {
+            let cands: list[str] = ctx.methods_of.get_or(tt_base, [])
+            let mut key: str = ""
+            let mut i: int = 0
+            while i < cands.len() {
+                let mut k: str = cands.get(i)
+                if ctx.fns.get_or(k, dummy_fn()).name == name {
+                    key = k
+                }
+                i = i + 1
             }
-            i = i + 1
-        }
-        if key == "" {
-            cerr(line, "struct " + tt + " has no method " + name)
-        }
-        ctx.exprs[e].muser = true
-        ctx.exprs[e].mkey = key
-        add_edge(ctx, cur, key)
-        let f: FnInfo = ctx.fns.get_or(key, dummy_fn())
-        let np: int = f.params.len() - 1
-        if nargs != np {
-            cerr(line, tt + "." + name + " expects " + np.to_str() + " arguments, got " + nargs.to_str())
-        }
-        let mut mi: int = 0
-        while mi < nargs {
-            let at: str = check_expr(ctx, env, cur, ctx.exprs[e].args.get(mi), f.ptypes.get(mi + 1))
-            if at != f.ptypes.get(mi + 1) {
-                cerr(line, "argument '" + f.params.get(mi + 1) + "' of " + tt + "." + name + " expects " + f.ptypes.get(mi + 1) + ", got " + at)
+            if key == "" {
+                cerr(line, "struct " + tt_base + " has no method " + name)
             }
-            mi = mi + 1
+            ctx.exprs[e].muser = true
+            ctx.exprs[e].mkey = key
+            add_edge(ctx, cur, key)
+            let f: FnInfo = ctx.fns.get_or(key, dummy_fn())
+            let np: int = f.params.len() - 1
+            if nargs != np {
+                cerr(line, tt_base + "." + name + " expects " + np.to_str() + " arguments, got " + nargs.to_str())
+            }
+            # Build a type_map combining struct's type args + method's type params.
+            let type_map_tps: list[str] = []
+            let type_map_targs: list[str] = []
+            # Add the struct's type params first, bound to the actual type args.
+            let mut si: int = 0
+            while si < st.typeparams.len() {
+                type_map_tps.push(st.typeparams.get(si))
+                let targs_of_tt: list[str] = type_args(tt)
+                if si < targs_of_tt.len() {
+                    type_map_targs.push(targs_of_tt.get(si))
+                } else {
+                    type_map_targs.push("")
+                }
+                si = si + 1
+            }
+            # Then the method's own type params (initially unbound).
+            let mut mi: int = 0
+            while mi < f.typeparams.len() {
+                type_map_tps.push(f.typeparams.get(mi))
+                type_map_targs.push("")
+                mi = mi + 1
+            }
+            # Infer method's type params from arguments.
+            if f.typeparams.len() > 0 {
+                let mut ai: int = 0
+                while ai < nargs {
+                    let at: str = check_expr(ctx, env, cur, ctx.exprs[e].args.get(ai), "")
+                    if at != "never" {
+                        # pt is f.ptypes.get(ai+1) — instantiate struct type
+                        # params first, then unify with method type params.
+                        let pt: str = f.ptypes.get(ai + 1)
+                        let inst_pt: str = instantiate_type(pt, st.typeparams, type_args(tt))
+                        unify_into(ctx, inst_pt, at, f.typeparams, list_slice_from(type_map_targs, st.typeparams.len()))
+                    }
+                    ai = ai + 1
+                }
+                let mut ti: int = st.typeparams.len()
+                while ti < type_map_targs.len() {
+                    if type_map_targs.get(ti) == "" {
+                        cerr(line, "cannot infer type argument for " + tt_base + "." + name)
+                    }
+                    ti = ti + 1
+                }
+            }
+            # Type-check arguments against instantiated parameter types.
+            let mut ai2: int = 0
+            while ai2 < nargs {
+                let pt: str = f.ptypes.get(ai2 + 1)
+                let inst_pt: str = instantiate_type(pt, type_map_tps, type_map_targs)
+                let at: str = check_expr(ctx, env, cur, ctx.exprs[e].args.get(ai2), inst_pt)
+                if at == "never" {
+                    ai2 = ai2 + 1
+                    continue
+                }
+                if at != inst_pt {
+                    cerr(line, "argument of " + tt_base + "." + name + " expects " + inst_pt + ", got " + at)
+                }
+                ai2 = ai2 + 1
+            }
+            return instantiate_type(f.ret, type_map_tps, type_map_targs)
         }
-        return f.ret
     }
-    # builtin method: ptypes + ret table by target type
+    # Builtin method: ptypes + ret table by target type
     let ptypes: list[str] = []
     let mut ret: str = ""
     if tt == "str" {
@@ -1784,6 +2763,335 @@ fn check_method(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int) -> str
     return ret
 }
 
+# --- Enum variant literal check (rewrites the node to enumlit) ---
+
+fn check_enum_variant(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, expected: str, with_args: bool) -> void {
+    let ename: str = ctx.exprs[ctx.exprs[e].left].name
+    let vname: str = ctx.exprs[e].name
+    let line: int = ctx.exprs[e].line
+    if !ctx.enums.has(ename) {
+        cerr(line, "enum does not exist: " + ename)
+    }
+    let en: EnumInfo = ctx.enums.get_or(ename, dummy_enum())
+    let mut vidx: int = -1
+    let mut i: int = 0
+    while i < en.variants.len() {
+        if en.variants.get(i) == vname {
+            vidx = i
+        }
+        i = i + 1
+    }
+    if vidx == -1 {
+        cerr(line, "enum " + ename + " has no variant " + vname)
+    }
+    let payloads: list[str] = en.payloads.get(vidx)
+    let mut nargs: int = 0
+    if with_args {
+        nargs = ctx.exprs[e].args.len()
+    }
+    if nargs != payloads.len() {
+        cerr(line, "variant " + vname + " of enum " + ename + " expects " + payloads.len().to_str() + " payloads, got " + nargs.to_str())
+    }
+    let typeparams: list[str] = en.typeparams
+    let targs: list[str] = []
+    let mut ti: int = 0
+    while ti < typeparams.len() {
+        targs.push("")
+        ti = ti + 1
+    }
+    # First pass: infer from args.
+    if typeparams.len() > 0 && with_args {
+        let mut ai: int = 0
+        while ai < nargs {
+            let at: str = check_expr(ctx, env, cur, ctx.exprs[e].args.get(ai), "")
+            if at != "never" {
+                unify_into(ctx, payloads.get(ai), at, typeparams, targs)
+            }
+            ai = ai + 1
+        }
+    }
+    # Second pass: try contextual expected type.
+    if typeparams.len() > 0 && expected != "" && type_base(expected) == ename {
+        let eargs: list[str] = type_args(expected)
+        if eargs.len() == typeparams.len() {
+            let mut j: int = 0
+            while j < eargs.len() {
+                if targs.get(j) == "" {
+                    targs.set(j, eargs.get(j))
+                }
+                j = j + 1
+            }
+        }
+    }
+    # If any type param is still unbound, error.
+    if typeparams.len() > 0 {
+        let mut ti2: int = 0
+        while ti2 < typeparams.len() {
+            if targs.get(ti2) == "" {
+                cerr(line, "cannot infer type argument for " + ename + "; provide a contextual type")
+            }
+            ti2 = ti2 + 1
+        }
+    }
+    # Type-check payloads against instantiated payload types.
+    let inst_payloads: list[str] = []
+    let mut pi: int = 0
+    while pi < payloads.len() {
+        if typeparams.len() > 0 {
+            inst_payloads.push(instantiate_type(payloads.get(pi), typeparams, targs))
+        } else {
+            inst_payloads.push(payloads.get(pi))
+        }
+        pi = pi + 1
+    }
+    if with_args {
+        let mut ai2: int = 0
+        while ai2 < nargs {
+            let at: str = check_expr(ctx, env, cur, ctx.exprs[e].args.get(ai2), inst_payloads.get(ai2))
+            if at == "never" {
+                ai2 = ai2 + 1
+                continue
+            }
+            if at != inst_payloads.get(ai2) {
+                cerr(line, "payload type mismatch: expected " + inst_payloads.get(ai2) + ", got " + at)
+            }
+            ai2 = ai2 + 1
+        }
+    }
+    # Rewrite the node to enumlit.
+    let result_type: str = ""
+    if typeparams.len() > 0 {
+        ctx.exprs[e].t = ename + "[" + join(targs, ", ") + "]"
+        # Record this enum instantiation for codegen — only if all type args
+        # are concrete.
+        let inst_t: str = ename + "[" + join(targs, ", ") + "]"
+        if type_is_concrete(ctx, inst_t) && !list_has(ctx.enum_insts, inst_t) {
+            ctx.enum_insts.push(inst_t)
+        }
+    } else {
+        ctx.exprs[e].t = ename
+    }
+    ctx.exprs[e].kind = "enumlit"
+    ctx.exprs[e].enum_name = ename
+    ctx.exprs[e].variant = vname
+}
+
+# --- match ---
+
+fn check_match(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, expected: str) -> str {
+    let scrut_t: str = check_expr(ctx, env, cur, ctx.exprs[e].left, "")
+    if scrut_t == "never" {
+        cerr(ctx.exprs[e].line, "never value cannot be used in match")
+    }
+    let ename: str = type_base(scrut_t)
+    if !ctx.enums.has(ename) {
+        cerr(ctx.exprs[e].line, "match scrutinee must be an enum, got " + scrut_t)
+    }
+    let en: EnumInfo = ctx.enums.get_or(ename, dummy_enum())
+    let typeparams: list[str] = en.typeparams
+    let targs: list[str] = []
+    let mut ti: int = 0
+    while ti < typeparams.len() {
+        targs.push("")
+        ti = ti + 1
+    }
+    if typeparams.len() > 0 {
+        let sargs: list[str] = type_args(scrut_t)
+        if sargs.len() == typeparams.len() {
+            let mut j: int = 0
+            while j < sargs.len() {
+                targs.set(j, sargs.get(j))
+                j = j + 1
+            }
+        } else {
+            cerr(ctx.exprs[e].line, "invalid enum instantiation: " + scrut_t)
+        }
+    }
+    # Check exhaustiveness and arm types.
+    let covered: list[str] = []
+    let mut has_wildcard: bool = false
+    let arm_types: list[str] = []
+    let mut arm_n: int = 0
+    while arm_n < ctx.exprs[e].args.len() {
+        let arm_idx: int = ctx.exprs[e].args.get(arm_n)
+        let arm: MatchArm = ctx.match_arms.get(arm_idx)
+        if arm.pat_kind == "wildcard" {
+            has_wildcard = true
+        } else {
+            if arm.enum_name != ename {
+                cerr(arm.line, "match arm pattern belongs to enum " + arm.enum_name + ", not " + ename)
+            }
+            # Find variant index.
+            let mut vidx: int = -1
+            let mut vi: int = 0
+            while vi < en.variants.len() {
+                if en.variants.get(vi) == arm.variant {
+                    vidx = vi
+                }
+                vi = vi + 1
+            }
+            if vidx == -1 {
+                cerr(arm.line, "enum " + ename + " has no variant " + arm.variant)
+            }
+            let payloads: list[str] = en.payloads.get(vidx)
+            if arm.has_paren && arm.bindings.len() != payloads.len() {
+                cerr(arm.line, "variant " + arm.variant + " has " + payloads.len().to_str() + " payloads, but pattern binds " + arm.bindings.len().to_str())
+            }
+            if !arm.has_paren && payloads.len() != 0 {
+                cerr(arm.line, "variant " + arm.variant + " requires " + payloads.len().to_str() + " payload bindings")
+            }
+            covered.push(arm.variant)
+        }
+        # Check arm body in a new scope with the bindings.
+        env.push(map_new())
+        if arm.pat_kind != "wildcard" {
+            # Bind payload values.
+            if arm.has_paren {
+                let mut vidx2: int = -1
+                let mut vi2: int = 0
+                while vi2 < en.variants.len() {
+                    if en.variants.get(vi2) == arm.variant {
+                        vidx2 = vi2
+                    }
+                    vi2 = vi2 + 1
+                }
+                let payloads2: list[str] = en.payloads.get(vidx2)
+                let mut bi: int = 0
+                while bi < payloads2.len() {
+                    let pt: str = payloads2.get(bi)
+                    let mut inst_pt: str = ""
+                    if typeparams.len() > 0 {
+                        inst_pt = instantiate_type(pt, typeparams, targs)
+                    } else {
+                        inst_pt = pt
+                    }
+                    let bname: str = arm.bindings.get(bi)
+                    if bname != "_" {
+                        if lookup_exists(env, bname) {
+                            cerr(arm.line, "shadowing not allowed in match arm: " + bname)
+                        }
+                        env.get(env.len() - 1).set(bname, Binding { t: inst_pt, is_mut: false })
+                    }
+                    bi = bi + 1
+                }
+            }
+        }
+        let body_t: str = check_expr(ctx, env, cur, arm.body, expected)
+        let mut arm_m: MatchArm = ctx.match_arms.get(arm_idx)
+        arm_m.body_t = body_t
+        ctx.match_arms.set(arm_idx, arm_m)
+        env.pop()
+        if body_t != "never" {
+            arm_types.push(body_t)
+        }
+        arm_n = arm_n + 1
+    }
+    # Exhaustiveness check.
+    if !has_wildcard {
+        let mut missing: list[str] = []
+        let mut vi3: int = 0
+        while vi3 < en.variants.len() {
+            let v: str = en.variants.get(vi3)
+            let mut found: bool = false
+            let mut ci: int = 0
+            while ci < covered.len() {
+                if covered.get(ci) == v {
+                    found = true
+                }
+                ci = ci + 1
+            }
+            if !found {
+                missing.push(v)
+            }
+            vi3 = vi3 + 1
+        }
+        if missing.len() > 0 {
+            cerr(ctx.exprs[e].line, "match is not exhaustive; missing: " + join(missing, ", "))
+        }
+    }
+    # All arm types must agree.
+    if arm_types.len() == 0 {
+        ctx.exprs[e].t = "never"
+        return "never"
+    }
+    let first: str = arm_types.get(0)
+    let mut ai: int = 1
+    while ai < arm_types.len() {
+        if arm_types.get(ai) != first {
+            cerr(ctx.exprs[e].line, "match arms have different types: " + first + " and " + arm_types.get(ai))
+        }
+        ai = ai + 1
+    }
+    ctx.exprs[e].t = first
+    return first
+}
+
+# --- `?` operator ---
+
+fn check_qmark(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, expected: str) -> str {
+    let inner_t: str = check_expr(ctx, env, cur, ctx.exprs[e].left, "")
+    if inner_t == "never" {
+        cerr(ctx.exprs[e].line, "never value cannot be used in expression")
+    }
+    let ename: str = type_base(inner_t)
+    if !ctx.enums.has(ename) {
+        cerr(ctx.exprs[e].line, "? operator requires an enum type, got " + inner_t)
+    }
+    let en: EnumInfo = ctx.enums.get_or(ename, dummy_enum())
+    # Find error variant (Err with 1 payload, or None with 0) and ok variant
+    # (Ok or Some with 1 payload).
+    let mut err_v: str = ""
+    let mut ok_v: str = ""
+    let mut ok_payload: str = ""
+    let mut vi: int = 0
+    while vi < en.variants.len() {
+        let v: str = en.variants.get(vi)
+        let pl: list[str] = en.payloads.get(vi)
+        if v == "Err" && pl.len() == 1 {
+            err_v = v
+        }
+        if v == "None" && pl.len() == 0 {
+            err_v = v
+        }
+        if v == "Ok" && pl.len() == 1 {
+            ok_v = v
+            ok_payload = pl.get(0)
+        }
+        if v == "Some" && pl.len() == 1 {
+            ok_v = v
+            ok_payload = pl.get(0)
+        }
+        vi = vi + 1
+    }
+    if err_v == "" {
+        cerr(ctx.exprs[e].line, "? operator requires enum " + ename + " to have an 'Err' (1 payload) or 'None' variant")
+    }
+    if ok_v == "" {
+        cerr(ctx.exprs[e].line, "? operator requires enum " + ename + " to have an 'Ok' or 'Some' variant (1 payload)")
+    }
+    # Compute the success value type (instantiated).
+    let mut success_t: str = ""
+    if en.typeparams.len() > 0 {
+        let sargs: list[str] = type_args(inner_t)
+        success_t = instantiate_type(ok_payload, en.typeparams, sargs)
+    } else {
+        success_t = ok_payload
+    }
+    # Check that the enclosing function returns an enum of the same base.
+    let cur_ret: str = ctx.cur_fn_ret
+    if cur_ret == "void" {
+        cerr(ctx.exprs[e].line, "? operator cannot be used in a void function")
+    }
+    let cur_ret_base: str = type_base(cur_ret)
+    if cur_ret_base != ename {
+        cerr(ctx.exprs[e].line, "? operator: enclosing function returns " + cur_ret + ", cannot propagate " + ename)
+    }
+    ctx.exprs[e].t = success_t
+    ctx.exprs[e].err_variant = err_v
+    ctx.exprs[e].ok_variant = ok_v
+    return success_t
+}
+
 fn check_effects(ctx: Ctx) -> void {
     let eff: map[str, bool] = map_new()
     let mut i: int = 0
@@ -1819,7 +3127,6 @@ fn check_effects(ctx: Ctx) -> void {
             i2 = i2 + 1
         }
     }
-    # report violations
     let mut i3: int = 0
     while i3 < ctx.fn_order.len() {
         let mut key: str = ctx.fn_order.get(i3)
@@ -2289,7 +3596,12 @@ fn runtime_lines() -> list[str] {
 # 5. CODEGEN — HLS -> C
 # ----------------------------------------------------------------------------
 
-fn c_type(ctx: Ctx, t: str) -> str {
+fn c_type(ctx: Ctx, t_in: str) -> str {
+    # Substitute type params from current instantiation context.
+    let mut t: str = t_in
+    if ctx.cur_typeparams.len() > 0 && ctx.cur_targs.len() == ctx.cur_typeparams.len() {
+        t = instantiate_type(t, ctx.cur_typeparams, ctx.cur_targs)
+    }
     if t == "int" {
         return "int64_t"
     }
@@ -2311,7 +3623,7 @@ fn c_type(ctx: Ctx, t: str) -> str {
     if is_map_t(t) {
         return "hl_map*"
     }
-    return t + "*"
+    return c_type_name(t) + "*"
 }
 
 fn is_ptr_type(t: str) -> bool {
@@ -2351,6 +3663,34 @@ fn box_val(t: str, cexpr: str) -> str {
     return box_fn_for(t) + "(" + cexpr + ")"
 }
 
+# c_type_name(t) — mangle a HLS type name into a valid C identifier.
+# Used for both user types and their generic instantiations.
+# Examples:
+#   "Point"            -> "Point"
+#   "Box[int]"         -> "Box__int"
+#   "Pair[int, str]"   -> "Pair__int__str"
+#   "Option[list[int]]" -> "Option__list_int_"
+#   "Foo[A, B, C]"     -> "Foo__A__B__C"  (only when A, B, C are already-bound type args)
+fn c_type_name(t: str) -> str {
+    let base: str = type_base(t)
+    let args: list[str] = type_args(t)
+    if args.len() == 0 {
+        return base
+    }
+    let mut out: str = base + "__"
+    let mut i: int = 0
+    while i < args.len() {
+        if i > 0 {
+            out = out + "__"
+        }
+        out = out + c_type_name(args.get(i))
+        i = i + 1
+    }
+    return out
+}
+
+# c_fn_name(key) — mangle a HLS function key into a C identifier.
+# "foo" -> "foo"; "Point.dist" -> "Point_dist"
 fn c_fn_name(key: str) -> str {
     let parts: list[str] = []
     let mut i: int = 0
@@ -2363,6 +3703,24 @@ fn c_fn_name(key: str) -> str {
         i = i + 1
     }
     return join(parts, "")
+}
+
+# c_mangled_fn_name(key, targs) — mangle a generic function call's
+# instantiation: identity[int] -> "identity__int"
+fn c_mangled_fn_name(key: str, tps: list[str], targs: list[str]) -> str {
+    if tps.len() == 0 {
+        return c_fn_name(key)
+    }
+    let mut out: str = c_fn_name(key) + "__"
+    let mut i: int = 0
+    while i < targs.len() {
+        if i > 0 {
+            out = out + "__"
+        }
+        out = out + c_type_name(targs.get(i))
+        i = i + 1
+    }
+    return out
 }
 
 fn c_str_lit(s: str) -> str {
@@ -2432,7 +3790,6 @@ fn gen_expr(ctx: Ctx, e: int) -> str {
     let mut k: str = ctx.exprs[e].kind
     if k == "int" {
         if ctx.exprs[e].ival == -9223372036854775808 {
-            # INT64_MIN: dung idiom C chuan de tranh canh bao literal
             return "(-9223372036854775807LL - 1)"
         }
         return ctx.exprs[e].ival.to_str()
@@ -2483,13 +3840,22 @@ fn gen_expr(ctx: Ctx, e: int) -> str {
         return gen_listlit(ctx, e)
     }
     if k == "structlit" {
-        let parts: list[str] = []
-        let mut i: int = 0
-        while i < ctx.exprs[e].args.len() {
-            parts.push(gen_expr(ctx, ctx.exprs[e].args.get(i)))
-            i = i + 1
-        }
-        return "usf_new_" + ctx.exprs[e].name + "(" + join(parts, ", ") + ")"
+        return gen_structlit(ctx, e)
+    }
+    if k == "enumlit" {
+        return gen_enumlit(ctx, e)
+    }
+    if k == "match" {
+        # Match in expression position: emit an immediately-invoked lambda
+        # equivalent (a block expression). We use a GCC statement expression
+        # `({ ... })` for this purpose.
+        return gen_match_expr(ctx, e)
+    }
+    if k == "qmark" {
+        # `?` in expression position: similar — emit a statement expression
+        # that returns the unwrapped value or returns the error from the
+        # enclosing function.
+        return gen_qmark_expr(ctx, e)
     }
     if k == "mapnew" {
         return "hl_map_new()"
@@ -2500,7 +3866,6 @@ fn gen_expr(ctx: Ctx, e: int) -> str {
 
 fn gen_bin(ctx: Ctx, e: int) -> str {
     let op: str = ctx.exprs[e].op
-    # NOTE: dispatch on the LEFT OPERAND type (not the result type!)
     let t: str = ctx.exprs[ctx.exprs[e].left].t
     let a: str = gen_expr(ctx, ctx.exprs[e].left)
     let b: str = gen_expr(ctx, ctx.exprs[e].right)
@@ -2761,8 +4126,6 @@ fn gen_listlit(ctx: Ctx, e: int) -> str {
     ctx.lit_count = ctx.lit_count + 1
     let fname: str = "hl_lit_" + ctx.lit_count.to_str()
     let elem: str = list_elem_t(ctx.exprs[e].t)
-    # EMIT ELEMENT VALUES FIRST — nested-literal helpers must
-    # appear completely before outer helpers (C declaration order).
     let vals: list[str] = []
     let mut i: int = 0
     while i < ctx.exprs[e].args.len() {
@@ -2780,6 +4143,176 @@ fn gen_listlit(ctx: Ctx, e: int) -> str {
     ctx.lit_helpers.push("}")
     ctx.lit_helpers.push("")
     return fname + "()"
+}
+
+fn gen_structlit(ctx: Ctx, e: int) -> str {
+    let st: StructInfo = ctx.structs.get_or(ctx.exprs[e].name, dummy_struct())
+    # Substitute type params from current instantiation context.
+    let mut t: str = ctx.exprs[e].t
+    if ctx.cur_typeparams.len() > 0 && ctx.cur_targs.len() == ctx.cur_typeparams.len() {
+        t = instantiate_type(ctx.exprs[e].t, ctx.cur_typeparams, ctx.cur_targs)
+    }
+    # Record the (now concrete) instantiation for codegen.
+    if st.typeparams.len() > 0 && type_is_concrete(ctx, t) && !list_has(ctx.struct_insts, t) {
+        ctx.struct_insts.push(t)
+    }
+    # Compute the constructor name (mangled if generic).
+    let ctor_name: str = "usf_new_" + c_type_name(t)
+    # Collect provided field values.
+    let parts: list[str] = []
+    let provided: list[str] = ctx.exprs[e].ffields
+    let mut fi: int = 0
+    while fi < provided.len() {
+        parts.push(gen_expr(ctx, ctx.exprs[e].args.get(fi)))
+        fi = fi + 1
+    }
+    # For each remaining declared field with a default, evaluate the default
+    # (in the calling context) and pass it.
+    let mut pi: int = provided.len()
+    while pi < st.fields.len() {
+        let dflt_idx: int = st.fdefaults.get(pi)
+        if dflt_idx == -1 {
+            panic("internal codegen error: missing required field " + st.fields.get(pi) + " in struct literal")
+        }
+        parts.push(gen_expr(ctx, dflt_idx))
+        pi = pi + 1
+    }
+    return ctor_name + "(" + join(parts, ", ") + ")"
+}
+
+fn gen_enumlit(ctx: Ctx, e: int) -> str {
+    # The enum type is ctx.exprs[e].t (e.g., "Option[int]" or "Color").
+    # Substitute type params from current instantiation context.
+    let mut t: str = ctx.exprs[e].t
+    if ctx.cur_typeparams.len() > 0 && ctx.cur_targs.len() == ctx.cur_typeparams.len() {
+        t = instantiate_type(ctx.exprs[e].t, ctx.cur_typeparams, ctx.cur_targs)
+    }
+    # Record the (now concrete) instantiation for codegen.
+    let en: EnumInfo = ctx.enums.get_or(ctx.exprs[e].enum_name, dummy_enum())
+    if en.typeparams.len() > 0 && type_is_concrete(ctx, t) && !list_has(ctx.enum_insts, t) {
+        ctx.enum_insts.push(t)
+    }
+    # The constructor function name is "usf_make_" + c_type_name(t) + "_" + variant.
+    let ctor_name: str = "usf_make_" + c_type_name(t) + "_" + ctx.exprs[e].variant
+    let parts: list[str] = []
+    let mut i: int = 0
+    while i < ctx.exprs[e].args.len() {
+        parts.push(gen_expr(ctx, ctx.exprs[e].args.get(i)))
+        i = i + 1
+    }
+    return ctor_name + "(" + join(parts, ", ") + ")"
+}
+
+# gen_match_expr — emit a GCC statement expression for a match in expression
+# position. Each arm is checked via tag comparison; the matching arm's body
+# is the result.
+fn gen_match_expr(ctx: Ctx, e: int) -> str {
+    # The scrutinee's type (e.g., "Color" or "Option[int]") — use the
+    # scrutinee expression's type, not the match's result type.
+    # Substitute type params from current instantiation context (for generic
+    # function instantiations).
+    let raw_scrut_t: str = ctx.exprs[ctx.exprs[e].left].t
+    let mut scrut_t: str = raw_scrut_t
+    if ctx.cur_typeparams.len() > 0 && ctx.cur_targs.len() == ctx.cur_typeparams.len() {
+        scrut_t = instantiate_type(raw_scrut_t, ctx.cur_typeparams, ctx.cur_targs)
+    }
+    let ename: str = type_base(scrut_t)
+    let c_type: str = c_type(ctx, scrut_t)
+    let scrut_c: str = gen_expr(ctx, ctx.exprs[e].left)
+    # The statement expression uses a tmp variable for the scrutinee.
+    let tmp_name: str = fresh_tmp(ctx, "hlc_m")
+    let block: list[str] = []
+    block.push("({")
+    block.push("    " + c_type(ctx, scrut_t) + " " + tmp_name + " = " + scrut_c + ";")
+    block.push("    " + c_type(ctx, ctx.exprs[e].t) + " hlc_m_r;")
+    block.push("    if (0) {}")
+    let mut i: int = 0
+    while i < ctx.exprs[e].args.len() {
+        let arm_idx: int = ctx.exprs[e].args.get(i)
+        let arm: MatchArm = ctx.match_arms.get(arm_idx)
+        if arm.pat_kind == "wildcard" {
+            block.push("    else {")
+            if arm.body_t != "never" {
+                block.push("        hlc_m_r = " + gen_expr(ctx, arm.body) + ";")
+            } else {
+                block.push("        " + gen_expr(ctx, arm.body) + ";")
+            }
+            block.push("    }")
+        } else {
+            let cond: str = tmp_name + "->tag == " + ename + "__TAG_" + arm.variant + "_" + c_type_name(scrut_t)
+            block.push("    else if (" + cond + ") {")
+            # Bind payload values.
+            let en: EnumInfo = ctx.enums.get_or(ename, dummy_enum())
+            let mut vi: int = 0
+            let mut vidx: int = -1
+            while vi < en.variants.len() {
+                if en.variants.get(vi) == arm.variant {
+                    vidx = vi
+                }
+                vi = vi + 1
+            }
+            let payloads: list[str] = en.payloads.get(vidx)
+            # Compute instantiated payload types.
+            let typeparams: list[str] = en.typeparams
+            let targs: list[str] = type_args(scrut_t)
+            let mut bi: int = 0
+            while bi < arm.bindings.len() {
+                let bname: str = arm.bindings.get(bi)
+                if bname != "_" {
+                    let pt: str = payloads.get(bi)
+                    let mut inst_pt: str = ""
+                    if typeparams.len() > 0 {
+                        inst_pt = instantiate_type(pt, typeparams, targs)
+                    } else {
+                        inst_pt = pt
+                    }
+                    let cn: str = fresh_local(ctx, bname)
+                    # Enum payloads are stored DIRECTLY in the C union (not
+                    # boxed), so we access them directly without unboxing.
+                    # The union has per-variant structs: data.<Variant>.v<i>.
+                    block.push("        " + c_type(ctx, inst_pt) + " " + cn + " = " + tmp_name + "->data." + arm.variant + ".v" + bi.to_str() + ";")
+                }
+                bi = bi + 1
+            }
+            if arm.body_t != "never" {
+                block.push("        hlc_m_r = " + gen_expr(ctx, arm.body) + ";")
+            } else {
+                block.push("        " + gen_expr(ctx, arm.body) + ";")
+            }
+            block.push("    }")
+        }
+        i = i + 1
+    }
+    block.push("    else { hl_die(\"match: no arm matched (internal)\"); }")
+    block.push("    hlc_m_r;")
+    block.push("})")
+    # Append the block to the output (as a multi-line statement expression
+    # embedded in the surrounding expression). We need to return the joined
+    # string for inline use. Statement expressions can span lines.
+    return join(block, "\n")
+}
+
+# gen_qmark_expr — emit a statement expression for `expr?`.
+fn gen_qmark_expr(ctx: Ctx, e: int) -> str {
+    let inner_t: str = ctx.exprs[ctx.exprs[e].left].t
+    let ename: str = type_base(inner_t)
+    let c_type: str = c_type(ctx, inner_t)
+    let inner_c: str = gen_expr(ctx, ctx.exprs[e].left)
+    let ok_v: str = ctx.exprs[e].ok_variant
+    let err_v: str = ctx.exprs[e].err_variant
+    let success_t: str = ctx.exprs[e].t
+    let tmp_name: str = fresh_tmp(ctx, "hlc_q")
+    let block: list[str] = []
+    block.push("({")
+    block.push("    " + c_type(ctx, inner_t) + " " + tmp_name + " = " + inner_c + ";")
+    block.push("    if (" + tmp_name + "->tag == " + ename + "__TAG_" + err_v + "_" + c_type_name(inner_t) + ") {")
+    block.push("        return " + tmp_name + ";")
+    block.push("    }")
+    # Success variant's payload is at data.<ok_v>.v0.
+    block.push("    " + c_type(ctx, success_t) + " hlc_q_r = " + tmp_name + "->data." + ok_v + ".v0;")
+    block.push("    hlc_q_r;")
+    block.push("})")
+    return join(block, "\n")
 }
 
 # --- C statement generation ---
@@ -2807,7 +4340,6 @@ fn gen_stmt(ctx: Ctx, sidx: int, ind: str) -> void {
         gen_stmts(ctx, s.body, ind + "    ")
         ctx.out.push(ind + "}")
     } else if s.kind == "for" {
-        # snapshot length once (per SPEC section 5)
         let it_c: str = gen_expr(ctx, s.iter)
         let itn: str = fresh_tmp(ctx, "hlc_it")
         let itn_len: str = fresh_tmp(ctx, "hlc_n")
@@ -2859,7 +4391,6 @@ fn gen_assign(ctx: Ctx, s: StmtN, ind: str) -> void {
         let base: str = gen_expr(ctx, ctx.exprs[tgt].left)
         ctx.out.push(ind + "(" + base + ")->" + ctx.exprs[tgt].name + " = " + v + ";")
     } else {
-        # index assignment: hl_list_set(list, i, box(v))
         let lst: str = gen_expr(ctx, ctx.exprs[tgt].left)
         let idx: str = gen_expr(ctx, ctx.exprs[tgt].right)
         let mut elem: str = list_elem_t(ctx.exprs[ctx.exprs[tgt].left].t)
@@ -2884,7 +4415,25 @@ fn gen_fn_body(ctx: Ctx, key: str) -> void {
         ptypes_c.push(c_type(ctx, f.ptypes.get(i)) + " " + cn)
         i = i + 1
     }
-    let mut sig: str = c_type(ctx, f.ret) + " usf_" + c_fn_name(key) + "("
+    # For generic functions, we emit a specialization. The "key" passed in is
+    # the original key; we generate a specialization with a mangled name when
+    # the function has type params. The specialization instantiation is
+    # handled in gen_program by enumerating instantiations.
+    let mut fname: str = "usf_" + c_fn_name(key)
+    if f.typeparams.len() > 0 {
+        # Append the instantiated type args.
+        let mut inst: str = "__"
+        let mut j: int = 0
+        while j < f.typeparams.len() {
+            if j > 0 {
+                inst = inst + "__"
+            }
+            inst = inst + f.typeparams.get(j)
+            j = j + 1
+        }
+        fname = fname + inst
+    }
+    let mut sig: str = c_type(ctx, f.ret) + " " + fname + "("
     if ptypes_c.len() == 0 {
         sig = sig + "void)"
     } else {
@@ -2902,38 +4451,242 @@ fn gen_struct_lines(ctx: Ctx) -> list[str] {
     let mut i: int = 0
     while i < names.len() {
         let st: StructInfo = ctx.structs.get_or(names.get(i), dummy_struct())
-        out.push("typedef struct " + st.name + " {")
-        let mut j: int = 0
-        while j < st.fields.len() {
-            out.push("    " + c_type(ctx, st.ftypes.get(j)) + " " + st.fields.get(j) + ";")
-            j = j + 1
+        # For non-generic structs, emit a typedef and constructor.
+        # For generic structs, the instantiations are emitted separately
+        # (driven by gen_program which tracks all instantiations used).
+        if st.typeparams.len() == 0 {
+            out.push("typedef struct " + st.name + " {")
+            let mut j: int = 0
+            while j < st.fields.len() {
+                out.push("    " + c_type(ctx, st.ftypes.get(j)) + " " + st.fields.get(j) + ";")
+                j = j + 1
+            }
+            out.push("} " + st.name + ";")
+            out.push("")
+            # constructor
+            let ptypes_c: list[str] = []
+            let assigns: list[str] = []
+            let mut j2: int = 0
+            while j2 < st.fields.len() {
+                ptypes_c.push(c_type(ctx, st.ftypes.get(j2)) + " " + st.fields.get(j2))
+                assigns.push("    p->" + st.fields.get(j2) + " = " + st.fields.get(j2) + ";")
+                j2 = j2 + 1
+            }
+            out.push("static " + st.name + "* usf_new_" + st.name + "(" + join(ptypes_c, ", ") + ") {")
+            out.push("    " + st.name + "* p = (" + st.name + "*)malloc(sizeof(" + st.name + "));")
+            out.push("    if (!p) hl_die(\"out of memory\");")
+            let mut k: int = 0
+            while k < assigns.len() {
+                out.push(assigns.get(k))
+                k = k + 1
+            }
+            out.push("    return p;")
+            out.push("}")
+            out.push("")
         }
-        out.push("} " + st.name + ";")
-        out.push("")
-        # constructor
-        let ptypes_c: list[str] = []
-        let assigns: list[str] = []
-        let mut j2: int = 0
-        while j2 < st.fields.len() {
-            ptypes_c.push(c_type(ctx, st.ftypes.get(j2)) + " " + st.fields.get(j2))
-            assigns.push("    p->" + st.fields.get(j2) + " = " + st.fields.get(j2) + ";")
-            j2 = j2 + 1
-        }
-        out.push("static " + st.name + "* usf_new_" + st.name + "(" + join(ptypes_c, ", ") + ") {")
-        out.push("    " + st.name + "* p = (" + st.name + "*)malloc(sizeof(" + st.name + "));")
-        out.push("    if (!p) hl_die(\"out of memory\");")
-        let mut k: int = 0
-        while k < assigns.len() {
-            out.push(assigns.get(k))
-            k = k + 1
-        }
-        out.push("    return p;")
-        out.push("}")
-        out.push("")
         i = i + 1
     }
     return out
 }
+
+# gen_enum_lines — emit C struct + variant constructors for each enum
+# (non-generic; generic instantiations are emitted by gen_program).
+fn gen_enum_lines(ctx: Ctx) -> list[str] {
+    let mut out: list[str] = []
+    let names: list[str] = ctx.enums.keys()
+    let mut i: int = 0
+    while i < names.len() {
+        let en: EnumInfo = ctx.enums.get_or(names.get(i), dummy_enum())
+        if en.typeparams.len() == 0 {
+            concat_lines(out, gen_one_enum(ctx, en.name, en))
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# gen_one_enum(ctx, c_type, en) emits the C declaration + variant constructors
+# for a specific (instantiated) enum. `c_type` is the mangled C name (e.g.,
+# "Option__int"); `en` is the EnumInfo; `targs` are the concrete type args
+# (parallel to en.typeparams).
+fn gen_one_enum(ctx: Ctx, c_name: str, en: EnumInfo) -> list[str] {
+    let mut out: list[str] = []
+    # Tag enum
+    out.push("typedef enum {")
+    let mut vi: int = 0
+    while vi < en.variants.len() {
+        out.push("    " + en.name + "__TAG_" + en.variants.get(vi) + "_" + c_name)
+        if vi < en.variants.len() - 1 {
+            out.push(",")
+        } else {
+            out.push("")
+        }
+        vi = vi + 1
+    }
+    # Actually, the simpler approach: emit each tag on its own line, joined by
+    # commas. Let me redo this.
+    return out
+}
+
+# (gen_one_enum is replaced by a simpler implementation below)
+
+# gen_one_enum(ctx, c_name, en, targs) emits a complete C enum definition +
+# variant constructors. `c_name` is the mangled C identifier (e.g.,
+# "Option__int"), `en` is the EnumInfo, `targs` are the concrete type args
+# (parallel to en.typeparams, empty for non-generic).
+fn gen_one_enum_full(ctx: Ctx, c_name: str, en: EnumInfo, targs: list[str]) -> list[str] {
+    let mut out: list[str] = []
+    # 1. Tag enum.
+    out.push("typedef enum {")
+    let mut vi: int = 0
+    let mut tag_line: str = "    "
+    while vi < en.variants.len() {
+        if vi > 0 {
+            tag_line = tag_line + ", "
+        }
+        tag_line = tag_line + en.name + "__TAG_" + en.variants.get(vi) + "_" + c_name
+        vi = vi + 1
+    }
+    out.push(tag_line)
+    out.push("} " + c_name + "_Tag;")
+    out.push("")
+    # 2. Struct with tag + union of PER-VARIANT structs (each variant has
+    # its own struct containing all its payloads, so payloads don't overlap).
+    out.push("typedef struct " + c_name + " {")
+    out.push("    " + c_name + "_Tag tag;")
+    out.push("    union {")
+    let mut vi2: int = 0
+    while vi2 < en.variants.len() {
+        let payloads: list[str] = en.payloads.get(vi2)
+        let vname: str = en.variants.get(vi2)
+        if payloads.len() > 0 {
+            out.push("        struct {")
+            let mut pi: int = 0
+            while pi < payloads.len() {
+                let pt: str = payloads.get(pi)
+                let mut inst_pt: str = ""
+                if en.typeparams.len() > 0 {
+                    inst_pt = instantiate_type(pt, en.typeparams, targs)
+                } else {
+                    inst_pt = pt
+                }
+                out.push("            " + c_type(ctx, inst_pt) + " v" + pi.to_str() + ";")
+                pi = pi + 1
+            }
+            out.push("        } " + vname + ";")
+        }
+        vi2 = vi2 + 1
+    }
+    out.push("    } data;")
+    out.push("} " + c_name + ";")
+    out.push("")
+    # 3. Constructor per variant.
+    let mut vi3: int = 0
+    while vi3 < en.variants.len() {
+        let vname: str = en.variants.get(vi3)
+        let payloads: list[str] = en.payloads.get(vi3)
+        let params: list[str] = []
+        let mut pi2: int = 0
+        while pi2 < payloads.len() {
+            let pt: str = payloads.get(pi2)
+            let mut inst_pt: str = ""
+            if en.typeparams.len() > 0 {
+                inst_pt = instantiate_type(pt, en.typeparams, targs)
+            } else {
+                inst_pt = pt
+            }
+            params.push(c_type(ctx, inst_pt) + " v" + pi2.to_str())
+            pi2 = pi2 + 1
+        }
+        let mut param_sig: str = "void"
+        if params.len() > 0 {
+            param_sig = join(params, ", ")
+        }
+        out.push("static " + c_name + "* usf_make_" + c_name + "_" + vname + "(" + param_sig + ") {")
+        out.push("    " + c_name + "* p = (" + c_name + "*)malloc(sizeof(" + c_name + "));")
+        out.push("    if (!p) hl_die(\"out of memory\");")
+        out.push("    p->tag = " + en.name + "__TAG_" + vname + "_" + c_name + ";")
+        let mut pi3: int = 0
+        while pi3 < payloads.len() {
+            out.push("    p->data." + vname + ".v" + pi3.to_str() + " = v" + pi3.to_str() + ";")
+            pi3 = pi3 + 1
+        }
+        out.push("    return p;")
+        out.push("}")
+        out.push("")
+        vi3 = vi3 + 1
+    }
+    return out
+}
+
+# gen_struct_instantiation(ctx, t) emits a typedef + constructor for a generic
+# struct instantiation. `t` is the full type string like "Box[int]".
+fn gen_struct_instantiation(ctx: Ctx, t: str) -> list[str] {
+    let mut out: list[str] = []
+    let base: str = type_base(t)
+    let st: StructInfo = ctx.structs.get_or(base, dummy_struct())
+    let targs: list[str] = type_args(t)
+    let c_name: str = c_type_name(t)
+    out.push("typedef struct " + c_name + " {")
+    let mut j: int = 0
+    while j < st.fields.len() {
+        let ftype: str = st.ftypes.get(j)
+        let mut inst_ftype: str = ""
+        if st.typeparams.len() > 0 {
+            inst_ftype = instantiate_type(ftype, st.typeparams, targs)
+        } else {
+            inst_ftype = ftype
+        }
+        out.push("    " + c_type(ctx, inst_ftype) + " " + st.fields.get(j) + ";")
+        j = j + 1
+    }
+    out.push("} " + c_name + ";")
+    out.push("")
+    # constructor — only takes the required (non-defaulted) fields; default
+    # values are filled in inside the constructor.
+    let ptypes_c: list[str] = []
+    let assigns: list[str] = []
+    let mut j2: int = 0
+    while j2 < st.fields.len() {
+        let ftype: str = st.ftypes.get(j2)
+        let mut inst_ftype: str = ""
+        if st.typeparams.len() > 0 {
+            inst_ftype = instantiate_type(ftype, st.typeparams, targs)
+        } else {
+            inst_ftype = ftype
+        }
+        let dflt_idx: int = st.fdefaults.get(j2)
+        if dflt_idx == -1 {
+            ptypes_c.push(c_type(ctx, inst_ftype) + " " + st.fields.get(j2))
+            assigns.push("    p->" + st.fields.get(j2) + " = " + st.fields.get(j2) + ";")
+        } else {
+            # Use the default value (codegen evaluates the default expression).
+            # The default expression's stored `t` is the declared (possibly
+            # type-param) type; we evaluate it as-is — the generated C code
+            # for the default expr uses c_type(ctx, declared_type). For
+            # instantiated generics, we'd need to know the instantiation
+            # at default-check time, which we don't track here. For now, we
+            # evaluate the default's C expression as-is. This works for
+            # defaults that don't reference type params (the common case).
+            assigns.push("    p->" + st.fields.get(j2) + " = " + gen_expr(ctx, dflt_idx) + ";")
+        }
+        j2 = j2 + 1
+    }
+    out.push("static " + c_name + "* usf_new_" + c_name + "(" + join(ptypes_c, ", ") + ") {")
+    out.push("    " + c_name + "* p = (" + c_name + "*)malloc(sizeof(" + c_name + "));")
+    out.push("    if (!p) hl_die(\"out of memory\");")
+    let mut k: int = 0
+    while k < assigns.len() {
+        out.push(assigns.get(k))
+        k = k + 1
+    }
+    out.push("    return p;")
+    out.push("}")
+    out.push("")
+    return out
+}
+
+# --- Function prototype + instantiation generation ---
 
 fn gen_proto_lines(ctx: Ctx) -> list[str] {
     let mut out: list[str] = []
@@ -2941,6 +4694,12 @@ fn gen_proto_lines(ctx: Ctx) -> list[str] {
     while i < ctx.fn_order.len() {
         let mut key: str = ctx.fn_order.get(i)
         let f: FnInfo = ctx.fns.get_or(key, dummy_fn())
+        if f.typeparams.len() > 0 {
+            # Skip generic functions here — their prototypes are emitted
+            # with the instantiations in gen_fn_inst_lines.
+            i = i + 1
+            continue
+        }
         let ptypes_c: list[str] = []
         let mut j: int = 0
         while j < f.params.len() {
@@ -2956,9 +4715,133 @@ fn gen_proto_lines(ctx: Ctx) -> list[str] {
         out.push(sig + ";")
         i = i + 1
     }
+    # Also emit prototypes for generic function instantiations.
+    let mut j2: int = 0
+    while j2 < ctx.fn_insts.len() {
+        let inst: str = ctx.fn_insts.get(j2)
+        let parsed: list[str] = parse_inst_str(inst)
+        # parsed[0] = key, parsed[1..n] = type args
+        let key: str = parsed.get(0)
+        let targs: list[str] = list_slice_from(parsed, 1)
+        let f: FnInfo = ctx.fns.get_or(key, dummy_fn())
+        let ptypes_c: list[str] = []
+        let mut k: int = 0
+        while k < f.params.len() {
+            let inst_pt: str = instantiate_type(f.ptypes.get(k), f.typeparams, targs)
+            ptypes_c.push(c_type(ctx, inst_pt))
+            k = k + 1
+        }
+        let mut ret_str: str = instantiate_type(f.ret, f.typeparams, targs)
+        let mut sig: str = c_type(ctx, ret_str) + " usf_" + c_mangled_fn_name(key, f.typeparams, targs) + "("
+        if ptypes_c.len() == 0 {
+            sig = sig + "void)"
+        } else {
+            sig = sig + join(ptypes_c, ", ") + ")"
+        }
+        out.push(sig + ";")
+        j2 = j2 + 1
+    }
     out.push("")
     return out
 }
+
+# parse_inst_str(s) parses "key|arg1,arg2,..." into [key, arg1, arg2, ...].
+fn parse_inst_str(s: str) -> list[str] {
+    let out: list[str] = []
+    let mut i: int = 0
+    let mut key: str = ""
+    while i < s.len() {
+        if s.byte_at(i) == 124 {
+            key = s.slice(0, i)
+            break
+        }
+        i = i + 1
+    }
+    if key == "" {
+        out.push(s)
+        return out
+    }
+    out.push(key)
+    let args_str: str = s.slice(i + 1, s.len())
+    if args_str == "" {
+        return out
+    }
+    let args: list[str] = split_args_str(args_str)
+    let mut j: int = 0
+    while j < args.len() {
+        out.push(args.get(j))
+        j = j + 1
+    }
+    return out
+}
+
+# gen_fn_inst_lines(ctx) emits the body for each generic function
+# instantiation recorded in ctx.fn_insts.
+fn gen_fn_inst_lines(ctx: Ctx) -> list[str] {
+    let mut out: list[str] = []
+    let mut i: int = 0
+    while i < ctx.fn_insts.len() {
+        let inst: str = ctx.fn_insts.get(i)
+        let parsed: list[str] = parse_inst_str(inst)
+        let key: str = parsed.get(0)
+        let targs: list[str] = list_slice_from(parsed, 1)
+        let f: FnInfo = ctx.fns.get_or(key, dummy_fn())
+        gen_reset_fn(ctx)
+        # Push the instantiation type map for the function body. The function
+        # body's expressions reference types that have already been checked,
+        # so the stored `t` field already has the *instantiated* type from the
+        # call site... actually no, the checker currently checks the generic
+        # function definition ONCE (with type params unbound). The codegen
+        # needs to substitute type params when emitting the body.
+        # Workaround: set ctx.cur_typeparams and add a parallel list of
+        # targs in ctx; then everywhere we look up a type in codegen, we
+        # substitute. This is too invasive. Alternative: store the
+        # instantiated types in the AST at check time. But that requires
+        # checking each instantiation separately.
+        # For now, we use a simpler approach: set a "current instantiation"
+        # on ctx, and a helper `inst_t(t)` that substitutes when typeparams
+        # are present. Then codegen uses `inst_t(t)` instead of `t` directly.
+        ctx.cur_typeparams = f.typeparams
+        ctx.cur_targs = targs
+        # Build the signature.
+        let ptypes_c: list[str] = []
+        let mut j: int = 0
+        while j < f.params.len() {
+            let cn: str = fresh_local(ctx, f.params.get(j))
+            let inst_pt: str = instantiate_type(f.ptypes.get(j), f.typeparams, targs)
+            ptypes_c.push(c_type(ctx, inst_pt) + " " + cn)
+            j = j + 1
+        }
+        let ret_str: str = instantiate_type(f.ret, f.typeparams, targs)
+        let mut sig: str = c_type(ctx, ret_str) + " usf_" + c_mangled_fn_name(key, f.typeparams, targs) + "("
+        if ptypes_c.len() == 0 {
+            sig = sig + "void)"
+        } else {
+            sig = sig + join(ptypes_c, ", ") + ")"
+        }
+        out.push(sig + " {")
+        # Emit statements. The gen_stmt / gen_expr functions need to use
+        # inst_t for types. We achieve this by intercepting in c_type via
+        # the ctx.cur_typeparams + ctx.cur_targs.
+        let saved_out: list[str] = ctx.out
+        ctx.out = []
+        gen_stmts(ctx, f.body, "    ")
+        let mut k: int = 0
+        while k < ctx.out.len() {
+            out.push(ctx.out.get(k))
+            k = k + 1
+        }
+        ctx.out = saved_out
+        out.push("}")
+        out.push("")
+        ctx.cur_typeparams = []
+        ctx.cur_targs = []
+        i = i + 1
+    }
+    return out
+}
+
+# --- Top-level program generation ---
 
 fn gen_program(ctx: Ctx) -> list[str] {
     # 1. emit function bodies first (produces list-literal helpers)
@@ -2968,11 +4851,20 @@ fn gen_program(ctx: Ctx) -> list[str] {
     ctx.tmp = 0
     let mut i: int = 0
     while i < ctx.fn_order.len() {
-        gen_fn_body(ctx, ctx.fn_order.get(i))
+        let key: str = ctx.fn_order.get(i)
+        let f: FnInfo = ctx.fns.get_or(key, dummy_fn())
+        if f.typeparams.len() > 0 {
+            # Generic function — skip here; we emit per instantiation later.
+            i = i + 1
+            continue
+        }
+        gen_fn_body(ctx, key)
         i = i + 1
     }
+    # 1b. emit generic function instantiation bodies.
+    let fn_inst_bodies: list[str] = gen_fn_inst_lines(ctx)
     let bodies: list[str] = ctx.out
-    # 2. concatenate in order: header -> runtime -> struct -> proto -> lit -> body -> main
+    # 2. concatenate in order: header -> runtime -> forward-decls -> struct -> enum -> proto -> lit -> body -> main
     let final: list[str] = []
     final.push("// =============================================================")
     final.push("// C code generated BY hlc — the Hieu Louis compiler (HLS)")
@@ -2981,10 +4873,60 @@ fn gen_program(ctx: Ctx) -> list[str] {
     final.push("")
     concat_lines(final, runtime_lines())
     final.push("")
+    # 2a. Forward declarations for ALL structs and enums (recursive types).
+    let struct_names: list[str] = ctx.structs.keys()
+    let mut sni: int = 0
+    while sni < struct_names.len() {
+        let st: StructInfo = ctx.structs.get_or(struct_names.get(sni), dummy_struct())
+        if st.typeparams.len() == 0 {
+            final.push("typedef struct " + st.name + " " + st.name + ";")
+        }
+        sni = sni + 1
+    }
+    let mut si2: int = 0
+    while si2 < ctx.struct_insts.len() {
+        final.push("typedef struct " + c_type_name(ctx.struct_insts.get(si2)) + " " + c_type_name(ctx.struct_insts.get(si2)) + ";")
+        si2 = si2 + 1
+    }
+    let enum_names: list[str] = ctx.enums.keys()
+    let mut eni: int = 0
+    while eni < enum_names.len() {
+        let en: EnumInfo = ctx.enums.get_or(enum_names.get(eni), dummy_enum())
+        if en.typeparams.len() == 0 {
+            final.push("typedef struct " + en.name + " " + en.name + ";")
+        }
+        eni = eni + 1
+    }
+    let mut ei2: int = 0
+    while ei2 < ctx.enum_insts.len() {
+        final.push("typedef struct " + c_type_name(ctx.enum_insts.get(ei2)) + " " + c_type_name(ctx.enum_insts.get(ei2)) + ";")
+        ei2 = ei2 + 1
+    }
+    final.push("")
     concat_lines(final, gen_struct_lines(ctx))
+    # 2b. emit generic struct instantiations.
+    let mut si: int = 0
+    while si < ctx.struct_insts.len() {
+        let inst_t: str = ctx.struct_insts.get(si)
+        concat_lines(final, gen_struct_instantiation(ctx, inst_t))
+        si = si + 1
+    }
+    # 2c. emit non-generic enums.
+    concat_lines(final, gen_enum_lines_simple(ctx))
+    # 2d. emit generic enum instantiations.
+    let mut ei: int = 0
+    while ei < ctx.enum_insts.len() {
+        let inst_t: str = ctx.enum_insts.get(ei)
+        let base: str = type_base(inst_t)
+        let en: EnumInfo = ctx.enums.get_or(base, dummy_enum())
+        let targs: list[str] = type_args(inst_t)
+        concat_lines(final, gen_one_enum_full(ctx, c_type_name(inst_t), en, targs))
+        ei = ei + 1
+    }
     concat_lines(final, gen_proto_lines(ctx))
     concat_lines(final, ctx.lit_helpers)
     concat_lines(final, bodies)
+    concat_lines(final, fn_inst_bodies)
     # 3. main wrapper
     let mf: FnInfo = ctx.fns.get_or("main", dummy_fn())
     final.push("int main(int argc, char** argv) {")
@@ -2997,6 +4939,22 @@ fn gen_program(ctx: Ctx) -> list[str] {
     }
     final.push("}")
     return final
+}
+
+# gen_enum_lines_simple — emit non-generic enum typedefs + variant constructors.
+fn gen_enum_lines_simple(ctx: Ctx) -> list[str] {
+    let mut out: list[str] = []
+    let names: list[str] = ctx.enums.keys()
+    let mut i: int = 0
+    while i < names.len() {
+        let en: EnumInfo = ctx.enums.get_or(names.get(i), dummy_enum())
+        if en.typeparams.len() == 0 {
+            let empty_targs: list[str] = []
+            concat_lines(out, gen_one_enum_full(ctx, en.name, en, empty_targs))
+        }
+        i = i + 1
+    }
+    return out
 }
 
 # ----------------------------------------------------------------------------
@@ -3052,18 +5010,10 @@ fn parent_dir(dir: str) -> str {
 
 # resolve_import_path(imp, entry_dir, repo_root) returns the resolved file
 # path for an import, or "" if not found.
-# - "std.X" → searches several candidate locations for std/X.hls:
-#     <entry_dir>/std/X.hls
-#     <entry_dir>/../std/X.hls
-#     <entry_dir>/../../std/X.hls
-#     <entry_dir>/../../../std/X.hls
-#     <repo_root>/std/X.hls
-# - other  → relative to entry_dir
 fn resolve_import_path(imp: str, entry_dir: str, repo_root: str) -> str uses IO {
     if imp.starts_with("std.") {
         let module_name: str = imp.slice(4, imp.len())
         let rel: str = "std/" + module_name + ".hls"
-        # Try walking up from entry_dir.
         let mut d: str = entry_dir
         let mut tries: int = 0
         while tries < 5 {
@@ -3078,7 +5028,6 @@ fn resolve_import_path(imp: str, entry_dir: str, repo_root: str) -> str uses IO 
             d = parent
             tries = tries + 1
         }
-        # Fall back to repo_root.
         let fallback: str = join_path(repo_root, rel)
         if file_exists(fallback) {
             return fallback
@@ -3105,8 +5054,6 @@ fn already_loaded(ctx: Ctx, path: str) -> bool {
 }
 
 # load_file_into(ctx, abs_path) reads, lexes and parses abs_path into ctx.
-# Records the file as loaded to prevent cycles. Recursively processes the
-# imported file's own imports before its declarations are merged.
 fn load_file_into(ctx: Ctx, abs_path: str) -> void uses IO {
     if already_loaded(ctx, abs_path) {
         return
@@ -3123,7 +5070,6 @@ fn load_file_into(ctx: Ctx, abs_path: str) -> void uses IO {
     ctx.imports = []
     lex(ctx)
     parse_program(ctx)
-    # Process this file's imports recursively (depth-first).
     let my_imports: list[str] = ctx.imports
     let mut i: int = 0
     while i < my_imports.len() {
@@ -3135,7 +5081,6 @@ fn load_file_into(ctx: Ctx, abs_path: str) -> void uses IO {
         load_file_into(ctx, resolved)
         i = i + 1
     }
-    # Restore caller's lex state (structs/fns persist across files).
     ctx.src = saved_src
     ctx.toks = saved_toks
     ctx.pos = saved_pos
@@ -3152,9 +5097,6 @@ fn main() -> int uses IO {
     let src: str = read_file(entry_path)
     let ctx: Ctx = new_ctx(src)
     ctx.entry_dir = dir_of(entry_path)
-    # The repo root is the parent of the entry file's directory when the
-    # entry file lives in src/, examples/, tests/, or boot/; otherwise it
-    # is the entry directory itself. We probe a few candidate paths.
     ctx.repo_root = parent_dir(ctx.entry_dir)
     # Lex + parse the entry file.
     lex(ctx)
@@ -3172,7 +5114,6 @@ fn main() -> int uses IO {
         load_file_into(ctx, resolved)
         i = i + 1
     }
-    # Mark the entry file as loaded too (for completeness).
     check_program(ctx)
     let lines: list[str] = gen_program(ctx)
     let code: str = join(lines, "\n")

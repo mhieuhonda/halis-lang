@@ -3,10 +3,11 @@
 KEYWORDS = {
     "fn", "let", "mut", "return", "if", "else", "while", "for", "in",
     "break", "continue", "struct", "impl", "import", "uses", "true", "false",
+    "enum", "match",
 }
 
-TWO_CHAR = ("->", "==", "!=", "<=", ">=", "&&", "||")
-ONE_CHAR = set("(){}[],:.<>+-*/%!=")
+TWO_CHAR = ("->", "==", "!=", "<=", ">=", "&&", "||", "=>")
+ONE_CHAR = set("(){}[],:.<>+-*/%!=?")
 
 
 class HLError(Exception):

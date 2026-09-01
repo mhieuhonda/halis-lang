@@ -106,13 +106,17 @@ def load_program(entry_path):
 
     # Merge all loaded programs into one. Earlier-loaded files (dependencies)
     # appear first; the entry file appears last.
-    merged = {"structs": {}, "fns": {}, "imports": []}
+    merged = {"structs": {}, "enums": {}, "fns": {}, "imports": []}
     for abs_path in load_order:
         prog = loaded[abs_path]
         for sname, sdef in prog["structs"].items():
             if sname in merged["structs"]:
                 raise HLError("duplicate struct across modules: %s" % sname, 0, 0)
             merged["structs"][sname] = sdef
+        for ename, edef in prog["enums"].items():
+            if ename in merged["enums"] or ename in merged["structs"]:
+                raise HLError("duplicate enum across modules: %s" % ename, 0, 0)
+            merged["enums"][ename] = edef
         for fname, fdef in prog["fns"].items():
             if fname in merged["fns"]:
                 raise HLError("duplicate function across modules: %s" % fname, 0, 0)

@@ -1,9 +1,14 @@
-"""Stage-0 type checker & effects analyzer for HLS. Conforms to SPEC.md sections 3-9.
+"""Stage-0 type checker & effects analyzer for HLS. Conforms to SPEC.md
+sections 3-12 (v0.3) — adds enum, match, generics monomorphisation, the `?`
+operator, and struct default field values.
 
 Side effect: annotates the AST so the evaluator can run quickly:
   - every expression has e['t'] = type (or 'never')
   - e['rc'] = ('user', key) | ('builtin', name) for function calls
   - e['rm'] = ('user', key) | ('builtin', op) for method calls
+  - enum literals are rewritten in-place: e['k'] = 'enumlit',
+    e['enum_name'], e['variant'], e['args'] (instantiated payloads)
+  - match arms have arm['body_t'] = arm body type
   - program['edges'] = {fn_key: set(callees)} for effects analysis
 """
 from .lexer import HLError
@@ -25,6 +30,86 @@ def is_map(t):
 
 def map_val(t):
     return t[9:-1]
+
+
+def split_type_args(s):
+    """Split a comma-separated list of type strings, respecting nested [ ]."""
+    if s == "":
+        return []
+    parts = []
+    depth = 0
+    start = 0
+    i = 0
+    while i < len(s):
+        c = s[i]
+        if c == "[":
+            depth += 1
+        elif c == "]":
+            depth -= 1
+        elif c == "," and depth == 0:
+            parts.append(s[start:i].strip())
+            start = i + 1
+        i += 1
+    parts.append(s[start:].strip())
+    return parts
+
+
+def type_base(t):
+    """For a type string, return the head identifier (before any `[`)."""
+    if "[" in t:
+        return t[: t.index("[")]
+    return t
+
+
+def type_args(t):
+    """For an instantiated type, return the list of type-arg strings."""
+    if "[" not in t:
+        return []
+    idx = t.index("[")
+    return split_type_args(t[idx + 1: -1])
+
+
+def instantiate_type(t, type_map):
+    """Substitute type parameters in `t` according to `type_map`."""
+    if t in type_map:
+        return type_map[t]
+    if t in ("int", "float", "bool", "str", "void"):
+        return t
+    if is_list(t):
+        return "list[" + instantiate_type(list_elem(t), type_map) + "]"
+    if is_map(t):
+        return "map[str, " + instantiate_type(map_val(t), type_map) + "]"
+    if "[" in t and t.endswith("]"):
+        base = type_base(t)
+        args = type_args(t)
+        new_args = [instantiate_type(a, type_map) for a in args]
+        return base + "[" + ", ".join(new_args) + "]"
+    return t
+
+
+def unify(pt, at, typeparams, type_map):
+    """Match a parameter type `pt` against an argument type `at`, binding
+    any type params in `typeparams` to concrete types in `type_map`."""
+    if pt in typeparams:
+        if pt in type_map and type_map[pt] != at:
+            return False
+        type_map[pt] = at
+        return True
+    if pt.startswith("list[") and at.startswith("list["):
+        return unify(list_elem(pt), list_elem(at), typeparams, type_map)
+    if pt.startswith("map[str, ") and at.startswith("map[str, "):
+        return unify(map_val(pt), map_val(at), typeparams, type_map)
+    if "[" in pt and "[" in at and type_base(pt) == type_base(at):
+        pargs = type_args(pt)
+        aargs = type_args(at)
+        if len(pargs) != len(aargs):
+            return False
+        ok = True
+        for p, a in zip(pargs, aargs):
+            if not unify(p, a, typeparams, type_map):
+                ok = False
+        return ok
+    return pt == at
 
 
 BUILTIN_FNS = {
@@ -51,10 +136,13 @@ class Checker:
     def __init__(self, program):
         self.p = program
         self.structs = program["structs"]
+        self.enums = program.get("enums", {})
         self.fns = program["fns"]
         self.edges = {}
         self.methods = {}  # struct -> {meth: key}
         self.cur_fn = None
+        self.cur_fn_ret = "void"  # for `?` propagation
+        self.cur_typeparams = set()  # type params valid in the current context
 
     # ---------- utilities ----------
     def err(self, msg, node):
@@ -63,17 +151,58 @@ class Checker:
     def type_exists(self, t, node):
         if t in ("int", "float", "bool", "str"):
             return True
+        if t in self.cur_typeparams:
+            return True
         if is_list(t):
             return self.type_exists(list_elem(t), node)
         if is_map(t):
             return self.type_exists(map_val(t), node)
-        return t in self.structs
+        base = type_base(t)
+        args = type_args(t)
+        if base in self.structs or base in self.enums:
+            tp = self.structs[base]["typeparams"] if base in self.structs \
+                else self.enums[base]["typeparams"]
+            if len(tp) != len(args):
+                return False
+            for a in args:
+                if not self.type_exists(a, node):
+                    return False
+            return True
+        return False
 
     def require_type(self, t, node, what):
         if t == "void":
             self.err("cannot use 'void' as %s" % what, node)
         if not self.type_exists(t, node):
             self.err("type does not exist: %s" % t, node)
+
+    def resolve_struct(self, t):
+        """If t is a (possibly generic) struct type, return (StructInfo, type_map).
+        Otherwise return None."""
+        base = type_base(t)
+        if base not in self.structs:
+            return None
+        st = self.structs[base]
+        tp = st["typeparams"]
+        args = type_args(t)
+        if len(tp) != len(args):
+            return None
+        type_map = dict(zip(tp, args))
+        return (st, type_map)
+
+    def resolve_enum(self, t):
+        """If t is a (possibly generic) enum type, return (EnumInfo, type_map).
+        Otherwise return None."""
+        base = type_base(t)
+        if base not in self.enums:
+            return None
+        en = self.enums[base]
+        tp = en["typeparams"]
+        args = type_args(t)
+        if len(tp) != len(args):
+            return None
+        type_map = dict(zip(tp, args))
+        return (en, type_map)
 
     # ---------- lifecycle ----------
     def check(self):
@@ -82,11 +211,20 @@ class Checker:
             if fn["struct"] is not None:
                 m = self.methods.setdefault(fn["struct"], {})
                 m[fn["name"]] = key
-        # 2. check declarations
+        # 2. check declarations (struct/enum field types, function signatures)
         for name, st in self.structs.items():
-            for fname, ftype in st["fields"]:
+            self.cur_typeparams = set(st["typeparams"])
+            for fname, ftype, _ in st["fields"]:
                 self.require_type(ftype, st, "struct field type")
+            self.cur_typeparams = set()
+        for ename, en in self.enums.items():
+            self.cur_typeparams = set(en["typeparams"])
+            for vname, payloads in en["variants"]:
+                for pt in payloads:
+                    self.require_type(pt, en, "variant payload type")
+            self.cur_typeparams = set()
         for key, fn in self.fns.items():
+            self.cur_typeparams = set(fn.get("typeparams", []))
             if fn["struct"] is None:
                 if fn["name"] in BUILTIN_FNS:
                     self.err("cannot redefine builtin function: %s" % fn["name"], fn)
@@ -104,6 +242,7 @@ class Checker:
             if fn["ret"] != "void" and not self.type_exists(fn["ret"], fn):
                 self.err("return type does not exist: %s" % fn["ret"], fn)
             self.edges[key] = set()
+            self.cur_typeparams = set()
         if "main" not in self.fns:
             self.err("missing main function", {"line": 1})
         mainf = self.fns["main"]
@@ -142,10 +281,14 @@ class Checker:
 
     def check_fn(self, key, fn):
         self.cur_fn = key
+        self.cur_fn_ret = fn["ret"]
+        saved_typeparams = self.cur_typeparams
+        self.cur_typeparams = set(fn.get("typeparams", []))
         env = self.new_env(fn)
         self.check_stmts(fn["body"], env, fn, False)
         if fn["ret"] != "void" and not self.all_return(fn["body"]):
             self.err("function '%s' does not return on all paths" % fn["name"], fn)
+        self.cur_typeparams = saved_typeparams
 
     def all_return(self, stmts):
         if not stmts:
@@ -157,7 +300,17 @@ class Checker:
             return True
         if last["k"] == "if" and last["els"] is not None:
             return self.all_return(last["then"]) and self.all_return(last["els"])
+        if last["k"] == "expr" and last["e"]["k"] == "match" and \
+           self.match_all_return(last["e"]):
+            return True
         return False
+
+    def match_all_return(self, e):
+        for arm in e["arms"]:
+            if not (arm["body"]["k"] == "return" or
+                    (arm["body"]["k"] == "expr" and arm["body"].get("t") == "never")):
+                return False
+        return True
 
     def check_stmts(self, stmts, env, fn, in_loop):
         for s in stmts:
@@ -176,8 +329,6 @@ class Checker:
                 self.err("shadowing not allowed: %s" % s["name"], s)
             vt = self.check_expr(s["value"], env, s["t"])
             if vt == "never":
-                # `let x: T = panic()` is sound: x is unreachable.
-                # Mark binding with the declared type so later references type-check.
                 env[-1][s["name"]] = [s["t"], s["mut"]]
                 return
             if vt != s["t"]:
@@ -254,7 +405,6 @@ class Checker:
         tt = self.check_lvalue(tgt, env)
         vt = self.check_expr(s["value"], env, tt)
         if vt == "never":
-            # `x = panic()` is sound: unreachable. Treat as no-op for type checking.
             return
         if vt != tt:
             self.err("type mismatch on assignment: expected %s, got %s" % (tt, vt), s)
@@ -265,12 +415,14 @@ class Checker:
             return b[0]
         if e["k"] == "field":
             bt = self.check_expr(e["target"], env, None)
-            if bt not in self.structs:
+            info = self.resolve_struct(bt)
+            if info is None:
                 self.err("cannot access field on type %s" % bt, e)
-            for fname, ftype in self.structs[bt]["fields"]:
+            st, type_map = info
+            for fname, ftype, _ in st["fields"]:
                 if fname == e["name"]:
-                    return ftype
-            self.err("struct %s has no field %s" % (bt, e["name"]), e)
+                    return instantiate_type(ftype, type_map) if type_map else ftype
+            self.err("struct %s has no field %s" % (type_base(bt), e["name"]), e)
         if e["k"] == "index":
             tt = self.check_expr(e["target"], env, None)
             if not is_list(tt):
@@ -296,9 +448,16 @@ class Checker:
             e["t"] = "str"
         elif k == "ident":
             b = self.lookup(env, e["name"])
-            if b is None:
+            if b is not None:
+                e["t"] = b[0]
+            elif e["name"] in self.enums:
+                # bare enum name used as a value — only valid inside an enum
+                # variant literal `Enum.Variant`; otherwise it's a type error.
+                self.err("enum name '%s' cannot be used as a value" % e["name"], e)
+            elif e["name"] in self.structs:
+                self.err("struct name '%s' cannot be used as a value" % e["name"], e)
+            else:
                 self.err("variable does not exist: %s" % e["name"], e)
-            e["t"] = b[0]
         elif k == "bin":
             e["t"] = self.check_bin(e, env)
         elif k == "un":
@@ -322,33 +481,136 @@ class Checker:
                 self.err("index must be int, got %s" % it, e)
             e["t"] = list_elem(tt)
         elif k == "field":
-            tt = self.check_expr(e["target"], env, None)
-            if tt == "never":
-                self.err("never value cannot be used in expression", e)
-            if tt not in self.structs:
-                self.err("cannot access field on type %s" % tt, e)
-            e["t"] = None
-            for fname, ftype in self.structs[tt]["fields"]:
-                if fname == e["name"]:
-                    e["t"] = ftype
-                    break
-            if e["t"] is None:
-                self.err("struct %s has no field %s" % (tt, e["name"]), e)
-        elif k == "call":
-            e["t"] = self.check_call(e, env, expected)
+            # Disambiguate: if target is `ident` matching an enum name AND no
+            # variable with that name exists in scope, this is an enum variant
+            # with no payload.
+            if e["target"]["k"] == "ident" and \
+               e["target"]["name"] in self.enums and \
+               self.lookup(env, e["target"]["name"]) is None:
+                self.check_enum_variant(e, env, expected, with_args=False)
+            else:
+                tt = self.check_expr(e["target"], env, None)
+                if tt == "never":
+                    self.err("never value cannot be used in expression", e)
+                info = self.resolve_struct(tt)
+                if info is None:
+                    self.err("cannot access field on type %s" % tt, e)
+                st, type_map = info
+                e["t"] = None
+                for fname, ftype, _ in st["fields"]:
+                    if fname == e["name"]:
+                        e["t"] = instantiate_type(ftype, type_map) if type_map else ftype
+                        break
+                if e["t"] is None:
+                    self.err("struct %s has no field %s" % (type_base(tt), e["name"]), e)
+        elif k == "fieldcall":
+            # Disambiguate: if target is `ident` matching an enum name AND no
+            # variable with that name exists, this is an enum variant with
+            # payload. Otherwise it's a method call.
+            if e["target"]["k"] == "ident" and \
+               e["target"]["name"] in self.enums and \
+               self.lookup(env, e["target"]["name"]) is None:
+                self.check_enum_variant(e, env, expected, with_args=True)
+            else:
+                # Rewrite as a method call.
+                e["k"] = "method"
+                e["t"] = self.check_method(e, env)
         elif k == "method":
             e["t"] = self.check_method(e, env)
+        elif k == "call":
+            e["t"] = self.check_call(e, env, expected)
         elif k == "listlit":
             e["t"] = self.check_listlit(e, env, expected)
         elif k == "structlit":
-            e["t"] = self.check_structlit(e, env)
+            e["t"] = self.check_structlit(e, env, expected)
+        elif k == "match":
+            e["t"] = self.check_match(e, env, expected)
+        elif k == "qmark":
+            e["t"] = self.check_qmark(e, env, expected)
         elif k == "mapnew":
             if expected is None or not is_map(expected):
                 self.err("map_new() requires a 'map[str, T]' type in the surrounding context", e)
             e["t"] = expected
+        elif k == "enumlit":
+            # Already rewritten during a previous visit (e.g. nested); re-evaluate.
+            self.check_enum_variant(e, env, expected, with_args=len(e.get("args", [])) > 0)
         else:
             self.err("unknown expression: %s" % k, e)
         return e["t"]
+
+    def check_enum_variant(self, e, env, expected, with_args):
+        """Check an enum variant literal. The node `e` is either:
+          - {k: 'field', target: {k:'ident', name: EnumName}, name: VariantName}
+            — no payload
+          - {k: 'fieldcall', target: {...}, name: VariantName, args: [...]}
+            — with payload
+        The node is rewritten in-place to k='enumlit'.
+        """
+        ename = e["target"]["name"]
+        vname = e["name"]
+        if ename not in self.enums:
+            self.err("enum does not exist: %s" % ename, e)
+        edef = self.enums[ename]
+        variant = None
+        for v, payloads in edef["variants"]:
+            if v == vname:
+                variant = (v, payloads)
+                break
+        if variant is None:
+            self.err("enum %s has no variant %s" % (ename, vname), e)
+        v, payloads = variant
+        args = e.get("args", []) if with_args else []
+        if len(args) != len(payloads):
+            self.err("variant %s of enum %s expects %d payloads, got %d"
+                     % (vname, ename, len(payloads), len(args)), e)
+        typeparams = edef["typeparams"]
+        type_map = {}
+        # First pass: infer type args from arguments.
+        for a, pt in zip(args, payloads):
+            at = self.check_expr(a, env, None)
+            if at == "never":
+                self.err("never value cannot be used as an enum payload", e)
+            if typeparams:
+                unify(pt, at, typeparams, type_map)
+            else:
+                if at != pt:
+                    self.err("payload type mismatch: expected %s, got %s" % (pt, at), e)
+        # Second pass: if any type params are still unbound, try the contextual
+        # expected type.
+        if typeparams and expected is not None and type_base(expected) == ename:
+            eargs = type_args(expected)
+            if len(eargs) == len(typeparams):
+                for tp, ea in zip(typeparams, eargs):
+                    if tp not in type_map:
+                        type_map[tp] = ea
+                    # If conflicting, trust the argument-inferred one
+        # If any type param is still unbound, error.
+        if typeparams:
+            for tp in typeparams:
+                if tp not in type_map:
+                    self.err("cannot infer type argument for %s; provide a contextual type"
+                             % tp, e)
+            # Build the instantiated type.
+            result_type = ename + "[" + ", ".join(type_map[tp] for tp in typeparams) + "]"
+        else:
+            result_type = ename
+        # Type-check payloads against instantiated payload types.
+        if typeparams:
+            inst_payloads = [instantiate_type(pt, type_map) for pt in payloads]
+        else:
+            inst_payloads = list(payloads)
+        for a, pt in zip(args, inst_payloads):
+            at = self.check_expr(a, env, pt)
+            if at == "never":
+                continue
+            if at != pt:
+                self.err("payload type mismatch: expected %s, got %s" % (pt, at), e)
+        # Rewrite the node in-place so the interpreter can dispatch on `enumlit`.
+        e["k"] = "enumlit"
+        e["enum_name"] = ename
+        e["variant"] = vname
+        e["payload_types"] = inst_payloads
+        e["t"] = result_type
 
     def check_bin(self, e, env):
         lt = self.check_expr(e["l"], env, None)
@@ -401,23 +663,69 @@ class Checker:
                          % (elem, vt), it)
         return "list[%s]" % elem
 
-    def check_structlit(self, e, env):
-        name = e["name"]
+    def check_structlit(self, e, env, expected):
+        name = type_base(e["name"]) if "[" in e["name"] else e["name"]
         if name not in self.structs:
-            self.err("struct does not exist: %s" % name, e)
-        fields = self.structs[name]["fields"]
-        if len(e["fields"]) != len(fields):
-            self.err("struct literal %s requires exactly %d fields, got %d"
-                     % (name, len(fields), len(e["fields"])), e)
-        for (lfname, lfe), (fname, ftype) in zip(e["fields"], fields):
-            if lfname != fname:
-                self.err("field order mismatch: expected '%s', got '%s'"
-                         % (fname, lfname), e)
-            vt = self.check_expr(lfe, env, ftype)
-            if vt != ftype:
+            self.err("struct does not exist: %s" % e["name"], e)
+        st = self.structs[name]
+        typeparams = st["typeparams"]
+        type_map = {}
+        # If generic, infer type args from contextual expected type if available.
+        if typeparams and expected is not None and type_base(expected) == name:
+            eargs = type_args(expected)
+            if len(eargs) == len(typeparams):
+                for tp, ea in zip(typeparams, eargs):
+                    type_map[tp] = ea
+        # Determine the struct's effective field types (instantiate or not).
+        fields_with_defaults = st["fields"]
+        # Fields provided in the literal must come in declaration order, and
+        # any fields with defaults may be omitted. We allow the user to omit
+        # only trailing fields that have defaults.
+        provided_names = [fname for fname, _ in e["fields"]]
+        # Validate names against declared fields.
+        decl_names = [fname for fname, _, _ in fields_with_defaults]
+        for i, fname in enumerate(provided_names):
+            if i >= len(decl_names) or decl_names[i] != fname:
+                self.err("struct literal field order mismatch at position %d: expected '%s', got '%s'"
+                         % (i, decl_names[i] if i < len(decl_names) else "<end>", fname), e)
+        # Determine if all non-defaulted fields are present.
+        defaulted = {fname for fname, _, d in fields_with_defaults if d is not None}
+        required = [fname for fname, _, d in fields_with_defaults if d is None]
+        for r in required:
+            if r not in provided_names:
+                self.err("struct literal missing required field '%s'" % r, e)
+        # If we've provided fewer fields than declared, the rest must have
+        # defaults — checked above. Any extra fields beyond declared?
+        if len(provided_names) > len(decl_names):
+            self.err("struct literal %s has too many fields" % name, e)
+        # Now type-check each provided field.
+        for i, (fname, fexpr) in enumerate(e["fields"]):
+            decl_fname, decl_ftype, _ = fields_with_defaults[i]
+            if typeparams and type_map:
+                inst_ftype = instantiate_type(decl_ftype, type_map)
+            else:
+                inst_ftype = decl_ftype
+            vt = self.check_expr(fexpr, env, inst_ftype)
+            if vt != inst_ftype:
                 self.err("field type %s mismatch: expected %s, got %s"
-                         % (fname, ftype, vt), e)
-        return name
+                         % (fname, inst_ftype, vt), e)
+        # If generic and we couldn't infer all type params from context, try
+        # to infer from provided field types.
+        if typeparams:
+            for i, (fname, fexpr) in enumerate(e["fields"]):
+                decl_ftype = fields_with_defaults[i][1]
+                ft = self.check_expr(fexpr, env, None)
+                if ft == "never":
+                    continue
+                unify(decl_ftype, ft, typeparams, type_map)
+            for tp in typeparams:
+                if tp not in type_map:
+                    self.err("cannot infer type argument for struct %s; provide a contextual type"
+                             % name, e)
+            result_type = name + "[" + ", ".join(type_map[tp] for tp in typeparams) + "]"
+        else:
+            result_type = name
+        return result_type
 
     def check_call(self, e, env, expected):
         name = e["name"]
@@ -434,14 +742,33 @@ class Checker:
             if len(args) != len(fn["params"]):
                 self.err("function %s expects %d arguments, got %d"
                          % (name, len(fn["params"]), len(args)), e)
+            # Generic function: infer type args from argument types.
+            typeparams = fn.get("typeparams", [])
+            type_map = {}
+            if typeparams:
+                for a, (pn, pt, _) in zip(args, fn["params"]):
+                    at = self.check_expr(a, env, None)
+                    if at == "never":
+                        continue
+                    unify(pt, at, typeparams, type_map)
+                for tp in typeparams:
+                    if tp not in type_map:
+                        self.err("cannot infer type argument for %s; provide explicit types"
+                                 % tp, e)
+            # Type-check arguments against instantiated parameter types.
             for a, (pn, pt, _) in zip(args, fn["params"]):
-                at = self.check_expr(a, env, pt)
+                if typeparams:
+                    inst_pt = instantiate_type(pt, type_map)
+                else:
+                    inst_pt = pt
+                at = self.check_expr(a, env, inst_pt)
                 if at == "never":
-                    # `foo(panic())` is sound: argument is unreachable.
                     continue
-                if at != pt:
+                if at != inst_pt:
                     self.err("argument '%s' of %s expects %s, got %s"
-                             % (pn, name, pt, at), a)
+                             % (pn, name, inst_pt, at), a)
+            if typeparams:
+                return instantiate_type(fn["ret"], type_map)
             return fn["ret"]
         self.err("function does not exist: %s" % name, e)
 
@@ -536,24 +863,49 @@ class Checker:
             self.err("never value cannot be used in expression", e)
         name = e["name"]
         args = e["args"]
-        if tt in self.structs:
-            m = self.methods.get(tt, {})
+        info = self.resolve_struct(tt)
+        if info is not None:
+            # User-defined struct method. The struct is the base name (e.g.,
+            # "Box" for "Box[int]"). Methods are registered under the base
+            # name in self.methods.
+            tt_base = type_base(tt)
+            m = self.methods.get(tt_base, {})
             if name not in m:
-                self.err("struct %s has no method %s" % (tt, name), e)
+                self.err("struct %s has no method %s" % (tt_base, name), e)
             key = m[name]
             e["rm"] = ("user", key)
             fn = self.fns[key]
             params = fn["params"][1:]
             if len(args) != len(params):
                 self.err("%s.%s expects %d arguments, got %d"
-                         % (tt, name, len(params), len(args)), e)
+                         % (tt_base, name, len(params), len(args)), e)
+            # Generic method: infer type args from arguments.
+            typeparams = fn.get("typeparams", [])
+            # If the struct is itself generic, propagate its type args.
+            st, struct_type_map = info
+            type_map = dict(struct_type_map)
+            if typeparams:
+                for a, (pn, pt, _) in zip(args, params):
+                    at = self.check_expr(a, env, None)
+                    if at == "never":
+                        continue
+                    unify(pt, at, typeparams, type_map)
+                for tp in typeparams:
+                    if tp not in type_map:
+                        self.err("cannot infer type argument for %s.%s" % (tt_base, name), e)
             for a, (pn, pt, _) in zip(args, params):
-                at = self.check_expr(a, env, pt)
+                if type_map:
+                    inst_pt = instantiate_type(pt, type_map)
+                else:
+                    inst_pt = pt
+                at = self.check_expr(a, env, inst_pt)
                 if at == "never":
                     continue
-                if at != pt:
+                if at != inst_pt:
                     self.err("argument '%s' of %s.%s expects %s, got %s"
-                             % (pn, tt, name, pt, at), a)
+                             % (pn, tt_base, name, inst_pt, at), a)
+            if type_map:
+                return instantiate_type(fn["ret"], type_map)
             return fn["ret"]
         if tt == "str":
             if name not in STR_M:
@@ -601,6 +953,11 @@ class Checker:
                 self.err("map has no method %s" % name, e)
             ptypes, ret = tbl[name]
             e["rm"] = ("builtin", "map." + name)
+        elif "[" in tt and type_base(tt) in self.enums:
+            # Method on a generic enum instantiation — currently we do not
+            # support user-defined methods on enums. Future: enable `impl`.
+            self.err("enum %s has no method %s (enum impl not supported yet)"
+                     % (type_base(tt), name), e)
         else:
             self.err("cannot call method on type %s" % tt, e)
         if len(args) != len(ptypes):
@@ -613,6 +970,156 @@ class Checker:
             if at != pt:
                 self.err("argument of %s.%s expects %s, got %s" % (tt, name, pt, at), a)
         return ret
+
+    # ---------- match ----------
+    def check_match(self, e, env, expected):
+        scrut_t = self.check_expr(e["scrut"], env, None)
+        if scrut_t == "never":
+            self.err("never value cannot be used in match", e)
+        if "[" in scrut_t:
+            ename = type_base(scrut_t)
+        else:
+            ename = scrut_t
+        if ename not in self.enums:
+            self.err("match scrutinee must be an enum, got %s" % scrut_t, e)
+        edef = self.enums[ename]
+        # For generic enums, instantiate variant payloads from scrut_t.
+        typeparams = edef["typeparams"]
+        type_map = {}
+        if typeparams:
+            sargs = type_args(scrut_t)
+            if len(sargs) != len(typeparams):
+                self.err("invalid enum instantiation: %s" % scrut_t, e)
+            for tp, sa in zip(typeparams, sargs):
+                type_map[tp] = sa
+        # Check exhaustiveness and arm types.
+        covered = set()
+        has_wildcard = False
+        arm_types = []
+        for arm in e["arms"]:
+            pat = arm["pattern"]
+            if pat["k"] == "wildcard":
+                has_wildcard = True
+            else:
+                pen = pat["enum"]
+                pv = pat["variant"]
+                if pen != ename:
+                    self.err("match arm pattern belongs to enum %s, not %s"
+                             % (pen, ename), arm)
+                # find the variant
+                variant = None
+                for v, payloads in edef["variants"]:
+                    if v == pv:
+                        variant = (v, payloads)
+                        break
+                if variant is None:
+                    self.err("enum %s has no variant %s" % (ename, pv), arm)
+                v, payloads = variant
+                covered.add(v)
+                # Check binding count.
+                if pat["has_paren"] and len(pat["bindings"]) != len(payloads):
+                    self.err("variant %s has %d payloads, but pattern binds %d"
+                             % (pv, len(payloads), len(pat["bindings"])), arm)
+                if not pat["has_paren"] and len(payloads) != 0:
+                    self.err("variant %s requires %d payload bindings"
+                             % (pv, len(payloads)), arm)
+            # Check arm body in a new scope with the bindings.
+            self.child(env)
+            if pat["k"] != "wildcard":
+                # Bind payload values.
+                if pat["has_paren"]:
+                    # find variant payloads
+                    for v, payloads in edef["variants"]:
+                        if v == pat["variant"]:
+                            inst_payloads = [instantiate_type(p, type_map) if typeparams
+                                             else p for p in payloads]
+                            for bname, btype in zip(pat["bindings"], inst_payloads):
+                                if bname == "_":
+                                    continue
+                                if self.lookup(env, bname) is not None:
+                                    self.err("shadowing not allowed in match arm: %s" % bname, arm)
+                                env[-1][bname] = [btype, False]
+                            break
+            body_t = self.check_expr(arm["body"], env, expected)
+            arm["body_t"] = body_t
+            env.pop()
+            if body_t == "never":
+                arm_types.append(None)
+            else:
+                arm_types.append(body_t)
+        # Exhaustiveness check.
+        all_variants = {v for v, _ in edef["variants"]}
+        if not has_wildcard:
+            missing = all_variants - covered
+            if missing:
+                self.err("match is not exhaustive; missing: %s"
+                         % ", ".join(sorted(missing)), e)
+        # All arm types must agree.
+        non_never = [t for t in arm_types if t is not None]
+        if not non_never:
+            # All arms are `never` — match type is never.
+            e["t"] = "never"
+            return "never"
+        first = non_never[0]
+        for t in non_never:
+            if t != first:
+                self.err("match arms have different types: %s and %s" % (first, t), e)
+        e["t"] = first
+        return first
+
+    # ---------- `?` operator ----------
+    def check_qmark(self, e, env, expected):
+        inner_t = self.check_expr(e["e"], env, None)
+        if inner_t == "never":
+            self.err("never value cannot be used in expression", e)
+        ename = type_base(inner_t) if "[" in inner_t else inner_t
+        if ename not in self.enums:
+            self.err("? operator requires an enum type, got %s" % inner_t, e)
+        edef = self.enums[ename]
+        # Find the "error" variant: Err (with one payload) or None (no payload).
+        err_variant = None
+        ok_variant = None
+        for v, payloads in edef["variants"]:
+            if v == "Err" and len(payloads) == 1:
+                err_variant = (v, payloads)
+            elif v == "None" and len(payloads) == 0:
+                err_variant = (v, payloads)
+            elif v == "Ok" and len(payloads) == 1:
+                ok_variant = (v, payloads)
+            elif v == "Some" and len(payloads) == 1:
+                ok_variant = (v, payloads)
+        if err_variant is None:
+            self.err("? operator requires enum %s to have an 'Err' (1 payload) or 'None' variant"
+                     % ename, e)
+        if ok_variant is None:
+            self.err("? operator requires enum %s to have an 'Ok' or 'Some' variant (1 payload)"
+                     % ename, e)
+        # The success value type is the (instantiated) payload type of the
+        # success variant.
+        typeparams = edef["typeparams"]
+        if typeparams:
+            type_map = {}
+            iargs = type_args(inner_t)
+            if len(iargs) != len(typeparams):
+                self.err("invalid enum instantiation: %s" % inner_t, e)
+            for tp, ia in zip(typeparams, iargs):
+                type_map[tp] = ia
+            ok_payload = ok_variant[1][0]
+            success_t = instantiate_type(ok_payload, type_map)
+        else:
+            success_t = ok_variant[1][0]
+        # Check that the enclosing function's return type is compatible.
+        cur_ret = self.cur_fn_ret
+        if cur_ret == "void":
+            self.err("? operator cannot be used in a void function", e)
+        cur_ret_base = type_base(cur_ret) if "[" in cur_ret else cur_ret
+        if cur_ret_base != ename:
+            self.err("? operator: enclosing function returns %s, cannot propagate %s"
+                     % (cur_ret, ename), e)
+        e["t"] = success_t
+        e["err_variant"] = err_variant[0]
+        e["ok_variant"] = ok_variant[0]
+        return success_t
 
     # ---------- effects ----------
     def check_effects(self):
