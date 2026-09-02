@@ -59,15 +59,22 @@ audit:
 
 # Run the example programs to verify they still work after a change
 examples:
+	@# Most examples exit 0; secure_demo.hls deliberately panics on
+	@# integer overflow to demonstrate safe-panic semantics (exit 101).
 	@for f in examples/hello.hls examples/fibonacci.hls examples/primes.hls \
-	          examples/secure_demo.hls examples/enum_demo.hls examples/option_demo.hls \
-	          examples/result_demo.hls examples/ownership_demo.hls examples/effects_demo.hls \
+	          examples/enum_demo.hls examples/option_demo.hls examples/result_demo.hls \
+	          examples/ownership_demo.hls examples/effects_demo.hls \
 	          examples/hex_demo.hls examples/base64_demo.hls examples/crypto_demo.hls \
 	          examples/csv_demo.hls examples/list_demo.hls examples/time_demo.hls \
 	          examples/uuid_demo.hls examples/web_demo.hls examples/stdlib_demo.hls \
 	          examples/taint_demo.hls; do \
 	        echo "--- $$f"; $(PYTHON) boot/boot.py $$f; \
 	done
+	@echo "--- examples/secure_demo.hls (deliberately panics on overflow)"
+	@$(PYTHON) boot/boot.py examples/secure_demo.hls; rc=$$?; \
+	if [ "$$rc" != "0" ] && [ "$$rc" != "101" ]; then \
+	    echo "secure_demo.hls failed with unexpected exit code $$rc"; exit 1; \
+	fi
 	@# wordcount needs a data-file argument
 	@echo "--- examples/wordcount.hls"; $(PYTHON) boot/boot.py examples/wordcount.hls examples/data.txt
 
