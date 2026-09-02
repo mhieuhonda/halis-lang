@@ -27,7 +27,7 @@ remains green.
 | 10 | Taint tracking & sandbox | 🔄 | 8–10 weeks |
 | 11 | SSA IR + optimisation | 🔄 | 10–14 weeks |
 | 12 | Native LLVM backend | 🔄 | 10–14 weeks |
-| 13 | Package manager `hls-pkg` | ⬜ | 6–8 weeks |
+| 13 | Package manager `hls-pkg` | 🔄 | 6–8 weeks |
 | 14 | Tooling: LSP, formatter, linter | ⬜ | 6–8 weeks |
 | 15 | Safe C FFI | ⬜ | 4–6 weeks |
 | 16 | Concurrency & async (data-race freedom) | ⬜ | 12–16 weeks |
@@ -589,20 +589,68 @@ diagnostic pass, parallel to the C backend).
 output matching the C backend. (The v0.10.0-alpha release ships the IR
 emitter; the bootstrap chain is the Stage 12 release target.)
 
-## STAGE 13 — Package manager `hls-pkg` ⬜
+## STAGE 13 — Package manager `hls-pkg` 🔄 (alpha v0.11.0-alpha)
 
 **Goal:** reuse code with verified provenance.
 
-**Work:**
-- `hls-pkg.toml` + content-addressed lockfile: each package identified by the
-  SHA-256 of its content + its effect table.
-- Enforce package effects: a pure library package CANNOT declare `uses Net`.
-- Decentralised (git-based) registry + transparency log.
-- `hls-pkg audit`: print the total capabilities/effects of the entire
-  dependency tree.
+**Status (v0.11.0-alpha):** the **alpha subset of Stage 13** has shipped.
+A new `tools/hls-pkg.py` package manager CLI supports the full
+manifest → lockfile → audit → build cycle, with content-addressed
+dependencies (SHA-256 of resolved file content) and effect enforcement
+(the package's declared `effects.allowed` set must be a superset of
+every dependency's computed effects). **145/145 tests PASS.**
+
+**Shipped in v0.11.0-alpha (Stage 13-alpha):**
+
+- New `tools/hls-pkg.py` CLI with 6 subcommands:
+  - `hls-pkg init NAME` — create a new package skeleton (manifest +
+    entry source + README + .gitignore).
+  - `hls-pkg add NAME GIT PATH [--tag T | --branch B]` — add a
+    git-based dependency to the manifest.
+  - `hls-pkg lock` — resolve dependencies, compute SHA-256 of each
+    resolved file, extract the package's declared and computed effects
+    via `boot.py --audit`, write `hls-pkg.lock` (JSON). Enforces the
+    package's `effects.allowed` surface: if any dependency's computed
+    effects are not in the allowed set, the lock fails with a
+    per-dependency violation report.
+  - `hls-pkg audit` — print the total effect report of the resolved
+    dependency tree (per-package declared vs transitive effects + a
+    total summary).
+  - `hls-pkg verify` — verify the lockfile's SHA-256 hashes still
+    match the resolved files (defence against silent upstream mutation).
+  - `hls-pkg build [--entry main.hls]` — compile the package's entry
+    point with the resolved dependencies on the import path.
+- Manifest format: `hls-pkg.toml` (minimal TOML parser) with
+  `[package]`, `[dependencies]`, `[effects]` sections.
+- Lockfile format: `hls-pkg.lock` (JSON) with per-package
+  `name`, `source`, `sha256`, `effects`, `transitive_effects`,
+  `resolved_path`.
+- Effect extraction: a temporary `pure` main wrapper is generated
+  alongside the target file so library files (without `main`) can be
+  audited. The wrapper's `pure` keyword ensures it doesn't pollute
+  the audit with IO-family effects.
+- Git dependencies are cloned into `.hls-pkg-cache/` (gitignored).
+- New example: `examples/pkg_demo.hls` showing how a package's
+  `hls-pkg.toml` looks in practice.
+
+**Remaining work for Stage 13 (release and beyond):**
+
+- Transparency log: every published package version is appended to a
+  publicly-verifiable append-only log (like Certificate Transparency).
+- Decentralised registry: today's resolver fetches git repos directly;
+  the release target is a registry API with content-addressed storage.
+- Multi-file packages: today's resolver treats each dependency as a
+  single `.hls` file; multi-file packages with internal imports are
+  the release target.
+- Re-implement `hls-pkg` in HLS itself (today it's Python; the
+  roadmap's "every feature must self-compile" rule applies).
+- Versioning: lockfile should record the resolved version, not just
+  the SHA-256 (today the tag/branch is recorded but not verified).
 
 **Acceptance:** install a third-party package, view its effect report, build
-bit-for-bit reproducibly from the lockfile.
+bit-for-bit reproducibly from the lockfile. (The v0.11.0-alpha release
+implements the core cycle; the transparency log and decentralised
+registry are the Stage 13 release target.)
 
 ## STAGE 14 — Tooling: LSP, formatter, linter ⬜
 

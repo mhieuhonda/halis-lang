@@ -135,6 +135,15 @@ python3 boot/boot.py --opt-stats examples/optimize_demo.hls
 # 10. Stage 12-alpha: print LLVM IR (v0.10.0-alpha)
 python3 boot/boot.py --emit llvm examples/llvm_demo.hls
 python3 boot/boot.py --emit llvm --target aarch64-linux examples/llvm_demo.hls
+
+# 11. Stage 13-alpha: package manager (v0.11.0-alpha)
+python3 tools/hls-pkg.py init mypkg
+cd mypkg
+python3 ../tools/hls-pkg.py add std.str https://github.com/mhieuhonda/hieu-louis-lang.git std/str.hls
+python3 ../tools/hls-pkg.py lock    # resolves deps + enforces effect surface
+python3 ../tools/hls-pkg.py audit  # total effect report of dep tree
+python3 ../tools/hls-pkg.py verify # check SHA-256 hashes still match
+python3 ../tools/hls-pkg.py build  # compile main.hls
 ```
 
 ## Language example
@@ -228,9 +237,14 @@ hieu-louis-lang/
 │   ├── ok/              #   42 valid programs (incl. safe panics)
 │   ├── fail/            #   45 programs that MUST be rejected (types/effects/taint)
 │   └── run_tests.sh     #   143 tests: ok/fail/differential/bootstrap fixed-point
-├── Makefile             # bootstrap · test · run · examples
+├── Makefile             # bootstrap · test · run · examples · audit · opt-stats · emit-ir · emit-llvm
 └── bin/                 # (generated) native hlc
 ```
+
+The `tools/` directory (Stage 11+) holds the SSA IR + optimiser
+(`tools/ir/`), the LLVM IR text backend (`tools/llvm_emit.py`), and the
+package manager (`tools/hls-pkg.py`). These are Python tools today;
+re-implementing them in HLS itself is a Stage 11/12/13 release target.
 
 ## Design philosophy (abridged)
 

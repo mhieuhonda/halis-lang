@@ -8,7 +8,40 @@ Releases on `main` follow the 20-stage roadmap (see [ROADMAP.md](ROADMAP.md)).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
-## [unreleased] — Stage 12-alpha (v0.10.0-alpha)
+## [unreleased] — Stage 13-alpha (v0.11.0-alpha)
+
+### Added
+- **Stage 13-alpha: `hls-pkg` package manager.** A new
+  `tools/hls-pkg.py` CLI supports the full manifest → lockfile →
+  audit → build cycle, with content-addressed dependencies
+  (SHA-256 of resolved file content) and effect enforcement.
+  - `hls-pkg init NAME` — create a new package skeleton (manifest +
+    entry source + README + .gitignore).
+  - `hls-pkg add NAME GIT PATH [--tag T | --branch B]` — add a
+    git-based dependency to the manifest.
+  - `hls-pkg lock` — resolve dependencies, compute SHA-256, extract
+    effects via `boot.py --audit`, write `hls-pkg.lock`. Enforces the
+    package's `effects.allowed` surface: any dependency's computed
+    effects not in the allowed set causes the lock to fail with a
+    per-dependency violation report.
+  - `hls-pkg audit` — print the total effect report of the dependency
+    tree (per-package declared vs transitive effects + a total
+    summary).
+  - `hls-pkg verify` — verify the lockfile's SHA-256 hashes still
+    match the resolved files.
+  - `hls-pkg build [--entry main.hls]` — compile the package's entry
+    point.
+  - Manifest format: `hls-pkg.toml` (minimal TOML parser).
+  - Lockfile format: `hls-pkg.lock` (JSON).
+  - Effect extraction: a temporary `pure` main wrapper is generated
+    alongside the target file so library files (without `main`) can
+    be audited. The wrapper's `pure` keyword ensures it doesn't
+    pollute the audit with IO-family effects.
+  - Git dependencies are cloned into `.hls-pkg-cache/` (gitignored).
+- **145/145 tests PASS** (no test changes; `hls-pkg` is a separate
+  tool, not part of the compiler bootstrap).
+
+## [v0.10.0-alpha] — Stage 12-alpha (LLVM IR text backend)
 
 ### Added
 - **Stage 12-alpha: LLVM IR text backend.** A new `tools/llvm_emit.py`
