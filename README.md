@@ -36,16 +36,21 @@ fn main() -> int uses IO {
 }
 ```
 
-Three core guarantees of v0.2:
+Three core guarantees of v0.4.0-alpha:
 
 1. **I/O is a declared effect.** Forget `uses IO` while printing to the
    screen? Compile error — even when the call is indirect through 5 function
    layers.
 2. **Every operation is checked.** Integer overflow, divide-by-zero,
    out-of-bounds array access — all halt safely, with no undefined behaviour.
-   v0.2 has no switch to disable checks.
-3. **No null.** No uninitialised variables, no hidden state, no globals.
+   v0.4 has no switch to disable checks.
+3. **No null. No uninitialised variables, no hidden state, no globals.**
    Everything is explicit so it can be audited.
+4. **(NEW in v0.4.0-alpha) Use-after-move is a compile error.** The new
+   ownership primitives — `drop`, `clone`, `take` — let the compiler track
+   when a binding has been moved, and statically reject any subsequent use.
+   This is the first subset of Stage 8 (ownership & borrow checking) — see
+   [SPEC.md section 16](SPEC.md).
 
 ## Self-hosting — proof, not promise
 
@@ -85,7 +90,7 @@ make bootstrap
 # 3. Compile your program to a native binary
 make run F=examples/primes.hls
 
-# 4. Run the full test suite (56 tests: types, effects, differential, bootstrap)
+# 4. Run the full test suite (87 tests: types, effects, ownership, differential, bootstrap)
 make test
 ```
 
@@ -132,9 +137,10 @@ fn main() -> int uses IO {
 
 See also: [examples/](examples/) — including `secure_demo.hls` demonstrating
 safe panics on integer overflow, `wordcount.hls` reading a real file,
-`web_demo.hls` showing URL parsing, JSON handling and HTML escaping, and
+`web_demo.hls` showing URL parsing, JSON handling and HTML escaping,
 `enum_demo.hls` / `option_demo.hls` / `result_demo.hls` demonstrating Stage 7
-features (enums, match, `?` operator, Option/Result).
+features (enums, match, `?` operator, Option/Result), and the new
+`ownership_demo.hls` demonstrating Stage 8-alpha's `drop`/`clone`/`take`.
 
 ## Standard library (Stage 6 + Stage 7)
 
@@ -198,24 +204,29 @@ Full details: [SPEC.md](SPEC.md) · Stage-by-stage roadmap:
 
 ## Status
 
-**v0.3.0 — Stages 1–7 complete** (see ROADMAP):
+**v0.4.0-alpha — Stages 1–7 complete, Stage 8-alpha shipped** (see ROADMAP):
 
 - ✅ Complete core specification
 - ✅ Stage-0 reference (interpreted, with type + effects checking)
 - ✅ Self-hosted compiler `hlc.hls` (front-end + C backend)
-- ✅ Self-compiling fixed-point; 78/78 tests PASS
+- ✅ Self-compiling fixed-point; bootstrap is deterministic
 - ✅ Module system & standard library (Stage 6): `std.str`, `std.math`,
   `std.json`, `std.url`, `std.html`
 - ✅ **Stage 7 — Advanced type system**: `enum` + `match` (with
   exhaustiveness checking), `Option[T]`/`Result[T, E]` in stdlib,
   `?` error-propagation operator, monomorphising generics on functions /
   structs / enums, struct default field values, recursive enums
-- ⬜ ownership/borrow, fine-grained effects, SSA IR, LLVM, concurrency...
+- 🔄 **Stage 8-alpha — Ownership primitives** (v0.4.0-alpha):
+  `drop(x)` / `clone(x)` / `take(x)` builtins, with compile-time
+  use-after-move tracking. Bindings carry a `moved` flag in both Stage-0
+  and `hlc.hls`. 6 new tests; **87/87 tests PASS**.
+- ⬜ Stage 8-beta (full borrow checker, end-of-arena runtime), fine-grained
+effects, SSA IR, LLVM, concurrency...
 
 ## Contributing
 
-Every contribution must preserve the three core guarantees and pass
-`make test` (56 tests, including differential testing of the two
+Every contribution must preserve the core guarantees and pass
+`make test` (87 tests, including differential testing of the two
 implementations). Every new feature must first be used inside `hlc` itself —
 the compiler is always the first customer of the language.
 

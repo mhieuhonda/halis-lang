@@ -1,13 +1,12 @@
-# Hieu Louis language specification (HLS) — v0.3.0
+# Hieu Louis language specification (HLS) — v0.4.0-alpha
 
 > **Hieu Louis** is a high-security, native-compiled programming language
 > designed around the philosophy: **safety by default, explicitness for
-> auditability, performance via AOT compilation**. Version v0.3.0 extends the
-> v0.2 core with **sum types (`enum`), pattern matching (`match`), generic
-> types via monomorphisation, the `?` error-propagation operator, and struct
-> default field values** — bringing controlled error handling to the
-> language. Every operation is still checked, every I/O is statically
-> tracked, no null, no undefined behaviour.
+> auditability, performance via AOT compilation**. Version v0.4.0-alpha
+> introduces the **Stage 8-alpha ownership primitives** (`drop`, `clone`,
+> `take`) — the first step toward memory safety without GC. Every operation
+> is still checked, every I/O is statically tracked, no null, no undefined
+> behaviour, and now: **use-after-move is a compile error**.
 
 - Source files: `*.hls`
 - Self-hosted compiler: `src/hlc.hls` (HLS → C → native)
@@ -328,6 +327,9 @@ Operands:
 | `clock_ms()` | `int` | IO | milliseconds (monotonic clock) |
 | `chr(i: int)` | `str` | — | 1-byte string; `i` outside 0..255 → panic |
 | `file_exists(path: str)` | `bool` | IO | returns `true` if `path` is a regular file |
+| `drop(x: T)` | `void` | — | (Stage 8-alpha) release ownership of `x`; `x` becomes moved |
+| `clone(x: T)` | `T` | — | (Stage 8-alpha) return an independent deep copy of `x` |
+| `take(x: T)` | `T` | — | (Stage 8-alpha) move `x`'s value out; `x` becomes moved |
 
 `int(s)`: allows a leading minus sign, only accepts digits 0–9, value must
 fit in int64 range, otherwise panics with "cannot convert string to int".
@@ -477,12 +479,12 @@ fn use_first(xs: list[int]) -> Option[int] {
 }
 ```
 
-## 13. What v0.3 deliberately does NOT have
+## 13. What v0.4 deliberately does NOT have
 
 | Feature | Stage |
 |---------|-------|
 | Bitwise operators (`&` `\|` `^` `<<` `>>`) with checked semantics | later |
-| Ownership & borrow checking | 8 |
+| Full borrow checking (one mut borrow OR many shared) | 8-beta |
 | Fine-grained effects (`Net`, `Fs`, `Clock`, `Rand`), capabilities, taint | 9–10 |
 | SSA IR + optimisation | 11 |
 | Direct LLVM backend | 12 |
@@ -576,3 +578,127 @@ self-hosted compiler `src/hlc.hls`) must produce **identical output** on the
 same program (differential testing — see `tests/run_tests.sh`). The only
 allowed difference: panic messages on Stage-0 include the line location, the
 native version does not (debug info: Stage 11).
+
+---
+
+## 16. Ownership primitives (Stage 8-alpha — v0.4.0-alpha)
+
+Stage 8 of the roadmap calls for full ownership & borrow checking (memory
+safety without GC, ending the arena model). That stage is the highest-risk
+item in the entire roadmap. To reduce risk and ship value early, v0.4.0-alpha
+introduces **the first subset of Stage 8: three ownership primitives that
+give the compiler a static "moved" tracking pass**. The runtime still uses
+arena allocation; runtime memory reclamation is deferred to Stage 8-beta.
+
+### 16.1. The three primitives
+
+| Primitive | Type | Behaviour |
+|-----------|------|----------|
+| `drop(x: T) -> void` | builtin | Marks binding `x` as **moved**. Subsequent use of `x` is a compile error. Runtime: no-op (arena mode). |
+| `clone(x: T) -> T` | builtin | Returns an **independent deep copy** of `x`. `x` is NOT moved. |
+| `take(x: T) -> T` | builtin | Returns `x`'s value and marks binding `x` as **moved**. The value is now "owned" by the expression context. |
+
+### 16.2. Use-after-move is a compile error
+
+Once a binding is moved (via `drop(x)` or `take(x)`), any subsequent
+reference to `x` produces a compile-time error:
+
+```hls
+fn main() -> int uses IO {
+    let s: str = "hello"
+    drop(s)
+    println(s)            # compile error: use of moved value: s
+    return 0
+}
+```
+
+The error is raised at the use site, with the offending variable name. The
+underlying value is still in memory (the runtime is arena-based), but the
+compiler refuses to let you reference it.
+
+### 16.3. Revival via reassignment
+
+A moved `let mut` binding can be **revived** by reassignment:
+
+```hls
+fn main() -> int uses IO {
+    let mut s: str = "first"
+    drop(s)               # s is now moved
+    s = "second"          # s is revived — fresh ownership
+    println(s)            # OK: prints "second"
+    return 0
+}
+```
+
+Field/index assignment on a moved binding is **not** revived — only whole-
+binding assignment (`x = ...`) revives.
+
+### 16.4. `clone()` — independent deep copy
+
+`clone(x)` returns an independent copy: mutating the clone does not affect
+the original. This is the primary tool for code that needs to share data
+without giving up ownership.
+
+```hls
+fn main() -> int uses IO {
+    let xs: list[int] = [1, 2, 3]
+    let ys: list[int] = clone(xs)
+    ys.push(4)                      # only ys changes
+    println(xs.len().to_str())      # 3
+    println(ys.len().to_str())      # 4
+    return 0
+}
+```
+
+### 16.5. `take()` — explicit ownership transfer
+
+`take(x)` is for transferring ownership out of a binding when you no longer
+need it locally. Common use: passing a value to a consuming function without
+paying for a `clone`.
+
+```hls
+fn consume(s: str) -> int {
+    return s.len()
+}
+
+fn main() -> int uses IO {
+    let s1: str = "hello hieu"
+    let n: int = consume(take(s1))   # s1 is now moved
+    println("consumed=" + n.to_str())
+    # println(s1)                    # would be a compile error: use of moved value
+    return 0
+}
+```
+
+### 16.6. Scope-local moves
+
+A move done inside an `if`/`while`/`for` body does **not** leak out of the
+body. The compiler takes a snapshot of the moved-status on entry to a child
+scope and restores it on exit. This means:
+
+```hls
+fn main() -> int uses IO {
+    let s: str = "hello"
+    if true {
+        drop(s)              # s is moved inside this block
+    }
+    println(s)               # OK — s is usable again outside the if
+    return 0
+}
+```
+
+The rationale: the `if` body may not execute at all, so post-`if` code must
+remain valid for every path. The conservative model "moves don't escape
+child scopes" matches this requirement.
+
+### 16.7. Limitations in v0.4.0-alpha (Stage 8-beta targets)
+
+| Limitation | Stage 8-beta target |
+|------------|---------------------|
+| `clone()` not yet supported on `struct`/`enum` (or `list[struct]`/`map[str, struct]`) | per-instantiation clone helpers generated at codegen time |
+| `drop(x)` is a runtime no-op (arena model still in use) | refcounted or borrow-checked runtime that actually reclaims memory |
+| No full borrow checker (multiple shared borrows are still allowed) | one mut OR many shared — see ROADMAP Stage 8 |
+| No lifetime annotations or inference | "minimal lifetimes: infer everything, only report errors when inference fails" (per ROADMAP) |
+
+These limitations are deliberate and documented. They will be lifted in
+subsequent alpha/beta releases as the Stage 8 work proceeds.

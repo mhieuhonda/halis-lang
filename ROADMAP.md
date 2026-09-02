@@ -22,7 +22,7 @@ remains green.
 | 5 | Full self-compilation (fixed-point) | ✅ | (done) |
 | 6 | Module system & standard library | ✅ | (done) |
 | 7 | Advanced type system: enum, Option/Result, generics | ✅ | (done) |
-| 8 | Ownership & borrow checking (end of arena) | ⬜ | 10–14 weeks |
+| 8 | Ownership & borrow checking (end of arena) | 🔄 | 10–14 weeks |
 | 9 | Fine-grained effects & capabilities | ⬜ | 6–8 weeks |
 | 10 | Taint tracking & sandbox | ⬜ | 8–10 weeks |
 | 11 | SSA IR + optimisation | ⬜ | 10–14 weeks |
@@ -37,6 +37,58 @@ remains green.
 | 20 | HLS v1.0 — API freeze, LTS, pure-HLS bootstrap | ⬜ | 4 weeks |
 
 Estimated total duration: ~24–30 months (small team of 2–4 full-time).
+
+---
+
+## STAGE 8 — Ownership & borrow checking 🔄 (alpha shipped v0.4.0-alpha)
+
+**Goal:** memory safety WITHOUT GC, ending the arena model.
+
+**Status (v0.4.0-alpha):** the **first subset of Stage 8** has shipped.
+The compiler now performs **static ownership tracking** via three new
+primitives — `drop`, `clone`, `take` — and use-after-move is a compile
+error. The runtime still uses arena allocation; runtime memory reclamation
+is the Stage 8-beta target.
+
+**Shipped in v0.4.0-alpha (Stage 8-alpha):**
+
+- `drop(x: T) -> void` — release ownership of a binding; subsequent use
+  is a compile error.
+- `clone(x: T) -> T` — independent deep copy. Supported for `str` and for
+  `list[prim]`/`map[str, prim]` where `prim ∈ {int, float, bool, str}`.
+- `take(x: T) -> T` — transfer ownership out of a binding without paying
+  for a clone.
+- Bindings now carry a `moved` flag (in both Stage-0 and the self-hosted
+  compiler `hlc.hls`). Use-after-move raises a compile error with the
+  variable name.
+- Moves done inside `if`/`while`/`for` child scopes don't leak out — the
+  compiler snapshots moved-status on scope entry and restores on exit.
+- Reassignment (`x = new_value`) revives a moved `let mut` binding.
+- 6 new tests: 3 ok (`feat_drop`, `feat_clone`, `feat_take`) + 3 fail
+  (`fail_use_after_drop`, `fail_double_drop`, `fail_take_moved`).
+- The bootstrap is still **deterministic**: two self-compile passes
+  produce byte-identical C output. **87/87 tests PASS**.
+
+**Remaining work for Stage 8 (beta and beyond):**
+
+- Move semantics by default; checked borrows: one mutable borrow OR many
+  read-only borrows.
+- Exact `free` when leaving scope; statically prove no use-after-free /
+  double-free through the type system itself.
+- Minimal lifetimes: no lifetime syntax — infer everything, only report
+  errors when inference fails.
+- New C runtime replacing arena: stack `alloca` + heap `malloc` with static
+  free timing.
+- Expand `clone()` to support `struct`/`enum` via per-instantiation
+  codegen helpers.
+
+**Acceptance (full Stage 8):** a memory-stress program (web server running
+24h) does not increase RSS; Valgrind/ASan clean.
+
+**Highest risk in the entire roadmap** — budget 30% extra time; may downgrade
+to "ref-counting + ownership analysis pass" if full borrow-checking is too
+costly. (The v0.4.0-alpha release already follows the "ownership analysis
+pass" downgrade path; runtime memory reclamation is deferred.)
 
 ---
 
@@ -203,9 +255,10 @@ model.
   expected I/O errors): deferred to a follow-up commit; the infrastructure
   is in place.
 
-## STAGE 8 — Ownership & borrow checking ⬜
+## STAGE 8 (continued) — full borrow checking & end-of-arena runtime
 
-**Goal:** memory safety WITHOUT GC, ending the arena model.
+> The Stage 8-alpha subset has shipped in v0.4.0-alpha (see the top of this
+> file). The remaining work below is the Stage 8-beta target.
 
 **Work:**
 - Move semantics by default; checked borrows: one mutable borrow OR many

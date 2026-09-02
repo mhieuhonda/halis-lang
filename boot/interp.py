@@ -162,13 +162,13 @@ class Interp:
         env = [{}]
         if fn["struct"] is not None:
             sn, _, sm = fn["params"][0]
-            env[0][sn] = [args[0], sm]
+            env[0][sn] = [args[0], sm, False]
             params = fn["params"][1:]
             args = args[1:]
         else:
             params = fn["params"]
         for (pn, _, _), v in zip(params, args):
-            env[0][pn] = [v, False]
+            env[0][pn] = [v, False, False]
         try:
             self.exec_stmts(fn["body"], env)
         except ReturnSig as r:
@@ -184,7 +184,7 @@ class Interp:
         self.line = s.get("line", 0)
         k = s["k"]
         if k == "let":
-            env[-1][s["name"]] = [self.eval_expr(s["value"], env), s["mut"]]
+            env[-1][s["name"]] = [self.eval_expr(s["value"], env), s["mut"], False]
         elif k == "assign":
             self.exec_assign(s, env)
         elif k == "if":
@@ -365,7 +365,7 @@ class Interp:
                 for i, bname in enumerate(pat["bindings"]):
                     if bname == "_":
                         continue
-                    env[-1][bname] = [s_data[i] if i < len(s_data) else None, False]
+                    env[-1][bname] = [s_data[i] if i < len(s_data) else None, False, False]
                 return self.eval_expr(arm["body"], env)
             finally:
                 env.pop()
@@ -488,7 +488,38 @@ class Interp:
         if name == "file_exists":
             import os
             return os.path.isfile(args[0].decode("utf-8", "replace"))
+        # ----- Stage 8-alpha: ownership primitives -----
+        # drop(x): semantically releases x. In Stage-0 (Python), the underlying
+        # value is left for Python's GC. The binding is marked moved at compile
+        # time, so this runtime path just needs to be a no-op that returns None.
+        if name == "drop":
+            return None
+        # clone(x): deep-copy a heap value.
+        if name == "clone":
+            return self.deep_clone(args[0])
+        # take(x): returns x's value (binding is marked moved at compile time).
+        if name == "take":
+            return args[0]
         raise HLPanic("unknown builtin function: %s" % name, line)
+
+    def deep_clone(self, v):
+        """Deep-copy an HLS runtime value (Stage-0 / Python)."""
+        if isinstance(v, bytes):
+            return bytes(v)  # strings are immutable, shallow copy is fine
+        if isinstance(v, list):
+            return [self.deep_clone(x) for x in v]
+        if isinstance(v, dict) and "enum" not in v:
+            # map[str, T] — copy insertion-ordered dict
+            new = {}
+            for k in v:
+                new[k] = self.deep_clone(v[k])
+            return new
+        if isinstance(v, dict) and "enum" in v:
+            # enum value — clone payload values too
+            return {"enum": v["enum"], "var": v["var"],
+                    "data": [self.deep_clone(x) for x in v["data"]]}
+        # primitives (int, float, bool, None)
+        return v
 
     def builtin_method(self, op, t, args):
         line = self.line

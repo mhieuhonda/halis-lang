@@ -33,7 +33,8 @@ struct Tok {
 
 struct Binding {
     t: str,
-    is_mut: bool
+    is_mut: bool,
+    moved: bool
 }
 
 struct StructInfo {
@@ -1364,6 +1365,8 @@ fn is_builtin_fn(n: str) -> bool {
         || n == "map_new" || n == "read_file" || n == "write_file"
         || n == "args" || n == "clock_ms" || n == "chr"
         || n == "file_exists"
+        # Stage 8-alpha ownership primitives
+        || n == "drop" || n == "clone" || n == "take"
 }
 
 fn list_has(list: list[str], x: str) -> bool {
@@ -1472,7 +1475,7 @@ fn resolve_enum(ctx: Ctx, t: str) -> EnumInfo {
 # (We use lists since HLS has no map of str->str.)
 
 fn dummy_binding() -> Binding {
-    return Binding { t: "", is_mut: false }
+    return Binding { t: "", is_mut: false, moved: false }
 }
 
 fn lookup_binding(env: list[map[str, Binding]], name: str) -> Binding {
@@ -1493,6 +1496,62 @@ fn lookup_exists(env: list[map[str, Binding]], name: str) -> bool {
             return true
         }
         i = i - 1
+    }
+    return false
+}
+
+# --- Stage 8-alpha ownership helpers (v0.4.0-alpha) ---
+# Bindings carry a `moved` flag (Stage 8-alpha). These helpers mutate the flag
+# in place (HLS maps are mutable through .set()).
+
+fn mark_moved(env: list[map[str, Binding]], name: str) -> bool {
+    let mut i: int = env.len() - 1
+    while i >= 0 {
+        if env.get(i).has(name) {
+            let b: Binding = env.get(i).get_or(name, dummy_binding())
+            env.get(i).set(name, Binding { t: b.t, is_mut: b.is_mut, moved: true })
+            return true
+        }
+        i = i - 1
+    }
+    return false
+}
+
+fn revive_binding(env: list[map[str, Binding]], name: str) -> bool {
+    let mut i: int = env.len() - 1
+    while i >= 0 {
+        if env.get(i).has(name) {
+            let b: Binding = env.get(i).get_or(name, dummy_binding())
+            env.get(i).set(name, Binding { t: b.t, is_mut: b.is_mut, moved: false })
+            return true
+        }
+        i = i - 1
+    }
+    return false
+}
+
+# is_owned_type: True if values of this type are heap-owned and subject to
+# move tracking. Primitives (int/float/bool) are Copy — passing them is fine.
+fn is_owned_type(t: str) -> bool {
+    if t == "int" || t == "float" || t == "bool" || t == "void" || t == "never" {
+        return false
+    }
+    return true
+}
+
+# is_clone_supported: True if clone() supports this type in v0.4.0-alpha.
+# Stage 8-beta will expand this to all heap types.
+fn is_clone_supported(t: str) -> bool {
+    if t == "str" {
+        return true
+    }
+    if is_list_t(t) {
+        let e: str = list_elem_t(t)
+        return e == "int" || e == "float" || e == "bool" || e == "str"
+    }
+    if is_map_t(t) {
+        let v: str = map_val_t(t)
+        return v == "int" || v == "float" || v == "bool" || v == "str"
     }
     return false
 }
@@ -1829,10 +1888,10 @@ fn check_fn_body(ctx: Ctx, key: str) -> void {
     let env: list[map[str, Binding]] = []
     let scope0: map[str, Binding] = map_new()
     if f.is_method {
-        scope0.set(f.params.get(0), Binding { t: f.ptypes.get(0), is_mut: f.pmuts.get(0) })
+        scope0.set(f.params.get(0), Binding { t: f.ptypes.get(0), is_mut: f.pmuts.get(0), moved: false })
         let mut i: int = 1
         while i < f.params.len() {
-            scope0.set(f.params.get(i), Binding { t: f.ptypes.get(i), is_mut: f.pmuts.get(i) })
+            scope0.set(f.params.get(i), Binding { t: f.ptypes.get(i), is_mut: f.pmuts.get(i), moved: false })
             i = i + 1
         }
     } else {
@@ -1842,7 +1901,7 @@ fn check_fn_body(ctx: Ctx, key: str) -> void {
             if scope0.has(pn) {
                 cerr(f.line, "duplicate parameter name: " + pn)
             }
-            scope0.set(pn, Binding { t: f.ptypes.get(i), is_mut: f.pmuts.get(i) })
+            scope0.set(pn, Binding { t: f.ptypes.get(i), is_mut: f.pmuts.get(i), moved: false })
             i = i + 1
         }
     }
@@ -1921,13 +1980,13 @@ fn check_stmt(ctx: Ctx, env: list[map[str, Binding]], cur: str, f: FnInfo, sidx:
         let vt: str = check_expr(ctx, env, cur, s.value, s.vtype)
         if vt == "never" {
             # `let x: T = panic()` is sound: x is unreachable.
-            env.get(env.len() - 1).set(s.name, Binding { t: s.vtype, is_mut: s.is_mut })
+            env.get(env.len() - 1).set(s.name, Binding { t: s.vtype, is_mut: s.is_mut, moved: false })
             return
         }
         if vt != s.vtype {
             cerr(s.line, "type mismatch: declared " + s.vtype + " but got " + vt)
         }
-        env.get(env.len() - 1).set(s.name, Binding { t: s.vtype, is_mut: s.is_mut })
+        env.get(env.len() - 1).set(s.name, Binding { t: s.vtype, is_mut: s.is_mut, moved: false })
     } else if s.kind == "assign" {
         check_assign(ctx, env, cur, s)
     } else if s.kind == "if" {
@@ -1961,7 +2020,7 @@ fn check_stmt(ctx: Ctx, env: list[map[str, Binding]], cur: str, f: FnInfo, sidx:
             cerr(s.line, "variable type " + s.vtype + " does not match element " + elem)
         }
         env.push(map_new())
-        env.get(env.len() - 1).set(s.name, Binding { t: elem, is_mut: false })
+        env.get(env.len() - 1).set(s.name, Binding { t: elem, is_mut: false, moved: false })
         check_stmts(ctx, env, cur, f, s.body, true)
         env.pop()
     } else if s.kind == "return" {
@@ -2003,8 +2062,23 @@ fn check_assign(ctx: Ctx, env: list[map[str, Binding]], cur: str, s: StmtN) -> v
     if b.t == "" {
         cerr(s.line, "variable does not exist: " + ctx.exprs[root].name)
     }
-    if ctx.exprs[tgt].kind == "ident" && !b.is_mut {
-        cerr(s.line, "cannot reassign immutable variable: " + ctx.exprs[root].name)
+    # Stage 8-alpha: use-after-move check on the LHS root.
+    # Whole-binding assignment (`x = ...`) on a `let mut` binding is allowed
+    # and revives the binding; field/index assignment requires the binding
+    # to be unmoved (because reading x.field reads x).
+    if b.moved {
+        if ctx.exprs[tgt].kind == "ident" {
+            if !b.is_mut {
+                cerr(s.line, "cannot reassign immutable variable: " + ctx.exprs[root].name)
+            }
+            # otherwise OK — will be revived below
+        } else {
+            cerr(s.line, "use of moved value: " + ctx.exprs[root].name)
+        }
+    } else {
+        if ctx.exprs[tgt].kind == "ident" && !b.is_mut {
+            cerr(s.line, "cannot reassign immutable variable: " + ctx.exprs[root].name)
+        }
     }
     let tt: str = check_lvalue(ctx, env, cur, tgt)
     let vt: str = check_expr(ctx, env, cur, s.value, tt)
@@ -2013,6 +2087,10 @@ fn check_assign(ctx: Ctx, env: list[map[str, Binding]], cur: str, s: StmtN) -> v
     }
     if vt != tt {
         cerr(s.line, "type mismatch on assignment: expected " + tt + ", got " + vt)
+    }
+    # Stage 8-alpha: revive the binding on whole-binding assignment.
+    if ctx.exprs[tgt].kind == "ident" {
+        let _ok: bool = revive_binding(env, ctx.exprs[root].name)
     }
 }
 
@@ -2071,6 +2149,10 @@ fn check_expr(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, expected
     } else if k == "ident" {
         let b: Binding = lookup_binding(env, ctx.exprs[e].name)
         if b.t != "" {
+            # Stage 8-alpha: use-after-move check
+            if b.moved {
+                cerr(ctx.exprs[e].line, "use of moved value: " + ctx.exprs[e].name)
+            }
             ctx.exprs[e].t = b.t
         } else if ctx.enums.has(ctx.exprs[e].name) {
             cerr(ctx.exprs[e].line, "enum name '" + ctx.exprs[e].name + "' cannot be used as a value")
@@ -2550,6 +2632,57 @@ fn check_builtin_call(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, 
         add_edge(ctx, cur, "b:file_exists")
         return "bool"
     }
+    # ----- Stage 8-alpha: ownership primitives (drop / clone / take) -----
+    if name == "drop" {
+        if nargs != 1 {
+            cerr(line, "drop() expects 1 argument")
+        }
+        let at: str = argt.get(0)
+        if !is_owned_type(at) {
+            cerr(line, "drop() requires an owned (heap) type, got " + at)
+        }
+        # Argument must be a plain identifier so we can mark its binding.
+        let arg_idx: int = ctx.exprs[e].args.get(0)
+        if ctx.exprs[arg_idx].kind != "ident" {
+            cerr(line, "drop() requires a variable name (not an expression)")
+        }
+        let arg_name: str = ctx.exprs[arg_idx].name
+        if !mark_moved(env, arg_name) {
+            cerr(line, "drop() argument is not a binding: " + arg_name)
+        }
+        return "void"
+    }
+    if name == "clone" {
+        if nargs != 1 {
+            cerr(line, "clone() expects 1 argument")
+        }
+        let at2: str = argt.get(0)
+        if !is_owned_type(at2) {
+            cerr(line, "clone() requires an owned (heap) type, got " + at2)
+        }
+        if !is_clone_supported(at2) {
+            cerr(line, "clone() on type " + at2 + " is not supported in v0.4.0-alpha (only str, list/map of int/float/bool/str are supported)")
+        }
+        return at2
+    }
+    if name == "take" {
+        if nargs != 1 {
+            cerr(line, "take() expects 1 argument")
+        }
+        let at3: str = argt.get(0)
+        if !is_owned_type(at3) {
+            cerr(line, "take() requires an owned (heap) type, got " + at3)
+        }
+        let arg_idx3: int = ctx.exprs[e].args.get(0)
+        if ctx.exprs[arg_idx3].kind != "ident" {
+            cerr(line, "take() requires a variable name (not an expression)")
+        }
+        let arg_name3: str = ctx.exprs[arg_idx3].name
+        if !mark_moved(env, arg_name3) {
+            cerr(line, "take() argument is not a binding: " + arg_name3)
+        }
+        return at3
+    }
     cerr(line, "unknown builtin function: " + name)
     return ""
 }
@@ -2970,7 +3103,7 @@ fn check_match(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, expecte
                         if lookup_exists(env, bname) {
                             cerr(arm.line, "shadowing not allowed in match arm: " + bname)
                         }
-                        env.get(env.len() - 1).set(bname, Binding { t: inst_pt, is_mut: false })
+                        env.get(env.len() - 1).set(bname, Binding { t: inst_pt, is_mut: false, moved: false })
                     }
                     bi = bi + 1
                 }
@@ -3589,6 +3722,92 @@ fn runtime_lines() -> list[str] {
     r.push("    return stat(path->data, &st) == 0 && S_ISREG(st.st_mode);")
     r.push("}")
     r.push("")
+    # ----- Stage 8-alpha: ownership primitives runtime -----
+    # drop() is a compile-time annotation only; runtime no-op. The compiler
+    # emits ((void)0) for drop(x). Memory reclamation is deferred to a later
+    # Stage 8-beta (refcounted or borrow-checked runtime).
+    # clone() helpers — one per supported type. Stage 8-alpha supports:
+    #   str, list[prim], map[str, prim] (prim ∈ {int, float, bool, str})
+    # Strings are immutable, so a shallow copy is a deep copy.
+    r.push("// clone(str) — strings are immutable, so a shallow copy is fine.")
+    r.push("static hl_str* hl_clone_str(hl_str* s) {")
+    r.push("    return hl_str_from(s->data, s->len);")
+    r.push("}")
+    r.push("")
+    # Per-element-type list clone: allocates a new list, pushes a clone of
+    # each element. For primitive (unboxed) element types, the clone is just
+    # the value itself (with a new box). For str element type, we clone the
+    # string too. Struct/enum element types are not supported in v0.4.0-alpha.
+    r.push("// clone(list[int]) — deep copy with new box per element.")
+    r.push("static hl_list* hl_clone_list_int(hl_list* l) {")
+    r.push("    hl_list* r = hl_list_new();")
+    r.push("    for (int64_t i = 0; i < l->len; i++) {")
+    r.push("        hl_list_push(r, hl_box_i64(hl_unbox_i64(l->items[i])));")
+    r.push("    }")
+    r.push("    return r;")
+    r.push("}")
+    r.push("")
+    r.push("static hl_list* hl_clone_list_float(hl_list* l) {")
+    r.push("    hl_list* r = hl_list_new();")
+    r.push("    for (int64_t i = 0; i < l->len; i++) {")
+    r.push("        hl_list_push(r, hl_box_f64(hl_unbox_f64(l->items[i])));")
+    r.push("    }")
+    r.push("    return r;")
+    r.push("}")
+    r.push("")
+    r.push("static hl_list* hl_clone_list_bool(hl_list* l) {")
+    r.push("    hl_list* r = hl_list_new();")
+    r.push("    for (int64_t i = 0; i < l->len; i++) {")
+    r.push("        hl_list_push(r, hl_box_bool(hl_unbox_bool(l->items[i])));")
+    r.push("    }")
+    r.push("    return r;")
+    r.push("}")
+    r.push("")
+    r.push("static hl_list* hl_clone_list_str(hl_list* l) {")
+    r.push("    hl_list* r = hl_list_new();")
+    r.push("    for (int64_t i = 0; i < l->len; i++) {")
+    r.push("        hl_list_push(r, hl_clone_str((hl_str*)l->items[i]));")
+    r.push("    }")
+    r.push("    return r;")
+    r.push("}")
+    r.push("")
+    # Map clone: similar pattern. Iterate insertion order, clone values.
+    r.push("static hl_map* hl_clone_map_int(hl_map* m) {")
+    r.push("    hl_map* r = hl_map_new();")
+    r.push("    for (int64_t i = 0; i < m->order->len; i++) {")
+    r.push("        hl_str* k = (hl_str*)m->order->items[i];")
+    r.push("        hl_map_set(r, hl_clone_str(k), hl_box_i64(hl_unbox_i64(hl_map_get(m, k, NULL))));")
+    r.push("    }")
+    r.push("    return r;")
+    r.push("}")
+    r.push("")
+    r.push("static hl_map* hl_clone_map_float(hl_map* m) {")
+    r.push("    hl_map* r = hl_map_new();")
+    r.push("    for (int64_t i = 0; i < m->order->len; i++) {")
+    r.push("        hl_str* k = (hl_str*)m->order->items[i];")
+    r.push("        hl_map_set(r, hl_clone_str(k), hl_box_f64(hl_unbox_f64(hl_map_get(m, k, NULL))));")
+    r.push("    }")
+    r.push("    return r;")
+    r.push("}")
+    r.push("")
+    r.push("static hl_map* hl_clone_map_bool(hl_map* m) {")
+    r.push("    hl_map* r = hl_map_new();")
+    r.push("    for (int64_t i = 0; i < m->order->len; i++) {")
+    r.push("        hl_str* k = (hl_str*)m->order->items[i];")
+    r.push("        hl_map_set(r, hl_clone_str(k), hl_box_bool(hl_unbox_bool(hl_map_get(m, k, NULL))));")
+    r.push("    }")
+    r.push("    return r;")
+    r.push("}")
+    r.push("")
+    r.push("static hl_map* hl_clone_map_str(hl_map* m) {")
+    r.push("    hl_map* r = hl_map_new();")
+    r.push("    for (int64_t i = 0; i < m->order->len; i++) {")
+    r.push("        hl_str* k = (hl_str*)m->order->items[i];")
+    r.push("        hl_map_set(r, hl_clone_str(k), hl_clone_str((hl_str*)hl_map_get(m, k, NULL)));")
+    r.push("    }")
+    r.push("    return r;")
+    r.push("}")
+    r.push("")
     return r
 }
 
@@ -4004,6 +4223,36 @@ fn gen_call(ctx: Ctx, e: int) -> str {
     }
     if name == "file_exists" {
         return "hl_file_exists(" + args + ")"
+    }
+    # ----- Stage 8-alpha: ownership primitives -----
+    # drop(x) is a compile-time annotation; at runtime (arena mode) it's a no-op.
+    # The compiler still emits a (void) cast so the C compiler doesn't warn.
+    if name == "drop" {
+        return "((void)0)"
+    }
+    # clone(x) dispatches by type. v0.4.0-alpha supports:
+    #   str, list[prim], map[str, prim] (prim ∈ {int, float, bool, str})
+    # Each supported type has a dedicated runtime helper.
+    if name == "clone" {
+        let at: str = ctx.exprs[ctx.exprs[e].args.get(0)].t
+        if at == "str" {
+            return "hl_clone_str(" + args + ")"
+        }
+        if is_list_t(at) {
+            let elem: str = list_elem_t(at)
+            return "hl_clone_list_" + elem + "(" + args + ")"
+        }
+        if is_map_t(at) {
+            let vt: str = map_val_t(at)
+            return "hl_clone_map_" + vt + "(" + args + ")"
+        }
+        # Unsupported types are rejected at check time, so this is unreachable.
+        panic("internal codegen error: clone() on unsupported type " + at)
+        return ""
+    }
+    # take(x) is a compile-time move; at runtime it's just the value.
+    if name == "take" {
+        return args
     }
     panic("internal codegen error: unknown builtin function " + name)
     return ""

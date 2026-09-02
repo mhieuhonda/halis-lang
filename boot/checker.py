@@ -116,8 +116,18 @@ BUILTIN_FNS = {
     "print", "println", "panic", "exit", "str", "int", "len", "range",
     "map_new", "read_file", "write_file", "args", "clock_ms", "chr",
     "file_exists",
+    # Stage 8-alpha ownership primitives (v0.4.0-alpha)
+    "drop", "clone", "take",
 }
 IO_BUILTINS = {"print", "println", "read_file", "write_file", "exit", "args", "clock_ms", "file_exists"}
+
+# Types whose values are "owned" heap allocations — subject to move tracking.
+# Primitives (int/float/bool) are Copy: passing them never moves.
+def is_owned_type(t):
+    """True if values of this type are heap-owned and subject to move tracking."""
+    if t in ("int", "float", "bool", "void", "never"):
+        return False
+    return True  # str, list, map, struct, enum — all heap-allocated in v0.4
 
 STR_M = {
     "len": ([], "int"), "byte_at": (["int"], "int"),
@@ -259,18 +269,21 @@ class Checker:
         self.check_effects()
 
     # ---------- environment ----------
+    # Bindings are now [type, mut, moved] (3-tuple) — `moved` is True after
+    # `drop(x)` or `take(x)`, which forbids subsequent use of `x` until it is
+    # re-assigned. See sections 16 (Stage 8-alpha) in SPEC.md.
     def new_env(self, fn):
         env = [{}]
         if fn["struct"] is not None:
             sname, stype, smut = fn["params"][0]
-            env[0][sname] = [stype, smut]
+            env[0][sname] = [stype, smut, False]
             params = fn["params"][1:]
         else:
             params = fn["params"]
         for pn, pt, pm in params:
             if pn in env[0]:
                 self.err("duplicate parameter name: %s" % pn, fn)
-            env[0][pn] = [pt, pm]
+            env[0][pn] = [pt, pm, False]
         return env
 
     def lookup(self, env, name):
@@ -278,6 +291,39 @@ class Checker:
             if name in scope:
                 return scope[name]
         return None
+
+    def mark_moved(self, env, name):
+        """Mark a binding as moved (drop/take). Returns True on success."""
+        for scope in reversed(env):
+            if name in scope:
+                scope[name][2] = True
+                return True
+        return False
+
+    def revive_binding(self, env, name):
+        """Re-clear moved status on reassignment (binding becomes 're-owned')."""
+        for scope in reversed(env):
+            if name in scope:
+                scope[name][2] = False
+                return True
+        return False
+
+    def snapshot_moved(self, env):
+        """Take a snapshot of moved-status for all bindings (for scope restore)."""
+        snap = []
+        for scope in env:
+            row = {}
+            for name, b in scope.items():
+                row[name] = b[2]
+            snap.append(row)
+        return snap
+
+    def restore_moved(self, env, snap):
+        """Restore moved-status from a snapshot (used when child scope exits)."""
+        for scope, snap_row in zip(env, snap):
+            for name, moved in snap_row.items():
+                if name in scope:
+                    scope[name][2] = moved
 
     def check_fn(self, key, fn):
         self.cur_fn = key
@@ -329,18 +375,22 @@ class Checker:
                 self.err("shadowing not allowed: %s" % s["name"], s)
             vt = self.check_expr(s["value"], env, s["t"])
             if vt == "never":
-                env[-1][s["name"]] = [s["t"], s["mut"]]
+                env[-1][s["name"]] = [s["t"], s["mut"], False]
                 return
             if vt != s["t"]:
                 self.err("type mismatch: declared %s but got %s"
                          % (s["t"], vt), s)
-            env[-1][s["name"]] = [s["t"], s["mut"]]
+            env[-1][s["name"]] = [s["t"], s["mut"], False]
         elif k == "assign":
             self.check_assign(s, env)
         elif k == "if":
             ct = self.check_expr(s["cond"], env, None)
             if ct != "bool":
                 self.err("if condition must be bool, got %s" % ct, s)
+            # Stage 8-alpha: take a snapshot of moved-status so moves done in
+            # the then/else branches don't leak out (a binding moved inside an
+            # if-arm should not be considered moved after the if completes).
+            snap = self.snapshot_moved(env)
             self.child(env)
             self.check_stmts(s["then"], env, fn, in_loop)
             env.pop()
@@ -348,13 +398,18 @@ class Checker:
                 self.child(env)
                 self.check_stmts(s["els"], env, fn, in_loop)
                 env.pop()
+            self.restore_moved(env, snap)
         elif k == "while":
             ct = self.check_expr(s["cond"], env, None)
             if ct != "bool":
                 self.err("while condition must be bool, got %s" % ct, s)
+            # Moves inside the loop body don't leak out — the loop may execute
+            # zero or many times, so any post-loop use must remain valid.
+            snap = self.snapshot_moved(env)
             self.child(env)
             self.check_stmts(s["body"], env, fn, True)
             env.pop()
+            self.restore_moved(env, snap)
         elif k == "for":
             it = self.check_expr(s["iter"], env, None)
             if not is_list(it):
@@ -363,10 +418,12 @@ class Checker:
             if s["vtype"] != elem:
                 self.err("loop variable type %s does not match element %s"
                          % (s["vtype"], elem), s)
+            snap = self.snapshot_moved(env)
             self.child(env)
-            env[-1][s["var"]] = [elem, False]
+            env[-1][s["var"]] = [elem, False, False]
             self.check_stmts(s["body"], env, fn, True)
             env.pop()
+            self.restore_moved(env, snap)
         elif k == "return":
             if fn["ret"] == "void":
                 if s["value"] is not None:
@@ -398,16 +455,35 @@ class Checker:
         binding = self.lookup(env, root["name"])
         if binding is None:
             self.err("variable does not exist: %s" % root["name"], s)
-        # 'mut' only governs REASSIGNMENT of the binding (name = v).
-        # Field/index assignment mutates CONTENTS through a reference — no mut needed.
-        if tgt["k"] == "ident" and not binding[1]:
-            self.err("cannot reassign immutable variable: %s" % root["name"], s)
+        # Stage 8-alpha: use-after-move check on the LHS root.
+        # Reading a moved binding (even to reassign) requires `mut` first.
+        # For `mut x = ...`, the binding is "revived" — its moved flag is cleared.
+        # For `x.field = ...` / `xs[i] = ...`, the binding itself is being read
+        # (to obtain the reference), so moved bindings cannot be used.
+        if len(binding) >= 3 and binding[2]:
+            if tgt["k"] == "ident":
+                # Whole-binding assignment: this is allowed on `let mut` only.
+                # The binding will be revived below after the RHS is checked.
+                if not binding[1]:
+                    self.err("cannot reassign immutable variable: %s" % root["name"], s)
+            else:
+                # Field/index assignment — uses the binding's value (reference).
+                self.err("use of moved value: %s" % root["name"], s)
+        else:
+            # 'mut' only governs REASSIGNMENT of the binding (name = v).
+            # Field/index assignment mutates CONTENTS through a reference — no mut needed.
+            if tgt["k"] == "ident" and not binding[1]:
+                self.err("cannot reassign immutable variable: %s" % root["name"], s)
         tt = self.check_lvalue(tgt, env)
         vt = self.check_expr(s["value"], env, tt)
         if vt == "never":
             return
         if vt != tt:
             self.err("type mismatch on assignment: expected %s, got %s" % (tt, vt), s)
+        # Stage 8-alpha: revive the binding (clear moved) on whole-binding
+        # assignment. The binding now owns a fresh value.
+        if tgt["k"] == "ident":
+            self.revive_binding(env, root["name"])
 
     def check_lvalue(self, e, env):
         if e["k"] == "ident":
@@ -449,6 +525,9 @@ class Checker:
         elif k == "ident":
             b = self.lookup(env, e["name"])
             if b is not None:
+                # Stage 8-alpha: use-after-move check
+                if len(b) >= 3 and b[2]:
+                    self.err("use of moved value: %s" % e["name"], e)
                 e["t"] = b[0]
             elif e["name"] in self.enums:
                 # bare enum name used as a value — only valid inside an enum
@@ -855,7 +934,56 @@ class Checker:
             argt(0, "str")
             self.edges[self.cur_fn].add("b:file_exists")
             return "bool"
+        # ----- Stage 8-alpha: ownership primitives (drop / clone / take) -----
+        if name == "drop":
+            need(1)
+            at = argt(0, None)
+            if not is_owned_type(at):
+                self.err("drop() requires an owned (heap) type, got %s" % at, e)
+            # The argument must be a simple `ident` lvalue — we need a binding
+            # to mark as moved. Complex expressions are not allowed.
+            arg = args[0]
+            if arg["k"] != "ident":
+                self.err("drop() requires a variable name (not an expression)", e)
+            # Mark the binding as moved.
+            if not self.mark_moved(env, arg["name"]):
+                self.err("drop() argument is not a binding: %s" % arg["name"], e)
+            return "void"
+        if name == "clone":
+            need(1)
+            at = argt(0, None)
+            if not is_owned_type(at):
+                self.err("clone() requires an owned (heap) type, got %s" % at, e)
+            if not self.is_clone_supported(at):
+                self.err("clone() on type %s is not supported in v0.4.0-alpha "
+                         "(only str, list/map of int/float/bool/str are supported)"
+                         % at, e)
+            # Argument is consumed by value (read), not moved.
+            return at
+        if name == "take":
+            need(1)
+            at = argt(0, None)
+            if not is_owned_type(at):
+                self.err("take() requires an owned (heap) type, got %s" % at, e)
+            arg = args[0]
+            if arg["k"] != "ident":
+                self.err("take() requires a variable name (not an expression)", e)
+            if not self.mark_moved(env, arg["name"]):
+                self.err("take() argument is not a binding: %s" % arg["name"], e)
+            return at
         self.err("unknown builtin function: %s" % name, e)
+
+    @staticmethod
+    def is_clone_supported(t):
+        """Types supported by clone() in v0.4.0-alpha. Stage 8-beta will
+        expand this to all heap types via per-instantiation helpers."""
+        if t == "str":
+            return True
+        if is_list(t):
+            return list_elem(t) in ("int", "float", "bool", "str")
+        if is_map(t):
+            return map_val(t) in ("int", "float", "bool", "str")
+        return False
 
     def check_method(self, e, env):
         tt = self.check_expr(e["target"], env, None)
@@ -1038,7 +1166,7 @@ class Checker:
                                     continue
                                 if self.lookup(env, bname) is not None:
                                     self.err("shadowing not allowed in match arm: %s" % bname, arm)
-                                env[-1][bname] = [btype, False]
+                                env[-1][bname] = [btype, False, False]
                             break
             body_t = self.check_expr(arm["body"], env, expected)
             arm["body_t"] = body_t
