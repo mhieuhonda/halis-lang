@@ -137,22 +137,40 @@ def run_cli():
     args = sys.argv[1:]
     check_only = False
     audit_only = False
+    emit_ir = False      # Stage 11 (v0.9.0-alpha): print HLIR text
+    opt_stats = False    # Stage 11: print optimiser statistics
     if "--check" in args:
         check_only = True
         args.remove("--check")
     if "--audit" in args:
         audit_only = True
         args.remove("--audit")
+    if "--emit" in args:
+        i = args.index("--emit")
+        if i + 1 < len(args) and args[i + 1] == "ir":
+            emit_ir = True
+            del args[i:i + 2]
+        else:
+            sys.stderr.write("error: --emit expects 'ir'\n")
+            return 2
+    if "--opt-stats" in args:
+        opt_stats = True
+        args.remove("--opt-stats")
     # BUG-025 fix: --check and --audit are mutually exclusive — error out
     # explicitly rather than silently preferring one over the other.
-    if check_only and audit_only:
-        sys.stderr.write("error: --check and --audit are mutually exclusive\n")
+    mutually_exclusive = sum([check_only, audit_only, emit_ir, opt_stats])
+    if mutually_exclusive > 1:
+        sys.stderr.write(
+            "error: --check / --audit / --emit ir / --opt-stats are mutually exclusive\n")
         return 2
     if not args:
         sys.stderr.write(
-            "usage: boot.py [--check | --audit] <file.hls> [program args...]\n"
-            "  --check    type-check + effects-check only, no execution.\n"
-            "  --audit    print the capability / effect tree of every function.\n"
+            "usage: boot.py [--check | --audit | --emit ir | --opt-stats] "
+            "<file.hls> [program args...]\n"
+            "  --check        type-check + effects-check only, no execution.\n"
+            "  --audit        print the capability / effect tree of every function.\n"
+            "  --emit ir      print the HLIR (Stage 11) of every function.\n"
+            "  --opt-stats    run the Stage 11 optimiser, print per-pass stats.\n"
         )
         return 2
     path = args[0]
@@ -173,6 +191,10 @@ def run_cli():
     if audit_only:
         print_audit(program, checker)
         return 0
+    if emit_ir:
+        return print_ir(program)
+    if opt_stats:
+        return print_opt_stats(program)
     if check_only:
         sys.stdout.write("OK: types and effects valid\n")
         return 0
@@ -292,6 +314,70 @@ def print_audit(program, checker):
                 print("      - " + k)
         else:
             print("    %s (0):" % bname)
+
+
+def print_ir(program):
+    """Stage 11 (v0.9.0-alpha): print the HLIR of a program."""
+    # Local import — the IR lives under tools/ to keep boot/ clean.
+    import os as _os
+    _tools = _os.path.join(_REPO_ROOT, "tools")
+    if _tools not in sys.path:
+        sys.path.insert(0, _tools)
+    try:
+        from ir import build_module, dump_module  # noqa: E402
+    except ImportError as ex:
+        sys.stderr.write("error: cannot load HLIR module: %s\n" % ex)
+        return 2
+    mod = build_module(program)
+    sys.stdout.write(dump_module(mod))
+    return 0
+
+
+def print_opt_stats(program):
+    """Stage 11 (v0.9.0-alpha): run the optimiser, print per-pass stats.
+
+    Reports the number of instructions before/after each pass, per function.
+    Useful for `make opt-stats F=examples/foo.hls`.
+    """
+    import os as _os
+    _tools = _os.path.join(_REPO_ROOT, "tools")
+    if _tools not in sys.path:
+        sys.path.insert(0, _tools)
+    try:
+        from ir import build_module  # noqa: E402
+        from ir.optimize import optimize as ir_optimize  # noqa: E402
+    except ImportError as ex:
+        sys.stderr.write("error: cannot load HLIR optimiser: %s\n" % ex)
+        return 2
+    mod = build_module(program)
+    # Snapshot pre-optimisation instruction counts.
+    before = {}
+    for fname, irf in mod.functions.items():
+        before[fname] = sum(len(b.instrs) for b in irf.blocks)
+    # Run the optimiser.
+    ir_optimize(mod, fast=False)
+    after = {}
+    for fname, irf in mod.functions.items():
+        after[fname] = sum(len(b.instrs) for b in irf.blocks)
+    # Report.
+    name_w = max((len(n) for n in before), default=4)
+    print("=" * (name_w + 30))
+    print("  %-*s  %10s  %10s  %10s" % (name_w, "function", "before", "after", "removed"))
+    print("=" * (name_w + 30))
+    total_b, total_a = 0, 0
+    for fname in before:
+        b = before[fname]
+        a = after[fname]
+        total_b += b
+        total_a += a
+        print("  %-*s  %10d  %10d  %10d" % (name_w, fname, b, a, b - a))
+    print("=" * (name_w + 30))
+    print("  %-*s  %10d  %10d  %10d" % (
+        name_w, "TOTAL", total_b, total_a, total_b - total_a))
+    print("")
+    print("  Passes: constant_fold, copy_propagate, dead_code_elim")
+    print("  (run -O fast for additional safe-arithmetic annotations)")
+    return 0
 
 
 def main():

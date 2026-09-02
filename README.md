@@ -113,7 +113,7 @@ make bootstrap
 # 3. Compile your program to a native binary
 make run F=examples/primes.hls
 
-# 4. Run the full test suite (143 tests: types, effects, ownership, taint, taint-beta, differential, bootstrap)
+# 4. Run the full test suite (145 tests: types, effects, ownership, taint, taint-beta, optimize, differential, bootstrap)
 make test
 
 # 5. Try the fine-grained effects (v0.7.0-alpha)
@@ -127,6 +127,10 @@ python3 boot/boot.py examples/taint_demo.hls "first arg" "/api/users"
 
 # 8. Run the Stage 10-beta demo (read_file_tainted + extended audit, v0.8.0-alpha)
 python3 boot/boot.py examples/taint_beta_demo.hls examples/data.txt
+
+# 9. Stage 11-alpha: print HLIR / optimiser stats (v0.9.0-alpha)
+python3 boot/boot.py --emit ir examples/optimize_demo.hls
+python3 boot/boot.py --opt-stats examples/optimize_demo.hls
 ```
 
 ## Language example

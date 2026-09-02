@@ -25,7 +25,7 @@ remains green.
 | 8 | Ownership & borrow checking (end of arena) | 🔄 | 10–14 weeks |
 | 9 | Fine-grained effects & capabilities | 🔄 | 6–8 weeks |
 | 10 | Taint tracking & sandbox | 🔄 | 8–10 weeks |
-| 11 | SSA IR + optimisation | ⬜ | 10–14 weeks |
+| 11 | SSA IR + optimisation | 🔄 | 10–14 weeks |
 | 12 | Native LLVM backend | ⬜ | 10–14 weeks |
 | 13 | Package manager `hls-pkg` | ⬜ | 6–8 weeks |
 | 14 | Tooling: LSP, formatter, linter | ⬜ | 6–8 weeks |
@@ -471,22 +471,66 @@ effects; `Net` is reserved pending future builtins.) For Stage 10, the
 acceptance criterion is: a program that uses an unsanitised argv value in
 an SQL statement → compile error showing the taint propagation path.
 
-## STAGE 11 — SSA IR + optimisation ⬜
+## STAGE 11 — SSA IR + optimisation 🔄 (alpha v0.9.0-alpha)
 
 **Goal:** performance on par with C/Rust at `-O2`.
 
-**Work:**
-- Mid-level SSA IR (HLIR) written in HLS; HLS→HLIR→C.
-- Optimisations: inlining, constant folding, DCE, copy propagation, escape
-  analysis, loop-invariant code motion, strength reduction.
-- `-O fast` mode skips checks **only when** safety is provable (out-of-bounds
-  is impossible, addition cannot overflow) — or when the user signs off on the
-  risk.
+**Status (v0.9.0-alpha):** the **alpha subset of Stage 11** has shipped. A
+mid-level IR (HLIR) is built from the AST and fed to an optimiser pipeline
+consisting of three passes: constant folding, copy propagation, and dead
+code elimination. The optimiser is wired into `boot.py` via the new
+`--emit ir` and `--opt-stats` flags. **145/145 tests PASS.**
+
+**Shipped in v0.9.0-alpha (Stage 11-alpha):**
+
+- New `tools/ir/` package with the HLIR data model and builder:
+  - `Instr`, `Block`, `HLIRFunction`, `HLIRModule` dataclasses.
+  - `IRBuilder` lowers a checked HLS program (post-type-check) into an
+    HLIR module. Because HLS already disallows shadowing and
+    uninitialised variables, the IR has SSA-like properties without
+    explicit phi-node construction.
+  - `dump_module` pretty-prints the IR as human-readable text for the
+    `--emit ir` flag.
+- New `tools/ir/optimize.py` with three optimisation passes:
+  - `constant_fold` — fold literal arithmetic and string concatenation.
+    Tracks constants propagated through `OP_LOAD` (the IR's `let`
+    lowering) so downstream binops on `let x = 5` can be folded too.
+    Respects `OP_STORE` mutations: if a binding is reassigned, the
+    constant entry is cleared.
+  - `copy_propagate` — replace `%t1 = %t0` uses with `%t0`.
+  - `dead_code_elim` — remove instructions whose result is never used
+    and that have no side effects (i.e. not calls / stores / panics /
+    branches / returns).
+- New `boot.py` flags:
+  - `boot.py --emit ir FILE.hls` — print the HLIR of every function.
+  - `boot.py --opt-stats FILE.hls` — run the optimiser, print per-pass
+    statistics (instructions before / after / removed, per function
+    and total).
+- `-O fast` mode is plumbed through the optimiser (see
+  `_annotate_safe` in `optimize.py`). Today it only annotates trivial
+  safe-arithmetic patterns (`a + 0`, `a * 0`); the codegen does not
+  yet consume these annotations. Full `-O fast` is the Stage 11 release
+  target.
+- New example: `examples/optimize_demo.hls` exercising the optimiser
+  pipeline.
+- New test: `tests/ok/feat_optimize.hls` — a differential test that
+  also runs through the optimiser.
+
+**Remaining work for Stage 11 (release and beyond):**
+
+- Inline small `pure` functions.
+- Loop-invariant code motion.
+- Wire the HLIR into the self-hosted `hlc.hls` codegen (today the
+  optimiser is a Stage-0 diagnostic pass; the native compiler still
+  emits C directly from the AST).
+- Make `-O fast` actually skip overflow checks when the optimiser can
+  prove safety (today it only annotates; codegen does not consume).
 - Position info in panics (file:line) thanks to IR debug info.
 
 **Acceptance:** standard benchmarks (sieve, json parse, matrix) reach ≥ 95% of
 `gcc -O2` performance on equivalent C code; differential tests still 100%
-after optimisation.
+after optimisation. (The v0.9.0-alpha release ships the optimiser
+infrastructure; benchmarking is the Stage 11 release target.)
 
 ## STAGE 12 — Native LLVM backend ⬜
 

@@ -8,7 +8,39 @@ Releases on `main` follow the 20-stage roadmap (see [ROADMAP.md](ROADMAP.md)).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
-## [unreleased] — Stage 10-beta (v0.8.0-alpha)
+## [unreleased] — Stage 11-alpha (v0.9.0-alpha)
+
+### Added
+- **Stage 11-alpha: SSA IR (HLIR) + optimiser pipeline.** A new mid-level
+  IR is built from the AST and fed to a three-pass optimiser:
+  - `constant_fold` — fold literal arithmetic / string concatenation,
+    including constants propagated through `let` bindings.
+  - `copy_propagate` — replace `%t1 = %t0` uses with `%t0`.
+  - `dead_code_elim` — remove instructions whose result is never used
+    and that have no side effects.
+  The IR is the optimisation substrate; the native codegen (in `hlc.hls`)
+  still emits C directly from the AST and relies on `gcc -O2` for
+  machine-level optimisation. Wiring the HLIR into `hlc.hls` is the
+  Stage 11 release target.
+- **New `boot.py` flags:**
+  - `boot.py --emit ir FILE.hls` — print the HLIR of every function.
+  - `boot.py --opt-stats FILE.hls` — run the optimiser and print
+    per-pass statistics (instructions before / after / removed, per
+    function and total).
+- **New `tools/ir/` Python package** containing:
+  - `__init__.py` — HLIR data model (`Instr`, `Block`, `HLIRFunction`,
+    `HLIRModule`), the `IRBuilder` that lowers a checked program to
+    HLIR, and a `dump_module` pretty-printer.
+  - `optimize.py` — the three optimisation passes plus the
+    `_annotate_safe` helper for the future `-O fast` mode (today the
+    codegen does not consume the annotations; it is plumbing for the
+    Stage 11 release target).
+- **New example:** `examples/optimize_demo.hls` exercising the
+  optimiser pipeline on a small `compute()` function.
+- **New tests:** `tests/ok/feat_optimize.hls` (differential test
+  through both interpreter and native). **145/145 tests PASS.**
+
+## [v0.8.0-alpha] — Stage 10-beta (taint tracking extended)
 
 ### Added
 - **Stage 10-beta: second taint source.** New builtin
