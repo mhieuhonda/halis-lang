@@ -362,25 +362,32 @@ def extract_effects(file_path: str) -> Tuple[List[str], List[str]]:
     computed = set()
     KNOWN_EFFECTS = {"IO", "Fs", "Clock", "Args", "Exit"}
     for line in result.stdout.split("\n"):
-        # Look for status lines like:
-        #   greet  (none - pure)  (none)  OK
-        #   main   IO             IO      OK
-        # We want to collect all declared effects (column 2) and all
-        # computed effects (column 3) — but only count actual effect names.
-        if line.startswith("  ") and "OK" in line:
-            parts = line.strip().split()
-            for p in parts:
-                if p in KNOWN_EFFECTS:
-                    declared.add(p)
-                if p in KNOWN_EFFECTS:
-                    computed.add(p)
-            # Also handle comma-separated lists like "Args, Clock"
-            for tok in line.split():
-                for sub in tok.split(","):
-                    sub = sub.strip()
-                    if sub in KNOWN_EFFECTS:
-                        declared.add(sub)
-                        computed.add(sub)
+        # BUG-SC-PKG-11 fix: the previous parser added every effect name
+        # found on each status line to BOTH declared and computed, making
+        # them always identical (the union of all effects across all
+        # functions). This made effect enforcement meaningless. Now we
+        # properly split each audit line into columns: function name,
+        # declared, computed, status. The boot.py audit output formats
+        # these as fixed-width columns separated by 2+ spaces.
+        if line.startswith("  ") and ("OK" in line or "VIOLATION" in line):
+            # Strip the leading indent and split on 2+ spaces.
+            stripped = line.strip()
+            # Split on runs of 2+ spaces to get the columns.
+            import re as _re
+            cols = _re.split(r"\s{2,}", stripped)
+            if len(cols) < 4:
+                continue
+            # cols[0] = function name, cols[1] = declared, cols[2] = computed,
+            # cols[3] = status (OK / VIOLATION: ...).
+            # Parse comma-separated effect names from each column.
+            for eff in cols[1].replace("pure", "").replace("(none - pure)", "").replace("(none)", "").split(","):
+                eff = eff.strip()
+                if eff in KNOWN_EFFECTS:
+                    declared.add(eff)
+            for eff in cols[2].replace("(none)", "").split(","):
+                eff = eff.strip()
+                if eff in KNOWN_EFFECTS:
+                    computed.add(eff)
     return sorted(declared), sorted(computed)
 
 
@@ -582,9 +589,37 @@ def cmd_build(args):
         return 1
     boot_py = os.path.join(REPO_ROOT, "boot", "boot.py")
     print("Building %s..." % entry)
+    # BUG-SC-PKG-12 fix: if a lockfile exists, symlink each resolved
+    # dependency into a local `.hls-pkg-deps/` directory and set
+    # HLS_PKG_DEPS env var so boot.py's import resolver can find them.
+    # Previously `hls-pkg build` just ran `boot.py <entry>` with no import
+    # path, so any `import` in the entry file failed with "module not found".
+    lock_path = os.path.join(os.getcwd(), "hls-pkg.lock")
+    env = os.environ.copy()
+    deps_dir = None
+    if os.path.isfile(lock_path):
+        import json as _json
+        with open(lock_path) as lf:
+            lockfile = _json.load(lf)
+        deps_dir = os.path.join(os.getcwd(), ".hls-pkg-deps")
+        os.makedirs(deps_dir, exist_ok=True)
+        for pkg in lockfile.get("packages", []):
+            rp = pkg.get("resolved_path", "")
+            if rp and os.path.isfile(rp):
+                # Symlink (or copy) the dep file into deps_dir so boot.py
+                # can resolve `import "dep_name"` via the standard search path.
+                dst = os.path.join(deps_dir, os.path.basename(rp))
+                try:
+                    if os.path.islink(dst) or os.path.exists(dst):
+                        os.remove(dst)
+                    os.symlink(os.path.abspath(rp), dst)
+                except OSError:
+                    import shutil as _shutil
+                    _shutil.copy2(rp, dst)
+        env["HLS_PKG_DEPS"] = deps_dir
     cmd = [sys.executable, boot_py, entry]
     print("  $ %s" % " ".join(cmd))
-    result = subprocess.run(cmd)
+    result = subprocess.run(cmd, env=env)
     return result.returncode
 
 

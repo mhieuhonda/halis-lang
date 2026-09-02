@@ -16,6 +16,27 @@ from .lexer import HLError
 INT64_MAX = 9223372036854775807
 
 
+# Stage 10-alpha: built-in taint wrapper `tainted[T]`.
+# Single source of truth for taint-type predicates (BUG-SC-12: previously
+# `is_taint`/`taint_inner` and `is_tainted_type`/`list_taint_inner` were
+# duplicate implementations with slightly different behaviour — the `.strip()`]
+# was only in one of them. Consolidated here.)
+def is_taint(t):
+    return t.startswith("tainted[")
+
+
+def taint_inner(t):
+    # `.strip()` is harmless for parser-produced types (no interior spaces)
+    # but keeps the function robust if a future caller passes a hand-built
+    # type string with accidental whitespace.
+    return t[8:-1].strip()
+
+
+# Backwards-compatible aliases (used by boot/boot.py and tools/).
+is_tainted_type = is_taint
+list_taint_inner = taint_inner
+
+
 def is_list(t):
     return t.startswith("list[")
 
@@ -32,13 +53,9 @@ def map_val(t):
     return t[9:-1]
 
 
-# Stage 10-alpha: built-in taint wrapper `tainted[T]`.
-def is_taint(t):
-    return t.startswith("tainted[")
-
-
-def taint_inner(t):
-    return t[8:-1]
+# NOTE: is_taint / taint_inner / is_tainted_type / list_taint_inner are now
+# defined ONCE near the top of this file (BUG-SC-12 consolidation). The
+# duplicate definitions that used to live here have been removed.
 
 
 def split_type_args(s):
@@ -316,8 +333,17 @@ class Checker:
         # 2. check declarations (struct/enum field types, function signatures)
         for name, st in self.structs.items():
             self.cur_typeparams = set(st["typeparams"])
-            for fname, ftype, _ in st["fields"]:
+            # BUG-SC-7 fix: type-check struct field DEFAULT expressions.
+            # Previously defaults were not checked, so `struct Foo { x: int = "hi" }`
+            # compiled cleanly and only failed at runtime (type-safety hole).
+            # We check each default in an empty env (no bindings in scope).
+            for fname, ftype, fdefault in st["fields"]:
                 self.require_type(ftype, st, "struct field type")
+                if fdefault is not None:
+                    dv = self.check_expr(fdefault, [{}], ftype)
+                    if dv != "never" and dv != ftype:
+                        self.err("default value of field '%s' expects %s, got %s"
+                                 % (fname, ftype, dv), st)
             self.cur_typeparams = set()
         for ename, en in self.enums.items():
             self.cur_typeparams = set(en["typeparams"])
@@ -439,6 +465,15 @@ class Checker:
         if last["k"] == "return":
             return True
         if last["k"] == "expr" and last["e"].get("t") == "never":
+            return True
+        # BUG-SC-5 fix: a `let` or `assign` whose RHS is `never`-typed
+        # (e.g. `let x: int = panic("...")` or `x = exit(0)`) always
+        # diverges, so the function returns on all paths. Previously
+        # this was rejected with a spurious "does not return on all
+        # paths" error.
+        if last["k"] == "let" and last["value"].get("t") == "never":
+            return True
+        if last["k"] == "assign" and last["value"].get("t") == "never":
             return True
         if last["k"] == "if" and last["els"] is not None:
             return self.all_return(last["then"]) and self.all_return(last["els"])
@@ -707,10 +742,10 @@ class Checker:
             e["t"] = self.check_match(e, env, expected)
         elif k == "qmark":
             e["t"] = self.check_qmark(e, env, expected)
-        elif k == "mapnew":
-            if expected is None or not is_map(expected):
-                self.err("map_new() requires a 'map[str, T]' type in the surrounding context", e)
-            e["t"] = expected
+        # BUG-SC-10 fix: removed the dead `elif k == "mapnew":` branch.
+        # The parser never produces a `mapnew` AST node — `map_new()` is
+        # parsed as a `call` node with name="map_new" and dispatched via
+        # check_call -> check_builtin_call. This branch was unreachable.
         elif k == "enumlit":
             # Already rewritten during a previous visit (e.g. nested); re-evaluate.
             self.check_enum_variant(e, env, expected, with_args=len(e.get("args", [])) > 0)
@@ -849,16 +884,32 @@ class Checker:
 
     def check_listlit(self, e, env, expected):
         elem = None
+        first_vt = None  # BUG-SC-3 fix: cache first element's type
         if expected is not None and is_list(expected):
             elem = list_elem(expected)
         if elem is None:
             if not e["items"]:
                 self.err("empty list literal requires a type in the surrounding context", e)
-            elem = self.check_expr(e["items"][0], env, None)
+            # Check the first element ONCE to infer the element type, then
+            # reuse its cached type below. Previously the loop re-checked
+            # every item (including items[0]), which re-executed side
+            # effects (drop/take move-marking) and produced spurious
+            # "use of moved value" errors. Same class of bug as BUG-A/BUG-A2
+            # in check_call/check_structlit.
+            first_vt = self.check_expr(e["items"][0], env, None)
+            elem = first_vt
             if elem in ("void", "never"):
                 self.err("list element cannot have type %s" % elem, e)
-        for it in e["items"]:
-            vt = self.check_expr(it, env, elem)
+        for i, it in enumerate(e["items"]):
+            # Reuse the cached first-pass type for item 0 when available;
+            # avoids re-running check_expr (which would re-execute side
+            # effects like drop/take move-marking).
+            if i == 0 and first_vt is not None:
+                vt = first_vt
+            else:
+                vt = self.check_expr(it, env, elem)
+            if vt == "never":
+                continue
             if vt != elem:
                 self.err("list element mismatch: expected %s, got %s"
                          % (elem, vt), it)
@@ -1401,8 +1452,18 @@ class Checker:
                             for bname, btype in zip(pat["bindings"], inst_payloads):
                                 if bname == "_":
                                     continue
-                                if self.lookup(env, bname) is not None:
-                                    self.err("shadowing not allowed in match arm: %s" % bname, arm)
+                                # BUG-SC-2 fix: SPEC.md section 5 states that
+                                # match-arm bindings INTRODUCE a new scope and
+                                # may shadow outer bindings for the duration of
+                                # the arm (the one and only shadowing exception).
+                                # Previously `self.lookup(env, bname)` searched
+                                # ALL scopes and rejected any name already
+                                # bound anywhere — contradicting the SPEC. We
+                                # now only reject duplicates WITHIN the same
+                                # arm (e.g. `E.Foo(a, a)`), which is the only
+                                # real error.
+                                if bname in env[-1]:
+                                    self.err("duplicate binding name in match arm: %s" % bname, arm)
                                 env[-1][bname] = [btype, False, False]
                             break
             body_t = self.check_expr(arm["body"], env, expected)
@@ -1520,7 +1581,20 @@ class Checker:
                     if c.startswith("b:"):
                         new_eff = BUILTIN_EFFECTS.get(c[2:], set())
                     else:
-                        new_eff = eff.get(c, set())
+                        # BUG-SC-1 fix (SOUNDNESS): extern fns have no body
+                        # (so no outgoing edges), but their DECLARED effects
+                        # are part of the capability surface. A caller of an
+                        # extern fn must declare a superset of the extern's
+                        # declared `uses` set. Previously the fixpoint used
+                        # `eff[c]` (always empty for externs), so callers
+                        # silently bypassed the capability check — a function
+                        # calling `puts` (declared `uses IO`) without declaring
+                        # `uses IO` itself would compile cleanly.
+                        callee_fn = self.fns.get(c)
+                        if callee_fn is not None and callee_fn.get("extern", False):
+                            new_eff = set(callee_fn["effects"])
+                        else:
+                            new_eff = eff.get(c, set())
                     before = len(eff[key])
                     eff[key] |= new_eff
                     if len(eff[key]) != before:

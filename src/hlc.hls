@@ -66,7 +66,8 @@ struct FnInfo {
     is_method: bool,
     struct_of: str,
     typeparams: list[str],
-    line: int
+    line: int,
+    is_extern: bool        # Stage 15-beta: extern "C" fn — forward declaration, no body
 }
 
 struct MatchArm {
@@ -189,6 +190,11 @@ fn is_keyword(w: str) -> bool {
         || w == "break" || w == "continue" || w == "struct" || w == "impl"
         || w == "import" || w == "uses" || w == "true" || w == "false"
         || w == "enum" || w == "match" || w == "pure"
+        # Stage 15-beta: `extern` keyword for `extern "C" { ... }` blocks.
+        # Previously hlc.hls did not recognise `extern` as a keyword, so
+        # programs using FFI would fail to parse. This closes the Stage 15
+        # remaining-work gap documented in ROADMAP.md.
+        || w == "extern"
 }
 
 fn is_ident_start(c: int) -> bool {
@@ -642,6 +648,12 @@ fn eat_ident(ctx: Ctx) -> str {
     if t.kind != "ident" {
         perr(ctx, "expected identifier but got " + tok_desc(ctx))
     }
+    # BUG-SC-4 fix: reject reserved identifiers (secure / trait) — they
+    # are reserved for future keywords per SPEC section 2.5. boot/parser.py
+    # (BUG-29 fix) already rejects these; hlc.hls must match.
+    if t.value == "secure" || t.value == "trait" {
+        perr_at(ctx, "'" + t.value + "' is a reserved identifier and cannot be used as a name (it will become a keyword in a future stage)", t)
+    }
     ctx.pos = ctx.pos + 1
     return t.value
 }
@@ -773,8 +785,11 @@ fn parse_program(ctx: Ctx) -> void {
             }
             ctx.pos = ctx.pos + 1
             ctx.imports.push(pt.value)
+        } else if t.kind == "kw" && t.value == "extern" {
+            # Stage 15-beta: extern "C" { ... } block.
+            parse_extern_block(ctx)
         } else {
-            perr_at(ctx, "only struct/enum/impl/fn/import declarations allowed at top level", t)
+            perr_at(ctx, "only struct/enum/impl/fn/import/extern declarations allowed at top level", t)
         }
     }
 }
@@ -980,8 +995,122 @@ fn parse_fn(ctx: Ctx, impl_struct: str) -> FnInfo {
         name: name, params: params, ptypes: ptypes, pmuts: pmuts,
         ret: ret, effects: effects, is_pure: is_pure, body: body,
         is_method: impl_struct != "", struct_of: impl_struct,
-        typeparams: typeparams, line: t0.line
+        typeparams: typeparams, line: t0.line, is_extern: false
     }
+}
+
+# Stage 15-beta: parse `extern "C" { fn ... }` block.
+# Each fn declaration has NO body (just a signature). The `uses IO` (or
+# `pure`) clause is REQUIRED — FFI is unsafe by default.
+fn parse_extern_block(ctx: Ctx) -> void {
+    let t0: Tok = ctx.toks.get(ctx.pos)
+    eat_kw(ctx, "extern")
+    let abi_tok: Tok = ctx.toks.get(ctx.pos)
+    if abi_tok.kind != "str" {
+        perr_at(ctx, "expected ABI string (e.g. \"C\") after 'extern'", abi_tok)
+    }
+    ctx.pos = ctx.pos + 1
+    let abi: str = abi_tok.value
+    if abi != "C" {
+        perr_at(ctx, "unsupported ABI '" + abi + "'; only \"C\" is supported today", abi_tok)
+    }
+    eat_sym(ctx, "{")
+    while !at_sym(ctx, "}") {
+        if !at_kw(ctx, "fn") {
+            perr(ctx, "extern block can only contain fn declarations")
+        }
+        # Parse the fn signature (no body). We reuse parse_fn but it
+        # requires a body — so we parse up to the effects clause, then
+        # skip the body parse for extern fns.
+        let ft0: Tok = ctx.toks.get(ctx.pos)
+        eat_kw(ctx, "fn")
+        let name: str = eat_ident(ctx)
+        let typeparams: list[str] = parse_typeparams(ctx)
+        eat_sym(ctx, "(")
+        let params: list[str] = []
+        let ptypes: list[str] = []
+        let pmuts: list[bool] = []
+        while !at_sym(ctx, ")") {
+            let mut is_mut: bool = false
+            if at_kw(ctx, "mut") {
+                ctx.pos = ctx.pos + 1
+                is_mut = true
+            }
+            let pn: str = eat_ident(ctx)
+            eat_sym(ctx, ":")
+            let pt: str = parse_type(ctx, false)
+            params.push(pn)
+            ptypes.push(pt)
+            pmuts.push(is_mut)
+            if at_sym(ctx, ",") {
+                ctx.pos = ctx.pos + 1
+            } else if !at_sym(ctx, ")") {
+                perr(ctx, "expected ',' or ')' in parameters")
+            }
+        }
+        eat_sym(ctx, ")")
+        let mut ret: str = "void"
+        if at_sym(ctx, "->") {
+            ctx.pos = ctx.pos + 1
+            ret = parse_type(ctx, true)
+        }
+        let mut is_pure: bool = false
+        if at_kw(ctx, "pure") {
+            ctx.pos = ctx.pos + 1
+            is_pure = true
+        }
+        let mut effects: list[str] = []
+        if at_kw(ctx, "uses") {
+            if is_pure {
+                perr(ctx, "'pure' and 'uses' are mutually exclusive (a pure function declares no effects)")
+            }
+            ctx.pos = ctx.pos + 1
+            while true {
+                let e: str = eat_ident(ctx)
+                if e == "Net" || e == "Rand" || e == "Proc" {
+                    perr(ctx, "effect '" + e + "' is reserved for a future stage (no builtins implemented yet)")
+                }
+                if e != "IO" && e != "Fs" && e != "Clock" && e != "Args" && e != "Exit" {
+                    perr(ctx, "unknown effect '" + e + "'; known effects: IO, Fs, Clock, Args, Exit")
+                }
+                if !list_has(effects, e) {
+                    effects.push(e)
+                }
+                if e == "IO" {
+                    let mut k: int = 0
+                    let fam: list[str] = ["IO", "Fs", "Clock", "Args", "Exit"]
+                    while k < fam.len() {
+                        let fe: str = fam.get(k)
+                        if !list_has(effects, fe) {
+                            effects.push(fe)
+                        }
+                        k = k + 1
+                    }
+                }
+                if at_sym(ctx, ",") {
+                    ctx.pos = ctx.pos + 1
+                    continue
+                }
+                break
+            }
+        }
+        # Extern fns MUST declare `uses IO` (or `pure`) — FFI is unsafe by default.
+        if effects.len() == 0 && !is_pure {
+            perr_at(ctx, "extern fn '" + name + "' must declare `uses IO` (or `pure`) — FFI is unsafe by default", t0)
+        }
+        if ctx.fns.has(name) {
+            perr_at(ctx, "duplicate function name: " + name, t0)
+        }
+        let empty_body: list[int] = []
+        ctx.fns.set(name, FnInfo {
+            name: name, params: params, ptypes: ptypes, pmuts: pmuts,
+            ret: ret, effects: effects, is_pure: is_pure, body: empty_body,
+            is_method: false, struct_of: "", typeparams: typeparams,
+            line: ft0.line, is_extern: true
+        })
+        ctx.fn_order.push(name)
+    }
+    eat_sym(ctx, "}")
 }
 
 fn parse_block(ctx: Ctx) -> list[int] {
@@ -1284,8 +1413,11 @@ fn parse_match(ctx: Ctx) -> int {
         let mut variant: str = ""
         let mut bindings: list[str] = []
         let mut has_paren: bool = false
-        # NOTE (BUG-001 fix): `_` is tokenized as an ident, not a sym.
-        if at_sym(ctx, "_") || at_ident(ctx, "_") {
+        # BUG-SC-16 fix: `_` is ALWAYS tokenized as an ident (byte 95 is a
+        # valid ident-start char), never as a sym. The `at_sym(ctx, "_")`
+        # check is dead code — removed for clarity (same as boot/parser.py
+        # BUG-001 fix / BUG-18 cleanup).
+        if at_ident(ctx, "_") {
             ctx.pos = ctx.pos + 1
             pat_kind = "wildcard"
         } else {
@@ -1297,7 +1429,7 @@ fn parse_match(ctx: Ctx) -> int {
                 has_paren = true
                 eat_sym(ctx, "(")
                 while !at_sym(ctx, ")") {
-                    if at_sym(ctx, "_") || at_ident(ctx, "_") {
+                    if at_ident(ctx, "_") {
                         ctx.pos = ctx.pos + 1
                         bindings.push("_")
                     } else {
@@ -2129,7 +2261,7 @@ fn dummy_fn() -> FnInfo {
     return FnInfo {
         name: "", params: [], ptypes: [], pmuts: [], ret: "void",
         effects: [], is_pure: false, body: [], is_method: false, struct_of: "",
-        typeparams: [], line: 0
+        typeparams: [], line: 0, is_extern: false
     }
 }
 
@@ -2137,6 +2269,15 @@ fn check_fn_body(ctx: Ctx, key: str) -> void {
     let f: FnInfo = ctx.fns.get_or(key, dummy_fn())
     let saved_ret: str = ctx.cur_fn_ret
     let saved_tp: list[str] = ctx.cur_typeparams
+    # Stage 15-beta: extern fns have NO body — they are forward declarations
+    # for C functions. Skip body checking and the "must return on all paths"
+    # check. They still participate in effects analysis (their declared
+    # effects propagate to callers).
+    if f.is_extern {
+        ctx.cur_fn_ret = saved_ret
+        ctx.cur_typeparams = saved_tp
+        return
+    }
     ctx.cur_fn_ret = f.ret
     ctx.cur_typeparams = f.typeparams
     let env: list[map[str, Binding]] = []
@@ -2180,6 +2321,16 @@ fn all_return(ctx: Ctx, stmts: list[int]) -> bool {
         return true
     }
     if k == "expr" && ctx.exprs[ctx.stmts[last].e].t == "never" {
+        return true
+    }
+    # BUG-SC-5 fix: a `let` or `assign` whose RHS is `never`-typed
+    # (e.g. `let x: int = panic("...")`) always diverges, so the
+    # function returns on all paths. Previously this was rejected with
+    # a spurious "does not return on all paths" error.
+    if k == "let" && ctx.exprs[ctx.stmts[last].value].t == "never" {
+        return true
+    }
+    if k == "assign" && ctx.exprs[ctx.stmts[last].value].t == "never" {
         return true
     }
     if k == "if" {
@@ -3511,8 +3662,13 @@ fn check_match(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, expecte
                     }
                     let bname: str = arm.bindings.get(bi)
                     if bname != "_" {
-                        if lookup_exists(env, bname) {
-                            cerr(arm.line, "shadowing not allowed in match arm: " + bname)
+                        # BUG-SC-2 fix: SPEC.md section 5 states that match-arm
+                        # bindings INTRODUCE a new scope and may shadow outer
+                        # bindings for the duration of the arm. We now only
+                        # reject duplicates WITHIN the same arm (e.g. E.Foo(a, a)),
+                        # not shadowing of outer bindings.
+                        if env.get(env.len() - 1).has(bname) {
+                            cerr(arm.line, "duplicate binding name in match arm: " + bname)
                         }
                         env.get(env.len() - 1).set(bname, Binding { t: inst_pt, is_mut: false, moved: false })
                     }
@@ -4711,6 +4867,12 @@ fn gen_args_c(ctx: Ctx, e: int) -> str {
 
 fn gen_call(ctx: Ctx, e: int) -> str {
     if ctx.exprs[e].muser {
+        # Stage 15-beta: extern fns use the RAW C name (no `usf_` prefix)
+        # so the C linker can resolve them from libc.
+        let cf: FnInfo = ctx.fns.get_or(ctx.exprs[e].mkey, dummy_fn())
+        if cf.is_extern {
+            return ctx.exprs[e].mkey + "(" + gen_args_c(ctx, e) + ")"
+        }
         return "usf_" + c_fn_name(ctx.exprs[e].mkey) + "(" + gen_args_c(ctx, e) + ")"
     }
     let name: str = ctx.exprs[e].mkey
@@ -5190,6 +5352,11 @@ fn gen_stmt(ctx: Ctx, sidx: int, ind: str) -> void {
         ctx.out.push(ind + "    int64_t " + itn_len + " = hl_list_len(" + itn + ");")
         ctx.out.push(ind + "    int64_t " + iv + ";")
         ctx.out.push(ind + "    for (" + iv + " = 0; " + iv + " < " + itn_len + "; " + iv + "++) {")
+        # BUG-SC-4 fix: if the loop body shrinks the list (e.g. xs.pop()),
+        # hl_list_get(itn, iv) would panic with "array access out of bounds".
+        # Bounds-check before access and break if the list is now shorter
+        # than the snapshotted length (matching the interpreter's behavior).
+        ctx.out.push(ind + "        if (" + iv + " >= hl_list_len(" + itn + ")) break;")
         let cn: str = fresh_local(ctx, s.name)
         let mut elem: str = s.vtype
         ctx.out.push(ind + "        " + c_type(ctx, elem) + " " + cn
@@ -5265,6 +5432,27 @@ fn gen_reset_fn(ctx: Ctx) -> void {
 
 fn gen_fn_body(ctx: Ctx, key: str) -> void {
     let f: FnInfo = ctx.fns.get_or(key, dummy_fn())
+    # Stage 15-beta: extern fns are forward declarations for C functions.
+    # Emit just the prototype (no body) using the RAW C name (no `usf_`
+    # prefix) so the C linker can resolve them from libc.
+    if f.is_extern {
+        gen_reset_fn(ctx)
+        let ptypes_c: list[str] = []
+        let mut i: int = 0
+        while i < f.params.len() {
+            ptypes_c.push(c_type(ctx, f.ptypes.get(i)))
+            i = i + 1
+        }
+        let mut sig: str = c_type(ctx, f.ret) + " " + f.name + "("
+        if ptypes_c.len() == 0 {
+            sig = sig + "void)"
+        } else {
+            sig = sig + join(ptypes_c, ", ") + ")"
+        }
+        ctx.out.push(sig + ";")
+        ctx.out.push("")
+        return
+    }
     gen_reset_fn(ctx)
     let ptypes_c: list[str] = []
     let mut i: int = 0
@@ -5338,32 +5526,16 @@ fn gen_struct_lines(ctx: Ctx) -> list[str] {
     return out
 }
 
-# gen_one_enum(ctx, c_type, en) emits the C declaration + variant constructors
-# for a specific (instantiated) enum. `c_type` is the mangled C name (e.g.,
-# "Option__int"); `en` is the EnumInfo; `targs` are the concrete type args
-# (parallel to en.typeparams).
-fn gen_one_enum(ctx: Ctx, c_name: str, en: EnumInfo) -> list[str] {
-    let mut out: list[str] = []
-    # Tag enum
-    out.push("typedef enum {")
-    let mut vi: int = 0
-    while vi < en.variants.len() {
-        out.push("    " + en.name + "__TAG_" + en.variants.get(vi) + "_" + c_name)
-        if vi < en.variants.len() - 1 {
-            out.push(",")
-        } else {
-            out.push("")
-        }
-        vi = vi + 1
-    }
-    # Actually, the simpler approach: emit each tag on its own line, joined by
-    # commas. Let me redo this.
-    return out
-}
+# BUG-SC-15 fix: removed the dead `gen_one_enum` stub (lines 5524-5541).
+# It was an incomplete function that pushed a "typedef enum {" line and
+# per-variant tags, then returned early with a comment "Actually, the
+# simpler approach: emit each tag on its own line, joined by commas.
+# Let me redo this." It never closed the typedef or emitted the
+# struct/constructors, and was NEVER called (replaced by
+# `gen_one_enum_full` below). Removing it eliminates dead code that
+# would produce invalid C if ever invoked.
 
-# (gen_one_enum is replaced by a simpler implementation below)
-
-# gen_one_enum(ctx, c_name, en, targs) emits a complete C enum definition +
+# gen_one_enum_full(ctx, c_name, en, targs) emits a complete C enum definition +
 # variant constructors. `c_name` is the mangled C identifier (e.g.,
 # "Option__int"), `en` is the EnumInfo, `targs` are the concrete type args
 # (parallel to en.typeparams, empty for non-generic).

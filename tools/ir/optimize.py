@@ -178,6 +178,18 @@ def _constant_fold(irf: HLIRFunction):
                         new_instrs.append(new_ins)
                         consts[ins.dest] = folded
                         continue
+                # BUG-SC-IR-14 fix: fold the `!` (logical not) operator on
+                # boolean literals. Previously only `-` was folded; `!true`
+                # and `!false` stayed as runtime OP_UNOP instructions.
+                if op_arg[0] == "op" and op_arg[1] == "!":
+                    a_val = _resolve(a_arg, consts)
+                    if isinstance(a_val, bool):
+                        folded = not a_val
+                        new_ins = Instr(dest=ins.dest, op=OP_CONST,
+                                        args=[("lit", folded)], line=ins.line)
+                        new_instrs.append(new_ins)
+                        consts[ins.dest] = folded
+                        continue
             new_instrs.append(ins)
         block.instrs = new_instrs
 
@@ -225,10 +237,17 @@ def _rewrite_arg(arg, canon):
 # ----------------------------------------------------------------------------
 
 def _dead_code_elim(irf: HLIRFunction):
-    """Remove instructions whose result is never used."""
+    """Remove instructions whose result is never used.
+
+    BUG-SC-IR-2 fix: previously `used` was computed PER BLOCK, so any SSA
+    name defined in block A but consumed in block B (the normal case for
+    `let` bindings flowing into `if`/`while`/`for` branches) was considered
+    unused in A and was deleted — corrupting the IR. Now we compute `used`
+    across ALL blocks of the function before deciding what to drop.
+    """
+    # Collect all referenced SSA names across the ENTIRE function.
+    used: Set[str] = set()
     for block in irf.blocks:
-        # Collect all referenced SSA names.
-        used: Set[str] = set()
         for ins in block.instrs:
             for a in ins.args:
                 if a[0] == "var":
@@ -237,7 +256,8 @@ def _dead_code_elim(irf: HLIRFunction):
             for a in block.terminator.args:
                 if a[0] == "var":
                     used.add(a[1])
-        # Keep an instruction if it has side effects OR its dest is used.
+    # Now drop dead instructions per block (using the function-wide `used` set).
+    for block in irf.blocks:
         new_instrs = []
         for ins in block.instrs:
             if _has_side_effects(ins):
@@ -296,10 +316,15 @@ def _annotate_safe(irf: HLIRFunction):
             a_is_zero = a_arg[0] == "lit" and a_arg[1] == 0
             b_is_zero = b_arg[0] == "lit" and b_arg[1] == 0
             if (op == "+" or op == "-") and (a_is_zero or b_is_zero):
-                if not hasattr(ins, "attrs"):
+                # BUG-SC-IR-5 fix: Instr is a @dataclass with attrs: Optional[Dict]
+                # defaulting to None. `hasattr(ins, "attrs")` is always True
+                # (the attribute exists), so the guard never initialized it,
+                # causing `ins.attrs["safe_overflow"] = True` to crash with
+                # TypeError when attrs is None. Check for None instead.
+                if ins.attrs is None:
                     ins.attrs = {}
                 ins.attrs["safe_overflow"] = True
             elif op == "*" and (a_is_zero or b_is_zero):
-                if not hasattr(ins, "attrs"):
+                if ins.attrs is None:
                     ins.attrs = {}
                 ins.attrs["safe_overflow"] = True

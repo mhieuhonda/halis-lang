@@ -186,8 +186,16 @@ class Parser:
         typeparams = self.parse_typeparams()
         self.eat_sym("{")
         fields = []  # list of (name, type, default_expr_or_None)
+        # BUG-SC-8 fix: reject duplicate field names. Previously
+        # `struct Foo { x: int, x: int }` was silently accepted; at
+        # runtime `eval_structlit` builds a dict, so `Foo { x: 1, x: 2 }`
+        # would silently produce `{"x": 2}` (the first value lost).
+        seen_fields = set()
         while not self.at_sym("}"):
             ft = self.eat_ident()
+            if ft["v"] in seen_fields:
+                self.err("duplicate field name in struct: %s" % ft["v"], ft)
+            seen_fields.add(ft["v"])
             self.eat_sym(":")
             ty = self.parse_type()
             default = None

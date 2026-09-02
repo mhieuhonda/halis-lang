@@ -300,7 +300,12 @@ class IRBuilder:
             inc = self._emit(OP_BINOP,
                              [("op", "+"), ("var", i_name), ("lit", 1)],
                              stmt.get("line", 0))
-            self._emit(OP_STORE, [("var", inc), ("name", i_name + "__i")],
+            # BUG-SC-IR-1 fix: the store target must be the binding name
+            # WITHOUT the "v_" prefix (the constant-folder / store handler
+            # prepends "v_"). Previously this used `i_name + "__i"` which
+            # produced `v_x__i__i` (double-prefixed), so the loop counter
+            # was never updated — representing an infinite loop in the IR.
+            self._emit(OP_STORE, [("var", inc), ("name", stmt["var"] + "__i")],
                        stmt.get("line", 0), dest=i_name)
             if not self._current.terminator:
                 self._current.terminator = Instr(None, OP_JUMP,

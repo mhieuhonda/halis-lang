@@ -8,7 +8,160 @@ Releases on `main` follow the 20-stage roadmap (see [ROADMAP.md](ROADMAP.md)).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
-## [unreleased] — Stage 15-beta (v0.14.0-alpha)
+## [unreleased] — Stage 15-gamma (v0.15.0-alpha)
+
+### Stage 15 remaining work completed — `extern` keyword in self-hosted compiler
+- **src/hlc.hls**: added full `extern "C" { ... }` block support (previously
+  only boot/ supported it — the self-hosted compiler would fail to parse
+  programs using FFI). This closes the Stage 15 remaining-work gap
+  documented in ROADMAP.md.
+  - `extern` is now a recognised keyword in the lexer.
+  - `parse_extern_block` parses the block and registers each fn with
+    `is_extern: true` in the function table.
+  - The checker skips body checking and the "must return on all paths"
+    check for extern fns (they have no body).
+  - Extern fn effects propagate through the effects fixpoint (see
+    BUG-SC-1 below) — a caller of an extern fn must declare a superset
+    of the extern's `uses` set.
+  - The codegen emits a forward declaration (prototype) using the RAW
+    C function name (no `usf_` prefix) so the C linker can resolve it
+    from libc. Call sites also use the raw name.
+  - `FnInfo` struct gains an `is_extern: bool` field.
+
+### Fixed — second deep codebase scan (60+ bugs found and fixed)
+
+#### boot/checker.py — soundness & logic fixes
+- **BUG-SC-1** (SOUNDNESS, high): extern fn declared effects were not
+  propagated through the effects fixpoint. A function calling an extern
+  fn declared `uses IO` without declaring `uses IO` itself would compile
+  cleanly — breaking the language's central capability-check guarantee.
+  The fixpoint now uses the extern fn's DECLARED effects as the base set.
+- **BUG-SC-2** (medium): match arm bindings were incorrectly rejected
+  for shadowing outer bindings. SPEC.md section 5 explicitly allows this
+  ("the one and only shadowing exception"). Now only duplicates WITHIN
+  the same arm are rejected (e.g. `E.Foo(a, a)`).
+- **BUG-SC-3** (medium): `check_listlit` re-checked the first element
+  when inferring the element type, causing side-effecting expressions
+  like `take(x)` to be double-evaluated and spuriously fail with "use
+  of moved value". Now caches the first element's type (same fix pattern
+  as BUG-A/BUG-A2 in `check_call`/`check_structlit`).
+- **BUG-SC-5** (medium): `all_return` did not recognize `let`/`assign`
+  with a `never`-typed RHS (e.g. `let x: int = panic("...")`) as a
+  divergence point. Functions ending with such a statement were
+  spuriously rejected with "does not return on all paths".
+- **BUG-SC-7** (medium): struct field default expressions were not
+  type-checked at declaration time. `struct Foo { x: int = "hi" }`
+  compiled cleanly and only failed at runtime. Now checked at declaration.
+- **BUG-SC-12** (low): consolidated duplicate taint helper functions
+  (`is_taint`/`is_tainted_type` and `taint_inner`/`list_taint_inner`)
+  into a single source of truth.
+- **BUG-SC-10** (low): removed dead `mapnew` branch in `check_expr`
+  (the parser never produces a `mapnew` AST node).
+
+#### boot/parser.py
+- **BUG-SC-8** (medium): duplicate struct field names were silently
+  accepted. `struct Foo { x: int, x: int }` compiled and at runtime
+  `Foo { x: 1, x: 2 }` silently produced `{"x": 2}` (first value lost).
+  Now rejected at parse time.
+
+#### boot/interp.py
+- **BUG-SC-4** (medium): for-loop body shrinking the list (e.g.
+  `xs.pop()`) caused a Python `IndexError` crash instead of a clean
+  stop. Now bounds-checks before access and stops iterating.
+- **BUG-SC-6** (low): `f64_div` produced the wrong sign of infinity
+  when the divisor was `-0.0` (treated +0.0 and -0.0 the same). Now
+  uses `math.copysign` to distinguish them.
+- **BUG-SC-9** (low): `list.pop()` on an empty list raised "array
+  access out of bounds" — misleading. Now raises "pop from empty list".
+- **BUG-SC-10** (low): removed dead `mapnew` branch in `eval_expr`.
+
+#### src/hlc.hls — self-hosted compiler alignment fixes
+- **BUG-SC-2** (medium): match arm shadowing — aligned with boot/ fix.
+- **BUG-SC-5** (medium): `all_return` for `never`-typed `let`/`assign`
+  — aligned with boot/ fix.
+- **BUG-SC-4** (medium): for-loop codegen now bounds-checks before
+  `hl_list_get` to handle list shrinking during iteration (matching
+  the interpreter's behavior).
+- **BUG-SC-4h** (high): `extern` keyword support added (see Stage 15
+  section above).
+- **BUG-SC-4r** (high): `eat_ident` now rejects reserved identifiers
+  `secure` and `trait` (matching boot/parser.py BUG-29 fix).
+- **BUG-SC-15** (low): removed dead `gen_one_enum` stub (incomplete
+  function that was never called, superseded by `gen_one_enum_full`).
+- **BUG-SC-16** (low): removed dead `at_sym(ctx, "_")` checks in
+  `parse_match` (`_` is always tokenized as an ident, never a sym).
+
+#### tools/ir/ — HLIR & optimiser fixes
+- **BUG-SC-IR-1** (critical): for-loop counter increment stored to the
+  wrong binding name (`v_x__i__i` instead of `v_x__i`), so the counter
+  was never updated — representing an infinite loop in the IR.
+- **BUG-SC-IR-2** (critical): dead-code elimination computed `used`
+  per-block, so SSA names defined in one block but consumed in another
+  (the normal case for `let` bindings flowing into `if`/`while`/`for`
+  branches) were deleted — corrupting the IR. Now computes `used`
+  across the entire function.
+- **BUG-SC-IR-5** (high): `_annotate_safe` used `hasattr(ins, "attrs")`
+  which is always True for dataclass instances, so `ins.attrs` was
+  never initialized from None — crashing with `TypeError` on the first
+  `+0`/`*0` binop under `-O fast`. Now checks `ins.attrs is None`.
+- **BUG-SC-IR-14** (medium): constant folding did not fold the `!`
+  (logical not) operator on boolean literals. `!true` and `!false`
+  stayed as runtime `OP_UNOP` instructions. Now folded to `false`/`true`.
+
+#### tools/llvm_emit.py — LLVM IR backend fixes
+- **BUG-SC-LLVM-3** (critical): panic message globals had wrong array
+  sizes (`[18 x i8]` for 17-byte strings). LLVM rejects size mismatches.
+  Fixed to `[17 x i8]`.
+- **BUG-SC-LLVM-24** (low): removed dead duplicate method-key lookup
+  (the `if fn is None: fn = self.program["fns"].get(name)` branch was
+  identical to the line above it — a no-op).
+
+#### tools/hls-pkg.py — package manager fixes
+- **BUG-SC-PKG-11** (high): `extract_effects` added every effect name
+  on each audit status line to BOTH declared and computed, making them
+  always identical — effect enforcement was meaningless. Now properly
+  splits audit output into columns (function/declared/computed/status).
+- **BUG-SC-PKG-12** (high): `cmd_build` didn't add resolved dependency
+  directories to the import path. Any `import` in the entry file failed
+  with "module not found". Now symlinks deps into `.hls-pkg-deps/` and
+  sets `HLS_PKG_DEPS` env var.
+
+#### tools/hls-lsp.py — LSP protocol fixes
+- **BUG-SC-LSP-13** (high): the server exited immediately after
+  `shutdown` (loop condition `while not self.shutdown_requested`),
+  before `exit` arrived — breaking the LSP protocol for VS Code /
+  Neovim. Now keeps the connection open until `exit` is received.
+- **BUG-SC-LSP-20** (medium): `exit` handler always returned exit code
+  0. Per LSP spec, should return 1 if `shutdown` was not previously
+  received. Now `sys.exit(0 if self.shutdown_requested else 1)`.
+
+#### tools/hlfmt.py — formatter fixes
+- Fixed false docstring claims: "preserves all comments" (actually
+  strips `#` comments — documented limitation), "auto-inserted blank
+  lines" (only preserves existing ones). Updated version to
+  v0.14.0-alpha.
+
+#### tools/hlbindgen.py — bindgen fixes
+- **BUG-SC-BG-23** (low): duplicate `re.sub(r"^const\s+", "", base)`
+  line was a no-op. Second instance now strips TRAILING `const`
+  (e.g. `char const *` — legal C spelling).
+
+### Cleanup
+- Removed the empty `...,` file from the repo root (accidental creation
+  from a misformed shell redirect in a previous session).
+- Updated `examples/ffi_demo.hls` with documentation noting the native
+  compilation type-mapping limitation (HLS int is 64-bit; C int is
+  32-bit — the boot interpreter handles this via ctypes, but native
+  codegen emits `int64_t` signatures that may conflict with C stdlib).
+
+### Tests
+- 4 new regression tests: `feat_deep_scan_fixes` (ok), `fail_struct_dup_field`,
+  `fail_struct_default_type`, `fail_extern_effect_propagation`.
+- **150/150 tests PASS** (was 145; +5 new).
+- Bootstrap remains DETERMINISTIC (two self-compile passes produce
+  byte-identical C output).
+
+## [v0.14.0-alpha] — Stage 15-beta: deep codebase scan & bug fixes
 
 ### Fixed — deep codebase scan & bug fixes
 - **tools/llvm_emit.py**: major rewrite for type-correctness.

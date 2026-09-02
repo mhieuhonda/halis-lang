@@ -122,7 +122,10 @@ def _parse_c_type(type_str: str, full: str = None) -> str:
         # Strip the * and any leading const.
         base = t.replace("*", "").strip()
         base = re.sub(r"^const\s+", "", base)
-        base = re.sub(r"^const\s+", "", base)
+        # BUG-SC-BG-23 fix: the second `re.sub` was identical to the first
+        # (a no-op). The intent was to also strip a TRAILING `const` (e.g.
+        # `char const *` — legal C spelling). Now handles both forms.
+        base = re.sub(r"\s+const$", "", base)
         if base in PTR_TO_HLS:
             return PTR_TO_HLS[base]
         # Unknown pointer type — opaque int.

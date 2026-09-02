@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """hlfmt — Opinionated formatter for Hieu Louis (HLS).
 
-Stage 14 (v0.12.0-alpha): the `gofmt` of HLS — ends style debates.
+Stage 14 (v0.14.0-alpha): the `gofmt` of HLS — ends style debates.
 
 Design:
   - 4-space indentation; no tabs.
@@ -9,14 +9,18 @@ Design:
   - Single space after commas, colons, around binary operators.
   - No space before `(`, `[`, after `!`, `.` (postfix).
   - Space before `{` (function/struct/enum/impl/match/if/while/for bodies).
-  - Empty line between top-level declarations (auto-inserted).
+  - Preserves existing blank lines between top-level declarations.
   - Trailing newline at EOF.
   - Idempotent: running twice = running once.
 
 The formatter operates on the token stream (preserving line/col info)
-so it preserves all comments and string literals exactly. It walks the
-tokens, normalises the whitespace BETWEEN them, and re-emits while
-preserving the original line breaks.
+so it preserves all string literals exactly. It walks the tokens,
+normalises the whitespace BETWEEN them, and re-emits while preserving
+the original line breaks.
+
+NOTE: the HLS lexer treats `#` comments as whitespace and emits no token
+for them, so hlfmt currently strips `#` comments. Preserving comments is
+a Stage 14 release target (requires switching to a byte-level formatter).
 
 Usage:
   hlfmt FILE.hls               # print formatted source to stdout

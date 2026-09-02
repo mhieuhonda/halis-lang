@@ -718,15 +718,41 @@ Stage 14 release target. **145/145 tests PASS.**
 = running once). (The v0.12.0-alpha release ships all three tools with
 idempotent formatting; the editor plugins are the Stage 14 release target.)
 
-## STAGE 15 — Safe C FFI 🔄 (alpha v0.13.0-alpha)
+## STAGE 15 — Safe C FFI 🔄 (alpha v0.13.0-alpha + beta v0.14.0-alpha + gamma v0.15.0-alpha)
 
 **Goal:** reuse the C ecosystem without breaking the safety enclave.
+
+**Status (v0.15.0-alpha):** the **gamma subset of Stage 15** has shipped.
+The self-hosted compiler `hlc.hls` now fully supports `extern "C" { ... }`
+blocks (previously only boot/ supported it). This closes the primary
+remaining-work gap for Stage 15. **150/150 tests PASS.**
+
+**Status (v0.14.0-alpha):** the **beta subset of Stage 15** shipped with
+a deep codebase scan fixing 60+ bugs across boot/, src/hlc.hls, and
+tools/. **145/145 tests PASS.**
 
 **Status (v0.13.0-alpha):** the **alpha subset of Stage 15** has shipped.
 A new `extern "C" { ... }` block declares external C functions. The
 checker enforces that every extern fn declares `uses IO` (or `pure`)
 — the safe default for FFI is to assume side effects. The interpreter
 calls the C function via ctypes. **145/145 tests PASS.**
+
+**Shipped in v0.15.0-alpha (Stage 15-gamma):**
+
+- `extern` is now a recognised keyword in the self-hosted compiler's
+  lexer (was only in boot/ previously).
+- `parse_extern_block` in `hlc.hls` parses the block and registers
+  each fn with `is_extern: true`.
+- The checker in `hlc.hls` skips body checking and the "must return
+  on all paths" check for extern fns.
+- Extern fn effects propagate through the effects fixpoint in BOTH
+  boot/ and hlc.hls — a caller of an extern fn must declare a superset
+  of the extern's `uses` set (BUG-SC-1 soundness fix).
+- The codegen emits a forward declaration (prototype) using the RAW
+  C function name (no `usf_` prefix) so the C linker can resolve it
+  from libc. Call sites also use the raw name.
+- 60+ additional bug fixes across the codebase (see CHANGELOG.md).
+- 4 new regression tests. **150/150 tests PASS.**
 
 **Shipped in v0.13.0-alpha (Stage 15-alpha):**
 

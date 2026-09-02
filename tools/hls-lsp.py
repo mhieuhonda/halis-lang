@@ -94,7 +94,12 @@ class HLSServer:
         self.shutdown_requested = False
 
     def run(self):
-        while not self.shutdown_requested:
+        # BUG-SC-LSP-13 fix: per LSP spec, the server must keep the connection
+        # open after `shutdown` (only `exit` terminates the process). Previously
+        # the loop condition `while not self.shutdown_requested` caused the
+        # server to exit immediately after `shutdown`, before `exit` arrived —
+        # breaking the protocol for well-behaved clients (VS Code, Neovim).
+        while True:
             msg = read_message()
             if msg is None:
                 break
@@ -118,7 +123,7 @@ class HLSServer:
                 },
                 "serverInfo": {
                     "name": "hls-lsp",
-                    "version": "0.12.0-alpha",
+                    "version": "0.14.0-alpha",
                 },
             })
         elif method == "initialized":
@@ -127,7 +132,9 @@ class HLSServer:
             self.shutdown_requested = True
             self.send_response(msg_id, None)
         elif method == "exit":
-            sys.exit(0)
+            # BUG-SC-LSP-20 fix: per LSP spec, `exit` should return exit code 1
+            # if `shutdown` was not previously received, and 0 only if it was.
+            sys.exit(0 if self.shutdown_requested else 1)
         elif method == "textDocument/didOpen":
             self.handle_did_open(params)
         elif method == "textDocument/didChange":

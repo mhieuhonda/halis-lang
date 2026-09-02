@@ -187,8 +187,11 @@ class LLVMEmitter:
             self._emit(line)
         self._emit("")
         # Emit panic message constants.
-        self._emit('@.panic_overflow_msg = private unnamed_addr constant [18 x i8] c"integer overflow\\00"')
-        self._emit('@.panic_divzero_msg = private unnamed_addr constant [18 x i8] c"division by zero\\00"')
+        # BUG-SC-LLVM-3 fix: the array sizes were [18 x i8] but both messages
+        # are 16 chars + 1 NUL = 17 bytes. LLVM rejects size mismatches.
+        # "integer overflow" = 16 chars, "division by zero" = 16 chars.
+        self._emit('@.panic_overflow_msg = private unnamed_addr constant [17 x i8] c"integer overflow\\00"')
+        self._emit('@.panic_divzero_msg = private unnamed_addr constant [17 x i8] c"division by zero\\00"')
         self._emit("")
         # Emit functions. (String constants are emitted on demand by
         # _emit_string_const and accumulated; we append them at the end
@@ -758,9 +761,11 @@ class LLVMEmitter:
             return (ret_ty, tmp)
         # User-defined function call.
         fn = self.program["fns"].get(name)
-        if fn is None:
-            # Method-key like "Type.method" — look up directly.
-            fn = self.program["fns"].get(name)
+        # BUG-SC-LLVM-24 fix: removed the dead duplicate lookup — the
+        # previous `if fn is None: fn = self.program["fns"].get(name)`
+        # branch was identical to the line above (a no-op). Method-key
+        # calls ("Type.method") arrive here with name already being the
+        # full key, so the single lookup above suffices.
         ret_ty = hls_type_to_llvm(fn["ret"]) if fn else "ptr"
         param_tys = [hls_type_to_llvm(p[1]) for p in fn["params"]] if fn else (
             ["i64"] * len(arg_pairs))

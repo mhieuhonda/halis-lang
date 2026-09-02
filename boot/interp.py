@@ -87,9 +87,16 @@ def f64_div(a, b):
     try:
         return a / b
     except ZeroDivisionError:
+        # BUG-SC-6 fix: handle -0.0 divisor correctly. Previously the
+        # sign test `(a > 0) == (b >= 0)` treated +0.0 and -0.0 the same
+        # (both pass `>= 0`), producing the wrong sign of infinity when
+        # the divisor was -0.0. Use math.copysign to distinguish them.
         if a == 0 or a != a:
             return float("nan")
-        return float("inf") if (a > 0) == (b >= 0) else float("-inf")
+        # copysign(1.0, x) returns 1.0 for +x (incl. +0.0) and -1.0 for -x
+        # (incl. -0.0). Result is +inf iff signs of a and b agree.
+        same_sign = math.copysign(1.0, a) == math.copysign(1.0, b)
+        return float("inf") if same_sign else float("-inf")
 
 
 def f64_mod(a, b):
@@ -332,6 +339,16 @@ class Interp:
             n = len(lst)  # snapshot length once (SPEC section 5)
             i = 0
             while i < n:
+                # BUG-SC-4 fix: if the loop body shrinks the list (e.g.
+                # `xs.pop()`), `lst[i]` would raise a Python IndexError,
+                # crashing the interpreter with a traceback instead of a
+                # clean HLPanic. Bounds-check before access and stop
+                # iterating once the list is shorter than the snapshot.
+                # The SPEC only guarantees that appended elements are not
+                # visited; shrinking during iteration is undefined, so we
+                # stop cleanly rather than crash.
+                if i >= len(lst):
+                    break
                 # BUG-22 fix: use a 3-element binding [value, mut, moved]
                 # to match all other bindings in the interpreter. The
                 # previous 2-element form was internally inconsistent and
@@ -428,8 +445,9 @@ class Interp:
             return self.eval_match(e, env)
         if k == "qmark":
             return self.eval_qmark(e, env)
-        if k == "mapnew":
-            return {}
+        # BUG-SC-10 fix: removed the dead `if k == "mapnew": return {}`
+        # branch. The parser never produces a `mapnew` AST node; `map_new()`
+        # is a `call` node handled by the `builtin` method.
         raise HLPanic("unknown expression: %s" % k, self.line)
 
     def eval_structlit(self, e, env):
@@ -789,7 +807,10 @@ class Interp:
             return t[args[0]]
         if op == "list.pop":
             if len(t) == 0:
-                raise HLPanic("array access out of bounds", line)
+                # BUG-SC-9 fix: "array access out of bounds" is misleading
+                # for pop() — the user called pop() on an empty list, not
+                # an index operation. Report the actual problem.
+                raise HLPanic("pop from empty list", line)
             return t.pop()
         if op == "list.set":
             if args[0] < 0 or args[0] >= len(t):
