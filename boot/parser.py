@@ -6,6 +6,14 @@ INT64_MIN = -9223372036854775808
 
 PRIM_TYPES = ("int", "float", "bool", "str", "void")
 
+# Stage 9-alpha: fine-grained effects & capabilities (v0.5.0-alpha)
+# Recognized effect names. `IO` is a blanket alias for the entire IO family
+# (IO + Fs + Clock + Args + Exit) — expanded at parse time so the fixpoint
+# is a trivial subset test.
+KNOWN_EFFECTS = {"IO", "Fs", "Clock", "Args", "Exit"}
+RESERVED_EFFECTS = {"Net", "Rand", "Proc"}  # recognized but no builtins yet
+IO_FAMILY = {"IO", "Fs", "Clock", "Args", "Exit"}
+
 BIN_LEVELS = [
     ("||",),
     ("&&",),
@@ -225,17 +233,35 @@ class Parser:
         if self.at_sym("->"):
             self.next()
             ret = self.parse_type(allow_void=True)
-        uses_io = False
+        # Stage 9-alpha: fine-grained effects. `uses IO` is a blanket alias
+        # for the entire IO family (expanded at parse time). Other recognized
+        # effects: Fs, Clock, Args, Exit. Reserved: Net, Rand, Proc.
+        effects = set()
         if self.at_kw("uses"):
             self.next()
-            io = self.eat_ident()
-            if io["v"] != "IO":
-                self.err("the only effect in v0.3 is 'uses IO'", io)
-            uses_io = True
+            while True:
+                tok = self.eat_ident()
+                eff = tok["v"]
+                if eff in RESERVED_EFFECTS:
+                    self.err("effect '%s' is reserved for a future stage "
+                             "(no builtins implemented yet)" % eff, tok)
+                if eff not in KNOWN_EFFECTS:
+                    self.err("unknown effect '%s'; known effects: IO, Fs, "
+                             "Clock, Args, Exit" % eff, tok)
+                if eff in effects:
+                    self.err("duplicate effect declaration: %s" % eff, tok)
+                effects.add(eff)
+                # `IO` is the blanket alias — expand to the full IO family.
+                if eff == "IO":
+                    effects |= IO_FAMILY
+                if self.at_sym(","):
+                    self.next()
+                    continue
+                break
         body = self.parse_block()
         return {
             "name": name, "typeparams": typeparams, "params": params, "ret": ret,
-            "uses_io": uses_io, "body": body, "line": t0["line"],
+            "effects": effects, "body": body, "line": t0["line"],
             "struct": impl_struct,
         }
 

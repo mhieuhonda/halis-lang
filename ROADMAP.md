@@ -23,7 +23,7 @@ remains green.
 | 6 | Module system & standard library | ✅ | (done) |
 | 7 | Advanced type system: enum, Option/Result, generics | ✅ | (done) |
 | 8 | Ownership & borrow checking (end of arena) | 🔄 | 10–14 weeks |
-| 9 | Fine-grained effects & capabilities | ⬜ | 6–8 weeks |
+| 9 | Fine-grained effects & capabilities | 🔄 | 6–8 weeks |
 | 10 | Taint tracking & sandbox | ⬜ | 8–10 weeks |
 | 11 | SSA IR + optimisation | ⬜ | 10–14 weeks |
 | 12 | Native LLVM backend | ⬜ | 10–14 weeks |
@@ -277,22 +277,65 @@ increase RSS; Valgrind/ASan clean.
 to "ref-counting + ownership analysis pass" if full borrow-checking is too
 costly.
 
-## STAGE 9 — Fine-grained effects & capabilities ⬜
+## STAGE 9 — Fine-grained effects & capabilities 🔄 (alpha shipped v0.5.0-alpha)
 
 **Goal:** every effect declared individually and statically verified.
 
-**Work:**
-- Split effects: `uses IO`, `uses Net`, `uses Fs`, `uses Clock`, `uses Rand`,
-  `uses Proc`.
-- Capability tokens: opening a file/network must hold a capability granted by
-  `main` — impossible to "sneak" a file read deep inside a library.
-- Pure functions explicitly marked & statically guaranteed → eligible for
-  memoisation / JIT compilation.
-- Default-deny at compile time when a declaration is missing.
+**Status (v0.5.0-alpha):** the **first subset of Stage 9** has shipped.
+The single `IO` effect is split into five fine-grained capabilities
+(`IO`, `Fs`, `Clock`, `Args`, `Exit`), each gated by a per-builtin mapping.
+`uses IO` remains as a backwards-compatible blanket alias (expanded at
+parse time to the full IO family). The fixpoint analysis now tracks effect
+SETS, not a single bool. **100/100 tests PASS.**
+
+**Shipped in v0.5.0-alpha (Stage 9-alpha):**
+
+- Five active effects: `IO` (console), `Fs` (filesystem), `Clock`
+  (monotonic clock), `Args` (command-line args), `Exit` (process exit).
+- Per-builtin effect mapping:
+  - `print`, `println` → IO
+  - `read_file`, `write_file`, `file_exists` → Fs
+  - `clock_ms` → Clock
+  - `args` → Args
+  - `exit` → Exit
+  - All other builtins (panic, str, int, len, range, map_new, chr, drop,
+    clone, take) → no effect (pure)
+- `uses` clause now accepts a comma-separated list:
+  `uses Fs`, `uses Fs, Clock`, `uses IO` (blanket).
+- `uses IO` is a blanket alias — expanded at parse time to
+  `{IO, Fs, Clock, Args, Exit}`. Backwards compatible with all v0.3/v0.4
+  code: every existing program compiles unchanged.
+- Reserved effect names (recognized but error if used): `Net`, `Rand`,
+  `Proc`. These will be enabled in a later stage.
+- Fixpoint analysis rewritten from per-function `bool` to per-function
+  effect SET. Monotone, bounded (5-element universe), deterministic.
+- Capability semantics: a function's declared effects ARE its
+  capabilities. A function may call a callee/builtin only if its declared
+  set is a superset of the callee's computed effect set. Default-deny: a
+  function with no `uses` clause is statically guaranteed pure.
+- Error messages name the function, the missing effect, the violating
+  callee/builtin, and the declared set — e.g.
+  `function 'log_warning' calls 'log_to_file' which requires effect 'Fs'
+  not declared (declared: (none - pure); missing: Fs)`.
+- The bootstrap is still **deterministic**: two self-compile passes produce
+  byte-identical C output. **100/100 tests PASS** (was 87/87 in v0.4.0).
+- 9 new tests: 4 ok (`feat_effects_fs`, `feat_effects_clock`,
+  `feat_effects_multi`, `feat_effects_pure`) + 5 fail
+  (`fail_effect_fs_missing`, `fail_effect_clock_missing`,
+  `fail_effect_transitive_fs`, `fail_effect_reserved`, `fail_effect_unknown`).
+
+**Remaining work for Stage 9 (beta and beyond):**
+
+- Add `Net`, `Rand`, `Proc` builtins (currently reserved — error if used).
+- First-class capability tokens (passed as args, stored in structs).
+- `hlc --audit` flag to print the full capability tree of a program.
+- Explicit `pure` keyword for documentation/linting (purity is currently
+  implicit via no `uses` clause).
 
 **Acceptance:** a program that doesn't declare `uses Net` CANNOT call a socket
 even through 5 function layers — the compile error points to the exact call
-chain.
+chain. (The v0.5.0-alpha release already enforces this for the five active
+effects; `Net` is reserved pending future builtins.)
 
 ## STAGE 10 — Taint tracking & sandbox ⬜
 

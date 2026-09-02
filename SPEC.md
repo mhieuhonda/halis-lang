@@ -1,12 +1,15 @@
-# Hieu Louis language specification (HLS) — v0.4.0-alpha
+# Hieu Louis language specification (HLS) — v0.5.0-alpha
 
 > **Hieu Louis** is a high-security, native-compiled programming language
 > designed around the philosophy: **safety by default, explicitness for
-> auditability, performance via AOT compilation**. Version v0.4.0-alpha
-> introduces the **Stage 8-alpha ownership primitives** (`drop`, `clone`,
-> `take`) — the first step toward memory safety without GC. Every operation
-> is still checked, every I/O is statically tracked, no null, no undefined
-> behaviour, and now: **use-after-move is a compile error**.
+> auditability, performance via AOT compilation**. Version v0.5.0-alpha
+> introduces the **Stage 9-alpha fine-grained effects & capabilities**
+> model: a single `IO` effect is split into five capabilities (`IO`, `Fs`,
+> `Clock`, `Args`, `Exit`) that are individually declared and statically
+> verified through the call graph. `uses IO` remains as a backwards-compatible
+> blanket alias for the entire IO family. Every operation is still checked,
+> every effect is statically tracked, no null, no undefined behaviour, and
+> use-after-move is a compile error (Stage 8-alpha).
 
 - Source files: `*.hls`
 - Self-hosted compiler: `src/hlc.hls` (HLS → C → native)
@@ -315,18 +318,18 @@ Operands:
 | `print(s: str)` | `void` | IO | print without newline |
 | `println(s: str)` | `void` | IO | print with newline |
 | `panic(msg: str)` | never returns | — | halt program, exit code 101 |
-| `exit(code: int)` | never returns | IO | exit with `code` |
+| `exit(code: int)` | never returns | Exit | exit with `code` |
 | `str(x)` | `str` | — | `x ∈ {int, float, bool, str}` |
 | `int(s: str)` | `int` | — | error if string is not a valid integer literal |
 | `len(x)` | `int` | — | `str` (byte count), `list`, `map` |
 | `range(a: int, b: int)` | `list[int]` | — | `[a, b)` — `a >= b` → empty |
 | `map_new()` | `map[str, T]` | — | `T` taken from the surrounding context |
-| `read_file(path: str)` | `str` | IO | read entire file; I/O error → panic |
-| `write_file(path: str, content: str)` | `void` | IO | write entire file; error → panic |
-| `args()` | `list[str]` | IO | command-line arguments; `args()[0]` is the program |
-| `clock_ms()` | `int` | IO | milliseconds (monotonic clock) |
+| `read_file(path: str)` | `str` | Fs | read entire file; I/O error → panic |
+| `write_file(path: str, content: str)` | `void` | Fs | write entire file; error → panic |
+| `args()` | `list[str]` | Args | command-line arguments; `args()[0]` is the program |
+| `clock_ms()` | `int` | Clock | milliseconds (monotonic clock) |
 | `chr(i: int)` | `str` | — | 1-byte string; `i` outside 0..255 → panic |
-| `file_exists(path: str)` | `bool` | IO | returns `true` if `path` is a regular file |
+| `file_exists(path: str)` | `bool` | Fs | returns `true` if `path` is a regular file |
 | `drop(x: T)` | `void` | — | (Stage 8-alpha) release ownership of `x`; `x` becomes moved |
 | `clone(x: T)` | `T` | — | (Stage 8-alpha) return an independent deep copy of `x` |
 | `take(x: T)` | `T` | — | (Stage 8-alpha) move `x`'s value out; `x` becomes moved |
@@ -363,30 +366,81 @@ To mutate fields: declare `mut self: Point`.
 
 ---
 
-## 9. The effects system — v0.3's security heart
+## 9. The effects system — v0.5's security heart (Stage 9-alpha)
 
-- The only effect in v0.3: **IO** (print/file read-write, command-line args,
-  exit, clock).
-- A function that (directly or indirectly through a static call chain) calls
-  any builtin function/method with the IO effect **must declare** `uses IO`.
-- The analysis is a **fixpoint on the static call graph** (every call is
-  static in v0.3).
-- Violations → compile error, naming the function and the violating call chain.
-- Consequence: every function without `uses IO` is **guaranteed pure** (no
-  possible I/O side effect). This is the foundation for later optimisations
-  and verification.
+- **Five fine-grained effects** (Stage 9-alpha): `IO` (console print),
+  `Fs` (filesystem), `Clock` (monotonic clock), `Args` (command-line args),
+  `Exit` (process exit). Each builtin maps to exactly one effect (see §8).
+- **Reserved effect names** (recognized but no builtins yet, error if used):
+  `Net`, `Rand`, `Proc`. These will be enabled in a later stage.
+- **`uses IO` is a blanket alias** — backwards compatible with all v0.3/v0.4
+  code. At parse time, `uses IO` expands to the entire IO family
+  `{IO, Fs, Clock, Args, Exit}`, granting every currently-defined effect.
+- **Fine-grained declaration** (NEW in v0.5.0-alpha): a function can declare
+  only the specific effects it needs — `uses Fs`, `uses Clock`, or
+  combinations like `uses Fs, Clock`. The declared set is a **capability**:
+  the function may call only builtins/callees whose computed effect set is a
+  subset of the declared set.
+- The analysis is a **monotone fixpoint on the static call graph**: each
+  function's computed effect set is the union of its builtins' effects and
+  the computed sets of all its callees. The fixpoint converges because the
+  effect universe is finite (5 elements).
+- **Default-deny**: a function with no `uses` clause has an empty declared
+  set. Any builtin call (or call to a callee with a non-empty computed set)
+  is a compile error.
+- Violations → compile error, naming the function, the missing effect, and
+  the violating callee.
+- Consequence: every function without a `uses` clause is **guaranteed pure**
+  (no possible I/O, filesystem, clock, args, or exit side effect). This is
+  the foundation for later optimisations and verification.
 
 Example:
 
 ```hls
 fn double(x: int) -> int {          # PURE — guaranteed by the compiler
-    return x * 2
+    return x * 2                    # no `uses` clause => no capabilities
 }
 
 fn greet(name: str) -> int uses IO {
     println("Hello " + name)        # IO must be declared
     return 0
 }
+
+# Fine-grained: only filesystem capability, nothing else.
+fn read_config(path: str) -> str uses Fs {
+    return read_file(path)
+}
+
+# Combination: only filesystem and clock.
+fn save_with_timestamp(path: str) -> int uses Fs, Clock {
+    let t: int = clock_ms()
+    write_file(path, "ts=" + t.to_str())
+    return t
+}
+```
+
+The fixpoint analysis works through the entire call graph:
+
+```hls
+fn log_to_file(path: str, msg: str) -> void uses Fs {
+    write_file(path, msg)             # Fs effect (direct)
+}
+
+fn log_warning(path: str, msg: str) -> void uses Fs {
+    log_to_file(path, "[WARN] " + msg)  # Fs effect (transitive)
+}
+
+fn main() -> int uses IO {
+    # IO blanket grants Fs too, so the call to log_warning is satisfied.
+    log_warning("/tmp/app.log", "started")
+    return 0
+}
+```
+
+If `log_warning` had no `uses` clause, the compiler would report:
+```
+function 'log_warning' calls 'log_to_file' which requires effect 'Fs'
+not declared (declared: (none - pure); missing: Fs)
 ```
 
 ---
@@ -479,13 +533,14 @@ fn use_first(xs: list[int]) -> Option[int] {
 }
 ```
 
-## 13. What v0.4 deliberately does NOT have
+## 13. What v0.5 deliberately does NOT have
 
 | Feature | Stage |
 |---------|-------|
 | Bitwise operators (`&` `\|` `^` `<<` `>>`) with checked semantics | later |
 | Full borrow checking (one mut borrow OR many shared) | 8-beta |
-| Fine-grained effects (`Net`, `Fs`, `Clock`, `Rand`), capabilities, taint | 9–10 |
+| Capability tokens for `Net`/`Rand`/`Proc` effects (reserved names, no builtins yet) | 9-beta |
+| Taint tracking (`tainted[T]`), sandboxed compile mode | 10 |
 | SSA IR + optimisation | 11 |
 | Direct LLVM backend | 12 |
 | Closures, function pointers, async | 16 |
@@ -702,3 +757,126 @@ child scopes" matches this requirement.
 
 These limitations are deliberate and documented. They will be lifted in
 subsequent alpha/beta releases as the Stage 8 work proceeds.
+
+---
+
+## 17. Fine-grained effects & capabilities (Stage 9-alpha — v0.5.0-alpha)
+
+Stage 9 of the roadmap calls for splitting the single `IO` effect into
+fine-grained, individually-declared capabilities, plus capability tokens
+that flow from `main` down through the call graph. v0.5.0-alpha ships the
+**first subset of Stage 9**: the effect taxonomy is split, the fixpoint
+analysis tracks effect SETS, and a function's declared effects are its
+static capabilities (the "token" model).
+
+### 17.1. The five active effects
+
+| Effect | Builtins it gates | Capability scope |
+|--------|-------------------|------------------|
+| `IO` | `print`, `println` | console output |
+| `Fs` | `read_file`, `write_file`, `file_exists` | filesystem access |
+| `Clock` | `clock_ms` | monotonic clock read |
+| `Args` | `args` | command-line arguments |
+| `Exit` | `exit` | process termination |
+
+Reserved (recognized but error if used — no builtins yet): `Net`, `Rand`,
+`Proc`. These will be enabled in later stages.
+
+### 17.2. The `uses` clause — declared capabilities
+
+Grammar (Stage 9-alpha):
+```
+fndef := "fn" ... ("uses" effect ("," effect)*)? block
+effect := "IO" | "Fs" | "Clock" | "Args" | "Exit"
+        | "Net" | "Rand" | "Proc"   # reserved, error if used
+```
+
+- `uses IO` — **blanket alias**: at parse time, expands to the entire IO
+  family `{IO, Fs, Clock, Args, Exit}`. Backwards compatible with all
+  v0.3/v0.4 code.
+- `uses Fs` — only filesystem capability.
+- `uses Fs, Clock` — filesystem and clock.
+- `uses Net` — parse error: "effect 'Net' is reserved for a future stage".
+- `uses Bogus` — parse error: "unknown effect 'Bogus'; known effects: IO,
+  Fs, Clock, Args, Exit".
+- No `uses` clause — empty declared set (default-deny: pure function).
+
+### 17.3. Capability semantics — declared ⊇ computed
+
+A function's declared effects ARE its capabilities. The compiler computes,
+for each function, the SET of effects its body transitively requires (the
+union of its builtins' effects and its callees' computed effect sets,
+iterated to a fixpoint). The capability check is a subset test:
+
+```
+declared_effects(function) ⊇ computed_effects(function)
+```
+
+If `computed - declared` is non-empty, the compiler reports the missing
+effect, the violating callee/builtin, and the function name.
+
+### 17.4. Default-deny — `main` is the root capability holder
+
+A function with no `uses` clause has an empty declared set. It cannot call
+any builtin with an effect, and cannot transitively call any function
+whose computed effect set is non-empty. This is **default-deny**: purity
+is the default, capabilities must be explicitly requested.
+
+`main` is the root capability holder — it can declare any effect. Library
+functions can be more restrictive: a library that only needs to read files
+can declare `uses Fs` and be statically guaranteed to never touch the
+clock, never read command-line args, never print to the console.
+
+### 17.5. Example — transitive capability propagation
+
+```hls
+# Library function: filesystem capability only.
+fn load_config(path: str) -> str uses Fs {
+    return read_file(path)
+}
+
+# Library function: filesystem + clock capabilities.
+fn save_with_ts(path: str, content: str) -> void uses Fs, Clock {
+    let t: int = clock_ms()
+    write_file(path, content + " @ " + t.to_str())
+}
+
+# Application code: IO blanket grants all five effects.
+fn main() -> int uses IO {
+    let cfg: str = load_config("/etc/app.conf")
+    save_with_ts("/var/log/app.log", "started")
+    println("loaded " + cfg.len().to_str() + " bytes")
+    return 0
+}
+```
+
+If `load_config` accidentally called `println`, the compiler would report:
+
+```
+function 'load_config' calls 'println' which requires effect 'IO'
+not declared (declared: Fs; missing: IO)
+```
+
+### 17.6. Implementation notes
+
+- The fixpoint is monotone and bounded (5-element effect universe). The
+  iteration order is deterministic in both Stage-0 (Python `dict` order)
+  and the self-hosted compiler (`ctx.fn_order` list), so the bootstrap
+  fixed-point test (Stage 5) is preserved.
+- The C codegen is unaffected — `uses` clauses are pure compile-time
+  annotations; no runtime effect tracking is emitted.
+- Existing v0.3/v0.4 code with `uses IO` continues to compile unchanged
+  (the parse-time expansion to the IO family is transparent).
+
+### 17.7. Limitations in v0.5.0-alpha (Stage 9-beta targets)
+
+| Limitation | Stage 9-beta target |
+|------------|---------------------|
+| `Net`, `Rand`, `Proc` reserved but no builtins yet | add network/random/process builtins + their effect mappings |
+| Capability tokens are not first-class values (can't be passed as args, stored in structs) | first-class capability type, e.g. `cap[Net]` |
+| No `hlc --audit` flag to print the full capability tree | add an audit subcommand that prints per-function declared/computed effects |
+| No pure-function annotation (purity is implicit via no `uses`) | explicit `pure` keyword for documentation / linting |
+| Per-builtin effect taxonomy is fixed (no user-defined effects) | user-defined effects via a registration mechanism (later stage) |
+
+These limitations are deliberate and documented. They will be lifted in
+subsequent alpha/beta releases as the Stage 9 work proceeds.

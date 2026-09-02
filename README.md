@@ -36,21 +36,25 @@ fn main() -> int uses IO {
 }
 ```
 
-Three core guarantees of v0.4.0-alpha:
+Three core guarantees of v0.5.0-alpha:
 
 1. **I/O is a declared effect.** Forget `uses IO` while printing to the
    screen? Compile error — even when the call is indirect through 5 function
    layers.
 2. **Every operation is checked.** Integer overflow, divide-by-zero,
    out-of-bounds array access — all halt safely, with no undefined behaviour.
-   v0.4 has no switch to disable checks.
+   v0.5 has no switch to disable checks.
 3. **No null. No uninitialised variables, no hidden state, no globals.**
    Everything is explicit so it can be audited.
-4. **(NEW in v0.4.0-alpha) Use-after-move is a compile error.** The new
-   ownership primitives — `drop`, `clone`, `take` — let the compiler track
-   when a binding has been moved, and statically reject any subsequent use.
-   This is the first subset of Stage 8 (ownership & borrow checking) — see
-   [SPEC.md section 16](SPEC.md).
+4. **(Stage 8-alpha) Use-after-move is a compile error.** The ownership
+   primitives — `drop`, `clone`, `take` — let the compiler track when a
+   binding has been moved, and statically reject any subsequent use.
+5. **(NEW in v0.5.0-alpha) Fine-grained effects & capabilities.** The
+   single `IO` effect is split into five capabilities — `IO`, `Fs`,
+   `Clock`, `Args`, `Exit` — each individually declared and statically
+   verified. `uses IO` remains as a backwards-compatible blanket alias.
+   A function with no `uses` clause is statically guaranteed pure.
+   See [SPEC.md section 9 & 17](SPEC.md).
 
 ## Self-hosting — proof, not promise
 
@@ -90,8 +94,11 @@ make bootstrap
 # 3. Compile your program to a native binary
 make run F=examples/primes.hls
 
-# 4. Run the full test suite (87 tests: types, effects, ownership, differential, bootstrap)
+# 4. Run the full test suite (100 tests: types, effects, ownership, differential, bootstrap)
 make test
+
+# 5. Try the new fine-grained effects (v0.5.0-alpha)
+python3 boot/boot.py examples/effects_demo.hls arg1 arg2
 ```
 
 ## Language example
@@ -139,8 +146,10 @@ See also: [examples/](examples/) — including `secure_demo.hls` demonstrating
 safe panics on integer overflow, `wordcount.hls` reading a real file,
 `web_demo.hls` showing URL parsing, JSON handling and HTML escaping,
 `enum_demo.hls` / `option_demo.hls` / `result_demo.hls` demonstrating Stage 7
-features (enums, match, `?` operator, Option/Result), and the new
-`ownership_demo.hls` demonstrating Stage 8-alpha's `drop`/`clone`/`take`.
+features (enums, match, `?` operator, Option/Result), the new
+`ownership_demo.hls` demonstrating Stage 8-alpha's `drop`/`clone`/`take`,
+and `effects_demo.hls` demonstrating Stage 9-alpha's fine-grained effects
+(`uses Fs`, `uses Clock`, `uses Args`).
 
 ## Standard library (Stage 6 + Stage 7)
 
@@ -204,7 +213,7 @@ Full details: [SPEC.md](SPEC.md) · Stage-by-stage roadmap:
 
 ## Status
 
-**v0.4.0-alpha — Stages 1–7 complete, Stage 8-alpha shipped** (see ROADMAP):
+**v0.5.0-alpha — Stages 1–7 complete, Stage 8-alpha + Stage 9-alpha shipped**:
 
 - ✅ Complete core specification
 - ✅ Stage-0 reference (interpreted, with type + effects checking)
@@ -219,14 +228,21 @@ Full details: [SPEC.md](SPEC.md) · Stage-by-stage roadmap:
 - 🔄 **Stage 8-alpha — Ownership primitives** (v0.4.0-alpha):
   `drop(x)` / `clone(x)` / `take(x)` builtins, with compile-time
   use-after-move tracking. Bindings carry a `moved` flag in both Stage-0
-  and `hlc.hls`. 6 new tests; **87/87 tests PASS**.
-- ⬜ Stage 8-beta (full borrow checker, end-of-arena runtime), fine-grained
-effects, SSA IR, LLVM, concurrency...
+  and `hlc.hls`.
+- 🔄 **Stage 9-alpha — Fine-grained effects & capabilities** (v0.5.0-alpha):
+  Single `IO` effect split into five — `IO`, `Fs`, `Clock`, `Args`, `Exit`.
+  `uses` clause now accepts a comma-separated list; `uses IO` is a
+  backwards-compatible blanket alias. Capability subset semantics
+  (`declared ⊇ computed`) with default-deny for pure functions. **100/100
+  tests PASS**.
+- ⬜ Stage 8-beta (full borrow checker, end-of-arena runtime),
+  Stage 9-beta (`Net`/`Rand`/`Proc` builtins, first-class capability tokens),
+  fine-grained taint, SSA IR, LLVM, concurrency...
 
 ## Contributing
 
 Every contribution must preserve the core guarantees and pass
-`make test` (87 tests, including differential testing of the two
+`make test` (100 tests, including differential testing of the two
 implementations). Every new feature must first be used inside `hlc` itself —
 the compiler is always the first customer of the language.
 

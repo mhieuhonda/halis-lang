@@ -121,6 +121,21 @@ BUILTIN_FNS = {
 }
 IO_BUILTINS = {"print", "println", "read_file", "write_file", "exit", "args", "clock_ms", "file_exists"}
 
+# Stage 9-alpha: per-builtin effect mapping. Pure builtins (panic, str, int,
+# len, range, map_new, chr, drop, clone, take) are absent — they contribute
+# no effect. A builtin may in principle contribute multiple effects; using a
+# set value future-proofs the design.
+BUILTIN_EFFECTS = {
+    "print":       {"IO"},
+    "println":     {"IO"},
+    "read_file":   {"Fs"},
+    "write_file":  {"Fs"},
+    "file_exists": {"Fs"},
+    "clock_ms":    {"Clock"},
+    "args":        {"Args"},
+    "exit":        {"Exit"},
+}
+
 # Types whose values are "owned" heap allocations — subject to move tracking.
 # Primitives (int/float/bool) are Copy: passing them never moves.
 def is_owned_type(t):
@@ -1249,32 +1264,56 @@ class Checker:
         e["ok_variant"] = ok_variant[0]
         return success_t
 
-    # ---------- effects ----------
+    # ---------- effects (Stage 9-alpha: fine-grained, set-based) ----------
     def check_effects(self):
-        eff = {}
-        for key, fn in self.fns.items():
-            eff[key] = fn["uses_io"]
+        """Fixpoint on the static call graph that computes, per function, the
+        SET of effects its body transitively requires. A function passes iff
+        its declared effect set is a superset of the computed set.
+        """
+        # eff[key] = computed set of effects required by `key`'s body.
+        eff = {key: set() for key in self.fns}
+
+        # Monotone fixpoint: union in each callee's computed effect set.
         changed = True
         while changed:
             changed = False
             for key, callees in self.edges.items():
-                if eff[key]:
-                    continue
                 for c in callees:
                     if c.startswith("b:"):
-                        eff[key] = True
+                        new_eff = BUILTIN_EFFECTS.get(c[2:], set())
+                    else:
+                        new_eff = eff.get(c, set())
+                    before = len(eff[key])
+                    eff[key] |= new_eff
+                    if len(eff[key]) != before:
                         changed = True
-                        break
-                    if eff.get(c):
-                        eff[key] = True
-                        changed = True
-                        break
+
+        # Capability check: declared ⊇ computed.
         for key, fn in self.fns.items():
-            if eff[key] and not fn["uses_io"]:
-                for c in self.edges.get(key, ()):  # find a violating edge to report
-                    if c.startswith("b:") or eff.get(c):
-                        self.err("function '%s' calls '%s' (IO) but does not declare 'uses IO'"
-                                 % (fn["name"], c[2:] if c.startswith("b:") else c), fn)
+            declared = fn["effects"]
+            computed = eff[key]
+            missing = computed - declared
+            if not missing:
+                continue
+            # Find a witness edge for one of the missing effects and report it.
+            for c in self.edges.get(key, ()):
+                if c.startswith("b:"):
+                    c_eff = BUILTIN_EFFECTS.get(c[2:], set())
+                    callee_disp = c[2:]
+                else:
+                    c_eff = eff.get(c, set())
+                    callee_disp = c
+                violated = c_eff - declared
+                if not violated:
+                    continue
+                miss = sorted(violated)[0]
+                self.err(
+                    "function '%s' calls '%s' which requires effect '%s' "
+                    "not declared (declared: %s; missing: %s)"
+                    % (fn["name"], callee_disp, miss,
+                       ", ".join(sorted(declared)) or "(none — pure)",
+                       ", ".join(sorted(violated))),
+                    fn)
 
 
 def check(program):

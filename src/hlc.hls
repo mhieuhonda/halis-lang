@@ -60,7 +60,7 @@ struct FnInfo {
     ptypes: list[str],
     pmuts: list[bool],
     ret: str,
-    uses_io: bool,
+    effects: list[str],   # Stage 9-alpha: declared effects (IO is expanded at parse time to IO+Fs+Clock+Args+Exit)
     body: list[int],
     is_method: bool,
     struct_of: str,
@@ -889,19 +889,46 @@ fn parse_fn(ctx: Ctx, impl_struct: str) -> FnInfo {
         ctx.pos = ctx.pos + 1
         ret = parse_type(ctx, true)
     }
-    let mut uses_io: bool = false
+    # Stage 9-alpha: fine-grained effects. `uses IO` is a blanket alias
+    # for the entire IO family (expanded at parse time). Other recognized
+    # effects: Fs, Clock, Args, Exit. Reserved: Net, Rand, Proc.
+    let mut effects: list[str] = []
     if at_kw(ctx, "uses") {
         ctx.pos = ctx.pos + 1
-        let io: str = eat_ident(ctx)
-        if io != "IO" {
-            perr(ctx, "the only effect in v0.3 is 'uses IO'")
+        while true {
+            let e: str = eat_ident(ctx)
+            if e == "Net" || e == "Rand" || e == "Proc" {
+                perr(ctx, "effect '" + e + "' is reserved for a future stage (no builtins implemented yet)")
+            }
+            if e != "IO" && e != "Fs" && e != "Clock" && e != "Args" && e != "Exit" {
+                perr(ctx, "unknown effect '" + e + "'; known effects: IO, Fs, Clock, Args, Exit")
+            }
+            if !list_has(effects, e) {
+                effects.push(e)
+            }
+            # `IO` is the blanket alias — expand to the full IO family.
+            if e == "IO" {
+                let mut k: int = 0
+                let fam: list[str] = ["IO", "Fs", "Clock", "Args", "Exit"]
+                while k < fam.len() {
+                    let fe: str = fam.get(k)
+                    if !list_has(effects, fe) {
+                        effects.push(fe)
+                    }
+                    k = k + 1
+                }
+            }
+            if at_sym(ctx, ",") {
+                ctx.pos = ctx.pos + 1
+                continue
+            }
+            break
         }
-        uses_io = true
     }
     let body: list[int] = parse_block(ctx)
     return FnInfo {
         name: name, params: params, ptypes: ptypes, pmuts: pmuts,
-        ret: ret, uses_io: uses_io, body: body,
+        ret: ret, effects: effects, body: body,
         is_method: impl_struct != "", struct_of: impl_struct,
         typeparams: typeparams, line: t0.line
     }
@@ -1563,6 +1590,62 @@ fn add_edge(ctx: Ctx, cur: str, callee: str) -> void {
     ctx.edges.get_or(cur, []).push(callee)
 }
 
+# --- Stage 9-alpha: fine-grained effects helpers (v0.5.0-alpha) ---
+
+# builtin_effect(name) — the BUILTIN_EFFECTS table encoded as a function
+# (HLS has no map-of-sets). Returns the list of effects a builtin requires
+# (empty for pure builtins). Single-element lists today; future-proof for
+# multi-effect builtins.
+fn builtin_effect(name: str) -> list[str] {
+    if name == "print" || name == "println" {
+        return ["IO"]
+    }
+    if name == "read_file" || name == "write_file" || name == "file_exists" {
+        return ["Fs"]
+    }
+    if name == "clock_ms" {
+        return ["Clock"]
+    }
+    if name == "args" {
+        return ["Args"]
+    }
+    if name == "exit" {
+        return ["Exit"]
+    }
+    return []   # pure builtin
+}
+
+# effects_add(eff, key, e) — set-style insert into eff[key]'s list.
+# Returns true if the set grew (used by the fixpoint to detect change).
+fn effects_add(eff: map[str, list[str]], key: str, e: str) -> bool {
+    if !eff.has(key) {
+        eff.set(key, [])
+    }
+    let lst: list[str] = eff.get_or(key, [])
+    if !list_has(lst, e) {
+        lst.push(e)
+        return true
+    }
+    return false
+}
+
+# fmt_effects(effs) — pretty-print an effect set for error messages.
+# Empty set renders as "(none - pure)".
+fn fmt_effects(effs: list[str]) -> str {
+    if effs.len() == 0 {
+        return "(none - pure)"
+    }
+    return join(effs, ", ")
+}
+
+# effects_to_str(effs) — compact comma-separated string for one-line display.
+fn effects_to_str(effs: list[str]) -> str {
+    if effs.len() == 0 {
+        return ""
+    }
+    return join(effs, ", ")
+}
+
 # --- unify: try to match a parameter type `pt` against an argument type `at`,
 # binding type params from `tps` to concrete types in `targs_out` (parallel to
 # `tps`). Returns true if unification succeeded for any type params.
@@ -1874,7 +1957,7 @@ fn dummy_enum() -> EnumInfo {
 fn dummy_fn() -> FnInfo {
     return FnInfo {
         name: "", params: [], ptypes: [], pmuts: [], ret: "void",
-        uses_io: false, body: [], is_method: false, struct_of: "",
+        effects: [], body: [], is_method: false, struct_of: "",
         typeparams: [], line: 0
     }
 }
@@ -3226,60 +3309,90 @@ fn check_qmark(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, expecte
 }
 
 fn check_effects(ctx: Ctx) -> void {
-    let eff: map[str, bool] = map_new()
-    let mut i: int = 0
-    while i < ctx.fn_order.len() {
-        let mut key: str = ctx.fn_order.get(i)
-        eff.set(key, ctx.fns.get_or(key, dummy_fn()).uses_io)
-        i = i + 1
+    # Stage 9-alpha: fine-grained effects & capabilities.
+    # eff[key] = computed list of effects the body of `key` requires.
+    # A function passes iff its declared effects (f.effects) is a superset
+    # of the computed effects.
+    let eff: map[str, list[str]] = map_new()
+    let mut i0: int = 0
+    while i0 < ctx.fn_order.len() {
+        let key0: str = ctx.fn_order.get(i0)
+        eff.set(key0, [])
+        i0 = i0 + 1
     }
+
+    # Monotone fixpoint: union in each callee's computed effect set.
     let mut changed: bool = true
     while changed {
         changed = false
-        let mut i2: int = 0
-        while i2 < ctx.fn_order.len() {
-            let mut key: str = ctx.fn_order.get(i2)
-            if !eff.get_or(key, false) {
-                let edges: list[str] = ctx.edges.get_or(key, [])
-                let mut j: int = 0
-                while j < edges.len() {
-                    let c: str = edges.get(j)
-                    if c.starts_with("b:") {
-                        eff.set(key, true)
-                        changed = true
-                        break
-                    }
-                    if eff.get_or(c, false) {
-                        eff.set(key, true)
-                        changed = true
-                        break
-                    }
-                    j = j + 1
-                }
-            }
-            i2 = i2 + 1
-        }
-    }
-    let mut i3: int = 0
-    while i3 < ctx.fn_order.len() {
-        let mut key: str = ctx.fn_order.get(i3)
-        let f: FnInfo = ctx.fns.get_or(key, dummy_fn())
-        if eff.get_or(key, false) && !f.uses_io {
+        let mut i: int = 0
+        while i < ctx.fn_order.len() {
+            let key: str = ctx.fn_order.get(i)
             let edges: list[str] = ctx.edges.get_or(key, [])
             let mut j: int = 0
             while j < edges.len() {
                 let c: str = edges.get(j)
-                if c.starts_with("b:") || eff.get_or(c, false) {
-                    let mut nm: str = c
-                    if c.starts_with("b:") {
-                        nm = c.slice(2, c.len())
+                let mut new_eff: list[str] = []
+                if c.starts_with("b:") {
+                    new_eff = builtin_effect(c.slice(2, c.len()))
+                } else {
+                    new_eff = eff.get_or(c, [])
+                }
+                let mut k: int = 0
+                while k < new_eff.len() {
+                    if effects_add(eff, key, new_eff.get(k)) {
+                        changed = true
                     }
-                    cerr(f.line, "function '" + f.name + "' calls '" + nm + "' (IO) but does not declare 'uses IO'")
+                    k = k + 1
                 }
                 j = j + 1
             }
+            i = i + 1
         }
-        i3 = i3 + 1
+    }
+
+    # Capability check: declared ⊇ computed.
+    let mut i2: int = 0
+    while i2 < ctx.fn_order.len() {
+        let key2: str = ctx.fn_order.get(i2)
+        let f: FnInfo = ctx.fns.get_or(key2, dummy_fn())
+        let computed: list[str] = eff.get_or(key2, [])
+        # Walk each effect in `computed`; if any is missing from f.effects,
+        # find a witness edge and report.
+        let mut ci: int = 0
+        let mut found_violation: bool = false
+        while ci < computed.len() && !found_violation {
+            let ce: str = computed.get(ci)
+            if !list_has(f.effects, ce) {
+                # Find the first edge that contributes this effect.
+                let edges: list[str] = ctx.edges.get_or(key2, [])
+                let mut j2: int = 0
+                while j2 < edges.len() && !found_violation {
+                    let c: str = edges.get(j2)
+                    let mut c_eff: list[str] = []
+                    if c.starts_with("b:") {
+                        c_eff = builtin_effect(c.slice(2, c.len()))
+                    } else {
+                        c_eff = eff.get_or(c, [])
+                    }
+                    if list_has(c_eff, ce) {
+                        let mut nm: str = c
+                        if c.starts_with("b:") {
+                            nm = c.slice(2, c.len())
+                        }
+                        cerr(f.line,
+                            "function '" + f.name + "' calls '" + nm +
+                            "' which requires effect '" + ce +
+                            "' not declared (declared: " + fmt_effects(f.effects) +
+                            "; missing: " + ce + ")")
+                        found_violation = true
+                    }
+                    j2 = j2 + 1
+                }
+            }
+            ci = ci + 1
+        }
+        i2 = i2 + 1
     }
 }
 
