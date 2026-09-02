@@ -277,16 +277,41 @@ increase RSS; Valgrind/ASan clean.
 to "ref-counting + ownership analysis pass" if full borrow-checking is too
 costly.
 
-## STAGE 9 — Fine-grained effects & capabilities 🔄 (alpha shipped v0.5.0-alpha)
+## STAGE 9 — Fine-grained effects & capabilities 🔄 (alpha v0.5.0 + beta v0.6.0-alpha)
 
 **Goal:** every effect declared individually and statically verified.
 
-**Status (v0.5.0-alpha):** the **first subset of Stage 9** has shipped.
-The single `IO` effect is split into five fine-grained capabilities
+**Status (v0.6.0-alpha):** the **beta subset of Stage 9** has shipped. The
+two beta targets — `--audit` flag and explicit `pure` keyword — are
+implemented in both Stage-0 and the self-hosted `hlc`. **127/127 tests PASS.**
+
+**Status (v0.5.0-alpha):** the **first subset of Stage 9** shipped. The
+single `IO` effect is split into five fine-grained capabilities
 (`IO`, `Fs`, `Clock`, `Args`, `Exit`), each gated by a per-builtin mapping.
 `uses IO` remains as a backwards-compatible blanket alias (expanded at
 parse time to the full IO family). The fixpoint analysis now tracks effect
 SETS, not a single bool. **100/100 tests PASS.**
+
+**Shipped in v0.6.0-alpha (Stage 9-beta):**
+
+- `boot.py --audit <file.hls>` and `hlc --audit <file.hls>` print the full
+  capability / effect tree of every function — declared vs computed effects,
+  with a clear OK/VIOLATION status per function. The auditor also surfaces
+  the reserved-effect table (Net, Rand, Proc) and the IO-family expansion
+  reminder. Useful for security review and supply-chain audits.
+- Explicit `pure` keyword for documentation/linting. A function declared
+  `fn f(...) pure` must have NO `uses` clause AND transitively call nothing
+  effectful (the checker enforces this with a witness edge in the error
+  message). Purity was previously implicit (no `uses` => pure); `pure` makes
+  it explicit and self-documenting.
+- `pure` and `uses` are mutually exclusive at parse time.
+- New field `is_pure` on `FnInfo` in hlc.hls (renamed from `pure` because
+  `pure` is now a keyword and cannot be a struct literal field name).
+- `check()` in Stage-0 now returns the `Checker` instance so callers can
+  read the `computed_effects` map for audit purposes.
+- `print_audit` function added to both Stage-0 (Python) and self-hosted (HLS).
+- 4 new tests: 1 ok (`feat_audit_pure`) + 3 fail (`fail_pure_and_uses`,
+  `fail_pure_uses_io`, `fail_pure_calls_impure`).
 
 **Shipped in v0.5.0-alpha (Stage 9-alpha):**
 
@@ -318,19 +343,16 @@ SETS, not a single bool. **100/100 tests PASS.**
   `function 'log_warning' calls 'log_to_file' which requires effect 'Fs'
   not declared (declared: (none - pure); missing: Fs)`.
 - The bootstrap is still **deterministic**: two self-compile passes produce
-  byte-identical C output. **100/100 tests PASS** (was 87/87 in v0.4.0).
+  byte-identical C output.
 - 9 new tests: 4 ok (`feat_effects_fs`, `feat_effects_clock`,
   `feat_effects_multi`, `feat_effects_pure`) + 5 fail
   (`fail_effect_fs_missing`, `fail_effect_clock_missing`,
   `fail_effect_transitive_fs`, `fail_effect_reserved`, `fail_effect_unknown`).
 
-**Remaining work for Stage 9 (beta and beyond):**
+**Remaining work for Stage 9 (release and beyond):**
 
 - Add `Net`, `Rand`, `Proc` builtins (currently reserved — error if used).
 - First-class capability tokens (passed as args, stored in structs).
-- `hlc --audit` flag to print the full capability tree of a program.
-- Explicit `pure` keyword for documentation/linting (purity is currently
-  implicit via no `uses` clause).
 
 **Acceptance:** a program that doesn't declare `uses Net` CANNOT call a socket
 even through 5 function layers — the compile error points to the exact call
