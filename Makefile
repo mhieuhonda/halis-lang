@@ -8,7 +8,7 @@ HLC     = src/hlc.hls
 BIN     = bin
 PREFIX  ?= /usr/local
 
-.PHONY: all stage0 bootstrap test examples clean run check bench install uninstall audit opt-stats emit-ir
+.PHONY: all stage0 bootstrap test examples clean run check bench install uninstall audit opt-stats emit-ir emit-llvm
 
 # Main goal: use the full bootstrap chain to build the native compiler
 all: bootstrap
@@ -60,6 +60,10 @@ audit:
 # Stage 11 (v0.9.0-alpha): print the HLIR of a program
 emit-ir:
 	@$(PYTHON) boot/boot.py --emit ir $(F)
+
+# Stage 12 (v0.10.0-alpha): print the LLVM IR of a program
+emit-llvm:
+	@$(PYTHON) boot/boot.py --emit llvm $(F)
 
 # Stage 11: run the optimiser and print per-pass statistics
 opt-stats:

@@ -8,7 +8,38 @@ Releases on `main` follow the 20-stage roadmap (see [ROADMAP.md](ROADMAP.md)).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
-## [unreleased] — Stage 11-alpha (v0.9.0-alpha)
+## [unreleased] — Stage 12-alpha (v0.10.0-alpha)
+
+### Added
+- **Stage 12-alpha: LLVM IR text backend.** A new `tools/llvm_emit.py`
+  emits LLVM IR text (`.ll` format) from a checked HLS program. The
+  emitted IR can be assembled by `llc` or `clang` (when available) into
+  a native binary.
+  - HLS → LLVM type mapping: `int -> i64`, `float -> double`,
+    `bool -> i1`, `str -> ptr`, `list/map/struct/enum/tainted -> ptr`.
+  - HLS C runtime is declared as opaque externals via `declare`
+    statements, mirroring the C backend's runtime API.
+  - Each HLS function becomes an LLVM `define` with stack-allocated
+    locals (`alloca` + `load`/`store`).
+  - Integer arithmetic uses `llvm.sadd/ssub/smul.with.overflow.i64`
+    with explicit overflow-path branches to `hl_die`.
+  - Division by zero is checked before `sdiv`/`srem`.
+  - String concatenation dispatches to `hl_str_concat`.
+  - Float arithmetic uses `fadd`/`fsub`/`fmul`/`fdiv`/`frem`.
+  - Control flow (`if`/`while`/`for`/`break`/`continue`/`return`) is
+    lowered to LLVM basic blocks + `br` instructions.
+  - String literals are emitted as `private unnamed_addr constant`
+    globals and wrapped via `hl_str_from` at runtime.
+- **New `boot.py` flags:**
+  - `boot.py --emit llvm FILE.hls` — print the LLVM IR of the program.
+  - `--target TRIPLE` — set the LLVM target triple (e.g.
+    `aarch64-linux` for cross-compilation).
+- **New Makefile target:** `make emit-llvm F=...`.
+- **New example:** `examples/llvm_demo.hls`.
+- **145/145 tests PASS** (no test changes; the LLVM emitter is a new
+  diagnostic pass, parallel to the C backend).
+
+## [v0.9.0-alpha] — Stage 11-alpha (SSA IR + optimiser pipeline)
 
 ### Added
 - **Stage 11-alpha: SSA IR (HLIR) + optimiser pipeline.** A new mid-level

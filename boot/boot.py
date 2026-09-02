@@ -137,8 +137,10 @@ def run_cli():
     args = sys.argv[1:]
     check_only = False
     audit_only = False
-    emit_ir = False      # Stage 11 (v0.9.0-alpha): print HLIR text
-    opt_stats = False    # Stage 11: print optimiser statistics
+    emit_ir = False        # Stage 11 (v0.9.0-alpha): print HLIR text
+    emit_llvm = False      # Stage 12 (v0.10.0-alpha): print LLVM IR text
+    opt_stats = False      # Stage 11: print optimiser statistics
+    target_triple = None   # Stage 12: --target <triple>
     if "--check" in args:
         check_only = True
         args.remove("--check")
@@ -150,27 +152,40 @@ def run_cli():
         if i + 1 < len(args) and args[i + 1] == "ir":
             emit_ir = True
             del args[i:i + 2]
+        elif i + 1 < len(args) and args[i + 1] == "llvm":
+            emit_llvm = True
+            del args[i:i + 2]
         else:
-            sys.stderr.write("error: --emit expects 'ir'\n")
+            sys.stderr.write("error: --emit expects 'ir' or 'llvm'\n")
             return 2
     if "--opt-stats" in args:
         opt_stats = True
         args.remove("--opt-stats")
+    if "--target" in args:
+        i = args.index("--target")
+        if i + 1 < len(args):
+            target_triple = args[i + 1]
+            del args[i:i + 2]
+        else:
+            sys.stderr.write("error: --target expects a triple\n")
+            return 2
     # BUG-025 fix: --check and --audit are mutually exclusive — error out
     # explicitly rather than silently preferring one over the other.
-    mutually_exclusive = sum([check_only, audit_only, emit_ir, opt_stats])
+    mutually_exclusive = sum([check_only, audit_only, emit_ir, emit_llvm, opt_stats])
     if mutually_exclusive > 1:
         sys.stderr.write(
-            "error: --check / --audit / --emit ir / --opt-stats are mutually exclusive\n")
+            "error: --check / --audit / --emit ir / --emit llvm / --opt-stats are mutually exclusive\n")
         return 2
     if not args:
         sys.stderr.write(
-            "usage: boot.py [--check | --audit | --emit ir | --opt-stats] "
-            "<file.hls> [program args...]\n"
+            "usage: boot.py [--check | --audit | --emit ir | --emit llvm | --opt-stats]\n"
+            "               [--target <triple>] <file.hls> [program args...]\n"
             "  --check        type-check + effects-check only, no execution.\n"
             "  --audit        print the capability / effect tree of every function.\n"
             "  --emit ir      print the HLIR (Stage 11) of every function.\n"
+            "  --emit llvm    print the LLVM IR (Stage 12) of every function.\n"
             "  --opt-stats    run the Stage 11 optimiser, print per-pass stats.\n"
+            "  --target TRIPLE  set the LLVM target triple (e.g. aarch64-linux).\n"
         )
         return 2
     path = args[0]
@@ -193,6 +208,8 @@ def run_cli():
         return 0
     if emit_ir:
         return print_ir(program)
+    if emit_llvm:
+        return print_llvm(program, target_triple)
     if opt_stats:
         return print_opt_stats(program)
     if check_only:
@@ -330,6 +347,22 @@ def print_ir(program):
         return 2
     mod = build_module(program)
     sys.stdout.write(dump_module(mod))
+    return 0
+
+
+def print_llvm(program, target_triple=None):
+    """Stage 12 (v0.10.0-alpha): print the LLVM IR of a program."""
+    import os as _os
+    _tools = _os.path.join(_REPO_ROOT, "tools")
+    if _tools not in sys.path:
+        sys.path.insert(0, _tools)
+    try:
+        from llvm_emit import emit_module  # noqa: E402
+    except ImportError as ex:
+        sys.stderr.write("error: cannot load LLVM emitter: %s\n" % ex)
+        return 2
+    out = emit_module(program, target_triple=target_triple)
+    sys.stdout.write(out)
     return 0
 
 

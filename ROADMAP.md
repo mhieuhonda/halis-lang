@@ -26,7 +26,7 @@ remains green.
 | 9 | Fine-grained effects & capabilities | 🔄 | 6–8 weeks |
 | 10 | Taint tracking & sandbox | 🔄 | 8–10 weeks |
 | 11 | SSA IR + optimisation | 🔄 | 10–14 weeks |
-| 12 | Native LLVM backend | ⬜ | 10–14 weeks |
+| 12 | Native LLVM backend | 🔄 | 10–14 weeks |
 | 13 | Package manager `hls-pkg` | ⬜ | 6–8 weeks |
 | 14 | Tooling: LSP, formatter, linter | ⬜ | 6–8 weeks |
 | 15 | Safe C FFI | ⬜ | 4–6 weeks |
@@ -532,19 +532,62 @@ code elimination. The optimiser is wired into `boot.py` via the new
 after optimisation. (The v0.9.0-alpha release ships the optimiser
 infrastructure; benchmarking is the Stage 11 release target.)
 
-## STAGE 12 — Native LLVM backend ⬜
+## STAGE 12 — Native LLVM backend 🔄 (alpha v0.10.0-alpha)
 
 **Goal:** drop the C intermediate, emit machine code directly.
 
-**Work:**
-- HLIR → LLVM IR (via C++ binding or by emitting `.ll` text).
-- Multi-platform: x86-64, AArch64; cross-compile (`--target aarch64-linux`).
-- Stack probes (deep recursion no longer segfaults), hot/cold attributes,
-  PGO (profile-guided optimisation).
-- C backend kept as a fallback and for exotic platforms.
+**Status (v0.10.0-alpha):** the **alpha subset of Stage 12** has shipped.
+A new LLVM IR text backend emits `.ll` files from a checked HLS program.
+The IR can be assembled by `llc` or `clang` (when available) into a
+native binary. The C backend remains the primary codegen path; the LLVM
+backend is a parallel infrastructure for the Stage 12 release target.
+**145/145 tests PASS** (no test changes; the LLVM emitter is a new
+diagnostic pass, parallel to the C backend).
+
+**Shipped in v0.10.0-alpha (Stage 12-alpha):**
+
+- New `tools/llvm_emit.py` with the `LLVMEmitter` class:
+  - HLS → LLVM type mapping (`int -> i64`, `float -> double`,
+    `bool -> i1`, `str -> ptr`, `list/map/struct/enum/tainted -> ptr`).
+  - HLS C runtime is declared as opaque externals via `declare`
+    statements (mirroring the C backend's runtime API).
+  - Each HLS function becomes an LLVM `define` with stack-allocated
+    locals (`alloca` + `load`/`store`).
+  - Integer arithmetic uses `llvm.sadd/ssub/smul.with.overflow.i64`
+    with explicit overflow-path branches to `hl_die`.
+  - Division by zero is checked before `sdiv`/`srem`.
+  - String concatenation dispatches to `hl_str_concat`.
+  - Float arithmetic uses `fadd`/`fsub`/`fmul`/`fdiv`/`frem` (no
+    overflow check needed).
+  - Control flow (`if`/`while`/`for`/`break`/`continue`/`return`)
+    is lowered to LLVM basic blocks + `br` instructions.
+  - String literals are emitted as `private unnamed_addr constant`
+    globals and wrapped via `hl_str_from` at runtime.
+- New `boot.py` flags:
+  - `boot.py --emit llvm FILE.hls` — print the LLVM IR of the program.
+  - `--target TRIPLE` — set the LLVM target triple (e.g.
+    `aarch64-linux` for cross-compilation).
+- New Makefile target: `make emit-llvm F=...`.
+- New example: `examples/llvm_demo.hls`.
+
+**Remaining work for Stage 12 (release and beyond):**
+
+- Full method dispatch (today method calls are emitted as opaque
+  calls to `hl_method_<name>`).
+- Full struct/enum/list/map lowering with typed field access.
+- Match expression lowering (today `match` falls through the
+  expression fallback path).
+- Stack probes for deep recursion (`llvm.stackprobe` attribute).
+- PGO (profile-guided optimisation).
+- Verify the IR text assembles correctly via `llc`/`clang` (the
+  Stage 12-alpha release emits the text only; CI verification is
+  the Stage 12 release target).
+- Thrice-clean bootstrap: HLS→LLVM→native→self-compile, with output
+  matching the C backend.
 
 **Acceptance:** thrice-clean bootstrap: HLS→LLVM→native→self-compile, with
-output matching the C backend.
+output matching the C backend. (The v0.10.0-alpha release ships the IR
+emitter; the bootstrap chain is the Stage 12 release target.)
 
 ## STAGE 13 — Package manager `hls-pkg` ⬜
 

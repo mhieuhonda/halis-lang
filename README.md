@@ -131,6 +131,10 @@ python3 boot/boot.py examples/taint_beta_demo.hls examples/data.txt
 # 9. Stage 11-alpha: print HLIR / optimiser stats (v0.9.0-alpha)
 python3 boot/boot.py --emit ir examples/optimize_demo.hls
 python3 boot/boot.py --opt-stats examples/optimize_demo.hls
+
+# 10. Stage 12-alpha: print LLVM IR (v0.10.0-alpha)
+python3 boot/boot.py --emit llvm examples/llvm_demo.hls
+python3 boot/boot.py --emit llvm --target aarch64-linux examples/llvm_demo.hls
 ```
 
 ## Language example
