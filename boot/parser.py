@@ -296,6 +296,15 @@ class Parser:
             vt = self.parse_type()
             self.eat_sym("]")
             return "map[str, %s]" % vt
+        # Stage 10-alpha: `tainted[T]` — a built-in generic wrapper for
+        # taint tracking. The wrapper is recognised by the checker as a
+        # built-in (no struct/enum definition needed). At runtime it is
+        # represented as a Python dict {"tainted": True, "value": <T>}.
+        if base == "tainted":
+            self.eat_sym("[")
+            inner = self.parse_type()
+            self.eat_sym("]")
+            return "tainted[%s]" % inner
         if base in PRIM_TYPES:
             if base == "void" and not allow_void:
                 self.err("void can only be used as a return type", t)

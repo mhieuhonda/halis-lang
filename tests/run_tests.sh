@@ -12,7 +12,7 @@ cd "$(dirname "$0")/.."
 PASS=0
 FAIL=0
 TMP=$(mktemp -d)
-trap 'rm -rf "$TMP"' EXIT
+trap 'rm -rf "$TMP"' EXIT INT TERM HUP
 
 ok()   { PASS=$((PASS+1)); echo "  [PASS] $1"; }
 bad()  { FAIL=$((FAIL+1)); echo "  [FAIL] $1"; }
@@ -102,11 +102,13 @@ else
     bad "two passes produce different output!"
 fi
 echo "  [5.4] Native hlc compiles a sample program..."
+nat=""
+interp=""
 "$TMP/hlc1" examples/fibonacci.hls "$TMP/fib.c" >/dev/null 2>&1 \
     && gcc -O2 -o "$TMP/fib" "$TMP/fib.c" -lm 2>/dev/null \
     && nat=$("$TMP/fib" 2>/dev/null) \
     && interp=$(python3 boot/boot.py examples/fibonacci.hls 2>/dev/null)
-if [ "$nat" == "$interp" ]; then
+if [ -n "$nat" ] && [ -n "$interp" ] && [ "$nat" == "$interp" ]; then
     ok "native hlc compiles + runs fibonacci correctly"
 else
     bad "native hlc compiles fibonacci"

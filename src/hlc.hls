@@ -246,6 +246,16 @@ fn map_val_t(t: str) -> str {
     return t.slice(9, t.len() - 1)
 }
 
+# Stage 10-alpha: built-in taint wrapper `tainted[T]`. Like `list[T]` it
+# is a built-in generic type — no struct/enum definition required.
+fn is_taint_t(t: str) -> bool {
+    return t.starts_with("tainted[")
+}
+
+fn taint_inner_t(t: str) -> str {
+    return t.slice(8, t.len() - 1)
+}
+
 # type_base(t) returns the head identifier (before any `[`).
 fn type_base(t: str) -> str {
     let mut i: int = 0
@@ -362,6 +372,11 @@ fn instantiate_type(t: str, tps: list[str], targs: list[str]) -> str {
         let val: str = map_val_t(t)
         let new_val: str = instantiate_type(val, tps, targs)
         return "map[str, " + new_val + "]"
+    }
+    if is_taint_t(t) {
+        let inner: str = taint_inner_t(t)
+        let new_inner: str = instantiate_type(inner, tps, targs)
+        return "tainted[" + new_inner + "]"
     }
     # User-defined type with possible type args
     let base: str = type_base(t)
@@ -648,6 +663,13 @@ fn parse_type(ctx: Ctx, allow_void: bool) -> str {
         let vt: str = parse_type(ctx, false)
         eat_sym(ctx, "]")
         return "map[str, " + vt + "]"
+    }
+    # Stage 10-alpha: built-in taint wrapper `tainted[T]`.
+    if base == "tainted" {
+        eat_sym(ctx, "[")
+        let inner: str = parse_type(ctx, false)
+        eat_sym(ctx, "]")
+        return "tainted[" + inner + "]"
     }
     if base == "int" || base == "float" || base == "bool" || base == "str" {
         return base
@@ -1420,6 +1442,8 @@ fn is_builtin_fn(n: str) -> bool {
         || n == "file_exists"
         # Stage 8-alpha ownership primitives
         || n == "drop" || n == "clone" || n == "take"
+        # Stage 10-alpha taint primitives
+        || n == "tainted_args" || n == "taint_mark" || n == "taint_unwrap"
 }
 
 fn list_has(list: list[str], x: str) -> bool {
@@ -1445,6 +1469,11 @@ fn type_exists(ctx: Ctx, t: str) -> bool {
     }
     if is_map_t(t) {
         return type_exists(ctx, map_val_t(t))
+    }
+    if is_taint_t(t) {
+        # Stage 10-alpha: tainted[T] is a built-in generic wrapper; the
+        # inner type must exist but `tainted` itself needs no struct/enum.
+        return type_exists(ctx, taint_inner_t(t))
     }
     let base: str = type_base(t)
     let args: list[str] = type_args(t)
@@ -1692,12 +1721,14 @@ fn builtin_effect(name: str) -> list[str] {
     if name == "clock_ms" {
         return ["Clock"]
     }
-    if name == "args" {
+    if name == "args" || name == "tainted_args" {
+        # Stage 10-alpha: tainted_args carries the same Args effect as args.
         return ["Args"]
     }
     if name == "exit" {
         return ["Exit"]
     }
+    # taint_mark / taint_unwrap are pure (no effect; just wrap/unwrap).
     return []   # pure builtin
 }
 
@@ -1761,6 +1792,10 @@ fn unify_into(ctx: Ctx, pt: str, at: str, tps: list[str], targs_out: list[str]) 
         unify_into(ctx, map_val_t(pt), map_val_t(at), tps, targs_out)
         return
     }
+    if is_taint_t(pt) && is_taint_t(at) {
+        unify_into(ctx, taint_inner_t(pt), taint_inner_t(at), tps, targs_out)
+        return
+    }
     # Same base name — recurse into args.
     let pb: str = type_base(pt)
     let ab: str = type_base(at)
@@ -1803,6 +1838,10 @@ fn unify_into_offset(ctx: Ctx, pt: str, at: str, tps: list[str], targs_out: list
     }
     if is_map_t(pt) && is_map_t(at) {
         unify_into_offset(ctx, map_val_t(pt), map_val_t(at), tps, targs_out, offset)
+        return
+    }
+    if is_taint_t(pt) && is_taint_t(at) {
+        unify_into_offset(ctx, taint_inner_t(pt), taint_inner_t(at), tps, targs_out, offset)
         return
     }
     let pb: str = type_base(pt)
@@ -1946,6 +1985,10 @@ fn collect_insts(ctx: Ctx, t: str) -> void {
         collect_insts(ctx, map_val_t(t))
         return
     }
+    if is_taint_t(t) {
+        collect_insts(ctx, taint_inner_t(t))
+        return
+    }
     let base: str = type_base(t)
     let args: list[str] = type_args(t)
     # Skip if the base isn't a known struct/enum — it's a type param.
@@ -1996,6 +2039,9 @@ fn type_is_concrete(ctx: Ctx, t: str) -> bool {
     }
     if is_map_t(t) {
         return type_is_concrete(ctx, map_val_t(t))
+    }
+    if is_taint_t(t) {
+        return type_is_concrete(ctx, taint_inner_t(t))
     }
     let base: str = type_base(t)
     let args: list[str] = type_args(t)
@@ -2757,6 +2803,32 @@ fn check_builtin_call(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, 
         }
         j = j + 1
     }
+    # Stage 10-alpha: taint-sink enforcement.
+    # Reject tainted[T] at sink argument positions; user must explicitly
+    # untaint via taint_unwrap or a sanitizer (sanitize_html etc.).
+    if name == "print" || name == "println" {
+        if is_taint_t(argt.get(0)) {
+            cerr(line, "taint-sink violation: " + name + " argument 1 is " + argt.get(0) + " (tainted values must be sanitised before reaching a sink — use sanitize_html / sanitize_path / sanitize_sql / sanitize_command from std.sanitize, or taint_unwrap() if you accept the risk)")
+        }
+    }
+    if name == "exit" {
+        if is_taint_t(argt.get(0)) {
+            cerr(line, "taint-sink violation: exit argument 1 is " + argt.get(0) + " (tainted values must be sanitised before reaching a sink)")
+        }
+    }
+    if name == "read_file" || name == "file_exists" {
+        if is_taint_t(argt.get(0)) {
+            cerr(line, "taint-sink violation: " + name + " argument 1 is " + argt.get(0) + " (tainted values must be sanitised before reaching a sink)")
+        }
+    }
+    if name == "write_file" {
+        if is_taint_t(argt.get(0)) {
+            cerr(line, "taint-sink violation: write_file argument 1 (path) is " + argt.get(0) + " (tainted values must be sanitised before reaching a sink)")
+        }
+        if is_taint_t(argt.get(1)) {
+            cerr(line, "taint-sink violation: write_file argument 2 (content) is " + argt.get(1) + " (tainted values must be sanitised before reaching a sink)")
+        }
+    }
     if name == "print" || name == "println" {
         if nargs != 1 || argt.get(0) != "str" {
             cerr(line, name + " expects 1 str argument")
@@ -2838,6 +2910,36 @@ fn check_builtin_call(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, 
         }
         add_edge(ctx, cur, "b:args")
         return "list[str]"
+    }
+    # Stage 10-alpha: tainted_args — like args() but each element is
+    # wrapped as tainted[str] (defined in std/taint.hls).
+    if name == "tainted_args" {
+        if nargs != 0 {
+            cerr(line, "tainted_args() takes no arguments")
+        }
+        add_edge(ctx, cur, "b:tainted_args")
+        return "list[tainted[str]]"
+    }
+    # Stage 10-alpha: taint_mark / taint_unwrap — generic wrap / unwrap.
+    if name == "taint_mark" {
+        if nargs != 1 {
+            cerr(line, "taint_mark() expects 1 argument")
+        }
+        let a0: str = argt.get(0)
+        if a0 == "void" {
+            cerr(line, "taint_mark() does not support void")
+        }
+        return "tainted[" + a0 + "]"
+    }
+    if name == "taint_unwrap" {
+        if nargs != 1 {
+            cerr(line, "taint_unwrap() expects 1 argument")
+        }
+        let a0: str = argt.get(0)
+        if !is_taint_t(a0) {
+            cerr(line, "taint_unwrap() expects a tainted[T] value, got " + a0)
+        }
+        return taint_inner_t(a0)
     }
     if name == "clock_ms" {
         if nargs != 0 {
@@ -4189,12 +4291,23 @@ fn c_type(ctx: Ctx, t_in: str) -> str {
     if is_map_t(t) {
         return "hl_map*"
     }
+    if is_taint_t(t) {
+        # Stage 10-alpha: at the C level, a tainted[T] is represented the
+        # same as T — the taint is a compile-time property only, enforced
+        # by the checker's taint-sink rule. Runtime distinction (e.g. a
+        # taint flag carried at runtime) is deferred to Stage 10-beta.
+        return c_type(ctx, taint_inner_t(t))
+    }
     return c_type_name(t) + "*"
 }
 
 fn is_ptr_type(t: str) -> bool {
     if t == "int" || t == "float" || t == "bool" || t == "void" {
         return false
+    }
+    if is_taint_t(t) {
+        # tainted[T] is a pointer iff T is.
+        return is_ptr_type(taint_inner_t(t))
     }
     return true
 }
@@ -4561,6 +4674,19 @@ fn gen_call(ctx: Ctx, e: int) -> str {
     }
     if name == "args" {
         return "hl_args()"
+    }
+    # Stage 10-alpha: taint primitives — at runtime, taint is a no-op
+    # (the check is purely at compile-time). tainted_args() returns the
+    # same hl_args() result; taint_mark(x) returns x; taint_unwrap(x)
+    # returns x. The C type of tainted[T] is the same as T (see c_type).
+    if name == "tainted_args" {
+        return "hl_args()"
+    }
+    if name == "taint_mark" {
+        return args
+    }
+    if name == "taint_unwrap" {
+        return args
     }
     if name == "clock_ms" {
         return "hl_clock_ms()"

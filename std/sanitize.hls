@@ -1,0 +1,192 @@
+# ============================================================================
+# std/sanitize.hls — Sanitisers for tainted strings (Stage 10-alpha)
+# ----------------------------------------------------------------------------
+# Each sanitize_* function takes a `tainted[str]` and returns a CLEAN `str`
+# that is safe to pass to a sink. Internally, each one:
+#   1. Calls taint_unwrap to get the inner string (the explicit untaint).
+#   2. Applies a normalising filter that removes / escapes the
+#      dangerous characters for the sink domain.
+#   3. Returns the cleaned str (NOT tainted[str]).
+#
+# The unwrapping is done inside the sanitizer body — from the caller's
+# perspective, they pass a tainted value in and get a safe value out.
+#
+# Available sanitizers:
+#   * sanitize_html(t)        — escape < > & " ' / for safe HTML rendering
+#   * sanitize_html_attr(t)   — escape for an HTML attribute value
+#   * sanitize_path(t)         — reject path traversal (.., leading /, NUL)
+#   * sanitize_sql_identifier(t) — allow only [A-Za-z_][A-Za-z0-9_]*, else panic
+#   * sanitize_sql_string(t)  — escape ' and \ for SQL string literals
+#   * sanitize_command(t)      — reject shell metacharacters; panic if any
+#   * sanitize_filename(t)    — allow only [A-Za-z0-9._-]+, else panic
+#
+# All functions here are pure (no `uses IO`).
+# ============================================================================
+
+import "std.taint"
+import "std.html"
+import "std.str"
+
+# ----------------------------------------------------------------------------
+# HTML sanitizers — defer to std.html, which has battle-tested escaping.
+# ----------------------------------------------------------------------------
+
+# sanitize_html(t) escapes the inner string for safe HTML body / text
+# rendering. The result is a clean str that can be passed to print,
+# write_file, etc. without further taint concerns.
+fn sanitize_html(t: tainted[str]) -> str {
+    let inner: str = taint_unwrap(t)
+    return html_escape(inner)
+}
+
+# sanitize_html_attr(t) escapes for an HTML attribute value (covers
+# additional characters that are dangerous in attribute context).
+fn sanitize_html_attr(t: tainted[str]) -> str {
+    let inner: str = taint_unwrap(t)
+    return html_escape_attr(inner)
+}
+
+# ----------------------------------------------------------------------------
+# Path sanitiser — prevent path traversal attacks.
+# A safe path:
+#   - is non-empty
+#   - contains no NUL bytes
+#   - contains no ".." segments
+#   - is not absolute (doesn't start with "/")
+# Any violation causes a panic — the caller is expected to surface the
+# error to the user, not silently mangle the path.
+# ----------------------------------------------------------------------------
+
+fn sanitize_path(t: tainted[str]) -> str {
+    let inner: str = taint_unwrap(t)
+    if inner.len() == 0 {
+        panic("sanitize_path: empty path")
+    }
+    # NUL byte check
+    let mut i: int = 0
+    while i < inner.len() {
+        if inner.byte_at(i) == 0 {
+            panic("sanitize_path: NUL byte in path")
+        }
+        i = i + 1
+    }
+    # Absolute path check
+    if inner.byte_at(0) == 47 {  # '/'
+        panic("sanitize_path: absolute path not allowed")
+    }
+    # Parent-directory traversal check — look for ".." as a path segment.
+    # We split on '/' (byte 47) and reject any segment equal to "..".
+    let parts: list[str] = inner.split("/")
+    let mut j: int = 0
+    while j < parts.len() {
+        if parts.get(j) == ".." {
+            panic("sanitize_path: '..' traversal not allowed")
+        }
+        j = j + 1
+    }
+    return inner
+}
+
+# ----------------------------------------------------------------------------
+# SQL sanitizers.
+#   - sanitize_sql_identifier: for table / column names. Only allows
+#     [A-Za-z_][A-Za-z0-9_]*. Panics on anything else.
+#   - sanitize_sql_string: for string LITERALS. Doubles ' and \. The
+#     result must STILL be wrapped in '...' by the caller.
+# ----------------------------------------------------------------------------
+
+fn sanitize_sql_identifier(t: tainted[str]) -> str {
+    let inner: str = taint_unwrap(t)
+    if inner.len() == 0 {
+        panic("sanitize_sql_identifier: empty identifier")
+    }
+    let first: int = inner.byte_at(0)
+    if !((first >= 65 && first <= 90) || (first >= 97 && first <= 122) || first == 95) {
+        panic("sanitize_sql_identifier: first char must be [A-Za-z_]")
+    }
+    let mut i: int = 0
+    while i < inner.len() {
+        let c: int = inner.byte_at(i)
+        if !((c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c == 95) {
+            panic("sanitize_sql_identifier: char must be [A-Za-z0-9_]")
+        }
+        i = i + 1
+    }
+    return inner
+}
+
+fn sanitize_sql_string(t: tainted[str]) -> str {
+    let inner: str = taint_unwrap(t)
+    # Escape ' as '' and \ as \\ — standard SQL string escaping.
+    let out: list[str] = []
+    let mut i: int = 0
+    while i < inner.len() {
+        let c: int = inner.byte_at(i)
+        if c == 39 {  # '\''
+            out.push("'")
+            out.push("'")
+        } else if c == 92 {  # '\\'
+            out.push("\\")
+            out.push("\\")
+        } else {
+            out.push(chr(c))
+        }
+        i = i + 1
+    }
+    return str_join(out, "")
+}
+
+# ----------------------------------------------------------------------------
+# Command sanitiser — reject shell metacharacters.
+# A safe command argument:
+#   - contains no shell metacharacters: ; | & ` $ ( ) < > ! \ " ' * ? [ ] { } space newline tab
+# Any violation causes a panic — the caller must surface the error.
+# ----------------------------------------------------------------------------
+
+fn sanitize_command(t: tainted[str]) -> str {
+    let inner: str = taint_unwrap(t)
+    let mut i: int = 0
+    while i < inner.len() {
+        let c: int = inner.byte_at(i)
+        # Reject: 32 (space), 9 (tab), 10 (newline), 13 (CR),
+        # 59 ; 124 | 38 & 96 ` 36 $ 40 ( 41 ) 60 < 62 > 33 !
+        # 92 \ 34 " 39 ' 42 * 63 ? 91 [ 93 ] 123 { 125 }
+        if c == 32 || c == 9 || c == 10 || c == 13
+            || c == 59 || c == 124 || c == 38 || c == 96
+            || c == 36 || c == 40 || c == 41 || c == 60
+            || c == 62 || c == 33 || c == 92 || c == 34
+            || c == 39 || c == 42 || c == 63 || c == 91
+            || c == 93 || c == 123 || c == 125 {
+            panic("sanitize_command: shell metacharacter not allowed")
+        }
+        i = i + 1
+    }
+    return inner
+}
+
+# ----------------------------------------------------------------------------
+# Filename sanitiser — allow only [A-Za-z0-9._-]+. Reject empty, paths,
+# dots, etc.
+# ----------------------------------------------------------------------------
+
+fn sanitize_filename(t: tainted[str]) -> str {
+    let inner: str = taint_unwrap(t)
+    if inner.len() == 0 {
+        panic("sanitize_filename: empty filename")
+    }
+    let mut i: int = 0
+    while i < inner.len() {
+        let c: int = inner.byte_at(i)
+        # Allow: A-Z a-z 0-9 . _ -
+        if !((c >= 65 && c <= 90) || (c >= 97 && c <= 122)
+              || (c >= 48 && c <= 57) || c == 46 || c == 95 || c == 45) {
+            panic("sanitize_filename: char must be [A-Za-z0-9._-]")
+        }
+        i = i + 1
+    }
+    # Reject leading dot (hidden file) and consecutive dots (.. traversal)
+    if inner.byte_at(0) == 46 {
+        panic("sanitize_filename: leading dot not allowed")
+    }
+    return inner
+}

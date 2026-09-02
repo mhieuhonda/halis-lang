@@ -22,7 +22,7 @@ performance is not the price of safety**.
 # A function without 'uses IO' is GUARANTEED pure by the compiler
 fn sum_squares(n: int) -> int {
     let mut total: int = 0
-    let i: int = 0
+    let mut i: int = 0
     while i < n {
         total = total + i * i
         i = i + 1
@@ -36,7 +36,7 @@ fn main() -> int uses IO {
 }
 ```
 
-Three core guarantees of v0.5.0-alpha:
+Five core guarantees of v0.7.0-alpha:
 
 1. **I/O is a declared effect.** Forget `uses IO` while printing to the
    screen? Compile error — even when the call is indirect through 5 function
@@ -55,6 +55,25 @@ Three core guarantees of v0.5.0-alpha:
    verified. `uses IO` remains as a backwards-compatible blanket alias.
    A function with no `uses` clause is statically guaranteed pure.
    See [SPEC.md section 9 & 17](SPEC.md).
+6. **(Stage 9-beta, v0.6.0-alpha) Explicit `pure` keyword + `--audit`
+   flag.** A function declared `pure` must have no `uses` and must
+   transitively call nothing effectful — enforced by the checker with
+   a witness edge in the error message. `hlc --audit` and
+   `boot.py --audit` print the full capability / effect tree of every
+   function in the program — declared vs computed, with a clear
+   OK/VIOLATION status per function. Useful for security review and
+   supply-chain audits.
+7. **(NEW in v0.7.0-alpha) Taint tracking.** The new built-in generic
+   type `tainted[T]` wraps any value as potentially-attacker-controlled.
+   The checker statically rejects passing a tainted value to a sink
+   (print, println, write_file, read_file, file_exists, exit) — the
+   user must sanitise first via the standard library
+   `sanitize_html` / `sanitize_path` / `sanitize_sql_identifier` /
+   `sanitize_sql_string` / `sanitize_command` / `sanitize_filename`
+   helpers, or use the explicit `taint_unwrap()` escape hatch.
+   `tainted_args()` returns the program's argv wrapped as
+   `list[tainted[str]]`, so every command-line input is tainted by
+   default. See [SPEC.md section 19](SPEC.md).
 
 ## Self-hosting — proof, not promise
 
@@ -94,11 +113,17 @@ make bootstrap
 # 3. Compile your program to a native binary
 make run F=examples/primes.hls
 
-# 4. Run the full test suite (100 tests: types, effects, ownership, differential, bootstrap)
+# 4. Run the full test suite (135 tests: types, effects, ownership, taint, differential, bootstrap)
 make test
 
-# 5. Try the new fine-grained effects (v0.5.0-alpha)
+# 5. Try the fine-grained effects (v0.7.0-alpha)
 python3 boot/boot.py examples/effects_demo.hls arg1 arg2
+
+# 6. Audit the capability / effect tree of a program
+make audit F=examples/effects_demo.hls
+
+# 7. Run the new taint tracking demo (v0.7.0-alpha)
+python3 boot/boot.py examples/taint_demo.hls "first arg" "/api/users"
 ```
 
 ## Language example
@@ -213,7 +238,7 @@ Full details: [SPEC.md](SPEC.md) · Stage-by-stage roadmap:
 
 ## Status
 
-**v0.5.0-alpha — Stages 1–7 complete, Stage 8-alpha + Stage 9-alpha shipped**:
+**v0.7.0-alpha — Stages 1–7 complete, Stage 8-alpha + Stage 9-alpha + Stage 9-beta + Stage 10-alpha shipped**:
 
 - ✅ Complete core specification
 - ✅ Stage-0 reference (interpreted, with type + effects checking)
@@ -233,18 +258,43 @@ Full details: [SPEC.md](SPEC.md) · Stage-by-stage roadmap:
   Single `IO` effect split into five — `IO`, `Fs`, `Clock`, `Args`, `Exit`.
   `uses` clause now accepts a comma-separated list; `uses IO` is a
   backwards-compatible blanket alias. Capability subset semantics
-  (`declared ⊇ computed`) with default-deny for pure functions. **100/100
+  (`declared ⊇ computed`) with default-deny for pure functions.
+- ✅ **Stage 9-beta — Explicit `pure` keyword + `--audit` flag**
+  (v0.6.0-alpha): `fn f(...) pure` declares purity explicitly; mutually
+  exclusive with `uses` at parse time. `hlc --audit` and
+  `boot.py --audit` print the full capability / effect tree of every
+  function in the program.
+- ✅ **Stage 10-alpha — Taint tracking & sandbox** (v0.7.0-alpha):
+  New built-in generic type `tainted[T]` wraps any value as potentially
+  attacker-controlled. Three new builtins: `tainted_args()` returns the
+  program's argv wrapped as `list[tainted[str]]`; `taint_mark(x)` wraps
+  any value; `taint_unwrap(x)` is the explicit untaint escape hatch. The
+  checker statically rejects passing `tainted[T]` to any sink
+  (`print`, `println`, `read_file`, `write_file`, `file_exists`,
+  `exit`). Two new stdlib modules: `std.taint` (pure-query helpers on
+  tainted strings — length, prefix/suffix, contains, slice that stays
+  tainted) and `std.sanitize` (six sanitizers: `sanitize_html`,
+  `sanitize_html_attr`, `sanitize_path`, `sanitize_sql_identifier`,
+  `sanitize_sql_string`, `sanitize_command`, `sanitize_filename`).
+  The new `examples/taint_demo.hls` exercises the full flow. **135/135
   tests PASS**.
 - ⬜ Stage 8-beta (full borrow checker, end-of-arena runtime),
-  Stage 9-beta (`Net`/`Rand`/`Proc` builtins, first-class capability tokens),
-  fine-grained taint, SSA IR, LLVM, concurrency...
+  Stage 10-beta (sandboxed compile mode, taint analysis report from
+  `hlc --audit`), fine-grained taint, SSA IR, LLVM, concurrency...
 
 ## Contributing
 
 Every contribution must preserve the core guarantees and pass
-`make test` (100 tests, including differential testing of the two
+`make test` (135 tests, including differential testing of the two
 implementations). Every new feature must first be used inside `hlc` itself —
 the compiler is always the first customer of the language.
+
+**Branch protection:** the `main` branch is protected — all non-admin
+contributors must open a pull request. CI must pass on every PR (full
+test suite + bootstrap determinism + example programs, on the 2×2
+matrix of Python 3.8/3.11 and gcc/clang). Direct pushes to `main` are
+limited to the repo owner. Linear history is enforced (no merge
+commits); force-push and branch deletion are disabled.
 
 ## Licence
 

@@ -32,6 +32,15 @@ def map_val(t):
     return t[9:-1]
 
 
+# Stage 10-alpha: built-in taint wrapper `tainted[T]`.
+def is_taint(t):
+    return t.startswith("tainted[")
+
+
+def taint_inner(t):
+    return t[8:-1]
+
+
 def split_type_args(s):
     """Split a comma-separated list of type strings, respecting nested [ ]."""
     if s == "":
@@ -79,6 +88,8 @@ def instantiate_type(t, type_map):
         return "list[" + instantiate_type(list_elem(t), type_map) + "]"
     if is_map(t):
         return "map[str, " + instantiate_type(map_val(t), type_map) + "]"
+    if is_taint(t):
+        return "tainted[" + instantiate_type(taint_inner(t), type_map) + "]"
     if "[" in t and t.endswith("]"):
         base = type_base(t)
         args = type_args(t)
@@ -99,6 +110,8 @@ def unify(pt, at, typeparams, type_map):
         return unify(list_elem(pt), list_elem(at), typeparams, type_map)
     if pt.startswith("map[str, ") and at.startswith("map[str, "):
         return unify(map_val(pt), map_val(at), typeparams, type_map)
+    if is_taint(pt) and is_taint(at):
+        return unify(taint_inner(pt), taint_inner(at), typeparams, type_map)
     if "[" in pt and "[" in at and type_base(pt) == type_base(at):
         pargs = type_args(pt)
         aargs = type_args(at)
@@ -118,8 +131,9 @@ BUILTIN_FNS = {
     "file_exists",
     # Stage 8-alpha ownership primitives (v0.4.0-alpha)
     "drop", "clone", "take",
+    # Stage 10-alpha: taint-tracking primitives (v0.7.0-alpha)
+    "tainted_args", "taint_mark", "taint_unwrap",
 }
-IO_BUILTINS = {"print", "println", "read_file", "write_file", "exit", "args", "clock_ms", "file_exists"}
 
 # Stage 9-alpha: per-builtin effect mapping. Pure builtins (panic, str, int,
 # len, range, map_new, chr, drop, clone, take) are absent — they contribute
@@ -134,6 +148,9 @@ BUILTIN_EFFECTS = {
     "clock_ms":    {"Clock"},
     "args":        {"Args"},
     "exit":        {"Exit"},
+    # Stage 10-alpha: tainted_args carries the Args effect (same as args).
+    "tainted_args": {"Args"},
+    # taint_mark / taint_unwrap are pure (no side effect; just wrap/unwrap).
 }
 
 # Types whose values are "owned" heap allocations — subject to move tracking.
@@ -143,6 +160,38 @@ def is_owned_type(t):
     if t in ("int", "float", "bool", "void", "never"):
         return False
     return True  # str, list, map, struct, enum — all heap-allocated in v0.4
+
+
+# Stage 10-alpha: taint tracking.
+# A value is "tainted" if its type is `tainted[T]` (the wrapper defined in
+# std/taint.hls). The checker statically rejects passing a tainted value
+# into a SINK (console output, filesystem, process exit). The user must
+# explicitly untaint via a sanitizer (sanitize_html / sanitize_path /
+# sanitize_sql / sanitize_command) or `taint_unwrap` (the "I know what I'm
+# doing" escape hatch) before reaching the sink.
+#
+# Sinks are a hardcoded subset of BUILTIN_FNS — see SINK_BUILTINS below.
+# Per-builtin sink-argument indexes are listed in SINK_ARG_INDEX.
+SINK_BUILTINS = {
+    "print":        (0,),   # the message is the taint vector
+    "println":      (0,),
+    "read_file":     (0,),  # tainted path → path-traversal
+    "write_file":    (0, 1),  # tainted path or content → both bad
+    "exit":          (0,),   # tainted exit code → behavior-injection
+}
+
+# Returns True iff `t` is the taint wrapper type `tainted[T]` for any T.
+def is_tainted_type(t):
+    return t.startswith("tainted[") or t.startswith("Tainted[")
+
+
+def list_taint_inner(t):
+    """For `tainted[T]` return T; otherwise return t unchanged."""
+    if t.startswith("tainted["):
+        return t[8:-1].strip()
+    if t.startswith("Tainted["):
+        return t[8:-1].strip()
+    return t
 
 STR_M = {
     "len": ([], "int"), "byte_at": (["int"], "int"),
@@ -182,6 +231,11 @@ class Checker:
             return self.type_exists(list_elem(t), node)
         if is_map(t):
             return self.type_exists(map_val(t), node)
+        if is_taint(t):
+            # Stage 10-alpha: tainted[T] is a built-in generic wrapper; the
+            # inner type must exist but `tainted` itself needs no struct
+            # or enum definition.
+            return self.type_exists(taint_inner(t), node)
         base = type_base(t)
         args = type_args(t)
         if base in self.structs or base in self.enums:
@@ -664,11 +718,18 @@ class Checker:
                      % (vname, ename, len(payloads), len(args)), e)
         typeparams = edef["typeparams"]
         type_map = {}
-        # First pass: infer type args from arguments.
+        # First pass: infer type args from arguments. Cache the resulting
+        # type per argument so we can avoid a second check_expr call when the
+        # first pass already produced a concrete type that matches the
+        # instantiated payload type. BUG-A fix: a second check_expr call on
+        # the same argument would re-execute side effects (drop/take move
+        # the binding) and produce a spurious "use of moved value" error.
+        first_at = []
         for a, pt in zip(args, payloads):
             at = self.check_expr(a, env, None)
             if at == "never":
                 self.err("never value cannot be used as an enum payload", e)
+            first_at.append(at)
             if typeparams:
                 unify(pt, at, typeparams, type_map)
             else:
@@ -693,17 +754,31 @@ class Checker:
             result_type = ename + "[" + ", ".join(type_map[tp] for tp in typeparams) + "]"
         else:
             result_type = ename
-        # Type-check payloads against instantiated payload types.
+        # Type-check payloads against instantiated payload types. We reuse
+        # the first-pass types whenever they already match the instantiated
+        # payload type — this avoids re-running check_expr (which would
+        # re-execute side effects like drop/take move-marking, BUG-A).
         if typeparams:
             inst_payloads = [instantiate_type(pt, type_map) for pt in payloads]
         else:
             inst_payloads = list(payloads)
-        for a, pt in zip(args, inst_payloads):
-            at = self.check_expr(a, env, pt)
+        for i, (a, pt) in enumerate(zip(args, inst_payloads)):
+            at = first_at[i] if first_at else None
+            if at is None:
+                at = self.check_expr(a, env, pt)
             if at == "never":
                 continue
             if at != pt:
-                self.err("payload type mismatch: expected %s, got %s" % (pt, at), e)
+                # Only re-check if the first pass type disagrees with the
+                # expected type AND the first pass used no contextual hint —
+                # the disagreement may be due to a missing contextual type
+                # (e.g. an empty list literal `[]` would return `list[?]`
+                # on the first pass and require the contextual type).
+                at2 = self.check_expr(a, env, pt)
+                if at2 == "never":
+                    continue
+                if at2 != pt:
+                    self.err("payload type mismatch: expected %s, got %s" % (pt, at2), e)
         # Rewrite the node in-place so the interpreter can dispatch on `enumlit`.
         e["k"] = "enumlit"
         e["enum_name"] = ename
@@ -797,7 +872,13 @@ class Checker:
         # defaults — checked above. Any extra fields beyond declared?
         if len(provided_names) > len(decl_names):
             self.err("struct literal %s has too many fields" % name, e)
-        # Now type-check each provided field.
+        # Now type-check each provided field. We do a SINGLE pass that
+        # records the resulting type for each field expression, then
+        # optionally infers remaining type params from those types. This
+        # avoids re-running check_expr (BUG-A: drop/take would re-execute
+        # their move-marking side effects and spuriously fail with
+        # "use of moved value" on the second pass).
+        first_vt = []
         for i, (fname, fexpr) in enumerate(e["fields"]):
             decl_fname, decl_ftype, _ = fields_with_defaults[i]
             if typeparams and type_map:
@@ -805,15 +886,31 @@ class Checker:
             else:
                 inst_ftype = decl_ftype
             vt = self.check_expr(fexpr, env, inst_ftype)
+            first_vt.append(vt)
+            # If the expected type is a concrete (non-typeparam) type,
+            # enforce the match. If it's an uninstantiated typeparam, defer
+            # — the second pass below will infer.
+            if vt == "never":
+                continue
+            if typeparams and not type_map:
+                # Cannot enforce type when the type param is still unbound.
+                continue
             if vt != inst_ftype:
                 self.err("field type %s mismatch: expected %s, got %s"
                          % (fname, inst_ftype, vt), e)
         # If generic and we couldn't infer all type params from context, try
-        # to infer from provided field types.
+        # to infer from provided field types — reusing the first-pass types.
         if typeparams:
             for i, (fname, fexpr) in enumerate(e["fields"]):
                 decl_ftype = fields_with_defaults[i][1]
-                ft = self.check_expr(fexpr, env, None)
+                ft = first_vt[i] if i < len(first_vt) else None
+                if ft is None:
+                    # No first-pass result (shouldn't happen). Fall back to
+                    # a single non-contextual check; this path is only
+                    # reached when first_vt was not collected, e.g. if the
+                    # field expression was added by the parser after the
+                    # first pass.
+                    ft = self.check_expr(fexpr, env, None)
                 if ft == "never":
                     continue
                 unify(decl_ftype, ft, typeparams, type_map)
@@ -822,6 +919,18 @@ class Checker:
                     self.err("cannot infer type argument for struct %s; provide a contextual type"
                              % name, e)
             result_type = name + "[" + ", ".join(type_map[tp] for tp in typeparams) + "]"
+            # Now that we have the final type_map, re-verify the field types
+            # against the INSTANTIATED types — but only on the cached
+            # first-pass results, never by re-calling check_expr.
+            for i, (fname, fexpr) in enumerate(e["fields"]):
+                decl_ftype = fields_with_defaults[i][1]
+                inst_ftype = instantiate_type(decl_ftype, type_map)
+                ft = first_vt[i]
+                if ft == "never":
+                    continue
+                if ft != inst_ftype:
+                    self.err("field type %s mismatch: expected %s, got %s"
+                             % (fname, inst_ftype, ft), e)
         else:
             result_type = name
         return result_type
@@ -886,18 +995,45 @@ class Checker:
                 self.err("%s expects argument %s, got %s" % (name, want, at), e)
             return at
 
+        # Stage 10-alpha: taint-sink enforcement.
+        # For each SINK builtin, before we type-check the args, run a pass
+        # that rejects `tainted[T]` values being passed to sink argument
+        # positions. We do this AFTER the regular argt() call so the
+        # underlying type error message takes precedence (e.g. passing
+        # an int to print already errors as "expected str, got int"; we
+        # only need the taint error for the case where the type is
+        # otherwise fine but the value is tainted).
+        def reject_tainted_at_sink(arg_idx, want):
+            arg = args[arg_idx]
+            # Check the expression to get its type. Pass `want` so we
+            # don't break type inference (e.g. for `map_new()`).
+            at = self.check_expr(arg, env, want)
+            if at == "never":
+                return at  # never propagates; let the caller handle
+            if is_tainted_type(at):
+                self.err(
+                    "taint-sink violation: %s argument %d is tainted[%s] "
+                    "(tainted values must be sanitised before reaching "
+                    "a sink — use sanitize_html / sanitize_path / "
+                    "sanitize_sql / sanitize_command from std.sanitize, "
+                    "or taint_unwrap() if you accept the risk)" %
+                    (name, arg_idx + 1, list_taint_inner(at)), e)
+            return at
+
         if name in ("print", "println"):
             need(1)
-            argt(0, "str")
+            reject_tainted_at_sink(0, "str")
             self.edges[self.cur_fn].add("b:print")
             return "void"
         if name == "panic":
             need(1)
+            # panic is NOT a taint sink — panicking with a tainted message
+            # is fine; panic is for programming bugs, not user output.
             argt(0, "str")
             return "never"
         if name == "exit":
             need(1)
-            argt(0, "int")
+            reject_tainted_at_sink(0, "int")
             self.edges[self.cur_fn].add("b:exit")
             return "never"
         if name == "str":
@@ -928,19 +1064,41 @@ class Checker:
             return expected
         if name == "read_file":
             need(1)
-            argt(0, "str")
+            reject_tainted_at_sink(0, "str")
             self.edges[self.cur_fn].add("b:read_file")
             return "str"
         if name == "write_file":
             need(2)
-            argt(0, "str")
-            argt(1, "str")
+            reject_tainted_at_sink(0, "str")
+            reject_tainted_at_sink(1, "str")
             self.edges[self.cur_fn].add("b:write_file")
             return "void"
         if name == "args":
             need(0)
             self.edges[self.cur_fn].add("b:args")
             return "list[str]"
+        # Stage 10-alpha: tainted_args — like `args` but each element is
+        # wrapped as `tainted[str]` (defined in std/taint.hls).
+        if name == "tainted_args":
+            need(0)
+            self.edges[self.cur_fn].add("b:tainted_args")
+            return "list[tainted[str]]"
+        # Stage 10-alpha: taint_mark / taint_unwrap — generic wrap/unwrap.
+        # Both are pure (no effect); taint_unwrap is the "I know what I'm
+        # doing" escape hatch — it is the explicit untaint operation.
+        if name == "taint_mark":
+            need(1)
+            at = argt(0, None)
+            if at == "void":
+                self.err("taint_mark() does not support void", e)
+            return "tainted[%s]" % at
+        if name == "taint_unwrap":
+            need(1)
+            at = argt(0, None)
+            if not is_tainted_type(at):
+                self.err(
+                    "taint_unwrap() expects a tainted[T] value, got %s" % at, e)
+            return list_taint_inner(at)
         if name == "chr":
             need(1)
             argt(0, "int")
@@ -951,7 +1109,7 @@ class Checker:
             return "int"
         if name == "file_exists":
             need(1)
-            argt(0, "str")
+            reject_tainted_at_sink(0, "str")
             self.edges[self.cur_fn].add("b:file_exists")
             return "bool"
         # ----- Stage 8-alpha: ownership primitives (drop / clone / take) -----

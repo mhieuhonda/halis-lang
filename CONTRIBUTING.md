@@ -10,7 +10,7 @@ how to submit changes.
 git clone https://github.com/mhieuhonda/hieu-louis-lang.git
 cd hieu-louis-lang
 make bootstrap    # builds the native compiler via the bootstrap chain
-make test         # 92 tests: interpreter, native, differential, bootstrap
+make test         # 135 tests: interpreter, native, differential, bootstrap
 ```
 
 Requirements: Python 3.8+ (only for the Stage-0 seed), gcc or clang.
@@ -19,13 +19,32 @@ Requirements: Python 3.8+ (only for the Stage-0 seed), gcc or clang.
 
 | Branch                           | Purpose                                       |
 |----------------------------------|-----------------------------------------------|
-| `main`                           | The roadmap branch. Stages 1–7 are complete (v0.3.0). Each new roadmap stage lands here when ready. |
+| `main`                           | The roadmap branch. Stages 1–7 complete; Stage 8-alpha, 9-alpha, 9-beta, 10-alpha shipped (current: v0.7.0-alpha). Each new roadmap stage lands here when ready. |
 | `feature/community-extensions`   | Non-roadmap upgrades: new stdlib modules, tooling, examples, CI/CD. Smaller, more frequent releases cut from here. |
 | `feature/*` / `fix/*`             | Short-lived topic branches.                   |
 
 We **never** rewrite history on `main` or on `feature/community-extensions`.
 Every commit must build (`make bootstrap`) and pass the full test suite
 (`make test`).
+
+### Branch protection (enforced on `main`)
+
+The `main` branch is protected. The rules in effect:
+
+- **Pull requests are required** for all non-admin pushers. Direct
+  pushes to `main` are limited to the repo owner (admin).
+- **CI must pass** on every PR: the full 2×2 matrix of Python
+  3.8/3.11 × gcc/clang runs `make test`, `make bootstrap`, and the
+  example programs. All four cells must pass before a PR can merge.
+- **Linear history** is enforced — no merge commits. Rebase your PR
+  before merging.
+- **No force-push, no branch deletion** on `main`.
+- **Conversation resolution**: all review conversations on a PR must be
+  marked as resolved before the PR can merge.
+
+To work on a feature: fork the repo (or branch off `main`), commit,
+push to your branch, open a PR. Do not push to `main` directly unless
+you are the owner.
 
 ## How to contribute
 
@@ -85,7 +104,7 @@ Every module under `std/` must:
   explaining what it does and any panic conditions.
 - Use `panic` **only for programming bugs**. Expected errors must use
   `Result[T, E]` from `std.result`.
-- No bitwise operators (`&`, `|`, `^`, `<<`, `>>`) — HLS v0.3 does not
+- No bitwise operators (`&`, `|`, `^`, `<<`, `>>`) — HLS does not
   have them. Decompose bit manipulations into multiply / modulo / division
   on `int64`.
 

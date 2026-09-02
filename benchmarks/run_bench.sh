@@ -5,13 +5,15 @@
 #   2. Native hlc-compiled binary (compiled via Stage-0 + gcc)
 #   3. Native hlc-compiled binary (compiled via the native hlc itself)
 #
-# Reports timing for each. All three paths should produce identical output
-# (the differential property of the bootstrap chain).
+# Runs each benchmark three ways and prints its output (the benchmarks
+# self-time; for real timing use `time` externally). All three paths
+# should produce identical output (the differential property of the
+# bootstrap chain).
 # ============================================================================
 set -u
 cd "$(dirname "$0")/.."
 TMP=$(mktemp -d)
-trap 'rm -rf "$TMP"' EXIT
+trap 'rm -rf "$TMP"' EXIT INT TERM HUP
 
 run_interp() {
     local f="$1"

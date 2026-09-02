@@ -1,15 +1,22 @@
-# Hieu Louis language specification (HLS) — v0.5.0-alpha
+# Hieu Louis language specification (HLS) — v0.7.0-alpha
 
 > **Hieu Louis** is a high-security, native-compiled programming language
 > designed around the philosophy: **safety by default, explicitness for
-> auditability, performance via AOT compilation**. Version v0.5.0-alpha
-> introduces the **Stage 9-alpha fine-grained effects & capabilities**
-> model: a single `IO` effect is split into five capabilities (`IO`, `Fs`,
-> `Clock`, `Args`, `Exit`) that are individually declared and statically
-> verified through the call graph. `uses IO` remains as a backwards-compatible
-> blanket alias for the entire IO family. Every operation is still checked,
-> every effect is statically tracked, no null, no undefined behaviour, and
-> use-after-move is a compile error (Stage 8-alpha).
+> auditability, performance via AOT compilation**. Version v0.7.0-alpha
+> introduces the **Stage 10-alpha taint tracking** model on top of the
+> Stage 9 fine-grained effects & capabilities system: a new built-in
+> generic type `tainted[T]` lets the compiler statically reject passing
+> tainted values to sinks (print, file I/O, exit) — the user must
+> sanitise first via `std.sanitize`. Version v0.5.0-alpha introduced
+> the **fine-grained effects & capabilities** model: a single `IO`
+> effect split into five capabilities (`IO`, `Fs`, `Clock`, `Args`,
+> `Exit`) individually declared and statically verified through the
+> call graph. `uses IO` remains as a backwards-compatible blanket alias
+> for the entire IO family. Version v0.6.0-alpha added the explicit
+> `pure` keyword and the `--audit` flag (Stage 9-beta). Every operation
+> is still checked, every effect is statically tracked, no null, no
+> undefined behaviour, and use-after-move is a compile error (Stage
+> 8-alpha).
 
 - Source files: `*.hls`
 - Self-hosted compiler: `src/hlc.hls` (HLS → C → native)
@@ -59,10 +66,15 @@
 ### 2.4. Identifiers
 - `[A-Za-z_][A-Za-z0-9_]*`. Convention: functions/variables `snake_case`,
   structs `PascalCase`.
-- Cannot clash with keywords. Keywords (19): `fn let mut return if else while
-  for in break continue struct impl import uses true false enum match`.
+- Cannot clash with keywords. Keywords (21): `fn let mut return if else while
+  for in break continue struct impl import uses true false enum match pure`.
+  (`pure` was added in Stage 9-beta / v0.6.0-alpha.)
 
-### 2.5. Reserved keywords (unused, error if encountered): `secure`, `trait`
+### 2.5. Reserved keywords (unused, error if encountered): `secure`, `trait`,
+`tainted` (NOTE: `tainted` is not a keyword — it is a built-in generic type
+name recognised by the parser, like `list` and `map`. You can still use
+`tainted` as an identifier for variables/functions; only in type position
+does it denote the taint wrapper.)
 
 ### 2.6. Numbers
 - Integer: `[0-9][0-9_]*` (underscores for readability: `1_000_000`). Type
@@ -80,11 +92,12 @@
 
 ### 2.8. Operators & symbols
 ```
-->  ==  !=  <=  >=  <  >  =  +  -  *  /  %  !  &&  ||  ?
+->  ==  !=  <=  >=  <  >  =  +  -  *  /  %  !  &&  ||  ?  =>
 (  )  {  }  [  ]  ,  :  . 
 ```
-Lone `&` and `|` are lexical errors. No bitwise operators in v0.3 (each
-bitwise operator will be added with its own checked semantics — later stage).
+`=>` is the match-arm operator (see §5 grammar). Lone `&` and `|` are
+lexical errors. No bitwise operators in v0.3 (each bitwise operator
+will be added with its own checked semantics — later stage).
 The `?` postfix operator is the error-propagation operator (section 12).
 
 ---
@@ -868,15 +881,141 @@ not declared (declared: Fs; missing: IO)
 - Existing v0.3/v0.4 code with `uses IO` continues to compile unchanged
   (the parse-time expansion to the IO family is transparent).
 
-### 17.7. Limitations in v0.5.0-alpha (Stage 9-beta targets)
+### 17.7. Limitations after Stage 9-beta (v0.6.0-alpha)
 
-| Limitation | Stage 9-beta target |
-|------------|---------------------|
-| `Net`, `Rand`, `Proc` reserved but no builtins yet | add network/random/process builtins + their effect mappings |
-| Capability tokens are not first-class values (can't be passed as args, stored in structs) | first-class capability type, e.g. `cap[Net]` |
-| No `hlc --audit` flag to print the full capability tree | add an audit subcommand that prints per-function declared/computed effects |
-| No pure-function annotation (purity is implicit via no `uses`) | explicit `pure` keyword for documentation / linting |
-| Per-builtin effect taxonomy is fixed (no user-defined effects) | user-defined effects via a registration mechanism (later stage) |
+| Limitation | When lifted |
+|------------|--------------|
+| `Net`, `Rand`, `Proc` reserved but no builtins yet | future Stage 9 release |
+| Capability tokens are not first-class values (can't be passed as args, stored in structs) | future Stage 9 release (first-class capability type) |
+| Per-builtin effect taxonomy is fixed (no user-defined effects) | future Stage 9 release (user-defined effects via a registration mechanism) |
 
-These limitations are deliberate and documented. They will be lifted in
-subsequent alpha/beta releases as the Stage 9 work proceeds.
+The two original Stage 9-beta targets — `hlc --audit` flag and the
+explicit `pure` keyword — **shipped in v0.6.0-alpha**. See §18 below.
+
+---
+
+## 18. Explicit purity (`pure` keyword) & audit mode (Stage 9-beta — v0.6.0-alpha)
+
+Stage 9-beta shipped two features on top of the Stage 9-alpha effects
+system:
+
+### 18.1. The `pure` keyword
+
+A function declared `fn f(...) pure` is **explicitly pure**:
+- It MUST have no `uses` clause. `pure` and `uses` are mutually
+  exclusive at parse time (the parser rejects `fn f(...) pure uses IO`
+  with a clear error).
+- The checker verifies that its computed effect set is empty. If any
+  transitive callee is effectful, the checker reports the violating
+  edge with a witness, e.g.:
+  ```
+  function 'helper' is declared 'pure' but transitively uses effects
+  IO (declared pure but callee chain is not pure)
+  ```
+
+Purity was previously implicit (a function with no `uses` is pure);
+`pure` makes it explicit and self-documenting. The `is_pure` field is
+stored on `FnInfo` in `hlc.hls` (renamed from `pure` because `pure` is
+now a keyword and cannot be a struct literal field name).
+
+### 18.2. The `--audit` flag
+
+`hlc --audit <file.hls>` and `boot.py --audit <file.hls>` print the
+full capability / effect tree of every function in the program:
+
+- Declared effects (or `pure`) per function.
+- Computed effects (the fixpoint result) per function.
+- An OK/VIOLATION status per function.
+- A summary count (how many functions declared pure / with effects).
+- The active vs reserved effects table.
+- The `uses IO` blanket-alias expansion reminder.
+
+Useful for security review and supply-chain audits.
+
+### 18.3. Reserved-effect reporting
+
+`--audit` also surfaces the reserved-effect table (`Net`, `Rand`,
+`Proc`): they are recognized by the parser but error if used in a
+`uses` clause. They will be enabled in a later stage, but until then
+the compiler rejects any program that tries to use them.
+
+---
+
+## 19. Taint tracking (Stage 10-alpha — v0.7.0-alpha)
+
+Stage 10-alpha ships a **static taint tracking** system that prevents
+input-driven vulnerabilities (injection, XSS, path traversal) at the
+type level.
+
+### 19.1. The `tainted[T]` type
+
+`tainted[T]` is a new built-in generic type (alongside `list[T]`,
+`map[str, T]`). At runtime, `tainted[T]` is represented the same as
+`T` — the taint is a **compile-time property only**; runtime
+distinction (e.g. a taint flag carried at runtime) is deferred to
+Stage 10-beta.
+
+The checker rejects passing a `tainted[T]` value to any of these sinks:
+`print`, `println`, `read_file`, `write_file` (both the path argument
+and the content argument), `file_exists`, `exit`.
+
+### 19.2. Taint builtins
+
+Three new builtins (all pure except `tainted_args`):
+
+| Builtin | Effect | Type |
+|---------|--------|------|
+| `tainted_args()` | `Args` | `list[tainted[str]]` |
+| `taint_mark(x)` | (none) | `T -> tainted[T]` |
+| `taint_unwrap(x)` | (none) | `tainted[T] -> T` |
+
+`tainted_args()` is the **taint source** for command-line inputs —
+every program's argv is tainted by default. `taint_unwrap` is the
+explicit "I accept the risk" escape hatch; the user should normally
+use a sanitizer instead.
+
+### 19.3. Sanitisers (`std.sanitize`)
+
+The standard library provides six sanitizers in `std/sanitize.hls`.
+Each takes a `tainted[str]` and returns a clean `str`:
+
+| Sanitizer | Behaviour |
+|-----------|-----------|
+| `sanitize_html(t)` | escapes `< > & " ' /` for safe HTML body rendering |
+| `sanitize_html_attr(t)` | escapes for an HTML attribute value |
+| `sanitize_path(t)` | rejects empty / NUL / absolute / `..` segments |
+| `sanitize_sql_identifier(t)` | only `[A-Za-z_][A-Za-z0-9_]*`; panic otherwise |
+| `sanitize_sql_string(t)` | doubles `'` and `\` for SQL string literals |
+| `sanitize_command(t)` | rejects 26 shell metacharacters |
+| `sanitize_filename(t)` | only `[A-Za-z0-9._-]+`, no leading dot |
+
+### 19.4. Pure queries on tainted values (`std.taint`)
+
+`std/taint.hls` provides pure-query helpers on `tainted[str]` that do
+NOT untaint — useful for routing on argv without exposing the inner
+string to a sink:
+
+- `taint_check_len(t) -> int`
+- `taint_check_is_empty(t) -> bool`
+- `taint_check_starts_with(t, prefix) -> bool`
+- `taint_check_ends_with(t, suffix) -> bool`
+- `taint_check_equals(t, literal) -> bool`
+- `taint_check_contains(t, sub) -> bool`
+- `taint_slice(t, start, end) -> tainted[str]` — the slice result
+  REMAINS tainted (a slice of attacker-controlled bytes is still
+  attacker-controlled).
+
+### 19.5. What Stage 10-alpha does NOT yet do
+
+- Sandboxed compile mode (a program only running inside a granted
+  directory / socket set) — Stage 10-beta.
+- Taint analysis report from `hlc --audit` (the current `--audit`
+  flag reports the effects tree; taint-flow reporting is deferred).
+- First-class taint labels (e.g. `tainted[str, Html]` vs
+  `tainted[str, Sql]` so HTML-tainted values cannot be used in SQL
+  even after `sanitize_html`) — future Stage 10 work.
+- Runtime taint flag (defence-in-depth) — future Stage 10 work.
+- Taint sources beyond argv (e.g. `read_file`, `read_line` if added,
+  HTTP request body if added) — currently only argv is a taint
+  source.
+

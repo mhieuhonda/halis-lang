@@ -24,7 +24,7 @@ remains green.
 | 7 | Advanced type system: enum, Option/Result, generics | ✅ | (done) |
 | 8 | Ownership & borrow checking (end of arena) | 🔄 | 10–14 weeks |
 | 9 | Fine-grained effects & capabilities | 🔄 | 6–8 weeks |
-| 10 | Taint tracking & sandbox | ⬜ | 8–10 weeks |
+| 10 | Taint tracking & sandbox | 🔄 | 8–10 weeks |
 | 11 | SSA IR + optimisation | ⬜ | 10–14 weeks |
 | 12 | Native LLVM backend | ⬜ | 10–14 weeks |
 | 13 | Package manager `hls-pkg` | ⬜ | 6–8 weeks |
@@ -359,22 +359,77 @@ even through 5 function layers — the compile error points to the exact call
 chain. (The v0.5.0-alpha release already enforces this for the five active
 effects; `Net` is reserved pending future builtins.)
 
-## STAGE 10 — Taint tracking & sandbox ⬜
+## STAGE 10 — Taint tracking & sandbox 🔄 (alpha shipped v0.7.0-alpha)
 
 **Goal:** stop input-driven vulnerabilities (injection, XSS, path traversal)
 at the type level.
 
-**Work:**
-- `tainted[T]` type: data from inputs is automatically `tainted`; only usable
-  after `sanitize`.
-- Standard normalising filters for SQL/HTML/paths/commands; matches the
-  standard sentinel library.
-- Sandboxed compile mode: a program only runs inside a granted directory /
-  socket set.
-- Taint analysis report from the compiler (`hlc --audit`).
+**Status (v0.7.0-alpha):** the **alpha subset of Stage 10** has shipped.
+The compiler now performs **static taint tracking** via a new built-in
+generic type `tainted[T]` and three new builtins. Sinks (print, println,
+read_file, write_file, file_exists, exit) statically reject tainted
+arguments; the user must sanitise via `std.sanitize` or explicitly
+untaint via `taint_unwrap()`. The checker enforces this in both Stage-0
+and the self-hosted `hlc.hls`. **135/135 tests PASS.**
 
-**Acceptance:** deliberately using user input in an SQL statement without
-sanitising → compile error showing the taint propagation path.
+**Shipped in v0.7.0-alpha (Stage 10-alpha):**
+
+- New built-in generic type `tainted[T]` — a compile-time wrapper
+  around any value. At runtime, `tainted[T]` is represented the same as
+  `T` (the taint is a compile-time property only; runtime distinction
+  is deferred to Stage 10-beta).
+- Three new builtins:
+  - `tainted_args() -> list[tainted[str]]` — every program's argv is
+    tainted by default.
+  - `taint_mark(x: T) -> tainted[T]` — wrap any value as tainted.
+  - `taint_unwrap(x: tainted[T]) -> T` — the explicit "I accept the
+    risk" escape hatch.
+- Static sink enforcement in the checker: `print`, `println`,
+  `read_file`, `write_file` (both path and content), `file_exists`,
+  `exit` reject `tainted[T]` arguments with a clear error message
+  naming the sink, the argument index, the tainted type, and the
+  available sanitizers.
+- New stdlib modules:
+  - `std/taint.hls` — pure-query helpers on `tainted[str]` that don't
+    untaint (`taint_check_len`, `taint_check_is_empty`,
+    `taint_check_starts_with`, `taint_check_ends_with`,
+    `taint_check_equals`, `taint_check_contains`, `taint_slice` —
+    the slice result REMAINS tainted).
+  - `std/sanitize.hls` — six sanitizers returning a clean `str`:
+    `sanitize_html`, `sanitize_html_attr`, `sanitize_path`,
+    `sanitize_sql_identifier`, `sanitize_sql_string`,
+    `sanitize_command`, `sanitize_filename`.
+- New example `examples/taint_demo.hls` exercising the full flow.
+- 7 new tests: 1 ok (`feat_taint`, differential Stage-0 + native) +
+  6 fail (`fail_taint_print`, `fail_taint_write_file_path`,
+  `fail_taint_write_file_content`, `fail_taint_read_file`,
+  `fail_taint_file_exists`, `fail_taint_exit`).
+- The self-hosted `hlc.hls` recognises `tainted[T]` as a built-in
+  generic type (alongside `list[T]`, `map[str, T]`), implements the
+  three taint builtins in the checker, and emits the same C code as
+  Stage-0. Bootstrap is still **deterministic**.
+
+**Remaining work for Stage 10 (beta and beyond):**
+
+- Sandboxed compile mode: a program only runs inside a granted
+  directory / socket set.
+- Taint analysis report from the compiler (`hlc --audit` extended
+  with a taint-flow section).
+- Runtime taint flag (so a tainted value carries a tag at runtime,
+  enabling defence-in-depth and runtime sink checks).
+- Taint sources beyond argv: `read_file`, `read_line` (when added),
+  HTTP request body (when added), etc. — currently only argv is a
+  taint source.
+- First-class taint labels (e.g. `tainted[str, Html]` vs
+  `tainted[str, Sql]`) so the checker can enforce "HTML-tainted
+  values cannot be used in SQL even after sanitize_html".
+
+**Acceptance:** a program that doesn't declare `uses Net` CANNOT call a socket
+even through 5 function layers — the compile error points to the exact call
+chain. (The v0.5.0-alpha release already enforces this for the five active
+effects; `Net` is reserved pending future builtins.) For Stage 10, the
+acceptance criterion is: a program that uses an unsanitised argv value in
+an SQL statement → compile error showing the taint propagation path.
 
 ## STAGE 11 — SSA IR + optimisation ⬜
 

@@ -13,10 +13,10 @@ PREFIX  ?= /usr/local
 # Main goal: use the full bootstrap chain to build the native compiler
 all: bootstrap
 
-# Run Stage-0 directly (interpret HLS)
+# Run Stage-0 directly (interpret an HLS program via the bootstrap seed)
 stage0:
-	@$(PYTHON) boot/boot.py --help 2>/dev/null || true
-	@echo "Example: $(PYTHON) boot/boot.py examples/hello.hls"
+	@test "x$(F)" != "x" || (echo "Usage: make stage0 F=examples/hello.hls" && false)
+	@$(PYTHON) boot/boot.py $(F)
 
 # FULL BOOTSTRAP:
 #   1. Stage-0 runs hlc.hls to compile itself -> hlc.c
@@ -38,7 +38,8 @@ bootstrap:
 # Compile and run an HLS program: make run F=examples/hello.hls
 run:
 	@test -x $(BIN)/hlc || $(MAKE) bootstrap
-	@$(BIN)/hlc $(F) /tmp/hls_out.c && $(CC) $(CFLAGS) -o /tmp/hls_out /tmp/hls_out.c -lm && /tmp/hls_out
+	@mkdir -p $(BIN)
+	@$(BIN)/hlc $(F) $(BIN)/hls_out.c && $(CC) $(CFLAGS) -o $(BIN)/hls_out $(BIN)/hls_out.c -lm && $(BIN)/hls_out
 
 # Only check types + effects (no execution)
 check:
@@ -59,16 +60,19 @@ audit:
 # Run the example programs to verify they still work after a change
 examples:
 	@for f in examples/hello.hls examples/fibonacci.hls examples/primes.hls \
-	          examples/enum_demo.hls examples/option_demo.hls examples/result_demo.hls \
-	          examples/base64_demo.hls examples/csv_demo.hls examples/crypto_demo.hls \
-	          examples/hex_demo.hls examples/list_demo.hls examples/time_demo.hls \
-	          examples/uuid_demo.hls examples/web_demo.hls \
-	          examples/ownership_demo.hls examples/effects_demo.hls; do \
+	          examples/secure_demo.hls examples/enum_demo.hls examples/option_demo.hls \
+	          examples/result_demo.hls examples/ownership_demo.hls examples/effects_demo.hls \
+	          examples/hex_demo.hls examples/base64_demo.hls examples/crypto_demo.hls \
+	          examples/csv_demo.hls examples/list_demo.hls examples/time_demo.hls \
+	          examples/uuid_demo.hls examples/web_demo.hls examples/stdlib_demo.hls \
+	          examples/taint_demo.hls; do \
 	        echo "--- $$f"; $(PYTHON) boot/boot.py $$f; \
 	done
+	@# wordcount needs a data-file argument
+	@echo "--- examples/wordcount.hls"; $(PYTHON) boot/boot.py examples/wordcount.hls examples/data.txt
 
 clean:
-	rm -rf $(BIN) /tmp/hls_out /tmp/hls_out.c
+	rm -rf $(BIN) bin/hls_out bin/hls_out.c
 
 # Install the native compiler and stdlib to PREFIX (default /usr/local)
 install: bootstrap

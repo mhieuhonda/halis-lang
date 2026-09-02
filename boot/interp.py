@@ -500,6 +500,31 @@ class Interp:
         # take(x): returns x's value (binding is marked moved at compile time).
         if name == "take":
             return args[0]
+        # ----- Stage 10-alpha: taint tracking -----
+        # tainted_args() — like args() but each element is wrapped in the
+        # `tainted[str]` runtime representation: a dict {"tainted": True,
+        # "value": <bytes>}. The wrapper is created here; the std.taint /
+        # std.sanitize helpers consume it. See std/taint.hls.
+        if name == "tainted_args":
+            return [{"tainted": True, "value": a} for a in self.argv]
+        # taint_mark(x) — wrap any value as tainted. The wrapper is a dict
+        # so it's distinguishable from raw values (especially strings,
+        # which are bytes).
+        if name == "taint_mark":
+            return {"tainted": True, "value": args[0]}
+        # taint_unwrap(x) — extract the inner value, dropping taint.
+        # The checker rejects taint_unwrap on non-tainted values, so by
+        # the time we get here, args[0] is guaranteed to be a tainted
+        # wrapper dict.
+        if name == "taint_unwrap":
+            v = args[0]
+            if isinstance(v, dict) and "tainted" in v:
+                return v["value"]
+            # Defensive: if a user constructs the wrapper manually and
+            # forgets the flag, unwrap anyway.
+            if isinstance(v, dict):
+                return v.get("value", v)
+            return v
         raise HLPanic("unknown builtin function: %s" % name, line)
 
     def deep_clone(self, v):

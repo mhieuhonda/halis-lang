@@ -7,7 +7,15 @@ This is the SEED used to bootstrap the self-hosting cycle of Hieu Louis:
   3. From there on, the native compilation cycle is self-sustaining.
 
 Usage:
-  python3 boot/boot.py [--check] <file.hls> [program args...]
+  python3 boot/boot.py [--check | --audit] <file.hls> [program args...]
+
+Flags:
+  --check    type-check + effects-check only, no execution.
+  --audit    print the capability / effect tree of every function
+             (declared vs computed, with a clear OK/VIOLATION status).
+
+  --check and --audit are mutually exclusive. If neither flag is given,
+  the program is type-checked, effects-checked, and executed.
 
 Imports (Stage 6):
   `import "path/to/file.hls"` — relative to the importing file's directory.
@@ -222,6 +230,33 @@ def print_audit(program, checker):
     print("  Active effects:    IO, Fs, Clock, Args, Exit")
     print("  Reserved effects:  Net, Rand, Proc  (error if used)")
     print("  `uses IO` expands to: {IO, Fs, Clock, Args, Exit}")
+    # Stage 10-alpha: taint sources / sinks / unwraps summary.
+    # Sources: builtins that introduce tainted values.
+    # Sinks: builtins that reject tainted values at the checker.
+    # Unwraps: builtins / functions that explicitly untaint.
+    print("")
+    print("  Taint sources (builtins):  tainted_args")
+    print("  Taint sinks (builtins):    print, println, read_file,")
+    print("                            write_file, file_exists, exit")
+    print("  Explicit untaint:         taint_unwrap, std.sanitize.*")
+    # Scan the call graph for actual taint-source / taint-unwrap usage.
+    src_users = []
+    unwrap_users = []
+    sanitize_users = []
+    for key, fn in fns.items():
+        callees = checker.edges.get(key, set())
+        if "b:tainted_args" in callees:
+            src_users.append(key)
+        # taint_unwrap is a pure builtin, no edge recorded by default.
+        # We look at the body via a textual scan of the AST — but that's
+        # expensive. For the audit summary, simply note the available
+        # surface; deeper taint-flow reporting is deferred to Stage 10-beta.
+    if src_users:
+        print("  Functions calling tainted_args():")
+        for k in src_users:
+            print("    - " + k)
+    else:
+        print("  No function calls tainted_args() (no taint sources in this program).")
 
 
 def main():
