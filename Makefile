@@ -71,7 +71,7 @@ examples:
 	        echo "--- $$f"; $(PYTHON) boot/boot.py $$f; \
 	done
 	@echo "--- examples/secure_demo.hls (deliberately panics on overflow)"
-	@$(PYTHON) boot/boot.py examples/secure_demo.hls; rc=$$?; \
+	@rc=0; $(PYTHON) boot/boot.py examples/secure_demo.hls || rc=$$?; \
 	if [ "$$rc" != "0" ] && [ "$$rc" != "101" ]; then \
 	    echo "secure_demo.hls failed with unexpected exit code $$rc"; exit 1; \
 	fi
