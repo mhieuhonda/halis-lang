@@ -29,7 +29,7 @@ remains green.
 | 12 | Native LLVM backend | 🔄 | 10–14 weeks |
 | 13 | Package manager `hls-pkg` | 🔄 | 6–8 weeks |
 | 14 | Tooling: LSP, formatter, linter | 🔄 | 6–8 weeks |
-| 15 | Safe C FFI | ⬜ | 4–6 weeks |
+| 15 | Safe C FFI | 🔄 | 4–6 weeks |
 | 16 | Concurrency & async (data-race freedom) | ⬜ | 12–16 weeks |
 | 17 | Formal verification & contracts | ⬜ | 10–14 weeks |
 | 18 | Testing ecosystem & fuzzing | ⬜ | 4–6 weeks |
@@ -718,22 +718,66 @@ Stage 14 release target. **145/145 tests PASS.**
 = running once). (The v0.12.0-alpha release ships all three tools with
 idempotent formatting; the editor plugins are the Stage 14 release target.)
 
-## STAGE 15 — Safe C FFI ⬜
+## STAGE 15 — Safe C FFI 🔄 (alpha v0.13.0-alpha)
 
 **Goal:** reuse the C ecosystem without breaking the safety enclave.
 
-**Work:**
-- `extern "C"` with explicit type table; compiler emits an ABI-compatibility
-  checking header.
-- Ownership rules across the boundary: data passed into FFI is frozen or
-  copied; results must pass through a null/bounds-check layer.
-- `bindgen`: emit HLS declarations from C headers with manual effect
-  annotations.
-- Fence: every FFI call automatically carries the `IO` effect (safe by
-  default).
+**Status (v0.13.0-alpha):** the **alpha subset of Stage 15** has shipped.
+A new `extern "C" { ... }` block declares external C functions. The
+checker enforces that every extern fn declares `uses IO` (or `pure`)
+— the safe default for FFI is to assume side effects. The interpreter
+calls the C function via ctypes. **145/145 tests PASS.**
+
+**Shipped in v0.13.0-alpha (Stage 15-alpha):**
+
+- New `extern` keyword in the lexer (was unused; safe to add as a
+  keyword after a repo-wide grep showed zero occurrences).
+- New parser support for `extern "C" { ... }` blocks:
+  - Each block declares one or more C function signatures (no body).
+  - The `uses IO` clause (or `pure`) is REQUIRED — FFI is unsafe by
+    default.
+  - The ABI string is checked: only `"C"` is supported today.
+- Checker updates:
+  - Extern fns are registered in the function table with an `extern: True` flag.
+  - The "must return on all paths" check is skipped for extern fns
+    (they have no body).
+- Interpreter updates:
+  - `call_fn` detects `extern: True` and dispatches to `call_extern`.
+  - `call_extern` loads libc via `ctypes.CDLL(None)` and looks up the
+    function by name.
+  - Argument types: `int -> c_int64`, `float -> c_double`,
+    `bool -> c_bool`, `str -> c_char_p` (null-terminated C string;
+    HLS bytes passed as-is), other types -> opaque `c_void_p`.
+  - Return types: same mapping. `void` returns `None`.
+- New `tools/hlbindgen.py` — C header → HLS extern block generator:
+  - Parses simple C function declarations (`int foo(char* s, long n);`).
+  - Maps C types to HLS types (int, long, char -> int; char* -> str;
+    void -> void; double/float -> float).
+  - Every generated function is marked `uses IO` (safe default); the
+    user edits to mark as `pure` if appropriate.
+- New example: `examples/ffi_demo.hls` calls `abs`, `strlen`,
+  `toupper` via the FFI.
+
+**Remaining work for Stage 15 (release and beyond):**
+
+- Add `extern` keyword support to `src/hlc.hls` (the self-hosted
+  compiler) — today only boot/ supports it; native hlc would fail
+  to compile a program with `extern`.
+- C codegen for extern fns: emit forward declarations instead of
+  definitions.
+- Ownership rules across the boundary: data passed into FFI is frozen
+  or copied; results must pass through a null/bounds-check layer.
+- `bindgen` improvements: struct/enum generation, macro expansion,
+  `#include` resolution, `const`/`volatile` qualifiers.
+- ABI-compatibility checking header: emit a C header that gcc can
+  compile to verify the HLS extern signature matches the real C
+  declaration.
+- Re-implement `hlbindgen` in HLS itself.
 
 **Acceptance:** call `libcurl` from HLS via the bindgen layer; ASan detects
-no errors in the glue code.
+no errors in the glue code. (The v0.13.0-alpha release ships the syntax
++ interpreter dispatch + simple bindgen; the libcurl demo and the
+self-hosted compiler support are the Stage 15 release target.)
 
 ## STAGE 16 — Concurrency & async (data-race freedom) ⬜
 

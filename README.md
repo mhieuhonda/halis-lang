@@ -151,6 +151,10 @@ python3 tools/hlfmt.py -c examples/hello.hls          # check formatting
 python3 tools/hllint.py examples/hello.hls            # lint
 python3 tools/hllint.py --list                        # list rules
 python3 tools/hls-lsp.py --check examples/hello.hls   # one-shot diagnostics
+
+# 13. Stage 15-alpha: Safe C FFI (v0.13.0-alpha)
+python3 boot/boot.py examples/ffi_demo.hls           # call libc functions
+python3 tools/hlbindgen.py /usr/include/stdlib.h      # generate extern block from C header
 ```
 
 ## Language example

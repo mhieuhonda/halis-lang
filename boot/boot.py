@@ -113,7 +113,8 @@ def load_program(entry_path):
 
     # Merge all loaded programs into one. Earlier-loaded files (dependencies)
     # appear first; the entry file appears last.
-    merged = {"structs": {}, "enums": {}, "fns": {}, "imports": []}
+    merged = {"structs": {}, "enums": {}, "fns": {}, "imports": [],
+              "externs": []}
     for abs_path in load_order:
         prog = loaded[abs_path]
         for sname, sdef in prog["structs"].items():
@@ -130,6 +131,9 @@ def load_program(entry_path):
             if fname in merged["fns"]:
                 raise HLError("duplicate function across modules: %s" % fname, 0, 0)
             merged["fns"][fname] = fdef
+        # Stage 15: merge extern blocks.
+        for ext in prog.get("externs", []):
+            merged["externs"].append(ext)
     return merged
 
 

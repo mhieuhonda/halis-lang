@@ -83,6 +83,7 @@ class Parser:
         enums = {}      # name -> enum
         fns = {}       # key -> fn  (key = function name or "Struct.method")
         imports = []   # list of import paths
+        externs = []   # Stage 15 (v0.13.0-alpha): list of extern blocks
         while self.peek()["k"] != "eof":
             if self.at_kw("struct"):
                 st = self.parse_struct()
@@ -104,9 +105,55 @@ class Parser:
             elif self.at_kw("import"):
                 imp = self.parse_import()
                 imports.append(imp)
+            elif self.at_kw("extern"):
+                # Stage 15 (v0.13.0-alpha): extern "C" { ... } block.
+                ext = self.parse_extern_block()
+                for fn_decl in ext["decls"]:
+                    if fn_decl["name"] in fns:
+                        self.err("duplicate function name: %s" % fn_decl["name"])
+                    fns[fn_decl["name"]] = fn_decl
+                externs.append(ext)
             else:
-                self.err("only struct/enum/impl/fn/import declarations allowed at top level")
-        return {"structs": structs, "enums": enums, "fns": fns, "imports": imports}
+                self.err("only struct/enum/impl/fn/import/extern declarations allowed at top level")
+        return {"structs": structs, "enums": enums, "fns": fns,
+                "imports": imports, "externs": externs}
+
+    def parse_extern_block(self):
+        """Stage 15 (v0.13.0-alpha): parse `extern "C" { fn decls }` block.
+
+        Syntax:
+            extern "C" {
+                fn puts(s: str) -> int uses IO
+                fn malloc(size: int) -> ptr uses IO
+                ...
+            }
+
+        Each `fn` declaration has NO body (just a signature). The
+        `uses IO` clause is REQUIRED unless `pure` is declared — the
+        safe default for FFI is to assume side effects.
+        """
+        t0 = self.eat_kw("extern")
+        abi_tok = self.peek()
+        if abi_tok["k"] != "str":
+            self.err("expected ABI string (e.g. \"C\") after 'extern'", abi_tok)
+        self.next()
+        abi = abi_tok["v"]
+        if isinstance(abi, bytes):
+            abi = abi.decode("latin-1")
+        if abi != "C":
+            self.err("unsupported ABI '%s'; only \"C\" is supported today" % abi, abi_tok)
+        self.eat_sym("{")
+        decls = []
+        while not self.at_sym("}"):
+            if not self.at_kw("fn"):
+                self.err("extern block can only contain fn declarations")
+            fn_decl = self.parse_fn(None, extern=True)
+            if not fn_decl["effects"] and not fn_decl["pure"]:
+                self.err("extern fn '%s' must declare `uses IO` (or `pure`) "
+                         "— FFI is unsafe by default" % fn_decl["name"], t0)
+            decls.append(fn_decl)
+        self.eat_sym("}")
+        return {"abi": abi, "decls": decls, "line": t0["line"]}
 
     def parse_import(self):
         t0 = self.eat_kw("import")
@@ -214,7 +261,7 @@ class Parser:
                 self.err("only fn definitions allowed inside impl")
         self.eat_sym("}")
 
-    def parse_fn(self, impl_struct):
+    def parse_fn(self, impl_struct, extern=False):
         t0 = self.eat_kw("fn")
         name = self.eat_ident()["v"]
         typeparams = self.parse_typeparams()
@@ -274,11 +321,20 @@ class Parser:
                     self.next()
                     continue
                 break
+        if extern:
+            # Stage 15 (v0.13.0-alpha): extern fn declarations have NO
+            # body. They are forward declarations for C functions.
+            return {
+                "name": name, "typeparams": typeparams, "params": params,
+                "ret": ret, "effects": effects, "pure": is_pure,
+                "body": [], "line": t0["line"], "struct": impl_struct,
+                "extern": True,
+            }
         body = self.parse_block()
         return {
             "name": name, "typeparams": typeparams, "params": params, "ret": ret,
             "effects": effects, "pure": is_pure, "body": body, "line": t0["line"],
-            "struct": impl_struct,
+            "struct": impl_struct, "extern": False,
         }
 
     # ---------- types ----------

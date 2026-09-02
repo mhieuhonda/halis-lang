@@ -7,6 +7,7 @@ Runtime values:
   map[str,T]   -> dict (insertion-ordered), struct -> dict {field: value}
   enum         -> dict {"enum": <name>, "var": <variant>, "data": [payloads]}
 """
+import ctypes
 import math
 import sys
 import time
@@ -159,6 +160,9 @@ class Interp:
 
     def call_fn(self, key, args):
         fn = self.fns[key]
+        # Stage 15 (v0.13.0-alpha): extern fn — call via ctypes.
+        if fn.get("extern", False):
+            return self.call_extern(fn, args)
         env = [{}]
         if fn["struct"] is not None:
             sn, _, sm = fn["params"][0]
@@ -174,6 +178,118 @@ class Interp:
         except ReturnSig as r:
             return r.value
         return None
+
+    # ---------- extern (Stage 15) ----------
+    _libc = None
+
+    def _get_libc(self):
+        """Lazily load libc for extern calls."""
+        if self._libc is None:
+            try:
+                # `None` loads the default C library (libc on Linux,
+                # msvcrt on Windows, libSystem on macOS).
+                Interp._libc = ctypes.CDLL(None)
+            except OSError as ex:
+                raise HLPanic("cannot load libc for extern call: %s" % ex,
+                              getattr(self, "line", 0))
+        return self._libc
+
+    def call_extern(self, fn, args):
+        """Call a C function via ctypes (Stage 15-alpha).
+
+        The function signature is taken from the HLS declaration:
+          - int -> c_int64
+          - float -> c_double
+          - bool -> c_bool
+          - str -> c_char_p (passed as a null-terminated C string;
+            HLS bytes are passed as-is; the caller is responsible for
+            ensuring no embedded NUL bytes)
+          - void -> no return
+          - any other type (list/map/struct/enum/tainted/ptr) -> ptr
+            (treated as an opaque pointer; the caller must ensure
+            ABI compatibility)
+
+        For the alpha, only int/str args are fully supported. Float
+        and bool work via automatic ctypes conversion. Opaque pointers
+        are NOT derefenced by the interpreter — they're passed as
+        raw addresses.
+        """
+        libc = self._get_libc()
+        name = fn["name"]
+        try:
+            c_fn = getattr(libc, name)
+        except AttributeError:
+            raise HLPanic("extern function not found in libc: %s" % name,
+                          getattr(self, "line", 0))
+        # Set up the argument types.
+        c_argtypes = []
+        c_args = []
+        for (pn, pt, _), v in zip(fn["params"], args):
+            if pt == "int":
+                c_argtypes.append(ctypes.c_int64)
+                c_args.append(int(v))
+            elif pt == "float":
+                c_argtypes.append(ctypes.c_double)
+                c_args.append(float(v))
+            elif pt == "bool":
+                c_argtypes.append(ctypes.c_bool)
+                c_args.append(bool(v))
+            elif pt == "str":
+                # HLS str is bytes. Pass as a null-terminated C string.
+                c_argtypes.append(ctypes.c_char_p)
+                if isinstance(v, bytes):
+                    c_args.append(v)
+                else:
+                    c_args.append(str(v).encode("utf-8"))
+            else:
+                # Opaque pointer. The caller is responsible for ABI
+                # compatibility; we treat the value as a raw address.
+                c_argtypes.append(ctypes.c_void_p)
+                if isinstance(v, int):
+                    c_args.append(v)
+                elif isinstance(v, bytes):
+                    c_args.append(ctypes.cast(v, ctypes.c_void_p).value)
+                else:
+                    c_args.append(id(v))
+        c_fn.argtypes = c_argtypes
+        # Set up the return type.
+        ret = fn["ret"]
+        if ret == "int":
+            c_fn.restype = ctypes.c_int64
+        elif ret == "float":
+            c_fn.restype = ctypes.c_double
+        elif ret == "bool":
+            c_fn.restype = ctypes.c_bool
+        elif ret == "str":
+            c_fn.restype = ctypes.c_char_p
+        elif ret == "void":
+            c_fn.restype = None
+        else:
+            c_fn.restype = ctypes.c_void_p
+        # Call.
+        try:
+            result = c_fn(*c_args)
+        except Exception as ex:
+            raise HLPanic("extern call to '%s' failed: %s" % (name, ex),
+                          getattr(self, "line", 0))
+        # Convert the return value back to HLS runtime values.
+        if ret == "int":
+            return int(result) if result is not None else 0
+        if ret == "float":
+            return float(result) if result is not None else 0.0
+        if ret == "bool":
+            return bool(result) if result is not None else False
+        if ret == "str":
+            # c_char_p returns bytes (null-terminated).
+            if result is None:
+                return b""
+            if isinstance(result, bytes):
+                return result
+            return bytes(result)
+        if ret == "void":
+            return None
+        # Opaque pointer -> int (the raw address).
+        return int(result) if result is not None else 0
 
     # ---------- statements ----------
     def exec_stmts(self, stmts, env):

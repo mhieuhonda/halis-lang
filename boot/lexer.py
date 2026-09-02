@@ -4,6 +4,12 @@ KEYWORDS = {
     "fn", "let", "mut", "return", "if", "else", "while", "for", "in",
     "break", "continue", "struct", "impl", "import", "uses", "true", "false",
     "enum", "match", "pure",
+    # Stage 15 (v0.13.0-alpha): extern "C" — for declaring external C
+    # functions. Adding `extern` as a keyword reserves the name; existing
+    # programs that used `extern` as an identifier would break, but a
+    # grep over the entire repo (src/, std/, examples/, tests/) shows
+    # zero occurrences, so this is safe.
+    "extern",
 }
 
 # BUG-29 fix: reserved identifiers (per SPEC.md section 2.5). These are

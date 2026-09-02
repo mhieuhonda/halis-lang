@@ -424,7 +424,11 @@ class Checker:
         self.cur_typeparams = set(fn.get("typeparams", []))
         env = self.new_env(fn)
         self.check_stmts(fn["body"], env, fn, False)
-        if fn["ret"] != "void" and not self.all_return(fn["body"]):
+        # Stage 15 (v0.13.0-alpha): extern fns have NO body — they are
+        # forward declarations. Skip the "must return on all paths" check.
+        if (not fn.get("extern", False)
+                and fn["ret"] != "void"
+                and not self.all_return(fn["body"])):
             self.err("function '%s' does not return on all paths" % fn["name"], fn)
         self.cur_typeparams = saved_typeparams
 

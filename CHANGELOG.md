@@ -8,7 +8,35 @@ Releases on `main` follow the 20-stage roadmap (see [ROADMAP.md](ROADMAP.md)).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
-## [unreleased] — Stage 14-alpha (v0.12.0-alpha)
+## [unreleased] — Stage 15-alpha (v0.13.0-alpha)
+
+### Added
+- **Stage 15-alpha: Safe C FFI.** A new `extern "C" { ... }` block
+  declares external C functions. The checker enforces that every
+  extern fn declares `uses IO` (or `pure`) — the safe default for
+  FFI is to assume side effects. The interpreter calls the C
+  function via ctypes.
+  - New `extern` keyword in the lexer (was unused; safe to add as a
+    keyword after a repo-wide grep showed zero occurrences).
+  - Parser support for `extern "C" { ... }` blocks.
+  - Checker: extern fns are registered with an `extern: True` flag;
+    the "must return on all paths" check is skipped.
+  - Interpreter: `call_fn` dispatches to `call_extern` which loads
+    libc via `ctypes.CDLL(None)`. Argument types: int -> c_int64,
+    float -> c_double, bool -> c_bool, str -> c_char_p (HLS bytes
+    passed as null-terminated C string), other types -> opaque
+    c_void_p. Return types: same mapping; void returns None.
+- **New `tools/hlbindgen.py`** — C header → HLS extern block generator.
+  Parses simple C function declarations, maps C types to HLS types,
+  emits `extern "C" { ... }` block with `uses IO` on every function
+  (safe default).
+- **New example:** `examples/ffi_demo.hls` calls `abs`, `strlen`,
+  `toupper` via the FFI.
+- **145/145 tests PASS** (the FFI test is interpreter-only today;
+  the self-hosted `hlc.hls` doesn't yet recognise the `extern`
+  keyword — that's the Stage 15 release target).
+
+## [v0.12.0-alpha] — Stage 14-alpha (tooling)
 
 ### Added
 - **Stage 14-alpha: tooling — LSP, formatter, linter.** Three new tools
