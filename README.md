@@ -36,7 +36,7 @@ fn main() -> int uses IO {
 }
 ```
 
-Seven core guarantees of v0.8.0-alpha:
+Seven core guarantees of v0.13.0-alpha:
 
 1. **I/O is a declared effect.** Forget `uses IO` while printing to the
    screen? Compile error — even when the call is indirect through 5 function
@@ -245,9 +245,9 @@ hieu-louis-lang/
 ├── std/                 # Standard library (Stage 6 + Stage 10, in HLS)
 ├── examples/            # hello, fibonacci, primes, wordcount, secure_demo, ...
 ├── tests/
-│   ├── ok/              #   42 valid programs (incl. safe panics)
-│   ├── fail/            #   45 programs that MUST be rejected (types/effects/taint)
-│   └── run_tests.sh     #   143 tests: ok/fail/differential/bootstrap fixed-point
+│   ├── ok/              #   46 valid programs (incl. safe panics)
+│   ├── fail/            #   47 programs that MUST be rejected (types/effects/taint)
+│   └── run_tests.sh     #   145 tests: ok/fail/differential/bootstrap fixed-point
 ├── Makefile             # bootstrap · test · run · examples · audit · opt-stats · emit-ir · emit-llvm
 └── bin/                 # (generated) native hlc
 ```
@@ -328,7 +328,7 @@ Full details: [SPEC.md](SPEC.md) · Stage-by-stage roadmap:
   pairs; base64_decode validates padding placement; URL parser
   uses the FIRST `@` for userinfo split (defensive).
   The new `examples/taint_beta_demo.hls` exercises the flow.
-  **143/143 tests PASS**.
+  **145/145 tests PASS**.
 - ⬜ Stage 8-beta (full borrow checker, end-of-arena runtime),
   Stage 10-gamma (sandboxed compile mode, first-class taint labels,
   runtime taint flag in the native backend), SSA IR, LLVM,
@@ -337,7 +337,7 @@ Full details: [SPEC.md](SPEC.md) · Stage-by-stage roadmap:
 ## Contributing
 
 Every contribution must preserve the core guarantees and pass
-`make test` (143 tests, including differential testing of the two
+`make test` (145 tests, including differential testing of the two
 implementations). Every new feature must first be used inside `hlc` itself —
 the compiler is always the first customer of the language.
 

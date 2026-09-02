@@ -1,7 +1,7 @@
-"""LLVM IR emitter for Hieu Louis (Stage 12, v0.10.0-alpha).
+"""LLVM IR emitter for Hieu Louis (Stage 12).
 
-This module emits LLVM IR text (.ll) from a checked HLS program (post-type-
-check AST). The IR can be assembled by `llc` or `clang` into a native binary.
+Emits LLVM IR text (.ll) from a checked HLS program (post-type-check AST).
+The IR can be assembled by `llc` or `clang` into a native binary.
 
 Design:
   - The HLS C runtime (declared inline in `src/hlc.hls` codegen) is treated
@@ -16,8 +16,8 @@ Design:
       list[T] / map[str,T] / struct / enum / tainted[T] -> ptr (opaque)
   - Each HLS function becomes an LLVM `define` with the appropriate
     parameter types.
-  - Local variables become `alloca` + `load`/`store` (we do NOT use SSA
-    registers for locals; this would require phi-node construction).
+  - Local variables become `alloca` + `load`/`store` with TYPE TRACKING
+    (each slot's LLVM type is recorded so load/store use the right type).
   - Basic blocks are emitted for `if`/`while`/`for`/`match` control flow.
   - Integer arithmetic uses LLVM's `add`/`sub`/`mul`/`sdiv`/`srem` with
     explicit overflow checks via `llvm.sadd.with.overflow.i64` etc. The
@@ -26,13 +26,10 @@ Design:
 Multi-target support:
   - The default target is the host triple (queried from `llvm-config`).
   - `--target aarch64-linux` cross-compiles.
-  - Stack probes are emitted via `llvm.stackprobe` attribute on functions
-    with large stack frames (>4KB).
-  - PGO (profile-guided optimisation) is deferred to the Stage 12 release
-    target.
+  - PGO (profile-guided optimisation) is deferred to a later stage.
 
 The emitter is a *separate backend* from the C codegen. It is wired into
-`boot.py` via the new `--emit llvm` flag.
+`boot.py` via the `--emit llvm` flag.
 """
 from __future__ import annotations
 from typing import Any, Dict, List, Optional, Tuple
@@ -90,6 +87,7 @@ declare i64      @hl_chr(i64)
 declare i64      @hl_ord(ptr)
 """
 
+
 # HLS -> LLVM type mapping.
 def hls_type_to_llvm(t: str) -> str:
     if t == "int":
@@ -127,8 +125,12 @@ class LLVMEmitter:
         self._string_consts: List[Tuple[str, bytes, str]] = []
         # Stack of (continue_label, break_label) for loops.
         self._loop_stack: List[Tuple[str, str]] = []
-        # Per-function local variable map: name -> LLVM register.
-        self._locals: Dict[str, str] = {}
+        # Per-function local variable map: name -> (LLVM register, llvm_type).
+        self._locals: Dict[str, Tuple[str, str]] = {}
+        # The current function's return type (HLS type string).
+        self._current_ret_type_value: str = "void"
+        # Whether the current basic block has already been terminated.
+        self._block_terminated_flag: bool = False
 
     def _fresh(self, prefix="t"):
         self._tmp += 1
@@ -141,23 +143,87 @@ class LLVMEmitter:
     def _emit(self, line: str):
         self.lines.append(line)
 
+    def _mark_terminated(self):
+        self._block_terminated_flag = True
+
+    def _reset_terminated(self):
+        self._block_terminated_flag = False
+
+    def _to_i1(self, val_ty: str, val: str) -> str:
+        """Coerce a value to i1 for use as a branch condition."""
+        if val_ty == "i1":
+            return val
+        if val_ty == "i64":
+            tmp = self._fresh("b")
+            self._emit("  %s = trunc i64 %s to i1" % (tmp, val))
+            return tmp
+        if val_ty == "ptr":
+            tmp = self._fresh("b")
+            self._emit("  %s = icmp ne ptr %s, null" % (tmp, val))
+            return tmp
+        # Fallback: treat any other type as truthy (non-zero).
+        tmp = self._fresh("b")
+        self._emit("  %s = or i1 1, 0" % tmp)
+        return tmp
+
     # ---------- public API ----------
     def emit(self) -> str:
+        """Emit the complete module (prelude + functions)."""
+        # Reset ALL emitter state (idempotent — safe to call twice).
+        self.lines = []
+        self._string_consts = []
+        self._tmp = 0
+        self._label = 0
+        self._ov_counter = 0
+        self._dz_counter = 0
+        self._str_counter = 0
+        self._locals = {}
+        self._loop_stack = []
+        self._block_terminated_flag = False
         if self.target_triple:
             self._emit("target triple = \"%s\"" % self.target_triple)
             self._emit("")
-        # Emit runtime declarations.
         for line in RUNTIME_DECLS.strip().split("\n"):
             self._emit(line)
         self._emit("")
-        # Emit each function.
+        # Emit panic message constants.
+        self._emit('@.panic_overflow_msg = private unnamed_addr constant [18 x i8] c"integer overflow\\00"')
+        self._emit('@.panic_divzero_msg = private unnamed_addr constant [18 x i8] c"division by zero\\00"')
+        self._emit("")
+        # Emit functions. (String constants are emitted on demand by
+        # _emit_string_const and accumulated; we append them at the end
+        # before joining.)
         for fname, fn in self.program["fns"].items():
             self._emit_function(fname, fn)
+        # Emit collected string constants just before the final join.
+        # Insert them at the position right after the panic constants.
+        if self._string_consts:
+            # Find the second blank line (after panic constants) and
+            # insert string constants there.
+            insert_at = None
+            blank_count = 0
+            for idx, ln in enumerate(self.lines):
+                if ln == "":
+                    blank_count += 1
+                    if blank_count == 2:
+                        insert_at = idx + 1
+                        break
+            if insert_at is None:
+                insert_at = len(self.lines)
+            sc_lines = []
+            for name, data, bytes_str in self._string_consts:
+                sc_lines.append('@%s = private unnamed_addr constant [%d x i8] [%s]' % (
+                    name, len(data) + 1, bytes_str))
+            sc_lines.append("")
+            self.lines[insert_at:insert_at] = sc_lines
         return "\n".join(self.lines) + "\n"
 
     # ---------- function emission ----------
     def _emit_function(self, fname: str, fn: Dict):
         ret_llvm = hls_type_to_llvm(fn["ret"])
+        self._current_ret_type_value = fn["ret"]
+        self._locals = {}
+        self._block_terminated_flag = False
         params = []
         for (pname, ptype, _) in fn["params"]:
             params.append("%s %%v_%s" % (hls_type_to_llvm(ptype), pname))
@@ -165,25 +231,26 @@ class LLVMEmitter:
         self._emit("define %s @%s(%s) {" % (ret_llvm, fname, param_str))
         self._emit("entry:")
         # Allocate stack slots for parameters so we can re-assign them
-        # (HLS allows `let mut` reassignment).
-        self._locals = {}
+        # (HLS allows `let mut` reassignment). Track the LLVM type per
+        # slot so load/store use the right type.
         for (pname, ptype, _) in fn["params"]:
             slot = self._fresh("p")
-            self._emit("  %s = alloca %s" % (slot, hls_type_to_llvm(ptype)))
-            self._emit("  store %s %%v_%s, ptr %s" % (
-                hls_type_to_llvm(ptype), pname, slot))
-            self._locals[pname] = slot
+            pty = hls_type_to_llvm(ptype)
+            self._emit("  %s = alloca %s" % (slot, pty))
+            self._emit("  store %s %%v_%s, ptr %s" % (pty, pname, slot))
+            self._locals[pname] = (slot, pty)
         # Lower each statement.
         for stmt in fn["body"]:
             self._lower_stmt(stmt)
         # Implicit return void for void functions; panic for non-void
         # (the type checker already rejects missing returns).
-        if fn["ret"] == "void":
-            self._emit("  ret void")
-        else:
-            # The function should have hit a `return` already; defensively
-            # emit an unreachable marker.
-            self._emit("  unreachable")
+        if not self._block_terminated_flag:
+            if fn["ret"] == "void":
+                self._emit("  ret void")
+            else:
+                # Defensive unreachable — the checker should have rejected
+                # this function for not returning on all paths.
+                self._emit("  unreachable")
         self._emit("}")
         self._emit("")
 
@@ -191,39 +258,44 @@ class LLVMEmitter:
     def _lower_stmt(self, stmt: Dict):
         k = stmt["k"]
         if k == "let":
-            val = self._lower_expr(stmt["value"])
+            val_ty, val = self._lower_expr_typed(stmt["value"])
             slot = self._fresh("l")
             ty = hls_type_to_llvm(stmt["t"])
             self._emit("  %s = alloca %s" % (slot, ty))
             self._emit("  store %s %s, ptr %s" % (ty, val, slot))
-            self._locals[stmt["name"]] = slot
+            self._locals[stmt["name"]] = (slot, ty)
         elif k == "assign":
             target = stmt["target"]
-            val = self._lower_expr(stmt["value"])
+            val_ty, val = self._lower_expr_typed(stmt["value"])
             if target["k"] == "ident":
-                slot = self._locals.get(target["name"])
-                if slot is None:
+                entry = self._locals.get(target["name"])
+                if entry is None:
                     # The checker already rejects undefined vars; defensively skip.
                     return
-                # Need to know the LLVM type of the slot. We don't track it
-                # explicitly here; use `ptr` cast + i64 store as the fallback
-                # (this only works for int locals — full type-tracking is a
-                # Stage 12 release target).
-                self._emit("  store i64 %s, ptr %s" % (val, slot))
-            else:
-                # field/index assignment goes through the runtime API.
-                # For now, we emit a call to the corresponding runtime fn.
-                # (Stage 12 release target: full support.)
-                pass
+                slot, slot_ty = entry
+                self._emit("  store %s %s, ptr %s" % (slot_ty, val, slot))
+            elif target["k"] == "field":
+                recv_ty, recv = self._lower_expr_typed(target["target"])
+                # Field assignment via runtime helper. Full typed-field
+                # support is deferred; emit a runtime call.
+                self._emit("  call void @hl_struct_set_field(ptr %s, ptr @.field_%s, ptr %s)" % (
+                    recv, target["name"], val))
+            elif target["k"] == "index":
+                lst_ty, lst = self._lower_expr_typed(target["target"])
+                idx_ty, idx = self._lower_expr_typed(target["idx"])
+                self._emit("  call void @hl_list_set(ptr %s, i64 %s, ptr %s)" % (
+                    lst, idx, val))
         elif k == "return":
             if stmt.get("value") is None:
                 self._emit("  ret void")
             else:
-                val = self._lower_expr(stmt["value"])
-                fn_ret = self._current_ret_type
+                val_ty, val = self._lower_expr_typed(stmt["value"])
+                fn_ret = self._current_ret_type_value
                 self._emit("  ret %s %s" % (hls_type_to_llvm(fn_ret), val))
+            self._mark_terminated()
         elif k == "if":
-            cond = self._lower_expr(stmt["cond"])
+            cond_ty, cond = self._lower_expr_typed(stmt["cond"])
+            cond = self._to_i1(cond_ty, cond)
             then_lbl = self._fresh_label("then")
             else_lbl = self._fresh_label("else")
             end_lbl = self._fresh_label("endif")
@@ -235,50 +307,57 @@ class LLVMEmitter:
                 self._emit("  br i1 %s, label %%%s, label %%%s" % (
                     cond, then_lbl, end_lbl))
             self._emit("%s:" % then_lbl)
+            self._reset_terminated()
             for s in stmt["then"]:
                 self._lower_stmt(s)
-            if not self._block_terminated():
+            if not self._block_terminated_flag:
                 self._emit("  br label %%%s" % end_lbl)
             if has_else:
                 self._emit("%s:" % else_lbl)
+                self._reset_terminated()
                 for s in stmt["els"]:
                     self._lower_stmt(s)
-                if not self._block_terminated():
+                if not self._block_terminated_flag:
                     self._emit("  br label %%%s" % end_lbl)
             self._emit("%s:" % end_lbl)
-            self._block_started = True
+            self._reset_terminated()
         elif k == "while":
             cond_lbl = self._fresh_label("while_cond")
             body_lbl = self._fresh_label("while_body")
             end_lbl = self._fresh_label("while_end")
             self._emit("  br label %%%s" % cond_lbl)
             self._emit("%s:" % cond_lbl)
-            cond = self._lower_expr(stmt["cond"])
+            self._reset_terminated()
+            cond_ty, cond = self._lower_expr_typed(stmt["cond"])
+            cond = self._to_i1(cond_ty, cond)
             self._emit("  br i1 %s, label %%%s, label %%%s" % (
                 cond, body_lbl, end_lbl))
             self._emit("%s:" % body_lbl)
+            self._reset_terminated()
             self._loop_stack.append((cond_lbl, end_lbl))
             for s in stmt["body"]:
                 self._lower_stmt(s)
             self._loop_stack.pop()
-            if not self._block_terminated():
+            if not self._block_terminated_flag:
                 self._emit("  br label %%%s" % cond_lbl)
             self._emit("%s:" % end_lbl)
-            self._block_started = True
+            self._reset_terminated()
         elif k == "for":
             # for v: T in iter { body } -> lowered as a while loop over
-            # list indices. See the HLIR lowering for the same pattern.
-            iter_val = self._lower_expr(stmt["iter"])
+            # list indices.
+            iter_ty, iter_val = self._lower_expr_typed(stmt["iter"])
             len_val = self._fresh("len")
             self._emit("  %s = call i64 @hl_list_len(ptr %s)" % (len_val, iter_val))
             i_slot = self._fresh("i")
             self._emit("  %s = alloca i64" % i_slot)
             self._emit("  store i64 0, ptr %s" % i_slot)
+            self._locals["__for_i_%s" % stmt["var"]] = (i_slot, "i64")
             cond_lbl = self._fresh_label("for_cond")
             body_lbl = self._fresh_label("for_body")
             end_lbl = self._fresh_label("for_end")
             self._emit("  br label %%%s" % cond_lbl)
             self._emit("%s:" % cond_lbl)
+            self._reset_terminated()
             i_val = self._fresh("i")
             self._emit("  %s = load i64, ptr %s" % (i_val, i_slot))
             cond_tmp = self._fresh("cond")
@@ -286,14 +365,22 @@ class LLVMEmitter:
             self._emit("  br i1 %s, label %%%s, label %%%s" % (
                 cond_tmp, body_lbl, end_lbl))
             self._emit("%s:" % body_lbl)
+            self._reset_terminated()
             # Bind the loop variable.
             v_slot = self._fresh("v")
-            self._emit("  %s = alloca ptr" % v_slot)
+            vty = hls_type_to_llvm(stmt["vtype"])
+            self._emit("  %s = alloca %s" % (v_slot, vty))
             elem = self._fresh("elem")
             self._emit("  %s = call ptr @hl_list_get(ptr %s, i64 %s)" % (
                 elem, iter_val, i_val))
-            self._emit("  store ptr %s, ptr %s" % (elem, v_slot))
-            self._locals[stmt["var"]] = v_slot
+            # Cast elem (ptr) to the actual element type if it's a primitive.
+            if vty == "i64":
+                cvt = self._fresh("cvt")
+                self._emit("  %s = ptrtoint ptr %s to i64" % (cvt, elem))
+                self._emit("  store %s %s, ptr %s" % (vty, cvt, v_slot))
+            else:
+                self._emit("  store %s %s, ptr %s" % (vty, elem, v_slot))
+            self._locals[stmt["var"]] = (v_slot, vty)
             self._loop_stack.append((cond_lbl, end_lbl))
             for s in stmt["body"]:
                 self._lower_stmt(s)
@@ -302,280 +389,298 @@ class LLVMEmitter:
             inc = self._fresh("inc")
             self._emit("  %s = add i64 %s, 1" % (inc, i_val))
             self._emit("  store i64 %s, ptr %s" % (inc, i_slot))
-            if not self._block_terminated():
+            if not self._block_terminated_flag:
                 self._emit("  br label %%%s" % cond_lbl)
             self._emit("%s:" % end_lbl)
-            self._block_started = True
+            self._reset_terminated()
         elif k == "break":
             if self._loop_stack:
                 self._emit("  br label %%%s" % self._loop_stack[-1][1])
-                self._block_terminated_flag = True
+                self._mark_terminated()
         elif k == "continue":
             if self._loop_stack:
                 self._emit("  br label %%%s" % self._loop_stack[-1][0])
-                self._block_terminated_flag = True
+                self._mark_terminated()
         elif k == "expr":
-            self._lower_expr(stmt["e"])
+            self._lower_expr_typed(stmt["e"])
 
     # ---------- expression lowering ----------
-    def _lower_expr(self, e: Dict) -> str:
+    def _lower_expr_typed(self, e: Dict) -> Tuple[str, str]:
+        """Lower an expression; return (llvm_type, llvm_value)."""
         k = e["k"]
         if k == "int":
-            return str(e["v"])
+            return ("i64", str(e["v"]))
         if k == "float":
-            # LLVM requires the exact hex-bits representation of the double
-            # for full precision. For simplicity we use the decimal form,
-            # which LLVM accepts.
-            return "0x%X" % float_to_ieee_bits(e["v"]) if False else \
-                ("%.17e" % e["v"])
+            return ("double", "%.17e" % e["v"])
         if k == "bool":
-            return "1" if e["v"] else "0"
+            return ("i1", "1" if e["v"] else "0")
         if k == "str":
-            # Emit a global constant for the string bytes, then construct
-            # an hl_str via hl_str_from.
             data = e["v"]
             if isinstance(data, str):
                 data = data.encode("utf-8")
             const_name = self._emit_string_const(data)
-            # Build the hl_str via hl_str_from.
             tmp = self._fresh("s")
             self._emit("  %s = call ptr @hl_str_from(ptr @%s, i64 %d)" % (
                 tmp, const_name, len(data)))
-            return tmp
+            return ("ptr", tmp)
         if k == "ident":
-            slot = self._locals.get(e["name"])
-            if slot is None:
+            entry = self._locals.get(e["name"])
+            if entry is None:
                 # Should not happen post-check; defensively return 0.
-                return "0"
-            # We don't track the LLVM type per local. Use i64 as the default
-            # (the most common case for int locals). Full type-tracking is
-            # a Stage 12 release target.
+                return ("i64", "0")
+            slot, slot_ty = entry
             tmp = self._fresh("r")
-            self._emit("  %s = load i64, ptr %s" % (tmp, slot))
-            return tmp
+            self._emit("  %s = load %s, ptr %s" % (tmp, slot_ty, slot))
+            return (slot_ty, tmp)
         if k == "bin":
-            return self._lower_binop(e)
+            return self._lower_binop_typed(e)
         if k == "un":
-            a = self._lower_expr(e["e"])
+            a_ty, a = self._lower_expr_typed(e["e"])
             tmp = self._fresh("u")
             if e["op"] == "-":
-                # Negation with overflow check.
-                ovf = self._fresh("ov")
-                res = self._fresh("sub_ov")
-                self._emit(
-                    "  %s = call { i64, i1 } @llvm.ssub.with.overflow.i64("
-                    "i64 0, i64 %s)" % (res, a))
-                self._emit("  %s = extractvalue { i64, i1 } %s, 0" % (tmp, res))
-                self._emit("  %s = extractvalue { i64, i1 } %s, 1" % (ovf, res))
-                self._emit("  br i1 %s, label %%ov_panic, label %%ov_ok" % ovf)
-                self._emit("ov_panic:")
-                self._emit("  call void @hl_die(ptr @.panic_overflow_msg)")
-                self._emit("  unreachable")
-                self._emit("ov_ok:")
-                return tmp
+                if a_ty == "i64":
+                    res = self._fresh("sub_ov")
+                    ovf = self._fresh("ov")
+                    self._emit(
+                        "  %s = call { i64, i1 } @llvm.ssub.with.overflow.i64("
+                        "i64 0, i64 %s)" % (res, a))
+                    self._emit("  %s = extractvalue { i64, i1 } %s, 0" % (tmp, res))
+                    self._emit("  %s = extractvalue { i64, i1 } %s, 1" % (ovf, res))
+                    n = self._ov_counter
+                    self._ov_counter += 1
+                    self._emit("  br i1 %s, label %%ov_panic_%d, label %%ov_ok_%d" % (ovf, n, n))
+                    self._emit("ov_panic_%d:" % n)
+                    self._emit("  call void @hl_die(ptr @.panic_overflow_msg)")
+                    self._emit("  unreachable")
+                    self._emit("ov_ok_%d:" % n)
+                    self._reset_terminated()
+                    return ("i64", tmp)
+                # float negation
+                self._emit("  %s = fneg double %s" % (tmp, a))
+                return ("double", tmp)
             elif e["op"] == "!":
                 self._emit("  %s = xor i1 %s, 1" % (tmp, a))
-                return tmp
-            return "0"
+                return ("i1", tmp)
+            return ("i64", "0")
         if k == "call":
-            return self._lower_call(e)
+            return self._lower_call_typed(e)
         if k == "method" or k == "fieldcall":
-            # Method calls dispatch through the runtime. Today the LLVM
-            # backend treats them as opaque calls to a mangled name.
-            # Full method dispatch is a Stage 12 release target.
-            recv = self._lower_expr(e["target"])
-            args = [self._lower_expr(a) for a in e["args"]]
+            recv_ty, recv = self._lower_expr_typed(e["target"])
+            arg_vals = [self._lower_expr_typed(a) for a in e["args"]]
             mangled = "hl_method_%s" % e["name"]
-            arg_str = ", ".join(["ptr %s" % recv] + ["ptr %s" % a for a in args])
+            arg_str = ", ".join(["ptr %s" % recv] + ["ptr %s" % v for _, v in arg_vals])
             tmp = self._fresh("m")
             self._emit("  %s = call ptr @%s(%s)" % (tmp, mangled, arg_str))
-            return tmp
+            return ("ptr", tmp)
         if k == "field":
-            recv = self._lower_expr(e["target"])
+            recv_ty, recv = self._lower_expr_typed(e["target"])
             tmp = self._fresh("f")
-            # Field access via runtime helper. The runtime function
-            # `hl_struct_get` returns a ptr to the field; full support
-            # for typed fields is the Stage 12 release target.
             self._emit("  %s = call ptr @hl_struct_get(ptr %s, ptr @.field_%s)" % (
                 tmp, recv, e["name"]))
-            return tmp
+            return ("ptr", tmp)
+        if k == "index":
+            lst_ty, lst = self._lower_expr_typed(e["target"])
+            idx_ty, idx = self._lower_expr_typed(e["idx"])
+            tmp = self._fresh("e")
+            self._emit("  %s = call ptr @hl_list_get(ptr %s, i64 %s)" % (
+                tmp, lst, idx))
+            return ("ptr", tmp)
         if k == "listlit":
             tmp = self._fresh("lst")
             self._emit("  %s = call ptr @hl_list_new()" % tmp)
             for item in e["items"]:
-                v = self._lower_expr(item)
+                _, v = self._lower_expr_typed(item)
                 self._emit("  call void @hl_list_push(ptr %s, ptr %s)" % (tmp, v))
-            return tmp
+            return ("ptr", tmp)
         if k == "structlit":
-            # Allocate via the runtime; details deferred.
             tmp = self._fresh("st")
             self._emit("  %s = inttoptr i64 0 to ptr" % tmp)
-            return tmp
-        if k == "index":
-            lst = self._lower_expr(e["target"])
-            idx = self._lower_expr(e["idx"])
-            tmp = self._fresh("e")
-            self._emit("  %s = call ptr @hl_list_get(ptr %s, i64 %s)" % (
-                tmp, lst, idx))
-            return tmp
+            return ("ptr", tmp)
+        if k == "match":
+            # Fall back to a runtime call; full lowering is complex.
+            scrut_ty, scrut = self._lower_expr_typed(e["scrut"])
+            tmp = self._fresh("match")
+            self._emit("  %s = call ptr @hl_match_dispatch(ptr %s)" % (tmp, scrut))
+            return ("ptr", tmp)
+        if k == "qmark":
+            # Lower ? as a runtime dispatch.
+            inner_ty, inner = self._lower_expr_typed(e["e"])
+            tmp = self._fresh("qmark")
+            self._emit("  %s = call ptr @hl_qmark_dispatch(ptr %s)" % (tmp, inner))
+            return ("ptr", tmp)
+        if k == "mapnew":
+            tmp = self._fresh("map")
+            self._emit("  %s = call ptr @hl_map_new()" % tmp)
+            return ("ptr", tmp)
+        if k == "enumlit":
+            tmp = self._fresh("enum")
+            self._emit("  %s = call ptr @hl_enum_new(ptr @.enum_%s_%s)" % (
+                tmp, e.get("enum_name", "_"), e.get("variant", "_")))
+            return ("ptr", tmp)
         # Fallback for unsupported expression kinds.
-        return "0"
+        return ("i64", "0")
 
-    def _lower_binop(self, e: Dict) -> str:
+    def _lower_binop_typed(self, e: Dict) -> Tuple[str, str]:
         op = e["op"]
-        a = self._lower_expr(e["l"])
-        b = self._lower_expr(e["r"])
-        # Use the checker's type annotation (set during `check()`) to
-        # dispatch on operand type. The left operand's type determines
-        # the operation kind for HLS.
         lt = e["l"].get("t", "int")
+        a_ty, a = self._lower_expr_typed(e["l"])
+        b_ty, b = self._lower_expr_typed(e["r"])
+
         if lt == "str" and op == "+":
-            # String concatenation.
             tmp = self._fresh("cat")
-            self._emit("  %s = call ptr @hl_str_concat(ptr %s, ptr %s)" % (
-                tmp, a, b))
-            return tmp
+            self._emit("  %s = call ptr @hl_str_concat(ptr %s, ptr %s)" % (tmp, a, b))
+            return ("ptr", tmp)
         if lt == "str" and op == "==":
             tmp = self._fresh("r")
-            self._emit("  %s = call i1 @hl_str_eq(ptr %s, ptr %s)" % (
-                tmp, a, b))
+            self._emit("  %s = call i1 @hl_str_eq(ptr %s, ptr %s)" % (tmp, a, b))
             ext = self._fresh("ext")
             self._emit("  %s = zext i1 %s to i64" % (ext, tmp))
-            return ext
+            return ("i64", ext)
         if lt == "str" and op == "!=":
-            tmp = self._fresh("r")
             eq = self._fresh("eq")
-            self._emit("  %s = call i1 @hl_str_eq(ptr %s, ptr %s)" % (
-                eq, a, b))
+            self._emit("  %s = call i1 @hl_str_eq(ptr %s, ptr %s)" % (eq, a, b))
+            tmp = self._fresh("r")
             self._emit("  %s = xor i1 %s, 1" % (tmp, eq))
             ext = self._fresh("ext")
             self._emit("  %s = zext i1 %s to i64" % (ext, tmp))
-            return ext
+            return ("i64", ext)
         if lt == "float":
-            # Float arithmetic (no overflow check).
             tmp = self._fresh("r")
             if op == "+":
                 self._emit("  %s = fadd double %s, %s" % (tmp, a, b))
-            elif op == "-":
+                return ("double", tmp)
+            if op == "-":
                 self._emit("  %s = fsub double %s, %s" % (tmp, a, b))
-            elif op == "*":
+                return ("double", tmp)
+            if op == "*":
                 self._emit("  %s = fmul double %s, %s" % (tmp, a, b))
-            elif op == "/":
+                return ("double", tmp)
+            if op == "/":
                 self._emit("  %s = fdiv double %s, %s" % (tmp, a, b))
-            elif op == "%":
+                return ("double", tmp)
+            if op == "%":
                 self._emit("  %s = frem double %s, %s" % (tmp, a, b))
-            elif op == "==":
+                return ("double", tmp)
+            if op == "==":
                 self._emit("  %s = fcmp oeq double %s, %s" % (tmp, a, b))
-            elif op == "!=":
-                self._emit("  %s = fcmp one double %s, %s" % (tmp, a, b))
-            elif op == "<":
-                self._emit("  %s = fcmp olt double %s, %s" % (tmp, a, b))
-            elif op == "<=":
-                self._emit("  %s = fcmp ole double %s, %s" % (tmp, a, b))
-            elif op == ">":
-                self._emit("  %s = fcmp ogt double %s, %s" % (tmp, a, b))
-            elif op == ">=":
-                self._emit("  %s = fcmp oge double %s, %s" % (tmp, a, b))
-            else:
-                return "0.0"
-            # Comparison results are i1; arithmetic results are double.
-            if op in ("==", "!=", "<", "<=", ">", ">="):
                 ext = self._fresh("ext")
                 self._emit("  %s = zext i1 %s to i64" % (ext, tmp))
-                return ext
-            return tmp
+                return ("i64", ext)
+            if op == "!=":
+                self._emit("  %s = fcmp one double %s, %s" % (tmp, a, b))
+                ext = self._fresh("ext")
+                self._emit("  %s = zext i1 %s to i64" % (ext, tmp))
+                return ("i64", ext)
+            if op == "<":
+                self._emit("  %s = fcmp olt double %s, %s" % (tmp, a, b))
+                ext = self._fresh("ext")
+                self._emit("  %s = zext i1 %s to i64" % (ext, tmp))
+                return ("i64", ext)
+            if op == "<=":
+                self._emit("  %s = fcmp ole double %s, %s" % (tmp, a, b))
+                ext = self._fresh("ext")
+                self._emit("  %s = zext i1 %s to i64" % (ext, tmp))
+                return ("i64", ext)
+            if op == ">":
+                self._emit("  %s = fcmp ogt double %s, %s" % (tmp, a, b))
+                ext = self._fresh("ext")
+                self._emit("  %s = zext i1 %s to i64" % (ext, tmp))
+                return ("i64", ext)
+            if op == ">=":
+                self._emit("  %s = fcmp oge double %s, %s" % (tmp, a, b))
+                ext = self._fresh("ext")
+                self._emit("  %s = zext i1 %s to i64" % (ext, tmp))
+                return ("i64", ext)
         # Default: integer arithmetic with overflow checks.
         if op == "+":
-            return self._emit_overflow_op("llvm.sadd.with.overflow.i64", a, b)
+            res = self._emit_overflow_op("llvm.sadd.with.overflow.i64", a, b)
+            return ("i64", res)
         if op == "-":
-            return self._emit_overflow_op("llvm.ssub.with.overflow.i64", a, b)
+            res = self._emit_overflow_op("llvm.ssub.with.overflow.i64", a, b)
+            return ("i64", res)
         if op == "*":
-            return self._emit_overflow_op("llvm.smul.with.overflow.i64", a, b)
+            res = self._emit_overflow_op("llvm.smul.with.overflow.i64", a, b)
+            return ("i64", res)
         if op == "/":
-            # Check for division by zero first.
             is_zero = self._fresh("dz")
             self._emit("  %s = icmp eq i64 %s, 0" % (is_zero, b))
             n = self._dz_counter
             self._dz_counter += 1
-            self._emit("  br i1 %s, label %%dz_panic_%d, label %%dz_ok_%d" % (
-                is_zero, n, n))
+            self._emit("  br i1 %s, label %%dz_panic_%d, label %%dz_ok_%d" % (is_zero, n, n))
             self._emit("dz_panic_%d:" % n)
             self._emit("  call void @hl_die(ptr @.panic_divzero_msg)")
             self._emit("  unreachable")
             self._emit("dz_ok_%d:" % n)
+            self._reset_terminated()
             tmp = self._fresh("r")
             self._emit("  %s = sdiv i64 %s, %s" % (tmp, a, b))
-            return tmp
+            return ("i64", tmp)
         if op == "%":
             is_zero = self._fresh("dz")
             self._emit("  %s = icmp eq i64 %s, 0" % (is_zero, b))
             n = self._dz_counter
             self._dz_counter += 1
-            self._emit("  br i1 %s, label %%dz_panic_%d, label %%dz_ok_%d" % (
-                is_zero, n, n))
+            self._emit("  br i1 %s, label %%dz_panic_%d, label %%dz_ok_%d" % (is_zero, n, n))
             self._emit("dz_panic_%d:" % n)
             self._emit("  call void @hl_die(ptr @.panic_divzero_msg)")
             self._emit("  unreachable")
             self._emit("dz_ok_%d:" % n)
+            self._reset_terminated()
             tmp = self._fresh("r")
             self._emit("  %s = srem i64 %s, %s" % (tmp, a, b))
-            return tmp
+            return ("i64", tmp)
         if op == "==":
             tmp = self._fresh("r")
             self._emit("  %s = icmp eq i64 %s, %s" % (tmp, a, b))
             ext = self._fresh("ext")
             self._emit("  %s = zext i1 %s to i64" % (ext, tmp))
-            return ext
+            return ("i64", ext)
         if op == "!=":
             tmp = self._fresh("r")
             self._emit("  %s = icmp ne i64 %s, %s" % (tmp, a, b))
             ext = self._fresh("ext")
             self._emit("  %s = zext i1 %s to i64" % (ext, tmp))
-            return ext
+            return ("i64", ext)
         if op == "<":
             tmp = self._fresh("r")
             self._emit("  %s = icmp slt i64 %s, %s" % (tmp, a, b))
             ext = self._fresh("ext")
             self._emit("  %s = zext i1 %s to i64" % (ext, tmp))
-            return ext
+            return ("i64", ext)
         if op == "<=":
             tmp = self._fresh("r")
             self._emit("  %s = icmp sle i64 %s, %s" % (tmp, a, b))
             ext = self._fresh("ext")
             self._emit("  %s = zext i1 %s to i64" % (ext, tmp))
-            return ext
+            return ("i64", ext)
         if op == ">":
             tmp = self._fresh("r")
             self._emit("  %s = icmp sgt i64 %s, %s" % (tmp, a, b))
             ext = self._fresh("ext")
             self._emit("  %s = zext i1 %s to i64" % (ext, tmp))
-            return ext
+            return ("i64", ext)
         if op == ">=":
             tmp = self._fresh("r")
             self._emit("  %s = icmp sge i64 %s, %s" % (tmp, a, b))
             ext = self._fresh("ext")
             self._emit("  %s = zext i1 %s to i64" % (ext, tmp))
-            return ext
+            return ("i64", ext)
         if op == "&&":
             tmp = self._fresh("r")
             self._emit("  %s = and i1 %s, %s" % (tmp, a, b))
             ext = self._fresh("ext")
             self._emit("  %s = zext i1 %s to i64" % (ext, tmp))
-            return ext
+            return ("i64", ext)
         if op == "||":
             tmp = self._fresh("r")
             self._emit("  %s = or i1 %s, %s" % (tmp, a, b))
             ext = self._fresh("ext")
             self._emit("  %s = zext i1 %s to i64" % (ext, tmp))
-            return ext
-        # String concat (+ on str) is handled by the runtime; if both operands
-        # are str, we'd need a different lowering. For simplicity, the Stage 12
-        # alpha treats `+` as integer addition; full type-aware lowering is
-        # a release target.
-        return "0"
+            return ("i64", ext)
+        return ("i64", "0")
 
     def _emit_overflow_op(self, llvm_intrinsic: str, a: str, b: str) -> str:
-        """Emit a checked overflow operation."""
+        """Emit a checked overflow operation; return the result SSA name."""
         n = self._ov_counter
         self._ov_counter += 1
         res = self._fresh("ov_res")
@@ -585,70 +690,107 @@ class LLVMEmitter:
         self._emit("  %s = extractvalue { i64, i1 } %s, 0" % (out, res))
         ovf = self._fresh("ov")
         self._emit("  %s = extractvalue { i64, i1 } %s, 1" % (ovf, res))
-        # Each overflow op must use unique labels.
         panic_lbl = "ov_panic_%d" % n
         ok_lbl = "ov_ok_%d" % n
-        self._emit("  br i1 %s, label %%%s, label %%%s" % (
-            ovf, panic_lbl, ok_lbl))
+        self._emit("  br i1 %s, label %%%s, label %%%s" % (ovf, panic_lbl, ok_lbl))
         self._emit("%s:" % panic_lbl)
         self._emit("  call void @hl_die(ptr @.panic_overflow_msg)")
         self._emit("  unreachable")
         self._emit("%s:" % ok_lbl)
+        self._reset_terminated()
         return out
 
-    def _lower_call(self, e: Dict) -> str:
+    def _lower_call_typed(self, e: Dict) -> Tuple[str, str]:
         """Lower a function call. Maps HLS builtins to runtime functions."""
         name = e["name"]
-        args = [self._lower_expr(a) for a in e["args"]]
+        arg_pairs = [self._lower_expr_typed(a) for a in e["args"]]
         # HLS builtin -> runtime function mapping.
         builtin_map = {
-            "println": ("void", "@hl_println", ["ptr"]),
-            "print":    ("void", "@hl_print",   ["ptr"]),
-            "len":      ("i64",  "@hl_str_len", ["ptr"]),
-            "str":      ("ptr",  "@hl_int_to_str", ["i64"]),
-            "panic":    ("void", "@hl_die",     ["ptr"]),
-            "clock_ms": ("i64",  "@hl_clock_ms", []),
-            "file_exists": ("i1", "@hl_file_exists", ["ptr"]),
-            "read_file":   ("ptr", "@hl_read_file", ["ptr"]),
-            "write_file":  ("void", "@hl_write_file", ["ptr", "ptr"]),
-            "exit":        ("void", "@hl_exit", ["i64"]),
-            "chr":         ("i64", "@hl_chr", ["i64"]),
-            "args":        ("ptr", "@hl_args_get_zero", []),
-            "range":       ("ptr", "@hl_range", ["i64", "i64"]),
+            "println":          ("void", "@hl_println",    ["ptr"]),
+            "print":            ("void", "@hl_print",      ["ptr"]),
+            "len":              ("i64",  "@hl_str_len",    ["ptr"]),   # generic len (str/list/map)
+            "str":              ("ptr",  "@hl_int_to_str", ["i64"]),
+            "panic":            ("void", "@hl_die",        ["ptr"]),
+            "clock_ms":         ("i64",  "@hl_clock_ms",   []),
+            "file_exists":      ("i1",   "@hl_file_exists", ["ptr"]),
+            "read_file":        ("ptr",  "@hl_read_file",  ["ptr"]),
+            "write_file":       ("void", "@hl_write_file", ["ptr", "ptr"]),
+            "exit":             ("void", "@hl_exit",       ["i64"]),
+            "chr":              ("i64",  "@hl_chr",        ["i64"]),
+            "args":             ("ptr",  "@hl_args_get",   ["i64"]),  # placeholder: returns first arg
+            "range":            ("ptr",  "@hl_range",      ["i64", "i64"]),
+            "map_new":          ("ptr",  "@hl_map_new",    []),
+            "tainted_args":     ("ptr",  "@hl_tainted_args", []),
+            "taint_mark":       ("ptr",  "@hl_taint_mark", ["ptr"]),
+            "taint_unwrap":     ("ptr",  "@hl_taint_unwrap", ["ptr"]),
+            "read_file_tainted": ("ptr", "@hl_read_file_tainted", ["ptr"]),
+            "drop":             ("void", "@hl_drop",       ["ptr"]),
+            "clone":            ("ptr",  "@hl_clone",      ["ptr"]),
+            "take":             ("ptr",  "@hl_take",       ["ptr"]),
         }
         if name in builtin_map:
             ret_ty, fn_name, arg_tys = builtin_map[name]
-            arg_str = ", ".join("%s %s" % (t, a) for t, a in zip(arg_tys, args))
+            # Coerce each argument to the expected type.
+            coerced = []
+            for (aty, aval), want_ty in zip(arg_pairs, arg_tys):
+                if aty == want_ty:
+                    coerced.append(aval)
+                elif aty == "i64" and want_ty == "ptr":
+                    cvt = self._fresh("i2p")
+                    self._emit("  %s = inttoptr i64 %s to ptr" % (cvt, aval))
+                    coerced.append(cvt)
+                elif aty == "ptr" and want_ty == "i64":
+                    cvt = self._fresh("p2i")
+                    self._emit("  %s = ptrtoint ptr %s to i64" % (cvt, aval))
+                    coerced.append(cvt)
+                elif aty == "i1" and want_ty == "i64":
+                    cvt = self._fresh("z")
+                    self._emit("  %s = zext i1 %s to i64" % (cvt, aval))
+                    coerced.append(cvt)
+                else:
+                    coerced.append(aval)
+            arg_str = ", ".join("%s %s" % (t, v) for t, v in zip(arg_tys, coerced))
             if ret_ty == "void":
                 self._emit("  call void %s(%s)" % (fn_name, arg_str))
-                return "0"
+                return ("void", "0")
             tmp = self._fresh("call")
             self._emit("  %s = call %s %s(%s)" % (tmp, ret_ty, fn_name, arg_str))
-            return tmp
-        # User-defined function call. All HLS functions are emitted with
-        # their original name in LLVM IR.
-        # Determine the function's return type from the program.
+            return (ret_ty, tmp)
+        # User-defined function call.
         fn = self.program["fns"].get(name)
         if fn is None:
-            # Might be a method-key like "Type.method" — check that too.
+            # Method-key like "Type.method" — look up directly.
             fn = self.program["fns"].get(name)
         ret_ty = hls_type_to_llvm(fn["ret"]) if fn else "ptr"
         param_tys = [hls_type_to_llvm(p[1]) for p in fn["params"]] if fn else (
-            ["i64"] * len(args))
-        arg_str = ", ".join("%s %s" % (t, a) for t, a in zip(param_tys, args))
+            ["i64"] * len(arg_pairs))
+        coerced = []
+        for (aty, aval), want_ty in zip(arg_pairs, param_tys):
+            if aty == want_ty:
+                coerced.append(aval)
+            elif aty == "i64" and want_ty == "ptr":
+                cvt = self._fresh("i2p")
+                self._emit("  %s = inttoptr i64 %s to ptr" % (cvt, aval))
+                coerced.append(cvt)
+            elif aty == "ptr" and want_ty == "i64":
+                cvt = self._fresh("p2i")
+                self._emit("  %s = ptrtoint ptr %s to i64" % (cvt, aval))
+                coerced.append(cvt)
+            else:
+                coerced.append(aval)
+        arg_str = ", ".join("%s %s" % (t, v) for t, v in zip(param_tys, coerced))
         if ret_ty == "void":
             self._emit("  call void @%s(%s)" % (name, arg_str))
-            return "0"
+            return ("void", "0")
         tmp = self._fresh("call")
         self._emit("  %s = call %s @%s(%s)" % (tmp, ret_ty, name, arg_str))
-        return tmp
+        return (ret_ty, tmp)
 
     # ---------- string constant emission ----------
     def _emit_string_const(self, data: bytes) -> str:
         """Emit a global string constant. Returns the global name."""
-        name = ".str.%d" % (self._tmp_str_consts())
-        # LLVM IR string constants are arrays of i8 with a trailing null
-        # byte (for C compatibility).
+        self._str_counter += 1
+        name = ".str.%d" % self._str_counter
         if data:
             bytes_str = ", ".join("i8 %d" % b for b in data) + ", i8 0"
         else:
@@ -656,65 +798,7 @@ class LLVMEmitter:
         self._string_consts.append((name, data, bytes_str))
         return name
 
-    _str_counter = 0
-    _ov_counter = 0
-
-    def _tmp_str_consts(self):
-        self._str_counter += 1
-        return self._str_counter
-
-    # ---------- helpers ----------
-    @property
-    def _current_ret_type(self):
-        return self._current_ret_type_value
-
-    _current_ret_type_value = "void"
-
-    _block_terminated_flag = False
-    _block_started = True
-
-    def _block_terminated(self):
-        # Return True if the current block ends with a terminator (br / ret /
-        # unreachable). We approximate this by checking the last emitted line.
-        if not self.lines:
-            return False
-        last = self.lines[-1].strip()
-        return (last.startswith("ret ") or last.startswith("br ")
-                or last == "ret void" or last == "unreachable")
-
-    # ---------- final assembly ----------
-    def emit_final(self) -> str:
-        """Emit the complete module, including prelude and string consts."""
-        # Reset state.
-        self.lines = []
-        self._string_consts = []
-        if self.target_triple:
-            self._emit("target triple = \"%s\"" % self.target_triple)
-            self._emit("")
-        for line in RUNTIME_DECLS.strip().split("\n"):
-            self._emit(line)
-        self._emit("")
-        # Emit panic message constants.
-        self._emit('@.panic_overflow_msg = private unnamed_addr constant [18 x i8] c"integer overflow\\00"')
-        self._emit('@.panic_divzero_msg = private unnamed_addr constant [18 x i8] c"division by zero\\00"')
-        self._emit("")
-        # Emit string constants.
-        for name, data, bytes_str in self._string_consts:
-            self._emit('@%s = private unnamed_addr constant [%d x i8] [%s]' % (
-                name, len(data) + 1, bytes_str))
-        self._emit("")
-        # Emit functions.
-        for fname, fn in self.program["fns"].items():
-            self._current_ret_type_value = fn["ret"]
-            self._emit_function(fname, fn)
-        return "\n".join(self.lines) + "\n"
-
-
-def float_to_ieee_bits(f: float) -> int:
-    import struct
-    return struct.unpack(">Q", struct.pack(">d", f))[0]
-
 
 def emit_module(program, target_triple: Optional[str] = None) -> str:
     """Convenience: emit LLVM IR for a checked program."""
-    return LLVMEmitter(program, target_triple).emit_final()
+    return LLVMEmitter(program, target_triple).emit()

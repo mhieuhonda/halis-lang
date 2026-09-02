@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """hlbindgen — C header → HLS extern declaration generator.
 
-Stage 15 (v0.12.0-alpha): emits HLS `extern "C" { ... }` declarations
+Stage 15 (v0.13.0-alpha): emits HLS `extern "C" { ... }` declarations
 from simple C headers.
 
 Usage:

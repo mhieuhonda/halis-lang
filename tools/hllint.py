@@ -1,34 +1,36 @@
 #!/usr/bin/env python3
 """hllint — Linter for Hieu Louis (HLS).
 
-Stage 14 (v0.12.0-alpha): safety rules for HLS programs.
+Stage 14: safety rules for HLS programs.
 
 Rules:
   L001  unused-binding        A `let` binding is never referenced after
                               its declaration.
   L002  unused-function       A function is never called.
   L003  unused-struct-field   A struct field is never read.
-  L004  ignored-result         A call to a function returning Result[T, E]
+  L004  ignored-result        A call to a function returning Result[T, E]
                               is used as a statement (no `?`, no
                               `let _ = ...`, no `match`).
-  L005  explicit-unwrap        A call to `result_unwrap` or
+  L005  explicit-unwrap       A call to `result_unwrap` or
                               `option_unwrap` without a prior
                               `result_is_ok` / `option_is_some` check.
-  L006  unnecessary-effects    A function declares `uses IO` (or any
+  L006  unnecessary-effects   A function declares `uses IO` (or any
                               effect) but its body calls only pure
                               functions.
   L007  dead-code-after-return Statements after `return` are unreachable.
   L008  long-function         A function body exceeds 80 statements
                               (refactor candidate).
   L009  shadowing             A `let` binding shadows an outer binding
-                              with the same name.
+                              with the same name (info only — the checker
+                              already rejects this as a compile error, so
+                              this rule never fires for valid programs).
   L010  empty-impl            An `impl` block has no methods.
 
 Usage:
   hllint FILE.hls              # print warnings to stdout, exit 0
   hllint --strict FILE.hls     # exit non-zero if any warnings
   hllint --rule L001 FILE.hls  # only run rule L001
-  hllint --list FILE.hls       # list rules and exit
+  hllint --list                # list rules and exit
 
 Status: alpha. The linter runs the Stage-0 checker to get the AST +
 type/effect info, then walks the AST for each rule. The linter does
@@ -57,7 +59,7 @@ RULES = {
     "L006": ("unnecessary-effects",   "warning"),
     "L007": ("dead-code-after-return", "warning"),
     "L008": ("long-function",         "info"),
-    "L009": ("shadowing",             "warning"),
+    "L009": ("shadowing",             "info"),
     "L010": ("empty-impl",            "warning"),
 }
 
@@ -125,6 +127,70 @@ def collect_idents(e, idents):
     walk_expr(e, visit)
 
 
+def collect_calls(e, calls):
+    """Collect all function/method call names in an expression."""
+    def visit(node):
+        if node.get("k") == "call":
+            calls.add(node["name"])
+        elif node.get("k") in ("method", "fieldcall"):
+            calls.add(node["name"])
+    walk_expr(e, visit)
+
+
+def collect_field_reads(e, fields):
+    """Collect all struct field reads (`x.field`) in an expression."""
+    def visit(node):
+        if node.get("k") == "field":
+            fields.add(node["name"])
+    walk_expr(e, visit)
+
+
+def exprs_in_stmt(s):
+    """Yield every expression contained in a statement (recursively)."""
+    if s is None:
+        return
+    k = s.get("k")
+    if k == "let":
+        yield s["value"]
+    elif k == "assign":
+        yield s["value"]
+        # The target may also contain expressions (e.g. `xs[i] = v` has `i`).
+        tgt = s["target"]
+        if tgt["k"] == "index":
+            yield tgt["idx"]
+    elif k == "return":
+        if s.get("value") is not None:
+            yield s["value"]
+    elif k == "expr":
+        yield s["e"]
+    elif k == "if":
+        yield s["cond"]
+    elif k == "while":
+        yield s["cond"]
+    elif k == "for":
+        yield s["iter"]
+
+
+def all_exprs_in_stmts(stmts):
+    """Yield every expression in a statement list (recursively into
+    nested if/while/for bodies)."""
+    for s in stmts:
+        for e in exprs_in_stmt(s):
+            yield e
+        if s["k"] == "if":
+            for e in all_exprs_in_stmts(s["then"]):
+                yield e
+            if s.get("els"):
+                for e in all_exprs_in_stmts(s["els"]):
+                    yield e
+        elif s["k"] == "while":
+            for e in all_exprs_in_stmts(s["body"]):
+                yield e
+        elif s["k"] == "for":
+            for e in all_exprs_in_stmts(s["body"]):
+                yield e
+
+
 # ---------------------------------------------------------------------------
 # Linter.
 # ---------------------------------------------------------------------------
@@ -152,100 +218,51 @@ class Linter:
     def _rule_l001(self):
         """Unused-binding: a `let` binding is never referenced."""
         for fname, fn in self.program["fns"].items():
-            # Collect all identifier references in the function body.
+            # Collect all identifier references in the function body
+            # by walking EVERY expression (including nested ones).
             refs = set()
-            def visit(node):
-                if node.get("k") == "ident":
-                    refs.add(node["name"])
-            for s in fn["body"]:
-                walk_stmts([s], lambda s: None)
-                if s["k"] == "let":
-                    collect_idents(s["value"], refs)
-                elif s["k"] == "assign":
-                    collect_idents(s["value"], refs)
-                elif s["k"] == "return" and s.get("value"):
-                    collect_idents(s["value"], refs)
-                elif s["k"] == "expr":
-                    walk_expr(s["e"], visit)
-                elif s["k"] == "if":
-                    collect_idents(s["cond"], refs)
-                elif s["k"] == "while":
-                    collect_idents(s["cond"], refs)
-                elif s["k"] == "for":
-                    collect_idents(s["iter"], refs)
-            # Also walk the body recursively.
-            for s in fn["body"]:
-                if s["k"] == "expr":
-                    walk_expr(s["e"], visit)
-                elif s["k"] == "if":
-                    collect_idents(s["cond"], refs)
-                    for sub in s["then"] + (s.get("els") or []):
-                        if sub["k"] == "expr":
-                            walk_expr(sub["e"], visit)
-                elif s["k"] == "while":
-                    collect_idents(s["cond"], refs)
-                    for sub in s["body"]:
-                        if sub["k"] == "expr":
-                            walk_expr(sub["e"], visit)
+            for e in all_exprs_in_stmts(fn["body"]):
+                collect_idents(e, refs)
             # Now check each `let` binding.
-            for s in fn["body"]:
+            for s in walk_stmts_collected(fn["body"]):
                 if s["k"] == "let":
                     name = s["name"]
-                    # If the binding is used anywhere (including the
-                    # let's own value — which would be a recursion error
-                    # but the checker already rejects that), skip.
-                    # We use a simple heuristic: if `name` appears in
-                    # `refs` (the set of all identifier references),
-                    # it's used.
                     if name not in refs:
                         self._warn("L001", s.get("line", 0),
                                    "let binding '%s' is never used" % name)
 
     def _rule_l002(self):
         """Unused-function: a function is never called."""
-        # Collect all function/method names referenced via call/fieldcall.
         called = set()
         for fname, fn in self.program["fns"].items():
-            # Walk EVERY expression in the function body (let values,
-            # assign values, return values, if/while/for conditions,
-            # expr statements).
-            def visit_call(node):
-                if node.get("k") == "call":
-                    called.add(node["name"])
-                elif node.get("k") in ("method", "fieldcall"):
-                    called.add(node["name"])
-            for s in fn["body"]:
-                if s["k"] == "let":
-                    walk_expr(s["value"], visit_call)
-                elif s["k"] == "assign":
-                    walk_expr(s["value"], visit_call)
-                elif s["k"] == "return" and s.get("value"):
-                    walk_expr(s["value"], visit_call)
-                elif s["k"] == "expr":
-                    walk_expr(s["e"], visit_call)
-                elif s["k"] == "if":
-                    walk_expr(s["cond"], visit_call)
-                    for sub in s["then"] + (s.get("els") or []):
-                        if sub["k"] == "expr":
-                            walk_expr(sub["e"], visit_call)
-                elif s["k"] == "while":
-                    walk_expr(s["cond"], visit_call)
-                    for sub in s["body"]:
-                        if sub["k"] == "expr":
-                            walk_expr(sub["e"], visit_call)
-                elif s["k"] == "for":
-                    walk_expr(s["iter"], visit_call)
-                    for sub in s["body"]:
-                        if sub["k"] == "expr":
-                            walk_expr(sub["e"], visit_call)
+            for e in all_exprs_in_stmts(fn["body"]):
+                collect_calls(e, called)
         # Special-case: `main` is always considered used.
         called.add("main")
+        # Methods registered as "Struct.method" — the short name is
+        # what appears in fieldcall/method nodes.
         for fname in self.program["fns"]:
             if fname == "main":
                 continue
             short = fname.split(".")[-1]
             if fname not in called and short not in called:
                 self._warn("L002", 0, "function '%s' is never called" % fname)
+
+    def _rule_l003(self):
+        """Unused-struct-field: a struct field is never read."""
+        # Collect all field-read names across all functions.
+        read_fields = set()
+        for fname, fn in self.program["fns"].items():
+            for e in all_exprs_in_stmts(fn["body"]):
+                collect_field_reads(e, read_fields)
+        # Also collect field reads in struct literal field NAMES — wait,
+        # those are field WRITES, not reads. Skip.
+        # Check each struct's fields.
+        for sname, sdef in self.program["structs"].items():
+            for fname, ftype, _ in sdef["fields"]:
+                if fname not in read_fields:
+                    self._warn("L003", sdef.get("line", 0),
+                               "struct field '%s.%s' is never read" % (sname, fname))
 
     def _rule_l004(self):
         """Ignored-result: a call returning Result is used as a statement."""
@@ -254,7 +271,7 @@ class Linter:
         # top-level expression is a `call` to a function whose name
         # contains "parse" or "result_".
         for fname, fn in self.program["fns"].items():
-            for s in fn["body"]:
+            for s in walk_stmts_collected(fn["body"]):
                 if s["k"] == "expr" and s["e"]["k"] == "call":
                     callee = s["e"]["name"]
                     if "parse" in callee.lower() or callee.startswith("result_"):
@@ -267,14 +284,13 @@ class Linter:
         # For the alpha, we flag ANY call to `result_unwrap` / `option_unwrap`.
         # A more sophisticated linter would track control flow.
         for fname, fn in self.program["fns"].items():
-            for s in fn["body"]:
-                if s["k"] == "expr":
-                    def visit(node):
-                        if node.get("k") == "call" and node["name"] in (
-                                "result_unwrap", "option_unwrap"):
-                            self._warn("L005", node.get("line", 0),
-                                       "explicit unwrap without prior is_ok/is_some check")
-                    walk_expr(s["e"], visit)
+            for e in all_exprs_in_stmts(fn["body"]):
+                def visit(node):
+                    if node.get("k") == "call" and node["name"] in (
+                            "result_unwrap", "option_unwrap"):
+                        self._warn("L005", node.get("line", 0),
+                                   "explicit unwrap without prior is_ok/is_some check")
+                walk_expr(e, visit)
 
     def _rule_l006(self):
         """Unnecessary-effects: function declares `uses` but body is pure."""
@@ -298,12 +314,26 @@ class Linter:
     def _rule_l007(self):
         """Dead-code-after-return: statements after `return` are unreachable."""
         for fname, fn in self.program["fns"].items():
-            for i, s in enumerate(fn["body"]):
-                if s["k"] == "return":
-                    if i < len(fn["body"]) - 1:
-                        nxt = fn["body"][i + 1]
-                        self._warn("L007", nxt.get("line", 0),
-                                   "statement after `return` is unreachable")
+            self._check_dead_after_return(fn["body"], fname)
+
+    def _check_dead_after_return(self, stmts, fname):
+        seen_return = False
+        for s in stmts:
+            if seen_return:
+                self._warn("L007", s.get("line", 0),
+                           "statement after `return` is unreachable")
+            if s["k"] == "return":
+                seen_return = True
+            # Recurse into nested scopes (the return inside an if-branch
+            # only kills code AFTER the if, not inside it).
+            if s["k"] == "if":
+                self._check_dead_after_return(s["then"], fname)
+                if s.get("els"):
+                    self._check_dead_after_return(s["els"], fname)
+            elif s["k"] == "while":
+                self._check_dead_after_return(s["body"], fname)
+            elif s["k"] == "for":
+                self._check_dead_after_return(s["body"], fname)
 
     def _rule_l008(self):
         """Long-function: function body exceeds 80 statements."""
@@ -318,46 +348,50 @@ class Linter:
                            % (fname, count[0]))
 
     def _rule_l009(self):
-        """Shadowing: a `let` binding shadows an outer binding."""
-        # Track bindings as we descend into scopes.
-        for fname, fn in self.program["fns"].items():
-            outer = set(p[0] for p in fn["params"])
-            self._check_shadowing(fn["body"], outer, fname)
+        """Shadowing: a `let` binding shadows an outer binding.
 
-    def _check_shadowing(self, stmts, bindings, fname):
-        local = set(bindings)
-        for s in stmts:
-            if s["k"] == "let":
-                if s["name"] in local:
-                    self._warn("L009", s.get("line", 0),
-                               "let binding '%s' shadows an outer binding" % s["name"])
-                local.add(s["name"])
-            elif s["k"] == "for":
-                if s["var"] in local:
-                    self._warn("L009", s.get("line", 0),
-                               "for-loop variable '%s' shadows an outer binding" % s["var"])
-                local.add(s["var"])
-                self._check_shadowing(s["body"], local, fname)
-            elif s["k"] == "if":
-                self._check_shadowing(s["then"], local, fname)
-                if s.get("els"):
-                    self._check_shadowing(s["els"], local, fname)
-            elif s["k"] == "while":
-                self._check_shadowing(s["body"], local, fname)
+        NOTE: the Stage-0 checker already rejects shadowing as a compile
+        error, so this rule never fires for valid programs. It's kept
+        for documentation and as a placeholder for a future "warning
+        before error" mode.
+        """
+        # No-op: the checker rejects shadowing before the linter runs.
+        pass
 
     def _rule_l010(self):
-        """Empty-impl: an impl block has no methods."""
-        # We don't have impl blocks in the AST directly; methods are
-        # registered as "Struct.method" in the fns dict. We can't easily
-        # detect empty impls without parser changes. For the alpha, we
-        # skip this rule.
+        """Empty-impl: an `impl` block has no methods.
+
+        NOTE: the parser already rejects empty impl blocks (they require
+        at least one `fn`), so this rule never fires for valid programs.
+        Kept for documentation.
+        """
+        # No-op: parser rejects empty impls.
         pass
+
+
+def walk_stmts_collected(stmts):
+    """Yield each statement in a flat sequence (recursively into nested
+    scopes). Used by rules that need to inspect every statement."""
+    for s in stmts:
+        yield s
+        if s["k"] == "if":
+            for sub in walk_stmts_collected(s["then"]):
+                yield sub
+            if s.get("els"):
+                for sub in walk_stmts_collected(s["els"]):
+                    yield sub
+        elif s["k"] == "while":
+            for sub in walk_stmts_collected(s["body"]):
+                yield sub
+        elif s["k"] == "for":
+            for sub in walk_stmts_collected(s["body"]):
+                yield sub
 
 
 def main():
     parser = argparse.ArgumentParser(
         prog="hllint",
-        description="Hieu Louis linter (Stage 14-alpha).")
+        description="Hieu Louis linter (Stage 14).")
     parser.add_argument("file", nargs="?", help="HLS source file to lint.")
     parser.add_argument("--strict", action="store_true",
                         help="Exit non-zero if any warnings are emitted.")

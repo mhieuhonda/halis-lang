@@ -1,25 +1,34 @@
-# Hieu Louis language specification (HLS) — v0.8.0-alpha
+# Hieu Louis language specification (HLS) — v0.13.0-alpha
 
 > **Hieu Louis** is a high-security, native-compiled programming language
 > designed around the philosophy: **safety by default, explicitness for
-> auditability, performance via AOT compilation**. Version v0.8.0-alpha
-> extends the Stage 10 taint tracking model with a second taint source
-> (`read_file_tainted`), extended `--audit` taint-flow reporting, and
-> new pure-query helpers on `tainted[str]` (taint_check_byte_at,
-> taint_concat, taint_concat_clean). Version v0.7.0-alpha introduces
-> the **Stage 10-alpha taint tracking** model on top of the Stage 9
-> fine-grained effects & capabilities system: a new built-in generic
-> type `tainted[T]` lets the compiler statically reject passing tainted
-> values to sinks (print, file I/O, exit) — the user must sanitise first
-> via `std.sanitize`. Version v0.5.0-alpha introduced the **fine-grained
-> effects & capabilities** model: a single `IO` effect split into five
-> capabilities (`IO`, `Fs`, `Clock`, `Args`, `Exit`) individually
-> declared and statically verified through the call graph. `uses IO`
-> remains as a backwards-compatible blanket alias for the entire IO
-> family. Version v0.6.0-alpha added the explicit `pure` keyword and
-> the `--audit` flag (Stage 9-beta). Every operation is still checked,
-> every effect is statically tracked, no null, no undefined behaviour,
-> and use-after-move is a compile error (Stage 8-alpha).
+> auditability, performance via AOT compilation**. Version v0.13.0-alpha
+> adds **Stage 15-alpha: Safe C FFI** — a new `extern "C" { ... }` block
+> declares external C functions, with the interpreter dispatching via
+> ctypes. Version v0.12.0-alpha added **Stage 14-alpha: developer
+> tooling** (hls-lsp language server, hlfmt formatter, hllint linter).
+> Version v0.11.0-alpha added **Stage 13-alpha: the hls-pkg package
+> manager** with content-addressed dependencies and effect enforcement.
+> Version v0.10.0-alpha added **Stage 12-alpha: the LLVM IR text backend**.
+> Version v0.9.0-alpha added **Stage 11-alpha: the HLIR (SSA-style IR)
+> and optimiser pipeline** (constant folding, copy propagation, DCE).
+> Version v0.8.0-alpha extends the Stage 10 taint tracking model with a
+> second taint source (`read_file_tainted`), extended `--audit` taint-flow
+> reporting, and new pure-query helpers on `tainted[str]`
+> (taint_check_byte_at, taint_concat, taint_concat_clean). Version
+> v0.7.0-alpha introduces the **Stage 10-alpha taint tracking** model on
+> top of the Stage 9 fine-grained effects & capabilities system: a new
+> built-in generic type `tainted[T]` lets the compiler statically reject
+> passing tainted values to sinks (print, file I/O, exit) — the user must
+> sanitise first via `std.sanitize`. Version v0.5.0-alpha introduced the
+> **fine-grained effects & capabilities** model: a single `IO` effect
+> split into five capabilities (`IO`, `Fs`, `Clock`, `Args`, `Exit`)
+> individually declared and statically verified through the call graph.
+> `uses IO` remains as a backwards-compatible blanket alias for the
+> entire IO family. Version v0.6.0-alpha added the explicit `pure`
+> keyword and the `--audit` flag (Stage 9-beta). Every operation is still
+> checked, every effect is statically tracked, no null, no undefined
+> behaviour, and use-after-move is a compile error (Stage 8-alpha).
 
 - Source files: `*.hls`
 - Self-hosted compiler: `src/hlc.hls` (HLS → C → native)
@@ -351,6 +360,10 @@ Operands:
 | `drop(x: T)` | `void` | — | (Stage 8-alpha) release ownership of `x`; `x` becomes moved |
 | `clone(x: T)` | `T` | — | (Stage 8-alpha) return an independent deep copy of `x` |
 | `take(x: T)` | `T` | — | (Stage 8-alpha) move `x`'s value out; `x` becomes moved |
+| `tainted_args()` | `list[tainted[str]]` | Args | (Stage 10-alpha) argv, wrapped as tainted |
+| `taint_mark(x: T)` | `tainted[T]` | — | (Stage 10-alpha) wrap any value as tainted |
+| `taint_unwrap(x: tainted[T])` | `T` | — | (Stage 10-alpha) explicit untaint (escape hatch) |
+| `read_file_tainted(path: str)` | `tainted[str]` | Fs | (Stage 10-beta) read file; result is tainted |
 
 `int(s)`: allows a leading minus sign, only accepts digits 0–9, value must
 fit in int64 range, otherwise panics with "cannot convert string to int".
@@ -1055,4 +1068,211 @@ input and which functions reach sinks.
 - Taint sources beyond argv and file content (e.g. `read_line` if added,
   HTTP request body if added) — currently only argv and read_file_tainted
   are taint sources.
+
+## 20. HLIR — Hieu Louis Intermediate Representation (Stage 11-alpha — v0.9.0-alpha)
+
+The mid-level IR is built from the AST (post-type-check) and fed to an
+optimiser pipeline. It is a *light* SSA form: HLS already disallows
+shadowing and uninitialised variables, so every binding has exactly one
+definition point at the source level — the IR inherits "implicit SSA"
+for free.
+
+### 20.1. IR structure
+
+- `Instr` — a single instruction with `dest` (SSA name or None), `op`,
+  `args` (operands), `line`, `attrs`.
+- `Block` — a linear sequence of `Instr`s ending in a terminator
+  (branch / jump / return / panic).
+- `HLIRFunction` — params, return type, effects, blocks.
+- `HLIRModule` — functions.
+
+### 20.2. Op codes
+
+`const`, `binop`, `unop`, `call`, `method`, `builtin`, `load`, `store`,
+`list_new`, `list_get`, `list_set`, `list_len`, `map_new`, `map_get`,
+`map_set`, `struct_new`, `struct_get`, `struct_set`, `branch`, `jump`,
+`return`, `panic`, `match`, `qmark`.
+
+### 20.3. Optimiser pipeline
+
+1. `constant_fold` — fold literal arithmetic and string concatenation.
+   Tracks constants propagated through `OP_LOAD` (the IR's `let` lowering).
+   Respects `OP_STORE` mutations.
+2. `copy_propagate` — replace `%t1 = %t0` uses with `%t0`.
+3. `dead_code_elim` — remove instructions whose result is never used and
+   that have no side effects.
+
+### 20.4. `-O fast` mode
+
+Annotates provably-safe binops (e.g. `a + 0`, `a * 0`) with
+`attrs["safe_overflow"] = True` so the codegen can skip the C-level
+overflow check. Today the codegen ignores this annotation; consuming
+it is the Stage 11 release target.
+
+### 20.5. CLI flags
+
+- `boot.py --emit ir FILE.hls` — print the HLIR of every function.
+- `boot.py --opt-stats FILE.hls` — run the optimiser, print per-pass
+  statistics (instructions before / after / removed, per function and
+  total).
+
+## 21. LLVM IR text backend (Stage 12-alpha — v0.10.0-alpha)
+
+A separate backend that emits LLVM IR text (`.ll`) from a checked HLS
+program. The IR can be assembled by `llc` or `clang` (when available)
+into a native binary. The C backend remains the primary codegen path;
+the LLVM backend is a parallel infrastructure.
+
+### 21.1. Type mapping
+
+| HLS type | LLVM type |
+|----------|-----------|
+| `int` | `i64` |
+| `float` | `double` |
+| `bool` | `i1` |
+| `str` | `ptr` (pointer to `%hl_str`) |
+| `void` | `void` |
+| `list[T]`, `map[str,T]`, `struct`, `enum`, `tainted[T]` | `ptr` (opaque) |
+
+### 21.2. Arithmetic
+
+Integer arithmetic uses `llvm.sadd/ssub/smul.with.overflow.i64` with
+explicit overflow-path branches to `hl_die`. Division by zero is checked
+before `sdiv`/`srem`. Float arithmetic uses `fadd`/`fsub`/`fmul`/`fdiv`/
+`frem` (no overflow check needed).
+
+### 21.3. CLI flags
+
+- `boot.py --emit llvm FILE.hls` — print the LLVM IR of the program.
+- `--target TRIPLE` — set the LLVM target triple (e.g. `aarch64-linux`).
+
+### 21.4. Limitations (Stage 12 release targets)
+
+- Full method dispatch (today method calls are emitted as opaque calls
+  to `hl_method_<name>`).
+- Full struct/enum/list/map lowering with typed field access.
+- Match expression lowering (today `match` falls through to a runtime
+  dispatch).
+- Stack probes for deep recursion.
+- PGO (profile-guided optimisation).
+- Verify the IR text assembles correctly via `llc`/`clang`.
+- Thrice-clean bootstrap: HLS→LLVM→native→self-compile.
+
+## 22. Package manager `hls-pkg` (Stage 13-alpha — v0.11.0-alpha)
+
+A content-addressed package manager CLI with the full manifest →
+lockfile → audit → build cycle. Dependencies are verified by SHA-256 of
+resolved file content, and the package's declared `effects.allowed`
+surface is enforced: if any dependency's computed effects are not in the
+allowed set, the lock fails.
+
+### 22.1. Commands
+
+- `hls-pkg init NAME` — create a new package skeleton.
+- `hls-pkg add NAME GIT PATH [--tag T | --branch B]` — add a git dep.
+- `hls-pkg lock` — resolve deps, compute SHA-256, write `hls-pkg.lock`.
+- `hls-pkg audit` — print the total effect report of the dep tree.
+- `hls-pkg verify` — verify lockfile SHA-256 hashes still match.
+- `hls-pkg build [--entry main.hls]` — compile the package.
+
+### 22.2. Manifest format (`hls-pkg.toml`)
+
+```toml
+[package]
+name = "mylib"
+version = "0.1.0"
+
+[dependencies]
+std.str = { git = "https://github.com/.../hieu-louis-lang.git", path = "std/str.hls" }
+
+[effects]
+allowed = []   # empty = pure library
+```
+
+### 22.3. Lockfile format (`hls-pkg.lock`, JSON)
+
+Records per-package: `name`, `source`, `sha256`, `effects`,
+`transitive_effects`, `resolved_path`.
+
+## 23. Developer tooling (Stage 14-alpha — v0.12.0-alpha)
+
+Three tools provide the core developer experience:
+
+### 23.1. `hlfmt` — opinionated formatter
+
+- 4-space indentation; no tabs.
+- One statement per line.
+- Single space after commas, colons, around binary operators.
+- **Idempotent: running twice = running once.**
+- Subcommands: `hlfmt FILE` (print), `hlfmt -w FILE` (write),
+  `hlfmt -c FILE` (check), `hlfmt -d FILE` (diff).
+- Limitation: strips `#` comments (the HLS lexer treats them as
+  whitespace). Comment preservation is a Stage 14 release target.
+
+### 23.2. `hllint` — safety rules linter
+
+10 rules: `L001` unused-binding, `L002` unused-function,
+`L003` unused-struct-field, `L004` ignored-result,
+`L005` explicit-unwrap, `L006` unnecessary-effects,
+`L007` dead-code-after-return, `L008` long-function,
+`L009` shadowing, `L010` empty-impl.
+
+Subcommands: `hllint FILE`, `hllint --strict FILE`,
+`hllint --rule L001 FILE`, `hllint --list`.
+
+### 23.3. `hls-lsp` — language server
+
+Minimal LSP server over JSON-RPC stdio:
+- `initialize` / `shutdown` / `exit`.
+- `textDocument/didOpen` / `didChange` / `didClose`.
+- `textDocument/hover` — show the inferred type of an identifier.
+- `textDocument/definition` — find the function/struct/enum definition.
+- `textDocument/completion` — keyword + identifier completion.
+- `textDocument/publishDiagnostics` — runs the checker, publishes errors.
+- `--check FILE` one-shot mode prints diagnostics to stdout.
+
+## 24. Safe C FFI (Stage 15-alpha — v0.13.0-alpha)
+
+A new `extern "C" { ... }` block declares external C functions. The
+checker enforces that every extern fn declares `uses IO` (or `pure`) —
+the safe default for FFI is to assume side effects. The interpreter
+calls the C function via ctypes.
+
+### 24.1. Syntax
+
+```hls
+extern "C" {
+    fn abs(n: int) -> int pure
+    fn strlen(s: str) -> int uses IO
+}
+```
+
+### 24.2. Type mapping (interpreter)
+
+| HLS type | ctypes |
+|----------|--------|
+| `int` | `c_int64` |
+| `float` | `c_double` |
+| `bool` | `c_bool` |
+| `str` | `c_char_p` (null-terminated; caller must ensure no embedded NULs) |
+| `void` | no return |
+| other | `c_void_p` (opaque pointer) |
+
+### 24.3. `hlbindgen` — C header → HLS extern generator
+
+Parses simple C function declarations (`int foo(char* s, long n);`),
+maps C types to HLS types, emits an `extern "C" { ... }` block with
+`uses IO` on every function (safe default).
+
+### 24.4. Limitations (Stage 15 release targets)
+
+- `extern` is not yet supported in the self-hosted `hlc.hls` (only
+  `boot/` supports it).
+- C codegen for extern fns (forward declarations) is not implemented.
+- Ownership rules across the FFI boundary are not enforced.
+- `bindgen` improvements: struct/enum generation, macro expansion,
+  `#include` resolution, `const`/`volatile` qualifiers.
+- ABI-compatibility checking header.
+- Re-implement `hlbindgen` in HLS itself.
+
 

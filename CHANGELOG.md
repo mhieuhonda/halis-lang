@@ -8,7 +8,114 @@ Releases on `main` follow the 20-stage roadmap (see [ROADMAP.md](ROADMAP.md)).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
-## [unreleased] — Stage 15-alpha (v0.13.0-alpha)
+## [unreleased] — Stage 15-beta (v0.14.0-alpha)
+
+### Fixed — deep codebase scan & bug fixes
+- **tools/llvm_emit.py**: major rewrite for type-correctness.
+  - Track LLVM type per local slot (was hardcoded to `i64`, causing
+    type mismatches for `str`/`list`/`map`/`struct`/`enum` locals).
+  - Reset all emitter state in `emit()` (was leaving `_tmp`, `_label`,
+    `_ov_counter`, `_str_counter`, `_locals`, `_loop_stack` stale
+    between calls).
+  - Reset `_block_terminated_flag` after each basic block (was never
+    reset, causing all blocks after the first `break`/`continue` to be
+    considered terminated — silently dropping code).
+  - Add `_to_i1` coercion for branch conditions (was passing `i64`
+    to `br i1`, which LLVM rejects).
+  - Add lowering for `match`, `qmark`, `mapnew`, `enumlit` (were
+    falling through to `return "0"`).
+  - Add type coercions for call arguments (int↔ptr, i1↔i64).
+  - Add missing runtime declarations (`hl_range`, `hl_args_get`,
+    `hl_tainted_args`, `hl_taint_mark`, `hl_taint_unwrap`,
+    `hl_read_file_tainted`, `hl_drop`, `hl_clone`, `hl_take`).
+  - Remove dead `emit()` method (replaced by `emit_final`, now renamed
+    `emit`).
+  - Remove dead `float_to_ieee_bits` function (was never called due
+    to `if False else` short-circuit).
+  - Remove dead class-level `_str_counter = 0` and `_ov_counter = 0`
+    (shadowed by instance attributes).
+  - Remove redundant identical method-key lookup in `_lower_call`.
+- **tools/hllint.py**: major correctness fixes.
+  - Implement `_rule_l003` (unused-struct-field) — was declared in
+    RULES but the method was missing.
+  - Fix `_rule_l001` (unused-binding): the `visit` closure was defined
+    inside the loop but only used in a second incomplete loop. Rewrote
+    with `all_exprs_in_stmts` helper that walks every expression
+    recursively.
+  - Fix `_rule_l002` (unused-function): same closure bug; rewrote
+    with `all_exprs_in_stmts` + `collect_calls`.
+  - Fix `_rule_l004` (ignored-result): only checked top-level `expr`
+    statements; now walks recursively.
+  - Fix `_rule_l005` (explicit-unwrap): only checked `expr` statements;
+    now walks all expressions recursively.
+  - Fix `_rule_l007` (dead-code-after-return): only flagged the single
+    statement immediately after `return`; now flags ALL subsequent
+    statements and recurses into nested scopes.
+  - Document `_rule_l009` (shadowing) and `_rule_l010` (empty-impl) as
+    no-ops (the checker/parser already reject these as compile errors).
+- **tools/hls-lsp.py**: fix URI handling.
+  - `_ident_at` and `handle_completion` were using the FIRST document
+    in `self.docs` instead of the document matching the request URI.
+    This meant hover/completion/definition returned wrong results when
+    multiple documents were open. Now uses the URI from the request
+    params.
+  - Fix `BUILTINS` list: removed `float`, `bool` (types, not builtins),
+    `list_new`, `ord` (don't exist as HLS builtins). Added `extern`
+    to KEYWORDS.
+- **tools/hlfmt.py**: remove dead `;` from `NO_SPACE_BEFORE` and
+  `SPACE_AFTER_SYMS` (HLS does not have a `;` token).
+- **tools/hlbindgen.py**: fix version string (was "v0.12.0-alpha",
+  should be "v0.13.0-alpha" — Stage 15).
+- **boot/checker.py**: remove redundant `want if want is not None else
+  None` expression in `argt` (was a no-op).
+- **src/hlc.hls**: remove dead code.
+  - Remove `resolve_enum` (defined but never called — 13 lines).
+  - Remove `effects_to_str` (defined but never called — superseded by
+    `fmt_effects`).
+  - Remove `gen_enum_lines` (defined but never called — superseded by
+    `gen_enum_lines_simple`).
+  - Remove unused `let t0` in `parse_impl` (was captured but never
+    used).
+  - Remove unused `let result_type` in `check_enum_variant`.
+  - Remove unused `let c_type` in `gen_match_expr` and `gen_qmark_expr`
+    (the actual usage re-computes `c_type(ctx, ...)` inline).
+  - Remove unused `let method_tps` and `let method_targs` in
+    `gen_fn_inst_lines` (the body uses `combined_tps` / `targs` directly).
+- **Makefile**: fix `examples` target.
+  - `taint_beta_demo.hls` was listed in the main for-loop (which runs
+    it WITHOUT the required data-file argument), causing the loop to
+    fail and the subsequent dedicated runs (wordcount, taint_beta_demo
+    with data file) to never execute. Removed it from the for-loop;
+    the dedicated line now runs correctly.
+  - Added `ffi_demo.hls`, `optimize_demo.hls`, `llvm_demo.hls`,
+    `tooling_demo.hls`, `pkg_demo.hls` to the for-loop (were missing).
+  - Added `|| exit 1` to the for-loop body so a failing example
+    aborts the target (was silently continuing).
+- **.github/workflows/ci.yml**: add CI steps for Stage 11-15 tooling.
+  - Test `--emit ir`, `--opt-stats` (Stage 11).
+  - Test `--emit llvm` (Stage 12).
+  - Test `hlfmt`, `hllint`, `hls-lsp` (Stage 14).
+  - Test `hls-pkg` (Stage 13).
+  - Test `hlbindgen` (Stage 15).
+  - Include all examples (was missing ffi/optimize/llvm/tooling/pkg).
+- **.github/workflows/release.yml**: update test count (143 → 145).
+- **Root directory**: remove empty `...` file (accidental creation,
+  likely from a misformed shell redirect).
+- **SPEC.md**: update version header to v0.13.0-alpha. Add Stage 10
+  taint builtins to section 8 (were missing). Add sections 20-24
+  covering Stages 11-15 (HLIR, LLVM backend, package manager, developer
+  tooling, FFI).
+- **README.md**: update version reference (v0.8.0-alpha → v0.13.0-alpha).
+
+### Notes
+- All 145 tests still PASS after the fixes.
+- Bootstrap remains DETERMINISTIC (two self-compile passes produce
+  byte-identical C output).
+- The LLVM IR emitter now produces type-correct IR for string, list,
+  map, struct, and enum types (was previously producing invalid IR
+  with `i64` / `ptr` type mismatches).
+
+## [v0.13.0-alpha] — Stage 15-alpha: Safe C FFI
 
 ### Added
 - **Stage 15-alpha: Safe C FFI.** A new `extern "C" { ... }` block

@@ -1027,7 +1027,7 @@ class Checker:
                 self.err("%s expects %d arguments, got %d" % (name, n, len(args)), e)
 
         def argt(i, want):
-            at = self.check_expr(args[i], env, want if want is not None else None)
+            at = self.check_expr(args[i], env, want)
             if at == "never":
                 self.err("never value cannot be used as an argument", e)
             if want is not None and at != want:

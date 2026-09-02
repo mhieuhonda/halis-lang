@@ -85,14 +85,18 @@ lsp-check:
 examples:
 	@# Most examples exit 0; secure_demo.hls deliberately panics on
 	@# integer overflow to demonstrate safe-panic semantics (exit 101).
+	@# NOTE: taint_beta_demo.hls and wordcount.hls need a data-file
+	@# argument and are run separately below.
 	@for f in examples/hello.hls examples/fibonacci.hls examples/primes.hls \
 		  examples/enum_demo.hls examples/option_demo.hls examples/result_demo.hls \
 		  examples/ownership_demo.hls examples/effects_demo.hls \
 		  examples/hex_demo.hls examples/base64_demo.hls examples/crypto_demo.hls \
 		  examples/csv_demo.hls examples/list_demo.hls examples/time_demo.hls \
 		  examples/uuid_demo.hls examples/web_demo.hls examples/stdlib_demo.hls \
-		  examples/taint_demo.hls examples/taint_beta_demo.hls; do \
-		echo "--- $$f"; $(PYTHON) boot/boot.py $$f; \
+		  examples/taint_demo.hls examples/ffi_demo.hls \
+		  examples/optimize_demo.hls examples/llvm_demo.hls \
+		  examples/tooling_demo.hls examples/pkg_demo.hls; do \
+		echo "--- $$f"; $(PYTHON) boot/boot.py $$f || exit 1; \
 	done
 	@echo "--- examples/secure_demo.hls (deliberately panics on overflow)"
 	@rc=0; $(PYTHON) boot/boot.py examples/secure_demo.hls || rc=$$?; \

@@ -39,7 +39,8 @@ SYM = "sym"
 STR = "str"
 
 # Tokens that should NOT have a space before them when on the same line.
-NO_SPACE_BEFORE = {"(", "[", ".", ",", ")", "]", "?", ":", ";"}
+# (HLS does not have a `;` token, so it's omitted here.)
+NO_SPACE_BEFORE = {"(", "[", ".", ",", ")", "]", "?", ":"}
 
 # Tokens that should NOT have a space after them.
 NO_SPACE_AFTER = {"(", "[", ".", "!", "?"}
@@ -50,7 +51,8 @@ NO_SPACE_AFTER = {"(", "[", ".", "!", "?"}
 WORD_KINDS = {"kw", "ident", "int", "float", "str"}
 
 # Tokens that should have a space AFTER them (binary operators etc.).
-SPACE_AFTER_SYMS = {",", ";", ":", "=", "==", "!=", "<=", ">=", "->", "=>",
+# (HLS does not have a `;` token, so it's omitted here.)
+SPACE_AFTER_SYMS = {",", ":", "=", "==", "!=", "<=", ">=", "->", "=>",
                     "+", "-", "*", "/", "%", "<", ">", "&&", "||"}
 
 # Tokens that should have a space BEFORE them when on the same line.

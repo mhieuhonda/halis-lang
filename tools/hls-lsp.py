@@ -77,10 +77,11 @@ def write_message(msg):
 
 KEYWORDS = ["fn", "let", "mut", "return", "if", "else", "while", "for", "in",
             "break", "continue", "struct", "impl", "import", "uses", "true",
-            "false", "enum", "match", "pure"]
-BUILTINS = ["println", "print", "len", "str", "int", "float", "bool", "panic",
-            "clock_ms", "args", "exit", "chr", "ord", "range", "map_new",
-            "list_new", "drop", "clone", "take", "file_exists", "read_file",
+            "false", "enum", "match", "pure", "extern"]
+# Only actual HLS builtin functions (see boot/checker.py BUILTIN_FNS).
+BUILTINS = ["println", "print", "len", "str", "int", "panic",
+            "clock_ms", "args", "exit", "chr", "range", "map_new",
+            "drop", "clone", "take", "file_exists", "read_file",
             "write_file", "tainted_args", "taint_mark", "taint_unwrap",
             "read_file_tainted"]
 EFFECTS = ["IO", "Fs", "Clock", "Args", "Exit"]
@@ -238,7 +239,7 @@ class HLSServer:
         # Find the identifier at the given position by walking the AST.
         # Each token has line/col info; we look for an `ident` or `kw`
         # token at the given position.
-        ident_name = self._ident_at(prog, line, col)
+        ident_name = self._ident_at(prog, line, col, uri=uri)
         if ident_name is None:
             self.send_response(msg_id, None)
             return
@@ -251,12 +252,19 @@ class HLSServer:
             "contents": {"kind": "markdown", "value": hover_text}
         })
 
-    def _ident_at(self, prog, line, col):
-        """Re-tokenise the source and find the identifier at the given position."""
+    def _ident_at(self, prog, line, col, uri=None):
+        """Re-tokenise the source and find the identifier at the given position.
+
+        If `uri` is given, use that document; otherwise fall back to the
+        first available document (best-effort for legacy callers).
+        """
         doc = None
-        for uri, d in self.docs.items():
-            doc = d
-            break
+        if uri is not None and uri in self.docs:
+            doc = self.docs[uri]
+        else:
+            for u, d in self.docs.items():
+                doc = d
+                break
         if not doc:
             return None
         try:
@@ -266,7 +274,8 @@ class HLSServer:
         for t in toks:
             if t["k"] == "eof":
                 break
-            if t["line"] == line and t["col"] <= col < t["col"] + len(str(t["v"])):
+            tlen = len(str(t["v"])) if not isinstance(t["v"], bytes) else len(t["v"])
+            if t["line"] == line and t["col"] <= col < t["col"] + tlen:
                 if t["k"] in ("ident", "kw"):
                     return t["v"]
         return None
@@ -304,7 +313,7 @@ class HLSServer:
             self.send_response(msg_id, None)
             return
         prog = doc["program"]
-        ident_name = self._ident_at(prog, line, col)
+        ident_name = self._ident_at(prog, line, col, uri=uri)
         if ident_name is None:
             self.send_response(msg_id, None)
             return
@@ -356,11 +365,15 @@ class HLSServer:
         for kw in KEYWORDS + BUILTINS + EFFECTS:
             items.append({"label": kw, "kind": 14})  # 14 = Keyword
             seen.add(kw)
-        # Add identifiers from the program.
-        doc = None
-        for uri, d in self.docs.items():
-            doc = d
-            break
+        # Add identifiers from the program matching the requested URI.
+        td = params.get("textDocument", {})
+        uri = td.get("uri")
+        doc = self.docs.get(uri) if uri else None
+        if doc is None:
+            # Fall back to the first available document.
+            for u, d in self.docs.items():
+                doc = d
+                break
         if doc and doc.get("program") is not None:
             prog = doc["program"]
             for fname in prog["fns"]:
