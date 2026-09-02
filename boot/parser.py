@@ -233,11 +233,22 @@ class Parser:
         if self.at_sym("->"):
             self.next()
             ret = self.parse_type(allow_void=True)
+        # Stage 9-beta: explicit `pure` keyword for documentation/linting.
+        # A function declared `pure` must have NO `uses` clause, and the
+        # checker will reject it if its body transitively calls anything
+        # effectful. `pure` and `uses` are mutually exclusive.
+        is_pure = False
+        if self.at_kw("pure"):
+            self.next()
+            is_pure = True
         # Stage 9-alpha: fine-grained effects. `uses IO` is a blanket alias
         # for the entire IO family (expanded at parse time). Other recognized
         # effects: Fs, Clock, Args, Exit. Reserved: Net, Rand, Proc.
         effects = set()
         if self.at_kw("uses"):
+            if is_pure:
+                self.err("'pure' and 'uses' are mutually exclusive (a pure "
+                         "function declares no effects)", t0)
             self.next()
             while True:
                 tok = self.eat_ident()
@@ -261,7 +272,7 @@ class Parser:
         body = self.parse_block()
         return {
             "name": name, "typeparams": typeparams, "params": params, "ret": ret,
-            "effects": effects, "body": body, "line": t0["line"],
+            "effects": effects, "pure": is_pure, "body": body, "line": t0["line"],
             "struct": impl_struct,
         }
 

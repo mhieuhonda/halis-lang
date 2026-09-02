@@ -61,6 +61,7 @@ struct FnInfo {
     pmuts: list[bool],
     ret: str,
     effects: list[str],   # Stage 9-alpha: declared effects (IO is expanded at parse time to IO+Fs+Clock+Args+Exit)
+    is_pure: bool,           # Stage 9-beta: explicit `pure` keyword — function declares no effects AND transitively calls none
     body: list[int],
     is_method: bool,
     struct_of: str,
@@ -146,7 +147,8 @@ struct Ctx {
     cur_targs: list[str],
     fn_insts: list[str],
     struct_insts: list[str],
-    enum_insts: list[str]
+    enum_insts: list[str],
+    computed_effects: map[str, list[str]]   # Stage 9-beta: per-function computed effect set, populated by check_effects
 }
 
 fn new_ctx(src: str) -> Ctx {
@@ -161,7 +163,8 @@ fn new_ctx(src: str) -> Ctx {
         imports: [], loaded_files: [],
         entry_dir: "", repo_root: "",
         cur_fn_ret: "void", cur_typeparams: [], cur_targs: [],
-        fn_insts: [], struct_insts: [], enum_insts: []
+        fn_insts: [], struct_insts: [], enum_insts: [],
+        computed_effects: map_new()
     }
 }
 
@@ -185,7 +188,7 @@ fn is_keyword(w: str) -> bool {
         || w == "else" || w == "while" || w == "for" || w == "in"
         || w == "break" || w == "continue" || w == "struct" || w == "impl"
         || w == "import" || w == "uses" || w == "true" || w == "false"
-        || w == "enum" || w == "match"
+        || w == "enum" || w == "match" || w == "pure"
 }
 
 fn is_ident_start(c: int) -> bool {
@@ -889,11 +892,22 @@ fn parse_fn(ctx: Ctx, impl_struct: str) -> FnInfo {
         ctx.pos = ctx.pos + 1
         ret = parse_type(ctx, true)
     }
+    # Stage 9-beta: explicit `pure` keyword for documentation/linting.
+    # `pure` and `uses` are mutually exclusive. The checker enforces that
+    # a `pure` function's body transitively calls nothing effectful.
+    let mut is_pure: bool = false
+    if at_kw(ctx, "pure") {
+        ctx.pos = ctx.pos + 1
+        is_pure = true
+    }
     # Stage 9-alpha: fine-grained effects. `uses IO` is a blanket alias
     # for the entire IO family (expanded at parse time). Other recognized
     # effects: Fs, Clock, Args, Exit. Reserved: Net, Rand, Proc.
     let mut effects: list[str] = []
     if at_kw(ctx, "uses") {
+        if is_pure {
+            perr(ctx, "'pure' and 'uses' are mutually exclusive (a pure function declares no effects)")
+        }
         ctx.pos = ctx.pos + 1
         while true {
             let e: str = eat_ident(ctx)
@@ -928,7 +942,7 @@ fn parse_fn(ctx: Ctx, impl_struct: str) -> FnInfo {
     let body: list[int] = parse_block(ctx)
     return FnInfo {
         name: name, params: params, ptypes: ptypes, pmuts: pmuts,
-        ret: ret, effects: effects, body: body,
+        ret: ret, effects: effects, is_pure: is_pure, body: body,
         is_method: impl_struct != "", struct_of: impl_struct,
         typeparams: typeparams, line: t0.line
     }
@@ -1957,7 +1971,7 @@ fn dummy_enum() -> EnumInfo {
 fn dummy_fn() -> FnInfo {
     return FnInfo {
         name: "", params: [], ptypes: [], pmuts: [], ret: "void",
-        effects: [], body: [], is_method: false, struct_of: "",
+        effects: [], is_pure: false, body: [], is_method: false, struct_of: "",
         typeparams: [], line: 0
     }
 }
@@ -3351,12 +3365,58 @@ fn check_effects(ctx: Ctx) -> void {
         }
     }
 
+    # Stage 9-beta: publish the computed effect set per function so an
+    # external auditor (hlc --audit) can print the capability tree.
+    let mut ic: int = 0
+    while ic < ctx.fn_order.len() {
+        let keyc: str = ctx.fn_order.get(ic)
+        ctx.computed_effects.set(keyc, eff.get_or(keyc, []))
+        ic = ic + 1
+    }
+
     # Capability check: declared ⊇ computed.
+    # Stage 9-beta: also enforce that a function declared `pure` transitively
+    # calls nothing effectful (its computed effect set must be empty).
     let mut i2: int = 0
     while i2 < ctx.fn_order.len() {
         let key2: str = ctx.fn_order.get(i2)
         let f: FnInfo = ctx.fns.get_or(key2, dummy_fn())
         let computed: list[str] = eff.get_or(key2, [])
+        # Stage 9-beta: `pure` enforcement — a `pure` function must have an
+        # empty computed effect set (no transitive effectful callees).
+        if f.is_pure && computed.len() > 0 {
+            # Find the first edge that contributes any effect.
+            let edges: list[str] = ctx.edges.get_or(key2, [])
+            let mut j2: int = 0
+            let mut found: bool = false
+            while j2 < edges.len() && !found {
+                let c: str = edges.get(j2)
+                let mut c_eff: list[str] = []
+                if c.starts_with("b:") {
+                    c_eff = builtin_effect(c.slice(2, c.len()))
+                } else {
+                    c_eff = eff.get_or(c, [])
+                }
+                if c_eff.len() > 0 {
+                    let mut nm: str = c
+                    if c.starts_with("b:") {
+                        nm = c.slice(2, c.len())
+                    }
+                    cerr(f.line,
+                        "function '" + f.name + "' is declared 'pure' but calls '" +
+                        nm + "' which requires effect '" + c_eff.get(0) +
+                        "' (declared pure but callee chain is not pure)")
+                    found = true
+                }
+                j2 = j2 + 1
+            }
+            if !found {
+                cerr(f.line,
+                    "function '" + f.name + "' is declared 'pure' but transitively " +
+                    "uses effects " + fmt_effects(computed) +
+                    " (declared pure but callee chain is not pure)")
+            }
+        }
         # Walk each effect in `computed`; if any is missing from f.effects,
         # find a witness edge and report.
         let mut ci: int = 0
@@ -5451,8 +5511,37 @@ fn load_file_into(ctx: Ctx, abs_path: str) -> void uses IO {
 
 fn main() -> int uses IO {
     let a: list[str] = args()
+    # Stage 9-beta: `hlc --audit <file.hls>` prints the capability tree.
+    if a.len() >= 2 && a.get(1) == "--audit" {
+        if a.len() < 3 {
+            println("usage: hlc --audit <input.hls>")
+            return 1
+        }
+        let entry_path: str = a.get(2)
+        let src: str = read_file(entry_path)
+        let ctx: Ctx = new_ctx(src)
+        ctx.entry_dir = dir_of(entry_path)
+        ctx.repo_root = parent_dir(ctx.entry_dir)
+        lex(ctx)
+        parse_program(ctx)
+        let entry_imports: list[str] = ctx.imports
+        let mut i: int = 0
+        while i < entry_imports.len() {
+            let imp: str = entry_imports.get(i)
+            let resolved: str = resolve_import_path(imp, ctx.entry_dir, ctx.repo_root)
+            if resolved == "" {
+                println("error: module not found: " + imp)
+                return 1
+            }
+            load_file_into(ctx, resolved)
+            i = i + 1
+        }
+        check_program(ctx)
+        print_audit(ctx)
+        return 0
+    }
     if a.len() < 3 {
-        println("usage: hlc <input.hls> <output.c | ->")
+        println("usage: hlc <input.hls> <output.c | ->  |  hlc --audit <input.hls>")
         return 1
     }
     let entry_path: str = a.get(1)
@@ -5487,6 +5576,74 @@ fn main() -> int uses IO {
         write_file(out_path, code)
     }
     return 0
+}
+
+# Stage 9-beta: print the capability / effect tree of every function.
+# Mirrors boot.py's --audit output. Reads ctx.computed_effects (populated
+# by check_effects) and the per-function declared effect list.
+fn print_audit(ctx: Ctx) -> void uses IO {
+    let keys: list[str] = ctx.fn_order
+    let mut i: int = 0
+    println("==============================================================================")
+    println("  function                       declared                       computed")
+    println("==============================================================================")
+    while i < keys.len() {
+        let key: str = keys.get(i)
+        let f: FnInfo = ctx.fns.get_or(key, dummy_fn())
+        let declared: list[str] = f.effects
+        let computed: list[str] = ctx.computed_effects.get_or(key, [])
+        let mut decl_disp: str = ""
+        if f.is_pure {
+            decl_disp = "pure"
+        }
+        let mut j: int = 0
+        while j < declared.len() {
+            if decl_disp != "" {
+                decl_disp = decl_disp + ", "
+            }
+            decl_disp = decl_disp + declared.get(j)
+            j = j + 1
+        }
+        if decl_disp == "" {
+            decl_disp = "(none — pure)"
+        }
+        let mut comp_disp: str = ""
+        let mut k: int = 0
+        while k < computed.len() {
+            if comp_disp != "" {
+                comp_disp = comp_disp + ", "
+            }
+            comp_disp = comp_disp + computed.get(k)
+            k = k + 1
+        }
+        if comp_disp == "" {
+            comp_disp = "(none)"
+        }
+        # Pad the function name to 30 chars for alignment.
+        let padded: str = pad_right(key, 30)
+        let padded_decl: str = pad_right(decl_disp, 30)
+        println("  " + padded + "  " + padded_decl + "  " + comp_disp)
+        i = i + 1
+    }
+    println("==============================================================================")
+    println("  Active effects:    IO, Fs, Clock, Args, Exit")
+    println("  Reserved effects:  Net, Rand, Proc  (error if used)")
+    println("  `uses IO` expands to: {IO, Fs, Clock, Args, Exit}")
+}
+
+# Right-pad a string with spaces to width `n`. Truncates if longer than n.
+fn pad_right(s: str, n: int) -> str pure {
+    let sl: int = s.len()
+    if sl >= n {
+        return s.slice(0, n)
+    }
+    let mut out: str = s
+    let mut i: int = 0
+    while i < n - sl {
+        out = out + " "
+        i = i + 1
+    }
+    return out
 }
 
 # --- END ---

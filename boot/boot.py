@@ -127,11 +127,19 @@ def load_program(entry_path):
 def run_cli():
     args = sys.argv[1:]
     check_only = False
+    audit_only = False
     if "--check" in args:
         check_only = True
         args.remove("--check")
+    if "--audit" in args:
+        audit_only = True
+        args.remove("--audit")
     if not args:
-        sys.stderr.write("usage: boot.py [--check] <file.hls> [program args...]\n")
+        sys.stderr.write(
+            "usage: boot.py [--check | --audit] <file.hls> [program args...]\n"
+            "  --check    type-check + effects-check only, no execution.\n"
+            "  --audit    print the capability / effect tree of every function.\n"
+        )
         return 2
     path = args[0]
     prog_args = [a.encode("utf-8") for a in args]
@@ -144,15 +152,68 @@ def run_cli():
         sys.stderr.write("error: cannot open file %s\n" % path)
         return 2
     try:
-        check(program)
+        checker = check(program)
     except HLError as ex:
         sys.stderr.write("compile error: %s\n" % ex)
         return 1
+    if audit_only:
+        print_audit(program, checker)
+        return 0
     if check_only:
         sys.stdout.write("OK: types and effects valid\n")
         return 0
     interp = Interp(program, prog_args, sys.stdout.buffer)
     return interp.run()
+
+
+def print_audit(program, checker):
+    """Print the full capability / effect tree of every function in the
+    program. Used by `boot.py --audit <file.hls>` (Stage 9-beta)."""
+    fns = program["fns"]
+    computed = getattr(checker, "computed_effects", {})
+    # Compute a display name per function key.
+    rows = []
+    for key, fn in fns.items():
+        decl = fn["effects"]
+        comp = computed.get(key, set())
+        # If `pure` was declared, surface it in the declared column.
+        if fn.get("pure", False):
+            decl_disp = "pure" if not decl else ("pure + " + ", ".join(sorted(decl)))
+        else:
+            decl_disp = ", ".join(sorted(decl)) if decl else "(none — pure)"
+        comp_disp = ", ".join(sorted(comp)) if comp else "(none)"
+        missing = comp - decl
+        if missing:
+            status = "VIOLATION: missing " + ", ".join(sorted(missing))
+        elif fn.get("pure", False) and comp:
+            status = "VIOLATION: pure but uses effects"
+        else:
+            status = "OK"
+        rows.append((key, decl_disp, comp_disp, status))
+    # Compute column widths.
+    name_w = max((len(r[0]) for r in rows), default=4)
+    decl_w = max((len(r[1]) for r in rows), default=8)
+    comp_w = max((len(r[2]) for r in rows), default=8)
+    # Header.
+    print("=" * (name_w + decl_w + comp_w + 22))
+    print("  %-*s  %-*s  %-*s  %s" % (
+        name_w, "function", decl_w, "declared", comp_w, "computed", "status"))
+    print("=" * (name_w + decl_w + comp_w + 22))
+    for key, decl_disp, comp_disp, status in rows:
+        print("  %-*s  %-*s  %-*s  %s" % (
+            name_w, key, decl_w, decl_disp, comp_w, comp_disp, status))
+    print("=" * (name_w + decl_w + comp_w + 22))
+    # Summary line.
+    n_pure = sum(1 for _, fn in fns.items() if fn.get("pure", False))
+    n_eff = sum(1 for _, fn in fns.items() if fn["effects"])
+    n_total = len(fns)
+    print("  %d functions: %d declared pure, %d declared with effects"
+          % (n_total, n_pure, n_eff))
+    # Active vs reserved effects table.
+    print("")
+    print("  Active effects:    IO, Fs, Clock, Args, Exit")
+    print("  Reserved effects:  Net, Rand, Proc  (error if used)")
+    print("  `uses IO` expands to: {IO, Fs, Clock, Args, Exit}")
 
 
 def main():

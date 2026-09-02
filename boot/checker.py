@@ -1269,6 +1269,10 @@ class Checker:
         """Fixpoint on the static call graph that computes, per function, the
         SET of effects its body transitively requires. A function passes iff
         its declared effect set is a superset of the computed set.
+
+        Stage 9-beta: after the fixpoint converges, the per-function computed
+        effect set is stored in self.computed_effects so an external auditor
+        (e.g. boot.py --audit) can print the full capability tree.
         """
         # eff[key] = computed set of effects required by `key`'s body.
         eff = {key: set() for key in self.fns}
@@ -1288,12 +1292,26 @@ class Checker:
                     if len(eff[key]) != before:
                         changed = True
 
+        # Publish the computed effect sets for downstream audit.
+        self.computed_effects = eff
+
         # Capability check: declared ⊇ computed.
+        # Also enforce the `pure` keyword (Stage 9-beta): a function declared
+        # `pure` must have BOTH an empty declared set AND an empty computed
+        # set (it transitively calls nothing effectful).
         for key, fn in self.fns.items():
             declared = fn["effects"]
             computed = eff[key]
             missing = computed - declared
             if not missing:
+                # If the function is marked `pure`, verify it actually is.
+                if fn.get("pure", False):
+                    if computed:
+                        self.err(
+                            "function '%s' is declared 'pure' but transitively "
+                            "uses effects %s (declared pure but callee chain "
+                            "is not pure)" % (fn["name"], ", ".join(sorted(computed))),
+                            fn)
                 continue
             # Find a witness edge for one of the missing effects and report it.
             for c in self.edges.get(key, ()):
@@ -1317,4 +1335,9 @@ class Checker:
 
 
 def check(program):
-    Checker(program).check()
+    """Type-check + effects-check a program. Returns the Checker instance
+    so callers (e.g. boot.py --audit) can inspect program['computed_effects']
+    and the per-function declared effects."""
+    c = Checker(program)
+    c.check()
+    return c

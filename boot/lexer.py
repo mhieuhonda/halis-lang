@@ -3,7 +3,7 @@
 KEYWORDS = {
     "fn", "let", "mut", "return", "if", "else", "while", "for", "in",
     "break", "continue", "struct", "impl", "import", "uses", "true", "false",
-    "enum", "match",
+    "enum", "match", "pure",
 }
 
 TWO_CHAR = ("->", "==", "!=", "<=", ">=", "&&", "||", "=>")
