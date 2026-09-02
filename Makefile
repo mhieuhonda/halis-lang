@@ -6,15 +6,16 @@ CFLAGS  ?= -O2
 PYTHON  ?= python3
 HLC     = src/hlc.hls
 BIN     = bin
+PREFIX  ?= /usr/local
 
-.PHONY: all stage0 bootstrap test examples clean run check
+.PHONY: all stage0 bootstrap test examples clean run check bench install uninstall
 
 # Main goal: use the full bootstrap chain to build the native compiler
 all: bootstrap
 
 # Run Stage-0 directly (interpret HLS)
 stage0:
-	$(PYTHON) boot/boot.py --help 2>/dev/null || true
+	@$(PYTHON) boot/boot.py --help 2>/dev/null || true
 	@echo "Example: $(PYTHON) boot/boot.py examples/hello.hls"
 
 # FULL BOOTSTRAP:
@@ -47,10 +48,34 @@ check:
 test:
 	bash tests/run_tests.sh
 
+# Run the benchmarks folder (interpreter + native paths)
+bench:
+	@bash benchmarks/run_bench.sh
+
+# Run the example programs to verify they still work after a change
 examples:
-	@for f in examples/hello.hls examples/fibonacci.hls examples/primes.hls; do \
+	@for f in examples/hello.hls examples/fibonacci.hls examples/primes.hls \
+	          examples/enum_demo.hls examples/option_demo.hls examples/result_demo.hls \
+	          examples/base64_demo.hls examples/csv_demo.hls examples/crypto_demo.hls \
+	          examples/hex_demo.hls examples/list_demo.hls examples/time_demo.hls \
+	          examples/uuid_demo.hls examples/web_demo.hls; do \
 		echo "--- $$f"; $(PYTHON) boot/boot.py $$f; \
 	done
+
+# Install the native compiler and stdlib to PREFIX (default /usr/local)
+install: bootstrap
+	@mkdir -p $(PREFIX)/bin $(PREFIX)/share/hls/std $(PREFIX)/share/hls/examples
+	@install -m 755 $(BIN)/hlc $(PREFIX)/bin/hlc
+	@cp -r std/*.hls $(PREFIX)/share/hls/std/
+	@cp -r examples/*.hls $(PREFIX)/share/hls/examples/ 2>/dev/null || true
+	@echo "Installed: $(PREFIX)/bin/hlc"
+	@echo "Stdlib:   $(PREFIX)/share/hls/std/"
+
+# Remove the installed files
+uninstall:
+	@rm -f $(PREFIX)/bin/hlc
+	@rm -rf $(PREFIX)/share/hls
+	@echo "Removed: $(PREFIX)/bin/hlc and $(PREFIX)/share/hls"
 
 clean:
 	rm -rf $(BIN) /tmp/hls_out /tmp/hls_out.c
