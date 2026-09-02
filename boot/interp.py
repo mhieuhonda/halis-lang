@@ -515,7 +515,12 @@ class Interp:
                 new[k] = self.deep_clone(v[k])
             return new
         if isinstance(v, dict) and "enum" in v:
-            # enum value — clone payload values too
+            # BUG-018: this branch is currently dead because the checker's
+            # `is_clone_supported` rejects enums at check time. It is
+            # INTENTIONALLY KEPT for forward-compatibility — when Stage 8-beta
+            # expands clone() to support structs/enums (per ROADMAP), the
+            # runtime path will be exercised. Removing it now would risk a
+            # silent regression later.
             return {"enum": v["enum"], "var": v["var"],
                     "data": [self.deep_clone(x) for x in v["data"]]}
         # primitives (int, float, bool, None)
@@ -551,21 +556,29 @@ class Interp:
         if op == "str.to_int":
             return parse_int(t, line)
         if op == "str.to_float":
-            # strict: ^-?[0-9]+(\.[0-9]+)?$ — matches the C version exactly
+            # strict: ^-?[0-9]+(\.[0-9]+)?$ OR ^-?[0-9]*\.[0-9]+$ — matches the C version
+            # BUG-007 fix: must require at least one digit on at least one
+            # side of the decimal point, otherwise Python's float(b".") raises
+            # ValueError which crashes Stage-0 with a stack trace. The C
+            # runtime's strtod(".") returns 0.0 silently, so for parity we
+            # also reject "." here (panicking with a clean HLPanic).
             i = 0
             if t[0:1] == b"-":
                 i = 1
             if i >= len(t):
                 raise HLPanic("cannot convert string to float", line)
             dots = 0
+            digits = 0
             while i < len(t):
                 c = t[i]
                 if c == 46:
                     dots += 1
-                elif not (48 <= c <= 57):
+                elif 48 <= c <= 57:
+                    digits += 1
+                else:
                     raise HLPanic("cannot convert string to float", line)
                 i += 1
-            if dots > 1:
+            if dots > 1 or digits == 0:
                 raise HLPanic("cannot convert string to float", line)
             return float(t)
         if op == "str.to_str":

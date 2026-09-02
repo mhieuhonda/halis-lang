@@ -367,9 +367,14 @@ class Checker:
         return False
 
     def match_all_return(self, e):
+        # BUG-008 fix: arm["body"] is the result of parse_expr (parser.py:540)
+        # — it's always an EXPRESSION node (call, match, bin, enumlit, …),
+        # never a statement node ("return" or "expr"). The original check
+        # therefore always returned False. The correct check is: every arm
+        # must be `never`-typed (i.e. its body is something that doesn't
+        # fall through, like panic() or exit()).
         for arm in e["arms"]:
-            if not (arm["body"]["k"] == "return" or
-                    (arm["body"]["k"] == "expr" and arm["body"].get("t") == "never")):
+            if arm["body"].get("t") != "never":
                 return False
         return True
 
@@ -1329,7 +1334,7 @@ class Checker:
                     "function '%s' calls '%s' which requires effect '%s' "
                     "not declared (declared: %s; missing: %s)"
                     % (fn["name"], callee_disp, miss,
-                       ", ".join(sorted(declared)) or "(none — pure)",
+                       ", ".join(sorted(declared)) or "(none - pure)",
                        ", ".join(sorted(violated))),
                     fn)
 

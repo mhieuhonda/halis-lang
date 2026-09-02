@@ -335,22 +335,9 @@ fn split_args_str(s: str) -> list[str] {
     return out
 }
 
-# strip a single leading/trailing space from a type string (used by type_args
-# because we put a space after the comma in "map[str, T]" etc.)
-# (Currently unused; kept here in case future code needs it.)
-fn trim_one_space(s: str) -> str {
-    let mut out: str = s
-    if out.len() == 0 {
-        return out
-    }
-    if out.byte_at(0) == 32 {
-        out = out.slice(1, out.len())
-    }
-    if out.len() > 0 && out.byte_at(out.len() - 1) == 32 {
-        out = out.slice(0, out.len() - 1)
-    }
-    return out
-}
+# BUG-019 fix: removed dead trim_one_space function (was unused, with a
+# "currently unused" comment that itself was a maintenance hint — resurrect
+# from git history if ever needed).
 
 # instantiate_type(t, typeparams, typeargs) substitutes each type param in `t`
 # with the corresponding concrete type from `typeargs`.
@@ -403,7 +390,7 @@ fn mk_tok(kind: str, value: str, line: int, col: int) -> Tok {
 }
 
 fn lex_err(msg: str, line: int, col: int) -> void {
-    panic("lex error: " + msg + " (dong " + line.to_str() + ":" + col.to_str() + ")")
+    panic("lex error: " + msg + " (line " + line.to_str() + ":" + col.to_str() + ")")
 }
 
 fn lex(ctx: Ctx) -> void {
@@ -424,8 +411,11 @@ fn lex(ctx: Ctx) -> void {
             i = i + 1
         } else if c == 35 {
             # comment: # to end of line
+            # BUG-016 fix: track column past the comment, so error messages
+            # on a later token on the same line report the right column.
             while i < n && src.byte_at(i) != 10 {
                 i = i + 1
+                col = col + 1
             }
         } else if is_ident_start(c) {
             let mut j: int = i
@@ -481,7 +471,8 @@ fn lex(ctx: Ctx) -> void {
                     if i + 1 >= n {
                         lex_err("unterminated string", ln, cl)
                     }
-                    let mut e: int = src.byte_at(i + 1)
+                    # BUG-020 fix: `e` is never reassigned — remove misleading `mut`.
+                    let e: int = src.byte_at(i + 1)
                     if e == 110 {
                         parts.push(chr(10))
                     } else if e == 116 {
@@ -568,11 +559,11 @@ fn nx_match_arm(ctx: Ctx, pat_kind: str, enum_name: str, variant: str,
 
 fn perr(ctx: Ctx, msg: str) -> void {
     let t: Tok = ctx.toks.get(ctx.pos)
-    panic("syntax error: " + msg + " (dong " + t.line.to_str() + ":" + t.col.to_str() + ")")
+    panic("syntax error: " + msg + " (line " + t.line.to_str() + ":" + t.col.to_str() + ")")
 }
 
 fn perr_at(ctx: Ctx, msg: str, t: Tok) -> void {
-    panic("syntax error: " + msg + " (dong " + t.line.to_str() + ":" + t.col.to_str() + ")")
+    panic("syntax error: " + msg + " (line " + t.line.to_str() + ":" + t.col.to_str() + ")")
 }
 
 fn tok_desc(ctx: Ctx) -> str {
@@ -591,6 +582,14 @@ fn at_sym(ctx: Ctx, v: str) -> bool {
 fn at_kw(ctx: Ctx, v: str) -> bool {
     let t: Tok = ctx.toks.get(ctx.pos)
     return t.kind == "kw" && t.value == v
+}
+
+# at_ident returns true iff the current token is an identifier with the
+# given name. Used to disambiguate the `_` wildcard (which the lexer
+# tokenizes as an ident because `_` is a valid ident-start character).
+fn at_ident(ctx: Ctx, v: str) -> bool {
+    let t: Tok = ctx.toks.get(ctx.pos)
+    return t.kind == "ident" && t.value == v
 }
 
 fn eat_sym(ctx: Ctx, v: str) -> void {
@@ -1248,7 +1247,8 @@ fn parse_match(ctx: Ctx) -> int {
         let mut variant: str = ""
         let mut bindings: list[str] = []
         let mut has_paren: bool = false
-        if at_sym(ctx, "_") {
+        # NOTE (BUG-001 fix): `_` is tokenized as an ident, not a sym.
+        if at_sym(ctx, "_") || at_ident(ctx, "_") {
             ctx.pos = ctx.pos + 1
             pat_kind = "wildcard"
         } else {
@@ -1260,7 +1260,7 @@ fn parse_match(ctx: Ctx) -> int {
                 has_paren = true
                 eat_sym(ctx, "(")
                 while !at_sym(ctx, ")") {
-                    if at_sym(ctx, "_") {
+                    if at_sym(ctx, "_") || at_ident(ctx, "_") {
                         ctx.pos = ctx.pos + 1
                         bindings.push("_")
                     } else {
@@ -1298,15 +1298,27 @@ fn parse_primary(ctx: Ctx, allow_struct: bool) -> int {
     if t.kind == "int" {
         ctx.pos = ctx.pos + 1
         let idx: int = nx_expr(ctx, "int", t.line)
-        if t.value.len() > 19 {
+        # BUG-015 fix: strip leading zeros before the length check, so that
+        # a 20-char literal like "09223372036854775808" (= 2^63 with a leading
+        # zero) is treated as 19-char "9223372036854775808" — matching Stage-0's
+        # behaviour. Stage-0 uses Python int() which strips leading zeros
+        # automatically; the self-hosted uses string comparison so it must do
+        # so explicitly.
+        let mut v: str = t.value
+        let mut stripped: str = v
+        while stripped.len() > 1 && stripped.byte_at(0) == 48 {
+            stripped = stripped.slice(1, stripped.len())
+        }
+        v = stripped
+        if v.len() > 19 {
             perr_at(ctx, "integer literal too large (exceeds int64)", t)
-        } else if t.value.len() == 19 && t.value > "9223372036854775808" {
+        } else if v.len() == 19 && v > "9223372036854775808" {
             perr_at(ctx, "integer literal too large (exceeds int64)", t)
-        } else if t.value.len() == 19 && t.value == "9223372036854775808" {
+        } else if v.len() == 19 && v == "9223372036854775808" {
             ctx.exprs[idx].ival = -9223372036854775808
             ctx.exprs[idx].op = "big"
         } else {
-            ctx.exprs[idx].ival = t.value.to_int()
+            ctx.exprs[idx].ival = v.to_int()
         }
         return idx
     }
@@ -1397,7 +1409,7 @@ fn parse_struct_lit(ctx: Ctx) -> int {
 # ----------------------------------------------------------------------------
 
 fn cerr(line: int, msg: str) -> void {
-    panic("type error: " + msg + " (dong " + line.to_str() + ")")
+    panic("type error: " + msg + " (line " + line.to_str() + ")")
 }
 
 fn is_builtin_fn(n: str) -> bool {
@@ -1571,6 +1583,66 @@ fn revive_binding(env: list[map[str, Binding]], name: str) -> bool {
     return false
 }
 
+# BUG-003 fix: snapshot_moved / restore_moved mirror Stage-0's snapshot/
+# restore for the `moved` flag. They are used around `if`/`while`/`for`
+# bodies so that moves done inside a child scope don't leak out — the
+# branch may not execute, so any binding "moved" inside should still be
+# considered unmoved after the construct completes.
+#
+# Snapshot format: a list of (scope_index, name, moved) tuples. We use
+# a flat list of strings "i|name|0|1" because HLS maps require str keys.
+fn snapshot_moved(env: list[map[str, Binding]]) -> list[str] {
+    let snap: list[str] = []
+    let mut i: int = 0
+    while i < env.len() {
+        let scope: map[str, Binding] = env.get(i)
+        let names: list[str] = scope.keys()
+        let mut j: int = 0
+        while j < names.len() {
+            let nm: str = names.get(j)
+            let b: Binding = scope.get_or(nm, dummy_binding())
+            let mut mv: str = "0"
+            if b.moved {
+                mv = "1"
+            }
+            snap.push(i.to_str() + "|" + nm + "|" + mv)
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return snap
+}
+
+fn restore_moved(env: list[map[str, Binding]], snap: list[str]) -> void {
+    let mut i: int = 0
+    while i < snap.len() {
+        let entry: str = snap.get(i)
+        # Format is "scope_idx|name|0or1". Identifier names never contain '|',
+        # so split("|") yields exactly 3 parts. (If a future name contains '|',
+        # the snapshot format would need to change — but identifiers can't.)
+        let parts: list[str] = entry.split("|")
+        if parts.len() < 3 {
+            i = i + 1
+            continue
+        }
+        let scope_idx: int = parts.get(0).to_int()
+        let nm: str = parts.get(1)
+        let mv_str: str = parts.get(2)
+        if scope_idx < env.len() {
+            let scope: map[str, Binding] = env.get(scope_idx)
+            if scope.has(nm) {
+                let b: Binding = scope.get_or(nm, dummy_binding())
+                let mut mv: bool = false
+                if mv_str == "1" {
+                    mv = true
+                }
+                scope.set(nm, Binding { t: b.t, is_mut: b.is_mut, moved: mv })
+            }
+        }
+        i = i + 1
+    }
+}
+
 # is_owned_type: True if values of this type are heap-owned and subject to
 # move tracking. Primitives (int/float/bool) are Copy — passing them is fine.
 fn is_owned_type(t: str) -> bool {
@@ -1702,6 +1774,46 @@ fn unify_into(ctx: Ctx, pt: str, at: str, tps: list[str], targs_out: list[str]) 
             let mut j: int = 0
             while j < pa.len() {
                 unify_into(ctx, pa.get(j), aa.get(j), tps, targs_out)
+                j = j + 1
+            }
+        }
+    }
+}
+
+# unify_into_offset: like unify_into but writes into a SLICE of targs_out
+# starting at `offset`. Used by check_method when inferring a method's own
+# type params (which sit AFTER the struct's type params in targs_out).
+# This avoids the BUG-002 throwaway-list issue where list_slice_from
+# returns a fresh list and unify_into's .set() mutations never propagate.
+fn unify_into_offset(ctx: Ctx, pt: str, at: str, tps: list[str], targs_out: list[str], offset: int) -> void {
+    # Exact-match case: pt is a type param.
+    let mut i: int = 0
+    while i < tps.len() {
+        if pt == tps.get(i) {
+            if targs_out.get(offset + i) == "" {
+                targs_out.set(offset + i, at)
+            }
+            return
+        }
+        i = i + 1
+    }
+    if is_list_t(pt) && is_list_t(at) {
+        unify_into_offset(ctx, list_elem_t(pt), list_elem_t(at), tps, targs_out, offset)
+        return
+    }
+    if is_map_t(pt) && is_map_t(at) {
+        unify_into_offset(ctx, map_val_t(pt), map_val_t(at), tps, targs_out, offset)
+        return
+    }
+    let pb: str = type_base(pt)
+    let ab: str = type_base(at)
+    if pb == ab && pt != pb && at != ab {
+        let pa: list[str] = type_args(pt)
+        let aa: list[str] = type_args(at)
+        if pa.len() == aa.len() {
+            let mut j: int = 0
+            while j < pa.len() {
+                unify_into_offset(ctx, pa.get(j), aa.get(j), tps, targs_out, offset)
                 j = j + 1
             }
         }
@@ -2043,7 +2155,11 @@ fn match_all_return(ctx: Ctx, e: int) -> bool {
     while i < ctx.exprs[e].args.len() {
         let arm_idx: int = ctx.exprs[e].args.get(i)
         let arm: MatchArm = ctx.match_arms.get(arm_idx)
-        let body_k: str = ctx.stmts[0].kind
+        # BUG-009 fix: removed dead `let body_k: str = ctx.stmts[0].kind`
+        # line — that accessed the FIRST statement in the entire program
+        # (not the arm body's statement) and was unused. The actual check
+        # below uses arm.body_t which is the arm body's type (set during
+        # check_match).
         # arm.body is an expression index; we check if it's a return wrapped
         # in an expression-statement. But arms are expressions — they don't
         # contain return statements directly. So a match can only be a
@@ -2091,6 +2207,10 @@ fn check_stmt(ctx: Ctx, env: list[map[str, Binding]], cur: str, f: FnInfo, sidx:
         if ct != "bool" {
             cerr(s.line, "if condition must be bool, got " + ct)
         }
+        # BUG-003 fix: snapshot moved-status so moves done inside the
+        # then/else branches don't leak out (a binding moved inside an
+        # if-arm should not be considered moved after the if completes).
+        let snap: list[str] = snapshot_moved(env)
         env.push(map_new())
         check_stmts(ctx, env, cur, f, s.body, in_loop)
         env.pop()
@@ -2099,14 +2219,19 @@ fn check_stmt(ctx: Ctx, env: list[map[str, Binding]], cur: str, f: FnInfo, sidx:
             check_stmts(ctx, env, cur, f, s.else_body, in_loop)
             env.pop()
         }
+        restore_moved(env, snap)
     } else if s.kind == "while" {
         let ct: str = check_expr(ctx, env, cur, s.cond, "")
         if ct != "bool" {
             cerr(s.line, "while condition must be bool, got " + ct)
         }
+        # BUG-003 fix: moves inside the loop body don't leak out — the loop
+        # may execute zero or many times, so any post-loop use must remain valid.
+        let snap: list[str] = snapshot_moved(env)
         env.push(map_new())
         check_stmts(ctx, env, cur, f, s.body, true)
         env.pop()
+        restore_moved(env, snap)
     } else if s.kind == "for" {
         let it: str = check_expr(ctx, env, cur, s.iter, "")
         if !is_list_t(it) {
@@ -2116,10 +2241,12 @@ fn check_stmt(ctx: Ctx, env: list[map[str, Binding]], cur: str, f: FnInfo, sidx:
         if s.vtype != elem {
             cerr(s.line, "variable type " + s.vtype + " does not match element " + elem)
         }
+        let snap: list[str] = snapshot_moved(env)
         env.push(map_new())
         env.get(env.len() - 1).set(s.name, Binding { t: elem, is_mut: false, moved: false })
         check_stmts(ctx, env, cur, f, s.body, true)
         env.pop()
+        restore_moved(env, snap)
     } else if s.kind == "return" {
         if f.ret == "void" {
             if s.value != -1 {
@@ -2566,7 +2693,10 @@ fn check_call(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, expected
             let mut ti2: int = 0
             while ti2 < typeparams.len() {
                 if targs.get(ti2) == "" {
-                    cerr(line, "cannot infer type argument for " + name)
+                    # BUG-013 fix: name the unbound type-param (e.g. "T") instead
+                    # of just the function name — so the user knows WHICH type
+                    # param of a multi-param generic is unbound.
+                    cerr(line, "cannot infer type argument '" + typeparams.get(ti2) + "' for " + name + "; provide explicit types")
                 }
                 ti2 = ti2 + 1
             }
@@ -2848,16 +2978,19 @@ fn check_method(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int) -> str
                     if at != "never" {
                         # pt is f.ptypes.get(ai+1) — instantiate struct type
                         # params first, then unify with method type params.
+                        # NOTE (BUG-002 fix): we pass an explicit offset
+                        # (st.typeparams.len()) so unify_into_offset writes
+                        # directly into the method's portion of type_map_targs.
                         let pt: str = f.ptypes.get(ai + 1)
                         let inst_pt: str = instantiate_type(pt, st.typeparams, type_args(tt))
-                        unify_into(ctx, inst_pt, at, f.typeparams, list_slice_from(type_map_targs, st.typeparams.len()))
+                        unify_into_offset(ctx, inst_pt, at, f.typeparams, type_map_targs, st.typeparams.len())
                     }
                     ai = ai + 1
                 }
                 let mut ti: int = st.typeparams.len()
                 while ti < type_map_targs.len() {
                     if type_map_targs.get(ti) == "" {
-                        cerr(line, "cannot infer type argument for " + tt_base + "." + name)
+                        cerr(line, "cannot infer type argument '" + f.typeparams.get(ti - st.typeparams.len()) + "' for " + tt_base + "." + name)
                     }
                     ti = ti + 1
                 }
@@ -2876,6 +3009,47 @@ fn check_method(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int) -> str
                     cerr(line, "argument of " + tt_base + "." + name + " expects " + inst_pt + ", got " + at)
                 }
                 ai2 = ai2 + 1
+            }
+            # BUG-002 fix: if the method has its own type params (or the
+            # struct is generic), record this instantiation for codegen.
+            # The mangled name encodes BOTH the struct's type args (resolved
+            # from the receiver type) AND the method's inferred type args.
+            if f.typeparams.len() > 0 || st.typeparams.len() > 0 {
+                let mut all_targs: list[str] = []
+                # Struct's type args first.
+                let mut si2: int = 0
+                let targs_of_tt: list[str] = type_args(tt)
+                while si2 < st.typeparams.len() {
+                    if si2 < targs_of_tt.len() {
+                        all_targs.push(targs_of_tt.get(si2))
+                    } else {
+                        all_targs.push("")
+                    }
+                    si2 = si2 + 1
+                }
+                # Then method's own type args.
+                let mut mi2: int = st.typeparams.len()
+                while mi2 < type_map_targs.len() {
+                    all_targs.push(type_map_targs.get(mi2))
+                    mi2 = mi2 + 1
+                }
+                # Compose a combined typeparams list for the mangling.
+                let combined_tps: list[str] = []
+                let mut ci: int = 0
+                while ci < st.typeparams.len() {
+                    combined_tps.push(st.typeparams.get(ci))
+                    ci = ci + 1
+                }
+                let mut cj: int = 0
+                while cj < f.typeparams.len() {
+                    combined_tps.push(f.typeparams.get(cj))
+                    cj = cj + 1
+                }
+                let inst_str: str = key + "|" + join(all_targs, ",")
+                if !list_has(ctx.fn_insts, inst_str) {
+                    ctx.fn_insts.push(inst_str)
+                }
+                ctx.exprs[e].mkey = c_mangled_fn_name(key, combined_tps, all_targs)
             }
             return instantiate_type(f.ret, type_map_tps, type_map_targs)
         }
@@ -4646,13 +4820,23 @@ fn gen_match_expr(ctx: Ctx, e: int) -> str {
     let block: list[str] = []
     block.push("({")
     block.push("    " + c_type(ctx, scrut_t) + " " + tmp_name + " = " + scrut_c + ";")
-    block.push("    " + c_type(ctx, ctx.exprs[e].t) + " hlc_m_r;")
+    # BUG-004 fix: if the match result type is `never` (e.g. all arms
+    # are panic/exit), we must NOT declare a `hlc_m_r` accumulator —
+    # `never` is not a valid C type. Emit the dispatch without an
+    # accumulator and without a trailing `hlc_m_r;` value.
+    let match_t: str = ctx.exprs[e].t
+    let is_never: bool = match_t == "never"
+    if !is_never {
+        block.push("    " + c_type(ctx, match_t) + " hlc_m_r;")
+    }
     block.push("    if (0) {}")
+    let mut has_wildcard: bool = false
     let mut i: int = 0
     while i < ctx.exprs[e].args.len() {
         let arm_idx: int = ctx.exprs[e].args.get(i)
         let arm: MatchArm = ctx.match_arms.get(arm_idx)
         if arm.pat_kind == "wildcard" {
+            has_wildcard = true
             block.push("    else {")
             if arm.body_t != "never" {
                 block.push("        hlc_m_r = " + gen_expr(ctx, arm.body) + ";")
@@ -4705,8 +4889,14 @@ fn gen_match_expr(ctx: Ctx, e: int) -> str {
         }
         i = i + 1
     }
-    block.push("    else { hl_die(\"match: no arm matched (internal)\"); }")
-    block.push("    hlc_m_r;")
+    # Only emit the fall-through "no arm matched" trap when no wildcard arm
+    # is present — a wildcard already catches all unmatched cases.
+    if !has_wildcard {
+        block.push("    else { hl_die(\"match: no arm matched (internal)\"); }")
+    }
+    if !is_never {
+        block.push("    hlc_m_r;")
+    }
     block.push("})")
     # Append the block to the output (as a multi-line statement expression
     # embedded in the surrounding expression). We need to return the joined
@@ -4744,7 +4934,14 @@ fn gen_stmt(ctx: Ctx, sidx: int, ind: str) -> void {
     if s.kind == "let" {
         let cn: str = fresh_local(ctx, s.name)
         let v: str = gen_expr(ctx, s.value)
-        ctx.out.push(ind + c_type(ctx, s.vtype) + " " + cn + " = " + v + ";")
+        # BUG-004 fix: if the RHS expression is `never`-typed (panic/exit/
+        # all-never match), the C call returns void — we must not bind it
+        # to a variable. Emit just the side-effect call.
+        if ctx.exprs[s.value].t == "never" {
+            ctx.out.push(ind + v + ";")
+        } else {
+            ctx.out.push(ind + c_type(ctx, s.vtype) + " " + cn + " = " + v + ";")
+        }
     } else if s.kind == "assign" {
         gen_assign(ctx, s, ind)
     } else if s.kind == "if" {
@@ -4782,7 +4979,17 @@ fn gen_stmt(ctx: Ctx, sidx: int, ind: str) -> void {
         if s.value == -1 {
             ctx.out.push(ind + "return;")
         } else {
-            ctx.out.push(ind + "return " + gen_expr(ctx, s.value) + ";")
+            # BUG-004 fix: if the return value expression is `never`-typed
+            # (e.g. `return panic("...")` or `return match_all_never`),
+            # emit just the side-effect call without a `return <value>;`
+            # wrapper (the value is void and the surrounding code is
+            # unreachable anyway — the call itself exits the process).
+            let v: str = gen_expr(ctx, s.value)
+            if ctx.exprs[s.value].t == "never" {
+                ctx.out.push(ind + v + ";")
+            } else {
+                ctx.out.push(ind + "return " + v + ";")
+            }
         }
     } else if s.kind == "break" {
         ctx.out.push(ind + "break;")
@@ -4806,6 +5013,13 @@ fn gen_stmts(ctx: Ctx, stmts: list[int], ind: str) -> void {
 fn gen_assign(ctx: Ctx, s: StmtN, ind: str) -> void {
     let tgt: int = s.target
     let v: str = gen_expr(ctx, s.value)
+    # BUG-004 fix: if the RHS is `never`-typed (e.g. `x = panic("...")`),
+    # emit just the side-effect call without the assignment — the assignment
+    # target is unreachable code.
+    if ctx.exprs[s.value].t == "never" {
+        ctx.out.push(ind + v + ";")
+        return
+    }
     if ctx.exprs[tgt].kind == "ident" {
         let cn: str = local_c(ctx, ctx.exprs[tgt].name)
         ctx.out.push(ind + cn + " = " + v + ";")
@@ -4842,19 +5056,10 @@ fn gen_fn_body(ctx: Ctx, key: str) -> void {
     # the function has type params. The specialization instantiation is
     # handled in gen_program by enumerating instantiations.
     let mut fname: str = "usf_" + c_fn_name(key)
-    if f.typeparams.len() > 0 {
-        # Append the instantiated type args.
-        let mut inst: str = "__"
-        let mut j: int = 0
-        while j < f.typeparams.len() {
-            if j > 0 {
-                inst = inst + "__"
-            }
-            inst = inst + f.typeparams.get(j)
-            j = j + 1
-        }
-        fname = fname + inst
-    }
+    # BUG-010 fix: removed dead branch that built a mangled name from the
+    # type-parameter NAMES (e.g. "T") instead of the type ARGS (e.g. "int").
+    # That branch was unreachable because gen_program never routes generic
+    # functions through gen_fn_body — they go through gen_fn_inst_lines.
     let mut sig: str = c_type(ctx, f.ret) + " " + fname + "("
     if ptypes_c.len() == 0 {
         sig = sig + "void)"
@@ -5209,33 +5414,43 @@ fn gen_fn_inst_lines(ctx: Ctx) -> list[str] {
         let targs: list[str] = list_slice_from(parsed, 1)
         let f: FnInfo = ctx.fns.get_or(key, dummy_fn())
         gen_reset_fn(ctx)
-        # Push the instantiation type map for the function body. The function
-        # body's expressions reference types that have already been checked,
-        # so the stored `t` field already has the *instantiated* type from the
-        # call site... actually no, the checker currently checks the generic
-        # function definition ONCE (with type params unbound). The codegen
-        # needs to substitute type params when emitting the body.
-        # Workaround: set ctx.cur_typeparams and add a parallel list of
-        # targs in ctx; then everywhere we look up a type in codegen, we
-        # substitute. This is too invasive. Alternative: store the
-        # instantiated types in the AST at check time. But that requires
-        # checking each instantiation separately.
-        # For now, we use a simpler approach: set a "current instantiation"
-        # on ctx, and a helper `inst_t(t)` that substitutes when typeparams
-        # are present. Then codegen uses `inst_t(t)` instead of `t` directly.
-        ctx.cur_typeparams = f.typeparams
+        # BUG-002 fix: for generic methods on generic structs, we need to
+        # combine the struct's type params with the method's. The targs list
+        # carries BOTH (struct's args first, then method's args) — see how
+        # check_method composes `all_targs`. We mirror that here to build
+        # the combined typeparams list and pass the right targs slice.
+        let mut combined_tps: list[str] = []
+        let mut struct_tps_count: int = 0
+        if f.is_method && f.struct_of != "" {
+            let st: StructInfo = ctx.structs.get_or(f.struct_of, dummy_struct())
+            let mut si: int = 0
+            while si < st.typeparams.len() {
+                combined_tps.push(st.typeparams.get(si))
+                si = si + 1
+            }
+            struct_tps_count = st.typeparams.len()
+        }
+        let mut mi: int = 0
+        while mi < f.typeparams.len() {
+            combined_tps.push(f.typeparams.get(mi))
+            mi = mi + 1
+        }
+        # The method's own type params (used by instantiate_type for body).
+        let method_tps: list[str] = f.typeparams
+        let method_targs: list[str] = list_slice_from(targs, struct_tps_count)
+        ctx.cur_typeparams = combined_tps
         ctx.cur_targs = targs
         # Build the signature.
         let ptypes_c: list[str] = []
         let mut j: int = 0
         while j < f.params.len() {
             let cn: str = fresh_local(ctx, f.params.get(j))
-            let inst_pt: str = instantiate_type(f.ptypes.get(j), f.typeparams, targs)
+            let inst_pt: str = instantiate_type(f.ptypes.get(j), combined_tps, targs)
             ptypes_c.push(c_type(ctx, inst_pt) + " " + cn)
             j = j + 1
         }
-        let ret_str: str = instantiate_type(f.ret, f.typeparams, targs)
-        let mut sig: str = c_type(ctx, ret_str) + " usf_" + c_mangled_fn_name(key, f.typeparams, targs) + "("
+        let ret_str: str = instantiate_type(f.ret, combined_tps, targs)
+        let mut sig: str = c_type(ctx, ret_str) + " usf_" + c_mangled_fn_name(key, combined_tps, targs) + "("
         if ptypes_c.len() == 0 {
             sig = sig + "void)"
         } else {
@@ -5541,7 +5756,7 @@ fn main() -> int uses IO {
         return 0
     }
     if a.len() < 3 {
-        println("usage: hlc <input.hls> <output.c | ->  |  hlc --audit <input.hls>")
+        println("usage: hlc <input.hls> <output.c|->   |   hlc --audit <input.hls>")
         return 1
     }
     let entry_path: str = a.get(1)
@@ -5605,7 +5820,7 @@ fn print_audit(ctx: Ctx) -> void uses IO {
             j = j + 1
         }
         if decl_disp == "" {
-            decl_disp = "(none — pure)"
+            decl_disp = "(none - pure)"
         }
         let mut comp_disp: str = ""
         let mut k: int = 0

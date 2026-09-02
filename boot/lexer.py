@@ -57,8 +57,11 @@ def tokenize(src):
             continue
         # comment: # to end of line
         if c == 35:  # '#'
+            # BUG-016 fix: track column past the comment, so error messages
+            # on a later token on the same line report the right column.
             while i < n and src[i] != 10:
                 i += 1
+                col += 1
             continue
         # identifier / keyword
         if _is_ident_start(c):

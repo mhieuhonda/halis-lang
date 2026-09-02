@@ -134,6 +134,11 @@ def run_cli():
     if "--audit" in args:
         audit_only = True
         args.remove("--audit")
+    # BUG-025 fix: --check and --audit are mutually exclusive — error out
+    # explicitly rather than silently preferring one over the other.
+    if check_only and audit_only:
+        sys.stderr.write("error: --check and --audit are mutually exclusive\n")
+        return 2
     if not args:
         sys.stderr.write(
             "usage: boot.py [--check | --audit] <file.hls> [program args...]\n"
@@ -180,7 +185,7 @@ def print_audit(program, checker):
         if fn.get("pure", False):
             decl_disp = "pure" if not decl else ("pure + " + ", ".join(sorted(decl)))
         else:
-            decl_disp = ", ".join(sorted(decl)) if decl else "(none — pure)"
+            decl_disp = ", ".join(sorted(decl)) if decl else "(none - pure)"
         comp_disp = ", ".join(sorted(comp)) if comp else "(none)"
         missing = comp - decl
         if missing:
@@ -191,9 +196,12 @@ def print_audit(program, checker):
             status = "OK"
         rows.append((key, decl_disp, comp_disp, status))
     # Compute column widths.
-    name_w = max((len(r[0]) for r in rows), default=4)
-    decl_w = max((len(r[1]) for r in rows), default=8)
-    comp_w = max((len(r[2]) for r in rows), default=8)
+    # BUG-024 fix: removed unreachable `default=4` arguments — rows is
+    # guaranteed non-empty because the checker errors out if there's no
+    # `main` function, so we always have at least one entry.
+    name_w = max(len(r[0]) for r in rows)
+    decl_w = max(len(r[1]) for r in rows)
+    comp_w = max(len(r[2]) for r in rows)
     # Header.
     print("=" * (name_w + decl_w + comp_w + 22))
     print("  %-*s  %-*s  %-*s  %s" % (

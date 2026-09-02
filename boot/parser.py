@@ -506,7 +506,10 @@ class Parser:
         #        | Name.Variant
         #        | Name.Variant(Ident, Ident, ...)   (with payload bindings)
         #        | Name.Variant(_)                    (payload ignored)
-        if self.at_sym("_"):
+        # NOTE (BUG-001 fix): `_` is tokenized by the lexer as an `ident`
+        # token (because `_is_ident_start` returns True for byte 95), NOT
+        # as a `sym`. So we must test for both kinds here.
+        if self.at_sym("_") or (self.peek()["k"] == "ident" and self.peek()["v"] == "_"):
             self.next()
             pattern = {"k": "wildcard"}
         else:
@@ -523,7 +526,8 @@ class Parser:
                 has_paren = True
                 self.next()
                 while not self.at_sym(")"):
-                    if self.at_sym("_"):
+                    # NOTE (BUG-001 fix): `_` is an ident token, not a sym.
+                    if self.at_sym("_") or (self.peek()["k"] == "ident" and self.peek()["v"] == "_"):
                         self.next()
                         bindings.append("_")  # wildcard — payload ignored
                     else:
