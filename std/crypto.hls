@@ -1,0 +1,257 @@
+# ============================================================================
+# std/crypto.hls — Lightweight hash / digest helpers for Hieu Louis
+# ----------------------------------------------------------------------------
+# Pure-HLS non-cryptographic hash functions. NOT intended for security use
+# (use Blake2/SHA-2 from a future std.crypto.secure module after FFI lands in
+# Stage 15). These are intended for hash tables, checksums, content addressing
+# in package manager prototypes, and bloom filters — exactly the use-cases
+# where FNV-1a / djb2 / CRC32 are the right tools.
+#
+# All functions are pure (no `uses IO`).
+#
+# Hashes provided:
+#   * crypto_fnv1a_64(s)  -> 64-bit FNV-1a, returns int (unsigned semantics)
+#   * crypto_fnv1a_32(s)  -> 32-bit FNV-1a (low 32 bits, masked)
+#   * crypto_djb2(s)      -> classic djb2 string hash
+#   * crypto_sdbm(s)     -> sdbm string hash (used by gawk, berkeley db)
+#   * crypto_crc32(s)     -> IEEE 802.3 CRC-32 (table-driven)
+#
+# HMAC-style construction helper (toy / educational only — not constant-time,
+# not side-channel safe):
+#   * crypto_xor(a, b)    -> byte-wise XOR of two equal-length strings
+#
+# Because HLS v0.3 has NO bitwise operators (`&`, `|`, `^`, `<<`, `>>`),
+# every operation here is decomposed into multiply / modulo / division on
+# int64. The largest intermediate value is 2^40 (FNV prime product) which
+# is well within int64 range.
+# ============================================================================
+
+import "std.str"
+import "std.hex"
+import "std.math"
+
+# ----------------------------------------------------------------------------
+# FNV-1a 64-bit.
+#   hash := 0xcbf29ce484222325 (offset basis)
+#   for each byte b: hash := (hash ^ b) * 0x100000001b3 (FNV prime)
+#
+# Without XOR, we compute the bit pattern using arithmetic on the low
+# and high halves. HLS has no uint64 type, so we use int64 and rely on the
+# fact that no overflow occurs at the intermediate steps after our masking.
+# ----------------------------------------------------------------------------
+
+# FNV-1a 64-bit constants (decimal):
+#   offset basis = 14695981039346656037
+#   prime        = 1099511628211
+#
+# NOTE: 14695981039346656037 exceeds INT64_MAX (9223372036854775807). We
+# emulate 64-bit unsigned arithmetic on signed int64 by working with
+# the representation value modulo 2^64. Because HLS ints are 64-bit
+# signed, we instead carry a low 32-bit half and a high 32-bit half in
+# two separate int variables and combine only at the end.
+
+# Mask 32 bits.
+fn u32_mask(x: int) -> int {
+    # x mod 2^32 — but x may be negative (after subtraction in our emulated XOR)
+    # so we bring it back into 0 .. 2^32 - 1.
+    let m: int = x % 4294967296
+    if m < 0 {
+        return m + 4294967296
+    }
+    return m
+}
+
+# XOR of two bytes (0..255). Decomposed bit-by-bit using division and modulo
+# (HLS v0.3 has no bitwise operators). Inputs must be in 0..255.
+fn byte_xor(a: int, b: int) -> int {
+    let mut result: int = 0
+    let mut k: int = 0
+    while k < 8 {
+        let bit_a: int = (a / math_power_int(2, k)) % 2
+        let bit_b: int = (b / math_power_int(2, k)) % 2
+        if bit_a != bit_b {
+            result = result + math_power_int(2, k)
+        }
+        k = k + 1
+    }
+    return result
+}
+
+# XOR of two 32-bit words (carried as int in 0 .. 2^32 - 1).
+# Decompose each into 4 bytes, XOR them, then recombine.
+fn u32_xor(a: int, b: int) -> int {
+    let a0: int = a / 1 % 256
+    let a1: int = a / 256 % 256
+    let a2: int = a / 65536 % 256
+    let a3: int = a / 16777216 % 256
+    let b0: int = b / 1 % 256
+    let b1: int = b / 256 % 256
+    let b2: int = b / 65536 % 256
+    let b3: int = b / 16777216 % 256
+    let r0: int = byte_xor(a0, b0)
+    let r1: int = byte_xor(a1, b1)
+    let r2: int = byte_xor(a2, b2)
+    let r3: int = byte_xor(a3, b3)
+    return r0 + r1 * 256 + r2 * 65536 + r3 * 16777216
+}
+
+# ----------------------------------------------------------------------------
+# FNV-1a 32-bit.  offset basis = 2166136261, prime = 16777619.
+# All arithmetic fits comfortably in int64 (no masking trickery needed
+# because the intermediate (2166136261 * 16777619) < 2^63).
+# ----------------------------------------------------------------------------
+fn crypto_fnv1a_32(s: str) -> int {
+    let mut hash: int = 2166136261
+    let n: int = s.len()
+    let mut i: int = 0
+    while i < n {
+        hash = u32_xor(hash, s.byte_at(i))
+        hash = u32_mask(hash * 16777619)
+        i = i + 1
+    }
+    return hash
+}
+
+# ----------------------------------------------------------------------------
+# FNV-1a 64-bit, emulated via two 32-bit halves.
+#
+# NOTE: HLS v0.3 int64 cannot hold the full 2^64 unsigned range, so we
+# expose this hash ONLY as a 16-character hex string (the natural form
+# for a 64-bit digest). Callers needing a numeric hash should use
+# crypto_fnv1a_32 instead.
+# ----------------------------------------------------------------------------
+# Returns the 16-character lowercase hex digest of FNV-1a 64-bit applied
+# to the input string.
+fn crypto_fnv1a_64_hex(s: str) -> str {
+    # Initial hash = 0xcbf29ce484222325
+    # Split into high32 = 0xcbf29ce4, low32 = 0x84222325
+    let mut hi: int = 3421676524              # 0xcbf29ce4
+    let mut lo: int = 2219441701              # 0x84222325
+    # FNV prime = 0x00000100000001b3 — split into high32 = 0x00000100 = 256,
+    # low32 = 0x000001b3 = 435.
+    let p_hi: int = 256
+    let p_lo: int = 435
+    let n: int = s.len()
+    let mut i: int = 0
+    while i < n {
+        let b: int = s.byte_at(i)
+        # XOR into the low half.
+        lo = u32_xor(lo, b)
+        # Multiply (hi:lo) by (p_hi:p_lo).
+        # New lo = lo * p_lo (mod 2^32)  + carry from high
+        # New hi = hi * p_lo + lo * p_hi + carry from above (mod 2^32)
+        let lo_p_lo: int = lo * p_lo
+        let lo_p_hi: int = lo * p_hi
+        let hi_p_lo: int = hi * p_lo
+        # lo_p_lo can be up to (2^32 - 1) * 435 ~ 1.8e12, fits int64.
+        let new_lo: int = u32_mask(lo_p_lo)
+        let carry: int = lo_p_lo / 4294967296
+        let new_hi: int = u32_mask(hi_p_lo + lo_p_hi + carry)
+        lo = new_lo
+        hi = new_hi
+        i = i + 1
+    }
+    return u32_to_hex(hi) + u32_to_hex(lo)
+}
+
+fn u32_to_hex(x: int) -> str {
+    let b3: int = x / 16777216 % 256
+    let b2: int = x / 65536 % 256
+    let b1: int = x / 256 % 256
+    let b0: int = x % 256
+    return hex_byte(b3) + hex_byte(b2) + hex_byte(b1) + hex_byte(b0)
+}
+
+# ----------------------------------------------------------------------------
+# djb2 string hash. hash = 5381; for each byte b: hash = hash * 33 + b
+# (mod 2^32). The classic version uses XOR (hash * 33 ^ b) — we use the
+# additive form which is the most common variant.
+# ----------------------------------------------------------------------------
+fn crypto_djb2(s: str) -> int {
+    let mut hash: int = 5381
+    let n: int = s.len()
+    let mut i: int = 0
+    while i < n {
+        hash = u32_mask(hash * 33 + s.byte_at(i))
+        i = i + 1
+    }
+    return hash
+}
+
+# ----------------------------------------------------------------------------
+# sdbm hash — used by gawk, Berkeley DB. Pushes bits to the left via multiply.
+#   hash = 0
+#   for each byte b: hash = b + (hash << 6) + (hash << 16) - hash
+# In arithmetic: hash = b + hash * 65664 - hash  = b + hash * (65664 - 1) =
+# b + hash * 65536 + hash * 64 - hash = b + hash * (65536 + 64 - 1) = b + hash * 65599.
+# (The original formula is hash * 65599 + b.)
+# ----------------------------------------------------------------------------
+fn crypto_sdbm(s: str) -> int {
+    let mut hash: int = 0
+    let n: int = s.len()
+    let mut i: int = 0
+    while i < n {
+        hash = u32_mask(hash * 65599 + s.byte_at(i))
+        i = i + 1
+    }
+    return hash
+}
+
+# ----------------------------------------------------------------------------
+# CRC-32 (IEEE 802.3).
+#   Polynomial: 0xEDB88320 (reflected form)
+#   Initial value: 0xFFFFFFFF
+#   Final XOR: 0xFFFFFFFF
+# Table-driven: build the 256-entry table on first call, then process bytes.
+# Without bitwise operators, we implement XOR byte-by-byte using our byte_xor.
+# ----------------------------------------------------------------------------
+fn crc32_table_entry(i: int) -> int {
+    let mut c: int = i
+    let mut k: int = 0
+    while k < 8 {
+        # c = (c & 1) ? (c >> 1) ^ 0xEDB88320 : (c >> 1)
+        if c % 2 == 1 {
+            c = u32_xor(c / 2, 3988292384)        # 0xEDB88320
+        } else {
+            c = c / 2
+        }
+        k = k + 1
+    }
+    return c
+}
+
+fn crypto_crc32(s: str) -> int {
+    let mut crc: int = 4294967295                 # 0xFFFFFFFF
+    let n: int = s.len()
+    let mut i: int = 0
+    while i < n {
+        let idx: int = byte_xor(crc % 256, s.byte_at(i))
+        # Without XOR, use byte-level XOR for the low byte then divide by 256.
+        # idx is already correctly computed via byte_xor.
+        crc = u32_xor(crc / 256, crc32_table_entry(idx % 256))
+        i = i + 1
+    }
+    return u32_xor(crc, 4294967295)                # final XOR with 0xFFFFFFFF
+}
+
+fn crypto_crc32_hex(s: str) -> str {
+    return u32_to_hex(crypto_crc32(s))
+}
+
+# ----------------------------------------------------------------------------
+# crypto_xor(a, b) returns the byte-wise XOR of two equal-length strings.
+# Panics on length mismatch.
+# ----------------------------------------------------------------------------
+fn crypto_xor(a: str, b: str) -> str {
+    if a.len() != b.len() {
+        panic("crypto_xor: length mismatch")
+    }
+    let out: list[str] = []
+    let n: int = a.len()
+    let mut i: int = 0
+    while i < n {
+        out.push(chr(byte_xor(a.byte_at(i), b.byte_at(i))))
+        i = i + 1
+    }
+    return str_join(out, "")
+}
