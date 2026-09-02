@@ -82,6 +82,39 @@ fn json_is_str(v: JsonValue) -> bool { return v.kind == "str" }
 fn json_is_array(v: JsonValue) -> bool { return v.kind == "array" }
 fn json_is_object(v: JsonValue) -> bool { return v.kind == "object" }
 
+# Stage 10-beta: typed value accessors. Each panics if the value is not
+# of the expected kind — the caller should use json_is_* first if the
+# kind is uncertain. These make the JSON API more ergonomic (previously
+# callers had to access v.ival / v.fval / etc. as struct fields, which
+# worked but exposed the internal representation).
+fn json_bool_value(v: JsonValue) -> bool {
+    if v.kind != "bool" {
+        panic("json_bool_value: not a bool")
+    }
+    return v.bval
+}
+
+fn json_int_value(v: JsonValue) -> int {
+    if v.kind != "int" {
+        panic("json_int_value: not an int")
+    }
+    return v.ival
+}
+
+fn json_float_value(v: JsonValue) -> float {
+    if v.kind != "float" {
+        panic("json_float_value: not a float")
+    }
+    return v.fval
+}
+
+fn json_str_value(v: JsonValue) -> str {
+    if v.kind != "str" {
+        panic("json_str_value: not a str")
+    }
+    return v.sval
+}
+
 # object_get(obj, key) returns the value for key, or null if absent.
 fn json_object_get(obj: JsonValue, key: str) -> JsonValue {
     let mut i: int = 0
@@ -197,22 +230,32 @@ fn json_hex_digit(b: int) -> int {
     return -1
 }
 
-# encode a unicode codepoint (0..65535) as UTF-8 bytes appended to chars.
+# encode a unicode codepoint (0..1114111) as UTF-8 bytes appended to chars.
 # HLS v0.2 has no bitwise operators, so we use arithmetic equivalents:
 #   x & 63   ->  x % 64
 #   x & 15   ->  x % 16
 #   x >> n   ->  x / (2^n)
 #   prefix | suffix  ->  prefix + suffix   (when prefix's low bits are 0)
+# BUG-16 fix: extended to emit 4-byte UTF-8 sequences for codepoints above
+# 65535 (which arise from surrogate pair decoding). The previous version
+# only handled up to 0xFFFF and silently truncated higher codepoints.
 fn jsonp_push_utf8(chars: list[str], cp: int) -> void {
     if cp < 128 {
         chars.push(chr(cp))
     } else if cp < 2048 {
         chars.push(chr(192 + cp / 64))
         chars.push(chr(128 + cp % 64))
-    } else {
+    } else if cp < 65536 {
         chars.push(chr(224 + cp / 4096))
         chars.push(chr(128 + (cp / 64) % 64))
         chars.push(chr(128 + cp % 64))
+    } else {
+        # 4-byte UTF-8 for codepoints in [U+10000, U+10FFFF]
+        let c: int = cp - 65536
+        chars.push(chr(240 + c / 262144))
+        chars.push(chr(128 + (c / 4096) % 64))
+        chars.push(chr(128 + (c / 64) % 64))
+        chars.push(chr(128 + c % 64))
     }
 }
 
@@ -273,7 +316,54 @@ fn jsonp_parse_string(p: JsonParser) -> JsonValue {
                     code = code * 16 + hd
                     k = k + 1
                 }
-                jsonp_push_utf8(chars, code)
+                # BUG-16 fix: handle UTF-16 surrogate pairs. JSON strings
+                # can encode codepoints > U+FFFF via a high surrogate
+                # (0xD800..0xDBFF) followed by a low surrogate
+                # (0xDC00..0xDFFF). The two surrogates combine into a
+                # single codepoint = 0x10000 + ((high - 0xD800) << 10) +
+                # (low - 0xDC00). Without this fix, the parser would emit
+                # two separate 3-byte UTF-8 sequences for the surrogate
+                # codepoints themselves, which is invalid UTF-8.
+                if code >= 55296 && code <= 56319 {
+                    # High surrogate — must be followed by \uLOW.
+                    if p.pos + 6 < n
+                       && p.src.byte_at(p.pos + 1) == 92
+                       && p.src.byte_at(p.pos + 2) == 117 {
+                        # Skip past current \uXXXX (we're at last hex digit),
+                        # then consume the backslash + 'u'.
+                        p.pos = p.pos + 1   # past last hex digit
+                        p.pos = p.pos + 1   # past backslash
+                        p.pos = p.pos + 1   # past 'u'
+                        let mut low: int = 0
+                        let mut k2: int = 0
+                        while k2 < 4 {
+                            if p.pos >= n {
+                                jsonp_err(p, "incomplete low surrogate \\u escape")
+                            }
+                            let hd2: int = json_hex_digit(p.src.byte_at(p.pos))
+                            if hd2 < 0 {
+                                jsonp_err(p, "invalid hex digit in low surrogate")
+                            }
+                            low = low * 16 + hd2
+                            if k2 < 3 {
+                                p.pos = p.pos + 1
+                            }
+                            k2 = k2 + 1
+                        }
+                        if low < 56320 || low > 57343 {
+                            jsonp_err(p, "invalid low surrogate following high surrogate")
+                        }
+                        let cp: int = 65536 + (code - 55296) * 1024 + (low - 56320)
+                        jsonp_push_utf8(chars, cp)
+                    } else {
+                        jsonp_err(p, "high surrogate not followed by low surrogate")
+                    }
+                } else if code >= 56320 && code <= 57343 {
+                    # Low surrogate without preceding high surrogate.
+                    jsonp_err(p, "low surrogate without preceding high surrogate")
+                } else {
+                    jsonp_push_utf8(chars, code)
+                }
             } else {
                 jsonp_err(p, "invalid escape sequence")
             }

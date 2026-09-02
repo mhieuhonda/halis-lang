@@ -216,7 +216,11 @@ class Interp:
             n = len(lst)  # snapshot length once (SPEC section 5)
             i = 0
             while i < n:
-                env.append({s["var"]: [lst[i], False]})
+                # BUG-22 fix: use a 3-element binding [value, mut, moved]
+                # to match all other bindings in the interpreter. The
+                # previous 2-element form was internally inconsistent and
+                # would have crashed any future code that indexed [2].
+                env.append({s["var"]: [lst[i], False, False]})
                 try:
                     self.exec_stmts(s["body"], env)
                 except BreakSig:
@@ -470,6 +474,16 @@ class Interp:
                     return f.read()
             except OSError:
                 raise HLPanic("cannot open file: %s" % to_display(args[0]), line)
+        # Stage 10-beta: read_file_tainted(path) — same as read_file but
+        # the returned str is wrapped as tainted[str]. The wrapper dict
+        # format is identical to taint_mark's output.
+        if name == "read_file_tainted":
+            try:
+                with open(args[0], "rb") as f:
+                    content = f.read()
+                return {"tainted": True, "value": content}
+            except OSError:
+                raise HLPanic("cannot open file: %s" % to_display(args[0]), line)
         if name == "write_file":
             try:
                 with open(args[0], "wb") as f:
@@ -520,11 +534,13 @@ class Interp:
             v = args[0]
             if isinstance(v, dict) and "tainted" in v:
                 return v["value"]
-            # Defensive: if a user constructs the wrapper manually and
-            # forgets the flag, unwrap anyway.
-            if isinstance(v, dict):
-                return v.get("value", v)
-            return v
+            # BUG-23 fix: the previous defensive fallback returned the
+            # "value" field of ANY dict (including user structs that
+            # happen to have a field named "value"). Since the checker
+            # guarantees args[0] is a tainted[T], we panic if we get here
+            # without the taint wrapper — that indicates a checker bug.
+            raise HLPanic("taint_unwrap: expected tainted[T] wrapper, "
+                          "got a non-tainted value", line)
         raise HLPanic("unknown builtin function: %s" % name, line)
 
     def deep_clone(self, v):
@@ -581,12 +597,12 @@ class Interp:
         if op == "str.to_int":
             return parse_int(t, line)
         if op == "str.to_float":
-            # strict: ^-?[0-9]+(\.[0-9]+)?$ OR ^-?[0-9]*\.[0-9]+$ — matches the C version
-            # BUG-007 fix: must require at least one digit on at least one
-            # side of the decimal point, otherwise Python's float(b".") raises
-            # ValueError which crashes Stage-0 with a stack trace. The C
-            # runtime's strtod(".") returns 0.0 silently, so for parity we
-            # also reject "." here (panicking with a clean HLPanic).
+            # strict: ^-?[0-9]+(\.[0-9]+)?([eE][-+]?[0-9]+)?$ — matches the C version
+            # BUG-007 fix: must require at least one digit; "." alone is invalid.
+            # BUG-4 fix (Stage 10-beta): accept optional scientific notation
+            # exponent so JSON parsers can produce floats like "1e5", "1.5e-3",
+            # etc. Previously the function rejected any non-digit/non-dot char
+            # (including 'e'/'E'), which made json_parse("1e5") panic.
             i = 0
             if t[0:1] == b"-":
                 i = 1
@@ -594,16 +610,32 @@ class Interp:
                 raise HLPanic("cannot convert string to float", line)
             dots = 0
             digits = 0
+            saw_exp = False
+            exp_digits = 0
             while i < len(t):
                 c = t[i]
-                if c == 46:
+                if c == 46:  # '.'
+                    if saw_exp:
+                        raise HLPanic("cannot convert string to float", line)
                     dots += 1
                 elif 48 <= c <= 57:
+                    if saw_exp:
+                        exp_digits += 1
                     digits += 1
+                elif c == 101 or c == 69:  # 'e' or 'E'
+                    if saw_exp or digits == 0:
+                        raise HLPanic("cannot convert string to float", line)
+                    saw_exp = True
+                    # Optional sign after e/E.
+                    if i + 1 < len(t) and (t[i + 1] == 43 or t[i + 1] == 45):
+                        i += 1
+                    exp_digits = 0
                 else:
                     raise HLPanic("cannot convert string to float", line)
                 i += 1
             if dots > 1 or digits == 0:
+                raise HLPanic("cannot convert string to float", line)
+            if saw_exp and exp_digits == 0:
                 raise HLPanic("cannot convert string to float", line)
             return float(t)
         if op == "str.to_str":
@@ -617,7 +649,15 @@ class Interp:
         if op == "float.to_str":
             return fmt_float(t)
         if op == "float.to_int":
-            return int(t)
+            # BUG-15 fix: range-check the conversion. Python's int() on a
+            # large float (e.g. 1e20) returns a Python int exceeding int64
+            # range, which would then propagate as a "valid" int and only
+            # trip the next arithmetic op. Panic early here so the error
+            # points to the actual source.
+            r = int(t)
+            if r < INT64_MIN or r > INT64_MAX:
+                raise HLPanic("float.to_int out of int64 range", line)
+            return r
         if op == "float.abs":
             return abs(t)
         if op == "bool.to_str":

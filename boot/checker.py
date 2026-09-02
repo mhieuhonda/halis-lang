@@ -79,21 +79,37 @@ def type_args(t):
 
 
 def instantiate_type(t, type_map):
-    """Substitute type parameters in `t` according to `type_map`."""
+    """Substitute type parameters in `t` according to `type_map`.
+
+    BUG-31 fix: if `type_map[T]` itself contains type params, recurse to
+    substitute them as well. The original implementation returned the
+    first lookup result without recursing, leaving inner type params
+    unbound in the output. To avoid infinite loops on (illegal) self-
+    referential maps, we cap recursion at 16 levels.
+    """
+    return _instantiate_type(t, type_map, 0)
+
+
+def _instantiate_type(t, type_map, depth):
+    if depth > 16:
+        return t  # safety cap — should never happen with valid input
     if t in type_map:
-        return type_map[t]
+        # Recurse on the substituted value: it may itself contain type
+        # params that need to be substituted (e.g. type_map[T] =
+        # "list[U]", type_map[U] = "int" → "list[int]").
+        return _instantiate_type(type_map[t], type_map, depth + 1)
     if t in ("int", "float", "bool", "str", "void"):
         return t
     if is_list(t):
-        return "list[" + instantiate_type(list_elem(t), type_map) + "]"
+        return "list[" + _instantiate_type(list_elem(t), type_map, depth + 1) + "]"
     if is_map(t):
-        return "map[str, " + instantiate_type(map_val(t), type_map) + "]"
+        return "map[str, " + _instantiate_type(map_val(t), type_map, depth + 1) + "]"
     if is_taint(t):
-        return "tainted[" + instantiate_type(taint_inner(t), type_map) + "]"
+        return "tainted[" + _instantiate_type(taint_inner(t), type_map, depth + 1) + "]"
     if "[" in t and t.endswith("]"):
         base = type_base(t)
         args = type_args(t)
-        new_args = [instantiate_type(a, type_map) for a in args]
+        new_args = [_instantiate_type(a, type_map, depth + 1) for a in args]
         return base + "[" + ", ".join(new_args) + "]"
     return t
 
@@ -133,6 +149,8 @@ BUILTIN_FNS = {
     "drop", "clone", "take",
     # Stage 10-alpha: taint-tracking primitives (v0.7.0-alpha)
     "tainted_args", "taint_mark", "taint_unwrap",
+    # Stage 10-beta: more taint sources (v0.8.0-alpha)
+    "read_file_tainted",
 }
 
 # Stage 9-alpha: per-builtin effect mapping. Pure builtins (panic, str, int,
@@ -150,6 +168,9 @@ BUILTIN_EFFECTS = {
     "exit":        {"Exit"},
     # Stage 10-alpha: tainted_args carries the Args effect (same as args).
     "tainted_args": {"Args"},
+    # Stage 10-beta: read_file_tainted carries the Fs effect (same as
+    # read_file) and returns a tainted[str].
+    "read_file_tainted": {"Fs"},
     # taint_mark / taint_unwrap are pure (no side effect; just wrap/unwrap).
 }
 
@@ -167,29 +188,31 @@ def is_owned_type(t):
 # std/taint.hls). The checker statically rejects passing a tainted value
 # into a SINK (console output, filesystem, process exit). The user must
 # explicitly untaint via a sanitizer (sanitize_html / sanitize_path /
-# sanitize_sql / sanitize_command) or `taint_unwrap` (the "I know what I'm
-# doing" escape hatch) before reaching the sink.
+# sanitize_sql_identifier / sanitize_sql_string / sanitize_command /
+# sanitize_filename) or `taint_unwrap` (the "I know what I'm doing"
+# escape hatch) before reaching the sink.
 #
-# Sinks are a hardcoded subset of BUILTIN_FNS — see SINK_BUILTINS below.
-# Per-builtin sink-argument indexes are listed in SINK_ARG_INDEX.
+# SINK_BUILTINS is the SINGLE SOURCE OF TRUTH for taint sink enforcement.
+# Each entry maps a sink builtin name to the tuple of tainted-rejecting
+# argument indexes (0-based). The check_builtin_call function consults
+# this table via reject_tainted_at_sink.
 SINK_BUILTINS = {
     "print":        (0,),   # the message is the taint vector
     "println":      (0,),
-    "read_file":     (0,),  # tainted path → path-traversal
-    "write_file":    (0, 1),  # tainted path or content → both bad
-    "exit":          (0,),   # tainted exit code → behavior-injection
+    "read_file":    (0,),   # tainted path → path-traversal
+    "write_file":   (0, 1),  # tainted path or content → both bad
+    "file_exists":  (0,),   # tainted path → information disclosure / traversal
+    "exit":         (0,),    # tainted exit code → behavior-injection
 }
 
 # Returns True iff `t` is the taint wrapper type `tainted[T]` for any T.
 def is_tainted_type(t):
-    return t.startswith("tainted[") or t.startswith("Tainted[")
+    return t.startswith("tainted[")
 
 
 def list_taint_inner(t):
     """For `tainted[T]` return T; otherwise return t unchanged."""
     if t.startswith("tainted["):
-        return t[8:-1].strip()
-    if t.startswith("Tainted["):
         return t[8:-1].strip()
     return t
 
@@ -953,9 +976,16 @@ class Checker:
             # Generic function: infer type args from argument types.
             typeparams = fn.get("typeparams", [])
             type_map = {}
+            # BUG-A2 fix (carried over from BUG-A): cache the first-pass
+            # type per argument so we don't re-run check_expr on the same
+            # argument in the second pass. Calling check_expr twice would
+            # re-execute side effects (drop/take move-marking) and produce
+            # spurious "use of moved value" errors.
+            first_at = [None] * len(args)
             if typeparams:
-                for a, (pn, pt, _) in zip(args, fn["params"]):
+                for i, (a, (pn, pt, _)) in enumerate(zip(args, fn["params"])):
                     at = self.check_expr(a, env, None)
+                    first_at[i] = at
                     if at == "never":
                         continue
                     unify(pt, at, typeparams, type_map)
@@ -964,12 +994,17 @@ class Checker:
                         self.err("cannot infer type argument for %s; provide explicit types"
                                  % tp, e)
             # Type-check arguments against instantiated parameter types.
-            for a, (pn, pt, _) in zip(args, fn["params"]):
+            for i, (a, (pn, pt, _)) in enumerate(zip(args, fn["params"])):
                 if typeparams:
                     inst_pt = instantiate_type(pt, type_map)
                 else:
                     inst_pt = pt
-                at = self.check_expr(a, env, inst_pt)
+                # Reuse the first-pass type whenever it already matches the
+                # instantiated parameter type — avoids re-running check_expr
+                # (which would re-execute side effects like drop/take).
+                at = first_at[i]
+                if at is None:
+                    at = self.check_expr(a, env, inst_pt)
                 if at == "never":
                     continue
                 if at != inst_pt:
@@ -1015,8 +1050,10 @@ class Checker:
                     "taint-sink violation: %s argument %d is tainted[%s] "
                     "(tainted values must be sanitised before reaching "
                     "a sink — use sanitize_html / sanitize_path / "
-                    "sanitize_sql / sanitize_command from std.sanitize, "
-                    "or taint_unwrap() if you accept the risk)" %
+                    "sanitize_sql_identifier / sanitize_sql_string / "
+                    "sanitize_command / sanitize_filename from "
+                    "std.sanitize, or taint_unwrap() if you accept the "
+                    "risk)" %
                     (name, arg_idx + 1, list_taint_inner(at)), e)
             return at
 
@@ -1067,6 +1104,15 @@ class Checker:
             reject_tainted_at_sink(0, "str")
             self.edges[self.cur_fn].add("b:read_file")
             return "str"
+        # Stage 10-beta: read_file_tainted(path) — like read_file but the
+        # returned str is wrapped as tainted[str]. This is the second taint
+        # source (after tainted_args) and covers the common case where
+        # user-controlled content is read from a file.
+        if name == "read_file_tainted":
+            need(1)
+            reject_tainted_at_sink(0, "str")
+            self.edges[self.cur_fn].add("b:read_file_tainted")
+            return "tainted[str]"
         if name == "write_file":
             need(2)
             reject_tainted_at_sink(0, "str")
@@ -1190,21 +1236,30 @@ class Checker:
             # If the struct is itself generic, propagate its type args.
             st, struct_type_map = info
             type_map = dict(struct_type_map)
+            # BUG-A2 fix (same fix as check_call): cache the first-pass type
+            # per argument so we don't re-run check_expr on the same
+            # argument in the second pass. Calling check_expr twice would
+            # re-execute side effects (drop/take move-marking) and produce
+            # spurious "use of moved value" errors.
+            first_at = [None] * len(args)
             if typeparams:
-                for a, (pn, pt, _) in zip(args, params):
+                for i, (a, (pn, pt, _)) in enumerate(zip(args, params)):
                     at = self.check_expr(a, env, None)
+                    first_at[i] = at
                     if at == "never":
                         continue
                     unify(pt, at, typeparams, type_map)
                 for tp in typeparams:
                     if tp not in type_map:
                         self.err("cannot infer type argument for %s.%s" % (tt_base, name), e)
-            for a, (pn, pt, _) in zip(args, params):
+            for i, (a, (pn, pt, _)) in enumerate(zip(args, params)):
                 if type_map:
                     inst_pt = instantiate_type(pt, type_map)
                 else:
                     inst_pt = pt
-                at = self.check_expr(a, env, inst_pt)
+                at = first_at[i]
+                if at is None:
+                    at = self.check_expr(a, env, inst_pt)
                 if at == "never":
                     continue
                 if at != inst_pt:
@@ -1412,6 +1467,18 @@ class Checker:
                 type_map[tp] = ia
             ok_payload = ok_variant[1][0]
             success_t = instantiate_type(ok_payload, type_map)
+            # BUG-3 fix: verify the error payload type matches the enclosing
+            # function's error type argument. Without this check, `?` on a
+            # `Result[int, int]` inside a function returning `Result[int, str]`
+            # would silently propagate an `Err(int)` as if it were `Err(str)`.
+            if err_variant[1]:  # has a payload (Err, not None)
+                err_payload_t = instantiate_type(err_variant[1][0], type_map)
+                cur_ret_args = type_args(self.cur_fn_ret) if "[" in self.cur_fn_ret else []
+                # The error type argument is the LAST type arg of the return.
+                if cur_ret_args and err_payload_t != cur_ret_args[-1]:
+                    self.err("? operator: error payload type %s does not match "
+                             "enclosing function's error type %s (in return type %s)"
+                             % (err_payload_t, cur_ret_args[-1], self.cur_fn_ret), e)
         else:
             success_t = ok_variant[1][0]
         # Check that the enclosing function's return type is compatible.

@@ -93,11 +93,10 @@ def load_program(entry_path):
                 src = f.read()
         except OSError:
             raise HLError("cannot open file: %s" % abs_path, 0, 0)
-        try:
-            toks = tokenize(src)
-            program = Parser(toks).parse_program()
-        except HLError:
-            raise
+        # BUG-20 fix: removed the redundant `except HLError: raise` block —
+        # catching an exception only to re-raise it unchanged is a no-op.
+        toks = tokenize(src)
+        program = Parser(toks).parse_program()
         # Resolve transitive imports first
         for imp in program["imports"]:
             resolved = _resolve_import(imp["path"], abs_path)
@@ -118,12 +117,14 @@ def load_program(entry_path):
     for abs_path in load_order:
         prog = loaded[abs_path]
         for sname, sdef in prog["structs"].items():
-            if sname in merged["structs"]:
-                raise HLError("duplicate struct across modules: %s" % sname, 0, 0)
+            # BUG-14 fix: struct names must not collide with each other
+            # OR with any enum defined in another module.
+            if sname in merged["structs"] or sname in merged["enums"]:
+                raise HLError("duplicate type name across modules: %s" % sname, 0, 0)
             merged["structs"][sname] = sdef
         for ename, edef in prog["enums"].items():
             if ename in merged["enums"] or ename in merged["structs"]:
-                raise HLError("duplicate enum across modules: %s" % ename, 0, 0)
+                raise HLError("duplicate type name across modules: %s" % ename, 0, 0)
             merged["enums"][ename] = edef
         for fname, fdef in prog["fns"].items():
             if fname in merged["fns"]:
@@ -235,28 +236,62 @@ def print_audit(program, checker):
     # Sinks: builtins that reject tainted values at the checker.
     # Unwraps: builtins / functions that explicitly untaint.
     print("")
-    print("  Taint sources (builtins):  tainted_args")
+    print("  Taint sources (builtins):  tainted_args, read_file_tainted")
     print("  Taint sinks (builtins):    print, println, read_file,")
     print("                            write_file, file_exists, exit")
     print("  Explicit untaint:         taint_unwrap, std.sanitize.*")
-    # Scan the call graph for actual taint-source / taint-unwrap usage.
+    # Scan the call graph for actual taint-source usage.
+    # (BUG-21 cleanup: removed the unused `unwrap_users` and `sanitize_users`
+    # lists — they were allocated but never appended to. Deeper taint-flow
+    # reporting is deferred to Stage 10-beta's `--audit` extension.)
     src_users = []
-    unwrap_users = []
-    sanitize_users = []
     for key, fn in fns.items():
         callees = checker.edges.get(key, set())
         if "b:tainted_args" in callees:
             src_users.append(key)
-        # taint_unwrap is a pure builtin, no edge recorded by default.
-        # We look at the body via a textual scan of the AST — but that's
-        # expensive. For the audit summary, simply note the available
-        # surface; deeper taint-flow reporting is deferred to Stage 10-beta.
     if src_users:
         print("  Functions calling tainted_args():")
         for k in src_users:
             print("    - " + k)
     else:
         print("  No function calls tainted_args() (no taint sources in this program).")
+
+    # Stage 10-beta: taint-flow audit extension. Scan the call graph for:
+    #   - functions calling read_file_tainted (second taint source)
+    #   - functions calling each taint sink (print, println, read_file,
+    #     write_file, file_exists, exit)
+    #   - functions calling taint_unwrap (the escape hatch)
+    rft_users = []
+    for key, fn in fns.items():
+        callees = checker.edges.get(key, set())
+        if "b:read_file_tainted" in callees:
+            rft_users.append(key)
+    if rft_users:
+        print("  Functions calling read_file_tainted():")
+        for k in rft_users:
+            print("    - " + k)
+    else:
+        print("  No function calls read_file_tainted().")
+
+    # Taint sinks: which functions call each sink?
+    SINK_BUILTIN_NAMES = ("b:print", "b:println", "b:read_file",
+                          "b:write_file", "b:file_exists", "b:exit")
+    sink_users = {b: [] for b in SINK_BUILTIN_NAMES}
+    for key, fn in fns.items():
+        callees = checker.edges.get(key, set())
+        for b in SINK_BUILTIN_NAMES:
+            if b in callees:
+                sink_users[b].append(key)
+    print("  Taint sinks called:")
+    for b in SINK_BUILTIN_NAMES:
+        users = sink_users[b]
+        bname = b[2:]  # strip "b:" prefix
+        if users:
+            print("    %s (%d):" % (bname, len(users)))
+            for k in users:
+                print("      - " + k)
+        else:
+            print("    %s (0):" % bname)
 
 
 def main():

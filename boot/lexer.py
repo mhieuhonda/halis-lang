@@ -6,6 +6,14 @@ KEYWORDS = {
     "enum", "match", "pure",
 }
 
+# BUG-29 fix: reserved identifiers (per SPEC.md section 2.5). These are
+# not keywords (they don't participate in syntax) but using them as the
+# name of a function, struct, enum, variable, or field raises a clear
+# compile error. This prevents code written against future Stage
+# additions (secure / trait) from silently breaking when those features
+# land and the names become keywords.
+RESERVED_IDENTIFIERS = {"secure", "trait"}
+
 TWO_CHAR = ("->", "==", "!=", "<=", ">=", "&&", "||", "=>")
 ONE_CHAR = set("(){}[],:.<>+-*/%!=?")
 
@@ -129,11 +137,7 @@ def tokenize(src):
                 if ch < 32:
                     err("string contains invalid control character")
                 out.append(ch)
-                if ch == 10:
-                    line += 1
-                    col = 1
-                else:
-                    col += 1
+                col += 1
                 i += 1
             toks.append({"k": "str", "v": bytes(out), "line": ln, "col": cl})
             continue

@@ -1,5 +1,5 @@
 """Stage-0 parser for HLS. Conforms to SPEC.md sections 4-6, 11b-12 (v0.3)."""
-from .lexer import HLError
+from .lexer import HLError, RESERVED_IDENTIFIERS
 
 INT64_MAX = 9223372036854775807
 INT64_MIN = -9223372036854775808
@@ -64,6 +64,11 @@ class Parser:
         t = self.peek()
         if t["k"] != "ident":
             self.err("expected identifier but got %s" % self._desc())
+        # BUG-29 fix: reject reserved identifiers (secure / trait) — they
+        # are reserved for future keywords per SPEC section 2.5.
+        if t["v"] in RESERVED_IDENTIFIERS:
+            self.err("'%s' is a reserved identifier and cannot be used as "
+                     "a name (it will become a keyword in a future stage)" % t["v"], t)
         return self.next()
 
     def _desc(self):
@@ -511,14 +516,21 @@ class Parser:
         return {"k": "match", "scrut": scrut, "arms": arms, "line": t0["line"]}
 
     def parse_arm(self):
+        # BUG-32 fix: capture the arm's line from the FIRST token of the
+        # pattern (not the token after the body, which is the next arm or
+        # the closing `}`). Error messages for arm issues now point to
+        # the right line.
+        arm_line = self.peek()["line"]
         # pattern: _ | _Ident (wildcard with optional bind, only `_` here)
         #        | Name.Variant
         #        | Name.Variant(Ident, Ident, ...)   (with payload bindings)
         #        | Name.Variant(_)                    (payload ignored)
-        # NOTE (BUG-001 fix): `_` is tokenized by the lexer as an `ident`
-        # token (because `_is_ident_start` returns True for byte 95), NOT
-        # as a `sym`. So we must test for both kinds here.
-        if self.at_sym("_") or (self.peek()["k"] == "ident" and self.peek()["v"] == "_"):
+        # NOTE (BUG-001 fix, BUG-18 cleanup): `_` is tokenized by the lexer
+        # as an `ident` token (because `_is_ident_start` returns True for
+        # byte 95). It is NEVER a `sym` token, so we only need to test for
+        # the ident form here — the at_sym("_") check is dead code and has
+        # been removed.
+        if self.peek()["k"] == "ident" and self.peek()["v"] == "_":
             self.next()
             pattern = {"k": "wildcard"}
         else:
@@ -535,8 +547,8 @@ class Parser:
                 has_paren = True
                 self.next()
                 while not self.at_sym(")"):
-                    # NOTE (BUG-001 fix): `_` is an ident token, not a sym.
-                    if self.at_sym("_") or (self.peek()["k"] == "ident" and self.peek()["v"] == "_"):
+                    # NOTE (BUG-001 fix, BUG-18 cleanup): `_` is an ident token.
+                    if self.peek()["k"] == "ident" and self.peek()["v"] == "_":
                         self.next()
                         bindings.append("_")  # wildcard — payload ignored
                     else:
@@ -551,11 +563,20 @@ class Parser:
                        "bindings": bindings, "has_paren": has_paren}
         self.eat_sym("=>")
         body = self.parse_expr()
-        return {"pattern": pattern, "body": body, "line": self.peek()["line"]}
+        return {"pattern": pattern, "body": body, "line": arm_line}
 
     def parse_primary(self, allow_struct):
         t = self.peek()
         if t["k"] == "int":
+            # BUG-37 analysis: the parser INTENTIONALLY allows literals up
+            # to (and including) 2^63 as an intermediate value, so that the
+            # unary-minus handler in parse_unary() can fold the literal
+            # `-9223372036854775808` (= INT64_MIN) into a single int node
+            # instead of evaluating `-` then `9223372036854775808` and
+            # panicking on the i64_neg of INT64_MIN. The checker then
+            # rejects POSITIVE literals exceeding INT64_MAX (2^63 - 1) at
+            # check time. So the parser's `2**63` boundary here is correct;
+            # any tighter bound would break the INT64_MIN literal.
             if t["v"] > 2 ** 63:
                 self.err("integer literal too large (exceeds int64)")
             self.next()

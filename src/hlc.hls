@@ -351,12 +351,28 @@ fn split_args_str(s: str) -> list[str] {
 
 # instantiate_type(t, typeparams, typeargs) substitutes each type param in `t`
 # with the corresponding concrete type from `typeargs`.
+# BUG-31 fix: recurse on the substituted value — but cap recursion at 16
+# levels to prevent infinite loops when a type arg IS itself a type param
+# (which happens when a generic function calls another generic function
+# with the same type-param names). The original code returned the first
+# lookup result without recursing, which left inner type params
+# unbound in some edge cases.
 fn instantiate_type(t: str, tps: list[str], targs: list[str]) -> str {
+    return instantiate_type_d(t, tps, targs, 0)
+}
+
+fn instantiate_type_d(t: str, tps: list[str], targs: list[str], depth: int) -> str {
+    if depth > 16 {
+        return t
+    }
     # First: if t is exactly a type param, substitute.
     let mut i: int = 0
     while i < tps.len() {
         if t == tps.get(i) {
-            return targs.get(i)
+            # Recurse on the substituted value — it may itself contain type
+            # params that need to be substituted (e.g. targs[i] = "list[U]"
+            # where U is another type param).
+            return instantiate_type_d(targs.get(i), tps, targs, depth + 1)
         }
         i = i + 1
     }
@@ -365,17 +381,17 @@ fn instantiate_type(t: str, tps: list[str], targs: list[str]) -> str {
     }
     if is_list_t(t) {
         let inner: str = list_elem_t(t)
-        let new_inner: str = instantiate_type(inner, tps, targs)
+        let new_inner: str = instantiate_type_d(inner, tps, targs, depth + 1)
         return "list[" + new_inner + "]"
     }
     if is_map_t(t) {
         let val: str = map_val_t(t)
-        let new_val: str = instantiate_type(val, tps, targs)
+        let new_val: str = instantiate_type_d(val, tps, targs, depth + 1)
         return "map[str, " + new_val + "]"
     }
     if is_taint_t(t) {
         let inner: str = taint_inner_t(t)
-        let new_inner: str = instantiate_type(inner, tps, targs)
+        let new_inner: str = instantiate_type_d(inner, tps, targs, depth + 1)
         return "tainted[" + new_inner + "]"
     }
     # User-defined type with possible type args
@@ -390,7 +406,7 @@ fn instantiate_type(t: str, tps: list[str], targs: list[str]) -> str {
     let new_args: list[str] = []
     let mut j: int = 0
     while j < args.len() {
-        new_args.push(instantiate_type(args.get(j), tps, targs))
+        new_args.push(instantiate_type_d(args.get(j), tps, targs, depth + 1))
         j = j + 1
     }
     return base + "[" + join(new_args, ", ") + "]"
@@ -1444,6 +1460,8 @@ fn is_builtin_fn(n: str) -> bool {
         || n == "drop" || n == "clone" || n == "take"
         # Stage 10-alpha taint primitives
         || n == "tainted_args" || n == "taint_mark" || n == "taint_unwrap"
+        # Stage 10-beta: more taint sources
+        || n == "read_file_tainted"
 }
 
 fn list_has(list: list[str], x: str) -> bool {
@@ -1716,6 +1734,10 @@ fn builtin_effect(name: str) -> list[str] {
         return ["IO"]
     }
     if name == "read_file" || name == "write_file" || name == "file_exists" {
+        return ["Fs"]
+    }
+    # Stage 10-beta: read_file_tainted is a taint source with the Fs effect.
+    if name == "read_file_tainted" {
         return ["Fs"]
     }
     if name == "clock_ms" {
@@ -2727,10 +2749,21 @@ fn check_call(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, expected
             targs.push("")
             ti = ti + 1
         }
+        # BUG-A2 fix: cache first-pass types per argument so we don't re-run
+        # check_expr on the same argument in the second pass. Calling
+        # check_expr twice would re-execute side effects (drop/take move-
+        # marking) and produce a spurious "use of moved value" error.
+        let first_at: list[str] = []
+        let mut fai: int = 0
+        while fai < ctx.exprs[e].args.len() {
+            first_at.push("")
+            fai = fai + 1
+        }
         if typeparams.len() > 0 {
             let mut ai: int = 0
             while ai < ctx.exprs[e].args.len() {
                 let at: str = check_expr(ctx, env, cur, ctx.exprs[e].args.get(ai), "")
+                first_at.set(ai, at)
                 if at != "never" {
                     unify_into(ctx, f.ptypes.get(ai), at, typeparams, targs)
                 }
@@ -2768,7 +2801,13 @@ fn check_call(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, expected
             } else {
                 inst_pt = f.ptypes.get(i)
             }
-            let at: str = check_expr(ctx, env, cur, ctx.exprs[e].args.get(i), inst_pt)
+            # Reuse the first-pass type whenever it already matches the
+            # instantiated parameter type — avoids re-running check_expr
+            # (which would re-execute side effects like drop/take).
+            let mut at: str = first_at.get(i)
+            if at == "" {
+                at = check_expr(ctx, env, cur, ctx.exprs[e].args.get(i), inst_pt)
+            }
             if at == "never" {
                 i = i + 1
                 continue
@@ -2808,7 +2847,7 @@ fn check_builtin_call(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, 
     # untaint via taint_unwrap or a sanitizer (sanitize_html etc.).
     if name == "print" || name == "println" {
         if is_taint_t(argt.get(0)) {
-            cerr(line, "taint-sink violation: " + name + " argument 1 is " + argt.get(0) + " (tainted values must be sanitised before reaching a sink — use sanitize_html / sanitize_path / sanitize_sql / sanitize_command from std.sanitize, or taint_unwrap() if you accept the risk)")
+            cerr(line, "taint-sink violation: " + name + " argument 1 is " + argt.get(0) + " (tainted values must be sanitised before reaching a sink — use sanitize_html / sanitize_path / sanitize_sql_identifier / sanitize_sql_string / sanitize_command / sanitize_filename from std.sanitize, or taint_unwrap() if you accept the risk)")
         }
     }
     if name == "exit" {
@@ -2816,9 +2855,9 @@ fn check_builtin_call(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, 
             cerr(line, "taint-sink violation: exit argument 1 is " + argt.get(0) + " (tainted values must be sanitised before reaching a sink)")
         }
     }
-    if name == "read_file" || name == "file_exists" {
+    if name == "read_file" || name == "file_exists" || name == "read_file_tainted" {
         if is_taint_t(argt.get(0)) {
-            cerr(line, "taint-sink violation: " + name + " argument 1 is " + argt.get(0) + " (tainted values must be sanitised before reaching a sink)")
+            cerr(line, "taint-sink violation: " + name + " argument 1 is " + argt.get(0) + " (tainted values must be sanitised before reaching a sink — use sanitize_path from std.sanitize, or taint_unwrap() if you accept the risk)")
         }
     }
     if name == "write_file" {
@@ -2896,6 +2935,16 @@ fn check_builtin_call(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, 
         }
         add_edge(ctx, cur, "b:read_file")
         return "str"
+    }
+    # Stage 10-beta: read_file_tainted(path) — same as read_file but the
+    # returned str is wrapped as tainted[str]. Second taint source after
+    # tainted_args; covers user-controlled content read from a file.
+    if name == "read_file_tainted" {
+        if nargs != 1 || argt.get(0) != "str" {
+            cerr(line, "read_file_tainted() expects 1 str argument")
+        }
+        add_edge(ctx, cur, "b:read_file_tainted")
+        return "tainted[str]"
     }
     if name == "write_file" {
         if nargs != 2 || argt.get(0) != "str" || argt.get(1) != "str" {
@@ -3073,10 +3122,19 @@ fn check_method(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int) -> str
                 mi = mi + 1
             }
             # Infer method's type params from arguments.
+            # BUG-A2 fix: cache first-pass types per argument so we don't
+            # re-run check_expr on the same argument in the second pass.
+            let first_at: list[str] = []
+            let mut fa_i: int = 0
+            while fa_i < nargs {
+                first_at.push("")
+                fa_i = fa_i + 1
+            }
             if f.typeparams.len() > 0 {
                 let mut ai: int = 0
                 while ai < nargs {
                     let at: str = check_expr(ctx, env, cur, ctx.exprs[e].args.get(ai), "")
+                    first_at.set(ai, at)
                     if at != "never" {
                         # pt is f.ptypes.get(ai+1) — instantiate struct type
                         # params first, then unify with method type params.
@@ -3102,7 +3160,11 @@ fn check_method(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int) -> str
             while ai2 < nargs {
                 let pt: str = f.ptypes.get(ai2 + 1)
                 let inst_pt: str = instantiate_type(pt, type_map_tps, type_map_targs)
-                let at: str = check_expr(ctx, env, cur, ctx.exprs[e].args.get(ai2), inst_pt)
+                # Reuse the first-pass type — avoids re-running check_expr.
+                let mut at: str = first_at.get(ai2)
+                if at == "" {
+                    at = check_expr(ctx, env, cur, ctx.exprs[e].args.get(ai2), inst_pt)
+                }
                 if at == "never" {
                     ai2 = ai2 + 1
                     continue
@@ -3577,11 +3639,33 @@ fn check_qmark(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, expecte
     }
     # Compute the success value type (instantiated).
     let mut success_t: str = ""
+    let mut err_payload_t: str = ""
     if en.typeparams.len() > 0 {
         let sargs: list[str] = type_args(inner_t)
         success_t = instantiate_type(ok_payload, en.typeparams, sargs)
+        # BUG-3 fix: compute the error payload type too, so we can verify
+        # it matches the enclosing function's error type argument.
+        if err_v == "Err" {
+            # Find the Err variant's payload type from the enum definition.
+            let mut ei: int = 0
+            while ei < en.variants.len() {
+                if en.variants.get(ei) == "Err" {
+                    err_payload_t = instantiate_type(en.payloads.get(ei).get(0), en.typeparams, sargs)
+                }
+                ei = ei + 1
+            }
+        }
     } else {
         success_t = ok_payload
+        if err_v == "Err" {
+            let mut ei: int = 0
+            while ei < en.variants.len() {
+                if en.variants.get(ei) == "Err" {
+                    err_payload_t = en.payloads.get(ei).get(0)
+                }
+                ei = ei + 1
+            }
+        }
     }
     # Check that the enclosing function returns an enum of the same base.
     let cur_ret: str = ctx.cur_fn_ret
@@ -3591,6 +3675,17 @@ fn check_qmark(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, expecte
     let cur_ret_base: str = type_base(cur_ret)
     if cur_ret_base != ename {
         cerr(ctx.exprs[e].line, "? operator: enclosing function returns " + cur_ret + ", cannot propagate " + ename)
+    }
+    # BUG-3 fix: verify the error payload type matches the enclosing
+    # function's error type argument.
+    if err_payload_t != "" {
+        let cur_ret_args: list[str] = type_args(cur_ret)
+        if cur_ret_args.len() > 0 {
+            let fn_err_t: str = cur_ret_args.get(cur_ret_args.len() - 1)
+            if err_payload_t != fn_err_t {
+                cerr(ctx.exprs[e].line, "? operator: error payload type " + err_payload_t + " does not match enclosing function's error type " + fn_err_t + " (in return type " + cur_ret + ")")
+            }
+        }
     }
     ctx.exprs[e].t = success_t
     ctx.exprs[e].err_variant = err_v
@@ -4143,15 +4238,28 @@ fn runtime_lines() -> list[str] {
     r.push("static double hl_str_to_double(hl_str* s) {")
     r.push("    int64_t i = 0;")
     r.push("    int64_t dots = 0;")
+    r.push("    int64_t digits = 0;")
+    r.push("    int saw_exp = 0;")
+    r.push("    int exp_digits = 0;")
     r.push("    if (s->len == 0) hl_die(\"cannot convert string to float\");")
     r.push("    if (s->data[0] == '-') i = 1;")
     r.push("    if (i >= s->len) hl_die(\"cannot convert string to float\");")
     r.push("    for (; i < s->len; i++) {")
     r.push("        char c = s->data[i];")
-    r.push("        if (c == '.') { dots++; continue; }")
+    r.push("        if (c == '.') { if (saw_exp) hl_die(\"cannot convert string to float\"); dots++; continue; }")
+    r.push("        if (c == 'e' || c == 'E') {")
+    r.push("            if (saw_exp || digits == 0) hl_die(\"cannot convert string to float\");")
+    r.push("            saw_exp = 1;")
+    r.push("            if (i + 1 < s->len && (s->data[i+1] == '+' || s->data[i+1] == '-')) i++;")
+    r.push("            exp_digits = 0;")
+    r.push("            continue;")
+    r.push("        }")
     r.push("        if (c < '0' || c > '9') hl_die(\"cannot convert string to float\");")
+    r.push("        if (saw_exp) exp_digits++;")
+    r.push("        digits++;")
     r.push("    }")
-    r.push("    if (dots > 1) hl_die(\"cannot convert string to float\");")
+    r.push("    if (dots > 1 || digits == 0) hl_die(\"cannot convert string to float\");")
+    r.push("    if (saw_exp && exp_digits == 0) hl_die(\"cannot convert string to float\");")
     r.push("    return strtod(s->data, NULL);")
     r.push("}")
     r.push("")
@@ -4163,6 +4271,15 @@ fn runtime_lines() -> list[str] {
     r.push("")
     r.push("static double hl_fmod(double a, double b) {")
     r.push("    return fmod(a, b);")
+    r.push("}")
+    r.push("")
+    r.push("// BUG-15 fix: range-checked float -> int64 conversion. C casts")
+    r.push("// silently truncate out-of-range floats; we panic instead so the")
+    r.push("// error points to the actual source of the bad value.")
+    r.push("static int64_t hl_float_to_int(double v) {")
+    r.push("    if (v < -9.2233720368547758e18 || v > 9.2233720368547757e18)")
+    r.push("        hl_die(\"float.to_int out of int64 range\");")
+    r.push("    return (int64_t)v;")
     r.push("}")
     r.push("")
     r.push("// file_exists: returns true if the path is a regular file")
@@ -4669,6 +4786,11 @@ fn gen_call(ctx: Ctx, e: int) -> str {
     if name == "read_file" {
         return "hl_read_file(" + args + ")"
     }
+    # Stage 10-beta: read_file_tainted — at runtime, returns the same hl_read_file
+    # result; taint is a compile-time property only (defense-in-depth is deferred).
+    if name == "read_file_tainted" {
+        return "hl_read_file(" + args + ")"
+    }
     if name == "write_file" {
         return "hl_write_file(" + args + ")"
     }
@@ -4792,7 +4914,7 @@ fn gen_method(ctx: Ctx, e: int) -> str {
         return "hl_str_from_double(" + t0 + ")"
     }
     if op == "float.to_int" {
-        return "((int64_t)(" + t0 + "))"
+        return "hl_float_to_int(" + t0 + ")"
     }
     if op == "float.abs" {
         return "(((" + t0 + ") < 0) ? -(" + t0 + ") : (" + t0 + "))"
@@ -5970,6 +6092,59 @@ fn print_audit(ctx: Ctx) -> void uses IO {
     println("  Active effects:    IO, Fs, Clock, Args, Exit")
     println("  Reserved effects:  Net, Rand, Proc  (error if used)")
     println("  `uses IO` expands to: {IO, Fs, Clock, Args, Exit}")
+    println("")
+    # Stage 10-beta: taint-flow audit extension. Scan the call graph for:
+    #   - functions calling taint sources (tainted_args, read_file_tainted)
+    #   - functions calling each taint sink
+    println("  Taint sources (builtins):  tainted_args, read_file_tainted")
+    println("  Taint sinks (builtins):    print, println, read_file,")
+    println("                            write_file, file_exists, exit")
+    println("  Explicit untaint:         taint_unwrap, std.sanitize.*")
+    println("")
+    # Find functions calling each taint source.
+    let mut targs_users: list[str] = []
+    let mut rft_users: list[str] = []
+    let mut si: int = 0
+    while si < keys.len() {
+        let skey: str = keys.get(si)
+        let callees: list[str] = ctx.edges.get_or(skey, [])
+        let mut cj: int = 0
+        while cj < callees.len() {
+            let ce: str = callees.get(cj)
+            if ce == "b:tainted_args" {
+                if !list_has(targs_users, skey) {
+                    targs_users.push(skey)
+                }
+            }
+            if ce == "b:read_file_tainted" {
+                if !list_has(rft_users, skey) {
+                    rft_users.push(skey)
+                }
+            }
+            cj = cj + 1
+        }
+        si = si + 1
+    }
+    if targs_users.len() > 0 {
+        println("  Functions calling tainted_args():")
+        let mut ti: int = 0
+        while ti < targs_users.len() {
+            println("    - " + targs_users.get(ti))
+            ti = ti + 1
+        }
+    } else {
+        println("  No function calls tainted_args() (no argv-taint sources in this program).")
+    }
+    if rft_users.len() > 0 {
+        println("  Functions calling read_file_tainted():")
+        let mut ri: int = 0
+        while ri < rft_users.len() {
+            println("    - " + rft_users.get(ri))
+            ri = ri + 1
+        }
+    } else {
+        println("  No function calls read_file_tainted().")
+    }
 }
 
 # Right-pad a string with spaces to width `n`. Truncates if longer than n.
