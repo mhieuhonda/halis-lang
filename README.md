@@ -85,7 +85,8 @@ make bootstrap
 # 3. Compile your program to a native binary
 make run F=examples/primes.hls
 
-# 4. Run the full test suite (56 tests: types, effects, differential, bootstrap)
+# 4. Run the full test suite (92 tests on `feature/community-extensions`,
+#    78 on `main`: types, effects, differential, bootstrap determinism)
 make test
 ```
 
@@ -136,10 +137,11 @@ safe panics on integer overflow, `wordcount.hls` reading a real file,
 `enum_demo.hls` / `option_demo.hls` / `result_demo.hls` demonstrating Stage 7
 features (enums, match, `?` operator, Option/Result).
 
-## Standard library (Stage 6 + Stage 7)
+## Standard library (Stages 6 + 7 + community extensions)
 
-HLS ships with a small pure-HLS standard library focused on web programming
-and error handling:
+HLS ships with a small pure-HLS standard library focused on web
+programming, error handling, and the everyday utilities a working
+language needs:
 
 | Module | What it provides |
 |--------|------------------|
@@ -150,6 +152,13 @@ and error handling:
 | `std.html` | `html_escape(s)`, `html_escape_attr(s)`, `html_unescape(s)`, `html_tag(name, attrs, content)`, `html_text(s)` |
 | `std.option` (Stage 7) | `enum Option[T] { Some(T), None }`, `option_unwrap`, `option_unwrap_or`, `option_is_some`, `option_is_none` |
 | `std.result` (Stage 7) | `enum Result[T, E] { Ok(T), Err(E) }`, `result_unwrap`, `result_unwrap_or`, `result_err_or`, `result_is_ok`, `result_is_err`, `int_parse(s) -> Result[int, str]`, `float_parse(s) -> Result[float, str]` |
+| `std.hex` *(community)* | `hex_encode(s)`, `hex_decode(s)`, `hex_byte(b)` — lowercase hex of byte strings |
+| `std.base64` *(community)* | `base64_encode/decode` (RFC 4648) + `base64url_encode/decode` (URL-safe variant) |
+| `std.crypto` *(community)* | `crypto_fnv1a_32`, `crypto_fnv1a_64_hex`, `crypto_djb2`, `crypto_sdbm`, `crypto_crc32`, `crypto_crc32_hex`, `crypto_xor` — non-cryptographic hashes |
+| `std.list` *(community)* | `list_reverse_T`, `list_contains_T`, `list_index_of_T`, `list_concat_T`, `list_max/min_int`, `list_sort_int_asc/desc`, `list_dedup_sorted_int`, `list_take/drop_int`, `list_equal_str/_int` |
+| `std.time` *(community)* | `time_now_ms` (uses IO), `time_format_hms`, `time_format_iso8601`, `time_human_ms`, `time_stopwatch_start/lap` |
+| `std.csv` *(community)* | `csv_parse_default`, `csv_parse(src, delim_byte)`, `csv_stringify_default`, `csv_stringify(rows, delim_byte)` — RFC 4180 subset |
+| `std.uuid` *(community)* | `uuid_v4_deterministic(ns, counter)`, `uuid_v5_like(ns, name)`, `uuid_is_valid`, `uuid_version` |
 
 Each module is written in HLS itself and can be used inside `hlc` (the
 compiler) or any user program. Import with `import "std.option"` (or whichever
@@ -198,12 +207,12 @@ Full details: [SPEC.md](SPEC.md) · Stage-by-stage roadmap:
 
 ## Status
 
-**v0.3.0 — Stages 1–7 complete** (see ROADMAP):
+**v0.3.0 — Stages 1–7 complete on `main`** (see ROADMAP):
 
 - ✅ Complete core specification
 - ✅ Stage-0 reference (interpreted, with type + effects checking)
 - ✅ Self-hosted compiler `hlc.hls` (front-end + C backend)
-- ✅ Self-compiling fixed-point; 78/78 tests PASS
+- ✅ Self-compiling fixed-point; 78/78 tests PASS on `main`
 - ✅ Module system & standard library (Stage 6): `std.str`, `std.math`,
   `std.json`, `std.url`, `std.html`
 - ✅ **Stage 7 — Advanced type system**: `enum` + `match` (with
@@ -211,6 +220,19 @@ Full details: [SPEC.md](SPEC.md) · Stage-by-stage roadmap:
   `?` error-propagation operator, monomorphising generics on functions /
   structs / enums, struct default field values, recursive enums
 - ⬜ ownership/borrow, fine-grained effects, SSA IR, LLVM, concurrency...
+
+**`feature/community-extensions` branch — non-roadmap upgrades**
+  (see [CHANGELOG.md](CHANGELOG.md)):
+
+- ✅ CI/CD pipeline (GitHub Actions, 2×2 matrix of Python 3.8/3.11 ×
+  gcc/clang)
+- ✅ Release workflow with auto-generated release notes and source tarballs
+- ✅ Seven new pure-HLS stdlib modules: `std.hex`, `std.base64`,
+  `std.crypto`, `std.list`, `std.time`, `std.csv`, `std.uuid`
+- ✅ Seven new examples, one per new module
+- ✅ Seven new differential tests (interpreter ↔ native); 92/92 PASS
+- ✅ `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, `CHANGELOG.md`
+- ✅ `.editorconfig`, expanded `.gitignore`
 
 ## Contributing
 
