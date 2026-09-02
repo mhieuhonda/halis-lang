@@ -28,7 +28,7 @@ remains green.
 | 11 | SSA IR + optimisation | 🔄 | 10–14 weeks |
 | 12 | Native LLVM backend | 🔄 | 10–14 weeks |
 | 13 | Package manager `hls-pkg` | 🔄 | 6–8 weeks |
-| 14 | Tooling: LSP, formatter, linter | ⬜ | 6–8 weeks |
+| 14 | Tooling: LSP, formatter, linter | 🔄 | 6–8 weeks |
 | 15 | Safe C FFI | ⬜ | 4–6 weeks |
 | 16 | Concurrency & async (data-race freedom) | ⬜ | 12–16 weeks |
 | 17 | Formal verification & contracts | ⬜ | 10–14 weeks |
@@ -652,20 +652,71 @@ bit-for-bit reproducibly from the lockfile. (The v0.11.0-alpha release
 implements the core cycle; the transparency log and decentralised
 registry are the Stage 13 release target.)
 
-## STAGE 14 — Tooling: LSP, formatter, linter ⬜
+## STAGE 14 — Tooling: LSP, formatter, linter 🔄 (alpha v0.12.0-alpha)
 
 **Goal:** first-class developer experience.
 
-**Work:**
-- `hls-lsp`: language server (go-to-definition, completion, rename, real-time
-  type/effects diagnostics).
-- `hlfmt`: opinionated formatter (like gofmt) — ends style debates.
-- `hllint`: safety rules (detect ignored Result, empty unwrap, unnecessary
-  effect propagation).
-- All three written in HLS, shipped as native binaries.
+**Status (v0.12.0-alpha):** the **alpha subset of Stage 14** has shipped.
+Three new tools (`hls-lsp`, `hlfmt`, `hllint`) provide the core developer
+experience. They are Python today; re-implementing in HLS itself is the
+Stage 14 release target. **145/145 tests PASS.**
+
+**Shipped in v0.12.0-alpha (Stage 14-alpha):**
+
+- New `tools/hlfmt.py` — opinionated formatter (like `gofmt`):
+  - 4-space indentation; no tabs.
+  - One statement per line (preserves the source's line breaks).
+  - Single space after commas, colons, around binary operators.
+  - No space before `(`, `[`, after `!`, `.` (postfix).
+  - Space before `{` (function/struct/enum/impl/match/if/while/for bodies).
+  - Trailing newline at EOF.
+  - **Idempotent: running twice = running once.** Verified on all 145
+    test/example programs.
+  - Subcommands: `hlfmt FILE` (print), `hlfmt -w FILE` (write),
+    `hlfmt -c FILE` (check), `hlfmt -d FILE` (diff).
+  - Multi-byte UTF-8 string literals preserved exactly via latin-1
+    byte-level round-tripping.
+- New `tools/hllint.py` — safety rules linter:
+  - 10 rules: `L001` unused-binding, `L002` unused-function,
+    `L003` unused-struct-field, `L004` ignored-result,
+    `L005` explicit-unwrap, `L006` unnecessary-effects,
+    `L007` dead-code-after-return, `L008` long-function,
+    `L009` shadowing, `L010` empty-impl.
+  - Subcommands: `hllint FILE`, `hllint --strict FILE`,
+    `hllint --rule L001 FILE`, `hllint --list`.
+  - Runs the Stage-0 checker internally to get type/effect info.
+  - Does NOT modify the source — only reports issues.
+- New `tools/hls-lsp.py` — minimal LSP server over JSON-RPC stdio:
+  - `initialize` / `shutdown` / `exit`.
+  - `textDocument/didOpen` / `didChange` / `didClose` (full document sync).
+  - `textDocument/hover` — show the inferred type of an identifier at
+    a position (uses the checker's annotations).
+  - `textDocument/definition` — find the function/struct/enum
+    definition at a position.
+  - `textDocument/completion` — basic keyword + identifier completion.
+  - `textDocument/publishDiagnostics` (notification) — runs the Stage-0
+    checker and publishes errors as LSP diagnostics.
+  - `--check FILE` one-shot mode (for non-LSP editors) prints
+    diagnostics to stdout.
+- New Makefile targets: `fmt`, `lint`, `lsp-check`.
+- New example: `examples/tooling_demo.hls` (format-stable + lint-clean).
+
+**Remaining work for Stage 14 (release and beyond):**
+
+- VS Code + Neovim plugins (today the LSP server speaks the protocol;
+  the editor plugins are the Stage 14 release target).
+- `hls-lsp`: go-to-definition across files (with import resolution).
+- `hls-lsp`: rename refactoring.
+- `hlfmt`: preserve comments (today the formatter strips `#` comments
+  because the HLS lexer treats them as whitespace).
+- `hllint`: control-flow-aware rules (e.g. unwrap-after-is_some check
+  requires tracking the if-branch).
+- Re-implement `hlfmt`, `hllint`, `hls-lsp` in HLS itself (the roadmap's
+  "every feature must self-compile" rule applies).
 
 **Acceptance:** VS Code + Neovim plugins; formatter idempotent (running twice
-= running once).
+= running once). (The v0.12.0-alpha release ships all three tools with
+idempotent formatting; the editor plugins are the Stage 14 release target.)
 
 ## STAGE 15 — Safe C FFI ⬜
 

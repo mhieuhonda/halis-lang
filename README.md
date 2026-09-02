@@ -144,6 +144,13 @@ python3 ../tools/hls-pkg.py lock    # resolves deps + enforces effect surface
 python3 ../tools/hls-pkg.py audit  # total effect report of dep tree
 python3 ../tools/hls-pkg.py verify # check SHA-256 hashes still match
 python3 ../tools/hls-pkg.py build  # compile main.hls
+
+# 12. Stage 14-alpha: tooling (v0.12.0-alpha)
+python3 tools/hlfmt.py examples/hello.hls            # format to stdout
+python3 tools/hlfmt.py -c examples/hello.hls          # check formatting
+python3 tools/hllint.py examples/hello.hls            # lint
+python3 tools/hllint.py --list                        # list rules
+python3 tools/hls-lsp.py --check examples/hello.hls   # one-shot diagnostics
 ```
 
 ## Language example

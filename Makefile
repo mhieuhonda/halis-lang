@@ -8,7 +8,7 @@ HLC     = src/hlc.hls
 BIN     = bin
 PREFIX  ?= /usr/local
 
-.PHONY: all stage0 bootstrap test examples clean run check bench install uninstall audit opt-stats emit-ir emit-llvm
+.PHONY: all stage0 bootstrap test examples clean run check bench install uninstall audit opt-stats emit-ir emit-llvm fmt lint lsp-check
 
 # Main goal: use the full bootstrap chain to build the native compiler
 all: bootstrap
@@ -68,6 +68,18 @@ emit-llvm:
 # Stage 11: run the optimiser and print per-pass statistics
 opt-stats:
 	@$(PYTHON) boot/boot.py --opt-stats $(F)
+
+# Stage 14 (v0.12.0-alpha): opinionated formatter
+fmt:
+	@$(PYTHON) tools/hlfmt.py $(F)
+
+# Stage 14: linter
+lint:
+	@$(PYTHON) tools/hllint.py $(F)
+
+# Stage 14: one-shot LSP diagnostics (for non-LSP editors)
+lsp-check:
+	@$(PYTHON) tools/hls-lsp.py --check $(F)
 
 # Run the example programs to verify they still work after a change
 examples:

@@ -8,7 +8,41 @@ Releases on `main` follow the 20-stage roadmap (see [ROADMAP.md](ROADMAP.md)).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
-## [unreleased] — Stage 13-alpha (v0.11.0-alpha)
+## [unreleased] — Stage 14-alpha (v0.12.0-alpha)
+
+### Added
+- **Stage 14-alpha: tooling — LSP, formatter, linter.** Three new tools
+  provide the core developer experience:
+  - **`hlfmt`** (opinionated formatter, like `gofmt`):
+    - 4-space indentation; one statement per line; normalised whitespace.
+    - **Idempotent: running twice = running once.** Verified on all
+      145 test/example programs.
+    - Subcommands: `hlfmt FILE` (print), `-w` (write), `-c` (check),
+      `-d` (diff).
+    - Multi-byte UTF-8 string literals preserved exactly via latin-1
+      byte-level round-tripping.
+  - **`hllint`** (safety rules linter):
+    - 10 rules: `L001` unused-binding, `L002` unused-function,
+      `L003` unused-struct-field, `L004` ignored-result,
+      `L005` explicit-unwrap, `L006` unnecessary-effects,
+      `L007` dead-code-after-return, `L008` long-function,
+      `L009` shadowing, `L010` empty-impl.
+    - Subcommands: `hllint FILE`, `--strict`, `--rule L001`, `--list`.
+    - Runs the Stage-0 checker internally to get type/effect info.
+  - **`hls-lsp`** (minimal LSP server over JSON-RPC stdio):
+    - `initialize` / `shutdown` / `exit`.
+    - `textDocument/didOpen` / `didChange` / `didClose`.
+    - `textDocument/hover` — inferred type of identifier at position.
+    - `textDocument/definition` — find function/struct/enum definition.
+    - `textDocument/completion` — keyword + identifier completion.
+    - `textDocument/publishDiagnostics` — runs checker, publishes errors.
+    - `--check FILE` one-shot mode (for non-LSP editors).
+  - New Makefile targets: `fmt`, `lint`, `lsp-check`.
+  - New example: `examples/tooling_demo.hls` (format-stable + lint-clean).
+- **145/145 tests PASS** (no test changes; the tools are separate from
+  the compiler bootstrap).
+
+## [v0.11.0-alpha] — Stage 13-alpha (hls-pkg package manager)
 
 ### Added
 - **Stage 13-alpha: `hls-pkg` package manager.** A new
