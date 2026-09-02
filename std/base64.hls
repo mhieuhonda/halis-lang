@@ -1,0 +1,212 @@
+# ============================================================================
+# std/base64.hls — Base64 encode / decode for Hieu Louis (RFC 4648)
+# ----------------------------------------------------------------------------
+# Pure-HLS implementation of the standard Base64 encoding used in MIME,
+# JWT, HTTP Basic auth, and many web protocols. No `uses IO` — can be used
+# anywhere, including inside the compiler `hlc` itself.
+#
+# HLS v0.3 has NO bitwise operators (no `<<`, `>>`, `&`, `|`). All bit
+# manipulations here use multiplication and division on int64 instead —
+# the largest intermediate value is 2^24 - 1, well within int64 range.
+#
+# Two operations:
+#   * base64_encode(bytes)        -> standard Base64 string (with padding)
+#   * base64_decode(b64_str)      -> original bytes  (panics on bad input)
+# Plus a URL-safe variant:
+#   * base64url_encode(bytes)     -> '-' / '_' instead of '+' / '/'
+#   * base64url_decode(b64_str)  -> original bytes
+# ============================================================================
+
+import "std.str"
+
+# Encode lookup table baked in as a function.
+# Standard alphabet: A-Z a-z 0-9 + /
+fn b64_char(i: int) -> str {
+    if i < 26 {
+        return chr(65 + i)            # A..Z
+    }
+    if i < 52 {
+        return chr(97 + (i - 26))     # a..z
+    }
+    if i < 62 {
+        return chr(48 + (i - 52))     # 0..9
+    }
+    if i == 62 {
+        return "+"
+    }
+    return "/"
+}
+
+# URL-safe alphabet uses '-' for 62 and '_' for 63.
+fn b64url_char(i: int) -> str {
+    if i < 62 {
+        return b64_char(i)
+    }
+    if i == 62 {
+        return "-"
+    }
+    return "_"
+}
+
+# Decode one base64 char to 0..63, or -1 if not a valid char.
+fn b64_decode_char(c: int) -> int {
+    if c >= 65 && c <= 90 {
+        return c - 65                  # A..Z
+    }
+    if c >= 97 && c <= 122 {
+        return c - 97 + 26              # a..z
+    }
+    if c >= 48 && c <= 57 {
+        return c - 48 + 52              # 0..9
+    }
+    if c == 43 {
+        return 62                      # '+'
+    }
+    if c == 47 {
+        return 63                      # '/'
+    }
+    return -1
+}
+
+fn b64url_decode_char(c: int) -> int {
+    if c == 45 {
+        return 62                      # '-'
+    }
+    if c == 95 {
+        return 63                      # '_'
+    }
+    return b64_decode_char(c)
+}
+
+# base64_encode(s) returns the Base64 encoding of s with '=' padding.
+fn base64_encode(s: str) -> str {
+    return b64_encode_with(s, false)
+}
+
+# base64url_encode(s) returns the URL-safe Base64 encoding of s, no padding.
+fn base64url_encode(s: str) -> str {
+    return b64_encode_with(s, true)
+}
+
+# Shared encoder. url_safe=true switches '+'/'/' to '-'/'_' and drops padding.
+fn b64_encode_with(s: str, url_safe: bool) -> str {
+    let n: int = s.len()
+    if n == 0 {
+        return ""
+    }
+    let out: list[str] = []
+    let mut i: int = 0
+    while i + 3 <= n {
+        let b0: int = s.byte_at(i)
+        let b1: int = s.byte_at(i + 1)
+        let b2: int = s.byte_at(i + 2)
+        # 24-bit triple: b0 * 65536 + b1 * 256 + b2  (no overflow at 2^24-1)
+        let t: int = b0 * 65536 + b1 * 256 + b2
+        out.push(b64_or_url(t / 262144, url_safe))         # bits 23..18
+        out.push(b64_or_url(t / 4096 % 64, url_safe))      # bits 17..12
+        out.push(b64_or_url(t / 64 % 64, url_safe))        # bits 11..6
+        out.push(b64_or_url(t % 64, url_safe))             # bits 5..0
+        i = i + 3
+    }
+    let rem: int = n - i
+    if rem == 1 {
+        let b0: int = s.byte_at(i)
+        let t: int = b0 * 65536
+        out.push(b64_or_url(t / 262144, url_safe))
+        out.push(b64_or_url(t / 4096 % 64, url_safe))
+        if !url_safe {
+            out.push("=")
+            out.push("=")
+        }
+    } else if rem == 2 {
+        let b0: int = s.byte_at(i)
+        let b1: int = s.byte_at(i + 1)
+        let t: int = b0 * 65536 + b1 * 256
+        out.push(b64_or_url(t / 262144, url_safe))
+        out.push(b64_or_url(t / 4096 % 64, url_safe))
+        out.push(b64_or_url(t / 64 % 64, url_safe))
+        if !url_safe {
+            out.push("=")
+        }
+    }
+    return str_join(out, "")
+}
+
+fn b64_or_url(idx: int, url_safe: bool) -> str {
+    if url_safe {
+        return b64url_char(idx)
+    }
+    return b64_char(idx)
+}
+
+# base64_decode(s) decodes a standard Base64 string (with or without padding)
+# back to the original bytes. Panics on invalid input.
+fn base64_decode(s: str) -> str {
+    return b64_decode_with(s, false)
+}
+
+# base64url_decode(s) decodes a URL-safe Base64 string. Padding optional.
+fn base64url_decode(s: str) -> str {
+    return b64_decode_with(s, true)
+}
+
+fn b64_decode_with(s: str, url_safe: bool) -> str {
+    let n: int = s.len()
+    if n == 0 {
+        return ""
+    }
+    let out: list[str] = []
+    let mut i: int = 0
+    while i + 4 <= n {
+        let c0: int = b64_pick(s.byte_at(i),     url_safe)
+        let c1: int = b64_pick(s.byte_at(i + 1), url_safe)
+        let c2: int = b64_pick(s.byte_at(i + 2), url_safe)
+        let c3: int = b64_pick(s.byte_at(i + 3), url_safe)
+        if c0 < 0 || c1 < 0 {
+            panic("base64_decode: invalid character")
+        }
+        let t: int = c0 * 262144 + c1 * 4096 + c2 * 64 + c3
+        out.push(chr(t / 65536 % 256))
+        if s.byte_at(i + 2) != 61 {
+            out.push(chr(t / 256 % 256))
+        }
+        if s.byte_at(i + 3) != 61 {
+            out.push(chr(t % 256))
+        }
+        i = i + 4
+    }
+    # Handle the trailing 2 or 3 chars (without padding).
+    let rem: int = n - i
+    if rem == 2 {
+        let c0: int = b64_pick(s.byte_at(i),     url_safe)
+        let c1: int = b64_pick(s.byte_at(i + 1), url_safe)
+        if c0 < 0 || c1 < 0 {
+            panic("base64_decode: invalid character")
+        }
+        let t: int = c0 * 262144 + c1 * 4096
+        out.push(chr(t / 65536 % 256))
+    } else if rem == 3 {
+        let c0: int = b64_pick(s.byte_at(i),     url_safe)
+        let c1: int = b64_pick(s.byte_at(i + 1), url_safe)
+        let c2: int = b64_pick(s.byte_at(i + 2), url_safe)
+        if c0 < 0 || c1 < 0 || c2 < 0 {
+            panic("base64_decode: invalid character")
+        }
+        let t: int = c0 * 262144 + c1 * 4096 + c2 * 64
+        out.push(chr(t / 65536 % 256))
+        out.push(chr(t / 256 % 256))
+    } else if rem == 1 {
+        panic("base64_decode: length not a multiple of 4")
+    }
+    return str_join(out, "")
+}
+
+fn b64_pick(c: int, url_safe: bool) -> int {
+    if c == 61 {
+        return 0                      # '=' is treated as 0; presence handled outside.
+    }
+    if url_safe {
+        return b64url_decode_char(c)
+    }
+    return b64_decode_char(c)
+}
