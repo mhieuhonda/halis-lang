@@ -359,10 +359,17 @@ even through 5 function layers — the compile error points to the exact call
 chain. (The v0.5.0-alpha release already enforces this for the five active
 effects; `Net` is reserved pending future builtins.)
 
-## STAGE 10 — Taint tracking & sandbox 🔄 (alpha shipped v0.7.0-alpha)
+## STAGE 10 — Taint tracking & sandbox 🔄 (alpha v0.7.0-alpha + beta v0.8.0-alpha)
 
 **Goal:** stop input-driven vulnerabilities (injection, XSS, path traversal)
 at the type level.
+
+**Status (v0.8.0-alpha):** the **beta subset of Stage 10** has shipped.
+This adds the second taint source (`read_file_tainted`), the extended
+`--audit` taint-flow report (lists functions calling each taint source
+and taint sink), and three new pure-query helpers on `tainted[str]`
+(`taint_check_byte_at`, `taint_concat`, `taint_concat_clean`).
+**143/143 tests PASS.**
 
 **Status (v0.7.0-alpha):** the **alpha subset of Stage 10** has shipped.
 The compiler now performs **static taint tracking** via a new built-in
@@ -371,6 +378,32 @@ read_file, write_file, file_exists, exit) statically reject tainted
 arguments; the user must sanitise via `std.sanitize` or explicitly
 untaint via `taint_unwrap()`. The checker enforces this in both Stage-0
 and the self-hosted `hlc.hls`. **135/135 tests PASS.**
+
+**Shipped in v0.8.0-alpha (Stage 10-beta):**
+
+- New taint source builtin `read_file_tainted(path: str) -> tainted[str]`
+  — the second taint source (after `tainted_args`), wrapping the file
+  content as `tainted[str]`. Useful when the file is untrusted (e.g.
+  user uploads, downloaded config). Carries the `Fs` effect (same as
+  `read_file`).
+- The checker in both Stage-0 and `hlc.hls` recognises `read_file_tainted`
+  as a taint source and rejects passing its result to any sink.
+- Extended `--audit` flag: now prints which functions call each taint
+  source (`tainted_args`, `read_file_tainted`) and which functions call
+  each taint sink (`print`, `println`, `read_file`, `write_file`,
+  `file_exists`, `exit`). Useful for security review.
+- Three new pure-query helpers in `std.taint`:
+  - `taint_check_byte_at(t, i) -> int` — pure byte-at-index query.
+  - `taint_concat(t1, t2) -> tainted[str]` — concatenate two tainted
+    strings; result remains tainted.
+  - `taint_concat_clean(t, clean) -> tainted[str]` — concatenate a
+    tainted string with a clean literal; result remains tainted.
+- New example: `examples/taint_beta_demo.hls` exercises the new flow.
+- New tests: 3 ok (`feat_taint_beta`, `feat_generic_take`,
+  `feat_float_scientific`) + 1 fail (`fail_taint_beta_read_file`).
+  Plus the bug-fix regression test `fail_qmark_err_type` for BUG-3.
+- The bootstrap is still **deterministic**: two self-compile passes
+  produce byte-identical C output.
 
 **Shipped in v0.7.0-alpha (Stage 10-alpha):**
 
@@ -409,20 +442,27 @@ and the self-hosted `hlc.hls`. **135/135 tests PASS.**
   three taint builtins in the checker, and emits the same C code as
   Stage-0. Bootstrap is still **deterministic**.
 
-**Remaining work for Stage 10 (beta and beyond):**
+**Remaining work for Stage 10 (post-beta):**
 
 - Sandboxed compile mode: a program only runs inside a granted
   directory / socket set.
-- Taint analysis report from the compiler (`hlc --audit` extended
-  with a taint-flow section).
-- Runtime taint flag (so a tainted value carries a tag at runtime,
-  enabling defence-in-depth and runtime sink checks).
-- Taint sources beyond argv: `read_file`, `read_line` (when added),
-  HTTP request body (when added), etc. — currently only argv is a
-  taint source.
+- Runtime taint flag in the NATIVE backend (so a tainted value carries
+  a tag at runtime, enabling defence-in-depth beyond the Stage-0
+  interpreter's existing wrapper dict).
+- Taint sources beyond argv and `read_file_tainted`: `read_line` (when
+  added), HTTP request body (when added), etc.
 - First-class taint labels (e.g. `tainted[str, Html]` vs
   `tainted[str, Sql]`) so the checker can enforce "HTML-tainted
   values cannot be used in SQL even after sanitize_html".
+
+**Done in Stage 10-beta (v0.8.0-alpha):**
+
+- ✅ `read_file_tainted(path) -> tainted[str]` — second taint source.
+- ✅ Extended `--audit` with a taint-flow section listing functions
+  calling each taint source and each taint sink.
+- ✅ New pure-query helpers in `std.taint`: `taint_check_byte_at`,
+  `taint_concat`, `taint_concat_clean`.
+
 
 **Acceptance:** a program that doesn't declare `uses Net` CANNOT call a socket
 even through 5 function layers — the compile error points to the exact call

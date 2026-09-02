@@ -36,7 +36,7 @@ fn main() -> int uses IO {
 }
 ```
 
-Five core guarantees of v0.7.0-alpha:
+Seven core guarantees of v0.8.0-alpha:
 
 1. **I/O is a declared effect.** Forget `uses IO` while printing to the
    screen? Compile error — even when the call is indirect through 5 function
@@ -113,7 +113,7 @@ make bootstrap
 # 3. Compile your program to a native binary
 make run F=examples/primes.hls
 
-# 4. Run the full test suite (135 tests: types, effects, ownership, taint, differential, bootstrap)
+# 4. Run the full test suite (143 tests: types, effects, ownership, taint, taint-beta, differential, bootstrap)
 make test
 
 # 5. Try the fine-grained effects (v0.7.0-alpha)
@@ -124,6 +124,9 @@ make audit F=examples/effects_demo.hls
 
 # 7. Run the new taint tracking demo (v0.7.0-alpha)
 python3 boot/boot.py examples/taint_demo.hls "first arg" "/api/users"
+
+# 8. Run the Stage 10-beta demo (read_file_tainted + extended audit, v0.8.0-alpha)
+python3 boot/boot.py examples/taint_beta_demo.hls examples/data.txt
 ```
 
 ## Language example
@@ -199,25 +202,24 @@ module you need).
 
 ```
 hieu-louis-lang/
-├── SPEC.md              # Language constitution (full v0.2 spec)
+├── SPEC.md              # Language constitution (full v0.7 spec)
 ├── ROADMAP.md           # 20-stage roadmap to v1.0
 ├── SECURITY.md          # Threat model & security policy
-├── boot/                # Stage-0: bootstrap seed (pure Python, ~1,400 lines)
-│   ├── lexer.py         #   lexer
-│   ├── parser.py        #   syntax → AST
-│   ├── checker.py       #   type check + effects analysis
-│   ├── interp.py        #   evaluator (reference semantics)
-│   └── boot.py          #   CLI
+├── boot/                # Stage-0: bootstrap seed (pure Python, ~3,200 lines)
+│   ├── lexer.py         #   lexer (~150 lines)
+│   ├── parser.py        #   syntax → AST (~620 lines)
+│   ├── checker.py       #   type check + effects + taint analysis (~1,500 lines)
+│   ├── interp.py        #   evaluator (reference semantics, ~660 lines)
+│   └── boot.py          #   CLI (~290 lines)
 ├── src/
-│   └── hlc.hls          # ★ COMPILER written 100% in HLS (~3,000 lines)
+│   └── hlc.hls          # ★ COMPILER written 100% in HLS (~6,000 lines)
 │                        #   lexer → parser → checker → C codegen → self-compile
-├── std/                 # Standard library (Stage 6, in HLS)
-├── examples/            # hello, fibonacci, primes, wordcount, secure_demo
+├── std/                 # Standard library (Stage 6 + Stage 10, in HLS)
+├── examples/            # hello, fibonacci, primes, wordcount, secure_demo, ...
 ├── tests/
-│   ├── ok/              #   14 valid programs (incl. safe panics)
-│   ├── fail/            #   22 programs that MUST be rejected (types/effects)
-│   ├── snapshots/       #   expected outputs
-│   └── run_tests.sh     #   56 tests: ok/fail/differential/bootstrap fixed-point
+│   ├── ok/              #   42 valid programs (incl. safe panics)
+│   ├── fail/            #   45 programs that MUST be rejected (types/effects/taint)
+│   └── run_tests.sh     #   143 tests: ok/fail/differential/bootstrap fixed-point
 ├── Makefile             # bootstrap · test · run · examples
 └── bin/                 # (generated) native hlc
 ```
@@ -238,7 +240,7 @@ Full details: [SPEC.md](SPEC.md) · Stage-by-stage roadmap:
 
 ## Status
 
-**v0.7.0-alpha — Stages 1–7 complete, Stage 8-alpha + Stage 9-alpha + Stage 9-beta + Stage 10-alpha shipped**:
+**v0.8.0-alpha — Stages 1–7 complete, Stage 8-alpha + Stage 9-alpha + Stage 9-beta + Stage 10-alpha + Stage 10-beta shipped**:
 
 - ✅ Complete core specification
 - ✅ Stage-0 reference (interpreted, with type + effects checking)
@@ -278,14 +280,31 @@ Full details: [SPEC.md](SPEC.md) · Stage-by-stage roadmap:
   `sanitize_sql_string`, `sanitize_command`, `sanitize_filename`).
   The new `examples/taint_demo.hls` exercises the full flow. **135/135
   tests PASS**.
+- ✅ **Stage 10-beta — Taint tracking extended** (v0.8.0-alpha):
+  Second taint source `read_file_tainted(path: str) -> tainted[str]`
+  (file content is tainted by default — useful for untrusted
+  uploads / downloaded config). Extended `--audit` flag with a
+  taint-flow section listing which functions call each taint
+  source and each taint sink. Three new pure-query helpers in
+  `std.taint`: `taint_check_byte_at`, `taint_concat`,
+  `taint_concat_clean`. New JSON typed value accessors
+  (`json_bool_value` / `json_int_value` / `json_float_value` /
+  `json_str_value`). Bug fixes: `str.to_float` accepts scientific
+  notation; `float.to_int` range-checks; `html_escape` escapes
+  forward slash per OWASP; JSON parser handles UTF-16 surrogate
+  pairs; base64_decode validates padding placement; URL parser
+  uses the FIRST `@` for userinfo split (defensive).
+  The new `examples/taint_beta_demo.hls` exercises the flow.
+  **143/143 tests PASS**.
 - ⬜ Stage 8-beta (full borrow checker, end-of-arena runtime),
-  Stage 10-beta (sandboxed compile mode, taint analysis report from
-  `hlc --audit`), fine-grained taint, SSA IR, LLVM, concurrency...
+  Stage 10-gamma (sandboxed compile mode, first-class taint labels,
+  runtime taint flag in the native backend), SSA IR, LLVM,
+  concurrency...
 
 ## Contributing
 
 Every contribution must preserve the core guarantees and pass
-`make test` (135 tests, including differential testing of the two
+`make test` (143 tests, including differential testing of the two
 implementations). Every new feature must first be used inside `hlc` itself —
 the compiler is always the first customer of the language.
 

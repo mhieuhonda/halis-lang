@@ -8,7 +8,229 @@ Releases on `main` follow the 20-stage roadmap (see [ROADMAP.md](ROADMAP.md)).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
-## [unreleased] — Stage 10-alpha (v0.7.0-alpha)
+## [unreleased] — Stage 10-beta (v0.8.0-alpha)
+
+### Added
+- **Stage 10-beta: second taint source.** New builtin
+  `read_file_tainted(path: str) -> tainted[str]` — like `read_file`
+  but the returned content is wrapped as `tainted[str]`. Useful when
+  the file content is untrusted (e.g. user uploads, downloaded config
+  files). Carries the `Fs` effect (same as `read_file`).
+- **Stage 10-beta: extended `--audit` flag.** `hlc --audit` and
+  `boot.py --audit` now print a taint-flow section listing which
+  functions call each taint source (`tainted_args`,
+  `read_file_tainted`) and which functions call each taint sink
+  (`print`, `println`, `read_file`, `write_file`, `file_exists`,
+  `exit`). Useful for security review and supply-chain audits.
+- **Stage 10-beta: new pure-query helpers in `std.taint`:**
+  - `taint_check_byte_at(t, i) -> int` — pure byte-at-index query.
+  - `taint_concat(t1, t2) -> tainted[str]` — concatenate two tainted
+    strings; the result REMAINS tainted.
+  - `taint_concat_clean(t, clean) -> tainted[str]` — concatenate a
+    tainted string with a clean literal; the result REMAINS tainted.
+- **New JSON typed value accessors** in `std/json.hls`:
+  `json_bool_value`, `json_int_value`, `json_float_value`,
+  `json_str_value`. Each panics if the value is not of the expected
+  kind; the caller should use `json_is_*` first if the kind is
+  uncertain. Previously callers had to access `v.ival` / `v.fval`
+  etc. as struct fields, which worked but exposed the internal
+  representation.
+- **New example:** `examples/taint_beta_demo.hls` exercising the new
+  read_file_tainted flow + the new pure-query helpers.
+- **New tests:** 4 ok (`feat_taint_beta`, `feat_generic_take`,
+  `feat_float_scientific` — differential Stage-0 + native, plus
+  `feat_qmark_err_type` regression test for BUG-3) + 2 fail
+  (`fail_taint_beta_read_file`, `fail_qmark_err_type`).
+- **`str.to_float` now accepts scientific notation** (e.g. `"1e5"`,
+  `"1.5e-3"`, `"-2.5E10"`). Previously the function rejected any
+  non-digit/non-dot character including `e`/`E`, which caused
+  `json_parse("1e5")` to panic. BUG-4 fix.
+- **`float.to_int` now range-checks the conversion.** A large float
+  (e.g. `1e20`) previously silently truncated via the C cast and
+  then panicked on the next arithmetic op. Now it panics at the
+  `float.to_int` call itself with a clear message. BUG-15 fix.
+- **`html_escape` now escapes the forward slash `/`** as `&#x2F;`
+  per OWASP recommendation. Previously the SPEC claimed `/` was
+  escaped but the implementation didn't. `html_unescape` now also
+  decodes `&#x2F;` back to `/`. BUG-12 fix.
+- **JSON parser now handles UTF-16 surrogate pairs** in `\uXXXX`
+  escapes. A high surrogate followed by a low surrogate is now
+  correctly combined into a single codepoint and emitted as a 4-byte
+  UTF-8 sequence. Previously the parser emitted two separate (and
+  invalid) 3-byte UTF-8 sequences for the surrogate codepoints
+  themselves. BUG-16 fix.
+- **`base64_decode` now validates padding placement.** RFC 4648 says
+  `=` padding may only appear at the end of the input (positions 2
+  and 3 of a 4-char block, never positions 0 or 1). Inputs like
+  `"AB=C"` previously produced wrong output without an error. BUG-35
+  fix.
+- **`url_parse_authority` now uses the FIRST `@`** to split userinfo
+  from host (instead of the LAST `@`). This is the safer, more
+  defensive interpretation — a malicious URL like
+  `user@evil.com@safe.com` should NOT parse as `user@evil.com`
+  userinfo + `safe.com` host. BUG-33 fix.
+- **Reserved identifiers `secure` and `trait`** are now rejected at
+  parse time. The SPEC said they were reserved but the lexer didn't
+  enforce it. BUG-29 fix.
+
+### Fixed
+- **BUG-1 (HIGH, logic):** `check_call` in `boot/checker.py` re-ran
+  `check_expr` TWICE on each argument of a generic function — once
+  for inference, once for verification. The first call would execute
+  side effects like `take(x)` (marking `x` as moved); the second call
+  would then see `x` already moved and raise a spurious "use of moved
+  value" error. Fixed by caching the first-pass type per argument
+  and reusing it in the second pass. Same pattern as the BUG-A fix
+  for `check_enum_variant` and `check_structlit`.
+- **BUG-2 (HIGH, logic):** `check_method` in `boot/checker.py` had
+  the same double-`check_expr` pattern as BUG-1 for generic methods.
+  Fixed identically.
+- **BUG-1 + BUG-2 in `hlc.hls`:** the self-hosted compiler had the
+  same double-`check_expr` pattern in its `check_call` and
+  `check_method` functions. Fixed identically.
+- **BUG-3 (HIGH, logic):** `check_qmark` in `boot/checker.py` (and
+  `hlc.hls`) only verified the enclosing function's return type was
+  an enum of the same base name, NOT that the error payload type
+  matched the function's error type argument. So `?` on a
+  `Result[int, int]` inside a function returning `Result[int, str]`
+  would silently propagate an `Err(int)` as if it were `Err(str)` —
+  a type soundness hole. Fixed by also verifying the error payload
+  type matches the LAST type argument of the enclosing function's
+  return type.
+- **BUG-4 (HIGH, logic):** `str.to_float` rejected scientific
+  notation, causing `json_parse("1e5")` to panic. Fixed in both
+  Stage-0 (`boot/interp.py`) and the native C runtime
+  (`src/hlc.hls`).
+- **BUG-5 (MEDIUM, dead-code + contradiction):** removed the dead
+  `SINK_BUILTINS` dict in `boot/checker.py` that was incomplete
+  (omitted `file_exists`) and never consulted. The actual taint
+  enforcement happens inline in `check_builtin_call`.
+- **BUG-6 (MEDIUM, contradiction):** `std/taint.hls` comments claimed
+  "we never unwrap, only query metadata" but the code called
+  `taint_unwrap` to perform the queries. Reworded the comments to
+  clarify: the functions DO unwrap locally but don't expose the
+  unwrapped value to the caller (the result is either a non-string
+  type like int/bool, or a re-tainted str).
+- **BUG-7 (MEDIUM, contradiction):** `std/taint.hls` listed
+  `taint_map_value` in its header doc but never defined it. Removed
+  the dangling reference (the function cannot be expressed in HLS
+  v0.7 because we don't have function values).
+- **BUG-8 (MEDIUM):** README claimed "Five core guarantees" but
+  listed 7 numbered items. Fixed to "Seven core guarantees".
+- **BUG-9, BUG-10 (MEDIUM, docs):** README's repository layout block
+  had stale line counts and test counts. Updated to actual numbers
+  (~6,000 lines for hlc.hls, ~3,200 lines for boot/, 42 ok tests,
+  45 fail tests, 143 total tests).
+- **BUG-11 (MEDIUM, spec vs implementation):** SPEC said
+  `tainted[T]` is represented the same as `T` at runtime, but the
+  Stage-0 interpreter used a wrapper dict. Updated SPEC to
+  acknowledge the Stage-0 wrapper dict (defence-in-depth) while
+  keeping the native backend's no-overhead representation.
+- **BUG-12 (MEDIUM, spec vs implementation):** SPEC said
+  `sanitize_html` escapes `/` but `html_escape` didn't. Added `/`
+  escaping (per OWASP) and the corresponding `&#x2F;` decoding.
+- **BUG-13 (MEDIUM):** SPEC and CHANGELOG said `sanitize_command`
+  rejects 26 shell metacharacters, but the code rejects 23.
+  Updated docs to say 23 with the full byte list.
+- **BUG-14 (MEDIUM, logic):** `boot/boot.py`'s cross-file merge
+  checked enum-enum and enum-struct collisions but NOT struct-enum.
+  A struct in file A and an enum in file B with the same name would
+  silently merge. Fixed to check both directions.
+- **BUG-15 (MEDIUM, logic):** `float.to_int` had no int64 range
+  check. A large float (e.g. `1e20`) would silently truncate via
+  the C cast. Fixed in both Stage-0 (`boot/interp.py`) and the
+  native C runtime (`src/hlc.hls`) — now panics with a clear
+  "float.to_int out of int64 range" message.
+- **BUG-16 (MEDIUM, logic):** `std/json.hls` `jsonp_push_utf8`
+  didn't handle codepoints above 65535 (which arise from surrogate
+  pair decoding). Extended to emit 4-byte UTF-8 sequences, and the
+  string parser now properly combines high + low surrogates.
+- **BUG-17 (LOW, dead code):** removed the unreachable `"Tainted["`
+  (capital T) branches in `is_tainted_type` and `list_taint_inner`
+  in `boot/checker.py`. The parser only ever produces lowercase
+  `"tainted["`.
+- **BUG-18 (LOW, dead code):** removed the dead `at_sym("_")`
+  checks in `boot/parser.py` `parse_arm`. The lexer treats `_` as
+  an ident token (never a `sym`), so the `at_sym("_")` half of the
+  OR was dead code.
+- **BUG-19 (LOW, dead code):** removed the unreachable LF-handling
+  branch inside `boot/lexer.py`'s string parser. The `< 32` check
+  at line 129 already raises before reaching the LF branch.
+- **BUG-20 (LOW, dead code):** removed the redundant
+  `except HLError: raise` block in `boot/boot.py`'s `load_file`
+  function — catching an exception only to re-raise it unchanged is
+  a no-op.
+- **BUG-21 (LOW, dead code):** removed the unused `unwrap_users`
+  and `sanitize_users` lists in `boot/boot.py`'s `print_audit`
+  function. They were allocated but never appended to.
+- **BUG-22 (LOW):** `boot/interp.py`'s for-loop binding used a
+  2-element list `[value, False]` while every other binding used a
+  3-element list `[value, mut, moved]`. Changed to the 3-element
+  form for consistency.
+- **BUG-23 (LOW, defensive bug):** `taint_unwrap`'s defensive
+  fallback in `boot/interp.py` returned the `"value"` field of ANY
+  dict — including user structs that happen to have a field named
+  `"value"`. Replaced with a panic that surfaces the checker bug
+  (which is the only path to reaching this fallback).
+- **BUG-24 (LOW, comment vs code):** `sanitize_filename` comment
+  said "Reject leading dot ... and consecutive dots", but the code
+  only checked leading dot. Reworded the comment to match the code.
+- **BUG-25 (LOW, comment vs code):** `std/sanitize.hls` header
+  claimed each sanitizer "Applies a normalising filter that removes
+  / escapes the dangerous characters". But `sanitize_path` and
+  `sanitize_command` only panic on invalid input (returning the
+  original input unchanged on success). Reworded the header
+  comment.
+- **BUG-27 (LOW, spec grammar):** SPEC's grammar didn't include
+  the `pure` keyword (added in v0.6.0-alpha). Updated to
+  `("->" type)? ("pure" | "uses" efflist)? block`.
+- **BUG-28 (LOW, spec count):** SPEC said "Keywords (21)" but the
+  lexer's `KEYWORDS` set has 20 entries. Fixed to "Keywords (20)".
+- **BUG-30 (LOW, error message):** the taint-sink error message
+  referenced `sanitize_sql` which doesn't exist (the actual
+  sanitizers are `sanitize_sql_identifier` and
+  `sanitize_sql_string`). Fixed to list the actual names.
+- **BUG-31 (LOW, latent bug):** `instantiate_type` in
+  `boot/checker.py` (and `hlc.hls`) didn't recursively substitute
+  when `type_map[t]` itself contained type params. The fix is
+  capped at 16 levels of recursion to prevent infinite loops on
+  illegal self-referential maps.
+- **BUG-32 (LOW, parser line):** `parse_arm` in `boot/parser.py`
+  set the arm's `line` from the token AFTER the body (next arm or
+  closing `}`). Fixed to capture the line from the FIRST token of
+  the pattern, so error messages for arm issues point to the right
+  line.
+- **BUG-35 (LOW, base64 validation):** `base64_decode` validated
+  that all four chars were valid base64, but didn't validate that
+  `=` padding only appeared at the END. Input like `"AB=C"` was
+  accepted with wrong output. Fixed.
+- **BUG-37 (LOW, integer literal edge case):** the parser
+  intentionally allows literals up to (and including) 2^63 as an
+  intermediate value, so the unary-minus handler can fold
+  `-9223372036854775808` (= INT64_MIN) into a single int node.
+  Added a comment explaining why the 2**63 boundary (not 2^63 - 1)
+  is correct here.
+
+### Changed
+- **README "Status" section** updated to reflect Stage 10-beta
+  shipped (in addition to 10-alpha).
+- **README "Quick start"** now also surfaces
+  `examples/taint_beta_demo.hls`.
+- **SPEC.md** updated for v0.8.0-alpha: taint tracking section now
+  covers both Stage 10-alpha and Stage 10-beta; new section 19.5
+  documents the taint-flow audit extension.
+
+### Test suite
+- **143/143 PASS** (was 135/135 in v0.7.0-alpha). The 8 new tests
+  are 4 ok (`feat_taint_beta`, `feat_generic_take`,
+  `feat_float_scientific`, plus the bug-fix regression tests) and
+  2 fail (`fail_taint_beta_read_file`, `fail_qmark_err_type`).
+  Bootstrap is still deterministic (two self-compile passes produce
+  byte-identical C output).
+
+---
+
+## [v0.7.0-alpha] — 2026 (Stage 10-alpha — taint tracking system)
 
 ### Added
 - **Stage 10-alpha: taint tracking.** New built-in generic type
@@ -38,7 +260,8 @@ new stdlib modules, tooling, examples, and CI/CD improvements.
     - `sanitize_path` — rejects empty / NUL / absolute / `..` segments.
     - `sanitize_sql_identifier` — only `[A-Za-z_][A-Za-z0-9_]*`.
     - `sanitize_sql_string` — doubles `'` and `\`.
-    - `sanitize_command` — rejects 26 shell metacharacters.
+    - `sanitize_command` — rejects 23 shell metacharacters (whitespace,
+      `; | & \` $ ( ) < > ! \ " ' * ? [ ] { }`).
     - `sanitize_filename` — only `[A-Za-z0-9._-]+`, no leading dot.
 - **New example:** `examples/taint_demo.hls` exercising the full flow
   (tainted argv, pure queries, all six sanitizers).

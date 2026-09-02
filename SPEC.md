@@ -1,22 +1,25 @@
-# Hieu Louis language specification (HLS) — v0.7.0-alpha
+# Hieu Louis language specification (HLS) — v0.8.0-alpha
 
 > **Hieu Louis** is a high-security, native-compiled programming language
 > designed around the philosophy: **safety by default, explicitness for
-> auditability, performance via AOT compilation**. Version v0.7.0-alpha
-> introduces the **Stage 10-alpha taint tracking** model on top of the
-> Stage 9 fine-grained effects & capabilities system: a new built-in
-> generic type `tainted[T]` lets the compiler statically reject passing
-> tainted values to sinks (print, file I/O, exit) — the user must
-> sanitise first via `std.sanitize`. Version v0.5.0-alpha introduced
-> the **fine-grained effects & capabilities** model: a single `IO`
-> effect split into five capabilities (`IO`, `Fs`, `Clock`, `Args`,
-> `Exit`) individually declared and statically verified through the
-> call graph. `uses IO` remains as a backwards-compatible blanket alias
-> for the entire IO family. Version v0.6.0-alpha added the explicit
-> `pure` keyword and the `--audit` flag (Stage 9-beta). Every operation
-> is still checked, every effect is statically tracked, no null, no
-> undefined behaviour, and use-after-move is a compile error (Stage
-> 8-alpha).
+> auditability, performance via AOT compilation**. Version v0.8.0-alpha
+> extends the Stage 10 taint tracking model with a second taint source
+> (`read_file_tainted`), extended `--audit` taint-flow reporting, and
+> new pure-query helpers on `tainted[str]` (taint_check_byte_at,
+> taint_concat, taint_concat_clean). Version v0.7.0-alpha introduces
+> the **Stage 10-alpha taint tracking** model on top of the Stage 9
+> fine-grained effects & capabilities system: a new built-in generic
+> type `tainted[T]` lets the compiler statically reject passing tainted
+> values to sinks (print, file I/O, exit) — the user must sanitise first
+> via `std.sanitize`. Version v0.5.0-alpha introduced the **fine-grained
+> effects & capabilities** model: a single `IO` effect split into five
+> capabilities (`IO`, `Fs`, `Clock`, `Args`, `Exit`) individually
+> declared and statically verified through the call graph. `uses IO`
+> remains as a backwards-compatible blanket alias for the entire IO
+> family. Version v0.6.0-alpha added the explicit `pure` keyword and
+> the `--audit` flag (Stage 9-beta). Every operation is still checked,
+> every effect is statically tracked, no null, no undefined behaviour,
+> and use-after-move is a compile error (Stage 8-alpha).
 
 - Source files: `*.hls`
 - Self-hosted compiler: `src/hlc.hls` (HLS → C → native)
@@ -66,7 +69,7 @@
 ### 2.4. Identifiers
 - `[A-Za-z_][A-Za-z0-9_]*`. Convention: functions/variables `snake_case`,
   structs `PascalCase`.
-- Cannot clash with keywords. Keywords (21): `fn let mut return if else while
+- Cannot clash with keywords. Keywords (20): `fn let mut return if else while
   for in break continue struct impl import uses true false enum match pure`.
   (`pure` was added in Stage 9-beta / v0.6.0-alpha.)
 
@@ -148,7 +151,9 @@ enumdef        := "enum" Ident typeparams? "{" variant ("," variant)* ","? "}"
 variant        := Ident ("(" type ("," type)* ","? ")")?
 typeparams     := "[" Ident ("," Ident)* "]"
 impl           := "impl" Ident "{" fndef* "}"
-fndef          := "fn" Ident typeparams? "(" params? ")" ("->" type)? ("uses" "IO")? block
+fndef          := "fn" Ident typeparams? "(" params? ")" ("->" type)? ("pure" | "uses" efflist)? block
+efflist        := effect ("," effect)*
+effect         := "IO" | "Fs" | "Clock" | "Args" | "Exit"
 params         := param ("," param)* ","?
 param          := "mut"? Ident ":" type
 type           := "int" | "float" | "bool" | "str" | "void"
@@ -941,38 +946,48 @@ the compiler rejects any program that tries to use them.
 
 ---
 
-## 19. Taint tracking (Stage 10-alpha — v0.7.0-alpha)
+## 19. Taint tracking (Stage 10-alpha v0.7.0-alpha + Stage 10-beta v0.8.0-alpha)
 
-Stage 10-alpha ships a **static taint tracking** system that prevents
+Stage 10 ships a **static taint tracking** system that prevents
 input-driven vulnerabilities (injection, XSS, path traversal) at the
-type level.
+type level. Stage 10-alpha (v0.7.0-alpha) introduced the `tainted[T]`
+type and three taint builtins. Stage 10-beta (v0.8.0-alpha) extends the
+model with a second taint source (`read_file_tainted`), extended
+`--audit` taint-flow reporting, and new pure-query helpers in
+`std.taint` (`taint_check_byte_at`, `taint_concat`, `taint_concat_clean`).
 
 ### 19.1. The `tainted[T]` type
 
-`tainted[T]` is a new built-in generic type (alongside `list[T]`,
-`map[str, T]`). At runtime, `tainted[T]` is represented the same as
-`T` — the taint is a **compile-time property only**; runtime
-distinction (e.g. a taint flag carried at runtime) is deferred to
-Stage 10-beta.
+`tainted[T]` is a built-in generic type (alongside `list[T]`,
+`map[str, T]`). At the C-runtime level, `tainted[T]` is represented the
+same as `T` — the taint is a **compile-time property only** in the
+native backend. The Stage-0 interpreter uses a runtime wrapper dict
+`{"tainted": True, "value": <T>}` to provide defence-in-depth (so a
+checker bug doesn't silently let tainted data reach a sink in
+interpreted mode). Runtime taint enforcement in the native backend
+(defence-in-depth) is deferred to a later Stage 10 sub-release.
 
 The checker rejects passing a `tainted[T]` value to any of these sinks:
-`print`, `println`, `read_file`, `write_file` (both the path argument
-and the content argument), `file_exists`, `exit`.
+`print`, `println`, `read_file`, `read_file_tainted`, `write_file` (both
+the path argument and the content argument), `file_exists`, `exit`.
 
 ### 19.2. Taint builtins
 
-Three new builtins (all pure except `tainted_args`):
+Four taint builtins (all pure except `tainted_args` and `read_file_tainted`):
 
-| Builtin | Effect | Type |
-|---------|--------|------|
-| `tainted_args()` | `Args` | `list[tainted[str]]` |
-| `taint_mark(x)` | (none) | `T -> tainted[T]` |
-| `taint_unwrap(x)` | (none) | `tainted[T] -> T` |
+| Builtin | Effect | Type | Stage |
+|---------|--------|------|-------|
+| `tainted_args()` | `Args` | `list[tainted[str]]` | 10-alpha |
+| `read_file_tainted(path)` | `Fs` | `str -> tainted[str]` | 10-beta |
+| `taint_mark(x)` | (none) | `T -> tainted[T]` | 10-alpha |
+| `taint_unwrap(x)` | (none) | `tainted[T] -> T` | 10-alpha |
 
 `tainted_args()` is the **taint source** for command-line inputs —
-every program's argv is tainted by default. `taint_unwrap` is the
-explicit "I accept the risk" escape hatch; the user should normally
-use a sanitizer instead.
+every program's argv is tainted by default. `read_file_tainted(path)`
+is the **second taint source** for file contents — useful when the
+file is untrusted (e.g. user uploads, downloaded config). `taint_unwrap`
+is the explicit "I accept the risk" escape hatch; the user should
+normally use a sanitizer instead.
 
 ### 19.3. Sanitisers (`std.sanitize`)
 
@@ -986,36 +1001,58 @@ Each takes a `tainted[str]` and returns a clean `str`:
 | `sanitize_path(t)` | rejects empty / NUL / absolute / `..` segments |
 | `sanitize_sql_identifier(t)` | only `[A-Za-z_][A-Za-z0-9_]*`; panic otherwise |
 | `sanitize_sql_string(t)` | doubles `'` and `\` for SQL string literals |
-| `sanitize_command(t)` | rejects 26 shell metacharacters |
+| `sanitize_command(t)` | rejects 23 shell metacharacters (whitespace, `; | & \` $ ( ) < > ! \ " ' * ? [ ] { }`) |
 | `sanitize_filename(t)` | only `[A-Za-z0-9._-]+`, no leading dot |
 
 ### 19.4. Pure queries on tainted values (`std.taint`)
 
-`std/taint.hls` provides pure-query helpers on `tainted[str]` that do
-NOT untaint — useful for routing on argv without exposing the inner
-string to a sink:
+`std/taint.hls` provides pure-query helpers on `tainted[str]` that DO NOT
+expose the inner string to the caller — useful for routing on argv
+without exposing the inner string to a sink:
 
-- `taint_check_len(t) -> int`
-- `taint_check_is_empty(t) -> bool`
-- `taint_check_starts_with(t, prefix) -> bool`
-- `taint_check_ends_with(t, suffix) -> bool`
-- `taint_check_equals(t, literal) -> bool`
-- `taint_check_contains(t, sub) -> bool`
+- `taint_check_len(t) -> int` (Stage 10-alpha)
+- `taint_check_is_empty(t) -> bool` (Stage 10-alpha)
+- `taint_check_starts_with(t, prefix) -> bool` (Stage 10-alpha)
+- `taint_check_ends_with(t, suffix) -> bool` (Stage 10-alpha)
+- `taint_check_equals(t, literal) -> bool` (Stage 10-alpha)
+- `taint_check_contains(t, sub) -> bool` (Stage 10-alpha)
 - `taint_slice(t, start, end) -> tainted[str]` — the slice result
   REMAINS tainted (a slice of attacker-controlled bytes is still
-  attacker-controlled).
+  attacker-controlled). (Stage 10-alpha)
+- `taint_check_byte_at(t, i) -> int` — pure byte-at-index query.
+  Returns an int (not a taint vector for any sink). (Stage 10-beta)
+- `taint_concat(t1, t2) -> tainted[str]` — concatenate two tainted
+  strings; result REMAINS tainted. (Stage 10-beta)
+- `taint_concat_clean(t, clean) -> tainted[str]` — concatenate a
+  tainted string with a clean literal; result REMAINS tainted. (Stage
+  10-beta)
 
-### 19.5. What Stage 10-alpha does NOT yet do
+### 19.5. Taint-flow audit (Stage 10-beta — v0.8.0-alpha)
+
+The `--audit` flag now reports the taint flow of the program in addition
+to the per-function effect tree (Stage 9-beta). Specifically, it lists:
+
+- Functions calling each taint source: `tainted_args`, `read_file_tainted`.
+- (Planned: functions calling each taint sink: `print`, `println`,
+  `read_file`, `write_file`, `file_exists`, `exit`.)
+- (Planned: functions calling the explicit untaint: `taint_unwrap`,
+  each `std.sanitize.*` helper.)
+
+This is useful for security review and supply-chain audits — at a
+glance the auditor can see which functions handle attacker-controlled
+input and which functions reach sinks.
+
+### 19.6. What Stage 10 still does NOT do
 
 - Sandboxed compile mode (a program only running inside a granted
-  directory / socket set) — Stage 10-beta.
-- Taint analysis report from `hlc --audit` (the current `--audit`
-  flag reports the effects tree; taint-flow reporting is deferred).
+  directory / socket set) — later Stage 10 sub-release.
 - First-class taint labels (e.g. `tainted[str, Html]` vs
   `tainted[str, Sql]` so HTML-tainted values cannot be used in SQL
   even after `sanitize_html`) — future Stage 10 work.
-- Runtime taint flag (defence-in-depth) — future Stage 10 work.
-- Taint sources beyond argv (e.g. `read_file`, `read_line` if added,
-  HTTP request body if added) — currently only argv is a taint
-  source.
+- Runtime taint flag in the native backend (defence-in-depth) — future
+  Stage 10 work. The Stage-0 interpreter already has this via its
+  wrapper dict.
+- Taint sources beyond argv and file content (e.g. `read_line` if added,
+  HTTP request body if added) — currently only argv and read_file_tainted
+  are taint sources.
 
