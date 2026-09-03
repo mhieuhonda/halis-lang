@@ -448,7 +448,13 @@ def resolve_dependency(name: str, source: Dict, cache_dir: str = CACHE_DIR) -> s
 # family so effect enforcement fails closed instead of silently passing
 # (BUG-DS4-23: the old behaviour returned ([], []) — an unaudittable or
 # actively broken dependency was recorded as PURE).
-FAIL_CLOSED_EFFECTS = sorted(["Args", "Clock", "Exit", "Fs", "IO"])
+# Stage 10/11 deep-scan fix: include Net, Rand, Proc (Stage 9 release)
+# so a dependency that uses net_lookup / rand_int / proc_exec is recorded
+# as requiring those effects (otherwise the package's `effects.allowed`
+# could silently approve a dependency using `proc_exec` because the
+# fail-closed list missed Proc — a security soundness bypass).
+FAIL_CLOSED_EFFECTS = sorted(["Args", "Clock", "Exit", "Fs", "IO",
+                              "Net", "Rand", "Proc"])
 
 
 def extract_effects(file_path: str) -> Tuple[List[str], List[str]]:
@@ -497,7 +503,12 @@ def extract_effects(file_path: str) -> Tuple[List[str], List[str]]:
     # declared and computed effect sets.
     declared = set()
     computed = set()
-    KNOWN_EFFECTS = {"IO", "Fs", "Clock", "Args", "Exit"}
+    # Stage 10/11 deep-scan fix: include Net, Rand, Proc so audit output
+    # for a dependency using net_lookup / rand_int / proc_exec is parsed
+    # correctly (was missing, so those effects were silently dropped,
+    # making effect enforcement meaningless for Net/Rand/Proc users).
+    KNOWN_EFFECTS = {"IO", "Fs", "Clock", "Args", "Exit",
+                    "Net", "Rand", "Proc"}
     for line in result.stdout.split("\n"):
         # BUG-SC-PKG-11 fix: the previous parser added every effect name
         # found on each status line to BOTH declared and computed, making

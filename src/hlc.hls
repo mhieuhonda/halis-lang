@@ -3038,21 +3038,36 @@ fn check_builtin_call(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, 
     # Reject tainted[T] at sink argument positions; user must explicitly
     # untaint via taint_unwrap or a sanitizer (sanitize_html etc.).
     if name == "print" || name == "println" {
+        # Deep-scan fix: check argument count BEFORE the taint check so
+        # `print()` (zero args) gives a clean error message instead of
+        # crashing on argt.get(0) out-of-bounds.
+        if nargs != 1 {
+            cerr(line, name + " expects 1 str argument")
+        }
         if is_taint_t(argt.get(0)) {
             cerr(line, "taint-sink violation: " + name + " argument 1 is " + argt.get(0) + " (tainted values must be sanitised before reaching a sink — use sanitize_html / sanitize_path / sanitize_sql_identifier / sanitize_sql_string / sanitize_command / sanitize_filename from std.sanitize, or taint_unwrap() if you accept the risk)")
         }
     }
     if name == "exit" {
+        if nargs != 1 {
+            cerr(line, "exit expects 1 int argument")
+        }
         if is_taint_t(argt.get(0)) {
             cerr(line, "taint-sink violation: exit argument 1 is " + argt.get(0) + " (tainted values must be sanitised before reaching a sink)")
         }
     }
     if name == "read_file" || name == "file_exists" || name == "read_file_tainted" {
+        if nargs != 1 {
+            cerr(line, name + "() expects 1 str argument")
+        }
         if is_taint_t(argt.get(0)) {
             cerr(line, "taint-sink violation: " + name + " argument 1 is " + argt.get(0) + " (tainted values must be sanitised before reaching a sink — use sanitize_path from std.sanitize, or taint_unwrap() if you accept the risk)")
         }
     }
     if name == "write_file" {
+        if nargs != 2 {
+            cerr(line, "write_file() expects 2 str arguments")
+        }
         if is_taint_t(argt.get(0)) {
             cerr(line, "taint-sink violation: write_file argument 1 (path) is " + argt.get(0) + " (tainted values must be sanitised before reaching a sink)")
         }
@@ -4219,7 +4234,12 @@ fn runtime_lines() -> list[str] {
     r.push("    if (strncmp(buf, hl_sandbox_root, sb_len) != 0)")
     r.push("        hl_die(\"sandbox violation: path resolves outside the sandbox\");")
     r.push("    char next = buf[sb_len];")
-    r.push("    if (next != 0 && next != '/')")
+    r.push("    // Deep-scan fix (C9): accept both / and \\\\ as path separators")
+    r.push("    // so the sandbox works on Windows. Previously only / was")
+    r.push("    // accepted, causing every sandboxed file op to panic on Windows")
+    r.push("    // (the parent-strip loop at line ~4207 accepts both, so the")
+    r.push("    // inconsistency was a latent portability bug).")
+    r.push("    if (next != 0 && next != '/' && next != '\\\\')")
     r.push("        hl_die(\"sandbox violation: path resolves outside the sandbox\");")
     r.push("}")
     r.push("")
@@ -4232,6 +4252,11 @@ fn runtime_lines() -> list[str] {
     r.push("}")
     r.push("")
     r.push("static hl_str* hl_str_alloc(int64_t len) {")
+    r.push("    // Deep-scan fix (C11): reject negative len before the cast to")
+    r.push("    // size_t. A negative len would wrap to ~2^64 via the cast,")
+    r.push("    // causing malloc to fail (DoS) or — on systems with a")
+    r.push("    // permissive overcommit — succeed with a huge buffer.")
+    r.push("    if (len < 0) hl_die(\"hl_str_alloc: negative length\");")
     r.push("    hl_str* s = (hl_str*)malloc(sizeof(hl_str));")
     r.push("    if (!s) hl_die(\"out of memory\");")
     r.push("    s->refcnt = 1;")
@@ -4414,9 +4439,17 @@ fn runtime_lines() -> list[str] {
     r.push("")
     r.push("static void hl_list_push(hl_list* l, void* v) {")
     r.push("    if (l->len == l->cap) {")
-    r.push("        l->cap *= 2;")
-    r.push("        l->items = (void**)realloc(l->items, (size_t)l->cap * sizeof(void*));")
-    r.push("        if (!l->items) hl_die(\"out of memory\");")
+    r.push("        size_t new_cap = l->cap * 2;")
+    r.push("        // Deep-scan fix (CC7): realloc-on-failure leaks the original")
+    r.push("        // buffer. Use a temp so the original is still freeable; the")
+    r.push("        // old code reassigned l->items to NULL on failure, losing")
+    r.push("        // the only reference to the original allocation (the leak")
+    r.push("        // was process-terminal because hl_die exits, but ASan /")
+    r.push("        // Valgrind would flag it; this fix is correctness hygiene).")
+    r.push("        void** nb = (void**)realloc(l->items, new_cap * sizeof(void*));")
+    r.push("        if (!nb) hl_die(\"out of memory\");")
+    r.push("        l->items = nb;")
+    r.push("        l->cap = new_cap;")
     r.push("    }")
     r.push("    l->items[l->len] = v;")
     r.push("    l->len++;")
@@ -4662,9 +4695,14 @@ fn runtime_lines() -> list[str] {
     r.push("    if (!buf) hl_die(\"out of memory\");")
     r.push("    for (;;) {")
     r.push("        if (len == cap) {")
-    r.push("            cap *= 2;")
-    r.push("            buf = (char*)realloc(buf, cap);")
-    r.push("            if (!buf) hl_die(\"out of memory\");")
+    r.push("            size_t new_cap = cap * 2;")
+    r.push("            // Deep-scan fix (C10): realloc-on-failure leaks the")
+    r.push("            // original buffer. Use a temp so the original is")
+    r.push("            // still freeable on OOM.")
+    r.push("            char* nb = (char*)realloc(buf, new_cap);")
+    r.push("            if (!nb) { free(buf); hl_die(\"out of memory\"); }")
+    r.push("            buf = nb;")
+    r.push("            cap = new_cap;")
     r.push("        }")
     r.push("        size_t n = fread(buf + len, 1, cap - len, f);")
     r.push("        len += n;")
@@ -7967,9 +8005,12 @@ fn print_audit(ctx: Ctx) -> void uses IO {
         i = i + 1
     }
     println("==============================================================================")
-    println("  Active effects:    IO, Fs, Clock, Args, Exit")
-    println("  Reserved effects:  Net, Rand, Proc  (error if used)")
+    println("  Active effects:    IO, Fs, Clock, Args, Exit, Net, Rand, Proc")
     println("  `uses IO` expands to: {IO, Fs, Clock, Args, Exit}")
+    println("  Net, Rand, Proc are independent effects (not part of the IO")
+    println("  family) — declare them explicitly to use net_lookup /")
+    println("  rand_int / rand_float / rand_seed / proc_exec builtins.")
+    println("  No reserved effects (Stage 9 release).")
     println("")
     # Stage 10-beta: taint-flow audit extension. Scan the call graph for:
     #   - functions calling taint sources (tainted_args, read_file_tainted, read_line)

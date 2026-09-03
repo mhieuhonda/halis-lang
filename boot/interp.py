@@ -355,15 +355,20 @@ class Interp:
                 else:
                     c_args.append(str(v).encode("utf-8"))
             else:
-                # Opaque pointer. The caller is responsible for ABI
-                # compatibility; we treat the value as a raw address.
-                c_argtypes.append(ctypes.c_void_p)
-                if isinstance(v, int):
-                    c_args.append(v)
-                elif isinstance(v, bytes):
-                    c_args.append(ctypes.cast(v, ctypes.c_void_p).value)
-                else:
-                    c_args.append(id(v))
+                # Deep-scan fix (C8): the previous code passed `id(v)` for
+                # list/map/struct args. That's a raw CPython heap address,
+                # which the C function would dereference as garbage — a
+                # soundness hole. Now we panic with a clean error: opaque
+                # pointer args are NOT supported (they require a real
+                # ABI/marshalling layer that Stage 15-alpha doesn't have).
+                # The user must declare extern fns with primitive types only
+                # (int, float, bool, str) and marshal complex types via str.
+                raise HLPanic(
+                    "extern call to '%s': argument of type %s is not "
+                    "supported (only int, float, bool, str args are "
+                    "allowed in extern FFI; use a string-encoded form "
+                    "for complex data)" % (name, pt),
+                    getattr(self, "line", 0))
         c_fn.argtypes = c_argtypes
         # Set up the return type.
         ret = fn["ret"]
@@ -763,7 +768,13 @@ class Interp:
         if name == "file_exists":
             import os
             _sandbox_check(args[0])
-            return os.path.isfile(args[0].decode("utf-8", "replace"))
+            # Deep-scan fix (H2): pass `args[0]` (bytes) directly to
+            # os.path.isfile — Python's os.path.isfile accepts bytes.
+            # The old code decoded with errors="replace", which substituted
+            # U+FFFD for non-UTF-8 bytes, so the interpreter checked a
+            # DIFFERENT path than the native runtime (which passes raw
+            # bytes to stat()). Files with non-UTF-8 names diverged.
+            return os.path.isfile(args[0])
         # ----- Stage 8-alpha: ownership primitives -----
         # drop(x): semantically releases x. In Stage-0 (Python), the underlying
         # value is left for Python's GC. The binding is marked moved at compile
@@ -830,9 +841,9 @@ class Interp:
         # or no A records). The interpreter uses Python's socket module
         # — the native runtime uses getaddrinfo directly.
         if name == "net_lookup":
+            import socket
             host = args[0].decode("utf-8", "replace")
             try:
-                import socket
                 infos = socket.getaddrinfo(host, None, socket.AF_INET)
                 for fam, _, _, _, sa in infos:
                     if fam == socket.AF_INET:
@@ -841,6 +852,14 @@ class Interp:
                               % to_display(args[0]), line)
             except socket.gaierror as ex:
                 raise HLPanic("net_lookup: DNS resolution failed for %s: %s"
+                              % (to_display(args[0]), str(ex)), line)
+            except OSError as ex:
+                # Deep-scan fix (C2): connection timeouts, refused
+                # connections, and other non-gaierror OSErrors used to
+                # propagate as raw Python tracebacks while the native
+                # runtime panicked cleanly. Catch the broader OSError
+                # family for differential parity.
+                raise HLPanic("net_lookup: network error for %s: %s"
                               % (to_display(args[0]), str(ex)), line)
         # proc_exec(cmd: str) -> int — run a shell command. Returns the
         # exit code (0 on success, 1..255 on failure). Uses os.system()

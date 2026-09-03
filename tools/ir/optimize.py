@@ -87,27 +87,41 @@ def optimize(mod: HLIRModule, fast: bool = False) -> HLIRModule:
 def _fold_binop(op, a, b):
     """Fold a binary operation on two literal values.
     Returns (folded_value, ok). `ok` is False if the op cannot be folded
-    (e.g. operands are wrong type, or operation would panic)."""
+    (e.g. operands are wrong type, or operation would panic).
+
+    Deep-scan fix (H1): use `isinstance(x, int) and not isinstance(x, bool)`
+    instead of plain `isinstance(x, int)` — in Python, `bool` is a subclass
+    of `int`, so `isinstance(True, int)` is True. Without this guard, the
+    folder would happily fold `True + 1` to `2`, miscompiling bool-typed
+    IR values (which HLS treats as a distinct type from int). The HLS
+    checker rejects `bool + int` at the AST level, but the IR can contain
+    such mixes after inlining or copy_propagation; folding them silently
+    would change observable behaviour.
+    """
     try:
         if op == "+":
-            if isinstance(a, int) and isinstance(b, int):
+            if isinstance(a, int) and not isinstance(a, bool) \
+                    and isinstance(b, int) and not isinstance(b, bool):
                 r = a + b
                 if INT64_MIN <= r <= INT64_MAX:
                     return r, True
             if isinstance(a, (bytes, str)) and isinstance(b, (bytes, str)):
                 return a + b, True
         elif op == "-":
-            if isinstance(a, int) and isinstance(b, int):
+            if isinstance(a, int) and not isinstance(a, bool) \
+                    and isinstance(b, int) and not isinstance(b, bool):
                 r = a - b
                 if INT64_MIN <= r <= INT64_MAX:
                     return r, True
         elif op == "*":
-            if isinstance(a, int) and isinstance(b, int):
+            if isinstance(a, int) and not isinstance(a, bool) \
+                    and isinstance(b, int) and not isinstance(b, bool):
                 r = a * b
                 if INT64_MIN <= r <= INT64_MAX:
                     return r, True
         elif op == "/":
-            if isinstance(a, int) and isinstance(b, int) and b != 0:
+            if isinstance(a, int) and not isinstance(a, bool) \
+                    and isinstance(b, int) and not isinstance(b, bool) and b != 0:
                 # BUG-DS4-13: INT64_MIN / -1 raises "integer overflow" at
                 # runtime (i64_div / hl_div_i64 check for it), and the
                 # mathematical result (+2^63) does not even fit in int64.
@@ -118,7 +132,8 @@ def _fold_binop(op, a, b):
                 q = abs(a) // abs(b)
                 return (q if (a < 0) == (b < 0) else -q), True
         elif op == "%":
-            if isinstance(a, int) and isinstance(b, int) and b != 0:
+            if isinstance(a, int) and not isinstance(a, bool) \
+                    and isinstance(b, int) and not isinstance(b, bool) and b != 0:
                 # BUG-DS4-13: INT64_MIN % -1 panics at runtime (i64_mod /
                 # hl_mod_i64), even though the mathematical result is 0.
                 # Folding it to 0 would REMOVE the panic and change program
@@ -212,7 +227,11 @@ def _constant_fold(irf: HLIRFunction):
                 op_arg, a_arg = ins.args[0], ins.args[1]
                 if op_arg[0] == "op" and op_arg[1] == "-":
                     a_val = _resolve(a_arg, consts)
-                    if isinstance(a_val, int) and a_val != INT64_MIN:
+                    # Deep-scan fix (H1): exclude bool — `isinstance(True, int)`
+                    # is True in Python, but HLS treats bool as a distinct
+                    # type. Folding `-True` would miscompile.
+                    if isinstance(a_val, int) and not isinstance(a_val, bool) \
+                            and a_val != INT64_MIN:
                         folded = -a_val
                         new_ins = Instr(dest=ins.dest, op=OP_CONST,
                                         args=[("lit", folded)], line=ins.line)

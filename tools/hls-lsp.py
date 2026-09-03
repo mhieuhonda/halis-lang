@@ -109,7 +109,9 @@ BUILTINS = ["println", "print", "len", "str", "int", "panic",
             "drop", "clone", "take", "file_exists", "read_file",
             "write_file", "tainted_args", "taint_mark", "taint_unwrap",
             "read_file_tainted"]
-EFFECTS = ["IO", "Fs", "Clock", "Args", "Exit"]
+# Deep-scan fix (C5): include Net, Rand, Proc (Stage 9 release) so editor
+# autocompletion offers them when the user types `uses `.
+EFFECTS = ["IO", "Fs", "Clock", "Args", "Exit", "Net", "Rand", "Proc"]
 
 
 class HLSServer:
