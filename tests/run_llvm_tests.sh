@@ -35,7 +35,7 @@ for f in tests/llvm/*.hls; do
         continue
     fi
     if ! python3 tools/ll_validate.py "$TMP/$name.ll" > /dev/null 2> "$TMP/$name.val"; then
-        bad "$name (invalid IR: $(rg -o 'V\d .{0,60}' "$TMP/$name.val" | head -2))"
+        bad "$name (invalid IR: $(grep -oE 'V[0-9] .{0,60}' "$TMP/$name.val" | head -2))"
         continue
     fi
     if command -v llvm-as >/dev/null 2>&1; then
@@ -75,7 +75,8 @@ echo "=== LLVM IR backend: unsupported constructs fail CLEANLY ==="
 printf 'struct S { x: int }\nfn main() -> int { let s: S = S { x: 1 }\n return s.x }\n' > "$TMP/unsup.hls"
 python3 boot/boot.py --emit llvm "$TMP/unsup.hls" > /dev/null 2> "$TMP/unsup.err"
 rc=$?
-if [ $rc -ne 0 ] && rg -q "not yet supported by --emit llvm" "$TMP/unsup.err" && ! rg -q "Traceback" "$TMP/unsup.err"; then
+# NOTE: use plain grep (not rg) — GitHub runners do not ship ripgrep.
+if [ $rc -ne 0 ] && grep -q "not yet supported by --emit llvm" "$TMP/unsup.err" && ! grep -q "Traceback" "$TMP/unsup.err"; then
     ok "unsupported construct -> clean error"
 else
     bad "unsupported construct (no clean error; rc=$rc; got: $(head -1 "$TMP/unsup.err"))"
