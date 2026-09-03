@@ -263,6 +263,10 @@ class Checker:
         # check_structlit adds an edge to the synthetic "@default.<Struct>"
         # call-graph node (BUG-DS4-2).
         self._structs_with_defaults = set()
+        # Stage 8-beta: > 0 while checking a while/for condition or
+        # iterable — take()/drop() are rejected there (a move would
+        # re-execute on every iteration).
+        self.loop_header = 0
 
     # ---------- utilities ----------
     def err(self, msg, node):
@@ -563,7 +567,9 @@ class Checker:
                 env.pop()
             self.restore_moved(env, snap)
         elif k == "while":
+            self.loop_header += 1
             ct = self.check_expr(s["cond"], env, None)
+            self.loop_header -= 1
             if ct != "bool":
                 self.err("while condition must be bool, got %s" % ct, s)
             # Moves inside the loop body don't leak out — the loop may execute
@@ -574,7 +580,9 @@ class Checker:
             env.pop()
             self.restore_moved(env, snap)
         elif k == "for":
+            self.loop_header += 1
             it = self.check_expr(s["iter"], env, None)
+            self.loop_header -= 1
             if not is_list(it):
                 self.err("for-in expression must be a list, got %s" % it, s)
             elem = list_elem(it)
@@ -649,8 +657,11 @@ class Checker:
             self.revive_binding(env, root["name"])
 
     def check_lvalue(self, e, env):
+        # Stage 8-beta: every branch annotates e["t"] so downstream
+        # consumers (codegen, linters) can read the lvalue's static type.
         if e["k"] == "ident":
             b = self.lookup(env, e["name"])
+            e["t"] = b[0]
             return b[0]
         if e["k"] == "field":
             bt = self.check_expr(e["target"], env, None)
@@ -660,7 +671,9 @@ class Checker:
             st, type_map = info
             for fname, ftype, _ in st["fields"]:
                 if fname == e["name"]:
-                    return instantiate_type(ftype, type_map) if type_map else ftype
+                    ft = instantiate_type(ftype, type_map) if type_map else ftype
+                    e["t"] = ft
+                    return ft
             self.err("struct %s has no field %s" % (type_base(bt), e["name"]), e)
         if e["k"] == "index":
             tt = self.check_expr(e["target"], env, None)
@@ -669,7 +682,9 @@ class Checker:
             it = self.check_expr(e["idx"], env, None)
             if it != "int":
                 self.err("index must be int, got %s" % it, e)
-            return list_elem(tt)
+            et = list_elem(tt)
+            e["t"] = et
+            return et
         self.err("invalid lvalue", e)
 
     # ---------- expressions ----------
@@ -1253,6 +1268,12 @@ class Checker:
             at = argt(0, None)
             if not is_owned_type(at):
                 self.err("drop() requires an owned (heap) type, got %s" % at, e)
+            # Stage 8-beta: a move inside a while/for condition or iterable
+            # would re-execute on every iteration — reject it up front.
+            if self.loop_header > 0:
+                self.err("drop() cannot be used inside a loop condition or "
+                         "iterable (the binding would be moved on every "
+                         "iteration)", e)
             # The argument must be a simple `ident` lvalue — we need a binding
             # to mark as moved. Complex expressions are not allowed.
             arg = args[0]
@@ -1268,9 +1289,8 @@ class Checker:
             if not is_owned_type(at):
                 self.err("clone() requires an owned (heap) type, got %s" % at, e)
             if not self.is_clone_supported(at):
-                self.err("clone() on type %s is not supported in v0.4.0-alpha "
-                         "(only str, list/map of int/float/bool/str are supported)"
-                         % at, e)
+                self.err("clone() on type %s is not supported (owned types "
+                         "only)" % at, e)
             # Argument is consumed by value (read), not moved.
             return at
         if name == "take":
@@ -1278,6 +1298,11 @@ class Checker:
             at = argt(0, None)
             if not is_owned_type(at):
                 self.err("take() requires an owned (heap) type, got %s" % at, e)
+            # Stage 8-beta: same loop-header restriction as drop().
+            if self.loop_header > 0:
+                self.err("take() cannot be used inside a loop condition or "
+                         "iterable (the binding would be moved on every "
+                         "iteration)", e)
             arg = args[0]
             if arg["k"] != "ident":
                 self.err("take() requires a variable name (not an expression)", e)
@@ -1288,15 +1313,20 @@ class Checker:
 
     @staticmethod
     def is_clone_supported(t):
-        """Types supported by clone() in v0.4.0-alpha. Stage 8-beta will
-        expand this to all heap types via per-instantiation helpers."""
+        """Types supported by clone(). Stage 8-beta (v0.19.0-alpha) expands
+        clone() to EVERY owned type — str, list, map, struct, enum,
+        tainted[...] — via the interpreter's deep_clone and per-
+        instantiation codegen helpers in the native compiler."""
         if t == "str":
             return True
         if is_list(t):
-            return list_elem(t) in ("int", "float", "bool", "str")
+            return Checker.is_clone_supported(list_elem(t))
         if is_map(t):
-            return map_val(t) in ("int", "float", "bool", "str")
-        return False
+            return Checker.is_clone_supported(map_val(t))
+        if is_taint(t):
+            return Checker.is_clone_supported(taint_inner(t))
+        # struct / enum / any other owned type
+        return True
 
     def check_method(self, e, env):
         tt = self.check_expr(e["target"], env, None)

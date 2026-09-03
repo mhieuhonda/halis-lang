@@ -673,22 +673,45 @@ native version does not (debug info: Stage 11).
 
 ---
 
-## 16. Ownership primitives (Stage 8-alpha — v0.4.0-alpha)
+## 16. Ownership & memory model (Stage 8 — complete in v0.19.0-alpha)
 
-Stage 8 of the roadmap calls for full ownership & borrow checking (memory
-safety without GC, ending the arena model). That stage is the highest-risk
-item in the entire roadmap. To reduce risk and ship value early, v0.4.0-alpha
-introduces **the first subset of Stage 8: three ownership primitives that
-give the compiler a static "moved" tracking pass**. The runtime still uses
-arena allocation; runtime memory reclamation is deferred to Stage 8-beta.
+Stage 8 of the roadmap calls for memory safety without GC, **ending the
+arena model**. It shipped in two steps:
+
+- **Stage 8-alpha (v0.4.0-alpha):** the three ownership primitives
+  (`drop` / `clone` / `take`) with a static "moved" tracking pass.
+- **Stage 8-beta (v0.19.0-alpha):** the **end of the arena** — the
+  generated C runtime is now reference-counted, and the codegen performs
+  a static **ownership analysis pass** that inserts exact
+  retain/release/free at compile time. A memory-stress program now runs
+  with a completely flat RSS (verified by `tests/run_tests.sh` section
+  3b under a 256 MB address-space limit) and `clone()` supports every
+  owned type.
+
+This follows the ROADMAP's explicitly sanctioned downgrade path
+("ref-counting + ownership analysis pass"): full borrow-checking syntax
+(`&mut`/lifetime annotations) is NOT part of the language; instead the
+compiler proves the retention balance statically and the runtime
+enforces it with non-atomic reference counts. Observable program
+behaviour is unchanged — the aliasing semantics of v0.1–v0.18 are
+preserved exactly (assignment still creates a reference, mutation is
+visible through all references); what changed is that memory is now
+reclaimed deterministically at scope exit.
 
 ### 16.1. The three primitives
 
 | Primitive | Type | Behaviour |
 |-----------|------|----------|
-| `drop(x: T) -> void` | builtin | Marks binding `x` as **moved**. Subsequent use of `x` is a compile error. Runtime: no-op (arena mode). |
-| `clone(x: T) -> T` | builtin | Returns an **independent deep copy** of `x`. `x` is NOT moved. |
-| `take(x: T) -> T` | builtin | Returns `x`'s value and marks binding `x` as **moved**. The value is now "owned" by the expression context. |
+| `drop(x: T) -> void` | builtin | Marks binding `x` as **moved**. Subsequent use of `x` is a compile error. Runtime: releases `x`'s retain immediately and nulls the binding (the scope-exit cleanup becomes a no-op). |
+| `clone(x: T) -> T` | builtin | Returns an **independent deep copy** of `x` (works for **every** owned type: `str`, `list`, `map`, `struct`, `enum`, `tainted[...]`). `x` is NOT moved. |
+| `take(x: T) -> T` | builtin | Returns `x`'s value and marks binding `x` as **moved** — the binding's retain transfers to the consumer. |
+
+**Stage 8-beta restriction:** `take()`/`drop()` are rejected inside a
+`while` condition or a `for` iterable — the header re-evaluates on every
+iteration, so a move would hand NULL to the callee from the second
+iteration on. Both compilers enforce this with the error
+`take() cannot be used inside a loop condition or iterable (the binding
+would be moved on every iteration)`.
 
 ### 16.2. Use-after-move is a compile error
 
@@ -783,17 +806,68 @@ The rationale: the `if` body may not execute at all, so post-`if` code must
 remain valid for every path. The conservative model "moves don't escape
 child scopes" matches this requirement.
 
-### 16.7. Limitations in v0.4.0-alpha (Stage 8-beta targets)
+### 16.7. The memory model (Stage 8-beta — end of the arena)
 
-| Limitation | Stage 8-beta target |
-|------------|---------------------|
-| `clone()` not yet supported on `struct`/`enum` (or `list[struct]`/`map[str, struct]`) | per-instantiation clone helpers generated at codegen time |
-| `drop(x)` is a runtime no-op (arena model still in use) | refcounted or borrow-checked runtime that actually reclaims memory |
-| No full borrow checker (multiple shared borrows are still allowed) | one mut OR many shared — see ROADMAP Stage 8 |
-| No lifetime annotations or inference | "minimal lifetimes: infer everything, only report errors when inference fails" (per ROADMAP) |
+Every heap value (string, list, map, struct, enum instance) begins with an
+`int64_t refcnt` field. The codegen's ownership analysis pass classifies
+every expression as **fresh** (carries one unowned retain — literals,
+concatenations, `clone`, call results, `pop`, `keys`, list/struct/enum
+literals) or **borrowed** (points at a retain owned elsewhere — idents,
+field/index access). The discipline:
 
-These limitations are deliberate and documented. They will be lifted in
-subsequent alpha/beta releases as the Stage 8 work proceeds.
+- **Bindings own one retain**, released by a C cleanup attribute at
+  block exit — this covers `break`/`continue`/`return` automatically
+  because the C compiler itself runs the cleanups on every control-flow
+  path.
+- **Function parameters own one retain of each argument** — call sites
+  pass fresh values raw and wrap borrowed values in `hl_retain(...)`.
+- **Containers own their elements**: `push`/`set`/`map.set` and struct
+  constructors store own-wrapped values; element destructors are
+  function pointers (`free` for primitive boxes, typed releases for
+  pointers) supplied at container creation.
+- **`return` of a borrowed value** adds one retain for the caller;
+  returning a fresh value transfers it. `return take(x)` nulls the
+  binding before the jump so the transfer is exact.
+- **Fresh values consumed in borrowed positions** (e.g. the left operand
+  of a `+` concat) are hoisted into temporaries with cleanups, so
+  nothing leaks even in expression trees.
+- `print`/`println`/`panic`/`read_file`/`write_file`/`file_exists`
+  **consume** their argument (release after use).
+
+Primitive values (int/float/bool) are never boxed outside containers and
+carry no refcount; container boxes are single-owner allocations freed by
+the container. The `?` operator retains the payload on success and
+retains the error value on the early-return path, so `Result` chains are
+leak-free. `match` arm bodies are own-wrapped so the match always yields
+an owned value regardless of which arm fired.
+
+Known (documented) limitations of the refcount model:
+
+| Limitation | Explanation |
+|------------|-------------|
+| Cycles leak | A struct whose field references (a copy of) itself keeps the last retain alive — same trade-off as Swift's non-ARC-optional mode. Cycles are rare because HLS has no references, only values. |
+| Deep struct chains recurse on release | Releasing a 1M-node linked struct recurses (stack depth = chain length). Lists/maps/strings release iteratively; the compiler itself (the largest HLS program) uses index pools, not pointer chains. |
+| Non-atomic refcounts | Single-threaded by design; Stage 16 (concurrency) will revisit. |
+| `exit()`/`panic()` skip cleanups | The process is terminating; reachable-at-exit blocks are bounded by live bindings. |
+
+### 16.8. `clone()` on every owned type (Stage 8-beta)
+
+`clone()` is now supported for `str`, `list[...]`, `map[str, ...]`,
+`struct`, `enum`, and `tainted[...]` (which clones as its inner type —
+taint is a compile-time property). The native compiler generates one
+`hl_clone_<mangled-type>` helper per instantiation, recursively cloning
+pointer children; the interpreter uses `deep_clone`. Mutating a clone
+never affects the original:
+
+```hls
+let a: Outer = Outer { name: "original", inner: Inner { label: "in", nums: [1, 2, 3] } }
+let b: Outer = clone(a)
+b.inner.nums.push(99)              # only b changes
+```
+
+The v0.4.0-alpha limitation table is now resolved in full: clone covers
+all owned types, `drop` reclaims at runtime, and the exact-free
+requirement is enforced by `tests/run_tests.sh` section 3b.
 
 ---
 

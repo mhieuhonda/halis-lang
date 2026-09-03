@@ -133,8 +133,6 @@ struct Ctx {
     fn_order: list[str],
     methods_of: map[str, list[str]],
     out: list[str],
-    lit_helpers: list[str],
-    lit_count: int,
     gen_locals: map[str, str],
     gen_counts: map[str, int],
     tmp: int,
@@ -149,7 +147,24 @@ struct Ctx {
     fn_insts: list[str],
     struct_insts: list[str],
     enum_insts: list[str],
-    computed_effects: map[str, list[str]]   # Stage 9-beta: per-function computed effect set, populated by check_effects
+    computed_effects: map[str, list[str]],
+    # ---- Stage 8-beta: ownership-analysis state ----
+    # hoist_map: expr index (as str) -> hoisted temp C name. Fresh
+    # pointer-typed subexpressions consumed in a borrowed position are
+    # materialised into temps with a cleanup attribute so they are
+    # released exactly when the enclosing C block exits.
+    hoist_map: map[str, str],
+    # null_after: C variable names to null out at the end of the current
+    # statement (bindings moved out by take()). Nulling makes the
+    # scope-exit cleanup a no-op, implementing ownership transfer.
+    null_after: list[str],
+    # clone_insts: HLS types that appeared in a clone() call (their
+    # hl_clone_<mangled> helpers will be generated).
+    clone_insts: list[str],
+    # loop_header: > 0 while checking a while/for condition or iterable —
+    # take()/drop() are rejected there (a move would re-execute every
+    # iteration).
+    loop_header: int
 }
 
 fn new_ctx(src: str) -> Ctx {
@@ -158,14 +173,15 @@ fn new_ctx(src: str) -> Ctx {
         exprs: [], stmts: [], match_arms: [],
         structs: map_new(), enums: map_new(), fns: map_new(), fn_order: [],
         methods_of: map_new(),
-        out: [], lit_helpers: [], lit_count: 0,
+        out: [],
         gen_locals: map_new(), gen_counts: map_new(), tmp: 0,
         edges: map_new(),
         imports: [], loaded_files: [],
         entry_dir: "", repo_root: "",
         cur_fn_ret: "void", cur_typeparams: [], cur_targs: [],
         fn_insts: [], struct_insts: [], enum_insts: [],
-        computed_effects: map_new()
+        computed_effects: map_new(),
+        hoist_map: map_new(), null_after: [], clone_insts: [], loop_header: 0
     }
 }
 
@@ -1816,21 +1832,25 @@ fn is_owned_type(t: str) -> bool {
     return true
 }
 
-# is_clone_supported: True if clone() supports this type in v0.4.0-alpha.
-# Stage 8-beta will expand this to all heap types.
+# is_clone_supported: True if clone() supports this type. Stage 8-beta
+# (v0.19.0-alpha) expands clone() to EVERY owned type — str, list, map,
+# struct, enum, tainted[...] — via per-instantiation codegen helpers
+# (hl_clone_<mangled-type>) and the interpreter's deep_clone.
 fn is_clone_supported(t: str) -> bool {
     if t == "str" {
         return true
     }
     if is_list_t(t) {
-        let e: str = list_elem_t(t)
-        return e == "int" || e == "float" || e == "bool" || e == "str"
+        return is_clone_supported(list_elem_t(t))
     }
     if is_map_t(t) {
-        let v: str = map_val_t(t)
-        return v == "int" || v == "float" || v == "bool" || v == "str"
+        return is_clone_supported(map_val_t(t))
     }
-    return false
+    if is_taint_t(t) {
+        return is_clone_supported(taint_inner_t(t))
+    }
+    # struct / enum / any other owned type
+    return true
 }
 
 fn add_edge(ctx: Ctx, cur: str, callee: str) -> void {
@@ -2417,7 +2437,9 @@ fn check_stmt(ctx: Ctx, env: list[map[str, Binding]], cur: str, f: FnInfo, sidx:
         }
         restore_moved(env, snap)
     } else if s.kind == "while" {
+        ctx.loop_header = ctx.loop_header + 1
         let ct: str = check_expr(ctx, env, cur, s.cond, "")
+        ctx.loop_header = ctx.loop_header - 1
         if ct != "bool" {
             cerr(s.line, "while condition must be bool, got " + ct)
         }
@@ -2429,7 +2451,9 @@ fn check_stmt(ctx: Ctx, env: list[map[str, Binding]], cur: str, f: FnInfo, sidx:
         env.pop()
         restore_moved(env, snap)
     } else if s.kind == "for" {
+        ctx.loop_header = ctx.loop_header + 1
         let it: str = check_expr(ctx, env, cur, s.iter, "")
+        ctx.loop_header = ctx.loop_header - 1
         if !is_list_t(it) {
             cerr(s.line, "for-in expression must be a list, got " + it)
         }
@@ -2516,7 +2540,10 @@ fn check_assign(ctx: Ctx, env: list[map[str, Binding]], cur: str, s: StmtN) -> v
 
 fn check_lvalue(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int) -> str {
     if ctx.exprs[e].kind == "ident" {
-        return lookup_binding(env, ctx.exprs[e].name).t
+        # Stage 8-beta: annotate the lvalue's type so the codegen can
+        # emit release/retain for assignments by static type.
+        ctx.exprs[e].t = lookup_binding(env, ctx.exprs[e].name).t
+        return ctx.exprs[e].t
     }
     if ctx.exprs[e].kind == "field" {
         let bt: str = check_expr(ctx, env, cur, ctx.exprs[e].left, "")
@@ -2528,11 +2555,14 @@ fn check_lvalue(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int) -> str
         while i < st.fields.len() {
             if st.fields.get(i) == ctx.exprs[e].name {
                 # If the struct is generic, instantiate the field type.
+                # Stage 8-beta: annotate the lvalue's type for codegen.
+                let mut ft: str = st.ftypes.get(i)
                 if st.typeparams.len() > 0 {
                     let targs: list[str] = type_args(bt)
-                    return instantiate_type(st.ftypes.get(i), st.typeparams, targs)
+                    ft = instantiate_type(st.ftypes.get(i), st.typeparams, targs)
                 }
-                return st.ftypes.get(i)
+                ctx.exprs[e].t = ft
+                return ft
             }
             i = i + 1
         }
@@ -2547,7 +2577,9 @@ fn check_lvalue(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int) -> str
         if it != "int" {
             cerr(ctx.exprs[e].line, "index must be int, got " + it)
         }
-        return list_elem_t(tt)
+        let et: str = list_elem_t(tt)
+        ctx.exprs[e].t = et
+        return et
     }
     cerr(ctx.exprs[e].line, "invalid lvalue")
     return ""
@@ -3143,6 +3175,9 @@ fn check_builtin_call(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, 
         if nargs != 1 {
             cerr(line, "drop() expects 1 argument")
         }
+        if ctx.loop_header > 0 {
+            cerr(line, "drop() cannot be used inside a loop condition or iterable (the binding would be moved on every iteration)")
+        }
         let at: str = argt.get(0)
         if !is_owned_type(at) {
             cerr(line, "drop() requires an owned (heap) type, got " + at)
@@ -3167,7 +3202,7 @@ fn check_builtin_call(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, 
             cerr(line, "clone() requires an owned (heap) type, got " + at2)
         }
         if !is_clone_supported(at2) {
-            cerr(line, "clone() on type " + at2 + " is not supported in v0.4.0-alpha (only str, list/map of int/float/bool/str are supported)")
+            cerr(line, "clone() on type " + at2 + " is not supported (owned types only)")
         }
         return at2
     }
@@ -3178,6 +3213,12 @@ fn check_builtin_call(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, 
         let at3: str = argt.get(0)
         if !is_owned_type(at3) {
             cerr(line, "take() requires an owned (heap) type, got " + at3)
+        }
+        # Stage 8-beta: a move inside a while/for condition or iterable
+        # would re-execute on every iteration (the binding is nulled in
+        # generated code after the first pass) — reject it up front.
+        if ctx.loop_header > 0 {
+            cerr(line, "take() cannot be used inside a loop condition or iterable (the binding would be moved on every iteration)")
         }
         let arg_idx3: int = ctx.exprs[e].args.get(0)
         if ctx.exprs[arg_idx3].kind != "ident" {
@@ -3975,9 +4016,15 @@ fn runtime_lines() -> list[str] {
     r.push("#include <math.h>")
     r.push("#include <sys/stat.h>")
     r.push("")
-    r.push("typedef struct { int64_t len; char* data; } hl_str;")
-    r.push("typedef struct { int64_t len; int64_t cap; void** items; } hl_list;")
-    r.push("typedef struct { int64_t len; int64_t cap; hl_str** slots; void** vals; hl_list* order; } hl_map;")
+    # ---- Stage 8-beta: the refcounted runtime (END OF ARENA) ----
+    # Every heap object starts with an int64_t refcnt as its FIRST field so
+    # hl_retain works uniformly on all object types. Releases are
+    # type-specific (they must release children). elem_free / val_free ==
+    # NULL means "arena mode": the container never releases its items (used
+    # by the LLVM backend, which is still arena-based).
+    r.push("typedef struct { int64_t refcnt; int64_t len; char* data; } hl_str;")
+    r.push("typedef struct { int64_t refcnt; int64_t len; int64_t cap; void** items; void (*elem_free)(void*); } hl_list;")
+    r.push("typedef struct { int64_t refcnt; int64_t len; int64_t cap; hl_str** slots; void** vals; hl_str** order; void (*val_free)(void*); } hl_map;")
     r.push("")
     r.push("// Checked byte string — used by the HLS runtime")
     r.push("static void hl_die(const char* msg) {")
@@ -3986,15 +4033,31 @@ fn runtime_lines() -> list[str] {
     r.push("    exit(101);")
     r.push("}")
     r.push("")
+    r.push("// ---- Stage 8-beta: reference-counting core ----")
+    r.push("// refcnt is the first field of every heap object, so retain is")
+    r.push("// generic; release is type-specific (it must release children).")
+    r.push("static void* hl_retain(void* p) {")
+    r.push("    if (p) ((int64_t*)p)[0] += 1;")
+    r.push("    return p;")
+    r.push("}")
+    r.push("")
     r.push("static hl_str* hl_str_alloc(int64_t len) {")
     r.push("    hl_str* s = (hl_str*)malloc(sizeof(hl_str));")
     r.push("    if (!s) hl_die(\"out of memory\");")
+    r.push("    s->refcnt = 1;")
     r.push("    s->len = len;")
     r.push("    s->data = (char*)malloc((size_t)len + 1);")
     r.push("    if (!s->data) hl_die(\"out of memory\");")
     r.push("    s->data[len] = 0;")
     r.push("    return s;")
     r.push("}")
+    r.push("")
+    r.push("static void hl_str_release(void* pv) {")
+    r.push("    hl_str* s = (hl_str*)pv;")
+    r.push("    if (!s) return;")
+    r.push("    if (--s->refcnt == 0) { free(s->data); free(s); }")
+    r.push("}")
+    r.push("static void hl_cleanup_str(hl_str** p) { hl_str_release(*p); }")
     r.push("")
     r.push("static hl_str* hl_str_from(const char* c, int64_t len) {")
     r.push("    hl_str* s = hl_str_alloc(len);")
@@ -4130,15 +4193,34 @@ fn runtime_lines() -> list[str] {
     r.push("static void* hl_box_ptr(void* p) { return p; }")
     r.push("static void* hl_unbox_ptr(void* p) { return p; }")
     r.push("")
-    r.push("static hl_list* hl_list_new(void) {")
+    r.push("// hl_list_new: elem_free describes how to release one element.")
+    r.push("// free       -> primitive boxes;  hl_str_release -> str;")
+    r.push("// hl_list_release / hl_map_release / hl_release_<T> -> containers/user types.")
+    r.push("// NULL = arena mode (never release elements — LLVM backend).")
+    r.push("static hl_list* hl_list_new(void (*elem_free)(void*)) {")
     r.push("    hl_list* l = (hl_list*)malloc(sizeof(hl_list));")
     r.push("    if (!l) hl_die(\"out of memory\");")
+    r.push("    l->refcnt = 1;")
     r.push("    l->len = 0;")
     r.push("    l->cap = 8;")
+    r.push("    l->elem_free = elem_free;")
     r.push("    l->items = (void**)malloc((size_t)l->cap * sizeof(void*));")
     r.push("    if (!l->items) hl_die(\"out of memory\");")
     r.push("    return l;")
     r.push("}")
+    r.push("")
+    r.push("static void hl_list_release(void* pl) {")
+    r.push("    hl_list* l = (hl_list*)pl;")
+    r.push("    if (!l) return;")
+    r.push("    if (--l->refcnt == 0) {")
+    r.push("        if (l->elem_free) {")
+    r.push("            for (int64_t i = 0; i < l->len; i++) l->elem_free(l->items[i]);")
+    r.push("        }")
+    r.push("        free(l->items);")
+    r.push("        free(l);")
+    r.push("    }")
+    r.push("}")
+    r.push("static void hl_cleanup_list(hl_list** p) { hl_list_release(*p); }")
     r.push("")
     r.push("static void hl_list_push(hl_list* l, void* v) {")
     r.push("    if (l->len == l->cap) {")
@@ -4157,18 +4239,22 @@ fn runtime_lines() -> list[str] {
     r.push("    return l->items[i];")
     r.push("}")
     r.push("")
+    r.push("// hl_list_set: v arrives OWNED (the caller transferred one retain).")
+    r.push("// Store first, then release the old item so self-assignment is safe.")
     r.push("static void hl_list_set(hl_list* l, int64_t i, void* v) {")
     r.push("    if (i < 0 || i >= l->len) hl_die(\"array access out of bounds\");")
+    r.push("    void* old = l->items[i];")
     r.push("    l->items[i] = v;")
+    r.push("    if (l->elem_free) l->elem_free(old);")
     r.push("}")
     r.push("")
     r.push("static hl_list* hl_range(int64_t a, int64_t b) {")
-    r.push("    hl_list* l = hl_list_new();")
+    r.push("    hl_list* l = hl_list_new(free);")
     r.push("    for (int64_t i = a; i < b; i++) hl_list_push(l, hl_box_i64(i));")
     r.push("    return l;")
     r.push("}")
     r.push("")
-    r.push("// ---- map[str, T]: linear-probing hash table + insertion-order list ----")
+    r.push("// ---- map[str, T]: linear-probing hash table + insertion-order array ----")
     r.push("static uint64_t hl_str_hash(hl_str* s) {")
     r.push("    uint64_t h = 1469598103934665603ULL;")
     r.push("    for (int64_t i = 0; i < s->len; i++) {")
@@ -4178,68 +4264,137 @@ fn runtime_lines() -> list[str] {
     r.push("    return h;")
     r.push("}")
     r.push("")
-    r.push("static hl_map* hl_map_new(void) {")
+    r.push("// hl_map_new: val_free describes how to release one value. The map")
+    r.push("// owns one retain per key and one retain (or box) per value.")
+    r.push("static hl_map* hl_map_new(void (*val_free)(void*)) {")
     r.push("    hl_map* m = (hl_map*)malloc(sizeof(hl_map));")
     r.push("    if (!m) hl_die(\"out of memory\");")
+    r.push("    m->refcnt = 1;")
     r.push("    m->len = 0;")
     r.push("    m->cap = 16;")
     r.push("    m->slots = (hl_str**)calloc((size_t)m->cap, sizeof(hl_str*));")
     r.push("    m->vals = (void**)malloc((size_t)m->cap * sizeof(void*));")
-    r.push("    if (!m->slots || !m->vals) hl_die(\"out of memory\");")
-    r.push("    m->order = hl_list_new();")
+    r.push("    m->order = (hl_str**)malloc((size_t)m->cap * sizeof(hl_str*));")
+    r.push("    m->val_free = val_free;")
+    r.push("    if (!m->slots || !m->vals || !m->order) hl_die(\"out of memory\");")
     r.push("    return m;")
     r.push("}")
     r.push("")
-    r.push("static void hl_map_set(hl_map* m, hl_str* k, void* v) {")
-    r.push("    if ((m->len + 1) * 10 >= m->cap * 7) {")
-    r.push("        int64_t ncap = m->cap * 2;")
-    r.push("        hl_str** nslots = (hl_str**)calloc((size_t)ncap, sizeof(hl_str*));")
-    r.push("        void** nvals = (void**)malloc((size_t)ncap * sizeof(void*));")
-    r.push("        if (!nslots || !nvals) hl_die(\"out of memory\");")
+    r.push("static void hl_map_release(void* pm) {")
+    r.push("    hl_map* m = (hl_map*)pm;")
+    r.push("    if (!m) return;")
+    r.push("    if (--m->refcnt == 0) {")
     r.push("        for (int64_t i = 0; i < m->cap; i++) {")
     r.push("            if (m->slots[i] != NULL) {")
-    r.push("                uint64_t idx = hl_str_hash(m->slots[i]) & (uint64_t)(ncap - 1);")
-    r.push("                while (nslots[idx] != NULL) idx = (idx + 1) & (uint64_t)(ncap - 1);")
-    r.push("                nslots[idx] = m->slots[i];")
-    r.push("                nvals[idx] = m->vals[i];")
+    r.push("                if (m->val_free) m->val_free(m->vals[i]);")
+    r.push("                hl_str_release(m->slots[i]);")
     r.push("            }")
     r.push("        }")
     r.push("        free(m->slots);")
     r.push("        free(m->vals);")
-    r.push("        m->slots = nslots;")
-    r.push("        m->vals = nvals;")
-    r.push("        m->cap = ncap;")
+    r.push("        free(m->order);")
+    r.push("        free(m);")
+    r.push("    }")
+    r.push("}")
+    r.push("static void hl_cleanup_map(hl_map** p) { hl_map_release(*p); }")
+    r.push("")
+    r.push("static void hl_map_grow(hl_map* m, int64_t ncap) {")
+    r.push("    hl_str** nslots = (hl_str**)calloc((size_t)ncap, sizeof(hl_str*));")
+    r.push("    void** nvals = (void**)malloc((size_t)ncap * sizeof(void*));")
+    r.push("    hl_str** norder = (hl_str**)malloc((size_t)ncap * sizeof(hl_str*));")
+    r.push("    if (!nslots || !nvals || !norder) hl_die(\"out of memory\");")
+    r.push("    for (int64_t i = 0; i < m->cap; i++) {")
+    r.push("        if (m->slots[i] != NULL) {")
+    r.push("            uint64_t idx = hl_str_hash(m->slots[i]) & (uint64_t)(ncap - 1);")
+    r.push("            while (nslots[idx] != NULL) idx = (idx + 1) & (uint64_t)(ncap - 1);")
+    r.push("            nslots[idx] = m->slots[i];")
+    r.push("            nvals[idx] = m->vals[i];")
+    r.push("        }")
+    r.push("    }")
+    r.push("    for (int64_t j = 0; j < m->len; j++) norder[j] = m->order[j];")
+    r.push("    free(m->slots);")
+    r.push("    free(m->vals);")
+    r.push("    free(m->order);")
+    r.push("    m->slots = nslots;")
+    r.push("    m->vals = nvals;")
+    r.push("    m->order = norder;")
+    r.push("    m->cap = ncap;")
+    r.push("}")
+    r.push("")
+    r.push("// hl_map_set: k and v arrive OWNED (the caller transferred one retain")
+    r.push("// of each). On overwrite the incoming key is released and the old")
+    r.push("// value is released. Store-then-release keeps self-assignment safe.")
+    r.push("static void hl_map_set(hl_map* m, hl_str* k, void* v) {")
+    r.push("    if ((m->len + 1) * 10 >= m->cap * 7) {")
+    r.push("        hl_map_grow(m, m->cap * 2);")
     r.push("    }")
     r.push("    uint64_t idx = hl_str_hash(k) & (uint64_t)(m->cap - 1);")
     r.push("    while (m->slots[idx] != NULL) {")
     r.push("        if (hl_str_eq(m->slots[idx], k)) {")
+    r.push("            void* oldv = m->vals[idx];")
     r.push("            m->vals[idx] = v;")
+    r.push("            if (m->val_free) m->val_free(oldv);")
+    r.push("            hl_str_release(k);")
     r.push("            return;")
     r.push("        }")
     r.push("        idx = (idx + 1) & (uint64_t)(m->cap - 1);")
     r.push("    }")
     r.push("    m->slots[idx] = k;")
     r.push("    m->vals[idx] = v;")
+    r.push("    m->order[m->len] = k;")
     r.push("    m->len++;")
-    r.push("    hl_list_push(m->order, hl_box_ptr(k));")
     r.push("}")
     r.push("")
-    r.push("static void* hl_map_get(hl_map* m, hl_str* k, void* dflt) {")
+    r.push("// hl_map_borrow: raw lookup — returns the stored slot value (a box for")
+    r.push("// primitive-valued maps, the value itself for pointer-valued maps) or")
+    r.push("// NULL when the key is missing. The map keeps ownership.")
+    r.push("static void* hl_map_borrow(hl_map* m, hl_str* k) {")
     r.push("    uint64_t idx = hl_str_hash(k) & (uint64_t)(m->cap - 1);")
     r.push("    while (m->slots[idx] != NULL) {")
     r.push("        if (hl_str_eq(m->slots[idx], k)) return m->vals[idx];")
     r.push("        idx = (idx + 1) & (uint64_t)(m->cap - 1);")
     r.push("    }")
+    r.push("    return NULL;")
+    r.push("}")
+    r.push("")
+    r.push("// Typed getters for primitive-valued maps: the default arrives by")
+    r.push("// value — no boxing, no allocation, no refcount traffic.")
+    r.push("static int64_t hl_map_get_i64(hl_map* m, hl_str* k, int64_t dflt) {")
+    r.push("    void* v = hl_map_borrow(m, k);")
+    r.push("    if (v == NULL) return dflt;")
+    r.push("    return hl_unbox_i64(v);")
+    r.push("}")
+    r.push("static double hl_map_get_f64(hl_map* m, hl_str* k, double dflt) {")
+    r.push("    void* v = hl_map_borrow(m, k);")
+    r.push("    if (v == NULL) return dflt;")
+    r.push("    return hl_unbox_f64(v);")
+    r.push("}")
+    r.push("static bool hl_map_get_bool(hl_map* m, hl_str* k, bool dflt) {")
+    r.push("    void* v = hl_map_borrow(m, k);")
+    r.push("    if (v == NULL) return dflt;")
+    r.push("    return hl_unbox_bool(v);")
+    r.push("}")
+    r.push("")
+    r.push("// hl_map_get_own: for pointer-valued maps. dflt arrives OWNED (+1)")
+    r.push("// and the result is returned OWNED (+1).")
+    r.push("static void* hl_map_get_own(hl_map* m, hl_str* k, void* dflt) {")
+    r.push("    void* v = hl_map_borrow(m, k);")
+    r.push("    if (v != NULL) {")
+    r.push("        hl_retain(v);")
+    r.push("        if (m->val_free) m->val_free(dflt);")
+    r.push("        return v;")
+    r.push("    }")
     r.push("    return dflt;")
     r.push("}")
     r.push("")
-    r.push("static bool hl_map_has(hl_map* m, hl_str* k) { return hl_map_get(m, k, NULL) != NULL; }")
+    r.push("static bool hl_map_has(hl_map* m, hl_str* k) { return hl_map_borrow(m, k) != NULL; }")
     r.push("")
     r.push("static int64_t hl_map_len(hl_map* m) { return m->len; }")
     r.push("")
+    r.push("// hl_map_keys: fresh list[str]; each key is retained for the new list.")
     r.push("static hl_list* hl_map_keys(hl_map* m) {")
-    r.push("    hl_list* r = hl_list_new();")
-    r.push("    for (int64_t i = 0; i < m->order->len; i++) hl_list_push(r, m->order->items[i]);")
+    r.push("    hl_list* r = hl_list_new(hl_str_release);")
+    r.push("    for (int64_t i = 0; i < m->len; i++) hl_list_push(r, hl_retain(m->order[i]));")
     r.push("    return r;")
     r.push("}")
     r.push("")
@@ -4278,11 +4433,11 @@ fn runtime_lines() -> list[str] {
     r.push("    return a % b;")
     r.push("}")
     r.push("")
-    r.push("// ---- I/O ----")
+    r.push("// ---- I/O (print-family builtins CONSUME their str argument) ----")
     r.push("static hl_list* g_hl_args = NULL;")
     r.push("")
     r.push("static void hl_init_args(int argc, char** argv) {")
-    r.push("    g_hl_args = hl_list_new();")
+    r.push("    g_hl_args = hl_list_new(hl_str_release);")
     r.push("    for (int i = 0; i < argc; i++) {")
     r.push("        hl_list_push(g_hl_args, hl_str_from(argv[i], (int64_t)strlen(argv[i])));")
     r.push("    }")
@@ -4290,27 +4445,48 @@ fn runtime_lines() -> list[str] {
     r.push("")
     r.push("static hl_list* hl_args(void) { return g_hl_args; }")
     r.push("")
-    r.push("static void hl_print(hl_str* s) { fwrite(s->data, 1, (size_t)s->len, stdout); }")
+    r.push("static void hl_print(hl_str* s) {")
+    r.push("    fwrite(s->data, 1, (size_t)s->len, stdout);")
+    r.push("    hl_str_release(s);")
+    r.push("}")
     r.push("")
     r.push("static void hl_println(hl_str* s) {")
     r.push("    fwrite(s->data, 1, (size_t)s->len, stdout);")
     r.push("    fputc('\\n', stdout);")
+    r.push("    hl_str_release(s);")
     r.push("}")
     r.push("")
+    r.push("// hl_read_file: consumes the path, returns a fresh str. The temporary")
+    r.push("// read buffer is freed before returning (it used to leak under the")
+    r.push("// arena model).")
     r.push("static hl_str* hl_read_file(hl_str* path) {")
     r.push("    FILE* f = fopen(path->data, \"rb\");")
     r.push("    if (!f) hl_die(\"cannot open file\");")
-    r.push("    if (fseek(f, 0, SEEK_END) != 0) hl_die(\"cannot open file\");")
-    r.push("    long sz = ftell(f);")
-    r.push("    if (sz < 0) hl_die(\"cannot open file\");")
-    r.push("    rewind(f);")
-    r.push("    char* buf = (char*)malloc((size_t)sz + 1);")
+    r.push("    // Virtual files (/proc, /sys) report size 0 via fseek/ftell,")
+    r.push("    // so read incrementally until EOF instead of trusting the")
+    r.push("    // size (BUG: the interpreter read them fine while the native")
+    r.push("    // binary got empty output — a differential divergence).")
+    r.push("    size_t cap = 4096, len = 0;")
+    r.push("    char* buf = (char*)malloc(cap);")
     r.push("    if (!buf) hl_die(\"out of memory\");")
-    r.push("    if (sz > 0 && fread(buf, 1, (size_t)sz, f) != (size_t)sz) hl_die(\"cannot open file\");")
+    r.push("    for (;;) {")
+    r.push("        if (len == cap) {")
+    r.push("            cap *= 2;")
+    r.push("            buf = (char*)realloc(buf, cap);")
+    r.push("            if (!buf) hl_die(\"out of memory\");")
+    r.push("        }")
+    r.push("        size_t n = fread(buf + len, 1, cap - len, f);")
+    r.push("        len += n;")
+    r.push("        if (n == 0) break;")
+    r.push("    }")
     r.push("    fclose(f);")
-    r.push("    return hl_str_from(buf, sz);")
+    r.push("    hl_str* out = hl_str_from(buf, (int64_t)len);")
+    r.push("    free(buf);")
+    r.push("    hl_str_release(path);")
+    r.push("    return out;")
     r.push("}")
     r.push("")
+    r.push("// hl_write_file: consumes the path and the content.")
     r.push("static void hl_write_file(hl_str* path, hl_str* content) {")
     r.push("    FILE* f = fopen(path->data, \"wb\");")
     r.push("    if (!f) hl_die(\"cannot write file\");")
@@ -4318,12 +4494,14 @@ fn runtime_lines() -> list[str] {
     r.push("        hl_die(\"cannot write file\");")
     r.push("    }")
     r.push("    if (fclose(f) != 0) hl_die(\"cannot write file\");")
+    r.push("    hl_str_release(content);")
+    r.push("    hl_str_release(path);")
     r.push("}")
     r.push("")
     r.push("static int64_t hl_clock_ms(void) {")
     r.push("    struct timespec ts;")
     r.push("    clock_gettime(CLOCK_MONOTONIC, &ts);")
-    r.push("    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;")
+    r.push("    return (int64_t)ts.tv_sec * 1000 + (int64_t)ts.tv_nsec / 1000000;")
     r.push("}")
     r.push("")
     r.push("static void hl_panic(hl_str* msg) {")
@@ -4340,31 +4518,54 @@ fn runtime_lines() -> list[str] {
     r.push("// String split helper (placed last because it depends on hl_list)")
     r.push("static hl_list* hl_str_split(hl_str* s, hl_str* sep) {")
     r.push("    if (sep->len == 0) hl_die(\"empty separator not allowed\");")
-    r.push("    hl_list* out = hl_list_new();")
+    r.push("    hl_list* out = hl_list_new(hl_str_release);")
     r.push("    if (s->len == 0) {")
-    r.push("        hl_list_push(out, hl_box_ptr(hl_str_from(\"\", 0)));")
+    r.push("        hl_list_push(out, hl_str_from(\"\", 0));")
     r.push("        return out;")
     r.push("    }")
     r.push("    int64_t start = 0;")
     r.push("    int64_t i = 0;")
     r.push("    while (i + sep->len <= s->len) {")
     r.push("        if (memcmp(s->data + i, sep->data, (size_t)sep->len) == 0) {")
-    r.push("            hl_list_push(out, hl_box_ptr(hl_str_from(s->data + start, i - start)));")
+    r.push("            hl_list_push(out, hl_str_from(s->data + start, i - start));")
     r.push("            i += sep->len;")
     r.push("            start = i;")
     r.push("        } else {")
     r.push("            i++;")
     r.push("        }")
     r.push("    }")
-    r.push("    hl_list_push(out, hl_box_ptr(hl_str_from(s->data + start, s->len - start)));")
+    r.push("    hl_list_push(out, hl_str_from(s->data + start, s->len - start));")
     r.push("    return out;")
     r.push("}")
     r.push("")
     r.push("// ---- v0.2 additions: pop, float, chr, fmod ----")
+    r.push("// hl_list_pop: ownership of the removed item transfers to the caller.")
     r.push("static void* hl_list_pop(hl_list* l) {")
     r.push("    if (l->len == 0) hl_die(\"array access out of bounds\");")
     r.push("    l->len--;")
     r.push("    return l->items[l->len];")
+    r.push("}")
+    r.push("")
+    r.push("// Typed pops for primitive element lists: pop the box, unbox the")
+    r.push("// value, free the box. (A plain pop + unbox would leak the box —")
+    r.push("// the caller only wanted the primitive.)")
+    r.push("static int64_t hl_list_pop_i64(hl_list* l) {")
+    r.push("    void* b = hl_list_pop(l);")
+    r.push("    int64_t v = hl_unbox_i64(b);")
+    r.push("    free(b);")
+    r.push("    return v;")
+    r.push("}")
+    r.push("static double hl_list_pop_f64(hl_list* l) {")
+    r.push("    void* b = hl_list_pop(l);")
+    r.push("    double v = hl_unbox_f64(b);")
+    r.push("    free(b);")
+    r.push("    return v;")
+    r.push("}")
+    r.push("static bool hl_list_pop_bool(hl_list* l) {")
+    r.push("    void* b = hl_list_pop(l);")
+    r.push("    bool v = hl_unbox_bool(b);")
+    r.push("    free(b);")
+    r.push("    return v;")
     r.push("}")
     r.push("")
     r.push("static double hl_str_to_double(hl_str* s) {")
@@ -4414,96 +4615,22 @@ fn runtime_lines() -> list[str] {
     r.push("    return (int64_t)v;")
     r.push("}")
     r.push("")
-    r.push("// file_exists: returns true if the path is a regular file")
+    r.push("// hl_file_exists: consumes the path.")
     r.push("static bool hl_file_exists(hl_str* path) {")
     r.push("    struct stat st;")
-    r.push("    return stat(path->data, &st) == 0 && S_ISREG(st.st_mode);")
+    r.push("    bool ok = stat(path->data, &st) == 0 && S_ISREG(st.st_mode);")
+    r.push("    hl_str_release(path);")
+    r.push("    return ok;")
     r.push("}")
     r.push("")
-    # ----- Stage 8-alpha: ownership primitives runtime -----
-    # drop() is a compile-time annotation only; runtime no-op. The compiler
-    # emits ((void)0) for drop(x). Memory reclamation is deferred to a later
-    # Stage 8-beta (refcounted or borrow-checked runtime).
-    # clone() helpers — one per supported type. Stage 8-alpha supports:
-    #   str, list[prim], map[str, prim] (prim ∈ {int, float, bool, str})
-    # Strings are immutable, so a shallow copy is a deep copy.
-    r.push("// clone(str) — strings are immutable, so a shallow copy is fine.")
+    # ----- Stage 8-beta: ownership primitives runtime -----
+    # clone(str) is the only fixed clone helper in the runtime. Every other
+    # clone() helper is generated per type-instantiation by the codegen
+    # (hl_clone_<mangled-type>) because it must know field/elem/value
+    # types — including user structs and enums.
+    r.push("// clone(str) — strings are immutable, so a shallow copy is a deep copy.")
     r.push("static hl_str* hl_clone_str(hl_str* s) {")
     r.push("    return hl_str_from(s->data, s->len);")
-    r.push("}")
-    r.push("")
-    # Per-element-type list clone: allocates a new list, pushes a clone of
-    # each element. For primitive (unboxed) element types, the clone is just
-    # the value itself (with a new box). For str element type, we clone the
-    # string too. Struct/enum element types are not supported in v0.4.0-alpha.
-    r.push("// clone(list[int]) — deep copy with new box per element.")
-    r.push("static hl_list* hl_clone_list_int(hl_list* l) {")
-    r.push("    hl_list* r = hl_list_new();")
-    r.push("    for (int64_t i = 0; i < l->len; i++) {")
-    r.push("        hl_list_push(r, hl_box_i64(hl_unbox_i64(l->items[i])));")
-    r.push("    }")
-    r.push("    return r;")
-    r.push("}")
-    r.push("")
-    r.push("static hl_list* hl_clone_list_float(hl_list* l) {")
-    r.push("    hl_list* r = hl_list_new();")
-    r.push("    for (int64_t i = 0; i < l->len; i++) {")
-    r.push("        hl_list_push(r, hl_box_f64(hl_unbox_f64(l->items[i])));")
-    r.push("    }")
-    r.push("    return r;")
-    r.push("}")
-    r.push("")
-    r.push("static hl_list* hl_clone_list_bool(hl_list* l) {")
-    r.push("    hl_list* r = hl_list_new();")
-    r.push("    for (int64_t i = 0; i < l->len; i++) {")
-    r.push("        hl_list_push(r, hl_box_bool(hl_unbox_bool(l->items[i])));")
-    r.push("    }")
-    r.push("    return r;")
-    r.push("}")
-    r.push("")
-    r.push("static hl_list* hl_clone_list_str(hl_list* l) {")
-    r.push("    hl_list* r = hl_list_new();")
-    r.push("    for (int64_t i = 0; i < l->len; i++) {")
-    r.push("        hl_list_push(r, hl_clone_str((hl_str*)l->items[i]));")
-    r.push("    }")
-    r.push("    return r;")
-    r.push("}")
-    r.push("")
-    # Map clone: similar pattern. Iterate insertion order, clone values.
-    r.push("static hl_map* hl_clone_map_int(hl_map* m) {")
-    r.push("    hl_map* r = hl_map_new();")
-    r.push("    for (int64_t i = 0; i < m->order->len; i++) {")
-    r.push("        hl_str* k = (hl_str*)m->order->items[i];")
-    r.push("        hl_map_set(r, hl_clone_str(k), hl_box_i64(hl_unbox_i64(hl_map_get(m, k, NULL))));")
-    r.push("    }")
-    r.push("    return r;")
-    r.push("}")
-    r.push("")
-    r.push("static hl_map* hl_clone_map_float(hl_map* m) {")
-    r.push("    hl_map* r = hl_map_new();")
-    r.push("    for (int64_t i = 0; i < m->order->len; i++) {")
-    r.push("        hl_str* k = (hl_str*)m->order->items[i];")
-    r.push("        hl_map_set(r, hl_clone_str(k), hl_box_f64(hl_unbox_f64(hl_map_get(m, k, NULL))));")
-    r.push("    }")
-    r.push("    return r;")
-    r.push("}")
-    r.push("")
-    r.push("static hl_map* hl_clone_map_bool(hl_map* m) {")
-    r.push("    hl_map* r = hl_map_new();")
-    r.push("    for (int64_t i = 0; i < m->order->len; i++) {")
-    r.push("        hl_str* k = (hl_str*)m->order->items[i];")
-    r.push("        hl_map_set(r, hl_clone_str(k), hl_box_bool(hl_unbox_bool(hl_map_get(m, k, NULL))));")
-    r.push("    }")
-    r.push("    return r;")
-    r.push("}")
-    r.push("")
-    r.push("static hl_map* hl_clone_map_str(hl_map* m) {")
-    r.push("    hl_map* r = hl_map_new();")
-    r.push("    for (int64_t i = 0; i < m->order->len; i++) {")
-    r.push("        hl_str* k = (hl_str*)m->order->items[i];")
-    r.push("        hl_map_set(r, hl_clone_str(k), hl_clone_str((hl_str*)hl_map_get(m, k, NULL)));")
-    r.push("    }")
-    r.push("    return r;")
     r.push("}")
     r.push("")
     return r
@@ -4712,9 +4839,493 @@ fn concat_lines(dst: list[str], src: list[str]) -> void {
     }
 }
 
+# ============================================================================
+# 4c. STAGE 8-BETA OWNERSHIP CODEGEN HELPERS
+# ----------------------------------------------------------------------------
+# The ownership discipline (see SPEC.md section 16):
+#   * Every heap value is reference-counted (refcnt is the first field).
+#   * "Fresh" expressions (literals, concat, clone, call results, pop,
+#     map.keys, list/struct/enum literals) carry one retain nobody owns —
+#     the consumer takes it over.
+#   * "Borrow" expressions (idents, field/index access) point at a retain
+#     owned elsewhere; a consumer that keeps the value adds its own retain.
+#   * Bindings own one retain, released by a C cleanup attribute at block
+#     exit (this covers break/continue/return automatically).
+#   * Function parameters own one retain of each argument (call sites
+#     own-wrap fresh values raw and borrowed values with hl_retain).
+#   * take(x) transfers the binding's retain: the C variable is nulled
+#     after the statement. drop(x) releases it immediately.
+#   * Fresh pointer-typed subexpressions consumed in a borrowed position
+#     are hoisted into temps with cleanups so nothing leaks.
+# ============================================================================
+
+# inst_t: substitute type params from the current instantiation context.
+fn inst_t(ctx: Ctx, t: str) -> str {
+    if ctx.cur_typeparams.len() > 0 && ctx.cur_targs.len() == ctx.cur_typeparams.len() {
+        return instantiate_type(t, ctx.cur_typeparams, ctx.cur_targs)
+    }
+    return t
+}
+
+# is_ptr_t: True when values of this (instantiated) type are refcounted
+# pointers. tainted[T] is a pointer iff T is.
+fn is_ptr_t(ctx: Ctx, t_in: str) -> bool {
+    let t: str = inst_t(ctx, t_in)
+    if t == "int" || t == "float" || t == "bool" || t == "void" || t == "never" {
+        return false
+    }
+    if is_taint_t(t) {
+        return is_ptr_t(ctx, taint_inner_t(t))
+    }
+    return true
+}
+
+# strip_taint: unwrap tainted[...] chains for release/clone dispatch.
+fn strip_taint(t: str) -> str {
+    let mut out: str = t
+    let mut guard: int = 0
+    while is_taint_t(out) && guard < 8 {
+        out = taint_inner_t(out)
+        guard = guard + 1
+    }
+    return out
+}
+
+# release_fn_for: the type-specific release function name.
+fn release_fn_for(ctx: Ctx, t_in: str) -> str {
+    let t: str = strip_taint(inst_t(ctx, t_in))
+    if t == "str" {
+        return "hl_str_release"
+    }
+    if is_list_t(t) {
+        return "hl_list_release"
+    }
+    if is_map_t(t) {
+        return "hl_map_release"
+    }
+    return "hl_release_" + c_type_name(t)
+}
+
+# cleanup_fn_for: the block-exit cleanup function (takes T**).
+fn cleanup_fn_for(ctx: Ctx, t_in: str) -> str {
+    let t: str = strip_taint(inst_t(ctx, t_in))
+    if t == "str" {
+        return "hl_cleanup_str"
+    }
+    if is_list_t(t) {
+        return "hl_cleanup_list"
+    }
+    if is_map_t(t) {
+        return "hl_cleanup_map"
+    }
+    return "hl_cleanup_" + c_type_name(t)
+}
+
+# elem_free_fn: the function pointer passed to hl_list_new / hl_map_new
+# describing how to release one element / value. `free` for primitive
+# boxes (they are single-owner allocations, not refcounted).
+fn elem_free_fn(ctx: Ctx, t_in: str) -> str {
+    let t: str = strip_taint(inst_t(ctx, t_in))
+    if t == "int" || t == "float" || t == "bool" {
+        return "free"
+    }
+    return release_fn_for(ctx, t)
+}
+
+# release_call: a full C statement expression releasing cexpr of type t.
+fn release_call(ctx: Ctx, t: str, cexpr: str) -> str {
+    if !is_ptr_t(ctx, t) {
+        return "((void)0)"
+    }
+    return release_fn_for(ctx, t) + "(" + cexpr + ")"
+}
+
+# own_wrap: wrap a generated expression so it arrives OWNED (+1 retain)
+# at its consumer. Primitives pass through; fresh pointer values pass
+# through raw (their inherent retain is the one transferred); borrowed
+# pointer values get an explicit hl_retain.
+fn own_wrap(ctx: Ctx, t: str, cexpr: str, fresh: bool) -> str {
+    if !is_ptr_t(ctx, t) {
+        return cexpr
+    }
+    if fresh {
+        return cexpr
+    }
+    return "hl_retain(" + cexpr + ")"
+}
+
+# gen_store_val: wrap a value being stored into a container
+# (list.push/set, map.set). Primitive boxes pass through box_val;
+# pointer values are own-wrapped so the container owns one retain.
+fn gen_store_val(ctx: Ctx, t: str, cexpr: str, fresh: bool) -> str {
+    if !is_ptr_t(ctx, t) {
+        return box_val(inst_t(ctx, t), cexpr)
+    }
+    return own_wrap(ctx, t, cexpr, fresh)
+}
+
+# expr_fresh: classify an expression by ownership. True = the value it
+# produces is "fresh" (one unowned retain the consumer takes over).
+fn expr_fresh(ctx: Ctx, e: int) -> bool {
+    let k: str = ctx.exprs[e].kind
+    if k == "str" {
+        return true
+    }
+    if k == "int" || k == "float" || k == "bool" || k == "ident" {
+        return false
+    }
+    if k == "bin" {
+        # Only pointer-typed binops exist for `+` on str (concat) — the
+        # result is fresh. Comparisons/arithmetic on primitives are not
+        # pointer values, so their class is irrelevant.
+        return is_ptr_t(ctx, ctx.exprs[e].t)
+    }
+    if k == "un" {
+        return false
+    }
+    if k == "index" {
+        return false
+    }
+    if k == "field" {
+        return false
+    }
+    if k == "listlit" || k == "structlit" || k == "enumlit" || k == "mapnew" {
+        return true
+    }
+    if k == "match" {
+        # Match arms own-wrap their results, so the match always yields
+        # an owned value.
+        return true
+    }
+    if k == "qmark" {
+        return true
+    }
+    if k == "call" {
+        return call_result_fresh(ctx, e)
+    }
+    if k == "method" {
+        return method_result_fresh(ctx, e)
+    }
+    return false
+}
+
+# call_result_fresh: freshness table for builtin/user calls.
+fn call_result_fresh(ctx: Ctx, e: int) -> bool {
+    if ctx.exprs[e].muser {
+        let cf: FnInfo = ctx.fns.get_or(ctx.exprs[e].mkey, dummy_fn())
+        if cf.is_extern {
+            # Extern C functions return raw values; the codegen does not
+            # refcount them (extern signatures returning pointers are
+            # handled as borrows).
+            return false
+        }
+        return true
+    }
+    let name: str = ctx.exprs[e].mkey
+    if name == "read_file" || name == "read_file_tainted" {
+        return true
+    }
+    if name == "range" || name == "chr" {
+        return true
+    }
+    if name == "map_new" {
+        return true
+    }
+    if name == "clone" || name == "take" {
+        return true
+    }
+    if name == "str" {
+        # str(x) is the identity for str arguments — the result's class
+        # follows the argument's.
+        let at: str = ctx.exprs[ctx.exprs[e].args.get(0)].t
+        if at == "str" {
+            return expr_fresh(ctx, ctx.exprs[e].args.get(0))
+        }
+        return false
+    }
+    if name == "taint_mark" || name == "taint_unwrap" {
+        return expr_fresh(ctx, ctx.exprs[e].args.get(0))
+    }
+    # args()/tainted_args() return the process-lifetime global list.
+    # print/println/panic/exit/write_file/len/int/float/clock_ms/
+    # file_exists/drop return void or primitives.
+    return false
+}
+
+# method_result_fresh: freshness table for builtin methods.
+fn method_result_fresh(ctx: Ctx, e: int) -> bool {
+    if ctx.exprs[e].muser {
+        return true
+    }
+    let op: str = ctx.exprs[e].mop
+    if op == "str.slice" || op == "str.split" || op == "str.trim" {
+        return true
+    }
+    if op == "str.to_str" {
+        # Identity on the receiver — the result's class follows it.
+        return expr_fresh(ctx, ctx.exprs[e].left)
+    }
+    if op == "int.to_str" || op == "float.to_str" || op == "bool.to_str" {
+        return true
+    }
+    if op == "list.pop" {
+        # Ownership of the removed element transfers out of the list.
+        return true
+    }
+    if op == "map.keys" {
+        return true
+    }
+    if op == "map.get_or" {
+        # Pointer-valued maps return an owned retain (hl_map_get_own).
+        # Primitive-valued maps return unboxed primitives.
+        let mt: str = inst_t(ctx, ctx.exprs[ctx.exprs[e].left].t)
+        if is_map_t(mt) {
+            return is_ptr_t(ctx, map_val_t(mt))
+        }
+        return false
+    }
+    return false
+}
+
+# flush_null_after: emit `x = NULL;` for every binding moved out by
+# take() during the current statement, then clear the list. Nulling
+# makes the scope-exit cleanup a no-op (ownership was transferred).
+fn flush_null_after(ctx: Ctx, ind: str) -> void {
+    let mut i: int = 0
+    while i < ctx.null_after.len() {
+        ctx.out.push(ind + ctx.null_after.get(i) + " = NULL;")
+        i = i + 1
+    }
+    ctx.null_after = []
+}
+
+# collect_hoist: walk the expression tree and record every fresh
+# pointer-typed node consumed in a BORROWED position (a position whose
+# consumer does not own the value). Those nodes are hoisted into temps
+# with cleanup attributes by hoist_all before the statement is emitted.
+#
+# Position table:
+#   bin/un operands, index/field receivers+indices      -> borrowed
+#   user fn call args, method receivers (user), container
+#   stores (push/set/map.set), struct/enum literal fields,
+#   list literal elements, consume-builtin args          -> transferred
+#   builtin borrow-fn args (clone, len, str-methods)     -> borrowed
+#   match scrutinee, qmark inner                         -> internal
+fn collect_hoist(ctx: Ctx, e: int) -> void {
+    let k: str = ctx.exprs[e].kind
+    if k == "int" || k == "float" || k == "bool" || k == "str" || k == "ident" {
+        return
+    }
+    if k == "un" || k == "index" || k == "field" {
+        hoist_child(ctx, ctx.exprs[e].left)
+        if k == "index" {
+            hoist_child(ctx, ctx.exprs[e].right)
+        }
+        return
+    }
+    if k == "bin" {
+        hoist_child(ctx, ctx.exprs[e].left)
+        hoist_child(ctx, ctx.exprs[e].right)
+        return
+    }
+    if k == "listlit" || k == "structlit" || k == "enumlit" {
+        # Elements/fields are transferred into the container — recurse
+        # into their subexpressions only.
+        let mut i: int = 0
+        while i < ctx.exprs[e].args.len() {
+            collect_hoist(ctx, ctx.exprs[e].args.get(i))
+            i = i + 1
+        }
+        return
+    }
+    if k == "mapnew" || k == "match" || k == "qmark" {
+        # match/qmark manage their scrutinee/inner ownership internally;
+        # still recurse so fresh-borrowed subexpressions get hoisted.
+        # NOTE: arm BODIES are NOT walked here — they may reference the
+        # match's pattern bindings, which only exist inside the statement
+        # expression. gen_match_expr performs arm-local hoisting instead.
+        if k == "match" {
+            collect_hoist(ctx, ctx.exprs[e].left)
+        } else {
+            collect_hoist(ctx, ctx.exprs[e].left)
+        }
+        return
+    }
+    if k == "call" {
+        if ctx.exprs[e].muser {
+            let cf: FnInfo = ctx.fns.get_or(ctx.exprs[e].mkey, dummy_fn())
+            let mut i: int = 0
+            while i < ctx.exprs[e].args.len() {
+                if cf.is_extern {
+                    # Extern args are borrowed (the C callee knows
+                    # nothing about refcounts).
+                    hoist_child(ctx, ctx.exprs[e].args.get(i))
+                } else {
+                    collect_hoist(ctx, ctx.exprs[e].args.get(i))
+                }
+                i = i + 1
+            }
+            return
+        }
+        let name: str = ctx.exprs[e].mkey
+        let mut j: int = 0
+        while j < ctx.exprs[e].args.len() {
+            let aidx: int = ctx.exprs[e].args.get(j)
+            if builtin_arg_borrowed(name) {
+                hoist_child(ctx, aidx)
+            } else {
+                collect_hoist(ctx, aidx)
+            }
+            j = j + 1
+        }
+        return
+    }
+    if k == "method" {
+        # Builtin method receivers are borrowed (even push/set: the
+        # receiver list is mutated, not stored into). User method
+        # receivers are transferred (the self param owns one retain).
+        if ctx.exprs[e].muser {
+            collect_hoist(ctx, ctx.exprs[e].left)
+        } else {
+            hoist_child(ctx, ctx.exprs[e].left)
+        }
+        let op: str = ctx.exprs[e].mop
+        let mut i: int = 0
+        while i < ctx.exprs[e].args.len() {
+            let aidx: int = ctx.exprs[e].args.get(i)
+            if method_arg_borrowed(op, i) {
+                hoist_child(ctx, aidx)
+            } else {
+                collect_hoist(ctx, aidx)
+            }
+            i = i + 1
+        }
+        return
+    }
+}
+
+# hoist_child: hoist child `c` if it is a fresh pointer value, otherwise
+# recurse into it. When hoisting, the node's OWN fresh children (in
+# borrowed positions) must be reserved FIRST — they are declared as
+# temps before the parent's temp, because the parent's initializer
+# expression references them. (HLS maps preserve insertion order, so the
+# reservation order in hoist_map is the declaration order.)
+fn hoist_child(ctx: Ctx, c: int) -> void {
+    if c < 0 {
+        return
+    }
+    let ck: str = c.to_str()
+    if is_ptr_t(ctx, ctx.exprs[c].t) && expr_fresh(ctx, c) && !ctx.hoist_map.has(ck) {
+        # Reserve the node's children first (declaration order).
+        collect_hoist(ctx, c)
+        ctx.hoist_map.set(ck, "")
+        # Reserved with an empty temp name; hoist_all fills it in.
+        return
+    }
+    collect_hoist(ctx, c)
+}
+
+# builtin_arg_borrowed: True when a builtin consumes its argument as a
+# borrow (no ownership transfer). Consume builtins (print family, I/O)
+# and identity builtins (str, taint_mark) transfer or pass through.
+fn builtin_arg_borrowed(name: str) -> bool {
+    if name == "println" || name == "print" || name == "panic" || name == "exit" {
+        return false
+    }
+    if name == "write_file" || name == "read_file" || name == "read_file_tainted" {
+        return false
+    }
+    if name == "file_exists" {
+        return false
+    }
+    if name == "str" || name == "taint_mark" || name == "taint_unwrap" {
+        return false
+    }
+    # clone, len, int, float, and the rest borrow their arguments.
+    return true
+}
+
+# method_arg_borrowed: True when a builtin method consumes argument `i`
+# as a borrow. Values stored into containers (push/set/map.set) and
+# pointer-valued get_or defaults are transferred.
+fn method_arg_borrowed(op: str, i: int) -> bool {
+    if op == "list.push" || op == "list.set" {
+        return false
+    }
+    if op == "map.set" {
+        return false
+    }
+    if op == "map.get_or" {
+        # The KEY is borrowed; the DEFAULT is transferred (owned) for
+        # pointer-valued maps — but primitive defaults pass by value.
+        return i == 0
+    }
+    return true
+}
+
+# hoist_all: materialise every node reserved by collect_hoist into a
+# temp declaration with a cleanup attribute, registered in hoist_map.
+# The declarations are appended to `dst` at the given indentation —
+# ctx.out for statement-level hoists, or a match arm's local block
+# for arm-local hoists (pattern bindings only exist there).
+fn hoist_all(ctx: Ctx, dst: list[str], ind: str) -> void {
+    let keys: list[str] = ctx.hoist_map.keys()
+    let mut i: int = 0
+    while i < keys.len() {
+        let key: str = keys.get(i)
+        if ctx.hoist_map.get_or(key, "") != "" {
+            # Already materialised (nested collect pass) — skip.
+            i = i + 1
+            continue
+        }
+        let e: int = key.to_int()
+        let tmp: str = fresh_tmp(ctx, "hlc_h")
+        let t: str = inst_t(ctx, ctx.exprs[e].t)
+        let v: str = gen_expr(ctx, e)
+        dst.push(ind + c_type(ctx, t) + " " + tmp
+            + " __attribute__((cleanup(" + cleanup_fn_for(ctx, t) + "))) = " + v + ";")
+        ctx.hoist_map.set(key, tmp)
+        i = i + 1
+    }
+}
+
+# clear_hoists: drop hoist registrations at the end of a statement (the
+# temps have been declared; the expression tree is not revisited).
+fn clear_hoists(ctx: Ctx) -> void {
+    ctx.hoist_map = map_new()
+}
+
+# gen_own_arg: generate one argument, own-wrapped for pointer types —
+# used at user fn / user method / consume-builtin call sites.
+fn gen_own_arg(ctx: Ctx, aidx: int) -> str {
+    let t: str = ctx.exprs[aidx].t
+    let fresh: bool = expr_fresh(ctx, aidx)
+    let c: str = gen_expr(ctx, aidx)
+    return own_wrap(ctx, t, c, fresh)
+}
+
+# gen_own_args_c: own-wrap every argument of a call.
+fn gen_own_args_c(ctx: Ctx, e: int) -> str {
+    let parts: list[str] = []
+    let mut i: int = 0
+    while i < ctx.exprs[e].args.len() {
+        parts.push(gen_own_arg(ctx, ctx.exprs[e].args.get(i)))
+        i = i + 1
+    }
+    return join(parts, ", ")
+}
+
 # --- C expression generation ---
 
 fn gen_expr(ctx: Ctx, e: int) -> str {
+    # Stage 8-beta: if this node was hoisted into a temp, use the temp.
+    let hk: str = e.to_str()
+    if ctx.hoist_map.has(hk) {
+        let tname: str = ctx.hoist_map.get_or(hk, "")
+        if tname != "" {
+            return tname
+        }
+    }
     let mut k: str = ctx.exprs[e].kind
     if k == "int" {
         if ctx.exprs[e].ival == -9223372036854775808 {
@@ -4868,23 +5479,27 @@ fn gen_args_c(ctx: Ctx, e: int) -> str {
 fn gen_call(ctx: Ctx, e: int) -> str {
     if ctx.exprs[e].muser {
         # Stage 15-beta: extern fns use the RAW C name (no `usf_` prefix)
-        # so the C linker can resolve them from libc.
+        # so the C linker can resolve them from libc. Extern args are
+        # borrowed (the C callee knows nothing about refcounts) — fresh
+        # pointer args were hoisted into temps by the statement wrapper.
         let cf: FnInfo = ctx.fns.get_or(ctx.exprs[e].mkey, dummy_fn())
         if cf.is_extern {
             return ctx.exprs[e].mkey + "(" + gen_args_c(ctx, e) + ")"
         }
-        return "usf_" + c_fn_name(ctx.exprs[e].mkey) + "(" + gen_args_c(ctx, e) + ")"
+        # Stage 8-beta: user fn params OWN one retain of each argument —
+        # fresh values are passed raw, borrowed values retain-wrapped.
+        return "usf_" + c_fn_name(ctx.exprs[e].mkey) + "(" + gen_own_args_c(ctx, e) + ")"
     }
     let name: str = ctx.exprs[e].mkey
     let args: str = gen_args_c(ctx, e)
     if name == "print" {
-        return "hl_print(" + args + ")"
+        return "hl_print(" + gen_own_arg(ctx, ctx.exprs[e].args.get(0)) + ")"
     }
     if name == "println" {
-        return "hl_println(" + args + ")"
+        return "hl_println(" + gen_own_arg(ctx, ctx.exprs[e].args.get(0)) + ")"
     }
     if name == "panic" {
-        return "hl_panic(" + args + ")"
+        return "hl_panic(" + gen_own_arg(ctx, ctx.exprs[e].args.get(0)) + ")"
     }
     if name == "exit" {
         return "hl_exit(" + args + ")"
@@ -4919,18 +5534,25 @@ fn gen_call(ctx: Ctx, e: int) -> str {
         return "hl_range(" + args + ")"
     }
     if name == "map_new" {
-        return "hl_map_new()"
+        # Stage 8-beta: the map owns its values — val_free comes from the
+        # map's value type (the checker types this call from context).
+        let mt: str = inst_t(ctx, ctx.exprs[e].t)
+        if is_map_t(mt) {
+            return "hl_map_new(" + elem_free_fn(ctx, map_val_t(mt)) + ")"
+        }
+        return "hl_map_new(NULL)"
     }
     if name == "read_file" {
-        return "hl_read_file(" + args + ")"
+        return "hl_read_file(" + gen_own_arg(ctx, ctx.exprs[e].args.get(0)) + ")"
     }
     # Stage 10-beta: read_file_tainted — at runtime, returns the same hl_read_file
     # result; taint is a compile-time property only (defense-in-depth is deferred).
     if name == "read_file_tainted" {
-        return "hl_read_file(" + args + ")"
+        return "hl_read_file(" + gen_own_arg(ctx, ctx.exprs[e].args.get(0)) + ")"
     }
     if name == "write_file" {
-        return "hl_write_file(" + args + ")"
+        return "hl_write_file(" + gen_own_arg(ctx, ctx.exprs[e].args.get(0)) + ", "
+            + gen_own_arg(ctx, ctx.exprs[e].args.get(1)) + ")"
     }
     if name == "args" {
         return "hl_args()"
@@ -4955,37 +5577,37 @@ fn gen_call(ctx: Ctx, e: int) -> str {
         return "hl_chr(" + args + ")"
     }
     if name == "file_exists" {
-        return "hl_file_exists(" + args + ")"
+        return "hl_file_exists(" + gen_own_arg(ctx, ctx.exprs[e].args.get(0)) + ")"
     }
-    # ----- Stage 8-alpha: ownership primitives -----
-    # drop(x) is a compile-time annotation; at runtime (arena mode) it's a no-op.
-    # The compiler still emits a (void) cast so the C compiler doesn't warn.
+    # ----- Stage 8-beta: ownership primitives -----
+    # drop(x): release the value now and null the binding so the
+    # scope-exit cleanup is a no-op. The checker guarantees x is an
+    # owned binding, so this is always a pointer type.
     if name == "drop" {
-        return "((void)0)"
+        let arg: int = ctx.exprs[e].args.get(0)
+        let cn: str = local_c(ctx, ctx.exprs[arg].name)
+        let t: str = ctx.exprs[arg].t
+        return "((" + release_call(ctx, t, cn) + "), (" + cn + " = NULL, (void)0))"
     }
-    # clone(x) dispatches by type. v0.4.0-alpha supports:
-    #   str, list[prim], map[str, prim] (prim ∈ {int, float, bool, str})
-    # Each supported type has a dedicated runtime helper.
+    # clone(x): dispatch to the per-instantiation helper generated by
+    # gen_clone_bodies (str uses the runtime's hl_clone_str). tainted[T]
+    # clones as T — the taint is a compile-time property only.
     if name == "clone" {
-        let at: str = ctx.exprs[ctx.exprs[e].args.get(0)].t
+        let at: str = strip_taint(inst_t(ctx, ctx.exprs[ctx.exprs[e].args.get(0)].t))
+        register_clone(ctx, at)
         if at == "str" {
             return "hl_clone_str(" + args + ")"
         }
-        if is_list_t(at) {
-            let elem: str = list_elem_t(at)
-            return "hl_clone_list_" + elem + "(" + args + ")"
-        }
-        if is_map_t(at) {
-            let vt: str = map_val_t(at)
-            return "hl_clone_map_" + vt + "(" + args + ")"
-        }
-        # Unsupported types are rejected at check time, so this is unreachable.
-        panic("internal codegen error: clone() on unsupported type " + at)
-        return ""
+        return "hl_clone_" + c_type_name(at) + "(" + args + ")"
     }
-    # take(x) is a compile-time move; at runtime it's just the value.
+    # take(x): a compile-time move — at runtime it is just the value.
+    # The binding is nulled at the end of the statement (null_after) so
+    # the scope-exit cleanup is a no-op: ownership transfers.
     if name == "take" {
-        return args
+        let arg: int = ctx.exprs[e].args.get(0)
+        let cn: str = local_c(ctx, ctx.exprs[arg].name)
+        ctx.null_after.push(cn)
+        return cn
     }
     panic("internal codegen error: unknown builtin function " + name)
     return ""
@@ -4993,12 +5615,17 @@ fn gen_call(ctx: Ctx, e: int) -> str {
 
 fn gen_method(ctx: Ctx, e: int) -> str {
     if ctx.exprs[e].muser {
+        # Stage 8-beta: the self parameter owns one retain of the
+        # receiver (the method may mutate through the shared pointer;
+        # the retain is released when the method returns).
+        let recv_fresh: bool = expr_fresh(ctx, ctx.exprs[e].left)
         let t0: str = gen_expr(ctx, ctx.exprs[e].left)
-        let rest: str = gen_args_c(ctx, e)
+        let recv: str = own_wrap(ctx, ctx.exprs[ctx.exprs[e].left].t, t0, recv_fresh)
+        let rest: str = gen_own_args_c(ctx, e)
         if ctx.exprs[e].args.len() == 0 {
-            return "usf_" + c_fn_name(ctx.exprs[e].mkey) + "(" + t0 + ")"
+            return "usf_" + c_fn_name(ctx.exprs[e].mkey) + "(" + recv + ")"
         }
-        return "usf_" + c_fn_name(ctx.exprs[e].mkey) + "(" + t0 + ", " + rest + ")"
+        return "usf_" + c_fn_name(ctx.exprs[e].mkey) + "(" + recv + ", " + rest + ")"
     }
     let op: str = ctx.exprs[e].mop
     let t0: str = gen_expr(ctx, ctx.exprs[e].left)
@@ -5064,35 +5691,79 @@ fn gen_method(ctx: Ctx, e: int) -> str {
         return "hl_list_len(" + t0 + ")"
     }
     if op == "list.push" {
-        let et: str = list_elem_t(ctx.exprs[ctx.exprs[e].left].t)
-        return "hl_list_push(" + t0 + ", " + box_val(et, args) + ")"
+        # The value is stored into the container: the list owns one
+        # retain (fresh raw / borrowed retain-wrapped / prim boxed).
+        let et: str = list_elem_t(inst_t(ctx, ctx.exprs[ctx.exprs[e].left].t))
+        let aidx: int = ctx.exprs[e].args.get(0)
+        let av: str = gen_expr(ctx, aidx)
+        let af: bool = expr_fresh(ctx, aidx)
+        return "hl_list_push(" + t0 + ", " + gen_store_val(ctx, et, av, af) + ")"
     }
     if op == "list.get" {
         return gen_unbox(ctx, ctx.exprs[e].t, "hl_list_get(" + t0 + ", " + args + ")")
     }
     if op == "list.set" {
-        let et: str = list_elem_t(ctx.exprs[ctx.exprs[e].left].t)
+        let et: str = list_elem_t(inst_t(ctx, ctx.exprs[ctx.exprs[e].left].t))
         let ai: str = gen_expr(ctx, ctx.exprs[e].args.get(0))
-        let av: str = gen_expr(ctx, ctx.exprs[e].args.get(1))
-        return "hl_list_set(" + t0 + ", " + ai + ", " + box_val(et, av) + ")"
+        let aidx: int = ctx.exprs[e].args.get(1)
+        let av: str = gen_expr(ctx, aidx)
+        let af: bool = expr_fresh(ctx, aidx)
+        return "hl_list_set(" + t0 + ", " + ai + ", " + gen_store_val(ctx, et, av, af) + ")"
     }
     if op == "list.pop" {
+        # Primitive element lists use the typed pops (the box is freed
+        # inside); pointer elements transfer ownership of the element.
+        let et: str = list_elem_t(inst_t(ctx, ctx.exprs[ctx.exprs[e].left].t))
+        if et == "int" {
+            return "hl_list_pop_i64(" + t0 + ")"
+        }
+        if et == "float" {
+            return "hl_list_pop_f64(" + t0 + ")"
+        }
+        if et == "bool" {
+            return "hl_list_pop_bool(" + t0 + ")"
+        }
         return gen_unbox(ctx, ctx.exprs[e].t, "hl_list_pop(" + t0 + ")")
     }
     if op == "map.len" {
         return "hl_map_len(" + t0 + ")"
     }
     if op == "map.set" {
-        let vt: str = map_val_t(ctx.exprs[ctx.exprs[e].left].t)
-        let ak: str = gen_expr(ctx, ctx.exprs[e].args.get(0))
-        let av: str = gen_expr(ctx, ctx.exprs[e].args.get(1))
-        return "hl_map_set(" + t0 + ", " + ak + ", " + box_val(vt, av) + ")"
+        # Key and value are stored into the map: it owns one retain of
+        # each (fresh raw / borrowed retain-wrapped / prim boxed).
+        let mt: str = inst_t(ctx, ctx.exprs[ctx.exprs[e].left].t)
+        let vt: str = map_val_t(mt)
+        let kidx: int = ctx.exprs[e].args.get(0)
+        let ak: str = gen_expr(ctx, kidx)
+        let kf: bool = expr_fresh(ctx, kidx)
+        let vidx: int = ctx.exprs[e].args.get(1)
+        let av: str = gen_expr(ctx, vidx)
+        let vf: bool = expr_fresh(ctx, vidx)
+        let kw: str = own_wrap(ctx, "str", ak, kf)
+        return "hl_map_set(" + t0 + ", " + kw + ", " + gen_store_val(ctx, vt, av, vf) + ")"
     }
     if op == "map.get_or" {
-        let vt: str = map_val_t(ctx.exprs[ctx.exprs[e].left].t)
+        # Primitive-valued maps use the typed getters (the default is
+        # passed by value — no boxing, no refcount traffic). Pointer-
+        # valued maps use hl_map_get_own: the default arrives owned and
+        # the result is returned owned.
+        let mt: str = inst_t(ctx, ctx.exprs[ctx.exprs[e].left].t)
+        let vt: str = map_val_t(mt)
         let ak: str = gen_expr(ctx, ctx.exprs[e].args.get(0))
-        let ad: str = gen_expr(ctx, ctx.exprs[e].args.get(1))
-        return gen_unbox(ctx, vt, "hl_map_get(" + t0 + ", " + ak + ", " + box_val(vt, ad) + ")")
+        let ad_idx: int = ctx.exprs[e].args.get(1)
+        let ad: str = gen_expr(ctx, ad_idx)
+        if vt == "int" {
+            return "hl_map_get_i64(" + t0 + ", " + ak + ", " + ad + ")"
+        }
+        if vt == "float" {
+            return "hl_map_get_f64(" + t0 + ", " + ak + ", " + ad + ")"
+        }
+        if vt == "bool" {
+            return "hl_map_get_bool(" + t0 + ", " + ak + ", " + ad + ")"
+        }
+        let adf: bool = expr_fresh(ctx, ad_idx)
+        let adw: str = own_wrap(ctx, vt, ad, adf)
+        return "((" + c_type(ctx, vt) + ")hl_map_get_own(" + t0 + ", " + ak + ", " + adw + "))"
     }
     if op == "map.has" {
         return "hl_map_has(" + t0 + ", " + args + ")"
@@ -5105,26 +5776,31 @@ fn gen_method(ctx: Ctx, e: int) -> str {
 }
 
 fn gen_listlit(ctx: Ctx, e: int) -> str {
-    ctx.lit_count = ctx.lit_count + 1
-    let fname: str = "hl_lit_" + ctx.lit_count.to_str()
-    let elem: str = list_elem_t(ctx.exprs[e].t)
-    let vals: list[str] = []
+    # Stage 8-beta: list literals are emitted INLINE as a GCC statement
+    # expression. The old implementation emitted a separate `hl_lit_N`
+    # helper function per literal, but the element expressions were
+    # generated in the ENCLOSING function's context — any element that
+    # referenced a local variable produced a C identifier that does not
+    # exist inside the helper (BUG: `[a, b, 30]` with locals a, b failed
+    # to compile natively). Inlining also gives the literal a natural
+    # ownership story: the fresh list owns one retain of each element
+    # (fresh raw / borrowed retain-wrapped / prim boxed).
+    let elem: str = list_elem_t(inst_t(ctx, ctx.exprs[e].t))
+    let tmp: str = fresh_tmp(ctx, "hlc_ll")
+    let block: list[str] = []
+    block.push("({")
+    block.push("    hl_list* " + tmp + " = hl_list_new(" + elem_free_fn(ctx, elem) + ");")
     let mut i: int = 0
     while i < ctx.exprs[e].args.len() {
-        vals.push(gen_expr(ctx, ctx.exprs[e].args.get(i)))
+        let aidx: int = ctx.exprs[e].args.get(i)
+        let v: str = gen_expr(ctx, aidx)
+        let fresh: bool = expr_fresh(ctx, aidx)
+        block.push("    hl_list_push(" + tmp + ", " + gen_store_val(ctx, elem, v, fresh) + ");")
         i = i + 1
     }
-    ctx.lit_helpers.push("static hl_list* " + fname + "(void) {")
-    ctx.lit_helpers.push("    hl_list* l = hl_list_new();")
-    let mut j: int = 0
-    while j < vals.len() {
-        ctx.lit_helpers.push("    hl_list_push(l, " + box_val(elem, vals.get(j)) + ");")
-        j = j + 1
-    }
-    ctx.lit_helpers.push("    return l;")
-    ctx.lit_helpers.push("}")
-    ctx.lit_helpers.push("")
-    return fname + "()"
+    block.push("    " + tmp + ";")
+    block.push("})")
+    return join(block, "\n")
 }
 
 fn gen_structlit(ctx: Ctx, e: int) -> str {
@@ -5140,12 +5816,19 @@ fn gen_structlit(ctx: Ctx, e: int) -> str {
     }
     # Compute the constructor name (mangled if generic).
     let ctor_name: str = "usf_new_" + c_type_name(t)
-    # Collect provided field values.
+    # Collect provided field values. The constructor stores its params
+    # raw, so each pointer-typed field value must arrive OWNED
+    # (Stage 8-beta): fresh raw, borrowed retain-wrapped.
     let parts: list[str] = []
     let provided: list[str] = ctx.exprs[e].ffields
     let mut fi: int = 0
     while fi < provided.len() {
-        parts.push(gen_expr(ctx, ctx.exprs[e].args.get(fi)))
+        let fidx: int = struct_field_index(st, provided.get(fi))
+        let ftype: str = instantiate_field_type(st, fidx, t)
+        let aidx: int = ctx.exprs[e].args.get(fi)
+        let av: str = gen_expr(ctx, aidx)
+        let af: bool = expr_fresh(ctx, aidx)
+        parts.push(own_wrap(ctx, ftype, av, af))
         fi = fi + 1
     }
     # For each remaining declared field with a default, evaluate the default
@@ -5162,6 +5845,35 @@ fn gen_structlit(ctx: Ctx, e: int) -> str {
     return ctor_name + "(" + join(parts, ", ") + ")"
 }
 
+# struct_field_index: find a field's index in a StructInfo (-1 if absent).
+fn struct_field_index(st: StructInfo, name: str) -> int {
+    let mut i: int = 0
+    while i < st.fields.len() {
+        if st.fields.get(i) == name {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+# instantiate_field_type: substitute a struct's type params for one field
+# using the concrete instantiation `t` (e.g. Box[int] -> field T becomes int).
+fn instantiate_field_type(st: StructInfo, fidx: int, t: str) -> str {
+    if fidx < 0 || fidx >= st.fields.len() {
+        return "int"
+    }
+    let ftype: str = st.ftypes.get(fidx)
+    if st.typeparams.len() == 0 {
+        return ftype
+    }
+    let targs: list[str] = type_args(t)
+    if targs.len() != st.typeparams.len() {
+        return ftype
+    }
+    return instantiate_type(ftype, st.typeparams, targs)
+}
+
 fn gen_enumlit(ctx: Ctx, e: int) -> str {
     # The enum type is ctx.exprs[e].t (e.g., "Option[int]" or "Color").
     # Substitute type params from current instantiation context.
@@ -5174,15 +5886,50 @@ fn gen_enumlit(ctx: Ctx, e: int) -> str {
     if en.typeparams.len() > 0 && type_is_concrete(ctx, t) && !list_has(ctx.enum_insts, t) {
         ctx.enum_insts.push(t)
     }
-    # The constructor function name is "usf_make_" + c_type_name(t) + "_" + variant.
+    # The constructor function name is "usf_make_" + c_type_name(t) + "" + "_" + variant.
     let ctor_name: str = "usf_make_" + c_type_name(t) + "_" + ctx.exprs[e].variant
+    # The constructor stores its payloads raw, so each pointer-typed
+    # payload must arrive OWNED (Stage 8-beta).
     let parts: list[str] = []
     let mut i: int = 0
     while i < ctx.exprs[e].args.len() {
-        parts.push(gen_expr(ctx, ctx.exprs[e].args.get(i)))
+        let aidx: int = ctx.exprs[e].args.get(i)
+        let av: str = gen_expr(ctx, aidx)
+        let af: bool = expr_fresh(ctx, aidx)
+        let pt: str = enum_payload_type(en, ctx.exprs[e].variant, i, t)
+        parts.push(own_wrap(ctx, pt, av, af))
         i = i + 1
     }
     return ctor_name + "(" + join(parts, ", ") + ")"
+}
+
+# enum_payload_type: the instantiated payload type for variant `vname`,
+# payload index `pidx`, of the concrete enum instantiation `t`.
+fn enum_payload_type(en: EnumInfo, vname: str, pidx: int, t: str) -> str {
+    let mut vidx: int = -1
+    let mut i: int = 0
+    while i < en.variants.len() {
+        if en.variants.get(i) == vname {
+            vidx = i
+        }
+        i = i + 1
+    }
+    if vidx < 0 {
+        return "int"
+    }
+    let payloads: list[str] = en.payloads.get(vidx)
+    if pidx < 0 || pidx >= payloads.len() {
+        return "int"
+    }
+    let pt: str = payloads.get(pidx)
+    if en.typeparams.len() == 0 {
+        return pt
+    }
+    let targs: list[str] = type_args(t)
+    if targs.len() != en.typeparams.len() {
+        return pt
+    }
+    return instantiate_type(pt, en.typeparams, targs)
 }
 
 # gen_match_expr — emit a GCC statement expression for a match in expression
@@ -5201,10 +5948,20 @@ fn gen_match_expr(ctx: Ctx, e: int) -> str {
     let ename: str = type_base(scrut_t)
     let scrut_c: str = gen_expr(ctx, ctx.exprs[e].left)
     # The statement expression uses a tmp variable for the scrutinee.
+    # Stage 8-beta: when the scrutinee is a FRESH value (call result,
+    # literal, ...), this tmp owns it — a cleanup attribute releases it
+    # at the end of the statement expression. When it is borrowed, the
+    # binding that owns it stays responsible.
+    let scrut_fresh: bool = expr_fresh(ctx, ctx.exprs[e].left)
     let tmp_name: str = fresh_tmp(ctx, "hlc_m")
     let block: list[str] = []
     block.push("({")
-    block.push("    " + c_type(ctx, scrut_t) + " " + tmp_name + " = " + scrut_c + ";")
+    if is_ptr_t(ctx, scrut_t) && scrut_fresh {
+        block.push("    " + c_type(ctx, scrut_t) + " " + tmp_name
+            + " __attribute__((cleanup(" + cleanup_fn_for(ctx, scrut_t) + "))) = " + scrut_c + ";")
+    } else {
+        block.push("    " + c_type(ctx, scrut_t) + " " + tmp_name + " = " + scrut_c + ";")
+    }
     # BUG-004 fix: if the match result type is `never` (e.g. all arms
     # are panic/exit), we must NOT declare a `hlc_m_r` accumulator —
     # `never` is not a valid C type. Emit the dispatch without an
@@ -5223,11 +5980,22 @@ fn gen_match_expr(ctx: Ctx, e: int) -> str {
         if arm.pat_kind == "wildcard" {
             has_wildcard = true
             block.push("    else {")
+            # Stage 8-beta: arm-local hoisting — fresh pointer values in
+            # borrowed positions within the arm body are materialised
+            # INSIDE the arm block (they may reference the pattern
+            # bindings, which only exist here).
+            collect_hoist(ctx, arm.body)
+            hoist_all(ctx, block, "        ")
             if arm.body_t != "never" {
-                block.push("        hlc_m_r = " + gen_expr(ctx, arm.body) + ";")
+                # Stage 8-beta: the arm result is OWNED — own-wrap borrow
+                # bodies with a retain so hlc_m_r always owns one retain.
+                let bv: str = gen_expr(ctx, arm.body)
+                let bf: bool = expr_fresh(ctx, arm.body)
+                block.push("        hlc_m_r = " + own_wrap(ctx, arm.body_t, bv, bf) + ";")
             } else {
                 block.push("        " + gen_expr(ctx, arm.body) + ";")
             }
+            clear_hoists(ctx)
             block.push("    }")
         } else {
             let cond: str = tmp_name + "->tag == " + ename + "__TAG_" + arm.variant + "_" + c_type_name(scrut_t)
@@ -5266,9 +6034,19 @@ fn gen_match_expr(ctx: Ctx, e: int) -> str {
                 bi = bi + 1
             }
             if arm.body_t != "never" {
-                block.push("        hlc_m_r = " + gen_expr(ctx, arm.body) + ";")
+                # Stage 8-beta: arm-local hoisting (see wildcard arm), then
+                # own-wrap borrow bodies so hlc_m_r always owns one retain.
+                collect_hoist(ctx, arm.body)
+                hoist_all(ctx, block, "        ")
+                let bv: str = gen_expr(ctx, arm.body)
+                let bf: bool = expr_fresh(ctx, arm.body)
+                block.push("        hlc_m_r = " + own_wrap(ctx, arm.body_t, bv, bf) + ";")
+                clear_hoists(ctx)
             } else {
+                collect_hoist(ctx, arm.body)
+                hoist_all(ctx, block, "        ")
                 block.push("        " + gen_expr(ctx, arm.body) + ";")
+                clear_hoists(ctx)
             }
             block.push("    }")
         }
@@ -5298,14 +6076,35 @@ fn gen_qmark_expr(ctx: Ctx, e: int) -> str {
     let err_v: str = ctx.exprs[e].err_variant
     let success_t: str = ctx.exprs[e].t
     let tmp_name: str = fresh_tmp(ctx, "hlc_q")
+    # Stage 8-beta ownership discipline for `?`:
+    #   * When the inner value is FRESH, this tmp owns it — a cleanup
+    #     attribute releases the Result at the end of the statement
+    #     expression (success path) .
+    #   * Error path: `return hl_retain(tmp)` — the +1 goes to the caller
+    #     and the cleanup (or the owning binding, for borrowed inners)
+    #     balances it. This works uniformly for both fresh and borrowed
+    #     inner values.
+    #   * Success path: the payload is borrowed from the enum, so the
+    #     result gets an explicit retain — the enum's own release (via
+    #     the cleanup or its binding) cannot free it underneath us.
+    let inner_fresh: bool = expr_fresh(ctx, ctx.exprs[e].left)
     let block: list[str] = []
     block.push("({")
-    block.push("    " + c_type(ctx, inner_t) + " " + tmp_name + " = " + inner_c + ";")
+    if is_ptr_t(ctx, inner_t) && inner_fresh {
+        block.push("    " + c_type(ctx, inner_t) + " " + tmp_name
+            + " __attribute__((cleanup(" + cleanup_fn_for(ctx, inner_t) + "))) = " + inner_c + ";")
+    } else {
+        block.push("    " + c_type(ctx, inner_t) + " " + tmp_name + " = " + inner_c + ";")
+    }
     block.push("    if (" + tmp_name + "->tag == " + ename + "__TAG_" + err_v + "_" + c_type_name(inner_t) + ") {")
-    block.push("        return " + tmp_name + ";")
+    block.push("        return hl_retain(" + tmp_name + ");")
     block.push("    }")
     # Success variant's payload is at data.<ok_v>.v0.
-    block.push("    " + c_type(ctx, success_t) + " hlc_q_r = " + tmp_name + "->data." + ok_v + ".v0;")
+    if is_ptr_t(ctx, success_t) {
+        block.push("    " + c_type(ctx, success_t) + " hlc_q_r = hl_retain(" + tmp_name + "->data." + ok_v + ".v0);")
+    } else {
+        block.push("    " + c_type(ctx, success_t) + " hlc_q_r = " + tmp_name + "->data." + ok_v + ".v0;")
+    }
     block.push("    hlc_q_r;")
     block.push("})")
     return join(block, "\n")
@@ -5316,7 +6115,14 @@ fn gen_qmark_expr(ctx: Ctx, e: int) -> str {
 fn gen_stmt(ctx: Ctx, sidx: int, ind: str) -> void {
     let s: StmtN = ctx.stmts[sidx]
     if s.kind == "let" {
+        # Stage 8-beta: hoist fresh pointer subexpressions consumed in
+        # borrowed positions within the RHS, then bind. Pointer-typed
+        # bindings get a cleanup attribute — released exactly at C block
+        # exit (covers break/continue/return automatically).
+        collect_hoist(ctx, s.value)
+        hoist_all(ctx, ctx.out, ind)
         let cn: str = fresh_local(ctx, s.name)
+        let fresh: bool = expr_fresh(ctx, s.value)
         let v: str = gen_expr(ctx, s.value)
         # BUG-004 fix: if the RHS expression is `never`-typed (panic/exit/
         # all-never match), the C call returns void — we must not bind it
@@ -5324,11 +6130,21 @@ fn gen_stmt(ctx: Ctx, sidx: int, ind: str) -> void {
         if ctx.exprs[s.value].t == "never" {
             ctx.out.push(ind + v + ";")
         } else {
-            ctx.out.push(ind + c_type(ctx, s.vtype) + " " + cn + " = " + v + ";")
+            let wrapped: str = own_wrap(ctx, s.vtype, v, fresh)
+            if is_ptr_t(ctx, s.vtype) {
+                ctx.out.push(ind + c_type(ctx, s.vtype) + " " + cn
+                    + " __attribute__((cleanup(" + cleanup_fn_for(ctx, s.vtype) + "))) = " + wrapped + ";")
+            } else {
+                ctx.out.push(ind + c_type(ctx, s.vtype) + " " + cn + " = " + wrapped + ";")
+            }
         }
+        flush_null_after(ctx, ind)
+        clear_hoists(ctx)
     } else if s.kind == "assign" {
         gen_assign(ctx, s, ind)
     } else if s.kind == "if" {
+        collect_hoist(ctx, s.cond)
+        hoist_all(ctx, ctx.out, ind)
         let c: str = gen_expr(ctx, s.cond)
         ctx.out.push(ind + "if (" + c + ") {")
         gen_stmts(ctx, s.body, ind + "    ")
@@ -5337,18 +6153,49 @@ fn gen_stmt(ctx: Ctx, sidx: int, ind: str) -> void {
             gen_stmts(ctx, s.else_body, ind + "    ")
         }
         ctx.out.push(ind + "}")
+        flush_null_after(ctx, ind)
+        clear_hoists(ctx)
     } else if s.kind == "while" {
-        let c: str = gen_expr(ctx, s.cond)
-        ctx.out.push(ind + "while (" + c + ") {")
-        gen_stmts(ctx, s.body, ind + "    ")
-        ctx.out.push(ind + "}")
+        collect_hoist(ctx, s.cond)
+        # If the condition contains hoisted temps, the plain `while (c)`
+        # form would evaluate them ONCE before the loop — a semantic
+        # change (fresh subexpressions must be re-evaluated per
+        # iteration). Use the `while (1) { temps; if (!c) break; ... }`
+        # transform so the temps (and their releases) are per-iteration.
+        if ctx.hoist_map.keys().len() > 0 {
+            hoist_all(ctx, ctx.out, ind + "    ")
+            let c: str = gen_expr(ctx, s.cond)
+            ctx.out.push(ind + "while (1) {")
+            ctx.out.push(ind + "    if (!(" + c + ")) break;")
+            gen_stmts(ctx, s.body, ind + "    ")
+            ctx.out.push(ind + "}")
+        } else {
+            let c: str = gen_expr(ctx, s.cond)
+            ctx.out.push(ind + "while (" + c + ") {")
+            gen_stmts(ctx, s.body, ind + "    ")
+            ctx.out.push(ind + "}")
+        }
+        flush_null_after(ctx, ind)
+        clear_hoists(ctx)
     } else if s.kind == "for" {
+        collect_hoist(ctx, s.iter)
+        hoist_all(ctx, ctx.out, ind + "    ")
         let it_c: str = gen_expr(ctx, s.iter)
+        let it_fresh: bool = expr_fresh(ctx, s.iter)
         let itn: str = fresh_tmp(ctx, "hlc_it")
         let itn_len: str = fresh_tmp(ctx, "hlc_n")
         let iv: str = fresh_tmp(ctx, "hlc_i")
         ctx.out.push(ind + "{")
-        ctx.out.push(ind + "    hl_list* " + itn + " = " + it_c + ";")
+        # Stage 8-beta: when the iterable is FRESH (call result, literal),
+        # this loop owns it — the itn temp carries a cleanup attribute and
+        # is released after the loop (including on break). A borrowed
+        # iterable stays owned by its binding.
+        if it_fresh {
+            ctx.out.push(ind + "    hl_list* " + itn
+                + " __attribute__((cleanup(hl_cleanup_list))) = " + it_c + ";")
+        } else {
+            ctx.out.push(ind + "    hl_list* " + itn + " = " + it_c + ";")
+        }
         ctx.out.push(ind + "    int64_t " + itn_len + " = hl_list_len(" + itn + ");")
         ctx.out.push(ind + "    int64_t " + iv + ";")
         ctx.out.push(ind + "    for (" + iv + " = 0; " + iv + " < " + itn_len + "; " + iv + "++) {")
@@ -5359,11 +6206,23 @@ fn gen_stmt(ctx: Ctx, sidx: int, ind: str) -> void {
         ctx.out.push(ind + "        if (" + iv + " >= hl_list_len(" + itn + ")) break;")
         let cn: str = fresh_local(ctx, s.name)
         let mut elem: str = s.vtype
-        ctx.out.push(ind + "        " + c_type(ctx, elem) + " " + cn
-            + " = " + gen_unbox(ctx, elem, "hl_list_get(" + itn + ", " + iv + ")") + ";")
+        # Stage 8-beta: a pointer-typed loop variable borrows the element
+        # from the list — the binding retains it and a cleanup releases it
+        # at the end of each iteration (C re-declares the variable in a
+        # fresh block scope per iteration). The list keeps its own retain.
+        if is_ptr_t(ctx, elem) {
+            ctx.out.push(ind + "        " + c_type(ctx, elem) + " " + cn
+                + " __attribute__((cleanup(" + cleanup_fn_for(ctx, elem) + ")))"
+                + " = hl_retain(" + gen_unbox(ctx, elem, "hl_list_get(" + itn + ", " + iv + ")") + ");")
+        } else {
+            ctx.out.push(ind + "        " + c_type(ctx, elem) + " " + cn
+                + " = " + gen_unbox(ctx, elem, "hl_list_get(" + itn + ", " + iv + ")") + ";")
+        }
         gen_stmts(ctx, s.body, ind + "        ")
         ctx.out.push(ind + "    }")
         ctx.out.push(ind + "}")
+        flush_null_after(ctx, ind)
+        clear_hoists(ctx)
     } else if s.kind == "return" {
         if s.value == -1 {
             ctx.out.push(ind + "return;")
@@ -5377,7 +6236,30 @@ fn gen_stmt(ctx: Ctx, sidx: int, ind: str) -> void {
             if ctx.exprs[s.value].t == "never" {
                 ctx.out.push(ind + v + ";")
             } else {
-                ctx.out.push(ind + "return " + v + ";")
+                # Stage 8-beta ownership on return:
+                #   * A BORROWED pointer value (an ident) gets one retain —
+                #     the caller owns it; the binding's own retain is
+                #     released by its cleanup as the scope exits.
+                #   * A FRESH value transfers its inherent retain.
+                #   * If the value moved bindings out via take(), null
+                #     them BEFORE the return (an `x = NULL` after the
+                #     return would be unreachable).
+                let fresh: bool = expr_fresh(ctx, s.value)
+                let rv: str = own_wrap(ctx, ctx.exprs[s.value].t, v, fresh)
+                if ctx.null_after.len() > 0 {
+                    let rt: str = ctx.exprs[s.value].t
+                    let rt_c: str = c_type(ctx, rt)
+                    if rt == "void" {
+                        ctx.out.push(ind + v + ";")
+                    } else {
+                        let tmp: str = fresh_tmp(ctx, "hlc_rv")
+                        ctx.out.push(ind + "{ " + rt_c + " " + tmp + " = " + rv + ";")
+                        flush_null_after(ctx, ind + "    ")
+                        ctx.out.push(ind + "    return " + tmp + "; }")
+                    }
+                } else {
+                    ctx.out.push(ind + "return " + rv + ";")
+                }
             }
         }
     } else if s.kind == "break" {
@@ -5385,7 +6267,21 @@ fn gen_stmt(ctx: Ctx, sidx: int, ind: str) -> void {
     } else if s.kind == "continue" {
         ctx.out.push(ind + "continue;")
     } else if s.kind == "expr" {
-        ctx.out.push(ind + gen_expr(ctx, s.e) + ";")
+        collect_hoist(ctx, s.e)
+        hoist_all(ctx, ctx.out, ind)
+        # Stage 8-beta: a discarded FRESH pointer value (e.g. `make();`
+        # or a match used as a statement) still owns one retain — wrap it
+        # in a cleanup temp so it is released instead of leaked.
+        if is_ptr_t(ctx, ctx.exprs[s.e].t) && expr_fresh(ctx, s.e) {
+            let tmp: str = fresh_tmp(ctx, "hlc_ed")
+            ctx.out.push(ind + "{ " + c_type(ctx, ctx.exprs[s.e].t) + " " + tmp
+                + " __attribute__((cleanup(" + cleanup_fn_for(ctx, ctx.exprs[s.e].t) + "))) = "
+                + gen_expr(ctx, s.e) + "; }")
+        } else {
+            ctx.out.push(ind + gen_expr(ctx, s.e) + ";")
+        }
+        flush_null_after(ctx, ind)
+        clear_hoists(ctx)
     } else {
         panic("internal codegen error: unknown statement " + s.kind)
     }
@@ -5401,33 +6297,105 @@ fn gen_stmts(ctx: Ctx, stmts: list[int], ind: str) -> void {
 
 fn gen_assign(ctx: Ctx, s: StmtN, ind: str) -> void {
     let tgt: int = s.target
+    collect_hoist(ctx, s.value)
+    # Hoist fresh subexpressions of the assignment TARGET too (e.g. a
+    # call result whose field is assigned: `f().name = "x"`).
+    collect_hoist(ctx, tgt)
+    hoist_all(ctx, ctx.out, ind)
     let v: str = gen_expr(ctx, s.value)
     # BUG-004 fix: if the RHS is `never`-typed (e.g. `x = panic("...")`),
     # emit just the side-effect call without the assignment — the assignment
     # target is unreachable code.
     if ctx.exprs[s.value].t == "never" {
         ctx.out.push(ind + v + ";")
+        flush_null_after(ctx, ind)
+        clear_hoists(ctx)
         return
     }
+    let fresh: bool = expr_fresh(ctx, s.value)
     if ctx.exprs[tgt].kind == "ident" {
         let cn: str = local_c(ctx, ctx.exprs[tgt].name)
-        ctx.out.push(ind + cn + " = " + v + ";")
+        let tgt_t: str = ctx.exprs[tgt].t
+        if is_ptr_t(ctx, tgt_t) {
+            # Stage 8-beta: release the old value AFTER storing the new
+            # one (self-assignment safe: the new value is retained or
+            # fresh before the old pointer is released).
+            let wrapped: str = own_wrap(ctx, tgt_t, v, fresh)
+            ctx.out.push(ind + "{ " + c_type(ctx, tgt_t) + " __hl_old = " + cn + "; "
+                + cn + " = " + wrapped + "; " + release_call(ctx, tgt_t, "__hl_old") + "; }")
+        } else {
+            ctx.out.push(ind + cn + " = " + v + ";")
+        }
     } else if ctx.exprs[tgt].kind == "field" {
+        let base_t: str = ctx.exprs[ctx.exprs[tgt].left].t
         let base: str = gen_expr(ctx, ctx.exprs[tgt].left)
-        ctx.out.push(ind + "(" + base + ")->" + ctx.exprs[tgt].name + " = " + v + ";")
+        let ftype: str = ctx.exprs[tgt].t
+        let fname: str = ctx.exprs[tgt].name
+        if is_ptr_t(ctx, ftype) {
+            # Materialise the base once (calling it twice would
+            # double-evaluate), then store-then-release.
+            let bt: str = fresh_tmp(ctx, "hlc_fb")
+            let wrapped: str = own_wrap(ctx, ftype, v, fresh)
+            ctx.out.push(ind + "{ " + c_type(ctx, base_t) + " " + bt + " = " + base + ";")
+            ctx.out.push(ind + "  " + c_type(ctx, ftype) + " __hl_old = " + bt + "->" + fname + ";")
+            ctx.out.push(ind + "  " + bt + "->" + fname + " = " + wrapped + ";")
+            ctx.out.push(ind + "  " + release_call(ctx, ftype, "__hl_old") + "; }")
+        } else {
+            ctx.out.push(ind + "(" + base + ")->" + fname + " = " + v + ";")
+        }
     } else {
+        let elem_t: str = list_elem_t(ctx.exprs[ctx.exprs[tgt].left].t)
         let lst: str = gen_expr(ctx, ctx.exprs[tgt].left)
         let idx: str = gen_expr(ctx, ctx.exprs[tgt].right)
-        let mut elem: str = list_elem_t(ctx.exprs[ctx.exprs[tgt].left].t)
-        ctx.out.push(ind + "hl_list_set(" + lst + ", " + idx + ", " + box_val(elem, v) + ");")
+        # hl_list_set releases the old element itself (store-then-release
+        # inside the runtime); the new value arrives owned.
+        let wrapped: str = gen_store_val(ctx, elem_t, v, fresh)
+        ctx.out.push(ind + "hl_list_set(" + lst + ", " + idx + ", " + wrapped + ");")
     }
+    flush_null_after(ctx, ind)
+    clear_hoists(ctx)
 }
+
 
 # --- Function generation ---
 
 fn gen_reset_fn(ctx: Ctx) -> void {
     ctx.gen_locals = map_new()
     ctx.gen_counts = map_new()
+    ctx.hoist_map = map_new()
+    ctx.null_after = []
+}
+
+# gen_param_locals: Stage 8-beta — function parameters OWN one retain of
+# each argument. C cannot attach a cleanup attribute to a parameter, so
+# the signature uses a `<name>_p` parameter and the body starts with a
+# local `u_<name>` copy carrying the cleanup attribute. The body's code
+# references the local (via gen_locals), never the raw parameter.
+fn gen_param_locals(ctx: Ctx, f: FnInfo, ptypes_c: list[str], param_local_names: list[str], sig_params: list[str]) -> void {
+    let mut i: int = 0
+    while i < f.params.len() {
+        let cn: str = fresh_local(ctx, f.params.get(i))
+        param_local_names.push(cn)
+        sig_params.push(ptypes_c.get(i) + " " + cn + "_p")
+        i = i + 1
+    }
+}
+
+# emit_param_local_decls: emit the `u_x = u_x_p` declarations (with
+# cleanups for pointer types) at the top of a function body.
+fn emit_param_local_decls(ctx: Ctx, f: FnInfo, inst_ptypes: list[str], param_local_names: list[str]) -> void {
+    let mut i: int = 0
+    while i < f.params.len() {
+        let cn: str = param_local_names.get(i)
+        let pt: str = inst_ptypes.get(i)
+        if is_ptr_t(ctx, pt) {
+            ctx.out.push("    " + c_type(ctx, pt) + " " + cn
+                + " __attribute__((cleanup(" + cleanup_fn_for(ctx, pt) + "))) = " + cn + "_p;")
+        } else {
+            ctx.out.push("    " + c_type(ctx, pt) + " " + cn + " = " + cn + "_p;")
+        }
+        i = i + 1
+    }
 }
 
 fn gen_fn_body(ctx: Ctx, key: str) -> void {
@@ -5455,12 +6423,19 @@ fn gen_fn_body(ctx: Ctx, key: str) -> void {
     }
     gen_reset_fn(ctx)
     let ptypes_c: list[str] = []
+    let inst_ptypes: list[str] = []
     let mut i: int = 0
     while i < f.params.len() {
-        let cn: str = fresh_local(ctx, f.params.get(i))
-        ptypes_c.push(c_type(ctx, f.ptypes.get(i)) + " " + cn)
+        inst_ptypes.push(f.ptypes.get(i))
+        ptypes_c.push(c_type(ctx, f.ptypes.get(i)))
         i = i + 1
     }
+    # Stage 8-beta: parameters own one retain of each argument. The
+    # signature carries `<name>_p` params; the body starts with owned
+    # local copies (see gen_param_locals / emit_param_local_decls).
+    let param_local_names: list[str] = []
+    let sig_params: list[str] = []
+    gen_param_locals(ctx, f, ptypes_c, param_local_names, sig_params)
     # For generic functions, we emit a specialization. The "key" passed in is
     # the original key; we generate a specialization with a mangled name when
     # the function has type params. The specialization instantiation is
@@ -5471,12 +6446,13 @@ fn gen_fn_body(ctx: Ctx, key: str) -> void {
     # That branch was unreachable because gen_program never routes generic
     # functions through gen_fn_body — they go through gen_fn_inst_lines.
     let mut sig: str = c_type(ctx, f.ret) + " " + fname + "("
-    if ptypes_c.len() == 0 {
+    if sig_params.len() == 0 {
         sig = sig + "void)"
     } else {
-        sig = sig + join(ptypes_c, ", ") + ")"
+        sig = sig + join(sig_params, ", ") + ")"
     }
     ctx.out.push(sig + " {")
+    emit_param_local_decls(ctx, f, inst_ptypes, param_local_names)
     gen_stmts(ctx, f.body, "    ")
     ctx.out.push("}")
     ctx.out.push("")
@@ -5492,52 +6468,105 @@ fn gen_struct_lines(ctx: Ctx) -> list[str] {
         # For generic structs, the instantiations are emitted separately
         # (driven by gen_program which tracks all instantiations used).
         if st.typeparams.len() == 0 {
-            out.push("typedef struct " + st.name + " {")
-            let mut j: int = 0
-            while j < st.fields.len() {
-                out.push("    " + c_type(ctx, st.ftypes.get(j)) + " " + st.fields.get(j) + ";")
-                j = j + 1
-            }
-            out.push("} " + st.name + ";")
-            out.push("")
-            # constructor
-            let ptypes_c: list[str] = []
-            let assigns: list[str] = []
-            let mut j2: int = 0
-            while j2 < st.fields.len() {
-                ptypes_c.push(c_type(ctx, st.ftypes.get(j2)) + " " + st.fields.get(j2))
-                assigns.push("    p->" + st.fields.get(j2) + " = " + st.fields.get(j2) + ";")
-                j2 = j2 + 1
-            }
-            out.push("static " + st.name + "* usf_new_" + st.name + "(" + join(ptypes_c, ", ") + ") {")
-            out.push("    " + st.name + "* p = (" + st.name + "*)malloc(sizeof(" + st.name + "));")
-            out.push("    if (!p) hl_die(\"out of memory\");")
-            let mut k: int = 0
-            while k < assigns.len() {
-                out.push(assigns.get(k))
-                k = k + 1
-            }
-            out.push("    return p;")
-            out.push("}")
-            out.push("")
+            let empty_targs: list[str] = []
+            concat_lines(out, gen_one_struct_full(ctx, st.name, st, empty_targs))
         }
         i = i + 1
     }
     return out
 }
 
-# BUG-SC-15 fix: removed the dead `gen_one_enum` stub (lines 5524-5541).
-# It was an incomplete function that pushed a "typedef enum {" line and
-# per-variant tags, then returned early with a comment "Actually, the
-# simpler approach: emit each tag on its own line, joined by commas.
-# Let me redo this." It never closed the typedef or emitted the
-# struct/constructors, and was NEVER called (replaced by
-# `gen_one_enum_full` below). Removing it eliminates dead code that
-# would produce invalid C if ever invoked.
+# gen_one_struct_full: typedef (refcnt first) + constructor + release +
+# cleanup for one struct definition (targs empty for non-generic).
+fn gen_one_struct_full(ctx: Ctx, c_name: str, st: StructInfo, targs: list[str]) -> list[str] {
+    let mut out: list[str] = []
+    # 1. typedef — refcnt is the FIRST field so hl_retain works uniformly.
+    out.push("typedef struct " + c_name + " {")
+    out.push("    int64_t refcnt;")
+    let mut j: int = 0
+    while j < st.fields.len() {
+        let ftype: str = st.ftypes.get(j)
+        let mut inst_ftype: str = ""
+        if st.typeparams.len() > 0 {
+            inst_ftype = instantiate_type(ftype, st.typeparams, targs)
+        } else {
+            inst_ftype = ftype
+        }
+        out.push("    " + c_type(ctx, inst_ftype) + " " + st.fields.get(j) + ";")
+        j = j + 1
+    }
+    out.push("} " + c_name + ";")
+    out.push("")
+    # 2. constructor — stores its params raw: they arrive OWNED (the
+    # call site own-wraps each field value). refcnt starts at 1.
+    # The constructor takes ALL fields as parameters — gen_structlit
+    # passes the provided values plus the default expressions evaluated
+    # at the literal site (fresh values whose ownership transfers here).
+    let ptypes_c: list[str] = []
+    let assigns: list[str] = []
+    let mut j2: int = 0
+    while j2 < st.fields.len() {
+        let ftype: str = st.ftypes.get(j2)
+        let mut inst_ftype: str = ""
+        if st.typeparams.len() > 0 {
+            inst_ftype = instantiate_type(ftype, st.typeparams, targs)
+        } else {
+            inst_ftype = ftype
+        }
+        ptypes_c.push(c_type(ctx, inst_ftype) + " " + st.fields.get(j2))
+        assigns.push("    p->" + st.fields.get(j2) + " = " + st.fields.get(j2) + ";")
+        j2 = j2 + 1
+    }
+    out.push("static " + c_name + "* usf_new_" + c_name + "(" + join(ptypes_c, ", ") + ") {")
+    out.push("    " + c_name + "* p = (" + c_name + "*)malloc(sizeof(" + c_name + "));")
+    out.push("    if (!p) hl_die(\"out of memory\");")
+    out.push("    p->refcnt = 1;")
+    let mut k: int = 0
+    while k < assigns.len() {
+        out.push(assigns.get(k))
+        k = k + 1
+    }
+    out.push("    return p;")
+    out.push("}")
+    out.push("")
+    # 3. release + cleanup (Stage 8-beta).
+    concat_lines(out, gen_struct_release_lines(ctx, c_name, st, targs))
+    return out
+}
+
+# gen_struct_release_lines: the refcounted destructor + cleanup wrapper.
+# Only the pointer-typed fields are released; primitives are inline C data.
+fn gen_struct_release_lines(ctx: Ctx, c_name: str, st: StructInfo, targs: list[str]) -> list[str] {
+    let mut out: list[str] = []
+    out.push("static void hl_release_" + c_name + "(void* pv) {")
+    out.push("    " + c_name + "* p = (" + c_name + "*)pv;")
+    out.push("    if (!p) return;")
+    out.push("    if (--p->refcnt == 0) {")
+    let mut j: int = 0
+    while j < st.fields.len() {
+        let ftype: str = st.ftypes.get(j)
+        let mut inst_ftype: str = ""
+        if st.typeparams.len() > 0 {
+            inst_ftype = instantiate_type(ftype, st.typeparams, targs)
+        } else {
+            inst_ftype = ftype
+        }
+        if is_ptr_t(ctx, inst_ftype) {
+            out.push("        " + release_call(ctx, inst_ftype, "p->" + st.fields.get(j)) + ";")
+        }
+        j = j + 1
+    }
+    out.push("        free(p);")
+    out.push("    }")
+    out.push("}")
+    out.push("static void hl_cleanup_" + c_name + "(" + c_name + "** p) { hl_release_" + c_name + "(*p); }")
+    out.push("")
+    return out
+}
 
 # gen_one_enum_full(ctx, c_name, en, targs) emits a complete C enum definition +
-# variant constructors. `c_name` is the mangled C identifier (e.g.,
-# "Option__int"), `en` is the EnumInfo, `targs` are the concrete type args
+# variant constructors + release/cleanup. `c_name` is the mangled C identifier
+# (e.g., "Option__int"), `en` is the EnumInfo, `targs` are the concrete type args
 # (parallel to en.typeparams, empty for non-generic).
 fn gen_one_enum_full(ctx: Ctx, c_name: str, en: EnumInfo, targs: list[str]) -> list[str] {
     let mut out: list[str] = []
@@ -5555,9 +6584,11 @@ fn gen_one_enum_full(ctx: Ctx, c_name: str, en: EnumInfo, targs: list[str]) -> l
     out.push(tag_line)
     out.push("} " + c_name + "_Tag;")
     out.push("")
-    # 2. Struct with tag + union of PER-VARIANT structs (each variant has
-    # its own struct containing all its payloads, so payloads don't overlap).
+    # 2. Struct with refcnt + tag + union of PER-VARIANT structs (each
+    # variant has its own struct containing all its payloads, so payloads
+    # don't overlap).
     out.push("typedef struct " + c_name + " {")
+    out.push("    int64_t refcnt;")
     out.push("    " + c_name + "_Tag tag;")
     out.push("    union {")
     let mut vi2: int = 0
@@ -5585,7 +6616,8 @@ fn gen_one_enum_full(ctx: Ctx, c_name: str, en: EnumInfo, targs: list[str]) -> l
     out.push("    } data;")
     out.push("} " + c_name + ";")
     out.push("")
-    # 3. Constructor per variant.
+    # 3. Constructor per variant — stores its payloads raw (they arrive
+    # OWNED from the call site). refcnt starts at 1.
     let mut vi3: int = 0
     while vi3 < en.variants.len() {
         let vname: str = en.variants.get(vi3)
@@ -5610,6 +6642,7 @@ fn gen_one_enum_full(ctx: Ctx, c_name: str, en: EnumInfo, targs: list[str]) -> l
         out.push("static " + c_name + "* usf_make_" + c_name + "_" + vname + "(" + param_sig + ") {")
         out.push("    " + c_name + "* p = (" + c_name + "*)malloc(sizeof(" + c_name + "));")
         out.push("    if (!p) hl_die(\"out of memory\");")
+        out.push("    p->refcnt = 1;")
         out.push("    p->tag = " + en.name + "__TAG_" + vname + "_" + c_name + ";")
         let mut pi3: int = 0
         while pi3 < payloads.len() {
@@ -5621,75 +6654,57 @@ fn gen_one_enum_full(ctx: Ctx, c_name: str, en: EnumInfo, targs: list[str]) -> l
         out.push("")
         vi3 = vi3 + 1
     }
+    # 4. release + cleanup (Stage 8-beta). Only the ACTIVE variant's
+    # payloads are valid to read — dispatch on the tag.
+    out.push("static void hl_release_" + c_name + "(void* pv) {")
+    out.push("    " + c_name + "* p = (" + c_name + "*)pv;")
+    out.push("    if (!p) return;")
+    out.push("    if (--p->refcnt == 0) {")
+    out.push("        switch (p->tag) {")
+    let mut vi4: int = 0
+    while vi4 < en.variants.len() {
+        let vname: str = en.variants.get(vi4)
+        let payloads: list[str] = en.payloads.get(vi4)
+        if payloads.len() > 0 {
+            out.push("            case " + en.name + "__TAG_" + vname + "_" + c_name + ":")
+            let mut pi4: int = 0
+            while pi4 < payloads.len() {
+                let pt: str = payloads.get(pi4)
+                let mut inst_pt: str = ""
+                if en.typeparams.len() > 0 {
+                    inst_pt = instantiate_type(pt, en.typeparams, targs)
+                } else {
+                    inst_pt = pt
+                }
+                if is_ptr_t(ctx, inst_pt) {
+                    out.push("                " + release_call(ctx, inst_pt, "p->data." + vname + ".v" + pi4.to_str()) + ";")
+                }
+                pi4 = pi4 + 1
+            }
+            out.push("                break;")
+        }
+        vi4 = vi4 + 1
+    }
+    out.push("            default: break;")
+    out.push("        }")
+    out.push("        free(p);")
+    out.push("    }")
+    out.push("}")
+    out.push("static void hl_cleanup_" + c_name + "(" + c_name + "** p) { hl_release_" + c_name + "(*p); }")
+    out.push("")
     return out
 }
 
 # gen_struct_instantiation(ctx, t) emits a typedef + constructor for a generic
 # struct instantiation. `t` is the full type string like "Box[int]".
 fn gen_struct_instantiation(ctx: Ctx, t: str) -> list[str] {
-    let mut out: list[str] = []
     let base: str = type_base(t)
     let st: StructInfo = ctx.structs.get_or(base, dummy_struct())
     let targs: list[str] = type_args(t)
     let c_name: str = c_type_name(t)
-    out.push("typedef struct " + c_name + " {")
-    let mut j: int = 0
-    while j < st.fields.len() {
-        let ftype: str = st.ftypes.get(j)
-        let mut inst_ftype: str = ""
-        if st.typeparams.len() > 0 {
-            inst_ftype = instantiate_type(ftype, st.typeparams, targs)
-        } else {
-            inst_ftype = ftype
-        }
-        out.push("    " + c_type(ctx, inst_ftype) + " " + st.fields.get(j) + ";")
-        j = j + 1
-    }
-    out.push("} " + c_name + ";")
-    out.push("")
-    # constructor — only takes the required (non-defaulted) fields; default
-    # values are filled in inside the constructor.
-    let ptypes_c: list[str] = []
-    let assigns: list[str] = []
-    let mut j2: int = 0
-    while j2 < st.fields.len() {
-        let ftype: str = st.ftypes.get(j2)
-        let mut inst_ftype: str = ""
-        if st.typeparams.len() > 0 {
-            inst_ftype = instantiate_type(ftype, st.typeparams, targs)
-        } else {
-            inst_ftype = ftype
-        }
-        let dflt_idx: int = st.fdefaults.get(j2)
-        if dflt_idx == -1 {
-            ptypes_c.push(c_type(ctx, inst_ftype) + " " + st.fields.get(j2))
-            assigns.push("    p->" + st.fields.get(j2) + " = " + st.fields.get(j2) + ";")
-        } else {
-            # Use the default value (codegen evaluates the default expression).
-            # The default expression's stored `t` is the declared (possibly
-            # type-param) type; we evaluate it as-is — the generated C code
-            # for the default expr uses c_type(ctx, declared_type). For
-            # instantiated generics, we'd need to know the instantiation
-            # at default-check time, which we don't track here. For now, we
-            # evaluate the default's C expression as-is. This works for
-            # defaults that don't reference type params (the common case).
-            assigns.push("    p->" + st.fields.get(j2) + " = " + gen_expr(ctx, dflt_idx) + ";")
-        }
-        j2 = j2 + 1
-    }
-    out.push("static " + c_name + "* usf_new_" + c_name + "(" + join(ptypes_c, ", ") + ") {")
-    out.push("    " + c_name + "* p = (" + c_name + "*)malloc(sizeof(" + c_name + "));")
-    out.push("    if (!p) hl_die(\"out of memory\");")
-    let mut k: int = 0
-    while k < assigns.len() {
-        out.push(assigns.get(k))
-        k = k + 1
-    }
-    out.push("    return p;")
-    out.push("}")
-    out.push("")
-    return out
+    return gen_one_struct_full(ctx, c_name, st, targs)
 }
+
 
 # --- Function prototype + instantiation generation ---
 
@@ -5817,21 +6832,27 @@ fn gen_fn_inst_lines(ctx: Ctx) -> list[str] {
         # the body uses ctx.cur_typeparams + ctx.cur_targs for instantiation.
         ctx.cur_typeparams = combined_tps
         ctx.cur_targs = targs
-        # Build the signature.
+        # Build the signature. Stage 8-beta: parameters own one retain of
+        # each argument — `<name>_p` in the signature, owned local copies
+        # with cleanups at the top of the body.
         let ptypes_c: list[str] = []
+        let inst_ptypes: list[str] = []
+        let param_local_names: list[str] = []
+        let sig_params: list[str] = []
         let mut j: int = 0
         while j < f.params.len() {
-            let cn: str = fresh_local(ctx, f.params.get(j))
             let inst_pt: str = instantiate_type(f.ptypes.get(j), combined_tps, targs)
-            ptypes_c.push(c_type(ctx, inst_pt) + " " + cn)
+            inst_ptypes.push(inst_pt)
+            ptypes_c.push(c_type(ctx, inst_pt))
             j = j + 1
         }
+        gen_param_locals(ctx, f, ptypes_c, param_local_names, sig_params)
         let ret_str: str = instantiate_type(f.ret, combined_tps, targs)
         let mut sig: str = c_type(ctx, ret_str) + " usf_" + c_mangled_fn_name(key, combined_tps, targs) + "("
-        if ptypes_c.len() == 0 {
+        if sig_params.len() == 0 {
             sig = sig + "void)"
         } else {
-            sig = sig + join(ptypes_c, ", ") + ")"
+            sig = sig + join(sig_params, ", ") + ")"
         }
         out.push(sig + " {")
         # Emit statements. The gen_stmt / gen_expr functions need to use
@@ -5839,6 +6860,7 @@ fn gen_fn_inst_lines(ctx: Ctx) -> list[str] {
         # the ctx.cur_typeparams + ctx.cur_targs.
         let saved_out: list[str] = ctx.out
         ctx.out = []
+        emit_param_local_decls(ctx, f, inst_ptypes, param_local_names)
         gen_stmts(ctx, f.body, "    ")
         let mut k: int = 0
         while k < ctx.out.len() {
@@ -5855,13 +6877,310 @@ fn gen_fn_inst_lines(ctx: Ctx) -> list[str] {
     return out
 }
 
+# ============================================================================
+# 4d. STAGE 8-BETA: clone() PER-INSTANTIATION HELPERS
+# ----------------------------------------------------------------------------
+# clone() now supports EVERY owned type (str, list, map, struct, enum,
+# tainted[...]) via generated helpers `hl_clone_<mangled-type>`. Each
+# helper deep-copies: primitives by value, pointers by recursively
+# cloning. Recursion is guarded by registration (clone_insts).
+# ============================================================================
+
+# clone_expr_for: the C expression cloning `cexpr` of HLS type t.
+fn clone_expr_for(ctx: Ctx, t: str, cexpr: str) -> str {
+    let tt: str = strip_taint(inst_t(ctx, t))
+    if tt == "int" || tt == "float" || tt == "bool" {
+        return cexpr
+    }
+    if tt == "str" {
+        return "hl_clone_str(" + cexpr + ")"
+    }
+    return "hl_clone_" + c_type_name(tt) + "(" + cexpr + ")"
+}
+
+# register_clone: record that a clone helper is needed for `t` (plus,
+# recursively, for every owned child type its body will clone).
+fn register_clone(ctx: Ctx, t: str) -> void {
+    let tt: str = strip_taint(t)
+    if tt == "int" || tt == "float" || tt == "bool" || tt == "str" {
+        return
+    }
+    if list_has(ctx.clone_insts, t) {
+        return
+    }
+    ctx.clone_insts.push(t)
+    if is_list_t(tt) {
+        register_clone(ctx, list_elem_t(tt))
+        return
+    }
+    if is_map_t(tt) {
+        register_clone(ctx, map_val_t(tt))
+        return
+    }
+    # User struct: register each pointer field's type.
+    let sbase: str = type_base(tt)
+    if ctx.structs.has(sbase) {
+        let st: StructInfo = ctx.structs.get_or(sbase, dummy_struct())
+        let targs: list[str] = type_args(tt)
+        let mut j: int = 0
+        while j < st.fields.len() {
+            let ftype: str = st.ftypes.get(j)
+            let mut inst_ftype: str = ftype
+            if st.typeparams.len() > 0 && targs.len() == st.typeparams.len() {
+                inst_ftype = instantiate_type(ftype, st.typeparams, targs)
+            }
+            if is_ptr_t(ctx, inst_ftype) {
+                register_clone(ctx, inst_ftype)
+            }
+            j = j + 1
+        }
+        return
+    }
+    # User enum: register each pointer payload's type (per variant).
+    let ebase: str = type_base(tt)
+    if ctx.enums.has(ebase) {
+        let en: EnumInfo = ctx.enums.get_or(ebase, dummy_enum())
+        let targs: list[str] = type_args(tt)
+        let mut vi: int = 0
+        while vi < en.variants.len() {
+            let payloads: list[str] = en.payloads.get(vi)
+            let mut pi: int = 0
+            while pi < payloads.len() {
+                let pt: str = payloads.get(pi)
+                let mut inst_pt: str = pt
+                if en.typeparams.len() > 0 && targs.len() == en.typeparams.len() {
+                    inst_pt = instantiate_type(pt, en.typeparams, targs)
+                }
+                if is_ptr_t(ctx, inst_pt) {
+                    register_clone(ctx, inst_pt)
+                }
+                pi = pi + 1
+            }
+            vi = vi + 1
+        }
+        return
+    }
+}
+
+# clone_fn_proto: the prototype line for the clone helper of type t.
+fn clone_fn_proto(ctx: Ctx, t: str) -> str {
+    let tt: str = strip_taint(t)
+    if is_list_t(tt) {
+        return "static hl_list* hl_clone_" + c_type_name(tt) + "(hl_list* l);"
+    }
+    if is_map_t(tt) {
+        return "static hl_map* hl_clone_" + c_type_name(tt) + "(hl_map* m);"
+    }
+    # c_type() already returns a pointer for user types — use the raw
+    # mangled name so the prototype is `static T* hl_clone_T(T* p);`.
+    return "static " + c_type_name(tt) + "* hl_clone_" + c_type_name(tt) + "(" + c_type_name(tt) + "* p);"
+}
+
+# gen_clone_list_lines: the body for clone(list[E]).
+fn gen_clone_list_lines(ctx: Ctx, tt: str) -> list[str] {
+    let mut out: list[str] = []
+    let elem: str = list_elem_t(tt)
+    let m: str = c_type_name(tt)
+    out.push("// clone(" + tt + ") — deep copy with fresh boxes / cloned elements.")
+    out.push("static hl_list* hl_clone_" + m + "(hl_list* l) {")
+    out.push("    hl_list* r = hl_list_new(" + elem_free_fn(ctx, elem) + ");")
+    out.push("    for (int64_t i = 0; i < l->len; i++) {")
+    if elem == "int" {
+        out.push("        hl_list_push(r, hl_box_i64(hl_unbox_i64(l->items[i])));")
+    } else if elem == "float" {
+        out.push("        hl_list_push(r, hl_box_f64(hl_unbox_f64(l->items[i])));")
+    } else if elem == "bool" {
+        out.push("        hl_list_push(r, hl_box_bool(hl_unbox_bool(l->items[i])));")
+    } else {
+        out.push("        hl_list_push(r, " + clone_expr_for(ctx, elem, "(" + c_type(ctx, elem) + ")l->items[i]") + ");")
+    }
+    out.push("    }")
+    out.push("    return r;")
+    out.push("}")
+    out.push("")
+    return out
+}
+
+# gen_clone_map_lines: the body for clone(map[str, V]).
+fn gen_clone_map_lines(ctx: Ctx, tt: str) -> list[str] {
+    let mut out: list[str] = []
+    let vt: str = map_val_t(tt)
+    let m: str = c_type_name(tt)
+    out.push("// clone(" + tt + ") — deep copy with cloned keys and values.")
+    out.push("static hl_map* hl_clone_" + m + "(hl_map* m) {")
+    out.push("    hl_map* r = hl_map_new(" + elem_free_fn(ctx, vt) + ");")
+    out.push("    for (int64_t i = 0; i < m->len; i++) {")
+    out.push("        hl_str* k = m->order[i];")
+    out.push("        void* v = hl_map_borrow(m, k);")
+    out.push("        if (v == NULL) continue;")
+    if vt == "int" {
+        out.push("        hl_map_set(r, hl_clone_str(k), hl_box_i64(hl_unbox_i64(v)));")
+    } else if vt == "float" {
+        out.push("        hl_map_set(r, hl_clone_str(k), hl_box_f64(hl_unbox_f64(v)));")
+    } else if vt == "bool" {
+        out.push("        hl_map_set(r, hl_clone_str(k), hl_box_bool(hl_unbox_bool(v)));")
+    } else {
+        out.push("        hl_map_set(r, hl_clone_str(k), " + clone_expr_for(ctx, vt, "(" + c_type(ctx, vt) + ")v") + ");")
+    }
+    out.push("    }")
+    out.push("    return r;")
+    out.push("}")
+    out.push("")
+    return out
+}
+
+# gen_clone_struct_lines: the body for clone(<struct instantiation>).
+fn gen_clone_struct_lines(ctx: Ctx, tt: str) -> list[str] {
+    let mut out: list[str] = []
+    let sbase: str = type_base(tt)
+    let st: StructInfo = ctx.structs.get_or(sbase, dummy_struct())
+    let targs: list[str] = type_args(tt)
+    let m: str = c_type_name(tt)
+    out.push("// clone(" + tt + ") — deep copy of every field.")
+    out.push("static " + m + "* hl_clone_" + m + "(" + m + "* p) {")
+    out.push("    " + m + "* r = (" + m + "*)malloc(sizeof(" + m + "));")
+    out.push("    if (!r) hl_die(\"out of memory\");")
+    out.push("    r->refcnt = 1;")
+    let mut j: int = 0
+    while j < st.fields.len() {
+        let ftype: str = st.ftypes.get(j)
+        let mut inst_ftype: str = ftype
+        if st.typeparams.len() > 0 && targs.len() == st.typeparams.len() {
+            inst_ftype = instantiate_type(ftype, st.typeparams, targs)
+        }
+        out.push("    r->" + st.fields.get(j) + " = " + clone_expr_for(ctx, inst_ftype, "p->" + st.fields.get(j)) + ";")
+        j = j + 1
+    }
+    out.push("    return r;")
+    out.push("}")
+    out.push("")
+    return out
+}
+
+# gen_clone_enum_lines: the body for clone(<enum instantiation>). Only the
+# active variant's payloads are copied (reading another variant's union
+# arm would be undefined behaviour).
+fn gen_clone_enum_lines(ctx: Ctx, tt: str) -> list[str] {
+    let mut out: list[str] = []
+    let ebase: str = type_base(tt)
+    let en: EnumInfo = ctx.enums.get_or(ebase, dummy_enum())
+    let targs: list[str] = type_args(tt)
+    let m: str = c_type_name(tt)
+    out.push("// clone(" + tt + ") — deep copy of the active variant's payloads.")
+    out.push("static " + m + "* hl_clone_" + m + "(" + m + "* p) {")
+    out.push("    " + m + "* r = (" + m + "*)malloc(sizeof(" + m + "));")
+    out.push("    if (!r) hl_die(\"out of memory\");")
+    out.push("    r->refcnt = 1;")
+    out.push("    r->tag = p->tag;")
+    out.push("    switch (p->tag) {")
+    let mut vi: int = 0
+    while vi < en.variants.len() {
+        let vname: str = en.variants.get(vi)
+        let payloads: list[str] = en.payloads.get(vi)
+        if payloads.len() > 0 {
+            out.push("        case " + en.name + "__TAG_" + vname + "_" + m + ": {")
+            let mut pi: int = 0
+            while pi < payloads.len() {
+                let pt: str = payloads.get(pi)
+                let mut inst_pt: str = pt
+                if en.typeparams.len() > 0 && targs.len() == en.typeparams.len() {
+                    inst_pt = instantiate_type(pt, en.typeparams, targs)
+                }
+                out.push("            r->data." + vname + ".v" + pi.to_str()
+                    + " = " + clone_expr_for(ctx, inst_pt, "p->data." + vname + ".v" + pi.to_str()) + ";")
+                pi = pi + 1
+            }
+            out.push("            break;")
+            out.push("        }")
+        }
+        vi = vi + 1
+    }
+    out.push("        default: break;")
+    out.push("    }")
+    out.push("    return r;")
+    out.push("}")
+    out.push("")
+    return out
+}
+
+# gen_clone_bodies: bodies for every registered clone instantiation.
+fn gen_clone_bodies(ctx: Ctx) -> list[str] {
+    let mut out: list[str] = []
+    let mut i: int = 0
+    while i < ctx.clone_insts.len() {
+        let t: str = ctx.clone_insts.get(i)
+        let tt: str = strip_taint(t)
+        if is_list_t(tt) {
+            concat_lines(out, gen_clone_list_lines(ctx, tt))
+        } else if is_map_t(tt) {
+            concat_lines(out, gen_clone_map_lines(ctx, tt))
+        } else if ctx.structs.has(type_base(tt)) {
+            concat_lines(out, gen_clone_struct_lines(ctx, tt))
+        } else if ctx.enums.has(type_base(tt)) {
+            concat_lines(out, gen_clone_enum_lines(ctx, tt))
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# gen_ownership_protos: forward declarations for every release / cleanup /
+# clone helper so struct/enum/clone definitions can reference each other
+# regardless of emission order (mutual recursion: a struct containing a
+# list of structs, an enum whose payload is the enum itself, ...).
+fn gen_ownership_protos(ctx: Ctx) -> list[str] {
+    let mut out: list[str] = []
+    out.push("// ---- Stage 8-beta: ownership helper prototypes ----")
+    let snames: list[str] = ctx.structs.keys()
+    let mut i: int = 0
+    while i < snames.len() {
+        let st: StructInfo = ctx.structs.get_or(snames.get(i), dummy_struct())
+        if st.typeparams.len() == 0 {
+            out.push("static void hl_release_" + st.name + "(void* p);")
+            out.push("static void hl_cleanup_" + st.name + "(" + st.name + "** p);")
+        }
+        i = i + 1
+    }
+    let mut si: int = 0
+    while si < ctx.struct_insts.len() {
+        let m: str = c_type_name(ctx.struct_insts.get(si))
+        out.push("static void hl_release_" + m + "(void* p);")
+        out.push("static void hl_cleanup_" + m + "(" + m + "** p);")
+        si = si + 1
+    }
+    let enames: list[str] = ctx.enums.keys()
+    let mut ei: int = 0
+    while ei < enames.len() {
+        let en: EnumInfo = ctx.enums.get_or(enames.get(ei), dummy_enum())
+        if en.typeparams.len() == 0 {
+            out.push("static void hl_release_" + en.name + "(void* p);")
+            out.push("static void hl_cleanup_" + en.name + "(" + en.name + "** p);")
+        }
+        ei = ei + 1
+    }
+    let mut eii: int = 0
+    while eii < ctx.enum_insts.len() {
+        let m: str = c_type_name(ctx.enum_insts.get(eii))
+        out.push("static void hl_release_" + m + "(void* p);")
+        out.push("static void hl_cleanup_" + m + "(" + m + "** p);")
+        eii = eii + 1
+    }
+    let mut ci: int = 0
+    while ci < ctx.clone_insts.len() {
+        out.push(clone_fn_proto(ctx, ctx.clone_insts.get(ci)))
+        ci = ci + 1
+    }
+    out.push("")
+    return out
+}
+
 # --- Top-level program generation ---
 
 fn gen_program(ctx: Ctx) -> list[str] {
-    # 1. emit function bodies first (produces list-literal helpers)
+    # 1. emit function bodies first (they collect struct/enum/clone
+    # instantiations as they are generated).
     ctx.out = []
-    ctx.lit_helpers = []
-    ctx.lit_count = 0
+    ctx.clone_insts = []
     ctx.tmp = 0
     let mut i: int = 0
     while i < ctx.fn_order.len() {
@@ -5878,7 +7197,9 @@ fn gen_program(ctx: Ctx) -> list[str] {
     # 1b. emit generic function instantiation bodies.
     let fn_inst_bodies: list[str] = gen_fn_inst_lines(ctx)
     let bodies: list[str] = ctx.out
-    # 2. concatenate in order: header -> runtime -> forward-decls -> struct -> enum -> proto -> lit -> body -> main
+    # 2. concatenate in order: header -> runtime -> forward typedefs ->
+    #    ownership protos -> struct/enum defs -> clone bodies -> fn protos
+    #    -> bodies -> main
     let final: list[str] = []
     final.push("// =============================================================")
     final.push("// C code generated BY hlc — the Hieu Louis compiler (HLS)")
@@ -5917,6 +7238,10 @@ fn gen_program(ctx: Ctx) -> list[str] {
         ei2 = ei2 + 1
     }
     final.push("")
+    # 2a-bis. Stage 8-beta: ownership helper prototypes (release / cleanup /
+    # clone) so the struct/enum/clone definitions below can reference each
+    # other in any order.
+    concat_lines(final, gen_ownership_protos(ctx))
     concat_lines(final, gen_struct_lines(ctx))
     # 2b. emit generic struct instantiations.
     let mut si: int = 0
@@ -5937,8 +7262,9 @@ fn gen_program(ctx: Ctx) -> list[str] {
         concat_lines(final, gen_one_enum_full(ctx, c_type_name(inst_t), en, targs))
         ei = ei + 1
     }
+    # 2e. Stage 8-beta: clone() per-instantiation helper bodies.
+    concat_lines(final, gen_clone_bodies(ctx))
     concat_lines(final, gen_proto_lines(ctx))
-    concat_lines(final, ctx.lit_helpers)
     concat_lines(final, bodies)
     concat_lines(final, fn_inst_bodies)
     # 3. main wrapper

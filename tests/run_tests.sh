@@ -5,6 +5,8 @@
 #  2. Stage-0: reject the fail programs (expect compile errors)
 #  3. Self-compile: hlc.hls (via Stage-0) compiles each ok program -> C
 #     -> gcc -> run native -> COMPARE TO INTERPRETER OUTPUT (differential)
+#  3b. Stage 8-beta: native memory-stress — RSS must stay flat under a
+#      256 MB address-space limit (end-of-arena refcounted runtime)
 #  4. Bootstrap: hlc self-compiles twice -> the two C outputs must be identical
 # ============================================================================
 set -u
@@ -64,6 +66,28 @@ for f in tests/ok/*.hls; do
         diff <(echo "$interp_out") <(echo "$nat_out") | head -4
     fi
 done
+
+echo "=== 3b. Stage 8-beta memory-stress (native RSS must stay flat) ==="
+# The Stage 8 acceptance criterion: a memory-stress program does not
+# increase RSS. The stress binary churns ~500k allocations of every heap
+# shape; under the old arena model it would exhaust a 256 MB address
+# space, with refcounting it completes with delta == 0 pages.
+if python3 boot/boot.py src/hlc.hls tests/memcheck/stress_leak.hls "$TMP/stress.c" >/dev/null 2>&1 \
+    && gcc -O2 -o "$TMP/stress" "$TMP/stress.c" -lm 2>/dev/null; then
+    stress_out=$(bash -c "ulimit -v 262144; \"$TMP/stress\"" 2>/dev/null); stress_rc=$?
+    if [ $stress_rc -eq 0 ]; then
+        delta=$(echo "$stress_out" | grep "rss_delta_pages=" | cut -d= -f2)
+        if [ "$delta" -le 1024 ] 2>/dev/null; then
+            ok "stress_leak under 256MB ulimit (rss delta=${delta} pages)"
+        else
+            bad "stress_leak RSS grew by ${delta} pages"
+        fi
+    else
+        bad "stress_leak failed under 256MB ulimit (exit=$stress_rc)"
+    fi
+else
+    bad "stress_leak (compile failed)"
+fi
 
 echo "=== 4. Differential test for examples (with data file) ==="
 python3 boot/boot.py examples/wordcount.hls examples/data.txt > "$TMP/wc_interp.txt" 2>/dev/null

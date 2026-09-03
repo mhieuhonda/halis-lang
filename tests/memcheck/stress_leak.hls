@@ -1,0 +1,133 @@
+# stress_leak.hls — Stage 8-beta acceptance: a memory-stress program
+# (the "24h web server" analog) whose RSS must stay flat. The program
+# churns hundreds of thousands of allocations of every heap shape
+# (strings, lists, maps, structs, enums, clones, takes, drops) and
+# prints its RSS (pages) before and after via /proc/self/statm.
+# tests/run_tests.sh (section 6) compiles+runs this natively under a
+# 256 MB address-space limit: under the old arena model this loop
+# would exhaust memory in seconds; with refcounting it completes with
+# a flat RSS.
+
+struct Rec {
+    id: int,
+    name: str,
+    tags: list[str]
+}
+
+enum Item {
+    Val(int),
+    Txt(str),
+    None2
+}
+
+fn make_tags(i: int) -> list[str] {
+    let t: list[str] = []
+    t.push("alpha-" + i.to_str())
+    t.push("beta-" + i.to_str())
+    t.push("gamma-" + i.to_str())
+    t.push("delta-" + i.to_str())
+    return t
+}
+
+fn rss_pages() -> int uses Fs {
+    let statm: str = read_file("/proc/self/statm")
+    let parts: list[str] = statm.split(" ")
+    if parts.len() > 1 {
+        return parts.get(1).to_int()
+    }
+    return 0
+}
+
+fn churn(rounds: int) -> int {
+    let mut checksum: int = 0
+    let mut i: int = 0
+    while i < rounds {
+        # strings
+        let s: str = "round-" + i.to_str() + "-payload-0123456789"
+        checksum = checksum + s.len()
+        let c: str = clone(s)
+        checksum = checksum + c.byte_at(2)
+        drop(c)
+
+        # lists of ints + clone + pop
+        let xs: list[int] = [i, i + 1, i + 2, i + 3, i + 4, i + 5, i + 6, i + 7]
+        let ys: list[int] = clone(xs)
+        ys.push(i * 3)
+        checksum = checksum + ys.pop() + xs.get(4)
+
+        # lists of strings
+        let tags: list[str] = make_tags(i)
+        let mut j: int = 0
+        while j < tags.len() {
+            checksum = checksum + tags.get(j).len()
+            j = j + 1
+        }
+
+        # maps
+        let m: map[str, int] = map_new()
+        m.set("alpha", i)
+        m.set("beta", i * 2)
+        m.set("gamma", i * 3)
+        m.set("delta", i * 4)
+        let mc: map[str, int] = clone(m)
+        mc.set("beta", -7)
+        checksum = checksum + m.get_or("gamma", 0) + mc.get_or("beta", 0)
+
+        # maps with pointer values
+        let mm: map[str, str] = map_new()
+        mm.set("one", "uno-" + i.to_str())
+        mm.set("two", "dos-" + i.to_str())
+        checksum = checksum + mm.get_or("two", "?").len()
+
+        # structs + clone + field assignment
+        let r: Rec = Rec { id: i, name: "rec-" + i.to_str(), tags: make_tags(i) }
+        let rc: Rec = clone(r)
+        rc.id = 100000 + i
+        checksum = checksum + r.id + rc.id + rc.tags.get(0).len()
+
+        # enums + match + clone
+        let mod3: int = i % 3
+        let mut it: Item = Item.None2
+        if mod3 == 0 {
+            it = Item.Val(i)
+        } else if mod3 == 1 {
+            it = Item.Txt("text-" + i.to_str())
+        }
+        let itc: Item = clone(it)
+        checksum = checksum + match itc {
+            Item.Val(v) => v,
+            Item.Txt(t) => t.len(),
+            Item.None2 => 1
+        }
+
+        # take / consume / borrow-return
+        let owned: str = "owned-" + i.to_str()
+        checksum = checksum + consume_str(take(owned))
+        checksum = checksum + pick("aaaa", "bbbbbb").len()
+        i = i + 1
+    }
+    return checksum
+}
+
+fn consume_str(s: str) -> int {
+    return s.len()
+}
+
+fn pick(a: str, b: str) -> str {
+    if a.len() > b.len() {
+        return a
+    }
+    return b
+}
+
+fn main() -> int uses IO {
+    let warmup: int = churn(2000)
+    let before: int = rss_pages()
+    let checksum: int = churn(50000) + warmup
+    let after: int = rss_pages()
+    println("checksum=" + checksum.to_str())
+    println("rss_before_pages=" + before.to_str())
+    println("rss_after_pages=" + after.to_str())
+    println("rss_delta_pages=" + (after - before).to_str())
+    return 0
+}

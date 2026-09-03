@@ -8,7 +8,116 @@ Releases on `main` follow the 20-stage roadmap (see [ROADMAP.md](ROADMAP.md)).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
-## [unreleased] — Stage deep-scan-4 (v0.16.0-alpha)
+## [v0.19.0-alpha] — Stage 8-beta: END OF ARENA — refcounted runtime & ownership analysis
+
+### Why this release exists — "the arena is gone"
+
+Since v0.1, every heap allocation in generated C programs leaked by
+design: the runtime had no `free` path at all (the "arena model" —
+structurally impossible to use-after-free, but every string, list, map,
+struct and enum lived until process exit). Stage 8-alpha (v0.4.0) added
+the *static* half of ownership (`drop`/`clone`/`take`, use-after-move
+errors) but `drop(x)` was documented as a runtime no-op. This release
+finishes Stage 8: **memory is now reclaimed deterministically at scope
+exit**, and the Stage 8 acceptance criterion — a memory-stress program
+must not grow RSS — is met and **enforced in CI**.
+
+### The ownership discipline (SPEC.md §16.7)
+
+- Every heap object starts with an `int64_t refcnt` (first field, so
+  `hl_retain` is generic across all types).
+- The codegen classifies every expression as **fresh** (one unowned
+  retain: literals, concat, `clone`, call results, `pop`, `keys`,
+  list/struct/enum literals) or **borrowed** (idents, field/index
+  access). Bindings own one retain; function parameters own one retain
+  of each argument; containers own their elements (destructor function
+  pointers per element/value type); `return` of a borrowed value adds
+  the caller's retain.
+- Pointer-typed bindings carry `__attribute__((cleanup(...)))` — the C
+  compiler itself runs the releases on **every** control-flow path
+  (break/continue/return), giving exact free timing without a GC.
+- Fresh values consumed in borrowed positions (e.g. the left operand of
+  a string concat) are hoisted into cleanup temporaries — expression
+  trees cannot leak.
+- `print`/`println`/`panic`/`read_file`/`write_file`/`file_exists`
+  consume their argument; `?` retains the payload on success and the
+  error value on the early-return path; `match` arms are own-wrapped so
+  the match always yields an owned value.
+- `take(x)` transfers the binding's retain (the C variable is nulled
+  after the statement); `drop(x)` releases immediately and nulls the
+  binding.
+
+Observable behaviour is unchanged — the aliasing semantics of every
+prior release is preserved exactly (differential suite: 100%).
+
+### clone() on every owned type
+
+`clone()` now supports `str`, `list[...]`, `map[str, ...]`, `struct`,
+`enum`, and `tainted[...]` via per-instantiation generated helpers
+(`hl_clone_<mangled-type>`, recursively cloning pointer children). The
+interpreter's `deep_clone` covers the same set. Mutating a clone never
+affects the original — including nested structs, structs inside lists,
+and structs inside maps.
+
+### New checker rule
+
+`take()`/`drop()` are rejected inside a `while` condition or `for`
+iterable: the header re-evaluates every iteration, so a move would hand
+NULL to the callee from the second iteration on (an interpreter/native
+divergence). Both compilers enforce the same error message.
+
+### Bug fixes (found by the differential + memory suite)
+
+- **List literals with local variables generated uncompilable C** —
+  `hl_lit_N()` helper functions embedded element expressions generated
+  in the *enclosing* function's context, so `[a, b, 30]` with locals
+  failed to compile natively while the interpreter ran it fine (a
+  differential hole: no prior test covered it). List literals are now
+  inlined as GCC statement expressions. Regression: `feat_list_local`.
+- **`pop()` on primitive-element lists leaked the element box** (8
+  bytes + malloc overhead per pop). New typed pops
+  `hl_list_pop_i64/f64/bool` free the box after unboxing.
+- **`hl_read_file` returned empty output for virtual files** —
+  `/proc`, `/sys` report size 0 via `fseek`/`ftell`, so the native
+  binary read nothing where the interpreter read the content (a real
+  interpreter/native divergence). The runtime now reads incrementally
+  until EOF.
+- **`hl_read_file` leaked its temporary read buffer** (the `buf` from
+  `ftell`-sized `malloc` was never freed) — now freed before return.
+- `clone(tainted[T])` emitted a call to a non-existent
+  `hl_clone_tainted__T` — the dispatch now unwraps taint (clone of
+  `tainted[T]` is the clone of `T`; taint is compile-time only).
+
+### Tests
+
+- 156 → **163 PASS / 0 FAIL** (157 with the memory-stress check):
+  - `feat_scope_free` — differential churn of every heap shape in
+    loops (strings, lists, maps, structs, enums, clone/take/drop,
+    borrow-chain returns, discarded fresh values).
+  - `feat_clone_deep` — deep clone semantics for nested structs,
+    recursive enums, structs in lists/maps.
+  - `feat_list_local` — regression for the list-literal bug.
+  - `fail_take_in_loop_cond` / `fail_drop_in_loop_iter` — the new
+    loop-header move rule.
+  - `tests/memcheck/stress_leak.hls` (native-only): 500k allocation
+    rounds; **RSS delta = 0 pages**; enforced under
+    `ulimit -v 262144` (256 MB) in `tests/run_tests.sh` section 3b —
+    under the old arena model this loop exhausts the limit in seconds.
+- Bootstrap still **deterministic** (two self-compile passes produce
+  byte-identical C).
+- The LLVM suite (13/13) still passes — the LLVM backend keeps the
+  arena model (`elem_free`/`val_free` = NULL means "never release"),
+  which is now an explicit, documented contract of the runtime.
+
+### Upgrade notes
+
+- Programs relying on `take()`/`drop()` inside loop conditions/iterables
+  now fail to compile (both compilers) — hoist the move out of the
+  header.
+- Generated C now uses `__attribute__((cleanup))` (GCC/Clang), which
+  the supported toolchains (gcc, clang) both provide.
+
+## [v0.18.0-alpha] — Stage deep-scan-4 (tools) + v0.17.0-alpha (LLVM backend) + v0.16.0-alpha (core)
 
 ### Why this release exists — "the scan that finally scans"
 

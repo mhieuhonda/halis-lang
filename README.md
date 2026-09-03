@@ -46,9 +46,11 @@ Seven core guarantees of v0.13.0-alpha:
    v0.5 has no switch to disable checks.
 3. **No null. No uninitialised variables, no hidden state, no globals.**
    Everything is explicit so it can be audited.
-4. **(Stage 8-alpha) Use-after-move is a compile error.** The ownership
-   primitives — `drop`, `clone`, `take` — let the compiler track when a
-   binding has been moved, and statically reject any subsequent use.
+4. **(Stage 8, complete) Memory safety without GC.** Use-after-move is a
+   compile error, `clone()` deep-copies every owned type, and the
+   generated runtime is reference-counted with **exact free at scope
+   exit** — a memory-stress program runs with a flat RSS (verified in CI
+   under a 256 MB address-space limit). No arena, no GC, no leaks.
 5. **(NEW in v0.5.0-alpha) Fine-grained effects & capabilities.** The
    single `IO` effect is split into five capabilities — `IO`, `Fs`,
    `Clock`, `Args`, `Exit` — each individually declared and statically
@@ -113,7 +115,8 @@ make bootstrap
 # 3. Compile your program to a native binary
 make run F=examples/primes.hls
 
-# 4. Run the full test suite (145 tests: types, effects, ownership, taint, taint-beta, optimize, differential, bootstrap)
+# 4. Run the full test suite (163 tests: types, effects, ownership, taint,
+#    differential, bootstrap determinism, LLVM IR, memory-stress RSS check)
 make test
 
 # 5. Try the fine-grained effects (v0.7.0-alpha)
@@ -273,7 +276,7 @@ Full details: [SPEC.md](SPEC.md) · Stage-by-stage roadmap:
 
 ## Status
 
-**v0.8.0-alpha — Stages 1–7 complete, Stage 8-alpha + Stage 9-alpha + Stage 9-beta + Stage 10-alpha + Stage 10-beta shipped**:
+**v0.19.0-alpha — Stages 1–8 complete (Stage 8: ownership + end-of-arena runtime), Stage 9–15 in alpha/beta**:
 
 - ✅ Complete core specification
 - ✅ Stage-0 reference (interpreted, with type + effects checking)
@@ -285,10 +288,16 @@ Full details: [SPEC.md](SPEC.md) · Stage-by-stage roadmap:
   exhaustiveness checking), `Option[T]`/`Result[T, E]` in stdlib,
   `?` error-propagation operator, monomorphising generics on functions /
   structs / enums, struct default field values, recursive enums
-- 🔄 **Stage 8-alpha — Ownership primitives** (v0.4.0-alpha):
-  `drop(x)` / `clone(x)` / `take(x)` builtins, with compile-time
-  use-after-move tracking. Bindings carry a `moved` flag in both Stage-0
-  and `hlc.hls`.
+- ✅ **Stage 8 — Ownership & memory model, COMPLETE** (alpha v0.4.0-alpha
+  + beta v0.19.0-alpha): `drop(x)` / `clone(x)` / `take(x)` builtins with
+  compile-time use-after-move tracking; **end of the arena** — the
+  generated C runtime is refcounted and the codegen's ownership-analysis
+  pass inserts exact retain/release at scope exit (cleanup attributes
+  cover every control-flow path). `clone()` supports every owned type
+  (str / list / map / struct / enum / tainted) via per-instantiation
+  helpers. The memory-stress acceptance test runs 500k allocation rounds
+  with **RSS delta = 0**, enforced under a 256 MB `ulimit -v` in the
+  test suite. **163/163 tests PASS**.
 - 🔄 **Stage 9-alpha — Fine-grained effects & capabilities** (v0.5.0-alpha):
   Single `IO` effect split into five — `IO`, `Fs`, `Clock`, `Args`, `Exit`.
   `uses` clause now accepts a comma-separated list; `uses IO` is a
@@ -329,15 +338,15 @@ Full details: [SPEC.md](SPEC.md) · Stage-by-stage roadmap:
   uses the FIRST `@` for userinfo split (defensive).
   The new `examples/taint_beta_demo.hls` exercises the flow.
   **145/145 tests PASS**.
-- ⬜ Stage 8-beta (full borrow checker, end-of-arena runtime),
-  Stage 10-gamma (sandboxed compile mode, first-class taint labels,
-  runtime taint flag in the native backend), SSA IR, LLVM,
-  concurrency...
+- ⬜ Stage 10-gamma (sandboxed compile mode, first-class taint labels,
+  runtime taint flag in the native backend), concurrency (Stage 16),
+  formal verification (Stage 17), testing ecosystem (Stage 18),
+  docs/book/playground (Stage 19), v1.0 (Stage 20)...
 
 ## Contributing
 
 Every contribution must preserve the core guarantees and pass
-`make test` (145 tests, including differential testing of the two
+`make test` (163 tests, including differential testing of the two
 implementations). Every new feature must first be used inside `hlc` itself —
 the compiler is always the first customer of the language.
 
