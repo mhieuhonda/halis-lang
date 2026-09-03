@@ -166,10 +166,13 @@ def run_cli():
     emit_llvm = False      # Stage 12 (v0.10.0-alpha): print LLVM IR text
     opt_stats = False      # Stage 11: print optimiser statistics
     target_triple = None   # Stage 12: --target <triple>
-    if "--check" in args:
+    # BUG (deep-scan-5): remove() only deleted the FIRST occurrence — a
+    # duplicated flag (e.g. `--check --check f.hls`) leaked the stray copy
+    # into the filename argument. Strip ALL occurrences of each flag.
+    while "--check" in args:
         check_only = True
         args.remove("--check")
-    if "--audit" in args:
+    while "--audit" in args:
         audit_only = True
         args.remove("--audit")
     if "--emit" in args:
@@ -183,7 +186,7 @@ def run_cli():
         else:
             sys.stderr.write("error: --emit expects 'ir' or 'llvm'\n")
             return 2
-    if "--opt-stats" in args:
+    while "--opt-stats" in args:
         opt_stats = True
         args.remove("--opt-stats")
     if "--target" in args:
@@ -462,6 +465,13 @@ def main():
     except SystemExit as ex:
         sys.stdout.buffer.flush()
         return ex.code if ex.code is not None else 0
+    except RecursionError:
+        # BUG (deep-scan-5): runaway HLS recursion (or mutually recursive
+        # struct field defaults) surfaced as a raw Python traceback. Report
+        # it like every other runtime halt — a clean panic, exit 101.
+        sys.stdout.buffer.flush()
+        sys.stderr.write("panic: stack overflow (recursion too deep)\n")
+        return 101
 
 
 if __name__ == "__main__":

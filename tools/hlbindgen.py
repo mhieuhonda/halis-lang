@@ -129,6 +129,23 @@ def parse_header(src: str) -> list:
                         ptype = _parse_c_type(ptype_str, p)
                 params.append((pname, ptype))
         decls.append({"name": name, "ret": ret_type, "params": params})
+    # BUG (deep-scan-5): declarations containing function pointers (or any
+    # other unsupported shape) were silently DROPPED — users got an extern
+    # block missing functions they expected, surfacing later as HLS
+    # "unknown function" errors. Report every skipped declaration.
+    # Collect all top-level `... );` declarations and warn about the ones
+    # the pattern did not match.
+    all_decls = re.findall(r"^[\w\s\*]+?\s+\**\s*\w+\s*\([^;]*\)\s*;",
+                           src, re.MULTILINE)
+    matched_spans = set()
+    for m in pattern.finditer(src):
+        matched_spans.add(m.group(1))
+    for d in all_decls:
+        nm = re.search(r"\**\s*(\w+)\s*\(", d)
+        if nm and nm.group(1) not in matched_spans:
+            sys.stderr.write(
+                "warning: skipped unsupported C declaration (function "
+                "pointers / complex params are not supported): %s\n" % d.strip()[:100])
     return decls
 
 

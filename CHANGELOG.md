@@ -8,6 +8,170 @@ Releases on `main` follow the 20-stage roadmap (see [ROADMAP.md](ROADMAP.md)).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
+## [v0.19.0-alpha] — deep-scan-5: whole-codebase bug sweep
+
+> A four-track audit (boot/, tools/, LLVM+IR backends, stdlib) with every
+> finding verified by a runnable repro before fixing. 26 distinct bugs
+> fixed; 7 new regression tests; 173/173 tests PASS.
+
+### boot/ — checker & interpreter (6 fixes)
+
+- **Extern "C" calls bypassed the effects/capability check entirely**
+  (soundness hole in the flagship capability system): the fixpoint
+  unioned an extern's DECLARED effects into the caller's computed set,
+  but the enforcement loop looked for a witness via the extern's computed
+  set — always empty for body-less externs. `--check` said OK while
+  `--audit` printed VIOLATION. Both the fixpoint and the two witness
+  loops (pure + violation) now use the extern's declared set, in both
+  Stage-0 and the self-hosted checker. Regression:
+  `fail_extern_effect_missing`.
+- **`float.to_int()` on ±inf/NaN crashed the interpreter** with a raw
+  Python `OverflowError` traceback while the native runtime panicked
+  cleanly — a differential divergence. The interpreter now checks
+  non-finiteness first; the C runtime gained an explicit `isnan` check
+  (NaN passes both range comparisons and fell into an undefined cast).
+  Regression: `panic_float_inf_toint`.
+- **`args()` diverged between the implementations**: the interpreter
+  returned a fresh copy per call, the native runtime returns THE
+  process-global list — mutating the result was observable natively but
+  not under Stage-0. The interpreter now returns the same list.
+- **The `for`-loop variable silently shadowed outer bindings** (the
+  `let` branch rejected shadowing, the `for` branch never checked —
+  SPEC §4). Rejected in both compilers. Regression: `fail_for_shadow`.
+- **`?` on an enum with a third variant** (beyond Ok/Err) was
+  checker-clean but guaranteed a runtime panic — and the native codegen
+  read garbage union bytes. **`?` on an enum declaring both `Err` and
+  `None`** silently kept only the last as the error variant. Both
+  rejected at check time now. Regressions: `fail_qmark_extra_variant`,
+  `fail_qmark_err_and_none`.
+- Runaway HLS recursion surfaced as a raw `RecursionError` traceback —
+  now a clean `panic: stack overflow` (exit 101). Duplicated CLI flags
+  no longer leak into the filename argument.
+
+### LLVM text backend + HLIR (10 fixes)
+
+- **Runtime ABI mismatches** (the declared externs were stale after the
+  Stage 8 runtime change): `hl_list_new()`/`hl_map_new()` called with 0
+  args where the runtime now takes a destructor pointer (garbage
+  function pointer → segfault); `hl_map_get` (removed symbol) called
+  with a boxed default. Now: `hl_list_new(ptr null)` / `hl_map_new(ptr
+  null)` (arena-mode contract) and `map.get_or` dispatches to the typed
+  getters `hl_map_get_i64/_f64/_bool` with defaults passed by value.
+- **`--opt-stats` crashed with a raw `TypeError` on any program with a
+  void function** (void returns emitted `args=[None]`; the optimiser
+  dereferenced it) — including three in-repo tests. Void returns now
+  emit an empty arg list.
+- **Statements after `return`/`break`/`continue` were lowered as live
+  code** — a second `return` silently REPLACED the first one's value in
+  the IR. The builder now stops lowering at a terminator, like the
+  interpreter.
+- **`list.pop()` on primitive lists leaked the element box** — the typed
+  pops (`hl_list_pop_i64/_f64/_bool`) are now used, mirroring the C
+  backend.
+- **The for-loop index `alloca` was not hoisted to the entry block** —
+  a `for` nested in a loop re-executed the alloca every outer iteration
+  (allocas are reclaimed only at function return → unbounded stack
+  growth). The index slot is pre-allocated via the binding pool.
+- **A never-typed argument in a non-final position** emitted
+  instructions after the terminator (invalid IR). Argument lowering now
+  stops when the block closes.
+- **IR `match` arms were stored as raw AST and never lowered** (side
+  effects silently dropped) — now a clean `--emit ir` unsupported error,
+  consistent with the enum-literal policy.
+- **DCE classified checked arithmetic (`binop`) and `list_get` as pure**
+  — a required panic could be erased; removed from the pure list.
+- **Copy propagation was a no-op** (it only recorded `t→t` copies but
+  the builder emits `v_*` dests); it now tracks `v_x = t_k` copies and
+  invalidates them on store.
+- **The IR for-loop compared against the snapshot length only** — a
+  shrinking list would be represented as an out-of-bounds `list_get`
+  panic; it now re-checks the current length every iteration like every
+  real backend.
+
+### Tools (11 fixes)
+
+- **hlfmt deleted every `#` comment** (`-w` silently destroyed user
+  documentation — the documented Stage 14 limitation). Comments are now
+  **preserved**: comment-only lines pass through verbatim (indent
+  kept), trailing comments are re-appended to their line; verified
+  idempotent + byte-safe (latin-1 pipeline) across all 156 repo files.
+- **hlfmt: spurious leading space** on every top-level line following an
+  `import` (indent-0 guard); **unary minus** formatted as a binary
+  operator (`let x: int = -5` → `let x: int =- 5`, `(-1)` → `(- 1`,
+  `return -x` → `return - x`); **`if !x` lost its space** (`if!x`).
+- **hls-lsp: the UTF-16 → byte column conversion returned code-point
+  indices** while the lexer counts bytes — hover/definition silently
+  failed after any non-ASCII text on the line. Now accumulates UTF-8
+  byte lengths (verified with accented + non-BMP input).
+- **hls-lsp: syntax-error diagnostics were always anchored at 0:0** —
+  now use the lexer-reported line/col.
+- **hls-pkg: `#` inside a string corrupted the entire manifest** (the
+  comment stripper ignored quotes; the string parser then swallowed
+  following lines). Comments are now stripped outside strings only;
+  string escapes are decoded; **bare list items** (`allowed = [IO, Fs]`)
+  were silently dropped — now collected with type conversion;
+  `hls-pkg add` **deleted unknown manifest sections** on round-trip —
+  now preserved; `_fmt_value` didn't escape backslashes (values grew on
+  every write).
+- **hls-pkg: `build` trusted the lockfile's package names unvalidated** —
+  a crafted `hls-pkg.lock` with `"name": "../outside"` could delete
+  files and plant symlinks outside `.hls-pkg-deps/`. Names are validated
+  before any path join (path traversal closed).
+- **hllint L002** false-positived on functions called only from struct
+  field defaults; **L010 (empty-impl) never fired** (justified by a
+  false claim that the parser rejects empty impls — it does not; the
+  rule is implemented now); **warning order was non-deterministic**
+  (set iteration) — now sorted.
+- **ll_validate false-rejected valid IR**: functions whose entry block
+  has no label (terminated initialised True at function start),
+  multi-line `switch` case lists, `br i1 <const>` conditions and
+  `tail call`/`musttail call` also bypassed the callee-existence check.
+- **hlbindgen silently dropped declarations containing function
+  pointers** — now emits a warning per skipped declaration.
+
+### stdlib (8 fixes)
+
+- **`json_stringify` emitted `inf`/`nan`** — invalid JSON per RFC 8259
+  §6 that no consumer (including `json_parse` itself) accepts; a single
+  `1e400` from an attacker corrupted the whole document. inf/NaN now
+  serialise as `null` (JavaScript `JSON.stringify` semantics).
+- **`json_parse` panicked on malformed input with RAW conversion
+  errors** (`"-"`, `"1e"`, `"9223372036854775808"` → `panic: cannot
+  convert string to int (at line 436)` — no JSON context or position).
+  The number scanner now validates digits/exponent/int64-range and every
+  error is a positioned `json parse error: ...`. New
+  **`json_parse_result(src) -> Result[JsonValue, str]`** — the
+  non-panicking entry point for untrusted input (json_parse keeps its
+  historic panic behaviour).
+- **`sanitize_path` accepted Windows-style backslash traversal**
+  (`..\..\etc\passwd` has no `..` segment when split on `/`) —
+  exploitable on Windows hosts. Backslashes are now rejected outright.
+- **`sanitize_sql_string` passed NUL bytes through** — C-string SQL
+  clients truncate at NUL (the classic `admin\0--` filter bypass).
+  Now rejected.
+- **`sanitize_command` missed the cmd.exe metacharacters `%` and `^`.**
+- **`base64_decode` accepted malformed padding**: data after padding
+  (`Zg==Zg==`), `=` in unpadded tails (`Zg=`, `Zm9vYQ=`) — phantom
+  bytes where Python's strict decoder rejects. All rejected now
+  (RFC 4648).
+- **`url_parse` panicked with a raw `to_int` error on a malformed port**
+  (`http://host:abc/`) and silently accepted negative/oversized ports —
+  ports are now validated (digits, 0–65535) with a URL-context error.
+- **`url_query_parse` created a phantom `""` key for empty segments**
+  (`&a=1&&b=2`); **`csv_parse` switched into quoted mode on a stray
+  mid-field quote**, swallowing delimiters for the rest of the row
+  (RFC 4180: quotes are only meaningful at field start).
+
+### Tests
+
+- 163 → **173 PASS / 0 FAIL**: +`feat_deep_scan5_json`,
+  +`feat_deep_scan5_stdlib` (differential), +`panic_float_inf_toint`
+  (differential, exit 101), +`fail_extern_effect_missing`,
+  +`fail_for_shadow`, +`fail_qmark_extra_variant`,
+  +`fail_qmark_err_and_none`.
+- Tooling verification: hlfmt idempotent across all 156 `.hls` files
+  (comments preserved); `lsp_smoke.py` all assertions pass.
+
 ## [v0.19.0-alpha] — Stage 8-beta: END OF ARENA — refcounted runtime & ownership analysis
 
 ### Why this release exists — "the arena is gone"

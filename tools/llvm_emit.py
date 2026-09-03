@@ -130,11 +130,14 @@ declare i64      @hl_mod_i64(i64, i64)
 declare i64      @hl_float_to_int(double)           ; range-checked
 
 ; dynamic list (boxed elements)
-declare ptr      @hl_list_new()
+declare ptr      @hl_list_new(ptr)               ; (elem_free) — arena mode passes null
 declare void     @hl_list_push(ptr, ptr)
 declare ptr      @hl_list_get(ptr, i64)
 declare void     @hl_list_set(ptr, i64, ptr)
 declare ptr      @hl_list_pop(ptr)
+declare i64     @hl_list_pop_i64(ptr)              ; pop + unbox + free the box
+declare double  @hl_list_pop_f64(ptr)
+declare i1      @hl_list_pop_bool(ptr)
 declare i64      @hl_list_len(ptr)
 declare ptr      @hl_range(i64, i64)
 
@@ -145,8 +148,11 @@ declare ptr      @hl_box_bool(i1)
 declare ptr      @hl_box_ptr(ptr)
 
 ; map[str, T]
-declare ptr      @hl_map_new()
-declare ptr      @hl_map_get(ptr, ptr, ptr)         ; (m, k, default) -> value or default
+declare ptr      @hl_map_new(ptr)                ; (val_free) — arena mode passes null
+declare i64     @hl_map_get_i64(ptr, ptr, i64)    ; (m, k, default) -> value or default
+declare double  @hl_map_get_f64(ptr, ptr, double)
+declare i1      @hl_map_get_bool(ptr, ptr, i1)
+declare ptr     @hl_map_borrow(ptr, ptr)           ; (m, k) -> stored value or null
 declare void     @hl_map_set(ptr, ptr, ptr)
 declare i1       @hl_map_has(ptr, ptr)
 declare i64      @hl_map_len(ptr)
@@ -437,6 +443,13 @@ class LLVMEmitter:
                 self._collect_bindings(s["body"], acc)
             elif k == "for":
                 acc.append((s["var"], s["vtype"]))
+                # BUG (deep-scan-5): the loop-index slot was NOT collected
+                # — a `for` nested in a loop re-executed its alloca every
+                # outer iteration; allocas are reclaimed only at function
+                # return, so the stack grew without bound. Pre-allocate it
+                # in the entry block like every other binding. The '#idx'
+                # suffix cannot collide with user identifiers.
+                acc.append((s["var"] + "#idx", "int"))
                 self._collect_bindings(s["body"], acc)
 
     def _get_slot(self, name: str, hls_ty: str) -> Tuple[str, str]:
@@ -564,8 +577,7 @@ class LLVMEmitter:
             return
         len_val = self._fresh("len")
         self._emit("  %s = call i64 @hl_list_len(ptr %s)" % (len_val, iter_val))
-        i_slot = self._fresh("i")
-        self._emit("  %s = alloca i64" % i_slot)
+        i_slot, _ = self._get_slot(stmt["var"] + "#idx", "int")
         self._emit("  store i64 0, ptr %s" % i_slot)
         # Loop variable slot (hoisted; vtype is the element type).
         v_slot, v_ty = self._get_slot(stmt["var"], stmt["vtype"])
@@ -693,7 +705,8 @@ class LLVMEmitter:
             return (hls_type_to_llvm(et), unboxed)
         if k == "listlit":
             tmp = self._fresh("lst")
-            self._emit("  %s = call ptr @hl_list_new()" % tmp)
+            # Arena-mode contract: elem_free = null (never release items).
+            self._emit("  %s = call ptr @hl_list_new(ptr null)" % tmp)
             # Box each element by the (checker-annotated) element type.
             list_t = e.get("t", "list[int]")
             elem_t = _list_elem(list_t) if _is_list(list_t) else "int"
@@ -988,7 +1001,15 @@ class LLVMEmitter:
         functions (same dispatch as the C backend's gen_call)."""
         name = e["name"]
         rc = e.get("rc")  # ("builtin", name) or ("user", name) — set by the checker
-        arg_pairs = [self._lower_expr_typed(a) for a in e["args"]]
+        # BUG (deep-scan-5): a never-typed argument (e.g. panic()) in a
+        # non-final position closed the block; the remaining args were
+        # still lowered, emitting instructions AFTER the terminator.
+        # Stop lowering as soon as the block closes.
+        arg_pairs = []
+        for a in e["args"]:
+            if self._cur_block is None:
+                break
+            arg_pairs.append(self._lower_expr_typed(a))
         if self._cur_block is None:
             return ("void", "0")
 
@@ -1063,7 +1084,8 @@ class LLVMEmitter:
             return self._call1("ptr", "@hl_range", ["i64", "i64"], arg_pairs)
         if name == "map_new":
             tmp = self._fresh("map")
-            self._emit("  %s = call ptr @hl_map_new()" % tmp)
+            # Arena-mode contract: val_free = null (never release values).
+            self._emit("  %s = call ptr @hl_map_new(ptr null)" % tmp)
             return ("ptr", tmp)
         if name == "read_file":
             return self._call1("ptr", "@hl_read_file", ["ptr"], arg_pairs)
@@ -1137,7 +1159,13 @@ class LLVMEmitter:
         recv_ty, recv = self._lower_expr_typed(e["target"])
         if self._cur_block is None:
             return ("i64", "0")
-        arg_pairs = [self._lower_expr_typed(a) for a in e["args"]]
+        # BUG (deep-scan-5): stop lowering args once a never-typed
+        # argument closes the block (see _lower_call_typed).
+        arg_pairs = []
+        for a in e["args"]:
+            if self._cur_block is None:
+                break
+            arg_pairs.append(self._lower_expr_typed(a))
         if self._cur_block is None:
             return ("i64", "0")
         recv_t = e["target"].get("t", "int")
@@ -1228,11 +1256,25 @@ class LLVMEmitter:
                     recv, idx, boxed))
                 return ("void", "0")
             if op == "list.pop":
+                # BUG (deep-scan-5): plain pop + unbox leaks the primitive
+                # box. Use the typed pops, which free the box after
+                # unboxing (mirrors the C backend's dispatch).
+                if elem_t == "int":
+                    tmp = self._fresh("pop")
+                    self._emit("  %s = call i64 @hl_list_pop_i64(ptr %s)" % (tmp, recv))
+                    return ("i64", tmp)
+                if elem_t == "float":
+                    tmp = self._fresh("pop")
+                    self._emit("  %s = call double @hl_list_pop_f64(ptr %s)" % (tmp, recv))
+                    return ("double", tmp)
+                if elem_t == "bool":
+                    tmp = self._fresh("pop")
+                    self._emit("  %s = call i1 @hl_list_pop_bool(ptr %s)" % (tmp, recv))
+                    return ("i1", tmp)
                 tmp = self._fresh("e")
                 self._emit("  %s = call ptr @hl_list_pop(ptr %s)" % (tmp, recv))
                 ret_t = e.get("t", elem_t)
-                unboxed = self._unbox_value(ret_t, tmp)
-                return (hls_type_to_llvm(ret_t), unboxed)
+                return (hls_type_to_llvm(ret_t), tmp)
             _unsupported("method '%s'" % op, e)
 
         # ---- map.* (boxed value ABI) ----
@@ -1248,15 +1290,45 @@ class LLVMEmitter:
                     recv, k, boxed))
                 return ("void", "0")
             if op == "map.get_or":
+                # BUG (deep-scan-5): the old code called hl_map_get(m, k,
+                # boxed-default) — a runtime symbol that no longer exists
+                # (the C runtime now has typed getters with defaults passed
+                # BY VALUE). Dispatch to the typed getter, mirroring the C
+                # backend. (The LLVM backend is arena-mode, so pointer-
+                # valued maps use the typed getters' borrow semantics —
+                # hl_map_get_own is refcount-specific.)
                 k = self._coerce(arg_pairs[0][0], arg_pairs[0][1], "ptr")
                 vty, d = arg_pairs[1]
-                boxed = self._box_value(val_t, vty, d)
+                if val_t == "int":
+                    dv = self._coerce(vty, d, "i64")
+                    tmp = self._fresh("gv")
+                    self._emit("  %s = call i64 @hl_map_get_i64(ptr %s, ptr %s, i64 %s)" % (
+                        tmp, recv, k, dv))
+                    return ("i64", tmp)
+                if val_t == "float":
+                    dv = self._coerce(vty, d, "double")
+                    tmp = self._fresh("gv")
+                    self._emit("  %s = call double @hl_map_get_f64(ptr %s, ptr %s, double %s)" % (
+                        tmp, recv, k, dv))
+                    return ("double", tmp)
+                if val_t == "bool":
+                    dv = self._coerce(vty, d, "i1")
+                    tmp = self._fresh("gv")
+                    self._emit("  %s = call i1 @hl_map_get_bool(ptr %s, ptr %s, i1 %s)" % (
+                        tmp, recv, k, dv))
+                    return ("i1", tmp)
+                # Pointer-valued map: use the generic borrow lookup via
+                # hl_map_has + hl_map_get_own is refcount-specific; the
+                # arena contract lets us reuse hl_map_borrow.
                 tmp = self._fresh("gv")
-                self._emit("  %s = call ptr @hl_map_get(ptr %s, ptr %s, ptr %s)" % (
-                    tmp, recv, k, boxed))
+                self._emit("  %s = call ptr @hl_map_borrow(ptr %s, ptr %s)" % (tmp, recv, k))
                 ret_t = e.get("t", val_t)
-                unboxed = self._unbox_value(ret_t, tmp)
-                return (hls_type_to_llvm(ret_t), unboxed)
+                cmp_tmp = self._fresh("gvnull")
+                self._emit("  %s = icmp ne ptr %s, null" % (cmp_tmp, tmp))
+                d2 = self._coerce(vty, d, "ptr")
+                sel = self._fresh("gvsel")
+                self._emit("  %s = select i1 %s, ptr %s, ptr %s" % (sel, cmp_tmp, tmp, d2))
+                return (hls_type_to_llvm(ret_t), sel)
             if op == "map.has":
                 k = self._coerce(arg_pairs[0][0], arg_pairs[0][1], "ptr")
                 tmp = self._fresh("has")

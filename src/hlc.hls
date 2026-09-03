@@ -2463,6 +2463,12 @@ fn check_stmt(ctx: Ctx, env: list[map[str, Binding]], cur: str, f: FnInfo, sidx:
         }
         let snap: list[str] = snapshot_moved(env)
         env.push(map_new())
+        # BUG (deep-scan-5): the `let` branch rejects shadowing but the
+        # `for` branch never checked — a loop variable could silently
+        # shadow an outer binding (SPEC §4: no shadowing).
+        if lookup_exists(env, s.name) {
+            cerr(s.line, "cannot shadow outer variable with the loop variable: " + s.name)
+        }
         env.get(env.len() - 1).set(s.name, Binding { t: elem, is_mut: false, moved: false })
         check_stmts(ctx, env, cur, f, s.body, true)
         env.pop()
@@ -3784,25 +3790,45 @@ fn check_qmark(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, expecte
     let mut err_v: str = ""
     let mut ok_v: str = ""
     let mut ok_payload: str = ""
+    let mut err_candidates: int = 0
     let mut vi: int = 0
     while vi < en.variants.len() {
         let v: str = en.variants.get(vi)
         let pl: list[str] = en.payloads.get(vi)
+        let mut matched: bool = false
         if v == "Err" && pl.len() == 1 {
             err_v = v
+            err_candidates = err_candidates + 1
+            matched = true
         }
         if v == "None" && pl.len() == 0 {
             err_v = v
+            err_candidates = err_candidates + 1
+            matched = true
         }
         if v == "Ok" && pl.len() == 1 {
             ok_v = v
             ok_payload = pl.get(0)
+            matched = true
         }
         if v == "Some" && pl.len() == 1 {
             ok_v = v
             ok_payload = pl.get(0)
+            matched = true
+        }
+        # BUG (deep-scan-5): a third variant beyond the ok/err pair can
+        # match NEITHER arm at runtime — the generated code would read
+        # garbage union bytes. Reject at check time.
+        if !matched {
+            cerr(ctx.exprs[e].line, "? operator requires enum " + ename + " to have exactly the ok variant (Ok/Some) and error variant (Err/None); found extra variant '" + v + "'")
         }
         vi = vi + 1
+    }
+    # BUG (deep-scan-5): declaring BOTH 'Err' and 'None' is ambiguous —
+    # the scan silently keeps only the last one and `?` on the other
+    # panics at runtime. Reject the ambiguity.
+    if err_candidates > 1 {
+        cerr(ctx.exprs[e].line, "? operator requires enum " + ename + " to declare EITHER 'Err' OR 'None' as its error variant, not both")
     }
     if err_v == "" {
         cerr(ctx.exprs[e].line, "? operator requires enum " + ename + " to have an 'Err' (1 payload) or 'None' variant")
@@ -3866,6 +3892,21 @@ fn check_qmark(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, expecte
     return success_t
 }
 
+# callee_effect_list: the effect REQUIREMENT contributed by a callee —
+# builtin table for "b:" nodes, the extern's DECLARED effects for extern
+# fns (they have no body, so their computed set is always empty — the
+# declared set IS the requirement), otherwise the computed fixpoint set.
+fn callee_effect_list(ctx: Ctx, c: str, eff: map[str, list[str]]) -> list[str] {
+    if c.starts_with("b:") {
+        return builtin_effect(c.slice(2, c.len()))
+    }
+    let cf: FnInfo = ctx.fns.get_or(c, dummy_fn())
+    if cf.is_extern {
+        return cf.effects
+    }
+    return eff.get_or(c, [])
+}
+
 fn check_effects(ctx: Ctx) -> void {
     # Stage 9-alpha: fine-grained effects & capabilities.
     # eff[key] = computed list of effects the body of `key` requires.
@@ -3890,12 +3931,7 @@ fn check_effects(ctx: Ctx) -> void {
             let mut j: int = 0
             while j < edges.len() {
                 let c: str = edges.get(j)
-                let mut new_eff: list[str] = []
-                if c.starts_with("b:") {
-                    new_eff = builtin_effect(c.slice(2, c.len()))
-                } else {
-                    new_eff = eff.get_or(c, [])
-                }
+                let mut new_eff: list[str] = callee_effect_list(ctx, c, eff)
                 let mut k: int = 0
                 while k < new_eff.len() {
                     if effects_add(eff, key, new_eff.get(k)) {
@@ -3935,12 +3971,7 @@ fn check_effects(ctx: Ctx) -> void {
             let mut found: bool = false
             while j2 < edges.len() && !found {
                 let c: str = edges.get(j2)
-                let mut c_eff: list[str] = []
-                if c.starts_with("b:") {
-                    c_eff = builtin_effect(c.slice(2, c.len()))
-                } else {
-                    c_eff = eff.get_or(c, [])
-                }
+                let mut c_eff: list[str] = callee_effect_list(ctx, c, eff)
                 if c_eff.len() > 0 {
                     let mut nm: str = c
                     if c.starts_with("b:") {
@@ -3973,12 +4004,7 @@ fn check_effects(ctx: Ctx) -> void {
                 let mut j2: int = 0
                 while j2 < edges.len() && !found_violation {
                     let c: str = edges.get(j2)
-                    let mut c_eff: list[str] = []
-                    if c.starts_with("b:") {
-                        c_eff = builtin_effect(c.slice(2, c.len()))
-                    } else {
-                        c_eff = eff.get_or(c, [])
-                    }
+                    let mut c_eff: list[str] = callee_effect_list(ctx, c, eff)
                     if list_has(c_eff, ce) {
                         let mut nm: str = c
                         if c.starts_with("b:") {
@@ -4610,7 +4636,9 @@ fn runtime_lines() -> list[str] {
     r.push("// silently truncate out-of-range floats; we panic instead so the")
     r.push("// error points to the actual source of the bad value.")
     r.push("static int64_t hl_float_to_int(double v) {")
-    r.push("    if (v < -9.2233720368547758e18 || v > 9.2233720368547757e18)")
+    r.push("    // NaN fails BOTH comparisons, so an explicit isnan check is")
+    r.push("    // required — otherwise the cast below is undefined behaviour.")
+    r.push("    if (isnan(v) || v < -9.2233720368547758e18 || v > 9.2233720368547757e18)")
     r.push("        hl_die(\"float.to_int out of int64 range\");")
     r.push("    return (int64_t)v;")
     r.push("}")

@@ -237,8 +237,12 @@ class HLSServer:
             except HLError:
                 pass  # Keep the program; checker errors go to diagnostics.
         except HLError as ex:
-            # Store the error for diagnostics.
-            program = {"_error": str(ex)}
+            # Store the error for diagnostics. BUG (deep-scan-5): only the
+            # message was kept, so every syntax error was anchored at
+            # 0:0 even when the lexer reported a real line/col.
+            program = {"_error": str(ex),
+                       "_error_line": getattr(ex, "line", 0),
+                       "_error_col": getattr(ex, "col", 0)}
         self.docs[uri] = {"version": version, "text": text, "program": program}
 
     def _publish_diagnostics(self, uri):
@@ -250,10 +254,15 @@ class HLSServer:
         if prog is None:
             return
         if "_error" in prog:
-            # Syntax error.
+            # Syntax error. Use the lexer-reported position when present
+            # (BUG deep-scan-5: previously always 0:0).
+            el = prog.get("_error_line", 0)
+            ec = prog.get("_error_col", 0)
+            eline = el - 1 if el > 0 else 0
+            echar = ec - 1 if ec > 0 else 0
             diagnostics.append({
-                "range": {"start": {"line": 0, "character": 0},
-                          "end": {"line": 0, "character": 1}},
+                "range": {"start": {"line": eline, "character": echar},
+                          "end": {"line": eline, "character": echar + 1}},
                 "severity": 1,
                 "source": "hls-checker",
                 "message": prog["_error"],
@@ -283,18 +292,41 @@ class HLSServer:
         """Convert an LSP UTF-16 `character` offset on a 0-indexed line to
         a 0-based BYTE offset in that line (the lexer's columns are
         byte-based). BUG-DS4-20: positions were previously compared as if
-        UTF-16 units were bytes, so any identifier preceded by non-ASCII
-        text on the same line could not be hovered/defined."""
+        UTF-16 units were bytes. BUG (deep-scan-5): the previous fix
+        returned the CODE-POINT index, still desynchronising by one byte
+        per non-ASCII code point (the lexer counts BYTES). Accumulate
+        UTF-8 byte lengths instead."""
         lines = text.split("\n")
         if line0 < 0 or line0 >= len(lines):
             return col16
-        line_text = lines[line0]
+        line_bytes = lines[line0].encode("utf-8")
         units = 0
-        for i, ch in enumerate(line_text):
+        bi = 0
+        n = len(line_bytes)
+        while bi < n:
             if units >= col16:
-                return i
-            units += 2 if ord(ch) > 0xFFFF else 1
-        return len(line_text)
+                return bi
+            b = line_bytes[bi]
+            if b < 0x80:
+                width = 1
+            elif b < 0xE0:
+                width = 2
+                units += 1
+                bi += width
+                continue
+            elif b < 0xF0:
+                width = 3
+                units += 1
+                bi += width
+                continue
+            else:
+                width = 4
+                units += 2
+                bi += width
+                continue
+            units += 1
+            bi += 1
+        return n
 
     def _doc_program(self, doc):
         """Return the parsed program of a doc, or None if the doc is

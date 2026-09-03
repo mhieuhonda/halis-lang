@@ -115,7 +115,7 @@ make bootstrap
 # 3. Compile your program to a native binary
 make run F=examples/primes.hls
 
-# 4. Run the full test suite (163 tests: types, effects, ownership, taint,
+# 4. Run the full test suite (173 tests: types, effects, ownership, taint,
 #    differential, bootstrap determinism, LLVM IR, memory-stress RSS check)
 make test
 
@@ -297,7 +297,7 @@ Full details: [SPEC.md](SPEC.md) · Stage-by-stage roadmap:
   (str / list / map / struct / enum / tainted) via per-instantiation
   helpers. The memory-stress acceptance test runs 500k allocation rounds
   with **RSS delta = 0**, enforced under a 256 MB `ulimit -v` in the
-  test suite. **163/163 tests PASS**.
+  test suite. **163/173 tests PASS**.
 - 🔄 **Stage 9-alpha — Fine-grained effects & capabilities** (v0.5.0-alpha):
   Single `IO` effect split into five — `IO`, `Fs`, `Clock`, `Args`, `Exit`.
   `uses` clause now accepts a comma-separated list; `uses IO` is a
@@ -346,7 +346,7 @@ Full details: [SPEC.md](SPEC.md) · Stage-by-stage roadmap:
 ## Contributing
 
 Every contribution must preserve the core guarantees and pass
-`make test` (163 tests, including differential testing of the two
+`make test` (173 tests, including differential testing of the two
 implementations). Every new feature must first be used inside `hlc` itself —
 the compiler is always the first customer of the language.
 

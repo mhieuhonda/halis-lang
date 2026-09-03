@@ -87,15 +87,14 @@ def parse_manifest(path: str) -> Dict:
         raise FileNotFoundError("manifest not found: %s" % path)
     with open(path, "r") as f:
         src = f.read()
-    # Strip comments.
+    # Strip comments — only OUTSIDE strings.
+    # BUG (deep-scan-5): the old code stripped everything after the first
+    # `#` on a line regardless of quotes, so `name = "demo # 1"` silently
+    # corrupted the manifest (the string parser then swallowed subsequent
+    # lines looking for a closing quote, garbling every following key).
     lines = []
     for line in src.split("\n"):
-        # Strip everything after `#` (not inside strings, but our parser
-        # is simple enough that this is fine for manifests without `#` in
-        # string values).
-        if "#" in line:
-            line = line[:line.index("#")]
-        lines.append(line)
+        lines.append(_strip_toml_comment(line))
     src = "\n".join(lines)
 
     # Parse into a tree of section -> key -> value.
@@ -137,6 +136,37 @@ def parse_manifest(path: str) -> Dict:
     return result
 
 
+def _strip_toml_comment(line: str) -> str:
+    """Strip a `#` comment, but only OUTSIDE double-quoted strings."""
+    out = []
+    in_str = False
+    i = 0
+    n = len(line)
+    while i < n:
+        c = line[i]
+        if in_str:
+            if c == '\\' and i + 1 < n:
+                out.append(c)
+                out.append(line[i + 1])
+                i += 2
+                continue
+            if c == '"':
+                in_str = False
+            out.append(c)
+            i += 1
+            continue
+        if c == '"':
+            in_str = True
+            out.append(c)
+            i += 1
+            continue
+        if c == '#':
+            break
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
 def _parse_value(src: str, i: int) -> Tuple[object, int]:
     """Parse a TOML value starting at position i. Returns (value, new_i)."""
     n = len(src)
@@ -147,32 +177,85 @@ def _parse_value(src: str, i: int) -> Tuple[object, int]:
         return None, i
     c = src[i]
     if c == '"':
-        # String.
+        # String (with escape decoding — BUG deep-scan-5: escapes were
+        # never decoded, so `say \"hi\"` round-tripped with literal
+        # backslashes and write_manifest grew them on every pass).
         j = i + 1
+        out = []
         while j < n and src[j] != '"':
-            if src[j] == '\\':
+            if src[j] == '\\' and j + 1 < n:
+                nxt = src[j + 1]
+                if nxt == 'n':
+                    out.append('\n')
+                elif nxt == 't':
+                    out.append('\t')
+                elif nxt == 'r':
+                    out.append('\r')
+                else:
+                    out.append(nxt)
                 j += 2
             else:
+                out.append(src[j])
                 j += 1
-        return src[i + 1:j], j + 1
+        return "".join(out), j + 1
     if c == '[':
-        # List (of strings).
+        # List of strings / bare tokens.
+        # BUG (deep-scan-5): bare items (IO, Fs, integers) were consumed
+        # char-by-char and silently DROPPED — `allowed = [IO, Fs]` parsed
+        # to an empty list. Collect them with type conversion, mirroring
+        # the bare-token branch below.
         j = i + 1
         items = []
         while j < n and src[j] != ']':
             while j < n and src[j] in " \t\r\n,":
                 j += 1
-            if j < n and src[j] == '"':
+            if j >= n or src[j] == ']':
+                break
+            if src[j] == '"':
                 k = j + 1
+                out = []
                 while k < n and src[k] != '"':
-                    if src[k] == '\\':
+                    if src[k] == '\\' and k + 1 < n:
+                        nxt = src[k + 1]
+                        if nxt == 'n':
+                            out.append('\n')
+                        elif nxt == 't':
+                            out.append('\t')
+                        elif nxt == 'r':
+                            out.append('\r')
+                        else:
+                            out.append(nxt)
                         k += 2
                     else:
+                        out.append(src[k])
                         k += 1
-                items.append(src[j + 1:k])
+                items.append("".join(out))
                 j = k + 1
             else:
-                j += 1
+                k = j
+                while k < n and src[k] not in " \t\r\n,]":
+                    k += 1
+                tok = src[j:k]
+                if tok:
+                    if tok == "true":
+                        items.append(True)
+                    elif tok == "false":
+                        items.append(False)
+                    else:
+                        try:
+                            items.append(int(tok))
+                            j = k
+                            continue
+                        except ValueError:
+                            pass
+                        try:
+                            items.append(float(tok))
+                            j = k
+                            continue
+                        except ValueError:
+                            pass
+                        items.append(tok)
+                j = k
         return items, j + 1
     if c == '{':
         # Inline table.
@@ -209,30 +292,42 @@ def _parse_value(src: str, i: int) -> Tuple[object, int]:
 
 
 def write_manifest(manifest: Dict, path: str):
-    """Write a manifest dict as TOML."""
+    """Write a manifest dict as TOML.
+
+    BUG (deep-scan-5): previously only [package]/[dependencies]/[effects]
+    were written — `hls-pkg add` silently DELETED any other section the
+    user had (e.g. [features]). Round-trip unknown sections too.
+    """
+    known = ["package", "dependencies", "effects"]
     lines = []
-    if "package" in manifest:
-        lines.append("[package]")
-        for k, v in manifest["package"].items():
-            lines.append('%s = %s' % (k, _fmt_value(v)))
+    for section in known:
+        if section in manifest:
+            lines.append("[%s]" % section)
+            for k, v in manifest[section].items():
+                lines.append('%s = %s' % (k, _fmt_value(v)))
+            lines.append("")
+    # Preserve unknown sections (round-trip).
+    for section, v in manifest.items():
+        if section in known or not isinstance(v, dict):
+            continue
+        lines.append("[%s]" % section)
+        for k, vv in v.items():
+            lines.append('%s = %s' % (k, _fmt_value(vv)))
         lines.append("")
-    if "dependencies" in manifest:
-        lines.append("[dependencies]")
-        for k, v in manifest["dependencies"].items():
-            lines.append('%s = %s' % (k, _fmt_value(v)))
-        lines.append("")
-    if "effects" in manifest:
-        lines.append("[effects]")
-        for k, v in manifest["effects"].items():
-            lines.append('%s = %s' % (k, _fmt_value(v)))
-        lines.append("")
+    # Preserve top-level scalar keys.
+    for k, v in manifest.items():
+        if isinstance(v, dict):
+            continue
+        lines.append('%s = %s' % (k, _fmt_value(v)))
     with open(path, "w") as f:
         f.write("\n".join(lines))
 
 
 def _fmt_value(v) -> str:
     if isinstance(v, str):
-        return '"%s"' % v.replace('"', '\\"')
+        # BUG (deep-scan-5): backslashes were not escaped, so a value
+        # containing one grew a backslash on every write/parse round-trip.
+        return '"%s"' % v.replace('\\', '\\\\').replace('"', '\\"')
     if isinstance(v, bool):
         return "true" if v else "false"
     if isinstance(v, int):
@@ -670,6 +765,16 @@ def cmd_build(args):
                 # entry imports the dependency by its manifest NAME —
                 # e.g. `strlib = { path = "std/str.hls" }` must be
                 # importable as `import "strlib.hls"`.
+                # BUG (deep-scan-5): the lockfile is a shared/committed
+                # file — a crafted "name" like "../outside" would delete
+                # files and plant symlinks OUTSIDE .hls-pkg-deps/. The
+                # `lock` path validates names; `build` trusted the
+                # lockfile blindly. Validate before any path join.
+                try:
+                    _validate_dep_name(pkg["name"])
+                except ValueError as ex:
+                    print("error: lockfile contains %s" % ex, file=sys.stderr)
+                    return 1
                 dst = os.path.join(deps_dir, pkg["name"] + ".hls")
                 try:
                     if os.path.islink(dst) or os.path.exists(dst):

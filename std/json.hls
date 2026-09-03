@@ -10,6 +10,8 @@
 # and the corresponding field holds the value.
 # ============================================================================
 
+import "std.result"
+
 struct JsonValue {
     kind: str,
     bval: bool,
@@ -145,11 +147,18 @@ fn json_object_has(obj: JsonValue, key: str) -> bool {
 struct JsonParser {
     src: str,
     pos: int,
-    line: int
+    line: int,
+    err: str
 }
 
 fn jsonp_err(p: JsonParser, msg: str) -> void {
-    panic("json parse error: " + msg + " (at line " + p.line.to_str() + ", offset " + p.pos.to_str() + ")")
+    # BUG (deep-scan-5): json_parse used to panic on malformed input —
+    # per the language's own error model ("panic is reserved for
+    # programming bugs", std/result.hls) malformed EXTERNAL data must be
+    # a Result.Err. jsonp_err now RECORDS the error; json_parse preserves
+    # its historic panic behaviour for compatibility, and the new
+    # json_parse_result returns the error.
+    p.err = "json parse error: " + msg + " (at line " + p.line.to_str() + ", offset " + p.pos.to_str() + ")"
 }
 
 fn jsonp_skip_ws(p: JsonParser) -> void {
@@ -168,10 +177,14 @@ fn jsonp_skip_ws(p: JsonParser) -> void {
 }
 
 fn jsonp_parse_value(p: JsonParser) -> JsonValue {
+    if p.err != "" {
+        return json_null()
+    }
     jsonp_skip_ws(p)
     let n: int = p.src.len()
     if p.pos >= n {
         jsonp_err(p, "unexpected end of input")
+        return json_null()
     }
     let c: int = p.src.byte_at(p.pos)
     # double-quoted string
@@ -208,10 +221,12 @@ fn jsonp_parse_keyword(p: JsonParser, word: str, val: JsonValue) -> JsonValue {
     let n: int = word.len()
     if p.pos + n > p.src.len() {
         jsonp_err(p, "expected keyword '" + word + "'")
+        return val
     }
     let s: str = p.src.slice(p.pos, p.pos + n)
     if s != word {
         jsonp_err(p, "expected keyword '" + word + "'")
+        return val
     }
     p.pos = p.pos + n
     return val
@@ -282,6 +297,7 @@ fn jsonp_parse_string(p: JsonParser) -> JsonValue {
             p.pos = p.pos + 1
             if p.pos >= n {
                 jsonp_err(p, "unterminated string escape")
+                return json_null()
             }
             let e: int = p.src.byte_at(p.pos)
             if e == 110 {
@@ -308,10 +324,12 @@ fn jsonp_parse_string(p: JsonParser) -> JsonValue {
                     p.pos = p.pos + 1
                     if p.pos >= n {
                         jsonp_err(p, "incomplete \\u escape")
+                        return json_null()
                     }
                     let hd: int = json_hex_digit(p.src.byte_at(p.pos))
                     if hd < 0 {
                         jsonp_err(p, "invalid hex digit in \\u escape")
+                        return json_null()
                     }
                     code = code * 16 + hd
                     k = k + 1
@@ -339,6 +357,7 @@ fn jsonp_parse_string(p: JsonParser) -> JsonValue {
                         while k2 < 4 {
                             if p.pos >= n {
                                 jsonp_err(p, "incomplete low surrogate \\u escape")
+                                return json_null()
                             }
                             let hd2: int = json_hex_digit(p.src.byte_at(p.pos))
                             if hd2 < 0 {
@@ -384,9 +403,11 @@ fn jsonp_parse_number(p: JsonParser) -> JsonValue {
     let start: int = p.pos
     let n: int = p.src.len()
     let mut is_float: bool = false
-    if p.pos < n && p.src.byte_at(p.pos) == 45 {
+    let neg: bool = p.pos < n && p.src.byte_at(p.pos) == 45
+    if neg {
         p.pos = p.pos + 1
     }
+    let int_start: int = p.pos
     while p.pos < n {
         let c: int = p.src.byte_at(p.pos)
         if c >= 48 && c <= 57 {
@@ -394,6 +415,14 @@ fn jsonp_parse_number(p: JsonParser) -> JsonValue {
         } else {
             break
         }
+    }
+    let int_digits: int = p.pos - int_start
+    let mut exp_start: int = -1
+    if int_digits == 0 {
+        # BUG (deep-scan-5): "-" alone reached to_int() and panicked with
+        # a raw "cannot convert string to int" (no JSON context/position).
+        jsonp_err(p, "invalid number (no digits)")
+        return json_int(0)
     }
     if p.pos < n && p.src.byte_at(p.pos) == 46 {
         is_float = true
@@ -419,6 +448,9 @@ fn jsonp_parse_number(p: JsonParser) -> JsonValue {
                     p.pos = p.pos + 1
                 }
             }
+            # BUG (deep-scan-5): "1e" / "1e+" reached to_float() and
+            # panicked with a raw conversion error. Require digits.
+            exp_start = p.pos
             while p.pos < n {
                 let c2: int = p.src.byte_at(p.pos)
                 if c2 >= 48 && c2 <= 57 {
@@ -429,9 +461,44 @@ fn jsonp_parse_number(p: JsonParser) -> JsonValue {
             }
         }
     }
+    if is_float && p.err == "" && exp_start >= 0 {
+        # An exponent was scanned: the first char after e[+-] must be a
+        # digit ("1e" / "1e+" are malformed). exp_start can be == n when
+        # the input ends right after 'e' — bounds-check first.
+        if exp_start >= p.src.len() {
+            jsonp_err(p, "invalid number (exponent has no digits)")
+            return json_int(0)
+        }
+        if p.src.byte_at(exp_start) < 48 || p.src.byte_at(exp_start) > 57 {
+            jsonp_err(p, "invalid number (exponent has no digits)")
+            return json_int(0)
+        }
+    }
     let text: str = p.src.slice(start, p.pos)
     if is_float {
         return json_float(text.to_float())
+    }
+    # BUG (deep-scan-5): "9223372036854775808" reached to_int() and
+    # panicked with a raw "integer too large" (no JSON context/position).
+    # Range-check by length + lexicographic comparison (same-length
+    # digit strings compare numerically as bytes).
+    let digits: str = p.src.slice(int_start, p.pos)
+    if digits.len() > 19 {
+        jsonp_err(p, "integer out of int64 range")
+        return json_int(0)
+    }
+    if digits.len() == 19 {
+        if neg {
+            if digits > "9223372036854775808" {
+                jsonp_err(p, "integer out of int64 range")
+                return json_int(0)
+            }
+        } else {
+            if digits > "9223372036854775807" {
+                jsonp_err(p, "integer out of int64 range")
+                return json_int(0)
+            }
+        }
     }
     return json_int(text.to_int())
 }
@@ -444,12 +511,16 @@ fn jsonp_parse_array(p: JsonParser) -> JsonValue {
         p.pos = p.pos + 1
         return json_array(items)
     }
-    while true {
+    while p.err == "" {
         let v: JsonValue = jsonp_parse_value(p)
+        if p.err != "" {
+            break
+        }
         items.push(v)
         jsonp_skip_ws(p)
         if p.pos >= p.src.len() {
             jsonp_err(p, "unterminated array")
+            break
         }
         let c: int = p.src.byte_at(p.pos)
         if c == 44 {
@@ -459,6 +530,7 @@ fn jsonp_parse_array(p: JsonParser) -> JsonValue {
             return json_array(items)
         } else {
             jsonp_err(p, "expected ',' or ']' in array")
+            break
         }
     }
     return json_array(items)
@@ -473,27 +545,37 @@ fn jsonp_parse_object(p: JsonParser) -> JsonValue {
         p.pos = p.pos + 1
         return json_object(keys, vals)
     }
-    while true {
+    while p.err == "" {
         jsonp_skip_ws(p)
         if p.pos >= p.src.len() {
             jsonp_err(p, "unterminated object")
+            break
         }
         if p.src.byte_at(p.pos) != 34 {
             jsonp_err(p, "expected string key in object")
+            break
         }
         let key_val: JsonValue = jsonp_parse_string(p)
+        if p.err != "" {
+            break
+        }
         let key: str = key_val.sval
         jsonp_skip_ws(p)
         if p.pos >= p.src.len() || p.src.byte_at(p.pos) != 58 {
             jsonp_err(p, "expected ':' after object key")
+            break
         }
         p.pos = p.pos + 1
         let v: JsonValue = jsonp_parse_value(p)
+        if p.err != "" {
+            break
+        }
         keys.push(key)
         vals.push(v)
         jsonp_skip_ws(p)
         if p.pos >= p.src.len() {
             jsonp_err(p, "unterminated object")
+            break
         }
         let c: int = p.src.byte_at(p.pos)
         if c == 44 {
@@ -503,6 +585,7 @@ fn jsonp_parse_object(p: JsonParser) -> JsonValue {
             return json_object(keys, vals)
         } else {
             jsonp_err(p, "expected ',' or '}' in object")
+            break
         }
     }
     return json_object(keys, vals)
@@ -510,13 +593,38 @@ fn jsonp_parse_object(p: JsonParser) -> JsonValue {
 
 # json_parse(src) parses a JSON document and returns the root JsonValue.
 fn json_parse(src: str) -> JsonValue {
-    let p: JsonParser = JsonParser { src: src, pos: 0, line: 1 }
+    let p: JsonParser = JsonParser { src: src, pos: 0, line: 1, err: "" }
     let v: JsonValue = jsonp_parse_value(p)
-    jsonp_skip_ws(p)
-    if p.pos != p.src.len() {
-        jsonp_err(p, "trailing data after JSON value")
+    if p.err == "" {
+        jsonp_skip_ws(p)
+        if p.pos != p.src.len() {
+            jsonp_err(p, "trailing data after JSON value")
+        }
+    }
+    if p.err != "" {
+        # Historic behaviour (v0.3+): malformed documents panic with the
+        # parse error. Use json_parse_result for the non-panicking form.
+        panic(p.err)
     }
     return v
+}
+
+# json_parse_result(src) parses a JSON document WITHOUT panicking:
+# malformed input returns Result.Err with a positioned message (the
+# recommended entry point for untrusted input — Stage deep-scan-5).
+fn json_parse_result(src: str) -> Result[JsonValue, str] {
+    let p: JsonParser = JsonParser { src: src, pos: 0, line: 1, err: "" }
+    let v: JsonValue = jsonp_parse_value(p)
+    if p.err == "" {
+        jsonp_skip_ws(p)
+        if p.pos != p.src.len() {
+            jsonp_err(p, "trailing data after JSON value")
+        }
+    }
+    if p.err != "" {
+        return Result.Err(p.err)
+    }
+    return Result.Ok(v)
 }
 
 # ============================================================================
@@ -598,6 +706,21 @@ fn json_stringify(v: JsonValue) -> str {
         return v.ival.to_str()
     }
     if v.kind == "float" {
+        # BUG (deep-scan-5): inf/NaN are FORBIDDEN in JSON (RFC 8259 §6) —
+        # emitting them produced a document no JSON consumer (including
+        # json_parse itself) accepts. Follow JavaScript's
+        # JSON.stringify: emit null.
+        let pinf: float = 1.0 / 0.0
+        if v.fval != v.fval {
+            # NaN
+            return "null"
+        }
+        if v.fval == pinf {
+            return "null"
+        }
+        if v.fval == -pinf {
+            return "null"
+        }
         # Trim trailing zeros from %.6f to look like JSON numbers when possible.
         let raw: str = v.fval.to_str()
         if raw.contains(".") {

@@ -224,15 +224,22 @@ def _copy_propagate(irf: HLIRFunction):
     """Replace `%t1 = %t0` uses with `%t0`."""
     for block in irf.blocks:
         # Map: SSA name -> canonical SSA name.
+        # BUG (deep-scan-5): this only recorded t1 = t0 copies, but the
+        # builder emits OP_LOAD with v_* dests — the pass was a no-op.
+        # Record v_x = t_k copies (temps are never store targets), and
+        # invalidate the mapping when v_x is reassigned.
         canon: Dict[str, str] = {}
         for ins in block.instrs:
             # Rewrite args first.
             ins.args = [_rewrite_arg(a, canon) for a in ins.args]
-            # If this is a copy `t1 = t0`, record the mapping.
+            if ins.op == OP_STORE and len(ins.args) >= 2 and ins.args[1][0] == "name":
+                # v_x is reassigned — later uses must see the new value.
+                canon.pop("v_" + ins.args[1][1], None)
+                continue
+            # If this is a copy `v_x = t_k`, record the mapping.
             if ins.op == OP_LOAD and len(ins.args) == 1 and ins.args[0][0] == "var":
                 src = ins.args[0][1]
-                # Don't alias parameters / explicit names (v_...).
-                if ins.dest.startswith("t") and src.startswith("t"):
+                if ins.dest is not None and src.startswith("t"):
                     canon[ins.dest] = src
         if block.terminator:
             block.terminator.args = [_rewrite_arg(a, canon)
@@ -285,11 +292,15 @@ def _dead_code_elim(irf: HLIRFunction):
 
 def _has_side_effects(ins: Instr) -> bool:
     """An instruction has side effects if it can affect external state."""
-    # Pure operations: const, binop, unop, load, list_new, struct_new,
-    # struct_get, list_get, map_get, list_len.
-    if ins.op in (OP_CONST, OP_BINOP, OP_UNOP, OP_LOAD,
+    # Pure operations: const, unop (! and float negation), load,
+    # list_new, struct_new, struct_get, map_get, list_len.
+    # BUG (deep-scan-5): binop and list_get were previously classified as
+    # pure — but checked arithmetic panics on overflow/div-zero and
+    # list_get panics on out-of-bounds; DCE must never erase a required
+    # panic.
+    if ins.op in (OP_CONST, OP_UNOP, OP_LOAD,
                   "list_new", "struct_new", "struct_get",
-                  "list_get", "map_get", "list_len"):
+                  "map_get", "list_len"):
         return False
     # Impure: store, call (might be impure), method (might be impure),
     # builtin (depends), panic, branch, jump, return.

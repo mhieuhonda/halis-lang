@@ -189,7 +189,7 @@ class IRBuilder:
         # `return void` (for void functions) or `panic` (for non-void).
         if not self._current.terminator:
             if irf.ret == "void":
-                self._current.terminator = Instr(None, OP_RETURN, [None], 0)
+                self._current.terminator = Instr(None, OP_RETURN, [], 0)
             else:
                 self._current.terminator = Instr(None, OP_PANIC,
                                                 [("lit", "missing return")], 0)
@@ -210,6 +210,13 @@ class IRBuilder:
 
     # ---------- statement lowering ----------
     def _lower_stmt(self, stmt, irf):
+        # BUG (deep-scan-5): statements after return/break/continue were
+        # lowered as live code — a second `return` silently REPLACED the
+        # first one's value (the IR misrepresents the program). Once the
+        # current block is terminated, the rest of the body is
+        # unreachable: skip it, exactly like the interpreter does.
+        if self._current.terminator is not None:
+            return
         k = stmt["k"]
         if k == "let":
             val = self._lower_expr(stmt["value"], irf)
@@ -235,10 +242,14 @@ class IRBuilder:
                            [("var", lst), ("var", idx), ("var", val)],
                            stmt.get("line", 0))
         elif k == "return":
-            val = None
+            # BUG (deep-scan-5): a void `return` used to emit args=[None],
+            # which crashed the optimiser's _rewrite_arg (`arg[0]` on
+            # None) — `--opt-stats` died with a raw TypeError on any
+            # program containing a void function. Emit an empty arg list.
+            vals = []
             if stmt.get("value") is not None:
-                val = ("var", self._lower_expr(stmt["value"], irf))
-            self._current.terminator = Instr(None, OP_RETURN, [val],
+                vals = [("var", self._lower_expr(stmt["value"], irf))]
+            self._current.terminator = Instr(None, OP_RETURN, vals,
                                              stmt.get("line", 0))
         elif k == "if":
             cond = self._lower_expr(stmt["cond"], irf)
@@ -307,9 +318,17 @@ class IRBuilder:
             self._current.terminator = Instr(None, OP_JUMP,
                                              [("label", cond_block.name)], 0)
             self._current = cond_block
+            # BUG (deep-scan-5): the condition compared against the
+            # SNAPSHOT length only — if the body shrinks the list (e.g.
+            # xs.pop()), the IR would represent an out-of-bounds list_get
+            # (a panic) where every real implementation breaks cleanly.
+            # Re-check the current length each iteration, like the
+            # interpreter / C / LLVM backends do.
+            cur_len = self._emit(OP_LIST_LEN, [("var", iter_name)],
+                                 stmt.get("line", 0))
             cond_tmp = self._emit(OP_BINOP,
                                   [("op", "<"), ("var", i_name),
-                                   ("var", len_name)],
+                                   ("var", cur_len)],
                                   stmt.get("line", 0))
             self._current.terminator = Instr(None, OP_BRANCH,
                                              [("var", cond_tmp),
@@ -411,13 +430,14 @@ class IRBuilder:
             v = self._lower_expr(e["e"], irf)
             return self._emit(OP_QMARK, [("var", v)], e.get("line", 0))
         if k == "match":
-            scrut = self._lower_expr(e["scrut"], irf)
-            return self._emit(OP_MATCH,
-                              [("var", scrut)] +
-                              [("arm", {"pattern": arm["pattern"],
-                                        "body": arm["body"]})
-                               for arm in e["arms"]],
-                              e.get("line", 0))
+            # BUG (deep-scan-5): arm bodies were stored as RAW AST — their
+            # side effects and pattern bindings never appeared in the IR,
+            # silently misrepresenting every program using match (the
+            # layer's own standard, see the enumlit error below, is to
+            # refuse constructs it cannot represent faithfully).
+            raise HLError("--emit ir / --opt-stats: `match` expressions "
+                          "are not supported by the HLIR builder yet "
+                          "(arm bodies would be dropped)", e.get("line", 0), 0)
         if k == "listlit":
             elems = [self._lower_expr(a, irf) for a in e["items"]]
             return self._emit(OP_LIST_NEW, [("var", a) for a in elems],

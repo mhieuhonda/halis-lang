@@ -626,7 +626,12 @@ class Interp:
             except OSError:
                 raise HLPanic("cannot write file: %s" % to_display(args[0]), line)
         if name == "args":
-            return list(self.argv)
+            # BUG (deep-scan-5): this returned a fresh list COPY on every
+            # call, but the native runtime returns THE process-global list
+            # — mutating the result is observable in native code but
+            # not under Stage-0 (a differential divergence). Return the
+            # actual list so both implementations alias identically.
+            return self.argv
         if name == "chr":
             if args[0] < 0 or args[0] > 255:
                 raise HLPanic("chr out of range 0..255", line)
@@ -788,6 +793,12 @@ class Interp:
             # range, which would then propagate as a "valid" int and only
             # trip the next arithmetic op. Panic early here so the error
             # points to the actual source.
+            # BUG (deep-scan-5): int() raises OverflowError on inf and
+            # ValueError on NaN BEFORE the range check runs — the
+            # interpreter crashed with a raw Python traceback while the
+            # native runtime panicked cleanly. Check non-finiteness first.
+            if t != t or t in (float("inf"), float("-inf")):
+                raise HLPanic("float.to_int out of int64 range", line)
             r = int(t)
             if r < INT64_MIN or r > INT64_MAX:
                 raise HLPanic("float.to_int out of int64 range", line)

@@ -65,6 +65,52 @@ SPACE_BEFORE_SYMS = {"{", "}", "=>", "->",
                      "==", "!=", "<=", ">=", "&&", "||", ","}
 
 
+def _extract_comments(src: bytes):
+    """Return {1-based line number: comment text} for every `#` comment,
+    respecting string literals (`#` inside quotes is not a comment).
+
+    BUG (deep-scan-5, fixed): the formatter used to DELETE all comments
+    (the HLS lexer treats them as whitespace) — `hlfmt -w` silently
+    destroyed user documentation. Comments are now preserved: comment-
+    only lines pass through verbatim in their source position; trailing
+    comments are re-appended to their line.
+    """
+    comments = {}
+    # latin-1 (byte-preserving) — the whole formatter pipeline round-trips
+    # bytes via latin-1 so multi-byte UTF-8 survives exactly; comments
+    # must use the same scheme or they would be re-interpreted.
+    text = src.decode("latin-1", errors="replace")
+    for idx, line in enumerate(text.split("\n"), start=1):
+        in_str = False
+        j = 0
+        n = len(line)
+        while j < n:
+            c = line[j]
+            if in_str:
+                if c == "\\" and j + 1 < n:
+                    j += 2
+                    continue
+                if c == '"':
+                    in_str = False
+                j += 1
+                continue
+            if c == '"':
+                in_str = True
+                j += 1
+                continue
+            if c == "#":
+                # For comment-ONLY lines keep the full original line
+                # (preserving its indentation); for trailing comments keep
+                # just the comment text.
+                if line[:j].strip() == "":
+                    comments[idx] = ("only", line.rstrip())
+                else:
+                    comments[idx] = ("trailing", line[j:].rstrip())
+                break
+            j += 1
+    return comments
+
+
 def format_source(src: bytes) -> str:
     """Format HLS source bytes; return the formatted source as a string."""
     try:
@@ -72,9 +118,11 @@ def format_source(src: bytes) -> str:
     except HLError as ex:
         sys.stderr.write("warning: %s\n" % ex)
         return src.decode("utf-8", errors="replace")
+    comments = _extract_comments(src)
 
     out_lines = []
     cur_line_parts = []
+    pending_unary = False
     indent = 0
     cur_line_num = 1
 
@@ -83,6 +131,15 @@ def format_source(src: bytes) -> str:
         line (used to preserve intentional blank lines in the source)."""
         nonlocal cur_line_parts
         line = "".join(cur_line_parts).rstrip()
+        # Trailing comments are re-appended to the formatted code of
+        # their line. (A comment-ONLY line never reaches here with empty
+        # parts: the gap/EOF handlers own those. The old fallback
+        # re-emitted the comment when a brace handler had ALREADY
+        # flushed the line — duplicating every trailing comment after
+        # an opening brace.)
+        cmt = comments.get(cur_line_num)
+        if line and cmt is not None and cmt[0] == "trailing" and cmt[1].strip():
+            line = (line + " " + cmt[1]).rstrip()
         if line:
             out_lines.append(line)
         elif force_blank and out_lines:
@@ -101,19 +158,39 @@ def format_source(src: bytes) -> str:
     while i < n:
         t = toks[i]
         if t["k"] == EOF:
+            # Flush the final line and any comments after the last token.
+            emit_cur_line()
+            for ln in sorted(l for l in comments
+                             if l >= cur_line_num and comments[l][0] == "only"
+                             and comments[l][1].strip()):
+                out_lines.append(comments[ln][1])
             break
         # Handle line breaks first — if the token's line is greater than
         # the current line, advance. Emit a blank line only if the gap
         # is more than 1 line (intentional blank in source).
         gap = t["line"] - cur_line_num
         if gap > 0:
-            # Flush the current line content.
+            # Flush the current line content. If nothing was pending on
+            # this line (e.g. the file STARTS with comments, or the line
+            # was already flushed by a brace handler), a comment-only
+            # entry here is emitted verbatim. Trailing comments were
+            # already appended to flushed code — never re-emit those.
+            had_pending = bool(cur_line_parts)
             emit_cur_line()
+            if not had_pending:
+                cmt = comments.get(cur_line_num)
+                if cmt is not None and cmt[0] == "only" and cmt[1].strip():
+                    out_lines.append(cmt[1])
             cur_line_num += 1
-            # For each remaining gap line, emit a blank line (but only
-            # if the gap > 1, meaning the source had an intentional blank).
+            # For each remaining gap line: emit a comment line verbatim
+            # (preserving the source's comment), or a blank line if the
+            # gap > 1 (an intentional blank in the source).
             while cur_line_num < t["line"]:
-                emit_cur_line(force_blank=True)
+                cmt = comments.get(cur_line_num)
+                if cmt is not None and cmt[0] == "only" and cmt[1].strip():
+                    out_lines.append(cmt[1])
+                else:
+                    emit_cur_line(force_blank=True)
                 cur_line_num += 1
         cur_line_num = t["line"]
         # Now emit the token.
@@ -180,9 +257,33 @@ def format_source(src: bytes) -> str:
             # Override: no space if prev is in NO_SPACE_AFTER.
             if prev_v in NO_SPACE_AFTER:
                 need_space = False
-            # Don't double-up spaces.
+            # BUG (deep-scan-5): unary `!` after a keyword or operator
+            # lost its preceding space — `if !x` printed as `if!x`.
+            if cur_v == "!" and (prev_kind in WORD_KINDS or
+                                 prev_v in SPACE_AFTER_SYMS):
+                need_space = True
+            # Don't double-up spaces — and never emit a space at the
+            # START of a line. BUG (deep-scan-5): at indent 0 the line
+            # prefix is the empty string, so the guard below saw
+            # `"".endswith(" ")` == False and emitted a leading space —
+            # every top-level line after `import` gained a bogus column-0
+            # space.
             if cur_line_parts and cur_line_parts[-1].endswith(" "):
                 need_space = False
+            if len(cur_line_parts) == 1 and not cur_line_parts[0].strip():
+                need_space = False
+            # BUG (deep-scan-5): unary minus was formatted as a binary
+            # operator — `let x: int = -5` became `let x: int =- 5` and
+            # `(-1)` became `(- 1`. When the previous token cannot end an
+            # expression, `-` is a prefix operator: no space after it.
+            if pending_unary:
+                need_space = False
+                pending_unary = False
+            if cur_v == "-" and (prev_v == "return" or
+                                 not (prev_kind in WORD_KINDS or prev_v in (")", "]"))):
+                pending_unary = True
+                if prev_v in SPACE_AFTER_SYMS or prev_v == "return":
+                    need_space = True
             if need_space:
                 cur_line_parts.append(" ")
         cur_line_parts.append(_render_token(t))

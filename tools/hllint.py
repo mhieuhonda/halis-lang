@@ -202,13 +202,18 @@ def all_exprs_in_stmts(stmts):
 # ---------------------------------------------------------------------------
 
 class Linter:
-    def __init__(self, program, only_rules=None):
+    def __init__(self, program, only_rules=None, path=None):
         self.program = program
         self.warnings = []
         self.only_rules = only_rules or set(RULES.keys())
+        # L010 scans the raw source (impl blocks are not in the AST).
+        self.path = path
 
     def run(self):
-        for rule_id in self.only_rules:
+        # BUG (deep-scan-5): iterating a SET made the rule order (and the
+        # output line order) non-deterministic across runs. Sort for
+        # reproducible output.
+        for rule_id in sorted(self.only_rules):
             if rule_id not in RULES:
                 continue
             method = getattr(self, "_rule_" + rule_id.lower().replace("-", "_"), None)
@@ -243,6 +248,13 @@ class Linter:
         for fname, fn in self.program["fns"].items():
             for e in all_exprs_in_stmts(fn["body"]):
                 collect_calls(e, called)
+        # BUG (deep-scan-5): struct field DEFAULT expressions can call
+        # functions (e.g. `x: int = five()`) — a function called only
+        # from a default was falsely reported as unused.
+        for sname, sdef in self.program["structs"].items():
+            for _fname, _ftype, dflt in sdef["fields"]:
+                if dflt is not None:
+                    collect_calls(dflt, called)
         # Special-case: `main` is always considered used.
         called.add("main")
         # Methods registered as "Struct.method" — the short name is
@@ -367,12 +379,24 @@ class Linter:
     def _rule_l010(self):
         """Empty-impl: an `impl` block has no methods.
 
-        NOTE: the parser already rejects empty impl blocks (they require
-        at least one `fn`), so this rule never fires for valid programs.
-        Kept for documentation.
+        BUG (deep-scan-5): this rule was a no-op justified by a false
+        claim — the parser silently ACCEPTS `impl Foo {}`. Implement it
+        against the raw source (the AST does not carry impl blocks; scan
+        the token stream of the original file).
         """
-        # No-op: parser rejects empty impls.
-        pass
+        try:
+            with open(self.path, "rb") as f:
+                src = f.read()
+        except (OSError, AttributeError):
+            return
+        # Scan for `impl Ident ... { }` with an empty body.
+        import re as _re
+        for m in _re.finditer(rb"impl\s+[A-Za-z_][A-Za-z0-9_]*\s*(\[[^\]]*\])?\s*{\s*}", src):
+            # Find the line of the match.
+            line = src[:m.start()].count(b"\n") + 1
+            name_m = _re.search(rb"impl\s+([A-Za-z_][A-Za-z0-9_]*)", m.group(0))
+            nm = name_m.group(1).decode("utf-8", "replace") if name_m else "?"
+            self._warn("L010", line, "impl block for '%s' is empty" % nm)
 
 
 def walk_stmts_collected(stmts):
@@ -430,7 +454,7 @@ def main():
         sys.stderr.write("error: %s\n" % ex)
         return 1
     only = set(args.rules) if args.rules else None
-    linter = Linter(program, only_rules=only)
+    linter = Linter(program, only_rules=only, path=args.file)
     warnings = linter.run()
     if not warnings:
         print("%s: no warnings" % args.file)

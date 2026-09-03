@@ -591,6 +591,12 @@ class Checker:
                          % (s["vtype"], elem), s)
             snap = self.snapshot_moved(env)
             self.child(env)
+            # BUG (deep-scan-5): the `let` branch rejects shadowing but the
+            # `for` branch never checked — a loop variable could silently
+            # shadow an outer binding (SPEC §4: no shadowing).
+            if self.lookup(env, s["var"]) is not None:
+                self.err("cannot shadow outer variable with the loop "
+                         "variable: %s" % s["var"], s)
             env[-1][s["var"]] = [elem, False, False]
             self.check_stmts(s["body"], env, fn, True)
             env.pop()
@@ -1576,15 +1582,32 @@ class Checker:
         # Find the "error" variant: Err (with one payload) or None (no payload).
         err_variant = None
         ok_variant = None
+        n_err_candidates = 0
         for v, payloads in edef["variants"]:
             if v == "Err" and len(payloads) == 1:
                 err_variant = (v, payloads)
+                n_err_candidates += 1
             elif v == "None" and len(payloads) == 0:
                 err_variant = (v, payloads)
+                n_err_candidates += 1
             elif v == "Ok" and len(payloads) == 1:
                 ok_variant = (v, payloads)
             elif v == "Some" and len(payloads) == 1:
                 ok_variant = (v, payloads)
+            else:
+                # BUG (deep-scan-5): a third variant beyond the ok/err pair
+                # can match NEITHER arm at runtime — the interpreter would
+                # panic ("matched neither ok nor err variant") on a
+                # checker-clean program. Reject at check time.
+                self.err("? operator requires enum %s to have exactly the "
+                         "ok variant (Ok/Some) and error variant (Err/None); "
+                         "found extra variant '%s'" % (ename, v), e)
+        # BUG (deep-scan-5): if the enum declares BOTH 'Err' and 'None',
+        # the loop above silently keeps only the LAST one — `?` on the
+        # other one panics at runtime. Reject the ambiguity.
+        if n_err_candidates > 1:
+            self.err("? operator requires enum %s to declare EITHER 'Err' "
+                     "OR 'None' as its error variant, not both" % ename, e)
         if err_variant is None:
             self.err("? operator requires enum %s to have an 'Err' (1 payload) or 'None' variant"
                      % ename, e)
@@ -1701,7 +1724,18 @@ class Checker:
                     c_eff = BUILTIN_EFFECTS.get(c[2:], set())
                     callee_disp = c[2:]
                 else:
-                    c_eff = eff.get(c, set())
+                    # BUG (deep-scan-5): extern fns have no body, so their
+                    # `eff` entry is empty — the witness check silently
+                    # passed even though the fixpoint had already unioned
+                    # the extern's DECLARED effects into the caller's
+                    # computed set (the --audit output showed VIOLATION
+                    # while --check said OK). Mirror the fixpoint here:
+                    # use the extern's declared effects as the requirement.
+                    callee_fn = self.fns.get(c)
+                    if callee_fn is not None and callee_fn.get("extern", False):
+                        c_eff = set(callee_fn["effects"])
+                    else:
+                        c_eff = eff.get(c, set())
                     callee_disp = c
                 violated = c_eff - declared
                 if not violated:

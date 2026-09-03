@@ -40,7 +40,9 @@ TERMINATORS = ("br ", "ret ", "unreachable", "switch ", "indirectbr ",
 # Instruction operand patterns we can check without a full parser.
 # NOTE: all patterns are anchored with `^\s*` and are matched against the
 # STRIPPED line, so they work with or without indentation.
-CALL_RE = re.compile(r"^\s*(?:%[\w.$-]+\s*=\s*)?call\s+(?:(\w+)\s+)?@([\w.$-]+)\((.*)\)\s*$")
+# BUG (deep-scan-5): `tail call` / `musttail call` prefixes bypassed the
+# callee-existence check (V2).
+CALL_RE = re.compile(r"^\s*(?:%[\w.$-]+\s*=\s*)?(?:musttail\s+|tail\s+)?call\s+(?:(\w+)\s+)?@([\w.$-]+)\((.*)\)\s*$")
 DEF_RE = re.compile(r"^define\s+[\w\s]*?@([\w.$-]+)\s*\(")
 DECLARE_RE = re.compile(r"^declare\s+[\w\s]*?@([\w.$-]+)\s*\(")
 GLOBAL_RE = re.compile(r"^@([\w.$-]+)\s*=")
@@ -49,7 +51,12 @@ ALLOCA_RE = re.compile(r"^\s*%([\w.$-]+)\s*=\s*alloca\s+(\w+)")
 STORE_SLOT_RE = re.compile(r"^\s*store\s+(\w+)\s+([^,]+),\s*ptr\s+%([\w.$-]+)\s*$")
 PHI_RE = re.compile(r"^\s*%([\w.$-]+)\s*=\s*phi\s+(\w+)\s+(.*)$")
 PHI_EDGE_RE = re.compile(r"\[\s*([^,\]]+?)\s*,\s*%([\w.$-]+)\s*\]")
-BR_RE = re.compile(r"^\s*br\s+(?:i1\s+%[\w.$-]+\s*,\s*)?label\s+%([\w.$-]+)(?:\s*,\s*label\s+%([\w.$-]+))?")
+# BUG (deep-scan-5): constant conditions (`br i1 true, ...`) bypassed the
+# label checks; switch lines/continuations were not handled at all.
+BR_RE = re.compile(r"^\s*br\s+(?:i1\s+(?:%[\w.$-]+|true|false)\s*,\s*)?label\s+%([\w.$-]+)(?:\s*,\s*label\s+%([\w.$-]+))?")
+SWITCH_RE = re.compile(r"^\s*switch\s+")
+SWITCH_CASE_RE = re.compile(r"^\s*[\w.\-]+\s+[^,]+,\s*label\s+%([\w.$-]+)\s*$")
+LABEL_REF_RE = re.compile(r"label\s+%([\w.$-]+)")
 # `ptr 5` / `ptr -1` as an operand — always invalid (pointers are not
 # integers in LLVM).
 PTR_LIT_RE = re.compile(r"(?:^|\s|,|\()ptr\s+-?\d+(?:\s|,|\)|$)")
@@ -85,7 +92,8 @@ def validate(text, name="<module>"):
     in_function = False
     fn_name = None
     cur_label = None           # label of the currently open block
-    terminated = True          # True right after a terminator / at function start
+    terminated = False         # True right after a terminator
+    in_switch = False          # True between a `switch` and its closing `]`
     labels = set()             # labels seen in this function
     referenced_labels = []     # labels referenced by br/jump (line no, label)
     phi_edges = []             # (line no, pred label)
@@ -121,7 +129,13 @@ def validate(text, name="<module>"):
                 in_function = True
                 fn_name = m.group(1)
                 cur_label = None
-                terminated = True
+                in_switch = False
+                # BUG (deep-scan-5): this was initialised True ("at
+                # function start"), so any function whose ENTRY block has
+                # no label was falsely rejected (V1 on its first
+                # instruction). The entry block starts OPEN (no
+                # terminator yet).
+                terminated = False
                 labels = set()
                 referenced_labels = []
                 phi_edges = []
@@ -141,7 +155,7 @@ def validate(text, name="<module>"):
                 errors.append("V8 %s (line %d): duplicate label '%s'"
                               % (fn_name, line_no, lbl))
             labels.add(lbl)
-            if not terminated:
+            if not terminated and cur_label is not None:
                 errors.append(
                     "V1 %s (line %d): label '%s' opens while the previous block "
                     "'%s' is still open (missing terminator)"
@@ -152,6 +166,21 @@ def validate(text, name="<module>"):
 
         if not ln or ln.startswith(";"):
             continue
+
+        # BUG (deep-scan-5): multi-line `switch` case lists — the
+        # continuation lines (`i32 0, label %zero`) and the closing `]`
+        # would hit V1, and the switch targets were never label-checked.
+        # Consume them while in switch-continuation mode.
+        if in_switch:
+            if ln == "]":
+                in_switch = False
+                continue
+            mc = SWITCH_CASE_RE.match(ln)
+            if mc:
+                for g in LABEL_REF_RE.findall(ln):
+                    referenced_labels.append((line_no, g))
+                continue
+            in_switch = False
 
         # V1: instructions after a terminator without an intervening label.
         if terminated:
@@ -168,6 +197,13 @@ def validate(text, name="<module>"):
                 for g in (m.group(1), m.group(2)):
                     if g:
                         referenced_labels.append((line_no, g))
+            if SWITCH_RE.match(ln):
+                # `switch ... , label %default [` — collect the default
+                # target and enter continuation mode (the case lines
+                # follow until the closing `]`).
+                for g in LABEL_REF_RE.findall(ln):
+                    referenced_labels.append((line_no, g))
+                in_switch = not ln.rstrip().endswith("]")
             continue
 
         # Calls: check the callee exists (V2).
