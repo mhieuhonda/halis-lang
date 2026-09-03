@@ -336,6 +336,18 @@ def _render_token(t) -> str:
         # break the escape syntax. Multi-byte UTF-8 sequences are
         # preserved as-is by emitting each byte via chr() and then
         # encoding the result as latin-1 when written to disk.
+        #
+        # Deep-scan-8 fix: the HLS lexer only supports four escape
+        # sequences inside string literals: \n \t \\ \" (see lexer.py
+        # lines 149-162). The previous formatter also emitted \r and
+        # \xNN escapes — which the lexer REJECTS as "invalid escape
+        # sequence". This made the formatter non-idempotent for any
+        # string containing a CR (0x0d) or other control character
+        # (0x00-0x1f except \n and \t). In practice the lexer rejects
+        # literal control chars in strings, so these branches were dead
+        # code — but they represented a latent soundness issue. Now we
+        # emit a clear error instead of silently producing unparseable
+        # output.
         if isinstance(v, bytes):
             out = ['"']
             for b in v:
@@ -347,10 +359,14 @@ def _render_token(t) -> str:
                     out.append('\\n')
                 elif b == 0x09:       # tab
                     out.append('\\t')
-                elif b == 0x0d:       # carriage return
-                    out.append('\\r')
                 elif b < 0x20:
-                    out.append('\\x%02x' % b)
+                    # Deep-scan-8: control chars that HLS string syntax
+                    # cannot represent. Raise a clear error so the user
+                    # knows the string can't be round-tripped.
+                    raise ValueError(
+                        "string literal contains control byte 0x%02x which "
+                        "cannot be represented in HLS string syntax (only "
+                        "\\n, \\t, \\\\, and \\\" escapes are supported)" % b)
                 else:
                     # Use chr(b) so the byte value is preserved exactly
                     # (1:1 mapping). When the output string is written

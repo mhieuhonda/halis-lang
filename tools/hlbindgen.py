@@ -236,18 +236,41 @@ def _parse_structs(src, decls):
                 base_type = _parse_c_type(" ".join(tokens[:-1]) + " *")
                 fields.append((_sanitize_field_name(fname), base_type))
                 continue
-            # Nested struct/enum type? (`struct Point start;`)
-            if tokens[0] in ("struct", "enum") and len(tokens) >= 3:
+            # Deep-scan-8 fix: handle `struct`/`enum` keyword ANYWHERE in
+            # the type tokens (not just first position). Previously
+            # `const struct Point start;` fell through to the plain-type
+            # case and became `start: int` (because `const struct Point`
+            # is not in C_TO_HLS). Now we scan tokens for `struct`/`enum`,
+            # strip qualifiers, and use the type name.
+            struct_or_enum_idx = -1
+            for idx, tok in enumerate(tokens[:-1]):
+                if tok in ("struct", "enum"):
+                    struct_or_enum_idx = idx
+                    break
+            if struct_or_enum_idx >= 0 and len(tokens) >= struct_or_enum_idx + 3:
                 fname = last
-                type_name = tokens[1]
-                # Strip any remaining qualifiers.
+                type_name = tokens[struct_or_enum_idx + 1]
                 fields.append((_sanitize_field_name(fname), type_name))
                 continue
-            # Plain type field.
+            # Plain type field (fallthrough: not array, not pointer,
+            # not struct/enum keyword).
             fname = last
-            ftype = _parse_c_type(" ".join(tokens[:-1]))
+            # Deep-scan-8 fix: handle `struct Name` / `enum Name` types
+            # in plain field declarations too. E.g. `struct Point start;`
+            # without const -> tokens = ["struct", "Point", "start"],
+            # which the old code sent to `_parse_c_type("struct Point")`
+            # -> `int` (wrong, should be `Point`).
+            if len(tokens) >= 3 and tokens[0] in ("struct", "enum"):
+                ftype = tokens[1]
+            else:
+                ftype = _parse_c_type(" ".join(tokens[:-1]))
             fields.append((_sanitize_field_name(fname), ftype))
-        decls["structs"].append({"name": sname, "fields": fields})
+        # Deep-scan-8 fix: skip empty structs (the HLS parser rejects
+        # `struct Foo {}` with "struct must have at least one field").
+        # Previously hlbindgen emitted invalid HLS that the checker
+        # would reject.
+        if fields:
+            decls["structs"].append({"name": sname, "fields": fields})
 
 
 def _parse_enums(src, decls):
@@ -283,7 +306,10 @@ def _parse_enums(src, decls):
                 val = next_val
             variants.append((vname, val))
             next_val = val + 1
-        decls["enums"].append({"name": ename, "variants": variants})
+        # Deep-scan-8 fix: skip empty enums (the HLS parser rejects
+        # `enum Foo {}` with "enum must have at least one variant").
+        if variants:
+            decls["enums"].append({"name": ename, "variants": variants})
 
 
 def _parse_functions(src, decls):
@@ -426,11 +452,23 @@ def emit_abi_header(decls: dict, src_header: str = None) -> str:
         lines.append('#include "%s"' % src_header)
         lines.append("")
     # Type-size assertions.
-    lines.append("/* Type-size assertions: the HLS int/float/str types")
-    lines.append("   must match the C types the externs declared. */")
-    lines.append('_Static_assert(sizeof(int) == 8, "HLS int must be 8 bytes");')
-    lines.append('_Static_assert(sizeof(float) == 8, "HLS float must be 8 bytes");')
-    lines.append('_Static_assert(sizeof(bool) == 1, "HLS bool must be 1 byte");')
+    # Deep-scan-8 CRITICAL fix: the old assertions checked
+    # `sizeof(int) == 8` and `sizeof(float) == 8`, but C `int` is
+    # 4 bytes and C `float` is 4 bytes on every mainstream platform.
+    # The assertions would FAIL on any standard gcc/clang build,
+    # making the ABI header unusable. HLS `int` is i64 (8 bytes) and
+    # HLS `float` is f64 (8 bytes), so the correct check is against
+    # `int64_t` and `double` — the C types that actually match the
+    # HLS ABI. Also include <stdint.h> for the int64_t typedef and
+    # <stdbool.h> for `_Bool` (the C99 bool type).
+    lines.append("/* Type-size assertions: HLS int is i64 (8 bytes),")
+    lines.append("   HLS float is f64 (8 bytes), HLS bool is 1 byte.")
+    lines.append("   C externs must use int64_t/double/_Bool to match. */")
+    lines.append("#include <stdint.h>")
+    lines.append("#include <stdbool.h>")
+    lines.append('_Static_assert(sizeof(int64_t) == 8, "HLS int is i64 (8 bytes)");')
+    lines.append('_Static_assert(sizeof(double) == 8, "HLS float is f64 (8 bytes)");')
+    lines.append('_Static_assert(sizeof(_Bool) == 1, "HLS bool is 1 byte");')
     # Function existence assertions (one per extern fn).
     lines.append("")
     lines.append("/* Function-existence assertions: each HLS extern must")

@@ -1248,6 +1248,12 @@ class Checker:
         # an int to print already errors as "expected str, got int"; we
         # only need the taint error for the case where the type is
         # otherwise fine but the value is tainted).
+        #
+        # Deep-scan-8 fix: the original implementation ONLY checked for
+        # taint — it did not validate that the argument's type matched
+        # `want`. So `print(42)` compiled cleanly and crashed at runtime
+        # with `TypeError: a bytes-like object is required, not 'int'`.
+        # The fix: also enforce the type when `want` is not None.
         def reject_tainted_at_sink(arg_idx, want):
             arg = args[arg_idx]
             # Check the expression to get its type. Pass `want` so we
@@ -1255,6 +1261,12 @@ class Checker:
             at = self.check_expr(arg, env, want)
             if at == "never":
                 return at  # never propagates; let the caller handle
+            # Deep-scan-8: enforce the expected type. Previously only
+            # taint was checked, so `print(42)` / `read_file(42)` /
+            # `exit("foo")` compiled and crashed at runtime.
+            if want is not None and at != want:
+                self.err("%s expects argument %d to be %s, got %s"
+                         % (name, arg_idx + 1, want, at), e)
             if is_tainted_type(at):
                 self.err(
                     "taint-sink violation: %s argument %d is tainted[%s] "

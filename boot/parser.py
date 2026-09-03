@@ -329,6 +329,15 @@ class Parser:
         # family (expanded at parse time). Active effects: Fs, Clock,
         # Args, Exit, Net, Rand, Proc. No reserved effects remain.
         effects = set()
+        # Deep-scan-8 fix: track EXPLICITLY-declared effects separately
+        # from the expanded set. `uses IO, Fs` used to error with
+        # "duplicate effect declaration: Fs" because IO is expanded to
+        # the full IO family (which includes Fs) at parse time, and the
+        # duplicate check ran against the expanded set. Now we only
+        # check for duplicates against the explicitly-declared names,
+        # so `uses IO, Fs` is accepted (redundant but legal), while
+        # `uses IO, IO` or `uses Fs, Fs` still errors.
+        explicit_effects = set()
         if self.at_kw("uses"):
             if is_pure:
                 self.err("'pure' and 'uses' are mutually exclusive (a pure "
@@ -343,8 +352,9 @@ class Parser:
                 if eff not in KNOWN_EFFECTS:
                     self.err("unknown effect '%s'; known effects: IO, Fs, "
                              "Clock, Args, Exit, Net, Rand, Proc" % eff, tok)
-                if eff in effects:
+                if eff in explicit_effects:
                     self.err("duplicate effect declaration: %s" % eff, tok)
+                explicit_effects.add(eff)
                 effects.add(eff)
                 # `IO` is the blanket alias — expand to the full IO family.
                 if eff == "IO":
