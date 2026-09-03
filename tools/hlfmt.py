@@ -217,6 +217,14 @@ def format_source(src: bytes) -> str:
             if nxt and nxt["k"] == SYM and nxt["v"] in (",", ")", "]", ";", "=>"):
                 # Will be handled by the next iteration's whitespace logic.
                 pass
+            # SCAN-B fix: keep `} else {` and `} else if (...) {` on the
+            # same line — the previous peek set missed the `else` keyword.
+            elif nxt and nxt["k"] == "kw" and nxt["v"] == "else":
+                # Append a space so the `else` token joins this line.
+                if cur_line_parts and not cur_line_parts[-1].endswith(" "):
+                    cur_line_parts.append(" ")
+                # Don't flush — the next iteration emits `else` on this line.
+                pass
             else:
                 emit_cur_line()
             prev = t

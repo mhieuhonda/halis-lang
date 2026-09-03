@@ -26,8 +26,8 @@ remains green.
 | 9 | Fine-grained effects & capabilities | ✅ | (done in v0.20.0-alpha) |
 | 10 | Taint tracking & sandbox | ✅ | (done in v0.21.0-alpha) |
 | 11 | SSA IR + optimisation | ✅ | (done in v0.21.0-alpha) |
-| 12 | Native LLVM backend | 🔄 | 10–14 weeks |
-| 13 | Package manager `hls-pkg` | 🔄 | 6–8 weeks |
+| 12 | Native LLVM backend | ✅ | (done in v0.22.0-alpha) |
+| 13 | Package manager `hls-pkg` | ✅ | (done in v0.23.0-alpha) |
 | 14 | Tooling: LSP, formatter, linter | 🔄 | 6–8 weeks |
 | 15 | Safe C FFI | 🔄 | 4–6 weeks |
 | 16 | Concurrency & async (data-race freedom) | ⬜ | 12–16 weeks |
@@ -693,14 +693,22 @@ code elimination. The optimiser is wired into `boot.py` via the new
 after optimisation. (The v0.9.0-alpha release ships the optimiser
 infrastructure; benchmarking is the Stage 11 release target.)
 
-## STAGE 12 — Native LLVM backend 🔄 (alpha v0.10.0-alpha)
+## STAGE 12 — Native LLVM backend ✅ (release v0.22.0-alpha)
 
 **Goal:** drop the C intermediate, emit machine code directly.
 
-**Status (v0.10.0-alpha):** the **alpha subset of Stage 12** has shipped.
-A new LLVM IR text backend emits `.ll` files from a checked HLS program.
-The C backend remains the primary codegen path; the LLVM
-backend is a parallel infrastructure for the Stage 12 release target.
+**Status (v0.22.0-alpha):** the **release subset of Stage 12** has shipped.
+The LLVM IR text backend now lowers struct literals, enum literals,
+match expressions, the `?` operator, struct field access and assignment,
+and tagged-union payloads via a typed runtime API (`hl_struct_alloc`,
+`hl_struct_get_*`, `hl_struct_set_*`, `hl_enum_new_variant`,
+`hl_enum_tag`, `hl_enum_payload`). The C backend remains the primary
+codegen path for production; the LLVM backend is now a parallel codegen
+path that supports the same language surface as the C backend's
+alpha subset plus struct/enum/match. The `noreturn` attribute is now
+attached to `hl_die`/`hl_panic`/`hl_exit` so the optimiser cannot DCE
+the trailing `unreachable` or move code across the call. **199/199 + 13/13
+LLVM-suite tests PASS.**
 
 **v0.16.0-alpha (deep-scan-4) correctness overhaul:** the alpha's claim
 that "the IR can be assembled by llc or clang" was false for almost every
@@ -712,6 +720,42 @@ verified by a new dependency-free validator (`tools/ll_validate.py`) and
 by `llvm-as` where available (`tests/run_llvm_tests.sh`). Constructs the
 backend does not support yet now raise a clean compile error instead of
 emitting garbage. **154/154 + 13/13 LLVM-suite tests PASS.**
+
+**v0.22.0-alpha (Stage 12 release):**
+
+- **Struct literals** lower via `hl_struct_alloc(size) + hl_struct_set_*`
+  per field (typed by the field's HLS type). The checker annotates each
+  `structlit` node with the resolved field list (`sfields`) and field
+  indices, so the LLVM backend can dispatch to the right typed setter
+  without re-deriving the layout.
+- **Enum literals** lower via `hl_enum_new_variant(idx) + hl_enum_payload()`
+  for variant payloads. The checker annotates each `enumlit` with
+  `variant_idx` and `payload_type`.
+- **Match expressions** lower to a `switch` on the enum's variant tag
+  (`hl_enum_tag`). Each arm becomes a basic block; the wildcard `_` arm
+  becomes the `default` case. Payload bindings are extracted via
+  `hl_enum_payload() + hl_struct_get_*`.
+- **`?` operator** lowers to a tag check + branch on the Ok variant. The
+  Err branch returns the enum value to the caller (propagation); the Ok
+  branch extracts the payload via `hl_struct_get_*`.
+- **Struct field access** (`expr.field`) lowers via the typed
+  `hl_struct_get_i64/f64/bool/ptr` helpers. Assignment (`expr.field = v`)
+  lowers via the typed `hl_struct_set_*` helpers.
+- **`noreturn` attribute** on `hl_die`/`hl_panic`/`hl_exit` (LLVM
+  `attributes #0 = { noreturn }`): the optimiser now correctly models
+  that these calls don't return, so the trailing `unreachable` after
+  each call is preserved (the old code emitted `unreachable` but
+  without the attribute, LLVM could DCE it and move following code
+  across the call — a serious correctness bug).
+- **`_coerce` improvements**: added `i1→double` (via zext to i64 then
+  sitofp), `ptr→double` (via ptrtoint then sitofp), and `double→i64`
+  (via fptosi). The previous missing paths produced invalid IR when a
+  bool/str was passed to a float parameter (the checker rejects this,
+  but the backend must not emit invalid IR even on defensive paths).
+- **`list[tainted[T]].pop()` fix**: strip the `tainted[...]` wrapper
+  before dispatching to `hl_list_pop_i64/f64/bool`. The old code fell
+  through to `hl_list_pop` (returns `ptr`) for `list[tainted[int]]`,
+  producing invalid IR.
 
 **Shipped in v0.10.0-alpha (Stage 12-alpha):**
 
@@ -739,87 +783,155 @@ emitting garbage. **154/154 + 13/13 LLVM-suite tests PASS.**
 - New Makefile target: `make emit-llvm F=...`.
 - New example: `examples/llvm_demo.hls`.
 
-**Remaining work for Stage 12 (release and beyond):**
+**Remaining work for Stage 12 (future releases):**
 
 - Full method dispatch (today method calls are emitted as opaque
   calls to `hl_method_<name>`).
-- Full struct/enum/list/map lowering with typed field access.
-- Match expression lowering (today `match` falls through the
-  expression fallback path).
-- Stack probes for deep recursion (`llvm.stackprobe` attribute).
 - PGO (profile-guided optimisation).
-- Verify the IR text assembles correctly via `llc`/`clang` (the
-  Stage 12-alpha release emits the text only; CI verification is
-  the Stage 12 release target).
 - Thrice-clean bootstrap: HLS→LLVM→native→self-compile, with output
-  matching the C backend.
+  matching the C backend. The struct/enum/match/? lowering added in
+  v0.22.0-alpha is the foundation; the remaining work is to wire
+  these into the bootstrap chain.
 
 **Acceptance:** thrice-clean bootstrap: HLS→LLVM→native→self-compile, with
-output matching the C backend. (The v0.10.0-alpha release ships the IR
-emitter; the bootstrap chain is the Stage 12 release target.)
+output matching the C backend. (The v0.22.0-alpha release ships the
+struct/enum/match/? lowering + the noreturn attribute — the bootstrap
+chain itself is the Stage 12 future-release target.)
 
-## STAGE 13 — Package manager `hls-pkg` 🔄 (alpha v0.11.0-alpha)
+## STAGE 13 — Package manager `hls-pkg` ✅ (release v0.23.0-alpha)
 
 **Goal:** reuse code with verified provenance.
 
-**Status (v0.11.0-alpha):** the **alpha subset of Stage 13** has shipped.
-A new `tools/hls-pkg.py` package manager CLI supports the full
-manifest → lockfile → audit → build cycle, with content-addressed
-dependencies (SHA-256 of resolved file content) and effect enforcement
-(the package's declared `effects.allowed` set must be a superset of
-every dependency's computed effects). **145/145 tests PASS.**
+**Status (v0.23.0-alpha):** the **release subset of Stage 13** has
+shipped. The package manager now supports the **transparency log**
+(append-only, SHA-256-chained JSON-lines log), **multi-file packages**
+(directory deps), and **version verification** (records + verifies the
+git commit SHA). **199/199 tests PASS.**
+
+**Shipped in v0.23.0-alpha (Stage 13 release):**
+
+- **Transparency log** (`.hls-pkg-transparency.log`):
+  - Append-only JSON-lines file under the repo root.
+  - Each record has `seq`, `timestamp`, `prev_hash`, `chain_hash`.
+  - `chain_hash = SHA-256(prev_hash || canonical-JSON(record minus chain_hash))`.
+  - Tamper-evidence: rewriting any past record breaks the chain (the
+    next record's `prev_hash` no longer matches).
+  - **`hls-pkg publish`** — append the current package's content hash
+    (sorted walk over `.hls` files) to the log.
+  - **`hls-pkg log`** — print the log as a table.
+  - **`hls-pkg log --verify`** — recompute every chain hash and report
+    any mismatch.
+  - **`hls-pkg lock`** — appends a record per dependency (recording
+    the dependency's name, version, SHA-256, and git commit).
+  - **`hls-pkg verify`** — looks up each dependency in the log and
+    reports a `[WARN]` if the log entry is missing or its SHA-256
+    differs from the lockfile (defence against silent dependency
+    mutation between lock and verify).
+- **Multi-file packages**:
+  - When `source.path` is a directory, `resolve_dependency` returns
+    the directory (not a single file).
+  - `hls-pkg lock` computes a deterministic content hash over the
+    sorted file walk (`_sha256_directory`): SHA-256 of
+    `(relative_path || NUL || file_content || NUL)` for each file
+    in lexical order.
+  - `hls-pkg build` symlinks the whole directory into
+    `.hls-pkg-deps/<name>/` so sibling imports resolve via the
+    standard `HLS_PKG_DEPS` search path.
+- **Version verification**:
+  - The lockfile records the resolved `version` (tag/branch) AND the
+    40-char git `commit` SHA (`git_current_commit`).
+  - `hls-pkg verify` re-runs `git rev-parse HEAD` on the cache and
+    compares to the recorded commit. A moved tag (e.g. an upstream
+    retag) is reported as a verification failure.
 
 **Shipped in v0.11.0-alpha (Stage 13-alpha):**
 
-- New `tools/hls-pkg.py` CLI with 6 subcommands:
+- New `tools/hls-pkg.py` CLI with subcommands:
   - `hls-pkg init NAME` — create a new package skeleton (manifest +
     entry source + README + .gitignore).
   - `hls-pkg add NAME GIT PATH [--tag T | --branch B]` — add a
-    git-based dependency to the manifest.
+    git-based dependency to the manifest (now rejects `--tag` AND
+    `--branch` together; validates the git URL/ref against option
+    injection).
   - `hls-pkg lock` — resolve dependencies, compute SHA-256 of each
     resolved file, extract the package's declared and computed effects
-    via `boot.py --audit`, write `hls-pkg.lock` (JSON). Enforces the
-    package's `effects.allowed` surface: if any dependency's computed
-    effects are not in the allowed set, the lock fails with a
-    per-dependency violation report.
+    via `boot.py --audit`, write `hls-pkg.lock` (JSON, v2 format with
+    `version`/`commit`/`log_seq`). Enforces the package's
+    `effects.allowed` surface: if any dependency's computed effects are
+    not in the allowed set, the lock fails with a per-dependency
+    violation report. Appends a transparency-log record per dep.
   - `hls-pkg audit` — print the total effect report of the resolved
     dependency tree (per-package declared vs transitive effects + a
     total summary).
   - `hls-pkg verify` — verify the lockfile's SHA-256 hashes still
-    match the resolved files (defence against silent upstream mutation).
+    match the resolved files (now also verifies git commits and
+    transparency-log entries).
   - `hls-pkg build [--entry main.hls]` — compile the package's entry
-    point with the resolved dependencies on the import path.
+    point with the resolved dependencies on the import path. Symlinks
+    directories for multi-file packages; validates lockfile hashes
+    before building (fail-closed on TOCTOU).
+  - `hls-pkg publish` — append the current package to the transparency log.
+  - `hls-pkg log [--verify]` — print the transparency log / verify its chain.
 - Manifest format: `hls-pkg.toml` (minimal TOML parser) with
   `[package]`, `[dependencies]`, `[effects]` sections.
-- Lockfile format: `hls-pkg.lock` (JSON) with per-package
-  `name`, `source`, `sha256`, `effects`, `transitive_effects`,
-  `resolved_path`.
+- Lockfile format: `hls-pkg.lock` (JSON v2) with per-package
+  `name`, `source`, `version`, `commit`, `sha256`, `effects`,
+  `transitive_effects`, `resolved_path`, `log_seq`.
 - Effect extraction: a temporary `pure` main wrapper is generated
   alongside the target file so library files (without `main`) can be
   audited. The wrapper's `pure` keyword ensures it doesn't pollute
   the audit with IO-family effects.
-- Git dependencies are cloned into `.hls-pkg-cache/` (gitignored).
+- Git dependencies are cloned into `.hls-pkg-cache/` (gitignored),
+  with `--` separator before the URL (defends against git option
+  injection — `git = "--upload-pack=/tmp/evil"` is now rejected).
 - New example: `examples/pkg_demo.hls` showing how a package's
   `hls-pkg.toml` looks in practice.
 
-**Remaining work for Stage 13 (release and beyond):**
+**v0.23.0-alpha security + soundness fixes (deep-scan-6):**
 
-- Transparency log: every published package version is appended to a
-  publicly-verifiable append-only log (like Certificate Transparency).
-- Decentralised registry: today's resolver fetches git repos directly;
-  the release target is a registry API with content-addressed storage.
-- Multi-file packages: today's resolver treats each dependency as a
-  single `.hls` file; multi-file packages with internal imports are
-  the release target.
+- **Git option injection** (Critical): `git = "--upload-pack=evil"` or
+  `tag = "--upload-pack=evil"` would be passed to git as a flag,
+  executing arbitrary commands. Now `_validate_git_arg` rejects any
+  value starting with `-` or containing NUL bytes; `git clone` is
+  invoked with `--` before positional args.
+- **`_confine` symlink escape** (Critical): `os.path.normpath` doesn't
+  resolve symlinks, so `path = "symlink_to_etc_passwd"` passed the
+  old confinement check. Now uses `os.path.realpath` for both `full`
+  and `base_real`, matching the runtime sandbox's behaviour.
+- **Manifest shape validation** (Critical): non-dict sections
+  (`[a]` then `[a.b]` where `a` was a string), empty section headers
+  (`[]`), empty keys (`= value`), non-list `effects.allowed`
+  (a string `allowed = "IO"` used to expand to `{"I", "O"}`),
+  and non-dict `dependencies`/`source` entries now raise clean errors
+  instead of crashing with `AttributeError`/`TypeError`.
+- **Lockfile shape validation** (Critical): malformed lockfile entries
+  (non-object, missing/non-string `name`, wrong-typed `sha256`)
+  now print a clean error instead of crashing.
+- **`extract_effects` fail-open** (High): if the audit produced
+  unparseable output (e.g. format drift), the old code returned
+  `([], [])` — recording the dependency as PURE. Now fails closed.
+- **`extract_effects` "pure + IO, Fs" drop** (High): the old parser
+  stripped `"pure"` from `pure + IO, Fs`, leaving `" + IO, Fs"` whose
+  `strip()` didn't match `IO` after the comma split. Now strips the
+  explicit `"pure + "` prefix.
+- **`cmd_init` path traversal** (High): `hls-pkg init ../evil` or
+  `hls-pkg init /tmp/owned` used to create directories outside cwd.
+  Now `_validate_dep_name` rejects names containing `/`, `..`, or
+  starting with `.` or `-`.
+
+**Remaining work for Stage 13 (future releases):**
+
+- Decentralised registry: today's resolver fetches git repos directly
+  and the transparency log is a single local file; the future target
+  is a registry API with content-addressed storage and a public
+  transparency log (like Certificate Transparency).
 - Re-implement `hls-pkg` in HLS itself (today it's Python; the
   roadmap's "every feature must self-compile" rule applies).
-- Versioning: lockfile should record the resolved version, not just
-  the SHA-256 (today the tag/branch is recorded but not verified).
 
-**Acceptance:** install a third-party package, view its effect report, build
-bit-for-bit reproducibly from the lockfile. (The v0.11.0-alpha release
-implements the core cycle; the transparency log and decentralised
-registry are the Stage 13 release target.)
+**Acceptance:** install a third-party package, view its effect report,
+build bit-for-bit reproducibly from the lockfile. ✅ **Done in v0.23.0-alpha.**
+(The transparency log, multi-file packages, and version verification
+close the Stage 13 release acceptance criteria.)
 
 ## STAGE 14 — Tooling: LSP, formatter, linter 🔄 (alpha v0.12.0-alpha)
 

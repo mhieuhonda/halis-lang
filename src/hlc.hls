@@ -496,6 +496,23 @@ fn lex(ctx: Ctx) -> void {
                     j = j + 1
                 }
             }
+            # SCAN-C fix: scientific notation. After the integer or
+            # fractional part, accept optional `e`/`E` + optional
+            # `+`/`-` + digits. Mirrors the Stage-0 lexer fix in
+            # boot/lexer.py.
+            if j < n && (src.byte_at(j) == 101 || src.byte_at(j) == 69) {
+                let mut k: int = j + 1
+                if k < n && (src.byte_at(k) == 43 || src.byte_at(k) == 45) {
+                    k = k + 1
+                }
+                if k < n && is_digit(src.byte_at(k)) {
+                    is_f = true
+                    j = k
+                    while j < n && (is_digit(src.byte_at(j)) || src.byte_at(j) == 95) {
+                        j = j + 1
+                    }
+                }
+            }
             let text: str = filter_us(src.slice(i, j))
             if is_f {
                 ctx.toks.push(mk_tok("float", text, line, col))
@@ -3755,6 +3772,7 @@ fn check_match(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, expecte
     # Check exhaustiveness and arm types.
     let covered: list[str] = []
     let mut has_wildcard: bool = false
+    let mut wildcard_idx: int = -1  # SCAN-C: track position for non-last check
     let arm_types: list[str] = []
     let mut arm_n: int = 0
     while arm_n < ctx.exprs[e].args.len() {
@@ -3762,6 +3780,15 @@ fn check_match(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, expecte
         let arm: MatchArm = ctx.match_arms.get(arm_idx)
         if arm.pat_kind == "wildcard" {
             has_wildcard = true
+            # SCAN-C fix: a wildcard arm not in the LAST position
+            # generates invalid C (the codegen emits `if (...) {...}
+            # else {...} else if (...) {...}` — the trailing `else if`
+            # has no matching `if`). Reject at check time with a clear
+            # error rather than letting gcc emit a confusing parse error.
+            if arm_n < ctx.exprs[e].args.len() - 1 {
+                cerr(arm.line, "wildcard arm must be the last arm in a match (found at position " + arm_n.to_str() + " of " + ctx.exprs[e].args.len().to_str() + ")")
+            }
+            wildcard_idx = arm_n
         } else {
             if arm.enum_name != ename {
                 cerr(arm.line, "match arm pattern belongs to enum " + arm.enum_name + ", not " + ename)
@@ -6623,10 +6650,19 @@ fn gen_stmt(ctx: Ctx, sidx: int, ind: str) -> void {
         # change (fresh subexpressions must be re-evaluated per
         # iteration). Use the `while (1) { temps; if (!c) break; ... }`
         # transform so the temps (and their releases) are per-iteration.
+        #
+        # SCAN-C fix: hoist_all was called BEFORE pushing `while (1) {`,
+        # so the hoisted temps were emitted OUTSIDE the loop body —
+        # contradicting the adjacent comment. A condition like
+        # `while len(f()) > 0` (where `f()` returns a fresh list) used
+        # to call `f()` only ONCE before the loop, then reuse the same
+        # stale pointer every iteration — leading to infinite loops or
+        # use-after-free if the list was mutated. Emit the temps AFTER
+        # the `while (1) {` line so they re-execute per iteration.
         if ctx.hoist_map.keys().len() > 0 {
+            ctx.out.push(ind + "while (1) {")
             hoist_all(ctx, ctx.out, ind + "    ")
             let c: str = gen_expr(ctx, s.cond)
-            ctx.out.push(ind + "while (1) {")
             ctx.out.push(ind + "    if (!(" + c + ")) break;")
             gen_stmts(ctx, s.body, ind + "    ")
             ctx.out.push(ind + "}")

@@ -124,9 +124,21 @@ def parse_header(src: str) -> list:
                         pname = arr.group(1)
                         ptype = _parse_c_type(" ".join(tokens[:-1]) + " *")
                     else:
-                        pname = last.lstrip("*")
-                        ptype_str = " ".join(tokens[:-1])
-                        ptype = _parse_c_type(ptype_str, p)
+                        # SCAN-B fix: function-pointer params (`int (*cb)(int)`)
+                        # used to leak into `pname = "(*cb)(int)"`, emitting
+                        # unparseable HLS. Detect parens in the last token
+                        # and synthesize `_argN` instead.
+                        if "(" in last or ")" in last:
+                            pname = "_arg%d" % len(params)
+                            sys.stderr.write(
+                                "warning: function-pointer parameter %r in "
+                                "%s is not supported; synthesizing an opaque "
+                                "ptr parameter named %s\n" % (last, p, pname))
+                            ptype = "ptr"
+                        else:
+                            pname = last.lstrip("*")
+                            ptype_str = " ".join(tokens[:-1])
+                            ptype = _parse_c_type(ptype_str, p)
                 params.append((pname, ptype))
         decls.append({"name": name, "ret": ret_type, "params": params})
     # BUG (deep-scan-5): declarations containing function pointers (or any

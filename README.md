@@ -348,17 +348,39 @@ Full details: [SPEC.md](SPEC.md) · Stage-by-stage roadmap:
   sequence, critical for differential testing. `net_lookup` and
   `proc_exec` are also TAINT SINKS (tainted host → DNS rebinding;
   tainted command → shell injection). **185/185 tests PASS**.
-- ⬜ Stage 10-gamma (sandboxed compile mode, first-class taint labels,
-  runtime taint flag in the native backend), concurrency (Stage 16),
-  formal verification (Stage 17), testing ecosystem (Stage 18),
-  docs/book/playground (Stage 19), v1.0 (Stage 20)...
+- ✅ **Stage 10 release — Taint tracking & sandbox** (v0.21.0-alpha):
+  `--sandbox DIR` restricts filesystem builtins to DIR (both
+  interpreter and native runtime). New taint source `read_line() ->
+  tainted[str]`. `--sandbox` rejects `extern "C"` blocks (FFI
+  bypasses the sandbox). 191/191 tests PASS.
+- ✅ **Stage 11 release — SSA IR + optimisation** (v0.21.0-alpha):
+  Two new optimiser passes — `inline_small` (inlines small pure
+  functions at their call sites) and `licm` (hoists loop-invariant
+  expressions out of loop bodies). 191/191 tests PASS.
+- ✅ **Stage 12 release — Native LLVM backend** (v0.22.0-alpha):
+  The LLVM IR text backend now lowers struct literals, enum literals,
+  match expressions, the `?` operator, struct field access and
+  assignment via a typed runtime API. The `noreturn` attribute is
+  attached to `hl_die`/`hl_panic`/`hl_exit` so the optimiser cannot
+  DCE the trailing `unreachable`. 199/199 + 13/13 LLVM tests PASS.
+- ✅ **Stage 13 release — Package manager `hls-pkg`** (v0.23.0-alpha):
+  Transparency log (append-only, SHA-256-chained JSON-lines),
+  multi-file packages (directory deps with content-addressed hashing),
+  version verification (records + verifies the git commit SHA).
+  New CLI: `hls-pkg publish` + `hls-pkg log [--verify]`. 199/199 +
+  13/13 LLVM tests PASS.
+- ⬜ Stage 14 release (tooling: LSP/plugins), Stage 15 release (safe
+  C FFI), concurrency (Stage 16), formal verification (Stage 17),
+  testing ecosystem (Stage 18), docs/book/playground (Stage 19),
+  v1.0 (Stage 20)...
 
 ## Contributing
 
 Every contribution must preserve the core guarantees and pass
-`make test` (185 tests, including differential testing of the two
-implementations). Every new feature must first be used inside `hlc` itself —
-the compiler is always the first customer of the language.
+`make test` (199 tests, including differential testing of the two
+implementations + 13 LLVM IR tests). Every new feature must first be
+used inside `hlc` itself — the compiler is always the first customer
+of the language.
 
 **Branch protection:** the `main` branch is protected — all non-admin
 contributors must open a pull request. CI must pass on every PR (full

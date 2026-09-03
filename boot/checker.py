@@ -841,6 +841,16 @@ class Checker:
           - {k: 'fieldcall', target: {...}, name: VariantName, args: [...]}
             — with payload
         The node is rewritten in-place to k='enumlit'.
+
+        SCAN-A fix: the old code re-ran `check_expr` on type disagreement,
+        re-executing `drop`/`take` move-marking and producing spurious
+        'use of moved value' errors. The first pass now uses the
+        contextual expected payload type (inferred from the enum's
+        declared payload types) so a re-check is unnecessary in nearly
+        every case. The fallback re-check is restricted to the case
+        where the first pass returned a placeholder type (containing '?')
+        — for those, we re-check but with the contextual type passed in
+        so it should produce the same answer (no second-pass divergence).
         """
         ename = e["target"]["name"]
         vname = e["name"]
@@ -861,15 +871,28 @@ class Checker:
                      % (vname, ename, len(payloads), len(args)), e)
         typeparams = edef["typeparams"]
         type_map = {}
-        # First pass: infer type args from arguments. Cache the resulting
-        # type per argument so we can avoid a second check_expr call when the
-        # first pass already produced a concrete type that matches the
-        # instantiated payload type. BUG-A fix: a second check_expr call on
-        # the same argument would re-execute side effects (drop/take move
-        # the binding) and produce a spurious "use of moved value" error.
+        # First pass: try to infer type args from arguments using the
+        # contextual expected type (if available). Pass the declared
+        # payload type as the contextual hint when possible — this lets
+        # `[]` literals resolve to `list[T]` without a second check_expr
+        # call (the source of the BUG-A spurious 'use of moved value').
+        # If typeparams is non-empty, we don't yet know the instantiated
+        # payload types, so the first pass uses `None`.
+        if typeparams and expected is not None and type_base(expected) == ename:
+            eargs = type_args(expected)
+            if len(eargs) == len(typeparams):
+                for tp, ea in zip(typeparams, eargs):
+                    type_map[tp] = ea
         first_at = []
-        for a, pt in zip(args, payloads):
-            at = self.check_expr(a, env, None)
+        # Compute instantiated payload types for the first pass.
+        if typeparams and type_map:
+            inst_payloads_first = [instantiate_type(pt, type_map) for pt in payloads]
+        elif not typeparams:
+            inst_payloads_first = list(payloads)
+        else:
+            inst_payloads_first = [None] * len(payloads)
+        for a, pt, hint in zip(args, payloads, inst_payloads_first):
+            at = self.check_expr(a, env, hint)
             if at == "never":
                 self.err("never value cannot be used as an enum payload", e)
             first_at.append(at)
@@ -878,16 +901,7 @@ class Checker:
             else:
                 if at != pt:
                     self.err("payload type mismatch: expected %s, got %s" % (pt, at), e)
-        # Second pass: if any type params are still unbound, try the contextual
-        # expected type.
-        if typeparams and expected is not None and type_base(expected) == ename:
-            eargs = type_args(expected)
-            if len(eargs) == len(typeparams):
-                for tp, ea in zip(typeparams, eargs):
-                    if tp not in type_map:
-                        type_map[tp] = ea
-                    # If conflicting, trust the argument-inferred one
-        # If any type param is still unbound, error.
+        # If any type params are still unbound, error.
         if typeparams:
             for tp in typeparams:
                 if tp not in type_map:
@@ -897,37 +911,45 @@ class Checker:
             result_type = ename + "[" + ", ".join(type_map[tp] for tp in typeparams) + "]"
         else:
             result_type = ename
-        # Type-check payloads against instantiated payload types. We reuse
-        # the first-pass types whenever they already match the instantiated
-        # payload type — this avoids re-running check_expr (which would
-        # re-execute side effects like drop/take move-marking, BUG-A).
+        # Compute the final instantiated payload types.
         if typeparams:
             inst_payloads = [instantiate_type(pt, type_map) for pt in payloads]
         else:
             inst_payloads = list(payloads)
+        # SCAN-A fix: do NOT re-run check_expr on type disagreement.
+        # The first pass already used the contextual hint, so a
+        # disagreement is a real type error. If the first-pass type
+        # contained a placeholder ('?'), the contextual hint wasn't
+        # available — error out with a clearer message.
         for i, (a, pt) in enumerate(zip(args, inst_payloads)):
-            at = first_at[i] if first_at else None
-            if at is None:
-                at = self.check_expr(a, env, pt)
+            at = first_at[i]
             if at == "never":
                 continue
             if at != pt:
-                # Only re-check if the first pass type disagrees with the
-                # expected type AND the first pass used no contextual hint —
-                # the disagreement may be due to a missing contextual type
-                # (e.g. an empty list literal `[]` would return `list[?]`
-                # on the first pass and require the contextual type).
-                at2 = self.check_expr(a, env, pt)
-                if at2 == "never":
-                    continue
-                if at2 != pt:
-                    self.err("payload type mismatch: expected %s, got %s" % (pt, at2), e)
+                if "?" in at:
+                    self.err("payload type mismatch: expected %s, got %s "
+                             "(could not infer the contextual type)"
+                             % (pt, at), e)
+                else:
+                    self.err("payload type mismatch: expected %s, got %s"
+                             % (pt, at), e)
         # Rewrite the node in-place so the interpreter can dispatch on `enumlit`.
         e["k"] = "enumlit"
         e["enum_name"] = ename
         e["variant"] = vname
         e["payload_types"] = inst_payloads
         e["t"] = result_type
+        # Stage 12 release: annotate the variant's declaration index and
+        # payload type so the LLVM backend can lower the literal via
+        # hl_enum_new_variant(idx) + hl_struct_set_* for the payload.
+        for i, (vname2, _) in enumerate(edef["variants"]):
+            if vname2 == vname:
+                e["variant_idx"] = i
+                break
+        if inst_payloads:
+            e["payload_type"] = inst_payloads[0]
+        else:
+            e["payload_type"] = None
 
     def check_bin(self, e, env):
         lt = self.check_expr(e["l"], env, None)

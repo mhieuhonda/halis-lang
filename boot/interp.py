@@ -46,11 +46,23 @@ def _sandbox_check(path_bytes):
     rejected. We DO allow the path to NOT exist (e.g. file_exists
     probing) — we just check that IF it existed, it would be inside
     the sandbox.
+
+    SCAN-A fix: decode bytes as latin-1 (a 1:1 byte->str mapping) so
+    the realpath comparison runs on the SAME byte sequence as `open()`
+    will use. The previous `errors="replace"` decoded non-UTF-8 bytes
+    to U+FFFD, so the realpath check ran on a different path than the
+    actual open() call — a non-UTF-8-named symlink inside the sandbox
+    pointing outside wasn't caught by the check, but `open()` would
+    still follow it.
     """
     if SANDBOX_ROOT is None:
         return
-    # bytes -> str (the path was passed as HLS str = bytes).
-    p = path_bytes.decode("utf-8", "replace") if isinstance(path_bytes, bytes) else str(path_bytes)
+    # bytes -> str using latin-1 (1:1 byte->str mapping) so the realpath
+    # check uses the EXACT same byte sequence as `open()` will.
+    if isinstance(path_bytes, bytes):
+        p = path_bytes.decode("latin-1")
+    else:
+        p = str(path_bytes)
     if not os.path.isabs(p):
         p = os.path.join(os.getcwd(), p)
     # realpath resolves symlinks; if the path does not exist, it
@@ -885,21 +897,21 @@ class Interp:
             return bytes(v)  # strings are immutable, shallow copy is fine
         if isinstance(v, list):
             return [self.deep_clone(x) for x in v]
-        if isinstance(v, dict) and "enum" not in v:
-            # map[str, T] — copy insertion-ordered dict
+        if isinstance(v, dict):
+            # SCAN-A fix: distinguish enum values from struct values. An
+            # enum value is `{"enum": name, "var": variant, "data": [...]}` —
+            # check for ALL THREE keys. A struct value with a field literally
+            # named "enum" would be `{"enum": value}` — missing "var" and
+            # "data" — so it must be treated as a struct (a plain dict).
+            if "enum" in v and "var" in v and "data" in v:
+                return {"enum": v["enum"], "var": v["var"],
+                        "data": [self.deep_clone(x) for x in v["data"]]}
+            # map[str, T] — copy insertion-ordered dict. Also covers
+            # struct values (which are dicts of field_name -> value).
             new = {}
             for k in v:
                 new[k] = self.deep_clone(v[k])
             return new
-        if isinstance(v, dict) and "enum" in v:
-            # BUG-018: this branch is currently dead because the checker's
-            # `is_clone_supported` rejects enums at check time. It is
-            # INTENTIONALLY KEPT for forward-compatibility — when Stage 8-beta
-            # expands clone() to support structs/enums (per ROADMAP), the
-            # runtime path will be exercised. Removing it now would risk a
-            # silent regression later.
-            return {"enum": v["enum"], "var": v["var"],
-                    "data": [self.deep_clone(x) for x in v["data"]]}
         # primitives (int, float, bool, None)
         return v
 

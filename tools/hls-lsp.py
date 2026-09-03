@@ -228,6 +228,13 @@ class HLSServer:
             "uri": uri, "diagnostics": []})
 
     def _store_doc(self, uri, version, text):
+        # SCAN-B fix: check version monotonicity — out-of-order
+        # didChange notifications (race / network reorder) used to
+        # overwrite newer text with older, silently dropping edits.
+        if uri in self.docs and version is not None:
+            cur = self.docs[uri].get("version")
+            if cur is not None and version <= cur:
+                return  # stale update — ignore
         # Parse + check the document. On syntax/check errors, store the
         # program as None so hover/completion degrade gracefully.
         program = None
@@ -245,6 +252,11 @@ class HLSServer:
             program = {"_error": str(ex),
                        "_error_line": getattr(ex, "line", 0),
                        "_error_col": getattr(ex, "col", 0)}
+        except (MemoryError, RecursionError, OSError):
+            # SCAN-B fix: a huge file or pathological input may crash
+            # tokenize/parse with a non-HLError. Store None so the
+            # editor still gets a (clear) empty-diagnostics notification.
+            program = None
         self.docs[uri] = {"version": version, "text": text, "program": program}
 
     def _publish_diagnostics(self, uri):
@@ -254,6 +266,13 @@ class HLSServer:
         diagnostics = []
         prog = doc.get("program")
         if prog is None:
+            # SCAN-B fix: even when program is None (tokenize/parse
+            # crashed), publish an EMPTY diagnostics list so the editor
+            # clears any stale markers it had from a previous version.
+            self.send_notification("textDocument/publishDiagnostics", {
+                "uri": uri,
+                "diagnostics": [],
+            })
             return
         if "_error" in prog:
             # Syntax error. Use the lexer-reported position when present

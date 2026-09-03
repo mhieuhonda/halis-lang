@@ -8,7 +8,7 @@ HLC     = src/hlc.hls
 BIN     = bin
 PREFIX  ?= /usr/local
 
-.PHONY: all stage0 bootstrap test examples clean run check bench install uninstall audit opt-stats emit-ir emit-llvm fmt lint lsp-check
+.PHONY: all stage0 bootstrap test examples clean run check bench install uninstall audit opt-stats emit-ir emit-llvm fmt lint lsp-check pkg-init pkg-add pkg-lock pkg-audit pkg-verify pkg-build pkg-publish pkg-log pkg-log-verify
 
 # Main goal: use the full bootstrap chain to build the native compiler
 all: bootstrap
@@ -80,6 +80,59 @@ lint:
 # Stage 14: one-shot LSP diagnostics (for non-LSP editors)
 lsp-check:
 	@$(PYTHON) tools/hls-lsp.py --check $(F)
+
+
+# ============================================================================
+# Stage 13 (v0.23.0-alpha): hls-pkg package manager targets
+# ============================================================================
+PKG = $(PYTHON) tools/hls-pkg.py
+
+# Create a new package skeleton: make pkg-init NAME=mylib
+pkg-init:
+	@test "x$(NAME)" != "x" || (echo "Usage: make pkg-init NAME=mylib" && false)
+	@$(PKG) init $(NAME)
+
+# Add a dependency: make pkg-add NAME=std.str GIT=... PATH=std/str.hls TAG=v0.23.0-alpha
+pkg-add:
+	@test "x$(NAME)" != "x" || (echo "Usage: make pkg-add NAME=.. GIT=.. PATH=.. [TAG=..] [BRANCH=..]" && false)
+	@if [ -n "$(TAG)" ] && [ -n "$(BRANCH)" ]; then \
+	  echo "error: --tag and --branch are mutually exclusive"; exit 1; \
+	fi
+	@if [ -n "$(TAG)" ]; then \
+	  $(PKG) add $(NAME) $(GIT) $(PATH) --tag $(TAG); \
+	elif [ -n "$(BRANCH)" ]; then \
+	  $(PKG) add $(NAME) $(GIT) $(PATH) --branch $(BRANCH); \
+	else \
+	  $(PKG) add $(NAME) $(GIT) $(PATH); \
+	fi
+
+# Resolve dependencies + write lockfile + append to transparency log
+pkg-lock:
+	@$(PKG) lock
+
+# Print the total effect report of the dependency tree
+pkg-audit:
+	@$(PKG) audit
+
+# Verify lockfile hashes + commits + transparency-log entries
+pkg-verify:
+	@$(PKG) verify
+
+# Compile the package's entry point with resolved dependencies
+pkg-build:
+	@$(PKG) build --entry $(or $(ENTRY),main.hls)
+
+# Stage 13 release: append the current package to the transparency log
+pkg-publish:
+	@$(PKG) publish
+
+# Print the transparency log
+pkg-log:
+	@$(PKG) log
+
+# Verify the transparency log's chain hashes
+pkg-log-verify:
+	@$(PKG) log --verify
 
 # Run the example programs to verify they still work after a change
 examples:

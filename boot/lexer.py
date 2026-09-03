@@ -101,6 +101,22 @@ def tokenize(src):
                 j += 1
                 while j < n and (48 <= src[j] <= 57 or src[j] == 95):
                     j += 1
+            # SCAN-C fix: scientific notation. After the integer or
+            # fractional part, accept optional `e`/`E` + optional `+`/`-`
+            # + digits. `1e10`, `1.5e-3`, `9.223372036854776e18` are now
+            # lexed as a single float token instead of a float followed
+            # by an `e<digits>` identifier (which caused parse errors
+            # and silent mis-compilation).
+            if j < n and (src[j] == 101 or src[j] == 69):  # 'e' / 'E'
+                k = j + 1
+                if k < n and (src[k] == 43 or src[k] == 45):  # '+' / '-'
+                    k += 1
+                if k < n and 48 <= src[k] <= 57:
+                    # Valid exponent — consume it.
+                    is_float = True
+                    j = k
+                    while j < n and (48 <= src[j] <= 57 or src[j] == 95):
+                        j += 1
             raw_text = src[i:j].decode("ascii")
             text = raw_text.replace("_", "")
             # BUG-DS4-15: keep the RAW source text on the token. Formatters

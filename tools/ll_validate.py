@@ -59,7 +59,18 @@ SWITCH_CASE_RE = re.compile(r"^\s*[\w.\-]+\s+[^,]+,\s*label\s+%([\w.$-]+)\s*$")
 LABEL_REF_RE = re.compile(r"label\s+%([\w.$-]+)")
 # `ptr 5` / `ptr -1` as an operand — always invalid (pointers are not
 # integers in LLVM).
-PTR_LIT_RE = re.compile(r"(?:^|\s|,|\()ptr\s+-?\d+(?:\s|,|\)|$)")
+# SCAN-B fix: the old regex only matched integer literals. Float-shaped
+# operands (`ptr 5.0`), hex (`ptr 0x...`), and scientific (`ptr 1e2`)
+# slipped through. Extended to catch all of them.
+PTR_LIT_RE = re.compile(
+    r"(?:^|\s|,|\()ptr\s+"
+    r"(?:"
+    r"-?\d+(?:\.\d*)?(?:[eE][-+]?\d+)?"   # decimal / float / scientific
+    r"|0[xX][0-9a-fA-F]+"                 # hex
+    r"|true|false"                         # boolean (shouldn't be a ptr)
+    r")"
+    r"(?:\s|,|\)|$)"
+)
 
 
 def validate(text, name="<module>"):

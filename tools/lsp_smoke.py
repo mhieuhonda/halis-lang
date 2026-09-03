@@ -30,12 +30,29 @@ def frame(obj):
 
 
 def parse_frames(buf):
+    """Parse LSP frames from `buf`. Returns list of decoded JSON messages.
+
+    SCAN-B fix: wrap the `int()` and `buf.index()` calls in try/except
+    so a malformed Content-Length header or missing CRLF separator
+    doesn't crash the smoke test with a raw ValueError (which would
+    mask the actual LSP failure we're trying to diagnose)."""
     msgs = []
     while b"Content-Length:" in buf:
         i = buf.index(b"Content-Length:")
-        j = buf.index(b"\r\n\r\n", i)
-        n = int(buf[i + 16:j])
-        msgs.append(json.loads(buf[j + 4:j + 4 + n]))
+        try:
+            j = buf.index(b"\r\n\r\n", i)
+            n = int(buf[i + 16:j])
+        except (ValueError, OSError):
+            # Malformed header — stop parsing what we have.
+            break
+        if j + 4 + n > len(buf):
+            # Truncated body — wait for more bytes (or stop).
+            break
+        try:
+            msgs.append(json.loads(buf[j + 4:j + 4 + n]))
+        except ValueError:
+            # Invalid JSON body — skip this frame, continue parsing.
+            pass
         buf = buf[j + 4 + n:]
     return msgs
 

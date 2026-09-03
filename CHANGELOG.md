@@ -8,6 +8,154 @@ Releases on `main` follow the 20-stage roadmap (see [ROADMAP.md](ROADMAP.md)).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
+## [v0.23.0-alpha] — Stage 13 release + deep-scan-6 bug sweep
+
+> **Stage 13 — Package manager `hls-pkg` — is COMPLETE.** The package
+> manager now supports the **transparency log** (append-only,
+> SHA-256-chained JSON-lines log), **multi-file packages** (directory
+> deps), and **version verification** (records + verifies the git commit
+> SHA). A deep codebase scan found and fixed **35+ bugs** across
+> `tools/hls-pkg.py`, `tools/hlfmt.py`, `tools/hls-lsp.py`,
+> `tools/hlbindgen.py`, `tools/ll_validate.py`, `tools/lsp_smoke.py`,
+> `boot/lexer.py`, `boot/interp.py`, `boot/checker.py`, `src/hlc.hls`,
+> and `std/*.hls`. **199/199 + 13/13 LLVM tests PASS**; the bootstrap
+> is still deterministic.
+
+### Stage 13 release — transparency log + multi-file + version verify
+
+- **Transparency log** (`.hls-pkg-transparency.log`): append-only
+  JSON-lines file. Each record has `seq`, `timestamp`, `prev_hash`,
+  `chain_hash` (= `SHA-256(prev_hash || canonical-JSON(record))`).
+  Tamper-evidence: rewriting any past record breaks the chain.
+  - `hls-pkg publish` — append the current package's content hash.
+  - `hls-pkg log` — print the log as a table.
+  - `hls-pkg log --verify` — recompute every chain hash.
+  - `hls-pkg lock` — appends a per-dep record.
+  - `hls-pkg verify` — looks up each dep in the log and warns on
+    missing/mismatched entries.
+- **Multi-file packages**: when `source.path` is a directory,
+  `resolve_dependency` returns the directory; `hls-pkg lock` computes
+  a deterministic content hash over the sorted file walk; `hls-pkg build`
+  symlinks the whole dir into `.hls-pkg-deps/<name>/` so sibling
+  imports resolve.
+- **Version verification**: lockfile records the resolved `version`
+  (tag/branch) AND the 40-char git `commit` SHA. `hls-pkg verify`
+  re-runs `git rev-parse HEAD` and compares; a moved tag is reported.
+- New CLI commands: `hls-pkg publish`, `hls-pkg log [--verify]`.
+- Lockfile format bumped to v2 (added `version`, `commit`, `log_seq`).
+
+### Deep-scan-6 fixes (35+ critical / high / medium bugs)
+
+**Critical:**
+
+- `tools/hls-pkg.py` — git option injection: `git = "--upload-pack=evil"`
+  used to execute arbitrary commands. Now `_validate_git_arg` rejects
+  values starting with `-`; `git clone` invoked with `--` separator.
+- `tools/hls-pkg.py` — `_confine` symlink escape: `os.path.normpath`
+  doesn't resolve symlinks; now uses `os.path.realpath`.
+- `tools/hls-pkg.py` — manifest shape validation: non-dict sections,
+  empty section headers, empty keys, non-list `effects.allowed`,
+  non-dict `dependencies`/`source` now raise clean errors.
+- `tools/hls-pkg.py` — lockfile shape validation: malformed entries
+  (non-object, missing `name`, wrong-typed `sha256`) now print clean
+  errors instead of crashing.
+- `tools/hls-pkg.py` — `cmd_init` path traversal: `hls-pkg init ../evil`
+  used to create directories outside cwd. Now `_validate_dep_name`
+  rejects names with `/`, `..`, or leading `.`/`-`.
+
+**High:**
+
+- `boot/interp.py` — `deep_clone` KeyError on a struct with a field
+  literally named `"enum"`. Now distinguishes enum values from struct
+  values by checking for ALL THREE keys (`enum`, `var`, `data`).
+- `boot/interp.py` — `_sandbox_check` UTF-8 bypass: decoded bytes with
+  `errors="replace"` (U+FFFD), so the realpath check ran on a different
+  path than `open()` would use. Now uses latin-1 (1:1 byte->str).
+- `boot/checker.py` — `check_enum_variant` re-ran `check_expr` on type
+  disagreement, re-executing `drop`/`take` move-marking and producing
+  spurious "use of moved value" errors. The first pass now uses the
+  contextual expected payload type, avoiding the re-check.
+- `tools/llvm_emit.py` — `list[tainted[T]].pop()` dispatched to
+  `hl_list_pop` (returns ptr) instead of `hl_list_pop_i64`. Now strips
+  the `tainted[...]` wrapper before dispatching.
+- `tools/llvm_emit.py` — `_coerce` missing `i1→double`, `ptr→double`,
+  and `double→i64` paths, producing invalid IR on defensive coercion.
+- `tools/llvm_emit.py` — `hl_die`/`hl_panic`/`hl_exit` declared
+  `noreturn` only in comments, not as the LLVM attribute. The optimiser
+  could DCE the trailing `unreachable` and move code across the call.
+  Now `attributes #0 = { noreturn }` is emitted at the end of the module.
+- `tools/hlfmt.py` — `} else {` and `} else if {` used to break onto
+  separate lines (the `}` peek set missed the `else` keyword).
+- `tools/hls-lsp.py` — `_publish_diagnostics` returned early WITHOUT
+  publishing an empty list when `program is None`, so the editor
+  retained stale diagnostics. Now always publishes an empty list.
+- `tools/hls-lsp.py` — `handle_did_change` didn't check version,
+  so out-of-order changes overwrote newer text.
+- `tools/hls-pkg.py` — `extract_effects` dropped effects for
+  `pure + IO, Fs` declarations (stripped `"pure"` from the middle).
+- `tools/hls-pkg.py` — `extract_effects` was fail-OPEN when boot.py
+  exited 0 with unparseable output. Now fails closed.
+- `src/hlc.hls` — `while`-loop with fresh subexpressions in the
+  condition emitted hoisted temps OUTSIDE the loop body (the
+  adjacent comment claimed otherwise). Now emits temps AFTER
+  `while (1) {` so they re-execute per iteration.
+- `src/hlc.hls` — wildcard match arm not in the LAST position
+  generated invalid C (`else {...} else if (...)`). Now the checker
+  rejects non-last wildcards with a clear error.
+
+**Medium:**
+
+- `boot/lexer.py` + `src/hlc.hls` — float literals didn't support
+  scientific notation (`1e10`, `1.5e-3`). Both lexers now accept
+  optional `e`/`E` + optional `+`/`-` + digits.
+- `std/json.hls` — `jsonp_parse_string` low-surrogate parse called
+  `jsonp_err` but didn't `return` — fell through to garbage computation
+  with `hd2 = -1`, pushing invalid UTF-8 bytes into `chars`.
+- `std/url.hls` — IPv6 URL with a trailing colon but no port digits
+  (e.g. `http://[::1]:`) called `urlp_parse_port("")`, which panics.
+  Now mirrors the non-IPv6 path's guard.
+- `std/math.hls` — `math_floor`/`math_ceil`/`math_round` called
+  `x.to_int()` which panics for floats outside int64 range
+  (e.g. `1e20`, +/-inf). Now handle out-of-range floats cleanly.
+- `std/math.hls` — `math_abs_int(INT64_MIN)` overflowed silently in
+  the interpreter (Python) but panicked in the native runtime —
+  differential-test divergence. Now panics explicitly.
+- `std/math.hls` — `math_sqrt(-0.0)` returned NaN (Newton's method
+  computes `-0.0 / -0.0`). Now returns -0.0 (matches libm sqrt).
+- `tools/lsp_smoke.py` — `parse_frames` ValueError on malformed
+  Content-Length header. Now wraps in try/except.
+- `tools/ll_validate.py` — `PTR_LIT_RE` only matched integer
+  operands; `ptr 5.0`, `ptr 0x...` slipped through. Extended.
+- `tools/hlbindgen.py` — function-pointer params (`int (*cb)(int)`)
+  produced unparseable HLS identifiers. Now synthesizes `_argN`.
+
+### Stage 12 release — struct/enum/match lowering (v0.22.0-alpha)
+
+> **Stage 12 — Native LLVM backend — is now feature-complete** for the
+> alpha-subset language surface. The LLVM IR text backend now lowers
+> struct literals, enum literals, match expressions, the `?` operator,
+> struct field access and assignment, and tagged-union payloads via a
+> typed runtime API.
+
+- **Struct literals** lower via `hl_struct_alloc(size) + hl_struct_set_*`
+  per field.
+- **Enum literals** lower via `hl_enum_new_variant(idx) + hl_enum_payload()`.
+- **Match expressions** lower to a `switch` on `hl_enum_tag`.
+- **`?` operator** lowers to a tag check + branch on the Ok variant.
+- **Struct field access/assignment** lowers via the typed
+  `hl_struct_get_*/set_*` helpers.
+- **`noreturn` attribute** on `hl_die`/`hl_panic`/`hl_exit`.
+- **`_coerce` improvements**: added `i1→double`, `ptr→double`, `double→i64`.
+- **`list[tainted[T]].pop()` fix**: strips the `tainted[...]` wrapper.
+- The checker now annotates `structlit` nodes with `sfields`, `enumlit`
+  nodes with `variant_idx` and `payload_type`, so the LLVM backend can
+  dispatch to the right runtime helpers.
+
+## [v0.22.0-alpha] — Stage 12 release (LLVM struct/enum/match lowering)
+
+(Same content as the "Stage 12 release" section above — kept as a
+separate version-tagged entry for git tag / release notes.)
+
 ## [v0.21.0-alpha] — Stage 10 + Stage 11 release + deep-scan fixes
 
 > **Stage 10 — Taint tracking & sandbox — is COMPLETE.** Sandboxed
