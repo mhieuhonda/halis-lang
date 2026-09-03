@@ -20,7 +20,7 @@ performance — the C compiler's `-O2` is still the primary optimiser.
 """
 from __future__ import annotations
 from typing import Dict, Set
-from . import (HLIRModule, HLIRFunction, Block, Instr,
+from . import (HLIRModule, HLIRFunction, Instr,
                OP_CONST, OP_BINOP, OP_UNOP, OP_LOAD, OP_STORE,
                OP_CALL, OP_METHOD, OP_BUILTIN, OP_BRANCH, OP_JUMP,
                OP_RETURN, OP_PANIC)
@@ -80,10 +80,23 @@ def _fold_binop(op, a, b):
                     return r, True
         elif op == "/":
             if isinstance(a, int) and isinstance(b, int) and b != 0:
+                # BUG-DS4-13: INT64_MIN / -1 raises "integer overflow" at
+                # runtime (i64_div / hl_div_i64 check for it), and the
+                # mathematical result (+2^63) does not even fit in int64.
+                # The old folder returned (2**63, True) — a value no backend
+                # can represent. Do not fold; let the runtime panic.
+                if a == INT64_MIN and b == -1:
+                    return None, False
                 q = abs(a) // abs(b)
                 return (q if (a < 0) == (b < 0) else -q), True
         elif op == "%":
             if isinstance(a, int) and isinstance(b, int) and b != 0:
+                # BUG-DS4-13: INT64_MIN % -1 panics at runtime (i64_mod /
+                # hl_mod_i64), even though the mathematical result is 0.
+                # Folding it to 0 would REMOVE the panic and change program
+                # behaviour. Do not fold.
+                if a == INT64_MIN and b == -1:
+                    return None, False
                 r = abs(a) % abs(b)
                 return (r if a >= 0 else -r), True
         elif op == "==":
@@ -315,7 +328,10 @@ def _annotate_safe(irf: HLIRFunction):
             # Try to identify a literal-0 operand.
             a_is_zero = a_arg[0] == "lit" and a_arg[1] == 0
             b_is_zero = b_arg[0] == "lit" and b_arg[1] == 0
-            if (op == "+" or op == "-") and (a_is_zero or b_is_zero):
+            # BUG-DS4-14: `0 - x` is NOT overflow-safe — 0 - INT64_MIN
+            # overflows to +2^63. Only `x - 0` (and `x + 0`, `x * 0`) are
+            # genuinely safe. The old code annotated `(0 - x)` as safe.
+            if op == "+" and (a_is_zero or b_is_zero):
                 # BUG-SC-IR-5 fix: Instr is a @dataclass with attrs: Optional[Dict]
                 # defaulting to None. `hasattr(ins, "attrs")` is always True
                 # (the attribute exists), so the guard never initialized it,
@@ -324,7 +340,7 @@ def _annotate_safe(irf: HLIRFunction):
                 if ins.attrs is None:
                     ins.attrs = {}
                 ins.attrs["safe_overflow"] = True
-            elif op == "*" and (a_is_zero or b_is_zero):
+            elif op == "-" and b_is_zero:
                 if ins.attrs is None:
                     ins.attrs = {}
                 ins.attrs["safe_overflow"] = True

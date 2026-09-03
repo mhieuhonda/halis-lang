@@ -538,11 +538,19 @@ infrastructure; benchmarking is the Stage 11 release target.)
 
 **Status (v0.10.0-alpha):** the **alpha subset of Stage 12** has shipped.
 A new LLVM IR text backend emits `.ll` files from a checked HLS program.
-The IR can be assembled by `llc` or `clang` (when available) into a
-native binary. The C backend remains the primary codegen path; the LLVM
+The C backend remains the primary codegen path; the LLVM
 backend is a parallel infrastructure for the Stage 12 release target.
-**145/145 tests PASS** (no test changes; the LLVM emitter is a new
-diagnostic pass, parallel to the C backend).
+
+**v0.16.0-alpha (deep-scan-4) correctness overhaul:** the alpha's claim
+that "the IR can be assembled by llc or clang" was false for almost every
+program (i1/i64 boolean mixups, eager `&&`/`||`, missing element boxing,
+instructions after terminators, runtime symbol mismatches, silently-broken
+struct/enum/match/`?` stubs). The emitter was rewritten where broken: the
+supported subset now emits **structurally valid, semantics-matched IR**,
+verified by a new dependency-free validator (`tools/ll_validate.py`) and
+by `llvm-as` where available (`tests/run_llvm_tests.sh`). Constructs the
+backend does not support yet now raise a clean compile error instead of
+emitting garbage. **154/154 + 13/13 LLVM-suite tests PASS.**
 
 **Shipped in v0.10.0-alpha (Stage 12-alpha):**
 

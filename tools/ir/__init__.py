@@ -38,6 +38,28 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, List, Dict, Optional, Tuple
 
+import os
+import sys
+
+# Resolve HLError whether we are imported via `boot.py` (sys.path contains
+# the repo root) or run from anywhere.
+try:
+    from boot.lexer import HLError  # type: ignore
+except ImportError:  # pragma: no cover
+    _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if _REPO_ROOT not in sys.path:
+        sys.path.insert(0, _REPO_ROOT)
+    from boot.lexer import HLError  # type: ignore
+
+
+def _unsupported_ir(what: str, node):
+    """Raise a clean compile error for constructs the HLIR layer does not
+    model yet. Silently emitting `const None` (the old behaviour) made
+    `--emit ir` misrepresent programs — a clean error is honest."""
+    line = node.get("line", 0) if isinstance(node, dict) else 0
+    raise HLError("%s is not yet supported by --emit ir "
+                  "(Stage 11 IR subset)" % what, line, 0)
+
 
 @dataclass
 class Instr:
@@ -140,6 +162,12 @@ class IRBuilder:
 
     def build(self):
         for fname, fn in self.program["fns"].items():
+            # BUG-DS4-11: extern fns have no body — building them produced
+            # an IR "function" whose only content is a synthetic
+            # `panic "missing return"` terminator, polluting --emit ir
+            # output. Skip them (they are declarations, not definitions).
+            if fn.get("extern", False):
+                continue
             self.mod.functions[fname] = self._build_fn(fname, fn)
         return self.mod
 
@@ -401,8 +429,16 @@ class IRBuilder:
                               + [("name", fname) for fname, _ in e["fields"]]
                               + [("var", a) for a in args],
                               e.get("line", 0))
-        # Fallback: emit a const None so we don't crash the optimiser.
-        return self._emit(OP_CONST, [("lit", None)], e.get("line", 0))
+        # Fallback for unsupported expression kinds.
+        # BUG-DS4-12: this used to silently emit `const None` for enum
+        # literals (the checker rewrites Enum.Variant to k='enumlit'), so
+        # --emit ir silently misrepresented every program using enums —
+        # the payload was dropped and matches read `match %t1` over None.
+        # A clean error is honest; the IR layer does not model enums yet.
+        if k == "enumlit":
+            _unsupported_ir("enum literal (%s.%s)" % (
+                e.get("enum_name", "_"), e.get("variant", "_")), e)
+        _unsupported_ir("expression kind '%s'" % k, e)
 
 
 # ----------------------------------------------------------------------------
