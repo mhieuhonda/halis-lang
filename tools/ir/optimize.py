@@ -339,13 +339,26 @@ def _dead_code_elim(irf: HLIRFunction):
 
 def _has_side_effects(ins: Instr) -> bool:
     """An instruction has side effects if it can affect external state."""
-    # Pure operations: const, unop (! and float negation), load,
-    # list_new, struct_new, struct_get, map_get, list_len.
+    # Pure operations: const, load, list_new, struct_new, struct_get,
+    # map_get, list_len, and OP_UNOP ONLY for `!` (boolean NOT, which
+    # can never panic).
     # BUG (deep-scan-5): binop and list_get were previously classified as
     # pure — but checked arithmetic panics on overflow/div-zero and
     # list_get panics on out-of-bounds; DCE must never erase a required
     # panic.
-    if ins.op in (OP_CONST, OP_UNOP, OP_LOAD,
+    # Deep-scan-7 fix: OP_UNOP was classified as pure for ALL unary
+    # operations, but `-` on int can panic on INT64_MIN (signed
+    # overflow). DCE could erase a `let x: int = -y` whose only
+    # consumer is the side-effectful panic — losing the panic. Now
+    # we conservatively treat `-` as impure (boolean `!` is still
+    # pure since booleans can't overflow).
+    if ins.op == OP_UNOP:
+        # The op is stored as the first arg's value.
+        if ins.args and ins.args[0][0] == "op" and ins.args[0][1] == "!":
+            return False  # boolean NOT — pure
+        # Any other unary op (including `-`) may panic.
+        return True
+    if ins.op in (OP_CONST, OP_LOAD,
                   "list_new", "struct_new", "struct_get",
                   "map_get", "list_len"):
         return False

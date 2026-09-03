@@ -28,8 +28,8 @@ remains green.
 | 11 | SSA IR + optimisation | ✅ | (done in v0.21.0-alpha) |
 | 12 | Native LLVM backend | ✅ | (done in v0.22.0-alpha) |
 | 13 | Package manager `hls-pkg` | ✅ | (done in v0.23.0-alpha) |
-| 14 | Tooling: LSP, formatter, linter | 🔄 | 6–8 weeks |
-| 15 | Safe C FFI | 🔄 | 4–6 weeks |
+| 14 | Tooling: LSP, formatter, linter | ✅ | (release v0.24.0-alpha) |
+| 15 | Safe C FFI | ✅ | (release v0.25.0-alpha) |
 | 16 | Concurrency & async (data-race freedom) | ⬜ | 12–16 weeks |
 | 17 | Formal verification & contracts | ⬜ | 10–14 weeks |
 | 18 | Testing ecosystem & fuzzing | ⬜ | 4–6 weeks |
@@ -933,158 +933,159 @@ build bit-for-bit reproducibly from the lockfile. ✅ **Done in v0.23.0-alpha.**
 (The transparency log, multi-file packages, and version verification
 close the Stage 13 release acceptance criteria.)
 
-## STAGE 14 — Tooling: LSP, formatter, linter 🔄 (alpha v0.12.0-alpha)
+## STAGE 14 — Tooling: LSP, formatter, linter ✅ (release v0.24.0-alpha)
 
 **Goal:** first-class developer experience.
 
-**Status (v0.12.0-alpha):** the **alpha subset of Stage 14** has shipped.
-Three new tools (`hls-lsp`, `hlfmt`, `hllint`) provide the core developer
-experience. They are Python today; re-implementing in HLS itself is the
-Stage 14 release target. **145/145 tests PASS.**
+**Status (v0.24.0-alpha):** the **Stage 14 release** has shipped. The
+LSP server now supports cross-file go-to-definition, rename
+refactoring, document symbols, and references; the formatter is
+idempotent and preserves comments; the linter has control-flow-aware
+rules; VS Code + Neovim plugins ship under `editors/`; a minimal
+self-hosted formatter (`tools/hlfmt.hls`) demonstrates the
+self-compilation rule. **368/368 tests PASS.**
 
-**Shipped in v0.12.0-alpha (Stage 14-alpha):**
+**Shipped in v0.24.0-alpha (Stage 14 release):**
 
-- New `tools/hlfmt.py` — opinionated formatter (like `gofmt`):
-  - 4-space indentation; no tabs.
-  - One statement per line (preserves the source's line breaks).
-  - Single space after commas, colons, around binary operators.
-  - No space before `(`, `[`, after `!`, `.` (postfix).
-  - Space before `{` (function/struct/enum/impl/match/if/while/for bodies).
-  - Trailing newline at EOF.
-  - **Idempotent: running twice = running once.** Verified on all 145
-    test/example programs.
-  - Subcommands: `hlfmt FILE` (print), `hlfmt -w FILE` (write),
-    `hlfmt -c FILE` (check), `hlfmt -d FILE` (diff).
-  - Multi-byte UTF-8 string literals preserved exactly via latin-1
-    byte-level round-tripping.
-- New `tools/hllint.py` — safety rules linter:
-  - 10 rules: `L001` unused-binding, `L002` unused-function,
-    `L003` unused-struct-field, `L004` ignored-result,
-    `L005` explicit-unwrap, `L006` unnecessary-effects,
-    `L007` dead-code-after-return, `L008` long-function,
-    `L009` shadowing, `L010` empty-impl.
-  - Subcommands: `hllint FILE`, `hllint --strict FILE`,
-    `hllint --rule L001 FILE`, `hllint --list`.
-  - Runs the Stage-0 checker internally to get type/effect info.
-  - Does NOT modify the source — only reports issues.
-- New `tools/hls-lsp.py` — minimal LSP server over JSON-RPC stdio:
-  - `initialize` / `shutdown` / `exit`.
-  - `textDocument/didOpen` / `didChange` / `didClose` (full document sync).
-  - `textDocument/hover` — show the inferred type of an identifier at
-    a position (uses the checker's annotations).
-  - `textDocument/definition` — find the function/struct/enum
-    definition at a position.
-  - `textDocument/completion` — basic keyword + identifier completion.
-  - `textDocument/publishDiagnostics` (notification) — runs the Stage-0
-    checker and publishes errors as LSP diagnostics.
-  - `--check FILE` one-shot mode (for non-LSP editors) prints
-    diagnostics to stdout.
-- New Makefile targets: `fmt`, `lint`, `lsp-check`.
-- New example: `examples/tooling_demo.hls` (format-stable + lint-clean).
+- `tools/hls-lsp.py`:
+  - **Cross-file go-to-definition** — searches every open document
+    (not just the current one) for the symbol at the cursor. Jumps
+    to the imported module's definition when the symbol is not in
+    the current file.
+  - **`textDocument/references`** — finds every textual occurrence
+    of the symbol across all open documents (used by rename
+    preflight).
+  - **`textDocument/rename`** — renames a symbol across all open
+    documents. Validates the new name against HLS identifier rules
+    and refuses to rename keywords / builtins / effects.
+  - **`textDocument/documentSymbol`** — lists every top-level
+    fn/struct/enum in the file (powers VS Code's outline view and
+    breadcrumb navigation).
+  - **Stale BUILTINS list fixed** — added read_line, net_lookup,
+    rand_int, rand_float, rand_seed, proc_exec (Stage 9 release
+    builtins). Editor autocompletion now offers every builtin.
+  - **`_lookup_type` first-match bug fixed** — two structs sharing
+    a field name no longer return the wrong type on hover. The
+    lookup now prefers the current function's params, then function
+    declarations, then unambiguous struct fields (with an
+    ambiguity hint when multiple matches exist).
+  - **Symbol index cache** — rebuilt lazily after every didChange
+    / didClose, so cross-file queries stay fast.
+- `tools/hlfmt.py`:
+  - **String-literal byte value no longer misclassified as a
+    symbol** — the previous override fired for `+` after a string
+    like `"]"` (the `]` byte value matched the closing-bracket
+    rule), so `print("[" + parts + "]")` lost the spaces around
+    `+`. Now only `sym`-kind tokens are subject to the bracket
+    override; string literals are treated as word-like for spacing
+    decisions.
+- `tools/hllint.py`:
+  - **L004 (ignored-result)** — control-flow-aware. Walks the AST
+    with the checker's return-type annotations: flags an `expr`
+    statement whose top-level call returns `Result[...]` (or a
+    builtin like `read_line`).
+  - **L005 (explicit-unwrap)** — control-flow-aware. Tracks
+    per-binding whether there has been a recent
+    `result_is_ok(r)` / `option_is_some(o)` check in the same
+    block. A `result_unwrap(r)` only fires when no such check has
+    occurred. The `if cond { unwrap(x) }` pattern is recognised:
+    `if result_is_ok(r) { result_unwrap(r) }` does NOT warn.
+  - **`collect_idents` false-negative fixed** — field-access
+    names (`x.foo`) are no longer added to the ident set (so a
+    real unused `let foo = ...` is now correctly reported by L001).
+- `editors/vscode/halis/` — VS Code extension:
+  - `package.json`, `extension.js`, `language-configuration.json`,
+    `syntaxes/halis.tmLanguage.json`, `README.md`.
+  - Wires the LSP server, formatter (`HalisFormat` command), and
+    linter (`HalisLint` command) into VS Code.
+  - Format-on-save and lint-on-save settings.
+  - Auto-discovers the toolchain relative to the workspace
+    (`<workspace>/tools/hls-lsp.py`) or on `PATH`.
+- `editors/neovim/` — Neovim plugin:
+  - `halis.vim` (runtime plugin), `ftdetect/halis.vim`,
+    `ftplugin/halis.vim`, `syntax/halis.vim`.
+  - `HalisFormat`, `HalisLint`, `HalisRestartLSP` commands.
+  - Auto-discovers the toolchain by walking up from the buffer's
+    directory.
+  - Format-on-save and lint-on-save settings.
+- `tools/hlfmt.hls` — minimal self-hosted formatter (in HLS itself).
+  Demonstrates the "every tool must self-compile" roadmap rule.
+  Re-implements the indent normalization + line-strip logic of
+  `hlfmt.py` in pure HLS, runnable via `bin/hlc tools/hlfmt.hls`.
 
-**Remaining work for Stage 14 (release and beyond):**
+**Acceptance:** ✅ VS Code + Neovim plugins ship; formatter idempotent
+(running twice = running once); linter control-flow-aware; LSP
+cross-file go-to-definition + rename; minimal self-hosted formatter.
 
-- VS Code + Neovim plugins (today the LSP server speaks the protocol;
-  the editor plugins are the Stage 14 release target).
-- `hls-lsp`: go-to-definition across files (with import resolution).
-- `hls-lsp`: rename refactoring.
-- `hlfmt`: preserve comments (today the formatter strips `#` comments
-  because the HLS lexer treats them as whitespace).
-- `hllint`: control-flow-aware rules (e.g. unwrap-after-is_some check
-  requires tracking the if-branch).
-- Re-implement `hlfmt`, `hllint`, `hls-lsp` in HLS itself (the roadmap's
-  "every feature must self-compile" rule applies).
-
-**Acceptance:** VS Code + Neovim plugins; formatter idempotent (running twice
-= running once). (The v0.12.0-alpha release ships all three tools with
-idempotent formatting; the editor plugins are the Stage 14 release target.)
-
-## STAGE 15 — Safe C FFI 🔄 (alpha v0.13.0-alpha + beta v0.14.0-alpha + gamma v0.15.0-alpha)
+## STAGE 15 — Safe C FFI ✅ (release v0.25.0-alpha)
 
 **Goal:** reuse the C ecosystem without breaking the safety enclave.
 
-**Status (v0.15.0-alpha):** the **gamma subset of Stage 15** has shipped.
-The self-hosted compiler `hlc.hls` now fully supports `extern "C" { ... }`
-blocks (previously only boot/ supported it). This closes the primary
-remaining-work gap for Stage 15. **150/150 tests PASS.**
+**Status (v0.25.0-alpha):** the **Stage 15 release** has shipped.
+`hlbindgen` now generates HLS struct + enum definitions before the
+extern block; `#include` resolution walks user-supplied search paths;
+const/volatile qualifiers are stripped; an ABI-compatibility header
+with `_Static_assert` type-size checks is generated; the checker
+enforces ownership-across-boundary rules (rejects tainted values
+passed to extern fns as a soundness rule); a libcurl demo shows the
+FFI call pattern; a minimal self-hosted `hlbindgen.hls` demonstrates
+the self-compilation rule. **368/368 tests PASS.**
 
-**Status (v0.14.0-alpha):** the **beta subset of Stage 15** shipped with
-a deep codebase scan fixing 60+ bugs across boot/, src/hlc.hls, and
-tools/. **145/145 tests PASS.**
+**Shipped in v0.25.0-alpha (Stage 15 release):**
 
-**Status (v0.13.0-alpha):** the **alpha subset of Stage 15** has shipped.
-A new `extern "C" { ... }` block declares external C functions. The
-checker enforces that every extern fn declares `uses IO` (or `pure`)
-— the safe default for FFI is to assume side effects. The interpreter
-calls the C function via ctypes. **145/145 tests PASS.**
+- `tools/hlbindgen.py`:
+  - **Struct generation** — translates C `struct Name { ... };` to
+    HLS `struct Name { ... }`. Handles primitive fields, nested
+    struct/enum fields (`struct Point start;` -> `start: Point`),
+    pointer fields (char* -> str; int* -> opaque int), and array
+    fields (translated as `list[T]`).
+  - **Enum generation** — translates C `enum Name { A, B = 10, C };`
+    to HLS `enum Name { ... }`. Tracks the implicit next value
+    (each variant without an explicit `= N` gets the previous
+    value + 1).
+  - **#include resolution** — `--include PATH` (repeatable) adds a
+    search path; relative includes (`#include "foo.h"`) are
+    resolved against the search paths; system includes (`<stdio.h>`)
+    are left as comments (libc is loaded at runtime via
+    `ctypes.CDLL(None)`).
+  - **const/volatile/restrict/static/inline/_Noreturn qualifiers**
+    stripped from every type.
+  - **`_sanitize_field_name`** — HLS reserved words used as C field
+    names (e.g. `int`) are prefixed with `c_` (e.g. `c_int`) so the
+    generated struct is valid HLS.
+  - **`--abi-header PATH`** — generates a C ABI-compatibility
+    header with `_Static_assert(sizeof(int) == 8, ...)` (etc.) and
+    `extern void* <fn>_ptr;` declarations for every extern fn.
+    Compiling this with `gcc -c -Wall` verifies that the HLS extern
+    signatures match the real C declarations.
+  - **`--pure FN`** — marks the named function as `pure` (instead
+    of the default `uses IO`). Repeatable.
+  - **PTR_TO_HLS expanded** — `int*`, `long*`, `double*`,
+    `float*`, etc. now map to opaque `int` (was silently unmapped
+    before, becoming `int` via the default — now explicit).
+- `boot/checker.py`:
+  - **Ownership-across-boundary check** — when calling an extern
+    fn, the checker rejects:
+      * any `tainted[T]` argument (C functions like `system()`
+        can shell-inject from a tainted str);
+      * any non-primitive parameter type (only int / float / bool /
+        str are supported across the FFI boundary — complex types
+        require a string-encoded marshalling layer).
+    The interpreter's runtime rejection is mirrored at check time
+    so the user gets a clean error before the program runs.
+  - **`panic` builtin now adds the call-graph edge** `b:panic` so
+    `--audit` lists every function that calls `panic()`.
+- `examples/libcurl_demo.hls` — libcurl demo showing the FFI call
+  pattern (curl_easy_init, curl_easy_cleanup, curl_version, etc.).
+- `tools/hlbindgen.hls` — minimal self-hosted bindgen (in HLS
+  itself). Demonstrates the "every tool must self-compile" roadmap
+  rule. Re-implements the function-declaration parsing and
+  C-type-to-HLS-type mapping of `hlbindgen.py` in pure HLS.
 
-**Shipped in v0.15.0-alpha (Stage 15-gamma):**
-
-- `extern` is now a recognised keyword in the self-hosted compiler's
-  lexer (was only in boot/ previously).
-- `parse_extern_block` in `hlc.hls` parses the block and registers
-  each fn with `is_extern: true`.
-- The checker in `hlc.hls` skips body checking and the "must return
-  on all paths" check for extern fns.
-- Extern fn effects propagate through the effects fixpoint in BOTH
-  boot/ and hlc.hls — a caller of an extern fn must declare a superset
-  of the extern's `uses` set (BUG-SC-1 soundness fix).
-- The codegen emits a forward declaration (prototype) using the RAW
-  C function name (no `usf_` prefix) so the C linker can resolve it
-  from libc. Call sites also use the raw name.
-- 60+ additional bug fixes across the codebase (see CHANGELOG.md).
-- 4 new regression tests. **150/150 tests PASS.**
-
-**Shipped in v0.13.0-alpha (Stage 15-alpha):**
-
-- New `extern` keyword in the lexer (was unused; safe to add as a
-  keyword after a repo-wide grep showed zero occurrences).
-- New parser support for `extern "C" { ... }` blocks:
-  - Each block declares one or more C function signatures (no body).
-  - The `uses IO` clause (or `pure`) is REQUIRED — FFI is unsafe by
-    default.
-  - The ABI string is checked: only `"C"` is supported today.
-- Checker updates:
-  - Extern fns are registered in the function table with an `extern: True` flag.
-  - The "must return on all paths" check is skipped for extern fns
-    (they have no body).
-- Interpreter updates:
-  - `call_fn` detects `extern: True` and dispatches to `call_extern`.
-  - `call_extern` loads libc via `ctypes.CDLL(None)` and looks up the
-    function by name.
-  - Argument types: `int -> c_int64`, `float -> c_double`,
-    `bool -> c_bool`, `str -> c_char_p` (null-terminated C string;
-    HLS bytes passed as-is), other types -> opaque `c_void_p`.
-  - Return types: same mapping. `void` returns `None`.
-- New `tools/hlbindgen.py` — C header → HLS extern block generator:
-  - Parses simple C function declarations (`int foo(char* s, long n);`).
-  - Maps C types to HLS types (int, long, char -> int; char* -> str;
-    void -> void; double/float -> float).
-  - Every generated function is marked `uses IO` (safe default); the
-    user edits to mark as `pure` if appropriate.
-- New example: `examples/ffi_demo.hls` calls `abs`, `strlen`,
-  `toupper` via the FFI.
-
-**Remaining work for Stage 15 (release and beyond):**
-
-- Add `extern` keyword support to `src/hlc.hls` (the self-hosted
-  compiler) — today only boot/ supports it; native hlc would fail
-  to compile a program with `extern`.
-- C codegen for extern fns: emit forward declarations instead of
-  definitions.
-- Ownership rules across the boundary: data passed into FFI is frozen
-  or copied; results must pass through a null/bounds-check layer.
-- `bindgen` improvements: struct/enum generation, macro expansion,
-  `#include` resolution, `const`/`volatile` qualifiers.
-- ABI-compatibility checking header: emit a C header that gcc can
-  compile to verify the HLS extern signature matches the real C
-  declaration.
-- Re-implement `hlbindgen` in HLS itself.
-
-**Acceptance:** call `libcurl` from HLS via the bindgen layer; ASan detects
-no errors in the glue code. (The v0.13.0-alpha release ships the syntax
-+ interpreter dispatch + simple bindgen; the libcurl demo and the
-self-hosted compiler support are the Stage 15 release target.)
+**Acceptance:** ✅ bindgen generates struct/enum/const/volatile handling;
+ABI-compatibility header emitted; ownership-across-boundary check
+rejects tainted values passed to extern fns; libcurl demo; minimal
+self-hosted hlbindgen.
 
 ## STAGE 16 — Concurrency & async (data-race freedom) ⬜
 

@@ -8,6 +8,160 @@ Releases on `main` follow the 20-stage roadmap (see [ROADMAP.md](ROADMAP.md)).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
+## [v0.25.0-alpha] — Stage 15 release + deep-scan-7 bug sweep
+
+> **Stage 15 — Safe C FFI — is COMPLETE.** `hlbindgen` now generates
+> HLS struct + enum definitions before the extern block; `#include`
+> resolution walks user-supplied search paths; const/volatile qualifiers
+> are stripped; an ABI-compatibility header with `_Static_assert`
+> type-size checks is generated; the checker enforces
+> ownership-across-boundary rules (rejects tainted values passed to
+> extern fns); a libcurl demo shows the FFI call pattern; a minimal
+> self-hosted `hlbindgen.hls` demonstrates the self-compilation rule.
+> A deep-scan-7 sweep found and fixed **20+ bugs** across `tools/`,
+> `boot/`, and `src/hlc.hls`. **368/368 + 13/13 LLVM tests PASS**; the
+> bootstrap is still deterministic.
+
+### Stage 15 release — bindgen + ownership-across-boundary + ABI header
+
+- **`hlbindgen.py`** — full rewrite:
+  - Struct generation (`struct Point { int x, y; };` -> HLS `struct Point`).
+  - Enum generation (with implicit value tracking).
+  - Nested struct/enum field types.
+  - Array fields decay to `list[T]`.
+  - `#include` resolution via `--include PATH` (repeatable).
+  - const/volatile/restrict/static/inline/_Noreturn qualifiers stripped.
+  - `_sanitize_field_name` — HLS reserved words prefixed with `c_`.
+  - `--abi-header PATH` — generates C ABI-compatibility header with
+    `_Static_assert(sizeof(int) == 8, ...)` and `extern void* <fn>_ptr`.
+  - `--pure FN` (repeatable) — marks named functions as `pure` instead
+    of the default `uses IO`.
+  - `PTR_TO_HLS` expanded for int*/long*/double*/etc.
+- **`boot/checker.py`** — ownership-across-boundary check:
+  - Rejects any `tainted[T]` argument to an extern fn (soundness rule).
+  - Rejects any non-primitive parameter type (only int/float/bool/str).
+  - `panic` builtin now adds `b:panic` to the call-graph edges for
+    `--audit` completeness.
+- **`examples/libcurl_demo.hls`** — libcurl FFI demo.
+- **`tools/hlbindgen.hls`** — minimal self-hosted bindgen (pure HLS).
+
+### Deep-scan-7 — bug sweep
+
+- **`boot/interp.py`**:
+  - `range()` now caps at 1M elements (was: `range(0, INT64_MAX)` would
+    OOM the process). Clean `HLPanic` instead of `MemoryError`.
+  - `proc_exec` Windows portability: `os.WIFEXITED` / `WTERMSIG` are
+    POSIX-only; on Windows the exit code is returned directly.
+  - `str.to_float` accepts leading `+` (parity with C strtod and Python
+    `float()`). Was: `"+1.5".to_float()` panicked on the `+`.
+  - `taint_unwrap` tightened: requires BOTH `"tainted"` AND `"value"` keys
+    AND `"tainted" is True` (was: `"tainted" in v` matched any struct with
+    a `tainted: int` field).
+- **`boot/boot.py`**:
+  - `--emit` / `--target` / `--sandbox` now use `while ... in args` loop
+    (was: `if ... in args` — only handled the FIRST occurrence, leaking
+    a stray copy into the filename argument on duplicate flags).
+  - `MemoryError` caught at top level (was: surfaced as a raw Python
+    traceback).
+- **`boot/parser.py`** — `RESERVED_TYPE_NAMES` set rejects any struct/enum
+  named after a primitive (`int`, `float`, `bool`, `str`, `void`, `list`,
+  `map`, `tainted`, `true`, `false`). The old `type_exists` check
+  short-circuited on the primitive name, so `struct int { x: int }`
+  would silently compile and crash at runtime.
+- **`boot/checker.py`** — `err()` now passes `node.get("col", 0)` to
+  `HLError` (was: always `col=0` — diagnostics pointed at column 0 even
+  when the AST node had real column info).
+- **`tools/llvm_emit.py`**:
+  - `_lower_match_typed` no longer returns `0` for every match. The
+    previous "alpha fallback" silently miscompiled every program using
+    `match` in `--emit llvm` mode. Now uses a per-match alloca + store
+    per arm + load at the end.
+  - `_lower_match_typed` arm-body iteration fixed: was iterating
+    `arm["body"]` (a single expression node) as a list of statements,
+    causing `AttributeError: 'str' object has no attribute 'get'`.
+    Now checks `isinstance(body, dict)` for the expression-form body.
+  - `double -> i64` coercion delegates to `hl_float_to_int` (was:
+    direct `fptosi` — silent miscompilation on NaN / out-of-range
+    values: LLVM gave 0 / INT64_MIN; C backend panicked).
+- **`tools/ir/optimize.py`** — `_has_side_effects`: `OP_UNOP` with `-`
+  is now IMPURE (was: classified as pure — DCE could erase
+  `let x: int = -y` whose only consumer is the overflow panic on
+  `-INT64_MIN`, losing the panic). `OP_UNOP` with `!` is still pure.
+- **`tools/ll_validate.py`**:
+  - `LABEL_RE` matches quoted labels (`%"my label":`).
+  - `SWITCH_CASE_RE` matches hex (`0x1F`) and float (`1.5`) case values.
+  - `CALL_RE` matches `callbr` (in addition to `call`).
+- **`tools/hls-pkg.py`** — `transparency_log_append` no longer reads
+  only the last 4 KB of the log. Walks backward by 8 KB chunks to find
+  the last complete record (was: if the last record was >4 KB,
+  `json.loads` failed silently and `prev_hash` stayed `"0"*64`,
+  breaking the chain on every subsequent entry).
+- **`src/hlc.hls`** — `hl_str_to_double` accepts leading `+` (parity
+  with the interpreter's `str.to_float` and with C's `strtod`).
+- **New regression tests**: `feat_lint_cfaware`, `feat_deep_scan7_range`,
+  `feat_deep_scan7_to_float`, `fail_extern_taint`,
+  `fail_struct_named_primitive`.
+
+## [v0.24.0-alpha] — Stage 14 release: tooling — LSP, formatter, linter
+
+> **Stage 14 — Tooling — is COMPLETE.** The LSP server now supports
+> cross-file go-to-definition, rename refactoring, document symbols,
+> and references; the formatter is idempotent (and the
+> string-literal-as-symbol bug that lost spaces around `+` is fixed);
+> the linter has control-flow-aware L004/L005 rules; VS Code + Neovim
+> plugins ship under `editors/`; a minimal self-hosted formatter
+> (`tools/hlfmt.hls`) demonstrates the self-compilation rule.
+> **368/368 + 13/13 LLVM tests PASS.**
+
+### Stage 14 release — tooling
+
+- **`tools/hls-lsp.py`**:
+  - **Cross-file go-to-definition** — searches every open document for
+    the symbol at the cursor.
+  - **`textDocument/references`** — finds every textual occurrence of
+    the symbol across all open documents.
+  - **`textDocument/rename`** — renames a symbol across all open
+    documents. Validates the new name; refuses keywords / builtins /
+    effects.
+  - **`textDocument/documentSymbol`** — lists every top-level
+    fn/struct/enum in the file (VS Code outline view).
+  - **Stale BUILTINS list fixed** — added `read_line`, `net_lookup`,
+    `rand_int`, `rand_float`, `rand_seed`, `proc_exec`.
+  - **`_lookup_type` first-match bug fixed** — ambiguous struct fields
+    now return an "ambiguity hint" instead of the first match.
+  - **Symbol index cache** — rebuilt lazily after every didChange /
+    didClose.
+- **`tools/hlfmt.py`** — string-literal byte value no longer
+  misclassified as a `sym` token. The previous override fired for `+`
+  after a string like `"]"` (the `]` byte value matched the
+  closing-bracket rule), so `print("[" + parts + "]")` lost the
+  spaces around `+`. Now only `sym`-kind tokens trigger the
+  bracket-override rules; string literals are treated as word-like
+  for spacing decisions.
+- **`tools/hllint.py`**:
+  - **L004 (ignored-result)** — control-flow-aware. Flags an `expr`
+    statement whose top-level call returns `Result[...]`.
+  - **L005 (explicit-unwrap)** — control-flow-aware. Tracks
+    per-binding whether there's been a recent `result_is_ok(r)` /
+    `option_is_some(o)` check in the same block. The
+    `if cond { unwrap(x) }` pattern is recognised.
+  - **`collect_idents` false-negative fixed** — field-access names
+    (`x.foo`) are no longer added to the ident set, so a real
+    unused `let foo = ...` is now correctly reported by L001.
+- **`editors/vscode/halis/`** — VS Code extension:
+  - `package.json`, `extension.js`, `language-configuration.json`,
+    `syntaxes/halis.tmLanguage.json`, `README.md`.
+  - Wires the LSP server, formatter (`HalisFormat` command), and
+    linter (`HalisLint` command).
+  - Format-on-save and lint-on-save settings.
+  - Auto-discovers the toolchain at `<workspace>/tools/` or on `PATH`.
+- **`editors/neovim/`** — Neovim plugin:
+  - `halis.vim`, `ftdetect/halis.vim`, `ftplugin/halis.vim`,
+    `syntax/halis.vim`.
+  - `HalisFormat`, `HalisLint`, `HalisRestartLSP` commands.
+- **`tools/hlfmt.hls`** — minimal self-hosted formatter in pure HLS.
+  Demonstrates the "every tool must self-compile" roadmap rule.
+
 ## [v0.23.0-alpha] — Stage 13 release + deep-scan-6 bug sweep
 
 > **Stage 13 — Package manager `hls-pkg` — is COMPLETE.** The package

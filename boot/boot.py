@@ -176,7 +176,12 @@ def run_cli():
     while "--audit" in args:
         audit_only = True
         args.remove("--audit")
-    if "--emit" in args:
+    # Deep-scan-7 fix: --emit / --target / --sandbox only handled the
+    # FIRST occurrence — a duplicated flag (e.g. `boot.py --emit ir
+    # --emit llvm f.hls`) leaked the stray copy into the filename
+    # argument. Strip ALL occurrences (loop) for parity with --check
+    # and --audit (which already used the loop pattern).
+    while "--emit" in args:
         i = args.index("--emit")
         if i + 1 < len(args) and args[i + 1] == "ir":
             emit_ir = True
@@ -190,7 +195,7 @@ def run_cli():
     while "--opt-stats" in args:
         opt_stats = True
         args.remove("--opt-stats")
-    if "--target" in args:
+    while "--target" in args:
         i = args.index("--target")
         if i + 1 < len(args):
             target_triple = args[i + 1]
@@ -202,7 +207,7 @@ def run_cli():
     # (read_file, read_file_tainted, write_file, file_exists) to DIR.
     # Both the interpreter and the C runtime enforce this. Extern "C"
     # blocks are rejected under sandbox mode (they bypass the sandbox).
-    if "--sandbox" in args:
+    while "--sandbox" in args:
         i = args.index("--sandbox")
         if i + 1 < len(args):
             sandbox_dir = args[i + 1]
@@ -536,6 +541,15 @@ def main():
         # it like every other runtime halt — a clean panic, exit 101.
         sys.stdout.buffer.flush()
         sys.stderr.write("panic: stack overflow (recursion too deep)\n")
+        return 101
+    except MemoryError:
+        # Deep-scan-7 fix: range() / list materialisation can OOM on
+        # adversarial inputs (a malicious program calling
+        # `range(0, INT64_MAX)`). Previously MemoryError surfaced as a
+        # raw Python traceback. Catch it here for parity with RecursionError.
+        sys.stdout.buffer.flush()
+        sys.stderr.write("panic: out of memory (program tried to allocate "
+                         "more than the host can provide)\n")
         return 101
 
 

@@ -722,7 +722,22 @@ class Interp:
         if name == "len":
             return len(args[0])
         if name == "range":
-            return list(range(args[0], args[1]))
+            # Deep-scan-7 fix: a malicious or buggy program calling
+            # `range(0, INT64_MAX)` would attempt to materialise a
+            # 9-quintillion-element list, exhausting memory. Cap at
+            # a reasonable limit (1M elements) and panic with a clear
+            # message otherwise. boot.py's main thread catches
+            # MemoryError, but list(range(...)) raises MemoryError
+            # AT THE PYTHON LEVEL — we want a clean HLPanic instead.
+            a, b = int(args[0]), int(args[1])
+            count = b - a if b > a else 0
+            RANGE_MAX = 1_000_000
+            if count > RANGE_MAX:
+                raise HLPanic(
+                    "range(%d, %d) would produce %d elements (limit %d) — "
+                    "use an explicit counter loop for large ranges"
+                    % (a, b, count, RANGE_MAX), line)
+            return list(range(a, b))
         if name == "map_new":
             return {}
         if name == "read_file":
@@ -817,7 +832,13 @@ class Interp:
         # wrapper dict.
         if name == "taint_unwrap":
             v = args[0]
-            if isinstance(v, dict) and "tainted" in v:
+            # Deep-scan-7 fix: the previous check `"tainted" in v` matched
+            # any dict with a field literally named "tainted" — including
+            # user structs with a `tainted: int` field. Tighten the check:
+            # require BOTH "tainted" AND "value" keys, AND "tainted" must
+            # be the boolean True (the taint-mark builtin sets it to True).
+            if (isinstance(v, dict) and "tainted" in v and "value" in v
+                    and v["tainted"] is True):
                 return v["value"]
             # BUG-23 fix: the previous defensive fallback returned the
             # "value" field of ANY dict (including user structs that
@@ -825,7 +846,8 @@ class Interp:
             # guarantees args[0] is a tainted[T], we panic if we get here
             # without the taint wrapper — that indicates a checker bug.
             raise HLPanic("taint_unwrap: expected tainted[T] wrapper, "
-                          "got a non-tainted value", line)
+                          "got a non-tainted value (got %s)"
+                          % type(v).__name__, line)
         # ----- Stage 9 release (v0.20.0-alpha): Net / Rand / Proc builtins -----
         # The interpreter implementations mirror the native runtime in
         # src/hlc.hls exactly, so differential testing passes.
@@ -882,9 +904,19 @@ class Interp:
             import os
             cmd = args[0].decode("utf-8", "replace")
             rc = os.system(cmd)
+            # Deep-scan-7 fix: os.WIFEXITED / WEXITSTATUS / WTERMSIG
+            # are POSIX-only macros. On Windows, os.system returns the
+            # exit code directly (not a status word). Detect the
+            # platform and handle both cases so the interpreter
+            # produces the same result as the C runtime on every OS.
+            if sys.platform == "win32":
+                # Windows: rc is already the exit code (0..255).
+                # Encode signal-like values as 128 + signum for parity.
+                if rc < 0:
+                    return 128 + (-rc)
+                return rc & 0xFF
             # POSIX: os.system returns a status word; the exit code is
-            # the high byte (WEXITSTATUS). On CPython, this matches the
-            # behaviour of system() exactly.
+            # the high byte (WEXITSTATUS).
             if os.WIFEXITED(rc):
                 return os.WEXITSTATUS(rc)
             # Killed by signal — encode as 128 + signum, like shells.
@@ -951,8 +983,15 @@ class Interp:
             # exponent so JSON parsers can produce floats like "1e5", "1.5e-3",
             # etc. Previously the function rejected any non-digit/non-dot char
             # (including 'e'/'E'), which made json_parse("1e5") panic.
+            # Deep-scan-7 fix: also accept leading `+` for parity with C's
+            # strtod() and Python's float() — both accept "+1.5". The old
+            # code only stripped a leading `-`, so "+1.5".to_float() panicked
+            # on the `+`. This caused a differential testing divergence
+            # between the interpreter and the C runtime.
             i = 0
             if t[0:1] == b"-":
+                i = 1
+            elif t[0:1] == b"+":
                 i = 1
             if i >= len(t):
                 raise HLPanic("cannot convert string to float", line)

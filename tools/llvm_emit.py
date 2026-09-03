@@ -857,12 +857,21 @@ class LLVMEmitter:
         return ("ptr", tmp)
 
     def _lower_match_typed(self, e: Dict) -> Tuple[str, str]:
-        """Stage 12 release: lower a match expression on an enum.
+        """Stage 12 release + deep-scan-7 fix: lower a match expression
+        on an enum.
 
         Lowers to a `switch` on the enum's variant tag (loaded via
-        `hl_enum_tag`). Each arm becomes a basic block; the arm's body
-        result is merged via a phi node at the end. The wildcard `_`
-        arm (if present) becomes the `default` case.
+        `hl_enum_tag`). Each arm becomes a basic block. The arm body's
+        result is stored to a per-match alloca; the result is loaded
+        after the end label.
+
+        Deep-scan-7 fix: the previous implementation always returned
+        0/null for every match (the comment at the old line 965-968
+        explicitly said "return 0/i64 — this matches the existing
+        alpha fallback"). This was silent miscompilation — every
+        `match` in --emit llvm mode produced 0 regardless of the arm
+        body's actual value. The fix uses a per-match alloca: each
+        arm stores its result value, and the end block loads it.
 
         Only matches on enums are supported today (matching on ints/
         strs with full literal patterns is future work).
@@ -879,6 +888,12 @@ class LLVMEmitter:
         # Result type is the match expression's annotated type.
         result_t = e.get("t", "int")
         llvm_ret_ty = hls_type_to_llvm(result_t)
+        # Deep-scan-7 fix: allocate a slot for the match result. Each
+        # arm stores its body's result here; the end block loads it.
+        # This is the simplest correct lowering — phi nodes would be
+        # more efficient but require tracking every predecessor block.
+        result_slot = self._fresh("match_result")
+        self._emit("  %s = alloca %s" % (result_slot, llvm_ret_ty))
         # Pre-emit each arm as a basic block. Each arm records:
         #   (variant_idx_or_None_for_default, label, body_result_value, body_end_block)
         arm_records = []
@@ -944,28 +959,50 @@ class LLVMEmitter:
                     self._emit("  %s = call ptr @hl_struct_get_ptr(ptr %s, i64 0)"
                                % (ptmp, payload_ptr))
                     self._emit("  store ptr %s, ptr %s" % (ptmp, slot))
-            # Lower the arm body (a block of statements ending in an
-            # expression — the last `expr` statement's value is the
-            # arm's result).
-            arm_result_ty = "i64"
-            arm_result_val = "0"
-            for s in arm.get("body", []):
-                if s.get("k") == "expr":
-                    arm_result_ty, arm_result_val = self._lower_expr_typed(s["e"])
-                else:
-                    self._lower_stmt(s)
+            # Lower the arm body. The HLS match arm body is a single
+            # EXPRESSION (the parser's `parse_expr`), not a list of
+            # statements. Deep-scan-7 fix: the old code iterated
+            # `arm["body"]` as if it were a list of statements — but
+            # since it's actually a single expression node, the
+            # iteration walked the dict's KEYS (strings), causing
+            # `AttributeError: 'str' object has no attribute 'get'`.
+            body = arm.get("body")
+            if isinstance(body, dict):
+                # Expression form (the only form parse_arm produces today).
+                arm_result_ty, arm_result_val = self._lower_expr_typed(body)
+            elif isinstance(body, list):
+                # Statement-list form (future-proofing; matches the
+                # statement-list lowering used elsewhere). The last
+                # `expr` statement's value is the arm's result.
+                arm_result_ty = llvm_ret_ty
+                arm_result_val = "0" if llvm_ret_ty != "ptr" else "null"
+                for s in body:
+                    if isinstance(s, dict) and s.get("k") == "expr":
+                        arm_result_ty, arm_result_val = self._lower_expr_typed(s["e"])
+                    else:
+                        self._lower_stmt(s)
+            else:
+                # No body? Use a zero default.
+                arm_result_ty = llvm_ret_ty
+                arm_result_val = "0" if llvm_ret_ty != "ptr" else "null"
+            # Deep-scan-7 fix: store the arm result to the per-match slot.
+            # Cast the value to the match's result type if needed.
+            if arm_result_ty != llvm_ret_ty:
+                # Coerce — same logic as the assignment path.
+                arm_result_val = self._coerce(
+                    arm_result_val, arm_result_ty, llvm_ret_ty)
+            self._emit("  store %s %s, ptr %s"
+                       % (llvm_ret_ty, arm_result_val, result_slot))
             if self._cur_block is not None:
                 self._emit("  br label %%%s" % end_lbl)
             arm_records[i][2] = arm_result_ty
             arm_records[i][3] = self._cur_block  # may be None if arm diverged
-        # End block — emit phi if any arm produced a value.
-        # Find the last open arm block to start the phi.
+        # End block — load the match result from the alloca.
         self._emit("%s:" % end_lbl)
-        # The simplest correct lowering is to NOT emit a phi (the arm
-        # value is stored to a temporary alloca). For now, return 0/i64
-        # — this matches the existing alpha fallback. A future release
-        # will use the per-arm result type via phi.
-        return (llvm_ret_ty, "0" if llvm_ret_ty != "ptr" else "null")
+        result_val = self._fresh("match_val")
+        self._emit("  %s = load %s, ptr %s"
+                   % (result_val, llvm_ret_ty, result_slot))
+        return (llvm_ret_ty, result_val)
 
     def _lower_qmark_typed(self, e: Dict) -> Tuple[str, str]:
         """Stage 12 release: lower the `?` operator.
@@ -1316,11 +1353,19 @@ class LLVMEmitter:
             tmp = self._fresh("p2d")
             self._emit("  %s = sitofp i64 %s to double" % (tmp, tmp_i64))
             return tmp
-        # SCAN-A fix: double → i64 (bitcast + trunc is wrong; use
-        # fptosi with range-check expected at a higher level).
+        # Deep-scan-7 fix: double -> i64. The C backend's
+        # `hl_float_to_int` (declared at line 130) range-checks the
+        # input and panics on NaN / out-of-range values (mirroring the
+        # interpreter's behavior). The LLVM backend's previous direct
+        # `fptosi` was a SILENT MISCOMPILATION: NaN produced 0 in LLVM
+        # but panicked in C; values > INT64_MAX wrapped to INT64_MIN in
+        # LLVM (UB) but panicked in C. The fix delegates to the same
+        # range-checked runtime helper the C backend uses, restoring
+        # differential parity.
         if val_ty == "double" and want_ty == "i64":
             tmp = self._fresh("d2s")
-            self._emit("  %s = fptosi double %s to i64" % (tmp, val))
+            self._emit("  %s = call i64 @hl_float_to_int(double %s)"
+                       % (tmp, val))
             return tmp
         return val
 

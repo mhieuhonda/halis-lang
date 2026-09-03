@@ -42,11 +42,15 @@ TERMINATORS = ("br ", "ret ", "unreachable", "switch ", "indirectbr ",
 # STRIPPED line, so they work with or without indentation.
 # BUG (deep-scan-5): `tail call` / `musttail call` prefixes bypassed the
 # callee-existence check (V2).
-CALL_RE = re.compile(r"^\s*(?:%[\w.$-]+\s*=\s*)?(?:musttail\s+|tail\s+)?call\s+(?:(\w+)\s+)?@([\w.$-]+)\((.*)\)\s*$")
+CALL_RE = re.compile(r"^\s*(?:%[\w.$-]+\s*=\s*)?(?:musttail\s+|tail\s+)?(?:call|callbr)\s+(?:(\w+)\s+)?@([\w.$-]+)\((.*)\)\s*$")
 DEF_RE = re.compile(r"^define\s+[\w\s]*?@([\w.$-]+)\s*\(")
 DECLARE_RE = re.compile(r"^declare\s+[\w\s]*?@([\w.$-]+)\s*\(")
 GLOBAL_RE = re.compile(r"^@([\w.$-]+)\s*=")
-LABEL_RE = re.compile(r"^([\w.$-]+):")
+# Deep-scan-7 fix: LABEL_RE didn't match QUOTED labels like `%"my label":`
+# (LLVM allows arbitrary string labels via `"..."). Duplicate-label and
+# label-reference checks silently missed them. Now matches both bare and
+# quoted label forms.
+LABEL_RE = re.compile(r"^([\w.$-]+|\"[^\"]+\"):")
 ALLOCA_RE = re.compile(r"^\s*%([\w.$-]+)\s*=\s*alloca\s+(\w+)")
 STORE_SLOT_RE = re.compile(r"^\s*store\s+(\w+)\s+([^,]+),\s*ptr\s+%([\w.$-]+)\s*$")
 PHI_RE = re.compile(r"^\s*%([\w.$-]+)\s*=\s*phi\s+(\w+)\s+(.*)$")
@@ -55,7 +59,10 @@ PHI_EDGE_RE = re.compile(r"\[\s*([^,\]]+?)\s*,\s*%([\w.$-]+)\s*\]")
 # label checks; switch lines/continuations were not handled at all.
 BR_RE = re.compile(r"^\s*br\s+(?:i1\s+(?:%[\w.$-]+|true|false)\s*,\s*)?label\s+%([\w.$-]+)(?:\s*,\s*label\s+%([\w.$-]+))?")
 SWITCH_RE = re.compile(r"^\s*switch\s+")
-SWITCH_CASE_RE = re.compile(r"^\s*[\w.\-]+\s+[^,]+,\s*label\s+%([\w.$-]+)\s*$")
+# Deep-scan-7 fix: SWITCH_CASE_RE didn't handle hex (`0x1F`) or float
+# (`1.5`) case values, which LLVM allows. Extended to match any numeric
+# literal as the case value.
+SWITCH_CASE_RE = re.compile(r"^\s*(?:0[xX][0-9a-fA-F]+|-?\d+(?:\.\d*)?(?:[eE][-+]?\d+)?)\s+[^,]+,\s*label\s+%([\w.$-]+)\s*$")
 LABEL_REF_RE = re.compile(r"label\s+%([\w.$-]+)")
 # `ptr 5` / `ptr -1` as an operand — always invalid (pointers are not
 # integers in LLVM).

@@ -83,6 +83,18 @@ class Parser:
         return "'%s'" % (t["v"] if not isinstance(t["v"], bytes) else t["v"].decode("latin-1"))
 
     # ---------- program ----------
+    # Deep-scan-7 fix: a struct/enum named after a primitive type
+    # (int, float, bool, str) or after void is a SOUNDNESS HOLE —
+    # `type_exists` short-circuits on the primitive name without
+    # consulting self.structs, so `let x: int = int { x: 5 }` would
+    # compile and the runtime would crash at access time. Reject
+    # any struct/enum declaration with a primitive name at parse time.
+    RESERVED_TYPE_NAMES = {
+        "int", "float", "bool", "str", "void",
+        "list", "map", "tainted",
+        "true", "false",  # boolean literals are reserved too
+    }
+
     def parse_program(self):
         structs = {}   # name -> struct
         enums = {}      # name -> enum
@@ -92,11 +104,17 @@ class Parser:
         while self.peek()["k"] != "eof":
             if self.at_kw("struct"):
                 st = self.parse_struct()
+                if st["name"] in self.RESERVED_TYPE_NAMES:
+                    self.err("type name '%s' is reserved (collides with a "
+                             "primitive type)" % st["name"])
                 if st["name"] in structs or st["name"] in enums:
                     self.err("duplicate type name: %s" % st["name"])
                 structs[st["name"]] = st
             elif self.at_kw("enum"):
                 en = self.parse_enum()
+                if en["name"] in self.RESERVED_TYPE_NAMES:
+                    self.err("type name '%s' is reserved (collides with a "
+                             "primitive type)" % en["name"])
                 if en["name"] in enums or en["name"] in structs:
                     self.err("duplicate type name: %s" % en["name"])
                 enums[en["name"]] = en

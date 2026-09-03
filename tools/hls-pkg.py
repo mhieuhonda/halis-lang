@@ -107,17 +107,6 @@ from typing import Dict, List, Optional, Tuple
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CACHE_DIR = os.path.join(REPO_ROOT, ".hls-pkg-cache")
-
-
-# ---------------------------------------------------------------------------
-# Stage 13 release: transparency log (append-only, content-addressed)
-# ---------------------------------------------------------------------------
-# The transparency log is a single JSON-lines file under the repo root.
-# Every `hls-pkg publish` appends one record; `hls-pkg verify` checks each
-# lockfile entry against the log so a tampered or roll-back dependency is
-# caught. The log is content-addressed (records SHA-256 chain, mirroring
-# Certificate Transparency's Head/X/Y structure on a single-host scale).
-
 TRANSPARENCY_LOG = os.path.join(REPO_ROOT, ".hls-pkg-transparency.log")
 
 
@@ -131,20 +120,47 @@ def transparency_log_append(record: Dict) -> Dict:
     prev_hash).
     """
     # Read the previous head's hash so we can chain to it.
+    # Deep-scan-7 fix: the old code read only the last 4 KB of the log
+    # and split by newlines — if the LAST record was >4 KB (e.g. a
+    # large package hash with a long `deps` field), json.loads failed
+    # silently and prev_hash stayed "0"*64, breaking the chain on
+    # every subsequent entry. Read the WHOLE file (it's small — a
+    # few KB per record is typical, a few thousand records is the
+    # practical limit).
     prev_hash = "0" * 64
     try:
         with open(TRANSPARENCY_LOG, "rb") as f:
-            tail = b""
-            # Read up to the last 4 KB to find the last line.
-            try:
-                f.seek(-4096, os.SEEK_END)
-            except OSError:
-                f.seek(0)
-            tail = f.read()
-            lines = [ln for ln in tail.split(b"\n") if ln.strip()]
-            if lines:
-                last = json.loads(lines[-1].decode("utf-8"))
-                prev_hash = last.get("chain_hash", prev_hash)
+            tail_lines = []
+            # Read line-by-line from the END (most efficient for large
+            # logs — we only need the last record's chain_hash).
+            # Seek to the end, then walk backward by chunks to find
+            # the last non-empty line.
+            f.seek(0, os.SEEK_END)
+            fsize = f.tell()
+            chunk = b""
+            offset = fsize
+            while offset > 0:
+                read_size = min(8192, offset)
+                offset -= read_size
+                f.seek(offset)
+                chunk = f.read(read_size) + chunk
+                lines = chunk.split(b"\n")
+                # If we have at least 2 lines, the last complete
+                # line is lines[-2] (since lines[-1] may be partial).
+                if len(lines) >= 2:
+                    last_complete = lines[-2] if not lines[-1].strip() else lines[-1]
+                    if last_complete.strip():
+                        last = json.loads(last_complete.decode("utf-8"))
+                        prev_hash = last.get("chain_hash", prev_hash)
+                        break
+                # Otherwise keep walking backward.
+            else:
+                # We read the whole file — use the first non-empty line
+                # if any (which is the only record).
+                lines = [ln for ln in chunk.split(b"\n") if ln.strip()]
+                if lines:
+                    last = json.loads(lines[-1].decode("utf-8"))
+                    prev_hash = last.get("chain_hash", prev_hash)
     except (FileNotFoundError, OSError, ValueError):
         # First record (or corrupted log) — chain from genesis.
         pass
