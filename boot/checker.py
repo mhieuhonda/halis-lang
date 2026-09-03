@@ -26,13 +26,20 @@ def is_taint(t):
 
 
 def taint_inner(t):
-    # `.strip()` is harmless for parser-produced types (no interior spaces)
-    # but keeps the function robust if a future caller passes a hand-built
-    # type string with accidental whitespace.
-    return t[8:-1].strip()
+    """For `tainted[T]` return T; otherwise return t unchanged (defensive —
+    keeps callers safe if a non-tainted type slips through). The `.strip()`
+    is harmless for parser-produced types (no interior spaces) but keeps the
+    function robust if a future caller passes a hand-built type string."""
+    if t.startswith("tainted["):
+        return t[8:-1].strip()
+    return t
 
 
 # Backwards-compatible aliases (used by boot/boot.py and tools/).
+# BUG-SC-12 (for real this time): the old duplicate definitions that used to
+# live further down in this file (which shadowed these aliases at import
+# time) have been removed — `is_tainted_type`/`list_taint_inner` now resolve
+# to exactly these implementations. Single source of truth.
 is_tainted_type = is_taint
 list_taint_inner = taint_inner
 
@@ -53,9 +60,9 @@ def map_val(t):
     return t[9:-1]
 
 
-# NOTE: is_taint / taint_inner / is_tainted_type / list_taint_inner are now
-# defined ONCE near the top of this file (BUG-SC-12 consolidation). The
-# duplicate definitions that used to live here have been removed.
+# NOTE: is_taint / taint_inner / is_tainted_type / list_taint_inner are
+# defined ONCE near the top of this file (BUG-SC-12 consolidation). Do NOT
+# add duplicate definitions below — they would silently shadow the aliases.
 
 
 def split_type_args(s):
@@ -222,16 +229,10 @@ SINK_BUILTINS = {
     "exit":         (0,),    # tainted exit code → behavior-injection
 }
 
-# Returns True iff `t` is the taint wrapper type `tainted[T]` for any T.
-def is_tainted_type(t):
-    return t.startswith("tainted[")
-
-
-def list_taint_inner(t):
-    """For `tainted[T]` return T; otherwise return t unchanged."""
-    if t.startswith("tainted["):
-        return t[8:-1].strip()
-    return t
+# NOTE: is_tainted_type / list_taint_inner are ALIASES defined once at the
+# top of this file (see is_taint / taint_inner). The duplicate definitions
+# that used to live here shadowed those aliases at import time (F811) and
+# have been removed for real — do not reintroduce them.
 
 STR_M = {
     "len": ([], "int"), "byte_at": (["int"], "int"),
@@ -257,6 +258,11 @@ class Checker:
         self.cur_fn = None
         self.cur_fn_ret = "void"  # for `?` propagation
         self.cur_typeparams = set()  # type params valid in the current context
+        # Structs that declare at least one defaulted field — constructing
+        # one may evaluate the default expressions (side effects!), so
+        # check_structlit adds an edge to the synthetic "@default.<Struct>"
+        # call-graph node (BUG-DS4-2).
+        self._structs_with_defaults = set()
 
     # ---------- utilities ----------
     def err(self, msg, node):
@@ -333,17 +339,38 @@ class Checker:
         # 2. check declarations (struct/enum field types, function signatures)
         for name, st in self.structs.items():
             self.cur_typeparams = set(st["typeparams"])
+            # BUG-DS4-2 fix: struct field default expressions are evaluated
+            # in the CALLING context at runtime (both eval_structlit in the
+            # interpreter and gen_structlit in the C backend evaluate the
+            # default expr per construction), and they may call other
+            # functions. The call graph therefore needs a synthetic node per
+            # struct ("@default.<Struct>") whose effects propagate to every
+            # function that constructs that struct. Previously check_expr
+            # inside a default crashed with `KeyError: None` because
+            # self.cur_fn was None while self.edges[None] does not exist.
+            default_key = "@default." + name
+            self.edges[default_key] = set()
+            saved_fn = self.cur_fn
+            saved_ret = self.cur_fn_ret
+            self.cur_fn = default_key
+            self.cur_fn_ret = "void"
             # BUG-SC-7 fix: type-check struct field DEFAULT expressions.
             # Previously defaults were not checked, so `struct Foo { x: int = "hi" }`
             # compiled cleanly and only failed at runtime (type-safety hole).
             # We check each default in an empty env (no bindings in scope).
+            has_defaults = False
             for fname, ftype, fdefault in st["fields"]:
                 self.require_type(ftype, st, "struct field type")
                 if fdefault is not None:
+                    has_defaults = True
                     dv = self.check_expr(fdefault, [{}], ftype)
                     if dv != "never" and dv != ftype:
                         self.err("default value of field '%s' expects %s, got %s"
                                  % (fname, ftype, dv), st)
+            if has_defaults:
+                self._structs_with_defaults.add(name)
+            self.cur_fn = saved_fn
+            self.cur_fn_ret = saved_ret
             self.cur_typeparams = set()
         for ename, en in self.enums.items():
             self.cur_typeparams = set(en["typeparams"])
@@ -920,6 +947,12 @@ class Checker:
         if name not in self.structs:
             self.err("struct does not exist: %s" % e["name"], e)
         st = self.structs[name]
+        # BUG-DS4-2: constructing this struct may evaluate defaulted field
+        # expressions (side effects live in the synthetic "@default.<S>"
+        # call-graph node). Add the edge so the effects fixpoint propagates
+        # the default's effects to the constructing function.
+        if name in self._structs_with_defaults:
+            self.edges[self.cur_fn].add("@default." + name)
         typeparams = st["typeparams"]
         type_map = {}
         # If generic, infer type args from contextual expected type if available.
@@ -941,7 +974,8 @@ class Checker:
                 self.err("struct literal field order mismatch at position %d: expected '%s', got '%s'"
                          % (i, decl_names[i] if i < len(decl_names) else "<end>", fname), e)
         # Determine if all non-defaulted fields are present.
-        defaulted = {fname for fname, _, d in fields_with_defaults if d is not None}
+        # (F841 cleanup: the previous `defaulted` set was computed but never
+        # used — the required-field check below subsumes it.)
         required = [fname for fname, _, d in fields_with_defaults if d is None]
         for r in required:
             if r not in provided_names:
@@ -1281,6 +1315,13 @@ class Checker:
                 self.err("struct %s has no method %s" % (tt_base, name), e)
             key = m[name]
             e["rm"] = ("user", key)
+            # BUG-DS4-1 fix (SOUNDNESS): method calls were NOT added to the
+            # call graph, so the effects fixpoint never traversed them. A
+            # function calling an IO-using method without declaring IO —
+            # or a `pure` function calling an effectful method — compiled
+            # cleanly, completely bypassing the capability system. Add the
+            # edge like check_call does for plain calls.
+            self.edges[self.cur_fn].add(key)
             fn = self.fns[key]
             params = fn["params"][1:]
             if len(args) != len(params):
@@ -1570,7 +1611,10 @@ class Checker:
         (e.g. boot.py --audit) can print the full capability tree.
         """
         # eff[key] = computed set of effects required by `key`'s body.
-        eff = {key: set() for key in self.fns}
+        # BUG-DS4-2: initialise from ALL call-graph nodes — self.fns keys PLUS
+        # the synthetic "@default.<Struct>" nodes added while checking
+        # struct field defaults (their effects must reach constructors).
+        eff = {key: set() for key in self.edges}
 
         # Monotone fixpoint: union in each callee's computed effect set.
         changed = True

@@ -70,7 +70,22 @@ def _resolve_import(import_path, importing_file):
     p = import_path
     base_dir = os.path.dirname(importing_file) if importing_file else _REPO_ROOT
     candidate = os.path.normpath(os.path.join(base_dir, p))
-    return candidate if os.path.isfile(candidate) else None
+    if os.path.isfile(candidate):
+        return candidate
+    # BUG-DS4-26: `hls-pkg build` sets HLS_PKG_DEPS to a directory of
+    # symlinked dependencies — but this resolver never consulted it, so
+    # building any package WITH dependencies still failed with
+    # "module not found" (the env var was a no-op). Search it as a final
+    # fallback (by basename, then by the raw import path).
+    deps_dir = os.environ.get("HLS_PKG_DEPS")
+    if deps_dir and os.path.isdir(deps_dir):
+        cand = os.path.join(deps_dir, os.path.basename(p))
+        if os.path.isfile(cand):
+            return cand
+        cand = os.path.join(deps_dir, p)
+        if os.path.isfile(cand):
+            return cand
+    return None
 
 
 def load_program(entry_path):
@@ -83,6 +98,12 @@ def load_program(entry_path):
     visiting = set()   # for cycle detection
 
     def load_file(abs_path):
+        # BUG-DS4-28: canonicalise via realpath so that the SAME file
+        # reached through different paths (e.g. a package dependency
+        # symlink in .hls-pkg-deps/ AND a direct std/ import from another
+        # module) is loaded once — otherwise every function in it was
+        # reported as "duplicate function across modules".
+        abs_path = os.path.realpath(abs_path)
         if abs_path in loaded:
             return loaded[abs_path]
         if abs_path in visiting:
@@ -349,7 +370,13 @@ def print_ir(program):
     except ImportError as ex:
         sys.stderr.write("error: cannot load HLIR module: %s\n" % ex)
         return 2
-    mod = build_module(program)
+    try:
+        mod = build_module(program)
+    except HLError as ex:
+        # BUG-DS4-31: unsupported constructs in the IR/LLVM layers must
+        # surface as clean compile errors, not raw Python tracebacks.
+        sys.stderr.write("compile error: %s\n" % ex)
+        return 1
     sys.stdout.write(dump_module(mod))
     return 0
 
@@ -365,7 +392,14 @@ def print_llvm(program, target_triple=None):
     except ImportError as ex:
         sys.stderr.write("error: cannot load LLVM emitter: %s\n" % ex)
         return 2
-    out = emit_module(program, target_triple=target_triple)
+    try:
+        out = emit_module(program, target_triple=target_triple)
+    except HLError as ex:
+        # BUG-DS4-31: unsupported constructs (struct/enum/match/?/user
+        # methods) raise HLError — report them like every other compile
+        # error instead of a raw traceback.
+        sys.stderr.write("compile error: %s\n" % ex)
+        return 1
     sys.stdout.write(out)
     return 0
 
@@ -386,7 +420,12 @@ def print_opt_stats(program):
     except ImportError as ex:
         sys.stderr.write("error: cannot load HLIR optimiser: %s\n" % ex)
         return 2
-    mod = build_module(program)
+    try:
+        mod = build_module(program)
+    except HLError as ex:
+        # BUG-DS4-31: clean compile error, not a traceback.
+        sys.stderr.write("compile error: %s\n" % ex)
+        return 1
     # Snapshot pre-optimisation instruction counts.
     before = {}
     for fname, irf in mod.functions.items():

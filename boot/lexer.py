@@ -101,11 +101,18 @@ def tokenize(src):
                 j += 1
                 while j < n and (48 <= src[j] <= 57 or src[j] == 95):
                     j += 1
-            text = src[i:j].decode("ascii").replace("_", "")
+            raw_text = src[i:j].decode("ascii")
+            text = raw_text.replace("_", "")
+            # BUG-DS4-15: keep the RAW source text on the token. Formatters
+            # (hlfmt) must re-emit the original literal — str(float) can
+            # produce exponent notation (1e-05) that the HLS lexer itself
+            # cannot re-parse, which corrupted files on `-w`.
             if is_float:
-                toks.append({"k": "float", "v": float(text), "line": line, "col": col})
+                toks.append({"k": "float", "v": float(text), "raw": raw_text,
+                             "line": line, "col": col})
             else:
-                toks.append({"k": "int", "v": int(text), "line": line, "col": col})
+                toks.append({"k": "int", "v": int(text), "raw": raw_text,
+                             "line": line, "col": col})
             col += j - i
             i = j
             continue

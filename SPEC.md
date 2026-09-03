@@ -416,6 +416,12 @@ To mutate fields: declare `mut self: Point`.
   function's computed effect set is the union of its builtins' effects and
   the computed sets of all its callees. The fixpoint converges because the
   effect universe is finite (5 elements).
+- **Method calls are call-graph edges** (v0.16.0-alpha): `x.method()` counts
+  exactly like a plain call for effect propagation — the method's computed
+  effects flow into the caller's set. Struct field DEFAULT expressions are
+  evaluated at each construction (in the calling context), so they form a
+  synthetic `@default.<Struct>` node: every function that constructs the
+  struct inherits the defaults' effects.
 - **Default-deny**: a function with no `uses` clause has an empty declared
   set. Any builtin call (or call to a callee with a non-empty computed set)
   is a compile error.
