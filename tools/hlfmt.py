@@ -249,6 +249,14 @@ def _render_token(t) -> str:
         return '"%s"' % escaped
     if isinstance(v, bytes):
         return v.decode("latin-1")
+    # BUG-DS4-15: numeric tokens carry their RAW source text (see the
+    # lexer). Re-rendering via str(v) corrupts float literals —
+    # str(0.00001) == '1e-05', which the HLS lexer cannot parse (no
+    # exponent support), so `hlfmt -w` wrote unparseable files and
+    # formatting was not idempotent. Emit the raw text when available.
+    raw = t.get("raw")
+    if k in ("int", "float") and raw is not None:
+        return raw
     return str(v)
 
 

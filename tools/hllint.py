@@ -154,10 +154,16 @@ def exprs_in_stmt(s):
         yield s["value"]
     elif k == "assign":
         yield s["value"]
-        # The target may also contain expressions (e.g. `xs[i] = v` has `i`).
+        # BUG-DS4-21: field/index assignment targets READ their container
+        # (`xs[i] = v` reads `xs`; `p.x = 5` reads `p`). The old code only
+        # yielded `tgt["idx"]`, so the container identifier was never
+        # collected and L001 reported "let binding 'xs' is never used"
+        # (false positive) for every index/field assignment. A plain ident
+        # target (`x = v`) is still NOT yielded — writing to a binding is
+        # not a read, so write-only variables remain lintable.
         tgt = s["target"]
-        if tgt["k"] == "index":
-            yield tgt["idx"]
+        if tgt["k"] in ("field", "index"):
+            yield tgt
     elif k == "return":
         if s.get("value") is not None:
             yield s["value"]

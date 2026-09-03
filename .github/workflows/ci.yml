@@ -105,15 +105,52 @@ jobs:
           python3 boot/boot.py --emit llvm examples/hello.hls > /dev/null
           python3 boot/boot.py --emit llvm --target x86_64-linux examples/fibonacci.hls > /dev/null
 
+      - name: LLVM IR backend suite (emit + structural validation)
+        run: |
+          # v0.16.0-alpha: the old CI only piped --emit llvm output to
+          # /dev/null — the emitter shipped invalid IR (i1/i64 boolean
+          # mixups, instructions after terminators, undefined runtime
+          # symbols) while every scan reported green. This suite emits,
+          # validates the IR structurally (tools/ll_validate.py), and
+          # checks the supported subset's behaviour.
+          bash tests/run_llvm_tests.sh
+
+      - name: LLVM IR assembler cross-check (if available)
+        run: |
+          # When llvm-as is installable, assemble the emitted IR with the
+          # REAL LLVM parser as an extra guard (best-effort).
+          if command -v llvm-as >/dev/null 2>&1 || sudo apt-get install -y -q llvm >/dev/null 2>&1; then
+            for f in tests/llvm/*.hls; do
+              name=$(basename "$f" .hls)
+              python3 boot/boot.py --emit llvm "$f" > "/tmp/$name.ll"
+              llvm-as "/tmp/$name.ll" -o "/tmp/$name.bc"
+            done
+            echo "llvm-as assembled all tests/llvm programs"
+          else
+            echo "llvm-as not available; skipped (structural validator already ran)"
+          fi
+
       - name: Test Stage 14 tooling (hlfmt, hllint, hls-lsp)
         run: |
           # Formatter: idempotency check on comment-free files.
           python3 tools/hlfmt.py -c examples/hello.hls || true  # comments not preserved (alpha)
+          # v0.16.0-alpha: float literals must survive formatting (the old
+          # formatter rewrote 0.00001 as 1e-05, which the lexer cannot
+          # re-parse — hlfmt -w corrupted files).
+          printf 'fn main() -> int {\n    let eps: float = 0.00001\n    let big: float = 10000000000000000.0\n    return eps.to_int()\n}\n' > /tmp/floatfmt.hls
+          python3 tools/hlfmt.py /tmp/floatfmt.hls > /tmp/floatfmt1.hls
+          python3 tools/hlfmt.py /tmp/floatfmt1.hls > /tmp/floatfmt2.hls
+          diff /tmp/floatfmt1.hls /tmp/floatfmt2.hls
+          python3 boot/boot.py --check /tmp/floatfmt1.hls
           # Linter: run on all source files (warnings are OK, exit 0).
           python3 tools/hllint.py --list
           python3 tools/hllint.py examples/fibonacci.hls
           # LSP: one-shot check mode.
           python3 tools/hls-lsp.py --check examples/hello.hls
+          # LSP: malformed-frame resilience + hover on broken doc (a single
+          # bad frame used to kill the server; hover on a syntax-error doc
+          # used to crash with KeyError and never answer the request).
+          python3 tools/lsp_smoke.py
 
       - name: Test Stage 13 package manager (hls-pkg)
         run: |
@@ -124,6 +161,15 @@ jobs:
         run: |
           echo 'int abs(int n); size_t strlen(const char* s);' > /tmp/test.h
           python3 tools/hlbindgen.py /tmp/test.h
+          # v0.16.0-alpha: return-type parsing and C array parameters
+          # (char* ch(char* s); used to map ch's return to int because the
+          # name matched inside "char"; char buf[] leaked brackets into the
+          # parameter name).
+          printf 'char* ch(char* s);\nconst char* cons(const char* s);\nvoid draw(char buf[], int pts[10]);\n' > /tmp/test2.h
+          python3 tools/hlbindgen.py /tmp/test2.h > /tmp/test2.hls
+          rg -q 'fn ch\(s: str\) -> str' /tmp/test2.hls
+          rg -q 'fn cons\(s: str\) -> str' /tmp/test2.hls
+          rg -q 'fn draw\(buf: str, pts: int\) -> void' /tmp/test2.hls
 
       - name: Run stdlib benchmarks (smoke)
         run: |

@@ -87,8 +87,15 @@ def parse_header(src: str) -> list:
         name = m.group(1)
         params_str = m.group(2).strip()
         # Parse the return type from the text before `name`.
+        # BUG-DS4-29: the old code used full.index(name) — the FIRST
+        # occurrence of the function name ANYWHERE in the match. For
+        # `char* ch(char* s);` the name "ch" is found inside the return
+        # type "char" itself, so the return type was parsed as "" -> int
+        # instead of str. Use the match group's start position (relative
+        # to the MATCH start — group offsets from finditer are absolute
+        # in the subject string) instead.
         full = m.group(0)
-        ret_part = full[:full.index(name)].strip()
+        ret_part = full[:m.start(1) - m.start(0)].strip()
         ret_type = _parse_c_type(ret_part)
         # Parse parameters.
         params = []
@@ -105,9 +112,21 @@ def parse_header(src: str) -> list:
                     pname = "_arg%d" % len(params)
                     ptype = _parse_c_type(p)
                 else:
-                    pname = tokens[-1].lstrip("*")
-                    ptype_str = " ".join(tokens[:-1])
-                    ptype = _parse_c_type(ptype_str, p)
+                    # BUG-DS4-30: C array parameters (`char buf[]`,
+                    # `int pts[10]`) used to leak the brackets into the
+                    # parameter NAME (emitting `buf[]: int`, which the
+                    # HLS parser rejects). An array parameter decays to a
+                    # pointer in C — strip the brackets from the name and
+                    # parse the type as a pointer (char[] -> str).
+                    last = tokens[-1]
+                    arr = re.match(r"^([A-Za-z_]\w*)\s*((?:\[[^\]]*\])+)\s*$", last)
+                    if arr:
+                        pname = arr.group(1)
+                        ptype = _parse_c_type(" ".join(tokens[:-1]) + " *")
+                    else:
+                        pname = last.lstrip("*")
+                        ptype_str = " ".join(tokens[:-1])
+                        ptype = _parse_c_type(ptype_str, p)
                 params.append((pname, ptype))
         decls.append({"name": name, "ret": ret_type, "params": params})
     return decls

@@ -8,7 +8,229 @@ Releases on `main` follow the 20-stage roadmap (see [ROADMAP.md](ROADMAP.md)).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
-## [unreleased] — Stage 15-gamma (v0.15.0-alpha)
+## [unreleased] — Stage deep-scan-4 (v0.16.0-alpha)
+
+### Why this release exists — "the scan that finally scans"
+
+The three previous "deep scan" releases (ec00e9f, 6906e52, dd9c730) each
+reported a clean bill of health after fixing dozens of bugs, yet bugs kept
+surviving. The root cause was never the scanning effort — it was that the
+**verification net had holes in it**:
+
+1. **The CI never actually verified the LLVM output.** The Stage 12 step
+   piped `--emit llvm` into `/dev/null` and checked only the exit code.
+   The emitter could (and did) ship IR that no LLVM parser would accept:
+   booleans widened to i64 but stored into i1 slots, instructions emitted
+   after terminators, calls to runtime symbols that do not exist, `ptr 5`
+   literal operands. Structs/enums/match/`?` lowering were silent stubs.
+2. **The test suite only exercised paths the author already thought of.**
+   Method calls bypassed the effect call-graph entirely; struct field
+   defaults with calls crashed the checker with a raw `KeyError: None`.
+   No existing test walked those paths, so "150/150 PASS" was true and
+   meaningless at the same time.
+3. **The tooling had no failure-mode tests.** hlfmt corrupted float
+   literals into unparseable output; the LSP died on the first malformed
+   JSON-RPC frame and never answered requests on broken documents; the
+   linter flagged every index/field assignment target as an unused
+   binding; hls-pkg set an env var that nothing read.
+
+This release fixes the bugs AND closes the verification holes: a new
+structural LLVM IR validator (`tools/ll_validate.py`), a new LLVM backend
+test suite (`tests/run_llvm_tests.sh` + `tests/llvm/`), a protocol-level
+LSP smoke test (`tools/lsp_smoke.py`), new fail/ok regression tests for
+the effect-graph fixes, and CI steps that assert on OUTPUT, not exit codes.
+
+### Fixed — fourth deep scan (DS4): 31 bugs
+
+#### boot/checker.py — effect-system soundness
+- **BUG-DS4-1** (SOUNDNESS, high): **method calls did not participate in
+  the effects call graph.** `check_method` never added an edge to
+  `self.edges`, so the fixpoint never traversed method calls — a function
+  calling an IO-using method without declaring `uses IO` (or a `pure`
+  function calling an effectful method) compiled cleanly, completely
+  bypassing the capability system. New regression test:
+  `tests/fail/fail_effect_method.hls`.
+- **BUG-DS4-2** (high): struct field default expressions containing calls
+  crashed the checker with a raw Python `KeyError: None` (the defaults
+  were checked with `self.cur_fn = None` while `self.edges[None]` does
+  not exist). Defaults are now checked under a synthetic `@default.<S>`
+  call-graph node, and every function that constructs such a struct gets
+  an edge to it — the default's effects propagate to constructors, which
+  matches the interpreter and C backend (both evaluate defaults at each
+  construction). New regression tests:
+  `tests/ok/feat_struct_default_call.hls`,
+  `tests/fail/fail_effect_struct_default.hls`.
+- **BUG-SC-12 (for real)** (low): the previous "consolidation" of the
+  taint helpers left the duplicate `is_tainted_type`/`list_taint_inner`
+  definitions further down the file, shadowing the consolidated aliases
+  (F811). Actually removed this time.
+- F841 cleanup: unused `defaulted` set in `check_structlit`.
+
+#### tools/llvm_emit.py — the LLVM backend was structurally broken
+Rewritten where broken. The emitted IR for the supported subset is now
+structurally valid (verified by `tools/ll_validate.py` and, when
+available, `llvm-as`) and semantically aligned with the interpreter and
+the C backend:
+
+- **BUG-DS4-3** (high): the RUNTIME_DECLS table declared symbols that do
+  not exist in the runtime (`hl_int_to_str`, `hl_float_to_str`,
+  `hl_str_to_float`, `hl_str_subst`, `hl_args_get`, `hl_ord`, ...) and
+  missed the ones that do (`hl_str_from_int64`, `hl_str_from_double`,
+  `hl_str_from_bool`, `hl_str_to_double`, `hl_range`, `hl_args`,
+  `hl_panic`, `hl_chr`, the `hl_box_*` family, `hl_div_i64`, `hl_mod_i64`,
+  `hl_neg_i64`, `hl_abs_i64`, `hl_clone_*`). Assembling/linking the old
+  output failed on undefined symbols. `panic()` also called `hl_die`
+  (const char*) with a boxed str — the correct callee is `hl_panic`.
+- **BUG-DS4-4** (high): booleans were i64-in/i1-out — every comparison
+  was `zext`ed to i64, then stored into i1 slots, branched on, or passed
+  to i1 parameters: invalid IR for any program with a bool variable.
+  Booleans are now i1 end-to-end.
+- **BUG-DS4-5** (high): instructions were emitted after terminators
+  (`for`-increments after a `continue`'s branch, statements after
+  `return`/`break`/`panic`). The emitter now tracks the open block and
+  skips unreachable code; the `for` increment lives in its own block,
+  which is also the `continue` target.
+- **BUG-DS4-6** (high): `extern "C"` functions were emitted as broken
+  `define`s with `unreachable` bodies that shadowed the real libc
+  symbols. They are now `declare` lines.
+- **BUG-DS4-7** (high): `let` slots were `alloca`ed inside loop bodies —
+  LLVM allocas are not released until function return, so loops with
+  lets grew the stack every iteration. All binding slots are now hoisted
+  to the function entry.
+- **BUG-DS4-8** (high): dynamic lists store BOXED elements in the C
+  runtime, but the LLVM path pushed raw values (`ptr 1` literal — invalid
+  IR — and unboxed loads). List literals, `push`/`set`, index get/assign,
+  `for` iteration and `pop` now box/unbox by the element type via
+  `hl_box_i64`/`hl_box_f64`/`hl_box_bool` (+ plain loads on get), matching
+  the C ABI exactly.
+- **BUG-DS4-9** (high, WRONG RESULTS): `&&`/`||` were lowered as EAGER
+  `and`/`or` — the RHS was evaluated even when the LHS decided the
+  result, so `x != 0 && 10 / x > 0` panicked on division by zero where
+  the interpreter printed a result. Now lowered as real short-circuit
+  control flow with `phi` nodes.
+- **BUG-DS4-10** (high): string relational comparisons (`s1 < s2`) fell
+  into the INTEGER path — `icmp` on pointers: invalid IR, and even as a
+  cast it would compare addresses, not bytes. Now routed through
+  `hl_str_cmp` like the C backend.
+- **BUG-DS4-11 / 12 / 13 / 14** (medium): integer `/`/`%`/unary `-` now
+  call the runtime's checked helpers (`hl_div_i64`/`hl_mod_i64`/
+  `hl_neg_i64`) so the zero and `INT64_MIN / -1` panics are identical to
+  the interpreter; the `for` loop re-checks the current list length each
+  iteration (BUG-SC-4 semantics, same as the C backend); the IR builder
+  no longer emits extern "functions" with synthetic panics; the
+  optimiser no longer folds `INT64_MIN / -1` into +2^63 (out of range!)
+  or `INT64_MIN % -1` into 0 (removing a runtime panic); `-O fast` no
+  longer marks `0 - x` as overflow-safe.
+- **BUG-DS4-15** (high): struct literals, struct field access, enum
+  literals, `match`, `?` and user-defined method calls were SILENT stubs
+  emitting garbage IR. They now raise a clean
+  `not yet supported by --emit llvm` compile error (see ROADMAP Stage 12
+  remaining work). Builtin methods (`.to_str()`, `.len()`, `.push()`,
+  `map`/`str`/`int`/`float`/`bool` methods) ARE now fully lowered with
+  correct box/unbox handling.
+- `tainted[T]` now maps to T's LLVM type (taint is compile-time only —
+  same as the C backend), and taint builtins lower to identity/`hl_args`/
+  `hl_read_file`.
+
+#### tools/hlfmt.py — the formatter corrupted files
+- **BUG-DS4-16** (high): float literals were re-rendered via `str(v)` —
+  `0.00001` became `1e-05`, which the HLS lexer cannot parse (no
+  exponent support). `hlfmt -w` rewrote valid programs into unparseable
+  ones, and formatting was not idempotent. The lexer now carries the RAW
+  source text of numeric tokens and the formatter re-emits it verbatim.
+
+#### tools/hls-lsp.py — protocol resilience
+- **BUG-DS4-17** (high): one malformed JSON-RPC frame (bad JSON, bad
+  `Content-Length`, short read) killed the whole server — and it happened
+  OUTSIDE the try/except. Now answers `-32700 Parse error` and keeps
+  serving.
+- **BUG-DS4-18** (high): hover/definition/completion against a document
+  with a syntax error crashed with `KeyError: 'fns'` and the exception
+  handler never ANSWERED the request — editors hung until timeout. Broken
+  documents now degrade to `null` results, and any failed REQUEST gets a
+  `-32603 Internal error` response.
+- **BUG-DS4-19** (medium): `didClose` never published empty diagnostics —
+  stale errors stayed on screen forever. Now clears them.
+- **BUG-DS4-20** (medium): LSP positions are UTF-16 units; the lexer's
+  columns are bytes. Hover/definition missed whenever non-ASCII text
+  preceded the identifier on the same line. Converted properly.
+
+#### tools/hllint.py — false positives
+- **BUG-DS4-21** (medium): L001 ("let binding is never used") fired for
+  every index/field assignment target (`xs[0] = 10`, `p.x = 5`) because
+  the assignment's container expression was never walked. Write-only
+  plain assignments are still (correctly) flagged.
+
+#### tools/hls-pkg.py — security & correctness
+- **BUG-DS4-22** (high, supply-chain): path traversal — a dependency
+  NAME starting with `/` escaped the cache directory entirely, and `path`
+  dependencies accepted absolute paths / `..` escapes, letting a
+  malicious manifest import arbitrary files. Names are now validated
+  (`[A-Za-z0-9._-]`, no leading `.`/`-`) and paths are confined to the
+  repo (or the clone dir for git deps).
+- **BUG-DS4-23** (high): effect auditing FAILED OPEN — a dependency that
+  couldn't be audited (missing boot.py, timeout, non-zero exit) was
+  recorded as PURE, so effect enforcement passed trivially. Now fails
+  closed (full effect family + loud warning).
+- **BUG-DS4-24** (high): `build` never verified the lockfile's SHA-256
+  hashes before compiling (TOCTOU). Now verifies each dependency and
+  fails closed on mismatch.
+- **BUG-DS4-25** (medium): manifest parse errors escaped as raw Python
+  tracebacks. Now clean CLI errors.
+- **BUG-DS4-26** (high): `hls-pkg build` set the `HLS_PKG_DEPS` env var
+  but boot.py never READ it — building any package with dependencies
+  always failed with "module not found". The import resolver now
+  searches the deps dir; dep symlinks are named after the manifest
+  dependency name (`import "strlib.hls"` works).
+- **BUG-DS4-27 / 28** (medium): importing the same module through two
+  paths (a `.hls-pkg-deps` symlink and a direct std import) double-loaded
+  it and reported every function as a duplicate. Imports are now
+  canonicalised via realpath.
+- Git subprocess calls now have timeouts; unused imports removed.
+
+#### tools/hlbindgen.py — wrong generated types
+- **BUG-DS4-29** (high): the return type was parsed via
+  `full.index(name)` — the FIRST occurrence of the function name
+  anywhere in the declaration. `char* ch(char* s);` found "ch" inside
+  "char" and emitted `-> int` instead of `-> str` (same for `cons`).
+  Fixed by slicing at the real match-group start.
+- **BUG-DS4-30** (medium): C array parameters (`char buf[]`) leaked the
+  brackets into the HLS parameter name (`buf[]: int` — unparseable) and
+  typed `char[]` as `int`. Arrays decay to pointers: brackets stripped,
+  `char[]` maps to `str`.
+
+#### boot/boot.py — UX & correctness
+- **BUG-DS4-31** (medium): `--emit llvm` / `--emit ir` / `--opt-stats`
+  on unsupported constructs surfaced as raw Python tracebacks from a
+  worker thread. Now clean `compile error: ...` messages.
+
+### Added — verification infrastructure (the real fix)
+- `tools/ll_validate.py`: dependency-free structural validator for the
+  emitted LLVM IR (checks terminators, declared symbols, store/load type
+  agreement, phi predecessors, branch targets, `ptr <int>` literals,
+  duplicate labels). This is the guardrail whose absence let the broken
+  IR ship through three "green" scans.
+- `tests/run_llvm_tests.sh` + `tests/llvm/*.hls` (6 programs covering
+  bools, boxed lists, short-circuit, div/mod, strings, loops) — emit +
+  validate + `llvm-as` (when available) + behaviour snapshots + the
+  clean-error contract for unsupported constructs.
+- `tools/lsp_smoke.py`: protocol-level LSP test (malformed frame
+  resilience, hover on broken docs, didClose diagnostics, shutdown/exit).
+- Regression tests: `tests/fail/fail_effect_method.hls`,
+  `tests/fail/fail_effect_struct_default.hls`,
+  `tests/ok/feat_struct_default_call.hls`.
+- CI: the LLVM suite, the `llvm-as` cross-check, formatter
+  idempotency/parse-back checks, the LSP smoke test, and bindgen
+  output assertions — all asserting on OUTPUT, not just exit codes.
+
+### Test results
+- `tests/run_tests.sh`: **154 PASS / 0 FAIL** (150 before; +1 ok program
+  and +2 fail programs and their differential/native runs).
+- `tests/run_llvm_tests.sh`: **13 PASS / 0 FAIL** (new).
+- `tools/lsp_smoke.py`: all protocol assertions pass (new).
+- `ruff check boot/ tools/ --select F,E9`: clean (was 9 findings).
+
+## [v0.15.0-alpha] — Stage 15-gamma
 
 ### Stage 15 remaining work completed — `extern` keyword in self-hosted compiler
 - **src/hlc.hls**: added full `extern "C" { ... }` block support (previously

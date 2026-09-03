@@ -66,11 +66,9 @@ import argparse
 import hashlib
 import json
 import os
-import shutil
+import re as _re_mod
 import subprocess
 import sys
-import tempfile
-from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 
@@ -273,17 +271,42 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CACHE_DIR = os.path.join(REPO_ROOT, ".hls-pkg-cache")
 
 
+def _validate_dep_name(name: str):
+    """BUG-DS4-22: dependency names become cache DIRECTORY components.
+    A name like "/tmp/pwned" made os.path.join treat it as an absolute
+    path — git cloned attacker-controlled content into an arbitrary
+    directory. Only [A-Za-z0-9._-] is allowed and the name must not start
+    with '.' or '-'."""
+    if not name or not _re_mod.fullmatch(r"[A-Za-z0-9._-]+", name) or name[0] in ".-":
+        raise ValueError("invalid dependency name: %r (allowed: letters, "
+                         "digits, '.', '_', '-'; must not start with '.' or '-')" % name)
+
+
+def _confine(base_dir: str, rel: str, what: str) -> str:
+    """Resolve `rel` under `base_dir` and REFUSE escapes (absolute paths,
+    '..' traversal). BUG-DS4-22: path deps could point outside the repo
+    (including absolute paths), letting a malicious manifest import any
+    file on the machine into the build."""
+    if os.path.isabs(rel):
+        raise ValueError("%s: absolute paths are not allowed: %s" % (what, rel))
+    full = os.path.normpath(os.path.join(base_dir, rel))
+    base_real = os.path.normpath(base_dir)
+    if not (full == base_real or full.startswith(base_real + os.sep)):
+        raise ValueError("%s: path escapes the allowed directory: %s" % (what, rel))
+    return full
+
+
 def resolve_dependency(name: str, source: Dict, cache_dir: str = CACHE_DIR) -> str:
     """Resolve a dependency to a local file path.
 
     For `path`-only deps: relative to the repo root.
     For `git` deps: clone into cache_dir, checkout tag/branch, return path.
     """
+    _validate_dep_name(name)
     if "path" in source:
-        # Path dependency. Resolve relative to the repo root or absolute.
-        p = source["path"]
-        if not os.path.isabs(p):
-            p = os.path.join(REPO_ROOT, p)
+        # Path dependency. Resolve relative to the repo root — and CONFINED
+        # to it (BUG-DS4-22).
+        p = _confine(REPO_ROOT, source["path"], "dependency %s" % name)
         if not os.path.isfile(p):
             raise FileNotFoundError(
                 "dependency %s: path not found: %s" % (name, p))
@@ -296,20 +319,24 @@ def resolve_dependency(name: str, source: Dict, cache_dir: str = CACHE_DIR) -> s
         clone_dir = os.path.join(cache_dir, name.replace(".", "_"), repo_hash)
         if not os.path.isdir(clone_dir):
             subprocess.run(["git", "clone", "--quiet", repo_url, clone_dir],
-                           check=True, capture_output=True)
+                           check=True, capture_output=True, timeout=300)
         # Checkout tag/branch if specified.
         ref = source.get("tag") or source.get("branch") or "main"
         try:
             subprocess.run(["git", "-C", clone_dir, "fetch", "--quiet",
-                            "origin", ref], check=True, capture_output=True)
+                            "origin", ref], check=True, capture_output=True,
+                           timeout=300)
             subprocess.run(["git", "-C", clone_dir, "checkout", "--quiet",
-                            ref], check=True, capture_output=True)
+                            ref], check=True, capture_output=True, timeout=300)
         except subprocess.CalledProcessError:
             # Fallback: try just `git checkout main`.
             subprocess.run(["git", "-C", clone_dir, "checkout", "--quiet",
-                            "main"], check=True, capture_output=True)
+                            "main"], check=True, capture_output=True, timeout=300)
         path = source.get("path", "")
-        full = os.path.join(clone_dir, path) if path else clone_dir
+        if path:
+            full = _confine(clone_dir, path, "dependency %s" % name)
+        else:
+            full = clone_dir
         if not os.path.isfile(full):
             raise FileNotFoundError(
                 "dependency %s: path not found in repo: %s" % (name, full))
@@ -321,6 +348,14 @@ def resolve_dependency(name: str, source: Dict, cache_dir: str = CACHE_DIR) -> s
 # Effect extraction.
 # ---------------------------------------------------------------------------
 
+# Fail-closed effect set: if the audit of a dependency cannot be run
+# (missing boot.py, timeout, non-zero exit), we record the FULL effect
+# family so effect enforcement fails closed instead of silently passing
+# (BUG-DS4-23: the old behaviour returned ([], []) — an unaudittable or
+# actively broken dependency was recorded as PURE).
+FAIL_CLOSED_EFFECTS = sorted(["Args", "Clock", "Exit", "Fs", "IO"])
+
+
 def extract_effects(file_path: str) -> Tuple[List[str], List[str]]:
     """Run `boot.py --audit` on a single-file package; return (declared, transitive).
 
@@ -331,7 +366,9 @@ def extract_effects(file_path: str) -> Tuple[List[str], List[str]]:
     """
     boot_py = os.path.join(REPO_ROOT, "boot", "boot.py")
     if not os.path.isfile(boot_py):
-        return [], []
+        print("warning: cannot audit %s (boot.py not found) — recording "
+              "the full effect set (fail closed)" % file_path, file=sys.stderr)
+        return list(FAIL_CLOSED_EFFECTS), list(FAIL_CLOSED_EFFECTS)
     # Generate a wrapper file alongside the target so relative imports work.
     target_dir = os.path.dirname(os.path.abspath(file_path))
     target_name = os.path.basename(file_path)
@@ -352,10 +389,15 @@ def extract_effects(file_path: str) -> Tuple[List[str], List[str]]:
                 os.unlink(wrapper_path)
             except OSError:
                 pass
-    except (subprocess.TimeoutExpired, OSError):
-        return [], []
+    except (subprocess.TimeoutExpired, OSError) as ex:
+        print("warning: cannot audit %s (%s) — recording the full effect "
+              "set (fail closed)" % (file_path, ex), file=sys.stderr)
+        return list(FAIL_CLOSED_EFFECTS), list(FAIL_CLOSED_EFFECTS)
     if result.returncode != 0:
-        return [], []
+        print("warning: audit of %s failed (exit %d) — recording the full "
+              "effect set (fail closed)" % (file_path, result.returncode),
+              file=sys.stderr)
+        return list(FAIL_CLOSED_EFFECTS), list(FAIL_CLOSED_EFFECTS)
     # Parse the audit output: look for the function table, extract the
     # declared and computed effect sets.
     declared = set()
@@ -582,7 +624,10 @@ def cmd_build(args):
     if not os.path.isfile(manifest_path):
         print("error: no hls-pkg.toml in current directory", file=sys.stderr)
         return 1
-    manifest = parse_manifest(manifest_path)
+    # Parse the manifest to validate it early (F841 cleanup: the result is
+    # intentionally unused here — `build` compiles the entry with the
+    # dependency import path from the LOCKFILE, not the manifest).
+    parse_manifest(manifest_path)
     entry = args.entry or "main.hls"
     if not os.path.isfile(entry):
         print("error: entry file not found: %s" % entry, file=sys.stderr)
@@ -606,9 +651,26 @@ def cmd_build(args):
         for pkg in lockfile.get("packages", []):
             rp = pkg.get("resolved_path", "")
             if rp and os.path.isfile(rp):
+                # BUG-DS4-24: verify the lockfile hash BEFORE using the
+                # dependency (fail closed). The git cache can be tampered
+                # with or moved forward between `lock` and `build` (TOCTOU);
+                # previously build compiled whatever was on disk.
+                actual_sha = sha256_file(rp)
+                if actual_sha != pkg.get("sha256"):
+                    print("error: dependency %s hash mismatch (expected %s, "
+                          "got %s) — run `hls-pkg lock` again, or investigate."
+                          % (pkg.get("name"),
+                             str(pkg.get("sha256"))[:12], actual_sha[:12]),
+                          file=sys.stderr)
+                    return 1
                 # Symlink (or copy) the dep file into deps_dir so boot.py
-                # can resolve `import "dep_name"` via the standard search path.
-                dst = os.path.join(deps_dir, os.path.basename(rp))
+                # can resolve `import "<dep_name>.hls"` via the standard
+                # search path (HLS_PKG_DEPS). BUG-DS4-27: the symlink used
+                # to be named after the SOURCE file's basename, but the
+                # entry imports the dependency by its manifest NAME —
+                # e.g. `strlib = { path = "std/str.hls" }` must be
+                # importable as `import "strlib.hls"`.
+                dst = os.path.join(deps_dir, pkg["name"] + ".hls")
                 try:
                     if os.path.islink(dst) or os.path.exists(dst):
                         os.remove(dst)
@@ -659,7 +721,17 @@ def main():
     p_build.set_defaults(func=cmd_build)
 
     args = parser.parse_args()
-    return args.func(args)
+    # BUG-DS4-25: manifest/lockfile problems used to escape as raw
+    # Python tracebacks (ValueError: substring not found, etc.). Report
+    # them as clean CLI errors.
+    try:
+        return args.func(args)
+    except (ValueError, KeyError) as ex:
+        print("error: %s" % ex, file=sys.stderr)
+        return 1
+    except FileNotFoundError as ex:
+        print("error: %s" % ex, file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

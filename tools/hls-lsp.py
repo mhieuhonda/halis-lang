@@ -43,23 +43,48 @@ from boot.checker import check  # noqa: E402
 # ---------------------------------------------------------------------------
 
 def read_message():
-    """Read a single JSON-RPC message from stdin (Content-Length framing)."""
+    """Read a single JSON-RPC message from stdin (Content-Length framing).
+
+    BUG-DS4-16: this used to RAISE on a malformed frame (bad JSON, bad
+    Content-Length header, short read at EOF) — and since run() called it
+    OUTSIDE its try/except, one malformed frame killed the whole server.
+    The LSP spec requires a -32700 Parse error response and staying alive.
+    Now returns ("__parse_error__", detail) markers instead of raising;
+    returns None only at clean EOF.
+    """
     headers = {}
-    while True:
-        line = sys.stdin.buffer.readline()
-        if not line:
-            return None
-        line = line.strip()
-        if not line:
-            break
-        if b":" in line:
-            k, v = line.split(b":", 1)
-            headers[k.strip().lower()] = v.strip()
+    try:
+        while True:
+            line = sys.stdin.buffer.readline()
+            if not line:
+                return None
+            line = line.strip()
+            if not line:
+                break
+            if b":" in line:
+                k, v = line.split(b":", 1)
+                headers[k.strip().lower()] = v.strip()
+    except OSError as ex:
+        return ("__parse_error__", "stdin read error: %s" % ex)
     if b"content-length" not in headers:
-        return None
-    n = int(headers[b"content-length"])
+        # No body framing — treat as a parse error (the client is speaking
+        # something other than LSP framing).
+        return ("__parse_error__", "missing Content-Length header")
+    try:
+        n = int(headers[b"content-length"])
+    except ValueError:
+        return ("__parse_error__", "invalid Content-Length: %r"
+                % headers[b"content-length"])
+    if n < 0 or n > (1 << 28):
+        return ("__parse_error__", "unreasonable Content-Length: %d" % n)
     body = sys.stdin.buffer.read(n)
-    return json.loads(body.decode("utf-8"))
+    if len(body) != n:
+        return ("__parse_error__", "short read: wanted %d bytes, got %d"
+                % (n, len(body)))
+    try:
+        return json.loads(body.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError) as ex:
+        return ("__parse_error__", "invalid JSON body: %s" % ex)
 
 
 def write_message(msg):
@@ -102,12 +127,28 @@ class HLSServer:
         while True:
             msg = read_message()
             if msg is None:
-                break
+                break  # clean EOF
+            if isinstance(msg, tuple) and msg and msg[0] == "__parse_error__":
+                # BUG-DS4-16: reply -32700 Parse error (id null per JSON-RPC)
+                # and keep serving.
+                self.send_response(None, None, error_code=-32700,
+                                   error_message="Parse error: %s" % msg[1])
+                continue
             try:
                 self.handle(msg)
             except Exception as ex:
                 sys.stderr.write("error handling message: %s\n" % ex)
                 traceback.print_exc(file=sys.stderr)
+                # BUG-DS4-17: if the failed message was a REQUEST (has an id),
+                # the client is waiting for a response — swallowing the
+                # exception without answering hung every editor request.
+                # Answer with -32603 Internal error.
+                if isinstance(msg, dict) and msg.get("id") is not None:
+                    try:
+                        self.send_response(msg["id"], None, error_code=-32603,
+                                           error_message="internal error: %s" % ex)
+                    except Exception:
+                        pass
 
     def handle(self, msg):
         method = msg.get("method")
@@ -178,6 +219,11 @@ class HLSServer:
         td = params.get("textDocument", {})
         uri = td.get("uri")
         self.docs.pop(uri, None)
+        # BUG-DS4-18: per LSP spec, closing a document must CLEAR its
+        # diagnostics — otherwise stale errors stay displayed forever.
+        # Publish an empty diagnostics list for the closed URI.
+        self.send_notification("textDocument/publishDiagnostics", {
+            "uri": uri, "diagnostics": []})
 
     def _store_doc(self, uri, version, text):
         # Parse + check the document. On syntax/check errors, store the
@@ -232,17 +278,52 @@ class HLSServer:
             "uri": uri, "diagnostics": diagnostics})
 
     # ---------- hover ----------
+    @staticmethod
+    def _utf16_col_to_byte(text, line0, col16):
+        """Convert an LSP UTF-16 `character` offset on a 0-indexed line to
+        a 0-based BYTE offset in that line (the lexer's columns are
+        byte-based). BUG-DS4-20: positions were previously compared as if
+        UTF-16 units were bytes, so any identifier preceded by non-ASCII
+        text on the same line could not be hovered/defined."""
+        lines = text.split("\n")
+        if line0 < 0 or line0 >= len(lines):
+            return col16
+        line_text = lines[line0]
+        units = 0
+        for i, ch in enumerate(line_text):
+            if units >= col16:
+                return i
+            units += 2 if ord(ch) > 0xFFFF else 1
+        return len(line_text)
+
+    def _doc_program(self, doc):
+        """Return the parsed program of a doc, or None if the doc is
+        missing, unparsed, or carries a syntax error (BUG-DS4-19: the
+        `_error` marker dicts used to flow into handlers that then
+        crashed with KeyError: 'fns')."""
+        if not doc:
+            return None
+        prog = doc.get("program")
+        if prog is None or isinstance(prog, dict) and "_error" in prog:
+            return None
+        return prog
+
     def handle_hover(self, params, msg_id):
         td = params.get("textDocument", {})
         uri = td.get("uri")
         pos = params.get("position", {})
         line = pos.get("line", 0) + 1  # LSP is 0-indexed
-        col = pos.get("character", 0) + 1
         doc = self.docs.get(uri)
-        if not doc or doc.get("program") is None:
+        if doc is None:
             self.send_response(msg_id, None)
             return
-        prog = doc["program"]
+        # LSP `character` is UTF-16 units; the lexer's columns are bytes.
+        col = self._utf16_col_to_byte(doc["text"], line - 1,
+                                      pos.get("character", 0)) + 1
+        prog = self._doc_program(doc)
+        if prog is None:
+            self.send_response(msg_id, None)
+            return
         # Find the identifier at the given position by walking the AST.
         # Each token has line/col info; we look for an `ident` or `kw`
         # token at the given position.
@@ -314,12 +395,16 @@ class HLSServer:
         uri = td.get("uri")
         pos = params.get("position", {})
         line = pos.get("line", 0) + 1
-        col = pos.get("character", 0) + 1
         doc = self.docs.get(uri)
-        if not doc or doc.get("program") is None:
+        if doc is None:
             self.send_response(msg_id, None)
             return
-        prog = doc["program"]
+        col = self._utf16_col_to_byte(doc["text"], line - 1,
+                                      pos.get("character", 0)) + 1
+        prog = self._doc_program(doc)
+        if prog is None:
+            self.send_response(msg_id, None)
+            return
         ident_name = self._ident_at(prog, line, col, uri=uri)
         if ident_name is None:
             self.send_response(msg_id, None)
@@ -381,8 +466,8 @@ class HLSServer:
             for u, d in self.docs.items():
                 doc = d
                 break
-        if doc and doc.get("program") is not None:
-            prog = doc["program"]
+        prog = self._doc_program(doc)
+        if prog is not None:
             for fname in prog["fns"]:
                 if fname not in seen:
                     items.append({"label": fname, "kind": 3})  # 3 = Function
