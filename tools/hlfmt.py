@@ -240,35 +240,44 @@ def format_source(src: bytes) -> str:
             cur_v = _token_str(t)
             prev_kind = prev["k"]
             cur_kind = t["k"]
+            # Deep-scan-7 fix: the NO_SPACE_BEFORE / NO_SPACE_AFTER /
+            # `prev_v in ("...", "...")` overrides used to fire for
+            # STRING LITERALS whose value was a single byte like `]`,
+            # `[`, `)`, `(` — so `print("[" + x + "]")` lost the spaces
+            # around the `+` (the `[` and `]` byte values matched
+            # the closing-bracket override). The fix: only apply
+            # symbol-only rules when the token's kind is `sym`.
+            prev_is_sym = (prev_kind == "sym")
+            cur_is_sym = (cur_kind == "sym")
             need_space = False
             # Rule 1: two word-like tokens in a row -> space.
             if prev_kind in WORD_KINDS and cur_kind in WORD_KINDS:
                 need_space = True
             # Rule 2: prev is a closing `)` or `]`, cur is a word -> space.
-            if prev_v in (")", "]") and cur_kind in WORD_KINDS:
+            if prev_is_sym and prev_v in (")", "]") and cur_kind in WORD_KINDS:
                 need_space = True
             # Rule 3: prev is a word/literal/`)`/`]`, cur is a sym with
             # space-before rule.
-            if (prev_kind in WORD_KINDS or prev_v in (")", "]")) and cur_v in SPACE_BEFORE_SYMS:
+            if (prev_kind in WORD_KINDS or (prev_is_sym and prev_v in (")", "]"))) and cur_is_sym and cur_v in SPACE_BEFORE_SYMS:
                 need_space = True
             # Rule 4: prev is a sym with space-after rule, cur is word/literal
             # or `(`, `[` (treat `(`/`[` like word tokens here so they get
             # a space after binary operators).
-            if prev_v in SPACE_AFTER_SYMS and (cur_kind in WORD_KINDS or cur_v in ("(", "[")):
+            if prev_is_sym and prev_v in SPACE_AFTER_SYMS and (cur_kind in WORD_KINDS or (cur_is_sym and cur_v in ("(", "["))):
                 need_space = True
             # Override: no space if cur is in NO_SPACE_BEFORE.
             # Exception: if prev is a binary operator (SPACE_AFTER_SYMS),
             # we still want a space before `(`/`[` (e.g. `1 + (2)` not
             # `1 +(2)`).
-            if cur_v in NO_SPACE_BEFORE and not (prev_v in SPACE_AFTER_SYMS and cur_v in ("(", "[")):
+            if cur_is_sym and cur_v in NO_SPACE_BEFORE and not (prev_is_sym and prev_v in SPACE_AFTER_SYMS and cur_v in ("(", "[")):
                 need_space = False
             # Override: no space if prev is in NO_SPACE_AFTER.
-            if prev_v in NO_SPACE_AFTER:
+            if prev_is_sym and prev_v in NO_SPACE_AFTER:
                 need_space = False
             # BUG (deep-scan-5): unary `!` after a keyword or operator
             # lost its preceding space — `if !x` printed as `if!x`.
-            if cur_v == "!" and (prev_kind in WORD_KINDS or
-                                 prev_v in SPACE_AFTER_SYMS):
+            if cur_is_sym and cur_v == "!" and (prev_kind in WORD_KINDS or
+                                 (prev_is_sym and prev_v in SPACE_AFTER_SYMS)):
                 need_space = True
             # Don't double-up spaces — and never emit a space at the
             # START of a line. BUG (deep-scan-5): at indent 0 the line
@@ -287,10 +296,10 @@ def format_source(src: bytes) -> str:
             if pending_unary:
                 need_space = False
                 pending_unary = False
-            if cur_v == "-" and (prev_v == "return" or
-                                 not (prev_kind in WORD_KINDS or prev_v in (")", "]"))):
+            if cur_is_sym and cur_v == "-" and (prev_v == "return" or
+                                 not (prev_kind in WORD_KINDS or (prev_is_sym and prev_v in (")", "]")))):
                 pending_unary = True
-                if prev_v in SPACE_AFTER_SYMS or prev_v == "return":
+                if prev_is_sym and prev_v in SPACE_AFTER_SYMS or prev_v == "return":
                     need_space = True
             if need_space:
                 cur_line_parts.append(" ")

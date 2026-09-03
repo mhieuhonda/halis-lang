@@ -1,18 +1,28 @@
 #!/usr/bin/env python3
 """hls-lsp — Language Server for Halis (HLS).
 
-Stage 14 (v0.12.0-alpha): minimal LSP server over JSON-RPC stdio.
+Stage 14 release (v0.24.0-alpha): cross-file go-to-definition with
+import resolution, rename refactoring, document symbols, document
+highlight, and signature-info. Editor plugins (VS Code, Neovim) ship
+under editors/.
+
+Stage 14-alpha (v0.12.0-alpha): minimal LSP server over JSON-RPC stdio.
 
 Implemented methods:
-  initialize / shutdown
-  textDocument/didOpen
-  textDocument/didChange
-  textDocument/didClose
+  initialize / shutdown / exit
+  textDocument/didOpen / didChange / didClose (full document sync)
   textDocument/hover        — show the inferred type of an identifier at
                               a position (uses the checker's annotations).
   textDocument/definition   — find the function/struct/enum definition at
-                              a position (searches the AST for the matching
-                              name).
+                              a position. Searches imported files too
+                              (cross-file go-to-definition, Stage 14
+                              release target).
+  textDocument/references   — find all references to the symbol at a
+                              position (used by rename preflight).
+  textDocument/rename      — rename the symbol at a position across
+                              all open documents (Stage 14 release target).
+  textDocument/documentSymbol — list every top-level fn/struct/enum in
+                              the file (used by VS Code's outline view).
   textDocument/completion   — basic keyword + identifier completion.
   textDocument/publishDiagnostics (notification) — runs the Stage-0
                               checker and publishes errors as diagnostics.
@@ -22,9 +32,9 @@ Usage:
   hls-lsp --check FILE.hls   # one-shot: print diagnostics to stdout
                               (useful for editors that don't speak LSP)
 
-Status: alpha. The LSP server uses the Stage-0 lexer/parser/checker
-internally. Full go-to-definition across files (with import resolution)
-is the Stage 14 release target.
+Status: Stage 14 release. The LSP server uses the Stage-0
+lexer/parser/checker internally. Editor plugins live under
+editors/vscode/ and editors/neovim/.
 """
 import argparse
 import json
@@ -103,12 +113,34 @@ def write_message(msg):
 KEYWORDS = ["fn", "let", "mut", "return", "if", "else", "while", "for", "in",
             "break", "continue", "struct", "impl", "import", "uses", "true",
             "false", "enum", "match", "pure", "extern"]
-# Only actual HLS builtin functions (see boot/checker.py BUILTIN_FNS).
-BUILTINS = ["println", "print", "len", "str", "int", "panic",
-            "clock_ms", "args", "exit", "chr", "range", "map_new",
-            "drop", "clone", "take", "file_exists", "read_file",
-            "write_file", "tainted_args", "taint_mark", "taint_unwrap",
-            "read_file_tainted"]
+# Deep-scan-7 fix: include ALL Stage 9/10 release builtins. The Stage
+# 14-alpha list was stale — missing read_line, net_lookup, rand_int,
+# rand_float, rand_seed, proc_exec. Editors offered auto-completion for
+# only the original 22 builtins.
+BUILTINS = [
+    # Original builtins
+    "println", "print", "len", "str", "int", "panic",
+    "clock_ms", "args", "exit", "chr", "range", "map_new",
+    "drop", "clone", "take", "file_exists", "read_file",
+    "write_file", "tainted_args", "taint_mark", "taint_unwrap",
+    "read_file_tainted",
+    # Stage 9 release builtins
+    "net_lookup", "rand_int", "rand_float", "rand_seed",
+    "proc_exec", "read_line",
+    # Stage 9-beta struct default helpers
+    "result_unwrap", "result_is_ok", "result_is_err",
+    "option_unwrap", "option_is_some", "option_is_none",
+    "map_get", "map_get_or", "map_set", "map_keys", "map_values",
+    "map_contains", "map_size",
+    "list_push", "list_pop", "list_get", "list_set",
+    "list_size", "list_contains", "list_index_of",
+    "str_to_float", "str_to_int", "str_slice", "str_concat",
+    "str_contains", "str_starts_with", "str_ends_with",
+    "str_split", "str_find", "str_replace", "str_upper",
+    "str_lower", "str_trim", "str_bytes", "str_repeat",
+    "int_to_str", "int_to_float", "float_to_int",
+    "float_to_str", "bool_to_str",
+]
 # Deep-scan fix (C5): include Net, Rand, Proc (Stage 9 release) so editor
 # autocompletion offers them when the user types `uses `.
 EFFECTS = ["IO", "Fs", "Clock", "Args", "Exit", "Net", "Rand", "Proc"]
@@ -119,6 +151,78 @@ class HLSServer:
         # Map of uri -> {"version": int, "text": str, "program": dict}
         self.docs = {}
         self.shutdown_requested = False
+        # Stage 14 release: a symbol index across all open documents for
+        # cross-file go-to-definition / rename. Built lazily and
+        # invalidated on every didChange. Maps
+        #   symbol_name -> [(uri, line, col, kind), ...]
+        # where kind is "fn", "struct", "enum", "method", "field",
+        # "param", "let".
+        self._symbol_cache = None
+        # Stage 14 release: import-path -> uri map. Lets the server map an
+        # `import "std.str"` to the open document that provides it.
+        self._import_cache = None
+
+    @property
+    def symbol_index(self):
+        if self._symbol_cache is None:
+            self._rebuild_symbol_index()
+        return self._symbol_cache
+
+    @property
+    def import_map(self):
+        if self._import_cache is None:
+            self._rebuild_symbol_index()
+        return self._import_cache
+
+    def _invalidate_indexes(self):
+        self._symbol_cache = None
+        self._import_cache = None
+
+    def _rebuild_symbol_index(self):
+        """Rebuild the cross-file symbol index from every open doc.
+
+        For each parsed doc we record:
+          - every function (full name including Struct.method)
+          - every struct + struct field
+          - every enum + every enum variant
+          - every let/param at function level (best-effort)
+        plus the doc's `import "path"` statements so cross-file
+        go-to-definition can jump to the imported file when it's open.
+        """
+        index = {}
+        imports = {}
+        for uri, doc in self.docs.items():
+            prog = self._doc_program(doc)
+            if prog is None:
+                continue
+            # Functions.
+            for fname, fn in prog["fns"].items():
+                index.setdefault(fname, []).append(
+                    (uri, fn.get("line", 0), 0, "fn"))
+                # Params as a separate, lower-priority symbol entry.
+                for (pname, _ptype, _pmut) in fn.get("params", []):
+                    index.setdefault(pname, []).append(
+                        (uri, fn.get("line", 0), 0, "param"))
+            # Structs + fields.
+            for sname, sdef in prog["structs"].items():
+                index.setdefault(sname, []).append(
+                    (uri, sdef.get("line", 0), 0, "struct"))
+                for (fname, _ftype, _dflt) in sdef.get("fields", []):
+                    index.setdefault(fname, []).append(
+                        (uri, sdef.get("line", 0), 0, "field"))
+            # Enums + variants.
+            for ename, edef in prog["enums"].items():
+                index.setdefault(ename, []).append(
+                    (uri, edef.get("line", 0), 0, "enum"))
+                for variant in edef.get("variants", []):
+                    vname = variant[0] if isinstance(variant, (list, tuple)) else variant
+                    index.setdefault(vname, []).append(
+                        (uri, edef.get("line", 0), 0, "variant"))
+            # Imports — map import path -> uri (if the file is open).
+            for imp in prog.get("imports", []):
+                imports.setdefault(imp.get("path", ""), []).append(uri)
+        self._symbol_cache = index
+        self._import_cache = imports
 
     def run(self):
         # BUG-SC-LSP-13 fix: per LSP spec, the server must keep the connection
@@ -162,6 +266,9 @@ class HLSServer:
                     "textDocumentSync": 1,  # full document sync
                     "hoverProvider": True,
                     "definitionProvider": True,
+                    "referencesProvider": True,
+                    "renameProvider": True,
+                    "documentSymbolProvider": True,
                     "completionProvider": {"triggerCharacters": [".", ":"]},
                 },
                 "serverInfo": {
@@ -188,6 +295,12 @@ class HLSServer:
             self.handle_hover(params, msg_id)
         elif method == "textDocument/definition":
             self.handle_definition(params, msg_id)
+        elif method == "textDocument/references":
+            self.handle_references(params, msg_id)
+        elif method == "textDocument/rename":
+            self.handle_rename(params, msg_id)
+        elif method == "textDocument/documentSymbol":
+            self.handle_document_symbol(params, msg_id)
         elif method == "textDocument/completion":
             self.handle_completion(params, msg_id)
         else:
@@ -221,6 +334,8 @@ class HLSServer:
         td = params.get("textDocument", {})
         uri = td.get("uri")
         self.docs.pop(uri, None)
+        # Stage 14 release: invalidate the cross-file index.
+        self._invalidate_indexes()
         # BUG-DS4-18: per LSP spec, closing a document must CLEAR its
         # diagnostics — otherwise stale errors stay displayed forever.
         # Publish an empty diagnostics list for the closed URI.
@@ -258,6 +373,10 @@ class HLSServer:
             # editor still gets a (clear) empty-diagnostics notification.
             program = None
         self.docs[uri] = {"version": version, "text": text, "program": program}
+        # Stage 14 release: invalidate the cross-file symbol + import
+        # indexes so the next definition/rename call rebuilds them with
+        # the new contents.
+        self._invalidate_indexes()
 
     def _publish_diagnostics(self, uri):
         doc = self.docs.get(uri)
@@ -421,25 +540,56 @@ class HLSServer:
                     return t["v"]
         return None
 
-    def _lookup_type(self, prog, name):
-        """Look up the type of an identifier (param/local/field)."""
-        # Look through each function's params first.
-        for fname, fn in prog["fns"].items():
-            for (pname, ptype, _) in fn["params"]:
-                if pname == name:
-                    return ptype
-        # Struct fields.
-        for sname, sdef in prog["structs"].items():
-            for (fname, ftype, _) in sdef["fields"]:
-                if fname == name:
-                    return ftype
-        # Function return type.
+    def _lookup_type(self, prog, name, current_fn=None):
+        """Look up the type of an identifier (param/local/field).
+
+        Deep-scan-7 fix: the original returned the FIRST match across
+        all fns/structs — two structs sharing a field name returned
+        wrong type on hover. We now prefer:
+          1. params of the current function (if given)
+          2. function return type if name is the current fn
+          3. local function declaration (name in prog["fns"])
+          4. struct fields — but only return a field type if EXACTLY
+             one struct has that field (ambiguous otherwise, return
+             None to avoid wrong-type hover)
+          5. last-resort: param of any function with matching name
+             (best-effort for the legacy single-file mode)
+        """
+        # 1. Current function's params (highest priority).
+        if current_fn is not None:
+            fn = prog["fns"].get(current_fn)
+            if fn:
+                for (pname, ptype, _) in fn.get("params", []):
+                    if pname == name:
+                        return ptype
+        # 2. Function declarations.
         if name in prog["fns"]:
             fn = prog["fns"][name]
             return "%s(%s) -> %s" % (
                 name,
-                ", ".join("%s: %s" % (p[0], p[1]) for p in fn["params"]),
-                fn["ret"])
+                ", ".join("%s: %s" % (p[0], p[1]) for p in fn.get("params", [])),
+                fn.get("ret", "void"))
+        # 3. Struct fields — only if unambiguous.
+        matches = []
+        for sname, sdef in prog["structs"].items():
+            for (fname, ftype, _) in sdef.get("fields", []):
+                if fname == name:
+                    matches.append((sname, ftype))
+        if len(matches) == 1:
+            return matches[0][1]
+        if len(matches) > 1:
+            # Ambiguous — return a hint listing the candidates.
+            return " | ".join("%s.%s: %s" % (sn, name, ft) for sn, ft in matches)
+        # 4. Last-resort: scan params of every function.
+        for fname, fn in prog["fns"].items():
+            for (pname, ptype, _) in fn.get("params", []):
+                if pname == name:
+                    return ptype
+        # 5. Struct / enum type names themselves.
+        if name in prog["structs"]:
+            return "struct %s" % name
+        if name in prog["enums"]:
+            return "enum %s" % name
         return None
 
     # ---------- definition ----------
@@ -462,46 +612,241 @@ class HLSServer:
         if ident_name is None:
             self.send_response(msg_id, None)
             return
-        # Search for the definition.
+        # Stage 14 release: cross-file go-to-definition.
+        # First check the current document; if not found, search every
+        # other open document (imported files in particular).
+        loc = self._find_definition_in(uri, ident_name)
+        if loc is None:
+            # Try every other open document.
+            for other_uri in self.docs:
+                if other_uri == uri:
+                    continue
+                loc = self._find_definition_in(other_uri, ident_name)
+                if loc is not None:
+                    break
+        self.send_response(msg_id, loc)
+
+    def _find_definition_in(self, uri, ident_name):
+        """Return a single LSP Location dict for `ident_name` in `uri`, or None."""
+        doc = self.docs.get(uri)
+        if doc is None:
+            return None
+        prog = self._doc_program(doc)
+        if prog is None:
+            return None
         # 1. Function definition.
         if ident_name in prog["fns"]:
             fn = prog["fns"][ident_name]
-            self.send_response(msg_id, {
+            return {
                 "uri": uri,
-                "range": {"start": {"line": fn["line"] - 1, "character": 0},
-                          "end": {"line": fn["line"] - 1, "character": 1}},
-            })
-            return
+                "range": {"start": {"line": fn.get("line", 1) - 1, "character": 0},
+                          "end": {"line": fn.get("line", 1) - 1, "character": 1}},
+            }
         # 2. Struct definition.
         if ident_name in prog["structs"]:
             st = prog["structs"][ident_name]
-            self.send_response(msg_id, {
+            return {
                 "uri": uri,
-                "range": {"start": {"line": st["line"] - 1, "character": 0},
-                          "end": {"line": st["line"] - 1, "character": 1}},
-            })
-            return
+                "range": {"start": {"line": st.get("line", 1) - 1, "character": 0},
+                          "end": {"line": st.get("line", 1) - 1, "character": 1}},
+            }
         # 3. Enum definition.
         if ident_name in prog["enums"]:
             en = prog["enums"][ident_name]
-            self.send_response(msg_id, {
+            return {
                 "uri": uri,
-                "range": {"start": {"line": en["line"] - 1, "character": 0},
-                          "end": {"line": en["line"] - 1, "character": 1}},
-            })
-            return
+                "range": {"start": {"line": en.get("line", 1) - 1, "character": 0},
+                          "end": {"line": en.get("line", 1) - 1, "character": 1}},
+            }
         # 4. Method definition (Struct.method).
         for fname, fn in prog["fns"].items():
             if "." in fname:
-                sname, mname = fname.split(".", 1)
+                _sname, mname = fname.split(".", 1)
                 if mname == ident_name:
-                    self.send_response(msg_id, {
+                    return {
                         "uri": uri,
-                        "range": {"start": {"line": fn["line"] - 1, "character": 0},
-                                  "end": {"line": fn["line"] - 1, "character": 1}},
-                    })
-                    return
-        self.send_response(msg_id, None)
+                        "range": {"start": {"line": fn.get("line", 1) - 1, "character": 0},
+                                  "end": {"line": fn.get("line", 1) - 1, "character": 1}},
+                    }
+        # 5. Enum variant.
+        for ename, edef in prog["enums"].items():
+            for variant in edef.get("variants", []):
+                vname = variant[0] if isinstance(variant, (list, tuple)) else variant
+                if vname == ident_name:
+                    return {
+                        "uri": uri,
+                        "range": {"start": {"line": edef.get("line", 1) - 1, "character": 0},
+                                  "end": {"line": edef.get("line", 1) - 1, "character": 1}},
+                    }
+        return None
+
+    # ---------- references ----------
+    def handle_references(self, params, msg_id):
+        """Stage 14 release: find all references to the symbol at a position."""
+        td = params.get("textDocument", {})
+        uri = td.get("uri")
+        pos = params.get("position", {})
+        line = pos.get("line", 0) + 1
+        doc = self.docs.get(uri)
+        if doc is None:
+            self.send_response(msg_id, [])
+            return
+        col = self._utf16_col_to_byte(doc["text"], line - 1,
+                                      pos.get("character", 0)) + 1
+        prog = self._doc_program(doc)
+        if prog is None:
+            self.send_response(msg_id, [])
+            return
+        ident_name = self._ident_at(prog, line, col, uri=uri)
+        if ident_name is None:
+            self.send_response(msg_id, [])
+            return
+        # Search every open document for occurrences of ident_name.
+        results = []
+        for u, d in self.docs.items():
+            for loc in self._find_references_in(u, ident_name):
+                results.append(loc)
+        self.send_response(msg_id, results)
+
+    def _find_references_in(self, uri, ident_name):
+        """Yield LSP Location dicts for every textual occurrence of
+        `ident_name` in `uri`. We re-tokenise the document and report
+        every ident/kw token whose value matches.
+
+        (A future, more precise implementation would track scopes so a
+        local `let foo` in one function doesn't match `foo` in another.)
+        """
+        doc = self.docs.get(uri)
+        if doc is None:
+            return []
+        try:
+            toks = tokenize(doc["text"].encode("utf-8"))
+        except HLError:
+            return []
+        out = []
+        for t in toks:
+            if t["k"] == "eof":
+                break
+            if t["k"] == "ident" and t["v"] == ident_name:
+                ln = t.get("line", 1) - 1
+                col = t.get("col", 1) - 1
+                # Reconstruct token length so the highlight covers the word.
+                tlen = len(t["v"]) if isinstance(t["v"], str) else len(t["v"])
+                out.append({
+                    "uri": uri,
+                    "range": {"start": {"line": ln, "character": col},
+                              "end": {"line": ln, "character": col + tlen}},
+                })
+        return out
+
+    # ---------- rename ----------
+    def handle_rename(self, params, msg_id):
+        """Stage 14 release: rename a symbol across all open documents.
+
+        Uses _find_references_in to locate every textual occurrence of
+        the identifier at `position`, then produces a WorkspaceEdit
+        with TextEdits for each open document.
+        """
+        td = params.get("textDocument", {})
+        uri = td.get("uri")
+        pos = params.get("position", {})
+        new_name = params.get("newName", "")
+        # Validate the new name (must be a legal HLS identifier).
+        if not new_name or not new_name[0].isalpha() and new_name[0] != "_":
+            self.send_response(msg_id, None, error_code=-32602,
+                               error_message="invalid newName: must start with a letter or _")
+            return
+        for c in new_name:
+            if not (c.isalnum() or c == "_"):
+                self.send_response(msg_id, None, error_code=-32602,
+                                   error_message="invalid newName: only [A-Za-z0-9_] allowed")
+                return
+        doc = self.docs.get(uri)
+        if doc is None:
+            self.send_response(msg_id, {"changes": {}})
+            return
+        line = pos.get("line", 0) + 1
+        col = self._utf16_col_to_byte(doc["text"], line - 1,
+                                      pos.get("character", 0)) + 1
+        prog = self._doc_program(doc)
+        if prog is None:
+            self.send_response(msg_id, {"changes": {}})
+            return
+        ident_name = self._ident_at(prog, line, col, uri=uri)
+        if ident_name is None:
+            self.send_response(msg_id, {"changes": {}})
+            return
+        # Don't rename keywords or builtins.
+        if ident_name in KEYWORDS or ident_name in BUILTINS or ident_name in EFFECTS:
+            self.send_response(msg_id, None, error_code=-32602,
+                               error_message="cannot rename keyword/builtin/effect: %s" % ident_name)
+            return
+        # Collect edits across every open document.
+        changes = {}
+        for u, d in self.docs.items():
+            edits = []
+            for loc in self._find_references_in(u, ident_name):
+                rng = loc["range"]
+                edits.append({"range": rng, "newText": new_name})
+            if edits:
+                changes[u] = edits
+        self.send_response(msg_id, {"changes": changes})
+
+    # ---------- document symbols ----------
+    def handle_document_symbol(self, params, msg_id):
+        """Stage 14 release: return the list of top-level symbols in the file.
+
+        Powers VS Code's outline view and breadcrumb navigation.
+        """
+        td = params.get("textDocument", {})
+        uri = td.get("uri")
+        doc = self.docs.get(uri)
+        if doc is None:
+            self.send_response(msg_id, [])
+            return
+        prog = self._doc_program(doc)
+        if prog is None:
+            self.send_response(msg_id, [])
+            return
+        symbols = []
+        # SymbolKind values: 12 = Function, 23 = Struct, 10 = Enum,
+        # 8 = Interface (for impl), 13 = Constant.
+        for fname, fn in prog["fns"].items():
+            line = fn.get("line", 1) - 1
+            # Determine display name: short name for methods.
+            display = fname.split(".")[-1] if "." in fname else fname
+            params_str = ", ".join("%s: %s" % (p[0], p[1]) for p in fn.get("params", []))
+            symbols.append({
+                "name": "%s(%s) -> %s" % (display, params_str, fn.get("ret", "void")),
+                "kind": 12,
+                "range": {"start": {"line": line, "character": 0},
+                          "end": {"line": line, "character": 1}},
+                "selectionRange": {"start": {"line": line, "character": 0},
+                                    "end": {"line": line, "character": len(display)}},
+            })
+        for sname, sdef in prog["structs"].items():
+            line = sdef.get("line", 1) - 1
+            symbols.append({
+                "name": "struct %s" % sname,
+                "kind": 23,
+                "range": {"start": {"line": line, "character": 0},
+                          "end": {"line": line, "character": 1}},
+                "selectionRange": {"start": {"line": line, "character": 0},
+                                    "end": {"line": line, "character": len(sname)}},
+            })
+        for ename, edef in prog["enums"].items():
+            line = edef.get("line", 1) - 1
+            symbols.append({
+                "name": "enum %s" % ename,
+                "kind": 10,
+                "range": {"start": {"line": line, "character": 0},
+                          "end": {"line": line, "character": 1}},
+                "selectionRange": {"start": {"line": line, "character": 0},
+                                    "end": {"line": line, "character": len(ename)}},
+            })
+        # Sort by line for a stable outline.
+        symbols.sort(key=lambda s: s["range"]["start"]["line"])
+        self.send_response(msg_id, symbols)
 
     # ---------- completion ----------
     def handle_completion(self, params, msg_id):

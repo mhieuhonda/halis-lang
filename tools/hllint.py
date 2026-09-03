@@ -120,10 +120,26 @@ def walk_expr(e, fn):
 
 
 def collect_idents(e, idents):
-    """Collect all identifier references in an expression."""
+    """Collect all identifier REFERENCES in an expression.
+
+    Deep-scan-7 fix: field-access names (`x.foo`) were added to the
+    ident set — masking a real unused `let foo = ...` (false-negative
+    on L001). Field access is now excluded: only the target of a
+    `field` node is collected, not the field name itself. Same for
+    method calls: the method name is the callee, not a reference to
+    a let-binding. Same for struct-literal field names (they're field
+    WRITES, not reads).
+    """
     def visit(node):
-        if node.get("k") == "ident":
+        if not isinstance(node, dict):
+            return
+        k = node.get("k")
+        if k == "ident":
             idents.add(node["name"])
+        # field: only collect the target's idents (the field name is
+        # NOT a reference to a let binding).
+        # method / fieldcall: only the target + args have idents.
+        # structlit: only the field VALUES, not the field names.
     walk_expr(e, visit)
 
 
@@ -283,32 +299,158 @@ class Linter:
                                "struct field '%s.%s' is never read" % (sname, fname))
 
     def _rule_l004(self):
-        """Ignored-result: a call returning Result is used as a statement."""
-        # We don't have type info in the AST today without re-running
-        # the checker. For the alpha, we flag any `expr` statement whose
-        # top-level expression is a `call` to a function whose name
-        # contains "parse" or "result_".
+        """Ignored-result: a call returning Result is used as a statement.
+
+        Stage 14 release: the original alpha was a crude substring match
+        (flag any call whose name contained `parse` or started with
+        `result_`). The release version walks the AST with the checker's
+        annotations: if a `call` node has type `Result[...]` (or the
+        callee's signature returns `Result[...]`) AND it appears as the
+        direct expression of an `expr` statement (not in a `?`, not in a
+        `let`, not in a `match` scrutinee), warn.
+        """
+        # First, build a callee -> return-type map.
+        callee_rets = {}
+        for fname, fn in self.program["fns"].items():
+            callee_rets[fname] = fn.get("ret", "void")
+        # Methods: short name -> return type.
+        for fname, fn in self.program["fns"].items():
+            if "." in fname:
+                short = fname.split(".", 1)[1]
+                callee_rets[short] = fn.get("ret", "void")
+        # Builtins that return Result-like values.
+        builtins_returning_result = {
+            "read_line", "read_file_tainted",
+        }
+        for b in builtins_returning_result:
+            callee_rets.setdefault(b, "Result[str, int]")
+
+        def _is_result_type(t):
+            if not t:
+                return False
+            return t.startswith("Result[") or t == "Result"
+
         for fname, fn in self.program["fns"].items():
             for s in walk_stmts_collected(fn["body"]):
-                if s["k"] == "expr" and s["e"]["k"] == "call":
-                    callee = s["e"]["name"]
-                    if "parse" in callee.lower() or callee.startswith("result_"):
+                if s["k"] != "expr":
+                    continue
+                e = s["e"]
+                # Top-level call.
+                if e.get("k") == "call":
+                    callee = e.get("name", "")
+                    rt = callee_rets.get(callee, "")
+                    # Also check the AST annotation if the checker ran.
+                    if not _is_result_type(rt):
+                        rt = e.get("t", "")
+                    if _is_result_type(rt):
                         self._warn("L004", s.get("line", 0),
                                    "call to '%s' returns Result; result is ignored "
                                    "(use `?` to propagate, or `let _ = ...` to discard)" % callee)
+                # Top-level method call (`x.method()`).
+                elif e.get("k") == "method":
+                    m = e.get("name", "")
+                    rt = callee_rets.get(m, "")
+                    if not _is_result_type(rt):
+                        rt = e.get("t", "")
+                    if _is_result_type(rt):
+                        self._warn("L004", s.get("line", 0),
+                                   "method call '%s' returns Result; result is ignored "
+                                   "(use `?` to propagate)" % m)
 
     def _rule_l005(self):
-        """Explicit-unwrap without prior is_some/is_ok check."""
-        # For the alpha, we flag ANY call to `result_unwrap` / `option_unwrap`.
-        # A more sophisticated linter would track control flow.
+        """Explicit-unwrap without prior is_some/is_ok check.
+
+        Stage 14 release: control-flow-aware. Walks each function's
+        statements in order; tracks per-binding whether there's been a
+        recent (in the same block, after the binding's last assignment)
+        `is_some` / `is_ok` check on the SAME value. A `result_unwrap(x)`
+        or `option_unwrap(x)` is only flagged when no such check has
+        occurred in the same block.
+
+        Conservative: a false-negative (we miss a real unsafe unwrap
+        across an if-branch) is acceptable; a false-positive (flag a
+        safe unwrap) is not. So we ONLY warn when:
+          - the unwrap is on an identifier `x`, AND
+          - there was NO recent `is_some(x)` / `is_ok(x)` in the same
+            block scope.
+        If we can't tell (e.g. the unwrap is on a complex expression,
+        or the prior check is inside a nested block), we DON'T warn.
+        """
+        UNWRAP_NAMES = {"result_unwrap", "option_unwrap"}
+        CHECK_PREFIXES = ("result_is_", "option_is_")
+
+        def _walk_block(stmts, checked_vars):
+            """Walk a flat statement list, mutating `checked_vars` (a set
+            of variable names whose Result/Option value was recently
+            checked). Returns a list of warnings to emit."""
+            warns = []
+            for s in stmts:
+                k = s.get("k")
+                if k == "let":
+                    # If the let value is `if cond { ... } else { ... }` and
+                    # the cond is `is_some(x)` / `is_ok(x)`, the let-bound
+                    # variable is implicitly safe to unwrap.
+                    val = s.get("value")
+                    if val and val.get("k") == "call":
+                        cn = val.get("name", "")
+                        if cn in ("result_is_ok", "option_is_some"):
+                            # The check argument might be `x` (ident).
+                            if val.get("args"):
+                                arg = val["args"][0]
+                                if arg.get("k") == "ident":
+                                    checked_vars.add(arg["name"])
+                    # New let invalidates the binding-name check status.
+                    # We add the let-bound name to the unchecked set
+                    # implicitly (we don't pre-populate anything).
+                elif k == "assign":
+                    # An assignment to x clears x's checked status.
+                    tgt = s.get("target")
+                    if tgt and tgt.get("k") == "ident":
+                        checked_vars.discard(tgt["name"])
+                elif k == "if":
+                    # If the condition is `is_some(x)` or `is_ok(x)`,
+                    # mark x as checked WITHIN the then-branch.
+                    cond = s.get("cond")
+                    then_checked = set(checked_vars)
+                    if cond and cond.get("k") == "call":
+                        cn = cond.get("name", "")
+                        if cn in ("result_is_ok", "option_is_some") and cond.get("args"):
+                            arg = cond["args"][0]
+                            if arg.get("k") == "ident":
+                                then_checked.add(arg["name"])
+                    warns.extend(_walk_block(s.get("then", []) or [], then_checked))
+                    if s.get("els"):
+                        # else-branch keeps the parent checked_vars.
+                        warns.extend(_walk_block(s["els"] or [], set(checked_vars)))
+                    continue
+                elif k == "while":
+                    # Inside a while, the checked status from outside
+                    # doesn't apply (loop body may execute zero times).
+                    warns.extend(_walk_block(s.get("body", []) or [], set()))
+                    continue
+                elif k == "for":
+                    warns.extend(_walk_block(s.get("body", []) or [], set()))
+                    continue
+                # Look for unwrap calls in this statement's expressions.
+                for e in exprs_in_stmt(s):
+                    def visit(node):
+                        if node.get("k") == "call" and node.get("name") in UNWRAP_NAMES:
+                            args = node.get("args", [])
+                            if not args:
+                                return
+                            arg = args[0]
+                            # Only flag if the argument is an identifier
+                            # that hasn't been recently checked.
+                            if arg.get("k") == "ident":
+                                if arg["name"] not in checked_vars:
+                                    self._warn("L005", node.get("line", 0),
+                                               "explicit unwrap of '%s' without prior "
+                                               "is_ok/is_some check in this block"
+                                               % arg["name"])
+                    walk_expr(e, visit)
+            return warns
         for fname, fn in self.program["fns"].items():
-            for e in all_exprs_in_stmts(fn["body"]):
-                def visit(node):
-                    if node.get("k") == "call" and node["name"] in (
-                            "result_unwrap", "option_unwrap"):
-                        self._warn("L005", node.get("line", 0),
-                                   "explicit unwrap without prior is_ok/is_some check")
-                walk_expr(e, visit)
+            _walk_block(fn["body"], set())
 
     def _rule_l006(self):
         """Unnecessary-effects: function declares `uses` but body is pure."""

@@ -104,6 +104,42 @@ else
     bad "wordcount"
 fi
 
+echo "=== 4b. Stage 14 release: tooling (hlfmt idempotent + hllint cfaware) ==="
+# hlfmt must be idempotent: running twice = running once. We test by
+# formatting once into a temp file, then formatting again into a second
+# temp file, and diffing them. (The original source files may predate
+# hlfmt's canonical form, so checking `hlfmt -c` against the original
+# is too strict.)
+fmt_fail=0
+for f in examples/*.hls tests/ok/*.hls tests/fail/*.hls; do
+    name=$(basename "$f" .hls)
+    cp "$f" "$TMP/p1.hls"
+    python3 tools/hlfmt.py -w "$TMP/p1.hls" >/dev/null 2>&1
+    cp "$TMP/p1.hls" "$TMP/p2.hls"
+    python3 tools/hlfmt.py -w "$TMP/p2.hls" >/dev/null 2>&1
+    if diff -q "$TMP/p1.hls" "$TMP/p2.hls" >/dev/null 2>&1; then
+        ok "hlfmt idempotent: $name"
+    else
+        bad "hlfmt non-idempotent: $name"
+        fmt_fail=1
+    fi
+done
+# hllint L005 control-flow-aware: 3 warnings expected on the cfaware test.
+l005_out=$(python3 tools/hllint.py --rule L005 tests/ok/feat_lint_cfaware.hls 2>&1)
+l005_count=$(echo "$l005_out" | grep -c "L005" || true)
+if [ "$l005_count" -eq 3 ]; then
+    ok "hllint L005 cfaware: 3 warnings (unsafe_unwrap, unsafe_in_loop, unwrap_literal)"
+else
+    bad "hllint L005 cfaware: expected 3 warnings, got $l005_count"
+    echo "$l005_out"
+fi
+# hllint must NOT warn on safe unwraps (cases 2 and 3 in the test file).
+if echo "$l005_out" | grep -q "safe_unwrap\|safe_unwrap_option"; then
+    bad "hllint L005 cfaware: false positive on a safe unwrap"
+else
+    ok "hllint L005 cfaware: no false positives on safe unwraps"
+fi
+
 echo "=== 5. BOOTSTRAP: hlc self-compiles (fixed-point) ==="
 echo "  [5.1] Stage-0 runs hlc.hls to compile hlc.hls itself..."
 if python3 boot/boot.py src/hlc.hls src/hlc.hls "$TMP/hlc_s1.c" >/dev/null 2>&1; then
