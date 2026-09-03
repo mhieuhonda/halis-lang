@@ -933,9 +933,19 @@ build bit-for-bit reproducibly from the lockfile. ✅ **Done in v0.23.0-alpha.**
 (The transparency log, multi-file packages, and version verification
 close the Stage 13 release acceptance criteria.)
 
-## STAGE 14 — Tooling: LSP, formatter, linter ✅ (release v0.24.0-alpha)
+## STAGE 14 — Tooling: LSP, formatter, linter ✅ (release v0.24.0-alpha, perfected v0.26.0-alpha)
 
 **Goal:** first-class developer experience.
+
+**Status (v0.26.0-alpha):** Stage 14 has been **perfected** via the
+deep-scan-8 sweep. The formatter's `_render_token` no longer emits
+invalid `\r` and `\xNN` escape sequences (latent soundness issue
+closed — the HLS lexer only supports `\n`/`\t`/`\\`/`\"`). All other
+Stage 14 features remain at release quality: LSP cross-file
+go-to-definition + rename, idempotent formatter (verified on all 119
+`.hls` files in the repo), control-flow-aware linter, VS Code +
+Neovim plugins, and the minimal self-hosted formatter. **373/373
+tests PASS.**
 
 **Status (v0.24.0-alpha):** the **Stage 14 release** has shipped. The
 LSP server now supports cross-file go-to-definition, rename
@@ -1017,9 +1027,21 @@ self-compilation rule. **368/368 tests PASS.**
 (running twice = running once); linter control-flow-aware; LSP
 cross-file go-to-definition + rename; minimal self-hosted formatter.
 
-## STAGE 15 — Safe C FFI ✅ (release v0.25.0-alpha)
+## STAGE 15 — Safe C FFI ✅ (release v0.25.0-alpha, perfected v0.26.0-alpha)
 
 **Goal:** reuse the C ecosystem without breaking the safety enclave.
+
+**Status (v0.26.0-alpha):** Stage 15 has been **perfected** via the
+deep-scan-8 sweep. Four hlbindgen bugs are now closed: (1) the ABI
+header's `_Static_assert` now checks `sizeof(int64_t) == 8` and
+`sizeof(double) == 8` instead of the wrong `sizeof(int) == 8` /
+`sizeof(float) == 8` (C `int` is 4 bytes — the old assertions would
+FAIL on any standard gcc/clang build); (2) `const struct Point start;`
+fields now correctly map to `start: Point` instead of `start: int`;
+(3) plain `struct Name start;` fields (without const) are also fixed;
+(4) empty C structs/enums are now skipped (the HLS parser rejects
+them). The checker's sink-type validation (print/read_file/exit/etc.)
+is also tightened — see Stage 14 notes. **373/373 tests PASS.**
 
 **Status (v0.25.0-alpha):** the **Stage 15 release** has shipped.
 `hlbindgen` now generates HLS struct + enum definitions before the

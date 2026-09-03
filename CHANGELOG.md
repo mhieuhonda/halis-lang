@@ -8,6 +8,63 @@ Releases on `main` follow the 20-stage roadmap (see [ROADMAP.md](ROADMAP.md)).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
+## [v0.26.0-alpha] — Deep-scan-8: Stage 14/15 perfection pass
+
+> **Stages 14 + 15 are PERFECTED.** A deep-scan-8 sweep found and fixed
+> **7 bugs** across `boot/checker.py`, `boot/parser.py`, `tools/hlbindgen.py`,
+> and `tools/hlfmt.py`. Two CRITICAL soundness holes (sink-type validation
+> and ABI-header type assertions) are now closed; the `uses IO, Fs`
+> false-duplicate is gone; and `hlbindgen` now correctly translates
+> `const struct` fields, empty C structs/enums, and plain `struct Name`
+> field types. **373/373 tests PASS**; the bootstrap is still deterministic.
+
+### Deep-scan-8 — bug sweep (Stage 14/15 perfection)
+
+- **`boot/checker.py`** — CRITICAL: sink builtins (`print`, `println`,
+  `read_file`, `write_file`, `file_exists`, `exit`, `net_lookup`,
+  `proc_exec`) now validate argument TYPES at compile time, not just
+  taint. Previously `print(42)` compiled cleanly and crashed at runtime
+  with `TypeError: a bytes-like object is required, not 'int'`. The
+  `reject_tainted_at_sink` helper now enforces `want` (the expected
+  type) in addition to the taint check.
+- **`boot/parser.py`** — `uses IO, Fs` no longer reports a false
+  "duplicate effect declaration: Fs". The IO blanket alias is expanded
+  to the full IO family (which includes Fs) at parse time; the duplicate
+  check now uses a separate `explicit_effects` set so redundant-but-legal
+  declarations like `uses IO, Fs` are accepted, while true duplicates
+  (`uses IO, IO` or `uses Fs, Fs`) still error.
+- **`tools/hlbindgen.py`** — CRITICAL: ABI header now asserts
+  `sizeof(int64_t) == 8` and `sizeof(double) == 8` instead of
+  `sizeof(int) == 8` and `sizeof(float) == 8`. C `int` is 4 bytes and
+  C `float` is 4 bytes on every mainstream platform; the old assertions
+  would FAIL on any standard gcc/clang build, making the ABI header
+  unusable. Now includes `<stdint.h>` and `<stdbool.h>`.
+- **`tools/hlbindgen.py`** — `const struct Point start;` field now
+  correctly maps to `start: Point` instead of `start: int`. The
+  `const` qualifier caused the field to fall through to the generic
+  type parser, which doesn't know `struct Point`. The parser now scans
+  tokens for `struct`/`enum` anywhere in the type, strips qualifiers,
+  and uses the type name.
+- **`tools/hlbindgen.py`** — plain `struct Name start;` fields (without
+  const) also fixed — the fallthrough path now recognises `struct`/`enum`
+  keywords and uses the type name instead of sending `struct Name` to
+  `_parse_c_type` (which returned `int`).
+- **`tools/hlbindgen.py`** — empty C structs/enums are now skipped.
+  Previously `struct Empty {};` produced `struct Empty {}` in the HLS
+  output, which the HLS parser rejects ("struct must have at least one
+  field"). Now empty structs/enums are silently omitted.
+- **`tools/hlfmt.py`** — `_render_token` no longer emits invalid `\r`
+  and `\xNN` escape sequences for string bytes. The HLS lexer only
+  supports `\n`, `\t`, `\\`, `\"` escapes; the old formatter produced
+  `\r` and `\x41` which the lexer rejects as "invalid escape sequence".
+  In practice the lexer rejects literal control chars in strings, so
+  these branches were dead code — but they represented a latent
+  soundness issue. Now raises a clear `ValueError` for unrepresentable
+  control bytes instead of silently producing unparseable output.
+- **Tests** — added `tests/ok/feat_deep_scan8_fixes.hls` (verifies
+  `uses IO, Fs` compiles) and `tests/fail/fail_print_int_arg.hls`
+  (verifies `print(42)` is rejected at compile time).
+
 ## [v0.25.0-alpha] — Stage 15 release + deep-scan-7 bug sweep
 
 > **Stage 15 — Safe C FFI — is COMPLETE.** `hlbindgen` now generates
