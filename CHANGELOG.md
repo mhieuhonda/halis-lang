@@ -8,6 +8,142 @@ Releases on `main` follow the 20-stage roadmap (see [ROADMAP.md](ROADMAP.md)).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
+## [v0.21.0-alpha] — Stage 10 + Stage 11 release + deep-scan fixes
+
+> **Stage 10 — Taint tracking & sandbox — is COMPLETE.** Sandboxed
+> compile mode restricts filesystem builtins to a granted directory
+> (both interpreter and native runtime). A new taint source
+> `read_line() -> tainted[str]` covers stdin. The `--sandbox DIR`
+> flag also rejects `extern "C"` blocks (FFI bypasses the sandbox).
+> **Stage 11 — SSA IR + optimisation — is COMPLETE.** Two new
+> optimiser passes — `inline_small` (inlines small pure functions
+> at their call sites) and `licm` (hoists loop-invariant expressions
+> out of loop bodies) — join the existing `constant_fold`,
+> `copy_propagate`, `dead_code_elim` pipeline. A deep codebase scan
+> found and fixed 13+ critical, high, and medium correctness/security
+> bugs across `boot/`, `tools/`, `src/hlc.hls`, and `std/`.
+> **191/191 tests PASS**; the bootstrap is still deterministic.
+
+### Stage 10 release — sandboxed compile mode + read_line taint source
+
+- **`--sandbox DIR` flag in `boot.py`** — restricts all filesystem
+  builtins (`read_file`, `read_file_tainted`, `write_file`,
+  `file_exists`) to paths that resolve INSIDE DIR. Mirrored in both
+  the Stage-0 interpreter (`_sandbox_check`) and the native C runtime
+  (`hl_sandbox_check` + `hl_set_sandbox_root`). Symlink escapes are
+  caught via realpath resolution.
+- **`HLS_SANDBOX_ROOT` env var** — the native runtime auto-
+  initialises the sandbox from this env var at startup. Users can
+  compile a program once and run it with different sandboxes (no
+  recompile needed). `--sandbox DIR` also exports the env var so any
+  subprocess (e.g. via `proc_exec`) inherits the gate.
+- **`--sandbox` rejects `extern "C"` blocks** — extern FFI can call
+  libc directly (`fopen`, `system`, `execve`, `socket`), bypassing
+  the sandbox entirely. The compiler refuses to compile such
+  programs under `--sandbox` to keep the sandbox guarantee sound.
+- **`read_line() -> tainted[str]` builtin** — the third taint source
+  (after `tainted_args` and `read_file_tainted`). Reads one line
+  from stdin (newline stripped), wraps as `tainted[str]`, carries
+  the `IO` effect. The interpreter strips CRLF line endings; the
+  native `hl_read_line` runtime helper mirrors this.
+- **`hl_die_at(msg, file, line)` runtime helper** — position-aware
+  panic, plumbed for Stage 11 release consumption in the codegen.
+
+### Stage 11 release — inline_small + LICM optimiser passes
+
+- **`inline_small` pass** — inlines calls to small `pure` functions
+  (≤12 instructions, single block, non-recursive). After inlining,
+  re-runs `constant_fold` + `copy_propagate` + `dead_code_elim` so
+  inlined bodies fold into their call sites (e.g. `square(5)` becomes
+  the constant `25` at compile time). The `optimize()` pipeline is
+  now: constant_fold → copy_propagate → DCE → inline_small →
+  constant_fold → copy_propagate → DCE → LICM → DCE.
+- **`licm` (loop-invariant code motion) pass** — identifies loops via
+  the `*_cond` block naming convention, hoists pure instructions
+  whose operands are all defined outside the loop body into the
+  preheader block. Conservative: skips `OP_BINOP` (might panic on
+  overflow), only hoists from the loop's immediate body block (not
+  nested control flow), so the pass is sound for nested if/else
+  inside loops.
+- **Extended `_annotate_safe`** to mark multiplications by 0 or 1
+  as `safe_overflow` (the result is provably safe — 0 or the other
+  operand, both of which fit in int64 since the operand already did).
+- **`--opt-stats` output** now lists the full pass list including
+  the two new passes.
+
+### Deep-scan fixes (13 critical / high / medium bugs)
+
+**Critical:**
+
+- `tools/hls-pkg.py` — `FAIL_CLOSED_EFFECTS` and `KNOWN_EFFECTS`
+  were missing `Net`, `Rand`, `Proc`. A dependency using
+  `proc_exec` was recorded as PURE, bypassing effect enforcement
+  (security soundness). Added all three Stage 9 release effects.
+- `src/hlc.hls` `print()`/`println()` with 0 args crashed instead
+  of giving a clean error. Argument count is now checked BEFORE
+  the taint-sink check.
+- `src/hlc.hls` `print_audit` claimed `Net`, `Rand`, `Proc` are
+  "Reserved (error if used)" — they are active since v0.20.0-alpha.
+- `boot/interp.py` extern FFI passed `id(v)` for list/map/struct
+  args — a raw CPython heap address. Now panics with a clean error
+  explaining opaque pointer args are not supported.
+- `src/hlc.hls` `hl_sandbox_check` only accepted `/` as separator —
+  broken on Windows. Now accepts `\\` too.
+- `src/hlc.hls` `hl_read_file` realloc-on-failure leaked the
+  original buffer. Now uses a temp so the original is freeable.
+- `src/hlc.hls` `hl_list_push` same realloc-on-failure leak.
+- `src/hlc.hls` `hl_str_alloc` allowed negative `len` to wrap to
+  ~2^64 via the `size_t` cast. Now rejects `len < 0` up front.
+- `src/hlc.hls` `hl_set_sandbox_root` didn't check strdup's
+  return. Now panics cleanly on OOM.
+- `boot/interp.py` `net_lookup` only caught `socket.gaierror`;
+  timeouts and other OSErrors propagated as raw tracebacks. Now
+  catches `OSError` broadly.
+- `tools/hls-lsp.py` `EFFECTS` list missing Net/Rand/Proc — editor
+  autocompletion never offered them.
+
+**High:**
+
+- `tools/ir/optimize.py` `_fold_binop` and unary `-` folding treated
+  `bool` as `int` (Python's `bool` subclasses `int`). Now uses
+  `isinstance(x, int) and not isinstance(x, bool)` so bool-typed IR
+  values aren't miscompiled.
+- `boot/interp.py` `file_exists` decoded path with
+  `errors="replace"`, substituting U+FFFD for non-UTF-8 bytes —
+  divergent from native runtime which passes raw bytes to `stat()`.
+  Now passes bytes directly.
+
+**Medium:**
+
+- `std/sanitize.hls` `sanitize_command` missing NUL byte (0) and
+  `~` (126) from reject list. NUL would truncate at C string
+  boundary; `~` enables bash tilde expansion.
+- `std/str.hls` `str_pad_left`/`str_pad_right` overshot `width`
+  when `pad.len() > 1` (e.g. `str_pad_left("ab", 6, "xyz")`
+  produced `"xyzxyzab"` instead of `"xyzxab"`). Now fills with a
+  single-byte prefix of pad so the final length is exactly `width`.
+- `tools/ir/optimize.py` `_licm` previously considered hoisting
+  from all blocks in a loop body — including nested if/else blocks
+  that might not execute on every iteration. Now only hoists from
+  the loop's immediate body block (soundness fix for nested control
+  flow inside loops).
+
+### New tests (2 ok)
+
+- `tests/ok/feat_read_line.hls` — differential test for the
+  `read_line()` taint source (Stage-0 vs native).
+- `tests/ok/feat_inline_licm.hls` — exercises the `inline_small`
+  and `licm` passes with a `square()` helper, an `add_one()` helper,
+  and a loop-invariant multiplication.
+
+### Tests run with stdin redirected from /dev/null
+
+`tests/run_tests.sh` now redirects stdin from `/dev/null` for every
+differential test. This prevents tests using `read_line()` from
+hanging waiting for input. The interpreter reads EOF (returns empty
+`tainted[str]`); the native binary does the same — the differential
+test still compares apples to apples.
+
 ## [v0.20.0-alpha] — Stage 9 release: complete fine-grained effects + Halis rename
 
 > **Stage 9 — Fine-grained effects & capabilities — is COMPLETE.** The

@@ -24,8 +24,8 @@ remains green.
 | 7 | Advanced type system: enum, Option/Result, generics | ✅ | (done) |
 | 8 | Ownership & borrow checking (end of arena) | ✅ | (done) |
 | 9 | Fine-grained effects & capabilities | ✅ | (done in v0.20.0-alpha) |
-| 10 | Taint tracking & sandbox | 🔄 | 8–10 weeks |
-| 11 | SSA IR + optimisation | 🔄 | 10–14 weeks |
+| 10 | Taint tracking & sandbox | ✅ | (done in v0.21.0-alpha) |
+| 11 | SSA IR + optimisation | ✅ | (done in v0.21.0-alpha) |
 | 12 | Native LLVM backend | 🔄 | 10–14 weeks |
 | 13 | Package manager `hls-pkg` | 🔄 | 6–8 weeks |
 | 14 | Tooling: LSP, formatter, linter | 🔄 | 6–8 weeks |
@@ -470,7 +470,7 @@ SETS, not a single bool. **100/100 tests PASS.**
 to the exact call chain. (The v0.20.0-alpha release enforces this for
 all eight active effects: IO, Fs, Clock, Args, Exit, Net, Rand, Proc.)
 
-## STAGE 10 — Taint tracking & sandbox 🔄 (alpha v0.7.0-alpha + beta v0.8.0-alpha)
+## STAGE 10 — Taint tracking & sandbox ✅ (alpha v0.7.0-alpha + beta v0.8.0-alpha + release v0.21.0-alpha)
 
 **Goal:** stop input-driven vulnerabilities (injection, XSS, path traversal)
 at the type level.
@@ -574,6 +574,30 @@ and the self-hosted `hlc.hls`. **135/135 tests PASS.**
 - ✅ New pure-query helpers in `std.taint`: `taint_check_byte_at`,
   `taint_concat`, `taint_concat_clean`.
 
+**Done in Stage 10 release (v0.21.0-alpha):**
+
+- ✅ Sandboxed compile mode: `boot.py --sandbox DIR` restricts all
+  filesystem builtins (read_file, read_file_tainted, write_file,
+  file_exists) to paths that resolve INSIDE DIR. Mirrored in both
+  the Stage-0 interpreter (`_sandbox_check`) and the native C runtime
+  (`hl_sandbox_check` + `hl_set_sandbox_root`). Symlink escapes are
+  caught via realpath resolution.
+- ✅ Native runtime reads `HLS_SANDBOX_ROOT` env var at startup so
+  users can compile once and run with different sandboxes (no recompile
+  needed). `--sandbox DIR` also exports this env var so any subprocess
+  (e.g. via proc_exec) inherits the gate.
+- ✅ `--sandbox` rejects `extern "C"` blocks (FFI can call libc directly,
+  bypassing the sandbox).
+- ✅ New taint source: `read_line() -> tainted[str]` (third source after
+  `tainted_args` and `read_file_tainted`). Reads one line from stdin
+  (newline stripped), wraps as `tainted[str]`, carries IO effect.
+- ✅ Runtime position-aware panic: `hl_die_at(msg, file, line)` runtime
+  helper (Stage 11 release consumption).
+- ✅ Deep-scan security fixes: NUL byte + `~` added to `sanitize_command`
+  reject list; `hl_str_alloc` rejects negative length; sandbox path
+  check accepts both `/` and `\\` (Windows portability).
+- ✅ Differential test: `tests/ok/feat_read_line.hls`.
+
 
 **Acceptance:** a program that doesn't declare `uses Net` CANNOT call a socket
 even through 5 function layers — the compile error points to the exact call
@@ -582,7 +606,7 @@ effects; `Net` is reserved pending future builtins.) For Stage 10, the
 acceptance criterion is: a program that uses an unsanitised argv value in
 an SQL statement → compile error showing the taint propagation path.
 
-## STAGE 11 — SSA IR + optimisation 🔄 (alpha v0.9.0-alpha)
+## STAGE 11 — SSA IR + optimisation ✅ (alpha v0.9.0-alpha + release v0.21.0-alpha)
 
 **Goal:** performance on par with C/Rust at `-O2`.
 
@@ -637,6 +661,32 @@ code elimination. The optimiser is wired into `boot.py` via the new
 - Make `-O fast` actually skip overflow checks when the optimiser can
   prove safety (today it only annotates; codegen does not consume).
 - Position info in panics (file:line) thanks to IR debug info.
+
+**Done in Stage 11 release (v0.21.0-alpha):**
+
+- ✅ `inline_small` pass — inlines calls to small `pure` functions
+  (≤12 instructions, single block, non-recursive). After inlining,
+  re-runs `constant_fold` + `copy_propagate` + `dead_code_elim` so
+  inlined bodies fold into their call sites (e.g. `square(5)` becomes
+  the constant `25` at compile time). The optimiser's `optimize()`
+  pipeline is now: constant_fold → copy_propagate → DCE → inline_small
+  → constant_fold → copy_propagate → DCE → LICM → DCE.
+- ✅ `licm` (loop-invariant code motion) — identifies loops via the
+  `*_cond` block naming convention, hoists pure instructions whose
+  operands are all defined outside the loop body into the preheader
+  block. Conservative: skips `OP_BINOP` (might panic on overflow),
+  only hoists from the loop's immediate body block (not nested
+  control flow), so the pass is sound for nested if/else inside loops.
+- ✅ Extended `_annotate_safe` to mark multiplications by 0 or 1 as
+  `safe_overflow` (the result is provably safe — 0 or the other
+  operand, both of which fit in int64 since the operand already did).
+- ✅ Deep-scan soundness fixes to the optimiser: `_fold_binop` and
+  unary `-` folding now use `isinstance(x, int) and not isinstance(x,
+  bool)` so bool-typed IR values aren't miscompiled (Python's `bool`
+  subclasses `int`; `isinstance(True, int)` is True without the guard).
+- ✅ Differential test: `tests/ok/feat_inline_licm.hls` exercises both
+  passes with a `square()` helper, an `add_one()` helper, and a
+  loop-invariant multiplication.
 
 **Acceptance:** standard benchmarks (sieve, json parse, matrix) reach ≥ 95% of
 `gcc -O2` performance on equivalent C code; differential tests still 100%

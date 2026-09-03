@@ -582,7 +582,7 @@ def _licm(irf: HLIRFunction):
     from a body block to a cond block (named "*_cond" by IRBuilder).
 
     For each instruction inside the loop body that:
-      - Is "pure" (no side effects: const, binop, unop, load, list_len,
+      - Is "pure" (no side effects: const, unop, load, list_len,
         struct_get, map_get, list_new, struct_new).
       - All its operand SSA names are defined OUTSIDE the loop (in a block
         that is not part of the loop), OR are themselves hoistable.
@@ -594,15 +594,18 @@ def _licm(irf: HLIRFunction):
     is outside the loop, which is the common case for `let c = a + b`
     inside `while ... { ... }` where `a` and `b` are not mutated by the
     loop body.
+
+    Deep-scan fix (O5): we ONLY hoist instructions from the loop's
+    IMMEDIATE body block (the one whose terminator is the back-edge to
+    cond). Nested control-flow inside the loop (e.g. an `if` with its
+    own then/else/endif blocks) is NOT considered for hoisting — those
+    blocks may not execute on every iteration, so hoisting their
+    instructions out would be unsafe.
     """
     # First, identify loops. A loop is a sequence of blocks where the
     # last block jumps back to the first (the cond). The cond block's
     # name ends with "_cond" (set by IRBuilder._new_block with prefix
     # "while_cond" or "for_cond").
-    # We need: for each cond block, the set of blocks in its loop body.
-    # Simple approximation: walk the block list; if block[i] has a
-    # terminator that jumps to a block at an EARLIER index whose name
-    # ends in "_cond", the loop spans [cond_index, i].
     for caller_block_idx in range(len(irf.blocks)):
         cond = irf.blocks[caller_block_idx]
         if not cond.name.endswith("_cond"):
@@ -634,27 +637,26 @@ def _licm(irf: HLIRFunction):
                 if ins.dest:
                     loop_defined.add(ins.dest)
 
-        # Walk the loop body blocks and hoist invariant instructions.
-        for j in range(caller_block_idx + 1, end_idx + 1):
-            blk = irf.blocks[j]
-            # Skip the cond block itself (its condition depends on the
-            # loop state, so almost nothing there is invariant).
-            hoisted: List[Instr] = []
-            remaining: List[Instr] = []
-            for ins in blk.instrs:
-                if not _is_hoistable(ins, loop_defined):
-                    remaining.append(ins)
-                    continue
-                # All operands are defined outside the loop. Hoist.
-                hoisted.append(ins)
-            if hoisted:
-                # Append the hoisted instructions to the preheader (just
-                # before its terminator if it has one, otherwise at end).
-                if preheader.terminator is not None:
-                    preheader.instrs.extend(hoisted)
-                else:
-                    preheader.instrs.extend(hoisted)
-                blk.instrs = remaining
+        # Deep-scan fix (O5): ONLY hoist from the loop's IMMEDIATE body
+        # block (the last one in the loop, whose terminator is the back-
+        # edge to cond). Hoisting from nested if/else/endif blocks would
+        # be unsafe because those blocks may not execute on every iter.
+        # The immediate body block is irf.blocks[end_idx].
+        body = irf.blocks[end_idx]
+        hoisted: List[Instr] = []
+        remaining: List[Instr] = []
+        for ins in body.instrs:
+            if not _is_hoistable(ins, loop_defined):
+                remaining.append(ins)
+                continue
+            # All operands are defined outside the loop. Hoist.
+            hoisted.append(ins)
+        if hoisted:
+            # Append the hoisted instructions to the preheader. The
+            # preheader's terminator is a separate field, so appending
+            # to .instrs is safe — it doesn't displace the terminator.
+            preheader.instrs.extend(hoisted)
+            body.instrs = remaining
 
 
 def _is_hoistable(ins: Instr, loop_defined: Set[str]) -> bool:
@@ -669,11 +671,14 @@ def _is_hoistable(ins: Instr, loop_defined: Set[str]) -> bool:
     # So we DO NOT hoist OP_BINOP (matches the DCE classification).
     if ins.op not in PURE_OPS:
         return False
+    # OP_STORE inside a loop is never invariant (it mutates state).
+    # (Deep-scan note H7: this check is dead code — OP_STORE is not in
+    # PURE_OPS, so the earlier guard already returned False. Kept for
+    # clarity / defensive programming.)
+    if ins.op == OP_STORE:
+        return False
     # All var-typed operands must be defined outside the loop.
     for a in ins.args:
         if a[0] == "var" and a[1] in loop_defined:
             return False
-    # OP_STORE inside a loop is never invariant (it mutates state).
-    if ins.op == OP_STORE:
-        return False
     return True
