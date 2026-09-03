@@ -1,4 +1,4 @@
-"""HLIR — Hieu Louis Intermediate Representation.
+"""HLIR — Halis Intermediate Representation.
 
 Stage 11 (v0.9.0-alpha): a mid-level IR with SSA-style single-assignment
 semantics, used as the optimisation substrate for HLS programs. The IR is

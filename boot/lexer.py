@@ -1,4 +1,4 @@
-"""Stage-0 lexer for Hieu Louis (HLS). Conforms to SPEC.md section 2."""
+"""Stage-0 lexer for Halis (HLS). Conforms to SPEC.md section 2."""
 
 KEYWORDS = {
     "fn", "let", "mut", "return", "if", "else", "while", "for", "in",

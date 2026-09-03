@@ -6,12 +6,17 @@ INT64_MIN = -9223372036854775808
 
 PRIM_TYPES = ("int", "float", "bool", "str", "void")
 
-# Stage 9-alpha: fine-grained effects & capabilities (v0.5.0-alpha)
+# Stage 9 (v0.20.0-alpha — Stage 9 release): fine-grained effects &
+# capabilities COMPLETE. All eight effects are now active; the reserved
+# set is empty.
+#
 # Recognized effect names. `IO` is a blanket alias for the entire IO family
 # (IO + Fs + Clock + Args + Exit) — expanded at parse time so the fixpoint
-# is a trivial subset test.
-KNOWN_EFFECTS = {"IO", "Fs", "Clock", "Args", "Exit"}
-RESERVED_EFFECTS = {"Net", "Rand", "Proc"}  # recognized but no builtins yet
+# is a trivial subset test. `Net`, `Rand`, `Proc` are independent effects
+# (not part of the IO family) — a program must declare them explicitly to
+# use network, random, or subprocess builtins.
+KNOWN_EFFECTS = {"IO", "Fs", "Clock", "Args", "Exit", "Net", "Rand", "Proc"}
+RESERVED_EFFECTS = set()  # no reserved effects as of v0.20.0-alpha
 IO_FAMILY = {"IO", "Fs", "Clock", "Args", "Exit"}
 
 BIN_LEVELS = [
@@ -301,9 +306,10 @@ class Parser:
         if self.at_kw("pure"):
             self.next()
             is_pure = True
-        # Stage 9-alpha: fine-grained effects. `uses IO` is a blanket alias
-        # for the entire IO family (expanded at parse time). Other recognized
-        # effects: Fs, Clock, Args, Exit. Reserved: Net, Rand, Proc.
+        # Stage 9 (v0.20.0-alpha — release): fine-grained effects &
+        # capabilities. `uses IO` is a blanket alias for the entire IO
+        # family (expanded at parse time). Active effects: Fs, Clock,
+        # Args, Exit, Net, Rand, Proc. No reserved effects remain.
         effects = set()
         if self.at_kw("uses"):
             if is_pure:
@@ -318,7 +324,7 @@ class Parser:
                              "(no builtins implemented yet)" % eff, tok)
                 if eff not in KNOWN_EFFECTS:
                     self.err("unknown effect '%s'; known effects: IO, Fs, "
-                             "Clock, Args, Exit" % eff, tok)
+                             "Clock, Args, Exit, Net, Rand, Proc" % eff, tok)
                 if eff in effects:
                     self.err("duplicate effect declaration: %s" % eff, tok)
                 effects.add(eff)

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Stage-0 bootstrap for Hieu Louis (HLS).
+"""Stage-0 bootstrap for Halis (HLS).
 
-This is the SEED used to bootstrap the self-hosting cycle of Hieu Louis:
+This is the SEED used to bootstrap the self-hosting cycle of Halis:
   1. boot.py can run HLS code directly (interpreted, with type + effects checking).
   2. boot.py is used to run the compiler `src/hlc.hls` (written in HLS).
   3. From there on, the native compilation cycle is self-sustaining.
@@ -295,17 +295,24 @@ def print_audit(program, checker):
           % (n_total, n_pure, n_eff))
     # Active vs reserved effects table.
     print("")
-    print("  Active effects:    IO, Fs, Clock, Args, Exit")
-    print("  Reserved effects:  Net, Rand, Proc  (error if used)")
+    print("  Active effects:    IO, Fs, Clock, Args, Exit, Net, Rand, Proc")
     print("  `uses IO` expands to: {IO, Fs, Clock, Args, Exit}")
+    print("  Net, Rand, Proc are independent effects (not part of the IO")
+    print("  family) — declare them explicitly to use net_lookup /")
+    print("  rand_int / rand_float / rand_seed / proc_exec builtins.")
+    print("  No reserved effects (as of v0.20.0-alpha — Stage 9 release).")
     # Stage 10-alpha: taint sources / sinks / unwraps summary.
     # Sources: builtins that introduce tainted values.
     # Sinks: builtins that reject tainted values at the checker.
     # Unwraps: builtins / functions that explicitly untaint.
+    # Stage 9 release (v0.20.0-alpha): net_lookup and proc_exec are
+    # also taint sinks (passing a tainted host is a DNS rebinding
+    # vector; passing a tainted command is a shell-injection vector).
     print("")
     print("  Taint sources (builtins):  tainted_args, read_file_tainted")
     print("  Taint sinks (builtins):    print, println, read_file,")
-    print("                            write_file, file_exists, exit")
+    print("                            write_file, file_exists, exit,")
+    print("                            net_lookup, proc_exec")
     print("  Explicit untaint:         taint_unwrap, std.sanitize.*")
     # Scan the call graph for actual taint-source usage.
     # (BUG-21 cleanup: removed the unused `unwrap_users` and `sanitize_users`
@@ -341,8 +348,12 @@ def print_audit(program, checker):
         print("  No function calls read_file_tainted().")
 
     # Taint sinks: which functions call each sink?
+    # Stage 9 release (v0.20.0-alpha): net_lookup and proc_exec are
+    # also taint sinks (tainted host -> DNS rebinding; tainted cmd ->
+    # shell injection). The checker rejects them at check time.
     SINK_BUILTIN_NAMES = ("b:print", "b:println", "b:read_file",
-                          "b:write_file", "b:file_exists", "b:exit")
+                          "b:write_file", "b:file_exists", "b:exit",
+                          "b:net_lookup", "b:proc_exec")
     sink_users = {b: [] for b in SINK_BUILTIN_NAMES}
     for key, fn in fns.items():
         callees = checker.edges.get(key, set())

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================================
-# run_tests.sh — Full test suite for Hieu Louis (HLS)
+# run_tests.sh — Full test suite for Halis (HLS)
 #  1. Stage-0: run the ok programs (compare to snapshot if present)
 #  2. Stage-0: reject the fail programs (expect compile errors)
 #  3. Self-compile: hlc.hls (via Stage-0) compiles each ok program -> C

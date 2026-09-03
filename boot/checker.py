@@ -175,12 +175,22 @@ BUILTIN_FNS = {
     "tainted_args", "taint_mark", "taint_unwrap",
     # Stage 10-beta: more taint sources (v0.8.0-alpha)
     "read_file_tainted",
+    # Stage 9 release (v0.20.0-alpha): Net / Rand / Proc builtins.
+    "net_lookup", "rand_int", "rand_float", "rand_seed", "proc_exec",
 }
 
-# Stage 9-alpha: per-builtin effect mapping. Pure builtins (panic, str, int,
-# len, range, map_new, chr, drop, clone, take) are absent — they contribute
-# no effect. A builtin may in principle contribute multiple effects; using a
-# set value future-proofs the design.
+# Stage 9 (v0.20.0-alpha — release): per-builtin effect mapping.
+# Pure builtins (panic, str, int, len, range, map_new, chr, drop, clone,
+# take) are absent — they contribute no effect. A builtin may in
+# principle contribute multiple effects; using a set value future-proofs
+# the design.
+#
+# Stage 9 release adds three new effect families with builtins:
+#   - Net    : net_lookup (DNS resolution)
+#   - Rand   : rand_int, rand_float, rand_seed
+#   - Proc   : proc_exec (subprocess via system())
+# These are NOT part of the IO family; a program must declare them
+# explicitly to use the corresponding builtins.
 BUILTIN_EFFECTS = {
     "print":       {"IO"},
     "println":     {"IO"},
@@ -196,6 +206,12 @@ BUILTIN_EFFECTS = {
     # read_file) and returns a tainted[str].
     "read_file_tainted": {"Fs"},
     # taint_mark / taint_unwrap are pure (no side effect; just wrap/unwrap).
+    # Stage 9 release: Net / Rand / Proc builtins.
+    "net_lookup":  {"Net"},
+    "rand_int":    {"Rand"},
+    "rand_float":  {"Rand"},
+    "rand_seed":   {"Rand"},
+    "proc_exec":   {"Proc"},
 }
 
 # Types whose values are "owned" heap allocations — subject to move tracking.
@@ -227,6 +243,15 @@ SINK_BUILTINS = {
     "write_file":   (0, 1),  # tainted path or content → both bad
     "file_exists":  (0,),   # tainted path → information disclosure / traversal
     "exit":         (0,),    # tainted exit code → behavior-injection
+    # Stage 9 release (v0.20.0-alpha): Net / Proc builtins as sinks.
+    # net_lookup's host is a sink because a tainted host enables DNS
+    # rebinding attacks (an attacker who controls the host can make
+    # the program connect to a different IP than the user intended).
+    "net_lookup":   (0,),
+    # proc_exec's command is a sink because a tainted command enables
+    # shell injection (an attacker who controls the command can run
+    # arbitrary shell code in the program's privilege context).
+    "proc_exec":    (0,),
 }
 
 # NOTE: is_tainted_type / list_taint_inner are ALIASES defined once at the
@@ -1315,6 +1340,48 @@ class Checker:
             if not self.mark_moved(env, arg["name"]):
                 self.err("take() argument is not a binding: %s" % arg["name"], e)
             return at
+        # ----- Stage 9 release (v0.20.0-alpha): Net / Rand / Proc builtins -----
+        # All five new builtins are SINK-free (no taint-sink enforcement) but
+        # they DO carry their respective effects; the fixpoint in
+        # check_effects() will reject a caller whose declared effects do not
+        # cover them. The error message names the function, the missing
+        # effect, the violating builtin, and the declared set.
+        # net_lookup(host: str) -> str — DNS resolution of an A record.
+        # Returns the first IPv4 address as a string. Panics on DNS failure.
+        if name == "net_lookup":
+            need(1)
+            reject_tainted_at_sink(0, "str")
+            self.edges[self.cur_fn].add("b:net_lookup")
+            return "str"
+        # rand_int(max: int) -> int — uniform random int in [0, max).
+        # Panics if max <= 0 (so the bound is always positive and the
+        # modulo bias is bounded by the caller's choice of max).
+        if name == "rand_int":
+            need(1)
+            argt(0, "int")
+            self.edges[self.cur_fn].add("b:rand_int")
+            return "int"
+        # rand_float() -> float — uniform random float in [0.0, 1.0).
+        if name == "rand_float":
+            need(0)
+            self.edges[self.cur_fn].add("b:rand_float")
+            return "float"
+        # rand_seed(s: int) -> void — seed the PRNG. Deterministic when
+        # the same seed is used (useful for testing / reproducible runs).
+        if name == "rand_seed":
+            need(1)
+            argt(0, "int")
+            self.edges[self.cur_fn].add("b:rand_seed")
+            return "void"
+        # proc_exec(cmd: str) -> int — run a shell command via system().
+        # Returns the exit code (0 on success, non-zero on failure). The
+        # command runs in a subshell — callers MUST sanitise any tainted
+        # input before constructing the command string.
+        if name == "proc_exec":
+            need(1)
+            reject_tainted_at_sink(0, "str")
+            self.edges[self.cur_fn].add("b:proc_exec")
+            return "int"
         self.err("unknown builtin function: %s" % name, e)
 
     @staticmethod

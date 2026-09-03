@@ -1,12 +1,112 @@
-# Changelog — Hieu Louis (HLS)
+# Changelog — Halis (HLS)
 
-All notable changes to Hieu Louis are documented in this file. The format
+All notable changes to Halis are documented in this file. The format
 is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 Releases on `main` follow the 20-stage roadmap (see [ROADMAP.md](ROADMAP.md)).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
+
+## [v0.20.0-alpha] — Stage 9 release: complete fine-grained effects + Halis rename
+
+> **Stage 9 — Fine-grained effects & capabilities — is COMPLETE.** The
+> three reserved effects (`Net`, `Rand`, `Proc`) are now active with
+> five new builtins. The language was renamed from "Hieu Louis" to
+> "Halis" (High-level Language Systems) — same `HLS` abbreviation,
+> same `.hls` file extension. **185/185 tests PASS**; the bootstrap
+> is still deterministic.
+
+### Language rename: "Hieu Louis" → "Halis"
+
+- **Name**: "Halis" — short, unique (no known programming language by
+  this name), backronym "H"igh-level "L"anguage for "S"ystems. The
+  abbreviation "HLS" is preserved exactly, as is the `.hls` file
+  extension, the `hlc` compiler binary name, and the `hl_*` runtime
+  symbol prefix.
+- 44 files updated. All textual references to "Hieu Louis" have been
+  replaced with "Halis" (docs, comments, code, test data, example
+  programs). The GitHub repo URL `hieu-louis-lang` is kept as-is (the
+  repo itself was not renamed).
+
+### Stage 9 release — five new builtins + three new effects
+
+- **`net_lookup(host: str) -> str`** (Net effect): DNS A-record
+  lookup via `getaddrinfo`. Returns the first IPv4 address as a
+  string. Panics on DNS failure (clean error). The host is a TAINT
+  SINK (tainted host → DNS rebinding attack vector; the checker
+  rejects it).
+- **`rand_int(max: int) -> int`** (Rand effect): uniform random int
+  in `[0, max)`. Panics if `max <= 0`.
+- **`rand_float() -> float`** (Rand effect): uniform random float in
+  `[0.0, 1.0)` — 53 bits of randomness (full IEEE double significand).
+- **`rand_seed(s: int) -> void`** (Rand effect): seed the PRNG. Same
+  seed produces the same sequence (deterministic).
+- **`proc_exec(cmd: str) -> int`** (Proc effect): run a shell command
+  via `system()`. Returns the exit code (0 on success, 1..255 on
+  failure, 128+signum on signal kill). The command is a TAINT SINK
+  (tainted command → shell-injection vector; the checker rejects it).
+
+### Shared PRNG — differential-test safety
+
+The Rand builtins use a 64-bit LCG with the same Knuth-MMIX constants
+(`state * 6364136223846793005 + 1442695040888963407` mod 2^64) in
+BOTH the Stage-0 interpreter (`boot/interp.py: HalisRNG`) and the
+native C runtime (`hl_rng_state` global). This makes random sequences
+**deterministic across implementations** — a test using `rand_seed(s)`
+then `rand_int(n)` produces the same output in both backends, which
+is critical for the project's differential-testing gate. Without
+this, the test suite would fail on any program using `rand_*`.
+
+### Taint-sink additions
+
+`net_lookup` and `proc_exec` are added to `SINK_BUILTINS` in
+`boot/checker.py` and to the audit-mode sink list in `boot/boot.py`.
+Passing a `tainted[T]` value as the host/cmd argument is now a
+compile-time error (matching `print`, `write_file`, etc.).
+
+### Portability fix
+
+The C runtime now includes `<sys/wait.h>` explicitly (needed for
+`WIFEXITED` / `WEXITSTATUS` / `WTERMSIG`). glibc pulls it in
+indirectly via `<stdlib.h>`, but musl and other libcs do NOT —
+without the explicit include, `proc_exec` would compile to
+non-portable code that returns the wrong exit code on non-glibc
+systems.
+
+### Parser
+
+- `RESERVED_EFFECTS` is now an empty set — all eight effects are
+  active. The error message for an unknown effect now lists all
+  eight known effects (was five).
+- The reserved-effect check (which produced "effect 'X' is
+  reserved for a future stage") is now unreachable. The
+  `fail_effect_reserved.hls` test was removed (it would pass
+  because no effect is reserved).
+
+### New tests (10 total: 4 ok, 1 panic, 5 fail)
+
+- `tests/ok/feat_effects_net.hls` — net_lookup demo
+- `tests/ok/feat_effects_rand.hls` — rand_int/rand_float/rand_seed demo
+- `tests/ok/feat_effects_proc.hls` — proc_exec demo
+- `tests/ok/panic_rand_zero.hls` — rand_int(0) panics cleanly
+- `tests/fail/fail_effect_net_missing.hls` — `uses Net` required for net_lookup (5-layer chain)
+- `tests/fail/fail_effect_rand_missing.hls` — `uses Rand` required for rand_int
+- `tests/fail/fail_effect_proc_missing.hls` — `uses Proc` required for proc_exec
+- `tests/fail/fail_taint_net_lookup.hls` — tainted host → DNS rebinding rejection
+- `tests/fail/fail_taint_proc_exec.hls` — tainted command → shell-injection rejection
+- (Removed) `tests/fail/fail_effect_reserved.hls` — no reserved effects remain
+
+### Documentation
+
+- `SPEC.md` §17 (Fine-grained effects & capabilities) rewritten for
+  the Stage 9 release — the eight active effects are listed, the new
+  `uses` clause grammar is documented, and the taint-sink additions
+  are noted.
+- `SPEC.md` §8a (Built-in functions table) — five new builtins added.
+- `ROADMAP.md` — Stage 9 marked ✅ (was 🔄) with a new release-record
+  section explaining what shipped, including the shared-PRNG note.
+- `README.md` — test count updated (185).
 
 ## [v0.19.0-alpha] — deep-scan-5: whole-codebase bug sweep
 
