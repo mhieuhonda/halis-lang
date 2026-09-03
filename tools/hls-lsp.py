@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""hls-lsp — Language Server for Hieu Louis (HLS).
+"""hls-lsp — Language Server for Halis (HLS).
 
 Stage 14 (v0.12.0-alpha): minimal LSP server over JSON-RPC stdio.
 
@@ -556,7 +556,7 @@ def one_shot_check(path):
 def main():
     parser = argparse.ArgumentParser(
         prog="hls-lsp",
-        description="Hieu Louis language server (Stage 14-alpha).")
+        description="Halis language server (Stage 14-alpha).")
     parser.add_argument("--check", metavar="FILE.hls",
                         help="One-shot: print diagnostics to stdout and exit.")
     args = parser.parse_args()

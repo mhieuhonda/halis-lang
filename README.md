@@ -1,10 +1,10 @@
 <div align="center">
 
-# Hieu Louis
+# Halis
 
 **A high-security, self-hosting, native-compiled programming language**
 
-`hlc` is written 100% in Hieu Louis itself. The compiler self-compiles,
+`hlc` is written 100% in Halis itself. The compiler self-compiles,
 and two compilation passes produce **byte-identical** output.
 
 [Specification](SPEC.md) · [20-stage roadmap](ROADMAP.md) · [Security](SECURITY.md)
@@ -13,9 +13,9 @@ and two compilation passes produce **byte-identical** output.
 
 ---
 
-## Why Hieu Louis?
+## Why Halis?
 
-Hieu Louis (HLS) exists because of one belief: **safety is not optional, and
+Halis (HLS) exists because of one belief: **safety is not optional, and
 performance is not the price of safety**.
 
 ```hls
@@ -36,7 +36,7 @@ fn main() -> int uses IO {
 }
 ```
 
-Seven core guarantees of v0.13.0-alpha:
+Seven core guarantees of v0.20.0-alpha:
 
 1. **I/O is a declared effect.** Forget `uses IO` while printing to the
    screen? Compile error — even when the call is indirect through 5 function
@@ -115,7 +115,7 @@ make bootstrap
 # 3. Compile your program to a native binary
 make run F=examples/primes.hls
 
-# 4. Run the full test suite (173 tests: types, effects, ownership, taint,
+# 4. Run the full test suite (185 tests: types, effects, ownership, taint,
 #    differential, bootstrap determinism, LLVM IR, memory-stress RSS check)
 make test
 
@@ -189,7 +189,7 @@ fn main() -> int uses IO {
     counts.set("louis", 2)
 
     # Strings are byte strings, full operation set
-    let s: str = "  Hieu Louis  "
+    let s: str = "  Halis  "
     println("[" + s.trim() + "]")
 
     # for-in loop: length snapshotted once
@@ -248,9 +248,9 @@ hieu-louis-lang/
 ├── std/                 # Standard library (Stage 6 + Stage 10, in HLS)
 ├── examples/            # hello, fibonacci, primes, wordcount, secure_demo, ...
 ├── tests/
-│   ├── ok/              #   46 valid programs (incl. safe panics)
-│   ├── fail/            #   47 programs that MUST be rejected (types/effects/taint)
-│   └── run_tests.sh     #   145 tests: ok/fail/differential/bootstrap fixed-point
+│   ├── ok/              #   60 valid programs (incl. safe panics + Stage 9 demos)
+│   ├── fail/            #   60 programs that MUST be rejected (types/effects/taint)
+│   └── run_tests.sh     #   185 tests: ok/fail/differential/bootstrap fixed-point
 ├── Makefile             # bootstrap · test · run · examples · audit · opt-stats · emit-ir · emit-llvm
 └── bin/                 # (generated) native hlc
 ```
@@ -276,7 +276,7 @@ Full details: [SPEC.md](SPEC.md) · Stage-by-stage roadmap:
 
 ## Status
 
-**v0.19.0-alpha — Stages 1–8 complete (Stage 8: ownership + end-of-arena runtime), Stage 9–15 in alpha/beta**:
+**v0.20.0-alpha — Stages 1–9 complete (Stage 9: complete fine-grained effects & capabilities), Stages 10–15 in alpha/beta**:
 
 - ✅ Complete core specification
 - ✅ Stage-0 reference (interpreted, with type + effects checking)
@@ -297,7 +297,8 @@ Full details: [SPEC.md](SPEC.md) · Stage-by-stage roadmap:
   (str / list / map / struct / enum / tainted) via per-instantiation
   helpers. The memory-stress acceptance test runs 500k allocation rounds
   with **RSS delta = 0**, enforced under a 256 MB `ulimit -v` in the
-  test suite. **163/173 tests PASS**.
+  test suite. **173/173 tests PASS** (Stage 8 final test count; the
+  current count after all Stage 9 release work is **185/185**).
 - 🔄 **Stage 9-alpha — Fine-grained effects & capabilities** (v0.5.0-alpha):
   Single `IO` effect split into five — `IO`, `Fs`, `Clock`, `Args`, `Exit`.
   `uses` clause now accepts a comma-separated list; `uses IO` is a
@@ -338,6 +339,15 @@ Full details: [SPEC.md](SPEC.md) · Stage-by-stage roadmap:
   uses the FIRST `@` for userinfo split (defensive).
   The new `examples/taint_beta_demo.hls` exercises the flow.
   **145/145 tests PASS**.
+- ✅ **Stage 9 release — Complete fine-grained effects & capabilities**
+  (v0.20.0-alpha): The three reserved effects `Net`, `Rand`, `Proc`
+  are now active with five new builtins — `net_lookup`,
+  `rand_int`, `rand_float`, `rand_seed`, `proc_exec`. The shared
+  64-bit LCG makes random sequences **deterministic across the
+  interpreter and native binary** — the same seed produces the same
+  sequence, critical for differential testing. `net_lookup` and
+  `proc_exec` are also TAINT SINKS (tainted host → DNS rebinding;
+  tainted command → shell injection). **185/185 tests PASS**.
 - ⬜ Stage 10-gamma (sandboxed compile mode, first-class taint labels,
   runtime taint flag in the native backend), concurrency (Stage 16),
   formal verification (Stage 17), testing ecosystem (Stage 18),
@@ -346,7 +356,7 @@ Full details: [SPEC.md](SPEC.md) · Stage-by-stage roadmap:
 ## Contributing
 
 Every contribution must preserve the core guarantees and pass
-`make test` (173 tests, including differential testing of the two
+`make test` (185 tests, including differential testing of the two
 implementations). Every new feature must first be used inside `hlc` itself —
 the compiler is always the first customer of the language.
 

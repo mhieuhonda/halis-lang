@@ -1,8 +1,8 @@
-# ROADMAP — Hieu Louis (HLS)
+# ROADMAP — Halis (HLS)
 
-> A 20-stage roadmap that takes Hieu Louis from a self-hosting v0.1 core to a
+> A 20-stage roadmap that takes Halis from a self-hosting v0.1 core to a
 > **highly secure, high-performance, complete v1.0 language** — with the entire
-> toolchain written in Hieu Louis itself.
+> toolchain written in Halis itself.
 
 **Status legend:** ✅ complete · 🔄 in progress · ⬜ not started
 **Standing principle:** every stage closes only when **100% of its acceptance
@@ -23,7 +23,7 @@ remains green.
 | 6 | Module system & standard library | ✅ | (done) |
 | 7 | Advanced type system: enum, Option/Result, generics | ✅ | (done) |
 | 8 | Ownership & borrow checking (end of arena) | ✅ | (done) |
-| 9 | Fine-grained effects & capabilities | 🔄 | 6–8 weeks |
+| 9 | Fine-grained effects & capabilities | ✅ | (done in v0.20.0-alpha) |
 | 10 | Taint tracking & sandbox | 🔄 | 8–10 weeks |
 | 11 | SSA IR + optimisation | 🔄 | 10–14 weeks |
 | 12 | Native LLVM backend | 🔄 | 10–14 weeks |
@@ -329,11 +329,63 @@ per round would exhaust the limit and fail the suite).
 **Highest risk in the entire roadmap** — the "ref-counting + ownership
 analysis pass" downgrade path was taken, as pre-authorised above.
 
-## STAGE 9 — Fine-grained effects & capabilities 🔄 (alpha v0.5.0 + beta v0.6.0-alpha)
+## STAGE 9 — Fine-grained effects & capabilities ✅ (alpha v0.5.0 + beta v0.6.0-alpha + release v0.20.0-alpha)
 
 **Goal:** every effect declared individually and statically verified.
 
-**Status (v0.6.0-alpha):** the **beta subset of Stage 9** has shipped. The
+**Status (v0.20.0-alpha — Stage 9 release):** Stage 9 is **COMPLETE**.
+The three reserved effects (`Net`, `Rand`, `Proc`) are now active with
+five new builtins. The shared 64-bit LCG (same Knuth-MMIX constants in
+the Python interpreter and the native C runtime) makes random
+sequences deterministic across implementations — the same seed produces
+the same sequence of `rand_int` / `rand_float` values in both backends,
+critical for differential testing. **185/185 tests PASS**, and the
+bootstrap is still **deterministic**.
+
+**Shipped in v0.20.0-alpha (Stage 9 release):**
+
+- **Net effect**: `net_lookup(host: str) -> str` — DNS A-record
+  lookup via `getaddrinfo`. Returns the first IPv4 address as a
+  string. Panics on DNS failure (clean error, no traceback). The
+  host is a TAINT SINK (passing a tainted host enables DNS rebinding;
+  the checker rejects it at check time).
+- **Rand effect**: three new builtins:
+  - `rand_int(max: int) -> int` — uniform random int in `[0, max)`.
+    Panics if `max <= 0` (the bound must be positive).
+  - `rand_float() -> float` — uniform random float in `[0.0, 1.0)`.
+    53 bits of randomness — full IEEE double significand precision.
+  - `rand_seed(s: int) -> void` — seed the process-wide PRNG. Same
+    seed → same sequence (deterministic).
+- **Proc effect**: `proc_exec(cmd: str) -> int` — run a shell command
+  via `system()`. Returns the exit code (0 on success, 1..255 on
+  failure, 128+signum on signal kill). The command is a TAINT SINK
+  (passing a tainted command enables shell injection; the checker
+  rejects it at check time).
+- **Shared PRNG**: a 64-bit LCG (Knuth MMIX constants
+  `state * 6364136223846793005 + 1442695040888963407` mod 2^64) is
+  used in both the Stage-0 interpreter (`boot/interp.py: HalisRNG`)
+  and the native C runtime (`hl_rng_state` global). Same constants,
+  same bit-mask, same float extraction → same sequence. This is
+  CRITICAL for differential testing.
+- **Parser**: `Net`, `Rand`, `Proc` are no longer reserved — they
+  are active effects with their own builtins. The `RESERVED_EFFECTS`
+  set is now empty. The error message for unknown effects now lists
+  all eight active effects.
+- **Audit mode**: `--audit` now lists the new taint sinks
+  (`net_lookup`, `proc_exec`) in the taint-flow summary.
+- **Portability fix**: the C runtime now includes `<sys/wait.h>`
+  explicitly (glibc pulls it in indirectly via `<stdlib.h>` but musl
+  and other libcs do NOT — without it, `WIFEXITED` would be undefined
+  and `proc_exec` would return the wrong exit code on non-glibc
+  systems).
+- 6 new tests: 3 ok (`feat_effects_net`, `feat_effects_rand`,
+  `feat_effects_proc`) + 3 fail (`fail_effect_net_missing`,
+  `fail_effect_rand_missing`, `fail_effect_proc_missing`) + 2 taint
+  fail tests (`fail_taint_net_lookup`, `fail_taint_proc_exec`) + 1
+  panic test (`panic_rand_zero`). The obsolete `fail_effect_reserved`
+  test was removed (no reserved effects remain).
+
+**Status (v0.6.0-alpha):** the **beta subset of Stage 9** shipped. The
 two beta targets — `--audit` flag and explicit `pure` keyword — are
 implemented in both Stage-0 and the self-hosted `hlc`. **127/127 tests PASS.**
 
@@ -401,15 +453,22 @@ SETS, not a single bool. **100/100 tests PASS.**
   (`fail_effect_fs_missing`, `fail_effect_clock_missing`,
   `fail_effect_transitive_fs`, `fail_effect_reserved`, `fail_effect_unknown`).
 
-**Remaining work for Stage 9 (release and beyond):**
+**Remaining work for Stage 9 (post-release):**
 
-- Add `Net`, `Rand`, `Proc` builtins (currently reserved — error if used).
 - First-class capability tokens (passed as args, stored in structs).
+  Currently, capabilities are implicit (a function's declared `uses`
+  clauses ARE its capabilities). First-class capability tokens would
+  let a function explicitly receive a `cap[Net]` parameter from its
+  caller (a typed witness that the caller has Net capability), enabling
+  more fine-grained capability delegation. Deferred to a future stage.
+- User-defined effects via a registration mechanism (currently the
+  effect taxonomy is fixed at the eight built-in effects). Deferred
+  to a future stage.
 
-**Acceptance:** a program that doesn't declare `uses Net` CANNOT call a socket
-even through 5 function layers — the compile error points to the exact call
-chain. (The v0.5.0-alpha release already enforces this for the five active
-effects; `Net` is reserved pending future builtins.)
+**Acceptance:** a program that doesn't declare `uses Net` CANNOT call
+`net_lookup` even through 5 function layers — the compile error points
+to the exact call chain. (The v0.20.0-alpha release enforces this for
+all eight active effects: IO, Fs, Clock, Args, Exit, Net, Rand, Proc.)
 
 ## STAGE 10 — Taint tracking & sandbox 🔄 (alpha v0.7.0-alpha + beta v0.8.0-alpha)
 
@@ -910,7 +969,7 @@ discrepancy between the two implementations; daily CI.
 ## STAGE 19 — Documentation, book, playground ⬜
 
 **Work:**
-- "The Hieu Louis Book" — a bilingual (Vietnamese + English) textbook, from
+- "The Halis Book" — a bilingual (Vietnamese + English) textbook, from
   intro to ownership/effects/verification.
 - Website + playground running native in the browser (WebAssembly backend).
 - Real-world examples: web server, CLI tool, data analysis program.

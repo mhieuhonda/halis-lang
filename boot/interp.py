@@ -142,6 +142,49 @@ def to_display(b):
     return str(b)
 
 
+# Stage 9 release (v0.20.0-alpha): HalisRNG — a 64-bit LCG shared between
+# the Stage-0 interpreter and the native C runtime. Same constants, same
+# bit-mask → same sequence for the same seed. Critical for differential
+# testing (a test using rand_seed + rand_int / rand_float must produce
+# identical output in both backends; otherwise the suite would fail).
+#
+# Algorithm: Knuth's LCG with the glibc/MMIX Taussian-Lewis constants.
+#   state = state * 6364136223846793005 + 1442695040888963407   (mod 2^64)
+#   rand_int(max) = state % max   (max > 0)
+#   rand_float() = (state >> 11) / 2^53   (53 bits of randomness)
+# The state is masked to 64 bits with & 0xFFFFFFFFFFFFFFFF to mirror C's
+# uint64_t overflow. Seed 0 is normalised to 1 because xorshift-style
+# alternatives would not — but the LCG actually accepts 0 (it just stays
+# at 0x...407 forever); we normalise anyway so the seed "0" does not
+# produce a degenerate sequence.
+class HalisRNG:
+    MASK = (1 << 64) - 1
+    A = 6364136223846793005
+    C = 1442695040888963407
+
+    def __init__(self):
+        self.state = 1  # nonzero default; same as native runtime
+
+    def seed(self, s):
+        # HLS ints are 64-bit signed; mask to 64 bits to mirror C uint64.
+        self.state = s & self.MASK
+        if self.state == 0:
+            self.state = 1
+
+    def _next(self):
+        self.state = (self.state * self.A + self.C) & self.MASK
+        return self.state
+
+    def randrange(self, max):
+        # Caller guarantees max > 0 (the checker raises otherwise).
+        return self._next() % max
+
+    def random(self):
+        # 53 bits of randomness — full precision of an IEEE double's
+        # significand. Matches the native runtime's calculation.
+        return (self._next() >> 11) / (1 << 53)
+
+
 class Interp:
     def __init__(self, program, argv, out):
         self.p = program
@@ -151,6 +194,16 @@ class Interp:
         self.argv = argv  # list[bytes]
         self.out = out
         self.line = 0
+        # Stage 9 release (v0.20.0-alpha): process-wide PRNG state for the
+        # Rand effect. Uses a 64-bit LCG with the same constants as the
+        # native runtime (Knuth LCG: state = state * 6364136223846793005
+        # + 1442695040888963407, masked to 64 bits). This makes the
+        # sequence DETERMINISTIC across implementations: the same seed
+        # produces the same sequence of ints and floats in both Stage-0
+        # (Python) and the native binary (C). Crucial for differential
+        # testing — tests using rand_seed + rand_int/rand_float produce
+        # identical output in both backends.
+        self.rand_state = HalisRNG()
 
     # ---------- lifecycle ----------
     def run(self):
@@ -680,6 +733,61 @@ class Interp:
             # without the taint wrapper — that indicates a checker bug.
             raise HLPanic("taint_unwrap: expected tainted[T] wrapper, "
                           "got a non-tainted value", line)
+        # ----- Stage 9 release (v0.20.0-alpha): Net / Rand / Proc builtins -----
+        # The interpreter implementations mirror the native runtime in
+        # src/hlc.hls exactly, so differential testing passes.
+        # rand_int(max: int) -> int — uniform random int in [0, max).
+        # Panics on max <= 0 to keep the bound well-defined. Uses the
+        # shared HalisRNG LCG so the sequence is identical to the native
+        # runtime for the same seed.
+        if name == "rand_int":
+            if args[0] <= 0:
+                raise HLPanic("rand_int() requires a positive max (got %d)"
+                              % args[0], line)
+            return self.rand_state.randrange(args[0])
+        # rand_float() -> float — uniform random float in [0.0, 1.0).
+        # Uses the same PRNG state as rand_int; 53 bits of randomness.
+        if name == "rand_float":
+            return self.rand_state.random()
+        # rand_seed(s: int) -> void — seed the PRNG. Same seed produces
+        # the same sequence in both the interpreter and the native
+        # runtime (the constants and bit-masking are identical).
+        if name == "rand_seed":
+            self.rand_state.seed(args[0])
+            return None
+        # net_lookup(host: str) -> str — DNS resolution. Returns the
+        # first IPv4 address as a string. Panics on failure (DNS error
+        # or no A records). The interpreter uses Python's socket module
+        # — the native runtime uses getaddrinfo directly.
+        if name == "net_lookup":
+            host = args[0].decode("utf-8", "replace")
+            try:
+                import socket
+                infos = socket.getaddrinfo(host, None, socket.AF_INET)
+                for fam, _, _, _, sa in infos:
+                    if fam == socket.AF_INET:
+                        return sa[0].encode("ascii")
+                raise HLPanic("net_lookup: no A records for %s"
+                              % to_display(args[0]), line)
+            except socket.gaierror as ex:
+                raise HLPanic("net_lookup: DNS resolution failed for %s: %s"
+                              % (to_display(args[0]), str(ex)), line)
+        # proc_exec(cmd: str) -> int — run a shell command. Returns the
+        # exit code (0 on success, 1..255 on failure). Uses os.system()
+        # so the command runs in a subshell, matching the C runtime's
+        # system() call. Tainted command strings are rejected at
+        # check time (proc_exec is a taint sink for argument 0).
+        if name == "proc_exec":
+            import os
+            cmd = args[0].decode("utf-8", "replace")
+            rc = os.system(cmd)
+            # POSIX: os.system returns a status word; the exit code is
+            # the high byte (WEXITSTATUS). On CPython, this matches the
+            # behaviour of system() exactly.
+            if os.WIFEXITED(rc):
+                return os.WEXITSTATUS(rc)
+            # Killed by signal — encode as 128 + signum, like shells.
+            return 128 + os.WTERMSIG(rc)
         raise HLPanic("unknown builtin function: %s" % name, line)
 
     def deep_clone(self, v):

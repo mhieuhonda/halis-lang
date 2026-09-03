@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""hlfmt — Opinionated formatter for Hieu Louis (HLS).
+"""hlfmt — Opinionated formatter for Halis (HLS).
 
 Stage 14 (v0.14.0-alpha): the `gofmt` of HLS — ends style debates.
 
@@ -370,7 +370,7 @@ def is_formatted(src: bytes) -> bool:
 def main():
     parser = argparse.ArgumentParser(
         prog="hlfmt",
-        description="Hieu Louis opinionated formatter (Stage 14-alpha).")
+        description="Halis opinionated formatter (Stage 14-alpha).")
     parser.add_argument("file", help="HLS source file to format.")
     parser.add_argument("-w", "--write", action="store_true",
                         help="Write back to file (default: print to stdout).")

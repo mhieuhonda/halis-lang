@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""hllint — Linter for Hieu Louis (HLS).
+"""hllint — Linter for Halis (HLS).
 
 Stage 14: safety rules for HLS programs.
 
@@ -421,7 +421,7 @@ def walk_stmts_collected(stmts):
 def main():
     parser = argparse.ArgumentParser(
         prog="hllint",
-        description="Hieu Louis linter (Stage 14).")
+        description="Halis linter (Stage 14).")
     parser.add_argument("file", nargs="?", help="HLS source file to lint.")
     parser.add_argument("--strict", action="store_true",
                         help="Exit non-zero if any warnings are emitted.")

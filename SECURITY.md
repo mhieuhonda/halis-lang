@@ -1,8 +1,8 @@
-# Security policy — Hieu Louis (HLS)
+# Security policy — Halis (HLS)
 
 ## Security model of the language (v0.7.0-alpha)
 
-Hieu Louis is designed so that **safety is the default state**. Four layers
+Halis is designed so that **safety is the default state**. Four layers
 of defence:
 
 ### Layer 1 — Compile time (static)

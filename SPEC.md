@@ -1,12 +1,17 @@
-# Hieu Louis language specification (HLS) — v0.13.0-alpha
+# Halis language specification (HLS) — v0.20.0-alpha
 
-> **Hieu Louis** is a high-security, native-compiled programming language
+> **Halis** is a high-security, native-compiled programming language
 > designed around the philosophy: **safety by default, explicitness for
-> auditability, performance via AOT compilation**. Version v0.13.0-alpha
-> adds **Stage 15-alpha: Safe C FFI** — a new `extern "C" { ... }` block
-> declares external C functions, with the interpreter dispatching via
-> ctypes. Version v0.12.0-alpha added **Stage 14-alpha: developer
-> tooling** (hls-lsp language server, hlfmt formatter, hllint linter).
+> auditability, performance via AOT compilation**. Version v0.20.0-alpha
+> **completes Stage 9**: the `Net`, `Rand`, and `Proc` effects are now
+> active with five new builtins (`net_lookup`, `rand_int`, `rand_float`,
+> `rand_seed`, `proc_exec`). The shared 64-bit LCG makes random sequences
+> deterministic across the Stage-0 interpreter and the native binary.
+> Version v0.15.0-alpha added **Stage 15-gamma: Safe C FFI** — a new
+> `extern "C" { ... }` block declares external C functions, with the
+> interpreter dispatching via ctypes. Version v0.12.0-alpha added
+> **Stage 14-alpha: developer tooling** (hls-lsp language server, hlfmt
+> formatter, hllint linter).
 > Version v0.11.0-alpha added **Stage 13-alpha: the hls-pkg package
 > manager** with content-addressed dependencies and effect enforcement.
 > Version v0.10.0-alpha added **Stage 12-alpha: the LLVM IR text backend**.
@@ -364,6 +369,11 @@ Operands:
 | `taint_mark(x: T)` | `tainted[T]` | — | (Stage 10-alpha) wrap any value as tainted |
 | `taint_unwrap(x: tainted[T])` | `T` | — | (Stage 10-alpha) explicit untaint (escape hatch) |
 | `read_file_tainted(path: str)` | `tainted[str]` | Fs | (Stage 10-beta) read file; result is tainted |
+| `net_lookup(host: str)` | `str` | Net | (Stage 9 release) DNS lookup; returns first IPv4 as string; tainted host → error |
+| `rand_int(max: int)` | `int` | Rand | (Stage 9 release) uniform random int in `[0, max)`; `max <= 0` → panic |
+| `rand_float()` | `float` | Rand | (Stage 9 release) uniform random float in `[0.0, 1.0)` |
+| `rand_seed(s: int)` | `void` | Rand | (Stage 9 release) seed the PRNG; same seed → same sequence (deterministic, shared with native) |
+| `proc_exec(cmd: str)` | `int` | Proc | (Stage 9 release) run shell command via `system()`; returns exit code (0 on success, 1..255 on failure, 128+signum on signal); tainted cmd → error |
 
 `int(s)`: allows a leading minus sign, only accepts digits 0–9, value must
 fit in int64 range, otherwise panics with "cannot convert string to int".
@@ -871,46 +881,69 @@ requirement is enforced by `tests/run_tests.sh` section 3b.
 
 ---
 
-## 17. Fine-grained effects & capabilities (Stage 9-alpha — v0.5.0-alpha)
+## 17. Fine-grained effects & capabilities (Stage 9 — v0.20.0-alpha)
 
-Stage 9 of the roadmap calls for splitting the single `IO` effect into
+Stage 9 of the roadmap called for splitting the single `IO` effect into
 fine-grained, individually-declared capabilities, plus capability tokens
-that flow from `main` down through the call graph. v0.5.0-alpha ships the
-**first subset of Stage 9**: the effect taxonomy is split, the fixpoint
-analysis tracks effect SETS, and a function's declared effects are its
-static capabilities (the "token" model).
+that flow from `main` down through the call graph. The Stage 9 release
+(v0.20.0-alpha) **completes the effect taxonomy**: the original five IO
+family effects plus three new independent effects (`Net`, `Rand`, `Proc`)
+are all active with builtins. The fixpoint analysis tracks effect SETS,
+and a function's declared effects are its static capabilities.
 
-### 17.1. The five active effects
+### 17.1. The eight active effects
 
 | Effect | Builtins it gates | Capability scope |
 |--------|-------------------|------------------|
 | `IO` | `print`, `println` | console output |
-| `Fs` | `read_file`, `write_file`, `file_exists` | filesystem access |
+| `Fs` | `read_file`, `write_file`, `file_exists`, `read_file_tainted` | filesystem access |
 | `Clock` | `clock_ms` | monotonic clock read |
-| `Args` | `args` | command-line arguments |
+| `Args` | `args`, `tainted_args` | command-line arguments |
 | `Exit` | `exit` | process termination |
+| `Net` | `net_lookup` | DNS resolution (network access) |
+| `Rand` | `rand_int`, `rand_float`, `rand_seed` | random number generation |
+| `Proc` | `proc_exec` | subprocess control via system() |
 
-Reserved (recognized but error if used — no builtins yet): `Net`, `Rand`,
-`Proc`. These will be enabled in later stages.
+`Net`, `Rand`, `Proc` are **independent** effects — they are NOT part
+of the IO family. A function must declare them explicitly to use the
+corresponding builtins; the blanket `uses IO` does NOT cover them. No
+reserved effects remain (the reserved set is empty as of v0.20.0-alpha).
+
+**Shared PRNG:** the `Rand` builtins use a 64-bit LCG with the same
+Knuth-MMIX constants in both the Stage-0 interpreter and the native C
+runtime. This makes the sequence **deterministic across implementations**
+— the same seed produces the same sequence of ints and floats in both
+backends. Critical for differential testing: tests using `rand_seed` +
+`rand_int` / `rand_float` produce identical output in both backends.
 
 ### 17.2. The `uses` clause — declared capabilities
 
-Grammar (Stage 9-alpha):
+Grammar (Stage 9 release):
 ```
 fndef := "fn" ... ("uses" effect ("," effect)*)? block
 effect := "IO" | "Fs" | "Clock" | "Args" | "Exit"
-        | "Net" | "Rand" | "Proc"   # reserved, error if used
+        | "Net" | "Rand" | "Proc"
 ```
 
 - `uses IO` — **blanket alias**: at parse time, expands to the entire IO
   family `{IO, Fs, Clock, Args, Exit}`. Backwards compatible with all
-  v0.3/v0.4 code.
+  v0.3/v0.4 code. **Does NOT include Net, Rand, or Proc** — declare
+  those explicitly if your function uses net/rng/subprocess builtins.
 - `uses Fs` — only filesystem capability.
 - `uses Fs, Clock` — filesystem and clock.
-- `uses Net` — parse error: "effect 'Net' is reserved for a future stage".
-- `uses Bogus` — parse error: "unknown effect 'Bogus'; known effects: IO,
-  Fs, Clock, Args, Exit".
+- `uses Net` — network capability (net_lookup).
+- `uses Rand` — random-number capability (rand_int, rand_float, rand_seed).
+- `uses Proc` — subprocess capability (proc_exec).
+- `uses IO, Net` — blanket IO family + network.
+- `uses Bogus` — parse error: "unknown effect 'Bogus'; known effects:
+  IO, Fs, Clock, Args, Exit, Net, Rand, Proc".
 - No `uses` clause — empty declared set (default-deny: pure function).
+
+**Taint sinks among the new builtins:** `net_lookup` and `proc_exec` are
+taint sinks (passing a tainted host enables DNS rebinding; passing a
+tainted command enables shell injection). The checker rejects tainted
+values at those argument positions just like it does for `print`,
+`write_file`, etc.
 
 ### 17.3. Capability semantics — declared ⊇ computed
 
@@ -979,13 +1012,21 @@ not declared (declared: Fs; missing: IO)
 - Existing v0.3/v0.4 code with `uses IO` continues to compile unchanged
   (the parse-time expansion to the IO family is transparent).
 
-### 17.7. Limitations after Stage 9-beta (v0.6.0-alpha)
+### 17.7. Status of Stage 9 release (v0.20.0-alpha)
 
-| Limitation | When lifted |
-|------------|--------------|
-| `Net`, `Rand`, `Proc` reserved but no builtins yet | future Stage 9 release |
-| Capability tokens are not first-class values (can't be passed as args, stored in structs) | future Stage 9 release (first-class capability type) |
-| Per-builtin effect taxonomy is fixed (no user-defined effects) | future Stage 9 release (user-defined effects via a registration mechanism) |
+The Stage 9 release lifts the two remaining limitations of Stage 9-beta:
+
+| Original limitation | Status in v0.20.0-alpha |
+|---------------------|--------------------------|
+| `Net`, `Rand`, `Proc` reserved but no builtins | **DONE** — five new builtins (net_lookup, rand_int, rand_float, rand_seed, proc_exec) activate all three effects |
+| Capability tokens are not first-class values (can't be passed as args, stored in structs) | DEFERRED — the capability system continues to use implicit declared effects. First-class capability tokens are deferred to a future stage. |
+| Per-builtin effect taxonomy is fixed (no user-defined effects) | DEFERRED — user-defined effects are deferred to a future stage. |
+
+**Acceptance criterion (Stage 9):** A program that doesn't declare `uses
+Net` CANNOT call `net_lookup` even through 5 function layers — the
+compile error points to the exact call chain. Same for `uses Rand` /
+`rand_int` and `uses Proc` / `proc_exec`. This is enforced by the same
+fixpoint + subset-test mechanism that backs all five IO-family effects.
 
 The two original Stage 9-beta targets — `hlc --audit` flag and the
 explicit `pure` keyword — **shipped in v0.6.0-alpha**. See §18 below.
@@ -1149,7 +1190,7 @@ input and which functions reach sinks.
   HTTP request body if added) — currently only argv and read_file_tainted
   are taint sources.
 
-## 20. HLIR — Hieu Louis Intermediate Representation (Stage 11-alpha — v0.9.0-alpha)
+## 20. HLIR — Halis Intermediate Representation (Stage 11-alpha — v0.9.0-alpha)
 
 The mid-level IR is built from the AST (post-type-check) and fed to an
 optimiser pipeline. It is a *light* SSA form: HLS already disallows

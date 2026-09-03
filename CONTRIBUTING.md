@@ -1,6 +1,6 @@
-# Contributing to Hieu Louis (HLS)
+# Contributing to Halis (HLS)
 
-Thank you for your interest in contributing to Hieu Louis! This document
+Thank you for your interest in contributing to Halis! This document
 describes how to set up your environment, the conventions we follow, and
 how to submit changes.
 
@@ -10,7 +10,7 @@ how to submit changes.
 git clone https://github.com/mhieuhonda/hieu-louis-lang.git
 cd hieu-louis-lang
 make bootstrap    # builds the native compiler via the bootstrap chain
-make test         # 135 tests: interpreter, native, differential, bootstrap
+make test         # 187 tests: interpreter, native, differential, bootstrap
 ```
 
 Requirements: Python 3.8+ (only for the Stage-0 seed), gcc or clang.
@@ -19,7 +19,7 @@ Requirements: Python 3.8+ (only for the Stage-0 seed), gcc or clang.
 
 | Branch                           | Purpose                                       |
 |----------------------------------|-----------------------------------------------|
-| `main`                           | The roadmap branch. Stages 1–7 complete; Stage 8-alpha, 9-alpha, 9-beta, 10-alpha shipped (current: v0.7.0-alpha). Each new roadmap stage lands here when ready. |
+| `main`                           | The roadmap branch. Stages 1–9 complete; Stage 10-alpha, 10-beta, 11–15 alpha/beta shipped (current: v0.20.0-alpha). Each new roadmap stage lands here when ready. |
 | `feature/community-extensions`   | Non-roadmap upgrades: new stdlib modules, tooling, examples, CI/CD. Smaller, more frequent releases cut from here. |
 | `feature/*` / `fix/*`             | Short-lived topic branches.                   |
 
@@ -131,7 +131,7 @@ Areas used in this repo:
 
 ### The three guarantees
 
-Every contribution must preserve the three core guarantees of Hieu Louis:
+Every contribution must preserve the three core guarantees of Halis:
 
 1. **I/O is a declared effect.** A function that does not declare
    `uses IO` must be statically guaranteed to perform no I/O.

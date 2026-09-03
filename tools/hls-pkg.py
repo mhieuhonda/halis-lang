@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""hls-pkg — Package manager for Hieu Louis (HLS).
+"""hls-pkg — Package manager for Halis (HLS).
 
 Stage 13 (v0.11.0-alpha): content-addressed package manager with
 verified provenance and effect enforcement.
@@ -564,7 +564,7 @@ fn main() -> int uses IO {
         f.write(src)
     # README.
     with open(os.path.join(pkg_dir, "README.md"), "w") as f:
-        f.write("# %s\n\nA Hieu Louis package.\n" % name)
+        f.write("# %s\n\nA Halis package.\n" % name)
     # .gitignore.
     with open(os.path.join(pkg_dir, ".gitignore"), "w") as f:
         f.write(".hls-pkg-cache/\nhls-pkg.lock\n")
@@ -797,7 +797,7 @@ def cmd_build(args):
 def main():
     parser = argparse.ArgumentParser(
         prog="hls-pkg",
-        description="Hieu Louis package manager (Stage 13-alpha).")
+        description="Halis package manager (Stage 13-alpha).")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p_init = sub.add_parser("init", help="Create a new package skeleton.")

@@ -1,7 +1,7 @@
 # ============================================================================
 # hlc — THE HIEU LOUIS COMPILER (HLS -> C)
 # ----------------------------------------------------------------------------
-# This compiler is written 100% in Hieu Louis itself.
+# This compiler is written 100% in Halis itself.
 # This is the self-hosting step of the language: the language's compiler
 # is written in that language.
 #
@@ -978,16 +978,19 @@ fn parse_fn(ctx: Ctx, impl_struct: str) -> FnInfo {
         ctx.pos = ctx.pos + 1
         while true {
             let e: str = eat_ident(ctx)
-            if e == "Net" || e == "Rand" || e == "Proc" {
-                perr(ctx, "effect '" + e + "' is reserved for a future stage (no builtins implemented yet)")
-            }
-            if e != "IO" && e != "Fs" && e != "Clock" && e != "Args" && e != "Exit" {
-                perr(ctx, "unknown effect '" + e + "'; known effects: IO, Fs, Clock, Args, Exit")
+            # Stage 9 release (v0.20.0-alpha): Net, Rand, Proc are now
+            # active effects with builtins (net_lookup, rand_int,
+            # rand_float, rand_seed, proc_exec). No reserved effects remain.
+            if e != "IO" && e != "Fs" && e != "Clock" && e != "Args" && e != "Exit"
+                && e != "Net" && e != "Rand" && e != "Proc" {
+                perr(ctx, "unknown effect '" + e + "'; known effects: IO, Fs, Clock, Args, Exit, Net, Rand, Proc")
             }
             if !list_has(effects, e) {
                 effects.push(e)
             }
             # `IO` is the blanket alias — expand to the full IO family.
+            # Net, Rand, Proc are NOT part of the IO family — a program
+            # must declare them explicitly to use the corresponding builtins.
             if e == "IO" {
                 let mut k: int = 0
                 let fam: list[str] = ["IO", "Fs", "Clock", "Args", "Exit"]
@@ -1083,11 +1086,11 @@ fn parse_extern_block(ctx: Ctx) -> void {
             ctx.pos = ctx.pos + 1
             while true {
                 let e: str = eat_ident(ctx)
-                if e == "Net" || e == "Rand" || e == "Proc" {
-                    perr(ctx, "effect '" + e + "' is reserved for a future stage (no builtins implemented yet)")
-                }
-                if e != "IO" && e != "Fs" && e != "Clock" && e != "Args" && e != "Exit" {
-                    perr(ctx, "unknown effect '" + e + "'; known effects: IO, Fs, Clock, Args, Exit")
+                # Stage 9 release (v0.20.0-alpha): Net, Rand, Proc are
+                # active effects. No reserved effects remain.
+                if e != "IO" && e != "Fs" && e != "Clock" && e != "Args" && e != "Exit"
+                    && e != "Net" && e != "Rand" && e != "Proc" {
+                    perr(ctx, "unknown effect '" + e + "'; known effects: IO, Fs, Clock, Args, Exit, Net, Rand, Proc")
                 }
                 if !list_has(effects, e) {
                     effects.push(e)
@@ -1609,6 +1612,9 @@ fn is_builtin_fn(n: str) -> bool {
         || n == "tainted_args" || n == "taint_mark" || n == "taint_unwrap"
         # Stage 10-beta: more taint sources
         || n == "read_file_tainted"
+        # Stage 9 release (v0.20.0-alpha): Net / Rand / Proc builtins
+        || n == "net_lookup" || n == "rand_int" || n == "rand_float"
+        || n == "rand_seed" || n == "proc_exec"
 }
 
 fn list_has(list: list[str], x: str) -> bool {
@@ -1886,6 +1892,19 @@ fn builtin_effect(name: str) -> list[str] {
     }
     if name == "exit" {
         return ["Exit"]
+    }
+    # Stage 9 release (v0.20.0-alpha): Net / Rand / Proc builtins.
+    # Net, Rand, Proc are independent effects — NOT part of the IO
+    # family. A program must declare them explicitly to use these
+    # builtins; the fixpoint in check_effects enforces the subset rule.
+    if name == "net_lookup" {
+        return ["Net"]
+    }
+    if name == "rand_int" || name == "rand_float" || name == "rand_seed" {
+        return ["Rand"]
+    }
+    if name == "proc_exec" {
+        return ["Proc"]
     }
     # taint_mark / taint_unwrap are pure (no effect; just wrap/unwrap).
     return []   # pure builtin
@@ -3236,6 +3255,57 @@ fn check_builtin_call(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, 
         }
         return at3
     }
+    # ----- Stage 9 release (v0.20.0-alpha): Net / Rand / Proc builtins -----
+    # net_lookup(host: str) -> str — DNS A record lookup. The host
+    # argument is a taint sink (passing a tainted host would be a DNS
+    # rebinding vector — reject it like read_file does for paths).
+    if name == "net_lookup" {
+        if nargs != 1 || argt.get(0) != "str" {
+            cerr(line, "net_lookup() expects 1 str argument")
+        }
+        if is_taint_t(argt.get(0)) {
+            cerr(line, "taint-sink violation: net_lookup argument 1 is " + argt.get(0) + " (tainted values must be sanitised before reaching a sink — use sanitize_command from std.sanitize, or taint_unwrap() if you accept the risk)")
+        }
+        add_edge(ctx, cur, "b:net_lookup")
+        return "str"
+    }
+    # rand_int(max: int) -> int — uniform random int in [0, max).
+    if name == "rand_int" {
+        if nargs != 1 || argt.get(0) != "int" {
+            cerr(line, "rand_int() expects 1 int argument")
+        }
+        add_edge(ctx, cur, "b:rand_int")
+        return "int"
+    }
+    # rand_float() -> float — uniform random float in [0.0, 1.0).
+    if name == "rand_float" {
+        if nargs != 0 {
+            cerr(line, "rand_float() takes no arguments")
+        }
+        add_edge(ctx, cur, "b:rand_float")
+        return "float"
+    }
+    # rand_seed(s: int) -> void — seed the PRNG.
+    if name == "rand_seed" {
+        if nargs != 1 || argt.get(0) != "int" {
+            cerr(line, "rand_seed() expects 1 int argument")
+        }
+        add_edge(ctx, cur, "b:rand_seed")
+        return "void"
+    }
+    # proc_exec(cmd: str) -> int — run a shell command via system().
+    # The command is a taint sink (passing a tainted cmd is a command-
+    # injection vector — reject it like exit does for the exit code).
+    if name == "proc_exec" {
+        if nargs != 1 || argt.get(0) != "str" {
+            cerr(line, "proc_exec() expects 1 str argument")
+        }
+        if is_taint_t(argt.get(0)) {
+            cerr(line, "taint-sink violation: proc_exec argument 1 is " + argt.get(0) + " (tainted values must be sanitised before reaching a sink — use sanitize_command from std.sanitize, or taint_unwrap() if you accept the risk)")
+        }
+        add_edge(ctx, cur, "b:proc_exec")
+        return "int"
+    }
     cerr(line, "unknown builtin function: " + name)
     return ""
 }
@@ -4041,6 +4111,18 @@ fn runtime_lines() -> list[str] {
     r.push("#include <time.h>")
     r.push("#include <math.h>")
     r.push("#include <sys/stat.h>")
+    # Stage 9 release (v0.20.0-alpha): Net / Rand / Proc builtins.
+    # net_lookup needs sys/socket.h, netdb.h, netinet/in.h for
+    # getaddrinfo. proc_exec uses system() (declared in stdlib.h);
+    # WIFEXITED / WEXITSTATUS / WTERMSIG are declared in sys/wait.h
+    # (stdlib.h pulls it in indirectly on glibc but NOT on musl/other
+    # libcs — explicitly include for portability).
+    # rand_* use rand()/srand() (declared in stdlib.h).
+    r.push("#include <sys/socket.h>")
+    r.push("#include <netdb.h>")
+    r.push("#include <netinet/in.h>")
+    r.push("#include <arpa/inet.h>")
+    r.push("#include <sys/wait.h>")
     r.push("")
     # ---- Stage 8-beta: the refcounted runtime (END OF ARENA) ----
     # Every heap object starts with an int64_t refcnt as its FIRST field so
@@ -4539,6 +4621,93 @@ fn runtime_lines() -> list[str] {
     r.push("static void hl_exit(int64_t code) {")
     r.push("    fflush(stdout);")
     r.push("    exit((int)code);")
+    r.push("}")
+    r.push("")
+    # ---- Stage 9 release (v0.20.0-alpha): Net / Rand / Proc runtime ----
+    # HalisRNG — a 64-bit LCG shared with the Stage-0 interpreter.
+    # Same constants (Knuth's MMIX), same bit-mask, same float extraction
+    # → same sequence for the same seed. This is CRITICAL for
+    # differential testing: a test using rand_seed + rand_int/rand_float
+    # must produce identical output in both backends, otherwise the
+    # test suite would fail.
+    # Algorithm:
+    #   state = state * 6364136223846793005 + 1442695040888963407   (mod 2^64)
+    #   rand_int(max) = state % max   (max > 0)
+    #   rand_float()  = (state >> 11) / 2^53   (53 bits of randomness)
+    r.push("static uint64_t hl_rng_state = 1;  /* nonzero default */")
+    r.push("")
+    r.push("static void hl_rand_seed(int64_t s) {")
+    r.push("    hl_rng_state = (uint64_t)s;")
+    r.push("    if (hl_rng_state == 0) hl_rng_state = 1;  /* avoid degenerate seq */")
+    r.push("}")
+    r.push("")
+    r.push("static uint64_t hl_rng_next(void) {")
+    r.push("    hl_rng_state = hl_rng_state * 6364136223846793005ULL + 1442695040888963407ULL;")
+    r.push("    return hl_rng_state;")
+    r.push("}")
+    r.push("")
+    # hl_rand_int(max) — uniform random int in [0, max). Panics on max <= 0
+    # (matches the interpreter). Modulo bias is bounded by the caller's
+    # choice of max; for cryptographically-unbiased randomness, use a
+    # rejection-sampling wrapper (deferred to a future stage).
+    r.push("static int64_t hl_rand_int(int64_t max) {")
+    r.push("    if (max <= 0) hl_die(\"rand_int() requires a positive max\");")
+    r.push("    uint64_t r = hl_rng_next();")
+    r.push("    return (int64_t)(r % (uint64_t)max);")
+    r.push("}")
+    r.push("")
+    # hl_rand_float() — uniform random float in [0.0, 1.0). 53 bits of
+    # randomness — full precision of an IEEE double's significand.
+    r.push("static double hl_rand_float(void) {")
+    r.push("    uint64_t r = hl_rng_next();")
+    r.push("    return (double)(r >> 11) / (double)(1ULL << 53);")
+    r.push("}")
+    r.push("")
+    # hl_net_lookup(host) — DNS A record lookup via getaddrinfo. Returns
+    # the first IPv4 address as a fresh str. Panics on failure (DNS
+    # error or no A records). Consumes the host argument.
+    r.push("static hl_str* hl_net_lookup(hl_str* host) {")
+    r.push("    struct addrinfo hints;")
+    r.push("    memset(&hints, 0, sizeof(hints));")
+    r.push("    hints.ai_family = AF_INET;")
+    r.push("    hints.ai_socktype = SOCK_STREAM;")
+    r.push("    struct addrinfo* res = NULL;")
+    r.push("    int rc = getaddrinfo(host->data, NULL, &hints, &res);")
+    r.push("    if (rc != 0 || res == NULL) {")
+    r.push("        hl_str_release(host);")
+    r.push("        hl_die(\"net_lookup: DNS resolution failed\");")
+    r.push("    }")
+    r.push("    char addr_buf[INET_ADDRSTRLEN];")
+    r.push("    const char* r = inet_ntop(AF_INET,")
+    r.push("        &((struct sockaddr_in*)res->ai_addr)->sin_addr,")
+    r.push("        addr_buf, sizeof(addr_buf));")
+    r.push("    freeaddrinfo(res);")
+    r.push("    if (!r) {")
+    r.push("        hl_str_release(host);")
+    r.push("        hl_die(\"net_lookup: inet_ntop failed\");")
+    r.push("    }")
+    r.push("    hl_str* out = hl_str_from(addr_buf, (int64_t)strlen(addr_buf));")
+    r.push("    hl_str_release(host);")
+    r.push("    return out;")
+    r.push("}")
+    r.push("")
+    # hl_proc_exec(cmd) — run a shell command via system(). Returns the
+    # exit code (0 on success, 1..255 on failure, 128+signum on signal
+    # kill). Consumes the cmd argument. The checker enforces that the
+    # command is not tainted (proc_exec is a taint sink).
+    r.push("static int64_t hl_proc_exec(hl_str* cmd) {")
+    r.push("    int rc = system(cmd->data);")
+    r.push("    hl_str_release(cmd);")
+    r.push("    if (rc == -1) {")
+    r.push("        hl_die(\"proc_exec: system() failed\");")
+    r.push("    }")
+    r.push("#ifdef WIFEXITED")
+    r.push("    if (WIFEXITED(rc)) return (int64_t)WEXITSTATUS(rc);")
+    r.push("    if (WIFSIGNALED(rc)) return (int64_t)(128 + WTERMSIG(rc));")
+    r.push("#else")
+    r.push("    return (int64_t)(rc & 0xFF);")
+    r.push("#endif")
+    r.push("    return (int64_t)(rc & 0xFF);")
     r.push("}")
     r.push("")
     r.push("// String split helper (placed last because it depends on hl_list)")
@@ -5053,6 +5222,15 @@ fn call_result_fresh(ctx: Ctx, e: int) -> bool {
     if name == "read_file" || name == "read_file_tainted" {
         return true
     }
+    # Stage 9 release (v0.20.0-alpha): net_lookup returns a fresh str
+    # (the host is consumed; a new str is allocated for the IP address).
+    # Without this, the binding `let ip: str = net_lookup(host)` would
+    # get an extra hl_retain wrap (because expr_fresh returns false), and
+    # the binding's cleanup would only release the extra retain — leaking
+    # the underlying str (the original refcnt=1 from hl_net_lookup).
+    if name == "net_lookup" {
+        return true
+    }
     if name == "range" || name == "chr" {
         return true
     }
@@ -5064,12 +5242,22 @@ fn call_result_fresh(ctx: Ctx, e: int) -> bool {
     }
     if name == "str" {
         # str(x) is the identity for str arguments — the result's class
-        # follows the argument's.
+        # follows the argument's. For int/float/bool the codegen calls
+        # hl_str_from_int64 / hl_str_from_double / hl_str_from_bool, all
+        # of which return a FRESH str (refcnt=1, unowned) — so the result
+        # is fresh, matching the method forms int.to_str() / float.to_str()
+        # / bool.to_str() (see method_result_fresh). BUG (deep-scan-5):
+        # previously this returned `false` for the primitive cases, so
+        # `let s: str = str(5)` was emitted as
+        # `hl_retain(hl_str_from_int64(5))` — the retain was never
+        # released (the binding's cleanup decremented only the extra
+        # one), leaking one hl_str per call site on every iteration.
         let at: str = ctx.exprs[ctx.exprs[e].args.get(0)].t
         if at == "str" {
             return expr_fresh(ctx, ctx.exprs[e].args.get(0))
         }
-        return false
+        # int / float / bool -> str produces a fresh str.
+        return true
     }
     if name == "taint_mark" || name == "taint_unwrap" {
         return expr_fresh(ctx, ctx.exprs[e].args.get(0))
@@ -5256,6 +5444,12 @@ fn hoist_child(ctx: Ctx, c: int) -> void {
 # builtin_arg_borrowed: True when a builtin consumes its argument as a
 # borrow (no ownership transfer). Consume builtins (print family, I/O)
 # and identity builtins (str, taint_mark) transfer or pass through.
+# Stage 9 release (v0.20.0-alpha): net_lookup and proc_exec ALSO consume
+# their argument (they call hl_str_release on the host/cmd at the end).
+# If this returns true for them, the codegen hoists a fresh-expression
+# argument (e.g. `cmd + " " + ip`) into a temporary with cleanup, passes
+# the temporary directly to the builtin, and the cleanup releases it
+# AGAIN after the builtin has already released it → double-free.
 fn builtin_arg_borrowed(name: str) -> bool {
     if name == "println" || name == "print" || name == "panic" || name == "exit" {
         return false
@@ -5267,6 +5461,13 @@ fn builtin_arg_borrowed(name: str) -> bool {
         return false
     }
     if name == "str" || name == "taint_mark" || name == "taint_unwrap" {
+        return false
+    }
+    # Stage 9 release: net_lookup and proc_exec consume their argument
+    # (the C runtime releases the host/cmd after using it). Without this,
+    # `proc_exec(cmd + " " + ip)` would crash with "malloc(): unaligned
+    # tcache chunk detected" (double-free of the concat result).
+    if name == "net_lookup" || name == "proc_exec" {
         return false
     }
     # clone, len, int, float, and the rest borrow their arguments.
@@ -5637,6 +5838,29 @@ fn gen_call(ctx: Ctx, e: int) -> str {
         ctx.null_after.push(cn)
         return cn
     }
+    # ----- Stage 9 release (v0.20.0-alpha): Net / Rand / Proc builtins -----
+    # net_lookup(host: str) -> str — DNS A record lookup. The host
+    # argument is an owned str (consumed by the runtime helper).
+    if name == "net_lookup" {
+        return "hl_net_lookup(" + gen_own_arg(ctx, ctx.exprs[e].args.get(0)) + ")"
+    }
+    # rand_int(max: int) -> int — uniform random int in [0, max).
+    if name == "rand_int" {
+        return "hl_rand_int(" + args + ")"
+    }
+    # rand_float() -> float — uniform random float in [0.0, 1.0).
+    if name == "rand_float" {
+        return "hl_rand_float()"
+    }
+    # rand_seed(s: int) -> void — seed the PRNG.
+    if name == "rand_seed" {
+        return "hl_rand_seed(" + args + ")"
+    }
+    # proc_exec(cmd: str) -> int — run a shell command via system().
+    # The command is an owned str (consumed by the runtime helper).
+    if name == "proc_exec" {
+        return "hl_proc_exec(" + gen_own_arg(ctx, ctx.exprs[e].args.get(0)) + ")"
+    }
     panic("internal codegen error: unknown builtin function " + name)
     return ""
 }
@@ -5860,14 +6084,25 @@ fn gen_structlit(ctx: Ctx, e: int) -> str {
         fi = fi + 1
     }
     # For each remaining declared field with a default, evaluate the default
-    # (in the calling context) and pass it.
+    # (in the calling context) and pass it. The constructor stores its params
+    # raw, so the default must arrive OWNED: fresh defaults pass raw, but
+    # borrowed defaults (e.g. `args()` which returns the process-lifetime
+    # global list) must be retain-wrapped — otherwise the struct's release
+    # would decrement the global's refcount (BUG deep-scan-5: a default
+    # like `argv: list[str] = args()` used to silently release the global
+    # args list when the struct was dropped, freeing it for the rest of
+    # the program). Use own_wrap with the instantiated field type so the
+    # retain is balanced by the struct's release.
     let mut pi: int = provided.len()
     while pi < st.fields.len() {
         let dflt_idx: int = st.fdefaults.get(pi)
         if dflt_idx == -1 {
             panic("internal codegen error: missing required field " + st.fields.get(pi) + " in struct literal")
         }
-        parts.push(gen_expr(ctx, dflt_idx))
+        let dflt_ftype: str = instantiate_field_type(st, pi, t)
+        let dflt_c: str = gen_expr(ctx, dflt_idx)
+        let dflt_fresh: bool = expr_fresh(ctx, dflt_idx)
+        parts.push(own_wrap(ctx, dflt_ftype, dflt_c, dflt_fresh))
         pi = pi + 1
     }
     return ctor_name + "(" + join(parts, ", ") + ")"
@@ -5975,6 +6210,29 @@ fn gen_match_expr(ctx: Ctx, e: int) -> str {
     }
     let ename: str = type_base(scrut_t)
     let scrut_c: str = gen_expr(ctx, ctx.exprs[e].left)
+    # BUG (deep-scan-5): match arm bindings are scoped to the arm only
+    # (SPEC §5: "Pattern bindings in `match` arms introduce a new scope:
+    # each arm's bindings shadow the outer scope for the duration of that
+    # arm only"). Each arm binding becomes a C local declared inside the
+    # match's statement expression — it goes OUT of C scope when the
+    # statement expression exits. The codegen's `gen_locals` map is flat
+    # (HLS name -> latest C name) and doesn't track C scope, so without
+    # restoration, post-match references to an outer binding with the
+    # same name as an arm binding resolved to the arm's now-dead C name
+    # — producing `error: 'u_x_3' undeclared` from gcc. Snapshot
+    # `gen_locals` BEFORE the arm-binding loop and restore it AFTER, so
+    # post-match references resolve back to the outer binding's C name.
+    # (`gen_counts` is NOT restored — arm bindings still consumed unique
+    # counter values, so a later `let` with the same HLS name gets a
+    # fresh C name that does not collide with the arm's.)
+    let saved_locals: map[str, str] = map_new()
+    let saved_keys: list[str] = ctx.gen_locals.keys()
+    let mut si: int = 0
+    while si < saved_keys.len() {
+        let sk: str = saved_keys.get(si)
+        saved_locals.set(sk, ctx.gen_locals.get_or(sk, ""))
+        si = si + 1
+    }
     # The statement expression uses a tmp variable for the scrutinee.
     # Stage 8-beta: when the scrutinee is a FRESH value (call result,
     # literal, ...), this tmp owns it — a cleanup attribute releases it
@@ -6089,6 +6347,13 @@ fn gen_match_expr(ctx: Ctx, e: int) -> str {
         block.push("    hlc_m_r;")
     }
     block.push("})")
+    # BUG (deep-scan-5): restore gen_locals to the pre-match state so
+    # post-match references to outer bindings (that may have been
+    # shadowed by arm bindings) resolve back to the outer binding's
+    # C name. The arm bindings' C names went out of scope when the
+    # statement expression exited; without this restore, local_c(name)
+    # would return those dead names and gcc would fail.
+    ctx.gen_locals = saved_locals
     # Append the block to the output (as a multi-line statement expression
     # embedded in the surrounding expression). We need to return the joined
     # string for inline use. Statement expressions can span lines.
@@ -7230,7 +7495,7 @@ fn gen_program(ctx: Ctx) -> list[str] {
     #    -> bodies -> main
     let final: list[str] = []
     final.push("// =============================================================")
-    final.push("// C code generated BY hlc — the Hieu Louis compiler (HLS)")
+    final.push("// C code generated BY hlc — the Halis compiler (HLS)")
     final.push("// The HLS source is compiled by hlc itself (self-hosted).")
     final.push("// =============================================================")
     final.push("")
