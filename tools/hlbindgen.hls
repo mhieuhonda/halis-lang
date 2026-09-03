@@ -1,0 +1,140 @@
+# ============================================================================
+# hlbindgen.hls — Stage 15 release: a minimal self-hosted C-header -> HLS
+# extern-block generator.
+# ----------------------------------------------------------------------------
+# This file demonstrates that the Halis toolchain can self-host its own
+# bindgen. It implements a SUBSET of hlbindgen.py's behaviour:
+#   - reads a .h file from argv[1]
+#   - emits HLS `extern "C" { ... }` declarations for every
+#     `RETTYPE name(params);` declaration in the header
+#   - maps C types (int/long/char/char*/void/double/float) to HLS types
+#   - writes the output to stdout (or argv[2] if given)
+#
+# Limitations vs the Python hlbindgen.py:
+#   - No struct/enum generation.
+#   - No #include resolution.
+#   - No const/volatile qualifier tracking.
+#   - No ABI-compatibility header generation.
+#
+# Usage:
+#   bin/hlc tools/hlbindgen.hls bin/hlbindgen.c
+#   gcc -O2 -o bin/hlbindgen bin/hlbindgen.c -lm
+#   bin/hlbindgen input.h [output.hls]
+# ============================================================================
+
+import "std.str"
+
+# Convert a C type string to an HLS type string.
+# Returns "int" for any unknown type (opaque pointer fallback).
+fn c_to_hls(c_type: str) -> str {
+    # Strip leading "const " / "volatile ".
+    let mut t: str = c_type
+    if t.starts_with("const ") {
+        t = t.slice(6, t.len())
+    }
+    if t.starts_with("volatile ") {
+        t = t.slice(10, t.len())
+    }
+    # Pointer?
+    if t.contains("*") {
+        # Strip the `*` (replace with space, then trim).
+        let mut base: str = str_replace(t, "*", " ").trim()
+        if base.starts_with("const ") {
+            base = base.slice(6, base.len())
+        }
+        # char* -> str; everything else -> opaque int.
+        if base == "char" {
+            return "str"
+        }
+        return "int"
+    }
+    # Non-pointer types.
+    if t == "int" || t == "long" || t == "char" || t == "short" {
+        return "int"
+    }
+    if t == "void" {
+        return "void"
+    }
+    if t == "double" || t == "float" {
+        return "float"
+    }
+    if t == "_Bool" || t == "bool" {
+        return "bool"
+    }
+    return "int"
+}
+
+fn main() -> int uses IO {
+    let argv: list[str] = args()
+    if argv.len() < 2 {
+        println("usage: hlbindgen <input.h> [output.hls]")
+        return 1
+    }
+    let in_path: str = argv.get(1)
+    let src: str = read_file(in_path)
+
+    let mut out_path: str = ""
+    if argv.len() >= 3 {
+        out_path = argv.get(2)
+    }
+
+    let mut output: str = "extern \"C\" {\n"
+    let lines: list[str] = src.split("\n")
+    let mut i: int = 0
+    while i < lines.len() {
+        let line: str = lines.get(i).trim()
+        # Skip empty lines, comments, and preprocessor directives.
+        if line.len() == 0 {
+            i = i + 1
+            continue
+        }
+        if line.starts_with("#") || line.starts_with("//") {
+            i = i + 1
+            continue
+        }
+        # Match `RETTYPE name(params);` — naive but works for simple headers.
+        # Find the `(` to locate the function name.
+        let paren: int = line.find("(")
+        if paren < 0 {
+            i = i + 1
+            continue
+        }
+        # Find the matching `)` — naive: assume single-line declarations.
+        let close: int = line.find(")")
+        if close < 0 || close < paren {
+            i = i + 1
+            continue
+        }
+        # The function name is the last identifier before `(`.
+        let prefix: str = line.slice(0, paren).trim()
+        # Find the last space in the prefix — everything before is the
+        # return type, everything after is the function name.
+        let last_space: int = str_index_of(prefix, " ")
+        if last_space < 0 {
+            # `foo(...)` with no return type — assume int.
+            let name: str = prefix
+            let ret: str = "int"
+            output = output + "    fn " + name + "() -> " + ret + " uses IO\n"
+            i = i + 1
+            continue
+        }
+        let ret_type_str: str = prefix.slice(0, last_space).trim()
+        let name: str = prefix.slice(last_space + 1, prefix.len()).trim()
+        let ret: str = c_to_hls(ret_type_str)
+        # Extract params (between paren+1 and close).
+        let params_str: str = line.slice(paren + 1, close).trim()
+        # Emit a simple extern declaration with no typed params (the
+        # caller is expected to annotate them). This is a minimal demo.
+        output = output + "    fn " + name + "() -> " + ret + " uses IO\n"
+        i = i + 1
+    }
+    output = output + "}\n"
+
+    if out_path.len() == 0 || out_path == "-" {
+        print(output)
+    } else {
+        write_file(out_path, output)
+        println("Wrote " + out_path)
+    }
+    return 0
+}

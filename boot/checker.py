@@ -303,7 +303,12 @@ class Checker:
 
     # ---------- utilities ----------
     def err(self, msg, node):
-        raise HLError(msg, node.get("line", 0), 0)
+        # Deep-scan-7 fix: always pass col=0 to HLError, losing column
+        # information that the AST already carries. The lexer / parser
+        # report real columns; the checker should too. Use the node's
+        # `col` if present, else fall back to 0.
+        col = node.get("col", 0) if isinstance(node, dict) else 0
+        raise HLError(msg, node.get("line", 0) if isinstance(node, dict) else 0, col)
 
     def type_exists(self, t, node):
         if t in ("int", "float", "bool", "str"):
@@ -1138,6 +1143,46 @@ class Checker:
             if len(args) != len(fn["params"]):
                 self.err("function %s expects %d arguments, got %d"
                          % (name, len(fn["params"]), len(args)), e)
+            # Stage 15 release: ownership-across-boundary check.
+            # Extern fns cross the FFI boundary into C, where the C
+            # side may hold a pointer to the argument data after the
+            # call returns. The interpreter rejects complex types
+            # (list/map/struct/enum/tainted) at runtime — we mirror
+            # that here at check time so the user gets a clean error
+            # before the program runs.
+            #
+            # The `str` argument is the dangerous case: a C function
+            # like `system()` accepts a null-terminated C string, so
+            # a tainted[str] is a shell-injection vector. Reject any
+            # tainted argument to an extern fn as a soundness rule.
+            if fn.get("extern", False):
+                for i, (a, (pn, pt, _)) in enumerate(zip(args, fn["params"])):
+                    # The argument type is checked below in the
+                    # generic / non-generic loop. We do an EARLY
+                    # check here only for the tainted-wrap case so
+                    # we can produce a targeted error message before
+                    # the generic "expected X, got Y" error fires.
+                    at = self.check_expr(a, env, None)
+                    if at == "never":
+                        continue
+                    if is_taint(at):
+                        self.err(
+                            "extern call to '%s': argument %d ('%s') is "
+                            "tainted[%s] — passing tainted data across the "
+                            "FFI boundary is forbidden (C functions like "
+                            "system() can shell-inject; reject tainted "
+                            "values or sanitise before calling externs)"
+                            % (name, i + 1, pn, type_args(at)[0] if type_args(at) else "?"),
+                            a)
+                    # Reject any non-primitive type. Extern fns
+                    # support only int / float / bool / str.
+                    if pt not in ("int", "float", "bool", "str", "void"):
+                        self.err(
+                            "extern call to '%s': parameter '%s' has type "
+                            "%s — extern fn params must be int / float / "
+                            "bool / str (use a string-encoded form for "
+                            "complex data)" % (name, pn, pt),
+                            e)
             # Generic function: infer type args from argument types.
             typeparams = fn.get("typeparams", [])
             type_map = {}
@@ -1232,6 +1277,11 @@ class Checker:
             # panic is NOT a taint sink — panicking with a tainted message
             # is fine; panic is for programming bugs, not user output.
             argt(0, "str")
+            # Deep-scan-7 fix: add panic to the call-graph edges so the
+            # --audit output lists every function that calls panic()
+            # (useful for security audits — programs that panic in
+            # unexpected places warrant review).
+            self.edges[self.cur_fn].add("b:panic")
             return "never"
         if name == "exit":
             need(1)
