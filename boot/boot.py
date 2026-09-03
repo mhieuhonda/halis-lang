@@ -518,7 +518,8 @@ def print_opt_stats(program):
     print("  %-*s  %10d  %10d  %10d" % (
         name_w, "TOTAL", total_b, total_a, total_b - total_a))
     print("")
-    print("  Passes: constant_fold, copy_propagate, dead_code_elim")
+    print("  Passes: constant_fold, copy_propagate, dead_code_elim,")
+    print("          inline_small, licm")
     print("  (run -O fast for additional safe-arithmetic annotations)")
     return 0
 

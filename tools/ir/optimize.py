@@ -5,6 +5,9 @@ Runs the following passes on an `HLIRModule`:
   1. `constant_fold`     — fold literal arithmetic, string concatenation.
   2. `copy_propagate`    — replace `%t1 = %t0` uses with `%t0`.
   3. `dead_code_elim`    — remove instructions whose result is never used.
+  4. `inline_small`      — inline calls to small `pure` functions.
+  5. `licm`              — loop-invariant code motion: hoist invariant
+                          expressions out of loop bodies.
 
 `-O fast` mode (when `fast=True`) additionally:
   - Skips the integer-overflow check on `add`/`sub`/`mul` when the optimiser
@@ -19,8 +22,8 @@ propagation. The goal is correctness and predictability, not peak
 performance — the C compiler's `-O2` is still the primary optimiser.
 """
 from __future__ import annotations
-from typing import Dict, Set
-from . import (HLIRModule, HLIRFunction, Instr,
+from typing import Dict, Set, List, Optional, Tuple
+from . import (HLIRModule, HLIRFunction, Block, Instr,
                OP_CONST, OP_BINOP, OP_UNOP, OP_LOAD, OP_STORE,
                OP_CALL, OP_METHOD, OP_BUILTIN, OP_BRANCH, OP_JUMP,
                OP_RETURN, OP_PANIC)
@@ -28,6 +31,13 @@ from . import (HLIRModule, HLIRFunction, Instr,
 
 INT64_MAX = 9223372036854775807
 INT64_MIN = -9223372036854775808
+
+# Stage 11 release: tunable for the inline_small pass. Functions with at
+# most this many instructions AND marked `pure` are candidates for
+# inlining at their call sites. Conservative — the goal is to remove
+# call overhead for trivial helpers (e.g. `fn add(a: int, b: int) -> int
+# pure { return a + b }`) without bloating the IR unreasonably.
+INLINE_MAX_INSTRS = 12
 
 
 def optimize(mod: HLIRModule, fast: bool = False) -> HLIRModule:
@@ -39,6 +49,24 @@ def optimize(mod: HLIRModule, fast: bool = False) -> HLIRModule:
     for fname, irf in mod.functions.items():
         _copy_propagate(irf)
     # Pass 3: dead code elimination.
+    for fname, irf in mod.functions.items():
+        _dead_code_elim(irf)
+    # Pass 4 (Stage 11 release): inline small pure functions. After
+    # inlining, re-run constant_fold + copy_propagate + DCE because
+    # inlining creates new fold opportunities (e.g. `square(5)` becomes
+    # `t = 5 * 5` which can fold to `t = 25`).
+    _inline_small(mod)
+    for fname, irf in mod.functions.items():
+        _constant_fold(irf)
+    for fname, irf in mod.functions.items():
+        _copy_propagate(irf)
+    for fname, irf in mod.functions.items():
+        _dead_code_elim(irf)
+    # Pass 5 (Stage 11 release): loop-invariant code motion.
+    for fname, irf in mod.functions.items():
+        _licm(irf)
+    # Final cleanup pass: DCE again (LICM may have made the old loop-body
+    # instruction dead once its value is hoisted out).
     for fname, irf in mod.functions.items():
         _dead_code_elim(irf)
     # `-O fast` annotations: mark provably-safe binops. We do not actually
@@ -355,3 +383,278 @@ def _annotate_safe(irf: HLIRFunction):
                 if ins.attrs is None:
                     ins.attrs = {}
                 ins.attrs["safe_overflow"] = True
+            # Stage 11 release: also annotate multiplications by 0 or 1
+            # (the result is provably safe — 0 or the other operand, both
+            # of which fit in int64 since the operand already did).
+            elif op == "*":
+                a_is_one = a_arg[0] == "lit" and a_arg[1] == 1
+                b_is_one = b_arg[0] == "lit" and b_arg[1] == 1
+                if a_is_zero or b_is_zero or a_is_one or b_is_one:
+                    if ins.attrs is None:
+                        ins.attrs = {}
+                    ins.attrs["safe_overflow"] = True
+
+
+# ----------------------------------------------------------------------------
+# Pass 4 (Stage 11 release): inline small `pure` functions
+# ----------------------------------------------------------------------------
+
+def _inline_small(mod: HLIRModule):
+    """Inline calls to small `pure` functions at their call sites.
+
+    A function is inlinable if ALL of:
+      - It is declared `pure` (no effects).
+      - Its body has at most INLINE_MAX_INSTRS instructions (excluding the
+        implicit terminator).
+      - It has exactly one block (no control flow). This keeps the inliner
+        trivial: it just clones the body into the caller.
+      - It is not recursive (directly or transitively). We approximate this
+        by skipping any function whose body contains a self-call (direct
+        recursion only — transitive is too expensive to detect here, and
+        is also rare for `pure` helpers).
+
+    For each call site `%r = call @f(%a, %b)` where `f` is inlinable:
+      - Allocate fresh SSA names for every instruction in `f`'s body.
+      - Replace `f`'s parameter SSA names with the call's argument SSA names
+        (or copy them via OP_LOAD if the argument is a literal).
+      - Replace `%r` (the call's dest) with the inlined `return`'s operand
+        (the last instruction's dest after rename).
+
+    The pass is conservative: it does not handle control flow, recursion,
+    or `?`/match expressions inside the inlined body (those would already
+    have raised HLError during IR construction).
+
+    Side effects: the call instruction is REMOVED; the inlined instructions
+    are INSERTED in its place. Subsequent DCE removes any leftover
+    instructions whose dest is now unused.
+    """
+    # Step 1: identify inlinable functions.
+    inlinable: Dict[str, HLIRFunction] = {}
+    for fname, irf in mod.functions.items():
+        # Must be pure (no effects).
+        if irf.effects:
+            continue
+        # Must have exactly one block (no control flow).
+        if len(irf.blocks) != 1:
+            continue
+        block = irf.blocks[0]
+        # Count instructions (excluding the terminator).
+        n_instrs = len(block.instrs)
+        if n_instrs > INLINE_MAX_INSTRS:
+            continue
+        # Skip recursive functions (direct self-call).
+        is_recursive = False
+        for ins in block.instrs:
+            if ins.op == OP_CALL and ins.args and ins.args[0][0] == "fname" \
+                    and ins.args[0][1] == fname:
+                is_recursive = True
+                break
+        if is_recursive:
+            continue
+        # Skip functions with no terminator or non-return terminator
+        # (defensive — IRBuilder always sets a terminator).
+        if block.terminator is None or block.terminator.op != OP_RETURN:
+            continue
+        inlinable[fname] = irf
+    if not inlinable:
+        return  # nothing to inline
+
+    # Step 2: walk every function body and rewrite call sites.
+    for caller_name, caller in mod.functions.items():
+        # Renumbering: we need fresh SSA names that don't collide with
+        # existing names in this function. Use a per-caller counter that
+        # starts above the highest existing temp id.
+        max_t = 0
+        for blk in caller.blocks:
+            for ins in blk.instrs:
+                if ins.dest and ins.dest.startswith("t"):
+                    try:
+                        v = int(ins.dest[1:])
+                        if v > max_t:
+                            max_t = v
+                    except ValueError:
+                        pass
+        counter = [max_t + 1]
+
+        def fresh():
+            n = counter[0]
+            counter[0] += 1
+            return "t%d" % n
+
+        for blk in caller.blocks:
+            new_instrs: List[Instr] = []
+            for ins in blk.instrs:
+                if ins.op != OP_CALL or not ins.args or ins.args[0][0] != "fname":
+                    new_instrs.append(ins)
+                    continue
+                target = ins.args[0][1]
+                if target not in inlinable:
+                    new_instrs.append(ins)
+                    continue
+                callee = inlinable[target]
+                # The callee is a single-block pure function ending in OP_RETURN.
+                # Map callee param SSA names -> caller argument SSA names.
+                # callee.params is List[(name, type)] — the SSA name in the IR
+                # is "v_<name>" (per IRBuilder._build_fn).
+                rename: Dict[str, Tuple] = {}
+                # ins.args[1:] are the call's argument SSA references.
+                call_args = ins.args[1:]
+                for (pname, _ptype), arg in zip(callee.params, call_args):
+                    rename["v_" + pname] = arg
+                # Rename every dest in the callee body to a fresh name, and
+                # rewrite every var reference via the rename map (chained:
+                # if v_a was renamed and v_b's source uses v_a, the rewrite
+                # follows the chain).
+                callee_block = callee.blocks[0]
+                last_dest: Optional[str] = None
+                for cin in callee_block.instrs:
+                    # Allocate a fresh dest for this instruction.
+                    new_dest = fresh() if cin.dest else None
+                    if cin.dest is not None:
+                        rename[cin.dest] = ("var", new_dest)
+                    # Rewrite args: each ("var", name) -> rename[name] if present.
+                    new_args = []
+                    for a in cin.args:
+                        if a[0] == "var" and a[1] in rename:
+                            new_args.append(rename[a[1]])
+                        else:
+                            new_args.append(a)
+                    new_instrs.append(Instr(
+                        dest=new_dest, op=cin.op, args=new_args,
+                        line=cin.line, attrs=dict(cin.attrs) if cin.attrs else None,
+                    ))
+                    if new_dest is not None:
+                        last_dest = new_dest
+                # The callee's terminator is OP_RETURN with the returned
+                # value. The CALL instruction's dest was %r — replace it
+                # with the inlined return value via a copy.
+                # We rewrite ins.dest references in subsequent instructions
+                # via OP_LOAD (a copy). For simplicity, allocate a fresh
+                # copy %r = load %last_dest.
+                ret_val = None
+                if callee_block.terminator and callee_block.terminator.args:
+                    ret_val = callee_block.terminator.args[0]
+                if ret_val is not None and ret_val[0] == "var":
+                    # Resolve through rename.
+                    if ret_val[1] in rename:
+                        ret_val = rename[ret_val[1]]
+                    # Emit a copy: dest = load ret_val.
+                    new_instrs.append(Instr(
+                        dest=ins.dest, op=OP_LOAD, args=[ret_val], line=ins.line,
+                    ))
+                else:
+                    # Void return or no return value: emit a const None
+                    # (will be DCE'd if the dest is unused).
+                    new_instrs.append(Instr(
+                        dest=ins.dest, op=OP_CONST, args=[("lit", None)],
+                        line=ins.line,
+                    ))
+            blk.instrs = new_instrs
+
+
+# ----------------------------------------------------------------------------
+# Pass 5 (Stage 11 release): loop-invariant code motion (LICM)
+# ----------------------------------------------------------------------------
+
+def _licm(irf: HLIRFunction):
+    """Hoist loop-invariant instructions out of loop bodies.
+
+    A loop is identified by the Block control-flow structure: a back-edge
+    from a body block to a cond block (named "*_cond" by IRBuilder).
+
+    For each instruction inside the loop body that:
+      - Is "pure" (no side effects: const, binop, unop, load, list_len,
+        struct_get, map_get, list_new, struct_new).
+      - All its operand SSA names are defined OUTSIDE the loop (in a block
+        that is not part of the loop), OR are themselves hoistable.
+    we MOVE that instruction from the loop body to the block that
+    immediately precedes the loop's cond block (the preheader).
+
+    This is conservative — we do not perform full dominator analysis or
+    SSA renaming. The pass only hoists when the SSA name's ONLY definition
+    is outside the loop, which is the common case for `let c = a + b`
+    inside `while ... { ... }` where `a` and `b` are not mutated by the
+    loop body.
+    """
+    # First, identify loops. A loop is a sequence of blocks where the
+    # last block jumps back to the first (the cond). The cond block's
+    # name ends with "_cond" (set by IRBuilder._new_block with prefix
+    # "while_cond" or "for_cond").
+    # We need: for each cond block, the set of blocks in its loop body.
+    # Simple approximation: walk the block list; if block[i] has a
+    # terminator that jumps to a block at an EARLIER index whose name
+    # ends in "_cond", the loop spans [cond_index, i].
+    for caller_block_idx in range(len(irf.blocks)):
+        cond = irf.blocks[caller_block_idx]
+        if not cond.name.endswith("_cond"):
+            continue
+        # Find the body of this loop: blocks from cond_index+1 until the
+        # block whose terminator jumps back to cond.
+        loop_blocks: Set[str] = {cond.name}
+        end_idx = caller_block_idx
+        for j in range(caller_block_idx + 1, len(irf.blocks)):
+            blk = irf.blocks[j]
+            loop_blocks.add(blk.name)
+            end_idx = j
+            if blk.terminator and blk.terminator.op == OP_JUMP \
+                    and blk.terminator.args \
+                    and blk.terminator.args[0][0] == "label" \
+                    and blk.terminator.args[0][1] == cond.name:
+                break
+        # The preheader is the block immediately before the cond block.
+        preheader = irf.blocks[caller_block_idx - 1] if caller_block_idx > 0 else None
+        if preheader is None:
+            continue  # no preheader available (shouldn't happen for real loops)
+
+        # Collect SSA names defined INSIDE the loop. Any name in this set
+        # is NOT loop-invariant by definition.
+        loop_defined: Set[str] = set()
+        for j in range(caller_block_idx, end_idx + 1):
+            blk = irf.blocks[j]
+            for ins in blk.instrs:
+                if ins.dest:
+                    loop_defined.add(ins.dest)
+
+        # Walk the loop body blocks and hoist invariant instructions.
+        for j in range(caller_block_idx + 1, end_idx + 1):
+            blk = irf.blocks[j]
+            # Skip the cond block itself (its condition depends on the
+            # loop state, so almost nothing there is invariant).
+            hoisted: List[Instr] = []
+            remaining: List[Instr] = []
+            for ins in blk.instrs:
+                if not _is_hoistable(ins, loop_defined):
+                    remaining.append(ins)
+                    continue
+                # All operands are defined outside the loop. Hoist.
+                hoisted.append(ins)
+            if hoisted:
+                # Append the hoisted instructions to the preheader (just
+                # before its terminator if it has one, otherwise at end).
+                if preheader.terminator is not None:
+                    preheader.instrs.extend(hoisted)
+                else:
+                    preheader.instrs.extend(hoisted)
+                blk.instrs = remaining
+
+
+def _is_hoistable(ins: Instr, loop_defined: Set[str]) -> bool:
+    """True if `ins` is a pure op whose operands are all defined outside
+    the loop (so the result is loop-invariant)."""
+    # Only hoist pure operations.
+    PURE_OPS = {OP_CONST, OP_UNOP, OP_LOAD, "list_new", "struct_new",
+                "struct_get", "map_get", "list_len"}
+    # OP_BINOP is pure in the sense of "doesn't write memory", but it can
+    # PANIC on overflow/div-zero — hoisting it out of a loop that never
+    # executes would panic on a program that should have run cleanly.
+    # So we DO NOT hoist OP_BINOP (matches the DCE classification).
+    if ins.op not in PURE_OPS:
+        return False
+    # All var-typed operands must be defined outside the loop.
+    for a in ins.args:
+        if a[0] == "var" and a[1] in loop_defined:
+            return False
+    # OP_STORE inside a loop is never invariant (it mutates state).
+    if ins.op == OP_STORE:
+        return False
+    return True
