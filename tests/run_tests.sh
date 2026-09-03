@@ -22,7 +22,7 @@ bad()  { FAIL=$((FAIL+1)); echo "  [FAIL] $1"; }
 echo "=== 1. Stage-0: valid programs ==="
 for f in tests/ok/*.hls; do
     name=$(basename "$f" .hls)
-    out=$(python3 boot/boot.py "$f" 2>/dev/null); code=$?
+    out=$(python3 boot/boot.py "$f" </dev/null 2>/dev/null); code=$?
     if [ $code -eq 0 ] || [ $code -eq 101 ]; then
         snap="tests/snapshots/$name.txt"
         if [ -f "$snap" ] && [ "$out" != "$(cat "$snap")" ]; then
@@ -49,7 +49,11 @@ done
 echo "=== 3. Self-compile + differential testing (interpreter vs native) ==="
 for f in tests/ok/*.hls; do
     name=$(basename "$f" .hls)
-    interp_out=$(python3 boot/boot.py "$f" 2>/dev/null); interp_code=$?
+    # Stage 10 release: redirect stdin from /dev/null so tests that use
+    # read_line() don't hang waiting for input. The interpreter reads
+    # EOF (returns empty tainted[str]); the native binary does the same
+    # — the differential test still compares apples to apples.
+    interp_out=$(python3 boot/boot.py "$f" </dev/null 2>/dev/null); interp_code=$?
     if ! python3 boot/boot.py src/hlc.hls "$f" "$TMP/$name.c" >/dev/null 2>&1; then
         bad "$name (hlc compile failed)"
         continue
@@ -58,7 +62,7 @@ for f in tests/ok/*.hls; do
         bad "$name (gcc error)"
         continue
     fi
-    nat_out=$("$TMP/$name.bin" 2>/dev/null); nat_code=$?
+    nat_out=$("$TMP/$name.bin" </dev/null 2>/dev/null); nat_code=$?
     if [ "$interp_out" == "$nat_out" ] && [ "$interp_code" == "$nat_code" ]; then
         ok "$name (native matches interpreter)"
     else

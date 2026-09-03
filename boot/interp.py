@@ -9,12 +9,65 @@ Runtime values:
 """
 import ctypes
 import math
+import os
 import sys
 import time
 
 INT64_MIN = -(2 ** 63)
 INT64_MAX = 2 ** 63 - 1
 B_LOW = bytes(range(0x21))  # bytes <= 0x20 used by trim
+
+# Stage 10 release: process-global sandbox root. When non-None, all
+# filesystem builtins (read_file, read_file_tainted, write_file,
+# file_exists) reject any path that does not resolve INSIDE this
+# directory. The sandbox is set via boot.py --sandbox DIR. The C
+# runtime mirrors this with hl_set_sandbox_root().
+SANDBOX_ROOT = None
+
+
+def _set_sandbox_root(path):
+    """Set the process-global sandbox root. Called by boot.py --sandbox."""
+    global SANDBOX_ROOT
+    if path is None:
+        SANDBOX_ROOT = None
+        return
+    # Canonicalise to an absolute, symlink-resolved path so that
+    # ../escape attempts are caught after resolution (NOT before,
+    # which would still allow the symlink to point outside).
+    SANDBOX_ROOT = os.path.realpath(path)
+
+
+def _sandbox_check(path_bytes):
+    """If SANDBOX_ROOT is set, verify that `path_bytes` resolves inside
+    the sandbox. Raises HLPanic with a clean message otherwise.
+
+    The check is performed AFTER realpath resolution, so paths like
+    "../etc/passwd" or symlinks pointing outside the sandbox are
+    rejected. We DO allow the path to NOT exist (e.g. file_exists
+    probing) — we just check that IF it existed, it would be inside
+    the sandbox.
+    """
+    if SANDBOX_ROOT is None:
+        return
+    # bytes -> str (the path was passed as HLS str = bytes).
+    p = path_bytes.decode("utf-8", "replace") if isinstance(path_bytes, bytes) else str(path_bytes)
+    if not os.path.isabs(p):
+        p = os.path.join(os.getcwd(), p)
+    # realpath resolves symlinks; if the path does not exist, it
+    # resolves as far as possible (the existing prefix) and leaves
+    # the rest verbatim. That is enough: if any component of the
+    # existing prefix points outside the sandbox, we reject.
+    resolved = os.path.realpath(p)
+    # Common-prefix check: SANDBOX_ROOT must be a prefix of `resolved`,
+    # AND the character after the prefix must be a separator (or end
+    # of string) — otherwise "/sandbox_evil" would be allowed inside
+    # "/sandbox".
+    sb = SANDBOX_ROOT
+    if resolved == sb:
+        return
+    if not resolved.startswith(sb + os.sep):
+        raise HLPanic("sandbox violation: path '%s' resolves outside the sandbox"
+                      % to_display(path_bytes), 0)
 
 
 class HLPanic(Exception):
@@ -656,6 +709,7 @@ class Interp:
         if name == "map_new":
             return {}
         if name == "read_file":
+            _sandbox_check(args[0])
             try:
                 with open(args[0], "rb") as f:
                     return f.read()
@@ -665,13 +719,28 @@ class Interp:
         # the returned str is wrapped as tainted[str]. The wrapper dict
         # format is identical to taint_mark's output.
         if name == "read_file_tainted":
+            _sandbox_check(args[0])
             try:
                 with open(args[0], "rb") as f:
                     content = f.read()
                 return {"tainted": True, "value": content}
             except OSError:
                 raise HLPanic("cannot open file: %s" % to_display(args[0]), line)
+        # Stage 10 release: read_line() -> tainted[str] — third taint source.
+        # Reads one line from stdin (newline stripped). The result is always
+        # tainted because stdin is untrusted input. EOF returns an empty
+        # tainted string (mirrors fgets() semantics in the C runtime).
+        if name == "read_line":
+            raw = sys.stdin.buffer.readline()
+            # Strip a trailing newline (matches the C runtime's hl_read_line).
+            if raw.endswith(b"\n"):
+                raw = raw[:-1]
+                # Also strip a trailing \r if present (CRLF line endings).
+                if raw.endswith(b"\r"):
+                    raw = raw[:-1]
+            return {"tainted": True, "value": raw}
         if name == "write_file":
+            _sandbox_check(args[0])
             try:
                 with open(args[0], "wb") as f:
                     f.write(args[1])
@@ -693,6 +762,7 @@ class Interp:
             return int(time.monotonic() * 1000)
         if name == "file_exists":
             import os
+            _sandbox_check(args[0])
             return os.path.isfile(args[0].decode("utf-8", "replace"))
         # ----- Stage 8-alpha: ownership primitives -----
         # drop(x): semantically releases x. In Stage-0 (Python), the underlying

@@ -175,6 +175,11 @@ BUILTIN_FNS = {
     "tainted_args", "taint_mark", "taint_unwrap",
     # Stage 10-beta: more taint sources (v0.8.0-alpha)
     "read_file_tainted",
+    # Stage 10 release: read_line — third taint source (stdin). Treats
+    # any input read from stdin as untrusted by default, mirroring argv
+    # and read_file_tainted. The program must sanitise before passing
+    # the value to any sink.
+    "read_line",
     # Stage 9 release (v0.20.0-alpha): Net / Rand / Proc builtins.
     "net_lookup", "rand_int", "rand_float", "rand_seed", "proc_exec",
 }
@@ -205,6 +210,9 @@ BUILTIN_EFFECTS = {
     # Stage 10-beta: read_file_tainted carries the Fs effect (same as
     # read_file) and returns a tainted[str].
     "read_file_tainted": {"Fs"},
+    # Stage 10 release: read_line carries the IO effect (reads from stdin)
+    # and returns a tainted[str]. This is the third taint source.
+    "read_line": {"IO"},
     # taint_mark / taint_unwrap are pure (no side effect; just wrap/unwrap).
     # Stage 9 release: Net / Rand / Proc builtins.
     "net_lookup":  {"Net"},
@@ -1247,6 +1255,14 @@ class Checker:
             need(1)
             reject_tainted_at_sink(0, "str")
             self.edges[self.cur_fn].add("b:read_file_tainted")
+            return "tainted[str]"
+        # Stage 10 release: read_line() -> tainted[str] — the third taint
+        # source. Reads a single line from stdin (up to and including the
+        # newline, which is stripped). The result is always tainted because
+        # stdin is untrusted input. Carries the IO effect.
+        if name == "read_line":
+            need(0)
+            self.edges[self.cur_fn].add("b:read_line")
             return "tainted[str]"
         if name == "write_file":
             need(2)

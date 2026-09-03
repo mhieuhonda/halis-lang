@@ -166,6 +166,7 @@ def run_cli():
     emit_llvm = False      # Stage 12 (v0.10.0-alpha): print LLVM IR text
     opt_stats = False      # Stage 11: print optimiser statistics
     target_triple = None   # Stage 12: --target <triple>
+    sandbox_dir = None     # Stage 10 release: --sandbox DIR restricts FS builtins
     # BUG (deep-scan-5): remove() only deleted the FIRST occurrence — a
     # duplicated flag (e.g. `--check --check f.hls`) leaked the stray copy
     # into the filename argument. Strip ALL occurrences of each flag.
@@ -197,6 +198,18 @@ def run_cli():
         else:
             sys.stderr.write("error: --target expects a triple\n")
             return 2
+    # Stage 10 release: --sandbox DIR — restrict filesystem builtins
+    # (read_file, read_file_tainted, write_file, file_exists) to DIR.
+    # Both the interpreter and the C runtime enforce this. Extern "C"
+    # blocks are rejected under sandbox mode (they bypass the sandbox).
+    if "--sandbox" in args:
+        i = args.index("--sandbox")
+        if i + 1 < len(args):
+            sandbox_dir = args[i + 1]
+            del args[i:i + 2]
+        else:
+            sys.stderr.write("error: --sandbox expects a directory\n")
+            return 2
     # BUG-025 fix: --check and --audit are mutually exclusive — error out
     # explicitly rather than silently preferring one over the other.
     mutually_exclusive = sum([check_only, audit_only, emit_ir, emit_llvm, opt_stats])
@@ -207,13 +220,14 @@ def run_cli():
     if not args:
         sys.stderr.write(
             "usage: boot.py [--check | --audit | --emit ir | --emit llvm | --opt-stats]\n"
-            "               [--target <triple>] <file.hls> [program args...]\n"
+            "               [--target <triple>] [--sandbox DIR] <file.hls> [program args...]\n"
             "  --check        type-check + effects-check only, no execution.\n"
             "  --audit        print the capability / effect tree of every function.\n"
             "  --emit ir      print the HLIR (Stage 11) of every function.\n"
             "  --emit llvm    print the LLVM IR (Stage 12) of every function.\n"
             "  --opt-stats    run the Stage 11 optimiser, print per-pass stats.\n"
             "  --target TRIPLE  set the LLVM target triple (e.g. aarch64-linux).\n"
+            "  --sandbox DIR     restrict filesystem builtins to DIR (Stage 10).\n"
         )
         return 2
     path = args[0]
@@ -231,6 +245,20 @@ def run_cli():
     except HLError as ex:
         sys.stderr.write("compile error: %s\n" % ex)
         return 1
+    # Stage 10 release: sandbox mode rejects `extern "C"` blocks. Extern
+    # blocks can call libc directly (fopen, system, execve, socket) which
+    # bypasses the sandbox entirely. We refuse to compile such programs
+    # under --sandbox to keep the sandbox guarantee sound.
+    if sandbox_dir is not None:
+        if program.get("externs"):
+            sys.stderr.write(
+                "error: --sandbox is incompatible with `extern \"C\"` blocks "
+                "(extern can call libc directly, bypassing the sandbox)\n")
+            return 1
+        # Validate the sandbox dir exists and is a directory.
+        if not os.path.isdir(sandbox_dir):
+            sys.stderr.write("error: --sandbox: not a directory: %s\n" % sandbox_dir)
+            return 2
     if audit_only:
         print_audit(program, checker)
         return 0
@@ -243,6 +271,21 @@ def run_cli():
     if check_only:
         sys.stdout.write("OK: types and effects valid\n")
         return 0
+    # Stage 10 release: install the sandbox root before running the
+    # interpreter. The interpreter's filesystem builtins consult
+    # SANDBOX_ROOT before each open/access. Also export the sandbox dir
+    # as HLS_SANDBOX_ROOT so any subprocess (e.g. a sandboxed native
+    # binary the program might spawn via proc_exec) inherits the gate.
+    if sandbox_dir is not None:
+        from boot.interp import _set_sandbox_root
+        _set_sandbox_root(sandbox_dir)
+        # Canonicalise to absolute (matches _set_sandbox_root's realpath).
+        sb_canonical = os.path.realpath(sandbox_dir)
+        os.environ["HLS_SANDBOX_ROOT"] = sb_canonical
+    else:
+        from boot.interp import _set_sandbox_root
+        _set_sandbox_root(None)
+        os.environ.pop("HLS_SANDBOX_ROOT", None)
     interp = Interp(program, prog_args, sys.stdout.buffer)
     return interp.run()
 
@@ -309,7 +352,8 @@ def print_audit(program, checker):
     # also taint sinks (passing a tainted host is a DNS rebinding
     # vector; passing a tainted command is a shell-injection vector).
     print("")
-    print("  Taint sources (builtins):  tainted_args, read_file_tainted")
+    print("  Taint sources (builtins):  tainted_args, read_file_tainted,")
+    print("                              read_line")
     print("  Taint sinks (builtins):    print, println, read_file,")
     print("                            write_file, file_exists, exit,")
     print("                            net_lookup, proc_exec")
@@ -336,16 +380,25 @@ def print_audit(program, checker):
     #     write_file, file_exists, exit)
     #   - functions calling taint_unwrap (the escape hatch)
     rft_users = []
+    rl_users = []
     for key, fn in fns.items():
         callees = checker.edges.get(key, set())
         if "b:read_file_tainted" in callees:
             rft_users.append(key)
+        if "b:read_line" in callees:
+            rl_users.append(key)
     if rft_users:
         print("  Functions calling read_file_tainted():")
         for k in rft_users:
             print("    - " + k)
     else:
         print("  No function calls read_file_tainted().")
+    if rl_users:
+        print("  Functions calling read_line():")
+        for k in rl_users:
+            print("    - " + k)
+    else:
+        print("  No function calls read_line().")
 
     # Taint sinks: which functions call each sink?
     # Stage 9 release (v0.20.0-alpha): net_lookup and proc_exec are

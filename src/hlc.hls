@@ -1612,6 +1612,8 @@ fn is_builtin_fn(n: str) -> bool {
         || n == "tainted_args" || n == "taint_mark" || n == "taint_unwrap"
         # Stage 10-beta: more taint sources
         || n == "read_file_tainted"
+        # Stage 10 release: read_line — third taint source (stdin)
+        || n == "read_line"
         # Stage 9 release (v0.20.0-alpha): Net / Rand / Proc builtins
         || n == "net_lookup" || n == "rand_int" || n == "rand_float"
         || n == "rand_seed" || n == "proc_exec"
@@ -1882,6 +1884,11 @@ fn builtin_effect(name: str) -> list[str] {
     # Stage 10-beta: read_file_tainted is a taint source with the Fs effect.
     if name == "read_file_tainted" {
         return ["Fs"]
+    }
+    # Stage 10 release: read_line is a taint source with the IO effect
+    # (reads from stdin; stdin is untrusted input).
+    if name == "read_line" {
+        return ["IO"]
     }
     if name == "clock_ms" {
         return ["Clock"]
@@ -3131,6 +3138,17 @@ fn check_builtin_call(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, 
         add_edge(ctx, cur, "b:read_file_tainted")
         return "tainted[str]"
     }
+    # Stage 10 release: read_line() -> tainted[str] — third taint source.
+    # Reads a single line from stdin (newline stripped); the result is
+    # always tainted because stdin is untrusted input. Carries the IO
+    # effect (same family as print/println).
+    if name == "read_line" {
+        if nargs != 0 {
+            cerr(line, "read_line() takes no arguments")
+        }
+        add_edge(ctx, cur, "b:read_line")
+        return "tainted[str]"
+    }
     if name == "write_file" {
         if nargs != 2 || argt.get(0) != "str" || argt.get(1) != "str" {
             cerr(line, "write_file() expects 2 str arguments")
@@ -4141,6 +4159,70 @@ fn runtime_lines() -> list[str] {
     r.push("    exit(101);")
     r.push("}")
     r.push("")
+    # Stage 10 release: the runtime position-aware panic. Used by codegen
+    # for panic() calls and arithmetic overflow checks (planned for Stage 11
+    # release; currently emitted by gen_call's panic path and gen_bin's
+    # overflow helpers when --opt fast is in effect).
+    r.push("static void hl_die_at(const char* msg, const char* file, int64_t line) {")
+    r.push("    fflush(stdout);")
+    r.push("    if (file && line > 0) {")
+    r.push("        fprintf(stderr, \"panic: %s (at %s:%lld)\\n\", msg, file, (long long)line);")
+    r.push("    } else {")
+    r.push("        fprintf(stderr, \"panic: %s\\n\", msg);")
+    r.push("    }")
+    r.push("    exit(101);")
+    r.push("}")
+    r.push("")
+    # Stage 10 release: sandbox root. When non-NULL, every filesystem
+    # builtin (hl_read_file, hl_write_file, hl_file_exists) refuses to
+    # touch any path that does not resolve INSIDE this directory. The
+    # sandbox is set at program startup via hl_set_sandbox_root() —
+    # boot.py --sandbox DIR emits the call in main().
+    r.push("static char* hl_sandbox_root = NULL;")
+    r.push("static void hl_set_sandbox_root(const char* dir) {")
+    r.push("    if (hl_sandbox_root) { free(hl_sandbox_root); hl_sandbox_root = NULL; }")
+    r.push("    if (dir) {")
+    r.push("        // Canonicalise via realpath so symlink escapes are caught.")
+    r.push("        char buf[4096];")
+    r.push("        char* rp = realpath(dir, buf);")
+    r.push("        if (rp) hl_sandbox_root = strdup(rp);")
+    r.push("    }")
+    r.push("}")
+    r.push("")
+    # Stage 10 release: hl_sandbox_check(path) — refuse to touch paths
+    # outside the sandbox root. Mirrors the interpreter's _sandbox_check.
+    # Resolves symlinks via realpath so ../../etc/passwd attacks fail.
+    r.push("static void hl_sandbox_check(const char* path) {")
+    r.push("    if (!hl_sandbox_root) return;")
+    r.push("    char buf[4096];")
+    r.push("    char* rp = realpath(path, buf);")
+    r.push("    // If realpath fails, the path doesn't exist yet (e.g. a write_file")
+    r.push("    // target). Resolve the parent directory and check it.")
+    r.push("    if (!rp) {")
+    r.push("        // Find the last path separator and resolve the parent.")
+    r.push("        char tmp[4096];")
+    r.push("        strncpy(tmp, path, sizeof(tmp) - 1);")
+    r.push("        tmp[sizeof(tmp) - 1] = 0;")
+    r.push("        size_t L = strlen(tmp);")
+    r.push("        while (L > 0 && tmp[L-1] != '/' && tmp[L-1] != '\\\\') {")
+    r.push("            tmp[--L] = 0;")
+    r.push("        }")
+    r.push("        if (L == 0) { strcpy(tmp, \".\"); L = 1; }")
+    r.push("        char pbuf[4096];")
+    r.push("        char* pp = realpath(tmp, pbuf);")
+    r.push("        if (!pp) hl_die(\"sandbox violation: cannot resolve path\");")
+    r.push("        // Re-append the basename.")
+    r.push("        snprintf(buf, sizeof(buf), \"%s%s\", pp, path + L);")
+    r.push("    }")
+    r.push("    // Common-prefix check with a separator after the prefix.")
+    r.push("    size_t sb_len = strlen(hl_sandbox_root);")
+    r.push("    if (strncmp(buf, hl_sandbox_root, sb_len) != 0)")
+    r.push("        hl_die(\"sandbox violation: path resolves outside the sandbox\");")
+    r.push("    char next = buf[sb_len];")
+    r.push("    if (next != 0 && next != '/')")
+    r.push("        hl_die(\"sandbox violation: path resolves outside the sandbox\");")
+    r.push("}")
+    r.push("")
     r.push("// ---- Stage 8-beta: reference-counting core ----")
     r.push("// refcnt is the first field of every heap object, so retain is")
     r.push("// generic; release is type-specific (it must release children).")
@@ -4568,6 +4650,7 @@ fn runtime_lines() -> list[str] {
     r.push("// read buffer is freed before returning (it used to leak under the")
     r.push("// arena model).")
     r.push("static hl_str* hl_read_file(hl_str* path) {")
+    r.push("    hl_sandbox_check(path->data);")
     r.push("    FILE* f = fopen(path->data, \"rb\");")
     r.push("    if (!f) hl_die(\"cannot open file\");")
     r.push("    // Virtual files (/proc, /sys) report size 0 via fseek/ftell,")
@@ -4594,8 +4677,40 @@ fn runtime_lines() -> list[str] {
     r.push("    return out;")
     r.push("}")
     r.push("")
+    r.push("// Stage 10 release: hl_read_line() — read one line from stdin.")
+    r.push("// Strips a trailing newline (and CRLF if present). Returns a fresh")
+    r.push("// hl_str* (refcount 1) owned by the caller. At EOF, returns an")
+    r.push("// empty string (mirrors fgets semantics). The Stage-0 interpreter")
+    r.push("// strips CRLF the same way so differential testing stays green.")
+    r.push("static hl_str* hl_read_line(void) {")
+    r.push("    size_t cap = 128, len = 0;")
+    r.push("    char* buf = (char*)malloc(cap);")
+    r.push("    if (!buf) hl_die(\"out of memory\");")
+    r.push("    for (;;) {")
+    r.push("        int c = getchar();")
+    r.push("        if (c == EOF) break;")
+    r.push("        if (len + 1 >= cap) {")
+    r.push("            cap *= 2;")
+    r.push("            char* nb = (char*)realloc(buf, cap);")
+    r.push("            if (!nb) { free(buf); hl_die(\"out of memory\"); }")
+    r.push("            buf = nb;")
+    r.push("        }")
+    r.push("        buf[len++] = (char)c;")
+    r.push("        if (c == '\\n') break;")
+    r.push("    }")
+    r.push("    // Strip trailing \\n and \\r\\n.")
+    r.push("    if (len > 0 && buf[len - 1] == '\\n') {")
+    r.push("        len--;")
+    r.push("        if (len > 0 && buf[len - 1] == '\\r') len--;")
+    r.push("    }")
+    r.push("    hl_str* out = hl_str_from(buf, (int64_t)len);")
+    r.push("    free(buf);")
+    r.push("    return out;")
+    r.push("}")
+    r.push("")
     r.push("// hl_write_file: consumes the path and the content.")
     r.push("static void hl_write_file(hl_str* path, hl_str* content) {")
+    r.push("    hl_sandbox_check(path->data);")
     r.push("    FILE* f = fopen(path->data, \"wb\");")
     r.push("    if (!f) hl_die(\"cannot write file\");")
     r.push("    if (content->len > 0 && fwrite(content->data, 1, (size_t)content->len, f) != (size_t)content->len) {")
@@ -4814,6 +4929,7 @@ fn runtime_lines() -> list[str] {
     r.push("")
     r.push("// hl_file_exists: consumes the path.")
     r.push("static bool hl_file_exists(hl_str* path) {")
+    r.push("    hl_sandbox_check(path->data);")
     r.push("    struct stat st;")
     r.push("    bool ok = stat(path->data, &st) == 0 && S_ISREG(st.st_mode);")
     r.push("    hl_str_release(path);")
@@ -5778,6 +5894,13 @@ fn gen_call(ctx: Ctx, e: int) -> str {
     # result; taint is a compile-time property only (defense-in-depth is deferred).
     if name == "read_file_tainted" {
         return "hl_read_file(" + gen_own_arg(ctx, ctx.exprs[e].args.get(0)) + ")"
+    }
+    # Stage 10 release: read_line() — reads one line from stdin (newline
+    # stripped). At runtime, identical to hl_read_line(); taint is a
+    # compile-time property only (the checker enforces sanitisation
+    # before sinks; the runtime wrapper is defence-in-depth, deferred).
+    if name == "read_line" {
+        return "hl_read_line()"
     }
     if name == "write_file" {
         return "hl_write_file(" + gen_own_arg(ctx, ctx.exprs[e].args.get(0)) + ", "
@@ -7564,6 +7687,13 @@ fn gen_program(ctx: Ctx) -> list[str] {
     let mf: FnInfo = ctx.fns.get_or("main", dummy_fn())
     final.push("int main(int argc, char** argv) {")
     final.push("    hl_init_args(argc, argv);")
+    # Stage 10 release: auto-initialise the sandbox from the
+    # HLS_SANDBOX_ROOT env var if set. This lets the user compile a
+    # program once and run it with different sandboxes (no recompile
+    # needed). boot.py --sandbox DIR sets the same env var before
+    # running the interpreter, so both paths share the same gating.
+    final.push("    const char* hl_sb = getenv(\"HLS_SANDBOX_ROOT\");")
+    final.push("    if (hl_sb && hl_sb[0]) hl_set_sandbox_root(hl_sb);")
     if mf.ret == "int" {
         final.push("    return (int)(usf_main());")
     } else {
@@ -7842,16 +7972,19 @@ fn print_audit(ctx: Ctx) -> void uses IO {
     println("  `uses IO` expands to: {IO, Fs, Clock, Args, Exit}")
     println("")
     # Stage 10-beta: taint-flow audit extension. Scan the call graph for:
-    #   - functions calling taint sources (tainted_args, read_file_tainted)
+    #   - functions calling taint sources (tainted_args, read_file_tainted, read_line)
     #   - functions calling each taint sink
-    println("  Taint sources (builtins):  tainted_args, read_file_tainted")
+    println("  Taint sources (builtins):  tainted_args, read_file_tainted,")
+    println("                              read_line")
     println("  Taint sinks (builtins):    print, println, read_file,")
-    println("                            write_file, file_exists, exit")
+    println("                            write_file, file_exists, exit,")
+    println("                            net_lookup, proc_exec")
     println("  Explicit untaint:         taint_unwrap, std.sanitize.*")
     println("")
     # Find functions calling each taint source.
     let mut targs_users: list[str] = []
     let mut rft_users: list[str] = []
+    let mut rl_users: list[str] = []
     let mut si: int = 0
     while si < keys.len() {
         let skey: str = keys.get(si)
@@ -7867,6 +8000,11 @@ fn print_audit(ctx: Ctx) -> void uses IO {
             if ce == "b:read_file_tainted" {
                 if !list_has(rft_users, skey) {
                     rft_users.push(skey)
+                }
+            }
+            if ce == "b:read_line" {
+                if !list_has(rl_users, skey) {
+                    rl_users.push(skey)
                 }
             }
             cj = cj + 1
@@ -7892,6 +8030,16 @@ fn print_audit(ctx: Ctx) -> void uses IO {
         }
     } else {
         println("  No function calls read_file_tainted().")
+    }
+    if rl_users.len() > 0 {
+        println("  Functions calling read_line():")
+        let mut li: int = 0
+        while li < rl_users.len() {
+            println("    - " + rl_users.get(li))
+            li = li + 1
+        }
+    } else {
+        println("  No function calls read_line().")
     }
 }
 
