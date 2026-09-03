@@ -488,9 +488,19 @@ class HLSServer:
     def handle_completion(self, params, msg_id):
         items = []
         seen = set()
-        for kw in KEYWORDS + BUILTINS + EFFECTS:
-            items.append({"label": kw, "kind": 14})  # 14 = Keyword
+        # Deep-scan fix (D6): use proper LSP CompletionItemKind values.
+        # 14 = Keyword, 3 = Function, 13 = Enum (for effects).
+        # Previously every item was tagged Keyword, which deprived
+        # editors of semantic categorisation.
+        for kw in KEYWORDS:
+            items.append({"label": kw, "kind": 14})  # Keyword
             seen.add(kw)
+        for b in BUILTINS:
+            items.append({"label": b, "kind": 3})    # Function
+            seen.add(b)
+        for e in EFFECTS:
+            items.append({"label": e, "kind": 13})   # Enum
+            seen.add(e)
         # Add identifiers from the program matching the requested URI.
         td = params.get("textDocument", {})
         uri = td.get("uri")
