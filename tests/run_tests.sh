@@ -81,7 +81,16 @@ if python3 boot/boot.py src/hlc.hls tests/memcheck/stress_leak.hls "$TMP/stress.
     stress_out=$(bash -c "ulimit -v 262144; \"$TMP/stress\"" 2>/dev/null); stress_rc=$?
     if [ $stress_rc -eq 0 ]; then
         delta=$(echo "$stress_out" | grep "rss_delta_pages=" | cut -d= -f2)
-        if [ "$delta" -le 1024 ] 2>/dev/null; then
+        # Deep-scan-11 fix: if the stress binary produced no
+        # `rss_delta_pages=` line (e.g. it crashed before printing
+        # the result), `delta` is empty. The old test
+        # `[ "" -le 1024 ]` errors with "integer expression expected"
+        # (suppressed by 2>/dev/null) and falls through to the
+        # `else` branch, printing the confusing "RSS grew by  pages"
+        # message with a blank. Distinguish the two failure modes.
+        if [ -z "$delta" ]; then
+            bad "stress_leak: no rss_delta_pages= line in output (stress binary crashed before reporting?)"
+        elif [ "$delta" -le 1024 ] 2>/dev/null; then
             ok "stress_leak under 256MB ulimit (rss delta=${delta} pages)"
         else
             bad "stress_leak RSS grew by ${delta} pages"
