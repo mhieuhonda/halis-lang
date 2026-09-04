@@ -1,6 +1,6 @@
 <div align="center">
 
-![Halis logo](Halis.png)
+<img src="Halis.png" alt="Halis logo" width="200">
 
 # Halis
 
