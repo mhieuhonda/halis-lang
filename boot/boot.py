@@ -159,7 +159,32 @@ def load_program(entry_path):
 
 
 def run_cli():
-    args = sys.argv[1:]
+    argv = sys.argv[1:]
+    # Deep-scan-10 fix (Stage-17 perfection): flags are recognised ONLY
+    # BEFORE the entry file. Arguments after the file are PROGRAM
+    # arguments (`boot.py <file.hls> [program args...]`, per the usage
+    # string) — e.g. `boot.py src/hlc.hls --fast in.hls out.c` drives
+    # the compiler with ITS OWN --fast flag. The old code stripped
+    # --fast / --contracts / -O / --check / ... from the WHOLE argv, so
+    # every flag after the entry path silently never reached the
+    # program: driving hlc.hls through Stage-0 with --fast emitted a
+    # NON-fast build, and --contracts could not be plumbed through at
+    # all (interpreter <-> native flag divergence).
+    _FLAG_WITH_VALUE = ("--emit", "--target", "--sandbox", "-O")
+    args = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if not (a.startswith("--") or a == "-O"):
+            break
+        args.append(a)
+        if a in _FLAG_WITH_VALUE and i + 1 < len(argv):
+            args.append(argv[i + 1])
+            i += 1
+        i += 1
+    # The leading flags occupy argv[0:nflags]; the strip loops below
+    # mutate `args`, so the boundary must be captured NOW.
+    nflags = len(args)
     check_only = False
     audit_only = False
     emit_ir = False        # Stage 11 (v0.9.0-alpha): print HLIR text
@@ -245,7 +270,12 @@ def run_cli():
         sys.stderr.write(
             "error: --check / --audit / --emit ir / --emit llvm / --opt-stats are mutually exclusive\n")
         return 2
-    if not args:
+    # Deep-scan-10 (continued): the entry path and the PROGRAM
+    # arguments are whatever follows the leading flags — program
+    # arguments are passed through VERBATIM (they may themselves look
+    # like flags: they belong to the program, not to boot.py).
+    rest = argv[nflags:]
+    if not rest:
         sys.stderr.write(
             "usage: boot.py [--check | --audit | --emit ir | --emit llvm | --opt-stats]\n"
             "               [--target <triple>] [--sandbox DIR] <file.hls> [program args...]\n"
@@ -258,8 +288,8 @@ def run_cli():
             "  --sandbox DIR     restrict filesystem builtins to DIR (Stage 10).\n"
         )
         return 2
-    path = args[0]
-    prog_args = [a.encode("utf-8") for a in args]
+    path = rest[0]
+    prog_args = [a.encode("utf-8") for a in rest]
     try:
         program = load_program(path)
     except HLError as ex:
@@ -283,6 +313,20 @@ def run_cli():
                 "error: --sandbox is incompatible with `extern \"C\"` blocks "
                 "(extern can call libc directly, bypassing the sandbox)\n")
             return 1
+        # Deep-scan-10 fix: `--sandbox` must also reject programs whose
+        # effect graph reaches the Proc family. proc_exec runs an
+        # arbitrary shell command — `--sandbox` gated only the four file
+        # builtins, so a `uses Proc` program could read/write ANY file on
+        # the host (`proc_exec("cat /etc/passwd")` compiled and ran under
+        # the sandbox). Mirrors the extern rejection rationale.
+        for key, fn in program["fns"].items():
+            if "Proc" in checker.computed_effects.get(key, set()):
+                sys.stderr.write(
+                    "error: --sandbox is incompatible with the Proc effect "
+                    "(function '%s' can reach proc_exec, which runs "
+                    "arbitrary shell commands outside the sandbox)\n"
+                    % fn["name"])
+                return 1
         # Validate the sandbox dir exists and is a directory.
         if not os.path.isdir(sandbox_dir):
             sys.stderr.write("error: --sandbox: not a directory: %s\n" % sandbox_dir)
@@ -658,5 +702,16 @@ if __name__ == "__main__":
     _t = threading.Thread(target=_runner)
     _t.start()
     _t.join()
-    sys.stdout.buffer.flush()
-    sys.exit(_result.get("code", 1))
+    # Deep-scan-10: a consumer closing the pipe early (e.g.
+    # `boot.py prog.hls | head`) used to print a BrokenPipeError
+    # traceback at interpreter shutdown. Redirect the remaining output
+    # to /dev/null (the conventional SIGPIPE handling) and exit quietly.
+    try:
+        sys.stdout.buffer.flush()
+    except BrokenPipeError:
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+    try:
+        sys.exit(_result.get("code", 1))
+    except BrokenPipeError:
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        os._exit(_result.get("code", 1))

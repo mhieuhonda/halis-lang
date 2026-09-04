@@ -60,8 +60,18 @@ def proof_report(program, checker):
             walk(e.get("idx"))
         if e.get("k") == "field":
             walk(e.get("target"))
+        if e.get("k") == "match":
+            # Deep-scan-10: the scrutinee expression was never walked, so
+            # proven checks inside it were under-reported.
+            walk(e.get("scrut"))
         for arm in (e.get("arms") or []):
             walk(arm.get("body"))
+        if e.get("k") in ("listlit", "structlit", "enumlit"):
+            # Deep-scan-10: literal items/fields were never walked.
+            for a in (e.get("items") or []):
+                walk(a)
+            for _, fe in (e.get("fields") or []):
+                walk(fe)
 
     def walk_stmts(stmts):
         for s in stmts or []:
@@ -142,7 +152,14 @@ def gen_smt(program, out_dir):
 
         scan(req)
         scan(ens)
-        result_int = fn.get("ret") == "int"
+        # Deep-scan-10 fix: the result sort follows the return type (int
+        # -> Int, bool -> Bool, anything else -> no declaration, and
+        # ensures queries referencing result are skipped for those). It
+        # used to be Int-or-nothing, so a bool contract asserting
+        # `result` referenced an undeclared constant (a z3 error).
+        ret = fn.get("ret")
+        result_int = True if ret == "int" else (False if ret == "bool"
+                                                else None)
         lines = _proof.smt_prelude(sorted(vars_int), sorted(vars_str),
                                    result_int)
         try:
@@ -158,17 +175,28 @@ def gen_smt(program, out_dir):
                 lines.extend(_proof.smt_prelude(sorted(vars_int),
                                                 sorted(vars_str),
                                                 result_int))
-            if ens is not None and req is not None:
-                req_smt = _proof.smt_of_expr(req, vars_int, vars_str)
-                ens_smt = _proof.smt_of_expr(ens, vars_int, vars_str)
-                # Query 2: requires && !ensures satisfiable? unsat =>
-                # the ensures is implied by the requires alone (a
-                # tautology given the precondition).
-                lines.append("; (check-sat) requires & !ensures:"
-                             " unsat => ensures is implied by requires")
-                lines.append("(assert %s)" % req_smt)
-                lines.append("(assert (not %s))" % ens_smt)
-                lines.append("(check-sat)")
+            if ens is not None:
+                # Deep-scan-10 fix: an ENSURES-ONLY contract used to emit
+                # declarations and NO query at all. Query 2 is now
+                # emitted with or without a requires (vacuity check:
+                # requires && !ensures, or just !ensures).
+                if result_int is not None:
+                    ens_smt = _proof.smt_of_expr(ens, vars_int, vars_str)
+                    if req is not None:
+                        req_smt2 = _proof.smt_of_expr(req, vars_int,
+                                                      vars_str)
+                        lines.append("; (check-sat) requires & !ensures:"
+                                     " unsat => ensures is implied by"
+                                     " requires")
+                        lines.append("(assert %s)" % req_smt2)
+                    else:
+                        lines.append("; (check-sat) !ensures:"
+                                     " unsat => ensures always holds")
+                    lines.append("(assert (not %s))" % ens_smt)
+                    lines.append("(check-sat)")
+                else:
+                    lines.append("; (ensures query skipped: result type"
+                                 " %s has no QF_LIA encoding)" % ret)
         except ValueError as ex:
             lines.append("; unsupported contract shape for SMT: %s" % ex)
         path = os.path.join(out_dir, "%s.smt2" % key.replace(".", "_"))
@@ -178,21 +206,66 @@ def gen_smt(program, out_dir):
     return results
 
 
+def _z3_verdicts_py(path):
+    """Run the .smt2 through the z3 PYTHON module (z3-solver package)
+    and return the list of check-sat verdicts. Returns None if the
+    module is unavailable. Deep-scan-10 (Stage-17 perfection): --z3 used
+    to require a z3 BINARY on PATH; the module fallback makes the bridge
+    usable everywhere the package is installed."""
+    try:
+        import z3  # noqa: F401
+    except ImportError:
+        return None
+    import z3 as z
+    text = open(path).read()
+    # Split on (reset): each segment is an independent set of commands.
+    segments = [seg.strip() for seg in text.split("(reset)") if seg.strip()]
+    verdicts = []
+    for seg in segments:
+        solver = z.Solver()
+        try:
+            solver.from_string(seg)
+        except Exception:
+            verdicts.append("?")
+            continue
+        verdicts.append(str(solver.check()))
+    return verdicts
+
+
 def run_z3(smt_files):
-    """Run z3 on each file if a z3 binary exists."""
+    """Run z3 on each file: the z3 binary if present, else the z3 python
+    module (z3-solver). Reports EVERY check-sat verdict in the file
+    (deep-scan-10: only the last line was reported, so the vacuity
+    verdict of a two-query file was silently dropped)."""
     for key, path in smt_files:
+        verdicts = None
         try:
             proc = subprocess.run(["z3", path], capture_output=True,
                                   text=True, timeout=10)
-            out = (proc.stdout or "").strip().splitlines()
-            verdict = out[-1] if out else "?"
-            print("    %-28s z3: %s" % (key, verdict))
+            if proc.returncode == 0:
+                out = (proc.stdout or "").strip().splitlines()
+                verdicts = [ln for ln in out if ln in ("sat", "unsat",
+                                                       "unknown")]
+                if not verdicts:
+                    verdicts = ["?"]
+            else:
+                verdicts = None
         except FileNotFoundError:
-            print("    %-28s z3 not found on PATH (install z3 or use "
-                  "--smt and run it yourself)" % key)
-            return
+            verdicts = None
         except subprocess.TimeoutExpired:
             print("    %-28s z3: TIMEOUT" % key)
+            continue
+        if verdicts is None:
+            verdicts = _z3_verdicts_py(path)
+        if verdicts is None:
+            print("    %-28s z3: neither the z3 binary nor the z3-solver"
+                  " python package is available (install one, or use"
+                  " --smt and inspect the .smt2 yourself)" % key)
+            return
+        labels = ["vacuity", "ensures"]
+        disp = ", ".join("%s: %s" % (labels[i] if i < len(labels) else "q%d" % i, v)
+                         for i, v in enumerate(verdicts))
+        print("    %-28s z3: %s" % (key, disp))
 
 
 def suggest_invariants(program):
@@ -211,7 +284,6 @@ def suggest_invariants(program):
             k = s.get("k")
             if k == "for":
                 it = s.get("iter")
-                rng = _proof._const_range(it) if isinstance(it, dict) else None
                 if isinstance(it, dict) and it.get("name") == "range":
                     args = it.get("args") or []
                     if len(args) == 2 and all(
@@ -249,8 +321,10 @@ def suggest_invariants(program):
 
 def main():
     args = sys.argv[1:]
-    want_smt = "--smt" in args
     want_z3 = "--z3" in args
+    # Deep-scan-10: --z3 without --smt silently did nothing; it now
+    # implies it.
+    want_smt = "--smt" in args or want_z3
     want_inv = "--suggest-invariants" in args
     args = [a for a in args if not a.startswith("--")]
     if not args:

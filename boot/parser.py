@@ -197,14 +197,30 @@ class Parser:
         return {"path": path, "line": t0["line"]}
 
     def parse_typeparams(self):
-        """Parse `[T, U, ...]` — list of type parameter names."""
+        """Parse `[T, U, ...]` — list of type parameter names.
+
+        Deep-scan-10 soundness fix: a type parameter may NOT be named
+        after a primitive / wrapper / builtin generic base (`int`,
+        `float`, `bool`, `str`, `void`, `list`, `map`, `tainted`,
+        `Chan`, `Task`, `Option`, `Result` — the latter two are stdlib
+        enums, the rest are language builtins). `fn f[int](x: int)`
+        used to parse fine, and `_instantiate_type` / `unify` consulted
+        the type_map BEFORE the primitive table, so a `str` argument
+        silently bound `int -> str` — a type-soundness hole (the
+        parameter declared `int` accepted a `str`)."""
         tps = []
         if not self.at_sym("["):
             return tps
         self.next()
         while not self.at_sym("]"):
             t = self.eat_ident()
-            tps.append(t["v"])
+            name = t["v"]
+            if name in ("int", "float", "bool", "str", "void", "list",
+                        "map", "tainted", "Chan", "Task", "Option",
+                        "Result"):
+                self.err("type parameter cannot be named '%s' (it is a "
+                         "builtin type name and would shadow it)" % name, t)
+            tps.append(name)
             if self.at_sym(","):
                 self.next()
             elif not self.at_sym("]"):
@@ -564,7 +580,12 @@ class Parser:
                 self._require_ident_root(e)
             val = self.parse_expr()
             return {"k": "assign", "target": e, "value": val, "line": eq["line"]}
-        if e["k"] not in ("call", "method", "fieldcall", "match"):
+        # Deep-scan-10 fix: `foo()?` as an expression-statement is the
+        # idiomatic "propagate the error, discard the value" form —
+        # `match` already had an exemption for exactly this reason. The
+        # qmark node is validated by the checker (its operand must be a
+        # call/fieldcall anyway).
+        if e["k"] not in ("call", "method", "fieldcall", "match", "qmark"):
             self.err("expression as statement must be a function/method call")
         return {"k": "expr", "e": e, "line": e["line"]}
 
@@ -645,7 +666,12 @@ class Parser:
                 else:
                     e = {"k": "field", "target": e, "name": name["v"],
                          "line": dot["line"]}
-            elif self.at_sym("[") and e["k"] in ("ident", "field", "index", "call", "method", "fieldcall"):
+            elif self.at_sym("[") and e["k"] in ("ident", "field", "index", "call", "method", "fieldcall", "qmark"):
+                # Deep-scan-10 fix: `qmark` joins the indexable forms —
+                # `g()?[0]` used to detach the `[0]` into a stray
+                # statement (inconsistent with `g()?.x`, which worked).
+                # `listlit` (indexing a fresh list literal) and `match`
+                # results are also indexable values.
                 lb = self.next()
                 idx = self.parse_expr()
                 self.eat_sym("]")
@@ -707,12 +733,22 @@ class Parser:
             pattern = {"k": "wildcard"}
         else:
             # `Name.Variant` or `Name.Variant(bindings)` — Name is the enum
-            # type name. (We require the enum name to be present — no bare
-            # `Variant` patterns, for auditability.)
+            # type name. Deep-scan-10 fix: a BARE `Variant` pattern (no
+            # `Name.` prefix) is also accepted, per the SPEC §5 grammar
+            # (`pattern := (Ident ".")? Ident ...`) — the checker resolves
+            # the enum from the scrutinee's type (a bare name that matches
+            # no variant of the scrutinee enum is a clean error there).
             ename_tok = self.eat_ident()
             ename = ename_tok["v"]
-            self.eat_sym(".")
-            vname = self.eat_ident()["v"]
+            vname = None
+            bare = True
+            if self.at_sym("."):
+                self.next()
+                vname = self.eat_ident()["v"]
+                bare = False
+            if bare:
+                vname = ename
+                ename = ""  # resolved by the checker from the scrutinee type
             bindings = []
             has_paren = False
             if self.at_sym("("):

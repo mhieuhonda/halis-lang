@@ -65,11 +65,22 @@ def tokenize(src):
 
     while i < n:
         c = src[i]
-        # whitespace
+        # whitespace. Deep-scan-10 fix: a lone \r (CR-only files, opened
+        # "rb" so no newline translation happens) is a LINE TERMINATOR —
+        # it used to count as a single column, so every token in a
+        # CR-terminated file reported line 1.
         if c in (32, 9, 13, 10):
             if c == 10:
                 line += 1
                 col = 1
+            elif c == 13:
+                # CRLF: the \n right after handles the newline; a lone
+                # CR is a terminator itself.
+                if i + 1 < n and src[i + 1] == 10:
+                    col += 1
+                else:
+                    line += 1
+                    col = 1
             else:
                 col += 1
             i += 1
@@ -124,15 +135,51 @@ def tokenize(src):
                         j += 1
             raw_text = src[i:j].decode("ascii")
             text = raw_text.replace("_", "")
+            # Deep-scan-10 fix: a number immediately followed by
+            # identifier characters (e.g. `0x1F`, `123abc`) used to split
+            # into two tokens with a confusing downstream error pointing
+            # at the WRONG token. Reject it here with a clear message
+            # (HLS has no hex literals).
+            if j < n and _is_ident_start(src[j]):
+                k2 = j
+                while k2 < n and _is_ident_char(src[k2]):
+                    k2 += 1
+                raise HLError("invalid numeric literal '%s' (digits followed "
+                              "by letters — HLS has no hex/adjoined-letter "
+                              "literals)" % src[i:k2].decode("ascii"),
+                              line, col)
             # BUG-DS4-15: keep the RAW source text on the token. Formatters
             # (hlfmt) must re-emit the original literal — str(float) can
             # produce exponent notation (1e-05) that the HLS lexer itself
             # cannot re-parse, which corrupted files on `-w`.
             if is_float:
-                toks.append({"k": "float", "v": float(text), "raw": raw_text,
+                fv = float(text)
+                # Deep-scan-10: a float literal that overflows to infinity
+                # (e.g. 1e400) is rejected — SPEC §7's "every operation is
+                # checked" philosophy; it used to parse silently and
+                # produce inf.
+                if fv == float("inf") and "inf" not in text:
+                    raise HLError("float literal overflows to infinity: %s"
+                                  % raw_text, line, col)
+                toks.append({"k": "float", "v": fv, "raw": raw_text,
                              "line": line, "col": col})
             else:
-                toks.append({"k": "int", "v": int(text), "raw": raw_text,
+                try:
+                    iv = int(text)
+                except ValueError:
+                    # Python 3.11+ int-str conversion limit: literals with
+                    # >= 4300 digits raise ValueError, which used to escape
+                    # as a raw traceback (not an HLError) and crash the CLI.
+                    raise HLError("integer literal too large: %s digits"
+                                  % len(text), line, col)
+                if iv > 9223372036854775808:
+                    # Up to 2^63 exactly is allowed THROUGH the lexer: the
+                    # parser folds `-` + `9223372036854775808` into the int64
+                    # minimum; a BARE 2^63 literal is rejected by the
+                    # checker's literal-range rule (fail_int_overflow_literal).
+                    raise HLError("integer literal out of int64 range: %s"
+                                  % raw_text, line, col)
+                toks.append({"k": "int", "v": iv, "raw": raw_text,
                              "line": line, "col": col})
             col += j - i
             i = j

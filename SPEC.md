@@ -1,8 +1,13 @@
-# Halis language specification (HLS) — v0.29.0-alpha
+# Halis language specification (HLS) — v0.30.0-alpha
 
 > **Halis** is a high-security, native-compiled programming language
 > designed around the philosophy: **safety by default, explicitness for
-> auditability, performance via AOT compilation**. Version v0.29.0-alpha
+> auditability, performance via AOT compilation**. Version v0.30.0-alpha
+> **perfects Stage 17**: the proof-engine soundness overhaul (every
+> false-PROVEN hole closed in both engines — see §26.9), native
+> `--contracts` ensures checks at every return, the loop-invariant
+> engine (two Kleene rounds + widening + post-fixpoint verification),
+> and the z3 python fallback. Version v0.29.0-alpha
 > **perfects Stage 16**: bounded channels with backpressure
 > (`chan_new_bounded` + blocking `send`), the non-blocking
 > `try_send`/`recv_or` pair, and a waiter-aware deadlock detector that
@@ -1689,11 +1694,50 @@ guarding the elided operations — the panic checks themselves are gone,
 exactly the acceptance criterion: *a core crypto module fully proven
 by HLS contracts, no panic checks needed*.
 
-### 26.8. Deliberate scope decisions (v0.28.0-alpha)
+### 26.8. Deliberate scope decisions (v0.30.0-alpha)
 
 | Deferred | Rationale |
 |----------|-----------|
 | Full SMT encoding of function bodies | the bridge encodes contract queries (satisfiability / implication), not whole-program semantics; the built-in interval prover handles body-level elision. |
-| `ensures` runtime checks in native | the interpreter checks both clauses under `--contracts`; the native backend checks `requires` (the elision-relevant clause). `ensures` verification is via `hlprove`/z3. |
-| Loop invariant inference into proofs | `--suggest-invariants` proposes; the engine itself uses conservative widening (sound, less precise). |
+| Loop invariant PRECISION beyond widening | v0.30.0-alpha closed the deferred row's gap: the engine now runs two Kleene rounds + the standard widening operator + a post-fixpoint verification pass (see 26.4) — strictly more precise than blanket TOP and still sound. What remains future work is inferring NON-interval invariants (modular/relational facts). |
 | Contracts on generics | contracts are checked per-declaration; instantiation-specific bounds (generic `requires`) are future work. |
+
+Shipped in v0.30.0-alpha (previously deferred): **`ensures` runtime
+checks in native** — the native `--contracts` build now asserts the
+postcondition at EVERY return with `result` bound to the returned value
+(the interpreter already checked both clauses; the native backend
+checked `requires` only). A violated postcondition panics identically
+in both implementations (same message, exit 101 — differentially
+tested).
+
+### 26.9. v0.30.0-alpha — the proof-engine soundness overhaul
+
+Deep code review found the interval engine could annotate checks as
+PROVEN when they were NOT — each a memory-safety hole under `-O fast`
+(some confirmed to SIGSEGV or wrap natively). All of the following are
+fixed in BOTH engines (boot/proof.py and the hlc.hls mirror), with
+differential regressions (`tests/ok/feat_proof_sound_*.hls`):
+
+| Hole | Old behaviour | Fix |
+|------|---------------|-----|
+| TOP "fits" int64 | `x + y` with unbounded `y` was `ovf_safe` (native UB wrap) | `fits` requires both bounds KNOWN |
+| while-condition facts | annotated with loop-ENTRY facts (false `bnd_safe` at loop-modified indices) | conditions annotated with the loop INVARIANT |
+| `for i in range(a, b)` | seeded `i` in `[0, count-1]` (both bounds wrong when `a != 0`) | seeds `[a, b-1]`; non-const iterables seed TOP |
+| `i <= s.len()` | proved `xs[i]` (the strict/non-strict delta was ignored) | only the strict `<` (delta -1) proves an index; `<=` is a slice-end bound only |
+| stale `len() >= k` | survived reassignment of the owner (`xs = [1]` kept `len >= 3`) | every binding write invalidates minlen / symbolic-len / nz facts |
+| stale loop facts | `for` never widened post-loop; stale `!= 0` kept `div_safe` after `y = 0` | post-loop joins; nz invalidation on write |
+| slice `a <= b` | granted when `a`'s upper bound was unknown | `a <= b` is a PROVEN obligation |
+| INT64_MIN / -1 | skipped when the dividend's lower bound was unknown | unbounded-below counts as possibly INT64_MIN |
+| symbolic len arithmetic | `x < s.len()` then `x + 1` crashed the compiler (tuple + int) | symbolic bounds collapse to numeric TOP in arithmetic |
+| native symbolic route | looked up the wrong map key — never elided (engine divergence) | lookups resolve the index VARIABLE |
+| multi-pass staleness | a `True` from an intermediate analysis pass survived the final pass | every verdict is reset each pass |
+| internal fact keys | a variable literally named `__nz__`/`__minlen__` crashed the engine | NUL-prefixed / `~ml~` keys (cannot be identifiers) |
+| `const_eval` division | int `/` evaluated in floating point (false call-site violations) | C-style truncated division/remainder |
+| SMT `/` `%` | encoded with SMT-LIB Euclidean semantics (wrong z3 verdicts) | `cdiv`/`cmod` helpers encode the C-truncated semantics |
+
+The loop analysis itself was upgraded to the standard abstract-
+interpretation shape: two Kleene rounds, the widening operator
+(growth → infinity, which PREServes e.g. `i >= 0` across `i = i + 1`),
+and a post-fixpoint verification pass (any variable whose body outcome
+escapes the invariant goes TOP — the verification is what makes a
+bounded number of rounds sound).

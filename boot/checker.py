@@ -625,7 +625,11 @@ class Checker:
         facts = _proof.seed_from_requires(req, fn["params"], 0)
         _proof.propagate_stmts(fn["body"], facts)
         for var, iv in facts.items():
-            if var == "__nz__":
+            # Deep-scan-10: skip the engine's NUL-prefixed internal keys
+            # (non-zero set, minimum-length map) — they are not variables.
+            if not isinstance(var, str) or var.startswith("\x00"):
+                continue
+            if not isinstance(iv, _proof.Interval):
                 continue
             self.proof_facts.setdefault(key, {})[var] = str(iv)
 
@@ -633,12 +637,22 @@ class Checker:
         """Contract expressions must be pure and side-effect-free: no
         calls to user functions or effectful builtins; only literals,
         params, arithmetic, comparisons, len() / .len() and field reads
-        of params are allowed."""
+        of params are allowed.
+
+        Deep-scan-10 fix: the walk now descends into EVERY child shape
+        (index targets/indices, field targets, match scrutinees and arm
+        bodies, list literal items, struct/enum literal payloads, and
+        the `?` operand). The old walk only recursed into l/r/e/args,
+        so an impure call hidden under an index (`requires double(x)[0]
+        > 0`) or inside a match arm compiled cleanly — a hole in SPEC
+        §26.1's purity rule."""
         if not isinstance(e, dict):
             return
         k = e["k"]
         if k == "call":
             if e.get("rc") == ("builtin", "len"):
+                for a in (e.get("args") or []):
+                    self.check_contract_purity(a, fn, which)
                 return
             name = e.get("name", "")
             self.err("contract expression calls '%s' — contracts must be "
@@ -647,6 +661,7 @@ class Checker:
         if k == "method":
             name = e.get("name", "")
             if name == "len":
+                self.check_contract_purity(e.get("target"), fn, which)
                 return
             self.err("contract expression calls method '%s' — contracts "
                      "must be pure" % name, e)
@@ -654,6 +669,22 @@ class Checker:
             self.check_contract_purity(sub, fn, which)
         for a in (e.get("args") or []):
             self.check_contract_purity(a, fn, which)
+        if k == "index":
+            self.check_contract_purity(e.get("target"), fn, which)
+            self.check_contract_purity(e.get("idx"), fn, which)
+        if k == "field":
+            self.check_contract_purity(e.get("target"), fn, which)
+        if k == "match":
+            self.check_contract_purity(e.get("scrut"), fn, which)
+            for arm in (e.get("arms") or []):
+                self.check_contract_purity(arm.get("body"), fn, which)
+        if k == "qmark":
+            self.check_contract_purity(e.get("e"), fn, which)
+        if k in ("listlit", "structlit", "enumlit"):
+            for a in (e.get("items") or e.get("args") or []):
+                self.check_contract_purity(a, fn, which)
+            for _, fe in (e.get("fields") or []):
+                self.check_contract_purity(fe, fn, which)
 
     def all_return(self, stmts):
         if not stmts:
@@ -1283,6 +1314,14 @@ class Checker:
             # like `system()` accepts a null-terminated C string, so
             # a tainted[str] is a shell-injection vector. Reject any
             # tainted argument to an extern fn as a soundness rule.
+            # BUG-A2 fix (carried over from BUG-A): cache the first-pass
+            # type per argument so we don't re-run check_expr on the same
+            # argument in the second pass. Calling check_expr twice would
+            # re-execute side effects (drop/take move-marking) and produce
+            # spurious "use of moved value" errors. (Deep-scan-10: the
+            # declaration moved ABOVE the extern early-check loop, which
+            # now also caches into it.)
+            first_at = [None] * len(args)
             if fn.get("extern", False):
                 for i, (a, (pn, pt, _)) in enumerate(zip(args, fn["params"])):
                     # The argument type is checked below in the
@@ -1290,7 +1329,16 @@ class Checker:
                     # check here only for the tainted-wrap case so
                     # we can produce a targeted error message before
                     # the generic "expected X, got Y" error fires.
+                    # Deep-scan-10 fix: CACHE the early type in
+                    # first_at — the second-pass loop re-ran
+                    # check_expr for NON-generic externs (first_at[i]
+                    # was None), re-executing take/drop move-marking
+                    # and producing spurious "use of moved value"
+                    # errors on legal programs like
+                    # `puts(take(s))` (the very BUG-A class the loop
+                    # comments claim was fixed).
                     at = self.check_expr(a, env, None)
+                    first_at[i] = at
                     if at == "never":
                         continue
                     if is_taint(at):
@@ -1314,12 +1362,6 @@ class Checker:
             # Generic function: infer type args from argument types.
             typeparams = fn.get("typeparams", [])
             type_map = {}
-            # BUG-A2 fix (carried over from BUG-A): cache the first-pass
-            # type per argument so we don't re-run check_expr on the same
-            # argument in the second pass. Calling check_expr twice would
-            # re-execute side effects (drop/take move-marking) and produce
-            # spurious "use of moved value" errors.
-            first_at = [None] * len(args)
             if typeparams:
                 for i, (a, (pn, pt, _)) in enumerate(zip(args, fn["params"])):
                     at = self.check_expr(a, env, None)
@@ -1355,7 +1397,13 @@ class Checker:
             # site (catches div(10, 0)-style bugs before the program
             # ever runs). Unknown values defer to runtime.
             req = fn.get("requires")
-            if req is not None and args:
+            # Deep-scan-10 fix: `and args` excluded ZERO-argument
+            # contracted fns — "every argument is a literal" is
+            # vacuously true with no arguments, so
+            # `fn f() requires false { ... } f()` was never
+            # constant-evaluated (the provably-false precondition
+            # compiled cleanly).
+            if req is not None:
                 consts = _proof.args_are_const(fn, args)
                 if consts is not None:
                     verdict = _proof.const_eval(req, consts)
@@ -1719,6 +1767,16 @@ class Checker:
                         "owned value may be simultaneously released by two "
                         "threads." % (what, i + 2), a)
             self.edges[self.cur_fn].add("b:spawn")
+            # Deep-scan-10 soundness fix: the spawned function IS a
+            # callee — its effects must reach the spawner's computed
+            # set (SPEC §17.3: "computed set = union over all
+            # callees"; the spawner CAUSES the task's effects).
+            # Previously only `b:spawn` was added, so a `uses Conc`
+            # main could transitively perform IO/Fs/Proc through a
+            # spawned task while --audit reported a clean Conc-only
+            # tree (struct defaults already get synthetic edges for
+            # exactly this reason — BUG-DS4-2).
+            self.edges[self.cur_fn].add(fname)
             # Rewrite the node: drop the fn-name argument and record the
             # target so the interpreter / codegen never evaluates the
             # function name as a value.
@@ -1820,10 +1878,15 @@ class Checker:
         if t in ("int", "float", "bool", "str", "void", "never"):
             return True
         if t in self.cur_typeparams:
-            # Unresolved type parameter (spawn targets are non-generic, so
-            # this cannot trigger — conservative True matches the concrete
-            # instantiation check that already ran on the target's params).
-            return True
+            # Deep-scan-10 soundness fix: an UNRESOLVED type parameter is
+            # NOT provably Send — a generic fn can be instantiated with
+            # Task[R] (explicitly non-Send) or any non-Send struct, and
+            # the generic body is never re-checked at the instantiation.
+            # The old code returned True here ("conservative" — actually
+            # UNSOUND), so `fn leak[T](ch: Chan[T], v: T) { ch.send(take(v)) }`
+            # compiled cleanly and sent a Task join handle across a
+            # channel. Conservative-DENY is the only sound default.
+            return False
         if is_chan(t):
             return self.type_is_send(chan_inner(t), _seen)
         if is_task(t):
@@ -2072,6 +2135,12 @@ class Checker:
             else:
                 pen = pat["enum"]
                 pv = pat["variant"]
+                # Deep-scan-10: a BARE pattern (no `Enum.` prefix —
+                # accepted per the SPEC §5 grammar) resolves against the
+                # scrutinee's enum here.
+                if pen == "":
+                    pen = ename
+                    pat["enum"] = ename
                 if pen != ename:
                     self.err("match arm pattern belongs to enum %s, not %s"
                              % (pen, ename), arm)
@@ -2295,7 +2364,11 @@ class Checker:
                             fn)
                 continue
             # Find a witness edge for one of the missing effects and report it.
-            for c in self.edges.get(key, ()):
+            # Deep-scan-10 fix: iterate the edges in SORTED order — the
+            # old code iterated a Python set, so with two violating
+            # callees the REPORTED one varied with PYTHONHASHSEED
+            # (SPEC §17.6 promises deterministic Stage-0 behaviour).
+            for c in sorted(self.edges.get(key, ())):
                 if c.startswith("b:"):
                     c_eff = BUILTIN_EFFECTS.get(c[2:], set())
                     callee_disp = c[2:]

@@ -31,7 +31,7 @@ remains green.
 | 14 | Tooling: LSP, formatter, linter | ✅ | (release v0.24.0-alpha) |
 | 15 | Safe C FFI | ✅ | (release v0.25.0-alpha) |
 | 16 | Concurrency & async (data-race freedom) | ✅ | (release v0.29.0-alpha, perfected) |
-| 17 | Formal verification & contracts | ✅ | (release v0.28.0-alpha) |
+| 17 | Formal verification & contracts | ✅ | (release v0.30.0-alpha, perfected) |
 | 18 | Testing ecosystem & fuzzing | ⬜ | 4–6 weeks |
 | 19 | Documentation, book, playground | ⬜ | 6 weeks |
 | 20 | HLS v1.0 — API freeze, LTS, pure-HLS bootstrap | ⬜ | 4 weeks |
@@ -1196,7 +1196,7 @@ self-hosted hlbindgen.
 **Acceptance:** a program sharing a variable outside a channel → compile error;
 concurrency benchmark (web server) scales linearly to 8 cores.
 
-## STAGE 17 — Formal verification & contracts ✅ (release v0.28.0-alpha)
+## STAGE 17 — Formal verification & contracts ✅ (release v0.30.0-alpha, perfected)
 
 **Goal:** "extremely high security" is proven, not just claimed.
 
@@ -1244,6 +1244,69 @@ concurrency benchmark (web server) scales linearly to 8 cores.
 
 **Acceptance:** a core crypto module (e.g. HMAC) fully proven by HLS contracts,
 no panic checks needed.
+
+**Perfected (v0.30.0-alpha) — soundness overhaul + the deferred scope:**
+- **Every false-PROVEN hole in the interval engine closed** (deep code
+  review; several confirmed native SIGSEGVs under `-O fast`): TOP no
+  longer "fits" int64; while CONDITIONS are annotated with the loop
+  invariant (not the entry facts); `range(a, b)` seeds `[a, b-1]`;
+  `i <= s.len()` no longer proves `xs[i]` (strict/non-strict delta
+  honoured); stale minlen / nz / symbolic-len facts are invalidated on
+  every binding write; slice `a <= b` is a PROVEN obligation; the
+  INT64_MIN/-1 corner fires for unbounded dividends; symbolic len
+  bounds no longer crash arithmetic (tuple + int); the native
+  symbolic-route lookup resolves the index VARIABLE (it was dead code
+  — the engines diverged); verdicts reset on every analysis pass; the
+  internal fact keys cannot collide with identifiers; `const_eval`
+  uses C-style division; the SMT bridge encodes C-truncated `/`/`%`
+  (SMT-LIB div/mod are Euclidean — the verdicts were wrong). All
+  mirrored in boot/proof.py AND src/hlc.hls, each with a differential
+  regression (`tests/ok/feat_proof_sound_*.hls` — 8 files).
+- **The loop analysis is now real abstract interpretation**: two
+  Kleene rounds + the standard widening operator (growth → infinity —
+  `i >= 0` is PRESERVED across `i = i + 1`, strictly more precise than
+  the old blanket TOP) + a post-fixpoint verification pass (vars whose
+  outcome escapes the invariant go TOP — what makes a bounded number
+  of rounds sound). This closes the "loop invariant inference into
+  proofs" deferred row for interval invariants.
+- **Native `--contracts` ENSURES** (the deferred row, closed): the
+  native backend asserts the postcondition at EVERY return with
+  `result` bound to the returned value — violated postconditions panic
+  identically in both implementations (differentially tested).
+- **`hlprove --z3` works without a z3 binary**: a z3-solver
+  python-package fallback runs the generated .smt2; every check-sat
+  verdict is reported (the vacuity verdict was silently dropped);
+  `--z3` implies `--smt`; bool-typed `result` is declared with the
+  right sort; ensures-only contracts emit their query.
+- **`hlmodel` actually checks contracts**: `Interp(..., contracts=True)`
+  — an always-false `requires` used to pass silently despite the
+  tool's documented promise.
+- **Checker soundness fixes** (both implementations): type parameters
+  may no longer shadow builtin type names (`fn f[int](x: int)` bound
+  `int -> str` — a type hole); unresolved type parameters are NOT
+  Send (a generic `ch.send(take(v))` could send a `Task` join handle
+  across a channel); `spawn(f)` adds f to the caller's effect graph
+  (a `uses Conc` main could transitively print through a task while
+  --audit stayed clean); zero-argument contracts are constant-evaluated
+  at call sites (`fn f() requires false`); extern call arguments are
+  type-checked ONCE (`puts(take(s))` no longer reports a phantom
+  "use of moved value"); effect-violation witnesses iterate in sorted
+  order (PYTHONHASHSE seed nondeterminism).
+- **Lexer/parser** (both implementations): hex/adjoined-letter
+  literals rejected with a clear error; ≥4300-digit and out-of-range
+  integer literals rejected cleanly (no raw Python tracebacks);
+  float literals overflowing to infinity rejected; lone-CR files
+  report correct line numbers; `g()?[0]` parses (qmark results are
+  indexable); `foo()?` is a valid statement (propagate-and-discard);
+  match arm patterns may omit the `Enum.` prefix (SPEC §5 grammar —
+  the checker resolves the scrutinee's enum).
+- **boot.py plumbing**: `--fast`/`--contracts`/flags after the entry
+  file are PROGRAM arguments (driving `hlc.hls --fast` through
+  Stage-0 used to silently emit a NON-fast build); `--sandbox` now
+  rejects the Proc effect (`proc_exec` escaped the filesystem
+  sandbox); the interpreter's sandbox check is byte-exact (non-UTF-8
+  path symlinks can no longer escape); BrokenPipeError at shutdown is
+  silent (`boot.py prog.hls | head`).
 
 ## STAGE 18 — Testing ecosystem & fuzzing ⬜
 

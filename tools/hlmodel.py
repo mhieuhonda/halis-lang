@@ -63,14 +63,17 @@ def main():
     rest = args[1:]
     i = 0
     while i < len(rest):
-        if rest[i] == "--fn":
-            fn_name = rest[i + 1]
-            i += 2
-        elif rest[i] == "--invariant":
-            inv_name = rest[i + 1]
-            i += 2
-        elif rest[i] == "--init":
-            init_variant = rest[i + 1]
+        if rest[i] in ("--fn", "--invariant", "--init"):
+            if i + 1 >= len(rest):
+                sys.stderr.write("hlmodel: %s expects a value\n" % rest[i])
+                return 2
+            val = rest[i + 1]
+            if rest[i] == "--fn":
+                fn_name = val
+            elif rest[i] == "--invariant":
+                inv_name = val
+            else:
+                init_variant = val
             i += 2
         else:
             sys.stderr.write("unknown option: %s\n" % rest[i])
@@ -99,7 +102,12 @@ def main():
     s_variants = enum_variants(program["enums"][s_enum], s_enum)
     e_variants = enum_variants(program["enums"][e_enum], e_enum)
 
-    interp = Interp(program, [b"hlmodel"], sys.stdout.buffer)
+    # Deep-scan-10 fix: contracts=True — the tool's docstring promises
+    # that requires/ensures are evaluated per pair; the interpreter only
+    # asserts them in contract mode. An always-false requires used to
+    # pass silently ("All transitions terminate without panic").
+    interp = Interp(program, [b"hlmodel"], sys.stdout.buffer,
+                    contracts=True)
     out = sys.stdout.buffer
     violations = 0
     print("hlmodel — exhaustive model check of '%s'" % fn_name)
@@ -123,10 +131,7 @@ def main():
                 rvar = None
                 violations += 1
                 status = "PANIC: %s" % ex.msg
-            # ensures check on the post-state (cheap, reuses interp)
-            ok = True
             print("    %s.%s + %s.%s  %s" % (s_enum, s, e_enum, e, status))
-            del ok
     if violations:
         print("")
         print("  VIOLATIONS: %d transitions panicked (see above)"

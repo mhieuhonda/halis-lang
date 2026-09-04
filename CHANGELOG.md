@@ -8,6 +8,163 @@ Releases on `main` follow the 20-stage roadmap (see [ROADMAP.md](ROADMAP.md)).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
+## [v0.30.0-alpha] — Stage 17 perfection: proof-engine soundness overhaul, native ensures, loop-invariant engine
+
+> **Stage 17 PERFECTED.** Deep review found the interval prover could
+> annotate checks PROVEN when they were not — every one a memory-safety
+> hole under `-O fast` (several confirmed native SIGSEGVs / silent
+> signed-overflow UB). All are fixed in BOTH engines with differential
+> regressions. The deferred scope is closed: native `--contracts`
+> ENSURES checks, the loop-invariant engine (Kleene + widening +
+> post-fixpoint verification), and `hlprove --z3` without a z3 binary.
+> **520/520 tests PASS**; the bootstrap is still deterministic.
+
+### Proof-engine soundness overhaul (boot/proof.py + the hlc.hls mirror)
+
+- **TOP no longer "fits" int64** — `fn add(x, y) requires x >= 0 {
+  return x + y }` was annotated `ovf_safe`; the `-O fast` build emitted
+  a raw C `+` that silently WRAPPED while checked builds panicked.
+- **While conditions are annotated with the loop invariant**, not the
+  loop-entry facts — `while xs[i] < 100 { i = i + 1 }` with
+  `xs.len() >= 1` proved a false `bnd_safe`; the native fast build
+  SIGSEGV'd at `i == 1`.
+- **`for i in range(a, b)` seeds `i` in `[a, b-1]`** — the old
+  `[0, count-1]` was wrong on BOTH bounds whenever `a != 0` (another
+  confirmed SIGSEGV). Non-const iterables seed TOP (list elements can
+  be negative).
+- **`i <= s.len()` no longer proves `xs[i]`** — the strict/non-strict
+  delta was ignored entirely, so `i == len` (out of bounds) was
+  "proven" safe. The delta now distinguishes index proofs (`<`, delta
+  -1) from slice-end bounds (`<=`, delta 0).
+- **Stale facts die on reassignment** — `requires xs.len() >= 3` then
+  `xs = [1]` kept the minlen and proved an OOB index; `y != 0` then
+  `y = 0` kept `div_safe` (a native SIGFPE). Every binding write now
+  invalidates the nz / minlen / symbolic-len facts derived from the
+  value — including NON-int targets (lists/strings).
+- **Post-loop widening for `for` loops** (stale entry facts for
+  loop-modified variables survived; `for ... { x = 0 } return 100 / x`
+  was a false `div_safe`).
+- **slice(a, b): `a <= b` is a PROVEN obligation** — it was granted
+  whenever `a`'s upper bound was unknown; `slice(5, 2)` was elided.
+- **The INT64_MIN / -1 corner fires for unbounded dividends** —
+  `x / y requires y < 0` was proven `div_safe` and hit UB at the
+  extreme corner.
+- **Symbolic len bounds never reach arithmetic** — `requires i <
+  s.len()` then `i + 1` crashed the whole compiler with a raw
+  TypeError (tuple + int).
+- **The native symbolic route works** — the hlc.hls engine looked up
+  the CONTAINER name in a map keyed by index VARIABLES, so the route
+  was dead code and the engines diverged (the Python engine elided,
+  the native one never did — including on the acceptance example's
+  byte accesses).
+- **Verdicts reset on every analysis pass** — a stale `True` from an
+  intermediate Kleene round survived into the final verdict.
+- **Internal fact keys cannot collide with identifiers** — a parameter
+  literally named `__nz__` crashed the engine with a raw
+  AttributeError.
+- **`const_eval` int division is C-truncated** — floating-point
+  division rounded `9223372036854775806 / 2` and spurred FALSE
+  "contract violation at call site" compile errors.
+- **The SMT bridge encodes C-truncated `/` and `%`** — SMT-LIB
+  div/mod are Euclidean; a contract like `requires a % 2 >= 0` got
+  wrong z3 verdicts. `cdiv`/`cmod` helper definitions now carry the
+  exact HLS semantics.
+
+### The loop-invariant engine (closes the deferred row)
+
+- While loops: two Kleene rounds + the standard widening operator
+  (growth → infinity — `i >= 0` is now PRESERVED across `i = i + 1`,
+  strictly more precise than the old blanket TOP) + a
+  **post-fixpoint verification pass** (any variable whose body outcome
+  still escapes the invariant goes TOP; the verification is what makes
+  a bounded number of rounds SOUND).
+
+### Native `--contracts` ENSURES (closes the deferred row)
+
+- The native backend asserts the postcondition at EVERY return with
+  `result` bound to the returned value. A violated `ensures` panics
+  identically in both implementations (same message, exit 101 —
+  differentially tested in run_tests.sh).
+
+### hlprove / hlmodel
+
+- `--z3` no longer requires a z3 BINARY: the z3-solver python package
+  is used as a fallback; every check-sat verdict is reported (the
+  vacuity verdict of two-query files was silently dropped); `--z3`
+  implies `--smt`; bool-typed `result` is declared Bool (it used to be
+  undeclared — a z3 error); ensures-only contracts emit their query.
+- The proof-report walker descends into match scrutinees and
+  list/struct/enum literal items (under-reported elisions).
+- `hlmodel` runs the interpreter with `contracts=True` — the tool's
+  documented per-pair requires/ensures evaluation was never enabled (an
+  always-false requires passed silently). `--fn`/`--invariant`/
+  `--init` without a value are clean errors (no IndexError traceback).
+
+### Checker soundness fixes (both implementations)
+
+- **Type parameters cannot shadow builtin type names** —
+  `fn f[int](x: int)` let a `str` argument bind `int -> str`: a type
+  soundness hole.
+- **Unresolved type parameters are NOT Send** — `fn leak[T](ch:
+  Chan[T], v: T)` sent a `Task` join handle across a channel (Task is
+  explicitly non-Send; the generic body is never re-checked at the
+  instantiation, so conservative-DENY is the only sound default).
+- **`spawn(f)` adds f to the spawner's effect graph** — a
+  `uses Conc` main could transitively perform IO/Fs/Proc through a
+  task while `--audit` reported a clean tree (struct defaults already
+  got synthetic edges for exactly this reason).
+- Zero-argument contracts are constant-evaluated at call sites
+  (`fn f() requires false` compiled cleanly).
+- Extern call arguments are type-checked ONCE — `puts(take(s))`
+  reported a phantom "use of moved value" (the early taint loop
+  re-ran `check_expr`, re-executing the move marking).
+- Effect-violation witnesses iterate in sorted order — which callee
+  got reported varied with PYTHONHASHSEED (SPEC §17.6 promises
+  deterministic Stage-0 behaviour).
+
+### Lexer / parser (both implementations)
+
+- Hex / adjoined-letter literals (`0x1F`, `123abc`) are rejected with
+  a clear error (they used to split into two tokens with a confusing
+  downstream error at the wrong token).
+- ≥4300-digit literals and out-of-int64-range literals are clean
+  compile errors (raw ValueError tracebacks crashed the CLI). 2^63
+  exactly passes the lexer so `-9223372036854775808` (int64 min) keeps
+  folding; the bare literal is still rejected by the checker.
+- Float literals that overflow to infinity (`1e400`) are rejected.
+- Lone-CR (classic Mac) files report correct line numbers.
+- `g()?[0]` parses — qmark results are indexable (the `[0]` used to
+  detach into a stray statement).
+- `foo()?` is a valid statement (propagate-and-discard; `match` already
+  had the same exemption).
+- Match arm patterns may omit the `Enum.` prefix (SPEC §5 grammar —
+  the checker resolves the scrutinee's enum); a bare name that matches
+  no variant is a clean error.
+
+### boot.py / interpreter
+
+- **Flag plumbing**: flags after the entry file are PROGRAM arguments —
+  `boot.py src/hlc.hls --fast in.hls out.c` used to silently swallow
+  `--fast` (the emitted C was never a fast build; `--contracts` could
+  not be plumbed through at all).
+- **`--sandbox` rejects the Proc effect** — `proc_exec("cat
+  /etc/passwd")` compiled and ran under the sandbox (only the four
+  file builtins were gated).
+- The sandbox path check is byte-exact — non-UTF-8 path bytes
+  (symlink names) escaped the realpath check while `open()` still
+  followed them.
+- BrokenPipeError at shutdown is silent (`boot.py prog.hls | head`).
+
+### Tests
+
+- 8 soundness differential regressions (`feat_proof_sound_*.hls`) —
+  each exploit must panic identically (101) in the interpreter AND the
+  `-O fast` native build.
+- Native `--contracts` ensures differential in run_tests.sh.
+- `feat_qmark_stmt.hls`, `feat_bare_pattern.hls`; fail tests for
+  hex/bigint/float-inf literals, typeparam shadowing, the Send bypass,
+  and spawn effect propagation.
+
 ## [v0.29.0-alpha] — Stage 16 perfection: bounded channels, non-blocking ops, waiter-aware deadlock detection
 
 > **Stage 16 PERFECTED.** The deferred scope from v0.27.0-alpha is

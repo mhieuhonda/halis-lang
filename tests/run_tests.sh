@@ -135,7 +135,11 @@ echo "=== 4b. Stage 17: contracts + proof (fast-mode differential) ==="
 # The proof elision must be semantics-preserving: the -O fast build
 # (checks elided where PROVEN) must produce byte-identical output to
 # the interpreter for the contracted test programs.
-for f in tests/ok/feat_contract_*.hls tests/ok/feat_proof_elide.hls; do
+# Deep-scan-10 (Stage-17 perfection): the soundness regressions are
+# also compiled -O fast — their checks must NOT be elided, so both
+# implementations must panic identically (101) byte for byte.
+for f in tests/ok/feat_contract_*.hls tests/ok/feat_proof_elide.hls \
+         tests/ok/feat_proof_sound_*.hls; do
     [ -f "$f" ] || continue
     name=$(basename "$f" .hls)
     if [ ! -x "$TMP/hlc1" ]; then
@@ -184,6 +188,39 @@ if [ $rt_rc -eq 101 ] && echo "$rt_out" | grep -q "contract violation: requires"
     ok "--contracts runtime requires violation panics cleanly (101)"
 else
     bad "--contracts did not catch the violated requires (rc=$rt_rc)"
+fi
+# Stage-17 perfection (v0.30.0-alpha): the NATIVE backend now checks
+# ENSURES at every return too (previously requires-only). Both
+# implementations must panic identically on a violated postcondition.
+cat > "$TMP/rt_ens.hls" <<'ENSEOF'
+fn bad(x: int) -> int
+    requires x > 0
+    ensures result > 100
+{
+    return x
+}
+fn main() -> int uses IO {
+    let a: int = bad(5)
+    println("a=" + a.to_str())
+    return 0
+}
+ENSEOF
+ens_interp=$(python3 boot/boot.py --contracts "$TMP/rt_ens.hls" </dev/null 2>&1); ens_irc=$?
+if [ ! -x "$TMP/hlc1" ]; then
+    python3 boot/boot.py src/hlc.hls src/hlc.hls "$TMP/hlc_nat.c" >/dev/null 2>&1
+    gcc -O2 -o "$TMP/hlc1" "$TMP/hlc_nat.c" -lm -pthread 2>/dev/null
+fi
+if "$TMP/hlc1" --contracts "$TMP/rt_ens.hls" "$TMP/rt_ens.c" >/dev/null 2>&1 \
+        && gcc -O2 -o "$TMP/rt_ens.bin" "$TMP/rt_ens.c" -lm -pthread 2>/dev/null; then
+    ens_nat=$("$TMP/rt_ens.bin" </dev/null 2>/dev/null); ens_nrc=$?
+    if [ $ens_irc -eq 101 ] && [ $ens_nrc -eq 101 ] \
+            && echo "$ens_interp" | grep -q "contract violation: ensures of 'bad'"; then
+        ok "native --contracts ensures violation panics identically (101)"
+    else
+        bad "native ensures check diverged (interp=$ens_irc nat=$ens_nrc)"
+    fi
+else
+    bad "native --contracts ensures compile failed"
 fi
 
 echo "=== 4b. Stage 14 release: tooling (hlfmt idempotent + hllint cfaware) ==="

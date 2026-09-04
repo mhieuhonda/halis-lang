@@ -60,27 +60,31 @@ def _sandbox_check(path_bytes):
     """
     if SANDBOX_ROOT is None:
         return
-    # bytes -> str using latin-1 (1:1 byte->str mapping) so the realpath
-    # check uses the EXACT same byte sequence as `open()` will.
-    if isinstance(path_bytes, bytes):
-        p = path_bytes.decode("latin-1")
-    else:
-        p = str(path_bytes)
+    # Deep-scan-10 fix: the whole check now runs on BYTES (realpath
+    # accepts and returns bytes — a byte-exact round trip). The old
+    # code decoded bytes as latin-1 to str and called realpath on the
+    # STR, which re-encoded via the UTF-8 filesystem encoding — for
+    # non-UTF-8 path bytes (e.g. b"\xff"), the realpath check ran on a
+    # DIFFERENT byte sequence than the open() call used, so a symlink
+    # named with such bytes inside the sandbox and pointing outside
+    # escaped the check while open() still followed it.
+    p = path_bytes if isinstance(path_bytes, bytes) \
+        else str(path_bytes).encode("utf-8")
     if not os.path.isabs(p):
-        p = os.path.join(os.getcwd(), p)
+        p = os.path.join(os.getcwd().encode("utf-8"), p)
     # realpath resolves symlinks; if the path does not exist, it
     # resolves as far as possible (the existing prefix) and leaves
     # the rest verbatim. That is enough: if any component of the
     # existing prefix points outside the sandbox, we reject.
     resolved = os.path.realpath(p)
     # Common-prefix check: SANDBOX_ROOT must be a prefix of `resolved`,
-    # AND the character after the prefix must be a separator (or end
-    # of string) — otherwise "/sandbox_evil" would be allowed inside
+    # AND the byte after the prefix must be a separator (or end of
+    # string) — otherwise "/sandbox_evil" would be allowed inside
     # "/sandbox".
-    sb = SANDBOX_ROOT
+    sb = SANDBOX_ROOT.encode("utf-8")
     if resolved == sb:
         return
-    if not resolved.startswith(sb + os.sep):
+    if not resolved.startswith(sb + b"/"):
         raise HLPanic("sandbox violation: path '%s' resolves outside the sandbox"
                       % to_display(path_bytes), 0)
 

@@ -155,6 +155,10 @@ struct Ctx {
     entry_dir: str,
     repo_root: str,
     cur_fn_ret: str,
+    # cur_fn: the key of the function being generated (v0.30.0-alpha:
+    # needed by the return handler to find the ensures clause for the
+    # --contracts postcondition checks).
+    cur_fn: str,
     cur_typeparams: list[str],
     cur_targs: list[str],
     fn_insts: list[str],
@@ -206,7 +210,7 @@ fn new_ctx(src: str) -> Ctx {
         edges: map_new(),
         imports: [], loaded_files: [],
         entry_dir: "", repo_root: "",
-        cur_fn_ret: "void", cur_typeparams: [], cur_targs: [],
+        cur_fn_ret: "void", cur_fn: "", cur_typeparams: [], cur_targs: [],
         fn_insts: [], struct_insts: [], enum_insts: [],
         computed_effects: map_new(),
         hoist_map: map_new(), null_after: [], clone_insts: [], loop_header: 0,
@@ -499,6 +503,71 @@ fn lex_err(msg: str, line: int, col: int) -> void {
     panic("lex error: " + msg + " (line " + line.to_str() + ":" + col.to_str() + ")")
 }
 
+# str_contains_inf: does a float literal text evaluate to infinity?
+# (Deep-scan-10: cheap conservative test - an exponent >= 400 or a
+# mantissa with > 309 significant digits overflows double range.)
+fn str_contains_inf(t: str) -> bool {
+    let epos: int = str_find_ch(t, 101)
+    let mut p: int = epos
+    if p == -1 {
+        p = str_find_ch(t, 69)
+    }
+    if p == -1 {
+        return t.len() > 320
+    }
+    # exponent magnitude
+    let mut q: int = p + 1
+    let mut neg: bool = false
+    if q < t.len() && (t.byte_at(q) == 43 || t.byte_at(q) == 45) {
+        if t.byte_at(q) == 45 {
+            neg = true
+        }
+        q = q + 1
+    }
+    let mut mag: int = 0
+    while q < t.len() {
+        mag = mag * 10 + (t.byte_at(q) - 48)
+        if mag > 100000 {
+            mag = 100000
+        }
+        q = q + 1
+    }
+    if neg {
+        return false
+    }
+    return mag > 308
+}
+
+fn str_find_ch(t: str, ch: int) -> int {
+    let mut i: int = 0
+    while i < t.len() {
+        if t.byte_at(i) == ch {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+# int_lit_over_range: an INT literal string whose value exceeds 2^63
+# exactly (the parser folds `-`+2^63 into int64 min; anything larger has
+# no int64 representation at all).
+fn int_lit_over_range(t: str) -> bool {
+    # Compare digit strings against "9223372036854775808" (2^63).
+    let lim: str = "9223372036854775808"
+    let s: str = t
+    let mut si: int = 0
+    # strip leading zeros
+    while si + 1 < s.len() && s.byte_at(si) == 48 {
+        si = si + 1
+    }
+    let s2: str = s.slice(si, s.len())
+    if s2.len() != lim.len() {
+        return s2.len() > lim.len()
+    }
+    return s2 > lim
+}
+
 fn lex(ctx: Ctx) -> void {
     let src: str = ctx.src
     let n: int = src.len()
@@ -507,9 +576,18 @@ fn lex(ctx: Ctx) -> void {
     let mut col: int = 1
     while i < n {
         let c: int = src.byte_at(i)
-        # whitespace
-        if c == 32 || c == 9 || c == 13 {
+        # whitespace. Deep-scan-10: a lone \r (CR-only files) is a LINE
+        # TERMINATOR (CRLF: the following \n handles it).
+        if c == 32 || c == 9 {
             col = col + 1
+            i = i + 1
+        } else if c == 13 {
+            if i + 1 < n && src.byte_at(i + 1) == 10 {
+                col = col + 1
+            } else {
+                line = line + 1
+                col = 1
+            }
             i = i + 1
         } else if c == 10 {
             line = line + 1
@@ -566,10 +644,29 @@ fn lex(ctx: Ctx) -> void {
                     }
                 }
             }
+            # Deep-scan-10: digits immediately followed by identifier
+            # characters (0x1F, 123abc) are rejected with a clear error
+            # (they used to split into two tokens and confuse the parser).
+            if j < n && is_ident_start(src.byte_at(j)) {
+                lex_err("invalid numeric literal '" + src.slice(i, j + 1)
+                    + "' (digits followed by letters - HLS has no hex/adjoined-letter literals)", line, col)
+            }
             let text: str = filter_us(src.slice(i, j))
             if is_f {
+                # Deep-scan-10: a float literal that overflows to
+                # infinity (1e400) is rejected (mirrors the Stage-0 fix).
+                if str_contains_inf(text) {
+                    lex_err("float literal overflows to infinity: " + src.slice(i, j), line, col)
+                }
                 ctx.toks.push(mk_tok("float", text, line, col))
             } else {
+                # Deep-scan-10: int literals out of the lexer range are
+                # rejected (up to 2^63 exactly is allowed through - the
+                # parser folds `-` + 9223372036854775808 into int64 min;
+                # a bare 2^63 is rejected by the checker's literal rule).
+                if int_lit_over_range(text) {
+                    lex_err("integer literal out of int64 range: " + src.slice(i, j), line, col)
+                }
                 ctx.toks.push(mk_tok("int", text, line, col))
             }
             col = col + (j - i)
@@ -841,6 +938,17 @@ fn parse_typeparams(ctx: Ctx) -> list[str] {
         let t: Tok = ctx.toks.get(ctx.pos)
         if t.kind != "ident" {
             perr(ctx, "expected type parameter name but got " + tok_desc(ctx))
+        }
+        # Deep-scan-10 soundness fix: a type parameter named after a
+        # builtin type hijacks instantiation (type_map is consulted
+        # before the primitive table), so `fn f[int](x: int)` accepted
+        # a str argument. Mirror of the boot/parser.py fix.
+        if t.value == "int" || t.value == "float" || t.value == "bool"
+            || t.value == "str" || t.value == "void" || t.value == "list"
+            || t.value == "map" || t.value == "tainted" || t.value == "Chan"
+            || t.value == "Task" || t.value == "Option" || t.value == "Result" {
+            perr_at(ctx, "type parameter cannot be named '" + t.value
+                + "' (it is a builtin type name and would shadow it)", t)
         }
         ctx.pos = ctx.pos + 1
         out.push(t.value)
@@ -1367,7 +1475,9 @@ fn parse_stmt(ctx: Ctx) -> int {
         return idx
     }
     let ek2: str = ctx.exprs[e].kind
-    if ek2 != "call" && ek2 != "method" && ek2 != "fieldcall" && ek2 != "match" {
+    # Deep-scan-10: `foo()?` as a statement is the idiomatic error-
+    # propagate-and-discard form (mirror of the boot/parser.py fix).
+    if ek2 != "call" && ek2 != "method" && ek2 != "fieldcall" && ek2 != "match" && ek2 != "qmark" {
         perr(ctx, "expression as statement must be a function/method call")
     }
     let idx: int = nx_stmt(ctx, "expr", ctx.exprs[e].line)
@@ -1493,7 +1603,9 @@ fn parse_unary(ctx: Ctx, allow_struct: bool) -> int {
 }
 
 fn can_index(k: str) -> bool {
-    return k == "ident" || k == "field" || k == "index" || k == "call" || k == "method" || k == "fieldcall"
+    # Deep-scan-10: qmark results are indexable (g()?[0] used to detach
+    # the [0] into a stray statement).
+    return k == "ident" || k == "field" || k == "index" || k == "call" || k == "method" || k == "fieldcall" || k == "qmark"
 }
 
 fn parse_postfix(ctx: Ctx, allow_struct: bool) -> int {
@@ -1582,9 +1694,18 @@ fn parse_match(ctx: Ctx) -> int {
             pat_kind = "wildcard"
         } else {
             pat_kind = "variant"
+            # Deep-scan-10: a BARE variant pattern (no `Enum.` prefix) is
+            # accepted per the SPEC §5 grammar; the checker resolves the
+            # enum from the scrutinee's type (mirror of boot/parser.py).
             enum_name = eat_ident(ctx)
-            eat_sym(ctx, ".")
-            variant = eat_ident(ctx)
+            variant = ""
+            if at_sym(ctx, ".") {
+                eat_sym(ctx, ".")
+                variant = eat_ident(ctx)
+            } else {
+                variant = enum_name
+                enum_name = ""
+            }
             if at_sym(ctx, "(") {
                 has_paren = true
                 eat_sym(ctx, "(")
@@ -2613,13 +2734,26 @@ fn iv_join(a: IVal, b: IVal) -> IVal {
 }
 
 fn iv_fits(a: IVal) -> bool {
-    if a.lo < INF_LO() {
+    # Deep-scan-10 CRITICAL soundness fix: an UNKNOWN (sentinel) bound
+    # means the value may be anywhere - TOP used to 'fit' int64, so a
+    # partially-unknown operand was annotated ovf_safe and -O fast
+    # emitted a raw C op that silently wrapped (signed-overflow UB)
+    # while the checked builds panicked. Both bounds must be FINITE
+    # (a bound that equals a sentinel is treated as unknown - sound).
+    if a.lo == INF_LO() {
         return false
     }
-    if a.hi > INF_HI() {
+    if a.hi == INF_HI() {
         return false
     }
     return true
+}
+
+fn iv_contains(a: IVal, b: IVal) -> bool {
+    # True if interval a contains interval b. The INF sentinels make
+    # plain numeric comparisons do the right thing (INF_LO <= any lo,
+    # any hi <= INF_HI).
+    return a.lo <= b.lo && b.hi <= a.hi
 }
 
 fn iv_excl_zero(a: IVal) -> bool {
@@ -2639,7 +2773,7 @@ fn iv_excl_zero(a: IVal) -> bool {
 # nz: vars proven != 0.
 fn seed_from_requires(ctx: Ctx, e: int, f: FnInfo,
                       facts: map[str, IVal], facts_lenhi: map[str, str],
-                      nz: list[str]) -> void {
+                      nz: map[str, bool]) -> void {
     if e < 0 {
         return
     }
@@ -2666,40 +2800,47 @@ fn seed_from_requires(ctx: Ctx, e: int, f: FnInfo,
         seed_bound(facts, rn.name, op, ln.ival, false)
         return
     }
-    # var != 0 with the var an int param (both orders).
+    # var != 0 with the var an int param (both orders). v0.30.0-alpha:
+    # nz is a map so branches can join (AND) and reassignment can kill.
     if op == "!=" && ln.kind == "int" && ln.ival == 0 && rn.kind == "ident" {
-        if is_int_param(f, rn.name) && !list_has(nz, rn.name) {
-            nz.push(rn.name)
+        if is_int_param(f, rn.name) {
+            nz.set(rn.name, true)
         }
         return
     }
     if op == "!=" && rn.kind == "int" && rn.ival == 0 && ln.kind == "ident" {
-        if is_int_param(f, ln.name) && !list_has(nz, ln.name) {
-            nz.push(ln.name)
+        if is_int_param(f, ln.name) {
+            nz.set(ln.name, true)
         }
         return
     }
-    # var < s.len() — symbolic upper bound.
+    # var < s.len() / var <= s.len() — symbolic upper bound on the var.
+    # Deep-scan-10 soundness fix: ONLY the STRICT `<` (var <= len-1)
+    # proves an INDEX; `<=` (var <= len) is valid solely as a slice
+    # END bound. The two forms are distinguished by a "~" suffix on the
+    # stored owner (identifiers cannot contain ~, so the encodings
+    # cannot collide).
     if ln.kind == "ident" && is_int_param(f, ln.name) && is_len_of(ctx, r) {
-        if op == "<" || op == "<=" {
+        if op == "<" {
             facts_lenhi.set(ln.name, len_owner(ctx, r))
-            let old: IVal = facts.get_or(ln.name, iv_top())
-            facts.set(ln.name, IVal { lo: old.lo, hi: INF_HI() })
+        } else if op == "<=" {
+            facts_lenhi.set(ln.name, len_owner(ctx, r) + "~")
         }
         return
     }
-    # s.len() > var
+    # s.len() > var / s.len() >= var
     if rn.kind == "ident" && is_int_param(f, rn.name) && is_len_of(ctx, l) {
-        if op == ">" || op == ">=" {
+        if op == ">" {
             facts_lenhi.set(rn.name, len_owner(ctx, l))
-            let old2: IVal = facts.get_or(rn.name, iv_top())
-            facts.set(rn.name, IVal { lo: old2.lo, hi: INF_HI() })
+        } else if op == ">=" {
+            facts_lenhi.set(rn.name, len_owner(ctx, l) + "~")
         }
         return
     }
     # Minimum-length facts: s.len() >= K (either order) — stored in
-    # facts_lenhi under the key "__minlen__<owner>" (encoded as a
-    # decimal string) so the bounds checks can use the numeric route.
+    # facts_lenhi under the key "~ml~<owner>" (encoded as a decimal
+    # string; the prefix cannot collide with identifiers) so the bounds
+    # checks can use the numeric route.
     if op == ">=" || op == ">" || op == "==" {
         if is_len_of(ctx, l) && rn.kind == "int" {
             let owner: str = len_owner(ctx, l)
@@ -2724,7 +2865,9 @@ fn seed_from_requires(ctx: Ctx, e: int, f: FnInfo,
 
 # set_minlen: record minlen[owner] = k (keep the MAXIMUM when merged).
 fn set_minlen(facts_lenhi: map[str, str], owner: str, k: int) -> void {
-    let key: str = "__minlen__" + owner
+    # The "~ml~" prefix cannot appear in any HLS identifier, so no
+    # variable name can collide with these synthetic keys (deep-scan-10).
+    let key: str = "~ml~" + owner
     if !facts_lenhi.has(key) {
         facts_lenhi.set(key, k.to_str())
         return
@@ -2738,7 +2881,7 @@ fn set_minlen(facts_lenhi: map[str, str], owner: str, k: int) -> void {
 
 # get_minlen: read minlen[owner]; -1 when absent.
 fn get_minlen(facts_lenhi: map[str, str], owner: str) -> int {
-    let key: str = "__minlen__" + owner
+    let key: str = "~ml~" + owner
     if !facts_lenhi.has(key) {
         return -1
     }
@@ -2893,40 +3036,44 @@ fn expr_interval(ctx: Ctx, e: int, facts: map[str, IVal], depth: int) -> IVal {
 }
 
 # annotate_exprs: walk one expression tree, setting the safety verdicts.
+# v0.30.0-alpha (deep-scan-10): every verdict is RESET on each pass -
+# the loop analysis visits expressions in multiple passes (Kleene
+# rounds + the final invariant pass) and a stale True from a
+# too-precise intermediate pass must never survive. The symbolic len
+# lookups now resolve the INDEX VARIABLE (the old code looked up the
+# CONTAINER name in a map keyed by index vars - the lookup could never
+# match, so the symbolic route was dead code and the engines diverged).
 fn annotate_exprs(ctx: Ctx, e: int, facts: map[str, IVal],
-                  facts_lenhi: map[str, str], nz: list[str], depth: int) -> void {
+                  facts_lenhi: map[str, str], nz: map[str, bool], depth: int) -> void {
     if e < 0 || depth > 64 {
         return
     }
     let n: ExprN = ctx.exprs[e]
-    # int + - * overflow provability.
+    # int + - * / % provability (each verdict is set BOTH ways).
     if n.kind == "bin" && n.t == "int" {
         if n.op == "+" {
-            if iv_fits(iv_add(expr_interval(ctx, n.left, facts, 0),
-                              expr_interval(ctx, n.right, facts, 0))) {
-                ctx.exprs[e].ovf_safe = true
-            }
+            ctx.exprs[e].ovf_safe = iv_fits(iv_add(expr_interval(ctx, n.left, facts, 0),
+                                                   expr_interval(ctx, n.right, facts, 0)))
         } else if n.op == "-" {
-            if iv_fits(iv_sub(expr_interval(ctx, n.left, facts, 0),
-                              expr_interval(ctx, n.right, facts, 0))) {
-                ctx.exprs[e].ovf_safe = true
-            }
+            ctx.exprs[e].ovf_safe = iv_fits(iv_sub(expr_interval(ctx, n.left, facts, 0),
+                                                   expr_interval(ctx, n.right, facts, 0)))
         } else if n.op == "*" {
-            if iv_fits(iv_mul(expr_interval(ctx, n.left, facts, 0),
-                              expr_interval(ctx, n.right, facts, 0))) {
-                ctx.exprs[e].ovf_safe = true
-            }
+            ctx.exprs[e].ovf_safe = iv_fits(iv_mul(expr_interval(ctx, n.left, facts, 0),
+                                                   expr_interval(ctx, n.right, facts, 0)))
         } else if n.op == "/" || n.op == "%" {
             # Division safety: divisor excludes zero (numeric or the nz
-            # set), and not the INT64_MIN / -1 overflow corner.
+            # map), and not the INT64_MIN / -1 overflow corner (an
+            # unbounded-below dividend lo == INF_LO() IS INT64_MIN for
+            # the sentinel arithmetic, so the corner fires correctly).
             let ri: IVal = expr_interval(ctx, n.right, facts, 0)
             let mut okz: bool = iv_excl_zero(ri)
             if !okz {
                 let rn: ExprN = ctx.exprs[n.right]
-                if rn.kind == "ident" && list_has(nz, rn.name) {
+                if rn.kind == "ident" && nz.get_or(rn.name, false) {
                     okz = true
                 }
             }
+            let mut proven: bool = false
             if okz {
                 let li: IVal = expr_interval(ctx, n.left, facts, 0)
                 let mut corner: bool = false
@@ -2936,25 +3083,39 @@ fn annotate_exprs(ctx: Ctx, e: int, facts: map[str, IVal],
                     }
                 }
                 if !corner {
-                    ctx.exprs[e].div_safe = true
+                    proven = true
                 }
             }
+            ctx.exprs[e].div_safe = proven
         }
     }
-    # Index bounds provability: xs[i] with i in [0, len(xs)-1] where the
-    # container is the ident the symbolic bound points at.
+    # Index bounds provability: xs[i] with i in [0, len(xs)-1].
     if n.kind == "index" {
         let tn: ExprN = ctx.exprs[n.left]
         if tn.kind == "ident" {
+            ctx.exprs[e].bnd_safe = false  # reset each pass
             let ii: IVal = expr_interval(ctx, n.right, facts, 0)
-            let owner: str = facts_lenhi.get_or(tn.name, "")
-            if owner == tn.name && ii.lo >= 0 {
-                ctx.exprs[e].bnd_safe = true
-            } else {
-                # Numeric route: i in [lo, hi] with hi < minlen[container].
-                let ml: int = get_minlen(facts_lenhi, tn.name)
-                if ml > 0 && ii.lo >= 0 && ii.hi != INF_HI() && ii.hi < ml {
+            if ii.lo >= 0 {
+                # Symbolic route: the INDEX expression is an ident var
+                # carrying a STRICT len bound (x < s.len()) that points
+                # at THIS container (a "~"-suffixed <= bound must NOT
+                # match - x == len is out of bounds).
+                let mut sym_ok: bool = false
+                let idxn: ExprN = ctx.exprs[n.right]
+                if idxn.kind == "ident" {
+                    let owner: str = facts_lenhi.get_or(idxn.name, "")
+                    if owner == tn.name {
+                        sym_ok = true
+                    }
+                }
+                if sym_ok {
                     ctx.exprs[e].bnd_safe = true
+                } else {
+                    # Numeric route: i in [lo, hi] with hi < minlen[container].
+                    let ml: int = get_minlen(facts_lenhi, tn.name)
+                    if ml > 0 && ii.hi != INF_HI() && ii.hi < ml {
+                        ctx.exprs[e].bnd_safe = true
+                    }
                 }
             }
         }
@@ -2963,28 +3124,61 @@ fn annotate_exprs(ctx: Ctx, e: int, facts: map[str, IVal],
     if n.kind == "method" && (n.mop == "str.byte_at" || n.mop == "str.slice") {
         let tn2: ExprN = ctx.exprs[n.left]
         if tn2.kind == "ident" {
-            let owner2: str = facts_lenhi.get_or(tn2.name, "")
-            let sym_ok: bool = owner2 == tn2.name
-            let ml2: int = get_minlen(facts_lenhi, tn2.name)
+            ctx.exprs[e].bnd_safe = false  # reset each pass
             if n.mop == "str.byte_at" && n.args.len() == 1 {
-                let ii2: IVal = expr_interval(ctx, n.args.get(0), facts, 0)
+                let idxe: int = n.args.get(0)
+                let idxn2: ExprN = ctx.exprs[idxe]
+                let ii2: IVal = expr_interval(ctx, idxe, facts, 0)
                 if ii2.lo >= 0 {
-                    if sym_ok {
+                    # Symbolic: the index ident has a strict len bound on
+                    # THIS string.
+                    let mut sym_ok2: bool = false
+                    if idxn2.kind == "ident" {
+                        let owner2: str = facts_lenhi.get_or(idxn2.name, "")
+                        if owner2 == tn2.name {
+                            sym_ok2 = true
+                        }
+                    }
+                    if sym_ok2 {
                         ctx.exprs[e].bnd_safe = true
-                    } else if ml2 > 0 && ii2.hi != INF_HI() && ii2.hi < ml2 {
-                        ctx.exprs[e].bnd_safe = true
+                    } else {
+                        let ml2: int = get_minlen(facts_lenhi, tn2.name)
+                        if ml2 > 0 && ii2.hi != INF_HI() && ii2.hi < ml2 {
+                            ctx.exprs[e].bnd_safe = true
+                        }
                     }
                 }
             }
             if n.mop == "str.slice" && n.args.len() == 2 {
+                # slice(a, b): 0 <= a, a <= b PROVEN, and b <= len.
                 let ai: IVal = expr_interval(ctx, n.args.get(0), facts, 0)
                 let bi: IVal = expr_interval(ctx, n.args.get(1), facts, 0)
-                if ai.lo >= 0 && bi.lo >= 0 {
-                    if sym_ok {
-                        ctx.exprs[e].bnd_safe = true
-                    } else if ml2 > 0 && ai.hi != INF_HI() && ai.hi < ml2
-                        && bi.hi != INF_HI() && bi.hi < ml2 {
-                        ctx.exprs[e].bnd_safe = true
+                if ai.lo >= 0 {
+                    # a <= b must be PROVEN (deep-scan-10: an unknown a
+                    # upper bound used to count as proven - slice(5, 2)
+                    # was elided and the runtime panicked on a negative
+                    # length).
+                    let a_le_b: bool = ai.hi != INF_HI() && bi.lo != INF_LO()
+                        && ai.hi <= bi.lo
+                    if a_le_b {
+                        # b <= len: the strict symbolic bound (owner) or
+                        # the non-strict one (owner~), or the numeric
+                        # minlen route.
+                        let bn: ExprN = ctx.exprs[n.args.get(1)]
+                        let mut ok_b: bool = false
+                        if bn.kind == "ident" {
+                            let ownerb: str = facts_lenhi.get_or(bn.name, "")
+                            if ownerb == tn2.name || ownerb == tn2.name + "~" {
+                                ok_b = true
+                            }
+                        }
+                        let ml3: int = get_minlen(facts_lenhi, tn2.name)
+                        if !ok_b && ml3 > 0 && bi.hi != INF_HI() && bi.hi < ml3 {
+                            ok_b = true
+                        }
+                        if ok_b {
+                            ctx.exprs[e].bnd_safe = true
+                        }
                     }
                 }
             }
@@ -3035,61 +3229,127 @@ fn const_range_count(ctx: Ctx, e: int) -> int {
 
 # annotate_stmts: walk statements, updating facts for int lets/assigns,
 # if/else joins, for-range bounds; annotate every expression.
+#
+# v0.30.0-alpha (Stage-17 perfection, mirrors boot/proof.py):
+#   * while conditions are annotated with the LOOP INVARIANT (entry
+#     facts joined over body outcomes, widened) - the old code used the
+#     entry facts, but the condition is re-evaluated on EVERY iteration
+#     with loop-modified values (false bnd_safe -> native OOB reads);
+#   * while loops run two Kleene rounds + the widening operator + a
+#     POST-FIXPOINT VERIFICATION pass (vars whose outcome still escapes
+#     the invariant go TOP - the verification is what makes a bounded
+#     number of rounds sound);
+#   * for-range(a, b) seeds the loop var in [a, b-1] (the old code
+#     seeded [0, count-1] - wrong on both bounds whenever a != 0);
+#     non-const-range loops seed TOP (list elements may be negative);
+#   * facts are joined AFTER for/while loops too (stale entry facts for
+#     loop-modified vars used to survive - a false div_safe);
+#   * let/assign invalidates nz / minlen / symbolic-len facts derived
+#     from the reassigned variable's value (deep-scan-10).
 fn annotate_stmts(ctx: Ctx, stmts: list[int], facts: map[str, IVal],
-                  facts_lenhi: map[str, str], nz: list[str], depth: int) -> void {
+                  facts_lenhi: map[str, str], nz: map[str, bool], depth: int) -> void {
     if depth > 32 {
         return
     }
     let mut si: int = 0
     while si < stmts.len() {
         let s: StmtN = ctx.stmts.get(stmts.get(si))
-        # Annotate the statement's expressions FIRST (pre-state facts).
-        annotate_exprs(ctx, s.value, facts, facts_lenhi, nz, 0)
-        annotate_exprs(ctx, s.cond, facts, facts_lenhi, nz, 0)
-        annotate_exprs(ctx, s.iter, facts, facts_lenhi, nz, 0)
-        annotate_exprs(ctx, s.e, facts, facts_lenhi, nz, 0)
-        if s.target >= 0 {
-            # For `xs[i] = v`, annotate the index subexpression.
-            let tgt: ExprN = ctx.exprs[s.target]
-            if tgt.kind == "index" {
-                annotate_exprs(ctx, tgt.right, facts, facts_lenhi, nz, 0)
-            }
-        }
-        # Update facts from let / assign.
-        if s.kind == "let" {
-            if s.vtype == "int" {
-                facts.set(s.name, expr_interval(ctx, s.value, facts, 0))
-            }
-        }
-        if s.kind == "assign" && s.target >= 0 {
-            let tgt2: ExprN = ctx.exprs[s.target]
-            if tgt2.kind == "ident" && tgt2.t == "int" {
-                facts.set(tgt2.name, expr_interval(ctx, s.value, facts, 0))
-            }
-        }
-        if s.kind == "if" {
-            # Branch-local copies; join (union) afterwards.
-            let f_then: map[str, IVal] = copy_facts(facts)
-            let f_else: map[str, IVal] = copy_facts(facts)
-            annotate_stmts(ctx, s.body, f_then, facts_lenhi, nz, depth + 1)
-            annotate_stmts(ctx, s.else_body, f_else, facts_lenhi, nz, depth + 1)
-            join_facts(facts, f_then, f_else)
-        }
         if s.kind == "while" {
-            # Unknown iterations: take the union of the entry facts and
-            # the body's outcomes (conservative widening). Modified int
-            # vars start at TOP (loop-carried-fact soundness).
-            let f_body: map[str, IVal] = copy_facts(facts)
-            let mods2: list[str] = assigned_int_vars_hlc(ctx, s.body)
-            let mut mi2: int = 0
-            while mi2 < mods2.len() {
-                f_body.set(mods2.get(mi2), iv_top())
-                mi2 = mi2 + 1
+            # The condition is annotated with the invariant INSIDE this
+            # branch (not with the entry facts below).
+            let body: list[int] = s.body
+            # Round 1: exact body outcome from the entry facts.
+            let w1: map[str, IVal] = copy_facts(facts)
+            let lh1: map[str, str] = copy_lenhi(facts_lenhi)
+            let nz1: map[str, bool] = copy_nz(nz)
+            annotate_stmts(ctx, body, w1, lh1, nz1, depth + 1)
+            let f1: map[str, IVal] = copy_facts(facts)
+            widen_facts(f1, w1)
+            # Round 2: body outcome from the joined facts.
+            let w2: map[str, IVal] = copy_facts(f1)
+            let lh2: map[str, str] = copy_lenhi(facts_lenhi)
+            let nz2: map[str, bool] = copy_nz(nz)
+            annotate_stmts(ctx, body, w2, lh2, nz2, depth + 1)
+            let f2: map[str, IVal] = copy_facts(f1)
+            widen_facts(f2, w2)
+            # Widen growth to infinity (the classic widening operator).
+            let finv: map[str, IVal] = copy_facts(f2)
+            let k2: list[str] = f2.keys()
+            let mut k2i: int = 0
+            while k2i < k2.len() {
+                let key: str = k2.get(k2i)
+                if f1.has(key) {
+                    let v1: IVal = f1.get_or(key, iv_top())
+                    let v2: IVal = f2.get_or(key, iv_top())
+                    finv.set(key, widen_growth_iv(v1, v2))
+                }
+                k2i = k2i + 1
             }
-            annotate_stmts(ctx, s.body, f_body, facts_lenhi, nz, depth + 1)
-            widen_facts(facts, f_body)
+            # POST-FIXPOINT VERIFICATION: run the body once more from the
+            # invariant; any var whose outcome escapes goes TOP (the top
+            # element cannot grow, so this stabilises).
+            let mut round: int = 0
+            while round < 4 {
+                let wchk: map[str, IVal] = copy_facts(finv)
+                let lhc: map[str, str] = copy_lenhi(facts_lenhi)
+                let nzc: map[str, bool] = copy_nz(nz)
+                annotate_stmts(ctx, body, wchk, lhc, nzc, depth + 1)
+                let ck: list[str] = wchk.keys()
+                let mut cki: int = 0
+                let grew: list[str] = []
+                while cki < ck.len() {
+                    let ckey: str = ck.get(cki)
+                    if finv.has(ckey) {
+                        let cur: IVal = finv.get_or(ckey, iv_top())
+                        let outv: IVal = wchk.get_or(ckey, iv_top())
+                        if !iv_contains(cur, outv) {
+                            grew.push(ckey)
+                        }
+                    }
+                    cki = cki + 1
+                }
+                if grew.len() == 0 {
+                    break
+                }
+                let mut gi: int = 0
+                while gi < grew.len() {
+                    finv.set(grew.get(gi), iv_top())
+                    gi = gi + 1
+                }
+                round = round + 1
+            }
+            # Annotate the CONDITION with the invariant (it is evaluated
+            # before every iteration, with loop-modified values), then
+            # the final body pass under the invariant.
+            annotate_exprs(ctx, s.cond, finv, facts_lenhi, nz, 0)
+            let wfin: map[str, IVal] = copy_facts(finv)
+            let lhfin: map[str, str] = copy_lenhi(facts_lenhi)
+            let nzfin: map[str, bool] = copy_nz(nz)
+            annotate_stmts(ctx, body, wfin, lhfin, nzfin, depth + 1)
+            # Post-loop state: facts := finv (stale keys go TOP - maps
+            # cannot delete entries).
+            let fk: list[str] = finv.keys()
+            let mut fki: int = 0
+            while fki < fk.len() {
+                facts.set(fk.get(fki), finv.get_or(fk.get(fki), iv_top()))
+                fki = fki + 1
+            }
+            let oldk: list[str] = facts.keys()
+            let mut oki: int = 0
+            while oki < oldk.len() {
+                let ok: str = oldk.get(oki)
+                if !finv.has(ok) {
+                    facts.set(ok, iv_top())
+                }
+                oki = oki + 1
+            }
+            si = si + 1
+            continue
         }
         if s.kind == "for" {
+            # The iter expression sees the entry facts (it is evaluated
+            # once, before the loop).
+            annotate_exprs(ctx, s.iter, facts, facts_lenhi, nz, 0)
             let f_body2: map[str, IVal] = copy_facts(facts)
             # SOUNDNESS: int vars assigned inside the loop can change
             # across iterations — their entry facts may not hold at
@@ -3103,15 +3363,72 @@ fn annotate_stmts(ctx: Ctx, stmts: list[int], facts: map[str, IVal],
                 }
                 mi = mi + 1
             }
-            let cnt: int = const_range_count(ctx, s.iter)
             if s.name != "" {
-                if cnt >= 0 {
-                    f_body2.set(s.name, IVal { lo: 0, hi: cnt - 1 })
+                if is_const_range(ctx, s.iter) {
+                    # deep-scan-10: range(a, b) iterates a..b-1 - the old
+                    # [0, count-1] was wrong on BOTH bounds when a != 0.
+                    f_body2.set(s.name, IVal { lo: const_range_a(ctx, s.iter),
+                                               hi: const_range_b(ctx, s.iter) - 1 })
                 } else {
-                    f_body2.set(s.name, IVal { lo: 0, hi: INF_HI() })
+                    # deep-scan-10: iterating a list yields arbitrary
+                    # element values - TOP, not [0, +inf).
+                    f_body2.set(s.name, iv_top())
                 }
             }
             annotate_stmts(ctx, s.body, f_body2, facts_lenhi, nz, depth + 1)
+            # Post-loop: join the entry facts with the body outcome; the
+            # loop var goes TOP (out of scope / stale).
+            widen_facts(facts, f_body2)
+            facts.set(s.name, iv_top())
+            si = si + 1
+            continue
+        }
+        # Annotate the statement's expressions FIRST (pre-state facts).
+        annotate_exprs(ctx, s.value, facts, facts_lenhi, nz, 0)
+        annotate_exprs(ctx, s.cond, facts, facts_lenhi, nz, 0)
+        annotate_exprs(ctx, s.e, facts, facts_lenhi, nz, 0)
+        if s.target >= 0 {
+            # For `xs[i] = v`, annotate the index subexpression.
+            let tgt: ExprN = ctx.exprs[s.target]
+            if tgt.kind == "index" {
+                annotate_exprs(ctx, tgt.right, facts, facts_lenhi, nz, 0)
+            }
+        }
+        # Update facts from let / assign. Deep-scan-10 (Stage-17
+        # perfection): the VALUE-fact invalidation (nz / minlen /
+        # symbolic len bounds) runs for EVERY binding write — int or
+        # not. Reassigning a LIST invalidates its minimum-length fact
+        # (`requires xs.len() >= 3` then `xs = [1]`); the old code only
+        # invalidated int targets, so a stale minlen proved an
+        # out-of-bounds index (the fast build SIGSEGV'd).
+        if s.kind == "let" {
+            invalidate_value_facts(nz, facts_lenhi, s.name)
+            if s.vtype == "int" {
+                facts.set(s.name, expr_interval(ctx, s.value, facts, 0))
+            }
+        }
+        if s.kind == "assign" && s.target >= 0 {
+            let tgt2: ExprN = ctx.exprs[s.target]
+            if tgt2.kind == "ident" {
+                invalidate_value_facts(nz, facts_lenhi, tgt2.name)
+                if tgt2.t == "int" {
+                    facts.set(tgt2.name, expr_interval(ctx, s.value, facts, 0))
+                }
+            }
+        }
+        if s.kind == "if" {
+            # Branch-local copies; join (union) afterwards.
+            let f_then: map[str, IVal] = copy_facts(facts)
+            let f_else: map[str, IVal] = copy_facts(facts)
+            let lh_then: map[str, str] = copy_lenhi(facts_lenhi)
+            let lh_else: map[str, str] = copy_lenhi(facts_lenhi)
+            let nz_then: map[str, bool] = copy_nz(nz)
+            let nz_else: map[str, bool] = copy_nz(nz)
+            annotate_stmts(ctx, s.body, f_then, lh_then, nz_then, depth + 1)
+            annotate_stmts(ctx, s.else_body, f_else, lh_else, nz_else, depth + 1)
+            join_facts(facts, f_then, f_else)
+            join_lenhi(facts_lenhi, lh_then, lh_else)
+            join_nz(nz, nz_then, nz_else)
         }
         si = si + 1
     }
@@ -3172,6 +3489,156 @@ fn widen_facts(facts: map[str, IVal], f_body: map[str, IVal]) -> void {
         }
         i = i + 1
     }
+}
+
+# widen_growth_iv: the standard interval WIDENING operator - bounds
+# that grew between the two Kleene rounds go to infinity; bounds that
+# did not grow are kept (this is what preserves e.g. `i >= 0` across a
+# `while i < n { i = i + 1 }` loop). v0.30.0-alpha.
+fn widen_growth_iv(a: IVal, b: IVal) -> IVal {
+    let mut lo: int = a.lo
+    let mut hi: int = a.hi
+    if b.lo < lo {
+        lo = INF_LO()
+    }
+    if b.hi > hi {
+        hi = INF_HI()
+    }
+    return IVal { lo: lo, hi: hi }
+}
+
+# copy_lenhi / copy_nz: shallow copies of the symbolic-bound and
+# non-zero maps (they are now per-branch, like the interval facts -
+# v0.30.0-alpha).
+fn copy_lenhi(lh: map[str, str]) -> map[str, str] {
+    let out: map[str, str] = map_new()
+    let keys: list[str] = lh.keys()
+    let mut i: int = 0
+    while i < keys.len() {
+        let k: str = keys.get(i)
+        out.set(k, lh.get_or(k, ""))
+        i = i + 1
+    }
+    return out
+}
+
+fn copy_nz(nz: map[str, bool]) -> map[str, bool] {
+    let out: map[str, bool] = map_new()
+    let keys: list[str] = nz.keys()
+    let mut i: int = 0
+    while i < keys.len() {
+        let k: str = keys.get(i)
+        out.set(k, nz.get_or(k, false))
+        i = i + 1
+    }
+    return out
+}
+
+# join_lenhi: after an if/else, a symbolic len bound survives only if
+# BOTH branches still have it (same value); a minlen entry becomes the
+# MIN of the two (both branches bound it below). Keys are set to dead
+# markers otherwise (maps cannot delete).
+fn join_lenhi(facts_lenhi: map[str, str], a: map[str, str], b: map[str, str]) -> void {
+    let keys: list[str] = a.keys()
+    let mut i: int = 0
+    while i < keys.len() {
+        let k: str = keys.get(i)
+        let va: str = a.get_or(k, "")
+        if b.has(k) {
+            let vb: str = b.get_or(k, "")
+            if is_minlen_key(k) {
+                let na: int = str_to_int_simple(va)
+                let nb: int = str_to_int_simple(vb)
+                if na <= nb {
+                    facts_lenhi.set(k, va)
+                } else {
+                    facts_lenhi.set(k, vb)
+                }
+            } else {
+                if va == vb {
+                    facts_lenhi.set(k, va)
+                } else {
+                    facts_lenhi.set(k, "")
+                }
+            }
+        } else {
+            facts_lenhi.set(k, "")
+        }
+        i = i + 1
+    }
+}
+
+fn is_minlen_key(k: str) -> bool {
+    return k.len() >= 4 && k.slice(0, 4) == "~ml~"
+}
+
+# join_nz: a non-zero fact survives an if/else only if BOTH branches
+# proved it (AND-join).
+fn join_nz(nz: map[str, bool], a: map[str, bool], b: map[str, bool]) -> void {
+    let keys: list[str] = a.keys()
+    let mut i: int = 0
+    while i < keys.len() {
+        let k: str = keys.get(i)
+        let va: bool = a.get_or(k, false)
+        let vb: bool = b.get_or(k, false)
+        nz.set(k, va && vb)
+        i = i + 1
+    }
+}
+
+# invalidate_value_facts: reassigning `tname` kills every fact derived
+# from its VALUE - the nz entry, the minimum-length fact, and every
+# symbolic len bound pointing at it (deep-scan-10: `requires
+# xs.len() >= 3` then `xs = [1]` used to keep the stale minlen and
+# prove an out-of-bounds index; likewise y != 0 then y = 0 kept
+# div_safe).
+fn invalidate_value_facts(nz: map[str, bool], facts_lenhi: map[str, str], tname: str) -> void {
+    nz.set(tname, false)
+    let mlkey: str = "~ml~" + tname
+    if facts_lenhi.has(mlkey) {
+        facts_lenhi.set(mlkey, "0")
+    }
+    let keys: list[str] = facts_lenhi.keys()
+    let mut i: int = 0
+    while i < keys.len() {
+        let k: str = keys.get(i)
+        if !is_minlen_key(k) {
+            let owner: str = facts_lenhi.get_or(k, "")
+            if owner == tname || owner == tname + "~" {
+                facts_lenhi.set(k, "")
+            }
+        }
+        i = i + 1
+    }
+}
+
+# is_const_range / const_range_a / const_range_b: `range(a, b)` with
+# both bounds int literals. v0.30.0-alpha: the loop variable spans
+# [a, b-1] (the old engine seeded [0, count-1]).
+fn is_const_range(ctx: Ctx, e: int) -> bool {
+    if e < 0 {
+        return false
+    }
+    let n: ExprN = ctx.exprs[e]
+    if n.kind != "call" || n.mkey != "range" || n.args.len() != 2 {
+        return false
+    }
+    let a: ExprN = ctx.exprs[n.args.get(0)]
+    let b: ExprN = ctx.exprs[n.args.get(1)]
+    if a.kind != "int" || b.kind != "int" {
+        return false
+    }
+    return true
+}
+
+fn const_range_a(ctx: Ctx, e: int) -> int {
+    let n: ExprN = ctx.exprs[e]
+    return ctx.exprs[n.args.get(0)].ival
+}
+
+fn const_range_b(ctx: Ctx, e: int) -> int {
+    let n: ExprN = ctx.exprs[e]
+    return ctx.exprs[n.args.get(1)].ival
 }
 
 
@@ -3252,7 +3719,7 @@ fn run_proof_pass_hlc(ctx: Ctx, f: FnInfo) -> void {
     }
     let facts: map[str, IVal] = map_new()
     let facts_lenhi: map[str, str] = map_new()
-    let nz: list[str] = []
+    let nz: map[str, bool] = map_new()
     seed_from_requires(ctx, f.requires_e, f, facts, facts_lenhi, nz)
     annotate_stmts(ctx, f.body, facts, facts_lenhi, nz, 0)
 }
@@ -4245,7 +4712,10 @@ fn type_is_send(ctx: Ctx, t: str, seen: list[str]) -> bool {
         return true
     }
     if list_has(ctx.cur_typeparams, t) {
-        return true
+        # Deep-scan-10 soundness fix: an unresolved type parameter is NOT
+        # provably Send (the generic body is never re-checked at the
+        # instantiation; Task is non-Send). Conservative-DENY.
+        return false
     }
     let seen2: list[str] = list_append_clone(seen, t)
     if is_chan_t(t) {
@@ -4446,6 +4916,11 @@ fn check_spawn_call(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int) ->
         i = i + 1
     }
     add_edge(ctx, cur, "b:spawn")
+    # Deep-scan-10 soundness fix: the spawned function IS a callee — its
+    # effects must reach the spawner's computed set (the spawner CAUSES
+    # the task's effects; struct defaults already get synthetic edges for
+    # exactly this reason). Mirror of the boot/checker.py fix.
+    add_edge(ctx, cur, fname)
     # Rewrite the node: drop the fn-name argument; record the target key
     # in mop (mkey stays "spawn" so gen_call dispatches to the spawn
     # codegen path, which reads the target from mop).
@@ -5330,6 +5805,12 @@ fn check_match(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, expecte
             }
             wildcard_idx = arm_n
         } else {
+            # Deep-scan-10: a bare pattern resolves against the
+            # scrutinee's enum (arm references the list's struct, so the
+            # field write mutates the stored arm).
+            if arm.enum_name == "" {
+                arm.enum_name = ename
+            }
             if arm.enum_name != ename {
                 cerr(arm.line, "match arm pattern belongs to enum " + arm.enum_name + ", not " + ename)
             }
@@ -9202,7 +9683,33 @@ fn gen_stmt(ctx: Ctx, sidx: int, ind: str) -> void {
                 #     return would be unreachable).
                 let fresh: bool = expr_fresh(ctx, s.value)
                 let rv: str = own_wrap(ctx, ctx.exprs[s.value].t, v, fresh)
-                if ctx.null_after.len() > 0 {
+                # Stage-17 perfection (v0.30.0-alpha): under --contracts
+                # the ENSURES assertion is checked at EVERY return, with
+                # `result` bound to the return value (the interpreter
+                # already checks both clauses; the native backend
+                # previously checked requires only — a documented gap,
+                # now closed). The value is materialised into a temp so
+                # the postcondition sees exactly what the caller gets.
+                let mut want_ens: bool = false
+                if ctx.contracts_mode && ctx.cur_fn != "" {
+                    let ef: FnInfo = ctx.fns.get_or(ctx.cur_fn, dummy_fn())
+                    if ef.ensures_e >= 0 {
+                        want_ens = true
+                    }
+                }
+                if want_ens {
+                    let rt: str = ctx.exprs[s.value].t
+                    let rt_c: str = c_type(ctx, rt)
+                    let tmp: str = fresh_tmp(ctx, "hlc_rv")
+                    ctx.out.push(ind + "{ " + rt_c + " " + tmp + " = " + rv + ";")
+                    flush_null_after(ctx, ind + "    ")
+                    let ef2: FnInfo = ctx.fns.get_or(ctx.cur_fn, dummy_fn())
+                    ctx.gen_locals.set("result", tmp)
+                    ctx.out.push(ind + "    if (!(" + gen_expr(ctx, ef2.ensures_e)
+                        + ")) hl_die(\"contract violation: ensures of '"
+                        + ef2.name + "' (function postcondition failed at runtime)\");")
+                    ctx.out.push(ind + "    return " + tmp + "; }")
+                } else if ctx.null_after.len() > 0 {
                     let rt: str = ctx.exprs[s.value].t
                     let rt_c: str = c_type(ctx, rt)
                     if rt == "void" {
@@ -9320,6 +9827,7 @@ fn gen_reset_fn(ctx: Ctx) -> void {
     ctx.gen_counts = map_new()
     ctx.hoist_map = map_new()
     ctx.null_after = []
+    ctx.cur_fn = ""
 }
 
 # gen_param_locals: Stage 8-beta — function parameters OWN one retain of
@@ -9449,6 +9957,9 @@ fn gen_fn_body(ctx: Ctx, key: str) -> void {
         return
     }
     gen_reset_fn(ctx)
+    # v0.30.0-alpha: record the fn key for the return handler's ensures
+    # checks (gen_reset_fn just cleared it).
+    ctx.cur_fn = key
     let ptypes_c: list[str] = []
     let inst_ptypes: list[str] = []
     let mut i: int = 0
