@@ -1,5 +1,7 @@
 <div align="center">
 
+![Halis logo](Halis.png)
+
 # Halis
 
 **A high-security, self-hosting, native-compiled programming language**
