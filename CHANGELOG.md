@@ -8,6 +8,139 @@ Releases on `main` follow the 20-stage roadmap (see [ROADMAP.md](ROADMAP.md)).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
+## [v0.31.0-alpha] — Non-roadmap stdlib upgrades: std.bits + std.set
+
+> Two new standard-library modules, plus their example programs and
+> regression tests. Both modules are pure HLS (no `uses IO`), so they
+> can be used inside the compiler `hlc` itself or any user program.
+> Cut from the `upgrade/deep-scan-and-beyond-v1` branch (PR #22).
+
+### `std.bits` — bitwise helpers built on arithmetic
+
+HLS has no bitwise operators (`&`, `|`, `^`, `~`, `<<`, `>>`) — the
+language core treats `int` as a mathematical int64 with checked
+arithmetic only. Many real programs (crypto, hashing, codec work,
+bit-packing) still need bit-level manipulation; rather than extend
+the language grammar, this module exposes the common bit operations
+as pure functions built on top of multiplication, division, and
+modulo.
+
+- `bits_pow2(k)` — `2^k` for `k` in `[0, 63]` (special-cases
+  `k == 63` to return `INT64_MIN`).
+- `bits_shl(x, n)`, `bits_shr(x, n)` (logical), `bits_sar(x, n)`
+  (arithmetic) — bit-by-bit O(64) to avoid int64 overflow.
+- `bits_and(a, b)`, `bits_or(a, b)`, `bits_xor(a, b)`, `bits_not(x)`.
+- `bits_get(x, n)`, `bits_set(x, n, v)` — single-bit helpers;
+  `bits_get` correctly handles negative `x` via the two's-complement
+  identity `bit k of x = 1 - bit k of (-x-1)`.
+- `bits_popcount(x)`, `bits_clz(x)`, `bits_ctz(x)`.
+- `bits_byte(x, n)`, `bits_bytes_be(x)`, `bits_bytes_le(x)`,
+  `bits_from_bytes_be(bs)`, `bits_from_bytes_le(bs)`.
+
+Acceptance:
+- `tests/ok/feat_stdlib_bits.hls` — known-answer test vectors for
+  every helper, including the negative-input edge cases that caught
+  the `bits_pow2` and `bits_sar` bugs during development.
+- `examples/bits_demo.hls` — nibble packing/unpacking, logical vs
+  arithmetic shift on a negative value, popcount/clz/ctz, big-endian
+  byte extraction with hex printing.
+
+### `std.set` — string-set helpers backed by `map[str, bool]`
+
+HLS's only map type is `map[str, T]`, so a set of strings is naturally
+represented as `map[str, bool]` (key presence is the only thing that
+matters; the value is always `true`). This module wraps that idiom
+with a clear API and adds the common set operations: union,
+intersect, difference, from-list, to-list, contains, equal.
+
+- `set_str_new()`, `set_str_from_list(xs)`.
+- `set_str_add(s, x)`, `set_str_contains(s, x)`, `set_str_size(s)`,
+  `set_str_to_list(s)`.
+- `set_str_union(a, b)`, `set_str_intersect(a, b)`,
+  `set_str_diff(a, b)`, `set_str_equal(a, b)`.
+
+Acceptance:
+- `tests/ok/feat_stdlib_set.hls` — known-answer vectors for every
+  helper, including the empty-set edge case and the duplicate-add
+  no-op semantics.
+- `examples/set_demo.hls` — a tiny document word-set demo that
+  extracts content words (unique words minus a stopword set) and
+  computes the shared vocabulary of two documents.
+
+### Test status
+
+`531/531` tests PASS. The +4 over v0.30.1-alpha are the new
+`feat_stdlib_bits` + `feat_stdlib_set` regression tests plus the
+bits_demo and set_demo example runs.
+
+### Linked issues
+
+- #20 `std.bits` feature
+- #21 `std.set` feature
+
+## [v0.30.1-alpha] — Deep-scan-11 bug fixes
+
+> A non-roadmap patch release on top of v0.30.0-alpha (Stage 17
+> perfection). Five bug fixes found by a fresh deep scan of the
+> whole codebase after the `hieu-louis-lang -> halis-lang` rename.
+> Cut from the `upgrade/deep-scan-and-beyond-v1` branch (PR #22).
+
+### Bug fixes
+
+1. **Lexer: CR-only comment handler ate the rest of the file.** The
+   `#` comment handler only stopped at `\n` (byte 10), but the
+   whitespace handler above it already treats a lone `\r` (byte 13)
+   as a line terminator. In a CR-only file (legacy Mac style), a
+   single comment swallowed every subsequent token. Now the loop
+   also stops at `\r`.
+
+2. **Docs/CI: stale repo name and version numbers.** `SECURITY.md`
+   (header was `v0.7.0-alpha`, security URL still pointed at
+   `hieu-louis-lang`), `CONTRIBUTING.md` (git clone URL, test count
+   `187`, branch-model table said `v0.20.0-alpha`), `README.md`
+   (Quick start said `185 tests`, Status header said
+   `v0.28.0-alpha`, Stage 9-alpha marked in-progress), `SPEC.md`
+   (placeholder URL), `examples/pkg_demo.hls`, `tools/hls-pkg.py`,
+   `.github/workflows/ci.yml` (header was 'Hieu Louis (HLS)',
+   example matrix skipped 7 examples), `.github/workflows/release.yml`
+   (header, tarball top-level directory, release body, clone URL,
+   test count all still `hieu-louis-lang`).
+
+3. **Editors: VS Code + Neovim syntax files out of sync with Stage
+   16/17 keyword set.** Missing `requires`/`ensures` (Stage 17),
+   `Chan`/`Task`/`Conc` (Stage 16), `spawn`/`chan_new_bounded`/
+   `select`/`try_send`/`recv_or` (Stage 16 builtins). Two
+   contradictions with the actual lexer also fixed: the VS Code
+   string-escape regex matched `\xNN` and `\r` as valid escapes (the
+   lexer rejects both), and the integer regex matched a bare `_` as
+   an integer.
+
+4. **Build: `make clean` had redundant paths.** `rm -rf $(BIN)
+   bin/hls_out bin/hls_out.c` — but `$(BIN)` IS `bin`, so the
+   trailing two paths were already covered by the recursive
+   removal. The redundant paths survived a previous refactor that
+   introduced the `$(BIN)` variable but did not prune the literal
+   paths.
+
+5. **Tests: stress_leak runner conflated empty-delta with
+   large-delta.** If the stress binary crashed before printing the
+   `rss_delta_pages=` line, the runner printed the confusing
+   `stress_leak RSS grew by  pages` message with a blank delta. Now
+   the runner distinguishes the two failure modes.
+
+### Test status
+
+`531/531` tests PASS. The +1 over main's `530` is the new
+`feat_deep_scan11_cr_comment` regression test.
+
+### Linked issues
+
+- #15 Lexer CR-only comment bug
+- #16 Docs/CI stale repo name and version
+- #17 Editors out of sync with Stage 16/17 keywords
+- #18 `make clean` redundant paths
+- #19 stress_leak runner conflated empty-delta with large-delta
+
 ## [v0.30.0-alpha] — Stage 17 perfection: proof-engine soundness overhaul, native ensures, loop-invariant engine
 
 > **Stage 17 PERFECTED.** Deep review found the interval prover could
