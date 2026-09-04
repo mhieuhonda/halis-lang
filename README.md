@@ -253,7 +253,7 @@ halis-lang/
 ├── tests/
 │   ├── ok/              #   60 valid programs (incl. safe panics + Stage 9 demos)
 │   ├── fail/            #   60 programs that MUST be rejected (types/effects/taint)
-│   └── run_tests.sh     #   185 tests: ok/fail/differential/bootstrap fixed-point
+│   └── run_tests.sh     #   549 tests: ok/fail/differential/bootstrap fixed-point
 ├── Makefile             # bootstrap · test · run · examples · audit · opt-stats · emit-ir · emit-llvm
 └── bin/                 # (generated) native hlc
 ```
@@ -279,7 +279,7 @@ Full details: [SPEC.md](SPEC.md) · Stage-by-stage roadmap:
 
 ## Status
 
-**v0.30.0-alpha — Stages 1–17 complete (Stage 17 perfected: proof-engine soundness overhaul + native ensures + loop-invariant engine)**:
+**v0.33.0-alpha — Stage 16 & 17 perfection re-verified + Deep-scan-12 (22 bug fixes across the IR optimiser, LLVM backend, stdlib, bindgen, package manager, LSP, linter, formatter, model checker, and URL module). 549/549 tests PASS, bootstrap deterministic, differential suite (interpreter ↔ native, including -O fast) byte-identical.** Previous release v0.32.0-alpha merged Dependabot PRs (action-gh-release 3, checkout 7, setup-python 7) and the deep-scan-and-beyond-v1 branch (PR #22) which closed all 7 open issues (#15-#21). Stage 17 was perfected in v0.30.0-alpha (proof-engine soundness overhaul + native ensures + loop-invariant engine).
 
 - ✅ Complete core specification
 - ✅ Stage-0 reference (interpreted, with type + effects checking)

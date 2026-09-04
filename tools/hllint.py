@@ -254,6 +254,14 @@ class Linter:
             for s in walk_stmts_collected(fn["body"]):
                 if s["k"] == "let":
                     name = s["name"]
+                    # Deep-scan-12 fix (DSS-T-10): `let _ = expr` is the
+                    # idiomatic way to discard a value (e.g. for a side
+                    # effect or to silence a "must consume" lint). The
+                    # `_` binding is intentionally unused; flagging it
+                    # as L001 is a false positive. Same for `let _foo =`
+                    # (the underscore-prefixed convention). Skip both.
+                    if name == "_" or name.startswith("_"):
+                        continue
                     if name not in refs:
                         self._warn("L001", s.get("line", 0),
                                    "let binding '%s' is never used" % name)
@@ -490,6 +498,16 @@ class Linter:
                 self._check_dead_after_return(s["then"], fname)
                 if s.get("els"):
                     self._check_dead_after_return(s["els"], fname)
+                # Deep-scan-12 fix (DSS-T-11): if BOTH branches of an
+                # `if` end in `return`, the code AFTER the if is also
+                # unreachable. The previous check only flagged a
+                # top-level `return` statement, missing the common
+                # pattern of `if cond { return X } else { return Y }`
+                # followed by more statements. Detect the
+                # both-branches-return case here.
+                if _stmts_end_in_return(s["then"]) and \
+                        _stmts_end_in_return(s.get("els") or []):
+                    seen_return = True
             elif s["k"] == "while":
                 self._check_dead_after_return(s["body"], fname)
             elif s["k"] == "for":
@@ -539,6 +557,23 @@ class Linter:
             name_m = _re.search(rb"impl\s+([A-Za-z_][A-Za-z0-9_]*)", m.group(0))
             nm = name_m.group(1).decode("utf-8", "replace") if name_m else "?"
             self._warn("L010", line, "impl block for '%s' is empty" % nm)
+
+
+def _stmts_end_in_return(stmts) -> bool:
+    """True iff the last statement of `stmts` is a `return` (or an
+    `if`/`else` whose both branches end in `return`). Used by L007 to
+    detect unreachable code after a both-branches-return if-statement.
+    Deep-scan-12 fix (DSS-T-11)."""
+    if not stmts:
+        return False
+    last = stmts[-1]
+    if last["k"] == "return":
+        return True
+    if last["k"] == "if":
+        then_returns = _stmts_end_in_return(last["then"])
+        els_returns = _stmts_end_in_return(last.get("els") or [])
+        return then_returns and els_returns
+    return False
 
 
 def walk_stmts_collected(stmts):

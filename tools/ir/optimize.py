@@ -84,6 +84,34 @@ def optimize(mod: HLIRModule, fast: bool = False) -> HLIRModule:
 # Pass 1: constant folding
 # ----------------------------------------------------------------------------
 
+def _same_hls_type(a, b) -> bool:
+    """True iff `a` and `b` are values of the SAME HLS type (so a comparison
+    or arithmetic fold is well-typed). HLS treats bool and int as distinct
+    types; Python's `bool` is a subclass of `int`, so an explicit check is
+    needed (Deep-scan-12 fix, DSS-T-13)."""
+    a_is_bool = isinstance(a, bool)
+    b_is_bool = isinstance(b, bool)
+    if a_is_bool or b_is_bool:
+        # Both must be bool (no mixing with int).
+        return a_is_bool and b_is_bool
+    a_is_int = isinstance(a, int)
+    b_is_int = isinstance(b, int)
+    if a_is_int or b_is_int:
+        return a_is_int and b_is_int
+    a_is_float = isinstance(a, float)
+    b_is_float = isinstance(b, float)
+    if a_is_float or b_is_float:
+        return a_is_float and b_is_float
+    a_is_str = isinstance(a, (str, bytes))
+    b_is_str = isinstance(b, (str, bytes))
+    if a_is_str or b_is_str:
+        return a_is_str and b_is_str \
+            and (isinstance(a, bytes) == isinstance(b, bytes)) \
+            and (isinstance(a, str) == isinstance(b, str))
+    # Fallback: same Python type.
+    return type(a) == type(b)
+
+
 def _fold_binop(op, a, b):
     """Fold a binary operation on two literal values.
     Returns (folded_value, ok). `ok` is False if the op cannot be folded
@@ -143,17 +171,29 @@ def _fold_binop(op, a, b):
                 r = abs(a) % abs(b)
                 return (r if a >= 0 else -r), True
         elif op == "==":
-            return (a == b), True
+            # Deep-scan-12 fix (DSS-T-13): HLS bool and int are distinct
+            # types. In Python `True == 1` is `True` (bool subclasses int),
+            # which would fold a mismatched-typed comparison to `True` and
+            # miscompile. Require both operands to be of the same HLS
+            # type: both bool, both int (excluding bool), both bytes/str,
+            # both float.
+            if _same_hls_type(a, b):
+                return (a == b), True
         elif op == "!=":
-            return (a != b), True
+            if _same_hls_type(a, b):
+                return (a != b), True
         elif op == "<":
-            return (a < b), True
+            if _same_hls_type(a, b):
+                return (a < b), True
         elif op == "<=":
-            return (a <= b), True
+            if _same_hls_type(a, b):
+                return (a <= b), True
         elif op == ">":
-            return (a > b), True
+            if _same_hls_type(a, b):
+                return (a > b), True
         elif op == ">=":
-            return (a >= b), True
+            if _same_hls_type(a, b):
+                return (a >= b), True
         elif op == "&&":
             if isinstance(a, bool) and isinstance(b, bool):
                 return (a and b), True
@@ -483,6 +523,23 @@ def _inline_small(mod: HLIRModule):
                 break
         if is_recursive:
             continue
+        # Deep-scan-12 soundness fix (DSS-T-01): skip functions containing
+        # OP_STORE. The inliner's rename map only rewrites ("var", name)
+        # operand tags — OP_STORE's `("name", target)` tag (the assignment
+        # target binding) is NOT rewritten, so a `let mut x: int` parameter
+        # reassigned in the callee would emit `OP_STORE ("name", "x")`
+        # into the caller's body, mutating the caller's `v_x` binding if
+        # one exists (or asserting if none). Pure functions rarely have
+        # OP_STORE (no `uses`), and the conservative skip preserves
+        # soundness at the cost of a few missed inlines. The proper fix
+        # would also rewrite `("name", ...)` tags through the rename map.
+        has_store = False
+        for ins in block.instrs:
+            if ins.op == OP_STORE:
+                has_store = True
+                break
+        if has_store:
+            continue
         # Skip functions with no terminator or non-return terminator
         # (defensive — IRBuilder always sets a terminator).
         if block.terminator is None or block.terminator.op != OP_RETURN:
@@ -566,19 +623,32 @@ def _inline_small(mod: HLIRModule):
                 ret_val = None
                 if callee_block.terminator and callee_block.terminator.args:
                     ret_val = callee_block.terminator.args[0]
+                # Deep-scan-12 fix (DSS-T-12): resolve rename first, then
+                # choose the right op. If the resolved ret_val is a var,
+                # emit OP_LOAD (a copy). If it's a lit (literal arg or a
+                # function that returns a constant), emit OP_CONST. The old
+                # code emitted `OP_LOAD ("lit", x)` for literal returns,
+                # which is invalid IR (OP_LOAD's only operand must be a
+                # var), and also discarded a function's literal return
+                # value entirely (the else branch emitted `("lit", None)`).
                 if ret_val is not None and ret_val[0] == "var":
-                    # Resolve through rename.
                     if ret_val[1] in rename:
                         ret_val = rename[ret_val[1]]
-                    # Emit a copy: dest = load ret_val.
-                    new_instrs.append(Instr(
-                        dest=ins.dest, op=OP_LOAD, args=[ret_val], line=ins.line,
-                    ))
-                else:
-                    # Void return or no return value: emit a const None
-                    # (will be DCE'd if the dest is unused).
+                if ret_val is None:
+                    # Void return: emit a const None (will be DCE'd if the
+                    # dest is unused).
                     new_instrs.append(Instr(
                         dest=ins.dest, op=OP_CONST, args=[("lit", None)],
+                        line=ins.line,
+                    ))
+                elif ret_val[0] == "var":
+                    new_instrs.append(Instr(
+                        dest=ins.dest, op=OP_LOAD, args=[ret_val],
+                        line=ins.line,
+                    ))
+                else:  # ("lit", value)
+                    new_instrs.append(Instr(
+                        dest=ins.dest, op=OP_CONST, args=[ret_val],
                         line=ins.line,
                     ))
             blk.instrs = new_instrs

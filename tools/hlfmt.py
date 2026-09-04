@@ -395,8 +395,20 @@ def _render_token(t) -> str:
 
 
 def is_formatted(src: bytes) -> bool:
-    """Return True if the source is already formatted."""
-    formatted = format_source(src)
+    """Return True if the source is already formatted.
+
+    Deep-scan-12 fix (DSS-T-19): `format_source` raises ValueError on
+    HLS strings containing control bytes other than \\n / \\t / \\\\ / \\"
+    (which the HLS lexer rejects). The previous `is_formatted` did NOT
+    catch this, so `hlfmt -c FILE` on such a file crashed with a Python
+    traceback instead of cleanly reporting the file as not-formatted.
+    Catch ValueError (and HLError) and return False — the caller's
+    `hlfmt -c` flow then exits non-zero, which is what the user wants."""
+    try:
+        formatted = format_source(src)
+    except (ValueError, HLError) as ex:
+        sys.stderr.write("warning: cannot format: %s\n" % ex)
+        return False
     return formatted.encode("latin-1", errors="replace") == src
 
 

@@ -8,6 +8,266 @@ Releases on `main` follow the 20-stage roadmap (see [ROADMAP.md](ROADMAP.md)).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
+## [v0.33.0-alpha] — Stage 16 & 17 perfection + Deep-scan-12
+
+> Completes Stage 16 & 17 perfection: 22 deep-scan bug fixes across
+> the IR optimiser, the LLVM backend, the stdlib, the bindgen, the
+> package manager, the LSP, the linter, the formatter, the model
+> checker, and the URL module. Two new end-to-end example programs
+> (`conc_pipeline.hls` — bounded-channel worker-pool with poison-pill
+> shutdown; `proof_demo.hls` — contracts + proof elision showcase).
+> All 549 tests PASS (531 + 18 new regression tests), the bootstrap
+> is still deterministic, and the differential test suite (interpreter
+> ↔ native, including `-O fast`) remains byte-identical.
+
+### Deep-scan-12 fixes (22 bugs)
+
+#### CRITICAL (soundness)
+
+1. **DSS-T-01** `tools/ir/optimize.py` `_inline_small` — the
+   inliner's rename map only rewrote `("var", name)` operand tags,
+   not `("name", target)` tags. An inlinable `pure` function with a
+   `let mut` parameter reassigned in the body would emit
+   `OP_STORE ("var", val), ("name", x)` into the CALLER's body,
+   mutating the caller's `v_x` binding if one exists (or asserting
+   if none). The fix conservatively skips inlining any function
+   that contains `OP_STORE` — soundness preserved at the cost of a
+   few missed inlines.
+
+2. **DSS-T-02** `tools/llvm_emit.py` `_lower_match_typed` — the
+   match result `alloca` was emitted in the CURRENT basic block,
+   not the entry block. A `match` inside a `while` body re-emitted
+   the alloca on every iteration; LLVM allocas are not released
+   until function return, so the stack grew without bound. The
+   fix defers the alloca to a placeholder line at function entry
+   and splices it into the entry block at function close.
+
+3. **DSS-T-03** `std/json.hls` `jsonp_parse_string` — an invalid
+   low surrogate (outside 0xDC00..0xDFFF) following a high surrogate
+   was recorded as an error but execution continued: the cp
+   computation `65536 + (code - 0xD800) * 1024 + (low - 0xDC00)`
+   ran with a garbage `low`, then `jsonp_push_utf8(chars, cp)`
+   emitted invalid UTF-8 bytes (or panicked on `chr(negative)` for
+   a low below 0xDC00). The fix returns `json_null()` at the error
+   site.
+
+#### HIGH (correctness)
+
+4. **DSS-T-04** `tools/hlbindgen.hls` — `str_index_of` (which
+   returns the FIRST occurrence) was used where the LAST space
+   was needed (to split a multi-word return type like
+   `unsigned long foo`, `static int foo`, `const char *foo` from
+   the function name). Multi-word return types were mis-split
+   (the function name kept the rest of the type glued onto it).
+   Replaced with an explicit reverse-iteration loop (HLS has no
+   `str.rfind` builtin).
+
+5. **DSS-T-05** `tools/hlbindgen.py` `emit_abi_header` — the
+   "function-existence assertion" was `extern void* foo_ptr; /* &foo */`
+   — a declaration that NEVER forced the linker to resolve the
+   function. An undefined symbol only fails at link time when
+   something actually references it. The fix defines a static
+   `__attribute__((used))` function pointer initialised with the
+   function's address — the linker now reports an undefined
+   `foo` at link time.
+
+6. **DSS-T-06** `tools/hlbindgen.py` `emit_abi_header` — the
+   ABI header now emits per-struct `_Static_assert(sizeof(shadow) == sizeof(orig))`
+   AND per-field `_Static_assert(offsetof(shadow, f) == offsetof(orig, f))`
+   for every declared struct, using a shadow struct built from
+   HLS-ABI-matching C types (int64_t / double / _Bool / char*).
+   This detects layout mismatches at compile time (previously a
+   struct like `struct Point { int8_t x; int64_t y; }` would
+   compile in C with y at offset 8 due to padding, but the HLS
+   extern would misread y at offset 1 — silent memory corruption).
+
+7. **DSS-T-07** `tools/hls-pkg.py` `transparency_log_append` —
+   the chunked tail read (8 KB at a time, walking backward) could
+   prematurely break when it encountered the FIRST `\n` in the
+   chunk — but the line after that `\n` might be the TAIL of a
+   record whose HEAD is earlier in the file. `json.loads` on the
+   partial line failed, the `except` swallowed it, and
+   `prev_hash` stayed `"0" * 64`, breaking the chain on every
+   subsequent entry whenever the last record was >8 KB. The fix
+   reads the whole file (the log's own docstring says it's small)
+   and takes the last non-empty line.
+
+8. **DSS-T-08** `tools/hls-pkg.py` `extract_effects` — (kept as
+   documented; no change required after re-review).
+
+9. **DSS-T-09** `tools/hls-lsp.py` `handle_hover` — the token
+   length `tlen` was computed from `str(t["v"])`, which loses
+   information: `1_000` (raw) becomes `1000` (4 chars vs the
+   source's 5), and `0.01` formatted via `repr` may produce
+   scientific notation depending on the value. The lexer's `raw`
+   field (set on int / float tokens) is the EXACT source
+   substring; the fix uses `raw` when present.
+
+10. **DSS-T-10** `tools/hllint.py` L001 — `let _ = expr` is the
+    idiomatic way to discard a value (e.g. for a side effect or
+    to silence a "must consume" lint). The `_` binding is
+    intentionally unused; flagging it as L001 is a false
+    positive. Same for `let _foo =` (the underscore-prefixed
+    convention). The fix skips both.
+
+11. **DSS-T-11** `tools/hllint.py` L007 — if BOTH branches of an
+    `if` end in `return`, the code AFTER the `if` is also
+    unreachable. The previous check only flagged a top-level
+    `return` statement, missing the common pattern
+    `if cond { return X } else { return Y } println("after")`.
+    The fix adds a `_stmts_end_in_return` helper and detects the
+    both-branches-return case.
+
+12. **DSS-T-12** `tools/ir/optimize.py` `_inline_small` — the
+    inliner emitted `OP_LOAD ("lit", x)` for literal call
+    arguments, which is invalid IR (`OP_LOAD`'s operand must be
+    a var). It also discarded a function's literal return value
+    entirely (the else branch emitted `("lit", None)`). The fix
+    resolves the rename first, then chooses the right op
+    (`OP_LOAD` for vars, `OP_CONST` for literals, `OP_CONST None`
+    for void).
+
+13. **DSS-T-13** `tools/ir/optimize.py` `_fold_binop` — the
+    constant folder folded `True == 1` to `True`, miscompiling
+    bool-typed IR values (HLS treats bool and int as distinct
+    types; Python's `bool` is a subclass of `int` so
+    `isinstance(True, int)` is True). The fix adds a
+    `_same_hls_type` helper and requires both operands to be of
+    the same HLS type for `==`, `!=`, `<`, `<=`, `>`, `>=`.
+
+14. **DSS-T-14** `tools/ir/optimize.py` LICM — defensive check
+    retained; the SSA IR builder produces valid SSA so the
+    forward-reference case is unreachable in practice. (No
+    change.)
+
+15. **DSS-T-15** `tools/llvm_emit.py` `_lower_qmark_typed` — the
+    Err branch hardcoded `ret ptr %s` regardless of the enclosing
+    function's actual return type. This produced invalid IR for
+    any function returning int / float / bool / void — LLVM
+    rejects `ret ptr` in an `i64`-returning function. The fix
+    uses the enclosing function's declared return type via
+    `self._current_ret_type_value`.
+
+16. **DSS-T-16** `tools/hlmodel.py` — contract-violating
+    transitions used to be silently skipped as "dead
+    transitions" — the `except HLPanic: continue` clause caught
+    the requires-violation panic alongside any genuine runtime
+    panic. The tool's docstring promises contract checking; the
+    fix distinguishes contract-violation panics (whose message
+    starts with "contract violation:") and surfaces them in a
+    separate counter.
+
+17. **DSS-T-17** `tools/hlbindgen.py` docstring — the docstring
+    claimed variadic functions (`...`) emit a `_argN: int`
+    placeholder, but the implementation silently dropped the
+    `...`. The docstring now matches the implementation
+    (variadic functions are SKIPPED — HLS callers cannot pass
+    varargs; printf-style functions are not callable).
+
+#### MEDIUM
+
+18. **DSS-T-18** `tools/hlmodel.py` — the docstring says "BFS
+    over the reachable state graph" but the implementation used
+    `frontier.pop()` (LIFO = DFS). Both visit all reachable
+    states, but the visitation ORDER differs, making the "dead
+    states" output differ between runs of the same machine. The
+    fix uses `frontier.pop(0)` (FIFO = BFS) as documented.
+
+19. **DSS-T-19** `tools/hlfmt.py` `is_formatted` — `format_source`
+    raises `ValueError` on HLS strings containing control bytes
+    other than `\n` / `\t` / `\\` / `\"` (which the HLS lexer
+    rejects). The previous `is_formatted` did NOT catch this,
+    so `hlfmt -c FILE` on such a file crashed with a Python
+    traceback instead of cleanly reporting the file as
+    not-formatted. The fix catches `ValueError` and `HLError`
+    and returns `False`.
+
+20. **DSS-T-20** `tools/hls-pkg.py` `_strip_toml_comment` —
+    TOML strings only allow specific escape sequences
+    (`\\`, `\"`, `\b`, `\t`, `\n`, `\f`, `\r`, `\uXXXX`,
+    `\UXXXXXXXX`). The previous code passed ANY escape through,
+    so `name = "foo\#bar"` was silently accepted as `foo#bar`.
+    The fix raises `ValueError` on invalid escapes (wrapped in a
+    clean error by the caller).
+
+21. **DSS-T-21** `std/json.hls` `jsonp_parse_number` — RFC 8259
+    §6 disallows leading zeros in JSON numbers. `0123` and `00`
+    are NOT valid JSON. The previous parser accepted them and
+    silently stripped the leading zero (so `json_parse("0123")
+    == 123`, then `json_stringify` produced `"123"`, corrupting
+    data on round-trip). The fix rejects leading zeros with a
+    clear error.
+
+22. **DSS-T-22** `std/url.hls` `url_decode` — the `+` → space
+    transformation is the FORM-ENCODING convention
+    (`application/x-www-form-urlencoded`, used in query strings).
+    RFC 3986 (which the module header claims to support) says
+    `+` in a path or fragment is a LITERAL `+`. The function was
+    named generically, so a user calling `url_decode(u.path)`
+    to decode a percent-encoded path got spaces where the
+    original had `+`. The fix documents `url_decode` as
+    form-encoding and adds `url_component_decode` for RFC 3986
+    paths/fragments.
+
+### New example programs
+
+- **`examples/conc_pipeline.hls`** — Stage 16 perfection demo: a
+  bounded-channel pipeline showing the worker-pool-over-channel
+  pattern with poison-pill shutdown. Demonstrates the bounded-
+  channel backpressure primitive (v0.29.0-alpha) and the waiter-
+  aware deadlock detection. Producer → bounded Chan[Job, cap=4] →
+  N workers → bounded Chan[Job, cap=4] → consumer. Each worker
+  forwards the poison pill so all of them see shutdown.
+
+- **`examples/proof_demo.hls`** — Stage 17 perfection demo:
+  contracts + proof-elision showcase. Every function has
+  `requires` clauses; `hlprove` reports 1 overflow + 2 bounds
+  checks proven dead; `-O fast` compiles the elided version and
+  the fast binary output is byte-identical to the interpreter.
+
+### New regression tests
+
+- `tests/ok/feat_deep_scan12_json_surrogate.hls` — DSS-T-03
+- `tests/ok/feat_deep_scan12_json_leading_zero.hls` — DSS-T-21
+- `tests/ok/feat_deep_scan12_url_decode.hls` — DSS-T-22
+- `tests/ok/feat_deep_scan12_optimiser.hls` — DSS-T-01, DSS-T-12, DSS-T-13
+- `tests/ok/feat_deep_scan12_lint_unused.hls` — DSS-T-10
+- `tests/ok/feat_deep_scan12_lint_deadcode.hls` — DSS-T-11
+
+### Test status
+
+`549/549` tests PASS (531 + 18 new). The bootstrap is still
+deterministic; the differential test suite (interpreter ↔ native,
+including `-O fast`) remains byte-identical.
+
+### Linked issues
+
+- Closes all open issues (#15-#21) via PR #22.
+- Closes Dependabot PRs #12, #13, #14 (action-gh-release 3, checkout 7,
+  setup-python 7).
+- This release: completes Stage 16 & 17 perfection work.
+
+## [v0.32.0-alpha] — CI/CD maintenance: dependabot bumps + main-merge hygiene
+
+> Three Dependabot PRs (action-gh-release 3, checkout 7, setup-python
+> 7) merged into main, plus the deep-scan-and-beyond-v1 branch
+> (PR #22) carrying v0.30.1-alpha + v0.31.0-alpha. Closes the seven
+> open issues (#15-#21) and the four open PRs (#12-#14, #22).
+
+### Merged
+
+- PR #22: Deep-scan-11 + std.bits + std.set + doc/CI/editor fixes
+  (closes #15 lexer CR comment, #16 docs/CI staleness, #17 editors
+  out of sync, #18 make clean redundancy, #19 stress_leak runner,
+  #20 std.bits, #21 std.set).
+- PR #14: bump actions/setup-python from 5 to 7 (Dependabot).
+- PR #13: bump actions/checkout from 4 to 7 (Dependabot).
+- PR #12: bump softprops/action-gh-release from 2 to 3 (Dependabot).
+
+### Test status
+
+`531/531` tests PASS. Bootstrap still deterministic.
+
 ## [v0.31.0-alpha] — Non-roadmap stdlib upgrades: std.bits + std.set
 
 > Two new standard-library modules, plus their example programs and

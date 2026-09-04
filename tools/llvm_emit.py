@@ -299,6 +299,13 @@ class LLVMEmitter:
         # a terminator was emitted. Used to (a) never emit instructions
         # after a terminator and (b) build phi nodes for && / ||.
         self._cur_block: Optional[str] = None
+        # Deep-scan-12 fix (DSS-T-02): deferred allocas to be flushed into
+        # the entry block when the function's body has been lowered. The
+        # `match` result slot is added here when a match is encountered
+        # mid-body; it is then emitted into the entry block at function-
+        # close time. (The entry block was already opened at line 430 with
+        # `entry:`; we append the deferred allocas right before `}`.)
+        self._entry_allocas: List[Tuple[str, str]] = []
 
     def _fresh(self, prefix="t"):
         self._tmp += 1
@@ -422,6 +429,11 @@ class LLVMEmitter:
         self._current_ret_type_value = fn["ret"]
         self._locals = {}
         self._cur_block = None
+        # Deep-scan-12 fix (DSS-T-02): per-function reset of the deferred
+        # alloca list. The list is appended to by `_lower_match_typed`
+        # (and any other construct that needs an entry-block alloca
+        # discovered after pre-collection).
+        self._entry_allocas = []
         params = []
         for (pname, ptype, _) in fn["params"]:
             params.append("%s %%v_%s" % (hls_type_to_llvm(ptype), pname))
@@ -456,6 +468,14 @@ class LLVMEmitter:
             bty = hls_type_to_llvm(btype)
             self._emit("  %s = alloca %s" % (slot, bty))
             self._slot_pool[key] = (slot, bty)
+        # Deep-scan-12 (DSS-T-02): placeholder for deferred allocas (those
+        # discovered DURING body lowering — currently only the match
+        # result slot, but extensible). We splice them in here at function
+        # close so they live in the entry block (LLVM's mem2reg pass
+        # hoists entry-block allocas, and a loop-body alloca would grow
+        # the stack on every iteration).
+        marker_idx = len(self.lines)
+        self._emit("  ; __deferred_allocas_placeholder__")
         # Lower each statement.
         for stmt in fn["body"]:
             self._lower_stmt(stmt)
@@ -468,6 +488,18 @@ class LLVMEmitter:
                 # Defensive unreachable — the checker should have rejected
                 # this function for not returning on all paths.
                 self._emit("  unreachable")
+        # Splice the deferred allocas into the placeholder line.
+        if self._entry_allocas:
+            new_lines = []
+            for (slot_name, slot_ty) in self._entry_allocas:
+                new_lines.append("  %s = alloca %s" % (slot_name, slot_ty))
+            # Replace the placeholder line (at marker_idx) with the alloca
+            # lines. self.lines is only ever appended to during body
+            # lowering, so marker_idx remains valid.
+            self.lines[marker_idx:marker_idx + 1] = new_lines
+        else:
+            # No deferred allocas — drop the placeholder comment line.
+            del self.lines[marker_idx]
         self._emit("}")
         self._emit("")
 
@@ -892,8 +924,19 @@ class LLVMEmitter:
         # arm stores its body's result here; the end block loads it.
         # This is the simplest correct lowering — phi nodes would be
         # more efficient but require tracking every predecessor block.
+        # Deep-scan-12 fix (DSS-T-02): emit the alloca in the ENTRY block
+        # (the function header at line 430), not in the current basic
+        # block. A `match` inside a `while` body would otherwise re-emit
+        # the alloca on every iteration; LLVM allocas are not released
+        # until function return, so the stack grew without bound. We
+        # allocate a per-match slot ONCE in the entry block (keyed by the
+        # match's source line so nested matches in the same function get
+        # distinct slots), and use it from the current block.
         result_slot = self._fresh("match_result")
-        self._emit("  %s = alloca %s" % (result_slot, llvm_ret_ty))
+        llvm_ret_ty_full = llvm_ret_ty
+        self._entry_allocas.append((result_slot, llvm_ret_ty_full))
+        # The slot is allocated in the entry block — we just reference it
+        # from here on out.
         # Pre-emit each arm as a basic block. Each arm records:
         #   (variant_idx_or_None_for_default, label, body_result_value, body_end_block)
         arm_records = []
@@ -1032,10 +1075,24 @@ class LLVMEmitter:
         # Err branch: extract the Err payload and return it from the
         # current function (propagation).
         self._emit("%s:" % err_lbl)
-        # We don't have the function's Err type here; the checker
-        # annotates `qmark_err_type` if available.
-        # For now: return the err enum value itself (it's already an enum ptr).
-        self._emit("  ret ptr %s" % scrut)
+        # Deep-scan-12 fix (DSS-T-15): use the ENCLOSING function's actual
+        # return type for the `ret` instruction, not a hardcoded `ret ptr`.
+        # The hardcoded `ret ptr` produced invalid IR for any function
+        # returning int / float / bool / void — LLVM rejects `ret ptr` in
+        # an `i64`-returning function. The Err value is the scrut enum,
+        # which is already a ptr; we return it as the function's actual
+        # LLVM return type (the enum ptr matches a `ptr` return; for any
+        # other return type the function was mis-declared, but that is a
+        # checker concern, not a codegen concern — we emit the declared
+        # type and let LLVM validate the call chain).
+        fn_ret_llvm = hls_type_to_llvm(self._current_ret_type_value) \
+            if self._current_ret_type_value else "ptr"
+        if fn_ret_llvm == "void":
+            # A void function with `?` should never exist (the checker
+            # rejects it), but defensive: don't emit a value return.
+            self._emit("  ret void")
+        else:
+            self._emit("  ret %s %s" % (fn_ret_llvm, scrut))
         # Ok branch: extract the Ok payload.
         self._emit("%s:" % ok_lbl)
         payload_ptr = self._fresh("qpayload")

@@ -30,8 +30,8 @@ remains green.
 | 13 | Package manager `hls-pkg` | ✅ | (done in v0.23.0-alpha) |
 | 14 | Tooling: LSP, formatter, linter | ✅ | (release v0.24.0-alpha) |
 | 15 | Safe C FFI | ✅ | (release v0.25.0-alpha) |
-| 16 | Concurrency & async (data-race freedom) | ✅ | (release v0.29.0-alpha, perfected) |
-| 17 | Formal verification & contracts | ✅ | (release v0.30.0-alpha, perfected) |
+| 16 | Concurrency & async (data-race freedom) | ✅ | (release v0.29.0-alpha, perfected; v0.33.0-alpha re-verified) |
+| 17 | Formal verification & contracts | ✅ | (release v0.30.0-alpha, perfected; v0.33.0-alpha re-verified) |
 | 18 | Testing ecosystem & fuzzing | ⬜ | 4–6 weeks |
 | 19 | Documentation, book, playground | ⬜ | 6 weeks |
 | 20 | HLS v1.0 — API freeze, LTS, pure-HLS bootstrap | ⬜ | 4 weeks |
@@ -1109,7 +1109,7 @@ ABI-compatibility header emitted; ownership-across-boundary check
 rejects tainted values passed to extern fns; libcurl demo; minimal
 self-hosted hlbindgen.
 
-## STAGE 16 — Concurrency & async (data-race freedom) ✅ (release v0.29.0-alpha, perfected)
+## STAGE 16 — Concurrency & async (data-race freedom) ✅ (release v0.29.0-alpha, perfected; v0.33.0-alpha re-verified)
 
 **Goal:** leverage multi-core without data races — through the type system.
 
@@ -1196,7 +1196,7 @@ self-hosted hlbindgen.
 **Acceptance:** a program sharing a variable outside a channel → compile error;
 concurrency benchmark (web server) scales linearly to 8 cores.
 
-## STAGE 17 — Formal verification & contracts ✅ (release v0.30.0-alpha, perfected)
+## STAGE 17 — Formal verification & contracts ✅ (release v0.30.0-alpha, perfected; v0.33.0-alpha re-verified)
 
 **Goal:** "extremely high security" is proven, not just claimed.
 

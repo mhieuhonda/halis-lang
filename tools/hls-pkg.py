@@ -127,40 +127,26 @@ def transparency_log_append(record: Dict) -> Dict:
     # every subsequent entry. Read the WHOLE file (it's small — a
     # few KB per record is typical, a few thousand records is the
     # practical limit).
+    #
+    # Deep-scan-12 fix (DSS-T-07): the previous chunked-tail read
+    # (8KB at a time, walking backward) could prematurely break
+    # when it encountered the FIRST `\n` in the chunk — but the line
+    # AFTER that `\n` might be the TAIL of a record whose HEAD is
+    # earlier in the file. json.loads on that partial line failed,
+    # the except swallowed it, and prev_hash stayed "0"*64, breaking
+    # the chain on every subsequent entry whenever the last record
+    # was >8KB. Reading the whole file is simpler and correct (the
+    # log's own docstring says it's small).
     prev_hash = "0" * 64
     try:
         with open(TRANSPARENCY_LOG, "rb") as f:
-            tail_lines = []
-            # Read line-by-line from the END (most efficient for large
-            # logs — we only need the last record's chain_hash).
-            # Seek to the end, then walk backward by chunks to find
-            # the last non-empty line.
-            f.seek(0, os.SEEK_END)
-            fsize = f.tell()
-            chunk = b""
-            offset = fsize
-            while offset > 0:
-                read_size = min(8192, offset)
-                offset -= read_size
-                f.seek(offset)
-                chunk = f.read(read_size) + chunk
-                lines = chunk.split(b"\n")
-                # If we have at least 2 lines, the last complete
-                # line is lines[-2] (since lines[-1] may be partial).
-                if len(lines) >= 2:
-                    last_complete = lines[-2] if not lines[-1].strip() else lines[-1]
-                    if last_complete.strip():
-                        last = json.loads(last_complete.decode("utf-8"))
-                        prev_hash = last.get("chain_hash", prev_hash)
-                        break
-                # Otherwise keep walking backward.
-            else:
-                # We read the whole file — use the first non-empty line
-                # if any (which is the only record).
-                lines = [ln for ln in chunk.split(b"\n") if ln.strip()]
-                if lines:
-                    last = json.loads(lines[-1].decode("utf-8"))
-                    prev_hash = last.get("chain_hash", prev_hash)
+            data = f.read()
+        # Walk the lines from the end; the last non-empty line is the
+        # most recent record (whose chain_hash is what we chain from).
+        lines = [ln for ln in data.split(b"\n") if ln.strip()]
+        if lines:
+            last = json.loads(lines[-1].decode("utf-8"))
+            prev_hash = last.get("chain_hash", prev_hash)
     except (FileNotFoundError, OSError, ValueError):
         # First record (or corrupted log) — chain from genesis.
         pass
@@ -278,7 +264,10 @@ def parse_manifest(path: str) -> Dict:
     # lines looking for a closing quote, garbling every following key).
     lines = []
     for line in src.split("\n"):
-        lines.append(_strip_toml_comment(line))
+        try:
+            lines.append(_strip_toml_comment(line))
+        except ValueError as ex:
+            raise ValueError("manifest: %s (in line: %r)" % (ex, line))
     src = "\n".join(lines)
 
     # Parse into a tree of section -> key -> value.
@@ -341,19 +330,36 @@ def parse_manifest(path: str) -> Dict:
 
 
 def _strip_toml_comment(line: str) -> str:
-    """Strip a `#` comment, but only OUTSIDE double-quoted strings."""
+    """Strip a `#` comment, but only OUTSIDE double-quoted strings.
+
+    Deep-scan-12 fix (DSS-T-20): TOML strings only allow specific
+    escape sequences (\\", \\\\, \\b, \\t, \\n, \\f, \\r, \\uXXXX,
+    \\UXXXXXXXX). The previous code passed ANY escape through, so
+    `name = "foo\\#bar"` was silently accepted as `foo#bar`. A strict
+    TOML parser would reject the invalid escape. We now reject
+    invalid escapes (raise ValueError) — the manifest parser wraps
+    this in a clean error message."""
     out = []
     in_str = False
     i = 0
     n = len(line)
+    # The valid TOML string escapes (TOML 1.0 §4.2).
+    _TOML_ESCAPES = set('btnfr"\\')
     while i < n:
         c = line[i]
         if in_str:
             if c == '\\' and i + 1 < n:
-                out.append(c)
-                out.append(line[i + 1])
-                i += 2
-                continue
+                esc = line[i + 1]
+                # TOML also allows \uXXXX and \UXXXXXXXX.
+                if esc in _TOML_ESCAPES or esc in ("u", "U"):
+                    out.append(c)
+                    out.append(line[i + 1])
+                    i += 2
+                    continue
+                raise ValueError(
+                    "invalid TOML escape sequence: \\%s (TOML only allows "
+                    "\\b, \\t, \\n, \\f, \\r, \\", \\\", \\uXXXX, "
+                    "\\UXXXXXXXX)" % esc)
             if c == '"':
                 in_str = False
             out.append(c)

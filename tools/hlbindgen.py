@@ -32,8 +32,11 @@ Limitations:
   - Unions are not supported (HLS does not have unions).
   - Bitfields are not supported (HLS does not have bitfields).
   - Macros are not expanded (#define is ignored).
-  - Variadic functions (`...`) emit `_argN: int` but the runtime
-    won't actually accept variadic args.
+  - Variadic functions (`...`) are SKIPPED — the `...` token is dropped
+    and the HLS signature has no placeholder for it. HLS callers cannot
+    pass varargs; printf-style functions are not callable. (The docstring
+    previously claimed a `_argN: int` placeholder was emitted; it was
+    not — Deep-scan-12 fix, DSS-T-17.)
 """
 import argparse
 import os
@@ -387,6 +390,30 @@ def _parse_c_type(type_str: str, full: str = None) -> str:
     return C_TO_HLS.get(t, "int")
 
 
+# Deep-scan-12 (DSS-T-06): the inverse of _parse_c_type, used by
+# emit_abi_header to declare a SHADOW C struct with HLS-ABI-matching
+# types (int64_t for HLS int, double for HLS float, _Bool for HLS
+# bool, char* for HLS str). The shadow struct's sizeof and field
+# offsets must match the original C struct's; the abi-header's
+# _Static_assert on each one detects ABI mismatches at compile time.
+_HLS_TO_C = {
+    "int": "int64_t",
+    "float": "double",
+    "bool": "_Bool",
+    "str": "char*",
+}
+
+
+def _hls_to_c_type(hls_type: str) -> str:
+    """Inverse of _parse_c_type for HLS primitive types. HLS structs
+    and enums are emitted as `void*` (the C runtime treats them as
+    opaque pointers); the struct's own fields are validated separately
+    by the per-field _Static_asserts in emit_abi_header."""
+    if hls_type in _HLS_TO_C:
+        return _HLS_TO_C[hls_type]
+    return "void*"
+
+
 def emit_extern_block(decls: dict, abi: str = "C",
                       pure_fns=None) -> str:
     """Emit an HLS extern block from a list of declarations.
@@ -469,14 +496,60 @@ def emit_abi_header(decls: dict, src_header: str = None) -> str:
     lines.append('_Static_assert(sizeof(int64_t) == 8, "HLS int is i64 (8 bytes)");')
     lines.append('_Static_assert(sizeof(double) == 8, "HLS float is f64 (8 bytes)");')
     lines.append('_Static_assert(sizeof(_Bool) == 1, "HLS bool is 1 byte");')
+    # Deep-scan-12 fix (DSS-T-06): per-struct size + field-offset
+    # assertions. The HLS C-runtime struct representation lays out
+    # fields in declaration order with C struct alignment rules, so
+    # the HLS struct's sizeof and field offsets MUST match the source
+    # C struct's. Without these checks, a struct like
+    #   struct Point { int8_t x; int64_t y; };
+    # would compile fine in C (sizeof=16, y at offset 8 due to padding)
+    # but the HLS extern would misread `y` at offset 1 (no padding) —
+    # silent memory corruption. Emit _Static_assert on each struct's
+    # size AND on offsetof for each field. Use <stddef.h> for offsetof.
+    lines.append("#include <stddef.h>")
+    for d in decls["structs"]:
+        sname = d["name"]
+        # The HLS struct is emitted as a C struct with the same field
+        # names and HLS-mapped types (int64_t for int, double for float,
+        # _Bool for bool, char* for str). Build the HLS-side struct
+        # name to compare against. We declare a SHADOW struct with
+        # HLS-mapped types and assert it matches the original.
+        shadow_name = "_hl_shadow_%s" % sname
+        field_lines = []
+        for (fname, ftype) in d["fields"]:
+            # _parse_c_type returns the HLS type name; we need the C
+            # equivalent that matches the HLS ABI.
+            c_type = _hls_to_c_type(ftype)
+            field_lines.append("    %s %s;" % (c_type, fname))
+        if not field_lines:
+            continue  # empty struct — skip
+        lines.append("/* Struct ABI check for %s */" % sname)
+        lines.append("struct %s {" % shadow_name)
+        lines.extend(field_lines)
+        lines.append("};")
+        lines.append('_Static_assert(sizeof(struct %s) == sizeof(%s),'
+                     ' "HLS struct %s size mismatch");'
+                     % (shadow_name, sname, sname))
+        for (fname, _) in d["fields"]:
+            lines.append('_Static_assert(offsetof(struct %s, %s) == offsetof(%s, %s),'
+                         ' "HLS struct %s field %s offset mismatch");'
+                         % (shadow_name, fname, sname, fname, sname, fname))
     # Function existence assertions (one per extern fn).
     lines.append("")
     lines.append("/* Function-existence assertions: each HLS extern must")
     lines.append("   resolve to a real C function with a compatible signature. */")
     for d in decls["functions"]:
-        # We can't easily type-check without a full C type parser, but
-        # we can take the address to force the linker to resolve it.
-        lines.append("extern void* %s_ptr; /* &%s */" % (d["name"], d["name"]))
+        # Deep-scan-12 fix (DSS-T-05): the old `extern void* foo_ptr;`
+        # declaration never forced the LINKER to resolve the function —
+        # an undefined symbol only fails at link time when something
+        # actually references it. Define the variable with an initializer
+        # that takes the function's address; `__attribute__((used))` keeps
+        # the definition alive even at -O2 (LLVM would otherwise drop
+        # the unused static). The function pointer cast is intentional:
+        # we don't know the real signature, but we don't need to — the
+        # LINKER does, and an undefined `foo` fails the link.
+        lines.append("__attribute__((used)) static void (*const %s_ptr)(void) "
+                     "= (void (*)(void))&%s;" % (d["name"], d["name"]))
     lines.append("")
     return "\n".join(lines)
 

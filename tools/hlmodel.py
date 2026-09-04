@@ -166,16 +166,37 @@ def main():
         except HLPanic as ex:
             bad_states.append("%s (panic: %s)" % (init_variant, ex.msg))
         seen = {init_variant}
+        # Deep-scan-12 fix (DSS-T-18): use a FIFO queue (`pop(0)`) for
+        # true BFS as documented. The previous `frontier.pop()` was
+        # LIFO (DFS) — same reachable set but different visitation
+        # order, which made the "dead states" output differ between
+        # runs of the same machine.
         frontier = [start]
+        # Deep-scan-12 fix (DSS-T-16): contract-violating transitions
+        # used to be silently skipped as "dead transitions" — the
+        # `except HLPanic: continue` clause caught the requires-violation
+        # panic alongside any genuine runtime panic. The tool's
+        # docstring promises contract checking; surface the violations
+        # in a separate counter.
+        contract_violations = []
         edges = 0
         while frontier:
-            cur = frontier.pop()
+            cur = frontier.pop(0)
             for e in e_variants:
                 e_val = {"enum": e_enum, "var": e, "data": []}
                 try:
                     nxt = interp.call_fn(fn_name, [cur, e_val])
-                except HLPanic:
-                    continue  # dead transition
+                except HLPanic as ex:
+                    # Distinguish contract-violation panics from other
+                    # panics. The contract-mode runtime emits a panic
+                    # message starting with "contract violation:" —
+                    # we report those, and treat other panics as dead
+                    # transitions.
+                    if "contract violation" in str(ex.msg):
+                        contract_violations.append(
+                            "%s + %s: %s" % (cur["var"], e, ex.msg))
+                        continue
+                    continue  # genuine runtime panic = dead transition
                 if not isinstance(nxt, dict):
                     continue
                 nvar = nxt["var"]
@@ -192,6 +213,11 @@ def main():
         dead = [s for s in s_variants if s not in seen]
         print("    reachable states: %d / %d (%d edges explored)"
               % (len(seen), len(s_variants), edges))
+        if contract_violations:
+            print("    CONTRACT VIOLATIONS (%d):"
+                  % len(contract_violations))
+            for v in contract_violations:
+                print("      %s" % v)
         if dead:
             print("    DEAD states (unreachable from %s.%s): %s"
                   % (s_enum, init_variant, ", ".join(dead)))

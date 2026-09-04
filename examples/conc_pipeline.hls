@@ -1,0 +1,93 @@
+# examples/conc_pipeline.hls — Stage 16 perfection demo: a bounded-channel
+# pipeline showing the worker-pool-over-channel pattern with poison-pill
+# shutdown. Demonstrates the bounded-channel backpressure primitive
+# (v0.29.0-alpha) and the waiter-aware deadlock detection.
+
+# Pipeline shape:
+#   producer (1 task) -> [bounded chan 4] -> worker pool (N tasks)
+#                                          -> [bounded chan 4] -> consumer (1 task)
+# Shutdown: producer closes after emitting all jobs by sending a poison
+# pill (job id == -1). Each worker, on receiving the poison pill,
+# re-forwards it so every worker eventually sees it. The consumer
+# counts results until it sees the poison pill.
+
+struct Job {
+    id: int,
+    payload: int
+}
+
+fn producer(out: Chan[Job], n: int, n_workers: int) uses IO, Conc {
+    let mut i: int = 0
+    while i < n {
+        let j: Job = Job { id: i, payload: i * i }
+        out.send(take(j))
+        i = i + 1
+    }
+    # Poison pills — one per worker so they ALL see shutdown.
+    let mut p: int = 0
+    while p < n_workers {
+        let pill: Job = Job { id: -1, payload: 0 }
+        out.send(take(pill))
+        p = p + 1
+    }
+}
+
+fn worker(in_ch: Chan[Job], out_ch: Chan[Job]) uses IO, Conc {
+    while true {
+        let j: Job = in_ch.recv()
+        if j.id == -1 {
+            # Forward the poison pill and exit.
+            out_ch.send(take(j))
+            return
+        }
+        # "Work": double the payload.
+        let r: Job = Job { id: j.id, payload: j.payload * 2 }
+        out_ch.send(take(r))
+    }
+}
+
+fn consumer(in_ch: Chan[Job], n_workers: int) -> int uses IO, Conc {
+    let mut count: int = 0
+    let mut pills: int = 0
+    while pills < n_workers {
+        let j: Job = in_ch.recv()
+        if j.id == -1 {
+            pills = pills + 1
+        } else {
+            count = count + 1
+        }
+    }
+    return count
+}
+
+fn main() -> int uses IO, Conc {
+    let n_jobs: int = 20
+    let n_workers: int = 4
+    let upstream: Chan[Job] = chan_new_bounded(4)
+    let downstream: Chan[Job] = chan_new_bounded(4)
+    let mut workers: list[Task[void]] = []
+    let mut i: int = 0
+    while i < n_workers {
+        # clone(ch) for a channel returns the SAME channel reference
+        # (channels are intrinsically shared; the clone is the
+        # checker-friendly way to say so).
+        let t: Task[void] = spawn(worker, clone(upstream), clone(downstream))
+        workers.push(t)
+        i = i + 1
+    }
+    let p: Task[void] = spawn(producer, clone(upstream), n_jobs, n_workers)
+    let total: int = consumer(clone(downstream), n_workers)
+    # Wait for the producer and all workers to finish (defensive — the
+    # consumer already returned after the poison pills propagated).
+    p.join()
+    let mut j: int = 0
+    while j < workers.len() {
+        workers.get(j).join()
+        j = j + 1
+    }
+    println("pipeline: " + total.to_str() + " jobs processed (expected " + n_jobs.to_str() + ")")
+    if total == n_jobs {
+        return 0
+    }
+    return 1
+}

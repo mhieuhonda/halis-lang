@@ -534,7 +534,20 @@ class HLSServer:
         for t in toks:
             if t["k"] == "eof":
                 break
-            tlen = len(str(t["v"])) if not isinstance(t["v"], bytes) else len(t["v"])
+            # Deep-scan-12 fix (DSS-T-09): use the lexer's `raw` field
+            # when present (it's set on int / float tokens). `str(v)`
+            # loses information: `1_000` (raw) becomes `1000` (4 chars
+            # vs the source's 5), and `0.01` formatted via `repr` may
+            # produce `0.01` or scientific notation depending on the
+            # value. The lexer's `raw` is the EXACT source substring
+            # the highlighter must use to compute the token's extent.
+            if "raw" in t and isinstance(t["raw"], (str, bytes)):
+                tlen = len(t["raw"]) if isinstance(t["raw"], str) \
+                    else len(t["raw"])
+            elif isinstance(t["v"], bytes):
+                tlen = len(t["v"])
+            else:
+                tlen = len(str(t["v"]))
             if t["line"] == line and t["col"] <= col < t["col"] + tlen:
                 if t["k"] in ("ident", "kw"):
                     return t["v"]
