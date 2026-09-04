@@ -225,6 +225,8 @@ and error handling:
 | `std.html` | `html_escape(s)`, `html_escape_attr(s)`, `html_unescape(s)`, `html_tag(name, attrs, content)`, `html_text(s)` |
 | `std.option` (Stage 7) | `enum Option[T] { Some(T), None }`, `option_unwrap`, `option_unwrap_or`, `option_is_some`, `option_is_none` |
 | `std.result` (Stage 7) | `enum Result[T, E] { Ok(T), Err(E) }`, `result_unwrap`, `result_unwrap_or`, `result_err_or`, `result_is_ok`, `result_is_err`, `int_parse(s) -> Result[int, str]`, `float_parse(s) -> Result[float, str]` |
+| `std.bits` (non-roadmap) | `bits_shl/shr/sar`, `bits_and/or/xor/not`, `bits_get/set`, `bits_popcount/clz/ctz`, `bits_byte`, `bits_bytes_be/le`, `bits_from_bytes_be/le` (HLS has no bitwise operators — these helpers are pure functions built on arithmetic) |
+| `std.set` (non-roadmap) | `set_str_new`, `set_str_from_list`, `set_str_add`, `set_str_contains`, `set_str_size`, `set_str_to_list`, `set_str_union`, `set_str_intersect`, `set_str_diff`, `set_str_equal` (string sets backed by `map[str, bool]`) |
 
 Each module is written in HLS itself and can be used inside `hlc` (the
 compiler) or any user program. Import with `import "std.option"` (or whichever

@@ -178,7 +178,8 @@ examples:
                   examples/conc_demo.hls examples/actor_demo.hls \
                   examples/bounded_chan_demo.hls \
                   examples/par_scan.hls examples/hmac_proven.hls \
-                  examples/conn_machine.hls examples/bits_demo.hls; do \
+                  examples/conn_machine.hls examples/bits_demo.hls \
+                  examples/set_demo.hls; do \
                 echo "--- $$f"; $(PYTHON) boot/boot.py $$f || exit 1; \
         done
         @echo "--- examples/secure_demo.hls (deliberately panics on overflow)"
