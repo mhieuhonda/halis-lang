@@ -9,7 +9,7 @@
 `hlc` is written 100% in Halis itself. The compiler self-compiles,
 and two compilation passes produce **byte-identical** output.
 
-[Specification](SPEC.md) · [20-stage roadmap](ROADMAP.md) · [Security](SECURITY.md)
+[Specification](SPEC.md) · [150-stage roadmap](ROADMAP.md) · [Security](SECURITY.md)
 
 </div>
 
@@ -239,7 +239,7 @@ module you need).
 ```
 halis-lang/
 ├── SPEC.md              # Language constitution (full v0.30 spec)
-├── ROADMAP.md           # 20-stage roadmap to v1.0
+├── ROADMAP.md           # 150-stage roadmap to v1.0
 ├── SECURITY.md          # Threat model & security policy
 ├── boot/                # Stage-0: bootstrap seed (pure Python, ~3,200 lines)
 │   ├── lexer.py         #   lexer (~150 lines)

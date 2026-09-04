@@ -306,6 +306,33 @@ else
     bad "native hlc compiles fibonacci"
 fi
 
+echo "=== 6. Stage 18: testing ecosystem (hltest + hlcov) ==="
+# hltest must discover and PASS every test_* function in the Stage 18
+# acceptance file (12 tests: assertions + quickcheck properties).
+hltest_out=$(python3 tools/hltest.py tests/ok/feat_stage18_hltest.hls 2>&1); hltest_rc=$?
+hltest_pass=$(echo "$hltest_out" | grep -E "^== hltest:" | tail -1)
+if [ $hltest_rc -eq 0 ] && echo "$hltest_pass" | grep -q "0 fail"; then
+    ok "hltest: $hltest_pass"
+else
+    bad "hltest: $hltest_pass"
+    echo "$hltest_out" | tail -8
+fi
+# hlcov must report coverage on the same file (non-zero total).
+hlcov_out=$(python3 tools/hlcov.py tests/ok/feat_stage18_hltest.hls 2>/dev/null)
+if echo "$hlcov_out" | grep -q "total:.*blocks hit"; then
+    ok "hlcov: $(echo "$hlcov_out" | grep 'total:')"
+else
+    bad "hlcov: no total line"
+fi
+# hls-fuzz must run for 5 seconds without finding any divergence.
+fuzz_out=$(timeout 15 python3 tools/hls-fuzz.py --time 5 --quiet 2>&1); fuzz_rc=$?
+if [ $fuzz_rc -eq 0 ] && echo "$fuzz_out" | tail -1 | grep -q "0 diverge"; then
+    ok "hls-fuzz: $(echo "$fuzz_out" | tail -1)"
+else
+    bad "hls-fuzz: divergences found (see fuzz-corpus/)"
+    echo "$fuzz_out" | tail -5
+fi
+
 echo ""
 echo "=========================================="
 echo "RESULT: $PASS PASS / $FAIL FAIL"

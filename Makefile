@@ -8,7 +8,7 @@ HLC     = src/hlc.hls
 BIN     = bin
 PREFIX  ?= /usr/local
 
-.PHONY: all stage0 bootstrap test examples clean run check bench install uninstall audit opt-stats emit-ir emit-llvm fmt lint lsp-check pkg-init pkg-add pkg-lock pkg-audit pkg-verify pkg-build pkg-publish pkg-log pkg-log-verify prove prove-full model prove-acceptance
+.PHONY: all stage0 bootstrap test examples clean run check bench install uninstall audit opt-stats emit-ir emit-llvm fmt lint lsp-check pkg-init pkg-add pkg-lock pkg-audit pkg-verify pkg-build pkg-publish pkg-log pkg-log-verify prove prove-full model prove-acceptance hltest fuzz cov fuzz-acceptance
 
 # Main goal: use the full bootstrap chain to build the native compiler
 all: bootstrap
@@ -81,6 +81,39 @@ lint:
 lsp-check:
 	@$(PYTHON) tools/hls-lsp.py --check $(F)
 
+
+# ============================================================================
+# Stage 18 (v0.34.0-alpha): testing ecosystem & fuzzing targets
+# ============================================================================
+
+# hltest: run every test_* function in the given .hls files (or dirs).
+# Usage: make hltest [F=tests/ok] [GREP=map] [J=4] [JUNIT=out.xml]
+hltest:
+	@test -n "$(F)" || F=tests/ok; \
+	  if [ -n "$(GREP)" ]; then G="--grep $(GREP)"; fi; \
+	  if [ -n "$(JUNIT)" ]; then J="--junit $(JUNIT)"; fi; \
+	  if [ -n "$(J)" ]; then P="-j $(J)"; fi; \
+	  $(PYTHON) tools/hltest.py -r $$P $$G $$J $$F
+
+# hls-fuzz: AST-level differential fuzzer. Default 60s smoke run;
+# CI runs `make fuzz-acceptance` for the 1-hour acceptance run.
+fuzz:
+	@$(PYTHON) tools/hls-fuzz.py --time $(or $(TIME),60) --seed $(or $(SEED),)
+
+# fuzz-acceptance: the Stage 18 acceptance criterion — fuzzer runs for
+# 1 hour without finding any semantic discrepancy between the
+# interpreter and the native compiler.
+fuzz-acceptance:
+	@echo "[Stage 18 acceptance] running hls-fuzz for 1 hour..."
+	@$(PYTHON) tools/hls-fuzz.py --time 3600
+	@echo "ACCEPTANCE OK: 1-hour fuzz run produced no divergences"
+
+# hlcov: HLIR-level coverage report for a single file.
+# Usage: make cov F=examples/hello.hls [LCOV=out.lcov]
+cov:
+	@test -n "$(F)" || (echo "Usage: make cov F=examples/hello.hls [LCOV=out.lcov]" && false)
+	@if [ -n "$(LCOV)" ]; then L="--lcov $(LCOV)"; fi; \
+	  $(PYTHON) tools/hlcov.py $$L $(F)
 
 # ============================================================================
 # Stage 13 (v0.23.0-alpha): hls-pkg package manager targets
@@ -166,22 +199,22 @@ examples:
 	@# NOTE: taint_beta_demo.hls and wordcount.hls need a data-file
 	@# argument and are run separately below.
 	@for f in examples/hello.hls examples/fibonacci.hls examples/primes.hls \
-		  examples/enum_demo.hls examples/option_demo.hls examples/result_demo.hls \
-		  examples/ownership_demo.hls examples/effects_demo.hls \
-		  examples/hex_demo.hls examples/base64_demo.hls examples/crypto_demo.hls \
-		  examples/csv_demo.hls examples/list_demo.hls examples/time_demo.hls \
-		  examples/uuid_demo.hls examples/web_demo.hls examples/stdlib_demo.hls \
-		  examples/taint_demo.hls examples/ffi_demo.hls \
-		  examples/optimize_demo.hls examples/llvm_demo.hls \
-		  examples/tooling_demo.hls examples/pkg_demo.hls \
-		  examples/libcurl_demo.hls \
-		  examples/conc_demo.hls examples/actor_demo.hls \
-		  examples/bounded_chan_demo.hls examples/conc_pipeline.hls \
-		  examples/par_scan.hls examples/hmac_proven.hls \
-		  examples/proof_demo.hls \
-		  examples/conn_machine.hls examples/bits_demo.hls \
-		  examples/set_demo.hls; do \
-		echo "--- $$f"; $(PYTHON) boot/boot.py $$f || exit 1; \
+		   examples/enum_demo.hls examples/option_demo.hls examples/result_demo.hls \
+		   examples/ownership_demo.hls examples/effects_demo.hls \
+		   examples/hex_demo.hls examples/base64_demo.hls examples/crypto_demo.hls \
+		   examples/csv_demo.hls examples/list_demo.hls examples/time_demo.hls \
+		   examples/uuid_demo.hls examples/web_demo.hls examples/stdlib_demo.hls \
+		   examples/taint_demo.hls examples/ffi_demo.hls \
+		   examples/optimize_demo.hls examples/llvm_demo.hls \
+		   examples/tooling_demo.hls examples/pkg_demo.hls \
+		   examples/libcurl_demo.hls \
+		   examples/conc_demo.hls examples/actor_demo.hls \
+		   examples/bounded_chan_demo.hls examples/conc_pipeline.hls \
+		   examples/par_scan.hls examples/hmac_proven.hls \
+		   examples/proof_demo.hls \
+		   examples/conn_machine.hls examples/bits_demo.hls \
+		   examples/set_demo.hls; do \
+		 echo "--- $$f"; $(PYTHON) boot/boot.py $$f || exit 1; \
 	done
 	@echo "--- examples/secure_demo.hls (deliberately panics on overflow)"
 	@rc=0; $(PYTHON) boot/boot.py examples/secure_demo.hls || rc=$$?; \

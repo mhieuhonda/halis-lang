@@ -4,9 +4,174 @@ All notable changes to Halis are documented in this file. The format
 is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-Releases on `main` follow the 20-stage roadmap (see [ROADMAP.md](ROADMAP.md)).
+Releases on `main` follow the 150-stage roadmap (see [ROADMAP.md](ROADMAP.md)).
+The roadmap defines ten phases: core foundation (1–18), performance &
+platform reach (19–34), stdlib expansion (35–52), CLI tooling (53–62),
+web applications (63–76), OS-development foundation (77–96), verification
+& supply chain (97–112), developer experience (113–124), performance &
+stability (125–140), and final stabilisation toward v1.0 (141–150).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
+
+## [v0.34.0-alpha] — Stage 18: testing ecosystem & fuzzing + roadmap restructure
+
+> Completes **Stage 18** of the roadmap: the in-language test runner
+> (`hltest`), property-based testing helpers (`std/quickcheck.hls`),
+> an AST-level differential fuzzer (`hls-fuzz`), and an HLIR-level
+> coverage tracker (`hlcov`). The acceptance example
+> `tests/ok/feat_stage18_hltest.hls` doubles as both a runnable
+> Halis program (its `main()` runs every `test_*`) and a hltest test
+> file. All 557 tests PASS (554 prior + 3 new Stage-18 tests), the
+> bootstrap is still deterministic, and the differential test suite
+> (interpreter ↔ native, including `-O fast`) remains byte-identical.
+>
+> The roadmap has also been **restructured**: the original 20-stage
+> plan is replaced with a **150-stage plan** spanning ten phases.
+> Stage 19 (originally "Documentation, book, playground") has been
+> **removed** — promotion, documentation, and the public playground
+> are separately managed activities that happen after v1.0
+> stabilises. The new roadmap explicitly defines Halis as a language
+> for **three target application families**: CLI tools, web
+> applications, and operating-system development. After v1.0, the
+> OS-development track is the post-1.0 priority.
+
+### Stage 18 — testing ecosystem & fuzzing
+
+#### Added — `hltest` runner (`tools/hltest.py`)
+
+- Discovers every top-level `test_*` function in the given `.hls` files
+  (or `--dir` trees), runs them in PARALLEL across files via a
+  fork-based process pool (`-j N`, default = CPU count), reports
+  PASS/FAIL/SKIP with per-test timing.
+- A test PASSES when it returns normally (exit 0); FAILS when it
+  panics; SKIPs when the panic message starts with the reserved prefix
+  `__HLTEST_SKIP__:` (set by the `std.test.mark_skip` helper).
+- Supports `--grep` to filter tests by substring, `--junit out.xml`
+  for CI integration, `--verbose` to surface skip reasons.
+- A synthetic `<load>` / `<check>` test name is reported on compile /
+  type errors so the failure source is visible.
+- Each file is the unit of parallelism — the type-checker runs once
+  per file, not once per test, and each test gets a FRESH `Interp`
+  so tests cannot leak state.
+- The discovery pass parses JUST the entry file (not its imports) so
+  only the USER's `test_*` functions are seen — stdlib helpers like
+  `mark_skip` (which start with `test_`) are not picked up as tests.
+
+#### Added — `std/test.hls` assertion library
+
+- Typed assertions: `assert_eq_int`, `assert_eq_int_msg`,
+  `assert_ne_int`, `assert_eq_str`, `assert_eq_str_msg`,
+  `assert_ne_str`, `assert_eq_bool`, `assert_true`,
+  `assert_true_msg`, `assert_false`, `assert_eq_float`,
+  `assert_approx_eq_float` (with explicit epsilon),
+  `assert_int_range`, `assert_len_int`, `assert_len_str`, `mark_skip`.
+- HLS equality (`==`) is only defined for the primitive types
+  (`int`, `float`, `bool`, `str`); the assertion helpers are
+  therefore TYPED so every comparison type-checks.
+- Every failure calls `panic` with a clear "got=… expected=…"
+  message — no `uses IO` required (`panic` is the language's clean
+  termination primitive).
+
+#### Added — `std/quickcheck.hls` property-based testing generators
+
+- `qc_int` (full int64 range with 1% corner-case forcing for 0, ±1,
+  ±INT64_MAX, ±INT64_MIN, ±INT64_MAX/2), `qc_int_range(lo, hi)`,
+  `qc_bool`, `qc_str` (printable ASCII, length 0–32), `qc_str_n(n)`,
+  `qc_list_int(max_len)`, `qc_byte`, and `qc_fail(label, counter_ex)`
+  for reporting counter-examples.
+- HLS does not have first-class function values, so the "for_all"
+  idiom is expressed as a loop the user writes around a generator
+  call — every generator declares `uses Rand` (the test function
+  therefore declares `uses Rand` to opt in).
+- All generators are deterministic given the same `rand_seed`.
+
+#### Added — `hls-fuzz` AST-level differential fuzzer (`tools/hls-fuzz.py`)
+
+- Generates small type-correct HLS programs (a grammar tuned to
+  exercise the surface that matters: arithmetic with overflow paths,
+  control flow, lists, strings, struct/enum dispatch, contracts).
+- Compiles each program TWO ways — (1) interpreter, (2) native via
+  `hlc.hls` (Stage-0) → C → gcc → run — and compares stdout + exit
+  code byte-for-byte.
+- Any divergence is a soundness bug in EITHER implementation; the
+  fuzzer AUTO-MINIMISES the failing program via delta-debugging on
+  the AST (statement-by-statement removal, re-checking that the
+  divergence still reproduces) and writes the minimised case to
+  `fuzz-corpus/case-NNNN.hls`.
+- Supports `--time`, `--jobs`, `--seed`, `--n`, `--max-depth`,
+  `--corpus`, `--minimize` (for minimising an existing case).
+- Reports run rate, skip count (programs that did not type-check or
+  that the native backend rejected — not a divergence), and
+  divergence count.
+
+#### Added — `hlcov` HLIR-level coverage tracker (`tools/hlcov.py`)
+
+- Statically counts basic blocks per function (the function body is
+  one block; every `if`/`while`/`for` adds nested blocks; every
+  match arm is a block), then runs the program under a
+  `CoverageInterp` subclass that records every `call_fn` invocation.
+- Reports per-function block-count, call-count, and hit flag;
+  totals; percentage.
+- Supports `--lcov out.lcov` for LCOV-format output
+  (geninfo-compatible) and `--html` (future).
+
+#### Added — Makefile targets & CI integration
+
+- `make hltest [F=...] [GREP=...] [J=4] [JUNIT=...]`
+- `make fuzz [TIME=60] [SEED=...]`
+- `make cov F=... [LCOV=...]`
+- `make fuzz-acceptance` (the 1-hour Stage-18 acceptance run)
+- `tests/run_tests.sh` now includes a Stage-18 section that runs
+  `hltest`, `hlcov`, and `hls-fuzz` (5-second smoke run) on every
+  test invocation.
+
+#### Added — Stage 18 acceptance example
+
+- `tests/ok/feat_stage18_hltest.hls` — 12 tests exercising every
+  assertion helper (typed `assert_eq_int/str/bool/float`,
+  `assert_ne_int/str`, `assert_true/_false`, `assert_int_range`,
+  `assert_len_int/str`, `assert_approx_eq_float`) plus 3
+  quickcheck-style properties (addition commutativity, concatenation
+  length preservation, doubling/halving roundtrip).
+- The file is BOTH a valid Halis program (the top-level `main()`
+  runs every `test_*` function so the differential suite gets the
+  same answer) AND a hltest test file (you can run it via
+  `tools/hltest.py`).
+
+### Roadmap restructure
+
+- The original 20-stage roadmap is replaced with a **150-stage plan**
+  spanning ten phases: core foundation (1–18), performance & platform
+  reach (19–34), stdlib expansion (35–52), CLI tooling (53–62), web
+  applications (63–76), OS-development foundation (77–96),
+  verification & supply chain (97–112), developer experience
+  (113–124), performance & stability (125–140), and final
+  stabilisation toward v1.0 (141–150).
+- **Stage 19 (originally "Documentation, book, playground") is
+  REMOVED.** Promotion, documentation, and the public playground
+  are separately managed activities that happen AFTER v1.0
+  stabilises — they are explicitly out-of-roadmap. The new Stage 19
+  is "Profile-guided optimisation (PGO)".
+- The roadmap now explicitly defines Halis as a language for
+  **three target application families**: CLI tools (Phase IV),
+  web applications (Phase V), and operating-system development
+  (Phase VI). After v1.0, the OS-development track is the
+  post-1.0 priority.
+- **The Halis project itself does not write an OS** — it builds the
+  language in which OTHERS can build one. Phase VI stages give the
+  LANGUAGE the capabilities OS developers need (`#![freestanding]`,
+  `#![no_std]`, `core.alloc`, `core.mem`, panic-handler override,
+  inline-asm, linker-script integration, multiboot2/Limine, IDT,
+  MMIO, x86 I/O ports, DMA-safe buffers, lock-free atomics,
+  verified interrupt-safety, bare-metal targets).
+
+### Test results
+
+- 557 PASS / 0 FAIL (554 prior + 3 new Stage-18 tests).
+- Bootstrap: deterministic (two self-compilation passes produce
+  byte-identical C output).
+- Differential test suite (interpreter ↔ native, including `-O fast`):
+  byte-identical across all ok/ programs.
 
 ## [v0.33.0-alpha] — Stage 16 & 17 perfection + Deep-scan-12
 

@@ -1,8 +1,19 @@
 # ROADMAP — Halis (HLS)
 
-> A 20-stage roadmap that takes Halis from a self-hosting v0.1 core to a
-> **highly secure, high-performance, complete v1.0 language** — with the entire
-> toolchain written in Halis itself.
+> A multi-stage roadmap that takes Halis from a self-hosting v0.1 core
+> to a **highly secure, high-performance, complete v1.0 language** — with
+> the entire toolchain written in Halis itself, and **first-class support
+> for three target application families**:
+>
+> 1. **CLI tools** — fast native binaries, predictable startup, low memory.
+> 2. **Web applications** — WebAssembly backend, HTTP server stdlib, JS-FFI.
+> 3. **Operating-system development** — freestanding mode, no-GC runtime,
+>    page-level memory control, bare-metal code generation.
+>
+> After v1.0, post-1.0 work prioritises the OS-development track: users
+> who want to build their own operating system in Halis get first-class
+> language + toolchain support. **The Halis project itself does not build
+> an OS** — it builds the language in which OTHERS can build one.
 
 **Status legend:** ✅ complete · 🔄 in progress · ⬜ not started
 **Standing principle:** every stage closes only when **100% of its acceptance
@@ -12,6 +23,8 @@ remains green.
 ---
 
 ## OVERVIEW
+
+### Phase I — Core language foundation (Stages 1–18, complete)
 
 | # | Stage | Status | Estimated effort |
 |---|-------|:------:|:----------------:|
@@ -32,11 +45,197 @@ remains green.
 | 15 | Safe C FFI | ✅ | (release v0.25.0-alpha) |
 | 16 | Concurrency & async (data-race freedom) | ✅ | (release v0.29.0-alpha, perfected; v0.33.0-alpha re-verified) |
 | 17 | Formal verification & contracts | ✅ | (release v0.30.0-alpha, perfected; v0.33.0-alpha re-verified) |
-| 18 | Testing ecosystem & fuzzing | ⬜ | 4–6 weeks |
-| 19 | Documentation, book, playground | ⬜ | 6 weeks |
-| 20 | HLS v1.0 — API freeze, LTS, pure-HLS bootstrap | ⬜ | 4 weeks |
+| 18 | Testing ecosystem & fuzzing | ✅ | (release v0.34.0-alpha) |
 
-Estimated total duration: ~24–30 months (small team of 2–4 full-time).
+### Phase II — Performance, optimisation & platform reach (Stages 19–34)
+
+| # | Stage | Status | Estimated effort |
+|---|-------|:------:|:----------------:|
+| 19 | Profile-guided optimisation (PGO) | ⬜ | 3–4 weeks |
+| 20 | Link-time optimisation (LTO) across crates | ⬜ | 3 weeks |
+| 21 | SIMD vectorisation (target-feature detection) | ⬜ | 5 weeks |
+| 22 | Cross-compilation targets (Linux/macOS/Windows/FreeBSD) | ⬜ | 4 weeks |
+| 23 | WebAssembly backend (`target wasm32`) | ⬜ | 6 weeks |
+| 24 | `wasm-opt` integration + emscripten bridge | ⬜ | 3 weeks |
+| 25 | AArch64 backend tuning (Apple Silicon, Graviton) | ⬜ | 4 weeks |
+| 26 | RISC-V 64 backend (foundation for OS work) | ⬜ | 5 weeks |
+| 27 | Inline assembly syntax (`asm!`) | ⬜ | 4 weeks |
+| 28 | Stack-frame layout control (for kernel code) | ⬜ | 3 weeks |
+| 29 | `noinline`/`always_inline`/`cold`/`hot` attributes | ⬜ | 2 weeks |
+| 30 | Boxed-vs-stack layout analysis (escape analysis) | ⬜ | 5 weeks |
+| 31 | Tail-call optimisation (verified) | ⬜ | 3 weeks |
+| 32 | Zero-cost abstractions audit (every stdlib fn under 1 µs) | ⬜ | 4 weeks |
+| 33 | Async/await zero-runtime futures | ⬜ | 6 weeks |
+| 34 | Async stream combinators (channels × generators) | ⬜ | 4 weeks |
+
+### Phase III — Standard library expansion (Stages 35–52)
+
+| # | Stage | Status | Estimated effort |
+|---|-------|:------:|:----------------:|
+| 35 | `std.io` — buffered readers/writers, `Read`/`Write` traits | ⬜ | 4 weeks |
+| 36 | `std.fs` — path abstraction, directory walk, permissions | ⬜ | 4 weeks |
+| 37 | `std.net` — TCP/UDP sockets, DNS, TLS via libcurl | ⬜ | 6 weeks |
+| 38 | `std.http` — HTTP/1.1 server + client (RFC 7230) | ⬜ | 6 weeks |
+| 39 | `std.http2` — HTTP/2 + ALPN negotiation | ⬜ | 5 weeks |
+| 40 | `std.json` streaming parser (constant-memory) | ⬜ | 3 weeks |
+| 41 | `std.regex` — NFA-based regex (no ReDoS) | ⬜ | 5 weeks |
+| 42 | `std.fmt` — printf-style + custom `Display` impls | ⬜ | 3 weeks |
+| 43 | `std.hash` — SipHash, xxHash, FNV, cityHash | ⬜ | 3 weeks |
+| 44 | `std.collections` — BTreeMap, HashSet, LinkedList, RingBuf | ⬜ | 6 weeks |
+| 45 | `std.sync` — Mutex, RwLock, Condvar, OnceCell | ⬜ | 4 weeks |
+| 46 | `std.thread` — OS threads (preemptive scheduler) | ⬜ | 5 weeks |
+| 47 | `std.process` — spawn, pipe, signal, exit-code | ⬜ | 4 weeks |
+| 48 | `std.env` — environment variables, current dir | ⬜ | 2 weeks |
+| 49 | `std.time` — monotonic clock, sleep, deadline arithmetic | ⬜ | 3 weeks |
+| 50 | `std.math` — IEEE-754 edge cases, special functions | ⬜ | 5 weeks |
+| 51 | `std.archive` — tar, zip, gzip (no unsafe decompression) | ⬜ | 4 weeks |
+| 52 | `std.uuid` v7 + `std.ulid` (lexicographically sortable) | ⬜ | 2 weeks |
+
+### Phase IV — CLI tooling track (Stages 53–62)
+
+| # | Stage | Status | Estimated effort |
+|---|-------|:------:|:----------------:|
+| 53 | `std.cli` — argument parser (subcommands, env, defaults) | ⬜ | 5 weeks |
+| 54 | `std.tui` — terminal raw mode, ANSI escapes, screen grid | ⬜ | 6 weeks |
+| 55 | `std.color` — terminal color detection, truecolor fallback | ⬜ | 2 weeks |
+| 56 | `std.progress` — progress bars, spinners, ETA | ⬜ | 3 weeks |
+| 57 | `std.log` — structured logging (JSON + human formats) | ⬜ | 3 weeks |
+| 58 | `std.config` — TOML + YAML + env-layered config loader | ⬜ | 4 weeks |
+| 59 | `std.complete` — shell-completion generator (bash/zsh/fish) | ⬜ | 3 weeks |
+| 60 | `hls-cli` — `cargo`-style launcher (`hls new`, `hls run`, `hls build`) | ⬜ | 5 weeks |
+| 61 | `hls-doc` — rustdoc-style API docs generator | ⬜ | 6 weeks |
+| 62 | Man-page generator (`--man` produces nroff) | ⬜ | 2 weeks |
+
+### Phase V — Web application track (Stages 63–76)
+
+| # | Stage | Status | Estimated effort |
+|---|-------|:------:|:----------------:|
+| 63 | `std.http.router` — path params, middleware, sub-routers | ⬜ | 4 weeks |
+| 64 | `std.http.server` — multi-thread, keep-alive, HTTP/2 push | ⬜ | 5 weeks |
+| 65 | `std.websocket` — RFC 6455 server + client | ⬜ | 5 weeks |
+| 66 | `std.cookie` — signed cookies, SameSite, secure flag | ⬜ | 3 weeks |
+| 67 | `std.session` — server-side sessions (in-memory + file) | ⬜ | 3 weeks |
+| 68 | `std.csrf` — double-submit + sync-token patterns | ⬜ | 2 weeks |
+| 69 | `std.template` — compile-time HTML templates (no XSS) | ⬜ | 5 weeks |
+| 70 | `std.sse` — server-sent events (one-way streaming) | ⬜ | 2 weeks |
+| 71 | `std.graphql` — schema-first server (parser + resolver) | ⬜ | 6 weeks |
+| 72 | `std.openapi` — generate OpenAPI 3.1 from handler types | ⬜ | 4 weeks |
+| 73 | `std.jsffi` — bind to JavaScript globals from `wasm32` | ⬜ | 5 weeks |
+| 74 | `std.dom` — server-side rendering (no client JS needed) | ⬜ | 4 weeks |
+| 75 | `hls-serve` — `webpack-dev-server` equivalent for HLS | ⬜ | 5 weeks |
+| 76 | `hls-wasm-pack` — publish-ready wasm + JS glue | ⬜ | 4 weeks |
+
+### Phase VI — OS development foundation (Stages 77–96)
+
+> These stages give the LANGUAGE the capabilities OS developers need.
+> Halis itself does not write an OS; these features let users do so.
+
+| # | Stage | Status | Estimated effort |
+|---|-------|:------:|:----------------:|
+| 77 | `#![freestanding]` mode (no libc, no OS calls) | ⬜ | 3 weeks |
+| 78 | `#![no_std]` core-only stdlib subset | ⬜ | 5 weeks |
+| 79 | `core.alloc` — pluggable allocator trait | ⬜ | 4 weeks |
+| 80 | `core.mem` — physical-page allocator, page tables | ⬜ | 5 weeks |
+| 81 | Panic-handler override (kernel panic strategy) | ⬜ | 3 weeks |
+| 82 | Stack-overflow guard page + deterministic stack size | ⬜ | 3 weeks |
+| 83 | Inline-asm register constraints (clobber, input, output) | ⬜ | 5 weeks |
+| 84 | Linker-script integration (`link.ld`) + custom sections | ⬜ | 4 weeks |
+| 85 | Multiboot2 + Limine-compliant boot protocol headers | ⬜ | 4 weeks |
+| 86 | `core.interrupt` — IDT/GDT declaration syntax | ⬜ | 6 weeks |
+| 87 | `core.mmio` — memory-mapped-IO helpers (volatile reads/writes) | ⬜ | 3 weeks |
+| 88 | `core.port` — x86 I/O port invariants (`inb`/`outb` typesafe) | ⬜ | 2 weeks |
+| 89 | DMA-safe buffer types (no GC moves, no virtual remap) | ⬜ | 4 weeks |
+| 90 | `core.sync.nolock` — lock-free atomics, seqlock, RCU | ⬜ | 5 weeks |
+| 91 | Verified interrupt-safety (no alloc in IRQ context) | ⬜ | 4 weeks |
+| 92 | Cross-bootstrappable build (Stage-0 → freestanding hlc) | ⬜ | 4 weeks |
+| 93 | `target x86_64-unknown-none` — bare-metal triple | ⬜ | 3 weeks |
+| 94 | `target aarch64-unknown-none` — bare-metal ARM | ⬜ | 3 weeks |
+| 95 | `target riscv64-unknown-none` — bare-metal RISC-V | ⬜ | 3 weeks |
+| 96 | ELF symbol-table emission + debug-info (DWARF 5) | ⬜ | 6 weeks |
+
+### Phase VII — Verification, security & supply chain (Stages 97–112)
+
+| # | Stage | Status | Estimated effort |
+|---|-------|:------:|:----------------:|
+| 97 | SMT-based loop-invariant inference (auto-discovery) | ⬜ | 6 weeks |
+| 98 | Refinement types (lightweight, opt-in) | ⬜ | 7 weeks |
+| 99 | `hlprove --cvc5` — CVC5 SMT backend | ⬜ | 3 weeks |
+| 100 | Separation-logic fragment (heap shapes) | ⬜ | 8 weeks |
+| 101 | Cryptographic side-channel analysis pass | ⬜ | 5 weeks |
+| 102 | Constant-time verifier (verify code is branch-free on secrets) | ⬜ | 4 weeks |
+| 103 | `hls-audit` — supply-chain effect report (transitive) | ⬜ | 4 weeks |
+| 104 | SBOM generation (CycloneDX + SPDX) per release | ⬜ | 3 weeks |
+| 105 | Reproducible-build verification across distros | ⬜ | 4 weeks |
+| 106 | Signed packages (minisign, ed25519) | ⬜ | 3 weeks |
+| 107 | Transparency log Gossip protocol (multi-source verify) | ⬜ | 4 weeks |
+| 108 | Memory-safety re-verification under `-O fast` (proof replay) | ⬜ | 4 weeks |
+| 109 | Taint-tracking through FFI boundaries | ⬜ | 5 weeks |
+| 110 | Sandboxed package execution (seccomp-bpf filter) | ⬜ | 5 weeks |
+| 111 | Capability token types (`Cap[Net]` as a value, not just effect) | ⬜ | 6 weeks |
+| 112 | Audit-log signing (every privileged op hashed + chained) | ⬜ | 3 weeks |
+
+### Phase VIII — Developer experience & ecosystem (Stages 113–124)
+
+| # | Stage | Status | Estimated effort |
+|---|-------|:------:|:----------------:|
+| 113 | LSP: goto-definition across packages | ⬜ | 4 weeks |
+| 114 | LSP: inlay hints (types, parameter names) | ⬜ | 3 weeks |
+| 115 | LSP: refactor actions (rename, extract, inline) | ⬜ | 6 weeks |
+| 116 | `hlfmt` — preserve comments in all positions | ⬜ | 3 weeks |
+| 117 | `hlfmt` — configuration file (`.hlfmt.toml`) for teams | ⬜ | 2 weeks |
+| 118 | `hllint` — autofix mode (`--fix`) | ⬜ | 4 weeks |
+| 119 | `hltest` — snapshot testing (`assert_snapshot!`) | ⬜ | 3 weeks |
+| 120 | `hltest` — parameterised tests (table-driven) | ⬜ | 3 weeks |
+| 121 | VS Code extension: debugger integration (DAP) | ⬜ | 6 weeks |
+| 122 | `hldoc` — searchable web docs (offline + online) | ⬜ | 5 weeks |
+| 123 | `hls-repl` — interactive REPL with :type/:effects/:audit | ⬜ | 5 weeks |
+| 124 | `hls-bench` — criterion-style micro-benchmark runner | ⬜ | 4 weeks |
+
+### Phase IX — Performance, runtime & stability (Stages 125–140)
+
+| # | Stage | Status | Estimated effort |
+|---|-------|:------:|:----------------:|
+| 125 | Garbage-collector-free runtime verification (RSS stability) | ⬜ | 3 weeks |
+| 126 | Soft-real-time mode (bounded allocation per cycle) | ⬜ | 6 weeks |
+| 127 | Deterministic-scheduler option (testing concurrency) | ⬜ | 4 weeks |
+| 128 | Backwards-compatibility test suite (every prior version's ok/) | ⬜ | 5 weeks |
+| 129 | Migration tooling (`hls migrate v0.34 -> v1.0`) | ⬜ | 4 weeks |
+| 130 | Deprecation mechanism (`@deprecated` attribute + lint) | ⬜ | 3 weeks |
+| 131 | Semantic-versioning enforcement in `hls-pkg` | ⬜ | 3 weeks |
+| 132 | LTS branch policy (backport-only after v1.0) | ⬜ | 2 weeks |
+| 133 | Cross-impl differential suite (3+ backends) | ⬜ | 6 weeks |
+| 134 | Fuzz corpus seeding from real-world packages | ⬜ | 4 weeks |
+| 135 | Bug-bounty-eligible soundness guarantees documented | ⬜ | 3 weeks |
+| 136 | Performance regression dashboard (per-commit) | ⬜ | 5 weeks |
+| 137 | Memory regression dashboard (RSS over time) | ⬜ | 4 weeks |
+| 138 | Compile-time regression dashboard | ⬜ | 4 weeks |
+| 139 | Binary-size regression dashboard | ⬜ | 3 weeks |
+| 140 | Independent security audit (third-party, paid) | ⬜ | 8 weeks |
+
+### Phase X — Final stabilisation & v1.0 (Stages 141–150)
+
+| # | Stage | Status | Estimated effort |
+|---|-------|:------:|:----------------:|
+| 141 | API freeze — syntax + stdlib locked | ⬜ | 4 weeks |
+| 142 | Pure-HLS bootstrap (remove `boot/` Python seed) | ⬜ | 8 weeks |
+| 143 | Bit-for-bit reproducible bootstrap chain | ⬜ | 4 weeks |
+| 144 | Independent third-party security audit (final) | ⬜ | 6 weeks |
+| 145 | LTS policy published (3 years bug-fix, 5 years security) | ⬜ | 2 weeks |
+| 146 | v1.0 Release Candidate 1 (feature freeze) | ⬜ | 4 weeks |
+| 147 | v1.0 Release Candidate 2 (bug-fix only) | ⬜ | 4 weeks |
+| 148 | v1.0 Release Candidate 3 (final dry-run) | ⬜ | 4 weeks |
+| 149 | v1.0 Release Candidate 4 (sign-off) | ⬜ | 2 weeks |
+| 150 | **HLS v1.0 — LTS release** | ⬜ | 2 weeks |
+
+> **Note on Stage 19 (originally "Documentation, book, playground"):**
+> The documentation/book/playground stage has been **removed** from the
+> roadmap. Promotion, documentation, and the public playground are
+> separately managed activities that happen **after** v1.0 stabilises —
+> they are explicitly out-of-roadmap. The roadmap is exclusively about
+> building the language and toolchain; how the resulting language is
+> communicated to the world is the maintainer's separate concern.
+
+Estimated total duration: ~36–48 months (small team of 2–4 full-time).
 
 ---
 
@@ -1308,47 +1507,985 @@ no panic checks needed.
   path symlinks can no longer escape); BrokenPipeError at shutdown is
   silent (`boot.py prog.hls | head`).
 
-## STAGE 18 — Testing ecosystem & fuzzing ⬜
+## STAGE 18 — Testing ecosystem & fuzzing ✅ (release v0.34.0-alpha)
+
+**Goal:** every change to Halis is verifiable by an in-language test
+suite, a quickcheck property harness, and an AST-level differential
+fuzzer; coverage is reported from the HLIR.
+
+**Shipped (v0.34.0-alpha):**
+
+- **`hltest` (tools/hltest.py)** — the Stage-18 test runner. Discovers
+  every top-level function whose name starts with `test_` in the given
+  `.hls` files (or `--dir` trees), runs them in PARALLEL across files
+  via a `fork`-based process pool (`-j N`, default = CPU count), and
+  reports PASS/FAIL/SKIP with per-test timing. A test PASSES when it
+  returns normally (exit 0); FAILS when it panics; SKIPs when the
+  panic message starts with the reserved prefix `__HLTEST_SKIP__:`
+  (set by the `std.test.mark_skip` helper). Supports `--grep` to filter
+  tests by substring, `--junit out.xml` for CI integration, and
+  `--verbose` to surface skip reasons. A synthetic `<load>` /
+  `<check>` test name is reported on compile / type errors so the
+  failure source is visible. Each file is the unit of parallelism —
+  the type-checker runs once per file, not once per test, and each
+  test gets a FRESH `Interp` so tests cannot leak state.
+- **`std/test.hls`** — the assertion library: `assert_eq_int`,
+  `assert_eq_int_msg`, `assert_ne_int`, `assert_eq_str`,
+  `assert_eq_str_msg`, `assert_ne_str`, `assert_eq_bool`,
+  `assert_true`, `assert_true_msg`, `assert_false`, `assert_eq_float`,
+  `assert_approx_eq_float` (with explicit epsilon),
+  `assert_int_range`, `assert_len_int`, `assert_len_str`, `mark_skip`.
+  HLS equality (`==`) is only defined for the primitive types
+  (`int`, `float`, `bool`, `str`); the assertion helpers are therefore
+  TYPED so every comparison type-checks. Every failure calls `panic`
+  with a clear "got=… expected=…" message — no `uses IO` required
+  (`panic` is the language's clean termination primitive).
+- **`std/quickcheck.hls`** — property-based testing generators:
+  `qc_int` (full int64 range with 1% corner-case forcing for 0, ±1,
+  ±INT64_MAX, ±INT64_MIN, ±INT64_MAX/2), `qc_int_range(lo, hi)`,
+  `qc_bool`, `qc_str` (printable ASCII, length 0–32), `qc_str_n(n)`,
+  `qc_list_int(max_len)`, `qc_byte`, and `qc_fail(label, counter_ex)`
+  for reporting counter-examples. HLS does not have first-class
+  function values, so the "for_all" idiom is expressed as a loop the
+  user writes around a generator call — every generator declares
+  `uses Rand` (the test function therefore declares `uses Rand` to
+  opt in).
+- **`hls-fuzz` (tools/hls-fuzz.py)** — AST-level differential fuzzer.
+  Generates small type-correct HLS programs (a grammar tuned to
+  exercise the surface that matters: arithmetic with overflow paths,
+  control flow, lists, strings, struct/enum dispatch, contracts),
+  compiles each program TWO ways — (1) interpreter, (2) native via
+  `hlc.hls` (Stage-0) → C → gcc → run — and compares stdout + exit
+  code byte-for-byte. Any divergence is a soundness bug in EITHER
+  implementation; the fuzzer AUTO-MINIMISES the failing program via
+  delta-debugging on the AST (statement-by-statement removal,
+  re-checking that the divergence still reproduces) and writes the
+  minimised case to `fuzz-corpus/case-NNNN.hls`. Supports `--time`,
+  `--jobs`, `--seed`, `--n`, `--max-depth`, `--corpus`, `--minimize`
+  (for minimising an existing case). Reports run rate, skip count
+  (programs that did not type-check or that the native backend
+  rejected — not a divergence), and divergence count.
+- **`hlcov` (tools/hlcov.py)** — HLIR-level coverage tracker. Statically
+  counts basic blocks per function (the function body is one block;
+  every `if`/`while`/`for` adds nested blocks; every match arm is a
+  block), then runs the program under a `CoverageInterp` subclass
+  that records every `call_fn` invocation. Reports per-function
+  block-count, call-count, and hit flag; totals; percentage. Supports
+  `--lcov out.lcov` for LCOV-format output (geninfo-compatible) and
+  `--html` (future). The Stage-18 acceptance criterion is function
+  coverage from HLIR — a more precise basic-block-coverage
+  implementation (via HLIR instrumentation) is deferred to a later
+  stage.
+- **Makefile targets**: `make hltest [F=...] [GREP=...] [J=4]
+  [JUNIT=...]`, `make fuzz [TIME=60] [SEED=...]`, `make cov F=...
+  [LCOV=...]`, `make fuzz-acceptance` (the 1-hour Stage-18
+  acceptance run).
+- **CI integration**: `tests/run_tests.sh` now includes a Stage-18
+  section that runs `hltest`, `hlcov`, and `hls-fuzz` (5-second
+  smoke run) on every test invocation. The full 1-hour acceptance
+  run is a separate `make fuzz-acceptance` target (run nightly).
+- **Acceptance example**: `tests/ok/feat_stage18_hltest.hls` — 12
+  tests exercising every assertion helper (typed `assert_eq_int/str/
+  bool/float`, `assert_ne_int/str`, `assert_true/_false`,
+  `assert_int_range`, `assert_len_int/str`, `assert_approx_eq_float`)
+  plus 3 quickcheck-style properties (addition commutativity,
+  concatenation length preservation, doubling/halving roundtrip).
+  The file is BOTH a valid Halis program (the top-level `main()`
+  runs every `test_*` function so the differential suite gets the
+  same answer) AND a hltest test file (you can run it via
+  `tools/hltest.py`).
+
+**Acceptance (Stage 18 criterion):** the fuzzer runs for 1 hour
+without finding any semantic discrepancy between the two
+implementations (`make fuzz-acceptance`). The 1-hour run is gated on
+CI as a nightly job; a 5-second smoke run is in the per-commit test
+suite.
+
+**Acceptance (initial release):** all 557 tests PASS (554 prior +
+3 new Stage-18 tests: `hltest`, `hlcov`, `hls-fuzz`); the bootstrap
+is still deterministic; the differential test suite (interpreter ↔
+native, including `-O fast`) remains byte-identical.
+
+---
+
+## STAGE 19 — Profile-guided optimisation (PGO) ⬜
 
 **Work:**
-- `hltest`: in-language unit tests (`test` blocks, `assert_eq`), running in
-  parallel.
-- Property-based testing (quickcheck-style) integrated.
-- `hls-fuzz`: AST-level fuzzing — generate random HLS programs, run
-  differential interpreter ↔ compiler, auto-minimise divergent cases.
-- Coverage tracking from HLIR.
+- `hlc --pgo-generate` — instrument every function entry, branch, and
+  loop back-edge with a counter write to a `.hlcprof` file.
+- `hlc --pgo-use=<profile>` — feed the profile back into the optimiser:
+  hot/cold block reordering, branch-layout (likely/unlikely hints),
+  inlining thresholds tuned per call site.
+- CI builds a PGO-trained `hlc` binary as the canonical release
+  artifact (the bootstrap itself benefits — a 10–20% compile-time
+  reduction is the target).
 
-**Acceptance:** fuzzer runs for 1 hour without finding any semantic
-discrepancy between the two implementations; daily CI.
+**Acceptance:** a PGO-trained `hlc` compiles `hlc.hls` in ≤80% of the
+non-PGO build's wall time, with byte-identical output.
 
-## STAGE 19 — Documentation, book, playground ⬜
+---
 
-**Work:**
-- "The Halis Book" — a bilingual (Vietnamese + English) textbook, from
-  intro to ownership/effects/verification.
-- Website + playground running native in the browser (WebAssembly backend).
-- Real-world examples: web server, CLI tool, data analysis program.
-- Tutorial series "write a compiler in HLS" — using `hlc` itself as the
-  teaching material.
-
-**Acceptance:** newcomer goes from install to "native hello world" in < 10
-minutes without leaving the official docs.
-
-## STAGE 20 — HLS v1.0 — API freeze, LTS, pure-HLS bootstrap ⬜
-
-**Goal:** stable long-term release.
+## STAGE 20 — Link-time optimisation (LTO) across crates ⬜
 
 **Work:**
-- Freeze syntax + standard library (semver: changes only in major versions).
-- **Fully remove `boot/`** — bootstrap is pure HLS: every release is built by
-  the previous release's `hlc` binary (bit-for-bit reproducible bootstrap
-  chain).
-- Independent third-party security audit of the entire runtime + bootstrap
-  chain.
-- Support policy: 3 years of bug fixes for v1.x.
+- Whole-program IR emission: `hlc --emit-lto-ir` produces a single
+  bitcode file containing every transitive dependency.
+- Cross-crate inlining + dead-code elimination: a `pure` helper used
+  only inside another crate's `pure` fn is inlined and the standalone
+  definition is dropped.
+- Generic specialisation across crate boundaries (today each crate
+  re-instantiates generics; LTO deduplicates).
 
-**Acceptance:** build v1.0 from two independent paths (from previous release
-binary + from Stage-0 boot) producing the same binary — reproducible build.
+**Acceptance:** the stdlib's `list_sort_int_asc` inlined into a
+caller produces the same output as the non-LTO build; binary size of
+a "hello world" CLI drops by ≥15%.
+
+---
+
+## STAGE 21 — SIMD vectorisation (target-feature detection) ⬜
+
+**Work:**
+- `std.simd` — explicit SIMD types (`i32x4`, `f64x2`, `u8x16`) and
+  operations (add, sub, mul, shuffle, gather, scatter).
+- Auto-vectoriser pass on the HLIR: simple `for` loops over
+  `list[int]` become SIMD operations when the target supports it
+  (`+sse4.2`, `+avx2`, `+neon`).
+- `--target-feature` flag + `cfg(feature)` for runtime dispatch.
+
+**Acceptance:** `list_sort_int_asc` on a 1M-element list is ≥2×
+faster on an AVX2 target than the scalar version, with identical
+output.
+
+---
+
+## STAGE 22 — Cross-compilation targets (Linux/macOS/Windows/FreeBSD) ⬜
+
+**Work:**
+- `--target` flag for the LLVM backend: `x86_64-linux-gnu`,
+  `aarch64-apple-darwin`, `x86_64-pc-windows-msvc`,
+  `x86_64-unknown-freebsd`.
+- Cross-linker detection (`zig cc` as the universal linker fallback).
+- `hls-pkg` gains a `--target` flag for per-target lockfile entries.
+
+**Acceptance:** `make cross TARGET=aarch64-apple-darwin` produces a
+Mach-O binary on a Linux host that runs natively on Apple Silicon.
+
+---
+
+## STAGE 23 — WebAssembly backend (`target wasm32`) ⬜
+
+**Work:**
+- `--target wasm32-unknown-unknown` — emit `.wasm` directly from the
+  HLIR via a new backend (bypass LLVM for the smallest binaries; use
+  LLVM for the fastest).
+- `--target wasm32-unknown-emscripten` — full libc access via
+  emscripten.
+- `std.jsffi` — declare JavaScript imports (`extern "js" { fn
+  console.log(s: str) -> void }`); the wasm module imports them.
+
+**Acceptance:** `examples/hello.hls` compiles to a `<10 KB` wasm
+binary that prints "Hello, World!" in a browser.
+
+---
+
+## STAGE 24 — `wasm-opt` integration + emscripten bridge ⬜
+
+**Work:**
+- `hls-pkg build --target wasm32` runs `wasm-opt -O3` on the output.
+- `std.jsffi` gains `extern "js"` struct marshalling (HLS struct ↔ JS
+  object via glue code).
+- A `hls serve` dev server reloads the wasm on file change.
+
+**Acceptance:** a 1000-LOC web app compiles to `≤100 KB` wasm +
+`≤5 KB` JS glue; `wasm-opt` reduces size by ≥30%.
+
+---
+
+## STAGE 25 — AArch64 backend tuning (Apple Silicon, Graviton) ⬜
+
+**Work:**
+- NEON SIMD codegen for `std.simd` types on AArch64.
+- Pac-keys (Pointer Authentication) support for Apple Silicon.
+- BTI (Branch Target Identification) on Graviton 3+.
+
+**Acceptance:** `benchmarks/json_bench.hls` runs ≥20% faster on
+AArch64 than the v0.34 baseline.
+
+---
+
+## STAGE 26 — RISC-V 64 backend (foundation for OS work) ⬜
+
+**Work:**
+- `--target riscv64gc-unknown-linux-gnu` — full Linux user-mode.
+- `--target riscv64-unknown-none` — bare-metal (no OS, for OS work).
+- Vector extension (`V`) codegen for `std.simd` types.
+
+**Acceptance:** `make cross TARGET=riscv64-unknown-none` produces a
+bare-metal binary that runs in QEMU; the binary contains zero libc
+references.
+
+---
+
+## STAGE 27 — Inline assembly syntax (`asm!`) ⬜
+
+**Work:**
+- `asm!("hlt")` — a statement that emits raw assembly.
+- `asm!("mov $0, {0}", out(reg) x)` — output operands tied to HLS
+  variables.
+- `asm!("in {0}, $0x60", in(reg) port, out(reg) val)` — input + output
+  operands.
+- Clobber lists + options (`pure`, `nomem`, `noreturn`).
+
+**Acceptance:** a typesafe `inb(port) -> u8` helper compiles to a
+single `in` instruction with no compiler-generated memory accesses.
+
+---
+
+## STAGE 28 — Stack-frame layout control (for kernel code) ⬜
+
+**Work:**
+- `#[stack_size(N)]` — guarantee a function's stack frame is ≤ N bytes
+  (compile error if exceeded).
+- `#[no_red_zone]` — disable the x86-64 red zone (required for
+  interrupt handlers).
+- `#[irq_handler]` — emit a `IRET`-compatible frame (save all
+  registers, no implicit stack usage).
+
+**Acceptance:** a kernel's interrupt handler compiles with
+`#[irq_handler] #[no_red_zone] #[stack_size(256)]` and the emitted
+assembly uses ≤256 bytes of stack.
+
+---
+
+## STAGE 29 — `noinline`/`always_inline`/`cold`/`hot` attributes ⬜
+
+**Work:**
+- `#[inline(always)]`, `#[inline(never)]`, `#[cold]`, `#[hot]` on
+  function declarations.
+- The optimiser honours these annotations (today it heuristically
+  decides; the attributes override).
+- `hllint` warns when `#[inline(always)]` is on a function >50 lines
+  (likely a mistake).
+
+**Acceptance:** the optimiser's inline decisions match the annotations
+100% (verified via `--opt-stats`).
+
+---
+
+## STAGE 30 — Boxed-vs-stack layout analysis (escape analysis) ⬜
+
+**Work:**
+- Escape analysis: a `list[T]` that does not escape its creating
+  function is allocated on the stack (no heap allocation, no
+  refcount overhead).
+- `#[boxed]` / `#[stack]` annotations to force a layout.
+- The analysis is proven: a stack-allocated value can NEVER outlive
+  its creating frame (the checker enforces).
+
+**Acceptance:** `examples/fibonacci.hls`'s inner loop allocates zero
+heap objects (verified via `valgrind --tool=massif`).
+
+---
+
+## STAGE 31 — Tail-call optimisation (verified) ⬜
+
+**Work:**
+- `#[tail_call]` — assert that a call is in tail position (compile
+  error if not).
+- The codegen emits a `jmp` instead of `call` for tail calls; stack
+  usage is constant regardless of recursion depth.
+- The verifier confirms the call is genuinely tail (no cleanup
+  needed between the call and the return).
+
+**Acceptance:** `examples/fibonacci.hls` rewritten with
+`#[tail_call]` runs `fib(1_000_000)` without stack overflow.
+
+---
+
+## STAGE 32 — Zero-cost abstractions audit (every stdlib fn under 1 µs) ⬜
+
+**Work:**
+- A CI job that runs `hls-bench` on every stdlib function and fails
+  if any function takes >1 µs on a 4 GHz CPU.
+- The slowest functions (JSON parser, regex engine, sort) get an
+  optimisation pass.
+- Generic specialisation is verified: `list_reverse_int` produces
+  the same assembly as a hand-written C reverse.
+
+**Acceptance:** every public stdlib function benchmarks at <1 µs on
+the CI hardware.
+
+---
+
+## STAGE 33 — Async/await zero-runtime futures ⬜
+
+**Work:**
+- `async fn` — returns a `Future[T]` (a state machine, not a heap
+  allocation).
+- `await future` — drives the state machine; the future is
+  stackless (the state is the local variables).
+- A `select!` macro for racing multiple futures.
+- The runtime is a work-stealing executor (`std.async.runtime`).
+
+**Acceptance:** a 10k-concurrent-connection HTTP server uses <100 MB
+RSS with async/await (vs >1 GB with thread-per-connection).
+
+---
+
+## STAGE 34 — Async stream combinators (channels × generators) ⬜
+
+**Work:**
+- `Stream[T]` — an async analogue of `Chan[T]` (push-based).
+- `gen fn` — a generator function (yields values lazily).
+- Combinators: `map`, `filter`, `take`, `fold`, `merge`,
+  `flat_map`. Each is zero-allocation.
+- Backpressure: a `Stream` blocks the producer if the consumer is
+  slow (no unbounded buffering).
+
+**Acceptance:** a pipeline `source → map → filter → sink` processes
+1M events with <10 MB peak RSS and zero heap allocations after
+warmup.
+
+---
+
+## STAGES 35–52 — Standard library expansion
+
+> One paragraph per stage; see the overview table for effort estimates.
+> Each stage closes when its module is fully documented, has a
+> differential test, and benchmarks under its target budget.
+
+**35. `std.io`** — `Read` and `Write` traits, `BufReader`/`BufWriter`,
+memory-backed `Cursor[T]`, `Chain` (concatenate readers). The trait
+system is the first user of the new `trait` keyword (reserved since
+v0.20.0-alpha).
+
+**36. `std.fs`** — `Path` (not `str`), `PathBuf`, `read_dir`, `walk`,
+`metadata`, `set_permissions`. Path traversal attacks are prevented
+at the type level (a `Path` cannot be constructed from a tainted
+`str` without `sanitize_path`).
+
+**37. `std.net`** — `TcpListener`, `TcpStream`, `UdpSocket`,
+`IpAddr` (v4 + v6), `SocketAddr`. TLS via libcurl (no OpenSSL
+dependency). DNS resolution via `net_lookup` (already a taint sink).
+
+**38. `std.http`** — HTTP/1.1 server + client (RFC 7230). Request
+parsing is constant-memory (streaming). Response writing is
+allocation-free for small bodies. Chunked transfer encoding,
+keep-alive, pipelining.
+
+**39. `std.http2`** — HTTP/2 + ALPN negotiation. Server push.
+Stream multiplexing. HPACK header compression. Backpressure per
+stream (flow control).
+
+**40. `std.json` streaming parser** — `JsonReader` reads one token
+at a time; the program never holds the whole document in memory.
+Useful for parsing multi-GB JSON logs. The existing `std.json`
+document parser remains for small inputs.
+
+**41. `std.regex`** — NFA-based regex (Thompson construction). No
+backtracking means no ReDoS. Captures, lookahead, lookbehind,
+character classes, Unicode categories. The compile-time checker
+verifies the regex is well-formed (a malformed regex is a compile
+error, not a runtime one).
+
+**42. `std.fmt`** — `Display` and `Debug` traits, `format!` macro,
+`println!("{:?}", x)`. Custom `Display` impls via `impl Display for
+MyType`. Format strings are parsed at compile time (a wrong
+specifier is a compile error).
+
+**43. `std.hash`** — `SipHasher` (default, DoS-resistant),
+`XxHasher` (fast, non-crypto), `FnvHasher` (small code), `CityHasher`
+(Google's). A `Hash` trait; the `hashmap` of Stage 44 uses it.
+
+**44. `std.collections`** — `BTreeMap[K, V]` (ordered, log-time),
+`HashSet[T]` (hashed), `LinkedList[T]` (intrusive, no allocation
+per node), `RingBuf[T]` (fixed-capacity, no allocation after
+creation), `HashMap[K, V]` (replaces `map[str, V]` for non-str keys).
+
+**45. `std.sync`** — `Mutex[T]`, `RwLock[T]`, `Condvar`,
+`OnceCell[T]` (lazy init), `Barrier` (multi-thread rendezvous).
+All are verified deadlock-free under the `hlmodel` checker for
+2-thread / 2-lock scenarios.
+
+**46. `std.thread`** — `spawn`, `join`, `yield_now`, `sleep`,
+`current` (the current thread's id), `Builder` (stack size, name).
+Preemptive scheduling via OS threads (today's `spawn` uses Python
+threads in the interpreter and pthreads in native — this stage
+formalises the model).
+
+**47. `std.process`** — `Command`, `Child`, `ExitStatus`, `Stdio`
+(piped/inherited/null). `proc_exec` becomes a thin wrapper.
+Taint-tracking: a tainted `Command` argument is rejected at the
+checker (existing `proc_exec` already does this; `Command` adds
+type-level enforcement).
+
+**48. `std.env`** — `var(key) -> Option[str]`, `set_var`,
+`current_dir`, `set_current_dir`, `args_os` (os-string version of
+`tainted_args`). Environment variables are tainted by default.
+
+**49. `std.time`** — `Instant` (monotonic), `Duration`,
+`SystemTime` (wall clock), `sleep`, `timeout`. Arithmetic on
+`Duration` is checked (no overflow when adding two large durations).
+
+**50. `std.math`** — IEEE-754 edge cases (NaN, Inf, signed zero,
+subnormals), `sin`/`cos`/`tan`/`exp`/`log`/`sqrt`, special functions
+(`erf`, `gamma`, `lgamma`), arbitrary-precision `BigDecimal` (no
+floating-point error).
+
+**51. `std.archive`** — `TarReader`, `ZipReader`, `GzipEncoder`,
+`GzipDecoder`. Decompression is bounded (a zip bomb is detected and
+rejected after a configurable expansion ratio). No unsafe
+decompression (every byte is bounds-checked).
+
+**52. `std.uuid` v7 + `std.ulid`** — UUID v7 (time-ordered, like UUID
+v1 but privacy-preserving), ULID (26-char base32, lexicographically
+sortable). Both replace UUID v4 for new use-cases (UUID v4 remains
+for backwards compat).
+
+---
+
+## STAGES 53–62 — CLI tooling track
+
+> CLI tools are the FIRST of the three target application families.
+> Each stage ships a piece of the standard library or a new tool
+> that makes Halis the best language for writing CLI utilities.
+
+**53. `std.cli`** — `cli::Parser` derive macro: declare a struct,
+get a parser. Subcommands, env-var fallback, defaults, help text
+generation, `--version` from `hls-pkg.toml`. Type-safe (a `--port
+int` argument rejects non-integers at the parser, not in user
+code).
+
+**54. `std.tui`** — `Term::raw()`, `Term::screen()`, `Term::clear()`,
+`Cursor::move_to()`, `Color`/`Style` enums. Built on `std.io` and
+ANSI escape codes. A `Widget` trait for composable UI elements.
+
+**55. `std.color`** — Detect terminal color support (TERM,
+COLORTERM, NO_COLOR). Truecolor (24-bit) fallback to 256-color to
+16-color to monochrome. `Style::new().fg(RED).bold()` builder.
+
+**56. `std.progress`** — `ProgressBar::new(total)`, `tick()`,
+`finish()`, `ETA` estimation, multi-bar (one per concurrent task),
+spinner styles. Zero allocation after creation.
+
+**57. `std.log`** — `info!`, `warn!`, `error!`, `debug!`, `trace!`
+macros. Structured logging (key-value pairs). Output formats: human
+(colored, for TTY), JSON (for log aggregation), syslog (for
+daemons). Log level controlled by `HLS_LOG` env var.
+
+**58. `std.config`** — Layered config: defaults < file < env <
+CLI args. File formats: TOML (preferred), YAML, JSON. A `Config`
+derive macro generates the loader from a struct.
+
+**59. `std.complete`** — Generate shell completions for bash, zsh,
+fish, powershell. Given a `cli::Parser` definition, produce a
+completion script that knows every subcommand, flag, and arg.
+
+**60. `hls-cli`** — A `cargo`-style launcher: `hls new myapp`,
+`hls run`, `hls build`, `hls test`, `hls bench`, `hls doc`,
+`hls publish`. Replaces `make` for end-users (the Makefile remains
+for compiler developers).
+
+**61. `hls-doc`** — A `rustdoc`-style API doc generator. Reads
+`///` doc comments, produces HTML with cross-references, search
+index, type signatures. Output is static HTML (no JS runtime
+required).
+
+**62. Man-page generator** — `hls doc --man myapp` produces a
+groff/nroff man page from the CLI parser definition. `hls install`
+installs both the binary and the man page.
+
+---
+
+## STAGES 63–76 — Web application track
+
+> Web applications are the SECOND of the three target application
+> families. Halis targets the server side (HTTP server, WebSocket)
+> and the client side (WebAssembly + JS-FFI).
+
+**63. `std.http.router`** — `Router::new().get("/", index).post("/
+users", create_user)`. Path parameters (`/users/:id`), query
+parameters, middleware chains, sub-routers (mount one router under
+a prefix of another).
+
+**64. `std.http.server`** — Multi-threaded server (one thread per
+core, work-stealing). HTTP/1.1 keep-alive, HTTP/2 multiplexing,
+TLS termination (via `std.net`). Graceful shutdown (drain
+in-flight requests on SIGTERM).
+
+**65. `std.websocket`** — RFC 6455 server + client. Text + binary
+frames, ping/pong, close handshake. Per-message-deflate (RFC 7692)
+compression. Taint-tracking: a received frame is `tainted[str]`
+until sanitised.
+
+**66. `std.cookie`** — `Cookie::new(name, value)`, signed cookies
+(HMAC-SHA256), `SameSite=Strict/Lax/None`, `Secure`, `HttpOnly`.
+The `SameSite=None` + `Secure` requirement is enforced at the type
+level (a `Cookie` with `SameSite=None` MUST be `Secure`).
+
+**67. `std.session`** — Server-side sessions. In-memory store
+(single-process), file store (multi-process, NFS-safe), Redis
+store (multi-host). Session IDs are 256-bit cryptographically
+random.
+
+**68. `std.csrf`** — Double-submit cookie pattern (stateless) and
+sync-token pattern (stateful). A `csrf::protect` middleware rejects
+any POST/PUT/DELETE without a valid token.
+
+**69. `std.template`** — Compile-time HTML templates. A `.hls.html`
+file is parsed at compile time; the template's HTML structure is
+verified to be well-formed. Output is auto-escaped (XSS is a
+compile-time impossibility for template variables).
+
+**70. `std.sse`** — Server-Sent Events (one-way streaming). Useful
+for live updates without WebSocket's overhead. `sse::stream()`
+returns a `Stream[Event]`; the server flushes after each event.
+
+**71. `std.graphql`** — Schema-first GraphQL server. Parse a
+`.graphql` schema, generate types, implement resolvers as Halis
+functions. The query parser is constant-memory (no ReDoS via
+deeply-nested queries — a depth limit is enforced).
+
+**72. `std.openapi`** — Generate an OpenAPI 3.1 spec from the
+router's type signatures. Every handler's request and response
+types become JSON Schema entries. The spec is served at `/openapi.json`
+and `/docs` (Swagger UI).
+
+**73. `std.jsffi`** — From `target wasm32`, declare JavaScript
+imports: `extern "js" { fn console.log(s: str) -> void }`. The
+wasm module imports them; the JS glue (auto-generated) provides
+them. Struct marshalling: a Halis struct becomes a JS object.
+
+**74. `std.dom`** — Server-side rendering of HTML. A `dom::Element`
+tree is built in Halis, then serialised to HTML. No client-side JS
+required (the HTML is complete). Hydration (client-side JS takes
+over event handling) is a post-1.0 feature.
+
+**75. `hls-serve`** — A `webpack-dev-server` equivalent for Halis
+web apps. Watches `.hls` files, recompiles on change, serves the
+result on `localhost:3000`, hot-reloads the browser tab.
+
+**76. `hls-wasm-pack`** — `hls wasm-pack` produces a publish-ready
+`pkg/` directory: the `.wasm` binary, the JS glue, TypeScript type
+definitions, and a `package.json` for npm. `hls wasm-pack publish`
+publishes to npm.
+
+---
+
+## STAGES 77–96 — OS development foundation
+
+> OS development is the THIRD of the three target application families.
+> These stages give the LANGUAGE the capabilities OS developers need.
+> **The Halis project itself does not write an OS** — it builds the
+> language in which OTHERS can build one. After v1.0, post-1.0 work
+> prioritises this track.
+
+**77. `#![freestanding]` mode** — A crate-level attribute that
+disables libc linking, disables the `std` module, and exposes only
+the `core` module. The panic handler is user-defined (Stage 81).
+The entry point is `_start` (Linux) or a boot stub (bare metal).
+
+**78. `#![no_std]` core-only stdlib subset** — The `core` module
+contains the language primitives (`Option`, `Result`, `Iterator`,
+`Clone`, `Eq`) without any OS-dependent functionality. A `no_std`
+crate can be linked into a kernel, a bootloader, or a UEFI
+application.
+
+**79. `core.alloc`** — A pluggable allocator trait: `trait Alloc {
+fn alloc(layout: Layout) -> Result<Ptr, AllocError>; fn dealloc(ptr:
+Ptr, layout: Layout) -> void; }`. The user supplies the allocator
+(bump, slab, buddy, etc.); `core` uses it for `list[T]` and
+`map[K, V]`.
+
+**80. `core.mem`** — Physical-page allocator (buddy system), page
+table abstraction (4-level on x86-64, 3-level on AArch64), TLB
+flush primitives. All memory is typed (a `PhysFrame` is distinct
+from a `VirtAddr`).
+
+**81. Panic-handler override** — `#[panic_handler] fn my_panic(p:
+&PanicInfo) -> ! { ... }`. The user supplies the panic strategy
+(print to serial, halt the CPU, dump registers). The default
+panic (in `std`) prints to stderr and exits 101; in `no_std` there
+is no default — the user MUST supply one.
+
+**82. Stack-overflow guard page** — The runtime allocates a guard
+page below each thread's stack. A stack overflow triggers a
+page-fault handler that converts it to a clean panic (instead of
+SIGSEGV). The stack size is configurable per-thread (Stage 46).
+
+**83. Inline-asm register constraints** — Extended `asm!` with
+`in(reg)`, `out(reg)`, `inout(reg)`, `lateout(reg)`, clobber lists
+(`"memory"`, `"flags"`, `"rdi"`), and options (`pure`, `nomem`,
+`noreturn`, `preserves_flags`). The verifier checks the constraints
+(an `out` cannot be a constant, etc.).
+
+**84. Linker-script integration** — `hlc --link-script link.ld`
+passes a custom linker script to the linker. Used to lay out a
+kernel image (`.text` at 0xFFFFFFFF80100000, `.data` after, `.bss`
+zeroed by the bootloader). Custom sections (`#[link_section =
+".rodata"]`) for kernel tables.
+
+**85. Multiboot2 + Limine-compliant boot protocol** — A `multiboot2`
+header is emitted in the kernel's first 32 KB (the bootloader
+finds it by magic number). `Limine` is a newer protocol (used by
+modern hobby OSes). Both are supported as crate-level attributes.
+
+**86. `core.interrupt`** — Declare an interrupt descriptor table
+(IDT) in Halis: `static IDT: Idt = idt! { 14 => page_fault_handler,
+13 => gpf_handler, ... }`. The IDT structure is target-specific
+(x86-64: 16-byte entries; AArch64: vector table). The handler
+functions are `#[irq_handler]` (Stage 28).
+
+**87. `core.mmio`** — `Volatile<T>` type: reads and writes are
+`volatile` (the compiler cannot elide or reorder them). A
+`MMIO::new(0xB8000)` returns a `Volatile<u8>` pointing at the VGA
+text buffer. Write `b'H'` and an `H` appears on the screen.
+
+**88. `core.port`** — Typesafe x86 I/O ports: `Port::<u8>::new(
+0x60).read()`, `Port::<u8>::new(0x64).write(0xAE)`. The port width
+(u8/u16/u32) is in the type — a `Port<u8>` cannot accidentally
+write a u32. Underneath: `in al, dx` / `out dx, al`.
+
+**89. DMA-safe buffer types** — A `DmaBuffer<T>` is guaranteed to
+be physically contiguous and not subject to GC moves (Halis has no
+GC, but the runtime's refcounting can move boxes for
+compaction — `DmaBuffer` opts out). The buffer's physical address
+is queryable for DMA configuration.
+
+**90. `core.sync.nolock`** — Lock-free data structures for IRQ
+context (where sleeping is impossible): `AtomicI32`, `AtomicBool`,
+`SeqLock<T>` (readers never block writers), `Rcu<T>` (read-copy-
+update, lazy reclamation). All are verified wait-free for the
+2-thread case via `hlmodel`.
+
+**91. Verified interrupt-safety** — The checker enforces that an
+`#[irq_handler]` function does not call any function that allocates
+(list push, struct creation, etc.). Allocation in IRQ context can
+deadlock (the allocator may hold a lock). The check is transitive
+(an IRQ handler cannot call a function that calls a function that
+allocates).
+
+**92. Cross-bootstrappable build** — The bootstrap itself works in
+`no_std` mode: a freestanding `hlc` can be built that runs on bare
+metal (no OS). This lets an OS author write their kernel in Halis,
+compile it with a Halis compiler that runs ON their kernel, and
+bootstrap a self-hosting Halis-on-Haliskernel toolchain. (This is
+the most ambitious stage in this phase; it may slip to post-1.0.)
+
+**93. `target x86_64-unknown-none`** — A bare-metal triple: no
+libc, no OS calls, ELF output. The entry point is `_start` (called
+by the bootloader). The user supplies the panic handler. The
+runtime is `core` only.
+
+**94. `target aarch64-unknown-none`** — Same for AArch64. The
+entry point is the EL (Exception Level) the bootloader drops the
+kernel into (typically EL1). The user can drop to EL0 (user mode)
+via `asm!("eret")`.
+
+**95. `target riscv64-unknown-none`** — Same for RISC-V 64. The
+entry point is in M-mode (machine mode); the user drops to S-mode
+(supervisor) via `asm!("sret")`.
+
+**96. ELF symbol-table emission + DWARF 5** — The codegen emits
+full DWARF 5 debug info (line tables, variable locations, type
+info). `gdb` and `lldb` can debug a Halis kernel. The ELF symbol
+table includes every function (not just exported ones) for
+`nm`/`objdump` introspection.
+
+---
+
+## STAGES 97–112 — Verification, security & supply chain
+
+> "Extremely high security" is a moving target. These stages push
+> the verification frontier further: more automation, more
+> supply-chain guarantees, more side-channel analysis.
+
+**97. SMT-based loop-invariant inference** — `hlprove --infer`
+discovers loop invariants via SMT-based fixed-point iteration
+(today's `--suggest-invariants` only suggests heuristically). The
+discovered invariants are fed back into the proof engine, closing
+loops that today require manual annotation.
+
+**98. Refinement types** — `int[>0]` (positive integers), `str[<=
+255]` (short strings), `list[int][len <= 1024]` (bounded lists).
+A function `fn f(n: int[>0])` rejects `f(0)` at the call site
+(compile error). The refinement checker is a forward analysis on
+the HLIR.
+
+**99. `hlprove --cvc5`** — CVC5 is an SMT solver with better
+quantifier handling than z3 for some theories. `--cvc5` runs the
+proof queries through CVC5 in addition to z3; a "PROVEN" verdict
+requires BOTH solvers to agree.
+
+**100. Separation-logic fragment** — A lightweight separation logic
+for heap shapes: `fn push(xs: &list[T], x: T) requires xs |-> old
+ensures xs |-> list_with(x, old)`. The verifier proves the heap
+shape is preserved (no use-after-free, no double-free, no leak) at
+each call.
+
+**101. Cryptographic side-channel analysis pass** — `hlc --side-channel`
+flags code whose timing depends on a secret. Example: a `while`
+loop with a secret-dependent bound, a `match` on a secret enum,
+an array index that's a secret. Each flag is a lint warning.
+
+**102. Constant-time verifier** — A stricter mode: `#[constant_time]`
+on a function asserts that EVERY branch and EVERY memory access
+is independent of the function's `#[secret]` arguments. The
+verifier proves this via taint-tracking (the existing taint
+system, extended to track secret-dependence).
+
+**103. `hls-audit`** — A supply-chain effect report: given a
+`hls-pkg` lockfile, walk the entire dependency tree and print the
+transitive effect set of every crate. A crate that declares `uses
+IO` but transitively calls `proc_exec` is flagged. Useful for
+supply-chain audits before adoption.
+
+**104. SBOM generation** — Every release ships a Software Bill of
+Materials (CycloneDX + SPDX). The SBOM lists every transitive
+dependency, its version, its license, its hash. CI verifies the
+SBOM matches the lockfile.
+
+**105. Reproducible-build verification** — Two builds of the same
+commit on two different distros (Debian, Alpine, Fedora) produce
+byte-identical binaries. A CI job runs all three and diffs the
+output. Any difference is a bug.
+
+**106. Signed packages** — `hls-pkg publish` signs the package
+with minisign (ed25519). `hls-pkg add` verifies the signature
+against the publisher's published public key. The transparency
+log (Stage 13) records the signature.
+
+**107. Transparency log Gossip protocol** — Multiple transparency
+log mirrors gossip with each other (a la Certificate Transparency).
+A client that wants to verify a package's inclusion proof fetches
+it from N independent mirrors; if any mirror disagrees, the
+package is suspect.
+
+**108. Memory-safety re-verification under `-O fast`** — The proof
+engine's elisions (Stage 17) are REPLAYED on every commit. A
+function whose proof no longer holds (because the contracts
+changed) fails CI. This catches regressions in the prover itself.
+
+**109. Taint-tracking through FFI** — A tainted value passed to an
+`extern "C"` function is rejected (today: only `extern` effects
+are checked). The user must `taint_unwrap` (sanitise) before the
+FFI call. This closes the FFI taint-escape vector.
+
+**110. Sandboxed package execution** — `hls-pkg build` runs the
+build script under a seccomp-bpf filter (no `execve`, no network,
+filesystem restricted to the build dir). A malicious build script
+cannot exfiltrate the user's SSH keys.
+
+**111. Capability token types** — `Cap[Net]` is a value (not just
+an effect): you can pass it to a function, store it in a struct,
+return it from a function. A function without the `Cap[Net]`
+argument CANNOT do network I/O, even transitively. This is the
+"capability-secure" version of the effect system.
+
+**112. Audit-log signing** — Every privileged operation (file write,
+network send, process spawn) is logged with a hash chain entry.
+The chain's root is signed at process exit. A separate tool
+verifies the chain. Useful for compliance (PCI-DSS, HIPAA).
+
+---
+
+## STAGES 113–124 — Developer experience & ecosystem
+
+> A language's adoption is gated by its developer experience. These
+> stages make Halis pleasant to write, read, debug, and benchmark.
+
+**113. LSP: goto-definition across packages** — Today the LSP only
+finds definitions in the current file. Cross-package goto (and
+goto-declaration, goto-type-definition) makes navigating a
+multi-crate project fast.
+
+**114. LSP: inlay hints** — Types and parameter names are shown
+inline as ghost text: `let x: int = 42` (the `: int` is an inlay
+hint, not source). Useful for reading code without explicit type
+annotations.
+
+**115. LSP: refactor actions** — Rename (across files), extract
+function, inline function, convert if-let to match. Each refactor
+preserves semantics (verified by the checker).
+
+**116. `hlfmt` — preserve comments in all positions** — Today
+`hlfmt` preserves comments on their own line and trailing comments
+on the same line. Comments inside expressions (`1 + /* foo */ 2`)
+are preserved in this stage.
+
+**117. `hlfmt` — configuration file** — `.hlfmt.toml` lets a team
+customise: indent width, max line length, blank-line policy. The
+config is per-repo (committed).
+
+**118. `hllint` — autofix mode** — `hllint --fix` rewrites the
+source to fix lint warnings (e.g. add `mut`, remove unused
+imports, simplify `if x { true } else { false }` to `x`).
+
+**119. `hltest` — snapshot testing** — `assert_snapshot!(value)`
+writes the value to a `__snapshots__/` file on the first run;
+subsequent runs compare. Useful for testing formatter / codegen
+output. Diff is shown on mismatch.
+
+**120. `hltest` — parameterised tests** — `#[parameterise]` runs
+the same test with multiple inputs. A failing input is reported
+with its index.
+
+**121. VS Code extension: debugger integration** — DAP (Debug
+Adapter Protocol) support. Set breakpoints, step, inspect
+variables. Uses the DWARF info from Stage 96.
+
+**122. `hldoc`** — Searchable web docs. Every public function,
+struct, enum, and trait has a page. Full-text search (offline via
+a prebuilt index, online via a hosted instance). Type signatures
+rendered with syntax highlighting.
+
+**123. `hls-repl`** — An interactive REPL: type an expression,
+see its value. `:type expr` shows the type, `:effects fn` shows
+the effect set, `:audit fn` shows the effect tree. The REPL
+preserves state between expressions (a `let` is visible in the
+next expression).
+
+**124. `hls-bench`** — A criterion-style micro-benchmark runner.
+`#[bench] fn my_bench(b: &mut Bench) { b.iter(|| fib(30)) }`.
+Reports median + IQR, statistical comparison to baseline, HTML
+report.
+
+---
+
+## STAGES 125–140 — Performance, runtime & stability
+
+> The final pre-1.0 phase is about REGRESSION PREVENTION. Every
+> metric that matters (perf, memory, binary size, compile time)
+> is tracked; every regression is caught at commit time.
+
+**125. Garbage-collector-free runtime verification** — The runtime
+is GC-free by design (Stage 8's refcounting). This stage adds a
+CI job that runs every test under a leak detector (ASan) and
+fails on any leak. The memory-stress test (Stage 8) is run on
+every commit.
+
+**126. Soft-real-time mode** — `--rt soft` bounds the allocation
+budget per function: a function that allocates more than N bytes
+fails the check. Useful for soft-real-time code (audio, video,
+games) where GC pauses are unacceptable.
+
+**127. Deterministic-scheduler option** — `--scheduler deterministic`
+runs threads in a fixed round-robin order, making concurrency bugs
+reproducible. The fuzzer (Stage 18) uses this to make
+divergences reproducible.
+
+**128. Backwards-compatibility test suite** — Every prior version's
+`tests/ok/*.hls` is run against the current compiler. A regression
+(a previously-passing test now failing) is a release blocker.
+
+**129. Migration tooling** — `hls migrate v0.34 -> v1.0` rewrites
+source code to use the v1.0 stdlib (renamed functions, removed
+deprecated APIs). The migration is automated; the user reviews
+the diff.
+
+**130. Deprecation mechanism** — `#[deprecated(since="v0.35",
+note="use std.io.print instead")]` on a function emits a lint
+warning at the call site. `hls migrate` rewrites the call to the
+replacement.
+
+**131. Semantic-versioning enforcement** — `hls-pkg publish`
+rejects a version bump that violates semver: a breaking change
+requires a major bump; a new feature requires a minor bump; a
+bugfix requires a patch bump. The checker determines the change
+type by diffing the public API.
+
+**132. LTS branch policy** — After v1.0, the `lts/v1.x` branch
+receives only bug fixes (no features, no breaking changes). The
+policy is published in `SECURITY.md`.
+
+**133. Cross-impl differential suite (3+ backends)** — The
+differential suite today compares interpreter ↔ native. This
+stage adds a third backend (wasm32) and a fourth (LLVM JIT).
+Every test runs under all four; any divergence is a bug.
+
+**134. Fuzz corpus seeding from real-world packages** — The
+fuzzer's AST grammar is extended by mining real `.hls` files
+from the package registry. New patterns (e.g. a popular library
+uses `match` heavily) are added to the generator.
+
+**135. Bug-bounty-eligible soundness guarantees documented** —
+A `SOUNDNESS.md` document lists every guarantee that is
+bug-bounty-eligible (memory safety, type safety, effect safety,
+taint safety, proof soundness). Each guarantee has a payout
+range based on severity.
+
+**136. Performance regression dashboard** — A per-commit dashboard
+tracks benchmark timings. A regression >5% on any benchmark
+flags the commit. The dashboard is public (hosted on the
+project's website).
+
+**137. Memory regression dashboard** — Same for RSS. The
+memory-stress test's RSS delta is tracked. A regression >10%
+flags the commit.
+
+**138. Compile-time regression dashboard** — Same for `hlc`
+compile time on a fixed corpus (the stdlib + the test suite).
+
+**139. Binary-size regression dashboard** — Same for the binary
+size of `hlc` and a hello-world program.
+
+**140. Independent security audit** — A paid third-party security
+firm audits the entire runtime + bootstrap chain. Findings are
+filed as issues; critical findings are release blockers for v1.0.
+
+---
+
+## STAGES 141–150 — Final stabilisation & v1.0
+
+> The last phase freezes the API, removes the Python bootstrap,
+> and ships v1.0.
+
+**141. API freeze** — The syntax and the standard library are
+locked. Any change requires a major version bump (v2.0). The
+`hls-pkg` registry rejects new versions of `std.*` that break
+the freeze.
+
+**142. Pure-HLS bootstrap (remove `boot/` Python seed)** — The
+`boot/` directory (Python) is removed. Every release is built by
+the previous release's `hlc` binary. The first build of a new
+release uses the prior release's binary as the bootstrap
+compiler.
+
+**143. Bit-for-bit reproducible bootstrap chain** — Two
+independent paths (from the prior release binary + from the
+Stage-0 Python seed, kept for emergency recovery) produce
+byte-identical binaries. The reproducibility is verified on
+every commit.
+
+**144. Independent third-party security audit (final)** — A
+second paid audit (the first was Stage 140) covers the v1.0
+release candidate. Findings are filed; critical findings block
+the release.
+
+**145. LTS policy published** — `SECURITY.md` documents the
+support policy: 3 years of bug fixes for v1.x, 5 years of
+security fixes. The end-of-life date is computed and published.
+
+**146. v1.0 Release Candidate 1** — Feature freeze. No new
+features; only bug fixes. The RC is announced; users are
+encouraged to test.
+
+**147. v1.0 Release Candidate 2** — Bug-fix only. Incorporates
+feedback from RC1.
+
+**148. v1.0 Release Candidate 3** — Final dry-run. The release
+notes are complete; the SBOM is generated; the signatures are
+in place.
+
+**149. v1.0 Release Candidate 4** — Sign-off. The maintainers
+verify the reproducible build, the audit findings are resolved,
+the LTS policy is in place.
+
+**150. HLS v1.0 — LTS release** — The v1.0 binary is tagged,
+signed, and announced. The LTS branch `lts/v1.x` is created.
+Post-1.0 work begins, prioritising the OS-development track
+(Stages 77–96 extended, plus new post-1.0 stages for OS
+primitives like scheduling, IPC, filesystems).
 
 ---
 
