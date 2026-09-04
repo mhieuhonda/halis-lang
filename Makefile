@@ -176,6 +176,7 @@ examples:
                   examples/tooling_demo.hls examples/pkg_demo.hls \
                   examples/libcurl_demo.hls \
                   examples/conc_demo.hls examples/actor_demo.hls \
+                  examples/bounded_chan_demo.hls \
                   examples/par_scan.hls examples/hmac_proven.hls \
                   examples/conn_machine.hls; do \
                 echo "--- $$f"; $(PYTHON) boot/boot.py $$f || exit 1; \

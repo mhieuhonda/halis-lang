@@ -1758,8 +1758,9 @@ fn is_builtin_fn(n: str) -> bool {
         # Stage 9 release (v0.20.0-alpha): Net / Rand / Proc builtins
         || n == "net_lookup" || n == "rand_int" || n == "rand_float"
         || n == "rand_seed" || n == "proc_exec"
-        # Stage 16 (v0.27.0-alpha): concurrency builtins
-        || n == "chan_new" || n == "spawn" || n == "select"
+        # Stage 16 (v0.27.0-alpha): concurrency builtins. Stage-16
+        # perfection (v0.29.0-alpha) adds chan_new_bounded.
+        || n == "chan_new" || n == "chan_new_bounded" || n == "spawn" || n == "select"
 }
 
 fn list_has(list: list[str], x: str) -> bool {
@@ -2070,11 +2071,12 @@ fn builtin_effect(name: str) -> list[str] {
     # Stage 16 (v0.27.0-alpha): the concurrency effect. Every task /
     # channel operation carries `Conc`; a program must declare
     # `uses Conc` to use them. Builtin METHODS with effects are keyed
-    # here by their op names ("chan.send", "chan.recv", "chan.len",
-    # "task.join") — the fixpoint treats them exactly like builtin fns.
-    if name == "chan_new" || name == "spawn" || name == "select"
-        || name == "chan.send" || name == "chan.recv" || name == "chan.len"
-        || name == "task.join" {
+    # here by their op names ("chan.send", "chan.try_send",
+    # "chan.recv", "chan.recv_or", "chan.len", "task.join") — the
+    # fixpoint treats them exactly like builtin fns.
+    if name == "chan_new" || name == "chan_new_bounded" || name == "spawn" || name == "select"
+        || name == "chan.send" || name == "chan.try_send" || name == "chan.recv"
+        || name == "chan.recv_or" || name == "chan.len" || name == "task.join" {
         return ["Conc"]
     }
     # taint_mark / taint_unwrap are pure (no effect; just wrap/unwrap).
@@ -4796,6 +4798,30 @@ fn check_builtin_call(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, 
         add_edge(ctx, cur, "b:chan_new")
         return expected
     }
+    # chan_new_bounded(cap: int) -> Chan[T] — Stage-16 perfection
+    # (v0.29.0-alpha): a bounded channel whose send blocks while it
+    # holds `cap` messages (backpressure). A literal capacity < 1 is a
+    # COMPILE error; dynamic capacities are validated at runtime
+    # (clean panic 101).
+    if name == "chan_new_bounded" {
+        if nargs != 1 {
+            cerr(line, "chan_new_bounded() expects 1 int argument (the capacity)")
+        }
+        let a0: str = argt.get(0)
+        if a0 != "int" {
+            cerr(line, "chan_new_bounded() capacity expects int, got " + a0)
+        }
+        let capn: int = ctx.exprs[ctx.exprs[e].args.get(0)].ival
+        let capkind: str = ctx.exprs[ctx.exprs[e].args.get(0)].kind
+        if capkind == "int" && capn < 1 {
+            cerr(line, "chan_new_bounded() capacity must be >= 1, got literal " + capn.to_str())
+        }
+        if expected == "" || !is_chan_t(expected) {
+            cerr(line, "chan_new_bounded() requires a 'Chan[T]' type in the surrounding context")
+        }
+        add_edge(ctx, cur, "b:chan_new_bounded")
+        return expected
+    }
     # select(chs: list[Chan[T]]) -> int — index of the first ready channel.
     if name == "select" {
         if nargs != 1 {
@@ -5061,15 +5087,24 @@ fn check_method(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int) -> str
         else { cerr(line, "map has no method " + name) }
         ctx.exprs[e].mop = "map." + name
     } else if is_chan_t(tt) {
-        # Stage 16 (v0.27.0-alpha): Chan[T] methods.
+        # Stage 16 (v0.27.0-alpha): Chan[T] methods. Stage-16 perfection
+        # (v0.29.0-alpha) adds the non-blocking pair try_send/recv_or.
         let celem: str = chan_inner_t(tt)
         if name == "len" { ret = "int" }
         else if name == "recv" { ret = celem }
-        else if name == "send"  {
+        else if name == "recv_or" {
+        ptypes.push(celem)
+        ret = celem
+    }
+        else if name == "send" {
         ptypes.push(celem)
         ret = "void"
     }
-        else { cerr(line, "Chan has no method " + name + " (available: send, recv, len)") }
+        else if name == "try_send" {
+        ptypes.push(celem)
+        ret = "bool"
+    }
+        else { cerr(line, "Chan has no method " + name + " (available: send, try_send, recv, recv_or, len)") }
         ctx.exprs[e].mop = "chan." + name
     } else if is_task_t(tt) {
         # Stage 16 (v0.27.0-alpha): Task[R].join() -> R.
@@ -5085,12 +5120,15 @@ fn check_method(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int) -> str
     # Stage 16: method-level effects + the channel-send data-race rule.
     # These are the first builtin METHODS that carry an effect — the
     # call-graph edge keeps the effects fixpoint sound for them.
-    if ctx.exprs[e].mop == "chan.send" || ctx.exprs[e].mop == "chan.recv"
+    # (v0.29.0-alpha: chan.try_send / chan.recv_or join the family.)
+    if ctx.exprs[e].mop == "chan.send" || ctx.exprs[e].mop == "chan.try_send"
+        || ctx.exprs[e].mop == "chan.recv" || ctx.exprs[e].mop == "chan.recv_or"
         || ctx.exprs[e].mop == "chan.len" || ctx.exprs[e].mop == "task.join" {
         add_edge(ctx, cur, "b:" + ctx.exprs[e].mop)
     }
-    if ctx.exprs[e].mop == "chan.send" && nargs >= 1 {
-        # Send rule: the message type must be Send...
+    if (ctx.exprs[e].mop == "chan.send" || ctx.exprs[e].mop == "chan.try_send") && nargs >= 1 {
+        # Send rule: the message type must be Send (both the blocking
+        # send and the non-blocking try_send cross the task boundary)...
         let vt: str = chan_inner_t(tt)
         if !type_is_send(ctx, vt, []) {
             cerr(line, "type " + vt + " is not Send: values of this type cannot cross a task boundary")
@@ -5111,8 +5149,9 @@ fn check_method(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int) -> str
     # argument was type-checked — the syntactic form is what matters (a
     # bare ident/field/index read), mirroring the Python checker exactly.
     # (Running it earlier read stale annotation state and produced a
-    # divergence between the two checkers.)
-    if ctx.exprs[e].mop == "chan.send" && nargs >= 1 {
+    # divergence between the two checkers.) v0.29.0-alpha: try_send
+    # takes the message across the boundary the same way send does.
+    if (ctx.exprs[e].mop == "chan.send" || ctx.exprs[e].mop == "chan.try_send") && nargs >= 1 {
         let vt2: str = chan_inner_t(tt)
         let vidx: int = ctx.exprs[e].args.get(0)
         let vkind: str = ctx.exprs[vidx].kind
@@ -5121,7 +5160,7 @@ fn check_method(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int) -> str
             if vkind == "ident" {
                 what = "variable '" + ctx.exprs[vidx].name + "'"
             }
-            cerr(line, "cannot share " + what + " across tasks: ch.send(...) reads it directly — pass clone(x) (private copy) or take(x) (ownership transfer). Data-race freedom: no owned value may be simultaneously released by two threads.")
+            cerr(line, "cannot share " + what + " across tasks: " + ctx.exprs[e].mop + "(...) reads it directly — pass clone(x) (private copy) or take(x) (ownership transfer). Data-race freedom: no owned value may be simultaneously released by two threads.")
         }
     }
     return ret
@@ -5800,10 +5839,14 @@ fn runtime_lines() -> list[str] {
     # pthread tasks + channels. Design (mirrored exactly by the Python
     # interpreter's ConcRuntime so differential testing holds):
     #   - one global mutex + condvar guard ALL channel/task state
-    #   - channels are unbounded MPMC FIFO queues; send never blocks,
-    #     recv/select/join block on the global condvar
+    #   - channels are MPMC FIFO queues, unbounded by default or BOUNDED
+    #     via chan_new_bounded(cap) (Stage-16 perfection, v0.29.0-alpha):
+    #     a bounded channel's send blocks while full (backpressure);
+    #     recv/select/join (and full-sends) block on the global condvar
     #   - the deadlock detector fires when every thread that could
-    #     produce work is blocked AND no messages are pending anywhere
+    #     produce work is blocked AND no channel has a progress
+    #     opportunity (a pending message with a recv waiter, or free
+    #     capacity with a send waiter) — see hl_rt_deadlock_check
     #   - Chan refcounts are ATOMIC (channels are the one deliberately
     #     shared object); Task refcounts live under the global mutex.
     #     Every other type crosses task boundaries by OWNERSHIP TRANSFER
@@ -5820,6 +5863,11 @@ fn runtime_lines() -> list[str] {
     r.push("    volatile int64_t refcnt;   // ATOMIC — channels are shared across threads")
     r.push("    hl_msg* head;              // FIFO queue (guarded by g_rt_mu)")
     r.push("    hl_msg* tail;")
+    r.push("    int64_t cap;               // 0 = unbounded; >= 1 = bounded: send blocks while full")
+    r.push("    int64_t count;             // pending messages (guarded by g_rt_mu; O(1) len)")
+    r.push("    int64_t waiters;           // threads blocked in recv/select on THIS channel")
+    r.push("    int64_t send_waiters;      // threads blocked sending to this full channel")
+    r.push("    struct hl_chan *reg_next, *reg_prev;  // live-channel registry (deadlock scan)")
     r.push("    void (*elem_release)(void*);  // pointer-payload release (NULL for primitives)")
     r.push("} hl_chan;")
     r.push("")
@@ -5839,30 +5887,68 @@ fn runtime_lines() -> list[str] {
     r.push("static pthread_mutex_t g_rt_mu = PTHREAD_MUTEX_INITIALIZER;")
     r.push("static pthread_cond_t  g_rt_cv = PTHREAD_COND_INITIALIZER;")
     r.push("static int64_t g_rt_tasks   = 0;   // spawned tasks alive (main excluded)")
-    r.push("static int64_t g_rt_blocked = 0;   // threads blocked in recv/select/join (main included)")
+    r.push("static int64_t g_rt_blocked = 0;   // threads blocked in recv/select/join/send (main included)")
     r.push("static int64_t g_rt_msgs    = 0;   // pending messages across ALL channels")
+    r.push("static hl_chan* g_rt_chans  = NULL; // live-channel registry (guarded by g_rt_mu)")
     r.push("")
     r.push("// Deadlock check — call with g_rt_mu HELD, before blocking.")
-    r.push("// If every thread that could produce work is blocked and no")
-    r.push("// messages exist anywhere, no thread can ever make progress.")
-    r.push("// (A thread between two operations counts as alive-not-blocked,")
-    r.push("// so this cannot fire spuriously.)")
+    r.push("// Fires when EVERY thread is blocked (recv/select/join/full-send)")
+    r.push("// AND no channel has a progress opportunity: a pending message")
+    r.push("// with a recv waiter, or free capacity with a send waiter. A")
+    r.push("// woken-but-unscheduled thread is still counted in g_rt_blocked")
+    r.push("// (its decrement happens only after cond_wait re-acquires the")
+    r.push("// mutex), which is exactly why the waiter counters are needed:")
+    r.push("// `blocked == alive` alone can fire while a consumer's message is")
+    r.push("// already pending but the consumer has not been scheduled. (A")
+    r.push("// thread between two operations holds the mutex and is never")
+    r.push("// miscounted, so this cannot fire spuriously. Mirrors the Python")
+    r.push("// ConcRuntime.deadlock_check exactly.)")
     r.push("static void hl_rt_deadlock_check(void) {")
     r.push("    int64_t alive = g_rt_tasks + 1;   // +1: the main thread")
-    r.push("    if (g_rt_blocked == alive && g_rt_msgs == 0) {")
-    r.push("        pthread_mutex_unlock(&g_rt_mu);")
-    r.push("        hl_die(\"deadlock: all tasks are blocked on channel operations with no pending messages\");")
+    r.push("    if (g_rt_blocked != alive) return;")
+    r.push("    for (hl_chan* c = g_rt_chans; c; c = c->reg_next) {")
+    r.push("        if (c->head && c->waiters > 0) return;       // a consumer can proceed")
+    r.push("        if (c->send_waiters > 0 && c->count < c->cap) return;  // a woken sender can proceed")
     r.push("    }")
+    r.push("    pthread_mutex_unlock(&g_rt_mu);")
+    r.push("    hl_die(\"deadlock: all tasks are blocked on channel operations (no possible progress)\");")
     r.push("}")
     r.push("")
-    r.push("static hl_chan* hl_chan_new(void (*elem_release)(void*)) {")
+    r.push("static void hl_chan_register(hl_chan* c) {")
+    r.push("    c->reg_next = g_rt_chans;")
+    r.push("    c->reg_prev = NULL;")
+    r.push("    if (g_rt_chans) g_rt_chans->reg_prev = c;")
+    r.push("    g_rt_chans = c;")
+    r.push("}")
+    r.push("static void hl_chan_unregister(hl_chan* c) {  // g_rt_mu HELD")
+    r.push("    if (c->reg_prev) c->reg_prev->reg_next = c->reg_next; else g_rt_chans = c->reg_next;")
+    r.push("    if (c->reg_next) c->reg_next->reg_prev = c->reg_prev;")
+    r.push("}")
+    r.push("")
+    r.push("static hl_chan* hl_chan_new_cap(int64_t cap, void (*elem_release)(void*)) {")
     r.push("    hl_chan* c = (hl_chan*)malloc(sizeof(hl_chan));")
     r.push("    if (!c) hl_die(\"out of memory\");")
     r.push("    c->refcnt = 1;")
     r.push("    c->head = NULL;")
     r.push("    c->tail = NULL;")
+    r.push("    c->cap = cap;")
+    r.push("    c->count = 0;")
+    r.push("    c->waiters = 0;")
+    r.push("    c->send_waiters = 0;")
     r.push("    c->elem_release = elem_release;")
+    r.push("    pthread_mutex_lock(&g_rt_mu);")
+    r.push("    hl_chan_register(c);")
+    r.push("    pthread_mutex_unlock(&g_rt_mu);")
     r.push("    return c;")
+    r.push("}")
+    r.push("static hl_chan* hl_chan_new(void (*elem_release)(void*)) {")
+    r.push("    return hl_chan_new_cap(0, elem_release);")
+    r.push("}")
+    r.push("// chan_new_bounded(cap) — send blocks while `cap` messages are pending.")
+    r.push("// The checker rejects literal capacities < 1; dynamic ones die here.")
+    r.push("static hl_chan* hl_chan_new_bounded(int64_t cap, void (*elem_release)(void*)) {")
+    r.push("    if (cap < 1) hl_die(\"chan_new_bounded() capacity must be >= 1\");")
+    r.push("    return hl_chan_new_cap(cap, elem_release);")
     r.push("}")
     r.push("")
     r.push("// clone() of a channel SHARES it (atomic refcount + 1) — the whole")
@@ -5877,9 +5963,16 @@ fn runtime_lines() -> list[str] {
     r.push("    hl_chan* c = (hl_chan*)pv;")
     r.push("    if (!c) return;")
     r.push("    if (__atomic_fetch_sub(&c->refcnt, 1, __ATOMIC_ACQ_REL) == 1) {")
-    r.push("        // Last reference: drain and free. Safe without g_rt_mu —")
-    r.push("        // refcnt==0 means no binding holds the channel, and every")
-    r.push("        // send/recv requires a live reference.")
+    r.push("        // Last reference. v0.29.0-alpha: first unlink the channel")
+    r.push("        // from the live-channel registry (the deadlock scan must")
+    r.push("        // not walk a freed node). No waiter can exist: refcnt==0")
+    r.push("        // means no binding holds the channel, and every")
+    r.push("        // send/recv requires a live reference — so send_waiters ==")
+    r.push("        // waiters == 0 here. The drain then runs WITHOUT the lock;")
+    r.push("        // releasing payload channels re-enters safely (no nesting).")
+    r.push("        pthread_mutex_lock(&g_rt_mu);")
+    r.push("        hl_chan_unregister(c);")
+    r.push("        pthread_mutex_unlock(&g_rt_mu);")
     r.push("        hl_msg* m = c->head;")
     r.push("        while (m) {")
     r.push("            hl_msg* nx = m->next;")
@@ -5892,21 +5985,35 @@ fn runtime_lines() -> list[str] {
     r.push("}")
     r.push("static void hl_cleanup_chan(hl_chan** p) { hl_chan_release(*p); }")
     r.push("")
-    r.push("static void hl_chan_enqueue(hl_chan* c, hl_msg* m) {")
-    r.push("    pthread_mutex_lock(&g_rt_mu);")
+    r.push("// Blocking enqueue — g_rt_mu HELD. On a bounded channel, waits")
+    r.push("// while the queue holds `cap` messages (backpressure); a dequeue")
+    r.push("// broadcasts, which is what wakes a sender blocked here. Unbounded")
+    r.push("// channels (cap == 0) never block the sender.")
+    r.push("static void hl_chan_enqueue(hl_chan* c, hl_msg* m) {  // g_rt_mu HELD")
+    r.push("    while (c->cap > 0 && c->count >= c->cap) {")
+    r.push("        c->send_waiters++;")
+    r.push("        g_rt_blocked++;")
+    r.push("        hl_rt_deadlock_check();")
+    r.push("        pthread_cond_wait(&g_rt_cv, &g_rt_mu);")
+    r.push("        g_rt_blocked--;")
+    r.push("        c->send_waiters--;")
+    r.push("    }")
     r.push("    if (c->tail) { c->tail->next = m; } else { c->head = m; }")
     r.push("    c->tail = m;")
     r.push("    m->next = NULL;")
+    r.push("    c->count++;")
     r.push("    g_rt_msgs++;")
     r.push("    pthread_cond_broadcast(&g_rt_cv);")
-    r.push("    pthread_mutex_unlock(&g_rt_mu);")
     r.push("}")
     r.push("")
-    r.push("static hl_msg* hl_chan_dequeue(hl_chan* c) {")
+    r.push("static hl_msg* hl_chan_dequeue(hl_chan* c) {  // g_rt_mu HELD")
     r.push("    hl_msg* m = c->head;")
     r.push("    c->head = m->next;")
     r.push("    if (!c->head) c->tail = NULL;")
+    r.push("    c->count--;")
     r.push("    g_rt_msgs--;")
+    r.push("    // Freeing capacity can unblock a bounded-channel sender.")
+    r.push("    pthread_cond_broadcast(&g_rt_cv);")
     r.push("    return m;")
     r.push("}")
     r.push("")
@@ -5914,27 +6021,95 @@ fn runtime_lines() -> list[str] {
     r.push("    hl_msg* m = (hl_msg*)malloc(sizeof(hl_msg));")
     r.push("    if (!m) hl_die(\"out of memory\");")
     r.push("    m->v.p = v;")
+    r.push("    pthread_mutex_lock(&g_rt_mu);")
     r.push("    hl_chan_enqueue(c, m);")
+    r.push("    pthread_mutex_unlock(&g_rt_mu);")
     r.push("}")
     r.push("static void hl_chan_send_i64(hl_chan* c, int64_t v) {")
     r.push("    hl_msg* m = (hl_msg*)malloc(sizeof(hl_msg));")
     r.push("    if (!m) hl_die(\"out of memory\");")
     r.push("    m->v.i = v;")
+    r.push("    pthread_mutex_lock(&g_rt_mu);")
     r.push("    hl_chan_enqueue(c, m);")
+    r.push("    pthread_mutex_unlock(&g_rt_mu);")
     r.push("}")
     r.push("static void hl_chan_send_f64(hl_chan* c, double v) {")
     r.push("    hl_msg* m = (hl_msg*)malloc(sizeof(hl_msg));")
     r.push("    if (!m) hl_die(\"out of memory\");")
     r.push("    m->v.f = v;")
+    r.push("    pthread_mutex_lock(&g_rt_mu);")
     r.push("    hl_chan_enqueue(c, m);")
+    r.push("    pthread_mutex_unlock(&g_rt_mu);")
     r.push("}")
     r.push("")
-    r.push("static void hl_chan_wait(hl_chan* c) {")
+    r.push("// try_send — non-blocking variants: false iff a bounded channel")
+    r.push("// is full (the value is NOT enqueued). For pointer payloads the")
+    r.push("// caller's defensive copy is RELEASED here when the send fails")
+    r.push("// (elem_release owns exactly that payload type).")
+    r.push("static bool hl_chan_try_send_ptr(hl_chan* c, void* v) {")
+    r.push("    pthread_mutex_lock(&g_rt_mu);")
+    r.push("    if (c->cap > 0 && c->count >= c->cap) {")
+    r.push("        if (c->elem_release && v) c->elem_release(v);")
+    r.push("        pthread_mutex_unlock(&g_rt_mu);")
+    r.push("        return false;")
+    r.push("    }")
+    r.push("    hl_msg* m = (hl_msg*)malloc(sizeof(hl_msg));")
+    r.push("    if (!m) hl_die(\"out of memory\");")
+    r.push("    m->v.p = v;")
+    r.push("    m->next = NULL;")
+    r.push("    if (c->tail) { c->tail->next = m; } else { c->head = m; }")
+    r.push("    c->tail = m;")
+    r.push("    c->count++;")
+    r.push("    g_rt_msgs++;")
+    r.push("    pthread_cond_broadcast(&g_rt_cv);")
+    r.push("    pthread_mutex_unlock(&g_rt_mu);")
+    r.push("    return true;")
+    r.push("}")
+    r.push("static bool hl_chan_try_send_i64(hl_chan* c, int64_t v) {")
+    r.push("    pthread_mutex_lock(&g_rt_mu);")
+    r.push("    if (c->cap > 0 && c->count >= c->cap) {")
+    r.push("        pthread_mutex_unlock(&g_rt_mu);")
+    r.push("        return false;")
+    r.push("    }")
+    r.push("    hl_msg* m = (hl_msg*)malloc(sizeof(hl_msg));")
+    r.push("    if (!m) hl_die(\"out of memory\");")
+    r.push("    m->v.i = v;")
+    r.push("    m->next = NULL;")
+    r.push("    if (c->tail) { c->tail->next = m; } else { c->head = m; }")
+    r.push("    c->tail = m;")
+    r.push("    c->count++;")
+    r.push("    g_rt_msgs++;")
+    r.push("    pthread_cond_broadcast(&g_rt_cv);")
+    r.push("    pthread_mutex_unlock(&g_rt_mu);")
+    r.push("    return true;")
+    r.push("}")
+    r.push("static bool hl_chan_try_send_f64(hl_chan* c, double v) {")
+    r.push("    pthread_mutex_lock(&g_rt_mu);")
+    r.push("    if (c->cap > 0 && c->count >= c->cap) {")
+    r.push("        pthread_mutex_unlock(&g_rt_mu);")
+    r.push("        return false;")
+    r.push("    }")
+    r.push("    hl_msg* m = (hl_msg*)malloc(sizeof(hl_msg));")
+    r.push("    if (!m) hl_die(\"out of memory\");")
+    r.push("    m->v.f = v;")
+    r.push("    m->next = NULL;")
+    r.push("    if (c->tail) { c->tail->next = m; } else { c->head = m; }")
+    r.push("    c->tail = m;")
+    r.push("    c->count++;")
+    r.push("    g_rt_msgs++;")
+    r.push("    pthread_cond_broadcast(&g_rt_cv);")
+    r.push("    pthread_mutex_unlock(&g_rt_mu);")
+    r.push("    return true;")
+    r.push("}")
+    r.push("")
+    r.push("static void hl_chan_wait(hl_chan* c) {  // g_rt_mu HELD")
     r.push("    while (!c->head) {")
+    r.push("        c->waiters++;")
     r.push("        g_rt_blocked++;")
     r.push("        hl_rt_deadlock_check();")
     r.push("        pthread_cond_wait(&g_rt_cv, &g_rt_mu);")
     r.push("        g_rt_blocked--;")
+    r.push("        c->waiters--;")
     r.push("    }")
     r.push("}")
     r.push("")
@@ -5966,10 +6141,52 @@ fn runtime_lines() -> list[str] {
     r.push("    return v;")
     r.push("}")
     r.push("")
+    r.push("// recv_or — non-blocking recv: the pending message if one exists,")
+    r.push("// else the caller's default. For pointer payloads the default is")
+    r.push("// an OWNED extra reference (the codegen own-wraps non-fresh")
+    r.push("// expressions); when a message IS available the default must be")
+    r.push("// released here via elem_release (it owns exactly that type).")
+    r.push("static void* hl_chan_recv_or_ptr(hl_chan* c, void* def) {")
+    r.push("    pthread_mutex_lock(&g_rt_mu);")
+    r.push("    if (!c->head) {")
+    r.push("        pthread_mutex_unlock(&g_rt_mu);")
+    r.push("        return def;")
+    r.push("    }")
+    r.push("    hl_msg* m = hl_chan_dequeue(c);")
+    r.push("    void* v = m->v.p;")
+    r.push("    free(m);")
+    r.push("    if (c->elem_release && def) c->elem_release(def);")
+    r.push("    pthread_mutex_unlock(&g_rt_mu);")
+    r.push("    return v;")
+    r.push("}")
+    r.push("static int64_t hl_chan_recv_or_i64(hl_chan* c, int64_t def) {")
+    r.push("    pthread_mutex_lock(&g_rt_mu);")
+    r.push("    if (!c->head) {")
+    r.push("        pthread_mutex_unlock(&g_rt_mu);")
+    r.push("        return def;")
+    r.push("    }")
+    r.push("    hl_msg* m = hl_chan_dequeue(c);")
+    r.push("    int64_t v = m->v.i;")
+    r.push("    free(m);")
+    r.push("    pthread_mutex_unlock(&g_rt_mu);")
+    r.push("    return v;")
+    r.push("}")
+    r.push("static double hl_chan_recv_or_f64(hl_chan* c, double def) {")
+    r.push("    pthread_mutex_lock(&g_rt_mu);")
+    r.push("    if (!c->head) {")
+    r.push("        pthread_mutex_unlock(&g_rt_mu);")
+    r.push("        return def;")
+    r.push("    }")
+    r.push("    hl_msg* m = hl_chan_dequeue(c);")
+    r.push("    double v = m->v.f;")
+    r.push("    free(m);")
+    r.push("    pthread_mutex_unlock(&g_rt_mu);")
+    r.push("    return v;")
+    r.push("}")
+    r.push("")
     r.push("static int64_t hl_chan_len(hl_chan* c) {")
     r.push("    pthread_mutex_lock(&g_rt_mu);")
-    r.push("    int64_t n = 0;")
-    r.push("    for (hl_msg* m = c->head; m; m = m->next) n++;")
+    r.push("    int64_t n = c->count;")
     r.push("    pthread_mutex_unlock(&g_rt_mu);")
     r.push("    return n;")
     r.push("}")
@@ -5977,6 +6194,9 @@ fn runtime_lines() -> list[str] {
     r.push("// select(chs) — block until any channel has a pending message;")
     r.push("// return the index (list order) of the first ready one. The list")
     r.push("// holds raw hl_chan* items (pointer element lists are unboxed).")
+    r.push("// v0.29.0-alpha: while waiting, the waiter count is bumped on ALL")
+    r.push("// listed channels so the deadlock scan sees this thread as a")
+    r.push("// potential consumer of any of them.")
     r.push("static int64_t hl_chan_select(hl_list* chs) {")
     r.push("    pthread_mutex_lock(&g_rt_mu);")
     r.push("    if (chs->len == 0) {")
@@ -5991,10 +6211,14 @@ fn runtime_lines() -> list[str] {
     r.push("                return i;")
     r.push("            }")
     r.push("        }")
+    r.push("        for (int64_t i = 0; i < chs->len; i++)")
+    r.push("            ((hl_chan*)chs->items[i])->waiters++;")
     r.push("        g_rt_blocked++;")
     r.push("        hl_rt_deadlock_check();")
     r.push("        pthread_cond_wait(&g_rt_cv, &g_rt_mu);")
     r.push("        g_rt_blocked--;")
+    r.push("        for (int64_t i = 0; i < chs->len; i++)")
+    r.push("            ((hl_chan*)chs->items[i])->waiters--;")
     r.push("    }")
     r.push("}")
     r.push("")
@@ -7291,7 +7515,8 @@ fn call_result_fresh(ctx: Ctx, e: int) -> bool {
     }
     # Stage 16 (v0.27.0-alpha): spawn returns a fresh Task handle;
     # chan_new returns a fresh channel (refcnt 1, owned by the spawner).
-    if name == "spawn" || name == "chan_new" {
+    # v0.29.0-alpha: chan_new_bounded likewise.
+    if name == "spawn" || name == "chan_new" || name == "chan_new_bounded" {
         return true
     }
     # select returns an int (primitive — class irrelevant).
@@ -7345,7 +7570,9 @@ fn method_result_fresh(ctx: Ctx, e: int) -> bool {
     }
     # Stage 16 (v0.27.0-alpha): recv transfers message ownership to the
     # receiver; join transfers the task result to the joiner.
-    if op == "chan.recv" || op == "task.join" {
+    # v0.29.0-alpha: recv_or is fresh the same way — the message's
+    # retain transfers, or the own-wrapped default does.
+    if op == "chan.recv" || op == "chan.recv_or" || op == "task.join" {
         return true
     }
     if op == "map.keys" {
@@ -7560,8 +7787,17 @@ fn method_arg_borrowed(op: str, i: int) -> bool {
     }
     # Stage 16: ch.send(v) TRANSFERS the message into the channel's
     # queue (the channel owns it). Hoisting a fresh v into a temp with
-    # a cleanup would release it again after the transfer.
-    if op == "chan.send" {
+    # a cleanup would release it again after the transfer. The same
+    # holds for try_send (v0.29.0-alpha): on success the queue owns the
+    # copy; on failure the runtime releases it.
+    if op == "chan.send" || op == "chan.try_send" {
+        return false
+    }
+    # v0.29.0-alpha: ch.recv_or(default) — the runtime consumes the
+    # default either way: it is returned owned to the caller, or it is
+    # released via elem_release when a message was available. Hoisting
+    # it into a temp WITH a cleanup attribute double-releases it.
+    if op == "chan.recv_or" {
         return false
     }
     return true
@@ -7989,6 +8225,22 @@ fn gen_call(ctx: Ctx, e: int) -> str {
         }
         return "hl_chan_new(" + rel + ")"
     }
+    # chan_new_bounded(cap) — v0.29.0-alpha: same release-fn logic as
+    # chan_new, plus the capacity expression (validated at runtime; the
+    # checker already rejected literal capacities < 1).
+    if name == "chan_new_bounded" {
+        let mt2: str = inst_t(ctx, ctx.exprs[e].t)
+        let mut elem2: str = "int"
+        if is_chan_t(mt2) {
+            elem2 = strip_taint(chan_inner_t(mt2))
+        }
+        let mut rel2: str = "NULL"
+        if elem2 != "int" && elem2 != "float" && elem2 != "bool" {
+            rel2 = release_fn_for(ctx, elem2)
+        }
+        let cap: str = gen_expr(ctx, ctx.exprs[e].args.get(0))
+        return "hl_chan_new_bounded(" + cap + ", " + rel2 + ")"
+    }
     if name == "spawn" {
         return gen_spawn_call(ctx, e)
     }
@@ -8040,13 +8292,19 @@ fn gen_spawn_call(ctx: Ctx, e: int) -> str {
         } else if is_chan_t(pt) {
             # Channels cross by sharing (atomic refcount).
             bound = cex
-        } else if is_clone_call || argkind == "str" {
+        } else if is_clone_call || argkind == "str" || expr_fresh(ctx, aidx) {
             # clone(...) is already a private deep copy; a str literal is
-            # a fresh allocation.
+            # a fresh allocation; and any FRESH expression result is
+            # provably private (user fns return hl_retain-ed values — the
+            # callee's return wrapper adds the retain; concats/to_str/
+            # literals allocate). Deep-scan-10 fix: fresh values were
+            # previously defensively cloned and the fresh original never
+            # released — a leak on every spawn(f, a + b).
             bound = cex
         } else {
-            # str / composites returned by calls or built composites:
-            # defensive deep copy at the boundary.
+            # Borrowed composites (list.get(i) results, ...): defensive
+            # deep copy at the boundary — the value may be aliased by
+            # the spawner's container.
             bound = clone_expr_for(ctx, pt, cex)
         }
         cargs.push(bound)
@@ -8312,39 +8570,50 @@ fn gen_method(ctx: Ctx, e: int) -> str {
         return "hl_map_keys(" + t0 + ")"
     }
     # ----- Stage 16 (v0.27.0-alpha): Chan / Task methods -----
-    if op == "chan.send" {
-        # Boundary ownership rule (same as spawn): an owned message that
-        # is not provably private (a str literal, or syntactically
-        # clone(...)) is deep-copied at the boundary — a value returned by
-        # a user fn may alias a binding still live in the sender's
-        # thread, and no refcount may be touched by two threads.
+    if op == "chan.send" || op == "chan.try_send" {
+        # Boundary ownership rule (same as spawn): a value crossing the
+        # task boundary must arrive PRIVATE. Provably-private values
+        # pass raw: a str literal (fresh allocation), clone(...) (a
+        # private deep copy), and any FRESH expression result — user fn
+        # calls return hl_retain-ed values (the callee's return wrapper
+        # adds the retain), `+` concats / to_str() allocate, struct/enum
+        # literals allocate. NON-fresh values (e.g. list.get(i), which
+        # returns a borrow of the element the list still owns) are
+        # deep-copied at the boundary — no refcount may be touched by
+        # two threads. Deep-scan-10 fix: fresh values were previously
+        # cloned too, and the fresh original was never released (a leak
+        # on every ch.send(a + b)).
+        # v0.29.0-alpha: try_send mirrors send exactly; the runtime
+        # releases the private copy when a full bounded channel refuses.
         let mt: str = inst_t(ctx, ctx.exprs[ctx.exprs[e].left].t)
         let celem: str = chan_inner_t(mt)
         let vidx: int = ctx.exprs[e].args.get(0)
         let cex: str = gen_expr(ctx, vidx)
         let argkind: str = ctx.exprs[vidx].kind
         let is_clone_call: bool = argkind == "call" && ctx.exprs[vidx].mkey == "clone"
+        let mut sendf: str = "hl_chan_send"
+        if op == "chan.try_send" {
+            sendf = "hl_chan_try_send"
+        }
         if celem == "int" {
-            return "hl_chan_send_i64(" + t0 + ", " + cex + ")"
+            return sendf + "_i64(" + t0 + ", " + cex + ")"
         }
         if celem == "float" {
-            return "hl_chan_send_f64(" + t0 + ", " + cex + ")"
+            return sendf + "_f64(" + t0 + ", " + cex + ")"
         }
         if celem == "bool" {
-            return "hl_chan_send_i64(" + t0 + ", " + cex + " ? 1 : 0)"
+            return sendf + "_i64(" + t0 + ", " + cex + " ? 1 : 0)"
         }
-        # Channels cross by sharing (atomic refcount); a clone(...) result
-        # or a str literal is already private.
-        if is_chan_t(celem) || is_clone_call || argkind == "str" {
-            return "hl_chan_send_ptr(" + t0 + ", (void*)" + cex + ")"
+        # Channels cross by sharing (atomic refcount); provably private
+        # values (clone(...), literals, fresh expression results) pass raw.
+        if is_chan_t(celem) || is_clone_call || argkind == "str" || expr_fresh(ctx, vidx) {
+            return sendf + "_ptr(" + t0 + ", (void*)" + cex + ")"
         }
-        if celem == "str" {
-            return "hl_chan_send_ptr(" + t0 + ", (void*)hl_clone_str(" + cex + "))"
-        }
-        # Composites / other owned types: defensive deep copy.
+        # Borrowed composites (list.get(i) results, ...): defensive deep
+        # copy — the value may be aliased by the sender's container.
         let ct: str = strip_taint(celem)
         register_clone(ctx, ct)
-        return "hl_chan_send_ptr(" + t0 + ", (void*)" + clone_expr_for(ctx, ct, cex) + ")"
+        return sendf + "_ptr(" + t0 + ", (void*)" + clone_expr_for(ctx, ct, cex) + ")"
     }
     if op == "chan.recv" {
         # Message ownership transfers to the receiver (fresh result).
@@ -8360,6 +8629,30 @@ fn gen_method(ctx: Ctx, e: int) -> str {
             return "(hl_chan_recv_i64(" + t0 + ") != 0)"
         }
         return "((" + c_type(ctx, celem) + ")hl_chan_recv_ptr(" + t0 + "))"
+    }
+    if op == "chan.recv_or" {
+        # Non-blocking recv (v0.29.0-alpha): the pending message if one
+        # exists, else the caller's default. The result is fresh either
+        # way: the message transfers its retain, or the default arrives
+        # OWNED (own_wrap adds a retain for borrowed expressions; a
+        # message being available makes the runtime release that retain
+        # via the channel's elem_release — which owns exactly this type).
+        let mt: str = inst_t(ctx, ctx.exprs[ctx.exprs[e].left].t)
+        let celem: str = chan_inner_t(mt)
+        let didx: int = ctx.exprs[e].args.get(0)
+        let dexpr: str = gen_expr(ctx, didx)
+        let dfresh: bool = expr_fresh(ctx, didx)
+        if celem == "int" {
+            return "hl_chan_recv_or_i64(" + t0 + ", " + dexpr + ")"
+        }
+        if celem == "float" {
+            return "hl_chan_recv_or_f64(" + t0 + ", " + dexpr + ")"
+        }
+        if celem == "bool" {
+            return "(hl_chan_recv_or_i64(" + t0 + ", " + dexpr + " ? 1 : 0) != 0)"
+        }
+        let dw: str = own_wrap(ctx, celem, dexpr, dfresh)
+        return "((" + c_type(ctx, celem) + ")hl_chan_recv_or_ptr(" + t0 + ", (void*)" + dw + "))"
     }
     if op == "chan.len" {
         return "hl_chan_len(" + t0 + ")"

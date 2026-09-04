@@ -108,26 +108,68 @@ class ContinueSig(Exception):
 # ----------------------------------------------------------------------------
 # Stage 16 (v0.27.0-alpha): the concurrency runtime (interpreter side).
 #
-# `spawn` creates a REAL Python thread per task. Channels are unbounded
-# MPMC FIFO queues. All channel/task state is guarded by one global mutex
-# + condition variable (the interpreter's equivalent of the native C
-# runtime's g_rt_mu / g_rt_cv). The deadlock detector mirrors the native
-# semantics exactly: when every thread that could produce work is blocked
-# (on recv / select / join) and no messages are pending anywhere, the
-# program can never make progress -> clean HLPanic (exit 101).
+# `spawn` creates a REAL Python thread per task. Channels are MPMC FIFO
+# queues: unbounded by default, or BOUNDED via chan_new_bounded(cap) —
+# a bounded channel's send blocks while it holds `cap` messages
+# (backpressure; Stage-16 perfection, v0.29.0-alpha). All channel/task
+# state is guarded by one global mutex + condition variable (the
+# interpreter's equivalent of the native C runtime's g_rt_mu / g_rt_cv).
+#
+# Deadlock detection (perfected in v0.29.0-alpha): the detector fires
+# when every thread that could produce work is blocked (in
+# recv/select/join — and now also in a full-channel send). The old
+# additional condition `no messages pending anywhere` was both
+# unnecessary and incomplete: a blocked receiver's channel is provably
+# empty at block time (it re-checks under the same lock before every
+# wait), so pending messages can only sit on channels with NO waiter —
+# and all potential producers are blocked. `blocked == alive` is
+# therefore a sound AND complete deadlock condition in this design:
+#   * it cannot fire spuriously — deadlock_check runs with the lock
+#     held, so no thread can be mid-operation (uncounted) at that
+#     moment, and a thread whose wait condition is already satisfied
+#     never increments `blocked`;
+#   * it now catches deadlock cycles that the old `msgs == 0` guard
+#     missed (e.g. a task blocked sending to a full channel nobody
+#     consumes).
+# The native C runtime mirrors this condition exactly.
 #
 # Panics and exit()s inside a task halt the WHOLE process (safe-halt
-# semantics: tasks share the process fate). The interpreter achieves this
-# with os._exit after flushing, because an uncaught exception would
-# otherwise only kill the thread.
+# semantics: tasks share the process fate). The interpreter achieves
+# this with os._exit after flushing, because an uncaught exception
+# would otherwise only kill the thread.
 # ----------------------------------------------------------------------------
 class HLChan:
-    """A channel value: FIFO message queue (interpreter representation)."""
+    """A channel value: FIFO message queue (interpreter representation).
 
-    __slots__ = ("q",)
+    cap == 0 means unbounded (the default); cap >= 1 is a bounded
+    channel whose send blocks while `cap` messages are pending.
+    waiters = number of threads currently blocked in recv/select on
+    THIS channel (bookkeeping for the deadlock detector — see
+    ConcRuntime.deadlock_check).
+    """
 
-    def __init__(self):
+    __slots__ = ("q", "cap", "waiters", "send_waiters", "_registry")
+
+    def __init__(self, cap=0):
         self.q = []  # list of values (messages); guarded by the runtime lock
+        self.cap = cap  # 0 = unbounded; >= 1 = bounded (blocking send)
+        self.waiters = 0  # recv/select waiters on this channel
+        self.send_waiters = 0  # senders blocked on `full` (bounded only)
+        self._registry = None  # ConcRuntime.chans list (set on register)
+
+    def __del__(self):
+        # Deregister from the runtime's live-channel registry. Removal
+        # during another thread's registry iteration can make that
+        # iterator skip an element — but a channel being collected here
+        # holds no stack references, hence has no waiters, hence cannot
+        # affect the deadlock scan's verdict (only channels with BOTH
+        # pending messages AND waiters matter).
+        reg = getattr(self, "_registry", None)
+        if reg is not None:
+            try:
+                reg.remove(self)
+            except (ValueError, AttributeError):
+                pass
 
 
 class HLTask:
@@ -149,38 +191,114 @@ class ConcRuntime:
         self.mu = threading.Lock()
         self.cv = threading.Condition(self.mu)
         self.tasks_alive = 0   # spawned tasks not yet finished (main excluded)
-        self.blocked = 0       # threads currently blocked in recv/select/join
+        self.blocked = 0       # threads currently blocked in recv/select/join/send
         self.msgs = 0          # total pending messages across all channels
         self.next_id = 0
+        # Live-channel registry (for the deadlock scan). HLChan.__del__
+        # deregisters; see the soundness note there.
+        self.chans = []
+
+    def register(self, chan):
+        with self.cv:
+            self.chans.append(chan)
+            chan._registry = self.chans
 
     def deadlock_check(self):
-        """Call with the lock HELD, before blocking. Every thread that can
-        produce work is blocked AND no messages exist anywhere -> the
-        program can never progress. Mirrors hl_rt_deadlock_check() in C.
-        Raises HLPanic (the `with self.cv:` caller releases the lock on
-        unwind; the process is halting anyway)."""
+        """Call with the lock HELD, before blocking. Soundness contract:
+
+        1. A thread counts itself as `blocked` ONLY while it holds no
+           progress opportunity: every wait loop re-checks its condition
+           under the same lock before blocking, and the check itself runs
+           with the lock held (so no other thread can be mid-operation
+           and uncounted at that instant).
+        2. A woken-but-not-yet-rescheduled receiver is STILL counted in
+           `blocked` (its decrement happens only after wait() re-acquires
+           the lock) — which is exactly why `blocked == alive` alone is
+           NOT sufficient: it can fire while a receiver's message is
+           already pending but the receiver has not been scheduled yet.
+           The waiter counters close this hole in BOTH directions:
+           a channel with pending messages AND recv waiters, or a
+           not-full bounded channel with send waiters, means some
+           thread WILL make progress as soon as the lock is released.
+
+        Deadlock iff: every thread is blocked AND no channel has a
+        progress opportunity (pending message with a recv waiter, or
+        free capacity with a send waiter). This also catches cycles the
+        pre-v0.29 `msgs == 0` guard missed (e.g. a producer blocked on a
+        full channel that nobody consumes). Mirrors
+        hl_rt_deadlock_check() in C. Raises HLPanic (the `with self.cv:`
+        caller releases the lock on unwind; the process is halting
+        anyway)."""
         alive = self.tasks_alive + 1  # +1: the main thread
-        if self.blocked == alive and self.msgs == 0:
-            raise HLPanic(
-                "deadlock: all tasks are blocked on channel operations "
-                "with no pending messages", 0)
+        if self.blocked != alive:
+            return
+        for c in self.chans:
+            if c.q and c.waiters > 0:
+                return  # a consumer can make progress once scheduled
+            if c.send_waiters > 0 and not self._full(c):
+                return  # a woken sender can proceed (capacity freed)
+        raise HLPanic(
+            "deadlock: all tasks are blocked on channel operations "
+            "(no possible progress)", 0)
+
+    def _full(self, chan):
+        return chan.cap > 0 and len(chan.q) >= chan.cap
 
     def send(self, chan, value):
+        """Blocking send: on a bounded channel, waits while full.
+        Unbounded channels never block the sender."""
         with self.cv:
-            chan.q.append(value)
-            self.msgs += 1
-            self.cv.notify_all()
-
-    def recv(self, chan, line):
-        with self.cv:
-            while not chan.q:
+            while self._full(chan):
+                chan.send_waiters += 1
                 self.blocked += 1
                 self.deadlock_check()
                 self.cv.wait()
                 self.blocked -= 1
+                chan.send_waiters -= 1
+            chan.q.append(value)
+            self.msgs += 1
+            self.cv.notify_all()
+
+    def try_send(self, chan, value):
+        """Non-blocking send: False iff a bounded channel is full (the
+        value is NOT enqueued in that case); True otherwise."""
+        with self.cv:
+            if self._full(chan):
+                return False
+            chan.q.append(value)
+            self.msgs += 1
+            self.cv.notify_all()
+            return True
+
+    def recv(self, chan, line):
+        with self.cv:
+            while not chan.q:
+                chan.waiters += 1
+                self.blocked += 1
+                self.deadlock_check()
+                self.cv.wait()
+                self.blocked -= 1
+                chan.waiters -= 1
             value = chan.q.pop(0)
             self.msgs -= 1
+            # A dequeue frees capacity on a bounded channel — wake any
+            # sender blocked on `full` (v0.29.0-alpha: recv previously
+            # never notified; with unbounded-only channels that was fine,
+            # but bounded senders wait for exactly this signal).
+            self.cv.notify_all()
             return value
+
+    def recv_or(self, chan, default):
+        """Non-blocking recv: the pending message if one exists, else
+        `default` (ownership of the unused default stays with the
+        caller in the interpreter — GC makes the release a no-op)."""
+        with self.cv:
+            if chan.q:
+                value = chan.q.pop(0)
+                self.msgs -= 1
+                self.cv.notify_all()  # free capacity -> wake blocked senders
+                return value
+            return default
 
     def select(self, chans, line):
         with self.cv:
@@ -190,10 +308,14 @@ class ConcRuntime:
                 for i, c in enumerate(chans):
                     if c.q:
                         return i
+                for c in chans:
+                    c.waiters += 1
                 self.blocked += 1
                 self.deadlock_check()
                 self.cv.wait()
                 self.blocked -= 1
+                for c in chans:
+                    c.waiters -= 1
 
     def join(self, task, line):
         with self.cv:
@@ -371,7 +493,16 @@ class Interp:
         self.enums = program.get("enums", {})
         self.argv = argv  # list[bytes]
         self.out = out
-        self.line = 0
+        # Deep-scan-10 fix: `line` is now THREAD-LOCAL. It was a plain
+        # attribute mutated by every thread's exec_stmt — with tasks
+        # running on other threads, a panic raised by thread A could be
+        # attributed with the line number thread B was currently
+        # executing (GIL-interleaved), producing wrong panic locations
+        # in concurrent programs. A property over threading.local keeps
+        # the attribute protocol (self.line = X reads/writes) while
+        # giving each thread its own view.
+        self._tls = threading.local()
+        self._tls.line = 0
         # Stage 17 (v0.28.0-alpha): runtime contract checking mode.
         # When True, `requires` is asserted at every fn entry and
         # `ensures` at every return (violations are clean panics).
@@ -390,6 +521,14 @@ class Interp:
         # threads, one global mutex + condvar (mirrors the native C
         # runtime's design so differential behaviour matches).
         self.conc = ConcRuntime()
+
+    @property
+    def line(self):
+        return getattr(self._tls, "line", 0)
+
+    @line.setter
+    def line(self, value):
+        self._tls.line = value
 
     # ---------- lifecycle ----------
     def run(self):
@@ -451,6 +590,25 @@ class Interp:
 
     # ---------- extern (Stage 15) ----------
     _libc = None
+    # Deep-scan-10 fix: per-signature extern wrapper cache. Previously
+    # call_extern mutated the SHARED CDLL symbol's argtypes/restype on
+    # every call — two tasks calling different extern functions (or the
+    # same symbol with different declared signatures) raced the ABI,
+    # corrupting marshalling. A CFUNCTYPE prototype bound to a fresh
+    # _FuncPtr leaves the shared symbol untouched; the cache is guarded
+    # by a lock because tasks call externs from multiple threads.
+    _extern_cache = {}
+    _extern_lock = threading.Lock()
+    # ctypes restype per declared HLS return type (deep-scan-10: the
+    # per-signature wrapper needs this mapping up front).
+    _EXTERN_RESTYPES = {
+        "int": ctypes.c_int64,
+        "float": ctypes.c_double,
+        "bool": ctypes.c_bool,
+        "str": ctypes.c_char_p,
+        "void": None,
+        # any other type (list/map/struct/enum/tainted/...) -> opaque ptr
+    }
 
     def _get_libc(self):
         """Lazily load libc for extern calls."""
@@ -486,6 +644,7 @@ class Interp:
         """
         libc = self._get_libc()
         name = fn["name"]
+        ret = fn["ret"]
         try:
             c_fn = getattr(libc, name)
         except AttributeError:
@@ -526,21 +685,24 @@ class Interp:
                     "allowed in extern FFI; use a string-encoded form "
                     "for complex data)" % (name, pt),
                     getattr(self, "line", 0))
-        c_fn.argtypes = c_argtypes
-        # Set up the return type.
-        ret = fn["ret"]
-        if ret == "int":
-            c_fn.restype = ctypes.c_int64
-        elif ret == "float":
-            c_fn.restype = ctypes.c_double
-        elif ret == "bool":
-            c_fn.restype = ctypes.c_bool
-        elif ret == "str":
-            c_fn.restype = ctypes.c_char_p
-        elif ret == "void":
-            c_fn.restype = None
-        else:
-            c_fn.restype = ctypes.c_void_p
+        # Deep-scan-10 fix: build (or reuse) a per-signature wrapper instead
+        # of mutating the shared CDLL symbol — see the class comment on
+        # _extern_cache. The key is (name, argtypes, restype) so every
+        # declared signature gets its own immutable prototype.
+        cache_key = (name, tuple(c_argtypes), ret)
+        with Interp._extern_lock:
+            c_fn = Interp._extern_cache.get(cache_key)
+            if c_fn is None:
+                proto = ctypes.CFUNCTYPE(
+                    Interp._EXTERN_RESTYPES.get(ret, ctypes.c_void_p),
+                    *c_argtypes)
+                try:
+                    c_fn = proto((name, libc))
+                except AttributeError:
+                    raise HLPanic(
+                        "extern function not found in libc: %s" % name,
+                        getattr(self, "line", 0))
+                Interp._extern_cache[cache_key] = c_fn
         # Call.
         try:
             result = c_fn(*c_args)
@@ -695,7 +857,7 @@ class Interp:
             rm = e["rm"]
             if rm[0] == "user":
                 return self.call_fn(rm[1], [tgt] + args)
-            return self.builtin_method(rm[1], tgt, args)
+            return self.builtin_method(rm[1], tgt, args, e["args"])
         if k == "index":
             lst = self.eval_expr(e["target"], env)
             i = self.eval_expr(e["idx"], env)
@@ -1075,7 +1237,22 @@ class Interp:
         # ----- Stage 16 (v0.27.0-alpha): concurrency builtins -----
         # chan_new() -> Chan[T] — a fresh, empty channel.
         if name == "chan_new":
-            return HLChan()
+            ch = HLChan()
+            self.conc.register(ch)
+            return ch
+        # chan_new_bounded(cap: int) -> Chan[T] — a fresh bounded channel
+        # (Stage-16 perfection, v0.29.0-alpha): send blocks while the
+        # channel holds `cap` messages (backpressure). The checker
+        # rejects literal capacities < 1; dynamic ones are validated here.
+        if name == "chan_new_bounded":
+            cap = args[0]
+            if cap < 1:
+                raise HLPanic(
+                    "chan_new_bounded() capacity must be >= 1, got %d" % cap,
+                    line)
+            ch = HLChan(cap)
+            self.conc.register(ch)
+            return ch
         # select(chs: list[Chan[T]]) -> int — block until any channel is
         # ready; return the index (in list order) of the first ready one.
         if name == "select":
@@ -1119,6 +1296,19 @@ class Interp:
                 interp.out.flush()
                 code = ex.code if isinstance(ex.code, int) else 0
                 os._exit(code & 0xFF)
+            except BaseException as ex:
+                # Deep-scan-10 fix: an unexpected interpreter-level error
+                # inside a task (e.g. RecursionError from runaway HLS
+                # recursion) previously killed only the Python thread —
+                # task_finished was never called, so join() waited
+                # forever and the deadlock detector could never fire
+                # (blocked < alive forever): the process HUNG instead of
+                # safe-halting. Any unexpected task-side failure now
+                # halts the whole process with a clean panic (101), the
+                # same policy main-thread recursion already follows.
+                interp.out.flush()
+                sys.stderr.write("panic: %s (in task)\n" % ex)
+                os._exit(101)
             conc.task_finished(task, result)
 
         with conc.cv:
@@ -1167,7 +1357,7 @@ class Interp:
         # primitives (int, float, bool, None)
         return v
 
-    def builtin_method(self, op, t, args):
+    def builtin_method(self, op, t, args, arg_nodes=None):
         line = self.line
         if op == "str.len":
             return len(t)
@@ -1309,21 +1499,33 @@ class Interp:
         if op == "map.keys":
             return list(t.keys())
         # ----- Stage 16 (v0.27.0-alpha): Chan / Task methods -----
-        if op == "chan.send":
+        if op == "chan.send" or op == "chan.try_send":
             # Boundary ownership rule: an owned message is deep-copied at
-            # the send boundary unless it is syntactically clone(...) —
-            # the checker already rejected bare variable reads. (The AST
-            # node is not available here; the spawn path handles its own
-            # boundary. For send, the checker guarantees the arg is not a
-            # bare ident/field/index, so the remaining aliasing risk is
-            # covered by a defensive deep copy for mutable composites.)
+            # the send boundary unless it is syntactically clone(...)
+            # (already a private deep copy) — the checker already
+            # rejected bare variable reads. This mirrors the native
+            # codegen's gen path for chan.send/chan.try_send exactly
+            # (deep-scan-10: the interpreter previously deep-copied even
+            # clone(...) results — harmless but asymmetric with the
+            # native move semantics, and wasteful).
             v = args[0]
-            if isinstance(v, (list, dict)):
+            is_clone = False
+            if arg_nodes:
+                a0 = arg_nodes[0]
+                if a0.get("k") == "call" and a0.get("name") == "clone":
+                    is_clone = True
+            if not is_clone and isinstance(v, (list, dict)):
                 v = self.deep_clone(v)
-            self.conc.send(t, v)
-            return None
+            if op == "chan.send":
+                self.conc.send(t, v)
+                return None
+            return self.conc.try_send(t, v)
         if op == "chan.recv":
             return self.conc.recv(t, line)
+        if op == "chan.recv_or":
+            # Non-blocking recv: message if pending, else the caller's
+            # default. The default never crosses a task boundary.
+            return self.conc.recv_or(t, args[0])
         if op == "chan.len":
             with self.conc.cv:
                 return len(t.q)

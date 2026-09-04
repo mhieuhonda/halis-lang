@@ -204,8 +204,9 @@ BUILTIN_FNS = {
     "read_line",
     # Stage 9 release (v0.20.0-alpha): Net / Rand / Proc builtins.
     "net_lookup", "rand_int", "rand_float", "rand_seed", "proc_exec",
-    # Stage 16 (v0.27.0-alpha): concurrency builtins.
-    "chan_new", "spawn", "select",
+    # Stage 16 (v0.27.0-alpha): concurrency builtins. Stage-16
+    # perfection (v0.29.0-alpha) adds chan_new_bounded.
+    "chan_new", "chan_new_bounded", "spawn", "select",
 }
 
 # Stage 9 (v0.20.0-alpha — release): per-builtin effect mapping.
@@ -248,15 +249,18 @@ BUILTIN_EFFECTS = {
     # channel operation carries `Conc` — a function that spawns, joins,
     # sends, receives, or selects must declare `uses Conc`. This keeps the
     # "no uses clause => pure and deterministic" guarantee intact.
-    "chan_new":    {"Conc"},
-    "spawn":       {"Conc"},
-    "select":      {"Conc"},
+    "chan_new":         {"Conc"},
+    "chan_new_bounded": {"Conc"},
+    "spawn":            {"Conc"},
+    "select":           {"Conc"},
     # Builtin METHODS with effects (the first method-level effects —
     # previously all I/O lived in builtin functions):
-    "chan.send":   {"Conc"},
-    "chan.recv":   {"Conc"},
-    "chan.len":    {"Conc"},
-    "task.join":   {"Conc"},
+    "chan.send":     {"Conc"},
+    "chan.try_send": {"Conc"},
+    "chan.recv":     {"Conc"},
+    "chan.recv_or":  {"Conc"},
+    "chan.len":      {"Conc"},
+    "task.join":     {"Conc"},
 }
 
 # Types whose values are "owned" heap allocations — subject to move tracking.
@@ -1635,6 +1639,26 @@ class Checker:
                 self.err("chan_new() requires a 'Chan[T]' type in the "
                          "surrounding context", e)
             return expected
+        # chan_new_bounded(cap: int) -> Chan[T] — Stage-16 perfection
+        # (v0.29.0-alpha): a bounded channel whose send blocks while it
+        # holds `cap` messages (backpressure). Contextual typing like
+        # chan_new. A literal capacity < 1 is a COMPILE error (dynamic
+        # capacities are validated at runtime — clean panic 101).
+        if name == "chan_new_bounded":
+            need(1)
+            at = argt(0, "int")
+            if at != "int":
+                self.err("chan_new_bounded() capacity expects int, got %s"
+                         % at, e)
+            cap_arg = args[0]
+            if cap_arg["k"] == "int" and cap_arg["v"] < 1:
+                self.err("chan_new_bounded() capacity must be >= 1, got "
+                         "literal %d" % cap_arg["v"], e)
+            if expected is None or not is_chan(expected):
+                self.err("chan_new_bounded() requires a 'Chan[T]' type in "
+                         "the surrounding context", e)
+            self.edges[self.cur_fn].add("b:chan_new_bounded")
+            return expected
         # spawn(f, a1, ..., aN) -> Task[R] — start a task running function
         # f with the given arguments; returns a join handle. The FIRST
         # argument is a function NAME (identifier), not a value.
@@ -1949,19 +1973,24 @@ class Checker:
             ptypes, ret = tbl[name]
             e["rm"] = ("builtin", "map." + name)
         elif is_chan(tt):
-            # Stage 16 (v0.27.0-alpha): Chan[T] methods.
-            #   send(v: T) -> void — enqueue v (v must be a private value)
-            #   recv() -> T       — blocks while empty; deadlock-detected
-            #   len() -> int      — pending message count
+            # Stage 16 (v0.27.0-alpha): Chan[T] methods. Stage-16
+            # perfection (v0.29.0-alpha) adds the non-blocking pair:
+            #   send(v: T) -> void       — enqueue (blocks while a bounded channel is full)
+            #   try_send(v: T) -> bool   — non-blocking send (False iff full)
+            #   recv() -> T              — blocks while empty; deadlock-detected
+            #   recv_or(default: T) -> T — non-blocking recv (default if empty)
+            #   len() -> int             — pending message count
             elem = chan_inner(tt)
             tbl = {
                 "send": ([elem], "void"),
+                "try_send": ([elem], "bool"),
                 "recv": ([], elem),
+                "recv_or": ([elem], elem),
                 "len": ([], "int"),
             }
             if name not in tbl:
-                self.err("Chan has no method %s (available: send, recv, len)"
-                         % name, e)
+                self.err("Chan has no method %s (available: send, "
+                         "try_send, recv, recv_or, len)" % name, e)
             ptypes, ret = tbl[name]
             e["rm"] = ("builtin", "chan." + name)
         elif is_task(tt):
@@ -1991,9 +2020,10 @@ class Checker:
         # Stage 16: method-level effects + the channel-send data-race rule.
         if e["rm"][0] == "builtin":
             op = e["rm"][1]
-            if op in ("chan.send", "chan.recv", "chan.len", "task.join"):
+            if op in ("chan.send", "chan.try_send", "chan.recv",
+                      "chan.recv_or", "chan.len", "task.join"):
                 self.edges[self.cur_fn].add("b:" + op)
-            if op == "chan.send":
+            if op == "chan.send" or op == "chan.try_send":
                 v = args[0]
                 vt = ptypes[0]
                 if not self.type_is_send(vt):
@@ -2003,11 +2033,11 @@ class Checker:
                     what = ("variable '" + v["name"] + "'") if v["k"] == "ident" \
                         else "a borrowed value"
                     self.err(
-                        "cannot share %s across tasks: ch.send(...) reads it "
+                        "cannot share %s across tasks: %s(...) reads it "
                         "directly — pass clone(x) (private copy) or take(x) "
                         "(ownership transfer). Data-race freedom: no owned "
                         "value may be simultaneously released by two threads."
-                        % what, v)
+                        % (what, op), v)
         return ret
 
     # ---------- match ----------

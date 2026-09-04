@@ -1,9 +1,13 @@
-# Halis language specification (HLS) — v0.28.0-alpha
+# Halis language specification (HLS) — v0.29.0-alpha
 
 > **Halis** is a high-security, native-compiled programming language
 > designed around the philosophy: **safety by default, explicitness for
-> auditability, performance via AOT compilation**. Version v0.27.0-alpha
-> **completes Stage 17**: contracts & formal verification —
+> auditability, performance via AOT compilation**. Version v0.29.0-alpha
+> **perfects Stage 16**: bounded channels with backpressure
+> (`chan_new_bounded` + blocking `send`), the non-blocking
+> `try_send`/`recv_or` pair, and a waiter-aware deadlock detector that
+> catches cycles the old guard could not (see §25). Version
+> v0.28.0-alpha **completes Stage 17**: contracts & formal verification —
 > `requires`/`ensures`, the interval proof engine with `-O fast` check
 > elision, `hlprove` (proof reports + the z3 SMT bridge), and `hlmodel`
 > (exhaustive finite-state model checking) (see §26). Version
@@ -1418,10 +1422,13 @@ shared, internally synchronized object).
 | Construct | Type | Effect | Meaning |
 |-----------|------|--------|---------|
 | `chan_new() -> Chan[T]` | builtin | Conc | a fresh, empty channel (contextual typing like `map_new`) |
+| `chan_new_bounded(cap: int) -> Chan[T]` | builtin | Conc | a fresh **bounded** channel (v0.29.0-alpha): `send` blocks while `cap` messages are pending (backpressure); a literal `cap < 1` is a compile error, a dynamic one a clean panic |
 | `spawn(f, a1..aN) -> Task[R]` | builtin | Conc | start a task running `f(a1..aN)`; `R = f`'s return type (`Task[void]` allowed) |
-| `select(chs: list[Chan[T]]) -> int` | builtin | Conc | block until any channel is ready; return its index (list order) |
-| `ch.send(v: T) -> void` | method | Conc | enqueue `v` (FIFO; send never blocks — unbounded MPMC) |
+| `select(list[Chan[T]]) -> int` | builtin | Conc | block until any channel is ready; return its index (list order) |
+| `ch.send(v: T) -> void` | method | Conc | enqueue `v` (FIFO; on a bounded channel this BLOCKS while the channel holds `cap` messages) |
+| `ch.try_send(v: T) -> bool` | method | Conc | non-blocking enqueue (v0.29.0-alpha): `false` iff a bounded channel is full (the value is NOT enqueued); `true` otherwise |
 | `ch.recv() -> T` | method | Conc | block while empty; transfers the message's ownership to the receiver |
+| `ch.recv_or(default: T) -> T` | method | Conc | non-blocking recv (v0.29.0-alpha): the pending message if one exists, else `default` (the default never crosses a task boundary) |
 | `ch.len() -> int` | method | Conc | pending message count |
 | `t.join() -> R` | method | Conc | wait for the task; return its result; **join exactly once** (a second join is a runtime panic) |
 
@@ -1477,12 +1484,26 @@ The refcount model under concurrency:
 
 - One global mutex + condition variable guard all channel/task state
   (simple, correct; sharding is future work).
-- **Deadlock detection**: when every thread that could produce work is
-  blocked (in `recv`/`select`/`join`) AND no messages are pending
-  anywhere, the program can never make progress — the runtime halts
-  with `panic: deadlock: ...` (exit 101) instead of hanging. A thread
-  between two operations counts as alive, so the detector cannot fire
-  spuriously.
+- **Bounded channels (v0.29.0-alpha)**: `chan_new_bounded(cap)` makes
+  `send` wait while the channel holds `cap` messages — a dequeue
+  broadcasts and wakes the blocked senders, so producers are paced by
+  their consumers (backpressure). Unbounded channels never block a
+  sender. Every value crossing the boundary still obeys the privacy
+  rule of §25.3.
+- **Deadlock detection (perfected in v0.29.0-alpha)**: the detector
+  fires when every thread that could produce work is blocked (in
+  `recv`/`select`/`join` — and now also in a full-channel `send`) AND
+  no channel has a progress opportunity: a pending message with a
+  receiver waiting on it, or free capacity with a sender waiting on
+  it. The waiter counters are what make this sound — a woken-but-not-
+  yet-scheduled thread is still counted as blocked (its counter only
+  drops after the wait re-acquires the lock), so a naive
+  "all blocked = deadlock" test can fire while a consumer's message is
+  already pending. The pre-v0.29 guard (`no messages pending
+  anywhere`) missed real cycles — e.g. a producer blocked sending to a
+  full channel nobody consumes hung forever; the program now halts
+  with `panic: deadlock: ...` (exit 101). A thread between two
+  operations counts as alive, so the detector cannot fire spuriously.
 - **Safe-halt**: a `panic` or `exit()` in ANY task halts the whole
   process (tasks share the process fate).
 - `spawn` restrictions (v0.27.0-alpha): the target must be a
@@ -1491,8 +1512,9 @@ The refcount model under concurrency:
   takes a function name plus explicit arguments — there is no implicit
   capture, which is precisely what makes the sharing rule enforceable.)
 - Interpreter ↔ native parity: the interpreter uses real Python threads
-  with the same global-lock design and the same deadlock detector, so
-  differential testing holds (all `feat_conc_*` tests compare outputs).
+  with the same global-lock design and the same (waiter-aware)
+  deadlock detector, so differential testing holds (all `feat_conc_*`
+  tests compare outputs).
 
 ### 25.5. Determinism guidance
 
@@ -1510,15 +1532,20 @@ enum-typed message protocol dispatched with `match` (see
 owns its state exclusively; the mailbox is the only interface. No
 locks exist in the language.
 
-### 25.7. Deliberate scope decisions (v0.27.0-alpha)
+### 25.7. Deliberate scope decisions (v0.29.0-alpha)
 
 | Deferred | Rationale |
 |----------|-----------|
 | `async`/`await` syntax | without closures, async/await is `spawn`+`join` under another name; the explicit form exists today. Deferred until closures (post-v1.0 discussion). |
-| Work-stealing scheduler | `spawn` = one OS thread per task (pthread); scaling is demonstrated by `benchmarks/conc_bench.hls`. A user-level scheduler over the channel primitives is the natural Stage 18+ refinement. |
-| Bounded channels | channels are unbounded; send never blocks (deadlock detection covers blocked receivers). Capacity limits: future stdlib. |
+| Work-stealing scheduler | `spawn` = one OS thread per task (pthread); scaling is demonstrated by `benchmarks/conc_bench.hls`. A user-level scheduler over the channel primitives is the natural Stage 18+ refinement — the worker-pool shape over a BOUNDED channel (`examples/bounded_chan_demo.hls`) is the idiomatic pattern today. |
 | LLVM backend / HLIR | `--emit llvm` / `--emit ir` reject concurrency programs with a clean error (the C backend and interpreter are the Stage 16 deliverables). |
 | Spawn of generic fns | wrap in a non-generic fn (clear error message). |
+
+Shipped in v0.29.0-alpha (previously deferred): **bounded channels**
+(`chan_new_bounded`, blocking send, backpressure) plus the non-blocking
+pair `try_send` / `recv_or`, and the waiter-aware deadlock detector
+above. The "capacity limits: future stdlib" note from v0.27.0 is
+resolved.
 
 ---
 

@@ -8,6 +8,115 @@ Releases on `main` follow the 20-stage roadmap (see [ROADMAP.md](ROADMAP.md)).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
+## [v0.29.0-alpha] — Stage 16 perfection: bounded channels, non-blocking ops, waiter-aware deadlock detection
+
+> **Stage 16 PERFECTED.** The deferred scope from v0.27.0-alpha is
+> closed: bounded channels with backpressure, the non-blocking
+> `try_send`/`recv_or` pair, and a deadlock detector that catches
+> cycles the old `no pending messages` guard could never see (and is
+> proven unable to fire spuriously). ASan-verified memory-leak fixes at
+> every task boundary, interpreter concurrency hardening, and
+> `examples/bounded_chan_demo.hls` (the worker-pool pattern). All
+> mirrored in BOTH implementations (boot/ + src/hlc.hls) and
+> differential-tested.
+
+### Stage 16 perfection — bounded channels & non-blocking ops
+
+- **`chan_new_bounded(cap: int) -> Chan[T]`** (both implementations):
+  `send` blocks while the channel holds `cap` messages — a dequeue
+  broadcasts and wakes the blocked senders, so producers are paced by
+  their consumers (backpressure). Unbounded channels are unchanged.
+  A literal `cap < 1` is a compile error; a dynamic capacity is a
+  clean panic (101). Contextual typing like `chan_new`.
+- **`ch.try_send(v: T) -> bool`** — non-blocking enqueue: `false` iff
+  a bounded channel is full (the value is NOT enqueued; the runtime
+  releases the boundary-private copy). `true` otherwise — including
+  for unbounded channels (they never block). The Send rule and the
+  freshness (data-race-freedom) rule apply exactly as for `send`.
+- **`ch.recv_or(default: T) -> T`** — non-blocking recv: the pending
+  message if one exists, else `default`. The default never crosses a
+  task boundary; the codegen own-wraps borrowed defaults and the
+  runtime releases the wrap when a message was available (ASan-clean).
+- **Per-channel O(1) `len()`** (native): the queue tracks its count
+  under the runtime mutex.
+
+### Waiter-aware deadlock detection (sound + more complete)
+
+- The old condition — every thread blocked AND **no messages pending
+  anywhere** — was incomplete: a producer blocked SENDING to a full
+  channel that nobody consumes hung the program FOREVER (messages were
+  pending, so the detector refused to fire).
+- The new condition: every thread blocked (now including full-channel
+  senders) AND **no channel has a progress opportunity** — a pending
+  message with a receiver waiting on it, or free capacity with a
+  sender waiting on it. Per-channel recv/send waiter counters close
+  the "woken but not yet rescheduled" window in BOTH directions (a
+  woken-but-unscheduled thread is still counted as blocked — its
+  counter only drops after the wait re-acquires the lock; that is why
+  `blocked == alive` alone would fire spuriously, and why the old
+  guard was needed at all).
+- `tests/ok/feat_conc_bounded_deadlock.hls` differential test: both
+  implementations halt with the same panic message and exit 101.
+- Deadlock message updated: "deadlock: all tasks are blocked on
+  channel operations (no possible progress)".
+
+### Memory-safety fixes at the task boundary (ASan-verified)
+
+- **Leak on every `ch.send(a + b)` / `spawn(f, a + b)`** (pre-existing
+  since v0.27.0): fresh values (call results, `+` concats,
+  `to_str()`, literals, `clone()`, `take()`) crossing a
+  `spawn`/`send`/`try_send` boundary were defensively deep-copied and
+  the fresh original was never released. Provably-private values now
+  cross raw — user fn returns are `hl_retain`-ed by the callee's
+  return wrapper, so they carry their own retain; borrowed values
+  (e.g. `list.get(i)` results, which alias the list's element) are
+  still deep-copied. Verified with AddressSanitizer
+  (`ASAN_OPTIONS=detect_leaks=1`): 0 leaks on the new corpus.
+- **`recv_or` default double-release** (found by ASan during the
+  feature's development): the hoisting pass materialised the default
+  into a temp with a cleanup attribute while the runtime also
+  consumed it — `chan.recv_or` is now classified as consuming its
+  default (like `map.get_or`'s).
+
+### Interpreter concurrency hardening (Stage-0)
+
+- **Task-side exceptions safe-halt the process**: an unexpected
+  Python-level error inside a task (e.g. `RecursionError` from runaway
+  HLS recursion in a task) previously killed only the thread —
+  `task_finished` was never called, `join()` waited forever, and the
+  deadlock detector could never fire (blocked < alive forever): the
+  process HUNG. Any unexpected task-side failure now flushes output
+  and halts the whole process with a clean panic (exit 101), matching
+  the main-thread policy.
+- **`Interp.line` is thread-local**: panic locations from concurrent
+  programs were attributed to whichever thread last wrote the shared
+  field (GIL-interleaved) — a property now (backed by
+  `threading.local`), so each thread reports its own line.
+- **Extern FFI ABI race fixed**: `call_extern` mutated the shared
+  CDLL symbol's `argtypes`/`restype` on every call — two tasks calling
+  externs raced the ABI. A per-signature `CFUNCTYPE` prototype cache
+  (guarded by a lock) replaces the mutation; the shared symbol is
+  never touched.
+- **`chan.send` boundary symmetry**: the interpreter deep-copied even
+  syntactic `clone(...)` results (the native path passes them raw) —
+  the interpreter now mirrors the native move semantics exactly.
+
+### Tests, examples, docs
+
+- `tests/ok/feat_conc_bounded.hls` — bounded producer/consumer with
+  backpressure (differential).
+- `tests/ok/feat_conc_try.hls` — try_send/recv_or semantics incl.
+  borrowed defaults and the unbounded-channel cases.
+- `tests/ok/feat_conc_bounded_deadlock.hls` — the previously
+  undetectable cycle, now a clean panic in both implementations.
+- `tests/fail/fail_chan_bounded_cap.hls` — literal capacity 0 is a
+  compile error.
+- `examples/bounded_chan_demo.hls` — worker pool over a bounded
+  channel with poison-pill shutdown (deterministic sum).
+- SPEC §25.1/§25.4/§25.7 updated (bounded channels shipped; the
+  deferred-scope table shrinks); ROADMAP Stage 16 marked
+  **perfected**; Makefile runs the new example.
+
 ## [v0.28.0-alpha] — Stage 17 release: formal verification & contracts
 
 > **Stage 17 is COMPLETE.** "Extremely high security" moves from claimed

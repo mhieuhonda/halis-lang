@@ -1,0 +1,83 @@
+# ============================================================================
+# bounded_chan_demo.hls — Stage-16 perfection (v0.29.0-alpha)
+# ----------------------------------------------------------------------------
+# A worker pool over a BOUNDED channel: the job queue is capped at 3, so
+# the producer experiences BACKPRESSURE — its send blocks while the
+# queue is full, pacing production to the workers' consumption rate.
+# This is the idiomatic "user-level scheduler over channel primitives"
+# shape from the Stage 16 roadmap, now with real capacity control.
+#
+# Shutdown protocol: one poison pill (job 0) per worker; a worker that
+# receives 0 sends its partial sum to the results channel and exits.
+# Determinism: workers race for jobs (legal MPMC), but partial sums
+# commute, so the total is identical in the interpreter and the native
+# binary (differentially testable).
+# ============================================================================
+
+fn worker(jobs: Chan[int], results: Chan[int]) -> int uses Conc {
+    let mut partial: int = 0
+    let mut running: bool = true
+    while running {
+        let job: int = jobs.recv()
+        if job == 0 {
+            # Poison pill: report the partial sum and stop.
+            running = false
+        } else {
+            partial = partial + job * job
+        }
+    }
+    results.send(partial)
+    return 0
+}
+
+fn main() -> int uses Conc, IO {
+    let nworkers: int = 4
+    let njobs: int = 24
+    let cap: int = 3
+
+    let jobs: Chan[int] = chan_new_bounded(cap)
+    let results: Chan[int] = chan_new()
+
+    # Start the workers first — they drain the bounded queue, which is
+    # exactly what unblocks the producer below (backpressure in action).
+    let mut workers: list[Task[int]] = []
+    let mut i: int = 0
+    while i < nworkers {
+        workers.push(spawn(worker, clone(jobs), clone(results)))
+        i = i + 1
+    }
+
+    # Feed the jobs: at most `cap` are in flight at any moment. Then
+    # send one poison pill per worker.
+    let mut j: int = 0
+    while j < njobs {
+        jobs.send(j + 1)
+        j = j + 1
+    }
+    let mut p: int = 0
+    while p < nworkers {
+        jobs.send(0)
+        p = p + 1
+    }
+
+    # Collect one partial sum per worker, then join every task.
+    let mut total: int = 0
+    let mut k: int = 0
+    while k < nworkers {
+        total = total + results.recv()
+        k = k + 1
+    }
+    let mut w: int = 0
+    while w < nworkers {
+        let rc: int = workers.get(w).join()
+        if rc != 0 {
+            println("worker " + w.to_str() + " failed rc=" + rc.to_str())
+            return 1
+        }
+        w = w + 1
+    }
+
+    println("sum of squares 1.." + njobs.to_str() + " = " + total.to_str())
+    println("workers=" + nworkers.to_str() + " queue cap=" + cap.to_str())
+    return 0
+}

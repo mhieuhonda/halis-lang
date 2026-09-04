@@ -30,7 +30,7 @@ remains green.
 | 13 | Package manager `hls-pkg` | ✅ | (done in v0.23.0-alpha) |
 | 14 | Tooling: LSP, formatter, linter | ✅ | (release v0.24.0-alpha) |
 | 15 | Safe C FFI | ✅ | (release v0.25.0-alpha) |
-| 16 | Concurrency & async (data-race freedom) | ✅ | (release v0.27.0-alpha) |
+| 16 | Concurrency & async (data-race freedom) | ✅ | (release v0.29.0-alpha, perfected) |
 | 17 | Formal verification & contracts | ✅ | (release v0.28.0-alpha) |
 | 18 | Testing ecosystem & fuzzing | ⬜ | 4–6 weeks |
 | 19 | Documentation, book, playground | ⬜ | 6 weeks |
@@ -1109,7 +1109,7 @@ ABI-compatibility header emitted; ownership-across-boundary check
 rejects tainted values passed to extern fns; libcurl demo; minimal
 self-hosted hlbindgen.
 
-## STAGE 16 — Concurrency & async (data-race freedom) ✅ (alpha v0.27.0-alpha)
+## STAGE 16 — Concurrency & async (data-race freedom) ✅ (release v0.29.0-alpha, perfected)
 
 **Goal:** leverage multi-core without data races — through the type system.
 
@@ -1136,16 +1136,55 @@ self-hosted hlbindgen.
   request stream) scales with cores (measured 1.5× on this 2-core CI
   sandbox; the pattern is core-count-bound, not lock-bound).
 
+**Perfected (v0.29.0-alpha) — the previously-deferred scope, closed:**
+- **Bounded channels**: `chan_new_bounded(cap: int) -> Chan[T]` —
+  `send` blocks while `cap` messages are pending (backpressure); a
+  dequeue wakes the blocked senders. A literal `cap < 1` is a compile
+  error; a dynamic one is a clean panic (101). Mirrored in BOTH
+  implementations, differential-tested (`feat_conc_bounded.hls`).
+- **Non-blocking pair**: `ch.try_send(v) -> bool` (false iff a bounded
+  channel is full; the Send + freshness rules apply exactly as for
+  `send`) and `ch.recv_or(default) -> T` (message-or-default, the
+  default never crosses a boundary). `feat_conc_try.hls`.
+- **Waiter-aware deadlock detector**: the old `blocked == alive AND no
+  pending messages` condition missed real cycles (a producer blocked
+  sending to a full channel nobody consumes used to hang FOREVER —
+  `feat_conc_bounded_deadlock.hls` now halts with a clean panic, 101).
+  The new condition — all threads blocked AND no channel has a pending
+  message with a waiting receiver or free capacity with a waiting
+  sender — is proven sound in both the interpreter and the C runtime
+  (per-channel waiter counters close the "woken but not yet scheduled"
+  window in both directions).
+- **Memory-leak fixes at the task boundary (ASan-verified)**: fresh
+  values (call results, concats, `to_str()`) crossing a
+  `spawn`/`send`/`try_send` boundary were defensively deep-copied and
+  the fresh original was never released — a leak on every
+  `ch.send(a + b)` / `spawn(f, a + b)`. Provably-private values now
+  cross raw (user fns return `hl_retain`-ed values); borrowed values
+  (e.g. `list.get(i)` results) are still deep-copied.
+- **Interpreter concurrency hardening**: an unexpected Python-level
+  error inside a task (e.g. `RecursionError` from runaway HLS
+  recursion) previously killed only the thread — `join()` then waited
+  forever and the deadlock detector could never fire (the process
+  hung); any task-side failure now safe-halts the whole process (101).
+  `Interp.line` is now thread-local (panic locations from concurrent
+  programs were attributed to whichever thread ran last). Extern FFI
+  calls no longer race the shared CDLL symbol's argtypes/restype (a
+  per-signature prototype cache replaced the mutation).
+- `examples/bounded_chan_demo.hls` — the worker-pool-over-bounded-
+  channel pattern (poison-pill shutdown), the idiomatic user-level
+  "scheduler over channel primitives" shape.
+
 **Documented deviations (per the conflict-resolution principles):**
 - `async`/`await` syntax + a user-level work-stealing scheduler are
-  deferred: without closures, async/await is spawn/join under another
-  name — the explicit form ships today (see SPEC §25.7). `spawn` is
-  OS-thread-per-task, which genuinely parallelises on multi-core.
+  still deferred: without closures, async/await is spawn/join under
+  another name — the explicit form ships today (see SPEC §25.7). The
+  bounded-channel worker pool is the sanctioned pattern.
 - Deepened hardening beyond the original plan: every owned value that
   is not provably private is deep-copied at the spawn/send boundary, so
   the Stage 8 non-atomic refcounts stay sound under concurrency
   (channels alone use atomic refcounts). Deadlock detection is built
-  in (all-blocked + zero pending messages → clean panic, exit 101).
+  in (all-blocked + no progress opportunity → clean panic, exit 101).
 
 **Work:**
 - `Send`/`Sync` equivalent traits (types that can move between cores / share
