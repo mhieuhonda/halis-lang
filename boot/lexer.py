@@ -89,7 +89,18 @@ def tokenize(src):
         if c == 35:  # '#'
             # BUG-016 fix: track column past the comment, so error messages
             # on a later token on the same line report the right column.
-            while i < n and src[i] != 10:
+            # Deep-scan-11 fix: stop at `\r` too. The whitespace handler
+            # above treats a lone `\r` as a line terminator (CR-only files,
+            # legacy Mac style), but this comment loop only stopped at
+            # `\n` (byte 10). In a CR-only file, a `#` comment ate the
+            # rest of the file (every subsequent token silently dropped)
+            # — `# EOF comment\r print("hi")\r` produced ZERO tokens. The
+            # next iteration's whitespace handler then advanced the line
+            # counter for the `\r`, but the comment had already swallowed
+            # everything. Now we stop at either `\n` or `\r`; the
+            # whitespace handler on the next iteration processes the
+            # terminator itself (CRLF detection, lone CR, etc.).
+            while i < n and src[i] != 10 and src[i] != 13:
                 i += 1
                 col += 1
             continue

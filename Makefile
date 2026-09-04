@@ -178,7 +178,8 @@ examples:
                   examples/conc_demo.hls examples/actor_demo.hls \
                   examples/bounded_chan_demo.hls \
                   examples/par_scan.hls examples/hmac_proven.hls \
-                  examples/conn_machine.hls; do \
+                  examples/conn_machine.hls examples/bits_demo.hls \
+                  examples/set_demo.hls; do \
                 echo "--- $$f"; $(PYTHON) boot/boot.py $$f || exit 1; \
         done
         @echo "--- examples/secure_demo.hls (deliberately panics on overflow)"
@@ -192,7 +193,7 @@ examples:
         @echo "--- examples/taint_beta_demo.hls"; $(PYTHON) boot/boot.py examples/taint_beta_demo.hls examples/data.txt
 
 clean:
-        rm -rf $(BIN) bin/hls_out bin/hls_out.c
+        rm -rf $(BIN)
 
 # Install the native compiler and stdlib to PREFIX (default /usr/local)
 install: bootstrap

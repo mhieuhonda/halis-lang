@@ -1,0 +1,409 @@
+# ============================================================================
+# std.bits.hls — Bitwise helpers for Halis (Stage 14+ non-roadmap upgrade)
+# ----------------------------------------------------------------------------
+# HLS has no bitwise operators (&, |, ^, ~, <<, >>). The language core
+# treats int as a mathematical int64 with checked arithmetic only. Many
+# real programs (crypto, hashing, codec work, bit-packing) still need
+# bit-level manipulation; rather than extend the language grammar, this
+# module exposes the common bit operations as pure functions built on
+# top of multiplication, division, and modulo.
+#
+# All operations treat int as a 64-bit two's-complement value. Negative
+# inputs use C-style wrap-around semantics: the bit pattern of -1 is
+# 0xFFFFFFFFFFFFFFFF, etc. The helpers panic on negative shift counts
+# (the SPEC's "every operation is checked" rule).
+#
+# Implementation notes:
+#   - `bits_get` is the foundation; it correctly handles negative x
+#     via the two's-complement identity `bit k of x = 1 - bit k of (-x-1)`
+#     for x < 0 (other than INT64_MIN, which is special-cased).
+#   - The shift helpers are bit-by-bit O(64); this avoids the int64
+#     overflow that direct `x * 2^n` or `x / 2^n` would hit for
+#     large or negative inputs. The compiler's optimiser (Stage 11
+#     LICM + Stage 17 interval proof) can hoist and elide bounds
+#     checks when the inputs are statically known.
+#
+# All functions are pure (no `uses IO`).
+#
+# Helpers provided:
+#   bits_pow2(k)           2^k for k in [0, 63]
+#   bits_shl(x, n)         logical left shift  (x << n)
+#   bits_shr(x, n)         logical right shift (unsigned: fills with 0)
+#   bits_sar(x, n)         arithmetic right shift (sign-extending)
+#   bits_and(a, b)         bitwise AND
+#   bits_or(a, b)          bitwise OR
+#   bits_xor(a, b)         bitwise XOR
+#   bits_not(x)            bitwise NOT (one's complement)
+#   bits_get(x, n)         extract bit n (0 = LSB) as 0 or 1
+#   bits_set(x, n, v)      return x with bit n forced to v (0 or 1)
+#   bits_popcount(x)       number of 1 bits (treats x as unsigned 64-bit)
+#   bits_clz(x)            count leading zeros  (unsigned)
+#   bits_ctz(x)            count trailing zeros (unsigned)
+#   bits_byte(x, n)        extract byte n (0 = LSB) as 0..255
+#   bits_bytes_be(x)       list of 8 bytes, big-endian (index 0 = MSB)
+#   bits_bytes_le(x)       list of 8 bytes, little-endian (index 0 = LSB)
+#   bits_from_bytes_be(bs) assemble 8 bytes (big-endian) back into an int64
+#   bits_from_bytes_le(bs) assemble 8 bytes (little-endian) back into an int64
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# Power-of-two (used everywhere; not memoised because HLS has no globals).
+# ----------------------------------------------------------------------------
+fn bits_pow2(k: int) -> int {
+    # 2^k for k in [0, 63]. k == 63 returns INT64_MIN (the bit pattern
+    # 0x8000000000000000 — equal to 2^63 in two's complement). We
+    # special-case k == 63 because the loop `r = r * 2` would
+    # overflow int64 at the last iteration (2^62 * 2 = 2^63 is one
+    # above INT64_MAX); the native checked-multiply panics.
+    if k < 0 {
+        panic("bits_pow2: negative exponent")
+    }
+    if k >= 64 {
+        panic("bits_pow2: exponent out of range (max 63)")
+    }
+    if k == 63 {
+        return -9223372036854775808
+    }
+    let mut r: int = 1
+    let mut i: int = 0
+    while i < k {
+        r = r * 2
+        i = i + 1
+    }
+    return r
+}
+
+# ----------------------------------------------------------------------------
+# Single-bit get / set — the foundation.
+# ----------------------------------------------------------------------------
+fn bits_get(x: int, n: int) -> int {
+    if n < 0 {
+        panic("bits_get: negative bit index")
+    }
+    if n >= 64 {
+        panic("bits_get: bit index out of range (max 63)")
+    }
+    # INT64_MIN: only bit 63 is set.
+    if x == -9223372036854775808 {
+        if n == 63 {
+            return 1
+        }
+        return 0
+    }
+    if x >= 0 {
+        return (x / bits_pow2(n)) % 2
+    }
+    # For negative x (other than INT64_MIN), bit n of x =
+    # 1 - bit n of (-x - 1). Verified:
+    #   x = -1: p = 0, bit n of -1 = 1 - bit n of 0 = 1 (all bits set). OK.
+    #   x = -2: p = 1, bit 0 of -2 = 1 - 1 = 0, bits 1..63 = 1 - 0 = 1. OK.
+    #   x = -1024: p = 1023 = 0x3FF (bits 0..9 set, rest clear).
+    #     bit 0..9 of -1024 = 0, bits 10..63 of -1024 = 1. OK.
+    # Recursion is bounded: -x - 1 is non-negative for x < 0 and x != INT64_MIN.
+    return 1 - bits_get(0 - x - 1, n)
+}
+
+fn bits_set(x: int, n: int, v: int) -> int {
+    if n < 0 {
+        panic("bits_set: negative bit index")
+    }
+    if n >= 64 {
+        panic("bits_set: bit index out of range (max 63)")
+    }
+    if v != 0 && v != 1 {
+        panic("bits_set: value must be 0 or 1")
+    }
+    let cur: int = bits_get(x, n)
+    if cur == v {
+        return x
+    }
+    # Bit needs to flip. Arithmetic works for ANY x (positive or
+    # negative) because the bit pattern of x with bit n toggled is
+    # exactly x +/- 2^n in two's complement.
+    #   -1 with bit 5 cleared: -1 - 32 = -33 = 0xFFFFFFFFFFFFFFDF. OK.
+    #   INT64_MIN with bit 0 set: -2^63 + 1. OK.
+    if v == 1 {
+        return x + bits_pow2(n)
+    }
+    return x - bits_pow2(n)
+}
+
+# ----------------------------------------------------------------------------
+# Shifts (bit-by-bit; avoids int64 overflow for large / negative inputs).
+# ----------------------------------------------------------------------------
+fn bits_shl(x: int, n: int) -> int {
+    if n < 0 {
+        panic("bits_shl: negative shift count")
+    }
+    if n == 0 {
+        return x
+    }
+    if n >= 64 {
+        return 0
+    }
+    # Result bit k = x's bit (k - n) for k in [n, 63]; else 0.
+    # Build from MSB down to avoid the int64 overflow that
+    # `r + bits_pow2(k)` would hit when r approaches 2^64.
+    let mut r: int = 0
+    if bits_get(x, 63 - n) == 1 {
+        # Pre-set bit 63 by starting from INT64_MIN (avoids the
+        # `0 + bits_pow2(63)` overflow, since bits_pow2(63) == INT64_MIN
+        # and 0 + INT64_MIN == INT64_MIN, no overflow — but in general
+        # building bit-by-bit from the bottom would overflow when
+        # accumulating past 2^63 - 1).
+        r = -9223372036854775808
+    }
+    let mut k: int = 62
+    while k >= n {
+        if bits_get(x, k - n) == 1 {
+            r = r + bits_pow2(k)
+        }
+        k = k - 1
+    }
+    return r
+}
+
+fn bits_shr(x: int, n: int) -> int {
+    # Logical right shift: fills with 0. Result bit k = x's bit (k + n)
+    # for k in [0, 63 - n]; else 0.
+    if n < 0 {
+        panic("bits_shr: negative shift count")
+    }
+    if n == 0 {
+        return x
+    }
+    if n >= 64 {
+        return 0
+    }
+    let mut r: int = 0
+    let mut k: int = 0
+    while k + n < 64 {
+        if bits_get(x, k + n) == 1 {
+            r = r + bits_pow2(k)
+        }
+        k = k + 1
+    }
+    return r
+}
+
+fn bits_sar(x: int, n: int) -> int {
+    # Arithmetic right shift: sign-extends. Result bit k = x's bit (k + n)
+    # for k in [0, 63 - n]; the top n bits of the result are filled with
+    # the sign bit (1 if x < 0, else 0).
+    if n < 0 {
+        panic("bits_sar: negative shift count")
+    }
+    if n == 0 {
+        return x
+    }
+    if n >= 64 {
+        if x < 0 {
+            return -1
+        }
+        return 0
+    }
+    let sign: int = bits_get(x, 63)
+    # Start with the top bit (63) set to `sign` (always — right shift
+    # by n >= 1 makes bit 63 = sign). For n > 1 we additionally sign-
+    # extend bits (64-n) .. 62.
+    let mut r: int = 0
+    if sign == 1 {
+        r = -9223372036854775808  # bit 63 only
+    }
+    let mut j: int = 64 - n
+    while j < 63 {
+        if sign == 1 {
+            r = r + bits_pow2(j)
+        }
+        j = j + 1
+    }
+    # Copy the low (64 - n) bits from x: result bit k = x's bit (k + n).
+    let mut k: int = 0
+    while k + n < 64 {
+        if bits_get(x, k + n) == 1 {
+            r = r + bits_pow2(k)
+        }
+        k = k + 1
+    }
+    return r
+}
+
+# ----------------------------------------------------------------------------
+# Bitwise AND / OR / XOR / NOT.
+# ----------------------------------------------------------------------------
+fn bits_and(a: int, b: int) -> int {
+    let mut r: int = 0
+    let mut k: int = 0
+    while k < 64 {
+        if bits_get(a, k) == 1 && bits_get(b, k) == 1 {
+            if k == 63 {
+                r = -9223372036854775808
+            } else {
+                r = r + bits_pow2(k)
+            }
+        }
+        k = k + 1
+    }
+    return r
+}
+
+fn bits_or(a: int, b: int) -> int {
+    let mut r: int = 0
+    let mut k: int = 0
+    while k < 64 {
+        if bits_get(a, k) == 1 || bits_get(b, k) == 1 {
+            if k == 63 {
+                r = -9223372036854775808
+            } else {
+                r = r + bits_pow2(k)
+            }
+        }
+        k = k + 1
+    }
+    return r
+}
+
+fn bits_xor(a: int, b: int) -> int {
+    let mut r: int = 0
+    let mut k: int = 0
+    while k < 64 {
+        if bits_get(a, k) != bits_get(b, k) {
+            if k == 63 {
+                r = -9223372036854775808
+            } else {
+                r = r + bits_pow2(k)
+            }
+        }
+        k = k + 1
+    }
+    return r
+}
+
+fn bits_not(x: int) -> int {
+    # ~x = -x - 1 (two's complement identity).
+    # ~0 = -1; ~(-1) = 0; ~5 = -6.
+    return 0 - x - 1
+}
+
+# ----------------------------------------------------------------------------
+# Population count, leading/trailing zeros.
+# ----------------------------------------------------------------------------
+fn bits_popcount(x: int) -> int {
+    let mut n: int = 0
+    let mut k: int = 0
+    while k < 64 {
+        n = n + bits_get(x, k)
+        k = k + 1
+    }
+    return n
+}
+
+fn bits_clz(x: int) -> int {
+    # Count leading zeros (treats x as unsigned 64-bit).
+    if x == 0 {
+        return 64
+    }
+    let mut n: int = 0
+    let mut k: int = 63
+    while k >= 0 {
+        if bits_get(x, k) == 1 {
+            return n
+        }
+        n = n + 1
+        k = k - 1
+    }
+    return n
+}
+
+fn bits_ctz(x: int) -> int {
+    # Count trailing zeros (treats x as unsigned 64-bit).
+    if x == 0 {
+        return 64
+    }
+    let mut n: int = 0
+    let mut k: int = 0
+    while k < 64 {
+        if bits_get(x, k) == 1 {
+            return n
+        }
+        n = n + 1
+        k = k + 1
+    }
+    return n
+}
+
+# ----------------------------------------------------------------------------
+# Byte helpers (a byte is 8 bits; n in [0, 7]).
+# ----------------------------------------------------------------------------
+fn bits_byte(x: int, n: int) -> int {
+    if n < 0 {
+        panic("bits_byte: negative byte index")
+    }
+    if n >= 8 {
+        panic("bits_byte: byte index out of range (max 7)")
+    }
+    # Byte n is bits [8n, 8n+7].
+    let mut r: int = 0
+    let mut k: int = 0
+    while k < 8 {
+        r = r + bits_get(x, 8 * n + k) * bits_pow2(k)
+        k = k + 1
+    }
+    return r
+}
+
+fn bits_bytes_be(x: int) -> list[int] {
+    # Big-endian: index 0 is the MSB (byte 7).
+    let out: list[int] = []
+    let mut k: int = 7
+    while k >= 0 {
+        out.push(bits_byte(x, k))
+        k = k - 1
+    }
+    return out
+}
+
+fn bits_bytes_le(x: int) -> list[int] {
+    # Little-endian: index 0 is the LSB (byte 0).
+    let out: list[int] = []
+    let mut k: int = 0
+    while k < 8 {
+        out.push(bits_byte(x, k))
+        k = k + 1
+    }
+    return out
+}
+
+fn bits_from_bytes_be(bs: list[int]) -> int {
+    if bs.len() != 8 {
+        panic("bits_from_bytes_be: list must have exactly 8 bytes")
+    }
+    let mut r: int = 0
+    let mut i: int = 0
+    while i < 8 {
+        let b: int = bs.get(i)
+        if b < 0 || b > 255 {
+            panic("bits_from_bytes_be: byte out of range (must be 0..255)")
+        }
+        r = r * 256 + b
+        i = i + 1
+    }
+    return r
+}
+
+fn bits_from_bytes_le(bs: list[int]) -> int {
+    if bs.len() != 8 {
+        panic("bits_from_bytes_le: list must have exactly 8 bytes")
+    }
+    let mut r: int = 0
+    let mut i: int = 7
+    while i >= 0 {
+        let b: int = bs.get(i)
+        if b < 0 || b > 255 {
+            panic("bits_from_bytes_le: byte out of range (must be 0..255)")
+        }
+        r = r * 256 + b
+        i = i - 1
+    }
+    return r
+}

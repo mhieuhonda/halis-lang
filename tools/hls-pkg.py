@@ -900,7 +900,7 @@ fn main() -> int uses IO {
     print("")
     print("Next steps:")
     print("  cd %s" % name)
-    print("  hls-pkg add std.str https://github.com/mhieuhonda/hieu-louis-lang.git std/str.hls")
+    print("  hls-pkg add std.str https://github.com/mhieuhonda/halis-lang.git std/str.hls")
     print("  hls-pkg lock")
     print("  hls-pkg audit")
     print("  hls-pkg build")

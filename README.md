@@ -115,8 +115,9 @@ make bootstrap
 # 3. Compile your program to a native binary
 make run F=examples/primes.hls
 
-# 4. Run the full test suite (185 tests: types, effects, ownership, taint,
-#    differential, bootstrap determinism, LLVM IR, memory-stress RSS check)
+# 4. Run the full test suite (interpreter + native + differential +
+#    bootstrap determinism + LLVM IR + memory-stress RSS check + fmt +
+#    lint + proof/contracts). See CHANGELOG.md for the current count.
 make test
 
 # 5. Try the fine-grained effects (v0.7.0-alpha)
@@ -142,7 +143,7 @@ python3 boot/boot.py --emit llvm --target aarch64-linux examples/llvm_demo.hls
 # 11. Stage 13-alpha: package manager (v0.11.0-alpha)
 python3 tools/hls-pkg.py init mypkg
 cd mypkg
-python3 ../tools/hls-pkg.py add std.str https://github.com/mhieuhonda/hieu-louis-lang.git std/str.hls
+python3 ../tools/hls-pkg.py add std.str https://github.com/mhieuhonda/halis-lang.git std/str.hls
 python3 ../tools/hls-pkg.py lock    # resolves deps + enforces effect surface
 python3 ../tools/hls-pkg.py audit  # total effect report of dep tree
 python3 ../tools/hls-pkg.py verify # check SHA-256 hashes still match
@@ -224,6 +225,8 @@ and error handling:
 | `std.html` | `html_escape(s)`, `html_escape_attr(s)`, `html_unescape(s)`, `html_tag(name, attrs, content)`, `html_text(s)` |
 | `std.option` (Stage 7) | `enum Option[T] { Some(T), None }`, `option_unwrap`, `option_unwrap_or`, `option_is_some`, `option_is_none` |
 | `std.result` (Stage 7) | `enum Result[T, E] { Ok(T), Err(E) }`, `result_unwrap`, `result_unwrap_or`, `result_err_or`, `result_is_ok`, `result_is_err`, `int_parse(s) -> Result[int, str]`, `float_parse(s) -> Result[float, str]` |
+| `std.bits` (non-roadmap) | `bits_shl/shr/sar`, `bits_and/or/xor/not`, `bits_get/set`, `bits_popcount/clz/ctz`, `bits_byte`, `bits_bytes_be/le`, `bits_from_bytes_be/le` (HLS has no bitwise operators — these helpers are pure functions built on arithmetic) |
+| `std.set` (non-roadmap) | `set_str_new`, `set_str_from_list`, `set_str_add`, `set_str_contains`, `set_str_size`, `set_str_to_list`, `set_str_union`, `set_str_intersect`, `set_str_diff`, `set_str_equal` (string sets backed by `map[str, bool]`) |
 
 Each module is written in HLS itself and can be used inside `hlc` (the
 compiler) or any user program. Import with `import "std.option"` (or whichever
@@ -232,8 +235,8 @@ module you need).
 ## Repository layout
 
 ```
-hieu-louis-lang/
-├── SPEC.md              # Language constitution (full v0.7 spec)
+halis-lang/
+├── SPEC.md              # Language constitution (full v0.30 spec)
 ├── ROADMAP.md           # 20-stage roadmap to v1.0
 ├── SECURITY.md          # Threat model & security policy
 ├── boot/                # Stage-0: bootstrap seed (pure Python, ~3,200 lines)
@@ -276,7 +279,7 @@ Full details: [SPEC.md](SPEC.md) · Stage-by-stage roadmap:
 
 ## Status
 
-**v0.28.0-alpha — Stages 1–17 complete (Stage 17: formal verification & contracts)**:
+**v0.30.0-alpha — Stages 1–17 complete (Stage 17 perfected: proof-engine soundness overhaul + native ensures + loop-invariant engine)**:
 
 - ✅ Complete core specification
 - ✅ Stage-0 reference (interpreted, with type + effects checking)
@@ -299,7 +302,7 @@ Full details: [SPEC.md](SPEC.md) · Stage-by-stage roadmap:
   with **RSS delta = 0**, enforced under a 256 MB `ulimit -v` in the
   test suite. **173/173 tests PASS** (Stage 8 final test count; the
   current count after all Stage 9 release work is **185/185**).
-- 🔄 **Stage 9-alpha — Fine-grained effects & capabilities** (v0.5.0-alpha):
+- ✅ **Stage 9-alpha — Fine-grained effects & capabilities** (v0.5.0-alpha):
   Single `IO` effect split into five — `IO`, `Fs`, `Clock`, `Args`, `Exit`.
   `uses` clause now accepts a comma-separated list; `uses IO` is a
   backwards-compatible blanket alias. Capability subset semantics
@@ -408,10 +411,10 @@ Full details: [SPEC.md](SPEC.md) · Stage-by-stage roadmap:
 ## Contributing
 
 Every contribution must preserve the core guarantees and pass
-`make test` (199 tests, including differential testing of the two
-implementations + 13 LLVM IR tests). Every new feature must first be
-used inside `hlc` itself — the compiler is always the first customer
-of the language.
+`make test` (the full suite: interpreter + native + differential +
+bootstrap determinism + LLVM IR + memory-stress + fmt + lint +
+proof/contracts). Every new feature must first be used inside `hlc`
+itself — the compiler is always the first customer of the language.
 
 **Branch protection:** the `main` branch is protected — all non-admin
 contributors must open a pull request. CI must pass on every PR (full
