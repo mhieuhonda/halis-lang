@@ -15,7 +15,14 @@ PRIM_TYPES = ("int", "float", "bool", "str", "void")
 # is a trivial subset test. `Net`, `Rand`, `Proc` are independent effects
 # (not part of the IO family) — a program must declare them explicitly to
 # use network, random, or subprocess builtins.
-KNOWN_EFFECTS = {"IO", "Fs", "Clock", "Args", "Exit", "Net", "Rand", "Proc"}
+#
+# Stage 16 (v0.27.0-alpha): `Conc` — the concurrency effect. Carried by
+# chan_new / spawn / select builtins and the Chan.send / Chan.recv /
+# Chan.len / Task.join methods. NOT part of the IO family: a program must
+# declare `uses Conc` explicitly to use task/channel operations. This keeps
+# every function without a `uses` clause pure AND deterministic (spawn
+# introduces observable scheduling nondeterminism).
+KNOWN_EFFECTS = {"IO", "Fs", "Clock", "Args", "Exit", "Net", "Rand", "Proc", "Conc"}
 RESERVED_EFFECTS = set()  # no reserved effects as of v0.20.0-alpha
 IO_FAMILY = {"IO", "Fs", "Clock", "Args", "Exit"}
 
@@ -93,6 +100,8 @@ class Parser:
         "int", "float", "bool", "str", "void",
         "list", "map", "tainted",
         "true", "false",  # boolean literals are reserved too
+        # Stage 16 (v0.27.0-alpha): built-in concurrency wrappers.
+        "Chan", "Task",
     }
 
     def parse_program(self):
@@ -351,7 +360,7 @@ class Parser:
                              "(no builtins implemented yet)" % eff, tok)
                 if eff not in KNOWN_EFFECTS:
                     self.err("unknown effect '%s'; known effects: IO, Fs, "
-                             "Clock, Args, Exit, Net, Rand, Proc" % eff, tok)
+                             "Clock, Args, Exit, Net, Rand, Proc, Conc" % eff, tok)
                 if eff in explicit_effects:
                     self.err("duplicate effect declaration: %s" % eff, tok)
                 explicit_effects.add(eff)
@@ -408,6 +417,25 @@ class Parser:
             inner = self.parse_type()
             self.eat_sym("]")
             return "tainted[%s]" % inner
+        # Stage 16 (v0.27.0-alpha): `Chan[T]` — a built-in generic
+        # message-passing channel (MPMC, unbounded, blocking recv).
+        # No struct/enum definition needed; the checker recognises it.
+        if base == "Chan":
+            self.eat_sym("[")
+            inner = self.parse_type()
+            self.eat_sym("]")
+            if inner == "void":
+                self.err("Chan[T] element type cannot be void", t)
+            return "Chan[%s]" % inner
+        # Stage 16 (v0.27.0-alpha): `Task[R]` — a spawned task's join
+        # handle. R is the spawned function's return type (void allowed:
+        # join() returns nothing). Not Send: a Task handle cannot itself
+        # cross a task boundary.
+        if base == "Task":
+            self.eat_sym("[")
+            inner = self.parse_type(allow_void=True)
+            self.eat_sym("]")
+            return "Task[%s]" % inner
         if base in PRIM_TYPES:
             if base == "void" and not allow_void:
                 self.err("void can only be used as a return type", t)

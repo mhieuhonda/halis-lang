@@ -60,6 +60,27 @@ def map_val(t):
     return t[9:-1]
 
 
+# Stage 16 (v0.27.0-alpha): built-in concurrency wrappers.
+# `Chan[T]` — a message-passing channel (MPMC, unbounded queue, blocking
+# recv). `Task[R]` — a spawned task's join handle (R = spawned fn's return
+# type). Both are recognised by the checker as built-in generics; no
+# struct/enum definition is needed (same pattern as tainted[T]).
+def is_chan(t):
+    return t.startswith("Chan[")
+
+
+def chan_inner(t):
+    return t[5:-1]
+
+
+def is_task(t):
+    return t.startswith("Task[")
+
+
+def task_inner(t):
+    return t[5:-1]
+
+
 # NOTE: is_taint / taint_inner / is_tainted_type / list_taint_inner are
 # defined ONCE near the top of this file (BUG-SC-12 consolidation). Do NOT
 # add duplicate definitions below — they would silently shadow the aliases.
@@ -182,6 +203,8 @@ BUILTIN_FNS = {
     "read_line",
     # Stage 9 release (v0.20.0-alpha): Net / Rand / Proc builtins.
     "net_lookup", "rand_int", "rand_float", "rand_seed", "proc_exec",
+    # Stage 16 (v0.27.0-alpha): concurrency builtins.
+    "chan_new", "spawn", "select",
 }
 
 # Stage 9 (v0.20.0-alpha — release): per-builtin effect mapping.
@@ -220,6 +243,19 @@ BUILTIN_EFFECTS = {
     "rand_float":  {"Rand"},
     "rand_seed":   {"Rand"},
     "proc_exec":   {"Proc"},
+    # Stage 16 (v0.27.0-alpha): the concurrency effect. Every task /
+    # channel operation carries `Conc` — a function that spawns, joins,
+    # sends, receives, or selects must declare `uses Conc`. This keeps the
+    # "no uses clause => pure and deterministic" guarantee intact.
+    "chan_new":    {"Conc"},
+    "spawn":       {"Conc"},
+    "select":      {"Conc"},
+    # Builtin METHODS with effects (the first method-level effects —
+    # previously all I/O lived in builtin functions):
+    "chan.send":   {"Conc"},
+    "chan.recv":   {"Conc"},
+    "chan.len":    {"Conc"},
+    "task.join":   {"Conc"},
 }
 
 # Types whose values are "owned" heap allocations — subject to move tracking.
@@ -324,6 +360,16 @@ class Checker:
             # inner type must exist but `tainted` itself needs no struct
             # or enum definition.
             return self.type_exists(taint_inner(t), node)
+        if is_chan(t):
+            # Stage 16: Chan[T] is a built-in generic wrapper.
+            return self.type_exists(chan_inner(t), node)
+        if is_task(t):
+            # Stage 16: Task[R] is a built-in generic wrapper (R may be
+            # void — only allowed as a join result type).
+            inner = task_inner(t)
+            if inner == "void":
+                return True
+            return self.type_exists(inner, node)
         base = type_base(t)
         args = type_args(t)
         if base in self.structs or base in self.enums:
@@ -1419,9 +1465,10 @@ class Checker:
             at = argt(0, None)
             if not is_owned_type(at):
                 self.err("clone() requires an owned (heap) type, got %s" % at, e)
-            if not self.is_clone_supported(at):
-                self.err("clone() on type %s is not supported (owned types "
-                         "only)" % at, e)
+            if not self.clone_supported(at):
+                self.err("clone() on type %s is not supported (Task join "
+                         "handles and composites containing them cannot "
+                         "be cloned)" % at, e)
             # Argument is consumed by value (read), not moved.
             return at
         if name == "take":
@@ -1482,6 +1529,94 @@ class Checker:
             reject_tainted_at_sink(0, "str")
             self.edges[self.cur_fn].add("b:proc_exec")
             return "int"
+        # ----- Stage 16 (v0.27.0-alpha): concurrency builtins -----
+        # chan_new() -> Chan[T] — contextual typing (same pattern as
+        # map_new()): the surrounding let/param/return type supplies T.
+        if name == "chan_new":
+            need(0)
+            if expected is None or not is_chan(expected):
+                self.err("chan_new() requires a 'Chan[T]' type in the "
+                         "surrounding context", e)
+            return expected
+        # spawn(f, a1, ..., aN) -> Task[R] — start a task running function
+        # f with the given arguments; returns a join handle. The FIRST
+        # argument is a function NAME (identifier), not a value.
+        if name == "spawn":
+            if len(args) < 1:
+                self.err("spawn() expects a function name followed by its "
+                         "arguments", e)
+            fn_arg = args[0]
+            if fn_arg["k"] != "ident":
+                self.err("spawn() argument 1 must be a function name "
+                         "(an identifier), got a %s expression" % fn_arg["k"], e)
+            fname = fn_arg["name"]
+            if fname in BUILTIN_FNS:
+                self.err("spawn() target cannot be a builtin function: %s" % fname, e)
+            if fname not in self.fns:
+                self.err("spawn() target function does not exist: %s" % fname, e)
+            tfn = self.fns[fname]
+            if tfn["struct"] is not None:
+                self.err("spawn() target cannot be a method: %s (methods "
+                         "need a self receiver — spawn a free function)" % fname, e)
+            if tfn.get("typeparams"):
+                self.err("spawn() of generic functions is not supported "
+                         "yet: %s (wrap it in a non-generic fn)" % fname, e)
+            if tfn.get("extern", False):
+                self.err("spawn() of extern (FFI) functions is not "
+                         "supported", e)
+            params = tfn["params"]
+            vargs = args[1:]
+            if len(vargs) != len(params):
+                self.err("spawn() target %s expects %d arguments, got %d"
+                         % (fname, len(params), len(vargs)), e)
+            for i, (a, (pn, pt, _)) in enumerate(zip(vargs, params)):
+                at = self.check_expr(a, env, pt)
+                if at == "never":
+                    continue
+                if at != pt:
+                    self.err("spawn() argument '%s' of %s expects %s, got %s"
+                             % (pn, fname, pt, at), a)
+                # Send rule: values crossing a task boundary must be of a
+                # Send type. Task[R] is the first non-Send type (a join
+                # handle must stay with the task that spawned it).
+                if not self.type_is_send(pt):
+                    self.err("type %s is not Send: values of this type "
+                             "cannot cross a task boundary (a Task join "
+                             "handle must stay with its spawner)" % pt, a)
+                # Data-race-freedom rule (Stage 16 acceptance): a bare
+                # variable / field / index read of an OWNED type is a
+                # cross-thread refcount race (the value may be aliased by
+                # the sender thread) — reject it. Pass clone(x) (private
+                # deep copy) or take(x) (transfer) instead.
+                if is_owned_type(pt) and a["k"] in ("ident", "field", "index"):
+                    what = ("variable '" + a["name"] + "'") if a["k"] == "ident" \
+                        else "a borrowed value"
+                    self.err(
+                        "cannot share %s across tasks: spawn() argument %d "
+                        "reads it directly — pass clone(x) (private copy) or "
+                        "take(x) (ownership transfer). Data-race freedom: no "
+                        "owned value may be simultaneously released by two "
+                        "threads." % (what, i + 2), a)
+            self.edges[self.cur_fn].add("b:spawn")
+            # Rewrite the node: drop the fn-name argument and record the
+            # target so the interpreter / codegen never evaluates the
+            # function name as a value.
+            e["args"] = vargs
+            e["spawn_fn"] = fname
+            return "Task[%s]" % tfn["ret"]
+        # select(chs: list[Chan[T]]) -> int — blocks until at least one
+        # channel in the list has a pending message; returns the index of
+        # the first ready channel (list order).
+        if name == "select":
+            need(1)
+            at = argt(0, None)
+            if not is_list(at) or not is_chan(list_elem(at)):
+                self.err("select() expects a list[Chan[T]], got %s" % at, e)
+            if not self.type_is_send(list_elem(at)):
+                self.err("select() channel element type %s is not Send"
+                         % list_elem(at), e)
+            self.edges[self.cur_fn].add("b:select")
+            return "int"
         self.err("unknown builtin function: %s" % name, e)
 
     @staticmethod
@@ -1499,6 +1634,109 @@ class Checker:
         if is_taint(t):
             return Checker.is_clone_supported(taint_inner(t))
         # struct / enum / any other owned type
+        return True
+
+    def clone_supported(self, t, _seen=()):
+        """Stage 16: struct-aware clone support. A Chan clones by SHARING
+        (atomic refcount +1 — that is the point of a channel). A Task[R]
+        join handle cannot be cloned (it is single-consumer: join() exactly
+        once), and any composite containing a Task is not cloneable either.
+        Mirrors hlc.hls's clone_supported."""
+        if t in _seen:
+            return True
+        if t in ("int", "float", "bool", "str", "void", "never"):
+            return True
+        if is_chan(t):
+            return True
+        if is_task(t):
+            return False
+        _seen = _seen + (t,)
+        if is_list(t):
+            return self.clone_supported(list_elem(t), _seen)
+        if is_map(t):
+            return self.clone_supported(map_val(t), _seen)
+        if is_taint(t):
+            return self.clone_supported(taint_inner(t), _seen)
+        base = type_base(t)
+        args = type_args(t)
+        if base in self.structs:
+            st = self.structs[base]
+            if len(st["typeparams"]) != len(args):
+                return False
+            tmap = dict(zip(st["typeparams"], args))
+            for _, ftype, _ in st["fields"]:
+                ft = instantiate_type(ftype, tmap) if tmap else ftype
+                if not self.clone_supported(ft, _seen):
+                    return False
+            return True
+        if base in self.enums:
+            en = self.enums[base]
+            if len(en["typeparams"]) != len(args):
+                return False
+            tmap = dict(zip(en["typeparams"], args))
+            for _, payloads in en["variants"]:
+                for pt in payloads:
+                    pti = instantiate_type(pt, tmap) if tmap else pt
+                    if not self.clone_supported(pti, _seen):
+                        return False
+            return True
+        return True
+
+    def type_is_send(self, t, _seen=()):
+        """Stage 16: the Send rule set (the `Send`/`Sync` equivalent,
+        layered on the Stage 8 ownership system).
+
+        A type is Send iff its values may cross a task boundary:
+          - primitives (int/float/bool) and str: Send
+          - Chan[T]: Send iff T is Send (channels are the sharing
+            primitive — internally synchronized, atomic refcount)
+          - Task[R]: NOT Send (a join handle must stay with its spawner)
+          - list/map/tainted: Send iff the element/value type is Send
+          - struct/enum: Send iff every field/payload type is Send
+        """
+        if t in _seen:
+            return True
+        if t in ("int", "float", "bool", "str", "void", "never"):
+            return True
+        if t in self.cur_typeparams:
+            # Unresolved type parameter (spawn targets are non-generic, so
+            # this cannot trigger — conservative True matches the concrete
+            # instantiation check that already ran on the target's params).
+            return True
+        if is_chan(t):
+            return self.type_is_send(chan_inner(t), _seen)
+        if is_task(t):
+            return False
+        _seen = _seen + (t,)
+        if is_list(t):
+            return self.type_is_send(list_elem(t), _seen)
+        if is_map(t):
+            return self.type_is_send(map_val(t), _seen)
+        if is_taint(t):
+            return self.type_is_send(taint_inner(t), _seen)
+        base = type_base(t)
+        args = type_args(t)
+        if base in self.structs:
+            st = self.structs[base]
+            if len(st["typeparams"]) != len(args):
+                return False
+            tmap = dict(zip(st["typeparams"], args))
+            for _, ftype, _ in st["fields"]:
+                ft = instantiate_type(ftype, tmap) if tmap else ftype
+                if not self.type_is_send(ft, _seen):
+                    return False
+            return True
+        if base in self.enums:
+            en = self.enums[base]
+            if len(en["typeparams"]) != len(args):
+                return False
+            tmap = dict(zip(en["typeparams"], args))
+            for _, payloads in en["variants"]:
+                for pt in payloads:
+                    pti = instantiate_type(pt, tmap) if tmap else pt
+                    if not self.type_is_send(pti, _seen):
+                        return False
+            return True
         return True
 
     def check_method(self, e, env):
@@ -1613,6 +1851,30 @@ class Checker:
                 self.err("map has no method %s" % name, e)
             ptypes, ret = tbl[name]
             e["rm"] = ("builtin", "map." + name)
+        elif is_chan(tt):
+            # Stage 16 (v0.27.0-alpha): Chan[T] methods.
+            #   send(v: T) -> void — enqueue v (v must be a private value)
+            #   recv() -> T       — blocks while empty; deadlock-detected
+            #   len() -> int      — pending message count
+            elem = chan_inner(tt)
+            tbl = {
+                "send": ([elem], "void"),
+                "recv": ([], elem),
+                "len": ([], "int"),
+            }
+            if name not in tbl:
+                self.err("Chan has no method %s (available: send, recv, len)"
+                         % name, e)
+            ptypes, ret = tbl[name]
+            e["rm"] = ("builtin", "chan." + name)
+        elif is_task(tt):
+            # Stage 16 (v0.27.0-alpha): Task[R].join() -> R — wait for the
+            # task to finish and return its result. join() exactly once
+            # per handle (a second join is a runtime panic).
+            if name != "join":
+                self.err("Task has no method %s (available: join)" % name, e)
+            ptypes, ret = ([], task_inner(tt))
+            e["rm"] = ("builtin", "task.join")
         elif "[" in tt and type_base(tt) in self.enums:
             # Method on a generic enum instantiation — currently we do not
             # support user-defined methods on enums. Future: enable `impl`.
@@ -1629,6 +1891,26 @@ class Checker:
                 continue
             if at != pt:
                 self.err("argument of %s.%s expects %s, got %s" % (tt, name, pt, at), a)
+        # Stage 16: method-level effects + the channel-send data-race rule.
+        if e["rm"][0] == "builtin":
+            op = e["rm"][1]
+            if op in ("chan.send", "chan.recv", "chan.len", "task.join"):
+                self.edges[self.cur_fn].add("b:" + op)
+            if op == "chan.send":
+                v = args[0]
+                vt = ptypes[0]
+                if not self.type_is_send(vt):
+                    self.err("type %s is not Send: values of this type "
+                             "cannot cross a task boundary" % vt, v)
+                if is_owned_type(vt) and v["k"] in ("ident", "field", "index"):
+                    what = ("variable '" + v["name"] + "'") if v["k"] == "ident" \
+                        else "a borrowed value"
+                    self.err(
+                        "cannot share %s across tasks: ch.send(...) reads it "
+                        "directly — pass clone(x) (private copy) or take(x) "
+                        "(ownership transfer). Data-race freedom: no owned "
+                        "value may be simultaneously released by two threads."
+                        % what, v)
         return ret
 
     # ---------- match ----------

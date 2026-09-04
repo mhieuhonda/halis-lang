@@ -6,11 +6,14 @@ Runtime values:
   list[T]      -> list
   map[str,T]   -> dict (insertion-ordered), struct -> dict {field: value}
   enum         -> dict {"enum": <name>, "var": <variant>, "data": [payloads]}
+  Chan[T]      -> HLChan (Stage 16) — shared FIFO queue, GIL-guarded
+  Task[R]      -> HLTask (Stage 16) — thread join handle
 """
 import ctypes
 import math
 import os
 import sys
+import threading
 import time
 
 INT64_MIN = -(2 ** 63)
@@ -100,6 +103,116 @@ class BreakSig(Exception):
 
 class ContinueSig(Exception):
     pass
+
+
+# ----------------------------------------------------------------------------
+# Stage 16 (v0.27.0-alpha): the concurrency runtime (interpreter side).
+#
+# `spawn` creates a REAL Python thread per task. Channels are unbounded
+# MPMC FIFO queues. All channel/task state is guarded by one global mutex
+# + condition variable (the interpreter's equivalent of the native C
+# runtime's g_rt_mu / g_rt_cv). The deadlock detector mirrors the native
+# semantics exactly: when every thread that could produce work is blocked
+# (on recv / select / join) and no messages are pending anywhere, the
+# program can never make progress -> clean HLPanic (exit 101).
+#
+# Panics and exit()s inside a task halt the WHOLE process (safe-halt
+# semantics: tasks share the process fate). The interpreter achieves this
+# with os._exit after flushing, because an uncaught exception would
+# otherwise only kill the thread.
+# ----------------------------------------------------------------------------
+class HLChan:
+    """A channel value: FIFO message queue (interpreter representation)."""
+
+    __slots__ = ("q",)
+
+    def __init__(self):
+        self.q = []  # list of values (messages); guarded by the runtime lock
+
+
+class HLTask:
+    """A spawned task: Python thread + join state."""
+
+    __slots__ = ("thread", "done", "joined", "result")
+
+    def __init__(self, thread):
+        self.thread = thread
+        self.done = False
+        self.joined = False
+        self.result = None
+
+
+class ConcRuntime:
+    """Global state for spawn / channel operations (one per Interp)."""
+
+    def __init__(self):
+        self.mu = threading.Lock()
+        self.cv = threading.Condition(self.mu)
+        self.tasks_alive = 0   # spawned tasks not yet finished (main excluded)
+        self.blocked = 0       # threads currently blocked in recv/select/join
+        self.msgs = 0          # total pending messages across all channels
+        self.next_id = 0
+
+    def deadlock_check(self):
+        """Call with the lock HELD, before blocking. Every thread that can
+        produce work is blocked AND no messages exist anywhere -> the
+        program can never progress. Mirrors hl_rt_deadlock_check() in C.
+        Raises HLPanic (the `with self.cv:` caller releases the lock on
+        unwind; the process is halting anyway)."""
+        alive = self.tasks_alive + 1  # +1: the main thread
+        if self.blocked == alive and self.msgs == 0:
+            raise HLPanic(
+                "deadlock: all tasks are blocked on channel operations "
+                "with no pending messages", 0)
+
+    def send(self, chan, value):
+        with self.cv:
+            chan.q.append(value)
+            self.msgs += 1
+            self.cv.notify_all()
+
+    def recv(self, chan, line):
+        with self.cv:
+            while not chan.q:
+                self.blocked += 1
+                self.deadlock_check()
+                self.cv.wait()
+                self.blocked -= 1
+            value = chan.q.pop(0)
+            self.msgs -= 1
+            return value
+
+    def select(self, chans, line):
+        with self.cv:
+            if not chans:
+                raise HLPanic("select() on empty channel list", line)
+            while True:
+                for i, c in enumerate(chans):
+                    if c.q:
+                        return i
+                self.blocked += 1
+                self.deadlock_check()
+                self.cv.wait()
+                self.blocked -= 1
+
+    def join(self, task, line):
+        with self.cv:
+            if task.joined:
+                raise HLPanic("task already joined", line)
+            while not task.done:
+                self.blocked += 1
+                self.deadlock_check()
+                self.cv.wait()
+                self.blocked -= 1
+            task.joined = True
+            return task.result
+
+    def task_finished(self, task, result):
+        with self.cv:
+            task.result = result
+            task.done = True
+            self.tasks_alive -= 1
+            self.cv.notify_all()
 
 
 # ---------- int64 checked arithmetic ----------
@@ -269,6 +382,10 @@ class Interp:
         # testing — tests using rand_seed + rand_int/rand_float produce
         # identical output in both backends.
         self.rand_state = HalisRNG()
+        # Stage 16 (v0.27.0-alpha): the concurrency runtime — real Python
+        # threads, one global mutex + condvar (mirrors the native C
+        # runtime's design so differential behaviour matches).
+        self.conc = ConcRuntime()
 
     # ---------- lifecycle ----------
     def run(self):
@@ -532,6 +649,12 @@ class Interp:
             return e["v"]
         if k == "call":
             rc = e["rc"]
+            # Stage 16: spawn(f, args...) — the checker rewrote the node:
+            # the fn-name argument was removed and recorded in e["spawn_fn"].
+            # The target must NOT be evaluated as a value; do_spawn applies
+            # the boundary ownership rule to each argument node.
+            if rc[0] == "builtin" and rc[1] == "spawn":
+                return self.do_spawn(e["spawn_fn"], e["args"], env)
             args = [self.eval_expr(a, env) for a in e["args"]]
             if rc[0] == "user":
                 return self.call_fn(rc[1], args)
@@ -921,10 +1044,79 @@ class Interp:
                 return os.WEXITSTATUS(rc)
             # Killed by signal — encode as 128 + signum, like shells.
             return 128 + os.WTERMSIG(rc)
+        # ----- Stage 16 (v0.27.0-alpha): concurrency builtins -----
+        # chan_new() -> Chan[T] — a fresh, empty channel.
+        if name == "chan_new":
+            return HLChan()
+        # select(chs: list[Chan[T]]) -> int — block until any channel is
+        # ready; return the index (in list order) of the first ready one.
+        if name == "select":
+            chans = args[0]
+            return self.conc.select(chans, line)
         raise HLPanic("unknown builtin function: %s" % name, line)
+
+    # ---------- Stage 16: spawn ----------
+    def do_spawn(self, fn_key, arg_nodes, env):
+        """spawn(f, a1..aN) — start a task running f(args).
+
+        Boundary ownership rule (mirrors the native codegen exactly):
+        an owned value crossing the task boundary is deep-copied unless
+        it is syntactically clone(...) (already a private deep copy).
+        Channels cross by sharing (their internal state is guarded by the
+        runtime lock). This guarantees no mutable value is visible to two
+        threads at once — the interpreter-side mirror of the native
+        refcount discipline."""
+        values = []
+        for a in arg_nodes:
+            v = self.eval_expr(a, env)
+            if isinstance(v, (list, dict)) and not (
+                    a.get("k") == "call" and a.get("name") == "clone"):
+                v = self.deep_clone(v)
+            values.append(v)
+        conc = self.conc
+        task = HLTask(None)
+        interp = self
+
+        def runner():
+            try:
+                result = interp.call_fn(fn_key, values)
+            except HLPanic as ex:
+                # Safe-halt semantics: a panic in ANY task halts the whole
+                # process (tasks share the process fate).
+                interp.out.flush()
+                sys.stderr.write("panic: %s (at line %d)\n"
+                                 % (to_display(ex.msg), ex.line))
+                os._exit(101)
+            except SystemExit as ex:
+                interp.out.flush()
+                code = ex.code if isinstance(ex.code, int) else 0
+                os._exit(code & 0xFF)
+            conc.task_finished(task, result)
+
+        with conc.cv:
+            conc.tasks_alive += 1
+        # Daemon thread: the process must be able to exit while a task is
+        # still blocked in recv/select (mirrors the native semantics where
+        # main() returning terminates the whole process, threads included).
+        # Without daemon=True a deadlocked-at-exit task would hang the
+        # interpreter at shutdown (Python waits for non-daemon threads).
+        t = threading.Thread(target=runner)
+        t.daemon = True
+        task.thread = t
+        t.start()
+        return task
 
     def deep_clone(self, v):
         """Deep-copy an HLS runtime value (Stage-0 / Python)."""
+        if isinstance(v, HLChan):
+            # Stage 16: a channel clones by SHARING (that is its purpose —
+            # the queue is guarded by the runtime lock). Mirrors the
+            # native hl_chan_clone (atomic refcount + 1).
+            return v
+        if isinstance(v, HLTask):
+            # Stage 16: a Task join handle is single-consumer and cannot
+            # be cloned (the checker rejects this; defensive halt here).
+            raise HLPanic("cannot clone a Task join handle", self.line)
         if isinstance(v, bytes):
             return bytes(v)  # strings are immutable, shallow copy is fine
         if isinstance(v, list):
@@ -1088,4 +1280,25 @@ class Interp:
             return args[0] in t
         if op == "map.keys":
             return list(t.keys())
+        # ----- Stage 16 (v0.27.0-alpha): Chan / Task methods -----
+        if op == "chan.send":
+            # Boundary ownership rule: an owned message is deep-copied at
+            # the send boundary unless it is syntactically clone(...) —
+            # the checker already rejected bare variable reads. (The AST
+            # node is not available here; the spawn path handles its own
+            # boundary. For send, the checker guarantees the arg is not a
+            # bare ident/field/index, so the remaining aliasing risk is
+            # covered by a defensive deep copy for mutable composites.)
+            v = args[0]
+            if isinstance(v, (list, dict)):
+                v = self.deep_clone(v)
+            self.conc.send(t, v)
+            return None
+        if op == "chan.recv":
+            return self.conc.recv(t, line)
+        if op == "chan.len":
+            with self.conc.cv:
+                return len(t.q)
+        if op == "task.join":
+            return self.conc.join(t, line)
         raise HLPanic("unknown builtin method: %s" % op, line)

@@ -276,7 +276,7 @@ Full details: [SPEC.md](SPEC.md) · Stage-by-stage roadmap:
 
 ## Status
 
-**v0.20.0-alpha — Stages 1–9 complete (Stage 9: complete fine-grained effects & capabilities), Stages 10–15 in alpha/beta**:
+**v0.27.0-alpha — Stages 1–16 complete (Stage 16: concurrency & async with data-race freedom)**:
 
 - ✅ Complete core specification
 - ✅ Stage-0 reference (interpreted, with type + effects checking)
@@ -369,8 +369,26 @@ Full details: [SPEC.md](SPEC.md) · Stage-by-stage roadmap:
   version verification (records + verifies the git commit SHA).
   New CLI: `hls-pkg publish` + `hls-pkg log [--verify]`. 199/199 +
   13/13 LLVM tests PASS.
-- ⬜ Stage 14 release (tooling: LSP/plugins), Stage 15 release (safe
-  C FFI), concurrency (Stage 16), formal verification (Stage 17),
+- ✅ **Stage 14 release — Tooling** (v0.24.0-alpha, perfected
+  v0.26.0-alpha): `hls-lsp` language server, `hlfmt` formatter,
+  `hllint` linter (control-flow-aware `?`-unwrap analysis).
+- ✅ **Stage 15 release — Safe C FFI** (v0.25.0-alpha, perfected
+  v0.26.0-alpha): `extern "C"` blocks, `hlbindgen` C-header → HLS
+  generator (structs, enums, ABI header with `_Static_assert` size
+  checks), ownership-across-boundary enforcement.
+- ✅ **Stage 16 release — Concurrency & async, data-race freedom**
+  (v0.27.0-alpha): `spawn(f, args) -> Task[R]` (real threads —
+  pthread native / Python-thread interpreter), `Chan[T]`
+  message-passing channels (unbounded MPMC FIFO, blocking recv),
+  `select(list[Chan[T]])`, actor model via enum mailboxes, and a new
+  **`Conc` effect**. **Data races are impossible by construction:**
+  the Send rule set (Task handles are the first non-Send type) plus
+  the ownership boundary rule — *sharing a variable with a task
+  outside a channel is a compile error*. Runtime hardening deep-copies
+  non-provable values at the boundary, channels use atomic
+  refcounts, and a built-in deadlock detector halts all-blocked
+  programs with a clean panic. 426/426 tests PASS.
+- ⬜ formal verification (Stage 17),
   testing ecosystem (Stage 18), docs/book/playground (Stage 19),
   v1.0 (Stage 20)...
 

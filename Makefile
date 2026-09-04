@@ -27,7 +27,7 @@ bootstrap:
         @echo "[1/4] Stage-0: hlc.hls self-compiles..."
         @$(PYTHON) boot/boot.py $(HLC) $(HLC) $(BIN)/hlc.c
         @echo "[2/4] gcc: compiling native hlc..."
-        @$(CC) $(CFLAGS) -o $(BIN)/hlc $(BIN)/hlc.c -lm
+        @$(CC) $(CFLAGS) -o $(BIN)/hlc $(BIN)/hlc.c -lm -pthread
         @echo "[3/4] native hlc re-compiles itself..."
         @$(BIN)/hlc $(HLC) $(BIN)/hlc2.c
         @echo "[4/4] Comparing two passes of code generation..."
@@ -39,7 +39,7 @@ bootstrap:
 run:
         @test -x $(BIN)/hlc || $(MAKE) bootstrap
         @mkdir -p $(BIN)
-        @$(BIN)/hlc $(F) $(BIN)/hls_out.c && $(CC) $(CFLAGS) -o $(BIN)/hls_out $(BIN)/hls_out.c -lm && $(BIN)/hls_out
+        @$(BIN)/hlc $(F) $(BIN)/hls_out.c && $(CC) $(CFLAGS) -o $(BIN)/hls_out $(BIN)/hls_out.c -lm -pthread && $(BIN)/hls_out
 
 # Only check types + effects (no execution)
 check:
@@ -149,7 +149,9 @@ examples:
                   examples/taint_demo.hls examples/ffi_demo.hls \
                   examples/optimize_demo.hls examples/llvm_demo.hls \
                   examples/tooling_demo.hls examples/pkg_demo.hls \
-                  examples/libcurl_demo.hls; do \
+                  examples/libcurl_demo.hls \
+                  examples/conc_demo.hls examples/actor_demo.hls \
+                  examples/par_scan.hls; do \
                 echo "--- $$f"; $(PYTHON) boot/boot.py $$f || exit 1; \
         done
         @echo "--- examples/secure_demo.hls (deliberately panics on overflow)"

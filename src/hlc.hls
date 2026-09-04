@@ -164,7 +164,15 @@ struct Ctx {
     # loop_header: > 0 while checking a while/for condition or iterable —
     # take()/drop() are rejected there (a move would re-execute every
     # iteration).
-    loop_header: int
+    loop_header: int,
+    # ---- Stage 16 (v0.27.0-alpha): concurrency codegen state ----
+    # spawn_decls: top-level C declarations (arg structs + trampolines)
+    # accumulated while generating spawn() call sites, appended to the
+    # program before the fn bodies.
+    spawn_decls: list[str],
+    # spawn_n: monotonically increasing counter for unique spawn helper
+    # names (hl_sa_<n>_t / hl_mkargs_<n> / hl_tramp_<n>).
+    spawn_n: int
 }
 
 fn new_ctx(src: str) -> Ctx {
@@ -181,7 +189,8 @@ fn new_ctx(src: str) -> Ctx {
         cur_fn_ret: "void", cur_typeparams: [], cur_targs: [],
         fn_insts: [], struct_insts: [], enum_insts: [],
         computed_effects: map_new(),
-        hoist_map: map_new(), null_after: [], clone_insts: [], loop_header: 0
+        hoist_map: map_new(), null_after: [], clone_insts: [], loop_header: 0,
+        spawn_decls: [], spawn_n: 0
     }
 }
 
@@ -272,6 +281,25 @@ fn map_val_t(t: str) -> str {
 # is a built-in generic type — no struct/enum definition required.
 fn is_taint_t(t: str) -> bool {
     return t.starts_with("tainted[")
+}
+
+# Stage 16 (v0.27.0-alpha): built-in concurrency wrappers.
+# `Chan[T]` — message-passing channel (MPMC, unbounded, blocking recv).
+# `Task[R]` — spawned-task join handle (R = the spawned fn's return type).
+fn is_chan_t(t: str) -> bool {
+    return t.starts_with("Chan[")
+}
+
+fn chan_inner_t(t: str) -> str {
+    return t.slice(5, t.len() - 1)
+}
+
+fn is_task_t(t: str) -> bool {
+    return t.starts_with("Task[")
+}
+
+fn task_inner_t(t: str) -> str {
+    return t.slice(5, t.len() - 1)
 }
 
 fn taint_inner_t(t: str) -> str {
@@ -732,6 +760,22 @@ fn parse_type(ctx: Ctx, allow_void: bool) -> str {
         eat_sym(ctx, "]")
         return "tainted[" + inner + "]"
     }
+    # Stage 16 (v0.27.0-alpha): built-in concurrency wrappers.
+    if base == "Chan" {
+        eat_sym(ctx, "[")
+        let inner: str = parse_type(ctx, false)
+        eat_sym(ctx, "]")
+        if inner == "void" {
+            perr_at(ctx, "Chan[T] element type cannot be void", t)
+        }
+        return "Chan[" + inner + "]"
+    }
+    if base == "Task" {
+        eat_sym(ctx, "[")
+        let inner: str = parse_type(ctx, true)
+        eat_sym(ctx, "]")
+        return "Task[" + inner + "]"
+    }
     if base == "int" || base == "float" || base == "bool" || base == "str" {
         return base
     }
@@ -999,14 +1043,14 @@ fn parse_fn(ctx: Ctx, impl_struct: str) -> FnInfo {
             # active effects with builtins (net_lookup, rand_int,
             # rand_float, rand_seed, proc_exec). No reserved effects remain.
             if e != "IO" && e != "Fs" && e != "Clock" && e != "Args" && e != "Exit"
-                && e != "Net" && e != "Rand" && e != "Proc" {
-                perr(ctx, "unknown effect '" + e + "'; known effects: IO, Fs, Clock, Args, Exit, Net, Rand, Proc")
+                && e != "Net" && e != "Rand" && e != "Proc" && e != "Conc" {
+                perr(ctx, "unknown effect '" + e + "'; known effects: IO, Fs, Clock, Args, Exit, Net, Rand, Proc, Conc")
             }
             if !list_has(effects, e) {
                 effects.push(e)
             }
             # `IO` is the blanket alias — expand to the full IO family.
-            # Net, Rand, Proc are NOT part of the IO family — a program
+            # Net, Rand, Proc, Conc are NOT part of the IO family — a program
             # must declare them explicitly to use the corresponding builtins.
             if e == "IO" {
                 let mut k: int = 0
@@ -1106,8 +1150,8 @@ fn parse_extern_block(ctx: Ctx) -> void {
                 # Stage 9 release (v0.20.0-alpha): Net, Rand, Proc are
                 # active effects. No reserved effects remain.
                 if e != "IO" && e != "Fs" && e != "Clock" && e != "Args" && e != "Exit"
-                    && e != "Net" && e != "Rand" && e != "Proc" {
-                    perr(ctx, "unknown effect '" + e + "'; known effects: IO, Fs, Clock, Args, Exit, Net, Rand, Proc")
+                    && e != "Net" && e != "Rand" && e != "Proc" && e != "Conc" {
+                        perr(ctx, "unknown effect '" + e + "'; known effects: IO, Fs, Clock, Args, Exit, Net, Rand, Proc, Conc")
                 }
                 if !list_has(effects, e) {
                     effects.push(e)
@@ -1634,6 +1678,8 @@ fn is_builtin_fn(n: str) -> bool {
         # Stage 9 release (v0.20.0-alpha): Net / Rand / Proc builtins
         || n == "net_lookup" || n == "rand_int" || n == "rand_float"
         || n == "rand_seed" || n == "proc_exec"
+        # Stage 16 (v0.27.0-alpha): concurrency builtins
+        || n == "chan_new" || n == "spawn" || n == "select"
 }
 
 fn list_has(list: list[str], x: str) -> bool {
@@ -1664,6 +1710,17 @@ fn type_exists(ctx: Ctx, t: str) -> bool {
         # Stage 10-alpha: tainted[T] is a built-in generic wrapper; the
         # inner type must exist but `tainted` itself needs no struct/enum.
         return type_exists(ctx, taint_inner_t(t))
+    }
+    if is_chan_t(t) {
+        # Stage 16: Chan[T] is a built-in generic wrapper.
+        return type_exists(ctx, chan_inner_t(t))
+    }
+    if is_task_t(t) {
+        # Stage 16: Task[R] is a built-in generic wrapper (R may be void).
+        if task_inner_t(t) == "void" {
+            return true
+        }
+        return type_exists(ctx, task_inner_t(t))
     }
     let base: str = type_base(t)
     let args: list[str] = type_args(t)
@@ -1930,6 +1987,16 @@ fn builtin_effect(name: str) -> list[str] {
     if name == "proc_exec" {
         return ["Proc"]
     }
+    # Stage 16 (v0.27.0-alpha): the concurrency effect. Every task /
+    # channel operation carries `Conc`; a program must declare
+    # `uses Conc` to use them. Builtin METHODS with effects are keyed
+    # here by their op names ("chan.send", "chan.recv", "chan.len",
+    # "task.join") — the fixpoint treats them exactly like builtin fns.
+    if name == "chan_new" || name == "spawn" || name == "select"
+        || name == "chan.send" || name == "chan.recv" || name == "chan.len"
+        || name == "task.join" {
+        return ["Conc"]
+    }
     # taint_mark / taint_unwrap are pure (no effect; just wrap/unwrap).
     return []   # pure builtin
 }
@@ -2181,6 +2248,17 @@ fn collect_insts(ctx: Ctx, t: str) -> void {
     }
     if is_taint_t(t) {
         collect_insts(ctx, taint_inner_t(t))
+        return
+    }
+    # Stage 16: recurse into the concurrency wrappers so that e.g. a
+    # `Chan[Point]` binding forces the Point instantiation (its release
+    # fn is referenced as the channel's elem_release).
+    if is_chan_t(t) {
+        collect_insts(ctx, chan_inner_t(t))
+        return
+    }
+    if is_task_t(t) {
+        collect_insts(ctx, task_inner_t(t))
         return
     }
     let base: str = type_base(t)
@@ -3035,8 +3113,261 @@ fn check_call(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, expected
     return ""
 }
 
+# ============================================================================
+# Stage 16 (v0.27.0-alpha): concurrency checker helpers
+# ============================================================================
+
+# type_is_send — the Send rule set (the Send/Sync equivalent, layered on
+# the Stage 8 ownership system):
+#   - primitives and str: Send
+#   - Chan[T]: Send iff T is Send (channels are the sharing primitive)
+#   - Task[R]: NOT Send (a join handle must stay with its spawner)
+#   - list/map/tainted: Send iff the element type is Send
+#   - struct/enum: Send iff every field/payload type is Send
+# list_append_clone(xs, x) — a NEW list with x appended (keeps the caller's
+# list immutable; used for the coinductive cycle detection in
+# type_is_send / clone_supported).
+fn list_append_clone(xs: list[str], x: str) -> list[str] {
+    let out: list[str] = []
+    let mut i: int = 0
+    while i < xs.len() {
+        out.push(xs.get(i))
+        i = i + 1
+    }
+    out.push(x)
+    return out
+}
+
+# type_is_send(ctx, t, seen) — returns true iff values of type t may cross
+# a task boundary. `seen` carries the types already under inspection
+# (coinductive cycle detection for recursive structs).
+fn type_is_send(ctx: Ctx, t: str, seen: list[str]) -> bool {
+    if list_has(seen, t) {
+        return true
+    }
+    if t == "int" || t == "float" || t == "bool" || t == "str" || t == "void" || t == "never" {
+        return true
+    }
+    if list_has(ctx.cur_typeparams, t) {
+        return true
+    }
+    let seen2: list[str] = list_append_clone(seen, t)
+    if is_chan_t(t) {
+        return type_is_send(ctx, chan_inner_t(t), seen2)
+    }
+    if is_task_t(t) {
+        return false
+    }
+    if is_list_t(t) {
+        return type_is_send(ctx, list_elem_t(t), seen2)
+    }
+    if is_map_t(t) {
+        return type_is_send(ctx, map_val_t(t), seen2)
+    }
+    if is_taint_t(t) {
+        return type_is_send(ctx, taint_inner_t(t), seen2)
+    }
+    let base: str = type_base(t)
+    let args: list[str] = type_args(t)
+    if ctx.structs.has(base) {
+        let st: StructInfo = ctx.structs.get_or(base, dummy_struct())
+        if st.typeparams.len() != args.len() {
+            return false
+        }
+        let mut i: int = 0
+        while i < st.ftypes.len() {
+            let ft: str = instantiate_type(st.ftypes.get(i), st.typeparams, args)
+            if !type_is_send(ctx, ft, seen2) {
+                return false
+            }
+            i = i + 1
+        }
+        return true
+    }
+    if ctx.enums.has(base) {
+        let en: EnumInfo = ctx.enums.get_or(base, dummy_enum())
+        if en.typeparams.len() != args.len() {
+            return false
+        }
+        let mut v: int = 0
+        while v < en.variants.len() {
+            let pays: list[str] = en.payloads.get(v)
+            let mut p: int = 0
+            while p < pays.len() {
+                let pt: str = instantiate_type(pays.get(p), en.typeparams, args)
+                if !type_is_send(ctx, pt, seen2) {
+                    return false
+                }
+                p = p + 1
+            }
+            v = v + 1
+        }
+        return true
+    }
+    return true
+}
+
+# clone_supported — struct-aware clone support (Stage 16). A Chan clones
+# by SHARING (atomic refcount + 1 — that is the point of a channel). A
+# Task[R] join handle cannot be cloned (single-consumer: join() exactly
+# once), and any composite containing a Task is not cloneable either.
+# Mirrors boot/checker.py's Checker.clone_supported.
+fn clone_supported(ctx: Ctx, t: str, seen: list[str]) -> bool {
+    if list_has(seen, t) {
+        return true
+    }
+    if t == "int" || t == "float" || t == "bool" || t == "str" || t == "void" || t == "never" {
+        return true
+    }
+    if is_chan_t(t) {
+        return true
+    }
+    if is_task_t(t) {
+        return false
+    }
+    let seen2: list[str] = list_append_clone(seen, t)
+    if is_list_t(t) {
+        return clone_supported(ctx, list_elem_t(t), seen2)
+    }
+    if is_map_t(t) {
+        return clone_supported(ctx, map_val_t(t), seen2)
+    }
+    if is_taint_t(t) {
+        return clone_supported(ctx, taint_inner_t(t), seen2)
+    }
+    let base: str = type_base(t)
+    let args: list[str] = type_args(t)
+    if ctx.structs.has(base) {
+        let st: StructInfo = ctx.structs.get_or(base, dummy_struct())
+        if st.typeparams.len() != args.len() {
+            return false
+        }
+        let mut i: int = 0
+        while i < st.ftypes.len() {
+            let ft: str = instantiate_type(st.ftypes.get(i), st.typeparams, args)
+            if !clone_supported(ctx, ft, seen2) {
+                return false
+            }
+            i = i + 1
+        }
+        return true
+    }
+    if ctx.enums.has(base) {
+        let en: EnumInfo = ctx.enums.get_or(base, dummy_enum())
+        if en.typeparams.len() != args.len() {
+            return false
+        }
+        let mut v: int = 0
+        while v < en.variants.len() {
+            let pays: list[str] = en.payloads.get(v)
+            let mut p: int = 0
+            while p < pays.len() {
+                let pt: str = instantiate_type(pays.get(p), en.typeparams, args)
+                if !clone_supported(ctx, pt, seen2) {
+                    return false
+                }
+                p = p + 1
+            }
+            v = v + 1
+        }
+        return true
+    }
+    return true
+}
+
+# check_spawn_call — validate spawn(f, a1, ..., aN) and rewrite the node.
+# Rules enforced here (the Stage 16 acceptance criteria):
+#   1. The target f must be a non-generic, non-method, non-extern user fn.
+#   2. Every argument type must be Send (Task handles are not Send).
+#   3. Every OWNED argument must be a FRESH expression (a literal, call
+#      result, clone(x), take(x), composite, ...) — a bare variable /
+#      field / index read is a cross-thread sharing error.
+# After checking, the node is rewritten: the fn-name argument is removed
+# and the target key is recorded in mkey (mirroring the Python checker).
+fn check_spawn_call(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int) -> str {
+    let mut line: int = ctx.exprs[e].line
+    let nargs: int = ctx.exprs[e].args.len()
+    if nargs < 1 {
+        cerr(line, "spawn() expects a function name followed by its arguments")
+    }
+    let fn_arg: int = ctx.exprs[e].args.get(0)
+    if ctx.exprs[fn_arg].kind != "ident" {
+        cerr(line, "spawn() argument 1 must be a function name (an identifier)")
+    }
+    let fname: str = ctx.exprs[fn_arg].name
+    if is_builtin_fn(fname) {
+        cerr(line, "spawn() target cannot be a builtin function: " + fname)
+    }
+    if !ctx.fns.has(fname) {
+        cerr(line, "spawn() target function does not exist: " + fname)
+    }
+    let tf: FnInfo = ctx.fns.get_or(fname, dummy_fn())
+    if tf.is_method {
+        cerr(line, "spawn() target cannot be a method: " + fname + " (methods need a self receiver — spawn a free function)")
+    }
+    if tf.typeparams.len() > 0 {
+        cerr(line, "spawn() of generic functions is not supported yet: " + fname + " (wrap it in a non-generic fn)")
+    }
+    if tf.is_extern {
+        cerr(line, "spawn() of extern (FFI) functions is not supported")
+    }
+    let vargs: list[int] = []
+    let mut si: int = 1
+    while si < ctx.exprs[e].args.len() {
+        vargs.push(ctx.exprs[e].args.get(si))
+        si = si + 1
+    }
+    if vargs.len() != tf.params.len() {
+        cerr(line, "spawn() target " + fname + " expects " + tf.params.len().to_str() + " arguments, got " + vargs.len().to_str())
+    }
+    let mut i: int = 0
+    while i < vargs.len() {
+        let aidx: int = vargs.get(i)
+        let pt: str = tf.ptypes.get(i)
+        let at: str = check_expr(ctx, env, cur, aidx, pt)
+        if at != "never" && at != pt {
+            cerr(line, "spawn() argument '" + tf.params.get(i) + "' of " + fname + " expects " + pt + ", got " + at)
+        }
+        # Send rule: Task handles cannot cross a task boundary.
+        if !type_is_send(ctx, pt, []) {
+            cerr(line, "type " + pt + " is not Send: values of this type cannot cross a task boundary (a Task join handle must stay with its spawner)")
+        }
+        # Data-race-freedom rule: a bare binding read (ident / field /
+        # index) of an OWNED value is a cross-thread sharing error —
+        # reject it. This mirrors the Python checker EXACTLY (same three
+        # syntactic forms); every other form is allowed at check time and
+        # hardened at runtime by the boundary deep-copy in gen_spawn_call.
+        if is_owned_type(pt) {
+            let akind: str = ctx.exprs[aidx].kind
+            if akind == "ident" || akind == "field" || akind == "index" {
+                let mut what: str = "a borrowed value"
+                if akind == "ident" {
+                    what = "variable '" + ctx.exprs[aidx].name + "'"
+                }
+                cerr(line, "cannot share " + what + " across tasks: spawn() argument " + (i + 2).to_str() + " reads it directly — pass clone(x) (private copy) or take(x) (ownership transfer). Data-race freedom: no owned value may be simultaneously released by two threads.")
+            }
+        }
+        i = i + 1
+    }
+    add_edge(ctx, cur, "b:spawn")
+    # Rewrite the node: drop the fn-name argument; record the target key
+    # in mop (mkey stays "spawn" so gen_call dispatches to the spawn
+    # codegen path, which reads the target from mop).
+    ctx.exprs[e].args = vargs
+    ctx.exprs[e].mkey = "spawn"
+    ctx.exprs[e].mop = fname
+    return "Task[" + tf.ret + "]"
+}
+
 fn check_builtin_call(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, name: str, expected: str) -> str {
     let mut line: int = ctx.exprs[e].line
+    # Stage 16 (v0.27.0-alpha): spawn(f, a1, ..., aN) — the FIRST argument
+    # is a function NAME (identifier), not a value. It must be handled
+    # BEFORE the generic argument-evaluation loop below (which would try
+    # to resolve it as a variable and fail).
+    if name == "spawn" {
+        return check_spawn_call(ctx, env, cur, e)
+    }
     let nargs: int = ctx.exprs[e].args.len()
     let argt: list[str] = []
     let mut i: int = 0
@@ -3276,8 +3607,11 @@ fn check_builtin_call(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, 
         if !is_owned_type(at2) {
             cerr(line, "clone() requires an owned (heap) type, got " + at2)
         }
-        if !is_clone_supported(at2) {
-            cerr(line, "clone() on type " + at2 + " is not supported (owned types only)")
+        # Stage 16: struct-aware clone support — a Task handle (or any
+        # composite containing one) cannot be cloned; a Chan clones by
+        # SHARING (atomic refcount + 1).
+        if !clone_supported(ctx, at2, []) {
+            cerr(line, "clone() on type " + at2 + " is not supported (Task join handles and composites containing them cannot be cloned)")
         }
         return at2
     }
@@ -3354,6 +3688,30 @@ fn check_builtin_call(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, 
             cerr(line, "taint-sink violation: proc_exec argument 1 is " + argt.get(0) + " (tainted values must be sanitised before reaching a sink — use sanitize_command from std.sanitize, or taint_unwrap() if you accept the risk)")
         }
         add_edge(ctx, cur, "b:proc_exec")
+        return "int"
+    }
+    # ----- Stage 16 (v0.27.0-alpha): concurrency builtins -----
+    # chan_new() -> Chan[T] — contextual typing (same pattern as map_new).
+    if name == "chan_new" {
+        if nargs != 0 {
+            cerr(line, "chan_new() takes no arguments")
+        }
+        if expected == "" || !is_chan_t(expected) {
+            cerr(line, "chan_new() requires a 'Chan[T]' type in the surrounding context")
+        }
+        add_edge(ctx, cur, "b:chan_new")
+        return expected
+    }
+    # select(chs: list[Chan[T]]) -> int — index of the first ready channel.
+    if name == "select" {
+        if nargs != 1 {
+            cerr(line, "select() expects 1 list[Chan[T]] argument")
+        }
+        let a0: str = argt.get(0)
+        if !is_list_t(a0) || !is_chan_t(list_elem_t(a0)) {
+            cerr(line, "select() expects a list[Chan[T]], got " + a0)
+        }
+        add_edge(ctx, cur, "b:select")
         return "int"
     }
     cerr(line, "unknown builtin function: " + name)
@@ -3608,10 +3966,42 @@ fn check_method(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int) -> str
         else if name == "keys" { ret = "list[str]" }
         else { cerr(line, "map has no method " + name) }
         ctx.exprs[e].mop = "map." + name
+    } else if is_chan_t(tt) {
+        # Stage 16 (v0.27.0-alpha): Chan[T] methods.
+        let celem: str = chan_inner_t(tt)
+        if name == "len" { ret = "int" }
+        else if name == "recv" { ret = celem }
+        else if name == "send"  {
+        ptypes.push(celem)
+        ret = "void"
+    }
+        else { cerr(line, "Chan has no method " + name + " (available: send, recv, len)") }
+        ctx.exprs[e].mop = "chan." + name
+    } else if is_task_t(tt) {
+        # Stage 16 (v0.27.0-alpha): Task[R].join() -> R.
+        if name != "join" {
+            cerr(line, "Task has no method " + name + " (available: join)")
+        }
+        ret = task_inner_t(tt)
+        ctx.exprs[e].mop = "task.join"
     } else {
         cerr(line, "cannot call method on type " + tt)
     }
     ctx.exprs[e].muser = false
+    # Stage 16: method-level effects + the channel-send data-race rule.
+    # These are the first builtin METHODS that carry an effect — the
+    # call-graph edge keeps the effects fixpoint sound for them.
+    if ctx.exprs[e].mop == "chan.send" || ctx.exprs[e].mop == "chan.recv"
+        || ctx.exprs[e].mop == "chan.len" || ctx.exprs[e].mop == "task.join" {
+        add_edge(ctx, cur, "b:" + ctx.exprs[e].mop)
+    }
+    if ctx.exprs[e].mop == "chan.send" && nargs >= 1 {
+        # Send rule: the message type must be Send...
+        let vt: str = chan_inner_t(tt)
+        if !type_is_send(ctx, vt, []) {
+            cerr(line, "type " + vt + " is not Send: values of this type cannot cross a task boundary")
+        }
+    }
     if nargs != ptypes.len() {
         cerr(line, tt + "." + name + " expects " + ptypes.len().to_str() + " arguments, got " + nargs.to_str())
     }
@@ -3622,6 +4012,23 @@ fn check_method(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int) -> str
             cerr(line, "argument of " + tt + "." + name + " expects " + ptypes.get(i) + ", got " + at)
         }
         i = i + 1
+    }
+    # Stage 16 (part 2): the channel-send freshness rule runs AFTER the
+    # argument was type-checked — the syntactic form is what matters (a
+    # bare ident/field/index read), mirroring the Python checker exactly.
+    # (Running it earlier read stale annotation state and produced a
+    # divergence between the two checkers.)
+    if ctx.exprs[e].mop == "chan.send" && nargs >= 1 {
+        let vt2: str = chan_inner_t(tt)
+        let vidx: int = ctx.exprs[e].args.get(0)
+        let vkind: str = ctx.exprs[vidx].kind
+        if is_owned_type(vt2) && (vkind == "ident" || vkind == "field" || vkind == "index") {
+            let mut what: str = "a borrowed value"
+            if vkind == "ident" {
+                what = "variable '" + ctx.exprs[vidx].name + "'"
+            }
+            cerr(line, "cannot share " + what + " across tasks: ch.send(...) reads it directly — pass clone(x) (private copy) or take(x) (ownership transfer). Data-race freedom: no owned value may be simultaneously released by two threads.")
+        }
     }
     return ret
 }
@@ -3887,8 +4294,16 @@ fn check_match(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, expecte
         }
     }
     # All arm types must agree.
+    # NOTE (deep-scan-9 / Stage 16): do NOT write ctx.exprs[e].t here —
+    # the CALLER (check_expr's match branch) assigns the return value to
+    # the same field. Writing it in BOTH places made the generated C
+    # release the OLD field value twice (field assignment lowers to
+    # `release old, store new`): the inner write freed the node's
+    # initial "", then the caller's write released the stale pointer —
+    # a heap-use-after-free in the native compiler that only surfaced
+    # on match-heavy programs (feat_clone_deep). The interpreter was
+    # unaffected (Python rebinds, no refcount dance).
     if arm_types.len() == 0 {
-        ctx.exprs[e].t = "never"
         return "never"
     }
     let first: str = arm_types.get(0)
@@ -3899,7 +4314,6 @@ fn check_match(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, expecte
         }
         ai = ai + 1
     }
-    ctx.exprs[e].t = first
     return first
 }
 
@@ -4016,7 +4430,8 @@ fn check_qmark(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, expecte
             }
         }
     }
-    ctx.exprs[e].t = success_t
+    # NOTE (deep-scan-9): same as check_match — no internal .t write; the
+    # caller (check_expr's qmark branch) owns the field assignment.
     ctx.exprs[e].err_variant = err_v
     ctx.exprs[e].ok_variant = ok_v
     return success_t
@@ -4183,6 +4598,8 @@ fn runtime_lines() -> list[str] {
     r.push("#include <netinet/in.h>")
     r.push("#include <arpa/inet.h>")
     r.push("#include <sys/wait.h>")
+    # Stage 16 (v0.27.0-alpha): the concurrency runtime (pthread-based).
+    r.push("#include <pthread.h>")
     r.push("")
     # ---- Stage 8-beta: the refcounted runtime (END OF ARENA) ----
     # Every heap object starts with an int64_t refcnt as its FIRST field so
@@ -4284,6 +4701,314 @@ fn runtime_lines() -> list[str] {
     r.push("    if (p) ((int64_t*)p)[0] += 1;")
     r.push("    return p;")
     r.push("}")
+    r.push("")
+    # ---- Stage 16 (v0.27.0-alpha): the concurrency runtime ----
+    # pthread tasks + channels. Design (mirrored exactly by the Python
+    # interpreter's ConcRuntime so differential testing holds):
+    #   - one global mutex + condvar guard ALL channel/task state
+    #   - channels are unbounded MPMC FIFO queues; send never blocks,
+    #     recv/select/join block on the global condvar
+    #   - the deadlock detector fires when every thread that could
+    #     produce work is blocked AND no messages are pending anywhere
+    #   - Chan refcounts are ATOMIC (channels are the one deliberately
+    #     shared object); Task refcounts live under the global mutex.
+    #     Every other type crosses task boundaries by OWNERSHIP TRANSFER
+    #     (spawn/send boundary clones — see gen_spawn_call), so all
+    #     other refcount ops stay single-threaded, keeping the Stage 8
+    #     non-atomic refcount model sound under concurrency.
+    r.push("// ---- Stage 16: the concurrency runtime (tasks + channels) ----")
+    r.push("typedef struct hl_msg {")
+    r.push("    union { int64_t i; double f; void* p; } v;")
+    r.push("    struct hl_msg* next;")
+    r.push("} hl_msg;")
+    r.push("")
+    r.push("typedef struct hl_chan {")
+    r.push("    volatile int64_t refcnt;   // ATOMIC — channels are shared across threads")
+    r.push("    hl_msg* head;              // FIFO queue (guarded by g_rt_mu)")
+    r.push("    hl_msg* tail;")
+    r.push("    void (*elem_release)(void*);  // pointer-payload release (NULL for primitives)")
+    r.push("} hl_chan;")
+    r.push("")
+    r.push("typedef union { int64_t i; double f; void* p; } hl_task_res;")
+    r.push("")
+    r.push("typedef struct hl_task {")
+    r.push("    int64_t refcnt;            // guarded by g_rt_mu")
+    r.push("    pthread_t th;")
+    r.push("    bool done;")
+    r.push("    bool joined;")
+    r.push("    bool freed;")
+    r.push("    hl_task_res res;")
+    r.push("} hl_task;")
+    r.push("")
+    r.push("typedef struct { void (*body)(void*, hl_task*); void* argbox; hl_task* task; } hl_spawn_ctx;")
+    r.push("")
+    r.push("static pthread_mutex_t g_rt_mu = PTHREAD_MUTEX_INITIALIZER;")
+    r.push("static pthread_cond_t  g_rt_cv = PTHREAD_COND_INITIALIZER;")
+    r.push("static int64_t g_rt_tasks   = 0;   // spawned tasks alive (main excluded)")
+    r.push("static int64_t g_rt_blocked = 0;   // threads blocked in recv/select/join (main included)")
+    r.push("static int64_t g_rt_msgs    = 0;   // pending messages across ALL channels")
+    r.push("")
+    r.push("// Deadlock check — call with g_rt_mu HELD, before blocking.")
+    r.push("// If every thread that could produce work is blocked and no")
+    r.push("// messages exist anywhere, no thread can ever make progress.")
+    r.push("// (A thread between two operations counts as alive-not-blocked,")
+    r.push("// so this cannot fire spuriously.)")
+    r.push("static void hl_rt_deadlock_check(void) {")
+    r.push("    int64_t alive = g_rt_tasks + 1;   // +1: the main thread")
+    r.push("    if (g_rt_blocked == alive && g_rt_msgs == 0) {")
+    r.push("        pthread_mutex_unlock(&g_rt_mu);")
+    r.push("        hl_die(\"deadlock: all tasks are blocked on channel operations with no pending messages\");")
+    r.push("    }")
+    r.push("}")
+    r.push("")
+    r.push("static hl_chan* hl_chan_new(void (*elem_release)(void*)) {")
+    r.push("    hl_chan* c = (hl_chan*)malloc(sizeof(hl_chan));")
+    r.push("    if (!c) hl_die(\"out of memory\");")
+    r.push("    c->refcnt = 1;")
+    r.push("    c->head = NULL;")
+    r.push("    c->tail = NULL;")
+    r.push("    c->elem_release = elem_release;")
+    r.push("    return c;")
+    r.push("}")
+    r.push("")
+    r.push("// clone() of a channel SHARES it (atomic refcount + 1) — the whole")
+    r.push("// point of a channel. This is the ONLY clone in the language that")
+    r.push("// does not produce an independent copy.")
+    r.push("static hl_chan* hl_chan_clone(hl_chan* c) {")
+    r.push("    if (c) __atomic_fetch_add(&c->refcnt, 1, __ATOMIC_ACQ_REL);")
+    r.push("    return c;")
+    r.push("}")
+    r.push("")
+    r.push("static void hl_chan_release(void* pv) {")
+    r.push("    hl_chan* c = (hl_chan*)pv;")
+    r.push("    if (!c) return;")
+    r.push("    if (__atomic_fetch_sub(&c->refcnt, 1, __ATOMIC_ACQ_REL) == 1) {")
+    r.push("        // Last reference: drain and free. Safe without g_rt_mu —")
+    r.push("        // refcnt==0 means no binding holds the channel, and every")
+    r.push("        // send/recv requires a live reference.")
+    r.push("        hl_msg* m = c->head;")
+    r.push("        while (m) {")
+    r.push("            hl_msg* nx = m->next;")
+    r.push("            if (c->elem_release && m->v.p) c->elem_release(m->v.p);")
+    r.push("            free(m);")
+    r.push("            m = nx;")
+    r.push("        }")
+    r.push("        free(c);")
+    r.push("    }")
+    r.push("}")
+    r.push("static void hl_cleanup_chan(hl_chan** p) { hl_chan_release(*p); }")
+    r.push("")
+    r.push("static void hl_chan_enqueue(hl_chan* c, hl_msg* m) {")
+    r.push("    pthread_mutex_lock(&g_rt_mu);")
+    r.push("    if (c->tail) { c->tail->next = m; } else { c->head = m; }")
+    r.push("    c->tail = m;")
+    r.push("    m->next = NULL;")
+    r.push("    g_rt_msgs++;")
+    r.push("    pthread_cond_broadcast(&g_rt_cv);")
+    r.push("    pthread_mutex_unlock(&g_rt_mu);")
+    r.push("}")
+    r.push("")
+    r.push("static hl_msg* hl_chan_dequeue(hl_chan* c) {")
+    r.push("    hl_msg* m = c->head;")
+    r.push("    c->head = m->next;")
+    r.push("    if (!c->head) c->tail = NULL;")
+    r.push("    g_rt_msgs--;")
+    r.push("    return m;")
+    r.push("}")
+    r.push("")
+    r.push("static void hl_chan_send_ptr(hl_chan* c, void* v) {")
+    r.push("    hl_msg* m = (hl_msg*)malloc(sizeof(hl_msg));")
+    r.push("    if (!m) hl_die(\"out of memory\");")
+    r.push("    m->v.p = v;")
+    r.push("    hl_chan_enqueue(c, m);")
+    r.push("}")
+    r.push("static void hl_chan_send_i64(hl_chan* c, int64_t v) {")
+    r.push("    hl_msg* m = (hl_msg*)malloc(sizeof(hl_msg));")
+    r.push("    if (!m) hl_die(\"out of memory\");")
+    r.push("    m->v.i = v;")
+    r.push("    hl_chan_enqueue(c, m);")
+    r.push("}")
+    r.push("static void hl_chan_send_f64(hl_chan* c, double v) {")
+    r.push("    hl_msg* m = (hl_msg*)malloc(sizeof(hl_msg));")
+    r.push("    if (!m) hl_die(\"out of memory\");")
+    r.push("    m->v.f = v;")
+    r.push("    hl_chan_enqueue(c, m);")
+    r.push("}")
+    r.push("")
+    r.push("static void hl_chan_wait(hl_chan* c) {")
+    r.push("    while (!c->head) {")
+    r.push("        g_rt_blocked++;")
+    r.push("        hl_rt_deadlock_check();")
+    r.push("        pthread_cond_wait(&g_rt_cv, &g_rt_mu);")
+    r.push("        g_rt_blocked--;")
+    r.push("    }")
+    r.push("}")
+    r.push("")
+    r.push("static void* hl_chan_recv_ptr(hl_chan* c) {")
+    r.push("    pthread_mutex_lock(&g_rt_mu);")
+    r.push("    hl_chan_wait(c);")
+    r.push("    hl_msg* m = hl_chan_dequeue(c);")
+    r.push("    void* v = m->v.p;")
+    r.push("    free(m);")
+    r.push("    pthread_mutex_unlock(&g_rt_mu);")
+    r.push("    return v;")
+    r.push("}")
+    r.push("static int64_t hl_chan_recv_i64(hl_chan* c) {")
+    r.push("    pthread_mutex_lock(&g_rt_mu);")
+    r.push("    hl_chan_wait(c);")
+    r.push("    hl_msg* m = hl_chan_dequeue(c);")
+    r.push("    int64_t v = m->v.i;")
+    r.push("    free(m);")
+    r.push("    pthread_mutex_unlock(&g_rt_mu);")
+    r.push("    return v;")
+    r.push("}")
+    r.push("static double hl_chan_recv_f64(hl_chan* c) {")
+    r.push("    pthread_mutex_lock(&g_rt_mu);")
+    r.push("    hl_chan_wait(c);")
+    r.push("    hl_msg* m = hl_chan_dequeue(c);")
+    r.push("    double v = m->v.f;")
+    r.push("    free(m);")
+    r.push("    pthread_mutex_unlock(&g_rt_mu);")
+    r.push("    return v;")
+    r.push("}")
+    r.push("")
+    r.push("static int64_t hl_chan_len(hl_chan* c) {")
+    r.push("    pthread_mutex_lock(&g_rt_mu);")
+    r.push("    int64_t n = 0;")
+    r.push("    for (hl_msg* m = c->head; m; m = m->next) n++;")
+    r.push("    pthread_mutex_unlock(&g_rt_mu);")
+    r.push("    return n;")
+    r.push("}")
+    r.push("")
+    r.push("// select(chs) — block until any channel has a pending message;")
+    r.push("// return the index (list order) of the first ready one. The list")
+    r.push("// holds raw hl_chan* items (pointer element lists are unboxed).")
+    r.push("static int64_t hl_chan_select(hl_list* chs) {")
+    r.push("    pthread_mutex_lock(&g_rt_mu);")
+    r.push("    if (chs->len == 0) {")
+    r.push("        pthread_mutex_unlock(&g_rt_mu);")
+    r.push("        hl_die(\"select() on empty channel list\");")
+    r.push("    }")
+    r.push("    while (1) {")
+    r.push("        for (int64_t i = 0; i < chs->len; i++) {")
+    r.push("            hl_chan* c = (hl_chan*)chs->items[i];")
+    r.push("            if (c->head) {")
+    r.push("                pthread_mutex_unlock(&g_rt_mu);")
+    r.push("                return i;")
+    r.push("            }")
+    r.push("        }")
+    r.push("        g_rt_blocked++;")
+    r.push("        hl_rt_deadlock_check();")
+    r.push("        pthread_cond_wait(&g_rt_cv, &g_rt_mu);")
+    r.push("        g_rt_blocked--;")
+    r.push("    }")
+    r.push("}")
+    r.push("")
+    r.push("// ---- tasks ----")
+    r.push("static void hl_task_finish(hl_task* t, hl_task_res res) {")
+    r.push("    pthread_mutex_lock(&g_rt_mu);")
+    r.push("    t->res = res;")
+    r.push("    t->done = true;")
+    r.push("    g_rt_tasks--;")
+    r.push("    if (t->refcnt == 0 && !t->freed) { t->freed = true; free(t); }  // abandoned")
+    r.push("    pthread_cond_broadcast(&g_rt_cv);")
+    r.push("    pthread_mutex_unlock(&g_rt_mu);")
+    r.push("}")
+    r.push("")
+    r.push("// Typed finish wrappers (called by the generated trampolines).")
+    r.push("static void hl_task_finish_i64(hl_task* t, int64_t v) {")
+    r.push("    hl_task_res r; r.i = v; hl_task_finish(t, r);")
+    r.push("}")
+    r.push("static void hl_task_finish_f64(hl_task* t, double v) {")
+    r.push("    hl_task_res r; r.f = v; hl_task_finish(t, r);")
+    r.push("}")
+    r.push("static void hl_task_finish_ptr(hl_task* t, void* v) {")
+    r.push("    hl_task_res r; r.p = v; hl_task_finish(t, r);")
+    r.push("}")
+    r.push("")
+    r.push("static void* hl_spawn_entry(void* pv) {")
+    r.push("    hl_spawn_ctx* c = (hl_spawn_ctx*)pv;")
+    r.push("    void (*body)(void*, hl_task*) = c->body;")
+    r.push("    void* argbox = c->argbox;")
+    r.push("    hl_task* t = c->task;")
+    r.push("    free(c);")
+    r.push("    body(argbox, t);")
+    r.push("    return NULL;")
+    r.push("}")
+    r.push("")
+    r.push("static hl_task* hl_spawn(void (*body)(void*, hl_task*), void* argbox) {")
+    r.push("    hl_task* t = (hl_task*)malloc(sizeof(hl_task));")
+    r.push("    if (!t) hl_die(\"out of memory\");")
+    r.push("    t->refcnt = 1;")
+    r.push("    t->done = false;")
+    r.push("    t->joined = false;")
+    r.push("    t->freed = false;")
+    r.push("    t->res.p = NULL;")
+    r.push("    hl_spawn_ctx* c = (hl_spawn_ctx*)malloc(sizeof(hl_spawn_ctx));")
+    r.push("    if (!c) hl_die(\"out of memory\");")
+    r.push("    c->body = body;")
+    r.push("    c->argbox = argbox;")
+    r.push("    c->task = t;")
+    r.push("    pthread_mutex_lock(&g_rt_mu);")
+    r.push("    g_rt_tasks++;   // counted BEFORE the thread starts: no deadlock false-positive window")
+    r.push("    pthread_mutex_unlock(&g_rt_mu);")
+    r.push("    if (pthread_create(&t->th, NULL, hl_spawn_entry, c) != 0) {")
+    r.push("        pthread_mutex_lock(&g_rt_mu);")
+    r.push("        g_rt_tasks--;")
+    r.push("        pthread_mutex_unlock(&g_rt_mu);")
+    r.push("        free(c);")
+    r.push("        free(t);")
+    r.push("        hl_die(\"spawn: cannot create thread\");")
+    r.push("    }")
+    r.push("    return t;")
+    r.push("}")
+    r.push("")
+    r.push("static void hl_task_join_wait(hl_task* t) {")
+    r.push("    pthread_mutex_lock(&g_rt_mu);")
+    r.push("    if (t->joined) {")
+    r.push("        pthread_mutex_unlock(&g_rt_mu);")
+    r.push("        hl_die(\"task already joined\");")
+    r.push("    }")
+    r.push("    while (!t->done) {")
+    r.push("        g_rt_blocked++;")
+    r.push("        hl_rt_deadlock_check();")
+    r.push("        pthread_cond_wait(&g_rt_cv, &g_rt_mu);")
+    r.push("        g_rt_blocked--;")
+    r.push("    }")
+    r.push("    t->joined = true;")
+    r.push("    pthread_mutex_unlock(&g_rt_mu);")
+    r.push("}")
+    r.push("")
+    r.push("static int64_t hl_task_join_i64(hl_task* t) {")
+    r.push("    hl_task_join_wait(t);")
+    r.push("    return t->res.i;")
+    r.push("}")
+    r.push("static double hl_task_join_f64(hl_task* t) {")
+    r.push("    hl_task_join_wait(t);")
+    r.push("    return t->res.f;")
+    r.push("}")
+    r.push("static void* hl_task_join_ptr(hl_task* t) {")
+    r.push("    hl_task_join_wait(t);")
+    r.push("    return t->res.p;")
+    r.push("}")
+    r.push("static void hl_task_join_void(hl_task* t) {")
+    r.push("    hl_task_join_wait(t);")
+    r.push("}")
+    r.push("")
+    r.push("// Task release — called by the spawner's binding cleanup. Under the")
+    r.push("// global mutex, so task refcounts need no atomics. If the thread is")
+    r.push("// still running when the last reference drops, the task is")
+    r.push("// abandoned: hl_task_finish frees it.")
+    r.push("static void hl_task_release(void* pv) {")
+    r.push("    hl_task* t = (hl_task*)pv;")
+    r.push("    if (!t) return;")
+    r.push("    pthread_mutex_lock(&g_rt_mu);")
+    r.push("    if (--t->refcnt == 0) {")
+    r.push("        if (t->done && !t->freed) { t->freed = true; free(t); }")
+    r.push("    }")
+    r.push("    pthread_mutex_unlock(&g_rt_mu);")
+    r.push("}")
+    r.push("static void hl_cleanup_task(hl_task** p) { hl_task_release(*p); }")
     r.push("")
     r.push("static hl_str* hl_str_alloc(int64_t len) {")
     r.push("    // Deep-scan fix (C11): reject negative len before the cast to")
@@ -5059,6 +5784,13 @@ fn c_type(ctx: Ctx, t_in: str) -> str {
         # taint flag carried at runtime) is deferred to Stage 10-beta.
         return c_type(ctx, taint_inner_t(t))
     }
+    # Stage 16 (v0.27.0-alpha): concurrency wrappers.
+    if is_chan_t(t) {
+        return "hl_chan*"
+    }
+    if is_task_t(t) {
+        return "hl_task*"
+    }
     return c_type_name(t) + "*"
 }
 
@@ -5069,6 +5801,10 @@ fn is_ptr_type(t: str) -> bool {
     if is_taint_t(t) {
         # tainted[T] is a pointer iff T is.
         return is_ptr_type(taint_inner_t(t))
+    }
+    if is_chan_t(t) || is_task_t(t) {
+        # Stage 16: channels and task handles are heap objects.
+        return true
     }
     return true
 }
@@ -5288,6 +6024,14 @@ fn release_fn_for(ctx: Ctx, t_in: str) -> str {
     if is_map_t(t) {
         return "hl_map_release"
     }
+    # Stage 16: channel / task release fns (their refcounts are atomic /
+    # mutex-guarded — see the concurrency runtime).
+    if is_chan_t(t) {
+        return "hl_chan_release"
+    }
+    if is_task_t(t) {
+        return "hl_task_release"
+    }
     return "hl_release_" + c_type_name(t)
 }
 
@@ -5302,6 +6046,13 @@ fn cleanup_fn_for(ctx: Ctx, t_in: str) -> str {
     }
     if is_map_t(t) {
         return "hl_cleanup_map"
+    }
+    # Stage 16: channel / task cleanups.
+    if is_chan_t(t) {
+        return "hl_cleanup_chan"
+    }
+    if is_task_t(t) {
+        return "hl_cleanup_task"
     }
     return "hl_cleanup_" + c_type_name(t)
 }
@@ -5428,6 +6179,12 @@ fn call_result_fresh(ctx: Ctx, e: int) -> bool {
     if name == "clone" || name == "take" {
         return true
     }
+    # Stage 16 (v0.27.0-alpha): spawn returns a fresh Task handle;
+    # chan_new returns a fresh channel (refcnt 1, owned by the spawner).
+    if name == "spawn" || name == "chan_new" {
+        return true
+    }
+    # select returns an int (primitive — class irrelevant).
     if name == "str" {
         # str(x) is the identity for str arguments — the result's class
         # follows the argument's. For int/float/bool the codegen calls
@@ -5474,6 +6231,11 @@ fn method_result_fresh(ctx: Ctx, e: int) -> bool {
     }
     if op == "list.pop" {
         # Ownership of the removed element transfers out of the list.
+        return true
+    }
+    # Stage 16 (v0.27.0-alpha): recv transfers message ownership to the
+    # receiver; join transfers the task result to the joiner.
+    if op == "chan.recv" || op == "task.join" {
         return true
     }
     if op == "map.keys" {
@@ -5658,6 +6420,15 @@ fn builtin_arg_borrowed(name: str) -> bool {
     if name == "net_lookup" || name == "proc_exec" {
         return false
     }
+    # Stage 16 (v0.27.0-alpha): spawn TRANSFERS each argument into the
+    # task's argbox (ownership crosses the thread boundary). Without
+    # this, a fresh argument like clone(ch) was hoisted into a temp WITH
+    # a cleanup attribute — the temp's scope-exit release then fought
+    # the task's own release of the same retain (double-free /
+    # use-after-free on the channel).
+    if name == "spawn" {
+        return false
+    }
     # clone, len, int, float, and the rest borrow their arguments.
     return true
 }
@@ -5676,6 +6447,12 @@ fn method_arg_borrowed(op: str, i: int) -> bool {
         # The KEY is borrowed; the DEFAULT is transferred (owned) for
         # pointer-valued maps — but primitive defaults pass by value.
         return i == 0
+    }
+    # Stage 16: ch.send(v) TRANSFERS the message into the channel's
+    # queue (the channel owns it). Hoisting a fresh v into a temp with
+    # a cleanup would release it again after the transfer.
+    if op == "chan.send" {
+        return false
     }
     return true
 }
@@ -6018,6 +6795,11 @@ fn gen_call(ctx: Ctx, e: int) -> str {
     # clones as T — the taint is a compile-time property only.
     if name == "clone" {
         let at: str = strip_taint(inst_t(ctx, ctx.exprs[ctx.exprs[e].args.get(0)].t))
+        # Stage 16: a channel clones by SHARING (atomic refcount + 1) —
+        # no per-instantiation deep-clone helper is registered.
+        if is_chan_t(at) {
+            return "hl_chan_clone(" + args + ")"
+        }
         register_clone(ctx, at)
         if at == "str" {
             return "hl_clone_str(" + args + ")"
@@ -6056,8 +6838,176 @@ fn gen_call(ctx: Ctx, e: int) -> str {
     if name == "proc_exec" {
         return "hl_proc_exec(" + gen_own_arg(ctx, ctx.exprs[e].args.get(0)) + ")"
     }
+    # ----- Stage 16 (v0.27.0-alpha): concurrency builtins -----
+    if name == "chan_new" {
+        # The channel owns its pending messages: elem_release knows how to
+        # release one pointer payload of T (NULL for primitives — they are
+        # stored raw in the message union, not boxed).
+        let mt: str = inst_t(ctx, ctx.exprs[e].t)
+        let mut elem: str = "int"
+        if is_chan_t(mt) {
+            elem = strip_taint(chan_inner_t(mt))
+        }
+        let mut rel: str = "NULL"
+        if elem != "int" && elem != "float" && elem != "bool" {
+            rel = release_fn_for(ctx, elem)
+        }
+        return "hl_chan_new(" + rel + ")"
+    }
+    if name == "spawn" {
+        return gen_spawn_call(ctx, e)
+    }
+    if name == "select" {
+        return "hl_chan_select(" + args + ")"
+    }
     panic("internal codegen error: unknown builtin function " + name)
     return ""
+}
+
+# gen_spawn_call — codegen for spawn(f, a1, ..., aN) after the checker
+# rewrite (mkey = "spawn", mop = target fn key, args = value args).
+#
+# Emits per-site helpers into ctx.spawn_decls (appended to the program):
+#   typedef struct { ... } hl_sa_N_t;          — the argument tuple
+#   static void* hl_mkargs_N(...)              — heap-allocates + fills it
+#   static void hl_tramp_N(void*, hl_task*)    — calls usf_<fn>, stores the
+#                                                 result, frees the tuple
+# and returns the C expression `hl_spawn(hl_tramp_N, <argbox>)`.
+#
+# Boundary ownership rule (the data-race-freedom hardening): every OWNED
+# argument that is not provably private (a str literal, or syntactically
+# clone(...)) is deep-copied at the boundary. A value returned by a user
+# function may alias a binding still live in the spawning thread (HLS
+# assignment is reference semantics), so the defensive clone guarantees
+# no non-atomic refcount is ever touched by two threads. Channels are
+# exempt: their refcount is atomic and their state is guarded by the
+# runtime mutex. Primitives carry no refcount at all.
+fn gen_spawn_call(ctx: Ctx, e: int) -> str {
+    let fname: str = ctx.exprs[e].mop
+    let tf: FnInfo = ctx.fns.get_or(fname, dummy_fn())
+    let n: int = ctx.spawn_n
+    ctx.spawn_n = ctx.spawn_n + 1
+    let nid: str = n.to_str()
+
+    # --- call-site argument expressions (with the boundary rule) ---
+    let cargs: list[str] = []
+    let mut i: int = 0
+    while i < ctx.exprs[e].args.len() {
+        let aidx: int = ctx.exprs[e].args.get(i)
+        let pt: str = tf.ptypes.get(i)
+        let cex: str = gen_expr(ctx, aidx)
+        let argkind: str = ctx.exprs[aidx].kind
+        let is_clone_call: bool = argkind == "call" && ctx.exprs[aidx].mkey == "clone"
+        let mut bound: str = cex
+        if pt == "int" || pt == "float" || pt == "bool" {
+            # Copy primitives — no refcount, share freely.
+            bound = cex
+        } else if is_chan_t(pt) {
+            # Channels cross by sharing (atomic refcount).
+            bound = cex
+        } else if is_clone_call || argkind == "str" {
+            # clone(...) is already a private deep copy; a str literal is
+            # a fresh allocation.
+            bound = cex
+        } else {
+            # str / composites returned by calls or built composites:
+            # defensive deep copy at the boundary.
+            bound = clone_expr_for(ctx, pt, cex)
+        }
+        cargs.push(bound)
+        i = i + 1
+    }
+
+    # --- emit the top-level helpers ---
+    let d: list[str] = []
+    let sname: str = "hl_sa_" + nid + "_t"
+    let cparams: list[str] = []
+    let fields: list[str] = []
+    let mut k: int = 0
+    while k < tf.ptypes.len() {
+        let pct: str = c_type(ctx, tf.ptypes.get(k))
+        cparams.push(pct + " a" + k.to_str())
+        fields.push("    " + pct + " f" + k.to_str() + ";")
+        k = k + 1
+    }
+    if tf.ptypes.len() > 0 {
+        d.push("typedef struct {")
+        d.push(join(fields, "\n"))
+        d.push("} " + sname + ";")
+        d.push("static void* hl_mkargs_" + nid + "(" + join(cparams, ", ") + ") {")
+        d.push("    " + sname + "* p = (" + sname + "*)malloc(sizeof(" + sname + "));")
+        d.push("    if (!p) hl_die(\"out of memory\");")
+        let mut m: int = 0
+        while m < tf.ptypes.len() {
+            d.push("    p->f" + m.to_str() + " = a" + m.to_str() + ";")
+            m = m + 1
+        }
+        d.push("    return (void*)p;")
+        d.push("}")
+    }
+    # The trampoline: call the target with the struct fields (raw — the
+    # checker guaranteed each C value is owned; params own one retain),
+    # free the tuple shell, then publish the result.
+    d.push("static void hl_tramp_" + nid + "(void* pv, hl_task* t) {")
+    let ret: str = tf.ret
+    let mut arglist: list[str] = []
+    let mut q: int = 0
+    while q < tf.ptypes.len() {
+        arglist.push("a->f" + q.to_str())
+        q = q + 1
+    }
+    let callname: str = "usf_" + c_fn_name(fname) + "(" + join(arglist, ", ") + ")"
+    if tf.ptypes.len() == 0 {
+        if ret == "void" {
+            d.push("    (void)pv;")
+            d.push("    " + callname + ";")
+            d.push("    hl_task_finish_ptr(t, NULL);")
+        } else if ret == "int" || ret == "bool" {
+            d.push("    (void)pv;")
+            d.push("    int64_t r = " + callname + ";")
+            d.push("    hl_task_finish_i64(t, r);")
+        } else if ret == "float" {
+            d.push("    (void)pv;")
+            d.push("    double r = " + callname + ";")
+            d.push("    hl_task_finish_f64(t, r);")
+        } else {
+            d.push("    (void)pv;")
+            d.push("    void* r = (void*)" + callname + ";")
+            d.push("    hl_task_finish_ptr(t, r);")
+        }
+    } else {
+        d.push("    " + sname + "* a = (" + sname + "*)pv;")
+        if ret == "void" {
+            d.push("    " + callname + ";")
+            d.push("    free(a);")
+            d.push("    hl_task_finish_ptr(t, NULL);")
+        } else if ret == "int" || ret == "bool" {
+            d.push("    int64_t r = " + callname + ";")
+            d.push("    free(a);")
+            d.push("    hl_task_finish_i64(t, r);")
+        } else if ret == "float" {
+            d.push("    double r = " + callname + ";")
+            d.push("    free(a);")
+            d.push("    hl_task_finish_f64(t, r);")
+        } else {
+            d.push("    void* r = (void*)" + callname + ";")
+            d.push("    free(a);")
+            d.push("    hl_task_finish_ptr(t, r);")
+        }
+    }
+    d.push("}")
+    d.push("")
+    let mut di: int = 0
+    while di < d.len() {
+        ctx.spawn_decls.push(d.get(di))
+        di = di + 1
+    }
+
+    # --- the call-site expression ---
+    if tf.ptypes.len() == 0 {
+        return "hl_spawn(hl_tramp_" + nid + ", NULL)"
+    }
+    return "hl_spawn(hl_tramp_" + nid + ", hl_mkargs_" + nid + "(" + join(cargs, ", ") + "))"
 }
 
 fn gen_method(ctx: Ctx, e: int) -> str {
@@ -6217,6 +7167,79 @@ fn gen_method(ctx: Ctx, e: int) -> str {
     }
     if op == "map.keys" {
         return "hl_map_keys(" + t0 + ")"
+    }
+    # ----- Stage 16 (v0.27.0-alpha): Chan / Task methods -----
+    if op == "chan.send" {
+        # Boundary ownership rule (same as spawn): an owned message that
+        # is not provably private (a str literal, or syntactically
+        # clone(...)) is deep-copied at the boundary — a value returned by
+        # a user fn may alias a binding still live in the sender's
+        # thread, and no refcount may be touched by two threads.
+        let mt: str = inst_t(ctx, ctx.exprs[ctx.exprs[e].left].t)
+        let celem: str = chan_inner_t(mt)
+        let vidx: int = ctx.exprs[e].args.get(0)
+        let cex: str = gen_expr(ctx, vidx)
+        let argkind: str = ctx.exprs[vidx].kind
+        let is_clone_call: bool = argkind == "call" && ctx.exprs[vidx].mkey == "clone"
+        if celem == "int" {
+            return "hl_chan_send_i64(" + t0 + ", " + cex + ")"
+        }
+        if celem == "float" {
+            return "hl_chan_send_f64(" + t0 + ", " + cex + ")"
+        }
+        if celem == "bool" {
+            return "hl_chan_send_i64(" + t0 + ", " + cex + " ? 1 : 0)"
+        }
+        # Channels cross by sharing (atomic refcount); a clone(...) result
+        # or a str literal is already private.
+        if is_chan_t(celem) || is_clone_call || argkind == "str" {
+            return "hl_chan_send_ptr(" + t0 + ", (void*)" + cex + ")"
+        }
+        if celem == "str" {
+            return "hl_chan_send_ptr(" + t0 + ", (void*)hl_clone_str(" + cex + "))"
+        }
+        # Composites / other owned types: defensive deep copy.
+        let ct: str = strip_taint(celem)
+        register_clone(ctx, ct)
+        return "hl_chan_send_ptr(" + t0 + ", (void*)" + clone_expr_for(ctx, ct, cex) + ")"
+    }
+    if op == "chan.recv" {
+        # Message ownership transfers to the receiver (fresh result).
+        let mt: str = inst_t(ctx, ctx.exprs[ctx.exprs[e].left].t)
+        let celem: str = chan_inner_t(mt)
+        if celem == "int" {
+            return "hl_chan_recv_i64(" + t0 + ")"
+        }
+        if celem == "float" {
+            return "hl_chan_recv_f64(" + t0 + ")"
+        }
+        if celem == "bool" {
+            return "(hl_chan_recv_i64(" + t0 + ") != 0)"
+        }
+        return "((" + c_type(ctx, celem) + ")hl_chan_recv_ptr(" + t0 + "))"
+    }
+    if op == "chan.len" {
+        return "hl_chan_len(" + t0 + ")"
+    }
+    if op == "task.join" {
+        # Result ownership transfers to the joiner (fresh result). The
+        # mutex-ordered done-signal guarantees the task's own releases
+        # happen-before the joiner touches the result.
+        let mt: str = inst_t(ctx, ctx.exprs[ctx.exprs[e].left].t)
+        let rt: str = task_inner_t(mt)
+        if rt == "int" {
+            return "hl_task_join_i64(" + t0 + ")"
+        }
+        if rt == "float" {
+            return "hl_task_join_f64(" + t0 + ")"
+        }
+        if rt == "bool" {
+            return "(hl_task_join_i64(" + t0 + ") != 0)"
+        }
+        if rt == "void" {
+            return "hl_task_join_void(" + t0 + ")"
+        }
+        return "((" + c_type(ctx, rt) + ")hl_task_join_ptr(" + t0 + "))"
     }
     panic("internal codegen error: unknown method " + op)
     return ""
@@ -7392,6 +8415,11 @@ fn clone_expr_for(ctx: Ctx, t: str, cexpr: str) -> str {
     if tt == "str" {
         return "hl_clone_str(" + cexpr + ")"
     }
+    # Stage 16: a channel inside a composite clones by SHARING (atomic
+    # refcount) — the runtime helper, not a per-instantiation generator.
+    if is_chan_t(tt) {
+        return "hl_chan_clone(" + cexpr + ")"
+    }
     return "hl_clone_" + c_type_name(tt) + "(" + cexpr + ")"
 }
 
@@ -7400,6 +8428,11 @@ fn clone_expr_for(ctx: Ctx, t: str, cexpr: str) -> str {
 fn register_clone(ctx: Ctx, t: str) -> void {
     let tt: str = strip_taint(t)
     if tt == "int" || tt == "float" || tt == "bool" || tt == "str" {
+        return
+    }
+    # Stage 16: channels clone via the runtime helper hl_chan_clone (no
+    # per-instantiation generator); Task cannot be cloned at all.
+    if is_chan_t(tt) || is_task_t(tt) {
         return
     }
     if list_has(ctx.clone_insts, t) {
@@ -7679,6 +8712,8 @@ fn gen_program(ctx: Ctx) -> list[str] {
     ctx.out = []
     ctx.clone_insts = []
     ctx.tmp = 0
+    ctx.spawn_decls = []
+    ctx.spawn_n = 0
     let mut i: int = 0
     while i < ctx.fn_order.len() {
         let key: str = ctx.fn_order.get(i)
@@ -7762,6 +8797,10 @@ fn gen_program(ctx: Ctx) -> list[str] {
     # 2e. Stage 8-beta: clone() per-instantiation helper bodies.
     concat_lines(final, gen_clone_bodies(ctx))
     concat_lines(final, gen_proto_lines(ctx))
+    # 2e-bis. Stage 16: spawn-site helpers (arg structs + trampolines),
+    # collected while the fn bodies above were generated. Emitted AFTER
+    # the fn prototypes so the trampolines can call any usf_ function.
+    concat_lines(final, ctx.spawn_decls)
     concat_lines(final, bodies)
     concat_lines(final, fn_inst_bodies)
     # 3. main wrapper

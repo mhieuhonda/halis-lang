@@ -8,6 +8,105 @@ Releases on `main` follow the 20-stage roadmap (see [ROADMAP.md](ROADMAP.md)).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
+## [v0.27.0-alpha] — Stage 16 release: Concurrency & async (data-race freedom)
+
+> **Stage 16 is COMPLETE.** Halis now leverages multiple cores with
+> data-race freedom **proven by the type system**: no value may be
+> simultaneously owned by two threads. `spawn(f, args)` starts tasks,
+> `Chan[T]` channels are the sharing primitive, `select` multiplexes,
+> and a new `Conc` effect keeps every non-`uses` function pure AND
+> deterministic. The Stage 16 acceptance criterion — *a program sharing
+> a variable with a task outside a channel is a compile error* — is
+> enforced by the checker in both implementations (14 new fail tests).
+> The interpreter uses real Python threads; the native backend a
+> pthread runtime with atomic channel refcounts, boundary ownership
+> hardening, and built-in deadlock detection. **426/426 tests PASS**;
+> the bootstrap is still deterministic. A deep-scan-9 pre-sweep also
+> fixed a **pre-existing heap-use-after-free** in the native compiler.
+
+### Stage 16 release — concurrency & async
+
+- **Types & builtins**: `Chan[T]` (unbounded MPMC FIFO, blocking recv),
+  `Task[R]` (join handle), `chan_new()`, `spawn(f, a1..aN) -> Task[R]`,
+  `select(list[Chan[T]]) -> int`; methods `ch.send(v)` / `ch.recv()` /
+  `ch.len()` / `t.join()`. `Task[void]` allowed (join returns nothing).
+- **`Conc` effect** (independent of the IO family): spawn / join /
+  send / recv / select / chan_new all carry it. Builtin *methods* carry
+  effects for the first time — the call-graph fixpoint treats
+  `b:chan.send` nodes exactly like builtin functions.
+- **Send rule set** (the Send/Sync equivalent, on the Stage 8 ownership
+  system): primitives + str Send; `Chan[T]` Send iff T Send;
+  **`Task[R]` NOT Send** (first non-Send type); composites Send iff all
+  fields/payloads Send (coinductive for recursive types like `Tree`).
+- **Data-race freedom (acceptance)**: `spawn`/`send` arguments of owned
+  type must be fresh expressions — bare variable / field / index reads
+  are **compile errors** pointing at `clone(x)` / `take(x)`.
+- **Boundary ownership hardening** (codegen): owned values that are not
+  provably private (a `clone(...)` result or a str literal) are
+  deep-copied at the spawn/send boundary, so a value returned by a user
+  fn (which may alias a live binding — HLS assignment is reference
+  semantics) can never put one non-atomic refcount under two threads.
+  Channels alone use atomic refcounts; task refcounts live under the
+  runtime mutex; everything else stays single-threaded by construction.
+- **Native runtime** (`hlc.hls` codegen): `#include <pthread.h>` + a
+  channel/task runtime with one global mutex + condvar, per-site spawn
+  trampolines (`hl_sa_N_t` arg structs), typed finish/join accessors,
+  and **deadlock detection** (all threads blocked + zero pending
+  messages → `panic: deadlock: ...`, exit 101 — mirrors the
+  interpreter's detector exactly, verified differentially).
+- **Interpreter**: real Python threads (daemon tasks — a blocked task
+  no longer hangs interpreter exit), same global-lock design, same
+  deadlock detector; panic/exit in any task halts the process
+  (safe-halt).
+- **Safe-halt semantics**: `panic`/`exit()` inside a task terminates
+  the whole process (tasks share the process fate).
+- **Hoisting soundness fixes**: `spawn` and `chan.send` are marked as
+  ownership-TRANSFERRING in `builtin_arg_borrowed` /
+  `method_arg_borrowed` — without this, fresh arguments like
+  `clone(ch)` were hoisted into temps with cleanups that double-released
+  the transferred retain (heap corruption in any program spawning with
+  channel arguments).
+- **LLVM / HLIR**: programs using Chan/Task/spawn are rejected with a
+  clean error by `--emit llvm` / `--emit ir` (Stage 16 ships in the C
+  backend + interpreter; documented in SPEC §25.7).
+- **Actor model**: `examples/actor_demo.hls` (a KV-store actor with
+  enum-typed mailbox protocol) and `tests/ok/feat_conc_actor.hls`.
+- **Benchmark**: `benchmarks/conc_bench.hls` — web-server shape (N
+  worker tasks × request stream through channels); prints wall-clock
+  per pool size and the speedup (measured 1.5× on the 2-core CI
+  sandbox — the pattern is core-count-bound, not lock-bound).
+- **Examples**: `conc_demo.hls`, `actor_demo.hls`, `par_scan.hls`
+  (fan-out / fan-in). **Tests**: 7 new ok tests
+  (`feat_conc_{spawn,chan,select,actor,send_struct,take_clone,
+  deadlock_detect}`) + 14 new fail tests.
+
+### Deep-scan-9 (pre-release sweep) — bug fixes
+
+- **`src/hlc.hls` — CRITICAL (pre-existing): heap-use-after-free in the
+  native compiler.** `check_match` and `check_qmark` wrote the
+  expression's `.t` field *internally* while their caller
+  (`check_expr`) assigned the same field with the returned value — the
+  generated C then released the OLD field value **twice** (field
+  assignment lowers to `release old, store new`). Any match/qmark
+  expression whose node carried a heap `t` string corrupted the native
+  compiler's heap; `feat_clone_deep.hls` reliably crashed it with
+  `malloc(): unaligned fastbin chunk detected`. The crash was never
+  caught because the test suite only ran the *interpreted* compiler on
+  the ok/ programs — see the next item. Fix: the caller owns the
+  `.t` assignment; the internal writes were removed.
+- **`tests/run_tests.sh` — test gap closed**: new section 4a compiles
+  and gcc-builds **every** `tests/ok/*.hls` program with the *native*
+  `hlc` binary (section 3 used the interpreted Stage-0 only, which is
+  how the UAF above hid for multiple releases).
+- **`boot/interp.py`** — spawned tasks are now **daemon** threads: a
+  task still blocked on a channel when `main` returns no longer hangs
+  the interpreter at shutdown (Python waits for non-daemon threads);
+  this mirrors the native semantics (process exit kills threads).
+- **`boot/interp.py`** — `deadlock_check` no longer manually unlocks
+  the condition lock before raising (the `with` block releases it on
+  unwind; the manual unlock would have raised
+  `RuntimeError: release unlocked lock`).
+
 ## [v0.26.0-alpha] — Deep-scan-8: Stage 14/15 perfection pass
 
 > **Stages 14 + 15 are PERFECTED.** A deep-scan-8 sweep found and fixed

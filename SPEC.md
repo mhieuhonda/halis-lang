@@ -1,12 +1,14 @@
-# Halis language specification (HLS) — v0.20.0-alpha
+# Halis language specification (HLS) — v0.27.0-alpha
 
 > **Halis** is a high-security, native-compiled programming language
 > designed around the philosophy: **safety by default, explicitness for
-> auditability, performance via AOT compilation**. Version v0.20.0-alpha
-> **completes Stage 9**: the `Net`, `Rand`, and `Proc` effects are now
-> active with five new builtins (`net_lookup`, `rand_int`, `rand_float`,
-> `rand_seed`, `proc_exec`). The shared 64-bit LCG makes random sequences
-> deterministic across the Stage-0 interpreter and the native binary.
+> auditability, performance via AOT compilation**. Version v0.27.0-alpha
+> **completes Stage 16**: concurrency with data-race freedom — `spawn`
+> tasks, `Chan[T]` channels, `select`, the `Conc` effect, the Send rule
+> set, and a runtime deadlock detector (see §25). Version v0.20.0-alpha
+> completed Stage 9: the `Net`, `Rand`, and `Proc` effects with five
+> builtins (`net_lookup`, `rand_int`, `rand_float`, `rand_seed`,
+> `proc_exec`) and the deterministic shared 64-bit LCG.
 > Version v0.15.0-alpha added **Stage 15-gamma: Safe C FFI** — a new
 > `extern "C" { ... }` block declares external C functions, with the
 > interpreter dispatching via ctypes. Version v0.12.0-alpha added
@@ -1397,3 +1399,120 @@ maps C types to HLS types, emits an `extern "C" { ... }` block with
 - Re-implement `hlbindgen` in HLS itself.
 
 
+
+---
+
+## 25. Concurrency & async (Stage 16 — v0.27.0-alpha)
+
+Stage 16 adds multi-core parallelism **with data-race freedom proven by
+the type system**. The design principle: *no value may be simultaneously
+owned by two threads*. Ownership crosses task boundaries only by
+transfer; sharing happens only through channels (the one deliberately
+shared, internally synchronized object).
+
+### 25.1. Types & builtins
+
+| Construct | Type | Effect | Meaning |
+|-----------|------|--------|---------|
+| `chan_new() -> Chan[T]` | builtin | Conc | a fresh, empty channel (contextual typing like `map_new`) |
+| `spawn(f, a1..aN) -> Task[R]` | builtin | Conc | start a task running `f(a1..aN)`; `R = f`'s return type (`Task[void]` allowed) |
+| `select(chs: list[Chan[T]]) -> int` | builtin | Conc | block until any channel is ready; return its index (list order) |
+| `ch.send(v: T) -> void` | method | Conc | enqueue `v` (FIFO; send never blocks — unbounded MPMC) |
+| `ch.recv() -> T` | method | Conc | block while empty; transfers the message's ownership to the receiver |
+| `ch.len() -> int` | method | Conc | pending message count |
+| `t.join() -> R` | method | Conc | wait for the task; return its result; **join exactly once** (a second join is a runtime panic) |
+
+`Conc` is a NEW effect, independent of the IO family — a program must
+declare `uses Conc` explicitly. Every function without a `uses` clause
+stays pure AND **deterministic** (spawn introduces observable scheduling
+nondeterminism, which is exactly why it is an effect).
+
+### 25.2. The Send rule set (the Send/Sync equivalent)
+
+A type is **Send** iff its values may cross a task boundary:
+
+- `int`, `float`, `bool`, `str`: Send.
+- `Chan[T]`: Send iff T is Send (channels are the sharing primitive).
+- **`Task[R]`: NOT Send** — a join handle must stay with its spawner.
+- `list[T]` / `map[str, T]` / `tainted[T]`: Send iff the element is.
+- struct/enum: Send iff every field/payload type is Send (recursive
+  types are handled coinductively).
+
+Passing a non-Send value to `spawn`/`send`/`select` is a compile error.
+
+### 25.3. Data-race freedom (the Stage 16 acceptance criterion)
+
+**A program that tries to share a variable with a task outside a
+channel is a COMPILE ERROR.** Concretely, every `spawn(...)` argument
+and every `ch.send(...)` value of an owned type must be a *fresh*
+expression — a literal, a call result, a composite literal, `clone(x)`
+or `take(x)`. A bare variable / field / index read is rejected:
+
+```hls
+let s: str = "hello"
+spawn(worker, s)        # compile error: cannot share variable 's'
+spawn(worker, clone(s)) # OK — the task gets a private deep copy
+spawn(worker, take(s))  # OK — ownership transfers; s is moved
+```
+
+At runtime the boundary hardens this further: owned values that are not
+provably private (`clone(...)` results, str literals) are **deep-copied
+at the task/channel boundary**, because a value returned by a user
+function may alias a binding still live in the sender's thread (HLS
+assignment is reference semantics). The result: no non-atomic refcount
+is ever touched by two threads.
+
+The refcount model under concurrency:
+
+| Object | Refcount discipline |
+|--------|--------------------|
+| `Chan[T]` | **atomic** (channels are shared on purpose — `clone(ch)` shares with +1) |
+| `Task[R]` | guarded by the runtime mutex |
+| everything else | non-atomic, **single-threaded by construction** (ownership transfer only) |
+
+### 25.4. Runtime semantics
+
+- One global mutex + condition variable guard all channel/task state
+  (simple, correct; sharding is future work).
+- **Deadlock detection**: when every thread that could produce work is
+  blocked (in `recv`/`select`/`join`) AND no messages are pending
+  anywhere, the program can never make progress — the runtime halts
+  with `panic: deadlock: ...` (exit 101) instead of hanging. A thread
+  between two operations counts as alive, so the detector cannot fire
+  spuriously.
+- **Safe-halt**: a `panic` or `exit()` in ANY task halts the whole
+  process (tasks share the process fate).
+- `spawn` restrictions (v0.27.0-alpha): the target must be a
+  non-generic, non-method, non-extern function. Generic targets: wrap
+  them in a non-generic function. (No closures exist in HLS, so `spawn`
+  takes a function name plus explicit arguments — there is no implicit
+  capture, which is precisely what makes the sharing rule enforceable.)
+- Interpreter ↔ native parity: the interpreter uses real Python threads
+  with the same global-lock design and the same deadlock detector, so
+  differential testing holds (all `feat_conc_*` tests compare outputs).
+
+### 25.5. Determinism guidance
+
+A channel is FIFO and MPMC. Programs are deterministic when each
+channel has a single logical consumer (request/reply pairs, actor
+mailboxes, fan-in of results in order). Multiple competing receivers on
+one channel introduce message-grab races — legal, but nondeterministic
+(and hence un-testable differentially).
+
+### 25.6. Actor model
+
+The idiomatic shared-state pattern: a task + a mailbox channel + an
+enum-typed message protocol dispatched with `match` (see
+`examples/actor_demo.hls`, `tests/ok/feat_conc_actor.hls`). The actor
+owns its state exclusively; the mailbox is the only interface. No
+locks exist in the language.
+
+### 25.7. Deliberate scope decisions (v0.27.0-alpha)
+
+| Deferred | Rationale |
+|----------|-----------|
+| `async`/`await` syntax | without closures, async/await is `spawn`+`join` under another name; the explicit form exists today. Deferred until closures (post-v1.0 discussion). |
+| Work-stealing scheduler | `spawn` = one OS thread per task (pthread); scaling is demonstrated by `benchmarks/conc_bench.hls`. A user-level scheduler over the channel primitives is the natural Stage 18+ refinement. |
+| Bounded channels | channels are unbounded; send never blocks (deadlock detection covers blocked receivers). Capacity limits: future stdlib. |
+| LLVM backend / HLIR | `--emit llvm` / `--emit ir` reject concurrency programs with a clean error (the C backend and interpreter are the Stage 16 deliverables). |
+| Spawn of generic fns | wrap in a non-generic fn (clear error message). |

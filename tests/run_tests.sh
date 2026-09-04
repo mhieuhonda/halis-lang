@@ -58,7 +58,7 @@ for f in tests/ok/*.hls; do
         bad "$name (hlc compile failed)"
         continue
     fi
-    if ! gcc -O2 -o "$TMP/$name.bin" "$TMP/$name.c" -lm 2>"$TMP/$name.gcc"; then
+    if ! gcc -O2 -o "$TMP/$name.bin" "$TMP/$name.c" -lm -pthread 2>"$TMP/$name.gcc"; then
         bad "$name (gcc error)"
         continue
     fi
@@ -77,7 +77,7 @@ echo "=== 3b. Stage 8-beta memory-stress (native RSS must stay flat) ==="
 # shape; under the old arena model it would exhaust a 256 MB address
 # space, with refcounting it completes with delta == 0 pages.
 if python3 boot/boot.py src/hlc.hls tests/memcheck/stress_leak.hls "$TMP/stress.c" >/dev/null 2>&1 \
-    && gcc -O2 -o "$TMP/stress" "$TMP/stress.c" -lm 2>/dev/null; then
+    && gcc -O2 -o "$TMP/stress" "$TMP/stress.c" -lm -pthread 2>/dev/null; then
     stress_out=$(bash -c "ulimit -v 262144; \"$TMP/stress\"" 2>/dev/null); stress_rc=$?
     if [ $stress_rc -eq 0 ]; then
         delta=$(echo "$stress_out" | grep "rss_delta_pages=" | cut -d= -f2)
@@ -96,12 +96,39 @@ fi
 echo "=== 4. Differential test for examples (with data file) ==="
 python3 boot/boot.py examples/wordcount.hls examples/data.txt > "$TMP/wc_interp.txt" 2>/dev/null
 python3 boot/boot.py src/hlc.hls examples/wordcount.hls "$TMP/wc.c" >/dev/null 2>&1
-gcc -O2 -o "$TMP/wc.bin" "$TMP/wc.c" -lm 2>/dev/null
+gcc -O2 -o "$TMP/wc.bin" "$TMP/wc.c" -lm -pthread 2>/dev/null
 "$TMP/wc.bin" examples/data.txt > "$TMP/wc_nat.txt" 2>/dev/null
 if diff -q "$TMP/wc_interp.txt" "$TMP/wc_nat.txt" >/dev/null 2>&1; then
     ok "wordcount (native vs interpreter)"
 else
     bad "wordcount"
+fi
+
+echo "=== 4a. Stage 16: NATIVE hlc compiles every ok program ==="
+# Deep-scan-9 test-gap fix: section 3 above compiles the ok/ programs
+# with the INTERPRETED compiler (Stage-0). The NATIVE binary was only
+# exercised on hlc.hls itself + fibonacci — which let a heap-use-after-
+# free in the native codegen (double field-release for match/qmark .t)
+# hide until feat_clone_deep crashed it. From now on, the native
+# compiler must compile (and, where possible, run) EVERY ok program.
+if [ ! -x "$TMP/hlc1" ]; then
+    python3 boot/boot.py src/hlc.hls src/hlc.hls "$TMP/hlc_nat.c" >/dev/null 2>&1
+    gcc -O2 -o "$TMP/hlc1" "$TMP/hlc_nat.c" -lm -pthread 2>/dev/null
+fi
+nat_ok=0
+nat_bad=0
+for f in tests/ok/*.hls; do
+    name=$(basename "$f" .hls)
+    if "$TMP/hlc1" "$f" "$TMP/$name.nat.c" >/dev/null 2>&1 \
+            && gcc -O2 -o "$TMP/$name.nat.bin" "$TMP/$name.nat.c" -lm -pthread 2>/dev/null; then
+        nat_ok=$((nat_ok+1))
+    else
+        nat_bad=$((nat_bad+1))
+        bad "native hlc compile: $name"
+    fi
+done
+if [ $nat_bad -eq 0 ]; then
+    ok "native hlc compiles + gcc-builds all $nat_ok ok programs"
 fi
 
 echo "=== 4b. Stage 14 release: tooling (hlfmt idempotent + hllint cfaware) ==="
@@ -148,7 +175,7 @@ else
     bad "hlc.hls self-compiles via Stage-0"
 fi
 echo "  [5.2] Compile the first C pass into native hlc..."
-if gcc -O2 -o "$TMP/hlc1" "$TMP/hlc_s1.c" -lm 2>/dev/null; then
+if gcc -O2 -o "$TMP/hlc1" "$TMP/hlc_s1.c" -lm -pthread 2>/dev/null; then
     ok "gcc compiles native hlc"
 else
     bad "gcc compiles native hlc"

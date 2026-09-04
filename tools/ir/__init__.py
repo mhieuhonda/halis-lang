@@ -517,4 +517,96 @@ def dump_module(mod):
 
 def build_module(program):
     """Convenience: build an HLIRModule from a parsed program."""
+    # Stage 16 (v0.27.0-alpha): the HLIR does not model concurrency yet —
+    # reject programs that use Chan/Task types or the concurrency builtins
+    # with a clean error instead of a downstream crash.
+    _reject_concurrency(program, "--emit ir")
     return IRBuilder(program).build()
+
+
+_CONC_BUILTINS = {"chan_new", "spawn", "select"}
+
+
+def _uses_concurrency(program):
+    """True if the program mentions Chan[...]/Task[...] types or calls a
+    concurrency builtin."""
+    def type_uses(t):
+        if not isinstance(t, str):
+            return False
+        if t.startswith("Chan[") or t.startswith("Task["):
+            return True
+        if t.startswith("list[") or t.startswith("tainted["):
+            return type_uses(t[t.index("[") + 1:-1])
+        if t.startswith("map[str, "):
+            return type_uses(t[9:-1])
+        return False
+
+    def expr_uses(e):
+        if not isinstance(e, dict):
+            return False
+        if e.get("k") == "call" and e.get("name") in _CONC_BUILTINS:
+            return True
+        if e.get("k") == "method":
+            rm = e.get("rm")
+            if isinstance(rm, tuple) and rm[0] == "builtin" \
+                    and (rm[1].startswith("chan.") or rm[1] == "task.join"):
+                return True
+        for key in ("value", "target", "cond", "iter", "e", "scrut"):
+            if expr_uses(e.get(key)):
+                return True
+        if isinstance(e.get("args"), list):
+            for a in e["args"]:
+                if expr_uses(a):
+                    return True
+        if isinstance(e.get("l"), dict) and expr_uses(e["l"]):
+            return True
+        if isinstance(e.get("r"), dict) and expr_uses(e["r"]):
+            return True
+        if isinstance(e.get("arms"), list):
+            for arm in e["arms"]:
+                if expr_uses(arm.get("body")):
+                    return True
+        return False
+
+    for st in program["structs"].values():
+        for _, ftype, fdefault in st["fields"]:
+            if type_uses(ftype) or expr_uses(fdefault):
+                return True
+    for en in program.get("enums", {}).values():
+        for _, payloads in en["variants"]:
+            for pt in payloads:
+                if type_uses(pt):
+                    return True
+    for fn in program["fns"].values():
+        for _, pt, _ in fn["params"]:
+            if type_uses(pt):
+                return True
+        if type_uses(fn["ret"]):
+            return True
+
+    for fn in program["fns"].values():
+        for s in fn["body"]:
+            # walk statements (incl. nested bodies)
+            stack = [s]
+            while stack:
+                stx = stack.pop()
+                if not isinstance(stx, dict):
+                    continue
+                if expr_uses(stx.get("value")) or expr_uses(stx.get("e")) \
+                        or expr_uses(stx.get("cond")) or expr_uses(stx.get("iter")):
+                    return True
+                for bkey in ("body", "then", "els"):
+                    if isinstance(stx.get(bkey), list):
+                        stack.extend(stx[bkey])
+                if expr_uses(stx.get("target")):
+                    return True
+    return False
+
+
+def _reject_concurrency(program, mode):
+    from boot.lexer import HLError
+    if _uses_concurrency(program):
+        raise HLError(
+            "concurrency (Chan[T] / Task[R] / spawn / chan_new / select) is "
+            "not yet supported by the %s path — Stage 16 ships in the C "
+            "backend and the interpreter only" % mode, 0, 0)

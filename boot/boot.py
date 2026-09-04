@@ -343,12 +343,14 @@ def print_audit(program, checker):
           % (n_total, n_pure, n_eff))
     # Active vs reserved effects table.
     print("")
-    print("  Active effects:    IO, Fs, Clock, Args, Exit, Net, Rand, Proc")
+    print("  Active effects:    IO, Fs, Clock, Args, Exit, Net, Rand, Proc, Conc")
     print("  `uses IO` expands to: {IO, Fs, Clock, Args, Exit}")
     print("  Net, Rand, Proc are independent effects (not part of the IO")
     print("  family) — declare them explicitly to use net_lookup /")
     print("  rand_int / rand_float / rand_seed / proc_exec builtins.")
-    print("  No reserved effects (as of v0.20.0-alpha — Stage 9 release).")
+    print("  Conc (Stage 16, v0.27.0-alpha) is the concurrency effect —")
+    print("  declare `uses Conc` for spawn / join / channels / select.")
+    print("  No reserved effects (as of v0.27.0-alpha).")
     # Stage 10-alpha: taint sources / sinks / unwraps summary.
     # Sources: builtins that introduce tainted values.
     # Sinks: builtins that reject tainted values at the checker.

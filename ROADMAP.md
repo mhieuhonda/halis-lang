@@ -30,7 +30,7 @@ remains green.
 | 13 | Package manager `hls-pkg` | ✅ | (done in v0.23.0-alpha) |
 | 14 | Tooling: LSP, formatter, linter | ✅ | (release v0.24.0-alpha) |
 | 15 | Safe C FFI | ✅ | (release v0.25.0-alpha) |
-| 16 | Concurrency & async (data-race freedom) | ⬜ | 12–16 weeks |
+| 16 | Concurrency & async (data-race freedom) | ✅ | (release v0.27.0-alpha) |
 | 17 | Formal verification & contracts | ⬜ | 10–14 weeks |
 | 18 | Testing ecosystem & fuzzing | ⬜ | 4–6 weeks |
 | 19 | Documentation, book, playground | ⬜ | 6 weeks |
@@ -1109,9 +1109,43 @@ ABI-compatibility header emitted; ownership-across-boundary check
 rejects tainted values passed to extern fns; libcurl demo; minimal
 self-hosted hlbindgen.
 
-## STAGE 16 — Concurrency & async (data-race freedom) ⬜
+## STAGE 16 — Concurrency & async (data-race freedom) ✅ (alpha v0.27.0-alpha)
 
 **Goal:** leverage multi-core without data races — through the type system.
+
+**Shipped (v0.27.0-alpha):**
+- **Send rule set** layered on the Stage 8 ownership system: a type is
+  Send iff its values may cross a task boundary. `Task[R]` is the first
+  non-Send type (a join handle stays with its spawner); composites are
+  Send iff every field/payload is (coinductive for recursive types).
+- **`spawn(f, args...) -> Task[R]`** — one OS thread per task
+  (pthread native / Python-thread interpreter), join handle with
+  exactly-once `join()`.
+- **Message-passing channels as the primary primitive**: `Chan[T]`
+  (unbounded MPMC FIFO, blocking recv, `chan_new`/`send`/`recv`/`len`),
+  plus **`select(list[Chan[T]])`**.
+- **New `Conc` effect** (independent of the IO family): every task /
+  channel operation carries it — functions without `uses` remain pure
+  AND deterministic.
+- **Actor model** demonstrated end-to-end (enum-typed mailboxes,
+  `examples/actor_demo.hls`, `tests/ok/feat_conc_actor.hls`).
+- **Acceptance criteria met:** a program sharing a variable with a task
+  outside a channel is a COMPILE error (`fail_spawn_shared.hls`,
+  `fail_send_shared.hls` — 14 new fail tests); the concurrency
+  benchmark (`benchmarks/conc_bench.hls`, web-server shape: N workers ×
+  request stream) scales with cores (measured 1.5× on this 2-core CI
+  sandbox; the pattern is core-count-bound, not lock-bound).
+
+**Documented deviations (per the conflict-resolution principles):**
+- `async`/`await` syntax + a user-level work-stealing scheduler are
+  deferred: without closures, async/await is spawn/join under another
+  name — the explicit form ships today (see SPEC §25.7). `spawn` is
+  OS-thread-per-task, which genuinely parallelises on multi-core.
+- Deepened hardening beyond the original plan: every owned value that
+  is not provably private is deep-copied at the spawn/send boundary, so
+  the Stage 8 non-atomic refcounts stay sound under concurrency
+  (channels alone use atomic refcounts). Deadlock detection is built
+  in (all-blocked + zero pending messages → clean panic, exit 101).
 
 **Work:**
 - `Send`/`Sync` equivalent traits (types that can move between cores / share
