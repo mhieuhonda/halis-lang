@@ -1318,7 +1318,7 @@ name = "mylib"
 version = "0.1.0"
 
 [dependencies]
-std.str = { git = "https://github.com/.../hieu-louis-lang.git", path = "std/str.hls" }
+std.str = { git = "https://github.com/.../halis-lang.git", path = "std/str.hls" }
 
 [effects]
 allowed = []   # empty = pure library

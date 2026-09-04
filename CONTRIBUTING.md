@@ -7,10 +7,11 @@ how to submit changes.
 ## Quick start
 
 ```bash
-git clone https://github.com/mhieuhonda/hieu-louis-lang.git
-cd hieu-louis-lang
+git clone https://github.com/mhieuhonda/halis-lang.git
+cd halis-lang
 make bootstrap    # builds the native compiler via the bootstrap chain
-make test         # 187 tests: interpreter, native, differential, bootstrap
+make test         # full suite: interpreter, native, differential,
+                 # bootstrap determinism, LLVM IR, memory-stress, fmt, lint
 ```
 
 Requirements: Python 3.8+ (only for the Stage-0 seed), gcc or clang.
@@ -19,7 +20,7 @@ Requirements: Python 3.8+ (only for the Stage-0 seed), gcc or clang.
 
 | Branch                           | Purpose                                       |
 |----------------------------------|-----------------------------------------------|
-| `main`                           | The roadmap branch. Stages 1–9 complete; Stage 10-alpha, 10-beta, 11–15 alpha/beta shipped (current: v0.20.0-alpha). Each new roadmap stage lands here when ready. |
+| `main`                           | The roadmap branch. Stages 1–17 complete (current: v0.30.0-alpha). Each new roadmap stage (18–20) lands here when ready. |
 | `feature/community-extensions`   | Non-roadmap upgrades: new stdlib modules, tooling, examples, CI/CD. Smaller, more frequent releases cut from here. |
 | `feature/*` / `fix/*`             | Short-lived topic branches.                   |
 

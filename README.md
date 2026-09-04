@@ -115,8 +115,9 @@ make bootstrap
 # 3. Compile your program to a native binary
 make run F=examples/primes.hls
 
-# 4. Run the full test suite (185 tests: types, effects, ownership, taint,
-#    differential, bootstrap determinism, LLVM IR, memory-stress RSS check)
+# 4. Run the full test suite (interpreter + native + differential +
+#    bootstrap determinism + LLVM IR + memory-stress RSS check + fmt +
+#    lint + proof/contracts). See CHANGELOG.md for the current count.
 make test
 
 # 5. Try the fine-grained effects (v0.7.0-alpha)
@@ -142,7 +143,7 @@ python3 boot/boot.py --emit llvm --target aarch64-linux examples/llvm_demo.hls
 # 11. Stage 13-alpha: package manager (v0.11.0-alpha)
 python3 tools/hls-pkg.py init mypkg
 cd mypkg
-python3 ../tools/hls-pkg.py add std.str https://github.com/mhieuhonda/hieu-louis-lang.git std/str.hls
+python3 ../tools/hls-pkg.py add std.str https://github.com/mhieuhonda/halis-lang.git std/str.hls
 python3 ../tools/hls-pkg.py lock    # resolves deps + enforces effect surface
 python3 ../tools/hls-pkg.py audit  # total effect report of dep tree
 python3 ../tools/hls-pkg.py verify # check SHA-256 hashes still match
@@ -232,8 +233,8 @@ module you need).
 ## Repository layout
 
 ```
-hieu-louis-lang/
-├── SPEC.md              # Language constitution (full v0.7 spec)
+halis-lang/
+├── SPEC.md              # Language constitution (full v0.30 spec)
 ├── ROADMAP.md           # 20-stage roadmap to v1.0
 ├── SECURITY.md          # Threat model & security policy
 ├── boot/                # Stage-0: bootstrap seed (pure Python, ~3,200 lines)
@@ -276,7 +277,7 @@ Full details: [SPEC.md](SPEC.md) · Stage-by-stage roadmap:
 
 ## Status
 
-**v0.28.0-alpha — Stages 1–17 complete (Stage 17: formal verification & contracts)**:
+**v0.30.0-alpha — Stages 1–17 complete (Stage 17 perfected: proof-engine soundness overhaul + native ensures + loop-invariant engine)**:
 
 - ✅ Complete core specification
 - ✅ Stage-0 reference (interpreted, with type + effects checking)
@@ -299,7 +300,7 @@ Full details: [SPEC.md](SPEC.md) · Stage-by-stage roadmap:
   with **RSS delta = 0**, enforced under a 256 MB `ulimit -v` in the
   test suite. **173/173 tests PASS** (Stage 8 final test count; the
   current count after all Stage 9 release work is **185/185**).
-- 🔄 **Stage 9-alpha — Fine-grained effects & capabilities** (v0.5.0-alpha):
+- ✅ **Stage 9-alpha — Fine-grained effects & capabilities** (v0.5.0-alpha):
   Single `IO` effect split into five — `IO`, `Fs`, `Clock`, `Args`, `Exit`.
   `uses` clause now accepts a comma-separated list; `uses IO` is a
   backwards-compatible blanket alias. Capability subset semantics
@@ -408,10 +409,10 @@ Full details: [SPEC.md](SPEC.md) · Stage-by-stage roadmap:
 ## Contributing
 
 Every contribution must preserve the core guarantees and pass
-`make test` (199 tests, including differential testing of the two
-implementations + 13 LLVM IR tests). Every new feature must first be
-used inside `hlc` itself — the compiler is always the first customer
-of the language.
+`make test` (the full suite: interpreter + native + differential +
+bootstrap determinism + LLVM IR + memory-stress + fmt + lint +
+proof/contracts). Every new feature must first be used inside `hlc`
+itself — the compiler is always the first customer of the language.
 
 **Branch protection:** the `main` branch is protected — all non-admin
 contributors must open a pull request. CI must pass on every PR (full
