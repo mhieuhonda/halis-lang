@@ -358,7 +358,7 @@ def _strip_toml_comment(line: str) -> str:
                     continue
                 raise ValueError(
                     "invalid TOML escape sequence: \\%s (TOML only allows "
-                    "\\b, \\t, \\n, \\f, \\r, \\", \\\", \\uXXXX, "
+                    "\\b, \\t, \\n, \\f, \\r, \\\", \\uXXXX, "
                     "\\UXXXXXXXX)" % esc)
             if c == '"':
                 in_str = False
