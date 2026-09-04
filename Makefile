@@ -192,7 +192,7 @@ examples:
         @echo "--- examples/taint_beta_demo.hls"; $(PYTHON) boot/boot.py examples/taint_beta_demo.hls examples/data.txt
 
 clean:
-        rm -rf $(BIN) bin/hls_out bin/hls_out.c
+        rm -rf $(BIN)
 
 # Install the native compiler and stdlib to PREFIX (default /usr/local)
 install: bootstrap
