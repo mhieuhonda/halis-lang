@@ -1,11 +1,14 @@
-# Halis language specification (HLS) — v0.27.0-alpha
+# Halis language specification (HLS) — v0.28.0-alpha
 
 > **Halis** is a high-security, native-compiled programming language
 > designed around the philosophy: **safety by default, explicitness for
 > auditability, performance via AOT compilation**. Version v0.27.0-alpha
-> **completes Stage 16**: concurrency with data-race freedom — `spawn`
-> tasks, `Chan[T]` channels, `select`, the `Conc` effect, the Send rule
-> set, and a runtime deadlock detector (see §25). Version v0.20.0-alpha
+> **completes Stage 17**: contracts & formal verification —
+> `requires`/`ensures`, the interval proof engine with `-O fast` check
+> elision, `hlprove` (proof reports + the z3 SMT bridge), and `hlmodel`
+> (exhaustive finite-state model checking) (see §26). Version
+> v0.27.0-alpha completed Stage 16: concurrency with data-race freedom
+> (see §25). Version v0.20.0-alpha
 > completed Stage 9: the `Net`, `Rand`, and `Proc` effects with five
 > builtins (`net_lookup`, `rand_int`, `rand_float`, `rand_seed`,
 > `proc_exec`) and the deterministic shared 64-bit LCG.
@@ -1516,3 +1519,154 @@ locks exist in the language.
 | Bounded channels | channels are unbounded; send never blocks (deadlock detection covers blocked receivers). Capacity limits: future stdlib. |
 | LLVM backend / HLIR | `--emit llvm` / `--emit ir` reject concurrency programs with a clean error (the C backend and interpreter are the Stage 16 deliverables). |
 | Spawn of generic fns | wrap in a non-generic fn (clear error message). |
+
+---
+
+## 26. Contracts & formal verification (Stage 17 — v0.28.0-alpha)
+
+"Extremely high security" moves from *claimed* to *proven*: functions
+declare preconditions (`requires`) and postconditions (`ensures`); the
+compiler checks what it can prove, guards what it elides, and the tooling
+(`hlprove`, `hlmodel`) turns the contracts into reports, SMT queries, and
+exhaustive model checks.
+
+### 26.1. Syntax
+
+Zero or more `requires` clauses followed by zero or more `ensures`
+clauses, after the effects clause, before the body:
+
+```hls
+fn div(a: int, b: int) -> int
+    requires b != 0
+{
+    return a / b
+}
+
+fn add_pos(a: int, b: int) -> int
+    requires a >= 0
+    requires b >= 0
+    ensures result >= a
+{
+    return a + b
+}
+```
+
+- Multiple clauses of one kind are combined with `&&`.
+- Contract expressions are **pure** and see **only the parameters**
+  (plus `result` — the return value — inside `ensures`). Literals,
+  arithmetic, comparisons, `len(x)` / `x.len()` and field reads of
+  parameters are allowed; calling functions is a compile error.
+- `requires` must be `bool`-typed; `ensures` must be `bool`-typed and
+  is rejected on `void` functions.
+- Extern (FFI) functions may carry `requires` (it documents the C side's
+  precondition and is checked at literal call sites).
+
+### 26.2. Static checking (always on)
+
+1. **Validation** — type + purity + scope (above) at definition time.
+2. **Call-site constant evaluation** — when every argument is a
+   literal, the `requires` is evaluated at compile time; a provably
+   FALSE precondition is a **compile error** at the call site
+   (`div(10, 0)` never compiles). Unknown (non-literal) arguments
+   defer to runtime.
+
+### 26.3. Runtime checking (`--contracts`)
+
+`boot.py --contracts` (interpreter) asserts `requires` at every
+contracted fn entry and `ensures` at every return — violations are
+clean panics (exit 101). The native backend emits the same entry
+assertions under `--contracts`; under `-O fast` it emits them for the
+functions that need them (see 26.4).
+
+### 26.4. The interval proof engine & `-O fast`
+
+For every function with a `requires`, the checker seeds integer
+interval facts from the conjuncts and propagates them through the body:
+
+- recognised seeds: `x >= k`, `x <= k`, `x > k`, `x < k`, `k <= x`,
+  `k >= x`, `x == k`, `x != 0`, `x < s.len()` (symbolic length bound),
+  `s.len() >= k` (a MINIMUM LENGTH fact — `s` provably has at least k
+  bytes, which proves indices below k in bounds);
+- propagation: `let`/`assign` arithmetic (int only), if/else joins
+  (interval union), `for i in range(0, K)` with constant K
+  (`i in [0, K-1]`), while widening (conservative);
+- soundness: variables assigned inside a loop body are widened to TOP
+  for that body (loop-carried facts are not assumed).
+
+A check is annotated **PROVEN** only when the interval arithmetic
+discharges it exactly:
+
+| Annotation | Meaning | `-O fast` codegen |
+|------------|---------|-------------------|
+| `ovf_safe` | `a + b` / `a - b` / `a * b` cannot overflow int64 | raw C operator |
+| `div_safe` | `a / b` / `a % b`: divisor excludes 0 (and not the INT64_MIN/-1 corner) | raw C operator |
+| `bnd_safe` | `xs[i]` / `s.byte_at(i)` / `s.slice(a,b)` provably in bounds | unchecked accessors |
+
+**Elision soundness rule**: a function whose body contains elided
+operations ALWAYS emits its `requires` assertion at entry under `-O
+fast` — an elided check is only sound when the precondition that proved
+it is enforced. The fast path is therefore *guarded* by the proof
+obligations, never unconditionally unchecked. Anything the prover
+cannot prove keeps its runtime panic check.
+
+Differential testing enforces semantics preservation: every
+`feat_contract_*` / `feat_proof_elide` test compares the `-O fast`
+native output against the interpreter, byte for byte.
+
+### 26.5. `hlprove` — proof reports, the z3 bridge, invariant suggestions
+
+```
+python3 tools/hlprove.py file.hls [--smt] [--z3] [--suggest-invariants]
+```
+
+- **Default**: per-function proof report — the seeded facts and the
+  count of overflow / division / bounds checks proven elidable (the
+  same annotations the codegen honours under `-O fast`).
+- `--smt`: writes one `.smt2` (QF_LIA; string lengths abstracted to
+  Int) per contracted function with two queries: `requires`
+  satisfiability (unsat => the contract is vacuous) and
+  `requires && !ensures` (unsat => the ensures is implied). This is
+  the roadmap's "SMT solver z3 via a bridge GENERATED FROM HLS";
+  `--z3` runs external z3 on the files when it is on PATH.
+- `--suggest-invariants`: for every loop — exact bounds for const
+  `for i in range(a, b)` loops, the while condition as a candidate
+  invariant, and the mutated-variable set. The automatic inference
+  rule set from the roadmap.
+
+### 26.6. `hlmodel` — exhaustive finite-state model checking
+
+```
+python3 tools/hlmodel.py file.hls --fn step --invariant is_valid --init State.Start
+```
+
+For a transition function `fn step(s: State, e: Event) -> State` over
+payload-less enums, `hlmodel` enumerates EVERY (state, event) pair and
+EXECUTES the function via the interpreter — the full finite domain, no
+abstraction:
+
+- every transition must terminate without panic;
+- `requires`/`ensures` (if declared) are evaluated per pair;
+- with `--invariant fn` and `--init Variant`: BFS over the reachable
+  state graph verifies the predicate on every reachable state and
+  reports dead (unreachable) states.
+
+### 26.7. The acceptance example — `examples/hmac_proven.hls`
+
+An HMAC-style envelope (ipad/opad block construction with a modular
+mixer) whose hot path is **fully proven**: under `-O fast` every
+integer multiply in the mixer and every byte access in the block
+processors is proven overflow-free / in-bounds and elided (verified:
+the fast binary and the interpreter produce identical output). The
+only branches left in the hot path are the precondition assertions
+guarding the elided operations — the panic checks themselves are gone,
+exactly the acceptance criterion: *a core crypto module fully proven
+by HLS contracts, no panic checks needed*.
+
+### 26.8. Deliberate scope decisions (v0.28.0-alpha)
+
+| Deferred | Rationale |
+|----------|-----------|
+| Full SMT encoding of function bodies | the bridge encodes contract queries (satisfiability / implication), not whole-program semantics; the built-in interval prover handles body-level elision. |
+| `ensures` runtime checks in native | the interpreter checks both clauses under `--contracts`; the native backend checks `requires` (the elision-relevant clause). `ensures` verification is via `hlprove`/z3. |
+| Loop invariant inference into proofs | `--suggest-invariants` proposes; the engine itself uses conservative widening (sound, less precise). |
+| Contracts on generics | contracts are checked per-declaration; instantiation-specific bounds (generic `requires`) are future work. |

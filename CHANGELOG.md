@@ -8,6 +8,79 @@ Releases on `main` follow the 20-stage roadmap (see [ROADMAP.md](ROADMAP.md)).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
+## [v0.28.0-alpha] — Stage 17 release: formal verification & contracts
+
+> **Stage 17 is COMPLETE.** "Extremely high security" moves from claimed
+> to PROVEN: functions declare `requires`/`ensures` contracts, the
+> compiler constant-checks them at literal call sites, the interval
+> proof engine annotates provably-safe operations, and `-O fast` elides
+> exactly those panic checks (always guarded by the precondition that
+> proved them). `hlprove` turns contracts into proof reports, z3-ready
+> SMT-LIB2, and loop-invariant suggestions; `hlmodel` exhaustively model
+> checks finite-state machines by EXECUTING the transition relation.
+> The acceptance example (`examples/hmac_proven.hls`) is an HMAC-style
+> envelope whose hot path is fully proven — fast binary output is
+> byte-identical to the interpreter. **459/459 tests PASS**; the
+> bootstrap is still deterministic.
+
+### Stage 17 release — contracts & verification
+
+- **Syntax**: `requires <bool-expr>` / `ensures <bool-expr>` clauses
+  after the effects clause (any number of each, &&-combined; `result`
+  names the return value in ensures; `requires`/`ensures` are new
+  keywords — a repo grep showed the words only in comments).
+- **Checker validation** (boot + hlc.hls): bool-typed, PURE
+  (no calls except len()), parameters-only scope (+ result in
+  ensures); ensures rejected on void fns; extern fns may carry
+  requires. Contract expressions parse with allow_struct=false so a
+  struct literal cannot be confused with the body block.
+- **Static call-site checking**: literal arguments → the requires is
+  constant-evaluated; FALSE = compile error at the call site
+  ("contract violation at call site: requires of 'div' evaluates to
+  FALSE ...").
+- **`--contracts` runtime mode** (boot.py + interp + hlc): requires
+  asserted at every contracted fn entry, ensures at every return —
+  clean panics (exit 101) with function names.
+- **Interval proof engine** (boot/proof.py + a full HLS mirror inside
+  hlc.hls): seeds int bounds from requires conjuncts — `x >= k`,
+  `x < s.len()` (symbolic), `s.len() >= k` (minimum-length facts) —
+  propagates through let/assign arithmetic, if/else joins, const-bound
+  for-ranges; while/for bodies widen loop-modified variables to TOP
+  (loop-carried facts are never assumed — soundness first).
+- **`-O fast` / `--fast` elision**: PROVEN operations emit raw C ops
+  and unchecked accessors (`hl_str_byte_at_unchecked`,
+  `hl_list_get_unchecked`, `hl_str_slice_unchecked`).
+  **Soundness rule**: any fn whose body contains elided ops emits its
+  requires assertion at entry under -O fast — an elided check is only
+  sound when the precondition that proved it is enforced (verified by
+  the hmac example: the guard catches a violated seed bound before
+  the unchecked multiply).
+- **`hlprove.py`**: proof reports (seeded facts + elision counts per
+  contracted fn), the **z3 bridge** (`--smt` writes QF_LIA .smt2 with
+  requires-satisfiability and ensures-implication queries;
+  `--z3` runs external z3), and `--suggest-invariants` (const-range
+  bounds, while-condition invariants, mutated-variable sets).
+- **`hlmodel.py`**: exhaustive finite-state model checking — every
+  (state, event) pair of a payload-less-enum transition fn is
+  EXECUTED by the interpreter; `--invariant fn` + `--init Variant`
+  add BFS reachability, invariant verification, and dead-state
+  reporting. Demo: `examples/conn_machine.hls`.
+- **Acceptance**: `examples/hmac_proven.hls` — HMAC-style envelope
+  (ipad/opad, modular mixer) whose hot path is FULLY PROVEN: under
+  `-O fast` every multiply and byte access is elided; the only
+  remaining branches are the precondition assertions carrying the
+  proof. `make prove-acceptance` runs the report + builds + runs the
+  fast binary.
+- **Tests**: 4 new ok tests (contract basics, ensures, proof elision,
+  const-range loops + minlen) + 6 new fail tests (call-site violation,
+  non-bool, impure, unknown var, ensures-on-void, result-in-requires)
+  + a new run_tests.sh section: -O fast output must be byte-identical
+  to the interpreter for every contract test; hlprove/hlmodel must
+  run cleanly on the acceptance examples; --contracts must catch a
+  violated requires at runtime.
+- **Makefile**: `make prove F=...`, `make prove-full F=...`,
+  `make model F=... FN=step`, `make prove-acceptance`.
+
 ## [v0.27.0-alpha] — Stage 16 release: Concurrency & async (data-race freedom)
 
 > **Stage 16 is COMPLETE.** Halis now leverages multiple cores with

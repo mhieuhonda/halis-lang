@@ -10,6 +10,11 @@ KEYWORDS = {
     # grep over the entire repo (src/, std/, examples/, tests/) shows
     # zero occurrences, so this is safe.
     "extern",
+    # Stage 17 (v0.28.0-alpha): contract clauses on functions —
+    # `requires <bool-expr>` (precondition) and `ensures <bool-expr>`
+    # (postcondition; may reference `result`). A grep shows the words
+    # only appear in comments today, so reserving them is safe.
+    "requires", "ensures",
 }
 
 # BUG-29 fix: reserved identifiers (per SPEC.md section 2.5). These are

@@ -276,7 +276,7 @@ Full details: [SPEC.md](SPEC.md) · Stage-by-stage roadmap:
 
 ## Status
 
-**v0.27.0-alpha — Stages 1–16 complete (Stage 16: concurrency & async with data-race freedom)**:
+**v0.28.0-alpha — Stages 1–17 complete (Stage 17: formal verification & contracts)**:
 
 - ✅ Complete core specification
 - ✅ Stage-0 reference (interpreted, with type + effects checking)
@@ -388,8 +388,21 @@ Full details: [SPEC.md](SPEC.md) · Stage-by-stage roadmap:
   non-provable values at the boundary, channels use atomic
   refcounts, and a built-in deadlock detector halts all-blocked
   programs with a clean panic. 426/426 tests PASS.
-- ⬜ formal verification (Stage 17),
-  testing ecosystem (Stage 18), docs/book/playground (Stage 19),
+- ✅ **Stage 17 release — Formal verification & contracts**
+  (v0.28.0-alpha): `requires`/`ensures` contracts (validated, pure,
+  params-only scope; `result` in ensures), **static call-site
+  checking** (`div(10, 0)` is a compile error), `--contracts` runtime
+  assertions, the **interval proof engine** — symbolic length and
+  minimum-length facts from contracts prove overflow/division/bounds
+  checks dead — and **`-O fast`** elides exactly those (soundness:
+  every elision is guarded by the precondition that proved it).
+  Tools: `hlprove` (proof reports + the z3 SMT-LIB2 bridge +
+  loop-invariant suggestions) and `hlmodel` (exhaustive finite-state
+  model checking by executing the transition relation; BFS
+  reachability + invariants). Acceptance: `examples/hmac_proven.hls`
+  — an HMAC envelope whose hot path is fully proven (fast output is
+  byte-identical to the interpreter). 459/459 tests PASS.
+- ⬜ testing ecosystem (Stage 18), docs/book/playground (Stage 19),
   v1.0 (Stage 20)...
 
 ## Contributing

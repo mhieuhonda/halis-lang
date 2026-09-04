@@ -12,6 +12,7 @@ Side effect: annotates the AST so the evaluator can run quickly:
   - program['edges'] = {fn_key: set(callees)} for effects analysis
 """
 from .lexer import HLError
+from . import proof as _proof
 
 INT64_MAX = 9223372036854775807
 
@@ -336,6 +337,9 @@ class Checker:
         # iterable — take()/drop() are rejected there (a move would
         # re-execute on every iteration).
         self.loop_header = 0
+        # Stage 17: seeded interval facts per fn (for --check --fast and
+        # hlprove reporting).
+        self.proof_facts = {}
 
     # ---------- utilities ----------
     def err(self, msg, node):
@@ -564,7 +568,12 @@ class Checker:
         saved_typeparams = self.cur_typeparams
         self.cur_typeparams = set(fn.get("typeparams", []))
         env = self.new_env(fn)
+        # Stage 17 (v0.28.0-alpha): validate the contract clauses...
+        self.check_contracts(key, fn, env)
         self.check_stmts(fn["body"], env, fn, False)
+        # ...and AFTER the body is checked (annotations read e['t']),
+        # run the interval proof pass.
+        self.run_proof_pass(key, fn)
         # Stage 15 (v0.13.0-alpha): extern fns have NO body — they are
         # forward declarations. Skip the "must return on all paths" check.
         if (not fn.get("extern", False)
@@ -572,6 +581,75 @@ class Checker:
                 and not self.all_return(fn["body"])):
             self.err("function '%s' does not return on all paths" % fn["name"], fn)
         self.cur_typeparams = saved_typeparams
+
+    # ---------- Stage 17: contracts ----------
+    def check_contracts(self, key, fn, env):
+        """Validate `requires` / `ensures` expressions and, for functions
+        with a requires clause, run the interval proof pass over the
+        body (annotating provably-safe operations for -O fast)."""
+        params = fn["params"]
+        req = fn.get("requires")
+        ens = fn.get("ensures")
+        # Contract environment: ONLY the parameters (+ `result` for
+        # ensures). Nothing else is in scope.
+        cenv = [{}]
+        for pn, pt, _ in params:
+            cenv[0][pn] = [pt, False, False]
+        if req is not None:
+            t = self.check_expr(req, cenv, None)
+            if t not in ("bool", "never"):
+                self.err("requires clause of '%s' must be bool, got %s"
+                         % (fn["name"], t), req)
+            self.check_contract_purity(req, fn, "requires")
+        if ens is not None:
+            if fn["ret"] == "void":
+                self.err("ensures clause on void function '%s' (there is "
+                         "no result)" % fn["name"], ens)
+            cenv[0]["result"] = [fn["ret"], False, False]
+            t = self.check_expr(ens, cenv, None)
+            if t not in ("bool", "never"):
+                self.err("ensures clause of '%s' must be bool, got %s"
+                         % (fn["name"], t), ens)
+            self.check_contract_purity(ens, fn, "ensures")
+    def run_proof_pass(self, key, fn):
+        """Stage 17: seed interval facts from the (validated) requires
+        clause and annotate the body's provably-safe operations. Runs
+        AFTER the body was type-checked — the annotations read e['t']."""
+        req = fn.get("requires")
+        if req is None or fn.get("extern", False):
+            return
+        facts = _proof.seed_from_requires(req, fn["params"], 0)
+        _proof.propagate_stmts(fn["body"], facts)
+        for var, iv in facts.items():
+            if var == "__nz__":
+                continue
+            self.proof_facts.setdefault(key, {})[var] = str(iv)
+
+    def check_contract_purity(self, e, fn, which):
+        """Contract expressions must be pure and side-effect-free: no
+        calls to user functions or effectful builtins; only literals,
+        params, arithmetic, comparisons, len() / .len() and field reads
+        of params are allowed."""
+        if not isinstance(e, dict):
+            return
+        k = e["k"]
+        if k == "call":
+            if e.get("rc") == ("builtin", "len"):
+                return
+            name = e.get("name", "")
+            self.err("contract expression calls '%s' — contracts must be "
+                     "pure (only literals, parameters, arithmetic, "
+                     "comparisons and len() are allowed)" % name, e)
+        if k == "method":
+            name = e.get("name", "")
+            if name == "len":
+                return
+            self.err("contract expression calls method '%s' — contracts "
+                     "must be pure" % name, e)
+        for sub in (e.get("l"), e.get("r"), e.get("e")):
+            self.check_contract_purity(sub, fn, which)
+        for a in (e.get("args") or []):
+            self.check_contract_purity(a, fn, which)
 
     def all_return(self, stmts):
         if not stmts:
@@ -1266,6 +1344,25 @@ class Checker:
                 if at != inst_pt:
                     self.err("argument '%s' of %s expects %s, got %s"
                              % (pn, name, inst_pt, at), a)
+            # Stage 17 (v0.28.0-alpha): call-site contract checking. If
+            # the callee declares `requires` and every argument is a
+            # literal, the precondition is CONSTANT-EVALUATED here: a
+            # provably-false requires is a compile error at the call
+            # site (catches div(10, 0)-style bugs before the program
+            # ever runs). Unknown values defer to runtime.
+            req = fn.get("requires")
+            if req is not None and args:
+                consts = _proof.args_are_const(fn, args)
+                if consts is not None:
+                    verdict = _proof.const_eval(req, consts)
+                    if verdict is False:
+                        self.err(
+                            "contract violation at call site: requires of "
+                            "'%s' evaluates to FALSE for these literal "
+                            "arguments (%s)" % (
+                                name,
+                                ", ".join("%s=%r" % (pn, consts[pn])
+                                          for pn in consts)), e)
             if typeparams:
                 return instantiate_type(fn["ret"], type_map)
             return fn["ret"]

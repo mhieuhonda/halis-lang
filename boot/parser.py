@@ -375,18 +375,64 @@ class Parser:
         if extern:
             # Stage 15 (v0.13.0-alpha): extern fn declarations have NO
             # body. They are forward declarations for C functions.
+            # Stage 17: contracts on extern fns (requires only; an
+            # ensures without a body would be an unverifiable claim —
+            # allow it as a documentation claim but it is only checked
+            # at call sites, not verified).
+            contracts = self.parse_contracts(t0)
             return {
                 "name": name, "typeparams": typeparams, "params": params,
                 "ret": ret, "effects": effects, "pure": is_pure,
                 "body": [], "line": t0["line"], "struct": impl_struct,
                 "extern": True,
+                "requires": contracts[0], "ensures": contracts[1],
             }
+        # Stage 17 (v0.28.0-alpha): optional contract clauses —
+        # `requires <bool-expr>` then/and `ensures <bool-expr>`, parsed
+        # after the effects clause, before the body block.
+        contracts = self.parse_contracts(t0)
         body = self.parse_block()
         return {
             "name": name, "typeparams": typeparams, "params": params, "ret": ret,
             "effects": effects, "pure": is_pure, "body": body, "line": t0["line"],
             "struct": impl_struct, "extern": False,
+            "requires": contracts[0], "ensures": contracts[1],
         }
+
+    def parse_contracts(self, fn_tok):
+        """Stage 17: parse the contract clause list — any number of
+        `requires <expr>` clauses followed by any number of
+        `ensures <expr>` clauses (multiple clauses of the same kind are
+        combined with && into a single expression). Returns the
+        (requires_expr_or_None, ensures_expr_or_None) pair. The
+        expressions are parsed with allow_struct=False so a struct
+        literal cannot be confused with the function body's `{`."""
+        reqs = []
+        enss = []
+        while True:
+            if self.at_kw("requires") and not enss:
+                self.next()
+                reqs.append(self.parse_expr(allow_struct=False))
+            elif self.at_kw("ensures"):
+                self.next()
+                enss.append(self.parse_expr(allow_struct=False))
+            else:
+                break
+        req_expr = None
+        for x in reqs:
+            if req_expr is None:
+                req_expr = x
+            else:
+                req_expr = {"k": "bin", "op": "&&", "l": req_expr, "r": x,
+                            "line": x.get("line", 0)}
+        ens_expr = None
+        for x in enss:
+            if ens_expr is None:
+                ens_expr = x
+            else:
+                ens_expr = {"k": "bin", "op": "&&", "l": ens_expr, "r": x,
+                            "line": x.get("line", 0)}
+        return (req_expr, ens_expr)
 
     # ---------- types ----------
     def parse_type(self, allow_void=False):

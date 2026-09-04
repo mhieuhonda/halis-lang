@@ -31,7 +31,7 @@ remains green.
 | 14 | Tooling: LSP, formatter, linter | ✅ | (release v0.24.0-alpha) |
 | 15 | Safe C FFI | ✅ | (release v0.25.0-alpha) |
 | 16 | Concurrency & async (data-race freedom) | ✅ | (release v0.27.0-alpha) |
-| 17 | Formal verification & contracts | ⬜ | 10–14 weeks |
+| 17 | Formal verification & contracts | ✅ | (release v0.28.0-alpha) |
 | 18 | Testing ecosystem & fuzzing | ⬜ | 4–6 weeks |
 | 19 | Documentation, book, playground | ⬜ | 6 weeks |
 | 20 | HLS v1.0 — API freeze, LTS, pure-HLS bootstrap | ⬜ | 4 weeks |
@@ -1157,9 +1157,43 @@ self-hosted hlbindgen.
 **Acceptance:** a program sharing a variable outside a channel → compile error;
 concurrency benchmark (web server) scales linearly to 8 cores.
 
-## STAGE 17 — Formal verification & contracts ⬜
+## STAGE 17 — Formal verification & contracts ✅ (release v0.28.0-alpha)
 
 **Goal:** "extremely high security" is proven, not just claimed.
+
+**Shipped (v0.28.0-alpha):**
+- **Contracts**: `requires` / `ensures` clauses on functions (multiple
+  clauses combine with &&; `result` names the return value in
+  ensures; extern fns may carry requires). Contracts are validated
+  (bool-typed, pure, parameters-only scope) at check time in BOTH
+  implementations.
+- **Static call-site checking**: a `requires` evaluated to FALSE under
+  literal arguments is a compile ERROR at the call site — `div(10, 0)`
+  never compiles.
+- **`--contracts` runtime mode**: the interpreter asserts requires at
+  entry and ensures at every return (violations are clean panics,
+  exit 101); the native backend emits entry assertions.
+- **Interval proof engine + `-O fast`**: integer bounds seeded from
+  requires (incl. symbolic `x < s.len()` and minimum-length
+  `s.len() >= k` facts) propagate through the body and annotate
+  PROVABLY-safe operations; under `-O fast` the codegen elides exactly
+  those overflow / division / bounds checks (soundness: any function
+  with elided ops emits its requires assertion — an elided check is
+  always guarded by the precondition that proved it). Loop-modified
+  variables are widened (loop-carried facts never assumed).
+- **`hlprove`**: per-function proof reports; the **z3 SMT bridge**
+  (generates QF-LIB .smt2 queries from the contracts; `--z3` runs
+  external z3); `--suggest-invariants` loop-invariant heuristics.
+- **`hlmodel`**: exhaustive finite-state model checking — every
+  (state, event) pair of a payload-less-enum transition fn is
+  EXECUTED; BFS reachability + invariant verification + dead-state
+  reporting.
+- **Acceptance criterion met**: `examples/hmac_proven.hls` — an
+  HMAC-style envelope whose hot path is fully proven; under `-O fast`
+  every multiply and byte access is elided (fast binary output ==
+  interpreter output, differentially enforced), leaving only the
+  precondition branches that carry the proof. 4 + 6 new tests
+  (contracts, call-site errors, proof elision, fast-mode differential).
 
 **Work:**
 - Contracts: `requires`/`ensures` on functions; static checking for subsets

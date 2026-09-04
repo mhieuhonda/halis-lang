@@ -131,6 +131,61 @@ if [ $nat_bad -eq 0 ]; then
     ok "native hlc compiles + gcc-builds all $nat_ok ok programs"
 fi
 
+echo "=== 4b. Stage 17: contracts + proof (fast-mode differential) ==="
+# The proof elision must be semantics-preserving: the -O fast build
+# (checks elided where PROVEN) must produce byte-identical output to
+# the interpreter for the contracted test programs.
+for f in tests/ok/feat_contract_*.hls tests/ok/feat_proof_elide.hls; do
+    [ -f "$f" ] || continue
+    name=$(basename "$f" .hls)
+    if [ ! -x "$TMP/hlc1" ]; then
+        python3 boot/boot.py src/hlc.hls src/hlc.hls "$TMP/hlc_nat.c" >/dev/null 2>&1
+        gcc -O2 -o "$TMP/hlc1" "$TMP/hlc_nat.c" -lm -pthread 2>/dev/null
+    fi
+    interp_out=$(timeout 60 python3 boot/boot.py "$f" </dev/null 2>/dev/null); interp_rc=$?
+    if "$TMP/hlc1" --fast "$f" "$TMP/$name.fast.c" >/dev/null 2>&1 \
+            && gcc -O2 -o "$TMP/$name.fast.bin" "$TMP/$name.fast.c" -lm -pthread 2>/dev/null; then
+        fast_out=$(timeout 60 "$TMP/$name.fast.bin" </dev/null 2>/dev/null); fast_rc=$?
+        if [ "$interp_out" == "$fast_out" ] && [ "$interp_rc" == "$fast_rc" ]; then
+            ok "$name (-O fast output identical to interpreter)"
+        else
+            bad "$name (-O fast diverges: interp=$interp_rc fast=$fast_rc)"
+        fi
+    else
+        bad "$name (fast compile failed)"
+    fi
+done
+# hlprove must run cleanly on the acceptance example and report elisions.
+if python3 tools/hlprove.py examples/hmac_proven.hls >/dev/null 2>&1; then
+    ok "hlprove runs on the HMAC acceptance example"
+else
+    bad "hlprove failed on the HMAC acceptance example"
+fi
+# hlmodel must exhaustively check the demo state machine.
+if python3 tools/hlmodel.py examples/conn_machine.hls --fn step --invariant all_valid --init Closed >/dev/null 2>&1; then
+    ok "hlmodel exhaustive check of the demo state machine"
+else
+    bad "hlmodel failed on the demo state machine"
+fi
+# Runtime contract checking (--contracts) must catch a violated requires.
+cat > "$TMP/rt_contract.hls" <<'RTSEOF'
+fn risky(n: int) -> int
+    requires n > 0
+{
+    return n * 2
+}
+fn main() -> int uses Args {
+    let n: int = args().len() - 1
+    return risky(n)
+}
+RTSEOF
+rt_out=$(python3 boot/boot.py --contracts "$TMP/rt_contract.hls" </dev/null 2>&1 >/dev/null); rt_rc=$?
+if [ $rt_rc -eq 101 ] && echo "$rt_out" | grep -q "contract violation: requires"; then
+    ok "--contracts runtime requires violation panics cleanly (101)"
+else
+    bad "--contracts did not catch the violated requires (rc=$rt_rc)"
+fi
+
 echo "=== 4b. Stage 14 release: tooling (hlfmt idempotent + hllint cfaware) ==="
 # hlfmt must be idempotent: running twice = running once. We test by
 # formatting once into a temp file, then formatting again into a second

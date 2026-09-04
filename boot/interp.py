@@ -364,7 +364,7 @@ class HalisRNG:
 
 
 class Interp:
-    def __init__(self, program, argv, out):
+    def __init__(self, program, argv, out, contracts=False):
         self.p = program
         self.fns = program["fns"]
         self.structs = program["structs"]
@@ -372,6 +372,10 @@ class Interp:
         self.argv = argv  # list[bytes]
         self.out = out
         self.line = 0
+        # Stage 17 (v0.28.0-alpha): runtime contract checking mode.
+        # When True, `requires` is asserted at every fn entry and
+        # `ensures` at every return (violations are clean panics).
+        self.contracts = contracts
         # Stage 9 release (v0.20.0-alpha): process-wide PRNG state for the
         # Rand effect. Uses a 64-bit LCG with the same constants as the
         # native runtime (Knuth LCG: state = state * 6364136223846793005
@@ -415,11 +419,35 @@ class Interp:
             params = fn["params"]
         for (pn, _, _), v in zip(params, args):
             env[0][pn] = [v, False, False]
+        # Stage 17: runtime `requires` assertion (enabled by --contracts).
+        if self.contracts and fn.get("requires") is not None:
+            if not self._truthy(self.eval_expr(fn["requires"], env)):
+                raise HLPanic("contract violation: requires of '%s' "
+                              "(function precondition failed at runtime)"
+                              % fn["name"], self.line)
         try:
             self.exec_stmts(fn["body"], env)
         except ReturnSig as r:
+            # Stage 17: runtime `ensures` assertion (enabled by --contracts).
+            if self.contracts and fn.get("ensures") is not None:
+                env[0]["result"] = [r.value, False, False]
+                if not self._truthy(self.eval_expr(fn["ensures"], env)):
+                    raise HLPanic("contract violation: ensures of '%s' "
+                                  "(function postcondition failed at "
+                                  "runtime)" % fn["name"], self.line)
             return r.value
+        # Implicit void return: still check ensures (result is None).
+        if self.contracts and fn.get("ensures") is not None:
+            env[0]["result"] = [None, False, False]
+            if not self._truthy(self.eval_expr(fn["ensures"], env)):
+                raise HLPanic("contract violation: ensures of '%s' "
+                              "(function postcondition failed at runtime)"
+                              % fn["name"], self.line)
         return None
+
+    @staticmethod
+    def _truthy(v):
+        return bool(v)
 
     # ---------- extern (Stage 15) ----------
     _libc = None

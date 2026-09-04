@@ -8,7 +8,7 @@ HLC     = src/hlc.hls
 BIN     = bin
 PREFIX  ?= /usr/local
 
-.PHONY: all stage0 bootstrap test examples clean run check bench install uninstall audit opt-stats emit-ir emit-llvm fmt lint lsp-check pkg-init pkg-add pkg-lock pkg-audit pkg-verify pkg-build pkg-publish pkg-log pkg-log-verify
+.PHONY: all stage0 bootstrap test examples clean run check bench install uninstall audit opt-stats emit-ir emit-llvm fmt lint lsp-check pkg-init pkg-add pkg-lock pkg-audit pkg-verify pkg-build pkg-publish pkg-log pkg-log-verify prove prove-full model prove-acceptance
 
 # Main goal: use the full bootstrap chain to build the native compiler
 all: bootstrap
@@ -134,6 +134,31 @@ pkg-log:
 pkg-log-verify:
         @$(PKG) log --verify
 
+# ============================================================================
+# Stage 17 (v0.28.0-alpha): contracts / proof tools
+# ============================================================================
+
+# Proof report: which panic checks the interval prover proved dead
+prove:
+        @python3 tools/hlprove.py $(F)
+
+# Proof report + SMT-LIB2 files (z3-ready) + loop invariant suggestions
+prove-full:
+        @python3 tools/hlprove.py $(F) --smt --suggest-invariants
+
+# Exhaustive finite-state model checking of a transition fn
+model:
+        @python3 tools/hlmodel.py $(F) --fn $(FN) [--invariant $(INV)] [--init $(INIT)]
+
+# The Stage 17 acceptance example (HMAC envelope, fully proven hot path)
+prove-acceptance:
+        @python3 tools/hlprove.py examples/hmac_proven.hls
+        @test -x $(BIN)/hlc || $(MAKE) bootstrap
+        @$(BIN)/hlc --fast examples/hmac_proven.hls $(BIN)/hmac_fast.c
+        @$(CC) $(CFLAGS) -o $(BIN)/hmac_fast $(BIN)/hmac_fast.c -lm -pthread
+        @echo "--- running the -O fast (proof-elided) binary:"
+        @$(BIN)/hmac_fast
+
 # Run the example programs to verify they still work after a change
 examples:
         @# Most examples exit 0; secure_demo.hls deliberately panics on
@@ -151,7 +176,8 @@ examples:
                   examples/tooling_demo.hls examples/pkg_demo.hls \
                   examples/libcurl_demo.hls \
                   examples/conc_demo.hls examples/actor_demo.hls \
-                  examples/par_scan.hls; do \
+                  examples/par_scan.hls examples/hmac_proven.hls \
+                  examples/conn_machine.hls; do \
                 echo "--- $$f"; $(PYTHON) boot/boot.py $$f || exit 1; \
         done
         @echo "--- examples/secure_demo.hls (deliberately panics on overflow)"

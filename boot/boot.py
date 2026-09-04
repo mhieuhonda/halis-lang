@@ -167,6 +167,8 @@ def run_cli():
     opt_stats = False      # Stage 11: print optimiser statistics
     target_triple = None   # Stage 12: --target <triple>
     sandbox_dir = None     # Stage 10 release: --sandbox DIR restricts FS builtins
+    contracts = False      # Stage 17: --contracts — runtime requires/ensures checks
+    fast_mode = False      # Stage 17: --fast / -O fast — proof-driven check elision report
     # BUG (deep-scan-5): remove() only deleted the FIRST occurrence — a
     # duplicated flag (e.g. `--check --check f.hls`) leaked the stray copy
     # into the filename argument. Strip ALL occurrences of each flag.
@@ -214,6 +216,27 @@ def run_cli():
             del args[i:i + 2]
         else:
             sys.stderr.write("error: --sandbox expects a directory\n")
+            return 2
+    # Stage 17 (v0.28.0-alpha): --contracts — enable runtime requires /
+    # ensures assertions (interpreter checks both; the native backend
+    # checks requires at entry).
+    while "--contracts" in args:
+        contracts = True
+        args.remove("--contracts")
+    # Stage 17 (v0.28.0-alpha): --fast / -O fast — the proof-driven fast
+    # mode. Under --check it additionally prints which panic checks the
+    # interval prover proved dead (the same annotations the native
+    # codegen uses to elide them).
+    while "--fast" in args:
+        fast_mode = True
+        args.remove("--fast")
+    while "-O" in args:
+        i = args.index("-O")
+        if i + 1 < len(args) and args[i + 1] == "fast":
+            fast_mode = True
+            del args[i:i + 2]
+        else:
+            sys.stderr.write("error: -O expects 'fast' (the only level today)\n")
             return 2
     # BUG-025 fix: --check and --audit are mutually exclusive — error out
     # explicitly rather than silently preferring one over the other.
@@ -275,6 +298,8 @@ def run_cli():
         return print_opt_stats(program)
     if check_only:
         sys.stdout.write("OK: types and effects valid\n")
+        if fast_mode:
+            print_fast_report(program, checker)
         return 0
     # Stage 10 release: install the sandbox root before running the
     # interpreter. The interpreter's filesystem builtins consult
@@ -291,8 +316,69 @@ def run_cli():
         from boot.interp import _set_sandbox_root
         _set_sandbox_root(None)
         os.environ.pop("HLS_SANDBOX_ROOT", None)
-    interp = Interp(program, prog_args, sys.stdout.buffer)
+    interp = Interp(program, prog_args, sys.stdout.buffer, contracts=contracts)
     return interp.run()
+
+
+def print_fast_report(program, checker):
+    """Stage 17: --check --fast — report the elisions the interval
+    prover proved safe per function (the same annotations hlc.hls uses
+    under -O fast to emit unchecked arithmetic / bounds accesses)."""
+    counts = {"ovf": 0, "div": 0, "bnd": 0}
+
+    def walk(e):
+        if not isinstance(e, dict):
+            return
+        if e.get("ovf_safe"):
+            counts["ovf"] += 1
+        if e.get("div_safe"):
+            counts["div"] += 1
+        if e.get("bnd_safe"):
+            counts["bnd"] += 1
+        for key in ("l", "r", "e"):
+            walk(e.get(key))
+        for a in (e.get("args") or []):
+            walk(a)
+        if e.get("k") == "method":
+            walk(e.get("target"))
+        if e.get("k") == "index":
+            walk(e.get("target"))
+            walk(e.get("idx"))
+        if e.get("k") == "field":
+            walk(e.get("target"))
+        for arm in (e.get("arms") or []):
+            walk(arm.get("body"))
+
+    def walk_stmts(stmts):
+        for s in stmts or []:
+            if not isinstance(s, dict):
+                continue
+            for key in ("value", "cond", "iter", "e"):
+                walk(s.get(key))
+            tgt = s.get("target")
+            if isinstance(tgt, dict):
+                walk(tgt.get("idx"))
+            for bkey in ("body", "then", "els"):
+                walk_stmts(s.get(bkey))
+
+    print("\n-O fast proof report (interval prover; only PROVEN checks are "
+          "elided):")
+    n_fns = 0
+    for key, fn in program["fns"].items():
+        if fn.get("requires") is None or fn.get("extern", False):
+            continue
+        before = (counts["ovf"], counts["div"], counts["bnd"])
+        walk_stmts(fn["body"])
+        after = (counts["ovf"], counts["div"], counts["bnd"])
+        if after != before:
+            n_fns += 1
+            print("  %s: %d overflow checks, %d div/zero checks, "
+                  "%d bounds checks proven dead"
+                  % (key, after[0] - before[0], after[1] - before[1],
+                     after[2] - before[2]))
+    print("  TOTAL: %d overflow + %d division + %d bounds checks elidable "
+          "across %d contracted functions"
+          % (counts["ovf"], counts["div"], counts["bnd"], n_fns))
 
 
 def print_audit(program, checker):
