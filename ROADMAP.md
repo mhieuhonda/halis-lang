@@ -62,7 +62,7 @@ remains green.
 | 27 | Inline assembly syntax (`asm!`) | ⬜ | 4 weeks |
 | 28 | Stack-frame layout control (for kernel code) | ✅ | 3 weeks |
 | 29 | `noinline`/`always_inline`/`cold`/`hot` attributes | ✅ | 2 weeks |
-| 30 | Boxed-vs-stack layout analysis (escape analysis) | ⬜ | 5 weeks |
+| 30 | Boxed-vs-stack layout analysis (escape analysis) | ✅ | 5 weeks |
 | 31 | Tail-call optimisation (verified) | ⬜ | 3 weeks |
 | 32 | Zero-cost abstractions audit (every stdlib fn under 1 µs) | ⬜ | 4 weeks |
 | 33 | Async/await zero-runtime futures | ⬜ | 6 weeks |
@@ -2698,7 +2698,7 @@ on top of Stage 28:
 
 ---
 
-## STAGE 30 — Boxed-vs-stack layout analysis (escape analysis) ⬜
+## STAGE 30 — Boxed-vs-stack layout analysis (escape analysis) ✅
 
 **Work:**
 - Escape analysis: a `list[T]` that does not escape its creating
@@ -2710,6 +2710,128 @@ on top of Stage 28:
 
 **Acceptance:** `examples/fibonacci.hls`'s inner loop allocates zero
 heap objects (verified via `valgrind --tool=massif`).
+
+**Result (v0.47.0-alpha):** COMPLETE.
+
+1. **Escape analysis (automatic, default-on).** A
+   `list[int]` / `list[float]` / `list[bool]` binding initialised
+   from a non-empty list literal whose EVERY use in the function body
+   is borrow-safe — `.get(i)` / `.set(i, v)` / `.len()` receiver,
+   `xs[i]` index base (read and write), for-in iterable — is laid out
+   as a typed C array in the creating frame. Zero heap objects (a
+   3-element `list[int]` literal drops from 5 mallocs to 0), zero
+   refcount traffic (no cleanup attribute, no retain/release, no
+   elem_free bookkeeping). Any other position (return, call
+   argument, struct literal field, container element,
+   clone/take/drop argument, assignment source, operator operand,
+   match scrutinee, reassignment target, push/pop) is an escape and
+   the binding silently keeps the ordinary refcounted heap layout —
+   the automatic fallback is conservative and unobservable.
+2. **`#[stack]` / `#[boxed]` — the first let-binding attributes.**
+   `#[stack] let window: list[int] = [0, 1]` forces the stack layout;
+   `#[boxed]` forces the heap layout. Mutually exclusive. Placing
+   either before a `fn` (or a fn attribute before a `let`) is a
+   precise parse error.
+3. **The proof is checker-enforced.** Under `#[stack]`, every
+   escaping use is a COMPILE ERROR naming the use class and line
+   ("escapes its creating frame — return value (line 42). A
+   stack-allocated value can NEVER outlive the function that created
+   it"); `push`/`pop` are compile errors (fixed capacity); non-
+   primitive element types, non-literal or empty initialisers, and
+   generic functions are rejected with precise messages. Enforced by
+   BOTH checkers (`hlc` self-hosted and the Stage-0 boot checker), so
+   `boot.py --check` and the native compiler reject exactly the same
+   programs.
+4. **Codegen.** The let statement emits a typed frame array
+   (`int64_t u_window[2]; u_window[0] = 0; ...` — sequenced element
+   assignments preserve the interpreter's evaluation and panic
+   order); `.get`/`.set`/`.len`, `xs[i]` and for-in lower to
+   bounds-checked typed accessors whose panic message is identical
+   to the boxed runtime's ("array access out of bounds") — the
+   layout is observably identical (differential suite
+   byte-identical, including `--lto`, `-O fast`, PGO). LTO inlining
+   interacts safely (inlined bodies fall back to the heap layout).
+5. **`--opt-stats` layout report** + `make layout-report`: a summary
+   and a per-binding decision table — layout (STACK / BOXED / HEAP /
+   HEAP-PUSH), capacity, and the reason (the first escape site and
+   line for HEAP rows).
+6. **The compiler is the first customer.** `print_opt_stats` holds
+   its layout tally in a `#[stack] list[int]` and its column widths
+   in an un-annotated auto-stack `list[int]` — the self-compiled
+   `hlc` stack-allocates its own bindings (2 today, reported by
+   `bin/hlc --opt-stats src/hlc.hls`).
+7. **Acceptance — `make escape-acceptance`.**
+   `examples/fibonacci.hls` (rewritten) runs the `#[stack]`-window
+   `fib_loop` inner loop 200,000 times:
+   - the C source carries `int64_t u_window[2]` in `usf_fib_loop`'s
+     frame and zero `hl_list_new` calls in `usf_fib_loop` /
+     `usf_spin_fib`;
+   - the deterministic gate (a `-Wl,--wrap=malloc`/
+     `--wrap=realloc` interposer, `tests/memcheck/
+     malloc_count_wrap.c`) counts **90** heap allocations for the
+     whole 200k-round run (a constant: startup + prints) — the
+     `#[boxed]` twin of the same program allocates **12,800,234**,
+     proving both the zero-allocation claim and that the counter
+     catches heap traffic;
+   - `valgrind --tool=massif` also runs when valgrind is installed
+     (the roadmap's literal wording); where it is not, the
+     interposer is the stronger, exact-count equivalent;
+   - interpreter and native outputs remain byte-identical.
+8. **16 new tests** (2 ok differential programs + 13 fail programs
+   covering every escape class and every invalid-attribute shape) +
+   `tests/run_tests.sh` section 16 (a)–(i). Bootstrap deterministic.
+
+Documented scope (conservative by design): primitive element types
+only (pointer elements are refcounted and stay boxed — pointer-
+element stack layout is future work); list-literal initialisers only
+(capacity fixed at compile time); non-generic functions only; and
+`push`/`pop` are treated as growth/shrink escapes.
+
+### Stage 30 — `src/hlc.hls` parser
+
+#### Added — `parse_let_attrs`, `StmtN.attr_stack` / `attr_boxed`
+
+- The first let-binding attributes: `#[stack]` / `#[boxed]` parsed in
+  statement position directly before a `let`; mutual exclusion;
+  precise errors for the wrong position. `parse_attributes` (fn
+  position) rejects them with a pointer to the let form.
+
+### Stage 30 — `src/hlc.hls` escape analysis
+
+#### Added — `escape_check_fn` (+ `esc_collect_stmts` /
+`esc_collect_let` / `esc_walk_stmts` / `esc_walk_stmt` /
+`esc_walk_assign` / `esc_expr`)
+
+- The three-phase per-function pass (collect → classify uses →
+  decide + enforce), recorded on `ctx.layout_map` /
+  `layout_why` / `layout_cap` / `layout_order`; hooked as step 5.5 of
+  `check_program` (after bodies are checked — it reads the mop/muser
+  method tags; before codegen).
+
+### Stage 30 — `src/hlc.hls` codegen
+
+#### Added — `is_stack_var` / `stack_cap_of` / `stack_elem_suffix` /
+`stack_layout_helper_lines`
+
+#### Modified — `gen_stmt` (let + for), `gen_expr` (ident + index),
+`gen_method` (list.len/get/set), `gen_assign` (index target),
+`lto_emit_inline` (`ctx.in_inline_clone`), `print_opt_stats` (layout
+summary + per-binding table), `gen_program` (accessor emission)
+
+### Stage 30 — `boot/` mirror
+
+#### Added — `boot/parser.py` `parse_let_attrs` + stmt fields;
+`boot/checker.py` `escape_check_fn` + the walker mirror (step 3.5 of
+`check()`)
+
+### Stage 30 — Makefile + tests + examples
+
+#### Added — `escape-acceptance`, `layout-report`,
+`tests/memcheck/malloc_count_wrap.c`, section 16 of
+`tests/run_tests.sh`, `tests/ok/feat_stage30_stack.hls`,
+`tests/ok/feat_stage30_auto.hls`, 13 × `tests/fail/fail_stack_*.hls`,
+`examples/stack_layout_demo.hls`; rewritten
+`examples/fibonacci.hls`
 
 ---
 

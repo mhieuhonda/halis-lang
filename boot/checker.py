@@ -513,6 +513,14 @@ class Checker:
         # 3. check function bodies
         for key, fn in self.fns.items():
             self.check_fn(key, fn)
+        # 3.5 Stage 30 (v0.47.0-alpha): escape analysis (boxed-vs-stack
+        # layout). Runs AFTER the bodies are checked: the walker reads
+        # e["rm"] (the builtin-method tag check_method sets) to classify
+        # borrow-safe receivers. Enforces the #[stack] soundness proof
+        # (a stack-allocated value can never escape its creating frame)
+        # and validates #[stack]/#[boxed] applicability.
+        for key, fn in self.fns.items():
+            self.escape_check_fn(key, fn)
         # 4. effects analysis (fixpoint on the call graph)
         self.check_effects()
 
@@ -592,6 +600,285 @@ class Checker:
                 and not self.all_return(fn["body"])):
             self.err("function '%s' does not return on all paths" % fn["name"], fn)
         self.cur_typeparams = saved_typeparams
+
+    # ---------- Stage 30 (v0.47.0-alpha): escape analysis ----------
+    # Boxed-vs-stack layout analysis for list[int] / list[float] /
+    # list[bool] bindings. A binding whose EVERY use stays inside the
+    # creating function (borrow-safe positions only: .get/.set/.len
+    # receiver, xs[i] index base, for-in iterable) can be allocated on
+    # the C stack by the self-hosted compiler — zero heap objects, zero
+    # refcount traffic. #[stack] FORCES the stack layout (any escaping
+    # use is a compile error — the value provably never outlives its
+    # frame); #[boxed] FORCES the heap layout (opt-out of the automatic
+    # analysis). The boot checker mirrors the hlc checker's analysis so
+    # `boot.py --check` rejects exactly the same programs.
+
+    # Borrow-safe builtin list methods (receiver only).
+    ESC_SAFE_LIST_METHODS = ("list.get", "list.set", "list.len")
+    ESC_PRIM_ELEMS = ("int", "float", "bool")
+
+    def escape_check_fn(self, key, fn):
+        """Run the Stage 30 escape analysis over one function body."""
+        if fn.get("extern", False):
+            return
+        # Generic functions (and methods of generic structs) are
+        # instantiated per type-argument set; their codegen runs under
+        # mangled keys, so layout decisions taken on the source key would
+        # not apply. Skip the automatic analysis; #[stack] there is a
+        # clear, documented error rather than a silent no-op.
+        generic = bool(fn.get("typeparams"))
+        if fn["struct"] is not None and fn["struct"] in self.structs:
+            if self.structs[fn["struct"]].get("typeparams"):
+                generic = True
+        if generic:
+            self._escape_check_generic_attrs(fn)
+            return
+        # Phase 1 — collect candidate bindings + validate forced attrs.
+        cand = {}  # name -> decision record
+        self._esc_collect_stmts(fn["body"], cand)
+        # Phase 2 — classify every use of every candidate.
+        self._esc_walk_stmts(fn["body"], cand)
+        # Phase 3 — decide layouts + report #[stack] violations.
+        for name in cand:  # dict preserves discovery order (deterministic)
+            c = cand[name]
+            if c["forced_stack"]:
+                if c["esc"]:
+                    self.err("#[stack] violated: '%s' escapes its creating "
+                             "frame — %s (line %d). A stack-allocated value "
+                             "can NEVER outlive the function that created "
+                             "it: remove the escaping use or drop the "
+                             "attribute." % (name, c["esc"], c["esc_line"]),
+                             {"line": c["line"]})
+                if c["push"]:
+                    self.err("#[stack] violated: '%s' uses push() (line %d) — "
+                             "a stack-allocated list is fixed-capacity "
+                             "(capacity %d, taken from its literal). Use "
+                             ".get/.set within the capacity or drop the "
+                             "attribute." % (name, c["push_line"], c["cap"]),
+                             {"line": c["line"]})
+                if c["pop"]:
+                    self.err("#[stack] violated: '%s' uses pop() (line %d) — "
+                             "a stack-allocated list is fixed-capacity; its "
+                             "length is part of the layout and cannot "
+                             "shrink. Drop the attribute to use pop()."
+                             % (name, c["pop_line"]), {"line": c["line"]})
+            # Final layout (consumed by the codegen side of the mirror
+            # contract; the interpreter itself is layout-agnostic).
+            if c["boxed"]:
+                c["layout"] = "boxed"
+            elif (not c["esc"]) and (not c["push"]) and (not c["pop"]):
+                c["layout"] = "stack"
+            else:
+                c["layout"] = "heap"
+
+    def _escape_check_generic_attrs(self, fn):
+        """Reject #[stack]/#[boxed] inside generic functions / methods
+        with a precise message (the automatic analysis is simply skipped
+        there — layout is instantiation-dependent)."""
+        def visit(stmts):
+            for s in stmts:
+                if s["k"] == "let" and (s.get("stack") or s.get("boxed")):
+                    attr = "stack" if s.get("stack") else "boxed"
+                    self.err("#[%s] is not supported inside generic "
+                             "functions yet (the layout would depend on "
+                             "the type instantiation); drop the attribute "
+                             "here" % attr, s)
+                elif s["k"] in ("if", "while"):
+                    visit(s["body"])
+                    if s["k"] == "if" and s.get("els"):
+                        visit(s["els"])
+                elif s["k"] == "for":
+                    visit(s["body"])
+        visit(fn["body"])
+
+    def _esc_candidate(self, s):
+        """Is this let-stmt a stack-layout candidate? Requires a
+        list[primitive] binding initialised from a NON-EMPTY list
+        literal (the capacity is fixed at compile time)."""
+        t = s["t"]
+        if not is_list(t):
+            return False
+        if list_elem(t) not in self.ESC_PRIM_ELEMS:
+            return False
+        v = s["value"]
+        if v.get("k") != "listlit":
+            return False
+        return len(v["items"]) > 0
+
+    def _esc_collect_stmts(self, stmts, cand):
+        for s in stmts:
+            k = s["k"]
+            if k == "let":
+                forced_stack = bool(s.get("stack"))
+                boxed = bool(s.get("boxed"))
+                if forced_stack or boxed:
+                    attr = "stack" if forced_stack else "boxed"
+                    t = s["t"]
+                    if not is_list(t):
+                        self.err("#[%s] applies to a list[T] binding; '%s' "
+                                 "has type '%s'" % (attr, s["name"], t), s)
+                    if forced_stack:
+                        if list_elem(t) not in self.ESC_PRIM_ELEMS:
+                            self.err("#[stack] requires a primitive element "
+                                     "type (int / float / bool); '%s' is "
+                                     "'%s' whose elements are reference-"
+                                     "counted (boxed) values — a documented "
+                                     "Stage 30 limitation" % (s["name"], t), s)
+                        v = s["value"]
+                        if v.get("k") != "listlit":
+                            self.err("#[stack] requires a list-literal "
+                                     "initializer (the capacity is fixed at "
+                                     "compile time); '%s' is initialised "
+                                     "from a call/expression" % s["name"], s)
+                        elif len(v["items"]) == 0:
+                            self.err("#[stack] on an empty list literal has "
+                                     "no capacity — every .get() would "
+                                     "panic; use a non-empty literal or "
+                                     "drop the attribute", s)
+                if self._esc_candidate(s) and not boxed:
+                    v = s["value"]
+                    cand[s["name"]] = {
+                        "line": s["line"], "cap": len(v["items"]),
+                        "forced_stack": forced_stack, "boxed": boxed,
+                        "esc": None, "esc_line": 0,
+                        "push": False, "push_line": 0,
+                        "pop": False, "pop_line": 0,
+                        "layout": "heap",
+                    }
+            elif k == "if":
+                self._esc_collect_stmts(s["then"], cand)
+                if s.get("els"):
+                    self._esc_collect_stmts(s["els"], cand)
+            elif k == "while":
+                self._esc_collect_stmts(s["body"], cand)
+            elif k == "for":
+                self._esc_collect_stmts(s["body"], cand)
+
+    def _esc_walk_stmts(self, stmts, cand):
+        for s in stmts:
+            k = s["k"]
+            if k == "let":
+                v = s["value"]
+                if v.get("k") == "listlit":
+                    # Element expressions of ANY list literal (including a
+                    # candidate's own literal — its elements are primitive
+                    # expressions and cannot alias a tracked binding, but
+                    # walk them anyway for uniformity).
+                    for it in v["items"]:
+                        self._esc_expr(it, cand, False,
+                                       "element of a list literal")
+                else:
+                    self._esc_expr(v, cand, False,
+                                   "initializer of '%s'" % s["name"])
+            elif k == "assign":
+                tgt = s["target"]
+                if tgt["k"] == "ident":
+                    if tgt["name"] in cand:
+                        c = cand[tgt["name"]]
+                        if not c["esc"]:
+                            c["esc"] = "reassigned (assignment target)"
+                            c["esc_line"] = tgt.get("line", 0)
+                elif tgt["k"] == "index" and tgt["target"].get("k") == "ident":
+                    # xs[i] = v — the base binding is the index base (a
+                    # borrow-safe position); only the index expr escapes.
+                    self._esc_expr(tgt["idx"], cand, False,
+                                   "index expression")
+                else:
+                    self._esc_expr(tgt, cand, False, "assignment target")
+                self._esc_expr(s["value"], cand, False, "assigned value")
+            elif k == "if":
+                self._esc_expr(s["cond"], cand, False, "if condition")
+                self._esc_walk_stmts(s["then"], cand)
+                if s.get("els"):
+                    self._esc_walk_stmts(s["els"], cand)
+            elif k == "while":
+                self._esc_expr(s["cond"], cand, False, "while condition")
+                self._esc_walk_stmts(s["body"], cand)
+            elif k == "for":
+                it = s["iter"]
+                if it.get("k") == "ident" and it["name"] in cand:
+                    pass  # for-in iterable: borrow-safe position
+                else:
+                    self._esc_expr(it, cand, False, "for-in iterable")
+                self._esc_walk_stmts(s["body"], cand)
+            elif k == "return":
+                if s["value"] is not None:
+                    self._esc_expr(s["value"], cand, False, "return value")
+            elif k == "expr":
+                self._esc_expr(s["e"], cand, False,
+                               "discarded expression value")
+
+    def _esc_expr(self, e, cand, safe, why):
+        """Walk an expression, classifying every occurrence of a tracked
+        binding. `safe=True` means the CURRENT position is borrow-safe
+        (receiver of .get/.set/.len, index base); method/index nodes
+        re-derive the flag for their own children, so the ambient flag
+        only matters when an ident node is reached directly."""
+        if e is None or not isinstance(e, dict):
+            return
+        k = e.get("k")
+        if k == "ident":
+            name = e["name"]
+            if name in cand:
+                c = cand[name]
+                if not safe and not c["esc"]:
+                    c["esc"] = why
+                    c["esc_line"] = e.get("line", 0)
+            return
+        if k == "method":
+            rm = e.get("rm")
+            mname = e.get("name", "?")
+            tgt = e["target"]
+            if rm and rm[0] == "builtin" and rm[1] in self.ESC_SAFE_LIST_METHODS:
+                # .get/.set/.len receiver is borrow-safe.
+                self._esc_expr(tgt, cand, True, "receiver")
+            elif rm and rm[1] in ("list.push", "list.pop") and \
+                    tgt.get("k") == "ident" and tgt["name"] in cand:
+                # push/pop on a tracked binding: record the specific
+                # growth/shrink use (a dedicated error class — fixed
+                # capacity).
+                c = cand[tgt["name"]]
+                if rm[1] == "list.push" and not c["push"]:
+                    c["push"] = True
+                    c["push_line"] = tgt.get("line", 0)
+                elif rm[1] == "list.pop" and not c["pop"]:
+                    c["pop"] = True
+                    c["pop_line"] = tgt.get("line", 0)
+            else:
+                self._esc_expr(tgt, cand, False,
+                               "receiver of '%s()'" % mname)
+            for a in e.get("args", []):
+                self._esc_expr(a, cand, False,
+                               "argument of '%s()'" % mname)
+            return
+        if k == "index":
+            self._esc_expr(e["target"], cand, True, "index base")
+            self._esc_expr(e["idx"], cand, False, "index expression")
+            return
+        if k == "call":
+            for a in e.get("args", []):
+                self._esc_expr(a, cand, False,
+                               "argument of call '%s()'" % e.get("name", "?"))
+            return
+        # Generic children (bin: l/r, un/qmark: e, field/fieldcall:
+        # target, match: scrut + arm bodies, structlit: fields).
+        for ck in ("e", "l", "r", "scrut", "target"):
+            child = e.get(ck)
+            if isinstance(child, dict) and "k" in child:
+                self._esc_expr(child, cand, False, why)
+        if k == "match":
+            for arm in e.get("arms", []):
+                self._esc_expr(arm["body"], cand, False, "match arm body")
+        elif k == "listlit":
+            for it in e.get("items", []):
+                self._esc_expr(it, cand, False, "element of a list literal")
+        elif k == "structlit":
+            for fname, fexpr in e.get("fields", []):
+                self._esc_expr(fexpr, cand, False,
+                               "field '%s' of a struct literal" % fname)
+        for a in e.get("args", []):
+            if isinstance(a, dict) and "k" in a:
+                self._esc_expr(a, cand, False, why)
 
     # ---------- Stage 17: contracts ----------
     def check_contracts(self, key, fn, env):

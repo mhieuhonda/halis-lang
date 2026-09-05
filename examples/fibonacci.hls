@@ -1,4 +1,18 @@
-# fibonacci.hls — recursion + loops, overflow-checked arithmetic
+# fibonacci.hls — recursion + loops, overflow-checked arithmetic.
+#
+# Stage 30 (v0.47.0-alpha): fib_loop's inner loop is the roadmap's
+# escape-analysis acceptance target — "the inner loop allocates zero
+# heap objects". The sliding window [a, b] is a #[stack] list: the
+# checker PROVED it never escapes fib_loop's frame (every use is a
+# borrow-safe .get/.set receiver), so the C backend lays it out as a
+# plain int64_t[2] array in the frame. Zero hl_list structs, zero
+# boxed elements, zero refcount traffic — verified by the
+# `make escape-acceptance` gate (valgrind --tool=massif when
+# available, else the -Wl,--wrap=malloc interposer).
+#
+# fib(n) itself stays on the recursive path (checked arithmetic, the
+# classic compiler stress shape); fib_loop is the O(n) iterative path.
+
 fn fib(n: int) -> int {
     if n <= 1 {
         return n
@@ -6,17 +20,38 @@ fn fib(n: int) -> int {
     return fib(n - 1) + fib(n - 2)
 }
 
+# fib_loop: the iterative O(n) path. The #[stack] window list is
+# created and consumed entirely inside this frame — the escape
+# analysis proved it, and #[stack] turns that proof into a compile-time
+# guarantee (any escaping use would be a compile error naming the site).
 fn fib_loop(n: int) -> int {
-    let mut a: int = 0
-    let mut b: int = 1
+    #[stack]
+    let window: list[int] = [0, 1]
     let mut i: int = 0
     while i < n {
-        let t: int = a + b
-        a = b
-        b = t
+        # window.get / window.set are in-frame borrows — the classic
+        # sliding-window update, now with zero heap traffic.
+        let next: int = window.get(0) + window.get(1)
+        window.set(0, window.get(1))
+        window.set(1, next)
         i = i + 1
     }
-    return a
+    # After n iterations the window holds [F(n), F(n+1)].
+    return window.get(0)
+}
+
+# spin_fib: calls the inner loop `rounds` times so the acceptance gate
+# can observe allocation behaviour over many iterations. Pure (no
+# uses clause) — the compiler statically guarantees it performs no
+# I/O, which is exactly what a zero-allocation inner loop should be.
+fn spin_fib(rounds: int) -> int {
+    let mut acc: int = 0
+    let mut r: int = 0
+    while r < rounds {
+        acc = acc + fib_loop(30)
+        r = r + 1
+    }
+    return acc
 }
 
 fn main() -> int uses IO {
@@ -27,5 +62,9 @@ fn main() -> int uses IO {
     }
     println("")
     println("fib_loop(70) = " + fib_loop(70).to_str())
+    # The acceptance workload: 200,000 iterations of the (stack-laid-out)
+    # inner loop. Output stays deterministic so the interpreter and the
+    # native binary remain byte-identical (differential suite).
+    println("spin_fib(200000) = " + spin_fib(200000).to_str())
     return 0
 }

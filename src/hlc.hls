@@ -162,7 +162,15 @@ struct StmtN {
     else_body: list[int],
     iter: int,
     e: int,
-    line: int
+    line: int,
+    # ---- Stage 30 (v0.47.0-alpha): let-binding layout attributes ----
+    # attr_stack: #[stack] — force the stack layout for this list[T]
+    # binding (compile error if the value escapes its creating frame).
+    # attr_boxed: #[boxed] — force the heap (boxed) layout, opting out
+    # of the automatic escape analysis. Both live on `let` statements
+    # only; parse_stmt reads them via parse_let_attrs.
+    attr_stack: bool,
+    attr_boxed: bool
 }
 
 struct Ctx {
@@ -334,7 +342,46 @@ struct Ctx {
     # stderr after codegen (inline / hot / cold / noinline decisions,
     # annotated vs PGO vs heuristic). Independent of --lto-stats (which
     # is LTO-specific); --opt-stats covers the whole program.
-    opt_stats: bool
+    opt_stats: bool,
+    # ---- Stage 30 (v0.47.0-alpha): boxed-vs-stack layout analysis ----
+    # cur_let_stack / cur_let_boxed: the #[stack] / #[boxed] attributes
+    # for the `let` statement currently being parsed (parse_stmt ->
+    # parse_let_attrs -> parse_let). Reset after every let so an
+    # un-attributed let never inherits the previous one's attrs.
+    cur_let_stack: bool,
+    cur_let_boxed: bool,
+    # layout_map: "<fn key>::<binding>" -> layout decision:
+    #   "stack"      — stack-allocated (typed C array, no refcount)
+    #   "boxed"      — #[boxed] forced heap
+    #   "heap"       — automatic analysis found an escaping use
+    #   "heap-push"  — automatic analysis found push/pop (growing lists
+    #                   cannot use the fixed-capacity stack layout)
+    # Filled by escape_check_fn AFTER the bodies are checked (it reads
+    # the mop/muser method tags the checker sets); consulted by the
+    # codegen at the let / method / index / for-in / assign sites.
+    layout_map: map[str, str],
+    # layout_why: "<fn key>::<binding>" -> the human-readable reason
+    # (escape site / push site / "forced" / "escape-free"), used by the
+    # --opt-stats layout report.
+    layout_why: map[str, str],
+    # layout_cap: "<fn key>::<binding>" -> the fixed capacity (the
+    # literal length) of a stack-allocated binding.
+    layout_cap: map[str, int],
+    # layout_order: the keys in discovery order (deterministic reports
+    # — HLS maps are insertion-ordered, but an explicit list documents
+    # the guarantee and keeps the report stable).
+    layout_order: list[str],
+    # layout_stack_n: how many bindings ended up stack-allocated (the
+    # codegen emits the hlc_sg_/hlc_ss_ accessor helpers when > 0; the
+    # opt-stats report prints the total).
+    layout_stack_n: int,
+    # in_inline_clone: > 0 while the LTO inliner generates a callee body
+    # at the call site. Layout lookups are keyed by the SOURCE function;
+    # inside an inlined clone ctx.cur_fn is the CALLER, so a lookup would
+    # resolve the caller's same-named binding — wrong key, wrong layout.
+    # Stack-layout codegen (and is_stack_var) is suppressed while > 0;
+    # inlined bodies always use the (sound) heap layout.
+    in_inline_clone: int
 }
 
 fn new_ctx(src: str) -> Ctx {
@@ -367,7 +414,11 @@ fn new_ctx(src: str) -> Ctx {
         cur_attrs_stack_size: -1, cur_attrs_no_red_zone: false,
         cur_attrs_irq_handler: false, cur_attrs_inline: "",
         cur_attrs_hot: false, cur_attrs_cold: false,
-        opt_stats: false
+        opt_stats: false,
+        cur_let_stack: false, cur_let_boxed: false,
+        layout_map: map_new(), layout_why: map_new(),
+        layout_cap: map_new(), layout_order: [], layout_stack_n: 0,
+        in_inline_clone: 0
     }
 }
 
@@ -919,7 +970,8 @@ fn nx_stmt(ctx: Ctx, kind: str, line: int) -> int {
     let s: StmtN = StmtN {
         kind: kind, name: "", vtype: "", is_mut: false, value: -1,
         target: -1, cond: -1, body: [], else_body: [], iter: -1, e: -1,
-        line: line
+        line: line,
+        attr_stack: false, attr_boxed: false
     }
     ctx.stmts.push(s)
     return ctx.stmts.len() - 1
@@ -1133,6 +1185,11 @@ fn reset_cur_attrs(ctx: Ctx) -> void {
     ctx.cur_attrs_inline = ""
     ctx.cur_attrs_hot = false
     ctx.cur_attrs_cold = false
+    # Stage 30: let-binding attrs are reset by parse_let itself (they
+    # apply to exactly one statement); also clear here for belt-and-
+    # braces so no state leaks between declarations.
+    ctx.cur_let_stack = false
+    ctx.cur_let_boxed = false
 }
 
 # parse_attributes (Stage 28+29, v0.45.0-alpha): parse one or more
@@ -1199,6 +1256,13 @@ fn parse_attributes(ctx: Ctx) -> void {
                 # If multiple stack_size attrs appear, the LAST wins
                 # (the user's intent is to refine; we don't accumulate).
                 ctx.cur_attrs_stack_size = n
+            } else if attr_name == "stack" || attr_name == "boxed" {
+                # Stage 30 (v0.47.0-alpha): #[stack] / #[boxed] are
+                # LET-BINDING attributes (they control the boxed-vs-stack
+                # layout of a list[T] value), not function attributes.
+                # Placing one before a fn is a clear user error — point
+                # them at the let statement form.
+                perr_at(ctx, "'" + attr_name + "' is a let-binding attribute — place it inside a function, directly before a 'let' statement (e.g. #[" + attr_name + "] let xs: list[int] = [1, 2, 3])", hash_tok)
             } else {
                 perr_at(ctx, "unknown attribute '" + attr_name + "' (known: inline(always), inline(never), hot, cold, no_red_zone, irq_handler, stack_size(N))", hash_tok)
             }
@@ -1677,6 +1741,20 @@ fn parse_block(ctx: Ctx) -> list[int] {
 
 fn parse_stmt(ctx: Ctx) -> int {
     let t: Tok = ctx.toks.get(ctx.pos)
+    # Stage 30 (v0.47.0-alpha): a `#[stack]` / `#[boxed]` attribute
+    # list directly before a statement applies to a `let` binding
+    # (the only statement that accepts attributes). The lexer emits a
+    # bare `#` token ONLY when it is immediately followed by `[`
+    # (any other `#` starts a line comment), so seeing sym `#` here is
+    # unambiguous.
+    if t.kind == "sym" && t.value == "#" {
+        parse_let_attrs(ctx)
+        let nt: Tok = ctx.toks.get(ctx.pos)
+        if !(nt.kind == "kw" && nt.value == "let") {
+            perr_at(ctx, "#[stack]/#[boxed] attributes apply to a 'let' binding", t)
+        }
+        return parse_let(ctx)
+    }
     if t.kind == "kw" {
         if t.value == "let" {
             return parse_let(ctx)
@@ -1794,7 +1872,52 @@ fn parse_let(ctx: Ctx) -> int {
     ctx.stmts[idx].vtype = ty
     ctx.stmts[idx].is_mut = is_mut
     ctx.stmts[idx].value = val
+    # Stage 30 (v0.47.0-alpha): snapshot the #[stack] / #[boxed]
+    # let-binding layout attributes (set by parse_let_attrs via
+    # parse_stmt) onto the statement, then reset the cache so the
+    # next let never inherits them.
+    ctx.stmts[idx].attr_stack = ctx.cur_let_stack
+    ctx.stmts[idx].attr_boxed = ctx.cur_let_boxed
+    ctx.cur_let_stack = false
+    ctx.cur_let_boxed = false
     return idx
+}
+
+# parse_let_attrs (Stage 30, v0.47.0-alpha): parse one or more
+# `#[stack]` / `#[boxed]` attribute lists that apply to the FOLLOWING
+# `let` binding (called from parse_stmt). Only the two layout
+# attributes are accepted here — fn-level attributes (inline, hot,
+# ...) belong before a fn declaration and are rejected with a pointer.
+# The two are mutually exclusive. The caller (parse_stmt) verifies the
+# next token is `let`.
+fn parse_let_attrs(ctx: Ctx) -> void {
+    while at_sym(ctx, "#") {
+        let hash_tok: Tok = ctx.toks.get(ctx.pos)
+        eat_sym(ctx, "#")
+        eat_sym(ctx, "[")
+        while !at_sym(ctx, "]") {
+            let attr_name: str = eat_ident(ctx)
+            if attr_name == "stack" {
+                if ctx.cur_let_boxed {
+                    perr_at(ctx, "'stack' and 'boxed' are mutually exclusive", hash_tok)
+                }
+                ctx.cur_let_stack = true
+            } else if attr_name == "boxed" {
+                if ctx.cur_let_stack {
+                    perr_at(ctx, "'stack' and 'boxed' are mutually exclusive", hash_tok)
+                }
+                ctx.cur_let_boxed = true
+            } else {
+                perr_at(ctx, "unknown let-binding attribute '" + attr_name + "' (known: stack, boxed; function attributes go before a fn declaration)", hash_tok)
+            }
+            if at_sym(ctx, ",") {
+                ctx.pos = ctx.pos + 1
+            } else if !at_sym(ctx, "]") {
+                perr(ctx, "expected ',' or ']' in attribute list")
+            }
+        }
+        eat_sym(ctx, "]")
+    }
 }
 
 fn parse_if(ctx: Ctx) -> int {
@@ -2764,6 +2887,474 @@ fn estimate_stack_calls(ctx: Ctx, e: int) -> int {
     return calls
 }
 
+# ============================================================================
+# STAGE 30 (v0.47.0-alpha): boxed-vs-stack layout analysis (escape analysis)
+# ============================================================================
+#
+# A `list[T]` binding (T in {int, float, bool}) that does NOT escape its
+# creating function is allocated on the C stack as a typed array:
+#   * zero heap objects (no hl_list struct, no items buffer, no boxed
+#     elements — a 3-element list literal drops from 5 mallocs to 0),
+#   * zero refcount traffic (no cleanup attribute, no retain/release,
+#     no elem_free bookkeeping).
+#
+# The analysis is PROVEN SAFE, not assumed: a binding is stack-allocated
+# only when EVERY use in the function body is in a borrow-safe position —
+#   * receiver of the builtin .get(i) / .set(i, v) / .len() methods,
+#   * the base of an index expression xs[i] (read AND write),
+#   * the iterable of a for-in loop.
+# ANY other position (return, call argument, struct literal field, list
+# literal element, clone/take/drop argument, assignment source, operator
+# operand, match scrutinee...) is an escape — the binding keeps the
+# ordinary refcounted heap layout. The proof is enforced by the checker:
+# `#[stack]` on a binding with a single escaping use is a COMPILE ERROR
+# naming the escape site, so a stack-allocated value can NEVER outlive
+# its creating frame. `#[boxed]` forces the heap layout (an explicit
+# opt-out of the automatic analysis).
+#
+# Scope (documented limitations, conservative by design):
+#   * primitive element types only — list[str] / list[Point] elements
+#     are reference-counted and must stay boxed (pointer-element stack
+#     layout is future work),
+#   * list-literal initialisers only (the capacity is fixed at compile
+#     time by the literal length),
+#   * non-generic functions only (generic instantiations are generated
+#     under mangled keys; layout there would be instantiation-dependent),
+#   * push()/pop() are escapes (a fixed-capacity array cannot grow or
+#     shrink); under #[stack] they are compile errors.
+#
+# The analysis runs AFTER the bodies are checked (it reads the mop/muser
+# method tags check_method sets), and BEFORE codegen: the decisions are
+# recorded in ctx.layout_map ("<fn key>::<binding>" -> layout) which the
+# codegen consults at the let / method / index / for-in / assign sites.
+
+struct EscRec {
+    name: str,          # binding name
+    line: int,          # the let statement's line
+    cap: int,           # fixed capacity (literal length; 0 for boxed records)
+    forced: bool,       # #[stack] forced (escape = compile error)
+    boxed: bool,        # #[boxed] forced heap
+    esc: str,           # first escape reason ("" = escape-free so far)
+    esc_line: int,      # line of the first escaping use
+    push: bool,         # a .push() receiver use exists
+    push_line: int,
+    pop: bool,          # a .pop() receiver use exists
+    pop_line: int
+}
+
+fn esc_find(recs: list[EscRec], name: str) -> int {
+    let mut i: int = 0
+    while i < recs.len() {
+        if recs.get(i).name == name {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+fn esc_prim_elem(t: str) -> bool {
+    return t == "int" || t == "float" || t == "bool"
+}
+
+# esc_candidate: is this let-stmt eligible for a layout decision?
+# Requires list[primitive] + a NON-EMPTY list-literal initialiser (the
+# capacity is fixed at compile time by the literal).
+fn esc_candidate(ctx: Ctx, s: StmtN) -> bool {
+    if !is_list_t(s.vtype) {
+        return false
+    }
+    if !esc_prim_elem(list_elem_t(s.vtype)) {
+        return false
+    }
+    if ctx.exprs[s.value].kind != "listlit" {
+        return false
+    }
+    return ctx.exprs[s.value].args.len() > 0
+}
+
+# escape_check_fn: run the Stage 30 analysis over one function. Records
+# the layout decisions on ctx; raises compile errors for #[stack]
+# violations (the soundness proof).
+fn escape_check_fn(ctx: Ctx, key: str) -> void {
+    let f: FnInfo = ctx.fns.get_or(key, dummy_fn())
+    if f.is_extern {
+        return
+    }
+    # Generic functions (and methods of generic structs) are generated
+    # per instantiation under mangled keys; a layout decision taken on
+    # the source key would not apply there. The automatic analysis is
+    # simply skipped; a forced attribute is a clear, documented error
+    # rather than a silent no-op.
+    let mut generic: bool = f.typeparams.len() > 0
+    if f.is_method && ctx.structs.has(f.struct_of) {
+        let st: StructInfo = ctx.structs.get_or(f.struct_of, dummy_struct())
+        if st.typeparams.len() > 0 {
+            generic = true
+        }
+    }
+    if generic {
+        esc_generic_scan(ctx, f.body)
+        return
+    }
+    let recs: list[EscRec] = []
+    esc_collect_stmts(ctx, f.body, recs)
+    esc_walk_stmts(ctx, f.body, recs)
+    # Decide + record. esc_line/push_line are inside the reason strings.
+    let mut i: int = 0
+    while i < recs.len() {
+        let r: EscRec = recs.get(i)
+        let lkey: str = key + "::" + r.name
+        if r.forced {
+            if r.esc != "" {
+                cerr(r.line, "#[stack] violated: '" + r.name + "' escapes its creating frame — " + r.esc
+                    + " (line " + r.esc_line.to_str() + "). A stack-allocated value can NEVER outlive the function that created it: remove the escaping use or drop the attribute.")
+            }
+            if r.push {
+                cerr(r.line, "#[stack] violated: '" + r.name + "' uses push() (line " + r.push_line.to_str()
+                    + ") — a stack-allocated list is fixed-capacity (capacity " + r.cap.to_str()
+                    + ", taken from its literal). Use .get/.set within the capacity or drop the attribute.")
+            }
+            if r.pop {
+                cerr(r.line, "#[stack] violated: '" + r.name + "' uses pop() (line " + r.pop_line.to_str()
+                    + ") — a stack-allocated list is fixed-capacity; its length is part of the layout and cannot shrink. Drop the attribute to use pop().")
+            }
+        }
+        ctx.layout_order.push(lkey)
+        if r.boxed {
+            ctx.layout_map.set(lkey, "boxed")
+            ctx.layout_why.set(lkey, "#[boxed] forced heap layout")
+            ctx.layout_cap.set(lkey, r.cap)
+        } else if r.esc == "" && !r.push && !r.pop {
+            ctx.layout_map.set(lkey, "stack")
+            if r.forced {
+                ctx.layout_why.set(lkey, "#[stack] forced (escape-free)")
+            } else {
+                ctx.layout_why.set(lkey, "escape-free (auto)")
+            }
+            ctx.layout_cap.set(lkey, r.cap)
+            ctx.layout_stack_n = ctx.layout_stack_n + 1
+        } else if r.push || r.pop {
+            ctx.layout_map.set(lkey, "heap-push")
+            let mut why: str = "uses push() (grows; incompatible with fixed capacity)"
+            if r.pop {
+                why = "uses pop() (shrinks; incompatible with fixed capacity)"
+            }
+            ctx.layout_why.set(lkey, why)
+            ctx.layout_cap.set(lkey, r.cap)
+        } else {
+            ctx.layout_map.set(lkey, "heap")
+            ctx.layout_why.set(lkey, "escapes: " + r.esc + " (line " + r.esc_line.to_str() + ")")
+            ctx.layout_cap.set(lkey, r.cap)
+        }
+        i = i + 1
+    }
+}
+
+# esc_generic_scan: reject #[stack]/#[boxed] inside generic functions.
+fn esc_generic_scan(ctx: Ctx, stmts: list[int]) -> void {
+    let mut i: int = 0
+    while i < stmts.len() {
+        let s: StmtN = ctx.stmts[stmts.get(i)]
+        if s.kind == "let" {
+            if s.attr_stack || s.attr_boxed {
+                let mut attr: str = "boxed"
+                if s.attr_stack {
+                    attr = "stack"
+                }
+                cerr(s.line, "#[" + attr + "] is not supported inside generic functions yet (the layout would depend on the type instantiation); drop the attribute here")
+            }
+        } else if s.kind == "if" {
+            esc_generic_scan(ctx, s.body)
+            if s.else_body.len() > 0 {
+                esc_generic_scan(ctx, s.else_body)
+            }
+        } else if s.kind == "while" {
+            esc_generic_scan(ctx, s.body)
+        } else if s.kind == "for" {
+            esc_generic_scan(ctx, s.body)
+        }
+        i = i + 1
+    }
+}
+
+# ---- Phase 1: collect candidate bindings + validate forced attrs ----
+
+fn esc_collect_stmts(ctx: Ctx, stmts: list[int], recs: list[EscRec]) -> void {
+    let mut i: int = 0
+    while i < stmts.len() {
+        let s: StmtN = ctx.stmts[stmts.get(i)]
+        if s.kind == "let" {
+            esc_collect_let(ctx, s, recs)
+        } else if s.kind == "if" {
+            esc_collect_stmts(ctx, s.body, recs)
+            if s.else_body.len() > 0 {
+                esc_collect_stmts(ctx, s.else_body, recs)
+            }
+        } else if s.kind == "while" {
+            esc_collect_stmts(ctx, s.body, recs)
+        } else if s.kind == "for" {
+            esc_collect_stmts(ctx, s.body, recs)
+        }
+        i = i + 1
+    }
+}
+
+fn esc_collect_let(ctx: Ctx, s: StmtN, recs: list[EscRec]) -> void {
+    if !s.attr_stack && !s.attr_boxed {
+        # Un-attributed: a silent auto-mode candidate.
+        if esc_candidate(ctx, s) {
+            recs.push(EscRec {
+                name: s.name, line: s.line,
+                cap: ctx.exprs[s.value].args.len(),
+                forced: false, boxed: false,
+                esc: "", esc_line: 0,
+                push: false, push_line: 0,
+                pop: false, pop_line: 0
+            })
+        }
+        return
+    }
+    let mut attr: str = "boxed"
+    if s.attr_stack {
+        attr = "stack"
+    }
+    if !is_list_t(s.vtype) {
+        cerr(s.line, "#[" + attr + "] applies to a list[T] binding; '" + s.name + "' has type '" + s.vtype + "'")
+    }
+    if s.attr_stack {
+        # #[stack] requirements: primitive elements, list-literal init
+        # (fixed capacity), non-empty literal (capacity > 0).
+        if !esc_prim_elem(list_elem_t(s.vtype)) {
+            cerr(s.line, "#[stack] requires a primitive element type (int / float / bool); '" + s.name + "' is '" + s.vtype
+                + "' whose elements are reference-counted (boxed) values — a documented Stage 30 limitation")
+        }
+        if ctx.exprs[s.value].kind != "listlit" {
+            cerr(s.line, "#[stack] requires a list-literal initializer (the capacity is fixed at compile time); '" + s.name
+                + "' is initialised from a call/expression")
+        } else if ctx.exprs[s.value].args.len() == 0 {
+            cerr(s.line, "#[stack] on an empty list literal has no capacity — every .get() would panic; use a non-empty literal or drop the attribute")
+        }
+    }
+    if esc_candidate(ctx, s) && !s.attr_boxed {
+        recs.push(EscRec {
+            name: s.name, line: s.line,
+            cap: ctx.exprs[s.value].args.len(),
+            forced: s.attr_stack, boxed: false,
+            esc: "", esc_line: 0,
+            push: false, push_line: 0,
+            pop: false, pop_line: 0
+        })
+    } else if s.attr_boxed && is_list_t(s.vtype) {
+        # #[boxed] is legal on any list binding (it only forces the heap
+        # side); record it for the layout report even when it is not a
+        # stack candidate.
+        let mut cap: int = 0
+        if ctx.exprs[s.value].kind == "listlit" {
+            cap = ctx.exprs[s.value].args.len()
+        }
+        recs.push(EscRec {
+            name: s.name, line: s.line,
+            cap: cap,
+            forced: false, boxed: true,
+            esc: "", esc_line: 0,
+            push: false, push_line: 0,
+            pop: false, pop_line: 0
+        })
+    }
+}
+
+# ---- Phase 2: classify every use of every candidate ----
+
+fn esc_walk_stmts(ctx: Ctx, stmts: list[int], recs: list[EscRec]) -> void {
+    let mut i: int = 0
+    while i < stmts.len() {
+        esc_walk_stmt(ctx, ctx.stmts[stmts.get(i)], recs)
+        i = i + 1
+    }
+}
+
+fn esc_walk_stmt(ctx: Ctx, s: StmtN, recs: list[EscRec]) -> void {
+    if s.kind == "let" {
+        if ctx.exprs[s.value].kind == "listlit" {
+            # Element expressions of any list literal. A candidate's own
+            # elements are primitive expressions (they cannot alias a
+            # tracked binding), but walk them anyway for uniformity —
+            # heap literals can contain anything.
+            let mut i: int = 0
+            while i < ctx.exprs[s.value].args.len() {
+                esc_expr(ctx, ctx.exprs[s.value].args.get(i), recs, false, "element of a list literal")
+                i = i + 1
+            }
+        } else {
+            esc_expr(ctx, s.value, recs, false, "initializer of '" + s.name + "'")
+        }
+    } else if s.kind == "assign" {
+        esc_walk_assign(ctx, s, recs)
+    } else if s.kind == "if" {
+        esc_expr(ctx, s.cond, recs, false, "if condition")
+        esc_walk_stmts(ctx, s.body, recs)
+        if s.else_body.len() > 0 {
+            esc_walk_stmts(ctx, s.else_body, recs)
+        }
+    } else if s.kind == "while" {
+        esc_expr(ctx, s.cond, recs, false, "while condition")
+        esc_walk_stmts(ctx, s.body, recs)
+    } else if s.kind == "for" {
+        # for-in iterable: a DIRECT ident reference to a tracked binding
+        # is the borrow-safe iterable position. Anything else (calls,
+        # field exprs...) is walked as an ordinary escaping position.
+        if !(ctx.exprs[s.iter].kind == "ident" && esc_find(recs, ctx.exprs[s.iter].name) >= 0) {
+            esc_expr(ctx, s.iter, recs, false, "for-in iterable")
+        }
+        esc_walk_stmts(ctx, s.body, recs)
+    } else if s.kind == "return" {
+        if s.value != -1 {
+            esc_expr(ctx, s.value, recs, false, "return value")
+        }
+    } else if s.kind == "expr" {
+        esc_expr(ctx, s.e, recs, false, "discarded expression value")
+    }
+    # break / continue: no expressions.
+}
+
+fn esc_walk_assign(ctx: Ctx, s: StmtN, recs: list[EscRec]) -> void {
+    let tgt: int = s.target
+    if ctx.exprs[tgt].kind == "ident" {
+        # Whole-binding reassignment of a tracked binding: the new value
+        # replaces the frame-resident storage — an escape (the binding
+        # can no longer be a plain stack array).
+        let ri: int = esc_find(recs, ctx.exprs[tgt].name)
+        if ri >= 0 {
+            let r: EscRec = recs.get(ri)
+            if r.esc == "" {
+                r.esc = "reassigned (assignment target)"
+                r.esc_line = ctx.exprs[tgt].line
+            }
+        }
+    } else if ctx.exprs[tgt].kind == "index" && ctx.exprs[ctx.exprs[tgt].left].kind == "ident" {
+        # xs[i] = v — the base binding is the index base (borrow-safe);
+        # only the index expression is an ordinary position.
+        esc_expr(ctx, ctx.exprs[tgt].right, recs, false, "index expression")
+    } else {
+        # Field assignment / nested index bases: the whole target chain
+        # is an ordinary position.
+        esc_expr(ctx, tgt, recs, false, "assignment target")
+    }
+    esc_expr(ctx, s.value, recs, false, "assigned value")
+}
+
+# esc_expr: walk an expression, classifying every occurrence of a
+# tracked binding. `safe=true` means the CURRENT position is
+# borrow-safe (receiver of .get/.set/.len, index base); method and
+# index nodes re-derive the flag for their own children, so the ambient
+# flag only matters when an ident node is reached directly.
+fn esc_expr(ctx: Ctx, e: int, recs: list[EscRec], safe: bool, why: str) -> void {
+    if e < 0 {
+        return
+    }
+    let n: ExprN = ctx.exprs[e]
+    if n.kind == "ident" {
+        let ri: int = esc_find(recs, n.name)
+        if ri >= 0 {
+            let r: EscRec = recs.get(ri)
+            if !safe && r.esc == "" {
+                r.esc = why
+                r.esc_line = n.line
+            }
+        }
+        return
+    }
+    if n.kind == "method" {
+        let mname: str = n.name
+        if !n.muser && (n.mop == "list.get" || n.mop == "list.set" || n.mop == "list.len") {
+            # Borrow-safe builtin list methods: receiver stays in-frame.
+            esc_expr(ctx, n.left, recs, true, "receiver")
+        } else if !n.muser && (n.mop == "list.push" || n.mop == "list.pop") && ctx.exprs[n.left].kind == "ident" {
+            # push/pop on a tracked binding: a dedicated growth/shrink
+            # use class (fixed capacity — cannot grow or shrink).
+            let ri: int = esc_find(recs, ctx.exprs[n.left].name)
+            if ri >= 0 {
+                let r: EscRec = recs.get(ri)
+                if n.mop == "list.push" && !r.push {
+                    r.push = true
+                    r.push_line = ctx.exprs[n.left].line
+                }
+                if n.mop == "list.pop" && !r.pop {
+                    r.pop = true
+                    r.pop_line = ctx.exprs[n.left].line
+                }
+            } else {
+                esc_expr(ctx, n.left, recs, false, "receiver of '" + mname + "()'")
+            }
+        } else {
+            # User method or non-list builtin: the receiver escapes.
+            esc_expr(ctx, n.left, recs, false, "receiver of '" + mname + "()'")
+        }
+        let mut i: int = 0
+        while i < n.args.len() {
+            esc_expr(ctx, n.args.get(i), recs, false, "argument of '" + mname + "()'")
+            i = i + 1
+        }
+        return
+    }
+    if n.kind == "index" {
+        # xs[i]: the base binding is borrow-safe (the read/write stays
+        # in-frame); the index expression is an ordinary position.
+        esc_expr(ctx, n.left, recs, true, "index base")
+        esc_expr(ctx, n.right, recs, false, "index expression")
+        return
+    }
+    if n.kind == "call" {
+        let mut i: int = 0
+        while i < n.args.len() {
+            esc_expr(ctx, n.args.get(i), recs, false, "argument of call '" + n.name + "()'")
+            i = i + 1
+        }
+        return
+    }
+    if n.kind == "match" {
+        # left = scrutinee; args = MatchArm indices.
+        esc_expr(ctx, n.left, recs, false, "match scrutinee")
+        let mut ai: int = 0
+        while ai < n.args.len() {
+            let arm: MatchArm = ctx.match_arms.get(n.args.get(ai))
+            esc_expr(ctx, arm.body, recs, false, "match arm body")
+            ai = ai + 1
+        }
+        return
+    }
+    if n.kind == "listlit" {
+        let mut i: int = 0
+        while i < n.args.len() {
+            esc_expr(ctx, n.args.get(i), recs, false, "element of a list literal")
+            i = i + 1
+        }
+        return
+    }
+    if n.kind == "structlit" {
+        let mut i: int = 0
+        while i < n.args.len() {
+            esc_expr(ctx, n.args.get(i), recs, false, "field of a struct literal")
+            i = i + 1
+        }
+        return
+    }
+    # Generic children: bin (left/right), un (left), qmark (left),
+    # field (left), fieldcall (left + args), enumlit (args = payloads).
+    if n.left >= 0 {
+        esc_expr(ctx, n.left, recs, false, why)
+    }
+    if n.right >= 0 {
+        esc_expr(ctx, n.right, recs, false, why)
+    }
+    let mut i: int = 0
+    while i < n.args.len() {
+        esc_expr(ctx, n.args.get(i), recs, false, why)
+        i = i + 1
+    }
+}
+
 fn check_program(ctx: Ctx) -> void {
     # 1. struct: field types
     let keys_s: list[str] = ctx.structs.keys()
@@ -2906,6 +3497,17 @@ fn check_program(ctx: Ctx) -> void {
     while bi < ctx.fn_order.len() {
         check_fn_body(ctx, ctx.fn_order.get(bi))
         bi = bi + 1
+    }
+    # 5.5 Stage 30 (v0.47.0-alpha): boxed-vs-stack layout analysis.
+    # Runs AFTER the bodies are checked (the walker reads the mop/muser
+    # method tags check_method sets) and BEFORE codegen (the decisions
+    # are recorded on ctx.layout_map for the codegen hooks). Enforces
+    # the #[stack] soundness proof: a stack-allocated value can never
+    # outlive its creating frame.
+    let mut xi: int = 0
+    while xi < ctx.fn_order.len() {
+        escape_check_fn(ctx, ctx.fn_order.get(xi))
+        xi = xi + 1
     }
     # 6. effects analysis
     check_effects(ctx)
@@ -8344,6 +8946,89 @@ fn local_c(ctx: Ctx, name: str) -> str {
     return cn
 }
 
+# ============================================================================
+# STAGE 30 (v0.47.0-alpha): stack-layout codegen helpers
+# ============================================================================
+# The escape analysis (escape_check_fn, run during checking) recorded its
+# decisions in ctx.layout_map keyed "<fn key>::<binding>". The codegen
+# consults them at five sites: the let statement (emit the typed array),
+# the builtin list methods (.get/.set/.len), the index expression
+# (xs[i] read), the for-in loop, and the index assignment (xs[i] = v).
+
+# is_stack_var: is `name` a stack-allocated binding of the CURRENT
+# function? Suppressed inside LTO inline clones: layout keys are per
+# SOURCE function, and an inlined callee body generated under the
+# caller's cur_fn would resolve the caller's same-named binding — the
+# wrong key. Inlined bodies always use the (sound) heap layout.
+fn is_stack_var(ctx: Ctx, name: str) -> bool {
+    if ctx.in_inline_clone > 0 {
+        return false
+    }
+    if ctx.cur_fn == "" {
+        return false
+    }
+    return ctx.layout_map.get_or(ctx.cur_fn + "::" + name, "") == "stack"
+}
+
+# stack_cap_of: the fixed capacity of the current function's stack
+# binding `name` (the literal length recorded by the analysis).
+fn stack_cap_of(ctx: Ctx, name: str) -> int {
+    return ctx.layout_cap.get_or(ctx.cur_fn + "::" + name, 0)
+}
+
+# stack_elem_suffix: the C accessor suffix for an element type —
+# hlc_sg_i64 / hlc_ss_f64 / hlc_sg_bool etc.
+fn stack_elem_suffix(elem: str) -> str {
+    if elem == "int" {
+        return "i64"
+    }
+    if elem == "float" {
+        return "f64"
+    }
+    return "bool"
+}
+
+# stack_layout_helper_lines: the per-program C accessors for
+# stack-allocated lists. Bounds-checked with the SAME panic message as
+# hl_list_get / hl_list_set ("array access out of bounds") so a
+# stack-layout program is observably identical to the boxed one. The
+# helpers are `static inline` (gcc does not warn about unused static
+# inline functions) and are emitted only when at least one binding is
+# stack-allocated (ctx.layout_stack_n > 0).
+fn stack_layout_helper_lines() -> list[str] {
+    let r: list[str] = []
+    r.push("// ---- Stage 30 (v0.47.0-alpha): stack-layout accessors ----")
+    r.push("// Bounds-checked typed accessors for stack-allocated lists. The")
+    r.push("// panic message matches hl_list_get/hl_list_set exactly, so the")
+    r.push("// stack layout is observably identical to the boxed layout.")
+    r.push("static inline int64_t hlc_sg_i64(const int64_t* a, int64_t i, int64_t n) {")
+    r.push("    if (i < 0 || i >= n) hl_die(\"array access out of bounds\");")
+    r.push("    return a[i];")
+    r.push("}")
+    r.push("static inline void hlc_ss_i64(int64_t* a, int64_t i, int64_t n, int64_t v) {")
+    r.push("    if (i < 0 || i >= n) hl_die(\"array access out of bounds\");")
+    r.push("    a[i] = v;")
+    r.push("}")
+    r.push("static inline double hlc_sg_f64(const double* a, int64_t i, int64_t n) {")
+    r.push("    if (i < 0 || i >= n) hl_die(\"array access out of bounds\");")
+    r.push("    return a[i];")
+    r.push("}")
+    r.push("static inline void hlc_ss_f64(double* a, int64_t i, int64_t n, double v) {")
+    r.push("    if (i < 0 || i >= n) hl_die(\"array access out of bounds\");")
+    r.push("    a[i] = v;")
+    r.push("}")
+    r.push("static inline bool hlc_sg_bool(const bool* a, int64_t i, int64_t n) {")
+    r.push("    if (i < 0 || i >= n) hl_die(\"array access out of bounds\");")
+    r.push("    return a[i];")
+    r.push("}")
+    r.push("static inline void hlc_ss_bool(bool* a, int64_t i, int64_t n, bool v) {")
+    r.push("    if (i < 0 || i >= n) hl_die(\"array access out of bounds\");")
+    r.push("    a[i] = v;")
+    r.push("}")
+    r.push("")
+    return r
+}
+
 fn concat_lines(dst: list[str], src: list[str]) -> void {
     let mut i: int = 0
     while i < src.len() {
@@ -10419,6 +11104,12 @@ fn lto_emit_inline(ctx: Ctx, key: str, e: int, ind: str) -> str {
     # ---- 2. the callee body statements. The trailing return is NOT
     # emitted (a `return` inside the caller would return from the
     # CALLER); its expression becomes the result binding below.
+    # Stage 30 (v0.47.0-alpha): suppress stack-layout codegen while the
+    # callee body is generated inline — layout keys are per SOURCE
+    # function and ctx.cur_fn here is the CALLER, so a stack-lookup
+    # would resolve the caller's same-named binding (wrong key). The
+    # inlined body uses the sound heap layout instead.
+    ctx.in_inline_clone = ctx.in_inline_clone + 1
     let body_n: int = f.body.len()
     let mut gen_n: int = body_n
     if rkind == 1 || rkind == 2 {
@@ -10440,6 +11131,9 @@ fn lto_emit_inline(ctx: Ctx, key: str, e: int, ind: str) -> str {
         ret_temp = fresh_tmp(ctx, "hl_ir")
         ctx.out.push(ind + c_type(ctx, f.ret) + " " + ret_temp + " = " + rwrapped + ";")
     }
+    # Stage 30: the inlined callee body (and its result expression) are
+    # fully generated — re-enable stack-layout codegen for the caller.
+    ctx.in_inline_clone = ctx.in_inline_clone - 1
     # ---- 4. restore the caller's gen_locals view (the callee's `let`
     # registrations must not shadow the caller's bindings after the
     # inline site; the result binding above already resolved).
@@ -10497,6 +11191,15 @@ fn gen_expr(ctx: Ctx, e: int) -> str {
         return c_str_lit(ctx.exprs[e].sval)
     }
     if k == "ident" {
+        # Stage 30 (v0.47.0-alpha): defensive invariant — a stack-
+        # allocated binding must never reach a VALUE position (the
+        # escape analysis proved every use borrow-safe before the
+        # layout was chosen). If this fires, the analysis and the
+        # codegen disagree — a compiler bug, so fail loudly rather
+        # than emit a wrong C reference.
+        if is_stack_var(ctx, ctx.exprs[e].name) {
+            panic("internal codegen error: stack-allocated list '" + ctx.exprs[e].name + "' used as a value — the escape analysis and the codegen disagree")
+        }
         return local_c(ctx, ctx.exprs[e].name)
     }
     if k == "bin" {
@@ -10513,6 +11216,16 @@ fn gen_expr(ctx: Ctx, e: int) -> str {
         return "(-" + sub + ")"
     }
     if k == "index" {
+        # Stage 30 (v0.47.0-alpha): stack-layout index access —
+        # xs[i] lowers to the typed bounds-checked accessor instead of
+        # the boxed hl_list_get + unbox pair. The element type is
+        # annotated by the checker (exprs[e].t = elem type).
+        if ctx.exprs[ctx.exprs[e].left].kind == "ident" && is_stack_var(ctx, ctx.exprs[ctx.exprs[e].left].name) {
+            let sarr: str = local_c(ctx, ctx.exprs[ctx.exprs[e].left].name)
+            let sidx: str = gen_expr(ctx, ctx.exprs[e].right)
+            let scap: int = stack_cap_of(ctx, ctx.exprs[ctx.exprs[e].left].name)
+            return "hlc_sg_" + stack_elem_suffix(ctx.exprs[e].t) + "(" + sarr + ", " + sidx + ", " + scap.to_str() + ")"
+        }
         let lst: str = gen_expr(ctx, ctx.exprs[e].left)
         let idx: str = gen_expr(ctx, ctx.exprs[e].right)
         # Stage 17: -O fast — a bounds-proven index uses the unchecked
@@ -11081,6 +11794,31 @@ fn gen_method(ctx: Ctx, e: int) -> str {
         return "usf_" + c_fn_name(ctx.exprs[e].mkey) + "(" + recv + ", " + rest + ")"
     }
     let op: str = ctx.exprs[e].mop
+    # Stage 30 (v0.47.0-alpha): stack-layout receivers. The escape
+    # analysis proved the binding never escapes, so .len / .get / .set
+    # lower to the typed array accessors (no hl_list, no boxing, no
+    # refcount). push/pop can never reach here — the checker rejects
+    # them on #[stack] bindings and the auto analysis demotes such
+    # bindings to the heap layout.
+    if ctx.exprs[ctx.exprs[e].left].kind == "ident" && is_stack_var(ctx, ctx.exprs[ctx.exprs[e].left].name) {
+        if op == "list.len" {
+            return stack_cap_of(ctx, ctx.exprs[ctx.exprs[e].left].name).to_str()
+        }
+        if op == "list.get" {
+            let sarr: str = local_c(ctx, ctx.exprs[ctx.exprs[e].left].name)
+            let sidx: str = gen_expr(ctx, ctx.exprs[e].args.get(0))
+            let scap: int = stack_cap_of(ctx, ctx.exprs[ctx.exprs[e].left].name)
+            return "hlc_sg_" + stack_elem_suffix(ctx.exprs[e].t) + "(" + sarr + ", " + sidx + ", " + scap.to_str() + ")"
+        }
+        if op == "list.set" {
+            let sarr: str = local_c(ctx, ctx.exprs[ctx.exprs[e].left].name)
+            let sidx: str = gen_expr(ctx, ctx.exprs[e].args.get(0))
+            let sval: str = gen_expr(ctx, ctx.exprs[e].args.get(1))
+            let scap: int = stack_cap_of(ctx, ctx.exprs[ctx.exprs[e].left].name)
+            let set_suffix: str = stack_elem_suffix(list_elem_t(inst_t(ctx, ctx.exprs[ctx.exprs[e].left].t)))
+            return "hlc_ss_" + set_suffix + "(" + sarr + ", " + sidx + ", " + scap.to_str() + ", " + sval + ")"
+        }
+    }
     let t0: str = gen_expr(ctx, ctx.exprs[e].left)
     let args: str = gen_args_c(ctx, e)
     if op == "str.len" {
@@ -11725,6 +12463,29 @@ fn gen_qmark_expr(ctx: Ctx, e: int) -> str {
 fn gen_stmt(ctx: Ctx, sidx: int, ind: str) -> void {
     let s: StmtN = ctx.stmts[sidx]
     if s.kind == "let" {
+        # Stage 30 (v0.47.0-alpha): stack layout. The escape analysis
+        # proved this binding never escapes its creating function, so
+        # the list literal becomes a typed C array in the frame — zero
+        # heap objects, zero refcount traffic. Elements are emitted as
+        # SEPARATE sequenced assignments (not a braced initializer) so
+        # evaluation order (and the order of any element panic) is
+        # exactly the interpreter's left-to-right order.
+        if is_stack_var(ctx, s.name) && ctx.exprs[s.value].kind == "listlit" {
+            let cn: str = fresh_local(ctx, s.name)
+            let et: str = list_elem_t(s.vtype)
+            let cap: int = stack_cap_of(ctx, s.name)
+            ctx.out.push(ind + c_type(ctx, et) + " " + cn + "[" + cap.to_str() + "];")
+            let mut i: int = 0
+            while i < ctx.exprs[s.value].args.len() {
+                let aidx: int = ctx.exprs[s.value].args.get(i)
+                let v: str = gen_expr(ctx, aidx)
+                ctx.out.push(ind + cn + "[" + i.to_str() + "] = " + v + ";")
+                i = i + 1
+            }
+            flush_null_after(ctx, ind)
+            clear_hoists(ctx)
+            return
+        }
         # Stage 8-beta: hoist fresh pointer subexpressions consumed in
         # borrowed positions within the RHS, then bind. Pointer-typed
         # bindings get a cleanup attribute — released exactly at C block
@@ -11852,6 +12613,42 @@ fn gen_stmt(ctx: Ctx, sidx: int, ind: str) -> void {
         flush_null_after(ctx, ind)
         clear_hoists(ctx)
     } else if s.kind == "for" {
+        # Stage 30 (v0.47.0-alpha): for-in over a stack-allocated list.
+        # The iterable is a typed frame array: iterate it directly. The
+        # loop variable is re-declared per iteration (fresh C block
+        # scope, matching the heap path); the length is the compile-time
+        # capacity (push is impossible on a stack binding, so the
+        # per-iteration bounds re-check is unnecessary).
+        if ctx.exprs[s.iter].kind == "ident" && is_stack_var(ctx, ctx.exprs[s.iter].name) {
+            let iv: str = fresh_tmp(ctx, "hlc_i")
+            let cn: str = fresh_local(ctx, s.name)
+            let arr: str = local_c(ctx, ctx.exprs[s.iter].name)
+            let cap: int = stack_cap_of(ctx, ctx.exprs[s.iter].name)
+            ctx.out.push(ind + "{")
+            ctx.out.push(ind + "    int64_t " + iv + ";")
+            # Stage 19: PGO — one loop back-edge site per for
+            # (l:<fn>:<n>), counted at the top of the body; site-id
+            # consumption matches the heap path exactly.
+            let backedge_id: str = "l:" + ctx.cur_fn + ":" + ctx.pgo_fn_loop_n.to_str()
+            ctx.pgo_fn_loop_n = ctx.pgo_fn_loop_n + 1
+            let backedge_idx: int = pgo_site(ctx, backedge_id)
+            let lhint: int = pgo_loop_hint(ctx, backedge_id)
+            let mut for_cond: str = iv + " < " + cap.to_str()
+            if lhint >= 0 {
+                for_cond = pgo_wrap_expect(for_cond, lhint)
+            }
+            ctx.out.push(ind + "    for (" + iv + " = 0; " + for_cond + "; " + iv + "++) {")
+            if ctx.pgo_gen {
+                ctx.out.push(ind + "        __hlc_pgo_counts[" + backedge_idx.to_str() + "]++;")
+            }
+            ctx.out.push(ind + "        " + c_type(ctx, s.vtype) + " " + cn + " = " + arr + "[" + iv + "];")
+            gen_stmts(ctx, s.body, ind + "        ")
+            ctx.out.push(ind + "    }")
+            ctx.out.push(ind + "}")
+            flush_null_after(ctx, ind)
+            clear_hoists(ctx)
+            return
+        }
         collect_hoist(ctx, s.iter)
         hoist_all(ctx, ctx.out, ind + "    ")
         let it_c: str = gen_expr(ctx, s.iter)
@@ -12061,6 +12858,20 @@ fn gen_assign(ctx: Ctx, s: StmtN, ind: str) -> void {
             ctx.out.push(ind + "(" + base + ")->" + fname + " = " + v + ";")
         }
     } else {
+        # Stage 30 (v0.47.0-alpha): index assignment on a stack-allocated
+        # binding — xs[i] = v lowers to the typed bounds-checked setter
+        # (the value is a primitive C scalar, no boxing, no ownership
+        # transfer — the array element owns nothing).
+        if ctx.exprs[ctx.exprs[tgt].left].kind == "ident" && is_stack_var(ctx, ctx.exprs[ctx.exprs[tgt].left].name) {
+            let sarr: str = local_c(ctx, ctx.exprs[ctx.exprs[tgt].left].name)
+            let sidx: str = gen_expr(ctx, ctx.exprs[tgt].right)
+            let scap: int = stack_cap_of(ctx, ctx.exprs[ctx.exprs[tgt].left].name)
+            let set_suffix: str = stack_elem_suffix(list_elem_t(ctx.exprs[ctx.exprs[tgt].left].t))
+            ctx.out.push(ind + "hlc_ss_" + set_suffix + "(" + sarr + ", " + sidx + ", " + scap.to_str() + ", " + v + ");")
+            flush_null_after(ctx, ind)
+            clear_hoists(ctx)
+            return
+        }
         let elem_t: str = list_elem_t(ctx.exprs[ctx.exprs[tgt].left].t)
         let lst: str = gen_expr(ctx, ctx.exprs[tgt].left)
         let idx: str = gen_expr(ctx, ctx.exprs[tgt].right)
@@ -13198,6 +14009,12 @@ fn gen_program(ctx: Ctx) -> list[str] {
     final.push("// =============================================================")
     final.push("")
     concat_lines(final, runtime_lines())
+    # Stage 30 (v0.47.0-alpha): the stack-layout accessors are emitted
+    # right after the runtime preamble (they reference hl_die) whenever
+    # at least one binding in the program is stack-allocated.
+    if ctx.layout_stack_n > 0 {
+        concat_lines(final, stack_layout_helper_lines())
+    }
     # Stage 19 (v0.35.0-alpha): --pgo-generate — the profile counter
     # array. Sized by the fixed site cap (checked during body emission;
     # programs with more sites are rejected). Zero-initialised (.bss).
@@ -13833,10 +14650,47 @@ fn print_opt_stats(ctx: Ctx) -> void uses IO {
     } else {
         println("  LTO: (disabled; --lto to enable)")
     }
+    # Stage 30 (v0.47.0-alpha): layout summary. How many tracked
+    # list bindings ended up stack-allocated (zero heap objects, zero
+    # refcount traffic) vs boxed/heap. The tally itself is held in a
+    # #[stack] list — the compiler is the first customer of its own
+    # escape analysis (this binding is provably escape-free: every use
+    # below is a borrow-safe .get/.set receiver, so the C frame of
+    # usf_print_opt_stats carries a plain int64_t[4] instead of a
+    # refcounted heap list).
+    #[stack]
+    let lay_counts: list[int] = [0, 0, 0, 0]
+    if ctx.layout_order.len() > 0 {
+        let mut ci: int = 0
+        while ci < ctx.layout_order.len() {
+            let lay: str = ctx.layout_map.get_or(ctx.layout_order.get(ci), "?")
+            if lay == "stack" {
+                lay_counts.set(0, lay_counts.get(0) + 1)
+            } else if lay == "boxed" {
+                lay_counts.set(1, lay_counts.get(1) + 1)
+            } else if lay == "heap" {
+                lay_counts.set(2, lay_counts.get(2) + 1)
+            } else {
+                lay_counts.set(3, lay_counts.get(3) + 1)
+            }
+            ci = ci + 1
+        }
+        println("  stack-allocated list bindings  : " + lay_counts.get(0).to_str())
+        println("  boxed (forced heap) bindings   : " + lay_counts.get(1).to_str())
+        println("  heap (escaping) bindings       : " + lay_counts.get(2).to_str())
+        println("  heap (push/pop) bindings       : " + lay_counts.get(3).to_str())
+        println("  tracked list bindings          : " + ctx.layout_order.len().to_str())
+    }
     println("")
     println("  per-function decisions:")
     println("    name                          inline      hot/cold    frame                source")
     println("    ----                          ------      ---------   -----                ------")
+    # Stage 30 (v0.47.0-alpha): the column widths table is an
+    # UN-ANNOTATED list[int] binding whose every use below is a
+    # borrow-safe .get(i) receiver — the automatic escape analysis
+    # stack-allocates it with no attribute at all (the auto mode the
+    # whole Stage 30 optimisation runs on).
+    let widths: list[int] = [30, 11, 11, 20]
     let mut j: int = 0
     while j < ctx.fn_order.len() {
         let key: str = ctx.fn_order.get(j)
@@ -13889,13 +14743,40 @@ fn print_opt_stats(ctx: Ctx) -> void uses IO {
         } else {
             source_col = "heuristic"
         }
-        let padded_name: str = pad_right(key, 30)
-        let padded_inline: str = pad_right(inline_col, 11)
-        let padded_hotcold: str = pad_right(hotcold_col, 11)
-        let padded_frame: str = pad_right(frame_col, 20)
+        let padded_name: str = pad_right(key, widths.get(0))
+        let padded_inline: str = pad_right(inline_col, widths.get(1))
+        let padded_hotcold: str = pad_right(hotcold_col, widths.get(2))
+        let padded_frame: str = pad_right(frame_col, widths.get(3))
         println("    " + padded_name + "  " + padded_inline + "  "
             + padded_hotcold + "  " + padded_frame + "  " + source_col)
         j = j + 1
+    }
+    # Stage 30 (v0.47.0-alpha): the per-binding list-layout decision
+    # table. One row per tracked binding, in discovery order: the
+    # layout (STACK / BOXED / HEAP), the fixed capacity, and the reason
+    # (the first escape site for HEAP, #[stack]/#[boxed]/auto for the
+    # rest).
+    if ctx.layout_order.len() > 0 {
+        println("")
+        println("  list layout decisions (Stage 30):")
+        println("    binding                              layout     cap   reason")
+        println("    ------                              ------     ---   ------")
+        let mut lk_i: int = 0
+        while lk_i < ctx.layout_order.len() {
+            let lkey: str = ctx.layout_order.get(lk_i)
+            let lay: str = ctx.layout_map.get_or(lkey, "?")
+            let why: str = ctx.layout_why.get_or(lkey, "")
+            let capv: int = ctx.layout_cap.get_or(lkey, 0)
+            let mut disp_key: str = lkey
+            if disp_key.len() > 36 {
+                disp_key = disp_key.slice(0, 36)
+            }
+            let padded_lkey: str = pad_right(disp_key, 36)
+            let padded_lay: str = pad_right(lay, 9)
+            let padded_cap: str = pad_right(capv.to_str(), 5)
+            println("    " + padded_lkey + "  " + padded_lay + "  " + padded_cap + "  " + why)
+            lk_i = lk_i + 1
+        }
     }
 }
 

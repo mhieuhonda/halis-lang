@@ -178,6 +178,11 @@ make emit-lto-ir F=examples/hello.hls   # whole-program LTO'd LLVM IR (.ll/.bc)
 make simd-acceptance                    # the Stage 21 acceptance gate (>= 2x on AVX2)
 bin/hlc --target-feature avx2 bench.hls out.c    # native intrinsics for std.simd
 python3 boot/boot.py examples/simd_demo.hls      # portable std.simd everywhere
+
+# 17. Stage 30 (v0.47.0-alpha): boxed-vs-stack layout analysis
+python3 boot/boot.py examples/stack_layout_demo.hls   # run the demo
+make escape-acceptance    # the Stage 30 gate: fibonacci inner loop, zero heap objects
+make layout-report F=examples/stack_layout_demo.hls   # per-binding layout decisions
 ```
 
 ## Language example
@@ -271,9 +276,9 @@ halis-lang/
 ├── std/                 # Standard library (Stage 6 + Stage 10, in HLS)
 ├── examples/            # hello, fibonacci, primes, wordcount, secure_demo, ...
 ├── tests/
-│   ├── ok/              #   60 valid programs (incl. safe panics + Stage 9 demos)
-│   ├── fail/            #   60 programs that MUST be rejected (types/effects/taint)
-│   └── run_tests.sh     #   549 tests: ok/fail/differential/bootstrap fixed-point
+│   ├── ok/              #   111 valid programs (incl. safe panics + Stage 30 demos)
+│   ├── fail/            #   104 programs that MUST be rejected (types/effects/taint/escape)
+│   └── run_tests.sh     #   720 assertions: ok/fail/differential/bootstrap fixed-point
 ├── Makefile             # bootstrap · test · run · examples · audit · opt-stats · emit-ir · emit-llvm
 └── bin/                 # (generated) native hlc
 ```
@@ -298,6 +303,8 @@ Full details: [SPEC.md](SPEC.md) · Stage-by-stage roadmap:
 [ROADMAP.md](ROADMAP.md).
 
 ## Status
+
+**v0.47.0-alpha — Stage 30: boxed-vs-stack layout analysis (escape analysis).** A `list[int]`/`list[float]`/`list[bool]` whose every use stays inside its creating function is allocated on the C stack as a typed array — **zero heap objects, zero refcount traffic** (a 3-element list literal drops from 5 mallocs to 0). The analysis is *proven*, not assumed: only borrow-safe uses (`.get`/`.set`/`.len` receiver, `xs[i]` base, for-in iterable) keep a binding in-frame, and `#[stack]` turns the proof into a compile-time guarantee — an escaping use is a compile error naming the site, so a stack-allocated value can NEVER outlive its creating frame. `#[boxed]` opts back into the heap layout; both are the first let-binding attributes. The analysis runs automatically with no annotation, the `--opt-stats` report gains a per-binding layout table, and the compiler is its own first customer (2 of its own bindings are stack-allocated in the self-compiled binary). Acceptance: the fibonacci inner loop runs 200,000 rounds with a constant 90 heap allocations (its `#[boxed]` twin: 12,800,234), verified by `make escape-acceptance` and `examples/stack_layout_demo.hls`. **712/720 tests PASS** (the 8 failures are pre-existing environment issues — 6 wasm-toolchain + 2 simd-timing — verified to fail identically on the pre-Stage-30 code).
 
 **v0.37.0-alpha — Stage 21: SIMD vectorisation. `std.simd` ships explicit SIMD types (I32x4/F64x2/U8x16, wrapping lanes, checked boundaries) with the full op set + fused whole-loop kernels; `hlc --target-feature avx2|sse4.2` lowers the hot kernels to native intrinsics (arch-guarded, scalar fallback); `has_feature()`/`simd_cpu_supports()` give compile-time and runtime dispatch; the HLIR auto-vectoriser detects the canonical loops. Acceptance: the 1M-element 8-tap FIR kernel runs 2.4× faster on AVX2 (gate ≥ 2×) with identical output, fast path byte-identical to portable. Fixed a latent std.bits bit-63 clobber. 587/587 tests PASS.** Stage 20 (previous) delivered whole-program LTO (`hlc --lto`, 52% binary size drop, list_sort_int_asc inlined with the standalone definition dropped). `hlc --lto` inlines small single-return functions from imported modules at statement-level call sites (ownership bit-for-bit preserved) and drops both unreachable functions and fully-inlined standalone definitions; the acceptance binary shrinks 52% (35,344 → 17,144 bytes) with byte-identical output on all 105 ok/ programs. `--emit lto` / `make emit-lto-ir` emit the whole-program LTO'd LLVM IR; `hls-pkg build --lto` compiles packages through the pipeline. The LTO work also found and fixed a latent C-backend soundness bug (eager hoisting broke `&&`/`||` lazy short-circuiting). 578/578 tests PASS, bootstrap deterministic, differential suite byte-identical (including `--lto`).** Previous release v0.35.0-alpha delivered Stage 19 (PGO): the trained `hlc` self-compiles in 69.2–73.4% of the plain build's wall time with byte-identical output, and the O(n) `join` builtin cut a full self-compilation from 3.3 s to 0.48 s. Before that, v0.34.0-alpha completed Stage 18 (hltest + quickcheck + hls-fuzz + hlcov + the 150-stage roadmap restructure); v0.33.0-alpha merged the deep-scan-and-beyond-v1 branch (PR #22) which closed all 7 open issues (#15-#21). Stage 17 was perfected in v0.30.0-alpha (proof-engine soundness overhaul + native ensures + loop-invariant engine).
 
@@ -449,8 +456,18 @@ Full details: [SPEC.md](SPEC.md) · Stage-by-stage roadmap:
   paths under `--target-feature`, `has_feature`/`simd_cpu_supports`
   dispatch, HLIR auto-vectoriser detection. Acceptance: 2.4× ≥ 2× on
   AVX2, identical output. 587/587 tests PASS.
-- ⬜ Cross-compilation targets (Stage 22), WebAssembly backend (Stage
-  23), v1.0 (Stage 150)...
+- ✅ **Stage 30 release — boxed-vs-stack layout analysis**
+  (v0.47.0-alpha): automatic escape analysis for
+  `list[int/float/bool]` bindings — non-escaping lists are laid out
+  as typed C frame arrays (zero heap objects, zero refcount
+  traffic); `#[stack]` forces the layout with a compile-time escape
+  proof; `#[boxed]` opts back into the heap layout; `--opt-stats`
+  reports every per-binding layout decision; LTO/PGO/fast-mode
+  interaction-safe; differential suite byte-identical. Acceptance:
+  fibonacci inner loop, 200k rounds, 90 constant heap allocations
+  (`make escape-acceptance`).
+- ⬜ RISC-V backend (Stage 26), inline assembly (Stage 27),
+  tail-call optimisation (Stage 31), v1.0 (Stage 150)...
 
 ## Contributing
 

@@ -2182,3 +2182,162 @@ The acceptance gate (`make inline-acceptance`) verifies:
 5. `hllint L011` warns on `#[inline(always)]` > 50 statements.
 
 See `examples/inline_attrs_demo.hls` for the full example.
+
+---
+
+## 29. Boxed-vs-stack layout analysis (Stage 30 — v0.47.0-alpha)
+
+Stage 30 introduces **escape analysis** for `list[T]` bindings: a
+list that does not escape its creating function is allocated on the
+C **stack** as a typed array — zero heap objects, zero refcount
+traffic — while a list that does escape keeps the ordinary
+reference-counted heap layout ("boxed"). The analysis is automatic
+(no annotation needed) and *proven*: the checker classifies every
+use of every candidate binding, and a binding is stack-allocated
+only when every use is **borrow-safe**.
+
+```hls
+fn fib_loop(n: int) -> int {
+    #[stack]                        # force the stack layout (checked!)
+    let window: list[int] = [0, 1]  # capacity 2, fixed at compile time
+    let mut i: int = 0
+    while i < n {
+        let next: int = window.get(0) + window.get(1)
+        window.set(0, window.get(1))
+        window.set(1, next)
+        i = i + 1
+    }
+    return window.get(0)            # zero heap objects in this loop
+}
+```
+
+### 29.1. Candidates
+
+A `let` binding is a layout candidate when ALL of these hold:
+
+1. The type is `list[int]`, `list[float]` or `list[bool]`
+   (primitive elements — no per-element refcounting).
+2. The initialiser is a NON-EMPTY list literal (the capacity is
+   fixed at compile time by the literal length).
+3. The enclosing function is non-generic (generic instantiations
+   are generated under mangled keys; layout there would be
+   instantiation-dependent — a documented Stage 30 limitation).
+
+`mut` bindings are eligible (reassignment is classified as an
+escape, see 29.2).
+
+### 29.2. Borrow-safe uses vs escapes
+
+Every occurrence of a candidate binding is classified by the
+checker:
+
+**Borrow-safe (the list itself stays in the frame):**
+
+| Use | Example |
+|-----|---------|
+| `.get(i)` / `.set(i, v)` / `.len()` receiver | `window.get(0)` |
+| index base (read or write) | `xs[1]`, `xs[i] = v` |
+| for-in iterable | `for v: int in xs { ... }` |
+
+Note the receiver of `.get()` is safe even when the RESULT escapes:
+`sum(xs.get(0))` passes an int copy, not the list.
+
+**Escapes (the binding keeps the heap layout):** return value, call
+argument, method argument, user-method receiver, struct literal
+field, list/map literal element, `clone`/`take`/`drop` argument,
+assignment source, operator operand (`xs == ys`), match scrutinee,
+whole-binding reassignment (`xs = ...`), and `push`/`pop` receivers
+(a fixed-capacity array cannot grow or shrink).
+
+### 29.3. `#[stack]` — force the stack layout (the proof)
+
+`#[stack]` (placed directly before the `let` statement) forces the
+stack layout. The checker then REQUIRES the escape analysis to
+succeed — any escaping use is a compile error naming the class and
+line:
+
+```
+#[stack] violated: 'xs' escapes its creating frame — return value
+(line 42). A stack-allocated value can NEVER outlive the function
+that created it: remove the escaping use or drop the attribute.
+```
+
+`push`/`pop` on a `#[stack]` list, non-primitive element types
+(`list[str]`), non-literal initialisers, empty literals and generic
+enclosing functions are all rejected with precise messages. This is
+the roadmap's soundness guarantee, enforced by BOTH the self-hosted
+checker and the Stage-0 boot checker.
+
+### 29.4. `#[boxed]` — force the heap layout
+
+`#[boxed]` opts the binding out of the automatic analysis: it keeps
+the ordinary reference-counted heap layout even when escape-free
+(e.g. when the list will later be returned or grown by design).
+`#[stack]` and `#[boxed]` are mutually exclusive. Both are
+**let-binding attributes** — placing them before a `fn` (or a fn
+attribute such as `#[inline]` before a `let`) is a parse error with
+a message pointing at the correct position.
+
+### 29.5. Generated C
+
+A stack-allocated binding becomes a typed array in the creating
+frame, with elements emitted as separate sequenced assignments
+(preserving the interpreter's left-to-right evaluation and panic
+order):
+
+```c
+int64_t u_window[2];
+u_window[0] = 0;
+u_window[1] = 1;
+```
+
+`.get`/`.set`/`.len`/`xs[i]`/for-in lower to bounds-checked typed
+accessors (`hlc_sg_i64`, `hlc_ss_i64`, `hlc_sg_f64`, ... — emitted
+once per program) whose panic message is IDENTICAL to the boxed
+runtime's (`"array access out of bounds"`), so the two layouts are
+observably indistinguishable: the differential suite (interpreter ↔
+native) stays byte-identical, including under `--lto`, `-O fast`,
+`--pgo-generate` and `--pgo-use`. Under LTO, inlined callee bodies
+fall back to the heap layout (layout keys are per source function).
+
+### 29.6. `--opt-stats` layout report
+
+`--opt-stats` (Stage 29) gains a layout section: a summary
+(stack-allocated / boxed / heap-escape / heap-push / tracked) and a
+per-binding decision table:
+
+```
+list layout decisions (Stage 30):
+  binding                              layout     cap   reason
+  ------                              ------     ---   ------
+  fib_stack::window                     stack      2      #[stack] forced (escape-free)
+  poly_eval::coeffs                     stack      3      escape-free (auto)
+  make_table::xs                        heap       3      escapes: return value (line 62)
+  boxed_demo::xs                        boxed      3      #[boxed] forced heap layout
+```
+
+`make layout-report F=<file.hls>` prints it.
+
+### 29.7. Acceptance
+
+The Stage 30 acceptance criterion: `examples/fibonacci.hls`'s inner
+loop allocates zero heap objects. The gate
+(`make escape-acceptance`) verifies:
+
+1. The C source lays the `#[stack]` window out as a frame array
+   (`int64_t u_window[2]`), and `usf_fib_loop` / `usf_spin_fib`
+   contain zero `hl_list_new` calls.
+2. The deterministic malloc-count gate: the workload spins the
+   inner loop 200,000 times; with the stack layout the program
+   performs a CONSTANT ≤128 heap allocations total (measured: 90 —
+   startup + prints only), while the `#[boxed]` twin of the same
+   program performs 12,800,234 — proving both the zero-allocation
+   claim and that the counter catches heap traffic.
+3. `valgrind --tool=massif` runs too when valgrind is installed
+   (the roadmap's literal wording); the malloc interposer is its
+   exact-count equivalent where valgrind is absent.
+4. Interpreter and native outputs are byte-identical (the layout is
+   unobservable).
+
+See `examples/stack_layout_demo.hls` for the full example and
+`examples/fibonacci.hls` for the acceptance target.

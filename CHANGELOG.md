@@ -13,6 +13,203 @@ stability (125–140), and final stabilisation toward v1.0 (141–150).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
+## [v0.47.0-alpha] — Stage 30: boxed-vs-stack layout analysis (escape analysis)
+
+> Completes **Stage 30** of the roadmap: escape analysis for `list[T]`
+> bindings. A `list[int]` / `list[float]` / `list[bool]` whose every
+> use stays inside its creating function is allocated on the C stack
+> as a typed array — **zero heap objects, zero refcount traffic** (a
+> 3-element list literal drops from 5 mallocs to 0). The analysis is
+> *proven*, not assumed: a binding is stack-allocated only when every
+> use is in a borrow-safe position (`.get`/`.set`/`.len` receiver,
+> `xs[i]` index base, for-in iterable), and `#[stack]` turns the proof
+> into a compile-time guarantee — an escaping use is a COMPILE ERROR
+> naming the escape site, so a stack-allocated value can NEVER outlive
+> its creating frame. `#[boxed]` forces the ordinary refcounted heap
+> layout (an explicit opt-out). The analysis runs automatically (no
+> attribute needed) and the compiler is its own first customer.
+
+> - **Parser** (`src/hlc.hls` ~95 new lines, `boot/parser.py` ~85):
+>   `#[stack]` / `#[boxed]` are the first LET-BINDING attributes —
+>   `parse_let_attrs` parses them inside function bodies directly
+>   before a `let` statement (`#[stack] let xs: list[int] = [1, 2, 3]`).
+>   The two are mutually exclusive; both carry clear errors when placed
+>   before a `fn` (fn-attribute position) or when a fn attribute
+>   appears on a `let`. The lexer already emits a bare `#` token only
+>   when followed by `[` (Stage 28), so statement-position `#[` is
+>   unambiguous. `StmtN` grows `attr_stack` / `attr_boxed` fields.
+> - **Escape analysis** (`src/hlc.hls` ~330 new lines, `boot/checker.py`
+>   ~250): a three-phase per-function pass modelled on the Stage 28
+>   frame estimator. Phase 1 collects candidates (list[primitive]
+>   bindings initialised from a NON-EMPTY list literal — the capacity
+>   is fixed at compile time) and validates forced attributes (element
+>   type, literal shape, non-empty, non-generic function). Phase 2
+>   walks every statement and expression, classifying each occurrence
+>   of a tracked binding: borrow-safe positions keep it in-frame;
+>   ANYTHING else (return, call argument, struct literal field, list
+>   literal element, clone/take/drop argument, assignment source,
+>   operator operand, match scrutinee, reassignment target, `push`/
+>   `pop` receiver) is an escape, recorded with a human-readable
+>   reason and line. Phase 3 records the layout decision on
+>   `ctx.layout_map` and raises the `#[stack]` soundness errors. The
+>   boot checker mirrors the analysis exactly, so `boot.py --check`
+>   and `hlc` reject precisely the same programs.
+> - **Codegen** (`src/hlc.hls` ~120 new lines): the let statement emits
+>   a typed C frame array (`int64_t u_window[2]; u_window[0] = 0; ...`
+>   — elements as SEPARATE sequenced assignments, preserving the
+>   interpreter's left-to-right evaluation and panic order); `.get`/
+>   `.set`/`.len`, `xs[i]` reads, `xs[i] = v` writes and for-in loops
+>   lower to the typed accessors (`hlc_sg_i64`/`hlc_ss_i64`/`_f64`/
+>   `_bool`, emitted once per program when any binding is
+>   stack-allocated) — bounds-checked with the SAME panic message as
+>   the boxed runtime (`"array access out of bounds"`), so the layout
+>   is observably identical. The `for` loop keeps PGO back-edge
+>   instrumentation (site-id consumption matches the heap path).
+>   LTO inlining is interaction-safe: layout keys are per SOURCE
+>   function, so `ctx.in_inline_clone` suppresses stack codegen while
+>   a callee body is generated at a call site (inlined bodies use the
+>   sound heap layout).
+> - **`--opt-stats` layout report**: the report gains a summary
+>   (`stack-allocated list bindings` / boxed / heap-escape / push-pop /
+>   tracked totals) and a per-binding decision table — layout
+>   (STACK/BOXED/HEAP/HEAP-PUSH), capacity, and the reason (the first
+>   escape site and line for HEAP rows). New `make layout-report
+>   F=...` target prints it.
+> - **The compiler is the first customer**: `print_opt_stats` itself
+>   now holds its layout tally in a `#[stack] list[int]` and its column
+>   widths in an un-annotated (auto stack) `list[int]` — the
+>   self-compiled `hlc` carries `int64_t u_lay_counts[4]` and
+>   `int64_t u_widths[4]` in its own frame (see `bin/hlc --opt-stats
+>   src/hlc.hls`: 2 stack-allocated bindings in the compiler itself).
+> - **`examples/fibonacci.hls` rewritten** as the roadmap's acceptance
+>   target: `fib_loop`'s sliding window is a `#[stack] list[int]`;
+>   `spin_fib(200000)` spins the O(n) inner loop 200,000 times. New
+>   `examples/stack_layout_demo.hls` demonstrates forced / auto /
+>   escaping / boxed / for-in / index / float / bool forms with the
+>   `--opt-stats` decision table.
+> - **Acceptance** (`make escape-acceptance`): verifies (a) the C
+>   source lays `u_window` out as a frame array; (b) `usf_fib_loop` /
+>   `usf_spin_fib` contain zero `hl_list_new` calls; (c) — the
+>   deterministic gate — a link-time malloc interposer
+>   (`tests/memcheck/malloc_count_wrap.c`, `-Wl,--wrap=malloc
+>   -Wl,--wrap=realloc`) counts every heap allocation: with the stack
+>   layout the 200k-round workload stays at a CONSTANT ≤128 allocations
+>   (measured: 90), while the `#[boxed]` twin of the same program
+>   allocates 12,800,234 objects — proving both the zero-allocation
+>   claim and that the counter actually catches heap traffic;
+>   (d) `valgrind --tool=massif` runs too when valgrind is installed
+>   (the roadmap's literal wording); (e) the interpreter and native
+>   outputs remain byte-identical (the layout is unobservable).
+> - **16 new tests**: `tests/ok/feat_stage30_stack.hls` +
+>   `feat_stage30_auto.hls` (differential ok-programs) and 13
+>   `tests/fail/fail_stack_*.hls` (every escape class: return, call
+>   argument, clone, push, pop, reassignment, stack+boxed conflict,
+>   non-primitive element, empty literal, non-list binding,
+>   non-literal initialiser, generic function, fn-attribute position)
+>   — all rejected by BOTH the boot checker and the self-hosted
+>   compiler. Plus section 16 of `tests/run_tests.sh` (a)–(i).
+>   Bootstrap deterministic; differential suite byte-identical
+>   (including `--lto`, `-O fast`, `--pgo-generate`/`--pgo-use`).
+
+### Stage 30 — `src/hlc.hls` parser
+
+#### Added — `parse_let_attrs(ctx) -> void`
+
+- Parses one or more `#[stack]` / `#[boxed]` attribute lists in
+  statement position (called from `parse_stmt` when the next token is
+  the bare `#` the lexer emits for `#[`). Rejects unknown attributes
+  and the stack/boxed pair together. `parse_stmt` verifies the
+  attribute list is followed by a `let` statement.
+
+#### Added — `StmtN.attr_stack` / `StmtN.attr_boxed`
+
+- The two let-binding layout attributes, snapshotted by `parse_let`
+  from `ctx.cur_let_stack` / `ctx.cur_let_boxed` (reset after every
+  let). `nx_stmt` defaults both to false.
+
+#### Modified — `parse_attributes` (fn-attribute parser)
+
+- `stack` / `boxed` before a `fn` now produce a precise error pointing
+  at the let-binding form (they are layout attributes, not function
+  attributes).
+
+### Stage 30 — `src/hlc.hls` escape analysis (checker)
+
+#### Added — `escape_check_fn(ctx, key) -> void`
+
+- Per-function driver: skips extern/generic functions (with a precise
+  error when a forced attribute appears there), runs the three phases,
+  records decisions in `ctx.layout_map` / `layout_why` / `layout_cap` /
+  `layout_order` / `layout_stack_n`, and raises the `#[stack]`
+  soundness errors (escape / push / pop, each naming the site).
+
+#### Added — `esc_collect_stmts` / `esc_collect_let` / `esc_candidate`
+
+- Phase 1: candidate collection + forced-attribute validation
+  (primitive element type, list-literal initialiser, non-empty
+  literal).
+
+#### Added — `esc_walk_stmts` / `esc_walk_stmt` / `esc_walk_assign` / `esc_expr`
+
+- Phase 2: the use classifier. `safe` propagates only to direct ident
+  positions; method and index nodes re-derive the flag for their own
+  children, so `xs.get(0)` is safe in an escaping argument position
+  (the VALUE escapes — an int copy — not the list), while `foo(xs)`
+  and `return xs` are escapes. `push`/`pop` receivers get a dedicated
+  fixed-capacity error class.
+
+### Stage 30 — `src/hlc.hls` codegen
+
+#### Added — `is_stack_var` / `stack_cap_of` / `stack_elem_suffix` / `stack_layout_helper_lines`
+
+- Layout lookup (keyed `"<fn key>::<binding>"`, suppressed while
+  `ctx.in_inline_clone > 0`), capacity lookup, the C accessor suffix
+  per element type, and the six `static inline` bounds-checked
+  accessors emitted after the runtime preamble when
+  `ctx.layout_stack_n > 0`.
+
+#### Modified — `gen_stmt` (let / for branches), `gen_expr` (ident / index), `gen_method` (list.len/get/set), `gen_assign` (index target)
+
+- The five stack-layout emission sites. The `ident` branch gains a
+  defensive internal invariant (a stack binding reaching a value
+  position panics loudly — the analysis and codegen would disagree).
+
+#### Modified — `lto_emit_inline`
+
+- Sets `ctx.in_inline_clone` while the callee body + result expression
+  are generated at the call site, so per-source-function layout keys
+  cannot misresolve to the caller's same-named bindings.
+
+#### Modified — `print_opt_stats`
+
+- Layout summary counts + the per-binding decision table; the tally
+  itself lives in a `#[stack]` list and the column widths in an auto
+  stack list (the compiler eats its own cooking).
+
+### Stage 30 — `boot/` (Stage-0 seed)
+
+#### Added — `boot/parser.py`: `parse_let_attrs`, `#[stack]`/`#[boxed]` in `parse_stmt`, `stack`/`boxed` keys on let stmts, rejection of layout attrs in fn position
+
+#### Added — `boot/checker.py`: `escape_check_fn` + `_esc_collect_stmts` / `_esc_walk_stmts` / `_esc_expr` (the Python mirror of the analysis) hooked as step 3.5 of `check()`
+
+- `boot.py --check` now rejects exactly the programs `hlc` rejects
+  (the 13 `fail_stack_*` tests fail on both).
+
+### Stage 30 — Makefile
+
+#### Added — `escape-acceptance`
+
+- The Stage 30 gate: C-source assertions (frame array, no
+  `hl_list_new` in the acceptance functions), the malloc-interposer
+  constant-bound gate (≤128 across 200,000 inner-loop rounds), the
+  `#[boxed]` twin sanity check (>100,000 allocations), valgrind massif
+  when installed, and the interpreter/native differential check.
+
+#### Added — `layout-report`
+
+- `make layout-report F=<file.hls>` — prints the `--opt-stats` report
+  including the per-binding list-layout decision table.
+
 ## [v0.46.0-alpha] — Stage 29: inline / hot / cold attributes + --opt-stats
 
 > Completes **Stage 29** of the roadmap: four new function attributes

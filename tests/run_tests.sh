@@ -1579,6 +1579,198 @@ else
     bad "inline: bootstrap not deterministic with Stage 29 changes"
 fi
 
+echo "=== 16. Stage 30: boxed-vs-stack layout analysis (escape analysis) ==="
+# Stage 30 (v0.47.0-alpha): #[stack]/#[boxed] let-binding attributes,
+# automatic escape analysis (non-escaping list[primitive] bindings are
+# stack-allocated), checker-enforced soundness (a stack value can NEVER
+# outlive its creating frame), the --opt-stats layout report, and the
+# fibonacci zero-heap-objects acceptance.
+
+# (a) the demo example runs via the boot interpreter.
+if python3 boot/boot.py examples/stack_layout_demo.hls >"$TMP/s30_demo.out" 2>&1; then
+    ok "stage30: examples/stack_layout_demo.hls runs via boot"
+else
+    bad "stage30: examples/stack_layout_demo.hls failed via boot"
+    cat "$TMP/s30_demo.out" | head -5
+fi
+
+# (b) the native hlc compiles it; the C source contains the typed frame
+#     arrays (the #[stack] + auto layouts) and the accessors.
+if [ ! -x "$TMP/hlc1" ]; then
+    python3 boot/boot.py src/hlc.hls src/hlc.hls "$TMP/hlc_nat.c" >/dev/null 2>&1
+    gcc -O2 -o "$TMP/hlc1" "$TMP/hlc_nat.c" -lm -pthread 2>/dev/null
+fi
+if "$TMP/hlc1" examples/stack_layout_demo.hls "$TMP/s30_demo.c" >/dev/null 2>&1; then
+    if grep -q "int64_t u_window\[2\];" "$TMP/s30_demo.c" \
+        && grep -q "int64_t u_coeffs\[3\];" "$TMP/s30_demo.c" \
+        && grep -q "static inline int64_t hlc_sg_i64" "$TMP/s30_demo.c"; then
+        ok "stage30: C source has typed frame arrays (#[stack] + auto) + accessors"
+    else
+        bad "stage30: C source missing stack arrays / accessors"
+        grep -n "u_window\|u_coeffs\|hlc_sg_i64" "$TMP/s30_demo.c" | head -5
+    fi
+    # (c) the C source compiles and runs; output matches the interpreter.
+    if gcc -O2 -o "$TMP/s30_demo_bin" "$TMP/s30_demo.c" -lm -pthread 2>"$TMP/s30_gcc.log"; then
+        "$TMP/s30_demo_bin" >"$TMP/s30_demo_native.out" 2>&1
+        if diff -q "$TMP/s30_demo.out" "$TMP/s30_demo_native.out" >/dev/null; then
+            ok "stage30: differential (interpreter == native) for the demo"
+        else
+            bad "stage30: differential mismatch on the demo"
+            diff "$TMP/s30_demo.out" "$TMP/s30_demo_native.out" | head -5
+        fi
+    else
+        bad "stage30: C source fails to compile"
+        cat "$TMP/s30_gcc.log" | head -5
+    fi
+else
+    bad "stage30: hlc compile of the demo failed"
+fi
+
+# (d) --opt-stats prints the layout decision table.
+if "$TMP/hlc1" --opt-stats examples/stack_layout_demo.hls "$TMP/s30_stats.c" \
+    >"$TMP/s30_stats.log" 2>&1; then
+    if grep -q "list layout decisions" "$TMP/s30_stats.log" \
+        && grep -q "stack-allocated list bindings" "$TMP/s30_stats.log" \
+        && grep -q "fib_stack::window" "$TMP/s30_stats.log" \
+        && grep -q "#\[stack\] forced (escape-free)" "$TMP/s30_stats.log" \
+        && grep -q "escape-free (auto)" "$TMP/s30_stats.log" \
+        && grep -q "escapes: return value" "$TMP/s30_stats.log" \
+        && grep -q "#\[boxed\] forced heap layout" "$TMP/s30_stats.log"; then
+        ok "stage30: --opt-stats prints the per-binding layout decisions"
+    else
+        bad "stage30: --opt-stats layout section incomplete"
+        grep -A8 "list layout" "$TMP/s30_stats.log" | head -12
+    fi
+else
+    bad "stage30: --opt-stats invocation failed"
+fi
+
+# (e) the auto mode fires without any attribute: feat_stage30_auto.hls's
+#     escape-free bindings are stack arrays, the escaping one is a heap list.
+if "$TMP/hlc1" tests/ok/feat_stage30_auto.hls "$TMP/s30_auto.c" >/dev/null 2>&1; then
+    if grep -q "int64_t u_coeffs\[3\];" "$TMP/s30_auto.c" \
+        && grep -q "hl_list\* u_xs" "$TMP/s30_auto.c"; then
+        ok "stage30: auto analysis (no attributes) picks stack + heap layouts"
+    else
+        bad "stage30: auto analysis layouts missing in C source"
+        grep -n "u_coeffs\|u_xs" "$TMP/s30_auto.c" | head -5
+    fi
+else
+    bad "stage30: hlc compile of feat_stage30_auto.hls failed"
+fi
+
+# (f) the ok-program with #[stack] is differential (section 1/3/4a also
+#     cover it; here we assert the stack arrays made it into the C).
+if "$TMP/hlc1" tests/ok/feat_stage30_stack.hls "$TMP/s30_ok.c" >/dev/null 2>&1; then
+    if grep -q "int64_t u_window\[2\];" "$TMP/s30_ok.c" \
+        && grep -q "bool u_bs\[2\];" "$TMP/s30_ok.c" \
+        && grep -q "double u_fs\[2\];" "$TMP/s30_ok.c"; then
+        ok "stage30: feat_stage30_stack.hls lowers int/float/bool stack arrays"
+    else
+        bad "stage30: feat_stage30_stack.hls missing one of the typed arrays"
+        grep -n "u_window\|u_bs\|u_fs" "$TMP/s30_ok.c" | head -5
+    fi
+else
+    bad "stage30: hlc compile of feat_stage30_stack.hls failed"
+fi
+
+# (g) the fail-programs: boot --check AND the native compiler must both
+#     reject every escape class.
+LEAKS=0
+for f in tests/fail/fail_stack_*.hls; do
+    if python3 boot/boot.py --check "$f" >/dev/null 2>&1; then
+        echo "  boot --check LEAK: $f"
+        LEAKS=$((LEAKS + 1))
+    fi
+done
+if [ $LEAKS -eq 0 ]; then
+    ok "stage30: boot --check rejects all 13 fail_stack_* programs"
+else
+    bad "stage30: boot --check leaked $LEAKS fail_stack_* programs"
+fi
+LEAKS=0
+for f in tests/fail/fail_stack_*.hls; do
+    if "$TMP/hlc1" "$f" "$TMP/s30_leak.c" >/dev/null 2>&1; then
+        echo "  native hlc LEAK: $f"
+        LEAKS=$((LEAKS + 1))
+    fi
+done
+if [ $LEAKS -eq 0 ]; then
+    ok "stage30: native hlc rejects all 13 fail_stack_* programs"
+else
+    bad "stage30: native hlc leaked $LEAKS fail_stack_* programs"
+fi
+
+# (h) the escape error message names the binding, the use class and line.
+if "$TMP/hlc1" tests/fail/fail_stack_escape_return.hls "$TMP/s30_err.c" \
+    >"$TMP/s30_err.log" 2>&1; then
+    bad "stage30: escape-via-return should not compile"
+else
+    if grep -q "escapes its creating frame" "$TMP/s30_err.log" \
+        && grep -q "return value" "$TMP/s30_err.log" \
+        && grep -q "NEVER outlive" "$TMP/s30_err.log"; then
+        ok "stage30: escape error names binding + use class + the guarantee"
+    else
+        bad "stage30: escape error message incomplete"
+        cat "$TMP/s30_err.log" | head -3
+    fi
+fi
+
+# (i) the fibonacci acceptance: zero heap objects in the inner loop.
+#     (The full gate also runs via `make escape-acceptance`.)
+if "$TMP/hlc1" examples/fibonacci.hls "$TMP/s30_fib.c" >/dev/null 2>&1; then
+    if grep -q "int64_t u_window\[2\];" "$TMP/s30_fib.c"; then
+        ok "stage30: fibonacci fib_loop carries the #[stack] frame array"
+    else
+        bad "stage30: fibonacci missing the #[stack] frame array"
+    fi
+    FIB_N=$(awk '/int64_t usf_fib_loop/,/^}/' "$TMP/s30_fib.c" | grep -c "hl_list_new")
+    SPIN_N=$(awk '/int64_t usf_spin_fib/,/^}/' "$TMP/s30_fib.c" | grep -c "hl_list_new")
+    if [ "$FIB_N" = "0" ] && [ "$SPIN_N" = "0" ]; then
+        ok "stage30: usf_fib_loop / usf_spin_fib contain zero hl_list_new calls"
+    else
+        bad "stage30: heap list construction leaked into the acceptance fns"
+    fi
+else
+    bad "stage30: hlc compile of fibonacci.hls failed"
+fi
+if [ -x "$TMP/hlc1" ]; then
+    if gcc -O2 -o "$TMP/s30_fib_wrap" "$TMP/s30_fib.c" tests/memcheck/malloc_count_wrap.c \
+        -Wl,--wrap=malloc -Wl,--wrap=realloc -lm -pthread 2>/dev/null; then
+        "$TMP/s30_fib_wrap" >/dev/null 2>"$TMP/s30_fib_wrap.err" || true
+        MC=$(grep -o 'HL_MALLOC_COUNT=[0-9]*' "$TMP/s30_fib_wrap.err" | cut -d= -f2)
+        if [ -n "$MC" ] && [ "$MC" -le 128 ]; then
+            ok "stage30: malloc interposer: $MC allocations across 200k inner-loop rounds (constant)"
+        else
+            bad "stage30: malloc interposer count too high: $MC"
+        fi
+    else
+        bad "stage30: interposer build failed"
+    fi
+fi
+
+# (j) make escape-acceptance runs end-to-end.
+if make escape-acceptance >"$TMP/s30_acc.log" 2>&1; then
+    if grep -q "ACCEPTANCE OK: Stage 30" "$TMP/s30_acc.log"; then
+        ok "stage30: make escape-acceptance runs end-to-end"
+    else
+        bad "stage30: make escape-acceptance did not print ACCEPTANCE OK"
+        tail -5 "$TMP/s30_acc.log"
+    fi
+else
+    bad "stage30: make escape-acceptance failed"
+    tail -10 "$TMP/s30_acc.log"
+fi
+
+# (k) bootstrap still deterministic with the Stage 30 changes (the
+#     compiler's own print_opt_stats now uses #[stack] + auto layouts).
+if python3 boot/boot.py src/hlc.hls src/hlc.hls "$TMP/hlc_s30.c" >/dev/null 2>&1 \
+    && diff -q "$TMP/hlc_s30.c" "$TMP/hlc_nat.c" >/dev/null; then
+    ok "stage30: bootstrap deterministic with Stage 30 changes"
+else
+    bad "stage30: bootstrap not deterministic with Stage 30 changes"
+fi
+
 echo ""
 echo "=========================================="
 echo "RESULT: $PASS PASS / $FAIL FAIL"

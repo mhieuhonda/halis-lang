@@ -178,6 +178,16 @@ class Parser:
                         self.err("stack_size must be non-negative", nt)
                     self.eat_sym(")")
                     self.cur_attrs["stack_size"] = n
+                elif attr_name == "stack" or attr_name == "boxed":
+                    # Stage 30 (v0.47.0-alpha): #[stack] / #[boxed] are
+                    # LET-BINDING attributes (they control the layout of a
+                    # list[T] value), not function attributes. Placing one
+                    # before a fn is a clear user error — point them at the
+                    # let statement form.
+                    self.err("'%s' is a let-binding attribute — place it "
+                             "inside a function, directly before a 'let' "
+                             "statement (e.g. #[%s] let xs: list[int] = "
+                             "[1, 2, 3])" % (attr_name, attr_name), t0)
                 else:
                     self.err("unknown attribute '%s' (known: inline(always), "
                              "inline(never), hot, cold, no_red_zone, "
@@ -650,8 +660,56 @@ class Parser:
         self.eat_sym("}")
         return stmts
 
+    def parse_let_attrs(self):
+        """Stage 30 (v0.47.0-alpha): parse a `#[stack]` / `#[boxed]`
+        attribute list that applies to the FOLLOWING `let` binding.
+        Only the two layout attributes are accepted here (the fn-level
+        attributes like #[inline] must not appear on a let). Returns the
+        (stack, boxed) flags. The caller must verify the next token is
+        `let` — these attributes only apply to let bindings.
+        """
+        stack = False
+        boxed = False
+        while self.at_sym("#"):
+            t0 = self.next()  # consume '#'
+            self.eat_sym("[")
+            while not self.at_sym("]"):
+                attr_name = self.eat_ident()["v"]
+                if attr_name == "stack":
+                    if boxed:
+                        self.err("'stack' and 'boxed' are mutually exclusive", t0)
+                    stack = True
+                elif attr_name == "boxed":
+                    if stack:
+                        self.err("'stack' and 'boxed' are mutually exclusive", t0)
+                    boxed = True
+                else:
+                    self.err("unknown let-binding attribute '%s' (known: "
+                             "stack, boxed; function attributes go before "
+                             "a fn declaration)" % attr_name, t0)
+                if self.at_sym(","):
+                    self.next()
+                elif not self.at_sym("]"):
+                    self.err("expected ',' or ']' in attribute list")
+            self.eat_sym("]")
+        return stack, boxed
+
     def parse_stmt(self):
         t = self.peek()
+        # Stage 30 (v0.47.0-alpha): a `#[stack]` / `#[boxed]` attribute
+        # list directly before a statement applies to a `let` binding
+        # (the only statement that accepts attributes). The lexer only
+        # emits a bare `#` token when it is followed by `[` (anything
+        # else is a line comment), so seeing sym `#` here is unambiguous.
+        if t["k"] == "sym" and t["v"] == "#":
+            stack, boxed = self.parse_let_attrs()
+            if not self.at_kw("let"):
+                self.err("#[stack]/#[boxed] attributes apply to a 'let' "
+                         "binding", t)
+            s = self.parse_let()
+            s["stack"] = stack
+            s["boxed"] = boxed
+            return s
         if t["k"] == "kw":
             v = t["v"]
             if v == "let":
@@ -731,8 +789,13 @@ class Parser:
         ty = self.parse_type()
         self.eat_sym("=")
         val = self.parse_expr()
+        # Stage 30 (v0.47.0-alpha): let-binding layout attributes,
+        # populated by parse_stmt when a `#[stack]` / `#[boxed]` list
+        # precedes the let. Defaults are False (the automatic escape
+        # analysis decides the layout; the attrs only force a side).
         return {"k": "let", "name": name["v"], "t": ty, "mut": is_mut,
-                "value": val, "line": t0["line"]}
+                "value": val, "line": t0["line"],
+                "stack": False, "boxed": False}
 
     def parse_if(self):
         t0 = self.eat_kw("if")
