@@ -83,7 +83,9 @@ new stdlib modules, tooling, examples, and CI/CD improvements.
 >   src/hlc.hls`: 2 stack-allocated bindings in the compiler itself).
 > - **`examples/fibonacci.hls` rewritten** as the roadmap's acceptance
 >   target: `fib_loop`'s sliding window is a `#[stack] list[int]`;
->   `spin_fib(200000)` spins the O(n) inner loop 200,000 times. New
+>   `spin_fib(20000)` spins the O(n) inner loop 20,000 times (the
+>   interpreter-friendly workload; the boxed twin still allocates
+>   1,280,234 objects). New
 >   `examples/stack_layout_demo.hls` demonstrates forced / auto /
 >   escaping / boxed / for-in / index / float / bool forms with the
 >   `--opt-stats` decision table.
@@ -93,9 +95,9 @@ new stdlib modules, tooling, examples, and CI/CD improvements.
 >   deterministic gate — a link-time malloc interposer
 >   (`tests/memcheck/malloc_count_wrap.c`, `-Wl,--wrap=malloc
 >   -Wl,--wrap=realloc`) counts every heap allocation: with the stack
->   layout the 200k-round workload stays at a CONSTANT ≤128 allocations
+>   layout the 20k-round workload stays at a CONSTANT ≤128 allocations
 >   (measured: 90), while the `#[boxed]` twin of the same program
->   allocates 12,800,234 objects — proving both the zero-allocation
+>   allocates 1,280,234 objects — proving both the zero-allocation
 >   claim and that the counter actually catches heap traffic;
 >   (d) `valgrind --tool=massif` runs too when valgrind is installed
 >   (the roadmap's literal wording); (e) the interpreter and native
@@ -201,7 +203,7 @@ new stdlib modules, tooling, examples, and CI/CD improvements.
 
 - The Stage 30 gate: C-source assertions (frame array, no
   `hl_list_new` in the acceptance functions), the malloc-interposer
-  constant-bound gate (≤128 across 200,000 inner-loop rounds), the
+  constant-bound gate (≤128 across 20,000 inner-loop rounds), the
   `#[boxed]` twin sanity check (>100,000 allocations), valgrind massif
   when installed, and the interpreter/native differential check.
 

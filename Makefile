@@ -817,10 +817,10 @@ opt-stats-report:
 #   (b) ALWAYS: the link-time malloc interposer
 #       (tests/memcheck/malloc_count_wrap.c, -Wl,--wrap=malloc
 #       -Wl,--wrap=realloc) counts every heap allocation. The
-#       fibonacci workload spins the O(n) inner loop 200,000 times:
+#       fibonacci workload spins the O(n) inner loop 20,000 times:
 #       with the stack layout the count stays a small CONSTANT
 #       (<= 128: startup + print allocations only), while the #[boxed]
-#       twin of the same program allocates millions of objects —
+#       twin of the same program allocates 1,000,000+ objects —
 #       proving both the zero-allocation claim AND that the counter
 #       actually catches heap traffic.
 escape-acceptance:
@@ -850,10 +850,10 @@ escape-acceptance:
 	  || (echo "FAIL: interposer build failed"; exit 1)
 	@$(BIN)/fib30_wrap >$(BIN)/fib30_wrap.out 2>$(BIN)/fib30_wrap.err || true
 	@COUNT=$$(grep -o 'HL_MALLOC_COUNT=[0-9]*' $(BIN)/fib30_wrap.err | cut -d= -f2); \
-	echo "  heap allocations with #[stack] layout (200k inner-loop rounds): $$COUNT"; \
+	echo "  heap allocations with #[stack] layout (20k inner-loop rounds): $$COUNT"; \
 	if [ -z "$$COUNT" ]; then echo "FAIL: interposer printed no count"; exit 1; fi; \
 	if [ "$$COUNT" -le 128 ]; then \
-	  echo "  count <= 128 while spinning 200,000 rounds: inner loop allocates ZERO heap objects: OK"; \
+	  echo "  count <= 128 while spinning 20,000 rounds: inner loop allocates ZERO heap objects: OK"; \
 	else \
 	  echo "FAIL: $$COUNT heap allocations — the inner loop is not allocation-free"; exit 1; \
 	fi

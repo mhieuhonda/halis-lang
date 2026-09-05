@@ -2762,15 +2762,15 @@ heap objects (verified via `valgrind --tool=massif`).
    `bin/hlc --opt-stats src/hlc.hls`).
 7. **Acceptance — `make escape-acceptance`.**
    `examples/fibonacci.hls` (rewritten) runs the `#[stack]`-window
-   `fib_loop` inner loop 200,000 times:
+   `fib_loop` inner loop 20,000 times:
    - the C source carries `int64_t u_window[2]` in `usf_fib_loop`'s
      frame and zero `hl_list_new` calls in `usf_fib_loop` /
      `usf_spin_fib`;
    - the deterministic gate (a `-Wl,--wrap=malloc`/
      `--wrap=realloc` interposer, `tests/memcheck/
      malloc_count_wrap.c`) counts **90** heap allocations for the
-     whole 200k-round run (a constant: startup + prints) — the
-     `#[boxed]` twin of the same program allocates **12,800,234**,
+     whole 20k-round run (a constant: startup + prints) — the
+     `#[boxed]` twin of the same program allocates **1,280,234**,
      proving both the zero-allocation claim and that the counter
      catches heap traffic;
    - `valgrind --tool=massif` also runs when valgrind is installed

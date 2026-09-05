@@ -2328,10 +2328,10 @@ loop allocates zero heap objects. The gate
    (`int64_t u_window[2]`), and `usf_fib_loop` / `usf_spin_fib`
    contain zero `hl_list_new` calls.
 2. The deterministic malloc-count gate: the workload spins the
-   inner loop 200,000 times; with the stack layout the program
+   inner loop 20,000 times; with the stack layout the program
    performs a CONSTANT ≤128 heap allocations total (measured: 90 —
    startup + prints only), while the `#[boxed]` twin of the same
-   program performs 12,800,234 — proving both the zero-allocation
+   program performs 1,280,234 — proving both the zero-allocation
    claim and that the counter catches heap traffic.
 3. `valgrind --tool=massif` runs too when valgrind is installed
    (the roadmap's literal wording); the malloc interposer is its

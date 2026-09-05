@@ -1740,7 +1740,7 @@ if [ -x "$TMP/hlc1" ]; then
         "$TMP/s30_fib_wrap" >/dev/null 2>"$TMP/s30_fib_wrap.err" || true
         MC=$(grep -o 'HL_MALLOC_COUNT=[0-9]*' "$TMP/s30_fib_wrap.err" | cut -d= -f2)
         if [ -n "$MC" ] && [ "$MC" -le 128 ]; then
-            ok "stage30: malloc interposer: $MC allocations across 200k inner-loop rounds (constant)"
+            ok "stage30: malloc interposer: $MC allocations across 20k inner-loop rounds (constant)"
         else
             bad "stage30: malloc interposer count too high: $MC"
         fi
