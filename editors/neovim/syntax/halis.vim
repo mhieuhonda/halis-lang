@@ -30,8 +30,17 @@ syn keyword halisBuiltin spawn chan_new chan_new_bounded select
 syn keyword halisBuiltin try_send recv_or
 
 " Comments.
-syn match halisComment "#.*$" contains=halisTodo
+" Stage 28+29 (v0.45.0-alpha): `#[...]` is an attribute list, NOT a
+" comment. The match below uses a negative lookahead to skip `#[`.
+syn match halisComment "#\(\[\)\@!.*$" contains=halisTodo
 syn keyword halisTodo TODO FIXME XXX BUG HACK contained
+
+" Stage 28+29: attribute lists `#[name(args), ...]` — highlight as
+" meta-attribute with the attribute name in a special face.
+syn region halisAttribute matchgroup=halisAttrBracket start="#\[" end="\]" contains=halisAttrName,halisAttrPunct,halisAttrInt
+syn match halisAttrName "\<\(inline\|hot\|cold\|no_red_zone\|irq_handler\|stack_size\|always\|never\)\>" contained
+syn match halisAttrPunct "[,()]" contained
+syn match halisAttrInt "\<\d\(_\?\d\)*\>" contained
 
 " Strings.
 " SPEC \u00a72: HLS only supports \n \t \\ \" escapes. Any other
@@ -65,5 +74,11 @@ hi def link halisFloat Float
 hi def link halisInt Number
 hi def link halisOperator Operator
 hi def link halisArrow SpecialChar
+" Stage 28+29 (v0.45.0-alpha): attribute highlighting.
+hi def link halisAttribute Macro
+hi def link halisAttrBracket Macro
+hi def link halisAttrName Identifier
+hi def link halisAttrPunct Delimiter
+hi def link halisAttrInt Number
 
 let b:current_syntax = 'halis'

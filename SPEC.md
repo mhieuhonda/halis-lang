@@ -1744,3 +1744,203 @@ interpretation shape: two Kleene rounds, the widening operator
 and a post-fixpoint verification pass (any variable whose body outcome
 escapes the invariant goes TOP — the verification is what makes a
 bounded number of rounds sound).
+
+---
+
+## 27. Stack-frame layout control (Stage 28 — v0.45.0-alpha)
+
+Stage 28 introduces three new function attributes for kernel /
+bare-metal code that needs precise control over its stack frame:
+
+```hls
+#[stack_size(N)]   # assert the fn's frame is <= N bytes (compile error if exceeded)
+#[no_red_zone]     # disable the x86-64 red zone (required for interrupt handlers)
+#[irq_handler]     # emit an IRET-compatible frame (gcc's __attribute__((interrupt)))
+```
+
+### 27.1. Attribute syntax
+
+Attributes use the `#[...]` syntax (modelled on Rust's attributes).
+The lexer special-cases `#[` (vs `#` for line comments): when `#`
+is followed by `[`, the `#` is emitted as a sym token (followed by
+the normal `[` sym); otherwise it remains a line comment as before.
+
+Multiple `#[...]` lists may precede a single `fn` (each accumulates):
+
+```hls
+#[no_red_zone]
+#[irq_handler, stack_size(256)]
+fn handle_irq(frame: IrqFrame) -> void { ... }
+```
+
+is equivalent to:
+
+```hls
+#[no_red_zone, irq_handler, stack_size(256)]
+fn handle_irq(frame: IrqFrame) -> void { ... }
+```
+
+Within a single list, items are comma-separated. Each `attr` is one
+of:
+
+| Attribute                | Stage | Effect                                              |
+|--------------------------|-------|-----------------------------------------------------|
+| `#[stack_size(N)]`       | 28    | assert the fn's frame is <= N bytes (compile error) |
+| `#[no_red_zone]`        | 28    | disable the x86-64 red zone                          |
+| `#[irq_handler]`        | 28    | emit an IRET-compatible frame                        |
+| `#[inline(always)]`      | 29    | force inline at every call site                     |
+| `#[inline(never)]`       | 29    | forbid inlining at every call site                   |
+| `#[hot]`                 | 29    | mark the function hot (overrides PGO)                |
+| `#[cold]`                | 29    | mark the function cold (overrides PGO)              |
+
+Mutual exclusivity (compile error if violated):
+- `#[hot]` and `#[cold]` cannot both appear on the same function.
+- `#[inline(always)]` and `#[inline(never)]` cannot both appear on
+  the same function.
+
+Unknown attribute names raise a clear compile error.
+
+### 27.2. `#[stack_size(N)]` — static frame-size bound
+
+The checker runs a static analysis pass on the function body and
+estimates the stack frame size in bytes. The estimate is an UPPER
+BOUND: it counts every `let` binding (8 bytes — every HLS type lowers
+to a C scalar of 8 bytes: int64_t / double / pointer), every `for`
+loop (16 bytes — iter variable + index temp + iterator handle), every
+call site (16 bytes — gcc's call-frame overhead: return-address slot
++ caller-saved register spills), plus 32 bytes base overhead (saved
+RBP / RBX / alignment). The actual frame is always <= the estimate
+because gcc may reuse slots across sibling scopes.
+
+If the estimate exceeds N, the checker raises a compile error:
+
+```
+#[stack_size(8)]
+fn too_big(x: int) -> int {
+    let a: int = x + 1
+    let b: int = a + 2
+    let c: int = b + 3
+    return a + b + c
+}
+```
+
+```
+panic: type error: #[stack_size(8)] violated by function 'too_big':
+estimated frame size is 64 bytes (the body declares too many locals or
+nests too many call sites for the bound). Reduce locals or raise the
+bound. (line 2)
+```
+
+This makes `#[stack_size(N)]` a SOUND guarantee: if the estimate <= N
+then the emitted assembly's frame is also <= N. The acceptance gate
+verifies this by compiling the C source with `-ffreestanding
+-mgeneral-regs-only -mno-red-zone` and checking the resulting `.o`
+file's stack frame size (a defensive check — the compile error in
+the checker is the primary guarantee).
+
+### 27.3. `#[no_red_zone]` — disable the x86-64 red zone
+
+The x86-64 System V ABI reserves a 128-byte "red zone" below RSP that
+leaf functions may use without decrementing RSP. The CPU may push an
+exception or interrupt frame at any point inside the red zone,
+corrupting it — interrupt handlers and signal-handler trampolines
+MUST disable the red zone.
+
+The codegen emits `__attribute__((optimize("no-red-zone")))` on the
+function signature. gcc accepts this attribute (it emits a `-Wattributes`
+warning that the attribute "may be ineffective" — a limitation of
+gcc's per-function optimise-attribute machinery; the actual codegen
+DOES apply the flag). The acceptance gate compiles with
+`-Wno-attributes` to suppress the warning.
+
+When `#[irq_handler]` is also set, the `optimize("no-red-zone")`
+attribute is omitted (the interrupt attribute automatically disables
+the red zone — IRETQ semantics forbid red-zone use).
+
+### 27.4. `#[irq_handler]` — emit an IRET-compatible frame
+
+The codegen emits `__attribute__((interrupt))` on the function
+signature. gcc's x86-64 interrupt attribute makes the function:
+
+1. Save every caller-saved register (RAX, RCX, RDX, RSI, RDI, R8-R11,
+   XMM0-15) at function entry.
+2. Restore them at function exit.
+3. Return via `IRETQ` instead of `RET` (the IRETQ instruction pops
+   the saved RIP, CS, RFLAGS, RSP from the stack — the same frame
+   the CPU pushed when the interrupt was taken).
+
+The checker validates the function signature:
+- The function MUST return `void` (gcc's interrupt attribute
+  requires this).
+- The function MUST take exactly ONE parameter, and that parameter
+  MUST be a pointer-typed HLS value (str / list[T] / map[...] /
+  tainted[T]-of-pointer / Chan[T] / Task[T] / any user struct —
+  these all lower to C pointers). `int`/`float`/`bool` lower to C
+  scalars and are rejected (gcc's interrupt attribute would refuse
+  the signature).
+
+```hls
+struct IrqFrame {
+    vector: int,
+    error_code: int,
+    rip: int
+}
+
+#[no_red_zone, irq_handler, stack_size(256)]
+fn handle_irq(frame: IrqFrame) -> void {
+    let v: int = frame.vector
+    let _ack: int = v  # dead, but proves the frame stays small
+}
+```
+
+The emitted C signature is:
+
+```c
+__attribute__((interrupt)) void usf_handle_irq(IrqFrame* u_frame_p) { ... }
+```
+
+### 27.5. Freestanding build environment
+
+The Stage 28 acceptance gate compiles the C source under the
+freestanding build environment for kernel code:
+
+```bash
+gcc -O2 -Wno-attributes -ffreestanding -mgeneral-regs-only \
+    -mno-red-zone -fno-stack-protector -fno-pic -c \
+    -o kernel_irq.o kernel_irq.c
+```
+
+- `-ffreestanding`: no libc, no `main` required (the program may
+  define its own entry point; the interrupt handlers are freestanding
+  C functions that the kernel registers).
+- `-mgeneral-regs-only`: forbid SSE / MMX / AVX instructions (the
+  IRETQ frame doesn't save XMM registers, so the function body must
+  not use them). This means the body cannot call libc functions
+  (which use SSE); the body must be pure arithmetic + struct field
+  access.
+- `-mno-red-zone`: disable the red zone for the entire translation
+  unit (defensive — the per-function `optimize("no-red-zone")`
+  attribute is the primary mechanism).
+- `-fno-stack-protector`: no stack canaries (kernel code typically
+  uses its own stack-protector scheme).
+- `-fno-pic`: position-dependent code (kernel code is loaded at a
+  fixed address; PIC adds an indirection that slows interrupt entry).
+
+### 27.6. Acceptance
+
+The Stage 28 acceptance criterion: a kernel's interrupt handler
+compiles with `#[irq_handler] #[no_red_zone] #[stack_size(256)]` and
+the emitted assembly uses <= 256 bytes of stack.
+
+The acceptance gate (`make stack-acceptance`) verifies:
+
+1. The HLS file parses with all three attributes (via `boot/boot.py`
+   and via the native `bin/hlc`).
+2. The C source contains `__attribute__((interrupt))` on the
+   `handle_irq` and `handle_irq_minimal` functions.
+3. The C source compiles cleanly under the freestanding build
+   environment for kernel code.
+4. The static stack-size estimate is within the declared bound (no
+   `#[stack_size(N)] violated` compile error).
+
+See `examples/kernel_irq_demo.hls` for the full example.

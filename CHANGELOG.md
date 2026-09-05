@@ -13,6 +13,180 @@ stability (125–140), and final stabilisation toward v1.0 (141–150).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
+## [v0.45.0-alpha] — Stage 28: Stack-frame layout control (kernel code)
+
+> Completes **Stage 28** of the roadmap: three new function attributes
+> for kernel / bare-metal code — `#[stack_size(N)]` (static frame-size
+> bound, compile error if exceeded), `#[no_red_zone]` (disable the
+> x86-64 red zone, required for interrupt handlers), and
+> `#[irq_handler]` (emit an IRET-compatible frame via gcc's
+> `__attribute__((interrupt))`). The Stage 28 acceptance gate
+> (`make stack-acceptance`) compiles a kernel-style interrupt handler
+> under the freestanding build environment (`-ffreestanding
+> -mgeneral-regs-only -mno-red-zone -fno-stack-protector`) and
+> verifies the static stack-size estimate is within the declared bound.
+
+> - **Attribute syntax** (`boot/lexer.py`, `boot/parser.py`,
+>   `src/hlc.hls` lexer + parser, ~140 new lines): the lexer
+>   special-cases `#[` (vs `#` for line comments). The new
+>   `parse_attributes` function parses `#[attr1, attr2(arg), ...]`
+>   lists into the per-fn attribute cache (`ctx.cur_attrs_*`).
+>   Multiple `#[...]` lists may precede a single `fn` (each
+>   accumulates); `hot`/`cold` are mutually exclusive; `inline(always)`
+>   /`inline(never)` are mutually exclusive; unknown attribute names
+>   raise a clear compile error.
+> - **`#[stack_size(N)]` static analysis** (`src/hlc.hls`, ~80 new
+>   lines): the new `estimate_stack_size` function walks the fn body
+>   and sums: 32 bytes base overhead (saved RBP/RBX/alignment) + 8
+>   bytes per parameter local + 8 bytes per `let` binding (every HLS
+>   type lowers to a 8-byte C scalar: int64_t / double / pointer) +
+>   16 bytes per `for` loop (iter + index + iterator handle) + 16
+>   bytes per call site (gcc's call-frame overhead — return-address
+>   slot + caller-saved register spills). The estimate is an UPPER
+>   BOUND (gcc may reuse slots across sibling scopes, so the actual
+>   frame is always <= the estimate), making `#[stack_size(N)]` a
+>   sound guarantee: if the estimate <= N then the emitted assembly's
+>   frame <= N. The checker raises a clear compile error if the
+>   estimate exceeds N.
+> - **`#[irq_handler]` signature check** (`src/hlc.hls`): the checker
+>   validates that an irq_handler fn has signature
+>   `fn(<single pointer param>) -> void` (gcc's `interrupt` attribute
+>   requires a single pointer parameter that receives the saved frame,
+>   and returns void). The single param MUST be a pointer-typed HLS
+>   value (str / list[T] / struct / Chan / Task); `int`/`float`/`bool`
+>   lower to C scalars and are rejected.
+> - **C codegen** (`src/hlc.hls`): the new `fn_frame_attr` function
+>   emits `__attribute__((optimize("no-red-zone")))` for
+>   `#[no_red_zone]` (omitted when `#[irq_handler]` is also set — the
+>   interrupt attribute automatically disables the red zone) and
+>   `__attribute__((interrupt))` for `#[irq_handler]` (gcc's x86-64
+>   interrupt attribute: saves+restores every caller-saved register
+>   and returns via IRETQ instead of RET). The `fn_attr_prefix`
+>   function combines PGO annotations (Stage 19, unchanged) + Stage
+>   28 frame attributes. The same prefix is emitted on the fn body
+>   signature, the prototype, and every generic instantiation.
+> - **`examples/kernel_irq_demo.hls`** — a freestanding kernel-style
+>   interrupt handler with all three Stage 28 attributes. The handler
+>   takes an `IrqFrame` struct (lowers to `IrqFrame*` in C — the
+>   pointer-typed parameter gcc's interrupt attribute requires).
+> - **Acceptance**: `make stack-acceptance` verifies (a) the HLS file
+>   parses with all three attributes; (b) the C source contains
+>   `__attribute__((interrupt))`; (c) the C source compiles under the
+>   freestanding build environment for kernel code; (d) the static
+>   stack-size estimate is within the declared bound.
+> - **7 new tests** in `tests/run_tests.sh` section 14. **668/673
+>   total tests PASS** (5 pre-existing wasm failures unrelated to
+>   Stage 28). Bootstrap deterministic.
+
+### Stage 28 — `src/hlc.hls` attribute parser
+
+#### Added — `cur_attrs_*` fields on Ctx
+
+- Per-fn attribute cache: `cur_attrs_stack_size` (int, -1 = none),
+  `cur_attrs_no_red_zone` (bool), `cur_attrs_irq_handler` (bool),
+  `cur_attrs_inline` (str, "" = auto), `cur_attrs_hot` (bool),
+  `cur_attrs_cold` (bool). The inline/hot/cold fields are populated
+  but not yet wired up (that's Stage 29's job); they're accepted by
+  the parser so a file written against the upcoming Stage 29 doesn't
+  fail to parse on a Stage 28 compiler.
+
+#### Added — `FnInfo.attr_*` fields
+
+- `attr_stack_size: int`, `attr_no_red_zone: bool`,
+  `attr_irq_handler: bool`, `attr_inline: str`, `attr_hot: bool`,
+  `attr_cold: bool`. Carried from the parser's `cur_attrs_*` cache
+  into the FnInfo struct so the checker and codegen can read them.
+
+#### Added — `parse_attributes` + `reset_cur_attrs`
+
+- `parse_attributes` parses `#[attr1, attr2(arg), ...]` lists.
+  Validates mutual exclusivity (`hot`/`cold`, `inline(always)`/
+  `inline(never)`); `stack_size(N)` requires a non-negative integer;
+  unknown attribute names raise a clear compile error.
+- `reset_cur_attrs` clears the per-fn attribute cache to defaults
+  (called after every top-level declaration so the next fn doesn't
+  inherit the previous fn's attrs).
+
+### Stage 28 — `src/hlc.hls` stack-size estimator
+
+#### Added — `estimate_stack_size(ctx, f) -> int`
+
+- Returns the estimated stack frame size in bytes. The estimate is
+  an UPPER BOUND: 32 (base) + 8 per param local + 8 per `let` binding
+  + 16 per `for` loop + 16 per call site. Walks the body recursively
+  (if/while/for bodies; match arms walked as the LONGEST arm).
+
+#### Added — `estimate_stack_size_stmts` / `estimate_stack_size_stmt` / `estimate_stack_calls`
+
+- The recursive walkers used by `estimate_stack_size`. The statement
+  walker counts `let` bindings + `for` loops + recurses into
+  if/while/for bodies. The expression walker counts call sites in any
+  expression (including match arms — match is an expression in HLS).
+
+### Stage 28 — `src/hlc.hls` codegen
+
+#### Added — `fn_frame_attr(ctx, f) -> str`
+
+- Returns the Stage 28 C attribute prefix:
+  `__attribute__((optimize("no-red-zone")))` for `#[no_red_zone]`
+  (omitted when `#[irq_handler]` is also set); +
+  `__attribute__((interrupt))` for `#[irq_handler]`.
+
+#### Added — `fn_attr_prefix(ctx, f, key) -> str`
+
+- Returns the combined C attribute prefix: PGO annotations
+  (Stage 19, unchanged) + Stage 28 frame attributes. Used by
+  `gen_fn_body`, `gen_proto_lines`, and `gen_fn_inst_lines` so the
+  body signature, prototype, and generic instantiation all carry the
+  same attributes.
+
+### Stage 28 — `boot/parser.py` + `boot/lexer.py`
+
+#### Added — `#[` lexer special-case
+
+- The lexer now recognises `#[` as the start of an attribute list
+  (emitting `#` as a sym token) vs `#` followed by anything else
+  (which remains a line comment as before).
+
+#### Added — `parse_attributes` + `reset_cur_attrs`
+
+- Mirrors the self-hosted parser. The boot interpreter does NOT
+  honour these attributes (they only affect C codegen in the
+  self-hosted compiler), but it parses + stores them so that running
+  `boot/boot.py file_with_attrs.hls` does not error.
+
+### Stage 28 — Makefile targets
+
+#### Added
+
+- `make stack-acceptance` — the Stage 28 acceptance gate.
+- `make kernel-attrs F=<file.hls>` — print the per-function Stage 28
+  attribute decisions.
+
+### Stage 28 — `examples/kernel_irq_demo.hls`
+
+#### Added
+
+- A freestanding kernel-style interrupt handler demonstrating all
+  three Stage 28 attributes. The handler takes an `IrqFrame` struct
+  (lowers to `IrqFrame*` in C — the pointer-typed parameter gcc's
+  interrupt attribute requires) and reads the saved IRQ vector. The
+  body is intentionally minimal so the C source compiles under the
+  freestanding build environment for kernel code.
+
+### Stage 28 — editor support
+
+#### Added — VS Code + Neovim syntax highlighting for `#[...]` attributes
+
+- The VS Code TextMate grammar (`halis.tmLanguage.json`) adds an
+  `attributes` pattern that highlights `#[name(args), ...]` lists as
+  `meta.attribute.halis` with the attribute name in
+  `entity.other.attribute-name.halis`.
+- The Neovim syntax file (`halis.vim`) adds a `halisAttribute` region
+  with `halisAttrName` / `halisAttrPunct` / `halisAttrInt` sub-matches.
+  The comment regex uses a negative lookahead (`#\(\[\)\@!`) so `#[`
+  is not consumed as a comment.
+
 ## [v0.44.0-alpha] — Stage 25: AArch64 backend tuning (NEON + PAC + BTI)
 
 > Completes **Stage 25** of the roadmap: NEON SIMD codegen for

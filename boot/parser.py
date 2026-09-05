@@ -104,14 +104,105 @@ class Parser:
         "Chan", "Task",
     }
 
+    # Stage 28+29 (v0.45.0-alpha): attribute parser state. The boot
+    # interpreter does NOT honour these attributes (they only affect C
+    # codegen in the self-hosted compiler), but it MUST parse them so
+    # that running `boot/boot.py file_with_attrs.hls` does not error.
+    # parse_attributes populates these; parse_fn reads them and stores
+    # them on the fn dict (the checker / interp ignore them).
+    def reset_cur_attrs(self):
+        self.cur_attrs = {
+            "stack_size": -1,
+            "no_red_zone": False,
+            "irq_handler": False,
+            "inline": "",
+            "hot": False,
+            "cold": False,
+        }
+
+    def parse_attributes(self):
+        """Stage 28+29 (v0.45.0-alpha): parse one or more `#[...]`
+        attribute lists. Each list is `#` `[` attr (`,` attr)* `]`
+        where each `attr` is one of:
+            inline(always)   - force inline at every call site
+            inline(never)    - the function is never inlined
+            hot              - mark the function hot
+            cold             - mark the function cold
+            no_red_zone      - disable the x86-64 red zone
+            irq_handler      - emit an IRET-compatible frame
+            stack_size(N)    - assert the fn's frame is <= N bytes
+        Multiple `#[...]` lists may precede a single fn (each
+        accumulates). `hot` and `cold` are mutually exclusive; likewise
+        `inline(always)` and `inline(never)`. The boot parser
+        validates these constraints and stores the result in
+        self.cur_attrs; the boot interpreter ignores them.
+        """
+        while self.at_sym("#"):
+            t0 = self.next()  # consume '#'
+            self.eat_sym("[")
+            while not self.at_sym("]"):
+                attr_name = self.eat_ident()["v"]
+                if attr_name == "inline":
+                    self.eat_sym("(")
+                    mode = self.eat_ident()["v"]
+                    self.eat_sym(")")
+                    if mode not in ("always", "never"):
+                        self.err("unknown inline mode '%s' (expected "
+                                 "'always' or 'never')" % mode, t0)
+                    if (self.cur_attrs["inline"] != ""
+                            and self.cur_attrs["inline"] != mode):
+                        self.err("conflicting inline attributes (was '%s', "
+                                 "now '%s')" % (self.cur_attrs["inline"], mode), t0)
+                    self.cur_attrs["inline"] = mode
+                elif attr_name == "hot":
+                    if self.cur_attrs["cold"]:
+                        self.err("'hot' and 'cold' are mutually exclusive", t0)
+                    self.cur_attrs["hot"] = True
+                elif attr_name == "cold":
+                    if self.cur_attrs["hot"]:
+                        self.err("'hot' and 'cold' are mutually exclusive", t0)
+                    self.cur_attrs["cold"] = True
+                elif attr_name == "no_red_zone":
+                    self.cur_attrs["no_red_zone"] = True
+                elif attr_name == "irq_handler":
+                    self.cur_attrs["irq_handler"] = True
+                elif attr_name == "stack_size":
+                    self.eat_sym("(")
+                    nt = self.peek()
+                    if nt["k"] != "int":
+                        self.err("stack_size expects an integer byte count "
+                                 "but got %s" % self._desc(), nt)
+                    self.next()
+                    n = int(nt["v"])
+                    if n < 0:
+                        self.err("stack_size must be non-negative", nt)
+                    self.eat_sym(")")
+                    self.cur_attrs["stack_size"] = n
+                else:
+                    self.err("unknown attribute '%s' (known: inline(always), "
+                             "inline(never), hot, cold, no_red_zone, "
+                             "irq_handler, stack_size(N))" % attr_name, t0)
+                if self.at_sym(","):
+                    self.next()
+                elif not self.at_sym("]"):
+                    self.err("expected ',' or ']' in attribute list")
+            self.eat_sym("]")
+
     def parse_program(self):
         structs = {}   # name -> struct
         enums = {}      # name -> enum
         fns = {}       # key -> fn  (key = function name or "Struct.method")
         imports = []   # list of import paths
         externs = []   # Stage 15 (v0.13.0-alpha): list of extern blocks
+        # Stage 28+29: attribute cache, reset before every declaration.
+        self.reset_cur_attrs()
         while self.peek()["k"] != "eof":
+            # Stage 28+29: a leading `#[...]` applies to the next fn.
+            if self.at_sym("#"):
+                self.parse_attributes()
+                continue
             if self.at_kw("struct"):
+                self.reset_cur_attrs()
                 st = self.parse_struct()
                 if st["name"] in self.RESERVED_TYPE_NAMES:
                     self.err("type name '%s' is reserved (collides with a "
@@ -120,6 +211,7 @@ class Parser:
                     self.err("duplicate type name: %s" % st["name"])
                 structs[st["name"]] = st
             elif self.at_kw("enum"):
+                self.reset_cur_attrs()
                 en = self.parse_enum()
                 if en["name"] in self.RESERVED_TYPE_NAMES:
                     self.err("type name '%s' is reserved (collides with a "
@@ -128,6 +220,7 @@ class Parser:
                     self.err("duplicate type name: %s" % en["name"])
                 enums[en["name"]] = en
             elif self.at_kw("impl"):
+                self.reset_cur_attrs()
                 self.parse_impl(fns)
             elif self.at_kw("fn"):
                 f = self.parse_fn(None)
@@ -135,9 +228,11 @@ class Parser:
                     self.err("duplicate function name: %s" % f["name"])
                 fns[f["name"]] = f
             elif self.at_kw("import"):
+                self.reset_cur_attrs()
                 imp = self.parse_import()
                 imports.append(imp)
             elif self.at_kw("extern"):
+                self.reset_cur_attrs()
                 # Stage 15 (v0.13.0-alpha): extern "C" { ... } block.
                 ext = self.parse_extern_block()
                 for fn_decl in ext["decls"]:
@@ -147,6 +242,7 @@ class Parser:
                 externs.append(ext)
             else:
                 self.err("only struct/enum/impl/fn/import/extern declarations allowed at top level")
+            self.reset_cur_attrs()
         return {"structs": structs, "enums": enums, "fns": fns,
                 "imports": imports, "externs": externs}
 
@@ -316,6 +412,11 @@ class Parser:
         sname = self.eat_ident()["v"]
         self.eat_sym("{")
         while not self.at_sym("}"):
+            # Stage 28+29: methods may carry a `#[...]` attribute list
+            # (applies to the following fn).
+            if self.at_sym("#"):
+                self.parse_attributes()
+                continue
             if self.at_kw("fn"):
                 f = self.parse_fn(sname)
                 key = "%s.%s" % (sname, f["name"])
@@ -324,6 +425,7 @@ class Parser:
                 fns[key] = f
             else:
                 self.err("only fn definitions allowed inside impl")
+            self.reset_cur_attrs()
         self.eat_sym("}")
 
     def parse_fn(self, impl_struct, extern=False):
@@ -411,17 +513,31 @@ class Parser:
                 "body": [], "line": t0["line"], "struct": impl_struct,
                 "extern": True,
                 "requires": contracts[0], "ensures": contracts[1],
+                # Stage 28+29: extern fns are not allowed to carry HLS
+                # attributes (the FFI signature is the C ABI; inlining,
+                # interrupt frame layout etc. belong to the C side).
+                "attrs": {"stack_size": -1, "no_red_zone": False,
+                          "irq_handler": False, "inline": "",
+                          "hot": False, "cold": False},
             }
         # Stage 17 (v0.28.0-alpha): optional contract clauses —
         # `requires <bool-expr>` then/and `ensures <bool-expr>`, parsed
         # after the effects clause, before the body block.
         contracts = self.parse_contracts(t0)
         body = self.parse_block()
+        # Stage 28+29 (v0.45.0-alpha): snapshot the per-fn attribute
+        # cache into the fn dict. The boot interpreter does NOT honour
+        # these attributes (they only affect C codegen in the
+        # self-hosted compiler) but storing them keeps the AST shape
+        # consistent with the self-hosted FnInfo struct (the hlmodel /
+        # hlprove / hlbindgen tools that consume boot's AST see the
+        # fields and can reason about them).
         return {
             "name": name, "typeparams": typeparams, "params": params, "ret": ret,
             "effects": effects, "pure": is_pure, "body": body, "line": t0["line"],
             "struct": impl_struct, "extern": False,
             "requires": contracts[0], "ensures": contracts[1],
+            "attrs": dict(self.cur_attrs),
         }
 
     def parse_contracts(self, fn_tok):

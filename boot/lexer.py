@@ -87,6 +87,19 @@ def tokenize(src):
             continue
         # comment: # to end of line
         if c == 35:  # '#'
+            # Stage 28+29 (v0.45.0-alpha): `#[` introduces an attribute
+            # list (e.g. `#[inline(always)]`, `#[irq_handler]`). `#`
+            # followed by anything else (including end-of-line) is a
+            # line comment as before. The `#` is consumed here; the `[`
+            # is left for the normal symbol path so the parser sees
+            # `#` (as a token of kind "sym" with value "#") immediately
+            # followed by `[` (sym "[") — and parse_attributes consumes
+            # both.
+            if i + 1 < n and src[i + 1] == 91:  # '['
+                toks.append({"k": "sym", "v": "#", "line": line, "col": col})
+                col += 1
+                i += 1
+                continue
             # BUG-016 fix: track column past the comment, so error messages
             # on a later token on the same line report the right column.
             # Deep-scan-11 fix: stop at `\r` too. The whitespace handler

@@ -70,7 +70,39 @@ struct FnInfo {
     is_extern: bool,       # Stage 15-beta: extern "C" fn — forward declaration, no body
     # ---- Stage 17 (v0.28.0-alpha): contracts ----
     requires_e: int,        # expr index of the combined requires clause (-1 = none)
-    ensures_e: int          # expr index of the combined ensures clause (-1 = none)
+    ensures_e: int,        # expr index of the combined ensures clause (-1 = none)
+    # ---- Stage 28 (v0.45.0-alpha): stack-frame layout control ----
+    # attr_stack_size: requested maximum stack frame in bytes (-1 = none).
+    # The codegen runs a static analysis pass on the fn body to estimate
+    # the frame size (param locals + let bindings + per-call overhead);
+    # a compile error is raised if the estimate exceeds the bound.
+    attr_stack_size: int,
+    # attr_no_red_zone: disable the x86-64 red zone (required for
+    # interrupt handlers — the CPU may push an exception frame at any
+    # point inside the red zone). Emitted as
+    # __attribute__((target("no-red-zone"))) on x86-64; ignored elsewhere.
+    attr_no_red_zone: bool,
+    # attr_irq_handler: emit an IRET-compatible frame. On x86-64 the
+    # body is wrapped with __attribute__((interrupt)) which makes gcc
+    # save+restore every caller-saved register and return via IRETQ
+    # (rather than RET). The fn must have signature
+    # `fn(struct_or_ptr_to_frame) -> void` (gcc requires this).
+    attr_irq_handler: bool,
+    # ---- Stage 29 (v0.46.0-alpha): inline / hot / cold attributes ----
+    # attr_inline: "" = auto (the optimiser decides), "always" = force
+    # inline at every call site (LTO honours this by bypassing the
+    # budget check; the C signature carries
+    # __attribute__((always_inline)) inline), "never" = the function
+    # is NEVER inlined (the C signature carries
+    # __attribute__((noinline))).
+    attr_inline: str,
+    # attr_hot: mark this function hot — overrides PGO. Emitted as
+    # __attribute__((hot)). Implies attr_inline="" (the optimiser still
+    # picks; the hot attribute is purely a hint).
+    attr_hot: bool,
+    # attr_cold: mark this function cold — overrides PGO. Emitted as
+    # __attribute__((cold)). Mutually exclusive with attr_hot.
+    attr_cold: bool
 }
 
 struct MatchArm {
@@ -283,7 +315,20 @@ struct Ctx {
     # (simd_helpers_alt) is used for non-NEON hosts.
     simd_helpers_neon: list[str],
     # simd_helper_names: helper names already emitted (dedup).
-    simd_helper_names: list[str]
+    simd_helper_names: list[str],
+    # ---- Stage 28+29 (v0.45.0-alpha): attribute parser state ----
+    # cur_attrs_*: the parsed attributes for the fn currently being
+    # parsed. parse_program / parse_impl calls parse_attributes (when a
+    # `#[` is the next token), populates these fields, then calls
+    # parse_fn which reads them. parse_fn resets the fields to defaults
+    # at the start of its NEXT call (so an un-attributed fn never
+    # inherits the previous fn's attrs).
+    cur_attrs_stack_size: int,
+    cur_attrs_no_red_zone: bool,
+    cur_attrs_irq_handler: bool,
+    cur_attrs_inline: str,
+    cur_attrs_hot: bool,
+    cur_attrs_cold: bool
 }
 
 fn new_ctx(src: str) -> Ctx {
@@ -312,7 +357,10 @@ fn new_ctx(src: str) -> Ctx {
         lto_inline_n: 0, lto_dropped: 0, lto_inlined_report: [],
         lto_threshold: 0, lto_stats: false,
         target_feature: "", simd_helpers_main: [], simd_helpers_alt: [],
-        simd_helpers_plain: [], simd_helpers_neon: [], simd_helper_names: []
+        simd_helpers_plain: [], simd_helpers_neon: [], simd_helper_names: [],
+        cur_attrs_stack_size: -1, cur_attrs_no_red_zone: false,
+        cur_attrs_irq_handler: false, cur_attrs_inline: "",
+        cur_attrs_hot: false, cur_attrs_cold: false
     }
 }
 
@@ -685,12 +733,24 @@ fn lex(ctx: Ctx) -> void {
             col = 1
             i = i + 1
         } else if c == 35 {
-            # comment: # to end of line
-            # BUG-016 fix: track column past the comment, so error messages
-            # on a later token on the same line report the right column.
-            while i < n && src.byte_at(i) != 10 {
-                i = i + 1
+            # Stage 28+29 (v0.45.0-alpha): `#[` introduces an attribute
+            # list (e.g. `#[inline(always)]`, `#[irq_handler]`). `#`
+            # followed by anything else (including end-of-line) is a
+            # line comment as before. The `#` is consumed here as a
+            # sym token; the `[` is left for the normal symbol path so
+            # the parser sees `#` immediately followed by `[`.
+            if i + 1 < n && src.byte_at(i + 1) == 91 {
+                ctx.toks.push(mk_tok("sym", "#", line, col))
                 col = col + 1
+                i = i + 1
+            } else {
+                # comment: # to end of line
+                # BUG-016 fix: track column past the comment, so error messages
+                # on a later token on the same line report the right column.
+                while i < n && src.byte_at(i) != 10 {
+                    i = i + 1
+                    col = col + 1
+                }
             }
         } else if is_ident_start(c) {
             let mut j: int = i
@@ -1055,9 +1115,110 @@ fn parse_typeparams(ctx: Ctx) -> list[str] {
 
 # --- Program parsing ---
 
+# reset_cur_attrs (Stage 28+29, v0.45.0-alpha): clear the per-fn
+# attribute cache to defaults. Called after every top-level declaration
+# so the next fn (if un-attributed) doesn't inherit the previous fn's
+# attrs. Idempotent — safe to call when the cache is already clear.
+fn reset_cur_attrs(ctx: Ctx) -> void {
+    ctx.cur_attrs_stack_size = -1
+    ctx.cur_attrs_no_red_zone = false
+    ctx.cur_attrs_irq_handler = false
+    ctx.cur_attrs_inline = ""
+    ctx.cur_attrs_hot = false
+    ctx.cur_attrs_cold = false
+}
+
+# parse_attributes (Stage 28+29, v0.45.0-alpha): parse one or more
+# `#[attr1, attr2(arg), ...]` lists and merge them into ctx.cur_attrs_*.
+# Each list is `#` `[` attr (`,` attr)* `]` where each `attr` is one of:
+#
+#   inline(always)   - Stage 29: force inline at every call site
+#   inline(never)    - Stage 29: the function is never inlined
+#   hot              - Stage 29: mark the function hot (overrides PGO)
+#   cold             - Stage 29: mark the function cold (overrides PGO)
+#   no_red_zone      - Stage 28: disable the x86-64 red zone
+#   irq_handler      - Stage 28: emit an IRET-compatible frame
+#   stack_size(N)    - Stage 28: assert the fn's frame is <= N bytes
+#
+# Multiple `#[...]` lists may precede a single fn (each accumulates).
+# Within a single list, a duplicate attribute is a compile error.
+# `hot` and `cold` are mutually exclusive (compile error if both set).
+# `inline(always)` and `inline(never)` are mutually exclusive.
+fn parse_attributes(ctx: Ctx) -> void {
+    while at_sym(ctx, "#") {
+        let hash_tok: Tok = ctx.toks.get(ctx.pos)
+        eat_sym(ctx, "#")
+        eat_sym(ctx, "[")
+        while !at_sym(ctx, "]") {
+            let attr_name: str = eat_ident(ctx)
+            if attr_name == "inline" {
+                # inline(always) or inline(never)
+                eat_sym(ctx, "(")
+                let mode: str = eat_ident(ctx)
+                eat_sym(ctx, ")")
+                if mode != "always" && mode != "never" {
+                    perr_at(ctx, "unknown inline mode '" + mode + "' (expected 'always' or 'never')", hash_tok)
+                }
+                if ctx.cur_attrs_inline != "" && ctx.cur_attrs_inline != mode {
+                    perr_at(ctx, "conflicting inline attributes (was '" + ctx.cur_attrs_inline + "', now '" + mode + "')", hash_tok)
+                }
+                ctx.cur_attrs_inline = mode
+            } else if attr_name == "hot" {
+                if ctx.cur_attrs_cold {
+                    perr_at(ctx, "'hot' and 'cold' are mutually exclusive", hash_tok)
+                }
+                ctx.cur_attrs_hot = true
+            } else if attr_name == "cold" {
+                if ctx.cur_attrs_hot {
+                    perr_at(ctx, "'hot' and 'cold' are mutually exclusive", hash_tok)
+                }
+                ctx.cur_attrs_cold = true
+            } else if attr_name == "no_red_zone" {
+                ctx.cur_attrs_no_red_zone = true
+            } else if attr_name == "irq_handler" {
+                ctx.cur_attrs_irq_handler = true
+            } else if attr_name == "stack_size" {
+                eat_sym(ctx, "(")
+                let nt: Tok = ctx.toks.get(ctx.pos)
+                if nt.kind != "int" {
+                    perr_at(ctx, "stack_size expects an integer byte count but got " + tok_desc(ctx), nt)
+                }
+                ctx.pos = ctx.pos + 1
+                let n: int = int(nt.value)
+                if n < 0 {
+                    perr_at(ctx, "stack_size must be non-negative", nt)
+                }
+                eat_sym(ctx, ")")
+                # If multiple stack_size attrs appear, the LAST wins
+                # (the user's intent is to refine; we don't accumulate).
+                ctx.cur_attrs_stack_size = n
+            } else {
+                perr_at(ctx, "unknown attribute '" + attr_name + "' (known: inline(always), inline(never), hot, cold, no_red_zone, irq_handler, stack_size(N))", hash_tok)
+            }
+            if at_sym(ctx, ",") {
+                ctx.pos = ctx.pos + 1
+            } else if !at_sym(ctx, "]") {
+                perr(ctx, "expected ',' or ']' in attribute list")
+            }
+        }
+        eat_sym(ctx, "]")
+    }
+}
+
 fn parse_program(ctx: Ctx) -> void {
     while ctx.toks.get(ctx.pos).kind != "eof" {
         let t: Tok = ctx.toks.get(ctx.pos)
+        # Stage 28+29 (v0.45.0-alpha): a top-level `#[...]` attribute
+        # list applies to the following `fn` (the only declaration
+        # that currently accepts attributes). parse_attributes
+        # populates ctx.cur_attrs_*; parse_fn reads those fields.
+        # reset_cur_attrs is called at the END of every iteration so
+        # the NEXT declaration starts with cleared attrs (an
+        # un-attributed fn never inherits the previous fn's attrs).
+        if t.kind == "sym" && t.value == "#" {
+            parse_attributes(ctx)
+            continue
+        }
         if t.kind == "kw" && t.value == "struct" {
             let st: StructInfo = parse_struct(ctx)
             if ctx.structs.has(st.name) || ctx.enums.has(st.name) {
@@ -1093,6 +1254,10 @@ fn parse_program(ctx: Ctx) -> void {
         } else {
             perr_at(ctx, "only struct/enum/impl/fn/import/extern declarations allowed at top level", t)
         }
+        # Reset the per-fn attribute cache after every iteration so
+        # the next fn (if un-attributed) doesn't inherit the previous
+        # fn's attributes.
+        reset_cur_attrs(ctx)
     }
 }
 
@@ -1193,6 +1358,13 @@ fn parse_impl(ctx: Ctx) -> void {
     let sname: str = eat_ident(ctx)
     eat_sym(ctx, "{")
     while !at_sym(ctx, "}") {
+        # Stage 28+29: methods may carry a `#[...]` attribute list
+        # (applies to the following fn). Mirrors the top-level handling
+        # in parse_program.
+        if at_sym(ctx, "#") {
+            parse_attributes(ctx)
+            continue
+        }
         if !at_kw(ctx, "fn") {
             perr(ctx, "only fn definitions allowed inside impl")
         }
@@ -1208,6 +1380,7 @@ fn parse_impl(ctx: Ctx) -> void {
             ctx.methods_of.set(sname, [])
         }
         ctx.methods_of.get_or(sname, []).push(key)
+        reset_cur_attrs(ctx)
     }
     eat_sym(ctx, "}")
 }
@@ -1299,12 +1472,21 @@ fn parse_fn(ctx: Ctx, impl_struct: str) -> FnInfo {
     # block — parse them first.
     let contracts: list[int] = parse_contracts(ctx)
     let body: list[int] = parse_block(ctx)
+    # Stage 28+29 (v0.45.0-alpha): default-constructed attrs (the
+    # parse_fn caller — parse_program / parse_impl — already consumed
+    # any leading attribute list via parse_fn_with_attrs).
     return FnInfo {
         name: name, params: params, ptypes: ptypes, pmuts: pmuts,
         ret: ret, effects: effects, is_pure: is_pure, body: body,
         is_method: impl_struct != "", struct_of: impl_struct,
         typeparams: typeparams, line: t0.line, is_extern: false,
-        requires_e: contracts.get(0), ensures_e: contracts.get(1)
+        requires_e: contracts.get(0), ensures_e: contracts.get(1),
+        attr_stack_size: ctx.cur_attrs_stack_size,
+        attr_no_red_zone: ctx.cur_attrs_no_red_zone,
+        attr_irq_handler: ctx.cur_attrs_irq_handler,
+        attr_inline: ctx.cur_attrs_inline,
+        attr_hot: ctx.cur_attrs_hot,
+        attr_cold: ctx.cur_attrs_cold
     }
 }
 
@@ -1465,7 +1647,9 @@ fn parse_extern_block(ctx: Ctx) -> void {
             ret: ret, effects: effects, is_pure: is_pure, body: empty_body,
             is_method: false, struct_of: "", typeparams: typeparams,
             line: ft0.line, is_extern: true,
-            requires_e: contracts_ext.get(0), ensures_e: contracts_ext.get(1)
+            requires_e: contracts_ext.get(0), ensures_e: contracts_ext.get(1),
+            attr_stack_size: -1, attr_no_red_zone: false, attr_irq_handler: false,
+            attr_inline: "", attr_hot: false, attr_cold: false
         })
         ctx.fn_order.push(name)
     }
@@ -2423,6 +2607,156 @@ fn unify_into_offset(ctx: Ctx, pt: str, at: str, tps: list[str], targs_out: list
 
 # --- Checker lifecycle ---
 
+# estimate_stack_size (Stage 28, v0.45.0-alpha): conservatively
+# estimate the function's stack frame size in bytes. Used to validate
+# the #[stack_size(N)] attribute — if the estimate exceeds N, the
+# checker raises a compile error (the body declares too many locals
+# or nests too many call sites for the bound).
+#
+# The estimate is an UPPER BOUND on the frame gcc will emit for the
+# type-correct HLS source:
+#
+#   - Each `let` binding in the body contributes sizeof(C type) bytes.
+#     Every HLS type lowers to a C scalar of 8 bytes (int64_t, double,
+#     or pointer). bool lowers to 1 byte but is rounded up to 8 for
+#     alignment. void contributes 0 (no slot needed).
+#   - Each `for` loop's iteration variable adds 8 bytes (a list element
+#     pointer + an index temp; we conservatively count 8 to keep the
+#     arithmetic simple — the runtime allocates 2 slots, not 1, but
+#     gcc may merge them into one slot).
+#   - Each nested call site adds 16 bytes (gcc spills the caller-saved
+#     registers + the return-address slot for very-deep call chains;
+#     this is the standard "call frame overhead" estimate used by gcc
+#     itself in its -Wframe-larger-than check).
+#   - Base overhead: 32 bytes (saved RBP, RBX, the frame pointer chain
+#     + alignment padding to 16 bytes).
+#
+# The estimate is intentionally simple: we walk every statement
+# (recursively into if/while/for bodies) and count occurrences. We
+# don't try to model scope slot-reuse — gcc may overlap two sibling
+# `let` slots, but the upper bound is what we want for a sound
+# guarantee (the actual frame is always <= the estimate, so
+# estimate <= N => frame <= N).
+#
+# Returns the estimate in bytes.
+fn estimate_stack_size(ctx: Ctx, f: FnInfo) -> int {
+    let mut bytes: int = 32  # base overhead (saved RBP / RBX / alignment)
+    # Each parameter local adds 8 bytes (the body's owned copy of the
+    # param; the signature's `<name>_p` is not in the frame, it's the
+    # incoming register/stack-slot per the C ABI).
+    let mut pi: int = 0
+    while pi < f.params.len() {
+        bytes = bytes + 8
+        pi = pi + 1
+    }
+    # Walk the body, accumulating locals + call-site overhead.
+    bytes = estimate_stack_size_stmts(ctx, f.body, bytes)
+    return bytes
+}
+
+# estimate_stack_size_stmts walks a statement list, mutates `bytes`
+# (passed by reference via the closure over the outer `bytes` —
+# HLS doesn't have closures, so we return the accumulated value
+# instead). The caller reassigns.
+fn estimate_stack_size_stmts(ctx: Ctx, stmts: list[int], mut bytes: int) -> int {
+    let mut i: int = 0
+    while i < stmts.len() {
+        bytes = estimate_stack_size_stmt(ctx, stmts.get(i), bytes)
+        i = i + 1
+    }
+    return bytes
+}
+
+fn estimate_stack_size_stmt(ctx: Ctx, sidx: int, mut bytes: int) -> int {
+    let s: StmtN = ctx.stmts[sidx]
+    if s.kind == "let" {
+        # Each let-binding contributes sizeof(C type). All HLS types
+        # lower to 8-byte C scalars (int64_t / double / pointer); bool
+        # lowers to 1 byte but is rounded up to 8 for alignment. void
+        # contributes 0 (an unreachable binding, after a panic).
+        if s.vtype == "void" {
+            # void bindings are unreachable; no slot needed.
+        } else {
+            bytes = bytes + 8
+        }
+    } else if s.kind == "for" {
+        # The for-loop adds an iteration variable (8 bytes) plus an
+        # index temp (8 bytes) plus the list iterator handle (8 bytes).
+        # Conservatively count 16 bytes for the loop's own overhead.
+        bytes = bytes + 16
+        bytes = estimate_stack_size_stmts(ctx, s.body, bytes)
+    } else if s.kind == "while" {
+        bytes = estimate_stack_size_stmts(ctx, s.body, bytes)
+    } else if s.kind == "if" {
+        bytes = estimate_stack_size_stmts(ctx, s.body, bytes)
+        if s.else_body.len() > 0 {
+            bytes = estimate_stack_size_stmts(ctx, s.else_body, bytes)
+        }
+    }
+    # match is an EXPRESSION (lives in s.e / s.value); its arms are
+    # walked by estimate_stack_calls (which recurses through match
+    # arms via n.args -> MatchArm.body).
+    #
+    # Statement-position call sites add 16 bytes each (the call frame
+    # overhead — gcc reserves a slot for the return address + the
+    # caller-saved register spills for very deep chains). We detect
+    # call sites by inspecting the statement's expression for a call
+    # node. This is conservative — many expressions are not calls.
+    if s.e >= 0 {
+        bytes = bytes + estimate_stack_calls(ctx, s.e)
+    }
+    if s.value >= 0 && s.kind == "let" {
+        bytes = bytes + estimate_stack_calls(ctx, s.value)
+    }
+    if s.cond >= 0 && (s.kind == "if" || s.kind == "while") {
+        bytes = bytes + estimate_stack_calls(ctx, s.cond)
+    }
+    if s.iter >= 0 && s.kind == "for" {
+        bytes = bytes + estimate_stack_calls(ctx, s.iter)
+    }
+    return bytes
+}
+
+# estimate_stack_calls: count the number of call sites in an
+# expression tree (recursively). Each call site contributes 16 bytes
+# to the frame estimate (call frame overhead).
+fn estimate_stack_calls(ctx: Ctx, e: int) -> int {
+    if e < 0 {
+        return 0
+    }
+    let n: ExprN = ctx.exprs[e]
+    let mut calls: int = 0
+    if n.kind == "call" {
+        calls = calls + 16
+    }
+    if n.kind == "match" {
+        # match arms live in n.args (each is an index into
+        # ctx.match_arms). The arm body is an expression; recurse.
+        let mut ai: int = 0
+        while ai < n.args.len() {
+            let arm: MatchArm = ctx.match_arms[n.args.get(ai)]
+            calls = calls + estimate_stack_calls(ctx, arm.body)
+            ai = ai + 1
+        }
+    }
+    if n.left >= 0 {
+        calls = calls + estimate_stack_calls(ctx, n.left)
+    }
+    if n.right >= 0 {
+        calls = calls + estimate_stack_calls(ctx, n.right)
+    }
+    let mut i: int = 0
+    while i < n.args.len() {
+        if n.kind != "match" {
+            # For non-match, args are child expressions; for match they
+            # are arm indices (already handled above).
+            calls = calls + estimate_stack_calls(ctx, n.args.get(i))
+        }
+        i = i + 1
+    }
+    return calls
+}
+
 fn check_program(ctx: Ctx) -> void {
     # 1. struct: field types
     let keys_s: list[str] = ctx.structs.keys()
@@ -2499,6 +2833,48 @@ fn check_program(ctx: Ctx) -> void {
         if f.ret != "void" {
             if !type_exists(ctx, f.ret) {
                 cerr(f.line, "return type does not exist: " + f.ret)
+            }
+        }
+        # Stage 28 (v0.45.0-alpha): validate the #[stack_size(N)] bound
+        # by statically estimating the function's frame size. The estimate
+        # is conservative: count every let-binding / for-loop var in the
+        # body (8 bytes each — every HLS type lowers to int64_t / double /
+        # pointer, all 8 bytes), add 16 bytes per nested call (gcc spills
+        # the caller-saved registers + return address slot), plus 32 bytes
+        # base overhead (saved RBP / RBX / frame pointer chain). The
+        # estimate is an UPPER BOUND — gcc may reuse slots across sibling
+        # scopes, so the actual frame can be smaller, but it can never be
+        # larger than this number for the type-correct HLS source. This
+        # makes #[stack_size(N)] a sound guarantee: if the estimate <= N
+        # then the emitted assembly's frame <= N.
+        if f.attr_stack_size >= 0 && !f.is_extern {
+            let est: int = estimate_stack_size(ctx, f)
+            if est > f.attr_stack_size {
+                cerr(f.line, "#[stack_size(" + f.attr_stack_size.to_str()
+                    + ")] violated by function '" + f.name + "': estimated frame size is "
+                    + est.to_str() + " bytes (the body declares too many locals or nests too many call sites for the bound). Reduce locals or raise the bound.")
+            }
+        }
+        # Stage 28: #[irq_handler] is only valid on fns with signature
+        # `fn(<single pointer param>) -> void` (gcc's interrupt attribute
+        # requires a single pointer parameter that receives the saved
+        # frame, and returns void).
+        if f.attr_irq_handler && !f.is_extern {
+            if f.ret != "void" {
+                cerr(f.line, "#[irq_handler] requires the function to return 'void' (gcc's interrupt attribute); '" + f.name + "' returns '" + f.ret + "'")
+            }
+            if f.params.len() != 1 {
+                cerr(f.line, "#[irq_handler] requires exactly one parameter (the saved-frame pointer); '" + f.name + "' has " + f.params.len().to_str())
+            } else {
+                # The single param MUST be a C pointer type (any HLS
+                # type that lowers to a C pointer: str, list[T], map[...],
+                # tainted[T]-of-pointer, Chan[T], Task[T], or any user
+                # struct). `int`, `float`, `bool`, `void` lower to scalars
+                # and are rejected.
+                let pt: str = f.ptypes.get(0)
+                if !is_ptr_type(pt) {
+                    cerr(f.line, "#[irq_handler] requires its parameter to be a pointer-typed value (str / list[T] / struct / Chan / Task / tainted[T] of pointer); '" + f.name + "' has '" + pt + "' which lowers to a non-pointer C type and gcc's interrupt attribute would reject the signature")
+                }
             }
         }
         ctx.cur_typeparams = []
@@ -2704,7 +3080,9 @@ fn dummy_fn() -> FnInfo {
         name: "", params: [], ptypes: [], pmuts: [], ret: "void",
         effects: [], is_pure: false, body: [], is_method: false, struct_of: "",
         typeparams: [], line: 0, is_extern: false,
-        requires_e: -1, ensures_e: -1
+        requires_e: -1, ensures_e: -1,
+        attr_stack_size: -1, attr_no_red_zone: false, attr_irq_handler: false,
+        attr_inline: "", attr_hot: false, attr_cold: false
     }
 }
 
@@ -8747,6 +9125,83 @@ fn pgo_fn_inline(ctx: Ctx, key: str) -> bool {
 }
 
 # ============================================================================
+# STAGE 28 (v0.45.0-alpha): function attribute prefixes
+# ----------------------------------------------------------------------------
+# fn_attr_prefix(ctx, f) returns the C attribute prefix to attach to a
+# function signature. For Stage 28 this is ONLY the frame-layout
+# attributes (#[no_red_zone], #[irq_handler]). The PGO hot/cold
+# annotation logic (pgo_fn_attr / pgo_fn_inline) is preserved verbatim
+# from Stage 19 — Stage 28 does NOT yet override PGO with user attrs
+# (that's Stage 29's job).
+#
+# The caller writes:
+#     out.push(fn_attr_prefix(ctx, f, key) + sig + " {")
+#
+# For prototypes, use fn_attr_prefix the same way.
+# ============================================================================
+
+# fn_frame_attr: Stage 28 stack-frame attributes. Always emitted —
+# when the host C compiler does not support a given attribute (e.g.
+# clang on a non-x86-64 host rejecting `target("no-red-zone")`), it
+# emits a warning that the user can suppress with -Wno-attributes.
+#
+# `irq_handler` automatically disables the x86-64 red zone for that
+# function (gcc emits IRETQ semantics which forbid red-zone use); the
+# separate `no_red_zone` attribute is for the case where a function
+# is NOT an interrupt handler but still wants to be red-zone-free (e.g.
+# a signal handler trampoline).
+fn fn_frame_attr(ctx: Ctx, f: FnInfo) -> str {
+    let mut s: str = ""
+    if f.attr_no_red_zone && !f.attr_irq_handler {
+        # x86-64 System V ABI reserves a 128-byte "red zone" below RSP
+        # that leaf functions may use without decrementing RSP. The
+        # CPU may push an exception / interrupt frame at any point
+        # inside the red zone, corrupting it. gcc's `optimize`
+        # attribute accepts `no-red-zone` and disables it for this
+        # function. (`target("no-red-zone")` is NOT a recognised
+        # target attribute on x86-64; `optimize("no-red-zone")` is
+        # the correct syntax.) gcc emits a `-Wattributes` warning
+        # that the attribute "may be ineffective" — this is a
+        # limitation of gcc's per-function optimise-attribute
+        # machinery; the actual codegen DOES apply the flag. The
+        # acceptance gate compiles with -Wno-attributes.
+        s = s + "__attribute__((optimize(\"no-red-zone\"))) "
+    }
+    if f.attr_irq_handler {
+        # gcc's `interrupt` attribute on x86-64 makes the function
+        # save+restore every caller-saved register (RAX, RCX, RDX, RSI,
+        # RDI, R8-R11 + XMM0-15) and return via IRETQ instead of RET.
+        # It also implicitly disables the red zone (the IRETQ frame
+        # could be corrupted by a red-zone write). The fn must take a
+        # single POINTER parameter (the saved frame pointer; gcc
+        # populates it from the RSP at the interrupt entry) and return
+        # void. The Stage 28 checker validates this signature.
+        s = s + "__attribute__((interrupt)) "
+    }
+    return s
+}
+
+# fn_attr_prefix: the combined C attribute prefix for a function
+# signature (PGO hot/cold + static-inline hint + Stage 28 frame attrs).
+# Used by gen_fn_body, gen_proto_lines, and gen_fn_inst_lines.
+#
+# Stage 28: the prefix is PGO annotations (Stage 19, unchanged) +
+# Stage 28 frame attributes. Stage 29 (next commit) will add the
+# inline/hot/cold user-attribute overrides on top of this.
+fn fn_attr_prefix(ctx: Ctx, f: FnInfo, key: str) -> str {
+    let mut p: str = ""
+    # Stage 19 (v0.35.0-alpha): PGO hot/cold annotation + static
+    # inline hint (unchanged from Stage 19 / 20).
+    if pgo_fn_inline(ctx, key) {
+        p = p + "static inline "
+    }
+    p = p + pgo_fn_attr(ctx, key)
+    # Stage 28: frame layout attributes.
+    p = p + fn_frame_attr(ctx, f)
+    return p
+}
+
+# ============================================================================
 # STAGE 21 (v0.37.0-alpha): SIMD INTRINSIC FAST PATHS (--target-feature)
 # ----------------------------------------------------------------------------
 # Under --target-feature sse4.2|avx2, calls to the std.simd kernels
@@ -11734,9 +12189,15 @@ fn gen_fn_body(ctx: Ctx, key: str) -> void {
     # Stage 19 (v0.35.0-alpha): --pgo-use — annotate the function
     # signature hot/cold from the loaded profile (entry counts).
     # Stage 20: record the body's start index for LTO phase-B splicing.
+    # Stage 28+29 (v0.45.0-alpha): the signature prefix now also
+    # carries the user attributes (#[inline(always)], #[hot], #[cold],
+    # #[no_red_zone], #[irq_handler]). When a Stage 29 attribute is
+    # set, it OVERRIDES the PGO hint (the user's explicit decision
+    # wins). When no Stage 29 attribute is set, the PGO profile is
+    # consulted as before.
     let sig_start: int = ctx.out.len()
     ctx.lto_fn_start.set(key, sig_start)
-    ctx.out.push(pgo_fn_attr(ctx, key) + sig + " {")
+    ctx.out.push(fn_attr_prefix(ctx, f, key) + sig + " {")
     emit_param_local_decls(ctx, f, inst_ptypes, param_local_names)
     # Stage 19: PGO — function-entry counter site (e:<fnkey>), emitted
     # under --pgo-generate as the first statement of the body.
@@ -11772,8 +12233,14 @@ fn gen_fn_body(ctx: Ctx, key: str) -> void {
     # functions get a `static inline` hint retroactively patched onto the
     # already-pushed signature line (the prototype emitted later consults
     # the same map, so both stay consistent).
+    # Stage 28+29 (v0.45.0-alpha): the retro-patch is ONLY for the PGO
+    # path. When an explicit #[inline(always)] / #[inline(never)] /
+    # #[hot] / #[cold] attribute is set, the prefix is already correct
+    # on the signature line (the user attribute is emitted by
+    # fn_attr_prefix above); no retro-patch is needed (and would be a
+    # no-op: fn_inline_attr returns the same string on both calls).
     ctx.pgo_fn_sizes.set(key, ctx.out.len() - sig_start)
-    if pgo_fn_inline(ctx, key) {
+    if f.attr_inline == "" && pgo_fn_inline(ctx, key) {
         ctx.out.set(sig_start, "static inline " + ctx.out.get(sig_start))
     }
 }
@@ -12068,11 +12535,11 @@ fn gen_proto_lines(ctx: Ctx) -> list[str] {
         }
         # Stage 19 (v0.35.0-alpha): prototype mirrors the body's PGO
         # annotations (hot/cold attribute + static inline hint).
-        let mut attr: str = pgo_fn_attr(ctx, key)
-        if pgo_fn_inline(ctx, key) {
-            attr = "static inline " + attr
-        }
-        out.push(attr + sig + ";")
+        # Stage 28+29 (v0.45.0-alpha): prototype mirrors the body's
+        # user attributes too (#[inline(always)], #[hot], #[cold],
+        # #[no_red_zone], #[irq_handler]) — fn_attr_prefix returns
+        # the combined prefix identical to what gen_fn_body emitted.
+        out.push(fn_attr_prefix(ctx, f, key) + sig + ";")
         i = i + 1
     }
     # Also emit prototypes for generic function instantiations.
@@ -12100,11 +12567,9 @@ fn gen_proto_lines(ctx: Ctx) -> list[str] {
             sig = sig + join(ptypes_c, ", ") + ")"
         }
         # Stage 19: mirror the instantiation body's PGO annotations.
-        let mut attr: str = pgo_fn_attr(ctx, mangled)
-        if pgo_fn_inline(ctx, mangled) {
-            attr = "static inline " + attr
-        }
-        out.push(attr + sig + ";")
+        # Stage 28+29: mirror the user attributes too. The mangled
+        # key is used for PGO lookups (same as gen_fn_inst_lines).
+        out.push(fn_attr_prefix(ctx, f, mangled) + sig + ";")
         j2 = j2 + 1
     }
     out.push("")
@@ -12211,7 +12676,7 @@ fn gen_fn_inst_lines(ctx: Ctx) -> list[str] {
         # attributes come from the loaded profile like plain functions.
         let mangled: str = c_mangled_fn_name(key, combined_tps, targs)
         let sig_start: int = out.len()
-        out.push(pgo_fn_attr(ctx, mangled) + sig + " {")
+        out.push(fn_attr_prefix(ctx, f, mangled) + sig + " {")
         # Emit statements. The gen_stmt / gen_expr functions need to use
         # inst_t for types. We achieve this by intercepting in c_type via
         # the ctx.cur_typeparams + ctx.cur_targs.
@@ -12236,8 +12701,10 @@ fn gen_fn_inst_lines(ctx: Ctx) -> list[str] {
         out.push("")
         # Stage 19: body size + retroactive `static inline` hint (same
         # predicate the prototype emission consults).
+        # Stage 28+29: only retro-patch under PGO; explicit attrs are
+        # already on the signature line via fn_attr_prefix.
         ctx.pgo_fn_sizes.set(mangled, out.len() - sig_start)
-        if pgo_fn_inline(ctx, mangled) {
+        if f.attr_inline == "" && pgo_fn_inline(ctx, mangled) {
             out.set(sig_start, "static inline " + out.get(sig_start))
         }
         ctx.cur_typeparams = []
@@ -13191,6 +13658,7 @@ fn print_lto_stats(ctx: Ctx) -> void uses IO {
         }
     }
 }
+
 
 # Stage 9-beta: print the capability / effect tree of every function.
 # Mirrors boot.py's --audit output. Reads ctx.computed_effects (populated

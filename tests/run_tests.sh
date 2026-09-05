@@ -1341,6 +1341,102 @@ else
     bad "aarch64: bootstrap compile failed"
 fi
 
+echo "=== 14. Stage 28: stack-frame layout control (kernel code) ==="
+# Stage 28 (v0.45.0-alpha): #[no_red_zone], #[irq_handler], #[stack_size(N)]
+# attributes parse and emit the right C __attribute__ on the function
+# signature. The kernel_irq_demo.hls example exercises all three.
+
+# (a) the example file parses with all three attributes (via boot).
+if python3 boot/boot.py examples/kernel_irq_demo.hls >/dev/null 2>&1; then
+    ok "stack: examples/kernel_irq_demo.hls parses via boot"
+else
+    bad "stack: examples/kernel_irq_demo.hls failed to parse via boot"
+fi
+
+# (b) hlc compiles it to a C source that contains __attribute__((interrupt)).
+if [ ! -x "$TMP/hlc1" ]; then
+    python3 boot/boot.py src/hlc.hls src/hlc.hls "$TMP/hlc_nat.c" >/dev/null 2>&1
+    gcc -O2 -o "$TMP/hlc1" "$TMP/hlc_nat.c" -lm -pthread 2>/dev/null
+fi
+if "$TMP/hlc1" examples/kernel_irq_demo.hls "$TMP/kernel_irq.c" >/dev/null 2>&1; then
+    if grep -q "__attribute__((interrupt))" "$TMP/kernel_irq.c"; then
+        ok "stack: C source has __attribute__((interrupt))"
+    else
+        bad "stack: __attribute__((interrupt)) missing from C source"
+    fi
+    # (c) the C source compiles under freestanding flags (no libc, no SSE).
+    if gcc -O2 -Wno-attributes -ffreestanding -mgeneral-regs-only \
+        -mno-red-zone -fno-stack-protector -fno-pic -c \
+        -o "$TMP/kernel_irq.o" "$TMP/kernel_irq.c" 2>"$TMP/kernel_gcc.log"; then
+        ok "stack: C source compiles under freestanding flags (-ffreestanding -mgeneral-regs-only -mno-red-zone)"
+    else
+        bad "stack: freestanding compile failed"
+        cat "$TMP/kernel_gcc.log" | head -5
+    fi
+else
+    bad "stack: hlc compile failed"
+fi
+
+# (d) #[stack_size(N)] checker fires on a too-small bound.
+cat > "$TMP/stack_fail.hls" << 'SEOF'
+#[stack_size(8)]
+fn too_big(x: int) -> int {
+    let a: int = x + 1
+    let b: int = a + 2
+    let c: int = b + 3
+    return a + b + c
+}
+
+fn main() -> int {
+    return too_big(10)
+}
+SEOF
+err=$(python3 boot/boot.py src/hlc.hls "$TMP/stack_fail.hls" "$TMP/stack_fail.c" 2>&1)
+if echo "$err" | grep -q "#\[stack_size(8)\] violated"; then
+    ok "stack: #[stack_size(8)] checker fires on too-large frame"
+else
+    bad "stack: #[stack_size(N)] checker did NOT fire (got: $err)"
+fi
+
+# (e) #[irq_handler] checker rejects a non-void return.
+cat > "$TMP/irq_bad.hls" << 'IEOF'
+#[irq_handler]
+fn bad_irq(frame: int) -> int {
+    return 0
+}
+
+fn main() -> int {
+    return 0
+}
+IEOF
+err=$(python3 boot/boot.py src/hlc.hls "$TMP/irq_bad.hls" "$TMP/irq_bad.c" 2>&1)
+if echo "$err" | grep -q "irq_handler.*void"; then
+    ok "stack: #[irq_handler] rejects non-void return"
+else
+    bad "stack: #[irq_handler] did NOT reject non-void (got: $err)"
+fi
+
+# (f) make stack-acceptance runs end-to-end.
+if make stack-acceptance >"$TMP/stack_acc.log" 2>&1; then
+    if grep -q "ACCEPTANCE OK" "$TMP/stack_acc.log"; then
+        ok "stack: make stack-acceptance runs end-to-end"
+    else
+        bad "stack: make stack-acceptance did not print ACCEPTANCE OK"
+        tail -5 "$TMP/stack_acc.log"
+    fi
+else
+    bad "stack: make stack-acceptance failed"
+    tail -10 "$TMP/stack_acc.log"
+fi
+
+# (g) bootstrap still works after the src/hlc.hls Stage 28 changes.
+if python3 boot/boot.py src/hlc.hls src/hlc.hls "$TMP/hlc_s28.c" >/dev/null 2>&1 \
+    && diff -q "$TMP/hlc_s28.c" "$TMP/hlc_nat.c" >/dev/null; then
+    ok "stack: bootstrap deterministic with Stage 28 changes"
+else
+    bad "stack: bootstrap not deterministic with Stage 28 changes"
+fi
+
 echo ""
 echo "=========================================="
 echo "RESULT: $PASS PASS / $FAIL FAIL"

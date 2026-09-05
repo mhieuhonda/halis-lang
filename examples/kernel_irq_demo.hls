@@ -1,0 +1,89 @@
+# kernel_irq_demo.hls — Stage 28 (v0.45.0-alpha): stack-frame layout control.
+#
+# Demonstrates the three Stage 28 attributes on a kernel-style
+# interrupt handler:
+#
+#   #[stack_size(N)]  - assert the function's stack frame is <= N bytes
+#                       (compile error if exceeded). The checker runs
+#                       a static analysis pass that estimates the
+#                       frame size from locals + call-site overhead.
+#   #[no_red_zone]    - disable the x86-64 red zone (required for
+#                       interrupt handlers — the CPU may push an
+#                       exception frame at any point inside the
+#                       128-byte red zone below RSP, corrupting it).
+#   #[irq_handler]    - emit an IRET-compatible frame. On x86-64 the
+#                       body is wrapped with __attribute__((interrupt))
+#                       which makes gcc save+restore every caller-saved
+#                       register and return via IRETQ (rather than RET).
+#
+# Acceptance: a kernel's interrupt handler compiles with all three
+# attributes set and the emitted assembly uses <= 256 bytes of stack.
+# The acceptance gate (`make stack-acceptance`) verifies:
+#   (a) the HLS file parses with all three attributes
+#   (b) the C source contains `__attribute__((interrupt))` and the
+#       optimize("no-red-zone") attribute
+#   (c) the C source compiles cleanly under -ffreestanding
+#       -mgeneral-regs-only -mno-red-zone (the freestanding build
+#       environment for kernel code; no libc, no SSE)
+#   (d) the static stack-size estimate (printed by --opt-stats) is
+#       <= 256 bytes — confirmed by the checker NOT raising a
+#       `#[stack_size(256)] violated` compile error.
+
+struct IrqFrame {
+    vector: int,
+    error_code: int,
+    rip: int,
+    cs: int,
+    rflags: int
+}
+
+# The interrupt handler. The body is intentionally minimal: it reads
+# the saved IRQ vector, dispatches on it (a no-op for vectors we don't
+# handle), and returns. The function must:
+#   - take a single POINTER parameter (IrqFrame lowers to IrqFrame*)
+#   - return void (gcc's interrupt attribute requires this)
+#   - not use SSE (the IRETQ frame doesn't save XMM registers; the
+#     freestanding build uses -mgeneral-regs-only to enforce this)
+#
+# The stack_size(256) attribute is the Stage 28 acceptance criterion:
+# the checker's estimate (locals + base overhead + per-call overhead)
+# must be <= 256 bytes. The estimate here is:
+#   32 (base) + 8 (frame param local) + 8 (v) + 8 (err) + 16 (call to
+#   handle_unknown_vector) = 72 bytes << 256. Plenty of headroom for
+#   real kernel code that may add a few more locals + a nested call.
+#[no_red_zone, irq_handler, stack_size(256)]
+fn handle_irq(frame: IrqFrame) -> void {
+    let v: int = frame.vector
+    let err: int = frame.error_code
+    # In a real kernel: dispatch on v to the registered handler.
+    # Here we just acknowledge the IRQ (a real handler would write to
+    # the LAPIC's EOI register, but we can't do that from user-space).
+    # The arithmetic is dead but proves the stack frame stays small
+    # under our static analysis.
+    let _ack: int = v + err
+}
+
+# A second handler with a tighter bound — demonstrates that
+# stack_size(N) scales with N. The body is even simpler (no calls),
+# so the estimate is 32 (base) + 8 (frame) + 8 (v) = 48 bytes. The
+# bound is 64 — still under, but tight enough to catch a regression
+# that adds a local.
+#[no_red_zone, irq_handler, stack_size(64)]
+fn handle_irq_minimal(frame: IrqFrame) -> void {
+    let v: int = frame.vector
+    let _ack: int = v
+}
+
+# The user-space entry point. main() itself is NOT an interrupt
+# handler — it's just here so the program is a valid HLS file
+# (every HLS program needs a main). The interrupt handlers above
+# are NEVER called from main (they would crash in user-space: IRETQ
+# from ring 3 raises #GP). They exist purely as freestanding C
+# declarations that a kernel would link against.
+fn main() -> int uses IO {
+    println("Stage 28 kernel_irq_demo: handle_irq + handle_irq_minimal declared")
+    println("  #[no_red_zone, irq_handler, stack_size(256)] fn handle_irq(frame: IrqFrame) -> void")
+    println("  #[no_red_zone, irq_handler, stack_size(64)]  fn handle_irq_minimal(frame: IrqFrame) -> void")
+    println("Run `make stack-acceptance` to verify the C source compiles under -ffreestanding.")
+    return 0
+}
