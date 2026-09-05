@@ -152,11 +152,20 @@ class Parser:
 
     def parse_extern_block(self):
         """Stage 15 (v0.13.0-alpha): parse `extern "C" { fn decls }` block.
+        Stage 23 (v0.42.0-alpha): also accept `extern "js" { fn decls }`
+        for the WebAssembly JS-FFI (the wasm module imports these from
+        the JS host).
 
         Syntax:
             extern "C" {
                 fn puts(s: str) -> int uses IO
                 fn malloc(size: int) -> ptr uses IO
+                ...
+            }
+
+            extern "js" {
+                fn console.log(s: str) -> void uses IO
+                fn fetch(url: str) -> str uses IO
                 ...
             }
 
@@ -167,13 +176,13 @@ class Parser:
         t0 = self.eat_kw("extern")
         abi_tok = self.peek()
         if abi_tok["k"] != "str":
-            self.err("expected ABI string (e.g. \"C\") after 'extern'", abi_tok)
+            self.err("expected ABI string (e.g. \"C\" or \"js\") after 'extern'", abi_tok)
         self.next()
         abi = abi_tok["v"]
         if isinstance(abi, bytes):
             abi = abi.decode("latin-1")
-        if abi != "C":
-            self.err("unsupported ABI '%s'; only \"C\" is supported today" % abi, abi_tok)
+        if abi not in ("C", "js"):
+            self.err("unsupported ABI '%s'; only \"C\" and \"js\" are supported" % abi, abi_tok)
         self.eat_sym("{")
         decls = []
         while not self.at_sym("}"):

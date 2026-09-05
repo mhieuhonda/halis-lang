@@ -55,7 +55,7 @@ remains green.
 | 20 | Link-time optimisation (LTO) across crates | ✅ | 3 weeks |
 | 21 | SIMD vectorisation (target-feature detection) | ✅ | 5 weeks |
 | 22 | Cross-compilation targets (Linux/macOS/Windows/FreeBSD) | ✅ | 4 weeks |
-| 23 | WebAssembly backend (`target wasm32`) | ⬜ | 6 weeks |
+| 23 | WebAssembly backend (`target wasm32`) | ✅ | 6 weeks |
 | 24 | `wasm-opt` integration + emscripten bridge | ⬜ | 3 weeks |
 | 25 | AArch64 backend tuning (Apple Silicon, Graviton) | ⬜ | 4 weeks |
 | 26 | RISC-V 64 backend (foundation for OS work) | ⬜ | 5 weeks |
@@ -1760,7 +1760,7 @@ target and verifies the binary runs and produces the expected output.
 
 ---
 
-## STAGE 23 — WebAssembly backend (`target wasm32`) ⬜
+## STAGE 23 — WebAssembly backend (`target wasm32`) ✅ (release v0.42.0-alpha)
 
 **Work:**
 - `--target wasm32-unknown-unknown` — emit `.wasm` directly from the
@@ -1773,6 +1773,120 @@ target and verifies the binary runs and produces the expected output.
 
 **Acceptance:** `examples/hello.hls` compiles to a `<10 KB` wasm
 binary that prints "Hello, World!" in a browser.
+
+**Result (v0.42.0-alpha):** Stage 23 is **COMPLETE**. The direct
+WebAssembly emitter (`tools/hlwasm.py`, ~700 lines of Python) compiles
+a checked HLS program to a valid `.wasm` binary with zero external
+dependencies — no clang, no `wasm-ld`, no LLVM toolchain needed. The
+emitter walks the typed AST and emits wasm binary sections (type,
+import, function, memory, export, code, data) directly, including a
+small bump-allocator runtime and the string/int/float conversion
+helpers implemented in pure wasm.
+
+- `examples/hello.hls` compiles to a **1095-byte** wasm binary (well
+  under the 10 KB acceptance limit) that prints the expected output
+  when run in Node.js or a browser.
+- The wasm module imports three JS functions (`hl_js_println`,
+  `hl_js_print`, `hl_js_f64_to_str`) from module `env`; the
+  auto-generated `.js` glue provides them. `extern "js"` blocks
+  declared in HLS source become additional wasm imports.
+- **8 new tests** in `tests/run_tests.sh` section 11 (target list,
+  <10 KB size check, glue-file production, interpreter↔wasm output
+  match, `extern "js"` parsing, `extern "js"` import emission,
+  unsupported-construct clean error, `make wasm-acceptance`
+  end-to-end). **628/628 tests PASS**, bootstrap deterministic.
+
+### Stage 23 — `tools/hlwasm.py`
+
+#### Added — direct WebAssembly emitter
+
+- `hlwasm <input.hls> <output_base> [--target <triple>]` drives:
+  1. `boot.py` load + check (the standard HLS front-end).
+  2. `WasmEmitter` walks the typed AST and emits a `.wasm` binary
+     directly (type/import/function/memory/export/code/data sections).
+  3. The `.js` glue file is written (provides the JS imports).
+  4. The `.html` runner is written (loads the wasm in a browser).
+- `--target wasm32-unknown-unknown` (default) — freestanding wasm32,
+  no libc, JS imports only.
+- `--target wasm32-unknown-emscripten` — falls back to the
+  freestanding backend in the alpha (full emscripten integration is
+  Stage 24).
+- `--run` — run the compiled wasm in Node.js (if available) and
+  compare the output to the interpreter.
+- `--list-targets` — print the supported WebAssembly target triples.
+- `--no-wasm` / `--no-js` / `--no-html` — skip writing specific
+  output files.
+
+#### Added — type mapping (wasm32)
+
+| HLS type   | wasm type | notes                                 |
+|------------|-----------|---------------------------------------|
+| `int`      | `i64`     | HLS int is 64-bit                     |
+| `float`    | `f64`     |                                       |
+| `bool`     | `i32`     |                                       |
+| `str`      | `i32`     | pointer to `{i32 len, i8 data[len]}` |
+| `void`     | (no result) |                                    |
+| `list[T]`/`map`/struct/enum | `i32` (pointer; alpha raises clean error) | |
+
+#### Added — `extern "js"` FFI
+
+- `extern "js" { fn console.log(s: str) -> void uses IO }` — each
+  declared fn becomes a wasm import from module `env` with the same
+  name. The JS glue must provide a function of that name in the
+  import object (or the user passes `importOverrides` to
+  `Halis.run()`).
+- `extern "C"` blocks are rejected on the wasm32 target (no libc;
+  use `--target x86_64-linux-gnu` for the C backend).
+
+#### Added — `std.jsffi` stdlib module
+
+- Declares common JS host functions: `js_console_log`,
+  `js_console_warn`, `js_console_error`, `js_dom_set_text`,
+  `js_dom_append`, `js_random`, `js_random_int`, `js_fetch`,
+  `js_localstorage_get/set`, `js_now_ms`, `js_set_timeout`.
+- Import with `import "std.jsffi"`.
+
+#### Added — Makefile targets
+
+- `make wasm F=examples/hello.hls [OUT=/tmp/hello] [TARGET=...]` —
+  compile to a `.wasm` + `.js` + `.html` bundle.
+- `make wasm-run F=examples/hello.hls` — compile + run in Node.js.
+- `make wasm-list-targets` — print the supported wasm target triples.
+- `make wasm-acceptance` — the Stage 23 acceptance gate (compiles
+  `examples/hello.hls` to a <10 KB wasm, runs it, compares output to
+  the interpreter).
+
+#### Added — wasm runtime helpers (emitted as wasm functions)
+
+- `hl_alloc(n)` — bump allocator (reads/writes the heap pointer at
+  memory offset 0).
+- `hl_str_concat(a, b)` — string concatenation via `memory.copy`.
+- `hl_int_to_str(n)` — i64-to-decimal-string conversion (handles
+  zero and negative numbers).
+- `hl_float_to_str(f)` — calls the JS `hl_js_f64_to_str` helper
+  (JS has a well-specified float-to-string; reimplementing it in
+  wasm is error-prone).
+- `hl_bool_to_str(b)` — returns a pointer to "true" or "false".
+- `hl_str_eq(a, b)` — byte-by-byte string equality.
+- `hl_str_len(s)`, `hl_str_byte_at(s, i)`, `hl_chr_to_str(n)`,
+  `hl_int_abs(n)`, `hl_str_to_int(s)`.
+
+#### Subset supported by the alpha
+
+- Types: `int`, `float`, `bool`, `str`, `void` (and `tainted[T]`).
+- Statements: `let`, `let mut`, `assign`, `if`/`else`, `while`,
+  `for x in range(a, b)`, `return`, `break`, `continue`, `expr`.
+- Expressions: literals, `ident`, `bin` (`+ - * / % == != < <= > >= && ||`),
+  `un` (`- !`), `call` (user + builtins), `method` (builtin methods
+  like `.to_str()`, `.len()`).
+- Builtins: `println`, `print`, `panic`, `abort`, `exit`, `range`
+  (as for-iter only).
+- `extern "js"` blocks.
+
+Unsupported in the alpha (raises a clean `HLError` pointing at the C
+backend): structs, enums, `match`, `?`, lists, maps, struct/enum
+methods, field access, indexing, spawn/Chan/Task (concurrency). Full
+support lands with the HLIR-based emitter in Stage 24.
 
 ---
 

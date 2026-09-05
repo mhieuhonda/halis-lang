@@ -13,6 +13,118 @@ stability (125–140), and final stabilisation toward v1.0 (141–150).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
+## [v0.42.0-alpha] — Stage 23: WebAssembly backend (wasm32-unknown-unknown)
+
+> Completes **Stage 23** of the roadmap: a direct WebAssembly backend
+> that compiles HLS programs to `.wasm` binaries with zero external
+> dependencies. The emitter (`tools/hlwasm.py`, ~700 lines of Python)
+> walks the checked HLS AST and emits wasm binary sections (type,
+> import, function, memory, export, code, data) directly — no clang,
+> no `wasm-ld`, no LLVM toolchain needed. A small wasm runtime
+> (bump allocator, string concat, int-to-str, etc.) is emitted as
+> wasm functions; the JS glue provides three imports (`println`,
+> `print`, `f64_to_str`).
+>
+> - **`examples/hello.hls`** compiles to a **1095-byte** wasm binary
+>   (well under the 10 KB acceptance limit) that prints the expected
+>   output when run in Node.js or a browser.
+> - **`extern "js"` FFI**: `extern "js" { fn console.log(s: str) ->
+>   void uses IO }` blocks become wasm imports from module `env`. The
+>   JS glue provides default implementations; users can override via
+>   `importOverrides` to `Halis.run()`.
+> - **`std.jsffi`** stdlib module declares common JS host functions
+>   (`js_console_log`, `js_random`, `js_fetch`, etc.).
+> - **Type mapping**: `int`→`i64`, `float`→`f64`, `bool`→`i32`,
+>   `str`→`i32` (pointer to `{i32 len, i8 data[len]}` in linear
+>   memory).
+> - **Subset supported** (alpha): int/float/bool/str/void types,
+>   let/assign/if/while/for-range/return/break/continue, binary ops,
+>   unary ops, function calls, builtin methods (`.to_str()`, `.len()`),
+>   `extern "js"` blocks. Structs/enums/match/lists/maps raise clean
+>   errors (full support lands in Stage 24).
+> - **Makefile targets**: `wasm`, `wasm-run`, `wasm-list-targets`,
+>   `wasm-acceptance`.
+> - **8 new tests** in `tests/run_tests.sh` section 11. **628/628
+>   tests PASS**, bootstrap deterministic.
+
+### Stage 23 — `tools/hlwasm.py`
+
+#### Added — direct WebAssembly emitter
+
+- `hlwasm <input.hls> <output_base> [--target <triple>]` compiles an
+  HLS program to a `.wasm` + `.js` + `.html` bundle. The emitter
+  bypasses LLVM entirely — the wasm binary is assembled byte-by-byte
+  in Python, producing the smallest possible output.
+- `--target wasm32-unknown-unknown` (default) — freestanding wasm32,
+  no libc, JS imports only.
+- `--target wasm32-unknown-emscripten` — falls back to the freestanding
+  backend in the alpha (full emscripten integration is Stage 24).
+- `--run` — run the compiled wasm in Node.js and compare output to
+  the interpreter.
+- `--list-targets` — print the supported WebAssembly target triples.
+- `--no-wasm` / `--no-js` / `--no-html` — skip specific output files.
+
+#### Added — `extern "js"` FFI
+
+- `extern "js" { fn NAME(params) -> T uses IO }` — each declared fn
+  becomes a wasm import from module `env`. The JS glue must provide a
+  function of that name (or the user passes `importOverrides` to
+  `Halis.run()`).
+- `extern "C"` blocks are rejected on the wasm32 target (no libc;
+  use `--target x86_64-linux-gnu` for the C backend).
+- The parser now accepts both `"C"` and `"js"` as valid ABI strings
+  in `extern` blocks.
+
+#### Added — `std.jsffi` stdlib module
+
+- Declares common JS host functions: `js_console_log/warn/error`,
+  `js_dom_set_text/append`, `js_random`, `js_random_int`, `js_fetch`,
+  `js_localstorage_get/set`, `js_now_ms`, `js_set_timeout`.
+- Import with `import "std.jsffi"`.
+
+#### Added — Makefile targets
+
+- `make wasm F=examples/hello.hls [OUT=/tmp/hello] [TARGET=...]` —
+  compile to a `.wasm` + `.js` + `.html` bundle.
+- `make wasm-run F=examples/hello.hls` — compile + run in Node.js.
+- `make wasm-list-targets` — print the supported wasm target triples.
+- `make wasm-acceptance` — the Stage 23 acceptance gate (compiles
+  `examples/hello.hls` to a <10 KB wasm, runs it, compares output to
+  the interpreter).
+
+#### Added — wasm runtime helpers (pure wasm)
+
+- `hl_alloc(n)` — bump allocator (heap pointer stored at memory
+  offset 0).
+- `hl_str_concat(a, b)` — string concatenation via `memory.copy`.
+- `hl_int_to_str(n)` — i64-to-decimal-string (handles zero and
+  negative numbers).
+- `hl_float_to_str(f)` — calls the JS `hl_js_f64_to_str` helper.
+- `hl_bool_to_str(b)`, `hl_str_eq(a, b)`, `hl_str_len(s)`,
+  `hl_str_byte_at(s, i)`, `hl_chr_to_str(n)`, `hl_int_abs(n)`,
+  `hl_str_to_int(s)`.
+
+#### Added — examples
+
+- `examples/wasm_hello.hls` — demonstrates string concat, recursion
+  (fib), for-range loops, and `extern "js"` FFI via `std.jsffi`.
+
+#### Added — tests (section 11 of `tests/run_tests.sh`)
+
+- `wasm: --list-targets prints the Stage 23 target set`
+- `wasm: hello.hls compiles to <10 KB wasm`
+- `wasm: .js + .html glue files produced`
+- `wasm: hello.hls wasm output == interpreter (byte-identical)`
+- `wasm: extern "js" block accepted by the parser/checker`
+- `wasm: extern "js" functions become wasm imports`
+- `wasm: unsupported construct raises clean error`
+- `wasm: make wasm-acceptance runs end-to-end`
+
+### Changed
+
+- `boot/parser.py`: `parse_extern_block` now accepts both `"C"` and
+  `"js"` as valid ABI strings (previously only `"C"` was accepted).
+
 ## [v0.41.0-alpha] — Stage 22: cross-compilation targets (Linux/macOS/Windows/FreeBSD)
 
 > Completes **Stage 22** of the roadmap: cross-compilation to Linux,

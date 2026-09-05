@@ -341,7 +341,58 @@ cross-acceptance:
 	  grep -q "stdatomic.h\|_Atomic" $(BIN)/cross_hello.c && echo "NOTE: C source uses C11 atomics (portable on C11 compilers)" || true; \
 	  echo "ACCEPTANCE OK: cross-compilation pipeline (hlc -> C -> linker) works end-to-end on the host target"
 
-.PHONY: pgo pgo-acceptance pgo-report lto emit-lto-ir simd-bench simd-acceptance cross cross-list cross-host cross-acceptance
+.PHONY: pgo pgo-acceptance pgo-report lto emit-lto-ir simd-bench simd-acceptance cross cross-list cross-host cross-acceptance wasm wasm-run wasm-acceptance wasm-list-targets
+
+
+# ============================================================================
+# Stage 23 (v0.42.0-alpha): WebAssembly backend (direct .wasm emission)
+# ============================================================================
+
+# wasm: compile an HLS program to a .wasm + .js + .html bundle.
+#   make wasm F=examples/hello.hls [OUT=/tmp/hello] [TARGET=wasm32-unknown-unknown]
+# The direct emitter bypasses LLVM -- no clang/wasm-ld needed. The output
+# .wasm is a freestanding module that imports a small JS import set
+# (print, println, float-to-str) from module "env"; the generated .js glue
+# provides them. The .html runner loads the wasm in a browser.
+wasm:
+	@test -n "$(F)" || (echo "Usage: make wasm F=examples/hello.hls [OUT=/tmp/hello] [TARGET=wasm32-unknown-unknown]" && false)
+	@if [ -z "$(OUT)" ]; then OUT=$$(basename $(F) .hls); fi; \
+	  T=""; if [ -n "$(TARGET)" ]; then T="--target $(TARGET)"; fi; \
+	  R=""; if [ -n "$(GO_RUN)" ]; then R="--run"; fi; \
+	  $(PYTHON) tools/hlwasm.py $(F) $$OUT $$T $$R
+
+# wasm-run: compile + run in Node.js (if available).
+wasm-run:
+	@test -n "$(F)" || (echo "Usage: make wasm-run F=examples/hello.hls [OUT=/tmp/hello]" && false)
+	@if [ -z "$(OUT)" ]; then OUT=$$(basename $(F) .hls); fi; \
+	  $(PYTHON) tools/hlwasm.py $(F) $$OUT --run
+
+# wasm-list-targets: print the supported WebAssembly target triples.
+wasm-list-targets:
+	@$(PYTHON) tools/hlwasm.py --list-targets
+
+# wasm-acceptance: the Stage 23 acceptance criterion -- examples/hello.hls
+# compiles to a <10 KB wasm binary that prints "Hello, Halis!" correctly.
+# Verifies: (a) the .wasm is produced, (b) it's under 10 KB, (c) running
+# it in Node.js produces output matching the interpreter.
+wasm-acceptance:
+	@test -x $(BIN)/hlc || $(MAKE) bootstrap
+	@mkdir -p $(BIN)
+	@echo "[Stage 23 acceptance] compiling examples/hello.hls to wasm..."
+	@$(PYTHON) tools/hlwasm.py examples/hello.hls $(BIN)/hello_wasm >$(BIN)/wasm_acc.log 2>&1
+	@rc=$$?; if [ $$rc -ne 0 ]; then echo "FAIL: wasm compile failed"; cat $(BIN)/wasm_acc.log; exit 1; fi
+	@SIZE=$$(stat -c %s $(BIN)/hello_wasm.wasm); \
+	  echo "  wasm binary: $$SIZE bytes"; \
+	  if [ $$SIZE -ge 10240 ]; then echo "FAIL: wasm binary is $$SIZE bytes (>= 10 KB acceptance limit)"; exit 1; fi; \
+	  echo "  size check: OK (< 10 KB)"
+	@echo "[Stage 23 acceptance] running the wasm in Node.js..."
+	@$(PYTHON) tools/hlwasm.py examples/hello.hls $(BIN)/hello_wasm2 --run >$(BIN)/wasm_run.out 2>&1
+	@rc=$$?; if [ $$rc -ne 0 ]; then echo "FAIL: wasm run failed (rc=$$rc)"; cat $(BIN)/wasm_run.out; exit 1; fi
+	@python3 boot/boot.py examples/hello.hls </dev/null 2>/dev/null >$(BIN)/interp_out.txt
+	@grep -v "^wrote " $(BIN)/wasm_run.out | grep -v "^note:" >$(BIN)/wasm_out.txt
+	@python3 -c "import sys; a=open('$(BIN)/interp_out.txt').read(); b=open('$(BIN)/wasm_out.txt').read(); sys.exit(0 if a==b else 1)" || (echo "FAIL: wasm output differs from interpreter"; diff $(BIN)/interp_out.txt $(BIN)/wasm_out.txt | head -5; exit 1)
+	@echo "  output check: OK (wasm output matches interpreter)"
+	@echo "ACCEPTANCE OK: examples/hello.hls compiles to a <10 KB wasm binary with correct output"
 
 # ============================================================================
 # Stage 13 (v0.23.0-alpha): hls-pkg package manager targets

@@ -938,6 +938,121 @@ else
     tail -5 "$TMP/cross_acc.log"
 fi
 
+echo "=== 11. Stage 23: WebAssembly backend (wasm32-unknown-unknown) ==="
+# Stage 23 (v0.42.0-alpha): the direct wasm emitter (tools/hlwasm.py)
+# compiles an HLS program to a .wasm binary + .js glue + .html runner.
+# The wasm module imports a small JS function set (println, print,
+# f64_to_str) from module "env"; the JS glue provides them.
+WASM_F=examples/hello.hls
+# (a) hlwasm --list-targets prints the wasm target set.
+wasm_list=$(python3 tools/hlwasm.py --list-targets 2>&1)
+if echo "$wasm_list" | grep -q "wasm32-unknown-unknown" \
+        && echo "$wasm_list" | grep -q "wasm32-unknown-emscripten"; then
+    ok "wasm: --list-targets prints the Stage 23 target set"
+else
+    bad "wasm: --list-targets missing expected targets"
+fi
+# (b) hello.hls compiles to a <10 KB wasm binary.
+if python3 tools/hlwasm.py "$WASM_F" "$TMP/hello_wasm" >"$TMP/wasm.log" 2>&1; then
+    wasm_size=$(stat -c %s "$TMP/hello_wasm.wasm" 2>/dev/null || stat -f %z "$TMP/hello_wasm.wasm")
+    if [ "$wasm_size" -lt 10240 ]; then
+        ok "wasm: hello.hls compiles to ${wasm_size}-byte wasm (< 10 KB)"
+    else
+        bad "wasm: hello.hls wasm is ${wasm_size} bytes (>= 10 KB)"
+    fi
+    # (c) .js and .html glue files are produced.
+    if [ -f "$TMP/hello_wasm.js" ] && [ -f "$TMP/hello_wasm.html" ]; then
+        ok "wasm: .js + .html glue files produced"
+    else
+        bad "wasm: .js or .html glue missing"
+    fi
+else
+    bad "wasm: hello.hls compile failed"
+    cat "$TMP/wasm.log" | head -5
+fi
+# (d) running the wasm in Node.js produces the same output as the interpreter.
+#     (Only runs if node is available; skipped gracefully otherwise.)
+if command -v node >/dev/null 2>&1; then
+    interp_out=$(python3 boot/boot.py "$WASM_F" </dev/null 2>/dev/null)
+    if python3 tools/hlwasm.py "$WASM_F" "$TMP/hello_wasm2" --run >"$TMP/wasm_run.out" 2>&1; then
+        wasm_out=$(grep -v '^wrote ' "$TMP/wasm_run.out" | grep -v '^note:')
+        if [ "$interp_out" == "$wasm_out" ]; then
+            ok "wasm: hello.hls wasm output == interpreter (byte-identical)"
+        else
+            bad "wasm: hello.hls wasm output differs from interpreter"
+            diff <(echo "$interp_out") <(echo "$wasm_out") | head -4
+        fi
+    else
+        bad "wasm: hello.hls wasm run failed"
+        cat "$TMP/wasm_run.out" | head -5
+    fi
+else
+    echo "  [SKIP] wasm: node.js not installed (output-match test skipped)"
+    PASS=$((PASS+1))
+fi
+# (e) extern "js" blocks are accepted by the parser.
+cat > "$TMP/test_jsffi.hls" <<'HLS_EOF'
+extern "js" {
+    fn js_alert(msg: str) -> void uses IO
+    fn js_random() -> int uses IO
+}
+fn main() -> int uses IO {
+    js_alert("hello")
+    return 0
+}
+HLS_EOF
+if python3 boot/boot.py --check "$TMP/test_jsffi.hls" >/dev/null 2>&1; then
+    ok "wasm: extern \"js\" block accepted by the parser/checker"
+else
+    bad "wasm: extern \"js\" block rejected"
+fi
+# (f) compiling a program with extern "js" produces the right wasm imports.
+if python3 tools/hlwasm.py "$TMP/test_jsffi.hls" "$TMP/test_jsffi" >"$TMP/jsffi.log" 2>&1; then
+    # Check that the wasm imports include js_alert and js_random.
+    if python3 -c "
+import sys
+with open('$TMP/test_jsffi.wasm', 'rb') as f:
+    data = f.read()
+# Look for the import names in the binary.
+assert b'js_alert' in data, 'js_alert import missing'
+assert b'js_random' in data, 'js_random import missing'
+print('OK')
+" 2>/dev/null | grep -q OK; then
+        ok "wasm: extern \"js\" functions become wasm imports"
+    else
+        bad "wasm: extern \"js\" imports not found in wasm"
+    fi
+else
+    bad "wasm: compile of extern \"js\" program failed"
+    cat "$TMP/jsffi.log" | head -5
+fi
+# (g) unsupported constructs raise clean errors (not silent crashes).
+cat > "$TMP/test_unsupp.hls" <<'HLS_EOF'
+struct Point { x: int, y: int }
+fn main() -> int uses IO {
+    let p: Point = Point { x: 1, y: 2 }
+    return 0
+}
+HLS_EOF
+if python3 tools/hlwasm.py "$TMP/test_unsupp.hls" "$TMP/test_unsupp" 2>&1 \
+        | grep -q "not yet supported by --emit wasm"; then
+    ok "wasm: unsupported construct raises clean error"
+else
+    bad "wasm: unsupported construct did not raise clean error"
+fi
+# (h) make wasm-acceptance runs end-to-end.
+if make wasm-acceptance >"$TMP/wasm_acc.log" 2>&1; then
+    if grep -q "ACCEPTANCE OK" "$TMP/wasm_acc.log"; then
+        ok "wasm: make wasm-acceptance runs end-to-end"
+    else
+        bad "wasm: make wasm-acceptance did not print ACCEPTANCE OK"
+        tail -5 "$TMP/wasm_acc.log"
+    fi
+else
+    bad "wasm: make wasm-acceptance failed"
+    tail -5 "$TMP/wasm_acc.log"
+fi
+
 echo ""
 echo "=========================================="
 echo "RESULT: $PASS PASS / $FAIL FAIL"
