@@ -969,7 +969,13 @@ def cmd_lock(args):
         return 1
     pkg_version = manifest.get("package", {}).get("version", "0.0.0")
     pkg_name = manifest.get("package", {}).get("name", "<unnamed>")
-    lockfile = {"version": 2, "packages": []}
+    # Stage 22 (v0.41.0-alpha): record the target triple in the lockfile.
+    # When --target is given, the lockfile is stamped with the target;
+    # `hls-pkg verify --target <triple>` checks that the lockfile's target
+    # matches (a mismatch means the deps were resolved for a different
+    # platform — re-lock for the current target).
+    target_triple = getattr(args, "target", None)
+    lockfile = {"version": 2, "target": target_triple, "packages": []}
     for name, source in deps.items():
         print("Resolving %s..." % name, end=" ", flush=True)
         try:
@@ -1137,6 +1143,26 @@ def cmd_verify(args):
     lockfile = _load_lockfile(lockfile_path)
     if lockfile is None:
         return 1
+    # Stage 22 (v0.41.0-alpha): verify the lockfile's target matches
+    # the requested target (if --target was given). A mismatch means
+    # the deps were resolved for a different platform — re-lock for
+    # the current target.
+    expected_target = getattr(args, "target", None)
+    if expected_target is not None:
+        actual_target = lockfile.get("target")
+        if actual_target != expected_target:
+            print("error: lockfile target mismatch (lockfile has '%s', "
+                  "expected '%s') — run `hls-pkg lock --target %s` to "
+                  "re-resolve for this target" % (
+                      actual_target, expected_target, expected_target),
+                  file=sys.stderr)
+            return 1
+        print("lockfile target: %s (matches --target)" % actual_target)
+    else:
+        actual_target = lockfile.get("target")
+        if actual_target is not None:
+            print("lockfile target: %s (use --target %s to verify a specific "
+                  "target)" % (actual_target, actual_target))
     failures = 0
     for pkg in lockfile["packages"]:
         if not isinstance(pkg, dict):
@@ -1314,6 +1340,26 @@ def cmd_build(args):
         print("  $ %s" % out_bin)
         r3 = subprocess.run([out_bin], env=env)
         return r3.returncode
+    # Stage 22 (v0.41.0-alpha): --target <triple> — cross-compile the
+    # package's entry point to a foreign binary via hlcross. The
+    # resolver still uses boot.py to load + check the program (the
+    # cross-compilation only changes the FINAL hlc + linker step).
+    target_triple = getattr(args, "target", None)
+    if target_triple is not None:
+        hlcross = os.path.join(REPO_ROOT, "tools", "hlcross.py")
+        if not os.path.isfile(hlcross):
+            print("error: cannot find tools/hlcross.py (repo layout changed?)",
+                  file=sys.stderr)
+            return 1
+        out_dir = os.path.join(os.getcwd(), ".hls-pkg-build")
+        os.makedirs(out_dir, exist_ok=True)
+        out_bin = os.path.join(out_dir, "pkg_cross_" +
+                               target_triple.replace("-", "_"))
+        cmd = [sys.executable, hlcross, entry, out_bin,
+               "--target", target_triple]
+        print("  $ %s" % " ".join(cmd))
+        result = subprocess.run(cmd, env=env)
+        return result.returncode
     cmd = [sys.executable, boot_py, entry]
     print("  $ %s" % " ".join(cmd))
     result = subprocess.run(cmd, env=env)
@@ -1456,12 +1502,29 @@ def main():
     p_add.set_defaults(func=cmd_add)
 
     p_lock = sub.add_parser("lock", help="Resolve dependencies and write hls-pkg.lock.")
+    # Stage 22 (v0.41.0-alpha): --target <triple> — stamp the lockfile
+    # with the cross-compilation target. The lockfile's `target` field
+    # records which target this lockfile was generated for; `hls-pkg
+    # verify` checks that the lockfile's target matches the build's
+    # target (a mismatch means the dependencies were resolved for a
+    # different platform — re-lock for the current target).
+    p_lock.add_argument("--target", default=None,
+                        help="stamp the lockfile with this target triple "
+                             "(e.g. aarch64-apple-darwin). When omitted, "
+                             "the lockfile is target-agnostic (target: null).")
     p_lock.set_defaults(func=cmd_lock)
 
     p_audit = sub.add_parser("audit", help="Print the total effect report of the dep tree.")
     p_audit.set_defaults(func=cmd_audit)
 
     p_verify = sub.add_parser("verify", help="Verify lockfile SHA-256 hashes + commit + log.")
+    # Stage 22: --target <triple> — verify that the lockfile was
+    # generated for this target (mismatch = the deps were resolved for
+    # a different platform).
+    p_verify.add_argument("--target", default=None,
+                          help="verify that the lockfile's target matches "
+                               "this triple (mismatch = re-lock for the "
+                               "current target)")
     p_verify.set_defaults(func=cmd_verify)
 
     p_build = sub.add_parser("build", help="Compile the package with resolved dependencies.")
@@ -1471,6 +1534,12 @@ def main():
     p_build.add_argument("--lto", action="store_true",
                          help="compile natively with --lto (cross-crate "
                               "inlining + whole-program DCE)")
+    # Stage 22 (v0.41.0-alpha): --target <triple> — cross-compile the
+    # package's entry point to a foreign binary via hlcross.
+    p_build.add_argument("--target", default=None,
+                         help="cross-compile to this target triple "
+                              "(e.g. aarch64-apple-darwin). When omitted, "
+                              "builds for the host.")
     p_build.set_defaults(func=cmd_build)
 
     # Stage 13 release: transparency log commands.

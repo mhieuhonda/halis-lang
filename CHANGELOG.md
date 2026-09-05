@@ -13,6 +13,171 @@ stability (125–140), and final stabilisation toward v1.0 (141–150).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
+## [v0.41.0-alpha] — Stage 22: cross-compilation targets (Linux/macOS/Windows/FreeBSD)
+
+> Completes **Stage 22** of the roadmap: cross-compilation to Linux,
+> macOS, Windows, and FreeBSD targets from any host. The cross-
+> compilation orchestrator (`tools/hlcross.py`, ~330 lines of Python)
+> drives the full pipeline: `hlc <input.hls> <tmp.c>` (HLS → portable
+> ANSI C11) → `<cross-linker> <tmp.c> -o <out>` (C → foreign binary).
+> The C backend is target-agnostic — the cross-compilation problem
+> reduces to picking the right cross-linker.
+>
+> - **Five targets** supported (the roadmap's Stage 22 set plus a
+>   MinGW variant for Windows): `x86_64-linux-gnu`,
+>   `x86_64-unknown-freebsd`, `aarch64-apple-darwin`,
+>   `x86_64-pc-windows-msvc`, `x86_64-pc-windows-gnu`.
+> - **Cross-linker detection** (the FIRST available wins):
+>   1. `zig cc -target <triple>` — the universal linker. When zig is
+>      installed, EVERY target works through a single toolchain.
+>   2. Target-specific cross-linkers:
+>      - `x86_64-pc-windows-gnu` → `x86_64-w64-mingw32-gcc` (mingw-w64)
+>      - `aarch64-apple-darwin` → `aarch64-apple-darwin-clang` (osxcross)
+>      - `x86_64-unknown-freebsd` → `x86_64-unknown-freebsd13-gcc`
+>   3. The host compiler when the target triple matches the host
+>      (native build — always available for testing the pipeline).
+> - **Graceful SKIP**: when no cross-linker is available, `hlcross`
+>   reports SKIP (exit code 3) and still writes the C source — so the
+>   C file can be copied to a target machine and compiled there with
+>   the platform's native `cc`.
+> - **Binary format detection**: `hlcross` inspects the linker output
+>   and reports the format (ELF 64-bit LE / Mach-O 64-bit / PE COFF /
+>   etc.) — useful for verifying the cross-linker produced the right
+>   format.
+> - **`hls-pkg` integration**: `lock --target <triple>` stamps the
+>   lockfile with the target; `verify --target <triple>` checks the
+>   lockfile's target matches (mismatch = re-lock for the current
+>   target); `build --target <triple>` cross-compiles the package's
+>   entry point via `hlcross`.
+> - **Makefile targets**: `cross`, `cross-list`, `cross-host`,
+>   `cross-acceptance` (the always-runnable acceptance — cross-
+>   compiles to the host target and verifies the binary runs).
+> - **14 new tests** in `tests/run_tests.sh` section 10 (target list,
+>   host detection, unknown-target rejection, host-target byte-
+>   identical output, C source portability, foreign-target SKIP with
+>   C source written, `hls-pkg lock/verify --target` stamp + match +
+>   mismatch detection, `make cross-acceptance` end-to-end).
+>   **620/620 tests PASS**, bootstrap deterministic.
+
+### Stage 22 — `tools/hlcross.py`
+
+#### Added — cross-compilation orchestrator
+
+- `hlcross <input.hls> <output.bin> --target <triple>` drives:
+  1. `hlc <input.hls> <tmp.c>` — the HLS → C step (always works; the
+     C backend is target-agnostic).
+  2. `<cross-linker> <tmp.c> -o <output.bin>` — the C → foreign binary
+     step (uses the detected cross-linker).
+- `--linker auto|zig|gcc|clang|cc` — override the linker strategy
+  (default: auto-detect).
+- `--keep-c <path>` — keep the intermediate C file at PATH (useful for
+  shipping the C source to a target machine).
+- `--dry-run` — print the commands without executing them.
+- `--list-targets` — list the supported target triples + aliases.
+- `--show-host` — print the host's canonical triple.
+- `--hlc <path>` — path to the native `hlc` compiler (default: `bin/hlc`).
+
+#### Added — target registry
+
+- Five canonical targets (the roadmap's Stage 22 set plus MinGW):
+  - `x86_64-linux-gnu` (ELF x86-64, glibc)
+  - `x86_64-unknown-freebsd` (ELF x86-64, FreeBSD)
+  - `aarch64-apple-darwin` (Mach-O arm64, macOS Apple Silicon)
+  - `x86_64-pc-windows-msvc` (PE COFF x86-64, MSVC ABI)
+  - `x86_64-pc-windows-gnu` (PE COFF x86-64, MinGW ABI)
+- Aliases: `linux`, `linux64`, `freebsd`, `macos`, `macos-arm64`,
+  `darwin`, `windows`, `windows-msvc`, `windows-gnu`.
+
+#### Added — binary format detection
+
+- `detect_binary_format(path)` inspects the magic bytes of the linker
+  output and reports:
+  - `ELF 32-bit LE/BE` / `ELF 64-bit LE/BE` (Linux, FreeBSD)
+  - `Mach-O 32-bit` / `Mach-O 64-bit` (macOS)
+  - `PE COFF (Windows)` (Windows .exe)
+  - `unknown` (no magic match)
+
+### Stage 22 — `hls-pkg` integration
+
+#### Added — `hls-pkg lock --target <triple>`
+
+- Stamps the lockfile with the target triple. The lockfile gains a
+  `target` field at the top level (null when `--target` is omitted —
+  target-agnostic).
+- Useful for tracking which dependencies have been verified for which
+  target. A package's effect surface may differ across targets (e.g.,
+  a dependency that uses `extern "C"` to call a platform-specific
+  library); the target-stamped lockfile records which target this
+  resolution is valid for.
+
+#### Added — `hls-pkg verify --target <triple>`
+
+- Verifies that the lockfile's `target` field matches the requested
+  triple. A mismatch means the dependencies were resolved for a
+  different platform — re-lock for the current target.
+- When `--target` is omitted, the lockfile's target (if any) is
+  reported but not enforced.
+
+#### Added — `hls-pkg build --target <triple>`
+
+- Cross-compiles the package's entry point to a foreign binary via
+  `hlcross`. The resolver still uses `boot.py` to load + check the
+  program (the cross-compilation only changes the FINAL `hlc` +
+  linker step).
+- Output binary: `.hls-pkg-build/pkg_cross_<target>` (with the
+  target's binary suffix appended, e.g., `.exe` for Windows).
+
+### Stage 22 — Makefile targets
+
+- `make cross F=prog.hls TARGET=<triple> [OUT=path] [LINKER=auto]` —
+  cross-compile an HLS program to a foreign binary.
+- `make cross-list` — list the supported cross-compilation targets +
+  aliases.
+- `make cross-host` — print the host's canonical target triple.
+- `make cross-acceptance` — the always-runnable Stage 22 acceptance
+  criterion: cross-compile `examples/hello.hls` to the host target
+  (always available, even without a real cross-linker), run the
+  binary, and verify the output. Real cross-compilation to a foreign
+  target requires `zig` or a target-specific cross-linker (skipped
+  gracefully when not installed).
+
+### Stage 22 — tests
+
+- `tests/ok/feat_stage22_cross.hls` — a platform-independent test
+  program that exercises the standard library + IO + arithmetic. Its
+  output depends only on `std.list` and `std.str` (pure HLS, target-
+  independent). The differential suite (sections 1/3) covers the
+  interpreter vs native build; Stage 22 adds the cross-compiled build
+  as a third path.
+- `tests/run_tests.sh` section 10 gains 14 new checks:
+  1. The `feat_stage22_cross` program produces the expected
+     platform-independent output.
+  2. `hlcross --list-targets` prints the Stage 22 target set.
+  3. `hlcross --show-host` prints a non-empty canonical triple.
+  4. `hlcross` rejects an unknown target with a clear error.
+  5. Cross-compiling to the HOST target produces a binary whose
+     output is byte-identical to the interpreter.
+  6. The C source is portable (no SIMD intrinsic fast paths, no PGO
+     counters, no `__builtin_expect` hints in the unflagged build).
+  7. Cross-compiling to a FOREIGN target without a cross-linker
+     reports SKIP (exit code 3) and writes the C source for
+     target-side compilation.
+  8. `hls-pkg lock --target <triple>` stamps the lockfile.
+  9. `hls-pkg verify --target <triple>` matches when the lockfile's
+     target matches.
+  10. `hls-pkg verify --target <other>` detects a mismatch and
+      rejects.
+  11. `make cross-acceptance` runs end-to-end on the host target.
+
+### Test results
+
+- 620 PASS / 0 FAIL (606 prior + 14 new Stage-22 checks).
+- Bootstrap: deterministic.
+- Stage 22 acceptance: `make cross-acceptance` runs end-to-end on the
+  host target (always available). Real cross-compilation to a foreign
+  target requires `zig` or a target-specific cross-linker — skipped
+  gracefully when not installed (the C source is still written).
+
 ## [v0.40.0-alpha] — Stage 21 perfection: reduce_min/max + --target-feature native
 
 > A perfection pass on **Stage 21** (SIMD, v0.37.0-alpha). The

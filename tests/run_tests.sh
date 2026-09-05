@@ -775,6 +775,169 @@ else
     echo "$simd_interp_native" | grep has_feature
 fi
 
+echo "=== 10. Stage 22: cross-compilation targets (Linux/macOS/Windows/FreeBSD) ==="
+# Stage 22 (v0.41.0-alpha): the cross-compilation orchestrator
+# (tools/hlcross.py) drives hlc -> C -> cross-linker. The C backend
+# is portable ANSI C11; the cross-compilation problem reduces to
+# picking the right cross-linker. When no cross-linker is available,
+# the C source is still written (so it can be copied to a target
+# machine and compiled there).
+CROSS_F=tests/ok/feat_stage22_cross.hls
+cross_interp=$(python3 boot/boot.py "$CROSS_F" </dev/null 2>/dev/null)
+# (a) the feat_stage22_cross program is differentially covered by
+#     sections 1/3 (it lives in tests/ok); here we verify the
+#     expected platform-independent output.
+if echo "$cross_interp" | grep -q "1 + 1 = 2" \
+        && echo "$cross_interp" | grep -q "10 \* 10 = 100" \
+        && echo "$cross_interp" | grep -q "str_to_upper_ascii('hello') = HELLO" \
+        && echo "$cross_interp" | grep -q "sorted: 1,1,2,3,4,5,6,9"; then
+    ok "cross: feat_stage22_cross platform-independent output correct"
+else
+    bad "cross: feat_stage22_cross output wrong"
+    echo "$cross_interp" | head -8
+fi
+# (b) hlcross --list-targets prints the Stage 22 target set.
+list_out=$(python3 tools/hlcross.py --list-targets 2>&1)
+if echo "$list_out" | grep -q "x86_64-linux-gnu" \
+        && echo "$list_out" | grep -q "aarch64-apple-darwin" \
+        && echo "$list_out" | grep -q "x86_64-pc-windows-msvc" \
+        && echo "$list_out" | grep -q "x86_64-unknown-freebsd"; then
+    ok "cross: --list-targets prints the Stage 22 target set"
+else
+    bad "cross: --list-targets missing expected targets"
+fi
+# (c) hlcross --show-host prints a non-empty canonical triple.
+host_triple=$(python3 tools/hlcross.py --show-host 2>/dev/null)
+if [ -n "$host_triple" ] && echo "$host_triple" | grep -qE "^[a-z0-9_-]+$"; then
+    ok "cross: --show-host detected '$host_triple'"
+else
+    bad "cross: --show-host did not return a triple"
+fi
+# (d) hlcross rejects an unknown target.
+if python3 tools/hlcross.py "$CROSS_F" /tmp/bad_cross --target foo-bar-baz 2>&1 \
+        | grep -q "unknown target"; then
+    ok "cross: unknown target rejected with clear error"
+else
+    bad "cross: unknown target not rejected"
+fi
+# (e) cross-compile to the HOST target (always available — uses the
+#     host compiler). The binary must run and produce the same output
+#     as the interpreter.
+if [ ! -x "$TMP/hlc1" ]; then
+    python3 boot/boot.py src/hlc.hls src/hlc.hls "$TMP/hlc_nat.c" >/dev/null 2>&1
+    gcc -O2 -o "$TMP/hlc1" "$TMP/hlc_nat.c" -lm -pthread 2>/dev/null
+fi
+if python3 tools/hlcross.py "$CROSS_F" "$TMP/cross_host" --target "$host_triple" \
+        --hlc "$TMP/hlc1" --keep-c "$TMP/cross_host.c" >"$TMP/cross.log" 2>&1; then
+    cross_host_out=$("$TMP/cross_host" 2>/dev/null)
+    if [ "$cross_host_out" == "$cross_interp" ]; then
+        ok "cross: host-target binary output == interpreter (byte-identical)"
+    else
+        bad "cross: host-target binary diverged from interpreter"
+        diff <(echo "$cross_interp") <(echo "$cross_host_out") | head -4
+    fi
+    # The C source must be portable ANSI C11 (no SIMD intrinsic fast
+    # paths, no PGO counters, no __builtin_expect hints — those only
+    # appear under --target-feature / --pgo-generate / --pgo-use).
+    # NOTE: hl_simd_cpu_supports (the runtime CPU probe) IS in the
+    # runtime unconditionally — it's used by the simd_cpu_supports()
+    # builtin. The intrinsic fast PATHS (hl_simd_add_i32x4, etc.)
+    # are what only appear under --target-feature.
+    if grep -q "hl_simd_add_i32x4\|hl_simd_mul_i32x4\|_mm_mullo_epi32\|__hlc_pgo_counts\|__builtin_expect" "$TMP/cross_host.c"; then
+        bad "cross: C source leaked target-specific machinery (PGO/SIMD intrinsics)"
+    else
+        ok "cross: C source is portable (no PGO/SIMD intrinsic machinery in unflagged build)"
+    fi
+else
+    bad "cross: host-target cross-compile failed"
+    cat "$TMP/cross.log" | head -5
+fi
+# (f) cross-compile to a FOREIGN target — when no cross-linker is
+#     available, hlcross reports SKIP (exit code 3) and writes the C
+#     source (so it can be compiled on the target machine).
+foreign_target="aarch64-apple-darwin"
+if [ "$host_triple" != "$foreign_target" ]; then
+    python3 tools/hlcross.py "$CROSS_F" "$TMP/cross_foreign" \
+            --target "$foreign_target" --hlc "$TMP/hlc1" \
+            --keep-c "$TMP/cross_foreign.c" >"$TMP/cross_foreign.log" 2>&1
+    cross_rc=$?
+    if [ $cross_rc -eq 0 ]; then
+        # A cross-linker was available — the binary was produced.
+        fmt=$(python3 -c "
+import sys; sys.path.insert(0, 'tools')
+from hlcross import detect_binary_format
+print(detect_binary_format('$TMP/cross_foreign'))" 2>/dev/null)
+        ok "cross: $foreign_target binary produced (format: $fmt) — cross-linker available"
+    elif [ $cross_rc -eq 3 ]; then
+        # SKIP — no cross-linker. The C source must still be written.
+        if [ -s "$TMP/cross_foreign.c" ]; then
+            ok "cross: $foreign_target SKIP (no cross-linker) — C source written for target-side compilation"
+        else
+            bad "cross: $foreign_target SKIP but no C source written"
+        fi
+    else
+        bad "cross: $foreign_target failed unexpectedly (rc=$cross_rc)"
+        cat "$TMP/cross_foreign.log" | head -5
+    fi
+fi
+# (g) hls-pkg lock --target stamps the lockfile with the target triple.
+#     Verify by locking in a temp package dir.
+PKG_DIR="$TMP/stage22_pkg"
+mkdir -p "$PKG_DIR"
+cat > "$PKG_DIR/hls-pkg.toml" <<'PKGEOF'
+[package]
+name = "stage22-test"
+version = "0.1.0"
+authors = ["test"]
+description = "Stage 22 lockfile target test"
+[dependencies]
+[effects]
+allowed = []
+PKGEOF
+cat > "$PKG_DIR/main.hls" <<'HLS_EOF'
+fn main() -> int uses IO {
+    println("stage22 pkg")
+    return 0
+}
+HLS_EOF
+REPO_ABS="$(pwd)"
+( cd "$PKG_DIR" && python3 "$REPO_ABS/tools/hls-pkg.py" lock --target aarch64-apple-darwin >pkg.log 2>&1 )
+if grep -q '"target": "aarch64-apple-darwin"' "$PKG_DIR/hls-pkg.lock"; then
+    ok "cross: hls-pkg lock --target stamps the lockfile"
+else
+    bad "cross: hls-pkg lock --target did not stamp the lockfile"
+    cat "$PKG_DIR/pkg.log" | head -3
+fi
+# (h) hls-pkg verify --target checks the lockfile's target matches.
+( cd "$PKG_DIR" && python3 "$REPO_ABS/tools/hls-pkg.py" verify --target aarch64-apple-darwin >pkg_verify.log 2>&1 )
+if grep -q "lockfile target: aarch64-apple-darwin (matches --target)" "$PKG_DIR/pkg_verify.log"; then
+    ok "cross: hls-pkg verify --target matches"
+else
+    bad "cross: hls-pkg verify --target did not match"
+    cat "$PKG_DIR/pkg_verify.log" | head -3
+fi
+# (i) hls-pkg verify --target detects a mismatch.
+( cd "$PKG_DIR" && python3 "$REPO_ABS/tools/hls-pkg.py" verify --target x86_64-pc-windows-gnu >pkg_mismatch.log 2>&1 )
+rc=$?
+if [ $rc -ne 0 ] && grep -q "lockfile target mismatch" "$PKG_DIR/pkg_mismatch.log"; then
+    ok "cross: hls-pkg verify --target detects mismatch (rejected)"
+else
+    bad "cross: hls-pkg verify --target did not detect mismatch"
+    cat "$PKG_DIR/pkg_mismatch.log" | head -3
+fi
+# (j) make cross-acceptance runs end-to-end on the host target.
+if make cross-acceptance >"$TMP/cross_acc.log" 2>&1; then
+    if grep -q "ACCEPTANCE OK: cross-compilation pipeline" "$TMP/cross_acc.log"; then
+        ok "cross: make cross-acceptance runs end-to-end (host target)"
+    else
+        bad "cross: make cross-acceptance did not print ACCEPTANCE OK"
+        tail -5 "$TMP/cross_acc.log"
+    fi
+else
+    bad "cross: make cross-acceptance failed"
+    tail -5 "$TMP/cross_acc.log"
+fi
+
 echo ""
 echo "=========================================="
 echo "RESULT: $PASS PASS / $FAIL FAIL"
