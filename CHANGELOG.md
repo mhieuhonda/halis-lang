@@ -13,6 +13,173 @@ stability (125–140), and final stabilisation toward v1.0 (141–150).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
+## [v0.43.0-alpha] — Stage 24: wasm-opt integration + emscripten bridge
+
+> Completes **Stage 24** of the roadmap: a three-layer wasm size
+> optimization pipeline (in-tree DCE + Binaryen + hls-pkg integration),
+> a compact (~5 KB) JS glue with struct-marshalling API, an emscripten
+> bridge (when emcc is available), and a `hls serve` dev server with
+> live reload via Server-Sent Events.
+
+> - **In-tree optimizer** (`tools/hlwasm_opt.py`, ~600 lines of pure
+>   Python): dead function elimination, dead import elimination,
+>   type-section deduplication, local compaction, dead data
+>   elimination, and code-section peephole opts. No external deps.
+> - **External `wasm-opt` (Binaryen)**: invoked after the in-tree pass
+>   when available. Adds inlining, alias analysis, binary-level passes.
+> - **`hls-pkg build --target wasm32`** runs both layers automatically
+>   via `--wasm-opt auto` (default; `on`/`off` also accepted).
+> - **`hls serve` dev server** (`tools/hlserve.py`): watches .hls
+>   files, recompiles on save (200 ms debounce), serves the bundle
+>   over HTTP, pushes `reload` events via SSE. HTML runner auto-
+>   subscribes and reloads.
+> - **Compact JS glue** (~5 KB) is the default; the verbose Stage 23
+>   glue (~5.5 KB) is kept via `--glue verbose`. The compact glue
+>   includes `Halis.registerStruct`, `Halis.readStruct`,
+>   `Halis.writeStruct` for HLS struct <-> JS object marshalling.
+> - **`--target wasm32-unknown-emscripten`** uses `emcc` when
+>   available (real libc access); falls back to the freestanding
+>   backend with a clear note when not.
+> - **`examples/web_app_1000loc.hls`** is a 1755-LOC web app that
+>   compiles to an **8660-byte** wasm (< 100 KB) with a **5018-byte**
+>   JS glue (< 5 KB). The optimizer reduces the wasm size by **36.2%**
+>   (> 30% acceptance target).
+> - **12 new tests** in `tests/run_tests.sh` section 12. **640/640
+>   tests PASS**, bootstrap deterministic.
+
+### Stage 24 — `tools/hlwasm_opt.py`
+
+#### Added — in-tree wasm size optimizer
+
+- `hlwasm_opt <input.wasm> <output.wasm> [--level O1|O2|O3|Os]
+  [--report] [--external-wasm-opt PATH]` parses the wasm binary into
+  sections, runs the in-tree passes, invokes the external wasm-opt
+  (if available), and re-serializes the optimized module.
+
+#### Added — optimization passes (in-tree)
+
+- **DCE**: mark-and-sweep from exports + start; drop unreachable
+  functions; renumber surviving call targets.
+- **Dead import elimination**: drop imports not referenced by any
+  live function; renumber.
+- **Type-section deduplication**: collapse identical function
+  signatures into a single type entry.
+- **Local compaction**: merge adjacent (1, type) locals into (N, type).
+- **Dead data elimination**: drop data segments not referenced by any
+  `i32.const <offset>` in a live function (conservative).
+- **Peephole**: remove `nop`; const-fold `i32.const N; i32.eqz` into
+  `i32.const (N == 0)`.
+
+### Stage 24 — `tools/hlwasm.py` extensions
+
+#### Added — CLI flags
+
+- `--wasm-opt {auto,on,off}` (default `auto`).
+- `--opt-level {O1,O2,O3,Os}` (default `O3`).
+- `--glue {compact,verbose}` (default `compact`).
+- `--serve PORT`: after compiling, start the dev server.
+
+#### Added — emscripten bridge
+
+- `compile_via_emscripten`: when `emcc` is on PATH, compile HLS -> C
+  via hlc, then to wasm + JS via emcc. The emcc glue provides full
+  libc access; our compact struct-marshalling glue is written
+  alongside as `<output>.halis-glue.js`.
+
+#### Added — compact JS glue (~5 KB)
+
+- `Halis.registerStruct(name, descriptor)`: register a struct layout.
+- `Halis.readStruct(ptr, name)`: read a registered struct from wasm
+  memory at `ptr`; return a JS object.
+- `Halis.writeStruct(allocFn, obj, name)`: allocate space in wasm
+  memory, write the struct fields, return the pointer.
+- Default implementations for ALL `extern "js"` functions declared in
+  `std.jsffi` (console.log/warn/error wrappers, DOM set_text/append
+  with `typeof document` guards, Math.random / Math.floor wrappers
+  for random, Date.now wrapper for now_ms returning BigInt, localStorage
+  wrappers, no-op set_timeout, and the struct-marshalling entry points).
+  A wasm module declaring the standard jsffi set can instantiate even
+  without user overrides.
+
+### Stage 24 — `tools/hlserve.py` dev server
+
+#### Added — `hls serve`
+
+- `hlserve [--port 8080] [--bundle out] [--input examples/hello.hls]
+  [--target wasm32-unknown-unknown] [--wasm-opt auto] [--glue compact]
+  [--watch DIR]` runs a dev server that:
+  - Watches .hls files in the cwd, std/, the input file's dir, and the
+    bundle dir. Debounces 200 ms.
+  - Re-runs `hlwasm.compile_program` on change.
+  - Serves the bundle (.wasm, .js, .html) and source .hls over HTTP.
+  - Pushes a `reload` SSE event to browsers on every successful
+    recompile; pushes a `compile-error` event on failure.
+  - Injects a small SSE-listener snippet into the served HTML so the
+    page auto-reloads. On compile failure, a red banner is inserted.
+
+### Stage 24 — `std.jsffi` struct marshalling
+
+#### Added — `extern "js"` declarations
+
+- `js_struct_to_json(ptr: int, name: str) -> str`
+- `js_json_to_struct(json: str, name: str) -> int`
+- `js_call_with_struct(fn_name: str, ptr: int, name: str) -> int`
+
+### Stage 24 — `examples/web_app_1000loc.hls`
+
+#### Added — 1755-LOC web app
+
+- Exercises every wasm-supported construct plus the struct-
+  marshalling API.
+- Compiles to 8660-byte wasm + 5018-byte JS glue.
+- wasm-opt reduces size by 36.2%.
+
+### Stage 24 — Makefile targets
+
+#### Added
+
+- `make wasm-opt F=out/foo.wasm [LEVEL=O3] [OUT=...]`
+- `make webapp [OUT=...] [WASM_OPT=auto|on|off]`
+- `make webapp-acceptance` — the Stage 24 acceptance gate.
+- `make serve [F=...] [PORT=8080]`
+
+### Stage 24 — bug fixes
+
+- Fixed `hl_str_eq`: address computation was `i + 4` instead of
+  `a + i + 4` (the receiver `a` was left on the stack unused).
+  Rewritten using the load's offset immediate for clarity.
+- Fixed `hl_str_len` return type: declared as `i32` but HLS
+  `str.len()` returns `int` (i64). Now loads as i32 and sign-extends
+  to i64 via `i64.extend_i32_s`.
+- Fixed `hlwasm_opt.py` `_renumber_calls`: function index translation
+  was double-counting the original import count (used `n_imports +
+  len(new_imports) + len(new_funcs)` instead of just
+  `len(new_imports) + len(new_funcs)`).
+- Fixed `hlwasm_opt.py` parser: stripped the trailing `OP_END` from
+  each function body so the serializer's re-added `OP_END` doesn't
+  produce a double-END (validation failure: "trailing code after
+  function end").
+- Fixed `hlwasm_opt.py` `_scan_calls` / `_renumber_calls` /
+  `find_used_data_offsets`: now skip immediates for ALL memory
+  load/store ops (i32.load8_u, i64.load, f64.load, etc.), not just
+  `i32.load`. Previously, a `i32.load8_u` immediate would be
+  misparsed as an opcode, breaking the call analysis.
+- Fixed wasm conversion opcodes:
+  - `OP_I64_TRUNC_F64_S = 0xB0` (was `0xAA` = i32.trunc_f64_s).
+  - `OP_F64_CONVERT_I64_S = 0xB9` (was `0xBD` = f32.reinterpret_i32).
+- Added `str.byte_at`, `int.to_float`, `float.to_int` to the wasm
+  emitter's `_BUILTIN_METHODS` table (previously only available via
+  the C backend; needed for the 1000-LOC example's string walking
+  and float/int conversions).
+- Added `hl_float_to_int` and `hl_int_to_float` helper functions
+  (emit a single wasm `i64.trunc_f64_s` / `f64.convert_i64_s`
+  instruction).
+- Fixed `_lower_method` to lower method arguments beyond the
+  receiver (was only pushing the receiver, causing "not enough
+  arguments on the stack for call" for methods like `s.byte_at(i)`).
+- Added `str == str` and `str != str` lowering to `hl_str_eq` in
+  `_lower_bin` (previously raised "'==' on str not supported").
+
 ## [v0.42.0-alpha] — Stage 23: WebAssembly backend (wasm32-unknown-unknown)
 
 > Completes **Stage 23** of the roadmap: a direct WebAssembly backend

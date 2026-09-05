@@ -8,7 +8,7 @@ HLC     = src/hlc.hls
 BIN     = bin
 PREFIX  ?= /usr/local
 
-.PHONY: all stage0 bootstrap test examples clean run check bench install uninstall audit opt-stats emit-ir emit-llvm fmt lint lsp-check pkg-init pkg-add pkg-lock pkg-audit pkg-verify pkg-build pkg-publish pkg-log pkg-log-verify prove prove-full model prove-acceptance hltest fuzz cov fuzz-acceptance
+.PHONY: all stage0 bootstrap test examples clean run check bench install uninstall audit opt-stats emit-ir emit-llvm fmt lint lsp-check pkg-init pkg-add pkg-lock pkg-audit pkg-verify pkg-build pkg-publish pkg-log pkg-log-verify prove prove-full model prove-acceptance hltest fuzz cov fuzz-acceptance wasm-opt webapp webapp-acceptance serve
 
 # Main goal: use the full bootstrap chain to build the native compiler
 all: bootstrap
@@ -393,6 +393,78 @@ wasm-acceptance:
 	@python3 -c "import sys; a=open('$(BIN)/interp_out.txt').read(); b=open('$(BIN)/wasm_out.txt').read(); sys.exit(0 if a==b else 1)" || (echo "FAIL: wasm output differs from interpreter"; diff $(BIN)/interp_out.txt $(BIN)/wasm_out.txt | head -5; exit 1)
 	@echo "  output check: OK (wasm output matches interpreter)"
 	@echo "ACCEPTANCE OK: examples/hello.hls compiles to a <10 KB wasm binary with correct output"
+
+# ============================================================================
+# Stage 24 (v0.43.0-alpha): wasm-opt integration + emscripten bridge
+# ============================================================================
+
+# wasm-opt: run the in-tree + external wasm size optimizer on a .wasm file.
+# Usage: make wasm-opt F=out/foo.wasm [LEVEL=O3] [OUT=out/foo.opt.wasm]
+wasm-opt:
+	@test -n "$(F)" || (echo "Usage: make wasm-opt F=out/foo.wasm [LEVEL=O3] [OUT=out/foo.opt.wasm]" && false)
+	@if [ -z "$(OUT)" ]; then OUT=$(F:.wasm=.opt.wasm); fi; \
+	  if [ -z "$(LEVEL)" ]; then LEVEL=O3; fi; \
+	  $(PYTHON) tools/hlwasm_opt.py $(F) $$OUT --level $$LEVEL --report
+
+# webapp: compile the Stage 24 acceptance 1000-LOC web app to wasm + JS + HTML.
+# Usage: make webapp [OUT=/tmp/webapp] [WASM_OPT=auto|on|off]
+webapp:
+	@test -x $(BIN)/hlc || $(MAKE) bootstrap
+	@mkdir -p $(BIN)
+	@if [ -z "$(OUT)" ]; then OUT=$(BIN)/webapp; fi; \
+	  if [ -z "$(WASM_OPT)" ]; then WASM_OPT=auto; fi; \
+	  $(PYTHON) tools/hlwasm.py examples/web_app_1000loc.hls $$OUT \
+	    --wasm-opt $$WASM_OPT --opt-level O3 --glue compact
+
+# webapp-acceptance: the Stage 24 acceptance gate. The 1000-LOC web app
+# compiles to <=100 KB wasm + <=5 KB JS glue; wasm-opt reduces size by
+# >=30%. Verifies all three conditions (plus a Node.js run).
+webapp-acceptance:
+	@echo "[Stage 24 acceptance] compiling examples/web_app_1000loc.hls..."
+	@$(PYTHON) tools/hlwasm.py examples/web_app_1000loc.hls $(BIN)/webapp \
+	  >$(BIN)/webapp_acc.log 2>&1
+	@rc=$$?; if [ $$rc -ne 0 ]; then echo "FAIL: webapp compile failed"; \
+	  cat $(BIN)/webapp_acc.log; exit 1; fi
+	@WASM_SIZE=$$(stat -c %s $(BIN)/webapp.wasm 2>/dev/null || stat -f %z $(BIN)/webapp.wasm); \
+	  JS_SIZE=$$(stat -c %s $(BIN)/webapp.js 2>/dev/null || stat -f %z $(BIN)/webapp.js); \
+	  LOC=$$(wc -l < examples/web_app_1000loc.hls); \
+	  echo "  wasm binary: $$WASM_SIZE bytes (limit: 102400)"; \
+	  if [ $$WASM_SIZE -ge 102400 ]; then \
+	    echo "FAIL: wasm binary is $$WASM_SIZE bytes (>= 100 KB)"; exit 1; fi; \
+	  echo "  js glue:    $$JS_SIZE bytes (limit: 5120)"; \
+	  if [ $$JS_SIZE -ge 5120 ]; then \
+	    echo "FAIL: js glue is $$JS_SIZE bytes (>= 5 KB)"; exit 1; fi; \
+	  echo "  LOC:         $$LOC (requirement: >= 1000)"; \
+	  if [ $$LOC -lt 1000 ]; then \
+	    echo "FAIL: example is $$LOC LOC (< 1000)"; exit 1; fi
+	@# Check wasm-opt reduction (input size from --wasm-opt off build,
+	@# output size from the default --wasm-opt auto build).
+	@$(PYTHON) tools/hlwasm.py examples/web_app_1000loc.hls $(BIN)/webapp_no_opt \
+	  --wasm-opt off >$(BIN)/webapp_no_opt.log 2>&1
+	@RAW_SIZE=$$(stat -c %s $(BIN)/webapp_no_opt.wasm 2>/dev/null || stat -f %z $(BIN)/webapp_no_opt.wasm); \
+	  OPT_SIZE=$$(stat -c %s $(BIN)/webapp.wasm 2>/dev/null || stat -f %z $(BIN)/webapp.wasm); \
+	  PCT=$$(python3 -c "print(round(($$RAW_SIZE - $$OPT_SIZE) * 100.0 / $$RAW_SIZE, 1))"); \
+	  echo "  wasm-opt: $$RAW_SIZE -> $$OPT_SIZE bytes ($$PCT% reduction, requirement: >= 30.0%)"; \
+	  python3 -c "import sys; sys.exit(0 if $$PCT >= 30.0 else 1)" \
+	    || (echo "FAIL: wasm-opt reduction $$PCT% is below 30% requirement"; exit 1)
+	@# Verify the wasm runs in Node.js (if available).
+	@if command -v node >/dev/null 2>&1; then \
+	  node -e "const fs=require('fs');const w=fs.readFileSync('$(BIN)/webapp.wasm');const g=fs.readFileSync('$(BIN)/webapp.js','utf-8');eval(g);Halis.run(new Uint8Array(w)).then(c=>{if(c!==0n){console.error('FAIL: exit code',c);process.exit(1);}}).catch(e=>{console.error('FAIL:',e.message);process.exit(1);});" \
+	    || (echo "FAIL: webapp wasm did not run cleanly"; exit 1); \
+	  echo "  node run:   OK (exit 0)"; \
+	else \
+	  echo "  node run:   SKIP (node not installed)"; \
+	fi
+	@echo "ACCEPTANCE OK: Stage 24 webapp meets all criteria (LOC, wasm size, JS glue, wasm-opt reduction, node run)"
+
+# serve: start the hls serve dev server with live reload.
+# Usage: make serve [F=examples/hello.hls] [PORT=8080]
+serve:
+	@test -n "$(F)" || F=examples/hello.hls; \
+	  if [ -z "$(PORT)" ]; then PORT=8080; fi; \
+	  $(PYTHON) tools/hlserve.py --input $$F --bundle out --port $$PORT
+
+.PHONY: wasm-opt webapp webapp-acceptance serve
 
 # ============================================================================
 # Stage 13 (v0.23.0-alpha): hls-pkg package manager targets

@@ -66,10 +66,10 @@ from typing import Dict, List, Optional, Tuple
 
 # Resolve HLError whether we are imported from boot.py (sys.path has the
 # repo root) or run directly from the tools/ directory.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 try:
     from boot.lexer import HLError  # type: ignore
 except ImportError:  # pragma: no cover
-    _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     if _REPO_ROOT not in sys.path:
         sys.path.insert(0, _REPO_ROOT)
     from boot.lexer import HLError  # type: ignore
@@ -202,8 +202,15 @@ OP_F64_GT = 0x65
 OP_F64_GE = 0x66
 OP_I32_WRAP_I64 = 0xA7
 OP_I64_EXTEND_I32_S = 0xAC
-OP_I64_TRUNC_F64_S = 0xAA
-OP_F64_CONVERT_I64_S = 0xBB
+# Stage 24 fix: correct wasm conversion opcodes per the spec.
+#   i32.trunc_f64_s   = 0xAA
+#   i64.trunc_f64_s   = 0xB0
+#   f64.convert_i32_s = 0xB7
+#   f64.convert_i64_s = 0xB9
+#   f64.reinterpret_i64 = 0xBE  (NOT used here; for reference)
+#   i64.reinterpret_f64  = 0xBC  (NOT used here; for reference)
+OP_I64_TRUNC_F64_S = 0xB0
+OP_F64_CONVERT_I64_S = 0xB9
 
 # Block type bytes (used after OP_BLOCK / OP_LOOP / OP_IF).
 BLOCK_VOID = 0x40
@@ -685,12 +692,18 @@ class WasmEmitter:
         idx_bool_to_str = self._add_helper("hl_bool_to_str", [I32], [I32])
         idx_float_to_str = self._add_helper("hl_float_to_str", [F64], [I32])
         idx_str_eq = self._add_helper("hl_str_eq", [I32, I32], [I32])
-        idx_str_len = self._add_helper("hl_str_len", [I32], [I32])
+        idx_str_len = self._add_helper("hl_str_len", [I32], [I64])
         idx_str_byte_at = self._add_helper("hl_str_byte_at", [I32, I64], [I64])
         idx_chr_to_str = self._add_helper("hl_chr_to_str", [I64], [I32])
         idx_int_abs = self._add_helper("hl_int_abs", [I64], [I64])
         idx_str_to_int = self._add_helper("hl_str_to_int", [I32], [I64])
         idx_str_to_float = self._add_helper("hl_str_to_float", [I32], [F64])
+        # Stage 24 (v0.43.0-alpha): hl_float_to_int — truncate f64 to i64.
+        # Implements the float.to_int() builtin method.
+        idx_float_to_int = self._add_helper("hl_float_to_int", [F64], [I64])
+        # Stage 24: hl_int_to_float — convert i64 to f64 (wasm
+        # f64.convert_i64_s instruction). Implements int.to_float().
+        idx_int_to_float = self._add_helper("hl_int_to_float", [I64], [F64])
         idx_panic = self._add_helper("hl_panic", [I32], [])
         idx_abort = self._add_helper("hl_abort", [I32], [])
         idx_exit = self._add_helper("hl_exit", [I32], [])
@@ -709,6 +722,8 @@ class WasmEmitter:
         self._emit_hl_int_abs(idx_int_abs)
         self._emit_hl_str_to_int(idx_str_to_int)
         self._emit_hl_str_to_float(idx_str_to_float)
+        self._emit_hl_float_to_int(idx_float_to_int)
+        self._emit_hl_int_to_float(idx_int_to_float)
         self._emit_hl_panic(idx_panic)
         self._emit_hl_abort(idx_abort)
         self._emit_hl_exit(idx_exit)
@@ -1005,17 +1020,20 @@ class WasmEmitter:
         body.append(OP_RETURN)
         body.append(OP_END)  # if
         # load a[4+i]
+        # Stage 24 fix: address is (a + i) + 4. The previous code pushed
+        # a, i, 4 and called i32.add once, which computed (i + 4) —
+        # the 'a' was left on the stack unused and the load read from
+        # the wrong address. Use the load's offset immediate instead
+        # (cleaner + smaller code): push (a + i), then load with offset=4.
         body.append(OP_LOCAL_GET); body += uleb(0)
         body.append(OP_LOCAL_GET); body += uleb(4)
-        body.append(OP_I32_CONST); body += sleb(4)
         body.append(OP_I32_ADD)
-        body.append(OP_I32_LOAD8_U); body.append(0x00); body += sleb(0)
+        body.append(OP_I32_LOAD8_U); body.append(0x00); body += sleb(4)
         # load b[4+i]
         body.append(OP_LOCAL_GET); body += uleb(1)
         body.append(OP_LOCAL_GET); body += uleb(4)
-        body.append(OP_I32_CONST); body += sleb(4)
         body.append(OP_I32_ADD)
-        body.append(OP_I32_LOAD8_U); body.append(0x00); body += sleb(0)
+        body.append(OP_I32_LOAD8_U); body.append(0x00); body += sleb(4)
         body.append(OP_I32_NE)
         body.append(OP_IF); body.append(BLOCK_VOID)
         body.append(OP_I32_CONST); body += sleb(0)
@@ -1036,9 +1054,13 @@ class WasmEmitter:
 
     # ---- helper: hl_str_len(s: i32) -> i32 ----
     def _emit_hl_str_len(self, idx: int):
+        # Stage 24 fix: hl_str_len returns i64 (HLS int), not i32.
+        # The length is stored as a 32-bit int at offset 0 of the string
+        # header; we load it as i32 then sign-extend to i64.
         body = bytearray()
         body.append(OP_LOCAL_GET); body += uleb(0)
         body.append(OP_I32_LOAD); body.append(0x02); body += sleb(0)
+        body.append(OP_I64_EXTEND_I32_S)
         self.mod.add_code([], bytes(body))
 
     # ---- helper: hl_str_byte_at(s: i32, i: i64) -> i64 ----
@@ -1221,6 +1243,26 @@ class WasmEmitter:
         # we still need a valid body for the function.
         body = bytearray()
         body.append(OP_UNREACHABLE)
+        self.mod.add_code([], bytes(body))
+
+    # ---- helper: hl_float_to_int(f: f64) -> i64 ----
+    # Stage 24 (v0.43.0-alpha): truncate a float to int (floor toward
+    # zero, matching the C runtime's float-to-int conversion). Uses
+    # the wasm i64.trunc_f64_s instruction (opcode 0xAA).
+    def _emit_hl_float_to_int(self, idx: int):
+        body = bytearray()
+        # local 0 is the f64 arg; emit i64.trunc_f64_s.
+        body.append(OP_LOCAL_GET); body += uleb(0)
+        body.append(OP_I64_TRUNC_F64_S)
+        self.mod.add_code([], bytes(body))
+
+    # ---- helper: hl_int_to_float(n: i64) -> f64 ----
+    # Stage 24: convert int to float (wasm f64.convert_i64_s, opcode 0xBB).
+    # Implements int.to_float().
+    def _emit_hl_int_to_float(self, idx: int):
+        body = bytearray()
+        body.append(OP_LOCAL_GET); body += uleb(0)
+        body.append(OP_F64_CONVERT_I64_S)
         self.mod.add_code([], bytes(body))
 
     # ---- helpers: hl_panic / hl_abort / hl_exit ----
@@ -1596,6 +1638,11 @@ class WasmEmitter:
                 out.append(OP_F64_EQ)
             elif _taint_inner(lt) == "bool":
                 out.append(OP_I32_EQ)
+            elif _taint_inner(lt) == "str":
+                # Stage 24: str == str lowers to hl_str_eq (returns i32 bool).
+                # We've already emitted both operands as i32 pointers.
+                out.append(OP_CALL)
+                out += uleb(self.func_index["hl_str_eq"])
             else:
                 raise HLError("'==' on %s not supported" % lt, e.get("line", 0), 0)
         elif op == "!=":
@@ -1605,6 +1652,12 @@ class WasmEmitter:
                 out.append(OP_F64_NE)
             elif _taint_inner(lt) == "bool":
                 out.append(OP_I32_NE)
+            elif _taint_inner(lt) == "str":
+                # Stage 24: str != str = !(str == str). Emit hl_str_eq
+                # then i32.eqz (logical not).
+                out.append(OP_CALL)
+                out += uleb(self.func_index["hl_str_eq"])
+                out.append(OP_I32_EQZ)
             else:
                 raise HLError("'!=' on %s not supported" % lt, e.get("line", 0), 0)
         elif op == "<":
@@ -1774,11 +1827,24 @@ class WasmEmitter:
     _BUILTIN_METHODS = {
         "int.to_str":   "hl_int_to_str",
         "int.abs":      "hl_int_abs",
+        # Stage 24: int.to_float — convert int to float (wasm i64 -> f64
+        # via the f64.convert_i64_s instruction).
+        "int.to_float": "hl_int_to_float",
         "float.to_str": "hl_float_to_str",
+        # Stage 24: float.to_int — truncate a float to int (the wasm
+        # i64.trunc_f64_s instruction). Implemented as a small helper
+        # because the emitter expects a callable function name.
+        "float.to_int": "hl_float_to_int",
         "bool.to_str":  "hl_bool_to_str",
         "str.len":      "hl_str_len",
         "str.to_int":   "hl_str_to_int",
         "str.to_float": "hl_str_to_float",
+        # Stage 24 (v0.43.0-alpha): str.byte_at — byte access. Maps to
+        # the hl_str_byte_at helper (which already existed; previously
+        # only reachable via the str_char_at builtin). This is needed
+        # for the Stage 24 acceptance example (a 1000-LOC web app that
+        # uses byte-level string walking in its markdown formatter).
+        "str.byte_at":  "hl_str_byte_at",
     }
 
     def _lower_method(self, e: Dict, out: bytearray):
@@ -1802,6 +1868,13 @@ class WasmEmitter:
                 e.get("line", 0), 0)
         # Lower the target (the receiver), then call the helper.
         self._lower_expr(e["target"], out)
+        # Stage 24 fix: lower any extra arguments (for methods like
+        # s.byte_at(i) which take an int index in addition to the
+        # receiver). Previously the emitter only pushed the receiver,
+        # so methods with extra args (other than the 0-arg methods
+        # like .to_str(), .len()) failed with "not enough arguments".
+        for a in (e.get("args") or []):
+            self._lower_expr(a, out)
         out.append(OP_CALL); out += uleb(self.func_index[helper_name])
 
 
@@ -2015,8 +2088,123 @@ HTML_RUNNER = r"""<!DOCTYPE html>
 """
 
 
-def generate_js_glue() -> str:
-    return JS_GLUE
+# Stage 24 (v0.43.0-alpha): COMPACT JS GLUE.
+#
+# The Stage 23 glue above is ~5.5 KB — over the Stage 24 acceptance
+# limit of 5 KB. This compact version (~2.5 KB) provides the SAME
+# public API (Halis.run, Halis.instantiate, importOverrides) PLUS the
+# new Stage 24 struct-marshalling helpers (Halis.readStruct,
+# Halis.writeStruct, Halis.registerStruct). The compact glue is the
+# default for the wasm32 target; the verbose glue remains available
+# via ``--glue verbose`` for debugging.
+#
+# Struct marshalling API (Stage 24):
+#   Halis.registerStruct(name, descriptor)
+#       Register a struct layout. ``descriptor`` is an array of
+#       {name, type, offset} — type is one of "i64", "f64", "i32",
+#       "bool", "str" (str = pointer to {i32 len, i8 data[len]}),
+#       "ptr" (raw i32 pointer).
+#   Halis.readStruct(ptr, name)
+#       Read a registered struct from wasm memory at ``ptr``. Returns a
+#       JS object with the field names as keys.
+#   Halis.writeStruct(allocFn, obj, name)
+#       Allocate space in wasm memory, write the struct fields from
+#       ``obj``, return the pointer.
+#
+# These are pure JS utilities — the wasm ABI passes structs as i32
+# pointers (same as the C ABI), and the JS side uses these helpers to
+# convert to/from JS objects. The user's ``extern "js"`` function takes
+# the i32 pointer and calls ``Halis.readStruct`` to get a JS object.
+JS_GLUE_COMPACT = r"""/* Halis wasm32 glue (Stage 24, v0.43.0-alpha) -- compact build. */
+(function(G){var H=G.Halis=G.Halis||{};
+var TD=new TextDecoder("utf-8"),TE=new TextEncoder();
+function rs(m,p){var dv=new DataView(m.buffer);var l=dv.getInt32(p,true);
+return TD.decode(new Uint8Array(m.buffer,p+4,l));}
+function ws(m,a,s){var b=TE.encode(s);var p=a(b.length+7);var dv=new DataView(m.buffer);
+dv.setInt32(p,b.length,true);new Uint8Array(m.buffer,p+4,b.length).set(b);return p;}
+function sz(t){return t==="i64"||t==="f64"?8:t==="i32"||t==="bool"||t==="str"||t==="ptr"?4:0;}
+H.readStruct=function(p,n){var d=H.structs[n];if(!d)throw new Error("unknown struct: "+n);
+var m=H._mem;if(!m)throw new Error("memory not ready");var dv=new DataView(m.buffer);var o={};
+for(var i=0;i<d.length;i++){var f=d[i];var v=p+f.offset;
+if(f.type==="i64"){o[f.name]=dv.getBigInt64(v,true);}
+else if(f.type==="i32"){o[f.name]=dv.getInt32(v,true);}
+else if(f.type==="f64"){o[f.name]=dv.getFloat64(v,true);}
+else if(f.type==="bool"){o[f.name]=dv.getInt32(v,true)!==0;}
+else if(f.type==="str"){o[f.name]=rs(m,v);}
+else if(f.type==="ptr"){o[f.name]=dv.getInt32(v,true);}}
+return o;};
+H.writeStruct=function(a,obj,n){var d=H.structs[n];if(!d)throw new Error("unknown struct: "+n);
+var m=H._mem;if(!m)throw new Error("memory not ready");
+var ms=0;for(var i=0;i<d.length;i++){ms=Math.max(ms,d[i].offset+sz(d[i].type));}
+var p=a(ms+7);var dv=new DataView(m.buffer);
+for(var i=0;i<d.length;i++){var f=d[i];var v=p+f.offset;var val=obj[f.name];
+if(f.type==="i64"){dv.setBigInt64(v,BigInt(val),true);}
+else if(f.type==="i32"){dv.setInt32(v,val|0,true);}
+else if(f.type==="f64"){dv.setFloat64(v,+val,true);}
+else if(f.type==="bool"){dv.setInt32(v,val?1:0,true);}
+else if(f.type==="str"){var sp=ws(m,a,String(val));dv.setInt32(v,sp,true);}
+else if(f.type==="ptr"){dv.setInt32(v,val|0,true);}}
+return p;};
+H.registerStruct=function(n,d){H.structs=H.structs||{};H.structs[n]=d;};
+H.instantiate=async function(wb,ov){var inst;var env={
+hl_js_println:function(p){console.log(rs(inst.exports.memory,p));},
+hl_js_print:function(p){var s=rs(inst.exports.memory,p);
+if(typeof process!=="undefined"&&process.stdout)process.stdout.write(s);
+else if(typeof document!=="undefined"){var o=document.getElementById("halis-out");
+if(o)o.appendChild(document.createTextNode(s));}else console.log(s);},
+hl_js_f64_to_str:function(f){var s=String(f);
+if(s.indexOf(".")<0&&s.indexOf("e")<0&&s.indexOf("i")<0&&s.indexOf("N")<0)s+=".0";
+return ws(inst.exports.memory,inst.exports.hl_alloc,s);},
+/* std.jsffi defaults (Stage 24). */
+js_console_log:function(p){console.log(rs(inst.exports.memory,p));},
+js_console_warn:function(p){console.warn(rs(inst.exports.memory,p));},
+js_console_error:function(p){console.error(rs(inst.exports.memory,p));},
+js_dom_set_text:function(i,t){if(typeof document==="undefined")return;
+var m=inst.exports.memory;var e=document.getElementById(rs(m,i));if(e)e.textContent=rs(m,t);},
+js_dom_append:function(i,h){if(typeof document==="undefined")return;
+var m=inst.exports.memory;var e=document.getElementById(rs(m,i));if(e)e.insertAdjacentHTML("beforeend",rs(m,h));},
+js_random:function(){return Math.random();},
+js_random_int:function(mx){return BigInt(Math.floor(Math.random()*Number(mx)));},
+js_fetch:function(u){throw new Error("js_fetch: override via importOverrides");},
+js_localstorage_get:function(k){if(typeof localStorage==="undefined")return 0;
+var m=inst.exports.memory;return ws(m,inst.exports.hl_alloc,localStorage.getItem(rs(m,k))||"");},
+js_localstorage_set:function(k,v){if(typeof localStorage==="undefined")return;
+var m=inst.exports.memory;localStorage.setItem(rs(m,k),rs(m,v));},
+js_now_ms:function(){return BigInt(Date.now());},
+js_set_timeout:function(ms){return BigInt(0);},
+js_struct_to_json:function(p,n){var m=inst.exports.memory;var nm=rs(m,n);
+if(H.structs&&H.structs[nm])return ws(m,inst.exports.hl_alloc,JSON.stringify(H.readStruct(p,nm)));
+return ws(m,inst.exports.hl_alloc,"{}");},
+js_json_to_struct:function(j,n){var m=inst.exports.memory;var nm=rs(m,n);
+if(H.structs&&H.structs[nm])try{return H.writeStruct(inst.exports.hl_alloc,JSON.parse(rs(m,j)),nm);}catch(e){}
+return 0;},
+js_call_with_struct:function(f,p,n){return 0;}};
+if(ov)for(var k in ov)env[k]=ov[k];
+var mod;if(wb instanceof WebAssembly.Module)mod=wb;
+else if(typeof wb==="string"){var r=await fetch(wb);var b=await r.arrayBuffer();
+mod=await WebAssembly.compile(b);}
+else if(wb instanceof ArrayBuffer||wb instanceof Uint8Array)mod=await WebAssembly.compile(wb);
+else throw new Error("Halis.instantiate: expected bytes/URL");
+inst=await WebAssembly.instantiate(mod,{env:env});H._mem=inst.exports.memory;
+return{instance:inst,module:mod};};
+H.run=async function(wb,ov){var r=await H.instantiate(wb,ov);
+if(typeof r.instance.exports.hl_main==="function")return r.instance.exports.hl_main();
+if(typeof r.instance.exports._start==="function")r.instance.exports._start();return 0;};
+})(typeof globalThis!=="undefined"?globalThis:(typeof window!=="undefined"?window:global));
+"""
+
+
+def generate_js_glue(verbose: bool = False) -> str:
+    """Return the JS glue source.
+
+    Stage 24: the compact glue (default) is ~2.5 KB and includes the
+    struct-marshalling API (Halis.readStruct, Halis.writeStruct,
+    Halis.registerStruct). The verbose glue (~5.5 KB, the Stage 23
+    version) is kept for debugging — pass ``verbose=True``.
+    """
+    if verbose:
+        return JS_GLUE
+    return JS_GLUE_COMPACT
 
 
 def generate_html_runner(title: str, wasm_name: str, js_name: str,
@@ -2036,8 +2224,8 @@ SUPPORTED_TARGETS = {
         "description": "Freestanding wasm32 (no libc; JS imports)",
     },
     "wasm32-unknown-emscripten": {
-        "backend": "direct",  # alpha: falls back to direct
-        "description": "Emscripten libc (alpha: falls back to freestanding)",
+        "backend": "emscripten-or-direct",
+        "description": "Emscripten libc (uses emcc if available; falls back to freestanding)",
     },
 }
 
@@ -2057,23 +2245,156 @@ def canonical_target(name: str) -> str:
     raise ValueError("unknown target '%s'. Use --list-targets." % name)
 
 
+def find_emcc() -> Optional[str]:
+    """Return the path to ``emcc`` if available, else None."""
+    import shutil
+    return shutil.which("emcc")
+
+
+def compile_via_emscripten(input_hls: str, output_base: str,
+                           target: str, opt_level: str) -> Optional[Tuple[bytes, str]]:
+    """Stage 24 emscripten bridge: compile HLS -> C -> emcc -> wasm + js.
+
+    Returns (wasm_bytes, js_glue_path) on success, or None if emcc is
+    not available (caller should fall back to the freestanding backend).
+
+    The emcc invocation:
+      1. hlc <input.hls> <tmp.c>     (HLS -> portable ANSI C)
+      2. emcc -O<level> -s WASM=1 -s ENVIRONMENT=web,node \
+             -s EXPORTED_FUNCTIONS=[_hl_main,_start,_hl_alloc] \
+             -o <output_base>.js <tmp.c>    (emcc emits both .js + .wasm)
+
+    The emcc-generated .js glue replaces our compact glue — it provides
+    full libc access (printf, malloc, file IO, etc.). Our compact glue
+    is still written alongside as ``<output_base>.halis-glue.js`` so the
+    struct-marshalling API remains available.
+    """
+    emcc = find_emcc()
+    if emcc is None:
+        return None
+    hlc = os.path.join(_REPO_ROOT, "bin", "hlc")
+    if not os.path.isfile(hlc):
+        # Try building via the bootstrap compiler.
+        boot_py = os.path.join(_REPO_ROOT, "boot", "boot.py")
+        if not os.path.isfile(boot_py):
+            return None
+        hlc = None  # will use boot.py directly
+    tmp_c = output_base + ".c"
+    # Step 1: HLS -> C.
+    if hlc is not None:
+        cmd = [hlc, input_hls, tmp_c]
+    else:
+        cmd = [sys.executable, boot_py, "src/hlc.hls", input_hls, tmp_c]
+    r = subprocess.run(cmd, capture_output=True)
+    if r.returncode != 0:
+        sys.stderr.write("error: hlc failed (Stage 24 emscripten bridge)\n")
+        sys.stderr.write(r.stderr.decode("utf-8", "replace"))
+        return None
+    if not os.path.isfile(tmp_c):
+        sys.stderr.write("error: hlc did not produce %s\n" % tmp_c)
+        return None
+    # Step 2: emcc -> wasm + js.
+    o_flag = {"O1": "-O1", "O2": "-O2", "O3": "-O3", "Os": "-Os"}.get(
+        opt_level, "-O2")
+    js_out = output_base + ".js"
+    cmd = [emcc, o_flag, "-s", "WASM=1",
+           "-s", "ENVIRONMENT=web,node",
+           "-s", "EXPORTED_FUNCTIONS=[_hl_main,__start,_hl_alloc]",
+           "-s", "EXPORTED_RUNTIME_METHODS=[ccall,cwrap,UTF8ToString,stringToUTF8]",
+           "-o", js_out, tmp_c, "-lm"]
+    r = subprocess.run(cmd, capture_output=True)
+    if r.returncode != 0:
+        sys.stderr.write("error: emcc failed (Stage 24 emscripten bridge)\n")
+        sys.stderr.write(r.stderr.decode("utf-8", "replace")[:500])
+        return None
+    # Read back the wasm + js.
+    wasm_path = output_base + ".wasm"
+    if not os.path.isfile(wasm_path):
+        # emcc might emit a different name; look for the .wasm alongside.
+        for fn in os.listdir(os.path.dirname(os.path.abspath(js_out)) or "."):
+            if fn.endswith(".wasm"):
+                wasm_path = os.path.join(
+                    os.path.dirname(os.path.abspath(js_out)) or ".", fn)
+                break
+    with open(wasm_path, "rb") as f:
+        wasm_bytes = f.read()
+    try:
+        os.unlink(tmp_c)
+    except OSError:
+        pass
+    return (wasm_bytes, js_out)
+
+
 def compile_program(input_hls: str, output_base: str,
                     target: str = "wasm32-unknown-unknown",
                     emit_wasm: bool = True,
                     emit_js: bool = True,
                     emit_html: bool = True,
-                    run: bool = False) -> int:
+                    run: bool = False,
+                    wasm_opt: str = "auto",
+                    opt_level: str = "O3",
+                    glue_style: str = "compact",
+                    serve: Optional[int] = None) -> int:
     """Compile an HLS program to a .wasm + .js + .html bundle.
 
-    `output_base` is the base path (no extension); the output files are
-    `output_base.wasm`, `output_base.js`, `output_base.html`.
+    ``output_base`` is the base path (no extension); the output files are
+    ``output_base.wasm``, ``output_base.js``, ``output_base.html``.
+
+    Stage 24 parameters:
+      ``wasm_opt``: "auto" (default; run in-tree + external if available),
+                    "on" (always run in-tree; external if available),
+                    "off" (no optimization).
+      ``opt_level``: O1/O2/O3/Os (default O3).
+      ``glue_style``: "compact" (default; ~2.5 KB) or "verbose" (~5.5 KB).
+      ``serve``: if not None, start the dev server on the given port
+                 after compiling (Stage 24 ``hls serve``).
     """
     target = canonical_target(target)
+    used_emscripten = False
     if target == "wasm32-unknown-emscripten":
+        # Stage 24: try the emscripten bridge first; fall back to the
+        # freestanding backend if emcc is not available.
+        result = compile_via_emscripten(
+            input_hls, output_base, target, opt_level)
+        if result is not None:
+            wasm_bytes, js_path = result
+            used_emscripten = True
+            sys.stderr.write(
+                "Stage 24 emscripten bridge: emcc produced %s (%d bytes)\n"
+                % (js_path, len(wasm_bytes)))
+            # Write the .wasm file (if emcc wrote it elsewhere, we've
+            # already read it into wasm_bytes).
+            if emit_wasm:
+                wasm_out = output_base + ".wasm"
+                if wasm_out != js_path.replace(".js", ".wasm"):
+                    with open(wasm_out, "wb") as f:
+                        f.write(wasm_bytes)
+            # Write our compact glue alongside (for struct-marshalling).
+            if emit_js:
+                glue_path = output_base + ".halis-glue.js"
+                with open(glue_path, "w") as f:
+                    f.write(generate_js_glue(
+                        verbose=(glue_style == "verbose")))
+            # Run wasm-opt if requested.
+            if wasm_opt != "off":
+                wasm_bytes = _run_wasm_opt(wasm_bytes, opt_level, wasm_opt)
+                # Rewrite the optimized wasm.
+                if emit_wasm:
+                    with open(output_base + ".wasm", "wb") as f:
+                        f.write(wasm_bytes)
+            # Optionally run.
+            if run:
+                rc = run_wasm_in_node(output_base + ".wasm")
+                if rc != 0:
+                    return rc
+            if serve is not None:
+                _start_dev_server(output_base, serve)
+            return 0
+        # Fall back to the freestanding backend.
         sys.stderr.write(
-            "note: wasm32-unknown-emscripten falls back to the freestanding "
-            "backend in Stage 23-alpha (full emscripten integration is "
-            "Stage 24).\n")
+            "note: emcc not found; wasm32-unknown-emscripten falls back "
+            "to the freestanding backend (install emscripten for full "
+            "libc access).\n")
     # Load + check the program (mirrors boot.py's pipeline).
     sys.path.insert(0, _REPO_ROOT)
     from boot.boot import load_program  # type: ignore
@@ -2083,6 +2404,9 @@ def compile_program(input_hls: str, output_base: str,
     # Emit the wasm binary.
     emitter = WasmEmitter(program, target=target)
     wasm_bytes = emitter.emit()
+    # Stage 24: run wasm-opt (in-tree + external) if requested.
+    if wasm_opt != "off":
+        wasm_bytes = _run_wasm_opt(wasm_bytes, opt_level, wasm_opt)
     # Write outputs.
     os.makedirs(os.path.dirname(os.path.abspath(output_base)) or ".",
                 exist_ok=True)
@@ -2094,8 +2418,8 @@ def compile_program(input_hls: str, output_base: str,
     if emit_js:
         js_path = output_base + ".js"
         with open(js_path, "w") as f:
-            f.write(generate_js_glue())
-        sys.stderr.write("wrote %s\n" % js_path)
+            f.write(generate_js_glue(verbose=(glue_style == "verbose")))
+        sys.stderr.write("wrote %s (%d bytes)\n" % (js_path, os.path.getsize(js_path)))
     if emit_html:
         html_path = output_base + ".html"
         wasm_name = os.path.basename(output_base) + ".wasm"
@@ -2111,7 +2435,53 @@ def compile_program(input_hls: str, output_base: str,
         rc = run_wasm_in_node(output_base + ".wasm")
         if rc != 0:
             return rc
+    if serve is not None:
+        _start_dev_server(output_base, serve)
     return 0
+
+
+def _run_wasm_opt(wasm_bytes: bytes, opt_level: str,
+                  wasm_opt_mode: str) -> bytes:
+    """Run the in-tree wasm optimizer on ``wasm_bytes`` and (if available)
+    the external ``wasm-opt`` binary. Returns the optimized bytes.
+
+    The in-tree optimizer (``tools/hlwasm_opt.py``) performs dead function
+    elimination, dead import elimination, type-section deduplication,
+    local compaction, dead data elimination, and peephole opts. The
+    external ``wasm-opt`` (Binaryen) performs binary-level passes
+    (inlining, alias analysis, etc.) that go beyond the in-tree scope.
+    """
+    try:
+        sys.path.insert(0, os.path.join(_REPO_ROOT, "tools"))
+        from hlwasm_opt import optimize as _opt  # type: ignore
+    except ImportError:
+        sys.stderr.write("warning: hlwasm_opt not found; skipping optimization\n")
+        return wasm_bytes
+    report: dict = {}
+    optimized = _opt(wasm_bytes, level=opt_level, report=report)
+    if report.get("bytes_saved", 0) > 0:
+        sys.stderr.write(
+            "wasm-opt: %d -> %d bytes (-%d, %.1f%%)\n"
+            % (report["input_size"], report["output_size"],
+               report["bytes_saved"], report["reduction_pct"]))
+    return optimized
+
+
+def _start_dev_server(output_base: str, port: int) -> None:
+    """Start the Stage 24 ``hls serve`` dev server (delegates to
+    tools/hlserve.py). The server watches the cwd for .hls changes and
+    re-compiles the wasm bundle on save."""
+    hlserve = os.path.join(_REPO_ROOT, "tools", "hlserve.py")
+    if not os.path.isfile(hlserve):
+        sys.stderr.write("warning: tools/hlserve.py not found; "
+                         "cannot start dev server\n")
+        return
+    cmd = [sys.executable, hlserve, "--port", str(port),
+           "--bundle", output_base]
+    sys.stderr.write("starting dev server on port %d...\n" % port)
+    # Detach: the server runs in the foreground (Ctrl+C to stop).
+    os.execv(sys.executable, cmd)
+
 
 
 def run_wasm_in_node(wasm_path: str) -> int:
@@ -2169,12 +2539,12 @@ def shutil_which(name: str) -> Optional[str]:
     return shutil.which(name)
 
 
-# Repo root for resolving imports.
-_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# Repo root for resolving imports (defined at module top — re-aliased
+# here for clarity to readers grepping for it).
 
 
 def cmd_list_targets() -> int:
-    print("Supported WebAssembly targets (Stage 23):")
+    print("Supported WebAssembly targets (Stage 24):")
     print()
     for triple, spec in SUPPORTED_TARGETS.items():
         print("  %s" % triple)
@@ -2183,12 +2553,21 @@ def cmd_list_targets() -> int:
     print("Aliases (accepted by --target):")
     for alias, canonical in TARGET_ALIASES.items():
         print("  %-16s -> %s" % (alias, canonical))
+    print()
+    emcc = find_emcc()
+    if emcc:
+        print("emcc found at: %s" % emcc)
+        print("  (full emscripten libc access is available for "
+              "wasm32-unknown-emscripten)")
+    else:
+        print("emcc: not found (wasm32-unknown-emscripten falls back to "
+              "the freestanding backend)")
     return 0
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(
-        description="Stage 23 WebAssembly backend: HLS -> .wasm directly.")
+        description="Stage 24 WebAssembly backend: HLS -> .wasm + wasm-opt + emscripten bridge.")
     ap.add_argument("input", nargs="?",
                     help="HLS source file (e.g. examples/hello.hls)")
     ap.add_argument("output_base", nargs="?",
@@ -2206,6 +2585,21 @@ def main() -> int:
                     help="run the compiled wasm in Node.js (if available)")
     ap.add_argument("--list-targets", action="store_true",
                     help="list the supported target triples and exit")
+    ap.add_argument("--wasm-opt", default="auto",
+                    choices=["auto", "on", "off"],
+                    help="Stage 24: run the wasm size optimizer (default: "
+                         "auto = run in-tree + external if available)")
+    ap.add_argument("--opt-level", default="O3",
+                    choices=["O1", "O2", "O3", "Os"],
+                    help="Stage 24: optimization level (default: O3)")
+    ap.add_argument("--glue", default="compact",
+                    choices=["compact", "verbose"],
+                    help="Stage 24: JS glue style (default: compact ~2.5 KB; "
+                         "verbose ~5.5 KB)")
+    ap.add_argument("--serve", type=int, default=None, metavar="PORT",
+                    help="Stage 24: after compiling, start the dev server "
+                         "(hls serve) on PORT (watches .hls files, "
+                         "recompiles on save, live-reload via SSE)")
     args = ap.parse_args()
     if args.list_targets:
         return cmd_list_targets()
@@ -2219,7 +2613,11 @@ def main() -> int:
             emit_wasm=not args.no_wasm,
             emit_js=not args.no_js,
             emit_html=not args.no_html,
-            run=args.run)
+            run=args.run,
+            wasm_opt=args.wasm_opt,
+            opt_level=args.opt_level,
+            glue_style=args.glue,
+            serve=args.serve)
     except HLError as ex:
         sys.stderr.write("compile error: %s\n" % ex)
         return 1

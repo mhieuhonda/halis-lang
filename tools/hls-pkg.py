@@ -1345,6 +1345,29 @@ def cmd_build(args):
     # resolver still uses boot.py to load + check the program (the
     # cross-compilation only changes the FINAL hlc + linker step).
     target_triple = getattr(args, "target", None)
+    # Stage 24 (v0.43.0-alpha): wasm32 targets go through hlwasm (with
+    # wasm-opt) instead of hlcross. The roadmap's Stage 24 acceptance:
+    # "hls-pkg build --target wasm32 runs wasm-opt -O3 on the output."
+    if target_triple is not None and target_triple.startswith("wasm32"):
+        hlwasm = os.path.join(REPO_ROOT, "tools", "hlwasm.py")
+        if not os.path.isfile(hlwasm):
+            print("error: cannot find tools/hlwasm.py (repo layout changed?)",
+                  file=sys.stderr)
+            return 1
+        out_dir = os.path.join(os.getcwd(), ".hls-pkg-build")
+        os.makedirs(out_dir, exist_ok=True)
+        out_base = os.path.join(out_dir, "pkg_wasm")
+        wasm_opt_mode = getattr(args, "wasm_opt", "auto") or "auto"
+        opt_level = getattr(args, "opt_level", "O3") or "O3"
+        glue = getattr(args, "glue", "compact") or "compact"
+        cmd = [sys.executable, hlwasm, entry, out_base,
+               "--target", target_triple,
+               "--wasm-opt", wasm_opt_mode,
+               "--opt-level", opt_level,
+               "--glue", glue]
+        print("  $ %s" % " ".join(cmd))
+        result = subprocess.run(cmd, env=env)
+        return result.returncode
     if target_triple is not None:
         hlcross = os.path.join(REPO_ROOT, "tools", "hlcross.py")
         if not os.path.isfile(hlcross):
@@ -1538,8 +1561,22 @@ def main():
     # package's entry point to a foreign binary via hlcross.
     p_build.add_argument("--target", default=None,
                          help="cross-compile to this target triple "
-                              "(e.g. aarch64-apple-darwin). When omitted, "
-                              "builds for the host.")
+                              "(e.g. aarch64-apple-darwin, wasm32-unknown-unknown). "
+                              "When omitted, builds for the host.")
+    # Stage 24 (v0.43.0-alpha): wasm-specific build flags (only used
+    # when --target starts with wasm32). The default (--wasm-opt auto,
+    # --opt-level O3, --glue compact) matches the Stage 24 acceptance
+    # criterion ("hls-pkg build --target wasm32 runs wasm-opt -O3").
+    p_build.add_argument("--wasm-opt", default="auto",
+                         choices=["auto", "on", "off"],
+                         help="Stage 24: wasm size optimizer mode "
+                              "(default: auto = run in-tree + external)")
+    p_build.add_argument("--opt-level", default="O3",
+                         choices=["O1", "O2", "O3", "Os"],
+                         help="Stage 24: optimization level (default: O3)")
+    p_build.add_argument("--glue", default="compact",
+                         choices=["compact", "verbose"],
+                         help="Stage 24: JS glue style (default: compact)")
     p_build.set_defaults(func=cmd_build)
 
     # Stage 13 release: transparency log commands.

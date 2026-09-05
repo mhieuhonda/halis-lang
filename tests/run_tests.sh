@@ -1053,6 +1053,171 @@ else
     tail -5 "$TMP/wasm_acc.log"
 fi
 
+echo "=== 12. Stage 24: wasm-opt integration + emscripten bridge ==="
+# Stage 24 (v0.43.0-alpha): the in-tree wasm size optimizer (tools/hlwasm_opt.py)
+# performs dead function elimination, dead import elimination, type-section
+# deduplication, local compaction, dead data elimination, and peephole opts.
+# It also invokes the external wasm-opt (Binaryen) when available.
+
+# (a) hlwasm_opt --report on hello.wasm produces a non-trivial size reduction.
+if python3 tools/hlwasm.py examples/hello.hls "$TMP/hello_wasm24" --wasm-opt off >"$TMP/wasm24_setup.log" 2>&1 \
+    && python3 tools/hlwasm_opt.py "$TMP/hello_wasm24.wasm" "$TMP/hello_wasm24_opt.wasm" --report >"$TMP/wasm24_opt.log" 2>&1; then
+    if grep -q "reduction:" "$TMP/wasm24_opt.log" \
+        && grep -qE "reduction:\s+[1-9]" "$TMP/wasm24_opt.log"; then
+        ok "wasm24: hlwasm_opt reduces hello.wasm size (reduction > 0%)"
+    else
+        bad "wasm24: hlwasm_opt reported 0% reduction"
+        cat "$TMP/wasm24_opt.log" | head -3
+    fi
+else
+    bad "wasm24: hlwasm_opt failed"
+    cat "$TMP/wasm24_opt.log" | head -3
+fi
+
+# (b) the optimized wasm still runs correctly (output matches interpreter).
+if command -v node >/dev/null 2>&1; then
+    interp_out=$(python3 boot/boot.py examples/hello.hls </dev/null 2>/dev/null)
+    if python3 tools/hlwasm.py examples/hello.hls "$TMP/hello_wasm24_run" --wasm-opt auto >"$TMP/wasm24_run.log" 2>&1; then
+        # Run the wasm in node to get the actual runtime output.
+        wasm_out=$(node -e "
+const fs=require('fs');
+const w=fs.readFileSync('$TMP/hello_wasm24_run.wasm');
+const g=fs.readFileSync('$TMP/hello_wasm24_run.js','utf-8');
+eval(g);
+Halis.run(new Uint8Array(w)).then(c=>{}).catch(e=>{console.error(e.message);process.exit(1);});
+" 2>/dev/null)
+        if [ "$interp_out" == "$wasm_out" ]; then
+            ok "wasm24: optimized hello.wasm output == interpreter (byte-identical)"
+        else
+            bad "wasm24: optimized hello.wasm output differs from interpreter"
+            diff <(echo "$interp_out") <(echo "$wasm_out") | head -5
+        fi
+    else
+        bad "wasm24: optimized hello.hls compile failed"
+    fi
+else
+    echo "  [SKIP] wasm24: node.js not installed (output-match test skipped)"
+    PASS=$((PASS+1))
+fi
+
+# (c) the --wasm-opt CLI flag accepts auto/on/off.
+if python3 tools/hlwasm.py examples/hello.hls "$TMP/wasm24_off" --wasm-opt off >"$TMP/wasm24_off.log" 2>&1 \
+    && python3 tools/hlwasm.py examples/hello.hls "$TMP/wasm24_on" --wasm-opt on >"$TMP/wasm24_on.log" 2>&1 \
+    && python3 tools/hlwasm.py examples/hello.hls "$TMP/wasm24_auto" --wasm-opt auto >"$TMP/wasm24_auto.log" 2>&1; then
+    ok "wasm24: --wasm-opt flag accepts auto/on/off"
+else
+    bad "wasm24: --wasm-opt flag failed"
+fi
+
+# (d) the --glue flag accepts compact/verbose.
+if python3 tools/hlwasm.py examples/hello.hls "$TMP/wasm24_glue_c" --glue compact >"$TMP/wasm24_glue_c.log" 2>&1 \
+    && python3 tools/hlwasm.py examples/hello.hls "$TMP/wasm24_glue_v" --glue verbose >"$TMP/wasm24_glue_v.log" 2>&1; then
+    compact_size=$(stat -c %s "$TMP/wasm24_glue_c.js" 2>/dev/null || stat -f %z "$TMP/wasm24_glue_c.js")
+    verbose_size=$(stat -c %s "$TMP/wasm24_glue_v.js" 2>/dev/null || stat -f %z "$TMP/wasm24_glue_v.js")
+    if [ "$compact_size" -lt "$verbose_size" ]; then
+        ok "wasm24: --glue compact ($compact_size B) < verbose ($verbose_size B)"
+    else
+        bad "wasm24: --glue compact not smaller than verbose"
+    fi
+else
+    bad "wasm24: --glue flag failed"
+fi
+
+# (e) hls-pkg build --target wasm32 runs (uses hlwasm + wasm-opt).
+PKG_DIR="$TMP/stage24_pkg"
+mkdir -p "$PKG_DIR"
+cat > "$PKG_DIR/hls-pkg.toml" <<'PKGEOF'
+[package]
+name = "stage24-test"
+version = "0.1.0"
+description = "Stage 24 test package."
+PKGEOF
+cat > "$PKG_DIR/main.hls" <<'HLS_EOF'
+fn main() -> int uses IO {
+    println("Stage 24 hls-pkg wasm32 build")
+    return 0
+}
+HLS_EOF
+if ( cd "$PKG_DIR" && python3 "$REPO_ABS/tools/hls-pkg.py" build --target wasm32-unknown-unknown >pkg.log 2>&1 ); then
+    if [ -f "$PKG_DIR/.hls-pkg-build/pkg_wasm.wasm" ]; then
+        ok "wasm24: hls-pkg build --target wasm32 produces .wasm"
+    else
+        bad "wasm24: hls-pkg build --target wasm32 did not produce .wasm"
+        tail -3 "$PKG_DIR/pkg.log"
+    fi
+else
+    bad "wasm24: hls-pkg build --target wasm32 failed"
+    tail -5 "$PKG_DIR/pkg.log"
+fi
+
+# (f) the 1000-LOC web app example compiles to <=100 KB wasm + <=5 KB JS glue;
+#     wasm-opt reduces size by >=30%.
+WEBAPP_LOC=$(wc -l < examples/web_app_1000loc.hls)
+if [ "$WEBAPP_LOC" -ge 1000 ]; then
+    ok "wasm24: examples/web_app_1000loc.hls is $WEBAPP_LOC LOC (>= 1000)"
+else
+    bad "wasm24: examples/web_app_1000loc.hls is only $WEBAPP_LOC LOC (< 1000)"
+fi
+if python3 tools/hlwasm.py examples/web_app_1000loc.hls "$TMP/webapp24" >"$TMP/webapp24.log" 2>&1; then
+    wasm_size=$(stat -c %s "$TMP/webapp24.wasm" 2>/dev/null || stat -f %z "$TMP/webapp24.wasm")
+    js_size=$(stat -c %s "$TMP/webapp24.js" 2>/dev/null || stat -f %z "$TMP/webapp24.js")
+    if [ "$wasm_size" -lt 102400 ]; then
+        ok "wasm24: webapp wasm is $wasm_size bytes (< 100 KB)"
+    else
+        bad "wasm24: webapp wasm is $wasm_size bytes (>= 100 KB)"
+    fi
+    if [ "$js_size" -lt 5120 ]; then
+        ok "wasm24: webapp JS glue is $js_size bytes (< 5 KB)"
+    else
+        bad "wasm24: webapp JS glue is $js_size bytes (>= 5 KB)"
+    fi
+    # Check wasm-opt reduction: compare --wasm-opt off vs --wasm-opt auto.
+    if python3 tools/hlwasm.py examples/web_app_1000loc.hls "$TMP/webapp24_noopt" --wasm-opt off >"$TMP/webapp24_noopt.log" 2>&1; then
+        raw_size=$(stat -c %s "$TMP/webapp24_noopt.wasm" 2>/dev/null || stat -f %z "$TMP/webapp24_noopt.wasm")
+        reduction_pct=$(python3 -c "print(round(($raw_size - $wasm_size) * 100.0 / $raw_size, 1))")
+        if python3 -c "import sys; sys.exit(0 if $reduction_pct >= 30.0 else 1)"; then
+            ok "wasm24: wasm-opt reduction is ${reduction_pct}% (>= 30%)"
+        else
+            bad "wasm24: wasm-opt reduction is ${reduction_pct}% (< 30%)"
+        fi
+    else
+        bad "wasm24: --wasm-opt off build failed"
+    fi
+else
+    bad "wasm24: webapp compile failed"
+    cat "$TMP/webapp24.log" | head -5
+fi
+
+# (g) the compact JS glue includes the struct-marshalling API
+#     (Halis.readStruct, Halis.writeStruct, Halis.registerStruct).
+if grep -q "H.readStruct" "$TMP/webapp24.js" \
+    && grep -q "H.writeStruct" "$TMP/webapp24.js" \
+    && grep -q "H.registerStruct" "$TMP/webapp24.js"; then
+    ok "wasm24: compact JS glue includes struct-marshalling API"
+else
+    bad "wasm24: compact JS glue missing struct-marshalling API"
+fi
+
+# (h) make webapp-acceptance runs end-to-end.
+if make webapp-acceptance >"$TMP/webapp_acc24.log" 2>&1; then
+    if grep -q "ACCEPTANCE OK" "$TMP/webapp_acc24.log"; then
+        ok "wasm24: make webapp-acceptance runs end-to-end"
+    else
+        bad "wasm24: make webapp-acceptance did not print ACCEPTANCE OK"
+        tail -5 "$TMP/webapp_acc24.log"
+    fi
+else
+    bad "wasm24: make webapp-acceptance failed"
+    tail -10 "$TMP/webapp_acc24.log"
+fi
+
+# (i) hlserve (dev server) imports without error and has a main().
+if python3 -c "import sys; sys.path.insert(0, 'tools'); import hlserve; assert hasattr(hlserve, 'main'); print('OK')" 2>&1 | grep -q OK; then
+    ok "wasm24: tools/hlserve.py imports and has main()"
+else
+    bad "wasm24: tools/hlserve.py import failed"
+fi
+
 echo ""
 echo "=========================================="
 echo "RESULT: $PASS PASS / $FAIL FAIL"
