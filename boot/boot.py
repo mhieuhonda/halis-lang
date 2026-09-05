@@ -170,7 +170,8 @@ def run_cli():
     # program: driving hlc.hls through Stage-0 with --fast emitted a
     # NON-fast build, and --contracts could not be plumbed through at
     # all (interpreter <-> native flag divergence).
-    _FLAG_WITH_VALUE = ("--emit", "--target", "--sandbox", "-O")
+    _FLAG_WITH_VALUE = ("--emit", "--target", "--sandbox", "-O",
+                        "--target-feature")
     args = []
     i = 0
     while i < len(argv):
@@ -195,6 +196,7 @@ def run_cli():
     target_triple = None   # Stage 12: --target <triple>
     sandbox_dir = None     # Stage 10 release: --sandbox DIR restricts FS builtins
     contracts = False      # Stage 17: --contracts — runtime requires/ensures checks
+    target_feature = None  # Stage 21: --target-feature — SIMD feature dispatch
     fast_mode = False      # Stage 17: --fast / -O fast — proof-driven check elision report
     # BUG (deep-scan-5): remove() only deleted the FIRST occurrence — a
     # duplicated flag (e.g. `--check --check f.hls`) leaked the stray copy
@@ -255,6 +257,22 @@ def run_cli():
         else:
             sys.stderr.write("error: --sandbox expects a directory\n")
             return 2
+    # Stage 21 (v0.37.0-alpha): --target-feature FEAT — set the active
+    # SIMD feature (has_feature() const-folds from it; the interpreter
+    # reads it for parity with the native codegen).
+    while "--target-feature" in args:
+        i = args.index("--target-feature")
+        if i + 1 >= len(args):
+            sys.stderr.write("error: --target-feature expects a name "
+                             "(sse4.2 | avx2 | neon)\n")
+            return 2
+        feat = args[i + 1].lstrip("+")
+        if feat not in ("sse4.2", "avx2", "neon"):
+            sys.stderr.write("error: unknown target feature '%s' "
+                             "(expected sse4.2 | avx2 | neon)\n" % feat)
+            return 2
+        target_feature = feat
+        del args[i:i + 2]
     # Stage 17 (v0.28.0-alpha): --contracts — enable runtime requires /
     # ensures assertions (interpreter checks both; the native backend
     # checks requires at entry).
@@ -299,6 +317,7 @@ def run_cli():
             "  --emit llvm    print the LLVM IR (Stage 12) of every function.\n"
             "  --opt-stats    run the Stage 11 optimiser, print per-pass stats.\n"
             "  --target TRIPLE  set the LLVM target triple (e.g. aarch64-linux).\n"
+            "  --target-feature F  set the SIMD feature (sse4.2|avx2|neon, Stage 21).\n"
             "  --sandbox DIR     restrict filesystem builtins to DIR (Stage 10).\n"
         )
         return 2
@@ -345,6 +364,11 @@ def run_cli():
         if not os.path.isdir(sandbox_dir):
             sys.stderr.write("error: --sandbox: not a directory: %s\n" % sandbox_dir)
             return 2
+    # Stage 21: install the target feature for has_feature() parity.
+    if target_feature is not None:
+        from boot.interp import _set_target_feature
+        _set_target_feature(target_feature)
+        program["target_feature"] = target_feature
     if audit_only:
         print_audit(program, checker)
         return 0
@@ -358,7 +382,7 @@ def run_cli():
     if emit_lto:
         return print_llvm_lto(program, checker, target_triple)
     if opt_stats:
-        return print_opt_stats(program, lto_mode)
+        return print_opt_stats(program, lto_mode, target_feature or "")
     if check_only:
         sys.stdout.write("OK: types and effects valid\n")
         if fast_mode:
@@ -662,7 +686,7 @@ def print_llvm_lto(program, checker, target_triple=None):
     return 0
 
 
-def print_opt_stats(program, lto: bool = False):
+def print_opt_stats(program, lto: bool = False, target_feature: str = ""):
     """Stage 11 (v0.9.0-alpha): run the optimiser, print per-pass stats.
 
     Reports the number of instructions before/after each pass, per function.
@@ -715,6 +739,19 @@ def print_opt_stats(program, lto: bool = False):
     print("  Passes: constant_fold, copy_propagate, dead_code_elim,")
     print("          inline_small, licm")
     print("  (run -O fast for additional safe-arithmetic annotations)")
+    # Stage 21 (v0.37.0-alpha): auto-vectoriser detection report.
+    try:
+        from ir.optimize import auto_vectorize  # noqa: E402
+        vstats = auto_vectorize(mod, target_feature or "")
+        print("")
+        print("  auto-vectorize: %d loop(s), %d vectorisable candidate(s)"
+              "%s" % (vstats["loops"], vstats["candidates"],
+                      "  [feature: %s]" % vstats["feature"]
+                      if vstats["feature"] else ""))
+        print("  (candidates are annotated; the std.simd kernels lower to")
+        print("   native intrinsics under hlc --target-feature)")
+    except Exception:
+        pass
     return 0
 
 

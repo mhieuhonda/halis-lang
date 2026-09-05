@@ -141,6 +141,7 @@ declare i1      @hl_list_pop_bool(ptr)
 declare i64      @hl_list_len(ptr)
 declare ptr      @hl_range(i64, i64)
 declare ptr      @hl_str_join(ptr, ptr)         ; (list[str], sep) -> str — O(n) join (Stage 19)
+declare i1      @hl_simd_cpu_supports(ptr)      ; (feature name) -> bool (Stage 21 runtime probe)
 
 ; boxed element constructors (get uses a plain load from the box pointer)
 declare ptr      @hl_box_i64(i64)
@@ -1517,6 +1518,17 @@ class LLVMEmitter:
         # Stage 19 (v0.35.0-alpha): O(n) join(list[str], sep) -> str.
         if name == "join":
             return self._call1("ptr", "@hl_str_join", ["ptr", "ptr"], arg_pairs)
+        # Stage 21 (v0.37.0-alpha): has_feature — const-folded from the
+        # --target-feature flag (boot.py annotates the program dict).
+        if name == "has_feature":
+            lit = e["args"][0].get("v", "") if e["args"] else ""
+            if isinstance(lit, bytes):
+                lit = lit.decode("utf-8", "replace")
+            feat = self.program.get("target_feature") or ""
+            return ("i1", "1" if lit == feat else "0")
+        # Stage 21: simd_cpu_supports — runtime CPU probe.
+        if name == "simd_cpu_supports":
+            return self._call1("i1", "@hl_simd_cpu_supports", ["ptr"], arg_pairs)
         if name == "map_new":
             tmp = self._fresh("map")
             # Arena-mode contract: val_free = null (never release values).

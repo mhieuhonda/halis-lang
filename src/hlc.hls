@@ -254,7 +254,23 @@ struct Ctx {
     # lto_dropped: how many standalone bodies were dropped (stats).
     lto_dropped: int,
     # lto_inlined_report: callee keys inlined at least once (stats).
-    lto_inlined_report: list[str]
+    lto_inlined_report: list[str],
+    # ---- Stage 21 (v0.37.0-alpha): SIMD vectorisation ----
+    # target_feature: --target-feature sse4.2|avx2|neon — enables the
+    # std.simd intrinsic fast paths in gen_call and const-folds
+    # has_feature() calls.
+    target_feature: str,
+    # simd_helpers_main / simd_helpers_alt / simd_helpers_plain: the C
+    # lines of the emitted SIMD helpers — main = the x86 intrinsic
+    # bodies (in the #if x86 branch), alt = the scalar fallbacks (in the
+    # #else branch), plain = arch-independent kernels (gather/scatter —
+    # emitted in BOTH branches) — assembled by simd_helper_lines and
+    # spliced in after the clone bodies.
+    simd_helpers_main: list[str],
+    simd_helpers_alt: list[str],
+    simd_helpers_plain: list[str],
+    # simd_helper_names: helper names already emitted (dedup).
+    simd_helper_names: list[str]
 }
 
 fn new_ctx(src: str) -> Ctx {
@@ -280,7 +296,9 @@ fn new_ctx(src: str) -> Ctx {
         pgo_fn_sizes: map_new(),
         pgo_slit_n: 0, pgo_slits: [],
         lto_mode: false, lto_calls: map_new(), lto_fn_start: map_new(),
-        lto_inline_n: 0, lto_dropped: 0, lto_inlined_report: []
+        lto_inline_n: 0, lto_dropped: 0, lto_inlined_report: [],
+        target_feature: "", simd_helpers_main: [], simd_helpers_alt: [],
+        simd_helpers_plain: [], simd_helper_names: []
     }
 }
 
@@ -1946,6 +1964,8 @@ fn is_builtin_fn(n: str) -> bool {
         # (the old accumulating HLS-level join was quadratic and dominated
         # the bootstrap's compile time).
         || n == "join"
+    # Stage 21 (v0.37.0-alpha): SIMD feature dispatch builtins.
+    || n == "has_feature" || n == "simd_cpu_supports"
 }
 
 fn list_has(list: list[str], x: str) -> bool {
@@ -5003,6 +5023,29 @@ fn check_builtin_call(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, 
     if name == "spawn" {
         return check_spawn_call(ctx, env, cur, e)
     }
+    # Stage 21 (v0.37.0-alpha): has_feature("avx2") -> bool — a
+    # compile-time constant (const-folded by the codegen from the
+    # --target-feature flag), so the argument must be a STRING LITERAL.
+    # Pure (no effects). Mirrors cfg(feature) dispatch.
+    if name == "has_feature" {
+        if ctx.exprs[e].args.len() != 1 {
+            cerr(line, "has_feature() expects 1 argument (a feature name)")
+        }
+        if ctx.exprs[ctx.exprs[e].args.get(0)].kind != "str" {
+            cerr(line, "has_feature() expects a string literal (it is a compile-time constant)")
+        }
+        check_expr(ctx, env, cur, ctx.exprs[e].args.get(0), "str")
+        return "bool"
+    }
+    # Stage 21: simd_cpu_supports("avx2") -> bool — a runtime CPU probe
+    # (CPUID on x86; NEON compile-time check on aarch64). Pure.
+    if name == "simd_cpu_supports" {
+        if ctx.exprs[e].args.len() != 1 {
+            cerr(line, "simd_cpu_supports() expects 1 argument (a feature name)")
+        }
+        check_expr(ctx, env, cur, ctx.exprs[e].args.get(0), "str")
+        return "bool"
+    }
     # Stage 19 (v0.35.0-alpha): join(list[str], sep) -> str — pure, O(n).
     # Handled BEFORE the generic argument-evaluation loop so an empty
     # list literal `[]` infers list[str] from the expected type.
@@ -6336,6 +6379,31 @@ fn runtime_lines() -> list[str] {
     # sandbox is set at program startup via hl_set_sandbox_root() —
     # boot.py --sandbox DIR emits the call in main().
     r.push("static char* hl_sandbox_root = NULL;")
+    # Stage 21 (v0.37.0-alpha): runtime CPU feature probe. On x86-64 /
+    # x86 it uses gcc/clang's __builtin_cpu_supports (CPU + OS support);
+    # on aarch64 it reports "neon" when the compiler targets NEON (the
+    # SIMD instruction set is baseline there but still gate-able); every
+    # other architecture reports false. Used by simd_cpu_supports() —
+    # the runtime-dispatch half of cfg(feature).
+    r.push("static bool hl_simd_cpu_supports(hl_str* s) {")
+    r.push("    if (!s) return false;")
+    r.push("#define HL_FEAT_EQ(lit) \\")
+    r.push("    (s->len == (int64_t)sizeof(lit) - 1 && memcmp(s->data, lit, sizeof(lit) - 1) == 0)")
+    r.push("#if defined(__x86_64__) || defined(__i386__)")
+    r.push("    if (HL_FEAT_EQ(\"avx\")) return __builtin_cpu_supports(\"avx\");")
+    r.push("    if (HL_FEAT_EQ(\"avx2\")) return __builtin_cpu_supports(\"avx2\");")
+    r.push("    if (HL_FEAT_EQ(\"sse3\")) return __builtin_cpu_supports(\"sse3\");")
+    r.push("    if (HL_FEAT_EQ(\"sse4.2\")) return __builtin_cpu_supports(\"sse4.2\");")
+    r.push("    return false;")
+    r.push("#elif defined(__aarch64__)")
+    r.push("    if (HL_FEAT_EQ(\"neon\")) return true; /* NEON is baseline on aarch64 */")
+    r.push("    return false;")
+    r.push("#else")
+    r.push("    return false;")
+    r.push("#endif")
+    r.push("#undef HL_FEAT_EQ")
+    r.push("}")
+    r.push("")
     r.push("static void hl_set_sandbox_root(const char* dir) {")
     r.push("    if (hl_sandbox_root) { free(hl_sandbox_root); hl_sandbox_root = NULL; }")
     r.push("    if (dir) {")
@@ -8664,6 +8732,458 @@ fn pgo_fn_inline(ctx: Ctx, key: str) -> bool {
     return ctx.pgo_fn_sizes.get_or(key, 0) <= 40
 }
 
+# ============================================================================
+# STAGE 21 (v0.37.0-alpha): SIMD INTRINSIC FAST PATHS (--target-feature)
+# ----------------------------------------------------------------------------
+# Under --target-feature sse4.2|avx2, calls to the std.simd kernels
+# (matched by name AND argument types, so user-defined functions with
+# different signatures are never hijacked) are redirected to C helpers
+# with per-function target attributes using native vector intrinsics —
+# identical semantics to the portable HLS implementation (per-lane
+# wrapping arithmetic, range-checked lane entry, 4-wide gather/scatter
+# bounds checks). Programs compiled without the flag, or for an
+# architecture without matching intrinsics, use the scalar C fallback
+# (still much faster than the bit-by-bit portable HLS path).
+# NEON (aarch64) intrinsic tuning is Stage 25 ("AArch64 backend tuning").
+# ============================================================================
+
+# simd_redirectable: does this call site look like the std.simd kernel?
+# Name match AND argument-type match (the flat namespace convention:
+# std.simd owns the simd_* prefix; a user fn with a different signature
+# is never redirected).
+fn simd_redirectable(ctx: Ctx, name: str, e: int) -> bool {
+    if name == "simd_i32x4_add" || name == "simd_i32x4_sub" || name == "simd_i32x4_mul"
+        || name == "simd_i32x4_min" || name == "simd_i32x4_max" {
+        return ctx.exprs[e].args.len() == 2
+            && ctx.exprs[ctx.exprs[e].args.get(0)].t == "I32x4"
+            && ctx.exprs[ctx.exprs[e].args.get(1)].t == "I32x4"
+    }
+    if name == "simd_f64x2_add" || name == "simd_f64x2_sub" || name == "simd_f64x2_mul" {
+        return ctx.exprs[e].args.len() == 2
+            && ctx.exprs[ctx.exprs[e].args.get(0)].t == "F64x2"
+            && ctx.exprs[ctx.exprs[e].args.get(1)].t == "F64x2"
+    }
+    if name == "simd_i32x4_gather" {
+        return ctx.exprs[e].args.len() == 2
+            && ctx.exprs[ctx.exprs[e].args.get(0)].t == "list[int]"
+            && ctx.exprs[ctx.exprs[e].args.get(1)].t == "int"
+    }
+    if name == "simd_f64x2_gather" {
+        return ctx.exprs[e].args.len() == 2
+            && ctx.exprs[ctx.exprs[e].args.get(0)].t == "list[float]"
+            && ctx.exprs[ctx.exprs[e].args.get(1)].t == "int"
+    }
+    if name == "simd_correlate8_sum_i32x4" {
+        return ctx.exprs[e].args.len() == 9
+            && ctx.exprs[e].t == "int"
+            && ctx.exprs[ctx.exprs[e].args.get(0)].t == "list[int]"
+    }
+    if name == "simd_transform_sum_i32x4" {
+        return ctx.exprs[e].args.len() == 4
+            && ctx.exprs[e].t == "int"
+            && ctx.exprs[ctx.exprs[e].args.get(0)].t == "list[int]"
+            && ctx.exprs[ctx.exprs[e].args.get(1)].t == "list[int]"
+            && ctx.exprs[ctx.exprs[e].args.get(2)].t == "int"
+            && ctx.exprs[ctx.exprs[e].args.get(3)].t == "int"
+    }
+    if name == "simd_i32x4_scatter" {
+        return ctx.exprs[e].args.len() == 3
+            && ctx.exprs[e].t == "void"
+            && ctx.exprs[ctx.exprs[e].args.get(0)].t == "list[int]"
+            && ctx.exprs[ctx.exprs[e].args.get(1)].t == "int"
+            && ctx.exprs[ctx.exprs[e].args.get(2)].t == "I32x4"
+    }
+    if name == "simd_f64x2_scatter" {
+        return ctx.exprs[e].args.len() == 3
+            && ctx.exprs[e].t == "void"
+            && ctx.exprs[ctx.exprs[e].args.get(0)].t == "list[float]"
+            && ctx.exprs[ctx.exprs[e].args.get(1)].t == "int"
+            && ctx.exprs[ctx.exprs[e].args.get(2)].t == "F64x2"
+    }
+    return false
+}
+
+# simd_try_redirect: if the call matches a kernel, register (once) the
+# intrinsic helper and return the C call expression ("" = no redirect).
+fn simd_try_redirect(ctx: Ctx, name: str, e: int) -> str {
+    if !simd_redirectable(ctx, name, e) {
+        return ""
+    }
+    let helper: str = "hl_" + name
+    if !list_has(ctx.simd_helper_names, helper) {
+        ctx.simd_helper_names.push(helper)
+        simd_emit_helper(ctx, name)
+    }
+    return helper + "(" + gen_own_args_c(ctx, e) + ")"
+}
+
+# simd_emit_i32x4_ew: one elementwise i32x4 kernel — intrinsic body into
+# simd_helpers_main, scalar body into simd_helpers_alt.
+fn simd_emit_i32x4_ew(ctx: Ctx, name: str, intrinsic: str) -> void {
+    let m: list[str] = ctx.simd_helpers_main
+    let a: list[str] = ctx.simd_helpers_alt
+    m.push("/* " + name + " */")
+    m.push("__attribute__((target(\"" + ctx.target_feature + "\"))) static I32x4* hl_" + name + "(I32x4* x_p, I32x4* y_p) {")
+    m.push("    I32x4* x = x_p;")
+    m.push("    I32x4* y = y_p;")
+    m.push("    I32x4* r = usf_new_I32x4(0, 0);")
+    m.push("    __m128i va = _mm_set_epi64x(x->b, x->a);")
+    m.push("    __m128i vb = _mm_set_epi64x(y->b, y->a);")
+    m.push("    __m128i c = " + intrinsic + "(va, vb);")
+    m.push("    r->a = _mm_cvtsi128_si64(c);")
+    m.push("    r->b = _mm_cvtsi128_si64(_mm_unpackhi_epi64(c, c));")
+    m.push("    hl_release_I32x4(x);")
+    m.push("    hl_release_I32x4(y);")
+    m.push("    return r;")
+    m.push("}")
+    a.push("/* " + name + " (scalar fallback) */")
+    a.push("static I32x4* hl_" + name + "(I32x4* x_p, I32x4* y_p) {")
+    a.push("    I32x4* x = x_p; I32x4* y = y_p;")
+    a.push("    I32x4* r = usf_new_I32x4(0, 0);")
+    a.push("    int32_t la[4] = { (int32_t)(uint32_t)x->a, (int32_t)(uint32_t)(x->a >> 32),")
+    a.push("                       (int32_t)(uint32_t)x->b, (int32_t)(uint32_t)(x->b >> 32) };")
+    a.push("    int32_t lb[4] = { (int32_t)(uint32_t)y->a, (int32_t)(uint32_t)(y->a >> 32),")
+    a.push("                       (int32_t)(uint32_t)y->b, (int32_t)(uint32_t)(y->b >> 32) };")
+    if name == "simd_i32x4_min" {
+        a.push("    int32_t lr[4];")
+        a.push("    for (int k = 0; k < 4; k++) lr[k] = la[k] < lb[k] ? la[k] : lb[k];")
+    } else if name == "simd_i32x4_max" {
+        a.push("    int32_t lr[4];")
+        a.push("    for (int k = 0; k < 4; k++) lr[k] = la[k] > lb[k] ? la[k] : lb[k];")
+    } else {
+        let mut c_op: str = "+"
+        if name == "simd_i32x4_sub" {
+            c_op = "-"
+        } else if name == "simd_i32x4_mul" {
+            c_op = "*"
+        }
+        a.push("    uint32_t lr[4];")
+        a.push("    for (int k = 0; k < 4; k++) lr[k] = (uint32_t)((uint64_t)(uint32_t)la[k] " + c_op + " (uint64_t)(uint32_t)lb[k]);")
+    }
+    a.push("    r->a = (int64_t)((uint64_t)(uint32_t)lr[0] | ((uint64_t)(uint32_t)lr[1] << 32));")
+    a.push("    r->b = (int64_t)((uint64_t)(uint32_t)lr[2] | ((uint64_t)(uint32_t)lr[3] << 32));")
+    a.push("    hl_release_I32x4(x); hl_release_I32x4(y);")
+    a.push("    return r;")
+    a.push("}")
+}
+
+# simd_emit_f64x2_ew: one elementwise f64x2 kernel.
+fn simd_emit_f64x2_ew(ctx: Ctx, name: str, intrinsic: str) -> void {
+    let m: list[str] = ctx.simd_helpers_main
+    let a: list[str] = ctx.simd_helpers_alt
+    let mut c_op: str = "+"
+    if name == "simd_f64x2_sub" {
+        c_op = "-"
+    } else if name == "simd_f64x2_mul" {
+        c_op = "*"
+    }
+    m.push("/* " + name + " */")
+    m.push("__attribute__((target(\"" + ctx.target_feature + "\"))) static F64x2* hl_" + name + "(F64x2* x_p, F64x2* y_p) {")
+    m.push("    F64x2* x = x_p; F64x2* y = y_p;")
+    m.push("    F64x2* r = usf_new_F64x2(0.0, 0.0);")
+    m.push("    __m128d va = _mm_loadu_pd(&x->a);")
+    m.push("    __m128d vb = _mm_loadu_pd(&y->a);")
+    m.push("    __m128d c = " + intrinsic + "(va, vb);")
+    m.push("    _mm_storeu_pd(&r->a, c);")
+    m.push("    hl_release_F64x2(x); hl_release_F64x2(y);")
+    m.push("    return r;")
+    m.push("}")
+    a.push("/* " + name + " (scalar fallback) */")
+    a.push("static F64x2* hl_" + name + "(F64x2* x_p, F64x2* y_p) {")
+    a.push("    F64x2* x = x_p; F64x2* y = y_p;")
+    a.push("    F64x2* r = usf_new_F64x2(0.0, 0.0);")
+    a.push("    r->a = x->a " + c_op + " y->a;")
+    a.push("    r->b = x->b " + c_op + " y->b;")
+    a.push("    hl_release_F64x2(x); hl_release_F64x2(y);")
+    a.push("    return r;")
+    a.push("}")
+}
+
+# simd_emit_helper: dispatch one kernel into the main/alt lists. The
+# gather/scatter kernels are arch-independent (plain C field work — the
+# win is eliminating the per-element runtime calls), so they go into
+# BOTH lists (guarded only by the #if/#else split for tidiness).
+fn simd_emit_helper(ctx: Ctx, name: str) -> void {
+    if name == "simd_i32x4_add" {
+        simd_emit_i32x4_ew(ctx, name, "_mm_add_epi32")
+        return
+    }
+    if name == "simd_i32x4_sub" {
+        simd_emit_i32x4_ew(ctx, name, "_mm_sub_epi32")
+        return
+    }
+    if name == "simd_i32x4_mul" {
+        simd_emit_i32x4_ew(ctx, name, "_mm_mullo_epi32")
+        return
+    }
+    if name == "simd_i32x4_min" {
+        simd_emit_i32x4_ew(ctx, name, "_mm_min_epi32")
+        return
+    }
+    if name == "simd_i32x4_max" {
+        simd_emit_i32x4_ew(ctx, name, "_mm_max_epi32")
+        return
+    }
+    if name == "simd_f64x2_add" {
+        simd_emit_f64x2_ew(ctx, name, "_mm_add_pd")
+        return
+    }
+    if name == "simd_f64x2_sub" {
+        simd_emit_f64x2_ew(ctx, name, "_mm_sub_pd")
+        return
+    }
+    if name == "simd_f64x2_mul" {
+        simd_emit_f64x2_ew(ctx, name, "_mm_mul_pd")
+        return
+    }
+    if name == "simd_i32x4_gather" {
+        let b: list[str] = ctx.simd_helpers_plain
+        b.push("/* " + name + " */")
+        b.push("static I32x4* hl_" + name + "(hl_list* xs_p, int64_t i) {")
+        b.push("    hl_list* xs = xs_p;")
+        b.push("    if (i < 0 || i + 4 > xs->len) hl_die(\"simd gather out of bounds\");")
+        b.push("    int64_t v[4];")
+        b.push("    for (int k = 0; k < 4; k++) {")
+        b.push("        v[k] = hl_unbox_i64(xs->items[i + k]);")
+        b.push("        if (v[k] < INT32_MIN || v[k] > INT32_MAX)")
+        b.push("            hl_die(\"simd i32x4 lane out of range\");")
+        b.push("    }")
+        b.push("    I32x4* r = usf_new_I32x4(0, 0);")
+        b.push("    r->a = (int64_t)((uint32_t)v[0] | ((uint64_t)(uint32_t)v[1] << 32));")
+        b.push("    r->b = (int64_t)((uint32_t)v[2] | ((uint64_t)(uint32_t)v[3] << 32));")
+        b.push("    hl_list_release(xs);")
+        b.push("    return r;")
+        b.push("}")
+        return
+    }
+    if name == "simd_f64x2_gather" {
+        let b: list[str] = ctx.simd_helpers_plain
+        b.push("/* " + name + " */")
+        b.push("static F64x2* hl_" + name + "(hl_list* xs_p, int64_t i) {")
+        b.push("    hl_list* xs = xs_p;")
+        b.push("    if (i < 0 || i + 2 > xs->len) hl_die(\"simd gather out of bounds\");")
+        b.push("    F64x2* r = usf_new_F64x2(hl_unbox_f64(xs->items[i]), hl_unbox_f64(xs->items[i + 1]));")
+        b.push("    hl_list_release(xs);")
+        b.push("    return r;")
+        b.push("}")
+        return
+    }
+    if name == "simd_correlate8_sum_i32x4" {
+        let m: list[str] = ctx.simd_helpers_main
+        let a: list[str] = ctx.simd_helpers_alt
+        m.push("/* " + name + " - 8-tap correlation (canonical FIR vectorisation). */")
+        m.push("__attribute__((target(\"" + ctx.target_feature + "\"))) static int64_t hl_" + name + "(hl_list* xs_p, int64_t w0, int64_t w1, int64_t w2, int64_t w3, int64_t w4, int64_t w5, int64_t w6, int64_t w7) {")
+        m.push("    hl_list* xs = xs_p;")
+        m.push("    int64_t ws[8] = { w0, w1, w2, w3, w4, w5, w6, w7 };")
+        m.push("    for (int q = 0; q < 8; q++)")
+        m.push("        if (ws[q] < INT32_MIN || ws[q] > INT32_MAX)")
+        m.push("            hl_die(\"simd_correlate8_sum_i32x4: weight out of int32 range\");")
+        m.push("    __m128i vw[8];")
+        m.push("    for (int q = 0; q < 8; q++) vw[q] = _mm_set1_epi32((int32_t)ws[q]);")
+        m.push("    int64_t n = xs->len;")
+        m.push("    int64_t i = 0;")
+        m.push("    __m128i acc0 = _mm_setzero_si128();")
+        m.push("    __m128i acc1 = _mm_setzero_si128();")
+        m.push("    for (; i + 11 <= n; i += 4) {")
+        m.push("        __m128i vac = _mm_setzero_si128();")
+        m.push("        for (int t = 0; t < 8; t++) {")
+        m.push("            int64_t a0 = hl_unbox_i64(xs->items[i+t]);")
+        m.push("            int64_t a1 = hl_unbox_i64(xs->items[i+t+1]);")
+        m.push("            int64_t a2 = hl_unbox_i64(xs->items[i+t+2]);")
+        m.push("            int64_t a3 = hl_unbox_i64(xs->items[i+t+3]);")
+        m.push("            if (((((uint64_t)a0 + 0x80000000u) | ((uint64_t)a1 + 0x80000000u)")
+        m.push("                 | ((uint64_t)a2 + 0x80000000u) | ((uint64_t)a3 + 0x80000000u))")
+        m.push("                > 0xFFFFFFFFu)) hl_die(\"simd i32x4 lane out of range\");")
+        m.push("            __m128i win = _mm_set_epi32((int32_t)a3, (int32_t)a2, (int32_t)a1, (int32_t)a0);")
+        m.push("            vac = _mm_add_epi32(vac, _mm_mullo_epi32(win, vw[t]));")
+        m.push("        }")
+        m.push("        acc0 = _mm_add_epi64(acc0, _mm_cvtepi32_epi64(vac));")
+        m.push("        acc1 = _mm_add_epi64(acc1, _mm_cvtepi32_epi64(")
+        m.push("            _mm_shuffle_epi32(vac, _MM_SHUFFLE(0,0,3,2))));")
+        m.push("    }")
+        m.push("    int64_t lo[2], hi[2];")
+        m.push("    _mm_storeu_si128((__m128i*)lo, acc0);")
+        m.push("    _mm_storeu_si128((__m128i*)hi, acc1);")
+        m.push("    int64_t total = lo[0] + lo[1] + hi[0] + hi[1];")
+        m.push("    for (; i + 8 <= n; i++) {")
+        m.push("        total += hl_unbox_i64(xs->items[i]) * w0 + hl_unbox_i64(xs->items[i+1]) * w1")
+        m.push("                + hl_unbox_i64(xs->items[i+2]) * w2 + hl_unbox_i64(xs->items[i+3]) * w3")
+        m.push("                + hl_unbox_i64(xs->items[i+4]) * w4 + hl_unbox_i64(xs->items[i+5]) * w5")
+        m.push("                + hl_unbox_i64(xs->items[i+6]) * w6 + hl_unbox_i64(xs->items[i+7]) * w7;")
+        m.push("    }")
+        m.push("    hl_list_release(xs);")
+        m.push("    return total;")
+        m.push("}")
+        a.push("/* " + name + " (scalar fallback) */")
+        a.push("static int64_t hl_" + name + "(hl_list* xs_p, int64_t w0, int64_t w1, int64_t w2, int64_t w3, int64_t w4, int64_t w5, int64_t w6, int64_t w7) {")
+        a.push("    hl_list* xs = xs_p;")
+        a.push("    int64_t ws[8] = { w0, w1, w2, w3, w4, w5, w6, w7 };")
+        a.push("    for (int q = 0; q < 8; q++)")
+        a.push("        if (ws[q] < INT32_MIN || ws[q] > INT32_MAX)")
+        a.push("            hl_die(\"simd_correlate8_sum_i32x4: weight out of int32 range\");")
+        a.push("    int64_t total = 0;")
+        a.push("    int64_t n = xs->len;")
+        a.push("    for (int64_t i = 0; i + 8 <= n; i++) {")
+        a.push("        int64_t s = 0;")
+        a.push("        for (int t = 0; t < 8; t++) {")
+        a.push("            int64_t v = hl_unbox_i64(xs->items[i+t]);")
+        a.push("            if (v < INT32_MIN || v > INT32_MAX)")
+        a.push("                hl_die(\"simd i32x4 lane out of range\");")
+        a.push("            s += (int64_t)(int32_t)((uint32_t)v * (uint32_t)ws[t]);")
+        a.push("        }")
+        a.push("        total += (int64_t)(int32_t)(uint32_t)s;")
+        a.push("    }")
+        a.push("    hl_list_release(xs);")
+        a.push("    return total;")
+        a.push("}")
+        return
+    }
+    if name == "simd_transform_sum_i32x4" {
+        let m: list[str] = ctx.simd_helpers_main
+        let p: list[str] = ctx.simd_helpers_alt
+        m.push("/* " + name + " - the fused whole-loop kernel (Stage 21 acceptance). */")
+        m.push("__attribute__((target(\"" + ctx.target_feature + "\"))) static int64_t hl_" + name + "(hl_list* xs_p, hl_list* ys_p, int64_t k, int64_t sub) {")
+        m.push("    hl_list* xs = xs_p; hl_list* ys = ys_p;")
+        m.push("    if (xs->len != ys->len) hl_die(\"simd_transform_sum_i32x4: length mismatch\");")
+        m.push("    if (k < INT32_MIN || k > INT32_MAX) hl_die(\"simd_transform_sum_i32x4: k out of int32 range\");")
+        m.push("    if (sub < INT32_MIN || sub > INT32_MAX) hl_die(\"simd_transform_sum_i32x4: sub out of int32 range\");")
+        m.push("    int64_t total = 0;")
+        m.push("    int64_t n = xs->len;")
+        m.push("    int64_t i = 0;")
+        m.push("    __m128i vk = _mm_set1_epi32((int32_t)k);")
+        m.push("    __m128i vs = _mm_set1_epi32((int32_t)sub);")
+        m.push("    /* 2x64-bit lane accumulators (paddq, SSE2): lanes 0-1 and 2-3")
+        m.push("       of each 4-wide term, sign-extended, accumulated in exact")
+        m.push("       int64 (max term ~2^27, 1M terms -> < 2^47, no overflow). */")
+        m.push("    __m128i acc0 = _mm_setzero_si128();")
+        m.push("    __m128i acc1 = _mm_setzero_si128();")
+        m.push("    for (; i + 4 <= n; i += 4) {")
+        m.push("        int64_t a0 = hl_unbox_i64(xs->items[i]);")
+        m.push("        int64_t a1 = hl_unbox_i64(xs->items[i+1]);")
+        m.push("        int64_t a2 = hl_unbox_i64(xs->items[i+2]);")
+        m.push("        int64_t a3 = hl_unbox_i64(xs->items[i+3]);")
+        m.push("        int64_t b0 = hl_unbox_i64(ys->items[i]);")
+        m.push("        int64_t b1 = hl_unbox_i64(ys->items[i+1]);")
+        m.push("        int64_t b2 = hl_unbox_i64(ys->items[i+2]);")
+        m.push("        int64_t b3 = hl_unbox_i64(ys->items[i+3]);")
+        m.push("        /* biased-OR range check: v in [INT32_MIN, INT32_MAX] iff")
+        m.push("           (uint64_t)v + 0x80000000u <= 0xFFFFFFFF; the OR of the")
+        m.push("           biased values is in range iff EVERY value is. */")
+        m.push("        if (((((uint64_t)a0 + 0x80000000u) | ((uint64_t)a1 + 0x80000000u)")
+        m.push("             | ((uint64_t)a2 + 0x80000000u) | ((uint64_t)a3 + 0x80000000u)")
+        m.push("             | ((uint64_t)b0 + 0x80000000u) | ((uint64_t)b1 + 0x80000000u)")
+        m.push("             | ((uint64_t)b2 + 0x80000000u) | ((uint64_t)b3 + 0x80000000u))")
+        m.push("            > 0xFFFFFFFFu)) hl_die(\"simd i32x4 lane out of range\");")
+        m.push("        __m128i va = _mm_set_epi32((int32_t)a3, (int32_t)a2, (int32_t)a1, (int32_t)a0);")
+        m.push("        __m128i vb = _mm_set_epi32((int32_t)b3, (int32_t)b2, (int32_t)b1, (int32_t)b0);")
+        m.push("        __m128i t = _mm_add_epi32(va, _mm_sub_epi32(_mm_mullo_epi32(vb, vk), vs));")
+        m.push("        acc0 = _mm_add_epi64(acc0, _mm_cvtepi32_epi64(t));")
+        m.push("        acc1 = _mm_add_epi64(acc1, _mm_cvtepi32_epi64(")
+        m.push("            _mm_shuffle_epi32(t, _MM_SHUFFLE(0,0,3,2))));")
+        m.push("    }")
+        m.push("    int64_t lo[2], hi[2];")
+        m.push("    _mm_storeu_si128((__m128i*)lo, acc0);")
+        m.push("    _mm_storeu_si128((__m128i*)hi, acc1);")
+        m.push("    total = lo[0] + lo[1] + hi[0] + hi[1];")
+        m.push("    for (; i < n; i++) {")
+        m.push("        int64_t a = hl_unbox_i64(xs->items[i]);")
+        m.push("        int64_t b = hl_unbox_i64(ys->items[i]);")
+        m.push("        if (a < INT32_MIN || a > INT32_MAX || b < INT32_MIN || b > INT32_MAX)")
+        m.push("            hl_die(\"simd i32x4 lane out of range\");")
+        m.push("        total += a + b * k - sub;")
+        m.push("    }")
+        m.push("    hl_list_release(xs); hl_list_release(ys);")
+        m.push("    return total;")
+        m.push("}")
+        p.push("/* " + name + " (scalar fallback) */")
+        p.push("static int64_t hl_" + name + "(hl_list* xs_p, hl_list* ys_p, int64_t k, int64_t sub) {")
+        p.push("    hl_list* xs = xs_p; hl_list* ys = ys_p;")
+        p.push("    if (xs->len != ys->len) hl_die(\"simd_transform_sum_i32x4: length mismatch\");")
+        p.push("    if (k < INT32_MIN || k > INT32_MAX) hl_die(\"simd_transform_sum_i32x4: k out of int32 range\");")
+        p.push("    if (sub < INT32_MIN || sub > INT32_MAX) hl_die(\"simd_transform_sum_i32x4: sub out of int32 range\");")
+        p.push("    int64_t total = 0;")
+        p.push("    int64_t n = xs->len;")
+        p.push("    for (int64_t i = 0; i < n; i++) {")
+        p.push("        int64_t a = hl_unbox_i64(xs->items[i]);")
+        p.push("        int64_t b = hl_unbox_i64(ys->items[i]);")
+        p.push("        if (a < INT32_MIN || a > INT32_MAX || b < INT32_MIN || b > INT32_MAX)")
+        p.push("            hl_die(\"simd i32x4 lane out of range\");")
+        p.push("        int64_t term = a + (int64_t)(int32_t)((uint32_t)b * (uint32_t)k) - sub;")
+        p.push("        total += (int64_t)(int32_t)(uint32_t)term;")
+        p.push("    }")
+        p.push("    hl_list_release(xs); hl_list_release(ys);")
+        p.push("    return total;")
+        p.push("}")
+        return
+    }
+    if name == "simd_i32x4_scatter" {
+        let b: list[str] = ctx.simd_helpers_plain
+        b.push("/* " + name + " */")
+        b.push("static void hl_" + name + "(hl_list* xs_p, int64_t i, I32x4* v_p) {")
+        b.push("    hl_list* xs = xs_p;")
+        b.push("    I32x4* v = v_p;")
+        b.push("    if (i < 0 || i + 4 > xs->len) hl_die(\"simd scatter out of bounds\");")
+        b.push("    int64_t lane[4] = { (int64_t)(int32_t)(uint32_t)v->a, (int64_t)(int32_t)(uint32_t)(v->a >> 32),")
+        b.push("                       (int64_t)(int32_t)(uint32_t)v->b, (int64_t)(int32_t)(uint32_t)(v->b >> 32) };")
+        b.push("    for (int k = 0; k < 4; k++) {")
+        b.push("        if (xs->elem_free) xs->elem_free(xs->items[i + k]);")
+        b.push("        xs->items[i + k] = hl_box_i64(lane[k]);")
+        b.push("    }")
+        b.push("    hl_release_I32x4(v);")
+        b.push("    hl_list_release(xs);")
+        b.push("}")
+        return
+    }
+    if name == "simd_f64x2_scatter" {
+        let b: list[str] = ctx.simd_helpers_plain
+        b.push("/* " + name + " */")
+        b.push("static void hl_" + name + "(hl_list* xs_p, int64_t i, F64x2* v_p) {")
+        b.push("    hl_list* xs = xs_p;")
+        b.push("    F64x2* v = v_p;")
+        b.push("    if (i < 0 || i + 2 > xs->len) hl_die(\"simd scatter out of bounds\");")
+        b.push("    if (xs->elem_free) xs->elem_free(xs->items[i]);")
+        b.push("    xs->items[i] = hl_box_f64(v->a);")
+        b.push("    if (xs->elem_free) xs->elem_free(xs->items[i + 1]);")
+        b.push("    xs->items[i + 1] = hl_box_f64(v->b);")
+        b.push("    hl_release_F64x2(v);")
+        b.push("    hl_list_release(xs);")
+        b.push("}")
+        return
+    }
+}
+
+# simd_helper_lines: assemble the final C block (prologue + main + alt
+# with the arch #if/#else/#endif split, or scalar-only for neon).
+fn simd_helper_lines(ctx: Ctx) -> list[str] {
+    let out: list[str] = []
+    if ctx.simd_helper_names.len() == 0 {
+        return out
+    }
+    let x86: bool = ctx.target_feature == "sse4.2" || ctx.target_feature == "avx2"
+    out.push("// ===== Stage 21 (v0.37.0-alpha): std.simd intrinsic fast paths =====")
+    out.push("//      --target-feature " + ctx.target_feature
+        + " — semantics identical to the portable std/simd.hls path.")
+    if x86 {
+        out.push("#if defined(__x86_64__) || defined(__i386__)")
+        out.push("#include <immintrin.h>")
+        concat_lines(out, ctx.simd_helpers_main)
+        concat_lines(out, ctx.simd_helpers_plain)
+        out.push("#else")
+        out.push("// non-x86 host: portable scalar fallback (NEON tuning: Stage 25).")
+        concat_lines(out, ctx.simd_helpers_alt)
+        concat_lines(out, ctx.simd_helpers_plain)
+        out.push("#endif")
+    } else {
+        out.push("// NEON intrinsic tuning is Stage 25 (AArch64 backend); the")
+        out.push("// arch-independent fast paths below eliminate the per-element")
+        out.push("// runtime calls on every host.")
+        concat_lines(out, ctx.simd_helpers_alt)
+        concat_lines(out, ctx.simd_helpers_plain)
+    }
+    out.push("")
+    return out
+}
+
 # pgo_dump_lines: the C lines for the --pgo-generate profile dumper —
 # the site-id table + __hlc_pgo_dump(). Emitted after all function
 # bodies (so the site list is complete) and before main (which
@@ -9426,6 +9946,15 @@ fn gen_call(ctx: Ctx, e: int) -> str {
         }
         # Stage 8-beta: user fn params OWN one retain of each argument —
         # fresh values are passed raw, borrowed values retain-wrapped.
+        # Stage 21 (v0.37.0-alpha): --target-feature — std.simd kernel
+        # calls redirect to the intrinsic helpers (identical semantics,
+        # native vector code; helpers own their args like user fns).
+        if ctx.target_feature != "" {
+            let redirected: str = simd_try_redirect(ctx, ctx.exprs[e].mkey, e)
+            if redirected != "" {
+                return redirected
+            }
+        }
         # Stage 20 (v0.36.0-alpha): count the emitted out-of-line call
         # (LTO phase-B DCE drops standalone bodies at 0).
         lto_note_call(ctx, ctx.exprs[e].mkey)
@@ -9480,6 +10009,21 @@ fn gen_call(ctx: Ctx, e: int) -> str {
     if name == "join" {
         return "hl_str_join(" + args + ")"
     }
+    # Stage 21 (v0.37.0-alpha): has_feature — const-folded from the
+    # --target-feature flag. Exact-match semantics (asking for "avx2"
+    # is true only when avx2 was requested).
+    if name == "has_feature" {
+        if ctx.target_feature == ctx.exprs[ctx.exprs[e].args.get(0)].sval {
+            return "true"
+        }
+        return "false"
+    }
+    # Stage 21: simd_cpu_supports — runtime CPU probe.
+    if name == "simd_cpu_supports" {
+        return "hl_simd_cpu_supports(" + args + ")"
+    }
+    # (Stage 21 redirect lives in the muser branch above — user fn
+    # calls return before reaching the builtin section.)
     if name == "map_new" {
         # Stage 8-beta: the map owns its values — val_free comes from the
         # map's value type (the checker types this call from context).
@@ -11987,6 +12531,13 @@ fn gen_program(ctx: Ctx) -> list[str] {
     }
     # 2e. Stage 8-beta: clone() per-instantiation helper bodies.
     concat_lines(final, gen_clone_bodies(ctx))
+    # 2e-bis. Stage 21 (v0.37.0-alpha): std.simd intrinsic fast paths
+    # (--target-feature). Emitted after the struct definitions + clone
+    # bodies so the helpers can use the struct types, their constructors
+    # and their release functions.
+    if ctx.simd_helper_names.len() > 0 {
+        concat_lines(final, simd_helper_lines(ctx))
+    }
     concat_lines(final, gen_proto_lines(ctx))
     # 2e-bis. Stage 16: spawn-site helpers (arg structs + trampolines),
     # collected while the fn bodies above were generated. Emitted AFTER
@@ -12198,6 +12749,7 @@ fn main() -> int uses IO {
     let mut pgo_gen: bool = false
     let mut pgo_use_path: str = ""
     let mut lto_mode: bool = false
+    let mut target_feature: str = ""
     let a: list[str] = []
     let mut ai: int = 1
     while ai < argv.len() {
@@ -12212,6 +12764,25 @@ fn main() -> int uses IO {
             # Stage 20 (v0.36.0-alpha): link-time optimisation across
             # crates — cross-crate inlining + whole-program DCE.
             lto_mode = true
+        } else if tok == "--target-feature" {
+            # Stage 21 (v0.37.0-alpha): enable the std.simd intrinsic
+            # fast paths + const-fold has_feature().
+            if ai + 1 >= argv.len() {
+                println("error: --target-feature expects a feature name (sse4.2 | avx2 | neon)")
+                return 2
+            }
+            let feat: str = argv.get(ai + 1)
+            if feat == "+sse4.2" || feat == "sse4.2" {
+                target_feature = "sse4.2"
+            } else if feat == "+avx2" || feat == "avx2" {
+                target_feature = "avx2"
+            } else if feat == "+neon" || feat == "neon" {
+                target_feature = "neon"
+            } else {
+                println("error: unknown target feature '" + feat + "' (expected sse4.2 | avx2 | neon)")
+                return 2
+            }
+            ai = ai + 1
         } else if tok == "--pgo-use" {
             if ai + 1 >= argv.len() {
                 println("error: --pgo-use expects a profile file path")
@@ -12263,7 +12834,7 @@ fn main() -> int uses IO {
     }
     if a.len() < 2 {
         println("usage: hlc [--fast | -O fast] [--contracts] [--pgo-generate] [--pgo-use <profile>]")
-        println("              [--lto] <input.hls> <output.c|->")
+        println("              [--lto] [--target-feature sse4.2|avx2|neon] <input.hls> <output.c|->")
         println("       hlc --audit <input.hls>")
         return 1
     }
@@ -12276,6 +12847,7 @@ fn main() -> int uses IO {
     ctx.contracts_mode = contracts_mode
     ctx.pgo_gen = pgo_gen
     ctx.lto_mode = lto_mode
+    ctx.target_feature = target_feature
     # Stage 19: load the --pgo-use profile BEFORE codegen (the branch /
     # fn-attribute hints consult it during generation).
     if pgo_use_path != "" {

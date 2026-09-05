@@ -173,6 +173,11 @@ bin/hlc --pgo-use p.hlcprof prog.hls out2.c  # retrain codegen with the profile
 make lto F=examples/primes.hls          # whole-program inlining + DCE, then run
 bin/hlc --lto prog.hls out.c            # cross-crate inline + dead-code eliminate
 make emit-lto-ir F=examples/hello.hls   # whole-program LTO'd LLVM IR (.ll/.bc)
+
+# 16. Stage 21 (v0.37.0-alpha): SIMD vectorisation
+make simd-acceptance                    # the Stage 21 acceptance gate (>= 2x on AVX2)
+bin/hlc --target-feature avx2 bench.hls out.c    # native intrinsics for std.simd
+python3 boot/boot.py examples/simd_demo.hls      # portable std.simd everywhere
 ```
 
 ## Language example
@@ -240,6 +245,7 @@ and error handling:
 | `std.option` (Stage 7) | `enum Option[T] { Some(T), None }`, `option_unwrap`, `option_unwrap_or`, `option_is_some`, `option_is_none` |
 | `std.result` (Stage 7) | `enum Result[T, E] { Ok(T), Err(E) }`, `result_unwrap`, `result_unwrap_or`, `result_err_or`, `result_is_ok`, `result_is_err`, `int_parse(s) -> Result[int, str]`, `float_parse(s) -> Result[float, str]` |
 | `std.bits` (non-roadmap) | `bits_shl/shr/sar`, `bits_and/or/xor/not`, `bits_get/set`, `bits_popcount/clz/ctz`, `bits_byte`, `bits_bytes_be/le`, `bits_from_bytes_be/le` (HLS has no bitwise operators — these helpers are pure functions built on arithmetic) |
+| `std.simd` (Stage 21) | Explicit SIMD types `I32x4`/`F64x2`/`U8x16` (packed lanes, wrapping lane arithmetic, checked lane entry) + ops (splat/from/lane/set/add/sub/mul/min/max/shuffle/reduce/gather/scatter) + fused kernels (`simd_transform_sum_i32x4`, 8-tap FIR `simd_correlate8_sum_i32x4`); under `--target-feature avx2` the hot kernels lower to native intrinsics |
 | `std.set` (non-roadmap) | `set_str_new`, `set_str_from_list`, `set_str_add`, `set_str_contains`, `set_str_size`, `set_str_to_list`, `set_str_union`, `set_str_intersect`, `set_str_diff`, `set_str_equal` (string sets backed by `map[str, bool]`) |
 
 Each module is written in HLS itself and can be used inside `hlc` (the
@@ -293,7 +299,7 @@ Full details: [SPEC.md](SPEC.md) · Stage-by-stage roadmap:
 
 ## Status
 
-**v0.36.0-alpha — Stage 20: link-time optimisation across crates. `hlc --lto` inlines small single-return functions from imported modules at statement-level call sites (ownership bit-for-bit preserved) and drops both unreachable functions and fully-inlined standalone definitions; the acceptance binary shrinks 52% (35,344 → 17,144 bytes) with byte-identical output on all 105 ok/ programs. `--emit lto` / `make emit-lto-ir` emit the whole-program LTO'd LLVM IR; `hls-pkg build --lto` compiles packages through the pipeline. The LTO work also found and fixed a latent C-backend soundness bug (eager hoisting broke `&&`/`||` lazy short-circuiting). 578/578 tests PASS, bootstrap deterministic, differential suite byte-identical (including `--lto`).** Previous release v0.35.0-alpha delivered Stage 19 (PGO): the trained `hlc` self-compiles in 69.2–73.4% of the plain build's wall time with byte-identical output, and the O(n) `join` builtin cut a full self-compilation from 3.3 s to 0.48 s. Before that, v0.34.0-alpha completed Stage 18 (hltest + quickcheck + hls-fuzz + hlcov + the 150-stage roadmap restructure); v0.33.0-alpha merged the deep-scan-and-beyond-v1 branch (PR #22) which closed all 7 open issues (#15-#21). Stage 17 was perfected in v0.30.0-alpha (proof-engine soundness overhaul + native ensures + loop-invariant engine).
+**v0.37.0-alpha — Stage 21: SIMD vectorisation. `std.simd` ships explicit SIMD types (I32x4/F64x2/U8x16, wrapping lanes, checked boundaries) with the full op set + fused whole-loop kernels; `hlc --target-feature avx2|sse4.2` lowers the hot kernels to native intrinsics (arch-guarded, scalar fallback); `has_feature()`/`simd_cpu_supports()` give compile-time and runtime dispatch; the HLIR auto-vectoriser detects the canonical loops. Acceptance: the 1M-element 8-tap FIR kernel runs 2.4× faster on AVX2 (gate ≥ 2×) with identical output, fast path byte-identical to portable. Fixed a latent std.bits bit-63 clobber. 587/587 tests PASS.** Stage 20 (previous) delivered whole-program LTO (`hlc --lto`, 52% binary size drop, list_sort_int_asc inlined with the standalone definition dropped). `hlc --lto` inlines small single-return functions from imported modules at statement-level call sites (ownership bit-for-bit preserved) and drops both unreachable functions and fully-inlined standalone definitions; the acceptance binary shrinks 52% (35,344 → 17,144 bytes) with byte-identical output on all 105 ok/ programs. `--emit lto` / `make emit-lto-ir` emit the whole-program LTO'd LLVM IR; `hls-pkg build --lto` compiles packages through the pipeline. The LTO work also found and fixed a latent C-backend soundness bug (eager hoisting broke `&&`/`||` lazy short-circuiting). 578/578 tests PASS, bootstrap deterministic, differential suite byte-identical (including `--lto`).** Previous release v0.35.0-alpha delivered Stage 19 (PGO): the trained `hlc` self-compiles in 69.2–73.4% of the plain build's wall time with byte-identical output, and the O(n) `join` builtin cut a full self-compilation from 3.3 s to 0.48 s. Before that, v0.34.0-alpha completed Stage 18 (hltest + quickcheck + hls-fuzz + hlcov + the 150-stage roadmap restructure); v0.33.0-alpha merged the deep-scan-and-beyond-v1 branch (PR #22) which closed all 7 open issues (#15-#21). Stage 17 was perfected in v0.30.0-alpha (proof-engine soundness overhaul + native ensures + loop-invariant engine).
 
 - ✅ Complete core specification
 - ✅ Stage-0 reference (interpreted, with type + effects checking)
@@ -438,8 +444,13 @@ Full details: [SPEC.md](SPEC.md) · Stage-by-stage roadmap:
   definition dropped; binary size −52% (target ≥ 15%); byte-identical
   output on all ok/ programs. Fixed a latent `&&`/`||` eager-hoisting
   short-circuit bug. 578/578 tests PASS.
-- ⬜ SIMD vectorisation (Stage 21), cross-compilation targets (Stage
-  22), WebAssembly backend (Stage 23), v1.0 (Stage 150)...
+- ✅ **Stage 21 release — SIMD vectorisation** (v0.37.0-alpha):
+  `std.simd` (I32x4/F64x2/U8x16 + fused FIR kernel), intrinsic fast
+  paths under `--target-feature`, `has_feature`/`simd_cpu_supports`
+  dispatch, HLIR auto-vectoriser detection. Acceptance: 2.4× ≥ 2× on
+  AVX2, identical output. 587/587 tests PASS.
+- ⬜ Cross-compilation targets (Stage 22), WebAssembly backend (Stage
+  23), v1.0 (Stage 150)...
 
 ## Contributing
 

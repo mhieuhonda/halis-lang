@@ -53,7 +53,7 @@ remains green.
 |---|-------|:------:|:----------------:|
 | 19 | Profile-guided optimisation (PGO) | ✅ | 3–4 weeks |
 | 20 | Link-time optimisation (LTO) across crates | ✅ | 3 weeks |
-| 21 | SIMD vectorisation (target-feature detection) | ⬜ | 5 weeks |
+| 21 | SIMD vectorisation (target-feature detection) | ✅ | 5 weeks |
 | 22 | Cross-compilation targets (Linux/macOS/Windows/FreeBSD) | ⬜ | 4 weeks |
 | 23 | WebAssembly backend (`target wasm32`) | ⬜ | 6 weeks |
 | 24 | `wasm-opt` integration + emscripten bridge | ⬜ | 3 weeks |
@@ -1678,7 +1678,7 @@ short-circuit semantics (regression test added).
 
 ---
 
-## STAGE 21 — SIMD vectorisation (target-feature detection) ⬜
+## STAGE 21 — SIMD vectorisation (target-feature detection) ✅ (release v0.37.0-alpha)
 
 **Work:**
 - `std.simd` — explicit SIMD types (`i32x4`, `f64x2`, `u8x16`) and
@@ -1691,6 +1691,27 @@ short-circuit semantics (regression test added).
 **Acceptance:** `list_sort_int_asc` on a 1M-element list is ≥2×
 faster on an AVX2 target than the scalar version, with identical
 output.
+
+**Result (v0.37.0-alpha):** `std/simd.hls` ships the explicit SIMD
+types as packed-lane structs (`I32x4`/`F64x2`/`U8x16`) with the full
+operation set — wrapping lane arithmetic (the SIMD contract), CHECKED
+lane entry, 4-wide gather/scatter — plus two fused whole-loop kernels
+(`simd_transform_sum_i32x4`, the canonical 8-tap FIR
+`simd_correlate8_sum_i32x4`). Under `hlc --target-feature
+sse4.2|avx2` the C backend lowers the hot kernels to native intrinsics
+(`_mm_mullo_epi32`/`_mm_add_epi32`/`paddq` accumulation) with
+per-function `target(...)` attributes and arch-guarded scalar
+fallbacks (NEON intrinsic tuning is Stage 25); the fast path is
+verified byte-identical to the portable path in the test suite.
+`has_feature()` const-folds from the flag (the `cfg(feature)`
+dispatch), `simd_cpu_supports()` probes the CPU (CPUID / NEON
+baseline). The HLIR `auto_vectorize` pass detects + annotates the
+canonical elementwise loops (`--opt-stats [--lto]
+--target-feature`). Acceptance (`make simd-acceptance`): the 1M-element
+kernel is **2.4× faster** on the AVX2 target with identical output
+(checksums match on every path). The stage also fixed a latent
+`std.bits` bug (bit-63 setting clobbered the lower bits of
+`bits_and/or/xor`).
 
 ---
 

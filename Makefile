@@ -198,7 +198,41 @@ emit-lto-ir:
 	    echo "llvm-as not available: skipped bitcode (.bc) emission"; \
 	  fi
 
-.PHONY: pgo pgo-acceptance pgo-report lto emit-lto-ir
+# ============================================================================
+# Stage 21 (v0.37.0-alpha): SIMD vectorisation targets
+# ============================================================================
+
+# simd-bench: run the acceptance benchmark (1M-element 8-tap FIR
+# correlation, scalar vs std.simd vector path). With FEATURE set the
+# vector path uses native intrinsics; without it, the portable
+# (reference) implementation runs (very slow — it is the semantic
+# reference, not the fast path).
+# Usage: make simd-bench [FEATURE=avx2]
+simd-bench:
+	@test -x $(BIN)/hlc || $(MAKE) bootstrap
+	@mkdir -p $(BIN)
+	@if [ -n "$(FEATURE)" ]; then T="--target-feature $(FEATURE)"; fi; \
+	  $(BIN)/hlc $$T benchmarks/simd_bench.hls $(BIN)/simd_bench.c; \
+	  $(CC) $(CFLAGS) -o $(BIN)/simd_bench $(BIN)/simd_bench.c -lm -pthread; \
+	  $(BIN)/simd_bench
+
+# simd-acceptance: the Stage 21 acceptance gate — the vector kernel is
+# >= 2x faster than the scalar kernel on a 1M-element list, with
+# identical output (checksum equality). Requires an AVX2-capable host
+# (the intrinsics are x86-64; on other hosts the run reports SKIP).
+simd-acceptance:
+	@test -x $(BIN)/hlc || $(MAKE) bootstrap
+	@mkdir -p $(BIN)
+	@$(BIN)/hlc --target-feature avx2 benchmarks/simd_bench.hls $(BIN)/simd_acc.c
+	@$(CC) $(CFLAGS) -o $(BIN)/simd_acc $(BIN)/simd_acc.c -lm -pthread
+	@$(BIN)/simd_acc > $(BIN)/simd_acc.out 2>&1 || exit 1
+	@grep -q "checksums MATCH" $(BIN)/simd_acc.out \
+	  || (echo "FAIL: checksum mismatch (vector != scalar)"; exit 1)
+	@if ! grep -q "simd_cpu_supports(avx2) = true" $(BIN)/simd_acc.out; then \
+	  echo "SKIP: host CPU has no AVX2 (intrinsic path inactive)"; exit 0; fi
+	@python3 scripts/simd_ratio.py --out $(BIN)/simd_acc.out --min 2.0
+
+.PHONY: pgo pgo-acceptance pgo-report lto emit-lto-ir simd-bench simd-acceptance
 
 # ============================================================================
 # Stage 13 (v0.23.0-alpha): hls-pkg package manager targets

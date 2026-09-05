@@ -487,6 +487,101 @@ else
     bad "&& short-circuit: native compile failed"
 fi
 
+echo "=== 9. Stage 21: SIMD vectorisation (std.simd + target features) ==="
+# (a) the std.simd semantics test is differentially covered by sections
+#     1/3/4a (it lives in tests/ok); here we verify the INTRINSIC FAST
+#     PATH byte-identity: the native build compiled with
+#     --target-feature avx2 must produce the same output as the
+#     interpreter driven with the same flag (fast path == portable
+#     semantics). x86-64 hosts only (the intrinsics); others skip.
+SIMD_F=tests/ok/feat_stage21_simd.hls
+simd_interp_flag=$(python3 boot/boot.py --target-feature avx2 "$SIMD_F" </dev/null 2>/dev/null)
+if uname -m | grep -qE "x86_64|i386|i686"; then
+    if [ ! -x "$TMP/hlc1" ]; then
+        python3 boot/boot.py src/hlc.hls src/hlc.hls "$TMP/hlc_nat.c" >/dev/null 2>&1
+        gcc -O2 -o "$TMP/hlc1" "$TMP/hlc_nat.c" -lm -pthread 2>/dev/null
+    fi
+    if "$TMP/hlc1" --target-feature avx2 "$SIMD_F" "$TMP/s21a.c" >/dev/null 2>&1 \
+            && gcc -O2 -o "$TMP/s21a_bin" "$TMP/s21a.c" -lm -pthread 2>/dev/null; then
+        if grep -q "hl_simd_" "$TMP/s21a.c"; then
+            ok "simd: intrinsic fast path present in --target-feature build"
+        else
+            bad "simd: fast path missing from --target-feature build"
+        fi
+        s21_out=$("$TMP/s21a_bin" 2>/dev/null)
+        if [ "$s21_out" == "$simd_interp_flag" ]; then
+            ok "simd: AVX2 fast path output == interpreter (byte-identical)"
+        else
+            bad "simd: AVX2 fast path diverges from interpreter"
+            diff <(echo "$s21_out") <(echo "$simd_interp_flag") | head -4
+        fi
+    else
+        bad "simd: --target-feature avx2 compile failed"
+    fi
+    # Unflagged native build must contain ZERO SIMD helpers.
+    if ! grep -q "hl_simd_add_i32x4\|hl_simd_cpu_supports(hl_str" "$TMP/$name.c" 2>/dev/null; then
+        ok "simd: unflagged build has no SIMD helper emission"
+    else
+        bad "simd: SIMD machinery leaked into an unflagged build"
+    fi
+else
+    echo "  [SKIP] non-x86 host: intrinsic fast-path check skipped"
+fi
+# (b) the feature-flag const-folds has_feature in the native build.
+cat > "$TMP/feat_check.hls" <<'FCEOF'
+fn main() -> int uses IO {
+    if has_feature("avx2") {
+        println("flag-on")
+    } else {
+        println("flag-off")
+    }
+    return 0
+}
+FCEOF
+if [ ! -x "$TMP/hlc1" ]; then
+    python3 boot/boot.py src/hlc.hls src/hlc.hls "$TMP/hlc_nat.c" >/dev/null 2>&1
+    gcc -O2 -o "$TMP/hlc1" "$TMP/hlc_nat.c" -lm -pthread 2>/dev/null
+fi
+if "$TMP/hlc1" --target-feature avx2 "$TMP/feat_check.hls" "$TMP/fc.c" >/dev/null 2>&1 \
+        && gcc -O2 -o "$TMP/fc_bin" "$TMP/fc.c" -lm -pthread 2>/dev/null; then
+    fc_out=$("$TMP/fc_bin" 2>/dev/null)
+    fc_interp=$(python3 boot/boot.py --target-feature avx2 "$TMP/feat_check.hls" 2>/dev/null)
+    if [ "$fc_out" == "flag-on" ] && [ "$fc_interp" == "flag-on" ]; then
+        ok "simd: has_feature const-folds (native and interpreter agree)"
+    else
+        bad "simd: has_feature mis-folded (native='$fc_out' interp='$fc_interp')"
+    fi
+else
+    bad "simd: feature-flag compile failed"
+fi
+# (c) the SIMD acceptance benchmark (timing-gated: >= 2x on AVX2 hosts;
+#     correctness-gated everywhere the checksums must match).
+if [ ! -x "$TMP/hlc1" ]; then
+    python3 boot/boot.py src/hlc.hls src/hlc.hls "$TMP/hlc_nat.c" >/dev/null 2>&1
+    gcc -O2 -o "$TMP/hlc1" "$TMP/hlc_nat.c" -lm -pthread 2>/dev/null
+fi
+if "$TMP/hlc1" --target-feature avx2 benchmarks/simd_bench.hls "$TMP/s21b.c" >/dev/null 2>&1 \
+        && gcc -O2 -o "$TMP/s21b_bin" "$TMP/s21b.c" -lm -pthread 2>/dev/null; then
+    "$TMP/s21b_bin" > "$TMP/s21b.out" 2>&1
+    if grep -q "checksums MATCH" "$TMP/s21b.out"; then
+        ok "simd-bench: 1M-element kernel checksums MATCH (vector == scalar)"
+    else
+        bad "simd-bench: checksum mismatch"
+    fi
+    if grep -q "simd_cpu_supports(avx2) = true" "$TMP/s21b.out"; then
+        if python3 scripts/simd_ratio.py --out "$TMP/s21b.out" --min 2.0 >/dev/null 2>&1; then
+            ratio_line=$(grep "RATIO" "$TMP/s21b.out" | tail -1)
+            ok "simd-bench: acceptance ratio >= 2x ($ratio_line)"
+        else
+            bad "simd-bench: acceptance ratio below 2x"
+        fi
+    else
+        echo "  [SKIP] host CPU has no AVX2 — timing gate skipped (checksum still verified)"
+    fi
+else
+    bad "simd-bench: compile failed"
+fi
+
 echo ""
 echo "=========================================="
 echo "RESULT: $PASS PASS / $FAIL FAIL"

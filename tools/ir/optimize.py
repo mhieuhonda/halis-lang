@@ -26,7 +26,7 @@ from typing import Dict, Set, List, Optional, Tuple
 from . import (HLIRModule, HLIRFunction, Block, Instr,
                OP_CONST, OP_BINOP, OP_UNOP, OP_LOAD, OP_STORE,
                OP_CALL, OP_METHOD, OP_BUILTIN, OP_BRANCH, OP_JUMP,
-               OP_RETURN, OP_PANIC)
+               OP_RETURN, OP_PANIC, OP_LIST_GET, OP_LIST_LEN)
 
 
 INT64_MAX = 9223372036854775807
@@ -679,6 +679,62 @@ def _inline_small(mod: HLIRModule):
 # ----------------------------------------------------------------------------
 # Pass 5 (Stage 11 release): loop-invariant code motion (LICM)
 # ----------------------------------------------------------------------------
+
+# ----------------------------------------------------------------------------
+# Stage 21 (v0.37.0-alpha): auto-vectoriser DETECTION pass.
+# ----------------------------------------------------------------------------
+# Detects the canonical elementwise loop shape in the HLIR:
+#   for i: t_iter = <list>; loop { v = list_get(t_iter, i); ... binop ... }
+# A loop block whose body contains an OP_LIST_GET indexed by the loop's
+# induction variable feeding arithmetic is a vectorisation candidate.
+# The pass ANNOTATES the instructions (attrs["simd_candidate"]) and
+# reports counts — the codegen side (hlc --target-feature) lowers the
+# std.simd kernels to native intrinsics; the detection here is the
+# analysis that identifies which loops map onto those kernels.
+# ----------------------------------------------------------------------------
+
+def auto_vectorize(mod: HLIRModule, target_feature: str = "") -> dict:
+    """Detect + annotate vectorisable loops. Returns stats."""
+    stats = {"loops": 0, "candidates": 0, "feature": target_feature or None}
+    for fname, irf in mod.functions.items():
+        # A "loop" here = a block that is the target of a back-edge jump
+        # (a block whose terminator jumps to an earlier block). Approx:
+        # any block whose name is referenced by a later block's jump.
+        order = {b.name: i for i, b in enumerate(irf.blocks)}
+        for bi, blk in enumerate(irf.blocks):
+            term = blk.terminator
+            if term is None:
+                continue
+            tgt = None
+            for a in term.args:
+                if a[0] == "label" and a[1] in order and order[a[1]] <= bi:
+                    tgt = a[1]
+            if tgt is None:
+                continue
+            stats["loops"] += 1
+            # Vectorisation candidate: a list element load (for-loop
+            # OP_LIST_GET or a .get() method call) in this loop body,
+            # feeding arithmetic.
+            def is_elem_load(ins):
+                if ins.op == OP_LIST_GET:
+                    return True
+                if ins.op == OP_METHOD:
+                    for a in ins.args:
+                        if a[0] in ("mop", "name", "op") and a[1] == "get":
+                            return True
+                return False
+            has_lget = any(is_elem_load(ins) for ins in blk.instrs)
+            if has_lget and any(
+                    ins.op == OP_BINOP and ins.args and ins.args[0][0] == "op"
+                    and ins.args[0][1] in ("+", "-", "*")
+                    for ins in blk.instrs):
+                stats["candidates"] += 1
+                for ins in blk.instrs:
+                    if is_elem_load(ins):
+                        ins.attrs = dict(ins.attrs or {})
+                        ins.attrs["simd_candidate"] = True
+    return stats
+
 
 def _licm(irf: HLIRFunction):
     """Hoist loop-invariant instructions out of loop bodies.

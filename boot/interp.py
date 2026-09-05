@@ -489,6 +489,43 @@ class HalisRNG:
         return (self._next() >> 11) / (1 << 53)
 
 
+# Stage 21 (v0.37.0-alpha): target-feature state for has_feature() and
+# the runtime CPU probe for simd_cpu_supports().
+_TARGET_FEATURES = set()
+
+
+def _set_target_feature(feat):
+    """Set the active --target-feature (normalised, no leading '+')."""
+    _TARGET_FEATURES.clear()
+    if feat:
+        _TARGET_FEATURES.add(feat)
+
+
+def _cpu_supports(feat):
+    """Probe the host CPU for a SIMD feature (interpreter side; the
+    native side uses __builtin_cpu_supports). /proc/cpuinfo on Linux
+    x86; NEON is baseline on aarch64; False otherwise."""
+    try:
+        feat = feat.decode("utf-8") if isinstance(feat, bytes) else feat
+    except Exception:
+        return False
+    import platform
+    machine = platform.machine().lower()
+    if feat == "neon":
+        return machine in ("aarch64", "arm64", "armv8l")
+    flags = ""
+    try:
+        with open("/proc/cpuinfo", "rb") as f:
+            for line in f:
+                if line.startswith(b"flags") or line.startswith(b"Features"):
+                    flags = line.decode("utf-8", "replace").lower()
+                    break
+    except OSError:
+        return False
+    return (" %s " % feat) in (" %s " % flags.replace(",", " ")
+                               .replace("	", " ").replace(":", " "))
+
+
 class Interp:
     def __init__(self, program, argv, out, contracts=False):
         self.p = program
@@ -1055,6 +1092,18 @@ class Interp:
                     "use an explicit counter loop for large ranges"
                     % (a, b, count, RANGE_MAX), line)
             return list(range(a, b))
+        # Stage 21 (v0.37.0-alpha): has_feature — compile-time constant
+        # from the --target-feature flag (set via _set_target_feature).
+        if name == "has_feature":
+            feat = args[0]
+            if isinstance(feat, bytes):
+                feat = feat.decode("utf-8", "replace")
+            return feat in _TARGET_FEATURES
+        # Stage 21: simd_cpu_supports — runtime CPU probe (/proc/cpuinfo
+        # on Linux; conservative False elsewhere). Matches the C
+        # runtime's __builtin_cpu_supports for the probed names.
+        if name == "simd_cpu_supports":
+            return _cpu_supports(args[0])
         # Stage 19 (v0.35.0-alpha): O(n) join(list[str], sep) -> str.
         # Matches the C runtime's hl_str_join (single allocation, one
         # copy per element). The interpreter's str.join is likewise

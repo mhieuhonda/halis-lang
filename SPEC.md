@@ -388,6 +388,9 @@ Operands:
 | `rand_float()` | `float` | Rand | (Stage 9 release) uniform random float in `[0.0, 1.0)` |
 | `rand_seed(s: int)` | `void` | Rand | (Stage 9 release) seed the PRNG; same seed → same sequence (deterministic, shared with native) |
 | `proc_exec(cmd: str)` | `int` | Proc | (Stage 9 release) run shell command via `system()`; returns exit code (0 on success, 1..255 on failure, 128+signum on signal); tainted cmd → error |
+| `join(parts: list[str], sep: str)` | `str` | — | (Stage 19, v0.35.0-alpha) O(n) whole-list join: total length computed once, one allocation, one copy per element |
+| `has_feature(name: str)` | `bool` | — | (Stage 21, v0.37.0-alpha) compile-time constant folded from `--target-feature` (exact match; requires a string literal) — the `cfg(feature)` dispatch |
+| `simd_cpu_supports(name: str)` | `bool` | — | (Stage 21) runtime CPU probe (CPUID on x86; NEON baseline on aarch64) |
 
 `int(s)`: allows a leading minus sign, only accepts digits 0–9, value must
 fit in int64 range, otherwise panics with "cannot convert string to int".

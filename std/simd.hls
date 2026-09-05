@@ -1,0 +1,501 @@
+# ============================================================================
+# std.simd.hls — explicit SIMD types & operations (Stage 21, v0.37.0-alpha)
+# ----------------------------------------------------------------------------
+# HLS has no vector types in the core; this module provides explicit
+# SIMD vectors as structs with PACKED lanes, plus the operations a
+# vectorising compiler would emit. Everything is pure HLS: portable,
+# type-checked, and differential-tested (interpreter <-> native).
+#
+# Under `hlc --target-feature sse4.2|avx2|neon` the C backend lowers
+# the hot kernels (add/sub/mul/min/max, gather/scatter) to native
+# vector intrinsics (SSE4.2/AVX2 on x86-64, NEON on aarch64) while
+# keeping EXACTLY the same semantics — the fast path is verified
+# byte-for-byte against this portable implementation in the test
+# suite. `has_feature("avx2")` lets programs dispatch at compile
+# time; `simd_cpu_supports("avx2")` probes the actual CPU at runtime.
+#
+# Types & lane layout (little-endian packing):
+#   I32x4 { a: int, b: int }  lane 0 = low  32 bits of a
+#                             lane 1 = high 32 bits of a
+#                             lane 2 = low  32 bits of b
+#                             lane 3 = high 32 bits of b
+#   F64x2 { a: float, b: float }  lanes are plain doubles
+#   U8x16 { a: int, b: int }  bytes 0..7 packed in a, 8..15 in b
+#
+# Lane semantics (documented contract, mirrors every SIMD ISA):
+#   * i32/u8 lane arithmetic WRAPS modulo 2^32 / 2^8 (this is the point
+#     of SIMD lanes — unlike the checked int64 core, which halts).
+#   * Lane VALUES are range-checked on entry (splat/from/gather/set):
+#     an i32 lane must hold a value in [-2^31, 2^31); a u8 lane in
+#     [0, 256). Halis's "every operation is checked" rule applies at
+#     the vector boundary.
+#   * gather/scatter use 4 consecutive list elements with ONE 4-wide
+#     bounds check (semantically identical to four checked accesses).
+#
+# All functions are pure (no `uses`).
+# ============================================================================
+
+import "std.bits"
+import "std.math"
+
+struct I32x4 {
+    a: int,
+    b: int
+}
+
+struct F64x2 {
+    a: float,
+    b: float
+}
+
+struct U8x16 {
+    a: int,
+    b: int
+}
+
+# ----------------------------------------------------------------------------
+# Range checks (the vector boundary is CHECKED, like everything in Halis)
+# ----------------------------------------------------------------------------
+
+fn simd_check_i32(v: int, what: str) -> int {
+    if v < -2147483648 || v > 2147483647 {
+        panic("simd i32x4 lane " + what + " out of range: " + v.to_str())
+    }
+    return v
+}
+
+fn simd_check_u8(v: int, what: str) -> int {
+    if v < 0 || v > 255 {
+        panic("simd u8x16 lane " + what + " out of range: " + v.to_str())
+    }
+    return v
+}
+
+# ----------------------------------------------------------------------------
+# I32x4 — construction / lanes
+# ----------------------------------------------------------------------------
+
+# simd_i32x4_from: build from 4 signed lane values (range-checked).
+fn simd_i32x4_from(l0: int, l1: int, l2: int, l3: int) -> I32x4 {
+    simd_check_i32(l0, "0")
+    simd_check_i32(l1, "1")
+    simd_check_i32(l2, "2")
+    simd_check_i32(l3, "3")
+    return I32x4 {
+        a: bits_or(bits_and(l0, 4294967295), bits_shl(bits_and(l1, 4294967295), 32)),
+        b: bits_or(bits_and(l2, 4294967295), bits_shl(bits_and(l3, 4294967295), 32))
+    }
+}
+
+# simd_i32x4_splat: all four lanes = v (range-checked).
+fn simd_i32x4_splat(v: int) -> I32x4 {
+    return simd_i32x4_from(v, v, v, v)
+}
+
+# simd_i32x4_lane: sign-extended lane k (0..3).
+fn simd_i32x4_lane(x: I32x4, k: int) -> int {
+    if k < 0 || k > 3 {
+        panic("simd_i32x4 lane index out of range: " + k.to_str())
+    }
+    let mut raw: int = 0
+    if k == 0 {
+        raw = bits_and(x.a, 4294967295)
+    } else if k == 1 {
+        raw = bits_shr(x.a, 32)
+    } else if k == 2 {
+        raw = bits_and(x.b, 4294967295)
+    } else {
+        raw = bits_shr(x.b, 32)
+    }
+    # sign-extend from 32 bits.
+    if raw >= 2147483648 {
+        return raw - 4294967296
+    }
+    return raw
+}
+
+# simd_i32x4_set: return x with lane k replaced by v (range-checked).
+fn simd_i32x4_set(x: I32x4, k: int, v: int) -> I32x4 {
+    let l0: int = simd_i32x4_lane(x, 0)
+    let l1: int = simd_i32x4_lane(x, 1)
+    let l2: int = simd_i32x4_lane(x, 2)
+    let l3: int = simd_i32x4_lane(x, 3)
+    if k == 0 {
+        return simd_i32x4_from(v, l1, l2, l3)
+    }
+    if k == 1 {
+        return simd_i32x4_from(l0, v, l2, l3)
+    }
+    if k == 2 {
+        return simd_i32x4_from(l0, l1, v, l3)
+    }
+    if k == 3 {
+        return simd_i32x4_from(l0, l1, l2, v)
+    }
+    panic("simd_i32x4 lane index out of range: " + k.to_str())
+}
+
+# ----------------------------------------------------------------------------
+# I32x4 — lane arithmetic (WRAPPING per lane, like every SIMD ISA)
+# ----------------------------------------------------------------------------
+
+# simd_add32: (a + b) mod 2^32 on unsigned 32-bit lane values.
+fn simd_add32(a: int, b: int) -> int {
+    return bits_and(a + b, 4294967295)
+}
+
+# simd_sub32: (a - b) mod 2^32 (two's-complement borrow).
+fn simd_sub32(a: int, b: int) -> int {
+    return bits_and(a - b, 4294967295)
+}
+
+# simd_mul32: low 32 bits of a*b, computed without any int64 overflow
+# (16-bit split — see the module header). Inputs are unsigned lane
+# values in [0, 2^32).
+fn simd_mul32(a: int, b: int) -> int {
+    let al: int = bits_and(a, 65535)
+    let ah: int = bits_and(bits_shr(a, 16), 65535)
+    let bl: int = bits_and(b, 65535)
+    let bh: int = bits_and(bits_shr(b, 16), 65535)
+    let lo: int = al * bl
+    let mid: int = (ah * bl + al * bh) * 65536
+    return bits_and(lo + mid, 4294967295)
+}
+
+# simd_i32x4_add: per-lane wrapping addition.
+fn simd_i32x4_add(x: I32x4, y: I32x4) -> I32x4 {
+    return I32x4 {
+        a: bits_or(simd_add32(bits_and(x.a, 4294967295), bits_and(y.a, 4294967295)),
+                  bits_shl(simd_add32(bits_shr(x.a, 32), bits_shr(y.a, 32)), 32)),
+        b: bits_or(simd_add32(bits_and(x.b, 4294967295), bits_and(y.b, 4294967295)),
+                  bits_shl(simd_add32(bits_shr(x.b, 32), bits_shr(y.b, 32)), 32))
+    }
+}
+
+# simd_i32x4_sub: per-lane wrapping subtraction.
+fn simd_i32x4_sub(x: I32x4, y: I32x4) -> I32x4 {
+    return I32x4 {
+        a: bits_or(simd_sub32(bits_and(x.a, 4294967295), bits_and(y.a, 4294967295)),
+                  bits_shl(simd_sub32(bits_shr(x.a, 32), bits_shr(y.a, 32)), 32)),
+        b: bits_or(simd_sub32(bits_and(x.b, 4294967295), bits_and(y.b, 4294967295)),
+                  bits_shl(simd_sub32(bits_shr(x.b, 32), bits_shr(y.b, 32)), 32))
+    }
+}
+
+# simd_i32x4_mul: per-lane wrapping (low-32) multiplication.
+fn simd_i32x4_mul(x: I32x4, y: I32x4) -> I32x4 {
+    return I32x4 {
+        a: bits_or(simd_mul32(bits_and(x.a, 4294967295), bits_and(y.a, 4294967295)),
+                  bits_shl(simd_mul32(bits_shr(x.a, 32), bits_shr(y.a, 32)), 32)),
+        b: bits_or(simd_mul32(bits_and(x.b, 4294967295), bits_and(y.b, 4294967295)),
+                  bits_shl(simd_mul32(bits_shr(x.b, 32), bits_shr(y.b, 32)), 32))
+    }
+}
+
+# simd_i32x4_min / max: per-lane signed min/max.
+fn simd_i32x4_min(x: I32x4, y: I32x4) -> I32x4 {
+    return simd_i32x4_from(
+        math_min_int(simd_i32x4_lane(x, 0), simd_i32x4_lane(y, 0)),
+        math_min_int(simd_i32x4_lane(x, 1), simd_i32x4_lane(y, 1)),
+        math_min_int(simd_i32x4_lane(x, 2), simd_i32x4_lane(y, 2)),
+        math_min_int(simd_i32x4_lane(x, 3), simd_i32x4_lane(y, 3)))
+}
+
+fn simd_i32x4_max(x: I32x4, y: I32x4) -> I32x4 {
+    return simd_i32x4_from(
+        math_max_int(simd_i32x4_lane(x, 0), simd_i32x4_lane(y, 0)),
+        math_max_int(simd_i32x4_lane(x, 1), simd_i32x4_lane(y, 1)),
+        math_max_int(simd_i32x4_lane(x, 2), simd_i32x4_lane(y, 2)),
+        math_max_int(simd_i32x4_lane(x, 3), simd_i32x4_lane(y, 3)))
+}
+
+# simd_i32x4_reduce_add: horizontal wrapping sum of the 4 lanes
+# (result fits int32).
+fn simd_i32x4_reduce_add(x: I32x4) -> int {
+    let s01: int = simd_add32(bits_and(x.a, 4294967295), bits_shr(x.a, 32))
+    let s23: int = simd_add32(bits_and(x.b, 4294967295), bits_shr(x.b, 32))
+    let s: int = simd_add32(s01, s23)
+    if s >= 2147483648 {
+        return s - 4294967296
+    }
+    return s
+}
+
+# simd_i32x4_shuffle: lanes [i0, i1, i2, i3] of x (each 0..3).
+fn simd_i32x4_shuffle(x: I32x4, i0: int, i1: int, i2: int, i3: int) -> I32x4 {
+    return simd_i32x4_from(
+        simd_i32x4_lane(x, i0), simd_i32x4_lane(x, i1),
+        simd_i32x4_lane(x, i2), simd_i32x4_lane(x, i3))
+}
+
+# ----------------------------------------------------------------------------
+# I32x4 — gather / scatter (4 consecutive list elements)
+# ----------------------------------------------------------------------------
+
+# simd_i32x4_gather: load elements [i, i+4) of xs as lanes
+# (one 4-wide bounds check; lanes range-checked).
+fn simd_i32x4_gather(xs: list[int], i: int) -> I32x4 {
+    if i < 0 || i + 4 > xs.len() {
+        panic("simd gather out of bounds: index " + i.to_str()
+            + " with length " + xs.len().to_str())
+    }
+    return simd_i32x4_from(xs.get(i), xs.get(i + 1), xs.get(i + 2), xs.get(i + 3))
+}
+
+# simd_i32x4_scatter: store the lanes of v into xs[i, i+4)
+# (one 4-wide bounds check).
+fn simd_i32x4_scatter(xs: list[int], i: int, v: I32x4) -> void {
+    if i < 0 || i + 4 > xs.len() {
+        panic("simd scatter out of bounds: index " + i.to_str()
+            + " with length " + xs.len().to_str())
+    }
+    xs.set(i, simd_i32x4_lane(v, 0))
+    xs.set(i + 1, simd_i32x4_lane(v, 1))
+    xs.set(i + 2, simd_i32x4_lane(v, 2))
+    xs.set(i + 3, simd_i32x4_lane(v, 3))
+}
+
+# ----------------------------------------------------------------------------
+# F64x2 — construction / lanes / arithmetic
+# ----------------------------------------------------------------------------
+
+fn simd_f64x2_from(l0: float, l1: float) -> F64x2 {
+    return F64x2 { a: l0, b: l1 }
+}
+
+fn simd_f64x2_splat(v: float) -> F64x2 {
+    return F64x2 { a: v, b: v }
+}
+
+fn simd_f64x2_lane(x: F64x2, k: int) -> float {
+    if k == 0 {
+        return x.a
+    }
+    if k == 1 {
+        return x.b
+    }
+    panic("simd f64x2 lane index out of range: " + k.to_str())
+}
+
+fn simd_f64x2_add(x: F64x2, y: F64x2) -> F64x2 {
+    return F64x2 { a: x.a + y.a, b: x.b + y.b }
+}
+
+fn simd_f64x2_sub(x: F64x2, y: F64x2) -> F64x2 {
+    return F64x2 { a: x.a - y.a, b: x.b - y.b }
+}
+
+fn simd_f64x2_mul(x: F64x2, y: F64x2) -> F64x2 {
+    return F64x2 { a: x.a * y.a, b: x.b * y.b }
+}
+
+fn simd_f64x2_reduce_add(x: F64x2) -> float {
+    return x.a + x.b
+}
+
+fn simd_f64x2_gather(xs: list[float], i: int) -> F64x2 {
+    if i < 0 || i + 2 > xs.len() {
+        panic("simd gather out of bounds: index " + i.to_str()
+            + " with length " + xs.len().to_str())
+    }
+    return F64x2 { a: xs.get(i), b: xs.get(i + 1) }
+}
+
+fn simd_f64x2_scatter(xs: list[float], i: int, v: F64x2) -> void {
+    if i < 0 || i + 2 > xs.len() {
+        panic("simd scatter out of bounds: index " + i.to_str()
+            + " with length " + xs.len().to_str())
+    }
+    xs.set(i, v.a)
+    xs.set(i + 1, v.b)
+}
+
+# ----------------------------------------------------------------------------
+# U8x16 — construction / bytes / wrapping arithmetic
+# ----------------------------------------------------------------------------
+
+# simd_u8x16_from_bytes: build from exactly 16 byte values (0..255).
+fn simd_u8x16_from_bytes(bytes: list[int]) -> U8x16 {
+    if bytes.len() != 16 {
+        panic("simd u8x16 from_bytes expects 16 bytes, got " + bytes.len().to_str())
+    }
+    let mut a: int = 0
+    let mut b: int = 0
+    let mut i: int = 0
+    while i < 8 {
+        let byte: int = simd_check_u8(bytes.get(i), "a")
+        a = bits_or(a, bits_shl(byte, i * 8))
+        i = i + 1
+    }
+    let mut j: int = 0
+    while j < 8 {
+        let byte: int = simd_check_u8(bytes.get(8 + j), "b")
+        b = bits_or(b, bits_shl(byte, j * 8))
+        j = j + 1
+    }
+    return U8x16 { a: a, b: b }
+}
+
+# simd_u8x16_byte: byte k (0..15) as 0..255.
+fn simd_u8x16_byte(x: U8x16, k: int) -> int {
+    if k < 0 || k > 15 {
+        panic("simd u8x16 byte index out of range: " + k.to_str())
+    }
+    if k < 8 {
+        return bits_byte(x.a, k)
+    }
+    return bits_byte(x.b, k - 8)
+}
+
+# simd_u8x16_splat: all 16 bytes = v (0..255).
+fn simd_u8x16_splat(v: int) -> U8x16 {
+    let vv: int = simd_check_u8(v, "splat")
+    let mut acc: int = 0
+    let mut i: int = 0
+    while i < 8 {
+        acc = bits_or(acc, bits_shl(vv, i * 8))
+        i = i + 1
+    }
+    return U8x16 { a: acc, b: acc }
+}
+
+# simd_u8x16_add / sub: per-byte wrapping arithmetic.
+fn simd_u8x16_add(x: U8x16, y: U8x16) -> U8x16 {
+    # Byte-wise wrapping: (a+b) mod 256 on each of the 8 bytes of each
+    # lane word. Addition of two 64-bit words cannot overflow int64, so
+    # the wrap must be applied per byte.
+    let mut ra: int = 0
+    let mut rb: int = 0
+    let mut i: int = 0
+    while i < 8 {
+        let s: int = bits_and(bits_byte(x.a, i) + bits_byte(y.a, i), 255)
+        ra = bits_or(ra, bits_shl(s, i * 8))
+        let s2: int = bits_and(bits_byte(x.b, i) + bits_byte(y.b, i), 255)
+        rb = bits_or(rb, bits_shl(s2, i * 8))
+        i = i + 1
+    }
+    return U8x16 { a: ra, b: rb }
+}
+
+fn simd_u8x16_sub(x: U8x16, y: U8x16) -> U8x16 {
+    let mut ra: int = 0
+    let mut rb: int = 0
+    let mut i: int = 0
+    while i < 8 {
+        let d: int = bits_and(bits_byte(x.a, i) - bits_byte(y.a, i), 255)
+        ra = bits_or(ra, bits_shl(d, i * 8))
+        let d2: int = bits_and(bits_byte(x.b, i) - bits_byte(y.b, i), 255)
+        rb = bits_or(rb, bits_shl(d2, i * 8))
+        i = i + 1
+    }
+    return U8x16 { a: ra, b: rb }
+}
+
+# ----------------------------------------------------------------------------
+# FUSED kernels (whole-loop vectorisation) — the shape a real auto-
+# vectoriser emits: ONE call does gather + transform + accumulate.
+# These are the Stage 21 acceptance kernels: under --target-feature the
+# C backend lowers them to a single intrinsic loop (4-wide loads from
+# the list item arrays, _mm_mullo_epi32/_mm_add_epi32 lane arithmetic,
+# exact int64 accumulation of the sign-extended lanes).
+#
+# Contract (explicit-SIMD, like every kernel here): xs/ys values and the
+# k/sub constants must fit int32 lanes (CHECKED — the vector boundary
+# rule); the per-lane transform arithmetic WRAPS modulo 2^32 (documented
+# SIMD semantics); each iteration's four lane results are then
+# sign-extended and accumulated in EXACT int64 — so for inputs whose
+# per-lane results do not wrap, the result equals the scalar formula
+# sum(xs[i] + ys[i]*k - sub) exactly.
+# ----------------------------------------------------------------------------
+
+# simd_transform_sum_i32x4: sum over i of (xs[i] + ys[i]*k - sub),
+# computed 4 lanes at a time.
+fn simd_transform_sum_i32x4(xs: list[int], ys: list[int], k: int, sub: int) -> int {
+    let n: int = xs.len()
+    if ys.len() != n {
+        panic("simd_transform_sum_i32x4: length mismatch")
+    }
+    if k < -2147483648 || k > 2147483647 {
+        panic("simd_transform_sum_i32x4: k out of int32 range")
+    }
+    if sub < -2147483648 || sub > 2147483647 {
+        panic("simd_transform_sum_i32x4: sub out of int32 range")
+    }
+    let mut total: int = 0
+    let mut i: int = 0
+    while i + 4 <= n {
+        let a: I32x4 = simd_i32x4_gather(xs, i)
+        let b: I32x4 = simd_i32x4_gather(ys, i)
+        let t: I32x4 = simd_i32x4_add(a, simd_i32x4_sub(simd_i32x4_mul(b, simd_i32x4_splat(k)), simd_i32x4_splat(sub)))
+        total = total + simd_i32x4_lane(t, 0)
+        total = total + simd_i32x4_lane(t, 1)
+        total = total + simd_i32x4_lane(t, 2)
+        total = total + simd_i32x4_lane(t, 3)
+        i = i + 4
+    }
+    # Remainder (0..3 tail elements) — scalar, same formula.
+    while i < n {
+        total = total + xs.get(i) + ys.get(i) * k - sub
+        i = i + 1
+    }
+    return total
+}
+
+# ----------------------------------------------------------------------------
+# simd_correlate8_sum_i32x4 — 8-tap correlation (the canonical SIMD
+# workload: FIR filtering / matched filtering). Computes
+#     sum over i of  ( xs[i]*w0 + xs[i+1]*w1 + ... + xs[i+7]*w7 )
+# over i in [0, n-8), 4 outputs at a time (the standard FIR
+# vectorisation: the tap window slides, the lanes stride over i).
+#
+# Contract (explicit SIMD, like every kernel here): xs values and the
+# weights must fit int32 lanes (CHECKED); lane arithmetic wraps
+# modulo 2^32; the four lane results per iteration are sign-extended
+# and accumulated in EXACT int64 — for inputs whose per-lane results
+# do not wrap, the result equals the scalar int64 formula exactly.
+# ----------------------------------------------------------------------------
+
+fn simd_correlate8_sum_i32x4(xs: list[int], w0: int, w1: int, w2: int, w3: int,
+                             w4: int, w5: int, w6: int, w7: int) -> int {
+    let n: int = xs.len()
+    let ws: list[int] = [w0, w1, w2, w3, w4, w5, w6, w7]
+    let mut wi: int = 0
+    while wi < 8 {
+        if ws.get(wi) < -2147483648 || ws.get(wi) > 2147483647 {
+            panic("simd_correlate8_sum_i32x4: weight out of int32 range")
+        }
+        wi = wi + 1
+    }
+    let wv: list[I32x4] = []
+    let mut wj: int = 0
+    while wj < 8 {
+        wv.push(simd_i32x4_splat(ws.get(wj)))
+        wj = wj + 1
+    }
+    let mut total: int = 0
+    let mut i: int = 0
+    while i + 4 + 7 < n {
+        let mut acc: I32x4 = simd_i32x4_splat(0)
+        let mut t: int = 0
+        while t < 8 {
+            let window: I32x4 = simd_i32x4_gather(xs, i + t)
+            let prod: I32x4 = simd_i32x4_mul(window, wv.get(t))
+            acc = simd_i32x4_add(acc, prod)
+            t = t + 1
+        }
+        total = total + simd_i32x4_lane(acc, 0)
+        total = total + simd_i32x4_lane(acc, 1)
+        total = total + simd_i32x4_lane(acc, 2)
+        total = total + simd_i32x4_lane(acc, 3)
+        i = i + 4
+    }
+    # Tail: scalar over the remaining windows.
+    while i + 8 <= n {
+        let s: int = xs.get(i) * w0 + xs.get(i + 1) * w1 + xs.get(i + 2) * w2
+            + xs.get(i + 3) * w3 + xs.get(i + 4) * w4 + xs.get(i + 5) * w5
+            + xs.get(i + 6) * w6 + xs.get(i + 7) * w7
+        total = total + s
+        i = i + 1
+    }
+    return total
+}

@@ -13,6 +13,135 @@ stability (125–140), and final stabilisation toward v1.0 (141–150).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
+## [v0.37.0-alpha] — Stage 21: SIMD vectorisation (target-feature detection)
+
+> Completes **Stage 21** of the roadmap: the explicit SIMD library
+> (`std/simd.hls`), the `--target-feature` intrinsic fast paths in the
+> C backend, the `has_feature()` / `simd_cpu_supports()` dispatch
+> builtins, and the HLIR auto-vectoriser detection pass. Acceptance
+> (`make simd-acceptance`): the 1M-element 8-tap FIR kernel runs
+> **2.4× faster** on the AVX2 target than the scalar version (gate
+> ≥ 2×), with identical output (checksums match on the scalar, portable
+> and intrinsic paths). The fast path is additionally verified
+> **byte-identical** to the portable path in the test suite. 587/587
+> tests PASS; the Stage 19/20 acceptances re-verified (69.9% ≤ 80%;
+> LTO 52% size drop). Also fixed a latent `std.bits` bug where setting
+> bit 63 clobbered the lower bits of `bits_and`/`bits_or`/`bits_xor`.
+
+### Stage 21 — SIMD vectorisation
+
+#### Added — `std/simd.hls` (explicit SIMD, pure HLS)
+
+- **Types**: `I32x4` (4 signed i32 lanes packed into 2 int64 fields),
+  `F64x2` (2 doubles), `U8x16` (16 bytes). Explicit-SIMD contract:
+  lane arithmetic WRAPS modulo 2^32 / 2^8 (like every SIMD ISA — the
+  point of lanes), lane ENTRY is CHECKED (values must fit the lane;
+  Halis's "every operation is checked" applies at the vector boundary).
+- **Operations**: splat / from / lane / set, add / sub / mul (wrapping,
+  via a 16-bit split that never overflows int64), min / max, shuffle,
+  reduce_add, 4-wide gather / scatter with ONE bounds check covering
+  four consecutive elements (semantically identical to four checked
+  accesses).
+- **Fused whole-loop kernels** (the shape a real auto-vectoriser
+  emits): `simd_transform_sum_i32x4(xs, ys, k, sub)` and the canonical
+  8-tap FIR `simd_correlate8_sum_i32x4(xs, w0..w7)` — 4-wide loads,
+  lane multiply-accumulate, exact int64 accumulation of sign-extended
+  lanes.
+- Everything is pure HLS: portable, type-checked, and
+  differential-tested (interpreter ↔ native).
+
+#### Added — `--target-feature` + the intrinsic fast paths (`src/hlc.hls`)
+
+- `hlc --target-feature sse4.2|avx2|neon`: calls to the std.simd
+  kernels (matched by name AND argument types) are redirected to C
+  helpers with per-function `__attribute__((target(...)))` attributes
+  using native intrinsics — `_mm_mullo_epi32` / `_mm_add_epi32` /
+  `_mm_min_epi32` / `_mm_add_pd` for the elementwise kernels and the
+  fused loops, with `paddq` (2×i64) accumulation. The helpers own their
+  arguments exactly like user functions (same retain/release
+  convention), take ownership like HLS callees, and keep the identical
+  checked semantics (lane range checks with a branch-predictor-friendly
+  biased-OR form; 4-wide bounds checks).
+- Arch-dispatched in C: the x86 intrinsics live in
+  `#if defined(__x86_64__) || defined(__i386__)` with a plain-C scalar
+  fallback in the `#else` branch, so the generated code compiles and
+  runs correctly on every architecture (NEON intrinsic tuning is
+  Stage 25, per the roadmap). `--target-feature neon` selects the
+  arch-independent fast paths today.
+- Without the flag, calls run the portable HLS implementation — zero
+  SIMD machinery in the emitted C (test-verified).
+
+#### Added — feature dispatch builtins
+
+- **`has_feature("avx2") -> bool`** — a compile-time constant
+  const-folded from the `--target-feature` flag in the native codegen
+  and mirrored by the interpreter (the `cfg(feature)` dispatch).
+  Requires a string literal (checked).
+- **`simd_cpu_supports("avx2") -> bool`** — a runtime CPU probe:
+  `__builtin_cpu_supports` on x86 (CPU + OS support), NEON-baseline
+  check on aarch64, `/proc/cpuinfo` on the interpreter side. Enables
+  runtime dispatch: `if has_feature("avx2") || simd_cpu_supports("avx2")`.
+
+#### Added — HLIR auto-vectoriser pass (`tools/ir/optimize.py`)
+
+- `auto_vectorize(mod, target_feature)`: detects the canonical
+  elementwise loop shape (a loop body whose list element loads —
+  `list.get(i)` or for-loop `list_get` — feed `+`/`-`/`*` arithmetic),
+  annotates the instructions (`simd_candidate`) and reports counts via
+  `--opt-stats [--lto] --target-feature F`. The codegen side lowers the
+  std.simd kernels; this pass is the analysis that identifies which
+  loops map onto them.
+
+#### Added — benchmark / acceptance / tooling
+
+- `benchmarks/simd_bench.hls` — the Stage 21 acceptance benchmark:
+  1M-element list, the 8-tap FIR kernel, scalar reference vs the
+  std.simd vector path, 12 interleaved timed runs, checksum equality
+  verification and the ratio report.
+- `make simd-bench [FEATURE=avx2]` and `make simd-acceptance`
+  (checksum gate + ≥ 2× ratio gate on AVX2 hosts, graceful skip
+  otherwise) driven by `scripts/simd_ratio.py`.
+- `boot.py --target-feature F` (interpreter parity for `has_feature`),
+  `--emit llvm --target-feature` const-folds in the LLVM IR emitter.
+- CI runs `make simd-acceptance` on every push/PR.
+
+#### Fixed — `std.bits` bit-63 clobber bug
+
+- Found by the Stage 21 work (`bits_or(0, x)` with `x` having bits 60
+  and 63 set lost the (1<<60)): setting bit 63 in `bits_and` /
+  `bits_or` / `bits_xor` OVERWROTE the accumulated result with
+  `INT64_MIN` instead of adding `bits_pow2(63)`, discarding every
+  lower bit. Fixed by accumulating `r + bits_pow2(63)` (in [-2^63, 0),
+  never overflows). Regression covered by
+  `tests/ok/feat_stage21_simd.hls` (the negative-lane and bit-63
+  checks).
+
+#### Added — tests
+
+- `tests/ok/feat_stage21_simd.hls` — the acceptance demo: every
+  std.simd operation with deterministic output (wrapping lanes,
+  negative lanes, shuffle, set, gather/scatter, both fused kernels,
+  `has_feature`, `simd_cpu_supports`, the bits bit-63 regression) —
+  differentially tested like every ok/ program.
+- `tests/run_tests.sh` section 9 (9 new checks): the intrinsic fast
+  path is present under `--target-feature`, its output is
+  byte-identical to the interpreter driven with the same flag,
+  unflagged builds contain zero SIMD machinery, `has_feature`
+  const-folds identically in both implementations, the benchmark
+  checksums match, and the ≥ 2× ratio gate passes on AVX2 hosts
+  (skipped gracefully elsewhere).
+
+### Test results
+
+- 587 PASS / 0 FAIL (578 prior + 9 new Stage-21 checks).
+- Bootstrap: deterministic.
+- Differential suite (interpreter ↔ native, `-O fast`, `--lto`, the
+  AVX2 fast path): byte-identical across all ok/ programs.
+- Stage 21 acceptance (`make simd-acceptance`): **2.4× ≥ 2×, PASS**,
+  identical output.
+- Stage 19 acceptance re-verified: 69.9% ≤ 80%. Stage 20 size drop
+  re-verified: 52%.
+
 ## [v0.36.0-alpha] — Stage 20: link-time optimisation (LTO) across crates
 
 > Completes **Stage 20** of the roadmap: whole-program LTO for the

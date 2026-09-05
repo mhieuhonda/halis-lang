@@ -212,6 +212,8 @@ BUILTIN_FNS = {
     # dominated the bootstrap's compile time. The builtin joins a
     # list[str] with a separator in a single allocation.
     "join",
+    # Stage 21 (v0.37.0-alpha): SIMD feature dispatch builtins.
+    "has_feature", "simd_cpu_supports",
 }
 
 # Stage 9 (v0.20.0-alpha — release): per-builtin effect mapping.
@@ -1521,6 +1523,23 @@ class Checker:
             argt(0, "int")
             argt(1, "int")
             return "list[int]"
+        # Stage 21 (v0.37.0-alpha): has_feature("avx2") -> bool — a
+        # COMPILE-TIME constant folded from the --target-feature flag
+        # (cfg(feature) dispatch). Pure; the argument must be a string
+        # LITERAL (the native codegen folds it).
+        if name == "has_feature":
+            need(1)
+            if e["args"][0].get("k") != "str":
+                self.err("has_feature() expects a string literal "
+                         "(it is a compile-time constant)", e)
+            self.check_expr(args[0], env, "str")
+            return "bool"
+        # Stage 21: simd_cpu_supports("avx2") -> bool — runtime CPU
+        # probe (CPUID on x86, NEON compile check on aarch64). Pure.
+        if name == "simd_cpu_supports":
+            need(1)
+            self.check_expr(args[0], env, "str")
+            return "bool"
         # Stage 19 (v0.35.0-alpha): join(list[str], sep) -> str — the
         # O(n) whole-list join (single allocation + single copy per
         # element). Pure (no effects).

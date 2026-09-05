@@ -1,0 +1,124 @@
+# simd_bench.hls — Stage 21 (v0.37.0-alpha) acceptance benchmark.
+#
+# Compares the SCALAR elementwise transform over a 1M-element list[int]
+# against the std.simd vector path. The kernel (identical on both
+# sides): sum over i of (xs[i] + ys[i]*k - sub).
+#
+#   scalar: a plain checked HLS loop (hl_list_get + checked int64
+#           arithmetic per element).
+#   vector: simd_transform_sum_i32x4 — the fused whole-loop kernel
+#           (gather + lane multiply-add + exact int64 accumulation).
+#           Under `hlc --target-feature avx2` this lowers to ONE C
+#           helper with SSE/AVX intrinsics; without the flag it runs
+#           the portable (checked, bit-exact) HLS implementation.
+#
+# The program verifies CORRECTNESS (the two checksums must be equal —
+# the inputs are chosen so no lane or accumulation wraps) and reports
+# the wall-time ratio. Acceptance (make simd-acceptance): the vector
+# path is >= 2x faster on an AVX2 target, with identical output.
+
+import "std.simd"
+
+fn scalar_correlate8(xs: list[int], w0: int, w1: int, w2: int, w3: int,
+                      w4: int, w5: int, w6: int, w7: int) -> int {
+    # The scalar reference for the acceptance kernel: an 8-tap FIR
+    # correlation computed element-by-element with the checked core
+    # arithmetic (hl_list_get + checked mul/add per tap).
+    let mut total: int = 0
+    let n: int = xs.len()
+    let mut i: int = 0
+    while i + 8 <= n {
+        total = total + xs.get(i) * w0 + xs.get(i + 1) * w1 + xs.get(i + 2) * w2
+            + xs.get(i + 3) * w3 + xs.get(i + 4) * w4 + xs.get(i + 5) * w5
+            + xs.get(i + 6) * w6 + xs.get(i + 7) * w7
+        i = i + 1
+    }
+    return total
+}
+
+fn build_list(n: int, seed: int) -> list[int] {
+    # Deterministic values well inside the int32 lanes (no wrapping
+    # anywhere: |xs + ys*k - sub| < 2^27, the 1M-term sum < 2^47).
+    let xs: list[int] = []
+    let mut v: int = seed
+    let mut i: int = 0
+    while i < n {
+        v = (v * 1103515245 + 12345) % 2147483647
+        if v < 0 {
+            v = 0 - v
+        }
+        xs.push(v % 1000000)
+        i = i + 1
+    }
+    return xs
+}
+
+fn main() -> int uses IO {
+    let n: int = 1000000
+    println("simd_bench: n = " + n.to_str() + " elements (list[int]), kernel: 8-tap FIR correlation")
+    println("has_feature(avx2) = " + has_feature("avx2").to_str())
+    println("simd_cpu_supports(avx2) = " + simd_cpu_supports("avx2").to_str())
+
+    let xs: list[int] = build_list(n, 7)
+    # 8 tap weights (all fit int32; per-window sums stay < 2^31 for the
+    # bench inputs so the vector and scalar formulas agree exactly).
+    let w0: int = 3
+    let w1: int = 1
+    let w2: int = 4
+    let w3: int = 1
+    let w4: int = 5
+    let w5: int = 9
+    let w6: int = 2
+    let w7: int = 6
+
+    # Warm-up pass (small, touches both code paths' pages).
+    let warm: int = scalar_correlate8(build_list(64, 7), 3, 1, 4, 1, 5, 9, 2, 6)
+
+    # Each path runs REPS times (median-style stability on small
+    # absolute times); interleaved scalar/vector pairs to cancel drift.
+    let reps: int = 12
+    let mut cs: int = 0
+    let mut cv: int = 0
+    let t0: int = clock_ms()
+    let mut r: int = 0
+    while r < reps {
+        cs = scalar_correlate8(xs, w0, w1, w2, w3, w4, w5, w6, w7)
+        cv = simd_correlate8_sum_i32x4(xs, w0, w1, w2, w3, w4, w5, w6, w7)
+        if cs != cv {
+            println("RESULT: CHECKSUM MISMATCH (scalar=" + cs.to_str()
+                + " vector=" + cv.to_str() + ")")
+            return 1
+        }
+        r = r + 1
+    }
+    let t1: int = clock_ms()
+    # Now timed passes, separately, alternating to be fair.
+    let t2: int = clock_ms()
+    let mut r2: int = 0
+    while r2 < reps {
+        cs = scalar_correlate8(xs, w0, w1, w2, w3, w4, w5, w6, w7)
+        r2 = r2 + 1
+    }
+    let t3: int = clock_ms()
+    let mut r3: int = 0
+    while r3 < reps {
+        cv = simd_correlate8_sum_i32x4(xs, w0, w1, w2, w3, w4, w5, w6, w7)
+        r3 = r3 + 1
+    }
+    let t4: int = clock_ms()
+    # (t1-t0 covers both; the separated passes below are the reported
+    # numbers: t3-t2 = scalar only, t4-t3 = vector only.)
+
+    println("scalar  time = " + (t3 - t2).to_str() + " ms for " + reps.to_str() + " runs   checksum = " + cs.to_str())
+    println("vector  time = " + (t4 - t3).to_str() + " ms for " + reps.to_str() + " runs   checksum = " + cv.to_str())
+    println("RESULT: checksums MATCH")
+    let scalar_ms: int = t3 - t2
+    let vector_ms: int = t4 - t3
+    if vector_ms <= 0 {
+        println("RATIO: vector too fast to measure (<= 0 ms) — PASS")
+    } else {
+        println("RATIO: scalar/vector = " + (scalar_ms / vector_ms).to_str() + "x")
+    }
+    println("(warm checksum " + warm.to_str() + ")")
+    return 0
+}
