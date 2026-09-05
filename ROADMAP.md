@@ -1640,7 +1640,7 @@ per element) cut a full self-compilation from **3.3 s to 0.48 s**.
 
 ---
 
-## STAGE 20 — Link-time optimisation (LTO) across crates ✅ (release v0.36.0-alpha)
+## STAGE 20 — Link-time optimisation (LTO) across crates ✅ (release v0.36.0-alpha, perfected v0.39.0-alpha)
 
 **Work:**
 - Whole-program IR emission: `hlc --emit-lto-ir` produces a single

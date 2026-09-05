@@ -171,7 +171,7 @@ def run_cli():
     # NON-fast build, and --contracts could not be plumbed through at
     # all (interpreter <-> native flag divergence).
     _FLAG_WITH_VALUE = ("--emit", "--target", "--sandbox", "-O",
-                        "--target-feature")
+                        "--target-feature", "--lto-threshold")
     args = []
     i = 0
     while i < len(argv):
@@ -237,6 +237,20 @@ def run_cli():
     while "--lto" in args:
         lto_mode = True
         args.remove("--lto")
+    # Stage 20 perfection (v0.39.0-alpha): --lto-stats and
+    # --lto-threshold are NATIVE-codegen-only flags (the interpreter
+    # doesn't do cross-crate inlining + DCE). Silently accept them so
+    # the same command line works for both paths in differential
+    # testing; they have no effect on interpreter output.
+    while "--lto-stats" in args:
+        args.remove("--lto-stats")
+    while "--lto-threshold" in args:
+        i = args.index("--lto-threshold")
+        if i + 1 < len(args):
+            del args[i:i + 2]
+        else:
+            sys.stderr.write("error: --lto-threshold expects an integer\n")
+            return 2
     while "--target" in args:
         i = args.index("--target")
         if i + 1 < len(args):

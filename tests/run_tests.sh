@@ -558,6 +558,78 @@ else
     bad "&& short-circuit: native compile failed"
 fi
 
+# Stage 20 perfection (v0.39.0-alpha): --lto-stats, --lto-threshold,
+# and generic instantiation dedup verification.
+DEDUP_F=tests/ok/feat_stage20_lto_dedup.hls
+dedup_interp=$(python3 boot/boot.py "$DEDUP_F" </dev/null 2>/dev/null)
+# (a) --lto-stats prints a structured summary; the dedup program
+#     must show 1 generic struct instantiation (Pair[int, int]) and
+#     2 generic fn instantiations (pair_first[int,int], pair_second[int,int]).
+if "$TMP/hlc1" --lto-stats "$DEDUP_F" "$TMP/dedup.c" >"$TMP/dedup.stats" 2>&1; then
+    if grep -q "=== LTO stats ===" "$TMP/dedup.stats" \
+            && grep -q "inline expansions (sites)" "$TMP/dedup.stats" \
+            && grep -q "bodies dropped (phase A+B)" "$TMP/dedup.stats" \
+            && grep -q "inline stmt budget" "$TMP/dedup.stats" \
+            && grep -q "generic fn instantiations   : 2" "$TMP/dedup.stats" \
+            && grep -q "generic struct instantiations: 1" "$TMP/dedup.stats"; then
+        ok "lto-stats: structured summary correct (2 fn insts, 1 struct inst — dedup verified)"
+    else
+        bad "lto-stats: stats summary missing expected fields"
+        cat "$TMP/dedup.stats" | head -10
+    fi
+else
+    bad "lto-stats: --lto-stats compile failed"
+fi
+# (b) the LTO binary must produce byte-identical output to the
+#     interpreter (differential on the dedup program).
+if gcc -O2 -o "$TMP/dedup_bin" "$TMP/dedup.c" -lm -pthread 2>/dev/null; then
+    dedup_nat=$("$TMP/dedup_bin" 2>/dev/null)
+    if [ "$dedup_interp" == "$dedup_nat" ]; then
+        ok "lto-dedup: LTO binary output == interpreter (byte-identical)"
+    else
+        bad "lto-dedup: divergence (interp vs LTO native)"
+        diff <(echo "$dedup_interp") <(echo "$dedup_nat") | head -4
+    fi
+else
+    bad "lto-dedup: gcc failed on LTO output"
+fi
+# (c) the C output must contain exactly ONE definition of each Pair
+#     instantiation (dedup). Count definitions (lines ending in `{`).
+#     Prototypes end in `;` — they are NOT definitions.
+pair_defs=$(grep -c "^static.*usf_new_Pair__int__int.*{$" "$TMP/dedup.c" || true)
+pair_first_defs=$(grep -c "^int64_t usf_pair_first__int__int.*{$" "$TMP/dedup.c" || true)
+pair_second_defs=$(grep -c "^int64_t usf_pair_second__int__int.*{$" "$TMP/dedup.c" || true)
+if [ "$pair_defs" -eq 1 ] && [ "$pair_first_defs" -eq 1 ] && [ "$pair_second_defs" -eq 1 ]; then
+    ok "lto-dedup: 1 def each for Pair[int,int] / pair_first / pair_second (no duplicate instantiations)"
+else
+    bad "lto-dedup: duplicate instantiations (Pair=$pair_defs first=$pair_first_defs second=$pair_second_defs)"
+fi
+# (d) --lto-threshold=N controls inlining. Use feat_stage20_lto.hls
+#     (which has list_sort_int_asc, a bigger function) — threshold=5
+#     must inline FEWER call sites than threshold=60.
+"$TMP/hlc1" --lto-threshold 5 --lto-stats tests/ok/feat_stage20_lto.hls "$TMP/lto_t5.c" >"$TMP/lto_t5.stats" 2>&1
+n_inline_t5=$(grep "inline expansions (sites)" "$TMP/lto_t5.stats" | awk '{print $NF}')
+"$TMP/hlc1" --lto-threshold 60 --lto-stats tests/ok/feat_stage20_lto.hls "$TMP/lto_t60.c" >"$TMP/lto_t60.stats" 2>&1
+n_inline_t60=$(grep "inline expansions (sites)" "$TMP/lto_t60.stats" | awk '{print $NF}')
+if [ "${n_inline_t60:-0}" -gt "${n_inline_t5:-0}" ]; then
+    ok "lto-threshold: higher budget (60) inlines more ($n_inline_t5 -> $n_inline_t60 expansions)"
+else
+    bad "lto-threshold: threshold did not affect inline count ($n_inline_t5 -> $n_inline_t60)"
+fi
+# (e) --lto-threshold rejects out-of-range values.
+if "$TMP/hlc1" --lto-threshold 0 "$DEDUP_F" "$TMP/bad.c" 2>&1 | grep -q "error: --lto-threshold"; then
+    ok "lto-threshold: out-of-range value (0) rejected"
+else
+    bad "lto-threshold: out-of-range value (0) not rejected"
+fi
+# (f) boot.py accepts the new flags silently (no effect on interpreter).
+boot_out=$(python3 boot/boot.py --lto-stats --lto-threshold 30 "$DEDUP_F" 2>/dev/null)
+if [ "$boot_out" == "$dedup_interp" ]; then
+    ok "lto-flags: boot.py accepts --lto-stats / --lto-threshold (interpreter unaffected)"
+else
+    bad "lto-flags: boot.py diverged with --lto-stats / --lto-threshold"
+fi
+
 echo "=== 9. Stage 21: SIMD vectorisation (std.simd + target features) ==="
 # (a) the std.simd semantics test is differentially covered by sections
 #     1/3/4a (it lives in tests/ok); here we verify the INTRINSIC FAST

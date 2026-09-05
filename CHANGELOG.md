@@ -13,6 +13,137 @@ stability (125–140), and final stabilisation toward v1.0 (141–150).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
+## [v0.39.0-alpha] — Stage 20 perfection: LTO stats + tunable threshold + dedup test
+
+> A perfection pass on **Stage 20** (LTO, v0.36.0-alpha). The
+> in-compiler `--lto` pipeline is unchanged (cross-crate inlining +
+> two-phase DCE + generic instantiation dedup; the 52% binary-size
+> drop and byte-identical output on all ok/ programs still hold).
+> This release closes the operational gaps around LTO OBSERVABILITY
+> and TUNABILITY:
+>
+> - **`hlc --lto-stats`** — print a structured summary of LTO work
+>   after codegen: total functions in the program, inline expansions
+>   (sites), distinct callees inlined, bodies dropped (phase A+B),
+>   the per-callee statement budget in effect, the generic
+>   instantiation counts (fn / struct / enum), and the list of
+>   inlined callee keys. Implies `--lto`.
+> - **`hlc --lto-threshold N`** — override the per-callee statement
+>   budget (default 30, range 1..=200). Lower = less inlining +
+>   smaller compile-time; higher = more inlining + binary bloat.
+>   Implies `--lto`. Validated (rejects 0, negative, > 200, non-int).
+> - **`boot.py` parity**: `--lto-stats` and `--lto-threshold N` are
+>   silently accepted by the interpreter (they are native-codegen-
+>   only flags; the interpreter doesn't do cross-crate inlining).
+>   The same command line works for both paths in differential
+>   testing. `--lto-threshold` is now in `_FLAG_WITH_VALUE` so its
+>   integer argument is correctly consumed (was being treated as a
+>   positional arg, breaking the file path).
+> - **Makefile targets**: `lto-stats`, `lto-threshold`, `lto-bench`
+>   (compile + measure binary size on a stdlib-heavy program, plain
+>   vs LTO).
+> - **`tests/ok/feat_stage20_lto_dedup.hls`** — a new differential
+>   test program that instantiates a generic `Pair[T, U]` at two
+>   call sites with the same type arguments, plus calls two generic
+>   helpers (`pair_first`, `pair_second`) twice each. The LTO output
+>   must contain exactly ONE definition of each instantiation (the
+>   dedup contract).
+> - **9 new tests** in `tests/run_tests.sh` section 8 (lto-stats
+>   summary structure, dedup differential, dedup C-symbol count,
+>   threshold effect on inline count, out-of-range threshold
+>   rejection, boot.py parity). 602/602 tests PASS, bootstrap
+>   deterministic, Stage 20 acceptance re-verified (52% size drop).
+
+### Stage 20 perfection — `--lto-stats`
+
+#### Added — `hlc --lto-stats <input.hls> <output.c>`
+
+- Prints a structured LTO work summary to stdout after the C code is
+  written to the output file. The summary covers:
+  - functions in program (total)
+  - inline expansions (sites) — how many call sites were inlined
+  - distinct callees inlined — how many unique functions were inlined
+    at least once
+  - bodies dropped (phase A+B) — unreachable functions (phase A) +
+    fully-inlined functions whose standalone body was spliced out
+    (phase B)
+  - inline stmt budget — the per-callee statement budget in effect
+    (default 30, or `--lto-threshold N`)
+  - generic fn / struct / enum instantiations — the dedup count
+    (two modules instantiating the same generic with the same type
+    args share ONE specialisation)
+  - the list of inlined callee keys (for debugging)
+- Implies `--lto`. Compatible with `--lto-threshold`.
+
+### Stage 20 perfection — `--lto-threshold N`
+
+#### Added — tunable per-callee statement budget
+
+- `hlc --lto-threshold N` overrides `LTO_INLINE_MAX_STMTS` (the
+  per-callee statement budget, default 30). The budget gates which
+  small single-return functions are eligible for cross-crate
+  inlining: a callee with more statements than the budget is left
+  as an out-of-line call.
+- Range: 1..=200. Validated at parse time (rejects 0, negative,
+  > 200, non-integer). Implies `--lto`.
+- Use cases: `--lto-threshold 5` for minimal inlining (fastest
+  compile, smallest LTO work); `--lto-threshold 100` for aggressive
+  inlining (smallest binary, slowest compile).
+
+### Stage 20 perfection — `boot.py` parity
+
+#### Fixed — `--lto-threshold` was treated as a positional arg
+
+- `boot.py`'s leading-flag collection loop checks `_FLAG_WITH_VALUE`
+  to decide whether to consume the next argument. `--lto-threshold`
+  was NOT in this tuple, so `boot.py --lto-threshold 30 file.hls`
+  treated `30` as the entry file path (and `file.hls` as a program
+  argument). Fixed by adding `--lto-threshold` to the tuple.
+- `--lto-stats` (a boolean flag) is now also recognised and silently
+  ignored by the interpreter (it's a native-codegen-only flag).
+
+### Stage 20 perfection — Makefile targets
+
+- `make lto-stats F=prog.hls` — compile with `--lto-stats` and link
+  the result (the stats summary is printed during compilation).
+- `make lto-threshold F=prog.hls [N=20]` — compile with a custom
+  inline budget and print the stats.
+- `make lto-bench F=prog.hls` — compile + measure binary size on a
+  stdlib-heavy program (plain vs LTO); prints the size drop percentage.
+
+### Stage 20 perfection — tests
+
+- `tests/ok/feat_stage20_lto_dedup.hls` — a new differential test
+  program. Instantiates a generic `Pair[T, U]` at two call sites
+  with the same type arguments (`make_pair_int` and `swap_pair_int`
+  both return `Pair[int, int]`), and calls two generic helpers
+  (`pair_first[int, int]`, `pair_second[int, int]`) twice each. The
+  LTO output must contain exactly ONE definition of each
+  instantiation — the dedup contract.
+- `tests/run_tests.sh` section 8 gains 6 new checks:
+  1. `--lto-stats` prints a structured summary with the expected
+     fields (inline count, dropped count, generic instantiation
+     counts matching the dedup program's 2 fn insts + 1 struct inst).
+  2. The LTO binary's output is byte-identical to the interpreter
+     (differential on the dedup program).
+  3. The C output contains exactly ONE definition of each Pair
+     instantiation (no duplicate `usf_*` symbols).
+  4. `--lto-threshold 5` inlines fewer call sites than
+     `--lto-threshold 60` on a program with a bigger function
+     (`feat_stage20_lto.hls`'s `list_sort_int_asc`).
+  5. `--lto-threshold 0` is rejected with the expected error message.
+  6. `boot.py --lto-stats --lto-threshold 30` produces the same
+     output as the unflagged interpreter run (parity).
+
+### Test results
+
+- 602 PASS / 0 FAIL (593 prior + 9 new Stage-20 perfection checks).
+- Bootstrap: deterministic.
+- Stage 20 acceptance re-verified: 52% binary-size drop on the
+  "hello world + stdlib imports" program (target ≥ 15%); output
+  byte-identical on all 105 ok/ programs across interpreter, plain
+  native, and LTO native.
+
 ## [v0.38.0-alpha] — Stage 19 perfection: PGO profile utilities + percentile breakdown
 
 > A perfection pass on **Stage 19** (PGO, v0.35.0-alpha). The

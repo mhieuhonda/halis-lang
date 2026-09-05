@@ -255,6 +255,14 @@ struct Ctx {
     lto_dropped: int,
     # lto_inlined_report: callee keys inlined at least once (stats).
     lto_inlined_report: list[str],
+    # Stage 20 perfection (v0.39.0-alpha): tunable inline threshold.
+    # lto_threshold: --lto-threshold=N — overrides LTO_INLINE_MAX_STMTS
+    # (the per-callee statement budget). 0 = use the default (30).
+    lto_threshold: int,
+    # lto_stats: --lto-stats — print a summary of LTO work (inline
+    # count, dropped functions, generic instantiation dedup, total
+    # functions before/after) to stderr after codegen.
+    lto_stats: bool,
     # ---- Stage 21 (v0.37.0-alpha): SIMD vectorisation ----
     # target_feature: --target-feature sse4.2|avx2|neon — enables the
     # std.simd intrinsic fast paths in gen_call and const-folds
@@ -297,6 +305,7 @@ fn new_ctx(src: str) -> Ctx {
         pgo_slit_n: 0, pgo_slits: [],
         lto_mode: false, lto_calls: map_new(), lto_fn_start: map_new(),
         lto_inline_n: 0, lto_dropped: 0, lto_inlined_report: [],
+        lto_threshold: 0, lto_stats: false,
         target_feature: "", simd_helpers_main: [], simd_helpers_alt: [],
         simd_helpers_plain: [], simd_helper_names: []
     }
@@ -9541,11 +9550,20 @@ fn lto_is_recursive(ctx: Ctx, key: str) -> bool {
 
 # LTO_INLINE_MAX_SITES: total inline expansions per program (bloat
 # guard). LTO_INLINE_MAX_STMTS: per-callee statement budget.
+# Stage 20 perfection (v0.39.0-alpha): the per-callee budget is
+# tunable via --lto-threshold=N (ctx.lto_threshold > 0 overrides
+# the default of 30).
 fn LTO_INLINE_MAX_SITES() -> int {
     return 100
 }
 fn LTO_INLINE_MAX_STMTS() -> int {
     return 30
+}
+fn lto_inline_stmts_budget(ctx: Ctx) -> int {
+    if ctx.lto_threshold > 0 {
+        return ctx.lto_threshold
+    }
+    return LTO_INLINE_MAX_STMTS()
 }
 
 # lto_can_inline: the inlinability predicate.
@@ -9599,7 +9617,7 @@ fn lto_can_inline(ctx: Ctx, key: str) -> bool {
     if lto_body_has_qmark(ctx, f.body) {
         return false
     }
-    if lto_count_stmts(ctx, f.body) > LTO_INLINE_MAX_STMTS() {
+    if lto_count_stmts(ctx, f.body) > lto_inline_stmts_budget(ctx) {
         return false
     }
     if lto_is_recursive(ctx, key) {
@@ -12749,6 +12767,9 @@ fn main() -> int uses IO {
     let mut pgo_gen: bool = false
     let mut pgo_use_path: str = ""
     let mut lto_mode: bool = false
+    # Stage 20 perfection (v0.39.0-alpha): --lto-stats and --lto-threshold.
+    let mut lto_stats: bool = false
+    let mut lto_threshold: int = 0
     let mut target_feature: str = ""
     let a: list[str] = []
     let mut ai: int = 1
@@ -12764,6 +12785,29 @@ fn main() -> int uses IO {
             # Stage 20 (v0.36.0-alpha): link-time optimisation across
             # crates — cross-crate inlining + whole-program DCE.
             lto_mode = true
+        } else if tok == "--lto-stats" {
+            # Stage 20 perfection (v0.39.0-alpha): print a summary of
+            # LTO work (inline count, dropped functions, generic
+            # instantiation dedup, total functions before/after) to
+            # stderr after codegen. Implies --lto.
+            lto_mode = true
+            lto_stats = true
+        } else if tok == "--lto-threshold" {
+            # Stage 20 perfection (v0.39.0-alpha): override the
+            # per-callee statement budget (default 30). Implies --lto.
+            if ai + 1 >= argv.len() {
+                println("error: --lto-threshold expects an integer (1..=200)")
+                return 2
+            }
+            let n_str: str = argv.get(ai + 1)
+            let n: int = int(n_str)
+            if n_str != n.to_str() || n < 1 || n > 200 {
+                println("error: --lto-threshold expects an integer in 1..=200 (got '" + n_str + "')")
+                return 2
+            }
+            lto_mode = true
+            lto_threshold = n
+            ai = ai + 1
         } else if tok == "--target-feature" {
             # Stage 21 (v0.37.0-alpha): enable the std.simd intrinsic
             # fast paths + const-fold has_feature().
@@ -12834,7 +12878,8 @@ fn main() -> int uses IO {
     }
     if a.len() < 2 {
         println("usage: hlc [--fast | -O fast] [--contracts] [--pgo-generate] [--pgo-use <profile>]")
-        println("              [--lto] [--target-feature sse4.2|avx2|neon] <input.hls> <output.c|->")
+        println("              [--lto] [--lto-stats] [--lto-threshold N] [--target-feature sse4.2|avx2|neon]")
+        println("              <input.hls> <output.c|->")
         println("       hlc --audit <input.hls>")
         return 1
     }
@@ -12847,6 +12892,8 @@ fn main() -> int uses IO {
     ctx.contracts_mode = contracts_mode
     ctx.pgo_gen = pgo_gen
     ctx.lto_mode = lto_mode
+    ctx.lto_threshold = lto_threshold
+    ctx.lto_stats = lto_stats
     ctx.target_feature = target_feature
     # Stage 19: load the --pgo-use profile BEFORE codegen (the branch /
     # fn-attribute hints consult it during generation).
@@ -12888,7 +12935,53 @@ fn main() -> int uses IO {
     } else {
         write_file(out_path, code)
     }
+    # Stage 20 perfection (v0.39.0-alpha): --lto-stats — print a
+    # summary of LTO work to stderr. Only emitted under --lto-stats.
+    if ctx.lto_stats {
+        print_lto_stats(ctx)
+    }
     return 0
+}
+
+# Stage 20 perfection (v0.39.0-alpha): print the LTO work summary.
+# Reports: total functions in the program, unreachable functions
+# dropped by phase-A DCE, fully-inlined functions dropped by phase-B
+# DCE, total inline expansions, distinct callees inlined, the
+# per-callee statement budget in effect, and the generic instantiation
+# count (instantiations emitted; the dedup means two modules
+# instantiating the same generic with the same type args share ONE
+# specialisation).
+#
+# Stats are printed to STDOUT after the C code is written to the
+# output file. When `out_path == "-"` (code to stdout), the stats
+# follow the code — callers wanting machine-parsed stats should use
+# a file output path.
+fn print_lto_stats(ctx: Ctx) -> void uses IO {
+    let total_fns: int = ctx.fn_order.len()
+    let inlined_keys: int = ctx.lto_inlined_report.len()
+    let dropped: int = ctx.lto_dropped
+    let inline_n: int = ctx.lto_inline_n
+    let budget: int = lto_inline_stmts_budget(ctx)
+    let gen_insts: int = ctx.fn_insts.len()
+    let struct_insts: int = ctx.struct_insts.len()
+    let enum_insts: int = ctx.enum_insts.len()
+    println("=== LTO stats ===")
+    println("  functions in program        : " + total_fns.to_str())
+    println("  inline expansions (sites)   : " + inline_n.to_str())
+    println("  distinct callees inlined    : " + inlined_keys.to_str())
+    println("  bodies dropped (phase A+B)  : " + dropped.to_str())
+    println("  inline stmt budget          : " + budget.to_str() + " (--lto-threshold)")
+    println("  generic fn instantiations   : " + gen_insts.to_str())
+    println("  generic struct instantiations: " + struct_insts.to_str())
+    println("  generic enum instantiations : " + enum_insts.to_str())
+    if inlined_keys > 0 {
+        println("  inlined callees:")
+        let mut i: int = 0
+        while i < inlined_keys {
+            println("    " + ctx.lto_inlined_report.get(i))
+            i = i + 1
+        }
+    }
 }
 
 # Stage 9-beta: print the capability / effect tree of every function.
