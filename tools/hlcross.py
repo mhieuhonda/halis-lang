@@ -69,6 +69,10 @@ TARGETS = {
         "binary_suffix": "",
         "link_libs": ["-lm", "-lpthread"],
         "mingw": False,
+        # Stage 25 (v0.44.0-alpha): security hardening flags applied
+        # when --security pac+bti (or auto on aarch64-darwin/graviton).
+        # Empty for x86-64 (PAC/BTI are ARM-specific).
+        "security_flags": [],
     },
     "x86_64-unknown-freebsd": {
         "arch": "x86_64",
@@ -79,6 +83,7 @@ TARGETS = {
         "binary_suffix": "",
         "link_libs": ["-lm", "-lpthread"],
         "mingw": False,
+        "security_flags": [],
     },
     "aarch64-apple-darwin": {
         "arch": "arm64",
@@ -89,6 +94,44 @@ TARGETS = {
         "binary_suffix": "",
         "link_libs": ["-lm"],
         "mingw": False,
+        # Stage 25: Apple Silicon supports PAC (Pointer Authentication)
+        # and BTI (Branch Target Identification). The default
+        # -mbranch-protection leaves the compiler's default; passing
+        # pac-ret+bti enables both. Applied only when --security pac+bti
+        # is given (default: auto, which enables on Apple Silicon when
+        # the cross-linker is zig cc).
+        "security_flags": ["-mbranch-protection=pac-ret+bti"],
+    },
+    # Stage 25 (v0.44.0-alpha): AArch64 Linux targets (Graviton 3+,
+    # Raspberry Pi 4, etc.). The C backend is portable ANSI C11; the
+    # cross-compilation reduces to picking the right cross-linker
+    # (zig cc, aarch64-linux-gnu-gcc) and the right security flags
+    # (BTI on Graviton 3+; PAC + BTI on Apple Silicon emulation).
+    "aarch64-linux-gnu": {
+        "arch": "arm64",
+        "os": "linux",
+        "abi": "gnu",
+        "binary_format": "ELF aarch64 (Little Endian)",
+        "object_suffix": ".o",
+        "binary_suffix": "",
+        "link_libs": ["-lm", "-lpthread"],
+        "mingw": False,
+        # Stage 25: Graviton 3+ supports BTI (Branch Target
+        # Identification). PAC is also supported on Graviton 4. The
+        # default -mbranch-protection=bti enables just BTI; pass
+        # pac-ret+bti for full PAC+BTI (Apple Silicon + Graviton 4).
+        "security_flags": ["-mbranch-protection=bti"],
+    },
+    "aarch64-unknown-linux-gnu": {
+        "arch": "arm64",
+        "os": "linux",
+        "abi": "gnu",
+        "binary_format": "ELF aarch64 (Little Endian)",
+        "object_suffix": ".o",
+        "binary_suffix": "",
+        "link_libs": ["-lm", "-lpthread"],
+        "mingw": False,
+        "security_flags": ["-mbranch-protection=bti"],
     },
     "x86_64-pc-windows-msvc": {
         "arch": "x86_64",
@@ -99,6 +142,7 @@ TARGETS = {
         "binary_suffix": ".exe",
         "link_libs": [],
         "mingw": False,
+        "security_flags": [],
     },
     "x86_64-pc-windows-gnu": {
         "arch": "x86_64",
@@ -109,6 +153,7 @@ TARGETS = {
         "binary_suffix": ".exe",
         "link_libs": ["-lm"],
         "mingw": True,
+        "security_flags": [],
     },
 }
 
@@ -123,6 +168,14 @@ TARGET_ALIASES = {
     "windows": "x86_64-pc-windows-gnu",
     "windows-msvc": "x86_64-pc-windows-msvc",
     "windows-gnu": "x86_64-pc-windows-gnu",
+    # Stage 25 (v0.44.0-alpha): AArch64 Linux aliases.
+    "aarch64-linux": "aarch64-linux-gnu",
+    "aarch64": "aarch64-linux-gnu",
+    "arm64": "aarch64-linux-gnu",
+    "arm64-linux": "aarch64-linux-gnu",
+    "graviton": "aarch64-linux-gnu",
+    "rpi4": "aarch64-linux-gnu",
+    "raspberrypi": "aarch64-linux-gnu",
 }
 
 
@@ -220,6 +273,16 @@ def find_target_linker(target: str) -> Tuple[Optional[str], List[str], str]:
             p = _which(name)
             if p:
                 return (p, ["-O2"], "freebsd-gcc")
+    # Stage 25 (v0.44.0-alpha): aarch64-linux-gnu cross-linkers.
+    if target in ("aarch64-linux-gnu", "aarch64-unknown-linux-gnu"):
+        # Try the Debian/Ubuntu-style cross-compiler name first.
+        for name in ("aarch64-linux-gnu-gcc",
+                     "aarch64-linux-gnu-gcc-12",
+                     "aarch64-linux-gnu-gcc-11",
+                     "aarch64-linux-gnu-cc"):
+            p = _which(name)
+            if p:
+                return (p, ["-O2"], "aarch64-linux-gnu-gcc")
 
     # 3. host compiler when target == host (native build — useful for
     #    testing the pipeline end-to-end without a real cross-linker).
@@ -296,7 +359,9 @@ def run(cmd: List[str], capture: bool = False) -> Tuple[int, str]:
 
 def cross_compile(input_hls: str, output_bin: str, target: str,
                   linker_kind: str = "auto", keep_c: Optional[str] = None,
-                  dry_run: bool = False, hlc: str = "bin/hlc") -> int:
+                  dry_run: bool = False, hlc: str = "bin/hlc",
+                  security: str = "auto",
+                  target_feature: str = "") -> int:
     """Cross-compile an HLS program to a foreign binary.
 
     Steps:
@@ -345,7 +410,13 @@ def cross_compile(input_hls: str, output_bin: str, target: str,
               f"-o {output_bin}")
         return 0
     print(f"[1/2] hlc: compiling {input_hls} -> {c_path}")
-    code, _ = run([hlc, input_hls, c_path])
+    # Stage 25 (v0.44.0-alpha): pass --target-feature through to hlc
+    # when given (enables NEON/SSE/AVX intrinsic fast paths for std.simd).
+    hlc_cmd = [hlc, input_hls, c_path]
+    if target_feature:
+        hlc_cmd.append("--target-feature")
+        hlc_cmd.append(target_feature)
+    code, _ = run(hlc_cmd)
     if code != 0:
         print(f"error: hlc failed (exit {code})", file=sys.stderr)
         return 1
@@ -363,7 +434,20 @@ def cross_compile(input_hls: str, output_bin: str, target: str,
         return 3  # 3 = SKIP (no cross-linker available)
     out_path = output_bin + spec["binary_suffix"]
     print(f"[2/2] {kind}: linking {c_path} -> {out_path}")
-    cmd = [linker] + base_args + [c_path, "-o", out_path] + spec["link_libs"]
+    # Stage 25 (v0.44.0-alpha): apply the target's security_flags when
+    # --security auto (default) or --security pac+bti is given. The
+    # flags are -mbranch-protection=... for AArch64 targets; empty for
+    # x86-64 / Windows (PAC/BTI are ARM-specific).
+    sec_flags = []
+    if security == "auto":
+        sec_flags = spec.get("security_flags", [])
+    elif security == "pac+bti":
+        sec_flags = ["-mbranch-protection=pac-ret+bti"]
+    elif security == "bti":
+        sec_flags = ["-mbranch-protection=bti"]
+    elif security == "off":
+        sec_flags = []
+    cmd = [linker] + base_args + sec_flags + [c_path, "-o", out_path] + spec["link_libs"]
     code, _ = run(cmd)
     if code != 0:
         print(f"error: linker failed (exit {code})", file=sys.stderr)
@@ -428,6 +512,19 @@ def main() -> int:
                     help="print the host's canonical triple and exit")
     ap.add_argument("--hlc", default="bin/hlc",
                     help="path to the native hlc compiler (default: bin/hlc)")
+    # Stage 25 (v0.44.0-alpha): --security controls AArch64 PAC/BTI.
+    ap.add_argument("--security", default="auto",
+                    choices=["auto", "pac+bti", "bti", "off"],
+                    help="Stage 25: AArch64 security hardening "
+                         "(default: auto = use target's default; "
+                         "pac+bti = full PAC + BTI; bti = BTI only; "
+                         "off = no hardening)")
+    # Stage 25: --target-feature neon passes through to hlc.
+    ap.add_argument("--target-feature", default="",
+                    choices=["", "neon", "sse4.2", "avx2", "native"],
+                    help="Stage 25: enable std.simd intrinsic fast paths "
+                         "(neon for AArch64; sse4.2/avx2 for x86; "
+                         "native = auto-detect host)")
     args = ap.parse_args()
 
     if args.list_targets:
@@ -439,7 +536,9 @@ def main() -> int:
                  "--show-host)")
     return cross_compile(args.input, args.output, args.target,
                          linker_kind=args.linker, keep_c=args.keep_c,
-                         dry_run=args.dry_run, hlc=args.hlc)
+                         dry_run=args.dry_run, hlc=args.hlc,
+                         security=args.security,
+                         target_feature=args.target_feature)
 
 
 if __name__ == "__main__":

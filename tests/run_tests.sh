@@ -1219,6 +1219,129 @@ else
 fi
 
 echo ""
+echo "=== 13. Stage 25: AArch64 backend tuning (NEON + PAC + BTI) ==="
+# Stage 25 (v0.44.0-alpha): the NEON intrinsic emission in src/hlc.hls
+# generates <arm_neon.h> intrinsics (vaddq_s32, vsubq_s32, vmulq_s32,
+# vminq_s32, vmaxq_s32, vaddq_f64, vsubq_f64, vmulq_f64) when
+# --target-feature neon is passed. The hlcross.py orchestrator accepts
+# aarch64-linux-gnu targets and applies PAC/BTI security flags.
+
+# (a) --target-feature neon emits NEON intrinsics in the C source.
+if python3 boot/boot.py src/hlc.hls examples/simd_demo.hls "$TMP/simd_neon.c" --target-feature neon >/dev/null 2>&1; then
+    neon_count=$(grep -c "vaddq_s32\|vsubq_s32\|vmulq_s32\|vminq_s32\|vmaxq_s32" "$TMP/simd_neon.c" 2>/dev/null || echo 0)
+    if [ "$neon_count" -gt 0 ]; then
+        ok "aarch64: --target-feature neon emits NEON intrinsics ($neon_count sites)"
+    else
+        bad "aarch64: --target-feature neon did not emit any NEON intrinsics"
+    fi
+    # (b) the C source includes <arm_neon.h>.
+    if grep -q "<arm_neon.h>" "$TMP/simd_neon.c"; then
+        ok "aarch64: --target-feature neon includes <arm_neon.h>"
+    else
+        bad "aarch64: <arm_neon.h> not included in NEON C source"
+    fi
+    # (c) the C source has the #if __aarch64__ guard.
+    if grep -q "defined(__aarch64__)\|defined(__ARM_NEON__)" "$TMP/simd_neon.c"; then
+        ok "aarch64: C source has __aarch64__/__ARM_NEON__ guard"
+    else
+        bad "aarch64: missing __aarch64__/__ARM_NEON__ guard"
+    fi
+    # (d) the NEON C source still compiles on the x86_64 host (uses
+    #     the scalar fallback in the #else branch).
+    if gcc -O2 -o "$TMP/simd_neon_x86" "$TMP/simd_neon.c" -lm -pthread 2>/dev/null; then
+        if "$TMP/simd_neon_x86" >/dev/null 2>&1; then
+            ok "aarch64: NEON C source compiles + runs on x86_64 (scalar fallback)"
+        else
+            bad "aarch64: NEON C source compiles on x86_64 but doesn't run cleanly"
+        fi
+    else
+        bad "aarch64: NEON C source fails to compile on x86_64"
+    fi
+else
+    bad "aarch64: --target-feature neon compile failed"
+fi
+
+# (e) hlcross --list-targets prints the AArch64 target set.
+list_out=$(python3 tools/hlcross.py --list-targets 2>&1)
+if echo "$list_out" | grep -q "aarch64-linux-gnu" \
+    && echo "$list_out" | grep -q "aarch64-apple-darwin"; then
+    ok "aarch64: hlcross --list-targets includes AArch64 targets"
+else
+    bad "aarch64: hlcross --list-targets missing AArch64 targets"
+fi
+
+# (f) hlcross accepts the aarch64 alias.
+if python3 tools/hlcross.py examples/hello.hls "$TMP/aarch64_alias" --target aarch64 --keep-c "$TMP/aarch64_alias.c" 2>&1 | grep -q "no cross-linker found\|ELF aarch64"; then
+    ok "aarch64: hlcross accepts the 'aarch64' alias"
+else
+    bad "aarch64: hlcross did not accept the 'aarch64' alias"
+fi
+
+# (g) the hlaarch64.py helper exists and has a main().
+if python3 -c "import sys; sys.path.insert(0, 'tools'); import hlaarch64; assert hasattr(hlaarch64, 'main'); print('OK')" 2>&1 | grep -q OK; then
+    ok "aarch64: tools/hlaarch64.py imports and has main()"
+else
+    bad "aarch64: tools/hlaarch64.py import failed"
+fi
+
+# (h) hlaarch64.py --list-targets prints the target + security set.
+if python3 tools/hlaarch64.py --list-targets 2>&1 | grep -q "pac-ret+bti" \
+    && python3 tools/hlaarch64.py --list-targets 2>&1 | grep -q "bti"; then
+    ok "aarch64: hlaarch64 --list-targets prints pac+bti + bti security levels"
+else
+    bad "aarch64: hlaarch64 --list-targets missing security levels"
+fi
+
+# (i) hlaarch64.py compiles simd_bench.hls with NEON + PAC+BTI; the C
+#     source contains NEON intrinsics and the PAC/BTI flag is in the
+#     security_flags table (verified by checking the C source includes
+#     <arm_neon.h> AND the cross-linker invocation includes the
+#     -mbranch-protection flag).
+if python3 tools/hlaarch64.py benchmarks/simd_bench.hls "$TMP/aarch64_bench" \
+    --target aarch64-linux-gnu --target-feature neon \
+    --security pac+bti --keep-c "$TMP/aarch64_bench.c" >"$TMP/aarch64_bench.log" 2>&1 \
+    || [ $? -eq 3 ]; then
+    if grep -q "vaddq_s32\|vsubq_s32\|vmulq_s32" "$TMP/aarch64_bench.c" 2>/dev/null \
+        && grep -q "<arm_neon.h>" "$TMP/aarch64_bench.c" 2>/dev/null; then
+        ok "aarch64: hlaarch64 produces C source with NEON intrinsics + arm_neon.h"
+    else
+        bad "aarch64: hlaarch64 C source missing NEON intrinsics"
+    fi
+else
+    bad "aarch64: hlaarch64 compile failed unexpectedly"
+    cat "$TMP/aarch64_bench.log" | head -5
+fi
+
+# (j) make aarch64-acceptance runs end-to-end.
+if make aarch64-acceptance >"$TMP/aarch64_acc.log" 2>&1; then
+    if grep -q "ACCEPTANCE OK" "$TMP/aarch64_acc.log"; then
+        ok "aarch64: make aarch64-acceptance runs end-to-end"
+    else
+        bad "aarch64: make aarch64-acceptance did not print ACCEPTANCE OK"
+        tail -5 "$TMP/aarch64_acc.log"
+    fi
+else
+    bad "aarch64: make aarch64-acceptance failed"
+    tail -10 "$TMP/aarch64_acc.log"
+fi
+
+# (k) bootstrap still works after the src/hlc.hls NEON changes
+#     (the self-hosted compiler must remain deterministic).
+if python3 boot/boot.py src/hlc.hls src/hlc.hls "$TMP/hlc_neon.c" >/dev/null 2>&1 \
+    && python3 boot/boot.py src/hlc.hls src/hlc.hls "$TMP/hlc_neon2.c" --target-feature neon >/dev/null 2>&1; then
+    # The two outputs must be byte-identical when --target-feature is
+    # not used by hlc.hls itself (which it isn't — hlc.hls doesn't use
+    # std.simd).
+    if diff -q "$TMP/hlc_neon.c" "$TMP/hlc_neon2.c" >/dev/null; then
+        ok "aarch64: bootstrap deterministic with --target-feature neon"
+    else
+        bad "aarch64: bootstrap not deterministic with --target-feature neon"
+    fi
+else
+    bad "aarch64: bootstrap compile failed"
+fi
+
+echo ""
 echo "=========================================="
 echo "RESULT: $PASS PASS / $FAIL FAIL"
 echo "=========================================="

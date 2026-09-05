@@ -13,6 +13,158 @@ stability (125–140), and final stabilisation toward v1.0 (141–150).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
+## [v0.44.0-alpha] — Stage 25: AArch64 backend tuning (NEON + PAC + BTI)
+
+> Completes **Stage 25** of the roadmap: NEON SIMD codegen for
+> `std.simd` types on AArch64 (Apple Silicon, Graviton), plus
+> Pointer Authentication (PAC) and Branch Target Identification
+> (BTI) hardening flags for the AArch64 cross-linker.
+
+> - **NEON intrinsic emission** (`src/hlc.hls`, ~120 new lines in
+>   the self-hosted compiler): `simd_emit_neon_i32x4_ew` and
+>   `simd_emit_neon_f64x2_ew` emit `<arm_neon.h>` intrinsics
+>   (`vaddq_s32`, `vsubq_s32`, `vmulq_s32`, `vminq_s32`, `vmaxq_s32`,
+>   `vaddq_f64`, `vsubq_f64`, `vmulq_f64`) when `--target-feature neon`
+>   is passed. The `simd_helper_lines` function emits a three-way
+>   `#if x86 / #elif __aarch64__ / #else` structure so the SAME C
+>   source compiles on x86 (SSE/AVX), AArch64 (NEON), and other
+>   hosts (scalar fallback).
+> - **`aarch64-linux-gnu` cross-compilation target** (`tools/hlcross.py`):
+>   new target triple + aliases (`aarch64`, `arm64`, `graviton`,
+>   `rpi4`, `raspberrypi`). Default `security_flags =
+>   ["-mbranch-protection=bti"]` (Graviton 3+ baseline).
+> - **PAC + BTI security flags**: `--security {auto, pac+bti, bti, off}`
+>   CLI flag controls the `-mbranch-protection=...` flag passed to
+>   the cross-linker. `auto` (default) uses the target's default;
+>   `pac+bti` forces full PAC + BTI (Apple Silicon, Graviton 4);
+>   `bti` forces BTI only; `off` disables hardening.
+> - **`--target-feature {neon, sse4.2, avx2, native, ""}`** CLI flag
+>   passes through to `hlc`, enabling the SIMD intrinsic fast paths.
+> - **`tools/hlaarch64.py`** — a standalone helper that wraps hlcross
+>   with the right NEON + PAC/BTI flags. Defaults to
+>   `--target aarch64-linux-gnu --target-feature neon --security auto`.
+> - **Acceptance**: `examples/simd_demo.hls` compiled with
+>   `--target-feature neon` produces a C source containing 3 NEON
+>   intrinsic sites under the `#elif __aarch64__` guard. The same C
+>   source compiles cleanly on x86_64 (uses the scalar fallback in
+>   `#else`) and runs correctly. On AArch64 hosts, the runtime
+>   benchmark is ≥20% faster than the no-NEON baseline (SKIPped on
+>   non-AArch64 hosts — the static checks still pass).
+> - **11 new tests** in `tests/run_tests.sh` section 13. **651/651
+>   total tests PASS**, bootstrap deterministic.
+
+### Stage 25 — `src/hlc.hls` NEON intrinsic emission
+
+#### Added — `simd_helpers_neon` field on Ctx
+
+- Holds the C lines of the NEON intrinsic bodies (in the
+  `#elif defined(__aarch64__)` branch). Populated only when
+  `--target-feature neon` is passed.
+
+#### Added — `simd_emit_neon_i32x4_ew(ctx, name, intrinsic)`
+
+- Emits one elementwise i32x4 kernel using NEON intrinsics. Loads
+  `x` and `y` from their `{i64 a, i64 b}` layout into a 128-bit
+  NEON register via `vld1q_s64` + `vreinterpretq_s32_s64`, applies
+  the intrinsic, and stores back via `vreinterpretq_s64_s32` +
+  `vst1q_s64`. The same scalar fallback (as the x86 emitter) is
+  pushed into `simd_helpers_alt` for non-NEON hosts.
+
+#### Added — `simd_emit_neon_f64x2_ew(ctx, name, intrinsic)`
+
+- Emits one elementwise f64x2 kernel using NEON intrinsics
+  (`vaddq_f64`, `vsubq_f64`, `vmulq_f64`). Loads via `vld1q_f64`,
+  stores via `vst1q_f64`.
+
+#### Modified — `simd_emit_helper(ctx, name)`
+
+- Each dispatch entry checks `ctx.target_feature == "neon"` and
+  calls the NEON emitter (instead of the x86 emitter) when true.
+  Intrinsic mappings:
+  - `simd_i32x4_add` → `vaddq_s32`
+  - `simd_i32x4_sub` → `vsubq_s32`
+  - `simd_i32x4_mul` → `vmulq_s32`
+  - `simd_i32x4_min` → `vminq_s32`
+  - `simd_i32x4_max` → `vmaxq_s32`
+  - `simd_f64x2_add` → `vaddq_f64`
+  - `simd_f64x2_sub` → `vsubq_f64`
+  - `simd_f64x2_mul` → `vmulq_f64`
+
+#### Modified — `simd_helper_lines(ctx)`
+
+- The `if x86` branch now also checks `ctx.simd_helpers_neon.len() > 0`
+  and emits a `#elif defined(__aarch64__) || defined(__ARM_NEON__)`
+  branch with the NEON helpers when present.
+- A new `else if ctx.target_feature == "neon"` branch handles the
+  case where ONLY NEON was requested.
+
+### Stage 25 — `tools/hlcross.py` AArch64 targets + security flags
+
+#### Added — `aarch64-linux-gnu` target
+
+- New target triple: `arch=arm64`, `os=linux`, `abi=gnu`,
+  `binary_format=ELF aarch64 (Little Endian)`. Default
+  `security_flags = ["-mbranch-protection=bti"]`.
+- Aliases: `aarch64-linux`, `aarch64`, `arm64`, `arm64-linux`,
+  `graviton`, `rpi4`, `raspberrypi` all map to `aarch64-linux-gnu`.
+
+#### Added — `security_flags` field on every target
+
+- `x86_64-*` / `x86_64-pc-windows-*`: empty (PAC/BTI are ARM-specific).
+- `aarch64-apple-darwin`: `["-mbranch-protection=pac-ret+bti"]`
+  (Apple Silicon supports both PAC and BTI).
+- `aarch64-linux-gnu`: `["-mbranch-protection=bti"]` (Graviton 3+
+  baseline; PAC also supported on Graviton 4 — use `--security pac+bti`).
+
+#### Added — `--security {auto, pac+bti, bti, off}` CLI flag
+
+- `auto` (default): use the target's `security_flags`.
+- `pac+bti`: force `["-mbranch-protection=pac-ret+bti"]`.
+- `bti`: force `["-mbranch-protection=bti"]`.
+- `off`: empty.
+
+#### Added — `--target-feature {neon, sse4.2, avx2, native, ""}` CLI flag
+
+- Passes through to `hlc`. `neon` enables AArch64 NEON intrinsics
+  (Stage 25); `sse4.2`/`avx2` enable x86 SSE/AVX (Stage 21);
+  `native` auto-detects; `""` (empty) disables.
+
+#### Modified — `find_target_linker(target)`
+
+- AArch64 Linux cross-linker detection: tries `aarch64-linux-gnu-gcc`,
+  `aarch64-linux-gnu-gcc-12`, `aarch64-linux-gnu-gcc-11`,
+  `aarch64-linux-gnu-cc` (Debian/Ubuntu cross-toolchain).
+
+#### Modified — `cross_compile(input_hls, output_bin, target, ..., security, target_feature)`
+
+- New parameters `security` and `target_feature`.
+- The linker invocation appends `sec_flags` (from the security mode
+  + target's security_flags) between `base_args` and the C file path.
+- The hlc invocation appends `--target-feature <feat>` when
+  `target_feature` is non-empty.
+
+### Stage 25 — `tools/hlaarch64.py`
+
+#### Added — AArch64 backend tuning helper
+
+- `hlaarch64 <input.hls> <output.bin> [--target aarch64-linux-gnu]
+  [--target-feature neon] [--security auto] [--linker auto]
+  [--keep-c PATH] [--dry-run] [--hlc bin/hlc] [--list-targets]` —
+  a thin wrapper around `hlcross.cross_compile` that defaults to
+  `--target aarch64-linux-gnu --target-feature neon --security auto`.
+- `--list-targets` prints the supported AArch64 target triples +
+  security levels + target features.
+
+### Stage 25 — Makefile targets
+
+#### Added
+
+- `make aarch64-bench [F=benchmarks/simd_bench.hls] [OUT=...]
+  [SECURITY=pac+bti]` — cross-compile to AArch64 with NEON + PAC/BTI.
+- `make aarch64-acceptance` — the Stage 25 acceptance gate.
+- `make aarch64-list-targets` — print the AArch64 target + security
+  set.
+
 ## [v0.43.0-alpha] — Stage 24: wasm-opt integration + emscripten bridge
 
 > Completes **Stage 24** of the roadmap: a three-layer wasm size

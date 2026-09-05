@@ -8,7 +8,7 @@ HLC     = src/hlc.hls
 BIN     = bin
 PREFIX  ?= /usr/local
 
-.PHONY: all stage0 bootstrap test examples clean run check bench install uninstall audit opt-stats emit-ir emit-llvm fmt lint lsp-check pkg-init pkg-add pkg-lock pkg-audit pkg-verify pkg-build pkg-publish pkg-log pkg-log-verify prove prove-full model prove-acceptance hltest fuzz cov fuzz-acceptance wasm-opt webapp webapp-acceptance serve
+.PHONY: all stage0 bootstrap test examples clean run check bench install uninstall audit opt-stats emit-ir emit-llvm fmt lint lsp-check pkg-init pkg-add pkg-lock pkg-audit pkg-verify pkg-build pkg-publish pkg-log pkg-log-verify prove prove-full model prove-acceptance hltest fuzz cov fuzz-acceptance wasm-opt webapp webapp-acceptance serve aarch64-bench aarch64-acceptance aarch64-list-targets
 
 # Main goal: use the full bootstrap chain to build the native compiler
 all: bootstrap
@@ -465,6 +465,77 @@ serve:
 	  $(PYTHON) tools/hlserve.py --input $$F --bundle out --port $$PORT
 
 .PHONY: wasm-opt webapp webapp-acceptance serve
+
+# ============================================================================
+# Stage 25 (v0.44.0-alpha): AArch64 backend tuning (NEON + PAC + BTI)
+# ============================================================================
+
+# aarch64-bench: cross-compile benchmarks/simd_bench.hls (or json_bench.hls)
+# to AArch64 with NEON intrinsics + PAC/BTI hardening. The C source is
+# always produced; the binary is only produced when a cross-linker (zig
+# cc or aarch64-linux-gnu-gcc) is available.
+# Usage: make aarch64-bench [F=benchmarks/simd_bench.hls] [OUT=/tmp/simd_aarch64] [SECURITY=pac+bti]
+aarch64-bench:
+	@test -x $(BIN)/hlc || $(MAKE) bootstrap
+	@test -n "$(F)" || F=benchmarks/simd_bench.hls; \
+	  if [ -z "$(OUT)" ]; then OUT=$(BIN)/aarch64_bench; fi; \
+	  if [ -z "$(SECURITY)" ]; then SECURITY=pac+bti; fi; \
+	  $(PYTHON) tools/hlaarch64.py $$F $$OUT \
+	    --target aarch64-linux-gnu --target-feature neon \
+	    --security $$SECURITY --keep-c $$OUT.c
+
+# aarch64-acceptance: the Stage 25 acceptance gate.
+# Verifies that:
+#   (a) The C source produced for AArch64 + NEON contains NEON intrinsics
+#       (vaddq_s32 / vsubq_s32 / vmulq_s32 / vminq_s32 / vmaxq_s32).
+#   (b) The C source contains arm_neon.h include.
+#   (c) On an AArch64 host (rare in CI), compile + run json_bench.hls
+#       with NEON intrinsics and verify it's >=20% faster than the
+#       no-NEON baseline. On non-AArch64 hosts, this is SKIPped.
+aarch64-acceptance:
+	@echo "[Stage 25 acceptance] cross-compiling simd_bench.hls to AArch64 + NEON..."
+	@$(PYTHON) tools/hlaarch64.py benchmarks/simd_bench.hls $(BIN)/aarch64_acc \
+	  --target aarch64-linux-gnu --target-feature neon \
+	  --security pac+bti --keep-c $(BIN)/aarch64_acc.c \
+	  >$(BIN)/aarch64_acc.log 2>&1; \
+	  rc=$$?; \
+	  if [ $$rc -ne 0 ] && [ $$rc -ne 3 ]; then \
+	    echo "FAIL: aarch64 compile failed (rc=$$rc)"; \
+	    cat $(BIN)/aarch64_acc.log; exit 1; fi
+	@if grep -q "vaddq_s32\|vsubq_s32\|vmulq_s32" $(BIN)/aarch64_acc.c; then \
+	  echo "  NEON intrinsics: OK (found in C source)"; \
+	else \
+	  echo "FAIL: NEON intrinsics missing from C source"; \
+	  exit 1; fi
+	@if grep -q "<arm_neon.h>" $(BIN)/aarch64_acc.c; then \
+	  echo "  arm_neon.h:      OK"; \
+	else \
+	  echo "FAIL: arm_neon.h not included in C source"; \
+	  exit 1; fi
+	@HOST_ARCH=$$(uname -m 2>/dev/null || echo unknown); \
+	  if [ "$$HOST_ARCH" = "aarch64" ] || [ "$$HOST_ARCH" = "arm64" ]; then \
+	    echo "  runtime bench:   running on AArch64 host ($$HOST_ARCH)..."; \
+	    $(BIN)/hlc benchmarks/json_bench.hls $(BIN)/json_baseline.c; \
+	    $(CC) -O2 -o $(BIN)/json_baseline $(BIN)/json_baseline.c -lm -pthread; \
+	    BASELINE_MS=$$($(BIN)/json_baseline 2>/dev/null | grep "time = " | sed -n 's/.*time = \([0-9]*\) ms.*/\1/p'); \
+	    $(BIN)/hlc --target-feature neon benchmarks/json_bench.hls $(BIN)/json_neon.c; \
+	    $(CC) -O2 -mbranch-protection=pac-ret+bti -o $(BIN)/json_neon $(BIN)/json_neon.c -lm -pthread; \
+	    NEON_MS=$$($(BIN)/json_neon 2>/dev/null | grep "time = " | sed -n 's/.*time = \([0-9]*\) ms.*/\1/p'); \
+	    RATIO=$$(python3 -c "print(round($$NEON_MS * 100.0 / $$BASELINE_MS, 1))"); \
+	    echo "  baseline: $$BASELINE_MS ms; neon+pac+bti: $$NEON_MS ms ($$RATIO% of baseline)"; \
+	    python3 -c "import sys; sys.exit(0 if $$RATIO <= 80.0 else 1)" \
+	      || (echo "FAIL: NEON build is $$RATIO% of baseline (>80% = <20% speedup)"; exit 1); \
+	    echo "  runtime bench:   OK ($$RATIO% of baseline, >=20% speedup)"; \
+	  else \
+	    echo "  runtime bench:   SKIP (host is $$HOST_ARCH, not AArch64)"; \
+	  fi
+	@echo "ACCEPTANCE OK: Stage 25 AArch64 NEON codegen + PAC/BTI hardening verified"
+
+# aarch64-list-targets: list the AArch64 target triples + security levels.
+aarch64-list-targets:
+	@$(PYTHON) tools/hlaarch64.py --list-targets
+
+.PHONY: aarch64-bench aarch64-acceptance aarch64-list-targets
 
 # ============================================================================
 # Stage 13 (v0.23.0-alpha): hls-pkg package manager targets

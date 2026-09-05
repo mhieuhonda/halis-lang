@@ -277,6 +277,11 @@ struct Ctx {
     simd_helpers_main: list[str],
     simd_helpers_alt: list[str],
     simd_helpers_plain: list[str],
+    # Stage 25 (v0.44.0-alpha): simd_helpers_neon = the AArch64 NEON
+    # intrinsic bodies (in the #elif __aarch64__ branch). Populated
+    # when --target-feature neon is passed; the same scalar fallback
+    # (simd_helpers_alt) is used for non-NEON hosts.
+    simd_helpers_neon: list[str],
     # simd_helper_names: helper names already emitted (dedup).
     simd_helper_names: list[str]
 }
@@ -307,7 +312,7 @@ fn new_ctx(src: str) -> Ctx {
         lto_inline_n: 0, lto_dropped: 0, lto_inlined_report: [],
         lto_threshold: 0, lto_stats: false,
         target_feature: "", simd_helpers_main: [], simd_helpers_alt: [],
-        simd_helpers_plain: [], simd_helper_names: []
+        simd_helpers_plain: [], simd_helpers_neon: [], simd_helper_names: []
     }
 }
 
@@ -8908,41 +8913,187 @@ fn simd_emit_f64x2_ew(ctx: Ctx, name: str, intrinsic: str) -> void {
     a.push("}")
 }
 
+# ============================================================================
+# STAGE 25 (v0.44.0-alpha): AArch64 NEON INTRINSIC FAST PATHS
+# ----------------------------------------------------------------------------
+# Mirror of the x86 SSE emitter above, but using <arm_neon.h> intrinsics.
+# Emitted into simd_helpers_neon; assembled by simd_helper_lines into the
+# #elif defined(__aarch64__) || defined(__ARM_NEON__) branch. The same
+# scalar fallback (simd_helpers_alt) is used for non-NEON hosts.
+#
+# NEON intrinsic reference (ARMv8-A):
+#   i32x4 add/sub/mul/min/max: vaddq_s32 / vsubq_s32 / vmulq_s32 /
+#                              vminq_s32 / vmaxq_s32
+#   f64x2 add/sub/mul:         vaddq_f64 / vsubq_f64 / vmulq_f64
+#
+# The NEON intrinsics take int32x4_t / float64x2_t arguments directly
+# (not pointers); we load from the HLS struct's two i64 / f64 fields via
+# vld1q_s64 / vld1q_f64 and store back via vst1q_s64 / vst1q_f64. The
+# I32x4 struct stores {int64_t a, int64_t b} — a 128-bit value that
+# maps directly to a NEON int32x4_t register.
+# ============================================================================
+
+# simd_emit_neon_i32x4_ew: one elementwise i32x4 kernel using NEON
+# intrinsics. The intrinsic name (e.g. "vaddq_s32") is passed in;
+# the body loads x and y from their {i64 a, i64 b} layout into
+# int32x4_t registers, applies the intrinsic, and stores the result
+# back into a fresh I32x4 struct.
+fn simd_emit_neon_i32x4_ew(ctx: Ctx, name: str, intrinsic: str) -> void {
+    let m: list[str] = ctx.simd_helpers_neon
+    let a: list[str] = ctx.simd_helpers_alt
+    m.push("/* " + name + " (NEON) */")
+    m.push("static I32x4* hl_" + name + "(I32x4* x_p, I32x4* y_p) {")
+    m.push("    I32x4* x = x_p; I32x4* y = y_p;")
+    m.push("    I32x4* r = usf_new_I32x4(0, 0);")
+    # Load {i64 a, i64 b} into a 128-bit NEON register. The layout is
+    # little-endian: lane 0 = low 32 bits of a, lane 1 = high 32 bits
+    # of a, lane 2 = low 32 bits of b, lane 3 = high 32 bits of b.
+    # vreinterpretq_s32_s64 reinterprets the int64x2_t as int32x4_t.
+    m.push("    int64x2_t va = vld1q_s64((const int64_t*)&x->a);")
+    m.push("    int64x2_t vb = vld1q_s64((const int64_t*)&y->a);")
+    m.push("    int32x4_t va32 = vreinterpretq_s32_s64(va);")
+    m.push("    int32x4_t vb32 = vreinterpretq_s32_s64(vb);")
+    m.push("    int32x4_t c = " + intrinsic + "(va32, vb32);")
+    m.push("    int64x2_t c64 = vreinterpretq_s64_s32(c);")
+    m.push("    vst1q_s64((int64_t*)&r->a, c64);")
+    m.push("    hl_release_I32x4(x); hl_release_I32x4(y);")
+    m.push("    return r;")
+    m.push("}")
+    a.push("/* " + name + " (scalar fallback) */")
+    a.push("static I32x4* hl_" + name + "(I32x4* x_p, I32x4* y_p) {")
+    a.push("    I32x4* x = x_p; I32x4* y = y_p;")
+    a.push("    I32x4* r = usf_new_I32x4(0, 0);")
+    a.push("    int32_t la[4] = { (int32_t)(uint32_t)x->a, (int32_t)(uint32_t)(x->a >> 32),")
+    a.push("                       (int32_t)(uint32_t)x->b, (int32_t)(uint32_t)(x->b >> 32) };")
+    a.push("    int32_t lb[4] = { (int32_t)(uint32_t)y->a, (int32_t)(uint32_t)(y->a >> 32),")
+    a.push("                       (int32_t)(uint32_t)y->b, (int32_t)(uint32_t)(y->b >> 32) };")
+    if name == "simd_i32x4_min" {
+        a.push("    int32_t lr[4];")
+        a.push("    for (int k = 0; k < 4; k++) lr[k] = la[k] < lb[k] ? la[k] : lb[k];")
+    } else if name == "simd_i32x4_max" {
+        a.push("    int32_t lr[4];")
+        a.push("    for (int k = 0; k < 4; k++) lr[k] = la[k] > lb[k] ? la[k] : lb[k];")
+    } else {
+        let mut c_op: str = "+"
+        if name == "simd_i32x4_sub" {
+            c_op = "-"
+        } else if name == "simd_i32x4_mul" {
+            c_op = "*"
+        }
+        a.push("    uint32_t lr[4];")
+        a.push("    for (int k = 0; k < 4; k++) lr[k] = (uint32_t)((uint64_t)(uint32_t)la[k] " + c_op + " (uint64_t)(uint32_t)lb[k]);")
+    }
+    a.push("    r->a = (int64_t)((uint64_t)(uint32_t)lr[0] | ((uint64_t)(uint32_t)lr[1] << 32));")
+    a.push("    r->b = (int64_t)((uint64_t)(uint32_t)lr[2] | ((uint64_t)(uint32_t)lr[3] << 32));")
+    a.push("    hl_release_I32x4(x); hl_release_I32x4(y);")
+    a.push("    return r;")
+    a.push("}")
+}
+
+# simd_emit_neon_f64x2_ew: one elementwise f64x2 kernel using NEON.
+fn simd_emit_neon_f64x2_ew(ctx: Ctx, name: str, intrinsic: str) -> void {
+    let m: list[str] = ctx.simd_helpers_neon
+    let a: list[str] = ctx.simd_helpers_alt
+    let mut c_op: str = "+"
+    if name == "simd_f64x2_sub" {
+        c_op = "-"
+    } else if name == "simd_f64x2_mul" {
+        c_op = "*"
+    }
+    m.push("/* " + name + " (NEON) */")
+    m.push("static F64x2* hl_" + name + "(F64x2* x_p, F64x2* y_p) {")
+    m.push("    F64x2* x = x_p; F64x2* y = y_p;")
+    m.push("    F64x2* r = usf_new_F64x2(0.0, 0.0);")
+    m.push("    float64x2_t va = vld1q_f64((const double*)&x->a);")
+    m.push("    float64x2_t vb = vld1q_f64((const double*)&y->a);")
+    m.push("    float64x2_t c = " + intrinsic + "(va, vb);")
+    m.push("    vst1q_f64((double*)&r->a, c);")
+    m.push("    hl_release_F64x2(x); hl_release_F64x2(y);")
+    m.push("    return r;")
+    m.push("}")
+    a.push("/* " + name + " (scalar fallback) */")
+    a.push("static F64x2* hl_" + name + "(F64x2* x_p, F64x2* y_p) {")
+    a.push("    F64x2* x = x_p; F64x2* y = y_p;")
+    a.push("    F64x2* r = usf_new_F64x2(0.0, 0.0);")
+    a.push("    r->a = x->a " + c_op + " y->a;")
+    a.push("    r->b = x->b " + c_op + " y->b;")
+    a.push("    hl_release_F64x2(x); hl_release_F64x2(y);")
+    a.push("    return r;")
+    a.push("}")
+}
+
 # simd_emit_helper: dispatch one kernel into the main/alt lists. The
 # gather/scatter kernels are arch-independent (plain C field work — the
 # win is eliminating the per-element runtime calls), so they go into
 # BOTH lists (guarded only by the #if/#else split for tidiness).
 fn simd_emit_helper(ctx: Ctx, name: str) -> void {
+    # Stage 25 (v0.44.0-alpha): when --target-feature neon is given,
+    # dispatch to the NEON emitter (which pushes into simd_helpers_neon
+    # + simd_helpers_alt). Otherwise dispatch to the x86 emitter (which
+    # pushes into simd_helpers_main + simd_helpers_alt).
+    let use_neon: bool = ctx.target_feature == "neon"
     if name == "simd_i32x4_add" {
-        simd_emit_i32x4_ew(ctx, name, "_mm_add_epi32")
+        if use_neon {
+            simd_emit_neon_i32x4_ew(ctx, name, "vaddq_s32")
+        } else {
+            simd_emit_i32x4_ew(ctx, name, "_mm_add_epi32")
+        }
         return
     }
     if name == "simd_i32x4_sub" {
-        simd_emit_i32x4_ew(ctx, name, "_mm_sub_epi32")
+        if use_neon {
+            simd_emit_neon_i32x4_ew(ctx, name, "vsubq_s32")
+        } else {
+            simd_emit_i32x4_ew(ctx, name, "_mm_sub_epi32")
+        }
         return
     }
     if name == "simd_i32x4_mul" {
-        simd_emit_i32x4_ew(ctx, name, "_mm_mullo_epi32")
+        if use_neon {
+            simd_emit_neon_i32x4_ew(ctx, name, "vmulq_s32")
+        } else {
+            simd_emit_i32x4_ew(ctx, name, "_mm_mullo_epi32")
+        }
         return
     }
     if name == "simd_i32x4_min" {
-        simd_emit_i32x4_ew(ctx, name, "_mm_min_epi32")
+        if use_neon {
+            simd_emit_neon_i32x4_ew(ctx, name, "vminq_s32")
+        } else {
+            simd_emit_i32x4_ew(ctx, name, "_mm_min_epi32")
+        }
         return
     }
     if name == "simd_i32x4_max" {
-        simd_emit_i32x4_ew(ctx, name, "_mm_max_epi32")
+        if use_neon {
+            simd_emit_neon_i32x4_ew(ctx, name, "vmaxq_s32")
+        } else {
+            simd_emit_i32x4_ew(ctx, name, "_mm_max_epi32")
+        }
         return
     }
     if name == "simd_f64x2_add" {
-        simd_emit_f64x2_ew(ctx, name, "_mm_add_pd")
+        if use_neon {
+            simd_emit_neon_f64x2_ew(ctx, name, "vaddq_f64")
+        } else {
+            simd_emit_f64x2_ew(ctx, name, "_mm_add_pd")
+        }
         return
     }
     if name == "simd_f64x2_sub" {
-        simd_emit_f64x2_ew(ctx, name, "_mm_sub_pd")
+        if use_neon {
+            simd_emit_neon_f64x2_ew(ctx, name, "vsubq_f64")
+        } else {
+            simd_emit_f64x2_ew(ctx, name, "_mm_sub_pd")
+        }
         return
     }
     if name == "simd_f64x2_mul" {
-        simd_emit_f64x2_ew(ctx, name, "_mm_mul_pd")
+        if use_neon {
+            simd_emit_neon_f64x2_ew(ctx, name, "vmulq_f64")
+        } else {
+            simd_emit_f64x2_ew(ctx, name, "_mm_mul_pd")
+        }
         return
     }
     if name == "simd_i32x4_gather" {
@@ -9202,8 +9353,30 @@ fn simd_helper_lines(ctx: Ctx) -> list[str] {
         out.push("#include <immintrin.h>")
         concat_lines(out, ctx.simd_helpers_main)
         concat_lines(out, ctx.simd_helpers_plain)
+        # Stage 25 (v0.44.0-alpha): if --target-feature neon was given,
+        # the NEON emitters populated simd_helpers_neon too — emit them
+        # in the #elif __aarch64__ branch so the same C source compiles
+        # on both x86 (uses SSE/AVX) and aarch64 (uses NEON).
+        if ctx.simd_helpers_neon.len() > 0 {
+            out.push("#elif defined(__aarch64__) || defined(__ARM_NEON__)")
+            out.push("#include <arm_neon.h>")
+            concat_lines(out, ctx.simd_helpers_neon)
+            concat_lines(out, ctx.simd_helpers_plain)
+        }
         out.push("#else")
-        out.push("// non-x86 host: portable scalar fallback (NEON tuning: Stage 25).")
+        out.push("// non-x86/non-NEON host: portable scalar fallback.")
+        concat_lines(out, ctx.simd_helpers_alt)
+        concat_lines(out, ctx.simd_helpers_plain)
+        out.push("#endif")
+    } else if ctx.target_feature == "neon" {
+        # Stage 25: --target-feature neon — emit the NEON intrinsics in
+        # the #if __aarch64__ branch, with the scalar fallback in #else.
+        out.push("#if defined(__aarch64__) || defined(__ARM_NEON__)")
+        out.push("#include <arm_neon.h>")
+        concat_lines(out, ctx.simd_helpers_neon)
+        concat_lines(out, ctx.simd_helpers_plain)
+        out.push("#else")
+        out.push("// non-NEON host: portable scalar fallback.")
         concat_lines(out, ctx.simd_helpers_alt)
         concat_lines(out, ctx.simd_helpers_plain)
         out.push("#endif")
