@@ -416,6 +416,77 @@ else
     bad "join builtin: native compile failed"
 fi
 
+# Stage 19 perfection (v0.38.0-alpha): hlpgo.py offline profile utilities
+# (report / merge / diff). The profile produced by --pgo-generate above
+# is the input; the tools must (a) report the expected site kinds and
+# top-N format, (b) merge two profiles into one whose counters are the
+# sum, (c) diff two profiles and report per-site deltas.
+if [ -s "$TMP/pgo.hlcprof" ]; then
+    # (a) report: must list the entry/branch/loop site counts and the
+    #     top-N functions by entry count. The profile comes from
+    #     feat_stage19_pgo.hls (classify / sum_upto / main) — the top-N
+    #     list must mention one of these functions.
+    hlpgo_out=$(python3 tools/hlpgo.py report "$TMP/pgo.hlcprof" --top 5 2>&1)
+    if echo "$hlpgo_out" | grep -q "sites  :" \
+            && echo "$hlpgo_out" | grep -q "calls  :" \
+            && echo "$hlpgo_out" | grep -q "hottest functions" \
+            && echo "$hlpgo_out" | grep -qE "classify|sum_upto|e:main"; then
+        ok "pgo-report: hotness report lists entry/branch/loop sites + top-N fns"
+    else
+        bad "pgo-report: report missing expected sections"
+        echo "$hlpgo_out" | head -5
+    fi
+    # (b) merge: merging the profile with itself must double every count.
+    cp "$TMP/pgo.hlcprof" "$TMP/pgo_a.hlcprof"
+    cp "$TMP/pgo.hlcprof" "$TMP/pgo_b.hlcprof"
+    if python3 tools/hlpgo.py merge "$TMP/pgo_merged.hlcprof" \
+            "$TMP/pgo_a.hlcprof" "$TMP/pgo_b.hlcprof" >/dev/null 2>&1; then
+        # The merged file must START with the forward-compatible header
+        # added in v0.38.0-alpha, and the parsed counters must be 2x.
+        if head -1 "$TMP/pgo_merged.hlcprof" | grep -q "^# hlcprof v1$"; then
+            ok "pgo-merge: forward-compatible v1 header written"
+        else
+            bad "pgo-merge: v1 header missing from merged profile"
+        fi
+        merged_site_count=$(grep -c "^[eb]:l:" "$TMP/pgo_merged.hlcprof" 2>/dev/null || echo 0)
+        plain_site_count=$(grep -c "^[eb]:l:" "$TMP/pgo_a.hlcprof" 2>/dev/null || echo 0)
+        # Sample one site id and verify its count doubled.
+        sample_id=$(grep "^e:" "$TMP/pgo_a.hlcprof" | head -1 | awk '{print $1}')
+        sample_a=$(grep "^$sample_id " "$TMP/pgo_a.hlcprof" | awk '{print $2}')
+        sample_m=$(grep "^$sample_id " "$TMP/pgo_merged.hlcprof" | awk '{print $2}')
+        if [ -n "$sample_a" ] && [ "$sample_m" -eq $((sample_a * 2)) ] 2>/dev/null; then
+            ok "pgo-merge: site $sample_id count doubled ($sample_a -> $sample_m)"
+        else
+            bad "pgo-merge: site $sample_id did not double ($sample_a -> $sample_m)"
+        fi
+    else
+        bad "pgo-merge: failed to merge two profiles"
+    fi
+    # (c) diff: diffing the original against the merged must report
+    #     every site with delta == +count (the merged is 2x, so the
+    #     delta is +count_original). Use --min-delta to keep the output
+    #     bounded.
+    diff_out=$(python3 tools/hlpgo.py diff "$TMP/pgo_a.hlcprof" \
+            "$TMP/pgo_merged.hlcprof" --min-delta 1000 2>&1)
+    if echo "$diff_out" | grep -q "sites that differ by" \
+            && echo "$diff_out" | grep -q "delta +"; then
+        ok "pgo-diff: per-site deltas reported"
+    else
+        bad "pgo-diff: no deltas reported"
+        echo "$diff_out" | head -3
+    fi
+    # (d) backward compat: a v0 profile (no header) must still parse
+    #     identically. The original pgo.hlcprof is a v0 file (produced
+    #     by the runtime, which does not yet emit the header).
+    if python3 tools/hlpgo.py report "$TMP/pgo.hlcprof" 2>&1 | grep -q "format : v0"; then
+        ok "pgo-report: v0 (headerless) profile parses backward-compatibly"
+    else
+        bad "pgo-report: v0 profile not recognised"
+    fi
+else
+    bad "pgo: no profile available for hlpgo tests"
+fi
+
 echo "=== 8. Stage 20: LTO across crates (inlining + DCE) ==="
 # The Stage 20 acceptance, in four steps:
 #   (a) the stdlib's list_sort_int_asc is INLINED into the caller (its

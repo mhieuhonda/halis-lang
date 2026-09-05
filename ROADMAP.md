@@ -1608,7 +1608,7 @@ native, including `-O fast`) remains byte-identical.
 
 ---
 
-## STAGE 19 — Profile-guided optimisation (PGO) ✅ (release v0.35.0-alpha)
+## STAGE 19 — Profile-guided optimisation (PGO) ✅ (release v0.35.0-alpha, perfected v0.38.0-alpha)
 
 **Work:**
 - `hlc --pgo-generate` — instrument every function entry, branch, and

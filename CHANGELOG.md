@@ -13,6 +13,111 @@ stability (125–140), and final stabilisation toward v1.0 (141–150).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
+## [v0.38.0-alpha] — Stage 19 perfection: PGO profile utilities + percentile breakdown
+
+> A perfection pass on **Stage 19** (PGO, v0.35.0-alpha). The
+> in-compiler `--pgo-generate` / `--pgo-use` machinery is unchanged
+> (the acceptance gate at ≤ 80% wall-time, byte-identical output, and
+> zero instrumentation in unflagged builds all still hold). This
+> release closes the operational gaps around the profile FILE itself:
+>
+> - **`tools/hlpgo.py`** — three offline utilities for `.hlcprof`
+>   files: `report` (top-N hottest functions, branch-bias summary,
+>   loop back-edge counts), `merge` (the offline equivalent of
+>   `HLS_PGO_MERGE=1` — sum per-site counters across profiles), and
+>   `diff` (per-site delta between two profiles, for training-stability
+>   verification).
+> - **Forward-compatible profile format**: `hlpgo merge` writes a
+>   `# hlcprof v1` magic header on the first line. The parser
+>   recognises the header (v1) and silently accepts headerless files
+>   (v0, the original Stage 19 release format). The runtime continues
+>   to emit v0 files (zero impact on the in-compiler path); the new
+>   header is opt-in via the offline merge tool.
+> - **`pgo_ratio.py` percentile breakdown**: the acceptance script now
+>   prints p25/p50/p75 of the per-run ratios alongside the median, so a
+>   single noisy run cannot hide a regression. The acceptance gate
+>   still uses the median (the original Stage 19 contract). A new
+>   `--noisy` flag exits 0 even on a ratio failure (informational run).
+> - **Makefile targets**: `pgo-profile-report`, `pgo-merge`,
+>   `pgo-diff`, `pgo-clean` (in addition to the existing `pgo`,
+>   `pgo-acceptance`, `pgo-report`).
+> - **5 new tests** in `tests/run_tests.sh` section 7 (hlpgo report /
+>   merge / diff / backward-compat). 593/593 tests PASS, bootstrap
+>   deterministic, Stage 19 acceptance re-verified.
+
+### Stage 19 perfection — `tools/hlpgo.py`
+
+#### Added — `hlpgo report <profile> [--top N]`
+
+- Prints a hotness report: total site count (split into fn-entry /
+  branch / loop), total call volume (sum of fn-entry counts), the
+  top-N hottest functions by entry count with their percentage of
+  total calls, a branch-bias summary (true-count vs inferred
+  false-count, with the dominant bias direction), and the top-N
+  loop back-edges by iteration count.
+- Recognises the `# hlcprof v1` magic header (forward-compatible) and
+  reports the format version. Headerless v0 files (the original
+  Stage 19 release format) parse identically and are reported as
+  `v0 (no header)`.
+
+#### Added — `hlpgo merge <out> <in1> [in2 ...]`
+
+- Sums per-site counters across multiple `.hlcprof` files into one.
+  This is the offline equivalent of the runtime's `HLS_PGO_MERGE=1`
+  mode: useful for combining profiles from CI shards, from different
+  training workloads, or from re-runs of the same workload into a
+  single canonical profile.
+- The merged output always starts with the `# hlcprof v1` magic
+  header (forward-compatible). Sites are emitted in sorted order for
+  deterministic output (the runtime emits them in assignment order).
+
+#### Added — `hlpgo diff <p1> <p2> [--min-delta N]`
+
+- Per-site delta between two `.hlcprof` files. Useful for verifying
+  training stability: two runs of the same training workload should
+  produce profiles whose deltas are bounded by the run-to-run noise
+  of the workload (typically a few percent on the hot sites, zero on
+  the cold sites). A large delta on a hot site indicates the training
+  workload is not deterministic and the PGO-trained build may not
+  reflect production reality.
+
+#### Added — `pgo_ratio.py` percentile breakdown
+
+- Per-run ratios (trained/plain) are now sorted and the p25/p50/p75
+  percentiles are printed alongside the median. A wide spread
+  (p25 << p75) flags a noisy host; a tight spread with the median
+  above the threshold is a real regression.
+- New `--noisy` flag: exit 0 even when the ratio exceeds the
+  threshold. Used by `make pgo-report` (informational run; the FAIL
+  line is still printed so the regression is visible in CI logs
+  without breaking the build).
+
+#### Added — Makefile targets
+
+- `make pgo-profile-report F=bin/hlc.hlcprof [TOP=10]` — print the
+  hotness report.
+- `make pgo-merge OUT=merged.hlcprof F='a.hlcprof b.hlcprof ...'` —
+  merge profiles offline.
+- `make pgo-diff F='p1.hlcprof p2.hlcprof' [MIN_DELTA=100]` — diff
+  two profiles.
+- `make pgo-clean` — remove all PGO build artifacts
+  (`hlc_gen`, `hlc_gen.c`, `hlc_pgo`, `hlc_pgo.c`, `hlc.hlcprof`).
+
+#### Added — tests
+
+- `tests/run_tests.sh` section 7 gains 5 new checks: hlpgo `report`
+  lists the expected site kinds and top-N format; `merge` writes the
+  v1 header and doubles a sampled site's count; `diff` reports
+  per-site deltas; v0 (headerless) profiles parse backward-compatibly.
+
+### Test results
+
+- 593 PASS / 0 FAIL (588 prior + 5 new Stage-19 perfection checks).
+- Bootstrap: deterministic.
+- Stage 19 acceptance re-verified: PGO-trained `hlc` compiles
+  `hlc.hls` in ≤ 80% of the plain build's wall time, byte-identical
+  output.
+
 ## [v0.37.0-alpha] — Stage 21: SIMD vectorisation (target-feature detection)
 
 > Completes **Stage 21** of the roadmap: the explicit SIMD library

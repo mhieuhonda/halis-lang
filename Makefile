@@ -167,7 +167,31 @@ pgo-acceptance: pgo
 # pgo-report: same measurement, informational only (no gate).
 pgo-report: pgo
 	@python3 scripts/pgo_ratio.py --plain $(BIN)/hlc --trained $(BIN)/hlc_pgo \
-	  --input $(HLC) --runs 9
+	  --input $(HLC) --runs 9 --noisy
+
+# Stage 19 perfection (v0.38.0-alpha): offline profile utilities.
+#   pgo-profile-report <profile> : print hotness report (top-N fns, branch
+#                                  bias, loop back-edges) for a .hlcprof.
+#   pgo-merge <out> <in1> [in2..]: merge multiple .hlcprof files (offline
+#                                  equivalent of HLS_PGO_MERGE=1).
+#   pgo-diff <p1> <p2>           : per-site delta between two profiles.
+#   pgo-clean                    : remove all PGO build artifacts.
+pgo-profile-report:
+	@test -n "$(F)" || (echo "Usage: make pgo-profile-report F=bin/hlc.hlcprof [--top N]" && false)
+	@python3 tools/hlpgo.py report $(F) $(if $(TOP),--top $(TOP),)
+
+pgo-merge:
+	@test -n "$(OUT)" || (echo "Usage: make pgo-merge OUT=merged.hlcprof F='a.hlcprof b.hlcprof ...'" && false)
+	@python3 tools/hlpgo.py merge $(OUT) $(F)
+
+pgo-diff:
+	@test -n "$(F)" || (echo "Usage: make pgo-diff F='p1.hlcprof p2.hlcprof' [--min-delta N]" && false)
+	@python3 tools/hlpgo.py diff $(F) $(if $(MIN_DELTA),--min-delta $(MIN_DELTA),)
+
+pgo-clean:
+	@rm -f $(BIN)/hlc_gen $(BIN)/hlc_gen.c $(BIN)/hlc_pgo $(BIN)/hlc_pgo.c \
+	       $(BIN)/hlc.hlcprof $(BIN)/hlc_train_tmp.c
+	@echo "PGO artifacts removed"
 
 # ============================================================================
 # Stage 20 (v0.36.0-alpha): link-time optimisation across crates
