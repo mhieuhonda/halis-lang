@@ -333,6 +333,89 @@ else
     echo "$fuzz_out" | tail -5
 fi
 
+echo "=== 7. Stage 19: profile-guided optimisation (PGO) ==="
+# The PGO acceptance, in three steps (native compiler required):
+#   (a) --pgo-generate: the instrumented binary writes a .hlcprof with
+#       sane counters (entries / branches / loop back-edges).
+#   (b) --pgo-use: the trained compile must build AND run, producing
+#       BYTE-IDENTICAL output to the plain build (hints change layout,
+#       never meaning).
+#   (c) the profile/counter machinery must not appear in unflagged C.
+if [ ! -x "$TMP/hlc1" ]; then
+    python3 boot/boot.py src/hlc.hls src/hlc.hls "$TMP/hlc_nat.c" >/dev/null 2>&1
+    gcc -O2 -o "$TMP/hlc1" "$TMP/hlc_nat.c" -lm -pthread 2>/dev/null
+fi
+PGO_F=tests/ok/feat_stage19_pgo.hls
+if "$TMP/hlc1" --pgo-generate "$PGO_F" "$TMP/pgo_gen.c" >/dev/null 2>&1 \
+        && gcc -O2 -o "$TMP/pgo_gen_bin" "$TMP/pgo_gen.c" -lm -pthread 2>/dev/null; then
+    ok "pgo-generate: instrumented binary compiles"
+    HLS_PGO_FILE="$TMP/pgo.hlcprof" "$TMP/pgo_gen_bin" > "$TMP/pgo_gen.out" 2>/dev/null
+    if [ -s "$TMP/pgo.hlcprof" ] \
+            && grep -q "^e:main 1$" "$TMP/pgo.hlcprof" \
+            && grep -q "^l:sum_upto:0 1000$" "$TMP/pgo.hlcprof" \
+            && grep -q "^b:classify:0 " "$TMP/pgo.hlcprof"; then
+        ok "pgo-generate: .hlcprof has entry/branch/loop counters"
+    else
+        bad "pgo-generate: .hlcprof missing or counters wrong"
+        head -5 "$TMP/pgo.hlcprof" 2>/dev/null
+    fi
+    # Train: recompile with the profile; output must be byte-identical.
+    if "$TMP/hlc1" --pgo-use "$TMP/pgo.hlcprof" "$PGO_F" "$TMP/pgo_use.c" >/dev/null 2>&1 \
+            && gcc -O2 -o "$TMP/pgo_use_bin" "$TMP/pgo_use.c" -lm -pthread 2>/dev/null; then
+        ok "pgo-use: trained binary compiles"
+        pgo_out=$("$TMP/pgo_use_bin" 2>/dev/null)
+        if [ "$pgo_out" == "$(cat "$TMP/pgo_gen.out")" ]; then
+            ok "pgo-use: trained output byte-identical to plain build"
+        else
+            bad "pgo-use: trained output diverges"
+        fi
+        if grep -q "__builtin_expect" "$TMP/pgo_use.c"; then
+            ok "pgo-use: branch hints present in trained C"
+        else
+            bad "pgo-use: no __builtin_expect hints in trained C"
+        fi
+    else
+        bad "pgo-use: trained compile failed"
+    fi
+    # Unflagged builds must contain zero PGO machinery.
+    if grep -q "__hlc_pgo_counts" "$TMP/pgo_gen.c" \
+            && ! grep -q "__hlc_pgo_counts\|__builtin_expect" "$TMP/$name.c" 2>/dev/null; then
+        ok "pgo: unflagged build has zero instrumentation"
+    else
+        bad "pgo: instrumentation leaked into an unflagged build"
+    fi
+else
+    bad "pgo-generate: instrumented compile failed"
+fi
+# The join builtin (O(n) string join) must be pure and differential-safe.
+cat > "$TMP/join_check.hls" <<'JEOF'
+fn main() -> int uses IO {
+    let parts: list[str] = ["x", "yy", "zzz"]
+    println(join(parts, "-"))
+    println("empty=[" + join([], ",") + "]")
+    let big: list[str] = []
+    let mut i: int = 0
+    while i < 5000 {
+        big.push(i.to_str())
+        i = i + 1
+    }
+    println("big join len = " + join(big, ",").len().to_str())
+    return 0
+}
+JEOF
+j_interp=$(python3 boot/boot.py "$TMP/join_check.hls" 2>/dev/null)
+if python3 boot/boot.py src/hlc.hls "$TMP/join_check.hls" "$TMP/join_check.c" >/dev/null 2>&1 \
+        && gcc -O2 -o "$TMP/join_check_bin" "$TMP/join_check.c" -lm -pthread 2>/dev/null; then
+    j_nat=$("$TMP/join_check_bin" 2>/dev/null)
+    if [ "$j_interp" == "$j_nat" ] && echo "$j_nat" | grep -q "big join len = 23889"; then
+        ok "join builtin: interpreter and native agree (O(n) path)"
+    else
+        bad "join builtin: divergence (interp vs native)"
+    fi
+else
+    bad "join builtin: native compile failed"
+fi
+
 echo ""
 echo "=========================================="
 echo "RESULT: $PASS PASS / $FAIL FAIL"

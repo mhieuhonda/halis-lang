@@ -140,6 +140,7 @@ declare double  @hl_list_pop_f64(ptr)
 declare i1      @hl_list_pop_bool(ptr)
 declare i64      @hl_list_len(ptr)
 declare ptr      @hl_range(i64, i64)
+declare ptr      @hl_str_join(ptr, ptr)         ; (list[str], sep) -> str — O(n) join (Stage 19)
 
 ; boxed element constructors (get uses a plain load from the box pointer)
 declare ptr      @hl_box_i64(i64)
@@ -1513,6 +1514,9 @@ class LLVMEmitter:
             return self._call1("i64", "@hl_map_len", ["ptr"], arg_pairs)
         if name == "range":
             return self._call1("ptr", "@hl_range", ["i64", "i64"], arg_pairs)
+        # Stage 19 (v0.35.0-alpha): O(n) join(list[str], sep) -> str.
+        if name == "join":
+            return self._call1("ptr", "@hl_str_join", ["ptr", "ptr"], arg_pairs)
         if name == "map_new":
             tmp = self._fresh("map")
             # Arena-mode contract: val_free = null (never release values).

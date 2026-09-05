@@ -116,6 +116,62 @@ cov:
 	  $(PYTHON) tools/hlcov.py $$L $(F)
 
 # ============================================================================
+# Stage 19 (v0.35.0-alpha): profile-guided optimisation targets
+# ============================================================================
+
+# pgo: build a PGO-TRAINED native compiler (the canonical release binary):
+#   1. the plain native hlc compiles hlc.hls with --pgo-generate
+#      (counters at every fn entry / branch / loop back-edge),
+#   2. the instrumented compiler runs the training workload (compiling
+#      hlc.hls itself + a spread of example programs, merged into one
+#      .hlcprof via HLS_PGO_MERGE=1),
+#   3. hlc recompiles itself with --pgo-use -> __builtin_expect branch
+#      hints, hot/cold attributes, static-inline hints and hoisted
+#      string literals in hot functions,
+#   4. the trained binary is verified byte-identical on output.
+pgo: bootstrap
+	@mkdir -p $(BIN)
+	@echo "[1/4] hlc: generating PGO-instrumented compiler..."
+	@$(BIN)/hlc --pgo-generate $(HLC) $(BIN)/hlc_gen.c
+	@$(CC) $(CFLAGS) -o $(BIN)/hlc_gen $(BIN)/hlc_gen.c -lm -pthread
+	@echo "[2/4] training workload (self-compile + examples, merged profile)..."
+	@rm -f $(BIN)/hlc.hlcprof
+	@for i in 1 2 3; do \
+	  for f in $(HLC) examples/fibonacci.hls examples/optimize_demo.hls \
+		   examples/hello.hls examples/primes.hls examples/enum_demo.hls; do \
+	    HLS_PGO_FILE=$(BIN)/hlc.hlcprof HLS_PGO_MERGE=1 \
+	      $(BIN)/hlc_gen $$f $(BIN)/hlc_train_tmp.c || exit 1; \
+	  done; \
+	done
+	@rm -f $(BIN)/hlc_train_tmp.c
+	@echo "     profile: $$(wc -l < $(BIN)/hlc.hlcprof) sites"
+	@echo "[3/4] hlc: recompiling itself with --pgo-use (trained)..."
+	@$(BIN)/hlc --pgo-use $(BIN)/hlc.hlcprof $(HLC) $(BIN)/hlc_pgo.c
+	@$(CC) $(CFLAGS) -o $(BIN)/hlc_pgo $(BIN)/hlc_pgo.c -lm -pthread
+	@echo "[4/4] verifying byte-identical output on sample programs..."
+	@for f in examples/fibonacci.hls examples/primes.hls examples/optimize_demo.hls; do \
+	  $(BIN)/hlc $$f $(BIN)/v_plain.c && $(BIN)/hlc_pgo $$f $(BIN)/v_trained.c; \
+	  diff -q $(BIN)/v_plain.c $(BIN)/v_trained.c >/dev/null \
+	    || (echo "PGO FAILED: $$f output differs" && exit 1); \
+	done
+	@rm -f $(BIN)/v_plain.c $(BIN)/v_trained.c
+	@echo "PGO OK: trained compiler at $(BIN)/hlc_pgo (profile: $(BIN)/hlc.hlcprof)"
+
+# pgo-acceptance: the Stage 19 acceptance criterion — the PGO-trained hlc
+# compiles hlc.hls in <= 80% of the non-PGO build's wall time (median of
+# 9 runs each), with byte-identical output.
+pgo-acceptance: pgo
+	@python3 scripts/pgo_ratio.py --plain $(BIN)/hlc --trained $(BIN)/hlc_pgo \
+	  --input $(HLC) --runs 9 --max-ratio 0.80
+
+# pgo-report: same measurement, informational only (no gate).
+pgo-report: pgo
+	@python3 scripts/pgo_ratio.py --plain $(BIN)/hlc --trained $(BIN)/hlc_pgo \
+	  --input $(HLC) --runs 9
+
+.PHONY: pgo pgo-acceptance pgo-report
+
+# ============================================================================
 # Stage 13 (v0.23.0-alpha): hls-pkg package manager targets
 # ============================================================================
 PKG = $(PYTHON) tools/hls-pkg.py

@@ -1055,6 +1055,16 @@ class Interp:
                     "use an explicit counter loop for large ranges"
                     % (a, b, count, RANGE_MAX), line)
             return list(range(a, b))
+        # Stage 19 (v0.35.0-alpha): O(n) join(list[str], sep) -> str.
+        # Matches the C runtime's hl_str_join (single allocation, one
+        # copy per element). The interpreter's str.join is likewise
+        # linear, so differential outputs stay byte-identical.
+        if name == "join":
+            parts = args[0]
+            sep = args[1]
+            if not isinstance(parts, list):
+                raise HLPanic("join() expects a list[str]", line)
+            return sep.join(parts)
         if name == "map_new":
             return {}
         if name == "read_file":

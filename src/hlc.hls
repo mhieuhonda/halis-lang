@@ -196,7 +196,45 @@ struct Ctx {
     fast_mode: bool,
     # contracts_mode: --contracts — emit runtime `requires` assertions at
     # every contracted fn entry.
-    contracts_mode: bool
+    contracts_mode: bool,
+    # ---- Stage 19 (v0.35.0-alpha): profile-guided optimisation ----
+    # pgo_gen: --pgo-generate — instrument every function entry, branch
+    # and loop back-edge with a counter write; the counters are dumped to
+    # a .hlcprof profile file at process exit (atexit).
+    pgo_gen: bool,
+    # pgo_counts: --pgo-use=<profile> — the loaded profile (site id ->
+    # execution count), consulted while generating branches to emit
+    # __builtin_expect hints, hot/cold attributes and inline hints.
+    pgo_counts: map[str, int],
+    # pgo_total_calls: sum of all function-entry counts in the loaded
+    # profile (the denominator for the hot-function threshold).
+    pgo_total_calls: int,
+    # pgo_site_ids: the profile site ids in ASSIGNMENT order (the order
+    # is deterministic — identical between a --pgo-generate build and a
+    # --pgo-use build of the same source, so indices are stable).
+    pgo_site_ids: list[str],
+    # pgo_site_map: site id -> counter index (O(1) lookup; the ids list
+    # keeps the assignment order for the C table emission).
+    pgo_site_map: map[str, int],
+    # pgo_fn_branch_n / pgo_fn_loop_n: per-function branch/loop sequence
+    # numbers used to build stable site ids; reset per function.
+    pgo_fn_branch_n: int,
+    pgo_fn_loop_n: int,
+    # pgo_fn_sizes: fn key -> emitted body line count (filled during
+    # body generation; consulted when emitting prototypes to decide
+    # the `static inline` hint for hot small functions).
+    pgo_fn_sizes: map[str, int],
+    # pgo_slit_n / pgo_slits (Stage 19): profile-driven string-literal
+    # hoisting. A string literal used inside a HOT function is emitted
+    # as a thread-local one-time cache instead of a per-evaluation
+    # hl_cstr() conversion (malloc + strlen + memcpy + free each time).
+    # Mirrors LLVM's ConstantHoisting pass, which also gates on profile
+    # hotness. The lazy branch is per-thread (no cross-thread sharing,
+    # plain refcounts stay sound); the inline hl_retain gives the use
+    # site the same +1 a fresh literal had, so every existing cleanup /
+    # own-wrap path stays balanced.
+    pgo_slit_n: int,
+    pgo_slits: list[str]
 }
 
 fn new_ctx(src: str) -> Ctx {
@@ -215,24 +253,23 @@ fn new_ctx(src: str) -> Ctx {
         computed_effects: map_new(),
         hoist_map: map_new(), null_after: [], clone_insts: [], loop_header: 0,
         spawn_decls: [], spawn_n: 0,
-        fast_mode: false, contracts_mode: false
+        fast_mode: false, contracts_mode: false,
+        pgo_gen: false, pgo_counts: map_new(), pgo_total_calls: 0,
+        pgo_site_ids: [], pgo_site_map: map_new(),
+        pgo_fn_branch_n: 0, pgo_fn_loop_n: 0,
+        pgo_fn_sizes: map_new(),
+        pgo_slit_n: 0, pgo_slits: []
     }
 }
 
 # --- Common helpers ---
 
-fn join(parts: list[str], sep: str) -> str {
-    let mut acc: str = ""
-    let mut i: int = 0
-    while i < parts.len() {
-        if i > 0 {
-            acc = acc + sep
-        }
-        acc = acc + parts.get(i)
-        i = i + 1
-    }
-    return acc
-}
+# join(parts, sep) — REMOVED as an HLS-level function in v0.35.0-alpha:
+# the accumulating `acc = acc + sep + part` pattern is O(n^2) in total
+# bytes copied (hl_str_concat copies both operands on every call), which
+# dominated the self-compilation time. join is now a BUILTIN backed by
+# the O(n) hl_str_join runtime helper (single allocation, one copy per
+# element). All former call sites resolve to the builtin unchanged.
 
 fn is_keyword(w: str) -> bool {
     return w == "fn" || w == "let" || w == "mut" || w == "return" || w == "if"
@@ -1882,6 +1919,11 @@ fn is_builtin_fn(n: str) -> bool {
         # Stage 16 (v0.27.0-alpha): concurrency builtins. Stage-16
         # perfection (v0.29.0-alpha) adds chan_new_bounded.
         || n == "chan_new" || n == "chan_new_bounded" || n == "spawn" || n == "select"
+        # Stage 19 (v0.35.0-alpha): O(n) string join — see boot/checker.py.
+        # hlc itself joins the whole generated C file through this builtin
+        # (the old accumulating HLS-level join was quadratic and dominated
+        # the bootstrap's compile time).
+        || n == "join"
 }
 
 fn list_has(list: list[str], x: str) -> bool {
@@ -4939,6 +4981,26 @@ fn check_builtin_call(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, 
     if name == "spawn" {
         return check_spawn_call(ctx, env, cur, e)
     }
+    # Stage 19 (v0.35.0-alpha): join(list[str], sep) -> str — pure, O(n).
+    # Handled BEFORE the generic argument-evaluation loop so an empty
+    # list literal `[]` infers list[str] from the expected type.
+    if name == "join" {
+        if ctx.exprs[e].args.len() != 2 {
+            cerr(line, "join() expects 2 arguments (list[str], str)")
+        }
+        let at0: str = check_expr(ctx, env, cur, ctx.exprs[e].args.get(0), "list[str]")
+        if !is_list_t(at0) || list_elem_t(at0) != "str" {
+            cerr(line, "join() expects a list[str] as argument 1, got " + at0)
+        }
+        let at1: str = check_expr(ctx, env, cur, ctx.exprs[e].args.get(1), "str")
+        if at1 != "str" {
+            cerr(line, "join() expects a str separator as argument 2, got " + at1)
+        }
+        if at0 == "never" || at1 == "never" {
+            cerr(line, "never value cannot be used as an argument")
+        }
+        return "str"
+    }
     let nargs: int = ctx.exprs[e].args.len()
     let argt: list[str] = []
     let mut i: int = 0
@@ -6845,6 +6907,32 @@ fn runtime_lines() -> list[str] {
     r.push("    return s;")
     r.push("}")
     r.push("")
+    # Stage 19 (v0.35.0-alpha): O(n) whole-list join. Computing the total
+    # length first and copying each element exactly once turns output
+    # assembly from quadratic (growing concat) into linear — the single
+    # biggest compile-time win for the self-hosting bootstrap.
+    r.push("static hl_str* hl_str_join(hl_list* parts, hl_str* sep) {")
+    r.push("    int64_t n = parts->len;")
+    r.push("    int64_t total = 0;")
+    r.push("    for (int64_t i = 0; i < n; i++) {")
+    r.push("        hl_str* p = (hl_str*)parts->items[i];")
+    r.push("        total += p->len;")
+    r.push("    }")
+    r.push("    if (n > 1) total += (n - 1) * sep->len;")
+    r.push("    hl_str* s = hl_str_alloc(total);")
+    r.push("    int64_t off = 0;")
+    r.push("    for (int64_t i = 0; i < n; i++) {")
+    r.push("        if (i > 0 && sep->len > 0) {")
+    r.push("            memcpy(s->data + off, sep->data, (size_t)sep->len);")
+    r.push("            off += sep->len;")
+    r.push("        }")
+    r.push("        hl_str* p = (hl_str*)parts->items[i];")
+    r.push("        if (p->len > 0) memcpy(s->data + off, p->data, (size_t)p->len);")
+    r.push("        off += p->len;")
+    r.push("    }")
+    r.push("    return s;")
+    r.push("}")
+    r.push("")
     r.push("static bool hl_str_eq(hl_str* a, hl_str* b) {")
     r.push("    return a->len == b->len && (a->len == 0 || memcmp(a->data, b->data, (size_t)a->len) == 0);")
     r.push("}")
@@ -8338,6 +8426,284 @@ fn gen_own_args_c(ctx: Ctx, e: int) -> str {
 
 # --- C expression generation ---
 
+# ============================================================================
+# STAGE 19 (v0.35.0-alpha): PROFILE-GUIDED OPTIMISATION helpers
+# ----------------------------------------------------------------------------
+# Two codegen modes:
+#   --pgo-generate   every fn entry / branch / loop back-edge gets a counter
+#                    increment; counters are dumped to a .hlcprof file at
+#                    process exit (registered via atexit in main()).
+#   --pgo-use=F      the profile F (produced above) steers codegen:
+#                      * __builtin_expect hints on biased branches/loops
+#                      * __attribute__((hot))/((cold)) on function signatures
+#                      * `static inline` on hot, small functions
+#                    Site ids are deterministic (same source => same ids in
+#                    both modes), so a profile from build A trains build B.
+# ============================================================================
+
+# pgo_site: assign (or reuse) the counter index for a profile site id.
+# The id is appended to ctx.pgo_site_ids on FIRST assignment; the index
+# is its position. Ids must be assigned in IDENTICAL order in
+# --pgo-generate and --pgo-use builds (they are: the codegen walk is
+# deterministic). When NO PGO mode is active the call is a no-op —
+# plain builds pay zero instrumentation cost.
+fn pgo_site(ctx: Ctx, id: str) -> int {
+    if !ctx.pgo_gen && !pgo_has_profile(ctx) {
+        return 0
+    }
+    if ctx.pgo_site_map.has(id) {
+        return ctx.pgo_site_map.get_or(id, 0)
+    }
+    ctx.pgo_site_ids.push(id)
+    let idx: int = ctx.pgo_site_ids.len() - 1
+    ctx.pgo_site_map.set(id, idx)
+    return idx
+}
+
+# PGO_MAX_SITES: the fixed counter array size in the generated C. hlc
+# refuses to instrument programs with more profile sites than this.
+fn PGO_MAX_SITES() -> int {
+    return 65536
+}
+
+# pgo_load_profile: parse a .hlcprof file (one "<site_id> <count>" pair
+# per line) into ctx.pgo_counts. Returns an error message or "" on
+# success. The format is deliberately line-based plain text: portable,
+# diffable, and debuggable.
+fn pgo_load_profile(ctx: Ctx, content: str) -> str {
+    let mut i: int = 0
+    let n: int = content.len()
+    let mut sites: int = 0
+    while i < n {
+        # id = bytes up to the first space (32).
+        let id_start: int = i
+        while i < n && content.byte_at(i) != 32 && content.byte_at(i) != 10 {
+            i = i + 1
+        }
+        let id: str = content.slice(id_start, i)
+        if id.len() == 0 {
+            if i < n && content.byte_at(i) == 10 {
+                i = i + 1
+            }
+            continue
+        }
+        if i >= n || content.byte_at(i) != 32 {
+            return "malformed profile line (no count) near offset " + i.to_str()
+        }
+        # skip spaces.
+        while i < n && content.byte_at(i) == 32 {
+            i = i + 1
+        }
+        let num_start: int = i
+        while i < n && content.byte_at(i) >= 48 && content.byte_at(i) <= 57 {
+            i = i + 1
+        }
+        if num_start == i {
+            return "malformed profile count for site '" + id + "'"
+        }
+        let count: int = int(content.slice(num_start, i))
+        ctx.pgo_counts.set(id, count)
+        sites = sites + 1
+        # skip to end of line.
+        while i < n && content.byte_at(i) != 10 {
+            i = i + 1
+        }
+        if i < n {
+            i = i + 1
+        }
+    }
+    if sites == 0 {
+        return "profile contains no sites"
+    }
+    # Total calls = sum of all function-entry counts ("e:<fnkey>").
+    let keys: list[str] = ctx.pgo_counts.keys()
+    let mut total: int = 0
+    let mut ki: int = 0
+    while ki < keys.len() {
+        let k: str = keys.get(ki)
+        if k.len() > 2 && k.slice(0, 2) == "e:" {
+            total = total + ctx.pgo_counts.get_or(k, 0)
+        }
+        ki = ki + 1
+    }
+    ctx.pgo_total_calls = total
+    return ""
+}
+
+# pgo_site_count: the profile count for a site id (0 when absent).
+fn pgo_site_count(ctx: Ctx, id: str) -> int {
+    return ctx.pgo_counts.get_or(id, 0)
+}
+
+# pgo_has_profile: is a --pgo-use profile loaded?
+fn pgo_has_profile(ctx: Ctx) -> bool {
+    return ctx.pgo_counts.keys().len() > 0
+}
+
+# pgo_branch_hint: expected value for an if-condition's
+# __builtin_expect, or -1 when no hint should be emitted.
+# Bias thresholds: >= 90% taken -> expect 1; <= 10% taken -> expect 0.
+fn pgo_branch_hint(ctx: Ctx, true_id: str, false_id: str) -> int {
+    if !pgo_has_profile(ctx) {
+        return -1
+    }
+    let t: int = pgo_site_count(ctx, true_id)
+    let f: int = pgo_site_count(ctx, false_id)
+    let total: int = t + f
+    if total <= 0 {
+        return -1
+    }
+    if t * 10 >= total * 9 {
+        return 1
+    }
+    if t * 10 <= total {
+        return 0
+    }
+    return -1
+}
+
+# pgo_loop_hint: expected value for a loop condition (or -1 for no hint).
+# A loop that never iterated in the profile is likely dead -> expect 0;
+# one that iterated -> expect 1 (the common case keeps the body hot).
+fn pgo_loop_hint(ctx: Ctx, backedge_id: str) -> int {
+    if !pgo_has_profile(ctx) {
+        return -1
+    }
+    if pgo_site_count(ctx, backedge_id) <= 0 {
+        return 0
+    }
+    return 1
+}
+
+# pgo_wrap_expect: wrap a C condition expression with __builtin_expect.
+fn pgo_wrap_expect(cond: str, expected: int) -> str {
+    return "__builtin_expect((" + cond + "), " + expected.to_str() + ")"
+}
+
+# pgo_fn_is_hot: is this function hot per the loaded profile?
+# Hot = at least 1000 entries AND at least 2% of all function entries.
+fn pgo_fn_is_hot(ctx: Ctx, key: str) -> bool {
+    if !pgo_has_profile(ctx) || ctx.pgo_total_calls <= 0 {
+        return false
+    }
+    let c: int = pgo_site_count(ctx, "e:" + key)
+    if c < 1000 {
+        return false
+    }
+    return c * 50 >= ctx.pgo_total_calls
+}
+
+# pgo_fn_is_cold: the function was never called in the profile.
+fn pgo_fn_is_cold(ctx: Ctx, key: str) -> bool {
+    if !pgo_has_profile(ctx) {
+        return false
+    }
+    return pgo_site_count(ctx, "e:" + key) == 0
+}
+
+# pgo_fn_attr: the C attribute prefix for a function signature under
+# --pgo-use ("" when none).
+fn pgo_fn_attr(ctx: Ctx, key: str) -> str {
+    if pgo_fn_is_hot(ctx, key) {
+        return "__attribute__((hot)) "
+    }
+    if pgo_fn_is_cold(ctx, key) {
+        return "__attribute__((cold)) "
+    }
+    return ""
+}
+
+# pgo_fn_inline: should this function get the `static inline` hint?
+# True when the profile marks it hot AND its emitted body is small
+# (<= 40 lines) — the per-call-site inlining threshold, realised as a
+# hint gcc honours at every call site of the function.
+fn pgo_fn_inline(ctx: Ctx, key: str) -> bool {
+    if !pgo_fn_is_hot(ctx, key) {
+        return false
+    }
+    if !ctx.pgo_fn_sizes.has(key) {
+        return false
+    }
+    return ctx.pgo_fn_sizes.get_or(key, 0) <= 40
+}
+
+# pgo_dump_lines: the C lines for the --pgo-generate profile dumper —
+# the site-id table + __hlc_pgo_dump(). Emitted after all function
+# bodies (so the site list is complete) and before main (which
+# registers the dumper via atexit). The dump is BEST-EFFORT: a profile
+# file that cannot be opened is silently skipped — instrumentation must
+# never change program behaviour, including its exit code.
+fn pgo_dump_lines(ctx: Ctx) -> list[str] {
+    let out: list[str] = []
+    let n: int = ctx.pgo_site_ids.len()
+    if n == 0 {
+        # No profile sites at all — emit a no-op dumper so the atexit
+        # registration still links.
+        out.push("// ===== Stage 19: PGO profile dumper (no sites) =====")
+        out.push("static void __hlc_pgo_dump(void) { }")
+        out.push("")
+        return out
+    }
+    out.push("// ===== Stage 19: PGO site-id table + profile dumper =====")
+    out.push("static const char* __hlc_pgo_names[" + n.to_str() + "] = {")
+    # Emit the ids in rows of 4 to keep line lengths sane.
+    let mut i: int = 0
+    while i < n {
+        let mut row: str = "    \"" + ctx.pgo_site_ids.get(i) + "\","
+        if i + 1 < n {
+            row = row + " \"" + ctx.pgo_site_ids.get(i + 1) + "\","
+        }
+        if i + 2 < n {
+            row = row + " \"" + ctx.pgo_site_ids.get(i + 2) + "\","
+        }
+        if i + 3 < n {
+            row = row + " \"" + ctx.pgo_site_ids.get(i + 3) + "\","
+        }
+        out.push(row)
+        i = i + 4
+    }
+    out.push("};")
+    out.push("")
+    out.push("static void __hlc_pgo_dump(void) {")
+    out.push("    const char* path = getenv(\"HLS_PGO_FILE\");")
+    out.push("    if (!path || !path[0]) path = \"default.hlcprof\";")
+    out.push("    /* HLS_PGO_MERGE=1: ADD this run's counters to an existing")
+    out.push("       profile instead of overwriting it - a training workload")
+    out.push("       of N program runs then accumulates one merged profile. */")
+    out.push("    const char* merge = getenv(\"HLS_PGO_MERGE\");")
+    out.push("    if (merge && merge[0] == '1') {")
+    out.push("        FILE* r = fopen(path, \"r\");")
+    out.push("        if (r) {")
+    out.push("            char buf[512];")
+    out.push("            while (fgets(buf, sizeof buf, r)) {")
+    out.push("                char* sp = strchr(buf, ' ');")
+    out.push("                if (!sp) continue;")
+    out.push("                *sp = 0;")
+    out.push("                long long c = strtoll(sp + 1, NULL, 10);")
+    out.push("                for (int i = 0; i < " + n.to_str() + "; i++) {")
+    out.push("                    if (strcmp(__hlc_pgo_names[i], buf) == 0) {")
+    out.push("                        if (c > 0) __hlc_pgo_counts[i] += (uint64_t)c;")
+    out.push("                        break;")
+    out.push("                    }")
+    out.push("                }")
+    out.push("            }")
+    out.push("            fclose(r);")
+    out.push("        }")
+    out.push("    }")
+    out.push("    FILE* f = fopen(path, \"w\");")
+    out.push("    if (!f) return; /* best-effort: profiling must never crash the program */")
+    out.push("    for (int i = 0; i < " + n.to_str() + "; i++) {")
+    out.push("        if (__hlc_pgo_counts[i] > 0) {")
+    out.push("            fprintf(f, \"%s %llu\\n\", __hlc_pgo_names[i],")
+    out.push("                    (unsigned long long)__hlc_pgo_counts[i]);")
+    out.push("        }")
+    out.push("    }")
+    out.push("    fclose(f);")
+    out.push("}")
+    out.push("")
+    return out
+}
+
 fn gen_expr(ctx: Ctx, e: int) -> str {
     # Stage 8-beta: if this node was hoisted into a temp, use the temp.
     let hk: str = e.to_str()
@@ -8364,6 +8730,19 @@ fn gen_expr(ctx: Ctx, e: int) -> str {
         return "false"
     }
     if k == "str" {
+        # Stage 19 (v0.35.0-alpha): profile-driven literal hoisting. In
+        # a HOT function a string literal becomes a thread-local
+        # one-time cache: the conversion (malloc + strlen + memcpy)
+        # runs once per thread instead of once per evaluation. The
+        # trailing hl_retain supplies the +1 that a fresh literal's
+        # inherent refcount provided, so ownership paths are unchanged.
+        if pgo_has_profile(ctx) && pgo_fn_is_hot(ctx, ctx.cur_fn) {
+            ctx.pgo_slit_n = ctx.pgo_slit_n + 1
+            let name: str = "HLC_SL_" + ctx.pgo_slit_n.to_str()
+            ctx.pgo_slits.push("static __thread hl_str* " + name + " = NULL;")
+            return "hl_retain((" + name + " ? (" + name + ") : (" + name
+                + " = " + c_str_lit(ctx.exprs[e].sval) + ")))"
+        }
         return c_str_lit(ctx.exprs[e].sval)
     }
     if k == "ident" {
@@ -8578,6 +8957,12 @@ fn gen_call(ctx: Ctx, e: int) -> str {
     }
     if name == "range" {
         return "hl_range(" + args + ")"
+    }
+    # Stage 19 (v0.35.0-alpha): O(n) join(list[str], sep) -> str. Args
+    # are read-only for the callee (borrowed raw pointers, matching the
+    # concat convention); the result is a fresh string.
+    if name == "join" {
+        return "hl_str_join(" + args + ")"
     }
     if name == "map_new" {
         # Stage 8-beta: the map owns its values — val_free comes from the
@@ -9574,11 +9959,38 @@ fn gen_stmt(ctx: Ctx, sidx: int, ind: str) -> void {
         collect_hoist(ctx, s.cond)
         hoist_all(ctx, ctx.out, ind)
         let c: str = gen_expr(ctx, s.cond)
-        ctx.out.push(ind + "if (" + c + ") {")
+        # Stage 19 (v0.35.0-alpha): PGO. Two profile sites per if: the
+        # true-path count and the false-path count (ids are deterministic
+        # per function: b:<fn>:<n>). Under --pgo-generate both paths get
+        # counter increments (an else clause is synthesised when absent);
+        # under --pgo-use a strongly-biased condition is wrapped with
+        # __builtin_expect so gcc lays the hot path fall-through.
+        let true_id: str = "b:" + ctx.cur_fn + ":" + ctx.pgo_fn_branch_n.to_str()
+        let false_id: str = "b:" + ctx.cur_fn + ":" + (ctx.pgo_fn_branch_n + 1).to_str()
+        ctx.pgo_fn_branch_n = ctx.pgo_fn_branch_n + 2
+        let true_idx: int = pgo_site(ctx, true_id)
+        let false_idx: int = pgo_site(ctx, false_id)
+        let mut cond_c: str = c
+        let hint: int = pgo_branch_hint(ctx, true_id, false_id)
+        if hint >= 0 {
+            cond_c = pgo_wrap_expect(c, hint)
+        }
+        ctx.out.push(ind + "if (" + cond_c + ") {")
+        if ctx.pgo_gen {
+            ctx.out.push(ind + "    __hlc_pgo_counts[" + true_idx.to_str() + "]++;")
+        }
         gen_stmts(ctx, s.body, ind + "    ")
         if s.else_body.len() > 0 {
             ctx.out.push(ind + "} else {")
+            if ctx.pgo_gen {
+                ctx.out.push(ind + "    __hlc_pgo_counts[" + false_idx.to_str() + "]++;")
+            }
             gen_stmts(ctx, s.else_body, ind + "    ")
+        } else if ctx.pgo_gen {
+            # No else branch in the source: synthesise one purely to
+            # count the false path (semantically a no-op).
+            ctx.out.push(ind + "} else {")
+            ctx.out.push(ind + "    __hlc_pgo_counts[" + false_idx.to_str() + "]++;")
         }
         ctx.out.push(ind + "}")
         flush_null_after(ctx, ind)
@@ -9599,16 +10011,41 @@ fn gen_stmt(ctx: Ctx, sidx: int, ind: str) -> void {
         # stale pointer every iteration — leading to infinite loops or
         # use-after-free if the list was mutated. Emit the temps AFTER
         # the `while (1) {` line so they re-execute per iteration.
+        #
+        # Stage 19: PGO — one loop back-edge site per while
+        # (l:<fn>:<n>), counted at the top of the body; the condition is
+        # __builtin_expect-hinted from the back-edge count under
+        # --pgo-use (a loop that never iterated -> expect 0).
+        let backedge_id: str = "l:" + ctx.cur_fn + ":" + ctx.pgo_fn_loop_n.to_str()
+        ctx.pgo_fn_loop_n = ctx.pgo_fn_loop_n + 1
+        let backedge_idx: int = pgo_site(ctx, backedge_id)
+        let lhint: int = pgo_loop_hint(ctx, backedge_id)
         if ctx.hoist_map.keys().len() > 0 {
             ctx.out.push(ind + "while (1) {")
             hoist_all(ctx, ctx.out, ind + "    ")
             let c: str = gen_expr(ctx, s.cond)
-            ctx.out.push(ind + "    if (!(" + c + ")) break;")
+            let mut break_c: str = "if (!(" + c + ")) break;"
+            if lhint == 1 {
+                break_c = "if (!" + pgo_wrap_expect(c, 1) + ") break;"
+            } else if lhint == 0 {
+                break_c = "if (!" + pgo_wrap_expect(c, 0) + ") break;"
+            }
+            ctx.out.push(ind + "    " + break_c)
+            if ctx.pgo_gen {
+                ctx.out.push(ind + "    __hlc_pgo_counts[" + backedge_idx.to_str() + "]++;")
+            }
             gen_stmts(ctx, s.body, ind + "    ")
             ctx.out.push(ind + "}")
         } else {
             let c: str = gen_expr(ctx, s.cond)
-            ctx.out.push(ind + "while (" + c + ") {")
+            let mut cond_c: str = c
+            if lhint >= 0 {
+                cond_c = pgo_wrap_expect(c, lhint)
+            }
+            ctx.out.push(ind + "while (" + cond_c + ") {")
+            if ctx.pgo_gen {
+                ctx.out.push(ind + "    __hlc_pgo_counts[" + backedge_idx.to_str() + "]++;")
+            }
             gen_stmts(ctx, s.body, ind + "    ")
             ctx.out.push(ind + "}")
         }
@@ -9635,7 +10072,21 @@ fn gen_stmt(ctx: Ctx, sidx: int, ind: str) -> void {
         }
         ctx.out.push(ind + "    int64_t " + itn_len + " = hl_list_len(" + itn + ");")
         ctx.out.push(ind + "    int64_t " + iv + ";")
-        ctx.out.push(ind + "    for (" + iv + " = 0; " + iv + " < " + itn_len + "; " + iv + "++) {")
+        # Stage 19: PGO — for-loop back-edge site (l:<fn>:<n>). The
+        # counter is the first statement of the loop body; the C for
+        # condition gets an __builtin_expect hint under --pgo-use.
+        let backedge_id: str = "l:" + ctx.cur_fn + ":" + ctx.pgo_fn_loop_n.to_str()
+        ctx.pgo_fn_loop_n = ctx.pgo_fn_loop_n + 1
+        let backedge_idx: int = pgo_site(ctx, backedge_id)
+        let lhint: int = pgo_loop_hint(ctx, backedge_id)
+        let mut for_cond: str = iv + " < " + itn_len
+        if lhint >= 0 {
+            for_cond = pgo_wrap_expect(for_cond, lhint)
+        }
+        ctx.out.push(ind + "    for (" + iv + " = 0; " + for_cond + "; " + iv + "++) {")
+        if ctx.pgo_gen {
+            ctx.out.push(ind + "        __hlc_pgo_counts[" + backedge_idx.to_str() + "]++;")
+        }
         # BUG-SC-4 fix: if the loop body shrinks the list (e.g. xs.pop()),
         # hl_list_get(itn, iv) would panic with "array access out of bounds".
         # Bounds-check before access and break if the list is now shorter
@@ -9828,6 +10279,10 @@ fn gen_reset_fn(ctx: Ctx) -> void {
     ctx.hoist_map = map_new()
     ctx.null_after = []
     ctx.cur_fn = ""
+    # Stage 19 (v0.35.0-alpha): reset the per-function branch / loop
+    # site-id sequence numbers (site ids embed them: b:<fn>:<n>).
+    ctx.pgo_fn_branch_n = 0
+    ctx.pgo_fn_loop_n = 0
 }
 
 # gen_param_locals: Stage 8-beta — function parameters OWN one retain of
@@ -9989,8 +10444,20 @@ fn gen_fn_body(ctx: Ctx, key: str) -> void {
     } else {
         sig = sig + join(sig_params, ", ") + ")"
     }
-    ctx.out.push(sig + " {")
+    # Stage 19 (v0.35.0-alpha): --pgo-use — annotate the function
+    # signature hot/cold from the loaded profile (entry counts).
+    let sig_start: int = ctx.out.len()
+    ctx.out.push(pgo_fn_attr(ctx, key) + sig + " {")
     emit_param_local_decls(ctx, f, inst_ptypes, param_local_names)
+    # Stage 19: PGO — function-entry counter site (e:<fnkey>), emitted
+    # under --pgo-generate as the first statement of the body.
+    let entry_idx: int = pgo_site(ctx, "e:" + key)
+    if ctx.pgo_gen {
+        if entry_idx >= PGO_MAX_SITES() {
+            panic("pgo: too many profile sites (limit 65536)")
+        }
+        ctx.out.push("    __hlc_pgo_counts[" + entry_idx.to_str() + "]++;")
+    }
     # Stage 17 (v0.28.0-alpha): --contracts — emit the runtime `requires`
     # assertion at the function entry. The requires expression was checked
     # in the params-only scope, so every ident resolves to a param local.
@@ -10012,6 +10479,14 @@ fn gen_fn_body(ctx: Ctx, key: str) -> void {
     gen_stmts(ctx, f.body, "    ")
     ctx.out.push("}")
     ctx.out.push("")
+    # Stage 19: record the emitted body size; under --pgo-use, hot small
+    # functions get a `static inline` hint retroactively patched onto the
+    # already-pushed signature line (the prototype emitted later consults
+    # the same map, so both stay consistent).
+    ctx.pgo_fn_sizes.set(key, ctx.out.len() - sig_start)
+    if pgo_fn_inline(ctx, key) {
+        ctx.out.set(sig_start, "static inline " + ctx.out.get(sig_start))
+    }
 }
 
 fn gen_struct_lines(ctx: Ctx) -> list[str] {
@@ -10288,7 +10763,13 @@ fn gen_proto_lines(ctx: Ctx) -> list[str] {
         } else {
             sig = sig + join(ptypes_c, ", ") + ")"
         }
-        out.push(sig + ";")
+        # Stage 19 (v0.35.0-alpha): prototype mirrors the body's PGO
+        # annotations (hot/cold attribute + static inline hint).
+        let mut attr: str = pgo_fn_attr(ctx, key)
+        if pgo_fn_inline(ctx, key) {
+            attr = "static inline " + attr
+        }
+        out.push(attr + sig + ";")
         i = i + 1
     }
     # Also emit prototypes for generic function instantiations.
@@ -10308,13 +10789,19 @@ fn gen_proto_lines(ctx: Ctx) -> list[str] {
             k = k + 1
         }
         let mut ret_str: str = instantiate_type(f.ret, f.typeparams, targs)
-        let mut sig: str = c_type(ctx, ret_str) + " usf_" + c_mangled_fn_name(key, f.typeparams, targs) + "("
+        let mangled: str = c_mangled_fn_name(key, f.typeparams, targs)
+        let mut sig: str = c_type(ctx, ret_str) + " usf_" + mangled + "("
         if ptypes_c.len() == 0 {
             sig = sig + "void)"
         } else {
             sig = sig + join(ptypes_c, ", ") + ")"
         }
-        out.push(sig + ";")
+        # Stage 19: mirror the instantiation body's PGO annotations.
+        let mut attr: str = pgo_fn_attr(ctx, mangled)
+        if pgo_fn_inline(ctx, mangled) {
+            attr = "static inline " + attr
+        }
+        out.push(attr + sig + ";")
         j2 = j2 + 1
     }
     out.push("")
@@ -10388,6 +10875,12 @@ fn gen_fn_inst_lines(ctx: Ctx) -> list[str] {
         # the body uses ctx.cur_typeparams + ctx.cur_targs for instantiation.
         ctx.cur_typeparams = combined_tps
         ctx.cur_targs = targs
+        # Stage 19 (v0.35.0-alpha): PGO — set cur_fn to the MANGLED
+        # instantiation name so branch/loop site ids (b:<fn>:<n>) are
+        # unique per instantiation. The contracts return-handler looks
+        # the key up in ctx.fns and gets dummy_fn (ensures_e = -1), so
+        # --contracts behaviour is unchanged.
+        ctx.cur_fn = c_mangled_fn_name(key, combined_tps, targs)
         # Build the signature. Stage 8-beta: parameters own one retain of
         # each argument — `<name>_p` in the signature, owned local copies
         # with cleanups at the top of the body.
@@ -10410,13 +10903,25 @@ fn gen_fn_inst_lines(ctx: Ctx) -> list[str] {
         } else {
             sig = sig + join(sig_params, ", ") + ")"
         }
-        out.push(sig + " {")
+        # Stage 19 (v0.35.0-alpha): PGO — the instantiation's entry site
+        # is keyed by the MANGLED name (stable across builds); hot/cold
+        # attributes come from the loaded profile like plain functions.
+        let mangled: str = c_mangled_fn_name(key, combined_tps, targs)
+        let sig_start: int = out.len()
+        out.push(pgo_fn_attr(ctx, mangled) + sig + " {")
         # Emit statements. The gen_stmt / gen_expr functions need to use
         # inst_t for types. We achieve this by intercepting in c_type via
         # the ctx.cur_typeparams + ctx.cur_targs.
         let saved_out: list[str] = ctx.out
         ctx.out = []
         emit_param_local_decls(ctx, f, inst_ptypes, param_local_names)
+        let entry_idx: int = pgo_site(ctx, "e:" + mangled)
+        if ctx.pgo_gen {
+            if entry_idx >= PGO_MAX_SITES() {
+                panic("pgo: too many profile sites (limit 65536)")
+            }
+            ctx.out.push("    __hlc_pgo_counts[" + entry_idx.to_str() + "]++;")
+        }
         gen_stmts(ctx, f.body, "    ")
         let mut k: int = 0
         while k < ctx.out.len() {
@@ -10426,6 +10931,12 @@ fn gen_fn_inst_lines(ctx: Ctx) -> list[str] {
         ctx.out = saved_out
         out.push("}")
         out.push("")
+        # Stage 19: body size + retroactive `static inline` hint (same
+        # predicate the prototype emission consults).
+        ctx.pgo_fn_sizes.set(mangled, out.len() - sig_start)
+        if pgo_fn_inline(ctx, mangled) {
+            out.set(sig_start, "static inline " + out.get(sig_start))
+        }
         ctx.cur_typeparams = []
         ctx.cur_targs = []
         i = i + 1
@@ -10775,6 +11286,26 @@ fn gen_program(ctx: Ctx) -> list[str] {
     final.push("// =============================================================")
     final.push("")
     concat_lines(final, runtime_lines())
+    # Stage 19 (v0.35.0-alpha): --pgo-generate — the profile counter
+    # array. Sized by the fixed site cap (checked during body emission;
+    # programs with more sites are rejected). Zero-initialised (.bss).
+    if ctx.pgo_gen {
+        final.push("")
+        final.push("// ===== Stage 19: PGO instrumentation counters =====")
+        final.push("static uint64_t __hlc_pgo_counts[" + PGO_MAX_SITES().to_str() + "];")
+    }
+    # Stage 19: --pgo-use — the hoisted string-literal caches collected
+    # while generating hot function bodies. Each is a thread-local
+    # one-time cache (see the "str" literal case in gen_expr).
+    if ctx.pgo_slits.len() > 0 {
+        final.push("")
+        final.push("// ===== Stage 19: PGO-hoisted string-literal caches =====")
+        let mut si3: int = 0
+        while si3 < ctx.pgo_slits.len() {
+            final.push(ctx.pgo_slits.get(si3))
+            si3 = si3 + 1
+        }
+    }
     final.push("")
     # 2a. Forward declarations for ALL structs and enums (recursive types).
     let struct_names: list[str] = ctx.structs.keys()
@@ -10839,10 +11370,26 @@ fn gen_program(ctx: Ctx) -> list[str] {
     concat_lines(final, ctx.spawn_decls)
     concat_lines(final, bodies)
     concat_lines(final, fn_inst_bodies)
+    # Stage 19 (v0.35.0-alpha): --pgo-generate — the profile dumper,
+    # emitted AFTER all bodies (it references the site-id table below)
+    # and BEFORE main (which registers it via atexit). The site-id table
+    # is emitted in ASSIGNMENT order — index i of __hlc_pgo_names
+    # corresponds to counter __hlc_pgo_counts[i], exactly matching the
+    # increments emitted inside the bodies above.
+    if ctx.pgo_gen {
+        concat_lines(final, pgo_dump_lines(ctx))
+    }
     # 3. main wrapper
     let mf: FnInfo = ctx.fns.get_or("main", dummy_fn())
     final.push("int main(int argc, char** argv) {")
     final.push("    hl_init_args(argc, argv);")
+    if ctx.pgo_gen {
+        # Register the profile dumper BEFORE any work: atexit handlers
+        # run LIFO, so this runs after the user's own atexit handlers
+        # (none today) and catches every exit path, including exit().
+        # Panics call exit(101) -> the profile is still written.
+        final.push("    atexit(__hlc_pgo_dump);")
+    }
     # Stage 10 release: auto-initialise the sandbox from the
     # HLS_SANDBOX_ROOT env var if set. This lets the user compile a
     # program once and run it with different sandboxes (no recompile
@@ -11014,9 +11561,18 @@ fn main() -> int uses IO {
     #                       unknown keeps its runtime check)
     #   --contracts        emit runtime `requires` assertions at every
     #                       contracted fn entry
+    # Stage 19 (v0.35.0-alpha):
+    #   --pgo-generate     instrument fn entries / branches / loop
+    #                       back-edges with counters; a .hlcprof profile is
+    #                       written at exit (HLS_PGO_FILE or default.hlcprof)
+    #   --pgo-use <file>   train the codegen with a .hlcprof profile:
+    #                       __builtin_expect hints, hot/cold attributes,
+    #                       static-inline hints on hot small functions
     # Strip the flags first; `a` below is the positional-argument view.
     let mut fast_mode: bool = false
     let mut contracts_mode: bool = false
+    let mut pgo_gen: bool = false
+    let mut pgo_use_path: str = ""
     let a: list[str] = []
     let mut ai: int = 1
     while ai < argv.len() {
@@ -11025,6 +11581,15 @@ fn main() -> int uses IO {
             fast_mode = true
         } else if tok == "--contracts" {
             contracts_mode = true
+        } else if tok == "--pgo-generate" {
+            pgo_gen = true
+        } else if tok == "--pgo-use" {
+            if ai + 1 >= argv.len() {
+                println("error: --pgo-use expects a profile file path")
+                return 2
+            }
+            pgo_use_path = argv.get(ai + 1)
+            ai = ai + 1
         } else if tok == "-O" {
             if ai + 1 < argv.len() && argv.get(ai + 1) == "fast" {
                 fast_mode = true
@@ -11068,7 +11633,8 @@ fn main() -> int uses IO {
         return 0
     }
     if a.len() < 2 {
-        println("usage: hlc [--fast | -O fast] [--contracts] <input.hls> <output.c|->")
+        println("usage: hlc [--fast | -O fast] [--contracts] [--pgo-generate] [--pgo-use <profile>]")
+        println("              <input.hls> <output.c|->")
         println("       hlc --audit <input.hls>")
         return 1
     }
@@ -11079,6 +11645,21 @@ fn main() -> int uses IO {
     ctx.repo_root = parent_dir(ctx.entry_dir)
     ctx.fast_mode = fast_mode
     ctx.contracts_mode = contracts_mode
+    ctx.pgo_gen = pgo_gen
+    # Stage 19: load the --pgo-use profile BEFORE codegen (the branch /
+    # fn-attribute hints consult it during generation).
+    if pgo_use_path != "" {
+        if !file_exists(pgo_use_path) {
+            println("error: --pgo-use: profile file not found: " + pgo_use_path)
+            return 2
+        }
+        let prof: str = read_file(pgo_use_path)
+        let perr: str = pgo_load_profile(ctx, prof)
+        if perr != "" {
+            println("error: --pgo-use: " + perr)
+            return 2
+        }
+    }
     # Lex + parse the entry file.
     lex(ctx)
     parse_program(ctx)

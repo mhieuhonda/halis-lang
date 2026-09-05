@@ -38,7 +38,7 @@ fn main() -> int uses IO {
 }
 ```
 
-Seven core guarantees of v0.20.0-alpha:
+Seven core guarantees of v0.35.0-alpha:
 
 1. **I/O is a declared effect.** Forget `uses IO` while printing to the
    screen? Compile error — even when the call is indirect through 5 function
@@ -161,6 +161,13 @@ python3 tools/hls-lsp.py --check examples/hello.hls   # one-shot diagnostics
 # 13. Stage 15-alpha: Safe C FFI (v0.13.0-alpha)
 python3 boot/boot.py examples/ffi_demo.hls           # call libc functions
 python3 tools/hlbindgen.py /usr/include/stdlib.h      # generate extern block from C header
+
+# 14. Stage 19 (v0.35.0-alpha): profile-guided optimisation
+make pgo                        # train hlc on its own workload -> bin/hlc_pgo
+make pgo-acceptance             # the Stage 19 acceptance gate (<= 80% wall time)
+bin/hlc --pgo-generate prog.hls out.c   # instrument: counters -> .hlcprof
+HLS_PGO_FILE=p.hlcprof ./a.out          # run the workload (HLS_PGO_MERGE=1 to accumulate)
+bin/hlc --pgo-use p.hlcprof prog.hls out2.c  # retrain codegen with the profile
 ```
 
 ## Language example
@@ -220,7 +227,7 @@ and error handling:
 
 | Module | What it provides |
 |--------|------------------|
-| `std.str` | `str_repeat`, `str_reverse`, `str_join`, `str_replace`, `str_to_lower_ascii`, `str_to_upper_ascii`, `str_count`, `str_pad_left`, `str_pad_right`, `str_index_of` |
+| `std.str` | `str_repeat`, `str_reverse`, `str_join` (O(n) via the `join` builtin), `str_replace`, `str_to_lower_ascii`, `str_to_upper_ascii`, `str_count`, `str_pad_left`, `str_pad_right`, `str_index_of` |
 | `std.math` | `math_abs_int/float`, `math_min/max`, `math_clamp`, `math_power_int/float`, `math_sqrt`, `math_floor`, `math_ceil`, `math_round`, `math_sum_int/float`, `math_avg_float` |
 | `std.json` | `json_parse(src) -> JsonValue`, `json_stringify(v) -> str`, plus constructors (`json_null/bool/int/float/str/array/object`) and accessors (`json_object_get`, `json_object_has`, `json_is_*`) |
 | `std.url` | `url_parse(s) -> Url`, `url_stringify(u) -> str`, `url_query_parse(qs) -> map[str,str]`, `url_query_stringify(m) -> str`, `url_encode(s)`, `url_decode(s)` |
@@ -281,7 +288,7 @@ Full details: [SPEC.md](SPEC.md) · Stage-by-stage roadmap:
 
 ## Status
 
-**v0.33.0-alpha — Stage 16 & 17 perfection re-verified + Deep-scan-12 (22 bug fixes across the IR optimiser, LLVM backend, stdlib, bindgen, package manager, LSP, linter, formatter, model checker, and URL module). 549/549 tests PASS, bootstrap deterministic, differential suite (interpreter ↔ native, including -O fast) byte-identical.** Previous release v0.32.0-alpha merged Dependabot PRs (action-gh-release 3, checkout 7, setup-python 7) and the deep-scan-and-beyond-v1 branch (PR #22) which closed all 7 open issues (#15-#21). Stage 17 was perfected in v0.30.0-alpha (proof-engine soundness overhaul + native ensures + loop-invariant engine).
+**v0.35.0-alpha — Stage 19: profile-guided optimisation. The compiler can now train itself: `--pgo-generate` instruments every function entry / branch / loop back-edge into a `.hlcprof` profile, `--pgo-use` feeds it back as `__builtin_expect` branch hints, hot/cold attributes, `static inline` thresholds and profile-gated string-literal hoisting. The trained `hlc` compiles itself in 73.4% of the plain build's wall time (acceptance: ≤ 80%), with byte-identical output; a new O(n) `join` builtin cut the self-compilation from 3.3 s to 0.48 s. 567/567 tests PASS.** Previous release v0.34.0-alpha completed Stage 18 (hltest + quickcheck + hls-fuzz + hlcov + the 150-stage roadmap restructure); v0.33.0-alpha merged the deep-scan-and-beyond-v1 branch (PR #22) which closed all 7 open issues (#15-#21). Stage 17 was perfected in v0.30.0-alpha (proof-engine soundness overhaul + native ensures + loop-invariant engine).
 
 - ✅ Complete core specification
 - ✅ Stage-0 reference (interpreted, with type + effects checking)
@@ -407,8 +414,19 @@ Full details: [SPEC.md](SPEC.md) · Stage-by-stage roadmap:
   reachability + invariants). Acceptance: `examples/hmac_proven.hls`
   — an HMAC envelope whose hot path is fully proven (fast output is
   byte-identical to the interpreter). 459/459 tests PASS.
-- ⬜ testing ecosystem (Stage 18), docs/book/playground (Stage 19),
-  v1.0 (Stage 20)...
+- ✅ **Stage 18 release — testing ecosystem & fuzzing** (v0.34.0-alpha):
+  `hltest` in-language test runner, `std.test` assertion library,
+  `std.quickcheck` property generators, `hls-fuzz` differential fuzzer
+  with AST delta-debugging minimisation, `hlcov` HLIR coverage. 557/557
+  tests PASS.
+- ✅ **Stage 19 release — profile-guided optimisation** (v0.35.0-alpha):
+  `--pgo-generate` / `--pgo-use` in the self-hosted compiler, the O(n)
+  `join` builtin, `make pgo` / `make pgo-acceptance`, and the
+  PGO-trained `hlc` as the canonical CI release artifact. Acceptance:
+  trained hlc self-compiles in 73.4% of plain wall time (≤ 80% target),
+  byte-identical output. 567/567 tests PASS.
+- ⬜ LTO across crates (Stage 20), SIMD vectorisation (Stage 21),
+  cross-compilation targets (Stage 22), v1.0 (Stage 150)...
 
 ## Contributing
 

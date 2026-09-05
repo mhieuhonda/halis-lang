@@ -51,7 +51,7 @@ remains green.
 
 | # | Stage | Status | Estimated effort |
 |---|-------|:------:|:----------------:|
-| 19 | Profile-guided optimisation (PGO) | ⬜ | 3–4 weeks |
+| 19 | Profile-guided optimisation (PGO) | ✅ | 3–4 weeks |
 | 20 | Link-time optimisation (LTO) across crates | ⬜ | 3 weeks |
 | 21 | SIMD vectorisation (target-feature detection) | ⬜ | 5 weeks |
 | 22 | Cross-compilation targets (Linux/macOS/Windows/FreeBSD) | ⬜ | 4 weeks |
@@ -1608,7 +1608,7 @@ native, including `-O fast`) remains byte-identical.
 
 ---
 
-## STAGE 19 — Profile-guided optimisation (PGO) ⬜
+## STAGE 19 — Profile-guided optimisation (PGO) ✅ (release v0.35.0-alpha)
 
 **Work:**
 - `hlc --pgo-generate` — instrument every function entry, branch, and
@@ -1622,6 +1622,21 @@ native, including `-O fast`) remains byte-identical.
 
 **Acceptance:** a PGO-trained `hlc` compiles `hlc.hls` in ≤80% of the
 non-PGO build's wall time, with byte-identical output.
+
+**Result (v0.35.0-alpha):** all three deliverables implemented in the
+self-hosted compiler (`src/hlc.hls`, ~330 lines of new HLS) — counter
+instrumentation with a merged training profile
+(`HLS_PGO_MERGE=1`), `__builtin_expect` branch hints,
+`__attribute__((hot))/((cold))` + `static inline` per-function
+annotations, and profile-gated string-literal hoisting (the LLVM
+`ConstantHoisting` design: literals in hot functions become thread-local
+one-time caches). `make pgo` builds the trained binary (packaged as the
+canonical release artifact by CI), `make pgo-acceptance` gates the
+timing criterion. Measured: **73.4%** of the plain build's wall time
+(median of 9 interleaved runs), byte-identical output. The stage also
+fixed the quadratic output assembly that dominated the bootstrap: the
+new O(n) `join(list[str], sep)` builtin (single allocation, one copy
+per element) cut a full self-compilation from **3.3 s to 0.48 s**.
 
 ---
 

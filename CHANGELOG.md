@@ -13,6 +13,124 @@ stability (125–140), and final stabilisation toward v1.0 (141–150).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
+## [v0.35.0-alpha] — Stage 19: profile-guided optimisation (PGO)
+
+> Completes **Stage 19** of the roadmap: the profile-guided
+> optimisation pipeline for the self-hosted compiler —
+> `--pgo-generate` instrumentation, `--pgo-use` training, the
+> `make pgo` release build, and the acceptance gate
+> `make pgo-acceptance`. Measured: the PGO-trained `hlc` compiles
+> `hlc.hls` in **73.4%** of the plain build's wall time (acceptance
+> target ≤ 80%), with **byte-identical output** on every program
+> tested. The stage also fixed the quadratic output assembly that
+> dominated the bootstrap — a full self-compilation dropped from
+> **3.3 s to 0.48 s** (6.9×). 567/567 tests PASS (557 prior + 10 new
+> Stage-19 tests), bootstrap still deterministic, differential suite
+> still byte-identical.
+
+### Stage 19 — profile-guided optimisation
+
+#### Added — `--pgo-generate` (instrumentation, `src/hlc.hls`)
+
+- Every **function entry**, every **if/else branch** (true path and
+  false path counted separately) and every **loop back-edge**
+  (`while`/`for` iterations) gets a counter increment in the generated
+  C. Counters live in a fixed `.bss` array (`__hlc_pgo_counts`).
+- At process exit (`atexit`, registered before any user code runs, so
+  panics and `exit()` are covered too) a best-effort dumper writes a
+  `.hlcprof` profile — line-based plain text (`<site-id> <count>`),
+  diffable and debuggable. Output path: `HLS_PGO_FILE` env var, else
+  `default.hlcprof`.
+- **`HLS_PGO_MERGE=1`** makes the dumper ADD the run's counters to an
+  existing profile — a training workload of N program runs then
+  accumulates one merged profile (otherwise each run overwrites).
+- Site ids are **deterministic** (`e:<fn>`, `b:<fn>:<n>`,
+  `l:<fn>:<n>`), identical between a `--pgo-generate` build and a
+  `--pgo-use` build of the same source — a profile from build A can
+  train build B. Generic instantiations key their sites by mangled
+  name.
+- Instrumentation is a **pure codegen mode** — like `--contracts`, it
+  never changes program output; unflagged builds contain zero PGO
+  machinery (test-verified).
+
+#### Added — `--pgo-use=<profile>` (training, `src/hlc.hls`)
+
+- **Branch-layout hints**: a branch with ≥ 90% bias is wrapped in
+  `__builtin_expect(cond, 1)`; ≤ 10% bias → `…, 0)`. gcc then lays the
+  hot path fall-through (hot/cold block reordering at the C level).
+- **Loop hints**: loops that never iterated in the profile get
+  `expect(cond, 0)`; loops that iterated get `expect(cond, 1)`.
+- **Hot/cold functions**: ≥ 1000 entries AND ≥ 2% of all entries →
+  `__attribute__((hot))`; never called → `__attribute__((cold))`.
+  Emitted on BOTH the prototype and the definition.
+- **Inlining thresholds per call site**: hot functions with an emitted
+  body of ≤ 40 lines get `static inline` — a per-function threshold the
+  profile decides, realised as a hint gcc honours at every call site.
+- **Profile-driven string-literal hoisting** (the LLVM
+  `ConstantHoisting` design): a string literal used inside a **hot**
+  function is emitted as a thread-local one-time cache
+  (`static __thread hl_str* HLC_SL_N`) instead of a per-evaluation
+  `hl_cstr()` conversion (malloc + strlen + memcpy + free each time).
+  The lazy branch is per-thread — no cross-thread sharing, plain
+  refcounts stay sound with Stage 16 concurrency; the inline
+  `hl_retain` supplies the +1 a fresh literal had, so every existing
+  cleanup / own-wrap path stays balanced. On `hlc.hls` this hoists 152
+  literals out of the hot functions.
+
+#### Added — the O(n) `join` builtin (the bootstrap compile-time fix)
+
+- `join(list[str], sep) -> str` — a new **pure builtin** (checker +
+  interpreter + C backend + LLVM backend), backed by the
+  `hl_str_join` runtime helper: compute the total length once,
+  allocate once, copy each element once.
+- Motivation (measured): hlc assembled its generated C output with an
+  accumulating HLS-level join — **O(n²) total bytes copied**, which
+  dominated the self-compilation (4.3 s for a 1.2 MB output on the
+  micro-benchmark). The builtin made the whole self-compile
+  **6.9× faster** (3.3 s → 0.48 s) and `std.str`'s `str_join` now
+  delegates to it (same output, linear run time).
+
+#### Added — Makefile / CI / tooling
+
+- `make pgo` — the full training cycle (instrument → train on the
+  self-compilation workload + 5 example programs, 3 merged rounds →
+  recompile with `--pgo-use` → verify byte-identical output on sample
+  programs). Produces `bin/hlc_pgo` + `bin/hlc.hlcprof`.
+- `make pgo-acceptance` — the Stage 19 acceptance gate:
+  `scripts/pgo_ratio.py` compares medians of 9 interleaved runs of the
+  plain vs trained compiler on `src/hlc.hls` and gates at ≤ 80%,
+  re-verifying byte-identical output. **Measured: 73.4% — PASS.**
+- `make pgo-report` — the same measurement, informational (no gate).
+- The release workflow now builds the **PGO-trained `hlc` as the
+  canonical release artifact** (`hlc-pgo-<tag>.tar.gz`, containing the
+  trained binary + its `.hlcprof` profile) and adds it to SHA256SUMS.
+- CI runs `make pgo` on every push/PR (byte-identical verification;
+  the timing ratio is reported but not gated on shared runners).
+
+#### Added — tests
+
+- `tests/ok/feat_stage19_pgo.hls` — the acceptance demo: biased
+  branches, a hot loop, deterministic output; differentially tested
+  (interpreter ↔ native) like every ok/ program.
+- `tests/run_tests.sh` section 7 (9 new checks): the instrumented
+  binary compiles and writes a `.hlcprof` with correct
+  entry/branch/loop counters (`e:main 1`, `l:sum_upto:0 1000`,
+  `b:classify:0 …`); the `--pgo-use` recompiled binary produces
+  byte-identical output; `__builtin_expect` hints are present in the
+  trained C; unflagged builds contain zero instrumentation; the `join`
+  builtin agrees between interpreter and native (including a
+  5000-element join).
+
+### Test results
+
+- 567 PASS / 0 FAIL (557 prior + 10 new Stage-19 tests).
+- Bootstrap: deterministic (two self-compilation passes produce
+  byte-identical C output).
+- Differential suite (interpreter ↔ native, including `-O fast`):
+  byte-identical across all ok/ programs.
+- Stage 19 acceptance (`make pgo-acceptance`): **73.4% ≤ 80%, PASS**,
+  byte-identical output.
+
 ## [v0.34.0-alpha] — Stage 18: testing ecosystem & fuzzing + roadmap restructure
 
 > Completes **Stage 18** of the roadmap: the in-language test runner

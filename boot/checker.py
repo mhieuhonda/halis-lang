@@ -207,6 +207,11 @@ BUILTIN_FNS = {
     # Stage 16 (v0.27.0-alpha): concurrency builtins. Stage-16
     # perfection (v0.29.0-alpha) adds chan_new_bounded.
     "chan_new", "chan_new_bounded", "spawn", "select",
+    # Stage 19 (v0.35.0-alpha): O(n) string join — the accumulating
+    # `a + b` concat is quadratic when building large outputs, which
+    # dominated the bootstrap's compile time. The builtin joins a
+    # list[str] with a separator in a single allocation.
+    "join",
 }
 
 # Stage 9 (v0.20.0-alpha — release): per-builtin effect mapping.
@@ -1516,6 +1521,18 @@ class Checker:
             argt(0, "int")
             argt(1, "int")
             return "list[int]"
+        # Stage 19 (v0.35.0-alpha): join(list[str], sep) -> str — the
+        # O(n) whole-list join (single allocation + single copy per
+        # element). Pure (no effects).
+        if name == "join":
+            need(2)
+            # Expected type on arg 1 so an empty list literal `[]`
+            # infers list[str] from the call itself.
+            at = argt(0, "list[str]")
+            if not is_list(at) or list_elem(at) != "str":
+                self.err("join() expects a list[str] as argument 1, got %s" % at, e)
+            argt(1, "str")
+            return "str"
         if name == "map_new":
             need(0)
             if expected is None or not is_map(expected):
