@@ -725,6 +725,56 @@ else
     bad "simd-bench: compile failed"
 fi
 
+# Stage 21 perfection (v0.40.0-alpha): horizontal reduce_min/max +
+# --target-feature native auto-detection.
+# (d) the new reduce_min/reduce_max ops are covered by the differential
+#     suite (sections 1/3) since feat_stage21_simd.hls calls them; here
+#     we verify the values are correct (mixed-sign lanes).
+simd_interp_v2=$(python3 boot/boot.py "$SIMD_F" </dev/null 2>/dev/null)
+if echo "$simd_interp_v2" | grep -q "^reduce_min: -5$" \
+        && echo "$simd_interp_v2" | grep -q "^reduce_max: 7$"; then
+    ok "simd: reduce_min/reduce_max correct on mixed-sign lanes (-5, 7)"
+else
+    bad "simd: reduce_min/reduce_max values wrong"
+    echo "$simd_interp_v2" | grep reduce_
+fi
+# (e) --target-feature native: auto-detects the host's best feature.
+#     Both the interpreter and the native build must resolve "native"
+#     to the SAME concrete feature, so has_feature() const-folds
+#     identically on both sides.
+simd_interp_native=$(python3 boot/boot.py --target-feature native "$SIMD_F" </dev/null 2>/dev/null)
+if "$TMP/hlc1" --target-feature native "$SIMD_F" "$TMP/s21n.c" >/dev/null 2>&1 \
+        && gcc -O2 -o "$TMP/s21n_bin" "$TMP/s21n.c" -lm -pthread 2>/dev/null; then
+    s21n_out=$("$TMP/s21n_bin" 2>/dev/null)
+    if [ "$s21n_out" == "$simd_interp_native" ]; then
+        ok "simd: --target-feature native produces byte-identical output (interp == native)"
+    else
+        bad "simd: --target-feature native diverged from interpreter"
+        diff <(echo "$s21n_out") <(echo "$simd_interp_native") | head -4
+    fi
+    # The intrinsic helpers must be present under --target-feature native
+    # when the host CPU supports AVX2 (the auto-detected feature).
+    if grep -q "simd_cpu_supports(avx2) = true" <<<"$s21n_out"; then
+        if grep -q "hl_simd_" "$TMP/s21n.c"; then
+            ok "simd: --target-feature native emitted intrinsic fast path on AVX2 host"
+        else
+            bad "simd: --target-feature native did not emit intrinsic fast path on AVX2 host"
+        fi
+    fi
+else
+    bad "simd: --target-feature native compile failed"
+fi
+# (f) --target-feature native is accepted by boot.py and resolves to a
+#     concrete feature. On an AVX2 host, has_feature("avx2") must
+#     const-fold to true under --target-feature native (same as the
+#     explicit --target-feature avx2 path).
+if echo "$simd_interp_native" | grep -q "^has_feature(avx2) = true$"; then
+    ok "simd: boot.py --target-feature native resolves to avx2 on AVX2 host"
+else
+    bad "simd: boot.py --target-feature native did not resolve to avx2"
+    echo "$simd_interp_native" | grep has_feature
+fi
+
 echo ""
 echo "=========================================="
 echo "RESULT: $PASS PASS / $FAIL FAIL"

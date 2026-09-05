@@ -274,16 +274,37 @@ def run_cli():
     # Stage 21 (v0.37.0-alpha): --target-feature FEAT — set the active
     # SIMD feature (has_feature() const-folds from it; the interpreter
     # reads it for parity with the native codegen).
+    # Stage 21 perfection (v0.40.0-alpha): FEAT can also be "native" —
+    # auto-detect the host's best feature via simd_cpu_supports(). The
+    # interpreter resolves "native" to a concrete feature (avx2 |
+    # sse4.2 | neon | "") BEFORE running the program, so has_feature()
+    # const-folds identically to the native codegen path.
     while "--target-feature" in args:
         i = args.index("--target-feature")
         if i + 1 >= len(args):
             sys.stderr.write("error: --target-feature expects a name "
-                             "(sse4.2 | avx2 | neon)\n")
+                             "(sse4.2 | avx2 | neon | native)\n")
             return 2
         feat = args[i + 1].lstrip("+")
-        if feat not in ("sse4.2", "avx2", "neon"):
+        if feat == "native":
+            # Auto-detect: probe the host CPU. The interpreter's
+            # _cpu_supports() helper mirrors the C runtime's
+            # hl_simd_cpu_supports() — same probe, same result.
+            # `feat` becomes one of "avx2", "sse4.2", "neon", or "" (no
+            # fast path — the portable pure-HLS implementation runs).
+            from boot.interp import _cpu_supports
+            if _cpu_supports("avx2"):
+                feat = "avx2"
+            elif _cpu_supports("sse4.2"):
+                feat = "sse4.2"
+            elif _cpu_supports("neon"):
+                feat = "neon"
+            else:
+                feat = ""
+        if feat != "" and feat not in ("sse4.2", "avx2", "neon"):
             sys.stderr.write("error: unknown target feature '%s' "
-                             "(expected sse4.2 | avx2 | neon)\n" % feat)
+                             "(expected sse4.2 | avx2 | neon | native)\n"
+                             % feat)
             return 2
         target_feature = feat
         del args[i:i + 2]

@@ -1678,7 +1678,7 @@ short-circuit semantics (regression test added).
 
 ---
 
-## STAGE 21 — SIMD vectorisation (target-feature detection) ✅ (release v0.37.0-alpha)
+## STAGE 21 — SIMD vectorisation (target-feature detection) ✅ (release v0.37.0-alpha, perfected v0.40.0-alpha)
 
 **Work:**
 - `std.simd` — explicit SIMD types (`i32x4`, `f64x2`, `u8x16`) and

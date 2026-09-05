@@ -13,6 +13,121 @@ stability (125–140), and final stabilisation toward v1.0 (141–150).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
+## [v0.40.0-alpha] — Stage 21 perfection: reduce_min/max + --target-feature native
+
+> A perfection pass on **Stage 21** (SIMD, v0.37.0-alpha). The
+> `std.simd` library and the `--target-feature` intrinsic fast paths
+> are unchanged (the 2.4× acceptance ratio on the AVX2 target, the
+> byte-identical output across scalar / portable / intrinsic paths,
+> and the zero-SIMD-machinery-in-unflagged-builds guarantee all
+> still hold). This release closes two operational gaps:
+>
+> - **`simd_i32x4_reduce_min` / `simd_i32x4_reduce_max`** — the two
+>   missing horizontal reductions. Together with the existing
+>   `simd_i32x4_reduce_add`, they cover the three canonical SIMD
+>   horizontal operations (sum, min, max) — the shape a real
+>   auto-vectoriser emits for `for x in xs { acc = (acc op x) }`
+>   loops. Pure HLS; signed int32 lanes; range-checked lane entry.
+> - **`--target-feature native`** — auto-detect the host CPU's best
+>   SIMD feature. On x86-64 hosts, picks `avx2` (the strongest x86
+>   feature the std.simd intrinsic fast paths support today;
+>   AVX-512 tuning is post-1.0). On aarch64, picks `neon` (baseline
+>   on every ARMv8+ core). On other architectures, falls back to `""`
+>   (portable path — no intrinsic fast paths emitted).
+>   - **`boot.py` parity**: the interpreter resolves `native` to a
+>     concrete feature BEFORE running the program (via the existing
+>     `_cpu_supports()` helper), so `has_feature()` const-folds
+>     identically to the native codegen path. The same command line
+>     works for both paths in differential testing.
+> - **4 new tests** in `tests/run_tests.sh` section 9 (reduce_min/max
+>   value verification on mixed-sign lanes; `--target-feature native`
+>   produces byte-identical output between interpreter and native;
+>   intrinsic fast path emitted on AVX2 hosts; `boot.py` resolves
+>   `native` to `avx2` on AVX2 hosts). 606/606 tests PASS, bootstrap
+>   deterministic, Stage 21 acceptance re-verified (2.4× ratio).
+
+### Stage 21 perfection — `simd_i32x4_reduce_min` / `simd_i32x4_reduce_max`
+
+#### Added — horizontal min/max reductions (`std/simd.hls`)
+
+- `simd_i32x4_reduce_min(x: I32x4) -> int` — returns the smallest
+  lane value (signed int32). Lanes are extracted via
+  `simd_i32x4_lane` (range-checked entry), so a bad lane index is a
+  clean panic, not UB.
+- `simd_i32x4_reduce_max(x: I32x4) -> int` — returns the largest
+  lane value (signed int32). Same range-checked entry.
+- Together with `simd_i32x4_reduce_add`, these cover the three
+  canonical SIMD horizontal operations. The shape a real
+  auto-vectoriser emits for `for x in xs { acc = (acc op x) }`
+  loops is now expressible directly in `std.simd`.
+- Pure HLS (no intrinsic fast path) — the lane-by-lane
+  `math_min_int` / `math_max_int` calls are what every SIMD ISA's
+  horizontal-min/max instruction expands to anyway. The intrinsic
+  fast path for these would use `_mm_hmin_epi32` / `_mm_hmax_epi32`
+  (SSE4.1+); deferred to a follow-up if profiling shows it matters.
+
+### Stage 21 perfection — `--target-feature native`
+
+#### Added — auto-detection of the host's best SIMD feature
+
+- `hlc --target-feature native` probes the host CPU at compile time
+  and selects the strongest feature the std.simd intrinsic fast
+  paths support:
+  - x86-64 with AVX2 → `avx2`
+  - x86-64 with SSE4.2 but no AVX2 → `sse4.2`
+  - aarch64 → `neon` (baseline on every ARMv8+ core)
+  - other architectures → `""` (portable path — no intrinsic fast
+    paths emitted, the std.simd kernels run their pure-HLS
+    implementation)
+- Implemented in HLS as `simd_detect_native_feature()`, which calls
+  the existing `simd_cpu_supports()` builtin (a runtime CPU probe
+  via `__builtin_cpu_supports` on x86 / NEON baseline on aarch64).
+  When `hlc` is compiled and run, calling `simd_cpu_supports()`
+  probes the CPU `hlc` itself is running on.
+- The error message for an unknown feature now lists `native` as a
+  valid option: `expected sse4.2 | avx2 | neon | native`.
+
+#### Added — `boot.py` parity for `--target-feature native`
+
+- The interpreter resolves `native` to a concrete feature BEFORE
+  running the program, using the existing `_cpu_supports()` helper
+  (which mirrors the C runtime's `hl_simd_cpu_supports()` — same
+  probe, same result). This ensures `has_feature()` const-folds
+  identically on both sides:
+  - `boot.py --target-feature native` on an AVX2 host → resolves to
+    `avx2` → `has_feature("avx2")` const-folds to `true`.
+  - `hlc --target-feature native` on the same host → also resolves
+    to `avx2` → `has_feature("avx2")` const-folds to `true` in the
+    generated C.
+- The same command line works for both paths in differential
+  testing — no interpreter/native divergence on `has_feature()`.
+
+### Stage 21 perfection — tests
+
+- `tests/ok/feat_stage21_simd.hls` gains 2 new checks:
+  `reduce_min: -5` and `reduce_max: 7` on a mixed-sign lane vector
+  `simd_i32x4_from(-5, 7, -2, 3)`. The differential suite (sections
+  1/3) covers these — the interpreter and the native build must
+  produce the same values.
+- `tests/run_tests.sh` section 9 gains 4 new checks:
+  1. `reduce_min` / `reduce_max` return the correct values on
+     mixed-sign lanes (-5, 7).
+  2. `--target-feature native` produces byte-identical output
+     between the interpreter and the native build (both resolve
+     `native` to the same concrete feature).
+  3. The intrinsic fast path is emitted under `--target-feature
+     native` on AVX2 hosts (the auto-detected feature).
+  4. `boot.py --target-feature native` resolves to `avx2` on AVX2
+     hosts (the `has_feature("avx2")` line const-folds to `true`).
+
+### Test results
+
+- 606 PASS / 0 FAIL (602 prior + 4 new Stage-21 perfection checks).
+- Bootstrap: deterministic.
+- Stage 21 acceptance re-verified: 2.4× ratio on the 1M-element
+  8-tap FIR kernel (gate ≥ 2×); checksums match on the scalar,
+  portable, and intrinsic paths.
+
 ## [v0.39.0-alpha] — Stage 20 perfection: LTO stats + tunable threshold + dedup test
 
 > A perfection pass on **Stage 20** (LTO, v0.36.0-alpha). The
