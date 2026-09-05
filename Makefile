@@ -8,7 +8,7 @@ HLC     = src/hlc.hls
 BIN     = bin
 PREFIX  ?= /usr/local
 
-.PHONY: all stage0 bootstrap test examples clean run check bench install uninstall audit opt-stats emit-ir emit-llvm fmt lint lsp-check pkg-init pkg-add pkg-lock pkg-audit pkg-verify pkg-build pkg-publish pkg-log pkg-log-verify prove prove-full model prove-acceptance hltest fuzz cov fuzz-acceptance wasm-opt webapp webapp-acceptance serve aarch64-bench aarch64-acceptance aarch64-list-targets stack-acceptance kernel-attrs
+.PHONY: all stage0 bootstrap test examples clean run check bench install uninstall audit opt-stats emit-ir emit-llvm fmt lint lsp-check pkg-init pkg-add pkg-lock pkg-audit pkg-verify pkg-build pkg-publish pkg-log pkg-log-verify prove prove-full model prove-acceptance hltest fuzz cov fuzz-acceptance wasm-opt webapp webapp-acceptance serve aarch64-bench aarch64-acceptance aarch64-list-targets stack-acceptance inline-acceptance opt-stats-report kernel-attrs
 
 # Main goal: use the full bootstrap chain to build the native compiler
 all: bootstrap
@@ -701,6 +701,101 @@ kernel-attrs:
 	@test -n "$(F)" || (echo "Usage: make kernel-attrs F=examples/kernel_irq_demo.hls" && false)
 	@test -x $(BIN)/hlc || $(MAKE) bootstrap
 	@$(BIN)/hlc --opt-stats $(F) /tmp/kernel_attrs_out.c 2>&1 | head -40
+
+# ============================================================================
+# Stage 29 (v0.46.0-alpha): inline / hot / cold attributes + --opt-stats
+# ============================================================================
+
+# inline-acceptance: the Stage 29 acceptance gate. Verifies that:
+#   (a) examples/inline_attrs_demo.hls parses with all four Stage 29
+#       attributes (`#[inline(always)]`, `#[inline(never)]`, `#[hot]`,
+#       `#[cold]`).
+#   (b) The C source contains the right C attributes on each function.
+#   (c) --opt-stats prints a per-function table showing the annotations.
+#   (d) --lto honours the annotations:
+#       - #[inline(always)] => inlined at every call site
+#       - #[inline(never)] => NOT inlined
+#   (e) hllint warns (L011) when #[inline(always)] is on a function
+#       > 50 statements.
+inline-acceptance:
+	@echo "[Stage 29 acceptance] compiling examples/inline_attrs_demo.hls..."
+	@test -x $(BIN)/hlc || $(MAKE) bootstrap
+	@mkdir -p $(BIN)
+	@$(BIN)/hlc examples/inline_attrs_demo.hls $(BIN)/inline_attrs.c >$(BIN)/inline_acc.log 2>&1 \
+          || (echo "FAIL: hlc compile failed"; cat $(BIN)/inline_acc.log; exit 1)
+	@echo "  HLS parses with #[inline(always)], #[inline(never)], #[hot], #[cold]: OK"
+	@if grep -q "static inline __attribute__((always_inline)) int64_t usf_small_hot_helper" $(BIN)/inline_attrs.c; then \
+          echo "  C source has __attribute__((always_inline)) on small_hot_helper: OK"; \
+	else \
+          echo "FAIL: __attribute__((always_inline)) missing on small_hot_helper"; exit 1; \
+	fi
+	@if grep -q "__attribute__((noinline)) int64_t usf_big_rare_path" $(BIN)/inline_attrs.c; then \
+          echo "  C source has __attribute__((noinline)) on big_rare_path: OK"; \
+	else \
+          echo "FAIL: __attribute__((noinline)) missing on big_rare_path"; exit 1; \
+	fi
+	@if grep -q "__attribute__((hot)) int64_t usf_hot_loop" $(BIN)/inline_attrs.c; then \
+          echo "  C source has __attribute__((hot)) on hot_loop: OK"; \
+	else \
+          echo "FAIL: __attribute__((hot)) missing on hot_loop"; exit 1; \
+	fi
+	@if grep -q "__attribute__((cold)) int64_t usf_cold_path" $(BIN)/inline_attrs.c; then \
+          echo "  C source has __attribute__((cold)) on cold_path: OK"; \
+	else \
+          echo "FAIL: __attribute__((cold)) missing on cold_path"; exit 1; \
+	fi
+	@# Verify --opt-stats prints the per-function table.
+	@$(BIN)/hlc --opt-stats examples/inline_attrs_demo.hls /tmp/inline_optstats.c \
+          >$(BIN)/inline_optstats.log 2>&1
+	@if grep -q "ALWAYS" $(BIN)/inline_optstats.log && \
+          grep -q "NEVER" $(BIN)/inline_optstats.log && \
+          grep -q "HOT" $(BIN)/inline_optstats.log && \
+          grep -q "COLD" $(BIN)/inline_optstats.log; then \
+          echo "  --opt-stats prints inline/hot/cold decisions: OK"; \
+	else \
+          echo "FAIL: --opt-stats missing inline/hot/cold decisions"; \
+          cat $(BIN)/inline_optstats.log; exit 1; \
+	fi
+	@# Verify LTO honours #[inline(always)] and #[inline(never)].
+	@$(BIN)/hlc --lto --lto-stats examples/inline_attrs_demo.hls $(BIN)/inline_lto.c \
+          >$(BIN)/inline_lto.log 2>&1
+	@if grep -q "small_hot_helper" $(BIN)/inline_lto.log; then \
+          echo "  --lto inlines small_hot_helper (#[inline(always)]): OK"; \
+	else \
+          echo "FAIL: --lto did not inline small_hot_helper"; \
+          cat $(BIN)/inline_lto.log; exit 1; \
+	fi
+	@if ! grep -q "usf_small_hot_helper(" $(BIN)/inline_lto.c; then \
+          echo "  0 out-of-line calls to small_hot_helper in --lto build: OK"; \
+	else \
+          echo "FAIL: small_hot_helper has out-of-line calls under --lto"; \
+          grep "usf_small_hot_helper(" $(BIN)/inline_lto.c; exit 1; \
+	fi
+	@if grep -q "usf_big_rare_path(" $(BIN)/inline_lto.c; then \
+          echo "  big_rare_path kept out-of-line (#[inline(never)]): OK"; \
+	else \
+          echo "FAIL: big_rare_path not present as out-of-line call"; exit 1; \
+	fi
+	@# Verify hllint warns on #[inline(always)] > 50 statements (L011).
+	@# Synthetic test file: a function with 51 statements + #[inline(always)].
+	@printf '#[inline(always)]\nfn big_inline_always(n: int) -> int {\n  let mut s: int = 0\n  let mut i: int = 0\n' > $(BIN)/l011_test.hls
+	@for n in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51; do \
+          printf '  s = s + i\n  i = i + 1\n' >> $(BIN)/l011_test.hls; \
+	done
+	@printf '  return s\n}\n\nfn main() -> int {\n  return big_inline_always(10)\n}\n' >> $(BIN)/l011_test.hls
+	@if python3 tools/hllint.py --rule L011 $(BIN)/l011_test.hls 2>&1 | grep -q "L011"; then \
+          echo "  hllint L011 warns on #[inline(always)] > 50 statements: OK"; \
+	else \
+          echo "FAIL: hllint L011 did not warn on large #[inline(always)]"; exit 1; \
+	fi
+	@echo "ACCEPTANCE OK: Stage 29 inline / hot / cold attributes + --opt-stats verified"
+
+# opt-stats-report: print the --opt-stats report for a given file.
+# Usage: make opt-stats-report F=examples/inline_attrs_demo.hls
+opt-stats-report:
+	@test -n "$(F)" || (echo "Usage: make opt-stats-report F=examples/inline_attrs_demo.hls" && false)
+	@test -x $(BIN)/hlc || $(MAKE) bootstrap
+	@$(BIN)/hlc --opt-stats --lto $(F) /tmp/optstats_out.c 2>&1
 
 clean:
 	rm -rf $(BIN)

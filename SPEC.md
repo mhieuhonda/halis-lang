@@ -1944,3 +1944,241 @@ The acceptance gate (`make stack-acceptance`) verifies:
    `#[stack_size(N)] violated` compile error).
 
 See `examples/kernel_irq_demo.hls` for the full example.
+
+---
+
+## 28. Inline / hot / cold attributes (Stage 29 — v0.46.0-alpha)
+
+Stage 29 introduces four new function attributes that give the
+programmer explicit control over the optimiser's inline / hot / cold
+decisions. These override the PGO-derived heuristics (Stage 19) and
+the LTO inliner's budget-based decisions (Stage 20):
+
+```hls
+#[inline(always)]   # force inline at every call site
+#[inline(never)]    # forbid inlining at every call site
+#[hot]              # mark the function hot (overrides PGO)
+#[cold]             # mark the function cold (overrides PGO)
+```
+
+### 28.1. `#[inline(always)]` — force inline at every call site
+
+The codegen emits `static inline __attribute__((always_inline))` on
+the function signature. gcc requires BOTH the `inline` keyword AND
+the `__attribute__((always_inline))` attribute for the hint to take
+effect (a lone `__attribute__((always_inline))` without `inline`
+is silently ignored).
+
+The LTO inliner (`lto_can_inline`) honours `#[inline(always)]` by
+bypassing:
+
+1. The per-callee statement budget (`LTO_INLINE_MAX_STMTS`, default
+   30, tunable via `--lto-threshold`).
+2. The per-program inline-site cap (`LTO_INLINE_MAX_SITES`, default
+   100).
+
+The recursion check STAYS (inlining a recursive function would loop
+forever), and so does the never-return check.
+
+```hls
+#[inline(always)]
+fn small_hot_helper(x: int) -> int {
+    return x + 1
+}
+```
+
+Emitted C:
+
+```c
+static inline __attribute__((always_inline)) int64_t usf_small_hot_helper(int64_t u_x_p) {
+    return u_x_p + 1;
+}
+```
+
+### 28.2. `#[inline(never)]` — forbid inlining at every call site
+
+The codegen emits `__attribute__((noinline))` on the function
+signature. The LTO inliner returns false IMMEDIATELY for
+`#[inline(never)]` functions (before any other check). The
+`__attribute__((noinline))` is a SECOND layer of defence — gcc will
+refuse to inline even if the LTO inliner missed it.
+
+```hls
+#[inline(never)]
+fn big_rare_path(x: int) -> int {
+    let mut s: int = 0
+    let mut i: int = 0
+    while i < x {
+        s = s + i * 2
+        i = i + 1
+    }
+    return s
+}
+```
+
+Emitted C:
+
+```c
+__attribute__((noinline)) int64_t usf_big_rare_path(int64_t u_x_p) {
+    int64_t u_s = 0;
+    int64_t u_i = 0;
+    while (u_i < u_x_p) {
+        u_s = u_s + u_i * 2;
+        u_i = u_i + 1;
+    }
+    return u_s;
+}
+```
+
+### 28.3. `#[hot]` — mark the function hot (overrides PGO)
+
+The codegen emits `__attribute__((hot))` on the function signature.
+gcc's hot attribute:
+
+1. Hints gcc to inline-aggressively at every call site (the gcc
+   inliner respects the hot attribute as a strong hint).
+2. Lays out the function near other hot code (improves I-cache
+   locality).
+3. Applies hot-path optimisations (more aggressive inlining,
+   unrolling, vectorisation).
+
+When `--pgo-use` is active, `#[hot]` OVERRIDES the PGO profile's
+hot/cold classification — the user's explicit annotation wins.
+
+```hls
+#[hot]
+fn hot_loop(n: int) -> int {
+    let mut i: int = 0
+    let mut s: int = 0
+    while i < n {
+        s = s + i
+        i = i + 1
+    }
+    return s
+}
+```
+
+Emitted C:
+
+```c
+__attribute__((hot)) int64_t usf_hot_loop(int64_t u_n_p) { ... }
+```
+
+`#[hot]` is mutually exclusive with `#[cold]` (compile error if both
+appear on the same function).
+
+### 28.4. `#[cold]` — mark the function cold (overrides PGO)
+
+The codegen emits `__attribute__((cold))` on the function signature.
+gcc's cold attribute:
+
+1. Lays out the function away from hot code (improving I-cache
+   locality of the hot path).
+2. Applies cold-path optimisations (smaller code, more sharing
+   between cold paths — gcc merges cold paths aggressively).
+
+When `--pgo-use` is active, `#[cold]` OVERRIDES the PGO profile's
+hot/cold classification.
+
+```hls
+#[cold]
+fn cold_path(x: int) -> int {
+    if x < 0 {
+        return 0
+    }
+    return x
+}
+```
+
+Emitted C:
+
+```c
+__attribute__((cold)) int64_t usf_cold_path(int64_t u_x_p) { ... }
+```
+
+`#[cold]` is mutually exclusive with `#[hot]`.
+
+### 28.5. `--opt-stats` — per-function optimisation-decision report
+
+The new `--opt-stats` CLI flag prints a per-function optimisation-
+decision report to stdout after codegen (after the C source is
+written to the output file). The report covers:
+
+1. A tally of each annotation kind present in the program
+   (`#[inline(always)]`, `#[inline(never)]`, `#[hot]`, `#[cold]`,
+   `#[irq_handler]`, `#[no_red_zone]`, `#[stack_size(N)]`).
+2. The PGO-derived decisions when no annotation overrides (PGO-derived
+   hot, cold, static-inline).
+3. The LTO inline stats (sites + distinct callees + bodies dropped)
+   when `--lto` is active.
+4. A per-function table:
+
+```
+=== opt-stats ===
+  functions in program          : 5
+  #[inline(always)] annotations: 1
+  #[inline(never)]  annotations: 1
+  #[hot]             annotations: 1
+  #[cold]            annotations: 1
+  PGO profile: (none loaded; --pgo-use <file> to enable)
+  LTO: (disabled; --lto to enable)
+
+  per-function decisions:
+    name                          inline      hot/cold    frame                source
+    ----                          ------      ---------   -----                ------
+    small_hot_helper                ALWAYS       -            -                     annotated
+    rare_path                       NEVER        COLD         -                     annotated
+    hot_loop                        auto         HOT          -                     annotated
+    cold_path                       auto         -            -                     annotated
+    main                            auto         -            -                     heuristic
+```
+
+Columns:
+- **inline**: `ALWAYS` (#[inline(always)]), `NEVER`
+  (#[inline(never)]), `PGO-inline` (PGO-derived static-inline hint
+  for hot small functions), or `auto` (heuristic — gcc decides).
+- **hot/cold**: `HOT` (#[hot]), `COLD` (#[cold]), `PGO-hot`
+  (PGO-derived hot), `PGO-cold` (PGO-derived cold), or `-` (none).
+- **frame**: the Stage 28 frame attributes (`irq`, `no-red-zone`,
+  `stack<=N`) or `-` (none).
+- **source**: `annotated` (any Stage 28/29 attribute is set),
+  `PGO` (PGO-derived without user annotation), or `heuristic`
+  (no annotation, no PGO).
+
+### 28.6. `hllint` L011 — inline-always-large
+
+The new `hllint` rule `L011 inline-always-large` warns when
+`#[inline(always)]` is on a function whose body exceeds 50
+statements:
+
+```
+$ hllint big_inline.hls
+big_inline.hls:2: warning [L011] function 'big_inline' has #[inline(always)] but 54 statements (>50 — likely a mistake; consider removing the annotation or using #[hot])
+```
+
+The threshold (50 statements) mirrors gcc's `-Winline` warning. The
+user's intent is almost certainly to use `#[hot]` (let the optimiser
+decide based on the profile) or remove the annotation entirely.
+
+### 28.7. Acceptance
+
+The Stage 29 acceptance criterion: the optimiser's inline decisions
+match the annotations 100% (verified via `--opt-stats`).
+
+The acceptance gate (`make inline-acceptance`) verifies:
+
+1. The HLS file parses with all four attributes (`#[inline(always)]`,
+   `#[inline(never)]`, `#[hot]`, `#[cold]`).
+2. The C source contains the right `__attribute__` on each function
+   (always_inline on small_hot_helper, noinline on big_rare_path,
+   hot on hot_loop, cold on cold_path).
+3. `--opt-stats` prints the per-function table with the right
+   decisions (ALWAYS / NEVER / HOT / COLD).
+4. `--lto` honours the annotations:
+   - `#[inline(always)]` => the function is inlined at every call
+     site (0 out-of-line calls in the C source).
+   - `#[inline(never)]` => the function is NOT inlined (1+ out-of-
+     line calls in the C source).
+5. `hllint L011` warns on `#[inline(always)]` > 50 statements.
+
+See `examples/inline_attrs_demo.hls` for the full example.

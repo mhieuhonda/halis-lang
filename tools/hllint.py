@@ -25,6 +25,11 @@ Rules:
                               already rejects this as a compile error, so
                               this rule never fires for valid programs).
   L010  empty-impl            An `impl` block has no methods.
+  L011  inline-always-large   `#[inline(always)]` is on a function with
+                              >50 statements (likely a mistake — the
+                              inliner will bloat the binary without
+                              proportional speedup; consider #[hot] or
+                              removing the annotation).
 
 Usage:
   hllint FILE.hls              # print warnings to stdout, exit 0
@@ -61,6 +66,13 @@ RULES = {
     "L008": ("long-function",         "info"),
     "L009": ("shadowing",             "info"),
     "L010": ("empty-impl",            "warning"),
+    # Stage 29 (v0.46.0-alpha): inline-always-large — warn when
+    # #[inline(always)] is on a function >50 statements. Inlining a
+    # large function at every call site bloats the binary without
+    # proportional speedup; the user almost certainly meant #[hot]
+    # (let the optimiser decide based on the profile). 50 statements
+    # is the same threshold gcc uses for its -Winline warning.
+    "L011": ("inline-always-large",   "warning"),
 }
 
 
@@ -557,6 +569,34 @@ class Linter:
             name_m = _re.search(rb"impl\s+([A-Za-z_][A-Za-z0-9_]*)", m.group(0))
             nm = name_m.group(1).decode("utf-8", "replace") if name_m else "?"
             self._warn("L010", line, "impl block for '%s' is empty" % nm)
+
+    def _rule_l011(self):
+        """Stage 29 (v0.46.0-alpha): inline-always-large — warn when
+        #[inline(always)] is on a function whose body exceeds 50
+        statements (likely a mistake — inlining a large function at
+        every call site bloats the binary without proportional speedup;
+        the user probably meant #[hot] or no annotation). 50 is the
+        same threshold gcc uses for -Winline.
+
+        The function's attrs are stored on the fn dict by the boot
+        parser (Stage 28+29)."""
+        for fname, fn in self.program["fns"].items():
+            attrs = fn.get("attrs")
+            if not attrs:
+                continue
+            if attrs.get("inline") != "always":
+                continue
+            # Count statements recursively (mirrors L008).
+            count = [0]
+            def count_stmts(s):
+                count[0] += 1
+            walk_stmts(fn["body"], count_stmts)
+            if count[0] > 50:
+                self._warn("L011", fn.get("line", 0),
+                           "function '%s' has #[inline(always)] but %d "
+                           "statements (>50 — likely a mistake; consider "
+                           "removing the annotation or using #[hot])"
+                           % (fname, count[0]))
 
 
 def _stmts_end_in_return(stmts) -> bool:

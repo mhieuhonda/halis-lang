@@ -328,7 +328,13 @@ struct Ctx {
     cur_attrs_irq_handler: bool,
     cur_attrs_inline: str,
     cur_attrs_hot: bool,
-    cur_attrs_cold: bool
+    cur_attrs_cold: bool,
+    # ---- Stage 29 (v0.46.0-alpha): --opt-stats flag ----
+    # opt_stats: print a per-function optimisation-decision report to
+    # stderr after codegen (inline / hot / cold / noinline decisions,
+    # annotated vs PGO vs heuristic). Independent of --lto-stats (which
+    # is LTO-specific); --opt-stats covers the whole program.
+    opt_stats: bool
 }
 
 fn new_ctx(src: str) -> Ctx {
@@ -360,7 +366,8 @@ fn new_ctx(src: str) -> Ctx {
         simd_helpers_plain: [], simd_helpers_neon: [], simd_helper_names: [],
         cur_attrs_stack_size: -1, cur_attrs_no_red_zone: false,
         cur_attrs_irq_handler: false, cur_attrs_inline: "",
-        cur_attrs_hot: false, cur_attrs_cold: false
+        cur_attrs_hot: false, cur_attrs_cold: false,
+        opt_stats: false
     }
 }
 
@@ -9125,20 +9132,65 @@ fn pgo_fn_inline(ctx: Ctx, key: str) -> bool {
 }
 
 # ============================================================================
-# STAGE 28 (v0.45.0-alpha): function attribute prefixes
+# STAGE 28 + 29 (v0.45.0-alpha + v0.46.0-alpha): function attribute prefixes
 # ----------------------------------------------------------------------------
 # fn_attr_prefix(ctx, f) returns the C attribute prefix to attach to a
-# function signature. For Stage 28 this is ONLY the frame-layout
-# attributes (#[no_red_zone], #[irq_handler]). The PGO hot/cold
-# annotation logic (pgo_fn_attr / pgo_fn_inline) is preserved verbatim
-# from Stage 19 — Stage 28 does NOT yet override PGO with user attrs
-# (that's Stage 29's job).
+# function signature. It combines:
+#   - Stage 29 inline / hot / cold attrs (override PGO when set)
+#   - Stage 28 no_red_zone / irq_handler attrs (frame layout)
+#   - Stage 19 PGO hints (only when no explicit override)
 #
-# The caller writes:
+# The order matters: `static inline __attribute__((always_inline))`
+# MUST come before the function name; `__attribute__((hot))` / `((cold))`
+# / `((optimize("no-red-zone")))` / `((interrupt))` are independent and
+# can be appended. The caller writes:
 #     out.push(fn_attr_prefix(ctx, f, key) + sig + " {")
 #
-# For prototypes, use fn_attr_prefix the same way.
+# For prototypes, use fn_attr_prefix the same way — the C attribute
+# syntax allows the same attributes on prototypes as on definitions.
+#
+# The PGO `static inline` hint is ONLY added when:
+#   - attr_inline == "" (no explicit always/never)
+#   - pgo_fn_inline(key) is true (hot + small body)
+# When attr_inline == "always", we emit `static inline
+# __attribute__((always_inline))` (gcc requires the `inline` keyword
+# alongside the attribute for it to take effect). When attr_inline ==
+# "never", we emit `__attribute__((noinline))` (no `static inline`).
 # ============================================================================
+
+# fn_inline_attr: the inline-related prefix (may be empty).
+fn fn_inline_attr(ctx: Ctx, f: FnInfo, key: str) -> str {
+    if f.attr_inline == "always" {
+        # Stage 29 (v0.46.0-alpha): #[inline(always)] forces inlining
+        # at every call site. gcc requires both `inline` and
+        # __attribute__((always_inline)) for the hint to take effect.
+        return "static inline __attribute__((always_inline)) "
+    }
+    if f.attr_inline == "never" {
+        # Stage 29: #[inline(never)] forbids inlining at every call
+        # site (the LTO phase-B inliner also honours this — see
+        # lto_can_inline). gcc emits __attribute__((noinline)).
+        return "__attribute__((noinline)) "
+    }
+    # No explicit override — consult the PGO profile (--pgo-use) for
+    # the hot-small-function `static inline` hint.
+    if pgo_fn_inline(ctx, key) {
+        return "static inline "
+    }
+    return ""
+}
+
+# fn_hotcold_attr: the hot/cold attribute prefix (may be empty).
+fn fn_hotcold_attr(ctx: Ctx, f: FnInfo, key: str) -> str {
+    if f.attr_hot {
+        return "__attribute__((hot)) "
+    }
+    if f.attr_cold {
+        return "__attribute__((cold)) "
+    }
+    # No explicit override — consult PGO.
+    return pgo_fn_attr(ctx, key)
+}
 
 # fn_frame_attr: Stage 28 stack-frame attributes. Always emitted —
 # when the host C compiler does not support a given attribute (e.g.
@@ -9182,23 +9234,12 @@ fn fn_frame_attr(ctx: Ctx, f: FnInfo) -> str {
 }
 
 # fn_attr_prefix: the combined C attribute prefix for a function
-# signature (PGO hot/cold + static-inline hint + Stage 28 frame attrs).
-# Used by gen_fn_body, gen_proto_lines, and gen_fn_inst_lines.
-#
-# Stage 28: the prefix is PGO annotations (Stage 19, unchanged) +
-# Stage 28 frame attributes. Stage 29 (next commit) will add the
-# inline/hot/cold user-attribute overrides on top of this.
+# signature (inline + hot/cold + frame). Used by gen_fn_body,
+# gen_proto_lines, and gen_fn_inst_lines.
 fn fn_attr_prefix(ctx: Ctx, f: FnInfo, key: str) -> str {
-    let mut p: str = ""
-    # Stage 19 (v0.35.0-alpha): PGO hot/cold annotation + static
-    # inline hint (unchanged from Stage 19 / 20).
-    if pgo_fn_inline(ctx, key) {
-        p = p + "static inline "
-    }
-    p = p + pgo_fn_attr(ctx, key)
-    # Stage 28: frame layout attributes.
-    p = p + fn_frame_attr(ctx, f)
-    return p
+    return fn_inline_attr(ctx, f, key)
+        + fn_hotcold_attr(ctx, f, key)
+        + fn_frame_attr(ctx, f)
 }
 
 # ============================================================================
@@ -10243,6 +10284,14 @@ fn lto_can_inline(ctx: Ctx, key: str) -> bool {
     if f.ret == "never" {
         return false
     }
+    # Stage 29 (v0.46.0-alpha): #[inline(never)] forbids inlining at
+    # every call site — return false immediately (the user's explicit
+    # annotation overrides every other consideration). The C signature
+    # carries __attribute__((noinline)) as a SECOND layer of defence
+    # (gcc will refuse to inline even if the LTO inliner missed it).
+    if f.attr_inline == "never" {
+        return false
+    }
     # Contracted functions keep their standalone bodies (the requires /
     # ensures checks and -O fast elisions interplay with the fn boundary;
     # inlining them is deferred).
@@ -10269,6 +10318,18 @@ fn lto_can_inline(ctx: Ctx, key: str) -> bool {
     # from the CALLER. Callees containing ? are never inlined.
     if lto_body_has_qmark(ctx, f.body) {
         return false
+    }
+    # Stage 29 (v0.46.0-alpha): #[inline(always)] BYPASSES the
+    # per-callee statement budget AND the per-program inline-site cap
+    # (LTO_INLINE_MAX_SITES). The user's explicit annotation
+    # overrides the heuristic. The recursion check stays (inlining
+    # a recursive function would loop forever) and so does the
+    # never-return check.
+    if f.attr_inline == "always" {
+        if lto_is_recursive(ctx, key) {
+            return false
+        }
+        return true
     }
     if lto_count_stmts(ctx, f.body) > lto_inline_stmts_budget(ctx) {
         return false
@@ -13436,6 +13497,12 @@ fn main() -> int uses IO {
     let mut lto_stats: bool = false
     let mut lto_threshold: int = 0
     let mut target_feature: str = ""
+    # Stage 29 (v0.46.0-alpha): --opt-stats — print a per-function
+    # optimisation-decision report to stderr after codegen. Independent
+    # of --lto-stats (which is LTO-specific); --opt-stats covers the
+    # whole program (every function's inline/hot/cold decision,
+    # annotated vs PGO vs heuristic).
+    let mut opt_stats: bool = false
     let a: list[str] = []
     let mut ai: int = 1
     while ai < argv.len() {
@@ -13457,6 +13524,14 @@ fn main() -> int uses IO {
             # stderr after codegen. Implies --lto.
             lto_mode = true
             lto_stats = true
+        } else if tok == "--opt-stats" {
+            # Stage 29 (v0.46.0-alpha): print a per-function
+            # optimisation-decision report to stderr after codegen.
+            # Covers inline / hot / cold / noinline / irq_handler /
+            # no_red_zone / stack_size for every function in the
+            # program (annotated vs PGO-derived vs heuristic).
+            # Independent of --lto-stats (does NOT imply --lto).
+            opt_stats = true
         } else if tok == "--lto-threshold" {
             # Stage 20 perfection (v0.39.0-alpha): override the
             # per-callee statement budget (default 30). Implies --lto.
@@ -13569,6 +13644,7 @@ fn main() -> int uses IO {
     ctx.lto_mode = lto_mode
     ctx.lto_threshold = lto_threshold
     ctx.lto_stats = lto_stats
+    ctx.opt_stats = opt_stats
     ctx.target_feature = target_feature
     # Stage 19: load the --pgo-use profile BEFORE codegen (the branch /
     # fn-attribute hints consult it during generation).
@@ -13615,6 +13691,13 @@ fn main() -> int uses IO {
     if ctx.lto_stats {
         print_lto_stats(ctx)
     }
+    # Stage 29 (v0.46.0-alpha): --opt-stats — print a per-function
+    # optimisation-decision report to stderr. Only emitted under
+    # --opt-stats. Independent of --lto-stats (covers the whole
+    # program even without LTO).
+    if ctx.opt_stats {
+        print_opt_stats(ctx)
+    }
     return 0
 }
 
@@ -13659,6 +13742,162 @@ fn print_lto_stats(ctx: Ctx) -> void uses IO {
     }
 }
 
+# Stage 29 (v0.46.0-alpha): print the per-function optimisation-
+# decision report. For every function in the program, list:
+#   - the user's explicit annotations (#[inline(always)], #[hot], etc.)
+#   - the PGO-derived decision (when --pgo-use is active and no
+#     explicit annotation overrides it)
+#   - the final emitted C attribute(s) (what gen_fn_body wrote on
+#     the signature line)
+#   - for LTO, whether the function was inlined at any call site
+#
+# Acceptance gate: a test program with `#[inline(always)]` on `foo`
+# shows "ALWAYS" for foo; `#[inline(never)]` on `bar` shows "NEVER";
+# an un-annotated function shows "auto" (heuristic / PGO).
+#
+# Stats are printed to STDOUT after the C code is written to the
+# output file (same convention as print_lto_stats).
+fn print_opt_stats(ctx: Ctx) -> void uses IO {
+    let total: int = ctx.fn_order.len()
+    let mut inline_always: int = 0
+    let mut inline_never: int = 0
+    let mut hot_n: int = 0
+    let mut cold_n: int = 0
+    let mut irq_n: int = 0
+    let mut no_red_zone_n: int = 0
+    let mut stack_size_n: int = 0
+    let mut pgo_hot_n: int = 0
+    let mut pgo_cold_n: int = 0
+    let mut pgo_inline_n: int = 0
+    # Tally counters (HLS doesn't have closures, so we walk twice —
+    # once for the summary, once for the per-function table).
+    let mut i: int = 0
+    while i < ctx.fn_order.len() {
+        let key: str = ctx.fn_order.get(i)
+        let f: FnInfo = ctx.fns.get_or(key, dummy_fn())
+        if f.attr_inline == "always" {
+            inline_always = inline_always + 1
+        }
+        if f.attr_inline == "never" {
+            inline_never = inline_never + 1
+        }
+        if f.attr_hot {
+            hot_n = hot_n + 1
+        }
+        if f.attr_cold {
+            cold_n = cold_n + 1
+        }
+        if f.attr_irq_handler {
+            irq_n = irq_n + 1
+        }
+        if f.attr_no_red_zone {
+            no_red_zone_n = no_red_zone_n + 1
+        }
+        if f.attr_stack_size >= 0 {
+            stack_size_n = stack_size_n + 1
+        }
+        if f.attr_inline == "" && pgo_fn_is_hot(ctx, key) {
+            pgo_hot_n = pgo_hot_n + 1
+        }
+        if f.attr_inline == "" && pgo_fn_is_cold(ctx, key) {
+            pgo_cold_n = pgo_cold_n + 1
+        }
+        if f.attr_inline == "" && pgo_fn_inline(ctx, key) {
+            pgo_inline_n = pgo_inline_n + 1
+        }
+        i = i + 1
+    }
+    println("=== opt-stats ===")
+    println("  functions in program          : " + total.to_str())
+    println("  #[inline(always)] annotations: " + inline_always.to_str())
+    println("  #[inline(never)]  annotations: " + inline_never.to_str())
+    println("  #[hot]             annotations: " + hot_n.to_str())
+    println("  #[cold]            annotations: " + cold_n.to_str())
+    println("  #[irq_handler]     annotations: " + irq_n.to_str())
+    println("  #[no_red_zone]     annotations: " + no_red_zone_n.to_str())
+    println("  #[stack_size(N)]   annotations: " + stack_size_n.to_str())
+    if pgo_has_profile(ctx) {
+        println("  PGO-derived hot (no annotation): " + pgo_hot_n.to_str())
+        println("  PGO-derived cold (no annotation): " + pgo_cold_n.to_str())
+        println("  PGO-derived static-inline (no annotation): " + pgo_inline_n.to_str())
+    } else {
+        println("  PGO profile: (none loaded; --pgo-use <file> to enable)")
+    }
+    if ctx.lto_mode {
+        let inlined_n: int = ctx.lto_inlined_report.len()
+        let sites: int = ctx.lto_inline_n
+        let dropped: int = ctx.lto_dropped
+        println("  LTO inline expansions (sites) : " + sites.to_str())
+        println("  LTO distinct callees inlined : " + inlined_n.to_str())
+        println("  LTO bodies dropped (A+B)      : " + dropped.to_str())
+    } else {
+        println("  LTO: (disabled; --lto to enable)")
+    }
+    println("")
+    println("  per-function decisions:")
+    println("    name                          inline      hot/cold    frame                source")
+    println("    ----                          ------      ---------   -----                ------")
+    let mut j: int = 0
+    while j < ctx.fn_order.len() {
+        let key: str = ctx.fn_order.get(j)
+        let f: FnInfo = ctx.fns.get_or(key, dummy_fn())
+        # inline column
+        let mut inline_col: str = ""
+        if f.attr_inline == "always" {
+            inline_col = "ALWAYS"
+        } else if f.attr_inline == "never" {
+            inline_col = "NEVER"
+        } else if pgo_fn_inline(ctx, key) {
+            inline_col = "PGO-inline"
+        } else {
+            inline_col = "auto"
+        }
+        # hot/cold column
+        let mut hotcold_col: str = ""
+        if f.attr_hot {
+            hotcold_col = "HOT"
+        } else if f.attr_cold {
+            hotcold_col = "COLD"
+        } else if pgo_fn_is_hot(ctx, key) {
+            hotcold_col = "PGO-hot"
+        } else if pgo_fn_is_cold(ctx, key) {
+            hotcold_col = "PGO-cold"
+        } else {
+            hotcold_col = "-"
+        }
+        # frame column (irq_handler / no_red_zone / stack_size)
+        let mut frame_col: str = ""
+        if f.attr_irq_handler {
+            frame_col = frame_col + "irq "
+        }
+        if f.attr_no_red_zone {
+            frame_col = frame_col + "no-red-zone "
+        }
+        if f.attr_stack_size >= 0 {
+            frame_col = frame_col + "stack<=" + f.attr_stack_size.to_str()
+        }
+        if frame_col == "" {
+            frame_col = "-"
+        }
+        # source column (annotation vs PGO vs heuristic)
+        let mut source_col: str = ""
+        if f.attr_inline != "" || f.attr_hot || f.attr_cold
+            || f.attr_irq_handler || f.attr_no_red_zone || f.attr_stack_size >= 0 {
+            source_col = "annotated"
+        } else if pgo_fn_is_hot(ctx, key) || pgo_fn_is_cold(ctx, key) || pgo_fn_inline(ctx, key) {
+            source_col = "PGO"
+        } else {
+            source_col = "heuristic"
+        }
+        let padded_name: str = pad_right(key, 30)
+        let padded_inline: str = pad_right(inline_col, 11)
+        let padded_hotcold: str = pad_right(hotcold_col, 11)
+        let padded_frame: str = pad_right(frame_col, 20)
+        println("    " + padded_name + "  " + padded_inline + "  "
+            + padded_hotcold + "  " + padded_frame + "  " + source_col)
+        j = j + 1
+    }
+}
 
 # Stage 9-beta: print the capability / effect tree of every function.
 # Mirrors boot.py's --audit output. Reads ctx.computed_effects (populated

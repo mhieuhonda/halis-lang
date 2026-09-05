@@ -1437,6 +1437,148 @@ else
     bad "stack: bootstrap not deterministic with Stage 28 changes"
 fi
 
+echo "=== 15. Stage 29: inline / hot / cold attributes + --opt-stats ==="
+# Stage 29 (v0.46.0-alpha): #[inline(always)], #[inline(never)], #[hot],
+# #[cold] attributes parse and emit the right C __attribute__. --opt-stats
+# prints the per-function decision table. LTO honours inline(always) and
+# inline(never). hllint warns (L011) on inline(always) > 50 statements.
+
+# (a) the example file parses with all four attributes (via boot).
+if python3 boot/boot.py examples/inline_attrs_demo.hls >/dev/null 2>&1; then
+    ok "inline: examples/inline_attrs_demo.hls parses via boot"
+else
+    bad "inline: examples/inline_attrs_demo.hls failed to parse via boot"
+fi
+
+# (b) hlc compiles it to a C source that contains the right C attributes.
+if [ ! -x "$TMP/hlc1" ]; then
+    python3 boot/boot.py src/hlc.hls src/hlc.hls "$TMP/hlc_nat.c" >/dev/null 2>&1
+    gcc -O2 -o "$TMP/hlc1" "$TMP/hlc_nat.c" -lm -pthread 2>/dev/null
+fi
+if "$TMP/hlc1" examples/inline_attrs_demo.hls "$TMP/inline_attrs.c" >/dev/null 2>&1; then
+    if grep -q "static inline __attribute__((always_inline)) int64_t usf_small_hot_helper" "$TMP/inline_attrs.c" \
+        && grep -q "__attribute__((noinline)) int64_t usf_big_rare_path" "$TMP/inline_attrs.c" \
+        && grep -q "__attribute__((hot)) int64_t usf_hot_loop" "$TMP/inline_attrs.c" \
+        && grep -q "__attribute__((cold)) int64_t usf_cold_path" "$TMP/inline_attrs.c"; then
+        ok "inline: C source has all four C attributes (always_inline / noinline / hot / cold)"
+    else
+        bad "inline: C source missing one or more C attributes"
+        grep -E "always_inline|noinline|hot|cold" "$TMP/inline_attrs.c" | head -8
+    fi
+    # (c) the C source compiles cleanly with -Wno-attributes.
+    if gcc -O2 -Wno-attributes -o "$TMP/inline_attrs_bin" "$TMP/inline_attrs.c" -lm -pthread 2>"$TMP/inline_gcc.log"; then
+        ok "inline: C source compiles cleanly (-Wno-attributes)"
+        # And runs without crashing.
+        if "$TMP/inline_attrs_bin" >/dev/null 2>&1; then
+            ok "inline: compiled binary runs cleanly"
+        else
+            bad "inline: compiled binary crashed at runtime"
+        fi
+    else
+        bad "inline: C source fails to compile"
+        cat "$TMP/inline_gcc.log" | head -5
+    fi
+else
+    bad "inline: hlc compile failed"
+fi
+
+# (d) --opt-stats prints the per-function decision table.
+if "$TMP/hlc1" --opt-stats examples/inline_attrs_demo.hls "$TMP/inline_optstats.c" \
+    >"$TMP/inline_optstats.log" 2>&1; then
+    if grep -q "ALWAYS" "$TMP/inline_optstats.log" \
+        && grep -q "NEVER" "$TMP/inline_optstats.log" \
+        && grep -q "HOT" "$TMP/inline_optstats.log" \
+        && grep -q "COLD" "$TMP/inline_optstats.log"; then
+        ok "inline: --opt-stats prints inline/hot/cold decisions"
+    else
+        bad "inline: --opt-stats missing one or more decisions"
+        cat "$TMP/inline_optstats.log" | head -20
+    fi
+else
+    bad "inline: --opt-stats invocation failed"
+fi
+
+# (e) --lto honours #[inline(always)] (small_hot_helper inlined) and
+#     #[inline(never)] (big_rare_path NOT inlined).
+if "$TMP/hlc1" --lto --lto-stats examples/inline_attrs_demo.hls "$TMP/inline_lto.c" \
+    >"$TMP/inline_lto.log" 2>&1; then
+    if grep -q "small_hot_helper" "$TMP/inline_lto.log" \
+        && ! grep -q "usf_small_hot_helper(" "$TMP/inline_lto.c"; then
+        ok "inline: --lto inlines small_hot_helper (#[inline(always)])"
+    else
+        bad "inline: --lto did not inline small_hot_helper properly"
+    fi
+    if grep -q "usf_big_rare_path(" "$TMP/inline_lto.c"; then
+        ok "inline: --lto keeps big_rare_path out-of-line (#[inline(never)])"
+    else
+        bad "inline: --lto did NOT keep big_rare_path out-of-line"
+    fi
+else
+    bad "inline: --lto invocation failed"
+fi
+
+# (f) hllint warns (L011) on #[inline(always)] > 50 statements.
+printf '#[inline(always)]
+fn big_inline(n: int) -> int {
+  let mut s: int = 0
+  let mut i: int = 0
+' > "$TMP/l011_test.hls"
+for n in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51; do
+    printf '  s = s + i
+  i = i + 1
+' >> "$TMP/l011_test.hls"
+done
+printf '  return s
+}
+
+fn main() -> int {
+  return big_inline(10)
+}
+' >> "$TMP/l011_test.hls"
+if python3 tools/hllint.py --rule L011 "$TMP/l011_test.hls" 2>&1 | grep -q "L011"; then
+    ok "inline: hllint L011 warns on #[inline(always)] > 50 statements"
+else
+    bad "inline: hllint L011 did NOT warn on large #[inline(always)]"
+fi
+
+# (g) hllint does NOT warn on #[inline(always)] <= 50 statements.
+printf '#[inline(always)]
+fn small_inline(x: int) -> int {
+  return x + 1
+}
+
+fn main() -> int {
+  return small_inline(10)
+}
+' > "$TMP/l011_small.hls"
+if ! python3 tools/hllint.py --rule L011 "$TMP/l011_small.hls" 2>&1 | grep -q "L011"; then
+    ok "inline: hllint L011 does NOT warn on small #[inline(always)]"
+else
+    bad "inline: hllint L011 FALSE POSITIVE on small #[inline(always)]"
+fi
+
+# (h) make inline-acceptance runs end-to-end.
+if make inline-acceptance >"$TMP/inline_acc.log" 2>&1; then
+    if grep -q "ACCEPTANCE OK" "$TMP/inline_acc.log"; then
+        ok "inline: make inline-acceptance runs end-to-end"
+    else
+        bad "inline: make inline-acceptance did not print ACCEPTANCE OK"
+        tail -5 "$TMP/inline_acc.log"
+    fi
+else
+    bad "inline: make inline-acceptance failed"
+    tail -10 "$TMP/inline_acc.log"
+fi
+
+# (i) bootstrap still works after the src/hlc.hls Stage 29 changes
+#     (the self-hosted compiler must remain deterministic).
+if python3 boot/boot.py src/hlc.hls src/hlc.hls "$TMP/hlc_s29.c" >/dev/null 2>&1 \
+    && diff -q "$TMP/hlc_s29.c" "$TMP/hlc_nat.c" >/dev/null; then
+    ok "inline: bootstrap deterministic with Stage 29 changes"
+else
+    bad "inline: bootstrap not deterministic with Stage 29 changes"
+fi
+
 echo ""
 echo "=========================================="
 echo "RESULT: $PASS PASS / $FAIL FAIL"

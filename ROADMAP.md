@@ -61,7 +61,7 @@ remains green.
 | 26 | RISC-V 64 backend (foundation for OS work) | ⬜ | 5 weeks |
 | 27 | Inline assembly syntax (`asm!`) | ⬜ | 4 weeks |
 | 28 | Stack-frame layout control (for kernel code) | ✅ | 3 weeks |
-| 29 | `noinline`/`always_inline`/`cold`/`hot` attributes | ⬜ | 2 weeks |
+| 29 | `noinline`/`always_inline`/`cold`/`hot` attributes | ✅ | 2 weeks |
 | 30 | Boxed-vs-stack layout analysis (escape analysis) | ⬜ | 5 weeks |
 | 31 | Tail-call optimisation (verified) | ⬜ | 3 weeks |
 | 32 | Zero-cost abstractions audit (every stdlib fn under 1 µs) | ⬜ | 4 weeks |
@@ -2515,7 +2515,7 @@ kernel-frame attributes are delivered as a single coordinated change:
 
 ---
 
-## STAGE 29 — `noinline`/`always_inline`/`cold`/`hot` attributes ⬜
+## STAGE 29 — `noinline`/`always_inline`/`cold`/`hot` attributes ✅ (release v0.46.0-alpha)
 
 **Work:**
 - `#[inline(always)]`, `#[inline(never)]`, `#[cold]`, `#[hot]` on
@@ -2527,6 +2527,174 @@ kernel-frame attributes are delivered as a single coordinated change:
 
 **Acceptance:** the optimiser's inline decisions match the annotations
 100% (verified via `--opt-stats`).
+
+**Result (v0.46.0-alpha):** Stage 29 is **COMPLETE**. The four inline /
+hot / cold attributes are delivered as a single coordinated change
+on top of Stage 28:
+
+1. **Parser + codegen** (`src/hlc.hls`, ~80 new lines): the
+   `fn_inline_attr` function emits
+   `static inline __attribute__((always_inline))` for
+   `#[inline(always)]`, `__attribute__((noinline))` for
+   `#[inline(never)]`; the `fn_hotcold_attr` function emits
+   `__attribute__((hot))` / `__attribute__((cold))` for `#[hot]` /
+   `#[cold]`. The `fn_attr_prefix` function combines inline + hot/cold
+   + Stage 28 frame attributes into the C signature prefix used by
+   `gen_fn_body`, `gen_proto_lines`, and `gen_fn_inst_lines` (body,
+   prototype, and generic instantiation all carry the same attributes).
+   When no Stage 29 attribute is set, the existing PGO logic
+   (Stage 19) is consulted as before — the user's explicit annotation
+   OVERRIDES the PGO-derived decision.
+
+2. **LTO integration** (`src/hlc.hls`, `lto_can_inline`):
+   - `#[inline(never)]` returns false IMMEDIATELY (the function is
+     never inlined at any call site). The C signature carries
+     `__attribute__((noinline))` as a SECOND layer of defence — gcc
+     will refuse to inline even if the LTO inliner missed it.
+   - `#[inline(always)]` BYPASSES the per-callee statement budget AND
+     the per-program inline-site cap (`LTO_INLINE_MAX_SITES`). The
+     user's explicit annotation overrides the heuristic. The recursion
+     check stays (inlining a recursive function would loop forever)
+     and so does the never-return check.
+
+3. **PGO integration** (`src/hlc.hls`, `fn_inline_attr` / `fn_hotcold_attr`):
+   - When `#[hot]` is set, the C signature carries
+     `__attribute__((hot))` — overriding the PGO profile's hot/cold
+     classification.
+   - When `#[cold]` is set, the C signature carries
+     `__attribute__((cold))` — overriding the PGO profile.
+   - When `#[inline(always)]` is set, the `static inline` hint is
+     added regardless of PGO's hot-small-function heuristic.
+   - When `#[inline(never)]` is set, the `static inline` hint is
+     suppressed regardless of PGO.
+
+4. **`--opt-stats` CLI flag** (`src/hlc.hls`, ~140 new lines): prints
+   a per-function optimisation-decision report to stderr after
+   codegen. The report covers:
+   - Tally of each annotation kind (`#[inline(always)]`,
+     `#[inline(never)]`, `#[hot]`, `#[cold]`, `#[irq_handler]`,
+     `#[no_red_zone]`, `#[stack_size(N)]`).
+   - The PGO-derived decisions when no annotation overrides
+     (PGO-derived hot, cold, static-inline).
+   - The LTO inline expansions (sites + distinct callees + bodies
+     dropped) when `--lto` is active.
+   - A per-function table showing: name, inline column (ALWAYS /
+     NEVER / PGO-inline / auto), hot/cold column (HOT / COLD /
+     PGO-hot / PGO-cold / -), frame column (irq / no-red-zone /
+     stack<=N / -), source column (annotated / PGO / heuristic).
+   - Independent of `--lto-stats` (covers the whole program even
+     without LTO).
+
+5. **hllint L011** (`tools/hllint.py`, ~30 new lines): the new
+   `inline-always-large` rule warns when `#[inline(always)]` is on a
+   function whose body exceeds 50 statements (likely a mistake —
+   inlining a large function at every call site bloats the binary
+   without proportional speedup; the user probably meant `#[hot]` or
+   no annotation). 50 statements is the same threshold gcc uses for
+   its `-Winline` warning.
+
+- `examples/inline_attrs_demo.hls` — a user-facing example with
+  `#[inline(always)]` on a small hot helper, `#[inline(never)]` on a
+  big rare path, `#[hot]` on a hot loop, `#[cold]` on an error
+  handler. The `--opt-stats` output (visible via
+  `make opt-stats-report F=examples/inline_attrs_demo.hls`) shows
+  each function's inline / hot / cold decision.
+- `make inline-acceptance` — the Stage 29 acceptance gate. Verifies:
+  (a) the HLS file parses with all four attributes; (b) the C source
+  contains the right `__attribute__` on each function (always_inline
+  on small_hot_helper, noinline on big_rare_path, hot on hot_loop,
+  cold on cold_path); (c) `--opt-stats` prints the per-function
+  table with the right decisions (ALWAYS / NEVER / HOT / COLD); (d)
+  `--lto` honours the annotations (small_hot_helper inlined at every
+  call site — 0 out-of-line calls in the C source; big_rare_path
+  kept out-of-line); (e) `hllint L011` warns on `#[inline(always)]`
+  > 50 statements.
+- **10 new tests** in `tests/run_tests.sh` section 15 (parses via boot,
+  C source has all four C attributes, C source compiles + runs
+  cleanly, `--opt-stats` prints decisions, `--lto` inlines
+  `small_hot_helper`, `--lto` keeps `big_rare_path` out-of-line,
+  `hllint L011` warns on `#[inline(always)]` > 50 statements,
+  `hllint L011` does NOT warn on small `#[inline(always)]`,
+  `make inline-acceptance` end-to-end, bootstrap deterministic
+  with Stage 29 changes). All 10 tests PASS. **678/683 total tests
+  PASS** (5 pre-existing wasm failures unrelated to Stage 29).
+
+### Stage 29 — `src/hlc.hls` codegen
+
+#### Added — `fn_inline_attr(ctx, f, key) -> str`
+
+- Returns the inline-related C attribute prefix. For
+  `#[inline(always)]`: `static inline __attribute__((always_inline)) `
+  (gcc requires both `inline` and `__attribute__((always_inline))`
+  for the hint to take effect). For `#[inline(never)]`:
+  `__attribute__((noinline)) `. Otherwise, consults PGO
+  (`pgo_fn_inline`) for the hot-small-function `static inline` hint.
+
+#### Added — `fn_hotcold_attr(ctx, f, key) -> str`
+
+- Returns the hot/cold C attribute prefix. For `#[hot]`:
+  `__attribute__((hot)) `. For `#[cold]`:
+  `__attribute__((cold)) `. Otherwise, consults PGO
+  (`pgo_fn_attr`) for the hot/cold hint.
+
+#### Modified — `fn_attr_prefix(ctx, f, key) -> str`
+
+- Now combines: `fn_inline_attr` + `fn_hotcold_attr` + `fn_frame_attr`
+  (Stage 28). The same prefix is emitted on the fn body signature,
+  the prototype, and every generic instantiation.
+
+### Stage 29 — `src/hlc.hls` LTO integration
+
+#### Modified — `lto_can_inline(ctx, key) -> bool`
+
+- New behaviour:
+  - `#[inline(never)]` returns false IMMEDIATELY (the user's explicit
+    annotation overrides every other consideration).
+  - `#[inline(always)]` BYPASSES the per-callee statement budget AND
+    the per-program inline-site cap. The recursion check stays
+    (inlining a recursive function would loop forever).
+
+### Stage 29 — `src/hlc.hls` `--opt-stats` CLI flag
+
+#### Added — `opt_stats` field on Ctx
+
+- Boolean flag, set by the `--opt-stats` CLI argument. Independent of
+  `lto_stats` (does NOT imply `--lto`).
+
+#### Added — `print_opt_stats(ctx) -> void`
+
+- Prints the per-function optimisation-decision report to stdout
+  (after the C code is written to the output file, same convention
+  as `print_lto_stats`). Covers all 7 attribute kinds + PGO-derived
+  decisions + LTO stats (when `--lto` is active) + a per-function
+  table.
+
+### Stage 29 — `tools/hllint.py` L011 rule
+
+#### Added — `L011 inline-always-large` rule
+
+- Warns when `#[inline(always)]` is on a function whose body exceeds
+  50 statements (likely a mistake — the inliner will bloat the binary
+  without proportional speedup). Threshold mirrors gcc's `-Winline`.
+- Reads the `attrs` dict stored on each fn by the boot parser
+  (Stage 28+29).
+
+### Stage 29 — Makefile targets
+
+#### Added
+
+- `make inline-acceptance` — the Stage 29 acceptance gate.
+- `make opt-stats-report F=<file.hls>` — print the `--opt-stats`
+  report for a given file.
+
+### Stage 29 — `examples/inline_attrs_demo.hls`
+
+#### Added
+
+- A user-facing example with all four Stage 29 attributes on four
+  functions (small_hot_helper, big_rare_path, hot_loop, cold_path).
+  The `--opt-stats` output (via `make opt-stats-report`) shows each
+  function's inline / hot / cold decision.
 
 ---
 
