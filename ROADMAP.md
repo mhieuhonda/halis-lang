@@ -52,7 +52,7 @@ remains green.
 | # | Stage | Status | Estimated effort |
 |---|-------|:------:|:----------------:|
 | 19 | Profile-guided optimisation (PGO) | ✅ | 3–4 weeks |
-| 20 | Link-time optimisation (LTO) across crates | ⬜ | 3 weeks |
+| 20 | Link-time optimisation (LTO) across crates | ✅ | 3 weeks |
 | 21 | SIMD vectorisation (target-feature detection) | ⬜ | 5 weeks |
 | 22 | Cross-compilation targets (Linux/macOS/Windows/FreeBSD) | ⬜ | 4 weeks |
 | 23 | WebAssembly backend (`target wasm32`) | ⬜ | 6 weeks |
@@ -1640,7 +1640,7 @@ per element) cut a full self-compilation from **3.3 s to 0.48 s**.
 
 ---
 
-## STAGE 20 — Link-time optimisation (LTO) across crates ⬜
+## STAGE 20 — Link-time optimisation (LTO) across crates ✅ (release v0.36.0-alpha)
 
 **Work:**
 - Whole-program IR emission: `hlc --emit-lto-ir` produces a single
@@ -1654,6 +1654,27 @@ per element) cut a full self-compilation from **3.3 s to 0.48 s**.
 **Acceptance:** the stdlib's `list_sort_int_asc` inlined into a
 caller produces the same output as the non-LTO build; binary size of
 a "hello world" CLI drops by ≥15%.
+
+**Result (v0.36.0-alpha):** `hlc --lto` (C backend, implemented in
+HLS inside `src/hlc.hls`) performs statement-position cross-crate
+inlining (small single-return functions from imported modules are
+spliced into `let` / `return` / expression-statement call sites with
+per-site unique temps, own-wrapped arguments and saved/restored
+local bindings — ownership semantics are bit-for-bit preserved) plus
+two-phase whole-program DCE (unreachable functions are never
+generated; functions whose every call site was inlined are spliced
+back out). Generic instantiations are deduplicated by their mangled
+key. `boot.py --emit lto` / `make emit-lto-ir` emits the whole-program
+LTO'd LLVM IR (single .ll; .bc via llvm-as when available), and
+`hls-pkg build --lto` compiles packages through the LTO pipeline.
+Measured on the acceptance program: `list_sort_int_asc` is inlined
+into its caller with the standalone definition dropped; binary size
+**35 344 → 17 144 bytes (52% drop**, target ≥ 15%); output
+byte-identical across interpreter, plain native and LTO native on
+all 105 ok/ programs. The stage also fixed a latent C-backend bug
+found by the LTO work: fresh subexpressions in the RIGHT operand of
+`&&`/`||` were hoisted to statement level, breaking HLS's lazy
+short-circuit semantics (regression test added).
 
 ---
 

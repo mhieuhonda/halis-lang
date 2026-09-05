@@ -416,6 +416,77 @@ else
     bad "join builtin: native compile failed"
 fi
 
+echo "=== 8. Stage 20: LTO across crates (inlining + DCE) ==="
+# The Stage 20 acceptance, in four steps:
+#   (a) the stdlib's list_sort_int_asc is INLINED into the caller (its
+#       standalone definition is dropped: no usf_list_sort_int_asc
+#       symbol remains in the LTO C),
+#   (b) the LTO binary produces byte-identical output to the
+#       interpreter AND to the non-LTO native build,
+#   (c) binary size drops >= 15% (whole-program DCE of unused stdlib
+#       functions),
+#   (d) --emit lto produces a whole-program LTO'd LLVM IR module.
+if [ ! -x "$TMP/hlc1" ]; then
+    python3 boot/boot.py src/hlc.hls src/hlc.hls "$TMP/hlc_nat.c" >/dev/null 2>&1
+    gcc -O2 -o "$TMP/hlc1" "$TMP/hlc_nat.c" -lm -pthread 2>/dev/null
+fi
+LTO_F=tests/ok/feat_stage20_lto.hls
+lto_interp=$(python3 boot/boot.py "$LTO_F" </dev/null 2>/dev/null)
+if "$TMP/hlc1" --lto "$LTO_F" "$TMP/l20.c" >/dev/null 2>&1 \
+        && gcc -O2 -o "$TMP/l20_bin" "$TMP/l20.c" -lm -pthread 2>/dev/null \
+        && "$TMP/hlc1" "$LTO_F" "$TMP/l20p.c" >/dev/null 2>&1 \
+        && gcc -O2 -o "$TMP/l20p_bin" "$TMP/l20p.c" -lm -pthread 2>/dev/null; then
+    lto_out=$("$TMP/l20_bin" 2>/dev/null)
+    lto_plain_out=$("$TMP/l20p_bin" 2>/dev/null)
+    if [ "$lto_out" == "$lto_interp" ] && [ "$lto_out" == "$lto_plain_out" ]; then
+        ok "lto: inlined binary output identical (interpreter = plain native = LTO native)"
+    else
+        bad "lto: output divergence"
+    fi
+    # (a) the sort standalone definition must be GONE (fully inlined).
+    if grep -q "usf_list_sort_int_asc" "$TMP/l20.c"; then
+        bad "lto: list_sort_int_asc was not inlined (standalone definition present)"
+    else
+        ok "lto: list_sort_int_asc inlined into the caller, standalone definition dropped"
+    fi
+    # (c) binary size drop >= 15%.
+    sz_lto=$(stat -c %s "$TMP/l20_bin")
+    sz_plain=$(stat -c %s "$TMP/l20p_bin")
+    if [ "$sz_plain" -gt 0 ] && [ "$sz_lto" -le $((sz_plain * 85 / 100)) ]; then
+        ok "lto: binary size $sz_plain -> $sz_lto bytes ($((100 - sz_lto * 100 / sz_plain))% drop, >= 15%)"
+    else
+        bad "lto: binary size drop below 15% ($sz_plain -> $sz_lto)"
+    fi
+else
+    bad "lto: LTO compile failed"
+fi
+# (d) --emit lto: whole-program LTO'd LLVM IR (DCE'd — fewer defines
+# than the non-LTO emission).
+python3 boot/boot.py --emit lto "$LTO_F" > "$TMP/l20.ll" 2>"$TMP/l20.rep"
+defs_lto=$(grep -c "^define" "$TMP/l20.ll" || true)
+python3 boot/boot.py --emit llvm "$LTO_F" > "$TMP/l20p.ll" 2>/dev/null
+defs_plain=$(grep -c "^define" "$TMP/l20p.ll" || true)
+if [ "$defs_lto" -gt 0 ] && [ "$defs_lto" -lt "$defs_plain" ]; then
+    ok "lto: --emit lto IR has $defs_lto defines (non-LTO: $defs_plain — DCE applied)"
+else
+    bad "lto: --emit lto produced $defs_lto defines (non-LTO: $defs_plain)"
+fi
+# The && short-circuit regression (found by the LTO work): the native
+# build must not eagerly evaluate the right operand of &&/||.
+SC_F=tests/ok/feat_shortcircuit_slice.hls
+sc_interp=$(python3 boot/boot.py "$SC_F" </dev/null 2>/dev/null); sc_rc=$?
+if "$TMP/hlc1" "$SC_F" "$TMP/sc.c" >/dev/null 2>&1 \
+        && gcc -O2 -o "$TMP/sc_bin" "$TMP/sc.c" -lm -pthread 2>/dev/null; then
+    sc_nat=$("$TMP/sc_bin" </dev/null 2>/dev/null); sc_nrc=$?
+    if [ "$sc_interp" == "$sc_nat" ] && [ "$sc_rc" == "$sc_nrc" ]; then
+        ok "&& short-circuit: fresh right-operand subexpressions stay lazy (regression)"
+    else
+        bad "&& short-circuit regression (interp=$sc_rc native=$sc_nrc)"
+    fi
+else
+    bad "&& short-circuit: native compile failed"
+fi
+
 echo ""
 echo "=========================================="
 echo "RESULT: $PASS PASS / $FAIL FAIL"

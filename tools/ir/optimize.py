@@ -39,9 +39,22 @@ INT64_MIN = -9223372036854775808
 # pure { return a + b }`) without bloating the IR unreasonably.
 INLINE_MAX_INSTRS = 12
 
+# Stage 20 (v0.36.0-alpha): the LTO (whole-program) inline threshold —
+# cross-crate inlining accepts bigger pure helpers because the
+# standalone definition is dead once every call site is inlined.
+LTO_INLINE_MAX_INSTRS = 60
 
-def optimize(mod: HLIRModule, fast: bool = False) -> HLIRModule:
-    """Run the optimisation pipeline. Returns the (mutated) module."""
+
+def optimize(mod: HLIRModule, fast: bool = False,
+              lto: bool = False) -> HLIRModule:
+    """Run the optimisation pipeline. Returns the (mutated) module.
+
+    Stage 20 (v0.36.0-alpha): `lto=True` raises the cross-crate inline
+    threshold (a "small pure helper" may be up to LTO_INLINE_MAX_INSTRS
+    instructions instead of INLINE_MAX_INSTRS) — whole-program mode
+    trades code size for call-overhead removal across module
+    boundaries, mirroring what LTO does in native toolchains.
+    """
     # Pass 1: constant folding.
     for fname, irf in mod.functions.items():
         _constant_fold(irf)
@@ -55,7 +68,16 @@ def optimize(mod: HLIRModule, fast: bool = False) -> HLIRModule:
     # inlining, re-run constant_fold + copy_propagate + DCE because
     # inlining creates new fold opportunities (e.g. `square(5)` becomes
     # `t = 5 * 5` which can fold to `t = 25`).
-    _inline_small(mod)
+    # Stage 20: under --lto the threshold is raised (cross-crate
+    # inlining of bigger pure helpers).
+    global INLINE_MAX_INSTRS
+    saved_threshold = INLINE_MAX_INSTRS
+    if lto:
+        INLINE_MAX_INSTRS = LTO_INLINE_MAX_INSTRS
+    try:
+        _inline_small(mod)
+    finally:
+        INLINE_MAX_INSTRS = saved_threshold
     for fname, irf in mod.functions.items():
         _constant_fold(irf)
     for fname, irf in mod.functions.items():

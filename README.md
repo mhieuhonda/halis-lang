@@ -168,6 +168,11 @@ make pgo-acceptance             # the Stage 19 acceptance gate (<= 80% wall time
 bin/hlc --pgo-generate prog.hls out.c   # instrument: counters -> .hlcprof
 HLS_PGO_FILE=p.hlcprof ./a.out          # run the workload (HLS_PGO_MERGE=1 to accumulate)
 bin/hlc --pgo-use p.hlcprof prog.hls out2.c  # retrain codegen with the profile
+
+# 15. Stage 20 (v0.36.0-alpha): LTO across crates
+make lto F=examples/primes.hls          # whole-program inlining + DCE, then run
+bin/hlc --lto prog.hls out.c            # cross-crate inline + dead-code eliminate
+make emit-lto-ir F=examples/hello.hls   # whole-program LTO'd LLVM IR (.ll/.bc)
 ```
 
 ## Language example
@@ -288,7 +293,7 @@ Full details: [SPEC.md](SPEC.md) · Stage-by-stage roadmap:
 
 ## Status
 
-**v0.35.0-alpha — Stage 19: profile-guided optimisation. The compiler can now train itself: `--pgo-generate` instruments every function entry / branch / loop back-edge into a `.hlcprof` profile, `--pgo-use` feeds it back as `__builtin_expect` branch hints, hot/cold attributes, `static inline` thresholds and profile-gated string-literal hoisting. The trained `hlc` compiles itself in 73.4% of the plain build's wall time (acceptance: ≤ 80%), with byte-identical output; a new O(n) `join` builtin cut the self-compilation from 3.3 s to 0.48 s. 567/567 tests PASS.** Previous release v0.34.0-alpha completed Stage 18 (hltest + quickcheck + hls-fuzz + hlcov + the 150-stage roadmap restructure); v0.33.0-alpha merged the deep-scan-and-beyond-v1 branch (PR #22) which closed all 7 open issues (#15-#21). Stage 17 was perfected in v0.30.0-alpha (proof-engine soundness overhaul + native ensures + loop-invariant engine).
+**v0.36.0-alpha — Stage 20: link-time optimisation across crates. `hlc --lto` inlines small single-return functions from imported modules at statement-level call sites (ownership bit-for-bit preserved) and drops both unreachable functions and fully-inlined standalone definitions; the acceptance binary shrinks 52% (35,344 → 17,144 bytes) with byte-identical output on all 105 ok/ programs. `--emit lto` / `make emit-lto-ir` emit the whole-program LTO'd LLVM IR; `hls-pkg build --lto` compiles packages through the pipeline. The LTO work also found and fixed a latent C-backend soundness bug (eager hoisting broke `&&`/`||` lazy short-circuiting). 578/578 tests PASS, bootstrap deterministic, differential suite byte-identical (including `--lto`).** Previous release v0.35.0-alpha delivered Stage 19 (PGO): the trained `hlc` self-compiles in 69.2–73.4% of the plain build's wall time with byte-identical output, and the O(n) `join` builtin cut a full self-compilation from 3.3 s to 0.48 s. Before that, v0.34.0-alpha completed Stage 18 (hltest + quickcheck + hls-fuzz + hlcov + the 150-stage roadmap restructure); v0.33.0-alpha merged the deep-scan-and-beyond-v1 branch (PR #22) which closed all 7 open issues (#15-#21). Stage 17 was perfected in v0.30.0-alpha (proof-engine soundness overhaul + native ensures + loop-invariant engine).
 
 - ✅ Complete core specification
 - ✅ Stage-0 reference (interpreted, with type + effects checking)
@@ -425,8 +430,16 @@ Full details: [SPEC.md](SPEC.md) · Stage-by-stage roadmap:
   PGO-trained `hlc` as the canonical CI release artifact. Acceptance:
   trained hlc self-compiles in 73.4% of plain wall time (≤ 80% target),
   byte-identical output. 567/567 tests PASS.
-- ⬜ LTO across crates (Stage 20), SIMD vectorisation (Stage 21),
-  cross-compilation targets (Stage 22), v1.0 (Stage 150)...
+- ✅ **Stage 20 release — LTO across crates** (v0.36.0-alpha):
+  `hlc --lto` (statement-position cross-crate inliner + two-phase
+  whole-program DCE, implemented in HLS), `--emit lto` / `make
+  emit-lto-ir`, `hls-pkg build --lto`, generic-instantiation dedup.
+  Acceptance: `list_sort_int_asc` inlined with the standalone
+  definition dropped; binary size −52% (target ≥ 15%); byte-identical
+  output on all ok/ programs. Fixed a latent `&&`/`||` eager-hoisting
+  short-circuit bug. 578/578 tests PASS.
+- ⬜ SIMD vectorisation (Stage 21), cross-compilation targets (Stage
+  22), WebAssembly backend (Stage 23), v1.0 (Stage 150)...
 
 ## Contributing
 

@@ -13,6 +13,112 @@ stability (125–140), and final stabilisation toward v1.0 (141–150).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
+## [v0.36.0-alpha] — Stage 20: link-time optimisation (LTO) across crates
+
+> Completes **Stage 20** of the roadmap: whole-program LTO for the
+> self-hosted compiler — `hlc --lto` (cross-crate inlining + two-phase
+> dead-code elimination, implemented in HLS inside `src/hlc.hls`),
+> `boot.py --emit lto` / `make emit-lto-ir` (whole-program LTO'd LLVM
+> IR), and `hls-pkg build --lto`. Acceptance: the stdlib's
+> `list_sort_int_asc` is inlined into its caller with the standalone
+> definition dropped, and the "hello world + stdlib imports" binary
+> shrinks **35 344 → 17 144 bytes (52% drop**, target ≥ 15%) — with
+> byte-identical output on all 105 ok/ programs (interpreter = plain
+> native = LTO native). The LTO work also surfaced and fixed a latent
+> C-backend soundness bug: eager hoisting of `&&`/`||` right-operand
+> subexpressions. 578/578 tests PASS, bootstrap deterministic, PGO
+> acceptance re-verified at 69.2% (was 73.4% — the plain build got
+> faster too).
+
+### Stage 20 — LTO across crates
+
+#### Added — `hlc --lto` (cross-crate inlining, `src/hlc.hls`)
+
+- Small single-return functions from imported modules are inlined at
+  **statement-level call positions** (`let` bindings, `return` values,
+  expression statements): each argument is bound to an own-wrapped
+  temp with the same retain/cleanup discipline a real call applies,
+  the body is generated inline with per-site unique temps, the
+  trailing `return`'s expression is bound through the same `own_wrap`
+  the return path uses, and the caller's local-binding view is
+  saved/restored around the splice — so ownership semantics are
+  bit-for-bit identical to the out-of-line call.
+- Inlinability guards: non-generic, non-method, non-extern,
+  non-recursive (transitive check over the call graph), a SINGLE
+  return that is the LAST top-level statement (any nested/early
+  return disqualifies — an inlined `return` would return from the
+  CALLER), ≤ 30 statements, no contracts, no `?` operator in the body
+  (qmark lowers to a `return` inside a C statement expression), no
+  `never`-typed trailing value. Total expansions capped at 100.
+- A function whose every emitted call site was inlined (tracked via
+  per-key out-of-line call counts in `gen_call` / `gen_method` /
+  spawn trampolines) has its standalone body **spliced back out** of
+  the generated C and its prototype dropped — the roadmap's
+  "inlined and the standalone definition is dropped".
+
+#### Added — whole-program DCE (two phases, `src/hlc.hls` + `tools/lto.py`)
+
+- Phase A: functions unreachable from `main` (plus the "" roots —
+  struct-default expressions, whose calls are emitted from
+  constructors) are never generated. Roots cover method calls, spawn
+  targets and contract clauses through the checker's call graph.
+- Phase B (C backend): fully-inlined functions are removed as above.
+- The Python twin (`tools/lto.py`) applies the phase-A DCE to the
+  LLVM IR emission path (`boot.py --emit lto`), where it drops
+  38 of 41 functions from the acceptance program's IR.
+- Generic specialisation dedup: instantiations are keyed by mangled
+  name; two modules instantiating the same generic with the same type
+  arguments share ONE specialisation.
+
+#### Added — tooling & integration
+
+- `make lto F=prog.hls` — compile + run with the LTO pipeline.
+- `make emit-lto-ir F=prog.hls [OUT=...]` — whole-program LTO'd LLVM
+  IR (`.ll`, plus `.bc` bitcode when `llvm-as` is available).
+- `boot.py --emit lto` (whole-program DCE + single LLVM module) and
+  `boot.py --lto` with `--emit ir` / `--opt-stats` (raises the HLIR
+  cross-crate inline threshold from 12 to 60 instructions).
+- `hls-pkg build --lto` — packages compile natively through
+  `hlc --lto` → C → cc → run.
+
+#### Fixed — C-backend `&&`/`||` short-circuit soundness bug
+
+- Found by the Stage 20 work (`lto_reachable`'s
+  `k.len() >= 2 && k.slice(0, 2) == "b:"` panicked natively on
+  1-char keys while the interpreter was fine): `collect_hoist` walked
+  the RIGHT operand of `&&`/`||` and hoisted its fresh pointer
+  subexpressions to statement level — evaluating them EAGERLY and
+  destroying HLS's lazy short-circuit semantics. Any program with a
+  panicking subexpression (slice, checked division, call) in the right
+  operand diverged between the interpreter and the native build.
+- The fix: `collect_hoist` skips `&&`/`||` right subtrees, and
+  `gen_bin` scopes the right operand's fresh subexpressions inside a
+  GCC statement expression at the operand position — C's
+  short-circuit now skips both their evaluation AND their cleanup,
+  matching the interpreter exactly. Regression test:
+  `tests/ok/feat_shortcircuit_slice.hls` (differential).
+
+#### Added — tests
+
+- `tests/ok/feat_stage20_lto.hls` — the acceptance program (imports
+  std.list, sorts with `list_sort_int_asc`, differential-tested on
+  all three paths: interpreter, plain native, LTO native).
+- `tests/run_tests.sh` section 8 (8 new checks): the inlined binary's
+  output is identical across all three builds; `usf_list_sort_int_asc`
+  is absent from the LTO C (fully inlined); binary size drop
+  (measured 52%, gate ≥ 15%); `--emit lto` IR define count vs
+  non-LTO (3 vs 41); the `&&` short-circuit regression.
+- The full differential suite additionally runs every ok/ program
+  through `--lto` during development (105/105 identical).
+
+### Test results
+
+- 578 PASS / 0 FAIL (570 prior + 8 new Stage-20 checks).
+- Bootstrap: deterministic.
+- Differential suite (interpreter ↔ native, `-O fast`, `--lto`):
+  byte-identical across all ok/ programs.
+- Stage 19 acceptance re-verified: 69.2% ≤ 80%, byte-identical output.
+
 ## [v0.35.0-alpha] — Stage 19: profile-guided optimisation (PGO)
 
 > Completes **Stage 19** of the roadmap: the profile-guided

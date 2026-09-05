@@ -169,7 +169,36 @@ pgo-report: pgo
 	@python3 scripts/pgo_ratio.py --plain $(BIN)/hlc --trained $(BIN)/hlc_pgo \
 	  --input $(HLC) --runs 9
 
-.PHONY: pgo pgo-acceptance pgo-report
+# ============================================================================
+# Stage 20 (v0.36.0-alpha): link-time optimisation across crates
+# ============================================================================
+
+# lto: compile a program with the whole-program LTO pipeline
+# (cross-crate inlining + DCE) and run it. Usage: make lto F=prog.hls
+lto:
+	@test -x $(BIN)/hlc || $(MAKE) bootstrap
+	@test -n "$(F)" || (echo "Usage: make lto F=examples/foo.hls" && false)
+	@mkdir -p $(BIN)
+	@$(BIN)/hlc --lto $(F) $(BIN)/hls_lto.c
+	@$(CC) $(CFLAGS) -o $(BIN)/hls_lto $(BIN)/hls_lto.c -lm -pthread
+	@$(BIN)/hls_lto
+
+# emit-lto-ir: whole-program LTO'd LLVM IR (single .ll with every
+# transitive dependency; .bc too when llvm-as is available).
+# Usage: make emit-lto-ir F=examples/foo.hls [OUT=/tmp/foo]
+emit-lto-ir:
+	@test -n "$(F)" || (echo "Usage: make emit-lto-ir F=examples/foo.hls [OUT=/tmp/foo]" && false)
+	@if [ -z "$(OUT)" ]; then OUT=$(F:.hls=.lto.ll); fi; \
+	  $(PYTHON) boot/boot.py --emit lto $(F) > $$OUT; \
+	  echo "wrote $$OUT"; \
+	  if command -v llvm-as >/dev/null 2>&1; then \
+	    llvm-as $$OUT -o $$(dirname $$OUT)/$$(basename $$OUT .ll).bc; \
+	    echo "wrote $$(dirname $$OUT)/$$(basename $$OUT .ll).bc (bitcode)"; \
+	  else \
+	    echo "llvm-as not available: skipped bitcode (.bc) emission"; \
+	  fi
+
+.PHONY: pgo pgo-acceptance pgo-report lto emit-lto-ir
 
 # ============================================================================
 # Stage 13 (v0.23.0-alpha): hls-pkg package manager targets

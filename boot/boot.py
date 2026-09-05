@@ -189,6 +189,8 @@ def run_cli():
     audit_only = False
     emit_ir = False        # Stage 11 (v0.9.0-alpha): print HLIR text
     emit_llvm = False      # Stage 12 (v0.10.0-alpha): print LLVM IR text
+    emit_lto = False       # Stage 20 (v0.36.0-alpha): LTO'd LLVM IR text
+    lto_mode = False       # Stage 20: --lto (opt-stats / emit paths)
     opt_stats = False      # Stage 11: print optimiser statistics
     target_triple = None   # Stage 12: --target <triple>
     sandbox_dir = None     # Stage 10 release: --sandbox DIR restricts FS builtins
@@ -216,12 +218,23 @@ def run_cli():
         elif i + 1 < len(args) and args[i + 1] == "llvm":
             emit_llvm = True
             del args[i:i + 2]
+        # Stage 20 (v0.36.0-alpha): --emit lto — whole-program LTO'd
+        # LLVM IR (cross-crate DCE applied before emission).
+        elif i + 1 < len(args) and args[i + 1] == "lto":
+            emit_lto = True
+            del args[i:i + 2]
         else:
-            sys.stderr.write("error: --emit expects 'ir' or 'llvm'\n")
+            sys.stderr.write("error: --emit expects 'ir', 'llvm' or 'lto'\n")
             return 2
     while "--opt-stats" in args:
         opt_stats = True
         args.remove("--opt-stats")
+    # Stage 20 (v0.36.0-alpha): --lto — raise the HLIR inliner threshold
+    # (cross-crate inlining of bigger pure helpers) for the IR/LLVM
+    # paths. Mutually compatible with --emit / --opt-stats.
+    while "--lto" in args:
+        lto_mode = True
+        args.remove("--lto")
     while "--target" in args:
         i = args.index("--target")
         if i + 1 < len(args):
@@ -265,10 +278,11 @@ def run_cli():
             return 2
     # BUG-025 fix: --check and --audit are mutually exclusive — error out
     # explicitly rather than silently preferring one over the other.
-    mutually_exclusive = sum([check_only, audit_only, emit_ir, emit_llvm, opt_stats])
+    mutually_exclusive = sum([check_only, audit_only, emit_ir, emit_llvm,
+                              emit_lto, opt_stats])
     if mutually_exclusive > 1:
         sys.stderr.write(
-            "error: --check / --audit / --emit ir / --emit llvm / --opt-stats are mutually exclusive\n")
+            "error: --check / --audit / --emit ir / --emit llvm / --emit lto / --opt-stats are mutually exclusive\n")
         return 2
     # Deep-scan-10 (continued): the entry path and the PROGRAM
     # arguments are whatever follows the leading flags — program
@@ -335,11 +349,16 @@ def run_cli():
         print_audit(program, checker)
         return 0
     if emit_ir:
-        return print_ir(program)
+        return print_ir(program, lto_mode)
     if emit_llvm:
         return print_llvm(program, target_triple)
+    # Stage 20 (v0.36.0-alpha): --emit lto — apply the whole-program LTO
+    # pipeline (cross-crate DCE) to the checked program, then emit ONE
+    # LLVM IR module containing every transitive dependency.
+    if emit_lto:
+        return print_llvm_lto(program, checker, target_triple)
     if opt_stats:
-        return print_opt_stats(program)
+        return print_opt_stats(program, lto_mode)
     if check_only:
         sys.stdout.write("OK: types and effects valid\n")
         if fast_mode:
@@ -562,7 +581,7 @@ def print_audit(program, checker):
             print("    %s (0):" % bname)
 
 
-def print_ir(program):
+def print_ir(program, lto: bool = False):
     """Stage 11 (v0.9.0-alpha): print the HLIR of a program."""
     # Local import — the IR lives under tools/ to keep boot/ clean.
     import os as _os
@@ -581,6 +600,13 @@ def print_ir(program):
         # surface as clean compile errors, not raw Python tracebacks.
         sys.stderr.write("compile error: %s\n" % ex)
         return 1
+    # Stage 20: --lto raises the cross-crate inline threshold.
+    if lto:
+        try:
+            from ir.optimize import optimize as ir_optimize  # noqa: E402
+            ir_optimize(mod, fast=False, lto=True)
+        except ImportError:
+            pass
     sys.stdout.write(dump_module(mod))
     return 0
 
@@ -608,11 +634,42 @@ def print_llvm(program, target_triple=None):
     return 0
 
 
-def print_opt_stats(program):
+def print_llvm_lto(program, checker, target_triple=None):
+    """Stage 20 (v0.36.0-alpha): --emit lto — whole-program LTO'd LLVM IR.
+
+    Applies the cross-crate DCE pass (tools/lto.py) to the checked
+    program, then emits ONE LLVM IR module containing every transitive
+    dependency (imports are already merged into the single program).
+    """
+    import os as _os
+    _tools = _os.path.join(_REPO_ROOT, "tools")
+    if _tools not in sys.path:
+        sys.path.insert(0, _tools)
+    try:
+        from lto import lto_program, lto_report  # noqa: E402
+        from llvm_emit import emit_module  # noqa: E402
+    except ImportError as ex:
+        sys.stderr.write("error: cannot load LTO/LLVM modules: %s\n" % ex)
+        return 2
+    program_lto, stats = lto_program(program, checker)
+    sys.stderr.write(lto_report(stats) + "\n")
+    try:
+        out = emit_module(program_lto, target_triple=target_triple)
+    except HLError as ex:
+        sys.stderr.write("compile error: %s\n" % ex)
+        return 1
+    sys.stdout.write(out)
+    return 0
+
+
+def print_opt_stats(program, lto: bool = False):
     """Stage 11 (v0.9.0-alpha): run the optimiser, print per-pass stats.
 
     Reports the number of instructions before/after each pass, per function.
     Useful for `make opt-stats F=examples/foo.hls`.
+
+    Stage 20 (v0.36.0-alpha): `lto=True` (the --lto flag) raises the
+    cross-crate inline threshold before running the pipeline.
     """
     import os as _os
     _tools = _os.path.join(_REPO_ROOT, "tools")
@@ -634,8 +691,8 @@ def print_opt_stats(program):
     before = {}
     for fname, irf in mod.functions.items():
         before[fname] = sum(len(b.instrs) for b in irf.blocks)
-    # Run the optimiser.
-    ir_optimize(mod, fast=False)
+    # Run the optimiser (Stage 20: --lto raises the inline threshold).
+    ir_optimize(mod, fast=False, lto=lto)
     after = {}
     for fname, irf in mod.functions.items():
         after[fname] = sum(len(b.instrs) for b in irf.blocks)

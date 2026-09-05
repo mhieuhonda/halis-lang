@@ -1287,6 +1287,33 @@ def cmd_build(args):
                     import shutil as _shutil
                     _shutil.copy2(rp, dst)
         env["HLS_PKG_DEPS"] = deps_dir
+    # Stage 20 (v0.36.0-alpha): --lto — compile the package NATIVELY
+    # with the whole-program LTO pipeline (cross-crate inlining + DCE)
+    # instead of interpreting: hlc --lto -> C -> cc -> run.
+    if getattr(args, "lto", False):
+        hlc_src = os.path.join(REPO_ROOT, "src", "hlc.hls")
+        if not os.path.isfile(hlc_src):
+            print("error: cannot find src/hlc.hls (repo layout changed?)",
+                  file=sys.stderr)
+            return 1
+        out_dir = os.path.join(os.getcwd(), ".hls-pkg-build")
+        os.makedirs(out_dir, exist_ok=True)
+        out_c = os.path.join(out_dir, "pkg_lto.c")
+        out_bin = os.path.join(out_dir, "pkg_lto_bin")
+        cmd = [sys.executable, boot_py, hlc_src, "--lto", entry, out_c]
+        print("  $ %s" % " ".join(cmd))
+        r1 = subprocess.run(cmd, env=env)
+        if r1.returncode != 0:
+            return r1.returncode
+        cc = os.environ.get("CC", "cc")
+        cmd = [cc, "-O2", "-o", out_bin, out_c, "-lm", "-pthread"]
+        print("  $ %s" % " ".join(cmd))
+        r2 = subprocess.run(cmd, env=env)
+        if r2.returncode != 0:
+            return r2.returncode
+        print("  $ %s" % out_bin)
+        r3 = subprocess.run([out_bin], env=env)
+        return r3.returncode
     cmd = [sys.executable, boot_py, entry]
     print("  $ %s" % " ".join(cmd))
     result = subprocess.run(cmd, env=env)
@@ -1439,6 +1466,11 @@ def main():
 
     p_build = sub.add_parser("build", help="Compile the package with resolved dependencies.")
     p_build.add_argument("--entry", default="main.hls")
+    # Stage 20 (v0.36.0-alpha): whole-program LTO build (cross-crate
+    # inlining + dead-code elimination via hlc --lto).
+    p_build.add_argument("--lto", action="store_true",
+                         help="compile natively with --lto (cross-crate "
+                              "inlining + whole-program DCE)")
     p_build.set_defaults(func=cmd_build)
 
     # Stage 13 release: transparency log commands.
