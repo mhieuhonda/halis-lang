@@ -9762,9 +9762,19 @@ fn runtime_lines() -> list[str] {
     r.push("        hl_list_push(out, hl_str_from(\"\", 0));")
     r.push("        return out;")
     r.push("    }")
+    # Deep-scan-19 fix (LOW, theoretical overflow): rewrite the loop
+    # condition as `i <= s->len - sep->len` (after a `s->len < sep->len`
+    # early exit) so the addition `i + sep->len` never overflows int64
+    # for a ~9-EB string. The previous `i + sep->len <= s->len` could
+    # overflow to a negative number, making the comparison true and
+    # causing an out-of-bounds memcmp.
+    r.push("    if (s->len < sep->len) {")
+    r.push("        hl_list_push(out, hl_str_from(s->data, s->len));")
+    r.push("        return out;")
+    r.push("    }")
     r.push("    int64_t start = 0;")
     r.push("    int64_t i = 0;")
-    r.push("    while (i + sep->len <= s->len) {")
+    r.push("    while (i <= s->len - sep->len) {")
     r.push("        if (memcmp(s->data + i, sep->data, (size_t)sep->len) == 0) {")
     r.push("            hl_list_push(out, hl_str_from(s->data + start, i - start));")
     r.push("            i += sep->len;")
@@ -9780,7 +9790,12 @@ fn runtime_lines() -> list[str] {
     r.push("// ---- v0.2 additions: pop, float, chr, fmod ----")
     r.push("// hl_list_pop: ownership of the removed item transfers to the caller.")
     r.push("static void* hl_list_pop(hl_list* l) {")
-    r.push("    if (l->len == 0) hl_die(\"array access out of bounds\");")
+    # Deep-scan-19 fix (LOW, error-message differential): the interpreter
+    # raises "pop from empty list" (boot/interp.py BUG-SC-9); the C
+    # runtime said "array access out of bounds", which is misleading
+    # (it's a pop, not an index). Aligned so differential tests see
+    # the same message.
+    r.push("    if (l->len == 0) hl_die(\"pop from empty list\");")
     r.push("    l->len--;")
     r.push("    return l->items[l->len];")
     r.push("}")
@@ -13161,42 +13176,49 @@ fn gen_call(ctx: Ctx, e: int) -> str {
     # documents this as the same behaviour as the previous loop-based
     # implementation: shifts >= 64 yield 0 for shl/shr and the sign
     # value for sar).
+    #
+    # Deep-scan-19 fix (HIGH, UB): int_shl emits `(int64_t)(a0) << (n & 63)`
+    # — the cast to int64_t is REQUIRED because `1 << 63` with `int` (32-bit)
+    # is undefined behaviour in C (shift count >= bit width). The same
+    # applies to int_or/xor/and/not when the operand is a small literal
+    # (e.g. `int_xor(x, -1)` needs `(int64_t)x ^ (int64_t)-1`); we cast
+    # both operands defensively.
     if name == "int_and" || name == "int_or" || name == "int_xor"
         || name == "int_shl" || name == "int_shr" || name == "int_sar" {
         let a0c: str = gen_expr(ctx, ctx.exprs[e].args.get(0))
         let a1c: str = gen_expr(ctx, ctx.exprs[e].args.get(1))
         if name == "int_and" {
-            return "(" + a0c + " & " + a1c + ")"
+            return "((int64_t)(" + a0c + ") & (int64_t)(" + a1c + "))"
         }
         if name == "int_or" {
-            return "(" + a0c + " | " + a1c + ")"
+            return "((int64_t)(" + a0c + ") | (int64_t)(" + a1c + "))"
         }
         if name == "int_xor" {
-            return "(" + a0c + " ^ " + a1c + ")"
+            return "((int64_t)(" + a0c + ") ^ (int64_t)(" + a1c + "))"
         }
         if name == "int_shl" {
-            return "(" + a0c + " << (" + a1c + " & 63))"
+            return "((int64_t)(" + a0c + ") << (" + a1c + " & 63))"
         }
         if name == "int_shr" {
-            return "((int64_t)((uint64_t)" + a0c + " >> (" + a1c + " & 63)))"
+            return "((int64_t)((uint64_t)(int64_t)(" + a0c + ") >> (" + a1c + " & 63)))"
         }
         # int_sar
-        return "(" + a0c + " >> (" + a1c + " & 63))"
+        return "((int64_t)(" + a0c + ") >> (" + a1c + " & 63))"
     }
     if name == "int_not" || name == "int_popcount"
         || name == "int_clz" || name == "int_ctz" {
         let a0u: str = gen_expr(ctx, ctx.exprs[e].args.get(0))
         if name == "int_not" {
-            return "(~" + a0u + ")"
+            return "(~(int64_t)(" + a0u + "))"
         }
         if name == "int_popcount" {
-            return "__builtin_popcountll((uint64_t)" + a0u + ")"
+            return "__builtin_popcountll((uint64_t)(int64_t)(" + a0u + "))"
         }
         if name == "int_clz" {
-            return "hl_clz((uint64_t)" + a0u + ")"
+            return "hl_clz((uint64_t)(int64_t)(" + a0u + "))"
         }
         # int_ctz
-        return "hl_ctz((uint64_t)" + a0u + ")"
+        return "hl_ctz((uint64_t)(int64_t)(" + a0u + "))"
     }
     # Stage 21 (v0.37.0-alpha): has_feature — const-folded from the
     # --target-feature flag. Exact-match semantics (asking for "avx2"

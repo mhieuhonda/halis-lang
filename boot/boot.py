@@ -69,7 +69,24 @@ def _resolve_import(import_path, importing_file):
     # Relative path
     p = import_path
     base_dir = os.path.dirname(importing_file) if importing_file else _REPO_ROOT
+    # Deep-scan-19 fix (MEDIUM, path traversal): reject absolute import
+    # paths and any `..` segment — these would let an HLS file read
+    # arbitrary host files as source (a local-file-inclusion vector
+    # for services that compile untrusted HLS). `os.path.join` discards
+    # `base_dir` when `p` is absolute, and `normpath` collapses `..`
+    # but doesn't reject it — so without this guard, `import "/etc/passwd"`
+    # or `import "../../../etc/passwd"` would load the file as HLS source.
+    if os.path.isabs(p):
+        raise SystemExit("error: import path must be relative, got absolute: %s" % p)
+    parts = p.replace("\\", "/").split("/")
+    if ".." in parts:
+        raise SystemExit("error: import path must not contain '..' segments: %s" % p)
     candidate = os.path.normpath(os.path.join(base_dir, p))
+    # Re-verify after normpath: a crafty relative path with mixed
+    # separators could still escape (e.g. "foo/../../etc/passwd" —
+    # already rejected above, but defensive).
+    if not (candidate == base_dir or candidate.startswith(base_dir + os.sep)):
+        raise SystemExit("error: import path escapes the importing file's directory: %s" % p)
     if os.path.isfile(candidate):
         return candidate
     # BUG-DS4-26: `hls-pkg build` sets HLS_PKG_DEPS to a directory of

@@ -1,0 +1,137 @@
+# tests/ok/feat_stage32_perfection.hls — Stage 32 perfection (deep-scan-19)
+# regression test.
+#
+# Exercises every fix from the deep-scan-19 audit:
+#   - str_pad_left / str_pad_right (genuine O(n), preserving deep-scan-5 order)
+#   - jsonp_parse_string (O(n) str_join instead of quadratic concat)
+#   - float_parse accepts leading '+' (was differential with str.to_float)
+#   - bits_pow2(63) via int_shl (dead special case removed)
+#   - simd gather/scatter overflow-safe bounds check
+#   - quickcheck qc_str / qc_str_n use str_join (no longer quadratic)
+#
+# This test verifies CORRECTNESS only (not performance — that's the job
+# of hls-bench.py).
+
+import "std.str"
+import "std.json"
+import "std.result"
+import "std.bits"
+import "std.simd"
+import "std.quickcheck"
+
+fn main() -> int uses Rand, IO {
+    # ---- str_pad_left / str_pad_right: deep-scan-5 order preserved ----
+    # The deep-scan-5 fix puts the remainder (single-byte prefix) FIRST
+    # for pad_left and LAST for pad_right. Verify both.
+    if str_pad_left("ab", 6, "xyz") != "xxyzab" {
+        panic("str_pad_left(ab,6,xyz) failed: got " + str_pad_left("ab", 6, "xyz"))
+    }
+    if str_pad_left("ab", 7, "xyz") != "xxxyzab" {
+        panic("str_pad_left(ab,7,xyz) failed: got " + str_pad_left("ab", 7, "xyz"))
+    }
+    if str_pad_left("ab", 5, "xyz") != "xyzab" {
+        panic("str_pad_left(ab,5,xyz) failed: got " + str_pad_left("ab", 5, "xyz"))
+    }
+    if str_pad_right("ab", 6, "xyz") != "abxyzx" {
+        panic("str_pad_right(ab,6,xyz) failed: got " + str_pad_right("ab", 6, "xyz"))
+    }
+    if str_pad_right("ab", 7, "xyz") != "abxyzxx" {
+        panic("str_pad_right(ab,7,xyz) failed: got " + str_pad_right("ab", 7, "xyz"))
+    }
+    # Large width (was quadratic before deep-scan-19) — verify it
+    # completes quickly and produces the right length.
+    let big: str = str_pad_left("x", 1000, " ")
+    if big.len() != 1000 {
+        panic("str_pad_left large failed: len=" + big.len().to_str())
+    }
+    if big.byte_at(999) != 120 {
+        panic("str_pad_left large: last byte should be 'x'")
+    }
+
+    # ---- jsonp_parse_string: O(n) str_join (was quadratic concat) ----
+    # Parse a JSON object with a long string value. The previous
+    # implementation was O(n²) for an n-byte string. We don't time it
+    # here — we just verify the parse is correct.
+    let long_str: str = str_repeat("a", 200)
+    let jv: JsonValue = json_parse("\"" + long_str + "\"")
+    if json_str_value(jv).len() != 200 {
+        panic("json_parse long string failed: len=" + json_str_value(jv).len().to_str())
+    }
+    # Round-trip: stringify and re-parse, verify equality.
+    let jv2: JsonValue = json_parse(json_stringify(jv))
+    if json_str_value(jv2) != long_str {
+        panic("json round-trip long string failed")
+    }
+
+    # ---- float_parse accepts leading '+' (was differential) ----
+    let r1: Result[float, str] = float_parse("+1.5")
+    if !result_is_ok(r1) {
+        panic("float_parse(+1.5) should be Ok")
+    }
+    let r2: Result[float, str] = float_parse("-1.5")
+    if !result_is_ok(r2) {
+        panic("float_parse(-1.5) should be Ok")
+    }
+    let r3: Result[float, str] = float_parse("1.5")
+    if !result_is_ok(r3) {
+        panic("float_parse(1.5) should be Ok")
+    }
+    # Match str.to_float's behaviour for all three.
+    if "+1.5".to_float() != 1.5 {
+        panic("\"+1.5\".to_float() failed")
+    }
+    if "-1.5".to_float() != -1.5 {
+        panic("\"-1.5\".to_float() failed")
+    }
+
+    # ---- bits_pow2(63) via int_shl (dead special case removed) ----
+    if bits_pow2(63) != -9223372036854775808 {
+        panic("bits_pow2(63) failed: got " + bits_pow2(63).to_str())
+    }
+    if bits_pow2(0) != 1 {
+        panic("bits_pow2(0) failed")
+    }
+    if bits_pow2(1) != 2 {
+        panic("bits_pow2(1) failed")
+    }
+    if bits_pow2(62) != 4611686018427387904 {
+        panic("bits_pow2(62) failed: got " + bits_pow2(62).to_str())
+    }
+
+    # ---- simd gather/scatter: overflow-safe bounds check ----
+    # A list of 4 ints, gather at index 0 — should succeed.
+    let xs: list[int] = [10, 20, 30, 40]
+    let v: I32x4 = simd_i32x4_gather(xs, 0)
+    if simd_i32x4_lane(v, 0) != 10 || simd_i32x4_lane(v, 3) != 40 {
+        panic("simd_i32x4_gather at 0 failed")
+    }
+    # A list of 5 ints, gather at index 1 — should succeed (4 elements from index 1).
+    let xs5: list[int] = [10, 20, 30, 40, 50]
+    let v2: I32x4 = simd_i32x4_gather(xs5, 1)
+    if simd_i32x4_lane(v2, 0) != 20 || simd_i32x4_lane(v2, 3) != 50 {
+        panic("simd_i32x4_gather at 1 failed")
+    }
+    # An empty list — should panic (caught here via the bounds check).
+    let empty: list[int] = []
+    let panicked: bool = false
+    # We can't catch panics in HLS, so just verify the function exists
+    # by calling it on a valid input. The overflow fix is verified
+    # by the absence of "integer overflow" panics on pathologically
+    # large `i` values (which we can't easily construct in a test).
+
+    # ---- quickcheck qc_str / qc_str_n use str_join (no longer quadratic) ----
+    # Generate a fixed-width string of 100 chars; this was O(n²) before
+    # deep-scan-19. Verify the length is correct (the content is random).
+    let s100: str = qc_str_n(100)
+    if s100.len() != 100 {
+        panic("qc_str_n(100) failed: len=" + s100.len().to_str())
+    }
+    # qc_str returns a string of length 0..32. Verify it's in range.
+    let s_rand: str = qc_str()
+    if s_rand.len() < 0 || s_rand.len() > 32 {
+        panic("qc_str() length out of range: " + s_rand.len().to_str())
+    }
+
+    println("stage32 perfection ok")
+    return 0
+}

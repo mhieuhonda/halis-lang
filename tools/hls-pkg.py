@@ -470,6 +470,13 @@ def _parse_value(src: str, i: int) -> Tuple[object, int]:
             else:
                 out.append(src[j])
                 j += 1
+        # Deep-scan-19 fix (MEDIUM): reject unterminated string literals.
+        # The loop above exits at EOF without a closing quote; without
+        # this guard, the partial content silently becomes the manifest
+        # value (truncated, no error) — confusing package-resolution
+        # failures downstream.
+        if j >= n:
+            raise ValueError("unterminated string literal at offset %d" % i)
         return "".join(out), j + 1
     if c == '[':
         # List of strings / bare tokens.

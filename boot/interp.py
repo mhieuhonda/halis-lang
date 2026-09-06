@@ -44,6 +44,11 @@ def _sandbox_check(path_bytes):
     """If SANDBOX_ROOT is set, verify that `path_bytes` resolves inside
     the sandbox. Raises HLPanic with a clean message otherwise.
 
+    Returns the RESOLVED path (bytes) so callers can open() the
+    already-resolved path — avoiding a TOCTOU race where a symlink
+    inside the sandbox is swapped for one pointing outside between
+    the check and the open().
+
     The check is performed AFTER realpath resolution, so paths like
     "../etc/passwd" or symlinks pointing outside the sandbox are
     rejected. We DO allow the path to NOT exist (e.g. file_exists
@@ -59,7 +64,8 @@ def _sandbox_check(path_bytes):
     still follow it.
     """
     if SANDBOX_ROOT is None:
-        return
+        return path_bytes if isinstance(path_bytes, bytes) \
+            else str(path_bytes).encode("utf-8")
     # Deep-scan-10 fix: the whole check now runs on BYTES (realpath
     # accepts and returns bytes — a byte-exact round trip). The old
     # code decoded bytes as latin-1 to str and called realpath on the
@@ -83,10 +89,11 @@ def _sandbox_check(path_bytes):
     # "/sandbox".
     sb = SANDBOX_ROOT.encode("utf-8")
     if resolved == sb:
-        return
+        return resolved
     if not resolved.startswith(sb + b"/"):
         raise HLPanic("sandbox violation: path '%s' resolves outside the sandbox"
                       % to_display(path_bytes), 0)
+    return resolved
 
 
 class HLPanic(Exception):
@@ -808,11 +815,24 @@ class Interp:
                 c_args.append(bool(v))
             elif pt == "str":
                 # HLS str is bytes. Pass as a null-terminated C string.
+                # Deep-scan-19 fix (LOW, defence-in-depth): reject
+                # embedded NUL bytes. C functions interpret the string
+                # only up to the first NUL — passing "ls\0; rm -rf /"
+                # to system() would execute only "ls" (silent
+                # truncation). The caller is responsible for ensuring
+                # no embedded NULs; this guard surfaces the bug cleanly.
                 c_argtypes.append(ctypes.c_char_p)
                 if isinstance(v, bytes):
+                    if b"\x00" in v:
+                        raise HLPanic("extern str argument contains embedded NUL byte "
+                                      "(C would truncate at the NUL)", line)
                     c_args.append(v)
                 else:
-                    c_args.append(str(v).encode("utf-8"))
+                    encoded = str(v).encode("utf-8")
+                    if b"\x00" in encoded:
+                        raise HLPanic("extern str argument contains embedded NUL byte "
+                                      "(C would truncate at the NUL)", line)
+                    c_args.append(encoded)
             else:
                 # Deep-scan fix (C8): the previous code passed `id(v)` for
                 # list/map/struct args. That's a raw CPython heap address,
@@ -1325,9 +1345,13 @@ class Interp:
         if name == "map_new":
             return {}
         if name == "read_file":
-            _sandbox_check(args[0])
+            # Deep-scan-19 fix (MEDIUM, TOCTOU): open the RESOLVED path
+            # returned by _sandbox_check, not the original. Prevents a
+            # race where a symlink inside the sandbox is swapped for one
+            # pointing outside between the check and the open.
+            resolved = _sandbox_check(args[0])
             try:
-                with open(args[0], "rb") as f:
+                with open(resolved, "rb") as f:
                     return f.read()
             except OSError:
                 raise HLPanic("cannot open file: %s" % to_display(args[0]), line)
@@ -1335,9 +1359,9 @@ class Interp:
         # the returned str is wrapped as tainted[str]. The wrapper dict
         # format is identical to taint_mark's output.
         if name == "read_file_tainted":
-            _sandbox_check(args[0])
+            resolved = _sandbox_check(args[0])
             try:
-                with open(args[0], "rb") as f:
+                with open(resolved, "rb") as f:
                     content = f.read()
                 return {"tainted": True, "value": content}
             except OSError:
@@ -1356,9 +1380,9 @@ class Interp:
                     raw = raw[:-1]
             return {"tainted": True, "value": raw}
         if name == "write_file":
-            _sandbox_check(args[0])
+            resolved = _sandbox_check(args[0])
             try:
-                with open(args[0], "wb") as f:
+                with open(resolved, "wb") as f:
                     f.write(args[1])
                 return None
             except OSError:
@@ -1381,14 +1405,16 @@ class Interp:
             # `os` is already imported at module top (line 14), and
             # Python caches it in sys.modules so the local import was
             # a no-op besides raising a pylint W0404 reimport warning.
-            _sandbox_check(args[0])
-            # Deep-scan fix (H2): pass `args[0]` (bytes) directly to
-            # os.path.isfile — Python's os.path.isfile accepts bytes.
-            # The old code decoded with errors="replace", which substituted
-            # U+FFFD for non-UTF-8 bytes, so the interpreter checked a
-            # DIFFERENT path than the native runtime (which passes raw
-            # bytes to stat()). Files with non-UTF-8 names diverged.
-            return os.path.isfile(args[0])
+            # Deep-scan-19: use the RESOLVED path returned by _sandbox_check
+            # (TOCTOU consistency with read_file / write_file).
+            resolved = _sandbox_check(args[0])
+            # Deep-scan fix (H2): pass bytes directly to os.path.isfile
+            # (Python's os.path.isfile accepts bytes). The old code
+            # decoded with errors="replace", which substituted U+FFFD
+            # for non-UTF-8 bytes, so the interpreter checked a DIFFERENT
+            # path than the native runtime (which passes raw bytes to
+            # stat()). Files with non-UTF-8 names diverged.
+            return os.path.isfile(resolved)
         # ----- Stage 8-alpha: ownership primitives -----
         # drop(x): semantically releases x. In Stage-0 (Python), the underlying
         # value is left for Python's GC. The binding is marked moved at compile
