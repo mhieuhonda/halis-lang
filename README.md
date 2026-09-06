@@ -183,6 +183,11 @@ python3 boot/boot.py examples/simd_demo.hls      # portable std.simd everywhere
 python3 boot/boot.py examples/stack_layout_demo.hls   # run the demo
 make escape-acceptance    # the Stage 30 gate: fibonacci inner loop, zero heap objects
 make layout-report F=examples/stack_layout_demo.hls   # per-binding layout decisions
+
+# 18. Stage 31 (v0.48.0-alpha): verified tail-call optimisation
+python3 boot/boot.py examples/fibonacci.hls 1000000  # fib_tail(1M), zero Python recursion
+make tail-acceptance      # the Stage 31 gate: fib_tail(1M) under ulimit -s 1024
+make tail-report F=examples/fibonacci.hls            # verified tail-call decisions
 ```
 
 ## Language example
@@ -276,7 +281,7 @@ halis-lang/
 ├── std/                 # Standard library (Stage 6 + Stage 10, in HLS)
 ├── examples/            # hello, fibonacci, primes, wordcount, secure_demo, ...
 ├── tests/
-│   ├── ok/              #   111 valid programs (incl. safe panics + Stage 30 demos)
+│   ├── ok/              #   112 valid programs (incl. safe panics + Stage 30/31 demos)
 │   ├── fail/            #   104 programs that MUST be rejected (types/effects/taint/escape)
 │   └── run_tests.sh     #   720 assertions: ok/fail/differential/bootstrap fixed-point
 ├── Makefile             # bootstrap · test · run · examples · audit · opt-stats · emit-ir · emit-llvm
@@ -303,6 +308,8 @@ Full details: [SPEC.md](SPEC.md) · Stage-by-stage roadmap:
 [ROADMAP.md](ROADMAP.md).
 
 ## Status
+
+**v0.48.0-alpha — Stage 31: tail-call optimisation (verified).** `#[tail_call]` asserts that every recursive call to a function is in verified tail position, and the compiler turns that proof into a jump: the codegen lowers each verified site to a parameter-rebinding `goto` — **a jmp, not a call — so stack usage is constant regardless of recursion depth** (`fib_tail(1_000_000)` uses the same stack as `fib_tail(1)`). "Verified" is mechanical: the checker proves *position* (every self-call is the entire `return f(...)` expression) and *no cleanup* (the body flows only `int`/`float`/`bool` — nothing needing release between the call and the jump; the only exception is a string literal passed directly to `panic`/`print`/`println`). Scope: plain fns only — not generic, not a method, no contracts, not `irq_handler`/`inline(always)` (both conflicts caught at parse time). Both backends transform: the native C backend emits the loop, and the Stage-0 interpreter mirrors it as a **trampoline** — 1M-deep tail recursion costs zero Python recursion. PGO entry counters keep counting real entries; LTO never inlines a `#[tail_call]` fn (the loop must stay a loop). `--opt-stats` reports the verified sites. Acceptance (`make tail-acceptance`): native `fib_tail(1_000_000)` = 918091266 (independently computed), the same run under `ulimit -s 1024` (a 1 MB stack — a 1M call chain would need ~48 MB), the interpreter at the same depth with byte-identical output, and a non-tail self-call is rejected. See `examples/fibonacci.hls` and `tests/ok/feat_stage31_tail.hls`.
 
 **v0.47.0-alpha — Stage 30: boxed-vs-stack layout analysis (escape analysis).** A `list[int]`/`list[float]`/`list[bool]` whose every use stays inside its creating function is allocated on the C stack as a typed array — **zero heap objects, zero refcount traffic** (a 3-element list literal drops from 5 mallocs to 0). The analysis is *proven*, not assumed: only borrow-safe uses (`.get`/`.set`/`.len` receiver, `xs[i]` base, for-in iterable) keep a binding in-frame, and `#[stack]` turns the proof into a compile-time guarantee — an escaping use is a compile error naming the site, so a stack-allocated value can NEVER outlive its creating frame. `#[boxed]` opts back into the heap layout; both are the first let-binding attributes. The analysis runs automatically with no annotation, the `--opt-stats` report gains a per-binding layout table, and the compiler is its own first customer (2 of its own bindings are stack-allocated in the self-compiled binary). Acceptance: the fibonacci inner loop runs 20,000 rounds with a constant 90 heap allocations (its `#[boxed]` twin: 1,280,234), verified by `make escape-acceptance` and `examples/stack_layout_demo.hls`. **712/720 tests PASS** (the 8 failures are pre-existing environment issues — 6 wasm-toolchain + 2 simd-timing — verified to fail identically on the pre-Stage-30 code).
 
@@ -466,8 +473,19 @@ Full details: [SPEC.md](SPEC.md) · Stage-by-stage roadmap:
   interaction-safe; differential suite byte-identical. Acceptance:
   fibonacci inner loop, 20k rounds, 90 constant heap allocations
   (`make escape-acceptance`).
+- ✅ **Stage 31 release — tail-call optimisation (verified)**
+  (v0.48.0-alpha): `#[tail_call]` — the checker proves every
+  recursive call is in tail position AND needs no cleanup between
+  the call and the jump (primitive-only dataflow), then the codegen
+  lowers each verified site to a parameter-rebinding `goto` (a jmp,
+  not a call — constant stack at any depth); the interpreter mirrors
+  it as a trampoline (zero Python recursion at 1M depth); LTO never
+  inlines a tail-call fn; `--opt-stats` reports the verified sites.
+  Acceptance: `fib_tail(1_000_000)` = 918091266 natively under
+  `ulimit -s 1024` and in the interpreter, byte-identical
+  (`make tail-acceptance`).
 - ⬜ RISC-V backend (Stage 26), inline assembly (Stage 27),
-  tail-call optimisation (Stage 31), v1.0 (Stage 150)...
+  zero-cost abstractions audit (Stage 32), v1.0 (Stage 150)...
 
 ## Contributing
 

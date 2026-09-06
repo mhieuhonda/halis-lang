@@ -8,7 +8,7 @@ HLC     = src/hlc.hls
 BIN     = bin
 PREFIX  ?= /usr/local
 
-.PHONY: all stage0 bootstrap test examples clean run check bench install uninstall audit opt-stats emit-ir emit-llvm fmt lint lsp-check pkg-init pkg-add pkg-lock pkg-audit pkg-verify pkg-build pkg-publish pkg-log pkg-log-verify prove prove-full model prove-acceptance hltest fuzz cov fuzz-acceptance wasm-opt webapp webapp-acceptance serve aarch64-bench aarch64-acceptance aarch64-list-targets stack-acceptance inline-acceptance opt-stats-report kernel-attrs escape-acceptance layout-report
+.PHONY: all stage0 bootstrap test examples clean run check bench install uninstall audit opt-stats emit-ir emit-llvm fmt lint lsp-check pkg-init pkg-add pkg-lock pkg-audit pkg-verify pkg-build pkg-publish pkg-log pkg-log-verify prove prove-full model prove-acceptance hltest fuzz cov fuzz-acceptance wasm-opt webapp webapp-acceptance serve aarch64-bench aarch64-acceptance aarch64-list-targets stack-acceptance inline-acceptance opt-stats-report kernel-attrs escape-acceptance layout-report tail-acceptance tail-report
 
 # Main goal: use the full bootstrap chain to build the native compiler
 all: bootstrap
@@ -389,7 +389,10 @@ wasm-acceptance:
 	@$(PYTHON) tools/hlwasm.py examples/hello.hls $(BIN)/hello_wasm2 --run >$(BIN)/wasm_run.out 2>&1
 	@rc=$$?; if [ $$rc -ne 0 ]; then echo "FAIL: wasm run failed (rc=$$rc)"; cat $(BIN)/wasm_run.out; exit 1; fi
 	@python3 boot/boot.py examples/hello.hls </dev/null 2>/dev/null >$(BIN)/interp_out.txt
-	@grep -v "^wrote " $(BIN)/wasm_run.out | grep -v "^note:" >$(BIN)/wasm_out.txt
+	@# Deep-scan-13 fix: also filter the 'wasm-opt: N -> M bytes' info
+	@# line (stderr, merged by 2>&1) — it polluted the output comparison
+	@# whenever the in-tree optimizer was active (CI red on main).
+	@grep -v "^wrote " $(BIN)/wasm_run.out | grep -v "^note:" | grep -v "^wasm-opt: " >$(BIN)/wasm_out.txt
 	@python3 -c "import sys; a=open('$(BIN)/interp_out.txt').read(); b=open('$(BIN)/wasm_out.txt').read(); sys.exit(0 if a==b else 1)" || (echo "FAIL: wasm output differs from interpreter"; diff $(BIN)/interp_out.txt $(BIN)/wasm_out.txt | head -5; exit 1)
 	@echo "  output check: OK (wasm output matches interpreter)"
 	@echo "ACCEPTANCE OK: examples/hello.hls compiles to a <10 KB wasm binary with correct output"
@@ -900,6 +903,115 @@ layout-report:
 	@test -n "$(F)" || (echo "Usage: make layout-report F=examples/stack_layout_demo.hls" && false)
 	@test -x $(BIN)/hlc || $(MAKE) bootstrap
 	@$(BIN)/hlc --opt-stats $(F) /tmp/layout_out.c 2>&1 | sed -n '/=== opt-stats ===/,$$p'
+
+# ============================================================================
+# Stage 31 (v0.48.0-alpha): verified tail-call optimisation
+# ============================================================================
+
+# tail-acceptance: the Stage 31 acceptance gate.
+#
+# ROADMAP Stage 31: "examples/fibonacci.hls rewritten with #[tail_call]
+# runs fib(1_000_000) without stack overflow."
+#
+# Five complementary verifications run:
+#
+#   (a) SOURCE: the C emitted for usf_fib_tail contains the loop label
+#       (`hl_tail_restart:;`), the parameter-rebinding jump
+#       (`goto hl_tail_restart;`) and ZERO recursive calls to itself —
+#       the tail call is a jmp, not a call.
+#
+#   (b) NATIVE 1,000,000: ./fibonacci 1000000 exits 0 and prints the
+#       correct value (fib(1_000_000) mod 1e9+7, computed here by an
+#       independent Python fast-doubling implementation).
+#
+#   (c) CONSTANT STACK: the same 1M run under `ulimit -s 1024` (a 1 MB
+#       stack). A 1M-deep real call chain at ~48 bytes/frame needs
+#       ~48 MB; the loop fits in kilobytes. Passing under 1 MB PROVES
+#       the stack usage is constant regardless of recursion depth.
+#
+#   (d) INTERPRETER 1,000,000: the Stage-0 trampoline (TailCallSig +
+#       parameter rebind in call_fn) runs the same depth with zero
+#       Python recursion — no RecursionError, same output.
+#
+#   (e) DIFFERENTIAL: interpreter output and native output are
+#       byte-identical at the acceptance depth (layout and transform
+#       are observably identical).
+#
+#   (f) NEGATIVE: a #[tail_call] fn whose recursive call is NOT in
+#       tail position is rejected by the native compiler (the
+#       verifier half of "verified").
+tail-acceptance:
+	@echo "[Stage 31 acceptance] verified tail calls — fib_tail(1_000_000) without stack overflow..."
+	@test -x $(BIN)/hlc || $(MAKE) bootstrap
+	@mkdir -p $(BIN)
+	@$(BIN)/hlc examples/fibonacci.hls $(BIN)/fib31.c >$(BIN)/fib31.log 2>&1 \
+	  || (echo "FAIL: hlc compile failed"; cat $(BIN)/fib31.log; exit 1)
+	@echo "  fibonacci.hls parses with #[tail_call]: OK"
+	@if grep -q "^hl_tail_restart:;" $(BIN)/fib31.c; then \
+	  echo "  C source has the tail-call loop label (hl_tail_restart:): OK"; \
+	else \
+	  echo "FAIL: the tail-call loop label is missing from the C source"; exit 1; \
+	fi
+	@if grep -q "goto hl_tail_restart;" $(BIN)/fib31.c; then \
+	  echo "  C source has the parameter-rebinding jump (goto hl_tail_restart): OK"; \
+	else \
+	  echo "FAIL: the parameter-rebinding jump is missing from the C source"; exit 1; \
+	fi
+	@if [ "$$(awk '/^int64_t usf_fib_tail\(int64_t u_n_p/,/^}$$/' $(BIN)/fib31.c | grep -c 'usf_fib_tail(')" -le 1 ]; then \
+	  echo "  usf_fib_tail's body contains ZERO recursive calls (the tail call is a jmp, not a call): OK"; \
+	else \
+	  echo "FAIL: usf_fib_tail still calls itself — the tail call was not transformed"; exit 1; \
+	fi
+	@gcc -O2 -o $(BIN)/fib31 $(BIN)/fib31.c -lm -pthread \
+	  || (echo "FAIL: C compile failed"; exit 1)
+	@# (b) the full-depth native run + the independently computed value.
+	@EXPECTED=$$(python3 -c "exec(\"def fd(n):\n if n==0: return (0,1)\n a,b=fd(n>>1)\n c=a*((2*b-a)%1000000007)%1000000007\n d=(a*a+b*b)%1000000007\n return (d,(c+d)%1000000007) if n&1 else (c,d)\nprint(fd(1000000)[0])\")"); \
+	$(BIN)/fib31 1000000 >$(BIN)/fib31_nat.out 2>&1 || (echo "FAIL: native fib_tail(1_000_000) run failed"; exit 1); \
+	if grep -q "fib_tail(1000000) = $$EXPECTED" $(BIN)/fib31_nat.out; then \
+	  echo "  native fib_tail(1_000_000) = $$EXPECTED (independently computed via fast doubling): OK"; \
+	else \
+	  echo "FAIL: native output mismatch (expected fib(1e6) mod 1e9+7 = $$EXPECTED)"; cat $(BIN)/fib31_nat.out; exit 1; \
+	fi
+	@# (c) the constant-stack proof: 1 MB of stack, one million deep.
+	@if bash -c 'ulimit -s 1024; $(BIN)/fib31 1000000 >/dev/null 2>&1'; then \
+	  echo "  fib_tail(1_000_000) under ulimit -s 1024 (1 MB stack; a 1M call chain needs ~48 MB): OK"; \
+	else \
+	  echo "FAIL: fib_tail(1_000_000) blew the 1 MB stack — the transform is not constant-stack"; exit 1; \
+	fi
+	@# (d) the interpreter trampoline at full depth (zero Python recursion).
+	@python3 boot/boot.py examples/fibonacci.hls 1000000 >$(BIN)/fib31_interp.out 2>&1 \
+	  || (echo "FAIL: interpreter fib_tail(1_000_000) run failed (RecursionError?)"; cat $(BIN)/fib31_interp.out; exit 1)
+	@echo "  interpreter fib_tail(1_000_000) runs with zero Python recursion: OK"
+	@# (e) differential: byte-identical outputs at the acceptance depth.
+	@if diff -q $(BIN)/fib31_interp.out $(BIN)/fib31_nat.out >/dev/null; then \
+	  echo "  interpreter and native outputs are byte-identical at depth 1,000,000: OK"; \
+	else \
+	  echo "FAIL: differential mismatch at depth 1,000,000"; \
+	  diff $(BIN)/fib31_interp.out $(BIN)/fib31_nat.out | head -5; exit 1; \
+	fi
+	@# (f) negative: a non-tail recursive call must be rejected.
+	@if $(BIN)/hlc tests/fail/fail_tail_call_nontail.hls $(BIN)/fail31.c >/dev/null 2>&1; then \
+	  echo "FAIL: the native compiler accepted a non-tail recursive call under #[tail_call]"; exit 1; \
+	else \
+	  echo "  non-tail recursive call under #[tail_call] rejected by the native compiler: OK"; \
+	fi
+	@# --opt-stats reports the verified tail-call decision table.
+	@$(BIN)/hlc --opt-stats examples/fibonacci.hls /tmp/fib31_optstats.c >$(BIN)/fib31_optstats.log 2>&1
+	@if grep -q "#\[tail_call\].*annotations: 1" $(BIN)/fib31_optstats.log && \
+	  grep -q "fib_tail" $(BIN)/fib31_optstats.log; then \
+	  echo "  --opt-stats prints the verified tail-call decisions: OK"; \
+	else \
+	  echo "FAIL: --opt-stats missing the tail-call decisions"; \
+	  cat $(BIN)/fib31_optstats.log; exit 1; \
+	fi
+	@echo "ACCEPTANCE OK: Stage 31 verified tail calls — fib_tail(1_000_000) runs without stack overflow"
+
+# tail-report: print the --opt-stats tail-call decisions for a file.
+# Usage: make tail-report F=examples/fibonacci.hls
+tail-report:
+	@test -n "$(F)" || (echo "Usage: make tail-report F=examples/fibonacci.hls" && false)
+	@test -x $(BIN)/hlc || $(MAKE) bootstrap
+	@$(BIN)/hlc --opt-stats $(F) /tmp/tail_out.c 2>&1 | sed -n '/=== opt-stats ===/,$$p'
 
 clean:
 	rm -rf $(BIN)

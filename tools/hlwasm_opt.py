@@ -190,6 +190,10 @@ OP_LOCAL_SET = 0x21
 OP_LOCAL_TEE = 0x22
 OP_GLOBAL_GET = 0x23
 OP_GLOBAL_SET = 0x24
+# Deep-scan-13: table.get / table.set (uleb table index immediate) —
+# used by the strict body walker (_walk_instrs).
+OP_TABLE_GET = 0x25
+OP_TABLE_SET = 0x26
 # Memory load/store ops (all have align + offset immediates).
 OP_I32_LOAD = 0x28
 OP_I64_LOAD = 0x29
@@ -539,6 +543,26 @@ def _scan_calls(body: bytes) -> List[int]:
         elif op in _MEM_OPS:
             _, pos = read_uleb(body, pos)  # align
             _, pos = read_uleb(body, pos)  # offset
+        elif op == 0xFC:
+            # Deep-scan-13 fix: bulk-memory / table instructions carry a
+            # sub-opcode + immediates (memory.copy = 0xFC 0x0A dst, src).
+            # The old walker fell through and misparsed the sub-opcode
+            # bytes as instructions — a latent parser bug that could
+            # mark arbitrary function indices as called (conservative
+            # over-retention, but still wrong).
+            sub, pos = read_uleb(body, pos)
+            if sub == 0x08:      # memory.init dst, src
+                _, pos = read_uleb(body, pos)
+                _, pos = read_uleb(body, pos)
+            elif sub in (0x09, 0x0B, 0x0D, 0x10, 0x12, 0x14, 0x15,
+                         0x16, 0x17):
+                # data.drop / memory.fill / table.copy / elem.drop etc.
+                _, pos = read_uleb(body, pos)
+            else:
+                # memory.copy (0x0A) and the table.init variants take
+                # TWO index immediates.
+                _, pos = read_uleb(body, pos)
+                _, pos = read_uleb(body, pos)
         # For all other ops we encounter (drop, end, return, etc.), there
         # are no immediates — the loop continues.
     return out
@@ -1003,6 +1027,363 @@ def _peephole_body(body: bytes) -> Tuple[bytes, int]:
 
 
 # ============================================================================
+# Deep-scan-13 (Stage 24 rework): structure-aware code + data passes.
+# ============================================================================
+# The old optimizer removed whole functions / imports / data segments
+# (DCE) but never looked INSIDE the surviving bodies or at the data
+# SEGMENT layout. Two new O3 passes close that gap:
+#
+#   opt_code_clean — a strict, structure-aware walk of each body:
+#     (1) `local.set X; local.get X` -> `local.tee X` (the get re-reads
+#         exactly what the set stored; tee stores and keeps the value);
+#     (2) `br 0` immediately before the `end` of a NON-loop frame -> drop
+#         (the branch targets exactly where control falls through);
+#     (3) a trailing top-level `return` -> drop (the implicit function
+#         `end` returns the stack top / void identically).
+#
+#   opt_data_merge — merge data segments that are contiguous in memory
+#     (or separated by a tiny gap) into ONE segment. The reference
+#     emitter lays out one segment per string constant, which costs
+#     ~6 bytes of segment header per string (159 strings in the Stage
+#     24 web app = ~950 bytes of pure overhead). Gap bytes are written
+#     as zeros — identical to the memory's initial state, so the
+#     observable content is unchanged.
+#
+# The walker is STRICT: any opcode it does not know aborts the pass
+# for that body (the original is kept). It can therefore never corrupt
+# a construct it does not understand — including the 0xFC (bulk
+# memory / reference-types) prefix instructions the emitter uses for
+# memory.copy, which the older _scan_calls walker silently misparsed
+# (a latent parser bug — fixed below).
+
+class _WalkError(Exception):
+    """Raised by _walk_instrs on an opcode the walker cannot parse."""
+
+
+_PLAIN_OPS = frozenset(
+    [0x00, 0x01, 0x0B, 0x0F, 0x1A, 0x1B, 0x05] +   # ctrl/plain
+    list(range(0x45, 0xC5)) +                      # numeric/comparison
+    [0xD0, 0xD1, 0xD2])                            # ref.* (not emitted)
+_VALTYPES = frozenset([0x7F, 0x7E, 0x7D, 0x7C, 0x7B, 0x70, 0x6F])
+
+
+def _walk_instrs(body: bytes):
+    """Yield (start, op, end, frames) for each instruction in `body`.
+
+    `start`/`end` are byte offsets (op at start, immediates up to end,
+    end-exclusive). `frames` is the tuple of control-frame kinds OPEN at
+    the point AFTER this instruction's opcode is consumed — used to
+    distinguish loop back-edges from fall-through branches.
+
+    Raises _WalkError on any opcode the walker cannot fully parse —
+    callers must treat that as "leave this body alone".
+    """
+    pos = 0
+    n = len(body)
+    frames: List[str] = []
+    while pos < n:
+        start = pos
+        op = body[pos]; pos += 1
+        if op in (OP_BLOCK, OP_LOOP, OP_IF):
+            # Block type: 0x40 (void) or a value type byte, or a
+            # POSITIVE sleb type index (multi-value blocks).
+            if pos >= n:
+                raise _WalkError("truncated blocktype")
+            bt = body[pos]
+            if bt == 0x40 or bt in _VALTYPES:
+                pos += 1
+            else:
+                while pos < n and (body[pos] & 0x80):
+                    pos += 1
+                pos += 1
+            frames.append("loop" if op == OP_LOOP else "block")
+            yield start, op, pos, tuple(frames)
+            continue
+        if op == OP_END:
+            if frames:
+                frames.pop()
+            yield start, op, pos, tuple(frames)
+            continue
+        if op == OP_ELSE:
+            # The else belongs to the innermost IF frame.
+            if not frames or frames[-1] != "block":
+                # An `if` also pushes a "block" frame; an `else` with no
+                # open block frame is malformed.
+                raise _WalkError("else without open if frame")
+            yield start, op, pos, tuple(frames)
+            continue
+        if op in _PLAIN_OPS:
+            yield start, op, pos, tuple(frames)
+            continue
+        if op == OP_CALL or op == OP_BR or op == OP_BR_IF \
+                or op == OP_LOCAL_GET or op == OP_LOCAL_SET \
+                or op == OP_LOCAL_TEE or op == OP_GLOBAL_GET \
+                or op == OP_GLOBAL_SET or op == OP_TABLE_GET \
+                or op == OP_TABLE_SET:
+            _, pos = read_uleb(body, pos)
+            yield start, op, pos, tuple(frames)
+            continue
+        if op == OP_CALL_INDIRECT:
+            _, pos = read_uleb(body, pos)
+            _, pos = read_uleb(body, pos)
+            yield start, op, pos, tuple(frames)
+            continue
+        if op == OP_BR_TABLE:
+            cnt, pos = read_uleb(body, pos)
+            for _ in range(cnt + 1):
+                _, pos = read_uleb(body, pos)
+            yield start, op, pos, tuple(frames)
+            continue
+        if op == OP_I32_CONST or op == OP_I64_CONST:
+            _, pos = read_sleb(body, pos)
+            yield start, op, pos, tuple(frames)
+            continue
+        if op == OP_F32_CONST:
+            pos += 4
+            yield start, op, pos, tuple(frames)
+            continue
+        if op == OP_F64_CONST:
+            pos += 8
+            yield start, op, pos, tuple(frames)
+            continue
+        if op in _MEM_OPS:
+            _, pos = read_uleb(body, pos)
+            _, pos = read_uleb(body, pos)
+            yield start, op, pos, tuple(frames)
+            continue
+        if op == 0x1C:  # select_t
+            cnt, pos = read_uleb(body, pos)
+            for _ in range(cnt):
+                pos += 1
+            yield start, op, pos, tuple(frames)
+            continue
+        if op == 0xFC:  # misc prefix (bulk memory / tables)
+            if pos >= n:
+                raise _WalkError("truncated 0xFC")
+            sub, pos = read_uleb(body, pos)
+            if sub == 0x08:      # memory.init dst, src
+                _, pos = read_uleb(body, pos)
+                _, pos = read_uleb(body, pos)
+            elif sub == 0x09:    # data.drop
+                _, pos = read_uleb(body, pos)
+            elif sub == 0x0A:    # memory.copy dst, src
+                _, pos = read_uleb(body, pos)
+                _, pos = read_uleb(body, pos)
+            elif sub == 0x0B:    # memory.fill
+                _, pos = read_uleb(body, pos)
+            elif sub in (0x0C, 0x0D, 0x0E, 0x0F, 0x10, 0x11, 0x12, 0x13,
+                         0x14, 0x15, 0x16, 0x17):
+                # table.init / table.copy / elem.drop variants
+                if sub in (0x0C, 0x0E, 0x0F, 0x11, 0x13, 0x15):
+                    _, pos = read_uleb(body, pos)
+                    _, pos = read_uleb(body, pos)
+                else:
+                    _, pos = read_uleb(body, pos)
+            else:
+                raise _WalkError("unknown 0xFC sub-opcode %d" % sub)
+            yield start, op, pos, tuple(frames)
+            continue
+        raise _WalkError("unknown opcode 0x%02x at %d" % (op, start))
+
+
+def opt_code_clean(mod: WasmModule, report: dict):
+    """Structure-aware body cleanup (see the module comment above)."""
+    saved = 0
+    for code in mod.codes:
+        try:
+            new_body, s = _clean_body(code.body)
+        except _WalkError:
+            # Unknown construct: leave the body untouched (never corrupt
+            # what we do not fully understand).
+            continue
+        saved += s
+        code.body = new_body
+    report["code_clean_saved"] = saved
+
+
+def _clean_body(body: bytes) -> Tuple[bytes, int]:
+    instrs = list(_walk_instrs(body))
+    if not instrs:
+        return body, 0
+    drop = set()          # instruction start offsets to remove
+    tee_set = set()       # local.set starts that become local.tee
+    for i, (start, op, end, frames) in enumerate(instrs):
+        # (1) local.set X; local.get X -> local.tee X
+        if op == OP_LOCAL_SET and i + 1 < len(instrs):
+            nstart, nop, nend, _ = instrs[i + 1]
+            if nop == OP_LOCAL_GET and body[start + 1:end] == body[nstart + 1:nend]:
+                # Replace the set with a tee and drop the get.
+                drop.add(nstart)
+                tee_set.add(start)
+                continue
+        if op == OP_BR:
+            depth, _ = read_uleb(body, start + 1)
+            if depth == 0 and i + 1 < len(instrs):
+                nstart, nop, nend, _ = instrs[i + 1]
+                if nop == OP_END and frames and frames[-1] != "loop":
+                    # (2) br 0 into the immediately following end of a
+                    # block/if frame: control falls through to exactly
+                    # the same place. (A loop frame would make br 0 a
+                    # BACK EDGE — never removed.)
+                    drop.add(start)
+    # (3) trailing top-level return: the last instruction of the body
+    # is a `return` with no open frames — the serializer's final `end`
+    # returns the stack top / void identically.
+    if instrs:
+        lstart, lop, lend, lframes = instrs[-1]
+        if lop == OP_RETURN and not lframes:
+            drop.add(lstart)
+    if not drop and not tee_set:
+        return body, 0
+    out = bytearray()
+    saved = 0
+    for start, op, end, _frames in instrs:
+        if start in drop:
+            saved += end - start
+            continue
+        if start in tee_set:
+            # local.set X -> local.tee X (0x21 -> 0x22, same immediates)
+            out.append(OP_LOCAL_TEE)
+            out += body[start + 1:end]
+            continue
+        out += body[start:end]
+    return bytes(out), saved
+
+
+def opt_data_merge(mod: WasmModule, report: dict):
+    """Merge data segments that are contiguous (or nearly so) in memory.
+
+    The reference emitter emits one active segment per string constant;
+    each costs a ~6-byte header (flags + i32.const offset + end + uleb
+    length). A 159-string program pays ~950 bytes of pure overhead for
+    what is semantically ONE contiguous data region. Merging keeps the
+    byte-for-byte memory content identical (small gaps are filled with
+    zeros, which is the memory's initial state — untouched gap bytes
+    are zeros too) while collapsing the headers.
+    """
+    if len(mod.data) <= 1:
+        report["data_segments_merged"] = 0
+        report["data_merge_saved"] = 0
+        return
+    segs = sorted(mod.data, key=lambda s: s.offset)
+    # Reject overlapping segments outright (never emitted; defensively
+    # keep the original if seen).
+    for i in range(len(segs) - 1):
+        if segs[i].offset + len(segs[i].data) > segs[i + 1].offset:
+            report["data_segments_merged"] = 0
+            report["data_merge_saved"] = 0
+            return
+    # Merge a gap only when filling it with zeros is cheaper than the
+    # ~7-byte header (offset sleb + length uleb + flags) a separate
+    # segment would cost.
+    GAP_LIMIT = 6
+    merged: List[DataSegment] = []
+    cur_off = segs[0].offset
+    cur_data = bytearray(segs[0].data)
+    for seg in segs[1:]:
+        gap = seg.offset - (cur_off + len(cur_data))
+        if gap <= GAP_LIMIT:
+            cur_data += b"\x00" * gap
+            cur_data += seg.data
+        else:
+            merged.append(DataSegment(cur_off, bytes(cur_data)))
+            cur_off = seg.offset
+            cur_data = bytearray(seg.data)
+    merged.append(DataSegment(cur_off, bytes(cur_data)))
+    # Exact byte accounting from the serialized form.
+    def _sec_bytes(segs):
+        n = 1  # count uleb
+        for s in segs:
+            n += 1 + 1 + len(sleb(s.offset)) + 1 + len(uleb(len(s.data))) + len(s.data)
+        return n
+    before_bytes = _sec_bytes(segs)
+    after_bytes = _sec_bytes(merged)
+    report["data_segments_merged"] = len(segs) - len(merged)
+    report["data_merge_saved"] = max(0, before_bytes - after_bytes)
+    mod.data = merged
+
+
+def _uses_bulk_data_ops(mod: WasmModule) -> Optional[bool]:
+    """True if any body uses memory.init (0xFC 0x08) or data.drop
+    (0xFC 0x09) — the two instructions that REQUIRE a DataCount section.
+    False if definitively not. None if a body cannot be parsed (the
+    caller keeps the DataCount section — conservative)."""
+    for code in mod.codes:
+        try:
+            instrs = list(_walk_instrs(code.body))
+        except _WalkError:
+            return None
+        for start, op, end, _frames in instrs:
+            if op == 0xFC:
+                sub, _ = read_uleb(code.body, start + 1)
+                if sub == 0x08 or sub == 0x09:
+                    return True
+    return False
+
+
+def opt_dead_types(mod: WasmModule, report: dict):
+    """Remove type-section entries no longer referenced after DCE.
+
+    DCE may remove every function of a signature, leaving the type in
+    the type section. Removing it requires renumbering every type
+    reference: imports (kind 0), the function section, and the
+    call_indirect immediates inside bodies. Two-phase: build the full
+    plan first, apply only if every body parses (an unknown construct
+    aborts the whole pass — indices must stay consistent everywhere).
+    """
+    n_imports = len(mod.imports)
+    referenced: Set[int] = set()
+    for imp in mod.imports:
+        if imp.kind == 0:
+            referenced.add(imp.type_idx)
+    for tidx in mod.funcs:
+        referenced.add(tidx)
+    # call_indirect type indices from every body.
+    patches: List[Tuple[int, int, int, int]] = []  # (code idx, instr start, old, new)
+    for ci, code in enumerate(mod.codes):
+        try:
+            instrs = list(_walk_instrs(code.body))
+        except _WalkError:
+            report["dead_types_removed"] = 0
+            return
+        for start, op, end, _frames in instrs:
+            if op == OP_CALL_INDIRECT:
+                tidx, _ = read_uleb(code.body, start + 1)
+                referenced.add(tidx)
+    live = sorted(t for t in referenced if 0 <= t < len(mod.types))
+    if len(live) == len(mod.types):
+        report["dead_types_removed"] = 0
+        return
+    remap = {old: new for new, old in enumerate(live)}
+    # Phase 2: apply. Body rewrites need the walker again (same result).
+    for ci, code in enumerate(mod.codes):
+        try:
+            instrs = list(_walk_instrs(code.body))
+        except _WalkError:
+            # Should not happen (phase 1 walked the same bodies).
+            report["dead_types_removed"] = 0
+            return
+        out = bytearray()
+        for start, op, end, _frames in instrs:
+            if op == OP_CALL_INDIRECT:
+                tidx, rest = read_uleb(code.body, start + 1)
+                tbl, _ = read_uleb(code.body, rest)
+                out.append(OP_CALL_INDIRECT)
+                out += uleb(remap.get(tidx, tidx))
+                out += uleb(tbl)
+            else:
+                out += code.body[start:end]
+        code.body = bytes(out)
+    for imp in mod.imports:
+        if imp.kind == 0:
+            imp.type_idx = remap.get(imp.type_idx, imp.type_idx)
+    n_before = len(mod.types)
+    mod.funcs = [remap.get(t, t) for t in mod.funcs]
+    mod.types = [mod.types[t] for t in live]
+    report["dead_types_removed"] = n_before - len(mod.types)
+
+
+# ============================================================================
 # Serialization — turn the optimized module back into wasm bytes.
 # ============================================================================
 
@@ -1094,8 +1475,10 @@ def serialize(mod: WasmModule) -> bytes:
     # Start section.
     if mod.start is not None:
         out += section(SEC_START, uleb(mod.start))
-    # DataCount (must precede Code section when Data is present).
-    if mod.data:
+    # DataCount (must precede Code section when Data is present; only
+    # REQUIRED when memory.init / data.drop are used — see the
+    # bulk-memory proposal. optimize() sets mod.emit_datacount).
+    if getattr(mod, "emit_datacount", True):
         out += section(SEC_DATA_COUNT, uleb(len(mod.data)))
     # Code section.
     if mod.codes:
@@ -1150,13 +1533,31 @@ def optimize(wasm_bytes: bytes, level: str = "O3",
     # O1: DCE + local compaction.
     opt_dce(mod, report)
     opt_local_compact(mod, report)
-    # O2: type dedup + dead data.
+    # O2: type dedup + dead data + data-segment merging.
     if level in ("O2", "O3", "Os"):
         opt_type_dedup(mod, report)
         opt_dead_data(mod, report)
-    # O3: peephole opts.
+        # Deep-scan-13: merge contiguous data segments (one active
+        # segment per string constant is ~6 bytes of header each; the
+        # Stage 24 web app paid ~950 bytes for a single contiguous
+        # region).
+        opt_data_merge(mod, report)
+    # O3: peephole + structure-aware code cleanup.
     if level in ("O3", "Os"):
         opt_peephole(mod, report)
+        # Deep-scan-13: local.set/get -> tee, redundant br-0-into-end,
+        # trailing returns.
+        opt_code_clean(mod, report)
+        # Deep-scan-13: dead type-section entries after DCE (with full
+        # index remapping across imports / funcs / call_indirect).
+        opt_dead_types(mod, report)
+    # Deep-scan-13: the DataCount section is only REQUIRED for
+    # memory.init / data.drop (bulk-memory proposal). Our emitter's
+    # memory.copy does not need it; drop the 3-byte section when the
+    # bodies provably never use those two instructions. Conservative:
+    # any unparseable body keeps the section. (With no data segments at
+    # all there is nothing to count either.)
+    mod.emit_datacount = bool(mod.data) and (_uses_bulk_data_ops(mod) is not False)
     # Serialize.
     optimized = serialize(mod)
     # Run the external wasm-opt if available.

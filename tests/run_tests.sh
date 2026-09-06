@@ -717,6 +717,7 @@ if "$TMP/hlc1" --target-feature avx2 benchmarks/simd_bench.hls "$TMP/s21b.c" >/d
             ok "simd-bench: acceptance ratio >= 2x ($ratio_line)"
         else
             bad "simd-bench: acceptance ratio below 2x"
+            grep -E "time = |RATIO" "$TMP/s21b.out" | tail -3
         fi
     else
         echo "  [SKIP] host CPU has no AVX2 — timing gate skipped (checksum still verified)"
@@ -975,7 +976,13 @@ fi
 if command -v node >/dev/null 2>&1; then
     interp_out=$(python3 boot/boot.py "$WASM_F" </dev/null 2>/dev/null)
     if python3 tools/hlwasm.py "$WASM_F" "$TMP/hello_wasm2" --run >"$TMP/wasm_run.out" 2>&1; then
-        wasm_out=$(grep -v '^wrote ' "$TMP/wasm_run.out" | grep -v '^note:')
+        # Deep-scan-13 fix: also filter the 'wasm-opt: N -> M bytes' info
+        # line — it goes to stderr (merged by 2>&1) and is printed ONLY
+        # when the in-tree optimizer actually saves bytes. On machines
+        # without the optimizer active the test passed; with it active
+        # the info line polluted the comparison and failed the suite
+        # (CI red on main since the Stage 24 work landed).
+        wasm_out=$(grep -v '^wrote ' "$TMP/wasm_run.out" | grep -v '^note:' | grep -v '^wasm-opt: ')
         if [ "$interp_out" == "$wasm_out" ]; then
             ok "wasm: hello.hls wasm output == interpreter (byte-identical)"
         else
@@ -998,7 +1005,13 @@ extern "js" {
 }
 fn main() -> int uses IO {
     js_alert("hello")
-    return 0
+    # Deep-scan-13 fix: CALL js_random too — the wasm-opt dead-import
+    # elimination correctly removes an import that is never used, so
+    # the old test (only js_alert called) lost js_random from the
+    # import section and the presence assertion failed. Both imports
+    # live now; the test checks what it always meant to check.
+    let r: int = js_random() % 2
+    return r
 }
 HLS_EOF
 if python3 boot/boot.py --check "$TMP/test_jsffi.hls" >/dev/null 2>&1; then
@@ -1769,6 +1782,135 @@ if python3 boot/boot.py src/hlc.hls src/hlc.hls "$TMP/hlc_s30.c" >/dev/null 2>&1
     ok "stage30: bootstrap deterministic with Stage 30 changes"
 else
     bad "stage30: bootstrap not deterministic with Stage 30 changes"
+fi
+
+echo ""
+echo "=== 17. Stage 31: verified tail calls (#[tail_call]) ==="
+
+# (a) the feature matrix runs via the interpreter (fast depths).
+if s31out=$(python3 boot/boot.py tests/ok/feat_stage31_tail.hls 2>&1); then
+    if echo "$s31out" | grep -q "fib_tail(10000) = 271496360" \
+        && echo "$s31out" | grep -q "collatz_steps(27) = 111" \
+        && echo "$s31out" | grep -q "sum_tail(50000, 0) = 1250175003"; then
+        ok "stage31: feature matrix (fib / collatz / float / bool / while / panic-literal) via boot"
+    else
+        bad "stage31: feature matrix produced wrong values"
+        echo "$s31out" | head -5
+    fi
+else
+    bad "stage31: feature matrix failed to run"
+fi
+
+# (b) the C source has the loop label + the rebind goto and ZERO
+#     recursive calls in usf_fib_tail (a jmp, not a call).
+if "$TMP/hlc1" tests/ok/feat_stage31_tail.hls "$TMP/s31.c" >/dev/null 2>&1; then
+    if grep -q "^hl_tail_restart:;" "$TMP/s31.c" \
+        && grep -q "goto hl_tail_restart;" "$TMP/s31.c" \
+        && [ "$(awk '/^int64_t usf_fib_tail\(int64_t u_n_p/,/^}$/' "$TMP/s31.c" \
+            | grep -c 'usf_fib_tail(')" -le 1 ]; then
+        ok "stage31: C source lowers the tail call to a parameter-rebinding goto"
+    else
+        bad "stage31: the tail-call transform is missing from the C source"
+    fi
+else
+    bad "stage31: native hlc failed to compile the feature matrix"
+fi
+
+# (c) native + differential: the tail test's outputs match the
+#     interpreter's byte for byte (already covered by section 3's
+#     differential loop; this re-states it for the section report).
+nat31=$("$TMP/hlc1" tests/ok/feat_stage31_tail.hls "$TMP/s31b.c" >/dev/null 2>&1 \
+    && gcc -O2 -o "$TMP/s31.bin" "$TMP/s31b.c" -lm -pthread 2>/dev/null \
+    && "$TMP/s31.bin" 2>/dev/null)
+if [ "$nat31" == "$s31out" ]; then
+    ok "stage31: differential (native tail loop == interpreter trampoline)"
+else
+    bad "stage31: differential mismatch"
+    diff <(echo "$s31out") <(echo "$nat31") | head -4
+fi
+
+# (d) constant stack: the native binary runs 1M-deep under a 1 MB
+#     stack (a real 1M call chain needs ~48 MB).
+if bash -c "ulimit -s 1024; '$TMP/s31.bin' >/dev/null 2>&1"; then
+    ok "stage31: native tail recursion under ulimit -s 1024 (1 MB stack)"
+else
+    bad "stage31: native binary blew the 1 MB stack limit"
+fi
+
+# (e) the interpreter trampoline runs deep with zero Python recursion.
+cat > "$TMP/s31_trampoline.py" <<'PYEOF31'
+import sys
+sys.path.insert(0, ".")
+sys.setrecursionlimit(200)  # a 100k tail depth must NOT need Python frames
+from boot.boot import load_program
+from boot.checker import check
+from boot.interp import Interp
+import io
+prog = load_program("tests/ok/feat_stage31_tail.hls")
+check(prog)
+interp = Interp(prog, [b"tests/ok/feat_stage31_tail.hls"], io.BytesIO())
+r = interp.call_fn("fib_tail", [100000, 0, 1])
+assert r == 911435502, r
+print("trampoline ok at depth 100000 with recursionlimit 200")
+PYEOF31
+if python3 "$TMP/s31_trampoline.py" >/dev/null 2>&1; then
+    ok "stage31: interpreter trampoline, 100k deep under recursionlimit 200"
+else
+    bad "stage31: interpreter trampoline failed (RecursionError?)"
+fi
+
+# (f) the verifier rejects every fail_tail_call_* program (boot + native).
+s31fail=0
+for f in tests/fail/fail_tail_call_*.hls; do
+    if ! python3 boot/boot.py --check "$f" >/dev/null 2>&1; then
+        s31fail=$((s31fail+1))
+    else
+        bad "stage31: $(basename $f) was NOT rejected by the boot checker"
+    fi
+done
+if [ $s31fail -eq 13 ] && [ -x "$TMP/hlc1" ]; then
+    n31fail=0
+    for f in tests/fail/fail_tail_call_*.hls; do
+        if ! "$TMP/hlc1" "$f" "$TMP/s31f.c" >/dev/null 2>&1; then
+            n31fail=$((n31fail+1))
+        else
+            bad "stage31: $(basename $f) was NOT rejected by the native compiler"
+        fi
+    done
+    if [ $n31fail -eq 13 ]; then
+        ok "stage31: all 13 fail_tail_call_* programs rejected (boot + native)"
+    fi
+elif [ $s31fail -eq 13 ]; then
+    ok "stage31: all 13 fail_tail_call_* programs rejected by the boot checker"
+fi
+
+# (g) --opt-stats prints the verified tail-call decisions.
+if "$TMP/hlc1" --opt-stats examples/fibonacci.hls "$TMP/s31os.c" >/dev/null 2>&1 \
+    && "$TMP/hlc1" --opt-stats examples/fibonacci.hls "$TMP/s31os.c" 2>&1 \
+        | grep -q "verified tail calls (Stage 31)"; then
+    ok "stage31: --opt-stats prints the verified tail-call table"
+else
+    bad "stage31: --opt-stats missing the tail-call table"
+fi
+
+# (h) hllint L012 fires on a large #[tail_call] fn and not on small ones.
+if [ "$(python3 tools/hllint.py tests/ok/feat_stage31_tail.hls 2>/dev/null | grep -c 'L012')" -eq 0 ]; then
+    ok "stage31: hllint L012 silent on small #[tail_call] functions"
+else
+    bad "stage31: hllint L012 false positive on small functions"
+fi
+
+# (i) make tail-acceptance runs end-to-end.
+if make tail-acceptance >"$TMP/s31_acc.log" 2>&1; then
+    if grep -q "ACCEPTANCE OK" "$TMP/s31_acc.log"; then
+        ok "stage31: make tail-acceptance runs end-to-end"
+    else
+        bad "stage31: make tail-acceptance did not print ACCEPTANCE OK"
+        tail -5 "$TMP/s31_acc.log"
+    fi
+else
+    bad "stage31: make tail-acceptance failed"
+    tail -10 "$TMP/s31_acc.log"
 fi
 
 echo ""

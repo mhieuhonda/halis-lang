@@ -217,7 +217,11 @@ def _z3_verdicts_py(path):
     except ImportError:
         return None
     import z3 as z
-    text = open(path).read()
+    # Deep-scan-13 fix: close the SMT transcript file deterministically
+    # (the old bare open() relied on CPython's refcount GC — a resource
+    # leak on PyPy and a ResourceWarning under -W error).
+    with open(path) as f:
+        text = f.read()
     # Split on (reset): each segment is an independent set of commands.
     segments = [seg.strip() for seg in text.split("(reset)") if seg.strip()]
     verdicts = []

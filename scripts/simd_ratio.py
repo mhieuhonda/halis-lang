@@ -18,7 +18,10 @@ def main() -> int:
     ap.add_argument("--min", type=float, default=2.0)
     args = ap.parse_args()
 
-    text = open(args.out).read()
+    # Deep-scan-13 fix: deterministic close (the old bare open() relied
+    # on CPython's refcount GC).
+    with open(args.out) as f:
+        text = f.read()
     m_s = re.search(r"scalar\s+time = (\d+) ms", text)
     m_v = re.search(r"vector\s+time = (\d+) ms", text)
     if not m_s or not m_v:

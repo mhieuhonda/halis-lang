@@ -13,6 +13,166 @@ stability (125–140), and final stabilisation toward v1.0 (141–150).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
+## [v0.48.0-alpha] — Stage 31: tail-call optimisation (verified)
+
+> Completes **Stage 31** of the roadmap: `#[tail_call]` — the first
+> optimisation whose enabling condition is a *proof obligation*. The
+> attribute asserts that every recursive call to the function is in
+> verified tail position; the compiler then lowers the recursion to a
+> parameter-rebinding `goto` — **a jmp, not a call — so stack usage is
+> constant regardless of recursion depth**: `fib_tail(1_000_000)` uses
+> the same stack as `fib_tail(1)`. "Verified" is mechanical, not
+> aspirational: the checker proves (1) *position* — every self-call is
+> the entire `return f(...)` expression, and (2) *no cleanup* — the
+> body flows only `int` / `float` / `bool` values, so nothing between
+> the (transformed) call and the function entry needs release. Both
+> backends transform: the native C backend emits the loop
+> (`hl_tail_restart:` label + temps-then-rebind + `goto`), and the
+> Stage-0 interpreter mirrors it as a **trampoline** (`TailCallSig` →
+> parameter rebind → re-run in the same Python frame) — 1M-deep tail
+> recursion costs ZERO Python recursion. The acceptance gate runs
+> `fib_tail(1_000_000)` natively under `ulimit -s 1024` (a 1 MB stack,
+> while a 1M call chain needs ~48 MB) and in the interpreter, with
+> byte-identical output.
+
+> - **Parser** (`src/hlc.hls`, `boot/parser.py`): `#[tail_call]` is a
+>   function attribute, accepted alone or combined with the Stage
+>   28–30 attributes. Order-independent mutual exclusions, caught at
+>   parse time: `tail_call` + `irq_handler` (an interrupt frame must
+>   return via IRETQ, never jump) and `tail_call` + `inline(always)`
+>   (a loop cannot also be inlined at every call site). Placing it
+>   before a `let` gets a placement error pointing at the fn form.
+>   `FnInfo` grows `attr_tail_call`.
+> - **Verifier** (`src/hlc.hls` ~250 new lines, `boot/checker.py`
+>   ~200): `tail_check_fn` runs as phase 5.6 of `check_program` (after
+>   the bodies are checked — it reads the expression types and call
+>   tags). It enforces: plain fn only (not generic, not a method, not
+>   extern); no contracts (the ensures check would interpose cleanup);
+>   every parameter and the return type are `int` / `float` / `bool`;
+>   every self-call is the entire return expression; every `let` and
+>   every expression in the body is primitive-typed, with exactly one
+>   exception — a string LITERAL as the direct argument of
+>   `panic` / `print` / `println` (consume-builtins: transferred, never
+>   hoisted, never bound — provably cleanup-free at the jump); at
+>   least one self-call exists. Every violation is a compile error
+>   naming the line and the reason. The boot checker mirrors the rules
+>   and the messages exactly, so `boot.py --check` and `hlc` reject
+>   precisely the same programs.
+> - **Codegen** (`src/hlc.hls` ~90 new lines): `gen_fn_body` emits
+>   `hl_tail_restart:;` after the parameter locals / PGO entry counter
+>   / requires check — those run once per REAL entry, so the PGO
+>   profile keeps counting function entries, not loop iterations.
+>   `gen_tail_jump` lowers each verified site: evaluate the argument
+>   expressions into fresh temps left-to-right (a call's exact
+>   evaluation order — side effects and panics in source order), then
+>   rebind the parameter locals (plain copies — no refcounts, no
+>   aliasing, guaranteed by the verifier), then `goto`. The return
+>   handler consults `ctx.tail_label`, cleared per function (an LTO
+>   inline clone can never see a stale label). `lto_can_inline` never
+>   inlines a `#[tail_call]` fn — the label would be duplicated across
+>   inline clones, and the loop would regress to call machinery; the
+>   exclusion also keeps `lto_calls[key] >= 1`, so phase-B DCE can
+>   never drop the standalone body containing the loop.
+> - **Interpreter trampoline** (`boot/interp.py` ~70 new lines): the
+>   return handler raises `TailCallSig(key, args)` for a verified tail
+>   self-call; `call_fn` catches it, rebinds the parameters and re-runs
+>   the body in the SAME Python frame. The current-fn key lives on the
+>   same `threading.local` as the panic `line` number — created
+>   lazily for task threads, so `spawn` / channels / actor programs
+>   are unaffected (all concurrency tests re-run green). A defensive
+>   foreign-key path degrades to a normal call.
+> - **`--opt-stats`** (`src/hlc.hls`): `#[tail_call]` tally with
+>   verified-site count, `tail(N)` in the per-function frame column,
+>   and a dedicated `verified tail calls (Stage 31)` table (sites /
+>   params / ret / constant stack). `make tail-report F=...` prints it.
+> - **Examples** (`examples/fibonacci.hls`): `#[tail_call]
+>   fn fib_tail(n, a, b)` — the accumulator form mod 1e9+7 (exact
+>   modular arithmetic, no overflow). Default depth 100,000 keeps the
+>   differential suite fast; a CLI argument overrides it
+>   (`./fibonacci 1000000` — the roadmap's literal acceptance depth).
+>   All Stage 30 outputs are unchanged (escape-acceptance intact).
+> - **Tests** (`tests/`): `tests/ok/feat_stage31_tail.hls` — the
+>   feature matrix through BOTH backends: `fib_tail` (int accumulator,
+>   10,000 deep), `collatz_steps` (TWO verified tail sites — multiple
+>   return branches), `geo_tail` (float), `parity_tail` (bool),
+>   `sum_tail` (a `while` loop coexisting with the tail loop + `mut`
+>   param, 50,000 deep), `guarded_tail` (panic-literal guard). 13 new
+>   `tests/fail/fail_tail_call_*.hls` programs: non-tail position,
+>   let-bound call, owned parameter, owned let, no recursion, generic,
+>   method, contract, void return, computed panic argument,
+>   let misplacement, irq_handler conflict, inline(always) conflict.
+> - **Acceptance** (`make tail-acceptance`): (a) the C source contains
+>   the label + the parameter-rebinding goto and ZERO recursive calls
+>   in `usf_fib_tail`; (b) native `fib_tail(1_000_000)` = 918091266,
+>   computed independently by Python fast-doubling; (c) the same 1M
+>   run under `ulimit -s 1024` (1 MB stack — constant-stack proof);
+>   (d) the interpreter at the same depth with no `RecursionError`;
+>   (e) byte-identical differential output; (f) a non-tail self-call
+>   is rejected by the native compiler; plus the `--opt-stats` table.
+> - **Docs**: SPEC.md §30 (verified tail calls — the two verified
+>   properties, the C transform, the trampoline, PGO/LTO
+>   interactions, acceptance); ROADMAP.md Stage 31 marked complete
+>   with implementation notes.
+### Deep-scan-13 — CI-green fixes (pre-existing failures on `main`)
+
+> CI was RED on `main` (all recent runs, 6 failures per matrix leg)
+> before this release. All six reproduced locally, verified to fail
+> identically on the pre-Stage-31 code, and are now FIXED:
+
+> - **wasm output comparison polluted by the optimizer info line**
+>   (`wasm: hello.hls wasm output differs from interpreter` +
+>   `make wasm-acceptance failed`): the `wasm-opt: N -> M bytes`
+>   progress line goes to stderr, and both gates capture stderr
+>   (`2>&1`) — on machines where the in-tree optimizer saves bytes,
+>   the info line leaked into the OUTPUT comparison and failed the
+>   gate's byte-for-byte check. Both filters (run_tests.sh + the
+>   Makefile gate) now also drop `^wasm-opt: ` lines.
+> - **stale extern-"js" import test** (`extern "js" imports not found
+>   in wasm`): the test called only `js_alert`, so the wasm-opt
+>   dead-import elimination correctly removed the never-called
+>   `js_random` import — and the presence assertion then failed. The
+>   test now calls both imports (testing what it always meant to
+>   test).
+> - **wasm-opt reduction below the 30% gate (22.2%)** (`wasm24:` +
+>   `make webapp-acceptance failed`): the in-tree optimizer never
+>   looked INSIDE surviving function bodies or at the data SEGMENT
+>   layout. Four new passes close that gap (all semantics-preserving,
+>   with a strict structure-aware walker that refuses to touch bodies
+>   containing opcodes it cannot fully parse):
+>   `opt_data_merge` — contiguous data segments merged into one (the
+>   emitter emitted one ~6-byte-header segment per string constant:
+>   159 strings = ~950 bytes of pure overhead for one contiguous
+>   region; small gaps are zero-filled — the memory's initial
+>   state); `opt_code_clean` — `local.set X; local.get X` ->
+>   `local.tee X`, `br 0` into the immediately following non-loop
+>   `end` dropped (a loop frame would make it a back edge — never
+>   removed), trailing top-level `return` dropped (the implicit
+>   function `end` returns identically); `opt_dead_types` — dead
+>   type-section entries after DCE, with full index remapping across
+>   imports / the function section / call_indirect immediates; the
+>   DataCount section is dropped when the bodies provably never use
+>   memory.init / data.drop (memory.copy does not need it). Result:
+>   13570 -> 9488 bytes, **30.1% reduction** (gate: >= 30%), and the
+>   hello binary shrinks 488 -> 419 bytes.
+> - **latent wasm body-walker parser bug**: `_scan_calls` did not
+>   handle the 0xFC (bulk memory) prefix — `memory.copy`'s sub-opcode
+>   and immediates were misparsed as instructions, marking arbitrary
+>   function indices as called (conservative over-retention in DCE,
+>   still wrong). Now parsed correctly.
+> - **simd 2x gate flake** (`simd-bench: acceptance ratio below 2x`):
+>   a single 12-iteration timing window wobbles below 2.0 on shared
+>   CI runners (measured exactly 2.0x quiet, 1.9x under scheduler
+>   jitter). The benchmark now reports the MINIMUM over 5 interleaved
+>   rounds per side — the standard noise-free microbenchmark estimate
+>   (preemption only ever ADDS time, so min() converges on the true
+>   cost). Three consecutive local runs now report identical timings
+>   (105 ms / 49 ms = 2.14x).
+> - **resource hygiene**: `tools/hlprove.py` and
+>   `scripts/simd_ratio.py` read files via bare `open()` without a
+>   close (relies on CPython refcount GC; a leak under PyPy and a
+>   ResourceWarning under `-W error`) — both now use `with`.
+
+
 ## [v0.47.0-alpha] — Stage 30: boxed-vs-stack layout analysis (escape analysis)
 
 > Completes **Stage 30** of the roadmap: escape analysis for `list[T]`
