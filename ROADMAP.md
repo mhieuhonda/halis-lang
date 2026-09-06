@@ -3007,6 +3007,201 @@ work. Deep-scan-14 closes Stage 31 with the gate GREEN everywhere:
    the standard differential sections. Full local suite: **773
    PASS / 0 FAIL**.
 
+### Stage 31 perfection (v0.48.2-alpha) — deep-scan-15
+
+Deep-scan-14 closed Stage 31 with the SIMD acceptance gate GREEN on
+every CI matrix job. The deep-scan-15 pass returns to the broader
+codebase and audits every backend + the self-hosted compiler for
+latent bugs the Stage-31 work surfaced but did not need to fix. Four
+parallel reviewers (boot/, tools/, std/+examples/, src/hlc.hls)
+flagged 22 candidate defects; 13 survived verification as real bugs.
+The closure: **all 13 fixed, 5 new regression tests, full local
+suite 779 PASS / 0 FAIL** (was 773, +6 deep-scan-15 tests).
+
+1. **wasm `hl_str_to_int` sign-flag corruption (HIGH, silent
+   miscompile).** The decoder reused local 4 (the sign flag) as a
+   scratch slot via `OP_LOCAL_TEE 4` inside the digit loop. The
+   `tee` WRITES local 4 with the byte/digit value, silently
+   corrupting the sign flag — the subsequent `OP_DROP` only removes
+   the stack copy, NOT the local write. For inputs ending in `'0'`
+   (`"-10"`, `"-100"`, `"-120"`), local 4 ended at 0 (false) and the
+   `if negative: result = -result` branch was skipped, parsing
+   `"-10"` → `10`. Fix: dedicated 5th local for the digit scratch
+   (preserves the sign flag across the loop); also added the
+   previously-omitted digit range check (`0x30 <= byte <= 0x39`).
+
+2. **wasm `hl_int_to_str` INT64_MIN garbage output (MEDIUM).** The
+   loop used signed `i64.div_s` / `i64.rem_s` for digit extraction.
+   After `if negative: n = 0 - n`, the wraparound on INT64_MIN
+   leaves n unchanged (0 - INT64_MIN = INT64_MIN in two's
+   complement). The signed modulo then yields `-8` (a negative
+   digit), producing a stream of garbage characters instead of
+   `"-9223372036854775808"`. Fix: switch to `i64.div_u` / `i64.rem_u`
+   — the bit pattern after the (wrapped) `0 - n` is the correct
+   absolute value when reinterpreted as unsigned, and unsigned
+   div/rem gives identical results to signed for non-negative
+   inputs. The native C runtime already used `snprintf("%PRId64",
+   v)` (correct); the interpreter used Python's `str()` (also
+   correct); only the wasm path diverged.
+
+3. **wasm `hl_int_abs` INT64_MIN silent wrong answer (MEDIUM).** The
+   `0 - n` wraparound on INT64_MIN returns INT64_MIN, so `abs` of
+   the most-negative int returned itself instead of trapping. The C
+   runtime panics with "integer overflow"; the interpreter raises
+   HLPanic; only the wasm path silently produced wrong values. Fix:
+   add an `i64.eq INT64_MIN` check that emits `OP_UNREACHABLE` (a
+   wasm trap) — matching the native panic semantics.
+
+4. **wasm `_lower_method` format-string crash (HIGH, latent).** The
+   error path raised `HLError("user-defined methods are not yet
+   supported by --emit wasm (Stage 23-alpha subset; only builtin
+   methods like .to_str() and .len() are supported)" % e.get("name",
+   ""))` — but the format string has NO `%s` placeholder. At runtime
+   this raised `TypeError: not enough arguments for format string`
+   (Python) instead of the clean HLError the caller expected. Fix:
+   add the `%s` so the offending method name is named in the message
+   (which was the original intent of fetching it).
+
+5. **LLVM `_coerce` argument swap (MEDIUM, latent).** The match-arm
+   result coercion `self._coerce(arm_result_val, arm_result_ty,
+   llvm_ret_ty)` had args 1 and 2 swapped relative to the function
+   signature `(val_ty, val, want_ty)`. All other 17 call sites in
+   the file used the correct order; this one diverged, silently
+   mis-dispatching every defensive coercion (the i1/i64/double/ptr
+   branch never matched because `val_ty` received the value string).
+   Fix: swap back to the documented order.
+
+6. **`std/bits.hls` `bits_not(INT64_MIN)` panic (HIGH).** The
+   `0 - x - 1` identity overflowed checked arithmetic (|INT64_MIN| >
+   INT64_MAX). The XOR identity `~x = x ^ -1` produces the same
+   result without arithmetic negation, so it never overflows.
+   Verified: `bits_not(INT64_MIN)` now returns INT64_MAX (matching
+   `bits_xor(INT64_MIN, -1)`).
+
+7. **`std/bits.hls` `bits_from_bytes_be/le` INT64_MIN panic
+   (HIGH).** The accumulator `r = r * 256 + b` overflowed at the
+   final iteration whenever the result would have bit 63 set
+   (e.g. `[128, 0, 0, 0, 0, 0, 0, 0]` should give INT64_MIN). The
+   new implementation uses `bits_set(r, bit_pos, 1)` to set
+   individual bits via `bits_pow2(k)` (which special-cases bit 63 =
+   INT64_MIN, avoiding the overflow). Round-trip with the existing
+   `bits_bytes_be` is preserved.
+
+8. **`std/quickcheck.hls` `qc_int_range` overflow panic (MEDIUM).**
+   The original `hi - lo + 1` overflowed int64 for wide ranges
+   (e.g. `qc_int_range(0, INT64_MAX)` was a one-line panic). The
+   new implementation detects the would-overflow case by examining
+   signs (no subtraction needed for the check itself), special-cases
+   `lo == INT64_MIN` (whose `0 - lo` would itself overflow), and
+   falls back to a full-range draw via the `qc_int` path with
+   sign-aware output (positive-only for one-sided ranges,
+   both-signs for crossing-zero ranges).
+
+9. **`std/url.hls` empty-port inconsistency (MEDIUM).** The IPv6
+   path panicked on `http://[::1]:` but the non-IPv6 path silently
+   left port=0 on `http://host:/` — same input shape, opposite
+   behavior. Both paths now panic uniformly.
+
+10. **`std/html.hls` XSS hardening for tag name + attribute keys
+    (MEDIUM).** `html_tag` escaped attribute VALUES but interpolated
+    the attribute KEY and the tag NAME verbatim — a user-controlled
+    key like `onmouseover="alert(1)"` produced valid HTML with an
+    injected event handler. New `_html_validate_name` enforces
+    `[A-Za-z][A-Za-z0-9_-]*` for both, panicking on any whitespace,
+    quote, equals, or angle bracket.
+
+11. **`hls-pkg` silent `git checkout main` fallback (MEDIUM, supply
+    chain).** The dependency fetcher fell back to `git checkout main`
+    if the declared `tag`/`branch` failed — a moved tag, a
+    force-pushed branch, or a typo would silently fetch the WRONG
+    code (the maintainer's main HEAD, possibly compromised since
+    the lockfile was written). Now raises a clean RuntimeError
+    naming the unreachable ref.
+
+12. **`hls-pkg` transparency-log fork under concurrent publishes
+    (MEDIUM, supply chain).** The append-only log read
+    `prev_hash` → computed new record → appended, all without a
+    lock. Two concurrent `hls-pkg publish` invocations both read the
+    same `prev_hash`, both chained from it, both appended — forking
+    the chain (verification would then flag one as a rollback). New
+    `_acquire_exclusive_lock` / `_release_exclusive_lock` helpers
+    hold a cross-platform `flock`/`msvcrt.locking` on a sidecar
+    `.lock` file for the whole critical section.
+
+13. **LSP `shutdown` spec violation (LOW).** Per LSP base protocol,
+    the server must NOT process any request except `exit` after a
+    `shutdown`. The previous implementation processed every method
+    regardless of state; a misbehaving client could keep the server
+    busy post-shutdown. Now rejects every non-`exit` request with
+    error code -32600 (InvalidRequest).
+
+14. **`src/hlc.hls` match-AST catch-all in 4 tree-walkers
+    (MEDIUM-HIGH, soundness).** `tail_check_expr`,
+    `lto_expr_has_qmark`, `exprs_have_elisions`, and `annotate_exprs`
+    each walked `n.args` as if every entry were a child expression
+    index. For a `match` node, `n.args` is a list of arm INDICES
+    (into `ctx.match_arms`) — small integers like 0, 1, 2 — NOT
+    expression indices. Walking them as expressions either crashed
+    (out-of-bounds), or worse, silently walked UNRELATED
+    expressions (when the arm index happened to be a valid
+    `ctx.exprs` slot). The arm bodies are walked separately via the
+    `MatchArm` table; the fix is `if n.kind != "match"` around the
+    generic args walk (mirroring the discipline already used by
+    `estimate_stack_calls` and the boot checker).
+
+15. **`src/hlc.hls` `estimate_stack_size_stmt` missing return/assign
+    (MEDIUM, soundness).** The `#[stack_size(N)]` soundness check
+    only counted call sites in `let` (s.value), `if`/`while` (s.cond),
+    and `for` (s.iter). It MISSED `return` (whose return-value
+    expression is also in s.value) and `assign` (whose target and
+    RHS can both contain calls). A function declared `stack_size(8)`
+    could exceed 8 bytes when its return / assign sites had nested
+    calls. Fix: explicit coverage for `return` (s.value) and
+    `assign` (s.target + s.value).
+
+16. **Defensive + cleanup across the toolchain.**
+    - `boot/interp.py:675`: the `finally: getattr(..., "fn_stack",
+      []).pop()` raised IndexError on a fresh `[]` if the attribute
+      were somehow missing — masking the real in-flight exception.
+      Guarded with `if _fs:`.
+    - `boot/proof.py:327`: removed the `new_hi = new_hi` no-op
+      self-assignment (pylint W0127).
+    - `boot/checker.py`: added defensive sentinel `ptypes, ret = [],
+      "void"` in the unreachable post-`self.err` branches (pylint
+      E0606 — false positive in practice, but the sentinel makes
+      the analyser happy AND protects against a future change to
+      `err()`).
+    - `boot/interp.py:1248, 1356`: removed redundant local `import
+      os` (W0404) — `os` is already module-level.
+    - `boot/boot.py:771`: replaced `"%-*s" % (name_w, "TOTAL", ...)`
+      with the equivalent f-string (pylint E1307 false positive on
+      the `%-*s` width-from-arg form).
+    - `tools/hlserve.py:85`: initialized `last_change = 0.0` before
+      the loop (pylint E0606 — false positive, but defensive).
+    - `tools/hlprove.py:216-219`: collapsed the double `import z3`
+      / `import z3 as z` into a single `import z3 as z`.
+    - `tools/ir/__init__.py:609`: removed the redundant local
+      `from boot.lexer import HLError` (already imported at module
+      top with the sys.path fallback).
+    - `tools/hlfmt.py:217-222`: refactored the `nxt = ... if ... else
+      None; if nxt and nxt["k"] ...` pattern into
+      `nxt_k`/`nxt_v` locals (pylint E1136 false positive —
+      short-circuit protects against None subscripting).
+    - pyflakes clean across `boot/`, `tools/`, `scripts/`; pylint
+      9.99/10 (only the 4 intentional-`idx`-arg `_emit_hl_*`
+      interface-consistency warnings remain).
+
+17. **5 new regression tests** (section 9 c5): `feat_deep_scan15_bits`
+    (INT64_MIN bits_not/from_bytes_be/from_bytes_le round-trip),
+    `feat_deep_scan15_qc` (wide-range `qc_int_range` no longer
+    panics; small-range endpoints inclusive), `feat_deep_scan15_url_empty_port`
+    (consistent empty-port panic across IPv6 / non-IPv6 paths),
+    `feat_deep_scan15_html_xss_tag` and `feat_deep_scan15_html_xss_attr`
+    (XSS validation panics on injected tag name / attribute key).
+    Full local suite: **779 PASS / 0 FAIL** (was 773; the +6 includes
+    the 5 new tests + the moved `feat_stdlib` which now exercises the
+    new `html_tag` validation path).
+
 ---
 
 ## STAGE 32 — Zero-cost abstractions audit (every stdlib fn under 1 µs) ⬜
