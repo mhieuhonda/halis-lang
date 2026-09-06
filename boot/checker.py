@@ -592,6 +592,36 @@ class Checker:
                 if name in scope:
                     scope[name][2] = moved
 
+    def union_moved(self, env, snap):
+        """Deep-scan-16 HIGH-severity soundness fix: OR the moved-status
+        from `snap` (representing ONE possible execution path) into `env`.
+        A binding is treated as moved after the construct if it was moved
+        along ANY path — e.g. inside either arm of an `if`, or after one
+        iteration of a loop body (which re-executes at runtime).
+
+        The previous behaviour (snapshot + full restore_moved) treated
+        every if-arm / loop body as if it might execute ZERO times
+        (post-construct state = pre-construct state). That is unsound:
+        at runtime, an if-arm MAY execute and a loop body MAY iterate
+        >= 1 time, leaving the binding nulled in the native codegen
+        (drop/take push the local to null_after, so `u_x = NULL` is
+        emitted at statement end). Post-construct uses of the binding
+        then read NULL and segfault.
+
+        The conservative union (a binding is moved if it COULD be moved
+        along any path) is SOUND: it rejects post-construct uses whose
+        runtime safety cannot be proven. The trade-off is that some
+        valid programs are rejected (e.g. `while false { take(x) }; use(x)`
+        — provably zero iterations, but the checker can't prove that
+        without flow analysis). Reassignment via `x = ...` (a `mut`
+        binding) is still allowed because check_assign's revive step
+        clears the moved flag, so the idiomatic "drop then revive"
+        pattern continues to work."""
+        for scope, snap_row in zip(env, snap):
+            for name, moved in snap_row.items():
+                if name in scope and moved:
+                    scope[name][2] = True
+
     def check_fn(self, key, fn):
         self.cur_fn = key
         self.cur_fn_ret = fn["ret"]
@@ -1278,31 +1308,56 @@ class Checker:
             ct = self.check_expr(s["cond"], env, None)
             if ct != "bool":
                 self.err("if condition must be bool, got %s" % ct, s)
-            # Stage 8-alpha: take a snapshot of moved-status so moves done in
-            # the then/else branches don't leak out (a binding moved inside an
-            # if-arm should not be considered moved after the if completes).
+            # Deep-scan-16 HIGH-severity soundness fix: a binding moved
+            # inside EITHER arm may be moved at runtime (the arm could
+            # have executed). The previous snapshot+full-restore treated
+            # post-if state as pre-if state — a binding moved in an if-
+            # arm compiled cleanly through subsequent uses, but at
+            # runtime the native codegen had already nulled the local
+            # (`u_x = NULL` after drop/take). Sound fix: UNION the moved-
+            # status across both arms (a binding is moved if it was moved
+            # along any path).
             snap = self.snapshot_moved(env)
             self.child(env)
             self.check_stmts(s["then"], env, fn, in_loop)
             env.pop()
+            then_snap = self.snapshot_moved(env)
+            self.restore_moved(env, snap)
             if s["els"] is not None:
                 self.child(env)
                 self.check_stmts(s["els"], env, fn, in_loop)
                 env.pop()
-            self.restore_moved(env, snap)
+                else_snap = self.snapshot_moved(env)
+                self.restore_moved(env, snap)
+                self.union_moved(env, then_snap)
+                self.union_moved(env, else_snap)
+            else:
+                # No else arm — equivalent to an empty else (no moves).
+                # Union just the then-arm state.
+                self.union_moved(env, then_snap)
         elif k == "while":
             self.loop_header += 1
             ct = self.check_expr(s["cond"], env, None)
             self.loop_header -= 1
             if ct != "bool":
                 self.err("while condition must be bool, got %s" % ct, s)
-            # Moves inside the loop body don't leak out — the loop may execute
-            # zero or many times, so any post-loop use must remain valid.
+            # Deep-scan-16 HIGH-severity soundness fix: the loop body may
+            # execute >= 1 time. A binding moved inside the body (drop/take)
+            # is nulled at runtime after the first iteration. Post-loop
+            # uses of the binding read NULL and segfault. The previous
+            # snapshot+restore cleared moves done in the body, so
+            #   `while true { take(xs); break } let y = xs[0]`
+            # compiled cleanly but crashed at runtime.
+            # Sound fix: do NOT restore moves done in the body. The
+            # idiomatic "drop then revive via mut reassignment" pattern
+            # still works because check_assign's revive step clears the
+            # moved flag.
             snap = self.snapshot_moved(env)
             self.child(env)
             self.check_stmts(s["body"], env, fn, True)
             env.pop()
-            self.restore_moved(env, snap)
+            # No restore_moved — moves done in the body propagate to
+            # post-loop state (soundness: assume the body executed).
         elif k == "for":
             self.loop_header += 1
             it = self.check_expr(s["iter"], env, None)
@@ -1313,6 +1368,9 @@ class Checker:
             if s["vtype"] != elem:
                 self.err("loop variable type %s does not match element %s"
                          % (s["vtype"], elem), s)
+            # Deep-scan-16: same soundness fix as `while` — a binding moved
+            # inside the for-body may be nulled at runtime after the first
+            # iteration. Post-loop uses must be rejected.
             snap = self.snapshot_moved(env)
             self.child(env)
             # BUG (deep-scan-5): the `let` branch rejects shadowing but the
@@ -1324,7 +1382,7 @@ class Checker:
             env[-1][s["var"]] = [elem, False, False]
             self.check_stmts(s["body"], env, fn, True)
             env.pop()
-            self.restore_moved(env, snap)
+            # No restore_moved — moves done in the body propagate.
         elif k == "return":
             if fn["ret"] == "void":
                 if s["value"] is not None:
