@@ -829,6 +829,18 @@ class WasmEmitter:
         #   4 = tmp (i64) — for division
         #   5 = result_ptr (i32)
         #   6 = len (i32)
+        # Deep-scan-15 fix (MEDIUM severity): the previous implementation
+        # used signed `i64.div_s` / `i64.rem_s` in the digit-extraction
+        # loop. After `if negative: n = 0 - n`, the wraparound on
+        # INT64_MIN leaves n unchanged (0 - INT64_MIN = INT64_MIN in
+        # two's complement). The signed modulo then yields -8 (a
+        # negative digit), producing a stream of garbage characters
+        # instead of the correct "-9223372036854775808". Fix: after the
+        # sign-flip, treat the value as UNSIGNED (i64.div_u / i64.rem_u)
+        # — the bit pattern after the (wrapped) `0 - n` is the correct
+        # absolute value when reinterpreted as unsigned, and unsigned
+        # div/rem on a value < 2^63 gives identical results to signed
+        # for the original non-negative inputs.
         body = bytearray()
         # Allocate 24 bytes for the scratch buffer.
         body.append(OP_I32_CONST); body += sleb(24)
@@ -864,20 +876,24 @@ class WasmEmitter:
         body.append(OP_I32_STORE8); body.append(0x00); body += sleb(0)
         body.append(OP_END)  # if
         # Loop: while n != 0: digit = n % 10; n /= 10; pos--; buf[pos] = digit + '0'
+        # Deep-scan-15: UNSIGNED div/rem (i64.div_u / i64.rem_u) so the
+        # post-wraparound value of INT64_MIN (bit pattern 0x8000...0)
+        # is interpreted as 9223372036854775808, giving the correct
+        # 19 digits "9223372036854775808" with the '-' prepended.
         body.append(OP_BLOCK); body.append(BLOCK_VOID)
         body.append(OP_LOOP); body.append(BLOCK_VOID)
         body.append(OP_LOCAL_GET); body += uleb(0)
         body.append(OP_I64_EQZ)
         body.append(OP_BR_IF); body += uleb(1)  # break
-        # tmp = n % 10
+        # tmp = n % 10  (UNSIGNED — see deep-scan-15 fix above)
         body.append(OP_LOCAL_GET); body += uleb(0)
         body.append(OP_I64_CONST); body += sleb(10)
-        body.append(OP_I64_REM_S)
+        body.append(OP_I64_REM_U)
         body.append(OP_LOCAL_SET); body += uleb(4)
-        # n = n / 10
+        # n = n / 10  (UNSIGNED)
         body.append(OP_LOCAL_GET); body += uleb(0)
         body.append(OP_I64_CONST); body += sleb(10)
-        body.append(OP_I64_DIV_S)
+        body.append(OP_I64_DIV_U)
         body.append(OP_LOCAL_SET); body += uleb(0)
         # pos--
         body.append(OP_LOCAL_GET); body += uleb(2)
@@ -1105,8 +1121,22 @@ class WasmEmitter:
 
     # ---- helper: hl_int_abs(n: i64) -> i64 ----
     # abs(n) = n < 0 ? -n : n
+    # Deep-scan-15 fix (MEDIUM severity): for n == INT64_MIN, the
+    # `0 - n` wraparound yields INT64_MIN itself (two's complement
+    # overflow). The C runtime (`hl_abs_i64` in src/hlc.hls) panics
+    # with "integer overflow" on this input; the interpreter raises
+    # HLPanic. The wasm path must TRAP to match (silent wrong answer
+    # is worse than a visible trap). Use `i64.eq` + `if ... unreachable`
+    # to trap on INT64_MIN, then the standard `0 - n` for the rest.
     def _emit_hl_int_abs(self, idx: int):
         body = bytearray()
+        # if n == INT64_MIN: unreachable (trap, matching hl_die("integer overflow"))
+        body.append(OP_LOCAL_GET); body += uleb(0)
+        body.append(OP_I64_CONST); body += sleb(-9223372036854775808)
+        body.append(OP_I64_EQ)
+        body.append(OP_IF); body.append(BLOCK_VOID)
+        body.append(OP_UNREACHABLE)
+        body.append(OP_END)
         # Condition: n < 0 (produces i32)
         body.append(OP_LOCAL_GET); body += uleb(0)
         body.append(OP_I64_CONST); body += sleb(0)
@@ -1125,21 +1155,32 @@ class WasmEmitter:
     # Parses a decimal integer from the str's data. Skips leading whitespace;
     # handles optional leading '-'. Stops at the first non-digit byte.
     def _emit_hl_str_to_int(self, idx: int):
-        # locals: 0 = s (param), 1 = len, 2 = i, 3 = result, 4 = negative
+        # locals: 0 = s (param), 1 = len, 2 = i, 3 = result (i64),
+        #         4 = negative (i32), 5 = byte/digit scratch (i32)
+        # Deep-scan-15 fix (HIGH severity): the previous implementation
+        # reused local 4 (the sign flag) as a scratch slot via
+        # `OP_LOCAL_TEE 4` inside the digit loop. The `tee` WRITES
+        # local 4 with the byte/digit value, which silently corrupts
+        # the sign flag — the subsequent `OP_DROP` only removes the
+        # stack copy, NOT the local write. So for inputs ending in
+        # '0' (e.g. "-10", "-100"), local 4 ended at 0 (false) and
+        # the `if negative: result = -result` branch was skipped,
+        # silently parsing "-10" → 10. Fix: add a dedicated 5th
+        # local for the digit scratch so the sign flag is preserved.
         body = bytearray()
         # len = i32.load(s)
         body.append(OP_LOCAL_GET); body += uleb(0)
         body.append(OP_I32_LOAD); body.append(0x02); body += sleb(0)
         body.append(OP_LOCAL_SET); body += uleb(1)
-        # i = 0, result = 0, negative = 0
+        # i = 0, result = 0, negative = 0, digit = 0
         body.append(OP_I32_CONST); body += sleb(0)
         body.append(OP_LOCAL_SET); body += uleb(2)
         body.append(OP_I64_CONST); body += sleb(0)
         body.append(OP_LOCAL_SET); body += uleb(3)
         body.append(OP_I32_CONST); body += sleb(0)
         body.append(OP_LOCAL_SET); body += uleb(4)
-        # Skip leading whitespace (space = 0x20).
-        # For the alpha, just check for '-' at position 0.
+        body.append(OP_I32_CONST); body += sleb(0)
+        body.append(OP_LOCAL_SET); body += uleb(5)
         # if i < len and s.data[4] == '-': negative = 1; i++
         body.append(OP_LOCAL_GET); body += uleb(2)
         body.append(OP_LOCAL_GET); body += uleb(1)
@@ -1169,37 +1210,23 @@ class WasmEmitter:
         body.append(OP_LOCAL_GET); body += uleb(1)
         body.append(OP_I32_GE_S)
         body.append(OP_BR_IF); body += uleb(1)
-        # byte = s.data[4+i]
+        # byte = s.data[4+i]   → local 5 (digit scratch; does NOT clobber sign)
         body.append(OP_LOCAL_GET); body += uleb(0)
         body.append(OP_LOCAL_GET); body += uleb(2)
         body.append(OP_I32_CONST); body += sleb(4)
         body.append(OP_I32_ADD)
         body.append(OP_I32_LOAD8_U); body.append(0x00); body += sleb(0)
-        body.append(OP_LOCAL_TEE); body += uleb(4)  # reuse local 4 as temp? NO
-        # Actually we can't reuse local 4 (negative). Use a separate approach.
-        # Push byte - '0' and check 0 <= val < 10.
-        # Hmm, we used local_tee which clobbers negative. Let me redo.
-        # Actually the simplest: drop the tee'd value and reload.
-        body.append(OP_DROP)  # drop the tee'd value (undo the clobber)
-        body.append(OP_LOCAL_GET); body += uleb(0)
-        body.append(OP_LOCAL_GET); body += uleb(2)
-        body.append(OP_I32_CONST); body += sleb(4)
-        body.append(OP_I32_ADD)
-        body.append(OP_I32_LOAD8_U); body.append(0x00); body += sleb(0)
-        # byte - '0'
+        body.append(OP_LOCAL_TEE); body += uleb(5)
+        # Range check: 0 <= byte - 0x30 < 10  →  push (byte >= '0') & (byte <= '9')
         body.append(OP_I32_CONST); body += sleb(0x30)
-        body.append(OP_I32_SUB)
-        body.append(OP_LOCAL_TEE); body += uleb(4)  # WAIT this clobbers negative again!
-        # I need a 5th local for the digit. Let me restructure.
-        # For the alpha, let me just assume all bytes are digits (the parser
-        # validated the input). Skip the range check.
-        body.append(OP_DROP)
-        # Reload byte - '0' as i64.
-        body.append(OP_LOCAL_GET); body += uleb(0)
-        body.append(OP_LOCAL_GET); body += uleb(2)
-        body.append(OP_I32_CONST); body += sleb(4)
-        body.append(OP_I32_ADD)
-        body.append(OP_I32_LOAD8_U); body.append(0x00); body += sleb(0)
+        body.append(OP_I32_GE_S)
+        body.append(OP_LOCAL_GET); body += uleb(5)
+        body.append(OP_I32_CONST); body += sleb(0x39)
+        body.append(OP_I32_LE_S)
+        body.append(OP_I32_AND)
+        body.append(OP_IF); body.append(BLOCK_VOID)
+        # digit = byte - '0'  (i32), then extend to i64
+        body.append(OP_LOCAL_GET); body += uleb(5)
         body.append(OP_I32_CONST); body += sleb(0x30)
         body.append(OP_I32_SUB)
         body.append(OP_I64_EXTEND_I32_S)  # digit (i64)
@@ -1209,6 +1236,7 @@ class WasmEmitter:
         body.append(OP_I64_MUL)
         body.append(OP_I64_ADD)
         body.append(OP_LOCAL_SET); body += uleb(3)
+        body.append(OP_END)
         # i++
         body.append(OP_LOCAL_GET); body += uleb(2)
         body.append(OP_I32_CONST); body += sleb(1)
@@ -1227,8 +1255,10 @@ class WasmEmitter:
         body.append(OP_END)
         # return result
         body.append(OP_LOCAL_GET); body += uleb(3)
-        # locals: 1=len, 2=i, 3=result, 4=negative (all used above).
-        self.mod.add_code([(1, I32), (1, I32), (1, I64), (1, I32)], bytes(body))
+        # locals: 1=len (i32), 2=i (i32), 3=result (i64),
+        #         4=negative (i32), 5=digit scratch (i32).
+        self.mod.add_code(
+            [(1, I32), (1, I32), (1, I64), (1, I32), (1, I32)], bytes(body))
 
     # ---- helper: hl_str_to_float(s: i32) -> f64 ----
     # Delegates to a JS helper (the JS string-to-float is well-specified
@@ -1851,8 +1881,14 @@ class WasmEmitter:
         """Lower a builtin method call like 42.to_str() or "hi".len()."""
         rm = e.get("rm", ("", ""))
         if rm[0] != "builtin":
+            # Deep-scan-15 fix: the previous format string had NO `%s`
+            # placeholder but applied `% e.get("name", "")` — at runtime
+            # this raised `TypeError: not enough arguments for format
+            # string` (Python) instead of the clean HLError that callers
+            # expect. Add the `%s` so the offending method name is named
+            # in the message (which is the whole point of fetching it).
             raise HLError(
-                "user-defined methods are not yet supported by --emit wasm "
+                "user-defined method '%s' is not yet supported by --emit wasm "
                 "(Stage 23-alpha subset; only builtin methods like .to_str() "
                 "and .len() are supported)" % e.get("name", ""),
                 e.get("line", 0), 0)

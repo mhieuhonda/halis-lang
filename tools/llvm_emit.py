@@ -1034,8 +1034,15 @@ class LLVMEmitter:
             # Cast the value to the match's result type if needed.
             if arm_result_ty != llvm_ret_ty:
                 # Coerce — same logic as the assignment path.
+                # Deep-scan-15 fix: the previous call had the first two
+                # arguments swapped (`_coerce(arm_result_val, arm_result_ty, ...)`).
+                # _coerce's signature is `(val_ty, val, want_ty)` — passing
+                # the value string as `val_ty` made every defensive
+                # coercion silently misbehave (the i1/i64/double/ptr
+                # dispatch never matched). All other call sites in this
+                # file use the correct order; this one diverged.
                 arm_result_val = self._coerce(
-                    arm_result_val, arm_result_ty, llvm_ret_ty)
+                    arm_result_ty, arm_result_val, llvm_ret_ty)
             self._emit("  store %s %s, ptr %s"
                        % (llvm_ret_ty, arm_result_val, result_slot))
             if self._cur_block is not None:

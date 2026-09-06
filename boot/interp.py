@@ -672,7 +672,16 @@ class Interp:
                                       "runtime)" % fn["name"], self.line)
                 return r.value
             finally:
-                getattr(self._tls, "fn_stack", []).pop()
+                # Deep-scan-15 fix (LOW severity / defensive): the prior
+                # `getattr(self._tls, "fn_stack", []).pop()` would raise
+                # IndexError on a fresh `[]` default if the attribute
+                # were somehow missing — which would then mask the real
+                # in-flight exception (TailCallSig / ReturnSig). The try
+                # block above guarantees the attribute exists, but be
+                # defensive: only pop when the list is non-empty.
+                _fs = getattr(self._tls, "fn_stack", None)
+                if _fs:
+                    _fs.pop()
             # Implicit void return: still check ensures (result is None).
             if self.contracts and fn.get("ensures") is not None:
                 env[0]["result"] = [None, False, False]
@@ -1245,7 +1254,10 @@ class Interp:
         if name == "clock_ms":
             return int(time.monotonic() * 1000)
         if name == "file_exists":
-            import os
+            # Deep-scan-15 cleanup: removed redundant `import os` —
+            # `os` is already imported at module top (line 14), and
+            # Python caches it in sys.modules so the local import was
+            # a no-op besides raising a pylint W0404 reimport warning.
             _sandbox_check(args[0])
             # Deep-scan fix (H2): pass `args[0]` (bytes) directly to
             # os.path.isfile — Python's os.path.isfile accepts bytes.
@@ -1353,7 +1365,8 @@ class Interp:
         # system() call. Tainted command strings are rejected at
         # check time (proc_exec is a taint sink for argument 0).
         if name == "proc_exec":
-            import os
+            # Deep-scan-15 cleanup: removed redundant `import os` (see
+            # the file_exists branch above for the rationale).
             cmd = args[0].decode("utf-8", "replace")
             rc = os.system(cmd)
             # Deep-scan-7 fix: os.WIFEXITED / WEXITSTATUS / WTERMSIG
