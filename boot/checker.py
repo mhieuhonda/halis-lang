@@ -214,6 +214,14 @@ BUILTIN_FNS = {
     "join",
     # Stage 21 (v0.37.0-alpha): SIMD feature dispatch builtins.
     "has_feature", "simd_cpu_supports",
+    # Stage 32 (v0.51.0-alpha): native bitwise primitives. Halis has
+    # no `&`, `|`, `^`, `~`, `<<`, `>>` operators in its grammar —
+    # these builtins map to single C operations in the native backend,
+    # eliminating the O(64) bit-by-bit emulation loops that std/bits.hls
+    # previously used.
+    "int_and", "int_or", "int_xor", "int_not",
+    "int_shl", "int_shr", "int_sar",
+    "int_popcount", "int_clz", "int_ctz",
 }
 
 # Stage 9 (v0.20.0-alpha — release): per-builtin effect mapping.
@@ -2442,6 +2450,24 @@ class Checker:
                 self.err("join() expects a list[str] as argument 1, got %s" % at, e)
             argt(1, "str")
             return "str"
+        # Stage 32 (v0.51.0-alpha): native bitwise primitives.
+        # All take int args and return int; they are pure (no effects).
+        if name in ("int_and", "int_or", "int_xor",
+                    "int_shl", "int_shr", "int_sar"):
+            need(2)
+            at0 = argt(0, "int")
+            at1 = argt(1, "int")
+            if at0 != "int":
+                self.err("%s() expects int as argument 1, got %s" % (name, at0), e)
+            if at1 != "int":
+                self.err("%s() expects int as argument 2, got %s" % (name, at1), e)
+            return "int"
+        if name in ("int_not", "int_popcount", "int_clz", "int_ctz"):
+            need(1)
+            at0 = argt(0, "int")
+            if at0 != "int":
+                self.err("%s() expects int, got %s" % (name, at0), e)
+            return "int"
         if name == "map_new":
             need(0)
             if expected is None or not is_map(expected):

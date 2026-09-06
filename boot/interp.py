@@ -1268,6 +1268,60 @@ class Interp:
             if not isinstance(parts, list):
                 raise HLPanic("join() expects a list[str]", line)
             return sep.join(parts)
+        # Stage 32 (v0.51.0-alpha): native bitwise primitives — the
+        # interpreter mirrors the C semantics exactly. Shifts are
+        # masked to 6 bits (matching the C `& 63`); popcount/clz/ctz
+        # use Python's bit_length so they match __builtin_clzll on
+        # 64-bit values. All operands are int64 (Python ints; Halis
+        # invariant: every int value is in [-2^63, 2^63)).
+        #
+        # i64_wrap: bitwise ops in Python produce arbitrary-precision
+        # ints; we wrap back to signed int64 to match the C semantics
+        # (where the result of `(int64_t)(uint64_t)x >> n` is the
+        # two's-complement reinterpretation of the unsigned result).
+        def _i64_wrap(v):
+            v &= (1 << 64) - 1
+            if v >= (1 << 63):
+                v -= (1 << 64)
+            return v
+        if name == "int_and":
+            return _i64_wrap(args[0] & args[1])
+        if name == "int_or":
+            return _i64_wrap(args[0] | args[1])
+        if name == "int_xor":
+            return _i64_wrap(args[0] ^ args[1])
+        if name == "int_not":
+            return _i64_wrap(~args[0])
+        if name == "int_shl":
+            n = args[1] & 63
+            return _i64_wrap(args[0] << n)
+        if name == "int_shr":
+            n = args[1] & 63
+            # logical right shift on unsigned 64-bit
+            x = args[0] & ((1 << 64) - 1)
+            return _i64_wrap(x >> n)
+        if name == "int_sar":
+            n = args[1] & 63
+            # arithmetic right shift: Python's >> on negative ints
+            # already does sign-extension (floor division by 2^n).
+            return _i64_wrap(args[0] >> n)
+        if name == "int_popcount":
+            x = args[0] & ((1 << 64) - 1)
+            return bin(x).count("1")
+        if name == "int_clz":
+            x = args[0] & ((1 << 64) - 1)
+            if x == 0:
+                return 64
+            return 64 - x.bit_length()
+        if name == "int_ctz":
+            x = args[0] & ((1 << 64) - 1)
+            if x == 0:
+                return 64
+            n = 0
+            while (x & 1) == 0:
+                x >>= 1
+                n += 1
+            return n
         if name == "map_new":
             return {}
         if name == "read_file":

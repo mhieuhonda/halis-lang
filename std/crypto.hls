@@ -52,47 +52,30 @@ import "std.math"
 
 # Mask 32 bits.
 fn u32_mask(x: int) -> int {
-    # x mod 2^32 — but x may be negative (after subtraction in our emulated XOR)
-    # so we bring it back into 0 .. 2^32 - 1.
-    let m: int = x % 4294967296
-    if m < 0 {
-        return m + 4294967296
-    }
-    return m
+    # Stage 32 (v0.51.0-alpha): native bitwise AND with 0xFFFFFFFF.
+    # The previous `x % 4294967296` was a 64-bit modulo (a single
+    # library call on most platforms, but on x86 it's a div+rem pair
+    # after a CMOV for the sign-correction). int_and is a single AND
+    # instruction.
+    return int_and(x, 4294967295)
 }
 
-# XOR of two bytes (0..255). Decomposed bit-by-bit using division and modulo
-# (HLS v0.3 has no bitwise operators). Inputs must be in 0..255.
+# XOR of two bytes (0..255). Stage 32 (v0.51.0-alpha): native XOR.
+# The previous bit-by-bit loop with math_power_int(2, k) was ~8
+# iterations × ~k iterations of math_power_int = ~32-64 inner
+# multiplications per byte; now a single & instruction.
 fn byte_xor(a: int, b: int) -> int {
-    let mut result: int = 0
-    let mut k: int = 0
-    while k < 8 {
-        let bit_a: int = (a / math_power_int(2, k)) % 2
-        let bit_b: int = (b / math_power_int(2, k)) % 2
-        if bit_a != bit_b {
-            result = result + math_power_int(2, k)
-        }
-        k = k + 1
-    }
-    return result
+    return int_and(int_xor(a, b), 255)
 }
 
 # XOR of two 32-bit words (carried as int in 0 .. 2^32 - 1).
-# Decompose each into 4 bytes, XOR them, then recombine.
+# Stage 32 (v0.51.0-alpha): native XOR. The previous 4-byte
+# decomposition (4 byte_xor calls + 4 multiplications to recombine)
+# was ~32x slower than a single int_xor; now both operands are
+# masked to 32 bits, XOR'd via the native builtin, and re-masked
+# to the unsigned 32-bit range.
 fn u32_xor(a: int, b: int) -> int {
-    let a0: int = a / 1 % 256
-    let a1: int = a / 256 % 256
-    let a2: int = a / 65536 % 256
-    let a3: int = a / 16777216 % 256
-    let b0: int = b / 1 % 256
-    let b1: int = b / 256 % 256
-    let b2: int = b / 65536 % 256
-    let b3: int = b / 16777216 % 256
-    let r0: int = byte_xor(a0, b0)
-    let r1: int = byte_xor(a1, b1)
-    let r2: int = byte_xor(a2, b2)
-    let r3: int = byte_xor(a3, b3)
-    return r0 + r1 * 256 + r2 * 65536 + r3 * 16777216
+    return u32_mask(int_xor(int_and(a, 4294967295), int_and(b, 4294967295)))
 }
 
 # ----------------------------------------------------------------------------
@@ -154,12 +137,30 @@ fn crypto_fnv1a_64_hex(s: str) -> str {
     return u32_to_hex(hi) + u32_to_hex(lo)
 }
 
+# u32_to_hex(x) returns the 8-character lowercase hex representation
+# of the low 32 bits of x. Stage 32 (v0.51.0-alpha): O(1) — push 8
+# nibble slices into a list and join once (was: 4 hex_byte calls,
+# each doing chr+chr+concat = 12 allocations total; now: 8 slice
+# calls into a single join = 8 allocations + 1 final alloc).
 fn u32_to_hex(x: int) -> str {
-    let b3: int = x / 16777216 % 256
-    let b2: int = x / 65536 % 256
-    let b1: int = x / 256 % 256
-    let b0: int = x % 256
-    return hex_byte(b3) + hex_byte(b2) + hex_byte(b1) + hex_byte(b0)
+    let digits: str = "0123456789abcdef"
+    let out: list[str] = []
+    # Big-endian: byte 3 first, byte 0 last. Stage 32: use native
+    # int_shr / int_and (single C op each) instead of division chains.
+    let b3: int = int_and(int_shr(x, 24), 255)
+    let b2: int = int_and(int_shr(x, 16), 255)
+    let b1: int = int_and(int_shr(x, 8), 255)
+    let b0: int = int_and(x, 255)
+    # Push 2 nibbles per byte = 8 slices total.
+    out.push(digits.slice(b3 / 16, b3 / 16 + 1))
+    out.push(digits.slice(b3 % 16, b3 % 16 + 1))
+    out.push(digits.slice(b2 / 16, b2 / 16 + 1))
+    out.push(digits.slice(b2 % 16, b2 % 16 + 1))
+    out.push(digits.slice(b1 / 16, b1 / 16 + 1))
+    out.push(digits.slice(b1 % 16, b1 % 16 + 1))
+    out.push(digits.slice(b0 / 16, b0 / 16 + 1))
+    out.push(digits.slice(b0 % 16, b0 % 16 + 1))
+    return str_join(out, "")
 }
 
 # ----------------------------------------------------------------------------
@@ -206,14 +207,18 @@ fn crypto_sdbm(s: str) -> int {
 # Without bitwise operators, we implement XOR byte-by-byte using our byte_xor.
 # ----------------------------------------------------------------------------
 fn crc32_table_entry(i: int) -> int {
+    # Stage 32 (v0.51.0-alpha): native bitwise AND / XOR / shift.
+    # The previous modulo-and-division implementation was ~8x slower
+    # per table-entry build (8 iterations × 2 divisions + 1 XOR-via-
+    # arithmetic per iteration).
     let mut c: int = i
     let mut k: int = 0
     while k < 8 {
         # c = (c & 1) ? (c >> 1) ^ 0xEDB88320 : (c >> 1)
-        if c % 2 == 1 {
-            c = u32_xor(c / 2, 3988292384)        # 0xEDB88320
+        if int_and(c, 1) == 1 {
+            c = int_xor(int_shr(c, 1), 3988292384)        # 0xEDB88320
         } else {
-            c = c / 2
+            c = int_shr(c, 1)
         }
         k = k + 1
     }
@@ -221,17 +226,19 @@ fn crc32_table_entry(i: int) -> int {
 }
 
 fn crypto_crc32(s: str) -> int {
+    # Stage 32 (v0.51.0-alpha): native bitwise. The crc index uses
+    # int_and(int_xor(crc, byte), 255) (single XOR + AND) instead of
+    # the previous byte_xor (8-iteration bit loop). The crc update
+    # uses int_shr(crc, 8) (single shift) and int_xor (single XOR).
     let mut crc: int = 4294967295                 # 0xFFFFFFFF
     let n: int = s.len()
     let mut i: int = 0
     while i < n {
-        let idx: int = byte_xor(crc % 256, s.byte_at(i))
-        # Without XOR, use byte-level XOR for the low byte then divide by 256.
-        # idx is already correctly computed via byte_xor.
-        crc = u32_xor(crc / 256, crc32_table_entry(idx % 256))
+        let idx: int = int_and(int_xor(crc, s.byte_at(i)), 255)
+        crc = int_xor(int_shr(crc, 8), crc32_table_entry(idx))
         i = i + 1
     }
-    return u32_xor(crc, 4294967295)                # final XOR with 0xFFFFFFFF
+    return u32_mask(int_xor(crc, 4294967295))    # final XOR with 0xFFFFFFFF
 }
 
 fn crypto_crc32_hex(s: str) -> str {

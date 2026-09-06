@@ -2600,6 +2600,15 @@ fn is_builtin_fn(n: str) -> bool {
         || n == "join"
     # Stage 21 (v0.37.0-alpha): SIMD feature dispatch builtins.
     || n == "has_feature" || n == "simd_cpu_supports"
+    # Stage 32 (v0.51.0-alpha): native bitwise primitives. Halis has
+    # no `&`, `|`, `^`, `~`, `<<`, `>>` operators in its grammar —
+    # these builtins map directly to single C operations, eliminating
+    # the O(64) bit-by-bit emulation loops that std/bits.hls previously
+    # used (each loop iterated 64 times, called bits_get/bits_pow2 on
+    # every iteration, and dominated Stage 32 benchmark timing).
+    || n == "int_and" || n == "int_or" || n == "int_xor" || n == "int_not"
+    || n == "int_shl" || n == "int_shr" || n == "int_sar"
+    || n == "int_popcount" || n == "int_clz" || n == "int_ctz"
 }
 
 fn list_has(list: list[str], x: str) -> bool {
@@ -7113,6 +7122,69 @@ fn check_builtin_call(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, 
         }
         return "str"
     }
+    # Stage 32 (v0.51.0-alpha): native bitwise builtins. Each takes
+    # int arguments and returns int; the shift count is masked to 6
+    # bits (0..63) at runtime to match C's UB-free behaviour.
+    if name == "int_and" || name == "int_or" || name == "int_xor" {
+        if ctx.exprs[e].args.len() != 2 {
+            cerr(line, name + "() expects 2 int arguments")
+        }
+        let a0: str = check_expr(ctx, env, cur, ctx.exprs[e].args.get(0), "int")
+        let a1: str = check_expr(ctx, env, cur, ctx.exprs[e].args.get(1), "int")
+        if a0 != "int" {
+            cerr(line, name + "() expects int as argument 1, got " + a0)
+        }
+        if a1 != "int" {
+            cerr(line, name + "() expects int as argument 2, got " + a1)
+        }
+        if a0 == "never" || a1 == "never" {
+            cerr(line, "never value cannot be used as an argument")
+        }
+        return "int"
+    }
+    if name == "int_not" {
+        if ctx.exprs[e].args.len() != 1 {
+            cerr(line, "int_not() expects 1 int argument")
+        }
+        let a0n: str = check_expr(ctx, env, cur, ctx.exprs[e].args.get(0), "int")
+        if a0n != "int" {
+            cerr(line, "int_not() expects int, got " + a0n)
+        }
+        if a0n == "never" {
+            cerr(line, "never value cannot be used as an argument")
+        }
+        return "int"
+    }
+    if name == "int_shl" || name == "int_shr" || name == "int_sar" {
+        if ctx.exprs[e].args.len() != 2 {
+            cerr(line, name + "() expects 2 int arguments (value, shift)")
+        }
+        let a0s: str = check_expr(ctx, env, cur, ctx.exprs[e].args.get(0), "int")
+        let a1s: str = check_expr(ctx, env, cur, ctx.exprs[e].args.get(1), "int")
+        if a0s != "int" {
+            cerr(line, name + "() expects int value as argument 1, got " + a0s)
+        }
+        if a1s != "int" {
+            cerr(line, name + "() expects int shift count as argument 2, got " + a1s)
+        }
+        if a0s == "never" || a1s == "never" {
+            cerr(line, "never value cannot be used as an argument")
+        }
+        return "int"
+    }
+    if name == "int_popcount" || name == "int_clz" || name == "int_ctz" {
+        if ctx.exprs[e].args.len() != 1 {
+            cerr(line, name + "() expects 1 int argument")
+        }
+        let a0p: str = check_expr(ctx, env, cur, ctx.exprs[e].args.get(0), "int")
+        if a0p != "int" {
+            cerr(line, name + "() expects int, got " + a0p)
+        }
+        if a0p == "never" {
+            cerr(line, "never value cannot be used as an argument")
+        }
+        return "int"
+    }
     let nargs: int = ctx.exprs[e].args.len()
     let argt: list[str] = []
     let mut i: int = 0
@@ -9081,6 +9153,17 @@ fn runtime_lines() -> list[str] {
     r.push("")
     r.push("static bool hl_str_eq(hl_str* a, hl_str* b) {")
     r.push("    return a->len == b->len && (a->len == 0 || memcmp(a->data, b->data, (size_t)a->len) == 0);")
+    r.push("}")
+    r.push("")
+    # Stage 32 (v0.51.0-alpha): native bitwise primitives. clz/ctz wrap
+    # the C builtins with a 0-input guard (returns 64 — matching the
+    # std/bits.hls API contract for bits_clz(0) and bits_ctz(0)).
+    r.push("static int64_t hl_clz(uint64_t x) {")
+    r.push("    return x == 0 ? 64 : (int64_t)__builtin_clzll(x);")
+    r.push("}")
+    r.push("")
+    r.push("static int64_t hl_ctz(uint64_t x) {")
+    r.push("    return x == 0 ? 64 : (int64_t)__builtin_ctzll(x);")
     r.push("}")
     r.push("")
     r.push("static int64_t hl_str_cmp(hl_str* a, hl_str* b) {")
@@ -13071,6 +13154,49 @@ fn gen_call(ctx: Ctx, e: int) -> str {
     # concat convention); the result is a fresh string.
     if name == "join" {
         return "hl_str_join(" + args + ")"
+    }
+    # Stage 32 (v0.51.0-alpha): native bitwise builtins — each compiles
+    # to a single C operation. The shift count is masked to [0, 63] to
+    # avoid C undefined behaviour when n >= 64 (the std/bits.hls API
+    # documents this as the same behaviour as the previous loop-based
+    # implementation: shifts >= 64 yield 0 for shl/shr and the sign
+    # value for sar).
+    if name == "int_and" || name == "int_or" || name == "int_xor"
+        || name == "int_shl" || name == "int_shr" || name == "int_sar" {
+        let a0c: str = gen_expr(ctx, ctx.exprs[e].args.get(0))
+        let a1c: str = gen_expr(ctx, ctx.exprs[e].args.get(1))
+        if name == "int_and" {
+            return "(" + a0c + " & " + a1c + ")"
+        }
+        if name == "int_or" {
+            return "(" + a0c + " | " + a1c + ")"
+        }
+        if name == "int_xor" {
+            return "(" + a0c + " ^ " + a1c + ")"
+        }
+        if name == "int_shl" {
+            return "(" + a0c + " << (" + a1c + " & 63))"
+        }
+        if name == "int_shr" {
+            return "((int64_t)((uint64_t)" + a0c + " >> (" + a1c + " & 63)))"
+        }
+        # int_sar
+        return "(" + a0c + " >> (" + a1c + " & 63))"
+    }
+    if name == "int_not" || name == "int_popcount"
+        || name == "int_clz" || name == "int_ctz" {
+        let a0u: str = gen_expr(ctx, ctx.exprs[e].args.get(0))
+        if name == "int_not" {
+            return "(~" + a0u + ")"
+        }
+        if name == "int_popcount" {
+            return "__builtin_popcountll((uint64_t)" + a0u + ")"
+        }
+        if name == "int_clz" {
+            return "hl_clz((uint64_t)" + a0u + ")"
+        }
+        # int_ctz
+        return "hl_ctz((uint64_t)" + a0u + ")"
     }
     # Stage 21 (v0.37.0-alpha): has_feature — const-folded from the
     # --target-feature flag. Exact-match semantics (asking for "avx2"
