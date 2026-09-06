@@ -260,6 +260,18 @@ class HLSServer:
         method = msg.get("method")
         params = msg.get("params", {})
         msg_id = msg.get("id")
+        # Deep-scan-15 fix (LOW severity, LSP spec compliance): per the
+        # LSP base protocol, after a `shutdown` request the server must
+        # NOT process any requests except `exit` — all other requests
+        # should be rejected with error code -32600 (InvalidRequest).
+        # The previous implementation processed every method regardless
+        # of state; a misbehaving client could keep the server busy
+        # after shutdown.
+        if self.shutdown_requested and method != "exit":
+            if msg_id is not None:
+                self.send_response(msg_id, None, error_code=-32600,
+                                   error_message="server is shutting down")
+            return
         if method == "initialize":
             self.send_response(msg_id, {
                 "capabilities": {

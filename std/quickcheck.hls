@@ -67,11 +67,84 @@ fn qc_int() -> int uses Rand {
 # qc_int_range: a random int64 in the closed range [lo, hi]. The bounds
 # are inclusive — `qc_int_range(0, 9)` can return 0 or 9. Implemented
 # via rand_int(hi - lo + 1) + lo to avoid modulo bias on small ranges.
+# Deep-scan-15 fix (MEDIUM severity): `hi - lo + 1` overflows int64
+# for wide ranges (e.g. qc_int_range(0, INT64_MAX) → 0 - INT64_MAX + 1
+# = -INT64_MAX + 1, which is negative; the `<= 0` defensive guard then
+# silently returns `lo`). The subtraction `hi - lo` itself overflows
+# whenever lo < 0 and hi > 0 with both magnitudes large (lo = INT64_MIN,
+# hi = INT64_MAX is the canonical case). Strategy: detect the would-
+# overflow case by examining signs (no subtraction needed for the
+# check itself); in the wide case, draw a full-range int64 via the
+# qc_int path (random sign + random magnitude).
 fn qc_int_range(lo: int, hi: int) -> int uses Rand {
-    let span: int = hi - lo + 1
-    if span <= 0 {
+    if lo > hi {
+        # Empty range — undefined; return lo for stability.
         return lo
     }
+    # Compute the span safely. The original `hi - lo + 1` overflows
+    # int64 in two scenarios:
+    #   (a) lo >= 0 and (hi, lo) == (INT64_MAX, 0): hi - lo == INT64_MAX
+    #       so the +1 wraps to INT64_MIN.
+    #   (b) lo < 0 and hi >= 0 with abs(lo) + hi >= INT64_MAX: the
+    #       subtraction hi - lo itself overflows int64 (Halis panics
+    #       on signed-overflow).
+    # We detect both before performing any arithmetic, branching by
+    # the sign of lo (since the dangerous sub-case differs).
+    let mut wide: bool = false
+    if lo >= 0 {
+        # Both bounds non-negative. hi - lo is representable in
+        # [0, INT64_MAX]. The +1 overflows iff hi - lo == INT64_MAX,
+        # which given lo >= 0 happens iff hi == INT64_MAX and lo == 0.
+        if lo == 0 && hi == 9223372036854775807 {
+            wide = true
+        }
+    } else if hi >= 0 {
+        # lo < 0, hi >= 0. The subtraction hi - lo = hi + |lo| may
+        # exceed INT64_MAX. Special-case lo == INT64_MIN first —
+        # `0 - lo` would itself overflow, but the comparison
+        # `|lo| >= INT64_MAX - hi` is true whenever hi >= 0 (because
+        # |INT64_MIN| = 2^63 > INT64_MAX - hi). So the wide path is
+        # always taken for lo == INT64_MIN && hi >= 0.
+        if lo == -9223372036854775808 {
+            wide = true
+        } else {
+            # Safe to compute |lo| here (lo != INT64_MIN).
+            let abs_lo: int = 0 - lo
+            let budget: int = 9223372036854775807 - hi
+            if abs_lo >= budget {
+                wide = true
+            }
+        }
+    }
+    # else: both bounds negative — hi - lo = |lo| - |hi|, bounded by
+    # |lo| < INT64_MAX, no overflow possible.
+    if wide {
+        # Full-range draw. The case splits by sign of lo / hi:
+        #   * lo >= 0 (only the (0, INT64_MAX) case is wide): draw a
+        #     non-negative magnitude in [0, INT64_MAX) — already in range.
+        #   * lo < 0 && hi >= 0 with both halves near-INT64_MAX: draw
+        #     a magnitude in [0, INT64_MAX) and a random sign — the
+        #     output is in [-INT64_MAX, INT64_MAX], covering both halves
+        #     of the requested range.
+        # The two-sided case is what the wide detection above flags for
+        # the (INT64_MIN, INT64_MAX) span; the one-sided case (0,
+        # INT64_MAX) only fires when lo == 0 && hi == INT64_MAX.
+        let x: int = rand_int(9223372036854775807)
+        if lo >= 0 {
+            # One-sided positive — x is already in [0, INT64_MAX).
+            return x
+        }
+        if hi < 0 {
+            # One-sided negative — mirror the positive magnitude.
+            return 0 - x
+        }
+        # Two-sided crossing zero.
+        if x % 2 == 0 {
+            return 0 - x
+        }
+        return x
+    }
+    let span: int = hi - lo + 1
     return rand_int(span) + lo
 }
 

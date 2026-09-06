@@ -2904,11 +2904,31 @@ fn estimate_stack_size_stmt(ctx: Ctx, sidx: int, mut bytes: int) -> int {
     # caller-saved register spills for very deep chains). We detect
     # call sites by inspecting the statement's expression for a call
     # node. This is conservative — many expressions are not calls.
+    # Deep-scan-15 fix (MEDIUM severity, soundness): the previous
+    # implementation only counted call sites in let (s.value),
+    # if/while (s.cond), and for (s.iter). It MISSED `return` (whose
+    # return-value expression is also in s.value) and `assign` (whose
+    # target and RHS expressions can both contain calls). This
+    # under-counted the frame for code like
+    #   return helper(a, b) + other(c);
+    #   x.y = setup(get_default());
+    # — undermining the #[stack_size(N)] soundness guarantee (a fn
+    # declared stack_size(8) could exceed 8 bytes when its return /
+    # assign sites had nested calls). Add explicit coverage for return
+    # and assign below; the let case is preserved as-is.
     if s.e >= 0 {
         bytes = bytes + estimate_stack_calls(ctx, s.e)
     }
-    if s.value >= 0 && s.kind == "let" {
+    if s.value >= 0 && (s.kind == "let" || s.kind == "return") {
         bytes = bytes + estimate_stack_calls(ctx, s.value)
+    }
+    if s.kind == "assign" {
+        if s.target >= 0 {
+            bytes = bytes + estimate_stack_calls(ctx, s.target)
+        }
+        if s.value >= 0 {
+            bytes = bytes + estimate_stack_calls(ctx, s.value)
+        }
     }
     if s.cond >= 0 && (s.kind == "if" || s.kind == "while") {
         bytes = bytes + estimate_stack_calls(ctx, s.cond)
@@ -3563,10 +3583,24 @@ fn tail_check_expr(ctx: Ctx, e: int, key: str) -> void {
             ai = ai + 1
         }
     }
-    let mut k: int = 0
-    while k < n.args.len() {
-        tail_check_expr(ctx, n.args.get(k), key)
-        k = k + 1
+    # Deep-scan-15 fix (MEDIUM-HIGH severity, soundness): the previous
+    # code unconditionally walked `n.args` as if every entry were a
+    # child expression index. For a `match` node, `n.args` is a list
+    # of arm INDICES (into ctx.match_arms) — small integers like 0, 1,
+    # 2 — NOT expression indices. Walking them as expressions either
+    # crashed (out-of-bounds), or worse, silently walked UNRELATED
+    # expressions (if the arm index happened to be a valid ctx.exprs
+    # slot), causing the tail-call verifier to either flag false
+    # positives or miss real non-tail self-calls nested in arms.
+    # The arm bodies are already walked in the match-specific block
+    # above, so skip the generic args walk for match nodes (mirrors
+    # the discipline used by estimate_stack_calls and the boot checker).
+    if n.kind != "match" {
+        let mut k: int = 0
+        while k < n.args.len() {
+            tail_check_expr(ctx, n.args.get(k), key)
+            k = k + 1
+        }
     }
 }
 
@@ -4618,10 +4652,18 @@ fn annotate_exprs(ctx: Ctx, e: int, facts: map[str, IVal],
     # Recurse.
     annotate_exprs(ctx, n.left, facts, facts_lenhi, nz, depth + 1)
     annotate_exprs(ctx, n.right, facts, facts_lenhi, nz, depth + 1)
-    let mut i: int = 0
-    while i < n.args.len() {
-        annotate_exprs(ctx, n.args.get(i), facts, facts_lenhi, nz, depth + 1)
-        i = i + 1
+    # Deep-scan-15 fix (MEDIUM-HIGH severity, soundness): same bug as
+    # the other tree-walkers — for `match`, `n.args` holds arm INDICES,
+    # not expression indices. Walk arms via the MatchArm table (which
+    # is already done in the match-specific block below); skip the
+    # generic args walk for match to avoid walking arm indices as
+    # expressions (out-of-bounds or silent wrong-node walks).
+    if n.kind != "match" {
+        let mut i: int = 0
+        while i < n.args.len() {
+            annotate_exprs(ctx, n.args.get(i), facts, facts_lenhi, nz, depth + 1)
+            i = i + 1
+        }
     }
     if n.kind == "match" {
         let mut a2: int = 0
@@ -11447,15 +11489,33 @@ fn lto_expr_has_qmark(ctx: Ctx, e: int) -> bool {
     if lto_expr_has_qmark(ctx, ex.right) {
         return true
     }
-    let mut i: int = 0
-    while i < ex.args.len() {
-        if lto_expr_has_qmark(ctx, ex.args.get(i)) {
-            return true
+    # Deep-scan-15 fix (MEDIUM-HIGH severity, soundness): for non-match
+    # nodes, `n.args` is a list of child expression indices — walk them.
+    # For match, `n.args` is a list of arm INDICES (into ctx.match_arms)
+    # and must be walked via `ctx.match_arms[arm_idx].body`. The previous
+    # code unconditionally walked `n.args` as expressions, silently
+    # walking unrelated nodes (or panicking) for match — meaning an
+    # LTO inline-decision could be made on bogus qmark-presence data
+    # and drop a qmark that the inline clone needed.
+    if ex.kind != "match" {
+        let mut i: int = 0
+        while i < ex.args.len() {
+            if lto_expr_has_qmark(ctx, ex.args.get(i)) {
+                return true
+            }
+            i = i + 1
         }
-        i = i + 1
+    } else {
+        # match: walk each arm body via the MatchArm table.
+        let mut ai: int = 0
+        while ai < ex.args.len() {
+            let arm: MatchArm = ctx.match_arms.get(ex.args.get(ai))
+            if arm.body >= 0 && lto_expr_has_qmark(ctx, arm.body) {
+                return true
+            }
+            ai = ai + 1
+        }
     }
-    # match: the scrutinee is ex.left; arms carry their own stmt/expr
-    # lists on the MatchArm table (covered by lto_body_has_qmark).
     return false
 }
 
@@ -13725,10 +13785,16 @@ fn exprs_have_elisions(ctx: Ctx, e: int) -> bool {
     }
     if exprs_have_elisions(ctx, n.left) { return true }
     if exprs_have_elisions(ctx, n.right) { return true }
-    let mut i: int = 0
-    while i < n.args.len() {
-        if exprs_have_elisions(ctx, n.args.get(i)) { return true }
-        i = i + 1
+    # Deep-scan-15 fix (MEDIUM-HIGH severity, soundness): same bug as
+    # tail_check_expr / lto_expr_has_qmark — for a `match` node,
+    # `n.args` holds arm indices, NOT expression indices. Walk arms
+    # via the MatchArm table; walk the generic args only for non-match.
+    if n.kind != "match" {
+        let mut i: int = 0
+        while i < n.args.len() {
+            if exprs_have_elisions(ctx, n.args.get(i)) { return true }
+            i = i + 1
+        }
     }
     if n.kind == "match" {
         let mut a: int = 0

@@ -118,8 +118,69 @@ def transparency_log_append(record: Dict) -> Dict:
     writers don't truncate. The chain hash makes any silent mutation of
     a past record detectable (rewriting line N breaks line N+1's
     prev_hash).
+
+    Deep-scan-15 fix (MEDIUM severity, concurrency): the previous
+    implementation read the previous head's hash, computed a new
+    record, and appended — all WITHOUT holding a lock. Two concurrent
+    `hls-pkg publish` (or `hls-pkg lock`) invocations would both
+    read the same prev_hash, both compute new records chained from
+    it, and both append — forking the chain. Verification would then
+    flag one of them as a rollback. Fix: hold an exclusive `flock`
+    (or `msvcrt.locking` on Windows) on a sidecar lock file for the
+    whole read-compute-append critical section so only one process
+    appends at a time.
     """
-    # Read the previous head's hash so we can chain to it.
+    import contextlib
+    # Open the lock file (creating it if needed) and acquire an
+    # exclusive lock for the whole critical section. The lock file
+    # is separate from the log so the log itself can stay in `a+b`.
+    lock_path = TRANSPARENCY_LOG + ".lock"
+    with contextlib.closing(open(lock_path, "a+b")) as lockf:
+        _acquire_exclusive_lock(lockf)
+        try:
+            prev_hash = _read_chain_head_hash()
+            record = _build_chained_record(record, prev_hash)
+            # Append atomically: open in `ab` mode (O_APPEND on POSIX
+            # guarantees each write() is atomic up to PIPE_BUF).
+            with open(TRANSPARENCY_LOG, "ab") as f:
+                f.write((json.dumps(record, sort_keys=True) + "\n").encode("utf-8"))
+        finally:
+            _release_exclusive_lock(lockf)
+    return record
+
+
+def _acquire_exclusive_lock(lockf) -> None:
+    """Acquire an exclusive lock on `lockf` (cross-platform)."""
+    if sys.platform == "win32":
+        try:
+            import msvcrt
+            msvcrt.locking(lockf.fileno(), msvcrt.LK_LOCK, 1)
+        except (ImportError, OSError):
+            # Best-effort fallback on Windows without msvcrt — the
+            # caller should still be correct because the file open
+            # mode `a+b` doesn't truncate. The lock is advisory only.
+            pass
+    else:
+        import fcntl
+        fcntl.flock(lockf.fileno(), fcntl.LOCK_EX)
+
+
+def _release_exclusive_lock(lockf) -> None:
+    """Release the exclusive lock previously acquired on `lockf`."""
+    if sys.platform == "win32":
+        try:
+            import msvcrt
+            msvcrt.locking(lockf.fileno(), msvcrt.LK_UNLCK, 1)
+        except (ImportError, OSError):
+            pass
+    else:
+        import fcntl
+        fcntl.flock(lockf.fileno(), fcntl.LOCK_UN)
+
+
+def _read_chain_head_hash() -> str:
+    """Return the chain_hash of the last record in the transparency
+    log (or "0"*64 if the log is empty / corrupt)."""
     # Deep-scan-7 fix: the old code read only the last 4 KB of the log
     # and split by newlines — if the LAST record was >4 KB (e.g. a
     # large package hash with a long `deps` field), json.loads failed
@@ -150,7 +211,12 @@ def transparency_log_append(record: Dict) -> Dict:
     except (FileNotFoundError, OSError, ValueError):
         # First record (or corrupted log) — chain from genesis.
         pass
-    # Build the record.
+    return prev_hash
+
+
+def _build_chained_record(record: Dict, prev_hash: str) -> Dict:
+    """Build a chained transparency-log record: assign seq/timestamp/
+    prev_hash, then compute and attach the chain_hash field."""
     record = dict(record)
     record["seq"] = _next_seq()
     record["timestamp"] = int(time.time())
@@ -160,9 +226,6 @@ def transparency_log_append(record: Dict) -> Dict:
     canon = json.dumps(record, sort_keys=True, separators=(",", ":"))
     chain = hashlib.sha256((prev_hash + canon).encode("utf-8")).hexdigest()
     record["chain_hash"] = chain
-    # Append.
-    with open(TRANSPARENCY_LOG, "ab") as f:
-        f.write((json.dumps(record, sort_keys=True) + "\n").encode("utf-8"))
     return record
 
 
@@ -679,16 +742,29 @@ def resolve_dependency(name: str, source: Dict, cache_dir: str = CACHE_DIR) -> s
         # Checkout tag/branch if specified.
         ref = source.get("tag") or source.get("branch") or "main"
         _validate_git_arg(ref, "dependency %s git ref" % name)
+        # Deep-scan-15 fix (MEDIUM severity, supply-chain): the previous
+        # implementation silently fell back to `git checkout main` if the
+        # fetch/checkout of the declared `ref` failed. A moved tag, a
+        # force-pushed branch, or a typo would then fetch the WRONG code
+        # (the maintainer's `main` HEAD, which may have been compromised
+        # since the lockfile was written). Surface the failure loudly so
+        # the user knows their pinned dependency is unreachable instead
+        # of silently substituting it.
         try:
             subprocess.run(["git", "-C", clone_dir, "fetch", "--quiet",
                             "origin", "--", ref], check=True, capture_output=True,
                            timeout=300)
             subprocess.run(["git", "-C", clone_dir, "checkout", "--quiet",
                             ref], check=True, capture_output=True, timeout=300)
-        except subprocess.CalledProcessError:
-            # Fallback: try just `git checkout main`.
-            subprocess.run(["git", "-C", clone_dir, "checkout", "--quiet",
-                            "main"], check=True, capture_output=True, timeout=300)
+        except subprocess.CalledProcessError as ex:
+            raise RuntimeError(
+                "dependency %s: failed to fetch/checkout git ref '%s' "
+                "(declared in hls-pkg.lock). The previous behaviour silently "
+                "fell back to 'main' — a supply-chain risk if the ref was "
+                "force-pushed or the tag was moved. Inspect the upstream "
+                "repository or update the lockfile. Git stderr: %s"
+                % (name, ref, ex.stderr.decode("utf-8", "replace") if ex.stderr else "")
+            ) from ex
         path = source.get("path", "")
         if path:
             full = _confine(clone_dir, path, "dependency %s" % name)
