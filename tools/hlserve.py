@@ -226,9 +226,18 @@ class SSEHandler:
     def send(self, event: str, data: str = ""):
         if not self.alive:
             return
+        # Deep-scan-20 fix (HIGH, SSE injection): SSE fields are
+        # line-delimited; a `\r` or `\n` in `event` would inject a
+        # bogus `event:` field, and `\r` in `data` (only `\n` was
+        # split) would inject a `data:` field. Reject CR/LF in event
+        # names; normalise CRLF/CR to LF in data.
+        if "\n" in event or "\r" in event:
+            raise ValueError("SSE event name must not contain CR/LF "
+                             "(would inject a bogus event field)")
+        safe_data = data.replace("\r\n", "\n").replace("\r", "\n")
         try:
             payload = "event: %s\n" % event
-            for line in data.split("\n"):
+            for line in safe_data.split("\n"):
                 payload += "data: %s\n" % line
             payload += "\n"
             self.wfile.write(payload.encode("utf-8"))

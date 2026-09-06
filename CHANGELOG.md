@@ -13,6 +13,93 @@ stability (125–140), and final stabilisation toward v1.0 (141–150).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
+## [v0.51.2-alpha] — Stage 32 perfection (deep-scan-20): 11 bug fixes
+
+> A second-pass whole-codebase audit that closed 11 more latent
+> bugs across `tools/hlserve.py`, `tools/hls-pkg.py`, and 5 std/
+> modules. The deep-scan-19 pass closed 15 bugs; this pass closed
+> the next layer — focusing on stdlib edge cases (CSV, IPv6,
+> INT64_MIN exponents, SSE event injection, supply-chain fail-open).
+
+### Added — Stage 32 perfection (deep-scan-20) soundness + correctness fixes
+
+- **BUG-001 (HIGH, security):** `SSEHandler.send` in
+  `tools/hlserve.py` interpolated `event` directly into the SSE
+  payload and split `data` only on `\n` (not `\r`). A `\r` or `\n`
+  in either parameter would inject a bogus `event:` or `data:`
+  field — letting a crafted payload override the dispatched event
+  name. Fixed: reject CR/LF in event names; normalise CRLF/CR to
+  LF in data.
+- **BUG-002 (MED, security):** `sanitize_path` in
+  `std/sanitize.hls` only checked for a leading `/` (byte 47) as
+  the absolute-path marker. Windows drive-letter paths like
+  `C:/Windows/System32/...` started with a letter, passed the
+  check, had no `..` segments after splitting on `/`, and
+  contained no backslash — so they were returned unchanged,
+  defeating the path-traversal sanitizer on Windows hosts.
+  Fixed: reject `<letter>:` at the start of the path.
+- **BUG-003 (MED, malformed input):** `csv_parse` in
+  `std/csv.hls` silently accepted unterminated quoted fields —
+  when the input ended inside `in_quotes`, the partial content
+  was flushed as a valid field value. RFC 4180 requires quoted
+  fields to be closed. Fixed: panic with a clear message.
+- **BUG-004 (MED, overflow):** `math_power_float` in
+  `std/math.hls` computed `0 - exp` for negative exponents; for
+  `exp = INT64_MIN`, this overflows int64 (two's complement
+  wraps back to INT64_MIN, a negative number). The loop then
+  never executed, so the function returned `1.0` instead of the
+  correct ~0.0. Fixed: guard `exp == INT64_MIN` explicitly.
+- **BUG-005 (MED, overflow):** `time_elapsed_ms` in
+  `std/time.hls` returned `end - start` without overflow
+  protection; for `start = INT64_MIN, end = INT64_MAX`, the
+  difference is `2^64 - 1`, which wraps to -1 in int64,
+  violating the "never negative" contract. Fixed: overflow
+  guard with a clear panic message.
+- **BUG-006 (MED, malformed input):** `url_parse_authority` in
+  `std/url.hls` silently dropped trailing content after an IPv6
+  literal — `http://[::1]evil/path` set `u.host = "[::1]"` and
+  discarded `evil`, potentially bypassing host-based validation.
+  Fixed: panic if there is unexpected content after the IPv6
+  literal (or after the optional :port).
+- **BUG-007 (MED, security):** `cmd_verify` in
+  `tools/hls-pkg.py` swallowed ALL exceptions during commit
+  verification with `except (ValueError, OSError): pass` — a
+  missing `clone_dir` (which could indicate the cache was
+  deleted to hide a moved tag) was silently treated as "OK".
+  Fixed: print a warning and increment `warnings` (new counter)
+  so the user knows the supply-chain pin was not re-verified.
+- **BUG-008 (MED, TOML compliance):** `_parse_value` in
+  `tools/hls-pkg.py` only decoded `\n`, `\t`, `\r` and passed
+  everything else through as a literal char. `\b` became `b`
+  (not backspace), `\f` became `f` (not form-feed), `\uXXXX`
+  became `uXXXX` (not the codepoint), `\"` became `"` (which
+  then terminated the string early). Fixed: handle all TOML
+  escapes (`\b \f \" \\ \uXXXX \UXXXXXXXX`).
+- **BUG-009 (LOW, malformed input):** `_parse_value` bare-token
+  parser in `tools/hls-pkg.py` only terminated on `" \t\r\n,"`
+  — missing `]`, `}`, `=`, `#`. A malformed manifest like
+  `{ key = foo}bar }` consumed `foo}bar` as a single token.
+  Fixed: terminate on any structural character.
+- **BUG-010 (LOW, OOM):** `cmd_publish` in `tools/hls-pkg.py`
+  read the entire file into memory for SHA-256 hashing
+  (`h.update(f.read())`). A multi-GB .hls file would crash with
+  MemoryError. Fixed: use the chunked-read pattern
+  (`f.read(65536)`) already used by `_sha256_directory`.
+- **BUG-011 (LOW, race):** `extract_effects` in
+  `tools/hls-pkg.py` wrote its audit-wrapper file to a fixed
+  path `.hls-pkg-audit-wrapper.hls`. Two concurrent `hls-pkg
+  lock` runs auditing the same dependency in the same
+  `target_dir` would overwrite each other's wrapper, then the
+  `finally: os.unlink` would delete the wrong file. Fixed:
+  include the PID in the wrapper filename for uniqueness.
+
+### Added — tests
+
+- The existing `tests/ok/feat_stage32_perfection.hls` continues
+  to pass after deep-scan-20 (no regressions). Differential
+  (interpreter ↔ native) verified green for all stdlib,
+  url, csv, math, and time tests.
+
 ## [v0.51.1-alpha] — Stage 32 perfection (deep-scan-19): 15 bug fixes
 
 > A whole-codebase audit that closed 15 latent bugs across
