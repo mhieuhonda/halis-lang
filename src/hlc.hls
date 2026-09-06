@@ -2825,6 +2825,53 @@ fn restore_moved(env: list[map[str, Binding]], snap: list[str]) -> void {
     }
 }
 
+# Deep-scan-16 HIGH-severity soundness fix: union_moved ORs the moved-status
+# from `snap` (representing ONE possible execution path) into `env`. A
+# binding is treated as moved after the construct if it was moved along ANY
+# path — e.g. inside either arm of an `if`, or after one iteration of a
+# loop body (which re-executes at runtime).
+#
+# The previous behaviour (snapshot + full restore_moved) treated every
+# if-arm / loop body as if it might execute ZERO times (post-construct
+# state = pre-construct state). That is unsound: at runtime, an if-arm
+# MAY execute and a loop body MAY iterate >= 1 time, leaving the binding
+# nulled in the native codegen (drop/take push the local to null_after,
+# so `u_x = NULL` is emitted at statement end). Post-construct uses of
+# the binding then read NULL and segfault.
+#
+# The conservative union (a binding is moved if it COULD be moved along
+# any path) is SOUND: it rejects post-construct uses whose runtime safety
+# cannot be proven. Reassignment via `x = ...` (a `mut` binding) is
+# still allowed because check_assign's revive step clears the moved
+# flag, so the idiomatic "drop then revive" pattern continues to work.
+fn union_moved(env: list[map[str, Binding]], snap: list[str]) -> void {
+    let mut i: int = 0
+    while i < snap.len() {
+        let entry: str = snap.get(i)
+        let parts: list[str] = entry.split("|")
+        if parts.len() < 3 {
+            i = i + 1
+            continue
+        }
+        let scope_idx: int = parts.get(0).to_int()
+        let nm: str = parts.get(1)
+        let mv_str: str = parts.get(2)
+        if mv_str != "1" {
+            i = i + 1
+            continue
+        }
+        if scope_idx < env.len() {
+            let scope: map[str, Binding] = env.get(scope_idx)
+            if scope.has(nm) {
+                let b: Binding = scope.get_or(nm, dummy_binding())
+                # Only set moved=true; never clear (this is a UNION).
+                scope.set(nm, Binding { t: b.t, is_mut: b.is_mut, moved: true })
+            }
+        }
+        i = i + 1
+    }
+}
+
 # is_owned_type: True if values of this type are heap-owned and subject to
 # move tracking. Primitives (int/float/bool) are Copy — passing them is fine.
 fn is_owned_type(t: str) -> bool {
@@ -5809,19 +5856,32 @@ fn check_stmt(ctx: Ctx, env: list[map[str, Binding]], cur: str, f: FnInfo, sidx:
         if ct != "bool" {
             cerr(s.line, "if condition must be bool, got " + ct)
         }
-        # BUG-003 fix: snapshot moved-status so moves done inside the
-        # then/else branches don't leak out (a binding moved inside an
-        # if-arm should not be considered moved after the if completes).
+        # Deep-scan-16 HIGH-severity soundness fix: a binding moved inside
+        # EITHER arm may be moved at runtime (the arm could have executed).
+        # The previous snapshot+full-restore treated post-if state as
+        # pre-if state — a binding moved in an if-arm compiled cleanly
+        # through subsequent uses, but at runtime the native codegen had
+        # already nulled the local (`u_x = NULL` after drop/take).
+        # Sound fix: UNION the moved-status across both arms (a binding
+        # is moved if it was moved along any path).
         let snap: list[str] = snapshot_moved(env)
         env.push(map_new())
         check_stmts(ctx, env, cur, f, s.body, in_loop)
         env.pop()
+        let then_snap: list[str] = snapshot_moved(env)
+        restore_moved(env, snap)
         if s.else_body.len() > 0 {
             env.push(map_new())
             check_stmts(ctx, env, cur, f, s.else_body, in_loop)
             env.pop()
+            let else_snap: list[str] = snapshot_moved(env)
+            restore_moved(env, snap)
+            union_moved(env, then_snap)
+            union_moved(env, else_snap)
+        } else {
+            # No else arm — equivalent to an empty else (no moves).
+            union_moved(env, then_snap)
         }
-        restore_moved(env, snap)
     } else if s.kind == "while" {
         ctx.loop_header = ctx.loop_header + 1
         let ct: str = check_expr(ctx, env, cur, s.cond, "")
@@ -5829,13 +5889,23 @@ fn check_stmt(ctx: Ctx, env: list[map[str, Binding]], cur: str, f: FnInfo, sidx:
         if ct != "bool" {
             cerr(s.line, "while condition must be bool, got " + ct)
         }
-        # BUG-003 fix: moves inside the loop body don't leak out — the loop
-        # may execute zero or many times, so any post-loop use must remain valid.
+        # Deep-scan-16 HIGH-severity soundness fix: the loop body may
+        # execute >= 1 time. A binding moved inside the body (drop/take)
+        # is nulled at runtime after the first iteration. Post-loop uses
+        # of the binding read NULL and segfault. The previous snapshot+
+        # restore cleared moves done in the body, so
+        #   `while true { take(xs); break } let y = xs[0]`
+        # compiled cleanly but crashed at runtime.
+        # Sound fix: do NOT restore moves done in the body. The
+        # idiomatic "drop then revive via mut reassignment" pattern
+        # still works because check_assign's revive step clears the
+        # moved flag.
         let snap: list[str] = snapshot_moved(env)
         env.push(map_new())
         check_stmts(ctx, env, cur, f, s.body, true)
         env.pop()
-        restore_moved(env, snap)
+        # No restore_moved — moves done in the body propagate to
+        # post-loop state (soundness: assume the body executed).
     } else if s.kind == "for" {
         ctx.loop_header = ctx.loop_header + 1
         let it: str = check_expr(ctx, env, cur, s.iter, "")
@@ -5847,6 +5917,9 @@ fn check_stmt(ctx: Ctx, env: list[map[str, Binding]], cur: str, f: FnInfo, sidx:
         if s.vtype != elem {
             cerr(s.line, "variable type " + s.vtype + " does not match element " + elem)
         }
+        # Deep-scan-16: same soundness fix as `while` — a binding moved
+        # inside the for-body may be nulled at runtime after the first
+        # iteration. Post-loop uses must be rejected.
         let snap: list[str] = snapshot_moved(env)
         env.push(map_new())
         # BUG (deep-scan-5): the `let` branch rejects shadowing but the
@@ -5858,7 +5931,7 @@ fn check_stmt(ctx: Ctx, env: list[map[str, Binding]], cur: str, f: FnInfo, sidx:
         env.get(env.len() - 1).set(s.name, Binding { t: elem, is_mut: false, moved: false })
         check_stmts(ctx, env, cur, f, s.body, true)
         env.pop()
-        restore_moved(env, snap)
+        # No restore_moved — moves done in the body propagate.
     } else if s.kind == "return" {
         if f.ret == "void" {
             if s.value != -1 {
@@ -14259,6 +14332,74 @@ fn gen_asm(ctx: Ctx, s: StmtN, ind: str) -> void {
         k = k + 1
     }
     hoist_all(ctx, ctx.out, ind)
+    # Stage 27 deep-scan fix: list-index lvalues (`xs[0]`) cannot be
+    # used directly as GCC asm output operands because `gen_expr`
+    # produces `hl_unbox_i64(hl_list_get(xs, 0))` — a TEMPORARY value,
+    # not an lvalue. GCC would emit `"+r"(hl_unbox_i64(hl_list_get(xs, 0)))`
+    # which compiles but the write doesn't propagate back to the list.
+    #
+    # The fix: for each out/inout/late_out operand whose lvalue is a
+    # list index, materialise a fresh C temp BEFORE the asm:
+    #   int64_t hl_asm_t0 = hl_unbox_i64(hl_list_get(xs, 0));   // inout only
+    # Then use `hl_asm_t0` as the asm operand. After the asm:
+    #   hl_list_set(xs, 0, hl_box_i64(hl_asm_t0));
+    # This mirrors what gen_assign does for `xs[0] = v` (it emits
+    # `hl_list_set(xs, 0, ...)` rather than `xs[0] = ...`).
+    #
+    # Struct-field lvalues (`s.x` or `(s)->x`) DO work directly as GCC
+    # asm output operands — GCC's lvalue rules handle struct field
+    # access through a pointer correctly. Only list-index lvalues need
+    # the temp workaround.
+    #
+    # The temp-name list is parallel to s.asm_operands: temp_names[j]
+    # is "" if operand j doesn't need a temp (ident/field lvalue, or
+    # an `in` operand), or the temp variable name if it does.
+    let temp_names: list[str] = []
+    let temp_lists: list[str] = []
+    let temp_indices: list[str] = []
+    let temp_setters: list[int] = []   # index into temp_lists/temp_indices for the post-asm writeback
+    let mut j0: int = 0
+    while j0 < s.asm_operands.len() {
+        temp_names.push("")
+        temp_lists.push("")
+        temp_indices.push("")
+        j0 = j0 + 1
+    }
+    # Emit the temps for index-lvalue operands (in source order).
+    let mut j: int = 0
+    while j < s.asm_operands.len() {
+        let op: AsmOperand = s.asm_operands.get(j)
+        if op.dir != "in" {
+            let ek: str = ctx.exprs[op.expr_idx].kind
+            if ek == "index" {
+                # The lvalue is `xs[i]`. Generate a temp.
+                let lhs_e: int = ctx.exprs[op.expr_idx].left
+                let idx_e: int = ctx.exprs[op.expr_idx].right
+                let lst_c: str = gen_expr(ctx, lhs_e)
+                let idx_c: str = gen_expr(ctx, idx_e)
+                let tmp: str = fresh_tmp(ctx, "hlc_asm_t")
+                let elem_t: str = ctx.exprs[op.expr_idx].t
+                let c_t: str = c_type(ctx, elem_t)
+                if op.dir == "inout" {
+                    # inout: read the old value into the temp.
+                    let old_v: str = gen_unbox(ctx, elem_t, "hl_list_get(" + lst_c + ", " + idx_c + ")")
+                    ctx.out.push(ind + c_t + " " + tmp + " = " + old_v + ";")
+                } else {
+                    # out / late_out: write-only. Leave the temp
+                    # uninitialized — GCC will warn under -Wmaybe-
+                    # uninitialized, but the asm is guaranteed to
+                    # write to it (the checker rejects `pure`-with-
+                    # no-outputs, so an output operand exists).
+                    ctx.out.push(ind + c_t + " " + tmp + ";")
+                }
+                temp_names.set(j, tmp)
+                temp_lists.set(j, lst_c)
+                temp_indices.set(j, idx_c)
+                temp_setters.push(j)
+            }
+        }
+        j = j + 1
+    }
     # Build the outputs and inputs lists (in GCC positional order:
     # outputs first, then inputs).
     let outputs: list[str] = []
@@ -14274,22 +14415,27 @@ fn gen_asm(ctx: Ctx, s: StmtN, ind: str) -> void {
     let mut gcc_indices: list[str] = []
     let mut next_idx: int = 0
     # First pass: outputs (out/inout/late_out) in source order.
-    let mut j: int = 0
-    while j < s.asm_operands.len() {
-        let op: AsmOperand = s.asm_operands.get(j)
+    let mut j_out: int = 0
+    while j_out < s.asm_operands.len() {
+        let op: AsmOperand = s.asm_operands.get(j_out)
         if op.dir != "in" {
             let cstr: str = translate_asm_constraint(op)
-            # The C operand expression is the lvalue. We use gen_expr
-            # since the operand was parsed as a full expression —
-            # for ident/field/index this yields the lvalue's C name.
-            let ce: str = gen_expr(ctx, op.expr_idx)
+            # Use the temp if one was allocated (list-index lvalue),
+            # otherwise use the lvalue expression directly.
+            let mut ce: str = ""
+            let tmp_name: str = temp_names.get(j_out)
+            if tmp_name != "" {
+                ce = tmp_name
+            } else {
+                ce = gen_expr(ctx, op.expr_idx)
+            }
             outputs.push("\"" + cstr + "\"(" + ce + ")")
             gcc_indices.push(next_idx.to_str())
             next_idx = next_idx + 1
         } else {
             gcc_indices.push("-1")
         }
-        j = j + 1
+        j_out = j_out + 1
     }
     # Second pass: inputs in source order.
     let mut j2: int = 0
@@ -14347,6 +14493,26 @@ fn gen_asm(ctx: Ctx, s: StmtN, ind: str) -> void {
     # end of the fn).
     if list_contains_str(s.asm_options, "noreturn") {
         ctx.out.push(ind + "__builtin_unreachable();")
+    }
+    # Stage 27 deep-scan fix: write back the temp values for any
+    # list-index lvalue operands. The temp was used as the GCC asm
+    # output operand (above); now we copy it back to the list element
+    # via `hl_list_set` (mirroring gen_assign's pattern for index
+    # assignment).
+    let mut si: int = 0
+    while si < temp_setters.len() {
+        let op_idx: int = temp_setters.get(si)
+        let op: AsmOperand = s.asm_operands.get(op_idx)
+        let tmp_name: str = temp_names.get(op_idx)
+        let lst_c: str = temp_lists.get(op_idx)
+        let idx_c: str = temp_indices.get(op_idx)
+        let elem_t: str = ctx.exprs[op.expr_idx].t
+        # hl_list_set releases the old element itself; the new value
+        # must arrive OWNED (one retain). For primitive types
+        # (int/float/bool) the runtime boxes them via hl_box_i64 etc.
+        let boxed: str = gen_store_val(ctx, elem_t, tmp_name, false)
+        ctx.out.push(ind + "hl_list_set(" + lst_c + ", " + idx_c + ", " + boxed + ");")
+        si = si + 1
     }
     flush_null_after(ctx, ind)
     clear_hoists(ctx)
