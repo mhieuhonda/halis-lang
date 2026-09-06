@@ -963,6 +963,23 @@ class Interp:
             raise ContinueSig()
         elif k == "expr":
             self.eval_expr(s["e"], env)
+        elif k == "asm":
+            # Stage 27 (v0.50.0-alpha): inline-assembly statement.
+            # The boot interpreter is a pure-Python reference and
+            # cannot execute native asm. Raise a clean error rather
+            # than silently no-op'ing (a silent no-op would mislead
+            # users — `asm!("mov $0, {0}", out(reg) x); print(x)`
+            # would print the original x and look like the asm ran).
+            # Programs that declare `asm!` blocks but do NOT execute
+            # them at interpreter runtime (e.g. an `asm!` inside a
+            # kernel IRQ handler never called from `main`) run fine.
+            raise HLPanic(
+                "asm! cannot be executed by the boot interpreter — "
+                "use the native compiler `hlc` (which lowers asm! to "
+                "GCC extended asm) or wrap the asm! call in a path "
+                "the interpreter does not take (e.g. an extern \"C\" "
+                "fn or a kernel-only entrypoint)",
+                self.line)
         else:
             raise HLPanic("unknown statement: %s" % k, self.line)
 

@@ -1,0 +1,142 @@
+# asm_demo.hls — Stage 27 (v0.50.0-alpha): inline assembly (`asm!`).
+#
+# Demonstrates the four asm! forms from the roadmap:
+#
+#   1. Bare asm (no operands): `asm!("nop")`.
+#   2. Output-only: `asm!("mov $$0, {0}", out(reg) x)` — emit a single
+#      `mov` instruction with a C-level output operand tied to an HLS
+#      variable.
+#   3. Input + output: `asm!("add {0}, {1}", in(reg) y, out(reg) x)`
+#      — read an HLS variable as input, write another as output.
+#   4. Specific-register form: `asm!("in {0}, {1}", in("dx") port,
+#      out("al") val)` — the `inb(port) -> u8` helper from the
+#      Stage 27 acceptance criterion.
+#
+# The first three forms compile and run on the host (no privileged
+# instructions involved). The fourth form (port I/O) compiles cleanly
+# but the actual `in` instruction requires ring-0 privileges; running
+# it from a user-space program raises #GP. The demo declares the
+# helper but does NOT call it from main() — exactly like the kernel
+# IRQ handler example in kernel_irq_demo.hls (Stage 28).
+#
+# Acceptance: a typesafe `inb(port) -> int` helper compiles to a
+# single `in` instruction with no compiler-generated memory accesses
+# — verified by `make asm-acceptance`.
+
+import "std.bits"
+
+# A simple `cpuid`-style helper: read a CPU timestamp counter into an
+# HLS variable. Demonstrates output-only asm.
+#
+# NOTE: `rdtsc` is a privileged instruction on some platforms, but on
+# x86-64 user-space it is allowed (kernel-mode CR4.TSD bit clear by
+# default). The output is a 64-bit value split into EDX:EAX; we use
+# the `A` constraint (GCC: EDX:EAX as a single 64-bit value).
+fn read_tsc() -> int {
+    let mut lo: int = 0
+    let mut hi: int = 0
+    # `rdtsc` writes EDX:EAX. Use specific-register constraints so
+    # the asm compiles to a single instruction (no extra moves).
+    asm!("rdtsc", out("eax") lo, out("edx") hi)
+    # Combine into a 64-bit value (HLS int is int64). HLS has no
+    # hex literals (only decimal); use std.bits for the AND/OR.
+    return bits_or(bits_shl(hi, 32), bits_and(lo, 4294967295))
+}
+
+# A `pause` (REP NOP) hint — used in spin-wait loops to hint the CPU
+# that we're in a busy-wait and it should reduce power / avoid memory
+# ordering violations. No operands, no side effects beyond the CPU
+# hint. Options `nomem` (does not touch memory) and `preserves_flags`
+# (does not modify RFLAGS).
+fn cpu_pause() -> void {
+    asm!("rep nop", options(nomem, preserves_flags))
+}
+
+# An `add` instruction with one input and one output — the simplest
+# form of input + output asm. The output (`x`) is updated in place.
+# In AT&T syntax, `$1` is an immediate operand (the leading `$`
+# marks it as a literal, not a register).
+fn asm_add_one(mut x: int) -> int {
+    asm!("add $1, {0}", inout(reg) x)
+    return x
+}
+
+# A pure asm! — has an output but no side effects. The `pure` option
+# tells gcc the asm has no side effects beyond its outputs and may be
+# elided if the outputs are unused. The codegen DROPS `__volatile__`
+# (gcc's pure-asm convention: `__volatile__` keeps the asm; without
+# it, gcc may CSE/elide).
+fn asm_pure_read(x: int) -> int {
+    let mut y: int = 0
+    asm!("mov {1}, {0}", in(reg) x, out(reg) y, options(pure, nomem, preserves_flags))
+    return y
+}
+
+# The Stage 27 acceptance helper: a typesafe `inb(port) -> int` that
+# compiles to a SINGLE `in` instruction (no compiler-generated memory
+# accesses). The HLS source uses GCC's extended-asm template modifiers
+# directly: `%w1` is the WORD form of operand 1 (DX, the port — `in`
+# reads from a 16-bit port address), and `%b0` is the BYTE form of
+# operand 0 (AL, the byte read). GCC allocates RAX/RDX for the `=a`/
+# `d` constraints, but the asm instruction itself operates on the
+# byte/word form — the upper 56 bits of RAX are zero-extended by
+# GCC after the asm (the `=a` constraint is a write-only output, and
+# the C compiler doesn't read the upper bits).
+#
+# The `bits_and(val, 255)` mask is a defensive zero-extend of the byte
+# read (the asm writes only AL, leaving the upper 56 bits of RAX
+# untouched; the mask guarantees the function returns a value in
+# [0, 255] regardless of the upper-bit state). Under -O2 gcc folds
+# this into a `movzbl` after the `in` — the asm itself remains a
+# single `in` instruction with no compiler-generated memory accesses
+# (the `nomem` option tells gcc the asm doesn't touch memory).
+#
+# The helper is NOT called from main() — `in` is a privileged
+# instruction that would raise #GP from ring 3. It exists purely as
+# a freestanding C declaration that a kernel would link against
+# (matching the kernel_irq_demo.hls pattern from Stage 28).
+fn inb(port: int) -> int {
+    let mut val: int = 0
+    asm!("in %w1, %b0", in("edx") port, out("eax") val, options(nomem, preserves_flags))
+    return bits_and(val, 255)
+}
+
+# A matching `outb` helper — write a byte to an I/O port. The asm
+# template `out %b1, %w0` (AT&T syntax: source first, destination
+# second) writes AL to port DX.
+fn outb(port: int, val: int) -> void {
+    asm!("out %b1, %w0", in("edx") port, in("eax") val, options(nomem, preserves_flags))
+}
+
+# A `hlt`-style noreturn helper — the asm does not fall through, so
+# we annotate it with `options(noreturn)`. The codegen emits
+# `__builtin_unreachable()` after the asm so gcc knows the
+# surrounding function does not return on this path.
+fn halt_forever() -> void {
+    asm!("hlt", options(nomem, noreturn))
+}
+
+# main() runs the safe helpers (read_tsc, asm_add_one, cpu_pause)
+# and prints the inb/outb/halt signatures for documentation. The
+# privileged helpers (inb, outb, halt_forever) are NOT called — they
+# would crash the program in user-space.
+fn main() -> int uses IO {
+    let t0: int = read_tsc()
+    let mut x: int = 41
+    x = asm_add_one(x)
+    cpu_pause()
+    let t1: int = read_tsc()
+    let dt: int = t1 - t0
+    println("Stage 27 asm! demo:")
+    println("  read_tsc()       -> " + t0.to_str())
+    println("  asm_add_one(41)  -> " + x.to_str())
+    println("  cpu_pause()      -> (no observable effect)")
+    println("  read_tsc()-t0    -> " + dt.to_str() + " cycles (host dependent)")
+    println("Helpers declared (NOT called from ring-3 user-space):")
+    println("  inb(port: int) -> int            // single 'in %dx, %al'")
+    println("  outb(port: int, val: int) -> void // single 'out %al, %dx'")
+    println("  halt_forever() -> void           // 'hlt' + noreturn")
+    println("Run `make asm-acceptance` to verify inb compiles to a single in instruction.")
+    return 0
+}
+

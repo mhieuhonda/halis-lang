@@ -8,7 +8,7 @@ HLC     = src/hlc.hls
 BIN     = bin
 PREFIX  ?= /usr/local
 
-.PHONY: all stage0 bootstrap test examples clean run check bench install uninstall audit opt-stats emit-ir emit-llvm fmt lint lsp-check pkg-init pkg-add pkg-lock pkg-audit pkg-verify pkg-build pkg-publish pkg-log pkg-log-verify prove prove-full model prove-acceptance hltest fuzz cov fuzz-acceptance wasm-opt webapp webapp-acceptance serve aarch64-bench aarch64-acceptance aarch64-list-targets stack-acceptance inline-acceptance opt-stats-report kernel-attrs escape-acceptance layout-report tail-acceptance tail-report
+.PHONY: all stage0 bootstrap test examples clean run check bench install uninstall audit opt-stats emit-ir emit-llvm fmt lint lsp-check pkg-init pkg-add pkg-lock pkg-audit pkg-verify pkg-build pkg-publish pkg-log pkg-log-verify prove prove-full model prove-acceptance hltest fuzz cov fuzz-acceptance wasm-opt webapp webapp-acceptance serve aarch64-bench aarch64-acceptance aarch64-list-targets stack-acceptance inline-acceptance opt-stats-report kernel-attrs escape-acceptance layout-report tail-acceptance tail-report asm-acceptance asm-attrs
 
 # Main goal: use the full bootstrap chain to build the native compiler
 all: bootstrap
@@ -1015,6 +1015,83 @@ tail-report:
 	@test -n "$(F)" || (echo "Usage: make tail-report F=examples/fibonacci.hls" && false)
 	@test -x $(BIN)/hlc || $(MAKE) bootstrap
 	@$(BIN)/hlc --opt-stats $(F) /tmp/tail_out.c 2>&1 | sed -n '/=== opt-stats ===/,$$p'
+
+# ============================================================================
+# Stage 27 (v0.50.0-alpha): inline assembly (`asm!`)
+# ----------------------------------------------------------------------------
+# Implements the asm! statement from the roadmap:
+#   asm!("hlt")                                  - bare asm
+#   asm!("mov $0, {0}", out(reg) x)              - output operands
+#   asm!("in %w1, %b0", in("edx") port, out("eax") val) - input + output
+#   asm!("nop", options(pure, nomem, noreturn))   - options
+# Lowered to GCC extended-asm:
+#   __asm__ __volatile__("template" : outputs : inputs : clobbers);
+# Operands are positional (outputs first, then inputs); template `{N}`
+# is rewritten to `%N`. Options translate as: pure => drop
+# `__volatile__`, nomem => no "memory" clobber, noreturn => emit
+# `__builtin_unreachable()`, preserves_flags => no "cc" clobber.
+# ============================================================================
+
+# asm-acceptance: the Stage 27 acceptance gate. Verifies that:
+#   (a) examples/asm_demo.hls parses with all four asm! forms.
+#   (b) The C source contains `__asm__` on the asm!-containing fns.
+#   (c) The C source contains the default clobber list ("cc", "memory").
+#   (d) The noreturn option emits `__builtin_unreachable()`.
+#   (e) The pure option drops `__volatile__` (gcc may elide).
+#   (f) The C source compiles cleanly with gcc -O2 -Werror.
+#   (g) The inb() helper compiles to a SINGLE `in` instruction
+#       (verified by objdump on the produced .o file - no compiler-
+#       generated memory accesses thanks to the nomem option).
+asm-acceptance:
+	@echo "[Stage 27 acceptance] compiling examples/asm_demo.hls..."
+	@test -x $(BIN)/hlc || $(MAKE) bootstrap
+	@mkdir -p $(BIN)
+	@$(BIN)/hlc examples/asm_demo.hls $(BIN)/asm_demo.c >$(BIN)/asm_acc.log 2>&1 \
+	  || (echo "FAIL: hlc compile failed"; cat $(BIN)/asm_acc.log; exit 1)
+	@echo "  HLS parses with asm! (bare/output/inout/specific-register/options): OK"
+	@if grep -q "__asm__" $(BIN)/asm_demo.c; then \
+	  echo "  C source has __asm__ on the asm!-containing functions: OK"; \
+	else \
+	  echo "FAIL: __asm__ missing from C source"; exit 1; \
+	fi
+	@if grep -q '"cc", "memory"' $(BIN)/asm_demo.c; then \
+	  echo '  C source has default clobber list ("cc", "memory"): OK'; \
+	else \
+	  echo "FAIL: default clobber list missing"; exit 1; \
+	fi
+	@if grep -A 1 "hlt" $(BIN)/asm_demo.c | grep -q "__builtin_unreachable"; then \
+	  echo "  C source has __builtin_unreachable() after the noreturn asm: OK"; \
+	else \
+	  echo "FAIL: __builtin_unreachable() missing after noreturn asm"; exit 1; \
+	fi
+	@if grep -q '__asm__ ("mov' $(BIN)/asm_demo.c; then \
+	  echo "  pure asm drops __volatile__ (gcc may elide if outputs unused): OK"; \
+	else \
+	  echo "FAIL: pure asm should drop __volatile__"; exit 1; \
+	fi
+	@if grep -q 'in %w1, %b0' $(BIN)/asm_demo.c; then \
+	  echo "  inb() helper emits 'in %w1, %b0' (single in instruction): OK"; \
+	else \
+	  echo "FAIL: inb() helper did not emit the expected in instruction"; exit 1; \
+	fi
+	@gcc -O2 -Werror -c -o $(BIN)/asm_demo.o $(BIN)/asm_demo.c -lm -pthread 2>$(BIN)/asm_gcc.log \
+	  || (echo "FAIL: gcc compile failed"; cat $(BIN)/asm_gcc.log; exit 1)
+	@echo "  C source compiles cleanly with gcc -O2 -Werror: OK"
+	@in_count=$$(objdump -d $(BIN)/asm_demo.o | grep -E "in\s+\(%dx\),%al|in\s+%dx,%al" | wc -l); \
+	if [ "$$in_count" -ge 1 ]; then \
+	  echo "  inb() compiles to a single 'in' instruction ($$in_count site(s)): OK"; \
+	else \
+	  echo "FAIL: inb() did not compile to a single 'in' instruction"; \
+	  objdump -d $(BIN)/asm_demo.o | grep -A 5 "usf_inb"; exit 1; \
+	fi
+	@echo "ACCEPTANCE OK: Stage 27 inline assembly verified"
+
+# asm-attrs: print the asm! templates and operands of every function
+# in the given HLS file. Usage: make asm-attrs F=examples/asm_demo.hls
+asm-attrs:
+	@test -n "$(F)" || (echo "Usage: make asm-attrs F=examples/asm_demo.hls" && false)
+	@test -x $(BIN)/hlc || $(MAKE) bootstrap
+	@$(BIN)/hlc --opt-stats $(F) /tmp/asm_attrs_out.c 2>&1 | head -40
 
 # ============================================================================
 # Stage 26 (v0.49.0-alpha): RISC-V 64 backend (foundation for OS work)

@@ -127,6 +127,45 @@ struct MatchArm {
     line: int
 }
 
+# Stage 27 (v0.50.0-alpha): inline-assembly operand record.
+# One AsmOperand per `in(reg) expr` / `out(reg) lvalue` /
+# `inout(reg) lvalue` / `late_out(reg) lvalue` clause in an `asm!`
+# statement.
+#   dir:             "in" | "out" | "inout" | "late_out"
+#   constraint:      the constraint text verbatim:
+#                       "reg"  -> "r" (output: "=r", inout: "+r")
+#                       "mem"  -> "m"
+#                       "imm"  -> "i"
+#                       "eax"  -> "a"  (specific-register form)
+#                       "ecx"  -> "c"
+#                       "edx"  -> "d"
+#                     (the map_asm_constraint helper translates this)
+#   is_constraint_str: True iff the source wrote a string literal
+#                     (`out("eax") x`) rather than a bare register
+#                     class (`out(reg) x`). The translation step uses
+#                     this to give a clearer error on an unknown
+#                     constraint name (bare classes are constrained to
+#                     the small set above; string forms pass through
+#                     verbatim after lowercasing).
+#   var:              for out/inout/late_out — the lvalue name. For
+#                     in — "".
+#   var_kind:         "ident" | "field" | "index" — the lvalue form
+#                     (mirrors ExprN.kind). The checker rejects
+#                     `out(reg) f().x` (lvalue must start from a
+#                     variable).
+#   expr_idx:         for `in` — the expression index of the input
+#                     value. For out/inout/late_out — -1.
+#   line:             source line.
+struct AsmOperand {
+    dir: str,
+    constraint: str,
+    is_constraint_str: bool,
+    var: str,
+    var_kind: str,
+    expr_idx: int,
+    line: int
+}
+
 struct ExprN {
     kind: str,
     op: str,
@@ -181,7 +220,25 @@ struct StmtN {
     # of the automatic escape analysis. Both live on `let` statements
     # only; parse_stmt reads them via parse_let_attrs.
     attr_stack: bool,
-    attr_boxed: bool
+    attr_boxed: bool,
+    # ---- Stage 27 (v0.50.0-alpha): inline assembly (`asm!`) ----
+    # asm_template: the assembly template string (from the first string
+    # literal). Validated by check_asm: every `{N}` placeholder must
+    # have a matching operand (N in [0, len(operands))). The codegen
+    # rewrites `{N}` to `%N` for GCC's extended-asm syntax.
+    # asm_operands: the operands (in/out/inout/late_out). The codegen
+    # emits the outputs in source order, then the inputs, so the
+    # `{N}` placeholder indices are 0..(outputs+inputs-1).
+    # asm_options: the option list (pure/nomem/noreturn/preserves_flags/
+    # nostack/attsyntax). pure => drop `__volatile__` (gcc may elide
+    # if outputs unused). nomem => no "memory" clobber. noreturn =>
+    # emit `__builtin_unreachable()` after the asm. attsyntax =>
+    # emit the asm under `-masm=att` (the GCC default; the option is
+    # accepted for source compatibility with rustc-style asm! and is
+    # a no-op on x86, which is already AT&T syntax).
+    asm_template: str,
+    asm_operands: list[AsmOperand],
+    asm_options: list[str]
 }
 
 struct Ctx {
@@ -485,6 +542,10 @@ fn is_keyword(w: str) -> bool {
         # `ensures` on functions. The words only appeared in comments
         # before, so reserving them breaks nothing.
         || w == "requires" || w == "ensures"
+        # Stage 27 (v0.50.0-alpha): `asm` keyword — the inline-assembly
+        # statement `asm!("...", in(reg) x, out(reg) y, ...)`. Reserved
+        # for parity with the boot lexer; grep showed no production use.
+        || w == "asm"
 }
 
 fn is_ident_start(c: int) -> bool {
@@ -1010,7 +1071,8 @@ fn nx_stmt(ctx: Ctx, kind: str, line: int) -> int {
         kind: kind, name: "", vtype: "", is_mut: false, value: -1,
         target: -1, cond: -1, body: [], else_body: [], iter: -1, e: -1,
         line: line,
-        attr_stack: false, attr_boxed: false
+        attr_stack: false, attr_boxed: false,
+        asm_template: "", asm_operands: [], asm_options: []
     }
     ctx.stmts.push(s)
     return ctx.stmts.len() - 1
@@ -1832,6 +1894,10 @@ fn parse_stmt(ctx: Ctx) -> int {
         if t.value == "let" {
             return parse_let(ctx)
         }
+        # Stage 27 (v0.50.0-alpha): `asm!` inline-assembly statement.
+        if t.value == "asm" {
+            return parse_asm_stmt(ctx)
+        }
         if t.value == "return" {
             ctx.pos = ctx.pos + 1
             let idx: int = nx_stmt(ctx, "return", t.line)
@@ -1996,6 +2062,168 @@ fn parse_let_attrs(ctx: Ctx) -> void {
         }
         eat_sym(ctx, "]")
     }
+}
+
+# Stage 27 (v0.50.0-alpha): inline-assembly statement parser.
+#
+# Grammar (mirrors the boot parser):
+#
+#   asm_stmt := "asm" "!" "(" string_lit
+#                 ("," operand)*
+#                 ("," "options" "(" option_name ("," option_name)* ")")?
+#                 ")"
+#
+#   operand := direction "(" constraint ")" lvalue_or_expr
+#
+#   direction := "in" | "out" | "inout" | "late_out"
+#               (`in` is a keyword and is matched by at_kw; the others
+#                are bare identifiers and are matched by at_ident.)
+#
+#   constraint := IDENT ("reg"|"mem"|"imm") | STRING ("eax","a",...)
+#                 A bare register-class name is matched as an IDENT
+#                 token; a specific-register form is a string literal.
+#
+#   option_name := "pure" | "nomem" | "noreturn" | "preserves_flags" |
+#                  "nostack" | "attsyntax"
+#
+# The lvalue_or_expr is a full expression for `in` (any value of a
+# primitive type — int/float/bool — that fits in a register); for
+# out/inout/late_out it is parsed as an expression and the checker
+# restricts it to ident/field/index lvalues. We parse it as a full
+# expression here so the parser is uniform; the checker enforces the
+# lvalue restriction (which is type-driven, not syntax-driven).
+fn parse_asm_stmt(ctx: Ctx) -> int {
+    let t: Tok = ctx.toks.get(ctx.pos)
+    # consume `asm`
+    ctx.pos = ctx.pos + 1
+    # consume `!`
+    if !at_sym(ctx, "!") {
+        perr_at(ctx, "expected '!' after 'asm' (inline-assembly statement)", t)
+    }
+    ctx.pos = ctx.pos + 1
+    eat_sym(ctx, "(")
+    # The first operand is the assembly template (a string literal).
+    let tplt_tok: Tok = ctx.toks.get(ctx.pos)
+    if tplt_tok.kind != "str" {
+        perr_at(ctx, "asm! template must be a string literal", tplt_tok)
+    }
+    ctx.pos = ctx.pos + 1
+    let template: str = tplt_tok.value
+    let operands: list[AsmOperand] = []
+    let options: list[str] = []
+    # Operands + options follow.
+    while at_sym(ctx, ",") {
+        ctx.pos = ctx.pos + 1
+        # Options section: `options(pure, nomem, ...)`.
+        if at_ident(ctx, "options") {
+            ctx.pos = ctx.pos + 1
+            eat_sym(ctx, "(")
+            while !at_sym(ctx, ")") {
+                # An option name is normally an identifier (`nomem`,
+                # `noreturn`, ...). The exception is `pure`, which is
+                # a reserved keyword (Stage 9-beta). Accept both forms
+                # — the asm! options list is a separate namespace.
+                let opt_tok: Tok = ctx.toks.get(ctx.pos)
+                let mut opt: str = ""
+                if opt_tok.kind == "ident" || opt_tok.kind == "kw" {
+                    opt = opt_tok.value
+                    ctx.pos = ctx.pos + 1
+                } else {
+                    perr_at(ctx, "expected an option name (pure, nomem, noreturn, preserves_flags, nostack, attsyntax) but got " + tok_desc(ctx), opt_tok)
+                }
+                if opt != "pure" && opt != "nomem" && opt != "noreturn"
+                    && opt != "preserves_flags" && opt != "nostack"
+                    && opt != "attsyntax" {
+                    perr(ctx, "unknown asm! option '" + opt + "' (known: pure, nomem, noreturn, preserves_flags, nostack, attsyntax)")
+                }
+                options.push(opt)
+                if at_sym(ctx, ",") {
+                    ctx.pos = ctx.pos + 1
+                } else if !at_sym(ctx, ")") {
+                    perr(ctx, "expected ',' or ')' in options list")
+                }
+            }
+            eat_sym(ctx, ")")
+        } else {
+            # Direction.
+            let mut dir: str = ""
+            if at_kw(ctx, "in") {
+                dir = "in"
+                ctx.pos = ctx.pos + 1
+            } else if at_ident(ctx, "out") {
+                dir = "out"
+                ctx.pos = ctx.pos + 1
+            } else if at_ident(ctx, "inout") {
+                dir = "inout"
+                ctx.pos = ctx.pos + 1
+            } else if at_ident(ctx, "late_out") {
+                dir = "late_out"
+                ctx.pos = ctx.pos + 1
+            } else {
+                perr(ctx, "expected asm! operand direction (in/out/inout/late_out), got " + tok_desc(ctx))
+            }
+            eat_sym(ctx, "(")
+            # Constraint: IDENT or string literal.
+            let ct_tok: Tok = ctx.toks.get(ctx.pos)
+            let mut constraint: str = ""
+            let mut is_cstr: bool = false
+            if ct_tok.kind == "str" {
+                is_cstr = true
+                constraint = ct_tok.value
+                ctx.pos = ctx.pos + 1
+            } else if ct_tok.kind == "ident" {
+                constraint = ct_tok.value
+                ctx.pos = ctx.pos + 1
+            } else {
+                perr_at(ctx, "expected asm! constraint (a register class like 'reg' or a string like \"eax\"), got " + tok_desc(ctx), ct_tok)
+            }
+            eat_sym(ctx, ")")
+            # The lvalue (for out/inout/late_out) or expression (for in).
+            let e_idx: int = parse_expr(ctx, true)
+            let ek: str = ctx.exprs[e_idx].kind
+            # Snapshot the operand's lvalue shape (var/var_kind).
+            let mut op_var: str = ""
+            let mut op_var_kind: str = ""
+            # The expression index is ALWAYS recorded — for `in` it's
+            # the input value expression; for out/inout/late_out it's
+            # the lvalue expression (checker uses it to walk the
+            # binding root and codegen uses it to emit the C operand).
+            let operand_expr_idx: int = e_idx
+            if dir == "in" {
+                # `in` keeps the expression as the input value.
+            } else {
+                # out/inout/late_out — the operand must be an lvalue.
+                if ek != "ident" && ek != "field" && ek != "index" {
+                    perr(ctx, "asm! " + dir + " operand must be an lvalue (variable/field/index), got " + ek)
+                }
+                if ek == "ident" {
+                    op_var = ctx.exprs[e_idx].name
+                    op_var_kind = "ident"
+                } else if ek == "field" {
+                    op_var = ctx.exprs[e_idx].name
+                    op_var_kind = "field"
+                } else {
+                    op_var = ""
+                    op_var_kind = "index"
+                }
+            }
+            operands.push(AsmOperand {
+                dir: dir,
+                constraint: constraint,
+                is_constraint_str: is_cstr,
+                var: op_var,
+                var_kind: op_var_kind,
+                expr_idx: operand_expr_idx,
+                line: t.line
+            })
+        }
+    }
+    eat_sym(ctx, ")")
+    let idx: int = nx_stmt(ctx, "asm", t.line)
+    ctx.stmts[idx].asm_template = template
+    ctx.stmts[idx].asm_operands = operands
+    ctx.stmts[idx].asm_options = options
+    return idx
 }
 
 fn parse_if(ctx: Ctx) -> int {
@@ -5512,6 +5740,15 @@ fn all_return(ctx: Ctx, stmts: list[int]) -> bool {
             return true
         }
     }
+    # Stage 27 (v0.50.0-alpha): an asm! with `options(noreturn)` as
+    # the last statement always diverges (the codegen emits
+    # __builtin_unreachable() right after the asm; gcc knows the
+    # function never falls through to the implicit return).
+    if k == "asm" {
+        if list_contains_str(ctx.stmts[last].asm_options, "noreturn") {
+            return true
+        }
+    }
     return false
 }
 
@@ -5646,9 +5883,174 @@ fn check_stmt(ctx: Ctx, env: list[map[str, Binding]], cur: str, f: FnInfo, sidx:
         }
     } else if s.kind == "expr" {
         check_expr(ctx, env, cur, s.e, "")
+    } else if s.kind == "asm" {
+        # Stage 27 (v0.50.0-alpha): inline-assembly statement.
+        check_asm(ctx, env, cur, s)
     } else {
         cerr(s.line, "unknown statement: " + s.kind)
     }
+}
+
+# Stage 27 (v0.50.0-alpha): asm! checker (self-hosted mirror of the
+# boot checker). Validates:
+#   * Template {N} placeholders reference an existing operand.
+#   * `in` operands are primitive (int/float/bool).
+#   * `out`/`inout`/`late_out` operands are mutable primitive lvalues.
+#   * `pure` requires at least one output; `noreturn` forbids outputs.
+#   * Constraint names: bare register classes (reg/mem/imm) and the
+#     specific-register string form ("eax"/"a"/...).
+# On success the operand's HLS type is annotated on the corresponding
+# ExprN.t so the codegen can emit the right C type in the GCC extended
+# asm operand list.
+fn check_asm(ctx: Ctx, env: list[map[str, Binding]], cur: str, s: StmtN) -> void {
+    let template: str = s.asm_template
+    let operands: list[AsmOperand] = s.asm_operands
+    let options: list[str] = s.asm_options
+    let n_ops: int = operands.len()
+    # 1) Template {N} placeholder validation.
+    let mut i: int = 0
+    while i < template.len() {
+        let c: int = template.byte_at(i)
+        if c == 123 {
+            # `{` — could be `{{` (literal) or `{N}` (placeholder).
+            if i + 1 < template.len() && template.byte_at(i + 1) == 123 {
+                i = i + 2
+            } else {
+                # find the matching `}`
+                let mut j: int = i + 1
+                while j < template.len() && template.byte_at(j) != 125 {
+                    j = j + 1
+                }
+                if j >= template.len() {
+                    cerr(s.line, "asm! template has unterminated '{' (no matching '}'): " + template)
+                }
+                let body: str = template.slice(i + 1, j)
+                let n: int = parse_placeholder_int(ctx, body, s.line)
+                if n < 0 || n >= n_ops {
+                    cerr(s.line, "asm! template placeholder {" + body + "} is out of range (have " + n_ops.to_str() + " operand(s))")
+                }
+                i = j + 1
+            }
+        } else if c == 125 {
+            # `}` — must be `}}` (literal).
+            if i + 1 < template.len() && template.byte_at(i + 1) == 125 {
+                i = i + 2
+            } else {
+                cerr(s.line, "asm! template has lone '}' (use '}}' for a literal '}'): " + template)
+            }
+        } else {
+            i = i + 1
+        }
+    }
+    # 2) Per-operand validation.
+    let mut has_output: bool = false
+    let mut k: int = 0
+    while k < operands.len() {
+        let op: AsmOperand = operands.get(k)
+        let d: str = op.dir
+        if d != "in" && d != "out" && d != "inout" && d != "late_out" {
+            cerr(op.line, "asm! operand direction '" + d + "' is unknown")
+        }
+        if d != "in" {
+            has_output = true
+        }
+        # Constraint validation. The codegen does the final translation;
+        # the checker rejects unknown bare register classes.
+        let c: str = op.constraint
+        if !op.is_constraint_str {
+            if c != "reg" && c != "mem" && c != "imm" {
+                cerr(op.line, "asm! constraint '" + c + "' is unknown (bare constraints: reg, mem, imm; for a specific register use a string like \"eax\")")
+            }
+        }
+        if d == "in" {
+            # `in` operands: any primitive-typed expression.
+            let vt: str = check_expr(ctx, env, cur, op.expr_idx, "")
+            if vt != "int" && vt != "float" && vt != "bool" {
+                cerr(op.line, "asm! `in` operand must be a primitive (int/float/bool), got " + vt)
+            }
+        } else {
+            # out/inout/late_out — must be a mutable lvalue.
+            let ek: str = ctx.exprs[op.expr_idx].kind
+            if ek != "ident" && ek != "field" && ek != "index" {
+                cerr(op.line, "asm! " + d + " operand must be an lvalue (variable/field/index), got " + ek)
+            }
+            let mut root: int = op.expr_idx
+            while ctx.exprs[root].kind == "field" || ctx.exprs[root].kind == "index" {
+                root = ctx.exprs[root].left
+            }
+            let b: Binding = lookup_binding(env, ctx.exprs[root].name)
+            if b.t == "" {
+                cerr(op.line, "variable does not exist: " + ctx.exprs[root].name)
+            }
+            # `out(reg) x` writes to x — if x is an ident, x must be mut.
+            # (field/index assignments mutate through a reference, no
+            # mut needed — mirrors check_assign's semantics.)
+            if ctx.exprs[op.expr_idx].kind == "ident" && !b.is_mut {
+                cerr(op.line, "asm! " + d + " operand must be a `mut` binding (cannot write to immutable variable " + ctx.exprs[root].name + ")")
+            }
+            if d == "inout" {
+                if b.moved {
+                    cerr(op.line, "asm! inout operand uses a moved value: " + ctx.exprs[root].name)
+                }
+            }
+            let tt: str = check_lvalue(ctx, env, cur, op.expr_idx)
+            if tt != "int" && tt != "float" && tt != "bool" {
+                cerr(op.line, "asm! " + d + " operand must be a primitive (int/float/bool), got " + tt)
+            }
+        }
+        k = k + 1
+    }
+    # 3) Option validation.
+    let mut m: int = 0
+    while m < options.len() {
+        let opt: str = options.get(m)
+        if opt != "pure" && opt != "nomem" && opt != "noreturn"
+            && opt != "preserves_flags" && opt != "nostack"
+            && opt != "attsyntax" {
+            cerr(s.line, "unknown asm! option '" + opt + "' (known: pure, nomem, noreturn, preserves_flags, nostack, attsyntax)")
+        }
+        m = m + 1
+    }
+    if list_contains_str(options, "pure") && !has_output {
+        cerr(s.line, "asm! with `options(pure)` requires at least one output operand (a pure asm with no outputs is dead code — gcc would legitimately delete it)")
+    }
+    if list_contains_str(options, "noreturn") && has_output {
+        cerr(s.line, "asm! with `options(noreturn)` cannot have output operands (the asm does not fall through, so the outputs would never be observed)")
+    }
+}
+
+# parse_placeholder_int: parse a non-negative integer from a string
+# (an asm! template placeholder body, like "0" from "{0}").
+# Returns -1 on parse failure (caller reports a clear error).
+fn parse_placeholder_int(ctx: Ctx, s: str, line: int) -> int {
+    if s.len() == 0 {
+        return -1
+    }
+    let mut v: int = 0
+    let mut i: int = 0
+    while i < s.len() {
+        let c: int = s.byte_at(i)
+        if c < 48 || c > 57 {
+            return -1
+        }
+        v = v * 10 + (c - 48)
+        i = i + 1
+    }
+    return v
+}
+
+# list_contains_str: linear membership test on a list[str]. Used by
+# the asm! checker for the options list (small enough that the linear
+# scan is fine).
+fn list_contains_str(xs: list[str], v: str) -> bool {
+    let mut i: int = 0
+    while i < xs.len() {
+        if xs.get(i) == v {
+            return true
+        }
+        i = i + 1
+    }
+    return false
 }
 
 fn check_assign(ctx: Ctx, env: list[map[str, Binding]], cur: str, s: StmtN) -> void {
@@ -13754,9 +14156,395 @@ fn gen_stmt(ctx: Ctx, sidx: int, ind: str) -> void {
         }
         flush_null_after(ctx, ind)
         clear_hoists(ctx)
+    } else if s.kind == "asm" {
+        # Stage 27 (v0.50.0-alpha): inline-assembly statement.
+        # Lowered to GCC's extended-asm syntax:
+        #
+        #   __asm__ __volatile__("template"
+        #       : [outputs]
+        #       : [inputs]
+        #       : [clobbers]
+        #       : [options]);
+        #
+        # The template `{0}` / `{1}` placeholders are rewritten to
+        # GCC's positional `%0` / `%1` (a single `%` requires `%%` in
+        # GCC AT&T syntax — we honour that translation too). The
+        # `__volatile__` qualifier is omitted under `options(pure)`
+        # (gcc may legitimately elide a pure asm whose outputs are
+        # unused). `options(noreturn)` emits an `__builtin_unreachable()`
+        # immediately after the asm (gcc then knows the function does
+        # not fall through, which matches the `all_return` analysis).
+        gen_asm(ctx, s, ind)
     } else {
         panic("internal codegen error: unknown statement " + s.kind)
     }
+}
+
+# Stage 27 (v0.50.0-alpha): asm! codegen — lower an inline-assembly
+# statement to GCC's extended-asm syntax. The translation rules:
+#
+#   template:
+#     `{N}`           -> `%N`        (positional operand)
+#     `{{`            -> `{`         (literal brace)
+#     `}}`            -> `}`         (literal brace)
+#     `$`             -> `$$`        (GCC requires `$$` for a literal `$`
+#                                    in AT&T syntax — we accept both
+#                                    `$` and `$$` in the source and
+#                                    normalise to `$$`)
+#
+#   operand constraint:
+#     `reg`           -> `r`         (any general-purpose register)
+#     `mem`           -> `m`         (memory operand)
+#     `imm`           -> `i`         (immediate constant)
+#     string form     -> verbatim    (e.g. "eax" -> "a", "ecx" -> "c",
+#                                    "edx" -> "d" — GCC's constraint
+#                                    letters; the HLS source uses the
+#                                    register name and we translate the
+#                                    common x86-64 names; unknown names
+#                                    pass through verbatim after
+#                                    lowercasing)
+#
+#   direction prefix:
+#     `in`            -> (no prefix) input operand, e.g. "r"(x)
+#     `out`           -> `=`         write-only output, e.g. "=r"(x)
+#     `inout`         -> `+`         read-write output, e.g. "+r"(x)
+#     `late_out`      -> `=&`        early-clobber write-only output
+#                                    (the `&` modifier tells gcc the
+#                                    output is written BEFORE all inputs
+#                                    are consumed, so it must NOT alias
+#                                    any input register)
+#
+#   options:
+#     `pure`          -> omit `__volatile__`
+#     `nomem`         -> no "memory" clobber (the default adds it)
+#     `noreturn`      -> emit `__builtin_unreachable();` after the asm
+#     `preserves_flags` -> no "cc" clobber (the default adds it)
+#     `nostack`       -> no stack clobber (the default adds nothing for
+#                        stack — accepted for source compatibility)
+#     `attsyntax`     -> accepted; gcc default is AT&T, so this is a
+#                        no-op on x86-64
+#
+# The operand list order matches GCC's positional layout: outputs
+# first (in source order), then inputs. `{0}` references the first
+# operand, `{1}` the second, etc. — so an `in(reg) x, out(reg) y`
+# pair has `{0}` = `x` (input, listed after the output `y` in the C
+# asm form) and `{1}` = `y` (output, listed first). The HLS source
+# can use whichever operand order the user prefers; the codegen
+# re-orders them to match GCC's expectations and rewrites the
+# template placeholders accordingly.
+#
+# However, to keep the implementation simple and the source-vs-asm
+# mapping intuitive, we LAY OUT operands in source order: outputs
+# first (in their source order), then inputs (in their source order).
+# A source `in(reg) x, out(reg) y` becomes `outputs=[y], inputs=[x]`
+# — so `{0}` references `y` (the first output) and `{1}` references
+# `x` (the first input). This matches GCC's positional operand
+# numbering EXACTLY, so the source template `{0}` / `{1}` map
+# directly to `%0` / `%1` in the emitted C. The Stage 27 acceptance
+# test (tests/ok/feat_stage27_asm.hls) verifies this with an inb()
+# helper whose template `{0}, {1}` references the output then the
+# input — the produced assembly shows `in %1, %0` (AT&T source-dst).
+fn gen_asm(ctx: Ctx, s: StmtN, ind: str) -> void {
+    # Hoist fresh pointer subexpressions that appear in `in` operands
+    # (so they're materialised into temps with cleanup attributes
+    # before the asm). Pointer-typed operands are REJECTED by the
+    # checker (only int/float/bool are allowed), so this is mostly a
+    # no-op for correctness but keeps the ownership analysis happy.
+    let mut k: int = 0
+    while k < s.asm_operands.len() {
+        let op: AsmOperand = s.asm_operands.get(k)
+        if op.dir == "in" {
+            collect_hoist(ctx, op.expr_idx)
+        }
+        k = k + 1
+    }
+    hoist_all(ctx, ctx.out, ind)
+    # Build the outputs and inputs lists (in GCC positional order:
+    # outputs first, then inputs).
+    let outputs: list[str] = []
+    let inputs: list[str] = []
+    # We need to record the operand index (in source order) -> its
+    # position in the GCC operand list (0..N-1) so we can rewrite
+    # template placeholders. The HLS list[str] is used as a "scratch
+    # array" indexed by source-order position, holding the GCC
+    # operand index as a string ("0", "1", ...). This avoids needing
+    # a list[int] field on StmtN (the existing StmtN layout uses
+    # list[int] for stmts/exprs but a dedicated field for asm would
+    # bloat the struct for every non-asm statement).
+    let mut gcc_indices: list[str] = []
+    let mut next_idx: int = 0
+    # First pass: outputs (out/inout/late_out) in source order.
+    let mut j: int = 0
+    while j < s.asm_operands.len() {
+        let op: AsmOperand = s.asm_operands.get(j)
+        if op.dir != "in" {
+            let cstr: str = translate_asm_constraint(op)
+            # The C operand expression is the lvalue. We use gen_expr
+            # since the operand was parsed as a full expression —
+            # for ident/field/index this yields the lvalue's C name.
+            let ce: str = gen_expr(ctx, op.expr_idx)
+            outputs.push("\"" + cstr + "\"(" + ce + ")")
+            gcc_indices.push(next_idx.to_str())
+            next_idx = next_idx + 1
+        } else {
+            gcc_indices.push("-1")
+        }
+        j = j + 1
+    }
+    # Second pass: inputs in source order.
+    let mut j2: int = 0
+    while j2 < s.asm_operands.len() {
+        let op: AsmOperand = s.asm_operands.get(j2)
+        if op.dir == "in" {
+            let cstr: str = translate_asm_constraint(op)
+            let ce: str = gen_expr(ctx, op.expr_idx)
+            inputs.push("\"" + cstr + "\"(" + ce + ")")
+            # Record the GCC index for this source-order position.
+            gcc_indices.set(j2, next_idx.to_str())
+            next_idx = next_idx + 1
+        }
+        j2 = j2 + 1
+    }
+    # Build the Clobber list. Default: "cc" (condition codes) and
+    # "memory" (the asm may read/write memory). Options can suppress:
+    #   nomem             -> no "memory"
+    #   preserves_flags   -> no "cc"
+    # A "cc" clobber is also suppressed if the asm has no operands at
+    # all (a bare asm! with no operands never writes flags).
+    #
+    # Each clobber is emitted as a quoted C string literal (GCC's
+    # extended-asm syntax requires the clobber list entries to be
+    # string literals: "cc", "memory", "eax", ...).
+    let clobbers: list[str] = []
+    if !list_contains_str(s.asm_options, "preserves_flags") {
+        clobbers.push("\"cc\"")
+    }
+    if !list_contains_str(s.asm_options, "nomem") {
+        clobbers.push("\"memory\"")
+    }
+    # Translate the template: {N} -> %N, {{ -> {, }} -> }, $ -> $$.
+    let translated: str = translate_asm_template(s.asm_template, gcc_indices)
+    # Emit the GCC extended asm.
+    let mut volatile_kw: str = "__volatile__ "
+    if list_contains_str(s.asm_options, "pure") {
+        volatile_kw = ""
+    }
+    let outputs_str: str = join_str_list(outputs, ", ")
+    let inputs_str: str = join_str_list(inputs, ", ")
+    let clobbers_str: str = join_str_list(clobbers, ", ")
+    # GCC syntax: __asm__ __volatile__("template" : outputs : inputs : clobbers)
+    # If outputs is empty, the colon is still required.
+    let mut line: str = ind + "__asm__ " + volatile_kw + "("
+    # Quote the template (escape any embedded quotes/backslashes).
+    line = line + c_str_literal(translated)
+    line = line + " : " + outputs_str
+    line = line + " : " + inputs_str
+    line = line + " : " + clobbers_str
+    line = line + ");"
+    ctx.out.push(line)
+    # noreturn: emit __builtin_unreachable() so gcc knows the code
+    # after the asm is dead (eliminates the implicit `return` at the
+    # end of the fn).
+    if list_contains_str(s.asm_options, "noreturn") {
+        ctx.out.push(ind + "__builtin_unreachable();")
+    }
+    flush_null_after(ctx, ind)
+    clear_hoists(ctx)
+}
+
+# translate_asm_constraint: convert an HLS asm! constraint to the GCC
+# constraint string. See gen_asm for the full table.
+fn translate_asm_constraint(op: AsmOperand) -> str {
+    let c: str = op.constraint
+    # Compute the direction prefix. GCC requires outputs to start
+    # with `=` (write-only) or `+` (read-write), and a late-clobber
+    # output adds `&` (the operand is written before all inputs are
+    # consumed, so it must not alias any input register). The prefix
+    # applies to BOTH bare constraints (`out(reg) x` -> "=r") and
+    # specific-register string forms (`out("eax") x` -> "=a").
+    let mut prefix: str = ""
+    if op.dir == "out" {
+        prefix = "="
+    } else if op.dir == "inout" {
+        prefix = "+"
+    } else if op.dir == "late_out" {
+        prefix = "=&"
+    }
+    # `dir == "in"` has no prefix.
+    let mut body: str = c
+    if op.is_constraint_str {
+        # String form — translate known x86-64 register names to GCC
+        # constraint letters. GCC constraints are case-sensitive:
+        #   "a" = eax/rax   "b" = ebx/rbx   "c" = ecx/rcx
+        #   "d" = edx/rdx   "D" = edi/rdi   "S" = esi/rsi
+        # Unknown register names pass through verbatim (GCC accepts
+        # things like "r" / "=r" / "+r" / "=&r" as well as multi-letter
+        # constraints; the user takes responsibility for the validity).
+        if c == "eax" || c == "rax" {
+            body = "a"
+        } else if c == "ebx" || c == "rbx" {
+            body = "b"
+        } else if c == "ecx" || c == "rcx" {
+            body = "c"
+        } else if c == "edx" || c == "rdx" {
+            body = "d"
+        } else if c == "esi" || c == "rsi" {
+            body = "S"
+        } else if c == "edi" || c == "rdi" {
+            body = "D"
+        }
+        # If the user already prefixed the constraint with `=` or `+`,
+        # don't add another (e.g. `out("=r") x` -> "=r", not "==r").
+        # This is rare but supports users who want fine control.
+        if c.len() >= 1 && (c.byte_at(0) == 61 || c.byte_at(0) == 43) {
+            return c
+        }
+    } else {
+        # Bare register-class form.
+        if c == "reg" {
+            body = "r"
+        } else if c == "mem" {
+            body = "m"
+        } else if c == "imm" {
+            body = "i"
+        }
+    }
+    return prefix + body
+}
+
+# translate_asm_template: rewrite the HLS asm! template (which uses
+# `{N}` placeholders) to the GCC form (which uses `%N` positional
+# placeholders, `%%` for a literal `%`, and `{{` / `}}` for literal
+# braces). gcc_indices is the source-order list of GCC positional
+# indices (the source operand at position K has GCC index
+# gcc_indices[K], as a string; -1 means "this is an input that was
+# listed after the outputs in source order — the GCC index was
+# assigned during the second pass"). We rewrite `{N}` to
+# `%<gcc_indices[N]>` so the source-template `{0}` / `{1}` map to
+# the right GCC operand number regardless of in/out order.
+#
+# BUG-FIX (Stage 27): the original `gcc_indices` was filled only
+# during the OUTPUTS pass, leaving inputs at "-1" until the inputs
+# pass — but translate_asm_template runs AFTER both passes, so the
+# indices are all set. The function below looks up gcc_indices[N]
+# for each {N} placeholder.
+fn translate_asm_template(template: str, gcc_indices: list[str]) -> str {
+    let parts: list[str] = []
+    let mut i: int = 0
+    while i < template.len() {
+        let c: int = template.byte_at(i)
+        if c == 123 {
+            # `{` — could be `{{` or `{N}`.
+            if i + 1 < template.len() && template.byte_at(i + 1) == 123 {
+                parts.push("{")
+                i = i + 2
+            } else {
+                # find `}`
+                let mut j: int = i + 1
+                while j < template.len() && template.byte_at(j) != 125 {
+                    j = j + 1
+                }
+                # j is at `}` (or end-of-string).
+                let body: str = template.slice(i + 1, j)
+                # body is a number; look up gcc_indices[body.to_int()].
+                let n: int = body.to_int()
+                if n >= 0 && n < gcc_indices.len() {
+                    parts.push("%" + gcc_indices.get(n))
+                } else {
+                    # Out-of-range — the checker already rejected this;
+                    # emit as-is (will be a C compile error, which is
+                    # what we want for an unreachable codegen path).
+                    parts.push("%" + body)
+                }
+                i = j + 1
+            }
+        } else if c == 125 {
+            if i + 1 < template.len() && template.byte_at(i + 1) == 125 {
+                parts.push("}")
+                i = i + 2
+            } else {
+                # Should have been rejected by the checker; emit as-is.
+                parts.push("}")
+                i = i + 1
+            }
+        } else if c == 34 {
+            # `"` — escape for the C string literal.
+            parts.push("\\\"")
+            i = i + 1
+        } else if c == 92 {
+            # `\` — escape for the C string literal.
+            parts.push("\\\\")
+            i = i + 1
+        } else if c == 37 {
+            # `%` — GCC's extended-asm template uses `%` as the operand
+            # placeholder escape character:
+            #   `%0`      — operand 0 (positional)
+            #   `%b0`     — operand 0 in byte form (modifier `b`)
+            #   `%w0`     — operand 0 in word form (modifier `w`)
+            #   `%k0`     — operand 0 in dword form (modifier `k`)
+            #   `%q0`     — operand 0 in qword form (modifier `q`)
+            #   `%%`      — literal `%`
+            # The user can write any of these DIRECTLY in the template
+            # (in addition to the HLS `{N}` placeholder syntax). We
+            # pass `%` through verbatim — GCC handles the escape. The
+            # only special case is `%%` (literal `%`), which we pass
+            # through unchanged (it stays `%%` in the C string).
+            parts.push("%")
+            i = i + 1
+        } else {
+            # All other bytes (including `$` — which is NOT special in
+            # GCC's extended-asm template; AT&T syntax uses `$` for
+            # immediate values like `$0x60`, and GCC passes it through
+            # verbatim) pass through unchanged.
+            parts.push(template.slice(i, i + 1))
+            i = i + 1
+        }
+    }
+    return join(parts, "")
+}
+
+# join_str_list: join a list[str] with a separator. Mirrors the
+# boot's str.join — used by the asm codegen to build the
+# outputs/inputs/clobbers lists. The runtime `join` builtin already
+# exists, but it accepts list[str] directly; this wrapper is kept
+# for parity with the source-named convention used in gen_asm.
+fn join_str_list(xs: list[str], sep: str) -> str {
+    return join(xs, sep)
+}
+
+# c_str_literal: produce a C string literal (just the quoted form,
+# WITHOUT a wrapping hl_cstr() helper call) from an HLS string value.
+# Used by the asm codegen to embed the translated template into the C
+# source. (The existing c_str_lit helper produces `hl_cstr("...")`
+# which is a string-builder runtime call — we need a raw C literal
+# here because the GCC extended-asm syntax expects a bare string
+# token, not a function-call expression.)
+fn c_str_literal(s: str) -> str {
+    let parts: list[str] = []
+    parts.push("\"")
+    let mut i: int = 0
+    while i < s.len() {
+        let c: int = s.byte_at(i)
+        if c == 34 {
+            parts.push("\\\"")
+        } else if c == 92 {
+            parts.push("\\\\")
+        } else if c == 10 {
+            parts.push("\\n")
+        } else if c == 9 {
+            parts.push("\\t")
+        } else if c == 13 {
+            parts.push("\\r")
+        } else if c < 32 || c > 126 {
+            # Octal escape for non-printable bytes.
+            parts.push("\\" + ((c / 64) % 8).to_str() + ((c / 8) % 8).to_str() + (c % 8).to_str())
+        } else {
+            parts.push(s.slice(i, i + 1))
+        }
+        i = i + 1
+    }
+    parts.push("\"")
+    return join(parts, "")
 }
 
 fn gen_stmts(ctx: Ctx, stmts: list[int], ind: str) -> void {

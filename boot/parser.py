@@ -62,6 +62,19 @@ class Parser:
         t = self.peek()
         return t["k"] == "kw" and t["v"] == v
 
+    # Stage 27 (v0.50.0-alpha): at_ident(name) — does the current
+    # token look like an identifier with the given name? Used by
+    # parse_asm_stmt to recognise `options` / `out` / `inout` /
+    # `late_out` (which are NOT keywords — only `in` is, since it's
+    # also the for-loop keyword). The reserved-identifier check is
+    # the caller's responsibility (eat_ident rejects `secure` / `trait`
+    # — and asm! directions are checked against a fixed list before
+    # the operand is built, so a stray `out(trait) x` raises a clear
+    # "unknown constraint" error).
+    def at_ident(self, v):
+        t = self.peek()
+        return t["k"] == "ident" and t["v"] == v
+
     def eat_sym(self, v):
         if not self.at_sym(v):
             self.err("expected symbol '%s' but got %s" % (v, self._desc()))
@@ -760,6 +773,9 @@ class Parser:
             v = t["v"]
             if v == "let":
                 return self.parse_let()
+            # Stage 27 (v0.50.0-alpha): asm! inline-assembly statement.
+            if v == "asm":
+                return self.parse_asm_stmt()
             if v == "return":
                 self.next()
                 if self.at_sym("}"):
@@ -842,6 +858,137 @@ class Parser:
         return {"k": "let", "name": name["v"], "t": ty, "mut": is_mut,
                 "value": val, "line": t0["line"],
                 "stack": False, "boxed": False}
+
+    # Stage 27 (v0.50.0-alpha): inline-assembly statement parser.
+    # Grammar mirrors the self-hosted parser (parse_asm_stmt in
+    # src/hlc.hls):
+    #
+    #   asm_stmt := "asm" "!" "(" string_lit
+    #                 ("," operand)*
+    #                 ("," "options" "(" option_name ("," option_name)* ")")?
+    #                 ")"
+    #
+    # The boot interpreter cannot execute native asm, so the parser
+    # merely stores the AST node and the interpreter raises a clear
+    # error if the program is RUN (parsing alone is fine — the program
+    # may legitimately declare asm! blocks that are only exercised
+    # after self-compilation to C).
+    def parse_asm_stmt(self):
+        t0 = self.eat_kw("asm")
+        self.eat_sym("!")
+        self.eat_sym("(")
+        # The template MUST be a string literal.
+        tplt_tok = self.peek()
+        if tplt_tok["k"] != "str":
+            self.err("asm! template must be a string literal", tplt_tok)
+        self.next()
+        template = tplt_tok["v"]
+        if isinstance(template, bytes):
+            template = template.decode("utf-8", "replace")
+        operands = []
+        options = []
+        while self.at_sym(","):
+            self.next()
+            if self.at_ident("options"):
+                self.next()
+                self.eat_sym("(")
+                while not self.at_sym(")"):
+                    # An option name is normally an identifier (`nomem`,
+                    # `noreturn`, ...). The exception is `pure`, which
+                    # is a reserved keyword (Stage 9-beta: explicit
+                    # `pure` fn declaration). Accept both forms — the
+                    # asm! options list is a separate namespace.
+                    opt_tok = self.peek()
+                    if opt_tok["k"] == "ident" or opt_tok["k"] == "kw":
+                        opt = opt_tok["v"]
+                        self.next()
+                    else:
+                        self.err("expected an option name (pure, nomem, "
+                                 "noreturn, preserves_flags, nostack, "
+                                 "attsyntax) but got %s" % self._desc(),
+                                 opt_tok)
+                    if opt not in ("pure", "nomem", "noreturn",
+                                    "preserves_flags", "nostack",
+                                    "attsyntax"):
+                        self.err("unknown asm! option '%s' (known: pure, "
+                                 "nomem, noreturn, preserves_flags, "
+                                 "nostack, attsyntax)" % opt, opt_tok)
+                    options.append(opt)
+                    if self.at_sym(","):
+                        self.next()
+                    elif not self.at_sym(")"):
+                        self.err("expected ',' or ')' in options list")
+                self.eat_sym(")")
+            else:
+                # Direction.
+                if self.at_kw("in"):
+                    direction = "in"
+                    self.next()
+                elif self.at_ident("out"):
+                    direction = "out"
+                    self.next()
+                elif self.at_ident("inout"):
+                    direction = "inout"
+                    self.next()
+                elif self.at_ident("late_out"):
+                    direction = "late_out"
+                    self.next()
+                else:
+                    self.err("expected asm! operand direction "
+                             "(in/out/inout/late_out), got %s"
+                             % self._desc())
+                self.eat_sym("(")
+                ct_tok = self.peek()
+                if ct_tok["k"] == "str":
+                    constraint = ct_tok["v"]
+                    if isinstance(constraint, bytes):
+                        constraint = constraint.decode("utf-8", "replace")
+                    is_cstr = True
+                    self.next()
+                elif ct_tok["k"] == "ident":
+                    constraint = ct_tok["v"]
+                    is_cstr = False
+                    self.next()
+                else:
+                    self.err("expected asm! constraint (a register class "
+                             "like 'reg' or a string like \"eax\"), got %s"
+                             % self._desc(), ct_tok)
+                self.eat_sym(")")
+                e = self.parse_expr()
+                ek = e["k"]
+                op_var = ""
+                op_var_kind = ""
+                op_expr = e  # always store the parsed expression — the
+                             # checker needs it to validate mutability +
+                             # type for out/inout/late_out operands.
+                if direction != "in":
+                    if ek not in ("ident", "field", "index"):
+                        self.err("asm! %s operand must be an lvalue "
+                                 "(variable/field/index), got %s"
+                                 % (direction, ek))
+                    if ek == "ident":
+                        op_var = e["name"]
+                        op_var_kind = "ident"
+                    elif ek == "field":
+                        op_var = e["name"]
+                        op_var_kind = "field"
+                    else:
+                        op_var_kind = "index"
+                operands.append({
+                    "dir": direction,
+                    "constraint": constraint,
+                    "is_constraint_str": is_cstr,
+                    "var": op_var,
+                    "var_kind": op_var_kind,
+                    "expr": op_expr,
+                    "line": t0["line"],
+                })
+        self.eat_sym(")")
+        return {"k": "asm",
+                "template": template,
+                "operands": operands,
+                "options": options,
+                "line": t0["line"]}
 
     def parse_if(self):
         t0 = self.eat_kw("if")

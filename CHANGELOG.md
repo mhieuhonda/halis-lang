@@ -13,6 +13,203 @@ stability (125–140), and final stabilisation toward v1.0 (141–150).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
+## [v0.50.0-alpha] — Stage 27: inline assembly (`asm!`)
+
+> Stage 27 adds the inline-assembly statement `asm!("template",
+> [operands], [options(...)])` — the foundation for low-level
+> kernel, driver, and runtime code that needs to emit raw CPU
+> instructions (port I/O, CPUID, RDTSC, interrupt enable/disable,
+> `hlt`, etc.) without dropping out of the HLS type system. The
+> statement is lowered to GCC's extended-asm syntax
+> (`__asm__ __volatile__("..." : outputs : inputs : clobbers)`),
+> with the template `{N}` placeholders rewritten to `%N` and the
+> direction prefixes (`=`, `+`, `=&`) applied automatically.
+>
+> Four operand directions are supported: `in(constraint) expr`
+> (read-only input), `out(constraint) lvalue` (write-only output),
+> `inout(constraint) lvalue` (read-write output), and
+> `late_out(constraint) lvalue` (early-clobber output). Constraints
+> are either bare register classes (`reg`, `mem`, `imm`) or
+> specific-register string forms (`"eax"`, `"edx"`, ...). Six
+> options are supported: `pure` (drops `__volatile__`), `nomem`
+> (no "memory" clobber), `preserves_flags` (no "cc" clobber),
+> `noreturn` (emits `__builtin_unreachable()`), `nostack` (no-op
+> for source compatibility), `attsyntax` (no-op on x86-64).
+>
+> The acceptance criterion from the roadmap is satisfied: a
+> typesafe `inb(port) -> int` helper compiles to a SINGLE `in`
+> instruction with no compiler-generated memory accesses
+> (verified by objdump). The `make asm-acceptance` gate is GREEN
+> and **17 new tests** in `tests/run_tests.sh` section 18 PASS.
+> Bootstrap is deterministic with the Stage 27 changes; the full
+> local suite is **810 PASS / 0 FAIL** (was 793, +17 Stage 27
+> tests).
+
+### Added — `asm` keyword (lexer)
+
+- `boot/lexer.py` `KEYWORDS`: added `"asm"`. The `!` that follows
+  in the `asm!` statement form is the existing single-char `!` sym
+  (the unary-not operator) — no new lexer symbol is needed.
+- `src/hlc.hls` `is_keyword`: same addition for parity.
+
+### Added — `parse_asm_stmt` (parser)
+
+- `boot/parser.py`: new `parse_asm_stmt` method. Parses the grammar
+  `asm! ( string_lit (, operand)* (, options(...))? )` with operands
+  `in(constraint) expr`, `out(constraint) lvalue`,
+  `inout(constraint) lvalue`, `late_out(constraint) lvalue`.
+  The constraint is either an IDENT (`reg`, `mem`, `imm`) or a
+  string literal (`"eax"`, `"edx"`, ...). The `pure` keyword
+  (already reserved by Stage 9-beta) is accepted in the options
+  list as a special case.
+- `boot/parser.py`: new `at_ident(name)` helper — checks whether
+  the current token is an identifier with the given name (used to
+  recognise `options` / `out` / `inout` / `late_out` — these are
+  NOT keywords; only `in` is, since it's also the for-loop
+  keyword).
+- `src/hlc.hls`: mirrored `parse_asm_stmt` for the self-hosted
+  compiler. Both parsers store the AST on a new
+  `StmtN.kind == "asm"` node with three new fields:
+  `asm_template` (str), `asm_operands` (list[AsmOperand]),
+  `asm_options` (list[str]).
+
+### Added — `AsmOperand` struct + `StmtN` fields
+
+- `src/hlc.hls`: new `AsmOperand` struct records one asm! operand:
+  `dir` (in/out/inout/late_out), `constraint` (the source text),
+  `is_constraint_str` (True iff the source used a string literal
+  form), `var` (the lvalue name for out/inout/late_out; "" for in),
+  `var_kind` ("ident"/"field"/"index"), `expr_idx` (the expression
+  index — for `in` it's the input value; for out/inout/late_out
+  it's the lvalue expression), `line`.
+- `src/hlc.hls`: three new fields on `StmtN` (`asm_template`,
+  `asm_operands`, `asm_options`). The `nx_stmt` constructor
+  initialises them to `""`, `[]`, `[]` so non-asm statements are
+  unaffected.
+
+### Added — `check_asm` (checker)
+
+- `boot/checker.py`: new `check_asm` method. Validates:
+  - Template `{N}` placeholders reference an existing operand
+    (`{5}` with 1 operand is rejected with a clear "out of
+    range" message).
+  - `in` operands are primitive-typed (int / float / bool).
+  - `out`/`inout`/`late_out` operands are mutable primitive
+    lvalues (`out(reg) x` on a non-mut `x` is rejected).
+  - `options(pure)` requires at least one output (a pure asm
+    with no outputs is dead code).
+  - `options(noreturn)` forbids outputs (the asm does not fall
+    through, so the outputs would never be observed).
+  - Bare register-class constraints (`reg`, `mem`, `imm`) and
+    the specific-register string form (`"eax"`, `"edx"`, ...) are
+    accepted; unknown constraints are rejected.
+- `src/hlc.hls`: mirrored `check_asm` for the self-hosted compiler.
+- `src/hlc.hls`: `all_return` is updated so a `noreturn` asm! as
+  the last statement of a function counts as a return-on-all-paths
+  (the codegen emits `__builtin_unreachable()` after the asm).
+- `src/hlc.hls`: new `parse_placeholder_int` and
+  `list_contains_str` helpers used by `check_asm`.
+
+### Added — `gen_asm` (codegen)
+
+- `src/hlc.hls`: new `gen_asm` function — lowers the HLS `asm!` to
+  GCC's extended-asm syntax:
+  ```
+  __asm__ __volatile__("template" : outputs : inputs : clobbers);
+  ```
+  The template `{N}` placeholders are rewritten to `%N`. The
+  direction prefix is applied: `out` -> `=`, `inout` -> `+`,
+  `late_out` -> `=&`. The default clobber list is `"cc", "memory"`;
+  `nomem` suppresses `"memory"`, `preserves_flags` suppresses
+  `"cc"`. `pure` drops `__volatile__` (gcc may elide a pure asm).
+  `noreturn` emits `__builtin_unreachable();` after the asm.
+- `src/hlc.hls`: new `translate_asm_constraint` function — converts
+  an HLS asm! constraint to the GCC constraint string. Bare
+  register classes: `reg` -> `r`, `mem` -> `m`, `imm` -> `i`.
+  Specific-register string forms: `eax`/`rax` -> `a`, `ebx`/`rbx`
+  -> `b`, `ecx`/`rcx` -> `c`, `edx`/`rdx` -> `d`, `esi`/`rsi` ->
+  `S`, `edi`/`rdi` -> `D`. Unknown string-form constraints pass
+  through verbatim (the user takes responsibility for the
+  validity).
+- `src/hlc.hls`: new `translate_asm_template` function — rewrites
+  the HLS asm! template (which uses `{N}` placeholders) to the
+  GCC form (which uses `%N` positional placeholders, `%%` for a
+  literal `%`, and `{{` / `}}` for literal braces). GCC's template
+  modifiers (`%b0`, `%w1`, `%k0`, `%q0`, `%%`) pass through
+  verbatim — the user can write either `{0}` (HLS placeholder) or
+  `%b0` (GCC modifier) in the template.
+- `src/hlc.hls`: new `c_str_literal` function — produces a C
+  string literal (just the quoted form, WITHOUT the existing
+  `c_str_lit`'s `hl_cstr("...")` wrapper — the GCC extended-asm
+  syntax expects a bare string token, not a function-call
+  expression). The existing `c_str_lit` is unchanged (it's still
+  used by the regular string-literal codegen path).
+- `src/hlc.hls`: new `join_str_list` helper (joins a `list[str]`
+  with a separator — used by the asm codegen to build the
+  outputs/inputs/clobbers lists).
+
+### Added — `boot/interp.py` asm! handler
+
+- `boot/interp.py`: new `k == "asm"` case in `exec_stmt`. Raises a
+  clean `HLPanic` ("asm! cannot be executed by the boot
+  interpreter — use the native compiler `hlc`") when an `asm!` is
+  executed. Programs that DECLARE `asm!` blocks but do NOT execute
+  them at interpreter runtime (e.g. an `asm!` inside a kernel IRQ
+  handler never called from `main`) run fine — matching the
+  kernel_irq_demo.hls pattern from Stage 28.
+
+### Added — `examples/asm_demo.hls`
+
+- A complete demo exercising all five asm! forms:
+  - `asm!("nop")` (bare)
+  - `asm!("mov $0, {0}", out(reg) x)` (output-only)
+  - `asm!("add $1, {0}", inout(reg) x)` (input + output via inout)
+  - `asm!("in %w1, %b0", in("edx") port, out("eax") val,
+    options(nomem, preserves_flags))` (the `inb()` acceptance
+    helper)
+  - `asm!("hlt", options(nomem, noreturn))` (noreturn)
+  - `asm!("mov {1}, {0}", in(reg) x, out(reg) y, options(pure,
+    nomem, preserves_flags))` (pure)
+- The `inb()` helper compiles to a single `in %dx, %al`
+  instruction (verified by `objdump -d` on the produced .o file —
+  no compiler-generated memory accesses thanks to the `nomem`
+  option).
+
+### Added — `tests/ok/feat_stage27_asm.hls`
+
+- The Stage 27 acceptance test, declaring all six asm!-containing
+  helpers (`asm_nop`, `asm_set_zero`, `asm_add`, `asm_inb`,
+  `asm_halt`, `asm_pure`). Verified by the boot interpreter
+  (smoke), the boot checker (type check), the self-hosted hlc
+  (compile), gcc (link), and objdump (single `in` instruction).
+
+### Added — `make asm-acceptance` + `tests/run_tests.sh` section 18
+
+- `Makefile`: new `asm-acceptance` target — verifies the full
+  Stage 27 acceptance criterion: HLS parses, C source has
+  `__asm__`, default clobber list is present, noreturn emits
+  `__builtin_unreachable()`, pure drops `__volatile__`, C compiles
+  cleanly with gcc -O2 -Werror, and `inb()` compiles to a single
+  `in` instruction (verified by objdump on the produced .o file).
+- `Makefile`: new `asm-attrs` target — prints the asm! templates
+  and operands of every function in the given HLS file.
+- `tests/run_tests.sh` section 18: 17 new tests covering all the
+  above plus negative tests (out-of-range `{N}` placeholder,
+  pure-with-no-outputs, noreturn-with-outputs, immutable out
+  operand).
+
+### Fixed — deep-scan (post-Stage 27)
+
+- `boot/parser.py`: removed a stray stub `while not self.at_sym("}")`
+  loop in `parse_asm_stmt`'s options handler (a leftover from
+  early development that never executed but was confusing to read).
+- `src/hlc.hls` `gen_asm`: declared `volatile_kw` as `mut` so the
+  `pure` option can reassign it (was previously a `let` that
+  caused a compile error in the self-hosted checker).
+- `src/hlc.hls` `translate_asm_constraint`: declared `prefix` and
+  `body` as `mut` so they can be reassigned by the direction and
+  register-class branches.
+
 ## [v0.49.0-alpha] — Stage 26: RISC-V 64 backend (RVV + bare-metal)
 
 > Stage 26 adds the RISC-V 64 backend as the foundation for OS-

@@ -1344,8 +1344,134 @@ class Checker:
                 self.err("continue only allowed inside a loop", s)
         elif k == "expr":
             self.check_expr(s["e"], env, None)
+        elif k == "asm":
+            # Stage 27 (v0.50.0-alpha): inline-assembly statement.
+            # The boot checker accepts the AST (the boot interpreter
+            # cannot execute asm, but the program is still parseable
+            # and the self-hosted compiler hlc.hls is the canonical
+            # path that lowers asm! to GCC extended asm). Validation:
+            #   * `in` operands must be primitive (int/float/bool).
+            #   * `out`/`inout`/`late_out` operands must be a mutable
+            #     lvalue of a primitive type.
+            #   * `{N}` template placeholders must reference an
+            #     existing operand (N in [0, len(operands))).
+            #   * `pure` requires at least one output operand (a
+            #     pure asm with no output is dead code).
+            #   * `noreturn` requires no `out`/`inout`/`late_out`
+            #     (no point writing outputs that are never observed).
+            self.check_asm(s, env)
         else:
             self.err("unknown statement: %s" % k, s)
+
+    # Stage 27 (v0.50.0-alpha): asm! checker. See the boot parser's
+    # parse_asm_stmt for the AST node shape.
+    def check_asm(self, s, env):
+        template = s["template"]
+        operands = s["operands"]
+        options = s["options"]
+        # Validate the template's {N} placeholders.
+        n_ops = len(operands)
+        i = 0
+        while i < len(template):
+            ch = ord(template[i])
+            # `{` starts a placeholder; `{{` is a literal `{`.
+            if ch == 123:  # '{'
+                if i + 1 < len(template) and ord(template[i + 1]) == 123:
+                    i = i + 2
+                    continue
+                # Find the matching `}`.
+                j = i + 1
+                while j < len(template) and ord(template[j]) != 125:
+                    j = j + 1
+                if j >= len(template):
+                    self.err("asm! template has unterminated '{' (no "
+                             "matching '}'): %r" % template, s)
+                body = template[i + 1:j]
+                # body should be a non-negative integer.
+                try:
+                    n = int(body)
+                except ValueError:
+                    self.err("asm! template placeholder {%s} is not a "
+                             "number (expected {0}, {1}, ...)" % body, s)
+                    return  # unreachable — err raises
+                if n < 0 or n >= n_ops:
+                    self.err("asm! template placeholder {%d} is out of "
+                             "range (have %d operand(s))" % (n, n_ops), s)
+                i = j + 1
+            elif ch == 125:  # '}'
+                if i + 1 < len(template) and ord(template[i + 1]) == 125:
+                    i = i + 2
+                    continue
+                self.err("asm! template has lone '}' (use '}}' for a "
+                         "literal '}'): %r" % template, s)
+            else:
+                i = i + 1
+        # Validate each operand.
+        has_output = False
+        for op in operands:
+            d = op["dir"]
+            if d not in ("in", "out", "inout", "late_out"):
+                self.err("asm! operand direction '%s' is unknown" % d, s)
+            if d != "in":
+                has_output = True
+            # Constraint validation (lightweight — the codegen re-validates).
+            c = op["constraint"]
+            if not op["is_constraint_str"]:
+                if c not in ("reg", "mem", "imm"):
+                    self.err("asm! constraint '%s' is unknown (bare "
+                             "constraints: reg, mem, imm; for a "
+                             "specific register use a string like "
+                             "\"eax\")" % c, s)
+            # Validate the operand's value/lvalue type.
+            if d == "in":
+                vt = self.check_expr(op["expr"], env, None)
+                if vt not in ("int", "float", "bool"):
+                    self.err("asm! `in` operand must be a primitive "
+                             "(int/float/bool), got %s" % vt, s)
+            else:
+                # out/inout/late_out — must be a mutable lvalue.
+                if op["var_kind"] != "ident" and op["var_kind"] != "field" \
+                        and op["var_kind"] != "index":
+                    self.err("asm! %s operand must be an lvalue" % d, s)
+                # Use check_lvalue to annotate + verify the binding.
+                tgt = op["expr"]
+                # the parser stored the lvalue as `expr`; treat it as
+                # an assignment-target to enforce mutability.
+                root = tgt
+                while root["k"] in ("field", "index"):
+                    root = root["target"]
+                binding = self.lookup(env, root["name"])
+                if binding is None:
+                    self.err("variable does not exist: %s" % root["name"], s)
+                # `out(reg) x` writes to x — x must be mut OR be a
+                # field/index target (mutation through a reference).
+                # We allow `out` on a non-mut lvalue ONLY when the
+                # lvalue is a field/index (writing through a borrowed
+                # reference). For an ident, `mut` is required.
+                if tgt["k"] == "ident" and not binding[1]:
+                    self.err("asm! %s operand must be a `mut` binding "
+                             "(cannot write to immutable variable %s)"
+                             % (d, root["name"]), s)
+                if d == "inout":
+                    if len(binding) >= 3 and binding[2]:
+                        self.err("asm! inout operand uses a moved value: "
+                                 "%s" % root["name"], s)
+                tt = self.check_lvalue(tgt, env)
+                if tt not in ("int", "float", "bool"):
+                    self.err("asm! %s operand must be a primitive "
+                             "(int/float/bool), got %s" % (d, tt), s)
+                # Annotate the operand with the resolved type for
+                # the codegen (matches the self-hosted checker).
+                op["t"] = tt
+        # Option validation.
+        if "pure" in options and not has_output:
+            self.err("asm! with `options(pure)` requires at least one "
+                     "output operand (a pure asm with no outputs is dead "
+                     "code — gcc would legitimately delete it)", s)
+        if "noreturn" in options and has_output:
+            self.err("asm! with `options(noreturn)` cannot have output "
+                     "operands (the asm does not fall through, so the "
+                     "outputs would never be observed)", s)
 
     def check_assign(self, s, env):
         tgt = s["target"]

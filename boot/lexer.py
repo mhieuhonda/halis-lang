@@ -15,6 +15,13 @@ KEYWORDS = {
     # (postcondition; may reference `result`). A grep shows the words
     # only appear in comments today, so reserving them is safe.
     "requires", "ensures",
+    # Stage 27 (v0.50.0-alpha): `asm` keyword — the inline-assembly
+    # statement `asm!("...", in(reg) x, out(reg) y, ...)`. A grep shows
+    # the word only appears in comments and identifiers like `has_asm`,
+    # so reserving it breaks no program. The `!` that follows is the
+    # existing single-char `!` sym (the unary-not operator) — no new
+    # lexer symbol is needed.
+    "asm",
 }
 
 # BUG-29 fix: reserved identifiers (per SPEC.md section 2.5). These are

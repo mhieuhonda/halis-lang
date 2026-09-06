@@ -2243,6 +2243,249 @@ else
 fi
 
 echo ""
+echo "=== 18. Stage 27: inline assembly (asm!) ==="
+# Stage 27 (v0.50.0-alpha): the asm! statement is parsed by both
+# the boot lexer/parser and the self-hosted hlc.hls, type-checked
+# by both checkers, and lowered to GCC's extended-asm syntax by the
+# self-hosted codegen. The boot interpreter cannot execute native
+# asm (it raises a clean HLPanic), but the parser/checker must
+# accept the syntax so programs declaring asm! blocks can still
+# be parsed + type-checked by boot.
+
+# (a) boot parses feat_stage27_asm.hls (smoke test).
+if python3 boot/boot.py tests/ok/feat_stage27_asm.hls >"$TMP/s27_boot.out" 2>&1; then
+    if grep -q "ACCEPTANCE OK" "$TMP/s27_boot.out"; then
+        ok "asm: feat_stage27_asm.hls runs on the boot interpreter (no asm executed)"
+    else
+        bad "asm: feat_stage27_asm.hls did not pass on the boot interpreter"
+        tail -5 "$TMP/s27_boot.out"
+    fi
+else
+    bad "asm: feat_stage27_asm.hls failed to run on the boot interpreter"
+    tail -10 "$TMP/s27_boot.out"
+fi
+
+# (b) the asm! syntax parses via boot's --check mode.
+if python3 boot/boot.py --check tests/ok/feat_stage27_asm.hls >"$TMP/s27_check.out" 2>&1; then
+    if grep -q "OK: types and effects valid" "$TMP/s27_check.out"; then
+        ok "asm: boot --check accepts the asm! syntax (types + effects valid)"
+    else
+        bad "asm: boot --check did not accept asm!"
+        cat "$TMP/s27_check.out"
+    fi
+else
+    bad "asm: boot --check failed on asm!"
+    cat "$TMP/s27_check.out"
+fi
+
+# (c) the self-hosted hlc.hls parses + checks feat_stage27_asm.hls.
+if "$TMP/hlc1" tests/ok/feat_stage27_asm.hls "$TMP/s27.c" >"$TMP/s27_hlc.out" 2>&1; then
+    ok "asm: self-hosted hlc compiles feat_stage27_asm.hls"
+else
+    bad "asm: self-hosted hlc failed to compile feat_stage27_asm.hls"
+    cat "$TMP/s27_hlc.out"
+fi
+
+# (d) the C source contains __asm__ on every asm!-containing function.
+asm_count=$(grep -c "__asm__" "$TMP/s27.c" 2>/dev/null || echo 0)
+if [ "$asm_count" -ge 6 ]; then
+    ok "asm: C source has $asm_count __asm__ sites (6+ expected)"
+else
+    bad "asm: C source has only $asm_count __asm__ sites (expected 6+)"
+fi
+
+# (e) the C source contains the default clobber list ("cc", "memory").
+if grep -q '"cc", "memory"' "$TMP/s27.c"; then
+    ok "asm: C source has default clobber list ("cc", "memory")"
+else
+    bad "asm: C source missing default clobber list"
+fi
+
+# (f) the noreturn option emits __builtin_unreachable() after the asm.
+if grep -A 1 '"hlt"' "$TMP/s27.c" | grep -q "__builtin_unreachable"; then
+    ok "asm: noreturn option emits __builtin_unreachable()"
+else
+    bad "asm: noreturn option did not emit __builtin_unreachable()"
+fi
+
+# (g) the pure option drops __volatile__ (gcc may elide if outputs unused).
+if grep -q '__asm__ ("mov' "$TMP/s27.c"; then
+    ok "asm: pure option drops __volatile__ (gcc may elide)"
+else
+    bad "asm: pure option did not drop __volatile__"
+fi
+
+# (h) the C source compiles cleanly with gcc -O2.
+if gcc -O2 -Werror -c -o "$TMP/s27.o" "$TMP/s27.c" -lm -pthread 2>"$TMP/s27_gcc.log"; then
+    ok "asm: C source compiles cleanly with gcc -O2 -Werror"
+else
+    bad "asm: C source fails to compile with gcc -O2 -Werror"
+    cat "$TMP/s27_gcc.log"
+fi
+
+# (i) the inb() helper compiles to a SINGLE in instruction
+#     (verified by objdump on the produced .o file).
+in_count=$(objdump -d "$TMP/s27.o" 2>/dev/null | grep -E "in\s+\(%dx\),%al|in\s+%dx,%al" | wc -l)
+if [ "$in_count" -ge 1 ]; then
+    ok "asm: inb() compiles to a single 'in' instruction ($in_count site(s))"
+else
+    bad "asm: inb() did not compile to a single 'in' instruction"
+    objdump -d "$TMP/s27.o" | grep -A 5 "usf_asm_inb"
+fi
+
+# (j) the interpreter raises a clean error if asm! is executed.
+#     This verifies the boot interp's asm! handler.
+cat >"$TMP/s27_run.hls" <<'HLS_EOF'
+fn trigger_asm() -> void {
+    asm!("nop")
+}
+fn main() -> int uses IO {
+    trigger_asm()
+    return 0
+}
+HLS_EOF
+if python3 boot/boot.py "$TMP/s27_run.hls" >"$TMP/s27_run.out" 2>&1; then
+    bad "asm: interpreter should have raised an error on asm! execution"
+    cat "$TMP/s27_run.out"
+else
+    if grep -q "asm! cannot be executed by the boot interpreter" "$TMP/s27_run.out"; then
+        ok "asm: interpreter raises a clean error when asm! is executed"
+    else
+        bad "asm: interpreter did not raise the expected asm! error"
+        cat "$TMP/s27_run.out"
+    fi
+fi
+
+# (k) the checker rejects an out-of-range {N} template placeholder.
+cat >"$TMP/s27_bad_oob.hls" <<'HLS_EOF'
+fn bad_oob() -> void {
+    let mut x: int = 0
+    asm!("mov {0}, {5}", out(reg) x)
+}
+fn main() -> int uses IO {
+    return 0
+}
+HLS_EOF
+if python3 boot/boot.py --check "$TMP/s27_bad_oob.hls" >"$TMP/s27_bad_oob.out" 2>&1; then
+    bad "asm: checker did not reject out-of-range {5} template placeholder"
+else
+    if grep -q "out of range" "$TMP/s27_bad_oob.out"; then
+        ok "asm: checker rejects out-of-range {5} template placeholder"
+    else
+        bad "asm: checker rejected {5} but with the wrong message"
+        cat "$TMP/s27_bad_oob.out"
+    fi
+fi
+
+# (l) the checker rejects options(pure) with no outputs.
+cat >"$TMP/s27_bad_pure.hls" <<'HLS_EOF'
+fn bad_pure() -> void {
+    asm!("nop", options(pure))
+}
+fn main() -> int uses IO {
+    return 0
+}
+HLS_EOF
+if python3 boot/boot.py --check "$TMP/s27_bad_pure.hls" >"$TMP/s27_bad_pure.out" 2>&1; then
+    bad "asm: checker did not reject options(pure) with no outputs"
+else
+    if grep -q "pure" "$TMP/s27_bad_pure.out"; then
+        ok "asm: checker rejects options(pure) with no outputs"
+    else
+        bad "asm: checker rejected pure-no-outputs but with the wrong message"
+        cat "$TMP/s27_bad_pure.out"
+    fi
+fi
+
+# (m) the checker rejects options(noreturn) with outputs.
+cat >"$TMP/s27_bad_noret.hls" <<'HLS_EOF'
+fn bad_noret() -> void {
+    let mut x: int = 0
+    asm!("nop", out(reg) x, options(noreturn))
+}
+fn main() -> int uses IO {
+    return 0
+}
+HLS_EOF
+if python3 boot/boot.py --check "$TMP/s27_bad_noret.hls" >"$TMP/s27_bad_noret.out" 2>&1; then
+    bad "asm: checker did not reject options(noreturn) with outputs"
+else
+    if grep -q "noreturn" "$TMP/s27_bad_noret.out"; then
+        ok "asm: checker rejects options(noreturn) with outputs"
+    else
+        bad "asm: checker rejected noreturn-with-outputs but with the wrong message"
+        cat "$TMP/s27_bad_noret.out"
+    fi
+fi
+
+# (n) the checker rejects `out(reg) x` on an immutable variable.
+cat >"$TMP/s27_bad_immut.hls" <<'HLS_EOF'
+fn bad_immut() -> void {
+    let x: int = 0
+    asm!("nop", out(reg) x)
+}
+fn main() -> int uses IO {
+    return 0
+}
+HLS_EOF
+if python3 boot/boot.py --check "$TMP/s27_bad_immut.hls" >"$TMP/s27_bad_immut.out" 2>&1; then
+    bad "asm: checker did not reject out(reg) on immutable x"
+else
+    if grep -q "mut" "$TMP/s27_bad_immut.out"; then
+        ok "asm: checker rejects out(reg) on immutable x"
+    else
+        bad "asm: checker rejected immutable out but with the wrong message"
+        cat "$TMP/s27_bad_immut.out"
+    fi
+fi
+
+# (o) make asm-acceptance runs end-to-end.
+if make asm-acceptance >"$TMP/s27_acc.log" 2>&1; then
+    if grep -q "ACCEPTANCE OK" "$TMP/s27_acc.log"; then
+        ok "asm: make asm-acceptance runs end-to-end"
+    else
+        bad "asm: make asm-acceptance did not print ACCEPTANCE OK"
+        tail -5 "$TMP/s27_acc.log"
+    fi
+else
+    bad "asm: make asm-acceptance failed"
+    tail -10 "$TMP/s27_acc.log"
+fi
+
+# (p) bootstrap is deterministic with the asm! additions (the
+#     self-hosted compiler must remain deterministic).
+if python3 boot/boot.py src/hlc.hls src/hlc.hls "$TMP/hlc_asm1.c" >/dev/null 2>&1     && python3 boot/boot.py src/hlc.hls src/hlc.hls "$TMP/hlc_asm2.c" >/dev/null 2>&1; then
+    if diff -q "$TMP/hlc_asm1.c" "$TMP/hlc_asm2.c" >/dev/null; then
+        ok "asm: bootstrap deterministic with asm! changes"
+    else
+        bad "asm: bootstrap not deterministic with asm! changes"
+    fi
+else
+    bad "asm: bootstrap compile failed"
+fi
+
+# (q) the asm_demo.hls example compiles + runs cleanly (the safe
+#     helpers — read_tsc, asm_add_one, cpu_pause — should run on the
+#     host; the privileged helpers — inb, outb, halt_forever — are
+#     NOT called from main()).
+if "$TMP/hlc1" examples/asm_demo.hls "$TMP/s27_demo.c" >/dev/null 2>&1     && gcc -O2 -o "$TMP/s27_demo" "$TMP/s27_demo.c" -lm -pthread 2>"$TMP/s27_demo_gcc.log"; then
+    if "$TMP/s27_demo" >"$TMP/s27_demo.out" 2>&1; then
+        if grep -q "Stage 27 asm! demo:" "$TMP/s27_demo.out"             && grep -q "asm_add_one(41)  -> 42" "$TMP/s27_demo.out"; then
+            ok "asm: examples/asm_demo.hls runs cleanly (asm_add_one(41) -> 42)"
+        else
+            bad "asm: examples/asm_demo.hls ran but output is unexpected"
+            cat "$TMP/s27_demo.out"
+        fi
+    else
+        bad "asm: examples/asm_demo.hls binary failed to run"
+        cat "$TMP/s27_demo.out"
+    fi
+else
+    bad "asm: examples/asm_demo.hls failed to compile + link"
+    cat "$TMP/s27_demo_gcc.log"
+fi
+
+echo ""
 echo "=========================================="
 echo "RESULT: $PASS PASS / $FAIL FAIL"
 echo "=========================================="
