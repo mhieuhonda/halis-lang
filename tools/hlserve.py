@@ -72,6 +72,15 @@ class FileWatcher(threading.Thread):
         self._lock = threading.Lock()
 
     def run(self):
+        # Deep-scan-15 defensive: `last_change` is only assigned inside
+        # the `if changed:` branch, but is read below in the
+        # `if self._pending and (time.time() - last_change) >= ...`
+        # check. The two are always assigned together (the `_pending`
+        # flag is only set to True alongside `last_change = now`), so
+        # the read is safe at runtime — but static analyzers (pylint
+        # E0606) can't track the correlation. Initialize to 0.0 so
+        # the variable is provably defined on every code path.
+        last_change = 0.0
         while not self._stop:
             now = time.time()
             changed = self._scan()

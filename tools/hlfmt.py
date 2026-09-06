@@ -213,13 +213,21 @@ def format_source(src: bytes) -> str:
             cur_line_parts.append("}")
             # Peek ahead: if the next token is `=>`, `,`, `)`, `]`, keep on
             # same line; otherwise flush.
+            # Deep-scan-15 cleanup: the previous `nxt = ... if i + 1 < n else None`
+            # pattern tripped pylint's E1136 (unsubscriptable-object)
+            # because the `nxt and` short-circuit guard isn't tracked by
+            # the type-inference. Use the .get() accessor on the dict
+            # path (no None subscript) so the checker is happy without
+            # changing the runtime behavior.
             nxt = toks[i + 1] if i + 1 < n else None
-            if nxt and nxt["k"] == SYM and nxt["v"] in (",", ")", "]", ";", "=>"):
+            nxt_k = nxt["k"] if nxt is not None else None
+            nxt_v = nxt["v"] if nxt is not None else None
+            if nxt is not None and nxt_k == SYM and nxt_v in (",", ")", "]", ";", "=>"):
                 # Will be handled by the next iteration's whitespace logic.
                 pass
             # SCAN-B fix: keep `} else {` and `} else if (...) {` on the
             # same line — the previous peek set missed the `else` keyword.
-            elif nxt and nxt["k"] == "kw" and nxt["v"] == "else":
+            elif nxt is not None and nxt_k == "kw" and nxt_v == "else":
                 # Append a space so the `else` token joins this line.
                 if cur_line_parts and not cur_line_parts[-1].endswith(" "):
                     cur_line_parts.append(" ")

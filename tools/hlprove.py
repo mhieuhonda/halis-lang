@@ -212,11 +212,16 @@ def _z3_verdicts_py(path):
     module is unavailable. Deep-scan-10 (Stage-17 perfection): --z3 used
     to require a z3 BINARY on PATH; the module fallback makes the bridge
     usable everywhere the package is installed."""
+    # Deep-scan-15 cleanup: the previous code had TWO imports —
+    # `import z3  # noqa: F401` (just to test importability) followed
+    # by `import z3 as z` (the actual alias used below). The first
+    # import is redundant: if z3 doesn't exist, both lines raise
+    # ImportError; if it does, both succeed (Python caches modules
+    # in sys.modules). Collapse to a single `import z3 as z`.
     try:
-        import z3  # noqa: F401
+        import z3 as z
     except ImportError:
         return None
-    import z3 as z
     # Deep-scan-13 fix: close the SMT transcript file deterministically
     # (the old bare open() relied on CPython's refcount GC — a resource
     # leak on PyPy and a ResourceWarning under -W error).

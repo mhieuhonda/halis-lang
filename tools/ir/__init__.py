@@ -606,7 +606,10 @@ def _uses_concurrency(program):
 
 
 def _reject_concurrency(program, mode):
-    from boot.lexer import HLError
+    # Deep-scan-15 cleanup: HLError is already imported at module top
+    # (lines 47/52 with the sys.path fallback). The local re-import
+    # was redundant and shadowed the module-level binding with an
+    # identical one.
     if _uses_concurrency(program):
         raise HLError(
             "concurrency (Chan[T] / Task[R] / spawn / chan_new / select) is "

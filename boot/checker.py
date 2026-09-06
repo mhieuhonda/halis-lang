@@ -2625,8 +2625,21 @@ class Checker:
             # support user-defined methods on enums. Future: enable `impl`.
             self.err("enum %s has no method %s (enum impl not supported yet)"
                      % (type_base(tt), name), e)
+            # Deep-scan-15 defensive: see the matching sentinel in the
+            # `else` branch below — same rationale (self.err raises,
+            # but analyzers can't prove that).
+            ptypes, ret = [], "void"
         else:
             self.err("cannot call method on type %s" % tt, e)
+            # Deep-scan-15 defensive: every failing branch above calls
+            # self.err() which raises HLError, so ptypes/ret are
+            # guaranteed to be assigned when we reach the post-branch
+            # code at line ~2630. Initialize sentinels here so static
+            # analyzers (pylint E0606) don't flag the post-branch use
+            # of `ptypes`/`ret` as possibly-unassigned. If err() ever
+            # stops raising, the sentinel values produce a clean
+            # type-mismatch error instead of an UnboundLocalError.
+            ptypes, ret = [], "void"
         if len(args) != len(ptypes):
             self.err("%s.%s expects %d arguments, got %d"
                      % (tt, name, len(ptypes), len(args)), e)

@@ -768,8 +768,11 @@ def print_opt_stats(program, lto: bool = False, target_feature: str = ""):
         total_a += a
         print("  %-*s  %10d  %10d  %10d" % (name_w, fname, b, a, b - a))
     print("=" * (name_w + 30))
-    print("  %-*s  %10d  %10d  %10d" % (
-        name_w, "TOTAL", total_b, total_a, total_b - total_a))
+    # Deep-scan-15 cleanup: replaced the `"%-*s" % (name_w, "TOTAL", ...)`
+    # format string (which pylint's E1307 checker falsely flagged
+    # because it doesn't model the `%-*s` width-from-arg form) with
+    # the equivalent f-string. Same output, clearer intent.
+    print(f"  {'TOTAL':<{name_w}}  {total_b:>10d}  {total_a:>10d}  {total_b - total_a:>10d}")
     print("")
     print("  Passes: constant_fold, copy_propagate, dead_code_elim,")
     print("          inline_small, licm")

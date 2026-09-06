@@ -323,9 +323,15 @@ def _refine(facts, var, lo, hi):
         if isinstance(new_hi, tuple) or isinstance(old.hi, tuple):
             # Merge symbolic: prefer the symbolic (more precise for
             # in-bounds); numeric beats nothing.
-            if isinstance(old.hi, tuple) and isinstance(new_hi, tuple):
-                new_hi = new_hi  # keep latest
-            elif isinstance(old.hi, tuple):
+            # Deep-scan-15 cleanup: the previous branch
+            # `if isinstance(old.hi, tuple) and isinstance(new_hi, tuple):
+            #    new_hi = new_hi` was a no-op self-assignment (the
+            # `else if` only fires when `old.hi` is tuple and
+            # `new_hi` is not — i.e. use old.hi). The both-tuple case
+            # already leaves new_hi unchanged (it IS a tuple), so the
+            # explicit self-assignment was dead code that confused
+            # pylint (W0127) and obscured the intent.
+            if isinstance(old.hi, tuple):
                 new_hi = old.hi
         facts[var] = Interval(old.lo if lo is None else lo, new_hi)
         return
