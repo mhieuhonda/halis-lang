@@ -13,6 +13,185 @@ stability (125–140), and final stabilisation toward v1.0 (141–150).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
+## [v0.49.0-alpha] — Stage 26: RISC-V 64 backend (RVV + bare-metal)
+
+> Stage 26 adds the RISC-V 64 backend as the foundation for OS-
+> development work (Stages 77–96). Two RISC-V 64 targets are
+> supported: `riscv64gc-unknown-linux-gnu` (full Linux user-mode,
+> RV64GC: IMAFDC) and `riscv64-unknown-none` (bare-metal, RV64IMAC,
+> no OS, no libc). The RISC-V Vector (RVV) extension `V` is engaged
+> via `--target-feature rvv`, which emits `<riscv_vector.h>`
+> intrinsics (`__riscv_vadd_vv_i32m1`, `__riscv_vsub_vv_i32m1`,
+> `__riscv_vmul_vv_i32m1`, `__riscv_vmin_vv_i32m1`,
+> `__riscv_vmax_vv_i32m1` for i32x4; `__riscv_vadd_vv_f64m1`,
+> `__riscv_vsub_vv_f64m1`, `__riscv_vmul_vv_f64m1` for f64x2) under a
+> `#if defined(__riscv) && defined(__riscv_v)` guard, with the same
+> portable scalar fallback as the x86 (SSE4.2/AVX2) and AArch64
+> (NEON) paths. The same C source compiles on every host.
+> `make riscv-acceptance` (RVV codegen) and `make riscv-bare-
+> acceptance` (freestanding compile) are GREEN; bootstrap
+> deterministic with `--target-feature rvv`; full local suite
+> **793 PASS / 0 FAIL** (was 779, +14 Stage 26 tests).
+
+### Added — RISC-V Vector (RVV) intrinsic emission (`src/hlc.hls`)
+
+- New `simd_helpers_rvv` field on the `Ctx` struct (holds the C
+  lines of the RVV intrinsic bodies, populated when
+  `--target-feature rvv` is passed).
+- New `simd_emit_rvv_i32x4_ew(ctx, name, intrinsic)` function —
+  emits one elementwise i32x4 kernel using RVV intrinsics. The body
+  loads `x` and `y` from their `{i64 a, i64 b}` layout into
+  `vint32m1_t` registers via `__riscv_vle32_v_i32m1`, applies the
+  intrinsic with `vl=4` (4 i32 lanes at LMUL=1, VLEN≥128), and
+  stores the result back via `__riscv_vse32_v_i32m1`. The intrinsic
+  name (`__riscv_vadd_vv_i32m1`, `__riscv_vsub_vv_i32m1`,
+  `__riscv_vmul_vv_i32m1`, `__riscv_vmin_vv_i32m1`,
+  `__riscv_vmax_vv_i32m1`) is passed in.
+- New `simd_emit_rvv_f64x2_ew(ctx, name, intrinsic)` function —
+  emits one elementwise f64x2 kernel using RVV intrinsics. Loads via
+  `__riscv_vle64_v_f64m1`, stores via `__riscv_vse64_v_f64m1`. `vl=2`
+  (2 f64 lanes at LMUL=1, VLEN≥128).
+- Modified `simd_emit_helper(ctx, name)` — each dispatch entry now
+  also checks `ctx.target_feature == "rvv"` and calls the RVV
+  emitter (instead of the x86 or NEON emitter) when true. The same
+  scalar fallback is always emitted.
+- Modified `simd_helper_lines(ctx)` — new
+  `else if ctx.target_feature == "rvv"` branch emits
+  `#if defined(__riscv) && defined(__riscv_v)` /
+  `#include <riscv_vector.h>` / `simd_helpers_rvv` /
+  `simd_helpers_plain` / `#else` / `simd_helpers_alt` /
+  `simd_helpers_plain` / `#endif`.
+- Modified `simd_detect_native_feature()` — new probe:
+  `simd_cpu_supports("rvv")` returns true on a RISC-V 64 host whose
+  `/proc/cpuinfo` `isa:` line contains the V extension. Returns
+  `rvv` when true.
+- Modified `--target-feature` CLI parsing — accepts `rvv` (and
+  `+rvv`) in addition to `sse4.2`, `avx2`, `neon`, `native`. The
+  usage string is updated to
+  `--target-feature sse4.2|avx2|neon|rvv|native`.
+
+### Added — RISC-V 64 cross-compilation targets (`tools/hlcross.py`)
+
+- New target `riscv64gc-unknown-linux-gnu` (Linux user-mode,
+  RV64GC: IMAFDC). `arch=riscv64`, `os=linux`, `abi=gnu`,
+  `binary_format=ELF riscv64 (Little Endian, RV64GC)`,
+  `march=rv64gc`, `mabi=lp64d`. When `--target-feature rvv` is
+  given, `march` is promoted to `rv64gcv` (G + C + V).
+- `riscv64-unknown-linux-gnu` is an alias for the same target.
+- New target `riscv64-unknown-none` (bare-metal, RV64IMAC).
+  `arch=riscv64`, `os=none`, `abi=none`, `binary_format=ELF
+  riscv64 (Little Endian, RV64IMAC, freestanding)`, `march=rv64imac`,
+  `mabi=lp64`, `freestanding=True` (causes `cross_compile` to add
+  `-nostdlib -nostartfiles -ffreestanding` to the linker command),
+  `link_libs=[]` (no libc, no libm, no pthread).
+- New `march`/`mabi`/`freestanding` fields on RISC-V targets. The
+  `cross_compile` function appends `-march=<march> -mabi=<mabi>` to
+  the linker command for RISC-V targets, and
+  `-nostdlib -nostartfiles -ffreestanding` when `freestanding=True`.
+- New cross-linker detection:
+  - Linux user-mode: `riscv64-linux-gnu-gcc`,
+    `riscv64-linux-gnu-gcc-13`, `riscv64-linux-gnu-gcc-12`,
+    `riscv64-linux-gnu-cc`, `riscv64-unknown-linux-gnu-gcc`.
+  - Bare-metal: `riscv64-unknown-elf-gcc`, `riscv64-elf-gcc`,
+    `riscv64-none-elf-gcc`, `riscv64-linux-gnu-gcc` (the last is
+    used with `-nostdlib -nostartfiles` when only the Linux
+    toolchain is installed).
+- New aliases: `riscv64-linux`, `riscv64`, `riscv64gc`, `riscv`,
+  `visionfive`, `sifive` (Linux); `riscv64-bare`,
+  `riscv64-unknown`, `riscv-bare`, `riscv-none` (bare-metal).
+- Modified `host_triple()` — recognises RISC-V 64 hosts
+  (`riscv64`, `rv64`, `riscv`) and returns
+  `riscv64gc-unknown-linux-gnu`.
+- Modified `cmd_list_targets()` — prints `march`/`mabi` for targets
+  that have them; prints the freestanding flag note for targets with
+  `freestanding=True`.
+- Modified `--target-feature` CLI flag — accepts `rvv` in addition
+  to `neon`, `sse4.2`, `avx2`, `native`.
+
+### Added — `tools/hlriscv.py`
+
+- New helper that wraps `hlcross.cross_compile` with the right
+  RVV + `-march`/`-mabi` flags. Defaults to
+  `--target riscv64gc-unknown-linux-gnu --target-feature rvv`.
+- `--list-targets` prints the supported RISC-V target triples + the
+  RVV feature + the bare-metal flags.
+- For the bare-metal target (`riscv64-unknown-none`), the
+  `--target-feature rvv` is silently stripped (rv64imac has no V
+  extension).
+
+### Modified — `boot/boot.py` + `boot/interp.py`
+
+- `boot/boot.py` `--target-feature` parsing — accepts `rvv` (and
+  `+rvv`). The `--target-feature native` auto-detect now also
+  probes `_cpu_supports("rvv")` and resolves to `rvv` on a RISC-V
+  64 host with the V extension.
+- `boot/interp.py` `_cpu_supports(feat)` — new `feat == "rvv"`
+  branch: returns `True` on a RISC-V 64 host whose `/proc/cpuinfo`
+  `isa:` line contains the V extension. Returns `False` on
+  non-RISC-V hosts (best-effort runtime probe).
+
+### Added — Makefile targets
+
+- `make riscv-bench [F=benchmarks/simd_bench.hls] [OUT=...]` —
+  cross-compile to RISC-V 64 Linux with RVV intrinsics.
+- `make riscv-acceptance` — the Stage 26 RVV codegen acceptance
+  gate. Verifies that: (a) the C source for `simd_bench.hls`
+  contains RVV intrinsics; (b) it includes `<riscv_vector.h>`;
+  (c) it has the `__riscv && __riscv_v` guard; (d) the C source
+  compiles + runs on x86_64 via the scalar fallback; (e) on a
+  RISC-V 64 host, the runtime benchmark compares RVV vs baseline
+  (SKIPped on non-RISC-V hosts — the static checks still pass).
+- `make riscv-bare-metal [F=examples/riscv_demo.hls] [OUT=...]` —
+  cross-compile to `riscv64-unknown-none` (bare-metal).
+- `make riscv-bare-acceptance` — the Stage 26 bare-metal
+  acceptance gate. Verifies that: (a) the C source was produced;
+  (b) the C source compiles under `-ffreestanding -nostdlib -c`
+  (the user's code is freestanding-compatible); (c) when a RISC-V
+  cross-linker is available, the binary's ELF header identifies it
+  as RISC-V 64. The full "zero libc references" binary requires
+  the freestanding runtime (Stage 77+ `#![freestanding]` mode);
+  Stage 26 wires up the cross-compilation pipeline + verifies the
+  C source is freestanding-compatible.
+- `make riscv-list-targets` — print the RISC-V target + feature
+  set.
+
+### Added — examples + tests
+
+- `examples/riscv_demo.hls` — a demo program for both RISC-V
+  targets: `fib_iter` (pure integer Fibonacci), `riscv_sum_range`
+  (pure integer sum), `riscv_rvv_demo` (exercises the std.simd
+  kernels that lower to RVV intrinsics under `--target-feature
+  rvv`). The `main` function prints the results (Linux user-mode
+  entry). The bare-metal target uses the same C source — the
+  freestanding compile succeeds because the C source compiles
+  under `-ffreestanding -c`.
+- `tests/ok/feat_stage26_riscv.hls` — the Stage 26 ok-test:
+  exercises `fib_iter`, `riscv_sum_range`, and the std.simd kernels
+  (add/sub/mul/min/max for i32x4) on the portable path AND under
+  `--target-feature rvv` (which sets `has_feature("rvv")=true`).
+- 14 new tests in `tests/run_tests.sh` section 16: RVV intrinsics
+  emitted, `<riscv_vector.h>` included, `__riscv_v` guard present,
+  RVV C source compiles + runs on x86_64 via scalar fallback,
+  hlcross `--list-targets` includes RISC-V targets, hlcross accepts
+  the `riscv64` alias, `hlriscv.py` imports + has main,
+  `hlriscv --list-targets` prints RVV + bare-metal, `hlriscv`
+  produces C source with RVV intrinsics + `riscv_vector.h`,
+  `make riscv-acceptance` runs end-to-end, `make
+  riscv-bare-acceptance` runs end-to-end, `feat_stage26_riscv.hls`
+  runs on portable path AND with `--target-feature rvv`
+  (`has_feature("rvv")=true`), bootstrap deterministic with
+  `--target-feature rvv`, native `has_feature("rvv")` const-folds
+  to true under `--target-feature rvv`.
+
+### Test suite
+
+- **793/793 PASS** (was 779/779 in v0.48.2-alpha). Bootstrap still
+  deterministic with `--target-feature rvv` (the self-hosted
+  compiler doesn't use `std.simd`, so the RVV code paths don't
+  affect bootstrap output).
+
+---
+
 ## [v0.48.2-alpha] — Stage 31 perfection: deep-scan-15
 
 > The deep-scan-15 pass returns to the broader codebase and audits

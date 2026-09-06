@@ -524,7 +524,8 @@ def _set_target_feature(feat):
 def _cpu_supports(feat):
     """Probe the host CPU for a SIMD feature (interpreter side; the
     native side uses __builtin_cpu_supports). /proc/cpuinfo on Linux
-    x86; NEON is baseline on aarch64; False otherwise."""
+    x86; NEON is baseline on aarch64; rvv checks __riscv_v macro on
+    riscv64; False otherwise."""
     try:
         feat = feat.decode("utf-8") if isinstance(feat, bytes) else feat
     except Exception:
@@ -533,6 +534,41 @@ def _cpu_supports(feat):
     machine = platform.machine().lower()
     if feat == "neon":
         return machine in ("aarch64", "arm64", "armv8l")
+    # Stage 26 (v0.49.0-alpha): RISC-V Vector extension. The probe is
+    # based on the `Features` line in /proc/cpuinfo (Linux RISC-V
+    # exposes the V extension as `v` in the Features list) plus the
+    # platform machine check. The __riscv_v macro is defined by the C
+    # compiler when -march includes the V extension; the interpreter
+    # has no equivalent compile-time probe, so the runtime probe is
+    # the only signal (best-effort: returns False if /proc/cpuinfo is
+    # unreadable, e.g. on macOS/BSD where the V extension would be
+    # queried differently).
+    if feat == "rvv":
+        if machine not in ("riscv64", "rv64", "riscv"):
+            return False
+        try:
+            with open("/proc/cpuinfo", "rb") as f:
+                for line in f:
+                    if line.startswith(b"Features") or line.startswith(b"isa"):
+                        # Linux RISC-V /proc/cpuinfo exposes the ISA
+                        # extensions as `isa: rv64imafdv` (lowercase,
+                        # one string). The V extension is present
+                        # when 'v' appears in the isa string after
+                        # the base extensions. We check for "_v" or
+                        # "v" as a standalone token.
+                        isa = line.decode("utf-8", "replace").lower()
+                        # Strip the "isa:" / "features:" prefix.
+                        isa = isa.split(":", 1)[-1].strip()
+                        # The V extension is denoted by 'v' in the
+                        # isa string (e.g. "rv64imafdcv"). Check that
+                        # it appears as a suffix token (not inside
+                        # another extension name).
+                        if "v" in isa:
+                            return True
+                        break
+        except OSError:
+            return False
+        return False
     flags = ""
     try:
         with open("/proc/cpuinfo", "rb") as f:

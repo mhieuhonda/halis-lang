@@ -333,6 +333,11 @@ struct Ctx {
     # when --target-feature neon is passed; the same scalar fallback
     # (simd_helpers_alt) is used for non-NEON hosts.
     simd_helpers_neon: list[str],
+    # Stage 26 (v0.49.0-alpha): simd_helpers_rvv = the RISC-V Vector
+    # (RVV) intrinsic bodies (in the #elif __riscv && __riscv_v branch).
+    # Populated when --target-feature rvv is passed; the same scalar
+    # fallback (simd_helpers_alt) is used for non-RISC-V hosts.
+    simd_helpers_rvv: list[str],
     # simd_helper_names: helper names already emitted (dedup).
     simd_helper_names: list[str],
     # ---- Stage 28+29 (v0.45.0-alpha): attribute parser state ----
@@ -441,7 +446,8 @@ fn new_ctx(src: str) -> Ctx {
         lto_inline_n: 0, lto_dropped: 0, lto_inlined_report: [],
         lto_threshold: 0, lto_stats: false,
         target_feature: "", simd_helpers_main: [], simd_helpers_alt: [],
-        simd_helpers_plain: [], simd_helpers_neon: [], simd_helper_names: [],
+        simd_helpers_plain: [], simd_helpers_neon: [], simd_helpers_rvv: [],
+        simd_helper_names: [],
         cur_attrs_stack_size: -1, cur_attrs_no_red_zone: false,
         cur_attrs_irq_handler: false, cur_attrs_inline: "",
         cur_attrs_hot: false, cur_attrs_cold: false,
@@ -10592,6 +10598,121 @@ fn simd_emit_neon_f64x2_ew(ctx: Ctx, name: str, intrinsic: str) -> void {
 }
 
 # ============================================================================
+# Stage 26 (v0.49.0-alpha): RISC-V Vector (RVV) intrinsic emission.
+# ----------------------------------------------------------------------------
+# When --target-feature rvv is passed, simd_emit_helper dispatches the
+# elementwise kernels (add/sub/mul/min/max for i32x4, add/sub/mul for
+# f64x2) to simd_emit_rvv_*_ew, which pushes the RVV intrinsic body
+# into simd_helpers_rvv and the same scalar fallback (simd_helpers_alt)
+# into the #else branch. The RVV bodies are emitted in the
+# #elif defined(__riscv) && defined(__riscv_v) branch by
+# simd_helper_lines.
+#
+# RVV intrinsic reference (RVV 1.0 spec,
+# github.com/riscv-non-isa/rvv-intrinsic-doc):
+#   i32x4 add/sub/mul/min/max (LMUL=1, vl=4):
+#     __riscv_vadd_vv_i32m1 / __riscv_vsub_vv_i32m1 / __riscv_vmul_vv_i32m1 /
+#     __riscv_vmin_vv_i32m1 / __riscv_vmax_vv_i32m1
+#   f64x2 add/sub/mul (LMUL=1, vl=2):
+#     __riscv_vadd_vv_f64m1 / __riscv_vsub_vv_f64m1 / __riscv_vmul_vv_f64m1
+#   load/store:
+#     __riscv_vle32_v_i32m1 / __riscv_vse32_v_i32m1 (i32 elements)
+#     __riscv_vle64_v_f64m1 / __riscv_vse64_v_f64m1 (f64 elements)
+#
+# The "vl=4" / "vl=2" parameter is the vector length (number of elements
+# processed). At VLEN=128 (the baseline), an i32m1 register holds 4 i32
+# lanes (VLEN/SEW = 128/32 = 4) and an f64m1 register holds 2 f64 lanes
+# (128/64 = 2). At higher VLEN (256, 512), the same LMUL=1 register holds
+# more lanes — but we explicitly request vl=4 / vl=2 so the behavior is
+# identical across VLEN: only the first 4 / 2 lanes are processed. This
+# matches the HLS I32x4 / F64x2 type semantics (fixed-size vectors).
+# ============================================================================
+
+# simd_emit_rvv_i32x4_ew: one elementwise i32x4 kernel using RVV
+# intrinsics. The intrinsic name (e.g. "__riscv_vadd_vv_i32m1") is
+# passed in; the body loads x and y from their {i64 a, i64 b} layout
+# into vint32m1_t registers, applies the intrinsic, and stores the
+# result back into a fresh I32x4 struct.
+fn simd_emit_rvv_i32x4_ew(ctx: Ctx, name: str, intrinsic: str) -> void {
+    let m: list[str] = ctx.simd_helpers_rvv
+    let a: list[str] = ctx.simd_helpers_alt
+    m.push("/* " + name + " (RVV) */")
+    m.push("static I32x4* hl_" + name + "(I32x4* x_p, I32x4* y_p) {")
+    m.push("    I32x4* x = x_p; I32x4* y = y_p;")
+    m.push("    I32x4* r = usf_new_I32x4(0, 0);")
+    m.push("    /* RVV 1.0: vl=4 (4 i32 lanes at LMUL=1, VLEN>=128). */")
+    m.push("    vint32m1_t va = __riscv_vle32_v_i32m1((const int32_t*)&x->a, 4);")
+    m.push("    vint32m1_t vb = __riscv_vle32_v_i32m1((const int32_t*)&y->a, 4);")
+    m.push("    vint32m1_t c = " + intrinsic + "(va, vb, 4);")
+    m.push("    __riscv_vse32_v_i32m1((int32_t*)&r->a, c, 4);")
+    m.push("    hl_release_I32x4(x); hl_release_I32x4(y);")
+    m.push("    return r;")
+    m.push("}")
+    a.push("/* " + name + " (scalar fallback) */")
+    a.push("static I32x4* hl_" + name + "(I32x4* x_p, I32x4* y_p) {")
+    a.push("    I32x4* x = x_p; I32x4* y = y_p;")
+    a.push("    I32x4* r = usf_new_I32x4(0, 0);")
+    a.push("    int32_t la[4] = { (int32_t)(uint32_t)x->a, (int32_t)(uint32_t)(x->a >> 32),")
+    a.push("                       (int32_t)(uint32_t)x->b, (int32_t)(uint32_t)(x->b >> 32) };")
+    a.push("    int32_t lb[4] = { (int32_t)(uint32_t)y->a, (int32_t)(uint32_t)(y->a >> 32),")
+    a.push("                       (int32_t)(uint32_t)y->b, (int32_t)(uint32_t)(y->b >> 32) };")
+    if name == "simd_i32x4_min" {
+        a.push("    int32_t lr[4];")
+        a.push("    for (int k = 0; k < 4; k++) lr[k] = la[k] < lb[k] ? la[k] : lb[k];")
+    } else if name == "simd_i32x4_max" {
+        a.push("    int32_t lr[4];")
+        a.push("    for (int k = 0; k < 4; k++) lr[k] = la[k] > lb[k] ? la[k] : lb[k];")
+    } else {
+        let mut c_op: str = "+"
+        if name == "simd_i32x4_sub" {
+            c_op = "-"
+        } else if name == "simd_i32x4_mul" {
+            c_op = "*"
+        }
+        a.push("    uint32_t lr[4];")
+        a.push("    for (int k = 0; k < 4; k++) lr[k] = (uint32_t)((uint64_t)(uint32_t)la[k] " + c_op + " (uint64_t)(uint32_t)lb[k]);")
+    }
+    a.push("    r->a = (int64_t)((uint64_t)(uint32_t)lr[0] | ((uint64_t)(uint32_t)lr[1] << 32));")
+    a.push("    r->b = (int64_t)((uint64_t)(uint32_t)lr[2] | ((uint64_t)(uint32_t)lr[3] << 32));")
+    a.push("    hl_release_I32x4(x); hl_release_I32x4(y);")
+    a.push("    return r;")
+    a.push("}")
+}
+
+# simd_emit_rvv_f64x2_ew: one elementwise f64x2 kernel using RVV.
+fn simd_emit_rvv_f64x2_ew(ctx: Ctx, name: str, intrinsic: str) -> void {
+    let m: list[str] = ctx.simd_helpers_rvv
+    let a: list[str] = ctx.simd_helpers_alt
+    let mut c_op: str = "+"
+    if name == "simd_f64x2_sub" {
+        c_op = "-"
+    } else if name == "simd_f64x2_mul" {
+        c_op = "*"
+    }
+    m.push("/* " + name + " (RVV) */")
+    m.push("static F64x2* hl_" + name + "(F64x2* x_p, F64x2* y_p) {")
+    m.push("    F64x2* x = x_p; F64x2* y = y_p;")
+    m.push("    F64x2* r = usf_new_F64x2(0.0, 0.0);")
+    m.push("    /* RVV 1.0: vl=2 (2 f64 lanes at LMUL=1, VLEN>=128). */")
+    m.push("    vfloat64m1_t va = __riscv_vle64_v_f64m1((const double*)&x->a, 2);")
+    m.push("    vfloat64m1_t vb = __riscv_vle64_v_f64m1((const double*)&y->a, 2);")
+    m.push("    vfloat64m1_t c = " + intrinsic + "(va, vb, 2);")
+    m.push("    __riscv_vse64_v_f64m1((double*)&r->a, c, 2);")
+    m.push("    hl_release_F64x2(x); hl_release_F64x2(y);")
+    m.push("    return r;")
+    m.push("}")
+    a.push("/* " + name + " (scalar fallback) */")
+    a.push("static F64x2* hl_" + name + "(F64x2* x_p, F64x2* y_p) {")
+    a.push("    F64x2* x = x_p; F64x2* y = y_p;")
+    a.push("    F64x2* r = usf_new_F64x2(0.0, 0.0);")
+    a.push("    r->a = x->a " + c_op + " y->a;")
+    a.push("    r->b = x->b " + c_op + " y->b;")
+    a.push("    hl_release_F64x2(x); hl_release_F64x2(y);")
+    a.push("    return r;")
+    a.push("}")
+}
+
+# ============================================================================
 # Stage 31 perfection (v0.48.1-alpha): fused-kernel NEON emission + the
 # cache-blocked two-pass x86 kernels + one harmonised semantics.
 #
@@ -11061,10 +11182,16 @@ fn simd_emit_helper(ctx: Ctx, name: str) -> void {
     # dispatch to the NEON emitter (which pushes into simd_helpers_neon
     # + simd_helpers_alt). Otherwise dispatch to the x86 emitter (which
     # pushes into simd_helpers_main + simd_helpers_alt).
+    # Stage 26 (v0.49.0-alpha): when --target-feature rvv is given,
+    # dispatch to the RVV emitter (which pushes into simd_helpers_rvv
+    # + simd_helpers_alt).
     let use_neon: bool = ctx.target_feature == "neon"
+    let use_rvv: bool = ctx.target_feature == "rvv"
     if name == "simd_i32x4_add" {
         if use_neon {
             simd_emit_neon_i32x4_ew(ctx, name, "vaddq_s32")
+        } else if use_rvv {
+            simd_emit_rvv_i32x4_ew(ctx, name, "__riscv_vadd_vv_i32m1")
         } else {
             simd_emit_i32x4_ew(ctx, name, "_mm_add_epi32")
         }
@@ -11073,6 +11200,8 @@ fn simd_emit_helper(ctx: Ctx, name: str) -> void {
     if name == "simd_i32x4_sub" {
         if use_neon {
             simd_emit_neon_i32x4_ew(ctx, name, "vsubq_s32")
+        } else if use_rvv {
+            simd_emit_rvv_i32x4_ew(ctx, name, "__riscv_vsub_vv_i32m1")
         } else {
             simd_emit_i32x4_ew(ctx, name, "_mm_sub_epi32")
         }
@@ -11081,6 +11210,8 @@ fn simd_emit_helper(ctx: Ctx, name: str) -> void {
     if name == "simd_i32x4_mul" {
         if use_neon {
             simd_emit_neon_i32x4_ew(ctx, name, "vmulq_s32")
+        } else if use_rvv {
+            simd_emit_rvv_i32x4_ew(ctx, name, "__riscv_vmul_vv_i32m1")
         } else {
             simd_emit_i32x4_ew(ctx, name, "_mm_mullo_epi32")
         }
@@ -11089,6 +11220,8 @@ fn simd_emit_helper(ctx: Ctx, name: str) -> void {
     if name == "simd_i32x4_min" {
         if use_neon {
             simd_emit_neon_i32x4_ew(ctx, name, "vminq_s32")
+        } else if use_rvv {
+            simd_emit_rvv_i32x4_ew(ctx, name, "__riscv_vmin_vv_i32m1")
         } else {
             simd_emit_i32x4_ew(ctx, name, "_mm_min_epi32")
         }
@@ -11097,6 +11230,8 @@ fn simd_emit_helper(ctx: Ctx, name: str) -> void {
     if name == "simd_i32x4_max" {
         if use_neon {
             simd_emit_neon_i32x4_ew(ctx, name, "vmaxq_s32")
+        } else if use_rvv {
+            simd_emit_rvv_i32x4_ew(ctx, name, "__riscv_vmax_vv_i32m1")
         } else {
             simd_emit_i32x4_ew(ctx, name, "_mm_max_epi32")
         }
@@ -11105,6 +11240,8 @@ fn simd_emit_helper(ctx: Ctx, name: str) -> void {
     if name == "simd_f64x2_add" {
         if use_neon {
             simd_emit_neon_f64x2_ew(ctx, name, "vaddq_f64")
+        } else if use_rvv {
+            simd_emit_rvv_f64x2_ew(ctx, name, "__riscv_vadd_vv_f64m1")
         } else {
             simd_emit_f64x2_ew(ctx, name, "_mm_add_pd")
         }
@@ -11113,6 +11250,8 @@ fn simd_emit_helper(ctx: Ctx, name: str) -> void {
     if name == "simd_f64x2_sub" {
         if use_neon {
             simd_emit_neon_f64x2_ew(ctx, name, "vsubq_f64")
+        } else if use_rvv {
+            simd_emit_rvv_f64x2_ew(ctx, name, "__riscv_vsub_vv_f64m1")
         } else {
             simd_emit_f64x2_ew(ctx, name, "_mm_sub_pd")
         }
@@ -11121,6 +11260,8 @@ fn simd_emit_helper(ctx: Ctx, name: str) -> void {
     if name == "simd_f64x2_mul" {
         if use_neon {
             simd_emit_neon_f64x2_ew(ctx, name, "vmulq_f64")
+        } else if use_rvv {
+            simd_emit_rvv_f64x2_ew(ctx, name, "__riscv_vmul_vv_f64m1")
         } else {
             simd_emit_f64x2_ew(ctx, name, "_mm_mul_pd")
         }
@@ -11223,12 +11364,13 @@ fn simd_emit_helper(ctx: Ctx, name: str) -> void {
 # when the user passes `--target-feature native`. The probe uses the
 # existing simd_cpu_supports() builtin (a runtime CPU probe via
 # __builtin_cpu_supports on x86 / NEON baseline on aarch64). The
-# result is one of "avx2", "sse4.2", "neon", or "" (no fast path).
+# result is one of "avx2", "sse4.2", "neon", "rvv", or "" (no fast path).
 #
 # Preference order (x86): avx2 (the strongest feature the std.simd
 # intrinsic fast paths support today; AVX-512 tuning is post-1.0)
 # > sse4.2 > "" (portable). On aarch64: neon (baseline) > "". On
-# other architectures: "" (portable path — no intrinsic fast paths
+# RISC-V 64 (Stage 26): rvv when the V extension is available > "".
+# On other architectures: "" (portable path — no intrinsic fast paths
 # emitted, the std.simd kernels run their pure-HLS implementation).
 fn simd_detect_native_feature() -> str {
     if simd_cpu_supports("avx2") {
@@ -11239,6 +11381,12 @@ fn simd_detect_native_feature() -> str {
     }
     if simd_cpu_supports("neon") {
         return "neon"
+    }
+    # Stage 26 (v0.49.0-alpha): RISC-V Vector extension. The probe
+    # uses simd_cpu_supports("rvv") which checks for the __riscv_v
+    # macro (defined by gcc/clang when -march includes the V extension).
+    if simd_cpu_supports("rvv") {
+        return "rvv"
     }
     return ""
 }
@@ -11286,8 +11434,24 @@ fn simd_helper_lines(ctx: Ctx) -> list[str] {
         concat_lines(out, ctx.simd_helpers_alt)
         concat_lines(out, ctx.simd_helpers_plain)
         out.push("#endif")
+    } else if ctx.target_feature == "rvv" {
+        # Stage 26 (v0.49.0-alpha): --target-feature rvv — emit the RVV
+        # intrinsics in the #if __riscv && __riscv_v branch, with the
+        # scalar fallback in #else. The __riscv_v macro is defined by
+        # the C compiler when -march=rv64gcv (or any arch with the V
+        # extension) is in effect; __riscv is the baseline RISC-V macro.
+        out.push("#if defined(__riscv) && defined(__riscv_v)")
+        out.push("#include <riscv_vector.h>")
+        concat_lines(out, ctx.simd_helpers_rvv)
+        concat_lines(out, ctx.simd_helpers_plain)
+        out.push("#else")
+        out.push("// non-RISC-V host: portable scalar fallback.")
+        concat_lines(out, ctx.simd_helpers_alt)
+        concat_lines(out, ctx.simd_helpers_plain)
+        out.push("#endif")
     } else {
         out.push("// NEON intrinsic tuning is Stage 25 (AArch64 backend); the")
+        out.push("// RVV intrinsic tuning is Stage 26 (RISC-V backend); the")
         out.push("// arch-independent fast paths below eliminate the per-element")
         out.push("// runtime calls on every host.")
         concat_lines(out, ctx.simd_helpers_alt)
@@ -15191,8 +15355,10 @@ fn main() -> int uses IO {
         } else if tok == "--target-feature" {
             # Stage 21 (v0.37.0-alpha): enable the std.simd intrinsic
             # fast paths + const-fold has_feature().
+            # Stage 26 (v0.49.0-alpha): also accept "rvv" for the
+            # RISC-V Vector (RVV) intrinsics.
             if ai + 1 >= argv.len() {
-                println("error: --target-feature expects a feature name (sse4.2 | avx2 | neon)")
+                println("error: --target-feature expects a feature name (sse4.2 | avx2 | neon | rvv)")
                 return 2
             }
             let feat: str = argv.get(ai + 1)
@@ -15202,6 +15368,16 @@ fn main() -> int uses IO {
                 target_feature = "avx2"
             } else if feat == "+neon" || feat == "neon" {
                 target_feature = "neon"
+            } else if feat == "+rvv" || feat == "rvv" {
+                # Stage 26 (v0.49.0-alpha): RISC-V Vector extension.
+                # Enables the RVV intrinsic fast paths for std.simd
+                # kernels (the simd_emit_rvv_*_ew emitters push
+                # __riscv_vadd_vv_i32m1 / __riscv_vsub_vv_i32m1 /
+                # __riscv_vmul_vv_i32m1 / __riscv_vmin_vv_i32m1 /
+                # __riscv_vmax_vv_i32m1 / __riscv_vadd_vv_f64m1 /
+                # __riscv_vsub_vv_f64m1 / __riscv_vmul_vv_f64m1
+                # into the #elif __riscv && __riscv_v branch).
+                target_feature = "rvv"
             } else if feat == "native" {
                 # Stage 21 perfection (v0.40.0-alpha): --target-feature
                 # native — auto-detect the host's best SIMD feature.
@@ -15209,11 +15385,13 @@ fn main() -> int uses IO {
                 # feature the std.simd intrinsic fast paths support
                 # today; AVX-512 tuning is post-1.0). On aarch64,
                 # picks neon (baseline on every ARMv8+ core). On
-                # other architectures, falls back to "" (portable
-                # path — no intrinsic fast paths emitted).
+                # RISC-V 64 hosts, picks rvv when the V extension is
+                # available (Stage 26). On other architectures, falls
+                # back to "" (portable path — no intrinsic fast paths
+                # emitted).
                 target_feature = simd_detect_native_feature()
             } else {
-                println("error: unknown target feature '" + feat + "' (expected sse4.2 | avx2 | neon | native)")
+                println("error: unknown target feature '" + feat + "' (expected sse4.2 | avx2 | neon | rvv | native)")
                 return 2
             }
             ai = ai + 1
@@ -15268,7 +15446,7 @@ fn main() -> int uses IO {
     }
     if a.len() < 2 {
         println("usage: hlc [--fast | -O fast] [--contracts] [--pgo-generate] [--pgo-use <profile>]")
-        println("              [--lto] [--lto-stats] [--lto-threshold N] [--target-feature sse4.2|avx2|neon]")
+        println("              [--lto] [--lto-stats] [--lto-threshold N] [--target-feature sse4.2|avx2|neon|rvv]")
         println("              <input.hls> <output.c|->")
         println("       hlc --audit <input.hls>")
         return 1

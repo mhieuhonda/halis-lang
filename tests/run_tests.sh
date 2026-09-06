@@ -2057,6 +2057,192 @@ else
 fi
 
 echo ""
+echo "=== 16. Stage 26: RISC-V 64 backend (RVV + bare-metal) ==="
+# Stage 26 (v0.49.0-alpha): the RVV intrinsic emission in src/hlc.hls
+# generates <riscv_vector.h> intrinsics (__riscv_vadd_vv_i32m1,
+# __riscv_vsub_vv_i32m1, __riscv_vmul_vv_i32m1, __riscv_vmin_vv_i32m1,
+# __riscv_vmax_vv_i32m1, __riscv_vadd_vv_f64m1, __riscv_vsub_vv_f64m1,
+# __riscv_vmul_vv_f64m1) when --target-feature rvv is passed. The
+# hlcross.py orchestrator accepts riscv64gc-unknown-linux-gnu and
+# riscv64-unknown-none targets and applies -march/-mabi/-ffreestanding
+# flags.
+
+# (a) --target-feature rvv emits RVV intrinsics in the C source.
+if python3 boot/boot.py src/hlc.hls examples/riscv_demo.hls "$TMP/riscv_rvv.c" --target-feature rvv >/dev/null 2>&1; then
+    rvv_count=$(grep -c "__riscv_vadd_vv_i32m1\|__riscv_vsub_vv_i32m1\|__riscv_vmul_vv_i32m1\|__riscv_vmin_vv_i32m1\|__riscv_vmax_vv_i32m1" "$TMP/riscv_rvv.c" 2>/dev/null || echo 0)
+    if [ "$rvv_count" -gt 0 ]; then
+        ok "riscv: --target-feature rvv emits RVV intrinsics ($rvv_count sites)"
+    else
+        bad "riscv: --target-feature rvv did not emit any RVV intrinsics"
+    fi
+    # (b) the C source includes <riscv_vector.h>.
+    if grep -q "<riscv_vector.h>" "$TMP/riscv_rvv.c"; then
+        ok "riscv: --target-feature rvv includes <riscv_vector.h>"
+    else
+        bad "riscv: <riscv_vector.h> not included in RVV C source"
+    fi
+    # (c) the C source has the #if __riscv && __riscv_v guard.
+    if grep -q "defined(__riscv) && defined(__riscv_v)\|defined(__riscv_v)" "$TMP/riscv_rvv.c"; then
+        ok "riscv: C source has __riscv && __riscv_v guard"
+    else
+        bad "riscv: missing __riscv/__riscv_v guard"
+    fi
+    # (d) the RVV C source still compiles on the x86_64 host (uses
+    #     the scalar fallback in the #else branch).
+    if gcc -O2 -o "$TMP/riscv_rvv_x86" "$TMP/riscv_rvv.c" -lm -pthread 2>/dev/null; then
+        if "$TMP/riscv_rvv_x86" >/dev/null 2>&1; then
+            ok "riscv: RVV C source compiles + runs on x86_64 (scalar fallback)"
+        else
+            bad "riscv: RVV C source compiles on x86_64 but doesn't run cleanly"
+        fi
+    else
+        bad "riscv: RVV C source fails to compile on x86_64"
+    fi
+else
+    bad "riscv: --target-feature rvv compile failed"
+fi
+
+# (e) hlcross --list-targets prints the RISC-V target set.
+list_out=$(python3 tools/hlcross.py --list-targets 2>&1)
+if echo "$list_out" | grep -q "riscv64gc-unknown-linux-gnu" \
+    && echo "$list_out" | grep -q "riscv64-unknown-none"; then
+    ok "riscv: hlcross --list-targets includes RISC-V targets"
+else
+    bad "riscv: hlcross --list-targets missing RISC-V targets"
+fi
+
+# (f) hlcross accepts the riscv64 alias.
+if python3 tools/hlcross.py examples/hello.hls "$TMP/riscv_alias" --target riscv64 --keep-c "$TMP/riscv_alias.c" 2>&1 | grep -q "no cross-linker found\|ELF riscv64"; then
+    ok "riscv: hlcross accepts the 'riscv64' alias"
+else
+    bad "riscv: hlcross did not accept the 'riscv64' alias"
+fi
+
+# (g) the hlriscv.py helper exists and has a main().
+if python3 -c "import sys; sys.path.insert(0, 'tools'); import hlriscv; assert hasattr(hlriscv, 'main'); print('OK')" 2>&1 | grep -q OK; then
+    ok "riscv: tools/hlriscv.py imports and has main()"
+else
+    bad "riscv: tools/hlriscv.py import failed"
+fi
+
+# (h) hlriscv.py --list-targets prints the RVV target + the bare-metal info.
+if python3 tools/hlriscv.py --list-targets 2>&1 | grep -q "rvv" \
+    && python3 tools/hlriscv.py --list-targets 2>&1 | grep -q "riscv64-unknown-none"; then
+    ok "riscv: hlriscv --list-targets prints RVV feature + bare-metal target"
+else
+    bad "riscv: hlriscv --list-targets missing RVV or bare-metal"
+fi
+
+# (i) hlriscv.py compiles simd_bench.hls with RVV; the C source
+#     contains RVV intrinsics and includes <riscv_vector.h>.
+if python3 tools/hlriscv.py benchmarks/simd_bench.hls "$TMP/riscv_bench" \
+    --target riscv64gc-unknown-linux-gnu --target-feature rvv \
+    --keep-c "$TMP/riscv_bench.c" >"$TMP/riscv_bench.log" 2>&1 \
+    || [ $? -eq 3 ]; then
+    if grep -q "__riscv_vadd_vv_i32m1\|__riscv_vsub_vv_i32m1\|__riscv_vmul_vv_i32m1" "$TMP/riscv_bench.c" 2>/dev/null \
+        && grep -q "<riscv_vector.h>" "$TMP/riscv_bench.c" 2>/dev/null; then
+        ok "riscv: hlriscv produces C source with RVV intrinsics + riscv_vector.h"
+    else
+        bad "riscv: hlriscv C source missing RVV intrinsics"
+    fi
+else
+    bad "riscv: hlriscv compile failed unexpectedly"
+    cat "$TMP/riscv_bench.log" | head -5
+fi
+
+# (j) make riscv-acceptance runs end-to-end (RVV codegen gate).
+if make riscv-acceptance >"$TMP/riscv_acc.log" 2>&1; then
+    if grep -q "ACCEPTANCE OK" "$TMP/riscv_acc.log"; then
+        ok "riscv: make riscv-acceptance runs end-to-end"
+    else
+        bad "riscv: make riscv-acceptance did not print ACCEPTANCE OK"
+        tail -5 "$TMP/riscv_acc.log"
+    fi
+else
+    bad "riscv: make riscv-acceptance failed"
+    tail -10 "$TMP/riscv_acc.log"
+fi
+
+# (k) make riscv-bare-acceptance runs end-to-end (zero-libc gate).
+if make riscv-bare-acceptance >"$TMP/riscv_bare_acc.log" 2>&1; then
+    if grep -q "ACCEPTANCE OK" "$TMP/riscv_bare_acc.log"; then
+        ok "riscv: make riscv-bare-acceptance runs end-to-end"
+    else
+        bad "riscv: make riscv-bare-acceptance did not print ACCEPTANCE OK"
+        tail -5 "$TMP/riscv_bare_acc.log"
+    fi
+else
+    bad "riscv: make riscv-bare-acceptance failed"
+    tail -10 "$TMP/riscv_bare_acc.log"
+fi
+
+# (l) the feat_stage26_riscv.hls test runs cleanly via the boot interpreter
+#     (portable path) AND with --target-feature rvv (which sets
+#     has_feature("rvv") -> true).
+if python3 boot/boot.py tests/ok/feat_stage26_riscv.hls >"$TMP/s26_portable.out" 2>&1; then
+    if grep -q "ACCEPTANCE OK" "$TMP/s26_portable.out"; then
+        ok "riscv: feat_stage26_riscv.hls runs on portable path"
+    else
+        bad "riscv: feat_stage26_riscv.hls did not pass on portable path"
+        tail -5 "$TMP/s26_portable.out"
+    fi
+else
+    bad "riscv: feat_stage26_riscv.hls failed to run on portable path"
+    tail -10 "$TMP/s26_portable.out"
+fi
+if python3 boot/boot.py --target-feature rvv tests/ok/feat_stage26_riscv.hls >"$TMP/s26_rvv.out" 2>&1; then
+    if grep -q 'has_feature("rvv"): true' "$TMP/s26_rvv.out" \
+        && grep -q "ACCEPTANCE OK" "$TMP/s26_rvv.out"; then
+        ok "riscv: feat_stage26_riscv.hls runs with --target-feature rvv (has_feature(rvv)=true)"
+    else
+        bad "riscv: feat_stage26_riscv.hls did not pass with --target-feature rvv"
+        tail -5 "$TMP/s26_rvv.out"
+    fi
+else
+    bad "riscv: feat_stage26_riscv.hls failed with --target-feature rvv"
+    tail -10 "$TMP/s26_rvv.out"
+fi
+
+# (m) bootstrap still works after the src/hlc.hls RVV changes (the
+#     self-hosted compiler must remain deterministic).
+if python3 boot/boot.py src/hlc.hls src/hlc.hls "$TMP/hlc_rvv.c" >/dev/null 2>&1 \
+    && python3 boot/boot.py src/hlc.hls src/hlc.hls "$TMP/hlc_rvv2.c" --target-feature rvv >/dev/null 2>&1; then
+    # The two outputs must be byte-identical when --target-feature is
+    # not used by hlc.hls itself (which it isn't — hlc.hls doesn't use
+    # std.simd).
+    if diff -q "$TMP/hlc_rvv.c" "$TMP/hlc_rvv2.c" >/dev/null; then
+        ok "riscv: bootstrap deterministic with --target-feature rvv"
+    else
+        bad "riscv: bootstrap not deterministic with --target-feature rvv"
+    fi
+else
+    bad "riscv: bootstrap compile failed"
+fi
+
+# (n) has_feature("rvv") const-folds correctly under the native compiler.
+if "$TMP/hlc1" --target-feature rvv tests/ok/feat_stage26_riscv.hls "$TMP/s26_native.c" >/dev/null 2>&1; then
+    if grep -q "has_feature(\"rvv\"): true" "$TMP/s26_native.c" 2>/dev/null \
+        || grep -q 'has_feature(.rvv.): true' "$TMP/s26_native.c" 2>/dev/null; then
+        ok "riscv: native has_feature(\"rvv\") const-folds to true under --target-feature rvv"
+    else
+        # The const-fold replaces has_feature("rvv") with `true` or `1`
+        # — verify the runtime print path emits "true" by compiling +
+        # running the native binary.
+        if gcc -O2 -o "$TMP/s26_native_bin" "$TMP/s26_native.c" -lm -pthread 2>/dev/null; then
+            if "$TMP/s26_native_bin" 2>&1 | grep -q 'has_feature("rvv"): true'; then
+                ok "riscv: native has_feature(\"rvv\") const-folds to true under --target-feature rvv"
+            else
+                bad "riscv: native has_feature(\"rvv\") did not const-fold to true"
+            fi
+        else
+            bad "riscv: native C source fails to compile on x86_64"
+        fi
+    fi
+else
+    bad "riscv: native --target-feature rvv compile failed"
+fi
+
+echo ""
 echo "=========================================="
 echo "RESULT: $PASS PASS / $FAIL FAIL"
 echo "=========================================="

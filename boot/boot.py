@@ -277,21 +277,24 @@ def run_cli():
     # Stage 21 perfection (v0.40.0-alpha): FEAT can also be "native" —
     # auto-detect the host's best feature via simd_cpu_supports(). The
     # interpreter resolves "native" to a concrete feature (avx2 |
-    # sse4.2 | neon | "") BEFORE running the program, so has_feature()
+    # sse4.2 | neon | rvv | "") BEFORE running the program, so has_feature()
     # const-folds identically to the native codegen path.
+    # Stage 26 (v0.49.0-alpha): FEAT can also be "rvv" — the RISC-V
+    # Vector extension (enabled via -march=rv64gcv).
     while "--target-feature" in args:
         i = args.index("--target-feature")
         if i + 1 >= len(args):
             sys.stderr.write("error: --target-feature expects a name "
-                             "(sse4.2 | avx2 | neon | native)\n")
+                             "(sse4.2 | avx2 | neon | rvv | native)\n")
             return 2
         feat = args[i + 1].lstrip("+")
         if feat == "native":
             # Auto-detect: probe the host CPU. The interpreter's
             # _cpu_supports() helper mirrors the C runtime's
             # hl_simd_cpu_supports() — same probe, same result.
-            # `feat` becomes one of "avx2", "sse4.2", "neon", or "" (no
-            # fast path — the portable pure-HLS implementation runs).
+            # `feat` becomes one of "avx2", "sse4.2", "neon", "rvv", or
+            # "" (no fast path — the portable pure-HLS implementation
+            # runs).
             from boot.interp import _cpu_supports
             if _cpu_supports("avx2"):
                 feat = "avx2"
@@ -299,11 +302,13 @@ def run_cli():
                 feat = "sse4.2"
             elif _cpu_supports("neon"):
                 feat = "neon"
+            elif _cpu_supports("rvv"):
+                feat = "rvv"
             else:
                 feat = ""
-        if feat != "" and feat not in ("sse4.2", "avx2", "neon"):
+        if feat != "" and feat not in ("sse4.2", "avx2", "neon", "rvv"):
             sys.stderr.write("error: unknown target feature '%s' "
-                             "(expected sse4.2 | avx2 | neon | native)\n"
+                             "(expected sse4.2 | avx2 | neon | rvv | native)\n"
                              % feat)
             return 2
         target_feature = feat
@@ -352,7 +357,7 @@ def run_cli():
             "  --emit llvm    print the LLVM IR (Stage 12) of every function.\n"
             "  --opt-stats    run the Stage 11 optimiser, print per-pass stats.\n"
             "  --target TRIPLE  set the LLVM target triple (e.g. aarch64-linux).\n"
-            "  --target-feature F  set the SIMD feature (sse4.2|avx2|neon, Stage 21).\n"
+            "  --target-feature F  set the SIMD feature (sse4.2|avx2|neon|rvv, Stage 21/26).\n"
             "  --sandbox DIR     restrict filesystem builtins to DIR (Stage 10).\n"
         )
         return 2

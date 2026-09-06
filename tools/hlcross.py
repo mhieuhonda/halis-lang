@@ -155,6 +155,79 @@ TARGETS = {
         "mingw": True,
         "security_flags": [],
     },
+    # Stage 26 (v0.49.0-alpha): RISC-V 64 targets.
+    # riscv64gc-unknown-linux-gnu — full Linux user-mode (RV64GC: IMAFDC).
+    # The 'gc' suffix denotes the G (IMAFD) + C (compressed) extensions;
+    # this is the standard Linux RISC-V target (SiFive Freedom, VisionFive,
+    # QEMU riscv64). The C backend is portable ANSI C11; cross-compilation
+    # reduces to picking the right cross-linker (zig cc, the Debian/Ubuntu
+    # riscv64-linux-gnu-gcc cross-toolchain) and the right -march/-mabi.
+    "riscv64gc-unknown-linux-gnu": {
+        "arch": "riscv64",
+        "os": "linux",
+        "abi": "gnu",
+        "binary_format": "ELF riscv64 (Little Endian, RV64GC)",
+        "object_suffix": ".o",
+        "binary_suffix": "",
+        "link_libs": ["-lm", "-lpthread"],
+        "mingw": False,
+        # -march=rv64gc -mabi=lp64d: the standard Linux user-mode profile
+        # (G = IMAFD, C = compressed instructions; lp64d = 64-bit LP64
+        # with hardware double-float ABI). The Stage 26 RVV (V) extension
+        # is enabled separately via --target-feature rvv -> -march=rv64gcv.
+        "march": "rv64gc",
+        "mabi": "lp64d",
+        "security_flags": [],
+    },
+    "riscv64-unknown-linux-gnu": {
+        # Alias for riscv64gc-unknown-linux-gnu (canonical Linux RISC-V 64).
+        "arch": "riscv64",
+        "os": "linux",
+        "abi": "gnu",
+        "binary_format": "ELF riscv64 (Little Endian, RV64GC)",
+        "object_suffix": ".o",
+        "binary_suffix": "",
+        "link_libs": ["-lm", "-lpthread"],
+        "mingw": False,
+        "march": "rv64gc",
+        "mabi": "lp64d",
+        "security_flags": [],
+    },
+    # riscv64-unknown-none — bare-metal (no OS, no libc, for OS work).
+    # This is the foundation target for RISC-V OS development: a freestanding
+    # ELF with no libc references, suitable for booting in QEMU with
+    # `-bios none -machine virt` and jumping to the entry point. The C
+    # backend emits ANSI C11 with no libc calls (no printf, no malloc) —
+    # every runtime symbol is provided by the Halis C runtime
+    # (hl_*, usf_*, hl_box_*, hl_unbox_*), which the cross-linker
+    # resolves against the program itself (statically linked, no
+    # shared libraries). The _start entry point is supplied by a
+    # bare-metal linker script + crt0 (Stage 77+ provides the
+    # `#![freestanding]` mode; Stage 26 produces the binary that runs
+    # in QEMU with zero libc references).
+    "riscv64-unknown-none": {
+        "arch": "riscv64",
+        "os": "none",
+        "abi": "none",
+        "binary_format": "ELF riscv64 (Little Endian, RV64IMAC, freestanding)",
+        "object_suffix": ".o",
+        "binary_suffix": "",
+        # Bare-metal: no link libs at all (no libc, no libm, no pthread).
+        # The Halis C runtime provides every symbol the program references.
+        "link_libs": [],
+        "mingw": False,
+        # Bare-metal RV64IMAC: I (base integer) + M (mul/div) + A (atomics)
+        # + C (compressed) — the standard freestanding profile (no F/D
+        # because a kernel typically does NOT enable the FPU until it has
+        # saved the FCS/FRR state; the Stage 26 acceptance binary uses
+        # integer-only code). mabi=lp64 (no float ABI).
+        "march": "rv64imac",
+        "mabi": "lp64",
+        "security_flags": [],
+        # freestanding: -nostdlib -nostartfiles prevents the linker from
+        # pulling in crt0/libc; the program provides its own _start.
+        "freestanding": True,
+    },
 }
 
 # Aliases — accept the short forms users commonly type.
@@ -176,6 +249,17 @@ TARGET_ALIASES = {
     "graviton": "aarch64-linux-gnu",
     "rpi4": "aarch64-linux-gnu",
     "raspberrypi": "aarch64-linux-gnu",
+    # Stage 26 (v0.49.0-alpha): RISC-V 64 aliases.
+    "riscv64-linux": "riscv64gc-unknown-linux-gnu",
+    "riscv64": "riscv64gc-unknown-linux-gnu",
+    "riscv64gc": "riscv64gc-unknown-linux-gnu",
+    "riscv": "riscv64gc-unknown-linux-gnu",
+    "riscv64-bare": "riscv64-unknown-none",
+    "riscv64-unknown": "riscv64-unknown-none",
+    "riscv-bare": "riscv64-unknown-none",
+    "riscv-none": "riscv64-unknown-none",
+    "visionfive": "riscv64gc-unknown-linux-gnu",
+    "sifive": "riscv64gc-unknown-linux-gnu",
 }
 
 
@@ -202,6 +286,11 @@ def host_triple() -> str:
             return "x86_64-linux-gnu"
         if machine in ("aarch64", "arm64"):
             return "aarch64-linux-gnu"  # not in the Stage 22 set but useful
+        # Stage 26 (v0.49.0-alpha): RISC-V 64 host (e.g. VisionFive 2,
+        # SiFive Unmatched, QEMU riscv64). Detect both the canonical
+        # 'riscv64' machine name and the rarely-used 'rv64gcv' name.
+        if machine in ("riscv64", "rv64", "riscv"):
+            return "riscv64gc-unknown-linux-gnu"
     if system == "darwin":
         if machine in ("arm64", "aarch64"):
             return "aarch64-apple-darwin"
@@ -284,6 +373,35 @@ def find_target_linker(target: str) -> Tuple[Optional[str], List[str], str]:
             if p:
                 return (p, ["-O2"], "aarch64-linux-gnu-gcc")
 
+    # Stage 26 (v0.49.0-alpha): RISC-V 64 cross-linkers.
+    # Linux user-mode (riscv64gc-unknown-linux-gnu): Debian/Ubuntu ships
+    # `riscv64-linux-gnu-gcc`. Bare-metal (riscv64-unknown-none): the
+    # `riscv64-unknown-elf-gcc` toolchain (the official RISC-V GNU
+    # toolchain, github.com/riscv-collab/riscv-gnu-toolchain, configured
+    # with --with-arch=rv64imac --with-abi=lp64 — no libc, no OS).
+    if target in ("riscv64gc-unknown-linux-gnu",
+                  "riscv64-unknown-linux-gnu"):
+        for name in ("riscv64-linux-gnu-gcc",
+                     "riscv64-linux-gnu-gcc-13",
+                     "riscv64-linux-gnu-gcc-12",
+                     "riscv64-linux-gnu-cc",
+                     "riscv64-unknown-linux-gnu-gcc"):
+            p = _which(name)
+            if p:
+                return (p, ["-O2"], "riscv64-linux-gnu-gcc")
+    if target == "riscv64-unknown-none":
+        # Bare-metal cross-linker (riscv64-unknown-elf-gcc).
+        for name in ("riscv64-unknown-elf-gcc",
+                     "riscv64-elf-gcc",
+                     "riscv64-none-elf-gcc",
+                     "riscv64-linux-gnu-gcc"):
+            # The last fallback (riscv64-linux-gnu-gcc) is used with
+            # -nostdlib -nostartfiles — it produces a freestanding ELF
+            # when the Linux toolchain is the only one installed.
+            p = _which(name)
+            if p:
+                return (p, ["-O2"], "riscv64-unknown-elf-gcc")
+
     # 3. host compiler when target == host (native build — useful for
     #    testing the pipeline end-to-end without a real cross-linker).
     host = host_triple()
@@ -306,7 +424,12 @@ def cross_linker_hint(target: str, kind: str) -> str:
                 f"  - x86_64-pc-windows-gnu: apt install mingw-w64\n"
                 f"  - aarch64-apple-darwin:  install osxcross\n"
                 f"  - x86_64-unknown-freebsd: apt install freebsd-buildutils\n"
-                f"  - x86_64-pc-windows-msvc: requires Windows + MSVC build tools")
+                f"  - x86_64-pc-windows-msvc: requires Windows + MSVC build tools\n"
+                f"  - aarch64-linux-gnu:      apt install gcc-aarch64-linux-gnu\n"
+                f"  - riscv64gc-unknown-linux-gnu: apt install gcc-riscv64-linux-gnu\n"
+                f"  - riscv64-unknown-none:  build the RISC-V GNU toolchain from\n"
+                f"                            github.com/riscv-collab/riscv-gnu-toolchain\n"
+                f"                            (./configure --with-arch=rv64imac --with-abi=lp64)")
     return ""
 
 
@@ -447,7 +570,33 @@ def cross_compile(input_hls: str, output_bin: str, target: str,
         sec_flags = ["-mbranch-protection=bti"]
     elif security == "off":
         sec_flags = []
-    cmd = [linker] + base_args + sec_flags + [c_path, "-o", out_path] + spec["link_libs"]
+    # Stage 26 (v0.49.0-alpha): RISC-V -march/-mabi flags.
+    # riscv64gc-unknown-linux-gnu -> -march=rv64gc -mabi=lp64d (or rv64gcv
+    #   when --target-feature rvv is given: the V extension is added
+    #   to the -march string so the cross-linker accepts the RVV intrinsics).
+    # riscv64-unknown-none -> -march=rv64imac -mabi=lp64 (bare-metal) +
+    #   -nostdlib -nostartfiles -ffreestanding (the program provides its
+    #   own _start + every runtime symbol; no libc, no crt0).
+    arch_flags = []
+    freestanding_flags = []
+    if target in ("riscv64gc-unknown-linux-gnu",
+                  "riscv64-unknown-linux-gnu"):
+        march = spec.get("march", "rv64gc")
+        # When the user requested the V extension via --target-feature rvv,
+        # promote -march from rv64gc -> rv64gcv (the canonical notation for
+        # "G + C + V"). This is what the RVV intrinsics in <riscv_vector.h>
+        # require to compile.
+        if target_feature == "rvv":
+            march = "rv64gcv"
+        arch_flags = ["-march=" + march, "-mabi=" + spec.get("mabi", "lp64d")]
+    elif target == "riscv64-unknown-none":
+        march = spec.get("march", "rv64imac")
+        arch_flags = ["-march=" + march, "-mabi=" + spec.get("mabi", "lp64")]
+        if spec.get("freestanding", False):
+            freestanding_flags = ["-nostdlib", "-nostartfiles", "-ffreestanding"]
+    cmd = ([linker] + base_args + sec_flags + arch_flags
+           + freestanding_flags + [c_path, "-o", out_path]
+           + spec["link_libs"])
     code, _ = run(cmd)
     if code != 0:
         print(f"error: linker failed (exit {code})", file=sys.stderr)
@@ -465,12 +614,16 @@ def cross_compile(input_hls: str, output_bin: str, target: str,
 
 
 def cmd_list_targets() -> int:
-    print("Supported cross-compilation targets (Stage 22):")
+    print("Supported cross-compilation targets (Stage 22, extended Stage 25 + 26):")
     print()
     for triple, spec in TARGETS.items():
         print(f"  {triple}")
         print(f"      arch: {spec['arch']}, os: {spec['os']}, abi: {spec['abi']}")
         print(f"      format: {spec['binary_format']}")
+        if "march" in spec:
+            print(f"      march: {spec['march']}, mabi: {spec['mabi']}")
+        if spec.get("freestanding", False):
+            print(f"      freestanding: -nostdlib -nostartfiles -ffreestanding")
     print()
     print("Aliases (accepted by --target):")
     for alias, canonical in TARGET_ALIASES.items():
@@ -520,11 +673,14 @@ def main() -> int:
                          "pac+bti = full PAC + BTI; bti = BTI only; "
                          "off = no hardening)")
     # Stage 25: --target-feature neon passes through to hlc.
+    # Stage 26 (v0.49.0-alpha): --target-feature rvv enables the RISC-V
+    # Vector (RVV) intrinsic fast paths for std.simd kernels. Also
+    # promotes the cross-linker -march from rv64gc to rv64gcv.
     ap.add_argument("--target-feature", default="",
-                    choices=["", "neon", "sse4.2", "avx2", "native"],
-                    help="Stage 25: enable std.simd intrinsic fast paths "
+                    choices=["", "neon", "sse4.2", "avx2", "native", "rvv"],
+                    help="Stage 25/26: enable std.simd intrinsic fast paths "
                          "(neon for AArch64; sse4.2/avx2 for x86; "
-                         "native = auto-detect host)")
+                         "rvv for RISC-V 64; native = auto-detect host)")
     args = ap.parse_args()
 
     if args.list_targets:
