@@ -306,14 +306,43 @@ class DevHTTPHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             return
         full = os.path.join(self.bundle_dir, path)
-        if not os.path.isfile(full):
+        # Stage 27 perfection (v0.50.3-alpha) deep-scan-18: BUG-11 fix.
+        # The previous path-traversal check blocked literal `..` path
+        # components but did NOT call os.path.realpath / os.path.normpath
+        # on the resolved path. A symlink inside bundle_dir pointing
+        # outside (e.g. bundle_dir/foo -> /etc) was followed by open()
+        # without detection — exposing arbitrary host files via HTTP.
+        # The fix: resolve both paths to their canonical realpaths and
+        # verify the resolved file is still inside the (resolved)
+        # bundle dir.
+        try:
+            real_full = os.path.realpath(full)
+            real_bundle = os.path.realpath(self.bundle_dir)
+        except OSError:
             self.send_response(404)
             self.send_header("Content-Type", "text/plain")
             self.end_headers()
             self.wfile.write(("404: %s not found in bundle dir\n" % path)
                              .encode("utf-8"))
             return
-        with open(full, "rb") as f:
+        # The resolved path must equal or be a child of the bundle dir.
+        # Use os.sep to avoid matching a sibling like bundle_dir_evil.
+        if real_full != real_bundle and not real_full.startswith(real_bundle + os.sep):
+            self.send_response(403)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(("403: %s resolves outside bundle dir "
+                              "(symlink traversal blocked)\n" % path)
+                             .encode("utf-8"))
+            return
+        if not os.path.isfile(real_full):
+            self.send_response(404)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(("404: %s not found in bundle dir\n" % path)
+                             .encode("utf-8"))
+            return
+        with open(real_full, "rb") as f:
             data = f.read()
         ct = self._guess_content_type(path)
         self.send_response(200)

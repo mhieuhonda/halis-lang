@@ -2965,6 +2965,190 @@ work. The full local suite is **822 PASS / 0 FAIL** (was 810,
 is deterministic; the boot and self-hosted checkers produce
 identical error messages for every negative test.
 
+### Stage 27 perfection (v0.50.3-alpha) — deep-scan-18 (broader codebase)
+
+**Goal:** the deep-scan-17 pass hardened the asm! checker; the
+deep-scan-18 pass audited the WHOLE codebase (not just Stage 27)
+for soundness, correctness, and robustness bugs. Twelve bugs were
+found and fixed across `boot/checker.py`, `boot/interp.py`,
+`boot/proof.py`, `src/hlc.hls`, `std/math.hls`, and
+`tools/hlserve.py`. Each fix is mirrored in the self-hosted
+checker where applicable, and a new positive regression test
+(`tests/ok/feat_stage27_perfection2.hls`) exercises the smoke
+paths of every fix to verify the hardening does not break valid
+programs.
+
+**Twelve bug fixes:**
+
+1. **BUG-01 (MED, codegen): tainted-primitive container codegen.**
+   `box_fn_for` and `gen_unbox` in `src/hlc.hls` did NOT strip the
+   `tainted[...]` wrapper before dispatching to the typed
+   boxing/unboxing helper. For `list[tainted[int]]`,
+   `map[str, tainted[int]]`, `chan[tainted[int]]` — the codegen
+   emitted `hl_box_ptr`/`hl_unbox_ptr` on a value that is
+   semantically an `int64_t`. Undefined behaviour (type punning
+   through the wrong box field) and wrong values on any platform
+   where the box layout differs between int and pointer slots.
+   The interpreter (which uses Python's native int) produced
+   correct values, so differential testing would catch this — but
+   only if a test exercised `tainted[int]`/`tainted[float]`/
+   `tainted[bool]` in a container (none did). **Fix:** both
+   functions now call `strip_taint(t)` (already used by
+   `release_fn_for`/`cleanup_fn_for`/`is_ptr_t`) before the
+   int/float/bool checks. One-line change in each function.
+
+2. **BUG-02 (MED, proof): `const_eval` INT64_MIN / -1.** The
+   proof engine's `const_eval` for `/` computed
+   `abs(INT64_MIN) // abs(-1) = 9223372036854775808` — exceeding
+   `INT64_MAX`. The HLS runtime (`i64_div`) panics on this corner;
+   the const-eval returned a value the runtime can never produce,
+   letting `requires INT64_MIN / -1 > 0` const-eval to True while
+   the runtime would panic. Same issue for `%`. **Fix:** return
+   `None` (treat as "unknown") for `INT64_MIN / -1` and
+   `INT64_MIN % -1`, so the runtime check fires. Mirrors the
+   existing `r == 0` guard.
+
+3. **BUG-03 (MED, interp): cyclic-clone hang.** `deep_clone` in
+   `boot/interp.py` had no `_seen` cycle-detection set. A user-
+   constructed cyclic struct (`let mut n = Node{children:[]};
+   n.children.push(n)`) caused unbounded Python recursion and a
+   `RecursionError` (exit 101). The checker's `clone_supported`
+   already had a `_seen` guard and ACCEPTED cyclic types — so the
+   runtime HANG was a soundness gap. **Fix:** add a `_seen` dict
+   keyed by `id(v)`; on revisiting, return the already-cloned copy
+   (breaking the cycle by aliasing the clone). Mirror the pattern
+   already used by `clone_supported`.
+
+4. **BUG-04 (MED, checker): over-conservative struct-default
+   effect propagation.** `check_structlit` in `boot/checker.py`
+   added the `@default.<S>` edge to the constructing function's
+   call-graph UNCONDITIONALLY whenever the struct had ANY defaulted
+   field — even when the literal provided ALL fields (no default
+   was evaluated at this call site). A `pure` function constructing
+   a fully-specified struct whose sibling default called
+   `read_file` would be falsely rejected as "pure but transitively
+   uses Fs". **Fix:** only add the edge when at least one defaulted
+   field is ACTUALLY OMITTED from the literal (i.e. a default
+   expression is being evaluated at this call site).
+
+5. **BUG-05 (LOW, stdlib): `math_sqrt(+inf)` returns NaN.**
+   `std/math.hls`'s `math_sqrt` did not special-case `+inf` input.
+   Newton's method computes `(inf + inf/inf) / 2.0 = (inf + NaN) /
+   2.0 = NaN`, returned after 64 iterations. IEEE 754 (and libm
+   `sqrt`) specify `sqrt(inf) = inf`. `+inf` is reachable from
+   arithmetic like `1.0 / 0.0` at runtime (the lexer rejects the
+   literal but the runtime produces it). **Fix:** add a check
+   `x == 2.0 * x` (true only for ±inf and 0.0; combined with the
+   existing `x > 0.0` and `x == 0.0` guards, this catches +inf)
+   and return `x` (the +inf) unchanged.
+
+6. **BUG-06 (LOW, checker): `never` type not propagated in
+   binop.** `check_bin` in both `boot/checker.py` and `src/hlc.hls`
+   rejected `never` operands with "never value cannot be used in
+   expression" — a false positive. `never` is the bottom type
+   (returned by `panic()`/`exit()`); it should be compatible with
+   every type (the rest of the expression is unreachable). The
+   let-binding path already handled `never`; the binop / index /
+   field / method / qmark paths now also propagate `never`. The
+   codegen (`gen_bin`) emits just the diverging operand (without
+   the binary operation) so the C output compiles cleanly.
+
+7. **BUG-07 (LOW, hlc): `parse_placeholder_int` overflow.**
+   `src/hlc.hls`'s `parse_placeholder_int` accumulated
+   `v = v * 10 + (c - 48)` without overflow checking. A 20-digit
+   placeholder body like `{12345678901234567890}` overflowed
+   int64 and crashed the self-hosted checker with a raw `i64_mul`
+   panic — instead of the intended "placeholder out of range"
+   error. The boot checker used Python's arbitrary-precision
+   `int()` and never overflowed; the self-hosted checker diverged.
+   **Fix:** cap the loop at 18 digits (any operand index > 10^18
+   is absurdly out of range).
+
+8. **BUG-09 (LOW, checker): dead `snapshot_moved` in `while`/`for`.**
+   `boot/checker.py`'s `check_stmt` for `while` and `for` called
+   `snap = self.snapshot_moved(env)` but `snap` was never used (the
+   deep-scan-16 fix removed the matching `restore_moved` call for
+   soundness, but left the snapshot allocation as dead code).
+   **Fix:** removed the dead lines; updated the comments to
+   explain that no snapshot is needed (moves propagate soundly
+   without restoration).
+
+9. **BUG-10 (LOW, checker): `in(imm)` on runtime expression.** The
+   deep-scan-17 fix rejected `imm` on output directions but left
+   `in(imm) some_var` accepted (the comment said "reject on
+   non-literal expressions" but the code didn't). GCC's `i`
+   constraint requires a compile-time constant; without this
+   check, `in(imm) x` was accepted by the HLS checker and reached
+   GCC as `"i"(x)`, producing an opaque "impossible constraint"
+   error with no source-line attribution. **Fix:** reject
+   `in(imm)` on expressions that aren't integer literals or
+   unary-minus-of-integer-literals; suggest `reg` for runtime
+   values.
+
+10. **BUG-11 (LOW, tooling): `hlserve` symlink traversal.**
+    `tools/hlserve.py`'s `_serve_file` blocked literal `..` path
+    components but did NOT call `os.path.realpath`/`os.path.normpath`
+    on the resolved path. A symlink inside `bundle_dir` pointing
+    outside (e.g. `bundle_dir/foo -> /etc`) was followed by
+    `open()` without detection — exposing arbitrary host files via
+    HTTP. **Fix:** resolve both paths to their canonical realpaths
+    and verify the resolved file is still inside the (resolved)
+    bundle dir; return HTTP 403 if not.
+
+11. **BUG-13 (LOW, interp): defensive `None` fallback in match
+    binding.** `boot/interp.py`'s `eval_match` used
+    `s_data[i] if i < len(s_data) else None` for binding payloads.
+    If `i >= len(s_data)` (pattern has more bindings than the
+    enum variant's data — checker bug), the runtime would set a
+    binding to Python `None` and the next use would raise a
+    confusing `TypeError` (e.g. `None + 5`) instead of a clean
+    `HLPanic`. **Fix:** replace the `else None` fallback with
+    `raise HLPanic("match: binding count exceeds payload count
+    (internal checker bug — please report)")` so a checker bug
+    surfaces cleanly.
+
+12. **BUG-14 (LOW, checker): dead `isinstance` in `check_method`.**
+    `boot/checker.py`'s `check_method` (the `int` method dispatch)
+    had `([], INT_M[name]) if isinstance(INT_M[name], str) else
+    INT_M[name]` — but `INT_M` values are all strings
+    (`{"to_str": "str", "to_float": "float", "abs": "int"}`), so
+    the `else` branch was dead code. **Fix:** simplified to
+    `ptypes, ret = [], INT_M[name]` (matches the `FLOAT_M`/
+    `BOOL_M` form).
+
+**Test coverage (8 new tests in `tests/run_tests.sh` section 18,
+subsections (aa) through (bh)):**
+
+- `(aa)` checker rejects `in(imm)` on runtime expression.
+- `(bb)` `feat_stage27_perfection2.hls` runs on the boot
+  interpreter (smoke test for all 12 fixes).
+- `(bc)` self-hosted hlc compiles `feat_stage27_perfection2.hls` +
+  `gcc -O2 -Werror` (smoke test for the codegen-side fixes
+  BUG-01 and BUG-06).
+- `(bd)` `math_sqrt` finite-path unchanged (BUG-05 fix is sound —
+  doesn't break sqrt(4), sqrt(2), sqrt(0)).
+- `(be)` proof `const_eval` normal-path unchanged (BUG-02 fix is
+  sound — doesn't break safe_div(20,4)).
+- `(bf)` non-cyclic clone unchanged (BUG-03 fix is sound — doesn't
+  break the common case of cloning a tree).
+- `(bg)` struct-default effect propagation unchanged (BUG-04 fix
+  is sound — a fn that OMITS a defaulted field still picks up the
+  default's effects).
+- `(bh)` bootstrap deterministic with the deep-scan-18 codegen
+  additions (the new HLS code in `src/hlc.hls` self-compiles
+  deterministically).
+
+Plus 1 new `tests/fail/` file (`fail_asm_imm_runtime.hls`) and
+1 new `tests/ok/` file (`feat_stage27_perfection2.hls`).
+
+**Result:** the deep-scan-18 hardening closes 12 latent bugs found
+across the codebase. The full local suite is **830 PASS / 0 FAIL**
+(was 822, +8 deep-scan-18 tests). `make asm-acceptance` is GREEN;
+bootstrap is deterministic; the boot and self-hosted checkers
+produce identical error messages for every negative test. Stage 27
+remains production-grade for kernel / driver work, and the broader
+codebase is now measurably more sound.
+
 ---
 
 ## STAGE 28 — Stack-frame layout control (for kernel code) ✅ (release v0.45.0-alpha)

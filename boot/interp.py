@@ -1118,7 +1118,23 @@ class Interp:
                 for i, bname in enumerate(pat["bindings"]):
                     if bname == "_":
                         continue
-                    env[-1][bname] = [s_data[i] if i < len(s_data) else None, False, False]
+                    # Stage 27 perfection (v0.50.3-alpha) deep-scan-18:
+                    # BUG-13 fix. The previous `else None` fallback
+                    # silently set the binding to Python `None` when the
+                    # pattern had more bindings than the enum variant's
+                    # data (i >= len(s_data)). The checker validates
+                    # len(bindings) == len(payloads), so this branch
+                    # should be unreachable — but if a checker bug ever
+                    # allowed a mismatch, the runtime would set a
+                    # binding to None and the next use would raise a
+                    # confusing Python TypeError (e.g. `None + 5`).
+                    # Now: a clean HLPanic surfaces the bug.
+                    if i >= len(s_data):
+                        raise HLPanic("match: binding count exceeds "
+                                      "payload count (internal "
+                                      "checker bug — please report)",
+                                      self.line)
+                    env[-1][bname] = [s_data[i], False, False]
                 return self.eval_expr(arm["body"], env)
             finally:
                 env.pop()
@@ -1529,8 +1545,27 @@ class Interp:
         t.start()
         return task
 
-    def deep_clone(self, v):
+    def deep_clone(self, v, _seen=None):
         """Deep-copy an HLS runtime value (Stage-0 / Python)."""
+        # Stage 27 perfection (v0.50.3-alpha) deep-scan-18: BUG-03 fix.
+        # Add cycle detection via a `_seen` set keyed by id(v). A user-
+        # constructed cyclic struct (e.g. `let mut n = Node{children:[]};
+        # n.children.push(n)` — lists have reference semantics, so push
+        # aliases the dict) previously caused unbounded Python recursion
+        # and a RecursionError caught by boot.py as "stack overflow"
+        # (exit 101). The checker's `clone_supported` already has a
+        # `_seen` guard and ACCEPTS cyclic types — so the runtime HANG
+        # was a soundness gap between checker and runtime. The fix:
+        # on revisiting a seen object, return the already-cloned copy
+        # (breaking the cycle by aliasing the clone — matches what the
+        # native codegen would do via the typed hl_clone_<Struct> helper
+        # if/when it grows the same cycle support).
+        if _seen is None:
+            _seen = {}
+        if isinstance(v, (dict, list)):
+            vid = id(v)
+            if vid in _seen:
+                return _seen[vid]
         if isinstance(v, HLChan):
             # Stage 16: a channel clones by SHARING (that is its purpose —
             # the queue is guarded by the runtime lock). Mirrors the
@@ -1543,7 +1578,11 @@ class Interp:
         if isinstance(v, bytes):
             return bytes(v)  # strings are immutable, shallow copy is fine
         if isinstance(v, list):
-            return [self.deep_clone(x) for x in v]
+            new_list = []
+            _seen[id(v)] = new_list
+            for x in v:
+                new_list.append(self.deep_clone(x, _seen))
+            return new_list
         if isinstance(v, dict):
             # SCAN-A fix: distinguish enum values from struct values. An
             # enum value is `{"enum": name, "var": variant, "data": [...]}` —
@@ -1551,13 +1590,16 @@ class Interp:
             # named "enum" would be `{"enum": value}` — missing "var" and
             # "data" — so it must be treated as a struct (a plain dict).
             if "enum" in v and "var" in v and "data" in v:
-                return {"enum": v["enum"], "var": v["var"],
-                        "data": [self.deep_clone(x) for x in v["data"]]}
+                new_enum = {"enum": v["enum"], "var": v["var"], "data": []}
+                _seen[id(v)] = new_enum
+                new_enum["data"] = [self.deep_clone(x, _seen) for x in v["data"]]
+                return new_enum
             # map[str, T] — copy insertion-ordered dict. Also covers
             # struct values (which are dicts of field_name -> value).
             new = {}
+            _seen[id(v)] = new
             for k in v:
-                new[k] = self.deep_clone(v[k])
+                new[k] = self.deep_clone(v[k], _seen)
             return new
         # primitives (int, float, bool, None)
         return v

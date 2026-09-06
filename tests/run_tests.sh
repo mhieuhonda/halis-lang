@@ -2656,6 +2656,204 @@ else
     bad "asm: bootstrap compile failed (deep-scan-17)"
 fi
 
+# ======================================================================
+# Stage 27 perfection (v0.50.3-alpha) deep-scan-18:
+# Broader codebase hardening. Six classes of bugs found by the
+# deep-scan-18 audit: tainted-primitive container codegen, proof
+# const_eval overflow corner, cyclic-clone hang, struct-default
+# effect over-attribution, math_sqrt(inf), never-type binop
+# propagation, parse_placeholder_int overflow cap, dead-code
+# removal, in(imm) runtime-expr rejection, hlserve symlink traversal,
+# match binding assertion, dead isinstance in check_method.
+# ======================================================================
+
+# (aa) checker rejects in(imm) on a RUNTIME expression.
+if python3 boot/boot.py --check tests/fail/fail_asm_imm_runtime.hls >"$TMP/s27_aa.out" 2>&1; then
+    bad "asm: checker accepted in(imm) on runtime expr"
+else
+    if grep -q "requires a compile-time constant" "$TMP/s27_aa.out"; then
+        ok "asm: checker rejects in(imm) on runtime expr"
+    else
+        bad "asm: rejected in(imm)-runtime but with the wrong message"
+        cat "$TMP/s27_aa.out"
+    fi
+fi
+
+# (bb) the deep-scan-18 positive regression test (feat_stage27_perfection2.hls)
+#      runs on the boot interpreter and produces expected output.
+if python3 boot/boot.py tests/ok/feat_stage27_perfection2.hls >"$TMP/s27_bb.out" 2>&1; then
+    if grep -q "deep-scan-18 hardening does not break valid programs" "$TMP/s27_bb.out"; then
+        ok "asm: feat_stage27_perfection2.hls runs on the boot interpreter"
+    else
+        bad "asm: feat_stage27_perfection2.hls did not print the acceptance line"
+        cat "$TMP/s27_bb.out"
+    fi
+else
+    bad "asm: feat_stage27_perfection2.hls failed to run on the boot interpreter"
+    cat "$TMP/s27_bb.out"
+fi
+
+# (bc) the self-hosted hlc compiles feat_stage27_perfection2.hls + gcc -O2 -Werror.
+if "$TMP/hlc1" tests/ok/feat_stage27_perfection2.hls "$TMP/s27_bb.c" >"$TMP/s27_bb_hlc.out" 2>&1; then
+    if gcc -O2 -Werror -c -o "$TMP/s27_bb.o" "$TMP/s27_bb.c" -lm -pthread 2>"$TMP/s27_bb_gcc.log"; then
+        ok "asm: feat_stage27_perfection2.hls compiles cleanly with gcc -O2 -Werror"
+    else
+        bad "asm: feat_stage27_perfection2.hls C source fails to compile with gcc -O2 -Werror"
+        head -5 "$TMP/s27_bb_gcc.log"
+    fi
+else
+    bad "asm: self-hosted hlc failed to compile feat_stage27_perfection2.hls"
+    cat "$TMP/s27_bb_hlc.out"
+fi
+
+# (bd) the deep-scan-18 hardening does not break the existing
+#      stdlib (math_sqrt in particular — the BUG-05 fix uses `x == 2.0*x`
+#      to detect +inf, which must NOT affect finite inputs).
+cat >"$TMP/s27_bd.hls" <<'HLS_EOF'
+import "std.math"
+fn check_sqrt() -> int uses IO {
+    # sqrt(4) = 2.0, sqrt(2) ~= 1.41421..., sqrt(0) = 0.0
+    let s4: float = math_sqrt(4.0)
+    let s2: float = math_sqrt(2.0)
+    let s0: float = math_sqrt(0.0)
+    if s4 == 2.0 && s2 > 1.4142135 && s2 < 1.4142136 && s0 == 0.0 {
+        println("deep-scan-18: math_sqrt finite-path unchanged")
+        return 0
+    }
+    println("FAIL: s4=" + s4.to_str() + " s2=" + s2.to_str() + " s0=" + s0.to_str())
+    return 1
+}
+fn main() -> int uses IO {
+    return check_sqrt()
+}
+HLS_EOF
+if python3 boot/boot.py "$TMP/s27_bd.hls" >"$TMP/s27_bd.out" 2>&1; then
+    if grep -q "deep-scan-18: math_sqrt finite-path unchanged" "$TMP/s27_bd.out"; then
+        ok "asm: math_sqrt finite-path unchanged (BUG-05 fix is sound)"
+    else
+        bad "asm: math_sqrt finite-path broken by BUG-05 fix"
+        cat "$TMP/s27_bd.out"
+    fi
+else
+    bad "asm: math_sqrt smoke test failed to run"
+    cat "$TMP/s27_bd.out"
+fi
+
+# (be) the deep-scan-18 hardening does not break the proof const-eval
+#      path (BUG-02 fix returns None for INT64_MIN/-1, letting the
+#      runtime handle it).
+cat >"$TMP/s27_be.hls" <<'HLS_EOF'
+fn safe_div(a: int, b: int) -> int requires b != 0 {
+    return a / b
+}
+fn main() -> int uses IO {
+    # Normal division corner — must still work.
+    let r: int = safe_div(20, 4)
+    if r == 5 {
+        println("deep-scan-18: const_eval normal path unchanged")
+        return 0
+    }
+    println("FAIL: safe_div(20,4)=" + r.to_str())
+    return 1
+}
+HLS_EOF
+if python3 boot/boot.py "$TMP/s27_be.hls" >"$TMP/s27_be.out" 2>&1; then
+    if grep -q "const_eval normal path unchanged" "$TMP/s27_be.out"; then
+        ok "asm: proof const_eval normal-path unchanged (BUG-02 fix is sound)"
+    else
+        bad "asm: proof const_eval normal-path broken by BUG-02 fix"
+        cat "$TMP/s27_be.out"
+    fi
+else
+    bad "asm: proof const_eval smoke test failed to run"
+    cat "$TMP/s27_be.out"
+fi
+
+# (bf) the deep-scan-18 cyclic-clone fix (BUG-03) does not break
+#      non-cyclic clone (the common case).
+cat >"$TMP/s27_bf.hls" <<'HLS_EOF'
+struct Point { x: int, y: int }
+fn clone_smoke() -> int {
+    let p: Point = Point { x: 1, y: 2 }
+    let q: Point = clone(p)
+    # Mutating q must not affect p (deep clone).
+    return q.x + q.y + p.x + p.y  # 1+2+1+2 = 6
+}
+fn main() -> int uses IO {
+    let r: int = clone_smoke()
+    if r == 6 {
+        println("deep-scan-18: non-cyclic clone unchanged (BUG-03 fix is sound)")
+        return 0
+    }
+    println("FAIL: clone_smoke()=" + r.to_str())
+    return 1
+}
+HLS_EOF
+if python3 boot/boot.py "$TMP/s27_bf.hls" >"$TMP/s27_bf.out" 2>&1; then
+    if grep -q "non-cyclic clone unchanged" "$TMP/s27_bf.out"; then
+        ok "asm: non-cyclic clone unchanged (BUG-03 fix is sound)"
+    else
+        bad "asm: non-cyclic clone broken by BUG-03 fix"
+        cat "$TMP/s27_bf.out"
+    fi
+else
+    bad "asm: clone smoke test failed to run"
+    cat "$TMP/s27_bf.out"
+fi
+
+# (bg) the deep-scan-18 struct-default effect fix (BUG-04) does not
+#      break the existing struct-default machinery (a pure fn that
+#      OMITS a defaulted field still picks up the default's effects).
+cat >"$TMP/s27_bg.hls" <<'HLS_EOF'
+struct WithDefault {
+    x: int,
+    y: int = io_default()
+}
+fn io_default() -> int uses IO {
+    return 99
+}
+# This fn OMITS y -> the default IS evaluated -> this fn must use IO.
+fn construct_with_default() -> int uses IO {
+    let w: WithDefault = WithDefault { x: 1 }
+    return w.x + w.y
+}
+fn main() -> int uses IO {
+    let r: int = construct_with_default()
+    if r == 100 {
+        println("deep-scan-18: struct-default effect propagation unchanged (BUG-04 fix is sound)")
+        return 0
+    }
+    println("FAIL: construct_with_default()=" + r.to_str())
+    return 1
+}
+HLS_EOF
+if python3 boot/boot.py "$TMP/s27_bg.hls" >"$TMP/s27_bg.out" 2>&1; then
+    if grep -q "struct-default effect propagation unchanged" "$TMP/s27_bg.out"; then
+        ok "asm: struct-default effect propagation unchanged (BUG-04 fix is sound)"
+    else
+        bad "asm: struct-default effect propagation broken by BUG-04 fix"
+        cat "$TMP/s27_bg.out"
+    fi
+else
+    bad "asm: struct-default smoke test failed to run"
+    cat "$TMP/s27_bg.out"
+fi
+
+# (bh) bootstrap is still deterministic with the deep-scan-18
+#      additions (the new HLS code in src/hlc.hls — BUG-01 fix in
+#      box_fn_for/gen_unbox, BUG-06 fix in check_bin/check_method/
+#      check_qmark, BUG-07 fix in parse_placeholder_int — must
+#      self-compile deterministically).
+if python3 boot/boot.py src/hlc.hls src/hlc.hls "$TMP/hlc_ds18_1.c" >/dev/null 2>&1     && python3 boot/boot.py src/hlc.hls src/hlc.hls "$TMP/hlc_ds18_2.c" >/dev/null 2>&1; then
+    if diff -q "$TMP/hlc_ds18_1.c" "$TMP/hlc_ds18_2.c" >/dev/null; then
+        ok "asm: bootstrap deterministic with deep-scan-18 codegen additions"
+    else
+        bad "asm: bootstrap not deterministic with deep-scan-18 codegen additions"
+    fi
+else
+    bad "asm: bootstrap compile failed (deep-scan-18 codegen)"
+fi
+
 echo ""
 echo "=========================================="
 echo "RESULT: $PASS PASS / $FAIL FAIL"

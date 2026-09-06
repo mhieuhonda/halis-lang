@@ -1352,7 +1352,14 @@ class Checker:
             # idiomatic "drop then revive via mut reassignment" pattern
             # still works because check_assign's revive step clears the
             # moved flag.
-            snap = self.snapshot_moved(env)
+            #
+            # Stage 27 perfection (v0.50.3-alpha) deep-scan-18: BUG-09
+            # fix. The previous `snap = self.snapshot_moved(env)` line
+            # was dead code — the deep-scan-16 fix removed the matching
+            # `restore_moved` call (soundness), but left the snapshot
+            # allocation as a per-iteration dict that was immediately
+            # discarded. Removed it for clarity (a reader thinks the
+            # snapshot is used; it isn't).
             self.child(env)
             self.check_stmts(s["body"], env, fn, True)
             env.pop()
@@ -1371,7 +1378,11 @@ class Checker:
             # Deep-scan-16: same soundness fix as `while` — a binding moved
             # inside the for-body may be nulled at runtime after the first
             # iteration. Post-loop uses must be rejected.
-            snap = self.snapshot_moved(env)
+            #
+            # Stage 27 perfection (v0.50.3-alpha) deep-scan-18: BUG-09
+            # fix. Removed the dead `snap = self.snapshot_moved(env)`
+            # line (no matching restore_moved; deep-scan-16 fix left it
+            # as dead code).
             self.child(env)
             # BUG (deep-scan-5): the `let` branch rejects shadowing but the
             # `for` branch never checked — a loop variable could silently
@@ -1486,13 +1497,39 @@ class Checker:
                 # `in(imm) expr` is technically valid in GCC but requires
                 # `expr` to be a compile-time constant; the HLS compiler
                 # does not constant-fold in general, so reject `imm` on
-                # outputs unconditionally and warn-equivalent (reject)
-                # on `in(imm)` for non-literal expressions.
+                # outputs unconditionally.
+                #
+                # Stage 27 perfection (v0.50.3-alpha) deep-scan-18:
+                # BUG-10 fix. Also reject `in(imm)` on a NON-literal
+                # expression — GCC's `i` constraint requires a compile-
+                # time constant. Without this check, `in(imm) some_var`
+                # was accepted by the HLS checker and reached GCC as
+                # `"i"(some_var)`, producing an opaque "impossible
+                # constraint" error with no source-line attribution.
+                # Now the user gets a clear HLS error pointing at the
+                # asm! line, suggesting `reg` instead.
                 if c == "imm" and d != "in":
                     self.err("asm! constraint 'imm' cannot be used with "
                              "direction '%s' — an immediate is a compile-"
                              "time constant and cannot be written to" % d,
                              s)
+                if c == "imm" and d == "in":
+                    in_expr = op["expr"]
+                    in_kind = in_expr["k"] if isinstance(in_expr, dict) else None
+                    # Accept integer literals, bool literals, and
+                    # unary-minus of integer literals (the common
+                    # constant-expr forms). Reject everything else —
+                    # the user should use `reg` for runtime values.
+                    if in_kind == "un" and in_expr.get("op") == "-":
+                        inner = in_expr.get("e")
+                        if isinstance(inner, dict) and inner.get("k") == "int":
+                            in_kind = "int"  # treat -5 as a constant
+                    if in_kind not in ("int", "bool"):
+                        self.err("asm! `in(imm)` requires a compile-time "
+                                 "constant (int/bool literal or unary-"
+                                 "minus-of-int-literal), got a runtime "
+                                 "expression — use `reg` instead for "
+                                 "runtime values", s)
             else:
                 # Stage 27 perfection (v0.50.2-alpha) deep-scan-17:
                 # String-form constraint (a register name like "eax" or
@@ -1934,8 +1971,21 @@ class Checker:
     def check_bin(self, e, env):
         lt = self.check_expr(e["l"], env, None)
         rt = self.check_expr(e["r"], env, None)
+        # Stage 27 perfection (v0.50.3-alpha) deep-scan-18: BUG-06 fix.
+        # `never` is the bottom type (the expression diverges — e.g.
+        # `panic("...")` returns `never`). It should be compatible with
+        # EVERY type (the rest of the expression is unreachable). The
+        # previous code rejected `panic("...") + 1` with "never value
+        # cannot be used in expression" — a false positive that broke
+        # dead-code patterns like `let x: int = if c { 5 } else {
+        # panic("...") }` (which works via the let-binding path) but
+        # not `let x: int = panic("...") + 1` (which goes through
+        # check_bin). The fix: propagate `never` instead of erroring.
+        # The `+1` is dead code (panic diverges), but the checker
+        # should not reject the whole expression — the codegen emits
+        # the RHS as a no-op (it's unreachable).
         if lt == "never" or rt == "never":
-            self.err("never value cannot be used in expression", e)
+            return "never"
         op = e["op"]
         if op in ("||", "&&"):
             if lt != "bool" or rt != "bool":
@@ -2007,8 +2057,19 @@ class Checker:
         # expressions (side effects live in the synthetic "@default.<S>"
         # call-graph node). Add the edge so the effects fixpoint propagates
         # the default's effects to the constructing function.
-        if name in self._structs_with_defaults:
-            self.edges[self.cur_fn].add("@default." + name)
+        #
+        # Stage 27 perfection (v0.50.3-alpha) deep-scan-18: BUG-04 fix.
+        # The previous code added the @default.<S> edge UNCONDITIONALLY
+        # whenever the struct had ANY defaulted field — even when the
+        # literal provided ALL fields (no default is evaluated at this
+        # call site). This was a false-positive in effect inference: a
+        # pure function constructing a fully-specified struct whose
+        # sibling default calls read_file would be rejected as "pure
+        # but transitively uses Fs". The fix: only add the edge when at
+        # least one defaulted field is ACTUALLY OMITTED from the literal.
+        # We compute `provided_names` below (after the edge check) to
+        # avoid duplicating the field-list walk; defer the edge add
+        # until we know whether a default is being evaluated.
         typeparams = st["typeparams"]
         type_map = {}
         # If generic, infer type args from contextual expected type if available.
@@ -2040,6 +2101,26 @@ class Checker:
         # defaults — checked above. Any extra fields beyond declared?
         if len(provided_names) > len(decl_names):
             self.err("struct literal %s has too many fields" % name, e)
+        # Stage 27 perfection (v0.50.3-alpha) deep-scan-18: BUG-04 fix
+        # (deferred from the top of check_structlit). Now that we know
+        # `provided_names` and `decl_names`, add the @default.<S> edge
+        # ONLY if at least one defaulted field is actually OMITTED from
+        # the literal (i.e. a default expression is being evaluated at
+        # this call site). This prevents a pure function that constructs
+        # a fully-specified struct from being falsely attributed the
+        # sibling default's effects.
+        if name in self._structs_with_defaults:
+            if len(provided_names) < len(decl_names):
+                # Only add the edge if at least one omitted field has a
+                # default (the required-field check above guarantees
+                # this, but we double-check defensively).
+                omitted_have_default = False
+                for i in range(len(provided_names), len(decl_names)):
+                    if fields_with_defaults[i][2] is not None:
+                        omitted_have_default = True
+                        break
+                if omitted_have_default:
+                    self.edges[self.cur_fn].add("@default." + name)
         # Now type-check each provided field. We do a SINGLE pass that
         # records the resulting type for each field expression, then
         # optionally infers remaining type params from those types. This
@@ -2842,7 +2923,14 @@ class Checker:
         elif tt == "int":
             if name not in INT_M:
                 self.err("int has no method %s" % name, e)
-            ptypes, ret = ([], INT_M[name]) if isinstance(INT_M[name], str) else INT_M[name]
+            # Stage 27 perfection (v0.50.3-alpha) deep-scan-18: BUG-14
+            # fix. The previous `isinstance(INT_M[name], str)` check
+            # was dead code — INT_M is `{"to_str": "str", "to_float":
+            # "float", "abs": "int"}` and ALL its values are str (never
+            # a tuple). Simplified to direct assignment, matching
+            # FLOAT_M / BOOL_M / STR_M which all use the (ptuples, ret)
+            # form.
+            ptypes, ret = [], INT_M[name]
             e["rm"] = ("builtin", "int." + name)
         elif tt == "float":
             if name not in FLOAT_M:

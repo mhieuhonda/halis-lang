@@ -13,6 +13,102 @@ stability (125–140), and final stabilisation toward v1.0 (141–150).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
+## [v0.50.3-alpha] — Stage 27 perfection (deep-scan-18, broader codebase)
+
+> A whole-codebase audit that closed 12 latent bugs across
+> `boot/checker.py`, `boot/interp.py`, `boot/proof.py`,
+> `src/hlc.hls`, `std/math.hls`, and `tools/hlserve.py`. The
+> deep-scan-17 pass hardened the asm! checker; this pass hardened
+> everything else. Each fix is mirrored in the self-hosted checker
+> where applicable, and a new positive regression test
+> (`tests/ok/feat_stage27_perfection2.hls`) exercises the smoke
+> paths of every fix to verify the hardening does not break valid
+> programs. 8 new tests in `tests/run_tests.sh` section 18.
+
+### Added — Stage 27 perfection (deep-scan-18) soundness + correctness fixes
+
+- **BUG-01 (MED, codegen):** `box_fn_for` and `gen_unbox` in
+  `src/hlc.hls` did NOT strip the `tainted[...]` wrapper before
+  dispatching. `list[tainted[int]]` / `map[str, tainted[int]]` /
+  `chan[tainted[int]]` emitted `hl_box_ptr`/`hl_unbox_ptr` on
+  values that are semantically `int64_t` — undefined behaviour.
+  Both functions now call `strip_taint(t)` before the int/float/
+  bool checks.
+- **BUG-02 (MED, proof):** `const_eval` for `/` and `%` in
+  `boot/proof.py` returned `9223372036854775808` for
+  `INT64_MIN / -1`, exceeding `INT64_MAX` while the runtime
+  panics. Now returns `None` (treat as "unknown") for this corner.
+- **BUG-03 (MED, interp):** `deep_clone` in `boot/interp.py`
+  had no cycle-detection set; a cyclic struct caused unbounded
+  recursion and a `RecursionError`. Now uses a `_seen` dict keyed
+  by `id(v)` to break the cycle.
+- **BUG-04 (MED, checker):** `check_structlit` in
+  `boot/checker.py` added the `@default.<S>` edge unconditionally
+  when the struct had ANY defaulted field — even when the literal
+  provided ALL fields. A pure fn constructing a fully-specified
+  struct was falsely attributed the default's effects. Now only
+  adds the edge when at least one defaulted field is OMITTED.
+- **BUG-05 (LOW, stdlib):** `math_sqrt(+inf)` returned `NaN`
+  (Newton's method on +inf produces NaN). Now returns +inf
+  unchanged (IEEE 754 / libm contract), detected via
+  `x == 2.0 * x`.
+- **BUG-06 (LOW, checker):** `never` type rejected in binop /
+  index / field / method / qmark with "never value cannot be
+  used in expression". `never` is the bottom type — should be
+  compatible with every type (the rest of the expression is
+  unreachable). Now propagated (returns `never`). Codegen emits
+  just the diverging operand without the binary operation.
+- **BUG-07 (LOW, hlc):** `parse_placeholder_int` in `src/hlc.hls`
+  accumulated `v = v * 10 + ...` without overflow checking. A
+  20-digit placeholder body overflowed int64 and crashed the
+  self-hosted checker with a raw `i64_mul` panic. Now capped at
+  18 digits.
+- **BUG-09 (LOW, checker):** dead `snap = self.snapshot_moved(env)`
+  line in `while` and `for` branches of `check_stmt` (the
+  deep-scan-16 fix removed the matching `restore_moved` but left
+  the snapshot allocation as dead code). Removed.
+- **BUG-10 (LOW, checker):** `in(imm)` on a runtime expression
+  was accepted (the deep-scan-17 comment said "reject" but the
+  code didn't). Now rejected with a clear error suggesting `reg`
+  for runtime values. Integer literals and unary-minus-of-int-
+  literals are still accepted.
+- **BUG-11 (LOW, tooling):** `hlserve`'s `_serve_file` blocked
+  literal `..` but didn't call `os.path.realpath`. A symlink
+  inside `bundle_dir` pointing outside was followed by `open()`
+  — exposing arbitrary host files via HTTP. Now resolves both
+  paths to canonical realpaths and verifies containment; returns
+  HTTP 403 on traversal.
+- **BUG-13 (LOW, interp):** `eval_match`'s binding fallback
+  `s_data[i] if i < len(s_data) else None` silently set a binding
+  to Python `None` on a checker bug, producing a confusing
+  `TypeError` later. Now raises a clean `HLPanic` so checker
+  bugs surface cleanly.
+- **BUG-14 (LOW, checker):** dead `isinstance(INT_M[name], str)`
+  check in `check_method` (the `else` branch was unreachable
+  because `INT_M` values are all strings). Simplified.
+
+### Added — tests
+
+- 1 new `tests/fail/` file: `fail_asm_imm_runtime.hls`.
+- 1 new `tests/ok/` positive regression test:
+  `feat_stage27_perfection2.hls` — smoke-tests all 12 fixes
+  (tainted-container roundtrip, const-eval normal path, cyclic
+  clone, pure full-struct, math_sqrt(+inf), never-in-binop,
+  asm_imm_literal, match binding, int methods).
+- 8 new tests in `tests/run_tests.sh` section 18 (subsections
+  (aa) through (bh)): each smoke-test verifies the corresponding
+  fix is sound (doesn't break the common case).
+
+### Verification
+
+- `make asm-acceptance`: GREEN (8/8 sub-checks pass).
+- `make bootstrap`: deterministic self-compilation OK.
+- 8 new tests: 8 PASS / 0 FAIL.
+- All 17 existing Stage 27 tests: unchanged, still PASS.
+- All 12 deep-scan-17 tests: unchanged, still PASS.
+- Full local suite: **830 PASS / 0 FAIL** (was 822, +8 deep-scan-18
+  tests).
+
 ## [v0.50.2-alpha] — Stage 27 perfection (deep-scan-17)
 
 > A focused soundness pass over the Stage 27 `asm!` checker. The

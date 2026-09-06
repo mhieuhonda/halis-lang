@@ -1022,6 +1022,21 @@ def const_eval(e, consts):
                 if isinstance(l, int) and isinstance(r, int):
                     if r == 0:
                         return None
+                    # Stage 27 perfection (v0.50.3-alpha) deep-scan-18:
+                    # BUG-02 fix. INT64_MIN / -1 is the unique division
+                    # corner that overflows int64: abs(INT64_MIN) is
+                    # 9223372036854775808 (one past INT64_MAX), so
+                    # abs(l) // abs(r) returns 9223372036854775808,
+                    # which exceeds INT64_MAX. The HLS runtime (i64_div)
+                    # PANICS on this corner; the const-eval must NOT
+                    # return a value the runtime can never produce
+                    # (returning 9223372036854775808 here would let
+                    # `requires INT64_MIN / -1 > 0` const-eval to True,
+                    # but the runtime would panic — a soundness gap).
+                    # Treat as "unknown" (return None) so the runtime
+                    # check handles it.
+                    if l == -9223372036854775808 and r == -1:
+                        return None
                     q = abs(l) // abs(r)
                     return q if (l >= 0) == (r >= 0) else -q
                 return l / r
@@ -1030,6 +1045,16 @@ def const_eval(e, consts):
                 # interpreter's i64_mod and the native runtime.
                 if isinstance(l, int) and isinstance(r, int):
                     if r == 0:
+                        return None
+                    # Stage 27 perfection (v0.50.3-alpha) deep-scan-18:
+                    # BUG-02 fix. INT64_MIN % -1 is the unique modulo
+                    # corner that overflows: the mathematical result is
+                    # 0, but the C `%` operator is UB for INT64_MIN % -1
+                    # (and GCC may fold it to 0 OR raise SIGFPE on
+                    # x86-64). The HLS runtime (i64_mod) PANICS on this
+                    # corner; the const-eval must NOT return a value
+                    # the runtime can never produce. Treat as "unknown".
+                    if l == -9223372036854775808 and r == -1:
                         return None
                     q = abs(l) // abs(r)
                     q = q if (l >= 0) == (r >= 0) else -q

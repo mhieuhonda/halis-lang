@@ -6250,6 +6250,19 @@ fn parse_placeholder_int(ctx: Ctx, s: str, line: int) -> int {
     if s.len() == 0 {
         return -1
     }
+    # Stage 27 perfection (v0.50.3-alpha) deep-scan-18: BUG-07 fix.
+    # A pathological placeholder body like "{12345678901234567890}"
+    # (20+ digits) would overflow int64 during accumulation
+    # (v = v * 10 + ...) and crash the self-hosted checker with a
+    # raw i64_mul panic — instead of the intended "placeholder out
+    # of range" error. Cap the loop at 18 digits (the maximum
+    # number of digits in a non-negative int64 is 19, but any
+    # program with > 10^18 asm! operands is absurd — 18 digits is
+    # safe and produces a clean error for the malicious input).
+    # Any reasonable program has fewer than a million operands.
+    if s.len() > 18 {
+        return -1
+    }
     let mut v: int = 0
     let mut i: int = 0
     while i < s.len() {
@@ -6411,8 +6424,11 @@ fn check_expr(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, expected
         }
     } else if k == "index" {
         let tt: str = check_expr(ctx, env, cur, ctx.exprs[e].left, "")
+        # Stage 27 perfection (v0.50.3-alpha) deep-scan-18: BUG-06 fix.
+        # Propagate `never` instead of erroring (bottom-type rule).
         if tt == "never" {
-            cerr(ctx.exprs[e].line, "never value cannot be used in expression")
+            ctx.exprs[e].t = "never"
+            return "never"
         }
         if !is_list_t(tt) {
             cerr(ctx.exprs[e].line, "cannot use index on type " + tt)
@@ -6429,8 +6445,11 @@ fn check_expr(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, expected
             check_enum_variant(ctx, env, cur, e, expected, false)
         } else {
             let tt: str = check_expr(ctx, env, cur, ctx.exprs[e].left, "")
+            # Stage 27 perfection (v0.50.3-alpha) deep-scan-18: BUG-06 fix.
+            # Propagate `never` instead of erroring (bottom-type rule).
             if tt == "never" {
-                cerr(ctx.exprs[e].line, "never value cannot be used in expression")
+                ctx.exprs[e].t = "never"
+                return "never"
             }
             let st: StructInfo = resolve_struct(ctx, tt)
             if st.name == "" {
@@ -6498,8 +6517,15 @@ fn check_bin(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int) -> str {
     let mut line: int = ctx.exprs[e].line
     let lt: str = check_expr(ctx, env, cur, ctx.exprs[e].left, "")
     let rt: str = check_expr(ctx, env, cur, ctx.exprs[e].right, "")
+    # Stage 27 perfection (v0.50.3-alpha) deep-scan-18: BUG-06 fix.
+    # `never` is the bottom type — it should be compatible with every
+    # type (the rest of the expression is unreachable, e.g.
+    # `panic("...") + 1` is dead code after the panic). The previous
+    # code rejected `never` operands — a false positive that broke
+    # dead-code patterns. The fix: propagate `never` instead of
+    # erroring. Mirrors the boot checker fix in boot/checker.py.
     if lt == "never" || rt == "never" {
-        cerr(line, "never value cannot be used in expression")
+        return "never"
     }
     let op: str = ctx.exprs[e].op
     if op == "||" || op == "&&" {
@@ -7465,8 +7491,13 @@ fn check_method(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int) -> str
     let name: str = ctx.exprs[e].name
     let mut line: int = ctx.exprs[e].line
     let tt: str = check_expr(ctx, env, cur, ctx.exprs[e].left, "")
+    # Stage 27 perfection (v0.50.3-alpha) deep-scan-18: BUG-06 fix.
+    # Propagate `never` instead of erroring (bottom-type rule). A
+    # method call on a never-typed receiver is dead code (the receiver
+    # diverged) — the call result is also never.
     if tt == "never" {
-        cerr(line, "never value cannot be used in expression")
+        ctx.exprs[e].t = "never"
+        return "never"
     }
     let nargs: int = ctx.exprs[e].args.len()
     # User-defined struct method (resolve via base name).
@@ -8083,8 +8114,12 @@ fn check_match(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, expecte
 
 fn check_qmark(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, expected: str) -> str {
     let inner_t: str = check_expr(ctx, env, cur, ctx.exprs[e].left, "")
+    # Stage 27 perfection (v0.50.3-alpha) deep-scan-18: BUG-06 fix.
+    # Propagate `never` instead of erroring (bottom-type rule). A `?`
+    # on a never-typed expression is dead code (the expression diverged).
     if inner_t == "never" {
-        cerr(ctx.exprs[e].line, "never value cannot be used in expression")
+        ctx.exprs[e].t = "never"
+        return "never"
     }
     let ename: str = type_base(inner_t)
     if !ctx.enums.has(ename) {
@@ -9824,26 +9859,39 @@ fn is_ptr_type(t: str) -> bool {
 }
 
 fn box_fn_for(t: str) -> str {
-    if t == "int" {
+    # Stage 27 perfection (v0.50.3-alpha) deep-scan-18: BUG-01 fix.
+    # Strip the tainted[...] wrapper before dispatching. A tainted[int]
+    # is represented at the C level as int64_t (c_type unwraps taint),
+    # so its box/unbox helpers are the int helpers — NOT hl_box_ptr.
+    # Without this fix, list[tainted[int]].get(i) / chan[tainted[int]].send(v)
+    # / map[str, tainted[int]].get_or(...) emit hl_box_ptr / hl_unbox_ptr
+    # on a value that is semantically an int64_t — undefined behaviour
+    # (type punning through the wrong box field) and wrong values on any
+    # platform where the box layout differs between int and pointer slots.
+    let inner: str = strip_taint(t)
+    if inner == "int" {
         return "hl_box_i64"
     }
-    if t == "float" {
+    if inner == "float" {
         return "hl_box_f64"
     }
-    if t == "bool" {
+    if inner == "bool" {
         return "hl_box_bool"
     }
     return "hl_box_ptr"
 }
 
 fn gen_unbox(ctx: Ctx, t: str, cexpr: str) -> str {
-    if t == "int" {
+    # Stage 27 perfection (v0.50.3-alpha) deep-scan-18: BUG-01 fix.
+    # Mirror of box_fn_for — strip taint before dispatching.
+    let inner: str = strip_taint(t)
+    if inner == "int" {
         return "hl_unbox_i64(" + cexpr + ")"
     }
-    if t == "float" {
+    if inner == "float" {
         return "hl_unbox_f64(" + cexpr + ")"
     }
-    if t == "bool" {
+    if inner == "bool" {
         return "hl_unbox_bool(" + cexpr + ")"
     }
     return "(" + c_type(ctx, t) + ")hl_unbox_ptr(" + cexpr + ")"
@@ -12819,6 +12867,32 @@ fn gen_expr(ctx: Ctx, e: int) -> str {
 
 fn gen_bin(ctx: Ctx, e: int) -> str {
     let op: str = ctx.exprs[e].op
+    # Stage 27 perfection (v0.50.3-alpha) deep-scan-18: BUG-06 fix
+    # (codegen). If either operand has type `never` (e.g. `panic("...")`),
+    # the binop is dead code — the operand diverges. Emit just the
+    # diverging operand (which compiles to `hl_panic(...)` returning
+    # void) WITHOUT wrapping it in the binary operation — the C
+    # `+1`/`==`/etc on a void value would not compile. The `t` field
+    # of the binop expr is `never` (set by check_bin's propagation),
+    # so callers of gen_expr that consume this result are also dead
+    # code (the parent statement is unreachable).
+    let lt_check: str = ctx.exprs[ctx.exprs[e].left].t
+    let rt_check: str = ctx.exprs[ctx.exprs[e].right].t
+    if lt_check == "never" {
+        # The left operand diverges — emit it and stop.
+        let a_only: str = gen_expr(ctx, ctx.exprs[e].left)
+        return a_only
+    }
+    if rt_check == "never" {
+        # The right operand diverges — but we still need to emit the
+        # left operand first (it may have side effects). Use a GCC
+        # statement expression: ({ a; b; }) where the result type is
+        # `void` (matching the diverging b). The caller treats the
+        # binop result as dead code.
+        let a_val: str = gen_expr(ctx, ctx.exprs[e].left)
+        let b_val: str = gen_expr(ctx, ctx.exprs[e].right)
+        return "({ " + a_val + "; " + b_val + "; })"
+    }
     let t: str = ctx.exprs[ctx.exprs[e].left].t
     let a: str = gen_expr(ctx, ctx.exprs[e].left)
     if op == "||" || op == "&&" {

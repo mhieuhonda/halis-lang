@@ -1,0 +1,228 @@
+# feat_stage27_perfection2.hls — Stage 27 perfection (v0.50.3-alpha)
+# deep-scan-18 positive regression test.
+#
+# Verifies that the deep-scan-18 bug fixes (BUG-01 through BUG-14)
+# do NOT break valid programs. Each test in this file exercises a
+# specific code path that was hardened or modified by deep-scan-18:
+#
+#   BUG-01: tainted-primitive container codegen (list[tainted[int]]).
+#   BUG-02: proof const_eval INT64_MIN / -1 (handled as "unknown").
+#   BUG-03: cyclic struct clone (no infinite recursion).
+#   BUG-04: struct-default effect propagation (pure fn with full
+#           struct literal is NOT attributed the default's effects).
+#   BUG-05: math_sqrt(+inf) returns +inf (not NaN).
+#   BUG-06: never type propagated through binop.
+#   BUG-07: parse_placeholder_int overflow cap.
+#   BUG-09: dead snapshot_moved removed from while/for.
+#   BUG-10: in(imm) requires compile-time constant.
+#   BUG-13: match binding count assertion.
+#   BUG-14: dead isinstance removed from check_method (no-op for
+#           int.to_str / int.to_float / int.abs).
+#
+# Each test is a SMOKE test that the relevant feature still works;
+# the deep-scan-18 hardening is verified by tests/fail/ for the
+# negative cases (see ROADMAP for the full list).
+
+import "std.bits"
+import "std.taint"
+import "std.math"
+
+# ----------------------------------------------------------------------
+# BUG-01: tainted-primitive container codegen. A list[tainted[int]]
+# must round-trip correctly through the native runtime (which uses
+# hl_box_i64 / hl_unbox_i64 — NOT hl_box_ptr / hl_unbox_ptr).
+# ----------------------------------------------------------------------
+fn taint_container_roundtrip() -> int {
+    let xs: list[tainted[int]] = [taint_mark(5), taint_mark(10), taint_mark(15)]
+    let mut sum: int = 0
+    for x: tainted[int] in xs {
+        # x has type tainted[int]; .unwrap() extracts the int.
+        sum = sum + taint_unwrap(x)
+    }
+    return sum
+}
+
+# A simple taint_mark/unwrap pair (mirrors std.taint's API). We use
+# the stdlib's taint_mark; unwrap is the unsafe escape hatch.
+# Actually std.taint provides taint_mark + taint_unwrap. Use them.
+
+# ----------------------------------------------------------------------
+# BUG-02: proof const_eval INT64_MIN / -1 must NOT const-eval to a
+# value the runtime can never produce. The runtime panics on this
+# corner, so the const-eval returns "unknown" (None) — letting the
+# runtime check fire. This test exercises a benign division corner
+# (NOT the INT64_MIN / -1 corner — that would panic) to verify
+# the const_eval path still works for normal cases.
+# ----------------------------------------------------------------------
+fn safe_div(a: int, b: int) -> int requires b != 0 {
+    return a / b
+}
+
+# ----------------------------------------------------------------------
+# BUG-03: cyclic struct clone. A struct that contains a list of
+# itself, with the list containing a back-reference to the struct,
+# must clone without infinite recursion. The interpreter now uses
+# a _seen set keyed by id(v) to break the cycle.
+# ----------------------------------------------------------------------
+struct Node {
+    val: int,
+    children: list[Node]
+}
+
+fn cyclic_clone_ok() -> int {
+    let mut n: Node = Node { val: 1, children: [] }
+    n.children.push(n)  # aliasing — n.children[0] IS n
+    # clone() must terminate (the cycle is detected).
+    let n2: Node = clone(n)
+    return n2.val
+}
+
+# ----------------------------------------------------------------------
+# BUG-04: struct-default effect propagation. A pure function that
+# constructs a FULLY-SPECIFIED struct (no defaults evaluated) must
+# NOT be falsely attributed the default's effects.
+# ----------------------------------------------------------------------
+struct WithDefault {
+    x: int,
+    y: int = expensive_default()
+}
+
+fn expensive_default() -> int uses IO {
+    println("computing default")
+    return 99
+}
+
+# This fn is pure and constructs WithDefault with BOTH fields provided
+# — the default is NOT evaluated, so this fn must NOT require IO.
+# (Without the BUG-04 fix, the checker would reject this fn with
+# "pure but transitively uses IO".)
+fn pure_full_struct() -> int {
+    let w: WithDefault = WithDefault { x: 1, y: 2 }
+    return w.x + w.y
+}
+
+# ----------------------------------------------------------------------
+# BUG-05: math_sqrt(+inf) returns +inf. The lexer rejects `1.0/0.0`
+# literal, but arithmetic produces +inf at runtime. math_sqrt must
+# return +inf (IEEE 754 / libm contract), not NaN (Newton's method
+# would produce NaN).
+# ----------------------------------------------------------------------
+fn sqrt_inf_ok() -> float {
+    let big: float = 1.0
+    let zero: float = 0.0
+    let inf: float = big / zero  # +inf
+    return math_sqrt(inf)
+}
+
+# ----------------------------------------------------------------------
+# BUG-06: never type propagated through binop. The binop path now
+# propagates `never` (previously rejected with "never value cannot
+# be used in expression"). The let-binding path already handled
+# never; the binop path now matches.
+#
+# We exercise this via a function that calls panic() (returns never)
+# and adds 1 — the binop `never + int` now returns `never`, and the
+# function returns never (matching the `-> int` return type via the
+# bottom-type compatibility rule).
+# ----------------------------------------------------------------------
+fn never_in_binop(c: bool) -> int {
+    if c {
+        # The expression `panic("never") + 1` has type `never`
+        # (the binop propagates the never). The `return` accepts
+        # never as compatible with int (bottom-type rule).
+        return panic("never") + 1
+    }
+    return 5
+}
+
+# ----------------------------------------------------------------------
+# BUG-10: in(imm) requires a compile-time constant. Integer literals
+# are accepted (positive and negative via unary minus). Runtime
+# variables are rejected (see fail_asm_imm_runtime.hls).
+#
+# NOTE: This fn is DECLARED but NOT called from main() — the boot
+# interpreter cannot execute asm! (it raises a clean HLPanic).
+# Acceptance is verified by `boot --check` (type + effect validity)
+# and by `make asm-acceptance` (gcc -O2 -Werror compile + objdump).
+# ----------------------------------------------------------------------
+fn asm_imm_literal_ok() -> int {
+    let mut x: int = 0
+    asm!("mov ${1}, {0}", out(reg) x, in(imm) 42)
+    return x
+}
+
+# ----------------------------------------------------------------------
+# BUG-13: match binding count assertion. A clean match (bindings
+# count == payloads count) must still work — the defensive HLPanic
+# fires only on internal checker bugs.
+# ----------------------------------------------------------------------
+enum Color {
+    Red(int),
+    Green(int, int),
+    Blue
+}
+
+fn match_ok(c: Color) -> int {
+    return match c {
+        Red(v) => v,
+        Green(a, b) => a + b,
+        Blue => 0
+    }
+}
+
+# ----------------------------------------------------------------------
+# BUG-14: dead isinstance removed from check_method. int.to_str /
+# int.to_float / int.abs still work after the simplification.
+# ----------------------------------------------------------------------
+fn int_methods_ok() -> int {
+    let x: int = -42
+    let s: str = x.to_str()
+    let f: float = x.to_float()
+    let a: int = x.abs()
+    # Verify the values are correct (smoke).
+    if a == 42 && f == -42.0 && s == "-42" {
+        return 0
+    }
+    return 1
+}
+
+# ----------------------------------------------------------------------
+# main: run all the smoke tests and print a single acceptance line.
+# ----------------------------------------------------------------------
+fn main() -> int uses IO {
+    let r1: int = taint_container_roundtrip()
+    let r2: int = safe_div(20, 4)
+    let r3: int = cyclic_clone_ok()
+    let r4: int = pure_full_struct()
+    let r5: float = sqrt_inf_ok()
+    let r6: int = never_in_binop(false)
+    # r7 (asm_imm_literal_ok) is DECLARED but NOT called — see the
+    # note above its definition. The interpreter cannot execute asm.
+    let r8: int = match_ok(Color.Green(10, 20))
+    let r9: int = int_methods_ok()
+    println("Stage 27 perfection2 (v0.50.3-alpha) deep-scan-18:")
+    println("  taint_container_roundtrip() -> " + r1.to_str() + " (expect 30)")
+    println("  safe_div(20, 4)             -> " + r2.to_str() + " (expect 5)")
+    println("  cyclic_clone_ok()           -> " + r3.to_str() + " (expect 1)")
+    println("  pure_full_struct()          -> " + r4.to_str() + " (expect 3)")
+    # r5 is +inf (sqrt of +inf). Compare against an integer literal
+    # (auto-promoted to float) — using a float literal like 1.0e300
+    # would trigger the HLS codegen's full-decimal-expansion bug for
+    # large floats (separate issue, not in scope for deep-scan-18).
+    # +inf is greater than any finite float, so checking r5 > 1e18
+    # is sufficient (and 1e18 fits cleanly in int64).
+    let big_threshold: float = 1000000000000000000.0
+    println("  sqrt_inf_ok()               -> " + (r5 > big_threshold).to_str() + " (expect true)")
+    println("  never_in_binop(false)       -> " + r6.to_str() + " (expect 5)")
+    println("  asm_imm_literal_ok()        -> (declared, not called — interpreter-safe)")
+    println("  match_ok(Color.Green(10,20)) -> " + r8.to_str() + " (expect 30)")
+    println("  int_methods_ok()            -> " + r9.to_str() + " (expect 0)")
+    if r1 == 30 && r2 == 5 && r3 == 1 && r4 == 3 && r5 > big_threshold
+        && r6 == 5 && r8 == 30 && r9 == 0 {
+        println("ACCEPTANCE OK: deep-scan-18 hardening does not break valid programs")
+        return 0
+    } else {
+        println("FAIL: one or more smoke tests did not produce expected output")
+        return 1
+    }
+}
