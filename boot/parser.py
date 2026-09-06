@@ -118,6 +118,7 @@ class Parser:
             "inline": "",
             "hot": False,
             "cold": False,
+            "tail_call": False,
         }
 
     def parse_attributes(self):
@@ -131,11 +132,19 @@ class Parser:
             no_red_zone      - disable the x86-64 red zone
             irq_handler      - emit an IRET-compatible frame
             stack_size(N)    - assert the fn's frame is <= N bytes
+            tail_call        - Stage 31: assert every recursive call is
+                              in verified tail position (the codegen
+                              emits a parameter-rebinding goto — a jmp,
+                              not a call; the interpreter trampolines)
         Multiple `#[...]` lists may precede a single fn (each
         accumulates). `hot` and `cold` are mutually exclusive; likewise
-        `inline(always)` and `inline(never)`. The boot parser
-        validates these constraints and stores the result in
-        self.cur_attrs; the boot interpreter ignores them.
+        `inline(always)` and `inline(never)`. `tail_call` is mutually
+        exclusive with `irq_handler` (an interrupt frame must return
+        via IRETQ, never jump) and with `inline(always)` (the loop
+        transform and call-site inlining contradict each other). The
+        boot parser validates these constraints and stores the result
+        in self.cur_attrs; the boot interpreter consults tail_call
+        (the Stage 31 trampoline) and ignores the rest.
         """
         while self.at_sym("#"):
             t0 = self.next()  # consume '#'
@@ -153,6 +162,13 @@ class Parser:
                             and self.cur_attrs["inline"] != mode):
                         self.err("conflicting inline attributes (was '%s', "
                                  "now '%s')" % (self.cur_attrs["inline"], mode), t0)
+                    # Stage 31 (v0.48.0-alpha): inline(always) contradicts
+                    # the tail-call loop transform (order-independent
+                    # check — whichever attr is parsed first catches it).
+                    if mode == "always" and self.cur_attrs["tail_call"]:
+                        self.err("'tail_call' and 'inline(always)' are mutually "
+                                 "exclusive (a tail-call loop cannot also be "
+                                 "inlined at every call site)", t0)
                     self.cur_attrs["inline"] = mode
                 elif attr_name == "hot":
                     if self.cur_attrs["cold"]:
@@ -165,7 +181,28 @@ class Parser:
                 elif attr_name == "no_red_zone":
                     self.cur_attrs["no_red_zone"] = True
                 elif attr_name == "irq_handler":
+                    if self.cur_attrs["tail_call"]:
+                        self.err("'tail_call' and 'irq_handler' are mutually "
+                                 "exclusive (an interrupt frame must return "
+                                 "via IRETQ, never jump)", t0)
                     self.cur_attrs["irq_handler"] = True
+                elif attr_name == "tail_call":
+                    # Stage 31 (v0.48.0-alpha): verified tail-call
+                    # optimisation. The attribute is an ASSERTION: the
+                    # checker proves every recursive call sits in tail
+                    # position with no cleanup between the call and the
+                    # return; the self-hosted codegen lowers each
+                    # verified site to a parameter-rebinding goto, and
+                    # the interpreter mirrors it as a trampoline.
+                    if self.cur_attrs["irq_handler"]:
+                        self.err("'tail_call' and 'irq_handler' are mutually "
+                                 "exclusive (an interrupt frame must return "
+                                 "via IRETQ, never jump)", t0)
+                    if self.cur_attrs["inline"] == "always":
+                        self.err("'tail_call' and 'inline(always)' are mutually "
+                                 "exclusive (a tail-call loop cannot also be "
+                                 "inlined at every call site)", t0)
+                    self.cur_attrs["tail_call"] = True
                 elif attr_name == "stack_size":
                     self.eat_sym("(")
                     nt = self.peek()
@@ -191,7 +228,7 @@ class Parser:
                 else:
                     self.err("unknown attribute '%s' (known: inline(always), "
                              "inline(never), hot, cold, no_red_zone, "
-                             "irq_handler, stack_size(N))" % attr_name, t0)
+                             "irq_handler, stack_size(N), tail_call)" % attr_name, t0)
                 if self.at_sym(","):
                     self.next()
                 elif not self.at_sym("]"):
@@ -528,7 +565,8 @@ class Parser:
                 # interrupt frame layout etc. belong to the C side).
                 "attrs": {"stack_size": -1, "no_red_zone": False,
                           "irq_handler": False, "inline": "",
-                          "hot": False, "cold": False},
+                          "hot": False, "cold": False,
+                          "tail_call": False},
             }
         # Stage 17 (v0.28.0-alpha): optional contract clauses —
         # `requires <bool-expr>` then/and `ensures <bool-expr>`, parsed
@@ -683,6 +721,14 @@ class Parser:
                     if stack:
                         self.err("'stack' and 'boxed' are mutually exclusive", t0)
                     boxed = True
+                elif attr_name == "tail_call":
+                    # Stage 31 (v0.48.0-alpha): #[tail_call] is a
+                    # FUNCTION attribute — placing it before a let is a
+                    # clear user error; point them at the fn form.
+                    self.err("'tail_call' is a function attribute — place it "
+                             "directly before a 'fn' declaration (e.g. "
+                             "#[tail_call] fn fib_tail(n: int, a: int, "
+                             "b: int) -> int { ... })", t0)
                 else:
                     self.err("unknown let-binding attribute '%s' (known: "
                              "stack, boxed; function attributes go before "

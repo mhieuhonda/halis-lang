@@ -102,7 +102,18 @@ struct FnInfo {
     attr_hot: bool,
     # attr_cold: mark this function cold — overrides PGO. Emitted as
     # __attribute__((cold)). Mutually exclusive with attr_hot.
-    attr_cold: bool
+    attr_cold: bool,
+    # ---- Stage 31 (v0.48.0-alpha): verified tail-call optimisation ----
+    # attr_tail_call: #[tail_call] — assert that every recursive call
+    # to this function is in verified tail position (compile error if
+    # not). The codegen turns each such call into a parameter-rebinding
+    # `goto` back to the function entry (a jmp, not a call): stack usage
+    # is constant regardless of recursion depth. The verifier restricts
+    # the function to primitive (int/float/bool) parameters, return type
+    # and body dataflow, which makes "no cleanup needed between the call
+    # and the return" mechanically checkable — the transform is sound
+    # BY CONSTRUCTION, not by hoping the C compiler notices the tail call.
+    attr_tail_call: bool
 }
 
 struct MatchArm {
@@ -381,7 +392,27 @@ struct Ctx {
     # resolve the caller's same-named binding — wrong key, wrong layout.
     # Stack-layout codegen (and is_stack_var) is suppressed while > 0;
     # inlined bodies always use the (sound) heap layout.
-    in_inline_clone: int
+    in_inline_clone: int,
+    # ---- Stage 31 (v0.48.0-alpha): verified tail-call optimisation ----
+    # cur_attrs_tail_call: the parsed #[tail_call] attribute for the fn
+    # currently being parsed (consumed by parse_fn, reset by
+    # reset_cur_attrs so an un-attributed fn never inherits it).
+    cur_attrs_tail_call: bool,
+    # tail_label: the C label name of the tail-call loop entry while the
+    # codegen emits a #[tail_call] function body ("" otherwise). The
+    # return handler consults it: a verified tail self-call becomes a
+    # parameter-rebinding `goto <tail_label>` instead of a C call.
+    tail_label: str,
+    # tail_params: the C local names of the current #[tail_call] fn's
+    # parameters, in declaration order — the rebind targets of the
+    # generated tail-jump block. Set by gen_fn_body, cleared by
+    # gen_reset_fn (so an LTO inline clone generated after a tail fn
+    # can never see a stale label).
+    tail_params: list[str],
+    # tail_sites: fn key -> number of VERIFIED tail self-call sites
+    # (filled by tail_check_fn during checking; consulted by
+    # print_opt_stats for the Stage 31 decision report).
+    tail_sites: map[str, int]
 }
 
 fn new_ctx(src: str) -> Ctx {
@@ -418,7 +449,9 @@ fn new_ctx(src: str) -> Ctx {
         cur_let_stack: false, cur_let_boxed: false,
         layout_map: map_new(), layout_why: map_new(),
         layout_cap: map_new(), layout_order: [], layout_stack_n: 0,
-        in_inline_clone: 0
+        in_inline_clone: 0,
+        cur_attrs_tail_call: false, tail_label: "", tail_params: [],
+        tail_sites: map_new()
     }
 }
 
@@ -1185,6 +1218,9 @@ fn reset_cur_attrs(ctx: Ctx) -> void {
     ctx.cur_attrs_inline = ""
     ctx.cur_attrs_hot = false
     ctx.cur_attrs_cold = false
+    # Stage 31 (v0.48.0-alpha): reset the tail-call attribute too — an
+    # un-attributed fn never inherits the previous fn's #[tail_call].
+    ctx.cur_attrs_tail_call = false
     # Stage 30: let-binding attrs are reset by parse_let itself (they
     # apply to exactly one statement); also clear here for belt-and-
     # braces so no state leaks between declarations.
@@ -1203,11 +1239,17 @@ fn reset_cur_attrs(ctx: Ctx) -> void {
 #   no_red_zone      - Stage 28: disable the x86-64 red zone
 #   irq_handler      - Stage 28: emit an IRET-compatible frame
 #   stack_size(N)    - Stage 28: assert the fn's frame is <= N bytes
+#   tail_call        - Stage 31: assert every recursive call is in
+#                      verified tail position; the codegen emits a
+#                      parameter-rebinding goto (a jmp, not a call)
 #
 # Multiple `#[...]` lists may precede a single fn (each accumulates).
 # Within a single list, a duplicate attribute is a compile error.
 # `hot` and `cold` are mutually exclusive (compile error if both set).
 # `inline(always)` and `inline(never)` are mutually exclusive.
+# `tail_call` is mutually exclusive with `irq_handler` (an interrupt
+# frame must return via IRETQ, not jump) and with `inline(always)`
+# (the loop transform and call-site inlining contradict each other).
 fn parse_attributes(ctx: Ctx) -> void {
     while at_sym(ctx, "#") {
         let hash_tok: Tok = ctx.toks.get(ctx.pos)
@@ -1226,6 +1268,12 @@ fn parse_attributes(ctx: Ctx) -> void {
                 if ctx.cur_attrs_inline != "" && ctx.cur_attrs_inline != mode {
                     perr_at(ctx, "conflicting inline attributes (was '" + ctx.cur_attrs_inline + "', now '" + mode + "')", hash_tok)
                 }
+                # Stage 31: inline(always) contradicts the tail-call loop
+                # transform (order-independent check — whichever attr is
+                # parsed first catches the conflict here).
+                if mode == "always" && ctx.cur_attrs_tail_call {
+                    perr_at(ctx, "'tail_call' and 'inline(always)' are mutually exclusive (a tail-call loop cannot also be inlined at every call site)", hash_tok)
+                }
                 ctx.cur_attrs_inline = mode
             } else if attr_name == "hot" {
                 if ctx.cur_attrs_cold {
@@ -1240,7 +1288,24 @@ fn parse_attributes(ctx: Ctx) -> void {
             } else if attr_name == "no_red_zone" {
                 ctx.cur_attrs_no_red_zone = true
             } else if attr_name == "irq_handler" {
+                if ctx.cur_attrs_tail_call {
+                    perr_at(ctx, "'tail_call' and 'irq_handler' are mutually exclusive (an interrupt frame must return via IRETQ, never jump)", hash_tok)
+                }
                 ctx.cur_attrs_irq_handler = true
+            } else if attr_name == "tail_call" {
+                # Stage 31 (v0.48.0-alpha): verified tail-call optimisation.
+                # The attribute is an ASSERTION: the checker proves every
+                # recursive call sits in tail position with no cleanup
+                # between the call and the return, and the codegen lowers
+                # each verified site to a parameter-rebinding goto —
+                # constant stack at any recursion depth.
+                if ctx.cur_attrs_irq_handler {
+                    perr_at(ctx, "'tail_call' and 'irq_handler' are mutually exclusive (an interrupt frame must return via IRETQ, never jump)", hash_tok)
+                }
+                if ctx.cur_attrs_inline == "always" {
+                    perr_at(ctx, "'tail_call' and 'inline(always)' are mutually exclusive (a tail-call loop cannot also be inlined at every call site)", hash_tok)
+                }
+                ctx.cur_attrs_tail_call = true
             } else if attr_name == "stack_size" {
                 eat_sym(ctx, "(")
                 let nt: Tok = ctx.toks.get(ctx.pos)
@@ -1264,7 +1329,7 @@ fn parse_attributes(ctx: Ctx) -> void {
                 # them at the let statement form.
                 perr_at(ctx, "'" + attr_name + "' is a let-binding attribute — place it inside a function, directly before a 'let' statement (e.g. #[" + attr_name + "] let xs: list[int] = [1, 2, 3])", hash_tok)
             } else {
-                perr_at(ctx, "unknown attribute '" + attr_name + "' (known: inline(always), inline(never), hot, cold, no_red_zone, irq_handler, stack_size(N))", hash_tok)
+                perr_at(ctx, "unknown attribute '" + attr_name + "' (known: inline(always), inline(never), hot, cold, no_red_zone, irq_handler, stack_size(N), tail_call)", hash_tok)
             }
             if at_sym(ctx, ",") {
                 ctx.pos = ctx.pos + 1
@@ -1557,7 +1622,8 @@ fn parse_fn(ctx: Ctx, impl_struct: str) -> FnInfo {
         attr_irq_handler: ctx.cur_attrs_irq_handler,
         attr_inline: ctx.cur_attrs_inline,
         attr_hot: ctx.cur_attrs_hot,
-        attr_cold: ctx.cur_attrs_cold
+        attr_cold: ctx.cur_attrs_cold,
+        attr_tail_call: ctx.cur_attrs_tail_call
     }
 }
 
@@ -1720,7 +1786,8 @@ fn parse_extern_block(ctx: Ctx) -> void {
             line: ft0.line, is_extern: true,
             requires_e: contracts_ext.get(0), ensures_e: contracts_ext.get(1),
             attr_stack_size: -1, attr_no_red_zone: false, attr_irq_handler: false,
-            attr_inline: "", attr_hot: false, attr_cold: false
+            attr_inline: "", attr_hot: false, attr_cold: false,
+            attr_tail_call: false
         })
         ctx.fn_order.push(name)
     }
@@ -1907,6 +1974,11 @@ fn parse_let_attrs(ctx: Ctx) -> void {
                     perr_at(ctx, "'stack' and 'boxed' are mutually exclusive", hash_tok)
                 }
                 ctx.cur_let_boxed = true
+            } else if attr_name == "tail_call" {
+                # Stage 31 (v0.48.0-alpha): #[tail_call] is a FUNCTION
+                # attribute — placing it before a let is a clear user
+                # error; point them at the fn declaration form.
+                perr_at(ctx, "'tail_call' is a function attribute — place it directly before a 'fn' declaration (e.g. #[tail_call] fn fib_tail(n: int, a: int, b: int) -> int { ... })", hash_tok)
             } else {
                 perr_at(ctx, "unknown let-binding attribute '" + attr_name + "' (known: stack, boxed; function attributes go before a fn declaration)", hash_tok)
             }
@@ -3355,6 +3427,267 @@ fn esc_expr(ctx: Ctx, e: int, recs: list[EscRec], safe: bool, why: str) -> void 
     }
 }
 
+# ============================================================================
+# STAGE 31 (v0.48.0-alpha): verified tail-call optimisation — VERIFIER
+# ============================================================================
+# #[tail_call] on a function asserts that every recursive call to it is
+# in VERIFIED tail position. "Verified" is a concrete, mechanical claim:
+#
+#   1. Position — every self-call must be the ENTIRE return expression
+#      (`return f(...)`), never nested inside an operator, an argument,
+#      a let binding or a discarded expression statement.
+#
+#   2. No cleanup — nothing needing release may be created between the
+#      (transformed) call and the function entry. The goto-based loop
+#      would skip any __attribute__((cleanup)) variable declared in the
+#      body, so the verifier proves the body CANNOT contain one:
+#        * parameters, return type and every let binding are
+#          int / float / bool (never refcounted);
+#        * every expression in the body is primitive-typed — the ONLY
+#          exception is a string LITERAL passed directly to
+#          panic / print / println (consume-builtins: the argument is
+#          transferred, never hoisted, never bound).
+#
+# Together these make the C-level transform sound BY CONSTRUCTION:
+# at the tail site the codegen evaluates the argument expressions into
+# fresh temps (in order), rebinds the parameter locals, and jumps to
+# the function entry label. No call, no stack growth, no cleanup debt.
+#
+# The interpreter mirrors the same transform as a trampoline
+# (boot/interp.py): a tail `return f(...)` raises TailCallSig, call_fn
+# rebinds the parameters and re-runs the body in the SAME Python frame.
+
+# tail_prim_t: the types a #[tail_call] function may flow through.
+fn tail_prim_t(t: str) -> bool {
+    return t == "int" || t == "float" || t == "bool"
+}
+
+# tail_is_self_call: is expression e a direct call to fn `key`?
+fn tail_is_self_call(ctx: Ctx, e: int, key: str) -> bool {
+    if e < 0 {
+        return false
+    }
+    let n: ExprN = ctx.exprs[e]
+    if n.kind != "call" {
+        return false
+    }
+    return n.muser && n.mkey == key
+}
+
+# tail_check_expr: verify one expression subtree of a #[tail_call] fn.
+# Every reachable node must be primitive-typed (void/never allowed for
+# statement-level calls); a self-call OUTSIDE a return value is the
+# "not in tail position" error. panic/print/println accept exactly one
+# string LITERAL argument (the consume-builtin exception).
+fn tail_check_expr(ctx: Ctx, e: int, key: str) -> void {
+    if e < 0 {
+        return
+    }
+    let n: ExprN = ctx.exprs[e]
+    if n.kind == "int" || n.kind == "float" || n.kind == "bool" || n.kind == "ident" {
+        return
+    }
+    if n.kind == "str" {
+        cerr(n.line, "#[tail_call] violated: '" + key + "' cannot use string values (line " + n.line.to_str() + ") — only int / float / bool may flow through a tail-call function (a string would need release at the loop jump; string LITERALS are only allowed as the direct argument of panic / print / println)")
+        return
+    }
+    if n.kind == "call" {
+        # A self-call outside a return-value position is never tail.
+        if n.muser && n.mkey == key {
+            cerr(n.line, "#[tail_call] violated: the recursive call to '" + key + "' at line " + n.line.to_str() + " is not in tail position — every recursive call must be the entire return expression (`return " + key + "(...)`)")
+            return
+        }
+        # Consume-builtin exception: panic / print / println with ONE
+        # string literal argument (never hoisted, never bound, released
+        # by the callee — provably cleanup-free at the jump).
+        if !n.muser && (n.mkey == "panic" || n.mkey == "print" || n.mkey == "println") {
+            let mut ok: bool = n.args.len() == 1
+            if ok {
+                let a: ExprN = ctx.exprs[n.args.get(0)]
+                ok = a.kind == "str"
+            }
+            if !ok {
+                cerr(n.line, "#[tail_call] violated: the " + n.mkey + " call at line " + n.line.to_str() + " must take exactly one string LITERAL — a computed string would create a refcounted temporary needing cleanup between the tail call and the jump")
+            }
+            return
+        }
+        # Any other call: the RESULT must be primitive (or void/never
+        # for statement position), then walk the arguments.
+        if n.t != "void" && n.t != "never" && !tail_prim_t(n.t) {
+            cerr(n.line, "#[tail_call] violated: '" + key + "' contains a non-primitive expression of type '" + n.t + "' (line " + n.line.to_str() + ") — only int / float / bool values may flow through a tail-call function (refcounted values would need cleanup between the tail call and the jump)")
+            return
+        }
+        let mut i: int = 0
+        while i < n.args.len() {
+            tail_check_expr(ctx, n.args.get(i), key)
+            i = i + 1
+        }
+        return
+    }
+    if n.kind == "method" {
+        if n.t != "void" && n.t != "never" && !tail_prim_t(n.t) {
+            cerr(n.line, "#[tail_call] violated: '" + key + "' contains a non-primitive expression of type '" + n.t + "' (line " + n.line.to_str() + ") — only int / float / bool values may flow through a tail-call function")
+            return
+        }
+        tail_check_expr(ctx, n.left, key)
+        let mut j: int = 0
+        while j < n.args.len() {
+            tail_check_expr(ctx, n.args.get(j), key)
+            j = j + 1
+        }
+        return
+    }
+    # Every other node kind: the node's own type must be primitive.
+    if n.t != "void" && n.t != "never" && !tail_prim_t(n.t) {
+        cerr(n.line, "#[tail_call] violated: '" + key + "' contains a non-primitive expression of type '" + n.t + "' (line " + n.line.to_str() + ") — only int / float / bool values may flow through a tail-call function (refcounted values would need cleanup between the tail call and the jump)")
+        return
+    }
+    if n.left >= 0 {
+        tail_check_expr(ctx, n.left, key)
+    }
+    if n.right >= 0 {
+        tail_check_expr(ctx, n.right, key)
+    }
+    # Match arms: the scrutinee (left) already forces an enum — never
+    # primitive, so a match is always rejected — but walk the arm
+    # BODIES too so a self-call nested in an arm can never slip past
+    # the position check (mirror-parity with the boot checker, and
+    # future-proof if match-on-int ever lands).
+    if n.kind == "match" {
+        let mut ai: int = 0
+        while ai < n.args.len() {
+            let arm: MatchArm = ctx.match_arms.get(n.args.get(ai))
+            if arm.body >= 0 {
+                tail_check_expr(ctx, arm.body, key)
+            }
+            ai = ai + 1
+        }
+    }
+    let mut k: int = 0
+    while k < n.args.len() {
+        tail_check_expr(ctx, n.args.get(k), key)
+        k = k + 1
+    }
+}
+
+# tail_check_stmts / tail_check_stmt: walk the body. Return statements
+# with a self-call VALUE are the verified tail sites (counted); every
+# other statement's expressions go through tail_check_expr.
+fn tail_check_stmts(ctx: Ctx, stmts: list[int], key: str, mut sites: int) -> int {
+    let mut i: int = 0
+    while i < stmts.len() {
+        sites = tail_check_stmt(ctx, stmts.get(i), key, sites)
+        i = i + 1
+    }
+    return sites
+}
+
+fn tail_check_stmt(ctx: Ctx, sidx: int, key: str, mut sites: int) -> int {
+    if sidx < 0 {
+        return sites
+    }
+    let s: StmtN = ctx.stmts.get(sidx)
+    if s.kind == "return" {
+        if s.value != -1 {
+            if tail_is_self_call(ctx, s.value, key) {
+                # The verified tail site. Its ARGUMENTS still go through
+                # the primitive-dataflow check (they are re-evaluated
+                # into temps at the jump).
+                let n: ExprN = ctx.exprs[s.value]
+                let mut i: int = 0
+                while i < n.args.len() {
+                    tail_check_expr(ctx, n.args.get(i), key)
+                    i = i + 1
+                }
+                sites = sites + 1
+            } else {
+                tail_check_expr(ctx, s.value, key)
+            }
+        }
+        return sites
+    }
+    if s.kind == "let" {
+        if !tail_prim_t(s.vtype) {
+            cerr(s.line, "#[tail_call] violated: '" + key + "' cannot bind non-primitive values — `let " + s.name + ": " + s.vtype + "` at line " + s.line.to_str() + ". A refcounted binding would need release at the loop jump, which the verified transform forbids (keep the body to int / float / bool)")
+        }
+        tail_check_expr(ctx, s.value, key)
+        return sites
+    }
+    if s.kind == "assign" {
+        tail_check_expr(ctx, s.target, key)
+        tail_check_expr(ctx, s.value, key)
+        return sites
+    }
+    if s.kind == "if" {
+        tail_check_expr(ctx, s.cond, key)
+        sites = tail_check_stmts(ctx, s.body, key, sites)
+        sites = tail_check_stmts(ctx, s.else_body, key, sites)
+        return sites
+    }
+    if s.kind == "while" {
+        tail_check_expr(ctx, s.cond, key)
+        sites = tail_check_stmts(ctx, s.body, key, sites)
+        return sites
+    }
+    if s.kind == "for" {
+        # for-in iterates a list — never primitive. Report at the iter.
+        tail_check_expr(ctx, s.iter, key)
+        sites = tail_check_stmts(ctx, s.body, key, sites)
+        return sites
+    }
+    if s.kind == "expr" {
+        tail_check_expr(ctx, s.e, key)
+        return sites
+    }
+    # break / continue / anything else: no expressions.
+    return sites
+}
+
+# tail_check_fn: the Stage 31 entry point — verify one #[tail_call] fn.
+fn tail_check_fn(ctx: Ctx, key: str) -> void {
+    let f: FnInfo = ctx.fns.get_or(key, dummy_fn())
+    if !f.attr_tail_call {
+        return
+    }
+    if f.is_extern {
+        cerr(f.line, "#[tail_call] cannot be applied to an extern function")
+        return
+    }
+    if f.is_method {
+        cerr(f.line, "#[tail_call] is not supported on methods yet ('" + f.name + "' is a method of '" + f.struct_of + "')")
+        return
+    }
+    if f.typeparams.len() > 0 {
+        cerr(f.line, "#[tail_call] is not supported on generic functions yet ('" + f.name + "' has type parameters) — instantiate a concrete wrapper instead")
+        return
+    }
+    if f.requires_e != -1 || f.ensures_e != -1 {
+        cerr(f.line, "#[tail_call] and contracts (requires / ensures) are mutually exclusive on '" + f.name + "' — the postcondition check would interpose cleanup between the tail call and the jump")
+        return
+    }
+    # Parameters: primitive only. The transform rebinds them in place;
+    # a refcounted parameter would need release at the jump.
+    let mut pi: int = 0
+    while pi < f.ptypes.len() {
+        let pt: str = f.ptypes.get(pi)
+        if !tail_prim_t(pt) {
+            cerr(f.line, "#[tail_call] on '" + f.name + "' requires all parameters to be int / float / bool; parameter '" + f.params.get(pi) + ": " + pt + "' is not — refcounted values would need cleanup between the tail call and the jump, which the verified transform forbids")
+        }
+        pi = pi + 1
+    }
+    # Return type: the loop feeds a value back; void has nothing to feed.
+    if !tail_prim_t(f.ret) {
+        cerr(f.line, "#[tail_call] on '" + f.name + "' requires the return type to be int / float / bool, not '" + f.ret + "' (a tail call must feed a value back through the loop)")
+    }
+    # Body: position + dataflow verification.
+    let sites: int = tail_check_stmts(ctx, f.body, key, 0)
+    if sites == 0 {
+        cerr(f.line, "#[tail_call] on '" + f.name + "' found no recursive call to itself — remove the attribute (the tail-call transform needs a self-call to turn into a loop)")
+        return
+    }
+    ctx.tail_sites.set(key, sites)
+}
+
 fn check_program(ctx: Ctx) -> void {
     # 1. struct: field types
     let keys_s: list[str] = ctx.structs.keys()
@@ -3508,6 +3841,18 @@ fn check_program(ctx: Ctx) -> void {
     while xi < ctx.fn_order.len() {
         escape_check_fn(ctx, ctx.fn_order.get(xi))
         xi = xi + 1
+    }
+    # 5.6 Stage 31 (v0.48.0-alpha): verified tail-call optimisation.
+    # Runs after the bodies are checked (the walker reads the expression
+    # TYPES the checker annotated and the mkey tags check_call set).
+    # Verifies every #[tail_call] fn: tail position of every self-call,
+    # primitive-only dataflow (the "no cleanup needed between the call
+    # and the return" proof), and records the verified site count for
+    # the --opt-stats report.
+    let mut ti: int = 0
+    while ti < ctx.fn_order.len() {
+        tail_check_fn(ctx, ctx.fn_order.get(ti))
+        ti = ti + 1
     }
     # 6. effects analysis
     check_effects(ctx)
@@ -3691,7 +4036,8 @@ fn dummy_fn() -> FnInfo {
         typeparams: [], line: 0, is_extern: false,
         requires_e: -1, ensures_e: -1,
         attr_stack_size: -1, attr_no_red_zone: false, attr_irq_handler: false,
-        attr_inline: "", attr_hot: false, attr_cold: false
+        attr_inline: "", attr_hot: false, attr_cold: false,
+        attr_tail_call: false
     }
 }
 
@@ -10977,6 +11323,17 @@ fn lto_can_inline(ctx: Ctx, key: str) -> bool {
     if f.attr_inline == "never" {
         return false
     }
+    # Stage 31 (v0.48.0-alpha): #[tail_call] functions are NEVER
+    # inlined. Their bodies contain the label + parameter-rebinding
+    # goto of the tail-call loop: splicing that body into a caller
+    # would (a) duplicate the label across two inline expansions (a C
+    # compile error) and (b) turn the constant-stack loop back into
+    # call machinery. Every call site stays out-of-line — which also
+    # keeps lto_calls[key] >= 1, so phase-B DCE can never drop the
+    # standalone body that contains the loop.
+    if f.attr_tail_call {
+        return false
+    }
     # Contracted functions keep their standalone bodies (the requires /
     # ensures checks and -O fast elisions interplay with the fn boundary;
     # inlining them is deferred).
@@ -12460,6 +12817,39 @@ fn gen_qmark_expr(ctx: Ctx, e: int) -> str {
 
 # --- C statement generation ---
 
+# gen_tail_jump (Stage 31, v0.48.0-alpha): lower one VERIFIED tail
+# self-call to the constant-stack loop jump. The verifier already
+# proved (a) this expression is the entire return value of a
+# #[tail_call] fn and (b) every argument is primitive-typed. The
+# emission mirrors a call's evaluation order exactly:
+#   1. every argument expression is evaluated into a fresh temp,
+#      left to right (side effects + panics happen in source order);
+#   2. the parameter locals are rebound from the temps (plain copies —
+#      no refcounts, no aliasing);
+#   3. `goto hl_tail_restart` — a jmp, not a call. The frame never
+#      grows: fib_tail(1_000_000) uses the same stack as fib_tail(1).
+fn gen_tail_jump(ctx: Ctx, e: int, ind: str) -> void {
+    let f: FnInfo = ctx.fns.get_or(ctx.cur_fn, dummy_fn())
+    let n: ExprN = ctx.exprs[e]
+    ctx.out.push(ind + "{")
+    let temps: list[str] = []
+    let mut i: int = 0
+    while i < n.args.len() {
+        let tmp: str = fresh_tmp(ctx, "hlc_tc")
+        temps.push(tmp)
+        ctx.out.push(ind + "    " + c_type(ctx, f.ptypes.get(i)) + " " + tmp
+            + " = " + gen_expr(ctx, n.args.get(i)) + ";")
+        i = i + 1
+    }
+    let mut j: int = 0
+    while j < temps.len() {
+        ctx.out.push(ind + "    " + ctx.tail_params.get(j) + " = " + temps.get(j) + ";")
+        j = j + 1
+    }
+    ctx.out.push(ind + "    goto " + ctx.tail_label + ";")
+    ctx.out.push(ind + "}")
+}
+
 fn gen_stmt(ctx: Ctx, sidx: int, ind: str) -> void {
     let s: StmtN = ctx.stmts[sidx]
     if s.kind == "let" {
@@ -12711,6 +13101,13 @@ fn gen_stmt(ctx: Ctx, sidx: int, ind: str) -> void {
     } else if s.kind == "return" {
         if s.value == -1 {
             ctx.out.push(ind + "return;")
+        } else if ctx.tail_label != "" && tail_is_self_call(ctx, s.value, ctx.cur_fn) {
+            # Stage 31 (v0.48.0-alpha): #[tail_call] — a VERIFIED tail
+            # self-call. The checker proved this expression is the
+            # entire return value and the body needs no cleanup at the
+            # jump, so lower it to the parameter-rebinding loop jump
+            # instead of a C call (constant stack at any depth).
+            gen_tail_jump(ctx, s.value, ind)
         } else {
             # BUG-004 fix: if the return value expression is `never`-typed
             # (e.g. `return panic("...")` or `return match_all_never`),
@@ -12893,6 +13290,11 @@ fn gen_reset_fn(ctx: Ctx) -> void {
     ctx.hoist_map = map_new()
     ctx.null_after = []
     ctx.cur_fn = ""
+    # Stage 31 (v0.48.0-alpha): clear the tail-call codegen state — the
+    # next function starts with no loop label and no rebind targets (an
+    # LTO inline clone generated afterwards can never see a stale label).
+    ctx.tail_label = ""
+    ctx.tail_params = []
     # Stage 19 (v0.35.0-alpha): reset the per-function branch / loop
     # site-id sequence numbers (site ids embed them: b:<fn>:<n>).
     ctx.pgo_fn_branch_n = 0
@@ -13097,6 +13499,24 @@ fn gen_fn_body(ctx: Ctx, key: str) -> void {
         let rc: str = gen_expr(ctx, f.requires_e)
         ctx.out.push("    if (!(" + rc + ")) hl_die(\"contract violation: requires of '"
             + f.name + "' (function precondition failed at runtime)\");")
+    }
+    # Stage 31 (v0.48.0-alpha): #[tail_call] — the loop entry. The
+    # verifier proved the body flows only int / float / bool values
+    # (plus consume-builtin string literals), so nothing between this
+    # label and any goto below carries a cleanup attribute. A verified
+    # tail self-call rebinds the parameter locals and jumps here:
+    # a jmp, not a call — stack usage is constant at any recursion
+    # depth. The label sits AFTER the param locals / PGO entry counter
+    # / requires check so those run once per REAL entry, not per loop
+    # iteration (the PGO entry counter keeps counting function
+    # entries, which is exactly what a profile should count).
+    if f.attr_tail_call {
+        ctx.tail_label = "hl_tail_restart"
+        ctx.tail_params = param_local_names
+        ctx.out.push("hl_tail_restart:;")
+    } else {
+        ctx.tail_label = ""
+        ctx.tail_params = []
     }
     gen_stmts(ctx, f.body, "    ")
     ctx.out.push("}")
@@ -14583,6 +15003,8 @@ fn print_opt_stats(ctx: Ctx) -> void uses IO {
     let mut irq_n: int = 0
     let mut no_red_zone_n: int = 0
     let mut stack_size_n: int = 0
+    let mut tail_call_n: int = 0
+    let mut tail_site_n: int = 0
     let mut pgo_hot_n: int = 0
     let mut pgo_cold_n: int = 0
     let mut pgo_inline_n: int = 0
@@ -14613,6 +15035,11 @@ fn print_opt_stats(ctx: Ctx) -> void uses IO {
         if f.attr_stack_size >= 0 {
             stack_size_n = stack_size_n + 1
         }
+        # Stage 31 (v0.48.0-alpha): verified tail-call functions.
+        if f.attr_tail_call {
+            tail_call_n = tail_call_n + 1
+            tail_site_n = tail_site_n + ctx.tail_sites.get_or(key, 0)
+        }
         if f.attr_inline == "" && pgo_fn_is_hot(ctx, key) {
             pgo_hot_n = pgo_hot_n + 1
         }
@@ -14633,6 +15060,7 @@ fn print_opt_stats(ctx: Ctx) -> void uses IO {
     println("  #[irq_handler]     annotations: " + irq_n.to_str())
     println("  #[no_red_zone]     annotations: " + no_red_zone_n.to_str())
     println("  #[stack_size(N)]   annotations: " + stack_size_n.to_str())
+    println("  #[tail_call]       annotations: " + tail_call_n.to_str() + " (verified sites: " + tail_site_n.to_str() + ", stack O(1))")
     if pgo_has_profile(ctx) {
         println("  PGO-derived hot (no annotation): " + pgo_hot_n.to_str())
         println("  PGO-derived cold (no annotation): " + pgo_cold_n.to_str())
@@ -14730,13 +15158,18 @@ fn print_opt_stats(ctx: Ctx) -> void uses IO {
         if f.attr_stack_size >= 0 {
             frame_col = frame_col + "stack<=" + f.attr_stack_size.to_str()
         }
+        if f.attr_tail_call {
+            let tc_n: int = ctx.tail_sites.get_or(key, 0)
+            frame_col = frame_col + "tail(" + tc_n.to_str() + ")"
+        }
         if frame_col == "" {
             frame_col = "-"
         }
         # source column (annotation vs PGO vs heuristic)
         let mut source_col: str = ""
         if f.attr_inline != "" || f.attr_hot || f.attr_cold
-            || f.attr_irq_handler || f.attr_no_red_zone || f.attr_stack_size >= 0 {
+            || f.attr_irq_handler || f.attr_no_red_zone || f.attr_stack_size >= 0
+            || f.attr_tail_call {
             source_col = "annotated"
         } else if pgo_fn_is_hot(ctx, key) || pgo_fn_is_cold(ctx, key) || pgo_fn_inline(ctx, key) {
             source_col = "PGO"
@@ -14750,6 +15183,31 @@ fn print_opt_stats(ctx: Ctx) -> void uses IO {
         println("    " + padded_name + "  " + padded_inline + "  "
             + padded_hotcold + "  " + padded_frame + "  " + source_col)
         j = j + 1
+    }
+    # Stage 31 (v0.48.0-alpha): the verified tail-call decision table.
+    # One row per #[tail_call] function: the number of VERIFIED tail
+    # sites (each lowered to a parameter-rebinding goto — a jmp, not a
+    # call), the parameter count, and the return type.
+    if tail_call_n > 0 {
+        println("")
+        println("  verified tail calls (Stage 31):")
+        println("    name                          sites   params  ret      stack")
+        println("    ----                          -----   ------  ---      -----")
+        let mut tj: int = 0
+        while tj < ctx.fn_order.len() {
+            let key: str = ctx.fn_order.get(tj)
+            let f: FnInfo = ctx.fns.get_or(key, dummy_fn())
+            if f.attr_tail_call {
+                let tc_n: int = ctx.tail_sites.get_or(key, 0)
+                let padded_tname: str = pad_right(key, 29)
+                let padded_tsites: str = pad_right(tc_n.to_str(), 6)
+                let padded_tparams: str = pad_right(f.params.len().to_str(), 7)
+                let padded_tret: str = pad_right(f.ret, 8)
+                println("    " + padded_tname + "  " + padded_tsites + " "
+                    + padded_tparams + " " + padded_tret + " constant")
+            }
+            tj = tj + 1
+        }
     }
     # Stage 30 (v0.47.0-alpha): the per-binding list-layout decision
     # table. One row per tracked binding, in discovery order: the

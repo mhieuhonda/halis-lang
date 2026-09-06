@@ -101,6 +101,26 @@ class ReturnSig(Exception):
         self.value = value
 
 
+class TailCallSig(Exception):
+    """Stage 31 (v0.48.0-alpha): a VERIFIED tail self-call raised by the
+    return handler of a #[tail_call] function. call_fn catches it,
+    rebinds the parameters and re-runs the body in the SAME Python
+    frame — the interpreter-side mirror of the native parameter-
+    rebinding goto. A 1,000,000-deep tail recursion costs ZERO Python
+    stack frames.
+
+    Only self-calls raise it (the return handler checks the call target
+    against the fn on top of the thread-local fn stack), so tc.key is
+    always the currently-executing function.
+    """
+
+    def __init__(self, key, args, line=0):
+        super().__init__("tail call to %s" % key)
+        self.key = key
+        self.args = args
+        self.line = line
+
+
 class BreakSig(Exception):
     pass
 
@@ -523,7 +543,7 @@ def _cpu_supports(feat):
     except OSError:
         return False
     return (" %s " % feat) in (" %s " % flags.replace(",", " ")
-                               .replace("	", " ").replace(":", " "))
+                               .replace("       ", " ").replace(":", " "))
 
 
 class Interp:
@@ -544,6 +564,11 @@ class Interp:
         # giving each thread its own view.
         self._tls = threading.local()
         self._tls.line = 0
+        # Stage 31 (v0.48.0-alpha): thread-local stack of fn keys —
+        # the return handler consults the top entry to detect a tail
+        # SELF-call inside a #[tail_call] fn. Thread-local because tasks
+        # run on real Python threads (same discipline as `line`).
+        self._tls.fn_stack = []
         # Stage 17 (v0.28.0-alpha): runtime contract checking mode.
         # When True, `requires` is asserted at every fn entry and
         # `ensures` at every return (violations are clean panics).
@@ -589,41 +614,73 @@ class Interp:
         # Stage 15 (v0.13.0-alpha): extern fn — call via ctypes.
         if fn.get("extern", False):
             return self.call_extern(fn, args)
-        env = [{}]
-        if fn["struct"] is not None:
-            sn, _, sm = fn["params"][0]
-            env[0][sn] = [args[0], sm, False]
-            params = fn["params"][1:]
-            args = args[1:]
-        else:
-            params = fn["params"]
-        for (pn, _, _), v in zip(params, args):
-            env[0][pn] = [v, False, False]
-        # Stage 17: runtime `requires` assertion (enabled by --contracts).
-        if self.contracts and fn.get("requires") is not None:
-            if not self._truthy(self.eval_expr(fn["requires"], env)):
-                raise HLPanic("contract violation: requires of '%s' "
-                              "(function precondition failed at runtime)"
-                              % fn["name"], self.line)
-        try:
-            self.exec_stmts(fn["body"], env)
-        except ReturnSig as r:
-            # Stage 17: runtime `ensures` assertion (enabled by --contracts).
+        # Stage 31 (v0.48.0-alpha): #[tail_call] trampoline. The checker
+        # verified every self-call is in tail position with primitive-
+        # only dataflow, so a tail `return f(...)` arrives here as
+        # TailCallSig: rebind the parameters and re-run the body in the
+        # SAME Python frame (constant Python stack, mirroring the
+        # native goto loop). The fn-key stack is pushed per iteration
+        # so nested (non-tail) calls from the body still resolve the
+        # correct "current fn".
+        while True:
+            env = [{}]
+            if fn["struct"] is not None:
+                sn, _, sm = fn["params"][0]
+                env[0][sn] = [args[0], sm, False]
+                params = fn["params"][1:]
+                call_args = args[1:]
+            else:
+                params = fn["params"]
+                call_args = args
+            for (pn, _, _), v in zip(params, call_args):
+                env[0][pn] = [v, False, False]
+            # Stage 17: runtime `requires` assertion (enabled by --contracts).
+            if self.contracts and fn.get("requires") is not None:
+                if not self._truthy(self.eval_expr(fn["requires"], env)):
+                    raise HLPanic("contract violation: requires of '%s' "
+                                  "(function precondition failed at runtime)"
+                                  % fn["name"], self.line)
+            try:
+                # Stage 31: lazily create the thread-local fn stack — a
+                # TASK thread starts inside the spawn trampoline and
+                # never passes through __init__, so its fresh
+                # threading.local() has no fn_stack attribute yet (the
+                # same discipline the `line` property uses with
+                # getattr defaults).
+                fn_stack = getattr(self._tls, "fn_stack", None)
+                if fn_stack is None:
+                    fn_stack = []
+                    self._tls.fn_stack = fn_stack
+                fn_stack.append(key)
+                self.exec_stmts(fn["body"], env)
+            except TailCallSig as tc:
+                if tc.key == key:
+                    # The verified tail self-call: rebind + loop.
+                    args = tc.args
+                    continue
+                # Defensive: only self-calls raise TailCallSig (the
+                # return handler checks the target); a foreign key
+                # degrades to a normal call.
+                return self.call_fn(tc.key, tc.args)
+            except ReturnSig as r:
+                # Stage 17: runtime `ensures` assertion (enabled by --contracts).
+                if self.contracts and fn.get("ensures") is not None:
+                    env[0]["result"] = [r.value, False, False]
+                    if not self._truthy(self.eval_expr(fn["ensures"], env)):
+                        raise HLPanic("contract violation: ensures of '%s' "
+                                      "(function postcondition failed at "
+                                      "runtime)" % fn["name"], self.line)
+                return r.value
+            finally:
+                getattr(self._tls, "fn_stack", []).pop()
+            # Implicit void return: still check ensures (result is None).
             if self.contracts and fn.get("ensures") is not None:
-                env[0]["result"] = [r.value, False, False]
+                env[0]["result"] = [None, False, False]
                 if not self._truthy(self.eval_expr(fn["ensures"], env)):
                     raise HLPanic("contract violation: ensures of '%s' "
-                                  "(function postcondition failed at "
-                                  "runtime)" % fn["name"], self.line)
-            return r.value
-        # Implicit void return: still check ensures (result is None).
-        if self.contracts and fn.get("ensures") is not None:
-            env[0]["result"] = [None, False, False]
-            if not self._truthy(self.eval_expr(fn["ensures"], env)):
-                raise HLPanic("contract violation: ensures of '%s' "
-                              "(function postcondition failed at runtime)"
-                              % fn["name"], self.line)
-        return None
+                                  "(function postcondition failed at runtime)"
+                                  % fn["name"], self.line)
+            return None
 
     @staticmethod
     def _truthy(v):
@@ -835,7 +892,26 @@ class Interp:
                     env.pop()
                 i += 1
         elif k == "return":
-            raise ReturnSig(self.eval_expr(s["value"], env) if s["value"] is not None else None)
+            v = s["value"]
+            if v is not None:
+                # Stage 31 (v0.48.0-alpha): a VERIFIED tail self-call in
+                # a #[tail_call] fn raises TailCallSig instead — call_fn
+                # rebinds the parameters and re-runs the body in the
+                # SAME Python frame (the trampoline mirror of the native
+                # parameter-rebinding goto). The checker guarantees the
+                # call target is the CURRENT fn and the dataflow is
+                # primitive-only, so evaluating the argument list here
+                # has no refcount side effects.
+                fn_stack = getattr(self._tls, "fn_stack", None)
+                if fn_stack:
+                    cur = fn_stack[-1] if fn_stack else None
+                    rc = v.get("rc")
+                    if (rc is not None and rc[0] == "user" and rc[1] == cur
+                            and cur in self.fns
+                            and self.fns[cur].get("attrs", {}).get("tail_call", False)):
+                        args = [self.eval_expr(a, env) for a in v.get("args", [])]
+                        raise TailCallSig(cur, args, self.line)
+            raise ReturnSig(self.eval_expr(v, env) if v is not None else None)
         elif k == "break":
             raise BreakSig()
         elif k == "continue":

@@ -1792,11 +1792,19 @@ of:
 | `#[inline(never)]`       | 29    | forbid inlining at every call site                   |
 | `#[hot]`                 | 29    | mark the function hot (overrides PGO)                |
 | `#[cold]`                | 29    | mark the function cold (overrides PGO)              |
+| `#[tail_call]`           | 31    | assert every recursive call is in verified tail     |
+|                          |       | position; the codegen emits a parameter-rebinding   |
+|                          |       | goto (constant stack at any recursion depth)        |
 
 Mutual exclusivity (compile error if violated):
 - `#[hot]` and `#[cold]` cannot both appear on the same function.
 - `#[inline(always)]` and `#[inline(never)]` cannot both appear on
   the same function.
+- `#[tail_call]` cannot be combined with `#[irq_handler]` (an
+  interrupt frame must return via IRETQ, never jump) or with
+  `#[inline(always)]` (a tail-call loop cannot also be inlined at
+  every call site). Both conflicts are detected at parse time, in
+  either attribute order.
 
 Unknown attribute names raise a clear compile error.
 
@@ -2341,3 +2349,171 @@ loop allocates zero heap objects. The gate
 
 See `examples/stack_layout_demo.hls` for the full example and
 `examples/fibonacci.hls` for the acceptance target.
+
+## 30. Verified tail-call optimisation (Stage 31 — v0.48.0-alpha)
+
+`#[tail_call]` on a function asserts that every recursive call to it
+is in VERIFIED tail position. "Verified" is a concrete, mechanical
+claim — the compiler proves two properties and then lowers the
+recursion to a jump that is sound BY CONSTRUCTION:
+
+```hls
+#[tail_call]
+fn fib_tail(n: int, a: int, b: int) -> int {
+    if n == 0 {
+        return a
+    }
+    return fib_tail(n - 1, b, (a + b) % 1000000007)
+}
+```
+
+### 30.1. The two verified properties
+
+**Position.** Every self-call must be the ENTIRE return expression
+(`return f(...)`), never nested inside an operator, an argument, a
+`let` binding or a discarded expression statement. Anything else is
+a compile error naming the line:
+
+```
+#[tail_call]
+fn f(n: int) -> int {
+    return f(n - 1) + 1        # NOT tail: the result feeds an operator
+}
+```
+
+```
+panic: type error: #[tail_call] violated: the recursive call to 'f'
+at line 3 is not in tail position — every recursive call must be the
+entire return expression (`return f(...)`) (line 3)
+```
+
+**No cleanup.** Nothing needing release may be created between the
+(transformed) call and the function entry. The codegen lowers the
+tail call to a `goto` back to the function entry; a `goto` skips
+every `__attribute__((cleanup))` variable declared in the body — so
+the verifier PROVES the body cannot contain one:
+
+- every parameter, the return type and every `let` binding must be
+  `int` / `float` / `bool` (never refcounted);
+- every expression in the body must be primitive-typed. The ONE
+  exception: a string LITERAL passed directly to `panic` / `print` /
+  `println` — consume-builtins in both backends (the argument is
+  transferred and released by the callee, never hoisted into a
+  cleanup temp, never bound).
+
+```hls
+#[tail_call]
+fn f(n: int) -> int {
+    let s: str = "x"          # REJECTED: refcounted binding
+    return f(n - 1)
+}
+```
+
+```
+panic: type error: #[tail_call] violated: 'f' cannot bind non-primitive
+values — `let s: str` at line 3. A refcounted binding would need
+release at the loop jump, which the verified transform forbids (keep
+the body to int / float / bool) (line 3)
+```
+
+### 30.2. Scope restrictions (compile errors)
+
+- the function must be a plain `fn` — not generic (the codegen emits
+  per-instantiation bodies; the loop keying is per source fn), not a
+  method (`self` is a refcounted receiver);
+- no `requires` / `ensures` contracts (the postcondition check would
+  interpose cleanup between the tail call and the jump);
+- the return type must be `int` / `float` / `bool` (the loop feeds a
+  value back; `void` has nothing to feed);
+- `#[tail_call]` + `#[irq_handler]` or `#[inline(always)]` are
+  mutually exclusive (parse-time, either attribute order);
+- the function must actually call itself (a `#[tail_call]` fn with
+  zero self-calls is a pointless assertion — compile error).
+
+### 30.3. The native transform (C backend)
+
+`gen_fn_body` emits a label after the parameter locals:
+
+```c
+int64_t usf_fib_tail(int64_t u_n_p, int64_t u_a_p, int64_t u_b_p) {
+    int64_t u_n = u_n_p;
+    int64_t u_a = u_a_p;
+    int64_t u_b = u_b_p;
+hl_tail_restart:;
+    if ((u_n == 0)) {
+        return u_a;
+    }
+    {
+        int64_t hlc_tc_1 = hl_sub_i64(u_n, 1);      /* args first,  */
+        int64_t hlc_tc_2 = u_b;                     /* left->right  */
+        int64_t hlc_tc_3 = hl_mod_i64(hl_add_i64(u_a, u_b), 1000000007);
+        u_n = hlc_tc_1;                             /* then rebind  */
+        u_a = hlc_tc_2;
+        u_b = hlc_tc_3;
+        goto hl_tail_restart;                       /* a jmp, not   */
+    }                                               /* a call       */
+}
+```
+
+The argument expressions are evaluated into fresh temps FIRST (a
+call's exact evaluation order — side effects and panics happen in
+source order), then the parameter locals are rebound (plain copies:
+no refcounts, no aliasing — the verifier guarantees it), then the
+jump. The frame never grows: `fib_tail(1_000_000)` uses the same
+stack as `fib_tail(1)`.
+
+PGO / LTO interactions:
+- the PGO entry counter sits BEFORE the label, so it counts real
+  function entries (one per call, not one per loop iteration);
+- `lto_can_inline` never inlines a `#[tail_call]` fn: the label
+  would be duplicated across inline clones, and the constant-stack
+  loop would become call machinery again. Every call site stays
+  out-of-line, which also keeps `lto_calls[key] >= 1`, so phase-B
+  DCE can never drop the standalone body containing the loop.
+
+### 30.4. The interpreter mirror (trampoline)
+
+The Stage-0 interpreter implements the same transform as a
+trampoline: a verified tail `return f(...)` raises `TailCallSig`
+carrying the evaluated arguments; `call_fn` rebinds the parameters
+and re-runs the body in the SAME Python frame. `fib_tail(1_000_000)`
+needs zero Python recursion (no `RecursionError`). The current-fn
+key lives on the same thread-local storage as the panic `line`
+number (task threads get it lazily — concurrency is unaffected).
+
+### 30.5. `--opt-stats`
+
+```
+#[tail_call]       annotations: 1 (verified sites: 1, stack O(1))
+...
+  verified tail calls (Stage 31):
+    name                          sites   params  ret      stack
+    ----                          -----   ------  ---      -----
+    fib_tail                       1      3       int      constant
+```
+
+`make tail-report F=<file.hls>` prints it.
+
+### 30.6. Acceptance
+
+The Stage 31 acceptance criterion: `examples/fibonacci.hls` rewritten
+with `#[tail_call]` runs `fib(1_000_000)` without stack overflow. The
+gate (`make tail-acceptance`) verifies:
+
+1. The C source contains the loop label and the parameter-rebinding
+   `goto`, and `usf_fib_tail`'s body contains ZERO recursive calls
+   (the tail call is a jmp, not a call).
+2. Native `fib_tail(1_000_000)` equals the value computed
+   independently (Python fast-doubling): 918091266 (mod 1e9+7).
+3. The same 1M-deep run succeeds under `ulimit -s 1024` — a 1 MB
+   stack. A 1M-deep real call chain at ~48 bytes/frame would need
+   ~48 MB; the loop fits in kilobytes. This PROVES the stack usage is
+   constant regardless of recursion depth.
+4. The interpreter runs the same depth with no `RecursionError`
+   (the trampoline), producing byte-identical output (differential).
+
+See `examples/fibonacci.hls` for the acceptance target and
+`tests/ok/feat_stage31_tail.hls` for the feature matrix (multiple
+tail sites, float / bool accumulators, a `while` loop coexisting
+with the tail loop, a panic-literal guard, 50,000-deep runs through
+both backends).

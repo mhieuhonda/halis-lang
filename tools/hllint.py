@@ -30,6 +30,11 @@ Rules:
                               inliner will bloat the binary without
                               proportional speedup; consider #[hot] or
                               removing the annotation).
+  L012  tail-call-large       `#[tail_call]` is on a function with >30
+                              statements (the tail loop re-runs the
+                              whole body every iteration — a large body
+                              belongs in a helper the loop tail-calls,
+                              not in the loop itself).
 
 Usage:
   hllint FILE.hls              # print warnings to stdout, exit 0
@@ -73,6 +78,13 @@ RULES = {
     # (let the optimiser decide based on the profile). 50 statements
     # is the same threshold gcc uses for its -Winline warning.
     "L011": ("inline-always-large",   "warning"),
+    # Stage 31 (v0.48.0-alpha): tail-call-large — warn when
+    # #[tail_call] is on a function >30 statements. The transform
+    # turns the recursion into a loop that re-runs the ENTIRE body
+    # every iteration; a large body (unrelated setup, long branches)
+    # should live in a helper that the small tail loop calls, not in
+    # the loop itself. 30 statements keeps the hot path reviewable.
+    "L012": ("tail-call-large",       "warning"),
 }
 
 
@@ -596,6 +608,34 @@ class Linter:
                            "function '%s' has #[inline(always)] but %d "
                            "statements (>50 — likely a mistake; consider "
                            "removing the annotation or using #[hot])"
+                           % (fname, count[0]))
+
+    def _rule_l012(self):
+        """Stage 31 (v0.48.0-alpha): tail-call-large — warn when
+        #[tail_call] is on a function whose body exceeds 30
+        statements. The verified transform rebinds the parameters and
+        re-runs the ENTIRE body every loop iteration: a large body
+        (setup work, long non-loop branches) pays full price on every
+        recursion step. Move it into a helper the small tail loop
+        calls, or drop the attribute. Mirrors L011's structure (attrs
+        are stored on the fn dict by the boot parser)."""
+        for fname, fn in self.program["fns"].items():
+            attrs = fn.get("attrs")
+            if not attrs:
+                continue
+            if not attrs.get("tail_call", False):
+                continue
+            # Count statements recursively (mirrors L008/L011).
+            count = [0]
+            def count_stmts(s):
+                count[0] += 1
+            walk_stmts(fn["body"], count_stmts)
+            if count[0] > 30:
+                self._warn("L012", fn.get("line", 0),
+                           "function '%s' has #[tail_call] but %d "
+                           "statements (>30 — the loop re-runs the whole "
+                           "body every iteration; move the bulk into a "
+                           "helper the tail loop calls)"
                            % (fname, count[0]))
 
 

@@ -63,7 +63,7 @@ remains green.
 | 28 | Stack-frame layout control (for kernel code) | ✅ | 3 weeks |
 | 29 | `noinline`/`always_inline`/`cold`/`hot` attributes | ✅ | 2 weeks |
 | 30 | Boxed-vs-stack layout analysis (escape analysis) | ✅ | 5 weeks |
-| 31 | Tail-call optimisation (verified) | ⬜ | 3 weeks |
+| 31 | Tail-call optimisation (verified) | ✅ | 3 weeks |
 | 32 | Zero-cost abstractions audit (every stdlib fn under 1 µs) | ⬜ | 4 weeks |
 | 33 | Async/await zero-runtime futures | ⬜ | 6 weeks |
 | 34 | Async stream combinators (channels × generators) | ⬜ | 4 weeks |
@@ -2835,7 +2835,7 @@ summary + per-binding table), `gen_program` (accessor emission)
 
 ---
 
-## STAGE 31 — Tail-call optimisation (verified) ⬜
+## STAGE 31 — Tail-call optimisation (verified) ✅ (release v0.48.0-alpha)
 
 **Work:**
 - `#[tail_call]` — assert that a call is in tail position (compile
@@ -2847,6 +2847,91 @@ summary + per-binding table), `gen_program` (accessor emission)
 
 **Acceptance:** `examples/fibonacci.hls` rewritten with
 `#[tail_call]` runs `fib(1_000_000)` without stack overflow.
+
+### Stage 31 — implementation notes
+
+The attribute is an **assertion the compiler must prove** — `verified`
+is a concrete, mechanical claim, not a hope that the C compiler
+notices the tail call:
+
+1. **Position** — every self-call must be the ENTIRE return
+   expression (`return f(...)`), never nested inside an operator,
+   argument, let binding or discarded statement (compile error naming
+   the line otherwise).
+2. **No cleanup** — nothing needing release may be created between
+   the (transformed) call and the function entry. The goto-based loop
+   would skip any `__attribute__((cleanup))` variable, so the verifier
+   proves the body CANNOT contain one: parameters, return type, every
+   let binding and every expression must be int / float / bool. The
+   only exception is a string LITERAL passed directly to
+   panic / print / println (consume-builtins — transferred, never
+   hoisted, never bound).
+3. **Scope** — plain fns only: not generic (per-instantiation
+   keying), not a method (`self` is refcounted), no contracts (the
+   ensures check would interpose cleanup), not `irq_handler` (an
+   interrupt frame returns via IRETQ, never jumps) and not
+   `inline(always)` (the loop transform and call-site inlining
+   contradict each other). Both conflicts are caught at parse time,
+   in either attribute order.
+
+#### Added — `src/hlc.hls`
+- `parse_attributes` accepts `tail_call`; order-independent mutual
+  exclusion with `irq_handler` and `inline(always)`.
+- `FnInfo.attr_tail_call`; `Ctx.tail_label` / `Ctx.tail_params` /
+  `Ctx.tail_sites` (codegen + report state).
+- `tail_check_fn` + walkers (phase 5.6 of `check_program`):
+  the verifier above; records the verified site count.
+- `gen_fn_body` emits `hl_tail_restart:;` after the param locals /
+  PGO entry counter / requires check (so those run once per REAL
+  entry — the PGO entry counter keeps counting function entries,
+  which is what a profile should count).
+- `gen_tail_jump`: at each verified site, evaluate the argument
+  expressions into fresh temps (left to right — a call's exact
+  evaluation order), rebind the parameter locals, `goto` — a jmp,
+  not a call. The frame never grows.
+- `lto_can_inline` never inlines a `#[tail_call]` fn (label
+  duplication across inline clones; also keeps `lto_calls[key] >= 1`
+  so phase-B DCE can never drop the loop body).
+- `--opt-stats`: `#[tail_call]` tally + `tail(N)` in the frame column
+  + a dedicated verified-tail-calls table (sites / params / ret /
+  constant stack).
+
+#### Added — `boot/` mirror
+- `boot/parser.py`: parses / validates the attribute (identical
+  error messages, including the let-binding misplacement pointer).
+- `boot/checker.py`: `tail_call_check_fn` mirrors the verifier
+  exactly — `boot.py --check` rejects the same programs the
+  self-hosted compiler rejects (13 new fail tests run through BOTH).
+- `boot/interp.py`: the interpreter-side transform is a
+  **trampoline** — a verified tail `return f(...)` raises
+  `TailCallSig`; `call_fn` rebinds the parameters and re-runs the
+  body in the SAME Python frame (thread-safe: the current-fn key
+  lives on the same `threading.local` as `line`, lazily created for
+  task threads). fib_tail(1_000_000) needs zero Python recursion.
+
+#### Added — Makefile + tests + examples
+- `make tail-acceptance`: (a) the C source contains the label + the
+  parameter-rebinding goto and ZERO recursive calls in
+  `usf_fib_tail`; (b) native `fib_tail(1_000_000)` equals the
+  independently computed value (Python fast-doubling); (c) the same
+  1M run under `ulimit -s 1024` — a 1 MB stack, while a 1M call
+  chain needs ~48 MB; (d) the interpreter runs the same depth with
+  no RecursionError; (e) byte-identical differential output; (f) a
+  non-tail self-call is rejected; plus the `--opt-stats` table.
+  `make tail-report` prints the decisions for any file.
+- `tests/ok/feat_stage31_tail.hls`: fib_tail (1 site), collatz_steps
+  (2 sites — multiple return branches), geo_tail (float),
+  parity_tail (bool), sum_tail (a `while` coexisting with the tail
+  loop + `mut` param, 50,000 deep), guarded_tail (panic-literal
+  guard). Runs through BOTH backends (byte-identical output).
+- 13 `tests/fail/fail_tail_call_*.hls` programs (non-tail position,
+  let-bound call, owned param, owned let, no recursion, generic,
+  method, contract, void return, computed panic argument, let
+  misplacement, irq_handler conflict, inline(always) conflict).
+- `examples/fibonacci.hls`: `#[tail_call] fn fib_tail(n, a, b)` —
+  the accumulator form mod 1e9+7; default depth 100,000 (fast for
+  the differential suite), CLI-arg override for the 1M acceptance
+  depth. All Stage 30 outputs unchanged (escape-acceptance intact).
 
 ---
 
