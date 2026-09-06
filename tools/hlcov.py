@@ -199,7 +199,9 @@ def main():
         sys.stderr.write("compile error: %s\n" % ex)
         return 1
     try:
-        checker = check(program)
+        # Validate (the call's side effect): the result object itself is
+        # not needed here.
+        check(program)
     except HLError as ex:
         sys.stderr.write("type error: %s\n" % ex)
         return 1

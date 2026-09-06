@@ -243,7 +243,7 @@ def find_target_linker(target: str) -> Tuple[Optional[str], List[str], str]:
       2. target-specific cross-linker
       3. host compiler when target == host (native build)
     """
-    spec = TARGETS[target]
+    TARGETS[target]  # KeyError side effect: validates the target name.
     # 1. zig cc — the universal linker.
     zig = find_zig()
     if zig:
@@ -384,7 +384,7 @@ def cross_compile(input_hls: str, output_bin: str, target: str,
     elif linker_kind == "zig":
         zig = find_zig()
         if not zig:
-            print(f"error: --linker zig requested but zig is not installed",
+            print("error: --linker zig requested but zig is not installed",
                   file=sys.stderr)
             return 2
         linker, base_args, kind = zig, ["cc", "-target", target, "-O2"], "zig"

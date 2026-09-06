@@ -726,6 +726,149 @@ else
     bad "simd-bench: compile failed"
 fi
 
+# (c2) Stage 31 perfection (v0.48.1-alpha): the harmonised fused
+#      kernels. feat_stage31_simd_fused.hls exercises the vector body,
+#      the tails and the boundary shapes; the interpreter output must
+#      be byte-identical to BOTH the unflagged native build (the C
+#      scalar fallback) and the --target-feature avx2 build (the
+#      cache-blocked 256-bit intrinsic kernel) AND the --target-feature
+#      sse4.2 build (the 128-bit kernel). The two panic programs
+#      (panic_simd_lane.hls / panic_simd_lane_ys.hls) verify the
+#      upfront fail-fast int32 range check covers tail-region elements
+#      in every implementation (sections 1/3 already run them
+#      differentially: both sides must panic with exit 101).
+FUSED_F=tests/ok/feat_stage31_simd_fused.hls
+fused_interp=$(python3 boot/boot.py "$FUSED_F" </dev/null 2>/dev/null); fused_irc=$?
+if [ ! -x "$TMP/hlc1" ]; then
+    python3 boot/boot.py src/hlc.hls src/hlc.hls "$TMP/hlc_nat.c" >/dev/null 2>&1
+    gcc -O2 -o "$TMP/hlc1" "$TMP/hlc_nat.c" -lm -pthread 2>/dev/null
+fi
+fused_modes="avx2 sse4.2"
+fused_fail=0
+for mode in "" $fused_modes; do
+    if [ -n "$mode" ]; then T="--target-feature $mode"; else T=""; fi
+    if "$TMP/hlc1" $T "$FUSED_F" "$TMP/fused_$mode.c" >/dev/null 2>&1 \
+            && gcc -O2 -o "$TMP/fused_$mode.bin" "$TMP/fused_$mode.c" -lm -pthread 2>/dev/null; then
+        fused_out=$("$TMP/fused_$mode.bin" 2>/dev/null); fused_rc=$?
+        if [ "$fused_out" == "$fused_interp" ] && [ "$fused_rc" == "$fused_irc" ]; then
+            if [ -n "$mode" ]; then
+                ok "simd-fused: $mode kernel output == interpreter (byte-identical)"
+            else
+                ok "simd-fused: scalar-fallback output == interpreter (byte-identical)"
+            fi
+        else
+            bad "simd-fused: $mode kernel diverges from interpreter"
+            diff <(echo "$fused_interp") <(echo "$fused_out") | head -4
+            fused_fail=1
+        fi
+    else
+        bad "simd-fused: $mode compile failed"
+        fused_fail=1
+    fi
+done
+# (c3) Stage 31 perfection: multi-block native self-consistency. The
+#      cache-blocked kernels tile the 1M-element pass in 4 KB blocks;
+#      a 5,003-element list (n % 4 == 3, multi-block, odd tails) must
+#      give byte-identical output through the fallback and BOTH
+#      intrinsic paths (native-only: the interpreter runs the same
+#      portable path, so the fused differential above already covers
+#      it — this catches block-boundary bugs the small lists cannot
+#      reach).
+cat > ".fused_big_tmp.hls" <<'FBEOF'
+import "std.simd"
+
+fn build_list(n: int, seed: int) -> list[int] {
+    let xs: list[int] = []
+    let mut v: int = seed
+    let mut i: int = 0
+    while i < n {
+        v = (v * 1103515245 + 12345) % 2147483647
+        if v < 0 { v = 0 - v }
+        xs.push(v % 1000000)
+        i = i + 1
+    }
+    return xs
+}
+
+fn scalar_correlate8(xs: list[int], w0: int, w1: int, w2: int, w3: int,
+                      w4: int, w5: int, w6: int, w7: int) -> int {
+    let mut total: int = 0
+    let n: int = xs.len()
+    let mut i: int = 0
+    while i + 8 <= n {
+        total = total + xs.get(i) * w0 + xs.get(i + 1) * w1 + xs.get(i + 2) * w2
+            + xs.get(i + 3) * w3 + xs.get(i + 4) * w4 + xs.get(i + 5) * w5
+            + xs.get(i + 6) * w6 + xs.get(i + 7) * w7
+        i = i + 1
+    }
+    return total
+}
+
+fn main() -> int uses IO {
+    let xs: list[int] = build_list(5003, 7)
+    let ys: list[int] = build_list(5003, 11)
+    let c: int = scalar_correlate8(xs, 3, 1, 4, 1, 5, 9, 2, 6)
+    let v: int = simd_correlate8_sum_i32x4(xs, 3, 1, 4, 1, 5, 9, 2, 6)
+    if c != v {
+        println("correlate8 MISMATCH scalar=" + c.to_str() + " vector=" + v.to_str())
+        return 1
+    }
+    println("correlate8(5003) = " + v.to_str())
+    println("transform(5003) = " + simd_transform_sum_i32x4(xs, ys, 3, 1).to_str())
+    return 0
+}
+FBEOF
+# NOTE: the temp program lives in the repo root (dot-file, excluded
+# from the tests/ok glob) so that `import "std.simd"` resolves — the
+# import walker searches from the IMPORTING FILE's directory upward.
+big_ref=""
+for mode in "" $fused_modes; do
+    if [ -n "$mode" ]; then T="--target-feature $mode"; else T=""; fi
+    if "$TMP/hlc1" $T ".fused_big_tmp.hls" "$TMP/fused_big_$mode.c" >/dev/null 2>&1 \
+            && gcc -O2 -o "$TMP/fused_big_$mode.bin" "$TMP/fused_big_$mode.c" -lm -pthread 2>/dev/null; then
+        big_out=$("$TMP/fused_big_$mode.bin" 2>/dev/null); big_rc=$?
+        if [ -z "$big_ref" ]; then
+            big_ref="$big_out|$big_rc"
+        elif [ "$big_out|$big_rc" != "$big_ref" ]; then
+            bad "simd-fused-big: $mode output differs from the unflagged build (block boundary?)"
+            diff <(echo "$big_ref" | tr '|' '\n') <(echo "$big_out|$big_rc" | tr '|' '\n') | head -4
+            fused_fail=1
+        fi
+    else
+        bad "simd-fused-big: $mode compile failed"
+        fused_fail=1
+    fi
+done
+if [ $fused_fail -eq 0 ] && [ -n "$big_ref" ]; then
+    ok "simd-fused-big: 5003-element multi-block output identical across fallback + avx2 + sse4.2"
+fi
+rm -f ".fused_big_tmp.hls"
+# (c4) Stage 31 perfection: the NEON link regression. Under
+#      --target-feature neon the fused kernels must be defined in BOTH
+#      the #if __aarch64__ branch (the NEON kernels) and the #else
+#      branch (the portable fallback). The old emitter pushed them
+#      only into the x86 main-helper list, which the aarch64 branch
+#      never includes — a latent link failure on real NEON hardware.
+if "$TMP/hlc1" --target-feature neon "$FUSED_F" "$TMP/fused_neon.c" >/dev/null 2>&1; then
+    n_corr=$(grep -c "static int64_t hl_simd_correlate8_sum_i32x4" "$TMP/fused_neon.c")
+    n_tran=$(grep -c "static int64_t hl_simd_transform_sum_i32x4" "$TMP/fused_neon.c")
+    if [ "$n_corr" -eq 2 ] && [ "$n_tran" -eq 2 ] && grep -q "vld1q_s32" "$TMP/fused_neon.c"; then
+        ok "simd-neon: fused kernels defined in BOTH branches (NEON + fallback) — no aarch64 link hole"
+        if gcc -O2 -o "$TMP/fused_neon.bin" "$TMP/fused_neon.c" -lm -pthread 2>/dev/null; then
+            neon_out=$("$TMP/fused_neon.bin" 2>/dev/null)
+            if [ "$neon_out" == "$fused_interp" ]; then
+                ok "simd-neon: x86 fallback of the neon build == interpreter (byte-identical)"
+            else
+                bad "simd-neon: fallback diverges from interpreter"
+            fi
+        fi
+    else
+        bad "simd-neon: fused kernels missing from a branch (correlate=$n_corr transform=$n_tran)"
+    fi
+else
+    bad "simd-neon: --target-feature neon compile failed"
+fi
+
 # Stage 21 perfection (v0.40.0-alpha): horizontal reduce_min/max +
 # --target-feature native auto-detection.
 # (d) the new reduce_min/reduce_max ops are covered by the differential

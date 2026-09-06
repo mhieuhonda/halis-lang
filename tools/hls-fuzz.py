@@ -36,7 +36,6 @@ sys.path.insert(0, REPO_ROOT)
 
 from boot.boot import load_program          # noqa: E402
 from boot.checker import check              # noqa: E402
-from boot.interp import Interp              # noqa: E402
 from boot.lexer import HLError              # noqa: E402
 
 

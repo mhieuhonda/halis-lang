@@ -308,8 +308,10 @@ class IRBuilder:
             #     body
             #     t_i = t_i + 1
             iter_name = self._lower_expr(stmt["iter"], irf)
-            len_name = self._emit(OP_LIST_LEN, [("var", iter_name)],
-                                  stmt.get("line", 0))
+            # Deep-scan-14: no initial OP_LIST_LEN snapshot — the loop
+            # condition re-reads the CURRENT length every iteration
+            # (deep-scan-5); an initial length computation would be a
+            # dead instruction (its dest was never consumed).
             i_name = "v_%s__i" % stmt["var"]
             self._emit(OP_CONST, [("lit", 0)], stmt.get("line", 0), dest=i_name)
             cond_block = self._new_block(irf, "for_cond")

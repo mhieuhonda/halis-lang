@@ -426,17 +426,26 @@ fn simd_u8x16_sub(x: U8x16, y: U8x16) -> U8x16 {
 # FUSED kernels (whole-loop vectorisation) — the shape a real auto-
 # vectoriser emits: ONE call does gather + transform + accumulate.
 # These are the Stage 21 acceptance kernels: under --target-feature the
-# C backend lowers them to a single intrinsic loop (4-wide loads from
-# the list item arrays, _mm_mullo_epi32/_mm_add_epi32 lane arithmetic,
+# C backend lowers them to a cache-blocked two-pass intrinsic loop
+# (contiguous W-wide loads from a flattened, range-checked scratch
+# array — W = 8 under avx2, 4 under sse4.2/NEON — lane arithmetic,
 # exact int64 accumulation of the sign-extended lanes).
 #
-# Contract (explicit-SIMD, like every kernel here): xs/ys values and the
-# k/sub constants must fit int32 lanes (CHECKED — the vector boundary
-# rule); the per-lane transform arithmetic WRAPS modulo 2^32 (documented
-# SIMD semantics); each iteration's four lane results are then
-# sign-extended and accumulated in EXACT int64 — so for inputs whose
-# per-lane results do not wrap, the result equals the scalar formula
-# sum(xs[i] + ys[i]*k - sub) exactly.
+# Contract (explicit-SIMD, like every kernel here; harmonised across
+# ALL implementations in v0.48.1-alpha — portable path, x86 intrinsic
+# kernels, NEON kernels and the C scalar fallback agree on every
+# input, including the panic set and the panic order):
+#   1. the argument checks run first (weights / k / sub / lengths);
+#   2. EVERY element's int32 range is then checked upfront, fail-fast
+#      and in ascending order (xs fully, then ys) — the vector
+#      boundary rule applied to the whole list;
+#   3. the per-lane / per-window transform arithmetic WRAPS modulo
+#      2^32 — uniformly, in the BODY and the TAIL alike (the tail is
+#      the same lane computation on the remainder, not a different
+#      formula);
+#   4. the lane results are sign-extended and accumulated in EXACT
+#      CHECKED int64 — so for inputs whose per-lane results do not
+#      wrap, the result equals the scalar formula exactly.
 # ----------------------------------------------------------------------------
 
 # simd_transform_sum_i32x4: sum over i of (xs[i] + ys[i]*k - sub),
@@ -452,6 +461,26 @@ fn simd_transform_sum_i32x4(xs: list[int], ys: list[int], k: int, sub: int) -> i
     if sub < -2147483648 || sub > 2147483647 {
         panic("simd_transform_sum_i32x4: sub out of int32 range")
     }
+    # Stage 31 perfection (v0.48.1-alpha): upfront fail-fast int32
+    # check of EVERY element (xs ascending, then ys ascending) — the
+    # same check order as the intrinsic kernels, so the panic set and
+    # message match everywhere.
+    let mut q: int = 0
+    while q < n {
+        let a: int = xs.get(q)
+        if a < -2147483648 || a > 2147483647 {
+            panic("simd i32x4 lane out of range")
+        }
+        q = q + 1
+    }
+    let mut r: int = 0
+    while r < n {
+        let b: int = ys.get(r)
+        if b < -2147483648 || b > 2147483647 {
+            panic("simd i32x4 lane out of range")
+        }
+        r = r + 1
+    }
     let mut total: int = 0
     let mut i: int = 0
     while i + 4 <= n {
@@ -464,9 +493,19 @@ fn simd_transform_sum_i32x4(xs: list[int], ys: list[int], k: int, sub: int) -> i
         total = total + simd_i32x4_lane(t, 3)
         i = i + 4
     }
-    # Remainder (0..3 tail elements) — scalar, same formula.
+    # Remainder (0..3 tail elements) — scalar, same formula, with the
+    # SAME per-element mod-2^32 wrap as the vector body (Stage 31
+    # perfection: uniform lane semantics, body and tail alike, in
+    # every implementation).
     while i < n {
-        total = total + xs.get(i) + ys.get(i) * k - sub
+        let au: int = bits_and(xs.get(i), 4294967295)
+        let bu: int = bits_and(ys.get(i), 4294967295)
+        let tu: int = simd_add32(au, simd_sub32(simd_mul32(bu, bits_and(k, 4294967295)), bits_and(sub, 4294967295)))
+        if tu >= 2147483648 {
+            total = total + (tu - 4294967296)
+        } else {
+            total = total + tu
+        }
         i = i + 1
     }
     return total
@@ -479,11 +518,13 @@ fn simd_transform_sum_i32x4(xs: list[int], ys: list[int], k: int, sub: int) -> i
 # over i in [0, n-8), 4 outputs at a time (the standard FIR
 # vectorisation: the tap window slides, the lanes stride over i).
 #
-# Contract (explicit SIMD, like every kernel here): xs values and the
-# weights must fit int32 lanes (CHECKED); lane arithmetic wraps
-# modulo 2^32; the four lane results per iteration are sign-extended
-# and accumulated in EXACT int64 — for inputs whose per-lane results
-# do not wrap, the result equals the scalar int64 formula exactly.
+# Contract (explicit SIMD, like every kernel here — see the harmonised
+# fused-kernel contract above): weights and EVERY xs value must fit
+# int32 lanes (CHECKED upfront, fail-fast, ascending); lane arithmetic
+# wraps modulo 2^32 — uniformly, in the BODY and the TAIL alike; the
+# lane results are sign-extended and accumulated in EXACT CHECKED
+# int64 — for inputs whose per-lane results do not wrap, the result
+# equals the scalar int64 formula exactly.
 # ----------------------------------------------------------------------------
 
 fn simd_correlate8_sum_i32x4(xs: list[int], w0: int, w1: int, w2: int, w3: int,
@@ -496,6 +537,21 @@ fn simd_correlate8_sum_i32x4(xs: list[int], w0: int, w1: int, w2: int, w3: int,
             panic("simd_correlate8_sum_i32x4: weight out of int32 range")
         }
         wi = wi + 1
+    }
+    # Stage 31 perfection (v0.48.1-alpha): the fused kernels check
+    # EVERY element's int32 range upfront (fail-fast, ascending) — the
+    # vector boundary rule applied to the whole list rather than
+    # window-by-window. All implementations (this portable path, the
+    # x86 intrinsic kernels, the NEON kernels and the C scalar
+    # fallback) enforce the identical check order, so the panic set
+    # and the panic message match everywhere.
+    let mut q: int = 0
+    while q < n {
+        let v: int = xs.get(q)
+        if v < -2147483648 || v > 2147483647 {
+            panic("simd i32x4 lane out of range")
+        }
+        q = q + 1
     }
     let wv: list[I32x4] = []
     let mut wj: int = 0
@@ -520,12 +576,25 @@ fn simd_correlate8_sum_i32x4(xs: list[int], w0: int, w1: int, w2: int, w3: int,
         total = total + simd_i32x4_lane(acc, 3)
         i = i + 4
     }
-    # Tail: scalar over the remaining windows.
+    # Tail: the remaining windows, with the SAME per-window mod-2^32
+    # wrap as the vector body (Stage 31 perfection: the old tail used
+    # exact int64 arithmetic, which made the portable path disagree
+    # with the intrinsic kernels on inputs whose window sums exceed
+    # int32 — the documented SIMD lane contract now applies uniformly
+    # to every window, body or tail, in every implementation).
     while i + 8 <= n {
-        let s: int = xs.get(i) * w0 + xs.get(i + 1) * w1 + xs.get(i + 2) * w2
-            + xs.get(i + 3) * w3 + xs.get(i + 4) * w4 + xs.get(i + 5) * w5
-            + xs.get(i + 6) * w6 + xs.get(i + 7) * w7
-        total = total + s
+        let mut su: int = 0
+        let mut t: int = 0
+        while t < 8 {
+            let wu: int = bits_and(ws.get(t), 4294967295)
+            su = simd_add32(su, simd_mul32(bits_and(xs.get(i + t), 4294967295), wu))
+            t = t + 1
+        }
+        if su >= 2147483648 {
+            total = total + (su - 4294967296)
+        } else {
+            total = total + su
+        }
         i = i + 1
     }
     return total

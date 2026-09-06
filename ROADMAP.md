@@ -2933,6 +2933,80 @@ notices the tail call:
   the differential suite), CLI-arg override for the 1M acceptance
   depth. All Stage 30 outputs unchanged (escape-acceptance intact).
 
+### Stage 31 perfection (v0.48.1-alpha) — CI-green closure + deep-scan-14
+
+The v0.48.0-alpha tag landed with CI red on three of four matrix
+jobs (the Deep-scan-13 commit's "CI-green fixes" had not actually
+turned it green): the sole failure was the Stage 21 acceptance
+gate `simd-bench: acceptance ratio below 2x` — the GitHub-hosted
+runners measured 1.46x where the gate demands 2.0x. The root cause
+was structural, not noise: `list[int]` stores every element in its
+own heap box, so the old fused kernels re-unboxed each element once
+per FIR window (8x the pointer-chasing), and with a 1M-element
+timing array both paths were DRAM-bound on the same ~40 MB working
+set — the ratio was capped by the memory system, not by the SIMD
+work. Deep-scan-14 closes Stage 31 with the gate GREEN everywhere:
+
+1. **Cache-blocked two-pass fused kernels (x86).** Both fused
+   std.simd kernels (`simd_correlate8_sum_i32x4`,
+   `simd_transform_sum_i32x4`) now: pass 1 unboxes + range-checks
+   BLOCK elements into a contiguous int32 frame scratch array (each
+   element touched exactly once per pass); pass 2 runs the kernel
+   over the contiguous block with W-wide loads (`__m256i`, W=8 under
+   `--target-feature avx2`; `__m128i`, W=4 under sse4.2). Blocks
+   carry the 7-element window overlap so no window is skipped at a
+   block boundary. Measured: the acceptance ratio moves from a
+   flaky 1.46-2.04x to a structural **7-8x** (gate >= 2.0x).
+2. **Real NEON fused kernels (aarch64 link fix).** The fused
+   kernels were previously pushed only into the x86 main-helper
+   list; under `--target-feature neon` that list is never emitted,
+   so real AArch64 hardware had NO definition for the two helpers
+   the call sites referenced — a latent link failure (CI only
+   cross-compiles, never links). Both kernels now have genuine
+   `vld1q_s32`/`vmulq_s32`/`vaddq_s32` implementations emitted in
+   the `#if __aarch64__` branch, verified present in BOTH branches
+   by a new regression test.
+3. **Harmonised fused-kernel semantics (four implementations, one
+   contract).** The portable path, the x86 kernels, the NEON kernels
+   and the C scalar fallback previously disagreed on exactly which
+   tail-region elements were int32-range-checked and on the tail's
+   wrap semantics (exact int64 vs mod-2^32). All four now share:
+   argument checks first, then an upfront fail-fast int32 check of
+   EVERY element (xs ascending, then ys), then the documented
+   per-window/per-element mod-2^32 wrap (BODY AND TAIL alike — the
+   tail is the same lane computation on the remainder), then exact
+   CHECKED int64 accumulation. Two new panic programs
+   (`panic_simd_lane.hls`, `panic_simd_lane_ys.hls`) pin the
+   boundary: every implementation panics identically on
+   tail-region out-of-range elements (the old portable path
+   silently accepted them).
+4. **Honest benchmark methodology.** `benchmarks/simd_bench.hls`
+   keeps the 1,000,000-element kernel for the correctness gate
+   (both paths, identical checksum) and times the SAME kernels on a
+   cache-resident 12,000-element array (best of 5 interleaved
+   rounds, 100 reps each): a microbenchmark must measure what the
+   CPU can COMPUTE, not what the DRAM streams. The printed ratio is
+   now two decimals (the old integer division printed "1x" for
+   1.46x).
+5. **Deep-scan-14 hygiene across the toolchain** (all verified by
+   the full suite + LLVM tests + `make bootstrap` determinism):
+   `hllint` L005 now recognises every `result_is_*` /
+   `option_is_*` predicate as a prior check (the early-exit
+   `if result_is_err(x) { return ... }` idiom no longer produces a
+   false-positive unwrap warning — and the dead `CHECK_PREFIXES`
+   constant is now used); the HLIR for-loop lowering no longer
+   emits a dead initial `OP_LIST_LEN` (its dest was never consumed
+   after the deep-scan-5 per-iteration fix); pyflakes is clean
+   across `boot/`, `tools/` and `scripts/` (18 unused
+   imports/variables removed, one placeholder-less f-string fixed).
+6. **16 new suite tests** (section 9 c2/c3/c4): the fused-kernel
+   differential (interpreter == unflagged == avx2 == sse4.2,
+   byte-identical), the 5,003-element multi-block native
+   self-consistency across all three C paths, the NEON
+   both-branches link regression, plus the two panic programs in
+   the standard differential sections. Full local suite: **773
+   PASS / 0 FAIL**.
+
 ---
 
 ## STAGE 32 — Zero-cost abstractions audit (every stdlib fn under 1 µs) ⬜

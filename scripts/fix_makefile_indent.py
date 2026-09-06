@@ -16,7 +16,6 @@ def fix_makefile(path):
     in_recipe = False
     for line in lines:
         # Detect a target line: "name: deps" at column 0.
-        stripped = line.lstrip()
         if not line.startswith(" ") and not line.startswith("\t"):
             # Column 0 line.
             in_recipe = False

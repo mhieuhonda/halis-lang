@@ -119,7 +119,10 @@ def validate(text, name="<module>"):
     line_no = 0
 
     def close_fn():
-        nonlocal in_function, fn_name, labels, slot_types
+        # Deep-scan-14: `labels` / `slot_types` are only READ here, never
+        # assigned — a nonlocal declaration is only needed for names that
+        # are ASSIGNED in the nested scope (in_function / fn_name are).
+        nonlocal in_function, fn_name
         if in_function and not terminated and cur_label is not None:
             # Final open block without terminator (the emitter appends one,
             # so this would be an emitter bug).

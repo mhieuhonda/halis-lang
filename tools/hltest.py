@@ -145,7 +145,9 @@ def run_file(filepath, grep=None):
                                   "io: %s" % ex, 0.0))
         return results
     try:
-        checker = check(program)
+        # Validate (the call's side effect): the result object itself is
+        # not needed here.
+        check(program)
     except HLError as ex:
         results.append(TestResult(filepath, "<check>", "fail",
                                   "type error: %s" % ex, 0.0))

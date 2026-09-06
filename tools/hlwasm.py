@@ -2350,7 +2350,6 @@ def compile_program(input_hls: str, output_base: str,
                  after compiling (Stage 24 ``hls serve``).
     """
     target = canonical_target(target)
-    used_emscripten = False
     if target == "wasm32-unknown-emscripten":
         # Stage 24: try the emscripten bridge first; fall back to the
         # freestanding backend if emcc is not available.
@@ -2358,7 +2357,6 @@ def compile_program(input_hls: str, output_base: str,
             input_hls, output_base, target, opt_level)
         if result is not None:
             wasm_bytes, js_path = result
-            used_emscripten = True
             sys.stderr.write(
                 "Stage 24 emscripten bridge: emcc produced %s (%d bytes)\n"
                 % (js_path, len(wasm_bytes)))

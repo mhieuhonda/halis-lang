@@ -22,7 +22,6 @@ Two capabilities, both driven by `requires` contracts:
 Also here: the loop-invariant suggestion heuristics (for-loop bounds
 and while-condition textual invariants).
 """
-from .lexer import HLError
 
 INT64_MIN = -(2 ** 63)
 INT64_MAX = 2 ** 63 - 1

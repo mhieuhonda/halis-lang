@@ -1067,7 +1067,9 @@ class LLVMEmitter:
         tag = self._fresh("qtag")
         self._emit("  %s = call i64 @hl_enum_tag(ptr %s)" % (tag, scrut))
         ok_idx = e.get("qmark_ok_idx", 0)
-        err_idx = e.get("qmark_err_idx", 1)
+        # qmark_err_idx is not needed here: the branch tests `tag ==
+        # ok_idx` and EVERYTHING else falls through to the err path (the
+        # enum tag space is closed), so the err index is implicit.
         ok_lbl = self._fresh_label("qmark_ok")
         err_lbl = self._fresh_label("qmark_err")
         end_lbl = self._fresh_label("qmark_end")

@@ -573,7 +573,6 @@ def find_live_functions(mod: WasmModule) -> Set[int]:
     exported function, the start function, or an exported table element
     (the latter is not in our alpha)."""
     n_imports = len(mod.imports)
-    n_funcs = len(mod.funcs)
     live: Set[int] = set()
 
     # Seeds: exported functions + start function. Note: import indices
@@ -1331,7 +1330,6 @@ def opt_dead_types(mod: WasmModule, report: dict):
     plan first, apply only if every body parses (an unknown construct
     aborts the whole pass — indices must stay consistent everywhere).
     """
-    n_imports = len(mod.imports)
     referenced: Set[int] = set()
     for imp in mod.imports:
         if imp.kind == 0:
@@ -1339,7 +1337,6 @@ def opt_dead_types(mod: WasmModule, report: dict):
     for tidx in mod.funcs:
         referenced.add(tidx)
     # call_indirect type indices from every body.
-    patches: List[Tuple[int, int, int, int]] = []  # (code idx, instr start, old, new)
     for ci, code in enumerate(mod.codes):
         try:
             instrs = list(_walk_instrs(code.body))

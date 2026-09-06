@@ -22,11 +22,11 @@ propagation. The goal is correctness and predictability, not peak
 performance — the C compiler's `-O2` is still the primary optimiser.
 """
 from __future__ import annotations
-from typing import Dict, Set, List, Optional, Tuple
-from . import (HLIRModule, HLIRFunction, Block, Instr,
+from typing import Dict, Set, List, Tuple
+from . import (HLIRModule, HLIRFunction, Instr,
                OP_CONST, OP_BINOP, OP_UNOP, OP_LOAD, OP_STORE,
                OP_CALL, OP_METHOD, OP_BUILTIN, OP_BRANCH, OP_JUMP,
-               OP_RETURN, OP_PANIC, OP_LIST_GET, OP_LIST_LEN)
+               OP_RETURN, OP_PANIC, OP_LIST_GET)
 
 
 INT64_MAX = 9223372036854775807
@@ -617,7 +617,6 @@ def _inline_small(mod: HLIRModule):
                 # if v_a was renamed and v_b's source uses v_a, the rewrite
                 # follows the chain).
                 callee_block = callee.blocks[0]
-                last_dest: Optional[str] = None
                 for cin in callee_block.instrs:
                     # Allocate a fresh dest for this instruction.
                     new_dest = fresh() if cin.dest else None
@@ -634,8 +633,6 @@ def _inline_small(mod: HLIRModule):
                         dest=new_dest, op=cin.op, args=new_args,
                         line=cin.line, attrs=dict(cin.attrs) if cin.attrs else None,
                     ))
-                    if new_dest is not None:
-                        last_dest = new_dest
                 # The callee's terminator is OP_RETURN with the returned
                 # value. The CALL instruction's dest was %r — replace it
                 # with the inlined return value via a copy.

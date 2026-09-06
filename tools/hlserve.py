@@ -41,7 +41,7 @@ import socketserver
 import sys
 import threading
 import time
-from typing import List, Optional
+from typing import List
 
 # Repo root for resolving tools.
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

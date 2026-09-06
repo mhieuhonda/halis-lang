@@ -425,7 +425,15 @@ class Linter:
                     val = s.get("value")
                     if val and val.get("k") == "call":
                         cn = val.get("name", "")
-                        if cn in ("result_is_ok", "option_is_some"):
+                        # Deep-scan-14 fix: ANY is_* predicate (is_ok /
+                        # is_err / is_some / is_none) establishes that
+                        # the value was checked — e.g. the early-exit
+                        # idiom `if result_is_err(x) { return 1 }` makes
+                        # a later unwrap safe. Matching the prefixes
+                        # (rather than only is_ok/is_some) removes a
+                        # false-positive class the old rule had (and
+                        # the CHECK_PREFIXES constant was dead).
+                        if cn.startswith(CHECK_PREFIXES):
                             # The check argument might be `x` (ident).
                             if val.get("args"):
                                 arg = val["args"][0]
@@ -446,7 +454,7 @@ class Linter:
                     then_checked = set(checked_vars)
                     if cond and cond.get("k") == "call":
                         cn = cond.get("name", "")
-                        if cn in ("result_is_ok", "option_is_some") and cond.get("args"):
+                        if cn.startswith(CHECK_PREFIXES) and cond.get("args"):
                             arg = cond["args"][0]
                             if arg.get("k") == "ident":
                                 then_checked.add(arg["name"])

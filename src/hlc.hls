@@ -10549,6 +10549,467 @@ fn simd_emit_neon_f64x2_ew(ctx: Ctx, name: str, intrinsic: str) -> void {
     a.push("}")
 }
 
+# ============================================================================
+# Stage 31 perfection (v0.48.1-alpha): fused-kernel NEON emission + the
+# cache-blocked two-pass x86 kernels + one harmonised semantics.
+#
+# The two fused whole-loop kernels (simd_correlate8_sum_i32x4,
+# simd_transform_sum_i32x4) previously pushed only into
+# simd_helpers_main. Under --target-feature neon, simd_helper_lines
+# emits simd_helpers_neon + simd_helpers_plain in the
+# #if __aarch64__ branch and simd_helpers_alt + simd_helpers_plain in
+# the #else branch — simd_helpers_main is NEVER included — so a real
+# AArch64 host had NO definition for the two fused helpers while the
+# call sites still referenced them: a latent LINK FAILURE (the test
+# suite only cross-compiles the NEON build, it never links it on ARM
+# hardware). Each fused kernel now has a real NEON implementation
+# (simd_helpers_neon), an x86 intrinsic implementation (main,
+# cache-blocked two-pass) and ONE shared portable fallback (alt).
+#
+# All three implementations are semantically identical on EVERY input,
+# including the panic set and the panic order:
+#   * the argument checks first (weights / k / sub / length), then
+#   * an upfront fail-fast int32 range check of EVERY element
+#     (ascending: xs fully, then ys for the transform kernel) — the
+#     vector boundary rule applied to the whole list, not
+#     window-by-window (the old implementations disagreed on exactly
+#     which tail-region elements got checked),
+#   * the documented per-window / per-element mod-2^32 lane wrap,
+#     applied uniformly to the BODY and the TAIL alike (the old
+#     portable tails used exact int64 arithmetic while the C
+#     fallbacks wrapped — they disagreed on inputs whose per-window
+#     results exceed int32),
+#   * exact CHECKED int64 accumulation (hl_add_i64) of the
+#     sign-extended lane values.
+# ============================================================================
+
+# simd_cvt_lo: sign-extend the LOW half of a vector accumulator to
+# (W/2) int64 lanes. 128-bit: cvtepi32_epi64 of the whole register
+# (2 int64 lanes). 256-bit: the low 128 bits.
+fn simd_cvt_lo(ctx: Ctx, var: str) -> str {
+    if ctx.target_feature == "avx2" {
+        return "_mm256_cvtepi32_epi64(_mm256_castsi256_si128(" + var + "))"
+    }
+    return "_mm_cvtepi32_epi64(" + var + ")"
+}
+
+# simd_cvt_hi: sign-extend the HIGH half of a vector accumulator.
+# 128-bit: lanes 2,3 shuffled down then cvtepi32_epi64. 256-bit: the
+# high 128 bits.
+fn simd_cvt_hi(ctx: Ctx, var: str) -> str {
+    if ctx.target_feature == "avx2" {
+        return "_mm256_cvtepi32_epi64(_mm256_extracti128_si256(" + var + ", 1))"
+    }
+    return "_mm_cvtepi32_epi64(_mm_shuffle_epi32(" + var + ", _MM_SHUFFLE(0,0,3,2)))"
+}
+
+# simd_store_vec: store a vector accumulator to an int64 array.
+fn simd_store_vec(ctx: Ctx, arr: str, acc: str) -> str {
+    if ctx.target_feature == "avx2" {
+        return "_mm256_storeu_si256((__m256i*)" + arr + ", " + acc + ")"
+    }
+    return "_mm_storeu_si128((__m128i*)" + arr + ", " + acc + ")"
+}
+
+# simd_final_lanes: the checked int64 combine of the lo/hi lane
+# accumulators (4 lanes under 128-bit vectors, 8 under 256-bit).
+fn simd_final_lanes(ctx: Ctx) -> str {
+    if ctx.target_feature == "avx2" {
+        return "hl_add_i64(hl_add_i64(hl_add_i64(lo[0], lo[1]), hl_add_i64(lo[2], lo[3])), hl_add_i64(hl_add_i64(hi[0], hi[1]), hl_add_i64(hi[2], hi[3])))"
+    }
+    return "hl_add_i64(hl_add_i64(lo[0], lo[1]), hl_add_i64(hi[0], hi[1]))"
+}
+
+# simd_emit_x86_correlate8: the x86 intrinsic 8-tap FIR kernel. Cache-
+# blocked two-pass design: pass 1 unboxes + range-checks BLOCK list
+# elements into a contiguous int32 frame scratch array (each element
+# is touched exactly ONCE — the old kernel re-unboxed every element
+# once per window, 8x the pointer-chasing on the boxed list layout,
+# which made the whole kernel memory-bound and the 2x acceptance gate
+# flaky on small-cache CI runners); pass 2 runs the FIR over the
+# contiguous block with W-wide loads (W = 8 under avx2, 4 under
+# sse4.2). Per-window wrap mod 2^32, sign-extended, exact checked
+# int64 accumulation.
+fn simd_emit_x86_correlate8(ctx: Ctx) -> void {
+    let m: list[str] = ctx.simd_helpers_main
+    let wide: bool = ctx.target_feature == "avx2"
+    let mut vt: str = "__m128i"
+    let mut set1: str = "_mm_set1_epi32"
+    let mut zero: str = "_mm_setzero_si128"
+    let mut adde: str = "_mm_add_epi32"
+    let mut mullo: str = "_mm_mullo_epi32"
+    let mut add64: str = "_mm_add_epi64"
+    let mut loadu: str = "_mm_loadu_si128((const __m128i*)"
+    let mut wstr: str = "4"
+    let mut wm1: str = "3"
+    if wide {
+        vt = "__m256i"
+        set1 = "_mm256_set1_epi32"
+        zero = "_mm256_setzero_si256"
+        adde = "_mm256_add_epi32"
+        mullo = "_mm256_mullo_epi32"
+        add64 = "_mm256_add_epi64"
+        loadu = "_mm256_loadu_si256((const __m256i*)"
+        wstr = "8"
+        wm1 = "7"
+    }
+    m.push("/* simd_correlate8_sum_i32x4 - 8-tap correlation (canonical FIR")
+    m.push("   vectorisation). Cache-blocked two-pass kernel: pass 1 unboxes +")
+    m.push("   range-checks BLOCK elements into a contiguous int32 scratch array")
+    m.push("   (each element touched ONCE; the previous kernel re-unboxed every")
+    m.push("   element once per window - 8x the pointer-chasing on the boxed")
+    m.push("   list layout, which made the kernel memory-bound and the 2x")
+    m.push("   acceptance gate flaky on small-cache hosts); pass 2 runs the FIR")
+    m.push("   over the contiguous block. Semantics identical to the portable")
+    m.push("   path: upfront fail-fast int32 check of every element, per-window")
+    m.push("   wrap mod 2^32, sign-extended, exact checked int64 accumulation. */")
+    m.push("__attribute__((target(\"" + ctx.target_feature + "\"))) static int64_t hl_simd_correlate8_sum_i32x4(hl_list* xs_p, int64_t w0, int64_t w1, int64_t w2, int64_t w3, int64_t w4, int64_t w5, int64_t w6, int64_t w7) {")
+    m.push("    hl_list* xs = xs_p;")
+    m.push("    int64_t ws[8] = { w0, w1, w2, w3, w4, w5, w6, w7 };")
+    m.push("    for (int q = 0; q < 8; q++)")
+    m.push("        if (ws[q] < INT32_MIN || ws[q] > INT32_MAX)")
+    m.push("            hl_die(\"simd_correlate8_sum_i32x4: weight out of int32 range\");")
+    m.push("    const int64_t n = xs->len;")
+    m.push("    int64_t total = 0;")
+    m.push("    if (n >= 8) {")
+    m.push("        const int64_t last = n - 8;")
+    m.push("        const int64_t BLOCK = 4096;")
+    m.push("        int32_t buf[4104];")
+    m.push("        " + vt + " vw[8];")
+    m.push("        for (int t = 0; t < 8; t++) vw[t] = " + set1 + "((int32_t)ws[t]);")
+    m.push("        " + vt + " acc0 = " + zero + "();")
+    m.push("        " + vt + " acc1 = " + zero + "();")
+    m.push("        int64_t base = 0;")
+    m.push("        while (base <= last) {")
+    m.push("            int64_t take = n - base;")
+    m.push("            if (take > BLOCK + 7) take = BLOCK + 7;")
+    m.push("            /* BLOCK window STARTS per block: the block loads")
+    m.push("               elements [base, base+take) WITH the 7-element")
+    m.push("               window overlap, processes window starts")
+    m.push("               [base, base+take-8], then advances to the next")
+    m.push("               unprocessed start - no window is skipped at a")
+    m.push("               block boundary. */")
+    m.push("            for (int64_t j = 0; j < take; j++) {")
+    m.push("                int64_t v = hl_unbox_i64(xs->items[base + j]);")
+    m.push("                if (v < INT32_MIN || v > INT32_MAX)")
+    m.push("                    hl_die(\"simd i32x4 lane out of range\");")
+    m.push("                buf[j] = (int32_t)v;")
+    m.push("            }")
+    m.push("            const int64_t stop = base + take - 8;")
+    m.push("            int64_t i = base;")
+    m.push("            for (; i + " + wm1 + " <= stop; i += " + wstr + ") {")
+    m.push("                " + vt + " vac = " + zero + "();")
+    m.push("                for (int t = 0; t < 8; t++)")
+    m.push("                    vac = " + adde + "(vac, " + mullo + "(")
+    m.push("                        " + loadu + "(buf + (i - base) + t)), vw[t]));")
+    m.push("                acc0 = " + add64 + "(acc0, " + simd_cvt_lo(ctx, "vac") + ");")
+    m.push("                acc1 = " + add64 + "(acc1, " + simd_cvt_hi(ctx, "vac") + ");")
+    m.push("            }")
+    m.push("            for (; i <= stop; i++) {")
+    m.push("                uint64_t s = 0;")
+    m.push("                for (int t = 0; t < 8; t++)")
+    m.push("                    s += (uint64_t)(uint32_t)buf[i - base + t] * (uint64_t)(uint32_t)ws[t];")
+    m.push("                total = hl_add_i64(total, (int64_t)(int32_t)(uint32_t)s);")
+    m.push("            }")
+    m.push("            base += take - 7; /* next unprocessed window start */")
+    m.push("        }")
+    m.push("        int64_t lo[4], hi[4];")
+    m.push("        " + simd_store_vec(ctx, "lo", "acc0") + ";")
+    m.push("        " + simd_store_vec(ctx, "hi", "acc1") + ";")
+    m.push("        total = hl_add_i64(total, " + simd_final_lanes(ctx) + ");")
+    m.push("    }")
+    m.push("    hl_list_release(xs);")
+    m.push("    return total;")
+    m.push("}")
+}
+
+# simd_emit_x86_transform_sum: the x86 intrinsic fused transform kernel
+# (sum of xs[i] + ys[i]*k - sub). Same cache-blocked two-pass design:
+# pass 1 unboxes + range-checks xs then ys into two contiguous int32
+# scratch arrays; pass 2 computes the transform W lanes at a time.
+# Per-element wrap mod 2^32, exact checked int64 accumulation.
+fn simd_emit_x86_transform_sum(ctx: Ctx) -> void {
+    let m: list[str] = ctx.simd_helpers_main
+    let wide: bool = ctx.target_feature == "avx2"
+    let mut vt: str = "__m128i"
+    let mut set1: str = "_mm_set1_epi32"
+    let mut zero: str = "_mm_setzero_si128"
+    let mut adde: str = "_mm_add_epi32"
+    let mut sube: str = "_mm_sub_epi32"
+    let mut mullo: str = "_mm_mullo_epi32"
+    let mut add64: str = "_mm_add_epi64"
+    let mut loadu: str = "_mm_loadu_si128((const __m128i*)"
+    let mut wstr: str = "4"
+    let mut wm1: str = "3"
+    if wide {
+        vt = "__m256i"
+        set1 = "_mm256_set1_epi32"
+        zero = "_mm256_setzero_si256"
+        adde = "_mm256_add_epi32"
+        sube = "_mm256_sub_epi32"
+        mullo = "_mm256_mullo_epi32"
+        add64 = "_mm256_add_epi64"
+        loadu = "_mm256_loadu_si256((const __m256i*)"
+        wstr = "8"
+        wm1 = "7"
+    }
+    m.push("/* simd_transform_sum_i32x4 - the fused whole-loop kernel (Stage 21")
+    m.push("   acceptance). Cache-blocked two-pass: pass 1 unboxes + range-checks")
+    m.push("   xs then ys into contiguous int32 scratch arrays (each element")
+    m.push("   touched once); pass 2 computes a + b*k - sub W lanes at a time.")
+    m.push("   Semantics identical to the portable path: upfront fail-fast int32")
+    m.push("   check of every element (xs ascending, then ys ascending),")
+    m.push("   per-element wrap mod 2^32, exact checked int64 accumulation. */")
+    m.push("__attribute__((target(\"" + ctx.target_feature + "\"))) static int64_t hl_simd_transform_sum_i32x4(hl_list* xs_p, hl_list* ys_p, int64_t k, int64_t sub) {")
+    m.push("    hl_list* xs = xs_p; hl_list* ys = ys_p;")
+    m.push("    if (xs->len != ys->len) hl_die(\"simd_transform_sum_i32x4: length mismatch\");")
+    m.push("    if (k < INT32_MIN || k > INT32_MAX) hl_die(\"simd_transform_sum_i32x4: k out of int32 range\");")
+    m.push("    if (sub < INT32_MIN || sub > INT32_MAX) hl_die(\"simd_transform_sum_i32x4: sub out of int32 range\");")
+    m.push("    const int64_t n = xs->len;")
+    m.push("    int64_t total = 0;")
+    m.push("    if (n > 0) {")
+    m.push("        const int64_t BLOCK = 4096;")
+    m.push("        int32_t abuf[4096], bbuf[4096];")
+    m.push("        " + vt + " vk = " + set1 + "((int32_t)k);")
+    m.push("        " + vt + " vs = " + set1 + "((int32_t)sub);")
+    m.push("        " + vt + " acc0 = " + zero + "();")
+    m.push("        " + vt + " acc1 = " + zero + "();")
+    m.push("        int64_t base = 0;")
+    m.push("        while (base < n) {")
+    m.push("            int64_t take = n - base;")
+    m.push("            if (take > BLOCK) take = BLOCK;")
+    m.push("            for (int64_t j = 0; j < take; j++) {")
+    m.push("                int64_t a = hl_unbox_i64(xs->items[base + j]);")
+    m.push("                if (a < INT32_MIN || a > INT32_MAX)")
+    m.push("                    hl_die(\"simd i32x4 lane out of range\");")
+    m.push("                abuf[j] = (int32_t)a;")
+    m.push("            }")
+    m.push("            for (int64_t j = 0; j < take; j++) {")
+    m.push("                int64_t b = hl_unbox_i64(ys->items[base + j]);")
+    m.push("                if (b < INT32_MIN || b > INT32_MAX)")
+    m.push("                    hl_die(\"simd i32x4 lane out of range\");")
+    m.push("                bbuf[j] = (int32_t)b;")
+    m.push("            }")
+    m.push("            int64_t i = base;")
+    m.push("            for (; i + " + wm1 + " < base + take; i += " + wstr + ") {")
+    m.push("                " + vt + " va = " + loadu + "(abuf + (i - base)));")
+    m.push("                " + vt + " vb = " + loadu + "(bbuf + (i - base)));")
+    m.push("                " + vt + " vtv = " + adde + "(va, " + sube + "(" + mullo + "(vb, vk), vs));")
+    m.push("                acc0 = " + add64 + "(acc0, " + simd_cvt_lo(ctx, "vtv") + ");")
+    m.push("                acc1 = " + add64 + "(acc1, " + simd_cvt_hi(ctx, "vtv") + ");")
+    m.push("            }")
+    m.push("            for (; i < base + take; i++) {")
+    m.push("                int64_t a = abuf[i - base];")
+    m.push("                int64_t b = bbuf[i - base];")
+    m.push("                total = hl_add_i64(total, (int64_t)(int32_t)(uint32_t)(a + b * k - sub));")
+    m.push("            }")
+    m.push("            base += take;")
+    m.push("        }")
+    m.push("        int64_t lo[4], hi[4];")
+    m.push("        " + simd_store_vec(ctx, "lo", "acc0") + ";")
+    m.push("        " + simd_store_vec(ctx, "hi", "acc1") + ";")
+    m.push("        total = hl_add_i64(total, " + simd_final_lanes(ctx) + ");")
+    m.push("    }")
+    m.push("    hl_list_release(xs); hl_list_release(ys);")
+    m.push("    return total;")
+    m.push("}")
+}
+
+# simd_emit_neon_correlate8: the NEON fused 8-tap FIR kernel (Stage 31
+# perfection, v0.48.1-alpha). Same cache-blocked two-pass design as the
+# x86 kernel; 4-wide (int32x4_t) contiguous loads via vld1q_s32 +
+# vmulq_s32 + vaddq_s32 (both wrap per lane — the documented SIMD
+# contract), sign-extension via vmovl_s32, exact checked int64
+# accumulation.
+fn simd_emit_neon_correlate8(ctx: Ctx) -> void {
+    let m: list[str] = ctx.simd_helpers_neon
+    m.push("/* simd_correlate8_sum_i32x4 (NEON, cache-blocked two-pass). */")
+    m.push("static int64_t hl_simd_correlate8_sum_i32x4(hl_list* xs_p, int64_t w0, int64_t w1, int64_t w2, int64_t w3, int64_t w4, int64_t w5, int64_t w6, int64_t w7) {")
+    m.push("    hl_list* xs = xs_p;")
+    m.push("    int64_t ws[8] = { w0, w1, w2, w3, w4, w5, w6, w7 };")
+    m.push("    for (int q = 0; q < 8; q++)")
+    m.push("        if (ws[q] < INT32_MIN || ws[q] > INT32_MAX)")
+    m.push("            hl_die(\"simd_correlate8_sum_i32x4: weight out of int32 range\");")
+    m.push("    const int64_t n = xs->len;")
+    m.push("    int64_t total = 0;")
+    m.push("    if (n >= 8) {")
+    m.push("        const int64_t last = n - 8;")
+    m.push("        const int64_t BLOCK = 4096;")
+    m.push("        int32_t buf[4104];")
+    m.push("        int32x4_t vw[8];")
+    m.push("        for (int t = 0; t < 8; t++) vw[t] = vdupq_n_s32((int32_t)ws[t]);")
+    m.push("        int64x2_t acc0 = vdupq_n_s64(0);")
+    m.push("        int64x2_t acc1 = vdupq_n_s64(0);")
+    m.push("        int64_t base = 0;")
+    m.push("        while (base <= last) {")
+    m.push("            int64_t take = n - base;")
+    m.push("            if (take > BLOCK + 7) take = BLOCK + 7;")
+    m.push("            /* BLOCK window STARTS per block: the block loads")
+    m.push("               elements [base, base+take) WITH the 7-element")
+    m.push("               window overlap, processes window starts")
+    m.push("               [base, base+take-8], then advances to the next")
+    m.push("               unprocessed start - no window is skipped at a")
+    m.push("               block boundary. */")
+    m.push("            for (int64_t j = 0; j < take; j++) {")
+    m.push("                int64_t v = hl_unbox_i64(xs->items[base + j]);")
+    m.push("                if (v < INT32_MIN || v > INT32_MAX)")
+    m.push("                    hl_die(\"simd i32x4 lane out of range\");")
+    m.push("                buf[j] = (int32_t)v;")
+    m.push("            }")
+    m.push("            const int64_t stop = base + take - 8;")
+    m.push("            int64_t i = base;")
+    m.push("            for (; i + 3 <= stop; i += 4) {")
+    m.push("                int32x4_t vac = vdupq_n_s32(0);")
+    m.push("                for (int t = 0; t < 8; t++)")
+    m.push("                    vac = vaddq_s32(vac, vmulq_s32(")
+    m.push("                        vld1q_s32(buf + (i - base) + t), vw[t]));")
+    m.push("                acc0 = vaddq_s64(acc0, vmovl_s32(vget_low_s32(vac)));")
+    m.push("                acc1 = vaddq_s64(acc1, vmovl_s32(vget_high_s32(vac)));")
+    m.push("            }")
+    m.push("            for (; i <= stop; i++) {")
+    m.push("                uint64_t s = 0;")
+    m.push("                for (int t = 0; t < 8; t++)")
+    m.push("                    s += (uint64_t)(uint32_t)buf[i - base + t] * (uint64_t)(uint32_t)ws[t];")
+    m.push("                total = hl_add_i64(total, (int64_t)(int32_t)(uint32_t)s);")
+    m.push("            }")
+    m.push("            base += take - 7; /* next unprocessed window start */")
+    m.push("        }")
+    m.push("        int64_t f0 = vgetq_lane_s64(acc0, 0);")
+    m.push("        int64_t f1 = vgetq_lane_s64(acc0, 1);")
+    m.push("        int64_t f2 = vgetq_lane_s64(acc1, 0);")
+    m.push("        int64_t f3 = vgetq_lane_s64(acc1, 1);")
+    m.push("        total = hl_add_i64(total, hl_add_i64(hl_add_i64(f0, f1), hl_add_i64(f2, f3)));")
+    m.push("    }")
+    m.push("    hl_list_release(xs);")
+    m.push("    return total;")
+    m.push("}")
+}
+
+# simd_emit_neon_transform_sum: the NEON fused transform kernel.
+fn simd_emit_neon_transform_sum(ctx: Ctx) -> void {
+    let m: list[str] = ctx.simd_helpers_neon
+    m.push("/* simd_transform_sum_i32x4 (NEON, cache-blocked two-pass). */")
+    m.push("static int64_t hl_simd_transform_sum_i32x4(hl_list* xs_p, hl_list* ys_p, int64_t k, int64_t sub) {")
+    m.push("    hl_list* xs = xs_p; hl_list* ys = ys_p;")
+    m.push("    if (xs->len != ys->len) hl_die(\"simd_transform_sum_i32x4: length mismatch\");")
+    m.push("    if (k < INT32_MIN || k > INT32_MAX) hl_die(\"simd_transform_sum_i32x4: k out of int32 range\");")
+    m.push("    if (sub < INT32_MIN || sub > INT32_MAX) hl_die(\"simd_transform_sum_i32x4: sub out of int32 range\");")
+    m.push("    const int64_t n = xs->len;")
+    m.push("    int64_t total = 0;")
+    m.push("    if (n > 0) {")
+    m.push("        const int64_t BLOCK = 4096;")
+    m.push("        int32_t abuf[4096], bbuf[4096];")
+    m.push("        int32x4_t vk = vdupq_n_s32((int32_t)k);")
+    m.push("        int32x4_t vs = vdupq_n_s32((int32_t)sub);")
+    m.push("        int64x2_t acc0 = vdupq_n_s64(0);")
+    m.push("        int64x2_t acc1 = vdupq_n_s64(0);")
+    m.push("        int64_t base = 0;")
+    m.push("        while (base < n) {")
+    m.push("            int64_t take = n - base;")
+    m.push("            if (take > BLOCK) take = BLOCK;")
+    m.push("            for (int64_t j = 0; j < take; j++) {")
+    m.push("                int64_t a = hl_unbox_i64(xs->items[base + j]);")
+    m.push("                if (a < INT32_MIN || a > INT32_MAX)")
+    m.push("                    hl_die(\"simd i32x4 lane out of range\");")
+    m.push("                abuf[j] = (int32_t)a;")
+    m.push("            }")
+    m.push("            for (int64_t j = 0; j < take; j++) {")
+    m.push("                int64_t b = hl_unbox_i64(ys->items[base + j]);")
+    m.push("                if (b < INT32_MIN || b > INT32_MAX)")
+    m.push("                    hl_die(\"simd i32x4 lane out of range\");")
+    m.push("                bbuf[j] = (int32_t)b;")
+    m.push("            }")
+    m.push("            int64_t i = base;")
+    m.push("            for (; i + 3 < base + take; i += 4) {")
+    m.push("                int32x4_t va = vld1q_s32(abuf + (i - base));")
+    m.push("                int32x4_t vb = vld1q_s32(bbuf + (i - base));")
+    m.push("                int32x4_t vtv = vaddq_s32(va, vsubq_s32(vmulq_s32(vb, vk), vs));")
+    m.push("                acc0 = vaddq_s64(acc0, vmovl_s32(vget_low_s32(vtv)));")
+    m.push("                acc1 = vaddq_s64(acc1, vmovl_s32(vget_high_s32(vtv)));")
+    m.push("            }")
+    m.push("            for (; i < base + take; i++) {")
+    m.push("                int64_t a = abuf[i - base];")
+    m.push("                int64_t b = bbuf[i - base];")
+    m.push("                total = hl_add_i64(total, (int64_t)(int32_t)(uint32_t)(a + b * k - sub));")
+    m.push("            }")
+    m.push("            base += take;")
+    m.push("        }")
+    m.push("        int64_t f0 = vgetq_lane_s64(acc0, 0);")
+    m.push("        int64_t f1 = vgetq_lane_s64(acc0, 1);")
+    m.push("        int64_t f2 = vgetq_lane_s64(acc1, 0);")
+    m.push("        int64_t f3 = vgetq_lane_s64(acc1, 1);")
+    m.push("        total = hl_add_i64(total, hl_add_i64(hl_add_i64(f0, f1), hl_add_i64(f2, f3)));")
+    m.push("    }")
+    m.push("    hl_list_release(xs); hl_list_release(ys);")
+    m.push("    return total;")
+    m.push("}")
+}
+
+# simd_emit_alt_correlate8: the portable scalar fallback shared by the
+# x86 (#else) and NEON (#else) branches. Semantics identical to the
+# intrinsic kernels above: upfront fail-fast int32 check (ascending),
+# per-window wrap mod 2^32, exact checked int64 accumulation. The old
+# fallback wrapped the tail differently from the intrinsic paths and
+# checked only body-region elements — it now matches the portable
+# std/simd.hls definition exactly (all implementations agree on every
+# input, including the panic set).
+fn simd_emit_alt_correlate8(ctx: Ctx) -> void {
+    let a: list[str] = ctx.simd_helpers_alt
+    a.push("/* simd_correlate8_sum_i32x4 (portable scalar fallback). */")
+    a.push("static int64_t hl_simd_correlate8_sum_i32x4(hl_list* xs_p, int64_t w0, int64_t w1, int64_t w2, int64_t w3, int64_t w4, int64_t w5, int64_t w6, int64_t w7) {")
+    a.push("    hl_list* xs = xs_p;")
+    a.push("    int64_t ws[8] = { w0, w1, w2, w3, w4, w5, w6, w7 };")
+    a.push("    for (int q = 0; q < 8; q++)")
+    a.push("        if (ws[q] < INT32_MIN || ws[q] > INT32_MAX)")
+    a.push("            hl_die(\"simd_correlate8_sum_i32x4: weight out of int32 range\");")
+    a.push("    const int64_t n = xs->len;")
+    a.push("    for (int64_t q = 0; q < n; q++) {")
+    a.push("        int64_t v = hl_unbox_i64(xs->items[q]);")
+    a.push("        if (v < INT32_MIN || v > INT32_MAX)")
+    a.push("            hl_die(\"simd i32x4 lane out of range\");")
+    a.push("    }")
+    a.push("    int64_t total = 0;")
+    a.push("    for (int64_t i = 0; i + 8 <= n; i++) {")
+    a.push("        uint64_t s = 0;")
+    a.push("        for (int t = 0; t < 8; t++)")
+    a.push("            s += (uint64_t)(uint32_t)hl_unbox_i64(xs->items[i + t]) * (uint64_t)(uint32_t)ws[t];")
+    a.push("        total = hl_add_i64(total, (int64_t)(int32_t)(uint32_t)s);")
+    a.push("    }")
+    a.push("    hl_list_release(xs);")
+    a.push("    return total;")
+    a.push("}")
+}
+
+# simd_emit_alt_transform_sum: the portable scalar fallback for the
+# transform kernel (same harmonised semantics).
+fn simd_emit_alt_transform_sum(ctx: Ctx) -> void {
+    let p: list[str] = ctx.simd_helpers_alt
+    p.push("/* simd_transform_sum_i32x4 (portable scalar fallback). */")
+    p.push("static int64_t hl_simd_transform_sum_i32x4(hl_list* xs_p, hl_list* ys_p, int64_t k, int64_t sub) {")
+    p.push("    hl_list* xs = xs_p; hl_list* ys = ys_p;")
+    p.push("    if (xs->len != ys->len) hl_die(\"simd_transform_sum_i32x4: length mismatch\");")
+    p.push("    if (k < INT32_MIN || k > INT32_MAX) hl_die(\"simd_transform_sum_i32x4: k out of int32 range\");")
+    p.push("    if (sub < INT32_MIN || sub > INT32_MAX) hl_die(\"simd_transform_sum_i32x4: sub out of int32 range\");")
+    p.push("    const int64_t n = xs->len;")
+    p.push("    for (int64_t q = 0; q < n; q++) {")
+    p.push("        int64_t v = hl_unbox_i64(xs->items[q]);")
+    p.push("        if (v < INT32_MIN || v > INT32_MAX) hl_die(\"simd i32x4 lane out of range\");")
+    p.push("    }")
+    p.push("    for (int64_t q = 0; q < n; q++) {")
+    p.push("        int64_t v = hl_unbox_i64(ys->items[q]);")
+    p.push("        if (v < INT32_MIN || v > INT32_MAX) hl_die(\"simd i32x4 lane out of range\");")
+    p.push("    }")
+    p.push("    int64_t total = 0;")
+    p.push("    for (int64_t i = 0; i < n; i++) {")
+    p.push("        int64_t a = hl_unbox_i64(xs->items[i]);")
+    p.push("        int64_t b = hl_unbox_i64(ys->items[i]);")
+    p.push("        total = hl_add_i64(total, (int64_t)(int32_t)(uint32_t)(a + b * k - sub));")
+    p.push("    }")
+    p.push("    hl_list_release(xs); hl_list_release(ys);")
+    p.push("    return total;")
+    p.push("}")
+}
+
 # simd_emit_helper: dispatch one kernel into the main/alt lists. The
 # gather/scatter kernels are arch-independent (plain C field work — the
 # win is eliminating the per-element runtime calls), so they go into
@@ -10656,151 +11117,27 @@ fn simd_emit_helper(ctx: Ctx, name: str) -> void {
         return
     }
     if name == "simd_correlate8_sum_i32x4" {
-        let m: list[str] = ctx.simd_helpers_main
-        let a: list[str] = ctx.simd_helpers_alt
-        m.push("/* " + name + " - 8-tap correlation (canonical FIR vectorisation). */")
-        m.push("__attribute__((target(\"" + ctx.target_feature + "\"))) static int64_t hl_" + name + "(hl_list* xs_p, int64_t w0, int64_t w1, int64_t w2, int64_t w3, int64_t w4, int64_t w5, int64_t w6, int64_t w7) {")
-        m.push("    hl_list* xs = xs_p;")
-        m.push("    int64_t ws[8] = { w0, w1, w2, w3, w4, w5, w6, w7 };")
-        m.push("    for (int q = 0; q < 8; q++)")
-        m.push("        if (ws[q] < INT32_MIN || ws[q] > INT32_MAX)")
-        m.push("            hl_die(\"simd_correlate8_sum_i32x4: weight out of int32 range\");")
-        m.push("    __m128i vw[8];")
-        m.push("    for (int q = 0; q < 8; q++) vw[q] = _mm_set1_epi32((int32_t)ws[q]);")
-        m.push("    int64_t n = xs->len;")
-        m.push("    int64_t i = 0;")
-        m.push("    __m128i acc0 = _mm_setzero_si128();")
-        m.push("    __m128i acc1 = _mm_setzero_si128();")
-        m.push("    for (; i + 11 <= n; i += 4) {")
-        m.push("        __m128i vac = _mm_setzero_si128();")
-        m.push("        for (int t = 0; t < 8; t++) {")
-        m.push("            int64_t a0 = hl_unbox_i64(xs->items[i+t]);")
-        m.push("            int64_t a1 = hl_unbox_i64(xs->items[i+t+1]);")
-        m.push("            int64_t a2 = hl_unbox_i64(xs->items[i+t+2]);")
-        m.push("            int64_t a3 = hl_unbox_i64(xs->items[i+t+3]);")
-        m.push("            if (((((uint64_t)a0 + 0x80000000u) | ((uint64_t)a1 + 0x80000000u)")
-        m.push("                 | ((uint64_t)a2 + 0x80000000u) | ((uint64_t)a3 + 0x80000000u))")
-        m.push("                > 0xFFFFFFFFu)) hl_die(\"simd i32x4 lane out of range\");")
-        m.push("            __m128i win = _mm_set_epi32((int32_t)a3, (int32_t)a2, (int32_t)a1, (int32_t)a0);")
-        m.push("            vac = _mm_add_epi32(vac, _mm_mullo_epi32(win, vw[t]));")
-        m.push("        }")
-        m.push("        acc0 = _mm_add_epi64(acc0, _mm_cvtepi32_epi64(vac));")
-        m.push("        acc1 = _mm_add_epi64(acc1, _mm_cvtepi32_epi64(")
-        m.push("            _mm_shuffle_epi32(vac, _MM_SHUFFLE(0,0,3,2))));")
-        m.push("    }")
-        m.push("    int64_t lo[2], hi[2];")
-        m.push("    _mm_storeu_si128((__m128i*)lo, acc0);")
-        m.push("    _mm_storeu_si128((__m128i*)hi, acc1);")
-        m.push("    int64_t total = lo[0] + lo[1] + hi[0] + hi[1];")
-        m.push("    for (; i + 8 <= n; i++) {")
-        m.push("        total += hl_unbox_i64(xs->items[i]) * w0 + hl_unbox_i64(xs->items[i+1]) * w1")
-        m.push("                + hl_unbox_i64(xs->items[i+2]) * w2 + hl_unbox_i64(xs->items[i+3]) * w3")
-        m.push("                + hl_unbox_i64(xs->items[i+4]) * w4 + hl_unbox_i64(xs->items[i+5]) * w5")
-        m.push("                + hl_unbox_i64(xs->items[i+6]) * w6 + hl_unbox_i64(xs->items[i+7]) * w7;")
-        m.push("    }")
-        m.push("    hl_list_release(xs);")
-        m.push("    return total;")
-        m.push("}")
-        a.push("/* " + name + " (scalar fallback) */")
-        a.push("static int64_t hl_" + name + "(hl_list* xs_p, int64_t w0, int64_t w1, int64_t w2, int64_t w3, int64_t w4, int64_t w5, int64_t w6, int64_t w7) {")
-        a.push("    hl_list* xs = xs_p;")
-        a.push("    int64_t ws[8] = { w0, w1, w2, w3, w4, w5, w6, w7 };")
-        a.push("    for (int q = 0; q < 8; q++)")
-        a.push("        if (ws[q] < INT32_MIN || ws[q] > INT32_MAX)")
-        a.push("            hl_die(\"simd_correlate8_sum_i32x4: weight out of int32 range\");")
-        a.push("    int64_t total = 0;")
-        a.push("    int64_t n = xs->len;")
-        a.push("    for (int64_t i = 0; i + 8 <= n; i++) {")
-        a.push("        int64_t s = 0;")
-        a.push("        for (int t = 0; t < 8; t++) {")
-        a.push("            int64_t v = hl_unbox_i64(xs->items[i+t]);")
-        a.push("            if (v < INT32_MIN || v > INT32_MAX)")
-        a.push("                hl_die(\"simd i32x4 lane out of range\");")
-        a.push("            s += (int64_t)(int32_t)((uint32_t)v * (uint32_t)ws[t]);")
-        a.push("        }")
-        a.push("        total += (int64_t)(int32_t)(uint32_t)s;")
-        a.push("    }")
-        a.push("    hl_list_release(xs);")
-        a.push("    return total;")
-        a.push("}")
+        # Stage 31 perfection (v0.48.1-alpha): dispatch by target — NEON
+        # hosts now get a real fused kernel (the old code pushed the
+        # x86 intrinsic version into simd_helpers_main for EVERY
+        # target; under --target-feature neon that list is never
+        # emitted, leaving real AArch64 hardware with an undefined
+        # symbol). All targets share one portable fallback.
+        if ctx.target_feature == "neon" {
+            simd_emit_neon_correlate8(ctx)
+        } else {
+            simd_emit_x86_correlate8(ctx)
+        }
+        simd_emit_alt_correlate8(ctx)
         return
     }
     if name == "simd_transform_sum_i32x4" {
-        let m: list[str] = ctx.simd_helpers_main
-        let p: list[str] = ctx.simd_helpers_alt
-        m.push("/* " + name + " - the fused whole-loop kernel (Stage 21 acceptance). */")
-        m.push("__attribute__((target(\"" + ctx.target_feature + "\"))) static int64_t hl_" + name + "(hl_list* xs_p, hl_list* ys_p, int64_t k, int64_t sub) {")
-        m.push("    hl_list* xs = xs_p; hl_list* ys = ys_p;")
-        m.push("    if (xs->len != ys->len) hl_die(\"simd_transform_sum_i32x4: length mismatch\");")
-        m.push("    if (k < INT32_MIN || k > INT32_MAX) hl_die(\"simd_transform_sum_i32x4: k out of int32 range\");")
-        m.push("    if (sub < INT32_MIN || sub > INT32_MAX) hl_die(\"simd_transform_sum_i32x4: sub out of int32 range\");")
-        m.push("    int64_t total = 0;")
-        m.push("    int64_t n = xs->len;")
-        m.push("    int64_t i = 0;")
-        m.push("    __m128i vk = _mm_set1_epi32((int32_t)k);")
-        m.push("    __m128i vs = _mm_set1_epi32((int32_t)sub);")
-        m.push("    /* 2x64-bit lane accumulators (paddq, SSE2): lanes 0-1 and 2-3")
-        m.push("       of each 4-wide term, sign-extended, accumulated in exact")
-        m.push("       int64 (max term ~2^27, 1M terms -> < 2^47, no overflow). */")
-        m.push("    __m128i acc0 = _mm_setzero_si128();")
-        m.push("    __m128i acc1 = _mm_setzero_si128();")
-        m.push("    for (; i + 4 <= n; i += 4) {")
-        m.push("        int64_t a0 = hl_unbox_i64(xs->items[i]);")
-        m.push("        int64_t a1 = hl_unbox_i64(xs->items[i+1]);")
-        m.push("        int64_t a2 = hl_unbox_i64(xs->items[i+2]);")
-        m.push("        int64_t a3 = hl_unbox_i64(xs->items[i+3]);")
-        m.push("        int64_t b0 = hl_unbox_i64(ys->items[i]);")
-        m.push("        int64_t b1 = hl_unbox_i64(ys->items[i+1]);")
-        m.push("        int64_t b2 = hl_unbox_i64(ys->items[i+2]);")
-        m.push("        int64_t b3 = hl_unbox_i64(ys->items[i+3]);")
-        m.push("        /* biased-OR range check: v in [INT32_MIN, INT32_MAX] iff")
-        m.push("           (uint64_t)v + 0x80000000u <= 0xFFFFFFFF; the OR of the")
-        m.push("           biased values is in range iff EVERY value is. */")
-        m.push("        if (((((uint64_t)a0 + 0x80000000u) | ((uint64_t)a1 + 0x80000000u)")
-        m.push("             | ((uint64_t)a2 + 0x80000000u) | ((uint64_t)a3 + 0x80000000u)")
-        m.push("             | ((uint64_t)b0 + 0x80000000u) | ((uint64_t)b1 + 0x80000000u)")
-        m.push("             | ((uint64_t)b2 + 0x80000000u) | ((uint64_t)b3 + 0x80000000u))")
-        m.push("            > 0xFFFFFFFFu)) hl_die(\"simd i32x4 lane out of range\");")
-        m.push("        __m128i va = _mm_set_epi32((int32_t)a3, (int32_t)a2, (int32_t)a1, (int32_t)a0);")
-        m.push("        __m128i vb = _mm_set_epi32((int32_t)b3, (int32_t)b2, (int32_t)b1, (int32_t)b0);")
-        m.push("        __m128i t = _mm_add_epi32(va, _mm_sub_epi32(_mm_mullo_epi32(vb, vk), vs));")
-        m.push("        acc0 = _mm_add_epi64(acc0, _mm_cvtepi32_epi64(t));")
-        m.push("        acc1 = _mm_add_epi64(acc1, _mm_cvtepi32_epi64(")
-        m.push("            _mm_shuffle_epi32(t, _MM_SHUFFLE(0,0,3,2))));")
-        m.push("    }")
-        m.push("    int64_t lo[2], hi[2];")
-        m.push("    _mm_storeu_si128((__m128i*)lo, acc0);")
-        m.push("    _mm_storeu_si128((__m128i*)hi, acc1);")
-        m.push("    total = lo[0] + lo[1] + hi[0] + hi[1];")
-        m.push("    for (; i < n; i++) {")
-        m.push("        int64_t a = hl_unbox_i64(xs->items[i]);")
-        m.push("        int64_t b = hl_unbox_i64(ys->items[i]);")
-        m.push("        if (a < INT32_MIN || a > INT32_MAX || b < INT32_MIN || b > INT32_MAX)")
-        m.push("            hl_die(\"simd i32x4 lane out of range\");")
-        m.push("        total += a + b * k - sub;")
-        m.push("    }")
-        m.push("    hl_list_release(xs); hl_list_release(ys);")
-        m.push("    return total;")
-        m.push("}")
-        p.push("/* " + name + " (scalar fallback) */")
-        p.push("static int64_t hl_" + name + "(hl_list* xs_p, hl_list* ys_p, int64_t k, int64_t sub) {")
-        p.push("    hl_list* xs = xs_p; hl_list* ys = ys_p;")
-        p.push("    if (xs->len != ys->len) hl_die(\"simd_transform_sum_i32x4: length mismatch\");")
-        p.push("    if (k < INT32_MIN || k > INT32_MAX) hl_die(\"simd_transform_sum_i32x4: k out of int32 range\");")
-        p.push("    if (sub < INT32_MIN || sub > INT32_MAX) hl_die(\"simd_transform_sum_i32x4: sub out of int32 range\");")
-        p.push("    int64_t total = 0;")
-        p.push("    int64_t n = xs->len;")
-        p.push("    for (int64_t i = 0; i < n; i++) {")
-        p.push("        int64_t a = hl_unbox_i64(xs->items[i]);")
-        p.push("        int64_t b = hl_unbox_i64(ys->items[i]);")
-        p.push("        if (a < INT32_MIN || a > INT32_MAX || b < INT32_MIN || b > INT32_MAX)")
-        p.push("            hl_die(\"simd i32x4 lane out of range\");")
-        p.push("        int64_t term = a + (int64_t)(int32_t)((uint32_t)b * (uint32_t)k) - sub;")
-        p.push("        total += (int64_t)(int32_t)(uint32_t)term;")
-        p.push("    }")
-        p.push("    hl_list_release(xs); hl_list_release(ys);")
-        p.push("    return total;")
-        p.push("}")
+        if ctx.target_feature == "neon" {
+            simd_emit_neon_transform_sum(ctx)
+        } else {
+            simd_emit_x86_transform_sum(ctx)
+        }
+        simd_emit_alt_transform_sum(ctx)
         return
     }
     if name == "simd_i32x4_scatter" {
