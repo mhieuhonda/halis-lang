@@ -13,6 +13,127 @@ stability (125–140), and final stabilisation toward v1.0 (141–150).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
+## [v0.50.2-alpha] — Stage 27 perfection (deep-scan-17)
+
+> A focused soundness pass over the Stage 27 `asm!` checker. The
+> original implementation passed its acceptance gate, but a careful
+> re-read of `check_asm` (in both `boot/checker.py` and `src/hlc.hls`)
+> revealed six classes of asm! programs that should have been
+> REJECTED at the HLS type-checker layer but instead slipped through
+> to GCC, producing opaque C compile errors with no source-line
+> attribution. For kernel / driver writers — the very audience
+> Stage 27 was built for — that is a poor developer experience.
+>
+> The deep-scan-17 pass hardens the checker with six new soundness
+> rules, mirrored in both the boot checker and the self-hosted
+> checker, plus 6 new `tests/fail/` files and 1 new `tests/ok/`
+> regression test (12 new tests in `tests/run_tests.sh` section 18).
+> The existing 17 Stage 27 tests continue to PASS unchanged; the
+> boot and self-hosted checkers produce identical error messages
+> for every negative test.
+
+### Added — Stage 27 perfection soundness rules
+
+- **String-form constraint validation (HIGH).** `out("exa") x` (a
+  typo for `"eax"`) was previously accepted by the HLS checker and
+  reached GCC as `"=exa"(x)`, producing an opaque `impossible
+  constraint` error. The checker now validates the string-form
+  constraint against an allowlist of known x86-64 register names
+  + GCC single-letter constraint letters; unknown names are
+  rejected with a clear HLS error. New helper: `is_known_asm_constraint`
+  in `src/hlc.hls`; new `known_single` / `known_reg` tuples in
+  `boot/checker.py`'s `check_asm`.
+- **Duplicate option rejection (MED).** `options(nomem, nomem)` was
+  silently accepted (duplicates are a no-op semantically). The
+  checker now scans the options list for duplicates and rejects
+  them with a clear "appears more than once" error — almost always
+  a typo (e.g. the user probably meant `options(nomem,
+  preserves_flags)`).
+- **`pure` + `noreturn` contradiction (MED).** `pure` says the asm
+  may be elided if outputs are unused; `noreturn` says the asm
+  doesn't fall through. A pure-noreturn asm would either be elided
+  (silently turning a noreturn into a return — a SOUNDNESS BUG if
+  the asm was guarding a security boundary like `hlt`) or execute
+  (contradicting `pure`). The checker now rejects this combination
+  explicitly, with the check placed BEFORE the pure-requires-output
+  and noreturn-forbids-outputs checks so the user gets the most
+  informative error first.
+- **`pure` without `nomem` (MED).** `pure` says the asm has no side
+  effects beyond its outputs, but the default clobber list includes
+  `"memory"` (a memory side effect). These are contradictory. Rust's
+  `asm!` requires `pure` to be paired with `nomem`; the Halis
+  checker now follows the same rule.
+- **`imm` constraint on output operands (MED).** `imm` is GCC's
+  immediate-constant constraint — the operand must be a compile-
+  time constant. You can't WRITE to a constant, so
+  `out(imm) x` / `inout(imm) x` / `late_out(imm) x` are nonsensical.
+  The checker now rejects these with a clear "an immediate is a
+  compile-time constant and cannot be written to" error.
+- **Direction-prefix / constraint mismatch (MED).** The codegen has
+  a long-standing special case: `out("=r") x` (with the `=` prefix
+  already in the constraint string) skips re-adding the `=`. But
+  the checker never validated that the prefix matches the direction.
+  `in("=r") x` is contradictory (`=` means write-only output,
+  `in` means read-only input). The checker now rejects `in`
+  operands whose constraint starts with `=` or `+`, and `out`
+  operands whose constraint starts with `+`.
+
+### Changed — comment hygiene
+
+- `src/hlc.hls` `gen_asm`: the clobber-list comment previously
+  claimed "A 'cc' clobber is also suppressed if the asm has no
+  operands at all (a bare asm! with no operands never writes
+  flags)" — but the code NEVER implemented that suppression (it
+  always adds `"cc"` unless `preserves_flags` is set). The comment
+  is now fixed to match the code's safe behaviour: keep the `cc`
+  clobber for ALL asm! blocks (because `asm!("cpuid")` or
+  `asm!("add %al, %al")` may write RFLAGS); the user MUST opt out
+  via `options(preserves_flags)`. This matches rustc's `asm!`
+  semantics.
+
+### Added — tests
+
+- 6 new `tests/fail/` files:
+  - `fail_asm_bad_constraint_str.hls` — unknown string-form register
+    name (`"exa"`).
+  - `fail_asm_dup_option.hls` — duplicate option in the options
+    list (`options(nomem, nomem)`).
+  - `fail_asm_pure_noreturn.hls` — contradictory `pure` + `noreturn`.
+  - `fail_asm_pure_without_nomem.hls` — `pure` without `nomem`.
+  - `fail_asm_imm_out.hls` — `imm` constraint on `out` direction.
+  - `fail_asm_in_prefix_constraint.hls` — direction-prefix /
+    constraint mismatch (`in("=r") x`).
+- 1 new `tests/ok/` positive regression test:
+  - `feat_stage27_perfection.hls` — exercises all the forms that
+    SHOULD still work after the hardening: bare asm, output-only
+    with `reg`, inout, late_out, specific-register form (`"eax"`),
+    GCC single-letter constraint form (`"a"`), pure+nomem, and
+    noreturn. Verified by `boot --check`, `hlc` compile,
+    `gcc -O2 -Werror`, and `objdump` (the `inb()` helper still
+    compiles to a SINGLE `in` instruction).
+- 12 new tests in `tests/run_tests.sh` section 18 (subsections
+  (r) through (z)): each negative test is run through BOTH the boot
+  checker and the self-hosted checker (verifying they produce
+  identical error messages); the positive regression test is run
+  through boot interp + boot --check + self-hosted hlc compile +
+  gcc -O2 -Werror + objdump; the bootstrap-determinism test
+  verifies the new HLS code in `src/hlc.hls` self-compiles
+  deterministically.
+
+### Removed — N/A
+
+No public API is removed; the new checks are SOUNDNESS fixes that
+reject programs that were already broken (they would have failed
+at C compile time with opaque errors). The hardening is purely
+additive for the user.
+
+## [v0.50.1-alpha] — Stage 27 perfection (deep-scan-16)
+
+> A soundness fix in the boot checker (`union_moved`) that closes
+> a use-after-move hole, plus the asm! list-index lvalue fix and
+> regression tests. See the deep-scan-16 commit messages for the
+> full details.
+
 ## [v0.50.0-alpha] — Stage 27: inline assembly (`asm!`)
 
 > Stage 27 adds the inline-assembly statement `asm!("template",

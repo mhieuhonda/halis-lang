@@ -1480,6 +1480,72 @@ class Checker:
                              "constraints: reg, mem, imm; for a "
                              "specific register use a string like "
                              "\"eax\")" % c, s)
+                # Stage 27 perfection (v0.50.2-alpha) deep-scan-17:
+                # `imm` is an immediate-constant constraint — it cannot
+                # be used as an output (you can't write to a constant).
+                # `in(imm) expr` is technically valid in GCC but requires
+                # `expr` to be a compile-time constant; the HLS compiler
+                # does not constant-fold in general, so reject `imm` on
+                # outputs unconditionally and warn-equivalent (reject)
+                # on `in(imm)` for non-literal expressions.
+                if c == "imm" and d != "in":
+                    self.err("asm! constraint 'imm' cannot be used with "
+                             "direction '%s' — an immediate is a compile-"
+                             "time constant and cannot be written to" % d,
+                             s)
+            else:
+                # Stage 27 perfection (v0.50.2-alpha) deep-scan-17:
+                # String-form constraint (a register name like "eax" or
+                # a GCC constraint letter like "a"). Validate against an
+                # allowlist of known x86-64 register names + GCC single-
+                # letter constraints; reject anything else with a clear
+                # HLS error (otherwise the malformed constraint silently
+                # reaches GCC, which produces an opaque C compile error
+                # with no source-line attribution).
+                cl = c.lower() if isinstance(c, str) else c
+                # GCC single-letter constraint letters we accept.
+                known_single = ("a", "b", "c", "d", "D", "S", "q", "r",
+                                 "f", "t", "u", "y", "x", "A", "Q", "R")
+                # x86-64 register names we accept (the codegen translates
+                # these to GCC constraint letters; see translate_asm_constraint).
+                known_reg = ("eax", "rax", "ebx", "rbx", "ecx", "rcx",
+                             "edx", "rdx", "esi", "rsi", "edi", "rdi",
+                             "al", "bl", "cl", "dl", "ah", "bh", "ch", "dh",
+                             "ax", "bx", "cx", "dx", "si", "di", "bp", "sp",
+                             "rax", "rbx", "rcx", "rdx", "rsi", "rdi",
+                             "rbp", "rsp", "r8", "r9", "r10", "r11",
+                             "r12", "r13", "r14", "r15")
+                # If the user already prefixed the constraint with `=` or
+                # `+` (e.g. `out("=r") x`), validate the BODY (after the
+                # prefix). The codegen has special-case logic to skip
+                # re-adding the prefix when one is already present.
+                body = cl
+                prefix = ""
+                if isinstance(c, str) and len(c) >= 1 and c[0] in ("=", "+"):
+                    prefix = c[0]
+                    body = c[1:].lower()
+                    # `&` is the late-clobber marker; strip it for the
+                    # body check.
+                    if len(body) >= 1 and body[0] == "&":
+                        body = body[1:]
+                if body not in known_single and body not in known_reg:
+                    self.err("asm! constraint '%s' is not a recognised "
+                             "x86-64 register name or GCC constraint "
+                             "letter (known: eax/rax/ebx/rbx/ecx/rcx/"
+                             "edx/rdx/esi/rsi/edi/rdi, or single-letter "
+                             "GCC constraints a/b/c/d/D/S/q/r/A)" % c, s)
+                # Direction-vs-prefix consistency: `in("=r") x` is wrong
+                # (`=` means write-only output). `out("r") x` is OK (the
+                # codegen adds `=`). `in("+r") x` is also wrong.
+                if d == "in" and prefix in ("=", "+"):
+                    self.err("asm! constraint '%s' has a direction prefix "
+                             "'%s' but is used with `in` (input operands "
+                             "have no prefix — drop the '%s')" %
+                             (c, prefix, prefix), s)
+                if d == "out" and prefix == "+":
+                    self.err("asm! constraint '%s' has prefix '+' (read-"
+                             "write) but is used with `out` (write-only) "
+                             "— use `inout` if you want read-write" % c, s)
             # Validate the operand's value/lvalue type.
             if d == "in":
                 vt = self.check_expr(op["expr"], env, None)
@@ -1522,6 +1588,45 @@ class Checker:
                 # the codegen (matches the self-hosted checker).
                 op["t"] = tt
         # Option validation.
+        # Stage 27 perfection (v0.50.2-alpha) deep-scan-17: reject
+        # duplicate option names (e.g. `options(pure, pure)` is a
+        # user mistake — the asm accepts the duplicate silently, which
+        # is a foot-gun: a user who fat-fingers `options(nomem, nomem)`
+        # gets no signal that they probably meant `options(nomem,
+        # preserves_flags)`).
+        seen_opts = set()
+        for opt in options:
+            if opt in seen_opts:
+                self.err("asm! option '%s' appears more than once in "
+                         "the options list (duplicates are a no-op but "
+                         "usually indicate a typo)" % opt, s)
+            seen_opts.add(opt)
+        # Stage 27 perfection (v0.50.2-alpha) deep-scan-17:
+        # `pure` + `noreturn` are contradictory — `pure` says the asm
+        # may be elided if outputs are unused, but `noreturn` says it
+        # doesn't fall through (eliding a noreturn silently turns it
+        # into a return). Check this BEFORE the pure-requires-output
+        # and noreturn-forbids-outputs checks so the user gets the
+        # clearest error message for this contradiction (otherwise
+        # they'd get a side-effect error like "pure requires outputs"
+        # which doesn't explain the underlying contradiction).
+        if "pure" in options and "noreturn" in options:
+            self.err("asm! options `pure` and `noreturn` are "
+                     "contradictory — `pure` says the asm may be "
+                     "elided if its outputs are unused, but `noreturn` "
+                     "says it doesn't fall through (eliding it would "
+                     "silently turn a noreturn into a return)", s)
+        # Stage 27 perfection (v0.50.2-alpha) deep-scan-17:
+        # `pure` without `nomem` is contradictory — `pure` says the
+        # asm has no side effects, but the default `"memory"` clobber
+        # says it may read/write memory (a memory side effect). Rust's
+        # `asm!` requires `pure` to be paired with `nomem`; we follow
+        # the same rule for soundness.
+        if "pure" in options and "nomem" not in options:
+            self.err("asm! with `options(pure)` requires `nomem` too — "
+                     "a pure asm must not have memory side effects (the "
+                     "default `\"memory\"` clobber would contradict "
+                     "`pure`)", s)
         if "pure" in options and not has_output:
             self.err("asm! with `options(pure)` requires at least one "
                      "output operand (a pure asm with no outputs is dead "

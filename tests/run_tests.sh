@@ -2485,6 +2485,177 @@ else
     cat "$TMP/s27_demo_gcc.log"
 fi
 
+# ======================================================================
+# Stage 27 perfection (v0.50.2-alpha) deep-scan-17:
+# New negative tests for the soundness hardening. Each test verifies
+# that the checker REJECTS an asm! program that previously slipped
+# through to GCC and produced an opaque C compile error.
+# ======================================================================
+
+# (r) checker rejects an unknown string-form constraint (`"exa"`).
+if python3 boot/boot.py --check tests/fail/fail_asm_bad_constraint_str.hls >"$TMP/s27_r.out" 2>&1; then
+    bad "asm: checker accepted unknown string-form constraint 'exa'"
+else
+    if grep -q "not a recognised x86-64 register name" "$TMP/s27_r.out"; then
+        ok "asm: checker rejects unknown string-form constraint 'exa'"
+    else
+        bad "asm: rejected 'exa' but with the wrong message"
+        cat "$TMP/s27_r.out"
+    fi
+fi
+
+# (r-self) the self-hosted hlc rejects the same program (mirrors boot).
+if "$TMP/hlc1" tests/fail/fail_asm_bad_constraint_str.hls "$TMP/s27_r.c" >"$TMP/s27_r_hlc.out" 2>&1; then
+    bad "asm: self-hosted hlc accepted unknown string-form constraint 'exa'"
+else
+    if grep -q "not a recognised x86-64 register name" "$TMP/s27_r_hlc.out"; then
+        ok "asm: self-hosted hlc rejects unknown string-form constraint 'exa'"
+    else
+        bad "asm: self-hosted hlc rejected 'exa' but with the wrong message"
+        cat "$TMP/s27_r_hlc.out"
+    fi
+fi
+
+# (s) checker rejects duplicate options (`options(nomem, nomem)`).
+if python3 boot/boot.py --check tests/fail/fail_asm_dup_option.hls >"$TMP/s27_s.out" 2>&1; then
+    bad "asm: checker accepted duplicate option 'nomem'"
+else
+    if grep -q "appears more than once" "$TMP/s27_s.out"; then
+        ok "asm: checker rejects duplicate option 'nomem'"
+    else
+        bad "asm: rejected duplicate 'nomem' but with the wrong message"
+        cat "$TMP/s27_s.out"
+    fi
+fi
+
+# (s-self) self-hosted mirror.
+if "$TMP/hlc1" tests/fail/fail_asm_dup_option.hls "$TMP/s27_s.c" >"$TMP/s27_s_hlc.out" 2>&1; then
+    bad "asm: self-hosted hlc accepted duplicate option 'nomem'"
+else
+    if grep -q "appears more than once" "$TMP/s27_s_hlc.out"; then
+        ok "asm: self-hosted hlc rejects duplicate option 'nomem'"
+    else
+        bad "asm: self-hosted hlc rejected duplicate 'nomem' but with the wrong message"
+        cat "$TMP/s27_s_hlc.out"
+    fi
+fi
+
+# (t) checker rejects pure + noreturn (contradictory).
+if python3 boot/boot.py --check tests/fail/fail_asm_pure_noreturn.hls >"$TMP/s27_t.out" 2>&1; then
+    bad "asm: checker accepted contradictory pure + noreturn"
+else
+    if grep -q "pure.*noreturn.*contradictory\|noreturn.*pure.*contradictory\|contradictory" "$TMP/s27_t.out"; then
+        ok "asm: checker rejects contradictory pure + noreturn"
+    else
+        bad "asm: rejected pure+noreturn but with the wrong message"
+        cat "$TMP/s27_t.out"
+    fi
+fi
+
+# (u) checker rejects pure without nomem.
+if python3 boot/boot.py --check tests/fail/fail_asm_pure_without_nomem.hls >"$TMP/s27_u.out" 2>&1; then
+    bad "asm: checker accepted pure without nomem"
+else
+    if grep -q "requires.*nomem" "$TMP/s27_u.out"; then
+        ok "asm: checker rejects pure without nomem"
+    else
+        bad "asm: rejected pure-without-nomem but with the wrong message"
+        cat "$TMP/s27_u.out"
+    fi
+fi
+
+# (v) checker rejects imm constraint on out/inout/late_out.
+if python3 boot/boot.py --check tests/fail/fail_asm_imm_out.hls >"$TMP/s27_v.out" 2>&1; then
+    bad "asm: checker accepted imm on out direction"
+else
+    if grep -q "imm.*cannot be used" "$TMP/s27_v.out"; then
+        ok "asm: checker rejects imm constraint on out direction"
+    else
+        bad "asm: rejected imm-on-out but with the wrong message"
+        cat "$TMP/s27_v.out"
+    fi
+fi
+
+# (w) checker rejects direction-prefix/constraint mismatch (`in("=r") x`).
+if python3 boot/boot.py --check tests/fail/fail_asm_in_prefix_constraint.hls >"$TMP/s27_w.out" 2>&1; then
+    bad "asm: checker accepted in(\"=r\") x (direction-prefix mismatch)"
+else
+    if grep -q "direction prefix" "$TMP/s27_w.out"; then
+        ok "asm: checker rejects in(\"=r\") x (direction-prefix mismatch)"
+    else
+        bad "asm: rejected in(\"=r\") but with the wrong message"
+        cat "$TMP/s27_w.out"
+    fi
+fi
+
+# (x) the deep-scan-17 positive regression test compiles + runs cleanly
+#     on the boot interpreter and produces the expected output.
+if python3 boot/boot.py tests/ok/feat_stage27_perfection.hls >"$TMP/s27_x.out" 2>&1; then
+    if grep -q "deep-scan-17 hardening does not break valid asm!" "$TMP/s27_x.out"; then
+        ok "asm: feat_stage27_perfection.hls runs on the boot interpreter"
+    else
+        bad "asm: feat_stage27_perfection.hls did not print the acceptance line"
+        cat "$TMP/s27_x.out"
+    fi
+else
+    bad "asm: feat_stage27_perfection.hls failed to run on the boot interpreter"
+    cat "$TMP/s27_x.out"
+fi
+
+# (x-check) the self-hosted hlc compiles feat_stage27_perfection.hls.
+if "$TMP/hlc1" tests/ok/feat_stage27_perfection.hls "$TMP/s27_x.c" >"$TMP/s27_x_hlc.out" 2>&1; then
+    # The C source must have at least 9 __asm__ sites (one per
+    # asm!-containing function) and compile cleanly with gcc -O2 -Werror.
+    s27_x_asm_count=$(grep -c "__asm__" "$TMP/s27_x.c" 2>/dev/null || echo 0)
+    if [ "$s27_x_asm_count" -ge 9 ]; then
+        if gcc -O2 -Werror -c -o "$TMP/s27_x.o" "$TMP/s27_x.c" -lm -pthread 2>"$TMP/s27_x_gcc.log"; then
+            # Verify the inb() helper compiles to a single in instruction.
+            s27_x_in_count=$(objdump -d "$TMP/s27_x.o" 2>/dev/null | grep -E "in\s+\(%dx\),%al|in\s+%dx,%al" | wc -l)
+            if [ "$s27_x_in_count" -ge 1 ]; then
+                ok "asm: feat_stage27_perfection.hls compiles + inb()=single 'in' instruction ($s27_x_asm_count __asm__ sites)"
+            else
+                bad "asm: feat_stage27_perfection.hls inb() did not compile to a single 'in' instruction"
+                objdump -d "$TMP/s27_x.o" 2>/dev/null | grep -A 5 "usf_asm_inb"
+            fi
+        else
+            bad "asm: feat_stage27_perfection.hls C source fails to compile with gcc -O2 -Werror"
+            cat "$TMP/s27_x_gcc.log"
+        fi
+    else
+        bad "asm: feat_stage27_perfection.hls C source has only $s27_x_asm_count __asm__ sites (expected 9+)"
+    fi
+else
+    bad "asm: self-hosted hlc failed to compile feat_stage27_perfection.hls"
+    cat "$TMP/s27_x_hlc.out"
+fi
+
+# (y) boot --check accepts feat_stage27_perfection.hls (types + effects valid).
+if python3 boot/boot.py --check tests/ok/feat_stage27_perfection.hls >"$TMP/s27_y.out" 2>&1; then
+    if grep -q "OK: types and effects valid" "$TMP/s27_y.out"; then
+        ok "asm: boot --check accepts feat_stage27_perfection.hls"
+    else
+        bad "asm: boot --check did not accept feat_stage27_perfection.hls"
+        cat "$TMP/s27_y.out"
+    fi
+else
+    bad "asm: boot --check failed on feat_stage27_perfection.hls"
+    cat "$TMP/s27_y.out"
+fi
+
+# (z) bootstrap is still deterministic with the deep-scan-17 checker
+#     additions (the new HLS code in src/hlc.hls must self-compile
+#     deterministically — both boot and self-hosted compilers must
+#     agree on the new check_asm logic).
+if python3 boot/boot.py src/hlc.hls src/hlc.hls "$TMP/hlc_ds17_1.c" >/dev/null 2>&1     && python3 boot/boot.py src/hlc.hls src/hlc.hls "$TMP/hlc_ds17_2.c" >/dev/null 2>&1; then
+    if diff -q "$TMP/hlc_ds17_1.c" "$TMP/hlc_ds17_2.c" >/dev/null; then
+        ok "asm: bootstrap deterministic with deep-scan-17 checker additions"
+    else
+        bad "asm: bootstrap not deterministic with deep-scan-17 checker additions"
+    fi
+else
+    bad "asm: bootstrap compile failed (deep-scan-17)"
+fi
+
 echo ""
 echo "=========================================="
 echo "RESULT: $PASS PASS / $FAIL FAIL"

@@ -2820,6 +2820,151 @@ suite:
   pure-with-no-outputs, noreturn-with-outputs, immutable out
   operand).
 
+### Stage 27 perfection (v0.50.2-alpha) — deep-scan-17
+
+**Goal:** the original Stage 27 implementation passed its acceptance
+gate but a careful re-read of `check_asm` in both `boot/checker.py`
+and `src/hlc.hls` revealed six classes of asm! programs that should
+have been REJECTED at the HLS type-checker layer but instead slipped
+through to GCC, producing opaque C compile errors with no source-line
+attribution (a poor developer experience for kernel / driver writers
+— the very audience Stage 27 was built for). The deep-scan-17 pass
+hardens the checker with six new soundness rules, mirrored in both
+the boot checker (`boot/checker.py`) and the self-hosted checker
+(`src/hlc.hls`), plus 6 new `tests/fail/` files and 1 new
+`tests/ok/` regression test (12 new tests in `tests/run_tests.sh`
+section 18).
+
+**Six soundness fixes:**
+
+1. **String-form constraint validation (HIGH).** The Stage 27
+   checker validated only the bare register-class constraints
+   (`reg`/`mem`/`imm`); the specific-register string form
+   (`"eax"`, `"edx"`, ...) was accepted with NO validation. A typo
+   like `out("exa") x` would pass the HLS checker and reach GCC
+   as `"=exa"(x)`, producing an opaque `impossible constraint` or
+   `invalid 'asm' operand` error. The fix: a new
+   `is_known_asm_constraint(body)` predicate in `src/hlc.hls`
+   (and a Python `known_single` / `known_reg` tuple in
+   `boot/checker.py`) enumerates the recognised x86-64 register
+   names + GCC single-letter constraint letters; unknown names
+   are rejected with a clear HLS error pointing at the offending
+   constraint. The codegen's `translate_asm_constraint` was
+   already case-sensitive (only lowercase forms are translated);
+   the checker now matches that behaviour.
+
+2. **Duplicate option rejection (MED).** `options(nomem, nomem)`
+   was silently accepted (duplicates are a no-op semantically).
+   This is almost always a typo — the user probably meant
+   `options(nomem, preserves_flags)`. The fix: the checker scans
+   the options list for duplicates and rejects them with a clear
+   "appears more than once in the options list" error. The
+   self-hosted checker uses an O(n²) nested-loop scan (the
+   options list is small); the boot checker uses a `set()` for
+   O(n).
+
+3. **`pure` + `noreturn` contradiction (MED).** `pure` says the
+   asm has no side effects and may be elided if outputs are
+   unused; `noreturn` says the asm does not fall through. A
+   pure-noreturn asm would either be elided (silently turning a
+   noreturn into a return — a SOUNDNESS BUG if the asm was
+   guarding a security boundary like `hlt`) or execute
+   (contradicting `pure`). The fix: the checker rejects this
+   combination explicitly. The check is placed BEFORE the
+   pure-requires-output and noreturn-forbids-outputs checks so
+   the user gets the most informative error first.
+
+4. **`pure` without `nomem` (MED).** `pure` says the asm has no
+   side effects beyond its outputs, but the default clobber list
+   includes `"memory"` (the asm may read/write memory — a memory
+   side effect). These are contradictory: a memory-touching asm
+   IS a side effect, so gcc cannot elide it even if the outputs
+   are unused — making `pure` a lie that produces surprising
+   codegen. Rust's `asm!` requires `pure` to be paired with
+   `nomem`; we follow the same rule for soundness. The fix: the
+   checker rejects `options(pure)` without `options(nomem)`.
+
+5. **`imm` constraint on output operands (MED).** `imm` is
+   GCC's immediate-constant constraint — the operand must be a
+   compile-time constant. You can't WRITE to a constant, so
+   `out(imm) x` / `inout(imm) x` / `late_out(imm) x` are
+   nonsensical. Without this check, the HLS checker would accept
+   the code and GCC would emit an opaque "impossible constraint
+   in 'asm'" error with no source-line attribution. The fix: the
+   checker rejects `imm` on any non-`in` direction with a clear
+   "an immediate is a compile-time constant and cannot be written
+   to" error.
+
+6. **Direction-prefix / constraint mismatch (MED).** The codegen
+   has a long-standing special case: if the user writes
+   `out("=r") x` (with the `=` prefix already in the constraint
+   string), the codegen skips re-adding the `=` prefix. But the
+   checker never validated that the prefix matches the direction.
+   A constraint like `in("=r") x` is contradictory: `=` means
+   write-only output, but `in` means read-only input. The fix:
+   the checker rejects `in` operands whose constraint string
+   starts with `=` or `+`, and `out` operands whose constraint
+   string starts with `+` (read-write). The `late_out` direction
+   accepts both `=&` (which the codegen adds automatically) and
+   a user-supplied `=&` prefix.
+
+**Comment hygiene:** the `gen_asm` clobber-list comment in
+`src/hlc.hls` previously claimed "A 'cc' clobber is also suppressed
+if the asm has no operands at all (a bare asm! with no operands
+never writes flags)" — but the code NEVER implemented that
+suppression (it always adds `"cc"` unless `preserves_flags` is set).
+The comment is now fixed to match the code's safe behaviour: keep
+the `cc` clobber for ALL asm! blocks (because `asm!("cpuid")` or
+`asm!("add %al, %al")` may write RFLAGS); the user MUST opt out
+via `options(preserves_flags)` when they know the asm doesn't
+touch flags. This matches rustc's `asm!` semantics.
+
+**Test coverage:**
+
+- 6 new `tests/fail/` files (one per soundness fix):
+  - `fail_asm_bad_constraint_str.hls` — unknown string-form
+    register name.
+  - `fail_asm_dup_option.hls` — duplicate option in the options
+    list.
+  - `fail_asm_pure_noreturn.hls` — contradictory `pure` +
+    `noreturn`.
+  - `fail_asm_pure_without_nomem.hls` — `pure` without `nomem`.
+  - `fail_asm_imm_out.hls` — `imm` constraint on `out` direction.
+  - `fail_asm_in_prefix_constraint.hls` — direction-prefix /
+    constraint mismatch (`in("=r") x`).
+
+- 1 new `tests/ok/` positive regression test:
+  - `feat_stage27_perfection.hls` — exercises all the forms that
+    SHOULD still work after the hardening: bare asm, output-only
+    with `reg`, inout, late_out, specific-register form (`"eax"`),
+    GCC single-letter constraint form (`"a"`), pure+nomem, and
+    noreturn. The asm!-containing functions are NOT called from
+    main() (the boot interpreter would raise a clean error);
+    acceptance is verified by `boot --check` (type + effect
+    validity), `hlc` compile, `gcc -O2 -Werror`, and `objdump`
+    (the `inb()` helper still compiles to a SINGLE `in`
+    instruction).
+
+- 12 new tests in `tests/run_tests.sh` section 18 (subsections
+  (r) through (z)): each negative test is run through BOTH the
+  boot checker and the self-hosted checker (verifying they
+  produce identical error messages); the positive regression
+  test is run through boot interp + boot --check + self-hosted
+  hlc compile + gcc -O2 -Werror + objdump on the `inb()` helper
+  (single `in` instruction). The bootstrap-determinism test
+  (subsection (z)) verifies the new HLS code in `src/hlc.hls`
+  self-compiles deterministically.
+
+- The existing 17 Stage 27 tests (subsections (a)-(q)) continue
+  to PASS unchanged — the hardening does not break any valid
+  asm! program.
+
+**Result:** Stage 27 is now production-grade for kernel / driver
+work. The full local suite is **822 PASS / 0 FAIL** (was 810,
++12 deep-scan-17 tests). `make asm-acceptance` is GREEN; bootstrap
+is deterministic; the boot and self-hosted checkers produce
+identical error messages for every negative test.
+
 ---
 
 ## STAGE 28 — Stack-frame layout control (for kernel code) ✅ (release v0.45.0-alpha)

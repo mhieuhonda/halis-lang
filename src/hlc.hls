@@ -6034,6 +6034,57 @@ fn check_asm(ctx: Ctx, env: list[map[str, Binding]], cur: str, s: StmtN) -> void
             if c != "reg" && c != "mem" && c != "imm" {
                 cerr(op.line, "asm! constraint '" + c + "' is unknown (bare constraints: reg, mem, imm; for a specific register use a string like \"eax\")")
             }
+            # Stage 27 perfection (v0.50.2-alpha) deep-scan-17:
+            # `imm` is an immediate-constant constraint — it cannot be
+            # used as an output (you can't write to a constant). Reject
+            # `imm` on out/inout/late_out at check time so the user
+            # gets a clear HLS error instead of an opaque GCC error.
+            if c == "imm" && d != "in" {
+                cerr(op.line, "asm! constraint 'imm' cannot be used with direction '" + d + "' — an immediate is a compile-time constant and cannot be written to")
+            }
+        } else {
+            # Stage 27 perfection (v0.50.2-alpha) deep-scan-17:
+            # String-form constraint (a register name like "eax" or a
+            # GCC constraint letter like "a"). Validate against an
+            # allowlist of known x86-64 register names + GCC single-
+            # letter constraints; reject anything else with a clear
+            # HLS error (otherwise the malformed constraint silently
+            # reaches GCC, which produces an opaque C compile error
+            # with no source-line attribution).
+            #
+            # The codegen's translate_asm_constraint is case-sensitive
+            # (only lowercase register names are translated to GCC
+            # constraint letters; unknown forms pass through verbatim).
+            # So we validate `c` AS-IS, without lowercasing — this
+            # matches the codegen's behaviour and rejects typos like
+            # "EAX" (which would silently pass through to GCC and
+            # produce a malformed constraint).
+            #
+            # If the user already prefixed the constraint with `=` or
+            # `+`, strip the prefix before checking (the codegen has
+            # special-case logic to skip re-adding the prefix when one
+            # is already present). `&` is the late-clobber marker.
+            let mut body: str = c
+            let mut prefix_ch: str = ""
+            if c.len() >= 1 && (c.byte_at(0) == 61 || c.byte_at(0) == 43) {
+                prefix_ch = c.slice(0, 1)
+                body = c.slice(1, c.len())
+                if body.len() >= 1 && body.byte_at(0) == 38 {
+                    # '&' (38) — late-clobber marker, strip for the body check.
+                    body = body.slice(1, body.len())
+                }
+            }
+            if !is_known_asm_constraint(body) {
+                cerr(op.line, "asm! constraint '" + c + "' is not a recognised x86-64 register name or GCC constraint letter (known: eax/rax/ebx/rbx/ecx/rcx/edx/rdx/esi/rsi/edi/rdi, or single-letter GCC constraints a/b/c/d/D/S/q/r/A)")
+            }
+            # Direction-vs-prefix consistency: `in("=r") x` is wrong
+            # (`=` means write-only output). `in("+r") x` is also wrong.
+            if d == "in" && (prefix_ch == "=" || prefix_ch == "+") {
+                cerr(op.line, "asm! constraint '" + c + "' has a direction prefix '" + prefix_ch + "' but is used with `in` (input operands have no prefix — drop the '" + prefix_ch + "')")
+            }
+            if d == "out" && prefix_ch == "+" {
+                cerr(op.line, "asm! constraint '" + c + "' has prefix '+' (read-write) but is used with `out` (write-only) — use `inout` if you want read-write")
+            }
         }
         if d == "in" {
             # `in` operands: any primitive-typed expression.
@@ -6074,6 +6125,11 @@ fn check_asm(ctx: Ctx, env: list[map[str, Binding]], cur: str, s: StmtN) -> void
         k = k + 1
     }
     # 3) Option validation.
+    # Stage 27 perfection (v0.50.2-alpha) deep-scan-17: reject
+    # duplicate option names — the asm silently accepts duplicates,
+    # which is a foot-gun (a user who fat-fingers `options(nomem,
+    # nomem)` gets no signal that they probably meant `options(nomem,
+    # preserves_flags)`).
     let mut m: int = 0
     while m < options.len() {
         let opt: str = options.get(m)
@@ -6082,7 +6138,26 @@ fn check_asm(ctx: Ctx, env: list[map[str, Binding]], cur: str, s: StmtN) -> void
             && opt != "attsyntax" {
             cerr(s.line, "unknown asm! option '" + opt + "' (known: pure, nomem, noreturn, preserves_flags, nostack, attsyntax)")
         }
+        # Check for duplicates: scan the rest of the list for the same option.
+        let mut m2: int = m + 1
+        while m2 < options.len() {
+            if options.get(m2) == opt {
+                cerr(s.line, "asm! option '" + opt + "' appears more than once in the options list (duplicates are a no-op but usually indicate a typo)")
+            }
+            m2 = m2 + 1
+        }
         m = m + 1
+    }
+    if list_contains_str(options, "pure") && list_contains_str(options, "noreturn") {
+        cerr(s.line, "asm! options `pure` and `noreturn` are contradictory — `pure` says the asm may be elided if its outputs are unused, but `noreturn` says it doesn't fall through (eliding it would silently turn a noreturn into a return)")
+    }
+    # Stage 27 perfection (v0.50.2-alpha) deep-scan-17:
+    # `pure` without `nomem` is contradictory — `pure` says no side
+    # effects, but the default `"memory"` clobber says it may read/
+    # write memory. Rust's `asm!` requires `pure` to be paired with
+    # `nomem`; we follow the same rule for soundness.
+    if list_contains_str(options, "pure") && !list_contains_str(options, "nomem") {
+        cerr(s.line, "asm! with `options(pure)` requires `nomem` too — a pure asm must not have memory side effects (the default \"memory\" clobber would contradict `pure`)")
     }
     if list_contains_str(options, "pure") && !has_output {
         cerr(s.line, "asm! with `options(pure)` requires at least one output operand (a pure asm with no outputs is dead code — gcc would legitimately delete it)")
@@ -6090,6 +6165,82 @@ fn check_asm(ctx: Ctx, env: list[map[str, Binding]], cur: str, s: StmtN) -> void
     if list_contains_str(options, "noreturn") && has_output {
         cerr(s.line, "asm! with `options(noreturn)` cannot have output operands (the asm does not fall through, so the outputs would never be observed)")
     }
+}
+
+# is_known_asm_constraint: returns true iff `body` is a recognised
+# x86-64 register name or GCC single-letter constraint that the
+# codegen can lower. Used by check_asm's string-form constraint
+# validation (deep-scan-17). Keeping the allowlist here (next to
+# the checker) rather than in the codegen ensures the checker and
+# the codegen agree on what's valid.
+fn is_known_asm_constraint(body: str) -> bool {
+    # GCC single-letter constraints (x86-64).
+    if body == "a" || body == "b" || body == "c" || body == "d" {
+        return true
+    }
+    if body == "D" || body == "S" || body == "q" || body == "r" {
+        return true
+    }
+    if body == "f" || body == "t" || body == "u" || body == "y" || body == "x" {
+        return true
+    }
+    if body == "A" || body == "Q" || body == "R" || body == "m" || body == "i" {
+        return true
+    }
+    if body == "n" || body == "F" || body == "I" || body == "J" || body == "K" {
+        return true
+    }
+    if body == "L" || body == "M" || body == "N" || body == "O" || body == "P" {
+        return true
+    }
+    if body == "g" || body == "X" || body == "p" || body == "v" || body == "z" {
+        return true
+    }
+    # x86-64 register names (the codegen's translate_asm_constraint
+    # maps these to GCC constraint letters; see that function for the
+    # full table). r8-r15 are NOT mapped by the codegen but GCC accepts
+    # them via the `q`/`r` constraint letters, so we allow the user to
+    # specify them by name for clarity.
+    if body == "eax" || body == "rax" {
+        return true
+    }
+    if body == "ebx" || body == "rbx" {
+        return true
+    }
+    if body == "ecx" || body == "rcx" {
+        return true
+    }
+    if body == "edx" || body == "rdx" {
+        return true
+    }
+    if body == "esi" || body == "rsi" {
+        return true
+    }
+    if body == "edi" || body == "rdi" {
+        return true
+    }
+    if body == "rbp" || body == "rsp" {
+        return true
+    }
+    if body == "al" || body == "bl" || body == "cl" || body == "dl" {
+        return true
+    }
+    if body == "ah" || body == "bh" || body == "ch" || body == "dh" {
+        return true
+    }
+    if body == "ax" || body == "bx" || body == "cx" || body == "dx" {
+        return true
+    }
+    if body == "si" || body == "di" || body == "bp" || body == "sp" {
+        return true
+    }
+    if body == "r8" || body == "r9" || body == "r10" || body == "r11" {
+        return true
+    }
+    if body == "r12" || body == "r13" || body == "r14" || body == "r15" {
+        return true
+    }
+    return false
 }
 
 # parse_placeholder_int: parse a non-negative integer from a string
@@ -14455,8 +14606,17 @@ fn gen_asm(ctx: Ctx, s: StmtN, ind: str) -> void {
     # "memory" (the asm may read/write memory). Options can suppress:
     #   nomem             -> no "memory"
     #   preserves_flags   -> no "cc"
-    # A "cc" clobber is also suppressed if the asm has no operands at
-    # all (a bare asm! with no operands never writes flags).
+    #
+    # Stage 27 perfection (v0.50.2-alpha) deep-scan-17: the previous
+    # comment claimed "A 'cc' clobber is also suppressed if the asm
+    # has no operands at all (a bare asm! with no operands never
+    # writes flags)" — but the code NEVER implemented that suppression
+    # (it always adds "cc" unless `preserves_flags` is set). The safe
+    # behaviour is to KEEP the cc clobber for ALL asm! blocks, because
+    # a bare `asm!("cpuid")` or `asm!("add %al, %al")` may write
+    # RFLAGS. The user MUST opt out via `options(preserves_flags)`
+    # when they know the asm doesn't touch flags. The comment is now
+    # fixed to match the code's safe behaviour.
     #
     # Each clobber is emitted as a quoted C string literal (GCC's
     # extended-asm syntax requires the clobber list entries to be
