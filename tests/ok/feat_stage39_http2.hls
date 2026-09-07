@@ -1,0 +1,971 @@
+# tests/ok/feat_stage39_http2.hls — Stage 39 (v0.58.0-alpha): std.http2 module.
+#
+# Exercises:
+#   - Frame layer: 24-bit length / 31-bit stream id encode/decode
+#   - SETTINGS frame: encode -> serialize -> parse -> decode round-trip
+#   - SETTINGS ACK frame
+#   - HPACK integer (5-bit prefix, RFC 7541 §5.1 example: 1337)
+#   - HPACK string (literal, no Huffman)
+#   - HPACK header block encode/decode round-trip (literal encoder)
+#   - HPACK static table lookup (1..61)
+#   - HPACK dynamic table (add, evict, lookup, size update)
+#   - HEADERS frame (END_STREAM + END_HEADERS)
+#   - DATA frame (END_STREAM)
+#   - PING frame + PING ACK
+#   - RST_STREAM frame + payload parser
+#   - GOAWAY frame + payload parser (with debug data)
+#   - WINDOW_UPDATE frame + payload parser
+#   - PUSH_PROMISE frame + payload parser (with header block)
+#   - PRIORITY frame + payload parser (with exclusive bit)
+#   - Connection preface verification (24-byte magic)
+#   - Stream state machine: idle -> open -> half-closed -> closed
+#   - Connection: alloc stream (odd id for client, even for server)
+#   - Flow control: debit on send, credit on WINDOW_UPDATE
+#   - ALPN negotiation (h2 selection from list)
+#   - HPACK Huffman deferral (returns Err on H=1)
+#   - HPACK dynamic table size update (larger-than-max rejected)
+#
+# All tests are DETERMINISTIC — pure HLS, no I/O — so the
+# differential test (interpreter == native) is byte-exact.
+
+import "std.http2"
+import "std.str"
+import "std.bits"
+import "std.option"
+import "std.result"
+
+# ============================================================================
+# Section 1: 24-bit length and 31-bit stream id encode/decode.
+# ============================================================================
+
+fn test_length_24() -> int uses IO {
+    # Round-trip several values including boundaries (0, max).
+    let values: list[int] = [0, 1, 127, 128, 255, 256, 65535, 65536, 16777215]
+    let mut i: int = 0
+    while i < values.len() {
+        let v: int = values.get(i)
+        let enc: str = http2_encode_length_24(v)
+        if enc.len() != 3 {
+            panic("length_24(" + v.to_str() + "): encoded " + enc.len().to_str() + " bytes, expected 3")
+        }
+        let back: int = http2_decode_length_24(enc)
+        if back != v {
+            panic("length_24(" + v.to_str() + "): round-trip got " + back.to_str())
+        }
+        i = i + 1
+    }
+    println("length_24 OK: 9 values round-tripped (0, 1, 127, ..., 16777215)")
+    return 0
+}
+
+fn test_stream_id_31() -> int uses IO {
+    # The R bit (high bit) MUST be 0 on send and stripped on receive.
+    let values: list[int] = [0, 1, 100, 65535, 65536, 2147483647]
+    let mut i: int = 0
+    while i < values.len() {
+        let v: int = values.get(i)
+        let enc: str = http2_encode_stream_id_31(v)
+        if enc.len() != 4 {
+            panic("stream_id_31(" + v.to_str() + "): encoded " + enc.len().to_str() + " bytes, expected 4")
+        }
+        # The high bit of the first byte MUST be 0 (R bit).
+        if int_and(enc.byte_at(0), 128) != 0 {
+            panic("stream_id_31(" + v.to_str() + "): R bit set on encode")
+        }
+        let back: int = http2_decode_stream_id_31(enc)
+        if back != v {
+            panic("stream_id_31(" + v.to_str() + "): round-trip got " + back.to_str())
+        }
+        i = i + 1
+    }
+    println("stream_id_31 OK: 6 values round-tripped (R bit cleared on send, stripped on receive)")
+    return 0
+}
+
+# ============================================================================
+# Section 2: SETTINGS frame — encode + serialize + parse + decode round-trip.
+# ============================================================================
+
+fn test_settings_round_trip() -> int uses IO {
+    let s: Http2Settings = http2_settings_default()
+    s.header_table_size = 8192
+    s.max_concurrent_streams = 128
+    s.initial_window_size = 65535
+    s.max_frame_size = 65536
+    # Build the SETTINGS frame.
+    let f: Http2Frame = http2_make_settings_frame(s)
+    if f.frame_type != http2_frame_type_settings() {
+        panic("settings frame type: " + f.frame_type.to_str())
+    }
+    if f.stream_id != 0 {
+        panic("settings stream_id: " + f.stream_id.to_str() + " (must be 0)")
+    }
+    # Serialize, parse back.
+    let wire: str = http2_serialize_frame(f)
+    let back_r: Result[Http2Frame, str] = http2_parse_frame(wire)
+    if !result_is_ok(back_r) {
+        panic("parse: " + result_err_or(back_r, ""))
+    }
+    let back: Http2Frame = result_unwrap(back_r)
+    # Decode the payload.
+    let s_r: Result[Http2Settings, str] = http2_settings_decode(back.payload)
+    if !result_is_ok(s_r) {
+        panic("decode: " + result_err_or(s_r, ""))
+    }
+    let s_back: Http2Settings = result_unwrap(s_r)
+    if s_back.header_table_size != 8192 {
+        panic("header_table_size: " + s_back.header_table_size.to_str())
+    }
+    if s_back.max_concurrent_streams != 128 {
+        panic("max_concurrent_streams: " + s_back.max_concurrent_streams.to_str())
+    }
+    if s_back.max_frame_size != 65536 {
+        panic("max_frame_size: " + s_back.max_frame_size.to_str())
+    }
+    println("settings round-trip OK: 4 params encoded, 4 params decoded")
+    return 0
+}
+
+fn test_settings_ack() -> int uses IO {
+    let ack: Http2Frame = http2_make_settings_ack_frame()
+    if ack.frame_type != http2_frame_type_settings() {
+        panic("ack frame_type: " + ack.frame_type.to_str())
+    }
+    if int_and(ack.flags, http2_flag_ack()) == 0 {
+        panic("ack: ACK flag not set")
+    }
+    if ack.payload.len() != 0 {
+        panic("ack: payload non-empty (" + ack.payload.len().to_str() + ")")
+    }
+    if !http2_is_settings_ack(ack) {
+        panic("http2_is_settings_ack returned false")
+    }
+    # Serialize + parse round-trip.
+    let wire: str = http2_serialize_frame(ack)
+    let back_r: Result[Http2Frame, str] = http2_parse_frame(wire)
+    if !result_is_ok(back_r) {
+        panic("ack parse: " + result_err_or(back_r, ""))
+    }
+    let back: Http2Frame = result_unwrap(back_r)
+    if !http2_is_settings_ack(back) {
+        panic("parsed ack: is_settings_ack returned false")
+    }
+    println("settings ACK OK: ACK flag set, payload empty, round-trip verified")
+    return 0
+}
+
+# ============================================================================
+# Section 3: HPACK integer encoding (RFC 7541 §5.1).
+# ============================================================================
+
+fn test_hpack_integer() -> int uses IO {
+    # RFC 7541 §5.1 example: 1337 with 5-bit prefix is 3 bytes [0x1f, 0x9a, 0x0a].
+    let enc: str = http2_hpack_encode_integer(1337, 5, 0)
+    if enc.len() != 3 {
+        panic("1337 (5-bit): encoded " + enc.len().to_str() + " bytes, expected 3")
+    }
+    if enc.byte_at(0) != 31 {
+        panic("1337 (5-bit) byte 0: " + enc.byte_at(0).to_str() + ", expected 31")
+    }
+    if enc.byte_at(1) != 154 {
+        panic("1337 (5-bit) byte 1: " + enc.byte_at(1).to_str() + ", expected 154")
+    }
+    if enc.byte_at(2) != 10 {
+        panic("1337 (5-bit) byte 2: " + enc.byte_at(2).to_str() + ", expected 10")
+    }
+    # Decode.
+    let d: HpackDecoder = http2_hpack_decoder_new(enc)
+    let v: int = http2_hpack_decode_integer(d, 5)
+    if d.err != "" {
+        panic("decode 1337: " + d.err)
+    }
+    if v != 1337 {
+        panic("decode 1337: got " + v.to_str())
+    }
+    if d.pos != 3 {
+        panic("decode 1337: pos = " + d.pos.to_str() + ", expected 3")
+    }
+    # Single-byte values (less than prefix_max).
+    let enc_30: str = http2_hpack_encode_integer(30, 5, 0)
+    if enc_30.len() != 1 || enc_30.byte_at(0) != 30 {
+        panic("30 (5-bit): got " + enc_30.len().to_str() + " bytes, byte0=" + enc_30.byte_at(0).to_str())
+    }
+    # prefix_flags are OR'd into the high bits.
+    let enc_flagged: str = http2_hpack_encode_integer(0, 5, 64)
+    if enc_flagged.byte_at(0) != 64 {
+        panic("0 (5-bit, flags=64): byte0=" + enc_flagged.byte_at(0).to_str() + ", expected 64")
+    }
+    # Large value (multi-byte).
+    let enc_big: str = http2_hpack_encode_integer(1000000, 5, 0)
+    let d2: HpackDecoder = http2_hpack_decoder_new(enc_big)
+    let v2: int = http2_hpack_decode_integer(d2, 5)
+    if v2 != 1000000 {
+        panic("1000000 (5-bit): got " + v2.to_str())
+    }
+    println("HPACK integer OK: 30, 1337, 1000000 round-tripped (5-bit prefix)")
+    return 0
+}
+
+# ============================================================================
+# Section 4: HPACK string encoding (literal, no Huffman).
+# ============================================================================
+
+fn test_hpack_string() -> int uses IO {
+    let test_strings: list[str] = ["", "a", "hello", "www.example.com", "value with spaces"]
+    let mut i: int = 0
+    while i < test_strings.len() {
+        let s: str = test_strings.get(i)
+        let enc: str = http2_hpack_encode_string(s)
+        # 1 length byte (for short strings) + the raw bytes.
+        if enc.len() != 1 + s.len() {
+            panic("encode '" + s + "': " + enc.len().to_str() + " bytes, expected " + (1 + s.len()).to_str())
+        }
+        # The H bit MUST be 0 (no Huffman).
+        if int_and(enc.byte_at(0), 128) != 0 {
+            panic("encode '" + s + "': H bit set")
+        }
+        # Decode round-trip.
+        let d: HpackDecoder = http2_hpack_decoder_new(enc)
+        let v: str = http2_hpack_decode_string(d)
+        if d.err != "" {
+            panic("decode '" + s + "': " + d.err)
+        }
+        if v != s {
+            panic("round-trip '" + s + "': got '" + v + "'")
+        }
+        i = i + 1
+    }
+    println("HPACK string OK: 5 strings round-tripped (literal, no Huffman)")
+    return 0
+}
+
+# ============================================================================
+# Section 5: HPACK header block encode/decode round-trip.
+# ============================================================================
+
+fn test_hpack_header_block() -> int uses IO {
+    let headers: list[HttpHeader] = [
+        HttpHeader { name: ":method", value: "POST" },
+        HttpHeader { name: ":path", value: "/api/v1/submit" },
+        HttpHeader { name: ":scheme", value: "https" },
+        HttpHeader { name: ":authority", value: "api.example.com" },
+        HttpHeader { name: "content-type", value: "application/json" },
+        HttpHeader { name: "content-length", value: "42" },
+        HttpHeader { name: "accept-encoding", value: "gzip, deflate" },
+        HttpHeader { name: "user-agent", value: "halis-http2/0.58" },
+        HttpHeader { name: "x-request-id", value: "abc-123-def-456" }
+    ]
+    let block: str = http2_hpack_encode_header_block(headers)
+    let back_r: Result[list[HttpHeader], str] = http2_hpack_decode_block(block)
+    if !result_is_ok(back_r) {
+        panic("decode: " + result_err_or(back_r, ""))
+    }
+    let back: list[HttpHeader] = result_unwrap(back_r)
+    if back.len() != headers.len() {
+        panic("header count: " + back.len().to_str() + " vs " + headers.len().to_str())
+    }
+    let mut i: int = 0
+    while i < headers.len() {
+        let h: HttpHeader = headers.get(i)
+        let b: HttpHeader = back.get(i)
+        if h.name != b.name {
+            panic("header " + i.to_str() + " name: '" + h.name + "' vs '" + b.name + "'")
+        }
+        if h.value != b.value {
+            panic("header " + i.to_str() + " value: '" + h.value + "' vs '" + b.value + "'")
+        }
+        i = i + 1
+    }
+    println("HPACK header block OK: " + headers.len().to_str() + " headers round-tripped")
+    return 0
+}
+
+# ============================================================================
+# Section 6: HPACK static table lookup.
+# ============================================================================
+
+fn test_hpack_static_table() -> int uses IO {
+    # Verify a few known entries from RFC 7541 Appendix A.
+    let r1: Result[HpackStaticEntry, str] = http2_hpack_static_lookup(1)
+    if !result_is_ok(r1) {
+        panic("lookup[1]: " + result_err_or(r1, ""))
+    }
+    let e1: HpackStaticEntry = result_unwrap(r1)
+    if e1.name != ":authority" {
+        panic("static[1] name: '" + e1.name + "'")
+    }
+    let r2: Result[HpackStaticEntry, str] = http2_hpack_static_lookup(2)
+    let e2: HpackStaticEntry = result_unwrap(r2)
+    if e2.name != ":method" || e2.value != "GET" {
+        panic("static[2]: '" + e2.name + ": " + e2.value + "'")
+    }
+    # Index 61 is the last entry (www-authenticate).
+    let r61: Result[HpackStaticEntry, str] = http2_hpack_static_lookup(61)
+    let e61: HpackStaticEntry = result_unwrap(r61)
+    if e61.name != "www-authenticate" {
+        panic("static[61]: '" + e61.name + "'")
+    }
+    # Index 0 and 62+ are out of range.
+    let r0: Result[HpackStaticEntry, str] = http2_hpack_static_lookup(0)
+    if result_is_ok(r0) {
+        panic("static[0] should be Err (reserved)")
+    }
+    let r62: Result[HpackStaticEntry, str] = http2_hpack_static_lookup(62)
+    if result_is_ok(r62) {
+        panic("static[62] should be Err (out of range)")
+    }
+    println("HPACK static table OK: indices 1, 2, 61 verified; 0 and 62 correctly rejected")
+    return 0
+}
+
+# ============================================================================
+# Section 7: HPACK dynamic table — add, lookup, evict.
+# ============================================================================
+
+fn test_hpack_dynamic_table() -> int uses IO {
+    let table: HpackDynamicTable = http2_hpack_dynamic_table_new(4096)
+    # Empty table.
+    if table.entries.len() != 0 {
+        panic("initial len: " + table.entries.len().to_str())
+    }
+    if table.size != 0 {
+        panic("initial size: " + table.size.to_str())
+    }
+    # Add three entries.
+    http2_hpack_dynamic_table_add(table, "x-name-1", "value1")
+    http2_hpack_dynamic_table_add(table, "x-name-2", "value2")
+    http2_hpack_dynamic_table_add(table, "x-name-3", "value3")
+    if table.entries.len() != 3 {
+        panic("after 3 adds len: " + table.entries.len().to_str())
+    }
+    # Newest is index 1 (front of the list).
+    let r1: Result[HpackStaticEntry, str] = http2_hpack_dynamic_table_lookup(table, 1)
+    let e1: HpackStaticEntry = result_unwrap(r1)
+    if e1.name != "x-name-3" {
+        panic("dynamic[1]: '" + e1.name + "'")
+    }
+    # Oldest is index 3 (end of the list).
+    let r3: Result[HpackStaticEntry, str] = http2_hpack_dynamic_table_lookup(table, 3)
+    let e3: HpackStaticEntry = result_unwrap(r3)
+    if e3.name != "x-name-1" {
+        panic("dynamic[3]: '" + e3.name + "'")
+    }
+    # Combined lookup: index 62 = static[1..61] + dynamic[1] = newest dynamic.
+    let r62: Result[HpackStaticEntry, str] = http2_hpack_lookup_index(62, table)
+    let e62: HpackStaticEntry = result_unwrap(r62)
+    if e62.name != "x-name-3" {
+        panic("index 62: '" + e62.name + "'")
+    }
+    # Index 64 = static 61 + dynamic 3 = oldest dynamic.
+    let r64: Result[HpackStaticEntry, str] = http2_hpack_lookup_index(64, table)
+    let e64: HpackStaticEntry = result_unwrap(r64)
+    if e64.name != "x-name-1" {
+        panic("index 64: '" + e64.name + "'")
+    }
+    # Index 65 = out of range.
+    let r65: Result[HpackStaticEntry, str] = http2_hpack_lookup_index(65, table)
+    if result_is_ok(r65) {
+        panic("index 65 should be Err (out of range)")
+    }
+    println("HPACK dynamic table OK: 3 adds, lookup indices 62 (newest) and 64 (oldest)")
+    return 0
+}
+
+# ============================================================================
+# Section 8: HPACK dynamic table — size-based eviction.
+# ============================================================================
+
+fn test_hpack_dynamic_table_eviction() -> int uses IO {
+    # A small table (max_size = 100) — entries evict quickly.
+    let table: HpackDynamicTable = http2_hpack_dynamic_table_new(100)
+    # Each entry is name.len + value.len + 32 bytes of overhead.
+    # "aaaa/dddd" = 4+4+32 = 40 bytes.
+    http2_hpack_dynamic_table_add(table, "aaaa", "dddd")
+    if table.size != 40 {
+        panic("after 1 add: " + table.size.to_str() + ", expected 40")
+    }
+    http2_hpack_dynamic_table_add(table, "bbbb", "eeee")
+    if table.size != 80 {
+        panic("after 2 adds: " + table.size.to_str() + ", expected 80")
+    }
+    if table.entries.len() != 2 {
+        panic("entries.len: " + table.entries.len().to_str())
+    }
+    # A third 40-byte entry would make total 120 > 100, so the oldest
+    # is evicted first. After add: 80 - 40 + 40 = 80 bytes, 2 entries.
+    http2_hpack_dynamic_table_add(table, "cccc", "ffff")
+    if table.size != 80 {
+        panic("after 3 adds (with eviction): " + table.size.to_str() + ", expected 80")
+    }
+    if table.entries.len() != 2 {
+        panic("entries.len after eviction: " + table.entries.len().to_str() + ", expected 2")
+    }
+    # The oldest (aaaa=dddd) should be gone; newest is cccc=ffff.
+    let r1: Result[HpackStaticEntry, str] = http2_hpack_dynamic_table_lookup(table, 1)
+    let e1: HpackStaticEntry = result_unwrap(r1)
+    if e1.name != "cccc" {
+        panic("newest after eviction: '" + e1.name + "'")
+    }
+    let r2: Result[HpackStaticEntry, str] = http2_hpack_dynamic_table_lookup(table, 2)
+    let e2: HpackStaticEntry = result_unwrap(r2)
+    if e2.name != "bbbb" {
+        panic("oldest after eviction: '" + e2.name + "'")
+    }
+    # The third (aaaa=dddd) should be gone — index 3 = Err.
+    let r3: Result[HpackStaticEntry, str] = http2_hpack_dynamic_table_lookup(table, 3)
+    if result_is_ok(r3) {
+        panic("index 3 should be Err (evicted)")
+    }
+    println("HPACK eviction OK: 3 adds to 100-byte table, oldest evicted, size stays at 80")
+    return 0
+}
+
+# ============================================================================
+# Section 9: HPACK — indexed header representation (RFC 7541 §6.1).
+# ============================================================================
+
+fn test_hpack_indexed_rep() -> int uses IO {
+    # Build a header block with a single indexed rep: 0x82 = indexed,
+    # index 2 (= ":method GET" from the static table).
+    let block: str = chr(130)
+    let back_r: Result[list[HttpHeader], str] = http2_hpack_decode_block(block)
+    if !result_is_ok(back_r) {
+        panic("decode indexed: " + result_err_or(back_r, ""))
+    }
+    let back: list[HttpHeader] = result_unwrap(back_r)
+    if back.len() != 1 {
+        panic("indexed: " + back.len().to_str() + " headers, expected 1")
+    }
+    if back.get(0).name != ":method" || back.get(0).value != "GET" {
+        panic("indexed: '" + back.get(0).name + ": " + back.get(0).value + "'")
+    }
+    println("HPACK indexed rep OK: 0x82 decoded to ':method: GET' (static[2])")
+    return 0
+}
+
+# ============================================================================
+# Section 10: PING frame + ACK.
+# ============================================================================
+
+fn test_ping() -> int uses IO {
+    let opaque: str = "abcdefgh"
+    let ping: Http2Frame = http2_make_ping_frame(opaque)
+    if ping.frame_type != http2_frame_type_ping() {
+        panic("ping frame_type: " + ping.frame_type.to_str())
+    }
+    if ping.stream_id != 0 {
+        panic("ping stream_id: " + ping.stream_id.to_str())
+    }
+    if ping.payload.len() != 8 {
+        panic("ping payload len: " + ping.payload.len().to_str())
+    }
+    if ping.payload != opaque {
+        panic("ping payload mismatch")
+    }
+    # Serialize + parse round-trip.
+    let wire: str = http2_serialize_frame(ping)
+    let back_r: Result[Http2Frame, str] = http2_parse_frame(wire)
+    if !result_is_ok(back_r) {
+        panic("ping parse: " + result_err_or(back_r, ""))
+    }
+    let back: Http2Frame = result_unwrap(back_r)
+    if back.payload != opaque {
+        panic("ping round-trip payload mismatch")
+    }
+    # Build the ACK and verify.
+    let ack: Http2Frame = http2_make_ping_ack_frame(back.payload)
+    if int_and(ack.flags, http2_flag_ack()) == 0 {
+        panic("ping ACK: flag not set")
+    }
+    if ack.payload != opaque {
+        panic("ping ACK payload mismatch")
+    }
+    println("PING OK: 8-byte opaque data round-tripped, ACK built")
+    return 0
+}
+
+# ============================================================================
+# Section 11: HEADERS frame + HPACK decode.
+# ============================================================================
+
+fn test_headers_frame() -> int uses IO {
+    let headers: list[HttpHeader] = [
+        HttpHeader { name: ":method", value: "GET" },
+        HttpHeader { name: ":path", value: "/" },
+        HttpHeader { name: ":scheme", value: "https" },
+        HttpHeader { name: ":authority", value: "example.com" }
+    ]
+    let f: Http2Frame = http2_make_headers_frame(1, headers, true, true)
+    if f.frame_type != http2_frame_type_headers() {
+        panic("headers frame_type: " + f.frame_type.to_str())
+    }
+    if f.stream_id != 1 {
+        panic("headers stream_id: " + f.stream_id.to_str())
+    }
+    if int_and(f.flags, http2_flag_end_stream()) == 0 {
+        panic("END_STREAM not set")
+    }
+    if int_and(f.flags, http2_flag_end_headers()) == 0 {
+        panic("END_HEADERS not set")
+    }
+    let wire: str = http2_serialize_frame(f)
+    let back_r: Result[Http2Frame, str] = http2_parse_frame(wire)
+    if !result_is_ok(back_r) {
+        panic("headers parse: " + result_err_or(back_r, ""))
+    }
+    let back: Http2Frame = result_unwrap(back_r)
+    if int_and(back.flags, http2_flag_end_stream()) == 0 {
+        panic("round-trip END_STREAM not set")
+    }
+    let dec_r: Result[list[HttpHeader], str] = http2_hpack_decode_block(back.payload)
+    if !result_is_ok(dec_r) {
+        panic("headers decode: " + result_err_or(dec_r, ""))
+    }
+    let decoded: list[HttpHeader] = result_unwrap(dec_r)
+    if decoded.len() != headers.len() {
+        panic("decoded header count: " + decoded.len().to_str())
+    }
+    # Check :authority specifically (last in, often missed by off-by-one bugs).
+    let auth: HttpHeader = decoded.get(3)
+    if auth.name != ":authority" || auth.value != "example.com" {
+        panic(":authority mismatch: '" + auth.name + ": " + auth.value + "'")
+    }
+    println("HEADERS OK: 4 headers, END_STREAM+END_HEADERS set, round-tripped")
+    return 0
+}
+
+# ============================================================================
+# Section 12: RST_STREAM frame + payload parser.
+# ============================================================================
+
+fn test_rst_stream() -> int uses IO {
+    let f: Http2Frame = http2_make_rst_stream_frame(5, http2_err_cancel())
+    if f.frame_type != http2_frame_type_rst_stream() {
+        panic("rst frame_type: " + f.frame_type.to_str())
+    }
+    if f.stream_id != 5 {
+        panic("rst stream_id: " + f.stream_id.to_str())
+    }
+    let wire: str = http2_serialize_frame(f)
+    let back_r: Result[Http2Frame, str] = http2_parse_frame(wire)
+    let back: Http2Frame = result_unwrap(back_r)
+    let ec_r: Result[int, str] = http2_parse_rst_stream_payload(back.payload)
+    if !result_is_ok(ec_r) {
+        panic("rst payload parse: " + result_err_or(ec_r, ""))
+    }
+    let ec: int = result_unwrap(ec_r)
+    if ec != http2_err_cancel() {
+        panic("rst error code: " + ec.to_str())
+    }
+    println("RST_STREAM OK: stream_id=5, error=CANCEL")
+    return 0
+}
+
+# ============================================================================
+# Section 13: GOAWAY frame + payload parser (with debug data).
+# ============================================================================
+
+fn test_goaway() -> int uses IO {
+    let f: Http2Frame = http2_make_goaway_frame(7, http2_err_enhance_your_calm(), "too many pings")
+    let wire: str = http2_serialize_frame(f)
+    let back_r: Result[Http2Frame, str] = http2_parse_frame(wire)
+    let back: Http2Frame = result_unwrap(back_r)
+    let g_r: Result[Http2GoawayFrame, str] = http2_parse_goaway_payload(back.payload)
+    if !result_is_ok(g_r) {
+        panic("goaway payload: " + result_err_or(g_r, ""))
+    }
+    let g: Http2GoawayFrame = result_unwrap(g_r)
+    if g.last_stream_id != 7 {
+        panic("goaway last_stream_id: " + g.last_stream_id.to_str())
+    }
+    if g.error_code != http2_err_enhance_your_calm() {
+        panic("goaway error_code: " + g.error_code.to_str())
+    }
+    if g.debug_data != "too many pings" {
+        panic("goaway debug_data: '" + g.debug_data + "'")
+    }
+    println("GOAWAY OK: last_stream_id=7, error=ENHANCE_YOUR_CALM, debug='too many pings'")
+    return 0
+}
+
+# ============================================================================
+# Section 14: WINDOW_UPDATE frame + payload parser.
+# ============================================================================
+
+fn test_window_update() -> int uses IO {
+    # Stream-level.
+    let f1: Http2Frame = http2_make_window_update_frame(5, 1000)
+    let wire1: str = http2_serialize_frame(f1)
+    let b1: Http2Frame = result_unwrap(http2_parse_frame(wire1))
+    let inc1_r: Result[int, str] = http2_parse_window_update_payload(b1.payload)
+    let inc1: int = result_unwrap(inc1_r)
+    if inc1 != 1000 {
+        panic("window_update stream: " + inc1.to_str())
+    }
+    # Connection-level (stream id 0).
+    let f2: Http2Frame = http2_make_window_update_frame(0, 65535)
+    let wire2: str = http2_serialize_frame(f2)
+    let b2: Http2Frame = result_unwrap(http2_parse_frame(wire2))
+    let inc2_r: Result[int, str] = http2_parse_window_update_payload(b2.payload)
+    let inc2: int = result_unwrap(inc2_r)
+    if inc2 != 65535 {
+        panic("window_update conn: " + inc2.to_str())
+    }
+    println("WINDOW_UPDATE OK: stream=5 inc=1000, conn=0 inc=65535")
+    return 0
+}
+
+# ============================================================================
+# Section 15: PUSH_PROMISE frame + payload parser (with header block).
+# ============================================================================
+
+fn test_push_promise() -> int uses IO {
+    let pushed: list[HttpHeader] = [
+        HttpHeader { name: ":method", value: "GET" },
+        HttpHeader { name: ":path", value: "/style.css" },
+        HttpHeader { name: ":scheme", value: "https" },
+        HttpHeader { name: ":authority", value: "example.com" }
+    ]
+    let f: Http2Frame = http2_make_push_promise_frame(1, 2, pushed)
+    let wire: str = http2_serialize_frame(f)
+    let back_r: Result[Http2Frame, str] = http2_parse_frame(wire)
+    let back: Http2Frame = result_unwrap(back_r)
+    let pp_r: Result[Http2PushPromiseFrame, str] = http2_parse_push_promise_payload(back.payload)
+    if !result_is_ok(pp_r) {
+        panic("push_promise payload: " + result_err_or(pp_r, ""))
+    }
+    let pp: Http2PushPromiseFrame = result_unwrap(pp_r)
+    if pp.promised_stream_id != 2 {
+        panic("promised_stream_id: " + pp.promised_stream_id.to_str())
+    }
+    # Decode the pushed header block.
+    let dec_r: Result[list[HttpHeader], str] = http2_hpack_decode_block(pp.header_block)
+    let decoded: list[HttpHeader] = result_unwrap(dec_r)
+    if decoded.len() != pushed.len() {
+        panic("pushed header count: " + decoded.len().to_str())
+    }
+    let p0: HttpHeader = decoded.get(0)
+    if p0.name != ":method" || p0.value != "GET" {
+        panic("pushed[0]: '" + p0.name + ": " + p0.value + "'")
+    }
+    println("PUSH_PROMISE OK: stream_id=1, promised=2, 4 pushed headers round-tripped")
+    return 0
+}
+
+# ============================================================================
+# Section 16: PRIORITY frame + payload parser.
+# ============================================================================
+
+fn test_priority() -> int uses IO {
+    # Non-exclusive, depends on stream 0 (root), weight 16.
+    let f: Http2Frame = http2_make_priority_frame(3, 0, 16, false)
+    let wire: str = http2_serialize_frame(f)
+    let back_r: Result[Http2Frame, str] = http2_parse_frame(wire)
+    let back: Http2Frame = result_unwrap(back_r)
+    let p_r: Result[Http2PriorityFrame, str] = http2_parse_priority_payload(back.payload)
+    if !result_is_ok(p_r) {
+        panic("priority payload: " + result_err_or(p_r, ""))
+    }
+    let p: Http2PriorityFrame = result_unwrap(p_r)
+    if p.dependency_stream_id != 0 {
+        panic("priority dep: " + p.dependency_stream_id.to_str())
+    }
+    if p.weight != 16 {
+        panic("priority weight: " + p.weight.to_str())
+    }
+    if p.exclusive {
+        panic("priority exclusive: true")
+    }
+    # Exclusive: dep on stream 5, weight 255.
+    let f2: Http2Frame = http2_make_priority_frame(5, 3, 256, true)
+    let wire2: str = http2_serialize_frame(f2)
+    let back2: Http2Frame = result_unwrap(http2_parse_frame(wire2))
+    let p2: Http2PriorityFrame = result_unwrap(http2_parse_priority_payload(back2.payload))
+    if p2.dependency_stream_id != 3 {
+        panic("priority2 dep: " + p2.dependency_stream_id.to_str())
+    }
+    if p2.weight != 256 {
+        panic("priority2 weight: " + p2.weight.to_str())
+    }
+    if !p2.exclusive {
+        panic("priority2 exclusive: false")
+    }
+    println("PRIORITY OK: stream=3 dep=0 weight=16; stream=5 dep=3 weight=256 exclusive")
+    return 0
+}
+
+# ============================================================================
+# Section 17: Connection preface verification.
+# ============================================================================
+
+fn test_preface() -> int uses IO {
+    let preface: str = http2_connection_preface()
+    if preface.len() != 24 {
+        panic("preface length: " + preface.len().to_str())
+    }
+    let r: Result[int, str] = http2_verify_client_preface(preface)
+    if !result_is_ok(r) {
+        panic("verify preface: " + result_err_or(r, ""))
+    }
+    if result_unwrap(r) != 24 {
+        panic("verify preface: consumed wrong number of bytes")
+    }
+    # A bad preface (HTTP/1.x request line) MUST be rejected.
+    let bad_r: Result[int, str] = http2_verify_client_preface("GET / HTTP/1.1")
+    if result_is_ok(bad_r) {
+        panic("bad preface should be rejected")
+    }
+    println("preface OK: 24-byte magic verified; HTTP/1.x preface rejected")
+    return 0
+}
+
+# ============================================================================
+# Section 18: Stream state machine.
+# ============================================================================
+
+fn test_stream_state() -> int uses IO {
+    let s: Http2Stream = http2_stream_new(1, 65535)
+    if s.state != http2_stream_state_idle() {
+        panic("initial state: " + http2_stream_state_name(s.state))
+    }
+    http2_stream_open(s)
+    if s.state != http2_stream_state_open() {
+        panic("after open: " + http2_stream_state_name(s.state))
+    }
+    # Peer sends END_STREAM -> half-closed-remote.
+    http2_stream_close_remote(s)
+    if s.state != http2_stream_state_half_closed_remote() {
+        panic("after close_remote: " + http2_stream_state_name(s.state))
+    }
+    # We send END_STREAM -> closed.
+    http2_stream_close_local(s)
+    if !http2_stream_is_closed(s) {
+        panic("after close_local: " + http2_stream_state_name(s.state))
+    }
+    # Reset path: open -> closed.
+    let s2: Http2Stream = http2_stream_new(3, 65535)
+    http2_stream_open(s2)
+    http2_stream_reset(s2)
+    if !http2_stream_is_closed(s2) {
+        panic("after reset: " + http2_stream_state_name(s2.state))
+    }
+    println("stream state OK: idle->open->half-closed-remote->closed; open->closed (reset)")
+    return 0
+}
+
+# ============================================================================
+# Section 19: Connection alloc stream — odd ids for client, even for server.
+# ============================================================================
+
+fn test_connection_alloc() -> int uses IO {
+    let client: Http2Connection = http2_connection_new(true)
+    if client.next_stream_id != 1 {
+        panic("client next_stream_id: " + client.next_stream_id.to_str())
+    }
+    let s1: int = http2_connection_alloc_stream(client, false)
+    if s1 != 1 {
+        panic("client first stream: " + s1.to_str())
+    }
+    let s2: int = http2_connection_alloc_stream(client, false)
+    if s2 != 3 {
+        panic("client second stream: " + s2.to_str())
+    }
+    if client.next_stream_id != 5 {
+        panic("client next_stream_id after 2 allocs: " + client.next_stream_id.to_str())
+    }
+    # Server: even ids starting from 2.
+    let server: Http2Connection = http2_connection_new(false)
+    if server.next_stream_id != 2 {
+        panic("server next_stream_id: " + server.next_stream_id.to_str())
+    }
+    let s3: int = http2_connection_alloc_stream(server, false)
+    if s3 != 2 {
+        panic("server first stream: " + s3.to_str())
+    }
+    let s4: int = http2_connection_alloc_stream(server, false)
+    if s4 != 4 {
+        panic("server second stream: " + s4.to_str())
+    }
+    # Find the allocated streams.
+    let found_opt: Option[Http2Stream] = http2_connection_find_stream(client, 1)
+    if option_is_none(found_opt) {
+        panic("find stream 1: None")
+    }
+    let found: Http2Stream = option_unwrap(found_opt)
+    if found.stream_id != 1 {
+        panic("found.stream_id: " + found.stream_id.to_str())
+    }
+    let not_found_opt: Option[Http2Stream] = http2_connection_find_stream(client, 999)
+    if option_is_some(not_found_opt) {
+        panic("find stream 999: should be None")
+    }
+    println("connection_alloc OK: client allocs 1, 3 (odd); server allocs 2, 4 (even); find OK")
+    return 0
+}
+
+# ============================================================================
+# Section 20: Flow control accounting.
+# ============================================================================
+
+fn test_flow_control() -> int uses IO {
+    let conn: Http2Connection = http2_connection_new(true)
+    let initial_window: int = conn.conn_send_window
+    let sid: int = http2_connection_alloc_stream(conn, false)
+    # Send 1000 bytes.
+    let send_r: Result[int, str] = http2_connection_send_data(conn, sid, 1000)
+    if !result_is_ok(send_r) {
+        panic("send_data 1000: " + result_err_or(send_r, ""))
+    }
+    let s1: Http2Stream = option_unwrap(http2_connection_find_stream(conn, sid))
+    if s1.send_window != initial_window - 1000 {
+        panic("after send 1000: stream window=" + s1.send_window.to_str())
+    }
+    if conn.conn_send_window != initial_window - 1000 {
+        panic("after send 1000: conn window=" + conn.conn_send_window.to_str())
+    }
+    # WINDOW_UPDATE on stream (credit 500).
+    http2_connection_recv_window_update(conn, sid, 500)
+    let s2: Http2Stream = option_unwrap(http2_connection_find_stream(conn, sid))
+    if s2.send_window != initial_window - 1000 + 500 {
+        panic("after WU stream: " + s2.send_window.to_str())
+    }
+    # WINDOW_UPDATE on connection (credit 1000).
+    http2_connection_recv_window_update(conn, 0, 1000)
+    if conn.conn_send_window != initial_window {
+        panic("after WU conn: " + conn.conn_send_window.to_str())
+    }
+    # Send past the window should fail.
+    let over_r: Result[int, str] = http2_connection_send_data(conn, sid, initial_window + 100)
+    if result_is_ok(over_r) {
+        panic("send past window: should fail")
+    }
+    println("flow_control OK: debit 1000, credit 500+1000, send-past-window rejected")
+    return 0
+}
+
+# ============================================================================
+# Section 21: ALPN negotiation (h2 selection).
+# ============================================================================
+
+fn test_alpn() -> int uses IO {
+    # Successful negotiation: client offers ['h2', 'http/1.1'],
+    # server supports ['h2'] -> 'h2' wins.
+    let offered: list[str] = ["h2", "http/1.1"]
+    let supported: list[str] = ["h2"]
+    let r1: Option[str] = http2_alpn_negotiate(offered, supported)
+    if option_is_none(r1) {
+        panic("ALPN h2 negotiation: None")
+    }
+    if option_unwrap(r1) != "h2" {
+        panic("ALPN h2: got '" + option_unwrap(r1) + "'")
+    }
+    # Server prefers the client's first matching: ['http/1.1', 'h2']
+    # server supports ['h2', 'http/1.1'] -> 'http/1.1' (first in client list).
+    let offered2: list[str] = ["http/1.1", "h2"]
+    let supported2: list[str] = ["h2", "http/1.1"]
+    let r2: Option[str] = http2_alpn_negotiate(offered2, supported2)
+    if option_is_none(r2) {
+        panic("ALPN http/1.1 negotiation: None")
+    }
+    if option_unwrap(r2) != "http/1.1" {
+        panic("ALPN http/1.1: got '" + option_unwrap(r2) + "'")
+    }
+    # No overlap -> None.
+    let offered3: list[str] = ["h3"]
+    let supported3: list[str] = ["h2", "http/1.1"]
+    let r3: Option[str] = http2_alpn_negotiate(offered3, supported3)
+    if option_is_some(r3) {
+        panic("ALPN no overlap: should be None")
+    }
+    # h2c token is not ALPN-negotiable (cleartext only).
+    if http2_alpn_h2() != "h2" {
+        panic("h2 token: '" + http2_alpn_h2() + "'")
+    }
+    if http2_alpn_h2c() != "h2c" {
+        panic("h2c token: '" + http2_alpn_h2c() + "'")
+    }
+    println("ALPN OK: h2 negotiated, http/1.1 first-match, no-overlap returns None")
+    return 0
+}
+
+# ============================================================================
+# Section 22: HPACK Huffman deferral (returns Err on H=1).
+# ============================================================================
+
+fn test_huffman_deferral() -> int uses IO {
+    # A literal-without-indexing header block with a Huffman-coded name.
+    # byte 0: 0x00 = literal without indexing, name_idx=0 (literal name follows)
+    # byte 1: 0x80 = H=1 (Huffman), length=0
+    let huffman_block: str = chr(0) + chr(128)
+    let r: Result[list[HttpHeader], str] = http2_hpack_decode_block(huffman_block)
+    if result_is_ok(r) {
+        panic("Huffman block: should be Err (deferred)")
+    }
+    let err: str = result_err_or(r, "")
+    if !err.contains("Huffman") {
+        panic("Huffman error message: '" + err + "'")
+    }
+    println("Huffman deferral OK: H=1 strings correctly rejected with Err")
+    return 0
+}
+
+# ============================================================================
+# Section 23: SETTINGS decode rejects invalid values.
+# ============================================================================
+
+fn test_settings_validation() -> int uses IO {
+    # ENABLE_PUSH must be 0 or 1. A payload with value 2 is rejected.
+    # Build payload: ID=2 (enable_push), value=2.
+    let bad_payload: str = chr(0) + chr(2) + chr(0) + chr(0) + chr(0) + chr(2)
+    let r: Result[Http2Settings, str] = http2_settings_decode(bad_payload)
+    if result_is_ok(r) {
+        panic("ENABLE_PUSH=2: should be Err")
+    }
+    # MAX_FRAME_SIZE must be in [16384, 16777215]. A value of 100 is rejected.
+    let bad_payload2: str = chr(0) + chr(5) + chr(0) + chr(0) + chr(0) + chr(100)
+    let r2: Result[Http2Settings, str] = http2_settings_decode(bad_payload2)
+    if result_is_ok(r2) {
+        panic("MAX_FRAME_SIZE=100: should be Err")
+    }
+    # Payload not a multiple of 6 is rejected.
+    let r3: Result[Http2Settings, str] = http2_settings_decode("abc")
+    if result_is_ok(r3) {
+        panic("3-byte payload: should be Err")
+    }
+    println("settings validation OK: ENABLE_PUSH=2, MAX_FRAME_SIZE=100, odd payload rejected")
+    return 0
+}
+
+# ============================================================================
+# Main — run all sections in order.
+# ============================================================================
+
+fn main() -> int uses IO {
+    if test_length_24() != 0 { return 1 }
+    if test_stream_id_31() != 0 { return 2 }
+    if test_settings_round_trip() != 0 { return 3 }
+    if test_settings_ack() != 0 { return 4 }
+    if test_hpack_integer() != 0 { return 5 }
+    if test_hpack_string() != 0 { return 6 }
+    if test_hpack_header_block() != 0 { return 7 }
+    if test_hpack_static_table() != 0 { return 8 }
+    if test_hpack_dynamic_table() != 0 { return 9 }
+    if test_hpack_dynamic_table_eviction() != 0 { return 10 }
+    if test_hpack_indexed_rep() != 0 { return 11 }
+    if test_ping() != 0 { return 12 }
+    if test_headers_frame() != 0 { return 13 }
+    if test_rst_stream() != 0 { return 14 }
+    if test_goaway() != 0 { return 15 }
+    if test_window_update() != 0 { return 16 }
+    if test_push_promise() != 0 { return 17 }
+    if test_priority() != 0 { return 18 }
+    if test_preface() != 0 { return 19 }
+    if test_stream_state() != 0 { return 20 }
+    if test_connection_alloc() != 0 { return 21 }
+    if test_flow_control() != 0 { return 22 }
+    if test_alpn() != 0 { return 23 }
+    if test_huffman_deferral() != 0 { return 24 }
+    if test_settings_validation() != 0 { return 25 }
+    println("ALL HTTP/2 TESTS PASSED")
+    return 0
+}

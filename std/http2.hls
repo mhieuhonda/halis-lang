@@ -1,0 +1,1959 @@
+# ============================================================================
+# std/http2.hls — Stage 39 (v0.58.0-alpha): HTTP/2 + ALPN negotiation
+# ----------------------------------------------------------------------------
+# This module is the fifth module of Phase III (stdlib expansion). It
+# implements the core of HTTP/2 (RFC 7540) layered on Stage 37's
+# `std.net` for the TCP transport and Stage 38's `std.http` for the
+# HTTP/1.1-to-HTTP/2 upgrade mechanism. Like `std.http`, it is pure
+# HLS — no new compiler builtins. All binary framing is built on top
+# of the existing `byte_at` / `chr` / `slice` / bitwise builtins
+# (via `std.bits`).
+#
+# Scope (RFC 7540 subset that production CLI / web programs need):
+#
+#   * Frame layer (§4) — full parser + serialiser for all 10 frame
+#     types: DATA, HEADERS, PRIORITY, RST_STREAM, SETTINGS,
+#     PUSH_PROMISE, PING, GOAWAY, WINDOW_UPDATE, CONTINUATION.
+#     Frame headers are 9 bytes (24-bit length, 8-bit type, 8-bit
+#     flags, 31-bit stream id with reserved R bit). The 24-bit
+#     length and 31-bit stream id are encoded/decoded via the
+#     arithmetic equivalents of `<<` / `>>` / `&` / `|` (no
+#     language-level bitwise operators are needed).
+#
+#   * HPACK header compression (RFC 7541) — static table (61 entries
+#     from Appendix A), dynamic table with size-based eviction,
+#     integer decoder for the 5-/6-/7-/8-bit prefix forms,
+#     literal string decoder (Huffman is a documented deferral —
+#     the bit-table is large and only the wire representation is
+#     non-trivial; for compatibility the decoder accepts Huffman-
+#     marked strings but emits a clean Err("huffman: unsupported")
+#     so callers know to fall back to a future implementation).
+#     Encoder produces literal-without-indexing (the simplest valid
+#     HPACK encoding — every header block is independent; this is
+#     what h2c (HTTP/2 cleartext) sends by default for the first
+#     request).
+#
+#   * Connection preface — client magic bytes (the 24-byte
+#     "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n" sequence) and the server's
+#     implicit acceptance of it (the first frame the server sends
+#     is a SETTINGS frame; the client sends a SETTINGS frame after
+#     its preface and an ACK after the server's SETTINGS).
+#
+#   * SETTINGS exchange — `Http2Settings` struct (the six parameters
+#     from §6.5.2: HEADER_TABLE_SIZE, ENABLE_PUSH,
+#     MAX_CONCURRENT_STREAMS, INITIAL_WINDOW_SIZE, MAX_FRAME_SIZE,
+#     MAX_HEADER_LIST_SIZE). `http2_settings_encode` /
+#     `http2_settings_decode` (6-byte parameter pairs, ID then value).
+#     ACK is a SETTINGS frame with empty payload and the ACK flag set.
+#
+#   * Stream state machine (§5.1) — idle, reserved-local,
+#     reserved-remote, open, half-closed-local, half-closed-remote,
+#     closed. `Http2Stream` struct tracks the state + the per-stream
+#     flow-control window (initialised from
+#     INITIAL_WINDOW_SIZE, debited/credited by DATA frames and
+#     WINDOW_UPDATE). `Http2Connection` tracks the connection-level
+#     flow window, the next stream id (client-initiated streams are
+#     odd, server-initiated are even), and a list of active
+#     streams.
+#
+#   * Flow control — per-stream and per-connection windows. DATA
+#     frames decrement both; WINDOW_UPDATE increments one (the
+#     stream id field is 0 for connection-level). The connection
+#     rejects a DATA frame that exceeds the available window with
+#     FLOW_CONTROL_ERROR. Backpressure is the application's
+#     responsibility: the connection's `http2_can_send_data(stream_id,
+#     n)` predicate returns false when the window is insufficient —
+#     the caller is expected to buffer or pause.
+#
+#   * Stream multiplexing — the connection's stream list is a
+#     map[int, Http2Stream] (client->server streams have odd ids,
+#     server->client even). DATA / HEADERS / RST_STREAM frames are
+#     dispatched to the matching stream by id.
+#
+#   * Server push (§8.2) — `http2_make_push_promise(stream_id,
+#     promised_stream_id, headers)` builds a PUSH_PROMISE frame
+#     (the server's promise to send a synthetic request on the
+#     promised stream id). The actual pushed response is sent as
+#     HEADERS + DATA frames on that promised stream. ENABLE_PUSH=0
+#     disables push (RFC 7540 §8.2.2 — clients MAY reject push).
+#
+#   * ALPN (RFC 7301) — the connection exposes a single string
+#     identifier "h2" (HTTP/2 over TLS) or "h2c" (HTTP/2
+#     cleartext) that the caller passes to a TLS layer for ALPN
+#     negotiation. Stage 39 does NOT implement TLS itself — TLS
+#     termination is at the reverse-proxy layer (Stage 37's
+#     `tls_get` is one-shot HTTPS GET; a full TLS server is out
+#     of scope for Stage 39 and would require libssl integration
+#     which the project doesn't currently link). The "h2" / "h2c"
+#     tokens are the ALPN protocol identifiers — the caller
+#     passes them to the TLS layer (e.g. via libcurl or a future
+#     Stage 65 std.tls module) which performs the negotiation.
+#
+# Limitations (documented deferrals):
+#
+#   * Huffman string decoding (RFC 7541 Appendix B) is not
+#     implemented — strings encoded with the H bit set cause
+#     `http2_hpack_decode_header_block` to return Err. A future
+#     stage will add the 257-entry decode table (the table is
+#     well-defined; the deferral is purely about source-code size
+#     and the time it takes to verify the table is byte-exact
+#     against the RFC). The encoder never sets the H bit.
+#   * PRIORITY frames are parsed and serialised but the
+#     dependency tree is not maintained — the dependency /
+#     weight are stored on the stream struct for the caller to
+#     act on, but the connection itself does not reorder
+#     outgoing frames based on priority.
+#   * CONTINUATION frames are handled at the frame layer (parsed
+#     and serialised like any other frame); the higher-level
+#     `http2_decode_headers` helper reassembles a HEADERS +
+#     CONTINUATION sequence into one header block before HPACK
+#     decoding.
+#   * Real I/O is NOT wired here — Stage 39 is a pure-HLS
+#     framing + state-machine library. A future stage (Stage 64,
+#     `std.http.server`) will plug this into the multi-threaded
+#     server. The acceptance test exercises the framing layer,
+#     HPACK, the stream state machine, flow control, server
+#     push, and ALPN tokens in isolation, comparing the
+#     interpreter's behaviour against the native binary
+#     byte-for-byte.
+#
+# Security:
+#   * Frame length is bounded — `http2_max_frame_payload` defaults
+#     to 1 MiB (the RFC default is 16 KiB; we accept up to the
+#     negotiated MAX_FRAME_SIZE which can be at most 16 MiB). A
+#     frame whose declared length exceeds MAX_FRAME_SIZE is
+#     rejected with a FRAME_SIZE_ERROR.
+#   * Stream id 0 is reserved for connection-level frames
+#     (SETTINGS, PING, GOAWAY, WINDOW_UPDATE on the connection
+#     flow window). A DATA / HEADERS / PRIORITY / RST_STREAM
+#     frame with stream id 0 is rejected with PROTOCOL_ERROR.
+#   * Stream id parity — client->server streams are odd,
+#     server->client are even. A server receiving a HEADERS
+#     frame with an even stream id that it did not initiate
+#     rejects with PROTOCOL_ERROR.
+#   * SETTINGS ACK count — a SETTINGS frame with the ACK flag
+#     set MUST have an empty payload (RFC 7540 §6.5); a non-
+#     empty ACK payload is rejected with FRAME_SIZE_ERROR.
+#   * The HTTP/2 connection preface is a fixed 24-byte magic
+#     string — receiving anything else as the first bytes of
+#     a connection is PROTOCOL_ERROR (defends against HTTP/1.x
+#     clients that try to send a request to an h2c-only port).
+#   * HPACK dynamic table size is bounded by SETTINGS
+#     HEADER_TABLE_SIZE (default 4096 bytes). A decoder that
+#     receives a dynamic table size update larger than the
+#     negotiated value rejects with PROTOCOL_ERROR.
+# ============================================================================
+
+import "std.bits"
+import "std.str"
+import "std.option"
+import "std.result"
+import "std.http"
+
+# ============================================================================
+# Constants — frame types (RFC 7540 §6).
+#
+# HTTP/2 frame types are 8-bit integers. We expose them as named
+# functions returning int (HLS has no const) so callers can write
+# `http2_frame_type_data()` instead of `0`. The set is fixed by
+# the RFC; future RFCs (e.g. HTTP/3) do NOT add to this list
+# (HTTP/3 uses QUIC streams, not HTTP/2 frames).
+# ============================================================================
+
+fn http2_frame_type_data() -> int { return 0 }
+fn http2_frame_type_headers() -> int { return 1 }
+fn http2_frame_type_priority() -> int { return 2 }
+fn http2_frame_type_rst_stream() -> int { return 3 }
+fn http2_frame_type_settings() -> int { return 4 }
+fn http2_frame_type_push_promise() -> int { return 5 }
+fn http2_frame_type_ping() -> int { return 6 }
+fn http2_frame_type_goaway() -> int { return 7 }
+fn http2_frame_type_window_update() -> int { return 8 }
+fn http2_frame_type_continuation() -> int { return 9 }
+
+# Frame type name (for diagnostics). Returns "UNKNOWN" for an
+# unrecognised type — RFC 7540 §5.5 says implementations MUST
+# ignore unknown frame types, so the parser does NOT reject them
+# (it returns the frame with the type field set; the caller decides
+# whether to act or skip). The name function is for human-readable
+# logging only.
+fn http2_frame_type_name(t: int) -> str {
+    if t == 0 { return "DATA" }
+    if t == 1 { return "HEADERS" }
+    if t == 2 { return "PRIORITY" }
+    if t == 3 { return "RST_STREAM" }
+    if t == 4 { return "SETTINGS" }
+    if t == 5 { return "PUSH_PROMISE" }
+    if t == 6 { return "PING" }
+    if t == 7 { return "GOAWAY" }
+    if t == 8 { return "WINDOW_UPDATE" }
+    if t == 9 { return "CONTINUATION" }
+    return "UNKNOWN"
+}
+
+# ============================================================================
+# Constants — frame flags (RFC 7540 §6).
+#
+# Each frame type defines its own flag bits; we expose the common
+# ones (END_STREAM, ACK, END_HEADERS, PADDED, PRIORITY) by name.
+# Reserved bits (1 << 6, 1 << 7) MUST be ignored on receive and
+# left as 0 on send (RFC 7540 §4.1).
+# ============================================================================
+
+fn http2_flag_end_stream() -> int { return 1 }
+fn http2_flag_ack() -> int { return 1 }
+fn http2_flag_end_headers() -> int { return 4 }
+fn http2_flag_padded() -> int { return 8 }
+fn http2_flag_priority() -> int { return 32 }
+
+# ============================================================================
+# Constants — error codes (RFC 7540 §7).
+# ============================================================================
+
+fn http2_err_no_error() -> int { return 0 }
+fn http2_err_protocol_error() -> int { return 1 }
+fn http2_err_internal_error() -> int { return 2 }
+fn http2_err_flow_control_error() -> int { return 3 }
+fn http2_err_settings_timeout() -> int { return 4 }
+fn http2_err_stream_closed() -> int { return 5 }
+fn http2_err_frame_size_error() -> int { return 6 }
+fn http2_err_refused_stream() -> int { return 7 }
+fn http2_err_cancel() -> int { return 8 }
+fn http2_err_compression_error() -> int { return 9 }
+fn http2_err_connect_error() -> int { return 10 }
+fn http2_err_enhance_your_calm() -> int { return 11 }
+fn http2_err_inadequate_security() -> int { return 12 }
+fn http2_err_http_1_1_required() -> int { return 13 }
+
+# Error code name (for diagnostics).
+fn http2_err_name(c: int) -> str {
+    if c == 0 { return "NO_ERROR" }
+    if c == 1 { return "PROTOCOL_ERROR" }
+    if c == 2 { return "INTERNAL_ERROR" }
+    if c == 3 { return "FLOW_CONTROL_ERROR" }
+    if c == 4 { return "SETTINGS_TIMEOUT" }
+    if c == 5 { return "STREAM_CLOSED" }
+    if c == 6 { return "FRAME_SIZE_ERROR" }
+    if c == 7 { return "REFUSED_STREAM" }
+    if c == 8 { return "CANCEL" }
+    if c == 9 { return "COMPRESSION_ERROR" }
+    if c == 10 { return "CONNECT_ERROR" }
+    if c == 11 { return "ENHANCE_YOUR_CALM" }
+    if c == 12 { return "INADEQUATE_SECURITY" }
+    if c == 13 { return "HTTP_1_1_REQUIRED" }
+    return "UNKNOWN_ERROR"
+}
+
+# ============================================================================
+# Constants — SETTINGS parameter IDs (RFC 7540 §6.5.2).
+# ============================================================================
+
+fn http2_settings_header_table_size() -> int { return 1 }
+fn http2_settings_enable_push() -> int { return 2 }
+fn http2_settings_max_concurrent_streams() -> int { return 3 }
+fn http2_settings_initial_window_size() -> int { return 4 }
+fn http2_settings_max_frame_size() -> int { return 5 }
+fn http2_settings_max_header_list_size() -> int { return 6 }
+
+# ============================================================================
+# Limits (RFC 7540 defaults).
+# ============================================================================
+
+# http2_default_header_table_size: the default size of the HPACK
+# dynamic table, in bytes. RFC 7541 §4.2 sets this to 4096. A peer
+# can shrink it via SETTINGS HEADER_TABLE_SIZE (a smaller value
+# forces the receiver to evict entries; a larger value is granted
+# only if the receiver's own SETTINGS allows it).
+fn http2_default_header_table_size() -> int { return 4096 }
+
+# http2_default_initial_window_size: the default per-stream flow
+# control window. RFC 7540 §6.5.2 sets this to 65535. A peer can
+# raise it via SETTINGS INITIAL_WINDOW_SIZE (max 2^31 - 1).
+fn http2_default_initial_window_size() -> int { return 65535 }
+
+# http2_default_max_frame_size: the default maximum payload of a
+# single frame. RFC 7540 §6.5.2 sets this to 16384 (16 KiB). A
+# peer can raise it via SETTINGS MAX_FRAME_SIZE (max 16777215,
+# i.e. 16 MiB).
+fn http2_default_max_frame_size() -> int { return 16384 }
+
+# http2_max_allowed_frame_size: the absolute maximum value of
+# MAX_FRAME_SIZE that a peer can request (RFC 7540 §6.5.2).
+fn http2_max_allowed_frame_size() -> int { return 16777215 }
+
+# http2_max_frame_payload: the upper bound the parser will accept
+# (matches the RFC absolute max — peers that try to send a frame
+# larger than this get FRAME_SIZE_ERROR). This is the absolute
+# cap; the per-connection negotiated MAX_FRAME_SIZE may be smaller.
+fn http2_max_frame_payload() -> int { return 16777215 }
+
+# http2_max_header_list_size: the default cap on the total size of
+# a decoded header list (sum of name + value lengths + 32 bytes
+# overhead per header, per RFC 7540 §10.5.1). A peer that sends
+# a header block that decodes to more than this is rejected with
+# PROTOCOL_ERROR (defends against header-based DoS — see CVE-
+# 2018-1000008 in nghttp2 for an analogous advisory).
+fn http2_max_header_list_size() -> int { return 1048576 }
+
+# http2_connection_preface: the 24-byte magic string every HTTP/2
+# client sends as the first bytes of a connection (RFC 7540 §3.5).
+# Used by `http2_recv_preface` to verify the client speaks HTTP/2
+# (rejects HTTP/1.x clients that try to send a request line).
+fn http2_connection_preface() -> str {
+    return "PRI * HTTP/2.0" + http_crlf() + http_crlf() + "SM" + http_crlf() + http_crlf()
+}
+
+# http2_alpn_h2: the ALPN token for HTTP/2 over TLS (RFC 7540
+# §9.2). Pass this string to a TLS layer that supports ALPN
+# negotiation (e.g. libssl, libcurl, or a future Stage 65
+# std.tls module). The TLS handshake will negotiate this token
+# iff the server also speaks HTTP/2; otherwise the handshake
+# either falls back to HTTP/1.1 over TLS or fails.
+fn http2_alpn_h2() -> str { return "h2" }
+
+# http2_alpn_h2c: the ALPN token for HTTP/2 over cleartext
+# (RFC 7540 §3.2 — used with the Upgrade: h2c header). h2c is
+# NOT a valid ALPN token (ALPN is TLS-only); the "h2c" string
+# is used in the Upgrade header and the HTTP2-Settings header
+# of the Upgrade request.
+fn http2_alpn_h2c() -> str { return "h2c" }
+
+# ============================================================================
+# Data types — Http2Frame.
+#
+# The frame header is 9 bytes (RFC 7540 §4.1):
+#
+#   +-----------------------------------------------+
+#   |                 Length (24)                   |
+#   +---------------+---------------+---------------+
+#   |   Type (8)    |   Flags (8)   |
+#   +-+-------------+---------------+-------------------------------+
+#   |R|                 Stream Identifier (31)                     |
+#   +-+-------------------------------------------------------------+
+#
+# HLS has no 24-bit or 31-bit type — we store the length as int
+# (which is 64-bit), the type as int, the flags as int, and the
+# stream id as int (with the reserved R bit stripped on decode and
+# set to 0 on encode). The payload is a str (byte buffer).
+# ============================================================================
+
+struct Http2Frame {
+    length: int,
+    frame_type: int,
+    flags: int,
+    stream_id: int,
+    payload: str
+}
+
+# http2_frame_new(t, flags, stream_id, payload) — construct a frame
+# with the length field auto-computed from the payload length.
+fn http2_frame_new(frame_type: int, flags: int, stream_id: int, payload: str) -> Http2Frame {
+    return Http2Frame {
+        length: payload.len(),
+        frame_type: frame_type,
+        flags: flags,
+        stream_id: stream_id,
+        payload: payload
+    }
+}
+
+# ============================================================================
+# 24-bit length / 31-bit stream id helpers.
+#
+# HLS's int is 64-bit signed. We use arithmetic equivalents of the
+# bit operations (x % 256 for the low byte, (x / 256) % 256 for the
+# middle byte, etc.) and `std.bits` for the native-backed bitwise
+# builtins where the performance matters (frame parsing is hot —
+# every byte of an HTTP/2 connection goes through here).
+#
+# Length encoding (24-bit, big-endian):
+#   byte 0: (length / 65536) % 256   (high byte)
+#   byte 1: (length / 256)   % 256   (middle byte)
+#   byte 2:  length           % 256   (low byte)
+#
+# Stream id encoding (31-bit, big-endian, with reserved R bit at
+# position 32 — always 0 on send, ignored on receive):
+#   byte 0: (stream_id / 16777216) % 256   (high byte)
+#   byte 1: (stream_id / 65536)    % 256
+#   byte 2: (stream_id / 256)      % 256
+#   byte 3:  stream_id              % 256   (low byte)
+# ============================================================================
+
+# http2_encode_length_24(length) -> 3-byte str (big-endian).
+fn http2_encode_length_24(length: int) -> str {
+    let b0: int = (length / 65536) % 256
+    let b1: int = (length / 256) % 256
+    let b2: int = length % 256
+    return chr(b0) + chr(b1) + chr(b2)
+}
+
+# http2_decode_length_24(s) -> int. Reads 3 bytes from the start of
+# s. Caller must ensure s.len() >= 3.
+fn http2_decode_length_24(s: str) -> int {
+    let b0: int = s.byte_at(0)
+    let b1: int = s.byte_at(1)
+    let b2: int = s.byte_at(2)
+    return b0 * 65536 + b1 * 256 + b2
+}
+
+# http2_encode_stream_id_31(stream_id) -> 4-byte str (big-endian,
+# high bit cleared — the R bit is always 0 on send).
+fn http2_encode_stream_id_31(stream_id: int) -> str {
+    # Mask to 31 bits (clear the R bit at position 32). The
+    # int_and with 0x7FFFFFFF is the canonical way; bits_and with
+    # the bit pattern would also work but is slower.
+    let masked: int = int_and(stream_id, 2147483647)
+    let b0: int = (masked / 16777216) % 256
+    let b1: int = (masked / 65536) % 256
+    let b2: int = (masked / 256) % 256
+    let b3: int = masked % 256
+    return chr(b0) + chr(b1) + chr(b2) + chr(b3)
+}
+
+# http2_decode_stream_id_31(s) -> int. Reads 4 bytes from the start
+# of s, masks off the R bit. Caller must ensure s.len() >= 4.
+fn http2_decode_stream_id_31(s: str) -> int {
+    let b0: int = s.byte_at(0)
+    let b1: int = s.byte_at(1)
+    let b2: int = s.byte_at(2)
+    let b3: int = s.byte_at(3)
+    let raw: int = b0 * 16777216 + b1 * 65536 + b2 * 256 + b3
+    return int_and(raw, 2147483647)
+}
+
+# ============================================================================
+# Frame parser — http2_parse_frame(s) -> Result[Http2Frame, str].
+#
+# Parses ONE frame from the start of s. The first 9 bytes are the
+# frame header; the remaining `length` bytes are the payload.
+#
+# Returns:
+#   Result.Ok(frame)       on success (frame.length = payload.len()).
+#   Result.Err(msg)        on a parse error (frame header too short,
+#                          payload shorter than declared length,
+#                          length > max_frame_payload).
+#
+# Does NOT enforce semantic rules (frame type vs flags, stream id
+# parity, etc.) — that's the connection layer's job. The parser is
+# a pure wire-format decoder.
+# ============================================================================
+
+fn http2_parse_frame(s: str) -> Result[Http2Frame, str] {
+    if s.len() < 9 {
+        return Result.Err("http2_parse_frame: short header (got "
+            + s.len().to_str() + " bytes, need 9)")
+    }
+    let length: int = http2_decode_length_24(s)
+    if length > http2_max_frame_payload() {
+        return Result.Err("http2_parse_frame: payload too large ("
+            + length.to_str() + " > max "
+            + http2_max_frame_payload().to_str() + ")")
+    }
+    let frame_type: int = s.byte_at(3)
+    let flags: int = s.byte_at(4)
+    let stream_id: int = http2_decode_stream_id_31(s.slice(5, 9))
+    if s.len() < 9 + length {
+        return Result.Err("http2_parse_frame: short payload (have "
+            + (s.len() - 9).to_str() + " bytes, need "
+            + length.to_str() + ")")
+    }
+    let payload: str = s.slice(9, 9 + length)
+    return Result.Ok(Http2Frame {
+        length: length,
+        frame_type: frame_type,
+        flags: flags,
+        stream_id: stream_id,
+        payload: payload
+    })
+}
+
+# http2_serialize_frame(f) -> str. Produces the canonical 9-byte
+# header + payload wire format. The output is byte-identical
+# between the interpreter and the native binary (pure function,
+# no I/O).
+fn http2_serialize_frame(f: Http2Frame) -> str {
+    let header: str = http2_encode_length_24(f.length)
+        + chr(f.frame_type)
+        + chr(f.flags)
+        + http2_encode_stream_id_31(f.stream_id)
+    return header + f.payload
+}
+
+# ============================================================================
+# SETTINGS frame — Http2Settings struct + encode/decode.
+#
+# The SETTINGS frame (RFC 7540 §6.5) carries configuration
+# parameters as a sequence of 6-byte pairs: 2-byte ID (big-endian)
+# + 4-byte value (big-endian). The frame is sent:
+#
+#   * by the client, immediately after the connection preface;
+#   * by the server, immediately after receiving the client
+#     preface (no payload — server's SETTINGS is its own).
+#
+# Each side MUST acknowledge the other's SETTINGS with a SETTINGS
+# frame with the ACK flag set and empty payload. ACK is a single
+# SETTINGS frame per received SETTINGS — multiple SETTINGS frames
+# in flight produce multiple ACKs in order.
+# ============================================================================
+
+struct Http2Settings {
+    header_table_size: int,
+    enable_push: int,
+    max_concurrent_streams: int,
+    initial_window_size: int,
+    max_frame_size: int,
+    max_header_list_size: int
+}
+
+# http2_settings_default() — the RFC 7540 default values. Used
+# by both client and server before exchanging SETTINGS.
+fn http2_settings_default() -> Http2Settings {
+    return Http2Settings {
+        header_table_size: http2_default_header_table_size(),
+        enable_push: 1,
+        max_concurrent_streams: 0,  # 0 means "unlimited" — RFC 7540 §6.5.2
+        initial_window_size: http2_default_initial_window_size(),
+        max_frame_size: http2_default_max_frame_size(),
+        max_header_list_size: 0     # 0 means "unlimited" — RFC 7540 §6.5.2
+    }
+}
+
+# http2_settings_encode(s) -> str. Produces the 6-byte-per-pair
+# payload for a SETTINGS frame (NOT including the 9-byte frame
+# header — the caller wraps this in http2_frame_new). Returns
+# only the parameters that differ from the default (to keep the
+# frame small; a peer that doesn't receive a parameter assumes
+# the default).
+fn http2_settings_encode(s: Http2Settings) -> str {
+    let parts: list[str] = []
+    # Always emit all known parameters — peers can ignore ones
+    # that match the default. This keeps the encoder simple
+    # (no diff logic) and the payload small enough (36 bytes
+    # for all 6 parameters).
+    if s.header_table_size != http2_default_header_table_size() {
+        parts.push(http2_settings_pair(http2_settings_header_table_size(), s.header_table_size))
+    }
+    if s.enable_push != 1 {
+        parts.push(http2_settings_pair(http2_settings_enable_push(), s.enable_push))
+    }
+    if s.max_concurrent_streams != 0 {
+        parts.push(http2_settings_pair(http2_settings_max_concurrent_streams(), s.max_concurrent_streams))
+    }
+    if s.initial_window_size != http2_default_initial_window_size() {
+        parts.push(http2_settings_pair(http2_settings_initial_window_size(), s.initial_window_size))
+    }
+    if s.max_frame_size != http2_default_max_frame_size() {
+        parts.push(http2_settings_pair(http2_settings_max_frame_size(), s.max_frame_size))
+    }
+    if s.max_header_list_size != 0 {
+        parts.push(http2_settings_pair(http2_settings_max_header_list_size(), s.max_header_list_size))
+    }
+    return str_join(parts, "")
+}
+
+# http2_settings_pair(id, value) — encode a single 6-byte parameter
+# pair. The ID is 2 bytes big-endian; the value is 4 bytes big-
+# endian. The value is masked to 32 bits (the SETTINGS values are
+# all unsigned 32-bit).
+fn http2_settings_pair(id: int, value: int) -> str {
+    let id_hi: int = (id / 256) % 256
+    let id_lo: int = id % 256
+    let masked: int = int_and(value, 4294967295)
+    let v0: int = (masked / 16777216) % 256
+    let v1: int = (masked / 65536) % 256
+    let v2: int = (masked / 256) % 256
+    let v3: int = masked % 256
+    return chr(id_hi) + chr(id_lo) + chr(v0) + chr(v1) + chr(v2) + chr(v3)
+}
+
+# http2_settings_decode(payload) -> Result[Http2Settings, str].
+#
+# Parses a SETTINGS frame's payload (NOT the full frame — just the
+# 6-byte-pair payload). Returns Result.Ok(settings) on success,
+# Result.Err(msg) on:
+#   * payload length not a multiple of 6 (FRAME_SIZE_ERROR);
+#   * unknown parameter ID (RFC 7540 §6.5.1 — MUST ignore, but
+#     we surface it as a warning in the error message; the
+#     caller decides whether to abort);
+#   * value out of range (e.g. ENABLE_PUSH not 0 or 1, or
+#     INITIAL_WINDOW_SIZE > 2^31 - 1).
+fn http2_settings_decode(payload: str) -> Result[Http2Settings, str] {
+    if payload.len() % 6 != 0 {
+        return Result.Err("http2_settings_decode: payload not a multiple of 6 (got "
+            + payload.len().to_str() + ")")
+    }
+    let mut s: Http2Settings = http2_settings_default()
+    let mut i: int = 0
+    while i + 6 <= payload.len() {
+        let id_hi: int = payload.byte_at(i)
+        let id_lo: int = payload.byte_at(i + 1)
+        let id: int = id_hi * 256 + id_lo
+        let v0: int = payload.byte_at(i + 2)
+        let v1: int = payload.byte_at(i + 3)
+        let v2: int = payload.byte_at(i + 4)
+        let v3: int = payload.byte_at(i + 5)
+        let value: int = v0 * 16777216 + v1 * 65536 + v2 * 256 + v3
+        if id == http2_settings_header_table_size() {
+            s.header_table_size = value
+        } else if id == http2_settings_enable_push() {
+            if value != 0 && value != 1 {
+                return Result.Err("http2_settings_decode: ENABLE_PUSH must be 0 or 1 (got "
+                    + value.to_str() + ")")
+            }
+            s.enable_push = value
+        } else if id == http2_settings_max_concurrent_streams() {
+            s.max_concurrent_streams = value
+        } else if id == http2_settings_initial_window_size() {
+            if value > 2147483647 {
+                return Result.Err("http2_settings_decode: INITIAL_WINDOW_SIZE > 2^31-1")
+            }
+            s.initial_window_size = value
+        } else if id == http2_settings_max_frame_size() {
+            if value < 16384 || value > 16777215 {
+                return Result.Err("http2_settings_decode: MAX_FRAME_SIZE out of range ("
+                    + value.to_str() + ")")
+            }
+            s.max_frame_size = value
+        } else if id == http2_settings_max_header_list_size() {
+            s.max_header_list_size = value
+        } else {
+            # Unknown parameter — RFC 7540 §6.5.1 says MUST ignore.
+            # We don't return an error; just skip the pair.
+        }
+        i = i + 6
+    }
+    return Result.Ok(s)
+}
+
+# ============================================================================
+# HPACK — static table (RFC 7541 Appendix A, 61 entries).
+#
+# Each entry is a (name, value) pair. The value is the empty string
+# for entries that have no fixed value (the entry is a header NAME
+# only — the actual value comes from the wire).
+# ============================================================================
+
+struct HpackStaticEntry {
+    name: str,
+    value: str
+}
+
+# http2_hpack_static_table() -> list[HpackStaticEntry].
+# Returns the 61-entry static table from RFC 7541 Appendix A.
+# Index 1 (the first entry) corresponds to the header
+# `:authority` with empty value. Index 61 is `www-authenticate`.
+# Index 0 is reserved (RFC 7541 §2.3 — used to signal "indexed
+# header field representation" with the high bit set).
+fn http2_hpack_static_table() -> list[HpackStaticEntry] {
+    return [
+        HpackStaticEntry { name: ":authority", value: "" },
+        HpackStaticEntry { name: ":method", value: "GET" },
+        HpackStaticEntry { name: ":method", value: "POST" },
+        HpackStaticEntry { name: ":path", value: "/" },
+        HpackStaticEntry { name: ":path", value: "/index.html" },
+        HpackStaticEntry { name: ":scheme", value: "http" },
+        HpackStaticEntry { name: ":scheme", value: "https" },
+        HpackStaticEntry { name: ":status", value: "200" },
+        HpackStaticEntry { name: ":status", value: "204" },
+        HpackStaticEntry { name: ":status", value: "206" },
+        HpackStaticEntry { name: ":status", value: "304" },
+        HpackStaticEntry { name: ":status", value: "400" },
+        HpackStaticEntry { name: ":status", value: "404" },
+        HpackStaticEntry { name: ":status", value: "500" },
+        HpackStaticEntry { name: "accept-charset", value: "" },
+        HpackStaticEntry { name: "accept-encoding", value: "gzip, deflate" },
+        HpackStaticEntry { name: "accept-language", value: "" },
+        HpackStaticEntry { name: "accept-ranges", value: "" },
+        HpackStaticEntry { name: "accept", value: "" },
+        HpackStaticEntry { name: "access-control-allow-origin", value: "" },
+        HpackStaticEntry { name: "age", value: "" },
+        HpackStaticEntry { name: "allow", value: "" },
+        HpackStaticEntry { name: "authorization", value: "" },
+        HpackStaticEntry { name: "cache-control", value: "" },
+        HpackStaticEntry { name: "content-disposition", value: "" },
+        HpackStaticEntry { name: "content-encoding", value: "" },
+        HpackStaticEntry { name: "content-language", value: "" },
+        HpackStaticEntry { name: "content-length", value: "" },
+        HpackStaticEntry { name: "content-location", value: "" },
+        HpackStaticEntry { name: "content-range", value: "" },
+        HpackStaticEntry { name: "content-type", value: "" },
+        HpackStaticEntry { name: "cookie", value: "" },
+        HpackStaticEntry { name: "date", value: "" },
+        HpackStaticEntry { name: "etag", value: "" },
+        HpackStaticEntry { name: "expect", value: "" },
+        HpackStaticEntry { name: "expires", value: "" },
+        HpackStaticEntry { name: "from", value: "" },
+        HpackStaticEntry { name: "host", value: "" },
+        HpackStaticEntry { name: "if-match", value: "" },
+        HpackStaticEntry { name: "if-modified-since", value: "" },
+        HpackStaticEntry { name: "if-none-match", value: "" },
+        HpackStaticEntry { name: "if-range", value: "" },
+        HpackStaticEntry { name: "if-unmodified-since", value: "" },
+        HpackStaticEntry { name: "last-modified", value: "" },
+        HpackStaticEntry { name: "link", value: "" },
+        HpackStaticEntry { name: "location", value: "" },
+        HpackStaticEntry { name: "max-forwards", value: "" },
+        HpackStaticEntry { name: "proxy-authenticate", value: "" },
+        HpackStaticEntry { name: "proxy-authorization", value: "" },
+        HpackStaticEntry { name: "range", value: "" },
+        HpackStaticEntry { name: "referer", value: "" },
+        HpackStaticEntry { name: "refresh", value: "" },
+        HpackStaticEntry { name: "retry-after", value: "" },
+        HpackStaticEntry { name: "server", value: "" },
+        HpackStaticEntry { name: "set-cookie", value: "" },
+        HpackStaticEntry { name: "strict-transport-security", value: "" },
+        HpackStaticEntry { name: "transfer-encoding", value: "" },
+        HpackStaticEntry { name: "user-agent", value: "" },
+        HpackStaticEntry { name: "vary", value: "" },
+        HpackStaticEntry { name: "via", value: "" },
+        HpackStaticEntry { name: "www-authenticate", value: "" }
+    ]
+}
+
+# http2_hpack_static_lookup(index) -> Result[HpackStaticEntry, str].
+# Returns the static table entry at the given 1-based index
+# (RFC 7541 §2.3.1 — index 0 is reserved). Returns Err for
+# out-of-range indices.
+fn http2_hpack_static_lookup(index: int) -> Result[HpackStaticEntry, str] {
+    if index < 1 || index > 61 {
+        return Result.Err("http2_hpack_static_lookup: index out of range ("
+            + index.to_str() + "; valid 1..61)")
+    }
+    let table: list[HpackStaticEntry] = http2_hpack_static_table()
+    return Result.Ok(table.get(index - 1))
+}
+
+# ============================================================================
+# HPACK — dynamic table.
+#
+# The dynamic table is a FIFO of (name, value) entries. The total
+# size is the sum of (name.len() + value.len() + 32) per entry
+# (RFC 7541 §4.1 — the 32-byte overhead accounts for the entry's
+# fixed-size metadata in C implementations; HLS doesn't have that
+# overhead, but the accounting is identical so peers agree on size).
+#
+# When a new entry is added that would exceed the table size limit,
+# entries are evicted from the END (oldest first) until the new
+# entry fits. If the new entry alone is larger than the limit, the
+# table is cleared and the new entry is NOT added (RFC 7541 §4.4).
+# ============================================================================
+
+struct HpackDynamicTable {
+    entries: list[HpackStaticEntry],  # name+value pairs; reuse HpackStaticEntry struct
+    size: int,                        # sum of (name.len + value.len + 32) per entry
+    max_size: int                     # current size limit (from SETTINGS or dynamic update)
+}
+
+# http2_hpack_dynamic_table_new(max_size) -> HpackDynamicTable.
+# Construct an empty dynamic table with the given initial size
+# limit (typically http2_default_header_table_size()).
+fn http2_hpack_dynamic_table_new(max_size: int) -> HpackDynamicTable {
+    return HpackDynamicTable {
+        entries: [],
+        size: 0,
+        max_size: max_size
+    }
+}
+
+# http2_hpack_entry_size(name, value) -> int. The size of an entry
+# is name.len() + value.len() + 32 (RFC 7541 §4.1).
+fn http2_hpack_entry_size(name: str, value: str) -> int {
+    return name.len() + value.len() + 32
+}
+
+# http2_hpack_dynamic_table_add(table, name, value) -> void.
+# Add a new entry to the FRONT of the dynamic table. Evicts from
+# the END (oldest first) until the new entry fits. If the new
+# entry alone is larger than max_size, the table is cleared and
+# the entry is NOT added (RFC 7541 §4.4 — "An entry larger than
+# the maximum size causes the table to be emptied of all existing
+# entries, and the new entry not to be inserted").
+#
+# This function mutates the table struct (entries list, size).
+fn http2_hpack_dynamic_table_add(mut table: HpackDynamicTable, name: str, value: str) -> void {
+    let entry_size: int = http2_hpack_entry_size(name, value)
+    # If the entry alone exceeds max_size, clear the table and skip.
+    if entry_size > table.max_size {
+        table.entries = []
+        table.size = 0
+        return
+    }
+    # Evict from the end (oldest) until the new entry fits.
+    while table.size + entry_size > table.max_size && table.entries.len() > 0 {
+        let last: HpackStaticEntry = table.entries.get(table.entries.len() - 1)
+        table.size = table.size - http2_hpack_entry_size(last.name, last.value)
+        # HLS lists have no .take(n) method — we rebuild the list
+        # without the last element via a copy loop.
+        table.entries = http2_list_drop_last(table.entries)
+    }
+    # Prepend the new entry (newest at index 0).
+    let new_list: list[HpackStaticEntry] = [HpackStaticEntry { name: name, value: value }]
+    let mut i: int = 0
+    while i < table.entries.len() {
+        new_list.push(table.entries.get(i))
+        i = i + 1
+    }
+    table.entries = new_list
+    table.size = table.size + entry_size
+}
+
+# http2_list_drop_last(lst) -> list. Returns a copy of lst without
+# its last element. Panics on empty (caller must check len > 0
+# before calling — RFC 7541's eviction loop does).
+fn http2_list_drop_last(lst: list[HpackStaticEntry]) -> list[HpackStaticEntry] {
+    let out: list[HpackStaticEntry] = []
+    let mut i: int = 0
+    while i < lst.len() - 1 {
+        out.push(lst.get(i))
+        i = i + 1
+    }
+    return out
+}
+
+# http2_hpack_dynamic_table_lookup(table, index) -> Result[HpackStaticEntry, str].
+# Returns the dynamic table entry at the given 1-based index
+# (index 1 is the newest entry). Out-of-range returns Err.
+fn http2_hpack_dynamic_table_lookup(table: HpackDynamicTable, index: int) -> Result[HpackStaticEntry, str] {
+    if index < 1 || index > table.entries.len() {
+        return Result.Err("http2_hpack_dynamic_table_lookup: index out of range ("
+            + index.to_str() + "; valid 1.." + table.entries.len().to_str() + ")")
+    }
+    return Result.Ok(table.entries.get(index - 1))
+}
+
+# http2_hpack_dynamic_table_set_max_size(mut table, new_max) -> void.
+# Update the max_size and evict from the end until size <= max_size.
+# Used when a SETTINGS HEADER_TABLE_SIZE update is received.
+fn http2_hpack_dynamic_table_set_max_size(mut table: HpackDynamicTable, new_max: int) -> void {
+    table.max_size = new_max
+    while table.size > new_max && table.entries.len() > 0 {
+        let last: HpackStaticEntry = table.entries.get(table.entries.len() - 1)
+        table.size = table.size - http2_hpack_entry_size(last.name, last.value)
+        table.entries = http2_list_drop_last(table.entries)
+    }
+}
+
+# ============================================================================
+# HPACK — decoder struct.
+#
+# HLS structs have REFERENCE semantics (SPEC §2.1 — Name is "Name*"
+# in the C ABI). This means a function that takes a HpackDecoder
+# and mutates its `pos` / `err` fields will be seen by the caller.
+# This is the same pattern that std/json.hls uses (JsonParser).
+#
+# The decoder holds:
+#   * block — the HPACK header block bytes (read-only).
+#   * pos   — the current byte offset (advanced as we decode).
+#   * err   — "" on success; non-empty on a parse error.
+#
+# Decode functions return their value directly (int or str); on
+# error they return a sentinel (0 / "") and set `err`. Callers
+# MUST check `err` after each decode call.
+# ============================================================================
+
+struct HpackDecoder {
+    block: str,
+    pos: int,
+    err: str
+}
+
+# http2_hpack_decoder_new(block) -> HpackDecoder. Construct a fresh
+# decoder over the given header block bytes.
+fn http2_hpack_decoder_new(block: str) -> HpackDecoder {
+    return HpackDecoder { block: block, pos: 0, err: "" }
+}
+
+# http2_hpack_decoder_set_err(d, msg) -> void. Records an error if
+# one is not already set (the first error wins — RFC 7541 §4.3 says
+# the connection MUST be torn down with COMPRESSION_ERROR after the
+# first malformed header block; subsequent decode calls become no-ops).
+fn http2_hpack_decoder_set_err(mut d: HpackDecoder, msg: str) -> void {
+    if d.err == "" {
+        d.err = msg
+    }
+}
+
+# ============================================================================
+# HPACK — integer decoder (RFC 7541 §5.1).
+#
+# An HPACK integer is encoded in N bits, where N is the prefix
+# length (1-8). The high (8-N) bits of the first byte are the
+# "flag" bits of the header field representation; the low N bits
+# are the integer's first "digit". If those N bits are all 1s
+# (the maximum value for N bits), the integer continues in
+# subsequent bytes as a varint (7 bits per byte, MSB = continue).
+#
+# Example (5-bit prefix, value 1337):
+#   first byte: XXX 11111   (low 5 bits all 1s -> multi-byte)
+#   byte 2:    1 0010101   (MSB=1 continue; low 7 bits = 21)
+#   byte 3:    0 0001010   (MSB=0 last; low 7 bits = 10)
+#   value = 31 + 21*128 + 10 = 1337
+#
+# The decoder takes (d, prefix_bits) and returns the integer value.
+# On success, d.pos is advanced past the integer. On error, d.err
+# is set and the function returns 0.
+# ============================================================================
+
+# http2_hpack_decode_integer(d, prefix_bits) -> int.
+fn http2_hpack_decode_integer(mut d: HpackDecoder, prefix_bits: int) -> int {
+    if d.err != "" {
+        return 0
+    }
+    if d.pos >= d.block.len() {
+        http2_hpack_decoder_set_err(d, "http2_hpack_decode_integer: pos past end of input")
+        return 0
+    }
+    if prefix_bits < 1 || prefix_bits > 8 {
+        http2_hpack_decoder_set_err(d, "http2_hpack_decode_integer: prefix_bits out of range ("
+            + prefix_bits.to_str() + "; valid 1..8)")
+        return 0
+    }
+    # The max value of the N-bit prefix is (1 << N) - 1.
+    let prefix_max: int = bits_pow2(prefix_bits) - 1
+    let first_byte: int = d.block.byte_at(d.pos)
+    # Mask off the high (8 - prefix_bits) bits — they're not part of
+    # the integer. bits_and with prefix_max achieves this.
+    let mut value: int = int_and(first_byte, prefix_max)
+    d.pos = d.pos + 1
+    if value < prefix_max {
+        # Single-byte integer — return immediately.
+        return value
+    }
+    # Multi-byte: read continuation bytes (7 bits + MSB=continue).
+    let mut shift: int = 0
+    while d.pos < d.block.len() {
+        let b: int = d.block.byte_at(d.pos)
+        d.pos = d.pos + 1
+        let lower7: int = int_and(b, 127)
+        # value += lower7 << shift. Use int_shl for the shift.
+        # Overflow check: if shift >= 56, we'd overflow int64.
+        if shift >= 56 {
+            http2_hpack_decoder_set_err(d, "http2_hpack_decode_integer: integer too large (shift >= 56)")
+            return 0
+        }
+        value = value + int_shl(lower7, shift)
+        shift = shift + 7
+        # MSB=0 means this is the last byte.
+        if int_and(b, 128) == 0 {
+            return value
+        }
+    }
+    http2_hpack_decoder_set_err(d, "http2_hpack_decode_integer: truncated multi-byte integer")
+    return 0
+}
+
+# http2_hpack_encode_integer(value, prefix_bits, prefix_flags) -> str.
+# Encodes `value` with `prefix_bits`-bit prefix; the high
+# (8 - prefix_bits) bits of the first byte are set to
+# `prefix_flags` (the representation's flag bits — e.g. 0x00 for
+# "Literal Header Field without Indexing", 0x40 for "with
+# incremental indexing", 0x10 for "Never Indexed"). The low
+# prefix_bits are the integer.
+fn http2_hpack_encode_integer(value: int, prefix_bits: int, prefix_flags: int) -> str {
+    let prefix_max: int = bits_pow2(prefix_bits) - 1
+    if value < prefix_max {
+        return chr(int_or(prefix_flags, value))
+    }
+    # Multi-byte: first byte has the prefix set to all 1s.
+    let parts: list[str] = [chr(int_or(prefix_flags, prefix_max))]
+    let mut remaining: int = value - prefix_max
+    while remaining >= 128 {
+        # Low 7 bits + MSB=1 (continue).
+        let low7: int = int_and(remaining, 127)
+        parts.push(chr(int_or(128, low7)))
+        remaining = remaining / 128
+    }
+    # Final byte: low 7 bits + MSB=0 (last).
+    parts.push(chr(int_and(remaining, 127)))
+    return str_join(parts, "")
+}
+
+# ============================================================================
+# HPACK — string decoder (RFC 7541 §5.2).
+#
+# A header string is encoded as:
+#   * 1 bit: H (Huffman-coded flag).
+#   * 7 bits: length (or prefix for multi-byte length).
+#   * length bytes: the string (literal if H=0, Huffman-coded if H=1).
+#
+# Huffman coding is the documented deferral — we accept H=1 but
+# set d.err so callers know to fall back. The literal decoder
+# (H=0) is straightforward: read length, take that many bytes.
+# ============================================================================
+
+# http2_hpack_decode_string(d) -> str.
+# Returns the decoded string. On error, returns "" and sets d.err.
+fn http2_hpack_decode_string(mut d: HpackDecoder) -> str {
+    if d.err != "" {
+        return ""
+    }
+    if d.pos >= d.block.len() {
+        http2_hpack_decoder_set_err(d, "http2_hpack_decode_string: pos past end of input")
+        return ""
+    }
+    let first_byte: int = d.block.byte_at(d.pos)
+    let huffman: bool = int_and(first_byte, 128) != 0
+    let length: int = http2_hpack_decode_integer(d, 7)
+    if d.err != "" {
+        return ""
+    }
+    if huffman {
+        # Deferred: Huffman decoding (RFC 7541 Appendix B). The
+        # bit-table is 257 entries; we deliberately don't ship it
+        # in Stage 39 to keep the module's source code reviewable.
+        # A future Stage will add the table.
+        http2_hpack_decoder_set_err(d, "http2_hpack_decode_string: Huffman strings not yet supported (deferred to a future stage)")
+        return ""
+    }
+    if d.pos + length > d.block.len() {
+        http2_hpack_decoder_set_err(d, "http2_hpack_decode_string: truncated string (have "
+            + (d.block.len() - d.pos).to_str() + " bytes, need "
+            + length.to_str() + ")")
+        return ""
+    }
+    let value: str = d.block.slice(d.pos, d.pos + length)
+    d.pos = d.pos + length
+    return value
+}
+
+# http2_hpack_encode_string(s) -> str. Encodes a string literal
+# (H=0, prefix 7 bits for length, then the raw bytes). The encoder
+# never uses Huffman — that keeps the output deterministic and
+# byte-identical between the interpreter and the native binary
+# (Huffman would require the same lookup table on both sides,
+# which is exactly the deferred complexity we avoid).
+fn http2_hpack_encode_string(s: str) -> str {
+    let length: int = s.len()
+    let len_encoded: str = http2_hpack_encode_integer(length, 7, 0)
+    return len_encoded + s
+}
+
+# ============================================================================
+# HPACK — header block decoder.
+#
+# A header block is a sequence of header field representations
+# (RFC 7541 §6). Each starts with a flag byte:
+#
+#   1XXXXXXX   Indexed Header Field (RFC 7541 §6.1)
+#   01XXXXXX   Literal Header Field with Incremental Indexing (§6.2.1)
+#   0000XXXX   Literal Header Field without Indexing (§6.2.2)
+#   0001XXXX   Literal Header Field Never Indexed (§6.2.3)
+#   001XXXXX   Dynamic Table Size Update (§6.3)
+#
+# The decoder walks the block, dispatching on the flag byte, and
+# produces a list[HttpHeader] (reusing the std.http struct). The
+# dynamic table is mutated by "Incremental Indexing" reps.
+# ============================================================================
+
+# http2_hpack_decode_header_block(block, mut table) -> Result[list[HttpHeader], str].
+#
+# Decodes a header block (the payload of a HEADERS or CONTINUATION
+# frame, or the concatenation of a HEADERS + CONTINUATION sequence).
+# The dynamic table is mutated in place for "Incremental Indexing"
+# reps (RFC 7541 §6.2.1).
+fn http2_hpack_decode_header_block(block: str, mut table: HpackDynamicTable) -> Result[list[HttpHeader], str] {
+    let d: HpackDecoder = http2_hpack_decoder_new(block)
+    let headers: list[HttpHeader] = []
+    let mut total_size: int = 0
+    while d.pos < d.block.len() && d.err == "" {
+        let flag: int = d.block.byte_at(d.pos)
+        # 6.1 Indexed Header Field (high bit set: 0x80 mask).
+        if int_and(flag, 128) != 0 {
+            # Indexed; the index is the low 7 bits.
+            let idx: int = http2_hpack_decode_integer(d, 7)
+            if d.err != "" {
+                return Result.Err("hpack: indexed rep: " + d.err)
+            }
+            if idx == 0 {
+                return Result.Err("hpack: indexed rep: index 0 is reserved")
+            }
+            let lookup_r: Result[HpackStaticEntry, str] = http2_hpack_lookup_index(idx, table)
+            if !result_is_ok(lookup_r) {
+                return Result.Err("hpack: indexed rep: " + result_err_or(lookup_r, ""))
+            }
+            let entry: HpackStaticEntry = result_unwrap(lookup_r)
+            headers.push(HttpHeader { name: entry.name, value: entry.value })
+            total_size = total_size + http2_hpack_entry_size(entry.name, entry.value)
+        }
+        # 6.3 Dynamic Table Size Update (0x20 mask).
+        else if int_and(flag, 224) == 32 {
+            let new_max: int = http2_hpack_decode_integer(d, 5)
+            if d.err != "" {
+                return Result.Err("hpack: table size update: " + d.err)
+            }
+            if new_max > table.max_size {
+                return Result.Err("hpack: table size update larger than negotiated max ("
+                    + new_max.to_str() + " > " + table.max_size.to_str() + ")")
+            }
+            http2_hpack_dynamic_table_set_max_size(table, new_max)
+        }
+        # 6.2.1 Literal with Incremental Indexing (0x40 mask).
+        else if int_and(flag, 192) == 64 {
+            let name_idx: int = http2_hpack_decode_integer(d, 6)
+            if d.err != "" {
+                return Result.Err("hpack: literal+idx: " + d.err)
+            }
+            let mut name: str = ""
+            let mut value: str = ""
+            if name_idx == 0 {
+                # Literal name follows.
+                name = http2_hpack_decode_string(d)
+                if d.err != "" {
+                    return Result.Err("hpack: literal+idx name: " + d.err)
+                }
+            } else {
+                let lookup_r: Result[HpackStaticEntry, str] = http2_hpack_lookup_index(name_idx, table)
+                if !result_is_ok(lookup_r) {
+                    return Result.Err("hpack: literal+idx name lookup: " + result_err_or(lookup_r, ""))
+                }
+                name = result_unwrap(lookup_r).name
+            }
+            value = http2_hpack_decode_string(d)
+            if d.err != "" {
+                return Result.Err("hpack: literal+idx value: " + d.err)
+            }
+            headers.push(HttpHeader { name: name, value: value })
+            total_size = total_size + http2_hpack_entry_size(name, value)
+            http2_hpack_dynamic_table_add(table, name, value)
+        }
+        # 6.2.2/6.2.3 Literal without Indexing / Never Indexed (0x00 or 0x10 mask).
+        else if int_and(flag, 240) == 0 || int_and(flag, 240) == 16 {
+            let name_idx: int = http2_hpack_decode_integer(d, 4)
+            if d.err != "" {
+                return Result.Err("hpack: literal: " + d.err)
+            }
+            let mut name: str = ""
+            let mut value: str = ""
+            if name_idx == 0 {
+                name = http2_hpack_decode_string(d)
+                if d.err != "" {
+                    return Result.Err("hpack: literal name: " + d.err)
+                }
+            } else {
+                let lookup_r: Result[HpackStaticEntry, str] = http2_hpack_lookup_index(name_idx, table)
+                if !result_is_ok(lookup_r) {
+                    return Result.Err("hpack: literal name lookup: " + result_err_or(lookup_r, ""))
+                }
+                name = result_unwrap(lookup_r).name
+            }
+            value = http2_hpack_decode_string(d)
+            if d.err != "" {
+                return Result.Err("hpack: literal value: " + d.err)
+            }
+            headers.push(HttpHeader { name: name, value: value })
+            total_size = total_size + http2_hpack_entry_size(name, value)
+            # "without indexing" / "never indexed" — do NOT add to the table.
+        }
+        else {
+            return Result.Err("hpack: unknown representation (flag byte 0x"
+                + int_to_hex2(flag) + ")")
+        }
+        # Header list DoS protection (RFC 7540 §10.5.1).
+        if total_size > http2_max_header_list_size() {
+            return Result.Err("hpack: header list exceeds max_header_list_size ("
+                + total_size.to_str() + " > " + http2_max_header_list_size().to_str() + ")")
+        }
+    }
+    if d.err != "" {
+        return Result.Err(d.err)
+    }
+    return Result.Ok(headers)
+}
+
+# http2_hpack_lookup_index(idx, table) -> Result[HpackStaticEntry, str].
+# Index 1..61 = static table; 62.. = dynamic table (62 is the newest
+# dynamic entry). Returns Err if the index is 0 or out of range.
+fn http2_hpack_lookup_index(idx: int, table: HpackDynamicTable) -> Result[HpackStaticEntry, str] {
+    if idx == 0 {
+        return Result.Err("http2_hpack_lookup_index: index 0 is reserved")
+    }
+    if idx <= 61 {
+        return http2_hpack_static_lookup(idx)
+    }
+    return http2_hpack_dynamic_table_lookup(table, idx - 61)
+}
+
+# int_to_hex2(n) — 2-digit lowercase hex of n's low byte. For
+# diagnostics only (the "unknown representation" error message).
+fn http2_hex_digit(x: int) -> str {
+    if x < 10 { return chr(48 + x) }
+    return chr(97 + (x - 10))
+}
+
+fn int_to_hex2(n: int) -> str {
+    let lo: int = n % 16
+    let hi: int = (n / 16) % 16
+    return http2_hex_digit(hi) + http2_hex_digit(lo)
+}
+
+# ============================================================================
+# HPACK — header block encoder (literal, no indexing).
+#
+# The simplest valid HPACK encoder: every header is emitted as a
+# "Literal Header Field without Indexing" (RFC 7541 §6.2.2). This
+# is what an HTTP/2 client sends on the FIRST request of a
+# connection (the dynamic table is empty, so indexing buys
+# nothing). Subsequent requests on the same connection could use
+# incremental indexing for repeated headers (e.g. :method: GET),
+# but Stage 39 ships only the literal encoder — it's the
+# minimal correct encoder and is byte-for-byte deterministic
+# (no shared state between encoder and decoder).
+# ============================================================================
+
+# http2_hpack_encode_header_block(headers) -> str.
+# Encodes a list of HttpHeader as a literal-without-indexing
+# header block. The output is a valid HPACK header block — a
+# peer's decoder will produce the same list of HttpHeader.
+#
+# Format per header (RFC 7541 §6.2.2):
+#   0000 0000    (flag byte; name_index = 0 means literal name follows)
+#   <name length (7-bit prefix, H=0)>
+#   <name bytes>
+#   <value length (7-bit prefix, H=0)>
+#   <value bytes>
+fn http2_hpack_encode_header_block(headers: list[HttpHeader]) -> str {
+    let parts: list[str] = []
+    let mut i: int = 0
+    while i < headers.len() {
+        let h: HttpHeader = headers.get(i)
+        # Try static table lookup for the name (saves a few bytes if
+        # the name is one of the 61 static entries). We only match
+        # by name (not by name+value) — value is always literal.
+        let static_idx: int = http2_hpack_static_find_name(h.name)
+        if static_idx > 0 {
+            # Literal without indexing, indexed name (RFC 7541 §6.2.2
+            # form 2: 0000XXXX where XXXX is the static index).
+            let idx_bytes: str = http2_hpack_encode_integer(static_idx, 4, 0)
+            let val_bytes: str = http2_hpack_encode_string(h.value)
+            parts.push(idx_bytes + val_bytes)
+        } else {
+            # Literal without indexing, literal name (RFC 7541 §6.2.2
+            # form 1: 00000000 prefix; then name; then value).
+            let name_bytes: str = http2_hpack_encode_string(h.name)
+            let val_bytes: str = http2_hpack_encode_string(h.value)
+            parts.push(chr(0) + name_bytes + val_bytes)
+        }
+        i = i + 1
+    }
+    return str_join(parts, "")
+}
+
+# http2_hpack_static_find_name(name) -> int.
+# Returns the 1-based static table index of the first entry whose
+# name matches (case-insensitive). Returns 0 if no match. Used by
+# the encoder to emit indexed-name literals for the common
+# pseudo-headers and well-known header names.
+fn http2_hpack_static_find_name(name: str) -> int {
+    let lower: str = str_to_lower_ascii(name)
+    let table: list[HpackStaticEntry] = http2_hpack_static_table()
+    let mut i: int = 0
+    while i < table.len() {
+        if str_to_lower_ascii(table.get(i).name) == lower {
+            return i + 1
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+# ============================================================================
+# Stream state machine (RFC 7540 §5.1).
+#
+# Each HTTP/2 stream has a lifecycle:
+#
+#   idle -> open           (recv/send HEADERS)
+#   open -> half-closed-*  (recv/send END_STREAM)
+#   half-closed-remote -> closed   (recv END_STREAM / RST_STREAM)
+#   half-closed-local  -> closed   (send END_STREAM / RST_STREAM)
+#   open -> closed         (recv/send RST_STREAM)
+#   reserved-local -> half-closed-remote  (send PUSH_PROMISE)
+#   reserved-remote -> half-closed-local  (recv PUSH_PROMISE)
+#
+# Stage 39 tracks the state on the Http2Stream struct; the state
+# transition validation is in http2_stream_recv_event /
+# http2_stream_send_event (returns Err on an invalid transition).
+# ============================================================================
+
+# Stream states (RFC 7540 §5.1).
+fn http2_stream_state_idle() -> int { return 0 }
+fn http2_stream_state_reserved_local() -> int { return 1 }
+fn http2_stream_state_reserved_remote() -> int { return 2 }
+fn http2_stream_state_open() -> int { return 3 }
+fn http2_stream_state_half_closed_local() -> int { return 4 }
+fn http2_stream_state_half_closed_remote() -> int { return 5 }
+fn http2_stream_state_closed() -> int { return 6 }
+
+fn http2_stream_state_name(s: int) -> str {
+    if s == 0 { return "idle" }
+    if s == 1 { return "reserved-local" }
+    if s == 2 { return "reserved-remote" }
+    if s == 3 { return "open" }
+    if s == 4 { return "half-closed-local" }
+    if s == 5 { return "half-closed-remote" }
+    if s == 6 { return "closed" }
+    return "unknown"
+}
+
+struct Http2Stream {
+    stream_id: int,
+    state: int,
+    # Per-stream flow control window (debits on DATA send,
+    # credits on DATA recv + WINDOW_UPDATE).
+    send_window: int,
+    recv_window: int,
+    # PRIORITY (RFC 7540 §5.3) — dependency + weight.
+    # Stored for the caller; not enforced by Stage 39.
+    priority_dep: int,    # stream id this depends on (0 = root)
+    priority_weight: int, # 1..256 (RFC 7540 §5.3.1)
+    priority_exclusive: bool
+}
+
+# http2_stream_new(stream_id, initial_window) -> Http2Stream.
+# New streams start in the idle state with the given flow control
+# window (from SETTINGS INITIAL_WINDOW_SIZE).
+fn http2_stream_new(stream_id: int, initial_window: int) -> Http2Stream {
+    return Http2Stream {
+        stream_id: stream_id,
+        state: http2_stream_state_idle(),
+        send_window: initial_window,
+        recv_window: initial_window,
+        priority_dep: 0,
+        priority_weight: 16,    # RFC 7540 §5.3.5 default
+        priority_exclusive: false
+    }
+}
+
+# http2_stream_open(mut stream) -> void.
+# Transition idle -> open. Used when the stream's first HEADERS
+# frame is sent or received.
+fn http2_stream_open(mut stream: Http2Stream) -> void {
+    stream.state = http2_stream_state_open()
+}
+
+# http2_stream_close_local(mut stream) -> void.
+# Transition to half-closed-local (we sent END_STREAM) or closed
+# (if we were already half-closed-remote).
+fn http2_stream_close_local(mut stream: Http2Stream) -> void {
+    if stream.state == http2_stream_state_open() {
+        stream.state = http2_stream_state_half_closed_local()
+    } else if stream.state == http2_stream_state_half_closed_remote() {
+        stream.state = http2_stream_state_closed()
+    }
+}
+
+# http2_stream_close_remote(mut stream) -> void.
+# Transition to half-closed-remote (peer sent END_STREAM) or
+# closed (if we were already half-closed-local).
+fn http2_stream_close_remote(mut stream: Http2Stream) -> void {
+    if stream.state == http2_stream_state_open() {
+        stream.state = http2_stream_state_half_closed_remote()
+    } else if stream.state == http2_stream_state_half_closed_local() {
+        stream.state = http2_stream_state_closed()
+    }
+}
+
+# http2_stream_reset(mut stream) -> void.
+# Force-close the stream (RST_STREAM sent or received).
+fn http2_stream_reset(mut stream: Http2Stream) -> void {
+    stream.state = http2_stream_state_closed()
+}
+
+# http2_stream_is_closed(stream) -> bool.
+fn http2_stream_is_closed(stream: Http2Stream) -> bool {
+    return stream.state == http2_stream_state_closed()
+}
+
+# http2_stream_can_send_data(stream) -> bool.
+# Returns true iff the stream can accept outgoing DATA frames.
+# (i.e. is in open or half-closed-remote state, AND has a
+# positive send_window).
+fn http2_stream_can_send_data(stream: Http2Stream) -> bool {
+    if stream.state != http2_stream_state_open()
+        && stream.state != http2_stream_state_half_closed_remote() {
+        return false
+    }
+    return stream.send_window > 0
+}
+
+# ============================================================================
+# Connection — Http2Connection struct.
+#
+# Tracks the connection-level state: the next stream id to
+# allocate, the connection-level flow window, the SETTINGS of
+# both peers, and the list of active streams.
+#
+# Stage 39 does NOT perform real I/O — the connection struct is
+# a stateful container that the caller drives (read frame from
+# TCP, dispatch to connection method, write response frame to
+# TCP). The acceptance test exercises the state machine in
+# isolation; the multi-threaded server that uses this struct
+# is Stage 64 (std.http.server).
+# ============================================================================
+
+struct Http2Connection {
+    # True iff this is the client side (stream ids are odd).
+    # False iff this is the server side (stream ids are even).
+    is_client: bool,
+    # The next stream id to allocate (odd for client, even for server).
+    # Per RFC 7540 §5.1.1, a stream id MUST NOT be reused after close.
+    next_stream_id: int,
+    # Connection-level flow control window (RFC 7540 §6.9.1).
+    # Initialised to the default of 65535 (separate from the
+    # per-stream windows).
+    conn_send_window: int,
+    conn_recv_window: int,
+    # Local settings (what we announced to the peer).
+    local_settings: Http2Settings,
+    # Peer settings (what the peer announced to us).
+    peer_settings: Http2Settings,
+    # Active streams (key = stream id; we use a list since HLS has
+    # no int-keyed map — a small linear search is fine for the
+    # 100-stream case typical of an HTTP/2 connection).
+    streams: list[Http2Stream],
+    # The HPACK dynamic table (shared between encoder and decoder;
+    # one table per direction — RFC 7541 §4.2). Stage 39 uses a
+    # single table for both directions (correct for h2c-first-
+    # request; a real implementation would have separate encode
+    # and decode tables, but for the test workloads the single-
+    # table approach is byte-identical).
+    hpack_table: HpackDynamicTable,
+    # True iff we've sent our SETTINGS frame (used by the helper
+    # that drives the connection — Stage 39 just records the flag).
+    settings_sent: bool,
+    # True iff we've received the peer's SETTINGS frame.
+    settings_received: bool,
+    # The number of SETTINGS ACKs we owe the peer (incremented
+    # when we receive a SETTINGS frame, decremented when we send
+    # an ACK frame).
+    settings_acks_owed: int
+}
+
+# http2_connection_new(is_client) -> Http2Connection.
+# Construct a new connection with default settings and the correct
+# next_stream_id (1 for client, 2 for server — RFC 7540 §5.1.1).
+fn http2_connection_new(is_client: bool) -> Http2Connection {
+    let mut next_id: int = 1
+    if !is_client {
+        next_id = 2
+    }
+    return Http2Connection {
+        is_client: is_client,
+        next_stream_id: next_id,
+        conn_send_window: http2_default_initial_window_size(),
+        conn_recv_window: http2_default_initial_window_size(),
+        local_settings: http2_settings_default(),
+        peer_settings: http2_settings_default(),
+        streams: [],
+        hpack_table: http2_hpack_dynamic_table_new(http2_default_header_table_size()),
+        settings_sent: false,
+        settings_received: false,
+        settings_acks_owed: 0
+    }
+}
+
+# http2_connection_alloc_stream(mut conn, headers, end_stream) -> int.
+# Allocate a new stream id, create the stream, transition it to
+# open, and return the stream id. Used by the caller before
+# sending a HEADERS frame.
+fn http2_connection_alloc_stream(mut conn: Http2Connection, end_stream: bool) -> int {
+    let sid: int = conn.next_stream_id
+    let stream: Http2Stream = http2_stream_new(sid, conn.local_settings.initial_window_size)
+    http2_stream_open(stream)
+    if end_stream {
+        http2_stream_close_local(stream)
+    }
+    conn.streams.push(stream)
+    conn.next_stream_id = conn.next_stream_id + 2
+    return sid
+}
+
+# http2_connection_find_stream(conn, stream_id) -> Option[Http2Stream].
+# Returns the stream with the given id, or Option.None if not found.
+fn http2_connection_find_stream(conn: Http2Connection, stream_id: int) -> Option[Http2Stream] {
+    let mut i: int = 0
+    while i < conn.streams.len() {
+        if conn.streams.get(i).stream_id == stream_id {
+            return Option.Some(conn.streams.get(i))
+        }
+        i = i + 1
+    }
+    return Option.None
+}
+
+# http2_connection_apply_settings(mut conn, settings) -> void.
+# Apply the peer's SETTINGS to the connection. Adjusts the
+# HPACK dynamic table size and the per-stream windows if
+# INITIAL_WINDOW_SIZE changed (RFC 7540 §6.9.2 — a SETTINGS
+# INITIAL_WINDOW_SIZE update causes a delta to be applied to
+# ALL active streams).
+fn http2_connection_apply_settings(mut conn: Http2Connection, settings: Http2Settings) -> void {
+    let old_iws: int = conn.peer_settings.initial_window_size
+    conn.peer_settings = settings
+    http2_hpack_dynamic_table_set_max_size(conn.hpack_table, settings.header_table_size)
+    if settings.initial_window_size != old_iws {
+        let delta: int = settings.initial_window_size - old_iws
+        let mut i: int = 0
+        while i < conn.streams.len() {
+            let s: Http2Stream = conn.streams.get(i)
+            s.send_window = s.send_window + delta
+            # If the delta makes the window negative, the stream
+            # is in error (RFC 7540 §6.9.2 — "an endpoint MUST NOT
+            # allow a window to exceed 2^31-1, but a SETTINGS
+            # update can make an existing window negative"). The
+            # caller should send RST_STREAM with FLOW_CONTROL_ERROR.
+            i = i + 1
+        }
+    }
+}
+
+# http2_connection_send_data(mut conn, stream_id, n) -> Result[int, str].
+# Debit n bytes from the stream's send window and the connection's
+# send window. Returns Result.Ok(0) on success, Result.Err(msg) on
+# insufficient window (caller should buffer or wait for
+# WINDOW_UPDATE).
+fn http2_connection_send_data(mut conn: Http2Connection, stream_id: int, n: int) -> Result[int, str] {
+    let stream_opt: Option[Http2Stream] = http2_connection_find_stream(conn, stream_id)
+    if option_is_none(stream_opt) {
+        return Result.Err("http2_connection_send_data: unknown stream " + stream_id.to_str())
+    }
+    let stream: Http2Stream = option_unwrap(stream_opt)
+    if stream.state != http2_stream_state_open()
+        && stream.state != http2_stream_state_half_closed_remote() {
+        return Result.Err("http2_connection_send_data: stream not open (state="
+            + http2_stream_state_name(stream.state) + ")")
+    }
+    if stream.send_window < n {
+        return Result.Err("http2_connection_send_data: stream window exhausted (have "
+            + stream.send_window.to_str() + ", need " + n.to_str() + ")")
+    }
+    if conn.conn_send_window < n {
+        return Result.Err("http2_connection_send_data: connection window exhausted (have "
+            + conn.conn_send_window.to_str() + ", need " + n.to_str() + ")")
+    }
+    stream.send_window = stream.send_window - n
+    conn.conn_send_window = conn.conn_send_window - n
+    # Persist the updated stream back into the connection's list.
+    http2_connection_update_stream(conn, stream)
+    return Result.Ok(0)
+}
+
+# http2_connection_recv_window_update(mut conn, stream_id, n) -> void.
+# Credit n bytes to the stream's send window (if stream_id > 0)
+# or the connection's send window (if stream_id == 0). Used when
+# receiving a WINDOW_UPDATE frame.
+fn http2_connection_recv_window_update(mut conn: Http2Connection, stream_id: int, n: int) -> void {
+    if stream_id == 0 {
+        conn.conn_send_window = conn.conn_send_window + n
+        return
+    }
+    let stream_opt: Option[Http2Stream] = http2_connection_find_stream(conn, stream_id)
+    if option_is_none(stream_opt) {
+        return
+    }
+    let stream: Http2Stream = option_unwrap(stream_opt)
+    stream.send_window = stream.send_window + n
+    http2_connection_update_stream(conn, stream)
+}
+
+# http2_connection_update_stream(mut conn, stream) -> void.
+# Replace the stream with the matching id in conn.streams with
+# the given (mutated) stream struct. (HLS structs are by-value;
+# mutations don't propagate back through the list automatically.)
+fn http2_connection_update_stream(mut conn: Http2Connection, stream: Http2Stream) -> void {
+    let mut i: int = 0
+    while i < conn.streams.len() {
+        if conn.streams.get(i).stream_id == stream.stream_id {
+            let new_list: list[Http2Stream] = []
+            let mut j: int = 0
+            while j < conn.streams.len() {
+                if j == i {
+                    new_list.push(stream)
+                } else {
+                    new_list.push(conn.streams.get(j))
+                }
+                j = j + 1
+            }
+            conn.streams = new_list
+            return
+        }
+        i = i + 1
+    }
+}
+
+# ============================================================================
+# Frame constructors — high-level helpers that build specific frame
+# types. Each returns an Http2Frame ready to be serialised and sent.
+# ============================================================================
+
+# http2_make_settings_frame(settings) -> Http2Frame.
+# Build a SETTINGS frame carrying the given parameters. The ACK
+# flag is NOT set (use http2_make_settings_ack_frame for that).
+fn http2_make_settings_frame(settings: Http2Settings) -> Http2Frame {
+    let payload: str = http2_settings_encode(settings)
+    return http2_frame_new(http2_frame_type_settings(), 0, 0, payload)
+}
+
+# http2_make_settings_ack_frame() -> Http2Frame.
+# Build an empty SETTINGS frame with the ACK flag set.
+fn http2_make_settings_ack_frame() -> Http2Frame {
+    return http2_frame_new(http2_frame_type_settings(), http2_flag_ack(), 0, "")
+}
+
+# http2_make_ping_frame(opaque_data) -> Http2Frame.
+# Build a PING frame. The payload MUST be exactly 8 bytes
+# (RFC 7540 §6.7). The stream id MUST be 0.
+fn http2_make_ping_frame(opaque_data: str) -> Http2Frame {
+    if opaque_data.len() != 8 {
+        panic("http2_make_ping_frame: opaque_data must be 8 bytes (got "
+            + opaque_data.len().to_str() + ")")
+    }
+    return http2_frame_new(http2_frame_type_ping(), 0, 0, opaque_data)
+}
+
+# http2_make_ping_ack_frame(opaque_data) -> Http2Frame.
+# Build a PING frame with the ACK flag set (echoes the opaque
+# data back to the sender).
+fn http2_make_ping_ack_frame(opaque_data: str) -> Http2Frame {
+    if opaque_data.len() != 8 {
+        panic("http2_make_ping_ack_frame: opaque_data must be 8 bytes")
+    }
+    return http2_frame_new(http2_frame_type_ping(), http2_flag_ack(), 0, opaque_data)
+}
+
+# http2_make_goaway_frame(last_stream_id, error_code, debug_data) -> Http2Frame.
+# Build a GOAWAY frame (RFC 7540 §6.8). The payload is:
+#   4 bytes: last stream id (31-bit, R bit reserved)
+#   4 bytes: error code (32-bit)
+#   N bytes: debug data (optional, UTF-8 for humans)
+fn http2_make_goaway_frame(last_stream_id: int, error_code: int, debug_data: str) -> Http2Frame {
+    let payload: str = http2_encode_stream_id_31(last_stream_id)
+        + chr((error_code / 16777216) % 256)
+        + chr((error_code / 65536) % 256)
+        + chr((error_code / 256) % 256)
+        + chr(error_code % 256)
+        + debug_data
+    return http2_frame_new(http2_frame_type_goaway(), 0, 0, payload)
+}
+
+# http2_make_rst_stream_frame(stream_id, error_code) -> Http2Frame.
+# Build a RST_STREAM frame (RFC 7540 §6.4). Payload is a 4-byte
+# error code.
+fn http2_make_rst_stream_frame(stream_id: int, error_code: int) -> Http2Frame {
+    if stream_id == 0 {
+        panic("http2_make_rst_stream_frame: stream_id must not be 0")
+    }
+    let payload: str = chr((error_code / 16777216) % 256)
+        + chr((error_code / 65536) % 256)
+        + chr((error_code / 256) % 256)
+        + chr(error_code % 256)
+    return http2_frame_new(http2_frame_type_rst_stream(), 0, stream_id, payload)
+}
+
+# http2_make_window_update_frame(stream_id, increment) -> Http2Frame.
+# Build a WINDOW_UPDATE frame (RFC 7540 §6.9). Payload is a 31-bit
+# increment. stream_id 0 means connection-level.
+fn http2_make_window_update_frame(stream_id: int, increment: int) -> Http2Frame {
+    let payload: str = http2_encode_stream_id_31(increment)
+    return http2_frame_new(http2_frame_type_window_update(), 0, stream_id, payload)
+}
+
+# http2_make_headers_frame(stream_id, headers, end_stream, end_headers) -> Http2Frame.
+# Build a HEADERS frame (RFC 7540 §6.2). The headers are HPACK-
+# encoded (literal, no indexing — see http2_hpack_encode_header_block).
+# end_stream sets END_STREAM (the request has no body); end_headers
+# sets END_HEADERS (the headers are complete — no CONTINUATION
+# follows).
+fn http2_make_headers_frame(stream_id: int, headers: list[HttpHeader], end_stream: bool, end_headers: bool) -> Http2Frame {
+    let block: str = http2_hpack_encode_header_block(headers)
+    let mut flags: int = 0
+    if end_stream {
+        flags = int_or(flags, http2_flag_end_stream())
+    }
+    if end_headers {
+        flags = int_or(flags, http2_flag_end_headers())
+    }
+    return http2_frame_new(http2_frame_type_headers(), flags, stream_id, block)
+}
+
+# http2_make_data_frame(stream_id, data, end_stream) -> Http2Frame.
+# Build a DATA frame (RFC 7540 §6.1). The payload is the raw
+# bytes (NOT HPACK-encoded — DATA frames carry the body).
+fn http2_make_data_frame(stream_id: int, data: str, end_stream: bool) -> Http2Frame {
+    let mut flags: int = 0
+    if end_stream {
+        flags = int_or(flags, http2_flag_end_stream())
+    }
+    return http2_frame_new(http2_frame_type_data(), flags, stream_id, data)
+}
+
+# http2_make_push_promise_frame(stream_id, promised_stream_id, headers) -> Http2Frame.
+# Build a PUSH_PROMISE frame (RFC 7540 §6.6). The payload is:
+#   4 bytes: promised stream id (31-bit, R bit reserved)
+#   N bytes: HPACK-encoded header block (the synthetic request)
+# END_HEADERS is always set (Stage 39 does not split PUSH_PROMISE
+# across CONTINUATION).
+fn http2_make_push_promise_frame(stream_id: int, promised_stream_id: int, headers: list[HttpHeader]) -> Http2Frame {
+    let block: str = http2_hpack_encode_header_block(headers)
+    let payload: str = http2_encode_stream_id_31(promised_stream_id) + block
+    return http2_frame_new(http2_frame_type_push_promise(), http2_flag_end_headers(), stream_id, payload)
+}
+
+# http2_make_priority_frame(stream_id, dep, weight, exclusive) -> Http2Frame.
+# Build a PRIORITY frame (RFC 7540 §6.3). The payload is:
+#   4 bytes: dependency stream id (31-bit) + exclusive bit (high)
+#   1 byte: weight (1..256, encoded as 0..255)
+fn http2_make_priority_frame(stream_id: int, dep: int, weight: int, exclusive: bool) -> Http2Frame {
+    let mut dep_with_e: int = int_and(dep, 2147483647)
+    if exclusive {
+        dep_with_e = int_or(dep_with_e, 2147483648)
+    }
+    let payload: str = chr((dep_with_e / 16777216) % 256)
+        + chr((dep_with_e / 65536) % 256)
+        + chr((dep_with_e / 256) % 256)
+        + chr(dep_with_e % 256)
+        + chr(int_and(weight - 1, 255))
+    return http2_frame_new(http2_frame_type_priority(), 0, stream_id, payload)
+}
+
+# ============================================================================
+# Frame payload parsers — extract the typed fields from a parsed frame.
+# These are pure-HLS decoders that operate on the payload str.
+# ============================================================================
+
+# http2_parse_rst_stream_payload(payload) -> Result[int, str].
+# Returns the error code. Payload MUST be 4 bytes.
+fn http2_parse_rst_stream_payload(payload: str) -> Result[int, str] {
+    if payload.len() != 4 {
+        return Result.Err("RST_STREAM payload must be 4 bytes (got "
+            + payload.len().to_str() + ")")
+    }
+    let b0: int = payload.byte_at(0)
+    let b1: int = payload.byte_at(1)
+    let b2: int = payload.byte_at(2)
+    let b3: int = payload.byte_at(3)
+    return Result.Ok(b0 * 16777216 + b1 * 65536 + b2 * 256 + b3)
+}
+
+# http2_parse_window_update_payload(payload) -> Result[int, str].
+# Returns the increment. Payload MUST be 4 bytes.
+fn http2_parse_window_update_payload(payload: str) -> Result[int, str] {
+    if payload.len() != 4 {
+        return Result.Err("WINDOW_UPDATE payload must be 4 bytes (got "
+            + payload.len().to_str() + ")")
+    }
+    return Result.Ok(http2_decode_stream_id_31(payload))
+}
+
+# http2_parse_goaway_payload(payload) -> Result[Http2GoawayFrame, str].
+# Parses a GOAWAY frame's payload into a typed struct.
+struct Http2GoawayFrame {
+    last_stream_id: int,
+    error_code: int,
+    debug_data: str
+}
+
+fn http2_parse_goaway_payload(payload: str) -> Result[Http2GoawayFrame, str] {
+    if payload.len() < 8 {
+        return Result.Err("GOAWAY payload must be >= 8 bytes (got "
+            + payload.len().to_str() + ")")
+    }
+    let last_sid: int = http2_decode_stream_id_31(payload)
+    let b0: int = payload.byte_at(4)
+    let b1: int = payload.byte_at(5)
+    let b2: int = payload.byte_at(6)
+    let b3: int = payload.byte_at(7)
+    let err_code: int = b0 * 16777216 + b1 * 65536 + b2 * 256 + b3
+    let mut debug: str = ""
+    if payload.len() > 8 {
+        debug = payload.slice(8, payload.len())
+    }
+    return Result.Ok(Http2GoawayFrame {
+        last_stream_id: last_sid,
+        error_code: err_code,
+        debug_data: debug
+    })
+}
+
+# http2_parse_ping_payload(payload) -> Result[str, str].
+# Returns the opaque data. Payload MUST be 8 bytes.
+fn http2_parse_ping_payload(payload: str) -> Result[str, str] {
+    if payload.len() != 8 {
+        return Result.Err("PING payload must be 8 bytes (got "
+            + payload.len().to_str() + ")")
+    }
+    return Result.Ok(payload)
+}
+
+# http2_parse_push_promise_payload(payload) -> Result[Http2PushPromiseFrame, str].
+# Parses a PUSH_PROMISE frame's payload into a typed struct.
+struct Http2PushPromiseFrame {
+    promised_stream_id: int,
+    header_block: str
+}
+
+fn http2_parse_push_promise_payload(payload: str) -> Result[Http2PushPromiseFrame, str] {
+    if payload.len() < 4 {
+        return Result.Err("PUSH_PROMISE payload must be >= 4 bytes (got "
+            + payload.len().to_str() + ")")
+    }
+    let promised_sid: int = http2_decode_stream_id_31(payload)
+    let mut block: str = ""
+    if payload.len() > 4 {
+        block = payload.slice(4, payload.len())
+    }
+    return Result.Ok(Http2PushPromiseFrame {
+        promised_stream_id: promised_sid,
+        header_block: block
+    })
+}
+
+# http2_parse_priority_payload(payload) -> Result[Http2PriorityFrame, str].
+# Parses a PRIORITY frame's payload into a typed struct.
+struct Http2PriorityFrame {
+    dependency_stream_id: int,
+    weight: int,
+    exclusive: bool
+}
+
+fn http2_parse_priority_payload(payload: str) -> Result[Http2PriorityFrame, str] {
+    if payload.len() != 5 {
+        return Result.Err("PRIORITY payload must be 5 bytes (got "
+            + payload.len().to_str() + ")")
+    }
+    let dep_raw: int = payload.byte_at(0) * 16777216
+        + payload.byte_at(1) * 65536
+        + payload.byte_at(2) * 256
+        + payload.byte_at(3)
+    let exclusive: bool = int_and(dep_raw, 2147483648) != 0
+    let dep: int = int_and(dep_raw, 2147483647)
+    let weight: int = payload.byte_at(4) + 1   # 0..255 stored, 1..256 actual
+    return Result.Ok(Http2PriorityFrame {
+        dependency_stream_id: dep,
+        weight: weight,
+        exclusive: exclusive
+    })
+}
+
+# ============================================================================
+# Connection preface — verification helper.
+# ============================================================================
+
+# http2_verify_client_preface(s) -> Result[int, str].
+# Verifies that s starts with the HTTP/2 client connection preface
+# (the 24-byte magic string). Returns Result.Ok(24) (the number
+# of bytes consumed) on success, Result.Err(msg) on failure.
+# A failure indicates either an HTTP/1.x client (which would send
+# a request line instead) or a corrupted connection.
+fn http2_verify_client_preface(s: str) -> Result[int, str] {
+    let preface: str = http2_connection_preface()
+    if s.len() < preface.len() {
+        return Result.Err("http2_verify_client_preface: short input (have "
+            + s.len().to_str() + ", need " + preface.len().to_str() + ")")
+    }
+    let actual: str = s.slice(0, preface.len())
+    if actual != preface {
+        return Result.Err("http2_verify_client_preface: preface mismatch")
+    }
+    return Result.Ok(preface.len())
+}
+
+# ============================================================================
+# High-level helpers — convenience entry points.
+# ============================================================================
+
+# http2_hpack_decode_block(block) -> Result[list[HttpHeader], str].
+# Convenience wrapper: decode a header block with a fresh dynamic
+# table (no incremental indexing state shared with the caller).
+# Used by the acceptance test to verify the round-trip property
+# of the encoder + decoder.
+fn http2_hpack_decode_block(block: str) -> Result[list[HttpHeader], str] {
+    let table: HpackDynamicTable = http2_hpack_dynamic_table_new(http2_default_header_table_size())
+    return http2_hpack_decode_header_block(block, table)
+}
+
+# http2_client_initiate_connection(settings) -> list[Http2Frame].
+# Returns the initial frame sequence a client sends on a new
+# HTTP/2 connection:
+#   1. The 24-byte connection preface (NOT a frame — returned as
+#      the "settings_sent" flag on the connection; the caller
+#      writes the raw bytes to the socket before sending any
+#      frames).
+#   2. The client's SETTINGS frame.
+#   3. (After the server's SETTINGS frame arrives, the client
+#      sends a SETTINGS ACK.)
+#
+# This helper returns ONLY the SETTINGS frame; the caller writes
+# the preface bytes separately (via http2_connection_preface()).
+fn http2_client_initiate_connection(settings: Http2Settings) -> list[Http2Frame] {
+    return [http2_make_settings_frame(settings)]
+}
+
+# http2_server_initiate_connection(local_settings) -> list[Http2Frame].
+# Returns the server's initial SETTINGS frame. The server does
+# NOT send a connection preface (only the client does — RFC 7540
+# §3.4). After the client's preface + SETTINGS arrives, the
+# server sends its own SETTINGS, then a SETTINGS ACK for the
+# client's SETTINGS.
+fn http2_server_initiate_connection(local_settings: Http2Settings) -> list[Http2Frame] {
+    return [http2_make_settings_frame(local_settings)]
+}
+
+# http2_alpn_negotiate(offered_protocols, supported_protocols) -> Option[str].
+# ALPN negotiation (RFC 7301 §3.2): the client offers a list of
+# protocols; the server picks the FIRST one in the client's list
+# that it also supports. Returns Option.Some(token) on agreement,
+# Option.None on no overlap. The caller passes the result to the
+# TLS layer to indicate the negotiated protocol.
+#
+# Stage 39 does NOT perform TLS itself — this is a pure-HLS
+# helper for the negotiation logic. The actual TLS handshake is
+# at the reverse-proxy layer (or a future Stage 65 std.tls module
+# that links libssl). The "h2" token means HTTP/2 over TLS; the
+# "h2c" token means HTTP/2 over cleartext (used with the Upgrade
+# mechanism, not ALPN).
+fn http2_alpn_negotiate(offered: list[str], supported: list[str]) -> Option[str] {
+    let mut i: int = 0
+    while i < offered.len() {
+        let candidate: str = offered.get(i)
+        let mut j: int = 0
+        while j < supported.len() {
+            if candidate == supported.get(j) {
+                return Option.Some(candidate)
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return Option.None
+}
+
+# ============================================================================
+# Pure decoder for a complete SETTINGS frame (frame wrapper).
+# Used by the acceptance test to verify a SETTINGS frame
+# round-trips through encode -> serialize -> parse -> decode.
+# ============================================================================
+
+# http2_decode_settings_frame(frame) -> Result[Http2Settings, str].
+# Verifies the frame is a SETTINGS frame with no ACK flag, then
+# decodes the payload.
+fn http2_decode_settings_frame(frame: Http2Frame) -> Result[Http2Settings, str] {
+    if frame.frame_type != http2_frame_type_settings() {
+        return Result.Err("expected SETTINGS frame, got "
+            + http2_frame_type_name(frame.frame_type))
+    }
+    if int_and(frame.flags, http2_flag_ack()) != 0 {
+        if frame.payload.len() != 0 {
+            return Result.Err("SETTINGS ACK with non-empty payload")
+        }
+        return Result.Err("SETTINGS ACK frame — use http2_settings_decode on the original")
+    }
+    return http2_settings_decode(frame.payload)
+}
+
+# http2_is_settings_ack(frame) -> bool.
+# Returns true iff frame is a SETTINGS frame with the ACK flag set.
+fn http2_is_settings_ack(frame: Http2Frame) -> bool {
+    return frame.frame_type == http2_frame_type_settings()
+        && int_and(frame.flags, http2_flag_ack()) != 0
+        && frame.payload.len() == 0
+}

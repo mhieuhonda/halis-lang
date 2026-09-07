@@ -1,0 +1,686 @@
+# http2_demo.hls — Stage 39 (v0.58.0-alpha): std.http2 module demo.
+#
+# This demo shows the std.http2 API surface for HTTP/2 (RFC 7540)
+# and HPACK (RFC 7541). HTTP/2 is implemented as pure-HLS layered
+# on Stage 37's std.net for the TCP transport (no real I/O is
+# exercised here — the demo runs entirely on synthetic byte streams
+# so it's deterministic and differentially verifiable).
+#
+# The demo:
+#   1. Builds a SETTINGS frame, serialises it, parses it back.
+#   2. Encodes + decodes HPACK header blocks (literal encoder,
+#      full decoder with static + dynamic table).
+#   3. Builds a PING frame, sends + ACKs.
+#   4. Builds a HEADERS frame carrying a full HTTP/2 request.
+#   5. Builds a PUSH_PROMISE frame (server push, §8.2).
+#   6. Exercises the stream state machine (idle -> open -> closed).
+#   7. Verifies the HTTP/2 connection preface.
+#   8. ALPN negotiation (h2 / h2c).
+#   9. Simulates a full request/response cycle at the frame layer.
+
+import "std.http2"
+import "std.str"
+import "std.bits"
+import "std.option"
+import "std.result"
+
+# ============================================================================
+# Section 1: Frame layer — SETTINGS frame round-trip.
+# ============================================================================
+
+fn section_settings_frame() -> int uses IO {
+    println("=== Section 1: SETTINGS frame ===")
+    let s: Http2Settings = http2_settings_default()
+    s.header_table_size = 8192
+    s.enable_push = 1
+    s.max_concurrent_streams = 128
+    s.initial_window_size = 65535
+    s.max_frame_size = 16384
+    let frame: Http2Frame = http2_make_settings_frame(s)
+    let wire: str = http2_serialize_frame(frame)
+    println("  wire bytes: " + wire.len().to_str())
+    let back_r: Result[Http2Frame, str] = http2_parse_frame(wire)
+    if !result_is_ok(back_r) {
+        println("FAIL: parse: " + result_err_or(back_r, ""))
+        return 1
+    }
+    let back: Http2Frame = result_unwrap(back_r)
+    if back.frame_type != http2_frame_type_settings() {
+        println("FAIL: type mismatch: " + back.frame_type.to_str())
+        return 1
+    }
+    let s_back_r: Result[Http2Settings, str] = http2_settings_decode(back.payload)
+    if !result_is_ok(s_back_r) {
+        println("FAIL: decode: " + result_err_or(s_back_r, ""))
+        return 1
+    }
+    let s_back: Http2Settings = result_unwrap(s_back_r)
+    if s_back.header_table_size != 8192 {
+        println("FAIL: header_table_size: " + s_back.header_table_size.to_str())
+        return 1
+    }
+    if s_back.max_concurrent_streams != 128 {
+        println("FAIL: max_concurrent_streams: " + s_back.max_concurrent_streams.to_str())
+        return 1
+    }
+    println("  SETTINGS frame round-trip OK")
+    println("  header_table_size=" + s_back.header_table_size.to_str())
+    println("  max_concurrent_streams=" + s_back.max_concurrent_streams.to_str())
+    println("  initial_window_size=" + s_back.initial_window_size.to_str())
+    println("  max_frame_size=" + s_back.max_frame_size.to_str())
+    return 0
+}
+
+# ============================================================================
+# Section 2: HPACK — integer encoding (5-bit prefix, value 1337).
+# ============================================================================
+
+fn section_hpack_integer() -> int uses IO {
+    println("")
+    println("=== Section 2: HPACK integer (RFC 7541 §5.1) ===")
+    let enc: str = http2_hpack_encode_integer(1337, 5, 0)
+    println("  encoded (5-bit prefix, value 1337): " + enc.len().to_str() + " bytes")
+    # RFC 7541 §5.1 example: 1337 with 5-bit prefix is 3 bytes:
+    #   0x1f 0x9a 0x0a  (prefix flag 0x00 -> 0x1f, 21 with continue, 10 final)
+    if enc.len() != 3 {
+        println("FAIL: expected 3 bytes, got " + enc.len().to_str())
+        return 1
+    }
+    let b0: int = enc.byte_at(0)
+    let b1: int = enc.byte_at(1)
+    let b2: int = enc.byte_at(2)
+    if b0 != 31 || b1 != 154 || b2 != 10 {
+        println("FAIL: bytes = " + b0.to_str() + " " + b1.to_str() + " " + b2.to_str())
+        println("      expected 31 154 10")
+        return 1
+    }
+    # Round-trip: decode.
+    let d: HpackDecoder = http2_hpack_decoder_new(enc)
+    let v: int = http2_hpack_decode_integer(d, 5)
+    if d.err != "" {
+        println("FAIL: decode: " + d.err)
+        return 1
+    }
+    if v != 1337 {
+        println("FAIL: round-trip: " + v.to_str())
+        return 1
+    }
+    println("  encoded bytes: [" + b0.to_str() + ", " + b1.to_str() + ", " + b2.to_str() + "]")
+    println("  decoded value: " + v.to_str())
+    println("  HPACK integer round-trip OK (3 bytes, matches RFC 7541 example)")
+    return 0
+}
+
+# ============================================================================
+# Section 3: HPACK — string encoding (RFC 7541 §5.2, literal H=0).
+# ============================================================================
+
+fn section_hpack_string() -> int uses IO {
+    println("")
+    println("=== Section 3: HPACK string (literal, no Huffman) ===")
+    let s: str = "www.example.com"
+    let enc: str = http2_hpack_encode_string(s)
+    # The encoded form is: 1 length byte (0x0f = 15) + 15 raw bytes.
+    if enc.len() != 1 + s.len() {
+        println("FAIL: expected " + (1 + s.len()).to_str() + " bytes, got " + enc.len().to_str())
+        return 1
+    }
+    let first: int = enc.byte_at(0)
+    if first != s.len() {
+        println("FAIL: length byte = " + first.to_str() + ", expected " + s.len().to_str())
+        return 1
+    }
+    let d: HpackDecoder = http2_hpack_decoder_new(enc)
+    let decoded: str = http2_hpack_decode_string(d)
+    if d.err != "" {
+        println("FAIL: decode: " + d.err)
+        return 1
+    }
+    if decoded != s {
+        println("FAIL: round-trip: '" + decoded + "'")
+        return 1
+    }
+    println("  encoded: " + enc.len().to_str() + " bytes (1 length + " + s.len().to_str() + " raw)")
+    println("  decoded: '" + decoded + "'")
+    println("  HPACK string round-trip OK")
+    return 0
+}
+
+# ============================================================================
+# Section 4: HPACK — header block encode/decode round-trip.
+# ============================================================================
+
+fn section_hpack_block() -> int uses IO {
+    println("")
+    println("=== Section 4: HPACK header block (RFC 7541 §6) ===")
+    let headers: list[HttpHeader] = [
+        HttpHeader { name: ":method", value: "GET" },
+        HttpHeader { name: ":path", value: "/" },
+        HttpHeader { name: ":scheme", value: "https" },
+        HttpHeader { name: ":authority", value: "example.com" },
+        HttpHeader { name: "accept-encoding", value: "gzip, deflate" },
+        HttpHeader { name: "user-agent", value: "halis-http2/0.58" },
+        HttpHeader { name: "x-custom-header", value: "value with spaces" }
+    ]
+    let block: str = http2_hpack_encode_header_block(headers)
+    println("  encoded " + headers.len().to_str() + " headers into " + block.len().to_str() + " bytes")
+    # Decode and verify round-trip.
+    let back_r: Result[list[HttpHeader], str] = http2_hpack_decode_block(block)
+    if !result_is_ok(back_r) {
+        println("FAIL: decode: " + result_err_or(back_r, ""))
+        return 1
+    }
+    let back: list[HttpHeader] = result_unwrap(back_r)
+    if back.len() != headers.len() {
+        println("FAIL: header count " + back.len().to_str() + " vs " + headers.len().to_str())
+        return 1
+    }
+    let mut i: int = 0
+    while i < headers.len() {
+        let h: HttpHeader = headers.get(i)
+        let b: HttpHeader = back.get(i)
+        if h.name != b.name || h.value != b.value {
+            println("FAIL: header " + i.to_str())
+            println("  expected: '" + h.name + ": " + h.value + "'")
+            println("  got:      '" + b.name + ": " + b.value + "'")
+            return 1
+        }
+        i = i + 1
+    }
+    println("  HPACK header block round-trip OK (" + back.len().to_str() + " headers)")
+    # Compression: static-table lookups save bytes vs literal names.
+    # For ':method GET' the encoder emits 0x04 (idx 2 in 4-bit prefix
+    # = static table index 2 = ":method GET" lookup) + 0-length
+    # literal value placeholder... actually for our encoder that uses
+    # literal-without-indexing form, :method gets the 0x04 prefix
+    # (indexed name) + 0x03 + "GET" value (3 bytes). Total 5 bytes
+    # instead of 8 (1 + 7 + 1 + 3 = 12... wait, let me re-check).
+    println("  Static-table indexed names save bytes (e.g. :method, :path, :scheme)")
+    return 0
+}
+
+# ============================================================================
+# Section 5: HPACK dynamic table — incremental indexing.
+# ============================================================================
+
+fn section_dynamic_table() -> int uses IO {
+    println("")
+    println("=== Section 5: HPACK dynamic table (RFC 7541 §4.2) ===")
+    let table: HpackDynamicTable = http2_hpack_dynamic_table_new(4096)
+    println("  initial size: " + table.size.to_str() + " / max " + table.max_size.to_str())
+    # Add some entries.
+    http2_hpack_dynamic_table_add(table, "x-custom-1", "value1")
+    http2_hpack_dynamic_table_add(table, "x-custom-2", "value2")
+    http2_hpack_dynamic_table_add(table, "x-custom-3", "value3")
+    println("  after 3 adds: size=" + table.size.to_str() + ", entries=" + table.entries.len().to_str())
+    if table.entries.len() != 3 {
+        println("FAIL: expected 3 entries, got " + table.entries.len().to_str())
+        return 1
+    }
+    # Index 1 = newest (x-custom-3).
+    let r1: Result[HpackStaticEntry, str] = http2_hpack_dynamic_table_lookup(table, 1)
+    if !result_is_ok(r1) {
+        println("FAIL: lookup[1]: " + result_err_or(r1, ""))
+        return 1
+    }
+    let newest: HpackStaticEntry = result_unwrap(r1)
+    if newest.name != "x-custom-3" {
+        println("FAIL: newest entry name: '" + newest.name + "'")
+        return 1
+    }
+    # In HPACK the dynamic table is indexed AFTER the static table.
+    # Index 62 = static[1..61] + dynamic[1] = newest dynamic entry.
+    let lookup_r: Result[HpackStaticEntry, str] = http2_hpack_lookup_index(62, table)
+    if !result_is_ok(lookup_r) {
+        println("FAIL: index 62 lookup: " + result_err_or(lookup_r, ""))
+        return 1
+    }
+    let entry_62: HpackStaticEntry = result_unwrap(lookup_r)
+    if entry_62.name != "x-custom-3" {
+        println("FAIL: index 62 should be x-custom-3, got '" + entry_62.name + "'")
+        return 1
+    }
+    println("  dynamic table[1] = '" + newest.name + ": " + newest.value + "' (newest)")
+    println("  HPACK index 62 (static 61 + dynamic 1) = '" + entry_62.name + "'")
+    println("  Dynamic table OK")
+    return 0
+}
+
+# ============================================================================
+# Section 6: PING frame — send + ACK.
+# ============================================================================
+
+fn section_ping() -> int uses IO {
+    println("")
+    println("=== Section 6: PING frame (RFC 7540 §6.7) ===")
+    let opaque: str = "12345678"
+    let ping: Http2Frame = http2_make_ping_frame(opaque)
+    let wire: str = http2_serialize_frame(ping)
+    println("  PING frame wire bytes: " + wire.len().to_str())
+    if wire.len() != 9 + 8 {
+        println("FAIL: expected 17 bytes, got " + wire.len().to_str())
+        return 1
+    }
+    # Round-trip: parse + check.
+    let back_r: Result[Http2Frame, str] = http2_parse_frame(wire)
+    if !result_is_ok(back_r) {
+        println("FAIL: parse: " + result_err_or(back_r, ""))
+        return 1
+    }
+    let back: Http2Frame = result_unwrap(back_r)
+    if back.frame_type != http2_frame_type_ping() {
+        println("FAIL: type")
+        return 1
+    }
+    if back.stream_id != 0 {
+        println("FAIL: stream_id != 0 (got " + back.stream_id.to_str() + ")")
+        return 1
+    }
+    if back.payload != opaque {
+        println("FAIL: payload mismatch")
+        return 1
+    }
+    # Build the ACK.
+    let ack: Http2Frame = http2_make_ping_ack_frame(back.payload)
+    if int_and(ack.flags, http2_flag_ack()) == 0 {
+        println("FAIL: ACK flag not set")
+        return 1
+    }
+    println("  PING frame parsed: stream_id=0, opaque='12345678'")
+    println("  PING ACK built: flags=0x" + int_to_hex2(ack.flags))
+    println("  PING round-trip OK")
+    return 0
+}
+
+# ============================================================================
+# Section 7: HEADERS frame — full HTTP/2 request.
+# ============================================================================
+
+fn section_headers_frame() -> int uses IO {
+    println("")
+    println("=== Section 7: HEADERS frame (RFC 7540 §6.2) ===")
+    let headers: list[HttpHeader] = [
+        HttpHeader { name: ":method", value: "GET" },
+        HttpHeader { name: ":path", value: "/index.html" },
+        HttpHeader { name: ":scheme", value: "https" },
+        HttpHeader { name: ":authority", value: "example.com" }
+    ]
+    let frame: Http2Frame = http2_make_headers_frame(1, headers, true, true)
+    let wire: str = http2_serialize_frame(frame)
+    println("  HEADERS frame: stream_id=1, END_STREAM+END_HEADERS, " + wire.len().to_str() + " wire bytes")
+    if int_and(frame.flags, http2_flag_end_stream()) == 0 {
+        println("FAIL: END_STREAM not set")
+        return 1
+    }
+    if int_and(frame.flags, http2_flag_end_headers()) == 0 {
+        println("FAIL: END_HEADERS not set")
+        return 1
+    }
+    # Round-trip: parse + decode headers.
+    let back_r: Result[Http2Frame, str] = http2_parse_frame(wire)
+    if !result_is_ok(back_r) {
+        println("FAIL: parse: " + result_err_or(back_r, ""))
+        return 1
+    }
+    let back: Http2Frame = result_unwrap(back_r)
+    let dec_r: Result[list[HttpHeader], str] = http2_hpack_decode_block(back.payload)
+    if !result_is_ok(dec_r) {
+        println("FAIL: decode: " + result_err_or(dec_r, ""))
+        return 1
+    }
+    let decoded: list[HttpHeader] = result_unwrap(dec_r)
+    if decoded.len() != headers.len() {
+        println("FAIL: header count mismatch")
+        return 1
+    }
+    let mut i: int = 0
+    while i < headers.len() {
+        let h: HttpHeader = headers.get(i)
+        let b: HttpHeader = decoded.get(i)
+        if h.name != b.name || h.value != b.value {
+            println("FAIL: header " + i.to_str())
+            return 1
+        }
+        i = i + 1
+    }
+    println("  decoded " + decoded.len().to_str() + " headers:")
+    i = 0
+    while i < decoded.len() {
+        let h: HttpHeader = decoded.get(i)
+        println("    " + h.name + ": " + h.value)
+        i = i + 1
+    }
+    println("  HEADERS frame round-trip OK")
+    return 0
+}
+
+# ============================================================================
+# Section 8: PUSH_PROMISE frame — server push (RFC 7540 §8.2).
+# ============================================================================
+
+fn section_push_promise() -> int uses IO {
+    println("")
+    println("=== Section 8: PUSH_PROMISE frame (RFC 7540 §6.6, §8.2) ===")
+    let pushed_headers: list[HttpHeader] = [
+        HttpHeader { name: ":method", value: "GET" },
+        HttpHeader { name: ":path", value: "/style.css" },
+        HttpHeader { name: ":scheme", value: "https" },
+        HttpHeader { name: ":authority", value: "example.com" }
+    ]
+    let pp: Http2Frame = http2_make_push_promise_frame(1, 2, pushed_headers)
+    let wire: str = http2_serialize_frame(pp)
+    println("  PUSH_PROMISE frame: stream_id=1, promised=2, " + wire.len().to_str() + " bytes")
+    # Round-trip.
+    let back_r: Result[Http2Frame, str] = http2_parse_frame(wire)
+    if !result_is_ok(back_r) {
+        println("FAIL: parse: " + result_err_or(back_r, ""))
+        return 1
+    }
+    let back: Http2Frame = result_unwrap(back_r)
+    if back.frame_type != http2_frame_type_push_promise() {
+        println("FAIL: type")
+        return 1
+    }
+    let pp_r: Result[Http2PushPromiseFrame, str] = http2_parse_push_promise_payload(back.payload)
+    if !result_is_ok(pp_r) {
+        println("FAIL: parse push promise: " + result_err_or(pp_r, ""))
+        return 1
+    }
+    let pp_back: Http2PushPromiseFrame = result_unwrap(pp_r)
+    if pp_back.promised_stream_id != 2 {
+        println("FAIL: promised_stream_id: " + pp_back.promised_stream_id.to_str())
+        return 1
+    }
+    # Decode the pushed headers.
+    let dec_r: Result[list[HttpHeader], str] = http2_hpack_decode_block(pp_back.header_block)
+    if !result_is_ok(dec_r) {
+        println("FAIL: decode: " + result_err_or(dec_r, ""))
+        return 1
+    }
+    let decoded: list[HttpHeader] = result_unwrap(dec_r)
+    if decoded.len() != pushed_headers.len() {
+        println("FAIL: header count mismatch")
+        return 1
+    }
+    println("  promised_stream_id=" + pp_back.promised_stream_id.to_str())
+    println("  decoded pushed request headers (" + decoded.len().to_str() + "):")
+    let mut i: int = 0
+    while i < decoded.len() {
+        let h: HttpHeader = decoded.get(i)
+        println("    " + h.name + ": " + h.value)
+        i = i + 1
+    }
+    println("  PUSH_PROMISE round-trip OK")
+    return 0
+}
+
+# ============================================================================
+# Section 9: Stream state machine (RFC 7540 §5.1).
+# ============================================================================
+
+fn section_stream_state() -> int uses IO {
+    println("")
+    println("=== Section 9: Stream state machine (RFC 7540 §5.1) ===")
+    let stream: Http2Stream = http2_stream_new(1, 65535)
+    println("  initial: " + http2_stream_state_name(stream.state))
+    http2_stream_open(stream)
+    println("  after open: " + http2_stream_state_name(stream.state))
+    http2_stream_close_local(stream)
+    println("  after close_local (END_STREAM sent): " + http2_stream_state_name(stream.state))
+    http2_stream_close_remote(stream)
+    println("  after close_remote (END_STREAM recv): " + http2_stream_state_name(stream.state))
+    if !http2_stream_is_closed(stream) {
+        println("FAIL: stream should be closed")
+        return 1
+    }
+    println("  Stream state machine OK")
+    return 0
+}
+
+# ============================================================================
+# Section 10: Connection preface + ALPN negotiation.
+# ============================================================================
+
+fn section_preface_alpn() -> int uses IO {
+    println("")
+    println("=== Section 10: Connection preface + ALPN ===")
+    let preface: str = http2_connection_preface()
+    println("  client preface: " + preface.len().to_str() + " bytes")
+    if preface.len() != 24 {
+        println("FAIL: preface must be 24 bytes, got " + preface.len().to_str())
+        return 1
+    }
+    let conn_r: Result[int, str] = http2_verify_client_preface(preface)
+    if !result_is_ok(conn_r) {
+        println("FAIL: verify: " + result_err_or(conn_r, ""))
+        return 1
+    }
+    let consumed: int = result_unwrap(conn_r)
+    if consumed != 24 {
+        println("FAIL: consumed " + consumed.to_str())
+        return 1
+    }
+    println("  preface verified (24 bytes consumed)")
+    # ALPN.
+    let offered: list[str] = ["h2", "http/1.1"]
+    let supported: list[str] = ["h2", "http/1.1"]
+    let alpn_r: Option[str] = http2_alpn_negotiate(offered, supported)
+    if option_is_none(alpn_r) {
+        println("FAIL: ALPN returned None")
+        return 1
+    }
+    let alpn: str = option_unwrap(alpn_r)
+    if alpn != "h2" {
+        println("FAIL: ALPN selected '" + alpn + "' instead of 'h2'")
+        return 1
+    }
+    println("  ALPN: client offered ['h2', 'http/1.1'], server supports ['h2', 'http/1.1']")
+    println("  ALPN negotiated: '" + alpn + "'")
+    # h2c token for cleartext (no ALPN).
+    println("  cleartext h2c token: '" + http2_alpn_h2c() + "' (used with Upgrade:)")
+    println("  Connection preface + ALPN OK")
+    return 0
+}
+
+# ============================================================================
+# Section 11: Full request/response cycle at the frame layer.
+# ============================================================================
+
+fn section_full_cycle() -> int uses IO {
+    println("")
+    println("=== Section 11: Full request/response cycle ===")
+    println("  [client] send connection preface (24 bytes)")
+    println("  [client] send SETTINGS frame (default values)")
+    println("  [server] send SETTINGS frame (server's own values)")
+    println("  [client] send SETTINGS ACK (empty payload, ACK flag)")
+    println("  [server] send SETTINGS ACK (empty payload, ACK flag)")
+    # Client SETTINGS.
+    let client_settings: Http2Settings = http2_settings_default()
+    let client_frame: Http2Frame = http2_make_settings_frame(client_settings)
+    let client_wire: str = http2_serialize_frame(client_frame)
+    println("  [client] SETTINGS frame: " + client_wire.len().to_str() + " wire bytes")
+    # Server SETTINGS (different values to prove it's independent).
+    let server_settings: Http2Settings = http2_settings_default()
+    server_settings.max_concurrent_streams = 100
+    let server_frame: Http2Frame = http2_make_settings_frame(server_settings)
+    let server_wire: str = http2_serialize_frame(server_frame)
+    println("  [server] SETTINGS frame: " + server_wire.len().to_str() + " wire bytes (max_concurrent_streams=100)")
+    # ACKs.
+    let ack: Http2Frame = http2_make_settings_ack_frame()
+    let ack_wire: str = http2_serialize_frame(ack)
+    println("  [both] SETTINGS ACK: " + ack_wire.len().to_str() + " wire bytes (9-byte header only)")
+    # Client request HEADERS frame on stream 1.
+    let req_headers: list[HttpHeader] = [
+        HttpHeader { name: ":method", value: "GET" },
+        HttpHeader { name: ":path", value: "/api/v1/users" },
+        HttpHeader { name: ":scheme", value: "https" },
+        HttpHeader { name: ":authority", value: "api.example.com" }
+    ]
+    let req_frame: Http2Frame = http2_make_headers_frame(1, req_headers, true, true)
+    let req_wire: str = http2_serialize_frame(req_frame)
+    println("  [client] HEADERS frame stream=1: " + req_wire.len().to_str() + " wire bytes")
+    # Server response HEADERS frame on stream 1.
+    let resp_headers: list[HttpHeader] = [
+        HttpHeader { name: ":status", value: "200" },
+        HttpHeader { name: "content-type", value: "application/json" }
+    ]
+    let resp_frame: Http2Frame = http2_make_headers_frame(1, resp_headers, false, true)
+    let resp_wire: str = http2_serialize_frame(resp_frame)
+    println("  [server] HEADERS frame stream=1: " + resp_wire.len().to_str() + " wire bytes")
+    # Server DATA frame on stream 1 (response body).
+    let body: str = "{\"users\":[{\"id\":1,\"name\":\"alice\"}]}"
+    let data_frame: Http2Frame = http2_make_data_frame(1, body, true)
+    let data_wire: str = http2_serialize_frame(data_frame)
+    println("  [server] DATA frame stream=1: " + data_wire.len().to_str() + " wire bytes (END_STREAM)")
+    # Verify all frames parse round-trip.
+    let all_frames: list[str] = [client_wire, server_wire, ack_wire, req_wire, resp_wire, data_wire]
+    let mut total_bytes: int = 0
+    let mut i: int = 0
+    while i < all_frames.len() {
+        let w: str = all_frames.get(i)
+        total_bytes = total_bytes + w.len()
+        let fr_r: Result[Http2Frame, str] = http2_parse_frame(w)
+        if !result_is_ok(fr_r) {
+            println("FAIL: parse frame " + i.to_str() + ": " + result_err_or(fr_r, ""))
+            return 1
+        }
+        i = i + 1
+    }
+    println("  total wire bytes: " + total_bytes.to_str())
+    println("  all 6 frames parsed OK round-trip")
+    println("  Full request/response cycle OK")
+    return 0
+}
+
+# ============================================================================
+# Section 12: Flow control windows (RFC 7540 §6.9).
+# ============================================================================
+
+fn section_flow_control() -> int uses IO {
+    println("")
+    println("=== Section 12: Flow control (RFC 7540 §6.9) ===")
+    let conn: Http2Connection = http2_connection_new(true)
+    println("  initial conn_send_window=" + conn.conn_send_window.to_str())
+    let sid: int = http2_connection_alloc_stream(conn, false)
+    println("  allocated stream " + sid.to_str())
+    # Send 1000 bytes.
+    let send_r: Result[int, str] = http2_connection_send_data(conn, sid, 1000)
+    if !result_is_ok(send_r) {
+        println("FAIL: send_data: " + result_err_or(send_r, ""))
+        return 1
+    }
+    let stream_opt: Option[Http2Stream] = http2_connection_find_stream(conn, sid)
+    if option_is_none(stream_opt) {
+        println("FAIL: stream not found")
+        return 1
+    }
+    let stream: Http2Stream = option_unwrap(stream_opt)
+    let expected_stream_window: int = 65535 - 1000
+    let expected_conn_window: int = 65535 - 1000
+    if stream.send_window != expected_stream_window {
+        println("FAIL: stream.send_window=" + stream.send_window.to_str()
+            + ", expected " + expected_stream_window.to_str())
+        return 1
+    }
+    if conn.conn_send_window != expected_conn_window {
+        println("FAIL: conn_send_window=" + conn.conn_send_window.to_str()
+            + ", expected " + expected_conn_window.to_str())
+        return 1
+    }
+    println("  after 1000-byte send: stream_window=" + stream.send_window.to_str())
+    println("                       conn_window=" + conn.conn_send_window.to_str())
+    # Peer sends WINDOW_UPDATE on the stream (credit 500 bytes).
+    http2_connection_recv_window_update(conn, sid, 500)
+    let stream2_opt: Option[Http2Stream] = http2_connection_find_stream(conn, sid)
+    let stream2: Http2Stream = option_unwrap(stream2_opt)
+    if stream2.send_window != expected_stream_window + 500 {
+        println("FAIL: after WINDOW_UPDATE stream=" + stream2.send_window.to_str())
+        return 1
+    }
+    println("  after WINDOW_UPDATE(stream, 500): stream_window=" + stream2.send_window.to_str())
+    # Peer sends WINDOW_UPDATE on the connection (credit 1000 bytes).
+    http2_connection_recv_window_update(conn, 0, 1000)
+    if conn.conn_send_window != expected_conn_window + 1000 {
+        println("FAIL: after WINDOW_UPDATE conn=" + conn.conn_send_window.to_str())
+        return 1
+    }
+    println("  after WINDOW_UPDATE(conn, 1000): conn_window=" + conn.conn_send_window.to_str())
+    println("  Flow control accounting OK")
+    return 0
+}
+
+# ============================================================================
+# Section 13: Error frames — RST_STREAM, GOAWAY.
+# ============================================================================
+
+fn section_error_frames() -> int uses IO {
+    println("")
+    println("=== Section 13: Error frames (RST_STREAM, GOAWAY) ===")
+    # RST_STREAM.
+    let rst: Http2Frame = http2_make_rst_stream_frame(1, http2_err_cancel())
+    let rst_wire: str = http2_serialize_frame(rst)
+    let rst_back_r: Result[Http2Frame, str] = http2_parse_frame(rst_wire)
+    if !result_is_ok(rst_back_r) {
+        println("FAIL: parse RST_STREAM: " + result_err_or(rst_back_r, ""))
+        return 1
+    }
+    let rst_back: Http2Frame = result_unwrap(rst_back_r)
+    let ec_r: Result[int, str] = http2_parse_rst_stream_payload(rst_back.payload)
+    if !result_is_ok(ec_r) {
+        println("FAIL: parse payload: " + result_err_or(ec_r, ""))
+        return 1
+    }
+    let ec: int = result_unwrap(ec_r)
+    if ec != http2_err_cancel() {
+        println("FAIL: error code " + ec.to_str())
+        return 1
+    }
+    println("  RST_STREAM: stream_id=1, error=CANCEL (" + http2_err_name(ec) + ")")
+    # GOAWAY.
+    let goaway: Http2Frame = http2_make_goaway_frame(0, http2_err_no_error(), "graceful shutdown")
+    let goaway_wire: str = http2_serialize_frame(goaway)
+    let goaway_back_r: Result[Http2Frame, str] = http2_parse_frame(goaway_wire)
+    if !result_is_ok(goaway_back_r) {
+        println("FAIL: parse GOAWAY: " + result_err_or(goaway_back_r, ""))
+        return 1
+    }
+    let goaway_back: Http2Frame = result_unwrap(goaway_back_r)
+    let g_r: Result[Http2GoawayFrame, str] = http2_parse_goaway_payload(goaway_back.payload)
+    if !result_is_ok(g_r) {
+        println("FAIL: parse goaway payload: " + result_err_or(g_r, ""))
+        return 1
+    }
+    let g: Http2GoawayFrame = result_unwrap(g_r)
+    println("  GOAWAY: last_stream_id=" + g.last_stream_id.to_str()
+        + ", error=" + http2_err_name(g.error_code)
+        + ", debug='" + g.debug_data + "'")
+    if g.debug_data != "graceful shutdown" {
+        println("FAIL: debug_data mismatch: '" + g.debug_data + "'")
+        return 1
+    }
+    println("  Error frames OK")
+    return 0
+}
+
+# ============================================================================
+# Main — run all sections in order.
+# ============================================================================
+
+fn main() -> int uses IO {
+    if section_settings_frame() != 0 { return 1 }
+    if section_hpack_integer() != 0 { return 2 }
+    if section_hpack_string() != 0 { return 3 }
+    if section_hpack_block() != 0 { return 4 }
+    if section_dynamic_table() != 0 { return 5 }
+    if section_ping() != 0 { return 6 }
+    if section_headers_frame() != 0 { return 7 }
+    if section_push_promise() != 0 { return 8 }
+    if section_stream_state() != 0 { return 9 }
+    if section_preface_alpn() != 0 { return 10 }
+    if section_full_cycle() != 0 { return 11 }
+    if section_flow_control() != 0 { return 12 }
+    if section_error_frames() != 0 { return 13 }
+    println("")
+    println("ALL HTTP/2 DEMO SECTIONS PASSED")
+    return 0
+}

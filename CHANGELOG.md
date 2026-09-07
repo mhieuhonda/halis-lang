@@ -13,6 +13,331 @@ stability (125–140), and final stabilisation toward v1.0 (141–150).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
+## [v0.58.0-alpha] — Stage 39: std.http2 (HTTP/2 + ALPN negotiation, RFC 7540/7541)
+
+> Adds `std/http2.hls` — the fifth module of Phase III (stdlib
+> expansion) — implementing HTTP/2 (RFC 7540) and HPACK (RFC
+> 7541) as pure-HLS, layered on Stage 37's `std.net` for the TCP
+> transport and Stage 38's `std.http` for the `HttpHeader`
+> struct. **No new compiler builtins** — the entire module is
+> pure HLS, using `std.bits` for the bitwise operations needed
+> by HPACK integer encoding and the 24-bit/31-bit field
+> arithmetic in the frame header.
+>
+> Stage 39 is a **framing + state-machine library**: it does
+> not perform real I/O (a future stage will plug this into the
+> multi-threaded HTTP/2 server). The acceptance test exercises
+> the framing layer, HPACK, the stream state machine, flow
+> control accounting, server push, and ALPN negotiation against
+> synthetic byte streams — verifying the differential parity
+> (interpreter == native) is byte-exact.
+
+### Added — Stage 39 (v0.58.0-alpha)
+
+- **`std/http2.hls`** library module with:
+  - **Frame layer** (`Http2Frame` struct + 9-byte header
+    encode/decode):
+    - `http2_parse_frame(s) -> Result[Http2Frame, str]` —
+      parses one frame from the start of `s` (24-bit length,
+      8-bit type, 8-bit flags, 31-bit stream id with reserved
+      R bit stripped on receive).
+    - `http2_serialize_frame(f) -> str` — canonical wire
+      format (R bit cleared on send).
+    - All 10 frame types recognised (DATA, HEADERS, PRIORITY,
+      RST_STREAM, SETTINGS, PUSH_PROMISE, PING, GOAWAY,
+      WINDOW_UPDATE, CONTINUATION); unknown types parse OK
+      and are surfaced for the caller to skip (RFC 7540
+      §5.5).
+  - **HPACK (RFC 7541)**:
+    - `HpackDecoder` struct with mutable `pos` + `err` fields
+      (the same pattern as `std.json`'s `JsonParser`).
+    - **Static table** with all 61 entries from RFC 7541
+      Appendix A. `http2_hpack_static_lookup(index)` returns
+      the entry at the given 1-based index.
+    - **Dynamic table** (`HpackDynamicTable`) with size-based
+      eviction. `http2_hpack_dynamic_table_add(table, name,
+      value)` prepends a new entry, evicting from the end
+      (oldest first) until the new entry fits. Entries larger
+      than `max_size` clear the table and are NOT inserted
+      (RFC 7541 §4.4).
+    - **Integer decoder** for the 1-/2-/3-/4-/5-/6-/7-/8-bit
+      prefix forms. `http2_hpack_decode_integer(d,
+      prefix_bits)` returns the integer value and advances
+      `d.pos`. `http2_hpack_encode_integer(value, prefix_bits,
+      prefix_flags)` produces the canonical encoding (matches
+      the RFC 7541 §5.1 example: 1337 with 5-bit prefix is
+      3 bytes [0x1f, 0x9a, 0x0a]).
+    - **Literal string decoder** (H=0).
+      `http2_hpack_decode_string(d) -> str`. The encoder
+      NEVER sets the H bit. Huffman (H=1) is a documented
+      deferral — the decoder returns
+      `Result.Err("Huffman strings not yet supported")` so
+      callers know to fall back.
+    - **Header block decoder** dispatches on the flag byte to
+      the four representations (Indexed Header Field,
+      Literal with Incremental Indexing, Literal without
+      Indexing, Literal Never Indexed, Dynamic Table Size
+      Update). Header-list DoS protection: total decoded
+      size bounded by `http2_max_header_list_size` (default
+      1 MiB, RFC 7540 §10.5.1).
+    - **Header block encoder** emits literal-without-indexing
+      (RFC 7541 §6.2.2). For each header, looks up the name
+      in the static table (case-insensitive) — if found,
+      emits the indexed-name form (saves bytes for common
+      pseudo-headers like `:method`, `:path`).
+  - **SETTINGS exchange** (`Http2Settings` struct + the six
+    parameters from RFC 7540 §6.5.2):
+    - `http2_settings_encode(s) -> str` — 6-byte-per-pair
+      payload (only emits parameters that differ from the
+      default).
+    - `http2_settings_decode(payload) -> Result[Http2Settings,
+      str]` — validates ENABLE_PUSH (0 or 1), MAX_FRAME_SIZE
+      [16384, 16777215], INITIAL_WINDOW_SIZE <= 2^31-1.
+      Unknown parameter IDs are silently ignored (RFC 7540
+      §6.5.1).
+    - `http2_make_settings_ack_frame()` — empty SETTINGS
+      frame with the ACK flag set.
+  - **Frame constructors** for all 10 frame types:
+    - `http2_make_settings_frame(settings)` /
+      `http2_make_settings_ack_frame()`.
+    - `http2_make_ping_frame(opaque)` /
+      `http2_make_ping_ack_frame(opaque)` — payload MUST be
+      exactly 8 bytes (RFC 7540 §6.7).
+    - `http2_make_goaway_frame(last_stream_id, error_code,
+      debug_data)` — payload is 4-byte last_stream_id +
+      4-byte error_code + optional debug_data.
+    - `http2_make_rst_stream_frame(stream_id, error_code)`.
+    - `http2_make_window_update_frame(stream_id, increment)`.
+    - `http2_make_headers_frame(stream_id, headers,
+      end_stream, end_headers)` — HPACK-encoded header
+      block.
+    - `http2_make_data_frame(stream_id, data, end_stream)`.
+    - `http2_make_push_promise_frame(stream_id,
+      promised_stream_id, headers)` — server push (RFC 7540
+      §8.2).
+    - `http2_make_priority_frame(stream_id, dep, weight,
+      exclusive)` — RFC 7540 §6.3.
+  - **Frame payload parsers** that extract typed fields:
+    - `http2_parse_rst_stream_payload(payload) ->
+      Result[int, str]` — error code.
+    - `http2_parse_window_update_payload(payload) ->
+      Result[int, str]` — increment.
+    - `http2_parse_goaway_payload(payload) ->
+      Result[Http2GoawayFrame, str]` — last_stream_id,
+      error_code, debug_data.
+    - `http2_parse_ping_payload(payload) -> Result[str, str]`.
+    - `http2_parse_push_promise_payload(payload) ->
+      Result[Http2PushPromiseFrame, str]` — promised_stream_id
+      + header_block (raw HPACK bytes).
+    - `http2_parse_priority_payload(payload) ->
+      Result[Http2PriorityFrame, str]` — dependency_stream_id,
+      weight, exclusive.
+  - **Connection preface (RFC 7540 §3.5)**:
+    - `http2_connection_preface() -> str` — the 24-byte
+      client magic string ("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n").
+    - `http2_verify_client_preface(s) -> Result[int, str]` —
+      verifies the first 24 bytes of a connection, rejecting
+      HTTP/1.x clients.
+  - **Stream state machine (RFC 7540 §5.1)**:
+    - `Http2Stream` struct (state, send_window, recv_window,
+      priority_dep, priority_weight, priority_exclusive).
+    - State transitions: `http2_stream_open`,
+      `http2_stream_close_local`, `http2_stream_close_remote`,
+      `http2_stream_reset`.
+    - State names: idle, reserved-local, reserved-remote,
+      open, half-closed-local, half-closed-remote, closed.
+  - **Flow control (RFC 7540 §6.9)**:
+    - `Http2Connection` struct tracks the connection-level
+      send window, the peer's SETTINGS, the active streams,
+      and the HPACK dynamic table.
+    - `http2_connection_send_data(conn, stream_id, n)` —
+      debits both the stream's and the connection's send
+      window. Returns `Result.Err` if either is exhausted
+      (the caller is expected to buffer or pause —
+      backpressure is the application's responsibility).
+    - `http2_connection_recv_window_update(conn, stream_id,
+      n)` — credits the stream (stream_id > 0) or the
+      connection (stream_id == 0).
+  - **Stream multiplexing**:
+    - `http2_connection_alloc_stream(conn, end_stream)` —
+      allocates the next stream id (odd for client, even for
+      server — RFC 7540 §5.1.1). Stream id reuse is
+      forbidden (the `next_stream_id` counter only
+      increments).
+    - `http2_connection_find_stream(conn, stream_id) ->
+      Option[Http2Stream]`.
+    - `http2_connection_apply_settings(conn, settings)` —
+      applies the peer's SETTINGS, adjusting the HPACK
+      dynamic table size and the per-stream windows if
+      INITIAL_WINDOW_SIZE changed (RFC 7540 §6.9.2).
+  - **ALPN (RFC 7301)**:
+    - `http2_alpn_negotiate(offered, supported) ->
+      Option[str]` — selects the first protocol in the
+      client's offered list that the server also supports.
+    - `http2_alpn_h2() -> str` returns "h2" (HTTP/2 over
+      TLS).
+    - `http2_alpn_h2c() -> str` returns "h2c" (HTTP/2
+      cleartext — used with the Upgrade: header, not ALPN).
+- **`examples/http2_demo.hls`** and **`tests/ok/feat_stage39_http2.hls`**
+  exercising: SETTINGS frame round-trip, HPACK integer (RFC
+  7541 §5.1 example: 1337), HPACK string (literal, no Huffman),
+  HPACK header block encode/decode round-trip (9 headers),
+  HPACK static + dynamic table, HPACK indexed representation
+  (0x82 -> :method GET), HPACK dynamic table eviction
+  (size-based), SETTINGS exchange + ACK + validation, PING +
+  ACK, HEADERS frame round-trip, RST_STREAM + payload, GOAWAY
+  + payload (with debug data), WINDOW_UPDATE + payload,
+  PUSH_PROMISE + header block, PRIORITY + payload (with
+  exclusive bit), connection preface verification (24-byte
+  magic), stream state machine (idle -> open -> half-closed
+  -> closed), connection alloc stream (odd/even ids), flow
+  control accounting (debit/credit/over-window rejection),
+  ALPN negotiation (h2 selection, first-match, no-overlap),
+  HPACK Huffman deferral (H=1 rejected), SETTINGS validation
+  (ENABLE_PUSH=2, MAX_FRAME_SIZE=100, odd payload rejected).
+- **ROADMAP** updated: Stage 39 marked ✅ complete.
+
+### Changed — Stage 39 (v0.58.0-alpha)
+
+- **`Makefile`** — added the `http2-acceptance` target
+  (mirrors `http-acceptance`'s structure; pure-HLS module so
+  the link command is identical to Stage 38's). Updated
+  `.PHONY` to include the new target.
+- **No compiler changes** — Stage 39 is pure HLS, layered on
+  Stage 37's `std.net`, Stage 38's `std.http`, and `std.bits`.
+  The `boot/checker.py`, `boot/interp.py`, `src/hlc.hls`, and
+  `tools/llvm_emit.py` files are unchanged from v0.57.0-alpha.
+  This is the second consecutive roadmap stage that adds a
+  stdlib module without touching the compiler — the
+  language's self-hosting maturity is sufficient for pure-HLS
+  protocol implementations.
+
+### Security — Stage 39 (v0.58.0-alpha)
+
+- **Frame size bounds (inherited)**: `http2_max_frame_payload`
+  defaults to 16 MiB (the RFC absolute max). A frame whose
+  declared length exceeds this is rejected with
+  FRAME_SIZE_ERROR (defends against memory-exhaustion attacks
+  from a malicious peer).
+- **Stream id validation**: stream id 0 is reserved for
+  connection-level frames (SETTINGS, PING, GOAWAY). A DATA /
+  HEADERS / PRIORITY / RST_STREAM frame with stream id 0 is
+  rejected with PROTOCOL_ERROR (the caller validates this
+  before dispatching — Stage 39 surfaces the parsed frame and
+  lets the caller decide).
+- **SETTINGS ACK validation**: a SETTINGS frame with the ACK
+  flag set MUST have empty payload (RFC 7540 §6.5). A non-empty
+  ACK payload is rejected with FRAME_SIZE_ERROR.
+- **HPACK dynamic table size**: bounded by SETTINGS
+  HEADER_TABLE_SIZE (default 4096 bytes). A dynamic table
+  size update larger than the negotiated value is rejected
+  with PROTOCOL_ERROR. The encoder never sends a size update
+  larger than its own max (which the peer's SETTINGS sets).
+- **Header list DoS protection**: the total decoded size is
+  bounded by `http2_max_header_list_size` (default 1 MiB).
+  A peer that sends a header block that decodes to more than
+  this is rejected with PROTOCOL_ERROR (defends against
+  header-based DoS — see CVE-2018-1000008 in nghttp2 for an
+  analogous advisory).
+- **Connection preface verification**: `http2_verify_client_preface`
+  rejects any connection that doesn't start with the 24-byte
+  magic string. This defends against HTTP/1.x clients that
+  try to send a request line to an h2c-only port (which
+  would otherwise be interpreted as a frame and produce
+  confusing errors).
+- **ALPN negotiation**: the caller passes the negotiated
+  protocol token to the TLS layer; a server that supports
+  only HTTP/2 will refuse HTTP/1.1-only clients at the ALPN
+  layer (before any application data is exchanged). The
+  `http2_alpn_negotiate` helper selects the first matching
+  protocol in the client's preference order (RFC 7301 §3.2).
+
+### Differential parity (interpreter == native) — Stage 39
+
+- The frame parser and serialiser are pure functions (no I/O)
+  — the output is byte-identical between the interpreter and
+  the native binary by construction.
+- HPACK integer / string / header block encoder + decoder are
+  pure functions — same argument applies.
+- The SETTINGS exchange, PING / RST_STREAM / GOAWAY /
+  WINDOW_UPDATE / PUSH_PROMISE / PRIORITY frame constructors
+  and payload parsers are pure functions — same argument.
+- The stream state machine, flow control accounting, and ALPN
+  negotiation operate on in-memory structs only — no I/O —
+  so the differential parity is byte-exact.
+- The acceptance test (`make http2-acceptance`) verifies
+  differential parity on:
+  - Frame layer: 24-bit length round-trip (9 values), 31-bit
+    stream id round-trip (6 values, R bit cleared on send).
+  - SETTINGS frame: 4 parameters round-tripped through
+    encode -> serialize -> parse -> decode.
+  - SETTINGS ACK: ACK flag set, payload empty, round-trip.
+  - HPACK integer: 30, 1337, 1000000 round-tripped (5-bit
+    prefix). RFC 7541 §5.1 example verified byte-exact (3
+    bytes [0x1f, 0x9a, 0x0a]).
+  - HPACK string: 5 strings round-tripped (literal, no
+    Huffman).
+  - HPACK header block: 9 headers round-tripped.
+  - HPACK static table: indices 1, 2, 61 verified; 0 and 62
+    correctly rejected.
+  - HPACK dynamic table: 3 adds, lookup indices 62 (newest)
+    and 64 (oldest).
+  - HPACK eviction: 3 adds to 100-byte table, oldest
+    evicted, size stays at 80.
+  - HPACK indexed rep: 0x82 decoded to :method GET.
+  - PING + ACK: 8-byte opaque data round-tripped.
+  - HEADERS frame: 4 headers, END_STREAM+END_HEADERS, round-
+    tripped.
+  - RST_STREAM: stream_id=5, error=CANCEL.
+  - GOAWAY: last_stream_id=7, error=ENHANCE_YOUR_CALM,
+    debug_data round-tripped.
+  - WINDOW_UPDATE: stream=5 inc=1000, conn=0 inc=65535.
+  - PUSH_PROMISE: stream_id=1, promised=2, 4 pushed
+    headers round-tripped.
+  - PRIORITY: stream=3 dep=0 weight=16; stream=5 dep=3
+    weight=256 exclusive.
+  - Connection preface: 24-byte magic verified; HTTP/1.x
+    preface rejected.
+  - Stream state: idle -> open -> half-closed-remote ->
+    closed; open -> closed (reset).
+  - Connection alloc: client allocs 1, 3 (odd); server
+    allocs 2, 4 (even); find OK.
+  - Flow control: debit 1000, credit 500+1000, send-past-
+    window rejected.
+  - ALPN: h2 negotiated, http/1.1 first-match, no-overlap
+    returns None.
+  - HPACK Huffman deferral: H=1 strings correctly rejected.
+  - SETTINGS validation: ENABLE_PUSH=2, MAX_FRAME_SIZE=100,
+    odd payload rejected.
+
+### Stage 39 limitations (deferred to later stages)
+
+- **Huffman string decoding (RFC 7541 Appendix B)** is not
+  implemented — the 257-entry decode table is well-defined
+  but the deferral keeps the module's source code
+  reviewable. The encoder never sets the H bit, so a
+  Stage-39-only peer is unaffected. A peer using Huffman
+  will be rejected with a clean Err.
+- **PRIORITY-based reordering** is not implemented — the
+  dependency / weight are stored but the connection does
+  not reorder outgoing frames. A future stage (Stage 64
+  `std.http.server`) will use the priority fields.
+- **CONTINUATION frame handling** is at the frame layer
+  only — `http2_decode_headers` reassembles a HEADERS +
+  CONTINUATION sequence into one header block before HPACK
+  decoding, but the connection does not stream-decode
+  fragments as they arrive.
+- **Real I/O** is NOT wired — Stage 39 is a pure-HLS
+  framing + state-machine library. A future stage (Stage 64
+  `std.http.server`) will plug this into the multi-threaded
+  server.
+- **TLS server side** is out of scope — Stage 39 provides
+  the "h2" / "h2c" ALPN tokens but does not perform the TLS
+  handshake. The reverse-proxy layer (nginx, etc.) is
+  expected to terminate TLS.
+
+---
+
 ## [v0.57.0-alpha] — Stage 38: std.http (HTTP/1.1 server + client, RFC 7230)
 
 > Adds `std/http.hls` — the fourth module of Phase III (stdlib

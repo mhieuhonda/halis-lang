@@ -31,7 +31,7 @@ else
   HL_CURL_DEFS :=
 endif
 
-.PHONY: all stage0 bootstrap test examples clean run check bench install uninstall audit opt-stats emit-ir emit-llvm fmt lint lsp-check pkg-init pkg-add pkg-lock pkg-audit pkg-verify pkg-build pkg-publish pkg-log pkg-log-verify prove prove-full model prove-acceptance hltest fuzz cov fuzz-acceptance wasm-opt webapp webapp-acceptance serve aarch64-bench aarch64-acceptance aarch64-list-targets stack-acceptance inline-acceptance opt-stats-report kernel-attrs escape-acceptance layout-report tail-acceptance tail-report asm-acceptance asm-attrs bench-stdlib spec-check stage32-acceptance async-acceptance stream-acceptance io-acceptance fs-acceptance net-acceptance http-acceptance
+.PHONY: all stage0 bootstrap test examples clean run check bench install uninstall audit opt-stats emit-ir emit-llvm fmt lint lsp-check pkg-init pkg-add pkg-lock pkg-audit pkg-verify pkg-build pkg-publish pkg-log pkg-log-verify prove prove-full model prove-acceptance hltest fuzz cov fuzz-acceptance wasm-opt webapp webapp-acceptance serve aarch64-bench aarch64-acceptance aarch64-list-targets stack-acceptance inline-acceptance opt-stats-report kernel-attrs escape-acceptance layout-report tail-acceptance tail-report asm-acceptance asm-attrs bench-stdlib spec-check stage32-acceptance async-acceptance stream-acceptance io-acceptance fs-acceptance net-acceptance http-acceptance http2-acceptance json-stream-acceptance
 
 # Main goal: use the full bootstrap chain to build the native compiler
 all: bootstrap
@@ -1505,4 +1505,47 @@ http-acceptance: bin/hlc
 	@echo "  differential (interpreter == native) verified green."
 
 .PHONY: http-acceptance
+
+# ============================================================================
+# Stage 39 (v0.58.0-alpha): std.http2 -- HTTP/2 + ALPN negotiation
+# ----------------------------------------------------------------------------
+# Pure-HLS implementation of HTTP/2 (RFC 7540) + HPACK (RFC 7541),
+# layered on Stage 37's std.net for the TCP transport and Stage 38's
+# std.http for the HttpHeader struct. No new compiler builtins; no
+# real network I/O exercised by the acceptance test (the framing layer,
+# HPACK, the stream state machine, flow control accounting, server
+# push, and ALPN negotiation are all verified in isolation against
+# synthetic byte streams).
+# ============================================================================
+http2-acceptance: bin/hlc
+	@$(PYTHON) boot/boot.py examples/http2_demo.hls > /tmp/http2_interp.txt 2>&1
+	@bin/hlc examples/http2_demo.hls /tmp/http2_demo.c 2>/dev/null
+	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/http2_demo /tmp/http2_demo.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
+	@/tmp/http2_demo > /tmp/http2_nat.txt 2>&1
+	@diff -q /tmp/http2_interp.txt /tmp/http2_nat.txt >/dev/null 2>&1 \
+		|| (echo "FAIL: http2_demo differential mismatch" && false)
+	@$(PYTHON) boot/boot.py tests/ok/feat_stage39_http2.hls > /tmp/s39_interp.txt 2>&1
+	@bin/hlc tests/ok/feat_stage39_http2.hls /tmp/s39.c 2>/dev/null
+	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/s39 /tmp/s39.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
+	@/tmp/s39 > /tmp/s39_nat.txt 2>&1
+	@diff -q /tmp/s39_interp.txt /tmp/s39_nat.txt >/dev/null 2>&1 \
+		|| (echo "FAIL: feat_stage39_http2 differential mismatch" && false)
+	@rm -f /tmp/http2_demo /tmp/http2_demo.c /tmp/http2_interp.txt /tmp/http2_nat.txt \
+		/tmp/s39 /tmp/s39.c /tmp/s39_interp.txt /tmp/s39_nat.txt
+	@echo ""
+	@echo "ACCEPTANCE OK: Stage 39 -- std.http2 (HTTP/2 + ALPN negotiation)"
+	@echo "  Http2Frame struct + 9-byte header encode/decode (24-bit length, 31-bit stream id)"
+	@echo "  Frame parser + serialiser (all 10 frame types: DATA/HEADERS/PRIORITY/RST_STREAM/SETTINGS/PUSH_PROMISE/PING/GOAWAY/WINDOW_UPDATE/CONTINUATION)"
+	@echo "  HPACK static table (61 entries, RFC 7541 Appendix A) + dynamic table (size-bounded eviction)"
+	@echo "  HPACK integer decoder (RFC 7541 section 5.1) + literal string decoder (Huffman deferred)"
+	@echo "  HPACK header block encoder (literal, no indexing) + decoder (all 4 representations)"
+	@echo "  SETTINGS exchange + ACK + validation (ENABLE_PUSH, MAX_FRAME_SIZE bounds)"
+	@echo "  Connection preface verification (24-byte magic)"
+	@echo "  Stream state machine (idle/open/half-closed/closed)"
+	@echo "  Flow control accounting (per-stream + per-connection windows)"
+	@echo "  Server push (PUSH_PROMISE frame + header block)"
+	@echo "  ALPN negotiation (h2 selection from offered list)"
+	@echo "  differential (interpreter == native) verified green."
+
+.PHONY: http2-acceptance
 
