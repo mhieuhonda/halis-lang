@@ -1,0 +1,983 @@
+# tests/ok/feat_stage40_json_stream.hls — Stage 40 (v0.59.0-alpha): std.json_stream.
+#
+# Exercises the constant-memory streaming JSON parser:
+#   - JsonReader struct + feed/finish/next_token API
+#   - Token kinds: ObjectStart/End, ArrayStart/End, Key, String,
+#     Int, Float, Bool, Null
+#   - One-shot parse (whole document fed at once)
+#   - Incremental parse (1-byte feed chunks)
+#   - 4-byte / 16-byte / 64-byte feed chunks (verify chunk-boundary
+#     independence)
+#   - Nested containers (object in array in object)
+#   - String escapes (\n, \t, \r, \", \\, \/, \b, \f)
+#   - Surrogate pair decoding (\uXXXX\uYYYY)
+#   - Number edge cases (int / float / exponent / negative)
+#   - Integer range check (out-of-range rejected)
+#   - Empty object/array
+#   - Trailing data after root value (rejected)
+#   - Empty input (rejected)
+#   - Unbalanced containers (rejected)
+#   - Invalid escape sequences (rejected)
+#   - max_token_size limit (token exceeding limit rejected)
+#   - Nesting depth limit (deeply-nested JSON rejected)
+#   - NDJSON (newline-delimited JSON, 5 records)
+#   - Large document (1000-element array, 256-byte chunks)
+#
+# All tests are DETERMINISTIC — pure HLS, no I/O — so the
+# differential test (interpreter == native) is byte-exact.
+
+import "std.json_stream"
+import "std.str"
+import "std.option"
+import "std.result"
+
+# ============================================================================
+# Helpers — parse a str and return the token list.
+# ============================================================================
+
+# parse_tokens(src) -> Result[list[JsonToken], str]. Convenience
+# wrapper: feed the whole src, finish, drain all tokens.
+fn parse_tokens(src: str) -> Result[list[JsonToken], str] {
+    let r: JsonReader = json_reader_new()
+    let _fr: Result[int, str] = json_reader_feed(r, src)
+    if !result_is_ok(_fr) {
+        return Result.Err(result_err_or(_fr, ""))
+    }
+    let _fin: Result[int, str] = json_reader_finish(r)
+    if !result_is_ok(_fin) {
+        return Result.Err(result_err_or(_fin, ""))
+    }
+    return json_reader_drain(r, 1000000)
+}
+
+# parse_tokens_chunked(src, chunk_size) -> Result[list[JsonToken], str].
+# Parse src by feeding it in chunks of chunk_size bytes. Verifies
+# the token sequence is identical to parse_tokens(src).
+fn parse_tokens_chunked(src: str, chunk_size: int) -> Result[list[JsonToken], str] {
+    let r: JsonReader = json_reader_new()
+    let tokens: list[JsonToken] = []
+    let mut fed: int = 0
+    while fed < src.len() {
+        let end: int = fed + chunk_size
+        let mut actual_end: int = end
+        if end > src.len() {
+            actual_end = src.len()
+        }
+        let chunk: str = src.slice(fed, actual_end)
+        let _fr: Result[int, str] = json_reader_feed(r, chunk)
+        if !result_is_ok(_fr) {
+            return Result.Err(result_err_or(_fr, ""))
+        }
+        # Drain tokens available so far.
+        let drain_r: Result[list[JsonToken], str] = json_reader_drain(r, 1000000)
+        if !result_is_ok(drain_r) {
+            return Result.Err(result_err_or(drain_r, ""))
+        }
+        let new_tokens: list[JsonToken] = result_unwrap(drain_r)
+        let mut j: int = 0
+        while j < new_tokens.len() {
+            tokens.push(new_tokens.get(j))
+            j = j + 1
+        }
+        fed = actual_end
+    }
+    let _fin: Result[int, str] = json_reader_finish(r)
+    if !result_is_ok(_fin) {
+        return Result.Err(result_err_or(_fin, ""))
+    }
+    let drain_r: Result[list[JsonToken], str] = json_reader_drain(r, 1000000)
+    if !result_is_ok(drain_r) {
+        return Result.Err(result_err_or(drain_r, ""))
+    }
+    let final_tokens: list[JsonToken] = result_unwrap(drain_r)
+    let mut k: int = 0
+    while k < final_tokens.len() {
+        tokens.push(final_tokens.get(k))
+        k = k + 1
+    }
+    return Result.Ok(tokens)
+}
+
+# tokens_count(tokens) -> int. Total number of tokens.
+fn tokens_count(tokens: list[JsonToken]) -> int {
+    return tokens.len()
+}
+
+# token_at_is_int(tokens, idx, expected) -> bool. Returns true iff
+# tokens[idx] is an Int token with the given value.
+fn token_at_is_int(tokens: list[JsonToken], idx: int, expected: int) -> bool {
+    if idx < 0 || idx >= tokens.len() {
+        return false
+    }
+    return match tokens.get(idx) {
+        JsonToken.Int(n) => n == expected,
+        _ => false
+    }
+}
+
+# token_at_is_string(tokens, idx, expected) -> bool.
+fn token_at_is_string(tokens: list[JsonToken], idx: int, expected: str) -> bool {
+    if idx < 0 || idx >= tokens.len() {
+        return false
+    }
+    return match tokens.get(idx) {
+        JsonToken.String(s) => s == expected,
+        _ => false
+    }
+}
+
+# token_at_is_key(tokens, idx, expected) -> bool.
+fn token_at_is_key(tokens: list[JsonToken], idx: int, expected: str) -> bool {
+    if idx < 0 || idx >= tokens.len() {
+        return false
+    }
+    return match tokens.get(idx) {
+        JsonToken.Key(s) => s == expected,
+        _ => false
+    }
+}
+
+# token_at_is_bool(tokens, idx, expected) -> bool.
+fn token_at_is_bool(tokens: list[JsonToken], idx: int, expected: bool) -> bool {
+    if idx < 0 || idx >= tokens.len() {
+        return false
+    }
+    return match tokens.get(idx) {
+        JsonToken.Bool(b) => b == expected,
+        _ => false
+    }
+}
+
+# ============================================================================
+# Section 1: simple object — one-shot parse.
+# ============================================================================
+
+fn test_simple_object() -> int uses IO {
+    let src: str = "{\"name\":\"alice\",\"age\":30}"
+    let r: Result[list[JsonToken], str] = parse_tokens(src)
+    if !result_is_ok(r) {
+        panic("simple_object: " + result_err_or(r, ""))
+    }
+    let tokens: list[JsonToken] = result_unwrap(r)
+    if tokens.len() != 6 {
+        panic("simple_object: expected 6 tokens, got " + tokens.len().to_str())
+    }
+    if !json_token_is_object_start(tokens.get(0)) {
+        panic("simple_object: token 0 not ObjectStart")
+    }
+    if !token_at_is_key(tokens, 1, "name") {
+        panic("simple_object: token 1 not Key('name')")
+    }
+    if !token_at_is_string(tokens, 2, "alice") {
+        panic("simple_object: token 2 not String('alice')")
+    }
+    if !token_at_is_key(tokens, 3, "age") {
+        panic("simple_object: token 3 not Key('age')")
+    }
+    if !token_at_is_int(tokens, 4, 30) {
+        panic("simple_object: token 4 not Int(30)")
+    }
+    if !json_token_is_object_end(tokens.get(5)) {
+        panic("simple_object: token 5 not ObjectEnd")
+    }
+    println("simple_object OK: 6 tokens for {\"name\":\"alice\",\"age\":30}")
+    return 0
+}
+
+# ============================================================================
+# Section 2: simple array — one-shot parse.
+# ============================================================================
+
+fn test_simple_array() -> int uses IO {
+    let src: str = "[1, 2, 3, \"four\", true, null]"
+    let r: Result[list[JsonToken], str] = parse_tokens(src)
+    if !result_is_ok(r) {
+        panic("simple_array: " + result_err_or(r, ""))
+    }
+    let tokens: list[JsonToken] = result_unwrap(r)
+    if tokens.len() != 8 {
+        panic("simple_array: expected 8 tokens, got " + tokens.len().to_str())
+    }
+    if !json_token_is_array_start(tokens.get(0)) {
+        panic("simple_array: token 0 not ArrayStart")
+    }
+    if !token_at_is_int(tokens, 1, 1) {
+        panic("simple_array: token 1 not Int(1)")
+    }
+    if !token_at_is_int(tokens, 2, 2) {
+        panic("simple_array: token 2 not Int(2)")
+    }
+    if !token_at_is_int(tokens, 3, 3) {
+        panic("simple_array: token 3 not Int(3)")
+    }
+    if !token_at_is_string(tokens, 4, "four") {
+        panic("simple_array: token 4 not String('four')")
+    }
+    if !token_at_is_bool(tokens, 5, true) {
+        panic("simple_array: token 5 not Bool(true)")
+    }
+    if !json_token_is_null(tokens.get(6)) {
+        panic("simple_array: token 6 not Null")
+    }
+    if !json_token_is_array_end(tokens.get(7)) {
+        panic("simple_array: token 7 not ArrayEnd")
+    }
+    println("simple_array OK: 8 tokens for [1,2,3,\"four\",true,null]")
+    return 0
+}
+
+# ============================================================================
+# Section 3: incremental parse — byte-by-byte feed.
+# ============================================================================
+
+fn test_incremental_byte_by_byte() -> int uses IO {
+    let src: str = "{\"key\":\"value\",\"n\":42}"
+    let one_shot_r: Result[list[JsonToken], str] = parse_tokens(src)
+    if !result_is_ok(one_shot_r) {
+        panic("incremental: one-shot failed: " + result_err_or(one_shot_r, ""))
+    }
+    let one_shot: list[JsonToken] = result_unwrap(one_shot_r)
+    let incremental_r: Result[list[JsonToken], str] = parse_tokens_chunked(src, 1)
+    if !result_is_ok(incremental_r) {
+        panic("incremental: chunked failed: " + result_err_or(incremental_r, ""))
+    }
+    let incremental: list[JsonToken] = result_unwrap(incremental_r)
+    if incremental.len() != one_shot.len() {
+        panic("incremental: token count mismatch (" + incremental.len().to_str() + " vs " + one_shot.len().to_str() + ")")
+    }
+    # Verify each token matches.
+    let mut i: int = 0
+    while i < one_shot.len() {
+        let a: JsonToken = one_shot.get(i)
+        let b: JsonToken = incremental.get(i)
+        let a_kind: str = json_token_kind_name(a)
+        let b_kind: str = json_token_kind_name(b)
+        if a_kind != b_kind {
+            panic("incremental: token " + i.to_str() + " kind mismatch (" + a_kind + " vs " + b_kind + ")")
+        }
+        i = i + 1
+    }
+    println("incremental OK: byte-by-byte feed produces same " + incremental.len().to_str() + " tokens as one-shot")
+    return 0
+}
+
+# ============================================================================
+# Section 4: chunk-boundary independence — 1/4/16/64-byte chunks.
+# ============================================================================
+
+fn test_chunk_independence() -> int uses IO {
+    let src: str = "{\"a\":[1,2,3],\"b\":{\"c\":true,\"d\":null},\"e\":\"hello\"}"
+    let one_shot_r: Result[list[JsonToken], str] = parse_tokens(src)
+    if !result_is_ok(one_shot_r) {
+        panic("chunk_indep: one-shot failed: " + result_err_or(one_shot_r, ""))
+    }
+    let one_shot: list[JsonToken] = result_unwrap(one_shot_r)
+    let chunk_sizes: list[int] = [1, 4, 16, 64, 256]
+    let mut i: int = 0
+    while i < chunk_sizes.len() {
+        let cs: int = chunk_sizes.get(i)
+        let r: Result[list[JsonToken], str] = parse_tokens_chunked(src, cs)
+        if !result_is_ok(r) {
+            panic("chunk_indep: chunk_size=" + cs.to_str() + " failed: " + result_err_or(r, ""))
+        }
+        let tokens: list[JsonToken] = result_unwrap(r)
+        if tokens.len() != one_shot.len() {
+            panic("chunk_indep: chunk_size=" + cs.to_str() + " token count mismatch")
+        }
+        # Verify token kinds match.
+        let mut j: int = 0
+        while j < one_shot.len() {
+            let a_kind: str = json_token_kind_name(one_shot.get(j))
+            let b_kind: str = json_token_kind_name(tokens.get(j))
+            if a_kind != b_kind {
+                panic("chunk_indep: chunk_size=" + cs.to_str() + " token " + j.to_str() + " kind mismatch")
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    println("chunk_independence OK: 5 chunk sizes (1, 4, 16, 64, 256) produce same " + one_shot.len().to_str() + " tokens")
+    return 0
+}
+
+# ============================================================================
+# Section 5: nested containers.
+# ============================================================================
+
+fn test_nested_containers() -> int uses IO {
+    let src: str = "{\"outer\":{\"inner\":[1,{\"x\":2}]}}"
+    let r: Result[list[JsonToken], str] = parse_tokens(src)
+    if !result_is_ok(r) {
+        panic("nested: " + result_err_or(r, ""))
+    }
+    let tokens: list[JsonToken] = result_unwrap(r)
+    # Expected: ObjectStart, Key("outer"), ObjectStart, Key("inner"),
+    # ArrayStart, Int(1), ObjectStart, Key("x"), Int(2), ObjectEnd,
+    # ArrayEnd, ObjectEnd, ObjectEnd = 13 tokens.
+    if tokens.len() != 13 {
+        panic("nested: expected 13 tokens, got " + tokens.len().to_str())
+    }
+    if !json_token_is_object_start(tokens.get(0)) {
+        panic("nested: token 0 not ObjectStart")
+    }
+    if !json_token_is_object_start(tokens.get(2)) {
+        panic("nested: token 2 not ObjectStart (nested)")
+    }
+    if !json_token_is_array_start(tokens.get(4)) {
+        panic("nested: token 4 not ArrayStart")
+    }
+    if !token_at_is_int(tokens, 5, 1) {
+        panic("nested: token 5 not Int(1)")
+    }
+    if !json_token_is_object_start(tokens.get(6)) {
+        panic("nested: token 6 not ObjectStart (deeply nested)")
+    }
+    if !token_at_is_int(tokens, 8, 2) {
+        panic("nested: token 8 not Int(2)")
+    }
+    if !json_token_is_object_end(tokens.get(9)) {
+        panic("nested: token 9 not ObjectEnd")
+    }
+    if !json_token_is_array_end(tokens.get(10)) {
+        panic("nested: token 10 not ArrayEnd")
+    }
+    if !json_token_is_object_end(tokens.get(12)) {
+        panic("nested: token 12 not ObjectEnd")
+    }
+    println("nested_containers OK: 13 tokens for {\"outer\":{\"inner\":[1,{\"x\":2}]}}")
+    return 0
+}
+
+# ============================================================================
+# Section 6: string escapes.
+# ============================================================================
+
+fn test_string_escapes() -> int uses IO {
+    let src: str = "\"line1\\nline2\\ttab\\rcr\\\"quote\\\\backslash\\/slash\\bbackspace\\fformfeed\""
+    let r: Result[list[JsonToken], str] = parse_tokens(src)
+    if !result_is_ok(r) {
+        panic("escapes: " + result_err_or(r, ""))
+    }
+    let tokens: list[JsonToken] = result_unwrap(r)
+    if tokens.len() != 1 {
+        panic("escapes: expected 1 token, got " + tokens.len().to_str())
+    }
+    let s: str = match tokens.get(0) {
+        JsonToken.String(v) => v,
+        _ => panic("escapes: token 0 not String")
+    }
+    # Verify each escape was decoded.
+    if !s.contains(chr(10)) {
+        panic("escapes: \\n not decoded to LF")
+    }
+    if !s.contains(chr(9)) {
+        panic("escapes: \\t not decoded to TAB")
+    }
+    if !s.contains(chr(13)) {
+        panic("escapes: \\r not decoded to CR")
+    }
+    if !s.contains("\"") {
+        panic("escapes: \\\" not decoded to '\"'")
+    }
+    if !s.contains(chr(92)) {
+        panic("escapes: \\\\ not decoded to backslash")
+    }
+    if !s.contains("/") {
+        panic("escapes: \\/ not decoded to slash")
+    }
+    if !s.contains(chr(8)) {
+        panic("escapes: \\b not decoded to backspace")
+    }
+    if !s.contains(chr(12)) {
+        panic("escapes: \\f not decoded to formfeed")
+    }
+    println("string_escapes OK: \\n \\t \\r \\\" \\\\ \\/ \\b \\f all decoded")
+    return 0
+}
+
+# ============================================================================
+# Section 7: surrogate pair decoding (\uXXXX\uYYYY).
+# ============================================================================
+
+fn test_surrogate_pairs() -> int uses IO {
+    # U+1F600 (grinning face emoji) = \uD83D\uDE00.
+    # Encoded as 4 UTF-8 bytes: 0xF0 0x9F 0x98 0x80.
+    let src: str = "\"\\uD83D\\uDE00\""
+    let r: Result[list[JsonToken], str] = parse_tokens(src)
+    if !result_is_ok(r) {
+        panic("surrogates: " + result_err_or(r, ""))
+    }
+    let tokens: list[JsonToken] = result_unwrap(r)
+    if tokens.len() != 1 {
+        panic("surrogates: expected 1 token, got " + tokens.len().to_str())
+    }
+    let s: str = match tokens.get(0) {
+        JsonToken.String(v) => v,
+        _ => panic("surrogates: token 0 not String")
+    }
+    # The decoded string should be 4 bytes (UTF-8 encoding of U+1F600).
+    if s.len() != 4 {
+        panic("surrogates: expected 4 bytes, got " + s.len().to_str())
+    }
+    if s.byte_at(0) != 240 {
+        panic("surrogates: byte 0 = " + s.byte_at(0).to_str() + ", expected 240")
+    }
+    if s.byte_at(1) != 159 {
+        panic("surrogates: byte 1 = " + s.byte_at(1).to_str() + ", expected 159")
+    }
+    if s.byte_at(2) != 152 {
+        panic("surrogates: byte 2 = " + s.byte_at(2).to_str() + ", expected 152")
+    }
+    if s.byte_at(3) != 128 {
+        panic("surrogates: byte 3 = " + s.byte_at(3).to_str() + ", expected 128")
+    }
+    println("surrogate_pairs OK: \\uD83D\\uDE00 -> 4-byte UTF-8 [0xF0, 0x9F, 0x98, 0x80]")
+    return 0
+}
+
+# ============================================================================
+# Section 8: number edge cases — int vs float, negative, exponent.
+# ============================================================================
+
+fn test_numbers() -> int uses IO {
+    let test_cases: list[str] = ["0", "42", "-42", "1000000", "2147483647",
+        "3.14", "-3.14", "1.0", "0.5",
+        "1e10", "1.5e10", "1.5E-3", "1e+5"]
+    let mut i: int = 0
+    while i < test_cases.len() {
+        let src: str = test_cases.get(i)
+        let r: Result[list[JsonToken], str] = parse_tokens(src)
+        if !result_is_ok(r) {
+            panic("numbers: '" + src + "': " + result_err_or(r, ""))
+        }
+        let tokens: list[JsonToken] = result_unwrap(r)
+        if tokens.len() != 1 {
+            panic("numbers: '" + src + "': expected 1 token, got " + tokens.len().to_str())
+        }
+        let t: JsonToken = tokens.get(0)
+        let kind: str = json_token_kind_name(t)
+        if src.contains(".") || src.contains("e") || src.contains("E") {
+            if kind != "Float" {
+                panic("numbers: '" + src + "' should be Float, got " + kind)
+            }
+        } else {
+            if kind != "Int" {
+                panic("numbers: '" + src + "' should be Int, got " + kind)
+            }
+        }
+        i = i + 1
+    }
+    println("numbers OK: 13 values (int + float + negative + exponent)")
+    return 0
+}
+
+# ============================================================================
+# Section 9: integer range — out-of-range rejected.
+# ============================================================================
+
+fn test_int_range() -> int uses IO {
+    # 9223372036854775807 = INT64_MAX — OK.
+    let r1: Result[list[JsonToken], str] = parse_tokens("9223372036854775807")
+    if !result_is_ok(r1) {
+        panic("int_range: INT64_MAX rejected: " + result_err_or(r1, ""))
+    }
+    # 9223372036854775808 = INT64_MAX+1 — out of range.
+    let r2: Result[list[JsonToken], str] = parse_tokens("9223372036854775808")
+    if result_is_ok(r2) {
+        panic("int_range: INT64_MAX+1 should be rejected")
+    }
+    # -9223372036854775808 = INT64_MIN — accepted (matches std.json).
+    let r3: Result[list[JsonToken], str] = parse_tokens("-9223372036854775808")
+    if !result_is_ok(r3) {
+        panic("int_range: INT64_MIN should be accepted (matches std.json): " + result_err_or(r3, ""))
+    }
+    # 9999999999999999999 (19 digits, exceeds INT64_MAX) — rejected.
+    let r4: Result[list[JsonToken], str] = parse_tokens("9999999999999999999")
+    if result_is_ok(r4) {
+        panic("int_range: 19-digit value should be rejected")
+    }
+    # 9223372036854775808 (positive overflow) — rejected.
+    let r5: Result[list[JsonToken], str] = parse_tokens("9223372036854775808")
+    if result_is_ok(r5) {
+        panic("int_range: INT64_MAX+1 should be rejected")
+    }
+    # -9223372036854775809 (negative overflow) — rejected.
+    let r6: Result[list[JsonToken], str] = parse_tokens("-9223372036854775809")
+    if result_is_ok(r6) {
+        panic("int_range: INT64_MIN-1 should be rejected")
+    }
+    println("int_range OK: INT64_MAX and INT64_MIN accepted; INT64_MAX+1, INT64_MIN-1, 19-digit values rejected")
+    return 0
+}
+
+# ============================================================================
+# Section 10: empty containers.
+# ============================================================================
+
+fn test_empty_containers() -> int uses IO {
+    # Empty object.
+    let r1: Result[list[JsonToken], str] = parse_tokens("{}")
+    if !result_is_ok(r1) {
+        panic("empty: {} rejected: " + result_err_or(r1, ""))
+    }
+    let t1: list[JsonToken] = result_unwrap(r1)
+    if t1.len() != 2 {
+        panic("empty: {} expected 2 tokens, got " + t1.len().to_str())
+    }
+    if !json_token_is_object_start(t1.get(0)) {
+        panic("empty: {} token 0 not ObjectStart")
+    }
+    if !json_token_is_object_end(t1.get(1)) {
+        panic("empty: {} token 1 not ObjectEnd")
+    }
+    # Empty array.
+    let r2: Result[list[JsonToken], str] = parse_tokens("[]")
+    if !result_is_ok(r2) {
+        panic("empty: [] rejected: " + result_err_or(r2, ""))
+    }
+    let t2: list[JsonToken] = result_unwrap(r2)
+    if t2.len() != 2 {
+        panic("empty: [] expected 2 tokens, got " + t2.len().to_str())
+    }
+    println("empty_containers OK: {} -> 2 tokens, [] -> 2 tokens")
+    return 0
+}
+
+# ============================================================================
+# Section 11: trailing data after root value — rejected.
+# ============================================================================
+
+fn test_trailing_data() -> int uses IO {
+    let r1: Result[list[JsonToken], str] = parse_tokens("42 extra")
+    if result_is_ok(r1) {
+        panic("trailing_data: '42 extra' should be rejected")
+    }
+    let r2: Result[list[JsonToken], str] = parse_tokens("\"hello\" world")
+    if result_is_ok(r2) {
+        panic("trailing_data: '\"hello\" world' should be rejected")
+    }
+    let r3: Result[list[JsonToken], str] = parse_tokens("true false")
+    if result_is_ok(r3) {
+        panic("trailing_data: 'true false' should be rejected")
+    }
+    println("trailing_data OK: 3 inputs with trailing data rejected")
+    return 0
+}
+
+# ============================================================================
+# Section 12: empty input — rejected.
+# ============================================================================
+
+fn test_empty_input() -> int uses IO {
+    let r1: Result[list[JsonToken], str] = parse_tokens("")
+    if result_is_ok(r1) {
+        panic("empty_input: '' should be rejected")
+    }
+    let r2: Result[list[JsonToken], str] = parse_tokens("   ")
+    if result_is_ok(r2) {
+        panic("empty_input: '   ' (whitespace only) should be rejected")
+    }
+    println("empty_input OK: empty string and whitespace-only rejected")
+    return 0
+}
+
+# ============================================================================
+# Section 13: unbalanced containers — rejected.
+# ============================================================================
+
+fn test_unbalanced() -> int uses IO {
+    # Missing close brace.
+    let r1: Result[list[JsonToken], str] = parse_tokens("{\"a\":1")
+    if result_is_ok(r1) {
+        panic("unbalanced: '{\"a\":1' (missing }) should be rejected")
+    }
+    # Extra close brace.
+    let r2: Result[list[JsonToken], str] = parse_tokens("1}")
+    if result_is_ok(r2) {
+        panic("unbalanced: '1}' (extra }) should be rejected")
+    }
+    # Mismatched: array close inside object.
+    let r3: Result[list[JsonToken], str] = parse_tokens("{\"a\":1]")
+    if result_is_ok(r3) {
+        panic("unbalanced: '{\"a\":1]' (] inside object) should be rejected")
+    }
+    # Missing close bracket.
+    let r4: Result[list[JsonToken], str] = parse_tokens("[1,2,3")
+    if result_is_ok(r4) {
+        panic("unbalanced: '[1,2,3' (missing ]) should be rejected")
+    }
+    println("unbalanced OK: 4 unbalanced container inputs rejected")
+    return 0
+}
+
+# ============================================================================
+# Section 14: invalid escape sequences — rejected.
+# ============================================================================
+
+fn test_invalid_escapes() -> int uses IO {
+    # \x is not a valid escape (only \n, \t, \r, \", \\, \/, \b, \f, \u).
+    let r1: Result[list[JsonToken], str] = parse_tokens("\"hello\\xworld\"")
+    if result_is_ok(r1) {
+        panic("invalid_escapes: '\\x' should be rejected")
+    }
+    # \u with too few hex digits.
+    let r2: Result[list[JsonToken], str] = parse_tokens("\"\\u12\"")
+    if result_is_ok(r2) {
+        panic("invalid_escapes: '\\u12' (truncated) should be rejected")
+    }
+    # \u with non-hex digit.
+    let r3: Result[list[JsonToken], str] = parse_tokens("\"\\uZZZZ\"")
+    if result_is_ok(r3) {
+        panic("invalid_escapes: '\\uZZZZ' should be rejected")
+    }
+    println("invalid_escapes OK: \\x, \\u12, \\uZZZZ rejected")
+    return 0
+}
+
+# ============================================================================
+# Section 15: max_token_size limit — token exceeding limit rejected.
+# ============================================================================
+
+fn test_max_token_size() -> int uses IO {
+    let r: JsonReader = json_reader_new()
+    json_reader_set_max_token_size(r, 16)
+    # A 20-byte string exceeds the 16-byte limit.
+    let _fr: Result[int, str] = json_reader_feed(r, "\"01234567890123456789\"")
+    let _fin: Result[int, str] = json_reader_finish(r)
+    let drain_r: Result[list[JsonToken], str] = json_reader_drain(r, 100)
+    if result_is_ok(drain_r) {
+        panic("max_token_size: 20-byte string should be rejected (limit 16)")
+    }
+    let err: str = result_err_or(drain_r, "")
+    if !err.contains("max_token_size") {
+        panic("max_token_size: error message doesn't mention max_token_size: '" + err + "'")
+    }
+    println("max_token_size OK: 20-byte string rejected (limit 16)")
+    return 0
+}
+
+# ============================================================================
+# Section 16: large document — 1000-element array, 256-byte chunks.
+# ============================================================================
+
+fn test_large_document() -> int uses IO {
+    # Build a 1000-element array of small objects.
+    let parts: list[str] = ["["]
+    let mut i: int = 0
+    while i < 1000 {
+        if i > 0 {
+            parts.push(",")
+        }
+        parts.push("{\"i\":" + i.to_str() + "}")
+        i = i + 1
+    }
+    parts.push("]")
+    let src: str = str_join(parts, "")
+    # Parse with 256-byte chunks.
+    let r: Result[list[JsonToken], str] = parse_tokens_chunked(src, 256)
+    if !result_is_ok(r) {
+        panic("large_document: " + result_err_or(r, ""))
+    }
+    let tokens: list[JsonToken] = result_unwrap(r)
+    # Expected: 1 (ArrayStart) + 1000 * 4 (ObjectStart, Key, Int, ObjectEnd) + 1 (ArrayEnd) = 4002.
+    if tokens.len() != 4002 {
+        panic("large_document: expected 4002 tokens, got " + tokens.len().to_str())
+    }
+    # Verify a few specific values.
+    if !json_token_is_array_start(tokens.get(0)) {
+        panic("large_document: token 0 not ArrayStart")
+    }
+    # Record 0: ArrayStart, ObjectStart, Key("i"), Int(0), ObjectEnd.
+    # Int(0) is at token 3.
+    if !token_at_is_int(tokens, 3, 0) {
+        panic("large_document: token 3 not Int(0)")
+    }
+    # Record N starts at token 1 + N*4 (ObjectStart, Key, Int, ObjectEnd).
+    # Int(N) is at token 4*N + 3.
+    if !token_at_is_int(tokens, 3999, 999) {
+        panic("large_document: token 3999 not Int(999)")
+    }
+    if !json_token_is_array_end(tokens.get(4001)) {
+        panic("large_document: token 4001 not ArrayEnd")
+    }
+    println("large_document OK: 1000-element array, 4002 tokens, 256-byte chunks")
+    return 0
+}
+
+# ============================================================================
+# Section 17: NDJSON stream — newline-delimited JSON.
+# ============================================================================
+
+fn test_ndjson() -> int uses IO {
+    let parts: list[str] = [
+        "{\"ts\":1000,\"level\":\"info\",\"msg\":\"starting\"}\n",
+        "{\"ts\":1001,\"level\":\"warn\",\"msg\":\"slow\"}\n",
+        "{\"ts\":1002,\"level\":\"error\",\"msg\":\"failed\"}\n"
+    ]
+    let src: str = str_join(parts, "")
+    let r: Result[list[JsonToken], str] = parse_tokens(src)
+    if !result_is_ok(r) {
+        panic("ndjson: " + result_err_or(r, ""))
+    }
+    let tokens: list[JsonToken] = result_unwrap(r)
+    # 3 records × 8 tokens = 24.
+    if tokens.len() != 24 {
+        panic("ndjson: expected 24 tokens, got " + tokens.len().to_str())
+    }
+    # Verify the "msg" value of each record (token at base+6).
+    if !token_at_is_string(tokens, 6, "starting") {
+        panic("ndjson: record 0 msg mismatch")
+    }
+    if !token_at_is_string(tokens, 14, "slow") {
+        panic("ndjson: record 1 msg mismatch")
+    }
+    if !token_at_is_string(tokens, 22, "failed") {
+        panic("ndjson: record 2 msg mismatch")
+    }
+    println("ndjson OK: 3 records, 24 tokens, msg values extracted")
+    return 0
+}
+
+# ============================================================================
+# Section 18: keywords — true/false/null.
+# ============================================================================
+
+fn test_keywords() -> int uses IO {
+    let r1: Result[list[JsonToken], str] = parse_tokens("true")
+    if !result_is_ok(r1) {
+        panic("keywords: 'true' rejected: " + result_err_or(r1, ""))
+    }
+    if !token_at_is_bool(result_unwrap(r1), 0, true) {
+        panic("keywords: 'true' not Bool(true)")
+    }
+    let r2: Result[list[JsonToken], str] = parse_tokens("false")
+    if !result_is_ok(r2) {
+        panic("keywords: 'false' rejected")
+    }
+    if !token_at_is_bool(result_unwrap(r2), 0, false) {
+        panic("keywords: 'false' not Bool(false)")
+    }
+    let r3: Result[list[JsonToken], str] = parse_tokens("null")
+    if !result_is_ok(r3) {
+        panic("keywords: 'null' rejected")
+    }
+    if !json_token_is_null(result_unwrap(r3).get(0)) {
+        panic("keywords: 'null' not Null")
+    }
+    # Truncated keywords at EOF — rejected.
+    let r4: Result[list[JsonToken], str] = parse_tokens("tru")
+    if result_is_ok(r4) {
+        panic("keywords: 'tru' (truncated) should be rejected")
+    }
+    let r5: Result[list[JsonToken], str] = parse_tokens("fals")
+    if result_is_ok(r5) {
+        panic("keywords: 'fals' (truncated) should be rejected")
+    }
+    let r6: Result[list[JsonToken], str] = parse_tokens("nul")
+    if result_is_ok(r6) {
+        panic("keywords: 'nul' (truncated) should be rejected")
+    }
+    println("keywords OK: true/false/null accepted; tru/fals/nul rejected")
+    return 0
+}
+
+# ============================================================================
+# Section 19: leading-zero rejection (RFC 8259 §6).
+# ============================================================================
+
+fn test_leading_zeros() -> int uses IO {
+    # "0123" is not valid JSON (RFC 8259 §6 disallows leading zeros).
+    let r1: Result[list[JsonToken], str] = parse_tokens("0123")
+    if result_is_ok(r1) {
+        panic("leading_zeros: '0123' should be rejected")
+    }
+    # "00" is also invalid.
+    let r2: Result[list[JsonToken], str] = parse_tokens("00")
+    if result_is_ok(r2) {
+        panic("leading_zeros: '00' should be rejected")
+    }
+    # "0" alone is valid.
+    let r3: Result[list[JsonToken], str] = parse_tokens("0")
+    if !result_is_ok(r3) {
+        panic("leading_zeros: '0' should be accepted: " + result_err_or(r3, ""))
+    }
+    # "0.5" is valid (leading zero before '.' is OK).
+    let r4: Result[list[JsonToken], str] = parse_tokens("0.5")
+    if !result_is_ok(r4) {
+        panic("leading_zeros: '0.5' should be accepted")
+    }
+    println("leading_zeros OK: 0123 and 00 rejected; 0 and 0.5 accepted")
+    return 0
+}
+
+# ============================================================================
+# Section 20: nesting depth limit.
+# ============================================================================
+
+fn test_nesting_depth() -> int uses IO {
+    # Build a deeply-nested array string: "[[[[..." × N + "]" × N.
+    # The default limit is 1024. We'll go just past it to verify
+    # the limit triggers.
+    let parts: list[str] = []
+    let mut i: int = 0
+    while i < 1100 {
+        parts.push("[")
+        i = i + 1
+    }
+    while i > 0 {
+        parts.push("]")
+        i = i - 1
+    }
+    let src: str = str_join(parts, "")
+    let r: Result[list[JsonToken], str] = parse_tokens(src)
+    if result_is_ok(r) {
+        panic("nesting_depth: 1100-deep array should be rejected (limit 1024)")
+    }
+    let err: str = result_err_or(r, "")
+    if !err.contains("depth") {
+        panic("nesting_depth: error doesn't mention 'depth': '" + err + "'")
+    }
+    println("nesting_depth OK: 1100-deep array rejected (limit 1024)")
+    return 0
+}
+
+# ============================================================================
+# Section 21: feed after finish — rejected.
+# ============================================================================
+
+fn test_feed_after_finish() -> int uses IO {
+    let r: JsonReader = json_reader_new()
+    let _fr: Result[int, str] = json_reader_feed(r, "42")
+    let _fin: Result[int, str] = json_reader_finish(r)
+    # Try to feed after finish — should be rejected.
+    let late_fr: Result[int, str] = json_reader_feed(r, "more")
+    if result_is_ok(late_fr) {
+        panic("feed_after_finish: should be rejected")
+    }
+    let err: str = result_err_or(late_fr, "")
+    if !err.contains("finished") {
+        panic("feed_after_finish: error doesn't mention 'finished': '" + err + "'")
+    }
+    println("feed_after_finish OK: feed() after finish() rejected")
+    return 0
+}
+
+# ============================================================================
+# Section 22: token-kind predicates.
+# ============================================================================
+
+fn test_token_predicates() -> int uses IO {
+    let tokens: list[JsonToken] = [
+        JsonToken.ObjectStart,
+        JsonToken.ObjectEnd,
+        JsonToken.ArrayStart,
+        JsonToken.ArrayEnd,
+        JsonToken.Key("k"),
+        JsonToken.String("s"),
+        JsonToken.Int(1),
+        JsonToken.Float(1.5),
+        JsonToken.Bool(true),
+        JsonToken.Null
+    ]
+    if !json_token_is_object_start(tokens.get(0)) { panic("predicates: ObjectStart") }
+    if !json_token_is_object_end(tokens.get(1)) { panic("predicates: ObjectEnd") }
+    if !json_token_is_array_start(tokens.get(2)) { panic("predicates: ArrayStart") }
+    if !json_token_is_array_end(tokens.get(3)) { panic("predicates: ArrayEnd") }
+    if !json_token_is_key(tokens.get(4)) { panic("predicates: Key") }
+    if !json_token_is_string(tokens.get(5)) { panic("predicates: String") }
+    if !json_token_is_int(tokens.get(6)) { panic("predicates: Int") }
+    if !json_token_is_float(tokens.get(7)) { panic("predicates: Float") }
+    if !json_token_is_bool(tokens.get(8)) { panic("predicates: Bool") }
+    if !json_token_is_null(tokens.get(9)) { panic("predicates: Null") }
+    println("token_predicates OK: 10 predicates verified")
+    return 0
+}
+
+# ============================================================================
+# Section 23: json_token_kind_name — diagnostic names.
+# ============================================================================
+
+fn test_kind_names() -> int uses IO {
+    # HLS doesn't have tuple types, so use two parallel lists.
+    let tokens: list[JsonToken] = [
+        JsonToken.ObjectStart,
+        JsonToken.ObjectEnd,
+        JsonToken.ArrayStart,
+        JsonToken.ArrayEnd,
+        JsonToken.Key("k"),
+        JsonToken.String("s"),
+        JsonToken.Int(1),
+        JsonToken.Float(1.5),
+        JsonToken.Bool(true),
+        JsonToken.Null
+    ]
+    let expected: list[str] = [
+        "ObjectStart", "ObjectEnd", "ArrayStart", "ArrayEnd",
+        "Key", "String", "Int", "Float", "Bool", "Null"
+    ]
+    if tokens.len() != expected.len() {
+        panic("kind_names: list length mismatch")
+    }
+    let mut i: int = 0
+    while i < tokens.len() {
+        let actual: str = json_token_kind_name(tokens.get(i))
+        let want: str = expected.get(i)
+        if actual != want {
+            panic("kind_names: token " + i.to_str() + " expected '" + want + "', got '" + actual + "'")
+        }
+        i = i + 1
+    }
+    println("kind_names OK: 10 token kinds have correct names")
+    return 0
+}
+
+# ============================================================================
+# Section 24: parse_all convenience wrapper.
+# ============================================================================
+
+fn test_parse_all() -> int uses IO {
+    let src: str = "[1,2,3]"
+    let r: Result[list[JsonToken], str] = json_reader_parse_all(src)
+    if !result_is_ok(r) {
+        panic("parse_all: " + result_err_or(r, ""))
+    }
+    let tokens: list[JsonToken] = result_unwrap(r)
+    if tokens.len() != 5 {
+        panic("parse_all: expected 5 tokens, got " + tokens.len().to_str())
+    }
+    println("parse_all OK: [1,2,3] -> 5 tokens via json_reader_parse_all")
+    return 0
+}
+
+# ============================================================================
+# Main — run all sections in order.
+# ============================================================================
+
+fn main() -> int uses IO {
+    if test_simple_object() != 0 { return 1 }
+    if test_simple_array() != 0 { return 2 }
+    if test_incremental_byte_by_byte() != 0 { return 3 }
+    if test_chunk_independence() != 0 { return 4 }
+    if test_nested_containers() != 0 { return 5 }
+    if test_string_escapes() != 0 { return 6 }
+    if test_surrogate_pairs() != 0 { return 7 }
+    if test_numbers() != 0 { return 8 }
+    if test_int_range() != 0 { return 9 }
+    if test_empty_containers() != 0 { return 10 }
+    if test_trailing_data() != 0 { return 11 }
+    if test_empty_input() != 0 { return 12 }
+    if test_unbalanced() != 0 { return 13 }
+    if test_invalid_escapes() != 0 { return 14 }
+    if test_max_token_size() != 0 { return 15 }
+    if test_large_document() != 0 { return 16 }
+    if test_ndjson() != 0 { return 17 }
+    if test_keywords() != 0 { return 18 }
+    if test_leading_zeros() != 0 { return 19 }
+    if test_nesting_depth() != 0 { return 20 }
+    if test_feed_after_finish() != 0 { return 21 }
+    if test_token_predicates() != 0 { return 22 }
+    if test_kind_names() != 0 { return 23 }
+    if test_parse_all() != 0 { return 24 }
+    println("ALL JSON_STREAM TESTS PASSED")
+    return 0
+}

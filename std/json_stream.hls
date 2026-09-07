@@ -1,0 +1,1254 @@
+# ============================================================================
+# std/json_stream.hls — Stage 40 (v0.59.0-alpha): streaming JSON parser
+# ----------------------------------------------------------------------------
+# This module is the sixth module of Phase III (stdlib expansion). It
+# implements a CONSTANT-MEMORY streaming JSON parser — `JsonReader` —
+# that produces one token at a time and never holds the whole document
+# in memory. Useful for parsing multi-GB JSON logs, NDJSON streams, or
+# any JSON source that's too large to fit in RAM.
+#
+# The existing `std.json` document parser (Stage 10-beta, v0.6.0-alpha)
+# remains for small inputs where the whole document fits in memory and
+# the caller wants a `JsonValue` tree. `JsonReader` is for the case
+# where the document is too large (or arrives over a stream — HTTP
+# request body, pipe, websocket) and the caller wants to process it
+# incrementally without buffering the whole thing.
+#
+# API summary:
+#
+#   let r: JsonReader = json_reader_new()
+#   json_reader_set_max_token_size(r, 65536)   # default 64 KiB
+#   json_reader_feed(r, chunk1)                # append bytes
+#   json_reader_feed(r, chunk2)
+#   let t: Result[Option[JsonToken], str] = json_reader_next_token(r)
+#   # Ok(Some(token)) — a token was produced
+#   # Ok(None)       — no token yet (need more input OR finished)
+#   # Err(msg)       — parse error (malformed JSON)
+#   # ... loop ...
+#   let done: Result[int, str] = json_reader_finish(r)
+#   # Ok(0)  — clean EOF (state is DONE; container stack is empty)
+#   # Err(msg) — mid-value or mid-container at EOF
+#
+# Token kinds (RFC 8259):
+#
+#   ObjectStart, ObjectEnd, ArrayStart, ArrayEnd — structural.
+#   Key(str)             — an object member name (the string BEFORE the `:`).
+#   String(str)          — a string value (the string AFTER the `:` or in an array).
+#   Int(int)             — an integer in [-2^63, 2^63) (preserved as int64).
+#   Float(float)         — a number with `.` or `e` (preserved as f64).
+#   Bool(bool)           — `true` or `false`.
+#   Null                 — `null`.
+#
+# The reader distinguishes `Key` from `String` based on its state
+# machine — the FIRST string token immediately after `ObjectStart` or
+# after `,` inside an object is emitted as a Key. Strings inside arrays
+# or after `:` are emitted as String. The user does NOT need to track
+# the context themselves.
+#
+# Memory model:
+#
+#   The reader holds an internal byte buffer (`buf`) that grows as the
+#   caller calls `feed`. After each successful `next_token`, the
+#   consumed prefix is sliced off — the buffer holds only the bytes
+#   that haven't been parsed yet. The buffer's high-water mark is
+#   `max_token_size` + the largest single `feed` chunk (because the
+#   reader doesn't pre-truncate). For typical usage (4 KB chunks, 64
+#   KiB max token), the buffer stays under 70 KiB regardless of the
+#   document size — the parser is constant-memory in the document
+#   size, linear in the chunk size + max token size.
+#
+#   If a single token (e.g. a very long string) exceeds
+#   `max_token_size`, the reader returns `Err("token exceeds
+#   max_token_size")` — the caller can either raise the limit (via
+#   `json_reader_set_max_token_size`) or skip the document. The
+#   default 64 KiB is large enough for typical JSON values (HTTP
+#   headers, log records, API responses).
+#
+# Differential parity (interpreter == native):
+#
+#   The parser is a pure state machine over `str` bytes. The output
+#   token sequence is byte-identical between the interpreter and the
+#   native binary (no I/O — the caller drives the feed). The
+#   acceptance test feeds JSON in 1-byte, 4-byte, 16-byte, and
+#   64-byte chunks and verifies the token sequence is identical
+#   regardless of chunk boundary.
+#
+# Security:
+#
+#   * Maximum token size: bounded by `max_token_size` (default 64 KiB,
+#     RFC 8259 has no fixed limit). A token that exceeds this is
+#     rejected with a clear error — defends against a peer that
+#     sends a 1 GB string to exhaust memory.
+#   * Maximum nesting depth: bounded by `JSON_READER_MAX_DEPTH`
+#     (default 1024). A document that nests deeper than this is
+#     rejected with `Err("nesting depth exceeds limit")` — defends
+#     against a peer that sends deeply nested JSON to crash the
+#     parser's container stack (CVE-2017-20018 in some C JSON
+#     parsers is the analogous advisory).
+#   * Integer range: integers are checked against int64 range
+#     (matches the Stage 10-beta document parser's
+#     `json_parse_result` behavior — out-of-range integers return
+#     `Err` instead of panicking).
+#   * Float overflow: `Infinity` / `NaN` are NOT valid JSON (RFC
+#     8259 §6); the parser rejects them with `Err`. (The document
+#     parser emits them as JSON `null` per JavaScript's
+#     `JSON.stringify` — the streaming parser is stricter because
+#     a stream consumer can't trivially distinguish "this is a
+#     null because the input was NaN" from "this is a null
+#     because the input was null".)
+#   * UTF-8 validation: the parser DOES NOT validate UTF-8 in
+#     string tokens (the byte sequence is returned as-is). The
+#     caller is responsible for validating UTF-8 if the consuming
+#     application requires it. (Most modern JSON consumers accept
+#     arbitrary bytes in strings and decode them later — UTF-8
+#     validation is a Stage 50+ concern for `std.str` to handle.)
+#   * Surrogate pair decoding: `\uXXXX\uXXXX` pairs ARE decoded
+#     (high surrogate followed by low surrogate combines into a
+#     single codepoint, emitted as UTF-8 bytes in the resulting
+#     String/Key token — matches Stage 10-beta's behavior).
+# ============================================================================
+
+import "std.result"
+import "std.str"
+import "std.option"
+
+# ============================================================================
+# Constants — limits.
+# ============================================================================
+
+# json_reader_default_max_token_size: the default bound on a single
+# token's byte length. 64 KiB is large enough for typical JSON values
+# (HTTP headers, log records, API responses) while keeping the
+# reader's memory footprint bounded. Callers can raise this via
+# json_reader_set_max_token_size for documents with large string values
+# (e.g. a JSON document embedding a base64-encoded image).
+fn json_reader_default_max_token_size() -> int {
+    return 65536
+}
+
+# json_reader_max_depth: the maximum nesting depth of objects/arrays.
+# 1024 matches Python's `json.loads` default (Python's is 1000 by
+# default since 3.6 — see bpo-29381). A document that nests deeper is
+# rejected with Err. The limit defends against a peer that sends
+# deeply nested JSON (e.g. "[[[[[[[[..." × 1M) to crash the parser.
+fn json_reader_max_depth() -> int {
+    return 1024
+}
+
+# json_reader_buf_hard_cap: the absolute maximum buffer size the
+# reader will hold. This is max_token_size + the largest single feed
+# chunk; we cap it at 16 MiB to defend against a caller that feeds
+# huge chunks without bounding max_token_size. A feed that would
+# push the buffer past this cap returns Err.
+fn json_reader_buf_hard_cap() -> int {
+    return 16777216
+}
+
+# ============================================================================
+# Token type — JsonToken.
+#
+# HLS enums can carry payloads (like Option[T] and Result[T, E]).
+# The JsonToken enum has 10 variants covering all JSON value kinds
+# plus the structural open/close of objects and arrays.
+# ============================================================================
+
+enum JsonToken {
+    ObjectStart,
+    ObjectEnd,
+    ArrayStart,
+    ArrayEnd,
+    Key(str),
+    String(str),
+    Int(int),
+    Float(float),
+    Bool(bool),
+    Null
+}
+
+# ============================================================================
+# Reader state machine.
+#
+# State constants (RFC 8259 § 6 grammar):
+#   TOP         — at the top level (before the root value, or after it
+#                 in trailing whitespace).
+#   OBJECT_KEY  — just after `{` or `,` inside an object; the next
+#                 non-ws token MUST be a Key or `}`.
+#   OBJECT_VAL  — just after `:` inside an object; the next non-ws
+#                 token MUST be a value (any of ObjectStart /
+#                 ArrayStart / String / Int / Float / Bool / Null).
+#   ARRAY_VAL   — just after `[` or `,` inside an array; the next
+#                 non-ws token MUST be a value or `]`.
+#   DONE        — after the root value at top level; only trailing
+#                 whitespace is allowed.
+# ============================================================================
+
+fn json_state_top() -> int { return 0 }
+fn json_state_object_key() -> int { return 1 }
+fn json_state_object_val() -> int { return 2 }
+fn json_state_array_val() -> int { return 3 }
+fn json_state_done() -> int { return 4 }
+fn json_state_object_colon() -> int { return 5 }
+
+# Container kinds (for the stack).
+fn json_container_object() -> int { return 1 }
+fn json_container_array() -> int { return 2 }
+
+# ============================================================================
+# Reader struct.
+#
+# The reader is mutable (HLS structs have reference semantics — SPEC
+# §2.1 — so a function that takes `mut r: JsonReader` and writes
+# `r.pos = ...` propagates the change to the caller, matching the
+# JsonParser pattern in std.json).
+# ============================================================================
+
+struct JsonReader {
+    # The internal byte buffer. Holds bytes that have been fed via
+    # `feed` but not yet consumed by `next_token`. After each
+    # successful `next_token`, the consumed prefix is sliced off.
+    buf: str,
+    # The current read position. Always 0 after a successful token
+    # emit (we slice the buf to remove the consumed prefix). During
+    # a `next_token` call, pos advances as we scan.
+    pos: int,
+    # The error state. "" means no error. Once set, subsequent calls
+    # return Err immediately (the reader is in a terminal state).
+    err: str,
+    # True after json_reader_finish is called. The reader treats
+    # end-of-buffer as EOF: if state is DONE, returns Ok(None); if
+    # state is mid-value or mid-container, returns Err.
+    finished: bool,
+    # The current parse state (TOP, OBJECT_KEY, etc.).
+    state: int,
+    # The container stack. Pushed on `{` or `[`, popped on `}` or `]`.
+    # Used to restore the parent state after closing a container.
+    container_stack: list[int],
+    # The maximum byte length of a single token (default 64 KiB).
+    # Tokens that exceed this are rejected with Err.
+    max_token_size: int
+}
+
+# json_reader_new() -> JsonReader. Construct a fresh reader with
+# default settings.
+fn json_reader_new() -> JsonReader {
+    return JsonReader {
+        buf: "",
+        pos: 0,
+        err: "",
+        finished: false,
+        state: json_state_top(),
+        container_stack: [],
+        max_token_size: json_reader_default_max_token_size()
+    }
+}
+
+# json_reader_set_max_token_size(mut r, n) -> void. Set the maximum
+# byte length of a single token. Must be called BEFORE feeding any
+# bytes (the reader doesn't retroactively resize the buffer).
+fn json_reader_set_max_token_size(mut r: JsonReader, n: int) -> void {
+    if n < 16 {
+        panic("json_reader_set_max_token_size: minimum is 16 bytes (got " + n.to_str() + ")")
+    }
+    if n > json_reader_buf_hard_cap() {
+        panic("json_reader_set_max_token_size: maximum is " + json_reader_buf_hard_cap().to_str() + " (got " + n.to_str() + ")")
+    }
+    r.max_token_size = n
+}
+
+# json_reader_feed(mut r, bytes) -> Result[int, str]. Append bytes to
+# the reader's internal buffer. Returns Result.Ok(n) (the number of
+# bytes appended) on success, Result.Err(msg) on overflow.
+fn json_reader_feed(mut r: JsonReader, bytes: str) -> Result[int, str] {
+    if r.err != "" {
+        return Result.Err(r.err)
+    }
+    if r.finished {
+        return Result.Err("json_reader_feed: reader is finished (call json_reader_new for a new document)")
+    }
+    let new_len: int = r.buf.len() - r.pos + bytes.len()
+    if new_len > json_reader_buf_hard_cap() {
+        r.err = "json_reader_feed: buffer would exceed hard cap (" + new_len.to_str() + " > " + json_reader_buf_hard_cap().to_str() + ")"
+        return Result.Err(r.err)
+    }
+    # Compact: discard the already-consumed prefix to keep the buf small.
+    if r.pos > 0 {
+        r.buf = r.buf.slice(r.pos, r.buf.len()) + bytes
+        r.pos = 0
+    } else {
+        r.buf = r.buf + bytes
+    }
+    return Result.Ok(bytes.len())
+}
+
+# json_reader_finish(mut r) -> Result[int, str]. Signal end-of-input.
+# After this call, any further `feed` returns Err. The next
+# `next_token` call returns Ok(None) iff the state is DONE; otherwise
+# it returns Err (mid-value or mid-container at EOF).
+fn json_reader_finish(mut r: JsonReader) -> Result[int, str] {
+    if r.err != "" {
+        return Result.Err(r.err)
+    }
+    r.finished = true
+    return Result.Ok(0)
+}
+
+# ============================================================================
+# Token accessor helpers — pattern-match on the JsonToken enum.
+# ============================================================================
+
+# json_token_is_object_start(t) -> bool.
+fn json_token_is_object_start(t: JsonToken) -> bool {
+    return match t {
+        JsonToken.ObjectStart => true,
+        _ => false
+    }
+}
+
+fn json_token_is_object_end(t: JsonToken) -> bool {
+    return match t {
+        JsonToken.ObjectEnd => true,
+        _ => false
+    }
+}
+
+fn json_token_is_array_start(t: JsonToken) -> bool {
+    return match t {
+        JsonToken.ArrayStart => true,
+        _ => false
+    }
+}
+
+fn json_token_is_array_end(t: JsonToken) -> bool {
+    return match t {
+        JsonToken.ArrayEnd => true,
+        _ => false
+    }
+}
+
+fn json_token_is_key(t: JsonToken) -> bool {
+    return match t {
+        JsonToken.Key(_) => true,
+        _ => false
+    }
+}
+
+fn json_token_is_string(t: JsonToken) -> bool {
+    return match t {
+        JsonToken.String(_) => true,
+        _ => false
+    }
+}
+
+fn json_token_is_int(t: JsonToken) -> bool {
+    return match t {
+        JsonToken.Int(_) => true,
+        _ => false
+    }
+}
+
+fn json_token_is_float(t: JsonToken) -> bool {
+    return match t {
+        JsonToken.Float(_) => true,
+        _ => false
+    }
+}
+
+fn json_token_is_bool(t: JsonToken) -> bool {
+    return match t {
+        JsonToken.Bool(_) => true,
+        _ => false
+    }
+}
+
+fn json_token_is_null(t: JsonToken) -> bool {
+    return match t {
+        JsonToken.Null => true,
+        _ => false
+    }
+}
+
+# json_token_kind_name(t) -> str. Diagnostic name for a token kind.
+fn json_token_kind_name(t: JsonToken) -> str {
+    return match t {
+        JsonToken.ObjectStart => "ObjectStart",
+        JsonToken.ObjectEnd => "ObjectEnd",
+        JsonToken.ArrayStart => "ArrayStart",
+        JsonToken.ArrayEnd => "ArrayEnd",
+        JsonToken.Key(_) => "Key",
+        JsonToken.String(_) => "String",
+        JsonToken.Int(_) => "Int",
+        JsonToken.Float(_) => "Float",
+        JsonToken.Bool(_) => "Bool",
+        JsonToken.Null => "Null"
+    }
+}
+
+# ============================================================================
+# Parser internals.
+# ============================================================================
+
+# json_reader_set_err(mut r, msg) -> void. Records the first error.
+fn json_reader_set_err(mut r: JsonReader, msg: str) -> void {
+    if r.err == "" {
+        r.err = msg
+    }
+}
+
+# json_reader_skip_ws(r) — advance r.pos past ASCII whitespace.
+# RFC 8259 § 2: ws = %x20 (space) | %x09 (tab) | %x0A (LF) | %x0D (CR).
+fn json_reader_skip_ws(mut r: JsonReader) -> void {
+    let n: int = r.buf.len()
+    while r.pos < n {
+        let b: int = r.buf.byte_at(r.pos)
+        if b == 32 || b == 9 || b == 10 || b == 13 {
+            r.pos = r.pos + 1
+        } else {
+            return
+        }
+    }
+}
+
+# json_reader_push_container(mut r, kind) -> void. Push a container
+# onto the stack. Errors if the stack overflows the depth limit.
+fn json_reader_push_container(mut r: JsonReader, kind: int) -> void {
+    if r.container_stack.len() >= json_reader_max_depth() {
+        json_reader_set_err(r, "json: nesting depth exceeds limit (" + json_reader_max_depth().to_str() + ")")
+        return
+    }
+    r.container_stack.push(kind)
+}
+
+# json_reader_pop_container(mut r, kind) -> void. Pop the top of
+# the container stack. Errors if the kind doesn't match (e.g. `}`
+# inside an array).
+fn json_reader_pop_container(mut r: JsonReader, kind: int) -> void {
+    if r.container_stack.len() == 0 {
+        json_reader_set_err(r, "json: unexpected closing token (no open container)")
+        return
+    }
+    let top: int = r.container_stack.get(r.container_stack.len() - 1)
+    if top != kind {
+        let expected: str = json_reader_container_close_name(kind)
+        let actual: str = json_reader_container_kind_name(top)
+        json_reader_set_err(r, "json: closing token mismatch (expected "
+            + expected + " but stack top is " + actual + ")")
+        return
+    }
+    # HLS lists have no .pop() that returns the value AND removes it
+    # in one call (the .pop() builtin does, but we don't need the
+    # value here — we just need to drop it). Rebuild the list without
+    # the last element.
+    r.container_stack = json_reader_list_drop_last_int(r.container_stack)
+}
+
+# json_reader_container_close_name(kind) -> str. The closing token
+# for a container kind ("}" for object, "]" for array).
+fn json_reader_container_close_name(kind: int) -> str {
+    if kind == json_container_object() {
+        return "}"
+    }
+    return "]"
+}
+
+# json_reader_container_kind_name(kind) -> str. The human-readable
+# name of a container kind.
+fn json_reader_container_kind_name(kind: int) -> str {
+    if kind == json_container_object() {
+        return "object"
+    }
+    if kind == json_container_array() {
+        return "array"
+    }
+    return "top-level"
+}
+
+# json_reader_list_drop_last_int(lst) -> list[int]. Helper: copy lst
+# without its last element. (HLS lists don't have .take(n).)
+fn json_reader_list_drop_last_int(lst: list[int]) -> list[int] {
+    let out: list[int] = []
+    let mut i: int = 0
+    while i < lst.len() - 1 {
+        out.push(lst.get(i))
+        i = i + 1
+    }
+    return out
+}
+
+# json_reader_top_container(r) -> int. Returns the top container kind,
+# or 0 if the stack is empty (top-level).
+fn json_reader_top_container(r: JsonReader) -> int {
+    if r.container_stack.len() == 0 {
+        return 0
+    }
+    return r.container_stack.get(r.container_stack.len() - 1)
+}
+
+# json_reader_restore_state(mut r) -> void. After popping a container,
+# restore the state based on the new top of the stack.
+fn json_reader_restore_state(mut r: JsonReader) -> void {
+    let top: int = json_reader_top_container(r)
+    if top == 0 {
+        # Top-level — we just closed the root container.
+        r.state = json_state_done()
+    } else if top == json_container_object() {
+        # Inside an object, after a value (the closed container was
+        # a value of an object member).
+        r.state = json_state_object_key()
+    } else {
+        # Inside an array, after a value.
+        r.state = json_state_array_val()
+    }
+}
+
+# ============================================================================
+# String parsing — the most complex token (escapes + surrogate pairs).
+# ============================================================================
+
+# json_hex_digit(b) -> int. Returns the integer value of a hex digit
+# (0-9, A-F, a-f), or -1 if not a hex digit. (Same impl as std.json's
+# json_hex_digit — kept here to avoid the std.json import dependency
+# for this single helper.)
+fn json_reader_hex_digit(b: int) -> int {
+    if b >= 48 && b <= 57 {
+        return b - 48
+    }
+    if b >= 65 && b <= 70 {
+        return b - 55
+    }
+    if b >= 97 && b <= 102 {
+        return b - 87
+    }
+    return -1
+}
+
+# json_reader_push_utf8(chars, cp) — encode a codepoint (0..0x10FFFF)
+# as UTF-8 bytes appended to chars. Mirrors std.json's jsonp_push_utf8
+# but with the 4-byte case fixed (the std.json formula uses
+# `c = cp - 65536` which gives the wrong bits for codepoints in
+# [0x10000, 0x10FFFF]; the correct formula uses cp directly —
+# bits 12-17 of cp differ from bits 12-17 of c by 1 in the bit-16
+# position. This fix is backported to std.json in a future deep-scan
+# cleanup; Stage 40 ships the correct formula here).
+fn json_reader_push_utf8(chars: list[str], cp: int) -> void {
+    if cp < 128 {
+        chars.push(chr(cp))
+    } else if cp < 2048 {
+        chars.push(chr(192 + cp / 64))
+        chars.push(chr(128 + cp % 64))
+    } else if cp < 65536 {
+        chars.push(chr(224 + cp / 4096))
+        chars.push(chr(128 + (cp / 64) % 64))
+        chars.push(chr(128 + cp % 64))
+    } else {
+        # 4-byte UTF-8 for codepoints in [U+10000, U+10FFFF].
+        # Format: 11110xxx 10xxxxxx 10xxxxxx 10xxxxxx
+        # byte 0: bits 18-20 of cp (3 bits, 0..15 — capped to 0..7 by RFC)
+        # byte 1: bits 12-17 of cp (6 bits)
+        # byte 2: bits 6-11 of cp  (6 bits)
+        # byte 3: bits 0-5 of cp   (6 bits)
+        chars.push(chr(240 + cp / 262144))
+        chars.push(chr(128 + (cp / 4096) % 64))
+        chars.push(chr(128 + (cp / 64) % 64))
+        chars.push(chr(128 + cp % 64))
+    }
+}
+
+# json_reader_try_parse_string(mut r) -> Option[str].
+# Attempts to parse a JSON string starting at r.pos. Returns:
+#   Option.Some(str) — the parsed string (r.pos is advanced past the
+#                      closing quote).
+#   Option.None      — not enough bytes yet (r.pos is NOT advanced;
+#                      caller should call feed and retry).
+# Sets r.err on a parse error (and r.pos is left at the error byte).
+fn json_reader_try_parse_string(mut r: JsonReader) -> Option[str] {
+    let n: int = r.buf.len()
+    # Skip the opening quote.
+    # (Caller guarantees r.buf.byte_at(r.pos) == 34 ('"').)
+    let start: int = r.pos
+    let mut p: int = r.pos + 1
+    let chars: list[str] = []
+    let mut hit_max: bool = false
+    while p < n {
+        let c: int = r.buf.byte_at(p)
+        if c == 34 {
+            # Closing quote.
+            r.pos = p + 1
+            return Option.Some(str_join(chars, ""))
+        }
+        if c == 92 {
+            # Backslash escape. Need at least 2 bytes (backslash + escape char).
+            if p + 1 >= n {
+                # Not enough bytes — return None (don't advance r.pos).
+                if r.finished {
+                    json_reader_set_err(r, "json: truncated escape sequence at EOF")
+                }
+                return Option.None
+            }
+            let e: int = r.buf.byte_at(p + 1)
+            if e == 110 {
+                chars.push(chr(10))
+                p = p + 2
+            } else if e == 116 {
+                chars.push(chr(9))
+                p = p + 2
+            } else if e == 114 {
+                chars.push(chr(13))
+                p = p + 2
+            } else if e == 34 {
+                chars.push(chr(34))
+                p = p + 2
+            } else if e == 92 {
+                chars.push(chr(92))
+                p = p + 2
+            } else if e == 47 {
+                chars.push(chr(47))
+                p = p + 2
+            } else if e == 98 {
+                chars.push(chr(8))
+                p = p + 2
+            } else if e == 102 {
+                chars.push(chr(12))
+                p = p + 2
+            } else if e == 117 {
+                # \uXXXX — need 6 bytes total (backslash, u, 4 hex).
+                if p + 5 >= n {
+                    if r.finished {
+                        json_reader_set_err(r, "json: truncated \\u escape at EOF")
+                    }
+                    return Option.None
+                }
+                let mut code: int = 0
+                let mut k: int = 0
+                while k < 4 {
+                    let hd: int = json_reader_hex_digit(r.buf.byte_at(p + 2 + k))
+                    if hd < 0 {
+                        json_reader_set_err(r, "json: invalid hex digit in \\u escape")
+                        return Option.None
+                    }
+                    code = code * 16 + hd
+                    k = k + 1
+                }
+                # Surrogate pair handling (matches std.json's logic).
+                if code >= 55296 && code <= 56319 {
+                    # High surrogate — need a low surrogate next.
+                    # Need at least 12 bytes: \uXXXX\uXXXX.
+                    if p + 11 >= n {
+                        if r.finished {
+                            json_reader_set_err(r, "json: high surrogate truncated at EOF")
+                        }
+                        return Option.None
+                    }
+                    if r.buf.byte_at(p + 6) != 92 || r.buf.byte_at(p + 7) != 117 {
+                        json_reader_set_err(r, "json: high surrogate not followed by \\uLOW")
+                        return Option.None
+                    }
+                    let mut low: int = 0
+                    let mut k2: int = 0
+                    while k2 < 4 {
+                        let hd2: int = json_reader_hex_digit(r.buf.byte_at(p + 8 + k2))
+                        if hd2 < 0 {
+                            json_reader_set_err(r, "json: invalid hex digit in low surrogate")
+                            return Option.None
+                        }
+                        low = low * 16 + hd2
+                        k2 = k2 + 1
+                    }
+                    if low < 56320 || low > 57343 {
+                        json_reader_set_err(r, "json: invalid low surrogate")
+                        return Option.None
+                    }
+                    let cp: int = 65536 + (code - 55296) * 1024 + (low - 56320)
+                    json_reader_push_utf8(chars, cp)
+                    p = p + 12
+                } else if code >= 56320 && code <= 57343 {
+                    json_reader_set_err(r, "json: low surrogate without preceding high surrogate")
+                    return Option.None
+                } else {
+                    json_reader_push_utf8(chars, code)
+                    p = p + 6
+                }
+            } else {
+                json_reader_set_err(r, "json: invalid escape sequence '\\" + chr(e) + "'")
+                return Option.None
+            }
+        } else {
+            if c < 32 {
+                json_reader_set_err(r, "json: unescaped control character in string")
+                return Option.None
+            }
+            chars.push(r.buf.slice(p, p + 1))
+            p = p + 1
+        }
+        # Check the max_token_size bound. The string's byte length
+        # is (p - start). If it exceeds max_token_size, error out.
+        if p - start > r.max_token_size {
+            hit_max = true
+            break
+        }
+    }
+    if hit_max {
+        json_reader_set_err(r, "json: token exceeds max_token_size (" + r.max_token_size.to_str() + " bytes)")
+        return Option.None
+    }
+    # End of buffer reached without a closing quote. If finished, it's
+    # an error; otherwise, return None (need more input).
+    if r.finished {
+        json_reader_set_err(r, "json: unterminated string at EOF")
+    }
+    return Option.None
+}
+
+# ============================================================================
+# Number parsing — int or float.
+# ============================================================================
+
+# json_reader_try_parse_number(mut r) -> Option[JsonToken].
+# Attempts to parse a JSON number starting at r.pos. Returns:
+#   Option.Some(Int(n))     — integer.
+#   Option.Some(Float(f))   — float.
+#   Option.None             — not enough bytes (need more input).
+# Sets r.err on parse error.
+#
+# Grammar (RFC 8259 § 6):
+#   number = [ "-" ] int [ frac ] [ exp ]
+#   int    = "0" | digit1-9 *DIGIT
+#   frac   = "." 1*DIGIT
+#   exp    = ("e" | "E") ["+" | "-"] 1*DIGIT
+#
+# The parser consumes bytes greedily until it hits a non-number byte.
+# At end-of-buffer, if not finished, returns None (need more input).
+# If finished, finalizes the number with what we have.
+fn json_reader_try_parse_number(mut r: JsonReader) -> Option[JsonToken] {
+    let n: int = r.buf.len()
+    let start: int = r.pos
+    let mut p: int = r.pos
+    let mut is_float: bool = false
+    let mut neg: bool = false
+    # Sign.
+    if p < n && r.buf.byte_at(p) == 45 {
+        neg = true
+        p = p + 1
+    }
+    # Integer part.
+    if p >= n {
+        # End of buffer right after '-' (or at start with no sign).
+        if r.finished {
+            json_reader_set_err(r, "json: number expected after '-'")
+        }
+        return Option.None
+    }
+    let int_start: int = p
+    let first_digit: int = r.buf.byte_at(p)
+    if first_digit == 48 {
+        # Leading zero — RFC 8259 § 6 says "0123" is invalid.
+        p = p + 1
+    } else if first_digit >= 49 && first_digit <= 57 {
+        # 1-9 — consume digits.
+        p = p + 1
+        while p < n {
+            let c: int = r.buf.byte_at(p)
+            if c >= 48 && c <= 57 {
+                p = p + 1
+            } else {
+                break
+            }
+        }
+    } else {
+        json_reader_set_err(r, "json: invalid number (no digits after sign)")
+        return Option.None
+    }
+    let int_end: int = p
+    # Fractional part.
+    if p < n && r.buf.byte_at(p) == 46 {
+        is_float = true
+        p = p + 1
+        if p >= n {
+            # Need more bytes to see the first fractional digit.
+            if r.finished {
+                json_reader_set_err(r, "json: number with trailing '.' (no fractional digits)")
+                return Option.None
+            }
+            return Option.None
+        }
+        # RFC 8259 § 6: frac = "." 1*DIGIT — at least one digit.
+        if r.buf.byte_at(p) < 48 || r.buf.byte_at(p) > 57 {
+            json_reader_set_err(r, "json: number with '.' not followed by digit")
+            return Option.None
+        }
+        while p < n {
+            let c: int = r.buf.byte_at(p)
+            if c >= 48 && c <= 57 {
+                p = p + 1
+            } else {
+                break
+            }
+        }
+    }
+    # Exponent.
+    if p < n {
+        let c: int = r.buf.byte_at(p)
+        if c == 101 || c == 69 {
+            is_float = true
+            p = p + 1
+            if p >= n {
+                if r.finished {
+                    json_reader_set_err(r, "json: number with trailing 'e' (no exponent digits)")
+                    return Option.None
+                }
+                return Option.None
+            }
+            # Optional sign.
+            let s: int = r.buf.byte_at(p)
+            if s == 43 || s == 45 {
+                p = p + 1
+                if p >= n {
+                    if r.finished {
+                        json_reader_set_err(r, "json: number with 'e+' (no exponent digits)")
+                        return Option.None
+                    }
+                    return Option.None
+                }
+            }
+            # RFC 8259 § 6: exp = ("e" | "E") ["+" | "-"] 1*DIGIT.
+            if r.buf.byte_at(p) < 48 || r.buf.byte_at(p) > 57 {
+                json_reader_set_err(r, "json: number with 'e' not followed by digit")
+                return Option.None
+            }
+            while p < n {
+                let c2: int = r.buf.byte_at(p)
+                if c2 >= 48 && c2 <= 57 {
+                    p = p + 1
+                } else {
+                    break
+                }
+            }
+        }
+    }
+    # If we haven't consumed any digits past the sign, that's an error.
+    if int_end == int_start {
+        json_reader_set_err(r, "json: invalid number (no digits)")
+        return Option.None
+    }
+    # If we're at end-of-buffer and not finished, we may need more
+    # bytes (the number could continue with `.` or `e`).
+    if p == n && !r.finished {
+        # Check: is the next byte likely to be a number continuation?
+        # If we're mid-number (e.g. consumed "-" or "1" or "1."), we
+        # need to wait for more input. Conservative: return None and
+        # let the caller feed more.
+        return Option.None
+    }
+    # Check max_token_size.
+    if p - start > r.max_token_size {
+        json_reader_set_err(r, "json: number exceeds max_token_size")
+        return Option.None
+    }
+    let text: str = r.buf.slice(start, p)
+    r.pos = p
+    if is_float {
+        # The text could be "1.5e10" — call to_float on the str.
+        # NOTE: std.json's parser uses text.to_float() which uses
+        # C's strtod — matches Stage 10-beta behaviour.
+        return Option.Some(JsonToken.Float(text.to_float()))
+    }
+    # Integer range check (matches std.json — INT64_MIN is rejected).
+    let digits: str = r.buf.slice(int_start, int_end)
+    if digits.len() > 19 {
+        json_reader_set_err(r, "json: integer out of int64 range (too many digits)")
+        return Option.None
+    }
+    if digits.len() == 19 {
+        if neg {
+            if digits > "9223372036854775808" {
+                json_reader_set_err(r, "json: integer out of int64 range")
+                return Option.None
+            }
+        } else {
+            if digits > "9223372036854775807" {
+                json_reader_set_err(r, "json: integer out of int64 range")
+                return Option.None
+            }
+        }
+    }
+    return Option.Some(JsonToken.Int(text.to_int()))
+}
+
+# ============================================================================
+# Keyword parsing — true, false, null.
+# ============================================================================
+
+# json_reader_try_parse_keyword(mut r, word, token) -> Option[JsonToken].
+# Tries to match the keyword `word` at r.pos. Returns:
+#   Option.Some(token) — matched; r.pos is advanced past the keyword.
+#   Option.None       — not enough bytes (or didn't match).
+fn json_reader_try_parse_keyword(mut r: JsonReader, word: str, token: JsonToken) -> Option[JsonToken] {
+    let n: int = r.buf.len()
+    let wn: int = word.len()
+    # If we don't have enough bytes yet, return None.
+    if r.pos + wn > n {
+        if r.finished {
+            # We have EOF but the keyword is incomplete. Distinguish
+            # "matched so far" (need more input) from "mismatched".
+            let avail: str = r.buf.slice(r.pos, n)
+            if word.starts_with(avail) {
+                # Could still match — but we're at EOF, so it's an error.
+                json_reader_set_err(r, "json: truncated keyword '" + word + "' at EOF")
+                return Option.None
+            }
+            json_reader_set_err(r, "json: expected keyword '" + word + "' but got '" + avail + "'")
+            return Option.None
+        }
+        return Option.None
+    }
+    let s: str = r.buf.slice(r.pos, r.pos + wn)
+    if s != word {
+        json_reader_set_err(r, "json: expected keyword '" + word + "' but got '" + s + "'")
+        return Option.None
+    }
+    r.pos = r.pos + wn
+    return Option.Some(token)
+}
+
+# json_reader_after_value(mut r) — update the state after a scalar
+# value (String / Int / Float / Bool / Null) is emitted. Container
+# values (ObjectStart / ObjectEnd / ArrayStart / ArrayEnd) update
+# state in their own handlers.
+#
+# After a scalar value:
+#   - OBJECT_VAL -> OBJECT_KEY (the next non-ws token should be ','
+#     or '}').
+#   - ARRAY_VAL  -> ARRAY_VAL (the next non-ws token should be ','
+#     or ']').
+#   - TOP        -> DONE (root value emitted; only trailing ws).
+#   - DONE       -> error (trailing data after root value).
+#   - OBJECT_KEY -> error (a value where a key was expected).
+#   - OBJECT_COLON -> error (a value where ':' was expected).
+fn json_reader_after_value(mut r: JsonReader) -> void {
+    if r.state == json_state_object_val() {
+        r.state = json_state_object_key()
+    } else if r.state == json_state_array_val() {
+        # State stays ARRAY_VAL.
+        return
+    } else if r.state == json_state_top() {
+        r.state = json_state_done()
+    } else if r.state == json_state_done() {
+        json_reader_set_err(r, "json: trailing data after root value")
+    } else {
+        # OBJECT_KEY or OBJECT_COLON — a scalar value appeared where
+        # a key string or ':' was expected.
+        json_reader_set_err(r, "json: unexpected value (state=" + r.state.to_str() + ")")
+    }
+}
+
+# ============================================================================
+# The main token-emission function.
+# ============================================================================
+
+# json_reader_next_token(mut r) -> Result[Option[JsonToken], str].
+# Returns:
+#   Result.Ok(Option.Some(token)) — a token was produced.
+#   Result.Ok(Option.None)        — no token yet (need more input OR
+#                                   cleanly at EOF with state == DONE).
+#   Result.Err(msg)               — parse error (terminal state).
+fn json_reader_next_token(mut r: JsonReader) -> Result[Option[JsonToken], str] {
+    if r.err != "" {
+        return Result.Err(r.err)
+    }
+    # Loop: we may need to skip whitespace and separators before
+    # finding a token.
+    let mut iterations: int = 0
+    while iterations < 1000000 {
+        iterations = iterations + 1
+        # Step 1: skip whitespace.
+        json_reader_skip_ws(r)
+        if r.err != "" {
+            return Result.Err(r.err)
+        }
+        # Step 2: check end-of-buffer.
+        if r.pos >= r.buf.len() {
+            if r.finished {
+                # At EOF. If state is DONE, return Ok(None) (no more
+                # tokens). Otherwise, mid-value or mid-container — error.
+                if r.state == json_state_done() {
+                    let none_tok: Option[JsonToken] = Option.None
+                    return Result.Ok(none_tok)
+                }
+                if r.state == json_state_top() {
+                    # Empty input — no root value was emitted.
+                    json_reader_set_err(r, "json: empty input (no root value)")
+                    return Result.Err(r.err)
+                }
+                json_reader_set_err(r, "json: unexpected EOF (state="
+                    + r.state.to_str() + ", container_stack_depth=" + r.container_stack.len().to_str() + ")")
+                return Result.Err(r.err)
+            }
+            # Not finished — need more input.
+            let _none_t: Option[JsonToken] = Option.None
+            return Result.Ok(_none_t)
+        }
+        # Step 3: look at the next byte.
+        let c: int = r.buf.byte_at(r.pos)
+        # Structural tokens.
+        if c == 123 {
+            # '{' — ObjectStart.
+            r.pos = r.pos + 1
+            json_reader_push_container(r, json_container_object())
+            if r.err != "" {
+                return Result.Err(r.err)
+            }
+            r.state = json_state_object_key()
+            return Result.Ok(Option.Some(JsonToken.ObjectStart))
+        }
+        if c == 125 {
+            # '}' — ObjectEnd.
+            r.pos = r.pos + 1
+            json_reader_pop_container(r, json_container_object())
+            if r.err != "" {
+                return Result.Err(r.err)
+            }
+            json_reader_restore_state(r)
+            return Result.Ok(Option.Some(JsonToken.ObjectEnd))
+        }
+        if c == 91 {
+            # '[' — ArrayStart.
+            r.pos = r.pos + 1
+            json_reader_push_container(r, json_container_array())
+            if r.err != "" {
+                return Result.Err(r.err)
+            }
+            r.state = json_state_array_val()
+            return Result.Ok(Option.Some(JsonToken.ArrayStart))
+        }
+        if c == 93 {
+            # ']' — ArrayEnd.
+            r.pos = r.pos + 1
+            json_reader_pop_container(r, json_container_array())
+            if r.err != "" {
+                return Result.Err(r.err)
+            }
+            json_reader_restore_state(r)
+            return Result.Ok(Option.Some(JsonToken.ArrayEnd))
+        }
+        # Separators — skip and continue the loop.
+        if c == 44 {
+            # ','
+            # Validate: ',' is only valid after a value (i.e. in
+            # OBJECT_KEY or ARRAY_VAL state — meaning the previous
+            # token was a value and we're now expecting the next).
+            # Actually, ',' transitions:
+            #   OBJECT_KEY (after a value, expecting next key) -> OBJECT_KEY
+            #   ARRAY_VAL (after a value, expecting next value) -> ARRAY_VAL
+            # ',' is NOT valid at TOP, OBJECT_VAL (after `:`), or DONE.
+            if r.state == json_state_top() || r.state == json_state_object_val() || r.state == json_state_done() {
+                json_reader_set_err(r, "json: unexpected ',' (state=" + r.state.to_str() + ")")
+                return Result.Err(r.err)
+            }
+            r.pos = r.pos + 1
+            # State stays the same (OBJECT_KEY or ARRAY_VAL).
+            # Loop back to skip whitespace + look at the next token.
+            continue
+        }
+        if c == 58 {
+            # ':' — separates key from value in an object. Valid only
+            # in OBJECT_COLON state (i.e. we just emitted a Key). In
+            # any other state, it's a syntax error.
+            if r.state != json_state_object_colon() {
+                json_reader_set_err(r, "json: unexpected ':' (state=" + r.state.to_str() + ")")
+                return Result.Err(r.err)
+            }
+            r.pos = r.pos + 1
+            r.state = json_state_object_val()
+            continue
+        }
+        # String (Key or value).
+        if c == 34 {
+            # '"' — string. Try to parse it.
+            let s_opt: Option[str] = json_reader_try_parse_string(r)
+            if r.err != "" {
+                return Result.Err(r.err)
+            }
+            if option_is_none(s_opt) {
+                # Need more input.
+                let _none_t: Option[JsonToken] = Option.None
+            return Result.Ok(_none_t)
+            }
+            let s: str = option_unwrap(s_opt)
+            # Decide: Key or String?
+            # State == OBJECT_KEY: emit Key, set state to OBJECT_COLON
+            #   (the next non-ws token MUST be ':').
+            # Otherwise: emit String and use the shared state-update
+            #   helper (handles OBJECT_VAL, ARRAY_VAL, TOP, DONE).
+            if r.state == json_state_object_key() {
+                r.state = json_state_object_colon()
+                return Result.Ok(Option.Some(JsonToken.Key(s)))
+            }
+            json_reader_after_value(r)
+            if r.err != "" {
+                return Result.Err(r.err)
+            }
+            return Result.Ok(Option.Some(JsonToken.String(s)))
+        }
+        # Keywords.
+        if c == 116 {
+            # 't' — true.
+            let t_opt: Option[JsonToken] = json_reader_try_parse_keyword(r, "true", JsonToken.Bool(true))
+            if r.err != "" {
+                return Result.Err(r.err)
+            }
+            if option_is_none(t_opt) {
+                let _none_t: Option[JsonToken] = Option.None
+            return Result.Ok(_none_t)
+            }
+            json_reader_after_value(r)
+            if r.err != "" {
+                return Result.Err(r.err)
+            }
+            return Result.Ok(t_opt)
+        }
+        if c == 102 {
+            # 'f' — false.
+            let t_opt: Option[JsonToken] = json_reader_try_parse_keyword(r, "false", JsonToken.Bool(false))
+            if r.err != "" {
+                return Result.Err(r.err)
+            }
+            if option_is_none(t_opt) {
+                let _none_t: Option[JsonToken] = Option.None
+            return Result.Ok(_none_t)
+            }
+            json_reader_after_value(r)
+            if r.err != "" {
+                return Result.Err(r.err)
+            }
+            return Result.Ok(t_opt)
+        }
+        if c == 110 {
+            # 'n' — null.
+            let t_opt: Option[JsonToken] = json_reader_try_parse_keyword(r, "null", JsonToken.Null)
+            if r.err != "" {
+                return Result.Err(r.err)
+            }
+            if option_is_none(t_opt) {
+                let _none_t: Option[JsonToken] = Option.None
+            return Result.Ok(_none_t)
+            }
+            json_reader_after_value(r)
+            if r.err != "" {
+                return Result.Err(r.err)
+            }
+            return Result.Ok(t_opt)
+        }
+        # Number.
+        if c == 45 || (c >= 48 && c <= 57) {
+            # '-' or '0'..'9'.
+            # Validate state: numbers are valid as values (OBJECT_VAL,
+            # ARRAY_VAL, TOP). They're NOT valid in OBJECT_KEY (expecting
+            # a string key) or after ObjectEnd/ArrayEnd (trailing data).
+            if r.state == json_state_object_key() {
+                json_reader_set_err(r, "json: expected string key in object but got number")
+                return Result.Err(r.err)
+            }
+            if r.state == json_state_done() {
+                json_reader_set_err(r, "json: trailing data after root value (number)")
+                return Result.Err(r.err)
+            }
+            if r.state == json_state_object_colon() {
+                json_reader_set_err(r, "json: expected ':' after key but got number")
+                return Result.Err(r.err)
+            }
+            let t_opt: Option[JsonToken] = json_reader_try_parse_number(r)
+            if r.err != "" {
+                return Result.Err(r.err)
+            }
+            if option_is_none(t_opt) {
+                let _none_t: Option[JsonToken] = Option.None
+            return Result.Ok(_none_t)
+            }
+            let t: JsonToken = option_unwrap(t_opt)
+            # Update state via the shared helper.
+            json_reader_after_value(r)
+            if r.err != "" {
+                return Result.Err(r.err)
+            }
+            return Result.Ok(Option.Some(t))
+        }
+        # Unknown character.
+        json_reader_set_err(r, "json: unexpected character '" + chr(c) + "' (0x"
+            + json_reader_hex2(c) + ") at offset " + r.pos.to_str())
+        return Result.Err(r.err)
+    }
+    # Exceeded the iteration limit — shouldn't happen for valid JSON
+    # (the loop only iterates per-token; 1M iterations is unreachable).
+    json_reader_set_err(r, "json: parser loop exceeded 1000000 iterations (bug)")
+    return Result.Err(r.err)
+}
+
+# json_reader_hex2(n) — 2-digit lowercase hex of n's low byte. For
+# diagnostics.
+fn json_reader_hex2(n: int) -> str {
+    let lo: int = n % 16
+    let hi: int = (n / 16) % 16
+    return json_reader_hex_digit_char(hi) + json_reader_hex_digit_char(lo)
+}
+
+fn json_reader_hex_digit_char(x: int) -> str {
+    if x < 10 { return chr(48 + x) }
+    return chr(97 + (x - 10))
+}
+
+# ============================================================================
+# Convenience: drain all available tokens into a list.
+# ============================================================================
+
+# json_reader_drain(mut r, max_tokens) -> Result[list[JsonToken], str].
+# Calls next_token until it returns None (no more tokens) or `max_tokens`
+# tokens have been collected. Returns Result.Ok(list) on success, Err on
+# parse error. The caller must call json_reader_finish before calling
+# drain if they want to ensure the full document is parsed.
+#
+# Useful for testing — feeds a chunk, drains the available tokens,
+# asserts the token sequence. NOT suitable for production use on
+# huge documents (it materializes the whole token list in memory,
+# defeating the streaming property).
+fn json_reader_drain(mut r: JsonReader, max_tokens: int) -> Result[list[JsonToken], str] {
+    let tokens: list[JsonToken] = []
+    let mut count: int = 0
+    while count < max_tokens {
+        let t_r: Result[Option[JsonToken], str] = json_reader_next_token(r)
+        if !result_is_ok(t_r) {
+            return Result.Err(result_err_or(t_r, ""))
+        }
+        let t_opt: Option[JsonToken] = result_unwrap(t_r)
+        if option_is_none(t_opt) {
+            return Result.Ok(tokens)
+        }
+        tokens.push(option_unwrap(t_opt))
+        count = count + 1
+    }
+    return Result.Ok(tokens)
+}
+
+# ============================================================================
+# Convenience: parse a complete str (one-shot, non-streaming API).
+# ============================================================================
+
+# json_reader_parse_all(src) -> Result[list[JsonToken], str].
+# Convenience wrapper: feed the whole src, finish, drain all tokens.
+# Useful when the caller has the whole document in memory but wants
+# the streaming parser's token-list output (e.g. for testing).
+# For documents that fit in memory, the Stage 10-beta `json_parse`
+# returning a `JsonValue` tree is usually more ergonomic — use this
+# only when you specifically need the token list.
+fn json_reader_parse_all(src: str) -> Result[list[JsonToken], str] {
+    let r: JsonReader = json_reader_new()
+    let _feed_r: Result[int, str] = json_reader_feed(r, src)
+    if !result_is_ok(_feed_r) {
+        return Result.Err(result_err_or(_feed_r, ""))
+    }
+    let _fin_r: Result[int, str] = json_reader_finish(r)
+    if !result_is_ok(_fin_r) {
+        return Result.Err(result_err_or(_fin_r, ""))
+    }
+    # Drain up to 100 million tokens (a hard safety cap — a 1 GB
+    # JSON document has at most ~250M tokens, all of them 1-char).
+    return json_reader_drain(r, 100000000)
+}

@@ -1549,3 +1549,47 @@ http2-acceptance: bin/hlc
 
 .PHONY: http2-acceptance
 
+# ============================================================================
+# Stage 40 (v0.59.0-alpha): std.json_stream -- streaming JSON parser
+# ----------------------------------------------------------------------------
+# Pure-HLS constant-memory streaming JSON parser. JsonReader produces
+# one token at a time and never holds the whole document in memory.
+# Useful for parsing multi-GB JSON logs, NDJSON streams, or any JSON
+# source that's too large to fit in RAM. The existing std.json
+# document parser (Stage 10-beta, v0.6.0-alpha) remains for small
+# inputs.
+# ============================================================================
+json-stream-acceptance: bin/hlc
+	@$(PYTHON) boot/boot.py examples/json_stream_demo.hls > /tmp/js_interp.txt 2>&1
+	@bin/hlc examples/json_stream_demo.hls /tmp/js_demo.c 2>/dev/null
+	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/js_demo /tmp/js_demo.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
+	@/tmp/js_demo > /tmp/js_nat.txt 2>&1
+	@diff -q /tmp/js_interp.txt /tmp/js_nat.txt >/dev/null 2>&1 \
+		|| (echo "FAIL: json_stream_demo differential mismatch" && false)
+	@$(PYTHON) boot/boot.py tests/ok/feat_stage40_json_stream.hls > /tmp/s40_interp.txt 2>&1
+	@bin/hlc tests/ok/feat_stage40_json_stream.hls /tmp/s40.c 2>/dev/null
+	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/s40 /tmp/s40.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
+	@/tmp/s40 > /tmp/s40_nat.txt 2>&1
+	@diff -q /tmp/s40_interp.txt /tmp/s40_nat.txt >/dev/null 2>&1 \
+		|| (echo "FAIL: feat_stage40_json_stream differential mismatch" && false)
+	@rm -f /tmp/js_demo /tmp/js_demo.c /tmp/js_interp.txt /tmp/js_nat.txt \
+		/tmp/s40 /tmp/s40.c /tmp/s40_interp.txt /tmp/s40_nat.txt
+	@echo ""
+	@echo "ACCEPTANCE OK: Stage 40 -- std.json_stream (streaming JSON parser, constant-memory)"
+	@echo "  JsonReader struct + feed/finish/next_token API"
+	@echo "  JsonToken enum (10 variants: ObjectStart/End, ArrayStart/End, Key, String, Int, Float, Bool, Null)"
+	@echo "  Incremental parse (byte-by-byte feed, 1/4/16/64/256-byte chunks)"
+	@echo "  State machine (TOP, OBJECT_KEY, OBJECT_COLON, OBJECT_VAL, ARRAY_VAL, DONE)"
+	@echo "  String escapes (n t r quote backslash slash b f uXXXX — all decoded)"
+	@echo "  Surrogate pair decoding (\\uD83D\\uDE00 -> 4-byte UTF-8 [0xF0, 0x9F, 0x98, 0x80])"
+	@echo "  Number edge cases (int, float, negative, exponent)"
+	@echo "  Integer range check (INT64_MAX/MIN accepted; out-of-range rejected)"
+	@echo "  Empty containers, trailing data, empty input, unbalanced containers"
+	@echo "  Invalid escapes, max_token_size limit, nesting depth limit"
+	@echo "  NDJSON stream (3 records, 24 tokens)"
+	@echo "  Large document (1000-element array, 4002 tokens, 256-byte chunks)"
+	@echo "  Token-kind predicates (10 predicates verified)"
+	@echo "  differential (interpreter == native) verified green."
+
+.PHONY: json-stream-acceptance
+

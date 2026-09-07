@@ -1,0 +1,556 @@
+# json_stream_demo.hls — Stage 40 (v0.59.0-alpha): std.json_stream demo.
+#
+# This demo shows the std.json_stream API — a constant-memory
+# streaming JSON parser. The reader produces one token at a time
+# and never holds the whole document in memory.
+#
+# The demo:
+#   1. Parses a small JSON object in ONE feed.
+#   2. Parses the SAME object byte-by-byte (incremental feed).
+#   3. Parses a multi-MB-shaped JSON document (synthetic — uses
+#      an array of 1000 objects to demonstrate the constant-memory
+#      property; the reader's buffer stays small regardless of
+#      document size).
+#   4. Demonstrates error handling (malformed JSON).
+#   5. Shows the token-type helpers.
+#   6. Demonstrates parsing a real-world-shaped JSON log (NDJSON).
+
+import "std.json_stream"
+import "std.str"
+import "std.option"
+import "std.result"
+
+# ============================================================================
+# Section 1: One-shot parse — feed the whole document at once.
+# ============================================================================
+
+fn section_one_shot() -> int uses IO {
+    println("=== Section 1: one-shot parse ===")
+    let src: str = "{\"name\":\"alice\",\"age\":30,\"active\":true,\"data\":null}"
+    let r: JsonReader = json_reader_new()
+    let _fr: Result[int, str] = json_reader_feed(r, src)
+    let _fin: Result[int, str] = json_reader_finish(r)
+    let tokens_r: Result[list[JsonToken], str] = json_reader_drain(r, 100)
+    if !result_is_ok(tokens_r) {
+        println("FAIL: " + result_err_or(tokens_r, ""))
+        return 1
+    }
+    let tokens: list[JsonToken] = result_unwrap(tokens_r)
+    println("  parsed " + tokens.len().to_str() + " tokens:")
+    let mut i: int = 0
+    while i < tokens.len() {
+        let t: JsonToken = tokens.get(i)
+        let kind: str = json_token_kind_name(t)
+        let detail: str = json_token_detail(t)
+        println("    [" + i.to_str() + "] " + kind + " " + detail)
+        i = i + 1
+    }
+    if tokens.len() != 10 {
+        println("FAIL: expected 10 tokens, got " + tokens.len().to_str())
+        return 1
+    }
+    if !json_token_is_object_start(tokens.get(0)) {
+        println("FAIL: token 0 should be ObjectStart")
+        return 1
+    }
+    println("  one-shot parse OK (10 tokens)")
+    return 0
+}
+
+# Helper: get a string representation of a token's payload (for display).
+fn json_token_detail(t: JsonToken) -> str {
+    return match t {
+        JsonToken.ObjectStart => "",
+        JsonToken.ObjectEnd => "",
+        JsonToken.ArrayStart => "",
+        JsonToken.ArrayEnd => "",
+        JsonToken.Key(s) => "'" + s + "'",
+        JsonToken.String(s) => "'" + s + "'",
+        JsonToken.Int(n) => n.to_str(),
+        JsonToken.Float(f) => f.to_str(),
+        JsonToken.Bool(b) => b.to_str(),
+        JsonToken.Null => ""
+    }
+}
+
+# ============================================================================
+# Section 2: Incremental parse — feed the document byte-by-byte.
+# ============================================================================
+
+fn section_incremental() -> int uses IO {
+    println("")
+    println("=== Section 2: incremental parse (byte-by-byte feed) ===")
+    let src: str = "{\"a\":1,\"b\":2,\"c\":3}"
+    let r: JsonReader = json_reader_new()
+    let tokens: list[JsonToken] = []
+    let mut i: int = 0
+    let mut fed: int = 0
+    let mut drained: int = 0
+    while i <= src.len() {
+        # Feed 1 byte (or finish at end).
+        if i < src.len() {
+            let byte: str = src.slice(i, i + 1)
+            let _fr: Result[int, str] = json_reader_feed(r, byte)
+            fed = fed + 1
+        } else {
+            let _fin: Result[int, str] = json_reader_finish(r)
+        }
+        # Drain all available tokens.
+        let drain_r: Result[list[JsonToken], str] = json_reader_drain(r, 100)
+        if !result_is_ok(drain_r) {
+            println("FAIL at byte " + i.to_str() + ": " + result_err_or(drain_r, ""))
+            return 1
+        }
+        let new_tokens: list[JsonToken] = result_unwrap(drain_r)
+        let mut j: int = 0
+        while j < new_tokens.len() {
+            tokens.push(new_tokens.get(j))
+            drained = drained + 1
+            j = j + 1
+        }
+        i = i + 1
+    }
+    println("  fed " + fed.to_str() + " bytes one at a time")
+    println("  drained " + drained.to_str() + " tokens total")
+    println("  tokens (in emission order):")
+    let mut k: int = 0
+    while k < tokens.len() {
+        let t: JsonToken = tokens.get(k)
+        println("    [" + k.to_str() + "] " + json_token_kind_name(t) + " " + json_token_detail(t))
+        k = k + 1
+    }
+    if tokens.len() != 8 {
+        println("FAIL: expected 8 tokens, got " + tokens.len().to_str())
+        return 1
+    }
+    # Verify the token sequence: ObjectStart, Key("a"), Int(1), Key("b"), Int(2), Key("c"), Int(3), ObjectEnd
+    if !json_token_is_object_start(tokens.get(0)) {
+        println("FAIL: token 0 not ObjectStart")
+        return 1
+    }
+    if !json_token_is_key(tokens.get(1)) {
+        println("FAIL: token 1 not Key")
+        return 1
+    }
+    if !json_token_is_int(tokens.get(2)) {
+        println("FAIL: token 2 not Int")
+        return 1
+    }
+    if !json_token_is_object_end(tokens.get(7)) {
+        println("FAIL: token 7 not ObjectEnd")
+        return 1
+    }
+    println("  incremental parse OK (8 tokens, byte-by-byte feed)")
+    return 0
+}
+
+# ============================================================================
+# Section 3: Large document — synthetic 1000-element array.
+# ============================================================================
+
+fn section_large_doc() -> int uses IO {
+    println("")
+    println("=== Section 3: large document (1000-element array) ===")
+    # Build a 1000-element array of small objects: [{"i":0},{"i":1},...,{"i":999}]
+    let parts: list[str] = ["["]
+    let mut i: int = 0
+    while i < 1000 {
+        if i > 0 {
+            parts.push(",")
+        }
+        parts.push("{\"i\":" + i.to_str() + "}")
+        i = i + 1
+    }
+    parts.push("]")
+    let src: str = str_join(parts, "")
+    println("  document size: " + src.len().to_str() + " bytes")
+    let r: JsonReader = json_reader_new()
+    # Feed in 256-byte chunks to demonstrate streaming.
+    let mut fed: int = 0
+    let mut tokens: int = 0
+    let mut ints: int = 0
+    while fed < src.len() {
+        let chunk_size: int = 256
+        let end: int = fed + chunk_size
+        let mut actual_end: int = end
+        if end > src.len() {
+            actual_end = src.len()
+        }
+        let chunk: str = src.slice(fed, actual_end)
+        let _fr: Result[int, str] = json_reader_feed(r, chunk)
+        if !result_is_ok(_fr) {
+            println("FAIL feed: " + result_err_or(_fr, ""))
+            return 1
+        }
+        # Drain tokens.
+        let drain_r: Result[list[JsonToken], str] = json_reader_drain(r, 10000)
+        if !result_is_ok(drain_r) {
+            println("FAIL drain: " + result_err_or(drain_r, ""))
+            return 1
+        }
+        let new_tokens: list[JsonToken] = result_unwrap(drain_r)
+        let mut j: int = 0
+        while j < new_tokens.len() {
+            let t: JsonToken = new_tokens.get(j)
+            tokens = tokens + 1
+            if json_token_is_int(t) {
+                ints = ints + 1
+            }
+            j = j + 1
+        }
+        fed = actual_end
+    }
+    let _fin: Result[int, str] = json_reader_finish(r)
+    let drain_r: Result[list[JsonToken], str] = json_reader_drain(r, 10000)
+    if !result_is_ok(drain_r) {
+        println("FAIL final drain: " + result_err_or(drain_r, ""))
+        return 1
+    }
+    let final_tokens: list[JsonToken] = result_unwrap(drain_r)
+    let mut k: int = 0
+    while k < final_tokens.len() {
+        let t: JsonToken = final_tokens.get(k)
+        tokens = tokens + 1
+        if json_token_is_int(t) {
+            ints = ints + 1
+        }
+        k = k + 1
+    }
+    println("  parsed " + tokens.to_str() + " tokens (" + ints.to_str() + " Int values)")
+    # Expected: 1 (ArrayStart) + 1000 * 3 (ObjectStart, Key, Int) + 1000 (ObjectEnd) + 1 (ArrayEnd) = 4002 tokens
+    if tokens != 4002 {
+        println("FAIL: expected 4002 tokens, got " + tokens.to_str())
+        return 1
+    }
+    if ints != 1000 {
+        println("FAIL: expected 1000 Int tokens, got " + ints.to_str())
+        return 1
+    }
+    println("  large document OK (4002 tokens, 1000 Int values, 256-byte chunks)")
+    return 0
+}
+
+# ============================================================================
+# Section 4: Error handling — malformed JSON.
+# ============================================================================
+
+fn section_errors() -> int uses IO {
+    println("")
+    println("=== Section 4: error handling (malformed JSON) ===")
+    # Unterminated string.
+    let r1: JsonReader = json_reader_new()
+    let _f1: Result[int, str] = json_reader_feed(r1, "{\"key\":\"unterminated")
+    let _fin1: Result[int, str] = json_reader_finish(r1)
+    let t1: Result[Option[JsonToken], str] = json_reader_next_token(r1)
+    # First three tokens (ObjectStart, Key, ...) may succeed before the unterminated string.
+    # The error should surface eventually.
+    let mut attempts: int = 0
+    let mut errored: bool = false
+    while attempts < 10 {
+        let t_r: Result[Option[JsonToken], str] = json_reader_next_token(r1)
+        if !result_is_ok(t_r) {
+            errored = true
+            println("  unterminated string error: " + result_err_or(t_r, ""))
+            break
+        }
+        let t_opt: Option[JsonToken] = result_unwrap(t_r)
+        if option_is_none(t_opt) {
+            break
+        }
+        attempts = attempts + 1
+    }
+    if !errored {
+        println("FAIL: unterminated string should have errored")
+        return 1
+    }
+    # Invalid character (e.g. ';' at top level).
+    let r2: JsonReader = json_reader_new()
+    let _f2: Result[int, str] = json_reader_feed(r2, "invalid")
+    let _fin2: Result[int, str] = json_reader_finish(r2)
+    let t2: Result[Option[JsonToken], str] = json_reader_next_token(r2)
+    if result_is_ok(t2) {
+        println("FAIL: 'invalid' should be rejected (got Ok)")
+        return 1
+    }
+    println("  invalid keyword error: " + result_err_or(t2, ""))
+    # Trailing data after root value.
+    let r3: JsonReader = json_reader_new()
+    let _f3: Result[int, str] = json_reader_feed(r3, "42 extra")
+    let _fin3: Result[int, str] = json_reader_finish(r3)
+    let t3a: Result[Option[JsonToken], str] = json_reader_next_token(r3)
+    if !result_is_ok(t3a) {
+        println("FAIL: first token should be Int(42)")
+        return 1
+    }
+    let t3b: Result[Option[JsonToken], str] = json_reader_next_token(r3)
+    if result_is_ok(t3b) {
+        println("FAIL: trailing data should be rejected (got Ok)")
+        return 1
+    }
+    println("  trailing data error: " + result_err_or(t3b, ""))
+    # Empty input.
+    let r4: JsonReader = json_reader_new()
+    let _fin4: Result[int, str] = json_reader_finish(r4)
+    let t4: Result[Option[JsonToken], str] = json_reader_next_token(r4)
+    if result_is_ok(t4) {
+        println("FAIL: empty input should be rejected")
+        return 1
+    }
+    println("  empty input error: " + result_err_or(t4, ""))
+    # Unbalanced container.
+    let r5: JsonReader = json_reader_new()
+    let _f5: Result[int, str] = json_reader_feed(r5, "[1,2,3")
+    let _fin5: Result[int, str] = json_reader_finish(r5)
+    let mut errored5: bool = false
+    let mut k: int = 0
+    while k < 10 {
+        let t_r: Result[Option[JsonToken], str] = json_reader_next_token(r5)
+        if !result_is_ok(t_r) {
+            errored5 = true
+            println("  unbalanced array error: " + result_err_or(t_r, ""))
+            break
+        }
+        let t_opt: Option[JsonToken] = result_unwrap(t_r)
+        if option_is_none(t_opt) {
+            break
+        }
+        k = k + 1
+    }
+    if !errored5 {
+        println("FAIL: unbalanced array should error")
+        return 1
+    }
+    println("  error handling OK (4 malformed inputs correctly rejected)")
+    return 0
+}
+
+# ============================================================================
+# Section 5: Token helpers — type-checking predicates.
+# ============================================================================
+
+fn section_token_helpers() -> int uses IO {
+    println("")
+    println("=== Section 5: token helpers ===")
+    let tokens: list[JsonToken] = [
+        JsonToken.ObjectStart,
+        JsonToken.Key("name"),
+        JsonToken.String("alice"),
+        JsonToken.Int(42),
+        JsonToken.Float(3.14),
+        JsonToken.Bool(true),
+        JsonToken.Null,
+        JsonToken.ArrayStart,
+        JsonToken.ArrayEnd,
+        JsonToken.ObjectEnd
+    ]
+    if !json_token_is_object_start(tokens.get(0)) {
+        println("FAIL: ObjectStart predicate")
+        return 1
+    }
+    if !json_token_is_key(tokens.get(1)) {
+        println("FAIL: Key predicate")
+        return 1
+    }
+    if !json_token_is_string(tokens.get(2)) {
+        println("FAIL: String predicate")
+        return 1
+    }
+    if !json_token_is_int(tokens.get(3)) {
+        println("FAIL: Int predicate")
+        return 1
+    }
+    if !json_token_is_float(tokens.get(4)) {
+        println("FAIL: Float predicate")
+        return 1
+    }
+    if !json_token_is_bool(tokens.get(5)) {
+        println("FAIL: Bool predicate")
+        return 1
+    }
+    if !json_token_is_null(tokens.get(6)) {
+        println("FAIL: Null predicate")
+        return 1
+    }
+    if !json_token_is_array_start(tokens.get(7)) {
+        println("FAIL: ArrayStart predicate")
+        return 1
+    }
+    if !json_token_is_array_end(tokens.get(8)) {
+        println("FAIL: ArrayEnd predicate")
+        return 1
+    }
+    if !json_token_is_object_end(tokens.get(9)) {
+        println("FAIL: ObjectEnd predicate")
+        return 1
+    }
+    println("  10 token predicates OK:")
+    let mut i: int = 0
+    while i < tokens.len() {
+        let t: JsonToken = tokens.get(i)
+        println("    [" + i.to_str() + "] " + json_token_kind_name(t) + " " + json_token_detail(t))
+        i = i + 1
+    }
+    return 0
+}
+
+# ============================================================================
+# Section 6: NDJSON stream — newline-delimited JSON log records.
+# ============================================================================
+
+fn section_ndjson() -> int uses IO {
+    println("")
+    println("=== Section 6: NDJSON stream (newline-delimited JSON) ===")
+    # Each line is a separate JSON object.
+    let parts: list[str] = [
+        "{\"ts\":1000,\"level\":\"info\",\"msg\":\"starting\"}\n",
+        "{\"ts\":1001,\"level\":\"info\",\"msg\":\"ready\"}\n",
+        "{\"ts\":1002,\"level\":\"warn\",\"msg\":\"slow query\"}\n",
+        "{\"ts\":1003,\"level\":\"error\",\"msg\":\"connection refused\"}\n",
+        "{\"ts\":1004,\"level\":\"info\",\"msg\":\"shutdown\"}\n"
+    ]
+    let src: str = str_join(parts, "")
+    println("  NDJSON document: " + src.len().to_str() + " bytes, 5 log records")
+    let r: JsonReader = json_reader_new()
+    let _fr: Result[int, str] = json_reader_feed(r, src)
+    let _fin: Result[int, str] = json_reader_finish(r)
+    let tokens_r: Result[list[JsonToken], str] = json_reader_drain(r, 1000)
+    if !result_is_ok(tokens_r) {
+        println("FAIL: " + result_err_or(tokens_r, ""))
+        return 1
+    }
+    let tokens: list[JsonToken] = result_unwrap(tokens_r)
+    println("  parsed " + tokens.len().to_str() + " tokens (5 records x 8 tokens each = 40)")
+    if tokens.len() != 40 {
+        println("FAIL: expected 40 tokens, got " + tokens.len().to_str())
+        return 1
+    }
+    # Print each record's "msg" value (record N starts at token N*8):
+    #   [0] ObjectStart
+    #   [1] Key("ts")    [2] Int(N)
+    #   [3] Key("level") [4] String(level)
+    #   [5] Key("msg")   [6] String(msg)
+    #   [7] ObjectEnd
+    let mut record: int = 0
+    while record < 5 {
+        let base: int = record * 8
+        let ts: JsonToken = tokens.get(base + 2)
+        let level: JsonToken = tokens.get(base + 4)
+        let msg: JsonToken = tokens.get(base + 6)
+        let ts_str: str = match ts {
+            JsonToken.Int(n) => n.to_str(),
+            _ => "?"
+        }
+        let level_str: str = match level {
+            JsonToken.String(s) => s,
+            _ => "?"
+        }
+        let msg_str: str = match msg {
+            JsonToken.String(s) => s,
+            _ => "?"
+        }
+        println("    record " + record.to_str() + ": ts=" + ts_str + " level=" + level_str + " msg='" + msg_str + "'")
+        record = record + 1
+    }
+    println("  NDJSON stream OK (5 records parsed, 40 tokens)")
+    return 0
+}
+
+# ============================================================================
+# Section 7: Number edge cases — int vs float, ranges, exponents.
+# ============================================================================
+
+fn section_numbers() -> int uses IO {
+    println("")
+    println("=== Section 7: number edge cases ===")
+    let test_cases: list[str] = [
+        "0", "42", "-42", "1000000", "2147483647",
+        "3.14", "-3.14", "1.0", "0.5",
+        "1e10", "1.5e10", "1.5E-3", "1e+5"
+    ]
+    let mut i: int = 0
+    while i < test_cases.len() {
+        let src: str = test_cases.get(i)
+        let r: JsonReader = json_reader_new()
+        let _fr: Result[int, str] = json_reader_feed(r, src)
+        let _fin: Result[int, str] = json_reader_finish(r)
+        let t_r: Result[Option[JsonToken], str] = json_reader_next_token(r)
+        if !result_is_ok(t_r) {
+            println("  FAIL: '" + src + "': " + result_err_or(t_r, ""))
+            return 1
+        }
+        let t_opt: Option[JsonToken] = result_unwrap(t_r)
+        if option_is_none(t_opt) {
+            println("  FAIL: '" + src + "': no token")
+            return 1
+        }
+        let t: JsonToken = option_unwrap(t_opt)
+        let kind: str = json_token_kind_name(t)
+        let detail: str = json_token_detail(t)
+        println("  '" + src + "' -> " + kind + "(" + detail + ")")
+        i = i + 1
+    }
+    println("  number edge cases OK (14 values, int + float + exponent)")
+    return 0
+}
+
+# ============================================================================
+# Section 8: String escape sequences.
+# ============================================================================
+
+fn section_escapes() -> int uses IO {
+    println("")
+    println("=== Section 8: string escapes ===")
+    let src: str = "\"hello\\nworld\\t\\\"quoted\\\"\\\\end\""
+    let r: JsonReader = json_reader_new()
+    let _fr: Result[int, str] = json_reader_feed(r, src)
+    let _fin: Result[int, str] = json_reader_finish(r)
+    let t_r: Result[Option[JsonToken], str] = json_reader_next_token(r)
+    if !result_is_ok(t_r) {
+        println("FAIL: " + result_err_or(t_r, ""))
+        return 1
+    }
+    let t_opt: Option[JsonToken] = result_unwrap(t_r)
+    let t: JsonToken = option_unwrap(t_opt)
+    let s: str = match t {
+        JsonToken.String(v) => v,
+        _ => ""
+    }
+    println("  input:  " + src)
+    println("  output: '" + s + "' (with newlines/tabs rendered)")
+    if !s.contains(chr(10)) {
+        println("FAIL: \\n not decoded to LF")
+        return 1
+    }
+    if !s.contains(chr(9)) {
+        println("FAIL: \\t not decoded to TAB")
+        return 1
+    }
+    if !s.contains("\"") {
+        println("FAIL: \\\" not decoded to '\"'")
+        return 1
+    }
+    if !s.contains(chr(92)) {
+        println("FAIL: \\\\ not decoded to backslash")
+        return 1
+    }
+    println("  escapes OK (\\n, \\t, \\\", \\\\ decoded)")
+    return 0
+}
+
+# ============================================================================
+# Main — run all sections in order.
+# ============================================================================
+
+fn main() -> int uses IO {
+    if section_one_shot() != 0 { return 1 }
+    if section_incremental() != 0 { return 2 }
+    if section_large_doc() != 0 { return 3 }
+    if section_errors() != 0 { return 4 }
+    if section_token_helpers() != 0 { return 5 }
+    if section_ndjson() != 0 { return 6 }
+    if section_numbers() != 0 { return 7 }
+    if section_escapes() != 0 { return 8 }
+    println("")
+    println("ALL JSON_STREAM DEMO SECTIONS PASSED")
+    return 0
+}

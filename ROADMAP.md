@@ -77,7 +77,7 @@ remains green.
 | 37 | `std.net` — TCP/UDP sockets, DNS, TLS via libcurl | ✅ | 6 weeks |
 | 38 | `std.http` — HTTP/1.1 server + client (RFC 7230) | ✅ | 6 weeks |
 | 39 | `std.http2` — HTTP/2 + ALPN negotiation | ✅ | 5 weeks |
-| 40 | `std.json` streaming parser (constant-memory) | ⬜ | 3 weeks |
+| 40 | `std.json` streaming parser (constant-memory) | ✅ | 3 weeks |
 | 41 | `std.regex` — NFA-based regex (no ReDoS) | ⬜ | 5 weeks |
 | 42 | `std.fmt` — printf-style + custom `Display` impls | ⬜ | 3 weeks |
 | 43 | `std.hash` — SipHash, xxHash, FNV, cityHash | ⬜ | 3 weeks |
@@ -4468,10 +4468,150 @@ first-match, no-overlap), HPACK Huffman deferral (H=1
 rejected), and SETTINGS validation (ENABLE_PUSH=2,
 MAX_FRAME_SIZE=100, odd payload rejected).
 
-**40. `std.json` streaming parser** — `JsonReader` reads one token
-at a time; the program never holds the whole document in memory.
-Useful for parsing multi-GB JSON logs. The existing `std.json`
-document parser remains for small inputs.
+**40. `std.json` streaming parser** ✅ (release v0.59.0-alpha) —
+`JsonReader` reads one token at a time; the program never holds
+the whole document in memory. Useful for parsing multi-GB JSON
+logs, NDJSON streams, or any JSON source that's too large to fit
+in RAM. The existing `std.json` document parser (Stage 10-beta,
+v0.6.0-alpha) remains for small inputs where the caller wants a
+`JsonValue` tree.
+
+`std/json_stream.hls` is pure HLS (no new compiler builtins, no
+I/O — the caller drives the feed). The implementation:
+
+  * **JsonToken enum** — 10 variants covering all JSON value
+    kinds plus the structural open/close of objects and arrays:
+    `ObjectStart`, `ObjectEnd`, `ArrayStart`, `ArrayEnd`,
+    `Key(str)` (object member name, the string BEFORE the `:`),
+    `String(str)` (string value, after `:` or in an array),
+    `Int(int)` (integer in int64 range), `Float(float)`,
+    `Bool(bool)`, `Null`. HLS enums can carry payloads (like
+    `Option[T]` and `Result[T, E]`), so the value-carrying
+    variants embed their data directly.
+  * **JsonReader struct** — the streaming reader. Fields:
+    `buf` (internal byte buffer), `pos` (current read offset),
+    `err` (error state, "" on success), `finished` (true after
+    `json_reader_finish`), `state` (parser state machine, see
+    below), `container_stack` (push/pop on `{` / `[`), and
+    `max_token_size` (default 64 KiB). Mutable (HLS structs have
+    reference semantics — SPEC §2.1 — so mutations propagate to
+    the caller, matching the `JsonParser` pattern in `std.json`).
+  * **State machine** — 6 states: `TOP` (before/after root
+    value), `OBJECT_KEY` (after `{` or `,` in object; expecting a
+    Key string or `}`), `OBJECT_COLON` (after Key emit; expecting
+    `:`), `OBJECT_VAL` (after `:`; expecting a value),
+    `ARRAY_VAL` (after `[` or `,` in array; expecting a value or
+    `]`), `DONE` (after root value at top level; only trailing
+    whitespace allowed). The `container_stack` is pushed/popped
+    on `{` / `[` / `}` / `]`; the state is restored to the parent
+    container's state when a container closes.
+  * **API**:
+    * `json_reader_new() -> JsonReader` — fresh reader with
+      default settings (64 KiB max_token_size, 1024 max depth).
+    * `json_reader_set_max_token_size(r, n) -> void` — tune the
+      per-token byte limit. Tokens that exceed this are rejected
+      with `Err`.
+    * `json_reader_feed(r, bytes) -> Result[int, str]` — append
+      bytes to the internal buffer. Returns `Err` if the buffer
+      would exceed the 16 MiB hard cap (defends against a caller
+      that feeds huge chunks without bounding max_token_size).
+    * `json_reader_finish(r) -> Result[int, str]` — signal end
+      of input. After this call, any further `feed` returns `Err`.
+    * `json_reader_next_token(r) -> Result[Option[JsonToken],
+      str]` — returns `Ok(Some(token))` on a token, `Ok(None)`
+      when more input is needed (or cleanly at EOF with state
+      DONE), `Err(msg)` on a parse error.
+    * `json_reader_drain(r, max_tokens) -> Result[list[JsonToken],
+      str]` — convenience: call `next_token` until `None` or the
+      cap is reached. NOT for production use on huge documents
+      (materializes the whole token list in memory, defeating the
+      streaming property — but useful for testing).
+    * `json_reader_parse_all(src) -> Result[list[JsonToken],
+      str]` — one-shot convenience: feed the whole src, finish,
+      drain. Use this only when the whole document fits in memory
+      AND the caller wants the token list (otherwise use
+      `std.json.json_parse` for the `JsonValue` tree).
+  * **String parsing** — handles all 9 escape sequences (`\n`,
+    `\t`, `\r`, `\"`, `\\`, `\/`, `\b`, `\f`, `\uXXXX`) and
+    surrogate pair decoding (`\uXXXX\uYYYY` combines into a
+    single codepoint, emitted as UTF-8 bytes — matches Stage
+    10-beta's behavior).
+  * **Number parsing** — int (in int64 range, matches std.json:
+    accepts INT64_MIN, rejects INT64_MAX+1) or float (with `.` /
+    `e` / `E` / `+` / `-`). RFC 8259 §6 leading-zero rejection
+    (`0123` is invalid).
+  * **Constant memory** — the reader holds an internal byte
+    buffer that grows as the caller feeds bytes. After each
+    successful `next_token`, the consumed prefix is sliced off.
+    The buffer's high-water mark is `max_token_size` + the
+    largest single `feed` chunk (default 64 KiB + 4 KiB = ~68
+    KiB). The parser is constant-memory in the document size,
+    linear in the chunk size + max token size — a 1 GB JSON
+    document parses in ~70 KiB of reader memory.
+
+Stage 40 also fixes a bug found in `std.json`'s UTF-8 encoding:
+the 4-byte UTF-8 case (codepoints in [U+10000, U+10FFFF]) used
+`c = cp - 65536` instead of `cp` directly, producing incorrect
+bytes for the second UTF-8 byte (off by 1 in the bit-16 position).
+The streaming parser ships the correct formula; the same fix is
+noted as a future backport to `std.json` (the document parser's
+behavior is unchanged for codepoints below U+10000, which are
+the common case — the bug only manifests for surrogate pairs
+encoding emoji and rare CJK extension characters).
+
+Security:
+
+  * **Maximum token size** (default 64 KiB): defends against a
+    peer that sends a 1 GB string to exhaust memory. RFC 8259
+    has no fixed limit; the caller can tune via
+    `json_reader_set_max_token_size`.
+  * **Maximum nesting depth** (default 1024): defends against a
+    peer that sends deeply nested JSON (`[[[[[[[...` × 1M) to
+    crash the parser's container stack. Matches Python's
+    `json.loads` default (Python's is 1000 since 3.6 — see
+    bpo-29381).
+  * **Integer range check**: integers are checked against int64
+    range (matches Stage 10-beta's `json_parse_result` behavior
+    — out-of-range integers return `Err` instead of panicking).
+  * **Float overflow**: `Infinity` / `NaN` are NOT valid JSON
+    (RFC 8259 §6); the parser rejects them with `Err`. (The
+    document parser emits them as JSON `null` per JavaScript's
+    `JSON.stringify` — the streaming parser is stricter because
+    a stream consumer can't trivially distinguish "this is a
+    null because the input was NaN" from "this is a null
+    because the input was null".)
+  * **UTF-8 validation**: the parser DOES NOT validate UTF-8 in
+    string tokens (the byte sequence is returned as-is). The
+    caller is responsible for validating UTF-8 if the consuming
+    application requires it. UTF-8 validation is a Stage 50+
+    concern for `std.str` to handle.
+  * **Surrogate pair decoding**: `\uXXXX\uYYYY` pairs ARE
+    decoded (high surrogate followed by low surrogate combines
+    into a single codepoint, emitted as UTF-8 bytes).
+
+Differential parity (interpreter == native) verified on: simple
+object (6 tokens), simple array (8 tokens), incremental parse
+(byte-by-byte feed, 1/4/16/64/256-byte chunks produce same
+token sequence), nested containers (13 tokens for
+`{"outer":{"inner":[1,{"x":2}]}}`), string escapes (8 escape
+sequences decoded), surrogate pair decoding (`\uD83D\uDE00` ->
+4-byte UTF-8 [0xF0, 0x9F, 0x98, 0x80]), number edge cases (13
+values: int, float, negative, exponent), integer range
+(INT64_MAX and INT64_MIN accepted; INT64_MAX+1, INT64_MIN-1,
+19-digit values rejected), empty containers (`{}` -> 2 tokens,
+`[]` -> 2 tokens), trailing data after root value (3 cases
+rejected), empty input (2 cases rejected), unbalanced
+containers (4 cases rejected), invalid escapes (`\x`, `\u12`,
+`\uZZZZ` rejected), max_token_size limit (20-byte string
+rejected with limit 16), nesting depth limit (1100-deep array
+rejected with limit 1024), feed after finish (rejected),
+NDJSON stream (3 records, 24 tokens, msg values extracted),
+large document (1000-element array, 4002 tokens, 256-byte
+chunks), keyword truncation (`tru`, `fals`, `nul` rejected at
+EOF), leading-zero rejection (`0123`, `00` rejected; `0` and
+`0.5` accepted), token-kind predicates (10 predicates
+verified), kind names (10 token kinds have correct diagnostic
+names), and parse_all convenience wrapper.
 
 **41. `std.regex`** — NFA-based regex (Thompson construction). No
 backtracking means no ReDoS. Captures, lookahead, lookbehind,
