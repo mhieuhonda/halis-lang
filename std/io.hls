@@ -1,0 +1,755 @@
+# ============================================================================
+# std/io.hls — Stage 35 (v0.54.0-alpha): buffered I/O traits + Cursor + Chain
+# ----------------------------------------------------------------------------
+# This module is the first user of the `trait` keyword (reserved since
+# v0.20.0-alpha). Because the trait *dispatch* machinery arrives in a later
+# stage, this module establishes the *convention* that the language's
+# trait system will formalise:
+#
+#   READ trait:
+#     read_byte(mut self) -> Option[int]   # None at EOF
+#     read_str(mut self, n: int) -> str    # short read at EOF
+#     position(self)        -> int
+#     length(self)          -> int
+#     remaining(self)       -> int
+#
+#   WRITE trait:
+#     write_byte(mut self, b: int)  -> void
+#     write_str (mut self, s: str)  -> void
+#     flush     (mut self)          -> void   # no-op for in-memory sinks
+#
+# All concrete types in this module (Cursor, BufReader, BufWriter, Chain)
+# implement these contracts via `impl` blocks. Until trait dispatch is
+# implemented, callers use the concrete type directly (the same pattern
+# used by std/list.hls: monomorphic helpers per concrete type). When
+# trait dispatch arrives, every `impl Read for X` will already be in
+# place — only the `trait Read { ... }` declaration needs to be added
+# at the top, and existing call sites will start working polymorphically.
+#
+# Type-safe by construction:
+#   - BufReader / BufWriter take a *clean* `str` path (not `tainted[str]`).
+#     The caller must sanitise before construction (use std.sanitize or
+#     std.fs.Path). The Fs effect on `flush` and on `BufReader.new_from_file`
+#     propagates through the checker, so a function that uses them must
+#     declare `uses Fs`.
+#   - Cursor and Chain are pure (no `uses IO/Fs`); they are in-memory.
+# ============================================================================
+
+import "std.option"
+import "std.str"
+
+# ============================================================================
+# Cursor — in-memory reader/writer over a byte buffer (HLS `str`).
+# ----------------------------------------------------------------------------
+# A `Cursor` wraps a `str` and tracks a read/write position. Reads advance
+# the position; writes *append* to the buffer (the buffer is not pre-sized,
+# because HLS `str` is immutable — the "write" produces a fresh `str`).
+#
+# The name follows Rust's `std::io::Cursor<T>` convention: a cursor is a
+# memory-backed Read+Write that is the simplest possible implementation
+# of both traits. Use it for unit tests, in-memory pipelines, and as the
+# building block for `Chain`.
+# ============================================================================
+
+struct Cursor {
+    buf: str,
+    pos: int
+}
+
+# cursor_new(s) — create a Cursor over s, with position 0.
+fn cursor_new(s: str) -> Cursor {
+    return Cursor { buf: s, pos: 0 }
+}
+
+# cursor_empty() — create a Cursor over an empty buffer. Useful as a sink
+# for BufWriter-style accumulation when you don't yet have data.
+fn cursor_empty() -> Cursor {
+    return Cursor { buf: "", pos: 0 }
+}
+
+impl Cursor {
+    # ---- READ trait ----
+
+    # read_byte() — return Some(b) and advance, or None at EOF.
+    fn read_byte(mut self: Cursor) -> Option[int] {
+        if self.pos >= self.buf.len() {
+            return Option.None
+        }
+        let b: int = self.buf.byte_at(self.pos)
+        self.pos = self.pos + 1
+        return Option.Some(b)
+    }
+
+    # read_str(n) — return up to n bytes starting at the current position.
+    # Returns a short read (possibly empty) at EOF. n <= 0 returns "".
+    # Does NOT panic on n > remaining — short-reads are the EOF contract.
+    fn read_str(mut self: Cursor, n: int) -> str {
+        if n <= 0 {
+            return ""
+        }
+        let avail: int = self.buf.len() - self.pos
+        let mut take_n: int = n
+        if take_n > avail {
+            take_n = avail
+        }
+        let s: str = self.buf.slice(self.pos, self.pos + take_n)
+        self.pos = self.pos + take_n
+        return s
+    }
+
+    # read_until(byte) — read up to and INCLUDING the first occurrence of
+    # `byte`, or to EOF if no occurrence is found. Useful for line-oriented
+    # protocols (read_until(10 /* \n */) reads one line including the \n).
+    fn read_until(mut self: Cursor, byte: int) -> str {
+        let mut i: int = self.pos
+        let n: int = self.buf.len()
+        let mut found: bool = false
+        while i < n {
+            if self.buf.byte_at(i) == byte {
+                i = i + 1
+                found = true
+                break
+            }
+            i = i + 1
+        }
+        let s: str = self.buf.slice(self.pos, i)
+        self.pos = i
+        return s
+    }
+
+    # read_line() — read one line (without the trailing newline). Returns
+    # "" at EOF. Strips both \n and \r\n terminators. The position is
+    # advanced PAST the newline (so subsequent calls return successive
+    # lines).
+    fn read_line(mut self: Cursor) -> str {
+        let raw: str = self.read_until(10)
+        if raw.len() == 0 {
+            return ""
+        }
+        # Strip trailing \n
+        let mut end: int = raw.len()
+        if raw.byte_at(end - 1) == 10 {
+            end = end - 1
+        }
+        # Strip trailing \r (CRLF)
+        if end > 0 && raw.byte_at(end - 1) == 13 {
+            end = end - 1
+        }
+        return raw.slice(0, end)
+    }
+
+    # position() — current read position (bytes from start).
+    fn position(self: Cursor) -> int {
+        return self.pos
+    }
+
+    # length() — total buffer length in bytes.
+    fn length(self: Cursor) -> int {
+        return self.buf.len()
+    }
+
+    # remaining() — bytes still unread.
+    fn remaining(self: Cursor) -> int {
+        return self.buf.len() - self.pos
+    }
+
+    # is_eof() — true when no more bytes can be read.
+    fn is_eof(self: Cursor) -> bool {
+        return self.pos >= self.buf.len()
+    }
+
+    # peek_byte() — look at the next byte without advancing. Returns
+    # None at EOF.
+    fn peek_byte(self: Cursor) -> Option[int] {
+        if self.pos >= self.buf.len() {
+            return Option.None
+        }
+        return Option.Some(self.buf.byte_at(self.pos))
+    }
+
+    # seek(pos) — set the read position. Panics on negative pos or pos
+    # beyond the buffer length (matching Rust's Cursor::seek with
+    # SeekFrom::Start). This is the only way to "rewind" a Cursor.
+    fn seek(mut self: Cursor, pos: int) -> void {
+        if pos < 0 {
+            panic("Cursor.seek: negative position")
+        }
+        if pos > self.buf.len() {
+            panic("Cursor.seek: position past end of buffer")
+        }
+        self.pos = pos
+    }
+
+    # rewind() — equivalent to seek(0). Provided as a convenience because
+    # "rewind and re-read" is a common pattern for in-memory tests.
+    fn rewind(mut self: Cursor) -> void {
+        self.pos = 0
+    }
+
+    # buffer(self) — return a clone of the underlying buffer. Useful
+    # when the caller wants the whole content (e.g. for hashing). Does
+    # not advance the position.
+    fn buffer(self: Cursor) -> str {
+        return self.buf
+    }
+
+    # ---- WRITE trait ----
+    # Writes on a Cursor APPEND to the buffer (the position becomes the
+    # new end-of-buffer). This matches the semantics of a memory-backed
+    # sink: there is no fixed capacity, and the "position" after a write
+    # is at the new end.
+
+    # write_byte(b) — append one byte (b must be 0..255). Panics outside
+    # that range (matches chr()).
+    fn write_byte(mut self: Cursor, b: int) -> void {
+        if b < 0 || b > 255 {
+            panic("Cursor.write_byte: byte must be 0..255")
+        }
+        self.buf = self.buf + chr(b)
+        self.pos = self.buf.len()
+    }
+
+    # write_str(s) — append s to the buffer.
+    fn write_str(mut self: Cursor, s: str) -> void {
+        self.buf = self.buf + s
+        self.pos = self.buf.len()
+    }
+
+    # write_str_at(s, pos) — overwrite `s.len()` bytes starting at `pos`,
+    # without changing the buffer length. Panics if [pos, pos+s.len())
+    # exceeds the current buffer length. Useful for back-patching a header
+    # (e.g. a length prefix) after the body has been written.
+    fn write_str_at(mut self: Cursor, s: str, pos: int) -> void {
+        if pos < 0 {
+            panic("Cursor.write_str_at: negative position")
+        }
+        let end: int = pos + s.len()
+        if end > self.buf.len() {
+            panic("Cursor.write_str_at: write range exceeds buffer")
+        }
+        self.buf = self.buf.slice(0, pos) + s + self.buf.slice(end, self.buf.len())
+    }
+
+    # flush() — no-op for an in-memory cursor. Provided so the Write
+    # trait contract is uniformly callable on every Write type.
+    fn flush(mut self: Cursor) -> void {
+        return
+    }
+}
+
+# ============================================================================
+# BufReader — buffered reader over a file.
+# ----------------------------------------------------------------------------
+# A `BufReader` wraps a file path and lazily reads the entire file into an
+# in-memory buffer on construction (Stage 35 simplification: read-once,
+# not chunked). This is the simplest design that uses the existing
+# `read_file` builtin and supports the same `read_byte`/`read_str`/
+# `read_line` API as `Cursor`.
+#
+# Effect: BufReader.new_from_file carries Fs (it calls read_file). All
+# Read-trait methods are pure (they just slice the in-memory buffer).
+#
+# The `path` field is kept so the caller can introspect which file was
+# opened (e.g. for error messages).
+# ============================================================================
+
+struct BufReader {
+    path: str,
+    buf: str,
+    pos: int
+}
+
+# buf_reader_from_file(path) — open `path`, read its full contents into
+# memory, return a BufReader. Carries the Fs effect.
+fn buf_reader_from_file(path: str) -> BufReader uses Fs {
+    let content: str = read_file(path)
+    return BufReader { path: path, buf: content, pos: 0 }
+}
+
+# buf_reader_from_str(s) — wrap an already-loaded string in a BufReader.
+# The path is recorded as "<memory>" so error messages still have a
+# meaningful "source" identifier. This is the in-memory path that
+# avoids the Fs effect — useful for testing and for code that already
+# has the bytes (e.g. received via read_file_tainted + sanitised).
+fn buf_reader_from_str(s: str) -> BufReader {
+    return BufReader { path: "<memory>", buf: s, pos: 0 }
+}
+
+impl BufReader {
+    # ---- READ trait (mirrors Cursor) ----
+
+    fn read_byte(mut self: BufReader) -> Option[int] {
+        if self.pos >= self.buf.len() {
+            return Option.None
+        }
+        let b: int = self.buf.byte_at(self.pos)
+        self.pos = self.pos + 1
+        return Option.Some(b)
+    }
+
+    fn read_str(mut self: BufReader, n: int) -> str {
+        if n <= 0 {
+            return ""
+        }
+        let avail: int = self.buf.len() - self.pos
+        let mut take_n: int = n
+        if take_n > avail {
+            take_n = avail
+        }
+        let s: str = self.buf.slice(self.pos, self.pos + take_n)
+        self.pos = self.pos + take_n
+        return s
+    }
+
+    fn read_until(mut self: BufReader, byte: int) -> str {
+        let mut i: int = self.pos
+        let n: int = self.buf.len()
+        while i < n {
+            if self.buf.byte_at(i) == byte {
+                i = i + 1
+                break
+            }
+            i = i + 1
+        }
+        let s: str = self.buf.slice(self.pos, i)
+        self.pos = i
+        return s
+    }
+
+    fn read_line(mut self: BufReader) -> str {
+        let raw: str = self.read_until(10)
+        if raw.len() == 0 {
+            return ""
+        }
+        let mut end: int = raw.len()
+        if raw.byte_at(end - 1) == 10 {
+            end = end - 1
+        }
+        if end > 0 && raw.byte_at(end - 1) == 13 {
+            end = end - 1
+        }
+        return raw.slice(0, end)
+    }
+
+    fn position(self: BufReader) -> int {
+        return self.pos
+    }
+
+    fn length(self: BufReader) -> int {
+        return self.buf.len()
+    }
+
+    fn remaining(self: BufReader) -> int {
+        return self.buf.len() - self.pos
+    }
+
+    fn is_eof(self: BufReader) -> bool {
+        return self.pos >= self.buf.len()
+    }
+
+    fn peek_byte(self: BufReader) -> Option[int] {
+        if self.pos >= self.buf.len() {
+            return Option.None
+        }
+        return Option.Some(self.buf.byte_at(self.pos))
+    }
+
+    # path() — return the file path the reader was opened from. Useful
+    # for error messages.
+    fn path(self: BufReader) -> str {
+        return self.path
+    }
+
+    # buffer() — return a clone of the underlying buffer. Useful when
+    # the caller wants the whole content (e.g. for hashing).
+    fn buffer(self: BufReader) -> str {
+        return self.buf
+    }
+}
+
+# ============================================================================
+# BufWriter — buffered writer that accumulates writes in memory.
+# ----------------------------------------------------------------------------
+# A `BufWriter` accumulates writes in a `list[str]` of parts. `flush()`
+# concatenates the parts and writes them to the file specified at
+# construction. The `parts` list enables O(1) append per write — we
+# avoid the quadratic `out = out + s` accumulator by deferring the
+# join to flush time.
+#
+# Effect: only `flush()` carries Fs. The `write_*` methods are pure
+# (they mutate in-memory state only).
+# ============================================================================
+
+struct BufWriter {
+    path: str,
+    parts: list[str],
+    flushed: bool
+}
+
+# buf_writer_new(path) — create a BufWriter that will write to `path`
+# when flushed. The path is recorded but no I/O is performed until
+# flush(). The writer starts in the "flushed" state (no pending writes),
+# matching the documented contract of `is_flushed`.
+fn buf_writer_new(path: str) -> BufWriter {
+    return BufWriter { path: path, parts: [], flushed: true }
+}
+
+impl BufWriter {
+    # ---- WRITE trait ----
+
+    # write_byte(b) — append one byte (b must be 0..255).
+    fn write_byte(mut self: BufWriter, b: int) -> void {
+        if b < 0 || b > 255 {
+            panic("BufWriter.write_byte: byte must be 0..255")
+        }
+        self.parts.push(chr(b))
+        self.flushed = false
+    }
+
+    # write_str(s) — append s to the in-memory buffer.
+    fn write_str(mut self: BufWriter, s: str) -> void {
+        if s.len() > 0 {
+            self.parts.push(s)
+            self.flushed = false
+        }
+    }
+
+    # write_str_at(s, pos) — overwrite bytes at `pos`. BufWriter does not
+    # support random-access writes (the parts are an append-only log).
+    # This method exists so BufWriter has the same Write API as Cursor;
+    # it panics to make the limitation visible at the call site.
+    fn write_str_at(mut self: BufWriter, s: str, pos: int) -> void {
+        panic("BufWriter.write_str_at: random-access writes are not supported")
+    }
+
+    # flush() — join all parts and write the result to the file. After
+    # flush, the parts list is cleared and a subsequent flush() is a
+    # no-op (until more writes happen). Carries the Fs effect.
+    fn flush(mut self: BufWriter) -> void uses Fs {
+        if self.flushed {
+            return
+        }
+        let joined: str = str_join(self.parts, "")
+        write_file(self.path, joined)
+        self.parts = []
+        self.flushed = true
+    }
+
+    # ---- introspection ----
+
+    # path() — the destination file path.
+    fn path(self: BufWriter) -> str {
+        return self.path
+    }
+
+    # pending_len() — total bytes buffered but not yet flushed. Computed
+    # by summing the parts; O(n) but typically called only for tests.
+    fn pending_len(self: BufWriter) -> int {
+        let mut total: int = 0
+        let mut i: int = 0
+        while i < self.parts.len() {
+            total = total + self.parts.get(i).len()
+            i = i + 1
+        }
+        return total
+    }
+
+    # is_flushed() — true iff flush() has been called since the last
+    # write (or no writes have happened at all).
+    fn is_flushed(self: BufWriter) -> bool {
+        return self.flushed
+    }
+}
+
+# ============================================================================
+# Chain — concatenate multiple Cursor readers into one Read.
+# ----------------------------------------------------------------------------
+# A `Chain` is a sequence of `Cursor` readers. Reads proceed through
+# the first cursor until EOF, then automatically fall through to the
+# next. This is the Halis analogue of Rust's `Chain<T, U>` and Python's
+# `itertools.chain`.
+#
+# Stage 35 simplification: Chain is a sequence of *Cursor* (not arbitrary
+# Read). This avoids the trait-dispatch requirement and keeps the type
+# monomorphic. When trait dispatch lands, the field will become
+# `list[Read]` and the methods will become polymorphic.
+# ============================================================================
+
+struct Chain {
+    readers: list[Cursor],
+    cur_idx: int,
+    cur_pos: int
+}
+
+# chain_new(readers) — create a Chain over the given list of Cursors.
+# The list is consumed (moved) into the Chain; the caller must not
+# reuse it. Pass `clone(xs)` if you need to retain the original.
+fn chain_new(readers: list[Cursor]) -> Chain {
+    return Chain { readers: readers, cur_idx: 0, cur_pos: 0 }
+}
+
+# chain_empty() — create an empty Chain. Reads always return EOF.
+fn chain_empty() -> Chain {
+    return Chain { readers: [], cur_idx: 0, cur_pos: 0 }
+}
+
+impl Chain {
+    # ---- READ trait ----
+
+    # read_byte() — return Some(b) from the current cursor, advancing
+    # to the next cursor on EOF. Returns None when all cursors are
+    # exhausted.
+    fn read_byte(mut self: Chain) -> Option[int] {
+        # Advance through any EOF-reached cursors.
+        while self.cur_idx < self.readers.len() {
+            let cur: Cursor = self.readers.get(self.cur_idx)
+            if self.cur_pos < cur.length() {
+                let b: int = cur.buffer().byte_at(self.cur_pos)
+                self.cur_pos = self.cur_pos + 1
+                return Option.Some(b)
+            }
+            # Current cursor exhausted; move to next.
+            self.cur_idx = self.cur_idx + 1
+            self.cur_pos = 0
+        }
+        return Option.None
+    }
+
+    # read_str(n) — read up to n bytes, possibly spanning cursor
+    # boundaries. Returns a short read at end-of-chain.
+    fn read_str(mut self: Chain, n: int) -> str {
+        if n <= 0 {
+            return ""
+        }
+        let parts: list[str] = []
+        let mut remaining_n: int = n
+        while remaining_n > 0 && self.cur_idx < self.readers.len() {
+            let cur: Cursor = self.readers.get(self.cur_idx)
+            let avail: int = cur.length() - self.cur_pos
+            if avail == 0 {
+                self.cur_idx = self.cur_idx + 1
+                self.cur_pos = 0
+                continue
+            }
+            let mut take_n: int = remaining_n
+            if take_n > avail {
+                take_n = avail
+            }
+            parts.push(cur.buffer().slice(self.cur_pos, self.cur_pos + take_n))
+            self.cur_pos = self.cur_pos + take_n
+            remaining_n = remaining_n - take_n
+            if self.cur_pos >= cur.length() {
+                self.cur_idx = self.cur_idx + 1
+                self.cur_pos = 0
+            }
+        }
+        return str_join(parts, "")
+    }
+
+    # read_until(byte) — read up to and including the first occurrence of
+    # `byte`, possibly spanning cursor boundaries. If no occurrence is
+    # found, reads to end-of-chain.
+    fn read_until(mut self: Chain, byte: int) -> str {
+        let parts: list[str] = []
+        while self.cur_idx < self.readers.len() {
+            let cur: Cursor = self.readers.get(self.cur_idx)
+            let buf: str = cur.buffer()
+            let n: int = buf.len()
+            let mut i: int = self.cur_pos
+            let mut found: bool = false
+            while i < n {
+                if buf.byte_at(i) == byte {
+                    i = i + 1
+                    found = true
+                    break
+                }
+                i = i + 1
+            }
+            if i > self.cur_pos {
+                parts.push(buf.slice(self.cur_pos, i))
+            }
+            self.cur_pos = i
+            if found {
+                return str_join(parts, "")
+            }
+            self.cur_idx = self.cur_idx + 1
+            self.cur_pos = 0
+        }
+        return str_join(parts, "")
+    }
+
+    # position() — total bytes read so far (across all cursors). This
+    # is approximate — for chains, "position" is the count of bytes
+    # returned, not the offset in any one cursor. Useful for metrics.
+    fn position(self: Chain) -> int {
+        let mut total: int = 0
+        let mut i: int = 0
+        while i < self.cur_idx && i < self.readers.len() {
+            total = total + self.readers.get(i).length()
+            i = i + 1
+        }
+        return total + self.cur_pos
+    }
+
+    # length() — total length across all chained cursors. O(n) in the
+    # number of cursors (calls Cursor.length() on each).
+    fn length(self: Chain) -> int {
+        let mut total: int = 0
+        let mut i: int = 0
+        while i < self.readers.len() {
+            total = total + self.readers.get(i).length()
+            i = i + 1
+        }
+        return total
+    }
+
+    # remaining() — bytes still unread across all cursors. O(n).
+    fn remaining(self: Chain) -> int {
+        let total: int = self.length()
+        let pos: int = self.position()
+        return total - pos
+    }
+
+    # is_eof() — true when all cursors are exhausted.
+    fn is_eof(self: Chain) -> bool {
+        return self.cur_idx >= self.readers.len()
+    }
+
+    # num_readers() — number of cursors in the chain. Useful for tests.
+    fn num_readers(self: Chain) -> int {
+        return self.readers.len()
+    }
+}
+
+# ============================================================================
+# Convenience helpers — operate on any concrete Read type via the
+# method API. These are the "trait method" analogues: each is monomorphic
+# per concrete type (matching std/list.hls's convention). When trait
+# dispatch lands, these will be replaceable by a single polymorphic
+# helper.
+# ============================================================================
+
+# io_copy_to_str(src, max) — read up to `max` bytes from `src` and return
+# the concatenation. `max <= 0` returns "" (no read). Works on Cursor.
+fn io_copy_cursor_to_str(src: Cursor, max: int) -> str {
+    return src.read_str(max)
+}
+
+# io_copy_to_str_bufreader — same, for BufReader.
+fn io_copy_bufreader_to_str(src: BufReader, max: int) -> str {
+    return src.read_str(max)
+}
+
+# io_copy_to_str_chain — same, for Chain.
+fn io_copy_chain_to_str(src: Chain, max: int) -> str {
+    return src.read_str(max)
+}
+
+# io_read_all_cursor(src) — read the rest of the cursor into a str.
+fn io_read_all_cursor(src: Cursor) -> str {
+    return src.read_str(src.remaining())
+}
+
+# io_read_all_bufreader(src) — read the rest of the BufReader into a str.
+fn io_read_all_bufreader(src: BufReader) -> str {
+    return src.read_str(src.remaining())
+}
+
+# io_read_all_chain(src) — read the rest of the chain into a str.
+fn io_read_all_chain(src: Chain) -> str {
+    return src.read_str(src.remaining())
+}
+
+# io_read_lines_cursor(src) — read all remaining lines from a Cursor.
+# Returns a list[str], one per line, with terminators stripped. An empty
+# input returns an empty list. A trailing line without a terminator is
+# still returned (so "a\nb" yields ["a", "b"], not ["a", "b\n"]).
+fn io_read_lines_cursor(src: Cursor) -> list[str] {
+    let out: list[str] = []
+    let mut cur: Cursor = src
+    while !cur.is_eof() {
+        let line: str = cur.read_line()
+        if line.len() > 0 || !cur.is_eof() {
+            out.push(line)
+        }
+    }
+    return out
+}
+
+# io_read_lines_bufreader(src) — same as io_read_lines_cursor, for BufReader.
+fn io_read_lines_bufreader(src: BufReader) -> list[str] {
+    let out: list[str] = []
+    let mut cur: BufReader = src
+    while !cur.is_eof() {
+        let line: str = cur.read_line()
+        if line.len() > 0 || !cur.is_eof() {
+            out.push(line)
+        }
+    }
+    return out
+}
+
+# ============================================================================
+# Hex helpers — a common operation on byte streams is to hex-encode or
+# hex-decode. These belong in std/io because they convert between `str`
+# (a byte buffer) and a hex `str` representation, which is a frequent
+# I/O-adjacent operation (e.g. for digest output, byte-precise logging).
+# ============================================================================
+
+# io_to_hex(src) — read the rest of `src` and return the hex encoding
+# (lowercase). Each byte becomes two hex digits. Empty input -> "".
+fn io_to_hex(src: Cursor) -> str {
+    let data: str = io_read_all_cursor(src)
+    let out: list[str] = []
+    let mut i: int = 0
+    while i < data.len() {
+        let b: int = data.byte_at(i)
+        let hi: int = b / 16
+        let lo: int = b - (hi * 16)
+        out.push(_io_hex_nibble(hi))
+        out.push(_io_hex_nibble(lo))
+        i = i + 1
+    }
+    return str_join(out, "")
+}
+
+# io_from_hex(s) — decode a hex string into a Cursor. Panics on
+# odd length or non-hex characters. The result is a fresh Cursor
+# over the decoded bytes.
+fn io_from_hex(s: str) -> Cursor {
+    if s.len() % 2 != 0 {
+        panic("io_from_hex: odd-length input")
+    }
+    let out: list[str] = []
+    let mut i: int = 0
+    while i + 1 < s.len() {
+        let hi: int = _io_hex_value(s.byte_at(i))
+        let lo: int = _io_hex_value(s.byte_at(i + 1))
+        out.push(chr(hi * 16 + lo))
+        i = i + 2
+    }
+    return cursor_new(str_join(out, ""))
+}
+
+# _io_hex_nibble(n) — return the hex digit for n in 0..15.
+fn _io_hex_nibble(n: int) -> str {
+    if n < 10 {
+        return chr(48 + n)
+    }
+    return chr(87 + n)
+}
+
+# _io_hex_value(b) — return the numeric value of hex digit byte b.
+fn _io_hex_value(b: int) -> int {
+    if b >= 48 && b <= 57 {
+        return b - 48
+    }
+    if b >= 65 && b <= 70 {
+        return b - 55
+    }
+    if b >= 97 && b <= 102 {
+        return b - 87
+    }
+    panic("io_from_hex: non-hex character")
+    return 0
+}

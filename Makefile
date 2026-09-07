@@ -8,7 +8,7 @@ HLC     = src/hlc.hls
 BIN     = bin
 PREFIX  ?= /usr/local
 
-.PHONY: all stage0 bootstrap test examples clean run check bench install uninstall audit opt-stats emit-ir emit-llvm fmt lint lsp-check pkg-init pkg-add pkg-lock pkg-audit pkg-verify pkg-build pkg-publish pkg-log pkg-log-verify prove prove-full model prove-acceptance hltest fuzz cov fuzz-acceptance wasm-opt webapp webapp-acceptance serve aarch64-bench aarch64-acceptance aarch64-list-targets stack-acceptance inline-acceptance opt-stats-report kernel-attrs escape-acceptance layout-report tail-acceptance tail-report asm-acceptance asm-attrs bench-stdlib spec-check stage32-acceptance async-acceptance stream-acceptance
+.PHONY: all stage0 bootstrap test examples clean run check bench install uninstall audit opt-stats emit-ir emit-llvm fmt lint lsp-check pkg-init pkg-add pkg-lock pkg-audit pkg-verify pkg-build pkg-publish pkg-log pkg-log-verify prove prove-full model prove-acceptance hltest fuzz cov fuzz-acceptance wasm-opt webapp webapp-acceptance serve aarch64-bench aarch64-acceptance aarch64-list-targets stack-acceptance inline-acceptance opt-stats-report kernel-attrs escape-acceptance layout-report tail-acceptance tail-report asm-acceptance asm-attrs bench-stdlib spec-check stage32-acceptance async-acceptance stream-acceptance io-acceptance
 
 # Main goal: use the full bootstrap chain to build the native compiler
 all: bootstrap
@@ -1362,3 +1362,31 @@ stream-acceptance: bin/hlc
 	@echo "  differential (interpreter == native) verified green."
 
 .PHONY: stream-acceptance
+
+# ============================================================================
+# Stage 35 (v0.54.0-alpha): std.io -- buffered I/O traits + Cursor + Chain
+# ============================================================================
+io-acceptance: bin/hlc
+	@$(PYTHON) boot/boot.py examples/io_demo.hls > /tmp/io_interp.txt 2>&1
+	@bin/hlc examples/io_demo.hls /tmp/io_demo.c 2>/dev/null
+	@gcc -O2 -o /tmp/io_demo /tmp/io_demo.c -lm -pthread 2>/dev/null
+	@/tmp/io_demo > /tmp/io_nat.txt 2>&1
+	@diff -q /tmp/io_interp.txt /tmp/io_nat.txt >/dev/null 2>&1 \
+		|| (echo "FAIL: io_demo differential mismatch" && false)
+	@$(PYTHON) boot/boot.py tests/ok/feat_stage35_io.hls > /tmp/s35_interp.txt 2>&1
+	@bin/hlc tests/ok/feat_stage35_io.hls /tmp/s35.c 2>/dev/null
+	@gcc -O2 -o /tmp/s35 /tmp/s35.c -lm -pthread 2>/dev/null
+	@/tmp/s35 > /tmp/s35_nat.txt 2>&1
+	@diff -q /tmp/s35_interp.txt /tmp/s35_nat.txt >/dev/null 2>&1 \
+		|| (echo "FAIL: feat_stage35_io differential mismatch" && false)
+	@rm -f /tmp/halis_io_demo*.txt /tmp/halis_io_demo*.csv \
+		/tmp/halis_stage35_io_test.txt /tmp/halis_stage35_io_out.txt \
+		/tmp/halis_stage35_pipe.csv
+	@echo ""
+	@echo "ACCEPTANCE OK: Stage 35 -- std.io (Read/Write traits, BufReader, BufWriter, Cursor, Chain)"
+	@echo "  Cursor (in-memory Read+Write) / BufReader (file Read) /"
+	@echo "  BufWriter (buffered file Write+flush) / Chain (concat readers)"
+	@echo "  hex helpers (io_to_hex / io_from_hex)"
+	@echo "  differential (interpreter == native) verified green."
+
+.PHONY: io-acceptance

@@ -13,6 +13,91 @@ stability (125–140), and final stabilisation toward v1.0 (141–150).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
+## [v0.54.0-alpha] — Stage 35: std.io (Read/Write traits + BufReader/BufWriter + Cursor + Chain)
+
+> Adds `std/io.hls` — the first module of Phase III (stdlib expansion)
+> — establishing the `Read` and `Write` trait contracts and providing
+> four concrete implementations: `Cursor` (in-memory Read + Write),
+> `BufReader` (file-backed Read), `BufWriter` (buffered file Write +
+> flush), and `Chain` (concatenate multiple readers). Also adds two
+> I/O-adjacent hex helpers (`io_to_hex`, `io_from_hex`) and monomorphic
+> line/all readers for each concrete type. The trait *dispatch*
+> machinery arrives in a later stage; this stage establishes the
+> *convention* (every `impl Read for X` is in place — only the `trait
+> Read { ... }` declaration needs to be added when dispatch lands).
+
+### Added — Stage 35 (v0.54.0-alpha)
+
+- **`std/io.hls`** library module with:
+  - `Cursor` struct + `impl` — in-memory Read + Write over a `str`
+    buffer. Read API: `read_byte`, `read_str`, `read_until`,
+    `read_line`, `peek_byte`, `seek`, `rewind`. Write API:
+    `write_byte`, `write_str`, `write_str_at` (back-patch),
+    `flush` (no-op). Introspection: `position`, `length`,
+    `remaining`, `is_eof`, `buffer`.
+  - `BufReader` struct + `impl` — file-backed Read. Constructed via
+    `buf_reader_from_file(path)` (carries `Fs`) or
+    `buf_reader_from_str(s)` (in-memory, no effect). Mirrors the
+    Cursor Read API plus `path()` and `buffer()`.
+  - `BufWriter` struct + `impl` — buffered file Write. Constructed
+    via `buf_writer_new(path)`. Write API: `write_byte`,
+    `write_str`, `flush` (carries `Fs`). Introspection: `path()`,
+    `pending_len()`, `is_flushed()`. Writes accumulate in a
+    `list[str]` for O(1) append; `flush()` joins and writes once
+    (deferring the O(n) join avoids the quadratic `out = out + s`
+    accumulator).
+  - `Chain` struct + `impl` — concatenate multiple `Cursor` readers
+    into one Read. Read API: `read_byte`, `read_str`, `read_until`
+    (each spans cursor boundaries). Introspection: `position`,
+    `length`, `remaining`, `is_eof`, `num_readers`.
+  - Monomorphic helpers: `io_copy_*_to_str`, `io_read_all_*`,
+    `io_read_lines_*` for each concrete Read type (Cursor,
+    BufReader, Chain). When trait dispatch lands, these will be
+    replaceable by a single polymorphic helper.
+  - Hex helpers: `io_to_hex(src)` reads the rest of a Cursor and
+    returns the lowercase hex encoding (each byte → two hex digits).
+    `io_from_hex(s)` decodes a hex string into a fresh Cursor
+    (panics on odd-length or non-hex input). Useful for digest
+    output, byte-precise logging, and round-trip tests.
+- **`examples/io_demo.hls`** — exercises every type and method,
+  including a 6-section integration test (Cursor, BufReader,
+  BufWriter, Chain, Hex, Pipeline).
+- **`tests/ok/feat_stage35_io.hls`** — feature test for the
+  differential suite. Six sections covering every method.
+- **`make io-acceptance`** — the official Stage 35 gate.
+
+### Fixed — Stage 35 (v0.54.0-alpha)
+
+- **Native-compiler heap-use-after-free (HIGH, native-only).** A
+  pre-existing bug in `src/hlc.hls`'s `collect_hoist` was causing
+  `w.method("literal")` to double-release the string literal:
+  the literal was hoisted into a temporary binding WITH a cleanup
+  attribute (so it would be released at end of the caller's scope)
+  AND the callee's parameter binding ALSO had a cleanup (so it
+  would be released at end of the callee). For a struct that
+  stored the arg into a `list[str]` field with `hl_str_release`
+  as the element-release callback (e.g. `BufWriter.parts`), this
+  was a heap-use-after-free: the list released the string at
+  flush time, then the caller's temp cleanup tried to release it
+  again. The bug had been masked because most call sites used
+  `let x = "lit"; m(x)` (the let-binding was consumed by transfer
+  semantics and the temp had no extra cleanup) or passed struct
+  literals inline (no temp created). Fix: `collect_hoist` for
+  user-method args now uses `collect_hoist` (recurse, do not
+  hoist) instead of `hoist_child` (which would create a temp
+  with cleanup), mirroring the existing handling of user-fn call
+  args. Verified with AddressSanitizer on `b.set("hello")`-style
+  programs that previously crashed.
+
+### Changed — Stage 35 (v0.54.0-alpha)
+
+- `src/hlc.hls` — `collect_hoist` for `kind=method` now checks
+  `muser` and uses `collect_hoist` for user-method args (so they
+  are not hoisted into temps with cleanup attributes), matching
+  the existing handling of user-fn call args.
+- `Makefile` — new `io-acceptance` target. Added to `.PHONY`.
+- `ROADMAP.md` — Stage 35 marked ✅.
+
 ## [v0.53.0-alpha] — Stage 34: async stream combinators (channels × generators)
 
 > Adds `Stream[T]` — a push-based async stream with backpressure — and
