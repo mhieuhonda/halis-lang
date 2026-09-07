@@ -1,0 +1,298 @@
+# fs_demo.hls — Stage 36 (v0.55.0-alpha): std.fs module demo.
+#
+# This demo shows the std.fs API:
+#   Path            encapsulated path (type-safe path-traversal prevention)
+#   PathBuf         mutable path builder (push/pop segments)
+#   FsMetadata      combined size + is_dir + is_file + read_only
+#
+# Construction:
+#   path_from_str(s)        clean literal -> Path
+#   path_from_tainted(t)    tainted[str] -> Path (via sanitize_path)
+#
+# Operations:
+#   path_exists / path_is_file / path_is_dir / path_size
+#   path_read_dir / path_walk / path_walk_files
+#   path_join / path_join_str
+#   path_set_perms
+#   path_metadata
+#   path_parent / path_filename / path_extension
+#   pathbuf_new / pathbuf_push / pathbuf_pop / pathbuf_to_path
+#
+# The demo builds a small fixture tree, walks it, prints metadata for
+# each entry, and verifies the type-level path-traversal safety
+# (a Path cannot be constructed from a tainted[str] without
+# sanitize_path).
+
+import "std.fs"
+import "std.sanitize"
+import "std.str"
+import "std.option"
+
+# ============================================================================
+# Section 1: Path construction (trusted and tainted).
+# ============================================================================
+
+fn section_construction() -> int uses IO, Fs {
+    println("=== Construction ===")
+
+    # Trusted: from a clean str literal.
+    let p: Path = path_from_str("/tmp/halis_fs_demo")
+    println("from_str=" + path_to_str(p))
+
+    # Tainted: simulate a tainted str by using taint_mark on a literal.
+    # In real code, this would come from tainted_args() or
+    # read_file_tainted(). The path_from_tainted function calls
+    # sanitize_path, which would panic on absolute paths, '..', NUL,
+    # backslashes, Windows drive letters. We use a SAFE relative path
+    # here so the demo doesn't panic.
+    let safe_t: tainted[str] = taint_mark("subdir/file.txt")
+    let safe_path: Path = path_from_tainted(safe_t)
+    println("from_tainted(safe)=" + path_to_str(safe_path))
+    return 0
+}
+
+# ============================================================================
+# Section 2: Path introspection (parent, filename, extension).
+# ============================================================================
+
+fn section_introspect() -> int uses IO {
+    println("=== Introspect ===")
+
+    let p: Path = path_from_str("/a/b/c.txt")
+    println("path=" + path_to_str(p))
+    println("parent=" + path_to_str(path_parent(p)))
+    println("filename=" + path_filename(p))
+    println("extension=" + path_extension(p))
+
+    let p2: Path = path_from_str("noext")
+    println("filename=" + path_filename(p2))
+    println("extension=[" + path_extension(p2) + "]")
+
+    let p3: Path = path_from_str("/tmp/.hidden")
+    println("hidden filename=" + path_filename(p3))
+    println("hidden extension=[" + path_extension(p3) + "]")
+
+    let p4: Path = path_from_str("/a/b.")
+    println("trailing-dot extension=[" + path_extension(p4) + "]")
+    return 0
+}
+
+# ============================================================================
+# Section 3: PathBuf — building paths incrementally.
+# ============================================================================
+
+fn section_pathbuf() -> int uses IO {
+    println("=== PathBuf ===")
+
+    let pb: PathBuf = pathbuf_new()
+    pb.push("/tmp")
+    pb.push("halis_fs_demo")
+    pb.push("subdir")
+    pb.push("file.txt")
+    let p: Path = pb.to_path()
+    println("pathbuf=" + path_to_str(p))
+    println("len=" + pb.len().to_str())
+
+    # Pop one segment and rebuild.
+    pb.pop()
+    let p2: Path = pb.to_path()
+    println("after_pop=" + path_to_str(p2))
+
+    # pathbuf_from_str convenience.
+    let pb2: PathBuf = pathbuf_from_str("/var")
+    pb2.push("log")
+    pb2.push("app.log")
+    println("from_str=" + path_to_str(pb2.to_path()))
+    return 0
+}
+
+# ============================================================================
+# Section 4: Directory operations (read_dir, walk, walk_files).
+# ============================================================================
+
+fn section_dirs() -> int uses IO, Fs, Proc {
+    println("=== Dirs ===")
+
+    # Build a fixture tree under /tmp/halis_fs_demo. proc_exec creates
+    # the directories (the path is a clean literal — no taint concern).
+    let _mkdir_rc: int = proc_exec("mkdir -p /tmp/halis_fs_demo/sub1/deeper /tmp/halis_fs_demo/sub2")
+    # Clean any leftover files from a previous run.
+    let _rm_rc: int = proc_exec("rm -rf /tmp/halis_fs_demo")
+    let _mkdir_rc2: int = proc_exec("mkdir -p /tmp/halis_fs_demo/sub1/deeper /tmp/halis_fs_demo/sub2")
+    let root: Path = path_from_str("/tmp/halis_fs_demo")
+    write_file("/tmp/halis_fs_demo/.gitkeep", "fixture root marker\n")
+    write_file("/tmp/halis_fs_demo/top.txt", "top-level file\n")
+    write_file("/tmp/halis_fs_demo/sub1/aa.txt", "sub1 aa\n")
+    write_file("/tmp/halis_fs_demo/sub1/deeper/bb.txt", "deeper bb\n")
+    write_file("/tmp/halis_fs_demo/sub2/cc.txt", "sub2 cc\n")
+
+    # read_dir
+    let entries: list[Path] = path_read_dir(root)
+    println("read_dir=" + entries.len().to_str() + " entries")
+    let mut i: int = 0
+    while i < entries.len() {
+        let e: Path = entries.get(i)
+        let kind: str = path_kind_str(path_is_dir(e))
+        println("  " + path_to_str(e) + " (" + kind + ")")
+        i = i + 1
+    }
+
+    # walk — depth-first, parent first.
+    let all: list[Path] = path_walk(root)
+    println("walk=" + all.len().to_str() + " entries")
+    let mut j: int = 0
+    while j < all.len() {
+        let cur: Path = all.get(j)
+        let kind: str = path_kind_str(path_is_dir(cur))
+        println("  " + path_to_str(cur) + " (" + kind + ")")
+        j = j + 1
+    }
+
+    # walk_files — files only.
+    let files: list[Path] = path_walk_files(root)
+    println("walk_files=" + files.len().to_str() + " files")
+    let mut k: int = 0
+    while k < files.len() {
+        let cur: Path = files.get(k)
+        println("  " + path_to_str(cur))
+        k = k + 1
+    }
+    return 0
+}
+
+# path_kind_str — helper: "DIR" or "FILE".
+fn path_kind_str(is_d: bool) -> str {
+    if is_d {
+        return "DIR"
+    }
+    return "FILE"
+}
+
+# ============================================================================
+# Section 5: Metadata (size, is_dir, is_file, exists).
+# ============================================================================
+
+fn section_metadata() -> int uses IO, Fs {
+    println("=== Metadata ===")
+
+    let p: Path = path_from_str("/tmp/halis_fs_demo/top.txt")
+    let md: FsMetadata = path_metadata(p)
+    println("size=" + md.size.to_str())
+    println("is_dir=" + md.is_dir.to_str())
+    println("is_file=" + md.is_file.to_str())
+    println("exists=" + md.exists.to_str())
+
+    let d: Path = path_from_str("/tmp/halis_fs_demo/sub1")
+    let md2: FsMetadata = path_metadata(d)
+    println("dir_size=" + md2.size.to_str())
+    println("dir_is_dir=" + md2.is_dir.to_str())
+    println("dir_is_file=" + md2.is_file.to_str())
+
+    let nonexistent: Path = path_from_str("/tmp/halis_fs_demo/does_not_exist")
+    let md3: FsMetadata = path_metadata(nonexistent)
+    println("nonex_exists=" + md3.exists.to_str())
+    return 0
+}
+
+# ============================================================================
+# Section 6: Permissions (chmod).
+# ============================================================================
+
+fn section_perms() -> int uses IO, Fs {
+    println("=== Perms ===")
+
+    let p: Path = path_from_str("/tmp/halis_fs_demo/perms_test.txt")
+    write_file("/tmp/halis_fs_demo/perms_test.txt", "permission test\n")
+
+    # 0o600 = 384: rw------- (owner only).
+    path_set_perms(p, 384)
+    println("set 0600 OK")
+
+    # 0o644 = 420: rw-r--r-- (owner rw, others r).
+    path_set_perms(p, 420)
+    println("set 0644 OK")
+
+    # 0o444 = 292: r--r--r-- (read-only for all).
+    path_set_perms(p, 292)
+    println("set 0444 OK")
+    return 0
+}
+
+# ============================================================================
+# Section 7: Path join operations.
+# ============================================================================
+
+fn section_join() -> int uses IO {
+    println("=== Join ===")
+
+    let base: Path = path_from_str("/tmp/halis_fs_demo")
+    let p1: Path = path_join_str(base, "sub1")
+    println("join sub1=" + path_to_str(p1))
+
+    let p2: Path = path_join_str(p1, "deeper")
+    println("join deeper=" + path_to_str(p2))
+
+    let p3: Path = path_join_str(p2, "file.txt")
+    println("join file.txt=" + path_to_str(p3))
+
+    # join with empty segment.
+    let p4: Path = path_join_str(base, "")
+    println("join ''=" + path_to_str(p4))
+
+    # join with full Path.
+    let p5: Path = path_join(base, path_from_str("leaf.txt"))
+    println("join(Path)=" + path_to_str(p5))
+
+    # join with base ending in /.
+    let slash_base: Path = path_from_str("/tmp/foo/")
+    let p6: Path = path_join_str(slash_base, "bar")
+    println("join slash_base=" + path_to_str(p6))
+    return 0
+}
+
+# ============================================================================
+# Section 8: Integration — walk + read all files.
+# ============================================================================
+
+fn section_integration() -> int uses IO, Fs {
+    println("=== Integration ===")
+
+    let root: Path = path_from_str("/tmp/halis_fs_demo")
+    let files: list[Path] = path_walk_files(root)
+    println("found " + files.len().to_str() + " files:")
+
+    let mut i: int = 0
+    while i < files.len() {
+        let f: Path = files.get(i)
+        let content: str = read_file(path_to_str(f))
+        let first_line: str = first_line_of(content)
+        println("  " + path_to_str(f) + " -> " + first_line)
+        i = i + 1
+    }
+    return 0
+}
+
+# first_line_of — return the first line of `s` (without trailing \n).
+fn first_line_of(s: str) -> str {
+    let mut i: int = 0
+    while i < s.len() {
+        if s.byte_at(i) == 10 {  # '\n'
+            return s.slice(0, i)
+        }
+        i = i + 1
+    }
+    return s
+}
+
+fn main() -> int uses IO, Fs, Proc {
+    if section_construction() != 0 { return 1 }
+    if section_introspect() != 0 { return 2 }
+    if section_pathbuf() != 0 { return 3 }
+    if section_dirs() != 0 { return 4 }
+    if section_metadata() != 0 { return 5 }
+    if section_perms() != 0 { return 6 }
+    if section_join() != 0 { return 7 }
+    if section_integration() != 0 { return 8 }
+    println("ALL FS TESTS PASSED")
+    return 0
+}

@@ -73,7 +73,7 @@ remains green.
 | # | Stage | Status | Estimated effort |
 |---|-------|:------:|:----------------:|
 | 35 | `std.io` — buffered readers/writers, `Read`/`Write` traits | ✅ | 4 weeks |
-| 36 | `std.fs` — path abstraction, directory walk, permissions | ⬜ | 4 weeks |
+| 36 | `std.fs` — path abstraction, directory walk, permissions | ✅ | 4 weeks |
 | 37 | `std.net` — TCP/UDP sockets, DNS, TLS via libcurl | ⬜ | 6 weeks |
 | 38 | `std.http` — HTTP/1.1 server + client (RFC 7230) | ⬜ | 6 weeks |
 | 39 | `std.http2` — HTTP/2 + ALPN negotiation | ⬜ | 5 weeks |

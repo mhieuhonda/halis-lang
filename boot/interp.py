@@ -1444,6 +1444,52 @@ class Interp:
             # path than the native runtime (which passes raw bytes to
             # stat()). Files with non-UTF-8 names diverged.
             return os.path.isfile(resolved)
+        # ----- Stage 36 (v0.55.0-alpha): filesystem metadata builtins -----
+        # All four builtins route through _sandbox_check (so a sandboxed
+        # interpreter can't escape) and use bytes-exact paths (so non-
+        # UTF-8 names behave identically in the interpreter and the C
+        # runtime — the same invariant the H2 deep-scan fix established
+        # for file_exists).
+        if name == "fs_read_dir":
+            resolved = _sandbox_check(args[0])
+            try:
+                # os.listdir returns names (NOT full paths) — the
+                # caller joins with the parent. Sort the result so
+                # the interpreter and the C runtime (which uses
+                # opendir/readdir) agree on the iteration order
+                # (readdir order is filesystem-dependent; sort by
+                # bytes for cross-implementation determinism).
+                entries = sorted(os.listdir(resolved))
+                # Each entry is a bytes object (because `resolved`
+                # is bytes); return the list of bytes directly
+                # (HLS str = Python bytes).
+                return [e if isinstance(e, bytes)
+                        else str(e).encode("utf-8") for e in entries]
+            except OSError:
+                raise HLPanic("fs_read_dir: cannot list directory: %s"
+                              % to_display(args[0]), line)
+        if name == "fs_size":
+            resolved = _sandbox_check(args[0])
+            try:
+                return os.path.getsize(resolved)
+            except OSError:
+                raise HLPanic("fs_size: cannot stat: %s"
+                              % to_display(args[0]), line)
+        if name == "fs_is_dir":
+            resolved = _sandbox_check(args[0])
+            # os.path.isdir returns False for non-existent paths
+            # (matches the C runtime's stat-based check: a missing
+            # path is not a directory).
+            return os.path.isdir(resolved)
+        if name == "fs_set_perms":
+            resolved = _sandbox_check(args[0])
+            mode = args[1]
+            try:
+                os.chmod(resolved, mode)
+            except OSError:
+                raise HLPanic("fs_set_perms: cannot chmod: %s"
+                              % to_display(args[0]), line)
+            return None
         # ----- Stage 8-alpha: ownership primitives -----
         # drop(x): semantically releases x. In Stage-0 (Python), the underlying
         # value is left for Python's GC. The binding is marked moved at compile

@@ -96,6 +96,11 @@ declare ptr      @hl_args()                         ; -> hl_list* (list[str])
 declare i1       @hl_file_exists(ptr)
 declare ptr      @hl_read_file(ptr)
 declare void     @hl_write_file(ptr, ptr)
+; Stage 36 (v0.55.0-alpha): filesystem metadata builtins.
+declare ptr      @hl_fs_read_dir(ptr)               ; -> hl_list* (list[str])
+declare i64      @hl_fs_size(ptr)
+declare i1       @hl_fs_is_dir(ptr)
+declare void     @hl_fs_set_perms(ptr, i64)
 declare void     @hl_print(ptr)                     ; hl_str*
 declare void     @hl_println(ptr)                   ; hl_str*
 
@@ -1573,6 +1578,17 @@ class LLVMEmitter:
             return ("i64", tmp)
         if name == "file_exists":
             return self._call1("i1", "@hl_file_exists", ["ptr"], arg_pairs)
+        # Stage 36 (v0.55.0-alpha): filesystem metadata builtins.
+        # All consume the path argument; fs_set_perms also takes a mode int.
+        if name == "fs_read_dir":
+            return self._call1("ptr", "@hl_fs_read_dir", ["ptr"], arg_pairs)
+        if name == "fs_size":
+            return self._call1("i64", "@hl_fs_size", ["ptr"], arg_pairs)
+        if name == "fs_is_dir":
+            return self._call1("i1", "@hl_fs_is_dir", ["ptr"], arg_pairs)
+        if name == "fs_set_perms":
+            return self._call1("void", "@hl_fs_set_perms", ["ptr", "i64"],
+                              arg_pairs)
         if name == "drop":
             # Compile-time annotation only; runtime no-op.
             return ("void", "0")

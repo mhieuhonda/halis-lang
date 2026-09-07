@@ -222,6 +222,17 @@ BUILTIN_FNS = {
     "print", "println", "panic", "exit", "str", "int", "len", "range",
     "map_new", "read_file", "write_file", "args", "clock_ms", "chr",
     "file_exists",
+    # Stage 36 (v0.55.0-alpha): filesystem metadata builtins.
+    # fs_read_dir(path) -> list[str] — list directory entries (names
+    #   only, not full paths; the caller can join with the parent
+    #   path via std.fs). Panics on I/O error (mirrors read_file).
+    # fs_size(path) -> int — file size in bytes. Panics on error.
+    # fs_is_dir(path) -> bool — true iff path is a directory.
+    #   Returns false for non-existent paths (mirrors file_exists
+    #   semantics for files).
+    # fs_set_perms(path, mode) -> void — chmod the path. `mode` is
+    #   the POSIX permission bits (e.g. 0o644 = 420). Panics on error.
+    "fs_read_dir", "fs_size", "fs_is_dir", "fs_set_perms",
     # Stage 8-alpha ownership primitives (v0.4.0-alpha)
     "drop", "clone", "take",
     # Stage 10-alpha: taint-tracking primitives (v0.7.0-alpha)
@@ -292,6 +303,15 @@ BUILTIN_EFFECTS = {
     "read_file":   {"Fs"},
     "write_file":  {"Fs"},
     "file_exists": {"Fs"},
+    # Stage 36 (v0.55.0-alpha): filesystem metadata builtins — all
+    # carry the Fs effect (they touch the filesystem). fs_set_perms
+    # is also a sink for path-traversal attacks (a tainted path
+    # would chmod an attacker-chosen file), so it is registered in
+    # SINK_BUILTINS below.
+    "fs_read_dir":  {"Fs"},
+    "fs_size":      {"Fs"},
+    "fs_is_dir":    {"Fs"},
+    "fs_set_perms": {"Fs"},
     "clock_ms":    {"Clock"},
     "args":        {"Args"},
     "exit":        {"Exit"},
@@ -387,6 +407,17 @@ SINK_BUILTINS = {
     # shell injection (an attacker who controls the command can run
     # arbitrary shell code in the program's privilege context).
     "proc_exec":    (0,),
+    # Stage 36 (v0.55.0-alpha): filesystem metadata builtins as sinks.
+    # fs_read_dir's path is a sink because a tainted path enables
+    # directory enumeration of attacker-chosen locations (information
+    # disclosure). fs_size and fs_is_dir likewise disclose information
+    # about attacker-chosen paths. fs_set_perms is the most dangerous:
+    # a tainted path lets the attacker chmod an arbitrary file
+    # (e.g. /etc/passwd → 0o666).
+    "fs_read_dir":  (0,),
+    "fs_size":      (0,),
+    "fs_is_dir":    (0,),
+    "fs_set_perms": (0,),
 }
 
 # NOTE: is_tainted_type / list_taint_inner are ALIASES defined once at the
@@ -2619,6 +2650,28 @@ class Checker:
             reject_tainted_at_sink(0, "str")
             self.edges[self.cur_fn].add("b:file_exists")
             return "bool"
+        # ----- Stage 36 (v0.55.0-alpha): filesystem metadata builtins -----
+        if name == "fs_read_dir":
+            need(1)
+            reject_tainted_at_sink(0, "str")
+            self.edges[self.cur_fn].add("b:fs_read_dir")
+            return "list[str]"
+        if name == "fs_size":
+            need(1)
+            reject_tainted_at_sink(0, "str")
+            self.edges[self.cur_fn].add("b:fs_size")
+            return "int"
+        if name == "fs_is_dir":
+            need(1)
+            reject_tainted_at_sink(0, "str")
+            self.edges[self.cur_fn].add("b:fs_is_dir")
+            return "bool"
+        if name == "fs_set_perms":
+            need(2)
+            reject_tainted_at_sink(0, "str")
+            argt(1, "int")
+            self.edges[self.cur_fn].add("b:fs_set_perms")
+            return "void"
         # ----- Stage 8-alpha: ownership primitives (drop / clone / take) -----
         if name == "drop":
             need(1)

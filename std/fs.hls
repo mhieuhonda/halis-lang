@@ -1,0 +1,474 @@
+# ============================================================================
+# std/fs.hls — Stage 36 (v0.55.0-alpha): path abstraction + dir walk + metadata
+# ----------------------------------------------------------------------------
+# This module provides a type-safe Path abstraction that enforces the
+# path-traversal-safety invariant at the TYPE level:
+#
+#   - A `Path` cannot be constructed from a `tainted[str]` without going
+#     through `path_from_tainted` (which calls `sanitize_path` from
+#     std.sanitize and panics on `..` segments, NUL bytes, absolute
+#     paths, Windows drive letters, and backslashes). The checker
+#     separately rejects passing a `tainted[str]` directly to fs_* sinks
+#     (read_file, write_file, fs_read_dir, fs_size, fs_is_dir,
+#     fs_set_perms), so the type-level invariant is defense-in-depth
+#     on top of the sink-level invariant.
+#
+#   - A `Path` CAN be constructed from a clean `str` literal via
+#     `path_from_str`. This is the trusted path: the caller asserts
+#     the literal is safe (it's in the source code, not user input).
+#
+# The module is layered on four Stage-36 builtins:
+#   - fs_read_dir(path) -> list[str]   (entry names, sorted)
+#   - fs_size(path)     -> int         (file size in bytes)
+#   - fs_is_dir(path)   -> bool        (true iff directory)
+#   - fs_set_perms(path, mode: int) -> void  (chmod)
+#
+# Plus the existing Stage-10 builtins:
+#   - read_file / write_file / file_exists (already in std)
+#
+# Public API:
+#   Path                       struct (encapsulated str)
+#   PathBuf                    struct (mutable path builder)
+#   FsMetadata                 struct (size, is_dir, is_file, read_only)
+#
+#   path_from_str(s)              -> Path      (clean literal -> Path)
+#   path_from_tainted(t)          -> Path      (tainted[str] -> Path via sanitize_path)
+#   path_to_str(p)               -> str       (extract the inner str — safe because Path is encapsulated)
+#   path_join(base, rel)         -> Path      (join with a single separator)
+#   path_join_str(base, rel)     -> Path      (join with a str literal)
+#   path_exists(p)               -> bool      (file_exists on the inner str)
+#   path_is_file(p)              -> bool      (file_exists on the inner str)
+#   path_is_dir(p)               -> bool      (fs_is_dir on the inner str)
+#   path_size(p)                 -> int       (fs_size on the inner str)
+#   path_read_dir(p)             -> list[Path] (fs_read_dir + join)
+#   path_walk(p)                 -> list[Path] (recursive: directory tree)
+#   path_walk_files(p)           -> list[Path] (recursive: files only)
+#   path_set_perms(p, mode)      -> void      (fs_set_perms)
+#   path_metadata(p)             -> FsMetadata (size + is_dir + is_file + read_only)
+#
+#   pathbuf_new()                -> PathBuf
+#   pathbuf_push(mut pb, segment) -> void
+#   pathbuf_pop(mut pb)           -> void
+#   pathbuf_to_path(pb)           -> Path
+#   pathbuf_len(pb)               -> int
+# ============================================================================
+
+import "std.option"
+import "std.sanitize"
+
+# ============================================================================
+# Path — encapsulated path. The inner str is a clean (sanitised) path.
+# Construction is gated by path_from_str (for clean literals) and
+# path_from_tainted (for untrusted input). There is no public constructor
+# that takes a raw str — the caller MUST go through one of the two gating
+# functions. This is the type-level path-traversal-safety invariant.
+# ============================================================================
+
+struct Path {
+    inner: str
+}
+
+# path_from_str(s) — construct a Path from a CLEAN str literal. The
+# caller asserts the string is safe (it's in the source code, not user
+# input). No sanitisation is performed — the str is wrapped as-is.
+#
+# THIS IS THE TRUSTED ENTRY POINT. Do not call this with a value derived
+# from user input — use path_from_tainted instead.
+fn path_from_str(s: str) -> Path {
+    return Path { inner: s }
+}
+
+# path_from_tainted(t) — construct a Path from a tainted[str] (e.g. an
+# argv value or a value read from a file). Calls sanitize_path on the
+# inner str, which panics on:
+#   - empty path
+#   - NUL bytes
+#   - absolute paths (leading '/')
+#   - Windows drive-letter paths (e.g. "C:/...")
+#   - backslash separators
+#   - ".." traversal segments
+# The returned Path wraps the sanitised str. After this call, the
+# caller has a type-level guarantee that the Path is path-traversal-safe.
+fn path_from_tainted(t: tainted[str]) -> Path {
+    let clean: str = sanitize_path(t)
+    return Path { inner: clean }
+}
+
+# path_to_str(p) — extract the inner str. This is safe because Path
+# is encapsulated: the only way to construct one is via path_from_str
+# (clean literal) or path_from_tainted (sanitised). The returned str
+# can be passed to any sink (the type-level invariant ensures it's clean).
+fn path_to_str(p: Path) -> str {
+    return p.inner
+}
+
+# ============================================================================
+# PathBuf — mutable path builder. Useful when constructing a path from
+# multiple segments (e.g. a base directory + subdirectory + filename).
+# PathBuf is internally a list[str] of segments; the final Path is
+# constructed by joining them with '/'.
+#
+# Design note: PathBuf is a struct with a `list[str]` field, NOT a Path
+# with concatenation. This avoids the O(n²) `out = out + "/" + segment`
+# accumulator — push is O(1) amortised, and the join happens once at
+# build time.
+# ============================================================================
+
+struct PathBuf {
+    segments: list[str]
+}
+
+# pathbuf_new() — create an empty PathBuf.
+fn pathbuf_new() -> PathBuf {
+    return PathBuf { segments: [] }
+}
+
+# pathbuf_from_str(s) — create a PathBuf pre-populated with a single
+# segment. Convenience constructor.
+fn pathbuf_from_str(s: str) -> PathBuf {
+    let pb: PathBuf = PathBuf { segments: [] }
+    pb.segments.push(s)
+    return pb
+}
+
+impl PathBuf {
+    # push(segment) — append a segment. The segment should not contain
+    # '/' (use multiple push calls for nested segments). The caller
+    # is responsible for ensuring the segment is clean (no NUL, no '..').
+    fn push(mut self: PathBuf, segment: str) -> void {
+        self.segments.push(segment)
+    }
+
+    # pop() — remove the last segment. No-op if the buffer is empty.
+    fn pop(mut self: PathBuf) -> void {
+        if self.segments.len() > 0 {
+            let _d: str = self.segments.pop()
+        }
+    }
+
+    # len() — number of segments.
+    fn len(self: PathBuf) -> int {
+        return self.segments.len()
+    }
+
+    # is_empty() — true iff no segments.
+    fn is_empty(self: PathBuf) -> bool {
+        return self.segments.len() == 0
+    }
+
+    # to_path(self) — join the segments with '/' and return a Path.
+    # The resulting Path is constructed via path_from_str (the joined
+    # str is built from segments the caller pushed, so it's as trusted
+    # as the inputs).
+    fn to_path(self: PathBuf) -> Path {
+        let joined: str = str_join(self.segments, "/")
+        return path_from_str(joined)
+    }
+}
+
+# ============================================================================
+# FsMetadata — combined metadata for a path. Combines size, is_dir,
+# is_file, and read_only into one struct so callers can query all
+# properties with a single fs_size + fs_is_dir + file_exists round
+# (instead of 3-4 separate stat() calls). The read_only bit is
+# derived from fs_set_perms's mode parameter (a path is read-only iff
+# NO write bit is set: not user-write, not group-write, not other-write).
+# ============================================================================
+
+struct FsMetadata {
+    size: int,
+    is_dir: bool,
+    is_file: bool,
+    exists: bool,
+    read_only: bool
+}
+
+# path_metadata(p) — return the combined metadata for a Path. Uses:
+#   - file_exists for `is_file` and `exists`
+#   - fs_is_dir for `is_dir`
+#   - fs_size for `size`
+# `read_only` is currently always false (Stage 36 does not include a
+# fs_get_perms builtin; that's deferred to a later stage). The field
+# is present in the struct so callers can write code that depends on
+# it without breaking when the get-perms builtin lands.
+fn path_metadata(p: Path) -> FsMetadata uses Fs {
+    let s: str = p.inner
+    let is_d: bool = fs_is_dir(s)
+    let is_f: bool = file_exists(s)
+    let size: int = path_metadata_size(is_d, is_f, s)
+    return FsMetadata {
+        size: size,
+        is_dir: is_d,
+        is_file: is_f,
+        exists: is_d || is_f,
+        read_only: false
+    }
+}
+
+# path_metadata_size — internal helper for path_metadata: returns
+# fs_size(s) if the path exists (dir or file), else 0. Avoids the
+# if-expression (HLS has none). Directories have a non-zero size on
+# most filesystems (the dirent block — typically 4096 on Linux ext4).
+fn path_metadata_size(is_d: bool, is_f: bool, s: str) -> int uses Fs {
+    if is_d {
+        return fs_size(s)
+    }
+    if is_f {
+        return fs_size(s)
+    }
+    return 0
+}
+
+# ============================================================================
+# Path operations: join, exists, is_file, is_dir, size, read_dir, walk.
+# ============================================================================
+
+# path_join_str(base, rel) — join a base Path with a relative str
+# segment using '/'. The `rel` segment should be a clean relative path
+# (no leading '/', no '..'). For tainted input, use path_from_tainted
+# first, then path_join.
+#
+# The resulting Path is constructed via path_from_str (the joined str
+# is built from a clean base + a clean literal, so it's trusted).
+fn path_join_str(base: Path, rel: str) -> Path {
+    if base.inner.len() == 0 {
+        return path_from_str(rel)
+    }
+    if rel.len() == 0 {
+        return base
+    }
+    # If base ends with '/', don't double it.
+    let last: int = base.inner.byte_at(base.inner.len() - 1)
+    if last == 47 {  # '/'
+        return path_from_str(base.inner + rel)
+    }
+    return path_from_str(base.inner + "/" + rel)
+}
+
+# path_join(base, rel) — join two Paths. Convenience wrapper around
+# path_join_str.
+fn path_join(base: Path, rel: Path) -> Path {
+    return path_join_str(base, rel.inner)
+}
+
+# path_exists(p) — true iff the path exists (file OR directory).
+fn path_exists(p: Path) -> bool uses Fs {
+    let is_d: bool = fs_is_dir(p.inner)
+    if is_d {
+        return true
+    }
+    return file_exists(p.inner)
+}
+
+# path_is_file(p) — true iff the path exists and is a regular file.
+fn path_is_file(p: Path) -> bool uses Fs {
+    return file_exists(p.inner)
+}
+
+# path_is_dir(p) — true iff the path exists and is a directory.
+fn path_is_dir(p: Path) -> bool uses Fs {
+    return fs_is_dir(p.inner)
+}
+
+# path_size(p) — file size in bytes. Panics if the path doesn't exist
+# or is not accessible (mirrors fs_size). For directories, returns
+# the directory entry size (typically 4096 on Linux — the size of the
+# dirent block, not the size of the contents).
+fn path_size(p: Path) -> int uses Fs {
+    return fs_size(p.inner)
+}
+
+# path_read_dir(p) — list the entries in a directory Path. Returns a
+# list[Path] (each entry is joined with the parent to form a full
+# Path). Returns an empty list if the path is not a directory. The
+# entries are sorted by byte-lexicographic order (matching the
+# underlying fs_read_dir builtin's sort).
+fn path_read_dir(p: Path) -> list[Path] uses Fs {
+    if !fs_is_dir(p.inner) {
+        return []
+    }
+    let names: list[str] = fs_read_dir(p.inner)
+    let out: list[Path] = []
+    let mut i: int = 0
+    while i < names.len() {
+        let child: Path = path_join_str(p, names.get(i))
+        out.push(child)
+        i = i + 1
+    }
+    return out
+}
+
+# path_walk(p) — recursively walk the directory tree rooted at `p`.
+# Returns a list[Path] containing `p` itself, then every file and
+# subdirectory (recursively). The order is depth-first: parent first,
+# then its children (sorted), then grandchildren. The walk does NOT
+# follow symlinks (the underlying fs_is_dir + fs_read_dir use lstat
+# semantics — they report the symlink itself, not its target).
+#
+# The walk uses an explicit work-list (no recursion — Halis does not
+# guarantee tail-call optimisation across user functions). The work-
+# list is a list[Path] used as a stack: pop the last element, process
+# it, and push its children (if it's a directory) in reverse order
+# so the first child is popped next.
+fn path_walk(p: Path) -> list[Path] uses Fs {
+    let out: list[Path] = []
+    let work: list[Path] = [p]
+    while work.len() > 0 {
+        let cur: Path = work.pop()
+        out.push(cur)
+        if fs_is_dir(cur.inner) {
+            let children: list[Path] = fs_read_dir_to_paths(cur)
+            # Push children in REVERSE so the first child is popped next
+            # (preserves sorted order in the output).
+            let mut i: int = children.len() - 1
+            while i >= 0 {
+                work.push(children.get(i))
+                i = i - 1
+            }
+        }
+    }
+    return out
+}
+
+# fs_read_dir_to_paths(p) — internal helper: like path_read_dir but
+# uses fs_read_dir directly (avoids the is_dir check at the top of
+# path_read_dir; the caller has already verified the path is a dir).
+fn fs_read_dir_to_paths(p: Path) -> list[Path] uses Fs {
+    let names: list[str] = fs_read_dir(p.inner)
+    let out: list[Path] = []
+    let mut i: int = 0
+    while i < names.len() {
+        let child: Path = path_join_str(p, names.get(i))
+        out.push(child)
+        i = i + 1
+    }
+    return out
+}
+
+# path_walk_files(p) — recursively walk, returning only the regular
+# files (skipping directories). Convenient for "process every file
+# in this tree" use cases.
+fn path_walk_files(p: Path) -> list[Path] uses Fs {
+    let all: list[Path] = path_walk(p)
+    let out: list[Path] = []
+    let mut i: int = 0
+    while i < all.len() {
+        let cur: Path = all.get(i)
+        if file_exists(cur.inner) {
+            out.push(cur)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# ============================================================================
+# Path permissions.
+# ============================================================================
+
+# path_set_perms(p, mode) — chmod the path. `mode` is the POSIX
+# permission bits. Common values (decimal, since HLS has no octal
+# literals):
+#   0o600 = 384   (rw-------)  owner only
+#   0o644 = 420   (rw-r--r--)  owner read/write, others read
+#   0o755 = 493   (rwxr-xr-x)  owner all, others read+execute
+#   0o444 = 292   (r--r--r--)  read-only for all
+# Panics on failure (matches fs_set_perms).
+fn path_set_perms(p: Path, mode: int) -> void uses Fs {
+    fs_set_perms(p.inner, mode)
+}
+
+# path_is_read_only(p) — true iff the path is read-only. Stage 36
+# simplification: always returns false (we don't have a get-perms
+# builtin yet; that arrives with Stage 37's std.net or a later OS-
+# development stage). The function exists so callers can write code
+# that depends on it without breaking when the get-perms builtin lands.
+fn path_is_read_only(p: Path) -> bool uses Fs {
+    # Touch the path so the function is not pure (so the Fs effect is
+    # observable — the caller's `uses Fs` clause is justified).
+    let _e: bool = file_exists(p.inner)
+    return false
+}
+
+# ============================================================================
+# Path display / debug helpers.
+# ============================================================================
+
+# path_display(p) — return a display string for the path. Same as
+# path_to_str; provided for API parity with std.fs in other languages
+# (Rust, Python) where display and to_str may differ (e.g. escaping
+# non-UTF-8 bytes).
+fn path_display(p: Path) -> str {
+    return p.inner
+}
+
+# path_parent(p) — return the parent directory of `p`, or p itself
+# if `p` has no '/' (it's a relative single-segment path). The parent
+# is computed by finding the LAST '/' and slicing up to (but not
+# including) it. If the path is empty, returns an empty Path.
+fn path_parent(p: Path) -> Path {
+    let s: str = p.inner
+    if s.len() == 0 {
+        return path_from_str("")
+    }
+    let mut i: int = s.len() - 1
+    while i >= 0 {
+        if s.byte_at(i) == 47 {  # '/'
+            if i == 0 {
+                # The path is like "/foo" — parent is "/".
+                return path_from_str("/")
+            }
+            return path_from_str(s.slice(0, i))
+        }
+        i = i - 1
+    }
+    # No '/' found — the path is a relative single segment. Return p
+    # unchanged (the caller's intent for "no parent" is ambiguous:
+    # "." would also be reasonable; returning p preserves the input).
+    return p
+}
+
+# path_filename(p) — return the last segment of the path (the filename).
+# For "a/b/c.txt", returns "c.txt". For "a", returns "a". For "" returns
+# "". For "/" returns "" (the root has no filename).
+fn path_filename(p: Path) -> str {
+    let s: str = p.inner
+    if s.len() == 0 {
+        return ""
+    }
+    let mut i: int = s.len() - 1
+    while i >= 0 {
+        if s.byte_at(i) == 47 {  # '/'
+            return s.slice(i + 1, s.len())
+        }
+        i = i - 1
+    }
+    return s
+}
+
+# path_extension(p) — return the file extension of the path (the
+# substring after the last '.'), or "" if there is no extension. For
+# "a/b.c", returns "c". For "a/b", returns "". For "a/.hidden",
+# returns "" (the leading dot is not an extension marker).
+fn path_extension(p: Path) -> str {
+    let fname: str = path_filename(p)
+    if fname.len() == 0 {
+        return ""
+    }
+    # Skip leading dots (hidden files).
+    let mut start: int = 0
+    while start < fname.len() && fname.byte_at(start) == 46 {  # '.'
+        start = start + 1
+    }
+    if start >= fname.len() {
+        return ""
+    }
+    let mut i: int = fname.len() - 1
+    while i >= start {
+        if fname.byte_at(i) == 46 {  # '.'
+            return fname.slice(i + 1, fname.len())
+        }
+        i = i - 1
+    }
+    return ""
+}

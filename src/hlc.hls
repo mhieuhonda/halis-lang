@@ -2644,6 +2644,11 @@ fn is_builtin_fn(n: str) -> bool {
         || n == "map_new" || n == "read_file" || n == "write_file"
         || n == "args" || n == "clock_ms" || n == "chr"
         || n == "file_exists"
+        # Stage 36 (v0.55.0-alpha): filesystem metadata builtins.
+        # All carry the Fs effect and are taint sinks (the path arg
+        # is index 0). The implementation mirrors file_exists / read_file.
+        || n == "fs_read_dir" || n == "fs_size" || n == "fs_is_dir"
+        || n == "fs_set_perms"
         # Stage 8-alpha ownership primitives
         || n == "drop" || n == "clone" || n == "take"
         # Stage 10-alpha taint primitives
@@ -3012,6 +3017,11 @@ fn builtin_effect(name: str) -> list[str] {
         return ["IO"]
     }
     if name == "read_file" || name == "write_file" || name == "file_exists" {
+        return ["Fs"]
+    }
+    # Stage 36 (v0.55.0-alpha): filesystem metadata builtins — all Fs.
+    if name == "fs_read_dir" || name == "fs_size" || name == "fs_is_dir"
+        || name == "fs_set_perms" {
         return ["Fs"]
     }
     # Stage 10-beta: read_file_tainted is a taint source with the Fs effect.
@@ -7365,6 +7375,26 @@ fn check_builtin_call(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, 
             cerr(line, "taint-sink violation: " + name + " argument 1 is " + argt.get(0) + " (tainted values must be sanitised before reaching a sink — use sanitize_path from std.sanitize, or taint_unwrap() if you accept the risk)")
         }
     }
+    # Stage 36 (v0.55.0-alpha): fs_read_dir / fs_size / fs_is_dir all
+    # take a single str path that must not be tainted (path-traversal /
+    # information-disclosure sink). fs_set_perms takes a path + a
+    # POSIX mode int (the mode is not a sink — only the path is).
+    if name == "fs_read_dir" || name == "fs_size" || name == "fs_is_dir" {
+        if nargs != 1 {
+            cerr(line, name + "() expects 1 str argument")
+        }
+        if is_taint_t(argt.get(0)) {
+            cerr(line, "taint-sink violation: " + name + " argument 1 is " + argt.get(0) + " (tainted values must be sanitised before reaching a sink — use sanitize_path from std.sanitize, or taint_unwrap() if you accept the risk)")
+        }
+    }
+    if name == "fs_set_perms" {
+        if nargs != 2 {
+            cerr(line, "fs_set_perms() expects 2 arguments: str path, int mode")
+        }
+        if is_taint_t(argt.get(0)) {
+            cerr(line, "taint-sink violation: fs_set_perms argument 1 (path) is " + argt.get(0) + " (tainted values must be sanitised before reaching a sink — a tainted path would chmod an attacker-chosen file)")
+        }
+    }
     if name == "write_file" {
         if nargs != 2 {
             cerr(line, "write_file() expects 2 str arguments")
@@ -7528,6 +7558,35 @@ fn check_builtin_call(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, 
         }
         add_edge(ctx, cur, "b:file_exists")
         return "bool"
+    }
+    # ----- Stage 36 (v0.55.0-alpha): filesystem metadata builtins -----
+    if name == "fs_read_dir" {
+        if nargs != 1 || argt.get(0) != "str" {
+            cerr(line, "fs_read_dir() expects 1 str argument")
+        }
+        add_edge(ctx, cur, "b:fs_read_dir")
+        return "list[str]"
+    }
+    if name == "fs_size" {
+        if nargs != 1 || argt.get(0) != "str" {
+            cerr(line, "fs_size() expects 1 str argument")
+        }
+        add_edge(ctx, cur, "b:fs_size")
+        return "int"
+    }
+    if name == "fs_is_dir" {
+        if nargs != 1 || argt.get(0) != "str" {
+            cerr(line, "fs_is_dir() expects 1 str argument")
+        }
+        add_edge(ctx, cur, "b:fs_is_dir")
+        return "bool"
+    }
+    if name == "fs_set_perms" {
+        if nargs != 2 || argt.get(0) != "str" || argt.get(1) != "int" {
+            cerr(line, "fs_set_perms() expects (str path, int mode)")
+        }
+        add_edge(ctx, cur, "b:fs_set_perms")
+        return "void"
     }
     # ----- Stage 8-alpha: ownership primitives (drop / clone / take) -----
     if name == "drop" {
@@ -9013,6 +9072,10 @@ fn runtime_lines() -> list[str] {
     r.push("#include <time.h>")
     r.push("#include <math.h>")
     r.push("#include <sys/stat.h>")
+    # Stage 36 (v0.55.0-alpha): filesystem metadata builtins.
+    # fs_read_dir uses opendir/readdir (declared in dirent.h).
+    # fs_set_perms uses chmod (declared in sys/stat.h, already included).
+    r.push("#include <dirent.h>")
     # Stage 9 release (v0.20.0-alpha): Net / Rand / Proc builtins.
     # net_lookup needs sys/socket.h, netdb.h, netinet/in.h for
     # getaddrinfo. proc_exec uses system() (declared in stdlib.h);
@@ -10598,6 +10661,99 @@ fn runtime_lines() -> list[str] {
     r.push("    return ok;")
     r.push("}")
     r.push("")
+    # ----- Stage 36 (v0.55.0-alpha): filesystem metadata runtime -----
+    # All four helpers consume the path (hl_str_release after use) and
+    # route through hl_sandbox_check (so a sandboxed native binary cannot
+    # escape). The implementations mirror the Stage-0 interpreter:
+    #   fs_read_dir  -> opendir + readdir (sorted by byte-lexicographic
+    #                  order to match the interpreter's sorted(os.listdir))
+    #   fs_size      -> stat() .st_size
+    #   fs_is_dir    -> stat() S_ISDIR
+    #   fs_set_perms -> chmod()
+    # The list[str] returned by fs_read_dir is constructed with
+    # hl_str_release as the elem_free (matching the args() list and the
+    # list[str] contract everywhere else in the runtime).
+    r.push("// hl_fs_read_dir: consumes the path, returns a fresh list[str]")
+    r.push("// of entry NAMES (not full paths). Sorted by byte-lexicographic")
+    r.push("// order so the native binary and the interpreter (which uses")
+    r.push("// sorted(os.listdir(...))) agree on iteration order. The list")
+    r.push("// owns one retain per entry; each entry is a fresh hl_str*.")
+    r.push("static hl_list* hl_fs_read_dir(hl_str* path) {")
+    r.push("    hl_sandbox_check(path->data);")
+    r.push("    DIR* d = opendir(path->data);")
+    r.push("    if (!d) {")
+    r.push("        hl_str_release(path);")
+    r.push("        hl_die(\"fs_read_dir: cannot open directory\");")
+    r.push("    }")
+    r.push("    hl_list* out = hl_list_new(hl_str_release);")
+    r.push("    struct dirent* e;")
+    r.push("    while ((e = readdir(d)) != NULL) {")
+    r.push("        // Skip \".\" and \"..\" — they are always present and")
+    r.push("        // never useful to callers (and they would create")
+    r.push("        // infinite loops in path_walk if included).")
+    r.push("        if (strcmp(e->d_name, \".\") == 0) continue;")
+    r.push("        if (strcmp(e->d_name, \"..\") == 0) continue;")
+    r.push("        int64_t n = (int64_t)strlen(e->d_name);")
+    r.push("        hl_list_push(out, hl_str_from(e->d_name, n));")
+    r.push("    }")
+    r.push("    closedir(d);")
+    r.push("    hl_str_release(path);")
+    r.push("    // Sort the entries by byte-lexicographic order. The list")
+    r.push("    // owns one retain per entry; we use a simple insertion sort")
+    r.push("    // to avoid pulling in qsort_r (which has portability")
+    r.push("    // quirks across glibc / musl / BSD). n is typically small")
+    r.push("    // (a single directory's entries), so O(n²) is fine here.")
+    r.push("    for (int64_t i = 1; i < out->len; i++) {")
+    r.push("        hl_str* v = (hl_str*)out->items[i];")
+    r.push("        int64_t j = i;")
+    r.push("        while (j > 0) {")
+    r.push("            hl_str* prev = (hl_str*)out->items[j - 1];")
+    r.push("            if (hl_str_cmp(prev, v) <= 0) break;")
+    r.push("            out->items[j] = out->items[j - 1];")
+    r.push("            j--;")
+    r.push("        }")
+    r.push("        out->items[j] = v;")
+    r.push("    }")
+    r.push("    return out;")
+    r.push("}")
+    r.push("")
+    r.push("// hl_fs_size: consumes the path, returns the file size in bytes.")
+    r.push("// Panics on stat failure (matches the interpreter).")
+    r.push("static int64_t hl_fs_size(hl_str* path) {")
+    r.push("    hl_sandbox_check(path->data);")
+    r.push("    struct stat st;")
+    r.push("    if (stat(path->data, &st) != 0) {")
+    r.push("        hl_str_release(path);")
+    r.push("        hl_die(\"fs_size: cannot stat\");")
+    r.push("    }")
+    r.push("    hl_str_release(path);")
+    r.push("    return (int64_t)st.st_size;")
+    r.push("}")
+    r.push("")
+    r.push("// hl_fs_is_dir: consumes the path, returns true iff it is a")
+    r.push("// directory. Returns false for non-existent paths (matches")
+    r.push("// file_exists semantics for files).")
+    r.push("static bool hl_fs_is_dir(hl_str* path) {")
+    r.push("    hl_sandbox_check(path->data);")
+    r.push("    struct stat st;")
+    r.push("    bool ok = stat(path->data, &st) == 0 && S_ISDIR(st.st_mode);")
+    r.push("    hl_str_release(path);")
+    r.push("    return ok;")
+    r.push("}")
+    r.push("")
+    r.push("// hl_fs_set_perms: consumes the path. `mode` is the POSIX")
+    r.push("// permission bits (e.g. 0644 = 420 decimal). Panics on chmod")
+    r.push("// failure. The path argument is consumed (one retain) — the")
+    r.push("// mode is a primitive int that needs no cleanup.")
+    r.push("static void hl_fs_set_perms(hl_str* path, int64_t mode) {")
+    r.push("    hl_sandbox_check(path->data);")
+    r.push("    if (chmod(path->data, (mode_t)mode) != 0) {")
+    r.push("        hl_str_release(path);")
+    r.push("        hl_die(\"fs_set_perms: cannot chmod\");")
+    r.push("    }")
+    r.push("    hl_str_release(path);")
+    r.push("}")
+    r.push("")
     # ----- Stage 8-beta: ownership primitives runtime -----
     # clone(str) is the only fixed clone helper in the runtime. Every other
     # clone() helper is generated per type-instantiation by the codegen
@@ -11420,6 +11576,15 @@ fn builtin_arg_borrowed(name: str) -> bool {
         return false
     }
     if name == "file_exists" {
+        return false
+    }
+    # Stage 36 (v0.55.0-alpha): filesystem metadata builtins all
+    # consume the path argument (the C runtime calls hl_str_release
+    # on the path after using it, mirroring read_file). fs_set_perms
+    # also takes a mode int (a primitive — not a refcount concern),
+    # so only the path argument matters here.
+    if name == "fs_read_dir" || name == "fs_size" || name == "fs_is_dir"
+        || name == "fs_set_perms" {
         return false
     }
     if name == "str" || name == "taint_mark" || name == "taint_unwrap" {
@@ -14038,6 +14203,20 @@ fn gen_call(ctx: Ctx, e: int) -> str {
     }
     if name == "file_exists" {
         return "hl_file_exists(" + gen_own_arg(ctx, ctx.exprs[e].args.get(0)) + ")"
+    }
+    # ----- Stage 36 (v0.55.0-alpha): filesystem metadata builtins -----
+    if name == "fs_read_dir" {
+        return "hl_fs_read_dir(" + gen_own_arg(ctx, ctx.exprs[e].args.get(0)) + ")"
+    }
+    if name == "fs_size" {
+        return "hl_fs_size(" + gen_own_arg(ctx, ctx.exprs[e].args.get(0)) + ")"
+    }
+    if name == "fs_is_dir" {
+        return "hl_fs_is_dir(" + gen_own_arg(ctx, ctx.exprs[e].args.get(0)) + ")"
+    }
+    if name == "fs_set_perms" {
+        return "hl_fs_set_perms(" + gen_own_arg(ctx, ctx.exprs[e].args.get(0))
+            + ", " + gen_expr(ctx, ctx.exprs[e].args.get(1)) + ")"
     }
     # ----- Stage 8-beta: ownership primitives -----
     # drop(x): release the value now and null the binding so the

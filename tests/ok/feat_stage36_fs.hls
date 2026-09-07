@@ -1,0 +1,370 @@
+# tests/ok/feat_stage36_fs.hls — Stage 36 (v0.55.0-alpha): std.fs module.
+#
+# Exercises:
+#   - Path: path_from_str, path_from_tainted, path_to_str
+#   - PathBuf: pathbuf_new, pathbuf_from_str, push, pop, len, is_empty, to_path
+#   - Path operations: path_join_str, path_join, path_exists,
+#     path_is_file, path_is_dir, path_size, path_read_dir, path_walk,
+#     path_walk_files, path_set_perms, path_metadata, path_parent,
+#     path_filename, path_extension, path_display, path_is_read_only
+#   - The 4 new builtins: fs_read_dir, fs_size, fs_is_dir, fs_set_perms
+#
+# The test builds a fixture directory tree under /tmp/halis_stage36_fs,
+# walks it, checks metadata for each entry, sets permissions, and
+# verifies the type-level path-traversal safety (a Path constructed
+# from a tainted[str] goes through sanitize_path).
+
+import "std.fs"
+import "std.sanitize"
+import "std.str"
+import "std.option"
+
+# ============================================================================
+# Section 1: Path construction.
+# ============================================================================
+
+fn test_construction() -> int uses IO, Fs {
+    # Trusted: from a clean str literal.
+    let p: Path = path_from_str("/tmp/halis_stage36_fs")
+    if path_to_str(p) != "/tmp/halis_stage36_fs" {
+        panic("path_from_str / path_to_str")
+    }
+
+    # Tainted: from a tainted[str] (simulated). path_from_tainted
+    # calls sanitize_path, which would panic on absolute paths, '..',
+    # NUL, backslashes, Windows drive letters. We use a SAFE relative
+    # path here so the test doesn't panic.
+    let safe_t: tainted[str] = taint_mark("subdir/file.txt")
+    let safe_path: Path = path_from_tainted(safe_t)
+    if path_to_str(safe_path) != "subdir/file.txt" {
+        panic("path_from_tainted (safe): got '" + path_to_str(safe_path) + "'")
+    }
+    return 0
+}
+
+# ============================================================================
+# Section 2: Path introspection.
+# ============================================================================
+
+fn test_introspect() -> int uses IO {
+    let p: Path = path_from_str("/a/b/c.txt")
+    if path_to_str(path_parent(p)) != "/a/b" {
+        let got: str = path_to_str(path_parent(p))
+        panic("path_parent: expected '/a/b', got '" + got + "'")
+    }
+    if path_filename(p) != "c.txt" {
+        panic("path_filename: expected 'c.txt'")
+    }
+    if path_extension(p) != "txt" {
+        panic("path_extension: expected 'txt', got '" + path_extension(p) + "'")
+    }
+
+    # No extension.
+    let p2: Path = path_from_str("noext")
+    if path_extension(p2) != "" {
+        panic("path_extension on noext: expected '', got '" + path_extension(p2) + "'")
+    }
+
+    # Hidden file (leading dot is not an extension marker).
+    let p3: Path = path_from_str("/tmp/.hidden")
+    if path_extension(p3) != "" {
+        panic("path_extension on .hidden: expected '', got '" + path_extension(p3) + "'")
+    }
+    if path_filename(p3) != ".hidden" {
+        panic("path_filename on .hidden: expected '.hidden'")
+    }
+
+    # Trailing dot (no extension after dot).
+    let p4: Path = path_from_str("/a/b.")
+    if path_extension(p4) != "" {
+        panic("path_extension on trailing dot: expected ''")
+    }
+    return 0
+}
+
+# ============================================================================
+# Section 3: PathBuf.
+# ============================================================================
+
+fn test_pathbuf() -> int uses IO {
+    let pb: PathBuf = pathbuf_new()
+    if !pb.is_empty() {
+        panic("pathbuf_new: should be empty")
+    }
+    pb.push("/tmp")
+    pb.push("halis_stage36_fs")
+    pb.push("subdir")
+    pb.push("file.txt")
+    let p: Path = pb.to_path()
+    if path_to_str(p) != "/tmp/halis_stage36_fs/subdir/file.txt" {
+        panic("PathBuf.to_path: got '" + path_to_str(p) + "'")
+    }
+    if pb.len() != 4 {
+        panic("PathBuf.len: expected 4, got " + pb.len().to_str())
+    }
+
+    # Pop.
+    pb.pop()
+    if pb.len() != 3 {
+        panic("PathBuf.len after pop: expected 3")
+    }
+    let p2: Path = pb.to_path()
+    if path_to_str(p2) != "/tmp/halis_stage36_fs/subdir" {
+        panic("PathBuf.to_path after pop: got '" + path_to_str(p2) + "'")
+    }
+
+    # pathbuf_from_str.
+    let pb2: PathBuf = pathbuf_from_str("/var")
+    pb2.push("log")
+    pb2.push("app.log")
+    let p3: Path = pb2.to_path()
+    if path_to_str(p3) != "/var/log/app.log" {
+        panic("pathbuf_from_str + push: got '" + path_to_str(p3) + "'")
+    }
+    return 0
+}
+
+# ============================================================================
+# Section 4: Directory operations (read_dir, walk, walk_files).
+# ============================================================================
+
+fn test_dirs() -> int uses IO, Fs, Proc {
+    # Clean any leftover and build a fixture tree.
+    let _rm_rc: int = proc_exec("rm -rf /tmp/halis_stage36_fs")
+    let _mkdir_rc: int = proc_exec("mkdir -p /tmp/halis_stage36_fs/sub1/deeper /tmp/halis_stage36_fs/sub2")
+    write_file("/tmp/halis_stage36_fs/top.txt", "top-level file\n")
+    write_file("/tmp/halis_stage36_fs/sub1/aa.txt", "sub1 aa\n")
+    write_file("/tmp/halis_stage36_fs/sub1/deeper/bb.txt", "deeper bb\n")
+    write_file("/tmp/halis_stage36_fs/sub2/cc.txt", "sub2 cc\n")
+
+    let root: Path = path_from_str("/tmp/halis_stage36_fs")
+
+    # read_dir: returns entries (sorted).
+    let entries: list[Path] = path_read_dir(root)
+    if entries.len() != 3 {
+        panic("path_read_dir: expected 3 entries (sub1, sub2, top.txt), got " + entries.len().to_str())
+    }
+    # Verify sorted order: sub1, sub2, top.txt.
+    if path_filename(entries.get(0)) != "sub1" {
+        panic("path_read_dir entry 0: expected 'sub1', got '" + path_filename(entries.get(0)) + "'")
+    }
+    if path_filename(entries.get(1)) != "sub2" {
+        panic("path_read_dir entry 1: expected 'sub2'")
+    }
+    if path_filename(entries.get(2)) != "top.txt" {
+        panic("path_read_dir entry 2: expected 'top.txt'")
+    }
+
+    # walk: depth-first, parent first.
+    let all: list[Path] = path_walk(root)
+    # Expected: root, sub1, sub1/aa.txt, sub1/deeper, sub1/deeper/bb.txt,
+    # sub2, sub2/cc.txt, top.txt = 8 entries.
+    if all.len() != 8 {
+        panic("path_walk: expected 8, got " + all.len().to_str())
+    }
+    # First entry is root itself.
+    if path_to_str(all.get(0)) != "/tmp/halis_stage36_fs" {
+        panic("path_walk entry 0: expected root")
+    }
+
+    # walk_files: files only.
+    let files: list[Path] = path_walk_files(root)
+    if files.len() != 4 {
+        panic("path_walk_files: expected 4 files, got " + files.len().to_str())
+    }
+
+    # path_read_dir on a non-directory returns [].
+    let not_dir: Path = path_from_str("/tmp/halis_stage36_fs/top.txt")
+    let empty: list[Path] = path_read_dir(not_dir)
+    if empty.len() != 0 {
+        panic("path_read_dir on a file: expected 0 entries")
+    }
+    return 0
+}
+
+# ============================================================================
+# Section 5: Metadata.
+# ============================================================================
+
+fn test_metadata() -> int uses IO, Fs {
+    let p: Path = path_from_str("/tmp/halis_stage36_fs/top.txt")
+    let md: FsMetadata = path_metadata(p)
+    if md.size != 15 {
+        panic("path_metadata.size: expected 15 (top-level file\\n has 15 bytes), got " + md.size.to_str())
+    }
+    if md.is_dir {
+        panic("path_metadata.is_dir: expected false for a file")
+    }
+    if !md.is_file {
+        panic("path_metadata.is_file: expected true")
+    }
+    if !md.exists {
+        panic("path_metadata.exists: expected true")
+    }
+
+    let d: Path = path_from_str("/tmp/halis_stage36_fs/sub1")
+    let md2: FsMetadata = path_metadata(d)
+    if !md2.is_dir {
+        panic("path_metadata on sub1: expected is_dir=true")
+    }
+    if md2.is_file {
+        panic("path_metadata on sub1: expected is_file=false")
+    }
+    if !md2.exists {
+        panic("path_metadata on sub1: expected exists=true")
+    }
+    if md2.size <= 0 {
+        panic("path_metadata on sub1: expected size > 0 (directory entry size), got " + md2.size.to_str())
+    }
+
+    let nonexistent: Path = path_from_str("/tmp/halis_stage36_fs/does_not_exist")
+    let md3: FsMetadata = path_metadata(nonexistent)
+    if md3.exists {
+        panic("path_metadata on non-existent: expected exists=false")
+    }
+    if md3.is_dir {
+        panic("path_metadata on non-existent: expected is_dir=false")
+    }
+    if md3.is_file {
+        panic("path_metadata on non-existent: expected is_file=false")
+    }
+    if md3.size != 0 {
+        panic("path_metadata on non-existent: expected size=0")
+    }
+    return 0
+}
+
+# ============================================================================
+# Section 6: Permissions.
+# ============================================================================
+
+fn test_perms() -> int uses IO, Fs {
+    let p: Path = path_from_str("/tmp/halis_stage36_fs/perms_test.txt")
+    write_file("/tmp/halis_stage36_fs/perms_test.txt", "permission test\n")
+
+    # 0o600 = 384: rw------- (owner only).
+    path_set_perms(p, 384)
+    # 0o644 = 420: rw-r--r--.
+    path_set_perms(p, 420)
+    # 0o444 = 292: r--r--r-- (read-only for all).
+    path_set_perms(p, 292)
+    # path_is_read_only is a placeholder (always false in Stage 36).
+    if path_is_read_only(p) {
+        panic("path_is_read_only: Stage 36 placeholder should be false")
+    }
+    return 0
+}
+
+# ============================================================================
+# Section 7: Path join operations.
+# ============================================================================
+
+fn test_join() -> int uses IO {
+    let base: Path = path_from_str("/tmp/halis_stage36_fs")
+    let p1: Path = path_join_str(base, "sub1")
+    if path_to_str(p1) != "/tmp/halis_stage36_fs/sub1" {
+        panic("path_join_str sub1: got '" + path_to_str(p1) + "'")
+    }
+
+    let p2: Path = path_join_str(p1, "deeper")
+    if path_to_str(p2) != "/tmp/halis_stage36_fs/sub1/deeper" {
+        panic("path_join_str deeper: got '" + path_to_str(p2) + "'")
+    }
+
+    # join with empty segment.
+    let p3: Path = path_join_str(base, "")
+    if path_to_str(p3) != "/tmp/halis_stage36_fs" {
+        panic("path_join_str '': got '" + path_to_str(p3) + "'")
+    }
+
+    # join with full Path.
+    let p4: Path = path_join(base, path_from_str("leaf.txt"))
+    if path_to_str(p4) != "/tmp/halis_stage36_fs/leaf.txt" {
+        panic("path_join Path: got '" + path_to_str(p4) + "'")
+    }
+
+    # join with base ending in /.
+    let slash_base: Path = path_from_str("/tmp/foo/")
+    let p5: Path = path_join_str(slash_base, "bar")
+    if path_to_str(p5) != "/tmp/foo/bar" {
+        panic("path_join_str slash_base: got '" + path_to_str(p5) + "'")
+    }
+    return 0
+}
+
+# ============================================================================
+# Section 8: Integration — walk + read all files.
+# ============================================================================
+
+fn test_integration() -> int uses IO, Fs {
+    let root: Path = path_from_str("/tmp/halis_stage36_fs")
+    let files: list[Path] = path_walk_files(root)
+
+    # Collect first lines from each file.
+    let lines: list[str] = []
+    let mut i: int = 0
+    while i < files.len() {
+        let f: Path = files.get(i)
+        let content: str = read_file(path_to_str(f))
+        let first: str = first_line_of(content)
+        lines.push(path_filename(f) + "=" + first)
+        i = i + 1
+    }
+
+    # Verify the expected set of files (by filename + first line).
+    # The fixture has 5 files: perms_test.txt, top.txt, sub1/aa.txt,
+    # sub1/deeper/bb.txt, sub2/cc.txt.
+    if files.len() != 5 {
+        panic("integration: expected 5 files, got " + files.len().to_str())
+    }
+
+    # Verify each file's content.
+    let mut found_perms: bool = false
+    let mut found_top: bool = false
+    let mut found_aa: bool = false
+    let mut found_bb: bool = false
+    let mut found_cc: bool = false
+    let mut j: int = 0
+    while j < lines.len() {
+        let entry: str = lines.get(j)
+        if entry == "perms_test.txt=permission test" { found_perms = true }
+        if entry == "top.txt=top-level file" { found_top = true }
+        if entry == "aa.txt=sub1 aa" { found_aa = true }
+        if entry == "bb.txt=deeper bb" { found_bb = true }
+        if entry == "cc.txt=sub2 cc" { found_cc = true }
+        j = j + 1
+    }
+    if !found_perms { panic("integration: perms_test.txt not found") }
+    if !found_top { panic("integration: top.txt not found") }
+    if !found_aa { panic("integration: aa.txt not found") }
+    if !found_bb { panic("integration: bb.txt not found") }
+    if !found_cc { panic("integration: cc.txt not found") }
+    return 0
+}
+
+# first_line_of — return the first line of `s` (without trailing \n).
+fn first_line_of(s: str) -> str {
+    let mut i: int = 0
+    while i < s.len() {
+        if s.byte_at(i) == 10 {  # '\n'
+            return s.slice(0, i)
+        }
+        i = i + 1
+    }
+    return s
+}
+
+fn main() -> int uses IO, Fs, Proc {
+    if test_construction() != 0 { return 1 }
+    if test_introspect() != 0 { return 2 }
+    if test_pathbuf() != 0 { return 3 }
+    if test_dirs() != 0 { return 4 }
+    if test_metadata() != 0 { return 5 }
+    if test_perms() != 0 { return 6 }
+    if test_join() != 0 { return 7 }
+    if test_integration() != 0 { return 8 }
+    # Cleanup the fixture tree.
+    let _rm_rc: int = proc_exec("rm -rf /tmp/halis_stage36_fs")
+    println("stage36 fs ok")
+    return 0
+}

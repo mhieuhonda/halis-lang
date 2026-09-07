@@ -8,7 +8,7 @@ HLC     = src/hlc.hls
 BIN     = bin
 PREFIX  ?= /usr/local
 
-.PHONY: all stage0 bootstrap test examples clean run check bench install uninstall audit opt-stats emit-ir emit-llvm fmt lint lsp-check pkg-init pkg-add pkg-lock pkg-audit pkg-verify pkg-build pkg-publish pkg-log pkg-log-verify prove prove-full model prove-acceptance hltest fuzz cov fuzz-acceptance wasm-opt webapp webapp-acceptance serve aarch64-bench aarch64-acceptance aarch64-list-targets stack-acceptance inline-acceptance opt-stats-report kernel-attrs escape-acceptance layout-report tail-acceptance tail-report asm-acceptance asm-attrs bench-stdlib spec-check stage32-acceptance async-acceptance stream-acceptance io-acceptance
+.PHONY: all stage0 bootstrap test examples clean run check bench install uninstall audit opt-stats emit-ir emit-llvm fmt lint lsp-check pkg-init pkg-add pkg-lock pkg-audit pkg-verify pkg-build pkg-publish pkg-log pkg-log-verify prove prove-full model prove-acceptance hltest fuzz cov fuzz-acceptance wasm-opt webapp webapp-acceptance serve aarch64-bench aarch64-acceptance aarch64-list-targets stack-acceptance inline-acceptance opt-stats-report kernel-attrs escape-acceptance layout-report tail-acceptance tail-report asm-acceptance asm-attrs bench-stdlib spec-check stage32-acceptance async-acceptance stream-acceptance io-acceptance fs-acceptance
 
 # Main goal: use the full bootstrap chain to build the native compiler
 all: bootstrap
@@ -1390,3 +1390,32 @@ io-acceptance: bin/hlc
 	@echo "  differential (interpreter == native) verified green."
 
 .PHONY: io-acceptance
+
+# ============================================================================
+# Stage 36 (v0.55.0-alpha): std.fs -- path abstraction + dir walk + metadata
+# ============================================================================
+fs-acceptance: bin/hlc
+	@$(PYTHON) boot/boot.py examples/fs_demo.hls > /tmp/fs_interp.txt 2>&1
+	@bin/hlc examples/fs_demo.hls /tmp/fs_demo.c 2>/dev/null
+	@gcc -O2 -o /tmp/fs_demo /tmp/fs_demo.c -lm -pthread 2>/dev/null
+	@/tmp/fs_demo > /tmp/fs_nat.txt 2>&1
+	@diff -q /tmp/fs_interp.txt /tmp/fs_nat.txt >/dev/null 2>&1 \
+		|| (echo "FAIL: fs_demo differential mismatch" && false)
+	@$(PYTHON) boot/boot.py tests/ok/feat_stage36_fs.hls > /tmp/s36_interp.txt 2>&1
+	@bin/hlc tests/ok/feat_stage36_fs.hls /tmp/s36.c 2>/dev/null
+	@gcc -O2 -o /tmp/s36 /tmp/s36.c -lm -pthread 2>/dev/null
+	@/tmp/s36 > /tmp/s36_nat.txt 2>&1
+	@diff -q /tmp/s36_interp.txt /tmp/s36_nat.txt >/dev/null 2>&1 \
+		|| (echo "FAIL: feat_stage36_fs differential mismatch" && false)
+	@rm -f /tmp/fs_demo /tmp/fs_demo.c /tmp/fs_interp.txt /tmp/fs_nat.txt \
+		/tmp/s36 /tmp/s36.c /tmp/s36_interp.txt /tmp/s36_nat.txt
+	@rm -rf /tmp/halis_fs_demo /tmp/halis_stage36_fs
+	@echo ""
+	@echo "ACCEPTANCE OK: Stage 36 -- std.fs (path abstraction + dir walk + metadata)"
+	@echo "  fs_read_dir / fs_size / fs_is_dir / fs_set_perms (new builtins)"
+	@echo "  Path / PathBuf / FsMetadata (type-safe path-traversal prevention)"
+	@echo "  path_join / path_walk / path_walk_files / path_metadata"
+	@echo "  path_parent / path_filename / path_extension"
+	@echo "  differential (interpreter == native) verified green."
+
+.PHONY: fs-acceptance

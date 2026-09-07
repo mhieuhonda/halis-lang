@@ -13,6 +13,100 @@ stability (125–140), and final stabilisation toward v1.0 (141–150).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
+## [v0.55.0-alpha] — Stage 36: std.fs (path abstraction + dir walk + metadata)
+
+> Adds `std/fs.hls` — the second module of Phase III (stdlib
+> expansion) — providing a type-safe `Path` abstraction that
+> enforces the path-traversal-safety invariant at the type level
+> (a `Path` cannot be constructed from a `tainted[str]` without
+> `sanitize_path`). Also adds four new compiler builtins
+> (`fs_read_dir`, `fs_size`, `fs_is_dir`, `fs_set_perms`) wired
+> through all four code-paths: `boot/checker.py` (registration +
+> taint-sink enforcement), `boot/interp.py` (Python-side runtime),
+> `src/hlc.hls` (C codegen + C runtime functions), and
+> `tools/llvm_emit.py` (LLVM IR emission).
+
+### Added — Stage 36 (v0.55.0-alpha)
+
+- **Four new compiler builtins (all carry `Fs`, all are taint sinks
+  on the path argument):**
+  - `fs_read_dir(path: str) -> list[str]` — list directory entries
+    (entry NAMES, not full paths; the caller joins with the
+    parent). Sorted by byte-lexicographic order so the interpreter
+    (which uses `sorted(os.listdir(...))`) and the native binary
+    (which uses `opendir`/`readdir` then an insertion sort) agree
+    on iteration order. Skips `.` and `..` (they would create
+    infinite loops in `path_walk` if included).
+  - `fs_size(path: str) -> int` — file size in bytes. Panics on
+    stat failure (mirrors `read_file`).
+  - `fs_is_dir(path: str) -> bool` — true iff the path is a
+    directory. Returns false for non-existent paths (matches
+    `file_exists` semantics for files).
+  - `fs_set_perms(path: str, mode: int) -> void` — chmod the
+    path. `mode` is the POSIX permission bits (HLS has no octal
+    literals — use decimal: `0o644 = 420`, `0o600 = 384`,
+    `0o444 = 292`). Panics on chmod failure.
+- **`std/fs.hls`** library module with:
+  - `Path` struct — encapsulated path. The only way to construct
+    one is `path_from_str` (clean literal) or `path_from_tainted`
+    (sanitised). No public constructor takes a raw `str`.
+  - `PathBuf` struct — mutable path builder (list[str] of segments,
+    joined with `/` at `to_path` time). O(1) push/pop, O(n) build.
+  - `FsMetadata` struct — combined `size`, `is_dir`, `is_file`,
+    `exists`, `read_only`. The `read_only` field is currently
+    always `false` (no `fs_get_perms` builtin yet); the field is
+    present so callers can depend on it without breaking when the
+    get-perms builtin lands.
+  - Construction: `path_from_str(s)`, `path_from_tainted(t)`
+    (calls `sanitize_path`).
+  - Introspection: `path_to_str(p)`, `path_display(p)`,
+    `path_parent(p)`, `path_filename(p)`, `path_extension(p)`.
+  - Operations: `path_exists(p)`, `path_is_file(p)`,
+    `path_is_dir(p)`, `path_size(p)`, `path_read_dir(p) -> list[Path]`,
+    `path_walk(p) -> list[Path]` (recursive depth-first),
+    `path_walk_files(p) -> list[Path]` (files only),
+    `path_set_perms(p, mode)`, `path_metadata(p) -> FsMetadata`,
+    `path_join_str(base, rel)`, `path_join(base, rel)`,
+    `path_is_read_only(p)` (placeholder).
+  - `PathBuf` API: `pathbuf_new()`, `pathbuf_from_str(s)`,
+    `push`, `pop`, `len`, `is_empty`, `to_path`.
+- **`examples/fs_demo.hls`** — 8-section integration demo
+  (Construction, Introspect, PathBuf, Dirs, Metadata, Perms, Join,
+  Integration).
+- **`tests/ok/feat_stage36_fs.hls`** — feature test for the
+  differential suite. Eight sections covering every type and method.
+- **`make fs-acceptance`** — the official Stage 36 gate.
+
+### Added — Compiler builtins wiring
+
+- `boot/checker.py` — `BUILTIN_FNS`, `BUILTIN_EFFECTS`,
+  `SINK_BUILTINS` updated with the four new builtins. Type-check
+  for each builtin (returns `list[str]` / `int` / `bool` / `void`).
+- `boot/interp.py` — runtime semantics for all four builtins
+  (Python-side; uses `os.listdir`/`os.path.getsize`/`os.path.isdir`/
+  `os.chmod`). Routes through `_sandbox_check` for sandbox safety.
+- `src/hlc.hls` — self-hosted compiler mirror:
+  - `is_builtin_fn`, `builtin_effect`, taint-sink check, type
+    inference, `builtin_arg_borrowed` (all four consume the path
+    argument, mirroring `read_file`), and `gen_call` emission.
+  - C runtime: `hl_fs_read_dir`, `hl_fs_size`, `hl_fs_is_dir`,
+    `hl_fs_set_perms` (in the generated C). All route through
+    `hl_sandbox_check` and release the path argument. `fs_read_dir`
+    uses `opendir`/`readdir` and an insertion-sort by
+    `hl_str_cmp` (matches the interpreter's
+    `sorted(os.listdir(...))`). `#include <dirent.h>` added.
+- `tools/llvm_emit.py` — `RUNTIME_DECLS` and `_lower_builtin_call`
+  updated with the four new builtins (matching the C runtime
+  1:1).
+
+### Changed — Stage 36 (v0.55.0-alpha)
+
+- `boot/checker.py`, `boot/interp.py`, `src/hlc.hls`,
+  `tools/llvm_emit.py` — four new builtins registered, type-
+  checked, runtime-implemented, codegen-emitted.
+- `Makefile` — new `fs-acceptance` target. Added to `.PHONY`.
+- `ROADMAP.md` — Stage 36 marked ✅.
+
 ## [v0.54.0-alpha] — Stage 35: std.io (Read/Write traits + BufReader/BufWriter + Cursor + Chain)
 
 > Adds `std/io.hls` — the first module of Phase III (stdlib expansion)
