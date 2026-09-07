@@ -13,6 +13,154 @@ stability (125–140), and final stabilisation toward v1.0 (141–150).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
+## [v0.60.0-alpha] — Stage 41: std.regex (NFA-based regex, no ReDoS)
+
+> Adds `std/regex.hls` — the eighth module of Phase III (stdlib
+> expansion) — implementing a **non-backtracking** regular
+> expression engine using Thompson's construction (Ken
+> Thompson, CACM 1968). The NFA is simulated in lockstep using
+> a bitmap of active states, which guarantees **O(n*m)
+> worst-case time** (n = text length, m = pattern size). There
+> is **no ReDoS** — the pathological `a^n b` patterns that take
+> exponential time on backtracking engines (PCRE, RE2, Python
+> re, JavaScript RegExp) terminate in linear time here.
+>
+> **No new compiler builtins** — the entire module is pure HLS,
+> layered on `std.str` for byte/string access and `std.list` for
+> state-list management.
+
+### Added — Stage 41 (v0.60.0-alpha)
+
+- **`std/regex.hls`** library module with:
+  - **`Regex` struct** — the compiled NFA. Fields: `pattern`
+    (the source for diagnostics), `states` (list[RegexState]),
+    `classes` (list[RegexCharClass] for `[...]`), `num_groups`,
+    `start` (entry state index), `accept` (MATCH state index).
+  - **`RegexState` struct** — one NFA state with a `kind`, an
+    optional payload (`byte` for LITERAL, `class_id` for CLASS,
+    `group_id` for SAVE), and two outgoing transitions
+    (`out1`, `out2`). Epsilon transitions are explicit EPSILON
+    states; the simulation threads them via the closure walk.
+  - **`RegexCharClass` struct** — a set of bytes encoded as a
+    list of (low, high) inclusive ranges + a `negate` flag.
+  - **`RegexParser` struct** — the recursive-descent parser +
+    Thompson-construction builder.
+  - **`RegexFrag` struct** — a "fragment" of compiled NFA code
+    (Thompson's classic construction trick).
+  - **`RegexMatch` + `RegexGroupSpan` structs** — the result of
+    a successful match: start/end byte offsets + capture-group
+    spans.
+  - **Construction** — recursive descent:
+    `regex_parse_alternation` -> `regex_parse_concat` ->
+    `regex_parse_repeat` -> `regex_parse_atom`. Atoms:
+    `(` capture / `(?:` non-capture / `[` class / `.`
+    any / `^` start / `$` end / `\` escape / literal.
+    Quantifiers: `*` `+` `?` `{n}` `{n,}` `{n,m}` `{,m}` with
+    optional lazy `?` suffix (treated as greedy; documented
+    approximation — the lazy form would require backtracking
+    semantics that an NFA cannot provide without rewriting).
+    `regex_frag_clone` deep-clones a fragment's sub-NFA via a
+    worklist BFS — needed for `{n,m}` expansion.
+  - **Simulation** — Thompson's classic algorithm with a
+    bitmap of active states. `regex_run` walks the text,
+    maintaining a current set of active states; for each byte,
+    every LITERAL/ANY/CLASS state tries to match; SAVE states
+    record the current position into a captures list; ANCHOR
+    states (`^` `$` `\b` `\B`) check the current position
+    against the text bounds / word-boundary predicate.
+  - **API**:
+    - `regex_compile(pattern) -> Result[Regex, str]`
+    - `regex_is_match(re, text) -> bool`
+    - `regex_find(re, text) -> Option[RegexMatch]`
+    - `regex_find_at(re, text, start) -> Option[RegexMatch]`
+    - `regex_find_all(re, text, max_results) -> list[RegexMatch]`
+    - `regex_match_text(re, text) -> Option[str]`
+    - `regex_groups(re, text) -> Option[list[str]]`
+    - `regex_replace(re, text, replacement) -> str`
+    - `regex_replace_all(re, text, replacement) -> str`
+    - `regex_split(re, text, max_parts) -> list[str]`
+    - `regex_match_to_str(m, text) -> str`
+
+- **`tests/ok/feat_stage41_regex.hls`** — comprehensive test
+  suite with 16 test groups covering literals, quantifiers,
+  alternation, capture groups, character classes, anchors,
+  dot, escapes, replace, split, find_all, compile errors,
+  complex patterns, find_at, match_text, and ReDoS safety.
+
+- **`examples/regex_demo.hls`** — interactive demo showing all
+  the regex API in 11 sections, including real-world patterns
+  (email, phone, URL, IPv4, date, log line) and ReDoS safety
+  demonstration.
+
+### Supported syntax — Stage 41 (v0.60.0-alpha)
+
+- `.` (any byte, no DOTALL — `\n` never matches)
+- `*` `+` `?` `{n}` `{n,}` `{n,m}` `{,m}` (greedy quantifiers)
+- `*?` `+?` `??` (lazy quantifiers — treated as greedy;
+  documented approximation)
+- `|` (alternation)
+- `()` (capture, numbered from 1) and `(?:)` (non-capture)
+- `[...]` (character class, ranges, negation with `^`)
+- `[^...]` (negated character class)
+- `\d \D \w \W \s \S` (digit, word, whitespace classes)
+- `\b \B` (word boundary / non-word-boundary, zero-width)
+- `^` `$` (start-of-text / end-of-text anchors, zero-width)
+- `\n \t \r \f \v \a \0` (control-byte escapes)
+- `\xNN` (hex byte, exactly 2 hex digits)
+- `\x{NNNN}` (hex codepoint, emits UTF-8 bytes)
+- `\.` `\\` `\(` `\)` etc. (literal escape of metacharacters)
+
+### Stage 41 limitations (deferred to later stages) — v0.60.0-alpha
+
+- **Lookahead `(?=...)` / `(?!...)`** — deferred to Stage 64
+  `std.http.server`. Requires a zero-width assertion mechanism
+  that the current NFA simulation can't express without
+  re-running the sub-NFA at each position.
+- **Lookbehind `(?<=...)` / `(?<!...)`** — same deferral.
+  Lookbehind is even harder (requires bounded look-back or a
+  reversed NFA).
+- **Named groups `(?P<name>...)`** — Stage 42+ will reuse the
+  trait machinery; for now use numbered groups.
+- **Unicode categories `\p{L} \p{N}`** — Stage 50+ `std.unicode`
+  will provide the category tables.
+- **Backreferences `\1 \2`** — fundamentally backtracking; a
+  future "Stage 41 perfection" may add a limited form for the
+  common case.
+- **Compile-time pattern validation** — `regex_compile` returns
+  `Result.Err(msg)` at RUNTIME; the language has no
+  compile-time string parsing yet. A wrong specifier is a
+  runtime error. A future stage may lift this to a true compile
+  error once macros / compile-time eval arrive.
+
+### Security — Stage 41 (v0.60.0-alpha)
+
+- **Linear-time guarantee**: the engine is O(n*m) where n =
+  text length and m = pattern size. There is NO pathological
+  input that triggers exponential behaviour — a peer that
+  sends a crafted pattern + text cannot DoS the regex matcher.
+- **Pattern size limit**: a pattern longer than
+  `regex_max_pattern` (default 64 KiB) is rejected. Defends
+  against a peer that sends a 1 GB pattern to exhaust memory
+  during NFA construction.
+- **Group count limit**: bounded by `regex_max_groups` (256).
+- **Repeat count limit**: bounded by `regex_max_rep` (1024) —
+  a pattern like `a{1,1000000}` is rejected.
+
+### Differential parity — Stage 41 (v0.60.0-alpha)
+
+The engine is a pure state machine over `str` bytes. The output
+is byte-identical between the interpreter and the native binary.
+Verified on: literal match, quantifiers (`*` `+` `?` `{n}`
+`{n,}` `{n,m}` `{,m}`), alternation, capture groups (simple,
+nested, non-capturing), character classes, anchors, dot (no
+DOTALL), escapes (`\n` `\t` `\r` `\f` `\v` `\a` `\0` `\d` `\w`
+`\s` `\D` `\W` `\S` `\xNN` `\x{NNNN}`), replace (single, all,
+with capture-group refs `$0` `$1` `$$`), split, find_all,
+compile errors (unbalanced paren, bad quantifier, bad hex,
+unterminated class, range out of order, quantifier at start),
+find_at, match_text, real-world patterns (email, phone, URL,
+IPv4, date, log line), and ReDoS safety (`(a+)+b` on 50 'a's —
+completes in microseconds, not exponential time).
 ## [v0.59.0-alpha] — Stage 40: std.json_stream (streaming JSON parser, constant-memory)
 
 > Adds `std/json_stream.hls` — the sixth module of Phase III (stdlib

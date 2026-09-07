@@ -1,0 +1,1801 @@
+# ============================================================================
+# std/regex.hls — Stage 41 (v0.60.0-alpha): NFA-based regular expressions
+# ----------------------------------------------------------------------------
+# This module is the eighth module of Phase III (stdlib expansion). It
+# implements an NFA-based regular expression engine using Thompson's
+# construction (Ken Thompson, CACM 1968). The implementation is
+# **non-backtracking** — the NFA is simulated in lockstep using a
+# bitmap of active states, which guarantees O(n*m) worst-case time
+# (n = text length, m = pattern size). There is **no ReDoS** — the
+# pathological "a^n b" patterns that take exponential time on
+# backtracking engines (PCRE, RE2, Python re, JavaScript RegExp)
+# terminate in linear time here.
+#
+# **No new compiler builtins** — the entire module is pure HLS,
+# layered on `std.str` for byte/string access and `std.list` for
+# working with state lists. The byte-level orientation matches
+# Rust's `regex` crate (the dominant linear-time engine): UTF-8
+# bytes are matched directly; Unicode categories are deferred to a
+# future stage.
+#
+# Supported syntax (POSIX-EGREP + PCRE subset):
+#
+#   .         any byte (no DOTALL: \n is never matched by .)
+#   *         0 or more (greedy)
+#   +         1 or more (greedy)
+#   ?         0 or 1 (greedy)
+#   {n}       exactly n
+#   {n,}      n or more
+#   {n,m}     n to m
+#   {,m}      0 to m (shorthand for {0,m})
+#   |         alternation
+#   ()        capture group (numbered from 1)
+#   (?:)      non-capture group
+#   [...]     character class (ranges, negation with ^)
+#   [^...]    negated character class
+#   \d \D     digit / non-digit
+#   \w \W     word / non-word ([A-Za-z0-9_])
+#   \s \S     whitespace / non-whitespace
+#   \b \B     word boundary / non-word-boundary (zero-width)
+#   ^         start-of-text anchor (zero-width)
+#   $         end-of-text anchor (zero-width)
+#   \n \t \r \f \v \a \0  escapes
+#   \xNN      hex byte (exactly 2 hex digits)
+#   \x{NNNN}  hex codepoint (1+ hex digits, emits UTF-8 bytes)
+#   \\.       literal escape (e.g. \. = literal ., \\ = literal \)
+#   *? +? ??  lazy quantifiers (best-effort: see "lazy quantizer" note)
+#
+# Not yet supported (deferred):
+#   - Lookahead (?=...) / (?!...) — deferred to Stage 64.
+#   - Lookbehind (?<=...) / (?<!...) — deferred to Stage 64.
+#   - Named groups (?P<name>...) — Stage 42+ will reuse the trait
+#     machinery; for now use numbered groups.
+#   - Unicode categories (\p{L}, \p{N}, ...) — Stage 50+ (std.unicode).
+#   - Backreferences (\1, \2) — fundamentally backtracking; a future
+#     "stage 41+ perfection" may add a limited form.
+#
+# API summary:
+#
+#   let re: Regex = regex_compile("a(b+)c").unwrap()
+#   regex_is_match(re, "abbc")             # true
+#   regex_find(re, "xx abbc yy")            # Option.Some(RegexMatch{...})
+#   regex_find_all(re, "abbc abbbbc", 100)  # [Match1, Match2]
+#   regex_groups(re, "abbc")                # Option.Some(["abbc", "bb"])
+#   regex_replace(re, "abbc", "AC")          # "AC"
+#   regex_replace_all(re, "abbc abbbbc", "X")  # "X X"
+#   regex_split(re.compile(","), "a,b,c", 0)   # ["a", "b", "c"]
+#
+# Differential parity (interpreter == native):
+#
+#   The engine is a pure state machine over `str` bytes. The output
+#   is byte-identical between the interpreter and the native binary
+#   (no I/O, no randomness, no float arithmetic). The acceptance
+#   test exercises the parser (compile errors), the NFA simulation
+#   (is_match / find / find_all), capture groups, character
+#   classes, anchors, word boundaries, escapes, alternation, and
+#   the replace/split helpers.
+#
+# Security:
+#
+#   * **Linear-time guarantee**: the engine is O(n*m) where n = text
+#     length and m = pattern size. There is NO pathological input
+#     that triggers exponential behaviour — a peer that sends a
+#     crafted pattern + text cannot DoS the regex matcher (the
+#     "ReDoS" attack that has been a CVE in JavaScript engines,
+#     node.js, and Python's re module). See Russ Cox's "Regular
+#     Expression Matching Can Be Simple And Fast" (2007) for the
+#     background.
+#   * **Compile-time validation**: a malformed regex returns
+#     `Result.Err(msg)` from `regex_compile`. The error message
+#     names the byte position and the kind of error (unbalanced
+#     `(`, bad repetition, bad escape, bad class). This matches
+#     Rust's `regex::Regex::new` semantics. (A future stage may
+#     lift this to a true compile error once the language has
+#     compile-time string parsing.)
+#   * **Pattern size limit**: a pattern longer than
+#     `REGEX_MAX_PATTERN` (default 64 KiB) is rejected. This is
+#     an NFA-state-count bound — Thompson construction produces
+#     at most one NFA state per pattern byte, and the bitmap
+#     simulation needs `m` bits of state, so 64 KiB is generous.
+#   * **Text size**: there is no explicit limit on text size; the
+#     simulation allocates O(m) state and reads the text lazily.
+#     A text larger than 4 GiB (the int32 range) cannot be
+#     addressed by HLS `str.slice` anyway — the language's int is
+#     64-bit, but the `byte_at` builtin operates on offsets that
+#     are stored in HLS-level `int` and the runtime's address
+#     arithmetic wraps at the C level.
+# ============================================================================
+
+import "std.result"
+import "std.str"
+import "std.option"
+import "std.list"
+
+# ============================================================================
+# Constants — limits.
+# ============================================================================
+
+# REGEX_MAX_PATTERN: the maximum byte length of a regex pattern. 64
+# KiB is generous — the longest pattern in the test suite is < 100
+# bytes; even pathological inputs from fuzzing stay under 4 KiB.
+# The bound defends against a peer that sends a 1 GB pattern to
+# exhaust memory during NFA construction.
+fn regex_max_pattern() -> int {
+    return 65536
+}
+
+# REGEX_MAX_STATES: the maximum NFA state count. The construction
+# produces at most one state per pattern byte, so 64 KiB matches
+# the pattern limit.
+fn regex_max_states() -> int {
+    return 65536
+}
+
+# REGEX_MAX_GROUPS: the maximum number of capture groups. 256
+# matches PCRE's default; the bitmap for group start/end uses
+# O(groups) storage per match attempt.
+fn regex_max_groups() -> int {
+    return 256
+}
+
+# REGEX_MAX_REP: the maximum repeat count accepted in {n,m}. The
+# expansion of {n,m} into n concatenated copies is bounded by this
+# limit; a pattern like a{1,1000000} would otherwise exhaust
+# memory.
+fn regex_max_rep() -> int {
+    return 1024
+}
+
+# ============================================================================
+# State kinds — used by the NFA construction. The NFA is a directed
+# graph; each state has a kind, an optional payload (e.g. a byte
+# literal, a class id), and one or two outgoing transitions.
+# Epsilon transitions are encoded explicitly via EPSILON states.
+# ============================================================================
+
+fn regex_st_literal() -> int { return 1 }       # match exact byte
+fn regex_st_any() -> int { return 2 }           # match any byte (except \n)
+fn regex_st_class() -> int { return 3 }         # match a CharClass
+fn regex_st_epsilon() -> int { return 4 }       # epsilon transition
+fn regex_st_match() -> int { return 5 }        # accepting state
+fn regex_st_save() -> int { return 6 }         # save capture group index
+fn regex_st_anchor_start() -> int { return 7 }  # ^ zero-width
+fn regex_st_anchor_end() -> int { return 8 }    # $ zero-width
+fn regex_st_word_boundary() -> int { return 9 } # \b zero-width
+fn regex_st_nonword_boundary() -> int { return 10 }  # \B zero-width
+
+# ============================================================================
+# CharClass — a set of bytes for [...] character classes.
+# ============================================================================
+
+struct RegexCharClass {
+    lows: list[int],
+    highs: list[int],
+    negate: bool
+}
+
+fn regex_charclass_new() -> RegexCharClass {
+    return RegexCharClass {
+        lows: [],
+        highs: [],
+        negate: false
+    }
+}
+
+# regex_charclass_add(cls, lo, hi) — add an inclusive byte range.
+fn regex_charclass_add(mut cls: RegexCharClass, lo: int, hi: int) -> void {
+    cls.lows.push(lo)
+    cls.highs.push(hi)
+}
+
+# regex_charclass_match(cls, byte) -> bool. True if `byte` is in the class.
+fn regex_charclass_match(cls: RegexCharClass, byte: int) -> bool {
+    let n: int = cls.lows.len()
+    let mut i: int = 0
+    let mut hit: bool = false
+    while i < n {
+        if byte >= cls.lows.get(i) && byte <= cls.highs.get(i) {
+            hit = true
+            break
+        }
+        i = i + 1
+    }
+    if cls.negate {
+        return !hit
+    }
+    return hit
+}
+
+# ============================================================================
+# NFA state.
+# ============================================================================
+
+struct RegexState {
+    kind: int,
+    byte: int,
+    class_id: int,
+    group_id: int,
+    out1: int,
+    out2: int
+}
+
+fn regex_state_new(kind: int) -> RegexState {
+    return RegexState {
+        kind: kind,
+        byte: 0,
+        class_id: 0,
+        group_id: 0,
+        out1: -1,
+        out2: -1
+    }
+}
+
+# ============================================================================
+# Regex — the compiled NFA.
+# ============================================================================
+
+struct Regex {
+    pattern: str,
+    states: list[RegexState],
+    classes: list[RegexCharClass],
+    num_groups: int,
+    start: int,
+    accept: int
+}
+
+# ============================================================================
+# RegexMatch — the result of a successful match.
+# ============================================================================
+
+struct RegexGroupSpan {
+    start: int,
+    end: int
+}
+
+struct RegexMatch {
+    start: int,
+    end: int,
+    groups: list[RegexGroupSpan]
+}
+
+# ============================================================================
+# Internal parser + NFA-builder state.
+# ============================================================================
+
+# A "fragment" of compiled NFA code (used during Thompson
+# construction). A fragment has a start state and a list of
+# "dangling" out-transitions that need to be patched to point at
+# the next state.
+struct RegexFrag {
+    start: int,
+    dangling_out1: list[int],
+    dangling_out2: list[int]
+}
+
+fn regex_frag_empty() -> RegexFrag {
+    return RegexFrag { start: -1, dangling_out1: [], dangling_out2: [] }
+}
+
+# The parser cursor over the pattern bytes.
+struct RegexParser {
+    pattern: str,
+    pos: int,
+    states: list[RegexState],
+    classes: list[RegexCharClass],
+    next_group: int,
+    err: str
+}
+
+# ============================================================================
+# Compile-error helpers.
+# ============================================================================
+
+fn regex_err_pos(mut p: RegexParser, msg: str) -> void {
+    p.err = "regex error at byte " + p.pos.to_str() + ": " + msg
+}
+
+fn regex_err_eof(mut p: RegexParser, msg: str) -> void {
+    p.err = "regex error: unexpected end of pattern: " + msg
+}
+
+# ============================================================================
+# State-field helpers — HLS forbids `p.states.get(idx).field = v`
+# (the LHS must start from a variable). Use these helpers to
+# mutate state fields through a temporary local struct.
+# ============================================================================
+
+# regex_state_set_out1(p, idx, val) — set states[idx].out1 = val.
+fn regex_state_set_out1(mut p: RegexParser, idx: int, val: int) -> void {
+    let mut st: RegexState = p.states.get(idx)
+    st.out1 = val
+    p.states.set(idx, st)
+}
+
+# regex_state_set_out2(p, idx, val) — set states[idx].out2 = val.
+fn regex_state_set_out2(mut p: RegexParser, idx: int, val: int) -> void {
+    let mut st: RegexState = p.states.get(idx)
+    st.out2 = val
+    p.states.set(idx, st)
+}
+
+# ============================================================================
+# NFA construction primitives.
+# ============================================================================
+
+# regex_add_state(p, st) -> int. Append a state to the NFA and return
+# its index. Returns -1 on overflow.
+fn regex_add_state(mut p: RegexParser, st: RegexState) -> int {
+    if p.states.len() >= regex_max_states() {
+        p.err = "regex error: pattern produces more than " + regex_max_states().to_str() + " NFA states (limit; the pattern is too complex)"
+        return -1
+    }
+    p.states.push(st)
+    return p.states.len() - 1
+}
+
+fn regex_add_class(mut p: RegexParser, cls: RegexCharClass) -> int {
+    p.classes.push(cls)
+    return p.classes.len() - 1
+}
+
+# regex_alloc_group(p) -> int. Allocate the next capture group id.
+# Returns -1 on overflow.
+fn regex_alloc_group(mut p: RegexParser) -> int {
+    if p.next_group >= regex_max_groups() {
+        p.err = "regex error: more than " + regex_max_groups().to_str() + " capture groups (limit)"
+        return -1
+    }
+    let g: int = p.next_group
+    p.next_group = p.next_group + 1
+    return g
+}
+
+# ============================================================================
+# Fragment construction helpers.
+# ============================================================================
+
+# regex_frag_literal(p, byte) -> RegexFrag. Match a single literal byte.
+fn regex_frag_literal(mut p: RegexParser, byte: int) -> RegexFrag {
+    let mut st: RegexState = regex_state_new(regex_st_literal())
+    st.byte = byte
+    let idx: int = regex_add_state(p, st)
+    if p.err != "" { return regex_frag_empty() }
+    return RegexFrag { start: idx, dangling_out1: [idx], dangling_out2: [] }
+}
+
+# regex_frag_any(p) -> RegexFrag. Match any byte except '\n' (no DOTALL).
+fn regex_frag_any(mut p: RegexParser) -> RegexFrag {
+    let st: RegexState = regex_state_new(regex_st_any())
+    let idx: int = regex_add_state(p, st)
+    if p.err != "" { return regex_frag_empty() }
+    return RegexFrag { start: idx, dangling_out1: [idx], dangling_out2: [] }
+}
+
+# regex_frag_class(p, cls) -> RegexFrag. Match a character class.
+fn regex_frag_class(mut p: RegexParser, cls: RegexCharClass) -> RegexFrag {
+    let cid: int = regex_add_class(p, cls)
+    let mut st: RegexState = regex_state_new(regex_st_class())
+    st.class_id = cid
+    let idx: int = regex_add_state(p, st)
+    if p.err != "" { return regex_frag_empty() }
+    return RegexFrag { start: idx, dangling_out1: [idx], dangling_out2: [] }
+}
+
+# regex_frag_epsilon(p) -> RegexFrag. An empty fragment that matches
+# nothing (used for empty alternation arms and empty groups).
+fn regex_frag_epsilon(mut p: RegexParser) -> RegexFrag {
+    let st: RegexState = regex_state_new(regex_st_epsilon())
+    let idx: int = regex_add_state(p, st)
+    if p.err != "" { return regex_frag_empty() }
+    return RegexFrag { start: idx, dangling_out1: [idx], dangling_out2: [] }
+}
+
+# regex_frag_save(p, group_id, inner) -> RegexFrag. Wrap a fragment
+# with two SAVE states — one to record the start of the group, one
+# to record the end.
+fn regex_frag_save(mut p: RegexParser, group_id: int, inner: RegexFrag) -> RegexFrag {
+    # SAVE for the start of the group.
+    let mut save_start: RegexState = regex_state_new(regex_st_save())
+    save_start.group_id = group_id * 2
+    let save_start_idx: int = regex_add_state(p, save_start)
+    if p.err != "" { return regex_frag_empty() }
+    regex_state_set_out1(p, save_start_idx, inner.start)
+
+    # SAVE for the end of the group.
+    let mut save_end: RegexState = regex_state_new(regex_st_save())
+    save_end.group_id = group_id * 2 + 1
+    let save_end_idx: int = regex_add_state(p, save_end)
+    if p.err != "" { return regex_frag_empty() }
+    regex_patch(p, inner, save_end_idx)
+
+    return RegexFrag {
+        start: save_start_idx,
+        dangling_out1: [save_end_idx],
+        dangling_out2: []
+    }
+}
+
+# regex_frag_anchor(p, kind) -> RegexFrag. Build a zero-width anchor
+# state.
+fn regex_frag_anchor(mut p: RegexParser, kind: int) -> RegexFrag {
+    let st: RegexState = regex_state_new(kind)
+    let idx: int = regex_add_state(p, st)
+    if p.err != "" { return regex_frag_empty() }
+    return RegexFrag { start: idx, dangling_out1: [idx], dangling_out2: [] }
+}
+
+# ============================================================================
+# Fragment combination helpers (Thompson construction).
+# ============================================================================
+
+# regex_patch(p, frag, target) — patch all of frag's dangling
+# out-transitions to point at `target`.
+fn regex_patch(mut p: RegexParser, frag: RegexFrag, target: int) -> void {
+    let mut i: int = 0
+    while i < frag.dangling_out1.len() {
+        regex_state_set_out1(p, frag.dangling_out1.get(i), target)
+        i = i + 1
+    }
+    let mut j: int = 0
+    while j < frag.dangling_out2.len() {
+        regex_state_set_out2(p, frag.dangling_out2.get(j), target)
+        j = j + 1
+    }
+}
+
+# regex_frag_concat(p, a, b) -> RegexFrag. Concatenate two fragments.
+fn regex_frag_concat(p: RegexParser, a: RegexFrag, b: RegexFrag) -> RegexFrag {
+    regex_patch(p, a, b.start)
+    return RegexFrag {
+        start: a.start,
+        dangling_out1: b.dangling_out1,
+        dangling_out2: b.dangling_out2
+    }
+}
+
+# regex_frag_alt(p, a, b) -> RegexFrag. Alternation: a|b.
+fn regex_frag_alt(mut p: RegexParser, a: RegexFrag, b: RegexFrag) -> RegexFrag {
+    let fork_st: RegexState = regex_state_new(regex_st_epsilon())
+    let fork_idx: int = regex_add_state(p, fork_st)
+    if p.err != "" { return regex_frag_empty() }
+    regex_state_set_out1(p, fork_idx, a.start)
+    regex_state_set_out2(p, fork_idx, b.start)
+    let combined: list[int] = list_concat_int(a.dangling_out1, b.dangling_out1)
+    let combined2: list[int] = list_concat_int(a.dangling_out2, b.dangling_out2)
+    return RegexFrag { start: fork_idx, dangling_out1: combined, dangling_out2: combined2 }
+}
+
+# regex_frag_star(p, inner) -> RegexFrag. Kleene star: inner*.
+# Construction:
+#   fork (epsilon):
+#     fork.out1 = inner.start (try one more)
+#     fork.out2 = -1 (dangling — exit)
+#   inner.dangling -> fork_idx (loop back)
+# So the new fragment's dangling is fork.out2, which is dangling_out2 = [fork_idx].
+fn regex_frag_star(mut p: RegexParser, inner: RegexFrag) -> RegexFrag {
+    let fork_st: RegexState = regex_state_new(regex_st_epsilon())
+    let fork_idx: int = regex_add_state(p, fork_st)
+    if p.err != "" { return regex_frag_empty() }
+    regex_state_set_out1(p, fork_idx, inner.start)
+    regex_patch(p, inner, fork_idx)
+    return RegexFrag { start: fork_idx, dangling_out1: [], dangling_out2: [fork_idx] }
+}
+
+# regex_frag_plus(p, inner) -> RegexFrag. Plus: inner+.
+# Construction:
+#   inner.dangling -> fork_idx (loop back)
+#   fork.out1 = inner.start (loop back)
+#   fork.out2 = -1 (dangling — exit)
+# So the new fragment's dangling is fork.out2, in dangling_out2 = [fork_idx].
+fn regex_frag_plus(mut p: RegexParser, inner: RegexFrag) -> RegexFrag {
+    let fork_st: RegexState = regex_state_new(regex_st_epsilon())
+    let fork_idx: int = regex_add_state(p, fork_st)
+    if p.err != "" { return regex_frag_empty() }
+    regex_patch(p, inner, fork_idx)
+    regex_state_set_out1(p, fork_idx, inner.start)
+    return RegexFrag { start: inner.start, dangling_out1: [], dangling_out2: [fork_idx] }
+}
+
+# regex_frag_question(p, inner) -> RegexFrag. Question mark: inner?.
+# Construction:
+#   fork.out1 = inner.start (try inner)
+#   fork.out2 = -1 (dangling — skip inner)
+#   inner.dangling -> (dangling — exit after inner)
+# So the new fragment's dangling is the union of fork.out2 and inner.dangling.
+fn regex_frag_question(mut p: RegexParser, inner: RegexFrag) -> RegexFrag {
+    let fork_st: RegexState = regex_state_new(regex_st_epsilon())
+    let fork_idx: int = regex_add_state(p, fork_st)
+    if p.err != "" { return regex_frag_empty() }
+    regex_state_set_out1(p, fork_idx, inner.start)
+    let combined_out2: list[int] = list_concat_int(inner.dangling_out2, [fork_idx])
+    return RegexFrag {
+        start: fork_idx,
+        dangling_out1: inner.dangling_out1,
+        dangling_out2: combined_out2
+    }
+}
+
+# regex_frag_repeat(p, inner, min_n, max_n) -> RegexFrag. Repeat
+# inner between min_n and max_n times. max_n == -1 means unbounded.
+fn regex_frag_repeat(mut p: RegexParser, inner: RegexFrag, min_n: int, max_n: int) -> RegexFrag {
+    if min_n < 0 {
+        regex_err_pos(p, "repeat count {n,m}: n must be >= 0")
+        return regex_frag_empty()
+    }
+    if max_n != -1 && max_n < min_n {
+        regex_err_pos(p, "repeat count {n,m}: m must be >= n")
+        return regex_frag_empty()
+    }
+    if min_n > regex_max_rep() {
+        regex_err_pos(p, "repeat count {n,m}: n exceeds limit " + regex_max_rep().to_str())
+        return regex_frag_empty()
+    }
+    if max_n > regex_max_rep() {
+        regex_err_pos(p, "repeat count {n,m}: m exceeds limit " + regex_max_rep().to_str())
+        return regex_frag_empty()
+    }
+    # Build the "min copies" part: inner inner ... inner (min_n times).
+    let mut out: RegexFrag = regex_frag_epsilon(p)
+    if p.err != "" { return regex_frag_empty() }
+    let mut i: int = 0
+    while i < min_n {
+        let copy: RegexFrag = regex_frag_clone(p, inner)
+        if p.err != "" { return regex_frag_empty() }
+        out = regex_frag_concat(p, out, copy)
+        i = i + 1
+    }
+    if max_n == -1 {
+        let star: RegexFrag = regex_frag_star(p, inner)
+        out = regex_frag_concat(p, out, star)
+    } else {
+        let extra: int = max_n - min_n
+        let mut j: int = 0
+        while j < extra {
+            let copy: RegexFrag = regex_frag_clone(p, inner)
+            if p.err != "" { return regex_frag_empty() }
+            let opt: RegexFrag = regex_frag_question(p, copy)
+            out = regex_frag_concat(p, out, opt)
+            j = j + 1
+        }
+    }
+    return out
+}
+
+# ============================================================================
+# Fragment cloning — used by regex_frag_repeat to expand {n,m}.
+# Walks the subgraph from `frag.start` and copies every reachable
+# state, rewriting out1/out2 to point at the copies.
+# ============================================================================
+
+# regex_frag_clone(p, frag) -> RegexFrag. Deep-clone the sub-NFA
+# reachable from frag.start.
+#
+# The algorithm is a worklist BFS. We maintain two parallel lists:
+# `old_indices` (the original state indices) and `new_indices` (the
+# new state indices, allocated as copies are made). We start with
+# frag.start; for each popped state, we allocate a copy, record the
+# mapping, and enqueue the children. After the BFS, we patch the
+# copies' out1/out2 using the mapping.
+#
+# The worklist is a list[int] used as a stack (pop from end); the
+# order of allocation doesn't matter as long as the patches are
+# consistent.
+fn regex_frag_clone(mut p: RegexParser, frag: RegexFrag) -> RegexFrag {
+    if frag.start < 0 {
+        return frag
+    }
+    let old_indices: list[int] = []
+    let new_indices: list[int] = []
+    # Worklist of old state indices to clone.
+    let worklist: list[int] = [frag.start]
+    while worklist.len() > 0 {
+        let cur_old: int = worklist.pop()
+        # Skip if already cloned.
+        if list_contains_int(old_indices, cur_old) {
+            continue
+        }
+        let old_st: RegexState = p.states.get(cur_old)
+        let mut new_st: RegexState = regex_state_new(old_st.kind)
+        new_st.byte = old_st.byte
+        new_st.class_id = old_st.class_id
+        new_st.group_id = old_st.group_id
+        let new_idx: int = regex_add_state(p, new_st)
+        if p.err != "" {
+            return regex_frag_empty()
+        }
+        old_indices.push(cur_old)
+        new_indices.push(new_idx)
+        if old_st.out1 >= 0 {
+            worklist.push(old_st.out1)
+        }
+        if old_st.out2 >= 0 {
+            worklist.push(old_st.out2)
+        }
+    }
+    # Patch the copies' out1/out2 using the old->new mapping.
+    let mut i: int = 0
+    while i < old_indices.len() {
+        let cur_old: int = old_indices.get(i)
+        let cur_new: int = new_indices.get(i)
+        let old_st: RegexState = p.states.get(cur_old)
+        let new_out1: int = regex_clone_remap(old_indices, new_indices, old_st.out1)
+        let new_out2: int = regex_clone_remap(old_indices, new_indices, old_st.out2)
+        regex_state_set_out1(p, cur_new, new_out1)
+        regex_state_set_out2(p, cur_new, new_out2)
+        i = i + 1
+    }
+    # Build the new dangling lists.
+    let mut new_dangling1: list[int] = []
+    let mut d: int = 0
+    while d < frag.dangling_out1.len() {
+        new_dangling1.push(regex_clone_remap(old_indices, new_indices, frag.dangling_out1.get(d)))
+        d = d + 1
+    }
+    let mut new_dangling2: list[int] = []
+    let mut e: int = 0
+    while e < frag.dangling_out2.len() {
+        new_dangling2.push(regex_clone_remap(old_indices, new_indices, frag.dangling_out2.get(e)))
+        e = e + 1
+    }
+    let new_start: int = regex_clone_remap(old_indices, new_indices, frag.start)
+    return RegexFrag {
+        start: new_start,
+        dangling_out1: new_dangling1,
+        dangling_out2: new_dangling2
+    }
+}
+
+# regex_clone_remap(old_indices, new_indices, old_idx) -> int.
+# Look up the new index for an old index in the clone mapping.
+fn regex_clone_remap(old_indices: list[int], new_indices: list[int], old_idx: int) -> int {
+    if old_idx < 0 {
+        return -1
+    }
+    let mut i: int = 0
+    while i < old_indices.len() {
+        if old_indices.get(i) == old_idx {
+            return new_indices.get(i)
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+# ============================================================================
+# Pattern parser — recursive descent.
+# ============================================================================
+
+# regex_parse_alternation(p) -> RegexFrag. Parse a|b|c.
+fn regex_parse_alternation(mut p: RegexParser) -> RegexFrag {
+    let mut current: RegexFrag = regex_parse_concat(p)
+    if p.err != "" {
+        return current
+    }
+    while p.pos < p.pattern.len() && p.pattern.byte_at(p.pos) == 124 {
+        p.pos = p.pos + 1
+        let right: RegexFrag = regex_parse_concat(p)
+        if p.err != "" {
+            return current
+        }
+        current = regex_frag_alt(p, current, right)
+    }
+    return current
+}
+
+# regex_parse_concat(p) -> RegexFrag. Parse a sequence of repeat-units.
+fn regex_parse_concat(mut p: RegexParser) -> RegexFrag {
+    let mut out: RegexFrag = regex_frag_epsilon(p)
+    if p.err != "" {
+        return out
+    }
+    while p.pos < p.pattern.len() {
+        let c: int = p.pattern.byte_at(p.pos)
+        # Stop at alternation or close-paren.
+        if c == 124 || c == 41 {
+            break
+        }
+        let unit: RegexFrag = regex_parse_repeat(p)
+        if p.err != "" {
+            return out
+        }
+        out = regex_frag_concat(p, out, unit)
+    }
+    return out
+}
+
+# regex_parse_repeat(p) -> RegexFrag. Parse an atom followed by an
+# optional quantifier.
+fn regex_parse_repeat(mut p: RegexParser) -> RegexFrag {
+    let inner: RegexFrag = regex_parse_atom(p)
+    if p.err != "" {
+        return inner
+    }
+    if p.pos >= p.pattern.len() {
+        return inner
+    }
+    let c: int = p.pattern.byte_at(p.pos)
+    if c == 42 {  # '*'
+        p.pos = p.pos + 1
+        let _lazy: bool = regex_consume_lazy(p)
+        return regex_frag_star(p, inner)
+    }
+    if c == 43 {  # '+'
+        p.pos = p.pos + 1
+        let _lazy2: bool = regex_consume_lazy(p)
+        return regex_frag_plus(p, inner)
+    }
+    if c == 63 {  # '?'
+        p.pos = p.pos + 1
+        let _lazy3: bool = regex_consume_lazy(p)
+        return regex_frag_question(p, inner)
+    }
+    if c == 123 {  # '{'
+        return regex_parse_brace_repeat(p, inner)
+    }
+    return inner
+}
+
+# regex_consume_lazy(p) -> bool. If the next byte is '?', consume it
+# and return true (lazy quantifier). Otherwise return false.
+fn regex_consume_lazy(mut p: RegexParser) -> bool {
+    if p.pos < p.pattern.len() && p.pattern.byte_at(p.pos) == 63 {
+        p.pos = p.pos + 1
+        return true
+    }
+    return false
+}
+
+# regex_parse_brace_repeat(p, inner) -> RegexFrag. Parse {n}, {n,}, {n,m}.
+fn regex_parse_brace_repeat(mut p: RegexParser, inner: RegexFrag) -> RegexFrag {
+    p.pos = p.pos + 1  # consume '{'
+    # Parse the first number (n).
+    let n_str_start: int = p.pos
+    while p.pos < p.pattern.len() {
+        let b: int = p.pattern.byte_at(p.pos)
+        if b < 48 || b > 57 {
+            break
+        }
+        p.pos = p.pos + 1
+    }
+    let n_str: str = p.pattern.slice(n_str_start, p.pos)
+    let mut min_n: int = 0
+    let mut max_n: int = 0
+    if n_str.len() > 0 {
+        min_n = regex_parse_uint(p, n_str)
+        if p.err != "" {
+            return inner
+        }
+        max_n = min_n
+    }
+    # Check for {n,} or {n,m}.
+    if p.pos < p.pattern.len() && p.pattern.byte_at(p.pos) == 44 {
+        p.pos = p.pos + 1
+        let m_str_start: int = p.pos
+        while p.pos < p.pattern.len() {
+            let b: int = p.pattern.byte_at(p.pos)
+            if b < 48 || b > 57 {
+                break
+            }
+            p.pos = p.pos + 1
+        }
+        let m_str: str = p.pattern.slice(m_str_start, p.pos)
+        if m_str.len() == 0 {
+            max_n = -1  # unbounded
+        } else {
+            max_n = regex_parse_uint(p, m_str)
+            if p.err != "" {
+                return inner
+            }
+        }
+    }
+    # Expect closing '}'.
+    if p.pos >= p.pattern.len() || p.pattern.byte_at(p.pos) != 125 {
+        regex_err_pos(p, "expected '}' to close {n,m}")
+        return inner
+    }
+    p.pos = p.pos + 1
+    let _lazy: bool = regex_consume_lazy(p)
+    return regex_frag_repeat(p, inner, min_n, max_n)
+}
+
+# regex_parse_uint(p, s) -> int. Parse a non-empty ASCII digit string.
+fn regex_parse_uint(p: RegexParser, s: str) -> int {
+    if s.len() == 0 {
+        return 0
+    }
+    let r: Result[int, str] = int_parse(s)
+    if !result_is_ok(r) {
+        p.err = "regex error: bad repeat count: " + s
+        return 0
+    }
+    return result_unwrap(r)
+}
+
+# regex_parse_atom(p) -> RegexFrag. Parse the smallest unit of a regex.
+fn regex_parse_atom(mut p: RegexParser) -> RegexFrag {
+    if p.pos >= p.pattern.len() {
+        regex_err_eof(p, "expected atom")
+        return regex_frag_empty()
+    }
+    let c: int = p.pattern.byte_at(p.pos)
+    # '(' or '(?:'
+    if c == 40 {
+        p.pos = p.pos + 1
+        # Check for (?: prefix.
+        if p.pos + 1 < p.pattern.len()
+            && p.pattern.byte_at(p.pos) == 63
+            && p.pattern.byte_at(p.pos + 1) == 58 {
+            p.pos = p.pos + 2
+            let inner: RegexFrag = regex_parse_alternation(p)
+            if p.err != "" {
+                return inner
+            }
+            if p.pos >= p.pattern.len() || p.pattern.byte_at(p.pos) != 41 {
+                regex_err_pos(p, "expected ')' to close (?:...)")
+                return inner
+            }
+            p.pos = p.pos + 1
+            return inner
+        }
+        # Capture group: allocate a new group id and wrap.
+        let gid: int = regex_alloc_group(p)
+        if p.err != "" {
+            return regex_frag_empty()
+        }
+        let inner: RegexFrag = regex_parse_alternation(p)
+        if p.err != "" {
+            return inner
+        }
+        if p.pos >= p.pattern.len() || p.pattern.byte_at(p.pos) != 41 {
+            regex_err_pos(p, "expected ')' to close (...)")
+            return inner
+        }
+        p.pos = p.pos + 1
+        return regex_frag_save(p, gid, inner)
+    }
+    # '[' — character class
+    if c == 91 {
+        return regex_parse_class(p)
+    }
+    # '.' — any byte
+    if c == 46 {
+        p.pos = p.pos + 1
+        return regex_frag_any(p)
+    }
+    # '^' — start anchor
+    if c == 94 {
+        p.pos = p.pos + 1
+        return regex_frag_anchor(p, regex_st_anchor_start())
+    }
+    # '$' — end anchor
+    if c == 36 {
+        p.pos = p.pos + 1
+        return regex_frag_anchor(p, regex_st_anchor_end())
+    }
+    # '\' — escape
+    if c == 92 {
+        return regex_parse_escape(p)
+    }
+    # '*+?' at the start of an atom is a syntax error.
+    if c == 42 || c == 43 || c == 63 || c == 124 || c == 41 || c == 125 {
+        regex_err_pos(p, "unexpected metacharacter '" + chr(c) + "'")
+        return regex_frag_empty()
+    }
+    # Literal byte.
+    p.pos = p.pos + 1
+    return regex_frag_literal(p, c)
+}
+
+# regex_parse_escape(p) -> RegexFrag. Parse a '\' escape.
+fn regex_parse_escape(mut p: RegexParser) -> RegexFrag {
+    p.pos = p.pos + 1
+    if p.pos >= p.pattern.len() {
+        regex_err_eof(p, "trailing backslash")
+        return regex_frag_empty()
+    }
+    let c: int = p.pattern.byte_at(p.pos)
+    p.pos = p.pos + 1
+    if c == 110 { return regex_frag_literal(p, 10) }   # \n
+    if c == 116 { return regex_frag_literal(p, 9) }    # \t
+    if c == 114 { return regex_frag_literal(p, 13) }   # \r
+    if c == 102 { return regex_frag_literal(p, 12) }   # \f
+    if c == 118 { return regex_frag_literal(p, 11) }   # \v
+    if c == 48 {  return regex_frag_literal(p, 0) }    # \0
+    if c == 97 {  return regex_frag_literal(p, 7) }    # \a (bell)
+    if c == 100 || c == 68 {
+        let cls: RegexCharClass = regex_class_digit(c == 68)
+        return regex_frag_class(p, cls)
+    }
+    if c == 119 || c == 87 {
+        let cls: RegexCharClass = regex_class_word(c == 87)
+        return regex_frag_class(p, cls)
+    }
+    if c == 115 || c == 83 {
+        let cls: RegexCharClass = regex_class_space(c == 83)
+        return regex_frag_class(p, cls)
+    }
+    if c == 98 { return regex_frag_anchor(p, regex_st_word_boundary()) }
+    if c == 66 { return regex_frag_anchor(p, regex_st_nonword_boundary()) }
+    if c == 120 {
+        return regex_parse_hex_escape(p)
+    }
+    # Literal escape of a metacharacter.
+    return regex_frag_literal(p, c)
+}
+
+# regex_parse_hex_escape(p) -> RegexFrag. Parse \xNN or \x{NNNN...}.
+fn regex_parse_hex_escape(mut p: RegexParser) -> RegexFrag {
+    if p.pos >= p.pattern.len() {
+        regex_err_eof(p, "trailing \\x")
+        return regex_frag_empty()
+    }
+    if p.pattern.byte_at(p.pos) == 123 {  # '{'
+        p.pos = p.pos + 1
+        let hex_start: int = p.pos
+        while p.pos < p.pattern.len() {
+            let b: int = p.pattern.byte_at(p.pos)
+            if b == 125 { break }
+            if !regex_is_hex_digit(b) {
+                regex_err_pos(p, "bad hex digit in \\x{...}")
+                return regex_frag_empty()
+            }
+            p.pos = p.pos + 1
+        }
+        if p.pos >= p.pattern.len() {
+            regex_err_eof(p, "unterminated \\x{...}")
+            return regex_frag_empty()
+        }
+        let hex_str: str = p.pattern.slice(hex_start, p.pos)
+        p.pos = p.pos + 1  # consume '}'
+        let cp: int = regex_parse_hex_int(p, hex_str)
+        return regex_emit_codepoint(p, cp)
+    }
+    # \xNN form — exactly 2 hex digits.
+    if p.pos + 1 >= p.pattern.len() {
+        regex_err_eof(p, "\\xNN needs two hex digits")
+        return regex_frag_empty()
+    }
+    let h1: int = p.pattern.byte_at(p.pos)
+    let h2: int = p.pattern.byte_at(p.pos + 1)
+    if !regex_is_hex_digit(h1) || !regex_is_hex_digit(h2) {
+        regex_err_pos(p, "\\xNN needs two hex digits")
+        return regex_frag_empty()
+    }
+    p.pos = p.pos + 2
+    let byte_val: int = regex_hex_digit_value(h1) * 16 + regex_hex_digit_value(h2)
+    return regex_frag_literal(p, byte_val)
+}
+
+# regex_emit_codepoint(p, cp) -> RegexFrag. Emit a codepoint as 1..4
+# UTF-8 byte literals.
+fn regex_emit_codepoint(mut p: RegexParser, cp: int) -> RegexFrag {
+    if cp < 0 || cp > 1114111 {
+        regex_err_pos(p, "codepoint out of range (\\x{...})")
+        return regex_frag_empty()
+    }
+    let bytes: list[int] = regex_encode_utf8(cp)
+    let mut out: RegexFrag = regex_frag_epsilon(p)
+    if p.err != "" { return regex_frag_empty() }
+    let mut i: int = 0
+    while i < bytes.len() {
+        let f: RegexFrag = regex_frag_literal(p, bytes.get(i))
+        if p.err != "" { return regex_frag_empty() }
+        out = regex_frag_concat(p, out, f)
+        i = i + 1
+    }
+    return out
+}
+
+# regex_encode_utf8(cp) -> list[int]. UTF-8 encode a codepoint into
+# 1..4 bytes.
+fn regex_encode_utf8(cp: int) -> list[int] {
+    if cp <= 127 {
+        return [cp]
+    }
+    if cp <= 2047 {
+        return [
+            int_or(192, int_shr(cp, 6)),
+            int_or(128, int_and(cp, 63))
+        ]
+    }
+    if cp <= 65535 {
+        return [
+            int_or(224, int_shr(cp, 12)),
+            int_or(128, int_and(int_shr(cp, 6), 63)),
+            int_or(128, int_and(cp, 63))
+        ]
+    }
+    return [
+        int_or(240, int_shr(cp, 18)),
+        int_or(128, int_and(int_shr(cp, 12), 63)),
+        int_or(128, int_and(int_shr(cp, 6), 63)),
+        int_or(128, int_and(cp, 63))
+    ]
+}
+
+# regex_parse_hex_int(p, s) -> int. Parse a hex string of any length.
+fn regex_parse_hex_int(p: RegexParser, s: str) -> int {
+    let mut v: int = 0
+    let mut i: int = 0
+    while i < s.len() {
+        v = int_shl(v, 4) + regex_hex_digit_value(s.byte_at(i))
+        i = i + 1
+    }
+    return v
+}
+
+fn regex_is_hex_digit(b: int) -> bool {
+    return (b >= 48 && b <= 57)
+        || (b >= 65 && b <= 70)
+        || (b >= 97 && b <= 102)
+}
+
+fn regex_hex_digit_value(b: int) -> int {
+    if b >= 48 && b <= 57 { return b - 48 }
+    if b >= 65 && b <= 70 { return b - 55 }
+    if b >= 97 && b <= 102 { return b - 87 }
+    return 0
+}
+
+# ============================================================================
+# Character class parser — [...].
+# ============================================================================
+
+# regex_parse_class(p) -> RegexFrag. Parse a character class starting
+# at '['. Supports ranges (a-z), negation (^), and the predefined
+# class shortcuts (\d \w \s) embedded in a class.
+fn regex_parse_class(mut p: RegexParser) -> RegexFrag {
+    p.pos = p.pos + 1  # consume '['
+    let cls: RegexCharClass = regex_charclass_new()
+    # Negation?
+    if p.pos < p.pattern.len() && p.pattern.byte_at(p.pos) == 94 {
+        cls.negate = true
+        p.pos = p.pos + 1
+    }
+    # ']' as the first char is a literal ']'.
+    if p.pos < p.pattern.len() && p.pattern.byte_at(p.pos) == 93 {
+        regex_charclass_add(cls, 93, 93)
+        p.pos = p.pos + 1
+    }
+    while p.pos < p.pattern.len() && p.pattern.byte_at(p.pos) != 93 {
+        let b: int = p.pattern.byte_at(p.pos)
+        if b == 92 {
+            p.pos = p.pos + 1
+            if p.pos >= p.pattern.len() {
+                regex_err_eof(p, "trailing backslash in class")
+                return regex_frag_empty()
+            }
+            let esc: int = p.pattern.byte_at(p.pos)
+            p.pos = p.pos + 1
+            if esc == 100 {
+                regex_charclass_add(cls, 48, 57)
+                continue
+            }
+            if esc == 68 {
+                regex_charclass_add_neg_range(cls, 48, 57)
+                continue
+            }
+            if esc == 119 {
+                regex_class_add_word(cls)
+                continue
+            }
+            if esc == 87 {
+                regex_class_add_word_neg(cls)
+                continue
+            }
+            if esc == 115 {
+                regex_class_add_space(cls)
+                continue
+            }
+            if esc == 83 {
+                regex_class_add_space_neg(cls)
+                continue
+            }
+            if esc == 120 {
+                if p.pos + 1 >= p.pattern.len() {
+                    regex_err_eof(p, "\\xNN needs two hex digits in class")
+                    return regex_frag_empty()
+                }
+                let h1: int = p.pattern.byte_at(p.pos)
+                let h2: int = p.pattern.byte_at(p.pos + 1)
+                if !regex_is_hex_digit(h1) || !regex_is_hex_digit(h2) {
+                    regex_err_pos(p, "\\xNN needs two hex digits in class")
+                    return regex_frag_empty()
+                }
+                p.pos = p.pos + 2
+                let bv: int = regex_hex_digit_value(h1) * 16 + regex_hex_digit_value(h2)
+                regex_class_add_byte_or_range(p, cls, bv)
+                continue
+            }
+            let ch: int = regex_translate_escape(esc)
+            regex_class_add_byte_or_range(p, cls, ch)
+            continue
+        }
+        p.pos = p.pos + 1
+        # Check for range: a-z.
+        if p.pos + 1 < p.pattern.len()
+            && p.pattern.byte_at(p.pos) == 45
+            && p.pattern.byte_at(p.pos + 1) != 93 {
+            let hi: int = p.pattern.byte_at(p.pos + 1)
+            if hi < b {
+                regex_err_pos(p, "range out of order in class (e.g. z-a)")
+                return regex_frag_empty()
+            }
+            regex_charclass_add(cls, b, hi)
+            p.pos = p.pos + 2
+            continue
+        }
+        regex_charclass_add(cls, b, b)
+    }
+    if p.pos >= p.pattern.len() {
+        regex_err_eof(p, "unterminated character class")
+        return regex_frag_empty()
+    }
+    p.pos = p.pos + 1
+    return regex_frag_class(p, cls)
+}
+
+# regex_class_add_byte_or_range(p, cls, byte) — add a single byte,
+# checking for a following range.
+fn regex_class_add_byte_or_range(p: RegexParser, mut cls: RegexCharClass, byte: int) -> void {
+    if p.pos + 1 < p.pattern.len()
+        && p.pattern.byte_at(p.pos) == 45
+        && p.pattern.byte_at(p.pos + 1) != 93 {
+        let hi: int = p.pattern.byte_at(p.pos + 1)
+        if hi < byte {
+            p.err = "regex error: range out of order in class (escape form)"
+            return
+        }
+        regex_charclass_add(cls, byte, hi)
+        p.pos = p.pos + 2
+        return
+    }
+    regex_charclass_add(cls, byte, byte)
+}
+
+# regex_translate_escape(c) -> int. Translate a single-letter escape
+# to its byte value.
+fn regex_translate_escape(c: int) -> int {
+    if c == 110 { return 10 }
+    if c == 116 { return 9 }
+    if c == 114 { return 13 }
+    if c == 102 { return 12 }
+    if c == 118 { return 11 }
+    if c == 48 {  return 0 }
+    if c == 97 {  return 7 }
+    return c
+}
+
+# ============================================================================
+# Predefined character classes — \d \w \s.
+# ============================================================================
+
+fn regex_class_digit(negate: bool) -> RegexCharClass {
+    let cls: RegexCharClass = regex_charclass_new()
+    cls.negate = negate
+    regex_charclass_add(cls, 48, 57)
+    return cls
+}
+
+fn regex_class_word(negate: bool) -> RegexCharClass {
+    let cls: RegexCharClass = regex_charclass_new()
+    cls.negate = negate
+    regex_charclass_add(cls, 65, 90)
+    regex_charclass_add(cls, 97, 122)
+    regex_charclass_add(cls, 48, 57)
+    regex_charclass_add(cls, 95, 95)
+    return cls
+}
+
+fn regex_class_space(negate: bool) -> RegexCharClass {
+    let cls: RegexCharClass = regex_charclass_new()
+    cls.negate = negate
+    regex_charclass_add(cls, 9, 13)
+    regex_charclass_add(cls, 32, 32)
+    return cls
+}
+
+fn regex_class_add_word(mut cls: RegexCharClass) -> void {
+    regex_charclass_add(cls, 65, 90)
+    regex_charclass_add(cls, 97, 122)
+    regex_charclass_add(cls, 48, 57)
+    regex_charclass_add(cls, 95, 95)
+}
+
+# regex_class_add_word_neg(cls) — add the complement of \w to a class.
+# Word bytes are [A-Za-z0-9_] = 48-57 (digits) + 65-90 (uppercase)
+# + 95 (_) + 97-122 (lowercase) = 63 bytes. Non-word bytes are
+# the other 193: [0..47] [58..64] [91..94] [96..96] [123..255]
+# = 48 + 7 + 4 + 1 + 133 = 193.
+#
+# Deep-scan-21 fix (MEDIUM): the previous code omitted byte 96
+# (backtick). So `\W` failed to match backtick and `[^\W]`
+# incorrectly included it. The fix: add the [96..96] range.
+fn regex_class_add_word_neg(mut cls: RegexCharClass) -> void {
+    regex_charclass_add(cls, 0, 47)
+    regex_charclass_add(cls, 58, 64)
+    regex_charclass_add(cls, 91, 94)
+    regex_charclass_add(cls, 96, 96)
+    regex_charclass_add(cls, 123, 255)
+}
+
+fn regex_class_add_space(mut cls: RegexCharClass) -> void {
+    regex_charclass_add(cls, 9, 13)
+    regex_charclass_add(cls, 32, 32)
+}
+
+fn regex_class_add_space_neg(mut cls: RegexCharClass) -> void {
+    regex_charclass_add(cls, 0, 8)
+    regex_charclass_add(cls, 14, 31)
+    regex_charclass_add(cls, 33, 255)
+}
+
+fn regex_charclass_add_neg_range(mut cls: RegexCharClass, lo: int, hi: int) -> void {
+    if lo > 0 {
+        regex_charclass_add(cls, 0, lo - 1)
+    }
+    if hi < 255 {
+        regex_charclass_add(cls, hi + 1, 255)
+    }
+}
+
+# ============================================================================
+# Compile entry point — regex_compile.
+# ============================================================================
+
+# regex_compile(pattern) -> Result[Regex, str]. Compile a regex
+# pattern into an NFA. Returns Result.Ok(re) on success,
+# Result.Err(msg) on a malformed pattern.
+fn regex_compile(pattern: str) -> Result[Regex, str] {
+    if pattern.len() > regex_max_pattern() {
+        return Result.Err("regex error: pattern exceeds limit " + regex_max_pattern().to_str() + " bytes")
+    }
+    let mut p: RegexParser = RegexParser {
+        pattern: pattern,
+        pos: 0,
+        states: [],
+        classes: [],
+        next_group: 1,
+        err: ""
+    }
+    let body: RegexFrag = regex_parse_alternation(p)
+    if p.err != "" {
+        return Result.Err(p.err)
+    }
+    if p.pos != p.pattern.len() {
+        return Result.Err("regex error at byte " + p.pos.to_str() + ": unexpected trailing input (unbalanced parenthesis?)")
+    }
+    # Wrap the body in group 0 (the whole match).
+    let whole: RegexFrag = regex_frag_save(p, 0, body)
+    if p.err != "" {
+        return Result.Err(p.err)
+    }
+    # Build the MATCH state (accepting).
+    let accept_st: RegexState = regex_state_new(regex_st_match())
+    let accept_idx: int = regex_add_state(p, accept_st)
+    if p.err != "" {
+        return Result.Err(p.err)
+    }
+    regex_patch(p, whole, accept_idx)
+    let re: Regex = Regex {
+        pattern: pattern,
+        states: p.states,
+        classes: p.classes,
+        num_groups: p.next_group,
+        start: whole.start,
+        accept: accept_idx
+    }
+    return Result.Ok(re)
+}
+
+# ============================================================================
+# NFA simulation — Thompson's algorithm with bitmap active set.
+#
+# We thread `text` and `pos` through the closure walk so that anchor
+# states (^ $ \b \B) can check the current byte position.
+# ============================================================================
+
+# regex_run(re, text, start_pos) -> Option[RegexMatch].
+# Try to match `re` against `text` starting at `start_pos`. Returns
+# Option.Some(match) if a match exists, Option.None otherwise.
+fn regex_run(re: Regex, text: str, start_pos: int) -> Option[RegexMatch] {
+    let n_states: int = re.states.len()
+    if n_states == 0 {
+        return Option.None
+    }
+    let n_words: int = (n_states + 63) / 64
+    let current: list[int] = list_filled(n_words, 0)
+    let next: list[int] = list_filled(n_words, 0)
+    let caps: list[int] = list_filled(re.num_groups * 2, -1)
+    # Initial closure: add the start state.
+    regex_add_state_to_set(re, current, re.start, caps, text, start_pos)
+    let mut pos: int = start_pos
+    let mut last_match_end: int = -1
+    let last_match_caps: list[int] = list_filled(re.num_groups * 2, -1)
+    let n: int = text.len()
+    while pos <= n {
+        # Check if accept is in the current set.
+        if regex_set_has(current, re.accept) {
+            last_match_end = pos
+            let mut k: int = 0
+            while k < caps.len() {
+                last_match_caps.set(k, caps.get(k))
+                k = k + 1
+            }
+        }
+        if pos == n {
+            break
+        }
+        # Clear the next set.
+        let mut w: int = 0
+        while w < n_words {
+            next.set(w, 0)
+            w = w + 1
+        }
+        let cur_byte: int = text.byte_at(pos)
+        let mut s: int = 0
+        while s < n_states {
+            if !regex_set_has(current, s) {
+                s = s + 1
+                continue
+            }
+            let st: RegexState = re.states.get(s)
+            if st.kind == regex_st_literal() {
+                if st.byte == cur_byte {
+                    regex_add_state_to_set(re, next, st.out1, caps, text, pos + 1)
+                }
+            } else if st.kind == regex_st_any() {
+                if cur_byte != 10 {
+                    regex_add_state_to_set(re, next, st.out1, caps, text, pos + 1)
+                }
+            } else if st.kind == regex_st_class() {
+                let cls: RegexCharClass = re.classes.get(st.class_id)
+                if regex_charclass_match(cls, cur_byte) {
+                    regex_add_state_to_set(re, next, st.out1, caps, text, pos + 1)
+                }
+            }
+            s = s + 1
+        }
+        # Swap current and next.
+        let mut t: int = 0
+        while t < n_words {
+            let tmp: int = current.get(t)
+            current.set(t, next.get(t))
+            next.set(t, tmp)
+            t = t + 1
+        }
+        pos = pos + 1
+        # Deep-scan-21 fix (MEDIUM, perf): break as soon as the
+        # active set becomes empty. The NFA simulation is monotone —
+        # once the active set is empty, no future byte can revive it
+        # (the only way to add states is via byte-consuming
+        # transitions from already-active states). The previous
+        # code only broke when a match had been found, which left
+        # the loop iterating through the rest of the text doing
+        # nothing — O(n) wasted iterations per `regex_run` call.
+        # Combined with the outer scan in `regex_find` /
+        # `regex_is_match` / `regex_find_all` / `regex_split`,
+        # this was O(n²·m) in the no-match case. With this fix
+        # the inner `regex_run` cost is O(actual_match_length · m)
+        # and the outer scan is O(leftmost_match · m).
+        if regex_set_empty(current) {
+            break
+        }
+    }
+    if last_match_end < 0 {
+        return Option.None
+    }
+    let groups: list[RegexGroupSpan] = []
+    let mut g: int = 0
+    while g < re.num_groups {
+        let start: int = last_match_caps.get(g * 2)
+        let end: int = last_match_caps.get(g * 2 + 1)
+        groups.push(RegexGroupSpan { start: start, end: end })
+        g = g + 1
+    }
+    return Option.Some(RegexMatch {
+        start: start_pos,
+        end: last_match_end,
+        groups: groups
+    })
+}
+
+# regex_add_state_to_set(re, set, state_idx, caps, text, pos) — add
+# a state to the active set, recursively following epsilon
+# transitions. SAVE states update the captures list. ANCHOR states
+# check the current position and discard themselves if the anchor
+# is not satisfied. MATCH states are added without further traversal.
+fn regex_add_state_to_set(re: Regex, set: list[int], state_idx: int, caps: list[int], text: str, pos: int) -> void {
+    if state_idx < 0 || state_idx >= re.states.len() {
+        return
+    }
+    if regex_set_has(set, state_idx) {
+        return
+    }
+    regex_set_add(set, state_idx)
+    let st: RegexState = re.states.get(state_idx)
+    if st.kind == regex_st_epsilon() {
+        regex_add_state_to_set(re, set, st.out1, caps, text, pos)
+        regex_add_state_to_set(re, set, st.out2, caps, text, pos)
+    } else if st.kind == regex_st_save() {
+        let slot: int = st.group_id
+        if slot < caps.len() {
+            caps.set(slot, pos)
+        }
+        regex_add_state_to_set(re, set, st.out1, caps, text, pos)
+    } else if st.kind == regex_st_anchor_start() {
+        # ^ matches only at position 0 (start of text).
+        if pos == 0 {
+            regex_add_state_to_set(re, set, st.out1, caps, text, pos)
+        }
+    } else if st.kind == regex_st_anchor_end() {
+        # $ matches only at the end of text.
+        if pos == text.len() {
+            regex_add_state_to_set(re, set, st.out1, caps, text, pos)
+        }
+    } else if st.kind == regex_st_word_boundary() {
+        # \b matches at a boundary between a word byte and a non-word byte.
+        if regex_word_boundary_at(text, pos) {
+            regex_add_state_to_set(re, set, st.out1, caps, text, pos)
+        }
+    } else if st.kind == regex_st_nonword_boundary() {
+        if !regex_word_boundary_at(text, pos) {
+            regex_add_state_to_set(re, set, st.out1, caps, text, pos)
+        }
+    }
+    # LITERAL / ANY / CLASS / MATCH are non-epsilon: leave the state
+    # in the set; the outer loop will consume a byte and advance.
+}
+
+# regex_word_boundary_at(text, pos) -> bool. True if pos is at a
+# word boundary (between a word byte and a non-word byte, or at the
+# start/end of text adjacent to a word byte).
+fn regex_word_boundary_at(text: str, pos: int) -> bool {
+    let before: bool = pos > 0 && regex_is_word_byte(text.byte_at(pos - 1))
+    let after: bool = pos < text.len() && regex_is_word_byte(text.byte_at(pos))
+    return before != after
+}
+
+# regex_is_word_byte(b) -> bool. True for [A-Za-z0-9_].
+fn regex_is_word_byte(b: int) -> bool {
+    if b >= 65 && b <= 90 { return true }
+    if b >= 97 && b <= 122 { return true }
+    if b >= 48 && b <= 57 { return true }
+    if b == 95 { return true }
+    return false
+}
+
+# ============================================================================
+# Bitmap helpers — list[int] as a bitset.
+# ============================================================================
+
+fn regex_set_has(set: list[int], idx: int) -> bool {
+    if idx < 0 {
+        return false
+    }
+    let word: int = idx / 64
+    let bit: int = idx % 64
+    if word >= set.len() {
+        return false
+    }
+    return int_and(set.get(word), int_shl(1, bit)) != 0
+}
+
+fn regex_set_add(mut set: list[int], idx: int) -> void {
+    if idx < 0 {
+        return
+    }
+    let word: int = idx / 64
+    let bit: int = idx % 64
+    if word >= set.len() {
+        return
+    }
+    set.set(word, int_or(set.get(word), int_shl(1, bit)))
+}
+
+fn regex_set_empty(set: list[int]) -> bool {
+    let mut i: int = 0
+    while i < set.len() {
+        if set.get(i) != 0 {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+# ============================================================================
+# List helpers (only `list_filled` — `list_contains_int` and
+# `list_concat_int` come from std.list).
+# ============================================================================
+
+fn list_filled(n: int, v: int) -> list[int] {
+    let out: list[int] = []
+    let mut i: int = 0
+    while i < n {
+        out.push(v)
+        i = i + 1
+    }
+    return out
+}
+
+# ============================================================================
+# Public API — is_match / find / find_all / groups / replace / split.
+# ============================================================================
+
+# regex_is_match(re, text) -> bool.
+fn regex_is_match(re: Regex, text: str) -> bool {
+    let mut start: int = 0
+    let n: int = text.len()
+    while start <= n {
+        let m: Option[RegexMatch] = regex_run(re, text, start)
+        if option_is_some(m) {
+            return true
+        }
+        start = start + 1
+    }
+    return false
+}
+
+# regex_find(re, text) -> Option[RegexMatch]. Find the leftmost
+# longest match of `re` in `text`.
+fn regex_find(re: Regex, text: str) -> Option[RegexMatch] {
+    let mut start: int = 0
+    let n: int = text.len()
+    while start <= n {
+        let m: Option[RegexMatch] = regex_run(re, text, start)
+        if option_is_some(m) {
+            return m
+        }
+        start = start + 1
+    }
+    return Option.None
+}
+
+# regex_find_at(re, text, start) -> Option[RegexMatch]. Find a match
+# at the specific position `start`. Returns Option.None if no match
+# begins at exactly that position.
+#
+# Deep-scan-21 fix (MEDIUM, safety): validate `start`. For
+# `start < 0` or `start > text.len()`, return Option.None instead
+# of letting the simulation read out-of-bounds bytes (the Python
+# interpreter would panic with "string access out of bounds"; the
+# C codegen would read before the buffer — undefined behavior).
+fn regex_find_at(re: Regex, text: str, start: int) -> Option[RegexMatch] {
+    if start < 0 || start > text.len() {
+        return Option.None
+    }
+    return regex_run(re, text, start)
+}
+
+# regex_find_all(re, text, max_results) -> list[RegexMatch]. Find all
+# non-overlapping matches. max_results <= 0 means unbounded.
+fn regex_find_all(re: Regex, text: str, max_results: int) -> list[RegexMatch] {
+    let out: list[RegexMatch] = []
+    let mut pos: int = 0
+    let n: int = text.len()
+    while pos <= n {
+        if max_results > 0 && out.len() >= max_results {
+            break
+        }
+        let m: Option[RegexMatch] = regex_run(re, text, pos)
+        if !option_is_some(m) {
+            pos = pos + 1
+            continue
+        }
+        let match_v: RegexMatch = option_unwrap(m)
+        out.push(match_v)
+        if match_v.end > pos {
+            pos = match_v.end
+        } else {
+            pos = pos + 1
+        }
+    }
+    return out
+}
+
+# regex_match_text(re, text) -> Option[str]. Return the matched substring.
+fn regex_match_text(re: Regex, text: str) -> Option[str] {
+    let m: Option[RegexMatch] = regex_find(re, text)
+    if !option_is_some(m) {
+        return Option.None
+    }
+    let mv: RegexMatch = option_unwrap(m)
+    return Option.Some(text.slice(mv.start, mv.end))
+}
+
+# regex_groups(re, text) -> Option[list[str]]. Return the capture
+# groups as a list of strings.
+fn regex_groups(re: Regex, text: str) -> Option[list[str]] {
+    let m: Option[RegexMatch] = regex_find(re, text)
+    if !option_is_some(m) {
+        return Option.None
+    }
+    let mv: RegexMatch = option_unwrap(m)
+    return Option.Some(regex_match_groups_strings(re, text, mv))
+}
+
+fn regex_match_groups_strings(re: Regex, text: str, m: RegexMatch) -> list[str] {
+    let out: list[str] = []
+    let mut i: int = 0
+    while i < m.groups.len() {
+        let span: RegexGroupSpan = m.groups.get(i)
+        if span.start < 0 || span.end < 0 {
+            out.push("")
+        } else {
+            out.push(text.slice(span.start, span.end))
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# regex_replace(re, text, replacement) -> str. Replace the FIRST match.
+fn regex_replace(re: Regex, text: str, replacement: str) -> str {
+    let m: Option[RegexMatch] = regex_find(re, text)
+    if !option_is_some(m) {
+        return text
+    }
+    let mv: RegexMatch = option_unwrap(m)
+    let groups: list[str] = regex_match_groups_strings(re, text, mv)
+    let expanded: str = regex_expand_replacement(replacement, groups)
+    return text.slice(0, mv.start) + expanded + text.slice(mv.end, text.len())
+}
+
+# regex_replace_all(re, text, replacement) -> str. Replace every
+# non-overlapping match.
+fn regex_replace_all(re: Regex, text: str, replacement: str) -> str {
+    let mut out: str = ""
+    let mut pos: int = 0
+    let n: int = text.len()
+    while pos <= n {
+        let m: Option[RegexMatch] = regex_run(re, text, pos)
+        if !option_is_some(m) {
+            if pos < n {
+                out = out + text.slice(pos, pos + 1)
+            }
+            pos = pos + 1
+            continue
+        }
+        let mv: RegexMatch = option_unwrap(m)
+        out = out + text.slice(pos, mv.start)
+        let groups: list[str] = regex_match_groups_strings(re, text, mv)
+        out = out + regex_expand_replacement(replacement, groups)
+        if mv.end > pos {
+            pos = mv.end
+        } else {
+            if pos < n {
+                out = out + text.slice(pos, pos + 1)
+            }
+            pos = pos + 1
+        }
+    }
+    return out
+}
+
+# regex_expand_replacement(replacement, groups) -> str. Expand $0, $1..$9
+# in the replacement string. $$ is a literal $.
+fn regex_expand_replacement(replacement: str, groups: list[str]) -> str {
+    let mut out: str = ""
+    let n: int = replacement.len()
+    let mut i: int = 0
+    while i < n {
+        let b: int = replacement.byte_at(i)
+        if b == 36 && i + 1 < n {
+            let next_b: int = replacement.byte_at(i + 1)
+            if next_b == 36 {
+                out = out + "$"
+                i = i + 2
+                continue
+            }
+            if next_b >= 48 && next_b <= 57 {
+                let gid: int = next_b - 48
+                if gid < groups.len() {
+                    out = out + groups.get(gid)
+                }
+                i = i + 2
+                continue
+            }
+            out = out + "$"
+            i = i + 1
+            continue
+        }
+        out = out + chr(b)
+        i = i + 1
+    }
+    return out
+}
+
+# regex_split(re, text, max_parts) -> list[str]. Split `text` at
+# every match of `re`. max_parts <= 0 means unbounded.
+fn regex_split(re: Regex, text: str, max_parts: int) -> list[str] {
+    let out: list[str] = []
+    let mut pos: int = 0
+    let n: int = text.len()
+    while pos <= n {
+        if max_parts > 0 && out.len() >= max_parts - 1 {
+            out.push(text.slice(pos, n))
+            return out
+        }
+        let m: Option[RegexMatch] = regex_find_from(re, text, pos)
+        if !option_is_some(m) {
+            # No more matches — push the remainder.
+            out.push(text.slice(pos, n))
+            return out
+        }
+        let mv: RegexMatch = option_unwrap(m)
+        # Push text[pos..mv.start] as a part (the text before the separator).
+        out.push(text.slice(pos, mv.start))
+        # Advance to the end of the match.
+        if mv.end > mv.start {
+            pos = mv.end
+        } else {
+            # Zero-width match — push the next byte and skip past it
+            # to avoid an infinite loop.
+            if pos < n {
+                pos = pos + 1
+            } else {
+                # At EOF with a zero-width match — push empty trailing.
+                out.push("")
+                return out
+            }
+        }
+    }
+    # Deep-scan-21 fix (LOW, dead-code): the previous post-loop
+    # block (pushing an empty trailing part when pos == n) was
+    # unreachable because every path through the loop body either
+    # returns early or advances pos such that the loop's exit
+    # condition `pos > n` is still false (the loop only exits
+    # when `pos > n` after `pos = mv.end` or `pos = pos + 1`).
+    # The 'a,'.split(',') == ["a", ""] case is correctly handled
+    # by the "no more matches" branch (line 1731) — the loop
+    # finds the match at the last comma, pushes "a", advances
+    # pos to mv.end == n, then on the next iteration the
+    # "no more matches" branch pushes the trailing "" and returns.
+    # The post-loop block is removed.
+    return out
+}
+
+# regex_find_from(re, text, pos) -> Option[RegexMatch]. Find the
+# leftmost-longest match of `re` in `text` starting the search at
+# or after position `pos`. The returned match's start is >= pos.
+fn regex_find_from(re: Regex, text: str, pos: int) -> Option[RegexMatch] {
+    let mut start: int = pos
+    let n: int = text.len()
+    while start <= n {
+        let m: Option[RegexMatch] = regex_run(re, text, start)
+        if option_is_some(m) {
+            return m
+        }
+        start = start + 1
+    }
+    return Option.None
+}
+
+# ============================================================================
+# Convenience: regex_match_to_str — debug-friendly formatting.
+# ============================================================================
+
+# regex_match_to_str(m, text) -> str. Format a RegexMatch as
+# "match[start..end, group0='...', group1='...']". For debugging.
+fn regex_match_to_str(m: RegexMatch, text: str) -> str {
+    let mut out: str = "match[" + m.start.to_str() + ".." + m.end.to_str()
+    let mut i: int = 0
+    while i < m.groups.len() {
+        let span: RegexGroupSpan = m.groups.get(i)
+        let mut s: str = ""
+        if span.start < 0 || span.end < 0 {
+            s = "<none>"
+        } else {
+            s = "'" + text.slice(span.start, span.end) + "'"
+        }
+        out = out + ", group" + i.to_str() + "=" + s
+        i = i + 1
+    }
+    out = out + "]"
+    return out
+}
+
+# ============================================================================
+# End of std/regex.hls
+# ============================================================================

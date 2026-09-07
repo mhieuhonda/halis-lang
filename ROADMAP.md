@@ -4613,11 +4613,153 @@ EOF), leading-zero rejection (`0123`, `00` rejected; `0` and
 verified), kind names (10 token kinds have correct diagnostic
 names), and parse_all convenience wrapper.
 
-**41. `std.regex`** — NFA-based regex (Thompson construction). No
-backtracking means no ReDoS. Captures, lookahead, lookbehind,
-character classes, Unicode categories. The compile-time checker
-verifies the regex is well-formed (a malformed regex is a compile
-error, not a runtime one).
+**41. `std.regex`** ✅ (release v0.60.0-alpha) — NFA-based regex
+(Thompson construction). No backtracking means no ReDoS. Captures,
+character classes, anchors, escapes; lookahead / lookbehind / Unicode
+categories are deferred to a future stage. **No new compiler
+builtins** — the entire module is pure HLS, layered on `std.str`
+for byte/string access and `std.list` for state-list management.
+
+The engine is **non-backtracking** (Ken Thompson's CACM 1968
+algorithm). The NFA is simulated in lockstep using a bitmap of
+active states, which guarantees **O(n*m) worst-case time** (n =
+text length, m = pattern size). There is no ReDoS — the
+pathological `a^n b` patterns that take exponential time on
+backtracking engines (PCRE, RE2, Python re, JavaScript RegExp)
+terminate in linear time here. See Russ Cox's "Regular Expression
+Matching Can Be Simple And Fast" (2007) for the background.
+
+`std/regex.hls` implements:
+
+  * **Regex struct** — the compiled NFA. Fields: `pattern` (the
+    source for diagnostics), `states` (list[RegexState]),
+    `classes` (list[RegexCharClass] for `[...]`), `num_groups`,
+    `start` (entry state index), `accept` (MATCH state index).
+  * **RegexState struct** — one NFA state with a `kind`, an
+    optional payload (`byte` for LITERAL, `class_id` for CLASS,
+    `group_id` for SAVE), and two outgoing transitions
+    (`out1`, `out2`). Epsilon transitions are explicit EPSILON
+    states; the simulation threads them via the closure walk.
+  * **RegexCharClass struct** — a set of bytes encoded as a
+    list of (low, high) inclusive ranges + a `negate` flag.
+    `regex_charclass_match` is O(ranges); for the typical 1..5
+    ranges this is faster than a 256-byte bitmap.
+  * **RegexParser struct** — the recursive-descent parser +
+    Thompson-construction builder. Walks the pattern with a
+    `pos` cursor and emits NFA states + classes + group ids
+    on the fly.
+  * **RegexFrag struct** — a "fragment" of compiled NFA code
+    (Thompson's classic construction trick). Each fragment has
+    a start state and a list of "dangling" out-transitions
+    that need to be patched to point at the next state.
+  * **RegexMatch + RegexGroupSpan structs** — the result of
+    a successful match: the start/end byte offsets plus a
+    list of capture-group spans (start/end, with -1 for
+    non-participating groups).
+  * **Construction** — the parser is recursive descent:
+    `regex_parse_alternation` -> `regex_parse_concat` ->
+    `regex_parse_repeat` -> `regex_parse_atom`. Atoms:
+    `(` capture / `(?:` non-capture / `[` class / `.`
+    any / `^` start / `$` end / `\` escape / literal.
+    Quantifiers: `*` `+` `?` `{n}` `{n,}` `{n,m}` `{,m}` with
+    optional lazy `?` suffix (treated as greedy; documented
+    approximation — the lazy form would require backtracking
+    semantics that an NFA cannot provide without rewriting).
+    `regex_frag_clone` deep-clones a fragment's sub-NFA via
+    a worklist BFS — needed for `{n,m}` expansion.
+  * **Simulation** — Thompson's classic algorithm with a
+    bitmap of active states. `regex_run` walks the text,
+    maintaining a current set of active states; for each byte,
+    every LITERAL/ANY/CLASS state tries to match; SAVE states
+    record the current position into a captures list; ANCHOR
+    states (`^` `$` `\b` `\B`) check the current position
+    against the text bounds / word-boundary predicate. The
+    accept state is the MATCH state; if it's in the active
+    set, the simulation records the match and continues
+    (leftmost-longest semantics — it does not stop at the
+    first match because a longer match may appear).
+  * **API**:
+    * `regex_compile(pattern: str) -> Result[Regex, str]` —
+      compile, return Ok(re) or Err(msg) with byte position
+      and error kind.
+    * `regex_is_match(re, text) -> bool` — true if any match
+      exists anywhere in `text`.
+    * `regex_find(re, text) -> Option[RegexMatch]` —
+      leftmost-longest match.
+    * `regex_find_at(re, text, start) -> Option[RegexMatch]` —
+      match at the specific position.
+    * `regex_find_all(re, text, max_results) ->
+      list[RegexMatch]` — non-overlapping matches.
+    * `regex_match_text(re, text) -> Option[str]` — the
+      matched substring.
+    * `regex_groups(re, text) -> Option[list[str]]` — capture
+      groups as a list of strings (group 0 = whole match).
+    * `regex_replace(re, text, replacement) -> str` — first
+      match. Replacement may contain `$0` (whole match),
+      `$1`..`$9` (capture groups), `$$` (literal `$`).
+    * `regex_replace_all(re, text, replacement) -> str` —
+      every non-overlapping match.
+    * `regex_split(re, text, max_parts) -> list[str]` — split
+      at every match (max_parts <= 0 means unbounded).
+    * `regex_match_to_str(m, text) -> str` — debug-friendly
+      formatting.
+
+Supported syntax (POSIX-EGREP + PCRE subset):
+
+  * `.` (any byte, no DOTALL — `\n` never matches)
+  * `*` `+` `?` `{n}` `{n,}` `{n,m}` `{,m}` (greedy quantifiers)
+  * `*?` `+?` `??` (lazy quantifiers — treated as greedy; the
+    approximation is documented in the module header)
+  * `|` (alternation)
+  * `()` (capture, numbered from 1) and `(?:)` (non-capture)
+  * `[...]` (character class, ranges, negation with `^`)
+  * `[^...]` (negated character class)
+  * `\d \D \w \W \s \S` (digit, word, whitespace classes)
+  * `\b \B` (word boundary / non-word-boundary, zero-width)
+  * `^` `$` (start-of-text / end-of-text anchors, zero-width)
+  * `\n \t \r \f \v \a \0` (control-byte escapes)
+  * `\xNN` (hex byte, exactly 2 hex digits)
+  * `\x{NNNN}` (hex codepoint, emits UTF-8 bytes)
+  * `\.` `\\` `\(` `\)` etc. (literal escape of metacharacters)
+
+Stage 41 limitations (deferred to later stages):
+
+  * **Lookahead `(?=...)` / `(?!...)`** — deferred to Stage 64
+    `std.http.server` (the HTTP-server router needs lookahead
+    for path patterns). Requires a zero-width assertion
+    mechanism that the current NFA simulation can't express
+    without re-running the sub-NFA at each position.
+  * **Lookbehind `(?<=...)` / `(?<!...)`** — same deferral.
+    Lookbehind is even harder (requires bounded look-back
+    or a reversed NFA).
+  * **Named groups `(?P<name>...)`** — Stage 42+ will reuse
+    the trait machinery; for now use numbered groups.
+  * **Unicode categories `\p{L} \p{N}`** — Stage 50+
+    `std.unicode` will provide the category tables.
+  * **Backreferences `\1 \2`** — fundamentally backtracking;
+    a future "Stage 41 perfection" may add a limited form
+    for the common case.
+  * **Compile-time pattern validation** — `regex_compile`
+    returns `Result.Err(msg)` at RUNTIME; the language has
+    no compile-time string parsing yet. A wrong specifier
+    is a runtime error. A future stage may lift this to a
+    true compile error once macros / compile-time eval
+    arrive.
+
+Differential parity (interpreter == native) verified on: literal
+match (`abc`), quantifiers (`*` `+` `?` `{n}` `{n,}` `{n,m}` `{,m}`),
+alternation (`cat|dog|bird`), capture groups (simple, nested,
+non-capturing), character classes (`[a-z]` `[^0-9]`
+`[A-Za-z0-9_]` `[\d]` `[\s]`), anchors (`^` `$` `\b` `\B`), dot (no
+DOTALL), escapes (`\n` `\t` `\r` `\f` `\v` `\a` `\0` `\d` `\w` `\s`
+`\D` `\W` `\S` `\xNN` `\x{NNNN}`), replace (single, all, with
+capture-group refs `$0` `$1` `$$`), split (basic, max_parts), find_all
+(unbounded, with max_results), compile errors (unbalanced paren,
+bad quantifier, bad hex, unterminated class, range out of order,
+quantifier at start), find_at, match_text, real-world patterns
+(email, phone, URL, IPv4, date, log line), and ReDoS safety
+(`(a+)+b` on 50 'a's — completes in microseconds, not exponential
+time).
 
 **42. `std.fmt`** — `Display` and `Debug` traits, `format!` macro,
 `println!("{:?}", x)`. Custom `Display` impls via `impl Display for

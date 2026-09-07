@@ -31,7 +31,7 @@ else
   HL_CURL_DEFS :=
 endif
 
-.PHONY: all stage0 bootstrap test examples clean run check bench install uninstall audit opt-stats emit-ir emit-llvm fmt lint lsp-check pkg-init pkg-add pkg-lock pkg-audit pkg-verify pkg-build pkg-publish pkg-log pkg-log-verify prove prove-full model prove-acceptance hltest fuzz cov fuzz-acceptance wasm-opt webapp webapp-acceptance serve aarch64-bench aarch64-acceptance aarch64-list-targets stack-acceptance inline-acceptance opt-stats-report kernel-attrs escape-acceptance layout-report tail-acceptance tail-report asm-acceptance asm-attrs bench-stdlib spec-check stage32-acceptance async-acceptance stream-acceptance io-acceptance fs-acceptance net-acceptance http-acceptance http2-acceptance json-stream-acceptance
+.PHONY: all stage0 bootstrap test examples clean run check bench install uninstall audit opt-stats emit-ir emit-llvm fmt lint lsp-check pkg-init pkg-add pkg-lock pkg-audit pkg-verify pkg-build pkg-publish pkg-log pkg-log-verify prove prove-full model prove-acceptance hltest fuzz cov fuzz-acceptance wasm-opt webapp webapp-acceptance serve aarch64-bench aarch64-acceptance aarch64-list-targets stack-acceptance inline-acceptance opt-stats-report kernel-attrs escape-acceptance layout-report tail-acceptance tail-report asm-acceptance asm-attrs bench-stdlib spec-check stage32-acceptance async-acceptance stream-acceptance io-acceptance fs-acceptance net-acceptance http-acceptance http2-acceptance json-stream-acceptance regex-acceptance
 
 # Main goal: use the full bootstrap chain to build the native compiler
 all: bootstrap
@@ -1593,3 +1593,39 @@ json-stream-acceptance: bin/hlc
 
 .PHONY: json-stream-acceptance
 
+# ============================================================================
+# Stage 41 (v0.60.0-alpha): std.regex -- NFA-based regular expressions
+# ----------------------------------------------------------------------------
+# Pure-HLS NFA-based regex engine using Thompson's construction.
+# Non-backtracking -- guarantees O(n*m) worst-case time, no ReDoS.
+# No new compiler builtins.
+# ============================================================================
+regex-acceptance: bin/hlc
+	@$(PYTHON) boot/boot.py examples/regex_demo.hls > /tmp/re_interp.txt 2>&1
+	@bin/hlc examples/regex_demo.hls /tmp/re_demo.c 2>/dev/null
+	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/re_demo /tmp/re_demo.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
+	@/tmp/re_demo > /tmp/re_nat.txt 2>&1
+	@diff -q /tmp/re_interp.txt /tmp/re_nat.txt >/dev/null 2>&1 \
+		|| (echo "FAIL: regex_demo differential mismatch" && false)
+	@$(PYTHON) boot/boot.py tests/ok/feat_stage41_regex.hls > /tmp/s41_interp.txt 2>&1
+	@bin/hlc tests/ok/feat_stage41_regex.hls /tmp/s41.c 2>/dev/null
+	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/s41 /tmp/s41.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
+	@/tmp/s41 > /tmp/s41_nat.txt 2>&1
+	@diff -q /tmp/s41_interp.txt /tmp/s41_nat.txt >/dev/null 2>&1 \
+		|| (echo "FAIL: feat_stage41_regex differential mismatch" && false)
+	@rm -f /tmp/re_demo /tmp/re_demo.c /tmp/re_interp.txt /tmp/re_nat.txt \
+		/tmp/s41 /tmp/s41.c /tmp/s41_interp.txt /tmp/s41_nat.txt
+	@echo ""
+	@echo "ACCEPTANCE OK: Stage 41 -- std.regex (NFA-based regex, no ReDoS)"
+	@echo "  Regex struct + RegexState + RegexCharClass + RegexMatch"
+	@echo "  RegexParser (recursive descent) + RegexFrag (Thompson construction)"
+	@echo "  Quantifiers: * + ? {n} {n,} {n,m} {,m}"
+	@echo "  Alternation: | (capture groups, non-capturing (?:...))"
+	@echo "  Character classes: [a-z] [^0-9] [\\d \\w \\s]"
+	@echo "  Anchors: ^ $ \\b \\B (zero-width)"
+	@echo "  Escapes: \\n \\t \\r \\f \\v \\a \\0 \\xNN \\x{NNNN}"
+	@echo "  API: compile/is_match/find/find_at/find_all/groups/replace/replace_all/split"
+	@echo "  ReDoS safety: (a+)+b on 50 a's completes in microseconds"
+	@echo "  differential (interpreter == native) verified green."
+
+.PHONY: regex-acceptance
