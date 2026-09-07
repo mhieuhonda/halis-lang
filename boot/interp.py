@@ -14,6 +14,7 @@ Runtime values:
 import ctypes
 import math
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -640,6 +641,14 @@ class Interp:
         # threads, one global mutex + condvar (mirrors the native C
         # runtime's design so differential behaviour matches).
         self.conc = ConcRuntime()
+        # Stage 37 (v0.56.0-alpha): socket-fd table for the net_tcp_* /
+        # net_udp_* builtins. The fd namespace is a monotonic counter
+        # (starting at 1) so Halis fds do NOT collide with the C
+        # runtime's stdin/stdout/stderr (0/1/2). The dict maps
+        # int fd -> Python socket object. net_close pops the entry;
+        # double-close is a silent no-op (matches the C runtime).
+        self.net_fds = {}
+        self._net_next_fd = 1
 
     @property
     def line(self):
@@ -648,6 +657,19 @@ class Interp:
     @line.setter
     def line(self, value):
         self._tls.line = value
+
+    # ---------- Stage 37: socket-fd registration ----------
+    def _net_register(self, sock):
+        """Register a Python socket under a fresh Halis fd and return the
+        fd. The fd namespace starts at 1 (0 is reserved — never returned
+        so a Halis program can use `if fd > 0` as the success check).
+        Thread-safe: net_fds is mutated under the concurrency mutex
+        (the same mutex that protects ConcRuntime state)."""
+        with self.conc.mu:
+            fd = self._net_next_fd
+            self._net_next_fd = self._net_next_fd + 1
+            self.net_fds[fd] = sock
+        return fd
 
     # ---------- lifecycle ----------
     def run(self):
@@ -1583,6 +1605,172 @@ class Interp:
                 # family for differential parity.
                 raise HLPanic("net_lookup: network error for %s: %s"
                               % (to_display(args[0]), str(ex)), line)
+        # ----- Stage 37 (v0.56.0-alpha): TCP / UDP / TLS builtins -----
+        # The interpreter mirrors the C runtime exactly so differential
+        # testing (interpreter == native) is byte-exact. All builtins
+        # return / accept primitive int fd values; the stdlib wraps them
+        # in TcpStream / TcpListener / UdpSocket structs.
+        #
+        # Socket fds are tracked in self.net_fds (a dict[int, socket])
+        # so the interpreter can mirror close() and detect double-
+        # close. The fd namespace is a monotonic counter starting at 1
+        # (0 is never used; the C runtime uses 0/1/2 for stdin/stdout/
+        # stderr, so a Halis fd of 0 would be ambiguous). Negative
+        # values are errors.
+        if name == "net_tcp_connect":
+            import socket as _sock
+            host = args[0].decode("utf-8", "replace")
+            port = int(args[1])
+            try:
+                infos = _sock.getaddrinfo(host, port, _sock.AF_INET,
+                                          _sock.SOCK_STREAM)
+                if not infos:
+                    return -1
+                fam, ty, pr, _, sa = infos[0]
+                s = _sock.socket(fam, ty, pr)
+                s.settimeout(5)
+                s.connect(sa)
+                return self._net_register(s)
+            except OSError:
+                return -1
+        if name == "net_tcp_listen":
+            import socket as _sock
+            host = args[0].decode("utf-8", "replace")
+            port = int(args[1])
+            backlog = int(args[2])
+            try:
+                s = _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM)
+                s.setsockopt(_sock.SOL_SOCKET, _sock.SO_REUSEADDR, 1)
+                s.bind((host, port))
+                s.listen(backlog)
+                return self._net_register(s)
+            except OSError:
+                return -1
+        if name == "net_tcp_accept":
+            fd = int(args[0])
+            s = self.net_fds.get(fd)
+            if s is None:
+                return -1
+            try:
+                s.settimeout(30)
+                conn, _addr = s.accept()
+                return self._net_register(conn)
+            except OSError:
+                return -1
+        if name == "net_read":
+            fd = int(args[0])
+            n = int(args[1])
+            if n <= 0:
+                return b""
+            s = self.net_fds.get(fd)
+            if s is None:
+                return b""
+            try:
+                s.settimeout(5)
+                data = s.recv(n)
+                return data if data else b""
+            except OSError:
+                return b""
+        if name == "net_write":
+            fd = int(args[0])
+            data = args[1]
+            s = self.net_fds.get(fd)
+            if s is None:
+                return -1
+            try:
+                s.settimeout(5)
+                # sendall blocks until all bytes are written (or the
+                # socket errors). Return the number of bytes written
+                # (== len(data) on success). On error return -1.
+                s.sendall(data)
+                return len(data)
+            except OSError:
+                return -1
+        if name == "net_close":
+            fd = int(args[0])
+            s = self.net_fds.pop(fd, None)
+            if s is not None:
+                try:
+                    s.close()
+                except OSError:
+                    pass
+            return None
+        if name == "net_udp_open":
+            import socket as _sock
+            try:
+                s = _sock.socket(_sock.AF_INET, _sock.SOCK_DGRAM)
+                s.settimeout(5)
+                return self._net_register(s)
+            except OSError:
+                return -1
+        if name == "net_udp_send_to":
+            fd = int(args[0])
+            host = args[1].decode("utf-8", "replace")
+            port = int(args[2])
+            data = args[3]
+            s = self.net_fds.get(fd)
+            if s is None:
+                return -1
+            try:
+                import socket as _sock
+                infos = _sock.getaddrinfo(host, port, _sock.AF_INET,
+                                          _sock.SOCK_DGRAM)
+                if not infos:
+                    return -1
+                _f, _t, _p, _c, sa = infos[0]
+                n = s.sendto(data, sa)
+                return n
+            except OSError:
+                return -1
+        if name == "net_udp_recv_from":
+            fd = int(args[0])
+            n = int(args[1])
+            if n <= 0:
+                return b""
+            s = self.net_fds.get(fd)
+            if s is None:
+                return b""
+            try:
+                s.settimeout(5)
+                data, _addr = s.recvfrom(n)
+                return data if data else b""
+            except OSError:
+                return b""
+        if name == "net_tls_get":
+            # HTTPS GET via libcurl. The interpreter shells out to the
+            # `curl` command-line tool (universally available on dev
+            # machines) to avoid requiring the Python pycurl binding.
+            # The native runtime links libcurl directly. Both produce
+            # the same response body byte-for-byte for the same URL.
+            #
+            # Build the URL: https://host:port/path
+            host = args[0].decode("utf-8", "replace")
+            port = int(args[1])
+            path = args[2].decode("utf-8", "replace")
+            if len(path) == 0 or path[0:1] != "/":
+                path = "/" + path
+            url = "https://" + host + ":" + str(port) + path
+            try:
+                # -s silent, -S show errors, -L follow redirects,
+                # --max-time 30 (avoid hanging on slow networks),
+                # --fail panic on HTTP >= 400.
+                proc = subprocess.run(
+                    ["curl", "-sS", "-L", "--max-time", "30",
+                     "--fail", url],
+                    capture_output=True, timeout=35)
+                if proc.returncode != 0:
+                    err = proc.stderr.decode("utf-8", "replace")
+                    raise HLPanic("net_tls_get: curl failed for %s: %s"
+                                  % (url, err), line)
+                body = proc.stdout
+                return body if isinstance(body, bytes) else body.encode("utf-8")
+            except FileNotFoundError:
+                raise HLPanic("net_tls_get: curl not installed (libcurl "
+                              "backend requires the curl CLI for the "
+                              "interpreter; the native runtime links "
+                              "libcurl directly)", line)
+            except subprocess.TimeoutExpired:
+                raise HLPanic("net_tls_get: timeout for %s" % url, line)
         # proc_exec(cmd: str) -> int — run a shell command. Returns the
         # exit code (0 on success, 1..255 on failure). Uses os.system()
         # so the command runs in a subshell, matching the C runtime's

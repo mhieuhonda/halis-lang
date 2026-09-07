@@ -199,6 +199,21 @@ declare ptr      @hl_read_line()                   ; -> hl_str* (one line, CRLF 
 
 ; Stage 12 release: net / rand / proc runtime helpers (Stage 9 release).
 declare i1       @hl_net_lookup(ptr, ptr)           ; (host, out_ip) -> success
+; Stage 37 (v0.56.0-alpha): TCP / UDP / TLS runtime helpers. All
+; socket helpers take / return primitive int64 fd values; the str
+; arguments (host / path / data) are owned ptr (one retain released
+; inside the helper). net_read / net_udp_recv_from / net_tls_get
+; return a fresh hl_str* (refcnt=1, ownership transfers to the caller).
+declare i64      @hl_net_tcp_connect(ptr, i64)       ; (host, port) -> fd
+declare i64      @hl_net_tcp_listen(ptr, i64, i64)   ; (host, port, backlog) -> fd
+declare i64      @hl_net_tcp_accept(i64)             ; (fd) -> client_fd
+declare ptr      @hl_net_read(i64, i64)              ; (fd, n) -> fresh str
+declare i64      @hl_net_write(i64, ptr)             ; (fd, data) -> bytes_written
+declare void     @hl_net_close(i64)                  ; (fd)
+declare i64      @hl_net_udp_open()                  ; -> fd
+declare i64      @hl_net_udp_send_to(i64, ptr, i64, ptr) ; (fd, host, port, data)
+declare ptr      @hl_net_udp_recv_from(i64, i64)     ; (fd, n) -> fresh str
+declare ptr      @hl_net_tls_get(ptr, i64, ptr)      ; (host, port, path) -> fresh str
 declare i64      @hl_rand_int(i64)                  ; (max_exclusive) -> [0, max)
 declare double   @hl_rand_float()
 declare void     @hl_rand_seed(i64)
@@ -1589,6 +1604,40 @@ class LLVMEmitter:
         if name == "fs_set_perms":
             return self._call1("void", "@hl_fs_set_perms", ["ptr", "i64"],
                               arg_pairs)
+        # Stage 37 (v0.56.0-alpha): TCP / UDP / TLS builtins. The host /
+        # path / data arguments are owned ptr (one retain released inside
+        # the helper); the fd / port / n / backlog arguments are i64.
+        # net_read / net_udp_recv_from / net_tls_get return a fresh str.
+        if name == "net_tcp_connect":
+            return self._call1("i64", "@hl_net_tcp_connect",
+                               ["ptr", "i64"], arg_pairs)
+        if name == "net_tcp_listen":
+            return self._call1("i64", "@hl_net_tcp_listen",
+                               ["ptr", "i64", "i64"], arg_pairs)
+        if name == "net_tcp_accept":
+            return self._call1("i64", "@hl_net_tcp_accept", ["i64"],
+                              arg_pairs)
+        if name == "net_read":
+            return self._call1("ptr", "@hl_net_read", ["i64", "i64"],
+                              arg_pairs)
+        if name == "net_write":
+            return self._call1("i64", "@hl_net_write", ["i64", "ptr"],
+                              arg_pairs)
+        if name == "net_close":
+            return self._call1("void", "@hl_net_close", ["i64"], arg_pairs)
+        if name == "net_udp_open":
+            tmp = self._fresh("udp_open")
+            self._emit("  %s = call i64 @hl_net_udp_open()" % tmp)
+            return ("i64", tmp)
+        if name == "net_udp_send_to":
+            return self._call1("i64", "@hl_net_udp_send_to",
+                               ["i64", "ptr", "i64", "ptr"], arg_pairs)
+        if name == "net_udp_recv_from":
+            return self._call1("ptr", "@hl_net_udp_recv_from",
+                               ["i64", "i64"], arg_pairs)
+        if name == "net_tls_get":
+            return self._call1("ptr", "@hl_net_tls_get",
+                               ["ptr", "i64", "ptr"], arg_pairs)
         if name == "drop":
             # Compile-time annotation only; runtime no-op.
             return ("void", "0")

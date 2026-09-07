@@ -47,6 +47,21 @@ for f in tests/fail/*.hls; do
 done
 
 echo "=== 3. Self-compile + differential testing (interpreter vs native) ==="
+# Stage 37 (v0.56.0-alpha): probe libcurl so the net_tls_get builtin
+# links cleanly when libcurl is installed (otherwise the runtime's
+# #ifdef HL_HAVE_LIBCURL guard emits a clean panic stub).
+LIBCURL_CFLAGS="$(curl-config --cflags 2>/dev/null)"
+LIBCURL_LIBS="$(curl-config --libs 2>/dev/null)"
+if [ -z "$LIBCURL_LIBS" ]; then
+    LIBCURL_CFLAGS="$(pkg-config --cflags libcurl 2>/dev/null)"
+    LIBCURL_LIBS="$(pkg-config --libs libcurl 2>/dev/null)"
+fi
+if [ -n "$LIBCURL_LIBS" ]; then
+    CURL_DEFS="-DHL_HAVE_LIBCURL"
+else
+    CURL_DEFS=""
+    LIBCURL_LIBS=""
+fi
 for f in tests/ok/*.hls; do
     name=$(basename "$f" .hls)
     # Stage 10 release: redirect stdin from /dev/null so tests that use
@@ -58,7 +73,7 @@ for f in tests/ok/*.hls; do
         bad "$name (hlc compile failed)"
         continue
     fi
-    if ! gcc -O2 -o "$TMP/$name.bin" "$TMP/$name.c" -lm -pthread 2>"$TMP/$name.gcc"; then
+    if ! gcc -O2 $CURL_DEFS $LIBCURL_CFLAGS -o "$TMP/$name.bin" "$TMP/$name.c" -lm -pthread $LIBCURL_LIBS 2>"$TMP/$name.gcc"; then
         bad "$name (gcc error)"
         continue
     fi

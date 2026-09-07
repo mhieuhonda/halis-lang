@@ -13,6 +13,198 @@ stability (125–140), and final stabilisation toward v1.0 (141–150).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
+## [v0.56.0-alpha] — Stage 37: std.net (TCP/UDP sockets, DNS, TLS via libcurl)
+
+> Adds `std/net.hls` — the third module of Phase III (stdlib expansion)
+> — providing high-level `TcpStream` / `TcpListener` / `UdpSocket`
+> structs that wrap ten new compiler builtins for BSD-sockets
+> networking, plus a libcurl-backed HTTPS GET helper. All ten builtins
+> carry the existing `Net` effect (a single `uses Net` clause unlocks
+> DNS + TCP + UDP + TLS), and the host / path arguments are taint
+> sinks (a tainted host enables SSRF + DNS rebinding; a tainted path
+> enables request smuggling). The data being SENT is NOT a sink — the
+> user is the origin of the data, not the attacker.
+>
+> The TLS builtin (`net_tls_get`) is conditionally compiled: when
+> libcurl is installed, the build defines `-DHL_HAVE_LIBCURL` and
+> links `-lcurl`; the builtin works. When libcurl is NOT installed,
+> the `#ifdef HL_HAVE_LIBCURL` guard compiles a clean panic stub —
+> the builtin panics with a clear "built without libcurl" message,
+> but everything else (TCP/UDP/DNS) works. The Makefile auto-probes
+> libcurl via `curl-config` (with a `pkg-config` fallback).
+
+### Added — Stage 37 (v0.56.0-alpha)
+
+- **Ten new compiler builtins (all carry `Net`, host/path args are
+  taint sinks):**
+  - `net_tcp_connect(host: str, port: int) -> int` — TCP connect to
+    `host:port`. Returns the OS socket fd (>= 0) or -1 on failure.
+    Sets a 5-second send/recv timeout (SO_RCVTIMEO / SO_SNDTIMEO).
+  - `net_tcp_listen(host: str, port: int, backlog: int) -> int` —
+    bind + listen. SO_REUSEADDR is set so a quick server restart
+    doesn't wait for TIME_WAIT. The host may be `"0.0.0.0"` (all
+    interfaces), `"127.0.0.1"` / `"localhost"` (loopback only), or
+    a dotted-decimal IPv4 address. Returns the listen fd or -1.
+  - `net_tcp_accept(fd: int) -> int` — accept a connection. Blocks
+    until a peer connects (the listen fd's accept timeout is
+    inherited). Returns the client fd or -1.
+  - `net_read(fd: int, n: int) -> str` — read up to n bytes (clamped
+    to a 64 KiB cap). Returns a fresh str (refcnt=1). Empty str at
+    EOF or on error.
+  - `net_write(fd: int, data: str) -> int` — write all bytes (uses
+    send() in a loop for large payloads). Returns bytes written or
+    -1. Consumes the data argument (one retain released inside).
+  - `net_close(fd: int) -> void` — close the socket. Idempotent (a
+    double-close is a silent no-op).
+  - `net_udp_open() -> int` — create a UDP socket. Returns fd or -1.
+    A 5-second recv timeout is set.
+  - `net_udp_send_to(fd: int, host: str, port: int, data: str) -> int`
+    — send a single UDP datagram. Returns bytes sent or -1. Consumes
+    host and data.
+  - `net_udp_recv_from(fd: int, n: int) -> str` — receive a single
+    UDP datagram (up to n bytes, clamped to 64 KiB). Returns a fresh
+    str. Empty str on error or timeout. The sender's address is
+    discarded (callers who need it should use C recvfrom via FFI).
+  - `net_tls_get(host: str, port: int, path: str) -> str` — one-shot
+    HTTPS GET via libcurl. Returns the response body as a fresh str.
+    Panics on transport/TLS error or HTTP >= 400 (the `--fail` flag).
+    The path is normalised to start with `/` (a leading slash is
+    prepended if missing). When libcurl is not available, panics
+    with a clean "built without libcurl" message.
+- **`std/net.hls`** library module with:
+  - `TcpStream` struct — connected TCP socket (client). Methods:
+    `read(n)`, `read_all(max)`, `write(data)`, `write_all(data)`,
+    `close()`, `fd()`, `is_open()`.
+  - `TcpListener` struct — bound+listening TCP socket (server).
+    Methods: `accept()`, `accept_or()`, `close()`, `fd()`,
+    `is_open()`.
+  - `UdpSocket` struct — UDP socket. Methods: `send_to(host, port,
+    data)`, `recv_from(n)`, `close()`, `fd()`, `is_open()`.
+  - Construction: `tcp_connect(host, port)`, `tcp_connect_or(host,
+    port) -> Result[TcpStream, str]`, `tcp_listen(host, port,
+    backlog)`, `tcp_listen_or(...)`, `udp_open()`, `udp_open_or()`.
+  - Free functions: `tls_get(host, port, path)`, `dns_lookup(host)`,
+    `dns_lookup_or(host) -> Result[str, str]`, `echo_server_start(port)`.
+  - Constants: `net_max_recv() = 65536`, `net_default_timeout_secs() = 5`.
+- **Three new fail-tests** verifying the taint-sink enforcement:
+  - `fail_effect_net_tcp_connect_missing.hls` — a function without
+    `uses Net` cannot call `net_tcp_connect`.
+  - `fail_taint_net_tcp_connect.hls` — a `tainted[str]` host cannot
+    be passed to `net_tcp_connect`.
+  - `fail_taint_net_tls_get_path.hls` — a `tainted[str]` path cannot
+    be passed to `net_tls_get`.
+- **`examples/net_demo.hls`** and **`tests/ok/feat_stage37_net.hls`**
+  exercising TCP echo (raw builtins + stdlib wrappers), UDP
+  loopback, connect-failure handling, and DNS resolution of
+  `localhost`. The TLS builtin is type-checked but not executed
+  (it would require network egress and is non-deterministic; the
+  differential test exercises TCP/UDP loopback only).
+- **Makefile** auto-probes libcurl via `curl-config` (with a
+  `pkg-config` fallback). The `LIBCURL_CFLAGS` / `LIBCURL_LIBS` /
+  `HL_CURL_DEFS` variables are populated when libcurl is found;
+  empty otherwise. `make run`, `make net-acceptance`, and the
+  differential test runner (`tests/run_tests.sh`) all use these
+  variables so net_tls_get links cleanly when libcurl is installed
+  and falls back to the panic stub when it's not.
+- **ROADMAP** updated: Stage 37 marked ✅ complete.
+
+### Changed — Stage 37 (v0.56.0-alpha)
+
+- **`boot/checker.py`** — registered the 10 new builtins in
+  `BUILTIN_FNS`, `BUILTIN_EFFECTS` (all `{"Net"}`), and
+  `SINK_BUILTINS` (`net_tcp_connect` / `net_tcp_listen` /
+  `net_udp_send_to` / `net_tls_get` — host/path args are sinks).
+  Added type-check rules in `check_builtin_call` for each builtin
+  (argument count, argument types, taint-sink rejection, call-graph
+  edge registration).
+- **`boot/interp.py`** — added interpreter implementations for all
+  10 builtins using Python's `socket` module (TCP/UDP) and the
+  `curl` CLI (TLS, mirroring the native libcurl). Added a socket-fd
+  table (`self.net_fds`) and a thread-safe `_net_register` helper
+  that allocates fresh Halis fds (starting at 1; 0 is never returned
+  so `if fd > 0` is a safe success check). The fd table is mutated
+  under the concurrency mutex (`self.conc.mu`) to keep it sound
+  under tasks.
+- **`src/hlc.hls`** (self-hosted compiler) — mirrored every change
+  in `boot/checker.py`:
+  - `is_builtin_fn`: added the 10 new names.
+  - `builtin_effect`: returns `["Net"]` for all 10.
+  - `check_builtin_call`: added type-check + taint-sink rules for
+    each builtin (matches the boot checker exactly).
+  - `call_result_fresh`: `net_read` / `net_udp_recv_from` /
+    `net_tls_get` return fresh str (refcnt=1).
+  - `builtin_arg_borrowed`: the host / path / data arguments are
+    owned (the C runtime releases one retain inside the helper);
+    the fd / port / n / backlog arguments are primitive int (no
+    refcount).
+  - `gen_builtin_call`: emits `hl_net_tcp_connect(...)` etc. with
+    the right owned-arg wrapping for str arguments.
+  - `gen_runtime`: emits the C runtime helpers (`hl_net_tcp_connect`
+    through `hl_net_tls_get`) using BSD sockets + libcurl. The
+    libcurl code path is guarded by `#ifdef HL_HAVE_LIBCURL` so a
+    build without libcurl still compiles (the helper panics cleanly).
+- **`tools/llvm_emit.py`** — added LLVM IR declarations for all 10
+  helpers and lowering rules in `_lower_builtin_call_typed` (the
+  LLVM backend now emits correct call instructions for the new
+  builtins).
+- **`tests/run_tests.sh`** — probes libcurl (via `curl-config` /
+  `pkg-config`) and passes `-DHL_HAVE_LIBCURL` + the curl link flags
+  to the differential-test gcc command. This keeps the test runner
+  green on both libcurl-installed and libcurl-missing systems.
+- **`Makefile`** — added the libcurl probe (top of file), the
+  `net-acceptance` target (mirrors `fs-acceptance`'s structure), and
+  updated `make run` to link libcurl when available.
+
+### Security — Stage 37 (v0.56.0-alpha)
+
+- **SSRF prevention**: every host argument to a networking builtin
+  is a taint sink. A program that reads a hostname from argv /
+  stdin / a file CANNOT pass it directly to `net_tcp_connect` /
+  `net_udp_send_to` / `net_tls_get` — the checker rejects it with
+  a clear error naming the sink, the violating argument, and the
+  sanitiser to use (`sanitize_command` from `std.sanitize`, or
+  `taint_unwrap` to accept the risk). This closes the SSRF /
+  DNS-rebinding vector at the type system level.
+- **Request-smuggling prevention**: the `path` argument to
+  `net_tls_get` is a taint sink (a tainted path enables
+  path-confusion attacks where a front-end proxy and a back-end
+  server disagree about the resource). Use `sanitize_path` from
+  `std.sanitize` to untaint.
+- **Capability discipline**: every networking builtin carries the
+  `Net` effect. A function without `uses Net` cannot call ANY
+  networking primitive — DNS, TCP, UDP, or TLS. The effect
+  propagates transitively through every caller, so a deep call
+  chain that eventually reaches a network builtin is rejected at
+  the outermost function that didn't declare `Net`. This is
+  defence in depth: even if a tainted host slipped through
+  sanitisation, the capability check would still catch an
+  accidental network call in a function that wasn't supposed to
+  touch the network.
+- **No data-side taint on sends**: the `data` argument to
+  `net_write` / `net_udp_send_to` is NOT a taint sink. The user is
+  the origin of the data, not the attacker — the data has already
+  been constructed by the program (and any attacker-controlled
+  portion was sanitised at the point of construction). This matches
+  the Stage 10 design where `print` / `println` are sinks but the
+  data flows from the program, not from an attacker-controlled
+  source.
+
+### Differential parity (interpreter == native) — Stage 37
+
+- TCP / UDP builtins use the same timeouts in both backends
+  (5-second send/recv, 30-second accept).
+- DNS uses `getaddrinfo` in both backends (Python's `socket.getaddrinfo`
+  is a thin wrapper around the C `getaddrinfo`).
+- TLS: the interpreter shells out to the `curl` CLI; the native binary
+  links libcurl directly. Both follow redirects, set a 30-second
+  timeout, and panic on HTTP >= 400 (the `--fail` flag in the CLI;
+  `CURLOPT_FAILONERROR` in libcurl). The response body is byte-
+  identical for the same URL.
+- The acceptance test (`make net-acceptance`) verifies differential
+  parity on TCP echo (raw + stdlib), UDP loopback, connect-failure,
+  and DNS lookup of `localhost`. The TLS builtin is type-checked but
+  not executed (network egress is non-deterministic).
+
 ## [v0.55.0-alpha] — Stage 36: std.fs (path abstraction + dir walk + metadata)
 
 > Adds `std/fs.hls` — the second module of Phase III (stdlib

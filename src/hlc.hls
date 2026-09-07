@@ -2660,6 +2660,17 @@ fn is_builtin_fn(n: str) -> bool {
         # Stage 9 release (v0.20.0-alpha): Net / Rand / Proc builtins
         || n == "net_lookup" || n == "rand_int" || n == "rand_float"
         || n == "rand_seed" || n == "proc_exec"
+        # Stage 37 (v0.56.0-alpha): TCP / UDP / TLS builtins — all
+        # carry the Net effect (already declared for net_lookup above);
+        # the host/path arguments are taint sinks (see check_builtin_call
+        # below). The stdlib (std.net) wraps the int fd values returned
+        # by these builtins in TcpStream / TcpListener / UdpSocket /
+        # TlsClient structs.
+        || n == "net_tcp_connect" || n == "net_tcp_listen"
+        || n == "net_tcp_accept" || n == "net_read" || n == "net_write"
+        || n == "net_close" || n == "net_udp_open"
+        || n == "net_udp_send_to" || n == "net_udp_recv_from"
+        || n == "net_tls_get"
         # Stage 16 (v0.27.0-alpha): concurrency builtins. Stage-16
         # perfection (v0.29.0-alpha) adds chan_new_bounded.
         || n == "chan_new" || n == "chan_new_bounded" || n == "spawn" || n == "select"
@@ -3048,6 +3059,18 @@ fn builtin_effect(name: str) -> list[str] {
     # family. A program must declare them explicitly to use these
     # builtins; the fixpoint in check_effects enforces the subset rule.
     if name == "net_lookup" {
+        return ["Net"]
+    }
+    # Stage 37 (v0.56.0-alpha): TCP / UDP / TLS builtins — all carry
+    # the Net effect. The taint-sink enforcement (see check_builtin_call
+    # below) prevents tainted hosts/paths from reaching any of them;
+    # the effect discipline controls CAPABILITY (a function without
+    # `uses Net` cannot call ANY networking primitive).
+    if name == "net_tcp_connect" || name == "net_tcp_listen"
+        || name == "net_tcp_accept" || name == "net_read"
+        || name == "net_write" || name == "net_close"
+        || name == "net_udp_open" || name == "net_udp_send_to"
+        || name == "net_udp_recv_from" || name == "net_tls_get" {
         return ["Net"]
     }
     if name == "rand_int" || name == "rand_float" || name == "rand_seed" {
@@ -7665,6 +7688,100 @@ fn check_builtin_call(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, 
         add_edge(ctx, cur, "b:net_lookup")
         return "str"
     }
+    # ----- Stage 37 (v0.56.0-alpha): TCP / UDP / TLS builtins -----
+    # Host / path arguments are taint sinks (SSRF, DNS rebinding,
+    # request smuggling). Data being SENT is NOT a sink (the user is
+    # the origin). Port is an int (untaintable). The fd argument of
+    # read/write/accept/send_to/recv_from/close is a primitive int
+    # (untaintable).
+    if name == "net_tcp_connect" {
+        if nargs != 2 || argt.get(0) != "str" || argt.get(1) != "int" {
+            cerr(line, "net_tcp_connect() expects (str host, int port)")
+        }
+        if is_taint_t(argt.get(0)) {
+            cerr(line, "taint-sink violation: net_tcp_connect argument 1 (host) is " + argt.get(0) + " (a tainted host enables SSRF + DNS rebinding — use sanitize_command, or taint_unwrap() if you accept the risk)")
+        }
+        add_edge(ctx, cur, "b:net_tcp_connect")
+        return "int"
+    }
+    if name == "net_tcp_listen" {
+        if nargs != 3 || argt.get(0) != "str" || argt.get(1) != "int"
+            || argt.get(2) != "int" {
+            cerr(line, "net_tcp_listen() expects (str host, int port, int backlog)")
+        }
+        if is_taint_t(argt.get(0)) {
+            cerr(line, "taint-sink violation: net_tcp_listen argument 1 (host) is " + argt.get(0) + " (a tainted host could bind an attacker-chosen interface — use sanitize_command, or taint_unwrap() if you accept the risk)")
+        }
+        add_edge(ctx, cur, "b:net_tcp_listen")
+        return "int"
+    }
+    if name == "net_tcp_accept" {
+        if nargs != 1 || argt.get(0) != "int" {
+            cerr(line, "net_tcp_accept() expects 1 int (listen fd)")
+        }
+        add_edge(ctx, cur, "b:net_tcp_accept")
+        return "int"
+    }
+    if name == "net_read" {
+        if nargs != 2 || argt.get(0) != "int" || argt.get(1) != "int" {
+            cerr(line, "net_read() expects (int fd, int n)")
+        }
+        add_edge(ctx, cur, "b:net_read")
+        return "str"
+    }
+    if name == "net_write" {
+        if nargs != 2 || argt.get(0) != "int" || argt.get(1) != "str" {
+            cerr(line, "net_write() expects (int fd, str data)")
+        }
+        add_edge(ctx, cur, "b:net_write")
+        return "int"
+    }
+    if name == "net_close" {
+        if nargs != 1 || argt.get(0) != "int" {
+            cerr(line, "net_close() expects 1 int (fd)")
+        }
+        add_edge(ctx, cur, "b:net_close")
+        return "void"
+    }
+    if name == "net_udp_open" {
+        if nargs != 0 {
+            cerr(line, "net_udp_open() takes no arguments")
+        }
+        add_edge(ctx, cur, "b:net_udp_open")
+        return "int"
+    }
+    if name == "net_udp_send_to" {
+        if nargs != 4 || argt.get(0) != "int" || argt.get(1) != "str"
+            || argt.get(2) != "int" || argt.get(3) != "str" {
+            cerr(line, "net_udp_send_to() expects (int fd, str host, int port, str data)")
+        }
+        if is_taint_t(argt.get(1)) {
+            cerr(line, "taint-sink violation: net_udp_send_to argument 2 (host) is " + argt.get(1) + " (a tainted host enables SSRF — use sanitize_command, or taint_unwrap() if you accept the risk)")
+        }
+        add_edge(ctx, cur, "b:net_udp_send_to")
+        return "int"
+    }
+    if name == "net_udp_recv_from" {
+        if nargs != 2 || argt.get(0) != "int" || argt.get(1) != "int" {
+            cerr(line, "net_udp_recv_from() expects (int fd, int n)")
+        }
+        add_edge(ctx, cur, "b:net_udp_recv_from")
+        return "str"
+    }
+    if name == "net_tls_get" {
+        if nargs != 3 || argt.get(0) != "str" || argt.get(1) != "int"
+            || argt.get(2) != "str" {
+            cerr(line, "net_tls_get() expects (str host, int port, str path)")
+        }
+        if is_taint_t(argt.get(0)) {
+            cerr(line, "taint-sink violation: net_tls_get argument 1 (host) is " + argt.get(0) + " (a tainted host enables SSRF — use sanitize_command, or taint_unwrap() if you accept the risk)")
+        }
+        if is_taint_t(argt.get(2)) {
+            cerr(line, "taint-sink violation: net_tls_get argument 3 (path) is " + argt.get(2) + " (a tainted path enables request smuggling — use sanitize_path, or taint_unwrap() if you accept the risk)")
+        }
+        add_edge(ctx, cur, "b:net_tls_get")
+        return "str"
+    }
     # rand_int(max: int) -> int — uniform random int in [0, max).
     if name == "rand_int" {
         if nargs != 1 || argt.get(0) != "int" {
@@ -9088,6 +9205,18 @@ fn runtime_lines() -> list[str] {
     r.push("#include <netinet/in.h>")
     r.push("#include <arpa/inet.h>")
     r.push("#include <sys/wait.h>")
+    r.push("#include <unistd.h>")
+    # Stage 37 (v0.56.0-alpha): TCP / UDP / TLS builtins.
+    # TCP/UDP use the BSD sockets API (already covered by the includes
+    # above). TLS uses libcurl — the include is conditional on
+    # HL_HAVE_LIBCURL so a build without libcurl installed still
+    # compiles (the net_tls_get helper emits a clean panic instead of
+    # a link error). The build system defines HL_HAVE_LIBCURL when
+    # `-lcurl` is available (the Makefile's bootstrap target probes
+    # for it and adds -DHAVE_LIBCURL to CFLAGS plus -lcurl to LIBS).
+    r.push("#ifdef HL_HAVE_LIBCURL")
+    r.push("#include <curl/curl.h>")
+    r.push("#endif")
     # Stage 16 (v0.27.0-alpha): the concurrency runtime (pthread-based).
     r.push("#include <pthread.h>")
     r.push("")
@@ -10535,6 +10664,270 @@ fn runtime_lines() -> list[str] {
     r.push("    return (int64_t)(rc & 0xFF);")
     r.push("}")
     r.push("")
+    # ----- Stage 37 (v0.56.0-alpha): TCP / UDP / TLS runtime helpers -----
+    # All socket helpers use the BSD sockets API. The fd values they
+    # return are the raw OS fds (>= 0 on success, -1 on failure). The
+    # Halis-level net_fds table is NOT used on the C side — the OS fd
+    # is the Halis fd (Halis programs treat fds as opaque ints; the
+    # 0/1/2 collision with stdin/stdout/stderr is benign because Halis
+    # programs never read/write stdin/stdout via net_read/net_write).
+    #
+    # Connect / listen / accept all set SO_REUSEADDR (so a quick
+    # restart of a server doesn't wait for TIME_WAIT to expire) and a
+    # 5-second send/recv timeout (so a dead peer doesn't hang the
+    # program forever — matches the interpreter).
+    r.push("// hl_net_tcp_connect(host, port) — TCP connect to host:port.")
+    r.push("// Returns the socket fd (>= 0) or -1 on failure. Consumes host.")
+    r.push("static int64_t hl_net_tcp_connect(hl_str* host, int64_t port) {")
+    r.push("    struct addrinfo hints;")
+    r.push("    memset(&hints, 0, sizeof(hints));")
+    r.push("    hints.ai_family = AF_INET;")
+    r.push("    hints.ai_socktype = SOCK_STREAM;")
+    r.push("    struct addrinfo* res = NULL;")
+    r.push("    char port_buf[16];")
+    r.push("    snprintf(port_buf, sizeof(port_buf), \"%lld\", (long long)port);")
+    r.push("    int rc = getaddrinfo(host->data, port_buf, &hints, &res);")
+    r.push("    if (rc != 0 || res == NULL) {")
+    r.push("        hl_str_release(host);")
+    r.push("        return -1;")
+    r.push("    }")
+    r.push("    int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);")
+    r.push("    if (fd < 0) {")
+    r.push("        freeaddrinfo(res);")
+    r.push("        hl_str_release(host);")
+    r.push("        return -1;")
+    r.push("    }")
+    r.push("    struct timeval tv;")
+    r.push("    tv.tv_sec = 5; tv.tv_usec = 0;")
+    r.push("    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));")
+    r.push("    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));")
+    r.push("    if (connect(fd, res->ai_addr, res->ai_addrlen) < 0) {")
+    r.push("        close(fd);")
+    r.push("        freeaddrinfo(res);")
+    r.push("        hl_str_release(host);")
+    r.push("        return -1;")
+    r.push("    }")
+    r.push("    freeaddrinfo(res);")
+    r.push("    hl_str_release(host);")
+    r.push("    return (int64_t)fd;")
+    r.push("}")
+    r.push("")
+    r.push("// hl_net_tcp_listen(host, port, backlog) — bind + listen. Returns")
+    r.push("// the listen fd or -1. SO_REUSEADDR is set so a restart doesn't")
+    r.push("// wait for TIME_WAIT. Consumes host.")
+    r.push("static int64_t hl_net_tcp_listen(hl_str* host, int64_t port, int64_t backlog) {")
+    r.push("    int fd = socket(AF_INET, SOCK_STREAM, 0);")
+    r.push("    if (fd < 0) {")
+    r.push("        hl_str_release(host);")
+    r.push("        return -1;")
+    r.push("    }")
+    r.push("    int yes = 1;")
+    r.push("    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));")
+    r.push("    struct sockaddr_in addr;")
+    r.push("    memset(&addr, 0, sizeof(addr));")
+    r.push("    addr.sin_family = AF_INET;")
+    r.push("    addr.sin_port = htons((uint16_t)port);")
+    r.push("    if (host->len == 0 || strcmp(host->data, \"0.0.0.0\") == 0) {")
+    r.push("        addr.sin_addr.s_addr = htonl(INADDR_ANY);")
+    r.push("    } else if (strcmp(host->data, \"127.0.0.1\") == 0 || strcmp(host->data, \"localhost\") == 0) {")
+    r.push("        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);")
+    r.push("    } else if (inet_pton(AF_INET, host->data, &addr.sin_addr) != 1) {")
+    r.push("        close(fd);")
+    r.push("        hl_str_release(host);")
+    r.push("        return -1;")
+    r.push("    }")
+    r.push("    if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {")
+    r.push("        close(fd);")
+    r.push("        hl_str_release(host);")
+    r.push("        return -1;")
+    r.push("    }")
+    r.push("    if (listen(fd, (int)backlog) < 0) {")
+    r.push("        close(fd);")
+    r.push("        hl_str_release(host);")
+    r.push("        return -1;")
+    r.push("    }")
+    r.push("    hl_str_release(host);")
+    r.push("    return (int64_t)fd;")
+    r.push("}")
+    r.push("")
+    r.push("// hl_net_tcp_accept(fd) — accept a connection. Returns the client")
+    r.push("// fd or -1 on error. Blocks until a peer connects (the listen")
+    r.push("// fd's accept timeout is inherited from the listen socket).")
+    r.push("static int64_t hl_net_tcp_accept(int64_t fd) {")
+    r.push("    int cfd = accept((int)fd, NULL, NULL);")
+    r.push("    if (cfd < 0) return -1;")
+    r.push("    struct timeval tv;")
+    r.push("    tv.tv_sec = 30; tv.tv_usec = 0;")
+    r.push("    setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));")
+    r.push("    setsockopt(cfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));")
+    r.push("    return (int64_t)cfd;")
+    r.push("}")
+    r.push("")
+    r.push("// hl_net_read(fd, n) — read up to n bytes from the socket.")
+    r.push("// Returns a fresh str (refcnt=1). Empty str at EOF or on error.")
+    r.push("// n is clamped to a 64 KiB cap to avoid unbounded allocation.")
+    r.push("static hl_str* hl_net_read(int64_t fd, int64_t n) {")
+    r.push("    if (n <= 0) return hl_str_from(\"\", 0);")
+    r.push("    if (n > 65536) n = 65536;")
+    r.push("    char buf[65536];")
+    r.push("    ssize_t got = recv((int)fd, buf, (size_t)n, 0);")
+    r.push("    if (got <= 0) return hl_str_from(\"\", 0);")
+    r.push("    return hl_str_from(buf, (int64_t)got);")
+    r.push("}")
+    r.push("")
+    r.push("// hl_net_write(fd, data) — write all bytes. Returns bytes written")
+    r.push("// or -1 on error. Consumes data. Uses send() in a loop because")
+    r.push("// a single send() may not write all bytes for large payloads.")
+    r.push("static int64_t hl_net_write(int64_t fd, hl_str* data) {")
+    r.push("    int64_t total = 0;")
+    r.push("    while (total < data->len) {")
+    r.push("        ssize_t w = send((int)fd, data->data + total,")
+    r.push("                         (size_t)(data->len - total), 0);")
+    r.push("        if (w <= 0) {")
+    r.push("            hl_str_release(data);")
+    r.push("            return -1;")
+    r.push("        }")
+    r.push("        total += w;")
+    r.push("    }")
+    r.push("    int64_t r = data->len;")
+    r.push("    hl_str_release(data);")
+    r.push("    return r;")
+    r.push("}")
+    r.push("")
+    r.push("// hl_net_close(fd) — close the socket. Idempotent (a double-close")
+    r.push("// is a silent no-op, matching the interpreter).")
+    r.push("static void hl_net_close(int64_t fd) {")
+    r.push("    if (fd >= 0) close((int)fd);")
+    r.push("}")
+    r.push("")
+    r.push("// hl_net_udp_open() — create a UDP socket. Returns fd or -1.")
+    r.push("// A 5-second recv timeout is set so recv_from doesn't hang")
+    r.push("// forever on a dead peer (matches the interpreter).")
+    r.push("static int64_t hl_net_udp_open() {")
+    r.push("    int fd = socket(AF_INET, SOCK_DGRAM, 0);")
+    r.push("    if (fd < 0) return -1;")
+    r.push("    struct timeval tv;")
+    r.push("    tv.tv_sec = 5; tv.tv_usec = 0;")
+    r.push("    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));")
+    r.push("    return (int64_t)fd;")
+    r.push("}")
+    r.push("")
+    r.push("// hl_net_udp_send_to(fd, host, port, data) — send a UDP datagram.")
+    r.push("// Returns bytes sent or -1. Consumes host and data.")
+    r.push("static int64_t hl_net_udp_send_to(int64_t fd, hl_str* host,")
+    r.push("                                 int64_t port, hl_str* data) {")
+    r.push("    struct addrinfo hints;")
+    r.push("    memset(&hints, 0, sizeof(hints));")
+    r.push("    hints.ai_family = AF_INET;")
+    r.push("    hints.ai_socktype = SOCK_DGRAM;")
+    r.push("    struct addrinfo* res = NULL;")
+    r.push("    char port_buf[16];")
+    r.push("    snprintf(port_buf, sizeof(port_buf), \"%lld\", (long long)port);")
+    r.push("    int rc = getaddrinfo(host->data, port_buf, &hints, &res);")
+    r.push("    hl_str_release(host);")
+    r.push("    if (rc != 0 || res == NULL) {")
+    r.push("        hl_str_release(data);")
+    r.push("        return -1;")
+    r.push("    }")
+    r.push("    ssize_t n = sendto((int)fd, data->data, (size_t)data->len, 0,")
+    r.push("                       res->ai_addr, res->ai_addrlen);")
+    r.push("    freeaddrinfo(res);")
+    r.push("    int64_t r = (n >= 0) ? (int64_t)n : -1;")
+    r.push("    hl_str_release(data);")
+    r.push("    return r;")
+    r.push("}")
+    r.push("")
+    r.push("// hl_net_udp_recv_from(fd, n) — receive a UDP datagram. Returns a")
+    r.push("// fresh str (refcnt=1). Empty str on error or timeout. The sender's")
+    r.push("// address is discarded (callers who need it should use the raw C")
+    r.push("// recvfrom directly via FFI — Stage 15).")
+    r.push("static hl_str* hl_net_udp_recv_from(int64_t fd, int64_t n) {")
+    r.push("    if (n <= 0) return hl_str_from(\"\", 0);")
+    r.push("    if (n > 65536) n = 65536;")
+    r.push("    char buf[65536];")
+    r.push("    ssize_t got = recvfrom((int)fd, buf, (size_t)n, 0, NULL, NULL);")
+    r.push("    if (got <= 0) return hl_str_from(\"\", 0);")
+    r.push("    return hl_str_from(buf, (int64_t)got);")
+    r.push("}")
+    r.push("")
+    # hl_net_tls_get(host, port, path) — HTTPS GET via libcurl. Returns
+    # the response body as a fresh str. Panics on transport/TLS error
+    # or HTTP >= 400 (the --fail flag). When libcurl is not available
+    # (HL_HAVE_LIBCURL undefined), panics with a clean message.
+    r.push("typedef struct { char* data; int64_t len; int64_t cap; } hl_curl_buf;")
+    r.push("static size_t hl_curl_write_cb(char* ptr, size_t sz, size_t n, void* ud) {")
+    r.push("    hl_curl_buf* b = (hl_curl_buf*)ud;")
+    r.push("    size_t total = sz * n;")
+    r.push("    if (b->len + (int64_t)total > b->cap) {")
+    r.push("        int64_t newcap = b->cap * 2;")
+    r.push("        if (newcap < b->len + (int64_t)total) newcap = b->len + (int64_t)total;")
+    r.push("        char* nd = (char*)realloc(b->data, (size_t)newcap);")
+    r.push("        if (!nd) return 0;")
+    r.push("        b->data = nd; b->cap = newcap;")
+    r.push("    }")
+    r.push("    memcpy(b->data + b->len, ptr, total);")
+    r.push("    b->len += (int64_t)total;")
+    r.push("    return total;")
+    r.push("}")
+    r.push("static hl_str* hl_net_tls_get(hl_str* host, int64_t port, hl_str* path) {")
+    r.push("    if (path->len == 0 || path->data[0] != '/') {")
+    r.push("        char* nb = (char*)malloc((size_t)(path->len + 2));")
+    r.push("        if (!nb) { hl_str_release(host); hl_str_release(path); hl_die(\"net_tls_get: oom\"); }")
+    r.push("        nb[0] = '/';")
+    r.push("        memcpy(nb + 1, path->data, (size_t)path->len);")
+    r.push("        nb[path->len + 1] = 0;")
+    r.push("        hl_str* np = hl_str_from(nb, path->len + 1);")
+    r.push("        free(nb);")
+    r.push("        hl_str_release(path);")
+    r.push("        path = np;")
+    r.push("    }")
+    r.push("    char url[4096];")
+    r.push("    snprintf(url, sizeof(url), \"https://%s:%lld%s\",")
+    r.push("             host->data, (long long)port, path->data);")
+    r.push("    (void)url;")
+    r.push("#ifdef HL_HAVE_LIBCURL")
+    r.push("    CURL* c = curl_easy_init();")
+    r.push("    if (!c) {")
+    r.push("        hl_str_release(host); hl_str_release(path);")
+    r.push("        hl_die(\"net_tls_get: curl_easy_init failed\");")
+    r.push("    }")
+    r.push("    hl_curl_buf buf;")
+    r.push("    buf.data = (char*)malloc(4096);")
+    r.push("    buf.len = 0; buf.cap = 4096;")
+    r.push("    if (!buf.data) {")
+    r.push("        curl_easy_cleanup(c);")
+    r.push("        hl_str_release(host); hl_str_release(path);")
+    r.push("        hl_die(\"net_tls_get: oom\");")
+    r.push("    }")
+    r.push("    curl_easy_setopt(c, CURLOPT_URL, url);")
+    r.push("    curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, hl_curl_write_cb);")
+    r.push("    curl_easy_setopt(c, CURLOPT_WRITEDATA, &buf);")
+    r.push("    curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);")
+    r.push("    curl_easy_setopt(c, CURLOPT_TIMEOUT, 30L);")
+    r.push("    curl_easy_setopt(c, CURLOPT_FAILONERROR, 1L);")
+    r.push("    CURLcode rc = curl_easy_perform(c);")
+    r.push("    long http_code = 0;")
+    r.push("    curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &http_code);")
+    r.push("    curl_easy_cleanup(c);")
+    r.push("    hl_str_release(host); hl_str_release(path);")
+    r.push("    if (rc != CURLE_OK) {")
+    r.push("        free(buf.data);")
+    r.push("        hl_die(\"net_tls_get: transport/TLS error\");")
+    r.push("    }")
+    r.push("    if (http_code >= 400) {")
+    r.push("        free(buf.data);")
+    r.push("        hl_die(\"net_tls_get: HTTP error\");")
+    r.push("    }")
+    r.push("    hl_str* out = hl_str_from(buf.data, buf.len);")
+    r.push("    free(buf.data);")
+    r.push("    return out;")
+    r.push("#else")
+    r.push("    hl_str_release(host); hl_str_release(path);")
+    r.push("    hl_die(\"net_tls_get: built without libcurl (rebuild with -DHAVE_LIBCURL and link -lcurl)\");")
+    r.push("#endif")
+    r.push("}")
+    r.push("")
+    r.push("// ---- v0.2 additions: pop, float, chr, fmod ----")
     r.push("// String split helper (placed last because it depends on hl_list)")
     r.push("static hl_list* hl_str_split(hl_str* s, hl_str* sep) {")
     r.push("    if (sep->len == 0) hl_die(\"empty separator not allowed\");")
@@ -11305,6 +11698,16 @@ fn call_result_fresh(ctx: Ctx, e: int) -> bool {
     if name == "net_lookup" {
         return true
     }
+    # Stage 37 (v0.56.0-alpha): net_read / net_udp_recv_from return a
+    # fresh str (refcnt=1, allocated by the C runtime). net_tls_get
+    # likewise returns a fresh str (the response body). The int-returning
+    # builtins (net_tcp_connect / net_tcp_listen / net_tcp_accept /
+    # net_write / net_udp_open / net_udp_send_to) are primitive — their
+    # result class is irrelevant. net_close returns void.
+    if name == "net_read" || name == "net_udp_recv_from"
+        || name == "net_tls_get" {
+        return true
+    }
     if name == "range" || name == "chr" {
         return true
     }
@@ -11595,6 +11998,27 @@ fn builtin_arg_borrowed(name: str) -> bool {
     # `proc_exec(cmd + " " + ip)` would crash with "malloc(): unaligned
     # tcache chunk detected" (double-free of the concat result).
     if name == "net_lookup" || name == "proc_exec" {
+        return false
+    }
+    # Stage 37 (v0.56.0-alpha): TCP / UDP / TLS builtins. The host
+    # (str) and path (str) and data (str) arguments are OWNED by the
+    # runtime helpers — each is hl_str_release'd after use. The fd /
+    # port / n / backlog arguments are primitive int (no refcount).
+    # Without this, `net_write(fd, body + "\n")` would double-free
+    # the concat result (same bug pattern as proc_exec above).
+    if name == "net_tcp_connect" || name == "net_tcp_listen"
+        || name == "net_tls_get" {
+        return false
+    }
+    if name == "net_write" || name == "net_udp_send_to" {
+        return false
+    }
+    # net_tcp_accept / net_read / net_udp_recv_from only take int
+    # arguments — they have no str to consume, so the question is moot.
+    # Return false (no str borrowing) for completeness.
+    if name == "net_tcp_accept" || name == "net_read"
+        || name == "net_close" || name == "net_udp_open"
+        || name == "net_udp_recv_from" {
         return false
     }
     # Stage 16 (v0.27.0-alpha): spawn TRANSFERS each argument into the
@@ -14262,6 +14686,54 @@ fn gen_call(ctx: Ctx, e: int) -> str {
     # argument is an owned str (consumed by the runtime helper).
     if name == "net_lookup" {
         return "hl_net_lookup(" + gen_own_arg(ctx, ctx.exprs[e].args.get(0)) + ")"
+    }
+    # ----- Stage 37 (v0.56.0-alpha): TCP / UDP / TLS builtins -----
+    # Host / path arguments are OWNED str (consumed by the runtime
+    # helpers — one retain released inside the helper). Data being
+    # sent (net_write / net_udp_send_to) is also an owned str. The
+    # fd / port / n / backlog arguments are primitive int (no
+    # ownership). net_read / net_udp_recv_from return a fresh str
+    # (refcnt=1, ownership transfers to the caller's binding).
+    if name == "net_tcp_connect" {
+        return "hl_net_tcp_connect(" + gen_own_arg(ctx, ctx.exprs[e].args.get(0))
+            + ", " + gen_expr(ctx, ctx.exprs[e].args.get(1)) + ")"
+    }
+    if name == "net_tcp_listen" {
+        return "hl_net_tcp_listen(" + gen_own_arg(ctx, ctx.exprs[e].args.get(0))
+            + ", " + gen_expr(ctx, ctx.exprs[e].args.get(1))
+            + ", " + gen_expr(ctx, ctx.exprs[e].args.get(2)) + ")"
+    }
+    if name == "net_tcp_accept" {
+        return "hl_net_tcp_accept(" + gen_expr(ctx, ctx.exprs[e].args.get(0)) + ")"
+    }
+    if name == "net_read" {
+        return "hl_net_read(" + gen_expr(ctx, ctx.exprs[e].args.get(0))
+            + ", " + gen_expr(ctx, ctx.exprs[e].args.get(1)) + ")"
+    }
+    if name == "net_write" {
+        return "hl_net_write(" + gen_expr(ctx, ctx.exprs[e].args.get(0))
+            + ", " + gen_own_arg(ctx, ctx.exprs[e].args.get(1)) + ")"
+    }
+    if name == "net_close" {
+        return "hl_net_close(" + gen_expr(ctx, ctx.exprs[e].args.get(0)) + ")"
+    }
+    if name == "net_udp_open" {
+        return "hl_net_udp_open()"
+    }
+    if name == "net_udp_send_to" {
+        return "hl_net_udp_send_to(" + gen_expr(ctx, ctx.exprs[e].args.get(0))
+            + ", " + gen_own_arg(ctx, ctx.exprs[e].args.get(1))
+            + ", " + gen_expr(ctx, ctx.exprs[e].args.get(2))
+            + ", " + gen_own_arg(ctx, ctx.exprs[e].args.get(3)) + ")"
+    }
+    if name == "net_udp_recv_from" {
+        return "hl_net_udp_recv_from(" + gen_expr(ctx, ctx.exprs[e].args.get(0))
+            + ", " + gen_expr(ctx, ctx.exprs[e].args.get(1)) + ")"
+    }
+    if name == "net_tls_get" {
+        return "hl_net_tls_get(" + gen_own_arg(ctx, ctx.exprs[e].args.get(0))
+            + ", " + gen_expr(ctx, ctx.exprs[e].args.get(1))
+            + ", " + gen_own_arg(ctx, ctx.exprs[e].args.get(2)) + ")"
     }
     # rand_int(max: int) -> int — uniform random int in [0, max).
     if name == "rand_int" {

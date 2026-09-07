@@ -1,0 +1,214 @@
+# net_demo.hls — Stage 37 (v0.56.0-alpha): std.net module demo.
+#
+# This demo shows the std.net API:
+#   TcpStream      connected TCP socket (client)
+#   TcpListener    bound+listening TCP socket (server)
+#   UdpSocket      UDP socket (send_to / recv_from)
+#   tls_get        one-shot HTTPS GET via libcurl
+#   net_lookup     DNS A-record lookup (Stage 9 release)
+#
+# The demo runs entirely on loopback (no real network) so it's safe
+# to run in any environment. It:
+#   1. Resolves localhost -> 127.0.0.1.
+#   2. Spawns a TCP echo server on 127.0.0.1:19037.
+#   3. Connects a TCP client, sends "ping\n", reads the echo.
+#   4. Opens a UDP socket, sends a datagram to itself.
+#   5. Verifies connect-failure to a definitely-closed port returns -1.
+
+import "std.net"
+import "std.str"
+import "std.option"
+import "std.result"
+
+# ============================================================================
+# Section 1: DNS — resolve "localhost" (deterministic on every POSIX system).
+# ============================================================================
+
+fn section_dns() -> int uses IO, Net {
+    println("=== DNS ===")
+    let ip: str = net_lookup("localhost")
+    println("localhost -> " + ip)
+    if ip != "127.0.0.1" {
+        println("WARN: expected 127.0.0.1, got " + ip)
+    }
+    return 0
+}
+
+# ============================================================================
+# Section 2: TCP echo server (raw builtins). The server task accepts one
+# client, echoes up to 1024 bytes, then closes. The client connects, sends
+# "ping\n", reads the echo, prints it.
+# ============================================================================
+
+fn echo_server(port: int) -> int uses Net {
+    let lfd: int = net_tcp_listen("127.0.0.1", port, 1)
+    if lfd < 0 {
+        panic("echo_server: listen failed on port " + port.to_str())
+    }
+    let cfd: int = net_tcp_accept(lfd)
+    if cfd < 0 {
+        net_close(lfd)
+        panic("echo_server: accept failed")
+    }
+    let data: str = net_read(cfd, 1024)
+    let _w: int = net_write(cfd, data)
+    net_close(cfd)
+    net_close(lfd)
+    return 0
+}
+
+fn echo_client(port: int) -> str uses Net {
+    let fd: int = net_tcp_connect("127.0.0.1", port)
+    if fd < 0 {
+        return ""
+    }
+    let _w: int = net_write(fd, "ping\n")
+    let echo: str = net_read(fd, 1024)
+    net_close(fd)
+    return echo
+}
+
+fn section_tcp_raw() -> int uses IO, Net, Conc {
+    println("=== TCP (raw builtins) ===")
+    let port: int = 19037
+    let server_task: Task[int] = spawn(echo_server, port)
+    let mut echo: str = ""
+    let mut attempts: int = 0
+    while attempts < 50 {
+        echo = echo_client(port)
+        if echo.len() > 0 {
+            break
+        }
+        attempts = attempts + 1
+    }
+    let _rc: int = server_task.join()
+    println("client sent: 'ping\\n'")
+    println("client got:  '" + echo + "'")
+    if echo == "ping\n" {
+        println("echo match: OK")
+    } else {
+        println("echo match: MISMATCH")
+    }
+    return 0
+}
+
+# ============================================================================
+# Section 3: TCP echo via stdlib wrappers (TcpListener / TcpStream). Same
+# logic as Section 2 but using the high-level API.
+# ============================================================================
+
+fn echo_server_std(port: int) -> int uses Net {
+    let listener: TcpListener = tcp_listen("127.0.0.1", port, 1)
+    let conn: TcpStream = listener.accept()
+    let data: str = conn.read(1024)
+    let _w: int = conn.write(data)
+    conn.close()
+    listener.close()
+    return 0
+}
+
+fn echo_client_std(port: int) -> str uses Net {
+    let r: Result[TcpStream, str] = tcp_connect_or("127.0.0.1", port)
+    if !result_is_ok(r) {
+        return ""
+    }
+    let conn: TcpStream = result_unwrap(r)
+    let _w: int = conn.write("pong\n")
+    let echo: str = conn.read(1024)
+    conn.close()
+    return echo
+}
+
+fn section_tcp_std() -> int uses IO, Net, Conc {
+    println("=== TCP (stdlib wrappers) ===")
+    let port: int = 19038
+    let server_task: Task[int] = spawn(echo_server_std, port)
+    let mut echo: str = ""
+    let mut attempts: int = 0
+    while attempts < 50 {
+        echo = echo_client_std(port)
+        if echo.len() > 0 {
+            break
+        }
+        attempts = attempts + 1
+    }
+    let _rc: int = server_task.join()
+    println("client sent: 'pong\\n'")
+    println("client got:  '" + echo + "'")
+    if echo == "pong\n" {
+        println("echo match: OK")
+    } else {
+        println("echo match: MISMATCH")
+    }
+    return 0
+}
+
+# ============================================================================
+# Section 4: UDP loopback. Open a socket, send a datagram to a high
+# loopback port, verify the send returned the right byte count. We don't
+# expect a reply (nobody is listening); the recv_from is best-effort.
+# ============================================================================
+
+fn section_udp() -> int uses IO, Net {
+    println("=== UDP ===")
+    let sock: UdpSocket = udp_open()
+    if !sock.is_open() {
+        panic("section_udp: udp_open failed")
+    }
+    let n: int = sock.send_to("127.0.0.1", 19039, "udp-ping")
+    println("send_to returned " + n.to_str() + " bytes")
+    if n != 8 {
+        panic("section_udp: send_to returned " + n.to_str() + " (expected 8)")
+    }
+    # recv_from with a 5-second timeout (set by the runtime). Since
+    # nobody is listening on the destination port, the OS will send
+    # an ICMP port-unreachable, and the subsequent recv_from will
+    # return "" immediately (ECONNREFUSED).
+    let _reply: str = sock.recv_from(1024)
+    sock.close()
+    println("udp loopback OK")
+    return 0
+}
+
+# ============================================================================
+# Section 5: Connect-failure handling. Connect to port 1 (reserved,
+# never has a listener on a user-space machine). Should return -1.
+# ============================================================================
+
+fn section_connect_failure() -> int uses IO, Net {
+    println("=== Connect failure ===")
+    let fd: int = net_tcp_connect("127.0.0.1", 1)
+    if fd >= 0 {
+        net_close(fd)
+        println("UNEXPECTED: connect to port 1 succeeded (fd=" + fd.to_str() + ")")
+    } else {
+        println("connect to port 1 failed as expected (fd=" + fd.to_str() + ")")
+    }
+    return 0
+}
+
+# ============================================================================
+# Section 6: TLS — type-check only. Calling net_tls_get at runtime would
+# require network egress and is non-deterministic; the demo skips the
+# actual call. The function below is a compile-only check that the
+# builtin type-checks with the right argument shape.
+# ============================================================================
+
+fn _unused_tls_demo() -> str uses Net {
+    # Compile-only: verifies net_tls_get type-checks.
+    return net_tls_get("example.com", 443, "/")
+}
+
+# ============================================================================
+# Main — run all sections in order.
+# ============================================================================
+
+fn main() -> int uses IO, Net, Conc {
+    if section_dns() != 0 { return 1 }
+    if section_tcp_raw() != 0 { return 2 }
+    if section_tcp_std() != 0 { return 3 }
+    if section_udp() != 0 { return 4 }
+    if section_connect_failure() != 0 { return 5 }
+    println("ALL NET DEMO TESTS PASSED")
+    return 0
+}

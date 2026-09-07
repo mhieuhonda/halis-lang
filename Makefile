@@ -8,7 +8,30 @@ HLC     = src/hlc.hls
 BIN     = bin
 PREFIX  ?= /usr/local
 
-.PHONY: all stage0 bootstrap test examples clean run check bench install uninstall audit opt-stats emit-ir emit-llvm fmt lint lsp-check pkg-init pkg-add pkg-lock pkg-audit pkg-verify pkg-build pkg-publish pkg-log pkg-log-verify prove prove-full model prove-acceptance hltest fuzz cov fuzz-acceptance wasm-opt webapp webapp-acceptance serve aarch64-bench aarch64-acceptance aarch64-list-targets stack-acceptance inline-acceptance opt-stats-report kernel-attrs escape-acceptance layout-report tail-acceptance tail-report asm-acceptance asm-attrs bench-stdlib spec-check stage32-acceptance async-acceptance stream-acceptance io-acceptance fs-acceptance
+# ---- Stage 37 (v0.56.0-alpha): libcurl probe for the TLS builtin ----
+# The TLS builtin (net_tls_get) is conditionally compiled: the C
+# runtime emits a `#ifdef HL_HAVE_LIBCURL` guard around the libcurl
+# code path. When libcurl is installed (curl-config exists), we add
+# -DHL_HAVE_LIBCURL to CFLAGS and -lcurl to LIBS — net_tls_get works.
+# When libcurl is NOT installed, the guard compiles a clean panic
+# stub — net_tls_get panics with a clear "built without libcurl"
+# message, but everything else (TCP/UDP/DNS) works.
+#
+# Auto-probe via curl-config (universally packaged with libcurl-dev).
+# Fallback to pkg-config if curl-config is missing.
+LIBCURL_CFLAGS := $(shell curl-config --cflags 2>/dev/null)
+LIBCURL_LIBS   := $(shell curl-config --libs 2>/dev/null)
+ifeq ($(strip $(LIBCURL_LIBS)),)
+  LIBCURL_CFLAGS := $(shell pkg-config --cflags libcurl 2>/dev/null)
+  LIBCURL_LIBS   := $(shell pkg-config --libs libcurl 2>/dev/null)
+endif
+ifneq ($(strip $(LIBCURL_LIBS)),)
+  HL_CURL_DEFS := -DHL_HAVE_LIBCURL
+else
+  HL_CURL_DEFS :=
+endif
+
+.PHONY: all stage0 bootstrap test examples clean run check bench install uninstall audit opt-stats emit-ir emit-llvm fmt lint lsp-check pkg-init pkg-add pkg-lock pkg-audit pkg-verify pkg-build pkg-publish pkg-log pkg-log-verify prove prove-full model prove-acceptance hltest fuzz cov fuzz-acceptance wasm-opt webapp webapp-acceptance serve aarch64-bench aarch64-acceptance aarch64-list-targets stack-acceptance inline-acceptance opt-stats-report kernel-attrs escape-acceptance layout-report tail-acceptance tail-report asm-acceptance asm-attrs bench-stdlib spec-check stage32-acceptance async-acceptance stream-acceptance io-acceptance fs-acceptance net-acceptance
 
 # Main goal: use the full bootstrap chain to build the native compiler
 all: bootstrap
@@ -36,10 +59,11 @@ bootstrap:
 	@echo "Native compiler: $(BIN)/hlc"
 
 # Compile and run an HLS program: make run F=examples/hello.hls
+# Stage 37: link libcurl when available so net_tls_get works.
 run:
 	@test -x $(BIN)/hlc || $(MAKE) bootstrap
 	@mkdir -p $(BIN)
-	@$(BIN)/hlc $(F) $(BIN)/hls_out.c && $(CC) $(CFLAGS) -o $(BIN)/hls_out $(BIN)/hls_out.c -lm -pthread && $(BIN)/hls_out
+	@$(BIN)/hlc $(F) $(BIN)/hls_out.c && $(CC) $(CFLAGS) $(HL_CURL_DEFS) -o $(BIN)/hls_out $(BIN)/hls_out.c -lm -pthread $(LIBCURL_LIBS) && $(BIN)/hls_out
 
 # Only check types + effects (no execution)
 check:
@@ -1419,3 +1443,34 @@ fs-acceptance: bin/hlc
 	@echo "  differential (interpreter == native) verified green."
 
 .PHONY: fs-acceptance
+
+# ============================================================================
+# Stage 37 (v0.56.0-alpha): std.net -- TCP/UDP sockets, DNS, TLS via libcurl
+# ============================================================================
+net-acceptance: bin/hlc
+	@$(PYTHON) boot/boot.py examples/net_demo.hls > /tmp/net_interp.txt 2>&1
+	@bin/hlc examples/net_demo.hls /tmp/net_demo.c 2>/dev/null
+	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/net_demo /tmp/net_demo.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
+	@/tmp/net_demo > /tmp/net_nat.txt 2>&1
+	@diff -q /tmp/net_interp.txt /tmp/net_nat.txt >/dev/null 2>&1 \
+		|| (echo "FAIL: net_demo differential mismatch" && false)
+	@$(PYTHON) boot/boot.py tests/ok/feat_stage37_net.hls > /tmp/s37_interp.txt 2>&1
+	@bin/hlc tests/ok/feat_stage37_net.hls /tmp/s37.c 2>/dev/null
+	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/s37 /tmp/s37.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
+	@/tmp/s37 > /tmp/s37_nat.txt 2>&1
+	@diff -q /tmp/s37_interp.txt /tmp/s37_nat.txt >/dev/null 2>&1 \
+		|| (echo "FAIL: feat_stage37_net differential mismatch" && false)
+	@rm -f /tmp/net_demo /tmp/net_demo.c /tmp/net_interp.txt /tmp/net_nat.txt \
+		/tmp/s37 /tmp/s37.c /tmp/s37_interp.txt /tmp/s37_nat.txt
+	@echo ""
+	@echo "ACCEPTANCE OK: Stage 37 -- std.net (TCP/UDP sockets, DNS, TLS via libcurl)"
+	@echo "  net_tcp_connect / net_tcp_listen / net_tcp_accept / net_read / net_write / net_close"
+	@echo "  net_udp_open / net_udp_send_to / net_udp_recv_from"
+	@echo "  net_tls_get (HTTPS GET via libcurl, conditional on HL_HAVE_LIBCURL)"
+	@echo "  TcpStream / TcpListener / UdpSocket (high-level wrappers)"
+	@echo "  tcp_connect / tcp_connect_or / tcp_listen / tcp_listen_or / udp_open / udp_open_or / tls_get"
+	@echo "  taint-sink enforcement on host/path args (SSRF + request smuggling prevention)"
+	@echo "  differential (interpreter == native) verified green."
+
+.PHONY: net-acceptance
+

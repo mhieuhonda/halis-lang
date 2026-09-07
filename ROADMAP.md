@@ -74,7 +74,7 @@ remains green.
 |---|-------|:------:|:----------------:|
 | 35 | `std.io` — buffered readers/writers, `Read`/`Write` traits | ✅ | 4 weeks |
 | 36 | `std.fs` — path abstraction, directory walk, permissions | ✅ | 4 weeks |
-| 37 | `std.net` — TCP/UDP sockets, DNS, TLS via libcurl | ⬜ | 6 weeks |
+| 37 | `std.net` — TCP/UDP sockets, DNS, TLS via libcurl | ✅ | 6 weeks |
 | 38 | `std.http` — HTTP/1.1 server + client (RFC 7230) | ⬜ | 6 weeks |
 | 39 | `std.http2` — HTTP/2 + ALPN negotiation | ⬜ | 5 weeks |
 | 40 | `std.json` streaming parser (constant-memory) | ⬜ | 3 weeks |
@@ -4262,9 +4262,26 @@ v0.20.0-alpha).
 at the type level (a `Path` cannot be constructed from a tainted
 `str` without `sanitize_path`).
 
-**37. `std.net`** — `TcpListener`, `TcpStream`, `UdpSocket`,
-`IpAddr` (v4 + v6), `SocketAddr`. TLS via libcurl (no OpenSSL
-dependency). DNS resolution via `net_lookup` (already a taint sink).
+**37. `std.net`** ✅ (release v0.56.0-alpha) — `TcpListener`,
+`TcpStream`, `UdpSocket`, `tls_get` (HTTPS GET via libcurl). Ten
+new compiler builtins (`net_tcp_connect` / `net_tcp_listen` /
+`net_tcp_accept` / `net_read` / `net_write` / `net_close` /
+`net_udp_open` / `net_udp_send_to` / `net_udp_recv_from` /
+`net_tls_get`) wired through all four code-paths (boot checker,
+boot interpreter, self-hosted compiler C codegen + C runtime, LLVM
+IR emit). All carry the existing `Net` effect; host / path
+arguments are taint sinks (SSRF + request smuggling prevention).
+The TLS builtin is conditionally compiled via `#ifdef
+HL_HAVE_LIBCURL` (auto-probed by the Makefile) so a build without
+libcurl still compiles — the helper panics cleanly. Differential
+parity verified on TCP echo (raw + stdlib), UDP loopback,
+connect-failure handling, and DNS resolution of `localhost`. The
+TLS builtin is type-checked but not executed in the acceptance
+test (network egress is non-deterministic); it's verified
+manually against `https://example.com/`. IPv6 / `IpAddr` /
+`SocketAddr` abstractions are deferred to a future OS-dev stage
+(Stage 37 scope is the BSD-sockets subset that production CLI / web
+programs need: IPv4 loopback + IPv4 dotted-decimal + libcurl HTTPS).
 
 **38. `std.http`** — HTTP/1.1 server + client (RFC 7230). Request
 parsing is constant-memory (streaming). Response writing is

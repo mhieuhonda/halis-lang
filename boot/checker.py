@@ -233,6 +233,31 @@ BUILTIN_FNS = {
     # fs_set_perms(path, mode) -> void — chmod the path. `mode` is
     #   the POSIX permission bits (e.g. 0o644 = 420). Panics on error.
     "fs_read_dir", "fs_size", "fs_is_dir", "fs_set_perms",
+    # Stage 37 (v0.56.0-alpha): networking builtins — TCP/UDP sockets
+    # and a libcurl-backed HTTPS GET. All carry the Net effect (a
+    # program must declare `uses Net` to call any of them). The host /
+    # path arguments are taint sinks (see SINK_BUILTINS below): a
+    # tainted host enables DNS rebinding + SSRF; a tainted path enables
+    # request-smuggling path confusion.
+    #
+    # net_tcp_connect(host, port) -> int — fd (>=0) or -1 on failure.
+    # net_tcp_listen(host, port, backlog) -> int — listen fd or -1.
+    # net_tcp_accept(fd) -> int — client fd (blocks until a peer
+    #   connects; returns -1 on error).
+    # net_read(fd, n) -> str — read up to n bytes; "" at EOF or error.
+    # net_write(fd, data) -> int — bytes written; -1 on error.
+    # net_close(fd) -> void — close socket (idempotent).
+    # net_udp_open() -> int — UDP socket fd or -1.
+    # net_udp_send_to(fd, host, port, data) -> int — bytes sent or -1.
+    # net_udp_recv_from(fd, n) -> str — received datagram (up to n
+    #   bytes); "" if no data / error.
+    # net_tls_get(host, port, path) -> str — HTTPS GET body via
+    #   libcurl. Panics on transport/TLS error. The body is the raw
+    #   response payload (no headers, no status line).
+    "net_tcp_connect", "net_tcp_listen", "net_tcp_accept",
+    "net_read", "net_write", "net_close",
+    "net_udp_open", "net_udp_send_to", "net_udp_recv_from",
+    "net_tls_get",
     # Stage 8-alpha ownership primitives (v0.4.0-alpha)
     "drop", "clone", "take",
     # Stage 10-alpha: taint-tracking primitives (v0.7.0-alpha)
@@ -326,6 +351,22 @@ BUILTIN_EFFECTS = {
     # taint_mark / taint_unwrap are pure (no side effect; just wrap/unwrap).
     # Stage 9 release: Net / Rand / Proc builtins.
     "net_lookup":  {"Net"},
+    # Stage 37 (v0.56.0-alpha): TCP / UDP / TLS builtins — all carry
+    # the same Net effect as net_lookup. A single `uses Net` clause
+    # unlocks every networking primitive (DNS, TCP, UDP, TLS). Taint-
+    # sink enforcement below prevents tainted hosts/paths from
+    # reaching any of them — effect discipline controls CAPABILITY,
+    # taint discipline controls DATA FLOW.
+    "net_tcp_connect":   {"Net"},
+    "net_tcp_listen":    {"Net"},
+    "net_tcp_accept":    {"Net"},
+    "net_read":          {"Net"},
+    "net_write":         {"Net"},
+    "net_close":         {"Net"},
+    "net_udp_open":      {"Net"},
+    "net_udp_send_to":   {"Net"},
+    "net_udp_recv_from": {"Net"},
+    "net_tls_get":       {"Net"},
     "rand_int":    {"Rand"},
     "rand_float":  {"Rand"},
     "rand_seed":   {"Rand"},
@@ -418,6 +459,19 @@ SINK_BUILTINS = {
     "fs_size":      (0,),
     "fs_is_dir":    (0,),
     "fs_set_perms": (0,),
+    # Stage 37 (v0.56.0-alpha): networking builtins as sinks.
+    # A tainted HOST enables SSRF + DNS rebinding (attacker connects
+    # the program to an internal service or redirects traffic to a
+    # capture endpoint). A tainted PATH enables request smuggling
+    # (path-confusion attacks where a front-end proxy and a back-end
+    # server disagree about the resource). The DATA being sent is NOT
+    # a sink — the user is the origin of the data, not the attacker.
+    # The PORT is an int (untaintable) — the type system already
+    # prevents taint flow through ints.
+    "net_tcp_connect":  (0,),    # host
+    "net_tcp_listen":   (0,),    # host
+    "net_udp_send_to":  (1,),    # host (arg 1, after fd: arg 0)
+    "net_tls_get":      (0, 2),  # host (arg 0) AND path (arg 2)
 }
 
 # NOTE: is_tainted_type / list_taint_inner are ALIASES defined once at the
@@ -2732,6 +2786,71 @@ class Checker:
             need(1)
             reject_tainted_at_sink(0, "str")
             self.edges[self.cur_fn].add("b:net_lookup")
+            return "str"
+        # ----- Stage 37 (v0.56.0-alpha): TCP / UDP / TLS builtins -----
+        # See SINK_BUILTINS above for the taint-sink rationale (host /
+        # path; NOT data, NOT port). All return / accept primitive int
+        # fd values; the stdlib (std.net) wraps them in TcpStream /
+        # TcpListener / UdpSocket structs.
+        if name == "net_tcp_connect":
+            need(2)
+            reject_tainted_at_sink(0, "str")
+            argt(1, "int")
+            self.edges[self.cur_fn].add("b:net_tcp_connect")
+            return "int"
+        if name == "net_tcp_listen":
+            need(3)
+            reject_tainted_at_sink(0, "str")
+            argt(1, "int")
+            argt(2, "int")
+            self.edges[self.cur_fn].add("b:net_tcp_listen")
+            return "int"
+        if name == "net_tcp_accept":
+            need(1)
+            argt(0, "int")
+            self.edges[self.cur_fn].add("b:net_tcp_accept")
+            return "int"
+        if name == "net_read":
+            need(2)
+            argt(0, "int")
+            argt(1, "int")
+            self.edges[self.cur_fn].add("b:net_read")
+            return "str"
+        if name == "net_write":
+            need(2)
+            argt(0, "int")
+            argt(1, "str")
+            self.edges[self.cur_fn].add("b:net_write")
+            return "int"
+        if name == "net_close":
+            need(1)
+            argt(0, "int")
+            self.edges[self.cur_fn].add("b:net_close")
+            return "void"
+        if name == "net_udp_open":
+            need(0)
+            self.edges[self.cur_fn].add("b:net_udp_open")
+            return "int"
+        if name == "net_udp_send_to":
+            need(4)
+            argt(0, "int")
+            reject_tainted_at_sink(1, "str")
+            argt(2, "int")
+            argt(3, "str")
+            self.edges[self.cur_fn].add("b:net_udp_send_to")
+            return "int"
+        if name == "net_udp_recv_from":
+            need(2)
+            argt(0, "int")
+            argt(1, "int")
+            self.edges[self.cur_fn].add("b:net_udp_recv_from")
+            return "str"
+        if name == "net_tls_get":
+            need(3)
+            reject_tainted_at_sink(0, "str")
+            argt(1, "int")
+            reject_tainted_at_sink(2, "str")
+            self.edges[self.cur_fn].add("b:net_tls_get")
             return "str"
         # rand_int(max: int) -> int — uniform random int in [0, max).
         # Panics if max <= 0 (so the bound is always positive and the
