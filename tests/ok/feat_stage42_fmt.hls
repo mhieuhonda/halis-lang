@@ -1,0 +1,522 @@
+# tests/ok/feat_stage42_fmt.hls — Stage 42 (v0.61.0-alpha): std.fmt.
+#
+# Exercises the Display / Debug traits and the format-string interpreter:
+#   - fmt_display_* / fmt_debug_* — concrete-type formatters
+#   - fmt(format, args) — Rust-style format-string interpreter
+#   - Format specifiers: {:?} {:x} {:X} {:o} {:b} {:e}
+#   - Width and alignment: {:>N} {:<N} {:^N}
+#   - Zero-pad: {:0N}
+#   - Precision: {:.P}
+#   - Explicit positional: {N} {N:?}
+#   - Literal braces: {{ }}
+#   - Error handling: missing args, bad specifiers, unmatched braces
+#
+# All tests are DETERMINISTIC — pure HLS, no I/O — so the
+# differential test (interpreter == native) is byte-exact.
+
+import "std.fmt"
+import "std.str"
+import "std.option"
+import "std.result"
+
+# ============================================================================
+# Helpers — assertion + nice error messages.
+# ============================================================================
+
+fn ok(actual: bool, msg: str) -> void uses IO {
+    if !actual {
+        panic("FAIL " + msg)
+    }
+}
+
+fn eq_str(actual: str, expected: str, msg: str) -> void uses IO {
+    if actual != expected {
+        panic("FAIL " + msg + ": expected '" + expected + "', got '" + actual + "'")
+    }
+}
+
+fn eq_int(actual: int, expected: int, msg: str) -> void uses IO {
+    if actual != expected {
+        panic("FAIL " + msg + ": expected " + expected.to_str() + ", got " + actual.to_str())
+    }
+}
+
+# fmt_or_panic(format, args) -> str. Format or panic with the error.
+fn fmt_or_panic(format: str, args: list[FmtValue]) -> str {
+    let r: Result[str, str] = fmt(format, args)
+    if !result_is_ok(r) {
+        panic("fmt(" + format + ") failed: " + result_err_or(r, ""))
+    }
+    return result_unwrap(r)
+}
+
+# err_msg(format, args) -> str. Returns the error message (or panics if
+# the format succeeds).
+fn err_msg(format: str, args: list[FmtValue]) -> str {
+    let r: Result[str, str] = fmt(format, args)
+    if result_is_ok(r) {
+        panic("expected fmt error, got OK: " + format)
+    }
+    return result_err_or(r, "")
+}
+
+# ============================================================================
+# Tests — Display (per concrete type).
+# ============================================================================
+
+fn test_display() -> int uses IO {
+    eq_str(fmt_display_int(42), "42", "display.int.42")
+    eq_str(fmt_display_int(0), "0", "display.int.0")
+    eq_str(fmt_display_int(-17), "-17", "display.int.-17")
+    eq_str(fmt_display_int(9223372036854775807), "9223372036854775807", "display.int.max")
+    eq_str(fmt_display_int(-9223372036854775807 - 1), "-9223372036854775808", "display.int.min")
+
+    eq_str(fmt_display_str("hello"), "hello", "display.str.hello")
+    eq_str(fmt_display_str(""), "", "display.str.empty")
+    eq_str(fmt_display_str("hello world"), "hello world", "display.str.with_space")
+
+    eq_str(fmt_display_bool(true), "true", "display.bool.true")
+    eq_str(fmt_display_bool(false), "false", "display.bool.false")
+
+    # Note: float display uses %.6f (matches the runtime's fmt_float).
+    eq_str(fmt_display_float(0.0), "0.000000", "display.float.0")
+    eq_str(fmt_display_float(1.0), "1.000000", "display.float.1")
+    eq_str(fmt_display_float(3.14), "3.140000", "display.float.3.14")
+    eq_str(fmt_display_float(-2.5), "-2.500000", "display.float.-2.5")
+
+    println("  Display OK")
+    return 0
+}
+
+# ============================================================================
+# Tests — Debug (per concrete type).
+# ============================================================================
+
+fn test_debug() -> int uses IO {
+    eq_str(fmt_debug_int(42), "42", "debug.int.42")
+    eq_str(fmt_debug_int(-17), "-17", "debug.int.-17")
+
+    eq_str(fmt_debug_bool(true), "true", "debug.bool.true")
+    eq_str(fmt_debug_bool(false), "false", "debug.bool.false")
+
+    # Debug for strings: quoted with escapes.
+    eq_str(fmt_debug_str("hello"), "\"hello\"", "debug.str.hello")
+    eq_str(fmt_debug_str(""), "\"\"", "debug.str.empty")
+    eq_str(fmt_debug_str("hello\nworld"), "\"hello\\nworld\"", "debug.str.newline")
+    eq_str(fmt_debug_str("a\tb"), "\"a\\tb\"", "debug.str.tab")
+    # HLS doesn't support \r in string literals — use chr(13).
+    eq_str(fmt_debug_str("a" + chr(13) + "b"), "\"a\\rb\"", "debug.str.cr")
+    eq_str(fmt_debug_str("a\\b"), "\"a\\\\b\"", "debug.str.backslash")
+    eq_str(fmt_debug_str("a\"b"), "\"a\\\"b\"", "debug.str.quote")
+    # HLS doesn't support \0 in string literals — use chr(0).
+    eq_str(fmt_debug_str("a" + chr(0) + "b"), "\"a\\0b\"", "debug.str.null")
+    # Control byte \x01 — HLS doesn't support \x in literals, use chr(1).
+    eq_str(fmt_debug_str("hello" + chr(1) + "world"), "\"hello\\x01world\"", "debug.str.control_byte")
+
+    # Float Debug uses the same form as Display.
+    eq_str(fmt_debug_float(1.0), "1.000000", "debug.float.1")
+
+    println("  Debug OK")
+    return 0
+}
+
+# ============================================================================
+# Tests — fmt() basic.
+# ============================================================================
+
+fn test_fmt_basic() -> int uses IO {
+    # Empty format string.
+    eq_str(fmt_or_panic("", []), "", "fmt.empty")
+    # No placeholders.
+    eq_str(fmt_or_panic("hello", []), "hello", "fmt.literal")
+    # Single positional.
+    eq_str(fmt_or_panic("Hello, {}!", [FmtValue.Str("World")]), "Hello, World!", "fmt.single")
+    # Multiple positional.
+    eq_str(fmt_or_panic("{} + {} = {}", [FmtValue.Int(2), FmtValue.Int(3), FmtValue.Int(5)]), "2 + 3 = 5", "fmt.multi")
+    # Mixed types.
+    eq_str(fmt_or_panic("name={}, age={}, active={}", [
+        FmtValue.Str("Alice"),
+        FmtValue.Int(30),
+        FmtValue.Bool(true)
+    ]), "name=Alice, age=30, active=true", "fmt.mixed")
+    println("  fmt basic OK")
+    return 0
+}
+
+# ============================================================================
+# Tests — explicit positional index.
+# ============================================================================
+
+fn test_explicit_index() -> int uses IO {
+    eq_str(fmt_or_panic("{0} and {1}", [FmtValue.Str("foo"), FmtValue.Str("bar")]), "foo and bar", "fmt.explicit")
+    # Reuse index.
+    eq_str(fmt_or_panic("{0} and {1} and {0}", [FmtValue.Str("foo"), FmtValue.Str("bar")]), "foo and bar and foo", "fmt.reuse_index")
+    # Index with spec.
+    eq_str(fmt_or_panic("{0:?} {1:?}", [FmtValue.Str("a"), FmtValue.Int(1)]), "\"a\" 1", "fmt.index_with_spec")
+    # Explicit index out of order.
+    eq_str(fmt_or_panic("{2}-{1}-{0}", [FmtValue.Int(1), FmtValue.Int(2), FmtValue.Int(3)]), "3-2-1", "fmt.out_of_order")
+    println("  explicit index OK")
+    return 0
+}
+
+# ============================================================================
+# Tests — Debug specifier {:?}.
+# ============================================================================
+
+fn test_debug_spec() -> int uses IO {
+    eq_str(fmt_or_panic("{:?}", [FmtValue.Str("hello")]), "\"hello\"", "fmt.debug.str")
+    eq_str(fmt_or_panic("{:?}", [FmtValue.Str("a\nb")]), "\"a\\nb\"", "fmt.debug.str.escaped")
+    eq_str(fmt_or_panic("{:?}", [FmtValue.Int(42)]), "42", "fmt.debug.int")
+    eq_str(fmt_or_panic("{:?}", [FmtValue.Bool(true)]), "true", "fmt.debug.bool")
+    println("  debug specifier OK")
+    return 0
+}
+
+# ============================================================================
+# Tests — width and alignment.
+# ============================================================================
+
+fn test_width() -> int uses IO {
+    # Right-align (default for numbers).
+    eq_str(fmt_or_panic("[{:>10}]", [FmtValue.Int(42)]), "[        42]", "fmt.right.int")
+    eq_str(fmt_or_panic("[{:>10}]", [FmtValue.Str("hi")]), "[        hi]", "fmt.right.str")
+    # Left-align.
+    eq_str(fmt_or_panic("[{:<10}]", [FmtValue.Int(42)]), "[42        ]", "fmt.left.int")
+    eq_str(fmt_or_panic("[{:<10}]", [FmtValue.Str("hi")]), "[hi        ]", "fmt.left.str")
+    # Center.
+    eq_str(fmt_or_panic("[{:^10}]", [FmtValue.Int(42)]), "[    42    ]", "fmt.center.int")
+    eq_str(fmt_or_panic("[{:^10}]", [FmtValue.Str("hi")]), "[    hi    ]", "fmt.center.str")
+    # Width smaller than value.
+    eq_str(fmt_or_panic("[{:>3}]", [FmtValue.Int(12345)]), "[12345]", "fmt.width.undersize")
+    # Default alignment (no align char) — left for strings, right for numbers.
+    eq_str(fmt_or_panic("[{:5}]", [FmtValue.Str("ab")]), "[ab   ]", "fmt.default.align.str")
+    eq_str(fmt_or_panic("[{:5}]", [FmtValue.Int(42)]), "[   42]", "fmt.default.align.int")
+    println("  width and alignment OK")
+    return 0
+}
+
+# ============================================================================
+# Tests — zero-pad.
+# ============================================================================
+
+fn test_zero_pad() -> int uses IO {
+    eq_str(fmt_or_panic("[{:05}]", [FmtValue.Int(42)]), "[00042]", "fmt.zero.42")
+    eq_str(fmt_or_panic("[{:05}]", [FmtValue.Int(-42)]), "[-0042]", "fmt.zero.-42")
+    eq_str(fmt_or_panic("[{:05}]", [FmtValue.Int(0)]), "[00000]", "fmt.zero.0")
+    eq_str(fmt_or_panic("[{:05}]", [FmtValue.Int(99999)]), "[99999]", "fmt.zero.oversize")
+    println("  zero-pad OK")
+    return 0
+}
+
+# ============================================================================
+# Tests — number bases.
+# ============================================================================
+
+fn test_bases() -> int uses IO {
+    # Binary.
+    eq_str(fmt_or_panic("[{:b}]", [FmtValue.Int(0)]), "[0]", "fmt.bin.0")
+    eq_str(fmt_or_panic("[{:b}]", [FmtValue.Int(10)]), "[1010]", "fmt.bin.10")
+    eq_str(fmt_or_panic("[{:b}]", [FmtValue.Int(255)]), "[11111111]", "fmt.bin.255")
+    # Octal.
+    eq_str(fmt_or_panic("[{:o}]", [FmtValue.Int(0)]), "[0]", "fmt.oct.0")
+    eq_str(fmt_or_panic("[{:o}]", [FmtValue.Int(8)]), "[10]", "fmt.oct.8")
+    eq_str(fmt_or_panic("[{:o}]", [FmtValue.Int(64)]), "[100]", "fmt.oct.64")
+    # Hex lowercase.
+    eq_str(fmt_or_panic("[{:x}]", [FmtValue.Int(0)]), "[0]", "fmt.hex.0")
+    eq_str(fmt_or_panic("[{:x}]", [FmtValue.Int(255)]), "[ff]", "fmt.hex.255")
+    eq_str(fmt_or_panic("[{:x}]", [FmtValue.Int(16)]), "[10]", "fmt.hex.16")
+    # Hex uppercase.
+    eq_str(fmt_or_panic("[{:X}]", [FmtValue.Int(255)]), "[FF]", "fmt.HEX.255")
+    eq_str(fmt_or_panic("[{:X}]", [FmtValue.Int(171)]), "[AB]", "fmt.HEX.171")
+    println("  number bases OK")
+    return 0
+}
+
+# ============================================================================
+# Tests — precision.
+# ============================================================================
+
+fn test_precision() -> int uses IO {
+    eq_str(fmt_or_panic("[{:.2}]", [FmtValue.Float(3.14159)]), "[3.14]", "fmt.prec.2")
+    eq_str(fmt_or_panic("[{:.0}]", [FmtValue.Float(3.14159)]), "[3]", "fmt.prec.0")
+    eq_str(fmt_or_panic("[{:.4}]", [FmtValue.Float(1.5)]), "[1.5000]", "fmt.prec.4")
+    eq_str(fmt_or_panic("[{:.10}]", [FmtValue.Float(0.1)]), "[0.1000000000]", "fmt.prec.10")
+    # Precision 0 strips the dot.
+    eq_str(fmt_or_panic("[{:.0}]", [FmtValue.Float(99.99)]), "[100]", "fmt.prec.0.roundup")
+    # Negative precision.
+    eq_str(fmt_or_panic("[{:.3}]", [FmtValue.Float(-1.5)]), "[-1.500]", "fmt.prec.3.neg")
+    # Width + precision.
+    eq_str(fmt_or_panic("[{:>10.2}]", [FmtValue.Float(3.14159)]), "[      3.14]", "fmt.width_prec")
+    println("  precision OK")
+    return 0
+}
+
+# ============================================================================
+# Tests — literal braces.
+# ============================================================================
+
+fn test_literal_braces() -> int uses IO {
+    eq_str(fmt_or_panic("{{}}", []), "{}", "fmt.literal.empty")
+    eq_str(fmt_or_panic("{{hello}}", []), "{hello}", "fmt.literal.text")
+    eq_str(fmt_or_panic("{{count = {}}}", [FmtValue.Int(42)]), "{count = 42}", "fmt.literal_with_placeholder")
+    eq_str(fmt_or_panic("pre{{mid}}post", []), "pre{mid}post", "fmt.mid.literal")
+    println("  literal braces OK")
+    return 0
+}
+
+# ============================================================================
+# Tests — error handling.
+# ============================================================================
+
+fn test_errors() -> int uses IO {
+    # Missing argument.
+    let e1: str = err_msg("{} {}", [FmtValue.Int(1)])
+    ok(e1.len() > 0, "err.missing_arg")
+    ok(e1.contains("missing"), "err.missing_arg.contains")
+
+    # Bad specifier.
+    let e2: str = err_msg("{:z}", [FmtValue.Int(1)])
+    ok(e2.len() > 0, "err.bad_spec")
+    ok(e2.contains("unknown type"), "err.bad_spec.contains")
+
+    # Unmatched '{'.
+    let e3: str = err_msg("hello {", [])
+    ok(e3.len() > 0, "err.unmatched_open")
+    ok(e3.contains("unmatched '{'"), "err.unmatched_open.contains")
+
+    # Unmatched '}'.
+    let e4: str = err_msg("hello }", [])
+    ok(e4.len() > 0, "err.unmatched_close")
+
+    # Bad width.
+    let e5: str = err_msg("{:>abc}", [FmtValue.Int(1)])
+    ok(e5.len() > 0, "err.bad_width")
+
+    # Precision without digits.
+    let e6: str = err_msg("{:.}", [FmtValue.Float(1.0)])
+    ok(e6.len() > 0, "err.precision_no_digits")
+
+    # Width exceeds limit.
+    let e7: str = err_msg("{:>99999}", [FmtValue.Int(1)])
+    ok(e7.len() > 0, "err.width_exceeds_limit")
+
+    # Format string exceeds limit.
+    let long_str: str = str_repeat_local("x", 70000)
+    let e8: str = err_msg(long_str, [])
+    ok(e8.len() > 0, "err.format_too_long")
+
+    println("  error handling OK")
+    return 0
+}
+
+# str_repeat_local — local copy of str_repeat to avoid cross-module
+# name collisions.
+fn str_repeat_local(s: str, n: int) -> str {
+    let parts: list[str] = []
+    let mut i: int = 0
+    while i < n {
+        parts.push(s)
+        i = i + 1
+    }
+    return str_join(parts, "")
+}
+
+# ============================================================================
+# Tests — fmt_value_display / fmt_value_debug.
+# ============================================================================
+
+fn test_value_dispatch() -> int uses IO {
+    let int_v: FmtValue = FmtValue.Int(42)
+    eq_str(fmt_value_display(int_v), "42", "vd.int")
+    eq_str(fmt_value_debug(int_v), "42", "vd.int.debug")
+
+    let str_v: FmtValue = FmtValue.Str("a\nb")
+    eq_str(fmt_value_display(str_v), "a\nb", "vd.str")
+    eq_str(fmt_value_debug(str_v), "\"a\\nb\"", "vd.str.debug")
+
+    let bool_v: FmtValue = FmtValue.Bool(true)
+    eq_str(fmt_value_display(bool_v), "true", "vd.bool")
+
+    let float_v: FmtValue = FmtValue.Float(1.5)
+    eq_str(fmt_value_display(float_v), "1.500000", "vd.float")
+    println("  value dispatch OK")
+    return 0
+}
+
+# ============================================================================
+# Tests — hex byte / hex digit helpers.
+# ============================================================================
+
+fn test_hex_helpers() -> int uses IO {
+    eq_str(fmt_hex_byte(0), "00", "hb.0")
+    eq_str(fmt_hex_byte(10), "0a", "hb.10")
+    eq_str(fmt_hex_byte(255), "ff", "hb.255")
+    eq_str(fmt_hex_byte(26), "1a", "hb.26")
+    eq_str(fmt_hex_byte(255), "ff", "hb.255.2")
+    eq_str(fmt_hex_byte(128), "80", "hb.128")
+    eq_str(fmt_hex_digit(0), "0", "hd.0")
+    eq_str(fmt_hex_digit(9), "9", "hd.9")
+    eq_str(fmt_hex_digit(10), "a", "hd.10")
+    eq_str(fmt_hex_digit(15), "f", "hd.15")
+    println("  hex helpers OK")
+    return 0
+}
+
+# ============================================================================
+# Tests — fmt_pad helpers.
+# ============================================================================
+
+fn test_pad_helpers() -> int uses IO {
+    eq_str(fmt_pad_left("42", 5, " "), "   42", "pad.left.space")
+    eq_str(fmt_pad_right("42", 5, " "), "42   ", "pad.right.space")
+    eq_str(fmt_pad_left("42", 5, "0"), "00042", "pad.left.zero")
+    eq_str(fmt_pad_right("42", 5, "0"), "42000", "pad.right.zero")
+    eq_str(fmt_pad_center("42", 6, " "), "  42  ", "pad.center")
+    eq_str(fmt_pad_center("42", 5, " "), "  42 ", "pad.center.odd")
+    # Width < length: no-op.
+    eq_str(fmt_pad_left("hello", 3, " "), "hello", "pad.left.noop")
+    eq_str(fmt_pad_right("hello", 3, " "), "hello", "pad.right.noop")
+    # Empty fill: no-op.
+    eq_str(fmt_pad_left("42", 5, ""), "42", "pad.left.emptyfill")
+    println("  pad helpers OK")
+    return 0
+}
+
+# ============================================================================
+# Tests — number-base conversion helpers.
+# ============================================================================
+
+fn test_base_helpers() -> int uses IO {
+    # Binary
+    eq_str(fmt_int_binary(0), "0", "bin.0")
+    eq_str(fmt_int_binary(1), "1", "bin.1")
+    eq_str(fmt_int_binary(10), "1010", "bin.10")
+    eq_str(fmt_int_binary(255), "11111111", "bin.255")
+    eq_str(fmt_int_binary(65535), "1111111111111111", "bin.65535")
+    # Deep-scan-21 regression test (MEDIUM): previously returned "" for negatives.
+    eq_str(fmt_int_binary(-1), "1111111111111111111111111111111111111111111111111111111111111111", "bin.-1")
+    eq_str(fmt_int_binary(-8), "1111111111111111111111111111111111111111111111111111111111111000", "bin.-8")
+    eq_str(fmt_int_binary(-9223372036854775808), "1000000000000000000000000000000000000000000000000000000000000000", "bin.INT64_MIN")
+
+    # Octal
+    eq_str(fmt_int_octal(0), "0", "oct.0")
+    eq_str(fmt_int_octal(8), "10", "oct.8")
+    eq_str(fmt_int_octal(64), "100", "oct.64")
+    eq_str(fmt_int_octal(511), "777", "oct.511")
+    # Deep-scan-21 regression test: previously panicked on INT64_MIN.
+    eq_str(fmt_int_octal(-8), "-10", "oct.-8")
+    eq_str(fmt_int_octal(-9223372036854775808), "-1000000000000000000000", "oct.INT64_MIN")
+
+    # Hex
+    eq_str(fmt_int_hex(0, false), "0", "hex.0")
+    eq_str(fmt_int_hex(255, false), "ff", "hex.255")
+    eq_str(fmt_int_hex(255, true), "FF", "hex.255.U")
+    eq_str(fmt_int_hex(171, false), "ab", "hex.171")
+    eq_str(fmt_int_hex(171, true), "AB", "hex.171.U")
+    eq_str(fmt_int_hex(4096, false), "1000", "hex.4096")
+    # Deep-scan-21 regression test: previously panicked on INT64_MIN.
+    eq_str(fmt_int_hex(-255, false), "-ff", "hex.-255")
+    eq_str(fmt_int_hex(-9223372036854775808, false), "-8000000000000000", "hex.INT64_MIN")
+    eq_str(fmt_int_hex(-9223372036854775808, true), "-8000000000000000", "hex.INT64_MIN.U")
+    println("  base helpers OK")
+    return 0
+}
+
+# ============================================================================
+# Tests — float precision helper.
+# ============================================================================
+
+fn test_float_precision_helper() -> int uses IO {
+    eq_str(fmt_float_with_precision(3.14159, 2), "3.14", "fprec.2")
+    eq_str(fmt_float_with_precision(3.14159, 0), "3", "fprec.0")
+    eq_str(fmt_float_with_precision(1.5, 0), "2", "fprec.roundup")
+    eq_str(fmt_float_with_precision(0.0, 3), "0.000", "fprec.0.3")
+    eq_str(fmt_float_with_precision(0.5, 0), "0", "fprec.halfeven.0")
+    eq_str(fmt_float_with_precision(1.5, 0), "2", "fprec.halfeven.1")
+    eq_str(fmt_float_with_precision(2.5, 0), "2", "fprec.halfeven.2")  # round to even
+    eq_str(fmt_float_with_precision(-1.5, 2), "-1.50", "fprec.neg")
+    # Deep-scan-21 regression tests: large precision and large floats.
+    # Precision is capped at 17 (round-trip precision for double).
+    # Beyond 17, the extra digits are noise.
+    let r17: str = fmt_float_with_precision(1.0, 17)
+    ok(r17.len() == 19, "fprec.17.len")  # "1." + 17 zeros = 19 chars
+    # Very large precision (above the cap) — should not crash.
+    let _r100: str = fmt_float_with_precision(1.0, 100)
+    # Very large float with precision — should fall back to %.6f form.
+    let large_r: str = fmt_float_with_precision(1.0e20, 2)
+    # 1e20 has 21 digits; with precision 2, scaled = 1e22 which exceeds int64.
+    # The fallback returns the %.6f form: "100000000000000000000.000000"
+    # (let's just check it doesn't panic and produces some output).
+    ok(large_r.len() > 0, "fprec.large_float_no_panic")
+    println("  float precision helper OK")
+    return 0
+}
+
+# ============================================================================
+# Tests — combined real-world format strings.
+# ============================================================================
+
+fn test_real_world() -> int uses IO {
+    # Table row formatting.
+    let r1: str = fmt_or_panic("| {:<10} | {:>5} | {:>8} |", [
+        FmtValue.Str("apple"),
+        FmtValue.Int(42),
+        FmtValue.Float(3.14)
+    ])
+    eq_str(r1, "| apple      |    42 | 3.140000 |", "real.table")
+
+    # Status line.
+    let r2: str = fmt_or_panic("[{:?}] {} processed {} items in {}ms", [
+        FmtValue.Str("INFO"),
+        FmtValue.Str("worker-1"),
+        FmtValue.Int(100),
+        FmtValue.Int(23)
+    ])
+    eq_str(r2, "[\"INFO\"] worker-1 processed 100 items in 23ms", "real.status")
+
+    # Hex dump.
+    let r3: str = fmt_or_panic("addr={:08x} size={:4} bytes", [
+        FmtValue.Int(255),
+        FmtValue.Int(16)
+    ])
+    eq_str(r3, "addr=000000ff size=  16 bytes", "real.hexdump")
+
+    # Date format.
+    let r4: str = fmt_or_panic("{:04}-{:02}-{:02}", [
+        FmtValue.Int(2024),
+        FmtValue.Int(12),
+        FmtValue.Int(25)
+    ])
+    eq_str(r4, "2024-12-25", "real.date")
+
+    println("  real-world formats OK")
+    return 0
+}
+
+# ============================================================================
+# Main — run all tests in sequence.
+# ============================================================================
+
+fn main() -> void uses IO {
+    println("=== Stage 42 (v0.61.0-alpha): std.fmt tests ===")
+    println("")
+    test_display()
+    test_debug()
+    test_fmt_basic()
+    test_explicit_index()
+    test_debug_spec()
+    test_width()
+    test_zero_pad()
+    test_bases()
+    test_precision()
+    test_literal_braces()
+    test_errors()
+    test_value_dispatch()
+    test_hex_helpers()
+    test_pad_helpers()
+    test_base_helpers()
+    test_float_precision_helper()
+    test_real_world()
+    println("")
+    println("ALL FMT TESTS PASSED")
+}

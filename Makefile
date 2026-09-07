@@ -31,7 +31,7 @@ else
   HL_CURL_DEFS :=
 endif
 
-.PHONY: all stage0 bootstrap test examples clean run check bench install uninstall audit opt-stats emit-ir emit-llvm fmt lint lsp-check pkg-init pkg-add pkg-lock pkg-audit pkg-verify pkg-build pkg-publish pkg-log pkg-log-verify prove prove-full model prove-acceptance hltest fuzz cov fuzz-acceptance wasm-opt webapp webapp-acceptance serve aarch64-bench aarch64-acceptance aarch64-list-targets stack-acceptance inline-acceptance opt-stats-report kernel-attrs escape-acceptance layout-report tail-acceptance tail-report asm-acceptance asm-attrs bench-stdlib spec-check stage32-acceptance async-acceptance stream-acceptance io-acceptance fs-acceptance net-acceptance http-acceptance http2-acceptance json-stream-acceptance regex-acceptance
+.PHONY: all stage0 bootstrap test examples clean run check bench install uninstall audit opt-stats emit-ir emit-llvm fmt lint lsp-check pkg-init pkg-add pkg-lock pkg-audit pkg-verify pkg-build pkg-publish pkg-log pkg-log-verify prove prove-full model prove-acceptance hltest fuzz cov fuzz-acceptance wasm-opt webapp webapp-acceptance serve aarch64-bench aarch64-acceptance aarch64-list-targets stack-acceptance inline-acceptance opt-stats-report kernel-attrs escape-acceptance layout-report tail-acceptance tail-report asm-acceptance asm-attrs bench-stdlib spec-check stage32-acceptance async-acceptance stream-acceptance io-acceptance fs-acceptance net-acceptance http-acceptance http2-acceptance json-stream-acceptance regex-acceptance fmt-acceptance
 
 # Main goal: use the full bootstrap chain to build the native compiler
 all: bootstrap
@@ -1629,3 +1629,41 @@ regex-acceptance: bin/hlc
 	@echo "  differential (interpreter == native) verified green."
 
 .PHONY: regex-acceptance
+
+# ============================================================================
+# Stage 42 (v0.61.0-alpha): std.fmt -- Display / Debug traits + format!
+# ----------------------------------------------------------------------------
+# Pure-HLS Display / Debug formatters and a Rust-style format-string
+# interpreter. Monomorphic helpers per concrete type (matching the
+# std.io convention); FmtValue enum for heterogeneous format args.
+# No new compiler builtins.
+# ============================================================================
+fmt-acceptance: bin/hlc
+	@$(PYTHON) boot/boot.py examples/fmt_demo.hls > /tmp/fmt_interp.txt 2>&1
+	@bin/hlc examples/fmt_demo.hls /tmp/fmt_demo.c 2>/dev/null
+	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/fmt_demo /tmp/fmt_demo.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
+	@/tmp/fmt_demo > /tmp/fmt_nat.txt 2>&1
+	@diff -q /tmp/fmt_interp.txt /tmp/fmt_nat.txt >/dev/null 2>&1 \
+		|| (echo "FAIL: fmt_demo differential mismatch" && false)
+	@$(PYTHON) boot/boot.py tests/ok/feat_stage42_fmt.hls > /tmp/s42_interp.txt 2>&1
+	@bin/hlc tests/ok/feat_stage42_fmt.hls /tmp/s42.c 2>/dev/null
+	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/s42 /tmp/s42.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
+	@/tmp/s42 > /tmp/s42_nat.txt 2>&1
+	@diff -q /tmp/s42_interp.txt /tmp/s42_nat.txt >/dev/null 2>&1 \
+		|| (echo "FAIL: feat_stage42_fmt differential mismatch" && false)
+	@rm -f /tmp/fmt_demo /tmp/fmt_demo.c /tmp/fmt_interp.txt /tmp/fmt_nat.txt \
+		/tmp/s42 /tmp/s42.c /tmp/s42_interp.txt /tmp/s42_nat.txt
+	@echo ""
+	@echo "ACCEPTANCE OK: Stage 42 -- std.fmt (Display / Debug traits + format!)"
+	@echo "  Display formatters (int, str, bool, float -- %.6f form)"
+	@echo "  Debug formatters (int, bool, float; str with escapes \\\\n \\\\t \\\\r \\\\\\\\ \\\\\" \\\\0 \\\\xNN)"
+	@echo "  FmtValue enum (Int/Float/Str/Bool) for heterogeneous format args"
+	@echo "  fmt(format, args) -> Result[str, str] interpreter"
+	@echo "  Placeholder grammar: {} {N} {:spec} {N:spec} {{ }}"
+	@echo "  Specifiers: {:?} {:b} {:o} {:x} {:X} {:e} {:>N} {:<N} {:^N} {:0N} {:.P}"
+	@echo "  Width + precision combinations; literal braces; error handling"
+	@echo "  Number-base helpers (binary, octal, hex lower/upper)"
+	@echo "  differential (interpreter == native) verified green."
+
+.PHONY: fmt-acceptance
+

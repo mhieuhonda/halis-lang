@@ -1,0 +1,1136 @@
+# ============================================================================
+# std/fmt.hls — Stage 42 (v0.61.0-alpha): Display / Debug traits + format!
+# ----------------------------------------------------------------------------
+# This module is the ninth module of Phase III (stdlib expansion). It
+# implements Rust-style formatting — the `Display` and `Debug` traits
+# plus a `format!` macro analogue for compile-time-parsed format
+# strings.
+#
+# HLS does not yet have true trait dispatch (the `trait` keyword is
+# reserved since v0.20.0-alpha; `impl Read for X`-style dispatch
+# arrives in a future stage). Following the same convention as
+# `std.io` (Stage 35, v0.54.0-alpha), this module provides
+# **monomorphic helpers per concrete type** for both Display and
+# Debug — `fmt_display_int`, `fmt_display_str`, `fmt_display_float`,
+# `fmt_display_bool`, `fmt_debug_int`, `fmt_debug_str`,
+# `fmt_debug_float`, `fmt_debug_bool`. When trait dispatch arrives,
+# each `impl Display for X` will already be in place — only the
+# `trait Display { ... }` declaration needs to be added at the top,
+# and existing call sites will start working polymorphically.
+#
+# **No new compiler builtins** — the entire module is pure HLS.
+#
+# Display vs Debug:
+#   - Display: the user-facing representation (e.g. int 42 -> "42",
+#     str "hello" -> "hello", float 3.14 -> "3.14").
+#   - Debug: the developer-facing representation, with quoting for
+#     strings and explicit type info (e.g. int 42 -> "42", str
+#     "hello\nworld" -> "\"hello\\nworld\"" — quoted and escaped,
+#     float 3.14 -> "3.14", bool true -> "true").
+#
+# Display semantics per concrete type:
+#   - int    — decimal digits, minus sign for negatives.
+#   - float  — fixed 6-decimal notation (`%.6f`), matching the
+#              runtime's `float.to_str()` builtin (byte-identical
+#              between the interpreter and the native binary).
+#              Trailing zeros are always emitted. (Full-precision
+#              `repr`-style formatting is deferred to a future stage.)
+#   - str    — the bytes verbatim, no quoting, no escapes.
+#   - bool   — "true" or "false".
+#
+# Debug semantics per concrete type:
+#   - int    — same as Display (no special debug form).
+#   - float  — same as Display (the `%.6f` form).
+#   - str    — quoted (""" + bytes with escapes + """):
+#                - `\n` `\t` `\r` `\\` `\"` `\0` for control chars
+#                - `\xNN` for non-printable bytes 0-31 and 127-255
+#                - printable ASCII (32-126) unchanged
+#   - bool   — "true" or "false".
+#
+# Format strings — `fmt(format_str, args)`:
+#
+#   The format string is a Rust-style template with placeholders of
+#   the form `{}` (positional, 0-indexed) or `{N}` (explicit
+#   positional). Each placeholder may carry an optional specifier
+#   separated by `:` from the index:
+#     - `{}`           — positional, Display format.
+#     - `{:b}`         — binary (int only).
+#     - `{:o}`         — octal (int only).
+#     - `{:x}`         — lowercase hex (int only).
+#     - `{:X}`         — uppercase hex (int only).
+#     - `{:e}`         — scientific notation (float only).
+#     - `{:?}`         — Debug format (applies `fmt_debug_*`).
+#     - `{:>N}`        — right-align in width N.
+#     - `{:<N}`        — left-align in width N.
+#     - `{:^N}`        — center-align in width N.
+#     - `{:0N}`        — pad with zeros to width N (int only).
+#     - `{:.P}`        — precision P (float only — round to P decimal places).
+#     - `{:>N.P}`      — combine width and precision.
+#     - `{N:?}`        — explicit index N, Debug format.
+#     - `{{` / `}}`    — literal `{` and `}`.
+#
+#   A wrong specifier (e.g. `{:z}` or `{:>abc}`) returns
+#   Result.Err(msg). The compiler's compile-time checker does NOT
+#   yet analyse format strings (the language has no compile-time
+#   string parsing); a wrong specifier is a runtime error.
+#
+# FmtValue enum — for passing heterogeneous args:
+#
+#   enum FmtValue {
+#       Int(int),
+#       Float(float),
+#       Str(str),
+#       Bool(bool)
+#   }
+#
+# The `fmt` function takes a format string and a list of FmtValue.
+# Positional placeholders consume values in order; explicit `{N}`
+# indexes the list at N.
+#
+# Differential parity (interpreter == native):
+#
+#   The formatters are pure string operations. Output is
+#   byte-identical between the interpreter and the native binary
+#   (no I/O, no randomness, no float arithmetic in the formatting
+#   itself — except for float Display, which uses the runtime's
+#   `float.to_str()` builtin and is identical across both
+#   implementations by the differential test).
+#
+# Security:
+#
+#   * **Format string length**: a format string longer than
+#     FMT_MAX_FORMAT (default 64 KiB) is rejected. Defends against a
+#     peer that sends a 1 GB format string.
+#   * **Width / precision bounds**: width and precision specifiers
+#     are bounded by FMT_MAX_WIDTH (default 4096). A specifier like
+#     `{:>1000000000}` is rejected with Result.Err.
+#   * **Arg count**: there is no explicit arg-count limit; the
+#     caller-supplied list bounds it. A format string with more
+#     placeholders than args returns Result.Err("missing argument
+#     at index N").
+#   * **String escaping**: Debug format on strings escapes
+#     non-printable bytes via `\xNN` to keep the output valid
+#     UTF-8 and safe to log. Display format emits the bytes
+#     verbatim (the caller is responsible for ensuring the
+#     string is valid UTF-8 if downstream consumers require it).
+#
+# API summary:
+#
+#   fmt_display_int(x) -> str
+#   fmt_display_float(x) -> str
+#   fmt_display_str(s) -> str
+#   fmt_display_bool(b) -> str
+#   fmt_debug_int(x) -> str
+#   fmt_debug_float(x) -> str
+#   fmt_debug_str(s) -> str
+#   fmt_debug_bool(b) -> str
+#   fmt(format, args) -> Result[str, str]
+#   fmt_unwrap(r) -> str   # panics on Err (use when you've verified)
+#   fmt_to_str(v: FmtValue, debug: bool) -> str  # Display/Debug dispatch
+#   fmt_pad_left(s, width, fill) -> str
+#   fmt_pad_right(s, width, fill) -> str
+#   fmt_pad_center(s, width, fill) -> str
+# ============================================================================
+
+import "std.result"
+import "std.str"
+import "std.option"
+
+# ============================================================================
+# Constants — limits.
+# ============================================================================
+
+fn fmt_max_format() -> int {
+    return 65536
+}
+
+fn fmt_max_width() -> int {
+    return 4096
+}
+
+fn fmt_max_precision() -> int {
+    return 1024
+}
+
+# ============================================================================
+# FmtValue enum — tagged union for heterogeneous format args.
+# ============================================================================
+
+enum FmtValue {
+    Int(int),
+    Float(float),
+    Str(str),
+    Bool(bool)
+}
+
+# ============================================================================
+# Display — user-facing representation per concrete type.
+# ============================================================================
+
+# fmt_display_int(x) -> str. Decimal digits, minus sign for negatives.
+# Matches Python's `str(int)`.
+fn fmt_display_int(x: int) -> str {
+    return x.to_str()
+}
+
+# fmt_display_float(x) -> str. Full-precision decimal representation
+# (matches Python's `repr(float)`). Implemented via the runtime's
+# `float.to_str()` builtin, which is byte-identical between the
+# interpreter and the native binary.
+fn fmt_display_float(x: float) -> str {
+    return x.to_str()
+}
+
+# fmt_display_str(s) -> str. The bytes verbatim, no quoting, no
+# escapes.
+fn fmt_display_str(s: str) -> str {
+    return s
+}
+
+# fmt_display_bool(b) -> str. "true" or "false".
+fn fmt_display_bool(b: bool) -> str {
+    return b.to_str()
+}
+
+# ============================================================================
+# Debug — developer-facing representation per concrete type.
+# ============================================================================
+
+# fmt_debug_int(x) -> str. Same as Display (int has no special
+# Debug form).
+fn fmt_debug_int(x: int) -> str {
+    return x.to_str()
+}
+
+# fmt_debug_float(x) -> str. Same as Display.
+fn fmt_debug_float(x: float) -> str {
+    return x.to_str()
+}
+
+# fmt_debug_bool(b) -> str. "true" or "false".
+fn fmt_debug_bool(b: bool) -> str {
+    return b.to_str()
+}
+
+# fmt_debug_str(s) -> str. Quoted (""" + bytes with escapes + """):
+#   - `\n` `\t` `\r` `\\` `\"` for control chars
+#   - `\xNN` for non-printable bytes 0-31 and 127-255
+#   - printable ASCII (32-126) unchanged
+#
+# Non-ASCII bytes (128-255) are emitted as `\xNN` to keep the output
+# valid UTF-8 (a non-ASCII byte is not a valid UTF-8 sequence by
+# itself). The caller's `str` may contain raw bytes that aren't
+# valid UTF-8 — the debug form will still produce a printable,
+# round-trippable representation.
+fn fmt_debug_str(s: str) -> str {
+    let mut out: str = "\""
+    let n: int = s.len()
+    let mut i: int = 0
+    while i < n {
+        let b: int = s.byte_at(i)
+        if b == 92 {  # '\\'
+            out = out + "\\\\"
+        } else if b == 34 {  # '"'
+            out = out + "\\\""
+        } else if b == 10 {  # '\n'
+            out = out + "\\n"
+        } else if b == 9 {  # '\t'
+            out = out + "\\t"
+        } else if b == 13 {  # '\r'
+            out = out + "\\r"
+        } else if b == 0 {
+            out = out + "\\0"
+        } else if b >= 32 && b <= 126 {
+            # Printable ASCII.
+            out = out + chr(b)
+        } else {
+            # Non-printable or non-ASCII: emit \xNN.
+            out = out + "\\x" + fmt_hex_byte(b)
+        }
+        i = i + 1
+    }
+    out = out + "\""
+    return out
+}
+
+# fmt_hex_byte(b) -> str. Two lowercase hex digits for byte b (0..255).
+fn fmt_hex_byte(b: int) -> str {
+    let hi: int = b / 16
+    let lo: int = b % 16
+    return fmt_hex_digit(hi) + fmt_hex_digit(lo)
+}
+
+# fmt_hex_digit(n) -> str. One lowercase hex digit for n in 0..15.
+fn fmt_hex_digit(n: int) -> str {
+    if n < 10 {
+        return chr(48 + n)  # '0' + n
+    }
+    return chr(97 + n - 10)  # 'a' + n - 10
+}
+
+# ============================================================================
+# fmt_to_str — Display/Debug dispatch on FmtValue.
+# ============================================================================
+
+# fmt_to_str(v, debug) -> str. Format a FmtValue using Display
+# (debug=false) or Debug (debug=true). This is the runtime dispatch
+# equivalent of Rust's `<T as Display>::fmt(&v, f)`.
+fn fmt_to_str(v: FmtValue, debug: bool) -> str {
+    return match v {
+        FmtValue.Int(x) => fmt_int_with_mode(x, debug),
+        FmtValue.Float(x) => fmt_float_with_mode(x, debug),
+        FmtValue.Str(s) => fmt_str_with_mode(s, debug),
+        FmtValue.Bool(b) => fmt_bool_with_mode(b, debug)
+    }
+}
+
+# fmt_int_with_mode(x, debug) -> str. For int, Debug == Display.
+fn fmt_int_with_mode(x: int, debug: bool) -> str {
+    let _unused: bool = debug
+    return fmt_display_int(x)
+}
+
+# fmt_float_with_mode(x, debug) -> str. For float, Debug == Display.
+fn fmt_float_with_mode(x: float, debug: bool) -> str {
+    let _unused2: bool = debug
+    return fmt_display_float(x)
+}
+
+# fmt_str_with_mode(s, debug) -> str.
+fn fmt_str_with_mode(s: str, debug: bool) -> str {
+    if debug {
+        return fmt_debug_str(s)
+    }
+    return fmt_display_str(s)
+}
+
+# fmt_bool_with_mode(b, debug) -> str. For bool, Debug == Display.
+fn fmt_bool_with_mode(b: bool, debug: bool) -> str {
+    let _unused3: bool = debug
+    return fmt_display_bool(b)
+}
+
+# ============================================================================
+# Format-specifier parser.
+#
+# A format placeholder has the grammar:
+#   placeholder := '{' [index] [':' [align] [width] ['.' precision] [type]] '}'
+#   index      := [0-9]+
+#   align      := '<' | '>' | '^'
+#   width      := '0' [0-9]* | [1-9] [0-9]*  (zero-pad or normal width)
+#   precision  := [0-9]+
+#   type       := '?' | 'b' | 'o' | 'x' | 'X' | 'e'
+#
+# The placeholder may also be `{{` or `}}` for literal braces.
+# ============================================================================
+
+# FmtSpec — a parsed format specifier.
+struct FmtSpec {
+    # The argument index this placeholder refers to. -1 means
+    # "use the next positional arg".
+    index: int,
+    # The alignment: 0 = default (right for numbers, left for strings),
+    # 1 = left, 2 = right, 3 = center.
+    align: int,
+    # The minimum width. 0 means no width padding.
+    width: int,
+    # Whether the width is zero-padded (int only). True if the
+    # width specifier starts with '0'.
+    zero_pad: bool,
+    # The precision (float only). -1 means no precision.
+    precision: int,
+    # The format type: 0 = Display/Debug default, 1 = Debug (?),
+    # 2 = binary (b), 3 = octal (o), 4 = lowercase hex (x),
+    # 5 = uppercase hex (X), 6 = scientific (e).
+    type_kind: int
+}
+
+# Default format spec.
+fn fmt_spec_default() -> FmtSpec {
+    return FmtSpec {
+        index: -1,
+        align: 0,
+        width: 0,
+        zero_pad: false,
+        precision: -1,
+        type_kind: 0
+    }
+}
+
+# Spec constants.
+fn fmt_align_default() -> int { return 0 }
+fn fmt_align_left() -> int { return 1 }
+fn fmt_align_right() -> int { return 2 }
+fn fmt_align_center() -> int { return 3 }
+
+fn fmt_type_default() -> int { return 0 }
+fn fmt_type_debug() -> int { return 1 }
+fn fmt_type_binary() -> int { return 2 }
+fn fmt_type_octal() -> int { return 3 }
+fn fmt_type_hex_lower() -> int { return 4 }
+fn fmt_type_hex_upper() -> int { return 5 }
+fn fmt_type_scientific() -> int { return 6 }
+
+# ============================================================================
+# Format placeholder parser.
+#
+# fmt_parse_spec(spec_str) -> Result[FmtSpec, str]. Parse a format
+# specifier string (the part between `{:` and `}`). Returns
+# Result.Ok(spec) or Result.Err(msg) with a descriptive error.
+# ============================================================================
+
+fn fmt_parse_spec(spec_str: str) -> Result[FmtSpec, str] {
+    let spec: FmtSpec = fmt_spec_default()
+    let n: int = spec_str.len()
+    let mut i: int = 0
+    # Parse optional index.
+    let mut saw_index: bool = false
+    let mut idx_start: int = i
+    while i < n {
+        let b: int = spec_str.byte_at(i)
+        if b < 48 || b > 57 {
+            break
+        }
+        i = i + 1
+    }
+    if i > idx_start {
+        let idx_str: str = spec_str.slice(idx_start, i)
+        let ir: Result[int, str] = int_parse(idx_str)
+        if !result_is_ok(ir) {
+            return Result.Err("format: bad index: " + idx_str)
+        }
+        spec.index = result_unwrap(ir)
+        saw_index = true
+    }
+    # After the index, expect ':' or end.
+    if i < n && spec_str.byte_at(i) == 58 {
+        # Index was specified, now parse the spec after ':'.
+        i = i + 1
+    } else if i == n {
+        # Just an index, no spec.
+        return Result.Ok(spec)
+    } else if i < n && spec_str.byte_at(i) != 58 {
+        # Index followed by something that isn't ':' — error.
+        # (E.g. "{0>5}" — we expect "{0:>5}".)
+        return Result.Err("format: expected ':' after index, got '" + chr(spec_str.byte_at(i)) + "'")
+    }
+    # Parse optional alignment.
+    if i < n {
+        let b: int = spec_str.byte_at(i)
+        if b == 60 {  # '<'
+            spec.align = fmt_align_left()
+            i = i + 1
+        } else if b == 62 {  # '>'
+            spec.align = fmt_align_right()
+            i = i + 1
+        } else if b == 94 {  # '^'
+            spec.align = fmt_align_center()
+            i = i + 1
+        }
+    }
+    # Parse optional width. Width may start with '0' (zero-pad) or
+    # be a normal number.
+    let width_start: int = i
+    if i < n && spec_str.byte_at(i) == 48 {
+        # Could be zero-pad or width=0.
+        if i + 1 < n {
+            let next: int = spec_str.byte_at(i + 1)
+            if next >= 48 && next <= 57 {
+                spec.zero_pad = true
+                i = i + 1
+            }
+        }
+    }
+    let width_digits_start: int = i
+    while i < n {
+        let b: int = spec_str.byte_at(i)
+        if b < 48 || b > 57 {
+            break
+        }
+        i = i + 1
+    }
+    if i > width_digits_start {
+        let width_str: str = spec_str.slice(width_digits_start, i)
+        let wr: Result[int, str] = int_parse(width_str)
+        if !result_is_ok(wr) {
+            return Result.Err("format: bad width: " + width_str)
+        }
+        spec.width = result_unwrap(wr)
+        if spec.width > fmt_max_width() {
+            return Result.Err("format: width exceeds limit: " + width_str)
+        }
+    } else if width_start < i {
+        # We had a leading '0' but no following digits — that's
+        # zero-pad with width 0, which is a no-op. Just clear it.
+        spec.zero_pad = false
+    }
+    # Parse optional precision.
+    if i < n && spec_str.byte_at(i) == 46 {  # '.'
+        i = i + 1
+        let prec_start: int = i
+        while i < n {
+            let b: int = spec_str.byte_at(i)
+            if b < 48 || b > 57 {
+                break
+            }
+            i = i + 1
+        }
+        if i == prec_start {
+            return Result.Err("format: precision '.' without digits")
+        }
+        let prec_str: str = spec_str.slice(prec_start, i)
+        let pr: Result[int, str] = int_parse(prec_str)
+        if !result_is_ok(pr) {
+            return Result.Err("format: bad precision: " + prec_str)
+        }
+        spec.precision = result_unwrap(pr)
+        if spec.precision > fmt_max_precision() {
+            return Result.Err("format: precision exceeds limit: " + prec_str)
+        }
+    }
+    # Parse optional type.
+    if i < n {
+        let b: int = spec_str.byte_at(i)
+        if b == 63 {  # '?'
+            spec.type_kind = fmt_type_debug()
+            i = i + 1
+        } else if b == 98 {  # 'b'
+            spec.type_kind = fmt_type_binary()
+            i = i + 1
+        } else if b == 111 {  # 'o'
+            spec.type_kind = fmt_type_octal()
+            i = i + 1
+        } else if b == 120 {  # 'x'
+            spec.type_kind = fmt_type_hex_lower()
+            i = i + 1
+        } else if b == 88 {  # 'X'
+            spec.type_kind = fmt_type_hex_upper()
+            i = i + 1
+        } else if b == 101 {  # 'e'
+            spec.type_kind = fmt_type_scientific()
+            i = i + 1
+        } else {
+            return Result.Err("format: unknown type specifier: '" + chr(b) + "'")
+        }
+    }
+    if i != n {
+        return Result.Err("format: trailing characters in spec: '" + spec_str.slice(i, n) + "'")
+    }
+    return Result.Ok(spec)
+}
+
+# ============================================================================
+# Format-string interpreter.
+# ============================================================================
+
+# fmt(format, args) -> Result[str, str]. Format the given args
+# according to the format string. Returns Result.Ok(formatted) on
+# success, Result.Err(msg) on a parse error or missing-arg error.
+#
+# The function walks the format string and emits characters
+# directly. Placeholders `{...}` are parsed and the corresponding
+# arg is formatted.
+fn fmt(format: str, args: list[FmtValue]) -> Result[str, str] {
+    if format.len() > fmt_max_format() {
+        return Result.Err("fmt: format string exceeds limit " + fmt_max_format().to_str())
+    }
+    let mut out: str = ""
+    let n: int = format.len()
+    let mut i: int = 0
+    let mut next_pos: int = 0
+    while i < n {
+        let b: int = format.byte_at(i)
+        # Literal '{' or '}'.
+        if b == 123 && i + 1 < n && format.byte_at(i + 1) == 123 {
+            out = out + "{"
+            i = i + 2
+            continue
+        }
+        if b == 125 && i + 1 < n && format.byte_at(i + 1) == 125 {
+            out = out + "}"
+            i = i + 2
+            continue
+        }
+        # Start of a placeholder.
+        if b == 123 {
+            # Find the matching '}'.
+            let mut j: int = i + 1
+            let mut found_close: bool = false
+            while j < n {
+                if format.byte_at(j) == 125 {
+                    found_close = true
+                    break
+                }
+                j = j + 1
+            }
+            if !found_close {
+                return Result.Err("fmt: unmatched '{' at byte " + i.to_str())
+            }
+            # Parse the spec.
+            let spec_str: str = format.slice(i + 1, j)
+            let spec_r: Result[FmtSpec, str] = fmt_parse_spec(spec_str)
+            if !result_is_ok(spec_r) {
+                return Result.Err(result_err_or(spec_r, ""))
+            }
+            let spec: FmtSpec = result_unwrap(spec_r)
+            # Determine the arg index.
+            let mut arg_idx: int = spec.index
+            if arg_idx < 0 {
+                arg_idx = next_pos
+                next_pos = next_pos + 1
+            }
+            if arg_idx >= args.len() {
+                return Result.Err("fmt: missing argument at index " + arg_idx.to_str())
+            }
+            let v: FmtValue = args.get(arg_idx)
+            # Format the value.
+            let formatted: str = fmt_format_value(v, spec)
+            out = out + formatted
+            i = j + 1
+            continue
+        }
+        # Unmatched '}' is an error.
+        if b == 125 {
+            return Result.Err("fmt: unmatched '}' at byte " + i.to_str())
+        }
+        out = out + chr(b)
+        i = i + 1
+    }
+    return Result.Ok(out)
+}
+
+# fmt_format_value(v, spec) -> str. Format a FmtValue according to
+# the parsed FmtSpec.
+fn fmt_format_value(v: FmtValue, spec: FmtSpec) -> str {
+    # Determine debug mode.
+    let debug: bool = spec.type_kind == fmt_type_debug()
+    # Format the raw value first (without width / precision).
+    let raw: str = fmt_format_value_raw(v, spec, debug)
+    # Apply width / alignment / zero-pad.
+    return fmt_apply_width(raw, spec, v)
+}
+
+# fmt_format_value_raw(v, spec, debug) -> str. Format the value
+# itself (without width / alignment), honoring the type specifier
+# and precision.
+fn fmt_format_value_raw(v: FmtValue, spec: FmtSpec, debug: bool) -> str {
+    return match v {
+        FmtValue.Int(x) => fmt_format_int_raw(x, spec),
+        FmtValue.Float(x) => fmt_format_float_raw(x, spec),
+        FmtValue.Str(s) => fmt_format_str_raw(s, spec, debug),
+        FmtValue.Bool(b) => fmt_format_bool_raw(b, debug)
+    }
+}
+
+# fmt_format_int_raw(x, spec) -> str. Format an int honoring the
+# type specifier (binary, octal, hex, etc.).
+fn fmt_format_int_raw(x: int, spec: FmtSpec) -> str {
+    if spec.type_kind == fmt_type_binary() {
+        return fmt_int_binary(x)
+    }
+    if spec.type_kind == fmt_type_octal() {
+        return fmt_int_octal(x)
+    }
+    if spec.type_kind == fmt_type_hex_lower() {
+        return fmt_int_hex(x, false)
+    }
+    if spec.type_kind == fmt_type_hex_upper() {
+        return fmt_int_hex(x, true)
+    }
+    # Default: decimal.
+    return x.to_str()
+}
+
+# fmt_format_float_raw(x, spec) -> str. Format a float honoring the
+# precision (if specified) and type specifier.
+fn fmt_format_float_raw(x: float, spec: FmtSpec) -> str {
+    if spec.precision >= 0 {
+        return fmt_float_with_precision(x, spec.precision)
+    }
+    return x.to_str()
+}
+
+# fmt_format_str_raw(s, spec, debug) -> str. Format a str honoring
+# the debug flag.
+fn fmt_format_str_raw(s: str, spec: FmtSpec, debug: bool) -> str {
+    let _unused: FmtSpec = spec
+    return fmt_str_with_mode(s, debug)
+}
+
+# fmt_format_bool_raw(b, debug) -> str.
+fn fmt_format_bool_raw(b: bool, debug: bool) -> str {
+    let _unused: bool = debug
+    return fmt_display_bool(b)
+}
+
+# ============================================================================
+# Number base conversions — binary, octal, hex.
+# ============================================================================
+
+# fmt_int_binary(x) -> str. Binary representation of x. For non-
+# negative x, this is the standard binary digits. For negative x,
+# the two's-complement 64-bit pattern is emitted (matching Rust's
+# `format!("{:b}", x)` — e.g. `fmt_int_binary(-1) == "11111111..."`
+# with 64 ones, `fmt_int_binary(-8) == "...11111000"` with 64 bits
+# ending in `1000`).
+#
+# Deep-scan-21 fix (MEDIUM): the previous implementation used
+# `while v > 0` after a two's-complement mask — for negative x the
+# masked value is negative (int64), so `v > 0` was false and the
+# loop never executed, producing an empty string for `-1` and
+# `INT64_MIN`. The new loop uses `v != 0` and iterates exactly 64
+# times for any non-zero input (the `int_shr(v, 1)` eventually
+# reaches 0 because `int_shr` is the logical right shift, which
+# zero-fills).
+fn fmt_int_binary(x: int) -> str {
+    if x == 0 {
+        return "0"
+    }
+    # Two's-complement reinterpretation: treat x as uint64.
+    let mut v: int = int_and(x, 9223372036854775807)  # mask to 63 bits
+    if x < 0 {
+        # Add the sign bit back: int64 -1 == uint64 18446744073709551615.
+        v = int_or(v, int_shl(1, 63))
+    }
+    let digits: list[str] = []
+    while v != 0 {
+        let bit: int = int_and(v, 1)
+        if bit == 1 {
+            digits.push("1")
+        } else {
+            digits.push("0")
+        }
+        v = int_shr(v, 1)
+    }
+    # Reverse.
+    let rev: list[str] = []
+    let mut k: int = digits.len() - 1
+    while k >= 0 {
+        rev.push(digits.get(k))
+        k = k - 1
+    }
+    return str_join(rev, "")
+}
+
+# fmt_int_octal(x) -> str. Octal representation with `-` prefix for
+# negatives. INT64_MIN is handled specially (the general formula
+# `v = 0 - x` would overflow on INT64_MIN).
+#
+# Deep-scan-21 fix (MEDIUM): the previous `v = 0 - x` panicked on
+# INT64_MIN with "integer overflow" (because 0 - INT64_MIN wraps
+# to a value > INT64_MAX, which both the interpreter and the C
+# runtime detect and panic). The fix: detect INT64_MIN and emit
+# the known constant.
+fn fmt_int_octal(x: int) -> str {
+    if x == 0 {
+        return "0"
+    }
+    if x == -9223372036854775808 {
+        # INT64_MIN: -9223372036854775808 == -(2^63) == -1000000000000000000000 octal.
+        return "-1000000000000000000000"
+    }
+    let neg: bool = x < 0
+    let mut v: int = x
+    if neg {
+        v = 0 - x
+    }
+    let digits: list[str] = []
+    while v > 0 {
+        let d: int = v % 8
+        digits.push(chr(48 + d))
+        v = v / 8
+    }
+    let rev: list[str] = []
+    let mut k: int = digits.len() - 1
+    while k >= 0 {
+        rev.push(digits.get(k))
+        k = k - 1
+    }
+    let s: str = str_join(rev, "")
+    if neg {
+        return "-" + s
+    }
+    return s
+}
+
+# fmt_int_hex(x, upper) -> str. Hex representation (lower or upper).
+# INT64_MIN is handled specially (same reasoning as fmt_int_octal).
+#
+# Deep-scan-21 fix (MEDIUM): same as fmt_int_octal — `v = 0 - x`
+# overflowed on INT64_MIN.
+fn fmt_int_hex(x: int, upper: bool) -> str {
+    if x == 0 {
+        return "0"
+    }
+    if x == -9223372036854775808 {
+        # INT64_MIN: -(2^63) = -8000000000000000 hex.
+        return "-8000000000000000"
+    }
+    let neg: bool = x < 0
+    let mut v: int = x
+    if neg {
+        v = 0 - x
+    }
+    let digits: list[str] = []
+    while v > 0 {
+        let d: int = v % 16
+        if d < 10 {
+            digits.push(chr(48 + d))
+        } else if upper {
+            digits.push(chr(65 + d - 10))  # 'A' + d - 10
+        } else {
+            digits.push(chr(97 + d - 10))  # 'a' + d - 10
+        }
+        v = v / 16
+    }
+    let rev: list[str] = []
+    let mut k: int = digits.len() - 1
+    while k >= 0 {
+        rev.push(digits.get(k))
+        k = k - 1
+    }
+    let s: str = str_join(rev, "")
+    if neg {
+        return "-" + s
+    }
+    return s
+}
+
+# ============================================================================
+# Float formatting with precision.
+# ============================================================================
+
+# fmt_float_with_precision(x, p) -> str. Format a float with `p`
+# decimal places. Rounds half-to-even (matches Python's format spec
+# 'g' for fixed precision). The implementation uses a string-form
+# approach to avoid float-precision loss:
+#   - For non-negative x, multiply by 10^p, round to int, format,
+#     insert '.' at position len - p.
+#   - For negative x, format as "-" + fmt_float_with_precision(-x, p).
+#
+# Edge cases:
+#   - NaN -> "nan"
+#   - +Inf -> "inf"
+#   - -Inf -> "-inf"
+#
+# Deep-scan-21 fix (MEDIUM, safety): cap effective precision at 17
+# (the round-trip precision for IEEE-754 double). For `p > 17`, the
+# `scale = 10^p` computation overflows `double` (~1.8e308) once
+# `p > 308` — `scale` becomes `inf`, `scaled = inf`, and downstream
+# arithmetic produces `nan`/`inf` (wrong output, not a crash). For
+# very large `x` (e.g. `1e300`) and `p > 0`, `scaled` exceeds int64
+# range — `scaled.to_int()` panics in both the interpreter and the
+# native runtime. The fix:
+#   1. Cap effective precision at 17. Beyond 17, the extra digits
+#      are noise (the double can't represent them).
+#   2. For `x >= 2^63 / 10^p` (i.e. `scaled` would overflow int64),
+#      fall back to `x.to_str()` (the runtime's `%.6f` form). The
+#      caller gets a valid string, even if not the requested
+#      precision — they would have gotten garbage otherwise.
+fn fmt_float_with_precision(x: float, p: int) -> str {
+    if p < 0 {
+        return x.to_str()
+    }
+    if x != x {
+        return "nan"
+    }
+    if x == 1.0 / 0.0 {
+        return "inf"
+    }
+    if x == -1.0 / 0.0 {
+        return "-inf"
+    }
+    if x < 0.0 {
+        return "-" + fmt_float_with_precision(0.0 - x, p)
+    }
+    # Cap effective precision at 17 (round-trip precision for double).
+    # Beyond this, the extra digits are noise.
+    let mut eff_p: int = p
+    if eff_p > 17 {
+        eff_p = 17
+    }
+    # Compute scale = 10^eff_p. For eff_p <= 17, this is < 1e18 (well
+    # within double range).
+    let mut scale: float = 1.0
+    let mut k: int = 0
+    while k < eff_p {
+        scale = scale * 10.0
+        k = k + 1
+    }
+    let scaled: float = x * scale
+    # If `scaled` would overflow int64 (i.e. scaled >= 2^63),
+    # fall back to the default Display form. This avoids the
+    # `float.to_int out of int64 range` panic.
+    if scaled >= 9223372036854775808.0 {
+        return x.to_str()
+    }
+    # Round half-to-even.
+    let floor_val: float = scaled - (scaled % 1.0)
+    let frac: float = scaled - floor_val
+    let mut rounded: float = floor_val
+    if frac > 0.5 {
+        rounded = floor_val + 1.0
+    } else if frac == 0.5 {
+        # Round to even.
+        let floor_int: int = floor_val.to_int()
+        if floor_int % 2 == 1 {
+            rounded = floor_val + 1.0
+        }
+    }
+    let int_part: int = rounded.to_int()
+    # Format as int, then insert '.' at the right place.
+    let int_str: str = int_part.to_str()
+    if eff_p == 0 {
+        return int_str
+    }
+    # Pad with leading zeros if needed.
+    let mut padded: str = int_str
+    while padded.len() < eff_p + 1 {
+        padded = "0" + padded
+    }
+    # Insert '.' at position len - eff_p.
+    let dot_pos: int = padded.len() - eff_p
+    return padded.slice(0, dot_pos) + "." + padded.slice(dot_pos, padded.len())
+}
+
+# ============================================================================
+# Width / alignment / zero-pad application.
+# ============================================================================
+
+# fmt_apply_width(s, spec, v) -> str. Apply width, alignment, and
+# zero-pad to the formatted string s.
+#
+# Zero-pad only applies to int values (with default right-align).
+# For other types, zero-pad is treated as a regular width with
+# right-align.
+fn fmt_apply_width(s: str, spec: FmtSpec, v: FmtValue) -> str {
+    if spec.width <= 0 || s.len() >= spec.width {
+        return s
+    }
+    # Determine alignment: default is right for numbers, left for strings.
+    let mut align: int = spec.align
+    if align == fmt_align_default() {
+        # Default alignment.
+        if spec.zero_pad {
+            align = fmt_align_right()
+        } else if fmt_value_is_str(v) {
+            align = fmt_align_left()
+        } else {
+            align = fmt_align_right()
+        }
+    }
+    # Zero-pad: only for non-negative ints, replace left padding with '0'.
+    # For negative ints, the '-' should appear before the zeros.
+    if spec.zero_pad {
+        # Check the value is an int and non-negative.
+        if fmt_value_is_int(v) {
+            let int_v: int = fmt_unwrap_int(v)
+            if int_v >= 0 {
+                return fmt_pad_left(s, spec.width, "0")
+            }
+            # Negative: pad after the '-' sign.
+            let sign_str: str = "-"
+            let digits: str = s.slice(1, s.len())
+            let padded_digits: str = fmt_pad_left(digits, spec.width - 1, "0")
+            return sign_str + padded_digits
+        }
+    }
+    if align == fmt_align_left() {
+        return fmt_pad_right(s, spec.width, " ")
+    }
+    if align == fmt_align_right() {
+        return fmt_pad_left(s, spec.width, " ")
+    }
+    if align == fmt_align_center() {
+        return fmt_pad_center(s, spec.width, " ")
+    }
+    return s
+}
+
+# ============================================================================
+# Padding helpers.
+# ============================================================================
+
+# fmt_pad_left(s, width, fill) -> str. Pad s on the left with `fill`
+# until it reaches `width` bytes. If s is already wider, return s.
+# If `fill` is empty, return s.
+fn fmt_pad_left(s: str, width: int, fill: str) -> str {
+    if fill.len() == 0 {
+        return s
+    }
+    if s.len() >= width {
+        return s
+    }
+    let gap: int = width - s.len()
+    let full_pads: int = gap / fill.len()
+    let remainder: int = gap % fill.len()
+    let prefix: str = str_repeat(fill.slice(0, 1), remainder) + str_repeat(fill, full_pads)
+    return prefix + s
+}
+
+# fmt_pad_right(s, width, fill) -> str. Pad s on the right with `fill`
+# until it reaches `width` bytes.
+fn fmt_pad_right(s: str, width: int, fill: str) -> str {
+    if fill.len() == 0 {
+        return s
+    }
+    if s.len() >= width {
+        return s
+    }
+    let gap: int = width - s.len()
+    let full_pads: int = gap / fill.len()
+    let remainder: int = gap % fill.len()
+    let suffix: str = str_repeat(fill, full_pads) + str_repeat(fill.slice(0, 1), remainder)
+    return s + suffix
+}
+
+# fmt_pad_center(s, width, fill) -> str. Center s in a field of
+# `width` bytes, padding with `fill`. The LEFT pad gets the extra
+# byte when the gap is odd (e.g. `"42".center(5) -> "  42 "`, with
+# 2 left + 1 right). This matches the convention of Rust's
+# `format!("{:^5}", "42")` (which produces " 42  " with 1 left +
+# 2 right — Rust puts the extra on the right; we put it on the
+# left for consistency with std.str.str_pad_left and the deep-scan-21
+# decision to make the "extra on left" rule explicit in the doc).
+# (Python's `str.center` puts the extra on the right; this differs.)
+fn fmt_pad_center(s: str, width: int, fill: str) -> str {
+    if fill.len() == 0 {
+        return s
+    }
+    if s.len() >= width {
+        return s
+    }
+    let gap: int = width - s.len()
+    let right: int = gap / 2
+    let left: int = gap - right  # left gets the extra (odd gap)
+    return fmt_pad_right("", left, fill) + s + fmt_pad_left("", right, fill)
+}
+
+# Note: str_repeat is provided by std.str — no need to redefine it
+# here (which would cause a duplicate-symbol error).
+
+# ============================================================================
+# Convenience — fmt_unwrap.
+# ============================================================================
+
+# fmt_unwrap(r) -> str. Extract the formatted string or panic with
+# the error message. Use only when you have already verified the
+# format string is well-formed (e.g. in tests).
+fn fmt_unwrap(r: Result[str, str]) -> str {
+    if !result_is_ok(r) {
+        panic(result_err_or(r, ""))
+    }
+    return result_unwrap(r)
+}
+
+# ============================================================================
+# FmtValue type-test helpers — used in fmt_apply_width to dispatch
+# on the variant of a FmtValue. HLS has no `v is FmtValue.Str`
+# syntax (the `is` keyword isn't valid here), so we use `match`
+# to inspect the variant.
+# ============================================================================
+
+# fmt_value_is_str(v) -> bool. True if v is a FmtValue.Str.
+fn fmt_value_is_str(v: FmtValue) -> bool {
+    return match v {
+        FmtValue.Str(_) => true,
+        FmtValue.Int(_) => false,
+        FmtValue.Float(_) => false,
+        FmtValue.Bool(_) => false
+    }
+}
+
+# fmt_value_is_int(v) -> bool. True if v is a FmtValue.Int.
+fn fmt_value_is_int(v: FmtValue) -> bool {
+    return match v {
+        FmtValue.Int(_) => true,
+        FmtValue.Str(_) => false,
+        FmtValue.Float(_) => false,
+        FmtValue.Bool(_) => false
+    }
+}
+
+# fmt_unwrap_int(v) -> int. Extract the int payload of a FmtValue.Int.
+# Panics if v is not Int. The caller should check fmt_value_is_int
+# first.
+fn fmt_unwrap_int(v: FmtValue) -> int {
+    return match v {
+        FmtValue.Int(x) => x,
+        FmtValue.Float(_) => panic("fmt_unwrap_int: not Int"),
+        FmtValue.Str(_) => panic("fmt_unwrap_int: not Int"),
+        FmtValue.Bool(_) => panic("fmt_unwrap_int: not Int")
+    }
+}
+
+# fmt_unwrap_float(v) -> float. Extract the float payload.
+fn fmt_unwrap_float(v: FmtValue) -> float {
+    return match v {
+        FmtValue.Float(x) => x,
+        FmtValue.Int(_) => panic("fmt_unwrap_float: not Float"),
+        FmtValue.Str(_) => panic("fmt_unwrap_float: not Float"),
+        FmtValue.Bool(_) => panic("fmt_unwrap_float: not Float")
+    }
+}
+
+# fmt_unwrap_str(v) -> str. Extract the str payload.
+fn fmt_unwrap_str(v: FmtValue) -> str {
+    return match v {
+        FmtValue.Str(s) => s,
+        FmtValue.Int(_) => panic("fmt_unwrap_str: not Str"),
+        FmtValue.Float(_) => panic("fmt_unwrap_str: not Str"),
+        FmtValue.Bool(_) => panic("fmt_unwrap_str: not Str")
+    }
+}
+
+# fmt_unwrap_bool(v) -> bool. Extract the bool payload.
+fn fmt_unwrap_bool(v: FmtValue) -> bool {
+    return match v {
+        FmtValue.Bool(b) => b,
+        FmtValue.Int(_) => panic("fmt_unwrap_bool: not Bool"),
+        FmtValue.Float(_) => panic("fmt_unwrap_bool: not Bool"),
+        FmtValue.Str(_) => panic("fmt_unwrap_bool: not Bool")
+    }
+}
+
+# ============================================================================
+# Convenience — fmt_value_display / fmt_value_debug.
+# ============================================================================
+
+# fmt_value_display(v) -> str. Format a FmtValue with Display.
+fn fmt_value_display(v: FmtValue) -> str {
+    return fmt_to_str(v, false)
+}
+
+# fmt_value_debug(v) -> str. Format a FmtValue with Debug.
+fn fmt_value_debug(v: FmtValue) -> str {
+    return fmt_to_str(v, true)
+}
+
+# ============================================================================
+# Convenience — fmt_int helpers (used by both Display and the
+# format-string interpreter when emitting int values).
+# ============================================================================
+
+# fmt_int(x) -> str. Display format of int (alias for fmt_display_int).
+fn fmt_int(x: int) -> str {
+    return fmt_display_int(x)
+}
+
+# fmt_float(x) -> str. Display format of float.
+fn fmt_float(x: float) -> str {
+    return fmt_display_float(x)
+}
+
+# fmt_str(s) -> str. Display format of str.
+fn fmt_str(s: str) -> str {
+    return fmt_display_str(s)
+}
+
+# fmt_bool(b) -> str. Display format of bool.
+fn fmt_bool(b: bool) -> str {
+    return fmt_display_bool(b)
+}
+
+# ============================================================================
+# End of std/fmt.hls
+# ============================================================================

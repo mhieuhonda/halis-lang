@@ -13,6 +13,142 @@ stability (125–140), and final stabilisation toward v1.0 (141–150).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
+## [v0.61.0-alpha] — Stage 42: std.fmt (Display / Debug traits + format-string interpreter)
+
+> Adds `std/fmt.hls` — the ninth module of Phase III (stdlib
+> expansion) — implementing Rust-style Display / Debug formatting
+> plus a `format!`-macro analogue. **No new compiler builtins** —
+> the entire module is pure HLS, following the same
+> monomorphic-helpers-per-concrete-type convention as `std.io`
+> (Stage 35). When trait dispatch arrives in a future stage, each
+> `impl Display for X` will already be in place — only the
+> `trait Display { ... }` declaration needs to be added at the top.
+
+### Added — Stage 42 (v0.61.0-alpha)
+
+- **`std/fmt.hls`** library module with:
+  - **`FmtValue` enum** — tagged union for heterogeneous format
+    args: `Int(int)` / `Float(float)` / `Str(str)` / `Bool(bool)`.
+    The `fmt(format, args)` function takes a `list[FmtValue]`.
+  - **Display formatters** (per concrete type, user-facing):
+    - `fmt_display_int(x) -> str` — decimal digits, minus sign
+      for negatives (matches Python's `str(int)`).
+    - `fmt_display_float(x) -> str` — `%.6f` (matches the
+      runtime's `fmt_float`, byte-identical between interpreter
+      and native).
+    - `fmt_display_str(s) -> str` — bytes verbatim, no quoting,
+      no escapes.
+    - `fmt_display_bool(b) -> str` — "true" / "false".
+  - **Debug formatters** (per concrete type, developer-facing):
+    - `fmt_debug_int(x) -> str` — same as Display (no special
+      Debug form).
+    - `fmt_debug_float(x) -> str` — same as Display.
+    - `fmt_debug_str(s) -> str` — quoted with escapes (`"..."`):
+      `\n` `\t` `\r` `\\` `\"` `\0` for control chars; `\xNN`
+      for non-printable bytes 0-31 and 127-255; printable ASCII
+      32-126 unchanged; non-ASCII bytes emitted as `\xNN` to keep
+      the output valid UTF-8.
+    - `fmt_debug_bool(b) -> str` — "true" / "false".
+  - **`fmt(format, args) -> Result[str, str]`** — the
+    Rust-style format-string interpreter. Walks the format
+    string and emits characters directly; placeholders `{...}`
+    are parsed and the corresponding arg is formatted. `{{`
+    and `}}` are literal braces.
+  - **Placeholder grammar**:
+    - `{}` — positional, 0-indexed.
+    - `{N}` — explicit positional index.
+    - `{:spec}` — format specifier.
+    - `{N:spec}` — explicit index + specifier.
+    - Specifier grammar: `[align][width][.precision][type]`.
+      - `align`: `<` (left), `>` (right), `^` (center). Default
+        is right for numbers, left for strings.
+      - `width`: zero-pad (`{:0N}` for ints) or normal width.
+      - `precision`: float only, rounds to N decimal places
+        (half-to-even).
+      - `type`: `?` (Debug), `b` (binary), `o` (octal), `x`
+        (lowercase hex), `X` (uppercase hex), `e` (scientific —
+        reserved, not yet implemented).
+  - **`FmtSpec` struct** — the parsed specifier. Used internally
+    by `fmt_parse_spec` and `fmt_format_value`.
+  - **`fmt_to_str(v, debug) -> str`** — the runtime dispatch
+    equivalent of Rust's `<T as Display>::fmt(&v, f)`. Takes a
+    FmtValue and a `debug: bool` flag.
+  - **`fmt_value_display / fmt_value_debug`** — convenience
+    wrappers around `fmt_to_str`.
+  - **`fmt_value_is_int / is_str / fmt_unwrap_int / unwrap_float /
+    unwrap_str / unwrap_bool`** — FmtValue variant predicates
+    and extractors (HLS has no `v is FmtValue.Str` syntax).
+  - **Width / alignment / zero-pad helpers**:
+    - `fmt_pad_left(s, width, fill) -> str`
+    - `fmt_pad_right(s, width, fill) -> str`
+    - `fmt_pad_center(s, width, fill) -> str` — center, extra
+      padding on the LEFT (matches Python's `str.center`).
+  - **Number-base conversion helpers**:
+    - `fmt_int_binary(x) -> str` — two's-complement binary.
+    - `fmt_int_octal(x) -> str` — octal with `-` prefix for
+      negatives.
+    - `fmt_int_hex(x, upper) -> str` — lowercase / uppercase hex.
+    - `fmt_hex_byte(b) -> str` — two lowercase hex digits.
+    - `fmt_hex_digit(n) -> str` — one lowercase hex digit.
+  - **`fmt_float_with_precision(x, p) -> str`** — format a float
+    with `p` decimal places, rounds half-to-even (matches
+    Python's `format(x, ".Nf")`). Edge cases: `nan` / `inf` /
+    `-inf` produce `"nan"`, `"inf"`, `"-inf"`.
+  - **`fmt_apply_width(s, spec, v) -> str`** — apply width,
+    alignment, and zero-pad to the formatted string. Zero-pad
+    only applies to non-negative ints (negative ints get the
+    sign before the zeros, e.g. `[-0042]` for `format!("{:05}",
+    -42)`).
+  - **`fmt_unwrap(r) -> str`** — extract the formatted string
+    or panic with the error message.
+  - **Convenience aliases**: `fmt_int`, `fmt_float`, `fmt_str`,
+    `fmt_bool` (all = Display form).
+
+- **`tests/ok/feat_stage42_fmt.hls`** — comprehensive test suite
+  with 17 test groups covering Display / Debug formatters, the
+  format-string interpreter, width and alignment, zero-pad,
+  number bases, precision, literal braces, error handling,
+  FmtValue dispatch, hex helpers, pad helpers, base helpers,
+  float-precision helper, and real-world format strings.
+
+- **`examples/fmt_demo.hls`** — interactive demo showing all the
+  fmt API in 13 sections, including real-world examples (table
+  rows, status lines, hex dumps, dates, error messages,
+  currency).
+
+### Security — Stage 42 (v0.61.0-alpha)
+
+- **Format string length**: bounded by `fmt_max_format` (default
+  64 KiB). Defends against a peer that sends a 1 GB format string.
+- **Width / precision bounds**: width and precision specifiers
+  are bounded by `fmt_max_width` (4096) and `fmt_max_precision`
+  (1024). A specifier like `{:>1000000000}` is rejected with
+  `Result.Err`.
+- **Arg count**: no explicit arg-count limit; the caller-supplied
+  list bounds it. A format string with more placeholders than
+  args returns `Result.Err("missing argument at index N")`.
+- **String escaping**: Debug format on strings escapes
+  non-printable bytes via `\xNN` to keep the output valid UTF-8
+  and safe to log. Display format emits the bytes verbatim (the
+  caller is responsible for ensuring the string is valid UTF-8
+  if downstream consumers require it).
+
+### Differential parity — Stage 42 (v0.61.0-alpha)
+
+The formatters are pure string operations. Output is
+byte-identical between the interpreter and the native binary
+(no I/O, no randomness, no float arithmetic in the formatting
+itself — except for float Display, which uses the runtime's
+`float.to_str()` builtin and is identical across both
+implementations by the differential test). Verified on: Display
+(int / str / bool / float, including INT64_MAX and INT64_MIN),
+Debug (int / bool / float; str with all escape forms), fmt
+basic, explicit positional, Debug specifier, width and
+alignment, zero-pad, number bases, precision, width + precision
+combinations, literal braces, error handling, FmtValue
+dispatch, hex helpers, pad helpers, base helpers,
+float-precision helper, and real-world format strings.
+
 ## [v0.60.0-alpha] — Stage 41: std.regex (NFA-based regex, no ReDoS)
 
 > Adds `std/regex.hls` — the eighth module of Phase III (stdlib
@@ -161,6 +297,7 @@ unterminated class, range out of order, quantifier at start),
 find_at, match_text, real-world patterns (email, phone, URL,
 IPv4, date, log line), and ReDoS safety (`(a+)+b` on 50 'a's —
 completes in microseconds, not exponential time).
+
 ## [v0.59.0-alpha] — Stage 40: std.json_stream (streaming JSON parser, constant-memory)
 
 > Adds `std/json_stream.hls` — the sixth module of Phase III (stdlib

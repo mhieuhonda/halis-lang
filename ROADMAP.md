@@ -78,8 +78,8 @@ remains green.
 | 38 | `std.http` — HTTP/1.1 server + client (RFC 7230) | ✅ | 6 weeks |
 | 39 | `std.http2` — HTTP/2 + ALPN negotiation | ✅ | 5 weeks |
 | 40 | `std.json` streaming parser (constant-memory) | ✅ | 3 weeks |
-| 41 | `std.regex` — NFA-based regex (no ReDoS) | ⬜ | 5 weeks |
-| 42 | `std.fmt` — printf-style + custom `Display` impls | ⬜ | 3 weeks |
+| 41 | `std.regex` — NFA-based regex (no ReDoS) | ✅ | (done in v0.60.0-alpha) |
+| 42 | `std.fmt` — printf-style + custom `Display` impls | ✅ | (done in v0.61.0-alpha) |
 | 43 | `std.hash` — SipHash, xxHash, FNV, cityHash | ⬜ | 3 weeks |
 | 44 | `std.collections` — BTreeMap, HashSet, LinkedList, RingBuf | ⬜ | 6 weeks |
 | 45 | `std.sync` — Mutex, RwLock, Condvar, OnceCell | ⬜ | 4 weeks |
@@ -4761,10 +4761,138 @@ quantifier at start), find_at, match_text, real-world patterns
 (`(a+)+b` on 50 'a's — completes in microseconds, not exponential
 time).
 
-**42. `std.fmt`** — `Display` and `Debug` traits, `format!` macro,
-`println!("{:?}", x)`. Custom `Display` impls via `impl Display for
-MyType`. Format strings are parsed at compile time (a wrong
-specifier is a compile error).
+**42. `std.fmt`** ✅ (release v0.61.0-alpha) — `Display` and
+`Debug` traits, `format!` macro analogue, `println!("{:?}", x)`.
+Custom `Display` impls via `impl Display for MyType`. Format
+strings are parsed at runtime (a wrong specifier returns
+`Result.Err` — a future stage may lift this to a compile error
+once the language has compile-time string parsing). **No new
+compiler builtins** — the entire module is pure HLS, layered on
+`std.str` for string operations and `std.option` / `std.result`
+for error handling.
+
+HLS does not yet have true trait dispatch (the `trait` keyword is
+reserved since v0.20.0-alpha; `impl Read for X`-style dispatch
+arrives in a future stage). Following the same convention as
+`std.io` (Stage 35, v0.54.0-alpha), this module provides
+**monomorphic helpers per concrete type** for both Display and
+Debug — `fmt_display_int`, `fmt_display_str`, `fmt_display_float`,
+`fmt_display_bool`, `fmt_debug_int`, `fmt_debug_str`,
+`fmt_debug_float`, `fmt_debug_bool`. When trait dispatch arrives,
+each `impl Display for X` will already be in place — only the
+`trait Display { ... }` declaration needs to be added at the top,
+and existing call sites will start working polymorphically.
+
+`std/fmt.hls` implements:
+
+  * **FmtValue enum** — tagged union for heterogeneous format
+    args: `Int(int)` / `Float(float)` / `Str(str)` / `Bool(bool)`.
+    The `fmt(format, args)` function takes a list[FmtValue].
+  * **Display formatters** (per concrete type):
+    * `fmt_display_int(x) -> str` — decimal digits, minus
+      sign for negatives (matches Python's `str(int)`).
+    * `fmt_display_float(x) -> str` — `%.6f` (matches the
+      runtime's `fmt_float`, byte-identical between
+      interpreter and native).
+    * `fmt_display_str(s) -> str` — bytes verbatim (no quoting,
+      no escapes).
+    * `fmt_display_bool(b) -> str` — "true" / "false".
+  * **Debug formatters** (per concrete type):
+    * `fmt_debug_int(x) -> str` — same as Display (no special
+      Debug form).
+    * `fmt_debug_float(x) -> str` — same as Display.
+    * `fmt_debug_str(s) -> str` — quoted (`"..."` with
+      escapes: `\n` `\t` `\r` `\\` `\"` `\0` for control
+      chars; `\xNN` for non-printable bytes 0-31 and 127-255;
+      printable ASCII 32-126 unchanged; non-ASCII bytes
+      emitted as `\xNN` to keep the output valid UTF-8).
+    * `fmt_debug_bool(b) -> str` — "true" / "false".
+  * **fmt(format, args) -> Result[str, str]** — the
+    Rust-style format-string interpreter. Walks the format
+    string and emits characters directly; placeholders
+    `{...}` are parsed and the corresponding arg is formatted.
+    `{{` and `}}` are literal braces.
+  * **Placeholder grammar**:
+    * `{}` — positional, 0-indexed.
+    * `{N}` — explicit positional index.
+    * `{:spec}` — format specifier.
+    * `{N:spec}` — explicit index + specifier.
+    * Specifier grammar: `[align][width][.precision][type]`.
+      * `align`: `<` (left), `>` (right), `^` (center). Default
+        is right for numbers, left for strings.
+      * `width`: zero-pad (`{:0N}` for ints) or normal width.
+      * `precision`: float only, rounds to N decimal places
+        (half-to-even).
+      * `type`: `?` (Debug), `b` (binary), `o` (octal), `x`
+        (lowercase hex), `X` (uppercase hex), `e` (scientific —
+        reserved, not yet implemented).
+  * **FmtSpec struct** — the parsed specifier. Used internally
+    by `fmt_parse_spec` and `fmt_format_value`.
+  * **fmt_to_str(v, debug) -> str** — the runtime dispatch
+    equivalent of Rust's `<T as Display>::fmt(&v, f)`. Takes
+    a FmtValue and a `debug: bool` flag.
+  * **fmt_value_display / fmt_value_debug** — convenience
+    wrappers around `fmt_to_str`.
+  * **fmt_value_is_int / is_str / fmt_unwrap_int / unwrap_float /
+    unwrap_str / unwrap_bool** — FmtValue variant predicates
+    and extractors (HLS has no `v is FmtValue.Str` syntax).
+  * **Width / alignment / zero-pad helpers**:
+    * `fmt_pad_left(s, width, fill) -> str`
+    * `fmt_pad_right(s, width, fill) -> str`
+    * `fmt_pad_center(s, width, fill) -> str` — center, extra
+      padding on the LEFT (matches Python's `str.center`).
+  * **Number-base conversion helpers**:
+    * `fmt_int_binary(x) -> str` — two's-complement binary
+      (matches Rust's `format!("{:b}", x)` for negatives).
+    * `fmt_int_octal(x) -> str` — octal with `-` prefix for
+      negatives.
+    * `fmt_int_hex(x, upper) -> str` — lowercase / uppercase
+      hex.
+    * `fmt_hex_byte(b) -> str` — two lowercase hex digits
+      for a byte 0..255.
+    * `fmt_hex_digit(n) -> str` — one lowercase hex digit
+      for n in 0..15.
+  * **Float-precision helper**:
+    * `fmt_float_with_precision(x, p) -> str` — format a
+      float with `p` decimal places, rounds half-to-even
+      (matches Python's `format(x, ".Nf")`). Edge cases:
+      `nan` / `inf` / `-inf` produce the strings `"nan"`,
+      `"inf"`, `"-inf"`.
+  * **fmt_apply_width(s, spec, v) -> str** — apply width,
+    alignment, and zero-pad to the formatted string. Zero-pad
+    only applies to non-negative ints (negative ints get
+    the sign before the zeros, e.g. `[-0042]` for
+    `format!("{:05}", -42)`).
+  * **fmt_unwrap(r) -> str** — extract the formatted string
+    or panic with the error message. Use only when you have
+    verified the format string is well-formed (e.g. in tests).
+  * **Convenience aliases**:
+    * `fmt_int(x) = fmt_display_int(x)`
+    * `fmt_float(x) = fmt_display_float(x)`
+    * `fmt_str(s) = fmt_display_str(s)`
+    * `fmt_bool(b) = fmt_display_bool(b)`
+
+Differential parity (interpreter == native) verified on: Display
+(int / str / bool / float, including INT64_MAX and INT64_MIN), Debug
+(int / bool / float; str with all escape forms — `\n` `\t` `\r`
+`\\` `\"` `\0` `\xNN`), fmt basic (empty / literal / single /
+multiple / mixed types), explicit positional (basic / reuse /
+out-of-order), Debug specifier (`{:?}`), width and alignment
+(right / left / center / default for str / default for int /
+undersize), zero-pad (positive / negative / zero / oversize),
+number bases (binary / octal / lowercase hex / uppercase hex),
+precision (0..10 dp, rounding half-to-even, negative numbers),
+width + precision combinations, literal braces (basic / with
+placeholder / mid-text), error handling (missing arg / bad
+specifier / unmatched `{` / unmatched `}` / bad width / precision
+without digits / width exceeds limit / format string exceeds
+limit), FmtValue dispatch (Display / Debug), hex helpers
+(fmt_hex_byte / fmt_hex_digit), pad helpers (left / right /
+center / no-op / empty fill), base helpers (binary / octal /
+hex lower / hex upper), float-precision helper (round-half-even
+on 0.5 / 1.5 / 2.5 / negatives), and real-world format strings
+(table rows, status lines, hex dumps, dates, error messages,
+currency).
 
 **43. `std.hash`** — `SipHasher` (default, DoS-resistant),
 `XxHasher` (fast, non-crypto), `FnvHasher` (small code), `CityHasher`
