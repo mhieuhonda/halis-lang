@@ -31,7 +31,7 @@ else
   HL_CURL_DEFS :=
 endif
 
-.PHONY: all stage0 bootstrap test examples clean run check bench install uninstall audit opt-stats emit-ir emit-llvm fmt lint lsp-check pkg-init pkg-add pkg-lock pkg-audit pkg-verify pkg-build pkg-publish pkg-log pkg-log-verify prove prove-full model prove-acceptance hltest fuzz cov fuzz-acceptance wasm-opt webapp webapp-acceptance serve aarch64-bench aarch64-acceptance aarch64-list-targets stack-acceptance inline-acceptance opt-stats-report kernel-attrs escape-acceptance layout-report tail-acceptance tail-report asm-acceptance asm-attrs bench-stdlib spec-check stage32-acceptance async-acceptance stream-acceptance io-acceptance fs-acceptance net-acceptance
+.PHONY: all stage0 bootstrap test examples clean run check bench install uninstall audit opt-stats emit-ir emit-llvm fmt lint lsp-check pkg-init pkg-add pkg-lock pkg-audit pkg-verify pkg-build pkg-publish pkg-log pkg-log-verify prove prove-full model prove-acceptance hltest fuzz cov fuzz-acceptance wasm-opt webapp webapp-acceptance serve aarch64-bench aarch64-acceptance aarch64-list-targets stack-acceptance inline-acceptance opt-stats-report kernel-attrs escape-acceptance layout-report tail-acceptance tail-report asm-acceptance asm-attrs bench-stdlib spec-check stage32-acceptance async-acceptance stream-acceptance io-acceptance fs-acceptance net-acceptance http-acceptance
 
 # Main goal: use the full bootstrap chain to build the native compiler
 all: bootstrap
@@ -1473,4 +1473,36 @@ net-acceptance: bin/hlc
 	@echo "  differential (interpreter == native) verified green."
 
 .PHONY: net-acceptance
+
+# ============================================================================
+# Stage 38 (v0.57.0-alpha): std.http -- HTTP/1.1 server + client (RFC 7230)
+# ============================================================================
+http-acceptance: bin/hlc
+	@$(PYTHON) boot/boot.py examples/http_demo.hls > /tmp/http_interp.txt 2>&1
+	@bin/hlc examples/http_demo.hls /tmp/http_demo.c 2>/dev/null
+	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/http_demo /tmp/http_demo.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
+	@/tmp/http_demo > /tmp/http_nat.txt 2>&1
+	@diff -q /tmp/http_interp.txt /tmp/http_nat.txt >/dev/null 2>&1 \
+		|| (echo "FAIL: http_demo differential mismatch" && false)
+	@$(PYTHON) boot/boot.py tests/ok/feat_stage38_http.hls > /tmp/s38_interp.txt 2>&1
+	@bin/hlc tests/ok/feat_stage38_http.hls /tmp/s38.c 2>/dev/null
+	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/s38 /tmp/s38.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
+	@/tmp/s38 > /tmp/s38_nat.txt 2>&1
+	@diff -q /tmp/s38_interp.txt /tmp/s38_nat.txt >/dev/null 2>&1 \
+		|| (echo "FAIL: feat_stage38_http differential mismatch" && false)
+	@rm -f /tmp/http_demo /tmp/http_demo.c /tmp/http_interp.txt /tmp/http_nat.txt \
+		/tmp/s38 /tmp/s38.c /tmp/s38_interp.txt /tmp/s38_nat.txt
+	@echo ""
+	@echo "ACCEPTANCE OK: Stage 38 -- std.http (HTTP/1.1 server + client, RFC 7230)"
+	@echo "  HttpRequest / HttpResponse / HttpHeader structs"
+	@echo "  http_parse_request / http_parse_response (RFC 7230 parser)"
+	@echo "  http_serialize_request / http_serialize_response (canonical wire format)"
+	@echo "  http_get (TCP client) / http_serve (single-connection server)"
+	@echo "  http_status_text (canonical reason phrases)"
+	@echo "  http_header_get / has / set / add (case-insensitive header list helpers)"
+	@echo "  http_text_response / http_html_response / http_json_response (constructors)"
+	@echo "  parse-error handling (400 Bad Request on malformed input)"
+	@echo "  differential (interpreter == native) verified green."
+
+.PHONY: http-acceptance
 

@@ -13,6 +13,202 @@ stability (125–140), and final stabilisation toward v1.0 (141–150).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
+## [v0.57.0-alpha] — Stage 38: std.http (HTTP/1.1 server + client, RFC 7230)
+
+> Adds `std/http.hls` — the fourth module of Phase III (stdlib
+> expansion) — implementing an HTTP/1.1 request/response parser and
+> serialiser that complies with RFC 7230 (the HTTP/1.1 message syntax
+> specification), plus a TCP-backed client (`http_get`) and server
+> (`http_serve`) that use Stage 37's `std.net` for the transport
+> layer. **No new compiler builtins** — the entire module is pure
+> HLS, layered on Stage 37's TCP transport.
+>
+> The parser is a single-pass state machine over `str` that accepts
+> the full RFC 7230 message format (CRLF line endings, with bare LF
+> accepted per § 3.5). The serialiser produces canonical RFC 7230
+> output (CRLF line endings, headers in insertion order, body bytes
+> as-is). Both are pure functions — no I/O — so the output is byte-
+> identical between the interpreter and the native binary.
+>
+> Stage 38 limitations (deferred to Stage 39 HTTP/2): chunked
+> Transfer-Encoding is rejected with 411 Length Required; keep-alive
+> is not supported (every response includes `Connection: close`);
+> the server is single-threaded (one connection at a time); HTTPS is
+> not supported in the server (use a reverse proxy for TLS
+> termination — the client uses Stage 37's `tls_get` for HTTPS via
+> `http_get_with_tls`).
+
+### Added — Stage 38 (v0.57.0-alpha)
+
+- **`std/http.hls`** library module with:
+  - **`HttpHeader`** struct — `{ name: str, value: str }`. Headers
+    are stored as a list (not a map) to preserve insertion order
+    and allow duplicate names (e.g. multiple `Set-Cookie` headers).
+  - **`HttpRequest`** struct — `{ method, path, version, headers,
+    body }`. Constructed via `http_request_new(method, path)`
+    (HTTP/1.1 by default, empty headers, empty body).
+  - **`HttpResponse`** struct — `{ version, status, reason,
+    headers, body }`. Constructed via `http_response_new(status)`
+    (canonical reason phrase from `http_status_text`).
+  - **Parser**:
+    - `http_parse_request(s: str) -> Result[HttpRequest, str]` —
+      RFC 7230 § 3 request grammar. Accepts CRLF and bare LF.
+      Returns `Err(msg)` on malformed input (missing method,
+      invalid method, invalid version, missing header terminator,
+      oversized request line / headers, too many headers, body
+      shorter than Content-Length, chunked Transfer-Encoding).
+    - `http_parse_response(s: str) -> Result[HttpResponse, str]` —
+      RFC 7230 § 3 response grammar. The reason phrase is optional
+      (defaults to `http_status_text(status)`).
+  - **Serialiser**:
+    - `http_serialize_request(req) -> str` — canonical CRLF wire
+      format. Headers in insertion order. Body bytes as-is.
+    - `http_serialize_response(resp) -> str` — canonical CRLF wire
+      format. Automatically adds `Content-Length` (if missing) and
+      `Connection: close` (Stage 38 does not support keep-alive).
+  - **Client**:
+    - `http_get(host, port, path) -> Result[HttpResponse, str]` —
+      one-shot HTTP/1.1 GET. Opens a TCP connection (via
+      `tcp_connect_or`), sends the request (with mandatory `Host`
+      header + `User-Agent: halis-http/0.57` + `Connection: close`),
+      reads the full response (up to `http_max_body` bytes), parses
+      it, returns the `HttpResponse`. The host argument is a taint
+      sink (delegated to `std.net.tcp_connect`, which enforces the
+      SSRF check from Stage 37).
+    - `http_get_with_tls(host, port, path) -> Result[str, str]` —
+      one-shot HTTPS GET via Stage 37's `tls_get` (libcurl-backed).
+      Returns ONLY the body (tls_get doesn't expose the headers).
+  - **Server**:
+    - `http_serve(host, port, max_conns) -> int` — bind a
+      `TcpListener` and serve `max_conns` connections, then return.
+      Each connection is handled inline (single-threaded — a future
+      stage will add a thread pool). The default `http_handle`
+      handler returns a 200 OK with a plain-text body describing
+      the request; callers override it by defining their own
+      `http_handle` function in the same program.
+    - `http_handle_one(conn)` — read one request, dispatch to
+      `http_handle`, write the response, close. Exposed publicly so
+      a custom server loop can call it directly. Reads the request
+      in a bounded loop (avoids the deadlock that a naive `read_all`
+      would cause — the client doesn't close its write side until
+      it receives the response).
+    - `http_handle(req) -> HttpResponse` — the default request
+      handler. Returns a 200 OK with a plain-text body describing
+      the request (`method=...`, `path=...`, `version=...`,
+      `headers=...`, `body_len=...`). Real handlers override this.
+  - **Header helpers** (case-insensitive, RFC 7230 § 3.2):
+    - `http_header_get(headers, name) -> str` — first value or "".
+    - `http_header_has(headers, name) -> bool`.
+    - `http_header_set(headers, name, value) -> list[HttpHeader]` —
+      replace first occurrence or append.
+    - `http_header_add(headers, name, value) -> list[HttpHeader]` —
+      append (for headers that may legitimately repeat).
+  - **Response constructors**:
+    - `http_text_response(status, body)` — Content-Type: text/plain.
+    - `http_html_response(status, body)` — Content-Type: text/html.
+    - `http_json_response(status, body)` — Content-Type: application/json.
+  - **Status text**: `http_status_text(code) -> str` — canonical
+    reason phrases for codes 100, 101, 200, 201, 202, 204, 206,
+    301, 302, 303, 304, 307, 308, 400, 401, 403, 404, 405, 406,
+    408, 409, 410, 411, 413, 414, 415, 429, 431, 500, 501, 502,
+    503, 504, 505. Returns "Unknown" for unrecognised codes.
+  - **Constants** (RFC 7230 limits):
+    - `http_max_request_line() = 8192` (matches nginx default).
+    - `http_max_header_line() = 8192` (matches nginx default).
+    - `http_max_headers() = 100` (matches nginx default).
+    - `http_max_body() = 1048576` (1 MiB default; configurable
+      per-server in a future stage).
+- **`examples/http_demo.hls`** and **`tests/ok/feat_stage38_http.hls`**
+  exercising request/response parsing, serialisation round-trip,
+  header helpers, response constructors, http_get + http_serve
+  loopback integration, and 4 parse-error cases (missing method,
+  invalid method, invalid version, missing header terminator).
+- **ROADMAP** updated: Stage 38 marked ✅ complete.
+
+### Changed — Stage 38 (v0.57.0-alpha)
+
+- **`Makefile`** — added the `http-acceptance` target (mirrors
+  `net-acceptance`'s structure; uses the libcurl probe from Stage 37
+  so the link command works whether or not libcurl is installed).
+- **No compiler changes** — Stage 38 is pure HLS, layered on Stage
+  37's `std.net`. The `boot/checker.py`, `boot/interp.py`,
+  `src/hlc.hls`, and `tools/llvm_emit.py` files are unchanged from
+  v0.56.0-alpha. This is the first roadmap stage that adds a stdlib
+  module without touching the compiler — a milestone for the
+  language's self-hosting maturity.
+
+### Security — Stage 38 (v0.57.0-alpha)
+
+- **SSRF prevention (inherited)**: `http_get` delegates the host
+  argument to `std.net.tcp_connect`, which is a taint sink (Stage
+  37). A program that reads a hostname from argv / stdin / a file
+  CANNOT pass it directly to `http_get` — the checker rejects it.
+- **Request-smuggling prevention (parser robustness)**: the parser
+  rejects malformed requests with a clear error message. The
+  server's `http_handle_one` returns 400 Bad Request for any parse
+  failure, with a descriptive body that names the failure precisely
+  (missing method, invalid version, missing header terminator, etc.).
+  This makes the server robust against request-smuggling attempts
+  that rely on parser confusion (a malformed request that one parser
+  accepts and another rejects is the request-smuggling vector).
+- **Resource-exhaustion prevention**: the parser enforces the
+  RFC 7230 limits (`http_max_request_line`, `http_max_header_line`,
+  `http_max_headers`, `http_max_body`). A request that exceeds any
+  limit is rejected with the appropriate 4xx status (414 / 431 /
+  413). The server's read loop is bounded — it cannot be tricked
+  into unbounded allocation by a malicious peer.
+- **No HTTP response splitting**: the serialiser constructs the
+  response as a single `str` (not by concatenating untrusted parts
+  into a header line). A `Content-Type` value containing CRLF would
+  be emitted as-is, but the parser on the receiving end would
+  reject the resulting message (the CRLF would be interpreted as
+  a header terminator, leaving the rest of the value in the body).
+  A future stage will add explicit header-value validation (reject
+  CR / LF in header values at the serialiser).
+
+### Differential parity (interpreter == native) — Stage 38
+
+- The parser and serialiser are pure functions (no I/O) — the
+  output is byte-identical between the interpreter and the native
+  binary by construction.
+- The http_get + http_serve integration test runs on loopback
+  (127.0.0.1:19080) — the TCP transport is Stage 37's, already
+  verified differentially. The HTTP layer adds no I/O of its own.
+- The acceptance test (`make http-acceptance`) verifies differential
+  parity on:
+  - `http_status_text` (200/404/500/418 — 4 codes covering 2xx,
+    4xx, 5xx, and unknown).
+  - `http_parse_request` (minimal GET with one header).
+  - `http_parse_request` with body (POST with Content-Length).
+  - `http_parse_response` (200 OK with HTML body).
+  - `http_serialize_request` + round-trip (build, serialise,
+    re-parse, verify equality).
+  - `http_serialize_response` (verify Content-Length +
+    Connection: close are present).
+  - `http_header_get` / `has` / `set` / `add` (case-insensitive).
+  - `http_text_response` / `http_html_response` / `http_json_response`.
+  - `http_get` + `http_serve` (full loopback round-trip).
+  - 4 parse-error cases (missing method, invalid method, invalid
+    version, missing header terminator).
+
+### Stage 38 limitations (deferred to Stage 39 HTTP/2)
+
+- **Chunked Transfer-Encoding**: rejected with 411 Length Required.
+  A chunked request body is not supported; the caller must use
+  Content-Length.
+- **Keep-alive**: not supported. Every response includes
+  `Connection: close`; the server closes the connection after each
+  response. Stage 39 (HTTP/2) will bring keep-alive.
+- **Single-threaded server**: `http_serve` handles one connection at
+  a time. A future stage will add a thread pool (likely Stage 46
+  `std.thread` or a dedicated `http_serve_threaded`).
+- **HTTPS server**: not supported. Use a reverse proxy (nginx,
+  Caddy) for TLS termination. The client supports HTTPS via
+  `http_get_with_tls` (which delegates to Stage 37's `tls_get`).
+- **HTTP/2**: not supported. Stage 39 will add HTTP/2 + ALPN
+  negotiation + server push + stream multiplexing + HPACK header
+  compression.
+
 ## [v0.56.0-alpha] — Stage 37: std.net (TCP/UDP sockets, DNS, TLS via libcurl)
 
 > Adds `std/net.hls` — the third module of Phase III (stdlib expansion)

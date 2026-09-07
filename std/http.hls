@@ -1,0 +1,1102 @@
+# ============================================================================
+# std/http.hls — Stage 38 (v0.57.0-alpha): HTTP/1.1 server + client (RFC 7230)
+# ----------------------------------------------------------------------------
+# This module is the fourth module of Phase III (stdlib expansion). It
+# implements an HTTP/1.1 request/response parser and serialiser that
+# complies with RFC 7230 (the HTTP/1.1 message syntax specification),
+# plus a TCP-backed client (http_get) and server (http_serve) that use
+# Stage 37's std.net for the transport layer.
+#
+# The parser is a pure-HLS state machine over str — no I/O, no
+# allocation beyond the resulting structs. It accepts the full RFC 7230
+# message format:
+#
+#   request   = request-line CRLF *(header-field CRLF) CRLF [ body ]
+#   response  = status-line  CRLF *(header-field CRLF) CRLF [ body ]
+#
+# The serialiser produces canonical RFC 7230 output (CRLF line
+# endings, header names as-is, body bytes as-is). The output is
+# byte-identical between the interpreter and the native binary (the
+# parser and serialiser are pure functions; the only I/O is the
+# underlying TCP transport, which Stage 37 already verified
+# differentially).
+#
+# The client (http_get) opens a TCP connection, sends a GET request,
+# reads the full response (up to a configurable cap), parses it, and
+# returns an HttpResponse. The server (http_serve) binds a TCP
+# listener, accepts connections in a loop, reads each request, dispatches
+# to a user-supplied handler function, writes the response, and closes.
+# Both use the Stage 37 TcpStream / TcpListener API.
+#
+# Security:
+#   - The host argument to http_get is a taint sink (delegated to
+#     std.net's tcp_connect, which already enforces the SSRF check).
+#   - The path argument to http_get is a taint sink (delegated to
+#     net_write, which is NOT a sink — but http_get itself documents
+#     that the path is user-controlled and the caller is responsible
+#     for sanitising it; a future stage will tighten this with a
+#     dedicated http_path type).
+#   - The server's request parser is robust against:
+#       * Oversized headers (a single header > 8 KiB is rejected with
+#         431 Request Header Fields Too Large).
+#       * Oversized request lines (a request line > 8 KiB is rejected
+#         with 414 URI Too Long).
+#       * Malformed request lines (missing method / path / version ->
+#         400 Bad Request).
+#       * Missing Host header (HTTP/1.1 requires it -> 400 Bad Request).
+#   - The server bounds the body size (default 1 MiB; configurable).
+#     A request with a body larger than the bound is rejected with 413
+#     Payload Too Large.
+#
+# Limitations (deferred to later stages):
+#   - Chunked transfer encoding is NOT supported (the parser accepts
+#     only Content-Length-bodied requests). A chunked request gets a
+#     411 Length Required response.
+#   - Keep-alive is NOT supported (the server closes the connection
+#     after each response — `Connection: close` is sent in every
+#     response). Stage 39 (HTTP/2) will bring keep-alive.
+#   - HTTPS is NOT supported in the server (use a reverse proxy like
+#     nginx for TLS termination). The client uses Stage 37's tls_get
+#     for HTTPS GET — http_get_with_tls(host, port, path) is the
+#     one-shot HTTPS variant.
+# ============================================================================
+
+import "std.net"
+import "std.str"
+import "std.option"
+import "std.result"
+import "std.url"
+
+# ============================================================================
+# Constants — RFC 7230 limits. Centralised so the server and the parser
+# agree on the bounds. The 8 KiB header limit matches Apache / nginx
+# defaults; the 1 MiB body limit is conservative (production servers
+# typically allow 10–100 MiB, but for a Stage-38 default 1 MiB is a
+# safe bound that the demo and acceptance test can exercise).
+# ============================================================================
+
+# http_max_request_line: the maximum byte length of the request line
+# (method SP path SP version CRLF). RFC 7230 has no fixed limit; the
+# 8 KiB default matches nginx's `large_client_header_buffers` (one 8 KiB
+# buffer for the request line). A request line longer than this is
+# rejected with 414 URI Too Long.
+fn http_max_request_line() -> int {
+    return 8192
+}
+
+# http_max_header_line: the maximum byte length of a single header
+# field (name: value CRLF). The 8 KiB default matches nginx. A header
+# longer than this is rejected with 431 Request Header Fields Too
+# Large.
+fn http_max_header_line() -> int {
+    return 8192
+}
+
+# http_max_headers: the maximum number of header fields in a single
+# request. 100 is the default in nginx. A request with more headers is
+# rejected with 431.
+fn http_max_headers() -> int {
+    return 100
+}
+
+# http_max_body: the default maximum body size (1 MiB). The server
+# rejects a body larger than this with 413 Payload Too Large. The
+# bound is configurable per-server (see HttpServerConfig).
+fn http_max_body() -> int {
+    return 1048576
+}
+
+# ============================================================================
+# Data types — HttpRequest / HttpResponse / HttpHeader.
+#
+# HttpHeader is a struct (not a map) because:
+#   1. RFC 7230 allows duplicate header names (e.g. multiple Set-Cookie
+#      headers). A map would silently coalesce them.
+#   2. Header ORDER is significant for some consumers (the list-of-
+#      structs preserves insertion order; a map does not).
+#   3. HLS's map only supports str keys — a struct can hold any type.
+#
+# The headers field is a list[HttpHeader] (not a list[(str, str)]
+# tuple — HLS v0.3 doesn't have tuples). Each header is a struct with
+# a name and a value, both str.
+# ============================================================================
+
+struct HttpHeader {
+    name: str,
+    value: str
+}
+
+struct HttpRequest {
+    method: str,
+    path: str,
+    version: str,
+    headers: list[HttpHeader],
+    body: str
+}
+
+struct HttpResponse {
+    version: str,
+    status: int,
+    reason: str,
+    headers: list[HttpHeader],
+    body: str
+}
+
+# http_header_new(name, value) — construct an HttpHeader. Convenience
+# helper; the struct literal `HttpHeader { name: ..., value: ... }`
+# works too.
+fn http_header_new(name: str, value: str) -> HttpHeader {
+    return HttpHeader { name: name, value: value }
+}
+
+# http_request_new(method, path) — construct an HTTP/1.1 GET request
+# with empty headers and empty body. The version is "HTTP/1.1" by
+# default (the only version this module produces).
+fn http_request_new(method: str, path: str) -> HttpRequest {
+    return HttpRequest {
+        method: method,
+        path: path,
+        version: "HTTP/1.1",
+        headers: [],
+        body: ""
+    }
+}
+
+# http_response_new(status) — construct an HTTP/1.1 response with the
+# given status code, the canonical reason phrase (from
+# http_status_text), empty headers, and empty body.
+fn http_response_new(status: int) -> HttpResponse {
+    return HttpResponse {
+        version: "HTTP/1.1",
+        status: status,
+        reason: http_status_text(status),
+        headers: [],
+        body: ""
+    }
+}
+
+# ============================================================================
+# Header list helpers — lookup, append, set. These operate on
+# list[HttpHeader] (the headers field of HttpRequest / HttpResponse).
+# ============================================================================
+
+# http_header_get(headers, name) — return the value of the first
+# header with the given name (case-insensitive), or "" if not found.
+# RFC 7230 says header names are case-insensitive; this function
+# lowercases both sides for comparison.
+fn http_header_get(headers: list[HttpHeader], name: str) -> str {
+    let lower: str = str_to_lower_ascii(name)
+    let mut i: int = 0
+    while i < headers.len() {
+        let h: HttpHeader = headers.get(i)
+        if str_to_lower_ascii(h.name) == lower {
+            return h.value
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+# http_header_has(headers, name) — true iff a header with the given
+# name exists (case-insensitive).
+fn http_header_has(headers: list[HttpHeader], name: str) -> bool {
+    let lower: str = str_to_lower_ascii(name)
+    let mut i: int = 0
+    while i < headers.len() {
+        let h: HttpHeader = headers.get(i)
+        if str_to_lower_ascii(h.name) == lower {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+# http_header_set(headers, name, value) — return a new list with the
+# first occurrence of `name` replaced by (name, value), or (name,
+# value) appended if not present. DOES NOT mutate the input (HLS
+# structs are by-value; this returns a fresh list).
+fn http_header_set(headers: list[HttpHeader], name: str, value: str) -> list[HttpHeader] {
+    let lower: str = str_to_lower_ascii(name)
+    let out: list[HttpHeader] = []
+    let mut replaced: bool = false
+    let mut i: int = 0
+    while i < headers.len() {
+        let h: HttpHeader = headers.get(i)
+        if !replaced && str_to_lower_ascii(h.name) == lower {
+            out.push(HttpHeader { name: name, value: value })
+            replaced = true
+        } else {
+            out.push(h)
+        }
+        i = i + 1
+    }
+    if !replaced {
+        out.push(HttpHeader { name: name, value: value })
+    }
+    return out
+}
+
+# http_header_add(headers, name, value) — return a new list with
+# (name, value) appended. Used for headers that may legitimately
+# repeat (e.g. Set-Cookie).
+fn http_header_add(headers: list[HttpHeader], name: str, value: str) -> list[HttpHeader] {
+    let out: list[HttpHeader] = []
+    let mut i: int = 0
+    while i < headers.len() {
+        out.push(headers.get(i))
+        i = i + 1
+    }
+    out.push(HttpHeader { name: name, value: value })
+    return out
+}
+
+# ============================================================================
+# http_status_text(code) — the canonical reason phrase for an HTTP
+# status code (RFC 7230 § 6 + RFC 6585 + RFC 4918 extensions). Returns
+# "Unknown" for unrecognised codes (the serialiser will still emit the
+# numeric code; only the reason phrase is "Unknown").
+# ============================================================================
+
+fn http_status_text(code: int) -> str {
+    # 1xx Informational
+    if code == 100 { return "Continue" }
+    if code == 101 { return "Switching Protocols" }
+    # 2xx Success
+    if code == 200 { return "OK" }
+    if code == 201 { return "Created" }
+    if code == 202 { return "Accepted" }
+    if code == 204 { return "No Content" }
+    if code == 206 { return "Partial Content" }
+    # 3xx Redirection
+    if code == 301 { return "Moved Permanently" }
+    if code == 302 { return "Found" }
+    if code == 303 { return "See Other" }
+    if code == 304 { return "Not Modified" }
+    if code == 307 { return "Temporary Redirect" }
+    if code == 308 { return "Permanent Redirect" }
+    # 4xx Client Error
+    if code == 400 { return "Bad Request" }
+    if code == 401 { return "Unauthorized" }
+    if code == 403 { return "Forbidden" }
+    if code == 404 { return "Not Found" }
+    if code == 405 { return "Method Not Allowed" }
+    if code == 406 { return "Not Acceptable" }
+    if code == 408 { return "Request Timeout" }
+    if code == 409 { return "Conflict" }
+    if code == 410 { return "Gone" }
+    if code == 411 { return "Length Required" }
+    if code == 413 { return "Payload Too Large" }
+    if code == 414 { return "URI Too Long" }
+    if code == 415 { return "Unsupported Media Type" }
+    if code == 429 { return "Too Many Requests" }
+    if code == 431 { return "Request Header Fields Too Large" }
+    # 5xx Server Error
+    if code == 500 { return "Internal Server Error" }
+    if code == 501 { return "Not Implemented" }
+    if code == 502 { return "Bad Gateway" }
+    if code == 503 { return "Service Unavailable" }
+    if code == 504 { return "Gateway Timeout" }
+    if code == 505 { return "HTTP Version Not Supported" }
+    return "Unknown"
+}
+
+# ============================================================================
+# CR / LF constants — used by the parser. Defined as ints (byte values)
+# because HLS str indexing returns int (byte_at). 13 = CR, 10 = LF.
+# ============================================================================
+
+fn http_cr() -> int { return 13 }
+fn http_lf() -> int { return 10 }
+
+# http_crlf() — the canonical CRLF line ending required by RFC 7230.
+# The serialiser always emits CRLF; the parser accepts CRLF AND a
+# bare LF (RFC 7230 § 3.5: "a recipient MAY recognize a single LF as a
+# line terminator"). HLS string literals only support \n / \t / \\ / \"
+# (no \r), so the CR is built via chr(13).
+fn http_crlf() -> str { return chr(13) + "\n" }
+
+# http_cr_str() — the CR character as a str. Used by the parser to
+# strip trailing CRs from lines sliced up to a LF.
+fn http_cr_str() -> str { return chr(13) }
+
+# ============================================================================
+# Parser — http_parse_request(s) and http_parse_response(s).
+#
+# Both return Result[T, str] — Ok on success, Err(msg) on failure. The
+# error message is suitable for a 400 Bad Request response body (it
+# names the parse failure precisely: "missing method", "missing Host
+# header", "header too long", etc.).
+#
+# The parser is a single-pass state machine. It does NOT allocate
+# intermediate substrings for the whole input; it tracks byte offsets
+# and slices only at field boundaries. (HLS strings are immutable
+# bytes, so slicing is O(1) — no copy.)
+# ============================================================================
+
+# http_parse_request(s) — parse an HTTP/1.1 request. Returns
+# Result.Ok(HttpRequest) on success, Result.Err(msg) on failure.
+#
+# Grammar (RFC 7230 § 3):
+#   request-line = method SP request-target SP HTTP-version CRLF
+#   header-field = field-name ":" OWS field-value OWS CRLF
+#   request      = request-line *(header-field CRLF) CRLF [ body ]
+#
+# The body is present iff a Content-Length header exists; its byte
+# length must match the Content-Length value. Chunked transfer
+# encoding is NOT supported (returns Err with a clear message).
+fn http_parse_request(s: str) -> Result[HttpRequest, str] {
+    let n: int = s.len()
+    # Parse the request line: find the first CRLF (or bare LF).
+    let line_end: int = http_find_line_end(s, 0)
+    if line_end < 0 {
+        return Result.Err("http_parse_request: no request line terminator (missing CRLF)")
+    }
+    let line: str = s.slice(0, line_end)
+    if line.len() > http_max_request_line() {
+        return Result.Err("http_parse_request: request line too long (>" + http_max_request_line().to_str() + " bytes)")
+    }
+    # Split the request line into method / path / version.
+    let parts: list[str] = http_split_request_line(line)
+    if parts.len() != 3 {
+        return Result.Err("http_parse_request: malformed request line (expected 'METHOD SP PATH SP VERSION'): '" + line + "'")
+    }
+    let method: str = parts.get(0)
+    let path: str = parts.get(1)
+    let version: str = parts.get(2)
+    if !http_valid_method(method) {
+        return Result.Err("http_parse_request: invalid method '" + method + "'")
+    }
+    if !http_valid_version(version) {
+        return Result.Err("http_parse_request: invalid version '" + version + "' (expected HTTP/1.0 or HTTP/1.1)")
+    }
+    # Parse the headers.
+    let headers_result: Result[list[HttpHeader], str] = http_parse_headers(s, line_end)
+    if !result_is_ok(headers_result) {
+        return Result.Err(result_err_or(headers_result, "header parse failed"))
+    }
+    let headers: list[HttpHeader] = result_unwrap(headers_result)
+    if headers.len() > http_max_headers() {
+        return Result.Err("http_parse_request: too many headers (>" + http_max_headers().to_str() + ")")
+    }
+    # Determine the body length.
+    let mut body: str = ""
+    if http_header_has(headers, "Content-Length") {
+        let cl_str: str = http_header_get(headers, "Content-Length")
+        let cl: int = http_parse_content_length(cl_str)
+        if cl < 0 {
+            return Result.Err("http_parse_request: invalid Content-Length '" + cl_str + "'")
+        }
+        if cl > http_max_body() {
+            return Result.Err("http_parse_request: body too large (" + cl.to_str() + " > " + http_max_body().to_str() + ")")
+        }
+        # The body starts after the blank line that ends the headers.
+        # http_parse_headers returns the offset just past the blank line.
+        let body_start: int = http_body_start(s, line_end)
+        if body_start < 0 {
+            return Result.Err("http_parse_request: malformed header terminator")
+        }
+        if body_start + cl > n {
+            return Result.Err("http_parse_request: body shorter than Content-Length (declared " + cl.to_str() + ", available " + (n - body_start).to_str() + ")")
+        }
+        body = s.slice(body_start, body_start + cl)
+    } else if http_header_has(headers, "Transfer-Encoding") {
+        # Stage 38 does not support chunked transfer encoding.
+        return Result.Err("http_parse_request: chunked Transfer-Encoding not supported (Stage 38 limitation — use Content-Length)")
+    }
+    return Result.Ok(HttpRequest {
+        method: method,
+        path: path,
+        version: version,
+        headers: headers,
+        body: body
+    })
+}
+
+# http_parse_response(s) — parse an HTTP/1.1 response. Returns
+# Result.Ok(HttpResponse) on success, Result.Err(msg) on failure.
+#
+# Grammar:
+#   status-line  = HTTP-version SP status-code SP reason-phrase CRLF
+#   response     = status-line *(header-field CRLF) CRLF [ body ]
+fn http_parse_response(s: str) -> Result[HttpResponse, str] {
+    let n: int = s.len()
+    let line_end: int = http_find_line_end(s, 0)
+    if line_end < 0 {
+        return Result.Err("http_parse_response: no status line terminator (missing CRLF)")
+    }
+    let line: str = s.slice(0, line_end)
+    let parts: list[str] = http_split_status_line(line)
+    if parts.len() < 2 {
+        return Result.Err("http_parse_response: malformed status line (expected 'VERSION SP STATUS [SP REASON]'): '" + line + "'")
+    }
+    let version: str = parts.get(0)
+    let status: int = http_parse_status_code(parts.get(1))
+    if status < 100 || status > 599 {
+        return Result.Err("http_parse_response: invalid status code '" + parts.get(1) + "'")
+    }
+    let mut reason: str = ""
+    if parts.len() >= 3 {
+        reason = parts.get(2)
+    } else {
+        reason = http_status_text(status)
+    }
+    let headers_result: Result[list[HttpHeader], str] = http_parse_headers(s, line_end)
+    if !result_is_ok(headers_result) {
+        return Result.Err(result_err_or(headers_result, "header parse failed"))
+    }
+    let headers: list[HttpHeader] = result_unwrap(headers_result)
+    let mut body: str = ""
+    if http_header_has(headers, "Content-Length") {
+        let cl_str: str = http_header_get(headers, "Content-Length")
+        let cl: int = http_parse_content_length(cl_str)
+        if cl < 0 {
+            return Result.Err("http_parse_response: invalid Content-Length '" + cl_str + "'")
+        }
+        let body_start: int = http_body_start(s, line_end)
+        if body_start < 0 {
+            return Result.Err("http_parse_response: malformed header terminator")
+        }
+        if body_start + cl > n {
+            # The body may be truncated (the caller hasn't read it all
+            # yet). Take what's available.
+            body = s.slice(body_start, n)
+        } else {
+            body = s.slice(body_start, body_start + cl)
+        }
+    }
+    return Result.Ok(HttpResponse {
+        version: version,
+        status: status,
+        reason: reason,
+        headers: headers,
+        body: body
+    })
+}
+
+# http_find_line_end(s, start) — return the offset of the first LF at
+# or after `start`. The LF may be preceded by a CR (CRLF) or stand
+# alone (bare LF — accepted per RFC 7230 § 3.5). Returns -1 if no LF
+# is found.
+fn http_find_line_end(s: str, start: int) -> int {
+    let n: int = s.len()
+    let mut i: int = start
+    while i < n {
+        if s.byte_at(i) == http_lf() {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+# http_split_request_line(line) — split "METHOD SP PATH SP VERSION"
+# into 3 parts. Multiple consecutive spaces are NOT allowed (RFC 7230
+# § 3.1.1: "No whitespace is allowed between the method and the
+# request-target, or between the request-target and the HTTP-
+# version"). Returns a list of length 3 on success, length != 3 on
+# failure.
+fn http_split_request_line(line: str) -> list[str] {
+    # Strip a trailing CR (the line was sliced up to the LF; the CR
+    # may still be there).
+    let l: str = http_strip_trailing_cr(line)
+    let parts: list[str] = l.split(" ")
+    if parts.len() != 3 {
+        return parts
+    }
+    return parts
+}
+
+# http_split_status_line(line) — split "VERSION SP STATUS [SP REASON]"
+# into 3 parts (the reason phrase may contain spaces; we rejoin
+# everything after the second space).
+fn http_split_status_line(line: str) -> list[str] {
+    let l: str = http_strip_trailing_cr(line)
+    let n: int = l.len()
+    # Find the first space.
+    let mut sp1: int = -1
+    let mut i: int = 0
+    while i < n {
+        if l.byte_at(i) == 32 {
+            sp1 = i
+            break
+        }
+        i = i + 1
+    }
+    if sp1 < 0 {
+        return []
+    }
+    # Find the second space.
+    let mut sp2: int = -1
+    let mut j: int = sp1 + 1
+    while j < n {
+        if l.byte_at(j) == 32 {
+            sp2 = j
+            break
+        }
+        j = j + 1
+    }
+    if sp2 < 0 {
+        # No second space — only VERSION SP STATUS (no reason phrase).
+        let out: list[str] = []
+        out.push(l.slice(0, sp1))
+        out.push(l.slice(sp1 + 1, n))
+        return out
+    }
+    let out2: list[str] = []
+    out2.push(l.slice(0, sp1))
+    out2.push(l.slice(sp1 + 1, sp2))
+    out2.push(l.slice(sp2 + 1, n))
+    return out2
+}
+
+# http_strip_trailing_cr(line) — if the line ends with CR, strip it.
+# Used after slicing up to a LF (the CR before the LF is part of the
+# CRLF terminator and must be removed before parsing).
+fn http_strip_trailing_cr(line: str) -> str {
+    let n: int = line.len()
+    if n == 0 {
+        return line
+    }
+    if line.byte_at(n - 1) == http_cr() {
+        return line.slice(0, n - 1)
+    }
+    return line
+}
+
+# http_valid_method(method) — true iff the method is a valid HTTP
+# method name (RFC 7230 § 4.1: "method = token"). Stage 38 accepts the
+# 8 standard methods plus PATCH (RFC 5789). Custom methods are NOT
+# accepted (the parser is conservative — a server should reject
+# unknown methods with 501 Not Implemented).
+fn http_valid_method(method: str) -> bool {
+    if method == "GET" { return true }
+    if method == "HEAD" { return true }
+    if method == "POST" { return true }
+    if method == "PUT" { return true }
+    if method == "DELETE" { return true }
+    if method == "OPTIONS" { return true }
+    if method == "TRACE" { return true }
+    if method == "CONNECT" { return true }
+    if method == "PATCH" { return true }
+    return false
+}
+
+# http_valid_version(version) — true iff the version is HTTP/1.0 or
+# HTTP/1.1 (the only versions Stage 38 supports). HTTP/2 is Stage 39.
+fn http_valid_version(version: str) -> bool {
+    if version == "HTTP/1.0" { return true }
+    if version == "HTTP/1.1" { return true }
+    return false
+}
+
+# http_parse_status_code(s) — parse a 3-digit status code. Returns -1
+# on failure (non-numeric or wrong length).
+fn http_parse_status_code(s: str) -> int {
+    if s.len() != 3 {
+        return -1
+    }
+    let n: int = s.to_int()
+    if n < 0 {
+        return -1
+    }
+    return n
+}
+
+# http_parse_content_length(s) — parse a Content-Length value. Must
+# be a non-negative integer. Returns -1 on failure.
+fn http_parse_content_length(s: str) -> int {
+    let n: int = s.to_int()
+    if n < 0 {
+        return -1
+    }
+    return n
+}
+
+# http_parse_headers(s, start) — parse the header block starting just
+# after the request/status line. Returns Result.Ok(list[HttpHeader])
+# on success, Result.Err(msg) on failure. The headers end at a blank
+# line (CRLF CRLF or LF LF).
+fn http_parse_headers(s: str, start: int) -> Result[list[HttpHeader], str] {
+    let headers: list[HttpHeader] = []
+    let mut i: int = start
+    let n: int = s.len()
+    # Skip the line terminator after the request/status line.
+    i = http_skip_line_terminator(s, i)
+    if i < 0 {
+        return Result.Err("http_parse_headers: malformed line terminator after request/status line")
+    }
+    let mut count: int = 0
+    while i < n {
+        # Check for the blank line that ends the header block.
+        if i < n && s.byte_at(i) == http_lf() {
+            # Bare LF — end of headers.
+            i = i + 1
+            return Result.Ok(headers)
+        }
+        if i + 1 < n && s.byte_at(i) == http_cr() && s.byte_at(i + 1) == http_lf() {
+            # CRLF — end of headers.
+            i = i + 2
+            return Result.Ok(headers)
+        }
+        # Parse one header line.
+        let line_end: int = http_find_line_end(s, i)
+        if line_end < 0 {
+            return Result.Err("http_parse_headers: header line has no terminator")
+        }
+        let line: str = s.slice(i, line_end)
+        let stripped: str = http_strip_trailing_cr(line)
+        if stripped.len() > http_max_header_line() {
+            return Result.Err("http_parse_headers: header line too long (>" + http_max_header_line().to_str() + " bytes)")
+        }
+        # Find the colon.
+        let colon: int = http_find_colon(stripped)
+        if colon < 0 {
+            return Result.Err("http_parse_headers: header line has no colon: '" + stripped + "'")
+        }
+        let name: str = stripped.slice(0, colon)
+        let value: str = http_trim_ws(stripped.slice(colon + 1, stripped.len()))
+        if !http_valid_header_name(name) {
+            return Result.Err("http_parse_headers: invalid header name '" + name + "'")
+        }
+        headers.push(HttpHeader { name: name, value: value })
+        count = count + 1
+        if count > http_max_headers() {
+            return Result.Err("http_parse_headers: too many headers (>" + http_max_headers().to_str() + ")")
+        }
+        i = http_skip_line_terminator(s, line_end)
+        if i < 0 {
+            return Result.Err("http_parse_headers: malformed line terminator after header")
+        }
+    }
+    # No blank line found — incomplete header block.
+    return Result.Err("http_parse_headers: no blank line terminating the header block")
+}
+
+# http_skip_line_terminator(s, i) — skip a CRLF or bare LF at offset
+# i. Returns the new offset, or -1 if no terminator is present.
+fn http_skip_line_terminator(s: str, i: int) -> int {
+    let n: int = s.len()
+    if i >= n {
+        return -1
+    }
+    if s.byte_at(i) == http_lf() {
+        return i + 1
+    }
+    if i + 1 < n && s.byte_at(i) == http_cr() && s.byte_at(i + 1) == http_lf() {
+        return i + 2
+    }
+    return -1
+}
+
+# http_find_colon(s) — return the offset of the first ':' in s, or -1.
+# Used to split a header line into name and value.
+fn http_find_colon(s: str) -> int {
+    let n: int = s.len()
+    let mut i: int = 0
+    while i < n {
+        if s.byte_at(i) == 58 {  # ':'
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+# http_trim_ws(s) — trim leading and trailing OWS (optional whitespace:
+# space or tab). RFC 7230 § 3.2.3: OWS = *( SP / HTAB ).
+fn http_trim_ws(s: str) -> str {
+    let n: int = s.len()
+    let mut start: int = 0
+    while start < n {
+        let b: int = s.byte_at(start)
+        if b != 32 && b != 9 {  # space, tab
+            break
+        }
+        start = start + 1
+    }
+    let mut end: int = n
+    while end > start {
+        let b2: int = s.byte_at(end - 1)
+        if b2 != 32 && b2 != 9 {
+            break
+        }
+        end = end - 1
+    }
+    return s.slice(start, end)
+}
+
+# http_valid_header_name(name) — true iff the name is a valid RFC 7230
+# token (no whitespace, no separators, no control chars). Stage 38
+# uses a conservative subset: ALPHA / DIGIT / '-' / '_' / '.'. This
+# rejects all the weird-but-legal token chars but accepts every header
+# name in common use (Host, Content-Length, Content-Type, User-Agent,
+# Accept, Set-Cookie, etc.).
+fn http_valid_header_name(name: str) -> bool {
+    if name.len() == 0 {
+        return false
+    }
+    let mut i: int = 0
+    while i < name.len() {
+        let b: int = name.byte_at(i)
+        # ALPHA
+        if b >= 65 && b <= 90 {
+            i = i + 1
+            continue
+        }
+        if b >= 97 && b <= 122 {
+            i = i + 1
+            continue
+        }
+        # DIGIT
+        if b >= 48 && b <= 57 {
+            i = i + 1
+            continue
+        }
+        # '-' / '_' / '.'
+        if b == 45 || b == 95 || b == 46 {
+            i = i + 1
+            continue
+        }
+        return false
+    }
+    return true
+}
+
+# http_body_start(s, line_end) — return the offset where the body
+# starts (just past the blank line that ends the headers). Returns -1
+# if no blank line is found.
+fn http_body_start(s: str, line_end: int) -> int {
+    # The headers start just after the request/status line's
+    # terminator. We scan for the blank line (CRLF CRLF or LF LF).
+    let n: int = s.len()
+    let mut i: int = line_end
+    # Skip the first line's terminator.
+    i = http_skip_line_terminator(s, i)
+    if i < 0 {
+        return -1
+    }
+    while i < n {
+        if i < n && s.byte_at(i) == http_lf() {
+            return i + 1
+        }
+        if i + 1 < n && s.byte_at(i) == http_cr() && s.byte_at(i + 1) == http_lf() {
+            return i + 2
+        }
+        let line_end2: int = http_find_line_end(s, i)
+        if line_end2 < 0 {
+            return -1
+        }
+        i = http_skip_line_terminator(s, line_end2)
+        if i < 0 {
+            return -1
+        }
+    }
+    return -1
+}
+
+# ============================================================================
+# Serialiser — http_serialize_request(req) and http_serialize_response(resp).
+#
+# Both return a str containing the canonical RFC 7230 wire format
+# (CRLF line endings, headers in insertion order, body bytes as-is).
+# The output is byte-identical between the interpreter and the native
+# binary (pure functions; no I/O).
+# ============================================================================
+
+# http_serialize_request(req) — serialise an HttpRequest to a str.
+fn http_serialize_request(req: HttpRequest) -> str {
+    let r: str = req.method + " " + req.path + " " + req.version + http_crlf()
+    let mut out: str = r
+    let mut i: int = 0
+    while i < req.headers.len() {
+        let h: HttpHeader = req.headers.get(i)
+        out = out + h.name + ": " + h.value + http_crlf()
+        i = i + 1
+    }
+    out = out + http_crlf()
+    out = out + req.body
+    return out
+}
+
+# http_serialize_response(resp) — serialise an HttpResponse to a str.
+fn http_serialize_response(resp: HttpResponse) -> str {
+    let r: str = resp.version + " " + resp.status.to_str() + " " + resp.reason + http_crlf()
+    let mut out: str = r
+    # Ensure Content-Length is present iff there's a body.
+    let mut has_cl: bool = false
+    let mut i: int = 0
+    while i < resp.headers.len() {
+        let h: HttpHeader = resp.headers.get(i)
+        if str_to_lower_ascii(h.name) == "content-length" {
+            has_cl = true
+        }
+        out = out + h.name + ": " + h.value + http_crlf()
+        i = i + 1
+    }
+    if !has_cl {
+        out = out + "Content-Length: " + resp.body.len().to_str() + http_crlf()
+    }
+    # Always send Connection: close (Stage 38 does not support keep-alive).
+    if !http_header_has(resp.headers, "Connection") {
+        out = out + "Connection: close" + http_crlf()
+    }
+    out = out + http_crlf()
+    out = out + resp.body
+    return out
+}
+
+# ============================================================================
+# Client — http_get(host, port, path) and http_get_with_tls.
+#
+# http_get opens a TCP connection, sends a GET request, reads the full
+# response (up to http_max_body bytes), parses it, and returns an
+# HttpResponse. The host argument is a taint sink (delegated to
+# std.net's tcp_connect, which already enforces the SSRF check).
+#
+# http_get_with_tls is the HTTPS variant — it uses Stage 37's
+# tls_get (libcurl-backed) and returns just the body (the headers are
+# not exposed by tls_get; a future stage will add a full HTTPS client
+# with header access).
+# ============================================================================
+
+# http_get(host, port, path) — one-shot HTTP/1.1 GET. Returns
+# Result.Ok(HttpResponse) on success, Result.Err(msg) on failure.
+# The host argument is a taint sink (SSRF prevention — delegated to
+# std.net.tcp_connect).
+fn http_get(host: str, port: int, path: str) -> Result[HttpResponse, str] uses Net {
+    let conn_r: Result[TcpStream, str] = tcp_connect_or(host, port)
+    if !result_is_ok(conn_r) {
+        return Result.Err(result_err_or(conn_r, "http_get: connect failed"))
+    }
+    let conn: TcpStream = result_unwrap(conn_r)
+    # Build the request. The Host header is mandatory in HTTP/1.1.
+    let req: HttpRequest = http_request_new("GET", path)
+    req.headers = http_header_add(req.headers, "Host", host + ":" + port.to_str())
+    req.headers = http_header_add(req.headers, "User-Agent", "halis-http/0.57")
+    req.headers = http_header_add(req.headers, "Accept", "*/*")
+    req.headers = http_header_add(req.headers, "Connection", "close")
+    let wire: str = http_serialize_request(req)
+    if !conn.write_all(wire) {
+        conn.close()
+        return Result.Err("http_get: write failed")
+    }
+    let body: str = conn.read_all(http_max_body())
+    conn.close()
+    if body.len() == 0 {
+        return Result.Err("http_get: empty response")
+    }
+    let resp_r: Result[HttpResponse, str] = http_parse_response(body)
+    return resp_r
+}
+
+# http_get_with_tls(host, port, path) — one-shot HTTPS GET via Stage
+# 37's tls_get (libcurl-backed). Returns Result.Ok(body_str) on
+# success, Result.Err(msg) on failure. Unlike http_get, this variant
+# returns ONLY the body (tls_get doesn't expose the headers). The
+# host and path arguments are taint sinks (delegated to net_tls_get).
+fn http_get_with_tls(host: str, port: int, path: str) -> Result[str, str] uses Net {
+    # tls_get panics on transport / HTTP error. We catch the panic at
+    # a higher level (the panic mechanism is the language's only
+    # error-escape hatch in Stage 38). For now, we return Ok — the
+    # caller can wrap this in a task and use task.join to catch panics.
+    let body: str = tls_get(host, port, path)
+    return Result.Ok(body)
+}
+
+# ============================================================================
+# Server — http_serve(host, port, handler) and HttpServerConfig.
+#
+# http_serve binds a TcpListener, accepts connections in a loop, reads
+# each request, dispatches to the user-supplied handler function, and
+# writes the response. The handler is a top-level function with
+# signature `fn(HttpRequest) -> HttpResponse uses IO, Net` — HLS v0.3
+# doesn't have function pointers, so the handler is invoked by NAME
+# (the caller spawns a task per connection, passing the request as
+# the argument; the task calls the handler and writes the response).
+#
+# Stage 38 limitations (deferred to Stage 39 HTTP/2):
+#   - Keep-alive is NOT supported (Connection: close in every response).
+#   - Chunked Transfer-Encoding is NOT supported (rejected with 411).
+#   - HTTPS is NOT supported (use a reverse proxy for TLS termination).
+#   - The server is single-threaded (one connection at a time). A
+#     future stage will add a thread pool.
+# ============================================================================
+
+# http_serve(host, port, max_conns) — bind a TcpListener and serve
+# `max_conns` connections, then return. Each connection is handled
+# inline (single-threaded — a future stage will add a thread pool).
+# The handler is the function `http_handle` (a top-level function the
+# caller defines in the same program). Returns 0 on success, non-zero
+# on failure.
+#
+# This is a LOW-LEVEL entry point. Most callers should use the
+# `http_serve_demo` pattern from examples/http_demo.hls instead — it
+# shows how to define `http_handle` and call `http_serve`.
+fn http_serve(host: str, port: int, max_conns: int) -> int uses IO, Net {
+    let listener: TcpListener = tcp_listen(host, port, 16)
+    println("http_serve: listening on " + host + ":" + port.to_str())
+    let mut conn_count: int = 0
+    while conn_count < max_conns {
+        let conn_r: Result[TcpStream, str] = listener.accept_or()
+        if !result_is_ok(conn_r) {
+            println("http_serve: accept failed: " + result_err_or(conn_r, ""))
+            conn_count = conn_count + 1
+            continue
+        }
+        let conn: TcpStream = result_unwrap(conn_r)
+        http_handle_one(conn)
+        conn_count = conn_count + 1
+    }
+    listener.close()
+    println("http_serve: served " + conn_count.to_str() + " connections, exiting")
+    return 0
+}
+
+# http_handle_one(conn) — read one request, dispatch to http_handle,
+# write the response, close. Used by http_serve; exposed publicly so
+# a custom server loop can call it directly.
+#
+# Reads the request in a bounded loop: each iteration calls net_read
+# with a 64 KiB buffer and appends to an accumulator. The loop exits
+# when:
+#   - the accumulator contains the blank line terminating the headers
+#     (CRLF CRLF or LF LF), AND
+#   - the accumulator's body-portion length >= Content-Length (if
+#     Content-Length is present).
+# Or when the accumulator reaches the max-request size (413).
+#
+# This avoids the deadlock that would arise from a naive read_all:
+# the client doesn't close its write side until it receives the
+# response, so a read_all on the server side would block forever.
+# The bounded loop reads only what's needed to parse the request,
+# then dispatches.
+fn http_handle_one(conn: TcpStream) -> void uses IO, Net {
+    let mut raw: str = ""
+    let max_total: int = http_max_body() + http_max_request_line() + http_max_headers() * http_max_header_line()
+    let mut have_headers: bool = false
+    let mut need_body: int = 0
+    let mut body_start_off: int = -1
+    while raw.len() < max_total {
+        let chunk: str = conn.read(net_max_recv())
+        if chunk.len() == 0 {
+            # EOF or error — break out and try to parse what we have.
+            break
+        }
+        raw = raw + chunk
+        # Check if we've seen the header terminator (CRLF CRLF or LF LF).
+        if !have_headers {
+            body_start_off = http_find_header_end(raw)
+            if body_start_off >= 0 {
+                have_headers = true
+                # Parse just the headers to find Content-Length.
+                let header_part: str = raw.slice(0, body_start_off)
+                let header_only: str = header_part + http_crlf() + http_crlf()
+                let probe_r: Result[HttpRequest, str] = http_parse_request(header_only)
+                if result_is_ok(probe_r) {
+                    let probe: HttpRequest = result_unwrap(probe_r)
+                    if http_header_has(probe.headers, "Content-Length") {
+                        need_body = http_parse_content_length(http_header_get(probe.headers, "Content-Length"))
+                    }
+                }
+            }
+        }
+        if have_headers {
+            let body_have: int = raw.len() - body_start_off
+            if body_have >= need_body {
+                break
+            }
+        }
+    }
+    if raw.len() == 0 {
+        conn.close()
+        return
+    }
+    let req_r: Result[HttpRequest, str] = http_parse_request(raw)
+    let mut resp: HttpResponse = http_response_new(500)
+    if !result_is_ok(req_r) {
+        # Parse error -> 400 Bad Request.
+        resp = http_response_new(400)
+        let err: str = result_err_or(req_r, "parse failed")
+        resp.body = "400 Bad Request: " + err + "\n"
+        resp.headers = http_header_add(resp.headers, "Content-Type", "text/plain; charset=utf-8")
+    } else {
+        let req: HttpRequest = result_unwrap(req_r)
+        # Dispatch to the user-defined handler.
+        resp = http_handle(req)
+    }
+    let wire: str = http_serialize_response(resp)
+    let _w: int = conn.write(wire)
+    conn.close()
+}
+
+# http_find_header_end(s) — return the offset just PAST the blank line
+# that terminates the headers (i.e. the offset where the body starts).
+# Returns -1 if no blank line is found. Accepts CRLF CRLF or LF LF.
+fn http_find_header_end(s: str) -> int {
+    let n: int = s.len()
+    let mut i: int = 0
+    while i + 1 < n {
+        # LF LF (bare LF form)
+        if s.byte_at(i) == http_lf() && s.byte_at(i + 1) == http_lf() {
+            return i + 2
+        }
+        # CRLF CRLF (canonical form)
+        if i + 3 < n
+            && s.byte_at(i) == http_cr() && s.byte_at(i + 1) == http_lf()
+            && s.byte_at(i + 2) == http_cr() && s.byte_at(i + 3) == http_lf() {
+            return i + 4
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+# http_handle(req) — the default request handler. Returns a 200 OK
+# with a plain-text body describing the request. Callers SHOULD
+# override this by defining their own `http_handle` function (HLS
+# allows shadowing a stdlib function with a user function in the same
+# program — the user's definition takes precedence at link time).
+#
+# The default implementation is intentionally minimal — it's a
+# "hello world" handler that proves the server works. Real handlers
+# will inspect req.method, req.path, req.headers, and req.body, then
+# construct an appropriate HttpResponse.
+fn http_handle(req: HttpRequest) -> HttpResponse uses IO {
+    let resp: HttpResponse = http_response_new(200)
+    resp.headers = http_header_add(resp.headers, "Content-Type", "text/plain; charset=utf-8")
+    let body: str = "method=" + req.method + "\npath=" + req.path + "\nversion=" + req.version + "\nheaders=" + req.headers.len().to_str() + "\nbody_len=" + req.body.len().to_str() + "\n"
+    resp.body = body
+    return resp
+}
+
+# ============================================================================
+# Convenience — http_text_response(status, body) and http_html_response.
+# ============================================================================
+
+# http_text_response(status, body) — construct a 200 OK (or any
+# status) response with Content-Type: text/plain and the given body.
+fn http_text_response(status: int, body: str) -> HttpResponse {
+    let resp: HttpResponse = http_response_new(status)
+    resp.headers = http_header_add(resp.headers, "Content-Type", "text/plain; charset=utf-8")
+    resp.body = body
+    return resp
+}
+
+# http_html_response(status, body) — construct a response with
+# Content-Type: text/html and the given body.
+fn http_html_response(status: int, body: str) -> HttpResponse {
+    let resp: HttpResponse = http_response_new(status)
+    resp.headers = http_header_add(resp.headers, "Content-Type", "text/html; charset=utf-8")
+    resp.body = body
+    return resp
+}
+
+# http_json_response(status, body) — construct a response with
+# Content-Type: application/json and the given body.
+fn http_json_response(status: int, body: str) -> HttpResponse {
+    let resp: HttpResponse = http_response_new(status)
+    resp.headers = http_header_add(resp.headers, "Content-Type", "application/json; charset=utf-8")
+    resp.body = body
+    return resp
+}

@@ -1,0 +1,371 @@
+# tests/ok/feat_stage38_http.hls — Stage 38 (v0.57.0-alpha): std.http module.
+#
+# Exercises:
+#   - HttpRequest / HttpResponse / HttpHeader structs
+#   - http_status_text (canonical reason phrases)
+#   - http_parse_request (RFC 7230 request parsing)
+#   - http_parse_response (RFC 7230 response parsing)
+#   - http_serialize_request / http_serialize_response
+#   - http_header_get / http_header_has / http_header_set / http_header_add
+#   - http_text_response / http_html_response / http_json_response
+#   - http_get (client, against a loopback echo server)
+#   - http_serve (server, single-connection, against a loopback client)
+#
+# The test is DETERMINISTIC (loopback only — no real network, no DNS,
+# no libcurl) so the differential test (interpreter == native) is
+# byte-exact. The HTTP/1.1 wire format is parsed and serialised
+# identically in both backends (pure HLS, no I/O in the parser /
+# serialiser; the only I/O is the underlying TCP transport, which
+# Stage 37 already verified differentially).
+
+import "std.http"
+import "std.net"
+import "std.str"
+import "std.option"
+import "std.result"
+
+# ============================================================================
+# Section 1: http_status_text — verify the canonical reason phrases.
+# ============================================================================
+
+fn test_status_text() -> int uses IO {
+    if http_status_text(200) != "OK" {
+        panic("http_status_text(200): expected 'OK', got '" + http_status_text(200) + "'")
+    }
+    if http_status_text(404) != "Not Found" {
+        panic("http_status_text(404): expected 'Not Found'")
+    }
+    if http_status_text(500) != "Internal Server Error" {
+        panic("http_status_text(500): expected 'Internal Server Error'")
+    }
+    if http_status_text(418) != "Unknown" {
+        panic("http_status_text(418): expected 'Unknown' (not in our table)")
+    }
+    println("status_text OK: 200=OK, 404=Not Found, 500=Internal Server Error, 418=Unknown")
+    return 0
+}
+
+# ============================================================================
+# Section 2: http_parse_request — verify RFC 7230 request parsing.
+# ============================================================================
+
+fn test_parse_request() -> int uses IO {
+    # A minimal GET request with one header.
+    let raw: str = "GET /index.html HTTP/1.1" + http_crlf()
+        + "Host: example.com" + http_crlf()
+        + http_crlf()
+    let r: Result[HttpRequest, str] = http_parse_request(raw)
+    if !result_is_ok(r) {
+        panic("http_parse_request: " + result_err_or(r, "parse failed"))
+    }
+    let req: HttpRequest = result_unwrap(r)
+    if req.method != "GET" {
+        panic("method: expected GET, got " + req.method)
+    }
+    if req.path != "/index.html" {
+        panic("path: expected /index.html, got " + req.path)
+    }
+    if req.version != "HTTP/1.1" {
+        panic("version: expected HTTP/1.1, got " + req.version)
+    }
+    if req.headers.len() != 1 {
+        panic("headers.len: expected 1, got " + req.headers.len().to_str())
+    }
+    if http_header_get(req.headers, "Host") != "example.com" {
+        panic("Host header: expected example.com, got " + http_header_get(req.headers, "Host"))
+    }
+    if req.body != "" {
+        panic("body: expected empty, got '" + req.body + "'")
+    }
+    println("parse_request OK: GET /index.html HTTP/1.1, Host=example.com")
+    return 0
+}
+
+# ============================================================================
+# Section 3: http_parse_request with body (POST).
+# ============================================================================
+
+fn test_parse_request_with_body() -> int uses IO {
+    let body: str = "hello=world&foo=bar"
+    let raw: str = "POST /submit HTTP/1.1" + http_crlf()
+        + "Host: example.com" + http_crlf()
+        + "Content-Type: application/x-www-form-urlencoded" + http_crlf()
+        + "Content-Length: " + body.len().to_str() + http_crlf()
+        + http_crlf()
+        + body
+    let r: Result[HttpRequest, str] = http_parse_request(raw)
+    if !result_is_ok(r) {
+        panic("http_parse_request (POST): " + result_err_or(r, "parse failed"))
+    }
+    let req: HttpRequest = result_unwrap(r)
+    if req.method != "POST" {
+        panic("method: expected POST, got " + req.method)
+    }
+    if req.body != body {
+        panic("body: expected '" + body + "', got '" + req.body + "'")
+    }
+    if http_header_get(req.headers, "Content-Length") != body.len().to_str() {
+        panic("Content-Length: expected " + body.len().to_str() + ", got " + http_header_get(req.headers, "Content-Length"))
+    }
+    println("parse_request_with_body OK: POST /submit, body='" + req.body + "'")
+    return 0
+}
+
+# ============================================================================
+# Section 4: http_parse_response — verify RFC 7230 response parsing.
+# ============================================================================
+
+fn test_parse_response() -> int uses IO {
+    let body: str = "<html><body>Hello</body></html>"
+    let raw: str = "HTTP/1.1 200 OK" + http_crlf()
+        + "Content-Type: text/html" + http_crlf()
+        + "Content-Length: " + body.len().to_str() + http_crlf()
+        + http_crlf()
+        + body
+    let r: Result[HttpResponse, str] = http_parse_response(raw)
+    if !result_is_ok(r) {
+        panic("http_parse_response: " + result_err_or(r, "parse failed"))
+    }
+    let resp: HttpResponse = result_unwrap(r)
+    if resp.version != "HTTP/1.1" {
+        panic("version: expected HTTP/1.1, got " + resp.version)
+    }
+    if resp.status != 200 {
+        panic("status: expected 200, got " + resp.status.to_str())
+    }
+    if resp.reason != "OK" {
+        panic("reason: expected OK, got " + resp.reason)
+    }
+    if resp.body != body {
+        panic("body: expected '" + body + "', got '" + resp.body + "'")
+    }
+    println("parse_response OK: 200 OK, body.len=" + resp.body.len().to_str())
+    return 0
+}
+
+# ============================================================================
+# Section 5: http_serialize_request / http_serialize_response — round-trip.
+# ============================================================================
+
+fn test_serialize() -> int uses IO {
+    # Build a request, serialise it, parse it back, verify equality.
+    let req: HttpRequest = http_request_new("GET", "/api/v1/users")
+    req.headers = http_header_add(req.headers, "Host", "api.example.com")
+    req.headers = http_header_add(req.headers, "Accept", "application/json")
+    let wire: str = http_serialize_request(req)
+    # The wire format must start with "GET /api/v1/users HTTP/1.1".
+    if !wire.starts_with("GET /api/v1/users HTTP/1.1") {
+        panic("serialize_request: wire doesn't start with request line: '" + wire.slice(0, 40) + "...'")
+    }
+    # Round-trip: parse the serialised request.
+    let r: Result[HttpRequest, str] = http_parse_request(wire)
+    if !result_is_ok(r) {
+        panic("serialize_request round-trip: " + result_err_or(r, "parse failed"))
+    }
+    let req2: HttpRequest = result_unwrap(r)
+    if req2.method != req.method {
+        panic("round-trip method mismatch")
+    }
+    if req2.path != req.path {
+        panic("round-trip path mismatch")
+    }
+    println("serialize_request OK: round-trip verified")
+
+    # Build a response, serialise it, verify Content-Length is present.
+    let resp: HttpResponse = http_text_response(200, "hello world")
+    let wire2: str = http_serialize_response(resp)
+    if !wire2.starts_with("HTTP/1.1 200 OK") {
+        panic("serialize_response: wire doesn't start with status line")
+    }
+    if !wire2.contains("Content-Length: 11") {
+        panic("serialize_response: missing Content-Length: 11")
+    }
+    if !wire2.contains("Connection: close") {
+        panic("serialize_response: missing Connection: close")
+    }
+    println("serialize_response OK: 200 OK, Content-Length=11, Connection=close")
+    return 0
+}
+
+# ============================================================================
+# Section 6: http_header_get / has / set / add — header list helpers.
+# ============================================================================
+
+fn test_header_helpers() -> int uses IO {
+    let h: list[HttpHeader] = []
+    let h1: list[HttpHeader] = http_header_add(h, "Host", "example.com")
+    let h2: list[HttpHeader] = http_header_add(h1, "Accept", "text/html")
+    let h3: list[HttpHeader] = http_header_add(h2, "X-Custom", "value1")
+
+    if !http_header_has(h3, "Host") {
+        panic("http_header_has(Host): expected true")
+    }
+    if !http_header_has(h3, "host") {
+        panic("http_header_has(host) case-insensitive: expected true")
+    }
+    if http_header_get(h3, "Host") != "example.com" {
+        panic("http_header_get(Host): expected example.com")
+    }
+    if http_header_get(h3, "missing") != "" {
+        panic("http_header_get(missing): expected empty")
+    }
+
+    # set replaces the first occurrence.
+    let h4: list[HttpHeader] = http_header_set(h3, "Host", "other.com")
+    if http_header_get(h4, "Host") != "other.com" {
+        panic("http_header_set: expected other.com")
+    }
+    if h4.len() != 3 {
+        panic("http_header_set: expected len 3, got " + h4.len().to_str())
+    }
+
+    # set on a missing header appends.
+    let h5: list[HttpHeader] = http_header_set(h4, "New-Header", "new-value")
+    if h5.len() != 4 {
+        panic("http_header_set (append): expected len 4, got " + h5.len().to_str())
+    }
+    if http_header_get(h5, "New-Header") != "new-value" {
+        panic("http_header_set (append): expected new-value")
+    }
+
+    println("header_helpers OK: get/has/set/add verified")
+    return 0
+}
+
+# ============================================================================
+# Section 7: http_text_response / http_html_response / http_json_response.
+# ============================================================================
+
+fn test_response_constructors() -> int uses IO {
+    let r1: HttpResponse = http_text_response(200, "hello")
+    if r1.status != 200 {
+        panic("text_response status: expected 200")
+    }
+    if r1.body != "hello" {
+        panic("text_response body: expected hello")
+    }
+    if http_header_get(r1.headers, "Content-Type") != "text/plain; charset=utf-8" {
+        panic("text_response Content-Type: expected text/plain; charset=utf-8")
+    }
+
+    let r2: HttpResponse = http_html_response(200, "<p>hi</p>")
+    if http_header_get(r2.headers, "Content-Type") != "text/html; charset=utf-8" {
+        panic("html_response Content-Type: expected text/html; charset=utf-8")
+    }
+
+    let r3: HttpResponse = http_json_response(200, "{}")
+    if http_header_get(r3.headers, "Content-Type") != "application/json; charset=utf-8" {
+        panic("json_response Content-Type: expected application/json; charset=utf-8")
+    }
+
+    println("response_constructors OK: text/html/json")
+    return 0
+}
+
+# ============================================================================
+# Section 8: http_get + http_serve (loopback integration test).
+#
+# Spawns an http_serve task on 127.0.0.1:19080, then calls http_get
+# against it. Verifies the full request -> response round-trip works
+# end-to-end through the TCP transport.
+# ============================================================================
+
+# http_server_task(port) — a tiny http_serve task that accepts ONE
+# connection and returns. The default http_handle returns a 200 OK
+# with a plain-text body describing the request.
+fn http_server_task(port: int) -> int uses IO, Net {
+    return http_serve("127.0.0.1", port, 1)
+}
+
+# test_http_get_serve() — spawn the server, call http_get, verify the
+# response. The server's default handler returns:
+#   200 OK
+#   Content-Type: text/plain; charset=utf-8
+#   method=GET
+#   path=/
+#   ...
+fn test_http_get_serve() -> int uses IO, Net, Conc {
+    let port: int = 19080
+    let server_task: Task[int] = spawn(http_server_task, port)
+
+    # Retry the http_get a few times — the server may not have called
+    # listen() yet when we first try.
+    let mut resp_body: str = ""
+    let mut attempts: int = 0
+    while attempts < 50 {
+        let r: Result[HttpResponse, str] = http_get("127.0.0.1", port, "/")
+        if result_is_ok(r) {
+            let resp: HttpResponse = result_unwrap(r)
+            if resp.status == 200 {
+                resp_body = resp.body
+                break
+            }
+        }
+        attempts = attempts + 1
+    }
+    let _rc: int = server_task.join()
+
+    if resp_body.len() == 0 {
+        panic("test_http_get_serve: no response after " + attempts.to_str() + " attempts")
+    }
+    # The default handler's body includes "method=GET" and "path=/".
+    if !resp_body.contains("method=GET") {
+        panic("test_http_get_serve: body doesn't contain 'method=GET': '" + resp_body + "'")
+    }
+    if !resp_body.contains("path=/") {
+        panic("test_http_get_serve: body doesn't contain 'path=/': '" + resp_body + "'")
+    }
+    println("http_get + http_serve OK: 200 OK, body contains 'method=GET' and 'path=/'")
+    return 0
+}
+
+# ============================================================================
+# Section 9: Parse-error handling — malformed requests return Err.
+# ============================================================================
+
+fn test_parse_errors() -> int uses IO {
+    # Missing method.
+    let r1: Result[HttpRequest, str] = http_parse_request("HTTP/1.1")
+    if result_is_ok(r1) {
+        panic("parse_errors: expected Err for 'HTTP/1.1' (no method)")
+    }
+
+    # Invalid method.
+    let r2: Result[HttpRequest, str] = http_parse_request("BOGUS / HTTP/1.1" + http_crlf() + http_crlf())
+    if result_is_ok(r2) {
+        panic("parse_errors: expected Err for method BOGUS")
+    }
+
+    # Invalid version.
+    let r3: Result[HttpRequest, str] = http_parse_request("GET / HTTP/9.9" + http_crlf() + http_crlf())
+    if result_is_ok(r3) {
+        panic("parse_errors: expected Err for version HTTP/9.9")
+    }
+
+    # No header terminator.
+    let r4: Result[HttpRequest, str] = http_parse_request("GET / HTTP/1.1" + http_crlf() + "Host: x" + http_crlf())
+    if result_is_ok(r4) {
+        panic("parse_errors: expected Err for missing blank line")
+    }
+
+    println("parse_errors OK: 4 malformed requests correctly rejected")
+    return 0
+}
+
+# ============================================================================
+# Main — run all sections in order.
+# ============================================================================
+
+fn main() -> int uses IO, Net, Conc {
+    if test_status_text() != 0 { return 1 }
+    if test_parse_request() != 0 { return 2 }
+    if test_parse_request_with_body() != 0 { return 3 }
+    if test_parse_response() != 0 { return 4 }
+    if test_serialize() != 0 { return 5 }
+    if test_header_helpers() != 0 { return 6 }
+    if test_response_constructors() != 0 { return 7 }
+    if test_http_get_serve() != 0 { return 8 }
+    if test_parse_errors() != 0 { return 9 }
+    println("ALL HTTP TESTS PASSED")
+    return 0
+}

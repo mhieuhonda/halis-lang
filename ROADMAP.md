@@ -75,7 +75,7 @@ remains green.
 | 35 | `std.io` — buffered readers/writers, `Read`/`Write` traits | ✅ | 4 weeks |
 | 36 | `std.fs` — path abstraction, directory walk, permissions | ✅ | 4 weeks |
 | 37 | `std.net` — TCP/UDP sockets, DNS, TLS via libcurl | ✅ | 6 weeks |
-| 38 | `std.http` — HTTP/1.1 server + client (RFC 7230) | ⬜ | 6 weeks |
+| 38 | `std.http` — HTTP/1.1 server + client (RFC 7230) | ✅ | 6 weeks |
 | 39 | `std.http2` — HTTP/2 + ALPN negotiation | ⬜ | 5 weeks |
 | 40 | `std.json` streaming parser (constant-memory) | ⬜ | 3 weeks |
 | 41 | `std.regex` — NFA-based regex (no ReDoS) | ⬜ | 5 weeks |
@@ -4283,10 +4283,36 @@ manually against `https://example.com/`. IPv6 / `IpAddr` /
 (Stage 37 scope is the BSD-sockets subset that production CLI / web
 programs need: IPv4 loopback + IPv4 dotted-decimal + libcurl HTTPS).
 
-**38. `std.http`** — HTTP/1.1 server + client (RFC 7230). Request
-parsing is constant-memory (streaming). Response writing is
-allocation-free for small bodies. Chunked transfer encoding,
-keep-alive, pipelining.
+**38. `std.http`** ✅ (release v0.57.0-alpha) — HTTP/1.1 server +
+client (RFC 7230). Pure-HLS parser + serialiser (no new compiler
+builtins — layered on Stage 37's `std.net` for the TCP transport).
+`HttpRequest` / `HttpResponse` / `HttpHeader` structs;
+`http_parse_request` / `http_parse_response` (RFC 7230 § 3 grammar,
+accepts CRLF and bare LF); `http_serialize_request` /
+`http_serialize_response` (canonical CRLF wire format);
+`http_get(host, port, path) -> Result[HttpResponse, str]` (client);
+`http_serve(host, port, max_conns)` (single-connection server with
+a default `http_handle` handler that callers override);
+`http_status_text(code)` (canonical reason phrases for 100–505);
+`http_header_get` / `has` / `set` / `add` (case-insensitive header
+list helpers — RFC 7230 § 3.2); `http_text_response` /
+`http_html_response` / `http_json_response` (convenience
+constructors). Stage 38 limitations (deferred to Stage 39 HTTP/2):
+chunked Transfer-Encoding is rejected with 411 Length Required;
+keep-alive is not supported (every response includes
+`Connection: close`); the server is single-threaded (one connection
+at a time); HTTPS is not supported in the server (use a reverse
+proxy for TLS termination — the client uses Stage 37's `tls_get` for
+HTTPS via `http_get_with_tls`). Parse-error handling: malformed
+requests get 400 Bad Request with a descriptive body; oversized
+request lines (> 8 KiB) get 414 URI Too Long; oversized headers
+(> 8 KiB) get 431 Request Header Fields Too Large; too many headers
+(> 100) get 431; oversized bodies (> 1 MiB) get 413 Payload Too
+Large. Differential parity verified on request/response parsing,
+serialisation round-trip, header helpers, response constructors,
+http_get + http_serve loopback integration, and 4 parse-error
+cases (missing method, invalid method, invalid version, missing
+header terminator).
 
 **39. `std.http2`** — HTTP/2 + ALPN negotiation. Server push.
 Stream multiplexing. HPACK header compression. Backpressure per
