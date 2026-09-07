@@ -8,6 +8,8 @@ Runtime values:
   enum         -> dict {"enum": <name>, "var": <variant>, "data": [payloads]}
   Chan[T]      -> HLChan (Stage 16) — shared FIFO queue, GIL-guarded
   Task[R]      -> HLTask (Stage 16) — thread join handle
+  Future[T]    -> HLChan (Stage 33) — same as Chan, cap 1, bounded
+  Stream[T]    -> HLChan (Stage 34) — same as Chan, cap N, bounded
 """
 import ctypes
 import math
@@ -19,6 +21,14 @@ import time
 INT64_MIN = -(2 ** 63)
 INT64_MAX = 2 ** 63 - 1
 B_LOW = bytes(range(0x21))  # bytes <= 0x20 used by trim
+
+# Stage 34 (v0.53.0-alpha): the end-of-stream sentinel for int streams.
+# INT64_MIN is chosen because it is the least likely "real" value in a
+# stream of computed integers (it only arises from INT64_MIN literal or
+# overflow, both of which are rare and would be bugs to send through a
+# stream anyway). The combinator workers and the user's producer both
+# use this sentinel to signal "no more values".
+INT64_MIN_SENTINEL = INT64_MIN
 
 # Stage 10 release: process-global sandbox root. When non-None, all
 # filesystem builtins (read_file, read_file_tainted, write_file,
@@ -1044,6 +1054,25 @@ class Interp:
             # the boundary ownership rule to each argument node.
             if rc[0] == "builtin" and rc[1] == "spawn":
                 return self.do_spawn(e["spawn_fn"], e["args"], env)
+            # Stage 33: async_spawn(f, args...) — like spawn, but creates
+            # a cap-1 bounded channel and returns it as a Future. The
+            # spawned task calls f(args...) and sends the result on the
+            # channel.
+            if rc[0] == "builtin" and rc[1] == "async_spawn":
+                return self.do_async_spawn(e["spawn_fn"], e["args"], env)
+            # Stage 34: gen_spawn(f, args...) -> Stream[T] — creates a
+            # bounded stream, spawns f(stream, args...), returns the stream.
+            if rc[0] == "builtin" and rc[1] == "gen_spawn":
+                return self.do_gen_spawn(e["spawn_fn"], e["args"], env)
+            # Stage 34: stream_map_int / stream_filter_int / stream_fold_int /
+            # stream_flat_map_int — each takes a Stream and a function name
+            # (recorded in spawn_fn by the checker). The worker is spawned
+            # with (in_stream, out_stream [, extra]) and calls the function.
+            if rc[0] == "builtin" and rc[1] in (
+                    "stream_map_int", "stream_filter_int",
+                    "stream_fold_int", "stream_flat_map_int"):
+                return self.do_stream_combinator(rc[1], e["spawn_fn"],
+                                                  e["args"], env)
             args = [self.eval_expr(a, env) for a in e["args"]]
             if rc[0] == "user":
                 return self.call_fn(rc[1], args)
@@ -1559,6 +1588,173 @@ class Interp:
         if name == "select":
             chans = args[0]
             return self.conc.select(chans, line)
+        # ----- Stage 33 (v0.52.0-alpha): async/await builtins -----
+        # await(fut: Future[T]) -> T — block until the future is ready,
+        # return its value. The Future is a cap-1 bounded HLChan; await
+        # is just chan.recv() on it.
+        if name == "await":
+            fut = args[0]
+            return self.conc.recv(fut, line)
+        # future_ready(v: T) -> Future[T] — make an immediately-ready
+        # future. Create a cap-1 chan and send the value; the recv()
+        # in await() will find it instantly.
+        if name == "future_ready":
+            v = args[0]
+            ch = HLChan(1)
+            self.conc.register(ch)
+            self.conc.send(ch, v)
+            return ch
+        # future_poll(fut: Future[T]) -> Option[T] — non-blocking poll.
+        # Returns Some(v) if the future is ready, None otherwise.
+        if name == "future_poll":
+            fut = args[0]
+            with self.conc.cv:
+                if fut.q:
+                    v = fut.q.pop(0)
+                    self.conc.msgs -= 1
+                    self.conc.cv.notify_all()
+                    return {"enum": "Option", "var": "Some", "data": [v]}
+            return {"enum": "Option", "var": "None", "data": []}
+        # future_select(futs: list[Future[T]]) -> int — race multiple
+        # futures; return the index of the first ready one. Same as
+        # select() but on Futures (which are channels under the hood).
+        if name == "future_select":
+            futs = args[0]
+            return self.conc.select(futs, line)
+        # ----- Stage 34 (v0.53.0-alpha): async stream builtins -----
+        # stream_new(cap: int) -> Stream[T] — bounded stream.
+        if name == "stream_new":
+            cap = args[0]
+            if cap < 1:
+                raise HLPanic(
+                    "stream_new() capacity must be >= 1, got %d" % cap,
+                    line)
+            ch = HLChan(cap)
+            self.conc.register(ch)
+            return ch
+        # stream_send(s: Stream[T], v: T) — push a value (backpressure).
+        if name == "stream_send":
+            s = args[0]
+            v = args[1]
+            # Boundary ownership: deep-clone owned values unless fresh.
+            # The checker already rejected bare ident reads of owned
+            # types; if we reach here, the value is either a primitive,
+            # a clone(...) result, or a fresh expression result.
+            self.conc.send(s, v)
+            return None
+        # stream_recv(s: Stream[T]) -> T — block until a value is available.
+        if name == "stream_recv":
+            s = args[0]
+            return self.conc.recv(s, line)
+        # stream_try_recv(s: Stream[T], default: T) -> T — non-blocking.
+        if name == "stream_try_recv":
+            s = args[0]
+            default = args[1]
+            return self.conc.recv_or(s, default)
+        # stream_len(s: Stream[T]) -> int — pending message count.
+        if name == "stream_len":
+            s = args[0]
+            with self.conc.cv:
+                return len(s.q)
+        # stream_close(s: Stream[T]) — signal end-of-stream.
+        # For int streams, send INT64_MIN (the sentinel). For other
+        # element types, this is a no-op (the user must send the
+        # appropriate sentinel via stream_send). The builtin exists so
+        # the type checker can validate the user remembered to close.
+        # We send the int sentinel regardless — it's harmless on
+        # non-int streams (the value is just a sentinel the consumer
+        # checks for, and non-int consumers don't check).
+        if name == "stream_close":
+            s = args[0]
+            self.conc.send(s, INT64_MIN_SENTINEL)
+            return None
+        # stream_take_int(in_s, n) -> Stream[int] — create an output
+        # stream, spawn a worker that forwards the first n values then
+        # sends the sentinel. The checker did NOT rewrite this node
+        # (no fn-name argument), so we handle it here directly.
+        if name == "stream_take_int":
+            in_s = args[0]
+            n = args[1]
+            out_s = HLChan(16)
+            self.conc.register(out_s)
+            conc = self.conc
+            interp = self
+
+            def take_runner():
+                try:
+                    count = 0
+                    while count < n:
+                        v = conc.recv(in_s, interp.line)
+                        if v == INT64_MIN_SENTINEL:
+                            break
+                        conc.send(out_s, v)
+                        count = count + 1
+                    conc.send(out_s, INT64_MIN_SENTINEL)
+                except HLPanic as ex:
+                    interp.out.flush()
+                    sys.stderr.write("panic: %s (at line %d)\n"
+                                     % (to_display(ex.msg), ex.line))
+                    os._exit(101)
+                except BaseException as ex:
+                    interp.out.flush()
+                    sys.stderr.write("panic: %s (in stream_take)\n" % ex)
+                    os._exit(101)
+                with conc.cv:
+                    conc.tasks_alive -= 1
+                    conc.cv.notify_all()
+
+            with self.conc.cv:
+                self.conc.tasks_alive += 1
+            t = threading.Thread(target=take_runner)
+            t.daemon = True
+            t.start()
+            return out_s
+        # stream_merge_int(a, b) -> Stream[int] — interleave two streams.
+        if name == "stream_merge_int":
+            a = args[0]
+            b = args[1]
+            out_s = HLChan(16)
+            self.conc.register(out_s)
+            conc = self.conc
+            interp = self
+
+            def merge_runner():
+                try:
+                    a_done = False
+                    b_done = False
+                    while not a_done or not b_done:
+                        if not a_done:
+                            v = conc.recv(a, interp.line)
+                            if v == INT64_MIN_SENTINEL:
+                                a_done = True
+                            else:
+                                conc.send(out_s, v)
+                        if not b_done:
+                            v = conc.recv(b, interp.line)
+                            if v == INT64_MIN_SENTINEL:
+                                b_done = True
+                            else:
+                                conc.send(out_s, v)
+                    conc.send(out_s, INT64_MIN_SENTINEL)
+                except HLPanic as ex:
+                    interp.out.flush()
+                    sys.stderr.write("panic: %s (at line %d)\n"
+                                     % (to_display(ex.msg), ex.line))
+                    os._exit(101)
+                except BaseException as ex:
+                    interp.out.flush()
+                    sys.stderr.write("panic: %s (in stream_merge)\n" % ex)
+                    os._exit(101)
+                with conc.cv:
+                    conc.tasks_alive -= 1
+                    conc.cv.notify_all()
+
+            with self.conc.cv:
+                self.conc.tasks_alive += 1
+            t = threading.Thread(target=merge_runner)
+            t.daemon = True
+            t.start()
+            return out_s
         raise HLPanic("unknown builtin function: %s" % name, line)
 
     # ---------- Stage 16: spawn ----------
@@ -1624,6 +1820,224 @@ class Interp:
         task.thread = t
         t.start()
         return task
+
+    # ---------- Stage 33 (v0.52.0-alpha): async_spawn ----------
+    def do_async_spawn(self, fn_key, arg_nodes, env):
+        """async_spawn(f, a1..aN) -> Future[R] — like spawn, but the
+        result is delivered via a cap-1 bounded channel (the Future).
+
+        The Future is represented at runtime as an HLChan with cap=1
+        (bounded — backpressure: the producing task blocks at send time
+        until the consumer takes the value, ensuring no unbounded
+        buffering). The spawned task calls f(args...) and sends the
+        result on the channel; await(fut) is a chan.recv().
+
+        Boundary ownership rule: same as do_spawn (deep-copy owned
+        values unless syntactically clone(...) or fresh).
+        """
+        # Evaluate + boundary-clone the arguments (same logic as do_spawn).
+        values = []
+        for a in arg_nodes:
+            v = self.eval_expr(a, env)
+            if isinstance(v, (list, dict)) and not (
+                    a.get("k") == "call" and a.get("name") == "clone"):
+                v = self.deep_clone(v)
+            values.append(v)
+        # Create the result channel (cap 1, bounded).
+        result_chan = HLChan(1)
+        self.conc.register(result_chan)
+        conc = self.conc
+        interp = self
+
+        def runner():
+            try:
+                result = interp.call_fn(fn_key, values)
+                # Send the result on the channel. On a cap-1 bounded
+                # channel this blocks until the consumer takes it
+                # (backpressure — the producer does not race ahead).
+                # The result may be a primitive (int/float/bool/str)
+                # or a heap value (list/dict). Channels deep-clone
+                # owned values at the send boundary (same rule as
+                # chan.send) — but our `result` is FRESH (the callee
+                # just returned it), so no defensive clone is needed.
+                conc.send(result_chan, result)
+            except HLPanic as ex:
+                interp.out.flush()
+                sys.stderr.write("panic: %s (at line %d)\n"
+                                 % (to_display(ex.msg), ex.line))
+                os._exit(101)
+            except SystemExit as ex:
+                interp.out.flush()
+                code = ex.code if isinstance(ex.code, int) else 0
+                os._exit(code & 0xFF)
+            except BaseException as ex:
+                interp.out.flush()
+                sys.stderr.write("panic: %s (in async task)\n" % ex)
+                os._exit(101)
+            # Note: we do NOT call conc.task_finished here because
+            # async_spawn does not return a Task join handle — the
+            # caller awaits the Future (the result channel) instead.
+            # But we MUST decrement tasks_alive so the deadlock
+            # detector's "alive" count stays correct.
+            with conc.cv:
+                conc.tasks_alive -= 1
+                conc.cv.notify_all()
+
+        with conc.cv:
+            conc.tasks_alive += 1
+        t = threading.Thread(target=runner)
+        t.daemon = True
+        t.start()
+        # The Future IS the result channel (same runtime representation).
+        return result_chan
+
+    # ---------- Stage 34 (v0.53.0-alpha): gen_spawn ----------
+    def do_gen_spawn(self, fn_key, arg_nodes, env):
+        """gen_spawn(f, args...) -> Stream[T] — create a bounded stream,
+        spawn f(stream, args...), return the stream.
+
+        The target function f must take the Stream as its FIRST parameter
+        (the checker enforces this). The generator writes values into the
+        stream via stream_send and signals end-of-stream via stream_close
+        (which sends a sentinel — for int streams, INT64_MIN).
+        """
+        # Default capacity for generator streams: 16 (bounded — backpressure
+        # without excessive latency). The user can override by creating the
+        # stream manually with stream_new(cap) and spawning the generator
+        # with plain spawn().
+        stream = HLChan(16)
+        self.conc.register(stream)
+        # Build the argument list: stream first, then the user's args.
+        values = [stream]
+        for a in arg_nodes:
+            v = self.eval_expr(a, env)
+            if isinstance(v, (list, dict)) and not (
+                    a.get("k") == "call" and a.get("name") == "clone"):
+                v = self.deep_clone(v)
+            values.append(v)
+        conc = self.conc
+        interp = self
+
+        def runner():
+            try:
+                # The generator function takes (stream, args...) and
+                # returns void (it just writes to the stream).
+                interp.call_fn(fn_key, values)
+            except HLPanic as ex:
+                interp.out.flush()
+                sys.stderr.write("panic: %s (at line %d)\n"
+                                 % (to_display(ex.msg), ex.line))
+                os._exit(101)
+            except SystemExit as ex:
+                interp.out.flush()
+                code = ex.code if isinstance(ex.code, int) else 0
+                os._exit(code & 0xFF)
+            except BaseException as ex:
+                interp.out.flush()
+                sys.stderr.write("panic: %s (in generator task)\n" % ex)
+                os._exit(101)
+            with conc.cv:
+                conc.tasks_alive -= 1
+                conc.cv.notify_all()
+
+        with conc.cv:
+            conc.tasks_alive += 1
+        t = threading.Thread(target=runner)
+        t.daemon = True
+        t.start()
+        return stream
+
+    # ---------- Stage 34: stream combinators ----------
+    def do_stream_combinator(self, kind, fn_key, arg_nodes, env):
+        """stream_map_int / stream_filter_int / stream_fold_int /
+        stream_flat_map_int — each spawns a worker that reads from the
+        input stream, applies fn_key, and writes to the output stream
+        (or, for fold, accumulates and returns the final value).
+
+        For map/filter/flat_map: creates an output Stream[int] (cap 16),
+        spawns a worker, returns the output stream. The pipeline runs
+        concurrently — the consumer of the output stream pulls values
+        as needed, and backpressure propagates through the bounded
+        channels.
+
+        For fold: BLOCKS the caller (drains the input stream to
+        completion, applying fn_key to accumulate). Returns int.
+        """
+        # Evaluate the input stream argument.
+        in_stream = self.eval_expr(arg_nodes[0], env)
+        if kind == "stream_fold_int":
+            # Blocking fold: drain the stream, apply fn_key(acc, v), return acc.
+            init = self.eval_expr(arg_nodes[1], env)
+            acc = init
+            while True:
+                v = self.conc.recv(in_stream, self.line)
+                # Sentinel check: INT64_MIN signals end-of-stream.
+                if v == INT64_MIN_SENTINEL:
+                    break
+                acc = self.call_fn(fn_key, [acc, v])
+            return acc
+        # map / filter / flat_map: create output stream, spawn worker.
+        out_stream = HLChan(16)
+        self.conc.register(out_stream)
+        conc = self.conc
+        interp = self
+
+        def runner():
+            try:
+                if kind == "stream_map_int":
+                    while True:
+                        v = conc.recv(in_stream, interp.line)
+                        if v == INT64_MIN_SENTINEL:
+                            conc.send(out_stream, INT64_MIN_SENTINEL)
+                            return
+                        r = interp.call_fn(fn_key, [v])
+                        conc.send(out_stream, r)
+                elif kind == "stream_filter_int":
+                    while True:
+                        v = conc.recv(in_stream, interp.line)
+                        if v == INT64_MIN_SENTINEL:
+                            conc.send(out_stream, INT64_MIN_SENTINEL)
+                            return
+                        keep = interp.call_fn(fn_key, [v])
+                        if keep:
+                            conc.send(out_stream, v)
+                elif kind == "stream_flat_map_int":
+                    while True:
+                        v = conc.recv(in_stream, interp.line)
+                        if v == INT64_MIN_SENTINEL:
+                            conc.send(out_stream, INT64_MIN_SENTINEL)
+                            return
+                        # fn_key(v) returns a Stream[int] (an HLChan).
+                        inner = interp.call_fn(fn_key, [v])
+                        # Forward all values from the inner stream.
+                        while True:
+                            iv = conc.recv(inner, interp.line)
+                            if iv == INT64_MIN_SENTINEL:
+                                break
+                            conc.send(out_stream, iv)
+            except HLPanic as ex:
+                interp.out.flush()
+                sys.stderr.write("panic: %s (at line %d)\n"
+                                 % (to_display(ex.msg), ex.line))
+                os._exit(101)
+            except SystemExit as ex:
+                interp.out.flush()
+                code = ex.code if isinstance(ex.code, int) else 0
+                os._exit(code & 0xFF)
+            except BaseException as ex:
+                interp.out.flush()
+                sys.stderr.write("panic: %s (in stream combinator)\n" % ex)
+                os._exit(101)
+            with conc.cv:
+                conc.tasks_alive -= 1
+                conc.cv.notify_all()
+
+        with conc.cv:
+            conc.tasks_alive += 1
+        t = threading.Thread(target=runner)
+        t.daemon = True
+        t.start()
+        return out_stream
 
     def deep_clone(self, v, _seen=None):
         """Deep-copy an HLS runtime value (Stage-0 / Python)."""

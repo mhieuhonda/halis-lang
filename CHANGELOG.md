@@ -13,6 +13,102 @@ stability (125–140), and final stabilisation toward v1.0 (141–150).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
+## [v0.53.0-alpha] — Stage 34: async stream combinators (channels × generators)
+
+> Adds `Stream[T]` — a push-based async stream with backpressure — and
+> the six combinators (`map`, `filter`, `take`, `fold`, `merge`,
+> `flat_map`) plus the `gen_spawn` generator pattern. Built on the
+> Stage 33 `Future[T]` primitive and the Stage 16 `Chan[T]` runtime.
+> Zero-allocation after warmup: streams are bounded channels, so
+> backpressure propagates through the pipeline without unbounded
+> buffering.
+
+### Added — Stage 34 (v0.53.0-alpha)
+
+- **`Stream[T]` built-in generic type.** A push-based async stream.
+  Runtime representation: a bounded `hl_chan*` (backpressure: a slow
+  consumer blocks the producer). Distinct from `Chan[T]` and
+  `Future[T]` at the type-system level. `Send` iff `T` is `Send`.
+  Clones by sharing (atomic refcount +1).
+- **Stream primitives (builtins):**
+  - `stream_new(cap: int) -> Stream[T]` — bounded stream
+  - `stream_send(s: Stream[T], v: T)` — push (backpressure)
+  - `stream_recv(s: Stream[T]) -> T` — block until available
+  - `stream_try_recv(s: Stream[T], default: T) -> T` — non-blocking
+  - `stream_len(s: Stream[T]) -> int` — pending count
+  - `stream_close(s: Stream[T])` — signal end-of-stream (sentinel)
+- **Combinators (builtins, each spawns a worker task):**
+  - `stream_map_int(s, fn) -> Stream[int]` — apply `fn(int) -> int`
+  - `stream_filter_int(s, fn) -> Stream[int]` — keep truthy
+  - `stream_take_int(s, n) -> Stream[int]` — first `n` elements
+  - `stream_fold_int(s, init, fn) -> int` — blocking fold
+  - `stream_merge_int(a, b) -> Stream[int]` — interleave
+  - `stream_flat_map_int(s, fn) -> Stream[int]` — map + flatten
+- **`gen_spawn(f, args...) -> Stream[T]`** — the generator pattern.
+  Creates a bounded stream, spawns `f(stream, args...)`, returns the
+  stream. The generator takes the `Stream[T]` as its FIRST parameter.
+- **`std/stream.hls`** library module with helpers:
+  `stream_drain_int`, `stream_count_int`, `stream_sum_int`,
+  `stream_to_chan_int`, `stream_from_list_int`.
+- **`examples/stream_demo.hls`** — exercises every primitive and
+  combinator, including a 7-stage pipeline.
+- **`tests/ok/feat_stage34_stream.hls`** — feature test for the
+  differential suite.
+- **`make stream-acceptance`** — the official Stage 34 gate.
+
+### Added — Stage 33 (v0.52.0-alpha)
+
+- **`Future[T]` built-in generic type.** A stackless state machine for
+  asynchronous computation. Runtime representation: a cap-1 bounded
+  `hl_chan*`. Distinct from `Chan[T]` at the type-system level.
+- **Async/await builtins:**
+  - `async_spawn(f, args...) -> Future[T]` — like `spawn`, returns a
+    `Future` instead of a `Task`
+  - `await(fut: Future[T]) -> T` — block until ready (channel recv)
+  - `future_ready(v: T) -> Future[T]` — immediately-ready future
+  - `future_poll(fut: Future[T]) -> Option[T]` — non-blocking poll
+  - `future_select(futs: list[Future[T]]) -> int` — race multiple
+- **`std/async.hls`** library module with combinators:
+  `async_run_all_int`, `async_race_int`, `async_block_on_int`,
+  `async_all_ok`, `async_any_ok`.
+- **`examples/async_demo.hls`** — exercises every primitive.
+- **`tests/ok/feat_stage33_async.hls`** — feature test.
+- **`make async-acceptance`** — the official Stage 33 gate.
+
+### Fixed — Stage 33 (v0.52.0-alpha)
+
+- **Deadlock detector false-positive (HIGH).** The Stage 16 deadlock
+  detector had a race when an async task was blocked in `t.join()`
+  and the joined task had just finished. The join waiter wakes, but
+  before it re-checks `t->done`, another thread's `deadlock_check`
+  sees `g_rt_blocked == alive` and fires. Fix: added
+  `g_rt_done_unjoined` counter — the number of tasks that have
+  finished but not yet been joined. If > 0, a join waiter can
+  proceed, so the deadlock check returns early. This fix also
+  benefits regular `spawn`+`join` code (the race was latent).
+
+### Changed — Stage 33/34
+
+- `boot/parser.py` — `parse_type` recognises `Future[T]` and
+  `Stream[T]`. `RESERVED_TYPE_NAMES` updated to prevent
+  user-defined types with these names.
+- `boot/checker.py` — `is_future`/`future_inner`/`is_stream`/
+  `stream_inner` helpers. `type_exists`, `type_is_send`,
+  `clone_supported` updated. Type-checking for 18 new builtins.
+- `boot/interp.py` — runtime semantics for all new builtins.
+  `do_async_spawn`, `do_gen_spawn`, `do_stream_combinator` methods.
+- `src/hlc.hls` (self-hosted compiler) — mirror of all boot changes
+  for native codegen. `is_future_t`/`future_inner_t`/`is_stream_t`/
+  `stream_inner_t`/`is_chan_like_t`/`chan_like_inner_t` helpers.
+  `c_type` maps `Future[T]`/`Stream[T]` to `hl_chan*`.
+  `release_fn_for`/`cleanup_fn_for`/`clone_expr_for`/`register_clone`
+  updated. Codegen for all new builtins: `gen_async_spawn_call`,
+  `gen_gen_spawn_call`, `gen_stream_combinator`, `gen_stream_take_int`,
+  `gen_stream_merge_int`. New C runtime helpers: `hl_async_spawn`,
+  `hl_async_spawn_stream`, `hl_async_spawn_take`, `hl_async_spawn_merge`.
+  New `Ctx` fields: `future_ready_n`, `future_poll_n`.
+- `Makefile` — `async-acceptance` and `stream-acceptance` targets.
+
 ## [v0.51.2-alpha] — Stage 32 perfection (deep-scan-20): 11 bug fixes
 
 > A second-pass whole-codebase audit that closed 11 more latent

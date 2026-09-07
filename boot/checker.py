@@ -82,6 +82,37 @@ def task_inner(t):
     return t[5:-1]
 
 
+# Stage 33 (v0.52.0-alpha): built-in async/await wrappers.
+# `Future[T]` — a stackless state machine for asynchronous computation.
+# Runtime representation: a `hl_chan*` of capacity 1 (bounded — backpressure
+# ensures the producing task is not unbounded-buffered). The "ready" state
+# is implicit: a future is ready when its underlying channel has a pending
+# message. An immediately-ready future (future_ready(v)) simply has the
+# value pre-sent on the channel.
+#
+# Distinct from Chan[T] at the type-system level so the user cannot
+# accidentally call chan.send on a future. The runtime representation is
+# identical (a channel is a channel), which keeps the codegen simple.
+def is_future(t):
+    return t.startswith("Future[")
+
+
+def future_inner(t):
+    return t[7:-1]
+
+
+# Stage 34 (v0.53.0-alpha): built-in async stream type.
+# `Stream[T]` — push-based async analogue of Chan[T]. Runtime representation:
+# a `hl_chan*` (bounded — backpressure: a slow consumer blocks the producer).
+# Distinct from Chan[T] and Future[T] at the type-system level.
+def is_stream(t):
+    return t.startswith("Stream[")
+
+
+def stream_inner(t):
+    return t[7:-1]
+
+
 # NOTE: is_taint / taint_inner / is_tainted_type / list_taint_inner are
 # defined ONCE near the top of this file (BUG-SC-12 consolidation). Do NOT
 # add duplicate definitions below — they would silently shadow the aliases.
@@ -207,6 +238,25 @@ BUILTIN_FNS = {
     # Stage 16 (v0.27.0-alpha): concurrency builtins. Stage-16
     # perfection (v0.29.0-alpha) adds chan_new_bounded.
     "chan_new", "chan_new_bounded", "spawn", "select",
+    # Stage 33 (v0.52.0-alpha): async/await builtins. async_spawn is
+    # like spawn but returns Future[T] (a cap-1 bounded channel
+    # carrying the result). await blocks on a future's result.
+    # future_ready makes an immediately-ready future. future_poll is
+    # non-blocking. future_select races multiple futures.
+    "async_spawn", "await", "future_ready", "future_poll",
+    "future_select",
+    # Stage 34 (v0.53.0-alpha): async stream builtins. stream_new
+    # creates a bounded stream. stream_send/recv/try_recv/len are the
+    # primitives. stream_close signals end-of-stream. The combinators
+    # (stream_map_int / stream_filter_int / stream_take_int /
+    # stream_fold_int / stream_merge_int / stream_flat_map_int) are
+    # also builtins because they spawn a worker that calls a named
+    # function (HLS has no closures).
+    "stream_new", "stream_send", "stream_recv", "stream_try_recv",
+    "stream_len", "stream_close",
+    "stream_map_int", "stream_filter_int", "stream_take_int",
+    "stream_fold_int", "stream_merge_int", "stream_flat_map_int",
+    "gen_spawn",
     # Stage 19 (v0.35.0-alpha): O(n) string join — the accumulating
     # `a + b` concat is quadratic when building large outputs, which
     # dominated the bootstrap's compile time. The builtin joins a
@@ -268,6 +318,27 @@ BUILTIN_EFFECTS = {
     "chan_new_bounded": {"Conc"},
     "spawn":            {"Conc"},
     "select":           {"Conc"},
+    # Stage 33 (v0.52.0-alpha): async/await — all carry Conc (they
+    # drive the same concurrency runtime as spawn/chan).
+    "async_spawn":      {"Conc"},
+    "await":            {"Conc"},
+    "future_ready":     {"Conc"},
+    "future_poll":      {"Conc"},
+    "future_select":    {"Conc"},
+    # Stage 34 (v0.53.0-alpha): async streams — same Conc effect.
+    "stream_new":            {"Conc"},
+    "stream_send":           {"Conc"},
+    "stream_recv":           {"Conc"},
+    "stream_try_recv":       {"Conc"},
+    "stream_len":            {"Conc"},
+    "stream_close":          {"Conc"},
+    "stream_map_int":        {"Conc"},
+    "stream_filter_int":     {"Conc"},
+    "stream_take_int":       {"Conc"},
+    "stream_fold_int":       {"Conc"},
+    "stream_merge_int":      {"Conc"},
+    "stream_flat_map_int":   {"Conc"},
+    "gen_spawn":             {"Conc"},
     # Builtin METHODS with effects (the first method-level effects —
     # previously all I/O lived in builtin functions):
     "chan.send":     {"Conc"},
@@ -396,6 +467,14 @@ class Checker:
             if inner == "void":
                 return True
             return self.type_exists(inner, node)
+        if is_future(t):
+            # Stage 33: Future[T] is a built-in generic wrapper. T must
+            # exist and cannot be void (a future carries a value).
+            return self.type_exists(future_inner(t), node)
+        if is_stream(t):
+            # Stage 34: Stream[T] is a built-in generic wrapper. T must
+            # exist and cannot be void.
+            return self.type_exists(stream_inner(t), node)
         base = type_base(t)
         args = type_args(t)
         if base in self.structs or base in self.enums:
@@ -2748,6 +2827,439 @@ class Checker:
                          % list_elem(at), e)
             self.edges[self.cur_fn].add("b:select")
             return "int"
+        # ----- Stage 33 (v0.52.0-alpha): async/await builtins -----
+        # async_spawn(f, a1, ..., aN) -> Future[R] — like spawn, but
+        # returns a Future (a cap-1 bounded channel carrying the result).
+        # The first argument is a function NAME (identifier), not a value.
+        # The target function must NOT return void — a future carries a
+        # value. (For a void-returning task, use plain spawn().)
+        if name == "async_spawn":
+            if len(args) < 1:
+                self.err("async_spawn() expects a function name followed "
+                         "by its arguments", e)
+            fn_arg = args[0]
+            if fn_arg["k"] != "ident":
+                self.err("async_spawn() argument 1 must be a function name "
+                         "(an identifier), got a %s expression" % fn_arg["k"], e)
+            fname = fn_arg["name"]
+            if fname in BUILTIN_FNS:
+                self.err("async_spawn() target cannot be a builtin function: "
+                         "%s" % fname, e)
+            if fname not in self.fns:
+                self.err("async_spawn() target function does not exist: %s"
+                         % fname, e)
+            tfn = self.fns[fname]
+            if tfn["struct"] is not None:
+                self.err("async_spawn() target cannot be a method: %s (methods "
+                         "need a self receiver — async_spawn a free function)"
+                         % fname, e)
+            if tfn.get("typeparams"):
+                self.err("async_spawn() of generic functions is not supported "
+                         "yet: %s (wrap it in a non-generic fn)" % fname, e)
+            if tfn.get("extern", False):
+                self.err("async_spawn() of extern (FFI) functions is not "
+                         "supported", e)
+            if tfn["ret"] == "void":
+                self.err("async_spawn() target %s returns void — a Future "
+                         "must carry a value (use plain spawn() for void "
+                         "tasks)" % fname, e)
+            params = tfn["params"]
+            vargs = args[1:]
+            if len(vargs) != len(params):
+                self.err("async_spawn() target %s expects %d arguments, got %d"
+                         % (fname, len(params), len(vargs)), e)
+            for i, (a, (pn, pt, _)) in enumerate(zip(vargs, params)):
+                at = self.check_expr(a, env, pt)
+                if at == "never":
+                    continue
+                if at != pt:
+                    self.err("async_spawn() argument '%s' of %s expects %s, "
+                             "got %s" % (pn, fname, pt, at), a)
+                if not self.type_is_send(pt):
+                    self.err("type %s is not Send: values of this type cannot "
+                             "cross a task boundary (async_spawn)" % pt, a)
+                if is_owned_type(pt) and a["k"] in ("ident", "field", "index"):
+                    what = ("variable '" + a["name"] + "'") if a["k"] == "ident" \
+                        else "a borrowed value"
+                    self.err(
+                        "cannot share %s across tasks: async_spawn() argument "
+                        "%d reads it directly — pass clone(x) or take(x). "
+                        "Data-race freedom: no owned value may be simultaneously "
+                        "released by two threads." % (what, i + 2), a)
+            self.edges[self.cur_fn].add("b:async_spawn")
+            # The spawned function's effects reach the spawner (same
+            # soundness rule as spawn).
+            self.edges[self.cur_fn].add(fname)
+            # Rewrite the node: drop the fn-name argument, record the
+            # target so the interpreter / codegen never evaluates the
+            # function name as a value. mkey "async_spawn" dispatches to
+            # the async_spawn codegen path.
+            e["args"] = vargs
+            e["spawn_fn"] = fname
+            return "Future[%s]" % tfn["ret"]
+        # await(fut: Future[T]) -> T — block until the future is ready,
+        # return its value. The argument must be a Future[T].
+        if name == "await":
+            need(1)
+            at = argt(0, None)
+            if not is_future(at):
+                self.err("await() expects a Future[T], got %s" % at, e)
+            self.edges[self.cur_fn].add("b:await")
+            return future_inner(at)
+        # future_ready(v: T) -> Future[T] — make an immediately-ready
+        # future. Contextual typing: T is inferred from the surrounding
+        # Future[T] type (like chan_new).
+        if name == "future_ready":
+            need(1)
+            if expected is None or not is_future(expected):
+                self.err("future_ready() requires a 'Future[T]' type in the "
+                         "surrounding context", e)
+            want_t = future_inner(expected)
+            at = argt(0, want_t)
+            if at != want_t:
+                self.err("future_ready() argument expects %s, got %s"
+                         % (want_t, at), e)
+            if not self.type_is_send(want_t):
+                self.err("type %s is not Send: a future's value crosses a "
+                         "task boundary" % want_t, e)
+            self.edges[self.cur_fn].add("b:future_ready")
+            return expected
+        # future_poll(fut: Future[T]) -> Option[T] — non-blocking poll.
+        # Returns Some(v) if the future is ready, None otherwise.
+        if name == "future_poll":
+            need(1)
+            at = argt(0, None)
+            if not is_future(at):
+                self.err("future_poll() expects a Future[T], got %s" % at, e)
+            self.edges[self.cur_fn].add("b:future_poll")
+            return "Option[%s]" % future_inner(at)
+        # future_select(futs: list[Future[T]]) -> int — race multiple
+        # futures; return the index of the first ready one.
+        if name == "future_select":
+            need(1)
+            at = argt(0, None)
+            if not is_list(at) or not is_future(list_elem(at)):
+                self.err("future_select() expects a list[Future[T]], got %s"
+                         % at, e)
+            if not self.type_is_send(future_inner(list_elem(at))):
+                self.err("future_select() future element type %s is not Send"
+                         % future_inner(list_elem(at)), e)
+            self.edges[self.cur_fn].add("b:future_select")
+            return "int"
+        # ----- Stage 34 (v0.53.0-alpha): async stream builtins -----
+        # stream_new(cap: int) -> Stream[T] — bounded stream (backpressure).
+        # Contextual typing: T from the surrounding Stream[T] type.
+        if name == "stream_new":
+            need(1)
+            at = argt(0, "int")
+            if at != "int":
+                self.err("stream_new() capacity expects int, got %s" % at, e)
+            cap_arg = args[0]
+            if cap_arg["k"] == "int" and cap_arg["v"] < 1:
+                self.err("stream_new() capacity must be >= 1, got literal %d"
+                         % cap_arg["v"], e)
+            if expected is None or not is_stream(expected):
+                self.err("stream_new() requires a 'Stream[T]' type in the "
+                         "surrounding context", e)
+            if not self.type_is_send(stream_inner(expected)):
+                self.err("stream_new() element type %s is not Send"
+                         % stream_inner(expected), e)
+            self.edges[self.cur_fn].add("b:stream_new")
+            return expected
+        # stream_send(s: Stream[T], v: T) — push a value (backpressure).
+        if name == "stream_send":
+            need(2)
+            st = argt(0, None)
+            if not is_stream(st):
+                self.err("stream_send() argument 1 expects Stream[T], got %s"
+                         % st, e)
+            et = stream_inner(st)
+            at = argt(1, et)
+            if at != et:
+                self.err("stream_send() argument 2 expects %s, got %s"
+                         % (et, at), e)
+            if not self.type_is_send(et):
+                self.err("type %s is not Send: stream values cross a task "
+                         "boundary" % et, args[1])
+            if is_owned_type(et) and args[1]["k"] in ("ident", "field", "index"):
+                what = ("variable '" + args[1]["name"] + "'") \
+                    if args[1]["k"] == "ident" else "a borrowed value"
+                self.err("cannot share %s across tasks: stream_send() reads "
+                         "it directly — pass clone(x) or take(x)" % what, args[1])
+            self.edges[self.cur_fn].add("b:stream_send")
+            return "void"
+        # stream_recv(s: Stream[T]) -> T — block until a value is available.
+        if name == "stream_recv":
+            need(1)
+            st = argt(0, None)
+            if not is_stream(st):
+                self.err("stream_recv() expects Stream[T], got %s" % st, e)
+            self.edges[self.cur_fn].add("b:stream_recv")
+            return stream_inner(st)
+        # stream_try_recv(s: Stream[T], default: T) -> T — non-blocking.
+        if name == "stream_try_recv":
+            need(2)
+            st = argt(0, None)
+            if not is_stream(st):
+                self.err("stream_try_recv() argument 1 expects Stream[T], "
+                         "got %s" % st, e)
+            et = stream_inner(st)
+            at = argt(1, et)
+            if at != et:
+                self.err("stream_try_recv() argument 2 expects %s, got %s"
+                         % (et, at), e)
+            self.edges[self.cur_fn].add("b:stream_try_recv")
+            return et
+        # stream_len(s: Stream[T]) -> int — pending message count.
+        if name == "stream_len":
+            need(1)
+            st = argt(0, None)
+            if not is_stream(st):
+                self.err("stream_len() expects Stream[T], got %s" % st, e)
+            self.edges[self.cur_fn].add("b:stream_len")
+            return "int"
+        # stream_close(s: Stream[T]) — signal end-of-stream by sending a
+        # sentinel. The sentinel convention is per-element-type (documented
+        # in std/stream.hls). For int streams, the sentinel is INT64_MIN.
+        # The builtin itself just records the edge; the actual sentinel
+        # send happens in the producer (the user calls stream_send with
+        # the sentinel value). This builtin is a no-op at the runtime
+        # level — it exists so the type checker can validate that the
+        # user remembered to close the stream (a stream without a close
+        # call leaks the producer task). Lint stage 35+ will enforce this.
+        if name == "stream_close":
+            need(1)
+            st = argt(0, None)
+            if not is_stream(st):
+                self.err("stream_close() expects Stream[T], got %s" % st, e)
+            self.edges[self.cur_fn].add("b:stream_close")
+            return "void"
+        # stream_map_int(in_s: Stream[int], fn_name) -> Stream[int] —
+        # spawn a worker that applies fn_name to each element.
+        # fn_name is a function identifier (like spawn's first arg).
+        # The target fn must have signature `fn(int) -> int`.
+        if name == "stream_map_int" or name == "stream_filter_int":
+            need(2)
+            st = argt(0, None)
+            if not is_stream(st) or stream_inner(st) != "int":
+                self.err("%s() argument 1 expects Stream[int], got %s"
+                         % (name, st), e)
+            fn_arg = args[1]
+            if fn_arg["k"] != "ident":
+                self.err("%s() argument 2 must be a function name "
+                         "(an identifier), got a %s expression"
+                         % (name, fn_arg["k"]), e)
+            fname = fn_arg["name"]
+            if fname in BUILTIN_FNS:
+                self.err("%s() target cannot be a builtin function: %s"
+                         % (name, fname), e)
+            if fname not in self.fns:
+                self.err("%s() target function does not exist: %s"
+                         % (name, fname), e)
+            tfn = self.fns[fname]
+            if tfn["struct"] is not None:
+                self.err("%s() target cannot be a method: %s"
+                         % (name, fname), e)
+            if tfn.get("typeparams") or tfn.get("extern", False):
+                self.err("%s() target must be a non-generic, non-extern "
+                         "function: %s" % (name, fname), e)
+            params = tfn["params"]
+            if len(params) != 1 or params[0][1] != "int" or tfn["ret"] != "int":
+                self.err("%s() target %s must have signature "
+                         "fn(int) -> int" % (name, fname), e)
+            if expected is None or not is_stream(expected) \
+                    or stream_inner(expected) != "int":
+                self.err("%s() requires a 'Stream[int]' type in the "
+                         "surrounding context" % name, e)
+            self.edges[self.cur_fn].add("b:" + name)
+            self.edges[self.cur_fn].add(fname)
+            # Rewrite: drop the fn-name argument, record the target.
+            e["args"] = [args[0]]
+            e["spawn_fn"] = fname
+            return expected
+        # stream_take_int(in_s: Stream[int], n: int) -> Stream[int] —
+        # take the first n values, then signal end-of-stream.
+        if name == "stream_take_int":
+            need(2)
+            st = argt(0, None)
+            if not is_stream(st) or stream_inner(st) != "int":
+                self.err("stream_take_int() argument 1 expects Stream[int], "
+                         "got %s" % st, e)
+            nt = argt(1, "int")
+            if nt != "int":
+                self.err("stream_take_int() argument 2 expects int, got %s"
+                         % nt, e)
+            if expected is None or not is_stream(expected) \
+                    or stream_inner(expected) != "int":
+                self.err("stream_take_int() requires a 'Stream[int]' type in "
+                         "the surrounding context", e)
+            self.edges[self.cur_fn].add("b:stream_take_int")
+            return expected
+        # stream_fold_int(in_s: Stream[int], init: int, fn_name) -> int —
+        # blocking fold. fn_name must have signature `fn(int, int) -> int`.
+        # Returns the final accumulator value.
+        if name == "stream_fold_int":
+            need(3)
+            st = argt(0, None)
+            if not is_stream(st) or stream_inner(st) != "int":
+                self.err("stream_fold_int() argument 1 expects Stream[int], "
+                         "got %s" % st, e)
+            it = argt(1, "int")
+            if it != "int":
+                self.err("stream_fold_int() argument 2 expects int, got %s"
+                         % it, e)
+            fn_arg = args[2]
+            if fn_arg["k"] != "ident":
+                self.err("stream_fold_int() argument 3 must be a function name"
+                         ", got a %s expression" % fn_arg["k"], e)
+            fname = fn_arg["name"]
+            if fname in BUILTIN_FNS:
+                self.err("stream_fold_int() target cannot be a builtin: %s"
+                         % fname, e)
+            if fname not in self.fns:
+                self.err("stream_fold_int() target function does not exist: %s"
+                         % fname, e)
+            tfn = self.fns[fname]
+            if tfn["struct"] is not None or tfn.get("typeparams") \
+                    or tfn.get("extern", False):
+                self.err("stream_fold_int() target must be a non-generic, "
+                         "non-extern free function: %s" % fname, e)
+            params = tfn["params"]
+            if len(params) != 2 or params[0][1] != "int" \
+                    or params[1][1] != "int" or tfn["ret"] != "int":
+                self.err("stream_fold_int() target %s must have signature "
+                         "fn(int, int) -> int" % fname, e)
+            self.edges[self.cur_fn].add("b:stream_fold_int")
+            self.edges[self.cur_fn].add(fname)
+            # Rewrite: drop the fn-name argument, record the target.
+            e["args"] = [args[0], args[1]]
+            e["spawn_fn"] = fname
+            return "int"
+        # stream_merge_int(a: Stream[int], b: Stream[int]) -> Stream[int] —
+        # interleave two int streams into one.
+        if name == "stream_merge_int":
+            need(2)
+            at = argt(0, None)
+            bt = argt(1, None)
+            if not is_stream(at) or stream_inner(at) != "int":
+                self.err("stream_merge_int() argument 1 expects Stream[int], "
+                         "got %s" % at, e)
+            if not is_stream(bt) or stream_inner(bt) != "int":
+                self.err("stream_merge_int() argument 2 expects Stream[int], "
+                         "got %s" % bt, e)
+            if expected is None or not is_stream(expected) \
+                    or stream_inner(expected) != "int":
+                self.err("stream_merge_int() requires a 'Stream[int]' type in "
+                         "the surrounding context", e)
+            self.edges[self.cur_fn].add("b:stream_merge_int")
+            return expected
+        # stream_flat_map_int(in_s: Stream[int], fn_name) -> Stream[int] —
+        # fn_name takes int, returns Stream[int] (the inner stream).
+        # The worker reads each value from in_s, calls fn_name to get an
+        # inner stream, then forwards each value from the inner stream to
+        # the output.
+        if name == "stream_flat_map_int":
+            need(2)
+            st = argt(0, None)
+            if not is_stream(st) or stream_inner(st) != "int":
+                self.err("stream_flat_map_int() argument 1 expects "
+                         "Stream[int], got %s" % st, e)
+            fn_arg = args[1]
+            if fn_arg["k"] != "ident":
+                self.err("stream_flat_map_int() argument 2 must be a function "
+                         "name, got a %s expression" % fn_arg["k"], e)
+            fname = fn_arg["name"]
+            if fname in BUILTIN_FNS:
+                self.err("stream_flat_map_int() target cannot be a builtin: %s"
+                         % fname, e)
+            if fname not in self.fns:
+                self.err("stream_flat_map_int() target function does not "
+                         "exist: %s" % fname, e)
+            tfn = self.fns[fname]
+            if tfn["struct"] is not None or tfn.get("typeparams") \
+                    or tfn.get("extern", False):
+                self.err("stream_flat_map_int() target must be a non-generic, "
+                         "non-extern free function: %s" % fname, e)
+            params = tfn["params"]
+            if len(params) != 1 or params[0][1] != "int" \
+                    or tfn["ret"] != "Stream[int]":
+                self.err("stream_flat_map_int() target %s must have signature "
+                         "fn(int) -> Stream[int]" % fname, e)
+            if expected is None or not is_stream(expected) \
+                    or stream_inner(expected) != "int":
+                self.err("stream_flat_map_int() requires a 'Stream[int]' type "
+                         "in the surrounding context", e)
+            self.edges[self.cur_fn].add("b:stream_flat_map_int")
+            self.edges[self.cur_fn].add(fname)
+            # Rewrite: drop the fn-name argument, record the target.
+            e["args"] = [args[0]]
+            e["spawn_fn"] = fname
+            return expected
+        # gen_spawn(f, args...) -> Stream[T] — like async_spawn, but for
+        # streams. The target function must take a Stream[T] as its FIRST
+        # parameter (the generator writes values into this stream), then
+        # any user args. The builtin creates the stream, spawns f with
+        # (stream, args...), and returns the stream.
+        # The expected type's element T must match the stream parameter
+        # of f (the FIRST parameter).
+        if name == "gen_spawn":
+            if len(args) < 1:
+                self.err("gen_spawn() expects a function name followed by "
+                         "its arguments", e)
+            fn_arg = args[0]
+            if fn_arg["k"] != "ident":
+                self.err("gen_spawn() argument 1 must be a function name "
+                         "(an identifier), got a %s expression" % fn_arg["k"], e)
+            fname = fn_arg["name"]
+            if fname in BUILTIN_FNS:
+                self.err("gen_spawn() target cannot be a builtin function: %s"
+                         % fname, e)
+            if fname not in self.fns:
+                self.err("gen_spawn() target function does not exist: %s"
+                         % fname, e)
+            tfn = self.fns[fname]
+            if tfn["struct"] is not None or tfn.get("typeparams") \
+                    or tfn.get("extern", False):
+                self.err("gen_spawn() target must be a non-generic, "
+                         "non-extern free function: %s" % fname, e)
+            if expected is None or not is_stream(expected):
+                self.err("gen_spawn() requires a 'Stream[T]' type in the "
+                         "surrounding context", e)
+            stream_t = expected
+            params = tfn["params"]
+            if len(params) < 1 or params[0][1] != stream_t:
+                self.err("gen_spawn() target %s must take %s as its first "
+                         "parameter (the generator writes into this stream)"
+                         % (fname, stream_t), e)
+            vargs = args[1:]
+            if len(vargs) != len(params) - 1:
+                self.err("gen_spawn() target %s expects %d arguments after "
+                         "the stream, got %d"
+                         % (fname, len(params) - 1, len(vargs)), e)
+            # Check the non-stream arguments.
+            for i, (a, (pn, pt, _)) in enumerate(zip(vargs, params[1:])):
+                at = self.check_expr(a, env, pt)
+                if at == "never":
+                    continue
+                if at != pt:
+                    self.err("gen_spawn() argument '%s' of %s expects %s, "
+                             "got %s" % (pn, fname, pt, at), a)
+                if not self.type_is_send(pt):
+                    self.err("type %s is not Send: gen_spawn() arguments "
+                             "cross a task boundary" % pt, a)
+                if is_owned_type(pt) and a["k"] in ("ident", "field", "index"):
+                    what = ("variable '" + a["name"] + "'") if a["k"] == "ident" \
+                        else "a borrowed value"
+                    self.err("cannot share %s across tasks: gen_spawn() "
+                             "argument %d reads it directly — pass clone(x) "
+                             "or take(x)" % (what, i + 2), a)
+            self.edges[self.cur_fn].add("b:gen_spawn")
+            self.edges[self.cur_fn].add(fname)
+            # Rewrite: drop the fn-name argument; codegen prepends the
+            # created stream to the remaining args.
+            e["args"] = vargs
+            e["spawn_fn"] = fname
+            return expected
         self.err("unknown builtin function: %s" % name, e)
 
     @staticmethod
@@ -2781,6 +3293,11 @@ class Checker:
             return True
         if is_task(t):
             return False
+        # Stage 33: Future[T] clones by SHARING (atomic refcount +1 —
+        # same as a channel; a future IS a channel under the hood).
+        # Stage 34: Stream[T] clones by SHARING (same).
+        if is_future(t) or is_stream(t):
+            return True
         _seen = _seen + (t,)
         if is_list(t):
             return self.clone_supported(list_elem(t), _seen)
@@ -2843,6 +3360,13 @@ class Checker:
             return self.type_is_send(chan_inner(t), _seen)
         if is_task(t):
             return False
+        # Stage 33: Future[T] is Send iff T is Send (a future is a
+        # cap-1 channel under the hood — channels are Send).
+        if is_future(t):
+            return self.type_is_send(future_inner(t), _seen)
+        # Stage 34: Stream[T] is Send iff T is Send (same as Chan).
+        if is_stream(t):
+            return self.type_is_send(stream_inner(t), _seen)
         _seen = _seen + (t,)
         if is_list(t):
             return self.type_is_send(list_elem(t), _seen)

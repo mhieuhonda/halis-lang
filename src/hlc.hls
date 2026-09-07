@@ -298,6 +298,10 @@ struct Ctx {
     # spawn_n: monotonically increasing counter for unique spawn helper
     # names (hl_sa_<n>_t / hl_mkargs_<n> / hl_tramp_<n>).
     spawn_n: int,
+    # Stage 33 (v0.52.0-alpha): per-call-site counters for future_ready
+    # and future_poll helpers (each call site emits a static inline fn).
+    future_ready_n: int,
+    future_poll_n: int,
     # ---- Stage 17 (v0.28.0-alpha): proof / contract codegen modes ----
     # fast_mode: -O fast / --fast — elide the panic checks the interval
     # prover proved dead (overflow, division, bounds).
@@ -493,6 +497,7 @@ fn new_ctx(src: str) -> Ctx {
         computed_effects: map_new(),
         hoist_map: map_new(), null_after: [], clone_insts: [], loop_header: 0,
         spawn_decls: [], spawn_n: 0,
+        future_ready_n: 0, future_poll_n: 0,
         fast_mode: false, contracts_mode: false,
         pgo_gen: false, pgo_counts: map_new(), pgo_total_calls: 0,
         pgo_site_ids: [], pgo_site_map: map_new(),
@@ -626,6 +631,46 @@ fn is_task_t(t: str) -> bool {
 
 fn task_inner_t(t: str) -> str {
     return t.slice(5, t.len() - 1)
+}
+
+# Stage 33 (v0.52.0-alpha): Future[T] — async/await wrapper.
+# Runtime: a hl_chan* of cap 1 (bounded). Distinct type at the type-system
+# level so await() only accepts Future, not raw Chan.
+fn is_future_t(t: str) -> bool {
+    return t.starts_with("Future[")
+}
+
+fn future_inner_t(t: str) -> str {
+    return t.slice(7, t.len() - 1)
+}
+
+# Stage 34 (v0.53.0-alpha): Stream[T] — async stream wrapper.
+# Runtime: a bounded hl_chan* (backpressure).
+fn is_stream_t(t: str) -> bool {
+    return t.starts_with("Stream[")
+}
+
+fn stream_inner_t(t: str) -> str {
+    return t.slice(7, t.len() - 1)
+}
+
+# is_chan_like_t — true for any channel-like type (Chan, Future, Stream).
+# All three have the same C representation (hl_chan*); this helper is used
+# in c_type, is_ptr_type, clone_supported, collect_insts, etc. where the
+# distinction does not matter.
+fn is_chan_like_t(t: str) -> bool {
+    return is_chan_t(t) || is_future_t(t) || is_stream_t(t)
+}
+
+# chan_like_inner_t — get the element type of any chan-like type.
+fn chan_like_inner_t(t: str) -> str {
+    if is_chan_t(t) {
+        return chan_inner_t(t)
+    }
+    if is_future_t(t) {
+        return future_inner_t(t)
+    }
+    return stream_inner_t(t)
 }
 
 fn taint_inner_t(t: str) -> str {
@@ -1209,6 +1254,26 @@ fn parse_type(ctx: Ctx, allow_void: bool) -> str {
         let inner: str = parse_type(ctx, true)
         eat_sym(ctx, "]")
         return "Task[" + inner + "]"
+    }
+    # Stage 33 (v0.52.0-alpha): Future[T] — async/await wrapper.
+    if base == "Future" {
+        eat_sym(ctx, "[")
+        let inner: str = parse_type(ctx, false)
+        eat_sym(ctx, "]")
+        if inner == "void" {
+            perr_at(ctx, "Future[T] element type cannot be void", t)
+        }
+        return "Future[" + inner + "]"
+    }
+    # Stage 34 (v0.53.0-alpha): Stream[T] — async stream wrapper.
+    if base == "Stream" {
+        eat_sym(ctx, "[")
+        let inner: str = parse_type(ctx, false)
+        eat_sym(ctx, "]")
+        if inner == "void" {
+            perr_at(ctx, "Stream[T] element type cannot be void", t)
+        }
+        return "Stream[" + inner + "]"
     }
     if base == "int" || base == "float" || base == "bool" || base == "str" {
         return base
@@ -2593,6 +2658,16 @@ fn is_builtin_fn(n: str) -> bool {
         # Stage 16 (v0.27.0-alpha): concurrency builtins. Stage-16
         # perfection (v0.29.0-alpha) adds chan_new_bounded.
         || n == "chan_new" || n == "chan_new_bounded" || n == "spawn" || n == "select"
+        # Stage 33 (v0.52.0-alpha): async/await builtins.
+        || n == "async_spawn" || n == "await" || n == "future_ready"
+        || n == "future_poll" || n == "future_select"
+        # Stage 34 (v0.53.0-alpha): async stream builtins.
+        || n == "stream_new" || n == "stream_send" || n == "stream_recv"
+        || n == "stream_try_recv" || n == "stream_len" || n == "stream_close"
+        || n == "stream_map_int" || n == "stream_filter_int"
+        || n == "stream_take_int" || n == "stream_fold_int"
+        || n == "stream_merge_int" || n == "stream_flat_map_int"
+        || n == "gen_spawn"
         # Stage 19 (v0.35.0-alpha): O(n) string join — see boot/checker.py.
         # hlc itself joins the whole generated C file through this builtin
         # (the old accumulating HLS-level join was quadratic and dominated
@@ -2650,6 +2725,14 @@ fn type_exists(ctx: Ctx, t: str) -> bool {
             return true
         }
         return type_exists(ctx, task_inner_t(t))
+    }
+    # Stage 33 (v0.52.0-alpha): Future[T] — built-in generic wrapper.
+    if is_future_t(t) {
+        return type_exists(ctx, future_inner_t(t))
+    }
+    # Stage 34 (v0.53.0-alpha): Stream[T] — built-in generic wrapper.
+    if is_stream_t(t) {
+        return type_exists(ctx, stream_inner_t(t))
     }
     let base: str = type_base(t)
     let args: list[str] = type_args(t)
@@ -2972,6 +3055,20 @@ fn builtin_effect(name: str) -> list[str] {
     if name == "chan_new" || name == "chan_new_bounded" || name == "spawn" || name == "select"
         || name == "chan.send" || name == "chan.try_send" || name == "chan.recv"
         || name == "chan.recv_or" || name == "chan.len" || name == "task.join" {
+        return ["Conc"]
+    }
+    # Stage 33 (v0.52.0-alpha): async/await — all carry Conc.
+    if name == "async_spawn" || name == "await" || name == "future_ready"
+        || name == "future_poll" || name == "future_select" {
+        return ["Conc"]
+    }
+    # Stage 34 (v0.53.0-alpha): async streams — all carry Conc.
+    if name == "stream_new" || name == "stream_send" || name == "stream_recv"
+        || name == "stream_try_recv" || name == "stream_len" || name == "stream_close"
+        || name == "stream_map_int" || name == "stream_filter_int"
+        || name == "stream_take_int" || name == "stream_fold_int"
+        || name == "stream_merge_int" || name == "stream_flat_map_int"
+        || name == "gen_spawn" {
         return ["Conc"]
     }
     # taint_mark / taint_unwrap are pure (no effect; just wrap/unwrap).
@@ -4214,6 +4311,16 @@ fn collect_insts(ctx: Ctx, t: str) -> void {
     }
     if is_task_t(t) {
         collect_insts(ctx, task_inner_t(t))
+        return
+    }
+    # Stage 33/34: Future[T] and Stream[T] are channels under the hood;
+    # recurse so the element type's release fn is referenced.
+    if is_future_t(t) {
+        collect_insts(ctx, future_inner_t(t))
+        return
+    }
+    if is_stream_t(t) {
+        collect_insts(ctx, stream_inner_t(t))
         return
     }
     let base: str = type_base(t)
@@ -6864,6 +6971,14 @@ fn type_is_send(ctx: Ctx, t: str, seen: list[str]) -> bool {
     if is_task_t(t) {
         return false
     }
+    # Stage 33: Future[T] is Send iff T is Send (a future IS a channel).
+    if is_future_t(t) {
+        return type_is_send(ctx, future_inner_t(t), seen2)
+    }
+    # Stage 34: Stream[T] is Send iff T is Send.
+    if is_stream_t(t) {
+        return type_is_send(ctx, stream_inner_t(t), seen2)
+    }
     if is_list_t(t) {
         return type_is_send(ctx, list_elem_t(t), seen2)
     }
@@ -6930,6 +7045,11 @@ fn clone_supported(ctx: Ctx, t: str, seen: list[str]) -> bool {
     }
     if is_task_t(t) {
         return false
+    }
+    # Stage 33/34: Future[T] and Stream[T] clone by SHARING (atomic
+    # refcount +1 — same as a channel; both ARE channels under the hood).
+    if is_future_t(t) || is_stream_t(t) {
+        return true
     }
     let seen2: list[str] = list_append_clone(seen, t)
     if is_list_t(t) {
@@ -7078,6 +7198,22 @@ fn check_builtin_call(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, 
     # to resolve it as a variable and fail).
     if name == "spawn" {
         return check_spawn_call(ctx, env, cur, e)
+    }
+    # Stage 33 (v0.52.0-alpha): async_spawn(f, args...) — like spawn, but
+    # returns Future[R] instead of Task[R].
+    if name == "async_spawn" {
+        return check_async_spawn_call(ctx, env, cur, e)
+    }
+    # Stage 34 (v0.53.0-alpha): gen_spawn(f, args...) -> Stream[T] —
+    # the target takes the Stream as its first param.
+    if name == "gen_spawn" {
+        return check_gen_spawn_call(ctx, env, cur, e, expected)
+    }
+    # Stage 34: stream_map_int / stream_filter_int / stream_fold_int /
+    # stream_flat_map_int — each takes a Stream + a function name.
+    if name == "stream_map_int" || name == "stream_filter_int"
+        || name == "stream_fold_int" || name == "stream_flat_map_int" {
+        return check_stream_combinator_call(ctx, env, cur, e, name, expected)
     }
     # Stage 21 (v0.37.0-alpha): has_feature("avx2") -> bool — a
     # compile-time constant (const-folded by the codegen from the
@@ -7555,8 +7691,430 @@ fn check_builtin_call(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, 
         add_edge(ctx, cur, "b:select")
         return "int"
     }
+    # ----- Stage 33 (v0.52.0-alpha): async/await builtins -----
+    # await(fut: Future[T]) -> T
+    if name == "await" {
+        if nargs != 1 {
+            cerr(line, "await() expects 1 Future[T] argument")
+        }
+        let a0: str = argt.get(0)
+        if !is_future_t(a0) {
+            cerr(line, "await() expects a Future[T], got " + a0)
+        }
+        add_edge(ctx, cur, "b:await")
+        return future_inner_t(a0)
+    }
+    # future_ready(v: T) -> Future[T] — contextual typing.
+    if name == "future_ready" {
+        if nargs != 1 {
+            cerr(line, "future_ready() expects 1 argument")
+        }
+        if expected == "" || !is_future_t(expected) {
+            cerr(line, "future_ready() requires a 'Future[T]' type in the surrounding context")
+        }
+        let want_t: str = future_inner_t(expected)
+        let at: str = argt.get(0)
+        if at != "never" && at != want_t {
+            cerr(line, "future_ready() argument expects " + want_t + ", got " + at)
+        }
+        if !type_is_send(ctx, want_t, []) {
+            cerr(line, "type " + want_t + " is not Send: a future's value crosses a task boundary")
+        }
+        add_edge(ctx, cur, "b:future_ready")
+        return expected
+    }
+    # future_poll(fut: Future[T]) -> Option[T]
+    if name == "future_poll" {
+        if nargs != 1 {
+            cerr(line, "future_poll() expects 1 Future[T] argument")
+        }
+        let a0: str = argt.get(0)
+        if !is_future_t(a0) {
+            cerr(line, "future_poll() expects a Future[T], got " + a0)
+        }
+        add_edge(ctx, cur, "b:future_poll")
+        return "Option[" + future_inner_t(a0) + "]"
+    }
+    # future_select(futs: list[Future[T]]) -> int
+    if name == "future_select" {
+        if nargs != 1 {
+            cerr(line, "future_select() expects 1 list[Future[T]] argument")
+        }
+        let a0: str = argt.get(0)
+        if !is_list_t(a0) || !is_future_t(list_elem_t(a0)) {
+            cerr(line, "future_select() expects a list[Future[T]], got " + a0)
+        }
+        add_edge(ctx, cur, "b:future_select")
+        return "int"
+    }
+    # ----- Stage 34 (v0.53.0-alpha): async stream builtins -----
+    # stream_new(cap: int) -> Stream[T] — contextual typing.
+    if name == "stream_new" {
+        if nargs != 1 {
+            cerr(line, "stream_new() expects 1 int argument")
+        }
+        let a0: str = argt.get(0)
+        if a0 != "never" && a0 != "int" {
+            cerr(line, "stream_new() capacity expects int, got " + a0)
+        }
+        if expected == "" || !is_stream_t(expected) {
+            cerr(line, "stream_new() requires a 'Stream[T]' type in the surrounding context")
+        }
+        if !type_is_send(ctx, stream_inner_t(expected), []) {
+            cerr(line, "stream_new() element type " + stream_inner_t(expected) + " is not Send")
+        }
+        add_edge(ctx, cur, "b:stream_new")
+        return expected
+    }
+    # stream_send(s: Stream[T], v: T) -> void
+    if name == "stream_send" {
+        if nargs != 2 {
+            cerr(line, "stream_send() expects 2 arguments")
+        }
+        let a0: str = argt.get(0)
+        if !is_stream_t(a0) {
+            cerr(line, "stream_send() argument 1 expects Stream[T], got " + a0)
+        }
+        let et: str = stream_inner_t(a0)
+        let a1: str = argt.get(1)
+        if a1 != "never" && a1 != et {
+            cerr(line, "stream_send() argument 2 expects " + et + ", got " + a1)
+        }
+        if !type_is_send(ctx, et, []) {
+            cerr(line, "type " + et + " is not Send: stream values cross a task boundary")
+        }
+        add_edge(ctx, cur, "b:stream_send")
+        return "void"
+    }
+    # stream_recv(s: Stream[T]) -> T
+    if name == "stream_recv" {
+        if nargs != 1 {
+            cerr(line, "stream_recv() expects 1 Stream[T] argument")
+        }
+        let a0: str = argt.get(0)
+        if !is_stream_t(a0) {
+            cerr(line, "stream_recv() expects Stream[T], got " + a0)
+        }
+        add_edge(ctx, cur, "b:stream_recv")
+        return stream_inner_t(a0)
+    }
+    # stream_try_recv(s: Stream[T], default: T) -> T
+    if name == "stream_try_recv" {
+        if nargs != 2 {
+            cerr(line, "stream_try_recv() expects 2 arguments")
+        }
+        let a0: str = argt.get(0)
+        if !is_stream_t(a0) {
+            cerr(line, "stream_try_recv() argument 1 expects Stream[T], got " + a0)
+        }
+        let et: str = stream_inner_t(a0)
+        let a1: str = argt.get(1)
+        if a1 != "never" && a1 != et {
+            cerr(line, "stream_try_recv() argument 2 expects " + et + ", got " + a1)
+        }
+        add_edge(ctx, cur, "b:stream_try_recv")
+        return et
+    }
+    # stream_len(s: Stream[T]) -> int
+    if name == "stream_len" {
+        if nargs != 1 {
+            cerr(line, "stream_len() expects 1 Stream[T] argument")
+        }
+        let a0: str = argt.get(0)
+        if !is_stream_t(a0) {
+            cerr(line, "stream_len() expects Stream[T], got " + a0)
+        }
+        add_edge(ctx, cur, "b:stream_len")
+        return "int"
+    }
+    # stream_close(s: Stream[T]) -> void
+    if name == "stream_close" {
+        if nargs != 1 {
+            cerr(line, "stream_close() expects 1 Stream[T] argument")
+        }
+        let a0: str = argt.get(0)
+        if !is_stream_t(a0) {
+            cerr(line, "stream_close() expects Stream[T], got " + a0)
+        }
+        add_edge(ctx, cur, "b:stream_close")
+        return "void"
+    }
+    # stream_take_int(in_s: Stream[int], n: int) -> Stream[int]
+    if name == "stream_take_int" {
+        if nargs != 2 {
+            cerr(line, "stream_take_int() expects 2 arguments")
+        }
+        let a0: str = argt.get(0)
+        if !is_stream_t(a0) || stream_inner_t(a0) != "int" {
+            cerr(line, "stream_take_int() argument 1 expects Stream[int], got " + a0)
+        }
+        let a1: str = argt.get(1)
+        if a1 != "never" && a1 != "int" {
+            cerr(line, "stream_take_int() argument 2 expects int, got " + a1)
+        }
+        if expected == "" || !is_stream_t(expected) || stream_inner_t(expected) != "int" {
+            cerr(line, "stream_take_int() requires a 'Stream[int]' type in the surrounding context")
+        }
+        add_edge(ctx, cur, "b:stream_take_int")
+        return expected
+    }
+    # stream_merge_int(a, b) -> Stream[int]
+    if name == "stream_merge_int" {
+        if nargs != 2 {
+            cerr(line, "stream_merge_int() expects 2 arguments")
+        }
+        let a0: str = argt.get(0)
+        let a1: str = argt.get(1)
+        if !is_stream_t(a0) || stream_inner_t(a0) != "int" {
+            cerr(line, "stream_merge_int() argument 1 expects Stream[int], got " + a0)
+        }
+        if !is_stream_t(a1) || stream_inner_t(a1) != "int" {
+            cerr(line, "stream_merge_int() argument 2 expects Stream[int], got " + a1)
+        }
+        if expected == "" || !is_stream_t(expected) || stream_inner_t(expected) != "int" {
+            cerr(line, "stream_merge_int() requires a 'Stream[int]' type in the surrounding context")
+        }
+        add_edge(ctx, cur, "b:stream_merge_int")
+        return expected
+    }
     cerr(line, "unknown builtin function: " + name)
     return ""
+}
+
+# Stage 33 (v0.52.0-alpha): check_async_spawn_call — mirrors
+# check_spawn_call but returns Future[R] instead of Task[R]. The target
+# function must NOT return void (a future carries a value).
+fn check_async_spawn_call(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int) -> str {
+    let mut line: int = ctx.exprs[e].line
+    let nargs: int = ctx.exprs[e].args.len()
+    if nargs < 1 {
+        cerr(line, "async_spawn() expects a function name followed by its arguments")
+    }
+    let fn_arg: int = ctx.exprs[e].args.get(0)
+    if ctx.exprs[fn_arg].kind != "ident" {
+        cerr(line, "async_spawn() argument 1 must be a function name (an identifier)")
+    }
+    let fname: str = ctx.exprs[fn_arg].name
+    if is_builtin_fn(fname) {
+        cerr(line, "async_spawn() target cannot be a builtin function: " + fname)
+    }
+    if !ctx.fns.has(fname) {
+        cerr(line, "async_spawn() target function does not exist: " + fname)
+    }
+    let tf: FnInfo = ctx.fns.get_or(fname, dummy_fn())
+    if tf.is_method {
+        cerr(line, "async_spawn() target cannot be a method: " + fname)
+    }
+    if tf.typeparams.len() > 0 {
+        cerr(line, "async_spawn() of generic functions is not supported yet: " + fname)
+    }
+    if tf.is_extern {
+        cerr(line, "async_spawn() of extern (FFI) functions is not supported")
+    }
+    if tf.ret == "void" {
+        cerr(line, "async_spawn() target " + fname + " returns void — a Future must carry a value (use plain spawn() for void tasks)")
+    }
+    let vargs: list[int] = []
+    let mut si: int = 1
+    while si < ctx.exprs[e].args.len() {
+        vargs.push(ctx.exprs[e].args.get(si))
+        si = si + 1
+    }
+    if vargs.len() != tf.params.len() {
+        cerr(line, "async_spawn() target " + fname + " expects " + tf.params.len().to_str() + " arguments, got " + vargs.len().to_str())
+    }
+    let mut i: int = 0
+    while i < vargs.len() {
+        let aidx: int = vargs.get(i)
+        let pt: str = tf.ptypes.get(i)
+        let at: str = check_expr(ctx, env, cur, aidx, pt)
+        if at != "never" && at != pt {
+            cerr(line, "async_spawn() argument '" + tf.params.get(i) + "' of " + fname + " expects " + pt + ", got " + at)
+        }
+        if !type_is_send(ctx, pt, []) {
+            cerr(line, "type " + pt + " is not Send: values of this type cannot cross a task boundary (async_spawn)")
+        }
+        if is_owned_type(pt) {
+            let akind: str = ctx.exprs[aidx].kind
+            if akind == "ident" || akind == "field" || akind == "index" {
+                let mut what: str = "a borrowed value"
+                if akind == "ident" {
+                    what = "variable '" + ctx.exprs[aidx].name + "'"
+                }
+                cerr(line, "cannot share " + what + " across tasks: async_spawn() argument " + (i + 2).to_str() + " reads it directly — pass clone(x) or take(x)")
+            }
+        }
+        i = i + 1
+    }
+    add_edge(ctx, cur, "b:async_spawn")
+    add_edge(ctx, cur, fname)
+    ctx.exprs[e].args = vargs
+    ctx.exprs[e].mkey = "async_spawn"
+    ctx.exprs[e].mop = fname
+    return "Future[" + tf.ret + "]"
+}
+
+# Stage 34 (v0.53.0-alpha): check_gen_spawn_call — gen_spawn(f, args...)
+# -> Stream[T]. The target function must take Stream[T] as its FIRST
+# parameter (the generator writes into this stream).
+fn check_gen_spawn_call(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, expected: str) -> str {
+    let mut line: int = ctx.exprs[e].line
+    let nargs: int = ctx.exprs[e].args.len()
+    if nargs < 1 {
+        cerr(line, "gen_spawn() expects a function name followed by its arguments")
+    }
+    let fn_arg: int = ctx.exprs[e].args.get(0)
+    if ctx.exprs[fn_arg].kind != "ident" {
+        cerr(line, "gen_spawn() argument 1 must be a function name (an identifier)")
+    }
+    let fname: str = ctx.exprs[fn_arg].name
+    if is_builtin_fn(fname) {
+        cerr(line, "gen_spawn() target cannot be a builtin function: " + fname)
+    }
+    if !ctx.fns.has(fname) {
+        cerr(line, "gen_spawn() target function does not exist: " + fname)
+    }
+    let tf: FnInfo = ctx.fns.get_or(fname, dummy_fn())
+    if tf.is_method || tf.typeparams.len() > 0 || tf.is_extern {
+        cerr(line, "gen_spawn() target must be a non-generic, non-extern free function: " + fname)
+    }
+    if expected == "" || !is_stream_t(expected) {
+        cerr(line, "gen_spawn() requires a 'Stream[T]' type in the surrounding context")
+    }
+    let stream_t: str = expected
+    if tf.params.len() < 1 || tf.ptypes.get(0) != stream_t {
+        cerr(line, "gen_spawn() target " + fname + " must take " + stream_t + " as its first parameter (the generator writes into this stream)")
+    }
+    let vargs: list[int] = []
+    let mut si: int = 1
+    while si < ctx.exprs[e].args.len() {
+        vargs.push(ctx.exprs[e].args.get(si))
+        si = si + 1
+    }
+    if vargs.len() != tf.params.len() - 1 {
+        cerr(line, "gen_spawn() target " + fname + " expects " + (tf.params.len() - 1).to_str() + " arguments after the stream, got " + vargs.len().to_str())
+    }
+    let mut i: int = 0
+    while i < vargs.len() {
+        let aidx: int = vargs.get(i)
+        let pt: str = tf.ptypes.get(i + 1)
+        let at: str = check_expr(ctx, env, cur, aidx, pt)
+        if at != "never" && at != pt {
+            cerr(line, "gen_spawn() argument '" + tf.params.get(i + 1) + "' of " + fname + " expects " + pt + ", got " + at)
+        }
+        if !type_is_send(ctx, pt, []) {
+            cerr(line, "type " + pt + " is not Send: gen_spawn() arguments cross a task boundary")
+        }
+        if is_owned_type(pt) {
+            let akind: str = ctx.exprs[aidx].kind
+            if akind == "ident" || akind == "field" || akind == "index" {
+                let mut what: str = "a borrowed value"
+                if akind == "ident" {
+                    what = "variable '" + ctx.exprs[aidx].name + "'"
+                }
+                cerr(line, "cannot share " + what + " across tasks: gen_spawn() argument " + (i + 2).to_str() + " reads it directly — pass clone(x) or take(x)")
+            }
+        }
+        i = i + 1
+    }
+    add_edge(ctx, cur, "b:gen_spawn")
+    add_edge(ctx, cur, fname)
+    ctx.exprs[e].args = vargs
+    ctx.exprs[e].mkey = "gen_spawn"
+    ctx.exprs[e].mop = fname
+    return expected
+}
+
+# Stage 34: check_stream_combinator_call — stream_map_int /
+# stream_filter_int / stream_fold_int / stream_flat_map_int.
+# Each takes a Stream[int] and a function name (the fn-name is
+# recorded in mop via the rewrite; the args list keeps only the
+# stream arg, plus the init value for fold).
+fn check_stream_combinator_call(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, name: str, expected: str) -> str {
+    let mut line: int = ctx.exprs[e].line
+    let nargs: int = ctx.exprs[e].args.len()
+    # Determine argument layout: map/filter/flat_map take (stream, fn_name);
+    # fold takes (stream, init, fn_name).
+    let fold_p: bool = name == "stream_fold_int"
+    if fold_p {
+        if nargs != 3 {
+            cerr(line, name + "() expects 3 arguments (stream, init, fn_name)")
+        }
+    } else {
+        if nargs != 2 {
+            cerr(line, name + "() expects 2 arguments (stream, fn_name)")
+        }
+    }
+    # Check the stream argument.
+    let stream_arg: int = ctx.exprs[e].args.get(0)
+    let st: str = check_expr(ctx, env, cur, stream_arg, "")
+    if !is_stream_t(st) || stream_inner_t(st) != "int" {
+        cerr(line, name + "() argument 1 expects Stream[int], got " + st)
+    }
+    # For fold, check the init argument.
+    let mut init_arg: int = -1
+    if fold_p {
+        init_arg = ctx.exprs[e].args.get(1)
+        let it: str = check_expr(ctx, env, cur, init_arg, "int")
+        if it != "never" && it != "int" {
+            cerr(line, "stream_fold_int() argument 2 expects int, got " + it)
+        }
+    }
+    # Check the function-name argument (index 1 for map/filter/flat_map,
+    # index 2 for fold).
+    let mut fn_arg_idx: int = 1
+    if fold_p {
+        fn_arg_idx = 2
+    }
+    let fn_arg: int = ctx.exprs[e].args.get(fn_arg_idx)
+    if ctx.exprs[fn_arg].kind != "ident" {
+        cerr(line, name + "() argument " + (fn_arg_idx + 1).to_str() + " must be a function name (an identifier)")
+    }
+    let fname: str = ctx.exprs[fn_arg].name
+    if is_builtin_fn(fname) {
+        cerr(line, name + "() target cannot be a builtin function: " + fname)
+    }
+    if !ctx.fns.has(fname) {
+        cerr(line, name + "() target function does not exist: " + fname)
+    }
+    let tf: FnInfo = ctx.fns.get_or(fname, dummy_fn())
+    if tf.is_method || tf.typeparams.len() > 0 || tf.is_extern {
+        cerr(line, name + "() target must be a non-generic, non-extern free function: " + fname)
+    }
+    # Validate the target's signature.
+    if name == "stream_map_int" || name == "stream_filter_int" {
+        if tf.params.len() != 1 || tf.ptypes.get(0) != "int" || tf.ret != "int" {
+            cerr(line, name + "() target " + fname + " must have signature fn(int) -> int")
+        }
+    } else if name == "stream_fold_int" {
+        if tf.params.len() != 2 || tf.ptypes.get(0) != "int" || tf.ptypes.get(1) != "int" || tf.ret != "int" {
+            cerr(line, "stream_fold_int() target " + fname + " must have signature fn(int, int) -> int")
+        }
+    } else if name == "stream_flat_map_int" {
+        if tf.params.len() != 1 || tf.ptypes.get(0) != "int" || tf.ret != "Stream[int]" {
+            cerr(line, "stream_flat_map_int() target " + fname + " must have signature fn(int) -> Stream[int]")
+        }
+    }
+    # For non-fold combinators, validate the expected return type.
+    if !fold_p {
+        if expected == "" || !is_stream_t(expected) || stream_inner_t(expected) != "int" {
+            cerr(line, name + "() requires a 'Stream[int]' type in the surrounding context")
+        }
+    }
+    add_edge(ctx, cur, "b:" + name)
+    add_edge(ctx, cur, fname)
+    # Rewrite: drop the fn-name argument, record the target.
+    let new_args: list[int] = [stream_arg]
+    if fold_p {
+        new_args.push(init_arg)
+    }
+    ctx.exprs[e].args = new_args
+    ctx.exprs[e].mkey = name
+    ctx.exprs[e].mop = fname
+    if fold_p {
+        return "int"
+    }
+    return expected
 }
 
 fn check_method(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int) -> str {
@@ -8650,6 +9208,14 @@ fn runtime_lines() -> list[str] {
     r.push("static int64_t g_rt_tasks   = 0;   // spawned tasks alive (main excluded)")
     r.push("static int64_t g_rt_blocked = 0;   // threads blocked in recv/select/join/send (main included)")
     r.push("static int64_t g_rt_msgs    = 0;   // pending messages across ALL channels")
+    # Stage 33 (v0.52.0-alpha): g_rt_done_unjoined — the number of tasks
+    # that have finished (hl_task_finish was called) but have NOT yet been
+    # joined. If this is > 0, a join waiter can proceed, so the deadlock
+    # check must NOT fire even if g_rt_blocked == alive. This fixes a
+    # false-positive deadlock when an async task is blocked in t.join()
+    # and the joined task has just finished (race between the join waiter
+    # re-checking t->done and another thread's deadlock_check).
+    r.push("static int64_t g_rt_done_unjoined = 0;   // tasks done but not yet joined")
     r.push("static hl_chan* g_rt_chans  = NULL; // live-channel registry (guarded by g_rt_mu)")
     r.push("")
     r.push("// Deadlock check — call with g_rt_mu HELD, before blocking.")
@@ -8667,6 +9233,9 @@ fn runtime_lines() -> list[str] {
     r.push("static void hl_rt_deadlock_check(void) {")
     r.push("    int64_t alive = g_rt_tasks + 1;   // +1: the main thread")
     r.push("    if (g_rt_blocked != alive) return;")
+    r.push("    // Stage 33: if any task is done but not yet joined, a join")
+    r.push("    // waiter can proceed — not a deadlock.")
+    r.push("    if (g_rt_done_unjoined > 0) return;")
     r.push("    for (hl_chan* c = g_rt_chans; c; c = c->reg_next) {")
     r.push("        if (c->head && c->waiters > 0) return;       // a consumer can proceed")
     r.push("        if (c->send_waiters > 0 && c->count < c->cap) return;  // a woken sender can proceed")
@@ -8989,6 +9558,7 @@ fn runtime_lines() -> list[str] {
     r.push("    t->res = res;")
     r.push("    t->done = true;")
     r.push("    g_rt_tasks--;")
+    r.push("    g_rt_done_unjoined++;   // Stage 33: a join waiter can now proceed")
     r.push("    if (t->refcnt == 0 && !t->freed) { t->freed = true; free(t); }  // abandoned")
     r.push("    pthread_cond_broadcast(&g_rt_cv);")
     r.push("    pthread_mutex_unlock(&g_rt_mu);")
@@ -9042,6 +9612,153 @@ fn runtime_lines() -> list[str] {
     r.push("    return t;")
     r.push("}")
     r.push("")
+    # Stage 33 (v0.52.0-alpha): async_spawn runtime helpers.
+    # hl_async_spawn: starts a detached thread running a trampoline that
+    # takes a single void* argbox (no hl_task* — the async task has no
+    # join handle; the caller awaits the Future channel).
+    r.push("static void* hl_async_spawn_entry(void* pv) {")
+    r.push("    void** box = (void**)pv;")
+    r.push("    void (*body)(void*) = (void(*)(void*))box[0];")
+    r.push("    void* argbox = box[1];")
+    r.push("    free(box);")
+    r.push("    body(argbox);")
+    r.push("    pthread_mutex_lock(&g_rt_mu);")
+    r.push("    g_rt_tasks--;")
+    r.push("    pthread_cond_broadcast(&g_rt_cv);")
+    r.push("    pthread_mutex_unlock(&g_rt_mu);")
+    r.push("    return NULL;")
+    r.push("}")
+    r.push("")
+    r.push("static void hl_async_spawn(void (*body)(void*), void* argbox) {")
+    r.push("    void** box = (void**)malloc(2 * sizeof(void*));")
+    r.push("    if (!box) hl_die(\"out of memory\");")
+    r.push("    box[0] = (void*)body;")
+    r.push("    box[1] = argbox;")
+    r.push("    pthread_mutex_lock(&g_rt_mu);")
+    r.push("    g_rt_tasks++;")
+    r.push("    pthread_mutex_unlock(&g_rt_mu);")
+    r.push("    pthread_t th;")
+    r.push("    if (pthread_create(&th, NULL, hl_async_spawn_entry, box) != 0) {")
+    r.push("        pthread_mutex_lock(&g_rt_mu);")
+    r.push("        g_rt_tasks--;")
+    r.push("        pthread_mutex_unlock(&g_rt_mu);")
+    r.push("        free(box);")
+    r.push("        hl_die(\"async_spawn: cannot create thread\");")
+    r.push("    }")
+    r.push("    pthread_detach(th);")
+    r.push("}")
+    r.push("")
+    # Stage 34 (v0.53.0-alpha): stream combinator runtime helpers.
+    # Each takes a worker fn ptr + the channels/args. The worker runs in
+    # a detached thread; when it returns, g_rt_tasks is decremented.
+    r.push("typedef struct { void (*body)(hl_chan*, hl_chan*); hl_chan* in_s; hl_chan* out_s; } hl_stream_comb_ctx;")
+    r.push("static void* hl_async_spawn_stream_entry(void* pv) {")
+    r.push("    hl_stream_comb_ctx* c = (hl_stream_comb_ctx*)pv;")
+    r.push("    void (*body)(hl_chan*, hl_chan*) = c->body;")
+    r.push("    hl_chan* in_s = c->in_s;")
+    r.push("    hl_chan* out_s = c->out_s;")
+    r.push("    free(c);")
+    r.push("    body(in_s, out_s);")
+    r.push("    pthread_mutex_lock(&g_rt_mu);")
+    r.push("    g_rt_tasks--;")
+    r.push("    pthread_cond_broadcast(&g_rt_cv);")
+    r.push("    pthread_mutex_unlock(&g_rt_mu);")
+    r.push("    return NULL;")
+    r.push("}")
+    r.push("")
+    r.push("static void hl_async_spawn_stream(void (*body)(hl_chan*, hl_chan*), hl_chan* in_s, hl_chan* out_s) {")
+    r.push("    hl_stream_comb_ctx* c = (hl_stream_comb_ctx*)malloc(sizeof(hl_stream_comb_ctx));")
+    r.push("    if (!c) hl_die(\"out of memory\");")
+    r.push("    c->body = body; c->in_s = in_s; c->out_s = out_s;")
+    r.push("    pthread_mutex_lock(&g_rt_mu);")
+    r.push("    g_rt_tasks++;")
+    r.push("    pthread_mutex_unlock(&g_rt_mu);")
+    r.push("    pthread_t th;")
+    r.push("    if (pthread_create(&th, NULL, hl_async_spawn_stream_entry, c) != 0) {")
+    r.push("        pthread_mutex_lock(&g_rt_mu);")
+    r.push("        g_rt_tasks--;")
+    r.push("        pthread_mutex_unlock(&g_rt_mu);")
+    r.push("        free(c);")
+    r.push("        hl_die(\"stream combinator: cannot create thread\");")
+    r.push("    }")
+    r.push("    pthread_detach(th);")
+    r.push("}")
+    r.push("")
+    # stream_take worker: takes (in_s, out_s, n).
+    r.push("typedef struct { void (*body)(hl_chan*, hl_chan*, int64_t); hl_chan* in_s; hl_chan* out_s; int64_t n; } hl_stream_take_ctx;")
+    r.push("static void* hl_async_spawn_take_entry(void* pv) {")
+    r.push("    hl_stream_take_ctx* c = (hl_stream_take_ctx*)pv;")
+    r.push("    void (*body)(hl_chan*, hl_chan*, int64_t) = c->body;")
+    r.push("    hl_chan* in_s = c->in_s;")
+    r.push("    hl_chan* out_s = c->out_s;")
+    r.push("    int64_t n = c->n;")
+    r.push("    free(c);")
+    r.push("    body(in_s, out_s, n);")
+    r.push("    pthread_mutex_lock(&g_rt_mu);")
+    r.push("    g_rt_tasks--;")
+    r.push("    pthread_cond_broadcast(&g_rt_cv);")
+    r.push("    pthread_mutex_unlock(&g_rt_mu);")
+    r.push("    return NULL;")
+    r.push("}")
+    r.push("")
+    r.push("static void hl_async_spawn_take(void (*body)(hl_chan*, hl_chan*, int64_t), hl_chan* in_s, hl_chan* out_s, int64_t n) {")
+    r.push("    hl_stream_take_ctx* c = (hl_stream_take_ctx*)malloc(sizeof(hl_stream_take_ctx));")
+    r.push("    if (!c) hl_die(\"out of memory\");")
+    r.push("    c->body = body; c->in_s = in_s; c->out_s = out_s; c->n = n;")
+    r.push("    pthread_mutex_lock(&g_rt_mu);")
+    r.push("    g_rt_tasks++;")
+    r.push("    pthread_mutex_unlock(&g_rt_mu);")
+    r.push("    pthread_t th;")
+    r.push("    if (pthread_create(&th, NULL, hl_async_spawn_take_entry, c) != 0) {")
+    r.push("        pthread_mutex_lock(&g_rt_mu);")
+    r.push("        g_rt_tasks--;")
+    r.push("        pthread_mutex_unlock(&g_rt_mu);")
+    r.push("        free(c);")
+    r.push("        hl_die(\"stream_take: cannot create thread\");")
+    r.push("    }")
+    r.push("    pthread_detach(th);")
+    r.push("}")
+    r.push("")
+    # stream_merge worker: takes (a, b, out_s).
+    r.push("typedef struct { void (*body)(hl_chan*, hl_chan*, hl_chan*); hl_chan* a; hl_chan* b; hl_chan* out_s; } hl_stream_merge_ctx;")
+    r.push("static void* hl_async_spawn_merge_entry(void* pv) {")
+    r.push("    hl_stream_merge_ctx* c = (hl_stream_merge_ctx*)pv;")
+    r.push("    void (*body)(hl_chan*, hl_chan*, hl_chan*) = c->body;")
+    r.push("    hl_chan* a = c->a;")
+    r.push("    hl_chan* b = c->b;")
+    r.push("    hl_chan* out_s = c->out_s;")
+    r.push("    free(c);")
+    r.push("    body(a, b, out_s);")
+    r.push("    pthread_mutex_lock(&g_rt_mu);")
+    r.push("    g_rt_tasks--;")
+    r.push("    pthread_cond_broadcast(&g_rt_cv);")
+    r.push("    pthread_mutex_unlock(&g_rt_mu);")
+    r.push("    return NULL;")
+    r.push("}")
+    r.push("")
+    r.push("static void hl_async_spawn_merge(void (*body)(hl_chan*, hl_chan*, hl_chan*), hl_chan* a, hl_chan* b, hl_chan* out_s) {")
+    r.push("    hl_stream_merge_ctx* c = (hl_stream_merge_ctx*)malloc(sizeof(hl_stream_merge_ctx));")
+    r.push("    if (!c) hl_die(\"out of memory\");")
+    r.push("    c->body = body; c->a = a; c->b = b; c->out_s = out_s;")
+    r.push("    pthread_mutex_lock(&g_rt_mu);")
+    r.push("    g_rt_tasks++;")
+    r.push("    pthread_mutex_unlock(&g_rt_mu);")
+    r.push("    pthread_t th;")
+    r.push("    if (pthread_create(&th, NULL, hl_async_spawn_merge_entry, c) != 0) {")
+    r.push("        pthread_mutex_lock(&g_rt_mu);")
+    r.push("        g_rt_tasks--;")
+    r.push("        pthread_mutex_unlock(&g_rt_mu);")
+    r.push("        free(c);")
+    r.push("        hl_die(\"stream_merge: cannot create thread\");")
+    r.push("    }")
+    r.push("    pthread_detach(th);")
+    r.push("}")
+    r.push("")
+    # INT64_MIN constant for the sentinel.
+    r.push("#ifndef INT64_MIN")
+    r.push("#define INT64_MIN (-9223372036854775807LL - 1)")
+    r.push("#endif")
+    r.push("")
     r.push("static void hl_task_join_wait(hl_task* t) {")
     r.push("    pthread_mutex_lock(&g_rt_mu);")
     r.push("    if (t->joined) {")
@@ -9055,6 +9772,7 @@ fn runtime_lines() -> list[str] {
     r.push("        g_rt_blocked--;")
     r.push("    }")
     r.push("    t->joined = true;")
+    r.push("    g_rt_done_unjoined--;   // Stage 33: this task is now joined")
     r.push("    pthread_mutex_unlock(&g_rt_mu);")
     r.push("}")
     r.push("")
@@ -9938,6 +10656,11 @@ fn c_type(ctx: Ctx, t_in: str) -> str {
     if is_task_t(t) {
         return "hl_task*"
     }
+    # Stage 33 (v0.52.0-alpha): Future[T] — runtime is a hl_chan* (cap 1).
+    # Stage 34 (v0.53.0-alpha): Stream[T] — runtime is a hl_chan* (cap N).
+    if is_future_t(t) || is_stream_t(t) {
+        return "hl_chan*"
+    }
     return c_type_name(t) + "*"
 }
 
@@ -9951,6 +10674,10 @@ fn is_ptr_type(t: str) -> bool {
     }
     if is_chan_t(t) || is_task_t(t) {
         # Stage 16: channels and task handles are heap objects.
+        return true
+    }
+    # Stage 33/34: Future[T] and Stream[T] are heap objects (channels).
+    if is_future_t(t) || is_stream_t(t) {
         return true
     }
     return true
@@ -10275,6 +11002,11 @@ fn release_fn_for(ctx: Ctx, t_in: str) -> str {
     if is_task_t(t) {
         return "hl_task_release"
     }
+    # Stage 33/34: Future[T] and Stream[T] are channels under the hood —
+    # their release fn is the same as a channel's.
+    if is_future_t(t) || is_stream_t(t) {
+        return "hl_chan_release"
+    }
     return "hl_release_" + c_type_name(t)
 }
 
@@ -10296,6 +11028,10 @@ fn cleanup_fn_for(ctx: Ctx, t_in: str) -> str {
     }
     if is_task_t(t) {
         return "hl_cleanup_task"
+    }
+    # Stage 33/34: Future[T] and Stream[T] use the channel cleanup.
+    if is_future_t(t) || is_stream_t(t) {
+        return "hl_cleanup_chan"
     }
     return "hl_cleanup_" + c_type_name(t)
 }
@@ -13308,6 +14044,10 @@ fn gen_call(ctx: Ctx, e: int) -> str {
         if is_chan_t(at) {
             return "hl_chan_clone(" + args + ")"
         }
+        # Stage 33/34: Future[T] and Stream[T] clone via hl_chan_clone.
+        if is_future_t(at) || is_stream_t(at) {
+            return "hl_chan_clone(" + args + ")"
+        }
         register_clone(ctx, at)
         if at == "str" {
             return "hl_clone_str(" + args + ")"
@@ -13381,8 +14121,208 @@ fn gen_call(ctx: Ctx, e: int) -> str {
     if name == "spawn" {
         return gen_spawn_call(ctx, e)
     }
+    if name == "async_spawn" {
+        return gen_async_spawn_call(ctx, e)
+    }
+    if name == "gen_spawn" {
+        return gen_gen_spawn_call(ctx, e)
+    }
+    if name == "stream_map_int" || name == "stream_filter_int"
+        || name == "stream_fold_int" || name == "stream_flat_map_int" {
+        return gen_stream_combinator(ctx, e, name)
+    }
     if name == "select" {
         return "hl_chan_select(" + args + ")"
+    }
+    # ----- Stage 33 (v0.52.0-alpha): async/await builtins -----
+    # await(fut) -> T : a future IS a hl_chan* (cap 1); await is chan.recv.
+    if name == "await" {
+        let fut_c: str = gen_expr(ctx, ctx.exprs[e].args.get(0))
+        let inner_t: str = inst_t(ctx, ctx.exprs[e].t)
+        if inner_t == "int" {
+            return "hl_chan_recv_i64(" + fut_c + ")"
+        }
+        if inner_t == "float" {
+            return "hl_chan_recv_f64(" + fut_c + ")"
+        }
+        if inner_t == "bool" {
+            return "(hl_chan_recv_i64(" + fut_c + ") != 0)"
+        }
+        return "((" + c_type(ctx, inner_t) + ")hl_chan_recv_ptr(" + fut_c + "))"
+    }
+    # future_ready(v) -> Future[T]: create a cap-1 chan, send v, return chan.
+    if name == "future_ready" {
+        let inner_t: str = future_inner_t(inst_t(ctx, ctx.exprs[e].t))
+        let v_c: str = gen_own_arg(ctx, ctx.exprs[e].args.get(0))
+        # Emit: (hl_chan* c = hl_chan_new_bounded(1, rel), hl_chan_send_<s>(c, v), c)
+        # But HLS codegen is expression-based, so we use a helper that
+        # does all three. We emit an inline-expression helper per call
+        # site (a static inline fn) to keep it as a single expression.
+        let n: int = ctx.future_ready_n
+        ctx.future_ready_n = ctx.future_ready_n + 1
+        let nid: str = n.to_str()
+        let mut rel: str = "NULL"
+        if inner_t != "int" && inner_t != "float" && inner_t != "bool" {
+            rel = release_fn_for(ctx, inner_t)
+        }
+        let mut send_fn: str = "hl_chan_send_i64"
+        if inner_t == "int" {
+            send_fn = "hl_chan_send_i64"
+        } else if inner_t == "float" {
+            send_fn = "hl_chan_send_f64"
+        } else if inner_t == "bool" {
+            send_fn = "hl_chan_send_i64"
+        } else {
+            send_fn = "hl_chan_send_ptr"
+        }
+        let mut v_cast: str = v_c
+        if inner_t == "bool" {
+            v_cast = "(" + v_c + " ? 1 : 0)"
+        } else if inner_t != "int" && inner_t != "float" {
+            v_cast = "(void*)" + v_c
+        }
+        let d: list[str] = []
+        d.push("static hl_chan* hl_future_ready_" + nid + "(void) {")
+        d.push("    hl_chan* c = hl_chan_new_bounded(1, " + rel + ");")
+        d.push("    " + send_fn + "(c, " + v_cast + ");")
+        d.push("    return c;")
+        d.push("}")
+        d.push("")
+        let mut di: int = 0
+        while di < d.len() {
+            ctx.spawn_decls.push(d.get(di))
+            di = di + 1
+        }
+        return "hl_future_ready_" + nid + "()"
+    }
+    # future_poll(fut) -> Option[T]: non-blocking poll.
+    # We emit a per-site helper that returns a heap-allocated Option enum
+    # value (Some(v) if ready, None otherwise). The enum value is
+    # allocated via the standard enum-construction helper.
+    if name == "future_poll" {
+        # For simplicity (and because Option[T] enum instantiation is
+        # complex to emit inline), we emit a per-site helper that does
+        # the poll and constructs the Option. The helper is named
+        # hl_future_poll_N.
+        let inner_t: str = future_inner_t(ctx.exprs[e].t)
+        let n: int = ctx.future_poll_n
+        ctx.future_poll_n = ctx.future_poll_n + 1
+        let nid: str = n.to_str()
+        let enum_t: str = "Option[" + inner_t + "]"
+        let enum_c: str = c_type_name(enum_t) + "*"
+        # Force the Option instantiation (so the Some/None constructors
+        # and the release fn are emitted).
+        collect_insts(ctx, enum_t)
+        # The constructor names follow the existing enum-literal pattern:
+        # usf_make_<TypeEnum>_<Variant>.
+        let some_fn: str = "usf_make_" + c_type_name(enum_t) + "_Some"
+        let none_fn: str = "usf_make_" + c_type_name(enum_t) + "_None"
+        # For the recv: we peek via hl_chan_len; if > 0, recv and wrap.
+        let mut recv_expr: str = "hl_chan_recv_i64(c)"
+        if inner_t == "float" {
+            recv_expr = "hl_chan_recv_f64(c)"
+        } else if inner_t == "bool" {
+            recv_expr = "(hl_chan_recv_i64(c) != 0)"
+        } else {
+            recv_expr = "((" + c_type(ctx, inner_t) + ")hl_chan_recv_ptr(c))"
+        }
+        let d: list[str] = []
+        d.push("static " + enum_c + " hl_future_poll_" + nid + "(hl_chan* c) {")
+        d.push("    if (hl_chan_len(c) > 0) {")
+        d.push("        return " + some_fn + "(" + recv_expr + ");")
+        d.push("    }")
+        d.push("    return " + none_fn + "();")
+        d.push("}")
+        d.push("")
+        let mut di: int = 0
+        while di < d.len() {
+            ctx.spawn_decls.push(d.get(di))
+            di = di + 1
+        }
+        let fut_c: str = gen_expr(ctx, ctx.exprs[e].args.get(0))
+        return "hl_future_poll_" + nid + "(" + fut_c + ")"
+    }
+    # future_select(futs) -> int: same as select() (futures ARE channels).
+    if name == "future_select" {
+        return "hl_chan_select(" + args + ")"
+    }
+    # ----- Stage 34 (v0.53.0-alpha): async stream builtins -----
+    # stream_new(cap) -> Stream[T]: bounded chan.
+    if name == "stream_new" {
+        let inner_t: str = stream_inner_t(ctx.exprs[e].t)
+        let mut rel: str = "NULL"
+        if inner_t != "int" && inner_t != "float" && inner_t != "bool" {
+            rel = release_fn_for(ctx, inner_t)
+        }
+        let cap_c: str = gen_expr(ctx, ctx.exprs[e].args.get(0))
+        return "hl_chan_new_bounded(" + cap_c + ", " + rel + ")"
+    }
+    # stream_send(s, v) -> void: same as chan.send.
+    if name == "stream_send" {
+        let s_c: str = gen_expr(ctx, ctx.exprs[e].args.get(0))
+        let st_t: str = ctx.exprs[ctx.exprs[e].args.get(0)].t
+        let et: str = stream_inner_t(st_t)
+        let v_c: str = gen_own_arg(ctx, ctx.exprs[e].args.get(1))
+        if et == "int" {
+            return "hl_chan_send_i64(" + s_c + ", " + v_c + ")"
+        }
+        if et == "float" {
+            return "hl_chan_send_f64(" + s_c + ", " + v_c + ")"
+        }
+        if et == "bool" {
+            return "hl_chan_send_i64(" + s_c + ", (" + v_c + " ? 1 : 0))"
+        }
+        return "hl_chan_send_ptr(" + s_c + ", (void*)" + v_c + ")"
+    }
+    # stream_recv(s) -> T: same as chan.recv.
+    if name == "stream_recv" {
+        let s_c: str = gen_expr(ctx, ctx.exprs[e].args.get(0))
+        let inner_t: str = inst_t(ctx, ctx.exprs[e].t)
+        if inner_t == "int" {
+            return "hl_chan_recv_i64(" + s_c + ")"
+        }
+        if inner_t == "float" {
+            return "hl_chan_recv_f64(" + s_c + ")"
+        }
+        if inner_t == "bool" {
+            return "(hl_chan_recv_i64(" + s_c + ") != 0)"
+        }
+        return "((" + c_type(ctx, inner_t) + ")hl_chan_recv_ptr(" + s_c + "))"
+    }
+    # stream_try_recv(s, default) -> T: same as chan.recv_or.
+    if name == "stream_try_recv" {
+        let s_c: str = gen_expr(ctx, ctx.exprs[e].args.get(0))
+        let st_t: str = ctx.exprs[ctx.exprs[e].args.get(0)].t
+        let et: str = stream_inner_t(st_t)
+        let d_c: str = gen_expr(ctx, ctx.exprs[e].args.get(1))
+        if et == "int" {
+            return "hl_chan_recv_or_i64(" + s_c + ", " + d_c + ")"
+        }
+        if et == "float" {
+            return "hl_chan_recv_or_f64(" + s_c + ", " + d_c + ")"
+        }
+        if et == "bool" {
+            return "(hl_chan_recv_or_i64(" + s_c + ", (" + d_c + " ? 1 : 0)) != 0)"
+        }
+        return "((" + c_type(ctx, et) + ")hl_chan_recv_or_ptr(" + s_c + ", (void*)" + d_c + "))"
+    }
+    # stream_len(s) -> int: same as chan.len.
+    if name == "stream_len" {
+        let s_c: str = gen_expr(ctx, ctx.exprs[e].args.get(0))
+        return "hl_chan_len(" + s_c + ")"
+    }
+    # stream_close(s) -> void: send the int sentinel (INT64_MIN).
+    if name == "stream_close" {
+        let s_c: str = gen_expr(ctx, ctx.exprs[e].args.get(0))
+        return "hl_chan_send_i64(" + s_c + ", INT64_MIN)"
+    }
+    # stream_take_int(in_s, n) -> Stream[int]: spawn a worker.
+    if name == "stream_take_int" {
+        return gen_stream_take_int(ctx, e)
+    }
+    # stream_merge_int(a, b) -> Stream[int]: spawn a worker.
+    if name == "stream_merge_int" {
+        return gen_stream_merge_int(ctx, e)
     }
     panic("internal codegen error: unknown builtin function " + name)
     return ""
@@ -13541,6 +14481,446 @@ fn gen_spawn_call(ctx: Ctx, e: int) -> str {
         return "hl_spawn(hl_tramp_" + nid + ", NULL)"
     }
     return "hl_spawn(hl_tramp_" + nid + ", hl_mkargs_" + nid + "(" + join(cargs, ", ") + "))"
+}
+
+# Stage 33 (v0.52.0-alpha): gen_async_spawn_call — codegen for
+# async_spawn(f, args...) -> Future[T]. Mirrors gen_spawn_call but:
+#   - the trampoline sends the result on a cap-1 bounded channel instead
+#     of calling hl_task_finish;
+#   - the call site creates the channel and passes it as an extra arg;
+#   - the return value is the channel (typed as Future[T]).
+# The trampoline signature is (void* argbox) — no hl_task* parameter,
+# because async tasks don't have a join handle (the caller awaits the
+# future, not joins a task).
+fn gen_async_spawn_call(ctx: Ctx, e: int) -> str {
+    let fname: str = ctx.exprs[e].mop
+    let tf: FnInfo = ctx.fns.get_or(fname, dummy_fn())
+    lto_note_call(ctx, fname)
+    let n: int = ctx.spawn_n
+    ctx.spawn_n = ctx.spawn_n + 1
+    let nid: str = n.to_str()
+    # --- call-site argument expressions (with the boundary rule) ---
+    let cargs: list[str] = []
+    let mut i: int = 0
+    while i < ctx.exprs[e].args.len() {
+        let aidx: int = ctx.exprs[e].args.get(i)
+        let pt: str = tf.ptypes.get(i)
+        let cex: str = gen_expr(ctx, aidx)
+        let argkind: str = ctx.exprs[aidx].kind
+        let is_clone_call: bool = argkind == "call" && ctx.exprs[aidx].mkey == "clone"
+        let mut bound: str = cex
+        if pt == "int" || pt == "float" || pt == "bool" {
+            bound = cex
+        } else if is_chan_t(pt) || is_future_t(pt) || is_stream_t(pt) {
+            bound = cex
+        } else if is_clone_call || argkind == "str" || expr_fresh(ctx, aidx) {
+            bound = cex
+        } else {
+            bound = clone_expr_for(ctx, pt, cex)
+        }
+        cargs.push(bound)
+        i = i + 1
+    }
+    # --- emit the top-level helpers ---
+    let ret: str = tf.ret
+    let mut send_fn: str = "hl_chan_send_i64"
+    let mut result_cast: str = ""
+    if ret == "int" {
+        send_fn = "hl_chan_send_i64"
+    } else if ret == "float" {
+        send_fn = "hl_chan_send_f64"
+    } else if ret == "bool" {
+        send_fn = "hl_chan_send_i64"
+        result_cast = " ? 1 : 0"
+    } else {
+        send_fn = "hl_chan_send_ptr"
+        result_cast = "(void*)"
+    }
+    # The argbox struct: the user's args + a hl_chan* (the result channel).
+    let d: list[str] = []
+    let sname: str = "hl_asa_" + nid + "_t"
+    let mk_cparams: list[str] = ["hl_chan* res"]
+    let fields: list[str] = ["    hl_chan* res;"]
+    let mut k: int = 0
+    while k < tf.ptypes.len() {
+        let pct: str = c_type(ctx, tf.ptypes.get(k))
+        mk_cparams.push(pct + " a" + k.to_str())
+        fields.push("    " + pct + " f" + k.to_str() + ";")
+        k = k + 1
+    }
+    d.push("typedef struct {")
+    d.push(join(fields, "\n"))
+    d.push("} " + sname + ";")
+    d.push("static void* hl_mkargs_async_" + nid + "(" + join(mk_cparams, ", ") + ") {")
+    d.push("    " + sname + "* p = (" + sname + "*)malloc(sizeof(" + sname + "));")
+    d.push("    if (!p) hl_die(\"out of memory\");")
+    d.push("    p->res = res;")
+    let mut m: int = 0
+    while m < tf.ptypes.len() {
+        d.push("    p->f" + m.to_str() + " = a" + m.to_str() + ";")
+        m = m + 1
+    }
+    d.push("    return (void*)p;")
+    d.push("}")
+    # The trampoline: call the target, send result on res channel, free.
+    d.push("static void hl_atramp_" + nid + "(void* pv) {")
+    d.push("    " + sname + "* a = (" + sname + "*)pv;")
+    let arglist: list[str] = []
+    let mut q: int = 0
+    while q < tf.ptypes.len() {
+        arglist.push("a->f" + q.to_str())
+        q = q + 1
+    }
+    let callname: str = "usf_" + c_fn_name(fname) + "(" + join(arglist, ", ") + ")"
+    if ret == "void" {
+        # Should not happen (checker rejects), but handle defensively.
+        d.push("    " + callname + ";")
+        d.push("    free(a);")
+    } else if ret == "int" {
+        d.push("    int64_t r = " + callname + ";")
+        d.push("    " + send_fn + "(a->res, r);")
+        d.push("    free(a);")
+    } else if ret == "float" {
+        d.push("    double r = " + callname + ";")
+        d.push("    " + send_fn + "(a->res, r);")
+        d.push("    free(a);")
+    } else if ret == "bool" {
+        d.push("    bool r = " + callname + ";")
+        d.push("    " + send_fn + "(a->res, r" + result_cast + ");")
+        d.push("    free(a);")
+    } else {
+        d.push("    " + c_type(ctx, ret) + " r = " + callname + ";")
+        d.push("    " + send_fn + "(a->res, " + result_cast + "r);")
+        d.push("    free(a);")
+    }
+    d.push("}")
+    d.push("")
+    let mut di: int = 0
+    while di < d.len() {
+        ctx.spawn_decls.push(d.get(di))
+        di = di + 1
+    }
+    # --- the call-site expression ---
+    # Create the result channel (cap 1, bounded), spawn the trampoline
+    # with the channel + user args, return the channel.
+    let mut rel: str = "NULL"
+    if ret != "int" && ret != "float" && ret != "bool" {
+        rel = release_fn_for(ctx, ret)
+    }
+    # The wrapper takes ONLY the user's args (not res — res is created
+    # inside the wrapper). It builds the argbox, spawns the trampoline,
+    # and returns res.
+    let wrapper: str = "hl_async_spawn_" + nid
+    # Wrapper params = user args only.
+    let wrap_cparams: list[str] = []
+    let mut wi2: int = 0
+    while wi2 < tf.ptypes.len() {
+        let pct: str = c_type(ctx, tf.ptypes.get(wi2))
+        wrap_cparams.push(pct + " a" + wi2.to_str())
+        wi2 = wi2 + 1
+    }
+    let wd: list[str] = []
+    wd.push("static hl_chan* " + wrapper + "(" + join(wrap_cparams, ", ") + ") {")
+    wd.push("    hl_chan* res = hl_chan_new_bounded(1, " + rel + ");")
+    if tf.ptypes.len() == 0 {
+        wd.push("    hl_async_spawn(hl_atramp_" + nid + ", NULL);")
+    } else {
+        # Build the arg list: "res" first, then the user args.
+        let call_args: list[str] = ["res"]
+        let mut ci: int = 0
+        while ci < cargs.len() {
+            call_args.push("a" + ci.to_str())
+            ci = ci + 1
+        }
+        wd.push("    hl_async_spawn(hl_atramp_" + nid + ", hl_mkargs_async_" + nid + "(" + join(call_args, ", ") + "));")
+    }
+    wd.push("    return res;")
+    wd.push("}")
+    wd.push("")
+    let mut wi: int = 0
+    while wi < wd.len() {
+        ctx.spawn_decls.push(wd.get(wi))
+        wi = wi + 1
+    }
+    if tf.ptypes.len() == 0 {
+        return wrapper + "()"
+    }
+    return wrapper + "(" + join(cargs, ", ") + ")"
+}
+
+# Stage 34 (v0.53.0-alpha): gen_gen_spawn_call — codegen for
+# gen_spawn(f, args...) -> Stream[T]. The target takes the Stream as
+# its first param; the codegen creates the stream, spawns f(stream, args),
+# returns the stream.
+fn gen_gen_spawn_call(ctx: Ctx, e: int) -> str {
+    let fname: str = ctx.exprs[e].mop
+    let tf: FnInfo = ctx.fns.get_or(fname, dummy_fn())
+    lto_note_call(ctx, fname)
+    let n: int = ctx.spawn_n
+    ctx.spawn_n = ctx.spawn_n + 1
+    let nid: str = n.to_str()
+    # The stream's element type comes from the return context's expected
+    # type. The checker set ctx.exprs[e].t to the Stream[T] type.
+    let stream_t: str = ctx.exprs[e].t
+    let elem_t: str = stream_inner_t(stream_t)
+    let mut rel: str = "NULL"
+    if elem_t != "int" && elem_t != "float" && elem_t != "bool" {
+        rel = release_fn_for(ctx, elem_t)
+    }
+    # --- call-site argument expressions (boundary rule) ---
+    # The user's args are tf.params[1:] (params[0] is the stream).
+    let cargs: list[str] = []
+    let mut i: int = 0
+    while i < ctx.exprs[e].args.len() {
+        let aidx: int = ctx.exprs[e].args.get(i)
+        let pt: str = tf.ptypes.get(i + 1)
+        let cex: str = gen_expr(ctx, aidx)
+        let argkind: str = ctx.exprs[aidx].kind
+        let is_clone_call: bool = argkind == "call" && ctx.exprs[aidx].mkey == "clone"
+        let mut bound: str = cex
+        if pt == "int" || pt == "float" || pt == "bool" {
+            bound = cex
+        } else if is_chan_t(pt) || is_future_t(pt) || is_stream_t(pt) {
+            bound = cex
+        } else if is_clone_call || argkind == "str" || expr_fresh(ctx, aidx) {
+            bound = cex
+        } else {
+            bound = clone_expr_for(ctx, pt, cex)
+        }
+        cargs.push(bound)
+        i = i + 1
+    }
+    # Emit a per-site wrapper that creates the stream and spawns the generator.
+    let wrapper: str = "hl_gen_spawn_" + nid
+    let cparams: list[str] = []
+    let mut k: int = 0
+    while k < tf.ptypes.len() - 1 {
+        let pct: str = c_type(ctx, tf.ptypes.get(k + 1))
+        cparams.push(pct + " a" + k.to_str())
+        k = k + 1
+    }
+    let d: list[str] = []
+    d.push("static hl_chan* " + wrapper + "(" + join(cparams, ", ") + ") {")
+    d.push("    hl_chan* stream = hl_chan_new_bounded(16, " + rel + ");")
+    # Build the argbox: stream first, then user args.
+    let sname: str = "hl_gsa_" + nid + "_t"
+    let fields: list[str] = ["    hl_chan* stream;"]
+    let mut m: int = 0
+    while m < tf.ptypes.len() - 1 {
+        let pct: str = c_type(ctx, tf.ptypes.get(m + 1))
+        fields.push("    " + pct + " f" + m.to_str() + ";")
+        m = m + 1
+    }
+    d.push("    " + sname + "* a = (" + sname + "*)malloc(sizeof(" + sname + "));")
+    d.push("    if (!a) hl_die(\"out of memory\");")
+    d.push("    a->stream = stream;")
+    let mut p: int = 0
+    while p < cargs.len() {
+        d.push("    a->f" + p.to_str() + " = " + cargs.get(p) + ";")
+        p = p + 1
+    }
+    # Emit the arg struct + trampoline.
+    ctx.spawn_decls.push("typedef struct {")
+    ctx.spawn_decls.push(join(fields, "\n"))
+    ctx.spawn_decls.push("} " + sname + ";")
+    # Trampoline.
+    let arglist: list[str] = ["a->stream"]
+    let mut q: int = 0
+    while q < tf.ptypes.len() - 1 {
+        arglist.push("a->f" + q.to_str())
+        q = q + 1
+    }
+    let callname: str = "usf_" + c_fn_name(fname) + "(" + join(arglist, ", ") + ")"
+    ctx.spawn_decls.push("static void hl_gtramp_" + nid + "(void* pv) {")
+    ctx.spawn_decls.push("    " + sname + "* a = (" + sname + "*)pv;")
+    ctx.spawn_decls.push("    " + callname + ";")
+    ctx.spawn_decls.push("    free(a);")
+    ctx.spawn_decls.push("}")
+    ctx.spawn_decls.push("")
+    d.push("    hl_async_spawn(hl_gtramp_" + nid + ", a);")
+    d.push("    return stream;")
+    d.push("}")
+    d.push("")
+    let mut di: int = 0
+    while di < d.len() {
+        ctx.spawn_decls.push(d.get(di))
+        di = di + 1
+    }
+    if cargs.len() == 0 {
+        return wrapper + "()"
+    }
+    return wrapper + "(" + join(cargs, ", ") + ")"
+}
+
+# Stage 34: gen_stream_combinator — codegen for stream_map_int /
+# stream_filter_int / stream_fold_int / stream_flat_map_int.
+# For map/filter/flat_map: creates an output stream, spawns a worker that
+#   reads from in_stream, applies fn_name, writes to out_stream.
+# For fold: emits an inline loop that drains in_stream and applies fn_name.
+fn gen_stream_combinator(ctx: Ctx, e: int, name: str) -> str {
+    let fname: str = ctx.exprs[e].mop
+    let tf: FnInfo = ctx.fns.get_or(fname, dummy_fn())
+    lto_note_call(ctx, fname)
+    let in_c: str = gen_expr(ctx, ctx.exprs[e].args.get(0))
+    if name == "stream_fold_int" {
+        # Blocking fold: emit an inline block-expression.
+        # The fold fn has signature fn(int, int) -> int; we call it as
+        # usf_<fname>(acc, v).
+        let init_c: str = gen_expr(ctx, ctx.exprs[e].args.get(1))
+        # Emit a per-site helper that does the fold loop.
+        let n: int = ctx.spawn_n
+        ctx.spawn_n = ctx.spawn_n + 1
+        let nid: str = n.to_str()
+        let helper: str = "hl_stream_fold_" + nid
+        let d: list[str] = []
+        d.push("static int64_t " + helper + "(hl_chan* in_s, int64_t init) {")
+        d.push("    int64_t acc = init;")
+        d.push("    while (1) {")
+        d.push("        int64_t v = hl_chan_recv_i64(in_s);")
+        d.push("        if (v == INT64_MIN) break;")
+        d.push("        acc = usf_" + c_fn_name(fname) + "(acc, v);")
+        d.push("    }")
+        d.push("    return acc;")
+        d.push("}")
+        d.push("")
+        let mut di: int = 0
+        while di < d.len() {
+            ctx.spawn_decls.push(d.get(di))
+            di = di + 1
+        }
+        return helper + "(" + in_c + ", " + init_c + ")"
+    }
+    # map / filter / flat_map: create output stream, spawn a worker.
+    let n: int = ctx.spawn_n
+    ctx.spawn_n = ctx.spawn_n + 1
+    let nid: str = n.to_str()
+    let out_s: str = "hl_stream_out_" + nid
+    let worker: str = "hl_stream_worker_" + nid
+    let d: list[str] = []
+    d.push("static void " + worker + "(hl_chan* in_s, hl_chan* out_s) {")
+    if name == "stream_map_int" {
+        d.push("    while (1) {")
+        d.push("        int64_t v = hl_chan_recv_i64(in_s);")
+        d.push("        if (v == INT64_MIN) { hl_chan_send_i64(out_s, INT64_MIN); return; }")
+        d.push("        int64_t r = usf_" + c_fn_name(fname) + "(v);")
+        d.push("        hl_chan_send_i64(out_s, r);")
+        d.push("    }")
+    } else if name == "stream_filter_int" {
+        d.push("    while (1) {")
+        d.push("        int64_t v = hl_chan_recv_i64(in_s);")
+        d.push("        if (v == INT64_MIN) { hl_chan_send_i64(out_s, INT64_MIN); return; }")
+        d.push("        if (usf_" + c_fn_name(fname) + "(v)) { hl_chan_send_i64(out_s, v); }")
+        d.push("    }")
+    } else if name == "stream_flat_map_int" {
+        d.push("    while (1) {")
+        d.push("        int64_t v = hl_chan_recv_i64(in_s);")
+        d.push("        if (v == INT64_MIN) { hl_chan_send_i64(out_s, INT64_MIN); return; }")
+        d.push("        hl_chan* inner = (hl_chan*)usf_" + c_fn_name(fname) + "(v);")
+        d.push("        while (1) {")
+        d.push("            int64_t iv = hl_chan_recv_i64(inner);")
+        d.push("            if (iv == INT64_MIN) break;")
+        d.push("            hl_chan_send_i64(out_s, iv);")
+        d.push("        }")
+        d.push("    }")
+    }
+    d.push("}")
+    d.push("")
+    let mut di: int = 0
+    while di < d.len() {
+        ctx.spawn_decls.push(d.get(di))
+        di = di + 1
+    }
+    # Emit the call-site wrapper that creates out_s + spawns the worker.
+    let wrapper: str = "hl_stream_comb_" + nid
+    let wd: list[str] = []
+    wd.push("static hl_chan* " + wrapper + "(hl_chan* in_s) {")
+    wd.push("    hl_chan* out_s = hl_chan_new_bounded(16, NULL);")
+    wd.push("    hl_async_spawn_stream(" + worker + ", in_s, out_s);")
+    wd.push("    return out_s;")
+    wd.push("}")
+    wd.push("")
+    let mut wi: int = 0
+    while wi < wd.len() {
+        ctx.spawn_decls.push(wd.get(wi))
+        wi = wi + 1
+    }
+    return wrapper + "(" + in_c + ")"
+}
+
+# Stage 34: gen_stream_take_int — codegen for stream_take_int(in_s, n).
+fn gen_stream_take_int(ctx: Ctx, e: int) -> str {
+    let in_c: str = gen_expr(ctx, ctx.exprs[e].args.get(0))
+    let n_c: str = gen_expr(ctx, ctx.exprs[e].args.get(1))
+    let n: int = ctx.spawn_n
+    ctx.spawn_n = ctx.spawn_n + 1
+    let nid: str = n.to_str()
+    let worker: str = "hl_stream_take_worker_" + nid
+    let wrapper: str = "hl_stream_take_" + nid
+    let d: list[str] = []
+    d.push("static void " + worker + "(hl_chan* in_s, hl_chan* out_s, int64_t n) {")
+    d.push("    int64_t count = 0;")
+    d.push("    while (count < n) {")
+    d.push("        int64_t v = hl_chan_recv_i64(in_s);")
+    d.push("        if (v == INT64_MIN) break;")
+    d.push("        hl_chan_send_i64(out_s, v);")
+    d.push("        count++;")
+    d.push("    }")
+    d.push("    hl_chan_send_i64(out_s, INT64_MIN);")
+    d.push("}")
+    d.push("")
+    d.push("static hl_chan* " + wrapper + "(hl_chan* in_s, int64_t n) {")
+    d.push("    hl_chan* out_s = hl_chan_new_bounded(16, NULL);")
+    d.push("    hl_async_spawn_take(" + worker + ", in_s, out_s, n);")
+    d.push("    return out_s;")
+    d.push("}")
+    d.push("")
+    let mut di: int = 0
+    while di < d.len() {
+        ctx.spawn_decls.push(d.get(di))
+        di = di + 1
+    }
+    return wrapper + "(" + in_c + ", " + n_c + ")"
+}
+
+# Stage 34: gen_stream_merge_int — codegen for stream_merge_int(a, b).
+fn gen_stream_merge_int(ctx: Ctx, e: int) -> str {
+    let a_c: str = gen_expr(ctx, ctx.exprs[e].args.get(0))
+    let b_c: str = gen_expr(ctx, ctx.exprs[e].args.get(1))
+    let n: int = ctx.spawn_n
+    ctx.spawn_n = ctx.spawn_n + 1
+    let nid: str = n.to_str()
+    let worker: str = "hl_stream_merge_worker_" + nid
+    let wrapper: str = "hl_stream_merge_" + nid
+    let d: list[str] = []
+    d.push("static void " + worker + "(hl_chan* a, hl_chan* b, hl_chan* out_s) {")
+    d.push("    int a_done = 0, b_done = 0;")
+    d.push("    while (!a_done || !b_done) {")
+    d.push("        if (!a_done) {")
+    d.push("            int64_t v = hl_chan_recv_i64(a);")
+    d.push("            if (v == INT64_MIN) a_done = 1;")
+    d.push("            else hl_chan_send_i64(out_s, v);")
+    d.push("        }")
+    d.push("        if (!b_done) {")
+    d.push("            int64_t v = hl_chan_recv_i64(b);")
+    d.push("            if (v == INT64_MIN) b_done = 1;")
+    d.push("            else hl_chan_send_i64(out_s, v);")
+    d.push("        }")
+    d.push("    }")
+    d.push("    hl_chan_send_i64(out_s, INT64_MIN);")
+    d.push("}")
+    d.push("")
+    d.push("static hl_chan* " + wrapper + "(hl_chan* a, hl_chan* b) {")
+    d.push("    hl_chan* out_s = hl_chan_new_bounded(16, NULL);")
+    d.push("    hl_async_spawn_merge(" + worker + ", a, b, out_s);")
+    d.push("    return out_s;")
+    d.push("}")
+    d.push("")
+    let mut di: int = 0
+    while di < d.len() {
+        ctx.spawn_decls.push(d.get(di))
+        di = di + 1
+    }
+    return wrapper + "(" + a_c + ", " + b_c + ")"
 }
 
 fn gen_method(ctx: Ctx, e: int) -> str {
@@ -15932,6 +17312,11 @@ fn clone_expr_for(ctx: Ctx, t: str, cexpr: str) -> str {
     if is_chan_t(tt) {
         return "hl_chan_clone(" + cexpr + ")"
     }
+    # Stage 33/34: Future[T] and Stream[T] are channels under the hood —
+    # clone via hl_chan_clone (atomic refcount +1).
+    if is_future_t(tt) || is_stream_t(tt) {
+        return "hl_chan_clone(" + cexpr + ")"
+    }
     return "hl_clone_" + c_type_name(tt) + "(" + cexpr + ")"
 }
 
@@ -15945,6 +17330,10 @@ fn register_clone(ctx: Ctx, t: str) -> void {
     # Stage 16: channels clone via the runtime helper hl_chan_clone (no
     # per-instantiation generator); Task cannot be cloned at all.
     if is_chan_t(tt) || is_task_t(tt) {
+        return
+    }
+    # Stage 33/34: Future[T] and Stream[T] clone via hl_chan_clone.
+    if is_future_t(tt) || is_stream_t(tt) {
         return
     }
     if list_has(ctx.clone_insts, t) {

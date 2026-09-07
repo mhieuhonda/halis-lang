@@ -115,6 +115,9 @@ class Parser:
         "true", "false",  # boolean literals are reserved too
         # Stage 16 (v0.27.0-alpha): built-in concurrency wrappers.
         "Chan", "Task",
+        # Stage 33 (v0.52.0-alpha): built-in async/await wrapper.
+        # Stage 34 (v0.53.0-alpha): built-in async stream wrapper.
+        "Future", "Stream",
     }
 
     # Stage 28+29 (v0.45.0-alpha): attribute parser state. The boot
@@ -684,6 +687,29 @@ class Parser:
             inner = self.parse_type(allow_void=True)
             self.eat_sym("]")
             return "Task[%s]" % inner
+        # Stage 33 (v0.52.0-alpha): `Future[T]` — a stackless state
+        # machine for asynchronous computation. Built-in generic wrapper
+        # (no struct/enum definition needed); the checker recognises it.
+        # Runtime representation: a `hl_chan*` of capacity 1 (bounded).
+        # Cannot be void: a future must carry a value.
+        if base == "Future":
+            self.eat_sym("[")
+            inner = self.parse_type()
+            self.eat_sym("]")
+            if inner == "void":
+                self.err("Future[T] element type cannot be void", t)
+            return "Future[%s]" % inner
+        # Stage 34 (v0.53.0-alpha): `Stream[T]` — a push-based async
+        # stream. Built-in generic wrapper. Runtime representation: a
+        # bounded `hl_chan*` (backpressure: producer blocks when full).
+        # Cannot be void: a stream must carry values.
+        if base == "Stream":
+            self.eat_sym("[")
+            inner = self.parse_type()
+            self.eat_sym("]")
+            if inner == "void":
+                self.err("Stream[T] element type cannot be void", t)
+            return "Stream[%s]" % inner
         if base in PRIM_TYPES:
             if base == "void" and not allow_void:
                 self.err("void can only be used as a return type", t)

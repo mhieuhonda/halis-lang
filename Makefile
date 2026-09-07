@@ -8,7 +8,7 @@ HLC     = src/hlc.hls
 BIN     = bin
 PREFIX  ?= /usr/local
 
-.PHONY: all stage0 bootstrap test examples clean run check bench install uninstall audit opt-stats emit-ir emit-llvm fmt lint lsp-check pkg-init pkg-add pkg-lock pkg-audit pkg-verify pkg-build pkg-publish pkg-log pkg-log-verify prove prove-full model prove-acceptance hltest fuzz cov fuzz-acceptance wasm-opt webapp webapp-acceptance serve aarch64-bench aarch64-acceptance aarch64-list-targets stack-acceptance inline-acceptance opt-stats-report kernel-attrs escape-acceptance layout-report tail-acceptance tail-report asm-acceptance asm-attrs bench-stdlib spec-check stage32-acceptance
+.PHONY: all stage0 bootstrap test examples clean run check bench install uninstall audit opt-stats emit-ir emit-llvm fmt lint lsp-check pkg-init pkg-add pkg-lock pkg-audit pkg-verify pkg-build pkg-publish pkg-log pkg-log-verify prove prove-full model prove-acceptance hltest fuzz cov fuzz-acceptance wasm-opt webapp webapp-acceptance serve aarch64-bench aarch64-acceptance aarch64-list-targets stack-acceptance inline-acceptance opt-stats-report kernel-attrs escape-acceptance layout-report tail-acceptance tail-report asm-acceptance asm-attrs bench-stdlib spec-check stage32-acceptance async-acceptance stream-acceptance
 
 # Main goal: use the full bootstrap chain to build the native compiler
 all: bootstrap
@@ -1315,3 +1315,50 @@ stage32-acceptance: bench-stdlib spec-check
 	@echo "is properly specialised (matches hand-written C reference)."
 
 .PHONY: bench-stdlib spec-check stage32-acceptance
+
+# ============================================================================
+# Stage 33 (v0.52.0-alpha): async/await zero-runtime futures
+# ============================================================================
+async-acceptance: bin/hlc
+	@$(PYTHON) boot/boot.py examples/async_demo.hls > /tmp/async_interp.txt 2>&1
+	@bin/hlc examples/async_demo.hls /tmp/async_demo.c 2>/dev/null
+	@gcc -O2 -o /tmp/async_demo /tmp/async_demo.c -lm -pthread 2>/dev/null
+	@/tmp/async_demo > /tmp/async_nat.txt 2>&1
+	@diff -q /tmp/async_interp.txt /tmp/async_nat.txt >/dev/null 2>&1 \
+		|| (echo "FAIL: async_demo differential mismatch" && false)
+	@$(PYTHON) boot/boot.py tests/ok/feat_stage33_async.hls > /tmp/s33_interp.txt 2>&1
+	@bin/hlc tests/ok/feat_stage33_async.hls /tmp/s33.c 2>/dev/null
+	@gcc -O2 -o /tmp/s33 /tmp/s33.c -lm -pthread 2>/dev/null
+	@/tmp/s33 > /tmp/s33_nat.txt 2>&1
+	@diff -q /tmp/s33_interp.txt /tmp/s33_nat.txt >/dev/null 2>&1 \
+		|| (echo "FAIL: feat_stage33_async differential mismatch" && false)
+	@echo ""
+	@echo "ACCEPTANCE OK: Stage 33 -- async/await zero-runtime futures"
+	@echo "  async_spawn / await / future_ready / future_poll / future_select"
+	@echo "  differential (interpreter == native) verified green."
+
+.PHONY: async-acceptance
+
+# ============================================================================
+# Stage 34 (v0.53.0-alpha): async stream combinators (channels x generators)
+# ============================================================================
+stream-acceptance: bin/hlc
+	@$(PYTHON) boot/boot.py examples/stream_demo.hls > /tmp/stream_interp.txt 2>&1
+	@bin/hlc examples/stream_demo.hls /tmp/stream_demo.c 2>/dev/null
+	@gcc -O2 -o /tmp/stream_demo /tmp/stream_demo.c -lm -pthread 2>/dev/null
+	@/tmp/stream_demo > /tmp/stream_nat.txt 2>&1
+	@diff -q /tmp/stream_interp.txt /tmp/stream_nat.txt >/dev/null 2>&1 \
+		|| (echo "FAIL: stream_demo differential mismatch" && false)
+	@$(PYTHON) boot/boot.py tests/ok/feat_stage34_stream.hls > /tmp/s34_interp.txt 2>&1
+	@bin/hlc tests/ok/feat_stage34_stream.hls /tmp/s34.c 2>/dev/null
+	@gcc -O2 -o /tmp/s34 /tmp/s34.c -lm -pthread 2>/dev/null
+	@/tmp/s34 > /tmp/s34_nat.txt 2>&1
+	@diff -q /tmp/s34_interp.txt /tmp/s34_nat.txt >/dev/null 2>&1 \
+		|| (echo "FAIL: feat_stage34_stream differential mismatch" && false)
+	@echo ""
+	@echo "ACCEPTANCE OK: Stage 34 -- async stream combinators"
+	@echo "  stream_new / send / recv / close / map / filter / take / fold / merge / flat_map"
+	@echo "  gen_spawn (generator pattern)"
+	@echo "  differential (interpreter == native) verified green."
+
+.PHONY: stream-acceptance

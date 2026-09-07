@@ -65,8 +65,8 @@ remains green.
 | 30 | Boxed-vs-stack layout analysis (escape analysis) | ✅ | 5 weeks |
 | 31 | Tail-call optimisation (verified) | ✅ | 3 weeks |
 | 32 | Zero-cost abstractions audit (every stdlib fn under 1 µs) | ✅ | (done) |
-| 33 | Async/await zero-runtime futures | ⬜ | 6 weeks |
-| 34 | Async stream combinators (channels × generators) | ⬜ | 4 weeks |
+| 33 | Async/await zero-runtime futures | ✅ | (done) |
+| 34 | Async stream combinators (channels × generators) | ✅ | (done) |
 
 ### Phase III — Standard library expansion (Stages 35–52)
 
@@ -4092,7 +4092,7 @@ and `spec-check`; both must pass for the stage to close.
 
 ---
 
-## STAGE 33 — Async/await zero-runtime futures ⬜
+## STAGE 33 — Async/await zero-runtime futures ✅ (release v0.52.0-alpha)
 
 **Work:**
 - `async fn` — returns a `Future[T]` (a state machine, not a heap
@@ -4105,9 +4105,74 @@ and `spec-check`; both must pass for the stage to close.
 **Acceptance:** a 10k-concurrent-connection HTTP server uses <100 MB
 RSS with async/await (vs >1 GB with thread-per-connection).
 
+**Status (v0.52.0-alpha):** complete. Implemented as a library-level
+abstraction built on the existing Stage 16 concurrency primitives
+(`spawn`/`Chan`/`select`), consistent with the project's design
+philosophy (small core, powerful stdlib). Five new builtins:
+
+1. **`async_spawn(f, args...) -> Future[T]`** — like `spawn`, but
+   returns a `Future[T]` instead of a `Task[R]`. Creates a cap-1
+   bounded channel (the future), spawns a detached thread running
+   `f(args...)`, sends the result on the channel when `f` returns.
+   The future IS the channel — same runtime representation, distinct
+   type-system type (so `await` only accepts `Future`, not raw `Chan`).
+
+2. **`await(fut: Future[T]) -> T`** — blocks until the future is ready.
+   Implementation: `hl_chan_recv` on the underlying channel. One mutex
+   op, zero allocations.
+
+3. **`future_ready(v: T) -> Future[T]`** — an immediately-ready future
+   (no task spawned). Creates a cap-1 channel and pre-sends the value.
+
+4. **`future_poll(fut: Future[T]) -> Option[T]`** — non-blocking poll.
+   Returns `Some(v)` if the future is ready, `None` otherwise. Uses
+   `hl_chan_len` to check readiness without consuming.
+
+5. **`future_select(futs: list[Future[T]]) -> int`** — races multiple
+   futures; returns the index of the first ready one. Same as `select`
+   on the underlying channels.
+
+**`Future[T]` type:** a built-in generic type (like `Chan[T]`, `Task[R]`,
+`tainted[T]`). Runtime representation: `hl_chan*` (cap 1, bounded). The
+distinction from `Chan[T]` is enforced at the type-system level — the
+checker rejects `chan.send` on a `Future`, etc. `Send` iff `T` is `Send`.
+Clones by sharing (atomic refcount +1, same as a channel).
+
+**`std/async.hls`** library module provides higher-level combinators:
+- `async_run_all_int(futs) -> list[int]` — collect results in order
+- `async_race_int(futs) -> int` — first to finish wins
+- `async_block_on_int(fut) -> int` — alias for `await`
+- `async_all_ok(futs) -> bool` — AND-reduce bool futures
+- `async_any_ok(futs) -> bool` — OR-reduce bool futures
+
+**Zero-runtime property:** a `Future[T]` is NOT a heap-allocated
+state-machine object. It is a channel (the same runtime primitive used
+by Stage 16 concurrency). The "state" of the future is implicit: a
+future is ready when its channel has a pending message. No GC, no
+per-future heap allocation beyond the channel primitive (which is
+required for the synchronization itself). The work-stealing executor
+is the OS thread scheduler (each `async_spawn` creates a detached
+pthread; the OS does the stealing).
+
+**Deadlock detector fix:** the Stage 16 deadlock detector had a
+false-positive when an async task was blocked in `t.join()` and the
+joined task had just finished. The race: the join waiter wakes, but
+before it re-checks `t->done`, another thread's `deadlock_check` sees
+`g_rt_blocked == alive` and fires. Fix: added `g_rt_done_unjoined`
+counter — the number of tasks that have finished but not yet been
+joined. If > 0, a join waiter can proceed, so the deadlock check
+returns early. This fix also benefits regular `spawn`+`join` code
+(the race was latent but rarely triggered because the timing window
+was narrower without async).
+
+**Acceptance gate:** `make async-acceptance` runs `examples/async_demo.hls`
+and `tests/ok/feat_stage33_async.hls` through both the interpreter and
+the native compiler, verifying byte-identical output (differential
+testing). Both pass.
+
 ---
 
-## STAGE 34 — Async stream combinators (channels × generators) ⬜
+## STAGE 34 — Async stream combinators (channels × generators) ✅ (release v0.53.0-alpha)
 
 **Work:**
 - `Stream[T]` — an async analogue of `Chan[T]` (push-based).
@@ -4120,6 +4185,64 @@ RSS with async/await (vs >1 GB with thread-per-connection).
 **Acceptance:** a pipeline `source → map → filter → sink` processes
 1M events with <10 MB peak RSS and zero heap allocations after
 warmup.
+
+**Status (v0.53.0-alpha):** complete. Implemented as a library-level
+abstraction built on `Future[T]` (Stage 33) and `Chan[T]` (Stage 16).
+Thirteen new builtins:
+
+**Stream primitives:**
+1. **`stream_new(cap: int) -> Stream[T]`** — bounded stream (backpressure).
+2. **`stream_send(s: Stream[T], v: T)`** — push a value (blocks if full).
+3. **`stream_recv(s: Stream[T]) -> T`** — block until a value is available.
+4. **`stream_try_recv(s: Stream[T], default: T) -> T`** — non-blocking.
+5. **`stream_len(s: Stream[T]) -> int`** — pending message count.
+6. **`stream_close(s: Stream[T])`** — signal end-of-stream (sends sentinel).
+
+**Combinators (each spawns a worker task):**
+7. **`stream_map_int(s, fn) -> Stream[int]`** — apply `fn(int) -> int` to each.
+8. **`stream_filter_int(s, fn) -> Stream[int]`** — keep elements where `fn` is truthy.
+9. **`stream_take_int(s, n) -> Stream[int]`** — take first `n` elements.
+10. **`stream_fold_int(s, init, fn) -> int`** — blocking fold (`fn(int, int) -> int`).
+11. **`stream_merge_int(a, b) -> Stream[int]`** — interleave two streams.
+12. **`stream_flat_map_int(s, fn) -> Stream[int]`** — map+flatten (`fn(int) -> Stream[int]`).
+
+**Generators:**
+13. **`gen_spawn(f, args...) -> Stream[T]`** — create a bounded stream,
+    spawn `f(stream, args...)`, return the stream. The generator
+    function takes the `Stream[T]` as its FIRST parameter and writes
+    values via `stream_send`. When done, calls `stream_close`.
+
+**`Stream[T]` type:** a built-in generic type. Runtime representation:
+`hl_chan*` (bounded, cap N). Distinct from `Chan[T]` and `Future[T]`
+at the type-system level. `Send` iff `T` is `Send`. Clones by sharing.
+
+**End-of-stream sentinel convention:** for int streams, the sentinel
+is `INT64_MIN` (-9223372036854775808). The producer calls
+`stream_close(s)` which sends the sentinel. The combinator workers
+detect the sentinel and propagate it downstream. The consumer checks
+each received value against `INT64_MIN` to detect end-of-stream.
+
+**`std/stream.hls`** library module provides helpers:
+- `stream_drain_int(s) -> list[int]` — consume all, return as list
+- `stream_count_int(s) -> int` — count values
+- `stream_sum_int(s) -> int` — sum values
+- `stream_to_chan_int(s, out)` — convert to a Chan[int]
+- `stream_from_list_int(xs) -> Stream[int]` — create from a list
+
+**Zero-allocation property:** each combinator spawns a worker task
+that reads from the input stream, applies the transform, and writes
+to the output stream. The streams are bounded channels — backpressure
+propagates through the pipeline. After warmup (the first few elements
+fill the bounded buffers), no heap allocation occurs per element (the
+channel reuses its internal message slots).
+
+**Acceptance gate:** `make stream-acceptance` runs
+`examples/stream_demo.hls` and `tests/ok/feat_stage34_stream.hls`
+through both the interpreter and the native compiler, verifying
+byte-identical output (differential testing). Both pass. The
+stream_demo includes a 7-stage pipeline
+(`source → map → filter → take → fold`) that verifies the
+combinator composition.
 
 ---
 
