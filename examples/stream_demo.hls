@@ -1,0 +1,147 @@
+# stream_demo.hls — Stage 34 (v0.53.0-alpha): async stream combinators.
+#
+# This demo shows the stream primitives and combinators:
+#   stream_new(cap) -> Stream[T]         bounded stream (backpressure)
+#   stream_send(s, v)                    push a value
+#   stream_recv(s) -> T                  block until a value is available
+#   stream_close(s)                      signal end-of-stream (sentinel)
+#   stream_map_int(s, fn) -> Stream[int] apply fn to each element
+#   stream_filter_int(s, fn) -> Stream[int]  keep elements where fn is truthy
+#   stream_take_int(s, n) -> Stream[int] take first n elements
+#   stream_fold_int(s, init, fn) -> int  blocking fold
+#   stream_merge_int(a, b) -> Stream[int]  interleave two streams
+#   stream_flat_map_int(s, fn) -> Stream[int]  map + flatten
+#   gen_spawn(f, args...) -> Stream[T]   spawn a generator function
+#
+# Backpressure: a Stream is a bounded channel. If the consumer is slow,
+# the producer blocks at stream_send (no unbounded buffering). This is
+# the key property that keeps peak RSS bounded under load.
+#
+# End-of-stream sentinel: for int streams, the sentinel is INT64_MIN.
+# The producer calls stream_close(s) which sends the sentinel. The
+# combinator workers detect the sentinel and propagate it downstream.
+
+import "std.stream"
+
+# A generator function: takes a Stream[int] as its first parameter,
+# writes values via stream_send, then calls stream_close.
+fn count_gen(out: Stream[int], n: int) uses Conc {
+    let mut i: int = 0
+    while i < n {
+        stream_send(out, i)
+        i = i + 1
+    }
+    stream_close(out)
+}
+
+# A transform fn for stream_map_int: signature fn(int) -> int.
+fn double_it(v: int) -> int {
+    return v * 2
+}
+
+# A predicate for stream_filter_int: signature fn(int) -> int (truthy).
+fn is_even(v: int) -> int {
+    if v % 2 == 0 {
+        return 1
+    }
+    return 0
+}
+
+# A fold fn for stream_fold_int: signature fn(int, int) -> int.
+fn add_them(acc: int, v: int) -> int {
+    return acc + v
+}
+
+# A flat_map fn: signature fn(int) -> Stream[int].
+fn expand_range(v: int) -> Stream[int] uses Conc {
+    let s: Stream[int] = stream_new(16)
+    let _t: Task[void] = spawn(expand_range_worker, clone(s), v)
+    return s
+}
+
+fn expand_range_worker(out: Stream[int], v: int) uses Conc {
+    let mut i: int = 0
+    while i < v {
+        stream_send(out, i)
+        i = i + 1
+    }
+    stream_close(out)
+}
+
+fn main() -> int uses IO, Conc {
+    # 1. gen_spawn + drain: the basic generator pattern.
+    let s: Stream[int] = gen_spawn(count_gen, 5)
+    let sum: int = stream_sum_int(s)
+    println("gen_spawn(count_gen, 5) sum = " + sum.to_str())
+    if sum != 10 {
+        return 1
+    }
+
+    # 2. stream_map_int: apply a transform to each element.
+    let s2: Stream[int] = gen_spawn(count_gen, 4)
+    let s3: Stream[int] = stream_map_int(s2, double_it)
+    let sum2: int = stream_sum_int(s3)
+    println("map(double, 0..4) sum = " + sum2.to_str())
+    # 0*2 + 1*2 + 2*2 + 3*2 = 12
+    if sum2 != 12 {
+        return 2
+    }
+
+    # 3. stream_filter_int: keep only even elements.
+    let s4: Stream[int] = gen_spawn(count_gen, 10)
+    let s5: Stream[int] = stream_filter_int(s4, is_even)
+    let count: int = stream_count_int(s5)
+    println("filter(is_even, 0..10) count = " + count.to_str())
+    # 0, 2, 4, 6, 8 = 5 elements
+    if count != 5 {
+        return 3
+    }
+
+    # 4. stream_fold_int: blocking fold.
+    let s6: Stream[int] = gen_spawn(count_gen, 10)
+    let total: int = stream_fold_int(s6, 0, add_them)
+    println("fold(+, 0, 0..10) = " + total.to_str())
+    # 0+1+2+...+9 = 45
+    if total != 45 {
+        return 4
+    }
+
+    # 5. stream_take_int: take the first n elements.
+    let s7: Stream[int] = gen_spawn(count_gen, 100)
+    let s8: Stream[int] = stream_take_int(s7, 5)
+    let take_sum: int = stream_sum_int(s8)
+    println("take(0..100, 5) sum = " + take_sum.to_str())
+    # 0+1+2+3+4 = 10
+    if take_sum != 10 {
+        return 5
+    }
+
+    # 6. stream_merge_int: interleave two streams.
+    let s9: Stream[int] = gen_spawn(count_gen, 3)
+    let s10: Stream[int] = gen_spawn(count_gen, 3)
+    let s11: Stream[int] = stream_merge_int(s9, s10)
+    let merge_count: int = stream_count_int(s11)
+    println("merge(0..3, 0..3) count = " + merge_count.to_str())
+    # 3 + 3 = 6
+    if merge_count != 6 {
+        return 6
+    }
+
+    # 7. Pipeline: source -> map -> filter -> take -> fold.
+    # This is the classic stream-combinator pipeline pattern.
+    let src: Stream[int] = gen_spawn(count_gen, 100)
+    let mapped: Stream[int] = stream_map_int(src, double_it)
+    let filtered: Stream[int] = stream_filter_int(mapped, is_even)
+    let taken: Stream[int] = stream_take_int(filtered, 10)
+    let pipeline_result: int = stream_fold_int(taken, 0, add_them)
+    println("pipeline (map*2 -> filter even -> take 10 -> fold) = "
+            + pipeline_result.to_str())
+    # 0..100 mapped to *2: 0,2,4,...,198. Filtered to even: all of them
+    # (they're all even after *2). Take 10: 0,2,4,...,18. Fold: 90.
+    if pipeline_result != 90 {
+        return 7
+    }
+
+    println("ALL STREAM TESTS PASSED")
+    return 0
+}

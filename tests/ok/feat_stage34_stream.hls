@@ -1,0 +1,159 @@
+# tests/ok/feat_stage34_stream.hls — Stage 34 (v0.53.0-alpha): async stream
+# combinators (channels × generators).
+#
+# Exercises every primitive:
+#   - stream_new(cap) -> Stream[T]
+#   - stream_send(s, v)
+#   - stream_recv(s) -> T
+#   - stream_try_recv(s, default) -> T
+#   - stream_len(s) -> int
+#   - stream_close(s)
+#   - stream_map_int(s, fn) -> Stream[int]
+#   - stream_filter_int(s, fn) -> Stream[int]
+#   - stream_take_int(s, n) -> Stream[int]
+#   - stream_fold_int(s, init, fn) -> int
+#   - stream_merge_int(a, b) -> Stream[int]
+#   - stream_flat_map_int(s, fn) -> Stream[int]
+#   - gen_spawn(f, args...) -> Stream[T]
+#
+# And the std.stream helpers:
+#   - stream_drain_int(s) -> list[int]
+#   - stream_count_int(s) -> int
+#   - stream_sum_int(s) -> int
+#   - stream_from_list_int(xs) -> Stream[int]
+
+import "std.stream"
+import "std.option"
+
+fn count_gen(out: Stream[int], n: int) uses Conc {
+    let mut i: int = 0
+    while i < n {
+        stream_send(out, i)
+        i = i + 1
+    }
+    stream_close(out)
+}
+
+fn double_it(v: int) -> int {
+    return v * 2
+}
+
+fn is_even(v: int) -> int {
+    if v % 2 == 0 {
+        return 1
+    }
+    return 0
+}
+
+fn add_them(acc: int, v: int) -> int {
+    return acc + v
+}
+
+fn expand_n(out: Stream[int], v: int) uses Conc {
+    let mut i: int = 0
+    while i < v {
+        stream_send(out, i)
+        i = i + 1
+    }
+    stream_close(out)
+}
+
+fn make_range_stream(v: int) -> Stream[int] uses Conc {
+    let s: Stream[int] = stream_new(16)
+    let _t: Task[void] = spawn(expand_n, clone(s), v)
+    return s
+}
+
+fn main() -> int uses IO, Conc {
+    # gen_spawn + stream_sum_int
+    let s: Stream[int] = gen_spawn(count_gen, 5)
+    if stream_sum_int(s) != 10 {
+        panic("gen_spawn + sum failed")
+    }
+
+    # stream_map_int
+    let s2: Stream[int] = gen_spawn(count_gen, 4)
+    let s3: Stream[int] = stream_map_int(s2, double_it)
+    if stream_sum_int(s3) != 12 {
+        panic("stream_map_int failed")
+    }
+
+    # stream_filter_int
+    let s4: Stream[int] = gen_spawn(count_gen, 10)
+    let s5: Stream[int] = stream_filter_int(s4, is_even)
+    if stream_count_int(s5) != 5 {
+        panic("stream_filter_int failed")
+    }
+
+    # stream_fold_int
+    let s6: Stream[int] = gen_spawn(count_gen, 10)
+    if stream_fold_int(s6, 0, add_them) != 45 {
+        panic("stream_fold_int failed")
+    }
+
+    # stream_take_int
+    let s7: Stream[int] = gen_spawn(count_gen, 100)
+    let s8: Stream[int] = stream_take_int(s7, 5)
+    if stream_sum_int(s8) != 10 {
+        panic("stream_take_int failed")
+    }
+
+    # stream_merge_int
+    let s9: Stream[int] = gen_spawn(count_gen, 3)
+    let s10: Stream[int] = gen_spawn(count_gen, 3)
+    let s11: Stream[int] = stream_merge_int(s9, s10)
+    if stream_count_int(s11) != 6 {
+        panic("stream_merge_int failed")
+    }
+
+    # stream_flat_map_int: each value v in 0..3 expands to 0..v
+    # flat_map(0..3, expand) = [0] (from 0) + [0] (from 1) + [0,1] (from 2) = 4 values
+    let s12: Stream[int] = gen_spawn(count_gen, 3)
+    let s13: Stream[int] = stream_flat_map_int(s12, make_range_stream)
+    let flat_count: int = stream_count_int(s13)
+    # v=0: expand to 0..0 (0 values), v=1: expand to 0..1 (1 value),
+    # v=2: expand to 0..2 (2 values). Total = 0+1+2 = 3 values.
+    if flat_count != 3 {
+        panic("stream_flat_map_int failed: got " + flat_count.to_str())
+    }
+
+    # stream_from_list_int + stream_drain_int (round-trip)
+    let xs: list[int] = [10, 20, 30, 40]
+    let s14: Stream[int] = stream_from_list_int(xs)
+    let drained: list[int] = stream_drain_int(s14)
+    if drained.len() != 4 {
+        panic("stream_from_list_int + drain failed: len=" + drained.len().to_str())
+    }
+    if drained.get(0) != 10 || drained.get(3) != 40 {
+        panic("stream round-trip values wrong")
+    }
+
+    # stream_try_recv (non-blocking)
+    let s15: Stream[int] = stream_new(4)
+    let v1: int = stream_try_recv(s15, -1)
+    if v1 != -1 {
+        panic("stream_try_recv on empty should return default")
+    }
+
+    # stream_len
+    let s16: Stream[int] = stream_new(4)
+    stream_send(s16, 1)
+    stream_send(s16, 2)
+    if stream_len(s16) != 2 {
+        panic("stream_len should be 2")
+    }
+
+    # Pipeline: source -> map -> filter -> take -> fold
+    let src: Stream[int] = gen_spawn(count_gen, 100)
+    let mapped: Stream[int] = stream_map_int(src, double_it)
+    let filtered: Stream[int] = stream_filter_int(mapped, is_even)
+    let taken: Stream[int] = stream_take_int(filtered, 10)
+    let pipeline_result: int = stream_fold_int(taken, 0, add_them)
+    # 0..100 *2 = 0,2,...,198 (all even). Take 10: 0,2,...,18. Sum = 90.
+    if pipeline_result != 90 {
+        panic("pipeline failed: got " + pipeline_result.to_str())
+    }
+
+    println("stage34 stream ok")
+    return 0
+}
