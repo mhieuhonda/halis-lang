@@ -4917,11 +4917,20 @@ hlmodel verifies the 2-thread / 2-lock consistent-ordering protocol
 is deadlock-free (Deadlock state unreachable from Init in a 9-state
 / 8-event finite-state model).
 
-**46. `std.thread`** — `spawn`, `join`, `yield_now`, `sleep`,
-`current` (the current thread's id), `Builder` (stack size, name).
-Preemptive scheduling via OS threads (today's `spawn` uses Python
-threads in the interpreter and pthreads in native — this stage
-formalises the model).
+**46. `std.thread`** ✅ (release v0.65.0-alpha) — `spawn`, `join`,
+`yield_now`, `sleep`, `current` (the current thread's id), `Builder`
+(stack size, name). Preemptive scheduling via OS threads (today's
+`spawn` uses Python threads in the interpreter and pthreads in native —
+this stage formalises the model). Adds three new compiler builtins
+(`thread_sleep_ms`, `thread_yield`, `thread_current_id`) wired through
+all four code-paths (boot checker, boot interpreter, self-hosted
+compiler C codegen + C runtime, LLVM IR emit). `thread_sleep_ms`
+carries Clock + Conc (uses nanosleep on POSIX, time.sleep in
+interpreter); `thread_yield` and `thread_current_id` carry Conc
+(sched_yield and pthread_self on POSIX, time.sleep(0) and
+threading.get_ident in interpreter). ThreadBuilder records spawn
+configuration (name + stack_size) for future use when the spawn
+primitive is extended to accept these.
 
 **47. `std.process`** — `Command`, `Child`, `ExitStatus`, `Stdio`
 (piped/inherited/null). `proc_exec` becomes a thin wrapper.

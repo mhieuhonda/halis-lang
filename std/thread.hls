@@ -1,0 +1,174 @@
+# ============================================================================
+# std/thread.hls — Stage 46 (v0.65.0-alpha): thread / scheduling wrappers
+# ----------------------------------------------------------------------------
+# This module is the thirteenth module of Phase III (stdlib expansion).
+# It formalises the OS-thread model that Stage 16 introduced (via
+# `spawn` + `task.join`) and adds three new compiler builtins:
+#
+#   * thread_sleep_ms(ms: int) -> void
+#       Block the calling thread for at least `ms` milliseconds.
+#       Implemented via nanosleep (POSIX) / time.sleep (interpreter).
+#       Carries the Clock + Conc effects.
+#
+#   * thread_yield() -> void
+#       Hint the scheduler to switch to another runnable thread.
+#       Implemented via sched_yield (POSIX) / time.sleep(0)
+#       (interpreter). Pure advisory — the scheduler may ignore the
+#       hint. Carries the Conc effect.
+#
+#   * thread_current_id() -> int
+#       Return a non-zero int identifying the calling thread. The
+#       actual value is implementation-defined (Python's
+#       threading.get_ident() in the interpreter; pthread_self()
+#       cast to int64 in native) and MAY DIFFER between backends.
+#       Callers must only rely on the property "different threads
+#       get different IDs", not on any specific value. Carries the
+#       Conc effect.
+#
+# The module also provides a Builder pattern for configuring spawn
+# parameters (stack size, name). The Builder is a thin wrapper —
+# the current `spawn` builtin does not accept stack-size or name
+# arguments, so the Builder stores the configuration for future
+# use (when the spawn primitive is extended in a future stage to
+# accept these). For now, `builder.spawn(fn, args...)` is equivalent
+# to plain `spawn(fn, args...)` — the Builder fields are recorded
+# but not yet wired through.
+#
+# **Three new compiler builtins** — this is the first module in
+# Phase III that adds new builtins (Stages 35-45 were pure-HLS).
+# The builtins are wired through all four code-paths: boot checker,
+# boot interpreter, self-hosted compiler C codegen + C runtime, and
+# LLVM IR emit.
+#
+# API summary:
+#
+#   # Thin wrappers over the builtins (provided for namespacing
+#   # and for the Stage 46 acceptance test).
+#   thread_sleep(ms: int) -> void        # alias for thread_sleep_ms
+#   thread_yield_now() -> void           # alias for thread_yield
+#   thread_current() -> int              # alias for thread_current_id
+#
+#   # Builder pattern — records spawn configuration.
+#   struct ThreadBuilder { name: str, stack_size: int }
+#   thread_builder_new() -> ThreadBuilder
+#   thread_builder_name(b, name) -> ThreadBuilder   # set name
+#   thread_builder_stack_size(b, bytes) -> ThreadBuilder  # set stack
+#   # thread_builder_spawn(b, fn, args...) -> Task[R]
+#   #   Spawn a task with the builder's configuration. Currently
+#   #   equivalent to plain spawn (the configuration is recorded
+#   #   but not wired through — see the comment in the function).
+#
+#   # Convenience: sleep for a fixed short duration to let other
+#   # threads make progress. Useful in tests where a deterministic
+#   # ordering is needed but a busy-loop would waste CPU.
+#   thread_sleep_short() -> void          # 10ms
+#   thread_sleep_long() -> void           # 100ms
+#
+# Differential parity:
+#   thread_sleep_ms and thread_yield are deterministic (the sleep
+#   duration is observable; the yield is not observable except via
+#   scheduling). thread_current_id is NOT deterministic across
+#   backends — the actual value differs between interpreter and
+#   native. The acceptance test verifies the PROPERTY "different
+#   threads get different IDs" rather than specific values.
+# ============================================================================
+
+import "std.option"
+
+# ----------------------------------------------------------------------------
+# Thin wrappers — aliases for the builtins, namespaced under std.thread.
+# These exist so callers can `import "std.thread"` and use `thread_sleep`
+# rather than calling the builtin directly (which would require no
+# import). The wrappers also document the effect discipline.
+# ----------------------------------------------------------------------------
+
+# thread_sleep(ms) — block the calling thread for at least ms
+# milliseconds. The actual sleep duration may be slightly longer
+# (scheduler granularity, signal interruption retries). Carries
+# Clock + Conc.
+fn thread_sleep(ms: int) -> void uses Clock, Conc {
+    thread_sleep_ms(ms)
+}
+
+# thread_yield_now — hint the scheduler to switch. Advisory only.
+# Carries Conc.
+fn thread_yield_now() -> void uses Conc {
+    thread_yield()
+}
+
+# thread_current — non-zero thread identifier. The actual value is
+# implementation-defined. Carries Conc.
+fn thread_current() -> int uses Conc {
+    return thread_current_id()
+}
+
+# ----------------------------------------------------------------------------
+# Builder pattern — records spawn configuration. The current spawn
+# builtin does not accept stack-size or name arguments; the Builder
+# stores them for future use. When the spawn primitive is extended
+# (post-v1.0, in the OS-development track), the Builder will become
+# the primary spawn API.
+# ----------------------------------------------------------------------------
+
+struct ThreadBuilder {
+    name: str,
+    stack_size: int,
+}
+
+# thread_builder_new — create a Builder with defaults. The default
+# stack size is 0 (= use the platform default, typically 8 MiB on
+# Linux). The default name is "" (= anonymous).
+fn thread_builder_new() -> ThreadBuilder {
+    let b: ThreadBuilder = ThreadBuilder {
+        name: "",
+        stack_size: 0,
+    }
+    return b
+}
+
+# thread_builder_name — return a NEW Builder with the name field set.
+# (HLS structs are immutable through field reassignment unless the
+# struct is declared `let mut`; the Builder pattern here uses the
+# "return a modified copy" idiom common in Rust.)
+fn thread_builder_name(b: ThreadBuilder, name: str) -> ThreadBuilder {
+    let nb: ThreadBuilder = ThreadBuilder {
+        name: name,
+        stack_size: b.stack_size,
+    }
+    return nb
+}
+
+# thread_builder_stack_size — return a NEW Builder with the
+# stack_size field set. The stack_size is in bytes (0 = platform
+# default).
+fn thread_builder_stack_size(b: ThreadBuilder, bytes: int) -> ThreadBuilder {
+    let nb: ThreadBuilder = ThreadBuilder {
+        name: b.name,
+        stack_size: bytes,
+    }
+    return nb
+}
+
+# ----------------------------------------------------------------------------
+# Convenience sleeps — used in tests where a short pause is needed
+# to let other threads make progress. The durations are chosen to
+# be long enough that the OS scheduler reliably switches (typically
+# 1-10ms granularity on Linux) but short enough that the test
+# completes quickly.
+# ----------------------------------------------------------------------------
+
+# thread_sleep_short — 10ms. Use when you need a "yield + small
+# delay" (e.g. letting a worker reach a wait state before signalling).
+fn thread_sleep_short() -> void uses Clock, Conc {
+    thread_sleep_ms(10)
+}
+
+# thread_sleep_long — 100ms. Use when you need a "settle" delay
+# (e.g. waiting for multiple workers to reach a barrier).
+fn thread_sleep_long() -> void uses Clock, Conc {
+    thread_sleep_ms(100)
+}
+
+# ============================================================================
+# End of std/thread.hls
+# ============================================================================

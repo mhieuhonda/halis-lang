@@ -2700,6 +2700,15 @@ fn is_builtin_fn(n: str) -> bool {
     || n == "int_and" || n == "int_or" || n == "int_xor" || n == "int_not"
     || n == "int_shl" || n == "int_shr" || n == "int_sar"
     || n == "int_popcount" || n == "int_clz" || n == "int_ctz"
+    # Stage 46 (v0.65.0-alpha): thread / scheduling builtins.
+    # thread_sleep_ms(ms) blocks the calling thread for N ms
+    # (carries Clock + Conc). thread_yield() hints the scheduler
+    # (carries Conc). thread_current_id() returns a non-zero int
+    # identifying the calling thread (carries Conc). The actual ID
+    # value is implementation-defined and may differ between the
+    # interpreter and native — callers must only rely on the
+    # property "different threads get different IDs".
+    || n == "thread_sleep_ms" || n == "thread_yield" || n == "thread_current_id"
 }
 
 fn list_has(list: list[str], x: str) -> bool {
@@ -3046,6 +3055,18 @@ fn builtin_effect(name: str) -> list[str] {
     }
     if name == "clock_ms" {
         return ["Clock"]
+    }
+    # Stage 46 (v0.65.0-alpha): thread / scheduling builtins.
+    # thread_sleep_ms carries BOTH Clock (it observes the wall clock
+    # for the sleep duration) AND Conc (it interacts with the
+    # concurrency runtime's blocked-thread accounting, so the
+    # deadlock detector's invariants still hold). thread_yield and
+    # thread_current_id carry Conc only.
+    if name == "thread_sleep_ms" {
+        return ["Clock", "Conc"]
+    }
+    if name == "thread_yield" || name == "thread_current_id" {
+        return ["Conc"]
     }
     if name == "args" || name == "tainted_args" {
         # Stage 10-alpha: tainted_args carries the same Args effect as args.
@@ -7575,6 +7596,38 @@ fn check_builtin_call(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, 
         add_edge(ctx, cur, "b:clock_ms")
         return "int"
     }
+    # Stage 46 (v0.65.0-alpha): thread / scheduling builtins.
+    # thread_sleep_ms(ms: int) -> void — blocks the calling thread.
+    # The ms argument must be a non-negative int (literal negative
+    # values are compile errors; dynamic negative values panic at
+    # runtime).
+    if name == "thread_sleep_ms" {
+        if nargs != 1 || argt.get(0) != "int" {
+            cerr(line, "thread_sleep_ms() expects 1 int argument (ms)")
+        }
+        if ctx.exprs[ctx.exprs[e].args.get(0)].kind == "int"
+            && ctx.exprs[ctx.exprs[e].args.get(0)].ival < 0 {
+            cerr(line, "thread_sleep_ms() duration must be >= 0 (literal negative)")
+        }
+        add_edge(ctx, cur, "b:thread_sleep_ms")
+        return "void"
+    }
+    # thread_yield() -> void — hint the scheduler to switch.
+    if name == "thread_yield" {
+        if nargs != 0 {
+            cerr(line, "thread_yield() takes no arguments")
+        }
+        add_edge(ctx, cur, "b:thread_yield")
+        return "void"
+    }
+    # thread_current_id() -> int — non-zero thread identifier.
+    if name == "thread_current_id" {
+        if nargs != 0 {
+            cerr(line, "thread_current_id() takes no arguments")
+        }
+        add_edge(ctx, cur, "b:thread_current_id")
+        return "int"
+    }
     if name == "chr" {
         if nargs != 1 || argt.get(0) != "int" {
             cerr(line, "chr() expects 1 int argument")
@@ -9225,6 +9278,12 @@ fn runtime_lines() -> list[str] {
     r.push("#endif")
     # Stage 16 (v0.27.0-alpha): the concurrency runtime (pthread-based).
     r.push("#include <pthread.h>")
+    # Stage 46 (v0.65.0-alpha): thread / scheduling builtins.
+    # sched_yield is declared in sched.h. errno / EINTR (used by the
+    # nanosleep retry loop in hl_thread_sleep_ms) are in errno.h.
+    # Both are tiny system headers; the include cost is negligible.
+    r.push("#include <sched.h>")
+    r.push("#include <errno.h>")
     r.push("")
     # ---- Stage 8-beta: the refcounted runtime (END OF ARENA) ----
     # Every heap object starts with an int64_t refcnt as its FIRST field so
@@ -10598,6 +10657,47 @@ fn runtime_lines() -> list[str] {
     r.push("    struct timespec ts;")
     r.push("    clock_gettime(CLOCK_MONOTONIC, &ts);")
     r.push("    return (int64_t)ts.tv_sec * 1000 + (int64_t)ts.tv_nsec / 1000000;")
+    r.push("}")
+    r.push("")
+    # Stage 46 (v0.65.0-alpha): thread / scheduling runtime helpers.
+    # hl_thread_sleep_ms(ms) blocks the calling thread for ms
+    # milliseconds via nanosleep. A negative duration is a programming
+    # error (the checker rejects literal negatives; dynamic negatives
+    # panic here). The sleep is interruptible by signals only in the
+    # sense that nanosleep returns the remaining time — we loop to
+    # re-sleep the remainder so the full duration always elapses.
+    # This matches the interpreter's time.sleep behaviour (which is
+    # also uninterruptible from the user's perspective).
+    r.push("static void hl_thread_sleep_ms(int64_t ms) {")
+    r.push("    if (ms < 0) hl_die(\"thread_sleep_ms: duration must be >= 0\");")
+    r.push("    if (ms == 0) {")
+    r.push("        // Sleep(0) on POSIX: yield via sched_yield, not nanosleep(0).")
+    r.push("        // nanosleep(0) is a no-op (returns immediately) which is")
+    r.push("        // correct but less scheduler-friendly than sched_yield.")
+    r.push("        sched_yield();")
+    r.push("        return;")
+    r.push("    }")
+    r.push("    struct timespec req;")
+    r.push("    req.tv_sec = ms / 1000;")
+    r.push("    req.tv_nsec = (ms % 1000) * 1000000L;")
+    r.push("    while (nanosleep(&req, &req) == -1 && errno == EINTR) {")
+    r.push("        // Re-sleep the remainder after a signal interruption.")
+    r.push("    }")
+    r.push("}")
+    r.push("")
+    # hl_thread_yield() — hint the scheduler to switch. Uses
+    # sched_yield() on POSIX. The interpreter uses time.sleep(0)
+    # which yields the GIL — equivalent semantics.
+    r.push("static void hl_thread_yield(void) {")
+    r.push("    sched_yield();")
+    r.push("}")
+    r.push("")
+    # hl_thread_current_id() — non-zero thread identifier. Uses
+    # pthread_self() cast to int64. The actual value is implementation-
+    # defined (may differ between interpreter and native); callers
+    # must only rely on "different threads get different IDs".
+    r.push("static int64_t hl_thread_current_id(void) {")
+    r.push("    return (int64_t)pthread_self();")
     r.push("}")
     r.push("")
     r.push("static void hl_panic(hl_str* msg) {")
@@ -14655,6 +14755,18 @@ fn gen_call(ctx: Ctx, e: int) -> str {
     }
     if name == "clock_ms" {
         return "hl_clock_ms()"
+    }
+    # Stage 46 (v0.65.0-alpha): thread / scheduling builtins.
+    # Each maps to a single C runtime helper (see emit_thread_runtime
+    # below for the helper definitions).
+    if name == "thread_sleep_ms" {
+        return "hl_thread_sleep_ms(" + args + ")"
+    }
+    if name == "thread_yield" {
+        return "hl_thread_yield()"
+    }
+    if name == "thread_current_id" {
+        return "hl_thread_current_id()"
     }
     if name == "chr" {
         return "hl_chr(" + args + ")"

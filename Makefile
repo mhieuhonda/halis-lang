@@ -31,7 +31,7 @@ else
   HL_CURL_DEFS :=
 endif
 
-.PHONY: all stage0 bootstrap test examples clean run check bench install uninstall audit opt-stats emit-ir emit-llvm fmt lint lsp-check pkg-init pkg-add pkg-lock pkg-audit pkg-verify pkg-build pkg-publish pkg-log pkg-log-verify prove prove-full model prove-acceptance hltest fuzz cov fuzz-acceptance wasm-opt webapp webapp-acceptance serve aarch64-bench aarch64-acceptance aarch64-list-targets stack-acceptance inline-acceptance opt-stats-report kernel-attrs escape-acceptance layout-report tail-acceptance tail-report asm-acceptance asm-attrs bench-stdlib spec-check stage32-acceptance async-acceptance stream-acceptance io-acceptance fs-acceptance net-acceptance http-acceptance http2-acceptance json-stream-acceptance regex-acceptance fmt-acceptance hash-acceptance collections-acceptance
+.PHONY: all stage0 bootstrap test examples clean run check bench install uninstall audit opt-stats emit-ir emit-llvm fmt lint lsp-check pkg-init pkg-add pkg-lock pkg-audit pkg-verify pkg-build pkg-publish pkg-log pkg-log-verify prove prove-full model prove-acceptance hltest fuzz cov fuzz-acceptance wasm-opt webapp webapp-acceptance serve aarch64-bench aarch64-acceptance aarch64-list-targets stack-acceptance inline-acceptance opt-stats-report kernel-attrs escape-acceptance layout-report tail-acceptance tail-report asm-acceptance asm-attrs bench-stdlib spec-check stage32-acceptance async-acceptance stream-acceptance io-acceptance fs-acceptance net-acceptance http-acceptance http2-acceptance json-stream-acceptance regex-acceptance fmt-acceptance hash-acceptance collections-acceptance sync-acceptance thread-acceptance
 
 # Main goal: use the full bootstrap chain to build the native compiler
 all: bootstrap
@@ -1742,10 +1742,8 @@ sync-acceptance: bin/hlc
 	@/tmp/s45 > /tmp/s45_nat.txt 2>&1
 	@diff -q /tmp/s45_interp.txt /tmp/s45_nat.txt >/dev/null 2>&1 \
 		|| (echo "FAIL: feat_stage45_sync differential mismatch" && false)
-	@# Stage 45 acceptance criterion: hlmodel verifies the 2-thread /
-	@# 2-lock acquisition protocol is deadlock-free. The model file
-	@# defines a 9-state / 8-event finite-state machine; the BFS
-	@# confirms Deadlock state is unreachable from Init.
+	@# Stage 45 acceptance: hlmodel verifies the 2-thread / 2-lock
+	@# acquisition protocol is deadlock-free (Deadlock state unreachable).
 	@python3 tools/hlmodel.py tests/ok/feat_stage45_sync_model.hls --fn step --invariant no_deadlock --init Init > /tmp/s45_hlmodel.txt 2>&1
 	@grep -q "invariant 'no_deadlock' holds on every reachable state" /tmp/s45_hlmodel.txt \
 		|| (echo "FAIL: hlmodel deadlock check failed" && cat /tmp/s45_hlmodel.txt && false)
@@ -1763,3 +1761,34 @@ sync-acceptance: bin/hlc
 
 .PHONY: sync-acceptance
 
+# ============================================================================
+# Stage 46 (v0.65.0-alpha): std.thread -- thread_sleep_ms, thread_yield,
+# thread_current_id, ThreadBuilder. Three new compiler builtins wired
+# through all four code-paths (boot checker, boot interpreter,
+# self-hosted compiler C codegen + C runtime, LLVM IR emit).
+# ============================================================================
+thread-acceptance: bin/hlc
+	@$(PYTHON) boot/boot.py examples/thread_demo.hls > /tmp/thread_interp.txt 2>&1
+	@bin/hlc examples/thread_demo.hls /tmp/thread_demo.c 2>/dev/null
+	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/thread_demo /tmp/thread_demo.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
+	@/tmp/thread_demo > /tmp/thread_nat.txt 2>&1
+	@diff -q /tmp/thread_interp.txt /tmp/thread_nat.txt >/dev/null 2>&1 \
+		|| (echo "FAIL: thread_demo differential mismatch" && false)
+	@$(PYTHON) boot/boot.py tests/ok/feat_stage46_thread.hls > /tmp/s46_interp.txt 2>&1
+	@bin/hlc tests/ok/feat_stage46_thread.hls /tmp/s46.c 2>/dev/null
+	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/s46 /tmp/s46.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
+	@/tmp/s46 > /tmp/s46_nat.txt 2>&1
+	@diff -q /tmp/s46_interp.txt /tmp/s46_nat.txt >/dev/null 2>&1 \
+		|| (echo "FAIL: feat_stage46_thread differential mismatch" && false)
+	@rm -f /tmp/thread_demo /tmp/thread_demo.c /tmp/thread_interp.txt /tmp/thread_nat.txt \
+		/tmp/s46 /tmp/s46.c /tmp/s46_interp.txt /tmp/s46_nat.txt
+	@echo ""
+	@echo "ACCEPTANCE OK: Stage 46 -- std.thread (sleep, yield, current_id, Builder)"
+	@echo "  thread_sleep_ms (nanosleep on POSIX, time.sleep in interpreter; Clock + Conc)"
+	@echo "  thread_yield (sched_yield on POSIX, time.sleep(0) in interpreter; Conc)"
+	@echo "  thread_current_id (pthread_self cast to int64; non-zero, distinct per thread)"
+	@echo "  ThreadBuilder (name + stack_size; immutable update pattern)"
+	@echo "  three new builtins wired through all 4 code-paths (checker/interp/hlc/llvm)"
+	@echo "  differential (interpreter == native) verified green."
+
+.PHONY: thread-acceptance

@@ -1451,6 +1451,40 @@ class Interp:
             return bytes([args[0]])
         if name == "clock_ms":
             return int(time.monotonic() * 1000)
+        # ----- Stage 46 (v0.65.0-alpha): thread / scheduling builtins -----
+        # thread_sleep_ms(ms) — block the calling thread for ms
+        # milliseconds. Uses time.sleep (which yields the GIL).
+        #
+        # Note: we do NOT touch self.conc.blocked here. The deadlock
+        # detector counts only threads blocked on CHANNEL operations
+        # (chan.recv with no sender, chan.send on a full bounded
+        # channel). A thread in time.sleep is NOT blocked on a
+        # channel — it WILL wake up after the sleep duration — so
+        # counting it as blocked would cause spurious deadlock
+        # panics. The detector's contract is "no thread can ever
+        # make progress", which is false while a sleep is pending.
+        if name == "thread_sleep_ms":
+            ms = args[0]
+            if ms < 0:
+                raise HLPanic("thread_sleep_ms: duration must be >= 0, "
+                              "got %d" % ms, line)
+            time.sleep(max(0.0, ms / 1000.0))
+            return None
+        # thread_yield() — hint the scheduler to switch. Python's
+        # time.sleep(0) yields the GIL and lets another thread run.
+        if name == "thread_yield":
+            time.sleep(0)
+            return None
+        # thread_current_id() — a non-zero int identifying the
+        # calling thread. Uses threading.get_ident() which returns
+        # a non-zero int on CPython (the main thread gets a non-zero
+        # ID; spawned threads get distinct non-zero IDs). The actual
+        # VALUE is implementation-defined and may differ between
+        # the interpreter and the native runtime — callers must
+        # only rely on the property "different threads get different
+        # IDs", not on any specific value.
+        if name == "thread_current_id":
+            return threading.get_ident()
         if name == "file_exists":
             # Deep-scan-15 cleanup: removed redundant `import os` —
             # `os` is already imported at module top (line 14), and

@@ -93,6 +93,16 @@ declare void     @hl_panic(ptr) #0                 ; hl_str* -> noreturn (panic:
 declare void     @hl_exit(i64) #0                  ; noreturn
 declare i64      @hl_clock_ms()
 declare ptr      @hl_args()                         ; -> hl_list* (list[str])
+; Stage 46 (v0.65.0-alpha): thread / scheduling builtins.
+; hl_thread_sleep_ms blocks the calling thread for N ms via nanosleep.
+; hl_thread_yield hints the scheduler (sched_yield on POSIX).
+; hl_thread_current_id returns a non-zero thread identifier
+; (pthread_self cast to int64 — the actual value is implementation-
+; defined and may differ from the interpreter; callers must only
+; rely on "different threads get different IDs").
+declare void     @hl_thread_sleep_ms(i64)           ; (ms) -> void
+declare void     @hl_thread_yield()                 ; () -> void
+declare i64      @hl_thread_current_id()            ; () -> int
 declare i1       @hl_file_exists(ptr)
 declare ptr      @hl_read_file(ptr)
 declare void     @hl_write_file(ptr, ptr)
@@ -1590,6 +1600,18 @@ class LLVMEmitter:
         if name == "clock_ms":
             tmp = self._fresh("call")
             self._emit("  %s = call i64 @hl_clock_ms()" % tmp)
+            return ("i64", tmp)
+        # Stage 46 (v0.65.0-alpha): thread / scheduling builtins.
+        # thread_sleep_ms(ms) -> void: blocking sleep.
+        if name == "thread_sleep_ms":
+            return self._call1("void", "@hl_thread_sleep_ms", ["i64"], arg_pairs)
+        # thread_yield() -> void: scheduler hint.
+        if name == "thread_yield":
+            return self._call1("void", "@hl_thread_yield", [], arg_pairs)
+        # thread_current_id() -> int: non-zero thread identifier.
+        if name == "thread_current_id":
+            tmp = self._fresh("tid")
+            self._emit("  %s = call i64 @hl_thread_current_id()" % tmp)
             return ("i64", tmp)
         if name == "file_exists":
             return self._call1("i1", "@hl_file_exists", ["ptr"], arg_pairs)

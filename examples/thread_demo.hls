@@ -1,0 +1,153 @@
+# examples/thread_demo.hls — Stage 46 (v0.65.0-alpha): std.thread
+#
+# Demonstrates the three new builtins (thread_sleep_ms, thread_yield,
+# thread_current_id) and the ThreadBuilder pattern:
+#   - 3 workers each sleep 50ms in parallel (total wall time ~50ms)
+#   - thread_current_id distinguishes main from workers
+#   - thread_yield inside a Mutex critical section (no lost updates)
+#   - ThreadBuilder records spawn configuration (name, stack_size)
+#
+# All output is deterministic in the FACTS printed (booleans, sleep
+# durations with tolerance) — the raw thread_current_id values are
+# NOT printed (they differ between interpreter and native).
+
+import "std.thread"
+import "std.sync"
+import "std.str"
+
+# ----------------------------------------------------------------------------
+# Demo 1: parallel sleep — 3 workers each sleep 50ms in parallel.
+# Total wall-clock time should be ~50ms (parallel), not ~150ms (serial).
+# ----------------------------------------------------------------------------
+
+fn parallel_sleep_worker(out: Chan[int], sleep_ms: int) -> void uses Clock, Conc {
+    let before: int = clock_ms()
+    thread_sleep_ms(sleep_ms)
+    let after: int = clock_ms()
+    out.send(after - before)
+}
+
+fn demo_parallel_sleep() -> void uses IO, Clock, Conc {
+    println("--- Parallel sleep (3 workers x 50ms) ---")
+    let out: Chan[int] = chan_new_bounded(3)
+    let wall_before: int = clock_ms()
+    let t1: Task[void] = spawn(parallel_sleep_worker, clone(out), 50)
+    let t2: Task[void] = spawn(parallel_sleep_worker, clone(out), 50)
+    let t3: Task[void] = spawn(parallel_sleep_worker, clone(out), 50)
+    t1.join()
+    t2.join()
+    t3.join()
+    let wall_after: int = clock_ms()
+    let wall_elapsed: int = wall_after - wall_before
+
+    let e1: int = out.recv()
+    let e2: int = out.recv()
+    let e3: int = out.recv()
+    println("  worker 1 elapsed = " + e1.to_str() + "ms")
+    println("  worker 2 elapsed = " + e2.to_str() + "ms")
+    println("  worker 3 elapsed = " + e3.to_str() + "ms")
+    # Print wall-clock rounded to a coarse 100ms bucket so the demo
+    # output is deterministic across interpreter and native (the
+    # actual elapsed time varies by ~1ms due to scheduler granularity
+    # and CI load; rounding to 100ms buckets "50-99ms" -> "50",
+    # "100-149ms" -> "100", etc.).
+    let wall_bucket: int = (wall_elapsed / 50) * 50
+    let total_work: int = e1 + e2 + e3
+    let work_bucket: int = (total_work / 50) * 50
+    println("  wall-clock elapsed ~" + wall_bucket.to_str() + "ms (rounded to 50ms bucket)")
+    println("  parallel speedup: " + work_bucket.to_str() + "ms work / ~" + wall_bucket.to_str() + "ms wall")
+    println("")
+}
+
+# ----------------------------------------------------------------------------
+# Demo 2: thread_current_id — distinguish main from workers.
+# ----------------------------------------------------------------------------
+
+fn id_worker(out: Chan[int]) -> void uses Clock, Conc {
+    # Send the ID, then sleep briefly so the ID is still allocated
+    # when the parent reads it (avoids pthread ID recycling).
+    out.send(thread_current_id())
+    thread_sleep_ms(20)
+}
+
+fn demo_current_id() -> void uses IO, Clock, Conc {
+    println("--- thread_current_id (main vs workers) ---")
+    let main_id: int = thread_current_id()
+    let out: Chan[int] = chan_new_bounded(2)
+    let t1: Task[void] = spawn(id_worker, clone(out))
+    let t2: Task[void] = spawn(id_worker, clone(out))
+    let id1: int = out.recv()
+    let id2: int = out.recv()
+    t1.join()
+    t2.join()
+    # Print only the boolean facts (the raw IDs differ between
+    # interpreter and native, so we don't print them).
+    println("  main != worker 1: " + (main_id != id1).to_str() + " (expected true)")
+    println("  main != worker 2: " + (main_id != id2).to_str() + " (expected true)")
+    println("  worker 1 != worker 2: " + (id1 != id2).to_str() + " (expected true)")
+    println("  main thread id non-zero: " + (main_id != 0).to_str() + " (expected true)")
+    println("")
+}
+
+# ----------------------------------------------------------------------------
+# Demo 3: yield inside Mutex critical section — no lost updates.
+# Two workers each increment a shared counter 100 times under a
+# mutex, with thread_yield() inside the critical section. Final
+# value must be 200 (no lost updates despite the yield).
+# ----------------------------------------------------------------------------
+
+fn yield_mutex_worker(m: Mutex, counter: Chan[int], iters: int) -> void uses Conc {
+    let mut i: int = 0
+    while i < iters {
+        mutex_lock(m)
+        thread_yield()
+        let v: int = counter.recv()
+        counter.send(v + 1)
+        mutex_unlock(m)
+        i = i + 1
+    }
+}
+
+fn demo_yield_in_critical_section() -> void uses IO, Conc {
+    println("--- thread_yield inside Mutex critical section ---")
+    let m: Mutex = mutex_new()
+    let counter: Chan[int] = chan_new_bounded(1)
+    counter.send(0)
+    let t1: Task[void] = spawn(yield_mutex_worker, clone(m), clone(counter), 100)
+    let t2: Task[void] = spawn(yield_mutex_worker, clone(m), clone(counter), 100)
+    t1.join()
+    t2.join()
+    let total: int = counter.recv()
+    println("  final counter = " + total.to_str() + " (expected 200, no lost updates)")
+    println("")
+}
+
+# ----------------------------------------------------------------------------
+# Demo 4: ThreadBuilder — record spawn configuration.
+# ----------------------------------------------------------------------------
+
+fn demo_builder() -> void uses IO {
+    println("--- ThreadBuilder (record spawn configuration) ---")
+    let b1: ThreadBuilder = thread_builder_new()
+    println("  default: name='" + b1.name + "', stack_size=" + b1.stack_size.to_str())
+    let b2: ThreadBuilder = thread_builder_name(b1, "worker-A")
+    let b3: ThreadBuilder = thread_builder_stack_size(b2, 131072)
+    println("  configured: name='" + b3.name + "', stack_size=" + b3.stack_size.to_str() + " (128 KiB)")
+    println("  original unchanged: name='" + b1.name + "', stack_size=" + b1.stack_size.to_str())
+    println("")
+}
+
+# ----------------------------------------------------------------------------
+# Main
+# ----------------------------------------------------------------------------
+
+fn main() -> int uses IO, Clock, Conc {
+    println("=== Stage 46: std.thread ===")
+    println("")
+    demo_parallel_sleep()
+    demo_current_id()
+    demo_yield_in_critical_section()
+    demo_builder()
+    println("=== Stage 46 demo complete ===")
+    return 0
+}

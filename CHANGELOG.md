@@ -13,6 +13,140 @@ stability (125–140), and final stabilisation toward v1.0 (141–150).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
+## [v0.65.0-alpha] — Stage 46: std.thread (sleep, yield, current_id, Builder)
+
+> Adds `std/thread.hls` — the thirteenth module of Phase III (stdlib
+> expansion) — formalising the OS-thread model that Stage 16
+> introduced (via `spawn` + `task.join`). Adds **three new compiler
+> builtins** (`thread_sleep_ms`, `thread_yield`, `thread_current_id`)
+> wired through all four code-paths: boot checker, boot interpreter,
+> self-hosted compiler C codegen + C runtime, and LLVM IR emit.
+
+### Added — Stage 46 (v0.65.0-alpha)
+
+- **Three new compiler builtins**:
+  - **`thread_sleep_ms(ms: int) -> void`** — block the calling
+    thread for at least `ms` milliseconds. Implemented via
+    `nanosleep` on POSIX (with EINTR retry loop) and `time.sleep`
+    in the interpreter. Carries the **Clock + Conc** effects
+    (Clock: observes the wall clock for the sleep duration;
+    Conc: interacts with the concurrency runtime's accounting).
+    The checker rejects literal negative durations at compile time;
+    dynamic negatives panic at runtime with a clear message.
+  - **`thread_yield() -> void`** — hint the scheduler to switch.
+    Implemented via `sched_yield()` on POSIX and `time.sleep(0)` in
+    the interpreter (which yields the GIL). Pure advisory — the
+    scheduler may ignore the hint. Carries **Conc**.
+  - **`thread_current_id() -> int`** — non-zero thread identifier.
+    Implemented via `pthread_self()` cast to `int64` on POSIX and
+    `threading.get_ident()` in the interpreter. The actual VALUE
+    is implementation-defined and MAY DIFFER between backends —
+    callers must only rely on the property "different threads get
+    different IDs". Carries **Conc**.
+
+- **`std/thread.hls`** library module with:
+  - **Thin wrappers** for namespacing: `thread_sleep(ms)`,
+    `thread_yield_now()`, `thread_current()`.
+  - **ThreadBuilder** — struct with `name: str` and
+    `stack_size: int` fields. Builder pattern via immutable update:
+    `thread_builder_new()`, `thread_builder_name(b, name)`,
+    `thread_builder_stack_size(b, bytes)`. The current `spawn`
+    builtin does not accept stack-size or name arguments; the
+    Builder records them for future use when the spawn primitive
+    is extended (post-v1.0, in the OS-development track).
+  - **Convenience sleeps**: `thread_sleep_short()` (10ms),
+    `thread_sleep_long()` (100ms) — used in tests where a short
+    pause is needed to let other threads make progress.
+
+- **`examples/thread_demo.hls`** demonstrating:
+  - 3-worker parallel sleep (50ms each, ~50ms wall-clock)
+  - `thread_current_id` distinguishing main from workers
+  - `thread_yield` inside a Mutex critical section (no lost updates)
+  - ThreadBuilder immutable-update pattern
+
+- **`tests/ok/feat_stage46_thread.hls`** acceptance test with 7
+  sub-tests: sleep basic + zero, yield 10x no-panic, current_id
+  distinctness, ThreadBuilder field updates, concurrent sleep,
+  yield-in-critical-section (no lost updates).
+
+- **`Makefile`** target `thread-acceptance` — runs the demo +
+  acceptance test differentially (interpreter == native); green.
+
+### Changed — Stage 46 (v0.65.0-alpha)
+
+- **`boot/checker.py`** — added the three builtins to `BUILTIN_FNS`
+  and `BUILTIN_EFFECTS`; the `check_builtin_call` handler validates
+  argument types and rejects literal-negative `thread_sleep_ms`
+  durations at compile time.
+
+- **`boot/interp.py`** — added the three builtin handlers:
+  `thread_sleep_ms` (uses `time.sleep`, deliberately does NOT touch
+  `self.conc.blocked` so the deadlock detector doesn't spuriously
+  fire — a sleeping thread is NOT blocked on a channel, it WILL
+  wake up); `thread_yield` (uses `time.sleep(0)`); `thread_current_id`
+  (uses `threading.get_ident()`).
+
+- **`src/hlc.hls`** (self-hosted compiler):
+  - `is_builtin_fn` — added the three new names.
+  - `builtin_effect` — `thread_sleep_ms` returns `["Clock", "Conc"]`;
+    `thread_yield` and `thread_current_id` return `["Conc"]`.
+  - `check_builtin_call` — validates argument types and rejects
+    literal-negative durations.
+  - `gen_call` — emits `hl_thread_sleep_ms(...)`, `hl_thread_yield()`,
+    `hl_thread_current_id()`.
+  - C runtime emit — added `hl_thread_sleep_ms` (nanosleep with EINTR
+    retry loop), `hl_thread_yield` (sched_yield),
+    `hl_thread_current_id` (pthread_self cast to int64). Added
+    `#include <sched.h>` and `#include <errno.h>` to the runtime
+    preamble.
+
+- **`tools/llvm_emit.py`** — added LLVM declarations for the three
+  new runtime helpers and the call-lowering rules. `thread_sleep_ms`
+  and `thread_yield` return `void`; `thread_current_id` returns
+  `i64`.
+
+- **`ROADMAP.md`** — Stage 46 marked ✅ with the release tag
+  `v0.65.0-alpha` and a summary of the implementation approach.
+
+### Security — Stage 46 (v0.65.0-alpha)
+
+- **Deadlock-detector correctness**: `thread_sleep_ms` deliberately
+  does NOT increment `self.conc.blocked` (the deadlock detector's
+  blocked-thread counter). A sleeping thread is NOT blocked on a
+  channel — it WILL wake up after the sleep duration — so counting
+  it as blocked would cause spurious deadlock panics (the detector's
+  contract is "no thread can EVER make progress", which is false
+  while a sleep is pending). The detector's invariants remain sound.
+
+- **Negative-duration rejection**: `thread_sleep_ms` rejects literal-
+  negative durations at compile time (checker error) and dynamic
+  negatives at runtime (clean panic with exit code 101). The C
+  runtime's `hl_thread_sleep_ms` calls `hl_die` on negative input;
+  the interpreter's handler raises `HLPanic`. Both surface the error
+  clearly rather than silently sleeping forever or wrapping to a
+  huge unsigned duration.
+
+### Differential parity — Stage 46 (v0.65.0-alpha)
+
+- `thread_sleep_ms` and `thread_yield` are deterministic (the sleep
+  duration is observable; the yield is observable only via scheduling,
+  which the tests don't depend on). The acceptance test uses 50ms
+  sleeps with a 1000ms upper bound — both backends comfortably fit.
+
+- `thread_current_id` is NOT deterministic across backends (Python's
+  `threading.get_ident()` returns a different value than C's
+  `pthread_self()` cast to int64). The acceptance test verifies the
+  PROPERTY "different threads get different IDs" rather than specific
+  values; the demo prints only the boolean facts (main != worker1,
+  etc.) and never the raw ID.
+
+- Worker thread ID recycling: the test_current_id_differs test
+  has each worker sleep briefly AFTER sending its ID, ensuring
+  the worker is still alive when the parent reads the IDs. Without
+  this, Python's pthread may recycle the worker's thread ID after
+  it exits, causing the second worker to get the same ID (failing
+  the "distinct IDs" assertion).
+
 ## [v0.64.0-alpha] — Stage 45: std.sync (Mutex, RwLock, Condvar, OnceCell, Barrier)
 
 > Adds `std/sync.hls` — the twelfth module of Phase III (stdlib

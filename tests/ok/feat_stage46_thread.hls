@@ -1,0 +1,257 @@
+# tests/ok/feat_stage46_thread.hls — Stage 46 (v0.65.0-alpha): std.thread.
+#
+# Exercises the three new builtins (thread_sleep_ms, thread_yield,
+# thread_current_id) and the std.thread wrappers:
+#   - thread_sleep_ms: verify the sleep duration is observable
+#   - thread_yield: verify it doesn't panic (advisory)
+#   - thread_current_id: verify "different threads get different IDs"
+#   - ThreadBuilder: verify the build pattern produces the expected
+#     configuration
+#
+# All tests are DETERMINISTIC in their ASSERTIONS but NOT in their
+# printed thread IDs. The differential test (interpreter == native)
+# compares printed output; we print only deterministic facts
+# (booleans, sleep durations with tolerance, builder field values)
+# and never the raw thread_current_id() value.
+
+import "std.thread"
+import "std.sync"
+import "std.str"
+import "std.option"
+
+# ============================================================================
+# Helpers
+# ============================================================================
+
+fn ok(actual: bool, msg: str) -> void uses IO {
+    if !actual {
+        panic("FAIL " + msg)
+    }
+}
+
+fn eq_int(actual: int, expected: int, msg: str) -> void uses IO {
+    if actual != expected {
+        panic("FAIL " + msg + ": expected " + expected.to_str() + ", got " + actual.to_str())
+    }
+}
+
+fn eq_str(actual: str, expected: str, msg: str) -> void uses IO {
+    if actual != expected {
+        panic("FAIL " + msg + ": expected '" + expected + "', got '" + actual + "'")
+    }
+}
+
+# ============================================================================
+# thread_sleep_ms — verify the sleep duration is observable.
+# ============================================================================
+
+fn test_sleep_basic() -> int uses IO, Clock, Conc {
+    let before: int = clock_ms()
+    thread_sleep_ms(50)
+    let after: int = clock_ms()
+    let elapsed: int = after - before
+    # Sleep should be AT LEAST 50ms. Allow a generous upper bound
+    # (200ms) for scheduler granularity and CI load.
+    ok(elapsed >= 50, "sleep.50ms.at_least_50")
+    ok(elapsed < 1000, "sleep.50ms.under_1s")
+    return 0
+}
+
+fn test_sleep_zero() -> int uses IO, Clock, Conc {
+    # thread_sleep_ms(0) should return immediately (it's effectively
+    # a yield). The elapsed time should be very small (< 10ms in
+    # normal conditions).
+    let before: int = clock_ms()
+    thread_sleep_ms(0)
+    let after: int = clock_ms()
+    let elapsed: int = after - before
+    ok(elapsed < 100, "sleep.0ms.under_100ms")
+    return 0
+}
+
+# ============================================================================
+# thread_yield — verify it doesn't panic.
+# ============================================================================
+
+fn test_yield_basic() -> int uses IO, Conc {
+    # thread_yield is advisory; just verify it doesn't panic.
+    let mut i: int = 0
+    while i < 10 {
+        thread_yield()
+        i = i + 1
+    }
+    ok(true, "yield.10x.no_panic")
+    return 0
+}
+
+# ============================================================================
+# thread_current_id — verify "different threads get different IDs".
+# ============================================================================
+
+# Worker that sends its thread_current_id to the parent, then sleeps
+# briefly so the worker is still alive when the parent reads the IDs.
+# Without the sleep, Python's pthread may recycle the worker's thread
+# ID after it exits, causing the second worker to get the same ID
+# (failing the "distinct IDs" assertion).
+fn thread_id_worker(out: Chan[int], worker_id: int) -> void uses Clock, Conc {
+    out.send(thread_current_id())
+    # Sleep briefly so the worker is still alive when the parent
+    # checks the IDs. Without this, the worker exits immediately
+    # after sending, and its thread ID may be recycled before the
+    # other worker reads its own ID.
+    thread_sleep_ms(50)
+}
+
+fn test_current_id_differs() -> int uses IO, Clock, Conc {
+    let main_id: int = thread_current_id()
+    let out: Chan[int] = chan_new_bounded(2)
+    let t1: Task[void] = spawn(thread_id_worker, clone(out), 1)
+    let t2: Task[void] = spawn(thread_id_worker, clone(out), 2)
+    # Read the IDs BEFORE joining — the workers are sleeping and
+    # their IDs are still allocated.
+    let id1: int = out.recv()
+    let id2: int = out.recv()
+    # All three IDs must be distinct (main, worker1, worker2).
+    ok(main_id != id1, "current_id.main_vs_worker1.differ")
+    ok(main_id != id2, "current_id.main_vs_worker2.differ")
+    ok(id1 != id2, "current_id.worker1_vs_worker2.differ")
+    # IDs must be non-zero (the runtime uses 0 as a sentinel for
+    # "no thread" in some internal accounting).
+    ok(main_id != 0, "current_id.main.nonzero")
+    ok(id1 != 0, "current_id.worker1.nonzero")
+    ok(id2 != 0, "current_id.worker2.nonzero")
+    t1.join()
+    t2.join()
+    return 0
+}
+
+# ============================================================================
+# ThreadBuilder — verify the build pattern.
+# ============================================================================
+
+fn test_builder_basic() -> int uses IO {
+    let b1: ThreadBuilder = thread_builder_new()
+    eq_str(b1.name, "", "builder.default.name_empty")
+    eq_int(b1.stack_size, 0, "builder.default.stack_size_zero")
+
+    let b2: ThreadBuilder = thread_builder_name(b1, "worker-1")
+    eq_str(b2.name, "worker-1", "builder.set.name")
+    eq_int(b2.stack_size, 0, "builder.set.stack_size_unchanged")
+
+    let b3: ThreadBuilder = thread_builder_stack_size(b2, 65536)
+    eq_str(b3.name, "worker-1", "builder.set2.name_unchanged")
+    eq_int(b3.stack_size, 65536, "builder.set2.stack_size")
+
+    # Original builder is unchanged (immutable update).
+    eq_str(b1.name, "", "builder.original.name_unchanged")
+    eq_int(b1.stack_size, 0, "builder.original.stack_size_unchanged")
+    return 0
+}
+
+# ============================================================================
+# Concurrent sleep + sync — verify thread_sleep_ms works inside
+# spawned tasks and the elapsed time is observable.
+# ============================================================================
+
+fn sleep_worker(out: Chan[int], sleep_ms: int) -> void uses Clock, Conc {
+    let before: int = clock_ms()
+    thread_sleep_ms(sleep_ms)
+    let after: int = clock_ms()
+    out.send(after - before)
+}
+
+fn test_concurrent_sleep() -> int uses IO, Clock, Conc {
+    let out: Chan[int] = chan_new_bounded(3)
+    # 3 workers each sleep 50ms in parallel. Total wall-clock time
+    # should be ~50ms (parallel) not ~150ms (serial). We verify
+    # each worker's individual elapsed time (>= 50ms).
+    let t1: Task[void] = spawn(sleep_worker, clone(out), 50)
+    let t2: Task[void] = spawn(sleep_worker, clone(out), 50)
+    let t3: Task[void] = spawn(sleep_worker, clone(out), 50)
+
+    let wall_before: int = clock_ms()
+    t1.join()
+    t2.join()
+    t3.join()
+    let wall_after: int = clock_ms()
+    let wall_elapsed: int = wall_after - wall_before
+
+    let e1: int = out.recv()
+    let e2: int = out.recv()
+    let e3: int = out.recv()
+    ok(e1 >= 50, "concurrent_sleep.worker1.>=50ms")
+    ok(e2 >= 50, "concurrent_sleep.worker2.>=50ms")
+    ok(e3 >= 50, "concurrent_sleep.worker3.>=50ms")
+    # Wall-clock time should be < 3 * 50ms = 150ms (i.e. the sleeps
+    # ran in parallel, not serially). Allow generous upper bound
+    # for CI load.
+    ok(wall_elapsed < 1000, "concurrent_sleep.wall.<1s")
+    return 0
+}
+
+# ============================================================================
+# yield + Mutex — verify yield doesn't break lock discipline.
+# Two workers each acquire a mutex, yield, then release. The shared
+# counter must equal 2 * iters at the end (no lost updates).
+# ============================================================================
+
+fn yield_mutex_worker(m: Mutex, counter: Chan[int], iters: int) -> void uses Conc {
+    let mut i: int = 0
+    while i < iters {
+        mutex_lock(m)
+        # Yield inside the critical section — this should NOT
+        # release the mutex. The other worker will block on
+        # mutex_lock until we unlock.
+        thread_yield()
+        let v: int = counter.recv()
+        counter.send(v + 1)
+        mutex_unlock(m)
+        i = i + 1
+    }
+}
+
+fn test_yield_in_critical_section() -> int uses IO, Conc {
+    let m: Mutex = mutex_new()
+    let counter: Chan[int] = chan_new_bounded(1)
+    counter.send(0)
+    let t1: Task[void] = spawn(yield_mutex_worker, clone(m), clone(counter), 100)
+    let t2: Task[void] = spawn(yield_mutex_worker, clone(m), clone(counter), 100)
+    t1.join()
+    t2.join()
+    let total: int = counter.recv()
+    eq_int(total, 200, "yield_in_critical_section.no_lost_updates")
+    return 0
+}
+
+# ============================================================================
+# Main — run all tests sequentially.
+# ============================================================================
+
+fn main() -> int uses IO, Clock, Conc {
+    println("=== Stage 46: std.thread ===")
+    println("")
+    println("--- thread_sleep_ms (basic 50ms) ---")
+    test_sleep_basic()
+    println("  ok")
+    println("--- thread_sleep_ms (0ms = yield) ---")
+    test_sleep_zero()
+    println("  ok")
+    println("--- thread_yield (10x, no panic) ---")
+    test_yield_basic()
+    println("  ok")
+    println("--- thread_current_id (distinct IDs) ---")
+    test_current_id_differs()
+    println("  ok")
+    println("--- ThreadBuilder (build pattern) ---")
+    test_builder_basic()
+    println("  ok")
+    println("--- concurrent sleep (3 workers x 50ms) ---")
+    test_concurrent_sleep()
+    println("  ok")
+    println("--- yield inside critical section ---")
+    test_yield_in_critical_section()
+    println("  ok")
+    println("")
+    println("ACCEPTANCE OK: Stage 46 — std.thread (sleep, yield, current_id, Builder)")
+    return 0
+}

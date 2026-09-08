@@ -308,6 +308,17 @@ BUILTIN_FNS = {
     "int_and", "int_or", "int_xor", "int_not",
     "int_shl", "int_shr", "int_sar",
     "int_popcount", "int_clz", "int_ctz",
+    # Stage 46 (v0.65.0-alpha): thread / scheduling builtins.
+    # thread_sleep_ms blocks the calling thread for N milliseconds
+    # (carries Clock because it observes the wall clock for the sleep
+    # duration, plus Conc because it interacts with the concurrency
+    # runtime's blocked-thread counter). thread_yield hints the
+    # scheduler to switch (no real effect on correctness; pure
+    # scheduling optimisation). thread_current_id returns a non-zero
+    # int identifying the calling thread (the main thread's ID is
+    # consistent across the program; spawned threads get distinct
+    # IDs). All three carry Conc.
+    "thread_sleep_ms", "thread_yield", "thread_current_id",
 }
 
 # Stage 9 (v0.20.0-alpha — release): per-builtin effect mapping.
@@ -400,6 +411,15 @@ BUILTIN_EFFECTS = {
     "stream_merge_int":      {"Conc"},
     "stream_flat_map_int":   {"Conc"},
     "gen_spawn":             {"Conc"},
+    # Stage 46 (v0.65.0-alpha): thread / scheduling builtins.
+    # thread_sleep_ms carries BOTH Clock (it observes the wall clock
+    # for the sleep duration) AND Conc (it interacts with the
+    # concurrency runtime's blocked-thread counter, so the deadlock
+    # detector knows the thread is parked rather than runnable).
+    # thread_yield and thread_current_id carry Conc only.
+    "thread_sleep_ms":       {"Clock", "Conc"},
+    "thread_yield":          {"Conc"},
+    "thread_current_id":     {"Conc"},
     # Builtin METHODS with effects (the first method-level effects —
     # previously all I/O lived in builtin functions):
     "chan.send":     {"Conc"},
@@ -2703,6 +2723,38 @@ class Checker:
         if name == "clock_ms":
             need(0)
             self.edges[self.cur_fn].add("b:clock_ms")
+            return "int"
+        # ----- Stage 46 (v0.65.0-alpha): thread / scheduling builtins -----
+        # thread_sleep_ms(ms: int) -> void — blocks the calling thread.
+        # The ms argument must be a non-negative int (negative sleep is
+        # a programming error — the runtime panics). The effect set
+        # (Clock + Conc) is set in BUILTIN_EFFECTS above.
+        if name == "thread_sleep_ms":
+            need(1)
+            at = argt(0, "int")
+            if at != "int":
+                self.err("thread_sleep_ms() expects an int, got %s" % at, e)
+            arg = args[0]
+            if arg["k"] == "int" and arg["v"] < 0:
+                self.err("thread_sleep_ms() duration must be >= 0, got "
+                         "literal %d" % arg["v"], e)
+            self.edges[self.cur_fn].add("b:thread_sleep_ms")
+            return "void"
+        # thread_yield() -> void — hint the scheduler to switch.
+        if name == "thread_yield":
+            need(0)
+            self.edges[self.cur_fn].add("b:thread_yield")
+            return "void"
+        # thread_current_id() -> int — non-zero thread identifier.
+        # The main thread and each spawned task get distinct IDs; the
+        # actual VALUE is implementation-defined (Python's
+        # threading.get_ident() vs C's pthread_self() cast) and may
+        # differ between interpreter and native. Callers must NOT
+        # rely on a specific value — only on the property "different
+        # threads get different IDs".
+        if name == "thread_current_id":
+            need(0)
+            self.edges[self.cur_fn].add("b:thread_current_id")
             return "int"
         if name == "file_exists":
             need(1)
