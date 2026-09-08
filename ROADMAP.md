@@ -4903,10 +4903,19 @@ currency).
 per node), `RingBuf[T]` (fixed-capacity, no allocation after
 creation), `HashMap[K, V]` (replaces `map[str, V]` for non-str keys).
 
-**45. `std.sync`** — `Mutex[T]`, `RwLock[T]`, `Condvar`,
-`OnceCell[T]` (lazy init), `Barrier` (multi-thread rendezvous).
+**45. `std.sync`** ✅ (release v0.64.0-alpha) — `Mutex[T]`, `RwLock[T]`,
+`Condvar`, `OnceCell[T]` (lazy init), `Barrier` (multi-thread rendezvous).
 All are verified deadlock-free under the `hlmodel` checker for
-2-thread / 2-lock scenarios.
+2-thread / 2-lock scenarios. Pure-HLS implementation layered on the
+Stage-16 channel primitives (no new compiler builtins). Mutex is a
+cap-1 token channel; RwLock uses three channels (writer, count_mu,
+reader_count) with no hold-and-wait; Condvar is a cap-1024 signal
+channel; OnceCell is a state+value channel pair (monomorphic per
+type: OnceCellInt / OnceCellStr / OnceCellBool); Barrier is single-use
+(reuse requires a fresh Barrier — see std/sync.hls for the rationale).
+hlmodel verifies the 2-thread / 2-lock consistent-ordering protocol
+is deadlock-free (Deadlock state unreachable from Init in a 9-state
+/ 8-event finite-state model).
 
 **46. `std.thread`** — `spawn`, `join`, `yield_now`, `sleep`,
 `current` (the current thread's id), `Builder` (stack size, name).

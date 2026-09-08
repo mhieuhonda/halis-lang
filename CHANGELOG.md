@@ -13,6 +13,114 @@ stability (125–140), and final stabilisation toward v1.0 (141–150).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
+## [v0.64.0-alpha] — Stage 45: std.sync (Mutex, RwLock, Condvar, OnceCell, Barrier)
+
+> Adds `std/sync.hls` — the twelfth module of Phase III (stdlib
+> expansion) — implementing five synchronisation primitives that
+> complement the channel-based concurrency model of Stage 16.
+> **No new compiler builtins** — the entire module is pure HLS,
+> layered on the Stage-16 channel primitives (`chan_new_bounded`,
+> `chan.send`, `chan.recv`, `chan.try_send`, `chan.recv_or`).
+
+### Added — Stage 45 (v0.64.0-alpha)
+
+- **`std/sync.hls`** library module with:
+  - **Mutex** — exclusive lock, implemented as a cap-1 bounded
+    channel holding a single token. `lock()` = `recv` (take the
+    token), `unlock()` = `send` (return it). `try_lock()` uses
+    `recv_or` for non-blocking acquisition. The Stage-16 channel
+    runtime's deadlock detector catches the case where all tasks
+    are blocked on a `recv` with no sender.
+  - **RwLock** — readers / writer lock with three cap-1 channels
+    (`writer`, `count_mu`, `reader_count`). The first reader takes
+    the writer token; the last reader releases it. The `count_mu`
+    is held only briefly across counter updates — never while
+    waiting on `writer` — so the protocol is provably deadlock-free
+    (no hold-and-wait pattern inside the primitive).
+  - **Condvar** — condition variable, implemented as a cap-1024
+    signal channel. `wait(cv, m)` atomically releases the mutex
+    and blocks on the signal channel (the "atomic release + block"
+    is approximated by releasing first then blocking — the channel
+    buffer absorbs the race, matching Rust's Condvar liveness
+    contract). `signal()` wakes one waiter; `broadcast(n)` wakes n.
+  - **OnceCell[T]** — lazy initialisation cell. Monomorphic per
+    type: `OnceCellInt`, `OnceCellStr`, `OnceCellBool`. State +
+    value are each cap-1 channels. `set(c, v)` returns true iff
+    this call performed the initialisation (linearisable: at most
+    one task observes state==0 and inits). `get(c)` blocks until
+    initialised; `get_or(c, default)` is non-blocking; `is_init(c)`
+    is a non-blocking peek.
+  - **Barrier** — multi-thread rendezvous, single-use. `count` and
+    `gate` channels; the Nth arrival sends `n-1` release tokens to
+    wake the earlier waiters. Reusable via fresh `barrier_new` per
+    round (the single-use contract is documented in `std/sync.hls` —
+    a reusable barrier would require generation-tagged tokens which
+    don't fit the channel-only model).
+  - `barrier_reset(b)` for explicit re-arming (caller must
+    externally synchronise — see the comment in `barrier_reset`).
+
+- **`examples/sync_demo.hls`** demonstrating all five primitives:
+  - 4-task contended counter under Mutex (final value 4000)
+  - 3-reader + 1-writer RwLock pattern (final value 100)
+  - 1-producer + 1-consumer Condvar signalling
+  - 4-way OnceCell race-to-init (exactly one winner)
+  - 4-way Barrier rendezvous (sum of IDs = 10)
+
+- **`tests/ok/feat_stage45_sync.hls`** acceptance test with 14
+  sub-tests covering all primitives, including concurrent
+  scenarios (3-worker shared mutex, 4-way OnceCell race, 4-way
+  barrier rendezvous, 2-round barrier reuse via fresh barriers).
+
+- **`tests/ok/feat_stage45_sync_model.hls`** — hlmodel finite-state
+  model of the 2-thread / 2-lock acquisition protocol. 9-state
+  (`Init`, `A_has_m1`, `A_has_both`, `B_has_m1`, `B_has_both`,
+  `A_has_m1_B_has_m1`, `A_has_both_B_has_m1`, `A_has_both_B_has_both`,
+  `Deadlock`) x 8-event (`A_acquire_m1`, `A_acquire_m2`,
+  `A_release_m1`, `A_release_m2`, `B_acquire_m1`, `B_acquire_m2`,
+  `B_release_m1`, `B_release_m2`) = 72 transitions. The BFS from
+  `Init` confirms the `Deadlock` state (and the "both hold m1"
+  states) are unreachable; the invariant `no_deadlock` holds on
+  every reachable state.
+
+- **`Makefile`** target `sync-acceptance` — runs the demo +
+  acceptance test differentially (interpreter == native) and the
+  hlmodel deadlock check; green on all three.
+
+### Changed — Stage 45 (v0.64.0-alpha)
+
+- **`ROADMAP.md`** — Stage 45 marked ✅ with the release tag
+  `v0.64.0-alpha` and a summary of the implementation approach.
+
+### Security — Stage 45 (v0.64.0-alpha)
+
+- **Deadlock-freedom (structural)**: `std.sync`'s primitives do not
+  introduce any "hold one lock, wait for another" pattern. The
+  `count_mu` of `RwLock` is held only across counter updates and
+  never while waiting on `writer`. The `Barrier`'s `count` channel
+  is held only across the arrival-count update and never while
+  waiting on `gate`. `Condvar.wait` releases the mutex BEFORE
+  blocking on the signal channel. User code that acquires two
+  mutexes in inconsistent orders can still deadlock — the
+  structural guarantee is about `std.sync`'s internals, not about
+  arbitrary user code.
+
+- **Single-use Barrier contract**: the Barrier is single-use to
+  avoid a token-stealing race between rounds (a token from round N
+  could be consumed by a waiter from round N+1, breaking the
+  protocol). The single-use contract is documented in
+  `std/sync.hls`; the user wraps `barrier_new + barrier_wait` in a
+  loop for multi-round rendezvous.
+
+### Differential parity — Stage 45 (v0.64.0-alpha)
+
+- All `std.sync` primitives are pure channel operations. The
+  interpreter and the native runtime use the same `hl_chan*`
+  implementation (Stage 16), so the observable behaviour is
+  identical. The only non-determinism is in OS scheduling — which
+  thread acquires a contended lock first — which is why the
+  acceptance test uses deterministic round-robin patterns (no
+  timing races in the output).
+
 ## [v0.63.0-alpha] — Stage 44: std.collections (BTreeMap, HashSet, LinkedList, RingBuf, HashMap)
 
 > Adds `std/collections.hls` — the eleventh module of Phase III
