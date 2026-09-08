@@ -2709,6 +2709,33 @@ fn is_builtin_fn(n: str) -> bool {
     # interpreter and native — callers must only rely on the
     # property "different threads get different IDs".
     || n == "thread_sleep_ms" || n == "thread_yield" || n == "thread_current_id"
+    # Stage 47 (v0.66.0-alpha): process management builtins.
+    # proc_spawn forks+execs a child with configurable stdio
+    # (0=Inherit / 1=Pipe / 2=Null). proc_wait blocks until the
+    # child exits and returns the encoded exit status (same
+    # encoding as proc_exec). proc_kill sends SIGTERM. The three
+    # proc_child_* builtins manage the parent end of the child's
+    # stdio pipes. All carry the Proc effect; proc_spawn's program
+    # argument is a taint sink (command injection — same threat
+    # as proc_exec).
+    || n == "proc_spawn" || n == "proc_wait" || n == "proc_kill"
+    || n == "proc_child_write" || n == "proc_child_read"
+    || n == "proc_child_close"
+    # Stage 48 (v0.67.0-alpha): environment + cwd builtins.
+    # env_get reads an env var (returns "" if not found). env_has
+    # checks existence. env_set / env_unset mutate the env. cwd_get
+    # reads the cwd. cwd_set mutates the cwd. args_os is the
+    # os-string version of args. All carry the Proc effect (env / cwd
+    # access is process-state access). The KEY arguments of env_get /
+    # env_has / env_set / env_unset are taint sinks (info disclosure /
+    # env injection); the path argument of cwd_set is a taint sink
+    # (directory traversal). The stdlib std/env.hls provides the
+    # user-facing API: env_var (Option[tainted[str]] built from
+    # env_has + env_get), env_set_var, env_unset_var, env_current_dir
+    # (tainted[str] wraps cwd_get), env_set_current_dir, env_args_os
+    # (list[tainted[str]] wraps args_os + taint_mark).
+    || n == "env_get" || n == "env_has" || n == "env_set" || n == "env_unset"
+    || n == "cwd_get" || n == "cwd_set" || n == "args_os"
 }
 
 fn list_has(list: list[str], x: str) -> bool {
@@ -3098,6 +3125,25 @@ fn builtin_effect(name: str) -> list[str] {
         return ["Rand"]
     }
     if name == "proc_exec" {
+        return ["Proc"]
+    }
+    # Stage 47 (v0.66.0-alpha): process management builtins — all
+    # carry the existing Proc effect (same as proc_exec). A function
+    # that spawns / waits / kills / pipes must declare `uses Proc`.
+    if name == "proc_spawn" || name == "proc_wait" || name == "proc_kill"
+        || name == "proc_child_write" || name == "proc_child_read"
+        || name == "proc_child_close" {
+        return ["Proc"]
+    }
+    # Stage 48 (v0.67.0-alpha): environment + cwd builtins — all
+    # carry the Proc effect (environment / cwd access is process-state
+    # access). Using Proc keeps the effect algebra simple (no new
+    # effect family) and matches the convention that proc_exec is the
+    # canonical Proc builtin (anything interacting with the process's
+    # external state — args, env, cwd, subprocess — carries Proc).
+    if name == "env_get" || name == "env_has" || name == "env_set"
+        || name == "env_unset" || name == "cwd_get" || name == "cwd_set"
+        || name == "args_os" {
         return ["Proc"]
     }
     # Stage 16 (v0.27.0-alpha): the concurrency effect. Every task /
@@ -7878,6 +7924,172 @@ fn check_builtin_call(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, 
         add_edge(ctx, cur, "b:proc_exec")
         return "int"
     }
+    # ----- Stage 47 (v0.66.0-alpha): process management builtins -----
+    # proc_spawn(program: str, args: list[str], stdin_kind: int,
+    #            stdout_kind: int, stderr_kind: int) -> int.
+    # Returns the child pid (>= 1) or -1 on failure. The program
+    # argument is a taint sink (command injection — same threat as
+    # proc_exec). The args list elements are NOT sink-checked (they
+    # are passed as argv[1..] without shell interpretation). The
+    # stdio kinds are 0=Inherit, 1=Pipe, 2=Null.
+    if name == "proc_spawn" {
+        if nargs != 5 || argt.get(0) != "str" || argt.get(1) != "list[str]"
+            || argt.get(2) != "int" || argt.get(3) != "int"
+            || argt.get(4) != "int" {
+            cerr(line, "proc_spawn() expects (str program, list[str] args, int stdin_kind, int stdout_kind, int stderr_kind)")
+        }
+        if is_taint_t(argt.get(0)) {
+            cerr(line, "taint-sink violation: proc_spawn argument 1 (program) is " + argt.get(0) + " (a tainted program enables command injection — use sanitize_command from std.sanitize, or taint_unwrap() if you accept the risk)")
+        }
+        # Validate stdio kind literals at compile time (0/1/2).
+        let mut k_idx: int = 2
+        while k_idx <= 4 {
+            let arg_e: int = ctx.exprs[e].args.get(k_idx)
+            if ctx.exprs[arg_e].kind == "int"
+                && (ctx.exprs[arg_e].ival < 0 || ctx.exprs[arg_e].ival > 2) {
+                cerr(line, "proc_spawn() stdio kind (arg " + (k_idx + 1).to_str() + ") must be 0 (Inherit), 1 (Pipe), or 2 (Null), got literal " + ctx.exprs[arg_e].ival.to_str())
+            }
+            k_idx = k_idx + 1
+        }
+        add_edge(ctx, cur, "b:proc_spawn")
+        return "int"
+    }
+    # proc_wait(pid: int) -> int — block until child exits; return the
+    # encoded exit status (0..255 normal, 128+signum signal, -1 on
+    # error). The encoding matches proc_exec.
+    if name == "proc_wait" {
+        if nargs != 1 || argt.get(0) != "int" {
+            cerr(line, "proc_wait() expects 1 int argument (pid)")
+        }
+        add_edge(ctx, cur, "b:proc_wait")
+        return "int"
+    }
+    # proc_kill(pid: int) -> int — send SIGTERM. Returns 0 on success,
+    # -1 on error. Idempotent on already-exited children (treated as
+    # success by the runtime).
+    if name == "proc_kill" {
+        if nargs != 1 || argt.get(0) != "int" {
+            cerr(line, "proc_kill() expects 1 int argument (pid)")
+        }
+        add_edge(ctx, cur, "b:proc_kill")
+        return "int"
+    }
+    # proc_child_write(pid: int, data: str) -> int — write to the
+    # child's stdin pipe. Returns bytes written or -1 on error. The
+    # data is NOT a taint sink (the user is the origin of the data
+    # being sent to the child's stdin — same convention as net_write).
+    if name == "proc_child_write" {
+        if nargs != 2 || argt.get(0) != "int" || argt.get(1) != "str" {
+            cerr(line, "proc_child_write() expects (int pid, str data)")
+        }
+        add_edge(ctx, cur, "b:proc_child_write")
+        return "int"
+    }
+    # proc_child_read(pid: int, fd_kind: int, n: int) -> str — read up
+    # to n bytes from stdout (fd_kind=1) or stderr (fd_kind=2). Returns
+    # "" at EOF or error. fd_kind=0 (stdin) is rejected at runtime.
+    if name == "proc_child_read" {
+        if nargs != 3 || argt.get(0) != "int" || argt.get(1) != "int"
+            || argt.get(2) != "int" {
+            cerr(line, "proc_child_read() expects (int pid, int fd_kind, int n)")
+        }
+        add_edge(ctx, cur, "b:proc_child_read")
+        return "str"
+    }
+    # proc_child_close(pid: int, fd_kind: int) -> int — close the parent
+    # end of the child's stdio pipe. fd_kind: 0=stdin, 1=stdout, 2=stderr.
+    # Idempotent (closing a closed pipe returns 0).
+    if name == "proc_child_close" {
+        if nargs != 2 || argt.get(0) != "int" || argt.get(1) != "int" {
+            cerr(line, "proc_child_close() expects (int pid, int fd_kind)")
+        }
+        add_edge(ctx, cur, "b:proc_child_close")
+        return "int"
+    }
+    # ----- Stage 48 (v0.67.0-alpha): environment + cwd builtins -----
+    # env_get(key: str) -> str — read an env var. Returns the value
+    # or "" if not found. The key is a taint sink (info disclosure).
+    # The stdlib wrapper env_var(key) builds Option[tainted[str]] from
+    # env_has + env_get + taint_mark.
+    if name == "env_get" {
+        if nargs != 1 || argt.get(0) != "str" {
+            cerr(line, "env_get() expects 1 str argument (key)")
+        }
+        if is_taint_t(argt.get(0)) {
+            cerr(line, "taint-sink violation: env_get argument 1 (key) is " + argt.get(0) + " (a tainted key enables information disclosure — the attacker learns which env vars exist by observing behaviour; use sanitize_command or sanitize_path from std.sanitize, or taint_unwrap() if you accept the risk)")
+        }
+        add_edge(ctx, cur, "b:env_get")
+        return "str"
+    }
+    # env_has(key: str) -> bool — check if an env var exists. The key
+    # is a taint sink (info disclosure — same threat as env_get).
+    if name == "env_has" {
+        if nargs != 1 || argt.get(0) != "str" {
+            cerr(line, "env_has() expects 1 str argument (key)")
+        }
+        if is_taint_t(argt.get(0)) {
+            cerr(line, "taint-sink violation: env_has argument 1 (key) is " + argt.get(0) + " (a tainted key enables information disclosure — use sanitize_command or sanitize_filename from std.sanitize, or taint_unwrap() if you accept the risk)")
+        }
+        add_edge(ctx, cur, "b:env_has")
+        return "bool"
+    }
+    # env_set(key: str, value: str) -> void — set an env var. The key
+    # is a taint sink (env injection). The value is NOT a sink (the
+    # user is the origin of the value they're setting).
+    if name == "env_set" {
+        if nargs != 2 || argt.get(0) != "str" || argt.get(1) != "str" {
+            cerr(line, "env_set() expects (str key, str value)")
+        }
+        if is_taint_t(argt.get(0)) {
+            cerr(line, "taint-sink violation: env_set argument 1 (key) is " + argt.get(0) + " (a tainted key enables env injection — e.g. LD_PRELOAD, PATH, IFS; use sanitize_command or sanitize_filename from std.sanitize, or taint_unwrap() if you accept the risk)")
+        }
+        add_edge(ctx, cur, "b:env_set")
+        return "void"
+    }
+    # env_unset(key: str) -> void — unset an env var. The key is a
+    # taint sink (same threat as env_set).
+    if name == "env_unset" {
+        if nargs != 1 || argt.get(0) != "str" {
+            cerr(line, "env_unset() expects 1 str argument (key)")
+        }
+        if is_taint_t(argt.get(0)) {
+            cerr(line, "taint-sink violation: env_unset argument 1 (key) is " + argt.get(0) + " (a tainted key enables env injection — use sanitize_command or sanitize_filename from std.sanitize, or taint_unwrap() if you accept the risk)")
+        }
+        add_edge(ctx, cur, "b:env_unset")
+        return "void"
+    }
+    # cwd_get() -> str — read the cwd. No args. The stdlib wrapper
+    # env_current_dir() applies taint_mark to the result.
+    if name == "cwd_get" {
+        if nargs != 0 {
+            cerr(line, "cwd_get() takes no arguments")
+        }
+        add_edge(ctx, cur, "b:cwd_get")
+        return "str"
+    }
+    # cwd_set(path: str) -> int — change the cwd. Returns 0 on
+    # success, -1 on error. The path is a taint sink (directory
+    # traversal — same threat as read_file / write_file).
+    if name == "cwd_set" {
+        if nargs != 1 || argt.get(0) != "str" {
+            cerr(line, "cwd_set() expects 1 str argument (path)")
+        }
+        if is_taint_t(argt.get(0)) {
+            cerr(line, "taint-sink violation: cwd_set argument 1 (path) is " + argt.get(0) + " (a tainted path enables directory traversal — use sanitize_path from std.sanitize, or taint_unwrap() if you accept the risk)")
+        }
+        add_edge(ctx, cur, "b:cwd_set")
+        return "int"
+    }
+    # args_os() -> list[str] — the os-string version of args. The
+    # stdlib wrapper env_args_os() applies taint_mark per element to
+    # return list[tainted[str]].
+    if name == "args_os" {
+        if nargs != 0 {
+            cerr(line, "args_os() takes no arguments")
+        }
+        add_edge(ctx, cur, "b:args_os")
+        return "list[str]"
+    }
     # ----- Stage 16 (v0.27.0-alpha): concurrency builtins -----
     # chan_new() -> Chan[T] — contextual typing (same pattern as map_new).
     if name == "chan_new" {
@@ -9284,6 +9496,14 @@ fn runtime_lines() -> list[str] {
     # Both are tiny system headers; the include cost is negligible.
     r.push("#include <sched.h>")
     r.push("#include <errno.h>")
+    # Stage 47 (v0.66.0-alpha): process management builtins.
+    # fork / execvp / dup2 / pipe / read / write are declared in
+    # unistd.h (already included above). waitpid is declared in
+    # sys/wait.h (already included). kill is declared in signal.h.
+    # open / O_RDONLY / O_WRONLY are declared in fcntl.h. pid_t
+    # is declared in sys/types.h (pulled in by sys/wait.h).
+    r.push("#include <signal.h>")
+    r.push("#include <fcntl.h>")
     r.push("")
     # ---- Stage 8-beta: the refcounted runtime (END OF ARENA) ----
     # Every heap object starts with an int64_t refcnt as its FIRST field so
@@ -10798,6 +11018,322 @@ fn runtime_lines() -> list[str] {
     r.push("    return (int64_t)(rc & 0xFF);")
     r.push("}")
     r.push("")
+    # ----- Stage 47 (v0.66.0-alpha): process management runtime -----
+    # The C runtime manages child processes in a fixed-size table
+    # (hl_proc_children[HL_PROC_MAX_CHILDREN]) indexed by a Halis-level
+    # pid (1..HL_PROC_MAX_CHILDREN). This mirrors the interpreter's
+    # approach: the OS pid differs between interpreter and native, so
+    # we expose our own pid namespace to keep differential testing
+    # byte-exact. The table holds: pid (OS), stdin_fd, stdout_fd,
+    # stderr_fd (parent ends of the pipes; -1 if not piped), and
+    # a state flag (1=alive, 0=exited, -1=slot free).
+    r.push("#define HL_PROC_MAX_CHILDREN 64")
+    r.push("struct hl_proc_child {")
+    r.push("    pid_t os_pid;          /* OS pid, 0 if slot free */")
+    r.push("    int   stdin_fd;        /* parent write end; -1 if not piped */")
+    r.push("    int   stdout_fd;       /* parent read end; -1 if not piped */")
+    r.push("    int   stderr_fd;       /* parent read end; -1 if not piped */")
+    r.push("    int   exited;          /* 1=exited (status valid), 0=alive */")
+    r.push("    int   exit_status;     /* encoded: 0..255 / 128+signum */")
+    r.push("};")
+    r.push("static struct hl_proc_child hl_proc_children[HL_PROC_MAX_CHILDREN];")
+    r.push("")
+    # hl_proc_alloc_slot — find a free slot, returning its index (1-based
+    # Halis pid). Returns 0 if the table is full (caller reports -1).
+    r.push("static int hl_proc_alloc_slot(void) {")
+    r.push("    for (int i = 0; i < HL_PROC_MAX_CHILDREN; i++) {")
+    r.push("        if (hl_proc_children[i].os_pid == 0) {")
+    r.push("            return i + 1;  /* Halis pid = slot + 1 (>= 1) */")
+    r.push("        }")
+    r.push("    }")
+    r.push("    return 0;  /* table full */")
+    r.push("}")
+    r.push("")
+    # hl_proc_spawn(program, args, stdin_kind, stdout_kind, stderr_kind)
+    #   -> int (Halis pid >= 1, or -1 on failure).
+    # Forks + execs the program with the given args list (each element
+    # becomes argv[1..]). stdio_kind: 0=Inherit, 1=Pipe, 2=Null.
+    # Consumes program and args.
+    r.push("static int64_t hl_proc_spawn(hl_str* program, hl_list* args,")
+    r.push("                            int64_t stdin_kind, int64_t stdout_kind,")
+    r.push("                            int64_t stderr_kind) {")
+    r.push("    if (stdin_kind < 0 || stdin_kind > 2 ||")
+    r.push("        stdout_kind < 0 || stdout_kind > 2 ||")
+    r.push("        stderr_kind < 0 || stderr_kind > 2) {")
+    r.push("        hl_str_release(program);")
+    r.push("        hl_list_release(args);")
+    r.push("        hl_die(\"proc_spawn: stdio kind must be 0/1/2\");")
+    r.push("    }")
+    r.push("    int slot = hl_proc_alloc_slot();")
+    r.push("    if (slot == 0) {")
+    r.push("        hl_str_release(program);")
+    r.push("        hl_list_release(args);")
+    r.push("        return -1;")
+    r.push("    }")
+    r.push("    int in_pipe[2] = {-1, -1};")
+    r.push("    int out_pipe[2] = {-1, -1};")
+    r.push("    int err_pipe[2] = {-1, -1};")
+    r.push("    if (stdin_kind == 1 && pipe(in_pipe) < 0) {")
+    r.push("        hl_str_release(program);")
+    r.push("        hl_list_release(args);")
+    r.push("        return -1;")
+    r.push("    }")
+    r.push("    if (stdout_kind == 1 && pipe(out_pipe) < 0) {")
+    r.push("        if (in_pipe[0] != -1) close(in_pipe[0]);")
+    r.push("        if (in_pipe[1] != -1) close(in_pipe[1]);")
+    r.push("        hl_str_release(program);")
+    r.push("        hl_list_release(args);")
+    r.push("        return -1;")
+    r.push("    }")
+    r.push("    if (stderr_kind == 1 && pipe(err_pipe) < 0) {")
+    r.push("        if (in_pipe[0] != -1) close(in_pipe[0]);")
+    r.push("        if (in_pipe[1] != -1) close(in_pipe[1]);")
+    r.push("        if (out_pipe[0] != -1) close(out_pipe[0]);")
+    r.push("        if (out_pipe[1] != -1) close(out_pipe[1]);")
+    r.push("        hl_str_release(program);")
+    r.push("        hl_list_release(args);")
+    r.push("        return -1;")
+    r.push("    }")
+    r.push("    pid_t pid = fork();")
+    r.push("    if (pid < 0) {")
+    r.push("        if (in_pipe[0] != -1) close(in_pipe[0]);")
+    r.push("        if (in_pipe[1] != -1) close(in_pipe[1]);")
+    r.push("        if (out_pipe[0] != -1) close(out_pipe[0]);")
+    r.push("        if (out_pipe[1] != -1) close(out_pipe[1]);")
+    r.push("        if (err_pipe[0] != -1) close(err_pipe[0]);")
+    r.push("        if (err_pipe[1] != -1) close(err_pipe[1]);")
+    r.push("        hl_str_release(program);")
+    r.push("        hl_list_release(args);")
+    r.push("        return -1;")
+    r.push("    }")
+    r.push("    if (pid == 0) {")
+    r.push("        /* Child: dup2 the pipe ends onto the std fds, then exec. */")
+    r.push("        if (stdin_kind == 1) {")
+    r.push("            dup2(in_pipe[0], 0);")
+    r.push("            close(in_pipe[1]);")
+    r.push("        } else if (stdin_kind == 2) {")
+    r.push("            int devnull = open(\"/dev/null\", O_RDONLY);")
+    r.push("            if (devnull >= 0) { dup2(devnull, 0); close(devnull); }")
+    r.push("        }")
+    r.push("        if (stdout_kind == 1) {")
+    r.push("            dup2(out_pipe[1], 1);")
+    r.push("            close(out_pipe[0]);")
+    r.push("        } else if (stdout_kind == 2) {")
+    r.push("            int devnull = open(\"/dev/null\", O_WRONLY);")
+    r.push("            if (devnull >= 0) { dup2(devnull, 1); close(devnull); }")
+    r.push("        }")
+    r.push("        if (stderr_kind == 1) {")
+    r.push("            dup2(err_pipe[1], 2);")
+    r.push("            close(err_pipe[0]);")
+    r.push("        } else if (stderr_kind == 2) {")
+    r.push("            int devnull = open(\"/dev/null\", O_WRONLY);")
+    r.push("            if (devnull >= 0) { dup2(devnull, 2); close(devnull); }")
+    r.push("        }")
+    r.push("        /* Close any other pipe fds the child shouldn't have. */")
+    r.push("        if (stdin_kind == 1) close(in_pipe[0]);")
+    r.push("        if (stdout_kind == 1) close(out_pipe[1]);")
+    r.push("        if (stderr_kind == 1) close(err_pipe[1]);")
+    r.push("        /* Build argv[] from program + args. */")
+    r.push("        int64_t n = hl_list_len(args);")
+    r.push("        char** argv = (char**)malloc(sizeof(char*) * (size_t)(n + 2));")
+    r.push("        if (!argv) _exit(127);")
+    r.push("        argv[0] = program->data;")
+    r.push("        for (int64_t i = 0; i < n; i++) {")
+    r.push("            hl_str* elem = (hl_str*)hl_list_get(args, i);")
+    r.push("            argv[i + 1] = elem ? elem->data : (char*)\"\";")
+    r.push("        }")
+    r.push("        argv[n + 1] = NULL;")
+    r.push("        execvp(program->data, argv);")
+    r.push("        /* execvp only returns on failure. */")
+    r.push("        _exit(127);")
+    r.push("    }")
+    r.push("    /* Parent: close the child's ends of the pipes. */")
+    r.push("    if (stdin_kind == 1) { close(in_pipe[0]); }")
+    r.push("    if (stdout_kind == 1) { close(out_pipe[1]); }")
+    r.push("    if (stderr_kind == 1) { close(err_pipe[1]); }")
+    r.push("    struct hl_proc_child* c = &hl_proc_children[slot - 1];")
+    r.push("    c->os_pid = pid;")
+    r.push("    c->stdin_fd = (stdin_kind == 1) ? in_pipe[1] : -1;")
+    r.push("    c->stdout_fd = (stdout_kind == 1) ? out_pipe[0] : -1;")
+    r.push("    c->stderr_fd = (stderr_kind == 1) ? err_pipe[0] : -1;")
+    r.push("    c->exited = 0;")
+    r.push("    c->exit_status = 0;")
+    r.push("    hl_str_release(program);")
+    r.push("    hl_list_release(args);")
+    r.push("    return (int64_t)slot;")
+    r.push("}")
+    r.push("")
+    # hl_proc_wait(pid) -> int — block until child exits; return encoded
+    # exit status. Returns -1 if the pid is invalid.
+    r.push("static int64_t hl_proc_wait(int64_t hl_pid) {")
+    r.push("    if (hl_pid < 1 || hl_pid > HL_PROC_MAX_CHILDREN) return -1;")
+    r.push("    struct hl_proc_child* c = &hl_proc_children[hl_pid - 1];")
+    r.push("    if (c->os_pid == 0) return -1;")
+    r.push("    if (c->exited) return (int64_t)c->exit_status;")
+    r.push("    /* Close any open write ends so the child sees EOF on stdin. */")
+    r.push("    if (c->stdin_fd != -1) { close(c->stdin_fd); c->stdin_fd = -1; }")
+    r.push("    int status = 0;")
+    r.push("    if (waitpid(c->os_pid, &status, 0) < 0) {")
+    r.push("        return -1;")
+    r.push("    }")
+    r.push("    int encoded;")
+    r.push("#ifdef WIFEXITED")
+    r.push("    if (WIFEXITED(status)) encoded = WEXITSTATUS(status);")
+    r.push("    else if (WIFSIGNALED(status)) encoded = 128 + WTERMSIG(status);")
+    r.push("    else encoded = -1;")
+    r.push("#else")
+    r.push("    encoded = status & 0xFF;")
+    r.push("#endif")
+    r.push("    c->exited = 1;")
+    r.push("    c->exit_status = encoded;")
+    r.push("    return (int64_t)encoded;")
+    r.push("}")
+    r.push("")
+    # hl_proc_kill(pid) -> int — send SIGTERM. Returns 0 on success,
+    # -1 on error. Idempotent on already-exited children.
+    r.push("static int64_t hl_proc_kill(int64_t hl_pid) {")
+    r.push("    if (hl_pid < 1 || hl_pid > HL_PROC_MAX_CHILDREN) return -1;")
+    r.push("    struct hl_proc_child* c = &hl_proc_children[hl_pid - 1];")
+    r.push("    if (c->os_pid == 0) return -1;")
+    r.push("    if (c->exited) return 0;")
+    r.push("    if (kill(c->os_pid, SIGTERM) < 0) {")
+    r.push("        /* ESRCH = child already reaped. Treat as success. */")
+    r.push("        if (errno == ESRCH) return 0;")
+    r.push("        return -1;")
+    r.push("    }")
+    r.push("    return 0;")
+    r.push("}")
+    r.push("")
+    # hl_proc_child_write(pid, data) -> int — write to child's stdin.
+    r.push("static int64_t hl_proc_child_write(int64_t hl_pid, hl_str* data) {")
+    r.push("    if (hl_pid < 1 || hl_pid > HL_PROC_MAX_CHILDREN) {")
+    r.push("        hl_str_release(data);")
+    r.push("        return -1;")
+    r.push("    }")
+    r.push("    struct hl_proc_child* c = &hl_proc_children[hl_pid - 1];")
+    r.push("    if (c->os_pid == 0 || c->stdin_fd == -1) {")
+    r.push("        hl_str_release(data);")
+    r.push("        return -1;")
+    r.push("    }")
+    r.push("    ssize_t n = write(c->stdin_fd, data->data, (size_t)data->len);")
+    r.push("    hl_str_release(data);")
+    r.push("    if (n < 0) return -1;")
+    r.push("    return (int64_t)n;")
+    r.push("}")
+    r.push("")
+    # hl_proc_child_read(pid, fd_kind, n) -> str — read from child's
+    # stdout (fd_kind=1) or stderr (fd_kind=2).
+    r.push("static hl_str* hl_proc_child_read(int64_t hl_pid, int64_t fd_kind,")
+    r.push("                                int64_t n) {")
+    r.push("    if (hl_pid < 1 || hl_pid > HL_PROC_MAX_CHILDREN)")
+    r.push("        return hl_str_from(\"\", 0);")
+    r.push("    struct hl_proc_child* c = &hl_proc_children[hl_pid - 1];")
+    r.push("    if (c->os_pid == 0) return hl_str_from(\"\", 0);")
+    r.push("    int fd = -1;")
+    r.push("    if (fd_kind == 1) fd = c->stdout_fd;")
+    r.push("    else if (fd_kind == 2) fd = c->stderr_fd;")
+    r.push("    else return hl_str_from(\"\", 0);")
+    r.push("    if (fd == -1) return hl_str_from(\"\", 0);")
+    r.push("    if (n < 0) n = 0;")
+    r.push("    if (n > (64 * 1024 * 1024)) n = 64 * 1024 * 1024;  /* 64 MiB cap */")
+    r.push("    char* buf = (char*)malloc((size_t)n + 1);")
+    r.push("    if (!buf) return hl_str_from(\"\", 0);")
+    r.push("    ssize_t got = read(fd, buf, (size_t)n);")
+    r.push("    if (got < 0) got = 0;")
+    r.push("    hl_str* out = hl_str_from(buf, (int64_t)got);")
+    r.push("    free(buf);")
+    r.push("    return out;")
+    r.push("}")
+    r.push("")
+    # hl_proc_child_close(pid, fd_kind) -> int — close the parent end
+    # of the child's stdio pipe. Idempotent (closing a closed pipe
+    # returns 0).
+    r.push("static int64_t hl_proc_child_close(int64_t hl_pid, int64_t fd_kind) {")
+    r.push("    if (hl_pid < 1 || hl_pid > HL_PROC_MAX_CHILDREN) return -1;")
+    r.push("    struct hl_proc_child* c = &hl_proc_children[hl_pid - 1];")
+    r.push("    if (c->os_pid == 0) return -1;")
+    r.push("    if (fd_kind < 0 || fd_kind > 2) return -1;")
+    r.push("    int* fd_ptr;")
+    r.push("    if (fd_kind == 0) fd_ptr = &c->stdin_fd;")
+    r.push("    else if (fd_kind == 1) fd_ptr = &c->stdout_fd;")
+    r.push("    else fd_ptr = &c->stderr_fd;")
+    r.push("    if (*fd_ptr == -1) return 0;  /* idempotent */")
+    r.push("    if (close(*fd_ptr) < 0) {")
+    r.push("        *fd_ptr = -1;")
+    r.push("        return -1;")
+    r.push("    }")
+    r.push("    *fd_ptr = -1;")
+    r.push("    return 0;")
+    r.push("}")
+    r.push("")
+    # ----- Stage 48 (v0.67.0-alpha): environment + cwd runtime helpers -----
+    # All helpers consume their str argument(s) (the runtime calls
+    # hl_str_release after using the str). The str argument is NUL-
+    # terminated (the runtime accesses ->data directly); env vars
+    # and cwd paths can contain any byte except NUL (POSIX restriction),
+    # so NUL-terminated C strings are the correct representation.
+    r.push("// hl_env_get(key) — read an env var. Returns a fresh str (the")
+    r.push("// value, or \"\" if not found). Consumes the key.")
+    r.push("static hl_str* hl_env_get(hl_str* key) {")
+    r.push("    const char* v = getenv(key->data);")
+    r.push("    hl_str* out;")
+    r.push("    if (v == NULL) {")
+    r.push("        out = hl_str_from(\"\", 0);")
+    r.push("    } else {")
+    r.push("        size_t n = strlen(v);")
+    r.push("        out = hl_str_from(v, (int64_t)n);")
+    r.push("    }")
+    r.push("    hl_str_release(key);")
+    r.push("    return out;")
+    r.push("}")
+    r.push("")
+    r.push("// hl_env_has(key) — check if an env var exists. Consumes key.")
+    r.push("static bool hl_env_has(hl_str* key) {")
+    r.push("    bool found = (getenv(key->data) != NULL);")
+    r.push("    hl_str_release(key);")
+    r.push("    return found;")
+    r.push("}")
+    r.push("")
+    r.push("// hl_env_set(key, value) — set an env var. setenv copies the")
+    r.push("// strings; we release the hl_str* args after the call.")
+    r.push("static void hl_env_set(hl_str* key, hl_str* value) {")
+    r.push("    setenv(key->data, value->data, 1);")
+    r.push("    hl_str_release(key);")
+    r.push("    hl_str_release(value);")
+    r.push("}")
+    r.push("")
+    r.push("// hl_env_unset(key) — unset an env var. unsetenv is a no-op if")
+    r.push("// the var does not exist (no error).")
+    r.push("static void hl_env_unset(hl_str* key) {")
+    r.push("    unsetenv(key->data);")
+    r.push("    hl_str_release(key);")
+    r.push("}")
+    r.push("")
+    r.push("// hl_cwd_get() — read the cwd. Returns a fresh str. The cwd is")
+    r.push("// always available on POSIX (no failure case). The buffer")
+    r.push("// grows as needed via getcwd(NULL, 0) — a glibc extension that")
+    r.push("// allocates the right size automatically. Falls back to a")
+    r.push("// fixed-size buffer on systems that don't support this.")
+    r.push("static hl_str* hl_cwd_get(void) {")
+    r.push("    char* buf = getcwd(NULL, 0);")
+    r.push("    if (buf == NULL) {")
+    r.push("        return hl_str_from(\"\", 0);")
+    r.push("    }")
+    r.push("    size_t n = strlen(buf);")
+    r.push("    hl_str* out = hl_str_from(buf, (int64_t)n);")
+    r.push("    free(buf);")
+    r.push("    return out;")
+    r.push("}")
+    r.push("")
+    r.push("// hl_cwd_set(path) — change the cwd. Returns 0 on success,")
+    r.push("// -1 on error. Consumes the path.")
+    r.push("static int64_t hl_cwd_set(hl_str* path) {")
+    r.push("    int rc = chdir(path->data);")
+    r.push("    hl_str_release(path);")
+    r.push("    if (rc < 0) return -1;")
+    r.push("    return 0;")
+    r.push("}")
+    r.push("")
     # ----- Stage 37 (v0.56.0-alpha): TCP / UDP / TLS runtime helpers -----
     # All socket helpers use the BSD sockets API. The fd values they
     # return are the raw OS fds (>= 0 on success, -1 on failure). The
@@ -12132,6 +12668,26 @@ fn builtin_arg_borrowed(name: str) -> bool {
     # `proc_exec(cmd + " " + ip)` would crash with "malloc(): unaligned
     # tcache chunk detected" (double-free of the concat result).
     if name == "net_lookup" || name == "proc_exec" {
+        return false
+    }
+    # Stage 47 (v0.66.0-alpha): proc_spawn's program (arg 0) is
+    # owned by the runtime helper (it's released after fork+exec).
+    # The args list (arg 1) is also consumed (the runtime copies the
+    # elements into a C argv[] array, then releases the list and
+    # each element). proc_child_write's data arg is similarly
+    # consumed. Without this, `proc_spawn("echo " + user_input, ...)`
+    # would double-free the concat result (same bug pattern as
+    # `proc_exec(cmd + " " + ip)` above).
+    if name == "proc_spawn" || name == "proc_child_write" {
+        return false
+    }
+    # Stage 48 (v0.67.0-alpha): env_set's key (arg 0) and value (arg 1)
+    # are owned by the runtime (the runtime calls setenv, which copies
+    # the strings, then releases the hl_str* args). env_get / env_has /
+    # env_unset / cwd_set similarly consume their key / path argument.
+    # Without this, `env_set(k, v1 + v2)` would double-free the concat.
+    if name == "env_get" || name == "env_has" || name == "env_set"
+        || name == "env_unset" || name == "cwd_set" {
         return false
     }
     # Stage 37 (v0.56.0-alpha): TCP / UDP / TLS builtins. The host
@@ -14897,6 +15453,67 @@ fn gen_call(ctx: Ctx, e: int) -> str {
     # The command is an owned str (consumed by the runtime helper).
     if name == "proc_exec" {
         return "hl_proc_exec(" + gen_own_arg(ctx, ctx.exprs[e].args.get(0)) + ")"
+    }
+    # ----- Stage 47 (v0.66.0-alpha): process management builtins -----
+    # proc_spawn consumes the program (arg 0) and args list (arg 1);
+    # the stdio kind ints (args 2/3/4) are primitive (no refcount).
+    if name == "proc_spawn" {
+        return "hl_proc_spawn(" + gen_own_arg(ctx, ctx.exprs[e].args.get(0))
+            + ", " + gen_own_arg(ctx, ctx.exprs[e].args.get(1))
+            + ", " + gen_expr(ctx, ctx.exprs[e].args.get(2))
+            + ", " + gen_expr(ctx, ctx.exprs[e].args.get(3))
+            + ", " + gen_expr(ctx, ctx.exprs[e].args.get(4)) + ")"
+    }
+    if name == "proc_wait" {
+        return "hl_proc_wait(" + gen_expr(ctx, ctx.exprs[e].args.get(0)) + ")"
+    }
+    if name == "proc_kill" {
+        return "hl_proc_kill(" + gen_expr(ctx, ctx.exprs[e].args.get(0)) + ")"
+    }
+    # proc_child_write consumes the data str (arg 1).
+    if name == "proc_child_write" {
+        return "hl_proc_child_write(" + gen_expr(ctx, ctx.exprs[e].args.get(0))
+            + ", " + gen_own_arg(ctx, ctx.exprs[e].args.get(1)) + ")"
+    }
+    if name == "proc_child_read" {
+        return "hl_proc_child_read(" + gen_expr(ctx, ctx.exprs[e].args.get(0))
+            + ", " + gen_expr(ctx, ctx.exprs[e].args.get(1))
+            + ", " + gen_expr(ctx, ctx.exprs[e].args.get(2)) + ")"
+    }
+    if name == "proc_child_close" {
+        return "hl_proc_child_close(" + gen_expr(ctx, ctx.exprs[e].args.get(0))
+            + ", " + gen_expr(ctx, ctx.exprs[e].args.get(1)) + ")"
+    }
+    # ----- Stage 48 (v0.67.0-alpha): environment + cwd builtins -----
+    # env_get consumes its key (arg 0); returns a fresh str.
+    if name == "env_get" {
+        return "hl_env_get(" + gen_own_arg(ctx, ctx.exprs[e].args.get(0)) + ")"
+    }
+    # env_has consumes its key (arg 0); returns a bool.
+    if name == "env_has" {
+        return "hl_env_has(" + gen_own_arg(ctx, ctx.exprs[e].args.get(0)) + ")"
+    }
+    # env_set consumes both its key (arg 0) and value (arg 1).
+    if name == "env_set" {
+        return "hl_env_set(" + gen_own_arg(ctx, ctx.exprs[e].args.get(0))
+            + ", " + gen_own_arg(ctx, ctx.exprs[e].args.get(1)) + ")"
+    }
+    # env_unset consumes its key (arg 0).
+    if name == "env_unset" {
+        return "hl_env_unset(" + gen_own_arg(ctx, ctx.exprs[e].args.get(0)) + ")"
+    }
+    # cwd_get returns a fresh str (no args).
+    if name == "cwd_get" {
+        return "hl_cwd_get()"
+    }
+    # cwd_set consumes its path (arg 0).
+    if name == "cwd_set" {
+        return "hl_cwd_set(" + gen_own_arg(ctx, ctx.exprs[e].args.get(0)) + ")"
+    }
+    # args_os returns the hl_args() list (same as args() at the
+    # C level; the stdlib env_args_os applies taint_mark per element).
+    if name == "args_os" {
+        return "hl_args()"
     }
     # ----- Stage 16 (v0.27.0-alpha): concurrency builtins -----
     if name == "chan_new" {

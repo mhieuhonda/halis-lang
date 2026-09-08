@@ -319,6 +319,35 @@ BUILTIN_FNS = {
     # consistent across the program; spawned threads get distinct
     # IDs). All three carry Conc.
     "thread_sleep_ms", "thread_yield", "thread_current_id",
+    # Stage 47 (v0.66.0-alpha): process management builtins.
+    # proc_spawn forks+execs a child process with configurable stdio
+    # (inherit / pipe / null). proc_wait blocks until the child exits
+    # and returns the encoded exit status (0..255 normal, 128+signum
+    # signal — same encoding as proc_exec). proc_kill sends SIGTERM.
+    # proc_child_write / proc_child_read / proc_child_close manage
+    # the parent end of the child's stdio pipes. All carry the Proc
+    # effect; proc_spawn's program argument is a taint sink (a tainted
+    # program enables command-injection — same threat as proc_exec).
+    "proc_spawn", "proc_wait", "proc_kill",
+    "proc_child_write", "proc_child_read", "proc_child_close",
+    # Stage 48 (v0.67.0-alpha): environment + cwd builtins.
+    # env_get(key) reads an env var (returns "" if not found). env_has
+    # checks existence. env_set / env_unset mutate the env. cwd_get
+    # reads the cwd. cwd_set mutates the cwd (path is a taint sink —
+    # directory traversal). args_os is the os-string version of args
+    # (returns list[str]; the stdlib env_args_os wraps it as
+    # list[tainted[str]]). All carry the Proc effect. The key arguments
+    # of env_get / env_has / env_set / env_unset are taint sinks (info
+    # disclosure / env injection); the path argument of cwd_set is a
+    # taint sink (directory traversal).
+    # The stdlib (std/env.hls) provides the user-facing API names from
+    # the roadmap: env_var (returns Option[tainted[str]] — built from
+    # env_has + env_get), env_set_var, env_unset_var, env_current_dir
+    # (returns tainted[str] — wraps cwd_get with taint_mark),
+    # env_set_current_dir, env_args_os (returns list[tainted[str]] —
+    # wraps args_os with taint_mark per element).
+    "env_get", "env_has", "env_set", "env_unset",
+    "cwd_get", "cwd_set", "args_os",
 }
 
 # Stage 9 (v0.20.0-alpha — release): per-builtin effect mapping.
@@ -420,6 +449,34 @@ BUILTIN_EFFECTS = {
     "thread_sleep_ms":       {"Clock", "Conc"},
     "thread_yield":          {"Conc"},
     "thread_current_id":     {"Conc"},
+    # Stage 47 (v0.66.0-alpha): process management builtins — all
+    # carry the existing Proc effect (same as proc_exec). proc_wait
+    # and proc_child_read are blocking I/O on the child; proc_kill is
+    # a signal; proc_child_write / close are pipe I/O. None of them
+    # carry Conc because they don't touch the channel runtime's
+    # accounting — a thread blocked in proc_wait is blocked on the
+    # child, not on a Halis channel (same rationale as thread_sleep_ms
+    # not touching blocked accounting).
+    "proc_spawn":            {"Proc"},
+    "proc_wait":             {"Proc"},
+    "proc_kill":             {"Proc"},
+    "proc_child_write":      {"Proc"},
+    "proc_child_read":       {"Proc"},
+    "proc_child_close":      {"Proc"},
+    # Stage 48 (v0.67.0-alpha): environment + cwd builtins — all
+    # carry the Proc effect. Environment access is process-state
+    # access; cwd access is process-state access. Using Proc keeps
+    # the effect algebra simple (no new effect family) and matches
+    # the existing convention that proc_exec is the canonical Proc
+    # builtin (anything that interacts with the process's external
+    # state — args, env, cwd, subprocess — carries Proc).
+    "env_get":              {"Proc"},
+    "env_has":              {"Proc"},
+    "env_set":              {"Proc"},
+    "env_unset":            {"Proc"},
+    "cwd_get":              {"Proc"},
+    "cwd_set":              {"Proc"},
+    "args_os":              {"Proc"},
     # Builtin METHODS with effects (the first method-level effects —
     # previously all I/O lived in builtin functions):
     "chan.send":     {"Conc"},
@@ -492,6 +549,36 @@ SINK_BUILTINS = {
     "net_tcp_listen":   (0,),    # host
     "net_udp_send_to":  (1,),    # host (arg 1, after fd: arg 0)
     "net_tls_get":      (0, 2),  # host (arg 0) AND path (arg 2)
+    # Stage 47 (v0.66.0-alpha): proc_spawn's program (arg 0) is a
+    # taint sink — a tainted program enables command injection (same
+    # threat model as proc_exec). The args list (arg 1) is a
+    # list[str] of command-line arguments; the elements are NOT
+    # sink-checked (they're passed to the child as argv[1..], not
+    # interpreted by a shell). The user must sanitise tainted args
+    # before adding them to the list — same convention as proc_exec's
+    # single shell-string argument. The stdio kind ints (args 2/3/4)
+    # are primitive ints (untaintable by the type system).
+    "proc_spawn":       (0,),    # program
+    # Stage 48 (v0.67.0-alpha): env builtins as taint sinks.
+    # env_get's KEY (arg 0) is a sink: looking up an attacker-controlled
+    # env var name is an information disclosure (the attacker learns
+    # which env vars exist by observing the program's behaviour).
+    # env_has's KEY (arg 0) is a sink: same info disclosure threat.
+    # env_set's KEY (arg 0) is a sink: setting an attacker-controlled
+    # env var name enables env injection (LD_PRELOAD, PATH, IFS, ...).
+    # The VALUE (arg 1) is NOT a sink: the user is the origin of the
+    # value they're setting (same convention as net_write: the data
+    # being sent is the user's data, not the attacker's).
+    # env_unset's KEY (arg 0) is a sink: same threat as env_set.
+    # cwd_set's PATH (arg 0) is a sink: a tainted path enables
+    # directory traversal (the attacker could cd to /etc/passwd or a
+    # sensitive directory).
+    # cwd_get / args_os take no arguments — no sink.
+    "env_get":               (0,),    # key
+    "env_has":               (0,),    # key
+    "env_set":               (0,),    # key
+    "env_unset":             (0,),    # key
+    "cwd_set":               (0,),    # path
 }
 
 # NOTE: is_tainted_type / list_taint_inner are ALIASES defined once at the
@@ -2938,6 +3025,132 @@ class Checker:
             reject_tainted_at_sink(0, "str")
             self.edges[self.cur_fn].add("b:proc_exec")
             return "int"
+        # ----- Stage 47 (v0.66.0-alpha): process management builtins -----
+        # proc_spawn(program, args, stdin_kind, stdout_kind, stderr_kind)
+        #   -> int (pid >= 1 on success, -1 on failure). The program is a
+        #   taint sink (command injection). The args list is passed as
+        #   argv[1..] (NOT shell-interpreted). The stdio kinds are 0=Inherit,
+        #   1=Pipe, 2=Null (the Stdio enum from std.process).
+        if name == "proc_spawn":
+            need(5)
+            reject_tainted_at_sink(0, "str")
+            at_args = argt(1, "list[str]")
+            if at_args != "list[str]":
+                self.err("proc_spawn() argument 2 must be list[str], got %s"
+                         % at_args, e)
+            argt(2, "int")
+            argt(3, "int")
+            argt(4, "int")
+            # Validate the stdio kind literals if they are int literals.
+            for kind_idx in (2, 3, 4):
+                karg = args[kind_idx]
+                if karg["k"] == "int" and (karg["v"] < 0 or karg["v"] > 2):
+                    self.err("proc_spawn() stdio kind (arg %d) must be 0, 1, "
+                             "or 2 (Inherit/Pipe/Null), got literal %d"
+                             % (kind_idx + 1, karg["v"]), e)
+            self.edges[self.cur_fn].add("b:proc_spawn")
+            return "int"
+        # proc_wait(pid: int) -> int — block until child exits; return
+        # the encoded exit status (0..255 normal, 128+signum signal,
+        # -1 on error). The encoding matches proc_exec.
+        if name == "proc_wait":
+            need(1)
+            argt(0, "int")
+            self.edges[self.cur_fn].add("b:proc_wait")
+            return "int"
+        # proc_kill(pid: int) -> int — send SIGTERM. Returns 0 on
+        # success, -1 on error. No effect if the child has already
+        # exited (the runtime treats this as success).
+        if name == "proc_kill":
+            need(1)
+            argt(0, "int")
+            self.edges[self.cur_fn].add("b:proc_kill")
+            return "int"
+        # proc_child_write(pid: int, data: str) -> int — write to the
+        # child's stdin pipe. Returns bytes written, -1 on error or if
+        # the stdin pipe is not open (kind != Pipe). The data argument
+        # is NOT a taint sink — the user is the origin of the data
+        # being sent to the child's stdin (same convention as
+        # net_write, which doesn't sink-check its data arg).
+        if name == "proc_child_write":
+            need(2)
+            argt(0, "int")
+            argt(1, "str")
+            self.edges[self.cur_fn].add("b:proc_child_write")
+            return "int"
+        # proc_child_read(pid: int, fd_kind: int, n: int) -> str —
+        # read up to n bytes from the child's stdout (fd_kind=1) or
+        # stderr (fd_kind=2). Returns "" at EOF or error. fd_kind=0
+        # (stdin) is rejected at runtime (the parent cannot read from
+        # its own write end). n must be >= 0.
+        if name == "proc_child_read":
+            need(3)
+            argt(0, "int")
+            argt(1, "int")
+            argt(2, "int")
+            self.edges[self.cur_fn].add("b:proc_child_read")
+            return "str"
+        # proc_child_close(pid: int, fd_kind: int) -> int — close the
+        # parent end of the child's stdio pipe. fd_kind: 0=stdin,
+        # 1=stdout, 2=stderr. Returns 0 on success, -1 on error or if
+        # the pipe is already closed (idempotent — closing a closed
+        # pipe returns 0).
+        if name == "proc_child_close":
+            need(2)
+            argt(0, "int")
+            argt(1, "int")
+            self.edges[self.cur_fn].add("b:proc_child_close")
+            return "int"
+        # ----- Stage 48 (v0.67.0-alpha): environment + cwd builtins -----
+        # env_get(key: str) -> str — read an env var. Returns the value
+        # or "" if not found. The key is a taint sink (info disclosure).
+        # The stdlib wrapper env_var(key) builds Option[tainted[str]]
+        # from env_has + env_get + taint_mark.
+        if name == "env_get":
+            need(1)
+            reject_tainted_at_sink(0, "str")
+            self.edges[self.cur_fn].add("b:env_get")
+            return "str"
+        # env_has(key: str) -> bool — check if an env var exists.
+        if name == "env_has":
+            need(1)
+            reject_tainted_at_sink(0, "str")
+            self.edges[self.cur_fn].add("b:env_has")
+            return "bool"
+        # env_set(key: str, value: str) -> void — set an env var.
+        # Key is a taint sink (env injection); value is NOT a sink.
+        if name == "env_set":
+            need(2)
+            reject_tainted_at_sink(0, "str")
+            argt(1, "str")
+            self.edges[self.cur_fn].add("b:env_set")
+            return "void"
+        # env_unset(key: str) -> void — unset an env var.
+        if name == "env_unset":
+            need(1)
+            reject_tainted_at_sink(0, "str")
+            self.edges[self.cur_fn].add("b:env_unset")
+            return "void"
+        # cwd_get() -> str — read the cwd. No args. The stdlib wrapper
+        # env_current_dir() applies taint_mark to the result.
+        if name == "cwd_get":
+            need(0)
+            self.edges[self.cur_fn].add("b:cwd_get")
+            return "str"
+        # cwd_set(path: str) -> int — change the cwd. Returns 0 on
+        # success, -1 on error. Path is a taint sink.
+        if name == "cwd_set":
+            need(1)
+            reject_tainted_at_sink(0, "str")
+            self.edges[self.cur_fn].add("b:cwd_set")
+            return "int"
+        # args_os() -> list[str] — the os-string version of args.
+        # The stdlib wrapper env_args_os() applies taint_mark per
+        # element to return list[tainted[str]].
+        if name == "args_os":
+            need(0)
+            self.edges[self.cur_fn].add("b:args_os")
+            return "list[str]"
         # ----- Stage 16 (v0.27.0-alpha): concurrency builtins -----
         # chan_new() -> Chan[T] — contextual typing (same pattern as
         # map_new()): the surrounding let/param/return type supplies T.

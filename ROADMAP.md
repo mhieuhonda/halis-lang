@@ -82,10 +82,10 @@ remains green.
 | 42 | `std.fmt` — printf-style + custom `Display` impls | ✅ | (done in v0.61.0-alpha) |
 | 43 | `std.hash` — SipHash, xxHash, FNV, cityHash | ✅ | (done in v0.62.0-alpha) |
 | 44 | `std.collections` — BTreeMap, HashSet, LinkedList, RingBuf | ✅ | (done in v0.63.0-alpha) |
-| 45 | `std.sync` — Mutex, RwLock, Condvar, OnceCell | ⬜ | 4 weeks |
-| 46 | `std.thread` — OS threads (preemptive scheduler) | ⬜ | 5 weeks |
-| 47 | `std.process` — spawn, pipe, signal, exit-code | ⬜ | 4 weeks |
-| 48 | `std.env` — environment variables, current dir | ⬜ | 2 weeks |
+| 45 | `std.sync` — Mutex, RwLock, Condvar, OnceCell | ✅ | (done in v0.64.0-alpha) |
+| 46 | `std.thread` — OS threads (preemptive scheduler) | ✅ | (done in v0.65.0-alpha) |
+| 47 | `std.process` — spawn, pipe, signal, exit-code | ✅ | (done in v0.66.0-alpha) |
+| 48 | `std.env` — environment variables, current dir | ✅ | (done in v0.67.0-alpha) |
 | 49 | `std.time` — monotonic clock, sleep, deadline arithmetic | ⬜ | 3 weeks |
 | 50 | `std.math` — IEEE-754 edge cases, special functions | ⬜ | 5 weeks |
 | 51 | `std.archive` — tar, zip, gzip (no unsafe decompression) | ⬜ | 4 weeks |
@@ -4932,15 +4932,67 @@ threading.get_ident in interpreter). ThreadBuilder records spawn
 configuration (name + stack_size) for future use when the spawn
 primitive is extended to accept these.
 
-**47. `std.process`** — `Command`, `Child`, `ExitStatus`, `Stdio`
-(piped/inherited/null). `proc_exec` becomes a thin wrapper.
-Taint-tracking: a tainted `Command` argument is rejected at the
-checker (existing `proc_exec` already does this; `Command` adds
-type-level enforcement).
+**47. `std.process`** ✅ (release v0.66.0-alpha) — `Command`,
+`Child`, `ExitStatus`, `Stdio` (piped/inherited/null). Six new
+compiler builtins (`proc_spawn` / `proc_wait` / `proc_kill` /
+`proc_child_write` / `proc_child_read` / `proc_child_close`) wired
+through all four code-paths (boot checker, boot interpreter,
+self-hosted compiler C codegen + C runtime, LLVM IR emit). All carry
+the existing `Proc` effect. `proc_spawn` uses fork+execvp WITHOUT
+a shell (the args list is passed as argv[1..], NOT shell-interpreted
+— eliminating the shell-injection vector that `proc_exec` carries).
+The `program` argument is a taint sink (a tainted program enables
+command injection — same threat model as `proc_exec`). The `Stdio`
+enum (`Inherit` / `Pipe` / `Null`) is encoded as 0/1/2 ints and
+validated at compile time (literal out-of-range is a compile error).
+`ExitStatus` is decoded from the encoded wait status (0..255 exit
+code, 128+signum signal kill, -1 error). The Halis-level pid
+namespace is a monotonic counter (1..64 in native, 1.. in the
+interpreter) — the OS pid is NEVER exposed (it differs between
+backends and would break differential testing). `proc_exec` is
+preserved as a thin wrapper over `system()` (shell one-shot —
+callers MUST sanitise; `command_spawn` is the type-safe, shell-free
+alternative). Stage 47 also adds LLVM backend support for the
+existing `proc_exec` builtin (which was previously declared but
+not yet codegen-able in the LLVM backend — Stage 12 alpha subset).
+Differential parity (interpreter == native) verified on simple
+spawn/wait, args passing, piped stdout capture, piped stdin write
++ close + read back, stderr capture, SIGTERM kill (encoded exit
+143 = 128+15), and the stdlib wrappers (Command builder, Child
+handle, ExitStatus decode, command_status, command_output).
 
-**48. `std.env`** — `var(key) -> Option[str]`, `set_var`,
-`current_dir`, `set_current_dir`, `args_os` (os-string version of
-`tainted_args`). Environment variables are tainted by default.
+**48. `std.env`** ✅ (release v0.67.0-alpha) — `var(key) -> Option[str]`,
+`set_var`, `current_dir`, `set_current_dir`, `args_os` (os-string
+version of `tainted_args`). Environment variables are tainted by
+default. Seven new compiler builtins (`env_get` / `env_has` /
+`env_set` / `env_unset` / `cwd_get` / `cwd_set` / `args_os`) wired
+through all four code-paths (boot checker, boot interpreter,
+self-hosted compiler C codegen + C runtime, LLVM IR emit). All
+carry the `Proc` effect (env / cwd access is process-state access).
+The KEY arguments of `env_get` / `env_has` / `env_set` / `env_unset`
+are taint sinks (info disclosure — attacker learns which env vars
+exist; env injection — attacker sets `LD_PRELOAD` / `PATH` / `IFS`).
+The PATH argument of `cwd_set` is a taint sink (directory traversal
+— same threat as `read_file` / `write_file`). The stdlib
+(`std/env.hls`) provides the user-facing API names from the
+roadmap, applying the taint wrappers: `env_var(key) -> Option[tainted[str]]`
+(built from `env_has` + `env_get` + `taint_mark` — Some if exists,
+None if not; the value is tainted by default); `env_set_var` /
+`env_unset_var` (thin wrappers); `env_current_dir() -> tainted[str]`
+(wraps `cwd_get` with `taint_mark` — the cwd may be sensitive);
+`env_set_current_dir(path) -> int` (thin wrapper; 0 on success,
+-1 on error); `env_args_os() -> list[tainted[str]]` (wraps `args_os`
+with `taint_mark` per element — the os-string version of
+`tainted_args`; semantically distinct even though they currently
+alias at the runtime level because Halis str = bytes already).
+Type-level taint enforcement: passing a `tainted[str]` to any of
+the "set" wrappers (env_set_var, env_unset_var, env_set_current_dir)
+is a compile error (the function signature requires `str`, not
+`tainted[str]`); passing a tainted value to the underlying builtin
+is a taint-sink violation. Differential parity (interpreter ==
+native) verified on env_get/has/set/unset (round-trip), cwd_get/set
+(round-trip via /tmp), cwd_set with nonexistent path (returns -1),
+args_os count, and all stdlib wrappers.
 
 **49. `std.time`** — `Instant` (monotonic), `Duration`,
 `SystemTime` (wall clock), `sleep`, `timeout`. Arithmetic on

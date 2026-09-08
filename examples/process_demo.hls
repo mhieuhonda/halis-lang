@@ -1,0 +1,201 @@
+# examples/process_demo.hls — Stage 47 (v0.66.0-alpha): std.process
+#
+# Demonstrates the six new process builtins and the Command/Child/ExitStatus
+# API from std.process:
+#   - command_spawn + child_wait (simple echo, no pipes)
+#   - command_stdout(Pipe) + child_read_stdout (capture stdout)
+#   - command_stdin(Pipe) + child_write + child_close_stdin + child_read_stdout
+#   - command_stderr(Pipe) + child_read_stderr (capture stderr from `ls /nonexistent`)
+#   - proc_kill (terminate a long-running `sleep 10`)
+#   - proc_exec_safe (the thin wrapper around the Stage 9 builtin)
+#   - exit_status_decode (success / failure / signal)
+#
+# All output is deterministic in the FACTS printed (exit codes, signal
+# numbers, byte counts) — the actual child process pids are NOT printed
+# (they differ between interpreter and native, like thread_current_id).
+
+import "std.process"
+import "std.option"
+import "std.str"
+
+# ----------------------------------------------------------------------------
+# Helpers
+# ----------------------------------------------------------------------------
+
+fn bool_str(b: bool) -> str {
+    if b {
+        return "true"
+    }
+    return "false"
+}
+
+# ----------------------------------------------------------------------------
+# Demo 1: simple spawn + wait — `true` exits 0, `false` exits 1. No
+# stdout inheritance issues because `true` / `false` produce no output.
+# This is the simplest "spawn and check exit code" pattern.
+# ----------------------------------------------------------------------------
+
+fn demo_simple_spawn() -> void uses IO, Proc {
+    println("--- Simple spawn + wait (true / false) ---")
+    let c_true: Command = command_new("true")
+    let ch_true: Child = command_spawn(c_true)
+    let rc_true: int = child_wait(ch_true)
+    let es_true: ExitStatus = exit_status_decode(rc_true)
+
+    let c_false: Command = command_new("false")
+    let ch_false: Child = command_spawn(c_false)
+    let rc_false: int = child_wait(ch_false)
+    let es_false: ExitStatus = exit_status_decode(rc_false)
+
+    println("  'true'  -> success = " + bool_str(exit_status_success(es_true))
+            + ", code = " + es_true.code.to_str())
+    println("  'false' -> success = " + bool_str(exit_status_success(es_false))
+            + ", code = " + es_false.code.to_str())
+    println("")
+}
+
+# ----------------------------------------------------------------------------
+# Demo 2: capture stdout — command_stdout(Pipe) + child_read_stdout.
+# The child's stdout is captured into a str via the parent's read end
+# of the pipe. stderr is inherited (so any error message would appear
+# on the parent's stderr).
+# ----------------------------------------------------------------------------
+
+fn demo_capture_stdout() -> void uses IO, Proc {
+    println("--- Capture stdout (piped) ---")
+    let c: Command = command_new("echo")
+    let c2: Command = command_arg(c, "captured")
+    let c3: Command = command_arg(c2, "stdout")
+    let c4: Command = command_stdout(c3, Stdio.Pipe)
+    let ch: Child = command_spawn(c4)
+    let out: str = child_read_stdout(ch, 4096)
+    let rc: int = child_wait(ch)
+    # The echo output ends with a newline; trim it for cleaner display.
+    let trimmed: str = out.trim()
+    println("  stdout    = '" + trimmed + "'")
+    println("  exit code = " + exit_status_decode(rc).code.to_str())
+    println("")
+}
+
+# ----------------------------------------------------------------------------
+# Demo 3: pipe to stdin — command_stdin(Pipe) + child_write +
+# child_close_stdin + child_read_stdout. We feed "ping\n" to `cat` and
+# read back what `cat` echoes.
+# ----------------------------------------------------------------------------
+
+fn demo_pipe_stdin() -> void uses IO, Proc {
+    println("--- Pipe to stdin (cat echoes back) ---")
+    let c: Command = command_new("cat")
+    let c2: Command = command_stdin(c, Stdio.Pipe)
+    let c3: Command = command_stdout(c2, Stdio.Pipe)
+    let ch: Child = command_spawn(c3)
+    let n: int = child_write(ch, "ping\n")
+    println("  wrote " + n.to_str() + " bytes")
+    let close_rc: int = child_close_stdin(ch)
+    println("  close stdin rc = " + close_rc.to_str())
+    let out: str = child_read_stdout(ch, 1024)
+    let rc: int = child_wait(ch)
+    let trimmed: str = out.trim()
+    println("  cat output = '" + trimmed + "'")
+    println("  exit code  = " + exit_status_decode(rc).code.to_str())
+    println("")
+}
+
+# ----------------------------------------------------------------------------
+# Demo 4: capture stderr — `ls /nonexistent` writes to stderr. We pipe
+# both stdout and stderr and verify we can read from each separately.
+# ----------------------------------------------------------------------------
+
+fn demo_capture_stderr() -> void uses IO, Proc {
+    println("--- Capture stderr (ls /nonexistent) ---")
+    let c: Command = command_new("ls")
+    let c2: Command = command_arg(c, "/nonexistent")
+    let c3: Command = command_stdout(c2, Stdio.Pipe)
+    let c4: Command = command_stderr(c3, Stdio.Pipe)
+    let ch: Child = command_spawn(c4)
+    let rc: int = child_wait(ch)
+    let out: str = child_read_stdout(ch, 4096)
+    let err: str = child_read_stderr(ch, 4096)
+    let es: ExitStatus = exit_status_decode(rc)
+    println("  exit code = " + es.code.to_str() + " (expected 2)")
+    println("  stdout empty? " + bool_str(out == ""))
+    # Don't print the actual stderr (it's "ls: cannot access ..."),
+    # just verify it's non-empty.
+    println("  stderr non-empty? " + bool_str(err != ""))
+    println("")
+}
+
+# ----------------------------------------------------------------------------
+# Demo 5: kill a long-running child — proc_spawn("sleep", ["10"], ...)
+# then proc_kill. The exit status should be 128 + 15 (SIGTERM).
+# ----------------------------------------------------------------------------
+
+fn demo_kill_child() -> void uses IO, Proc, Clock, Conc {
+    println("--- Kill a long-running child (SIGTERM) ---")
+    let c: Command = command_new("sleep")
+    let c2: Command = command_arg(c, "10")
+    let ch: Child = command_spawn(c2)
+    # Let the child sleep briefly so we know it's running.
+    thread_sleep_ms(50)
+    let k: int = child_kill(ch)
+    println("  kill rc = " + k.to_str())
+    let rc: int = child_wait(ch)
+    let es: ExitStatus = exit_status_decode(rc)
+    println("  exit code  = " + es.code.to_str())
+    println("  signal    = " + es.signal.to_str() + " (expected 15 = SIGTERM)")
+    println("  encoded   = " + rc.to_str() + " (expected 143 = 128+15)")
+    println("")
+}
+
+# ----------------------------------------------------------------------------
+# Demo 6: proc_exec_safe — the thin wrapper around the Stage 9
+# proc_exec builtin. proc_exec runs a command via system() (a shell
+# one-shot). For comparison with command_spawn, we run `true` (no
+# output, so no stdout-buffering interference with the parent's
+# println). The important point: command_spawn uses fork+execvp
+# WITHOUT a shell, so the args are NOT shell-interpreted; proc_exec
+# uses system() which DOES run the command through /bin/sh — callers
+# MUST sanitise any tainted input before constructing the command
+# string.
+# ----------------------------------------------------------------------------
+
+fn demo_proc_exec_safe() -> void uses IO, Proc {
+    println("--- proc_exec_safe (shell one-shot, for comparison) ---")
+    let rc: int = proc_exec_safe("true")
+    println("  proc_exec 'true' rc = " + rc.to_str())
+    println("  (command_spawn uses fork+execvp WITHOUT a shell —")
+    println("   prefer it for any case where args come from outside)")
+    println("")
+}
+
+# ----------------------------------------------------------------------------
+# Demo 7: command_status — the convenience that spawns + waits and
+# returns the ExitStatus. Show `true` -> success=true.
+# ----------------------------------------------------------------------------
+
+fn demo_command_status() -> void uses IO, Proc {
+    println("--- command_status (fire and forget) ---")
+    let c: Command = command_new("true")
+    let es: ExitStatus = command_status(c)
+    println("  'true' -> success = " + bool_str(exit_status_success(es))
+            + ", code = " + es.code.to_str())
+    println("")
+}
+
+# ----------------------------------------------------------------------------
+# Main
+# ----------------------------------------------------------------------------
+
+fn main() -> int uses IO, Proc, Clock, Conc {
+    println("=== Stage 47: std.process ===")
+    println("")
+    demo_simple_spawn()
+    demo_capture_stdout()
+    demo_pipe_stdin()
+    demo_capture_stderr()
+    demo_kill_child()
+    demo_proc_exec_safe()
+    demo_command_status()
+    println("=== Stage 47 demo complete ===")
+    return 0
+}

@@ -1792,3 +1792,99 @@ thread-acceptance: bin/hlc
 	@echo "  differential (interpreter == native) verified green."
 
 .PHONY: thread-acceptance
+
+# ============================================================================
+# Stage 47 (v0.66.0-alpha): std.process -- proc_spawn, proc_wait,
+# proc_kill, proc_child_write, proc_child_read, proc_child_close.
+# Six new compiler builtins wired through all four code-paths
+# (boot checker, boot interpreter, self-hosted compiler C codegen +
+# C runtime, LLVM IR emit). Command / Child / ExitStatus / Stdio
+# types and helpers in std/process.hls.
+# ============================================================================
+process-acceptance: bin/hlc
+	@$(PYTHON) boot/boot.py examples/process_demo.hls > /tmp/process_interp.txt 2>&1
+	@bin/hlc examples/process_demo.hls /tmp/process_demo.c 2>/dev/null
+	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/process_demo /tmp/process_demo.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
+	@/tmp/process_demo > /tmp/process_nat.txt 2>&1
+	@diff -q /tmp/process_interp.txt /tmp/process_nat.txt >/dev/null 2>&1 \
+		|| (echo "FAIL: process_demo differential mismatch" && false)
+	@$(PYTHON) boot/boot.py tests/ok/feat_stage47_process.hls > /tmp/s47_interp.txt 2>&1
+	@bin/hlc tests/ok/feat_stage47_process.hls /tmp/s47.c 2>/dev/null
+	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/s47 /tmp/s47.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
+	@/tmp/s47 > /tmp/s47_nat.txt 2>&1
+	@diff -q /tmp/s47_interp.txt /tmp/s47_nat.txt >/dev/null 2>&1 \
+		|| (echo "FAIL: feat_stage47_process differential mismatch" && false)
+	@# Stage 47: taint-sink enforcement -- a tainted program is rejected.
+	@if $(PYTHON) boot/boot.py --check tests/fail/fail_taint_proc_spawn.hls >/dev/null 2>&1; then \
+		echo "FAIL: fail_taint_proc_spawn should have been rejected"; false; \
+	fi
+	@if $(PYTHON) boot/boot.py --check tests/fail/fail_effect_proc_spawn_missing.hls >/dev/null 2>&1; then \
+		echo "FAIL: fail_effect_proc_spawn_missing should have been rejected"; false; \
+	fi
+	@rm -f /tmp/process_demo /tmp/process_demo.c /tmp/process_interp.txt /tmp/process_nat.txt \
+		/tmp/s47 /tmp/s47.c /tmp/s47_interp.txt /tmp/s47_nat.txt
+	@echo ""
+	@echo "ACCEPTANCE OK: Stage 47 -- std.process (Command, Child, ExitStatus, Stdio)"
+	@echo "  proc_spawn (fork+execvp on POSIX, subprocess.Popen in interpreter; Proc)"
+	@echo "  proc_wait (waitpid; 0..255 exit / 128+signum signal / -1 error)"
+	@echo "  proc_kill (SIGTERM; idempotent on already-exited children)"
+	@echo "  proc_child_write / proc_child_read / proc_child_close (pipe I/O)"
+	@echo "  Command builder + Child handle + ExitStatus decoder + Stdio enum"
+	@echo "  proc_spawn program arg is a taint sink (command injection)"
+	@echo "  six new builtins wired through all 4 code-paths (checker/interp/hlc/llvm)"
+	@echo "  differential (interpreter == native) verified green."
+
+.PHONY: process-acceptance
+
+# ============================================================================
+# Stage 48 (v0.67.0-alpha): std.env -- env_get, env_has, env_set,
+# env_unset, cwd_get, cwd_set, args_os. Seven new compiler builtins
+# wired through all four code-paths (boot checker, boot interpreter,
+# self-hosted compiler C codegen + C runtime, LLVM IR emit).
+# std/env.hls provides the user-facing API: env_var (Option[tainted[str]]),
+# env_set_var, env_unset_var, env_current_dir (tainted[str]),
+# env_set_current_dir, env_args_os (list[tainted[str]]).
+# ============================================================================
+env-acceptance: bin/hlc
+	@$(PYTHON) boot/boot.py examples/env_demo.hls > /tmp/env_interp.txt 2>&1
+	@bin/hlc examples/env_demo.hls /tmp/env_demo.c 2>/dev/null
+	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/env_demo /tmp/env_demo.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
+	@/tmp/env_demo > /tmp/env_nat.txt 2>&1
+	@diff -q /tmp/env_interp.txt /tmp/env_nat.txt >/dev/null 2>&1 \
+		|| (echo "FAIL: env_demo differential mismatch" && false)
+	@$(PYTHON) boot/boot.py tests/ok/feat_stage48_env.hls > /tmp/s48_interp.txt 2>&1
+	@bin/hlc tests/ok/feat_stage48_env.hls /tmp/s48.c 2>/dev/null
+	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/s48 /tmp/s48.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
+	@/tmp/s48 > /tmp/s48_nat.txt 2>&1
+	@diff -q /tmp/s48_interp.txt /tmp/s48_nat.txt >/dev/null 2>&1 \
+		|| (echo "FAIL: feat_stage48_env differential mismatch" && false)
+	@# Stage 48: taint-sink enforcement -- tainted keys and paths are rejected.
+	@if $(PYTHON) boot/boot.py --check tests/fail/fail_taint_env_get.hls >/dev/null 2>&1; then \
+		echo "FAIL: fail_taint_env_get should have been rejected"; false; \
+	fi
+	@if $(PYTHON) boot/boot.py --check tests/fail/fail_taint_env_set.hls >/dev/null 2>&1; then \
+		echo "FAIL: fail_taint_env_set should have been rejected"; false; \
+	fi
+	@if $(PYTHON) boot/boot.py --check tests/fail/fail_taint_env_set_var.hls >/dev/null 2>&1; then \
+		echo "FAIL: fail_taint_env_set_var should have been rejected"; false; \
+	fi
+	@if $(PYTHON) boot/boot.py --check tests/fail/fail_taint_cwd_set.hls >/dev/null 2>&1; then \
+		echo "FAIL: fail_taint_cwd_set should have been rejected"; false; \
+	fi
+	@rm -f /tmp/env_demo /tmp/env_demo.c /tmp/env_interp.txt /tmp/env_nat.txt \
+		/tmp/s48 /tmp/s48.c /tmp/s48_interp.txt /tmp/s48_nat.txt
+	@echo ""
+	@echo "ACCEPTANCE OK: Stage 48 -- std.env (env_var, env_set_var, env_unset_var, env_current_dir, env_set_current_dir, env_args_os)"
+	@echo "  env_get / env_has / env_set / env_unset (low-level env builtins; Proc)"
+	@echo "  cwd_get / cwd_set (low-level cwd builtins; Proc)"
+	@echo "  args_os (low-level argv builtin; same as args() at runtime)"
+	@echo "  env_var (stdlib: Option[tainted[str]] built from env_has + env_get + taint_mark)"
+	@echo "  env_set_var / env_unset_var (stdlib: thin wrappers)"
+	@echo "  env_current_dir (stdlib: tainted[str] wraps cwd_get with taint_mark)"
+	@echo "  env_set_current_dir (stdlib: thin wrapper; returns 0 / -1)"
+	@echo "  env_args_os (stdlib: list[tainted[str]] wraps args_os + taint_mark per element)"
+	@echo "  taint sinks: env_get/env_has/env_set/env_unset key, cwd_set path"
+	@echo "  seven new builtins wired through all 4 code-paths (checker/interp/hlc/llvm)"
+	@echo "  differential (interpreter == native) verified green."
+
+.PHONY: env-acceptance

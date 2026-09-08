@@ -228,6 +228,33 @@ declare i64      @hl_rand_int(i64)                  ; (max_exclusive) -> [0, max
 declare double   @hl_rand_float()
 declare void     @hl_rand_seed(i64)
 declare i64      @hl_proc_exec(ptr)                 ; (cmd) -> exit code
+; Stage 47 (v0.66.0-alpha): process management runtime helpers.
+; hl_proc_spawn forks+execs a child; the program (arg 0) and args
+; (arg 1) are owned ptr (one retain released inside the helper);
+; the stdio kind ints are i64. Returns the Halis pid (>= 1) or -1.
+; hl_proc_wait blocks until the child exits; returns the encoded
+; exit status (0..255 normal, 128+signum signal, -1 on error).
+; hl_proc_kill sends SIGTERM. hl_proc_child_write consumes the data
+; str (arg 1). hl_proc_child_read returns a fresh str. hl_proc_child_close
+; is idempotent (closing a closed pipe returns 0).
+declare i64      @hl_proc_spawn(ptr, ptr, i64, i64, i64)  ; (program, args, stdin_kind, stdout_kind, stderr_kind) -> pid
+declare i64      @hl_proc_wait(i64)                     ; (pid) -> exit_status
+declare i64      @hl_proc_kill(i64)                     ; (pid) -> 0 / -1
+declare i64      @hl_proc_child_write(i64, ptr)         ; (pid, data) -> bytes_written
+declare ptr      @hl_proc_child_read(i64, i64, i64)     ; (pid, fd_kind, n) -> fresh str
+declare i64      @hl_proc_child_close(i64, i64)         ; (pid, fd_kind) -> 0 / -1
+; Stage 48 (v0.67.0-alpha): environment + cwd runtime helpers.
+; hl_env_get returns a fresh str (the value, or "" if not found);
+; consumes the key. hl_env_has returns a bool; consumes the key.
+; hl_env_set consumes both key and value. hl_env_unset consumes the
+; key. hl_cwd_get returns a fresh str (no args). hl_cwd_set consumes
+; the path; returns 0 / -1. args_os uses hl_args() (no new symbol).
+declare ptr      @hl_env_get(ptr)                     ; (key) -> fresh str
+declare i1       @hl_env_has(ptr)                      ; (key) -> bool
+declare void     @hl_env_set(ptr, ptr)                ; (key, value)
+declare void     @hl_env_unset(ptr)                   ; (key)
+declare ptr      @hl_cwd_get()                        ; -> fresh str
+declare i64      @hl_cwd_set(ptr)                     ; (path) -> 0 / -1
 """
 
 # Stage 12 release: attributes block. `#0` is the noreturn attribute set
@@ -1687,6 +1714,54 @@ class LLVMEmitter:
                                        ["ptr"], arg_pairs)
                 _unsupported("clone() on map[str, %s]" % vt, e)
             _unsupported("clone() on type %s" % at, e)
+        # ----- Stage 9 release: proc_exec + Stage 47 (v0.66.0-alpha):
+        # process management builtins. proc_exec consumes its cmd
+        # (str); proc_spawn consumes program (arg 0) and args (arg 1);
+        # proc_child_write consumes data (arg 1). The other builtins
+        # take only int arguments.
+        if name == "proc_exec":
+            return self._call1("i64", "@hl_proc_exec", ["ptr"], arg_pairs)
+        if name == "proc_spawn":
+            return self._call1("i64", "@hl_proc_spawn",
+                               ["ptr", "ptr", "i64", "i64", "i64"], arg_pairs)
+        if name == "proc_wait":
+            return self._call1("i64", "@hl_proc_wait", ["i64"], arg_pairs)
+        if name == "proc_kill":
+            return self._call1("i64", "@hl_proc_kill", ["i64"], arg_pairs)
+        if name == "proc_child_write":
+            return self._call1("i64", "@hl_proc_child_write",
+                               ["i64", "ptr"], arg_pairs)
+        if name == "proc_child_read":
+            return self._call1("ptr", "@hl_proc_child_read",
+                               ["i64", "i64", "i64"], arg_pairs)
+        if name == "proc_child_close":
+            return self._call1("i64", "@hl_proc_child_close",
+                               ["i64", "i64"], arg_pairs)
+        # ----- Stage 48 (v0.67.0-alpha): environment + cwd builtins.
+        # env_get / env_has / env_unset / cwd_set consume their str
+        # argument; env_set consumes both; cwd_get / args_os take no
+        # arguments.
+        if name == "env_get":
+            return self._call1("ptr", "@hl_env_get", ["ptr"], arg_pairs)
+        if name == "env_has":
+            return self._call1("i1", "@hl_env_has", ["ptr"], arg_pairs)
+        if name == "env_set":
+            return self._call1("void", "@hl_env_set", ["ptr", "ptr"],
+                              arg_pairs)
+        if name == "env_unset":
+            return self._call1("void", "@hl_env_unset", ["ptr"], arg_pairs)
+        if name == "cwd_get":
+            tmp = self._fresh("cwd")
+            self._emit("  %s = call ptr @hl_cwd_get()" % tmp)
+            return ("ptr", tmp)
+        if name == "cwd_set":
+            return self._call1("i64", "@hl_cwd_set", ["ptr"], arg_pairs)
+        if name == "args_os":
+            # Same as args() at the LLVM level; the stdlib env_args_os
+            # applies taint_mark per element.
+            tmp = self._fresh("args_os")
+            self._emit("  %s = call ptr @hl_args()" % tmp)
+            return ("ptr", tmp)
         _unsupported("builtin function '%s'" % name, e)
 
     # ---------- method calls ----------

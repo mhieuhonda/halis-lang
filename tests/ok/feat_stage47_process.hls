@@ -1,0 +1,321 @@
+# tests/ok/feat_stage47_process.hls — Stage 47 (v0.66.0-alpha): std.process.
+#
+# Exercises the six new builtins (proc_spawn, proc_wait, proc_kill,
+# proc_child_write, proc_child_read, proc_child_close) and the
+# std.process wrappers (Command, Child, ExitStatus, Stdio):
+#   - proc_spawn + proc_wait: spawn `true`, verify exit code 0
+#   - proc_spawn with args: spawn `echo hello world`, verify exit code
+#   - Stdio.Pipe + child_read_stdout: capture stdout of `echo`
+#   - Stdio.Pipe on stdin + child_write + child_close_stdin: feed cat
+#   - Stdio.Pipe on stderr: capture stderr of `ls /nonexistent`
+#   - proc_kill: send SIGTERM to `sleep 10`, verify exit status
+#     encoded = 143 (128 + 15 = SIGTERM)
+#   - exit_status_decode: success / failure / signal kill
+#   - command_arg builder: append multiple args
+#   - command_status convenience: fire-and-forget
+#   - taint sink: a tainted `program` is rejected at the checker
+#     (verified separately via the fail_*.hls file).
+#
+# All tests are DETERMINISTIC in their ASSERTIONS. The differential
+# test (interpreter == native) compares printed output; we print only
+# deterministic facts (exit codes, byte counts, booleans, trimmed
+# strings) and never raw child pids (which differ between backends).
+# We also avoid inherited stdio for child processes that produce
+# output (to keep the parent's println ordering deterministic between
+# the line-buffered interpreter and the fully-buffered-when-piped
+# native runtime).
+
+import "std.process"
+import "std.option"
+import "std.str"
+
+# ============================================================================
+# Helpers
+# ============================================================================
+
+fn ok(actual: bool, msg: str) -> void uses IO {
+    if !actual {
+        panic("FAIL " + msg)
+    }
+}
+
+fn eq_int(actual: int, expected: int, msg: str) -> void uses IO {
+    if actual != expected {
+        panic("FAIL " + msg + ": expected " + expected.to_str() + ", got " + actual.to_str())
+    }
+}
+
+fn eq_str(actual: str, expected: str, msg: str) -> void uses IO {
+    if actual != expected {
+        panic("FAIL " + msg + ": expected '" + expected + "', got '" + actual + "'")
+    }
+}
+
+# ============================================================================
+# proc_spawn + proc_wait — basic spawn/wait cycle.
+# `true` exits 0; `false` exits 1.
+# ============================================================================
+
+fn test_spawn_true() -> int uses IO, Proc {
+    let empty_args: list[str] = []
+    let pid: int = proc_spawn("true", empty_args, 0, 0, 0)
+    ok(pid >= 1, "spawn_true.pid_positive")
+    let rc: int = proc_wait(pid)
+    eq_int(rc, 0, "spawn_true.rc_zero")
+    return 0
+}
+
+fn test_spawn_false() -> int uses IO, Proc {
+    let empty_args: list[str] = []
+    let pid: int = proc_spawn("false", empty_args, 0, 0, 0)
+    ok(pid >= 1, "spawn_false.pid_positive")
+    let rc: int = proc_wait(pid)
+    eq_int(rc, 1, "spawn_false.rc_one")
+    return 0
+}
+
+# ============================================================================
+# proc_spawn with args — spawn `echo hello world` with piped stdout,
+# capture output.
+# ============================================================================
+
+fn test_spawn_with_args() -> int uses IO, Proc {
+    let args: list[str] = ["hello", "world"]
+    let pid: int = proc_spawn("echo", args, 0, 1, 2)
+    ok(pid >= 1, "spawn_echo.pid_positive")
+    let out: str = proc_child_read(pid, 1, 1024)
+    let rc: int = proc_wait(pid)
+    eq_int(rc, 0, "spawn_echo.rc_zero")
+    # echo appends a newline; trim it for the comparison.
+    eq_str(out.trim(), "hello world", "spawn_echo.output")
+    return 0
+}
+
+# ============================================================================
+# Pipe stdin + write + close + read stdout — feed `cat` and read back.
+# ============================================================================
+
+fn test_pipe_stdin() -> int uses IO, Proc {
+    let empty_args: list[str] = []
+    let pid: int = proc_spawn("cat", empty_args, 1, 1, 2)
+    ok(pid >= 1, "pipe_stdin.pid_positive")
+    let n: int = proc_child_write(pid, "ping\n")
+    eq_int(n, 5, "pipe_stdin.write_5_bytes")
+    let close_rc: int = proc_child_close(pid, 0)
+    eq_int(close_rc, 0, "pipe_stdin.close_stdin_zero")
+    let out: str = proc_child_read(pid, 1, 1024)
+    let rc: int = proc_wait(pid)
+    eq_int(rc, 0, "pipe_stdin.rc_zero")
+    eq_str(out.trim(), "ping", "pipe_stdin.output")
+    return 0
+}
+
+# ============================================================================
+# Capture stderr — `ls /nonexistent` writes to stderr and exits 2.
+# ============================================================================
+
+fn test_capture_stderr() -> int uses IO, Proc {
+    let args: list[str] = ["/nonexistent"]
+    let pid: int = proc_spawn("ls", args, 2, 1, 1)
+    ok(pid >= 1, "capture_stderr.pid_positive")
+    let rc: int = proc_wait(pid)
+    eq_int(rc, 2, "capture_stderr.rc_2")
+    let out: str = proc_child_read(pid, 1, 4096)
+    let err: str = proc_child_read(pid, 2, 4096)
+    eq_str(out, "", "capture_stderr.stdout_empty")
+    ok(err != "", "capture_stderr.stderr_non_empty")
+    return 0
+}
+
+# ============================================================================
+# proc_kill — send SIGTERM to `sleep 10`. The exit status should be
+# encoded as 128 + 15 = 143.
+# ============================================================================
+
+fn test_kill_child() -> int uses IO, Proc, Clock, Conc {
+    let args: list[str] = ["10"]
+    let pid: int = proc_spawn("sleep", args, 0, 0, 0)
+    ok(pid >= 1, "kill_child.pid_positive")
+    # Let the child sleep briefly so we know it's running.
+    thread_sleep_ms(50)
+    let k: int = proc_kill(pid)
+    eq_int(k, 0, "kill_child.kill_zero")
+    let rc: int = proc_wait(pid)
+    eq_int(rc, 143, "kill_child.rc_143")
+    let es: ExitStatus = exit_status_decode(rc)
+    eq_int(es.code, -1, "kill_child.code_neg1")
+    eq_int(es.signal, 15, "kill_child.signal_15")
+    return 0
+}
+
+# ============================================================================
+# exit_status_decode — verify the encoding for all three cases:
+#   - exit code 0 -> success, code=0, signal=0
+#   - exit code 42 -> failure, code=42, signal=0
+#   - signal kill (encoded 128+9=137 for SIGKILL) -> code=-1, signal=9
+# ============================================================================
+
+fn test_exit_status_decode() -> int uses IO {
+    # 0 = success
+    let es0: ExitStatus = exit_status_decode(0)
+    ok(exit_status_success(es0), "decode.0.success")
+    eq_int(es0.code, 0, "decode.0.code")
+    eq_int(es0.signal, 0, "decode.0.signal")
+    ok(option_is_some(exit_status_code(es0)), "decode.0.code_some")
+    ok(option_is_none(exit_status_signal(es0)), "decode.0.signal_none")
+
+    # 42 = failure with exit code 42
+    let es42: ExitStatus = exit_status_decode(42)
+    ok(!exit_status_success(es42), "decode.42.not_success")
+    eq_int(es42.code, 42, "decode.42.code")
+    eq_int(es42.signal, 0, "decode.42.signal")
+
+    # 137 = signal kill (SIGKILL = 9, encoded as 128+9)
+    let es137: ExitStatus = exit_status_decode(137)
+    eq_int(es137.code, -1, "decode.137.code_neg1")
+    eq_int(es137.signal, 9, "decode.137.signal_9")
+    ok(option_is_none(exit_status_code(es137)), "decode.137.code_none")
+    ok(option_is_some(exit_status_signal(es137)), "decode.137.signal_some_9")
+
+    # -1 = error
+    let es_neg: ExitStatus = exit_status_decode(-1)
+    eq_int(es_neg.code, -1, "decode.neg1.code")
+    eq_int(es_neg.signal, 0, "decode.neg1.signal")
+    return 0
+}
+
+# ============================================================================
+# Command builder — verify the immutable-update pattern.
+# ============================================================================
+
+fn test_command_builder() -> int uses IO {
+    let c1: Command = command_new("echo")
+    eq_str(c1.program, "echo", "builder.default.program")
+    eq_int(c1.args.len(), 0, "builder.default.args_empty")
+    eq_int(c1.stdin_kind, 0, "builder.default.stdin_inherit")
+    eq_int(c1.stdout_kind, 0, "builder.default.stdout_inherit")
+    eq_int(c1.stderr_kind, 0, "builder.default.stderr_inherit")
+
+    let c2: Command = command_arg(c1, "hello")
+    eq_int(c2.args.len(), 1, "builder.arg1.len")
+    eq_str(c2.args.get(0), "hello", "builder.arg1.value")
+
+    let c3: Command = command_arg(c2, "world")
+    eq_int(c3.args.len(), 2, "builder.arg2.len")
+    eq_str(c3.args.get(0), "hello", "builder.arg2.value0")
+    eq_str(c3.args.get(1), "world", "builder.arg2.value1")
+
+    # Original is unchanged (immutable update).
+    eq_int(c1.args.len(), 0, "builder.original.unchanged")
+
+    let c4: Command = command_stdin(c3, Stdio.Pipe)
+    eq_int(c4.stdin_kind, 1, "builder.set_stdin.pipe")
+    eq_int(c4.stdout_kind, 0, "builder.set_stdin.stdout_unchanged")
+
+    let c5: Command = command_stdout(c4, Stdio.Null)
+    eq_int(c5.stdin_kind, 1, "builder.set_stdout.stdin_unchanged")
+    eq_int(c5.stdout_kind, 2, "builder.set_stdout.null")
+
+    let c6: Command = command_stderr(c5, Stdio.Inherit)
+    eq_int(c6.stderr_kind, 0, "builder.set_stderr.inherit")
+    return 0
+}
+
+# ============================================================================
+# Stdio enum helpers — stdio_to_int / stdio_from_int round-trip.
+# ============================================================================
+
+fn test_stdio_helpers() -> int uses IO {
+    eq_int(stdio_to_int(Stdio.Inherit), 0, "stdio.inherit.0")
+    eq_int(stdio_to_int(Stdio.Pipe), 1, "stdio.pipe.1")
+    eq_int(stdio_to_int(Stdio.Null), 2, "stdio.null.2")
+
+    # Round-trip via from_int (no equality on enums; use to_int).
+    eq_int(stdio_to_int(stdio_from_int(0)), 0, "stdio.roundtrip.0")
+    eq_int(stdio_to_int(stdio_from_int(1)), 1, "stdio.roundtrip.1")
+    eq_int(stdio_to_int(stdio_from_int(2)), 2, "stdio.roundtrip.2")
+    return 0
+}
+
+# ============================================================================
+# command_spawn + child_wait — the stdlib wrapper.
+# ============================================================================
+
+fn test_command_spawn() -> int uses IO, Proc {
+    let c: Command = command_new("echo")
+    let c2: Command = command_arg(c, "test")
+    let c3: Command = command_arg(c2, "output")
+    let c4: Command = command_stdout(c3, Stdio.Pipe)
+    let ch: Child = command_spawn(c4)
+    ok(ch.pid >= 1, "command_spawn.pid_positive")
+    ok(ch.stdin_open == false, "command_spawn.stdin_not_open")
+    ok(ch.stdout_open == true, "command_spawn.stdout_open")
+    ok(ch.stderr_open == false, "command_spawn.stderr_not_open")
+    let out: str = child_read_stdout(ch, 1024)
+    let rc: int = child_wait(ch)
+    eq_int(rc, 0, "command_spawn.rc_zero")
+    eq_str(out.trim(), "test output", "command_spawn.output")
+    return 0
+}
+
+# ============================================================================
+# command_status — the fire-and-forget convenience.
+# ============================================================================
+
+fn test_command_status() -> int uses IO, Proc {
+    let c_true: Command = command_new("true")
+    let es_true: ExitStatus = command_status(c_true)
+    ok(exit_status_success(es_true), "command_status.true.success")
+    eq_int(es_true.code, 0, "command_status.true.code")
+
+    let c_false: Command = command_new("false")
+    let es_false: ExitStatus = command_status(c_false)
+    ok(!exit_status_success(es_false), "command_status.false.not_success")
+    eq_int(es_false.code, 1, "command_status.false.code")
+    return 0
+}
+
+# ============================================================================
+# Main — run all tests sequentially.
+# ============================================================================
+
+fn main() -> int uses IO, Proc, Clock, Conc {
+    println("=== Stage 47: std.process ===")
+    println("")
+    println("--- proc_spawn + proc_wait (true) ---")
+    test_spawn_true()
+    println("  ok")
+    println("--- proc_spawn + proc_wait (false) ---")
+    test_spawn_false()
+    println("  ok")
+    println("--- proc_spawn with args (echo hello world) ---")
+    test_spawn_with_args()
+    println("  ok")
+    println("--- pipe stdin (cat echoes back) ---")
+    test_pipe_stdin()
+    println("  ok")
+    println("--- capture stderr (ls /nonexistent) ---")
+    test_capture_stderr()
+    println("  ok")
+    println("--- proc_kill (SIGTERM to sleep 10) ---")
+    test_kill_child()
+    println("  ok")
+    println("--- exit_status_decode (success / failure / signal) ---")
+    test_exit_status_decode()
+    println("  ok")
+    println("--- Command builder (immutable update) ---")
+    test_command_builder()
+    println("  ok")
+    println("--- Stdio enum helpers ---")
+    test_stdio_helpers()
+    println("  ok")
+    println("--- command_spawn + child_wait (stdlib wrapper) ---")
+    test_command_spawn()
+    println("  ok")
+    println("--- command_status (fire-and-forget) ---")
+    test_command_status()
+    println("  ok")
+    println("")
+    println("ACCEPTANCE OK: Stage 47 — std.process (Command, Child, ExitStatus, Stdio)")
+    return 0
+}

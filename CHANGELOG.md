@@ -13,6 +13,391 @@ stability (125–140), and final stabilisation toward v1.0 (141–150).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
+## [v0.67.0-alpha] — Stage 48: std.env (env_var, env_set_var, env_unset_var, env_current_dir, env_set_current_dir, env_args_os)
+
+> Adds `std/env.hls` — the fifteenth module of Phase III (stdlib
+> expansion) — providing the user-facing API for environment-variable
+> and current-working-directory access. Adds **seven new compiler
+> builtins** (`env_get`, `env_has`, `env_set`, `env_unset`,
+> `cwd_get`, `cwd_set`, `args_os`) wired through all four code-paths:
+> boot checker, boot interpreter, self-hosted compiler C codegen +
+> C runtime, and LLVM IR emit.
+
+### Added — Stage 48 (v0.67.0-alpha)
+
+- **Seven new compiler builtins** (low-level, returning plain types):
+  - **`env_get(key: str) -> str`** — read an env var. Returns the
+    value or `""` if not found. The `key` is a taint sink (info
+    disclosure — an attacker-controlled key reveals which env vars
+    exist by observing the program's behaviour). Carries **Proc**.
+  - **`env_has(key: str) -> bool`** — check if an env var exists.
+    The `key` is a taint sink (same info-disclosure threat as
+    `env_get`). Carries **Proc**.
+  - **`env_set(key: str, value: str) -> void`** — set an env var.
+    The `key` is a taint sink (env injection — attacker could set
+    `LD_PRELOAD`, `PATH`, `IFS`, ...). The `value` is NOT a sink
+    (the user is the origin of the value they're setting — same
+    convention as `net_write`). Carries **Proc**.
+  - **`env_unset(key: str) -> void`** — unset an env var. The `key`
+    is a taint sink (same threat as `env_set`). Idempotent (no-op
+    if the var does not exist). Carries **Proc**.
+  - **`cwd_get() -> str`** — read the current working directory.
+    No args; returns a fresh str. The stdlib wrapper applies
+    `taint_mark` to the result. Carries **Proc**.
+  - **`cwd_set(path: str) -> int`** — change the cwd. Returns 0 on
+    success, -1 on error. The `path` is a taint sink (directory
+    traversal — same threat as `read_file` / `write_file`).
+    Carries **Proc**.
+  - **`args_os() -> list[str]`** — the os-string version of `args`.
+    Returns the program's argv as a `list[str]`. The stdlib
+    wrapper applies `taint_mark` per element to return
+    `list[tainted[str]]`. Semantically distinct from `tainted_args`
+    (this is the raw OS bytes; `tainted_args` is the logical-str
+    version) even though they currently alias at the runtime
+    level (Halis str = bytes already). Carries **Proc**.
+
+- **`std/env.hls`** library module with the user-facing API names
+  from the roadmap, applying the taint wrappers:
+  - **`env_var(key: str) -> Option[tainted[str]]`** — built from
+    `env_has` + `env_get` + `taint_mark`. Returns `Option.Some`
+    with a tainted str if the var exists, `Option.None` if not.
+    The value is tainted by default (env vars are untrusted —
+    they come from the parent process / launch context, not the
+    program). The user must `taint_unwrap` or sanitise before
+    using the value as a command, path, etc.
+  - **`env_set_var(key: str, value: str) -> void`** — thin wrapper
+    over `env_set`.
+  - **`env_unset_var(key: str) -> void`** — thin wrapper over
+    `env_unset`.
+  - **`env_current_dir() -> tainted[str]`** — wraps `cwd_get` with
+    `taint_mark`. The cwd may be sensitive (e.g., the user cd'd
+    to `/etc/something`; or the cwd is read on behalf of a
+    network client who shouldn't learn it). The user must
+    `taint_unwrap` or sanitise before printing it or using it
+    as a path.
+  - **`env_set_current_dir(path: str) -> int`** — thin wrapper
+    over `cwd_set`. Returns 0 on success, -1 on error.
+  - **`env_args_os() -> list[tainted[str]]`** — wraps `args_os`
+    with `taint_mark` per element. Each element is tainted by
+    default (argv comes from the launch context, not the
+    program).
+
+- **`examples/env_demo.hls`** demonstrating:
+  - `env_var` reading HOME (Some) and a missing var (None)
+  - `env_set_var` + `env_var` round-trip (set a custom var, read
+    it back, verify the value matches)
+  - `env_unset_var` (unset, verify gone)
+  - `env_current_dir` (read cwd as `tainted[str]`, `taint_unwrap`
+    before printing — the demo runs locally)
+  - `env_set_current_dir` round-trip (save cwd, cd to `/tmp`,
+    verify, cd back, verify)
+  - `env_args_os` (read argv count; verify the basename of
+    argv[0] starts with `"env_demo"` — both interpreter and
+    native satisfy this)
+
+- **`tests/ok/feat_stage48_env.hls`** acceptance test with 11
+  sub-tests: low-level env_get/has/set/unset, env_set with empty
+  value (distinguishing empty from missing), cwd round-trip via
+  `/tmp`, cwd_set with nonexistent path (returns -1), args_os
+  count, env_var Some/None (stdlib), env_set_var + env_unset_var
+  (stdlib), env_current_dir (stdlib, matches cwd_get),
+  env_set_current_dir (stdlib, round-trip), env_args_os (stdlib,
+  matches args_os count + argv[0]).
+
+- **Four new fail tests** verifying taint-sink enforcement:
+  - `fail_taint_env_get.hls` — a tainted key passed to `env_get`
+    is rejected at compile time.
+  - `fail_taint_env_set.hls` — a tainted key passed to `env_set`
+    is rejected at compile time.
+  - `fail_taint_env_set_var.hls` — a tainted key passed to the
+    stdlib wrapper `env_set_var` is rejected at compile time
+    (type-level enforcement — the function signature requires
+    `str`, not `tainted[str]`).
+  - `fail_taint_cwd_set.hls` — a tainted path passed to `cwd_set`
+    is rejected at compile time.
+
+- **`Makefile`** target `env-acceptance` — runs the demo +
+  acceptance test differentially (interpreter == native), and
+  verifies all four fail tests are rejected.
+
+### Changed — Stage 48 (v0.67.0-alpha)
+
+- **`boot/checker.py`** — added the seven builtins to `BUILTIN_FNS`
+  and `BUILTIN_EFFECTS` (all `Proc`); added `env_get`, `env_has`,
+  `env_set`, `env_unset` keys, and `cwd_set` path, to `SINK_BUILTINS`;
+  the `check_builtin_call` handler validates argument types and
+  rejects tainted keys/paths at compile time.
+
+- **`boot/interp.py`** — added the seven builtin handlers using
+  Python's `os.environ`, `os.getcwd`, `os.chdir`, and the existing
+  `self.argv` (for `args_os`).
+
+- **`src/hlc.hls`** (self-hosted compiler):
+  - `is_builtin_fn` — added the seven new names.
+  - `builtin_effect` — all seven return `["Proc"]`.
+  - `check_builtin_call` — validates argument types and rejects
+    tainted keys/paths with a clear error message naming the
+    builtin, the argument, and the threat model.
+  - `builtin_arg_borrowed` — `env_get`, `env_has`, `env_set`,
+    `env_unset`, `cwd_set` consume their str argument(s) (the C
+    runtime calls `hl_str_release` after using the str).
+  - `gen_call` — emits `hl_env_get(...)`, `hl_env_has(...)`,
+    `hl_env_set(...)`, `hl_env_unset(...)`, `hl_cwd_get()`,
+    `hl_cwd_set(...)`, `hl_args()` (for `args_os`).
+  - C runtime emit — added `hl_env_get` (getenv + fresh str),
+    `hl_env_has` (getenv != NULL), `hl_env_set` (setenv with
+    overwrite=1), `hl_env_unset` (unsetenv, idempotent),
+    `hl_cwd_get` (getcwd(NULL, 0) — glibc auto-allocate extension),
+    `hl_cwd_set` (chdir, 0/-1).
+
+- **`tools/llvm_emit.py`** — added the seven builtin declarations
+  to `RUNTIME_DECLS` and codegen handlers in `_lower_call_typed`.
+
+### Type-level taint enforcement — Stage 48
+
+The roadmap promised: "Environment variables are tainted by
+default." This is enforced at TWO levels:
+
+1. **The "read" wrappers** (`env_var`, `env_current_dir`,
+   `env_args_os`) return `tainted[T]` by default. The user must
+   explicitly untaint (via `taint_unwrap` or a sanitiser from
+   `std.sanitize`) before using the value as a sink (command,
+   path, file content, ...). This matches the Stage 10-alpha
+   convention for `tainted_args`, `read_file_tainted`, `read_line`.
+
+2. **The "set" wrappers** (`env_set_var`, `env_unset_var`,
+   `env_set_current_dir`) take plain `str` (NOT `tainted[str]`).
+   Passing a `tainted[str]` to one of these is a compile error
+   (the function signature requires `str`). The underlying builtins
+   (`env_set`, `env_unset`, `cwd_set`) are ALSO taint sinks — so
+   even if the user bypassed the stdlib and called the builtin
+   directly, the checker would reject a tainted value. Two layers
+   of defence.
+
+### Differential parity — Stage 48
+
+The interpreter (Python `os.environ` / `os.getcwd` / `os.chdir`)
+and the C runtime (getenv / setenv / unsetenv / getcwd / chdir)
+produce byte-identical output on:
+
+- `env_get` + `env_has` (round-trip: set, verify exists, get value,
+  unset, verify gone)
+- `env_set` with empty value (distinguishing empty from missing —
+  `env_has` returns true, `env_get` returns `""`)
+- `cwd_get` + `cwd_set` round-trip via `/tmp` (save, cd to /tmp,
+  verify, cd back, verify restored)
+- `cwd_set` with nonexistent path (returns -1, cwd unchanged)
+- `args_os` count (matches between backends — the actual argv[0]
+  value differs between interpreter and native, but the count
+  matches)
+- All stdlib wrappers (`env_var`, `env_set_var`, `env_unset_var`,
+  `env_current_dir`, `env_set_current_dir`, `env_args_os`)
+
+## [v0.66.0-alpha] — Stage 47: std.process (Command, Child, ExitStatus, Stdio)
+
+> Adds `std/process.hls` — the fourteenth module of Phase III (stdlib
+> expansion) — formalising the child-process model that Stage 9
+> introduced (via `proc_exec`). Adds **six new compiler builtins**
+> (`proc_spawn`, `proc_wait`, `proc_kill`, `proc_child_write`,
+> `proc_child_read`, `proc_child_close`) wired through all four
+> code-paths: boot checker, boot interpreter, self-hosted compiler
+> C codegen + C runtime, and LLVM IR emit. Also adds LLVM backend
+> support for the existing `proc_exec` builtin (which was previously
+> declared but not yet codegen-able in the LLVM backend — Stage 12
+> alpha subset).
+
+### Added — Stage 47 (v0.66.0-alpha)
+
+- **Six new compiler builtins**:
+  - **`proc_spawn(program: str, args: list[str], stdin_kind: int, stdout_kind: int, stderr_kind: int) -> int`**
+    — fork + exec a child process. Returns the Halis pid (>= 1)
+    or -1 on failure. The `program` is the executable path; the
+    `args` list is passed as argv[1..] (NOT shell-interpreted —
+    eliminating the shell-injection vector that `proc_exec`
+    carries). The stdio kinds are 0=Inherit, 1=Pipe, 2=Null (see
+    the `Stdio` enum in `std/process.hls`). Carries **Proc**.
+    The `program` argument is a taint sink (command injection —
+    same threat model as `proc_exec`). The `args` list elements
+    are NOT sink-checked (they're passed as argv[1..], not
+    interpreted by a shell — the user must sanitise tainted args
+    before adding them to the list). The stdio kind literals
+    are validated at compile time (literal out-of-range 0/1/2 is
+    a compile error).
+  - **`proc_wait(pid: int) -> int`** — block until child exits.
+    Returns the encoded exit status: 0..255 for normal exit,
+    128+signum for signal kill, -1 on error. The encoding matches
+    `proc_exec`. Carries **Proc**.
+  - **`proc_kill(pid: int) -> int`** — send SIGTERM. Returns 0
+    on success, -1 on error. Idempotent on already-exited
+    children (treated as success by the runtime). Carries **Proc**.
+  - **`proc_child_write(pid: int, data: str) -> int`** — write to
+    the child's stdin pipe. Returns bytes written, -1 on error or
+    if the stdin pipe is not open (kind != Pipe). The `data` is
+    NOT a taint sink (the user is the origin of the data being
+    sent — same convention as `net_write`). Carries **Proc**.
+  - **`proc_child_read(pid: int, fd_kind: int, n: int) -> str`**
+    — read up to `n` bytes from the child's stdout (fd_kind=1) or
+    stderr (fd_kind=2). Returns `""` at EOF or error. fd_kind=0
+    (stdin) is rejected at runtime. Carries **Proc**.
+  - **`proc_child_close(pid: int, fd_kind: int) -> int`** — close
+    the parent end of the child's stdio pipe. fd_kind: 0=stdin,
+    1=stdout, 2=stderr. Idempotent (closing a closed pipe returns
+    0). Carries **Proc**.
+
+- **`std/process.hls`** library module with:
+  - **`Stdio` enum** (`Inherit` / `Pipe` / `Null` — encoded as
+    0 / 1 / 2 to keep the `proc_spawn` builtin signature primitive).
+    Helpers `stdio_to_int(s)` and `stdio_from_int(code)` bridge
+    the typed enum and the primitive builtin.
+  - **`Command` struct** with `program`, `args`, `stdin_kind`,
+    `stdout_kind`, `stderr_kind` fields. Builder pattern via
+    immutable update (each setter returns a NEW Command):
+    `command_new(program)`, `command_arg(c, arg)`,
+    `command_stdin(c, kind)`, `command_stdout(c, kind)`,
+    `command_stderr(c, kind)`.
+  - **`Child` struct** with `pid`, `stdin_open`, `stdout_open`,
+    `stderr_open` fields, returned by `command_spawn`.
+  - **`ExitStatus` struct** with `code` (0..255 if exited
+    normally, -1 if signal kill or error) and `signal` (signal
+    number if killed by a signal, 0 otherwise).
+    `exit_status_decode(encoded)` decodes from the encoded wait
+    status; `exit_status_success(es)` checks code==0;
+    `exit_status_code(es)` returns `Option.Some(code)` if normal
+    exit, None otherwise; `exit_status_signal(es)` returns
+    `Option.Some(signal)` if signal kill, None otherwise.
+  - **Child operations** — thin wrappers over the `proc_*`
+    builtins: `command_spawn`, `child_wait`, `child_kill`,
+    `child_write`, `child_read_stdout`, `child_read_stderr`,
+    `child_close_stdin`, `child_close_stdout`,
+    `child_close_stderr`. Each wrapper checks the corresponding
+    `*_open` flag and short-circuits (returning -1 or `""`)
+    if the pipe is not open.
+  - **Convenience helpers** — `command_status(c)` (fire-and-
+    forget: spawn + wait, returns `ExitStatus`); `command_output(c)`
+    (spawn with stdout + stderr piped, returns `Child` for the
+    caller to read pipes then wait); `proc_exec_safe(cmd)` (thin
+    alias for the `proc_exec` builtin — provided for namespacing
+    under `std.process`).
+
+- **`examples/process_demo.hls`** demonstrating:
+  - simple spawn + wait (`true` exits 0, `false` exits 1)
+  - capture stdout (piped `echo "captured stdout"`)
+  - pipe to stdin (`cat` echoes back `"ping"`)
+  - capture stderr (`ls /nonexistent` exits 2, writes to stderr)
+  - kill a long-running child (SIGTERM to `sleep 10`; encoded
+    exit = 143 = 128+15)
+  - `proc_exec_safe` (the shell one-shot, for comparison)
+  - `command_status` (fire-and-forget convenience)
+
+- **`tests/ok/feat_stage47_process.hls`** acceptance test with 11
+  sub-tests: spawn `true`/`false`, spawn with args (echo hello
+  world), pipe stdin (cat echoes back), capture stderr (ls
+  /nonexistent, exit 2), kill child (SIGTERM, exit 143),
+  exit_status_decode (success / failure / signal), Command
+  builder (immutable update), Stdio enum helpers (round-trip),
+  command_spawn + child_wait (stdlib wrapper), command_status
+  (fire-and-forget).
+
+- **Two new fail tests** verifying taint-sink and effect
+  enforcement:
+  - `fail_taint_proc_spawn.hls` — a tainted program passed to
+    `proc_spawn` is rejected at compile time.
+  - `fail_effect_proc_spawn_missing.hls` — a function without
+    `uses Proc` calling `proc_spawn` is rejected at compile time.
+
+- **`Makefile`** target `process-acceptance` — runs the demo +
+  acceptance test differentially (interpreter == native), and
+  verifies both fail tests are rejected.
+
+### Changed — Stage 47 (v0.66.0-alpha)
+
+- **`boot/checker.py`** — added the six builtins to `BUILTIN_FNS`
+  and `BUILTIN_EFFECTS` (all `Proc`); added `proc_spawn` to
+  `SINK_BUILTINS` (key 0 = program); the `check_builtin_call`
+  handler validates argument types, rejects a tainted program,
+  and validates stdio kind literals (compile error if out of
+  range 0/1/2).
+
+- **`boot/interp.py`** — added the six builtin handlers using
+  Python's `subprocess.Popen` with `close_fds=True`. The
+  Halis-level pid is a monotonic counter (1..) maintained in
+  `self.proc_next_pid`; the OS pid is stored in
+  `self.proc_children[hl_pid]` and never exposed.
+
+- **`src/hlc.hls`** (self-hosted compiler):
+  - `is_builtin_fn` — added the six new names.
+  - `builtin_effect` — all six return `["Proc"]`.
+  - `check_builtin_call` — validates argument types, rejects a
+    tainted program with a clear error message, and validates
+    stdio kind literals at compile time (loops over args 2/3/4
+    and reports the first out-of-range literal).
+  - `builtin_arg_borrowed` — `proc_spawn` (consumes program +
+    args list) and `proc_child_write` (consumes data) return
+    false (the C runtime releases the str args after use).
+  - `gen_call` — emits `hl_proc_spawn(...)`, `hl_proc_wait(...)`,
+    `hl_proc_kill(...)`, `hl_proc_child_write(...)`,
+    `hl_proc_child_read(...)`, `hl_proc_child_close(...)`.
+  - C runtime emit — added a fixed-size process-children table
+    (`hl_proc_children[64]`) keyed by a Halis-level pid (1..64);
+    `hl_proc_spawn` (fork + execvp, pipe setup with dup2,
+    /dev/null for Null stdio); `hl_proc_wait` (waitpid +
+    WIFEXITED/WIFSIGNALED encoding); `hl_proc_kill` (kill with
+    SIGTERM, ESRCH→0); `hl_proc_child_write` (write to stdin_fd);
+    `hl_proc_child_read` (read from stdout_fd or stderr_fd, fresh
+    str, 64 MiB cap); `hl_proc_child_close` (close + null the
+    fd slot, idempotent). Added `#include <signal.h>` and
+    `#include <fcntl.h>` to the runtime includes.
+
+- **`tools/llvm_emit.py`** — added the six new builtin
+  declarations to `RUNTIME_DECLS` and codegen handlers in
+  `_lower_call_typed`. Also added codegen for the existing
+  `proc_exec` builtin (which was previously declared but not
+  yet codegen-able in the LLVM backend — Stage 12 alpha subset).
+
+### Type-level taint enforcement — Stage 47
+
+The roadmap promised: "a tainted `Command` argument is rejected
+at the checker (existing `proc_exec` already does this; `Command`
+adds type-level enforcement)."
+
+This is enforced at TWO levels:
+
+1. **The `Command` struct's `program` field is `str`** (NOT
+   `tainted[str]`). A user who wants to build a Command from
+   tainted input must explicitly untaint (via `sanitize_command`
+   from `std.sanitize`, or `taint_unwrap` if they accept the risk)
+   — the `command_new(program)` helper enforces this by requiring
+   a `str` (passing a `tainted[str]` is a compile error).
+
+2. **The underlying `proc_spawn` builtin is a taint sink** for its
+   `program` argument — so even if the user bypassed the stdlib
+   and called the builtin directly with a tainted program, the
+   checker would reject it. Two layers of defence.
+
+### Differential parity — Stage 47
+
+The interpreter (Python `subprocess.Popen`) and the C runtime
+(fork + execvp) produce byte-identical output on:
+
+- simple spawn + wait (`true` exits 0, `false` exits 1)
+- spawn with args (echo "hello world", captured via piped stdout)
+- pipe stdin + write + close + read stdout (cat echoes back
+  "ping")
+- capture stderr (ls /nonexistent exits 2, writes to stderr)
+- kill a long-running child (SIGTERM to sleep 10; encoded exit =
+  143 = 128+15, matching the shell convention)
+- exit_status_decode (success / failure / signal kill)
+- Command builder (immutable update — original unchanged after
+  setter calls)
+- Stdio enum helpers (round-trip via stdio_to_int + stdio_from_int)
+- command_spawn + child_wait (stdlib wrapper)
+- command_status (fire-and-forget convenience)
+
+The Halis-level pid namespace (1..64 in native, 1.. in interpreter)
+is the same in both backends for the same spawn order — so
+differential testing is byte-exact. The OS pid (the actual Unix
+process id) is NEVER exposed to the Halis program.
+
 ## [v0.65.0-alpha] — Stage 46: std.thread (sleep, yield, current_id, Builder)
 
 > Adds `std/thread.hls` — the thirteenth module of Phase III (stdlib

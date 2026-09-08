@@ -1,0 +1,273 @@
+# tests/ok/feat_stage48_env.hls — Stage 48 (v0.67.0-alpha): std.env.
+#
+# Exercises the seven new builtins (env_get, env_has, env_set,
+# env_unset, cwd_get, cwd_set, args_os) and the std.env wrappers
+# (env_var, env_set_var, env_unset_var, env_current_dir,
+# env_set_current_dir, env_args_os):
+#   - env_get + env_has: read an env var, check existence
+#   - env_set + env_get + env_unset: set, read back, unset, verify gone
+#   - cwd_get + cwd_set: read cwd, change to /tmp, change back
+#   - args_os: read argv as list[str]
+#   - env_var (stdlib): read HOME (Some) and a missing var (None)
+#   - env_set_var + env_var (stdlib): set and read back a custom var
+#   - env_unset_var (stdlib): unset, verify gone
+#   - env_current_dir (stdlib): read cwd as tainted[str], taint_unwrap
+#   - env_set_current_dir (stdlib): change to /tmp, change back
+#   - env_args_os (stdlib): read argv as list[tainted[str]]
+#
+# All tests are DETERMINISTIC in their ASSERTIONS — we set our own
+# env vars (so the values are predictable), use /tmp (which exists on
+# every POSIX system), and verify the cwd round-trip (we save the
+# original cwd, change to /tmp, change back, verify it matches the
+# saved value).
+
+import "std.env"
+import "std.option"
+import "std.taint"
+import "std.str"
+
+# ============================================================================
+# Helpers
+# ============================================================================
+
+fn ok(actual: bool, msg: str) -> void uses IO {
+    if !actual {
+        panic("FAIL " + msg)
+    }
+}
+
+fn eq_int(actual: int, expected: int, msg: str) -> void uses IO {
+    if actual != expected {
+        panic("FAIL " + msg + ": expected " + expected.to_str() + ", got " + actual.to_str())
+    }
+}
+
+fn eq_str(actual: str, expected: str, msg: str) -> void uses IO {
+    if actual != expected {
+        panic("FAIL " + msg + ": expected '" + expected + "', got '" + actual + "'")
+    }
+}
+
+# ============================================================================
+# Low-level builtins — env_get, env_has, env_set, env_unset.
+# ============================================================================
+
+fn test_env_get_has() -> int uses IO, Proc {
+    # Set a var, verify env_has returns true, env_get returns the value.
+    env_set("HL_TEST_48_A", "alpha")
+    ok(env_has("HL_TEST_48_A"), "env_has.HL_TEST_48_A.exists")
+    eq_str(env_get("HL_TEST_48_A"), "alpha", "env_get.HL_TEST_48_A.value")
+
+    # A missing var: env_has returns false, env_get returns "".
+    ok(!env_has("HL_TEST_48_MISSING_A"), "env_has.missing.false")
+    eq_str(env_get("HL_TEST_48_MISSING_A"), "", "env_get.missing.empty")
+
+    # Unset, verify gone.
+    env_unset("HL_TEST_48_A")
+    ok(!env_has("HL_TEST_48_A"), "env_has.HL_TEST_48_A.gone")
+    eq_str(env_get("HL_TEST_48_A"), "", "env_get.HL_TEST_48_A.empty")
+    return 0
+}
+
+# ============================================================================
+# Low-level builtins — env_set with empty value (distinguish empty from
+# missing).
+# ============================================================================
+
+fn test_env_empty_value() -> int uses IO, Proc {
+    # Set a var to the empty string. env_has should return true (it's
+    # set, just to the empty string), env_get should return "".
+    env_set("HL_TEST_48_EMPTY", "")
+    ok(env_has("HL_TEST_48_EMPTY"), "env_has.empty_value.exists")
+    eq_str(env_get("HL_TEST_48_EMPTY"), "", "env_get.empty_value.empty")
+    env_unset("HL_TEST_48_EMPTY")
+    return 0
+}
+
+# ============================================================================
+# Low-level builtins — cwd_get, cwd_set round-trip.
+# ============================================================================
+
+fn test_cwd_roundtrip() -> int uses IO, Proc {
+    let saved: str = cwd_get()
+    # cd to /tmp (exists on every POSIX system).
+    let rc: int = cwd_set("/tmp")
+    eq_int(rc, 0, "cwd_set.tmp.rc_zero")
+    let in_tmp: str = cwd_get()
+    eq_str(in_tmp, "/tmp", "cwd_get.tmp")
+    # cd back to the saved cwd.
+    let rc2: int = cwd_set(saved)
+    eq_int(rc2, 0, "cwd_set.back.rc_zero")
+    let restored: str = cwd_get()
+    eq_str(restored, saved, "cwd_get.restored_matches_saved")
+    return 0
+}
+
+# ============================================================================
+# Low-level builtins — cwd_set with a nonexistent path returns -1.
+# ============================================================================
+
+fn test_cwd_set_nonexistent() -> int uses IO, Proc {
+    let saved: str = cwd_get()
+    let rc: int = cwd_set("/nonexistent/path/that/does/not/exist")
+    # cwd_set should return -1 (failure). Don't change cwd.
+    eq_int(rc, -1, "cwd_set.nonexistent.rc_neg1")
+    # Verify cwd is unchanged.
+    let still: str = cwd_get()
+    eq_str(still, saved, "cwd_get.unchanged_after_failed_set")
+    return 0
+}
+
+# ============================================================================
+# Low-level builtins — args_os.
+# ============================================================================
+
+fn test_args_os() -> int uses IO, Proc {
+    let args: list[str] = args_os()
+    # argc should be at least 1 (argv[0] is always the program name).
+    ok(args.len() >= 1, "args_os.argc_ge_1")
+    # The first arg should be non-empty.
+    ok(args.get(0).len() > 0, "args_os.argv0_non_empty")
+    return 0
+}
+
+# ============================================================================
+# Stdlib wrappers — env_var (returns Option[tainted[str]]).
+# ============================================================================
+
+fn test_env_var_some() -> int uses IO, Proc {
+    # Set a var, then env_var should return Some(tainted[str]).
+    env_set_var("HL_TEST_48_VAR", "hello")
+    let v: Option[tainted[str]] = env_var("HL_TEST_48_VAR")
+    let present: bool = match v {
+        Option.Some(_) => true,
+        Option.None => false
+    }
+    ok(present, "env_var.set.is_some")
+    let val: tainted[str] = match v {
+        Option.Some(s) => s,
+        Option.None => panic("env_var returned None after env_set_var")
+    }
+    eq_str(taint_unwrap(val), "hello", "env_var.set.value")
+    env_unset_var("HL_TEST_48_VAR")
+    return 0
+}
+
+fn test_env_var_none() -> int uses IO, Proc {
+    # A missing var: env_var should return None.
+    let v: Option[tainted[str]] = env_var("HL_TEST_48_MISSING_VAR")
+    let absent: bool = match v {
+        Option.Some(_) => false,
+        Option.None => true
+    }
+    ok(absent, "env_var.missing.is_none")
+    return 0
+}
+
+# ============================================================================
+# Stdlib wrappers — env_set_var / env_unset_var.
+# ============================================================================
+
+fn test_env_set_unset_var() -> int uses IO, Proc {
+    env_set_var("HL_TEST_48_SET", "set_value")
+    ok(env_has("HL_TEST_48_SET"), "env_set_var.exists")
+    eq_str(env_get("HL_TEST_48_SET"), "set_value", "env_set_var.value")
+
+    env_unset_var("HL_TEST_48_SET")
+    ok(!env_has("HL_TEST_48_SET"), "env_unset_var.gone")
+    return 0
+}
+
+# ============================================================================
+# Stdlib wrappers — env_current_dir (returns tainted[str]).
+# ============================================================================
+
+fn test_env_current_dir() -> int uses IO, Proc {
+    let cwd: tainted[str] = env_current_dir()
+    # taint_unwrap to get the plain str. Compare against the low-level
+    # cwd_get — they should match.
+    let plain: str = taint_unwrap(cwd)
+    eq_str(plain, cwd_get(), "env_current_dir.matches_cwd_get")
+    return 0
+}
+
+# ============================================================================
+# Stdlib wrappers — env_set_current_dir (round-trip via /tmp).
+# ============================================================================
+
+fn test_env_set_current_dir() -> int uses IO, Proc {
+    let saved: str = cwd_get()
+    let rc: int = env_set_current_dir("/tmp")
+    eq_int(rc, 0, "env_set_current_dir.tmp.rc_zero")
+    let in_tmp: str = taint_unwrap(env_current_dir())
+    eq_str(in_tmp, "/tmp", "env_current_dir.tmp")
+    let rc2: int = env_set_current_dir(saved)
+    eq_int(rc2, 0, "env_set_current_dir.back.rc_zero")
+    let restored: str = taint_unwrap(env_current_dir())
+    eq_str(restored, saved, "env_current_dir.restored_matches_saved")
+    return 0
+}
+
+# ============================================================================
+# Stdlib wrappers — env_args_os (returns list[tainted[str]]).
+# ============================================================================
+
+fn test_env_args_os() -> int uses IO, Proc {
+    let args: list[tainted[str]] = env_args_os()
+    # argc should match the low-level args_os.
+    let low_args: list[str] = args_os()
+    eq_int(args.len(), low_args.len(), "env_args_os.matches_args_os.count")
+    # Each element should be taint_mark-able — i.e., taint_unwrap
+    # should give the same value as the low-level args_os.
+    if args.len() > 0 {
+        let tainted0: tainted[str] = args.get(0)
+        let plain0: str = taint_unwrap(tainted0)
+        eq_str(plain0, low_args.get(0), "env_args_os.matches_args_os.argv0")
+    }
+    return 0
+}
+
+# ============================================================================
+# Main — run all tests sequentially.
+# ============================================================================
+
+fn main() -> int uses IO, Proc {
+    println("=== Stage 48: std.env ===")
+    println("")
+    println("--- env_get + env_has + env_set + env_unset (low-level) ---")
+    test_env_get_has()
+    println("  ok")
+    println("--- env_set with empty value (distinguish empty from missing) ---")
+    test_env_empty_value()
+    println("  ok")
+    println("--- cwd_get + cwd_set (round-trip via /tmp) ---")
+    test_cwd_roundtrip()
+    println("  ok")
+    println("--- cwd_set with nonexistent path (returns -1) ---")
+    test_cwd_set_nonexistent()
+    println("  ok")
+    println("--- args_os (low-level) ---")
+    test_args_os()
+    println("  ok")
+    println("--- env_var (Some — stdlib wrapper) ---")
+    test_env_var_some()
+    println("  ok")
+    println("--- env_var (None — stdlib wrapper) ---")
+    test_env_var_none()
+    println("  ok")
+    println("--- env_set_var + env_unset_var (stdlib wrapper) ---")
+    test_env_set_unset_var()
+    println("  ok")
+    println("--- env_current_dir (stdlib wrapper, tainted[str]) ---")
+    test_env_current_dir()
+    println("  ok")
+    println("--- env_set_current_dir (stdlib wrapper, round-trip) ---")
+    test_env_set_current_dir()
+    println("  ok")
+    println("--- env_args_os (stdlib wrapper, list[tainted[str]]) ---")
+    test_env_args_os()
+    println("  ok")
+    println("")
+    println("ACCEPTANCE OK: Stage 48 — std.env (env_var, env_set_var, env_unset_var, env_current_dir, env_set_current_dir, env_args_os)")
+    return 0
+}

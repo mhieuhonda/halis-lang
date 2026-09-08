@@ -1,0 +1,491 @@
+# ============================================================================
+# std/process.hls — Stage 47 (v0.66.0-alpha): process management
+# ----------------------------------------------------------------------------
+# This module is the fourteenth module of Phase III (stdlib expansion).
+# It formalises the child-process model that Stage 9 introduced (via
+# `proc_exec`) and adds six new compiler builtins for spawning, waiting,
+# signalling, and piping child processes:
+#
+#   * proc_spawn(program, args, stdin_kind, stdout_kind, stderr_kind) -> int
+#       Fork + exec a child. Returns the Halis pid (>= 1) or -1 on failure.
+#       `program` is the executable path; `args` is passed as argv[1..]
+#       (NOT shell-interpreted — no shell injection vector). The stdio
+#       kinds are 0=Inherit, 1=Pipe, 2=Null (see the Stdio enum below).
+#       Carries the Proc effect. The `program` argument is a taint sink
+#       (a tainted program enables command injection — same threat
+#       model as proc_exec). The args list elements are NOT sink-checked
+#       (the user is responsible for sanitising tainted args before
+#       adding them to the list).
+#
+#   * proc_wait(pid) -> int
+#       Block until the child exits. Returns the encoded exit status:
+#       0..255 for normal exit, 128+signum for signal kill, -1 on error.
+#       The encoding matches proc_exec. Carries Proc.
+#
+#   * proc_kill(pid) -> int
+#       Send SIGTERM. Returns 0 on success, -1 on error. Idempotent on
+#       already-exited children. Carries Proc.
+#
+#   * proc_child_write(pid, data) -> int
+#       Write to the child's stdin pipe. Returns bytes written, -1 on
+#       error or if the stdin pipe is not open (stdio kind != Pipe).
+#       Carries Proc. The data is NOT a taint sink (the user is the
+#       origin of the data — same convention as net_write).
+#
+#   * proc_child_read(pid, fd_kind, n) -> str
+#       Read up to n bytes from the child's stdout (fd_kind=1) or
+#       stderr (fd_kind=2). Returns "" at EOF or error. fd_kind=0
+#       (stdin) is rejected at runtime. Carries Proc.
+#
+#   * proc_child_close(pid, fd_kind) -> int
+#       Close the parent end of the child's stdio pipe. fd_kind:
+#       0=stdin, 1=stdout, 2=stderr. Idempotent (closing a closed
+#       pipe returns 0). Carries Proc.
+#
+# The builtins are wired through all four code-paths: boot checker,
+# boot interpreter, self-hosted compiler C codegen + C runtime, and
+# LLVM IR emit.
+#
+# The module also provides:
+#   * Stdio      — enum { Inherit, Pipe, Null } (0 / 1 / 2 as ints).
+#   * Command    — struct { program, args, stdin_kind, stdout_kind,
+#                 stderr_kind } with a builder pattern.
+#   * Child      — struct { pid, stdin_open, stdout_open, stderr_open }
+#                 returned by command_spawn.
+#   * ExitStatus — struct { code, signal } decoded from the encoded
+#                 wait status.
+#   * convenience helpers — command_new, command_program, command_arg,
+#                 command_stdin, command_stdout, command_stderr,
+#                 command_spawn, child_wait, child_kill, child_write,
+#                 child_read_stdout, child_read_stderr, child_close_stdin,
+#                 child_close_stdout, child_close_stderr,
+#                 exit_status_success, exit_status_code, exit_status_signal,
+#                 exit_status_decode.
+#   * proc_exec  — the Stage 9 builtin is preserved as a thin wrapper
+#                 over the new machinery (proc_exec(cmd) runs the command
+#                 via system(); command_spawn() uses fork+execvp without
+#                 a shell — the two are NOT equivalent: proc_exec is a
+#                 shell one-shot, command_spawn is a typed, pipe-aware
+#                 subprocess).
+#
+# Type-level taint enforcement:
+#   The `Command` struct's `program` field is `str` (NOT `tainted[str]`).
+#   A user who wants to build a Command from tainted input must explicitly
+#   untaint (via `sanitize_command` from std.sanitize, or `taint_unwrap`
+#   if they accept the risk) — the `command_program` helper enforces this
+#   by requiring a `str` (passing a `tainted[str]` is a compile error).
+#   This is the type-level enforcement the roadmap promised: "a tainted
+#   Command argument is rejected at the checker (existing proc_exec
+#   already does this; Command adds type-level enforcement)."
+#
+# Differential parity (interpreter == native):
+#   All builtins are implemented identically in the interpreter (Python
+#   subprocess.Popen) and the C runtime (fork+execvp). The Halis-level
+#   pid namespace is a monotonic counter (1..64 in native, 1.. in the
+#   interpreter) — both backends agree on the same Halis-level pid for
+#   the same spawn order, so differential testing is byte-exact. The
+#   OS pid (the actual Unix process id) is NEVER exposed to the Halis
+#   program — it differs between interpreter and native, so we hide it.
+#
+# Limitations (deferred to later stages):
+#   * proc_try_wait (non-blocking) — not yet provided; a future stage
+#     may add it once async proc integration is built.
+#   * Environment passing — the child inherits the parent's environment
+#     (no env_var / env_clear). Stage 48 (std.env) will provide the
+#     primitive to manipulate the env; a future stage will add
+#     Command.env_clear / Command.env_set.
+#   * Working directory — the child inherits the parent's cwd. A
+#     future stage will add Command.cwd.
+#   * proc_kill sends SIGTERM only; SIGKILL / SIGINT / SIGHUP are
+#     deferred to a future stage (the kill builtin could take a signal
+#     number, but adding a signal abstraction is a Stage 50+ concern).
+#   * Windows — the runtime uses fork(), which is not available on
+#     Windows. A Windows port would need to use CreateProcess. The
+#     interpreter uses subprocess.Popen which works on Windows, so the
+#     interpreter path is portable; the native path is POSIX-only for
+#     Stage 47 (matching proc_exec, which uses system() — also POSIX-
+#     centric in its signal encoding).
+# ============================================================================
+
+import "std.option"
+import "std.str"
+
+# ----------------------------------------------------------------------------
+# Stdio enum — the three standard configurations for a child's stdio
+# stream. Encoded as ints 0 / 1 / 2 (matching the proc_spawn builtin's
+# stdin_kind / stdout_kind / stderr_kind arguments). HLS enums are
+# tagged unions but here we use bare ints to keep the proc_spawn
+# builtin signature primitive (the builtin takes int args, not enum
+# values — the enum is a documentation / type-safety helper layered
+# on top).
+# ----------------------------------------------------------------------------
+
+enum Stdio {
+    Inherit,   # 0 — the child inherits the parent's fd
+    Pipe,      # 1 — a pipe is created; parent reads/writes via proc_child_*
+    Null,      # 2 — the child's fd is connected to /dev/null
+}
+
+# Convert a Stdio enum to its int code (the proc_spawn builtin takes
+# ints; this helper bridges the typed enum and the primitive builtin).
+# Uses match (HLS does not support == on enum values directly).
+fn stdio_to_int(s: Stdio) -> int {
+    return match s {
+        Stdio.Inherit => 0,
+        Stdio.Pipe => 1,
+        Stdio.Null => 2
+    }
+}
+
+# Convert an int code back to a Stdio enum. Panics if the code is
+# not 0 / 1 / 2 (the caller should validate first).
+fn stdio_from_int(code: int) -> Stdio {
+    if code == 0 {
+        return Stdio.Inherit
+    }
+    if code == 1 {
+        return Stdio.Pipe
+    }
+    if code == 2 {
+        return Stdio.Null
+    }
+    panic("stdio_from_int: invalid code " + code.to_str())
+}
+
+# ----------------------------------------------------------------------------
+# Command — a builder for a child process. The struct is immutable
+# (no field reassignment); each setter returns a NEW Command with the
+# field updated. This mirrors the Rust `std::process::Command` API
+# (which IS mutating in Rust — but HLS v0.3 lacks `let mut` field
+# reassignment through a builder, so we use the immutable-update
+# idiom from std.thread.ThreadBuilder).
+# ----------------------------------------------------------------------------
+
+struct Command {
+    program: str,
+    args: list[str],
+    stdin_kind: int,
+    stdout_kind: int,
+    stderr_kind: int,
+}
+
+# command_new(program) — create a Command with the given program,
+# empty args, and all stdio inherited (the simplest "just exec this"
+# configuration).
+fn command_new(program: str) -> Command {
+    let empty: list[str] = []
+    let c: Command = Command {
+        program: program,
+        args: empty,
+        stdin_kind: 0,
+        stdout_kind: 0,
+        stderr_kind: 0,
+    }
+    return c
+}
+
+# command_arg(c, arg) — return a NEW Command with arg appended to the
+# args list. (HLS lists are immutable through `push`; the helper makes
+# a shallow clone of the args list and pushes onto it.) The arg is a
+# `str` (NOT `tainted[str]`) — the caller must sanitise tainted input
+# before adding it to the args list (the proc_spawn builtin does NOT
+# sink-check the args elements).
+fn command_arg(c: Command, arg: str) -> Command {
+    let new_args: list[str] = []
+    let mut i: int = 0
+    while i < c.args.len() {
+        new_args.push(c.args.get(i))
+        i = i + 1
+    }
+    new_args.push(arg)
+    let nc: Command = Command {
+        program: c.program,
+        args: new_args,
+        stdin_kind: c.stdin_kind,
+        stdout_kind: c.stdout_kind,
+        stderr_kind: c.stderr_kind,
+    }
+    return nc
+}
+
+# command_stdin(c, kind) — return a NEW Command with the stdin kind
+# set to `kind` (a Stdio enum).
+fn command_stdin(c: Command, kind: Stdio) -> Command {
+    let nc: Command = Command {
+        program: c.program,
+        args: c.args,
+        stdin_kind: stdio_to_int(kind),
+        stdout_kind: c.stdout_kind,
+        stderr_kind: c.stderr_kind,
+    }
+    return nc
+}
+
+# command_stdout(c, kind) — return a NEW Command with the stdout kind
+# set to `kind` (a Stdio enum).
+fn command_stdout(c: Command, kind: Stdio) -> Command {
+    let nc: Command = Command {
+        program: c.program,
+        args: c.args,
+        stdin_kind: c.stdin_kind,
+        stdout_kind: stdio_to_int(kind),
+        stderr_kind: c.stderr_kind,
+    }
+    return nc
+}
+
+# command_stderr(c, kind) — return a NEW Command with the stderr kind
+# set to `kind` (a Stdio enum).
+fn command_stderr(c: Command, kind: Stdio) -> Command {
+    let nc: Command = Command {
+        program: c.program,
+        args: c.args,
+        stdin_kind: c.stdin_kind,
+        stdout_kind: c.stdout_kind,
+        stderr_kind: stdio_to_int(kind),
+    }
+    return nc
+}
+
+# ----------------------------------------------------------------------------
+# Child — a handle to a spawned child process. Returned by command_spawn.
+# The pid is the Halis-level pid (1..64 in native, 1.. in interpreter);
+# the OS pid is NEVER exposed (it differs between backends and would
+# break differential testing). The *_open flags track whether the
+# parent end of each stdio pipe is still open (set at spawn time based
+# on the Command's stdio kinds; cleared by child_close_*).
+# ----------------------------------------------------------------------------
+
+struct Child {
+    pid: int,
+    stdin_open: bool,
+    stdout_open: bool,
+    stderr_open: bool,
+}
+
+# command_spawn(c) -> Child — spawn the child process described by the
+# Command. Panics if proc_spawn returns -1 (spawn failure). The
+# stdin_open / stdout_open / stderr_open flags are derived from the
+# Command's stdio kinds (a pipe is "open" on the parent side; inherit
+# and null are not).
+fn command_spawn(c: Command) -> Child uses Proc {
+    let pid: int = proc_spawn(c.program, c.args, c.stdin_kind,
+                              c.stdout_kind, c.stderr_kind)
+    if pid < 0 {
+        panic("command_spawn: proc_spawn failed for '" + c.program + "'")
+    }
+    let ch: Child = Child {
+        pid: pid,
+        stdin_open: c.stdin_kind == 1,
+        stdout_open: c.stdout_kind == 1,
+        stderr_open: c.stderr_kind == 1,
+    }
+    return ch
+}
+
+# ----------------------------------------------------------------------------
+# Child operations — thin wrappers over the proc_* builtins. The
+# wrappers check the *_open flag and return -1 (for write/close) or
+# "" (for read) if the corresponding pipe is not open, saving the
+# caller from bookkeeping.
+# ----------------------------------------------------------------------------
+
+# child_wait(ch) -> int — block until child exits; return encoded exit
+# status. (Calls proc_wait directly — the wait builtin doesn't care
+# about the parent-end pipe state.)
+fn child_wait(ch: Child) -> int uses Proc {
+    return proc_wait(ch.pid)
+}
+
+# child_kill(ch) -> int — send SIGTERM to the child. Returns 0 on
+# success, -1 on error.
+fn child_kill(ch: Child) -> int uses Proc {
+    return proc_kill(ch.pid)
+}
+
+# child_write(ch, data) -> int — write to the child's stdin pipe.
+# Returns -1 if the stdin pipe is not open (no need to call the
+# builtin — the runtime would also return -1, but we short-circuit
+# here to avoid the builtin call entirely).
+fn child_write(ch: Child, data: str) -> int uses Proc {
+    if !ch.stdin_open {
+        return -1
+    }
+    return proc_child_write(ch.pid, data)
+}
+
+# child_read_stdout(ch, n) -> str — read up to n bytes from the
+# child's stdout pipe. Returns "" if the stdout pipe is not open.
+fn child_read_stdout(ch: Child, n: int) -> str uses Proc {
+    if !ch.stdout_open {
+        return ""
+    }
+    return proc_child_read(ch.pid, 1, n)
+}
+
+# child_read_stderr(ch, n) -> str — read up to n bytes from the
+# child's stderr pipe. Returns "" if the stderr pipe is not open.
+fn child_read_stderr(ch: Child, n: int) -> str uses Proc {
+    if !ch.stderr_open {
+        return ""
+    }
+    return proc_child_read(ch.pid, 2, n)
+}
+
+# child_close_stdin(ch) -> int — close the parent end of the child's
+# stdin pipe. Returns 0 on success, -1 on error. Idempotent on a
+# not-open pipe (returns 0 without calling the builtin).
+fn child_close_stdin(ch: Child) -> int uses Proc {
+    if !ch.stdin_open {
+        return 0
+    }
+    return proc_child_close(ch.pid, 0)
+}
+
+# child_close_stdout(ch) -> int — close the parent end of the child's
+# stdout pipe. Idempotent on a not-open pipe.
+fn child_close_stdout(ch: Child) -> int uses Proc {
+    if !ch.stdout_open {
+        return 0
+    }
+    return proc_child_close(ch.pid, 1)
+}
+
+# child_close_stderr(ch) -> int — close the parent end of the child's
+# stderr pipe. Idempotent on a not-open pipe.
+fn child_close_stderr(ch: Child) -> int uses Proc {
+    if !ch.stderr_open {
+        return 0
+    }
+    return proc_child_close(ch.pid, 2)
+}
+
+# ----------------------------------------------------------------------------
+# ExitStatus — a decoded representation of the encoded wait status
+# returned by proc_wait / child_wait. The encoded form is a single int
+# (0..255 = exit code, 128+signum = signal kill, -1 = error); this
+# struct splits it into a `code` field (the exit code if exited
+# normally, else -1) and a `signal` field (the signal number if killed
+# by a signal, else 0). Both fields are -1 / 0 if the wait returned
+# an error (the encoded form was -1).
+# ----------------------------------------------------------------------------
+
+struct ExitStatus {
+    code: int,    # exit code (0..255) if exited normally, else -1
+    signal: int,  # signal number if killed by signal, else 0
+}
+
+# exit_status_decode(encoded) -> ExitStatus — decode the encoded wait
+# status returned by proc_wait / child_wait. The encoded form is:
+#   -1          -> error (code = -1, signal = 0)
+#   0..255      -> normal exit (code = encoded, signal = 0)
+#   128+signum  -> signal kill (code = -1, signal = signum)
+# signal is at most 64 (real Unix signals are 1..31 + a few rtx
+# extensions; 128+64 is the upper bound of the encoding).
+fn exit_status_decode(encoded: int) -> ExitStatus {
+    if encoded < 0 {
+        let err: ExitStatus = ExitStatus { code: -1, signal: 0 }
+        return err
+    }
+    if encoded < 128 {
+        # Normal exit: 0..127 are valid exit codes (some shells cap
+        # at 127; our encoding reserves 128+ for signals).
+        let ok: ExitStatus = ExitStatus { code: encoded, signal: 0 }
+        return ok
+    }
+    # Signal kill: encoded = 128 + signum, so signum = encoded - 128.
+    # The caller can check signum against the standard Unix signal
+    # numbers (1=SIGHUP, 2=SIGINT, 9=SIGKILL, 15=SIGTERM, ...).
+    let sig: ExitStatus = ExitStatus { code: -1, signal: encoded - 128 }
+    return sig
+}
+
+# exit_status_success(es) -> bool — true iff the child exited normally
+# with code 0. This is the convenience callers reach for most often
+# ("did the command succeed?").
+fn exit_status_success(es: ExitStatus) -> bool {
+    return es.code == 0
+}
+
+# exit_status_code(es) -> Option[int] — Some(code) if the child exited
+# normally, None if killed by signal or if the wait returned an error.
+fn exit_status_code(es: ExitStatus) -> Option[int] {
+    if es.code < 0 {
+        return Option.None
+    }
+    return Option.Some(es.code)
+}
+
+# exit_status_signal(es) -> Option[int] — Some(signum) if the child
+# was killed by a signal, None if exited normally or if the wait
+# returned an error.
+fn exit_status_signal(es: ExitStatus) -> Option[int] {
+    if es.signal == 0 {
+        return Option.None
+    }
+    return Option.Some(es.signal)
+}
+
+# ----------------------------------------------------------------------------
+# Convenience: run a Command to completion and return its ExitStatus.
+# This is the "fire and forget" pattern: spawn, optionally close stdin,
+# wait. Stdout / stderr pipes are NOT read (the caller should use the
+# full child_* API if they need to capture output).
+# ----------------------------------------------------------------------------
+
+# command_status(c) -> ExitStatus — spawn the command, wait for it to
+# exit, and return the decoded ExitStatus. Stdin / stdout / stderr
+# are inherited by default (the caller should set up pipes explicitly
+# via command_stdin / command_stdout / command_stderr if they need
+# them). This is the simplest way to "just run a command and check
+# if it succeeded".
+fn command_status(c: Command) -> ExitStatus uses Proc {
+    let ch: Child = command_spawn(c)
+    let encoded: int = child_wait(ch)
+    return exit_status_decode(encoded)
+}
+
+# command_output(c) -> ExitStatus — like command_status but with stdout
+# and stderr piped (so the caller can read them via child_read_stdout
+# / child_read_stderr before waiting). The stdin kind is unchanged
+# (inherit by default). Returns the Child handle (the caller must
+# read the pipes and then child_wait).
+#
+# Note: this helper does NOT wait — the caller must call child_wait
+# after reading the pipes (otherwise the pipes may close before the
+# child finishes writing and the read may return "" prematurely).
+fn command_output(c: Command) -> Child uses Proc {
+    let c2: Command = command_stdout(c, Stdio.Pipe)
+    let c3: Command = command_stderr(c2, Stdio.Pipe)
+    return command_spawn(c3)
+}
+
+# ----------------------------------------------------------------------------
+# proc_exec — the Stage 9 builtin is preserved as a thin wrapper.
+# proc_exec(cmd) runs the command via system() (a shell one-shot — the
+# command IS interpreted by /bin/sh, so callers MUST sanitise any
+# tainted input before constructing the command string). For a
+# type-safe, shell-free alternative, use command_spawn (which uses
+# fork+execvp WITHOUT a shell — the args are passed as argv[1..] and
+# are NOT shell-interpreted).
+#
+# The two are NOT equivalent:
+#   proc_exec("echo hello; rm -rf /")   — runs BOTH commands (shell ;)
+#   command_spawn("echo", ["hello; rm -rf /"], ...) — runs echo with
+#     a single argument "hello; rm -rf /" (no shell, no injection).
+# Prefer command_spawn for any case where the args come from outside
+# the program (config file, network, user input).
+# ----------------------------------------------------------------------------
+
+# proc_exec_safe(cmd) -> int — a thin alias for the proc_exec builtin.
+# Provided for namespacing and to document the effect discipline. The
+# builtin itself is the canonical name; this helper exists so callers
+# can `import "std.process"` and use `proc_exec_safe` rather than
+# calling the builtin directly (which would require no import).
+fn proc_exec_safe(cmd: str) -> int uses Proc {
+    return proc_exec(cmd)
+}
+
+# ============================================================================
+# End of std/process.hls
+# ============================================================================

@@ -1832,6 +1832,178 @@ class Interp:
                 return os.WEXITSTATUS(rc)
             # Killed by signal — encode as 128 + signum, like shells.
             return 128 + os.WTERMSIG(rc)
+        # ----- Stage 47 (v0.66.0-alpha): process management builtins -----
+        # The interpreter mirrors the C runtime exactly so differential
+        # testing (interpreter == native) is byte-exact. Child processes
+        # are tracked in self.proc_children (a dict[int, subprocess.Popen])
+        # keyed by an int pid (a monotonic counter starting at 1, NOT
+        # the OS pid — the OS pid differs between interpreter and native,
+        # so we use our own namespace). The Halis-level pid is what
+        # proc_wait / proc_kill / proc_child_* use; the runtime translates
+        # it to the OS pid internally.
+        if name == "proc_spawn":
+            program = args[0].decode("utf-8", "replace")
+            arg_list = args[1]  # list of bytes
+            stdin_kind = int(args[2])
+            stdout_kind = int(args[3])
+            stderr_kind = int(args[4])
+            if stdin_kind < 0 or stdin_kind > 2:
+                raise HLPanic("proc_spawn: stdin_kind must be 0/1/2", line)
+            if stdout_kind < 0 or stdout_kind > 2:
+                raise HLPanic("proc_spawn: stdout_kind must be 0/1/2", line)
+            if stderr_kind < 0 or stderr_kind > 2:
+                raise HLPanic("proc_spawn: stderr_kind must be 0/1/2", line)
+            # Translate stdio kinds to subprocess constants.
+            def _translate_stdio(kind):
+                if kind == 0:
+                    return None  # inherit
+                if kind == 1:
+                    return subprocess.PIPE
+                return subprocess.DEVNULL  # null
+            try:
+                argv = [program] + [a.decode("utf-8", "replace") for a in arg_list]
+                proc = subprocess.Popen(
+                    argv,
+                    stdin=_translate_stdio(stdin_kind),
+                    stdout=_translate_stdio(stdout_kind),
+                    stderr=_translate_stdio(stderr_kind),
+                    close_fds=True,
+                )
+            except FileNotFoundError:
+                raise HLPanic("proc_spawn: program not found: %s"
+                              % to_display(args[0]), line)
+            except OSError as ex:
+                raise HLPanic("proc_spawn: %s: %s"
+                              % (to_display(args[0]), str(ex)), line)
+            # Allocate a Halis-level pid (monotonic counter, starting at 1).
+            if not hasattr(self, "proc_next_pid") or self.proc_next_pid < 1:
+                self.proc_next_pid = 1
+            if not hasattr(self, "proc_children"):
+                self.proc_children = {}
+            hl_pid = self.proc_next_pid
+            self.proc_next_pid += 1
+            self.proc_children[hl_pid] = proc
+            return hl_pid
+        if name == "proc_wait":
+            hl_pid = int(args[0])
+            if not hasattr(self, "proc_children") or hl_pid not in self.proc_children:
+                raise HLPanic("proc_wait: unknown pid %d" % hl_pid, line)
+            proc = self.proc_children[hl_pid]
+            try:
+                rc = proc.wait()
+            except OSError as ex:
+                return -1
+            # rc is already the exit code (subprocess encodes signals
+            # as -N; translate to 128 + signum for parity with proc_exec).
+            if rc < 0:
+                return 128 + (-rc)
+            return rc & 0xFF
+        if name == "proc_kill":
+            hl_pid = int(args[0])
+            if not hasattr(self, "proc_children") or hl_pid not in self.proc_children:
+                raise HLPanic("proc_kill: unknown pid %d" % hl_pid, line)
+            proc = self.proc_children[hl_pid]
+            try:
+                proc.terminate()
+                return 0
+            except OSError:
+                return -1
+        if name == "proc_child_write":
+            hl_pid = int(args[0])
+            data = args[1]
+            if not hasattr(self, "proc_children") or hl_pid not in self.proc_children:
+                raise HLPanic("proc_child_write: unknown pid %d" % hl_pid, line)
+            proc = self.proc_children[hl_pid]
+            if proc.stdin is None:
+                return -1
+            try:
+                proc.stdin.write(data if isinstance(data, bytes)
+                                 else bytes(data))
+                proc.stdin.flush()
+                return len(data)
+            except (OSError, BrokenPipeError, ValueError):
+                return -1
+        if name == "proc_child_read":
+            hl_pid = int(args[0])
+            fd_kind = int(args[1])
+            n = int(args[2])
+            if fd_kind not in (1, 2):
+                raise HLPanic("proc_child_read: fd_kind must be 1 (stdout) "
+                              "or 2 (stderr), got %d" % fd_kind, line)
+            if n < 0:
+                raise HLPanic("proc_child_read: n must be >= 0, got %d" % n, line)
+            if not hasattr(self, "proc_children") or hl_pid not in self.proc_children:
+                raise HLPanic("proc_child_read: unknown pid %d" % hl_pid, line)
+            proc = self.proc_children[hl_pid]
+            stream = proc.stdout if fd_kind == 1 else proc.stderr
+            if stream is None:
+                return b""
+            try:
+                return stream.read(n) if n > 0 else b""
+            except OSError:
+                return b""
+        if name == "proc_child_close":
+            hl_pid = int(args[0])
+            fd_kind = int(args[1])
+            if fd_kind not in (0, 1, 2):
+                raise HLPanic("proc_child_close: fd_kind must be 0/1/2, "
+                              "got %d" % fd_kind, line)
+            if not hasattr(self, "proc_children") or hl_pid not in self.proc_children:
+                raise HLPanic("proc_child_close: unknown pid %d" % hl_pid, line)
+            proc = self.proc_children[hl_pid]
+            stream = {0: proc.stdin, 1: proc.stdout, 2: proc.stderr}[fd_kind]
+            if stream is None:
+                return 0  # idempotent on already-closed / not-opened
+            try:
+                stream.close()
+                return 0
+            except OSError:
+                return -1
+        # ----- Stage 48 (v0.67.0-alpha): environment + cwd builtins -----
+        # The interpreter uses Python's os.environ, os.getcwd, os.chdir.
+        # All return / consume bytes-exact str (HLS str = Python bytes)
+        # so non-UTF-8 env vars and cwd paths behave identically to the
+        # C runtime (which uses getenv / setenv / unsetenv / getcwd /
+        # chdir with raw char*).
+        #
+        # These are LOW-LEVEL builtins returning plain str / bool / etc.
+        # The stdlib std/env.hls wrapper applies the taint wrappers to
+        # produce the user-facing API (env_var -> Option[tainted[str]],
+        # env_current_dir -> tainted[str], env_args_os -> list[tainted[str]]).
+        if name == "env_get":
+            key = args[0].decode("utf-8", "replace")
+            val = os.environ.get(key, "")
+            return val.encode("utf-8") if isinstance(val, str) else bytes(val)
+        if name == "env_has":
+            key = args[0].decode("utf-8", "replace")
+            return key in os.environ
+        if name == "env_set":
+            key = args[0].decode("utf-8", "replace")
+            val = args[1].decode("utf-8", "replace")
+            os.environ[key] = val
+            return None
+        if name == "env_unset":
+            key = args[0].decode("utf-8", "replace")
+            if key in os.environ:
+                del os.environ[key]
+            return None
+        if name == "cwd_get":
+            cwd = os.getcwd()
+            return cwd.encode("utf-8") if isinstance(cwd, str) else bytes(cwd)
+        if name == "cwd_set":
+            path = args[0].decode("utf-8", "replace")
+            try:
+                os.chdir(path)
+                return 0
+            except OSError:
+                return -1
+        if name == "args_os":
+            # Same as args() — the OS-string version. The roadmap
+            # distinguishes args_os from tainted_args semantically
+            # (args_os is the raw bytes from the OS; tainted_args is
+            # the logical str version) but in Halis str = bytes
+            # already, so they currently alias.
+            return self.argv
         # ----- Stage 16 (v0.27.0-alpha): concurrency builtins -----
         # chan_new() -> Chan[T] — a fresh, empty channel.
         if name == "chan_new":
