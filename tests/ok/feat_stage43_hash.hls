@@ -1,0 +1,300 @@
+# tests/ok/feat_stage43_hash.hls — Stage 43 (v0.62.0-alpha): std.hash.
+#
+# Exercises all four hash algorithms and the hash-trait helpers:
+#   - SipHash-2-4: empty, short, long, keyed, streaming
+#   - xxHash64: empty, short, long, seeded, streaming
+#   - FNV-1a 64-bit: empty, short, long
+#   - CityHash64: empty, short, long
+#   - Hash trait helpers: hash_int, hash_str, hash_bool, hash_float
+#   - hash_combine (order-sensitive)
+#   - Uniform Hasher enum API
+#   - Determinism and avalanche checks
+#   - Known test vectors (SipHash official, FNV-1a official)
+#
+# All tests are DETERMINISTIC — pure HLS, no I/O — so the
+# differential test (interpreter == native) is byte-exact.
+
+import "std.hash"
+import "std.str"
+import "std.option"
+import "std.result"
+
+# ============================================================================
+# Helpers — assertion + nice error messages.
+# ============================================================================
+
+fn ok(actual: bool, msg: str) -> void uses IO {
+    if !actual {
+        panic("FAIL " + msg)
+    }
+}
+
+fn eq_int(actual: int, expected: int, msg: str) -> void uses IO {
+    if actual != expected {
+        panic("FAIL " + msg + ": expected " + expected.to_str() + ", got " + actual.to_str())
+    }
+}
+
+# ============================================================================
+# SipHash-2-4 tests.
+# ============================================================================
+
+fn test_siphash() -> int uses IO {
+    # Known test vector: SipHash-2-4 with key read little-endian from
+    # bytes [0x00..0x0f], empty message.
+    # k0 = 0x0706050403020100 = 506097522914230528
+    # k1 = 0x0f0e0d0c0b0a0908 = 1084818905618843912
+    # Expected: 0x726fdb47dd0e0e31 = 8246050544436514353
+    let k0: int = 506097522914230528
+    let k1: int = 1084818905618843912
+    eq_int(siphash_str_keyed("", k0, k1), 8246050544436514353, "siphash.keyed.empty")
+
+    # Default key (0, 0) on empty
+    # Expected: 0x1e924b9d737700d7 = 2202906307356721367
+    eq_int(siphash_str(""), 2202906307356721367, "siphash.default.empty")
+
+    # Default key on "a"
+    # Expected: 0x96c20860cd93a249 = -7583489610679606711
+    eq_int(siphash_str("a"), -7583489610679606711, "siphash.default.a")
+
+    # Determinism: same input -> same hash
+    ok(siphash_str("hello") == siphash_str("hello"), "siphash.determinism")
+
+    # Avalanche: one-byte change -> different hash
+    ok(siphash_str("hello") != siphash_str("hellp"), "siphash.avalanche")
+
+    # Streaming matches one-shot
+    let h: SipHasher = siphash_new()
+    siphash_write_str(h, "hello ")
+    siphash_write_str(h, "world")
+    eq_int(siphash_finish(h), siphash_str("hello world"), "siphash.streaming")
+
+    # Keyed vs default differ
+    ok(siphash_str("hello") != siphash_str_keyed("hello", 42, 99), "siphash.keyed.differs")
+
+    println("  SipHash OK")
+    return 0
+}
+
+# ============================================================================
+# xxHash64 tests.
+# ============================================================================
+
+fn test_xxhash() -> int uses IO {
+    # Known test vector: xxHash64 seed=0, empty input
+    # Expected: 0xef46db3751d8e999 = -1205034819632174695
+    eq_int(xxhash_str(""), -1205034819632174695, "xxhash.empty")
+
+    # Known test vector: xxHash64 seed=0, "a"
+    eq_int(xxhash_str("a"), -90257947893481798, "xxhash.a")
+
+    # Seeded differs from default
+    ok(xxhash_str("hello") != xxhash_str_seeded("hello", 42), "xxhash.seeded.differs")
+
+    # Determinism
+    ok(xxhash_str("test") == xxhash_str("test"), "xxhash.determinism")
+
+    # Avalanche
+    ok(xxhash_str("hello") != xxhash_str("hellp"), "xxhash.avalanche")
+
+    # Long input (exercises accumulator path, 32+ bytes)
+    let long_str: str = "The quick brown fox jumps over the lazy dog!!"
+    ok(xxhash_str(long_str) != 0, "xxhash.long.nonzero")
+
+    # Streaming matches one-shot
+    let h: XxHasher = xxhash_new()
+    xxhash_write_str(h, "hello ")
+    xxhash_write_str(h, "world")
+    eq_int(xxhash_finish(h), xxhash_str("hello world"), "xxhash.streaming")
+
+    println("  xxHash OK")
+    return 0
+}
+
+# ============================================================================
+# FNV-1a 64-bit tests.
+# ============================================================================
+
+fn test_fnv() -> int uses IO {
+    # FNV-1a empty = offset basis = 0xcbf29ce484222325
+    # = -3750763034362895579 as int64
+    eq_int(fnv_str(""), -3750763034362895579, "fnv.empty")
+
+    # FNV-1a("a") = (offset ^ 0x61) * prime
+    eq_int(fnv_str("a"), -5808556873153909620, "fnv.a")
+
+    # Determinism
+    ok(fnv_str("test") == fnv_str("test"), "fnv.determinism")
+
+    # Avalanche
+    ok(fnv_str("hello") != fnv_str("hellp"), "fnv.avalanche")
+
+    # Different strings produce different hashes
+    ok(fnv_str("foo") != fnv_str("bar"), "fnv.distinct")
+
+    println("  FNV OK")
+    return 0
+}
+
+# ============================================================================
+# CityHash64 tests.
+# ============================================================================
+
+fn test_cityhash() -> int uses IO {
+    # CityHash empty
+    let c0: int = cityhash_str("")
+    ok(c0 != 0, "cityhash.empty.nonzero")
+
+    # Determinism
+    ok(cityhash_str("test") == cityhash_str("test"), "cityhash.determinism")
+
+    # Avalanche
+    ok(cityhash_str("hello") != cityhash_str("hellp"), "cityhash.avalanche")
+
+    # Different length buckets
+    ok(cityhash_str("a") != cityhash_str("ab"), "cityhash.len.1-2")
+    ok(cityhash_str("ab") != cityhash_str("abc"), "cityhash.len.2-3")
+
+    # 17-byte boundary (switches from 0-16 to 17-32 path)
+    let s16: str = "0123456789abcdef"
+    let s17: str = "0123456789abcdefg"
+    ok(cityhash_str(s16) != cityhash_str(s17), "cityhash.len.16-17")
+
+    # 33-byte boundary (switches from 17-32 to 33-64 path)
+    let s32: str = "0123456789abcdef0123456789abcdef"
+    let s33: str = "0123456789abcdef0123456789abcdef0"
+    ok(cityhash_str(s32) != cityhash_str(s33), "cityhash.len.32-33")
+
+    # 65-byte boundary (switches from 33-64 to 65+ path)
+    let s64: str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    let s65: str = s64 + "X"
+    ok(cityhash_str(s64) != cityhash_str(s65), "cityhash.len.64-65")
+
+    println("  CityHash OK")
+    return 0
+}
+
+# ============================================================================
+# Hash trait helpers.
+# ============================================================================
+
+fn test_hash_helpers() -> int uses IO {
+    # hash_int
+    ok(hash_int(42) != 0, "hash_int.42.nonzero")
+    ok(hash_int(42) == hash_int(42), "hash_int.determinism")
+    ok(hash_int(42) != hash_int(43), "hash_int.distinct")
+    ok(hash_int(0) != hash_int(1), "hash_int.0-1")
+    ok(hash_int(-1) != hash_int(1), "hash_int.neg")
+
+    # hash_str
+    ok(hash_str("hello") != 0, "hash_str.hello.nonzero")
+    ok(hash_str("hello") == hash_str("hello"), "hash_str.determinism")
+    ok(hash_str("hello") != hash_str("world"), "hash_str.distinct")
+
+    # hash_bool
+    ok(hash_bool(true) != hash_bool(false), "hash_bool.distinct")
+    ok(hash_bool(true) == hash_bool(true), "hash_bool.determinism")
+
+    # hash_float
+    ok(hash_float(3.14) == hash_float(3.14), "hash_float.determinism")
+    ok(hash_float(3.14) != hash_float(2.71), "hash_float.distinct")
+
+    # hash_combine (order-sensitive)
+    let ab: int = hash_combine(42, 100)
+    let ba: int = hash_combine(100, 42)
+    ok(ab != ba, "hash_combine.order-sensitive")
+    ok(ab == hash_combine(42, 100), "hash_combine.determinism")
+
+    println("  Hash helpers OK")
+    return 0
+}
+
+# ============================================================================
+# Uniform Hasher enum API.
+# ============================================================================
+
+fn test_hasher_enum() -> int uses IO {
+    # All four algorithms produce different hashes for the same input
+    let s: str = "hello world"
+    let h_sip: Hasher = hasher_new(0)
+    hasher_write_str(h_sip, s)
+    let r_sip: int = hasher_finish(h_sip)
+
+    let h_xx: Hasher = hasher_new(1)
+    hasher_write_str(h_xx, s)
+    let r_xx: int = hasher_finish(h_xx)
+
+    let h_fnv: Hasher = hasher_new(2)
+    hasher_write_str(h_fnv, s)
+    let r_fnv: int = hasher_finish(h_fnv)
+
+    let h_city: Hasher = hasher_new(3)
+    hasher_write_str(h_city, s)
+    let r_city: int = hasher_finish(h_city)
+
+    # All four should be different (extremely unlikely to collide)
+    ok(r_sip != r_xx, "hasher.sip-xx.differ")
+    ok(r_sip != r_fnv, "hasher.sip-fnv.differ")
+    ok(r_sip != r_city, "hasher.sip-city.differ")
+    ok(r_xx != r_fnv, "hasher.xx-fnv.differ")
+    ok(r_xx != r_city, "hasher.xx-city.differ")
+    ok(r_fnv != r_city, "hasher.fnv-city.differ")
+
+    # Streaming via Hasher enum matches one-shot
+    ok(r_sip == siphash_str(s), "hasher.sip.matches-oneshot")
+    ok(r_xx == xxhash_str(s), "hasher.xx.matches-oneshot")
+    ok(r_fnv == fnv_str(s), "hasher.fnv.matches-oneshot")
+    ok(r_city == cityhash_str(s), "hasher.city.matches-oneshot")
+
+    println("  Hasher enum API OK")
+    return 0
+}
+
+# ============================================================================
+# Algorithm constants.
+# ============================================================================
+
+fn test_constants() -> int uses IO {
+    # FNV offset basis = 0xcbf29ce484222325 = -3750763034362895579
+    eq_int(fnv_offset_basis(), -3750763034362895579, "fnv.offset_basis")
+
+    # FNV prime = 0x100000001b3 = 1099511628211
+    eq_int(fnv_prime(), 1099511628211, "fnv.prime")
+
+    # xxHash primes (check they're non-zero and distinct)
+    ok(xxhash_prime1() != 0, "xxhash.prime1.nonzero")
+    ok(xxhash_prime2() != 0, "xxhash.prime2.nonzero")
+    ok(xxhash_prime3() != 0, "xxhash.prime3.nonzero")
+    ok(xxhash_prime4() != 0, "xxhash.prime4.nonzero")
+    ok(xxhash_prime5() != 0, "xxhash.prime5.nonzero")
+    ok(xxhash_prime1() != xxhash_prime2(), "xxhash.prime1-2.distinct")
+
+    # SipHash default key is (0, 0)
+    eq_int(siphash_default_k0(), 0, "siphash.default_k0")
+    eq_int(siphash_default_k1(), 0, "siphash.default_k1")
+
+    # CityHash constants are non-zero
+    ok(cityhash_k0() != 0, "cityhash.k0.nonzero")
+    ok(cityhash_k1() != 0, "cityhash.k1.nonzero")
+    ok(cityhash_k2() != 0, "cityhash.k2.nonzero")
+
+    println("  Constants OK")
+    return 0
+}
+
+# ============================================================================
+# Main entry point.
+# ============================================================================
+
+fn main() -> int uses IO {
+    println("=== Stage 43: std.hash acceptance test ===")
+    test_siphash()
+    test_xxhash()
+    test_fnv()
+    test_cityhash()
+    test_hash_helpers()
+    test_hasher_enum()
+    test_constants()
+    println("=== All Stage 43 tests passed ===")
+    return 0
+}

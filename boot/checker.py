@@ -1952,9 +1952,14 @@ class Checker:
                     self.err("! operator requires bool, got %s" % vt, e)
                 e["t"] = "bool"
             else:
-                if vt not in ("int", "float"):
+                # Stage 43 deep-scan fix: allow `never` as operand (e.g.
+                # `-panic("...")`), propagating `never` as the result type.
+                if vt == "never":
+                    e["t"] = "never"
+                elif vt not in ("int", "float"):
                     self.err("- operator requires int/float, got %s" % vt, e)
-                e["t"] = vt
+                else:
+                    e["t"] = vt
         elif k == "index":
             tt = self.check_expr(e["target"], env, None)
             if tt == "never":

@@ -13,8 +13,88 @@ stability (125–140), and final stabilisation toward v1.0 (141–150).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
-## [v0.61.0-alpha] — Stage 42: std.fmt (Display / Debug traits + format-string interpreter)
+## [v0.63.0-alpha] — Stage 44: std.collections (BTreeMap, HashSet, LinkedList, RingBuf, HashMap)
 
+> Adds `std/collections.hls` — the eleventh module of Phase III
+> (stdlib expansion) — implementing five collection types that
+> complement the built-in `map[str, T]` and `list[T]`. **No new
+> compiler builtins** — the entire module is pure HLS, layered on
+> `std.hash` (Stage 43) for key hashing.
+
+### Added — Stage 44 (v0.63.0-alpha)
+
+- **`std/collections.hls`** library module with:
+  - **BTreeMap** — ordered associative array with O(log n) binary
+    search lookup. Monomorphic variants: `BTreeMapIntStr`,
+    `BTreeMapIntInt`. Supports `get`, `set`, `has`, `remove`,
+    `keys`, `values`, `min`, `max`, `size`, `is_empty`.
+  - **HashSet** — set of values with union, intersect, diff, equal.
+    Monomorphic variants: `HashSetInt`, `HashSetStr`. Backed by
+    `map[str, T]` with SipHash key conversion for int elements.
+  - **LinkedList** — doubly-linked list with O(1) push/pop at both
+    ends. Monomorphic variants: `LinkedListInt`, `LinkedListStr`.
+    Arena-based node allocation (no per-node heap allocation).
+  - **RingBuf** — fixed-capacity circular buffer. Monomorphic
+    variants: `RingBufInt`, `RingBufStr`. Supports both
+    overwrite mode (`push_overwrite`) and bounded mode (`push`
+    returns false when full).
+  - **HashMap** — general map with non-str keys. Monomorphic
+    variants: `HashMapIntStr`, `HashMapIntInt`. Uses SipHash
+    (Stage 43) for key hashing, with per-bucket collision
+    handling via linear search.
+
+### Fixed — Stage 44 deep-scan pass
+
+- **`boot/interp.py:859-866`** (HIGH): `call_extern`'s embedded-NUL
+  guard raised `NameError` (undefined `line`) instead of the intended
+  `HLPanic`. Fixed to use `getattr(self, "line", 0)`.
+- **`boot/checker.py:1948-1962`** + **`src/hlc.hls:6561-6579`**
+  (MEDIUM): Unary `-` operator rejected `never` operand — the BUG-06
+  `never`-propagation fix was applied to `bin`/`index`/`field` but
+  missed `un`. Fixed to propagate `never` (e.g. `-panic("...")` now
+  type-checks as `never`).
+- **`std/fmt.hls:880-885`** (MEDIUM): `fmt_float_with_precision`
+  panicked with "float.to_int out of int64 range" when round-half-to-
+  even pushed `scaled` from `[2^63 - 0.5, 2^63)` to exactly `2^63`.
+  Added a post-rounding guard.
+- **`src/hlc.hls:16146-16250`** (HIGH): C codegen declared `void
+  hlc_m_r;` for void-returning `match` expressions, which is invalid
+  C. Fixed to skip the accumulator declaration for `void` (matching
+  the existing `never` handling).
+
+## [v0.62.0-alpha] — Stage 43: std.hash (SipHash, xxHash, FNV, CityHash)
+
+> Adds `std/hash.hls` — the tenth module of Phase III (stdlib
+> expansion) — implementing four general-purpose hash functions.
+> **No new compiler builtins** — the entire module is pure HLS,
+> layered on `std.bits` for the bitwise primitives.
+
+### Added — Stage 43 (v0.62.0-alpha)
+
+- **`std/hash.hls`** library module with:
+  - **SipHash-2-4** (`SipHasher`) — the default DoS-resistant hash
+    used by Python's dict / Rust's HashMap / Perl / Haskell / Ruby.
+    Keyed (128-bit key). Verified against the official SipHash test
+    vector (key `00..0f`, empty message → `0x726fdb47dd0e0e31`).
+  - **xxHash64** (`XxHasher`) — extremely fast non-crypto hash.
+    Seeded. Verified against the official xxHash test vector
+    (seed=0, empty → `0xef46db3751d8e999`).
+  - **FNV-1a 64-bit** (`FnvHasher`) — tiny code (~5 lines),
+    deterministic. Verified against the official FNV-1a constants
+    (offset basis `0xcbf29ce484222325`, prime `0x100000001b3`).
+  - **CityHash64** (`CityHasher`) — tuned for short strings, with
+    dedicated length-bucket paths (0–16, 17–32, 33–64, 65+ bytes).
+  - **Hash trait helpers** — monomorphic per concrete type:
+    `hash_int`, `hash_str`, `hash_bool`, `hash_float`,
+    `hash_combine` (boost-style order-sensitive combination).
+  - **Uniform `Hasher` enum API** — `hasher_new(algo)`,
+    `hasher_write(h, bytes)`, `hasher_finish(h)` for runtime
+    algorithm selection.
+  - **Unsigned 64-bit arithmetic helpers** — `hash_u64_mul`,
+    `hash_u64_add`, `hash_u64_sub`, `hash_u64_rotl`, `hash_u64_rotr`,
+    `hash_u64_xor` — all using 16-bit limb splitting to avoid the
+    runtime's checked-overflow panic.
+## [v0.61.0-alpha] — Stage 42: std.fmt (Display / Debug traits + format-string interpreter)
 > Adds `std/fmt.hls` — the ninth module of Phase III (stdlib
 > expansion) — implementing Rust-style Display / Debug formatting
 > plus a `format!`-macro analogue. **No new compiler builtins** —

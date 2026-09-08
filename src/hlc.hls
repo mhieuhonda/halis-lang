@@ -6566,10 +6566,16 @@ fn check_expr(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, expected
             }
             ctx.exprs[e].t = "bool"
         } else {
-            if vt != "int" && vt != "float" {
-                cerr(ctx.exprs[e].line, "operator - expects int/float, got " + vt)
+            # Stage 43 deep-scan fix: propagate `never` for unary minus
+            # (e.g. `-panic("...")` should type-check as `never`).
+            if vt == "never" {
+                ctx.exprs[e].t = "never"
+            } else {
+                if vt != "int" && vt != "float" {
+                    cerr(ctx.exprs[e].line, "operator - expects int/float, got " + vt)
+                }
+                ctx.exprs[e].t = vt
             }
-            ctx.exprs[e].t = vt
         }
     } else if k == "index" {
         let tt: str = check_expr(ctx, env, cur, ctx.exprs[e].left, "")
@@ -16147,9 +16153,16 @@ fn gen_match_expr(ctx: Ctx, e: int) -> str {
     # are panic/exit), we must NOT declare a `hlc_m_r` accumulator —
     # `never` is not a valid C type. Emit the dispatch without an
     # accumulator and without a trailing `hlc_m_r;` value.
+    #
+    # Stage 43 fix: same applies when the match result type is `void` —
+    # `void hlc_m_r;` is invalid C (a variable cannot have void type).
+    # This case arises when a void function uses a match expression to
+    # dispatch (e.g. `fn hasher_write(h, b) -> void { match h { ... } }`).
     let match_t: str = ctx.exprs[e].t
     let is_never: bool = match_t == "never"
-    if !is_never {
+    let is_void: bool = match_t == "void"
+    let no_accum: bool = is_never || is_void
+    if !no_accum {
         block.push("    " + c_type(ctx, match_t) + " hlc_m_r;")
     }
     block.push("    if (0) {}")
@@ -16167,7 +16180,7 @@ fn gen_match_expr(ctx: Ctx, e: int) -> str {
             # bindings, which only exist here).
             collect_hoist(ctx, arm.body)
             hoist_all(ctx, block, "        ")
-            if arm.body_t != "never" {
+            if arm.body_t != "never" && arm.body_t != "void" {
                 # Stage 8-beta: the arm result is OWNED — own-wrap borrow
                 # bodies with a retain so hlc_m_r always owns one retain.
                 let bv: str = gen_expr(ctx, arm.body)
@@ -16214,7 +16227,7 @@ fn gen_match_expr(ctx: Ctx, e: int) -> str {
                 }
                 bi = bi + 1
             }
-            if arm.body_t != "never" {
+            if arm.body_t != "never" && arm.body_t != "void" {
                 # Stage 8-beta: arm-local hoisting (see wildcard arm), then
                 # own-wrap borrow bodies so hlc_m_r always owns one retain.
                 collect_hoist(ctx, arm.body)
@@ -16238,7 +16251,7 @@ fn gen_match_expr(ctx: Ctx, e: int) -> str {
     if !has_wildcard {
         block.push("    else { hl_die(\"match: no arm matched (internal)\"); }")
     }
-    if !is_never {
+    if !no_accum {
         block.push("    hlc_m_r;")
     }
     block.push("})")

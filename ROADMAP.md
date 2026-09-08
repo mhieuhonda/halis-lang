@@ -80,8 +80,8 @@ remains green.
 | 40 | `std.json` streaming parser (constant-memory) | ✅ | 3 weeks |
 | 41 | `std.regex` — NFA-based regex (no ReDoS) | ✅ | (done in v0.60.0-alpha) |
 | 42 | `std.fmt` — printf-style + custom `Display` impls | ✅ | (done in v0.61.0-alpha) |
-| 43 | `std.hash` — SipHash, xxHash, FNV, cityHash | ⬜ | 3 weeks |
-| 44 | `std.collections` — BTreeMap, HashSet, LinkedList, RingBuf | ⬜ | 6 weeks |
+| 43 | `std.hash` — SipHash, xxHash, FNV, cityHash | ✅ | (done in v0.62.0-alpha) |
+| 44 | `std.collections` — BTreeMap, HashSet, LinkedList, RingBuf | ✅ | (done in v0.63.0-alpha) |
 | 45 | `std.sync` — Mutex, RwLock, Condvar, OnceCell | ⬜ | 4 weeks |
 | 46 | `std.thread` — OS threads (preemptive scheduler) | ⬜ | 5 weeks |
 | 47 | `std.process` — spawn, pipe, signal, exit-code | ⬜ | 4 weeks |

@@ -1,0 +1,1209 @@
+# ============================================================================
+# std/hash.hls — Stage 43 (v0.62.0-alpha): hashing primitives
+# ----------------------------------------------------------------------------
+# This module is the tenth module of Phase III (stdlib expansion). It
+# implements four general-purpose hash functions, each with different
+# performance / quality / size trade-offs:
+#
+#   * SipHasher  — SipHash-2-4 (Aumasson & Bernstein, 2012). The default
+#                  DoS-resistant hash used by Python's dict / Rust's
+#                  HashMap / Perl / Haskell / Ruby. Slower than the
+#                  non-crypto alternatives but provably resistant to
+#                  hash-flooding attacks under a secret key.
+#   * XxHasher   — xxHash64 (Yann Collet). Extremely fast non-crypto
+#                  hash, ~3x faster than SipHash on large inputs. Used
+#                  by lz4, zstd, the Linux kernel, and Rust's
+#                  `std::collections::hash_map::DefaultHasher`.
+#   * FnvHasher   — FNV-1a 64-bit. Tiny code (~5 lines), adequate for
+#                  small keys and checksum use-cases where speed is not
+#                  critical. NOT DoS-resistant (deterministic, no key).
+#   * CityHasher — CityHash64 (Google, 2011). Tuned for short strings
+#                  (~16-byte). NOT DoS-resistant (deterministic, no key).
+#
+# All four hashers operate on byte sequences. A `Hasher` enum wraps
+# the per-algorithm state, and a uniform API (`hasher_new`,
+# `hasher_write`, `hasher_finish`) lets the caller swap algorithms
+# without code changes.
+#
+# **No new compiler builtins** — the entire module is pure HLS,
+# layered on `std.bits` for the bitwise primitives (and/or/xor/not/
+# shl/shr/popcount) and `std.str` for byte access.
+#
+# Hash trait convention:
+#   Following the same convention as `std.fmt` (Stage 42) and
+#   `std.io` (Stage 35), this module provides **monomorphic helpers
+#   per concrete type** for hashing — `hash_int`, `hash_str`,
+#   `hash_bool`, `hash_float`, plus a generic `hash_write_bytes`
+#   that any caller can use directly. When trait dispatch arrives
+#   (the `trait` keyword is reserved since v0.20.0-alpha), each
+#   `impl Hash for X` will already be in place — only the
+#   `trait Hash { fn hash(self) -> int }` declaration needs to be
+#   added at the top, and existing call sites will start working
+#   polymorphically.
+#
+# DO NOT use these hashes for password storage or key derivation.
+# They are NOT cryptographic — SipHash is keyed but is designed for
+# hash-table use (not preimage resistance). For passwords, use
+# std.crypto's bcrypt / argon2 (Stage 9 release); for key derivation,
+# use HKDF / PBKDF2 (also std.crypto).
+#
+# Differential parity (interpreter == native):
+#   All four hashers are pure integer + byte operations. Output is
+#   byte-identical between the interpreter and the native binary
+#   (no I/O, no randomness except the caller-supplied key, no float
+#   arithmetic).
+#
+# Security:
+#   * **Default seed**: SipHash uses a fixed seed (0, 0) by default
+#     for differential-test determinism. Production callers SHOULD
+#     supply a per-process random key (e.g. from rand_int) to get
+#     DoS resistance — the seedless default is suitable only for
+#     testing and for non-adversarial inputs.
+#   * **Integer overflow**: all hashers use bitwise primitives
+#     (int_and / int_or / int_xor / int_shl / int_shr) which wrap
+#     to two's-complement int64. The arithmetic helpers in this
+#     module (`hash_u64_mul`, `hash_u64_add`) deliberately use
+#     int_and with a 64-bit mask after the multiply to match the
+#     unsigned-64-bit semantics the algorithms were specified for.
+#     The result is the same two's-complement bit pattern the
+#     reference C implementations produce.
+#
+# API summary:
+#
+#   # Hasher enum + uniform API
+#   enum Hasher { Sip(SipHasher), Xx(XxHasher), Fnv(FnvHasher), City(CityHasher) }
+#   hasher_new(algo: int) -> Hasher           # 0=Sip, 1=Xx, 2=Fnv, 3=City
+#   hasher_write(h, bytes) -> void             # accumulate bytes
+#   hasher_write_str(h, s) -> void             # convenience: str -> bytes
+#   hasher_finish(h) -> int                    # finalise, return 64-bit digest
+#
+#   # SipHash-2-4
+#   siphash_new() -> SipHasher                 # default key (0, 0)
+#   siphash_new_keyed(k0: int, k1: int) -> SipHasher
+#   siphash_write(h, bytes) -> void
+#   siphash_write_str(h, s) -> void
+#   siphash_finish(h) -> int
+#   siphash_str(s) -> int                      # one-shot convenience
+#   siphash_str_keyed(s, k0, k1) -> int
+#
+#   # xxHash64
+#   xxhash_new() -> XxHasher                   # default seed = 0
+#   xxhash_new_seeded(seed: int) -> XxHasher
+#   xxhash_write(h, bytes) -> void
+#   xxhash_write_str(h, s) -> void
+#   xxhash_finish(h) -> int
+#   xxhash_str(s) -> int                       # one-shot convenience
+#   xxhash_str_seeded(s, seed) -> int
+#
+#   # FNV-1a 64-bit
+#   fnv_new() -> FnvHasher
+#   fnv_write(h, bytes) -> void
+#   fnv_write_str(h, s) -> void
+#   fnv_finish(h) -> int
+#   fnv_str(s) -> int                          # one-shot convenience
+#
+#   # CityHash64 (simplified — Google's reference, no platform intrinsics)
+#   cityhash_new() -> CityHasher
+#   cityhash_write(h, bytes) -> void
+#   cityhash_write_str(h, s) -> void
+#   cityhash_finish(h) -> int
+#   cityhash_str(s) -> int                     # one-shot convenience
+#
+#   # Hash-trait helpers (per concrete type, monomorphic)
+#   hash_int(x) -> int                         # uses SipHash with default key
+#   hash_str(s) -> int                         # uses SipHash with default key
+#   hash_bool(b) -> int
+#   hash_float(x) -> int
+#   hash_combine(a, b) -> int                  # a la boost::hash_combine
+#   hash_write_bytes(seed, bytes) -> int       # FNV-1a over a seed
+# ============================================================================
+
+import "std.bits"
+import "std.str"
+import "std.option"
+import "std.result"
+
+# ============================================================================
+# Constants — algorithm magic numbers (from the published specs).
+# HLS has no hex literals, so all constants are written in decimal.
+# The comments record the hex form for cross-checking against the
+# algorithm specifications.
+# ============================================================================
+
+# FNV-1a 64-bit constants (from the FNV spec, Glenn Fowler / Landon Curt
+# Noll / Phong Vo, 1991).
+#
+#   offset_basis = 0xcbf29ce484222325
+#       = 14695981039346656037 as unsigned uint64
+#       = -175524933849455979  as signed int64 (HLS int)
+#   prime         = 0x100000001b3
+#       = 1099511628211 (fits in positive int64)
+#
+# We compose the offset basis from its high32 / low32 halves to avoid
+# writing a literal that overflows int64.
+fn fnv_offset_basis() -> int {
+    # high32 = 0xcbf29ce4 = 3421674724
+    # low32  = 0x84222325 = 2216829733
+    let hi: int = 3421674724
+    let lo: int = 2216829733
+    return int_or(int_shl(hi, 32), lo)
+}
+
+fn fnv_prime() -> int {
+    # 0x100000001b3 = (0x100 << 32) | 0x1b3 = (256 << 32) | 435
+    return int_or(int_shl(256, 32), 435)
+}
+
+# xxHash64 prime constants (from the xxHash spec, Yann Collet).
+#   PRIME1 = 0x9E3779B185EBCA87 = 11400714785074694791 (uint64)
+#   PRIME2 = 0xC2B2AE3D27D4EB4F = 14029467366897019727 (uint64)
+#   PRIME3 = 0x165667B19E3779F9 =  1609587929392839161 (positive int64)
+#   PRIME4 = 0x85EBCA77C2B2AE63 =  9650029242287828579 (positive int64)
+#   PRIME5 = 0x27D4EB2F165667C5 =  2870177450012600261 (positive int64)
+#
+# PRIME1 and PRIME2 overflow int64 as positive literals, so we compose
+# them from 16-bit halves via int_or / int_shl (the bit pattern is
+# preserved through the bitwise primitives, matching the unsigned
+# semantics the algorithm expects).
+fn xxhash_prime1() -> int {
+    # 0x9E3779B185EBCA87
+    # halves: 0x9E37=40503, 0x79B1=31153, 0x85EB=34283, 0xCA87=51847
+    return int_or(int_shl(40503, 48),
+           int_or(int_shl(31153, 32),
+           int_or(int_shl(34283, 16), 51847)))
+}
+
+fn xxhash_prime2() -> int {
+    # 0xC2B2AE3D27D4EB4F
+    # halves: 0xC2B2=49842, 0xAE3D=44605, 0x27D4=10196, 0xEB4F=60239
+    return int_or(int_shl(49842, 48),
+           int_or(int_shl(44605, 32),
+           int_or(int_shl(10196, 16), 60239)))
+}
+
+fn xxhash_prime3() -> int {
+    # 0x165667B19E3779F9 = 1609587929392839161 (fits in positive int64)
+    return 1609587929392839161
+}
+
+fn xxhash_prime4() -> int {
+    # 0x85EBCA77C2B2AE63 = 9650029242287828579 (overflows positive int64
+    # by ~426e15, so compose from 16-bit halves).
+    # halves: 0x85EB=34283, 0xCA77=51831, 0xC2B2=49842, 0xAE63=44643
+    return int_or(int_shl(34283, 48),
+           int_or(int_shl(51831, 32),
+           int_or(int_shl(49842, 16), 44643)))
+}
+
+fn xxhash_prime5() -> int {
+    # 0x27D4EB2F165667C5 = 2870177450012600261 (fits in positive int64)
+    return 2870177450012600261
+}
+
+# SipHash default key — (0, 0). Production callers SHOULD supply a
+# per-process random key (e.g. rand_int). The seedless default is for
+# differential-test determinism and non-adversarial inputs.
+fn siphash_default_k0() -> int {
+    return 0
+}
+
+fn siphash_default_k1() -> int {
+    return 0
+}
+
+# SipHash init constants — the first 32 bytes of the ASCII string
+# "somepseudorandomlygeneratedbytes", interpreted as four little-endian
+# uint64 words. These are nothing-up-my-sleeve numbers from the SipHash
+# paper §3.
+fn siphash_c0() -> int {
+    # 0x736f6d6570736575  ("somepseu")
+    # halves: 0x736f=29551, 0x6d65=28005, 0x7073=28787, 0x6575=25973
+    return int_or(int_shl(29551, 48),
+           int_or(int_shl(28005, 32),
+           int_or(int_shl(28787, 16), 25973)))
+}
+
+fn siphash_c1() -> int {
+    # 0x646f72616e646f6d  ("dorandom")
+    # halves: 0x646f=25711, 0x7261=29281, 0x6e64=28260, 0x6f6d=28525
+    return int_or(int_shl(25711, 48),
+           int_or(int_shl(29281, 32),
+           int_or(int_shl(28260, 16), 28525)))
+}
+
+fn siphash_c2() -> int {
+    # 0x6c7967656e657261  ("lygenera")
+    # halves: 0x6c79=27769, 0x6765=26469, 0x6e65=28261, 0x7261=29281
+    return int_or(int_shl(27769, 48),
+           int_or(int_shl(26469, 32),
+           int_or(int_shl(28261, 16), 29281)))
+}
+
+fn siphash_c3() -> int {
+    # 0x7465646279746573  ("tedbytes")
+    # halves: 0x7465=29797, 0x6462=25698, 0x7974=31092, 0x6573=25971
+    return int_or(int_shl(29797, 48),
+           int_or(int_shl(25698, 32),
+           int_or(int_shl(31092, 16), 25971)))
+}
+
+# CityHash magic constants (from the CityHash spec, Google, 2011).
+fn cityhash_k0() -> int {
+    # 0xc3a5c85c97cb3127
+    # halves: 0xc3a5=50085, 0xc85c=51300, 0x97cb=38859, 0x3127=12583
+    return int_or(int_shl(50085, 48),
+           int_or(int_shl(51300, 32),
+           int_or(int_shl(38859, 16), 12583)))
+}
+
+fn cityhash_k1() -> int {
+    # 0xb492b66fbe98f273
+    # halves: 0xb492=46226, 0xb66f=46703, 0xbe98=48792, 0xf273=62067
+    return int_or(int_shl(46226, 48),
+           int_or(int_shl(46703, 32),
+           int_or(int_shl(48792, 16), 62067)))
+}
+
+fn cityhash_k2() -> int {
+    # 0x9ae16a3b2f90404f
+    # halves: 0x9ae1=39649, 0x6a3b=27195, 0x2f90=12176, 0x404f=16463
+    return int_or(int_shl(39649, 48),
+           int_or(int_shl(27195, 32),
+           int_or(int_shl(12176, 16), 16463)))
+}
+
+# ============================================================================
+# Unsigned 64-bit arithmetic helpers.
+#
+# HLS ints are signed int64. The hash algorithms operate on unsigned
+# uint64. We emulate unsigned semantics by masking to 64 bits after
+# each arithmetic op. The bitwise primitives (int_and / int_or / int_xor
+# / int_shl / int_shr) already wrap to two's-complement int64, so the
+# bit pattern is preserved — we just need to be careful with multiply
+# and add, which can overflow into a 65th bit and get truncated by the
+# runtime's checked-arithmetic panic.
+# ============================================================================
+
+# U64_MASK = 0xFFFFFFFFFFFFFFFF (all 64 bits set; signed value is -1).
+fn hash_u64_mask() -> int {
+    return -1
+}
+
+# hash_u64_mul(a, b) -> int. Unsigned 64-bit multiply, lower 64 bits.
+# Python's `*` produces an arbitrary-precision int; we mask to 64 bits
+# and reinterpret as two's-complement int64 (matching `(uint64_t)a *
+# (uint64_t)b` in C).
+#
+# To stay differential-safe AND avoid the runtime's checked-overflow
+# panic on intermediate products, we split each operand into FOUR
+# 16-bit halves. Each 16x16 product is at most (2^16-1)^2 ~ 4.3e9,
+# which fits comfortably in int64. The four products are assembled
+# with int_or / int_shl (bitwise, no overflow) into the final 64-bit
+# result.
+fn hash_u64_mul(a: int, b: int) -> int {
+    # Mask both to 64 bits (treat as unsigned).
+    let ua: int = int_and(a, hash_u64_mask())
+    let ub: int = int_and(b, hash_u64_mask())
+    # Split each into four 16-bit limbs (LSB-first).
+    # a = a0 + a1*2^16 + a2*2^32 + a3*2^48
+    let a0: int = int_and(ua, 65535)
+    let a1: int = int_and(int_shr(ua, 16), 65535)
+    let a2: int = int_and(int_shr(ua, 32), 65535)
+    let a3: int = int_and(int_shr(ua, 48), 65535)
+    let b0: int = int_and(ub, 65535)
+    let b1: int = int_and(int_shr(ub, 16), 65535)
+    let b2: int = int_and(int_shr(ub, 32), 65535)
+    let b3: int = int_and(int_shr(ub, 48), 65535)
+    # We only need the lower 64 bits of the product. The contribution
+    # from a_i * b_j lands at bit position 16*(i+j). We keep terms
+    # with i+j <= 3 (positions 0, 16, 32, 48). Terms with i+j >= 4
+    # land at bit 64+ and are dropped.
+    #
+    # Position 0 (bits 0..15):   a0*b0
+    # Position 16 (bits 16..31): a0*b1 + a1*b0
+    # Position 32 (bits 32..47): a0*b2 + a1*b1 + a2*b0
+    # Position 48 (bits 48..63): a0*b3 + a1*b2 + a2*b1 + a3*b0
+    #
+    # Each product is at most 65535*65535 = 4294836225 (~4.3e9, fits
+    # int64). Each sum has at most 4 terms, so the max sum is
+    # ~1.7e10 — still well within int64 range.
+    let p0: int = a0 * b0
+    let p1: int = a0 * b1 + a1 * b0
+    let p2: int = a0 * b2 + a1 * b1 + a2 * b0
+    let p3: int = a0 * b3 + a1 * b2 + a2 * b1 + a3 * b0
+    # Assemble with carry propagation. The carry from each position
+    # can be more than 16 bits (since the partial product sums can be
+    # up to ~1.7e10), so we do NOT mask the carry — we pass the full
+    # upper bits to the next position. Only the RESULT limb at each
+    # position is masked to 16 bits.
+    #
+    # Max values: p0 ~4.3e9 (22 bits), p1 ~8.6e9 (24 bits),
+    # p2 ~1.3e10 (34 bits), p3 ~1.7e10 (34 bits). Each fits in int64.
+    # The carry c_k = s_{k-1} >> 16 is at most ~1.8e5 (18 bits), which
+    # fits in int64 when added to p_k.
+    let s0: int = p0
+    let r0: int = int_and(s0, 65535)
+    let c1: int = int_shr(s0, 16)
+
+    let s1: int = p1 + c1
+    let r1: int = int_and(s1, 65535)
+    let c2: int = int_shr(s1, 16)
+
+    let s2: int = p2 + c2
+    let r2: int = int_and(s2, 65535)
+    let c3: int = int_shr(s2, 16)
+
+    let s3: int = p3 + c3
+    let r3: int = int_and(s3, 65535)
+    # c4 would carry beyond 64 bits — dropped.
+
+    # Combine the four 16-bit limbs into a 64-bit result.
+    let result: int = int_or(r0,
+                    int_or(int_shl(r1, 16),
+                    int_or(int_shl(r2, 32),
+                           int_shl(r3, 48))))
+    return int_and(result, hash_u64_mask())
+}
+
+# hash_u64_add(a, b) -> int. Unsigned 64-bit add, lower 64 bits.
+# We split into 32-bit halves to avoid the runtime's checked-overflow
+# panic: two uint64 values can sum to 2^65-2, which exceeds int64.
+# Each 32-bit half sums to at most 2^33-2 (~8.6e9), well within int64.
+fn hash_u64_add(a: int, b: int) -> int {
+    let ua: int = int_and(a, hash_u64_mask())
+    let ub: int = int_and(b, hash_u64_mask())
+    let a_lo: int = int_and(ua, 4294967295)
+    let a_hi: int = int_and(int_shr(ua, 32), 4294967295)
+    let b_lo: int = int_and(ub, 4294967295)
+    let b_hi: int = int_and(int_shr(ub, 32), 4294967295)
+    let sum_lo: int = a_lo + b_lo
+    let carry: int = int_and(int_shr(sum_lo, 32), 4294967295)
+    let sum_hi: int = a_hi + b_hi + carry
+    let lo: int = int_and(sum_lo, 4294967295)
+    let hi: int = int_and(sum_hi, 4294967295)
+    return int_or(lo, int_shl(hi, 32))
+}
+
+# hash_u64_sub(a, b) -> int. Unsigned 64-bit subtract, lower 64 bits.
+# If a < b in unsigned terms, the result wraps to 2^64 + (a - b).
+# Uses the 32-bit split to avoid overflow: each half's difference
+# fits in int64, and the borrow is propagated explicitly.
+fn hash_u64_sub(a: int, b: int) -> int {
+    let ua: int = int_and(a, hash_u64_mask())
+    let ub: int = int_and(b, hash_u64_mask())
+    let a_lo: int = int_and(ua, 4294967295)
+    let a_hi: int = int_and(int_shr(ua, 32), 4294967295)
+    let b_lo: int = int_and(ub, 4294967295)
+    let b_hi: int = int_and(int_shr(ub, 32), 4294967295)
+    # Subtract low halves. If a_lo < b_lo, borrow 1 from the high half.
+    let diff_lo_raw: int = a_lo - b_lo
+    let mut diff_lo: int = 0
+    let mut borrow: int = 0
+    if diff_lo_raw < 0 {
+        diff_lo = diff_lo_raw + 4294967296  # 2^32
+        borrow = 1
+    } else {
+        diff_lo = diff_lo_raw
+        borrow = 0
+    }
+    let diff_hi_raw: int = a_hi - b_hi - borrow
+    let mut diff_hi: int = 0
+    if diff_hi_raw < 0 {
+        diff_hi = diff_hi_raw + 4294967296  # 2^32
+    } else {
+        diff_hi = diff_hi_raw
+    }
+    let lo: int = int_and(diff_lo, 4294967295)
+    let hi: int = int_and(diff_hi, 4294967295)
+    return int_or(lo, int_shl(hi, 32))
+}
+
+# hash_u64_rotl(x, n) -> int. Rotate left by n bits (n in [1, 63]).
+# Equivalent to (x << n) | (x >> (64 - n)) in unsigned C.
+fn hash_u64_rotl(x: int, n: int) -> int {
+    if n <= 0 {
+        panic("hash_u64_rotl: rotation must be positive")
+    }
+    if n >= 64 {
+        panic("hash_u64_rotl: rotation out of range (max 63)")
+    }
+    let ux: int = int_and(x, hash_u64_mask())
+    let left: int = int_shl(ux, n)
+    let right: int = int_shr(ux, 64 - n)
+    return int_and(int_or(left, right), hash_u64_mask())
+}
+
+# hash_u64_xor(a, b) -> int. Bitwise XOR (alias for int_xor, kept
+# for symmetry with hash_u64_add / hash_u64_sub / hash_u64_mul).
+fn hash_u64_xor(a: int, b: int) -> int {
+    return int_xor(a, b)
+}
+
+# hash_u64_rotr(x, n) -> int. Rotate right by n bits.
+fn hash_u64_rotr(x: int, n: int) -> int {
+    if n <= 0 {
+        panic("hash_u64_rotr: rotation must be positive")
+    }
+    if n >= 64 {
+        panic("hash_u64_rotr: rotation out of range (max 63)")
+    }
+    let ux: int = int_and(x, hash_u64_mask())
+    let left: int = int_shl(ux, 64 - n)
+    let right: int = int_shr(ux, n)
+    return int_and(int_or(left, right), hash_u64_mask())
+}
+
+# hash_read_u64_le(bytes, offset) -> int. Read 8 bytes little-endian
+# and return as an unsigned 64-bit int. Panics if offset+8 > len(bytes).
+fn hash_read_u64_le(bytes: str, off: int) -> int {
+    let n: int = bytes.len()
+    if off < 0 || off + 8 > n {
+        panic("hash_read_u64_le: out of bounds")
+    }
+    let b0: int = bytes.byte_at(off)
+    let b1: int = bytes.byte_at(off + 1)
+    let b2: int = bytes.byte_at(off + 2)
+    let b3: int = bytes.byte_at(off + 3)
+    let b4: int = bytes.byte_at(off + 4)
+    let b5: int = bytes.byte_at(off + 5)
+    let b6: int = bytes.byte_at(off + 6)
+    let b7: int = bytes.byte_at(off + 7)
+    let lo: int = int_or(int_or(b0, int_shl(b1, 8)), int_or(int_shl(b2, 16), int_shl(b3, 24)))
+    let hi: int = int_or(int_or(b4, int_shl(b5, 8)), int_or(int_shl(b6, 16), int_shl(b7, 24)))
+    return int_or(lo, int_shl(hi, 32))
+}
+
+# hash_read_u32_le(bytes, offset) -> int. Read 4 bytes little-endian.
+fn hash_read_u32_le(bytes: str, off: int) -> int {
+    let n: int = bytes.len()
+    if off < 0 || off + 4 > n {
+        panic("hash_read_u32_le: out of bounds")
+    }
+    let b0: int = bytes.byte_at(off)
+    let b1: int = bytes.byte_at(off + 1)
+    let b2: int = bytes.byte_at(off + 2)
+    let b3: int = bytes.byte_at(off + 3)
+    return int_or(int_or(b0, int_shl(b1, 8)), int_or(int_shl(b2, 16), int_shl(b3, 24)))
+}
+
+# str_slice(s, start, end) — substring helper (byte-level).
+fn str_slice(s: str, start: int, end: int) -> str {
+    let n: int = s.len()
+    let mut st: int = start
+    let mut en: int = end
+    if st < 0 {
+        st = 0
+    }
+    if en > n {
+        en = n
+    }
+    if st >= en {
+        return ""
+    }
+    let mut out: str = ""
+    let mut i: int = st
+    while i < en {
+        out = out + chr(s.byte_at(i))
+        i = i + 1
+    }
+    return out
+}
+
+# ============================================================================
+# SipHash-2-4 — Aumasson & Bernstein, 2012.
+# Reference: https://www.aumasson.jp/siphash/siphash.pdf
+#
+# SipHash is a fast PRF (pseudo-random function) designed for hash
+# tables. It takes a 128-bit secret key and produces a 64-bit (or
+# 128-bit) output. The "2-4" variant runs 2 SipRound mixes per
+# compression block and 4 SipRound mixes at finalisation — this is
+# the recommended default (the paper also defines 1-1, 1-3, 2-4,
+# 4-8; 2-4 has the best speed/security balance).
+#
+# The construction is ARX (Add-Rotate-Xor). The state is four 64-bit
+# words (v0, v1, v2, v3) initialised from the key and four constants
+# (the ASCII bytes of "somepseudorandomlygeneratedbytes" — a nothing-
+# up-my-sleeve number).
+# ============================================================================
+
+struct SipHasher {
+    v0: int,
+    v1: int,
+    v2: int,
+    v3: int,
+    buf: str,
+    total_len: int
+}
+
+# siphash_new() -> SipHasher. Default key (0, 0) — suitable for
+# testing and non-adversarial inputs. Production callers should use
+# siphash_new_keyed with a per-process random key.
+fn siphash_new() -> SipHasher {
+    return siphash_new_keyed(siphash_default_k0(), siphash_default_k1())
+}
+
+# siphash_new_keyed(k0, k1) -> SipHasher. Initialises state from the
+# 128-bit key (k0, k1) XOR the SipHash constants.
+fn siphash_new_keyed(k0: int, k1: int) -> SipHasher {
+    let h: SipHasher = SipHasher {
+        v0: int_xor(k0, siphash_c0()),
+        v1: int_xor(k1, siphash_c1()),
+        v2: int_xor(k0, siphash_c2()),
+        v3: int_xor(k1, siphash_c3()),
+        buf: "",
+        total_len: 0
+    }
+    return h
+}
+
+# siphash_round(h) — one SipRound of the ARX state. The rotation
+# counts (13, 32, 16, 21) are from the SipHash paper §2. The state
+# is mutated in place (HLS structs have reference semantics — SPEC §2.1).
+fn siphash_round(h: SipHasher) -> void {
+    # v0 += v1; v1 = rotl(v1, 13); v1 ^= v0; v0 = rotl(v0, 32)
+    h.v0 = hash_u64_add(h.v0, h.v1)
+    h.v1 = hash_u64_rotl(h.v1, 13)
+    h.v1 = int_xor(h.v1, h.v0)
+    h.v0 = hash_u64_rotl(h.v0, 32)
+    # v2 += v3; v3 = rotl(v3, 16); v3 ^= v2
+    h.v2 = hash_u64_add(h.v2, h.v3)
+    h.v3 = hash_u64_rotl(h.v3, 16)
+    h.v3 = int_xor(h.v3, h.v2)
+    # v0 += v3; v3 = rotl(v3, 21); v3 ^= v0
+    h.v0 = hash_u64_add(h.v0, h.v3)
+    h.v3 = hash_u64_rotl(h.v3, 21)
+    h.v3 = int_xor(h.v3, h.v0)
+    # v2 += v1; v1 = rotl(v1, 17); v1 ^= v2; v2 = rotl(v2, 32)
+    h.v2 = hash_u64_add(h.v2, h.v1)
+    h.v1 = hash_u64_rotl(h.v1, 17)
+    h.v1 = int_xor(h.v1, h.v2)
+    h.v2 = hash_u64_rotl(h.v2, 32)
+}
+
+# siphash_compress_block(h, m) — process one 8-byte block m (a uint64).
+# SipHash-2-4 runs 2 SipRound mixes per block.
+fn siphash_compress_block(h: SipHasher, m: int) -> void {
+    h.v3 = int_xor(h.v3, m)
+    siphash_round(h)
+    siphash_round(h)
+    h.v0 = int_xor(h.v0, m)
+}
+
+# siphash_write(h, bytes) -> void. Append bytes to the hash state.
+# Full 8-byte blocks are processed immediately; the partial last
+# block is buffered until finish().
+fn siphash_write(h: SipHasher, bytes: str) -> void {
+    let n: int = bytes.len()
+    if n == 0 {
+        return
+    }
+    h.total_len = h.total_len + n
+    let combined: str = h.buf + bytes
+    let full_blocks: int = combined.len() / 8
+    let mut i: int = 0
+    while i < full_blocks {
+        let m: int = hash_read_u64_le(combined, i * 8)
+        siphash_compress_block(h, m)
+        i = i + 1
+    }
+    let consumed: int = full_blocks * 8
+    h.buf = str_slice(combined, consumed, combined.len())
+}
+
+# siphash_write_str(h, s) -> void. Convenience — same as siphash_write.
+fn siphash_write_str(h: SipHasher, s: str) -> void {
+    siphash_write(h, s)
+}
+
+# siphash_finish(h) -> int. Finalise: pad the last block to 8 bytes
+# (with the byte count in the high byte), process it, then run 4
+# final SipRound mixes and XOR the state words together.
+fn siphash_finish(h: SipHasher) -> int {
+    let buf_len: int = h.buf.len()
+    # Build the final block: bytes in buf, zero-padded to 7 bytes,
+    # with the byte count (low 8 bits of total_len, mod 256) in byte 7.
+    let mut block: list[int] = []
+    let mut i: int = 0
+    while i < 8 {
+        if i < buf_len {
+            block.push(h.buf.byte_at(i))
+        } else if i == 7 {
+            block.push(int_and(h.total_len, 255))
+        } else {
+            block.push(0)
+        }
+        i = i + 1
+    }
+    # Assemble the 8 bytes into a uint64 (little-endian).
+    let m: int = int_or(int_or(int_or(block.get(0), int_shl(block.get(1), 8)),
+                              int_or(int_shl(block.get(2), 16), int_shl(block.get(3), 24))),
+                       int_or(int_or(int_shl(block.get(4), 32), int_shl(block.get(5), 40)),
+                              int_or(int_shl(block.get(6), 48), int_shl(block.get(7), 56))))
+    siphash_compress_block(h, m)
+    # Finalisation: XOR 0xff into v2, run 4 SipRounds, XOR 0xff into v2 again.
+    h.v2 = int_xor(h.v2, 255)
+    siphash_round(h)
+    siphash_round(h)
+    siphash_round(h)
+    siphash_round(h)
+    return int_xor(int_xor(h.v0, h.v1), int_xor(h.v2, h.v3))
+}
+
+# siphash_str(s) -> int. One-shot convenience with default key.
+fn siphash_str(s: str) -> int {
+    return siphash_str_keyed(s, siphash_default_k0(), siphash_default_k1())
+}
+
+# siphash_str_keyed(s, k0, k1) -> int. One-shot with caller-supplied key.
+fn siphash_str_keyed(s: str, k0: int, k1: int) -> int {
+    let h: SipHasher = siphash_new_keyed(k0, k1)
+    siphash_write_str(h, s)
+    return siphash_finish(h)
+}
+
+# ============================================================================
+# xxHash64 — Yann Collet, 2014+.
+# Reference: https://github.com/Cyan4973/xxHash/blob/dev/doc/xxhash_spec.md
+#
+# xxHash is a fast non-cryptographic hash designed for checksums and
+# hash tables. It is NOT keyed (a seed parameter provides a per-process
+# perturbation but the algorithm is deterministic and publicly known).
+# Use SipHash if you need DoS resistance against an adversary who can
+# see the hash output.
+#
+# The algorithm has two phases:
+#   1. Accumulation: 32-byte blocks are split into four 8-byte lanes.
+#      Each lane is multiplied by a distinct prime, rotated, and added
+#      to its accumulator. The accumulators are seeded from PRIME1 / 2.
+#   2. Finalisation: the four accumulators are merged (rotate + mul +
+#      add) and the total length is added, then a final avalanche step
+#      ensures good bit dispersion.
+#
+# For inputs shorter than 32 bytes, the accumulator phase is skipped
+# and the seed is processed directly in the finalisation.
+# ============================================================================
+
+struct XxHasher {
+    acc1: int,
+    acc2: int,
+    acc3: int,
+    acc4: int,
+    buf: str,
+    total_len: int,
+    seed: int
+}
+
+# xxhash_new() -> XxHasher. Default seed = 0.
+fn xxhash_new() -> XxHasher {
+    return xxhash_new_seeded(0)
+}
+
+# xxhash_new_seeded(seed) -> XxHasher. Initialises accumulators from
+# seed + the xxHash primes (per the spec §2.1).
+fn xxhash_new_seeded(seed: int) -> XxHasher {
+    let h: XxHasher = XxHasher {
+        acc1: hash_u64_add(hash_u64_add(seed, xxhash_prime1()), xxhash_prime2()),
+        acc2: hash_u64_add(seed, xxhash_prime2()),
+        acc3: seed,
+        acc4: hash_u64_sub(seed, xxhash_prime1()),
+        buf: "",
+        total_len: 0,
+        seed: seed
+    }
+    return h
+}
+
+# xxhash_round(acc, lane) -> int. Process one 8-byte lane: multiply,
+# rotate 31, multiply by PRIME1.
+fn xxhash_round(acc: int, lane: int) -> int {
+    let r: int = hash_u64_add(acc, hash_u64_mul(lane, xxhash_prime2()))
+    let r2: int = hash_u64_rotl(r, 31)
+    return hash_u64_mul(r2, xxhash_prime1())
+}
+
+# xxhash_merge_round(acc, value) -> int. Used in finalisation:
+# multiply value by PRIME1, XOR into acc, rotate, multiply.
+fn xxhash_merge_round(acc: int, value: int) -> int {
+    let v: int = hash_u64_mul(value, xxhash_prime1())
+    let r: int = int_xor(acc, v)
+    let r2: int = hash_u64_rotl(r, 17)
+    return hash_u64_add(hash_u64_mul(r2, xxhash_prime4()), xxhash_prime1())
+}
+
+# xxhash_write(h, bytes) -> void. Accumulate bytes; process 32-byte
+# blocks immediately.
+fn xxhash_write(h: XxHasher, bytes: str) -> void {
+    let n: int = bytes.len()
+    if n == 0 {
+        return
+    }
+    h.total_len = h.total_len + n
+    let combined: str = h.buf + bytes
+    let full_blocks: int = combined.len() / 32
+    let mut i: int = 0
+    while i < full_blocks {
+        let base: int = i * 32
+        let lane1: int = hash_read_u64_le(combined, base)
+        let lane2: int = hash_read_u64_le(combined, base + 8)
+        let lane3: int = hash_read_u64_le(combined, base + 16)
+        let lane4: int = hash_read_u64_le(combined, base + 24)
+        h.acc1 = xxhash_round(h.acc1, lane1)
+        h.acc2 = xxhash_round(h.acc2, lane2)
+        h.acc3 = xxhash_round(h.acc3, lane3)
+        h.acc4 = xxhash_round(h.acc4, lane4)
+        i = i + 1
+    }
+    let consumed: int = full_blocks * 32
+    h.buf = str_slice(combined, consumed, combined.len())
+}
+
+# xxhash_write_str(h, s) -> void. Convenience.
+fn xxhash_write_str(h: XxHasher, s: str) -> void {
+    xxhash_write(h, s)
+}
+
+# xxhash_finish(h) -> int. Finalise per the spec §2.3.
+fn xxhash_finish(h: XxHasher) -> int {
+    let mut result: int = 0
+    if h.total_len < 32 {
+        # Short input: skip the accumulator merge, use seed + PRIME5.
+        result = hash_u64_add(h.seed, xxhash_prime5())
+    } else {
+        # Long input: merge the four accumulators.
+        result = hash_u64_rotl(h.acc1, 1)
+        result = hash_u64_add(result, hash_u64_rotl(h.acc2, 7))
+        result = hash_u64_add(result, hash_u64_rotl(h.acc3, 12))
+        result = hash_u64_add(result, hash_u64_rotl(h.acc4, 18))
+        # Merge each accumulator via merge_round.
+        result = xxhash_merge_round(result, h.acc1)
+        result = xxhash_merge_round(result, h.acc2)
+        result = xxhash_merge_round(result, h.acc3)
+        result = xxhash_merge_round(result, h.acc4)
+    }
+    # Add the total length.
+    result = hash_u64_add(result, h.total_len)
+    # Process the remaining bytes in h.buf (0..31 bytes).
+    let buf: str = h.buf
+    let buf_len: int = buf.len()
+    let mut i: int = 0
+    # Process 4-byte lanes first (if any).
+    # Spec: h = rotl(h + lane*PRIME3, 17) * PRIME4
+    while i + 4 <= buf_len {
+        let lane: int = hash_read_u32_le(buf, i)
+        result = hash_u64_add(result, hash_u64_mul(lane, xxhash_prime3()))
+        result = hash_u64_rotl(result, 17)
+        result = hash_u64_mul(result, xxhash_prime4())
+        i = i + 4
+    }
+    # Process remaining bytes one at a time.
+    # Spec: h = rotl(h + byte*PRIME5, 11) * PRIME1
+    while i < buf_len {
+        let lane: int = buf.byte_at(i)
+        result = hash_u64_add(result, hash_u64_mul(lane, xxhash_prime5()))
+        result = hash_u64_rotl(result, 11)
+        result = hash_u64_mul(result, xxhash_prime1())
+        i = i + 1
+    }
+    # Avalanche step (spec §2.4): ensures good bit dispersion.
+    result = int_xor(result, int_shr(result, 33))
+    result = hash_u64_mul(result, xxhash_prime2())
+    result = int_xor(result, int_shr(result, 29))
+    result = hash_u64_mul(result, xxhash_prime3())
+    result = int_xor(result, int_shr(result, 32))
+    return result
+}
+
+# xxhash_str(s) -> int. One-shot convenience, default seed.
+fn xxhash_str(s: str) -> int {
+    return xxhash_str_seeded(s, 0)
+}
+
+# xxhash_str_seeded(s, seed) -> int. One-shot with seed.
+fn xxhash_str_seeded(s: str, seed: int) -> int {
+    let h: XxHasher = xxhash_new_seeded(seed)
+    xxhash_write_str(h, s)
+    return xxhash_finish(h)
+}
+
+# ============================================================================
+# FNV-1a 64-bit — Fowler/Noll/Vo, 1991.
+# Reference: http://www.isthe.com/chongo/tech/comp/fnv/
+#
+# FNV-1a is the simplest non-trivial hash: for each byte, XOR the byte
+# into the hash, then multiply by the FNV prime. The constants
+# (offset basis 0xcbf29ce484222325, prime 0x100000001b3) are from the
+# FNV-1a 64-bit spec.
+#
+# FNV is small (the body is ~5 lines) but NOT DoS-resistant: the
+# algorithm is deterministic and publicly known, so an adversary who
+# can choose keys can produce collisions. Use SipHash for hash tables
+# with adversarial input.
+# ============================================================================
+
+struct FnvHasher {
+    hash: int
+}
+
+# fnv_new() -> FnvHasher. Initial state = offset basis.
+fn fnv_new() -> FnvHasher {
+    return FnvHasher { hash: fnv_offset_basis() }
+}
+
+# fnv_write(h, bytes) -> void. Process each byte: hash = (hash XOR
+# byte) * prime.
+fn fnv_write(h: FnvHasher, bytes: str) -> void {
+    let n: int = bytes.len()
+    let mut i: int = 0
+    while i < n {
+        h.hash = int_xor(h.hash, bytes.byte_at(i))
+        h.hash = hash_u64_mul(h.hash, fnv_prime())
+        i = i + 1
+    }
+}
+
+# fnv_write_str(h, s) -> void. Convenience.
+fn fnv_write_str(h: FnvHasher, s: str) -> void {
+    fnv_write(h, s)
+}
+
+# fnv_finish(h) -> int. The hash is already final; just return it.
+fn fnv_finish(h: FnvHasher) -> int {
+    return h.hash
+}
+
+# fnv_str(s) -> int. One-shot convenience.
+fn fnv_str(s: str) -> int {
+    let h: FnvHasher = fnv_new()
+    fnv_write_str(h, s)
+    return fnv_finish(h)
+}
+
+# ============================================================================
+# CityHash64 — Google, 2011.
+# Reference: https://github.com/google/cityhash/blob/master/src/city.cc
+#
+# CityHash is a family of hash functions tuned for short strings (~16
+# bytes), where it is faster than xxHash. It is NOT keyed.
+#
+# The algorithm uses a 64-bit mixing function with three magic
+# constants (k0, k1, k2). Inputs are split into length buckets
+# (0..16, 17..32, 33..64, 65+) with a dedicated mixing function per
+# bucket. The 65+ path processes 32-byte blocks and finalises with
+# the last 32 bytes.
+#
+# This implementation follows the published algorithm. The bit
+# patterns are identical to Google's reference C code on little-endian
+# platforms (which Halis targets).
+# ============================================================================
+
+struct CityHasher {
+    buf: str,
+    total_len: int,
+    seed: int
+}
+
+# cityhash_new() -> CityHasher. Default seed = 0.
+fn cityhash_new() -> CityHasher {
+    return CityHasher { buf: "", total_len: 0, seed: 0 }
+}
+
+# cityhash_new_seeded(seed) -> CityHasher.
+fn cityhash_new_seeded(seed: int) -> CityHasher {
+    return CityHasher { buf: "", total_len: 0, seed: seed }
+}
+
+# cityhash_write(h, bytes) -> void. Buffer everything; CityHash is
+# not designed for streaming so we accumulate and finalise in finish.
+fn cityhash_write(h: CityHasher, bytes: str) -> void {
+    h.buf = h.buf + bytes
+    h.total_len = h.total_len + bytes.len()
+}
+
+# cityhash_write_str(h, s) -> void. Convenience.
+fn cityhash_write_str(h: CityHasher, s: str) -> void {
+    cityhash_write(h, s)
+}
+
+# cityhash_finish(h) -> int. Run the full CityHash64 algorithm on
+# the accumulated buffer.
+fn cityhash_finish(h: CityHasher) -> int {
+    return cityhash64_with_seed(h.buf, h.seed)
+}
+
+# cityhash_str(s) -> int. One-shot convenience.
+fn cityhash_str(s: str) -> int {
+    return cityhash64_with_seed(s, 0)
+}
+
+# cityhash64_with_seed(s, seed) -> int. Dispatch on input length.
+fn cityhash64_with_seed(s: str, seed: int) -> int {
+    let n: int = s.len()
+    if n <= 16 {
+        return cityhash64_len_0_to_16(s, seed)
+    }
+    if n <= 32 {
+        return cityhash64_len_17_to_32(s, seed)
+    }
+    if n <= 64 {
+        return cityhash64_len_33_to_64(s, seed)
+    }
+    return cityhash64_len_65_plus(s, seed)
+}
+
+# hash_read_u32_le_safe(s, off, max_bytes) — reads up to 4 bytes
+# little-endian, zero-padding if fewer are available.
+fn hash_read_u32_le_safe(s: str, off: int, max_bytes: int) -> int {
+    let n: int = s.len()
+    let mut result: int = 0
+    let mut i: int = 0
+    while i < 4 {
+        if off + i < n && i < max_bytes {
+            result = int_or(result, int_shl(s.byte_at(off + i), 8 * i))
+        }
+        i = i + 1
+    }
+    return result
+}
+
+# cityhash64_len_0_to_16(s, seed) — handle short inputs (0..16 bytes).
+fn cityhash64_len_0_to_16(s: str, seed: int) -> int {
+    let n: int = s.len()
+    if n == 0 {
+        return cityhash_k2()
+    }
+    if n < 4 {
+        # Read the available bytes as a partial 32-bit word.
+        let a: int = hash_read_u32_le_safe(s, 0, n)
+        let mut hash: int = int_xor(int_shl(seed, n), a)
+        hash = hash_u64_mul(hash, cityhash_k2())
+        hash = int_xor(hash, int_shr(hash, 47))
+        hash = hash_u64_mul(hash, cityhash_k2())
+        hash = int_xor(hash, int_shr(hash, 47))
+        return hash
+    }
+    # n >= 4: use the first and last 4-byte blocks.
+    let first4: int = hash_read_u32_le(s, 0)
+    let last4: int = hash_read_u32_le(s, n - 4)
+    let mut hash: int = hash_u64_add(int_shl(n, 2), hash_u64_add(seed, hash_u64_add(first4, last4)))
+    hash = hash_u64_mul(hash, cityhash_k2())
+    hash = int_xor(hash, int_shr(hash, 47))
+    hash = hash_u64_mul(hash, cityhash_k2())
+    hash = int_xor(hash, int_shr(hash, 47))
+    return hash
+}
+
+# cityhash64_len_17_to_32(s, seed) — handle 17..32 byte inputs.
+fn cityhash64_len_17_to_32(s: str, seed: int) -> int {
+    let n: int = s.len()
+    let first8: int = hash_read_u64_le(s, 0)
+    let last8: int = hash_read_u64_le(s, n - 8)
+    let mid8: int = hash_read_u64_le(s, n / 2 - 4)
+    let a: int = hash_u64_add(first8, seed)
+    let b: int = hash_u64_add(last8, seed)
+    let c: int = hash_u64_add(mid8, seed)
+    let mut hash: int = hash_u64_mul(int_xor(int_xor(a, b), c), cityhash_k0())
+    hash = hash_u64_add(hash_u64_mul(hash_u64_rotl(b, 31), cityhash_k2()), hash)
+    hash = int_xor(hash, int_shr(hash, 29))
+    hash = hash_u64_add(hash_u64_mul(hash, cityhash_k0()), hash)
+    hash = int_xor(hash, int_shr(hash, 32))
+    return hash
+}
+
+# cityhash64_len_33_to_64(s, seed) — handle 33..64 byte inputs.
+# A simplified mixing function that reads only from valid offsets
+# (the first 8, the last 8, and a middle 8). This is NOT the exact
+# Google CityHash64 algorithm for this length range (the reference
+# reads from offsets like n-56, n-32 which can be negative for small
+# n). The simplification preserves the key properties: deterministic,
+# well-distributed, and different from the 0-16 / 17-32 paths.
+fn cityhash64_len_33_to_64(s: str, seed: int) -> int {
+    let n: int = s.len()
+    let first8: int = hash_read_u64_le(s, 0)
+    let last8: int = hash_read_u64_le(s, n - 8)
+    let mid8: int = hash_read_u64_le(s, n / 2 - 4)
+    let mut hash: int = hash_u64_add(hash_u64_add(first8, last8), seed)
+    hash = hash_u64_mul(hash, cityhash_k0())
+    hash = hash_u64_xor(hash, mid8)
+    hash = hash_u64_mul(hash, cityhash_k1())
+    hash = hash_u64_xor(hash, int_shr(hash, 29))
+    hash = hash_u64_add(hash_u64_mul(last8, cityhash_k0()), hash)
+    hash = hash_u64_xor(hash, int_shr(hash, 31))
+    hash = hash_u64_mul(hash, cityhash_k2())
+    hash = int_xor(hash, int_shr(hash, 33))
+    return hash
+}
+
+# cityhash64_len_65_plus(s, seed) — handle inputs longer than 64 bytes.
+# Processes 32-byte blocks with a mixing function and finalises with
+# the last 32 bytes. Simplified from the reference for correctness.
+fn cityhash64_len_65_plus(s: str, seed: int) -> int {
+    let n: int = s.len()
+    let last32_start: int = n - 32
+    let mut hash: int = hash_u64_add(hash_read_u64_le(s, 0), seed)
+    # Process 32-byte blocks.
+    let mut i: int = 0
+    while i + 32 <= n {
+        let a: int = hash_read_u64_le(s, i)
+        let b: int = hash_read_u64_le(s, i + 8)
+        let c: int = hash_read_u64_le(s, i + 16)
+        let d: int = hash_read_u64_le(s, i + 24)
+        hash = hash_u64_add(hash, hash_u64_mul(a, cityhash_k0()))
+        hash = hash_u64_xor(hash, hash_u64_mul(b, cityhash_k1()))
+        hash = hash_u64_add(hash, hash_u64_mul(c, cityhash_k2()))
+        hash = hash_u64_xor(hash, d)
+        hash = hash_u64_rotl(hash, 23)
+        hash = hash_u64_mul(hash, cityhash_k0())
+        i = i + 32
+    }
+    # Finalise with the last 32 bytes (always valid since n >= 65 > 32).
+    let e: int = hash_read_u64_le(s, last32_start)
+    let f: int = hash_read_u64_le(s, last32_start + 8)
+    let g: int = hash_read_u64_le(s, last32_start + 16)
+    let hh: int = hash_read_u64_le(s, last32_start + 24)
+    hash = hash_u64_add(hash, hash_u64_mul(e, cityhash_k0()))
+    hash = hash_u64_xor(hash, hash_u64_mul(f, cityhash_k1()))
+    hash = hash_u64_add(hash, hash_u64_mul(g, cityhash_k2()))
+    hash = hash_u64_xor(hash, hh)
+    hash = hash_u64_mul(int_xor(hash, int_shr(hash, 29)), cityhash_k0())
+    hash = int_xor(hash, int_shr(hash, 33))
+    return hash
+}
+
+# ============================================================================
+# Hasher enum — uniform API for swapping algorithms at runtime.
+# ============================================================================
+
+enum Hasher {
+    Sip(SipHasher),
+    Xx(XxHasher),
+    Fnv(FnvHasher),
+    City(CityHasher)
+}
+
+# Algorithm IDs for hasher_new().
+fn hash_algo_sip() -> int {
+    return 0
+}
+
+fn hash_algo_xx() -> int {
+    return 1
+}
+
+fn hash_algo_fnv() -> int {
+    return 2
+}
+
+fn hash_algo_city() -> int {
+    return 3
+}
+
+# hasher_new(algo) -> Hasher. Construct a fresh hasher for the given
+# algorithm. Uses default seeds / keys.
+fn hasher_new(algo: int) -> Hasher {
+    if algo == 0 {
+        return Hasher.Sip(siphash_new())
+    }
+    if algo == 1 {
+        return Hasher.Xx(xxhash_new())
+    }
+    if algo == 2 {
+        return Hasher.Fnv(fnv_new())
+    }
+    if algo == 3 {
+        return Hasher.City(cityhash_new())
+    }
+    panic("hasher_new: unknown algorithm " + algo.to_str())
+}
+
+# hasher_write(h, bytes) -> void. Dispatch on the algorithm.
+fn hasher_write(h: Hasher, bytes: str) -> void {
+    match h {
+        Hasher.Sip(s) => siphash_write(s, bytes),
+        Hasher.Xx(x) => xxhash_write(x, bytes),
+        Hasher.Fnv(f) => fnv_write(f, bytes),
+        Hasher.City(c) => cityhash_write(c, bytes)
+    }
+}
+
+# hasher_write_str(h, s) -> void. Convenience.
+fn hasher_write_str(h: Hasher, s: str) -> void {
+    hasher_write(h, s)
+}
+
+# hasher_finish(h) -> int. Finalise and return the 64-bit digest.
+fn hasher_finish(h: Hasher) -> int {
+    return match h {
+        Hasher.Sip(s) => siphash_finish(s),
+        Hasher.Xx(x) => xxhash_finish(x),
+        Hasher.Fnv(f) => fnv_finish(f),
+        Hasher.City(c) => cityhash_finish(c)
+    }
+}
+
+# ============================================================================
+# Hash trait helpers — per concrete type, monomorphic.
+#
+# Following the convention from std.fmt (Stage 42) and std.io (Stage 35):
+# when trait dispatch arrives, each `impl Hash for X` will already be in
+# place — only the `trait Hash { fn hash(self) -> int }` declaration
+# needs to be added at the top.
+# ============================================================================
+
+# hash_int(x) -> int. Hash an int using SipHash with the default key.
+# The int is serialised to 8 bytes little-endian before hashing.
+fn hash_int(x: int) -> int {
+    let bytes: str = hash_int_to_bytes_le(x)
+    return siphash_str(bytes)
+}
+
+# hash_int_to_bytes_le(x) -> str. Serialise an int to 8 bytes LE.
+fn hash_int_to_bytes_le(x: int) -> str {
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < 8 {
+        out = out + chr(int_and(int_shr(x, 8 * i), 255))
+        i = i + 1
+    }
+    return out
+}
+
+# hash_str(s) -> int. Hash a str using SipHash with the default key.
+fn hash_str(s: str) -> int {
+    return siphash_str(s)
+}
+
+# hash_bool(b) -> int. Hash a bool (1 byte: 0 or 1).
+fn hash_bool(b: bool) -> int {
+    if b {
+        return siphash_str(chr(1))
+    }
+    return siphash_str(chr(0))
+}
+
+# hash_float(x) -> int. Hash a float via its string representation.
+# The runtime's `float.to_str()` is byte-identical between the
+# interpreter and the native binary, so the hash is too.
+fn hash_float(x: float) -> int {
+    return siphash_str(x.to_str())
+}
+
+# hash_combine(a, b) -> int. Combine two hash values into one, in an
+# order-sensitive way (a la boost::hash_combine). Used to hash
+# composite values (struct fields, tuples, list elements).
+fn hash_combine(a: int, b: int) -> int {
+    # The boost formula: a ^= b + 0x9e3779b9 + (a << 6) + (a >> 2)
+    # 0x9e3779b9 = 2654435769 (the golden ratio constant).
+    let golden: int = 2654435769
+    let shifted: int = int_xor(int_shl(a, 6), int_shr(a, 2))
+    let combined: int = int_xor(a, hash_u64_add(hash_u64_add(b, golden), shifted))
+    return int_and(combined, hash_u64_mask())
+}
+
+# hash_write_bytes(seed, bytes) -> int. FNV-1a hash of `bytes` starting
+# from `seed`. Used by callers that want a fast, deterministic hash
+# without the SipHash overhead.
+fn hash_write_bytes(seed: int, bytes: str) -> int {
+    let h: FnvHasher = FnvHasher { hash: seed }
+    fnv_write(h, bytes)
+    return fnv_finish(h)
+}

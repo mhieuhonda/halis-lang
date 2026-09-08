@@ -1,0 +1,1052 @@
+# ============================================================================
+# std/collections.hls — Stage 44 (v0.63.0-alpha): collection types
+# ----------------------------------------------------------------------------
+# This module is the eleventh module of Phase III (stdlib expansion). It
+# implements five collection types that complement the built-in
+# `map[str, T]` and `list[T]`:
+#
+#   * BTreeMap — ordered associative array with O(log n) lookup.
+#     Implemented as a sorted array of (key, value) pairs with binary
+#     search. The "B-tree" name is aspirational — the data structure is
+#     a sorted vector, which gives O(log n) lookup and O(n) insertion
+#     but excellent cache locality for small-to-medium sizes.
+#   * HashSet — a set of values. Monomorphic variants for str and int
+#     keys (matching the std.list / std.set convention).
+#   * LinkedList — a doubly-linked list with O(1) push_front /
+#     push_back / pop_front / pop_back. Arena-based node allocation.
+#   * RingBuf — a fixed-capacity circular buffer. After creation,
+#     no allocation occurs. Writes past capacity overwrite the oldest
+#     element (or return false).
+#   * HashMap — a general map with non-str keys. Uses SipHash (Stage 43)
+#     to hash keys to strings, then stores values in `map[str, V]`.
+#     Collision handling via per-bucket linear search.
+#
+# **No new compiler builtins** — the entire module is pure HLS,
+# layered on `std.hash` (Stage 43), `std.list`, and `std.str`.
+#
+# Monomorphic convention:
+#   Following std.list and std.set, this module provides separate
+#   types per concrete key/value type (BTreeMapIntStr, HashSetInt,
+#   LinkedListInt, RingBufInt, HashMapIntStr, etc.). This matches
+#   HLS v0.3's lack of function pointers and multi-type-param
+#   generic struct construction. When trait dispatch and full generics
+#   arrive, these will be unified under generic types.
+#
+# Differential parity (interpreter == native):
+#   All operations are pure integer/string operations. Output is
+#   byte-identical between the interpreter and the native binary.
+# ============================================================================
+
+import "std.hash"
+import "std.list"
+import "std.str"
+import "std.option"
+import "std.result"
+
+# ============================================================================
+# BTreeMap — ordered associative array (int keys, str values).
+# ============================================================================
+
+struct BTreeMapIntStr {
+    keys: list[int],
+    values: list[str]
+}
+
+fn btreemap_int_str_new() -> BTreeMapIntStr {
+    return BTreeMapIntStr { keys: [], values: [] }
+}
+
+fn btreemap_int_str_size(m: BTreeMapIntStr) -> int {
+    return m.keys.len()
+}
+
+fn btreemap_int_str_is_empty(m: BTreeMapIntStr) -> bool {
+    return m.keys.len() == 0
+}
+
+# Binary search. Returns index if found, or -(insertion_point + 1) if not.
+fn btreemap_int_str_bsearch(m: BTreeMapIntStr, key: int) -> int {
+    let n: int = m.keys.len()
+    let mut lo: int = 0
+    let mut hi: int = n - 1
+    while lo <= hi {
+        let mid: int = (lo + hi) / 2
+        let mid_key: int = m.keys.get(mid)
+        if mid_key == key {
+            return mid
+        }
+        if mid_key < key {
+            lo = mid + 1
+        } else {
+            hi = mid - 1
+        }
+    }
+    return -(lo + 1)
+}
+
+fn btreemap_int_str_get(m: BTreeMapIntStr, key: int) -> Option[str] {
+    let idx: int = btreemap_int_str_bsearch(m, key)
+    if idx >= 0 {
+        return Option.Some(m.values.get(idx))
+    }
+    return Option.None
+}
+
+fn btreemap_int_str_has(m: BTreeMapIntStr, key: int) -> bool {
+    return btreemap_int_str_bsearch(m, key) >= 0
+}
+
+fn btreemap_int_str_set(m: BTreeMapIntStr, key: int, value: str) -> void {
+    let idx: int = btreemap_int_str_bsearch(m, key)
+    if idx >= 0 {
+        m.values.set(idx, value)
+        return
+    }
+    # Insert at position -(idx+1).
+    let pos: int = -(idx + 1)
+    # Rebuild both lists with the new entry at pos.
+    let n: int = m.keys.len()
+    let mut new_keys: list[int] = []
+    let mut new_values: list[str] = []
+    let mut i: int = 0
+    while i < pos {
+        new_keys.push(m.keys.get(i))
+        new_values.push(m.values.get(i))
+        i = i + 1
+    }
+    new_keys.push(key)
+    new_values.push(value)
+    while i < n {
+        new_keys.push(m.keys.get(i))
+        new_values.push(m.values.get(i))
+        i = i + 1
+    }
+    m.keys = new_keys
+    m.values = new_values
+}
+
+fn btreemap_int_str_remove(m: BTreeMapIntStr, key: int) -> bool {
+    let idx: int = btreemap_int_str_bsearch(m, key)
+    if idx < 0 {
+        return false
+    }
+    let n: int = m.keys.len()
+    let mut new_keys: list[int] = []
+    let mut new_values: list[str] = []
+    let mut i: int = 0
+    while i < n {
+        if i != idx {
+            new_keys.push(m.keys.get(i))
+            new_values.push(m.values.get(i))
+        }
+        i = i + 1
+    }
+    m.keys = new_keys
+    m.values = new_values
+    return true
+}
+
+fn btreemap_int_str_keys(m: BTreeMapIntStr) -> list[int] {
+    # Keys are already sorted (by invariant).
+    return m.keys
+}
+
+fn btreemap_int_str_values(m: BTreeMapIntStr) -> list[str] {
+    return m.values
+}
+
+fn btreemap_int_str_min(m: BTreeMapIntStr) -> Option[int] {
+    if m.keys.len() == 0 {
+        return Option.None
+    }
+    return Option.Some(m.keys.get(0))
+}
+
+fn btreemap_int_str_max(m: BTreeMapIntStr) -> Option[int] {
+    let n: int = m.keys.len()
+    if n == 0 {
+        return Option.None
+    }
+    return Option.Some(m.keys.get(n - 1))
+}
+
+# ----------------------------------------------------------------------------
+# BTreeMap[int, int]
+# ----------------------------------------------------------------------------
+
+struct BTreeMapIntInt {
+    keys: list[int],
+    values: list[int]
+}
+
+fn btreemap_int_int_new() -> BTreeMapIntInt {
+    return BTreeMapIntInt { keys: [], values: [] }
+}
+
+fn btreemap_int_int_size(m: BTreeMapIntInt) -> int {
+    return m.keys.len()
+}
+
+fn btreemap_int_int_bsearch(m: BTreeMapIntInt, key: int) -> int {
+    let n: int = m.keys.len()
+    let mut lo: int = 0
+    let mut hi: int = n - 1
+    while lo <= hi {
+        let mid: int = (lo + hi) / 2
+        let mid_key: int = m.keys.get(mid)
+        if mid_key == key {
+            return mid
+        }
+        if mid_key < key {
+            lo = mid + 1
+        } else {
+            hi = mid - 1
+        }
+    }
+    return -(lo + 1)
+}
+
+fn btreemap_int_int_get(m: BTreeMapIntInt, key: int) -> Option[int] {
+    let idx: int = btreemap_int_int_bsearch(m, key)
+    if idx >= 0 {
+        return Option.Some(m.values.get(idx))
+    }
+    return Option.None
+}
+
+fn btreemap_int_int_has(m: BTreeMapIntInt, key: int) -> bool {
+    return btreemap_int_int_bsearch(m, key) >= 0
+}
+
+fn btreemap_int_int_set(m: BTreeMapIntInt, key: int, value: int) -> void {
+    let idx: int = btreemap_int_int_bsearch(m, key)
+    if idx >= 0 {
+        m.values.set(idx, value)
+        return
+    }
+    let pos: int = -(idx + 1)
+    let n: int = m.keys.len()
+    let mut new_keys: list[int] = []
+    let mut new_values: list[int] = []
+    let mut i: int = 0
+    while i < pos {
+        new_keys.push(m.keys.get(i))
+        new_values.push(m.values.get(i))
+        i = i + 1
+    }
+    new_keys.push(key)
+    new_values.push(value)
+    while i < n {
+        new_keys.push(m.keys.get(i))
+        new_values.push(m.values.get(i))
+        i = i + 1
+    }
+    m.keys = new_keys
+    m.values = new_values
+}
+
+fn btreemap_int_int_remove(m: BTreeMapIntInt, key: int) -> bool {
+    let idx: int = btreemap_int_int_bsearch(m, key)
+    if idx < 0 {
+        return false
+    }
+    let n: int = m.keys.len()
+    let mut new_keys: list[int] = []
+    let mut new_values: list[int] = []
+    let mut i: int = 0
+    while i < n {
+        if i != idx {
+            new_keys.push(m.keys.get(i))
+            new_values.push(m.values.get(i))
+        }
+        i = i + 1
+    }
+    m.keys = new_keys
+    m.values = new_values
+    return true
+}
+
+fn btreemap_int_int_keys(m: BTreeMapIntInt) -> list[int] {
+    return m.keys
+}
+
+fn btreemap_int_int_min(m: BTreeMapIntInt) -> Option[int] {
+    if m.keys.len() == 0 {
+        return Option.None
+    }
+    return Option.Some(m.keys.get(0))
+}
+
+fn btreemap_int_int_max(m: BTreeMapIntInt) -> Option[int] {
+    let n: int = m.keys.len()
+    if n == 0 {
+        return Option.None
+    }
+    return Option.Some(m.keys.get(n - 1))
+}
+
+# ============================================================================
+# HashSet[int] — backed by map[str, int] (hash -> original value).
+# ============================================================================
+
+struct HashSetInt {
+    inner: map[str, int]
+}
+
+fn hashset_int_new() -> HashSetInt {
+    return HashSetInt { inner: map_new() }
+}
+
+fn hashset_int_key(x: int) -> str {
+    return hash_int(x).to_str()
+}
+
+fn hashset_int_add(s: HashSetInt, x: int) -> void {
+    s.inner.set(hashset_int_key(x), x)
+}
+
+fn hashset_int_contains(s: HashSetInt, x: int) -> bool {
+    return s.inner.has(hashset_int_key(x))
+}
+
+fn hashset_int_size(s: HashSetInt) -> int {
+    return s.inner.len()
+}
+
+fn hashset_int_is_empty(s: HashSetInt) -> bool {
+    return s.inner.len() == 0
+}
+
+fn hashset_int_to_list(s: HashSetInt) -> list[int] {
+    let keys: list[str] = s.inner.keys()
+    let mut out: list[int] = []
+    let mut i: int = 0
+    while i < keys.len() {
+        out.push(s.inner.get_or(keys.get(i), 0))
+        i = i + 1
+    }
+    return out
+}
+
+fn hashset_int_union(a: HashSetInt, b: HashSetInt) -> HashSetInt {
+    let out: HashSetInt = hashset_int_new()
+    let la: list[int] = hashset_int_to_list(a)
+    let mut i: int = 0
+    while i < la.len() {
+        hashset_int_add(out, la.get(i))
+        i = i + 1
+    }
+    let lb: list[int] = hashset_int_to_list(b)
+    let mut j: int = 0
+    while j < lb.len() {
+        hashset_int_add(out, lb.get(j))
+        j = j + 1
+    }
+    return out
+}
+
+fn hashset_int_intersect(a: HashSetInt, b: HashSetInt) -> HashSetInt {
+    let out: HashSetInt = hashset_int_new()
+    let la: list[int] = hashset_int_to_list(a)
+    let mut i: int = 0
+    while i < la.len() {
+        if hashset_int_contains(b, la.get(i)) {
+            hashset_int_add(out, la.get(i))
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn hashset_int_diff(a: HashSetInt, b: HashSetInt) -> HashSetInt {
+    let out: HashSetInt = hashset_int_new()
+    let la: list[int] = hashset_int_to_list(a)
+    let mut i: int = 0
+    while i < la.len() {
+        if !hashset_int_contains(b, la.get(i)) {
+            hashset_int_add(out, la.get(i))
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn hashset_int_equal(a: HashSetInt, b: HashSetInt) -> bool {
+    if hashset_int_size(a) != hashset_int_size(b) {
+        return false
+    }
+    let la: list[int] = hashset_int_to_list(a)
+    let mut i: int = 0
+    while i < la.len() {
+        if !hashset_int_contains(b, la.get(i)) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+# ============================================================================
+# HashSet[str] — backed by map[str, bool].
+# ============================================================================
+
+struct HashSetStr {
+    inner: map[str, bool]
+}
+
+fn hashset_str_new() -> HashSetStr {
+    return HashSetStr { inner: map_new() }
+}
+
+fn hashset_str_add(s: HashSetStr, x: str) -> void {
+    s.inner.set(x, true)
+}
+
+fn hashset_str_contains(s: HashSetStr, x: str) -> bool {
+    return s.inner.has(x) && s.inner.get_or(x, false)
+}
+
+fn hashset_str_size(s: HashSetStr) -> int {
+    let keys: list[str] = s.inner.keys()
+    let mut count: int = 0
+    let mut i: int = 0
+    while i < keys.len() {
+        if s.inner.get_or(keys.get(i), false) {
+            count = count + 1
+        }
+        i = i + 1
+    }
+    return count
+}
+
+fn hashset_str_to_list(s: HashSetStr) -> list[str] {
+    let keys: list[str] = s.inner.keys()
+    let mut out: list[str] = []
+    let mut i: int = 0
+    while i < keys.len() {
+        if s.inner.get_or(keys.get(i), false) {
+            out.push(keys.get(i))
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn hashset_str_union(a: HashSetStr, b: HashSetStr) -> HashSetStr {
+    let out: HashSetStr = hashset_str_new()
+    let la: list[str] = hashset_str_to_list(a)
+    let mut i: int = 0
+    while i < la.len() {
+        hashset_str_add(out, la.get(i))
+        i = i + 1
+    }
+    let lb: list[str] = hashset_str_to_list(b)
+    let mut j: int = 0
+    while j < lb.len() {
+        hashset_str_add(out, lb.get(j))
+        j = j + 1
+    }
+    return out
+}
+
+fn hashset_str_intersect(a: HashSetStr, b: HashSetStr) -> HashSetStr {
+    let out: HashSetStr = hashset_str_new()
+    let la: list[str] = hashset_str_to_list(a)
+    let mut i: int = 0
+    while i < la.len() {
+        if hashset_str_contains(b, la.get(i)) {
+            hashset_str_add(out, la.get(i))
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn hashset_str_diff(a: HashSetStr, b: HashSetStr) -> HashSetStr {
+    let out: HashSetStr = hashset_str_new()
+    let la: list[str] = hashset_str_to_list(a)
+    let mut i: int = 0
+    while i < la.len() {
+        if !hashset_str_contains(b, la.get(i)) {
+            hashset_str_add(out, la.get(i))
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# ============================================================================
+# LinkedList[int] — doubly-linked list with arena-based nodes.
+# ============================================================================
+
+struct LLNodeInt {
+    value: int,
+    prev: int,
+    next: int
+}
+
+struct LinkedListInt {
+    nodes: list[LLNodeInt],
+    head: int,
+    tail: int,
+    free_count: int
+}
+
+fn linkedlist_int_new() -> LinkedListInt {
+    return LinkedListInt {
+        nodes: [],
+        head: -1,
+        tail: -1,
+        free_count: 0
+    }
+}
+
+fn linkedlist_int_len(ll: LinkedListInt) -> int {
+    return ll.nodes.len() - ll.free_count
+}
+
+fn linkedlist_int_is_empty(ll: LinkedListInt) -> bool {
+    return ll.head == -1
+}
+
+fn linkedlist_int_alloc(ll: LinkedListInt, value: int, prev: int, next: int) -> int {
+    # Search for a free node (marked by prev == -2).
+    let mut i: int = 0
+    while i < ll.nodes.len() {
+        let n: LLNodeInt = ll.nodes.get(i)
+        if n.prev == -2 {
+            n.value = value
+            n.prev = prev
+            n.next = next
+            ll.free_count = ll.free_count - 1
+            return i
+        }
+        i = i + 1
+    }
+    # No free node; append.
+    let idx: int = ll.nodes.len()
+    let node: LLNodeInt = LLNodeInt { value: value, prev: prev, next: next }
+    ll.nodes.push(node)
+    return idx
+}
+
+fn linkedlist_int_push_back(ll: LinkedListInt, value: int) -> void {
+    let idx: int = linkedlist_int_alloc(ll, value, ll.tail, -1)
+    if ll.tail != -1 {
+        let tail_node: LLNodeInt = ll.nodes.get(ll.tail)
+        tail_node.next = idx
+    } else {
+        ll.head = idx
+    }
+    ll.tail = idx
+}
+
+fn linkedlist_int_push_front(ll: LinkedListInt, value: int) -> void {
+    let idx: int = linkedlist_int_alloc(ll, value, -1, ll.head)
+    if ll.head != -1 {
+        let head_node: LLNodeInt = ll.nodes.get(ll.head)
+        head_node.prev = idx
+    } else {
+        ll.tail = idx
+    }
+    ll.head = idx
+}
+
+fn linkedlist_int_pop_front(ll: LinkedListInt) -> Option[int] {
+    if ll.head == -1 {
+        return Option.None
+    }
+    let head_node: LLNodeInt = ll.nodes.get(ll.head)
+    let value: int = head_node.value
+    let next: int = head_node.next
+    # Mark as free.
+    head_node.prev = -2
+    ll.free_count = ll.free_count + 1
+    ll.head = next
+    if next != -1 {
+        let next_node: LLNodeInt = ll.nodes.get(next)
+        next_node.prev = -1
+    } else {
+        ll.tail = -1
+    }
+    return Option.Some(value)
+}
+
+fn linkedlist_int_pop_back(ll: LinkedListInt) -> Option[int] {
+    if ll.tail == -1 {
+        return Option.None
+    }
+    let tail_node: LLNodeInt = ll.nodes.get(ll.tail)
+    let value: int = tail_node.value
+    let prev: int = tail_node.prev
+    tail_node.prev = -2
+    ll.free_count = ll.free_count + 1
+    ll.tail = prev
+    if prev != -1 {
+        let prev_node: LLNodeInt = ll.nodes.get(prev)
+        prev_node.next = -1
+    } else {
+        ll.head = -1
+    }
+    return Option.Some(value)
+}
+
+fn linkedlist_int_front(ll: LinkedListInt) -> Option[int] {
+    if ll.head == -1 {
+        return Option.None
+    }
+    return Option.Some(ll.nodes.get(ll.head).value)
+}
+
+fn linkedlist_int_back(ll: LinkedListInt) -> Option[int] {
+    if ll.tail == -1 {
+        return Option.None
+    }
+    return Option.Some(ll.nodes.get(ll.tail).value)
+}
+
+fn linkedlist_int_to_list(ll: LinkedListInt) -> list[int] {
+    let out: list[int] = []
+    let mut idx: int = ll.head
+    while idx != -1 {
+        out.push(ll.nodes.get(idx).value)
+        idx = ll.nodes.get(idx).next
+    }
+    return out
+}
+
+# ============================================================================
+# LinkedList[str] — same structure, str values.
+# ============================================================================
+
+struct LLNodeStr {
+    value: str,
+    prev: int,
+    next: int
+}
+
+struct LinkedListStr {
+    nodes: list[LLNodeStr],
+    head: int,
+    tail: int,
+    free_count: int
+}
+
+fn linkedlist_str_new() -> LinkedListStr {
+    return LinkedListStr {
+        nodes: [],
+        head: -1,
+        tail: -1,
+        free_count: 0
+    }
+}
+
+fn linkedlist_str_len(ll: LinkedListStr) -> int {
+    return ll.nodes.len() - ll.free_count
+}
+
+fn linkedlist_str_push_back(ll: LinkedListStr, value: str) -> void {
+    let idx: int = ll.nodes.len()
+    let node: LLNodeStr = LLNodeStr { value: value, prev: ll.tail, next: -1 }
+    ll.nodes.push(node)
+    if ll.tail != -1 {
+        let tail_node: LLNodeStr = ll.nodes.get(ll.tail)
+        tail_node.next = idx
+    } else {
+        ll.head = idx
+    }
+    ll.tail = idx
+}
+
+fn linkedlist_str_push_front(ll: LinkedListStr, value: str) -> void {
+    let idx: int = ll.nodes.len()
+    let node: LLNodeStr = LLNodeStr { value: value, prev: -1, next: ll.head }
+    ll.nodes.push(node)
+    if ll.head != -1 {
+        let head_node: LLNodeStr = ll.nodes.get(ll.head)
+        head_node.prev = idx
+    } else {
+        ll.tail = idx
+    }
+    ll.head = idx
+}
+
+fn linkedlist_str_pop_front(ll: LinkedListStr) -> Option[str] {
+    if ll.head == -1 {
+        return Option.None
+    }
+    let head_node: LLNodeStr = ll.nodes.get(ll.head)
+    let value: str = head_node.value
+    ll.head = head_node.next
+    if ll.head != -1 {
+        let new_head: LLNodeStr = ll.nodes.get(ll.head)
+        new_head.prev = -1
+    } else {
+        ll.tail = -1
+    }
+    return Option.Some(value)
+}
+
+fn linkedlist_str_pop_back(ll: LinkedListStr) -> Option[str] {
+    if ll.tail == -1 {
+        return Option.None
+    }
+    let tail_node: LLNodeStr = ll.nodes.get(ll.tail)
+    let value: str = tail_node.value
+    ll.tail = tail_node.prev
+    if ll.tail != -1 {
+        let new_tail: LLNodeStr = ll.nodes.get(ll.tail)
+        new_tail.next = -1
+    } else {
+        ll.head = -1
+    }
+    return Option.Some(value)
+}
+
+fn linkedlist_str_to_list(ll: LinkedListStr) -> list[str] {
+    let out: list[str] = []
+    let mut idx: int = ll.head
+    while idx != -1 {
+        out.push(ll.nodes.get(idx).value)
+        idx = ll.nodes.get(idx).next
+    }
+    return out
+}
+
+# ============================================================================
+# RingBuf[int] — fixed-capacity circular buffer.
+# ============================================================================
+
+struct RingBufInt {
+    buf: list[int],
+    capacity: int,
+    head: int,
+    count: int
+}
+
+fn ringbuf_int_new(capacity: int) -> RingBufInt {
+    if capacity <= 0 {
+        panic("ringbuf_int_new: capacity must be positive")
+    }
+    let buf: list[int] = []
+    let mut i: int = 0
+    while i < capacity {
+        buf.push(0)
+        i = i + 1
+    }
+    return RingBufInt {
+        buf: buf,
+        capacity: capacity,
+        head: 0,
+        count: 0
+    }
+}
+
+fn ringbuf_int_capacity(rb: RingBufInt) -> int {
+    return rb.capacity
+}
+
+fn ringbuf_int_len(rb: RingBufInt) -> int {
+    return rb.count
+}
+
+fn ringbuf_int_is_empty(rb: RingBufInt) -> bool {
+    return rb.count == 0
+}
+
+fn ringbuf_int_is_full(rb: RingBufInt) -> bool {
+    return rb.count == rb.capacity
+}
+
+fn ringbuf_int_push_overwrite(rb: RingBufInt, value: int) -> void {
+    if rb.count < rb.capacity {
+        let pos: int = (rb.head + rb.count) % rb.capacity
+        rb.buf.set(pos, value)
+        rb.count = rb.count + 1
+    } else {
+        rb.buf.set(rb.head, value)
+        rb.head = (rb.head + 1) % rb.capacity
+    }
+}
+
+fn ringbuf_int_push(rb: RingBufInt, value: int) -> bool {
+    if rb.count >= rb.capacity {
+        return false
+    }
+    let pos: int = (rb.head + rb.count) % rb.capacity
+    rb.buf.set(pos, value)
+    rb.count = rb.count + 1
+    return true
+}
+
+fn ringbuf_int_pop_front(rb: RingBufInt) -> Option[int] {
+    if rb.count == 0 {
+        return Option.None
+    }
+    let value: int = rb.buf.get(rb.head)
+    rb.head = (rb.head + 1) % rb.capacity
+    rb.count = rb.count - 1
+    return Option.Some(value)
+}
+
+fn ringbuf_int_peek_front(rb: RingBufInt) -> Option[int] {
+    if rb.count == 0 {
+        return Option.None
+    }
+    return Option.Some(rb.buf.get(rb.head))
+}
+
+fn ringbuf_int_clear(rb: RingBufInt) -> void {
+    rb.head = 0
+    rb.count = 0
+}
+
+fn ringbuf_int_to_list(rb: RingBufInt) -> list[int] {
+    let out: list[int] = []
+    let mut i: int = 0
+    while i < rb.count {
+        let pos: int = (rb.head + i) % rb.capacity
+        out.push(rb.buf.get(pos))
+        i = i + 1
+    }
+    return out
+}
+
+# ============================================================================
+# RingBuf[str]
+# ============================================================================
+
+struct RingBufStr {
+    buf: list[str],
+    capacity: int,
+    head: int,
+    count: int
+}
+
+fn ringbuf_str_new(capacity: int) -> RingBufStr {
+    if capacity <= 0 {
+        panic("ringbuf_str_new: capacity must be positive")
+    }
+    let buf: list[str] = []
+    let mut i: int = 0
+    while i < capacity {
+        buf.push("")
+        i = i + 1
+    }
+    return RingBufStr {
+        buf: buf,
+        capacity: capacity,
+        head: 0,
+        count: 0
+    }
+}
+
+fn ringbuf_str_len(rb: RingBufStr) -> int {
+    return rb.count
+}
+
+fn ringbuf_str_push_overwrite(rb: RingBufStr, value: str) -> void {
+    if rb.count < rb.capacity {
+        let pos: int = (rb.head + rb.count) % rb.capacity
+        rb.buf.set(pos, value)
+        rb.count = rb.count + 1
+    } else {
+        rb.buf.set(rb.head, value)
+        rb.head = (rb.head + 1) % rb.capacity
+    }
+}
+
+fn ringbuf_str_pop_front(rb: RingBufStr) -> Option[str] {
+    if rb.count == 0 {
+        return Option.None
+    }
+    let value: str = rb.buf.get(rb.head)
+    rb.head = (rb.head + 1) % rb.capacity
+    rb.count = rb.count - 1
+    return Option.Some(value)
+}
+
+fn ringbuf_str_to_list(rb: RingBufStr) -> list[str] {
+    let out: list[str] = []
+    let mut i: int = 0
+    while i < rb.count {
+        let pos: int = (rb.head + i) % rb.capacity
+        out.push(rb.buf.get(pos))
+        i = i + 1
+    }
+    return out
+}
+
+# ============================================================================
+# HashMap[int, str] — uses SipHash for key hashing.
+# ============================================================================
+
+struct HashMapIntStrEntry {
+    key: int,
+    value: str
+}
+
+struct HashMapIntStr {
+    buckets: map[str, list[HashMapIntStrEntry]],
+    size: int
+}
+
+fn hashmap_int_str_new() -> HashMapIntStr {
+    return HashMapIntStr {
+        buckets: map_new(),
+        size: 0
+    }
+}
+
+fn hashmap_int_str_size(m: HashMapIntStr) -> int {
+    return m.size
+}
+
+fn hashmap_int_str_is_empty(m: HashMapIntStr) -> bool {
+    return m.size == 0
+}
+
+fn hashmap_int_str_set(m: HashMapIntStr, key: int, value: str) -> void {
+    let hkey: str = hash_int(key).to_str()
+    if m.buckets.has(hkey) {
+        let bucket: list[HashMapIntStrEntry] = m.buckets.get_or(hkey, [])
+        let mut i: int = 0
+        while i < bucket.len() {
+            if bucket.get(i).key == key {
+                let entry: HashMapIntStrEntry = bucket.get(i)
+                entry.value = value
+                return
+            }
+            i = i + 1
+        }
+        let entry: HashMapIntStrEntry = HashMapIntStrEntry { key: key, value: value }
+        bucket.push(entry)
+        m.size = m.size + 1
+    } else {
+        let entry: HashMapIntStrEntry = HashMapIntStrEntry { key: key, value: value }
+        let bucket: list[HashMapIntStrEntry] = [entry]
+        m.buckets.set(hkey, bucket)
+        m.size = m.size + 1
+    }
+}
+
+fn hashmap_int_str_get(m: HashMapIntStr, key: int) -> Option[str] {
+    let hkey: str = hash_int(key).to_str()
+    if !m.buckets.has(hkey) {
+        return Option.None
+    }
+    let bucket: list[HashMapIntStrEntry] = m.buckets.get_or(hkey, [])
+    let mut i: int = 0
+    while i < bucket.len() {
+        if bucket.get(i).key == key {
+            return Option.Some(bucket.get(i).value)
+        }
+        i = i + 1
+    }
+    return Option.None
+}
+
+fn hashmap_int_str_has(m: HashMapIntStr, key: int) -> bool {
+    return option_is_some(hashmap_int_str_get(m, key))
+}
+
+fn hashmap_int_str_keys(m: HashMapIntStr) -> list[int] {
+    let out: list[int] = []
+    let bucket_keys: list[str] = m.buckets.keys()
+    let mut i: int = 0
+    while i < bucket_keys.len() {
+        let bucket: list[HashMapIntStrEntry] = m.buckets.get_or(bucket_keys.get(i), [])
+        let mut j: int = 0
+        while j < bucket.len() {
+            out.push(bucket.get(j).key)
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# ============================================================================
+# HashMap[int, int]
+# ============================================================================
+
+struct HashMapIntIntEntry {
+    key: int,
+    value: int
+}
+
+struct HashMapIntInt {
+    buckets: map[str, list[HashMapIntIntEntry]],
+    size: int
+}
+
+fn hashmap_int_int_new() -> HashMapIntInt {
+    return HashMapIntInt {
+        buckets: map_new(),
+        size: 0
+    }
+}
+
+fn hashmap_int_int_size(m: HashMapIntInt) -> int {
+    return m.size
+}
+
+fn hashmap_int_int_set(m: HashMapIntInt, key: int, value: int) -> void {
+    let hkey: str = hash_int(key).to_str()
+    if m.buckets.has(hkey) {
+        let bucket: list[HashMapIntIntEntry] = m.buckets.get_or(hkey, [])
+        let mut i: int = 0
+        while i < bucket.len() {
+            if bucket.get(i).key == key {
+                let entry: HashMapIntIntEntry = bucket.get(i)
+                entry.value = value
+                return
+            }
+            i = i + 1
+        }
+        let entry: HashMapIntIntEntry = HashMapIntIntEntry { key: key, value: value }
+        bucket.push(entry)
+        m.size = m.size + 1
+    } else {
+        let entry: HashMapIntIntEntry = HashMapIntIntEntry { key: key, value: value }
+        let bucket: list[HashMapIntIntEntry] = [entry]
+        m.buckets.set(hkey, bucket)
+        m.size = m.size + 1
+    }
+}
+
+fn hashmap_int_int_get(m: HashMapIntInt, key: int) -> Option[int] {
+    let hkey: str = hash_int(key).to_str()
+    if !m.buckets.has(hkey) {
+        return Option.None
+    }
+    let bucket: list[HashMapIntIntEntry] = m.buckets.get_or(hkey, [])
+    let mut i: int = 0
+    while i < bucket.len() {
+        if bucket.get(i).key == key {
+            return Option.Some(bucket.get(i).value)
+        }
+        i = i + 1
+    }
+    return Option.None
+}
+
+fn hashmap_int_int_has(m: HashMapIntInt, key: int) -> bool {
+    return option_is_some(hashmap_int_int_get(m, key))
+}
+
+fn hashmap_int_int_keys(m: HashMapIntInt) -> list[int] {
+    let out: list[int] = []
+    let bucket_keys: list[str] = m.buckets.keys()
+    let mut i: int = 0
+    while i < bucket_keys.len() {
+        let bucket: list[HashMapIntIntEntry] = m.buckets.get_or(bucket_keys.get(i), [])
+        let mut j: int = 0
+        while j < bucket.len() {
+            out.push(bucket.get(j).key)
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return out
+}

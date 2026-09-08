@@ -857,13 +857,13 @@ class Interp:
                 if isinstance(v, bytes):
                     if b"\x00" in v:
                         raise HLPanic("extern str argument contains embedded NUL byte "
-                                      "(C would truncate at the NUL)", line)
+                                      "(C would truncate at the NUL)", getattr(self, "line", 0))
                     c_args.append(v)
                 else:
                     encoded = str(v).encode("utf-8")
                     if b"\x00" in encoded:
                         raise HLPanic("extern str argument contains embedded NUL byte "
-                                      "(C would truncate at the NUL)", line)
+                                      "(C would truncate at the NUL)", getattr(self, "line", 0))
                     c_args.append(encoded)
             else:
                 # Deep-scan fix (C8): the previous code passed `id(v)` for
