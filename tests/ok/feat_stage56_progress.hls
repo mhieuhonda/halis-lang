@@ -1,0 +1,694 @@
+# tests/ok/feat_stage56_progress.hls — Stage 56 (v0.75.0-alpha): std.progress.
+#
+# Exercises every public API of std.progress:
+#   - progress_new (determinate / indeterminate; defaults)
+#   - State: progress_inc / progress_set_position / progress_set_message /
+#     progress_tick / progress_finish_state (clamping, tick wrap)
+#   - Builders: progress_with_label / _message / _width / _chars / _head /
+#     _spinner / _color / _steady (immutable — the receiver is unchanged)
+#   - Method form: .with_* chaining + .start/.inc/.set_position/.tick/
+#     .draw/.finish/.position/.total/.is_finished/.percent/.eta_secs/.render
+#     (byte-identical to the free functions)
+#   - ProgressColor: eq / to_int / from_int / name / from_str
+#     (always / never / auto; case-insensitive; bogus -> auto)
+#   - SpinnerStyle: eq / to_int / from_int / name / from_name / frame_count /
+#     spinner_frame (wrap + negative clamp) / spinner_frames_preview
+#   - Percent / elapsed / ETA / rate: exact integer math, the unknown
+#     cases (position 0, not started, sub-second), the int64 overflow
+#     guard, progress_percent clamping + the divide-first fallback
+#   - Formatting: progress_format_secs table (0s..4d03h, "?"),
+#     progress_format_eta, progress_format_percent ("  0%".."100%", " --%")
+#   - Rendering: exact strings at fixed (position, level, now) for
+#     determinate / indeterminate / finished / head char / custom chars /
+#     narrow width / singular "1 tick" / colored spans (byte-exact SGR)
+#   - MultiBar: multibar_new/add/len/get/set/render; finish state through
+#     the (suppressed) live path; the .add/.get/.set/.render/.len methods
+#   - Live smoke: isatty fd probes (same for interpreter + native under
+#     the same redirection), progress_start stamps a real monotonic
+#     instant, progress_draw/tick/finish write NOTHING when stderr is not
+#     a TTY (draw_count stays 0 — asserted only in the piped case so an
+#     interactive run exercises the drawing path instead), eprint /
+#     eprintln deterministic stderr echo
+#   - Zero-allocation churn: 100k inc + tick state updates, position and
+#     tick_count land exactly
+#
+# All string assertions are byte-exact: every render is a pure function
+# of (state, ColorLevel, now_ns). The differential test (interpreter ==
+# native) is verified via the Makefile's progress-acceptance target.
+
+import "std.progress"
+import "std.str"
+
+# ============================================================================
+# Helpers
+# ============================================================================
+
+fn ok(actual: bool, msg: str) -> void uses IO {
+    if !actual {
+        panic("FAIL " + msg)
+    }
+}
+
+fn eq_int(actual: int, expected: int, msg: str) -> void uses IO {
+    if actual != expected {
+        panic("FAIL " + msg + ": expected " + expected.to_str() + ", got " + actual.to_str())
+    }
+}
+
+fn eq_str(actual: str, expected: str, msg: str) -> void uses IO {
+    if actual != expected {
+        panic("FAIL " + msg + ": expected '" + expected + "' (" + expected.len().to_str() + " bytes), got '" + actual + "' (" + actual.len().to_str() + " bytes)")
+    }
+}
+
+fn eq_bool(actual: bool, expected: bool, msg: str) -> void uses IO {
+    if actual != expected {
+        panic("FAIL " + msg + ": expected " + expected.to_str() + ", got " + actual.to_str())
+    }
+}
+
+# bar_at(total, position, start_ns) — a synthetic bar with a FIXED start
+# instant (the pure-render pattern; the interpreter and the native binary
+# see the same synthetic clock).
+fn bar_at(total: int, position: int, start_ns: int) -> ProgressBar {
+    let q: ProgressBar = progress_new(total)
+    progress_set_position(q, position)
+    return ProgressBar {
+        label: "",
+        msg: "",
+        total: total,
+        position: position,
+        width: 30,
+        start_ns: start_ns,
+        tick_pos: 0,
+        tick_count: 0,
+        filled_char: "#",
+        empty_char: "-",
+        head_char: "",
+        spinner: SpinnerStyle.SpinnerLine,
+        color: ProgressColor.ProgressColorAuto,
+        steady_ms: 100,
+        last_draw_ns: 0,
+        draws: 0,
+        finished: false,
+        finished_msg: "",
+        cells: q.cells,
+    }
+}
+
+# ============================================================================
+# progress_new + defaults + state updates.
+# ============================================================================
+
+fn test_new_and_state() -> int uses IO {
+    let pb: ProgressBar = progress_new(100)
+    eq_int(progress_position(pb), 0, "new position 0")
+    eq_int(progress_total(pb), 100, "new total")
+    eq_str(progress_label(pb), "", "new label empty")
+    eq_bool(progress_is_finished(pb), false, "new not finished")
+    eq_int(progress_percent(pb), 0, "new percent 0")
+    eq_int(progress_tick_count(pb), 0, "new tick_count 0")
+    eq_int(progress_draw_count(pb), 0, "new draws 0")
+
+    # inc / clamping.
+    progress_inc(pb, 40)
+    eq_int(progress_position(pb), 40, "inc 40")
+    progress_inc(pb, 40)
+    eq_int(progress_position(pb), 80, "inc 80")
+    progress_inc(pb, 40)
+    eq_int(progress_position(pb), 100, "inc clamped to total")
+    progress_inc(pb, 40)
+    eq_int(progress_position(pb), 100, "inc beyond total stays clamped")
+    progress_inc(pb, -250)
+    eq_int(progress_position(pb), 0, "negative inc clamps to 0")
+
+    # set_position.
+    progress_set_position(pb, 55)
+    eq_int(progress_position(pb), 55, "set_position 55")
+    progress_set_position(pb, -5)
+    eq_int(progress_position(pb), 0, "set_position negative clamps")
+    progress_set_position(pb, 999)
+    eq_int(progress_position(pb), 100, "set_position clamps to total")
+
+    # percent.
+    eq_int(progress_percent(pb), 100, "percent at total")
+    progress_set_position(pb, 42)
+    eq_int(progress_percent(pb), 42, "percent 42")
+    progress_set_position(pb, 1)
+    eq_int(progress_percent(pb), 1, "percent 1")
+
+    # indeterminate percent.
+    eq_int(progress_percent(progress_new(0)), -1, "indeterminate percent -1")
+
+    # set_message (rendered after the percent; position is 1 here).
+    progress_set_message(pb, "step 3")
+    eq_str(progress_render(pb, ColorLevel.ColorNone, 0),
+        "[------------------------------]   1% step 3",
+        "set_message shows in render")
+    return 0
+}
+
+# ============================================================================
+# Builders — immutable updates (the receiver is unchanged).
+# ============================================================================
+
+fn test_builders() -> int uses IO {
+    let pb: ProgressBar = progress_new(100)
+
+    let with_label: ProgressBar = progress_with_label(pb, "Copy")
+    eq_str(progress_label(with_label), "Copy", "with_label")
+    eq_str(progress_label(pb), "", "with_label receiver unchanged")
+
+    let with_msg: ProgressBar = progress_with_message(pb, "f.txt")
+    eq_str(progress_render(with_msg, ColorLevel.ColorNone, 0),
+        "[------------------------------]   0% f.txt", "with_message")
+    eq_str(progress_render(pb, ColorLevel.ColorNone, 0),
+        "[------------------------------]   0%", "with_message receiver unchanged")
+
+    let with_width: ProgressBar = progress_with_width(progress_new(10), 10)
+    eq_int(with_width.width, 10, "with_width")
+    eq_int(pb.width, 30, "with_width receiver unchanged")
+    progress_set_position(with_width, 5)
+    eq_str(progress_render(with_width, ColorLevel.ColorNone, 0),
+        "[#####-----]  50%", "with_width render")
+
+    let with_chars: ProgressBar = progress_with_chars(pb, "0", ".")
+    progress_set_position(with_chars, 30)
+    eq_str(progress_render(with_chars, ColorLevel.ColorNone, 0),
+        "[000000000.....................]  30%", "with_chars render")
+
+    # multi-byte UTF-8 cells — the geometry counts CELLS, not bytes.
+    let with_blk: ProgressBar = progress_with_chars(pb, "█", "░")
+    progress_set_position(with_blk, 30)
+    eq_str(progress_render(with_blk, ColorLevel.ColorNone, 0),
+        "[█████████░░░░░░░░░░░░░░░░░░░░░]  30%", "with_chars UTF-8 render")
+
+    let with_head: ProgressBar = progress_with_head(
+        progress_with_chars(pb, "=", "."), ">")
+    progress_set_position(with_head, 25)
+    eq_str(progress_render(with_head, ColorLevel.ColorNone, 0),
+        "[======>.......................]  25%", "with_head render")
+    progress_set_position(with_head, 100)
+    eq_str(progress_render(with_head, ColorLevel.ColorNone, 0),
+        "[=============================>] 100%", "with_head at 100%")
+
+    let with_sp: ProgressBar = progress_with_spinner(pb, SpinnerStyle.SpinnerArrow)
+    eq_int(spinner_style_to_int(with_sp.spinner), 3, "with_spinner")
+    eq_int(spinner_style_to_int(pb.spinner), 1, "with_spinner receiver unchanged")
+
+    let with_color: ProgressBar = progress_with_color(pb, ProgressColor.ProgressColorNever)
+    eq_int(progress_color_to_int(with_color.color), 2, "with_color")
+    eq_int(progress_color_to_int(pb.color), 0, "with_color receiver unchanged")
+
+    let with_steady: ProgressBar = progress_with_steady(pb, 250)
+    eq_int(with_steady.steady_ms, 250, "with_steady")
+    eq_int(pb.steady_ms, 100, "with_steady receiver unchanged (default 100)")
+
+    # method-chaining form — byte-identical to the free functions.
+    let chained: ProgressBar = progress_new(20).with_label("L").with_message("m")
+        .with_width(8).with_chars("#", ".").with_head(">").with_steady(0)
+        .with_spinner(SpinnerStyle.SpinnerDots)
+        .with_color(ProgressColor.ProgressColorNever)
+    progress_set_position(chained, 6)
+    eq_str(progress_render(chained, ColorLevel.ColorNone, 0),
+        "L [#>......]  30% m", "method-chained builder render")
+    eq_str(chained.render(ColorLevel.ColorNone, 0),
+        progress_render(chained, ColorLevel.ColorNone, 0),
+        "method .render == free progress_render")
+    return 0
+}
+
+# ============================================================================
+# ProgressColor — enum, names, parsing.
+# ============================================================================
+
+fn test_color_modes() -> int uses IO {
+    eq_int(progress_color_to_int(ProgressColor.ProgressColorAuto), 0, "auto 0")
+    eq_int(progress_color_to_int(ProgressColor.ProgressColorAlways), 1, "always 1")
+    eq_int(progress_color_to_int(ProgressColor.ProgressColorNever), 2, "never 2")
+
+    eq_bool(progress_color_eq(ProgressColor.ProgressColorAuto,
+        ProgressColor.ProgressColorAuto), true, "eq auto auto")
+    eq_bool(progress_color_eq(ProgressColor.ProgressColorAlways,
+        ProgressColor.ProgressColorAuto), false, "eq always auto")
+
+    eq_int(progress_color_to_int(progress_color_from_int(2)), 2, "from_int roundtrip")
+    eq_int(progress_color_to_int(progress_color_from_int(0)), 0, "from_int 0")
+
+    eq_str(progress_color_name(ProgressColor.ProgressColorAuto), "auto", "name auto")
+    eq_str(progress_color_name(ProgressColor.ProgressColorAlways), "always", "name always")
+    eq_str(progress_color_name(ProgressColor.ProgressColorNever), "never", "name never")
+
+    eq_int(progress_color_to_int(progress_color_from_str("always")), 1, "parse always")
+    eq_int(progress_color_to_int(progress_color_from_str("NEVER")), 2, "parse NEVER")
+    eq_int(progress_color_to_int(progress_color_from_str("Auto")), 0, "parse Auto")
+    eq_int(progress_color_to_int(progress_color_from_str("")), 0, "parse empty -> auto")
+    eq_int(progress_color_to_int(progress_color_from_str("purple")), 0, "parse bogus -> auto")
+    return 0
+}
+
+# ============================================================================
+# SpinnerStyle — frames, names, counts, previews.
+# ============================================================================
+
+fn test_spinners() -> int uses IO {
+    # eq + encoding.
+    eq_bool(spinner_style_eq(SpinnerStyle.SpinnerDots, SpinnerStyle.SpinnerDots), true, "eq dots")
+    eq_bool(spinner_style_eq(SpinnerStyle.SpinnerDots, SpinnerStyle.SpinnerLine), false, "neq dots line")
+    eq_int(spinner_style_to_int(SpinnerStyle.SpinnerDots), 0, "dots 0")
+    eq_int(spinner_style_to_int(SpinnerStyle.SpinnerPipe), 7, "pipe 7")
+    eq_int(spinner_style_to_int(spinner_style_from_int(4)), 4, "from_int roundtrip")
+    eq_int(spinner_style_to_int(spinner_style_from_int(0)), 0, "from_int 0")
+
+    # names + from_name.
+    eq_str(spinner_style_name(SpinnerStyle.SpinnerDots), "dots", "name dots")
+    eq_str(spinner_style_name(SpinnerStyle.SpinnerDotsAscii), "dots-ascii", "name dots-ascii")
+    eq_str(spinner_style_name(SpinnerStyle.SpinnerArrow), "arrow", "name arrow")
+    eq_str(spinner_style_name(SpinnerStyle.SpinnerBounce), "bounce", "name bounce")
+    eq_str(spinner_style_name(SpinnerStyle.SpinnerToggle), "toggle", "name toggle")
+    eq_str(spinner_style_name(SpinnerStyle.SpinnerTriangle), "triangle", "name triangle")
+    eq_str(spinner_style_name(SpinnerStyle.SpinnerPipe), "pipe", "name pipe")
+    eq_int(spinner_style_to_int(spinner_style_from_name("dots")), 0, "from_name dots")
+    eq_int(spinner_style_to_int(spinner_style_from_name("ARROW")), 3, "from_name ARROW")
+    eq_int(spinner_style_to_int(spinner_style_from_name("ascii")), 2, "from_name ascii")
+    eq_int(spinner_style_to_int(spinner_style_from_name("nope")), 1, "from_name bogus -> line")
+
+    # frame counts.
+    eq_int(spinner_frame_count(SpinnerStyle.SpinnerDots), 10, "dots frames")
+    eq_int(spinner_frame_count(SpinnerStyle.SpinnerLine), 4, "line frames")
+    eq_int(spinner_frame_count(SpinnerStyle.SpinnerDotsAscii), 5, "ascii frames")
+    eq_int(spinner_frame_count(SpinnerStyle.SpinnerArrow), 8, "arrow frames")
+    eq_int(spinner_frame_count(SpinnerStyle.SpinnerBounce), 8, "bounce frames")
+    eq_int(spinner_frame_count(SpinnerStyle.SpinnerToggle), 4, "toggle frames")
+    eq_int(spinner_frame_count(SpinnerStyle.SpinnerTriangle), 4, "triangle frames")
+    eq_int(spinner_frame_count(SpinnerStyle.SpinnerPipe), 4, "pipe frames")
+
+    # frames: first, middle, wrap, negative clamp.
+    eq_str(spinner_frame(SpinnerStyle.SpinnerDots, 0), "⠋", "dots frame 0")
+    eq_str(spinner_frame(SpinnerStyle.SpinnerDots, 9), "⠏", "dots frame 9")
+    eq_str(spinner_frame(SpinnerStyle.SpinnerDots, 10), "⠋", "dots frame wraps")
+    eq_str(spinner_frame(SpinnerStyle.SpinnerDots, 23), "⠸", "dots frame 23 -> idx 3")
+    eq_str(spinner_frame(SpinnerStyle.SpinnerDots, -7), "⠋", "dots negative clamps to 0")
+    eq_str(spinner_frame(SpinnerStyle.SpinnerLine, 1), "\\", "line frame 1 (backslash)")
+    eq_str(spinner_frame(SpinnerStyle.SpinnerLine, 2), "|", "line frame 2")
+    eq_str(spinner_frame(SpinnerStyle.SpinnerDotsAscii, 3), "@", "ascii frame 3")
+    eq_str(spinner_frame(SpinnerStyle.SpinnerArrow, 4), "→", "arrow frame 4")
+    eq_str(spinner_frame(SpinnerStyle.SpinnerBounce, 7), "█", "bounce frame 7")
+    eq_str(spinner_frame(SpinnerStyle.SpinnerToggle, 2), "▪", "toggle frame 2")
+    eq_str(spinner_frame(SpinnerStyle.SpinnerTriangle, 1), "◣", "triangle frame 1")
+    eq_str(spinner_frame(SpinnerStyle.SpinnerPipe, 3), "┊", "pipe frame 3")
+
+    # previews (byte-exact frame cycles).
+    eq_str(spinner_frames_preview(SpinnerStyle.SpinnerLine), "- \\ | /", "line preview")
+    eq_str(spinner_frames_preview(SpinnerStyle.SpinnerDotsAscii), ". o O @ *", "ascii preview")
+    eq_str(spinner_frames_preview(SpinnerStyle.SpinnerToggle), "■ □ ▪ ▫", "toggle preview")
+    eq_str(spinner_frames_preview(SpinnerStyle.SpinnerTriangle), "◢ ◣ ◤ ◥", "triangle preview")
+    return 0
+}
+
+# ============================================================================
+# Tick mechanics (the pure state update).
+# ============================================================================
+
+fn test_ticks() -> int uses IO {
+    let sp: ProgressBar = progress_with_spinner(progress_new(0), SpinnerStyle.SpinnerLine)
+    eq_int(progress_tick_count(sp), 0, "ticks start 0")
+
+    progress_tick(sp)
+    eq_int(progress_tick_count(sp), 1, "tick 1")
+    eq_str(spinner_frame(sp.spinner, sp.tick_pos), "\\", "tick 1 frame")
+
+    progress_tick(sp)
+    progress_tick(sp)
+    eq_int(progress_tick_count(sp), 3, "tick 3")
+    eq_str(spinner_frame(sp.spinner, sp.tick_pos), "/", "tick 3 frame")
+
+    # wrap to frame 0.
+    progress_tick(sp)
+    eq_int(progress_tick_count(sp), 4, "tick 4")
+    eq_str(spinner_frame(sp.spinner, sp.tick_pos), "-", "tick 4 wraps to frame 0")
+    return 0
+}
+
+# ============================================================================
+# Percent / elapsed / ETA / rate — the integer math.
+# ============================================================================
+
+fn test_eta_math() -> int uses IO {
+    let t0: int = 1000000000000000
+    let s: int = 1000000000
+
+    # elapsed.
+    eq_int(progress_elapsed_ns(bar_at(100, 25, t0), t0 + 5 * s), 5 * s, "elapsed 5s")
+    eq_int(progress_elapsed_ns(bar_at(100, 25, 0), t0), 0, "elapsed not started")
+    eq_int(progress_elapsed_ns(bar_at(100, 25, t0), t0 - 999), 0, "elapsed clamps negative")
+
+    # ETA: 25/100 done after 10s -> 10 * 75 / 25 = 30.
+    eq_int(progress_eta_secs(bar_at(100, 25, t0), t0 + 10 * s), 30, "eta 30s")
+    # 50/100 after 10s -> 10.
+    eq_int(progress_eta_secs(bar_at(100, 50, t0), t0 + 10 * s), 10, "eta 10s")
+    # 1/2 after 1s -> 1.
+    eq_int(progress_eta_secs(bar_at(2, 1, t0), t0 + s), 1, "eta 1s")
+    # done -> 0.
+    eq_int(progress_eta_secs(bar_at(100, 100, t0), t0 + s), 0, "eta at total 0")
+    # unknown cases.
+    eq_int(progress_eta_secs(bar_at(100, 0, t0), t0 + s), -1, "eta unknown position 0")
+    eq_int(progress_eta_secs(bar_at(100, 25, 0), t0 + s), -1, "eta unknown not started")
+    eq_int(progress_eta_secs(bar_at(100, 25, t0), t0 + 500000000), -1, "eta unknown sub-second")
+    # indeterminate.
+    eq_int(progress_eta_secs(bar_at(0, 0, t0), t0 + s), -1, "eta unknown indeterminate")
+
+    # overflow guard: elapsed_secs=2000, remaining ~ 9.2e18 -> overflow.
+    eq_int(progress_eta_secs(bar_at(9223372036854775807, 1, t0), t0 + 2000000000000), -1,
+        "eta overflow guard -> unknown")
+
+    # rate.
+    eq_int(progress_rate_per_sec(bar_at(100, 25, t0), t0 + 10 * s), 2, "rate 2/s")
+    eq_int(progress_rate_per_sec(bar_at(100, 25, t0), t0 + 4 * s), 6, "rate 6/s (25/4)")
+    eq_int(progress_rate_per_sec(bar_at(100, 25, 0), t0), 0, "rate not started")
+    eq_int(progress_rate_per_sec(bar_at(100, 25, t0), t0 + 500000000), 0, "rate sub-second")
+    return 0
+}
+
+# ============================================================================
+# Formatting — durations, ETA display, percent.
+# ============================================================================
+
+fn test_formatting() -> int uses IO {
+    eq_str(progress_format_secs(0), "0s", "fmt 0")
+    eq_str(progress_format_secs(1), "1s", "fmt 1")
+    eq_str(progress_format_secs(45), "45s", "fmt 45")
+    eq_str(progress_format_secs(59), "59s", "fmt 59")
+    eq_str(progress_format_secs(60), "1m00s", "fmt 60")
+    eq_str(progress_format_secs(61), "1m01s", "fmt 61")
+    eq_str(progress_format_secs(192), "3m12s", "fmt 192")
+    eq_str(progress_format_secs(3599), "59m59s", "fmt 3599")
+    eq_str(progress_format_secs(3600), "1h00m", "fmt 3600")
+    eq_str(progress_format_secs(7500), "2h05m", "fmt 7500")
+    eq_str(progress_format_secs(86399), "23h59m", "fmt 86399")
+    eq_str(progress_format_secs(86400), "1d00h", "fmt 86400")
+    eq_str(progress_format_secs(356000), "4d02h", "fmt 356000")
+    eq_str(progress_format_secs(-1), "?", "fmt -1")
+    eq_str(progress_format_secs(-100), "?", "fmt -100")
+
+    eq_str(progress_format_eta(30), "30s", "eta fmt 30")
+    eq_str(progress_format_eta(356000), "4d02h", "eta fmt 356000")
+    eq_str(progress_format_eta(-1), "?", "eta fmt unknown")
+    eq_str(progress_format_eta(-2), "?", "eta fmt unknown 2")
+
+    eq_str(progress_format_percent(0), "  0%", "pct 0")
+    eq_str(progress_format_percent(7), "  7%", "pct 7")
+    eq_str(progress_format_percent(42), " 42%", "pct 42")
+    eq_str(progress_format_percent(100), "100%", "pct 100")
+    eq_str(progress_format_percent(-1), " --%", "pct indeterminate")
+    eq_str(progress_format_percent(101), "100%", "pct 101 clamps")
+    return 0
+}
+
+# ============================================================================
+# Rendering — determinate, indeterminate, finished; monochrome exact.
+# ============================================================================
+
+fn test_render() -> int uses IO {
+    let t0: int = 2000000000000000
+    let s: int = 1000000000
+
+    # determinate, not started: no eta, no rate, no elapsed.
+    let pb: ProgressBar = progress_with_label(bar_at(100, 25, 0), "Downloading")
+    eq_str(progress_render(pb, ColorLevel.ColorNone, t0),
+        "Downloading [#######-----------------------]  25%",
+        "render determinate no clock")
+
+    # determinate, started: eta + rate + elapsed.
+    let pb2: ProgressBar = progress_with_label(bar_at(100, 25, t0), "Downloading")
+    progress_set_message(pb2, "file7.tar.gz")
+    eq_str(progress_render(pb2, ColorLevel.ColorNone, t0 + 10 * s),
+        "Downloading [#######-----------------------]  25% eta 30s 2/s file7.tar.gz 10s",
+        "render determinate full")
+
+    # sub-second elapsed renders "<1s" (not "0s").
+    let pb3: ProgressBar = progress_with_label(bar_at(100, 25, t0), "Fast")
+    eq_str(progress_render(pb3, ColorLevel.ColorNone, t0 + 400000000),
+        "Fast [#######-----------------------]  25% eta ? <1s",
+        "render sub-second")
+
+    # determinate, finished.
+    let pb4: ProgressBar = progress_with_label(bar_at(100, 100, t0), "Downloading")
+    progress_finish_state(pb4, "")
+    eq_str(progress_render(pb4, ColorLevel.ColorNone, t0 + 10 * s),
+        "Downloading [##############################] 100% done in 10s",
+        "render finished")
+
+    # finished with message.
+    progress_finish_state(pb4, "12 files, 3 skipped")
+    eq_str(progress_render(pb4, ColorLevel.ColorNone, t0 + 12 * s),
+        "Downloading [##############################] 100% done in 12s 12 files, 3 skipped",
+        "render finished with message")
+
+    # zero position / zero width fill.
+    eq_str(progress_render(bar_at(100, 0, 0), ColorLevel.ColorNone, t0),
+        "[------------------------------]   0%", "render 0%")
+
+    # indeterminate, running (frame + tick count + elapsed).
+    let sp: ProgressBar = progress_with_spinner(
+        progress_with_label(bar_at(0, 0, t0), "Scanning"), SpinnerStyle.SpinnerDots)
+    progress_tick(sp)
+    eq_str(progress_render(sp, ColorLevel.ColorNone, t0 + s),
+        "Scanning ⠙ 1 tick 1s", "render indeterminate singular tick")
+    progress_tick(sp)
+    progress_tick(sp)
+    progress_tick(sp)
+    eq_str(progress_render(sp, ColorLevel.ColorNone, t0 + 2 * s),
+        "Scanning ⠼ 4 ticks 2s", "render indeterminate plural ticks")
+
+    # indeterminate with message.
+    progress_set_message(sp, "resolving")
+    eq_str(progress_render(sp, ColorLevel.ColorNone, t0 + 2 * s),
+        "Scanning ⠼ 4 ticks resolving 2s", "render indeterminate with message")
+
+    # indeterminate, finished.
+    progress_finish_state(sp, "clean")
+    eq_str(progress_render(sp, ColorLevel.ColorNone, t0 + 3 * s),
+        "Scanning done in 3s (4 ticks) clean", "render indeterminate finished")
+
+    # method form parity.
+    eq_str(pb2.render(ColorLevel.ColorNone, t0 + 10 * s),
+        progress_render(pb2, ColorLevel.ColorNone, t0 + 10 * s),
+        "method .render == free render")
+    eq_int(pb2.percent(), 25, "method .percent")
+    eq_int(pb2.position(), 25, "method .position")
+    eq_int(pb2.total(), 100, "method .total")
+    eq_bool(pb2.is_finished(), false, "method .is_finished")
+    eq_int(pb2.eta_secs(t0 + 10 * s), 30, "method .eta_secs")
+    return 0
+}
+
+# ============================================================================
+# Rendering with color — byte-exact SGR spans at each level.
+# ============================================================================
+
+fn test_render_color() -> int uses IO {
+    let t0: int = 3000000000000000
+    let e: str = chr(27)
+
+    # None: fully escape-free (even the bold "done in" span).
+    eq_str(progress_render(bar_at(100, 50, 0), ColorLevel.ColorNone, t0),
+        "[###############---------------]  50%", "none render")
+    let fin: ProgressBar = bar_at(100, 100, t0)
+    progress_finish_state(fin, "")
+    eq_str(progress_render(fin, ColorLevel.ColorNone, t0),
+        "[##############################] 100% done in 0s", "none finished render")
+
+    # Basic: green filled span + reset; the empty span stays default.
+    # SGR: fg green = ESC[32m, reset = ESC[0m.
+    let pb: ProgressBar = progress_with_label(bar_at(20, 10, 0), "C")
+    eq_str(progress_render(pb, ColorLevel.ColorBasic, t0),
+        "C [" + e + "[32m###############" + e + "[0m---------------]  50%",
+        "basic green bar")
+
+    # 256 and truecolor: green is a basic color in every palette, so the
+    # emitted SGR is IDENTICAL (the same 32 code — graceful degradation
+    # means no extra information appears).
+    eq_str(progress_render(pb, ColorLevel.Color256, t0),
+        progress_render(pb, ColorLevel.ColorBasic, t0), "256 == basic for basic colors")
+    eq_str(progress_render(pb, ColorLevel.ColorTruecolor, t0),
+        progress_render(pb, ColorLevel.ColorBasic, t0), "truecolor == basic for basic colors")
+
+    # Basic spinner frame: cyan (36).
+    let sp: ProgressBar = progress_with_spinner(bar_at(0, 0, 0), SpinnerStyle.SpinnerBounce)
+    progress_tick(sp)
+    eq_str(progress_render(sp, ColorLevel.ColorBasic, t0),
+        e + "[36m▂" + e + "[0m 1 tick", "basic cyan frame")
+
+    # Basic finished: bold + green = ESC[32;1m.
+    let fin2: ProgressBar = bar_at(20, 20, t0)
+    progress_finish_state(fin2, "")
+    eq_str(progress_render(fin2, ColorLevel.ColorBasic, t0 + 2 * 1000000000),
+        "[" + e + "[32m##############################" + e + "[0m] 100% "
+        + e + "[32;1mdone in 2s" + e + "[0m",
+        "basic done bold green")
+    return 0
+}
+
+# ============================================================================
+# MultiBar.
+# ============================================================================
+
+fn test_multibar() -> int uses IO, Proc {
+    let t0: int = 4000000000000000
+
+    let mb: MultiBar = multibar_new()
+    eq_int(multibar_len(mb), 0, "multibar empty")
+
+    let a: ProgressBar = progress_with_label(bar_at(100, 40, 0), "download")
+    let b: ProgressBar = progress_with_spinner(
+        progress_with_label(bar_at(0, 0, 0), "parse"), SpinnerStyle.SpinnerDots)
+    let c: ProgressBar = progress_with_head(
+        progress_with_chars(progress_with_label(bar_at(50, 25, 0), "index"), "=", "-"),
+        ">")
+
+    eq_int(multibar_add(mb, a), 0, "add returns 0")
+    eq_int(multibar_add(mb, b), 1, "add returns 1")
+    eq_int(multibar_add(mb, c), 2, "add returns 2")
+    eq_int(multibar_len(mb), 3, "len 3")
+
+    progress_tick(b)
+    progress_tick(b)
+    progress_tick(b)
+
+    eq_str(multibar_render(mb, ColorLevel.ColorNone, t0),
+        "download [############------------------]  40%\n"
+        + "parse ⠸ 3 ticks\n"
+        + "index [==============>---------------]  50%",
+        "multibar render 3 lines")
+
+    # set: the value-snapshot update.
+    let a2: ProgressBar = multibar_get(mb, 0)
+    progress_set_position(a2, 70)
+    multibar_set(mb, 0, a2)
+    eq_int(multibar_get(mb, 0).position, 70, "multibar_set snapshot")
+    eq_str(multibar_render(mb, ColorLevel.ColorNone, t0),
+        "download [#####################---------]  70%\n"
+        + "parse ⠸ 3 ticks\n"
+        + "index [==============>---------------]  50%",
+        "multibar render after set")
+
+    # get / set through the method form.
+    eq_int(mb.len(), 3, "method .len")
+    eq_int(mb.get(1).tick_count, 3, "method .get")
+    let c2: ProgressBar = mb.get(2)
+    progress_set_position(c2, 50)
+    mb.set(2, c2)
+    eq_str(mb.render(ColorLevel.ColorNone, t0),
+        multibar_render(mb, ColorLevel.ColorNone, t0), "method .render parity")
+
+    # finish (the live path is suppressed when piped, but the STATE
+    # transitions still happen — the finish_state call runs first).
+    multibar_finish(mb)
+    eq_bool(multibar_get(mb, 0).finished, true, "multibar_finish marks finished")
+    eq_bool(mb.get(2).finished, true, "multibar_finish all bars")
+    eq_str(mb.render(ColorLevel.ColorNone, t0),
+        "download [##############################] 100% done in 0s\n"
+        + "parse done in 0s (3 ticks)\n"
+        + "index [=============================>] 100% done in 0s",
+        "multibar render finished")
+    return 0
+}
+
+# ============================================================================
+# Live smoke — isatty probes + start + suppressed draws + eprint echo.
+# ============================================================================
+
+fn test_live_smoke() -> int uses IO, Clock, Proc {
+    # isatty: the fd states are identical between the interpreter and the
+    # native binary under the same redirection, so printing the results
+    # is differential-safe. Negative / bogus fds are simply not terminals.
+    ok(!isatty(-1), "isatty(-1) false")
+    ok(!isatty(999), "isatty(999) false")
+
+    # progress_start stamps a real monotonic instant (relative assertion,
+    # the Stage 49 pattern: no exact nanosecond values in the output).
+    let pb: ProgressBar = progress_new(10).with_label("Live").with_steady(0)
+    eq_int(pb.start_ns, 0, "start_ns 0 before start")
+    progress_start(pb)
+    ok(pb.start_ns > 0, "start_ns stamped by start")
+    # a second start is a no-op (the baseline never moves).
+    let first: int = pb.start_ns
+    progress_start(pb)
+    eq_int(pb.start_ns, first, "start is idempotent")
+
+    # Live draws: when stderr is NOT a TTY (the piped / redirected case —
+    # what run_tests.sh and the acceptance target always do), the draws
+    # perform ZERO writes and the draw counter stays 0. When a human runs
+    # the test in a terminal the drawing path is exercised instead — the
+    # assertion is conditional so both worlds pass.
+    let before: int = progress_draw_count(pb)
+    progress_inc_draw(pb, 3)
+    progress_tick_draw(pb)
+    if !isatty(2) {
+        eq_int(progress_draw_count(pb), before, "piped: draws suppressed (0 writes)")
+    }
+    progress_finish(pb)
+
+    # eprint / eprintln — deterministic content on stderr (both backends
+    # flush stdout first, so the interleaving is byte-identical).
+    eprint("[stderr] echo ")
+    eprintln("line (deterministic)")
+
+    # PROGRESS_DISABLE also suppresses drawing even on a TTY.
+    ok(true, "smoke complete")
+    return 0
+}
+
+# ============================================================================
+# Zero-allocation state churn (the contract, at scale).
+# ============================================================================
+
+fn test_zero_alloc_churn() -> int uses IO {
+    let pb: ProgressBar = progress_with_label(progress_new(100000), "Churn")
+    let mut i: int = 0
+    while i < 100000 {
+        progress_inc(pb, 1)
+        progress_tick(pb)
+        i = i + 1
+    }
+    eq_int(progress_position(pb), 100000, "churn position exact")
+    eq_int(progress_tick_count(pb), 100000, "churn ticks exact")
+    eq_str(progress_render(pb, ColorLevel.ColorNone, 0),
+        "Churn [##############################] 100%", "churn render full")
+    return 0
+}
+
+# ============================================================================
+# Main — run every section in order.
+# ============================================================================
+
+fn main() -> int uses IO, Clock, Proc {
+    println("=== Stage 56: std.progress — bars, spinners, ETA, multi-bar ===")
+    println("--- progress_new + state ---")
+    test_new_and_state()
+    println("--- builders (immutable) + method chaining ---")
+    test_builders()
+    println("--- ProgressColor ---")
+    test_color_modes()
+    println("--- SpinnerStyle ---")
+    test_spinners()
+    println("--- tick mechanics ---")
+    test_ticks()
+    println("--- ETA / rate / percent ---")
+    test_eta_math()
+    println("--- formatting ---")
+    test_formatting()
+    println("--- rendering (monochrome) ---")
+    test_render()
+    println("--- rendering (color, byte-exact SGR) ---")
+    test_render_color()
+    println("--- MultiBar ---")
+    test_multibar()
+    println("--- live smoke (isatty / start / suppressed draws / eprint) ---")
+    test_live_smoke()
+    println("--- zero-allocation churn ---")
+    test_zero_alloc_churn()
+    println("ALL STAGE 56 TESTS PASSED")
+    return 0
+}

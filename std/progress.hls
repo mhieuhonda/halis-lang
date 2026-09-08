@@ -1,0 +1,1498 @@
+# ============================================================================
+# std/progress.hls — Stage 56 (v0.75.0-alpha): progress bars, spinners,
+# ETA estimation, multi-bar rendering.
+# ----------------------------------------------------------------------------
+# This module is the FOURTH module of Phase IV (the CLI tooling track,
+# Stages 53–62). It implements the roadmap's Stage 56 promise:
+#
+#   * ProgressBar::new(total) — `progress_new(total)` (+ the
+#     `impl ProgressBar` method form). total > 0 is a determinate bar
+#     (fraction + percent + ETA); total == 0 is an indeterminate
+#     spinner (frame + tick count + elapsed).
+#   * tick() — `progress_tick(pb)` advances the spinner frame (pure
+#     state update); `progress_tick_draw(pb)` / `pb.tick()` also
+#     redraw (the indicatif semantics).
+#   * finish() — `progress_finish(pb)` / `pb.finish()` marks the bar
+#     100%, renders the final line, and leaves the cursor on the next
+#     line.
+#   * ETA estimation — `progress_eta_secs(pb, now_ns)` (pure integer
+#     arithmetic with an overflow guard; no floats, so the output is
+#     byte-identical between the interpreter and the native binary).
+#   * multi-bar (one per concurrent task) — `MultiBar` renders one
+#     line per bar and redraws in place with ANSI cursor-up + EL 2.
+#   * spinner styles — 8 built-in styles (braille dots, line,
+#     ascii dots, arrows, bounce, toggle, triangle, pipe).
+#   * Zero allocation after creation — the ProgressBar's state is
+#     FIXED-SIZE (scalar fields + a pre-allocated `cells` list of
+#     `width` entries). State updates (inc / set_position / tick /
+#     set_message) mutate fields in place: no allocation at all. Each
+#     REDRAW performs a small constant number of bounded string
+#     allocations (the monochrome bar body is a single join over the
+#     pre-allocated cells), and redraws are rate-limited by
+#     `steady_ms` (default 100ms) — a suppressed redraw performs zero
+#     string work. This is the Halis analogue of indicatif's
+#     zero-allocation-after-construction guarantee: HLS strings are
+#     immutable, so the drawn line itself must be materialised per
+#     redraw, but the STATE never grows and the steady-state tick
+#     path allocates nothing.
+#
+# Design choices:
+#
+#   1. THREE NEW COMPILER BUILTINS (the only ones in this stage):
+#      * `eprint(s)` / `eprintln(s)` — write to STDERR (IO effect,
+#        taint sink, argument consumed). Progress bars draw on stderr
+#        so the program's data on stdout stays clean — the same
+#        convention as Python's tqdm, Rust's indicatif, and Go's
+#        progress. The helpers fflush(stdout) first so interleaved
+#        stdout/stderr output keeps the caller's logical order.
+#      * `isatty(fd)` — true when fd is a terminal (IO effect). This
+#        is the TTY detection std.color's v0.74.0-alpha limitations
+#        deferred to "Stage 56+ when std.progress lands and the
+#        spinner needs it". Bars draw ONLY when stderr is a TTY (or
+#        PROGRESS_FORCE is set), so piped output is never polluted
+#        with redraw escapes.
+#
+#   2. PURE CORE + THIN LIVE SHELL (the repo's std.color pattern).
+#      Every computation is a pure function taking explicit inputs:
+#      `progress_render(pb, level, now_ns)` takes the ColorLevel and
+#      the current time as ARGUMENTS, so the test suite can render
+#      with synthetic values (byte-identical between interpreter and
+#      native — no clock, no env, no isatty on the pure path). The
+#      live functions (`progress_draw`, `progress_tick_draw`,
+#      `progress_finish`, `multibar_draw`) are thin shells that read
+#      the clock (Clock), resolve the color mode (IO + Proc), and
+#      write to stderr (IO).
+#
+#   3. ETA / RATE VIA INTEGER ARITHMETIC ONLY.
+#      elapsed_ns * remaining / position would overflow int64 for
+#      long-running bars; progress_eta_secs pre-checks the multiply
+#      and returns -1 ("unknown", rendered as "eta ?") when the
+#      product would overflow or when there is not yet enough data
+#      (position == 0, elapsed < 1s, not started). The same guard
+#      pattern protects progress_percent. No float arithmetic
+#      anywhere in the render path — differential parity is
+#      byte-for-byte.
+#
+#   4. COLOR INTEGRATION (Stage 55, v0.74.0-alpha).
+#      The bar's filled span renders green (bold when finished), the
+#      spinner frame cyan, all via std.color's ColorStyle + the
+#      caller-supplied ColorLevel (graceful truecolor → 256 → basic →
+#      none down-sampling comes free from std.color). The color MODE
+#      is `ProgressColorAuto / Always / Never` — the roadmap's
+#      "--color=always / never / auto" flag surface: apps wire their
+#      own CLI flag to `progress_color_from_str(value)` and pass the
+#      mode to `progress_with_color`. Auto = color only when stderr
+#      is a TTY (isatty(2)); Always = color_detect() from env;
+#      Never = ColorLevel.None (no escapes at all).
+#
+#   5. DRAWS ARE SUPPRESSED WHEN NOT A TTY.
+#      `progress_should_draw()` checks PROGRESS_DISABLE (never draw),
+#      PROGRESS_FORCE (always draw), then isatty(2). When stdout is
+#      piped to `less` or a file, the program prints data; when it
+#      runs on a real terminal, it animates. The env overrides exist
+#      for CI / debugging (PROGRESS_FORCE=1 shows the redraws in a
+#      captured log; PROGRESS_DISABLE=1 silences a TTY run).
+#
+#   6. MULTIBAR = ONE LINE PER TASK.
+#      A `MultiBar` holds one ProgressBar per concurrent task and
+#      redraws all of them in place: cursor-up (n-1) then EL 2 +
+#      line + newline per bar. Each bar keeps its own label /
+#      position / spinner (the typical pipeline pattern: "download"
+#      / "parse" / "index" bars). HLS structs are values passed by
+#      reference; worker threads that own their own bar snapshots
+#      report back via channels, and the UI thread updates the
+#      MultiBar with `multibar_set` (the value-snapshot model —
+#      documented, deterministic, no shared mutable state).
+#
+# Security:
+#   * Every escape sequence is a FIXED STRING or built from fixed
+#     strings (chr(27) + "[..." from std.tui; SGR spans from
+#     std.color). No user input is ever embedded in an escape.
+#   * eprint / eprintln are TAINT SINKS (compiler-enforced): a
+#     tainted message cannot reach the terminal without an explicit
+#     taint_unwrap / sanitizer — the same ANSI-injection protection
+#     print / println have.
+#   * The label / msg fields are plain str rendered as TEXT; the
+#     renderer never interprets them as escape sequences (the SGR
+#     spans wrap fixed substrings, and the label/msg are emitted
+#     verbatim between them).
+#   * No path / command / env VALUE is ever written to the terminal —
+#     env access is limited to the three documented probes
+#     (PROGRESS_DISABLE / PROGRESS_FORCE / the std.color detector).
+#
+# Limitations (deferred to later stages):
+#   * No terminal WIDTH detection (no ioctl TIOCGWINSZ builtin). The
+#     bar width is caller-controlled (default 30). A future
+#     perfection stage may add `term_width()` and auto-fit.
+#   * No finitered / rate-smoothed ETA (the ETA is the simple
+#     linear estimate elapsed * remaining / position; indicatif's
+#     EMA smoothing needs float state + a mutable history buffer).
+#   * MultiBar does not thread-track: it renders whatever bar
+#     snapshots it holds when `multibar_draw` is called (the
+#     value-snapshot model above).
+#   * The wasm32 backend does not support eprint / isatty (no
+#     stderr / fd concept in the JS sandbox); std.progress is a
+#     native-backend module (same class as std.env / std.net).
+#   * Human-readable durations cap at days ("4d03h"); anything
+#     longer renders as days too (no weeks / months / years).
+# ============================================================================
+
+import "std.str"
+import "std.color"
+import "std.tui"
+
+# ----------------------------------------------------------------------------
+# Tunable defaults (function form — HLS v0.3 has no top-level constant
+# expressions for str; ints are available but the repo convention is
+# accessor fns, e.g. std.tui's tui_color_* family).
+# ----------------------------------------------------------------------------
+
+# progress_default_width() — the bar interior width in cells (chars).
+# 30 fits a 80-column terminal with a label + percent + ETA.
+fn progress_default_width() -> int { return 30 }
+
+# progress_default_steady_ms() — the minimum interval between actual
+# redraws (the rate limiter). 100ms = at most 10 frames/second, the
+# point where animation stops being readable and starts flickering.
+fn progress_default_steady_ms() -> int { return 100 }
+
+# progress_int64_max() — INT64_MAX, used by the overflow guards.
+fn progress_int64_max() -> int { return 9223372036854775807 }
+
+# ----------------------------------------------------------------------------
+# ProgressColor — the --color=always / never / auto flag surface.
+# ----------------------------------------------------------------------------
+# The roadmap's Stage 55 limitations promised: "--color=always / never /
+# auto CLI flag integration. That's a Stage 56+ concern (std.progress and
+# std.log will integrate with this detector via their own CLI flags)."
+# This enum IS that surface for std.progress: apps parse their own
+# --color flag and pass the mode here; the library resolves it to a
+# std.color ColorLevel at draw time.
+#
+#   * Auto   — color only when stderr (the draw stream) is a TTY.
+#   * Always — force color (the std.color env detector still applies
+#              for the LEVEL: NO_COLOR / FORCE_COLOR / COLORTERM...).
+#   * Never  — no escape sequences at all (ColorLevel.None).
+
+enum ProgressColor {
+    ProgressColorAuto,     # 0 — color iff stderr is a TTY
+    ProgressColorAlways,   # 1 — force color on
+    ProgressColorNever,    # 2 — force color off
+}
+
+# progress_color_eq(a, b) — equality (HLS enums have no ==; the
+# repo-wide convention is a match-based eq helper, e.g. color_level_eq).
+fn progress_color_eq(a: ProgressColor, b: ProgressColor) -> bool {
+    return match a {
+        ProgressColor.ProgressColorAuto =>
+            match b { ProgressColor.ProgressColorAuto => true, _ => false },
+        ProgressColor.ProgressColorAlways =>
+            match b { ProgressColor.ProgressColorAlways => true, _ => false },
+        ProgressColor.ProgressColorNever =>
+            match b { ProgressColor.ProgressColorNever => true, _ => false },
+    }
+}
+
+# progress_color_to_int(mode) — encode as 0..2 (stable, comparable).
+fn progress_color_to_int(mode: ProgressColor) -> int {
+    return match mode {
+        ProgressColor.ProgressColorAuto => 0,
+        ProgressColor.ProgressColorAlways => 1,
+        ProgressColor.ProgressColorNever => 2,
+    }
+}
+
+# progress_color_from_int(i) — decode 0..2. Panics on out-of-range
+# (same convention as color_level_from_int).
+fn progress_color_from_int(i: int) -> ProgressColor {
+    if i == 0 { return ProgressColor.ProgressColorAuto }
+    if i == 1 { return ProgressColor.ProgressColorAlways }
+    if i == 2 { return ProgressColor.ProgressColorNever }
+    panic("progress_color_from_int: expected 0..2 (auto / always / never), got " + i.to_str())
+}
+
+# progress_color_name(mode) — short lowercase name.
+fn progress_color_name(mode: ProgressColor) -> str {
+    return match mode {
+        ProgressColor.ProgressColorAuto => "auto",
+        ProgressColor.ProgressColorAlways => "always",
+        ProgressColor.ProgressColorNever => "never",
+    }
+}
+
+# progress_color_from_str(s) — parse a --color=<value> CLI flag value
+# (case-insensitive). "always" / "never" / "auto". Anything else
+# (including "") maps to Auto — a CLI library's unknown value should
+# error to the USER; the progress library stays lenient (the caller
+# has already decided what to do with the flag).
+fn progress_color_from_str(s: str) -> ProgressColor {
+    let v: str = str_to_lower_ascii(s)
+    if v == "always" { return ProgressColor.ProgressColorAlways }
+    if v == "never" { return ProgressColor.ProgressColorNever }
+    return ProgressColor.ProgressColorAuto
+}
+
+# ----------------------------------------------------------------------------
+# SpinnerStyle — 8 built-in spinner styles.
+# ----------------------------------------------------------------------------
+# Each style is a fixed frame table (index = tick_pos modulo the frame
+# count). The braille and box styles use multi-byte UTF-8 frames —
+# string values are byte strings in HLS, so a frame is simply a str of
+# 1..N bytes; the renderer places ONE frame per line (no per-byte
+# geometry), so multi-byte frames are safe (byte-identical between the
+# interpreter and the native binary).
+
+enum SpinnerStyle {
+    SpinnerDots,        # 0 — braille dots (10 frames) — the modern default
+    SpinnerLine,        # 1 — - \ | / (4 frames) — max compatibility
+    SpinnerDotsAscii,   # 2 — . o O @ * (5 frames) — pure ASCII
+    SpinnerArrow,       # 3 — ← ↖ ↑ ↗ → ↘ ↓ ↙ (8 frames)
+    SpinnerBounce,      # 4 — ▁▂▃▄▅▆▇█ (8 frames)
+    SpinnerToggle,      # 5 — ■ □ ▪ ▫ (4 frames)
+    SpinnerTriangle,    # 6 — ◢ ◣ ◤ ◥ (4 frames)
+    SpinnerPipe,        # 7 — ┃ ┆ ┈ ┊ (4 frames)
+}
+
+# spinner_style_eq(a, b) — match-based equality.
+fn spinner_style_eq(a: SpinnerStyle, b: SpinnerStyle) -> bool {
+    return match a {
+        SpinnerStyle.SpinnerDots =>
+            match b { SpinnerStyle.SpinnerDots => true, _ => false },
+        SpinnerStyle.SpinnerLine =>
+            match b { SpinnerStyle.SpinnerLine => true, _ => false },
+        SpinnerStyle.SpinnerDotsAscii =>
+            match b { SpinnerStyle.SpinnerDotsAscii => true, _ => false },
+        SpinnerStyle.SpinnerArrow =>
+            match b { SpinnerStyle.SpinnerArrow => true, _ => false },
+        SpinnerStyle.SpinnerBounce =>
+            match b { SpinnerStyle.SpinnerBounce => true, _ => false },
+        SpinnerStyle.SpinnerToggle =>
+            match b { SpinnerStyle.SpinnerToggle => true, _ => false },
+        SpinnerStyle.SpinnerTriangle =>
+            match b { SpinnerStyle.SpinnerTriangle => true, _ => false },
+        SpinnerStyle.SpinnerPipe =>
+            match b { SpinnerStyle.SpinnerPipe => true, _ => false },
+    }
+}
+
+# spinner_style_to_int(style) — encode as 0..7 (stable, comparable).
+fn spinner_style_to_int(style: SpinnerStyle) -> int {
+    return match style {
+        SpinnerStyle.SpinnerDots => 0,
+        SpinnerStyle.SpinnerLine => 1,
+        SpinnerStyle.SpinnerDotsAscii => 2,
+        SpinnerStyle.SpinnerArrow => 3,
+        SpinnerStyle.SpinnerBounce => 4,
+        SpinnerStyle.SpinnerToggle => 5,
+        SpinnerStyle.SpinnerTriangle => 6,
+        SpinnerStyle.SpinnerPipe => 7,
+    }
+}
+
+# spinner_style_from_int(i) — decode 0..7. Panics on out-of-range.
+fn spinner_style_from_int(i: int) -> SpinnerStyle {
+    if i == 0 { return SpinnerStyle.SpinnerDots }
+    if i == 1 { return SpinnerStyle.SpinnerLine }
+    if i == 2 { return SpinnerStyle.SpinnerDotsAscii }
+    if i == 3 { return SpinnerStyle.SpinnerArrow }
+    if i == 4 { return SpinnerStyle.SpinnerBounce }
+    if i == 5 { return SpinnerStyle.SpinnerToggle }
+    if i == 6 { return SpinnerStyle.SpinnerTriangle }
+    if i == 7 { return SpinnerStyle.SpinnerPipe }
+    panic("spinner_style_from_int: expected 0..7, got " + i.to_str())
+}
+
+# spinner_style_name(style) — short lowercase name (CLI-friendly).
+fn spinner_style_name(style: SpinnerStyle) -> str {
+    return match style {
+        SpinnerStyle.SpinnerDots => "dots",
+        SpinnerStyle.SpinnerLine => "line",
+        SpinnerStyle.SpinnerDotsAscii => "dots-ascii",
+        SpinnerStyle.SpinnerArrow => "arrow",
+        SpinnerStyle.SpinnerBounce => "bounce",
+        SpinnerStyle.SpinnerToggle => "toggle",
+        SpinnerStyle.SpinnerTriangle => "triangle",
+        SpinnerStyle.SpinnerPipe => "pipe",
+    }
+}
+
+# spinner_style_from_name(name) — parse a --spinner=<name> value
+# (case-insensitive). Unknown names return the plain SpinnerLine (the
+# most compatible style) — the same lenient-parse convention as
+# progress_color_from_str.
+fn spinner_style_from_name(name: str) -> SpinnerStyle {
+    let v: str = str_to_lower_ascii(name)
+    if v == "dots" { return SpinnerStyle.SpinnerDots }
+    if v == "line" { return SpinnerStyle.SpinnerLine }
+    if v == "dots-ascii" || v == "ascii" { return SpinnerStyle.SpinnerDotsAscii }
+    if v == "arrow" { return SpinnerStyle.SpinnerArrow }
+    if v == "bounce" { return SpinnerStyle.SpinnerBounce }
+    if v == "toggle" { return SpinnerStyle.SpinnerToggle }
+    if v == "triangle" { return SpinnerStyle.SpinnerTriangle }
+    if v == "pipe" { return SpinnerStyle.SpinnerPipe }
+    return SpinnerStyle.SpinnerLine
+}
+
+# spinner_frame_count(style) — the number of frames in the cycle.
+fn spinner_frame_count(style: SpinnerStyle) -> int {
+    return match style {
+        SpinnerStyle.SpinnerDots => 10,
+        SpinnerStyle.SpinnerLine => 4,
+        SpinnerStyle.SpinnerDotsAscii => 5,
+        SpinnerStyle.SpinnerArrow => 8,
+        SpinnerStyle.SpinnerBounce => 8,
+        SpinnerStyle.SpinnerToggle => 4,
+        SpinnerStyle.SpinnerTriangle => 4,
+        SpinnerStyle.SpinnerPipe => 4,
+    }
+}
+
+# spinner_frame(style, i) — the i-th frame (wraps modulo the frame
+# count; negative i is clamped to 0 — the module never produces it,
+# but the function stays total for external callers).
+#
+# Implementation note: HLS `match` requires an ENUM scrutinee (SPEC
+# §7 — int-literal arms are not a thing), so the per-frame dispatch
+# is a match on the STYLE (enum ✓) delegating to tiny per-style
+# helpers that select the frame with an if-chain on the wrapped
+# index. Zero allocation, no intermediate list.
+fn spinner_frame(style: SpinnerStyle, i: int) -> str {
+    if i < 0 {
+        return spinner_frame(style, 0)
+    }
+    let n: int = spinner_frame_count(style)
+    let idx: int = i - (i / n) * n
+    return match style {
+        SpinnerStyle.SpinnerDots => spinner_dots_frame(idx),
+        SpinnerStyle.SpinnerLine => spinner_line_frame(idx),
+        SpinnerStyle.SpinnerDotsAscii => spinner_ascii_frame(idx),
+        SpinnerStyle.SpinnerArrow => spinner_arrow_frame(idx),
+        SpinnerStyle.SpinnerBounce => spinner_bounce_frame(idx),
+        SpinnerStyle.SpinnerToggle => spinner_toggle_frame(idx),
+        SpinnerStyle.SpinnerTriangle => spinner_triangle_frame(idx),
+        SpinnerStyle.SpinnerPipe => spinner_pipe_frame(idx),
+    }
+}
+
+# spinner_dots_frame(idx) — braille dots: ⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏ (10 frames).
+fn spinner_dots_frame(idx: int) -> str {
+    if idx == 0 { return "⠋" }
+    if idx == 1 { return "⠙" }
+    if idx == 2 { return "⠹" }
+    if idx == 3 { return "⠸" }
+    if idx == 4 { return "⠼" }
+    if idx == 5 { return "⠴" }
+    if idx == 6 { return "⠦" }
+    if idx == 7 { return "⠧" }
+    if idx == 8 { return "⠇" }
+    return "⠏"
+}
+
+# spinner_line_frame(idx) — - \ | / (4 frames, max compatibility).
+fn spinner_line_frame(idx: int) -> str {
+    if idx == 0 { return "-" }
+    if idx == 1 { return "\\" }
+    if idx == 2 { return "|" }
+    return "/"
+}
+
+# spinner_ascii_frame(idx) — . o O @ * (5 frames, pure ASCII).
+fn spinner_ascii_frame(idx: int) -> str {
+    if idx == 0 { return "." }
+    if idx == 1 { return "o" }
+    if idx == 2 { return "O" }
+    if idx == 3 { return "@" }
+    return "*"
+}
+
+# spinner_arrow_frame(idx) — ← ↖ ↑ ↗ → ↘ ↓ ↙ (8 frames).
+fn spinner_arrow_frame(idx: int) -> str {
+    if idx == 0 { return "←" }
+    if idx == 1 { return "↖" }
+    if idx == 2 { return "↑" }
+    if idx == 3 { return "↗" }
+    if idx == 4 { return "→" }
+    if idx == 5 { return "↘" }
+    if idx == 6 { return "↓" }
+    return "↙"
+}
+
+# spinner_bounce_frame(idx) — ▁▂▃▄▅▆▇█ (8 frames).
+fn spinner_bounce_frame(idx: int) -> str {
+    if idx == 0 { return "▁" }
+    if idx == 1 { return "▂" }
+    if idx == 2 { return "▃" }
+    if idx == 3 { return "▄" }
+    if idx == 4 { return "▅" }
+    if idx == 5 { return "▆" }
+    if idx == 6 { return "▇" }
+    return "█"
+}
+
+# spinner_toggle_frame(idx) — ■ □ ▪ ▫ (4 frames).
+fn spinner_toggle_frame(idx: int) -> str {
+    if idx == 0 { return "■" }
+    if idx == 1 { return "□" }
+    if idx == 2 { return "▪" }
+    return "▫"
+}
+
+# spinner_triangle_frame(idx) — ◢ ◣ ◤ ◥ (4 frames).
+fn spinner_triangle_frame(idx: int) -> str {
+    if idx == 0 { return "◢" }
+    if idx == 1 { return "◣" }
+    if idx == 2 { return "◤" }
+    return "◥"
+}
+
+# spinner_pipe_frame(idx) — ┃ ┆ ┈ ┊ (4 frames).
+fn spinner_pipe_frame(idx: int) -> str {
+    if idx == 0 { return "┃" }
+    if idx == 1 { return "┆" }
+    if idx == 2 { return "┈" }
+    return "┊"
+}
+
+# spinner_frames_preview(style) — all frames of the cycle joined with
+# spaces (for CLI help text / the test suite: "dots: ⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏").
+fn spinner_frames_preview(style: SpinnerStyle) -> str {
+    let parts: list[str] = []
+    let n: int = spinner_frame_count(style)
+    let mut i: int = 0
+    while i < n {
+        parts.push(spinner_frame(style, i))
+        i = i + 1
+    }
+    return join(parts, " ")
+}
+
+# ----------------------------------------------------------------------------
+# ProgressBar — the bar value.
+# ----------------------------------------------------------------------------
+# FIXED-SIZE STATE (the "zero allocation after creation" contract):
+#   * 16 scalar fields — inc / set_position / tick / set_message /
+#     start / finish_state write them in place.
+#   * `cells` — the pre-allocated bar interior (exactly `width`
+#     entries, created once by progress_new / progress_with_width).
+#     Every monochrome render overwrites cells in place via
+#     list.set (a refcount swap — no allocation) and materialises
+#     the body with ONE join. Colored renders build the two spans
+#     with str_repeat (O(n), one allocation per span) — colored
+#     drawing only happens when the terminal supports it, at most
+#     once per steady_ms window.
+#
+# `start_ns` semantics: 0 = not started (elapsed renders as 0s, ETA
+# unknown). progress_start() stamps instant_now_ns() ONCE (re-calls
+# are no-ops). The PURE functions take now_ns as an argument so
+# tests can render with synthetic times.
+
+struct ProgressBar {
+    label: str,             # prefix ("Downloading") — "" omits it
+    msg: str,               # suffix message ("file2.dat") — "" omits it
+    total: int,             # total units; >0 determinate, 0 indeterminate
+    position: int,          # completed units (0..total; clamped)
+    width: int,             # bar interior width in cells
+    start_ns: int,          # instant_now_ns() at progress_start; 0 = not started
+    tick_pos: int,          # spinner frame index (indeterminate bars)
+    tick_count: int,        # total spinner ticks so far
+    filled_char: str,       # determinate bar filled cell (default "#")
+    empty_char: str,        # determinate bar empty cell (default "-")
+    head_char: str,         # leading-edge cell ("" = off; e.g. ">" / "▓")
+    spinner: SpinnerStyle,  # indeterminate spinner style
+    color: ProgressColor,   # auto / always / never (the --color surface)
+    steady_ms: int,         # min ms between actual redraws (0 = every call)
+    last_draw_ns: int,      # instant of the last actual redraw
+    draws: int,             # count of actual redraws (diagnostics)
+    finished: bool,         # finish() was called (position pinned to total)
+    finished_msg: str,      # message shown on the final line ("" = keep msg)
+    cells: list[str],       # PRE-ALLOCATED interior (length == width)
+}
+
+# progress_new(total) — the roadmap's ProgressBar::new(total).
+# total > 0: a determinate bar (fraction + percent + ETA).
+# total == 0: an indeterminate spinner (frame + ticks + elapsed).
+# total < 0: panic (a negative total is a caller bug).
+fn progress_new(total: int) -> ProgressBar {
+    if total < 0 {
+        panic("progress_new: total must be >= 0 (0 = indeterminate spinner bar), got " + total.to_str())
+    }
+    let cells: list[str] = []
+    let mut i: int = 0
+    while i < progress_default_width() {
+        cells.push("-")
+        i = i + 1
+    }
+    return ProgressBar {
+        label: "",
+        msg: "",
+        total: total,
+        position: 0,
+        width: progress_default_width(),
+        start_ns: 0,
+        tick_pos: 0,
+        tick_count: 0,
+        filled_char: "#",
+        empty_char: "-",
+        head_char: "",
+        spinner: SpinnerStyle.SpinnerLine,
+        color: ProgressColor.ProgressColorAuto,
+        steady_ms: progress_default_steady_ms(),
+        last_draw_ns: 0,
+        draws: 0,
+        finished: false,
+        finished_msg: "",
+        cells: cells,
+    }
+}
+
+# ----------------------------------------------------------------------------
+# Builders (immutable-update form — each returns the bar with one
+# field changed, the same convention as cstyle_fg / style_bold).
+# Builders may (re-)allocate `cells` (progress_with_width) — call them
+# BEFORE the hot loop; the zero-alloc contract starts once the bar is
+# configured.
+# ----------------------------------------------------------------------------
+
+# progress_with_label(pb, label) — the prefix shown before the bar.
+# Constructs a FRESH struct (immutable update — the receiver is
+# unchanged), the same convention as cstyle_fg. The cells list is
+# shared (scratch state — full overwrites only, so aliasing is safe).
+fn progress_with_label(pb: ProgressBar, label: str) -> ProgressBar {
+    return ProgressBar {
+        label: label, msg: pb.msg, total: pb.total, position: pb.position,
+        width: pb.width, start_ns: pb.start_ns, tick_pos: pb.tick_pos,
+        tick_count: pb.tick_count, filled_char: pb.filled_char,
+        empty_char: pb.empty_char, head_char: pb.head_char,
+        spinner: pb.spinner, color: pb.color, steady_ms: pb.steady_ms,
+        last_draw_ns: pb.last_draw_ns, draws: pb.draws,
+        finished: pb.finished, finished_msg: pb.finished_msg,
+        cells: pb.cells,
+    }
+}
+
+# progress_with_message(pb, msg) — the suffix shown after the bar.
+fn progress_with_message(pb: ProgressBar, msg: str) -> ProgressBar {
+    return ProgressBar {
+        label: pb.label, msg: msg, total: pb.total, position: pb.position,
+        width: pb.width, start_ns: pb.start_ns, tick_pos: pb.tick_pos,
+        tick_count: pb.tick_count, filled_char: pb.filled_char,
+        empty_char: pb.empty_char, head_char: pb.head_char,
+        spinner: pb.spinner, color: pb.color, steady_ms: pb.steady_ms,
+        last_draw_ns: pb.last_draw_ns, draws: pb.draws,
+        finished: pb.finished, finished_msg: pb.finished_msg,
+        cells: pb.cells,
+    }
+}
+
+# progress_with_width(pb, width) — the bar interior width in cells.
+# width < 1 panics. Re-allocates the cell list (the only builder that
+# allocates — documented above).
+fn progress_with_width(pb: ProgressBar, width: int) -> ProgressBar {
+    if width < 1 {
+        panic("progress_with_width: width must be >= 1, got " + width.to_str())
+    }
+    if width > 512 {
+        panic("progress_with_width: width must be <= 512 (a bar wider than any terminal), got " + width.to_str())
+    }
+    let cells: list[str] = []
+    let mut i: int = 0
+    while i < width {
+        cells.push("-")
+        i = i + 1
+    }
+    return ProgressBar {
+        label: pb.label, msg: pb.msg, total: pb.total, position: pb.position,
+        width: width, start_ns: pb.start_ns, tick_pos: pb.tick_pos,
+        tick_count: pb.tick_count, filled_char: pb.filled_char,
+        empty_char: pb.empty_char, head_char: pb.head_char,
+        spinner: pb.spinner, color: pb.color, steady_ms: pb.steady_ms,
+        last_draw_ns: pb.last_draw_ns, draws: pb.draws,
+        finished: pb.finished, finished_msg: pb.finished_msg,
+        cells: cells,
+    }
+}
+
+# progress_with_chars(pb, filled, empty) — the determinate bar cells.
+# Each cell may be any non-empty str; ONE cell renders one terminal
+# column for single-width glyphs (multi-byte UTF-8 like "█" / "▓" / "░"
+# is fine — the geometry counts CELLS, not bytes). Empty strings panic
+# (an empty cell would break the fixed-width interior).
+fn progress_with_chars(pb: ProgressBar, filled: str, empty: str) -> ProgressBar {
+    if filled.len() == 0 {
+        panic("progress_with_chars: filled must be a non-empty str")
+    }
+    if empty.len() == 0 {
+        panic("progress_with_chars: empty must be a non-empty str")
+    }
+    return ProgressBar {
+        label: pb.label, msg: pb.msg, total: pb.total, position: pb.position,
+        width: pb.width, start_ns: pb.start_ns, tick_pos: pb.tick_pos,
+        tick_count: pb.tick_count, filled_char: filled,
+        empty_char: empty, head_char: pb.head_char,
+        spinner: pb.spinner, color: pb.color, steady_ms: pb.steady_ms,
+        last_draw_ns: pb.last_draw_ns, draws: pb.draws,
+        finished: pb.finished, finished_msg: pb.finished_msg,
+        cells: pb.cells,
+    }
+}
+
+# progress_with_head(pb, head) — the leading-edge cell at the boundary
+# between filled and empty ("" disables it; e.g. ">" or "▓"). When set,
+# the last FILLED cell is the head — the classic "####>" edge.
+fn progress_with_head(pb: ProgressBar, head: str) -> ProgressBar {
+    return ProgressBar {
+        label: pb.label, msg: pb.msg, total: pb.total, position: pb.position,
+        width: pb.width, start_ns: pb.start_ns, tick_pos: pb.tick_pos,
+        tick_count: pb.tick_count, filled_char: pb.filled_char,
+        empty_char: pb.empty_char, head_char: head,
+        spinner: pb.spinner, color: pb.color, steady_ms: pb.steady_ms,
+        last_draw_ns: pb.last_draw_ns, draws: pb.draws,
+        finished: pb.finished, finished_msg: pb.finished_msg,
+        cells: pb.cells,
+    }
+}
+
+# progress_with_spinner(pb, style) — the indeterminate spinner style.
+fn progress_with_spinner(pb: ProgressBar, style: SpinnerStyle) -> ProgressBar {
+    return ProgressBar {
+        label: pb.label, msg: pb.msg, total: pb.total, position: pb.position,
+        width: pb.width, start_ns: pb.start_ns, tick_pos: pb.tick_pos,
+        tick_count: pb.tick_count, filled_char: pb.filled_char,
+        empty_char: pb.empty_char, head_char: pb.head_char,
+        spinner: style, color: pb.color, steady_ms: pb.steady_ms,
+        last_draw_ns: pb.last_draw_ns, draws: pb.draws,
+        finished: pb.finished, finished_msg: pb.finished_msg,
+        cells: pb.cells,
+    }
+}
+
+# progress_with_color(pb, mode) — the --color=always/never/auto mode.
+fn progress_with_color(pb: ProgressBar, mode: ProgressColor) -> ProgressBar {
+    return ProgressBar {
+        label: pb.label, msg: pb.msg, total: pb.total, position: pb.position,
+        width: pb.width, start_ns: pb.start_ns, tick_pos: pb.tick_pos,
+        tick_count: pb.tick_count, filled_char: pb.filled_char,
+        empty_char: pb.empty_char, head_char: pb.head_char,
+        spinner: pb.spinner, color: mode, steady_ms: pb.steady_ms,
+        last_draw_ns: pb.last_draw_ns, draws: pb.draws,
+        finished: pb.finished, finished_msg: pb.finished_msg,
+        cells: pb.cells,
+    }
+}
+
+# progress_with_steady(pb, ms) — the redraw rate limiter. 0 disables
+# rate limiting (every draw call redraws); the default is 100ms.
+fn progress_with_steady(pb: ProgressBar, ms: int) -> ProgressBar {
+    if ms < 0 {
+        panic("progress_with_steady: ms must be >= 0, got " + ms.to_str())
+    }
+    return ProgressBar {
+        label: pb.label, msg: pb.msg, total: pb.total, position: pb.position,
+        width: pb.width, start_ns: pb.start_ns, tick_pos: pb.tick_pos,
+        tick_count: pb.tick_count, filled_char: pb.filled_char,
+        empty_char: pb.empty_char, head_char: pb.head_char,
+        spinner: pb.spinner, color: pb.color, steady_ms: ms,
+        last_draw_ns: pb.last_draw_ns, draws: pb.draws,
+        finished: pb.finished, finished_msg: pb.finished_msg,
+        cells: pb.cells,
+    }
+}
+
+# ----------------------------------------------------------------------------
+# State updates (PURE — no effects, no allocation).
+# ----------------------------------------------------------------------------
+
+# progress_inc(pb, delta) — advance the position by delta (clamped to
+# 0..total). Negative deltas move backwards (still clamped).
+fn progress_inc(mut pb: ProgressBar, delta: int) -> void {
+    progress_set_position(pb, pb.position + delta)
+}
+
+# progress_set_position(pb, pos) — set the position (clamped to 0..total).
+fn progress_set_position(mut pb: ProgressBar, pos: int) -> void {
+    if pos < 0 {
+        pb.position = 0
+        return
+    }
+    if pos > pb.total {
+        pb.position = pb.total
+        return
+    }
+    pb.position = pos
+}
+
+# progress_set_message(pb, msg) — update the suffix message.
+fn progress_set_message(mut pb: ProgressBar, msg: str) -> void {
+    pb.msg = msg
+}
+
+# progress_tick(pb) — advance the spinner frame + count (pure state
+# update; the live form is progress_tick_draw).
+fn progress_tick(mut pb: ProgressBar) -> void {
+    pb.tick_count = pb.tick_count + 1
+    let n: int = spinner_frame_count(pb.spinner)
+    pb.tick_pos = pb.tick_pos + 1
+    if pb.tick_pos >= n {
+        pb.tick_pos = 0
+    }
+}
+
+# progress_start(pb) — stamp the monotonic start instant (ONCE; a
+# second call is a no-op — restarting a bar mid-flight would corrupt
+# the elapsed/ETA baseline). Carries Clock (reads the monotonic clock).
+fn progress_start(mut pb: ProgressBar) -> void uses Clock {
+    if pb.start_ns == 0 {
+        pb.start_ns = instant_now_ns()
+    }
+}
+
+# progress_finish_state(pb, msg) — mark the bar finished (position
+# pinned to total; the final line shows "done in <elapsed>"). msg
+# overrides the suffix on the final line ("" keeps the current msg).
+# PURE state update; the live form is progress_finish / finish_with.
+fn progress_finish_state(mut pb: ProgressBar, msg: str) -> void {
+    pb.finished = true
+    if pb.total > 0 {
+        pb.position = pb.total
+    }
+    if msg != "" {
+        pb.finished_msg = msg
+    }
+}
+
+# ----------------------------------------------------------------------------
+# Accessors (PURE).
+# ----------------------------------------------------------------------------
+
+# progress_position(pb) — the completed units (0..total).
+fn progress_position(pb: ProgressBar) -> int { return pb.position }
+
+# progress_total(pb) — the total units (0 = indeterminate).
+fn progress_total(pb: ProgressBar) -> int { return pb.total }
+
+# progress_label(pb) — the prefix label.
+fn progress_label(pb: ProgressBar) -> str { return pb.label }
+
+# progress_is_finished(pb) — did finish() run?
+fn progress_is_finished(pb: ProgressBar) -> bool { return pb.finished }
+
+# progress_tick_count(pb) — total spinner ticks so far.
+fn progress_tick_count(pb: ProgressBar) -> int { return pb.tick_count }
+
+# progress_draw_count(pb) — actual redraws performed (diagnostics:
+# proves the rate limiter suppressed the suppressed draws).
+fn progress_draw_count(pb: ProgressBar) -> int { return pb.draws }
+
+# progress_percent(pb) — 0..100 (integer, truncated). Indeterminate
+# bars return -1 (there is no fraction to show). The multiply is
+# overflow-guarded: position*100 fits for every sane total, and
+# absurd totals (> INT64_MAX/100) fall back to a divide-first
+# approximation (still 0..100, off by at most 1 point).
+fn progress_percent(pb: ProgressBar) -> int {
+    if pb.total <= 0 {
+        return -1
+    }
+    if pb.position >= pb.total {
+        return 100
+    }
+    if pb.position > progress_int64_max() / 100 {
+        return pb.position / (pb.total / 100 + 1)
+    }
+    return pb.position * 100 / pb.total
+}
+
+# progress_elapsed_ns(pb, now_ns) — elapsed nanoseconds (0 when not
+# started; a now BEFORE start clamps to 0 — the clock never runs
+# backwards in the render).
+fn progress_elapsed_ns(pb: ProgressBar, now_ns: int) -> int {
+    if pb.start_ns == 0 {
+        return 0
+    }
+    let d: int = now_ns - pb.start_ns
+    if d < 0 {
+        return 0
+    }
+    return d
+}
+
+# progress_eta_secs(pb, now_ns) — the linear ETA estimate
+# elapsed_secs * remaining / position, in SECONDS. Integer-only
+# (byte-identical between interpreter and native). Returns:
+#   * -1 — unknown: not started, position 0 (no rate yet), elapsed
+#     < 1s (not enough data), or the multiply would overflow int64.
+#     The renderer shows "eta ?".
+#   *  0 — nothing left (position >= total).
+fn progress_eta_secs(pb: ProgressBar, now_ns: int) -> int {
+    if pb.total <= 0 {
+        return -1
+    }
+    if pb.position >= pb.total {
+        return 0
+    }
+    if pb.position <= 0 {
+        return -1
+    }
+    let elapsed_ns: int = progress_elapsed_ns(pb, now_ns)
+    if elapsed_ns <= 0 {
+        return -1
+    }
+    let elapsed_secs: int = elapsed_ns / 1000000000
+    if elapsed_secs == 0 {
+        return -1
+    }
+    let remaining: int = pb.total - pb.position
+    # Overflow guard: elapsed_secs * remaining must fit in int64.
+    # (A 30-year elapsed on a 9e18-unit total would overflow; the
+    # honest answer for such scales is "unknown", not a wrapped
+    # negative number.)
+    if remaining > progress_int64_max() / elapsed_secs {
+        return -1
+    }
+    return (elapsed_secs * remaining) / pb.position
+}
+
+# progress_rate_per_sec(pb, now_ns) — units per whole second (0 when
+# there is no elapsed data or the elapsed is still sub-second — a
+# 0.4s elapsed would otherwise report an inflated 2.5x rate).
+fn progress_rate_per_sec(pb: ProgressBar, now_ns: int) -> int {
+    let elapsed_ns: int = progress_elapsed_ns(pb, now_ns)
+    if elapsed_ns <= 0 {
+        return 0
+    }
+    let elapsed_secs: int = elapsed_ns / 1000000000
+    if elapsed_secs == 0 {
+        return 0
+    }
+    return pb.position / elapsed_secs
+}
+
+# ----------------------------------------------------------------------------
+# Duration / percent formatting (PURE).
+# ----------------------------------------------------------------------------
+
+# progress_pad2(n) — zero-pad 0..99 to two digits ("07").
+fn progress_pad2(n: int) -> str {
+    return str_pad_left(n.to_str(), 2, "0")
+}
+
+# progress_format_secs(s) — compact human duration:
+#   < 60      "45s"
+#   < 3600    "3m12s"
+#   < 86400   "2h05m"
+#   >= 86400  "4d03h"
+# Negative values render as "?" (the unknown ETA marker).
+fn progress_format_secs(s: int) -> str {
+    if s < 0 {
+        return "?"
+    }
+    if s < 60 {
+        return s.to_str() + "s"
+    }
+    if s < 3600 {
+        return (s / 60).to_str() + "m" + progress_pad2(s - (s / 60) * 60) + "s"
+    }
+    if s < 86400 {
+        return (s / 3600).to_str() + "h" + progress_pad2((s - (s / 3600) * 3600) / 60) + "m"
+    }
+    return (s / 86400).to_str() + "d" + progress_pad2((s - (s / 86400) * 86400) / 3600) + "h"
+}
+
+# progress_format_eta(eta_secs) — the "eta X" value: "?" for the
+# unknown (-1 / -2 / any negative), otherwise progress_format_secs.
+fn progress_format_eta(eta_secs: int) -> str {
+    if eta_secs < 0 {
+        return "?"
+    }
+    return progress_format_secs(eta_secs)
+}
+
+# progress_format_percent(pct) — right-aligned 3-wide + "%":
+# "  0%", " 42%", "100%". Indeterminate (-1) renders as " --%"
+# (a fixed-width placeholder so lines stay aligned).
+fn progress_format_percent(pct: int) -> str {
+    if pct < 0 {
+        return " --%"
+    }
+    if pct > 100 {
+        return "100%"
+    }
+    return str_pad_left(pct.to_str(), 3, " ") + "%"
+}
+
+# ----------------------------------------------------------------------------
+# Rendering (PURE — the differential-safe core).
+# ----------------------------------------------------------------------------
+# progress_render(pb, level, now_ns) materialises the full line as a
+# str (no trailing newline, no \r — the live draw adds those). Every
+# input is explicit: the ColorLevel and the time come in as arguments,
+# so the same bar renders byte-identically in the interpreter and the
+# native binary.
+#
+# Line layouts (parts joined with single spaces; empty parts skipped):
+#   determinate, running:   label [bar] 42% eta 12s 33/s msg
+#   determinate, finished:  label [bar] 100% done in 3s msg
+#   indeterminate, running: label <frame> N ticks msg 3s
+#   indeterminate, finished: label done in 3s (N ticks)
+#
+# The layout deliberately avoids trailing spaces (empty parts are
+# skipped, not blank-padded) so a captured log of forced draws stays
+# clean, and every part is a fixed-width token where alignment matters
+# (percent is 3-wide, durations are compact).
+
+# progress_style_filled() — the filled span style: green fg.
+fn progress_style_filled() -> ColorStyle {
+    return cstyle_fg(cstyle_new(), color_green())
+}
+
+# progress_style_done() — the finished-line style: bold green.
+fn progress_style_done() -> ColorStyle {
+    return cstyle_bold(cstyle_fg(cstyle_new(), color_green()))
+}
+
+# progress_style_frame() — the spinner frame style: cyan fg.
+fn progress_style_frame() -> ColorStyle {
+    return cstyle_fg(cstyle_new(), color_cyan())
+}
+
+# progress_filled_cells(pb) — the number of filled cells in the
+# interior (0..width). A finished determinate bar is always full.
+fn progress_filled_cells(pb: ProgressBar) -> int {
+    if pb.total <= 0 {
+        return 0
+    }
+    if pb.finished || pb.position >= pb.total {
+        return pb.width
+    }
+    let f: int = pb.width * pb.position / pb.total
+    if f < 0 {
+        return 0
+    }
+    if f > pb.width {
+        return pb.width
+    }
+    return f
+}
+
+# progress_fill_cells(pb, filled) — overwrite the PRE-ALLOCATED cell
+# list in place (refcount swaps — zero allocation). The head char, if
+# set, replaces the LAST filled cell.
+fn progress_fill_cells(mut pb: ProgressBar, filled: int) -> void {
+    let mut i: int = 0
+    while i < pb.width {
+        if i < filled {
+            if pb.head_char != "" && i == filled - 1 {
+                pb.cells.set(i, pb.head_char)
+            } else {
+                pb.cells.set(i, pb.filled_char)
+            }
+        } else {
+            pb.cells.set(i, pb.empty_char)
+        }
+        i = i + 1
+    }
+}
+
+# progress_bar_part(pb, level) — the bracketed interior "[####----]".
+# Monochrome (ColorNone): ONE join over the pre-allocated cells — the
+# zero-alloc-after-creation render path.
+# Colored (Basic+): the filled span (incl. head) renders green via
+# std.color, the empty span stays default — two str_repeat spans
+# (O(n), bounded, at most once per steady_ms redraw).
+fn progress_bar_part(pb: ProgressBar, level: ColorLevel) -> str {
+    let f: int = progress_filled_cells(pb)
+    if color_level_ge(level, ColorLevel.ColorBasic) {
+        let mut filled: str = str_repeat(pb.filled_char, f)
+        if pb.head_char != "" && f > 0 {
+            filled = str_repeat(pb.filled_char, f - 1) + pb.head_char
+        }
+        let empty: str = str_repeat(pb.empty_char, pb.width - f)
+        return "[" + color_render(filled, progress_style_filled(), level)
+            + empty + "]"
+    }
+    progress_fill_cells(pb, f)
+    return "[" + join(pb.cells, "") + "]"
+}
+
+# progress_render(pb, level, now_ns) — the complete line (pure).
+fn progress_render(pb: ProgressBar, level: ColorLevel, now_ns: int) -> str {
+    let parts: list[str] = []
+    if pb.label != "" {
+        parts.push(pb.label)
+    }
+    let elapsed_ns: int = progress_elapsed_ns(pb, now_ns)
+    let elapsed_secs: int = elapsed_ns / 1000000000
+
+    if pb.finished {
+        # ---- finished (determinate and indeterminate share the shape) ----
+        if pb.total > 0 {
+            parts.push(progress_bar_part(pb, level))
+            parts.push(progress_format_percent(100))
+        }
+        # The "done in X" span is bold+green — but at ColorNone the
+        # monochrome line stays COMPLETELY escape-free (a TERM=dumb
+        # terminal shows raw ESC bytes as garbage), so the style is
+        # applied only when the level supports attributes AND colors
+        # (>= Basic; std.color keeps attrs at None by SGR spec — the
+        # module overrides that here for log cleanliness).
+        if color_level_ge(level, ColorLevel.ColorBasic) {
+            parts.push(color_render("done in " + progress_format_secs(elapsed_secs),
+                progress_style_done(), level))
+        } else {
+            parts.push("done in " + progress_format_secs(elapsed_secs))
+        }
+        if pb.total <= 0 {
+            if pb.tick_count == 1 {
+                parts.push("(1 tick)")
+            } else {
+                parts.push("(" + pb.tick_count.to_str() + " ticks)")
+            }
+        }
+        if pb.finished_msg != "" {
+            parts.push(pb.finished_msg)
+        } else if pb.msg != "" {
+            parts.push(pb.msg)
+        }
+        return join(parts, " ")
+    }
+
+    if pb.total > 0 {
+        # ---- determinate, running ----
+        parts.push(progress_bar_part(pb, level))
+        parts.push(progress_format_percent(progress_percent(pb)))
+        if pb.start_ns != 0 {
+            parts.push("eta " + progress_format_eta(progress_eta_secs(pb, now_ns)))
+        }
+        let rate: int = progress_rate_per_sec(pb, now_ns)
+        if rate > 0 {
+            parts.push(rate.to_str() + "/s")
+        }
+    } else {
+        # ---- indeterminate, running ----
+        parts.push(color_render(spinner_frame(pb.spinner, pb.tick_pos),
+            progress_style_frame(), level))
+        if pb.tick_count == 1 {
+            parts.push("1 tick")
+        } else {
+            parts.push(pb.tick_count.to_str() + " ticks")
+        }
+    }
+    if pb.msg != "" {
+        parts.push(pb.msg)
+    }
+    if pb.start_ns != 0 {
+        if elapsed_secs == 0 {
+            parts.push("<1s")
+        } else {
+            parts.push(progress_format_secs(elapsed_secs))
+        }
+    }
+    return join(parts, " ")
+}
+
+# ----------------------------------------------------------------------------
+# TTY / color resolution (the LIVE decision helpers).
+# ----------------------------------------------------------------------------
+
+# progress_should_draw() — should this process draw bars at all?
+#   PROGRESS_DISABLE set+non-empty  → false (never draw)
+#   PROGRESS_FORCE set+non-empty    → true  (always draw — CI / logs)
+#   otherwise                       → isatty(2) (stderr is a terminal)
+# The precedence (DISABLE beats FORCE) means a paranoid pipeline can
+# pin drawing off while still forcing color. Carries IO (isatty) +
+# Proc (env reads).
+fn progress_should_draw() -> bool uses IO, Proc {
+    if env_has("PROGRESS_DISABLE") {
+        if env_get("PROGRESS_DISABLE") != "" {
+            return false
+        }
+    }
+    if env_has("PROGRESS_FORCE") {
+        if env_get("PROGRESS_FORCE") != "" {
+            return true
+        }
+    }
+    return isatty(2)
+}
+
+# progress_resolve_level(mode) — the ColorLevel for a draw:
+#   Never  → ColorNone (no escapes at all)
+#   Always → color_detect() (the std.color env detector: NO_COLOR /
+#            FORCE_COLOR / CLICOLOR_FORCE / COLORTERM / TERM)
+#   Auto   → color_detect() when stderr is a TTY, else ColorNone
+# Carries IO (isatty) + Proc (env reads inside color_detect).
+fn progress_resolve_level(mode: ProgressColor) -> ColorLevel uses IO, Proc {
+    if progress_color_eq(mode, ProgressColor.ProgressColorNever) {
+        return ColorLevel.ColorNone
+    }
+    if progress_color_eq(mode, ProgressColor.ProgressColorAlways) {
+        return color_detect()
+    }
+    if isatty(2) {
+        return color_detect()
+    }
+    return ColorLevel.ColorNone
+}
+
+# ----------------------------------------------------------------------------
+# Live drawing (the thin IO shells).
+# ----------------------------------------------------------------------------
+# All live functions share one protocol:
+#   1. progress_should_draw() is false → return immediately (a piped
+#      process performs ZERO writes — stdout data stays clean).
+#   2. Rate limit: a redraw is suppressed when the last actual redraw
+#      is less than steady_ms ago (suppressed draws do no string work
+#      at all — the rate-limited tick path allocates nothing).
+#   3. A single-bar draw is "\r" + line (no newline — the cursor stays
+#      on the line; the next draw's \r returns to column 0).
+#   4. A final draw appends the newline so the shell prompt lands on
+#      the next line.
+
+# progress_draw(pb) — rate-limited redraw of the running line.
+fn progress_draw(mut pb: ProgressBar) -> void uses IO, Clock, Proc {
+    if !progress_should_draw() {
+        return
+    }
+    let now: int = instant_now_ns()
+    if pb.steady_ms > 0 && pb.last_draw_ns != 0 {
+        let since_ms: int = (now - pb.last_draw_ns) / 1000000
+        if since_ms < pb.steady_ms {
+            return
+        }
+    }
+    let level: ColorLevel = progress_resolve_level(pb.color)
+    eprint(chr(13) + progress_render(pb, level, now))
+    pb.last_draw_ns = now
+    pb.draws = pb.draws + 1
+}
+
+# progress_inc_draw(pb, delta) — inc + rate-limited draw (the hot-loop
+# convenience: `pb.inc(1)`).
+fn progress_inc_draw(mut pb: ProgressBar, delta: int) -> void uses IO, Clock, Proc {
+    progress_inc(pb, delta)
+    progress_draw(pb)
+}
+
+# progress_tick_draw(pb) — tick + rate-limited draw (the roadmap's
+# `tick()` semantics: advance the spinner and animate).
+fn progress_tick_draw(mut pb: ProgressBar) -> void uses IO, Clock, Proc {
+    progress_tick(pb)
+    progress_draw(pb)
+}
+
+# progress_draw_final(pb) — the final forced redraw (no rate limit)
+# ending with a newline.
+fn progress_draw_final(mut pb: ProgressBar) -> void uses IO, Clock, Proc {
+    if !progress_should_draw() {
+        return
+    }
+    let now: int = instant_now_ns()
+    let level: ColorLevel = progress_resolve_level(pb.color)
+    eprint(chr(13) + progress_render(pb, level, now) + chr(10))
+    pb.last_draw_ns = now
+    pb.draws = pb.draws + 1
+}
+
+# progress_finish(pb) — mark finished + final line + newline.
+fn progress_finish(mut pb: ProgressBar) -> void uses IO, Clock, Proc {
+    progress_finish_state(pb, "")
+    progress_draw_final(pb)
+}
+
+# progress_finish_with(pb, msg) — finish with a custom final message.
+fn progress_finish_with(mut pb: ProgressBar, msg: str) -> void uses IO, Clock, Proc {
+    progress_finish_state(pb, msg)
+    progress_draw_final(pb)
+}
+
+# ----------------------------------------------------------------------------
+# MultiBar — one line per concurrent task.
+# ----------------------------------------------------------------------------
+# A MultiBar holds one ProgressBar per task and redraws ALL of them in
+# place: cursor-up (drawn - 1), then per bar: EL 2 (erase line) + the
+# rendered line + newline. The FIRST draw paints forward (no cursor
+# movement); every later draw repaints the same n lines.
+#
+# Concurrency model (the value-snapshot model): HLS structs are values
+# passed by reference, and channels are the only sanctioned cross-task
+# communication. The intended pattern: worker tasks own private bars
+# (or just counters) and report through a channel; the UI task updates
+# its snapshot via multibar_set(idx, snapshot) and calls multibar_draw.
+# The MultiBar itself is single-threaded state — deterministic, no
+# locks, no shared mutation (HLS has no global mutable state by
+# design; this keeps the security story of the effect system intact).
+
+struct MultiBar {
+    bars: list[ProgressBar],   # one bar per task, in draw order
+    drawn: int,                # lines painted by the last draw (cursor math)
+}
+
+# multibar_new() — the empty multi-bar (add bars with multibar_add).
+fn multibar_new() -> MultiBar {
+    return MultiBar { bars: [], drawn: 0 }
+}
+
+# multibar_add(mb, pb) — append a bar; returns its index (0-based).
+fn multibar_add(mut mb: MultiBar, pb: ProgressBar) -> int {
+    mb.bars.push(pb)
+    return mb.bars.len() - 1
+}
+
+# multibar_len(mb) — the number of bars.
+fn multibar_len(mb: MultiBar) -> int {
+    return mb.bars.len()
+}
+
+# multibar_get(mb, idx) — the bar snapshot at idx. Panics on OOB
+# (the list.get convention).
+fn multibar_get(mb: MultiBar, idx: int) -> ProgressBar {
+    return mb.bars.get(idx)
+}
+
+# multibar_set(mb, idx, pb) — replace the snapshot at idx (the UI
+# task's update from a worker report). Panics on OOB.
+fn multibar_set(mut mb: MultiBar, idx: int, pb: ProgressBar) -> void {
+    mb.bars.set(idx, pb)
+}
+
+# multibar_render(mb, level, now_ns) — all lines joined with newlines
+# (PURE — the differential-safe core; one line per bar).
+fn multibar_render(mb: MultiBar, level: ColorLevel, now_ns: int) -> str {
+    let lines: list[str] = []
+    let mut i: int = 0
+    while i < mb.bars.len() {
+        lines.push(progress_render(mb.bars.get(i), level, now_ns))
+        i = i + 1
+    }
+    return join(lines, "\n")
+}
+
+# multibar_draw(mb) — redraw every bar in place (live).
+#   1. should_draw false → return (zero writes).
+#   2. cursor-up (drawn - 1) lines — return to the top bar's line.
+#   3. per bar: clear_line() (EL 2) + line + newline.
+#   4. drawn = number of bars (the next draw's cursor math).
+fn multibar_draw(mut mb: MultiBar) -> void uses IO, Clock, Proc {
+    if !progress_should_draw() {
+        return
+    }
+    let now: int = instant_now_ns()
+    if mb.drawn > 1 {
+        eprint(cursor_move_up(mb.drawn - 1))
+    }
+    let mut i: int = 0
+    while i < mb.bars.len() {
+        let bar: ProgressBar = mb.bars.get(i)
+        let level: ColorLevel = progress_resolve_level(bar.color)
+        eprint(clear_line() + progress_render(bar, level, now) + chr(10))
+        i = i + 1
+    }
+    mb.drawn = mb.bars.len()
+}
+
+# multibar_tick(mb) — tick every bar + redraw (the "one tick per
+# concurrent task" animation step).
+fn multibar_tick(mut mb: MultiBar) -> void uses IO, Clock, Proc {
+    let mut i: int = 0
+    while i < mb.bars.len() {
+        progress_tick(mb.bars.get(i))
+        i = i + 1
+    }
+    multibar_draw(mb)
+}
+
+# multibar_inc(mb, idx, delta) — inc one bar + redraw.
+fn multibar_inc(mut mb: MultiBar, idx: int, delta: int) -> void uses IO, Clock, Proc {
+    progress_inc(mb.bars.get(idx), delta)
+    multibar_draw(mb)
+}
+
+# multibar_finish(mb) — finish every bar + final redraw (cursor ends
+# below the block; the shell prompt lands cleanly).
+fn multibar_finish(mut mb: MultiBar) -> void uses IO, Clock, Proc {
+    let mut i: int = 0
+    while i < mb.bars.len() {
+        progress_finish_state(mb.bars.get(i), "")
+        i = i + 1
+    }
+    multibar_draw(mb)
+}
+
+# ----------------------------------------------------------------------------
+# Method-call form — the roadmap's exact API.
+# ----------------------------------------------------------------------------
+# `impl ProgressBar { ... }` gives the builder-chain + live-method
+# surface the roadmap names: ProgressBar-style usage reads
+#
+#   let pb: ProgressBar = progress_with_spinner(
+#       progress_with_label(progress_new(0), "Working"),
+#       SpinnerStyle.SpinnerDots)
+#   pb.start()
+#   while ... { pb.tick() }
+#   pb.finish()
+#
+# The live methods (inc / set_position / tick / draw / finish) carry
+# IO + Clock + Proc (draw decisions: isatty + env + clock + stderr);
+# the pure accessors (position / total / is_finished / eta_secs /
+# percent / render) carry nothing. set_message is pure (state only).
+
+impl ProgressBar {
+    # with_label(label) — builder method (immutable update).
+    fn with_label(self: ProgressBar, label: str) -> ProgressBar {
+        return progress_with_label(self, label)
+    }
+
+    # with_message(msg) — builder method.
+    fn with_message(self: ProgressBar, msg: str) -> ProgressBar {
+        return progress_with_message(self, msg)
+    }
+
+    # with_width(width) — builder method (re-allocates the cells).
+    fn with_width(self: ProgressBar, width: int) -> ProgressBar {
+        return progress_with_width(self, width)
+    }
+
+    # with_chars(filled, empty) — builder method.
+    fn with_chars(self: ProgressBar, filled: str, empty: str) -> ProgressBar {
+        return progress_with_chars(self, filled, empty)
+    }
+
+    # with_head(head) — builder method.
+    fn with_head(self: ProgressBar, head: str) -> ProgressBar {
+        return progress_with_head(self, head)
+    }
+
+    # with_spinner(style) — builder method.
+    fn with_spinner(self: ProgressBar, style: SpinnerStyle) -> ProgressBar {
+        return progress_with_spinner(self, style)
+    }
+
+    # with_color(mode) — builder method (--color surface).
+    fn with_color(self: ProgressBar, mode: ProgressColor) -> ProgressBar {
+        return progress_with_color(self, mode)
+    }
+
+    # with_steady(ms) — builder method (redraw rate limit).
+    fn with_steady(self: ProgressBar, ms: int) -> ProgressBar {
+        return progress_with_steady(self, ms)
+    }
+
+    # start() — stamp the monotonic start instant (once).
+    fn start(mut self: ProgressBar) -> void uses Clock {
+        progress_start(self)
+    }
+
+    # inc(delta) — advance + rate-limited redraw (the hot loop).
+    fn inc(mut self: ProgressBar, delta: int) -> void uses IO, Clock, Proc {
+        progress_inc_draw(self, delta)
+    }
+
+    # set_position(pos) — set the position + redraw.
+    fn set_position(mut self: ProgressBar, pos: int) -> void uses IO, Clock, Proc {
+        progress_set_position(self, pos)
+        progress_draw(self)
+    }
+
+    # set_message(msg) — update the suffix message (pure state).
+    fn set_message(mut self: ProgressBar, msg: str) -> void {
+        progress_set_message(self, msg)
+    }
+
+    # tick() — the roadmap's tick(): spinner advance + redraw.
+    fn tick(mut self: ProgressBar) -> void uses IO, Clock, Proc {
+        progress_tick_draw(self)
+    }
+
+    # draw() — force-check + rate-limited redraw.
+    fn draw(mut self: ProgressBar) -> void uses IO, Clock, Proc {
+        progress_draw(self)
+    }
+
+    # finish() — the roadmap's finish(): 100% + final line + newline.
+    fn finish(mut self: ProgressBar) -> void uses IO, Clock, Proc {
+        progress_finish(self)
+    }
+
+    # finish_with(msg) — finish with a custom final message.
+    fn finish_with(mut self: ProgressBar, msg: str) -> void uses IO, Clock, Proc {
+        progress_finish_with(self, msg)
+    }
+
+    # position() — completed units (pure).
+    fn position(self: ProgressBar) -> int {
+        return progress_position(self)
+    }
+
+    # total() — the total units (pure).
+    fn total(self: ProgressBar) -> int {
+        return progress_total(self)
+    }
+
+    # is_finished() — did finish() run? (pure)
+    fn is_finished(self: ProgressBar) -> bool {
+        return progress_is_finished(self)
+    }
+
+    # percent() — 0..100, -1 indeterminate (pure).
+    fn percent(self: ProgressBar) -> int {
+        return progress_percent(self)
+    }
+
+    # eta_secs(now_ns) — the linear ETA (pure; -1 = unknown).
+    fn eta_secs(self: ProgressBar, now_ns: int) -> int {
+        return progress_eta_secs(self, now_ns)
+    }
+
+    # render(level, now_ns) — the pure line renderer.
+    fn render(self: ProgressBar, level: ColorLevel, now_ns: int) -> str {
+        return progress_render(self, level, now_ns)
+    }
+}
+
+# impl MultiBar — the same method surface for multi-bar users.
+
+impl MultiBar {
+    # add(pb) — append a bar; returns its index.
+    fn add(mut self: MultiBar, pb: ProgressBar) -> int {
+        return multibar_add(self, pb)
+    }
+
+    # len() — the number of bars.
+    fn len(self: MultiBar) -> int {
+        return multibar_len(self)
+    }
+
+    # get(idx) — the bar snapshot at idx.
+    fn get(self: MultiBar, idx: int) -> ProgressBar {
+        return multibar_get(self, idx)
+    }
+
+    # set(idx, pb) — replace the snapshot at idx.
+    fn set(mut self: MultiBar, idx: int, pb: ProgressBar) -> void {
+        multibar_set(self, idx, pb)
+    }
+
+    # tick() — tick every bar + redraw.
+    fn tick(mut self: MultiBar) -> void uses IO, Clock, Proc {
+        multibar_tick(self)
+    }
+
+    # inc(idx, delta) — advance one bar + redraw.
+    fn inc(mut self: MultiBar, idx: int, delta: int) -> void uses IO, Clock, Proc {
+        multibar_inc(self, idx, delta)
+    }
+
+    # draw() — redraw every bar in place.
+    fn draw(mut self: MultiBar) -> void uses IO, Clock, Proc {
+        multibar_draw(self)
+    }
+
+    # finish() — finish every bar + final redraw.
+    fn finish(mut self: MultiBar) -> void uses IO, Clock, Proc {
+        multibar_finish(self)
+    }
+
+    # render(level, now_ns) — the pure multi-line renderer.
+    fn render(self: MultiBar, level: ColorLevel, now_ns: int) -> str {
+        return multibar_render(self, level, now_ns)
+    }
+}

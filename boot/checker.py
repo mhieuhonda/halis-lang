@@ -371,6 +371,16 @@ BUILTIN_FNS = {
     "math_erf", "math_erfc", "math_tgamma", "math_lgamma",
     "math_isnan", "math_isinf", "math_isfinite", "math_signbit",
     "math_copysign",
+    # Stage 56 (v0.75.0-alpha): stderr + TTY-detection builtins.
+    # eprint / eprintln write to stderr (IO effect; taint sinks — a
+    # tainted message lets an attacker inject ANSI escapes into the
+    # terminal, the same threat print / println carry). isatty(fd)
+    # reports whether a file descriptor is a terminal (IO effect — a
+    # stream-state observation; this is the TTY detection that
+    # std.color's v0.74.0-alpha limitations deferred to "Stage 56+
+    # when std.progress lands and the spinner needs it"). The stdlib
+    # std/progress.hls builds the user-facing API on all three.
+    "eprint", "eprintln", "isatty",
 }
 
 # Stage 9 (v0.20.0-alpha — release): per-builtin effect mapping.
@@ -388,6 +398,15 @@ BUILTIN_FNS = {
 BUILTIN_EFFECTS = {
     "print":       {"IO"},
     "println":     {"IO"},
+    # Stage 56 (v0.75.0-alpha): stderr + TTY-detection builtins.
+    # eprint / eprintln write to stderr — IO (the effect algebra does
+    # not distinguish which stream, only that a stream is written).
+    # isatty queries a file descriptor's stream state — an I/O
+    # observation (same family as read_line observing stdin), NOT a
+    # Proc process-state access (no env / cwd / subprocess involved).
+    "eprint":      {"IO"},
+    "eprintln":    {"IO"},
+    "isatty":      {"IO"},
     "read_file":   {"Fs"},
     "write_file":  {"Fs"},
     "file_exists": {"Fs"},
@@ -547,6 +566,12 @@ def is_owned_type(t):
 SINK_BUILTINS = {
     "print":        (0,),   # the message is the taint vector
     "println":      (0,),
+    # Stage 56 (v0.75.0-alpha): stderr writes are sinks for the same
+    # reason stdout writes are — a tainted message lets an attacker
+    # inject ANSI escape sequences into the terminal (spoofing,
+    # title reprogramming, clipboard theft on some terminals).
+    "eprint":       (0,),
+    "eprintln":     (0,),
     "read_file":    (0,),   # tainted path → path-traversal
     "write_file":   (0, 1),  # tainted path or content → both bad
     "file_exists":  (0,),   # tainted path → information disclosure / traversal
@@ -1295,10 +1320,12 @@ class Checker:
                          "expression (`return %s(...)`)"
                          % (key, e.get("line", 0), key), e)
                 return
-            # Consume-builtin exception: panic / print / println with
-            # ONE string literal argument.
+            # Consume-builtin exception: panic / print / println /
+            # eprint / eprintln with ONE string literal argument
+            # (Stage 56, v0.75.0-alpha added the stderr pair — they
+            # consume their argument exactly like print / println).
             if rc is not None and rc[0] == "builtin" and \
-                    rc[1] in ("panic", "print", "println"):
+                    rc[1] in ("panic", "print", "println", "eprint", "eprintln"):
                 args = e.get("args", [])
                 if len(args) != 1 or args[0].get("k") != "str":
                     self.err("#[tail_call] violated: the %s call at line %d "
@@ -2690,11 +2717,23 @@ class Checker:
                     (name, arg_idx + 1, list_taint_inner(at)), e)
             return at
 
-        if name in ("print", "println"):
+        if name in ("print", "println", "eprint", "eprintln"):
             need(1)
             reject_tainted_at_sink(0, "str")
-            self.edges[self.cur_fn].add("b:print")
+            # Edge name reflects the ACTUAL builtin (b:print / b:eprint /
+            # ...) so the --audit output lists which stream family was
+            # written. BUILTIN_EFFECTS resolves all four to {"IO"}.
+            self.edges[self.cur_fn].add("b:" + name)
             return "void"
+        # Stage 56 (v0.75.0-alpha): isatty(fd: int) -> bool — true when
+        # the file descriptor refers to a terminal. Carries IO. The fd
+        # is a program-controlled constant (0 / 1 / 2), not attacker
+        # data — NOT a taint sink.
+        if name == "isatty":
+            need(1)
+            argt(0, "int")
+            self.edges[self.cur_fn].add("b:isatty")
+            return "bool"
         if name == "panic":
             need(1)
             # panic is NOT a taint sink — panicking with a tainted message

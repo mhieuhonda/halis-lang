@@ -13,6 +13,288 @@ stability (125–140), and final stabilisation toward v1.0 (141–150).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
+## [v0.75.0-alpha] — Stage 56: std.progress (progress bars, spinners, ETA)
+
+> Continues **Phase IV (CLI tooling track, Stages 53–62)**.
+> Adds `std.progress` — progress bars, spinners, ETA estimation, and
+> multi-bar rendering for concurrent tasks, plus THREE new compiler
+> builtins: `eprint(s)` / `eprintln(s)` (stderr writes — the same
+> ownership / taint-sink / IO-effect discipline as `print` / `println`,
+> with an `fflush(stdout)` first so interleaved stdout/stderr output
+> keeps the caller's logical order) and `isatty(fd)` (TTY detection —
+> the probe std.color's v0.74.0-alpha limitations deferred to "Stage 56+
+> when std.progress lands and the spinner needs it"). The module
+> implements the roadmap's Stage 56 promise: `ProgressBar::new(total)`
+> (`progress_new(total)` + the `impl ProgressBar` method form), `tick()`
+> (spinner advance + rate-limited redraw), `finish()` (100% + final
+> line), ETA estimation (integer arithmetic with an int64 overflow
+> guard — no floats, so the render is byte-identical between the
+> interpreter and the native binary), multi-bar (one per concurrent
+> task, ANSI cursor-up + EL 2 in-place redraw), 8 spinner styles, and
+> the zero-allocation-after-creation contract (fixed-size state; the
+> pre-allocated `cells` list is mutated in place; suppressed redraws
+> perform zero string work).
+
+### Added — Stage 56 (v0.75.0-alpha)
+
+- **New compiler builtins** (wired through all four code-paths —
+  C backend, LLVM backend, Stage-0 interpreter, and the self-hosted
+  compiler's checker):
+  - `eprint(s: str) -> void` / `eprintln(s: str) -> void` — write to
+    **stderr** (IO effect; the str argument is consumed exactly like
+    `print` / `println`). Both `fflush(stdout)` FIRST: when both
+    streams share one capture, C stdout is block-buffered while stderr
+    is unbuffered — without the flush, every stderr line would land
+    before every stdout line. With it, the interpreter (which flushes
+    its own stdout buffer before writing `sys.stderr.buffer`) and the
+    native binary produce byte-identical interleaving (the same fix
+    pattern deep-scan-22 applied to `proc_exec` / `proc_spawn`).
+  - `isatty(fd: int) -> bool` — true when the file descriptor refers
+    to a terminal (IO effect — a stream-state observation, the same
+    family as `read_line`; NOT Proc — no env / cwd / subprocess is
+    touched). 0 = stdin, 1 = stdout, 2 = stderr; invalid / negative
+    fds simply return false (C `isatty` sets EBADF and returns 0 —
+    no panic, no UB; Python's `os.isatty` mirrors it).
+  - Taint-sink enforcement: `eprint` / `eprintln` argument 1 is a sink
+    (a tainted message lets an attacker inject ANSI escapes into the
+    terminal — spoofing, title reprogramming, clipboard theft). The
+    `#[tail_call]` consume-builtin exception now covers `eprint` /
+    `eprintln` with a single string literal (they consume their
+    argument exactly like `println`).
+  - LLVM backend: `declare void @hl_eprint(ptr)` / `@hl_eprintln(ptr)` /
+    `declare i1 @hl_isatty(i64)` + the corresponding lowering.
+
+- **ProgressBar** — the bar value. `progress_new(total)`:
+  - `total > 0` — a determinate bar (bar + percent + ETA + rate).
+  - `total == 0` — an indeterminate spinner (frame + tick count +
+    elapsed). `total < 0` panics with a clear message.
+  - Fixed-size state: 18 scalar fields + ONE pre-allocated `cells`
+    list (`width` entries, allocated at construction). State updates
+    (`inc` / `set_position` / `set_message` / `tick` /
+    `finish_state`) mutate fields in place — zero allocation, ever.
+    The monochrome bar body materialises from the cells with a single
+    `join` per redraw; colored renders build two `str_repeat` spans;
+    and the default 100 ms steady rate limiter bounds redraws to
+    ≤ 10/s (a suppressed draw performs zero string work).
+
+- **State API** (pure, no effects):
+  - `progress_inc(pb, delta)` — advance, clamped to `0..total`
+    (negative deltas move backwards, still clamped).
+  - `progress_set_position(pb, pos)` — set, clamped.
+  - `progress_set_message(pb, msg)` — the suffix message.
+  - `progress_tick(pb)` — advance the spinner frame + count (the
+    pure form; the roadmap's `tick()` semantics — advance AND
+    animate — is `progress_tick_draw` / `pb.tick()`).
+  - `progress_start(pb) uses Clock` — stamp the monotonic start
+    instant ONCE (re-calls are no-ops; the ETA baseline never moves).
+  - `progress_finish_state(pb, msg)` — mark finished (position pinned
+    to total) + optional final message. The live form is
+    `progress_finish` / `pb.finish()`.
+
+- **Builders** (immutable update — the receiver is unchanged, the
+  same convention as `cstyle_fg` / `style_bold`):
+  `progress_with_label` / `_message` / `_width` / `_chars` / `_head` /
+  `_spinner` / `_color` / `_steady`, each with an `impl ProgressBar`
+  method twin (`.with_label(...)` etc.) so the roadmap's builder chain
+  reads `progress_new(0).with_label("Working")
+  .with_spinner(SpinnerStyle.SpinnerDots)`. Multi-byte UTF-8 cells are
+  first-class (the geometry counts CELLS, not bytes — `"█"` / `"▓"` /
+  `"░"` bars render one terminal column per cell). `with_width` is the
+  only allocating builder (it re-sizes the cells list); `with_chars`
+  panics on empty strings (an empty cell would break the fixed-width
+  interior).
+
+- **ETA estimation** (pure integer arithmetic, byte-identical between
+  interpreter and native):
+  - `progress_eta_secs(pb, now_ns) -> int` — the linear estimate
+    `elapsed_secs * remaining / position`. Returns `-1` (unknown,
+    rendered "eta ?") when: not started, position 0 (no rate yet),
+    elapsed < 1s (not enough data), indeterminate, OR the multiply
+    would overflow int64 (pre-checked — a 30-year elapsed on a 9e18
+    unit total yields "unknown", not a wrapped negative). Returns `0`
+    when nothing remains.
+  - `progress_rate_per_sec(pb, now_ns) -> int` — units per whole
+    second (0 while elapsed is sub-second — a 0.4s elapsed would
+    otherwise report an inflated 2.5x rate).
+  - `progress_percent(pb)` — 0..100 (truncated; indeterminate → -1;
+    the multiply is overflow-guarded with a divide-first fallback for
+    absurd totals).
+  - `progress_elapsed_ns(pb, now_ns)` — elapsed nanoseconds (0 when
+    not started; a `now` before start clamps to 0).
+
+- **Formatting** (pure):
+  - `progress_format_secs(s)` — compact human durations: `45s` /
+    `3m12s` / `2h05m` / `4d03h` (negative → `?`).
+  - `progress_format_eta(eta)` — `?` for the unknown, otherwise the
+    compact form.
+  - `progress_format_percent(pct)` — 3-wide right-aligned + `%`
+    (`"  0%"`, `" 42%"`, `"100%"`); indeterminate renders `" --%"`.
+
+- **Spinner styles** — 8 built-in cycles:
+  `SpinnerDots` (braille, 10 frames), `SpinnerLine` (`- \ | /`),
+  `SpinnerDotsAscii` (`. o O @ *`), `SpinnerArrow` (8 arrows),
+  `SpinnerBounce` (8 blocks), `SpinnerToggle`, `SpinnerTriangle`,
+  `SpinnerPipe`. API: `spinner_style_eq / to_int / from_int / name /
+  from_name`, `spinner_frame_count`, `spinner_frame(style, i)` (wraps
+  modulo the cycle; negative clamps to 0),
+  `spinner_frames_preview(style)` (the full cycle, space-joined — for
+  `--spinner` help text).
+
+- **ProgressColor** — the roadmap's `--color=always / never / auto`
+  flag surface (Stage 55's limitations deferred exactly this to Stage
+  56): `progress_color_from_str("always" | "never" | "auto")` parses a
+  CLI flag value (case-insensitive, bogus → auto), and
+  `progress_resolve_level(mode) uses IO, Proc` resolves it to a
+  std.color `ColorLevel`:
+  - `Never` → `ColorNone` (no escapes at all).
+  - `Always` → `color_detect()` (the env detector: NO_COLOR /
+    FORCE_COLOR / CLICOLOR_FORCE / COLORTERM / TERM).
+  - `Auto` → `color_detect()` when stderr is a TTY, else `ColorNone`.
+
+- **Rendering** (pure — the differential-safe core):
+  - `progress_render(pb, level, now_ns) -> str` — the complete line.
+    Every input is explicit (ColorLevel + now_ns as ARGUMENTS), so the
+    test suite renders with synthetic values, byte-identical between
+    backends. Line layouts (empty parts skipped — no trailing spaces):
+    - determinate, running: `label [bar] 42% eta 12s 33/s msg`
+    - determinate, finished: `label [bar] 100% done in 3s msg`
+    - indeterminate, running: `label ⠸ 4 ticks msg 3s` (`1 tick`
+      singular)
+    - indeterminate, finished: `label done in 3s (4 ticks) clean`
+  - Colors: the filled span renders green (head char included), the
+    spinner frame cyan, the finished `done in` span bold green — all
+    via std.color's `ColorStyle` at the caller-supplied level
+    (truecolor → 256 → basic → none down-sampling comes free). The
+    monochrome line is COMPLETELY escape-free (even the bold span — a
+    TERM=dumb terminal shows raw ESC bytes as garbage, so the module
+    applies styles only at `>= Basic`).
+  - `progress_bar_part(pb, level)` — the bracketed interior.
+    Monochrome: ONE join over the pre-allocated cells. Colored: two
+    `str_repeat` spans (filled-with-head green + empty default).
+  - The head char (`progress_with_head(pb, ">")`) replaces the LAST
+    filled cell — the classic `####>` leading edge.
+
+- **Live drawing** (the thin IO shells — `uses IO, Clock, Proc`):
+  - `progress_should_draw() -> bool` — `PROGRESS_DISABLE` (never
+    draw) beats `PROGRESS_FORCE` (always draw — CI / captured logs)
+    beats `isatty(2)` (stderr is a terminal). A piped process performs
+    ZERO writes — stdout data stays clean.
+  - `progress_draw(pb)` — rate-limited redraw: `"\r" + line` (the
+    cursor stays on the line; the next draw's `\r` returns to column
+    0). Suppressed redraws (inside the `steady_ms` window, default
+    100 ms) perform zero string work and leave `draw_count` alone.
+  - `progress_inc_draw` / `progress_tick_draw` — state update + draw
+    (the hot-loop conveniences).
+  - `progress_draw_final` / `progress_finish` / `progress_finish_with`
+    — the forced final redraw ending with a newline (the shell prompt
+    lands on the next line).
+  - `impl ProgressBar` methods: `.start()`, `.inc(delta)`,
+    `.set_position(pos)`, `.set_message(msg)` (pure),
+    `.tick()`, `.draw()`, `.finish()`, `.finish_with(msg)` — plus the
+    pure accessors `.position() / .total() / .is_finished() /
+    .percent() / .eta_secs(now_ns) / .render(level, now_ns)`.
+
+- **MultiBar** — one line per concurrent task:
+  - `struct MultiBar { bars, drawn }`; `multibar_new() / add(mb, pb)
+    -> idx / len / get / set / render(mb, level, now_ns) (pure) /
+    draw / tick / inc(idx, delta) / finish` + the `impl MultiBar`
+    method twins.
+  - In-place redraw: cursor-up (`drawn - 1`) then per bar EL 2
+    (erase line) + line + newline; the FIRST draw paints forward.
+  - The **value-snapshot concurrency model**: HLS structs are values
+    passed by reference and channels are the only sanctioned
+    cross-task communication, so workers own private bars (or
+    counters) and report through a channel; the UI task updates its
+    snapshot via `multibar_set(idx, snapshot)` and calls
+    `multibar_draw`. No shared mutable state, no locks — the effect
+    system's security story stays intact.
+
+- **Effect discipline**:
+  - Pure (no `uses` clause): everything except the live shells —
+    `progress_new`, all builders, all state updates, all accessors,
+    all formatting, `progress_render`, `multibar_render`, all enum
+    helpers, `spinner_*`, `progress_color_*`.
+  - `uses Clock`: `progress_start` (reads the monotonic clock).
+  - `uses IO, Proc`: `progress_should_draw` (isatty + env),
+    `progress_resolve_level` (isatty + the std.color env detector).
+  - `uses IO, Clock, Proc`: the live draws (`progress_draw` /
+    `_inc_draw` / `_tick_draw` / `_draw_final` / `_finish` /
+    `_finish_with`, `multibar_draw` / `_tick` / `_inc` / `_finish`).
+
+- **Differential parity**:
+  - Every rendered line is a pure function of (state, ColorLevel,
+    now_ns) — no clock, no env, no isatty on the pure path. The test
+    suite asserts byte-exact strings (including the SGR spans:
+    `\x1b[32m` green, `\x1b[36m` cyan, `\x1b[32;1m` bold green).
+  - The live smoke prints only RELATIVE assertions (`start_ns > 0`,
+    fd-state probes that are identical under the same redirection) —
+    the Stage 49 pattern for wall-clock values.
+  - The demo's forced `eprint` / `eprintln` echo is deterministic
+    content on stderr; both backends flush stdout first, so the
+    combined capture (`2>&1`) interleaves byte-identically.
+  - Verified by `make progress-acceptance` — 2 differential tests
+    (progress_demo + feat_stage56_progress), both green.
+
+### Acceptance — Stage 56 (v0.75.0-alpha)
+
+`make progress-acceptance` runs:
+- `examples/progress_demo.hls` (differential test).
+- `tests/ok/feat_stage56_progress.hls` (differential test) — 13
+  sub-tests exercising every public API:
+  1. `progress_new` + defaults + state (inc / set_position clamping,
+     percent, indeterminate percent).
+  2. Builders — immutable updates (the receiver is proven unchanged)
+     + method chaining (byte-identical to the free functions) +
+     multi-byte UTF-8 cells + head char.
+  3. `ProgressColor` (eq / encode / decode / name / parse).
+  4. `SpinnerStyle` (eq / encode / decode / name / from_name /
+     frame counts / frames + wrap + negative clamp / previews).
+  5. Tick mechanics (frame advance + wrap).
+  6. ETA / rate / percent (exact integer math; the unknown cases;
+     the int64 overflow guard).
+  7. Formatting (`format_secs` / `format_eta` / `format_percent`
+     tables).
+  8. Rendering — monochrome exact strings (determinate running /
+     full / sub-second / finished / finished-with-message /
+     indeterminate singular + plural ticks / indeterminate finished).
+  9. Rendering — colored byte-exact SGR at every ColorLevel (256 and
+     truecolor degrade to the identical basic-green span).
+  10. `MultiBar` (add / get / set / len / render exact 3-line output /
+      finish state through the suppressed live path / method parity).
+  11. Live smoke (isatty probes for negative / bogus fds, `start_ns`
+      stamping + idempotence, draws suppressed when piped — asserted
+      conditionally so an interactive run exercises the drawing path
+      instead, deterministic `eprint` / `eprintln` echo).
+  12. Method-call parity (`.render` / `.percent` / `.position` /
+      `.total` / `.is_finished` / `.eta_secs` == the free functions).
+  13. Zero-allocation churn (100k `inc` + `tick` state updates land
+      exactly).
+  All sub-tests pass; both differential tests pass.
+
+### New test files — Stage 56 (v0.75.0-alpha)
+
+- `tests/ok/feat_stage56_progress.hls` — the 13-section suite above.
+- `tests/fail/fail_eprint_effect.hls` — `eprint` without `uses IO`.
+- `tests/fail/fail_eprint_tainted.hls` — `eprint` with a tainted
+  message (ANSI-injection sink violation).
+- `tests/fail/fail_isatty_arg.hls` — `isatty` with a str argument.
+
+### Limitations (deferred to later stages)
+
+- **No terminal WIDTH detection** (no `ioctl(TIOCGWINSZ)` builtin).
+  The bar width is caller-controlled (default 30). A future
+  perfection stage may add `term_width()` + auto-fit.
+- **No smoothed ETA** (the linear estimate only; indicatif's EMA
+  smoothing needs float state + a mutable history buffer).
+- **MultiBar does not thread-track** — it renders whatever bar
+  snapshots it holds at draw time (the value-snapshot model above).
+- **The wasm32 backend does not support eprint / isatty** (no stderr /
+  fd concept in the JS sandbox); `std.progress` is a native-backend
+  module (the same class as `std.env` / `std.net` / `std.process`).
+- **CLICOLOR=0 in the Always path** still routes through the v0.74.0
+  std.color detector (which treats a set-and-non-empty `CLICOLOR` as
+  "color on"); `--color=never` / `NO_COLOR` remain the robust offs.
+
 ## [v0.74.0-alpha] — Stage 55: std.color (terminal color support + Style builder)
 
 > Continues **Phase IV (CLI tooling track, Stages 53–62)**.

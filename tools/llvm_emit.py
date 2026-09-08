@@ -113,6 +113,13 @@ declare i1       @hl_fs_is_dir(ptr)
 declare void     @hl_fs_set_perms(ptr, i64)
 declare void     @hl_print(ptr)                     ; hl_str*
 declare void     @hl_println(ptr)                   ; hl_str*
+; Stage 56 (v0.75.0-alpha): stderr + TTY-detection builtins.
+; hl_eprint / hl_eprintln write to stderr (consuming the str — the
+; same ownership convention as hl_print / hl_println; they fflush
+; stdout first in the C runtime). hl_isatty(fd) -> bool (i1).
+declare void     @hl_eprint(ptr)                    ; hl_str* -> stderr
+declare void     @hl_eprintln(ptr)                  ; hl_str* -> stderr + '\n'
+declare i1       @hl_isatty(i64)                    ; (fd) -> bool
 
 ; strings
 declare ptr      @hl_str_alloc(i64)
@@ -1594,6 +1601,15 @@ class LLVMEmitter:
         if name in ("print", "println"):
             return self._call1("void", "@hl_print" if name == "print" else "@hl_println",
                                ["ptr"], arg_pairs)
+        # ----- Stage 56 (v0.75.0-alpha): stderr + TTY-detection builtins.
+        # eprint / eprintln consume their str argument (the same
+        # lowering as print / println — _call1's call-void path passes
+        # the raw pointer). isatty takes a primitive i64 and returns i1.
+        if name in ("eprint", "eprintln"):
+            return self._call1("void", "@hl_eprint" if name == "eprint" else "@hl_eprintln",
+                               ["ptr"], arg_pairs)
+        if name == "isatty":
+            return self._call1("i1", "@hl_isatty", ["i64"], arg_pairs)
         if name == "panic":
             # hl_panic never returns: emit call + unreachable so no
             # instructions follow in this block.

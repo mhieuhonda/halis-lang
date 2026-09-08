@@ -1,0 +1,444 @@
+# examples/progress_demo.hls — Stage 56 (v0.75.0-alpha): std.progress demo.
+#
+# This demo exercises every feature of std.progress:
+#   - ProgressBar (determinate): progress_new(total) + builders
+#     (with_label / with_message / with_width / with_chars / with_head /
+#     with_spinner / with_color / with_steady) in free-function AND
+#     method-chaining form
+#   - ProgressBar (indeterminate, total = 0): spinner animation frames
+#   - All 8 spinner styles (dots / line / dots-ascii / arrow / bounce /
+#     toggle / triangle / pipe)
+#   - ETA estimation (integer arithmetic, overflow-guarded) + rate
+#   - Percent formatting (3-wide right-aligned)
+#   - Duration formatting (45s / 3m12s / 2h05m / 4d03h)
+#   - Rendering at every ColorLevel (truecolor / 256 / basic / none —
+#     the same line degrades gracefully via std.color)
+#   - MultiBar (one line per concurrent task) — pure render
+#   - progress_color_from_str ("always" / "never" / "auto")
+#   - spinner_style_from_name + spinner_frames_preview
+#   - isatty(fd) live smoke (byte-identical between interpreter and
+#     native for the same redirection)
+#   - Live drawing (progress_start / inc / tick / draw / finish) —
+#     SUPPRESSED when stderr is not a TTY (isatty(2) false under
+#     redirection), so the captured output stays deterministic;
+#     run the demo in a real terminal to see the animation
+#   - eprint / eprintln forced echo (deterministic content on stderr;
+#     proves the Stage 56 builtins work in the differential path —
+#     the flush-first discipline keeps the interleaving identical)
+#
+# The demo is differential-safe: every line printed to stdout is a pure
+# function of fixed inputs (synthetic now_ns / ColorLevel), and the
+# only stderr output is either deterministic (the forced echo) or
+# absent (the live section checks isatty(2) first). Interpreter and
+# native produce byte-identical output.
+
+import "std.progress"
+import "std.str"
+
+# ----------------------------------------------------------------------------
+# Helper — print a header between sections.
+# ----------------------------------------------------------------------------
+
+fn section(title: str) -> void uses IO {
+    println("")
+    println("--- " + title + " ---")
+}
+
+# ----------------------------------------------------------------------------
+# Demo 1 — Determinate bars: the basic lifecycle at fixed positions.
+# ----------------------------------------------------------------------------
+
+fn demo_determinate() -> void uses IO {
+    section("Determinate bars (progress_new + inc + set_position)")
+
+    # A synthetic timebase: start at 1e15 ns; every step advances 1s.
+    # The renders are pure functions of (state, level, now_ns) —
+    # byte-identical between interpreter and native.
+    let t0: int = 1000000000000000
+    let s: int = 1000000000
+
+    let pb: ProgressBar = progress_with_label(progress_new(100), "Downloading")
+    progress_set_position(pb, 0)
+    println(progress_render(pb, ColorLevel.ColorNone, t0))
+    progress_set_position(pb, 25)
+    println(progress_render(pb, ColorLevel.ColorNone, t0 + 2 * s))
+    progress_set_position(pb, 50)
+    progress_set_message(pb, "file7.tar.gz")
+    println(progress_render(pb, ColorLevel.ColorNone, t0 + 4 * s))
+    progress_set_position(pb, 90)
+    println(progress_render(pb, ColorLevel.ColorNone, t0 + 8 * s))
+    progress_finish_state(pb, "")
+    println(progress_render(pb, ColorLevel.ColorNone, t0 + 10 * s))
+
+    # position clamping + negative inc
+    let pc: ProgressBar = progress_with_label(progress_new(8), "Clamped")
+    progress_inc(pc, 3)
+    progress_inc(pc, 100)
+    println("clamped position: " + progress_position(pc).to_str() + " / "
+        + progress_total(pc).to_str() + " pct: " + progress_percent(pc).to_str())
+    progress_inc(pc, -99)
+    println("after -99 inc: position " + progress_position(pc).to_str())
+}
+
+# ----------------------------------------------------------------------------
+# Demo 2 — Custom bar chars + head char + widths.
+# ----------------------------------------------------------------------------
+
+fn demo_custom_bars() -> void uses IO {
+    section("Custom chars / head / width")
+
+    let t0: int = 2000000000000000
+
+    # Block chars (multi-byte UTF-8 cells — geometry counts cells).
+    let blk: ProgressBar = progress_with_chars(
+        progress_with_label(progress_new(20), "Blocks"), "█", "░")
+    progress_set_position(blk, 12)
+    println(progress_render(blk, ColorLevel.ColorNone, t0))
+
+    # ASCII with a ">" head char at the leading edge.
+    let hd: ProgressBar = progress_with_head(
+        progress_with_chars(progress_with_label(progress_new(20), "Head"), "=", "."),
+        ">")
+    progress_set_position(hd, 12)
+    println(progress_render(hd, ColorLevel.ColorNone, t0))
+
+    # A narrow bar (width re-allocation).
+    let nw: ProgressBar = progress_with_width(
+        progress_with_label(progress_new(10), "Narrow"), 10)
+    progress_set_position(nw, 7)
+    println(progress_render(nw, ColorLevel.ColorNone, t0))
+
+    # A wide fancy bar with a unicode head.
+    let wf: ProgressBar = progress_with_head(
+        progress_with_chars(progress_with_width(
+            progress_with_label(progress_new(40), "Fancy"), 40), "▓", "·"), "▒")
+    progress_set_position(wf, 28)
+    println(progress_render(wf, ColorLevel.ColorNone, t0))
+}
+
+# ----------------------------------------------------------------------------
+# Demo 3 — All 8 spinner styles (indeterminate bars).
+# ----------------------------------------------------------------------------
+
+fn demo_spinners() -> void uses IO {
+    section("Spinner styles (indeterminate, total = 0)")
+
+    let styles: list[SpinnerStyle] = [
+        SpinnerStyle.SpinnerDots,
+        SpinnerStyle.SpinnerLine,
+        SpinnerStyle.SpinnerDotsAscii,
+        SpinnerStyle.SpinnerArrow,
+        SpinnerStyle.SpinnerBounce,
+        SpinnerStyle.SpinnerToggle,
+        SpinnerStyle.SpinnerTriangle,
+        SpinnerStyle.SpinnerPipe,
+    ]
+
+    # Frame previews (the full cycle of each style).
+    let mut i: int = 0
+    while i < styles.len() {
+        let st: SpinnerStyle = styles.get(i)
+        println("  " + str_pad_right(spinner_style_name(st), 10, " ")
+            + " [" + spinner_frames_preview(st) + "]"
+            + " count=" + spinner_frame_count(st).to_str())
+        i = i + 1
+    }
+
+    # An indeterminate bar advancing through the dots cycle.
+    let t0: int = 3000000000000000
+    let sp: ProgressBar = progress_with_spinner(
+        progress_with_label(progress_new(0), "Scanning"), SpinnerStyle.SpinnerDots)
+    let mut k: int = 0
+    while k < 10 {
+        progress_tick(sp)
+        println(progress_render(sp, ColorLevel.ColorNone, t0 + k * 100000000))
+        k = k + 1
+    }
+    progress_set_message(sp, "resolving links")
+    progress_tick(sp)
+    println(progress_render(sp, ColorLevel.ColorNone, t0 + 1500000000))
+    progress_finish_state(sp, "clean")
+    println(progress_render(sp, ColorLevel.ColorNone, t0 + 3000000000))
+
+    # spinner_style_from_name round-trip
+    println("from_name: dots=" + spinner_style_name(spinner_style_from_name("DOTS"))
+        + " ascii=" + spinner_style_name(spinner_style_from_name("ascii"))
+        + " unknown=" + spinner_style_name(spinner_style_from_name("nope")))
+}
+
+# ----------------------------------------------------------------------------
+# Demo 4 — ETA / rate / percent / duration formatting (pure math).
+# ----------------------------------------------------------------------------
+
+fn demo_eta_math() -> void uses IO {
+    section("ETA / rate / percent / duration formatting")
+
+    let t0: int = 4000000000000000
+    let s: int = 1000000000
+
+    # 100 units, 25 done after 10s → ETA = 10*75/25 = 30s, rate = 2/s.
+    # (The bar is built via the struct literal with a SYNTHETIC start_ns
+    # — the pure-render pattern; cells comes from a scaffold bar.)
+    let q: ProgressBar = progress_new(100)
+    progress_set_position(q, 25)
+    let bar: ProgressBar = ProgressBar {
+        label: "Eta",
+        msg: "",
+        total: 100,
+        position: 25,
+        width: 30,
+        start_ns: t0,
+        tick_pos: 0,
+        tick_count: 0,
+        filled_char: "#",
+        empty_char: "-",
+        head_char: "",
+        spinner: SpinnerStyle.SpinnerLine,
+        color: ProgressColor.ProgressColorAuto,
+        steady_ms: 100,
+        last_draw_ns: 0,
+        draws: 0,
+        finished: false,
+        finished_msg: "",
+        cells: q.cells,
+    }
+    println("eta(25/100 @10s) = " + progress_eta_secs(bar, t0 + 10 * s).to_str() + "s")
+    println("rate(25/100 @10s) = " + progress_rate_per_sec(bar, t0 + 10 * s).to_str() + "/s")
+    println("pct(25/100) = " + progress_percent(bar).to_str())
+    println("eta(0 done) = " + progress_eta_secs(progress_new(100), t0).to_str() + " (unknown)")
+    println("eta(not started) = " + progress_eta_secs(bar, 0).to_str() + " (unknown)")
+    println("eta(sub-second) = " + progress_eta_secs(bar, t0 + 500000000).to_str() + " (unknown)")
+
+    # The overflow guard: elapsed_secs=2000 * remaining~9.2e18 > INT64_MAX.
+    let big: ProgressBar = progress_new(9223372036854775807)
+    progress_set_position(big, 1)
+    let big2: ProgressBar = ProgressBar {
+        label: "", msg: "", total: 9223372036854775807, position: 1,
+        width: 30, start_ns: t0, tick_pos: 0, tick_count: 0,
+        filled_char: "#", empty_char: "-", head_char: "",
+        spinner: SpinnerStyle.SpinnerLine, color: ProgressColor.ProgressColorAuto,
+        steady_ms: 100, last_draw_ns: 0, draws: 0,
+        finished: false, finished_msg: "", cells: big.cells,
+    }
+    println("eta(overflow-guard) = " + progress_eta_secs(big2, t0 + 2000000000000).to_str() + " (unknown)")
+
+    # Duration formatting table.
+    let secs: list[int] = [0, 1, 45, 59, 60, 61, 192, 3599, 3600, 7500,
+        86399, 86400, 356000, -1]
+    let mut i: int = 0
+    while i < secs.len() {
+        let v: int = secs.get(i)
+        println("  format_secs(" + v.to_str() + ") = " + progress_format_secs(v))
+        i = i + 1
+    }
+
+    # Percent formatting table.
+    let pcts: list[int] = [0, 7, 42, 100, -1, 101]
+    let mut j: int = 0
+    while j < pcts.len() {
+        let p: int = pcts.get(j)
+        println("  format_pct(" + p.to_str() + ") = '" + progress_format_percent(p) + "'")
+        j = j + 1
+    }
+}
+
+# ----------------------------------------------------------------------------
+# Demo 5 — Rendering at every ColorLevel (graceful degradation).
+# ----------------------------------------------------------------------------
+
+fn demo_color_levels() -> void uses IO {
+    section("Rendering at every ColorLevel")
+
+    let t0: int = 5000000000000000
+    let pb: ProgressBar = progress_with_label(progress_new(20), "Color")
+    progress_set_position(pb, 10)
+
+    let levels: list[ColorLevel] = [
+        ColorLevel.ColorNone,
+        ColorLevel.ColorBasic,
+        ColorLevel.Color256,
+        ColorLevel.ColorTruecolor,
+    ]
+    let mut i: int = 0
+    while i < levels.len() {
+        let lv: ColorLevel = levels.get(i)
+        let line: str = progress_render(pb, lv, t0)
+        println("  " + str_pad_right(color_level_name(lv), 9, " ") + " "
+            + progress_render(pb, lv, t0))
+        println("    bytes=" + line.len().to_str())
+        i = i + 1
+    }
+
+    # A colored spinner frame + finished line at Basic.
+    let sp: ProgressBar = progress_with_spinner(
+        progress_with_label(progress_new(0), "Spin"), SpinnerStyle.SpinnerBounce)
+    progress_tick(sp)
+    println("  basic frame: " + progress_render(sp, ColorLevel.ColorBasic, t0))
+    progress_finish_state(sp, "")
+    println("  basic done: " + progress_render(sp, ColorLevel.ColorBasic, t0 + 2000000000))
+}
+
+# ----------------------------------------------------------------------------
+# Demo 6 — The --color flag surface (progress_color_from_str).
+# ----------------------------------------------------------------------------
+
+fn demo_color_modes() -> void uses IO {
+    section("Color modes (--color=always / never / auto)")
+
+    let vals: list[str] = ["always", "never", "auto", "ALWAYS", "Never", "bogus", ""]
+    let mut i: int = 0
+    while i < vals.len() {
+        let v: str = vals.get(i)
+        println("  --color=" + str_pad_right("'" + v + "'", 9, " ") + " -> "
+            + progress_color_name(progress_color_from_str(v)))
+        i = i + 1
+    }
+}
+
+# ----------------------------------------------------------------------------
+# Demo 7 — MultiBar (one line per concurrent task).
+# ----------------------------------------------------------------------------
+
+fn demo_multibar() -> void uses IO, Proc {
+    section("MultiBar (one line per task)")
+
+    let t0: int = 6000000000000000
+
+    let mb: MultiBar = multibar_new()
+    let dl: ProgressBar = progress_with_label(progress_new(100), "download")
+    let pr: ProgressBar = progress_with_spinner(
+        progress_with_label(progress_new(0), "parse"), SpinnerStyle.SpinnerDots)
+    let ix: ProgressBar = progress_with_head(
+        progress_with_chars(progress_with_label(progress_new(50), "index"), "=", "-"),
+        ">")
+
+    let i_dl: int = multibar_add(mb, dl)
+    let i_pr: int = multibar_add(mb, pr)
+    let i_ix: int = multibar_add(mb, ix)
+    println("  added " + multibar_len(mb).to_str() + " bars (idx "
+        + i_dl.to_str() + ", " + i_pr.to_str() + ", " + i_ix.to_str() + ")")
+
+    progress_set_position(dl, 40)
+    progress_tick(pr)
+    progress_tick(pr)
+    progress_tick(pr)
+    progress_set_position(ix, 25)
+    println(multibar_render(mb, ColorLevel.ColorNone, t0))
+
+    # A worker snapshot update (the value-snapshot model): "download"
+    # advances to 70 while "parse" finishes.
+    let dl2: ProgressBar = multibar_get(mb, 0)
+    progress_set_position(dl2, 70)
+    multibar_set(mb, 0, dl2)
+    let pr2: ProgressBar = multibar_get(mb, 1)
+    progress_finish_state(pr2, "3 files")
+    multibar_set(mb, 1, pr2)
+    progress_tick(multibar_get(mb, 2))
+    println(multibar_render(mb, ColorLevel.ColorNone, t0 + 3000000000))
+
+    multibar_finish(mb)
+    println(multibar_render(mb, ColorLevel.ColorNone, t0 + 5000000000))
+}
+
+# ----------------------------------------------------------------------------
+# Demo 8 — isatty smoke + live drawing (suppressed when piped).
+# ----------------------------------------------------------------------------
+
+fn demo_live() -> void uses IO, Clock, Proc {
+    section("Live drawing (isatty-gated)")
+
+    # The fd states are identical between the interpreter and the native
+    # binary under the same redirection, so these two lines are
+    # differential-safe.
+    if isatty(1) {
+        println("  stdout IS a terminal")
+    } else {
+        println("  stdout is NOT a terminal (piped / redirected)")
+    }
+    if isatty(2) {
+        println("  stderr IS a terminal -> bars will animate")
+    } else {
+        println("  stderr is NOT a terminal -> live bars stay silent")
+    }
+    if isatty(0) {
+        println("  stdin IS a terminal")
+    } else {
+        println("  stdin is NOT a terminal")
+    }
+
+    # The forced stderr echo — deterministic CONTENT on stderr proves the
+    # Stage 56 eprint/eprintln builtins work in the differential path
+    # (both backends flush stdout first, so the interleaving is
+    # byte-identical).
+    eprintln("  [stderr] eprint works — this line is deterministic")
+
+    # Live animation — only draws when stderr is a TTY (or
+    # PROGRESS_FORCE=1); under redirection this performs zero writes.
+    let pb: ProgressBar = progress_with_spinner(
+        progress_with_label(progress_new(0), "Live spin"), SpinnerStyle.SpinnerDots)
+    pb.start()
+    let mut i: int = 0
+    while i < 6 {
+        progress_tick_draw(pb)
+        i = i + 1
+    }
+    progress_finish_with(pb, "demo over")
+
+    let bar: ProgressBar = progress_with_label(progress_new(12), "Live bar")
+    bar.start()
+    let mut j: int = 0
+    while j < 12 {
+        progress_inc_draw(bar, 1)
+        j = j + 1
+    }
+    bar.finish()
+
+    # Whether or not anything was drawn, the marker shows the section ran.
+    println("  live section completed (draws: spin="
+        + progress_draw_count(pb).to_str() + " bar="
+        + progress_draw_count(bar).to_str() + ")")
+}
+
+# ----------------------------------------------------------------------------
+# Demo 9 — Zero-allocation state updates (the contract, demonstrated).
+# ----------------------------------------------------------------------------
+
+fn demo_zero_alloc() -> void uses IO {
+    section("Zero-allocation state updates")
+
+    # 1M inc + tick + set_message calls on fixed-size state: no list
+    # growth, no string materialisation (the renders are what allocate,
+    # and they are rate-limited in live use).
+    let pb: ProgressBar = progress_with_label(progress_new(1000000), "Churn")
+    let mut i: int = 0
+    while i < 1000000 {
+        progress_inc(pb, 1)
+        progress_tick(pb)
+        i = i + 1
+    }
+    println("  1,000,000 inc + tick calls:"
+        + " position=" + progress_position(pb).to_str()
+        + " ticks=" + progress_tick_count(pb).to_str()
+        + " renders=1")
+    println(progress_render(pb, ColorLevel.ColorNone, 7000000000000000))
+}
+
+# ----------------------------------------------------------------------------
+# Main — run every section in order.
+# ----------------------------------------------------------------------------
+
+fn main() -> int uses IO, Clock, Proc {
+    println("=== Stage 56: std.progress — bars, spinners, ETA, multi-bar ===")
+    demo_determinate()
+    demo_custom_bars()
+    demo_spinners()
+    demo_eta_math()
+    demo_color_levels()
+    demo_color_modes()
+    demo_multibar()
+    demo_live()
+    demo_zero_alloc()
+    println("")
+    println("demo complete.")
+    return 0
+}

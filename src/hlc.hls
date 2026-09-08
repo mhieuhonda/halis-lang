@@ -2762,6 +2762,25 @@ fn is_builtin_fn(n: str) -> bool {
     || n == "math_tgamma" || n == "math_lgamma" || n == "math_isnan"
     || n == "math_isinf" || n == "math_isfinite" || n == "math_signbit"
     || n == "math_copysign"
+    # Stage 56 (v0.75.0-alpha): stderr + TTY-detection builtins.
+    # eprint / eprintln write to STDERR (consuming the str argument,
+    # exactly like print / println consume theirs for stdout). They
+    # flush stdout FIRST so interleaved stdout/stderr output stays in
+    # the caller's logical order (stdout is block-buffered when
+    # redirected — without the flush, every stderr line would land
+    # before every stdout line in the combined capture). Both carry
+    # the IO effect and are taint sinks (same threat as print: a
+    # tainted message lets an attacker inject ANSI escapes into the
+    # terminal). isatty(fd) reports whether a file descriptor refers
+    # to a terminal (the TTY detection std.color's v0.74.0-alpha
+    # limitations deferred to "Stage 56+ when std.progress lands and
+    # the spinner needs it"). It carries the IO effect (querying a
+    # stream's state is an I/O observation). The stdlib
+    # std/progress.hls builds the user-facing API on all three:
+    # progress bars draw to stderr (data goes to stdout — the
+    # tqdm / indicatif convention) and suppress drawing when stderr
+    # is not a TTY.
+    || n == "eprint" || n == "eprintln" || n == "isatty"
 }
 
 fn list_has(list: list[str], x: str) -> bool {
@@ -3181,6 +3200,17 @@ fn builtin_effect(name: str) -> list[str] {
     # effect), so they fall through to the empty default.
     if name == "instant_now_ns" || name == "system_time_now_ms" {
         return ["Clock"]
+    }
+    # Stage 56 (v0.75.0-alpha): stderr + TTY-detection builtins.
+    # eprint / eprintln write to stderr (IO — the same effect family
+    # as print / println; the effect algebra does not distinguish
+    # WHICH stream is written, only THAT a stream is written). isatty
+    # queries a file descriptor's stream state — an I/O observation
+    # (IO), not a process-state access (Proc): it reads no env var,
+    # no cwd, no child; it observes the process's own I/O streams,
+    # exactly like read_line observes stdin.
+    if name == "eprint" || name == "eprintln" || name == "isatty" {
+        return ["IO"]
     }
     # Stage 16 (v0.27.0-alpha): the concurrency effect. Every task /
     # channel operation carries `Conc`; a program must declare
@@ -4040,10 +4070,14 @@ fn tail_check_expr(ctx: Ctx, e: int, key: str) -> void {
             cerr(n.line, "#[tail_call] violated: the recursive call to '" + key + "' at line " + n.line.to_str() + " is not in tail position — every recursive call must be the entire return expression (`return " + key + "(...)`)")
             return
         }
-        # Consume-builtin exception: panic / print / println with ONE
-        # string literal argument (never hoisted, never bound, released
-        # by the callee — provably cleanup-free at the jump).
-        if !n.muser && (n.mkey == "panic" || n.mkey == "print" || n.mkey == "println") {
+        # Consume-builtin exception: panic / print / println / eprint /
+        # eprintln with ONE string literal argument (never hoisted,
+        # never bound, released by the callee — provably
+        # cleanup-free at the jump). Stage 56 (v0.75.0-alpha) added
+        # eprint / eprintln to the exception set: they consume their
+        # argument exactly like print / println do.
+        if !n.muser && (n.mkey == "panic" || n.mkey == "print" || n.mkey == "println"
+            || n.mkey == "eprint" || n.mkey == "eprintln") {
             let mut ok: bool = n.args.len() == 1
             if ok {
                 let a: ExprN = ctx.exprs[n.args.get(0)]
@@ -7586,7 +7620,15 @@ fn check_builtin_call(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, 
     # Stage 10-alpha: taint-sink enforcement.
     # Reject tainted[T] at sink argument positions; user must explicitly
     # untaint via taint_unwrap or a sanitizer (sanitize_html etc.).
-    if name == "print" || name == "println" {
+    # Stage 56 (v0.75.0-alpha): eprint / eprintln are sinks for the
+    # same reason print / println are — a tainted message written to
+    # the terminal lets an attacker inject ANSI escape sequences
+    # (terminal spoofing / title reprogramming / clipboard theft on
+    # some terminals). isatty takes an int fd (not a sink — the fd is
+    # a program-controlled constant, never attacker data; passing a
+    # tainted int would leak nothing anyway since the result only
+    # reveals whether the program's OWN descriptor is a terminal).
+    if name == "print" || name == "println" || name == "eprint" || name == "eprintln" {
         # Deep-scan fix: check argument count BEFORE the taint check so
         # `print()` (zero args) gives a clean error message instead of
         # crashing on argt.get(0) out-of-bounds.
@@ -7644,12 +7686,28 @@ fn check_builtin_call(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, 
             cerr(line, "taint-sink violation: write_file argument 2 (content) is " + argt.get(1) + " (tainted values must be sanitised before reaching a sink)")
         }
     }
-    if name == "print" || name == "println" {
+    if name == "print" || name == "println" || name == "eprint" || name == "eprintln" {
         if nargs != 1 || argt.get(0) != "str" {
             cerr(line, name + " expects 1 str argument")
         }
-        add_edge(ctx, cur, "b:print")
+        # Edge name reflects the ACTUAL builtin (b:print / b:eprint / ...)
+        # so the --audit output lists which stream family was written.
+        # builtin_effect resolves all four to ["IO"].
+        add_edge(ctx, cur, "b:" + name)
         return "void"
+    }
+    # Stage 56 (v0.75.0-alpha): isatty(fd: int) -> bool — true when the
+    # file descriptor refers to a terminal. Carries IO (a stream-state
+    # observation). 0 = stdin, 1 = stdout, 2 = stderr (the POSIX fd
+    # convention); other descriptors work too (whatever the process
+    # opened). Negative fds are simply not terminals (isatty(2) in C
+    # returns 0 for EBADF — no panic, no UB).
+    if name == "isatty" {
+        if nargs != 1 || argt.get(0) != "int" {
+            cerr(line, "isatty expects 1 int argument (the file descriptor: 0 = stdin, 1 = stdout, 2 = stderr)")
+        }
+        add_edge(ctx, cur, "b:isatty")
+        return "bool"
     }
     if name == "panic" {
         if nargs != 1 || argt.get(0) != "str" {
@@ -11002,6 +11060,44 @@ fn runtime_lines() -> list[str] {
     r.push("    hl_str_release(s);")
     r.push("}")
     r.push("")
+    # ----- Stage 56 (v0.75.0-alpha): stderr + TTY-detection helpers -----
+    # hl_eprint / hl_eprintln write to stderr, consuming the str (the
+    # same ownership convention as hl_print / hl_println). They
+    # fflush(stdout) FIRST: when both streams are redirected into one
+    # capture, C stdout is block-buffered while stderr is unbuffered —
+    # without the flush every stderr line would land BEFORE every
+    # stdout line. With the flush the combined capture preserves the
+    # caller's logical order, and the Stage-0 interpreter (which
+    # flushes self.out before writing sys.stderr.buffer) produces
+    # byte-identical interleaving. This mirrors the deep-scan-22 fix
+    # that added fflush(stdout) to proc_exec / proc_spawn.
+    r.push("// Stage 56 (v0.75.0-alpha): hl_eprint / hl_eprintln — write to")
+    r.push("// stderr, consuming the str argument (same convention as")
+    r.push("// hl_print / hl_println). fflush(stdout) first so interleaved")
+    r.push("// stdout/stderr output keeps the caller's logical order in a")
+    r.push("// combined capture (stdout is block-buffered when redirected).")
+    r.push("static void hl_eprint(hl_str* s) {")
+    r.push("    fflush(stdout);")
+    r.push("    fwrite(s->data, 1, (size_t)s->len, stderr);")
+    r.push("    hl_str_release(s);")
+    r.push("}")
+    r.push("")
+    r.push("static void hl_eprintln(hl_str* s) {")
+    r.push("    fflush(stdout);")
+    r.push("    fwrite(s->data, 1, (size_t)s->len, stderr);")
+    r.push("    fputc('\\n', stderr);")
+    r.push("    hl_str_release(s);")
+    r.push("}")
+    r.push("")
+    r.push("// Stage 56 (v0.75.0-alpha): hl_isatty — true when fd refers to a")
+    r.push("// terminal. isatty() is declared in <unistd.h> (already included).")
+    r.push("// Invalid / negative fds simply return false (isatty sets EBADF")
+    r.push("// and returns 0 — no panic, no UB), matching os.isatty in the")
+    r.push("// Stage-0 interpreter byte-for-byte.")
+    r.push("static bool hl_isatty(int64_t fd) {")
+    r.push("    return isatty((int)fd);")
+    r.push("}")
+    r.push("")
     r.push("// hl_read_file: consumes the path, returns a fresh str. The temporary")
     r.push("// read buffer is freed before returning (it used to leak under the")
     r.push("// arena model).")
@@ -12984,6 +13080,15 @@ fn hoist_child(ctx: Ctx, c: int) -> void {
 # AGAIN after the builtin has already released it → double-free.
 fn builtin_arg_borrowed(name: str) -> bool {
     if name == "println" || name == "print" || name == "panic" || name == "exit" {
+        return false
+    }
+    # Stage 56 (v0.75.0-alpha): eprint / eprintln consume their str
+    # argument (the C runtime calls hl_str_release after the stderr
+    # fwrite — the same ownership convention as print / println).
+    # Without this, `eprint(prefix + msg)` would double-free the
+    # concat result (same bug pattern as proc_exec's `cmd + " " + ip`
+    # before the Stage 9 release fix).
+    if name == "eprint" || name == "eprintln" {
         return false
     }
     if name == "write_file" || name == "read_file" || name == "read_file_tainted" {
@@ -15499,6 +15604,19 @@ fn gen_call(ctx: Ctx, e: int) -> str {
     }
     if name == "println" {
         return "hl_println(" + gen_own_arg(ctx, ctx.exprs[e].args.get(0)) + ")"
+    }
+    # ----- Stage 56 (v0.75.0-alpha): stderr + TTY-detection builtins -----
+    # eprint / eprintln consume their str argument (gen_own_arg — the
+    # same convention as print / println). isatty takes a primitive int
+    # (no refcount concern — gen_expr passes it raw).
+    if name == "eprint" {
+        return "hl_eprint(" + gen_own_arg(ctx, ctx.exprs[e].args.get(0)) + ")"
+    }
+    if name == "eprintln" {
+        return "hl_eprintln(" + gen_own_arg(ctx, ctx.exprs[e].args.get(0)) + ")"
+    }
+    if name == "isatty" {
+        return "hl_isatty(" + gen_expr(ctx, ctx.exprs[e].args.get(0)) + ")"
     }
     if name == "panic" {
         return "hl_panic(" + gen_own_arg(ctx, ctx.exprs[e].args.get(0)) + ")"

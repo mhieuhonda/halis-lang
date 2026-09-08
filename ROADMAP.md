@@ -96,9 +96,9 @@ remains green.
 | # | Stage | Status | Estimated effort |
 |---|-------|:------:|:----------------:|
 | 53 | `std.cli` — argument parser (subcommands, env, defaults) | ✅ | (done in v0.72.0-alpha) |
-| 54 | `std.tui` — terminal raw mode, ANSI escapes, screen grid | ⬜ | 6 weeks |
-| 55 | `std.color` — terminal color detection, truecolor fallback | ⬜ | 2 weeks |
-| 56 | `std.progress` — progress bars, spinners, ETA | ⬜ | 3 weeks |
+| 54 | `std.tui` — terminal raw mode, ANSI escapes, screen grid | ✅ | (done in v0.73.0-alpha) |
+| 55 | `std.color` — terminal color detection, truecolor fallback | ✅ | (done in v0.74.0-alpha) |
+| 56 | `std.progress` — progress bars, spinners, ETA | ✅ | (done in v0.75.0-alpha) |
 | 57 | `std.log` — structured logging (JSON + human formats) | ⬜ | 3 weeks |
 | 58 | `std.config` — TOML + YAML + env-layered config loader | ⬜ | 4 weeks |
 | 59 | `std.complete` — shell-completion generator (bash/zsh/fish) | ⬜ | 3 weeks |
@@ -5633,7 +5633,69 @@ at every ColorLevel + rainbow gradient).
 
 **56. `std.progress`** — `ProgressBar::new(total)`, `tick()`,
 `finish()`, `ETA` estimation, multi-bar (one per concurrent task),
-spinner styles. Zero allocation after creation.
+spinner styles. Zero allocation after creation. ✅
+**DONE in v0.75.0-alpha** — implemented as `std/progress.hls` (pure
+render core + thin live shell) with THREE new compiler builtins:
+`eprint(s)` / `eprintln(s)` (stderr writes — IO effect, taint sinks,
+argument consumed, `fflush(stdout)` first so interleaved stdout/stderr
+output keeps the caller's logical order in a combined capture) and
+`isatty(fd) -> bool` (TTY detection — the probe std.color's
+v0.74.0-alpha limitations deferred to exactly this stage). The API
+covers every feature the roadmap promises:
+
+  * **ProgressBar** — `progress_new(total)`: `total > 0` determinate
+    (bar + percent + ETA + rate), `total == 0` indeterminate spinner
+    (frame + tick count + elapsed). The method form gives the
+    roadmap's exact API: `pb.start()`, `pb.inc(1)`, `pb.tick()`,
+    `pb.finish()`, `pb.finish_with(msg)`, plus the pure accessors
+    (`.position() / .total() / .percent() / .eta_secs(now_ns) /
+    .is_finished() / .render(level, now_ns)`). State updates (inc /
+    set_position / set_message / tick / finish_state) mutate
+    fixed-size fields in place — zero allocation; the pre-allocated
+    `cells` list (width entries) is overwritten in place via
+    `list.set` and materialised with ONE join per monochrome redraw;
+    suppressed redraws (the 100 ms steady rate limiter) perform zero
+    string work — the HLS analogue of indicatif's
+    zero-allocation-after-construction guarantee.
+  * **ETA estimation** — `progress_eta_secs(pb, now_ns)`: pure
+    INTEGER arithmetic (`elapsed_secs * remaining / position`) with a
+    pre-checked int64 overflow guard (unknown renders "eta ?", never
+    a wrapped negative). `progress_rate_per_sec` (0 while sub-second),
+    `progress_percent` (overflow-guarded 0..100), compact duration
+    formatting (45s / 3m12s / 2h05m / 4d03h).
+  * **Spinner styles** — 8 built-in cycles (braille dots, line,
+    dots-ascii, arrow, bounce, toggle, triangle, pipe) with
+    `spinner_frame(style, i)` (wraps modulo the cycle),
+    `spinner_style_from_name` (the `--spinner=<name>` flag surface),
+    and `spinner_frames_preview` (CLI help text).
+  * **Multi-bar** — `MultiBar` renders one line per concurrent task
+    and redraws in place (cursor-up + EL 2 + line + newline). The
+    value-snapshot concurrency model: workers own private bars /
+    counters and report through channels (the sanctioned cross-task
+    communication); the UI task updates snapshots via
+    `multibar_set(idx, snapshot)` and calls `multibar_draw` — no
+    shared mutable state, no locks.
+  * **Live drawing** — bars draw to STDERR (data stays clean on
+    stdout — the tqdm / indicatif convention) and are gated by
+    `progress_should_draw()`: `PROGRESS_DISABLE` beats
+    `PROGRESS_FORCE` beats `isatty(2)`. A piped process performs
+    ZERO writes. Rate-limited by `steady_ms` (default 100 ms).
+  * **Color integration** — the roadmap's `--color=always / never /
+    auto` flag surface (deferred to Stage 56 by std.color's
+    limitations): `progress_color_from_str` parses the flag value;
+    `progress_resolve_level` resolves Auto → color only when stderr
+    is a TTY, Always → the std.color env detector, Never → no
+    escapes. The filled span renders green, the spinner frame cyan,
+    the finished line bold green — at every ColorLevel
+    (truecolor → 256 → basic → none comes free from std.color); the
+    monochrome line is completely escape-free (TERM=dumb safe).
+  * **Differential parity** — the render core is PURE (ColorLevel +
+    now_ns as explicit arguments; no clock / env / isatty on the
+    render path), so interpreter and native outputs are
+    byte-identical (verified by `make progress-acceptance` — 13
+    sub-tests + 2 differential tests, all green). The live smoke
+    prints only relative assertions (the Stage 49 wall-clock
+    pattern). Bootstrap self-compilation remains deterministic.
 
 **57. `std.log`** — `info!`, `warn!`, `error!`, `debug!`, `trace!`
 macros. Structured logging (key-value pairs). Output formats: human

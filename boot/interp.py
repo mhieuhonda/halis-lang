@@ -1304,6 +1304,36 @@ class Interp:
         if name == "println":
             self.out.write(args[0] + b"\n")
             return None
+        # ----- Stage 56 (v0.75.0-alpha): stderr + TTY-detection builtins -----
+        # eprint / eprintln write to stderr. They flush self.out (the
+        # stdout buffer) FIRST so interleaved stdout/stderr output keeps
+        # the caller's logical order — the interpreter-side mirror of
+        # the C runtime's fflush(stdout) in hl_eprint / hl_eprintln
+        # (without it, Python's buffered stdout would land AFTER the
+        # unbuffered stderr writes in a combined capture, diverging
+        # from the native binary's byte order). sys.stderr.buffer is
+        # flushed after the write so the bytes leave immediately (the
+        # ordering guarantee holds even under 2>&1 redirection).
+        if name == "eprint":
+            self.out.flush()
+            sys.stderr.buffer.write(args[0])
+            sys.stderr.buffer.flush()
+            return None
+        if name == "eprintln":
+            self.out.flush()
+            sys.stderr.buffer.write(args[0] + b"\n")
+            sys.stderr.buffer.flush()
+            return None
+        # isatty(fd) — true when the file descriptor refers to a
+        # terminal. os.isatty mirrors C isatty() semantics: an invalid
+        # fd (negative / not open) simply returns False (EBADF), never
+        # raises in practice; the defensive except keeps the contract
+        # total (C's isatty also returns 0 on EBADF — no panic).
+        if name == "isatty":
+            try:
+                return bool(os.isatty(args[0]))
+            except (OSError, ValueError):
+                return False
         if name == "panic":
             raise HLPanic(args[0], line)
         if name == "exit":

@@ -31,7 +31,7 @@ else
   HL_CURL_DEFS :=
 endif
 
-.PHONY: all stage0 bootstrap test examples clean run check bench install uninstall audit opt-stats emit-ir emit-llvm fmt lint lsp-check pkg-init pkg-add pkg-lock pkg-audit pkg-verify pkg-build pkg-publish pkg-log pkg-log-verify prove prove-full model prove-acceptance hltest fuzz cov fuzz-acceptance wasm-opt webapp webapp-acceptance serve aarch64-bench aarch64-acceptance aarch64-list-targets stack-acceptance inline-acceptance opt-stats-report kernel-attrs escape-acceptance layout-report tail-acceptance tail-report asm-acceptance asm-attrs bench-stdlib spec-check stage32-acceptance async-acceptance stream-acceptance io-acceptance fs-acceptance net-acceptance http-acceptance http2-acceptance json-stream-acceptance regex-acceptance fmt-acceptance hash-acceptance collections-acceptance sync-acceptance thread-acceptance time-acceptance math-acceptance process-acceptance env-acceptance archive-acceptance uuid-ulid-acceptance cli-acceptance tui-acceptance color-acceptance
+.PHONY: all stage0 bootstrap test examples clean run check bench install uninstall audit opt-stats emit-ir emit-llvm fmt lint lsp-check pkg-init pkg-add pkg-lock pkg-audit pkg-verify pkg-build pkg-publish pkg-log pkg-log-verify prove prove-full model prove-acceptance hltest fuzz cov fuzz-acceptance wasm-opt webapp webapp-acceptance serve aarch64-bench aarch64-acceptance aarch64-list-targets stack-acceptance inline-acceptance opt-stats-report kernel-attrs escape-acceptance layout-report tail-acceptance tail-report asm-acceptance asm-attrs bench-stdlib spec-check stage32-acceptance async-acceptance stream-acceptance io-acceptance fs-acceptance net-acceptance http-acceptance http2-acceptance json-stream-acceptance regex-acceptance fmt-acceptance hash-acceptance collections-acceptance sync-acceptance thread-acceptance time-acceptance math-acceptance process-acceptance env-acceptance archive-acceptance uuid-ulid-acceptance cli-acceptance tui-acceptance color-acceptance progress-acceptance
 
 # Main goal: use the full bootstrap chain to build the native compiler
 all: bootstrap
@@ -2207,3 +2207,54 @@ color-acceptance: bin/hlc
 	@echo "  differential (interpreter == native) verified green."
 
 .PHONY: color-acceptance
+
+# ============================================================================
+# Stage 56 (v0.75.0-alpha): std.progress -- progress bars, spinners,
+# ETA estimation, multi-bar rendering. THREE new compiler builtins
+# (eprint / eprintln: stderr writes with the flush-first discipline;
+# isatty(fd): TTY detection -- the probe std.color deferred to this
+# stage). Pure-HLS module: the render core is pure (explicit ColorLevel
+# + now_ns), the live shell draws to stderr and stays silent when
+# stderr is not a TTY (isatty(2)) so piped output is never polluted.
+# ============================================================================
+
+# Stage 56 progress demo + acceptance test are deterministic: every
+# stdout line is a pure function of fixed inputs (synthetic now_ns /
+# ColorLevel), the live-draw section checks isatty(2) first and writes
+# NOTHING under redirection (the acceptance harness always redirects),
+# and the only forced stderr content is the fixed eprint/eprintln echo
+# (both backends flush stdout before the stderr write, so the combined
+# capture interleaves byte-identically). The differential tests compare
+# interpreter vs native output byte-for-byte.
+progress-acceptance: bin/hlc
+	@$(PYTHON) boot/boot.py examples/progress_demo.hls > /tmp/progress_demo_interp.txt 2>&1
+	@bin/hlc examples/progress_demo.hls /tmp/progress_demo.c 2>/dev/null
+	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/progress_demo /tmp/progress_demo.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
+	@/tmp/progress_demo > /tmp/progress_demo_nat.txt 2>&1
+	@diff -q /tmp/progress_demo_interp.txt /tmp/progress_demo_nat.txt >/dev/null 2>&1 \
+		|| (echo "FAIL: progress_demo differential mismatch" && false)
+	@$(PYTHON) boot/boot.py tests/ok/feat_stage56_progress.hls > /tmp/s56_interp.txt 2>&1
+	@bin/hlc tests/ok/feat_stage56_progress.hls /tmp/s56.c 2>/dev/null
+	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/s56 /tmp/s56.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
+	@/tmp/s56 > /tmp/s56_nat.txt 2>&1
+	@diff -q /tmp/s56_interp.txt /tmp/s56_nat.txt >/dev/null 2>&1 \
+		|| (echo "FAIL: feat_stage56_progress differential mismatch" && false)
+	@rm -f /tmp/progress_demo /tmp/progress_demo.c /tmp/progress_demo_interp.txt /tmp/progress_demo_nat.txt \
+		/tmp/s56 /tmp/s56.c /tmp/s56_interp.txt /tmp/s56_nat.txt
+	@echo ""
+	@echo "ACCEPTANCE OK: Stage 56 -- std.progress (progress bars, spinners, ETA)"
+	@echo "  ProgressBar: progress_new(total) determinate + indeterminate (total = 0)"
+	@echo "  State: inc / set_position / set_message / tick (pure, zero-alloc, clamped)"
+	@echo "  Builders: with_label/message/width/chars/head/spinner/color/steady (immutable)"
+	@echo "  impl ProgressBar: .start/.inc/.tick/.draw/.finish + pure accessors (roadmap API)"
+	@echo "  ETA estimation: integer math + int64 overflow guard (elapsed * remaining / pos)"
+	@echo "  Rate + percent + compact duration formatting (45s/3m12s/2h05m/4d03h)"
+	@echo "  8 spinner styles (dots/line/dots-ascii/arrow/bounce/toggle/triangle/pipe)"
+	@echo "  MultiBar: one line per task, cursor-up + EL 2 redraw, value-snapshot model"
+	@echo "  Rendering at every ColorLevel (byte-exact SGR; monochrome is escape-free)"
+	@echo "  3 new builtins: eprint/eprintln (stderr, taint sink, fflush-first) + isatty(fd)"
+	@echo "  Live draws gated by isatty(2) (+ PROGRESS_FORCE / PROGRESS_DISABLE env)"
+	@echo "  --color=always/never/auto surface (progress_color_from_str)"
+	@echo "  differential (interpreter == native) verified green."
+
+.PHONY: progress-acceptance
