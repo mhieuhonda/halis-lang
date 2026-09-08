@@ -1,0 +1,1571 @@
+# ============================================================================
+# std/color.hls — Stage 55 (v0.74.0-alpha): terminal color support +
+# truecolor/256/16/monochrome fallback + Style builder.
+# ----------------------------------------------------------------------------
+# This module is the THIRD module of Phase IV (the CLI tooling track,
+# Stages 53–62). It implements the roadmap's Stage 55 promise:
+#
+#   * Detect terminal color support from env vars (TERM, COLORTERM,
+#     NO_COLOR, plus CLICOLOR_FORCE / FORCE_COLOR / CLICOLOR for parity
+#     with the wider ecosystem: the `colored` crate, `no_color` crate,
+#     `supports-color` crate, and `clap`'s color-on/help-style logic).
+#   * Truecolor (24-bit) fallback to 256-colour to 16-colour to
+#     monochrome. The runtime queries the detected level ONCE, then every
+#     cstyle_to_sgr(cs, level) call emits the right escape codes for
+#     that level. A Color value carries its full RGB / 256 / basic
+#     information; cstyle_to_sgr quantises it down to whatever the
+#     terminal can render.
+#   * `cstyle_new().fg(color_red()).bold()` builder — the roadmap's
+#     exact API name. `cstyle_new()` returns the empty ColorStyle;
+#     chained `.fg(Color)` / `.bg(Color)` / `.bold()` / `.dim()` /
+#     `.italic()` / `.underline()` / ... return new ColorStyles
+#     (immutable update, same convention as std.tui's Style builder).
+#
+# Design choices (matching the roadmap's "Detect terminal color support
+# (TERM, COLORTERM, NO_COLOR). Truecolor (24-bit) fallback to 256-color
+# to 16-color to monochrome. Style::new().fg(RED).bold() builder."):
+#
+#   1. PURE-HLS IMPLEMENTATION.
+#      No new compiler builtins. The module uses the existing `env_has`
+#      + `env_get` builtins (Proc effect, Stage 48, v0.67.0-alpha) for
+#      the env-var probe, and the existing `print()` builtin (IO effect)
+#      for emitting ANSI escape codes. The escape sequences are
+#      constructed as `chr(27) + "[..."` byte strings — exactly the same
+#      pattern as std.tui's tui_csi() (Stage 54, v0.73.0-alpha) and
+#      std.http's http_crlf() (Stage 38, v0.57.0-alpha).
+#
+#   2. DETECTION IS PURE + EXPLICIT.
+#      `color_detect()` reads env vars and carries `uses Proc`. For
+#      testability and differential parity, the same logic is exposed
+#      as the PURE function `color_detect_from(term, has_term,
+#      colorterm, has_colorterm, no_color) -> ColorLevel` — every env
+#      value is passed in as an explicit argument, so the test suite
+#      can call it with synthetic values (no env_set, no Proc effect,
+#      byte-identical between interpreter and native).
+#
+#   3. COLOR IS A SUM TYPE, NOT AN INT.
+#      `enum Color { ColorNone, ColorBasic(int), Color256(int),
+#      ColorRgb(Rgb) }` carries the full color information up to the
+#      renderer. The renderer (cstyle_to_sgr) quantises it down to the
+#      detected ColorLevel. This is the same "rich type + quantise at
+#      the boundary" pattern that Rust's `nu-ansi-term`, Python's
+#      `rich`, and Go's `lipgloss` all use.
+#
+#   4. FALLBACK CHAIN.
+#      Truecolor → 256: quantise the RGB to the xterm-256 cube (6
+#      levels per channel: 0,95,135,175,215,255) OR to the 24-step
+#      grayscale ramp (8..238 step 10) if it's closer to a gray.
+#      256 → 16: map xterm-256 codes back to the basic 16-colour SGR
+#      codes (the cube colours 16..231 quantise to one of the 8 basic
+#      or 8 bright colours by nearest-reference-colour; the 24 grays
+#      232..255 quantise to black, white, bright-black, or bright-white
+#      by luminance). 16 → None: drop everything. None → None: trivial.
+#      The chain is monotone — quantising NEVER adds information.
+#
+#   5. EFFECT DISCIPLINE.
+#      - ColorLevel / Color / Rgb / ColorStyle are pure value types
+#        (no `uses IO`).
+#      - `color_detect_from(...)` is pure (no `uses` clause at all).
+#      - `color_detect()` carries `uses Proc` (reads env).
+#      - `cstyle_to_sgr(cs, level)` is pure (no `uses IO`) — returns
+#        the str; the caller decides whether to print.
+#      - `color_print(text, cs, level)` and `color_println(...)` carry
+#        `uses IO`.
+#
+#   6. DIFFERENTIAL PARITY.
+#      Every escape sequence is constructed via `chr(27) + "[..."` —
+#      a pure string operation. The output of `cstyle_to_sgr(cs, level)`
+#      is byte-identical between the interpreter and the native binary
+#      (no randomness, no system calls, no float arithmetic — the
+#      quantiser uses only integer arithmetic). The differential test
+#      (feat_stage55_color.hls) verifies this byte-for-byte via
+#      `make color-acceptance`.
+#
+#   7. NO BREAKING CHANGES TO std.tui.
+#      std.color is a SIBLING module to std.tui — it supplements, does
+#      not replace. std.tui's int-based Style stays as the low-level
+#      primitive (the 16-colour palette + SGR attributes); std.color's
+#      ColorStyle is the higher-level "rich color" type. A bridge
+#      function `cstyle_to_basic_style(cs)` extracts the basic-16
+#      + attributes as a std.tui Style (loses RGB / 256 info — same
+#      as if you called cstyle_to_sgr(cs, ColorBasic) but returns the
+#      Style value instead of the escape string). Callers that want
+#      truecolor go through std.color directly; callers that want
+#      only the basic palette can keep using std.tui.
+#
+# Security:
+#   * The escape sequences are FIXED STRINGS (no user input embedded).
+#     The Rgb / Color256 values are ints (validated at construction:
+#     rgb_new panics on r/g/b outside 0..255; color256_new panics on
+#     code outside 0..255). A malicious caller cannot smuggle an
+#     escape sequence into a Color value.
+#   * `color_detect()` reads env vars via env_has / env_get. The KEY
+#     arguments are taint sinks (info disclosure — looking up an
+#     attacker-controlled env var name reveals which env vars exist).
+#     The checker rejects a tainted key at compile time (same
+#     convention as std.env's env_var). The values returned by
+#     env_get are plain str (untainted) — they're used only in pure
+#     string comparisons inside the detector, never as a sink.
+#   * No path / command / file content is touched.
+#
+# Limitations (deferred to later stages):
+#   * No TTY detection. The detector reads env vars but does NOT
+#     isatty(STDOUT). A program piped to `less` will still emit color
+#     codes if the env says so. The standard workaround is to honor
+#     `CLICOLOR_FORCE` (force on) and `NO_COLOR` (force off) — both
+#     are honored here. True TTY detection requires a builtin
+#     (isatty(fd) -> bool); deferred to a future perfection stage or
+#     Stage 56+ when std.progress lands and the spinner needs it.
+#   * No `CLICOLOR=0` (the CLICOLOR spec says "0 means no color
+#     even on a TTY"). The v0.74.0-alpha detector honors CLICOLOR_FORCE
+#     and NO_COLOR; CLICOLOR=0 is treated as a set-and-non-empty
+#     CLICOLOR (which the spec says is "color on TTY"). A future
+#     perfection stage may add the isatty-based CLICOLOR handling.
+#   * No per-stream detection (only stdout). A program that prints
+#     colored output to stderr while stdout is redirected would
+#     still emit codes. The `supports-color` Rust crate handles this
+#     by taking a Stream argument; std.color's color_detect() is
+#     stdout-only (matching the most-common use case). A future
+#     perfection stage may add color_detect_stream(fd).
+#   * No COLORTERM validation beyond substring match. We accept any
+#     value containing "truecolor" or "24bit" as Truecolor. Real
+#     terminals set this to "truecolor" or "24bit" exactly; we're
+#     permissive (a value of "truecolorbanana" would still detect
+#     Truecolor). A future perfection stage may add exact-match
+#     validation.
+#   * No `--color=always` / `--color=never` / `--color=auto` CLI
+#     flag integration. That's a Stage 56+ concern (std.progress and
+#     std.log will integrate with this detector via their own CLI
+#     flags). For v0.74.0-alpha the caller does:
+#         let level: ColorLevel = color_detect()
+#         let s: ColorStyle = cstyle_new().fg(color_red()).bold()
+#         color_println("error", s, level)
+#     and the detector handles the rest.
+# ============================================================================
+
+import "std.str"
+import "std.option"
+import "std.tui"
+
+# ----------------------------------------------------------------------------
+# Constants — ANSI escape sequence prefixes (same pattern as std.tui).
+# ----------------------------------------------------------------------------
+
+# color_esc() — the ESC byte (0x1b). Provided as a function (not a
+# constant) because HLS v0.3 does not yet have top-level constant
+# expressions for str (constant decls must be int). Same convention as
+# std.tui's tui_esc() / std.http's http_cr_str().
+fn color_esc() -> str { return chr(27) }
+
+# color_csi() — the Control Sequence Introducer: ESC [.
+# Every SGR (color) sequence begins with these two bytes.
+fn color_csi() -> str { return chr(27) + "[" }
+
+# ----------------------------------------------------------------------------
+# ColorLevel — the detected capability of the terminal.
+# ----------------------------------------------------------------------------
+# The four levels form a total order: None < Basic < Color256 < Truecolor.
+# A higher level can render everything a lower level can; the renderer
+# quantises a Color value down to whatever the level supports.
+#
+# The values are:
+#   * ColorNone    — monochrome. No SGR color codes at all (the renderer
+#                    emits the attribute escapes only: bold, italic,
+#                    underline, ... — colors are dropped).
+#   * ColorBasic   — 16-colour (8 basic + 8 bright) + SGR attributes.
+#                    The classic ANSI palette; supported by every
+#                    terminal since the VT100.
+#   * Color256     — xterm's 256-colour palette (216 cube colours
+#                    16..231 + 24 grayscale 232..255 + the original 16).
+#                    Supported by xterm, gnome-terminal, konsole,
+#                    iTerm2, and every modern terminal.
+#   * ColorTruecolor — 24-bit RGB. The escape sequences are
+#                      `\x1b[38;2;r;g;bm` (fg) and `\x1b[48;2;r;g;bm`
+#                      (bg). Supported by every terminal that sets
+#                      COLORTERM=truecolor (which is every modern
+#                      terminal — gnome-terminal, konsole, iTerm2,
+#                      Windows Terminal, Alacritty, kitty, wezterm).
+
+enum ColorLevel {
+    ColorNone,        # 0 — monochrome
+    ColorBasic,       # 1 — 16-colour
+    Color256,         # 2 — xterm 256-colour
+    ColorTruecolor,   # 3 — 24-bit RGB
+}
+
+# color_level_to_int(level) — encode as an integer for comparison
+# (used by color_level_ge and the test suite). Lower = less capable.
+fn color_level_to_int(level: ColorLevel) -> int {
+    return match level {
+        ColorLevel.ColorNone => 0,
+        ColorLevel.ColorBasic => 1,
+        ColorLevel.Color256 => 2,
+        ColorLevel.ColorTruecolor => 3,
+    }
+}
+
+# color_level_from_int(i) — decode an integer back to a ColorLevel.
+# Used by tests and by the FORCE_COLOR=3 parser (which means "force
+# truecolor"). i outside 0..3 panics with a clear message.
+fn color_level_from_int(i: int) -> ColorLevel {
+    if i == 0 { return ColorLevel.ColorNone }
+    if i == 1 { return ColorLevel.ColorBasic }
+    if i == 2 { return ColorLevel.Color256 }
+    if i == 3 { return ColorLevel.ColorTruecolor }
+    panic("color_level_from_int: out of range " + i.to_str())
+}
+
+# color_level_ge(a, b) — true if level a is at least as capable as b.
+# Used by callers that want to skip work that the terminal can't show
+# (e.g., don't bother computing a 256-colour code if the level is Basic).
+fn color_level_ge(a: ColorLevel, b: ColorLevel) -> bool {
+    return color_level_to_int(a) >= color_level_to_int(b)
+}
+
+# color_level_eq(a, b) — equality (kept for symmetry with std.tui's
+# style_eq / rect_eq convention).
+fn color_level_eq(a: ColorLevel, b: ColorLevel) -> bool {
+    return color_level_to_int(a) == color_level_to_int(b)
+}
+
+# ----------------------------------------------------------------------------
+# Rgb — a 24-bit RGB color (0..255 per channel).
+# ----------------------------------------------------------------------------
+
+struct Rgb {
+    r: int,   # red,   0..255
+    g: int,   # green, 0..255
+    b: int,   # blue,  0..255
+}
+
+# rgb_new(r, g, b) — construct an Rgb. Validates each channel is in
+# 0..255; panics with a clear message otherwise (same convention as
+# std.tui's rect_new / buffer_new). The 0..255 range matches the SGR
+# truecolor spec (ISO 8613-6).
+fn rgb_new(r: int, g: int, b: int) -> Rgb {
+    if r < 0 || r > 255 {
+        panic("rgb_new: red out of range 0..255: " + r.to_str())
+    }
+    if g < 0 || g > 255 {
+        panic("rgb_new: green out of range 0..255: " + g.to_str())
+    }
+    if b < 0 || b > 255 {
+        panic("rgb_new: blue out of range 0..255: " + b.to_str())
+    }
+    let rgb: Rgb = Rgb { r: r, g: g, b: b }
+    return rgb
+}
+
+# rgb_eq(a, b) — structural equality.
+fn rgb_eq(a: Rgb, b: Rgb) -> bool {
+    if a.r != b.r { return false }
+    if a.g != b.g { return false }
+    if a.b != b.b { return false }
+    return true
+}
+
+# rgb_to_str(rgb) — human-readable "r,g,b" form (used by the demo and
+# by error messages). NOT the SGR escape sequence (use rgb_to_sgr_fg
+# / rgb_to_sgr_bg for those).
+fn rgb_to_str(rgb: Rgb) -> str {
+    return rgb.r.to_str() + "," + rgb.g.to_str() + "," + rgb.b.to_str()
+}
+
+# ----------------------------------------------------------------------------
+# Color — a sum type carrying full color information up to the renderer.
+# ----------------------------------------------------------------------------
+# The renderer (cstyle_to_sgr) quantises a Color down to whatever the
+# terminal's detected ColorLevel supports. Callers always construct
+# the richest Color they have (e.g., a ColorRgb for a truecolor value)
+# and let the renderer do the down-sampling. This is the "rich type +
+# quantise at the boundary" pattern used by Rust's `nu-ansi-term`,
+# Python's `rich`, and Go's `lipgloss`.
+#
+# The variants:
+#   * ColorNone       — no color. The renderer emits no color escape.
+#   * ColorBasic(int) — a 16-colour SGR code (30..37, 90..97, 39=default,
+#                       49=default-bg, 0=reset-all). The int is the SGR
+#                       parameter, same convention as std.tui's
+#                       tui_color_* constants.
+#   * Color256(int)   — an xterm 256-colour code (0..255). Codes 0..15
+#                       are the basic palette; 16..231 are the cube;
+#                       232..255 are the grayscale ramp.
+#   * ColorRgb(Rgb)   — a 24-bit RGB color. The renderer emits
+#                       `\x1b[38;2;r;g;bm` (fg) or `\x1b[48;2;r;g;bm`
+#                       (bg) for Truecolor terminals; down-samples to
+#                       256 or 16 for less-capable terminals.
+
+enum Color {
+    ColorNone,             # no color
+    ColorBasic(int),       # 16-colour SGR code (30..37, 90..97, 39, 49, 0)
+    Color256(int),         # xterm 256-colour code (0..255)
+    ColorRgb(Rgb),         # 24-bit RGB
+}
+
+# ----------------------------------------------------------------------------
+# Color constructors — the convenience API the roadmap promises.
+# ----------------------------------------------------------------------------
+# These return Color values (not ColorLevel). The caller passes them to
+# cstyle_fg / cstyle_bg, OR down-samples them manually via
+# color_downsample(c, level).
+
+# color_none() — the no-color Color. The renderer emits no color escape
+# (only the attribute escapes — bold, italic, etc.).
+fn color_none() -> Color {
+    return Color.ColorNone
+}
+
+# color_default() — the "default" foreground (SGR 39). This is what
+# you'd use to "clear" the foreground back to the terminal's default
+# text color. NOTE: SGR 39 is "default fg", SGR 49 is "default bg",
+# SGR 0 is "reset all". std.color exposes all three via separate
+# constructors.
+fn color_default() -> Color {
+    return Color.ColorBasic(39)
+}
+
+# color_default_bg() — the "default" background (SGR 49).
+fn color_default_bg() -> Color {
+    return Color.ColorBasic(49)
+}
+
+# color_reset() — SGR 0 (reset every attribute). Equivalent to
+# std.tui's tui_reset_sgr(). Useful as a "clear everything" Color.
+fn color_reset() -> Color {
+    return Color.ColorBasic(0)
+}
+
+# color_black() / color_red() / ... — the 8 basic ANSI colours,
+# returned as Color.ColorBasic(SGR). SGR codes 30..37 (fg).
+fn color_black()   -> Color { return Color.ColorBasic(30) }
+fn color_red()     -> Color { return Color.ColorBasic(31) }
+fn color_green()   -> Color { return Color.ColorBasic(32) }
+fn color_yellow()  -> Color { return Color.ColorBasic(33) }
+fn color_blue()    -> Color { return Color.ColorBasic(34) }
+fn color_magenta() -> Color { return Color.ColorBasic(35) }
+fn color_cyan()    -> Color { return Color.ColorBasic(36) }
+fn color_white()   -> Color { return Color.ColorBasic(37) }
+
+# color_bright_*() — the 8 bright ANSI colours, SGR 90..97 (fg).
+fn color_bright_black()   -> Color { return Color.ColorBasic(90) }
+fn color_bright_red()     -> Color { return Color.ColorBasic(91) }
+fn color_bright_green()   -> Color { return Color.ColorBasic(92) }
+fn color_bright_yellow()  -> Color { return Color.ColorBasic(93) }
+fn color_bright_blue()    -> Color { return Color.ColorBasic(94) }
+fn color_bright_magenta() -> Color { return Color.ColorBasic(95) }
+fn color_bright_cyan()    -> Color { return Color.ColorBasic(96) }
+fn color_bright_white()   -> Color { return Color.ColorBasic(97) }
+
+# color_bg(c) — convert a foreground Color to its background counterpart.
+# For ColorBasic, shifts 30..37 -> 40..47, 90..97 -> 100..107, 39 -> 49,
+# 0 stays 0 (reset-all works for both fg and bg). For Color256 / ColorRgb,
+# the conversion happens at the renderer (cstyle_to_sgr emits 48;5;code
+# or 48;2;r;g;b instead of 38;5;code or 38;2;r;g;b), so this function
+# is a passthrough for those variants. For ColorNone, returns ColorNone.
+fn color_bg(c: Color) -> Color {
+    return match c {
+        Color.ColorNone => Color.ColorNone,
+        Color.ColorBasic(code) => Color.ColorBasic(color_basic_to_bg(code)),
+        Color.Color256(code) => Color.Color256(code),
+        Color.ColorRgb(rgb) => Color.ColorRgb(rgb),
+    }
+}
+
+# color_basic_to_bg(fg_code) — internal: convert a basic SGR fg code to
+# its bg counterpart. 30..37 -> 40..47, 90..97 -> 100..107, 39 -> 49,
+# 0 stays 0 (passthrough for unknown codes — same convention as
+# std.tui's tui_color_bg).
+fn color_basic_to_bg(fg_code: int) -> int {
+    if fg_code >= 30 && fg_code <= 37 {
+        return fg_code + 10
+    }
+    if fg_code >= 90 && fg_code <= 97 {
+        return fg_code + 10
+    }
+    if fg_code == 39 {
+        return 49
+    }
+    return fg_code
+}
+
+# color_rgb(r, g, b) — construct a 24-bit Color from r/g/b. Validates
+# each channel is 0..255 (panics otherwise — same convention as rgb_new).
+fn color_rgb(r: int, g: int, b: int) -> Color {
+    return Color.ColorRgb(rgb_new(r, g, b))
+}
+
+# color_256(code) — construct a 256-colour Color from an xterm code.
+# Validates code is 0..255 (panics otherwise). Codes 0..15 are the
+# basic palette (the renderer emits SGR 38;5;code for them, which is
+# equivalent to the basic 30..37 / 90..97 codes for those terminals
+# that support 256-colour). Codes 16..231 are the cube; 232..255 are
+# the grayscale ramp.
+fn color_256(code: int) -> Color {
+    if code < 0 || code > 255 {
+        panic("color_256: code out of range 0..255: " + code.to_str())
+    }
+    return Color.Color256(code)
+}
+
+# ----------------------------------------------------------------------------
+# Color equality.
+# ----------------------------------------------------------------------------
+
+# color_eq(a, b) — structural equality. Used by the test suite and by
+# the renderer's diff (when a future perfection stage adds diff-based
+# flush).
+fn color_eq(a: Color, b: Color) -> bool {
+    return match a {
+        Color.ColorNone =>
+            match b {
+                Color.ColorNone => true,
+                _ => false,
+            },
+        Color.ColorBasic(ac) =>
+            match b {
+                Color.ColorBasic(bc) => ac == bc,
+                _ => false,
+            },
+        Color.Color256(ac) =>
+            match b {
+                Color.Color256(bc) => ac == bc,
+                _ => false,
+            },
+        Color.ColorRgb(ar) =>
+            match b {
+                Color.ColorRgb(br) => rgb_eq(ar, br),
+                _ => false,
+            },
+    }
+}
+
+# ----------------------------------------------------------------------------
+# ColorLevel — escape sequence emission.
+# ----------------------------------------------------------------------------
+# The renderer emits one of four SGR color encodings depending on the
+# terminal's level:
+#   * None     — emits nothing (the caller's attributes are emitted by
+#                cstyle_to_sgr separately).
+#   * Basic    — emits the basic SGR code (e.g., 31 for fg red, 41 for
+#                bg red). The Color256 and ColorRgb variants are
+#                down-sampled to a basic SGR code first.
+#   * 256      — emits `\x1b[38;5;CODEm` (fg) or `\x1b[48;5;CODEm` (bg).
+#                The ColorRgb variant is down-sampled to a 256 code
+#                first.
+#   * Truecolor — emits `\x1b[38;2;R;G;Bm` (fg) or `\x1b[48;2;R;G;Bm`
+#                (bg) for ColorRgb; the Color256 and ColorBasic
+#                variants are emitted as their native encoding (the
+#                terminal handles all three).
+
+# color_to_sgr_fg(c, level) — render a Color as the foreground SGR
+# sequence for the given level. Returns "" for ColorNone (no escape).
+fn color_to_sgr_fg(c: Color, level: ColorLevel) -> str {
+    return match c {
+        Color.ColorNone => "",
+        Color.ColorBasic(code) => color_basic_sgr_fg(code),
+        Color.Color256(code) => color_256_sgr_fg(color_downsample_256_to_basic_if_needed(code, level)),
+        Color.ColorRgb(rgb) => color_rgb_sgr_fg_downsampled(rgb, level),
+    }
+}
+
+# color_to_sgr_bg(c, level) — render a Color as the background SGR
+# sequence for the given level. Returns "" for ColorNone.
+fn color_to_sgr_bg(c: Color, level: ColorLevel) -> str {
+    return match c {
+        Color.ColorNone => "",
+        Color.ColorBasic(code) => color_basic_sgr_bg(code),
+        Color.Color256(code) => color_256_sgr_bg(color_downsample_256_to_basic_if_needed(code, level)),
+        Color.ColorRgb(rgb) => color_rgb_sgr_bg_downsampled(rgb, level),
+    }
+}
+
+# color_basic_sgr_fg(code) — emit `\x1b[<code>m` for a basic SGR code.
+# Used for both fg (30..37, 90..97) and the special codes 39 (default
+# fg), 49 (default bg), 0 (reset all). The renderer does not interpret
+# the code — it just emits it.
+fn color_basic_sgr_fg(code: int) -> str {
+    return color_csi() + code.to_str() + "m"
+}
+
+# color_basic_sgr_bg(code) — emit `\x1b[<code>m` for a basic SGR bg
+# code. The caller is responsible for converting a fg code to a bg
+# code via color_basic_to_bg (the SGR codes for bg are 40..47 / 100..107
+# / 49; the renderer does not shift on the fly).
+fn color_basic_sgr_bg(code: int) -> str {
+    return color_csi() + code.to_str() + "m"
+}
+
+# color_256_sgr_fg(code) — emit `\x1b[38;5;<code>m` for a 256-colour
+# foreground. The 38;5;CODE form is the xterm 256-colour SGR extension,
+# supported by every modern terminal.
+fn color_256_sgr_fg(code: int) -> str {
+    return color_csi() + "38;5;" + code.to_str() + "m"
+}
+
+# color_256_sgr_bg(code) — emit `\x1b[48;5;<code>m` for a 256-colour
+# background.
+fn color_256_sgr_bg(code: int) -> str {
+    return color_csi() + "48;5;" + code.to_str() + "m"
+}
+
+# color_rgb_sgr_fg(r, g, b) — emit `\x1b[38;2;r;g;bm` for a truecolor
+# foreground. The 38;2;R;G;B form is the ISO 8613-6 truecolor SGR
+# extension (supported by every terminal that sets
+# COLORTERM=truecolor).
+fn color_rgb_sgr_fg(r: int, g: int, b: int) -> str {
+    return color_csi() + "38;2;" + r.to_str() + ";" + g.to_str() + ";" + b.to_str() + "m"
+}
+
+# color_rgb_sgr_bg(r, g, b) — emit `\x1b[48;2;r;g;bm` for a truecolor
+# background.
+fn color_rgb_sgr_bg(r: int, g: int, b: int) -> str {
+    return color_csi() + "48;2;" + r.to_str() + ";" + g.to_str() + ";" + b.to_str() + "m"
+}
+
+# color_rgb_sgr_fg_downsampled(rgb, level) — internal: render an Rgb
+# as the foreground SGR sequence for the given level. Downsamples to
+# 256 / basic / none as needed.
+fn color_rgb_sgr_fg_downsampled(rgb: Rgb, level: ColorLevel) -> str {
+    if color_level_eq(level, ColorLevel.ColorTruecolor) {
+        return color_rgb_sgr_fg(rgb.r, rgb.g, rgb.b)
+    }
+    if color_level_eq(level, ColorLevel.Color256) {
+        let code: int = rgb_to_xterm256(rgb)
+        return color_256_sgr_fg(code)
+    }
+    if color_level_eq(level, ColorLevel.ColorBasic) {
+        let code: int = rgb_to_basic_sgr(rgb)
+        return color_basic_sgr_fg(code)
+    }
+    # ColorNone — emit nothing.
+    return ""
+}
+
+# color_rgb_sgr_bg_downsampled(rgb, level) — internal: render an Rgb
+# as the background SGR sequence for the given level.
+fn color_rgb_sgr_bg_downsampled(rgb: Rgb, level: ColorLevel) -> str {
+    if color_level_eq(level, ColorLevel.ColorTruecolor) {
+        return color_rgb_sgr_bg(rgb.r, rgb.g, rgb.b)
+    }
+    if color_level_eq(level, ColorLevel.Color256) {
+        let code: int = rgb_to_xterm256(rgb)
+        return color_256_sgr_bg(code)
+    }
+    if color_level_eq(level, ColorLevel.ColorBasic) {
+        let code: int = rgb_to_basic_sgr(rgb)
+        return color_basic_sgr_bg(color_basic_to_bg(code))
+    }
+    return ""
+}
+
+# color_downsample_256_to_basic_if_needed(code, level) — internal: if
+# the level is Basic or None, downsample a 256 code to a basic SGR
+# code; otherwise return the code unchanged.
+fn color_downsample_256_to_basic_if_needed(code: int, level: ColorLevel) -> int {
+    if color_level_eq(level, ColorLevel.ColorBasic) {
+        return xterm256_to_basic_sgr(code)
+    }
+    if color_level_eq(level, ColorLevel.ColorNone) {
+        # The caller will emit "" for ColorNone anyway, so return a
+        # sentinel that won't matter.
+        return -1
+    }
+    return code
+}
+
+# ----------------------------------------------------------------------------
+# Quantisation — RGB -> xterm 256 -> basic 16.
+# ----------------------------------------------------------------------------
+# The xterm-256 palette has three regions:
+#   * 0..15   — the basic 16-colour palette (same as the basic SGR
+#               codes — these are duplicated as 256-colour codes for
+#               convenience).
+#   * 16..231 — the 6x6x6 colour cube. Code = 16 + 36*r + 6*g + b where
+#               r, g, b are indices 0..5 corresponding to channel
+#               values [0, 95, 135, 175, 215, 255].
+#   * 232..255 — the 24-step grayscale ramp. Code = 232 + gray where
+#                gray is 0..23; the channel values are
+#                8 + 10*gray (i.e., 8, 18, 28, ..., 238).
+#
+# The quantiser finds the nearest of these 240 colours (cube + ramp;
+# the basic 16 are excluded because they're typically duplicated in
+# the cube). The algorithm:
+#   1. For each channel, find the nearest of the 6 cube levels.
+#   2. Compute the distance from the RGB to the nearest cube colour.
+#   3. Find the nearest gray (luminance = (r+g+b)/3, snap to the
+#      24-step ramp).
+#   4. Compute the distance from the RGB to the nearest gray.
+#   5. Pick whichever is closer (cube or gray).
+#
+# This matches the algorithm used by termcolor (Python) and ansi_colours
+# (Rust).
+
+# rgb_xterm_cube_level(idx) — internal: the 6 cube levels for one
+# channel. idx 0..5 → 0,95,135,175,215,255.
+fn rgb_xterm_cube_level(idx: int) -> int {
+    if idx == 0 { return 0 }
+    if idx == 1 { return 95 }
+    if idx == 2 { return 135 }
+    if idx == 3 { return 175 }
+    if idx == 4 { return 215 }
+    return 255
+}
+
+# rgb_nearest_cube_index(channel) — internal: find the cube index
+# (0..5) whose level is closest to `channel` (0..255). Ties go to the
+# lower index (deterministic).
+fn rgb_nearest_cube_index(channel: int) -> int {
+    let mut best_idx: int = 0
+    let mut best_dist: int = 1000000
+    let mut i: int = 0
+    while i < 6 {
+        let level: int = rgb_xterm_cube_level(i)
+        let d: int = (channel - level) * (channel - level)
+        if d < best_dist {
+            best_dist = d
+            best_idx = i
+        }
+        i = i + 1
+    }
+    return best_idx
+}
+
+# rgb_xterm_gray_level(idx) — internal: the 24 gray levels. idx 0..23
+# → 8 + 10*idx (i.e., 8, 18, 28, ..., 238).
+fn rgb_xterm_gray_level(idx: int) -> int {
+    return 8 + 10 * idx
+}
+
+# rgb_nearest_gray_index(luma) — internal: find the gray index
+# (0..23) whose level is closest to `luma`. Ties go to the lower
+# index (deterministic).
+fn rgb_nearest_gray_index(luma: int) -> int {
+    let mut best_idx: int = 0
+    let mut best_dist: int = 1000000
+    let mut i: int = 0
+    while i < 24 {
+        let level: int = rgb_xterm_gray_level(i)
+        let d: int = (luma - level) * (luma - level)
+        if d < best_dist {
+            best_dist = d
+            best_idx = i
+        }
+        i = i + 1
+    }
+    return best_idx
+}
+
+# rgb_to_xterm256(rgb) — quantise an RGB to the nearest xterm-256
+# code (216 cube + 24 grayscale). Returns a code in 16..255 (the basic
+# 16 are not returned — they're duplicated in the cube).
+fn rgb_to_xterm256(rgb: Rgb) -> int {
+    # Nearest cube colour.
+    let ri: int = rgb_nearest_cube_index(rgb.r)
+    let gi: int = rgb_nearest_cube_index(rgb.g)
+    let bi: int = rgb_nearest_cube_index(rgb.b)
+    let cube_r: int = rgb_xterm_cube_level(ri)
+    let cube_g: int = rgb_xterm_cube_level(gi)
+    let cube_b: int = rgb_xterm_cube_level(bi)
+    let cube_code: int = 16 + 36 * ri + 6 * gi + bi
+    let cube_dist: int = (rgb.r - cube_r) * (rgb.r - cube_r)
+                       + (rgb.g - cube_g) * (rgb.g - cube_g)
+                       + (rgb.b - cube_b) * (rgb.b - cube_b)
+    # Nearest gray.
+    let luma: int = (rgb.r + rgb.g + rgb.b) / 3
+    let gy: int = rgb_nearest_gray_index(luma)
+    let gray_level: int = rgb_xterm_gray_level(gy)
+    let gray_code: int = 232 + gy
+    let gray_dist: int = (rgb.r - gray_level) * (rgb.r - gray_level)
+                       + (rgb.g - gray_level) * (rgb.g - gray_level)
+                       + (rgb.b - gray_level) * (rgb.b - gray_level)
+    # Pick the closer of the two.
+    if gray_dist < cube_dist {
+        return gray_code
+    }
+    return cube_code
+}
+
+# rgb_to_basic_sgr(rgb) — quantise an RGB to the nearest basic 16-colour
+# SGR fg code (30..37, 90..97). Uses Euclidean distance to the 16
+# reference colours. Ties go to the lower SGR code (deterministic).
+#
+# Reference colours (matching the xterm / VT100 convention):
+#   Black (30):      (0,0,0)
+#   Red (31):        (170,0,0)        Bright Black (90):   (85,85,85)
+#   Green (32):      (0,170,0)       Bright Red (91):     (255,85,85)
+#   Yellow (33):     (170,85,0)      Bright Green (92):   (85,255,85)
+#   Blue (34):       (0,0,170)       Bright Yellow (93):  (255,255,85)
+#   Magenta (35):    (170,0,170)     Bright Blue (94):    (85,85,255)
+#   Cyan (36):       (0,170,170)     Bright Magenta (95): (255,85,255)
+#   White (37):      (170,170,170)   Bright Cyan (96):    (85,255,255)
+#                                    Bright White (97):   (255,255,255)
+fn rgb_to_basic_sgr(rgb: Rgb) -> int {
+    let codes: list[int] = [30, 31, 32, 33, 34, 35, 36, 37,
+                            90, 91, 92, 93, 94, 95, 96, 97]
+    let rs: list[int] = [0, 170, 0, 170, 0, 170, 0, 170,
+                         85, 255, 85, 255, 85, 255, 85, 255]
+    let gs: list[int] = [0, 0, 170, 85, 0, 0, 170, 170,
+                         85, 85, 255, 255, 85, 85, 255, 255]
+    let bs: list[int] = [0, 0, 0, 0, 170, 170, 170, 170,
+                         85, 85, 85, 85, 255, 255, 255, 255]
+    let mut best_code: int = 30
+    let mut best_dist: int = 1000000
+    let mut i: int = 0
+    while i < 16 {
+        let dr: int = rgb.r - rs.get(i)
+        let dg: int = rgb.g - gs.get(i)
+        let db: int = rgb.b - bs.get(i)
+        let d: int = dr * dr + dg * dg + db * db
+        if d < best_dist {
+            best_dist = d
+            best_code = codes.get(i)
+        }
+        i = i + 1
+    }
+    return best_code
+}
+
+# xterm256_to_basic_sgr(code) — map an xterm-256 code back to the
+# nearest basic 16-colour SGR code. Used by the renderer when the
+# detected level is Basic but the Color is a Color256.
+#
+# The mapping:
+#   * 0..15: the basic palette itself — pass through (the 256-colour
+#     codes 0..15 are the same colours as the SGR codes 30..37, 90..97;
+#     we shift them back).
+#   * 16..231: the cube. Convert (code - 16) to (r, g, b) indices, then
+#     to RGB values via the cube levels, then quantise via
+#     rgb_to_basic_sgr.
+#   * 232..255: the grayscale ramp. Convert (code - 232) to a gray
+#     level, then quantise via rgb_to_basic_sgr on (gray, gray, gray).
+fn xterm256_to_basic_sgr(code: int) -> int {
+    if code >= 0 && code <= 15 {
+        # The basic palette is duplicated in the 256-colour codes 0..15.
+        # Map back: 0..7 → 30..37, 8..15 → 90..97.
+        if code <= 7 {
+            return 30 + code
+        }
+        return 90 + (code - 8)
+    }
+    if code >= 16 && code <= 231 {
+        let offset: int = code - 16
+        let ri: int = offset / 36
+        let gi: int = (offset / 6) % 6
+        let bi: int = offset % 6
+        let r: int = rgb_xterm_cube_level(ri)
+        let g: int = rgb_xterm_cube_level(gi)
+        let b: int = rgb_xterm_cube_level(bi)
+        return rgb_to_basic_sgr(rgb_new(r, g, b))
+    }
+    # 232..255 — grayscale ramp.
+    let gray_idx: int = code - 232
+    let gray: int = rgb_xterm_gray_level(gray_idx)
+    return rgb_to_basic_sgr(rgb_new(gray, gray, gray))
+}
+
+# ----------------------------------------------------------------------------
+# ColorStyle — a value type combining fg, bg, and SGR attributes.
+# ----------------------------------------------------------------------------
+# A ColorStyle is built via the builder pattern (matching the roadmap's
+# `Style::new().fg(RED).bold()` API):
+#
+#   let s: ColorStyle = cstyle_new()
+#       .fg(color_red())
+#       .bg(color_black())
+#       .bold()
+#       .underline()
+#
+# The `fg` / `bg` fields store Color values (carrying full RGB / 256 /
+# basic information up to the renderer). The `bold` / `dim` / ... fields
+# are bool toggles. `cstyle_to_sgr(s, level)` returns the `\x1b[...m`
+# escape string for the full style at the given color level — down-
+# sampling RGB / 256 to whatever the terminal supports.
+
+struct ColorStyle {
+    fg: Color,           # foreground Color; ColorNone = unset
+    bg: Color,           # background Color; ColorNone = unset
+    bold: bool,
+    dim: bool,
+    italic: bool,
+    underline: bool,
+    blink_slow: bool,
+    blink_rapid: bool,
+    reverse: bool,
+    hidden: bool,
+    strikethrough: bool,
+}
+
+# cstyle_new() — the empty style (no fg, no bg, no attributes). Calling
+# cstyle_to_sgr(cstyle_new(), level) returns "" (no escape sequence —
+# the renderer skips empty styles). This is the convention used by
+# every "build up a style" code path.
+fn cstyle_new() -> ColorStyle {
+    let s: ColorStyle = ColorStyle {
+        fg: Color.ColorNone,
+        bg: Color.ColorNone,
+        bold: false,
+        dim: false,
+        italic: false,
+        underline: false,
+        blink_slow: false,
+        blink_rapid: false,
+        reverse: false,
+        hidden: false,
+        strikethrough: false,
+    }
+    return s
+}
+
+# cstyle_fg(s, c) — set the foreground. Returns a NEW ColorStyle
+# (immutable update — same convention as std.tui's style_fg).
+fn cstyle_fg(s: ColorStyle, c: Color) -> ColorStyle {
+    let ns: ColorStyle = ColorStyle {
+        fg: c,
+        bg: s.bg,
+        bold: s.bold,
+        dim: s.dim,
+        italic: s.italic,
+        underline: s.underline,
+        blink_slow: s.blink_slow,
+        blink_rapid: s.blink_rapid,
+        reverse: s.reverse,
+        hidden: s.hidden,
+        strikethrough: s.strikethrough,
+    }
+    return ns
+}
+
+# cstyle_bg(s, c) — set the background.
+fn cstyle_bg(s: ColorStyle, c: Color) -> ColorStyle {
+    let ns: ColorStyle = ColorStyle {
+        fg: s.fg,
+        bg: c,
+        bold: s.bold,
+        dim: s.dim,
+        italic: s.italic,
+        underline: s.underline,
+        blink_slow: s.blink_slow,
+        blink_rapid: s.blink_rapid,
+        reverse: s.reverse,
+        hidden: s.hidden,
+        strikethrough: s.strikethrough,
+    }
+    return ns
+}
+
+# cstyle_bold(s) / cstyle_dim(s) / ... — toggle the corresponding
+# attribute. Each returns a new ColorStyle with the attribute turned on.
+# Use cstyle_attr_off(s, attr) to turn one off (provided below).
+fn cstyle_bold(s: ColorStyle) -> ColorStyle {
+    let ns: ColorStyle = ColorStyle {
+        fg: s.fg, bg: s.bg, bold: true,
+        dim: s.dim, italic: s.italic, underline: s.underline,
+        blink_slow: s.blink_slow, blink_rapid: s.blink_rapid,
+        reverse: s.reverse, hidden: s.hidden, strikethrough: s.strikethrough,
+    }
+    return ns
+}
+fn cstyle_dim(s: ColorStyle) -> ColorStyle {
+    let ns: ColorStyle = ColorStyle {
+        fg: s.fg, bg: s.bg, bold: s.bold,
+        dim: true, italic: s.italic, underline: s.underline,
+        blink_slow: s.blink_slow, blink_rapid: s.blink_rapid,
+        reverse: s.reverse, hidden: s.hidden, strikethrough: s.strikethrough,
+    }
+    return ns
+}
+fn cstyle_italic(s: ColorStyle) -> ColorStyle {
+    let ns: ColorStyle = ColorStyle {
+        fg: s.fg, bg: s.bg, bold: s.bold,
+        dim: s.dim, italic: true, underline: s.underline,
+        blink_slow: s.blink_slow, blink_rapid: s.blink_rapid,
+        reverse: s.reverse, hidden: s.hidden, strikethrough: s.strikethrough,
+    }
+    return ns
+}
+fn cstyle_underline(s: ColorStyle) -> ColorStyle {
+    let ns: ColorStyle = ColorStyle {
+        fg: s.fg, bg: s.bg, bold: s.bold,
+        dim: s.dim, italic: s.italic, underline: true,
+        blink_slow: s.blink_slow, blink_rapid: s.blink_rapid,
+        reverse: s.reverse, hidden: s.hidden, strikethrough: s.strikethrough,
+    }
+    return ns
+}
+fn cstyle_blink_slow(s: ColorStyle) -> ColorStyle {
+    let ns: ColorStyle = ColorStyle {
+        fg: s.fg, bg: s.bg, bold: s.bold,
+        dim: s.dim, italic: s.italic, underline: s.underline,
+        blink_slow: true, blink_rapid: s.blink_rapid,
+        reverse: s.reverse, hidden: s.hidden, strikethrough: s.strikethrough,
+    }
+    return ns
+}
+fn cstyle_blink_rapid(s: ColorStyle) -> ColorStyle {
+    let ns: ColorStyle = ColorStyle {
+        fg: s.fg, bg: s.bg, bold: s.bold,
+        dim: s.dim, italic: s.italic, underline: s.underline,
+        blink_slow: s.blink_slow, blink_rapid: true,
+        reverse: s.reverse, hidden: s.hidden, strikethrough: s.strikethrough,
+    }
+    return ns
+}
+fn cstyle_reverse(s: ColorStyle) -> ColorStyle {
+    let ns: ColorStyle = ColorStyle {
+        fg: s.fg, bg: s.bg, bold: s.bold,
+        dim: s.dim, italic: s.italic, underline: s.underline,
+        blink_slow: s.blink_slow, blink_rapid: s.blink_rapid,
+        reverse: true, hidden: s.hidden, strikethrough: s.strikethrough,
+    }
+    return ns
+}
+fn cstyle_hidden(s: ColorStyle) -> ColorStyle {
+    let ns: ColorStyle = ColorStyle {
+        fg: s.fg, bg: s.bg, bold: s.bold,
+        dim: s.dim, italic: s.italic, underline: s.underline,
+        blink_slow: s.blink_slow, blink_rapid: s.blink_rapid,
+        reverse: s.reverse, hidden: true, strikethrough: s.strikethrough,
+    }
+    return ns
+}
+fn cstyle_strikethrough(s: ColorStyle) -> ColorStyle {
+    let ns: ColorStyle = ColorStyle {
+        fg: s.fg, bg: s.bg, bold: s.bold,
+        dim: s.dim, italic: s.italic, underline: s.underline,
+        blink_slow: s.blink_slow, blink_rapid: s.blink_rapid,
+        reverse: s.reverse, hidden: s.hidden, strikethrough: true,
+    }
+    return ns
+}
+
+# ----------------------------------------------------------------------------
+# Method-call form — `impl ColorStyle { ... }` so the builder pattern
+# works as `cstyle_new().fg(red).bold().underline()`.
+# ----------------------------------------------------------------------------
+# The roadmap's Stage 55 promises "Style::new().fg(RED).bold() builder".
+# Halis supports method chaining via `impl Struct { fn method(self,
+# args) -> Struct }` (Stage 28+, the same form std.fs.PathBuf uses for
+# its builder). The methods below delegate to the free functions
+# above — they're thin wrappers, NOT reimplementations. This way both
+# styles work:
+#
+#   let s: ColorStyle = cstyle_fg(cstyle_new(), color_red())        # free
+#   let s: ColorStyle = cstyle_new().fg(color_red())                # method
+#
+# and they produce byte-identical results (the methods just call the
+# free functions, which the inliner can collapse).
+
+impl ColorStyle {
+    # fg(c) — set the foreground. Returns a NEW ColorStyle (immutable
+    # update). The roadmap's exact API name.
+    fn fg(self: ColorStyle, c: Color) -> ColorStyle {
+        return cstyle_fg(self, c)
+    }
+
+    # bg(c) — set the background.
+    fn bg(self: ColorStyle, c: Color) -> ColorStyle {
+        return cstyle_bg(self, c)
+    }
+
+    # bold() / dim() / italic() / ... — toggle the corresponding
+    # attribute. Each returns a new ColorStyle with the attribute
+    # turned on.
+    fn bold(self: ColorStyle) -> ColorStyle {
+        return cstyle_bold(self)
+    }
+    fn dim(self: ColorStyle) -> ColorStyle {
+        return cstyle_dim(self)
+    }
+    fn italic(self: ColorStyle) -> ColorStyle {
+        return cstyle_italic(self)
+    }
+    fn underline(self: ColorStyle) -> ColorStyle {
+        return cstyle_underline(self)
+    }
+    fn blink_slow(self: ColorStyle) -> ColorStyle {
+        return cstyle_blink_slow(self)
+    }
+    fn blink_rapid(self: ColorStyle) -> ColorStyle {
+        return cstyle_blink_rapid(self)
+    }
+    fn reverse(self: ColorStyle) -> ColorStyle {
+        return cstyle_reverse(self)
+    }
+    fn hidden(self: ColorStyle) -> ColorStyle {
+        return cstyle_hidden(self)
+    }
+    fn strikethrough(self: ColorStyle) -> ColorStyle {
+        return cstyle_strikethrough(self)
+    }
+
+    # to_sgr(level) — render the ColorStyle as a single SGR escape
+    # sequence at the given color level. Method form of
+    # cstyle_to_sgr(s, level). Returns "" if the style is empty at
+    # that level.
+    fn to_sgr(self: ColorStyle, level: ColorLevel) -> str {
+        return cstyle_to_sgr(self, level)
+    }
+}
+
+# cstyle_eq(a, b) — structural equality. Used by the test suite.
+fn cstyle_eq(a: ColorStyle, b: ColorStyle) -> bool {
+    if !color_eq(a.fg, b.fg) { return false }
+    if !color_eq(a.bg, b.bg) { return false }
+    if a.bold != b.bold { return false }
+    if a.dim != b.dim { return false }
+    if a.italic != b.italic { return false }
+    if a.underline != b.underline { return false }
+    if a.blink_slow != b.blink_slow { return false }
+    if a.blink_rapid != b.blink_rapid { return false }
+    if a.reverse != b.reverse { return false }
+    if a.hidden != b.hidden { return false }
+    if a.strikethrough != b.strikethrough { return false }
+    return true
+}
+
+# ----------------------------------------------------------------------------
+# cstyle_to_sgr — render a ColorStyle as a single SGR escape sequence
+# at the given color level.
+# ----------------------------------------------------------------------------
+# Returns "" if the style is empty (no fg, no bg, no attributes) OR if
+# the level is ColorNone and no attributes are set.
+#
+# Otherwise returns `\x1b[<codes>m` where <codes> is a semicolon-
+# separated list of SGR parameters in the canonical order:
+#   1. fg SGR code (or `38;5;CODE` for 256-colour, or `38;2;R;G;B` for
+#      truecolor — depending on the level and the Color variant).
+#   2. bg SGR code (or `48;5;CODE` or `48;2;R;G;B`).
+#   3. The attribute codes (bold=1, dim=2, italic=3, underline=4,
+#      blink_slow=5, blink_rapid=6, reverse=7, hidden=8,
+#      strikethrough=9).
+#
+# The renderer coalesces fg, bg, and attributes into a SINGLE SGR
+# sequence (instead of three separate sequences). This matches the
+# xterm spec (a single CSI ... m can carry multiple parameters) and
+# minimises the escape overhead (one CSI per styled span instead of
+# three).
+#
+# For ColorNone level, fg and bg colors are dropped (they're
+# unrenderable), but the attribute codes are still emitted (a
+# monochrome terminal can still show bold / underline / etc.).
+#
+# The escape sequence is constructed as a list of strings joined by
+# ";" — the same approach as std.tui's style_to_sgr (Stage 54). The
+# fg / bg codes are emitted as multi-parameter groups (e.g.,
+# "38;5;123" or "38;2;255;128;64"); the attribute codes are emitted as
+# single parameters (e.g., "1", "4"). All are joined into one CSI.
+
+# cstyle_to_sgr(s, level) — render the ColorStyle as a single SGR
+# escape sequence at the given color level. Returns "" if the style
+# is empty at that level.
+fn cstyle_to_sgr(s: ColorStyle, level: ColorLevel) -> str {
+    let parts: list[str] = []
+    # Foreground.
+    if !color_eq(s.fg, Color.ColorNone) {
+        let fg_str: str = color_to_sgr_fg_params(s.fg, level)
+        if fg_str.len() > 0 {
+            parts.push(fg_str)
+        }
+    }
+    # Background.
+    if !color_eq(s.bg, Color.ColorNone) {
+        let bg_str: str = color_to_sgr_bg_params(s.bg, level)
+        if bg_str.len() > 0 {
+            parts.push(bg_str)
+        }
+    }
+    # Attributes — only emitted if the level is at least Basic (None
+    # drops them too — the convention is that a true monochrome
+    # terminal cannot render any SGR attribute). Actually, the SGR
+    # attributes (bold, italic, underline, ...) are part of the
+    # original VT100 spec and are universally supported — including by
+    # "dumb" terminals that don't support color. So we emit them even
+    # at ColorNone. The roadmap's "monochrome" fallback means "no
+    # COLOR", not "no attributes".
+    if s.bold { parts.push("1") }
+    if s.dim { parts.push("2") }
+    if s.italic { parts.push("3") }
+    if s.underline { parts.push("4") }
+    if s.blink_slow { parts.push("5") }
+    if s.blink_rapid { parts.push("6") }
+    if s.reverse { parts.push("7") }
+    if s.hidden { parts.push("8") }
+    if s.strikethrough { parts.push("9") }
+
+    if parts.len() == 0 {
+        return ""
+    }
+    return color_csi() + str_join(parts, ";") + "m"
+}
+
+# color_to_sgr_fg_params(c, level) — internal: the SGR parameter
+# string for a foreground color (e.g., "31" for basic red, "38;5;123"
+# for 256-colour, "38;2;255;128;64" for truecolor). Returns "" if the
+# color is ColorNone OR if the level drops it (e.g., Color256 at
+# ColorNone level). NOTE: this returns the parameter string WITHOUT
+# the leading CSI or trailing "m" — cstyle_to_sgr wraps it.
+fn color_to_sgr_fg_params(c: Color, level: ColorLevel) -> str {
+    # ColorNone level drops ALL colors (the convention is "no color",
+    # not "no attributes" — bold / italic / underline still render on
+    # a monochrome terminal). Attributes are emitted separately by
+    # cstyle_to_sgr; colors go through this function and are dropped
+    # at None level.
+    if color_level_eq(level, ColorLevel.ColorNone) {
+        return ""
+    }
+    return match c {
+        Color.ColorNone => "",
+        Color.ColorBasic(code) => color_basic_sgr_fg_params(code),
+        Color.Color256(code) => color_256_sgr_fg_params_downsampled(code, level),
+        Color.ColorRgb(rgb) => color_rgb_sgr_fg_params_downsampled(rgb, level),
+    }
+}
+
+# color_to_sgr_bg_params(c, level) — internal: the SGR parameter
+# string for a background color (e.g., "41" for basic red bg, "48;5;123"
+# for 256-colour bg, "48;2;255;128;64" for truecolor bg).
+fn color_to_sgr_bg_params(c: Color, level: ColorLevel) -> str {
+    if color_level_eq(level, ColorLevel.ColorNone) {
+        return ""
+    }
+    return match c {
+        Color.ColorNone => "",
+        Color.ColorBasic(code) => color_basic_sgr_bg_params(color_basic_to_bg(code)),
+        Color.Color256(code) => color_256_sgr_bg_params_downsampled(code, level),
+        Color.ColorRgb(rgb) => color_rgb_sgr_bg_params_downsampled(rgb, level),
+    }
+}
+
+# color_basic_sgr_fg_params(code) — internal: the parameter string for
+# a basic SGR fg code (just the code as a string).
+fn color_basic_sgr_fg_params(code: int) -> str {
+    return code.to_str()
+}
+
+# color_basic_sgr_bg_params(code) — internal: the parameter string for
+# a basic SGR bg code. The caller has already shifted 30..37 → 40..47
+# via color_basic_to_bg; this function just stringifies it.
+fn color_basic_sgr_bg_params(code: int) -> str {
+    return code.to_str()
+}
+
+# color_256_sgr_fg_params_downsampled(code, level) — internal: the
+# parameter string for a 256-colour fg at the given level. At
+# Truecolor / 256 level, emits "38;5;CODE". At Basic level, down-
+# samples to a basic SGR code and emits it. At None level, emits "".
+fn color_256_sgr_fg_params_downsampled(code: int, level: ColorLevel) -> str {
+    if color_level_eq(level, ColorLevel.ColorNone) {
+        return ""
+    }
+    if color_level_eq(level, ColorLevel.ColorBasic) {
+        let basic: int = xterm256_to_basic_sgr(code)
+        return basic.to_str()
+    }
+    return "38;5;" + code.to_str()
+}
+
+# color_256_sgr_bg_params_downsampled(code, level) — internal: the
+# parameter string for a 256-colour bg.
+fn color_256_sgr_bg_params_downsampled(code: int, level: ColorLevel) -> str {
+    if color_level_eq(level, ColorLevel.ColorNone) {
+        return ""
+    }
+    if color_level_eq(level, ColorLevel.ColorBasic) {
+        let basic: int = xterm256_to_basic_sgr(code)
+        return color_basic_to_bg(basic).to_str()
+    }
+    return "48;5;" + code.to_str()
+}
+
+# color_rgb_sgr_fg_params_downsampled(rgb, level) — internal: the
+# parameter string for a truecolor fg at the given level.
+fn color_rgb_sgr_fg_params_downsampled(rgb: Rgb, level: ColorLevel) -> str {
+    if color_level_eq(level, ColorLevel.ColorTruecolor) {
+        return "38;2;" + rgb.r.to_str() + ";" + rgb.g.to_str() + ";" + rgb.b.to_str()
+    }
+    if color_level_eq(level, ColorLevel.Color256) {
+        let code: int = rgb_to_xterm256(rgb)
+        return "38;5;" + code.to_str()
+    }
+    if color_level_eq(level, ColorLevel.ColorBasic) {
+        let code: int = rgb_to_basic_sgr(rgb)
+        return code.to_str()
+    }
+    return ""
+}
+
+# color_rgb_sgr_bg_params_downsampled(rgb, level) — internal: the
+# parameter string for a truecolor bg at the given level.
+fn color_rgb_sgr_bg_params_downsampled(rgb: Rgb, level: ColorLevel) -> str {
+    if color_level_eq(level, ColorLevel.ColorTruecolor) {
+        return "48;2;" + rgb.r.to_str() + ";" + rgb.g.to_str() + ";" + rgb.b.to_str()
+    }
+    if color_level_eq(level, ColorLevel.Color256) {
+        let code: int = rgb_to_xterm256(rgb)
+        return "48;5;" + code.to_str()
+    }
+    if color_level_eq(level, ColorLevel.ColorBasic) {
+        let code: int = rgb_to_basic_sgr(rgb)
+        return color_basic_to_bg(code).to_str()
+    }
+    return ""
+}
+
+# color_reset_sgr() — the universal reset sequence: `\x1b[0m`. Emitted
+# after every styled span to leave the terminal clean for the next
+# span. (Aliased here so callers can `import "std.color"` and not
+# also `import "std.tui"` just for the reset.)
+fn color_reset_sgr() -> str {
+    return color_csi() + "0m"
+}
+
+# ----------------------------------------------------------------------------
+# Detection — color_detect() and color_detect_from(...).
+# ----------------------------------------------------------------------------
+# The detection algorithm honours the following env vars, in order:
+#
+#   1. NO_COLOR (https://no-color.org): if set and non-empty, force
+#      ColorNone (the spec says "if present and non-empty, color is
+#      disabled"). This wins over EVERYTHING else (FORCE_COLOR,
+#      CLICOLOR_FORCE, COLORTERM, TERM) — the no-color.org convention
+#      is that NO_COLOR is the user's explicit "I never want color"
+#      signal.
+#   2. FORCE_COLOR (Node.js convention): if set, parse the value:
+#        - "0" or empty → ColorNone
+#        - "1" → ColorBasic
+#        - "2" → Color256
+#        - "3" → ColorTruecolor
+#        - "true" / "yes" / "on" / any other non-empty → ColorBasic
+#        (matching the supports-color Node.js package)
+#   3. CLICOLOR_FORCE (https://bixense.com/clicolors/): if set and
+#      non-empty (and not "0"), force ColorTruecolor (the convention
+#      is that CLICOLOR_FORCE means "always color").
+#   4. COLORTERM: if the value contains "truecolor" or "24bit" (case
+#      insensitive — but we use lowercase comparison), force
+#      ColorTruecolor. If non-empty otherwise, force Color256 (the
+#      presence of COLORTERM implies 256-colour support).
+#   5. TERM == "dumb" → ColorNone (POSIX convention).
+#   6. TERM contains "256" (e.g., "xterm-256color") → Color256.
+#   7. TERM contains "color" (e.g., "xterm-color", "linux") → ColorBasic.
+#   8. TERM contains "ansi" → ColorBasic (some older terminals).
+#   9. Default → ColorBasic (modern terminals default to at least
+#      16-colour — we err on the side of color, since "no env" usually
+#      means "modern terminal with default settings").
+#
+# Note: we cannot detect whether stdout is a TTY (no isatty builtin
+# yet — deferred to a future stage). The CLICOLOR / CLICOLOR_FORCE
+# distinction (CLICOLOR=0 means no color even on TTY) is therefore
+# approximated: CLICOLOR_FORCE forces color; CLICOLOR is not consulted
+# (the caller can pass the level through to cstyle_to_sgr if they
+# want to honor CLICOLOR themselves).
+
+# color_detect() — read env vars and return the detected ColorLevel.
+# Carries `uses Proc` (reads env via env_has + env_get).
+fn color_detect() -> ColorLevel uses Proc {
+    let no_color_set: bool = env_has("NO_COLOR")
+    let mut no_color_val: str = ""
+    if no_color_set {
+        no_color_val = env_get("NO_COLOR")
+    }
+    let force_color_set: bool = env_has("FORCE_COLOR")
+    let mut force_color_val: str = ""
+    if force_color_set {
+        force_color_val = env_get("FORCE_COLOR")
+    }
+    let clicolor_force_set: bool = env_has("CLICOLOR_FORCE")
+    let mut clicolor_force_val: str = ""
+    if clicolor_force_set {
+        clicolor_force_val = env_get("CLICOLOR_FORCE")
+    }
+    let colorterm_set: bool = env_has("COLORTERM")
+    let mut colorterm_val: str = ""
+    if colorterm_set {
+        colorterm_val = env_get("COLORTERM")
+    }
+    let term_set: bool = env_has("TERM")
+    let mut term_val: str = ""
+    if term_set {
+        term_val = env_get("TERM")
+    }
+    return color_detect_from(
+        term_val, term_set,
+        colorterm_val, colorterm_set,
+        no_color_set, no_color_val,
+        force_color_set, force_color_val,
+        clicolor_force_set, clicolor_force_val,
+    )
+}
+
+# color_detect_from(...) — pure function with explicit env values.
+# This is the testable / differential-safe core of the detector. Every
+# env value is passed in as an explicit argument; no env reads, no
+# Proc effect. The test suite calls this with synthetic values to
+# verify every detection branch (byte-identical between interpreter
+# and native).
+#
+# The arguments:
+#   term_val, term_set        — TERM env var
+#   colorterm_val, colorterm_set — COLORTERM env var
+#   no_color_set, no_color_val — NO_COLOR env var (only need the bool
+#                                "is set" — the value doesn't matter
+#                                per no-color.org, but we honour empty
+#                                value as "unset" per the spec's "if
+#                                present and non-empty")
+#   force_color_set, force_color_val — FORCE_COLOR env var
+#   clicolor_force_set, clicolor_force_val — CLICOLOR_FORCE env var
+fn color_detect_from(
+    term_val: str, term_set: bool,
+    colorterm_val: str, colorterm_set: bool,
+    no_color_set: bool, no_color_val: str,
+    force_color_set: bool, force_color_val: str,
+    clicolor_force_set: bool, clicolor_force_val: str,
+) -> ColorLevel {
+    # 1. NO_COLOR wins over everything (per https://no-color.org).
+    # "If present and non-empty" — an empty NO_COLOR is treated as
+    # unset (matching the spec).
+    if no_color_set && no_color_val.len() > 0 {
+        return ColorLevel.ColorNone
+    }
+    # 2. FORCE_COLOR (Node.js supports-color convention).
+    if force_color_set && force_color_val.len() > 0 {
+        return color_parse_force_color(force_color_val)
+    }
+    # 3. CLICOLOR_FORCE (https://bixense.com/clicolors/).
+    if clicolor_force_set && clicolor_force_val.len() > 0 && clicolor_force_val != "0" {
+        return ColorLevel.ColorTruecolor
+    }
+    # 4. COLORTERM.
+    if colorterm_set && colorterm_val.len() > 0 {
+        let lower: str = str_to_lower_ascii(colorterm_val)
+        if str_contains(lower, "truecolor") || str_contains(lower, "24bit") {
+            return ColorLevel.ColorTruecolor
+        }
+        return ColorLevel.Color256
+    }
+    # 5. TERM == "dumb" → None.
+    if term_set && term_val == "dumb" {
+        return ColorLevel.ColorNone
+    }
+    # 6. TERM contains "256" → 256.
+    if term_set && str_contains(term_val, "256") {
+        return ColorLevel.Color256
+    }
+    # 7. TERM contains "color" → Basic.
+    if term_set && str_contains(term_val, "color") {
+        return ColorLevel.ColorBasic
+    }
+    # 8. TERM contains "ansi" → Basic.
+    if term_set && str_contains(term_val, "ansi") {
+        return ColorLevel.ColorBasic
+    }
+    # 9. Default — modern terminals default to at least 16-colour.
+    # If TERM is unset entirely, we still return Basic (the convention
+    # is that an unset TERM means "default terminal" — which is
+    # typically a modern xterm-compatible terminal with 16-colour
+    # support). Conservative callers can override this by checking
+    # env_has("TERM") themselves.
+    return ColorLevel.ColorBasic
+}
+
+# color_parse_force_color(val) — internal: parse a FORCE_COLOR value
+# per the Node.js supports-color convention. "0" → None, "1" → Basic,
+# "2" → 256, "3" → Truecolor, any other non-empty value → Basic.
+fn color_parse_force_color(val: str) -> ColorLevel {
+    if val == "0" { return ColorLevel.ColorNone }
+    if val == "1" { return ColorLevel.ColorBasic }
+    if val == "2" { return ColorLevel.Color256 }
+    if val == "3" { return ColorLevel.ColorTruecolor }
+    return ColorLevel.ColorBasic
+}
+
+# ----------------------------------------------------------------------------
+# color_downsample — public API for manually down-sampling a Color to
+# fit a target ColorLevel.
+# ----------------------------------------------------------------------------
+# Useful when the caller wants to pre-quantise a Color (e.g., to cache
+# the quantised form). cstyle_to_sgr already does this internally;
+# color_downsample is exposed for callers that want to inspect or
+# cache the down-sampled value.
+
+# color_downsample(c, level) — down-sample a Color to fit the given
+# level. Returns the down-sampled Color. The down-sampling is
+# monotone — never adds information.
+fn color_downsample(c: Color, level: ColorLevel) -> Color {
+    if color_level_eq(level, ColorLevel.ColorTruecolor) {
+        # Truecolor can render everything — passthrough.
+        return c
+    }
+    if color_level_eq(level, ColorLevel.Color256) {
+        # 256 can render Basic + 256. Down-sample RGB to 256.
+        return match c {
+            Color.ColorNone => Color.ColorNone,
+            Color.ColorBasic(_) => c,
+            Color.Color256(_) => c,
+            Color.ColorRgb(rgb) => Color.Color256(rgb_to_xterm256(rgb)),
+        }
+    }
+    if color_level_eq(level, ColorLevel.ColorBasic) {
+        # Basic can render Basic only. Down-sample 256 / RGB to Basic.
+        return match c {
+            Color.ColorNone => Color.ColorNone,
+            Color.ColorBasic(_) => c,
+            Color.Color256(code) => Color.ColorBasic(xterm256_to_basic_sgr(code)),
+            Color.ColorRgb(rgb) => Color.ColorBasic(rgb_to_basic_sgr(rgb)),
+        }
+    }
+    # ColorNone — drop everything.
+    return Color.ColorNone
+}
+
+# ----------------------------------------------------------------------------
+# Convenience — render a styled string in one call.
+# ----------------------------------------------------------------------------
+
+# color_render(text, cs, level) — wrap `text` with the ColorStyle's
+# SGR sequence (open + text + reset). Returns the wrapped string.
+# If the SGR sequence is empty (no color, no attrs at this level),
+# returns `text` unchanged. Pure (no IO).
+fn color_render(text: str, cs: ColorStyle, level: ColorLevel) -> str {
+    let sgr: str = cstyle_to_sgr(cs, level)
+    if sgr.len() == 0 {
+        return text
+    }
+    return sgr + text + color_reset_sgr()
+}
+
+# color_print(text, cs, level) — print a styled string (without a
+# trailing newline). Effectful (uses IO).
+fn color_print(text: str, cs: ColorStyle, level: ColorLevel) -> void uses IO {
+    print(color_render(text, cs, level))
+}
+
+# color_println(text, cs, level) — print a styled string with a
+# trailing newline.
+fn color_println(text: str, cs: ColorStyle, level: ColorLevel) -> void uses IO {
+    println(color_render(text, cs, level))
+}
+
+# ----------------------------------------------------------------------------
+# Bridge to std.tui — convert a ColorStyle to a std.tui Style.
+# ----------------------------------------------------------------------------
+# `cstyle_to_basic_style(cs)` extracts the basic-16-colour SGR code +
+# attributes as a std.tui Style. RGB / 256 information is lost (the
+# caller should pass a ColorBasic or use cstyle_to_sgr(cs, level)
+# directly for richer rendering). This bridge is useful when:
+#   * The caller has std.tui Buffer / Cell / widget code that wants
+#     a std.tui Style, but the source of the styling is a ColorStyle
+#     (e.g., parsed from a config file or computed from a truecolor
+#     value).
+#   * The caller wants to down-sample a ColorStyle to the basic
+#     palette once and then re-use the resulting std.tui Style
+#     (cheaper than calling cstyle_to_sgr on every render).
+
+# cstyle_to_basic_style(cs) — extract the basic-16 SGR code +
+# attributes as a std.tui Style. RGB / 256 colors are down-sampled to
+# the basic palette. Returns a std.tui Style (the same type used by
+# std.tui's Buffer / Cell).
+#
+# NOTE: the user passes `.bg(color_blue())` (a fg-style ColorBasic(34))
+# to mean "blue background". The std.tui Style.bg field expects a
+# BG-style SGR code (40..47 / 100..107 / 49). This bridge applies the
+# fg->bg shift via color_basic_to_bg so the resulting Style works
+# correctly with std.tui's style_to_sgr (which just stringifies the
+# code without shifting).
+fn cstyle_to_basic_style(cs: ColorStyle) -> Style {
+    let fg_basic: Color = color_downsample(cs.fg, ColorLevel.ColorBasic)
+    let bg_basic: Color = color_downsample(cs.bg, ColorLevel.ColorBasic)
+    let fg_int: int = color_to_basic_int(fg_basic)
+    # Shift the bg code from fg-style (30..37) to bg-style (40..47)
+    # via color_basic_to_bg. If bg_int is -1 (no bg), the helper
+    # below returns s unchanged.
+    let bg_raw: int = color_to_basic_int(bg_basic)
+    let bg_int: int = color_basic_to_bg_for_bridge(bg_raw)
+    let base: Style = style_new()
+    let with_fg: Style = style_set_fg_if_set(base, fg_int)
+    let with_bg: Style = style_set_bg_if_set(with_fg, bg_int)
+    let with_attrs: Style = style_apply_attrs(with_bg, cs)
+    return with_attrs
+}
+
+# color_basic_to_bg_for_bridge(code) — internal: shift a basic SGR
+# fg code to its bg counterpart for the std.tui bridge. Returns -1 if
+# the input is -1 (no color) so style_set_bg_if_set can detect the
+# "unset" case.
+fn color_basic_to_bg_for_bridge(code: int) -> int {
+    if code < 0 {
+        return -1
+    }
+    return color_basic_to_bg(code)
+}
+
+# color_to_basic_int(c) — internal: extract the int SGR code from a
+# Color that has been down-sampled to Basic. Returns -1 for ColorNone
+# (the std.tui convention for "unset fg / bg").
+fn color_to_basic_int(c: Color) -> int {
+    return match c {
+        Color.ColorNone => -1,
+        Color.ColorBasic(code) => code,
+        Color.Color256(_) => -1,
+        Color.ColorRgb(_) => -1,
+    }
+}
+
+# style_set_fg_if_set(s, code) — internal: set fg if code >= 0;
+# otherwise return s unchanged.
+fn style_set_fg_if_set(s: Style, code: int) -> Style {
+    if code < 0 { return s }
+    return style_fg(s, code)
+}
+
+# style_set_bg_if_set(s, code) — internal: set bg if code >= 0;
+# otherwise return s unchanged.
+fn style_set_bg_if_set(s: Style, code: int) -> Style {
+    if code < 0 { return s }
+    return style_bg(s, code)
+}
+
+# style_apply_attrs(s, cs) — internal: apply the ColorStyle's
+# attributes to a std.tui Style.
+fn style_apply_attrs(s: Style, cs: ColorStyle) -> Style {
+    let mut cur: Style = s
+    if cs.bold { cur = style_bold(cur) }
+    if cs.dim { cur = style_dim(cur) }
+    if cs.italic { cur = style_italic(cur) }
+    if cs.underline { cur = style_underline(cur) }
+    if cs.blink_slow { cur = style_blink_slow(cur) }
+    if cs.blink_rapid { cur = style_blink_rapid(cur) }
+    if cs.reverse { cur = style_reverse(cur) }
+    if cs.hidden { cur = style_hidden(cur) }
+    if cs.strikethrough { cur = style_strikethrough(cur) }
+    return cur
+}
+
+# ----------------------------------------------------------------------------
+# color_level_name — human-readable name for a ColorLevel (used by the
+# demo and by error messages).
+# ----------------------------------------------------------------------------
+
+# color_level_name(level) — "none", "basic", "256", "truecolor".
+fn color_level_name(level: ColorLevel) -> str {
+    return match level {
+        ColorLevel.ColorNone => "none",
+        ColorLevel.ColorBasic => "basic",
+        ColorLevel.Color256 => "256",
+        ColorLevel.ColorTruecolor => "truecolor",
+    }
+}
+
+# color_level_name_long(level) — the long form: "monochrome",
+# "16-colour", "256-colour", "24-bit truecolor".
+fn color_level_name_long(level: ColorLevel) -> str {
+    return match level {
+        ColorLevel.ColorNone => "monochrome",
+        ColorLevel.ColorBasic => "16-colour",
+        ColorLevel.Color256 => "256-colour",
+        ColorLevel.ColorTruecolor => "24-bit truecolor",
+    }
+}
+
+# ============================================================================
+# End of std/color.hls
+# ============================================================================

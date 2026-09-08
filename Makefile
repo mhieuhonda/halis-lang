@@ -31,7 +31,7 @@ else
   HL_CURL_DEFS :=
 endif
 
-.PHONY: all stage0 bootstrap test examples clean run check bench install uninstall audit opt-stats emit-ir emit-llvm fmt lint lsp-check pkg-init pkg-add pkg-lock pkg-audit pkg-verify pkg-build pkg-publish pkg-log pkg-log-verify prove prove-full model prove-acceptance hltest fuzz cov fuzz-acceptance wasm-opt webapp webapp-acceptance serve aarch64-bench aarch64-acceptance aarch64-list-targets stack-acceptance inline-acceptance opt-stats-report kernel-attrs escape-acceptance layout-report tail-acceptance tail-report asm-acceptance asm-attrs bench-stdlib spec-check stage32-acceptance async-acceptance stream-acceptance io-acceptance fs-acceptance net-acceptance http-acceptance http2-acceptance json-stream-acceptance regex-acceptance fmt-acceptance hash-acceptance collections-acceptance sync-acceptance thread-acceptance time-acceptance math-acceptance process-acceptance env-acceptance archive-acceptance uuid-ulid-acceptance cli-acceptance tui-acceptance
+.PHONY: all stage0 bootstrap test examples clean run check bench install uninstall audit opt-stats emit-ir emit-llvm fmt lint lsp-check pkg-init pkg-add pkg-lock pkg-audit pkg-verify pkg-build pkg-publish pkg-log pkg-log-verify prove prove-full model prove-acceptance hltest fuzz cov fuzz-acceptance wasm-opt webapp webapp-acceptance serve aarch64-bench aarch64-acceptance aarch64-list-targets stack-acceptance inline-acceptance opt-stats-report kernel-attrs escape-acceptance layout-report tail-acceptance tail-report asm-acceptance asm-attrs bench-stdlib spec-check stage32-acceptance async-acceptance stream-acceptance io-acceptance fs-acceptance net-acceptance http-acceptance http2-acceptance json-stream-acceptance regex-acceptance fmt-acceptance hash-acceptance collections-acceptance sync-acceptance thread-acceptance time-acceptance math-acceptance process-acceptance env-acceptance archive-acceptance uuid-ulid-acceptance cli-acceptance tui-acceptance color-acceptance
 
 # Main goal: use the full bootstrap chain to build the native compiler
 all: bootstrap
@@ -2154,3 +2154,56 @@ tui-acceptance: bin/hlc
 	@echo "  differential (interpreter == native) verified green."
 
 .PHONY: tui-acceptance
+
+# ============================================================================
+# Stage 55 (v0.74.0-alpha): std.color -- terminal color support +
+# truecolor/256/16/monochrome fallback + Style builder (cstyle_new()
+# .fg(RED).bold()).  Pure-HLS implementation (no new compiler builtins)
+# -- uses env_has/env_get (Proc effect, Stage 48) for color detection
+# and chr(27) + "[..." (same pattern as std.tui in Stage 54) for ANSI
+# escape codes.
+# ============================================================================
+
+# Stage 55 color demo + acceptance test are deterministic: every escape
+# sequence is a pure string operation on chr(27); the only env reads
+# are in color_detect() which is NOT called from the differential paths
+# (the test uses color_detect_from(...) with explicit env values, and
+# the demo's color_detect() call is wrapped in a println that doesn't
+# affect the differential comparison because the live env is identical
+# between interpreter and native for the same process).
+color-acceptance: bin/hlc
+	@$(PYTHON) boot/boot.py examples/color_demo.hls > /tmp/color_demo_interp.txt 2>&1
+	@bin/hlc examples/color_demo.hls /tmp/color_demo.c 2>/dev/null
+	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/color_demo /tmp/color_demo.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
+	@/tmp/color_demo > /tmp/color_demo_nat.txt 2>&1
+	@diff -q /tmp/color_demo_interp.txt /tmp/color_demo_nat.txt >/dev/null 2>&1 \
+		|| (echo "FAIL: color_demo differential mismatch" && false)
+	@$(PYTHON) boot/boot.py tests/ok/feat_stage55_color.hls > /tmp/s55_interp.txt 2>&1
+	@bin/hlc tests/ok/feat_stage55_color.hls /tmp/s55.c 2>/dev/null
+	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/s55 /tmp/s55.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
+	@/tmp/s55 > /tmp/s55_nat.txt 2>&1
+	@diff -q /tmp/s55_interp.txt /tmp/s55_nat.txt >/dev/null 2>&1 \
+		|| (echo "FAIL: feat_stage55_color differential mismatch" && false)
+	@rm -f /tmp/color_demo /tmp/color_demo.c /tmp/color_demo_interp.txt /tmp/color_demo_nat.txt \
+		/tmp/s55 /tmp/s55.c /tmp/s55_interp.txt /tmp/s55_nat.txt
+	@echo ""
+	@echo "ACCEPTANCE OK: Stage 55 -- std.color (terminal color support + Style builder)"
+	@echo "  ColorLevel (None / Basic / 256 / Truecolor) + int encode/decode + ordering + names"
+	@echo "  Rgb (0..255 per channel; range validation; equality)"
+	@echo "  Color (ColorNone / ColorBasic(int) / Color256(int) / ColorRgb(Rgb))"
+	@echo "  Color constructors (named basic / bright / default / reset / rgb / 256 / none)"
+	@echo "  color_bg (fg -> bg conversion: 30..37 -> 40..47, 90..97 -> 100..107)"
+	@echo "  ColorStyle builder: cstyle_new().fg(RED).bg(BLACK).bold().underline() (method chaining)"
+	@echo "  ColorStyle builder: cstyle_fg/cstyle_bg/cstyle_bold/... (free-function form, parity)"
+	@echo "  cstyle_to_sgr at every level (truecolor / 256 / basic / none) with down-sampling"
+	@echo "  RGB down-sampling: rgb_to_xterm256 (cube + gray), rgb_to_basic_sgr, xterm256_to_basic_sgr"
+	@echo "  color_downsample (manual: Rgb -> 256 -> basic -> none, monotone)"
+	@echo "  color_render / color_print / color_println (convenience wrappers)"
+	@echo "  color_reset_sgr (\\x1b[0m)"
+	@echo "  Detection: color_detect() reads NO_COLOR / FORCE_COLOR / CLICOLOR_FORCE / COLORTERM / TERM"
+	@echo "  Detection: color_detect_from(...) pure form (differential-safe; explicit env values)"
+	@echo "  Bridge: cstyle_to_basic_style(cs) -> std.tui Style (down-samples RGB/256 to basic)"
+	@echo "  Pure-HLS implementation (no new compiler builtins; uses env_has/env_get Proc + print IO)"
+	@echo "  differential (interpreter == native) verified green."
+
+.PHONY: color-acceptance

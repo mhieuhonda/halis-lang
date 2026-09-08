@@ -5456,7 +5456,180 @@ style preservation, and frame-prefix bytes).
 
 **55. `std.color`** — Detect terminal color support (TERM,
 COLORTERM, NO_COLOR). Truecolor (24-bit) fallback to 256-color to
-16-color to monochrome. `Style::new().fg(RED).bold()` builder.
+16-color to monochrome. `Style::new().fg(RED).bold()` builder. ✅
+**DONE in v0.74.0-alpha** — implemented as a pure-HLS module that
+extends `std.tui`'s 16-colour palette with full 24-bit RGB / xterm
+256-colour support and a `ColorStyle` builder API matching the
+roadmap's exact spec (`cstyle_new().fg(RED).bg(BLACK).bold().underline()`).
+No new compiler builtins — uses `env_has` + `env_get` (Proc effect,
+Stage 48, v0.67.0-alpha) for env-var detection and `chr(27) + "[..."`
+byte strings for ANSI escape codes (same pattern as `std.tui`'s
+`tui_csi()` in Stage 54, v0.73.0-alpha). The API covers every feature
+the roadmap promises:
+
+  * **ColorLevel** — the detected capability: `ColorNone`
+    (monochrome), `ColorBasic` (16-colour), `Color256` (xterm),
+    `ColorTruecolor` (24-bit RGB). Total order: None < Basic < 256 <
+    Truecolor. The renderer quantises a `Color` down to whatever the
+    level supports — truecolor (38;2;r;g;b) → 256 (38;5;code) →
+    basic (30..37 / 90..97) → none (drop color, keep attributes).
+  * **Color** — a sum type (`enum Color { ColorNone, ColorBasic(int),
+    Color256(int), ColorRgb(Rgb) }`) carrying full color information
+    up to the renderer. The same "rich type + quantise at the boundary"
+    pattern used by Rust's `nu-ansi-term`, Python's `rich`, and Go's
+    `lipgloss`.
+  * **Rgb** — `struct Rgb { r, g, b: int }` with `rgb_new` (range
+    validation 0..255; panics otherwise), `rgb_eq`, `rgb_to_str`.
+  * **Color constructors** — `color_black() / color_red() / ... /
+    color_white()` (basic 8 as `Color.ColorBasic(30..37)`), `color_bright_black()
+    / ... / color_bright_white()` (bright 8 as `90..97`), `color_default()
+    (39)`, `color_default_bg() (49)`, `color_reset() (0)`, `color_rgb(r,g,b)`,
+    `color_256(code)`, `color_none()`, `color_bg(c)` (fg → bg shift
+    30→40, 90→100, 39→49), `color_eq(a, b)`.
+  * **ColorStyle** — a value type combining fg, bg, and 9 SGR
+    attributes (bold, dim, italic, underline, blink_slow, blink_rapid,
+    reverse, hidden, strikethrough). Two equivalent builder forms:
+      - **Method chaining** (the roadmap's exact API):
+        `cstyle_new().fg(color_red()).bg(color_black()).bold().underline()`
+        — uses Halis's `impl ColorStyle { fn fg(self, c) -> ColorStyle,
+        ... }` method-call form (Stage 28+, the same form
+        `std.fs.PathBuf` uses for its builder).
+      - **Free-function form** (matching `std.tui`'s `Style`
+        convention): `cstyle_underline(cstyle_bold(cstyle_fg(cstyle_new(),
+        color_red())))`.
+      - Both produce byte-identical results (the methods are thin
+        wrappers around the free functions).
+  * **Renderer (cstyle_to_sgr)** — coalesces fg, bg, and attributes
+    into a SINGLE SGR sequence (`\x1b[<codes>m`) instead of three
+    separate sequences (one CSI per styled span instead of three —
+    matches the xterm spec and minimises escape overhead). At
+    `ColorNone` level, fg and bg colors are DROPPED (the convention
+    is "no color", not "no attributes" — bold / italic / underline
+    still render on a monochrome terminal, matching the SGR spec
+    which defines these as part of the original VT100 attribute set).
+  * **RGB down-sampling** — pure integer arithmetic, byte-identical
+    between interpreter and native:
+      - `rgb_to_xterm256(rgb)` — quantise an RGB to the nearest
+        xterm-256 code. The palette has 216 cube colours (16..231,
+        6 levels per channel: 0, 95, 135, 175, 215, 255) + 24
+        grayscale colours (232..255, levels 8 + 10*i). Algorithm:
+        nearest of 240 colours (cube + ramp) by Euclidean distance;
+        basic 16 (0..15) excluded because they're duplicated in the
+        cube. Matches `termcolor` (Python) and `ansi_colours` (Rust).
+      - `rgb_to_basic_sgr(rgb)` — quantise an RGB to the nearest of
+        16 basic SGR codes by Euclidean distance to the 16 reference
+        colours (xterm / VT100 convention: black 0,0,0; red 170,0,0;
+        ... bright red 255,85,85; ... bright white 255,255,255). Ties
+        go to the lower SGR code (deterministic).
+      - `xterm256_to_basic_sgr(code)` — map an xterm-256 code back to
+        the nearest basic SGR code. 0..15 → 30..37 / 90..97; 16..231
+        → cube → RGB → `rgb_to_basic_sgr`; 232..255 → gray →
+        `rgb_to_basic_sgr(rgb_new(g, g, g))`.
+  * **color_downsample** — manual down-sampling: `color_downsample(c,
+    level) -> Color`. Monotone — never adds information. Truecolor →
+    256: quantise RGB to cube. 256 → Basic: map xterm code back to
+    basic SGR. Basic → None: drop. None → None: trivial. Useful when
+    the caller wants to pre-quantise a Color (e.g., to cache the
+    quantised form).
+  * **color_render / color_print / color_println** — convenience:
+    `color_render(text, cs, level)` wraps text with the SGR sequence
+    (open + text + reset); `color_print` / `color_println` are the
+    IO-effectful variants.
+  * **Color detection** — auto-detect from env vars:
+      - `color_detect() -> ColorLevel uses Proc` — read env vars
+        and return the detected ColorLevel.
+      - `color_detect_from(...) -> ColorLevel` — pure function with
+        explicit env values passed in as arguments. This is the
+        testable / differential-safe core of the detector; no env
+        reads, no Proc effect. The test suite calls this with
+        synthetic values to verify every detection branch
+        (byte-identical between interpreter and native).
+      - Detection algorithm (precedence order):
+        1. `NO_COLOR` set and non-empty → `ColorNone` (wins over
+           everything; an empty value is treated as unset, matching
+           https://no-color.org).
+        2. `FORCE_COLOR` set and non-empty → parse the value per
+           the Node.js `supports-color` convention: `"0"` → None,
+           `"1"` → Basic, `"2"` → 256, `"3"` → Truecolor, any other
+           non-empty → Basic.
+        3. `CLICOLOR_FORCE` set and non-empty (and not `"0"`) →
+           `ColorTruecolor` (https://bixense.com/clicolors/
+           convention; we interpret it as Truecolor — the
+           strongest possible signal).
+        4. `COLORTERM` set and non-empty → if value contains
+           `"truecolor"` or `"24bit"` (case-insensitive substring
+           match) → `ColorTruecolor`; otherwise `Color256`.
+        5. `TERM == "dumb"` → `ColorNone` (POSIX convention).
+        6. `TERM` contains `"256"` → `Color256`.
+        7. `TERM` contains `"color"` → `ColorBasic`.
+        8. `TERM` contains `"ansi"` → `ColorBasic`.
+        9. Default → `ColorBasic` (modern terminals default to
+           at least 16-colour; conservative callers can override
+           by checking `env_has("TERM")` themselves).
+  * **Bridge to std.tui** — `cstyle_to_basic_style(cs) -> Style`
+    extracts the basic-16 SGR code + attributes as a `std.tui.Style`.
+    RGB / 256 information is down-sampled to the basic palette; the
+    bg code is shifted from fg-style (30..37) to bg-style (40..47)
+    via `color_basic_to_bg`, so passing `color_blue()` for the bg
+    correctly produces a `std.tui.Style` with `bg = 44`. Useful for
+    rendering `ColorStyle`s into a `std.tui.Buffer` (which expects
+    `std.tui.Style` cells).
+  * **Effect discipline** — `ColorLevel` / `Color` / `Rgb` /
+    `ColorStyle` are pure value types. `color_detect_from(...)` is
+    pure (no `uses` clause). `color_detect()` carries `uses Proc`
+    (reads env via `env_has` + `env_get`). `cstyle_to_sgr(s, level)`
+    is pure (returns the str; the caller decides whether to print).
+    `color_print` / `color_println` carry `uses IO`.
+    `cstyle_to_basic_style(cs)` is pure (returns a `std.tui.Style`).
+  * **Differential parity** — every escape sequence is constructed
+    via `chr(27) + "[..."` (a pure string operation). The output of
+    `cstyle_to_sgr(s, level)` is byte-identical between the
+    interpreter and the native binary (no randomness, no system
+    calls, no float arithmetic — the quantiser uses only integer
+    arithmetic). Verified by the differential test in
+    `make color-acceptance` (both the demo and the acceptance test).
+
+Limitations (deferred to later stages):
+  * No TTY detection. The detector reads env vars but does NOT
+    `isatty(STDOUT)`. A program piped to `less` will still emit color
+    codes if the env says so. The standard workaround is to honor
+    `CLICOLOR_FORCE` (force on) and `NO_COLOR` (force off) — both
+    are honored here. True TTY detection requires a builtin
+    (`isatty(fd) -> bool`); deferred to a future perfection stage or
+    Stage 56+ when `std.progress` lands and the spinner needs it.
+  * No `CLICOLOR=0` (the spec says "0 means no color even on a TTY").
+    The v0.74.0-alpha detector honors `CLICOLOR_FORCE` and `NO_COLOR`;
+    `CLICOLOR=0` is treated as a set-and-non-empty `CLICOLOR` (which
+    the spec says is "color on TTY"). A future perfection stage may
+    add the isatty-based CLICOLOR handling.
+  * No per-stream detection (only stdout). A future perfection stage
+    may add `color_detect_stream(fd)`.
+  * No `COLORTERM` validation beyond substring match. We accept any
+    value containing `"truecolor"` or `"24bit"` as Truecolor. A
+    future perfection stage may add exact-match validation.
+  * No `--color=always / never / auto` CLI flag integration. That's
+    a Stage 56+ concern (`std.progress` and `std.log` will integrate
+    with this detector via their own CLI flags).
+
+Acceptance: `make color-acceptance` — 16 sub-tests + 2 differential
+tests (color_demo + feat_stage55_color), all green (interpreter ==
+native, byte-for-byte). The acceptance test exercises every public
+API: ColorLevel (encode/decode/ordering/names); Rgb (construction,
+equality, range validation); Color (constructors: named basic /
+bright / default / reset / rgb / 256 / none); color_bg (fg → bg
+conversion 30→40, 90→100, 39→49); ColorStyle builder (free-function
+form + method-chaining form — verified byte-identical); cstyle_to_sgr
+at every ColorLevel (truecolor / 256 / basic / none with
+down-sampling); RGB down-sampling (rgb_to_xterm256 cube + gray,
+rgb_to_basic_sgr nearest-of-16, xterm256_to_basic_sgr
+palette-mapping); color_downsample (manual: Rgb → 256 → basic →
+none, monotone); color_render / color_print / color_println;
+Detection (color_detect_from: NO_COLOR / FORCE_COLOR / CLICOLOR_FORCE
+/ COLORTERM / TERM branches + precedence order); color_detect live
+env smoke check; Bridge to std.tui (cstyle_to_basic_style down-samples
+RGB/256 to basic SGR + attrs); Method-chaining parity (.fg/.bg/.attrs/
+.to_sgr == cstyle_*); Integration (ERROR/WARN/INFO/DEBUG log messages
+at every ColorLevel + rainbow gradient).
 
 **56. `std.progress`** — `ProgressBar::new(total)`, `tick()`,
 `finish()`, `ETA` estimation, multi-bar (one per concurrent task),
