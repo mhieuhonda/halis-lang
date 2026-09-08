@@ -31,7 +31,7 @@ else
   HL_CURL_DEFS :=
 endif
 
-.PHONY: all stage0 bootstrap test examples clean run check bench install uninstall audit opt-stats emit-ir emit-llvm fmt lint lsp-check pkg-init pkg-add pkg-lock pkg-audit pkg-verify pkg-build pkg-publish pkg-log pkg-log-verify prove prove-full model prove-acceptance hltest fuzz cov fuzz-acceptance wasm-opt webapp webapp-acceptance serve aarch64-bench aarch64-acceptance aarch64-list-targets stack-acceptance inline-acceptance opt-stats-report kernel-attrs escape-acceptance layout-report tail-acceptance tail-report asm-acceptance asm-attrs bench-stdlib spec-check stage32-acceptance async-acceptance stream-acceptance io-acceptance fs-acceptance net-acceptance http-acceptance http2-acceptance json-stream-acceptance regex-acceptance fmt-acceptance hash-acceptance collections-acceptance sync-acceptance thread-acceptance time-acceptance math-acceptance process-acceptance env-acceptance archive-acceptance uuid-ulid-acceptance cli-acceptance
+.PHONY: all stage0 bootstrap test examples clean run check bench install uninstall audit opt-stats emit-ir emit-llvm fmt lint lsp-check pkg-init pkg-add pkg-lock pkg-audit pkg-verify pkg-build pkg-publish pkg-log pkg-log-verify prove prove-full model prove-acceptance hltest fuzz cov fuzz-acceptance wasm-opt webapp webapp-acceptance serve aarch64-bench aarch64-acceptance aarch64-list-targets stack-acceptance inline-acceptance opt-stats-report kernel-attrs escape-acceptance layout-report tail-acceptance tail-report asm-acceptance asm-attrs bench-stdlib spec-check stage32-acceptance async-acceptance stream-acceptance io-acceptance fs-acceptance net-acceptance http-acceptance http2-acceptance json-stream-acceptance regex-acceptance fmt-acceptance hash-acceptance collections-acceptance sync-acceptance thread-acceptance time-acceptance math-acceptance process-acceptance env-acceptance archive-acceptance uuid-ulid-acceptance cli-acceptance tui-acceptance
 
 # Main goal: use the full bootstrap chain to build the native compiler
 all: bootstrap
@@ -2115,3 +2115,42 @@ cli-acceptance: bin/hlc
 	@echo "  differential (interpreter == native) verified green."
 
 .PHONY: cli-acceptance
+
+# ============================================================================
+# Stage 54 (v0.73.0-alpha): std.tui -- terminal UI primitives (Term,
+# Cursor, Color, Style, Rect, Cell, Buffer, Widget trait convention).
+# Pure-HLS implementation (no new compiler builtins) -- uses print()
+# (IO effect) for emitting ANSI escape codes constructed from chr(27).
+# ============================================================================
+
+# Stage 54 tui demo is deterministic (every escape sequence is a pure
+# string operation on chr(27); no live input, no random clock). The
+# differential test compares interpreter and native output byte-for-byte.
+tui-acceptance: bin/hlc
+	@$(PYTHON) boot/boot.py examples/tui_demo.hls > /tmp/tui_demo_interp.txt 2>&1
+	@bin/hlc examples/tui_demo.hls /tmp/tui_demo.c 2>/dev/null
+	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/tui_demo /tmp/tui_demo.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
+	@/tmp/tui_demo > /tmp/tui_demo_nat.txt 2>&1
+	@diff -q /tmp/tui_demo_interp.txt /tmp/tui_demo_nat.txt >/dev/null 2>&1 \
+		|| (echo "FAIL: tui_demo differential mismatch" && false)
+	@$(PYTHON) boot/boot.py tests/ok/feat_stage54_tui.hls > /tmp/s54_interp.txt 2>&1
+	@bin/hlc tests/ok/feat_stage54_tui.hls /tmp/s54.c 2>/dev/null
+	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/s54 /tmp/s54.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
+	@/tmp/s54 > /tmp/s54_nat.txt 2>&1
+	@diff -q /tmp/s54_interp.txt /tmp/s54_nat.txt >/dev/null 2>&1 \
+		|| (echo "FAIL: feat_stage54_tui differential mismatch" && false)
+	@rm -f /tmp/tui_demo /tmp/tui_demo.c /tmp/tui_demo_interp.txt /tmp/tui_demo_nat.txt \
+		/tmp/s54 /tmp/s54.c /tmp/s54_interp.txt /tmp/s54_nat.txt
+	@echo ""
+	@echo "ACCEPTANCE OK: Stage 54 -- std.tui (terminal UI primitives)"
+	@echo "  Term (raw / restore / screen / clear / flush) -- ANSI escape sequences"
+	@echo "  Cursor (move_to / up / down / left / right / hide / show / save / restore)"
+	@echo "  Color (16-colour palette + bright + default + reset; bg conversion)"
+	@echo "  Style (fg / bg / bold / dim / italic / underline / blink / reverse / hidden / strikethrough)"
+	@echo "  Rect / Cell / Buffer (in-memory grid; pre-allocated; O(W*H) render)"
+	@echo "  Widget convention: Text, Block, Paragraph (monomorphic helpers)"
+	@echo "  Layout helpers: split_horizontal, split_vertical (weighted constraints)"
+	@echo "  Pure-HLS implementation (no new compiler builtins; uses print() IO)"
+	@echo "  differential (interpreter == native) verified green."
+
+.PHONY: tui-acceptance

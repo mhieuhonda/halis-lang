@@ -13,6 +13,213 @@ stability (125–140), and final stabilisation toward v1.0 (141–150).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
+## [v0.73.0-alpha] — Stage 54: std.tui (terminal UI primitives)
+
+> Continues **Phase IV (CLI tooling track, Stages 53–62)**.
+> Adds `std.tui` — terminal UI primitives: `Term`, `Cursor`, `Color`,
+> `Style`, `Rect`, `Cell`, `Buffer`, and a `Widget` trait convention
+> with three concrete widgets (`Text`, `Block`, `Paragraph`). Built on
+> `std.io` and ANSI escape codes (per the roadmap spec). Pure-HLS
+> implementation (no new compiler builtins): the module emits ANSI
+> escape sequences via the existing `print()` builtin (IO effect),
+> constructed as `chr(27) + "[..."` byte strings (same pattern as
+> `std.http`'s `http_crlf()` in Stage 38, v0.57.0-alpha).
+
+### Added — Stage 54 (v0.73.0-alpha)
+
+- **Color codes** — 16-colour palette + bright variants + default +
+  reset, returned as ANSI SGR codes (int):
+  - `tui_color_black() = 30`, `tui_color_red() = 31`, `tui_color_green() = 32`,
+    `tui_color_yellow() = 33`, `tui_color_blue() = 34`, `tui_color_magenta() = 35`,
+    `tui_color_cyan() = 36`, `tui_color_white() = 37`, `tui_color_default() = 39`,
+    `tui_color_reset() = 0`.
+  - Bright variants: `tui_color_bright_black() = 90`, ..., `tui_color_bright_white() = 97`.
+  - `tui_color_bg(fg_code)` — convert a foreground SGR code to its
+    background counterpart (30→40, 90→100, 39→49; passthrough for
+    other values like 0=reset-all).
+
+- **Style** — a value type combining fg, bg, and 8 SGR attributes
+  (bold, dim, italic, underline, blink_slow, blink_rapid, reverse,
+  hidden, strikethrough). Builder API:
+  - `style_new() -> Style` — the empty style (fg=-1, bg=-1, no attrs).
+  - `style_fg(s, fg_code) -> Style` / `style_bg(s, bg_code) -> Style` —
+    immutable-update setters.
+  - `style_bold(s) / style_dim(s) / style_italic(s) / style_underline(s) /
+    style_blink_slow(s) / style_blink_rapid(s) / style_reverse(s) /
+    style_hidden(s) / style_strikethrough(s)` — toggle each attribute.
+  - `style_eq(a, b) -> bool` — structural equality.
+  - `style_to_sgr(s) -> str` — render the style as `\x1b[<codes>m`
+    where `<codes>` is a semicolon-separated list of SGR parameters in
+    canonical order (fg, bg, then the 9 attributes). Returns `""` if
+    the style is empty (so the renderer skips empty styles).
+  - `tui_reset_sgr() -> str` — the universal `\x1b[0m` reset sequence,
+    emitted after every styled span to leave the terminal clean.
+
+- **Cursor escapes** — each function returns the escape sequence as a
+  `str`; the caller decides whether to `print()` it:
+  - `cursor_move_to(x, y) -> str` — CUP, 0-indexed → 1-indexed:
+    `\x1b[{y+1};{x+1}H`. Negative `x` or `y` panics.
+  - `cursor_move_up(n) / cursor_move_down(n) / cursor_move_right(n) /
+    cursor_move_left(n) -> str` — CUU/CUD/CUF/CUB. `n <= 0` is a
+    no-op (returns `""`).
+  - `cursor_hide() -> str` — `\x1b[?25l` (DECSET 25 off).
+  - `cursor_show() -> str` — `\x1b[?25h` (DECSET 25 on).
+  - `cursor_save() -> str` — `\x1b 7` (DECSC).
+  - `cursor_restore() -> str` — `\x1b 8` (DECRC).
+
+- **Clear escapes**:
+  - `clear_screen() -> str` — `\x1b[2J` (ED 2).
+  - `clear_line() -> str` — `\x1b[2K` (EL 2).
+  - `clear_to_end_of_line() -> str` — `\x1b[0K` (EL 0).
+  - `clear_from_beginning_of_line() -> str` — `\x1b[1K` (EL 1).
+
+- **Screen mode escapes**:
+  - `screen_enter() -> str` — `\x1b[?1049h` (alternate screen buffer;
+    matches `vim`/`less`/`htop`).
+  - `screen_leave() -> str` — `\x1b[?1049l`.
+  - `wrap_disable() -> str` — `\x1b[?7l` (no automatic line wrap).
+  - `wrap_enable() -> str` — `\x1b[?7h` (default).
+
+- **Term** — the terminal handle. Tracks `raw_on`, `screen_on`,
+  `wrap_on` so `Term::restore()` emits the inverse of every mode it
+  applied. Effectful operations (carry the `IO` effect):
+  - `term_new() -> Term` — the default state (not raw, not alt screen,
+    wrap on).
+  - `term_raw(t) -> Term` — emits `cursor_hide + wrap_disable +
+    \x1b[?1h` (application cursor keys). Returns a new Term with
+    `raw_on = true`. The caller MUST eventually call `term_restore(t)`
+    to emit the inverse sequences.
+  - `term_restore(t) -> Term` — emits the inverse of every applied mode
+    (cursor show, wrap enable, `?1l`, `screen_leave` if needed).
+    Returns a Term in the default state. Safe to call multiple times
+    (subsequent calls re-emit the inverse sequences idempotently).
+  - `term_screen(t) -> Term` — emits `screen_enter()` (idempotent:
+    calling it twice is a no-op, returns the same Term).
+  - `term_clear(t) -> void` — emits `clear_screen() + cursor_move_to(0, 0)`.
+  - `term_flush(t) -> void` — no-op in v0.73.0-alpha (deferred to a
+    future stage that adds an `fflush` builtin).
+
+- **Rect** — the geometry primitive:
+  - `Rect { x, y, width, height }`.
+  - `rect_new(x, y, width, height) -> Rect` — panics on negative width
+    or height (zero is valid; an empty rect).
+  - `rect_area(r) -> int` — `width * height`.
+  - `rect_contains(r, x, y) -> bool` — `[x, x+width) × [y, y+height)`
+    (top-left inclusive, bottom-right exclusive).
+  - `rect_eq(a, b) -> bool` — structural equality.
+
+- **Cell** — a single character + its style:
+  - `Cell { ch: str, style: Style }` — `ch` is a 1-byte str.
+  - `cell_new(ch, style) -> Cell` — clamps `ch` to a 1-byte string
+    (multi-byte strings use only the first byte; empty strings use
+    `" "`). This guarantees a buffer of cells is always visually
+    rectangular.
+  - `cell_empty() -> Cell` — a space with the empty style. Used to
+    initialise the buffer.
+  - `cell_eq(a, b) -> bool` — structural equality.
+
+- **Buffer** — the off-screen rendering grid. The ratatui/crossterm
+  model: render into a Buffer, then `buffer_render(b)` flushes it to
+  stdout in a single `print()` call (one syscall on most platforms,
+  minimal flicker):
+  - `Buffer { width, height, cells: list[Cell] }` — flat row-major
+    storage; the cell at `(x, y)` is at index `y * width + x`.
+  - `buffer_new(width, height) -> Buffer` — pre-allocates
+    `width * height` cells, each `cell_empty()`. Panics on negative
+    dimensions.
+  - `buffer_width(b) / buffer_height(b) -> int` — accessors.
+  - `buffer_get_cell(b, x, y) -> Cell` — panics on out-of-bounds.
+  - `buffer_set_cell(b, x, y, cell) -> void` — O(1) mutation via
+    `list.set`; no re-allocation.
+  - `buffer_set_str(b, x, y, s, style) -> void` — write `s` into row
+    `y` starting at column `x`. Clips at the right edge (no wrap).
+  - `buffer_set_str_clipped(b, x, y, s, style, max_width) -> void` —
+    same, with an explicit `max_width` cap.
+  - `buffer_fill_rect(b, area, cell) -> void` — fill a rectangular area
+    with the given cell (clipped to `b.width` / `b.height`).
+  - `buffer_clear(b) -> void` — reset every cell to empty.
+  - `buffer_render_into(b) -> str` — PURE (no IO). Returns the
+    complete frame: for each row, `cursor_move_to(0, y)` + each cell
+    (style SGR + char + reset SGR). Byte-identical between interpreter
+    and native.
+  - `buffer_render(b) -> void` — emit `buffer_render_into(b)` to
+    stdout (the IO-effectful variant).
+
+- **Widget trait convention** — the same monomorphic-helper pattern as
+  `std.io`'s Read/Write (Stage 35, v0.54.0-alpha). HLS does not yet
+  have true trait dispatch; widgets are
+  `widget_render_TYPE(buf, area, widget) / widget_height_TYPE(widget) /
+  widget_width_TYPE(widget)` helpers per concrete type. When trait
+  dispatch arrives (Stage 113+), each `impl Widget for X` will already
+  be in place — only the `trait Widget { ... }` declaration needs to
+  be added at the top of the file. Three concrete widgets ship in
+  v0.73.0-alpha:
+  - **Text** — `Text { content: str, style: Style }`. Renders a
+    single styled line, clipped to `area.width`. Height always 1;
+    width is `content.len()`.
+  - **Block** — `Block { title: str, style: Style }`. Renders a
+    border with an optional title. Uses ASCII box-drawing chars
+    (`+`, `-`, `|`) for max terminal compatibility (Unicode
+    `─ │ ┌ ┐ └ ┘` arrives in a future perfection stage). Title is
+    placed at `(area.x + 2, area.y)`, clipped to `area.width - 4`.
+    Height always 3 (border + content + border); width is
+    `title.len() + 4` (minimum 2).
+  - **Paragraph** — `Paragraph { content: str, style: Style }`.
+    Multi-line text with word wrap. Words are split on spaces; lines
+    break when the next word would exceed `area.width`. Words longer
+    than the width are placed on their own line and clipped. Lines
+    beyond `area.height` are dropped (no scrollback).
+
+- **Layout helpers** — split a Rect into rows / columns with weighted
+  constraints (the ratatui convention):
+  - `layout_split_horizontal(area, constraints) -> list[Rect]` — split
+    `area` into rows (top-to-bottom). Each constraint is an integer
+    weight; heights are `area.height * c / total` (integer division;
+    the last row absorbs the remainder).
+  - `layout_split_vertical(area, constraints) -> list[Rect]` — split
+    `area` into columns (left-to-right). Same weight-based
+    distribution.
+
+### Differential Parity — Stage 54 (v0.73.0-alpha)
+
+- **Pure-HLS, no new compiler builtins** — every escape sequence is
+  constructed via `chr(27) + "[..."` (a pure string operation). The
+  output of `buffer_render_into(b)` is byte-identical between the
+  interpreter and the native binary (no randomness, no system calls,
+  no float arithmetic in the formatting itself).
+- **`make tui-acceptance`** verifies both `examples/tui_demo.hls` and
+  `tests/ok/feat_stage54_tui.hls` produce byte-identical output under
+  the interpreter and the native binary (`diff -q` on the captured
+  stdout).
+- **Bootstrap self-compilation** remains deterministic
+  (`make bootstrap` — `BOOTSTRAP OK: self-compilation is deterministic`).
+
+### Limitations (deferred to later stages)
+
+- No actual termios raw mode (no echo, no char-by-char input).
+  `Term::raw()` emits the ANSI sequences that bring the terminal
+  closer to "raw" (hide cursor, disable line wrap, application cursor
+  keys) but does NOT disable line buffering or echo via termios.
+  Real raw mode requires a builtin (`term_raw_enter()` /
+  `term_raw_exit()` that call `tcgetattr`/`tcsetattr`); deferred to a
+  future perfection stage or Stage 55+ when `std.color` lands and a
+  true TUI loop becomes practical.
+- No mouse support (mouse tracking ANSI sequences are easy to emit
+  via `?1000h`, but parsing mouse reports requires char-by-char input
+  → termios raw mode).
+- No diff-based flush (full repaint every frame). A future perfection
+  stage may add `buffer_diff_into(prev, cur)` that emits only the
+  changed cells (minimal-flicker rendering).
+- No truecolor (24-bit RGB). The 16-colour palette covers every
+  terminal's basic range; truecolor (38;2;r;g;b / 48;2;r;g;b) arrives
+  with Stage 55's `std.color` module.
+- No Unicode box-drawing characters other than ASCII (`+`, `-`, `|`).
+- Widgets are monomorphic (no trait dispatch). The `Widget` trait
+  convention is documented; when trait dispatch arrives (Stage 113+),
+  existing `widget_render_X(buf, area, widget)` calls will be
+  replaceable with `widget.render(buf, area)` calls without changing
+  semantics.
+
 ## [v0.72.0-alpha] — Stage 53: std.cli (type-safe CLI argument parser)
 
 > Opens **Phase IV (CLI tooling track, Stages 53–62)**.

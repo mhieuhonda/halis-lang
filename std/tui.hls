@@ -1,0 +1,1339 @@
+# ============================================================================
+# std/tui.hls — Stage 54 (v0.73.0-alpha): terminal UI primitives
+# ----------------------------------------------------------------------------
+# This module is the SECOND module of Phase IV (the CLI tooling track,
+# Stages 53–62). It provides the terminal-output primitives described in
+# the roadmap (Stage 54):
+#
+#   * Term     — the terminal handle. `Term::raw()` enters "raw-like" mode
+#                (hide cursor, disable line wrap, switch to the alternate
+#                screen buffer) by emitting ANSI escape codes; `Term::restore()`
+#                emits the inverse codes. `Term::screen()` toggles the
+#                alternate screen buffer alone. `Term::clear()` clears the
+#                visible screen with the ED (Erase Display) sequence.
+#   * Cursor   — cursor movement helper. `Cursor::move_to(x, y)`,
+#                `Cursor::move_up(n)`, `Cursor::move_down(n)`,
+#                `Cursor::move_left(n)`, `Cursor::move_right(n)`,
+#                `Cursor::hide()`, `Cursor::show()`, `Cursor::save()`,
+#                `Cursor::restore()`.
+#   * Color    — foreground / background color codes (16-colour palette
+#                + bright variants + default/reset). Returned as int SGR
+#                codes; a `Style` struct carries the full SGR state.
+#   * Style    — a value type combining foreground, background, and the
+#                SGR attributes (bold, dim, italic, underline, blink,
+#                reverse, hidden, strikethrough). Built via a builder API
+#                (`style_new().fg(RED).bg(BLACK).bold()`).
+#   * Rect     — a screen rectangle (x, y, width, height). The geometry
+#                primitive used by every widget.
+#   * Buffer   — an in-memory grid of cells (one Cell per (row, col)).
+#                Widgets render INTO a Buffer; `Buffer::render(buf)` flushes
+#                it to stdout as a single string of ANSI-escaped bytes.
+#                This is the ratatui / crossterm model: render off-screen,
+#                then diff-and-flush. Diff-based flush arrives in a future
+#                perfection stage — the v0.73.0-alpha version does a
+#                full repaint (simpler, still correct).
+#   * Widget trait convention — the same convention as std.io's
+#                Read/Write traits (Stage 35, v0.54.0-alpha). HLS does
+#                not yet have true trait dispatch; widgets are monomorphic
+#                helpers per concrete type. When trait dispatch arrives,
+#                each `impl Widget for X` will already be in place — only
+#                the `trait Widget { ... }` declaration needs to be added
+#                at the top, and existing call sites will start working
+#                polymorphically.
+#   * Concrete widgets — Text (a single styled line), Block (a border +
+#                optional title + content), Paragraph (multi-line text
+#                with word wrap), Row (horizontal layout), Column
+#                (vertical layout). These cover the 80% use-case for a
+#                CLI tool's "splash screen" / "spinner view" / "menu".
+#
+# Design choices (matching the roadmap's "Built on std.io and ANSI escape
+# codes"):
+#
+#   1. PURE-HLS IMPLEMENTATION.
+#      No new compiler builtins. The module uses the existing `print()`
+#      builtin (IO effect) for emitting ANSI escape codes. The escape
+#      codes are constructed as `chr(27) + "[..."` byte strings, exactly
+#      the same pattern as std.http's `http_crlf()` (Stage 38, v0.57.0-alpha).
+#
+#   2. ANSI ESCAPE CODES ONLY (NO TERMIOCALLS).
+#      POSIX raw mode (termios cbreak / no-echo) requires actual syscalls
+#      (tcgetattr / tcsetattr). The roadmap says "Built on std.io and ANSI
+#      escape codes", so this stage emits the ANSI sequences that bring
+#      the terminal closer to "raw": hide cursor, disable line wrap,
+#      alternate screen buffer, application cursor keys. Actual termios
+#      raw mode (no echo, char-by-char input) arrives with a future stage
+#      that adds a `term_raw_enter()` / `term_raw_exit()` builtin — out
+#      of scope here.
+#
+#   3. BUFFER-BASED RENDERING.
+#      Drawing directly to stdout (one `print()` per cell) would interleave
+#      badly with line-buffered output and produce visible flicker. Instead,
+#      widgets render into a Buffer (an in-memory str grid), and the
+#      caller flushes the Buffer to stdout in a single `print()` call.
+#      This matches the ratatui / crossterm / termbox model.
+#
+#   4. ZERO ALLOCATION AFTER CREATION (FOR THE BUFFER).
+#      The Buffer's cell-storage is pre-allocated at construction time
+#      (`buffer_new(width, height)` allocates width*height cells). Per-frame
+#      rendering reuses this storage (cells are overwritten in place via
+#      buffer_set_cell). The final flush builds the output string in one
+#      pass (O(width*height)) — the same cost as a single println of the
+#      same total bytes.
+#
+#   5. EFFECT DISCIPLINE.
+#      - Building escape codes (Color, Style, Cursor codes) is PURE
+#        (no `uses IO`). They return `str`; the caller decides whether to
+#        print them.
+#      - `Term::raw()` / `Term::restore()` / `Term::screen()` / `Term::clear()`
+#        and `Buffer::render(buf)` carry the IO effect (they write to stdout).
+#      - `Buffer::render_into(buf)` is pure (returns the str instead of
+#        printing it) — useful for tests and for differential verification
+#        (interpreter == native).
+#
+#   6. DIFFERENTIAL PARITY.
+#      Every escape sequence is constructed via `chr(27) + "[..."` — a pure
+#      string operation. The output of `Buffer::render_into(buf)` is
+#      byte-identical between the interpreter and the native binary (no
+#      randomness, no system calls, no float arithmetic). The differential
+#      test (feat_stage54_tui.hls) verifies this byte-for-byte.
+#
+# Security:
+#   * The escape sequences are FIXED STRINGS (no user input embedded).
+#     There is no injection vector: a malicious caller cannot smuggle
+#     an escape sequence into a Color code or a Cursor position because
+#     those are int parameters (validated by the parser).
+#   * `Cursor::move_to(x, y)` validates x and y are non-negative (the
+#     ANSI sequence is `\x1b[{y+1};{x+1}H`; negative x or y would produce
+#     a malformed sequence). The validation panics with a clear message.
+#   * `Buffer::set_cell(x, y, ...)` validates x and y are within bounds
+#     (panics otherwise — same convention as `list.get(i)`).
+#   * `print(buf)` is a single syscall on most platforms, so a TUI app
+#     cannot be made to interleave its output with another writer.
+#
+# Limitations (deferred to later stages):
+#   * No actual termios raw mode (no echo, no char-by-char input). The
+#     `Term::raw()` method emits ANSI codes that get the terminal closer
+#     to raw mode but does NOT disable line buffering or echo. Real raw
+#     mode requires a builtin (Stage 55+ perfection or a future stage).
+#   * No mouse support (deferred — mouse tracking ANSI sequences are
+#     added by `Term::enable_mouse()`, but parsing mouse reports requires
+#     char-by-char input, which requires termios raw mode).
+#   * No diff-based flush (full repaint every frame). A future perfection
+#     stage may add `Buffer::diff_into(prev, cur)` that emits only the
+#     changed cells.
+#   * No truecolor (24-bit RGB). The 16-colour palette covers every
+#     terminal's "basic" range; truecolor arrives with Stage 55's
+#     `std.color` module.
+#   * No box-drawing characters other than the basic four (─ │ ┌ ┐ └ ┘).
+#     A future perfection stage may add rounded corners, double-line
+#     borders, etc.
+#   * Widgets are monomorphic (no trait dispatch). The `Widget` trait
+#     convention is documented; when trait dispatch arrives (Stage 113+),
+#     existing `widget_render_X(buf, area, widget)` calls will be
+#     replaceable with `widget.render(buf, area)` calls without changing
+#     semantics.
+# ============================================================================
+
+import "std.str"
+import "std.option"
+
+# ----------------------------------------------------------------------------
+# Constants — ANSI escape sequences.
+# ----------------------------------------------------------------------------
+
+# tui_esc() — the ESC byte (0x1b). Used as the prefix for every escape
+# sequence. Provided as a function (not a constant) because HLS v0.3 does
+# not yet have top-level constant expressions for str (constant decls
+# must be int). Same convention as std.http's http_crlf() / http_cr_str().
+fn tui_esc() -> str { return chr(27) }
+
+# tui_csi() — the Control Sequence Introducer: ESC [.
+# Every cursor / color / mode sequence begins with these two bytes.
+fn tui_csi() -> str { return chr(27) + "[" }
+
+# ----------------------------------------------------------------------------
+# Color codes — ANSI SGR (Select Graphic Rendition) parameters.
+# ----------------------------------------------------------------------------
+# Foreground colors use codes 30..37 (basic) and 90..97 (bright).
+# Background colors use codes 40..47 (basic) and 100..107 (bright).
+# Reset fg = 39, reset bg = 49, reset all = 0.
+#
+# The functions below return the FOREGROUND SGR code (30..37 / 90..97).
+# `tui_color_bg(code)` shifts a foreground code to its background
+# counterpart (adds 10): 30 -> 40, 90 -> 100, 39 -> 49 (reset).
+
+fn tui_color_reset()    -> int { return 0  }   # reset every attribute
+fn tui_color_black()    -> int { return 30 }
+fn tui_color_red()      -> int { return 31 }
+fn tui_color_green()    -> int { return 32 }
+fn tui_color_yellow()   -> int { return 33 }
+fn tui_color_blue()     -> int { return 34 }
+fn tui_color_magenta()  -> int { return 35 }
+fn tui_color_cyan()     -> int { return 36 }
+fn tui_color_white()    -> int { return 37 }
+fn tui_color_default()  -> int { return 39 }   # reset fg only
+fn tui_color_bright_black()   -> int { return 90 }
+fn tui_color_bright_red()     -> int { return 91 }
+fn tui_color_bright_green()   -> int { return 92 }
+fn tui_color_bright_yellow()  -> int { return 93 }
+fn tui_color_bright_blue()    -> int { return 94 }
+fn tui_color_bright_magenta() -> int { return 95 }
+fn tui_color_bright_cyan()    -> int { return 96 }
+fn tui_color_bright_white()   -> int { return 97 }
+
+# tui_color_bg(fg_code) — convert a foreground SGR code to its background
+# counterpart. 30 -> 40, 90 -> 100, 39 -> 49. Codes outside the known
+# ranges are passed through unchanged (so a caller can also pass 0 to
+# get 0 = reset-all).
+fn tui_color_bg(fg_code: int) -> int {
+    if fg_code >= 30 && fg_code <= 37 {
+        return fg_code + 10
+    }
+    if fg_code >= 90 && fg_code <= 97 {
+        return fg_code + 10
+    }
+    if fg_code == 39 {
+        return 49
+    }
+    return fg_code
+}
+
+# ----------------------------------------------------------------------------
+# Style attribute codes — additional SGR parameters.
+# ----------------------------------------------------------------------------
+fn tui_attr_bold()         -> int { return 1  }
+fn tui_attr_dim()          -> int { return 2  }
+fn tui_attr_italic()       -> int { return 3  }
+fn tui_attr_underline()     -> int { return 4  }
+fn tui_attr_blink_slow()   -> int { return 5  }
+fn tui_attr_blink_rapid()  -> int { return 6  }
+fn tui_attr_reverse()      -> int { return 7  }
+fn tui_attr_hidden()       -> int { return 8  }
+fn tui_attr_strikethrough() -> int { return 9  }
+
+# ----------------------------------------------------------------------------
+# Style — a value type combining fg, bg, and SGR attributes.
+# ----------------------------------------------------------------------------
+# A Style is built via the builder pattern:
+#   let s: Style = style_new()
+#       .fg(tui_color_green())
+#       .bg(tui_color_black())
+#       .bold()
+#       .underline()
+#
+# The `fg` / `bg` fields store the SGR code (30..37, 90..97, 39 = default).
+# The `bold` / `dim` / ... fields are bool toggles. `style_to_sgr(s)`
+# returns the `\x1b[...m` escape string for the full style.
+
+struct Style {
+    fg: int,            # foreground SGR code; 39 = default; -1 = unset
+    bg: int,            # background SGR code; 49 = default; -1 = unset
+    bold: bool,
+    dim: bool,
+    italic: bool,
+    underline: bool,
+    blink_slow: bool,
+    blink_rapid: bool,
+    reverse: bool,
+    hidden: bool,
+    strikethrough: bool,
+}
+
+# style_new() — the empty style (no fg, no bg, no attributes). Calling
+# style_to_sgr(style_new()) returns "" (no escape sequence — the
+# renderer skips empty styles). This is the convention used by every
+# "build up a style" code path.
+fn style_new() -> Style {
+    let s: Style = Style {
+        fg: -1,
+        bg: -1,
+        bold: false,
+        dim: false,
+        italic: false,
+        underline: false,
+        blink_slow: false,
+        blink_rapid: false,
+        reverse: false,
+        hidden: false,
+        strikethrough: false,
+    }
+    return s
+}
+
+# style_fg(s, fg_code) — set the foreground. fg_code is one of the
+# tui_color_* values. Setting it to -1 unsets it (style_to_sgr emits no
+# fg code). Returns a NEW Style (immutable update).
+fn style_fg(s: Style, fg_code: int) -> Style {
+    let ns: Style = Style {
+        fg: fg_code,
+        bg: s.bg,
+        bold: s.bold,
+        dim: s.dim,
+        italic: s.italic,
+        underline: s.underline,
+        blink_slow: s.blink_slow,
+        blink_rapid: s.blink_rapid,
+        reverse: s.reverse,
+        hidden: s.hidden,
+        strikethrough: s.strikethrough,
+    }
+    return ns
+}
+
+# style_bg(s, bg_code) — set the background. bg_code is one of the
+# tui_color_bg(tui_color_*) values (i.e. 40..47 / 100..107 / 49).
+fn style_bg(s: Style, bg_code: int) -> Style {
+    let ns: Style = Style {
+        fg: s.fg,
+        bg: bg_code,
+        bold: s.bold,
+        dim: s.dim,
+        italic: s.italic,
+        underline: s.underline,
+        blink_slow: s.blink_slow,
+        blink_rapid: s.blink_rapid,
+        reverse: s.reverse,
+        hidden: s.hidden,
+        strikethrough: s.strikethrough,
+    }
+    return ns
+}
+
+# style_bold(s) / style_dim(s) / ... — toggle the corresponding attribute.
+# Each returns a new Style with the attribute turned on. Use
+# style_attr_off(s, attr) to turn one off.
+fn style_bold(s: Style) -> Style {
+    let ns: Style = Style {
+        fg: s.fg, bg: s.bg, bold: true,
+        dim: s.dim, italic: s.italic, underline: s.underline,
+        blink_slow: s.blink_slow, blink_rapid: s.blink_rapid,
+        reverse: s.reverse, hidden: s.hidden, strikethrough: s.strikethrough,
+    }
+    return ns
+}
+fn style_dim(s: Style) -> Style {
+    let ns: Style = Style {
+        fg: s.fg, bg: s.bg, bold: s.bold,
+        dim: true, italic: s.italic, underline: s.underline,
+        blink_slow: s.blink_slow, blink_rapid: s.blink_rapid,
+        reverse: s.reverse, hidden: s.hidden, strikethrough: s.strikethrough,
+    }
+    return ns
+}
+fn style_italic(s: Style) -> Style {
+    let ns: Style = Style {
+        fg: s.fg, bg: s.bg, bold: s.bold,
+        dim: s.dim, italic: true, underline: s.underline,
+        blink_slow: s.blink_slow, blink_rapid: s.blink_rapid,
+        reverse: s.reverse, hidden: s.hidden, strikethrough: s.strikethrough,
+    }
+    return ns
+}
+fn style_underline(s: Style) -> Style {
+    let ns: Style = Style {
+        fg: s.fg, bg: s.bg, bold: s.bold,
+        dim: s.dim, italic: s.italic, underline: true,
+        blink_slow: s.blink_slow, blink_rapid: s.blink_rapid,
+        reverse: s.reverse, hidden: s.hidden, strikethrough: s.strikethrough,
+    }
+    return ns
+}
+fn style_blink_slow(s: Style) -> Style {
+    let ns: Style = Style {
+        fg: s.fg, bg: s.bg, bold: s.bold,
+        dim: s.dim, italic: s.italic, underline: s.underline,
+        blink_slow: true, blink_rapid: s.blink_rapid,
+        reverse: s.reverse, hidden: s.hidden, strikethrough: s.strikethrough,
+    }
+    return ns
+}
+fn style_blink_rapid(s: Style) -> Style {
+    let ns: Style = Style {
+        fg: s.fg, bg: s.bg, bold: s.bold,
+        dim: s.dim, italic: s.italic, underline: s.underline,
+        blink_slow: s.blink_slow, blink_rapid: true,
+        reverse: s.reverse, hidden: s.hidden, strikethrough: s.strikethrough,
+    }
+    return ns
+}
+fn style_reverse(s: Style) -> Style {
+    let ns: Style = Style {
+        fg: s.fg, bg: s.bg, bold: s.bold,
+        dim: s.dim, italic: s.italic, underline: s.underline,
+        blink_slow: s.blink_slow, blink_rapid: s.blink_rapid,
+        reverse: true, hidden: s.hidden, strikethrough: s.strikethrough,
+    }
+    return ns
+}
+fn style_hidden(s: Style) -> Style {
+    let ns: Style = Style {
+        fg: s.fg, bg: s.bg, bold: s.bold,
+        dim: s.dim, italic: s.italic, underline: s.underline,
+        blink_slow: s.blink_slow, blink_rapid: s.blink_rapid,
+        reverse: s.reverse, hidden: true, strikethrough: s.strikethrough,
+    }
+    return ns
+}
+fn style_strikethrough(s: Style) -> Style {
+    let ns: Style = Style {
+        fg: s.fg, bg: s.bg, bold: s.bold,
+        dim: s.dim, italic: s.italic, underline: s.underline,
+        blink_slow: s.blink_slow, blink_rapid: s.blink_rapid,
+        reverse: s.reverse, hidden: s.hidden, strikethrough: true,
+    }
+    return ns
+}
+
+# style_eq(a, b) — structural equality. Used by the renderer's diff
+# (when a future perfection stage adds diff-based flush) and by the
+# tests.
+fn style_eq(a: Style, b: Style) -> bool {
+    if a.fg != b.fg { return false }
+    if a.bg != b.bg { return false }
+    if a.bold != b.bold { return false }
+    if a.dim != b.dim { return false }
+    if a.italic != b.italic { return false }
+    if a.underline != b.underline { return false }
+    if a.blink_slow != b.blink_slow { return false }
+    if a.blink_rapid != b.blink_rapid { return false }
+    if a.reverse != b.reverse { return false }
+    if a.hidden != b.hidden { return false }
+    if a.strikethrough != b.strikethrough { return false }
+    return true
+}
+
+# style_to_sgr(s) — render the style as a single SGR escape sequence.
+# Returns "" if the style is empty (no fg, no bg, no attributes set).
+# Otherwise returns `\x1b[<codes>m` where <codes> is a semicolon-separated
+# list of SGR parameters in the canonical order: fg, bg, then attributes
+# in the order: bold, dim, italic, underline, blink_slow, blink_rapid,
+# reverse, hidden, strikethrough.
+#
+# This is the sequence the renderer emits BEFORE the styled text, and
+# `\x1b[0m` (reset-all) is emitted AFTER (to leave the terminal in a
+# clean state).
+fn style_to_sgr(s: Style) -> str {
+    let codes: list[int] = []
+    if s.fg >= 0 {
+        codes.push(s.fg)
+    }
+    if s.bg >= 0 {
+        codes.push(s.bg)
+    }
+    if s.bold { codes.push(tui_attr_bold()) }
+    if s.dim { codes.push(tui_attr_dim()) }
+    if s.italic { codes.push(tui_attr_italic()) }
+    if s.underline { codes.push(tui_attr_underline()) }
+    if s.blink_slow { codes.push(tui_attr_blink_slow()) }
+    if s.blink_rapid { codes.push(tui_attr_blink_rapid()) }
+    if s.reverse { codes.push(tui_attr_reverse()) }
+    if s.hidden { codes.push(tui_attr_hidden()) }
+    if s.strikethrough { codes.push(tui_attr_strikethrough()) }
+    if codes.len() == 0 {
+        return ""
+    }
+    # Build the comma-separated list as a string.
+    let parts: list[str] = []
+    let mut i: int = 0
+    while i < codes.len() {
+        parts.push(codes.get(i).to_str())
+        i = i + 1
+    }
+    return tui_csi() + str_join(parts, ";") + "m"
+}
+
+# tui_reset_sgr() — the universal reset sequence: `\x1b[0m`. Emitted
+# after every styled span to leave the terminal clean for the next span.
+fn tui_reset_sgr() -> str { return tui_csi() + "0m" }
+
+# ----------------------------------------------------------------------------
+# Cursor — cursor movement and visibility.
+# ----------------------------------------------------------------------------
+# Each function returns the escape sequence as a str. The caller can
+# `print()` it directly, or accumulate it into a larger buffer.
+#
+# Coordinates: (x, y) where x is the column (0-indexed from the left) and
+# y is the row (0-indexed from the top). The ANSI CUP sequence is
+# 1-indexed: `\x1b[{row+1};{col+1}H`. We translate at the boundary.
+
+# cursor_move_to(x, y) — move the cursor to column x, row y (0-indexed).
+# Negative x or y panics (the ANSI sequence would be malformed).
+fn cursor_move_to(x: int, y: int) -> str {
+    if x < 0 {
+        panic("cursor_move_to: negative x")
+    }
+    if y < 0 {
+        panic("cursor_move_to: negative y")
+    }
+    # CUP: CSI {row+1};{col+1} H
+    return tui_csi() + (y + 1).to_str() + ";" + (x + 1).to_str() + "H"
+}
+
+# cursor_move_up(n) — move cursor up n rows. n <= 0 is a no-op (returns "").
+fn cursor_move_up(n: int) -> str {
+    if n <= 0 { return "" }
+    return tui_csi() + n.to_str() + "A"
+}
+
+# cursor_move_down(n) — move cursor down n rows.
+fn cursor_move_down(n: int) -> str {
+    if n <= 0 { return "" }
+    return tui_csi() + n.to_str() + "B"
+}
+
+# cursor_move_right(n) — move cursor right n columns.
+fn cursor_move_right(n: int) -> str {
+    if n <= 0 { return "" }
+    return tui_csi() + n.to_str() + "C"
+}
+
+# cursor_move_left(n) — move cursor left n columns.
+fn cursor_move_left(n: int) -> str {
+    if n <= 0 { return "" }
+    return tui_csi() + n.to_str() + "D"
+}
+
+# cursor_hide() — hide the cursor (DECSET 25).
+fn cursor_hide() -> str {
+    return tui_csi() + "?25l"
+}
+
+# cursor_show() — show the cursor (DECRESET 25).
+fn cursor_show() -> str {
+    return tui_csi() + "?25h"
+}
+
+# cursor_save() — save the cursor position (DECSC = ESC 7).
+# Most modern terminals support DECSC; some support the SCO variant
+# (CSI s). DECSC is the more widely-supported one.
+fn cursor_save() -> str {
+    return tui_esc() + "7"
+}
+
+# cursor_restore() — restore the saved cursor position (DECRC = ESC 8).
+fn cursor_restore() -> str {
+    return tui_esc() + "8"
+}
+
+# ----------------------------------------------------------------------------
+# Clearing — screen and line.
+# ----------------------------------------------------------------------------
+
+# clear_screen() — erase the entire visible screen (ED 2: CSI 2J).
+# Note: this does NOT move the cursor — the caller usually follows with
+# `cursor_move_to(0, 0)` to reset to top-left.
+fn clear_screen() -> str {
+    return tui_csi() + "2J"
+}
+
+# clear_line() — erase the entire current line (EL 2: CSI 2K).
+fn clear_line() -> str {
+    return tui_csi() + "2K"
+}
+
+# clear_to_end_of_line() — erase from cursor to end of line (EL 0: CSI 0K).
+fn clear_to_end_of_line() -> str {
+    return tui_csi() + "0K"
+}
+
+# clear_from_beginning_of_line() — erase from beginning of line to cursor (EL 1).
+fn clear_from_beginning_of_line() -> str {
+    return tui_csi() + "1K"
+}
+
+# ----------------------------------------------------------------------------
+# Screen modes — alternate screen buffer, line wrap.
+# ----------------------------------------------------------------------------
+
+# screen_enter() — switch to the alternate screen buffer (DECSET 1049).
+# This is what `vim`, `less`, `htop`, and most full-screen TUIs use to
+# "take over" the terminal. The original screen is preserved; calling
+# screen_leave() restores it.
+fn screen_enter() -> str {
+    return tui_csi() + "?1049h"
+}
+
+# screen_leave() — leave the alternate screen buffer (DECRESET 1049).
+fn screen_leave() -> str {
+    return tui_csi() + "?1049l"
+}
+
+# wrap_disable() — disable automatic line wrapping (DECSET 7 off: CSI ?7l).
+# Useful for full-screen TUIs where a long line should NOT wrap to the
+# next row (the buffer's render pass places every cell explicitly).
+fn wrap_disable() -> str {
+    return tui_csi() + "?7l"
+}
+
+# wrap_enable() — re-enable automatic line wrapping (DECRESET 7 on: CSI ?7h).
+fn wrap_enable() -> str {
+    return tui_csi() + "?7h"
+}
+
+# ----------------------------------------------------------------------------
+# Term — the terminal handle. Owns the side-effecting operations
+# (raw / restore / screen / clear / flush). Building the escape sequences
+# is pure (the Cursor / clear / screen / wrap functions above); emitting
+# them is the only effectful step.
+# ----------------------------------------------------------------------------
+#
+# The Term is a value type with no mutable state — every method is either
+# a pure builder (returns a new Term) or an effectful emitter (returns
+# void, writes to stdout). The "raw mode state" is tracked by the `raw_on`
+# bool so `Term::restore()` knows whether to emit the inverse sequences.
+
+struct Term {
+    raw_on: bool,       # are we in "raw-like" mode?
+    screen_on: bool,    # are we on the alternate screen?
+    wrap_on: bool,      # is line wrap enabled? (true by default)
+}
+
+# term_new() — create a Term in the default state: not raw, not alt
+# screen, line wrap on. The caller can then call `term_raw(t)` or
+# `term_screen(t)` to switch modes.
+fn term_new() -> Term {
+    let t: Term = Term {
+        raw_on: false,
+        screen_on: false,
+        wrap_on: true,
+    }
+    return t
+}
+
+# term_raw(t) — enter "raw-like" mode. Emits the escape sequences to:
+#   1. hide the cursor (CSI ?25l)
+#   2. disable line wrap (CSI ?7l)
+#   3. enable application cursor keys (CSI ?1h) — minor; makes arrow keys
+#      send CSI sequences instead of single-byte codes, useful for
+#      full-screen apps that read arrow keys.
+# Returns a NEW Term with raw_on=true. The caller MUST eventually call
+# term_restore(t) to emit the inverse sequences (the alternative is to
+# leave the terminal in a weird state — though most modern terminals
+# auto-reset on program exit).
+fn term_raw(mut t: Term) -> Term uses IO {
+    print(cursor_hide())
+    print(wrap_disable())
+    print(tui_csi() + "?1h")
+    t.raw_on = true
+    t.wrap_on = false
+    return t
+}
+
+# term_restore(t) — emit the inverse of every mode-changing sequence
+# the Term has applied. This is safe to call multiple times (subsequent
+# calls re-emit the same inverse sequences — modern terminals treat them
+# idempotently). The Term's state is reset to the default.
+fn term_restore(mut t: Term) -> Term uses IO {
+    if t.raw_on {
+        print(tui_csi() + "?1l")
+        print(wrap_enable())
+        print(cursor_show())
+        t.raw_on = false
+        t.wrap_on = true
+    }
+    if t.screen_on {
+        print(screen_leave())
+        t.screen_on = false
+    }
+    return t
+}
+
+# term_screen(t) — switch to the alternate screen buffer. Emits
+# screen_enter(). Returns a NEW Term with screen_on=true. Idempotent —
+# calling it twice is a no-op (the second call returns the same Term).
+fn term_screen(mut t: Term) -> Term uses IO {
+    if !t.screen_on {
+        print(screen_enter())
+        t.screen_on = true
+    }
+    return t
+}
+
+# term_clear(t) — clear the visible screen with the ED 2 sequence, then
+# move the cursor to (0, 0). This is the standard "start of frame" emit.
+# Does NOT change any mode (raw / screen / wrap are left as-is).
+fn term_clear(t: Term) -> void uses IO {
+    print(clear_screen())
+    print(cursor_move_to(0, 0))
+}
+
+# term_flush(t) — emit a newline to flush the output. The native stdout
+# is line-buffered when attached to a terminal; an ANSI escape sequence
+# without a trailing newline may not appear immediately. `term_flush(t)`
+# emits a no-op cursor sequence (cursor_save + cursor_restore) which
+# forces the underlying C runtime's `fputs` to flush.
+#
+# Actually: the Halis `print()` builtin writes directly via `fputs` to
+# stdout, which is line-buffered for TTYs and fully buffered for pipes
+# / files. For test runs (which capture to a file), the output appears
+# in the captured file only when the buffer fills or the process exits.
+# `term_flush(t)` calls the implicit `flush` (no-op in v0.73 — the
+# builtin does not expose fflush yet; a future stage may add it).
+#
+# For now, term_flush is a no-op (returns void). The captured output is
+# correct because the test process exits cleanly, flushing stdout.
+fn term_flush(t: Term) -> void uses IO {
+    # No-op until a flush builtin is added (deferred to a future stage).
+    return
+}
+
+# ----------------------------------------------------------------------------
+# Rect — a screen rectangle (x, y, width, height).
+# ----------------------------------------------------------------------------
+
+struct Rect {
+    x: int,         # left edge (column)
+    y: int,         # top edge (row)
+    width: int,
+    height: int,
+}
+
+# rect_new(x, y, width, height) — basic constructor. Width / height may
+# be zero (an empty rect); negative values panic (a rect with negative
+# dimensions is meaningless and would produce invalid loop bounds in the
+# renderer).
+fn rect_new(x: int, y: int, width: int, height: int) -> Rect {
+    if width < 0 {
+        panic("rect_new: negative width")
+    }
+    if height < 0 {
+        panic("rect_new: negative height")
+    }
+    let r: Rect = Rect { x: x, y: y, width: width, height: height }
+    return r
+}
+
+# rect_area(r) — width * height. Zero for empty rects.
+fn rect_area(r: Rect) -> int {
+    return r.width * r.height
+}
+
+# rect_contains(r, x, y) — true if (x, y) is inside the rect (inclusive
+# of the top-left, exclusive of the bottom-right — same convention as
+# Rust's Rect / Python's range).
+fn rect_contains(r: Rect, x: int, y: int) -> bool {
+    if x < r.x { return false }
+    if y < r.y { return false }
+    if x >= r.x + r.width { return false }
+    if y >= r.y + r.height { return false }
+    return true
+}
+
+# rect_eq(a, b) — structural equality.
+fn rect_eq(a: Rect, b: Rect) -> bool {
+    if a.x != b.x { return false }
+    if a.y != b.y { return false }
+    if a.width != b.width { return false }
+    if a.height != b.height { return false }
+    return true
+}
+
+# ----------------------------------------------------------------------------
+# Cell — a single character + its style. The buffer is a 2D grid of Cells.
+# ----------------------------------------------------------------------------
+# The `ch` field is a single-byte str (one ASCII character). Multi-byte
+# characters are not yet supported (deferred to Stage 55+ when std.unicode
+# arrives); the v0.73.0-alpha widgets use ASCII only.
+
+struct Cell {
+    ch: str,        # a 1-byte string; " " for empty cells
+    style: Style,
+}
+
+# cell_new(ch, style) — construct a Cell. ch must be a 1-byte str; if
+# ch has length 0 or > 1, the cell uses " " (space) instead (so a
+# buffer of cells is always visually rectangular).
+fn cell_new(ch: str, style: Style) -> Cell {
+    if ch.len() == 1 {
+        return Cell { ch: ch, style: style }
+    }
+    if ch.len() == 0 {
+        return Cell { ch: " ", style: style }
+    }
+    return Cell { ch: ch.slice(0, 1), style: style }
+}
+
+# cell_empty() — an empty cell (space character with the default style).
+# Used to initialise the buffer.
+fn cell_empty() -> Cell {
+    return cell_new(" ", style_new())
+}
+
+# cell_eq(a, b) — structural equality.
+fn cell_eq(a: Cell, b: Cell) -> bool {
+    if a.ch != b.ch { return false }
+    if !style_eq(a.style, b.style) { return false }
+    return true
+}
+
+# ----------------------------------------------------------------------------
+# Buffer — an in-memory grid of cells. Widgets render INTO a Buffer;
+# `buffer_render(buf)` flushes it to stdout.
+# ----------------------------------------------------------------------------
+#
+# Storage: a flat list of Cells, row-major. The cell at (x, y) is at
+# index `y * width + x`. The buffer is PRE-ALLOCATED at construction
+# time (every cell is cell_empty()); per-frame rendering overwrites
+# cells in place via buffer_set_cell. The final render builds the
+# output string in a single pass.
+
+struct Buffer {
+    width: int,
+    height: int,
+    cells: list[Cell],
+}
+
+# buffer_new(width, height) — create a buffer of the given size,
+# initialised to empty cells. Width / height must be >= 0; the empty
+# buffer (width=0 or height=0) is valid and produces no output when
+# rendered.
+fn buffer_new(width: int, height: int) -> Buffer {
+    if width < 0 {
+        panic("buffer_new: negative width")
+    }
+    if height < 0 {
+        panic("buffer_new: negative height")
+    }
+    let cells: list[Cell] = []
+    let total: int = width * height
+    let mut i: int = 0
+    while i < total {
+        cells.push(cell_empty())
+        i = i + 1
+    }
+    let b: Buffer = Buffer { width: width, height: height, cells: cells }
+    return b
+}
+
+# buffer_width(b) / buffer_height(b) — accessors.
+fn buffer_width(b: Buffer) -> int { return b.width }
+fn buffer_height(b: Buffer) -> int { return b.height }
+
+# buffer_index(b, x, y) — internal: convert (x, y) to a flat index.
+# Panics on out-of-bounds (same convention as list.get).
+fn buffer_index(b: Buffer, x: int, y: int) -> int {
+    if x < 0 || x >= b.width {
+        panic("buffer_index: x out of bounds")
+    }
+    if y < 0 || y >= b.height {
+        panic("buffer_index: y out of bounds")
+    }
+    return y * b.width + x
+}
+
+# buffer_get_cell(b, x, y) — return the Cell at (x, y). Panics on OOB.
+fn buffer_get_cell(b: Buffer, x: int, y: int) -> Cell {
+    return b.cells.get(buffer_index(b, x, y))
+}
+
+# buffer_set_cell(b, x, y, cell) — overwrite the Cell at (x, y). Panics on OOB.
+# Mutates the buffer in place (the cells list is mutated via .set(i, v)
+# — HLS list.set is the O(1) mutation primitive).
+fn buffer_set_cell(mut b: Buffer, x: int, y: int, cell: Cell) -> void {
+    let idx: int = buffer_index(b, x, y)
+    b.cells.set(idx, cell)
+}
+
+# buffer_set_str(b, x, y, s, style) — write the string s starting at
+# (x, y), one cell per character. Stops at the right edge (does NOT
+# wrap — wrapping is the caller's responsibility). Each character of
+# s is rendered as a single Cell with the given style.
+#
+# Multi-byte chars: each byte of s is placed in a separate cell (the
+# renderer does not combine UTF-8 continuation bytes). For ASCII text
+# this is correct; for non-ASCII, the rendering will be byte-by-byte
+# (still safe — the cells are 1-byte strings).
+fn buffer_set_str(mut b: Buffer, x: int, y: int, s: str, style: Style) -> void {
+    let mut i: int = 0
+    let n: int = s.len()
+    while i < n {
+        let xi: int = x + i
+        if xi >= b.width {
+            break
+        }
+        let ch: str = s.slice(i, i + 1)
+        buffer_set_cell(b, xi, y, cell_new(ch, style))
+        i = i + 1
+    }
+}
+
+# buffer_set_str_clipped(b, x, y, s, style, max_width) — same as
+# buffer_set_str but clips to max_width characters. Useful for paragraph
+# rendering where a line should not exceed a certain width even if the
+# buffer is wider.
+fn buffer_set_str_clipped(mut b: Buffer, x: int, y: int, s: str, style: Style, max_width: int) -> void {
+    let mut i: int = 0
+    let n: int = s.len()
+    let mut xi: int = x
+    while i < n && xi < b.width && (xi - x) < max_width {
+        let ch: str = s.slice(i, i + 1)
+        buffer_set_cell(b, xi, y, cell_new(ch, style))
+        i = i + 1
+        xi = xi + 1
+    }
+}
+
+# buffer_fill_rect(b, area, cell) — fill the given rectangular area with
+# the given cell. Useful for clearing a region or filling a background.
+fn buffer_fill_rect(mut b: Buffer, area: Rect, cell: Cell) -> void {
+    let mut y: int = area.y
+    while y < area.y + area.height && y < b.height {
+        let mut x: int = area.x
+        while x < area.x + area.width && x < b.width {
+            if x >= 0 && y >= 0 {
+                buffer_set_cell(b, x, y, cell)
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+# buffer_clear(b) — reset every cell to empty.
+fn buffer_clear(mut b: Buffer) -> void {
+    let total: int = b.width * b.height
+    let mut i: int = 0
+    while i < total {
+        b.cells.set(i, cell_empty())
+        i = i + 1
+    }
+}
+
+# ----------------------------------------------------------------------------
+# Buffer rendering — render the buffer to a string / to stdout.
+# ----------------------------------------------------------------------------
+#
+# The renderer walks the buffer row by row. For each row, it emits:
+#   1. cursor_move_to(0, y) — move to the start of the row.
+#   2. For each cell: the cell's style SGR (if non-empty) + the cell's
+#      character + tui_reset_sgr() (if the style was non-empty).
+#   3. After the last cell of the row: nothing special — the next row's
+#      cursor_move_to() repositions the cursor.
+#
+# The output string is a complete "frame": cursor positioning + styled
+# text. The caller prints it with a single print() call (one syscall on
+# most platforms — minimal flicker).
+
+# buffer_render_into(b) — PURE: return the buffer as a single str (the
+# frame). Does NOT print. Useful for tests and for differential
+# verification (interpreter == native — the output is byte-identical).
+fn buffer_render_into(b: Buffer) -> str {
+    let parts: list[str] = []
+    let mut y: int = 0
+    while y < b.height {
+        parts.push(cursor_move_to(0, y))
+        let mut x: int = 0
+        while x < b.width {
+            let c: Cell = b.cells.get(y * b.width + x)
+            let sgr: str = style_to_sgr(c.style)
+            if sgr.len() > 0 {
+                parts.push(sgr)
+                parts.push(c.ch)
+                parts.push(tui_reset_sgr())
+            } else {
+                parts.push(c.ch)
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    return str_join(parts, "")
+}
+
+# buffer_render(b) — EMIT the buffer to stdout (the IO-effectful variant).
+# Equivalent to `print(buffer_render_into(b))`. Useful for the demo and
+# for production TUI loops.
+fn buffer_render(b: Buffer) -> void uses IO {
+    print(buffer_render_into(b))
+}
+
+# ----------------------------------------------------------------------------
+# Widget trait convention.
+# ----------------------------------------------------------------------------
+# Following the same pattern as std.io's Read/Write traits (Stage 35,
+# v0.54.0-alpha), widgets are monomorphic helpers per concrete type.
+# The convention is:
+#
+#   widget_render_TYPE(buf, area, widget)  -> void
+#   widget_height_TYPE(widget)            -> int
+#   widget_width_TYPE(widget)             -> int
+#
+# When trait dispatch arrives (Stage 113+), each `impl Widget for X`
+# block will already be in place — only the `trait Widget { ... }`
+# declaration needs to be added at the top of the file.
+#
+# Every widget renders INTO a Buffer, clipped to the given Rect. The
+# widget does NOT clear the area before rendering (the caller does that
+# with buffer_fill_rect if needed). This matches ratatui's convention:
+# the parent decides the background; the child paints on top.
+#
+# The 5 concrete widgets shipped in v0.73.0-alpha:
+#   * Text       — a single styled line of text.
+#   * Block      — a border with an optional title.
+#   * Paragraph  — multi-line text with word wrap.
+#   * Row        — horizontal layout (children laid out left to right).
+#   * Column     — vertical layout (children laid out top to bottom).
+# ----------------------------------------------------------------------------
+# (Concrete widget implementations below — they use the same monomorphic
+#  helper convention.)
+
+# ============================================================================
+# Text widget — a single styled line.
+# ============================================================================
+
+struct Text {
+    content: str,
+    style: Style,
+}
+
+# text_new(content, style) — construct a Text widget.
+fn text_new(content: str, style: Style) -> Text {
+    let t: Text = Text { content: content, style: style }
+    return t
+}
+
+# widget_render_Text(buf, area, t) — render the text into buf at area.
+# The text is clipped to area.width (one line, top-aligned at area.y).
+# The text is left-aligned at area.x.
+fn widget_render_Text(mut buf: Buffer, area: Rect, t: Text) -> void {
+    if area.width <= 0 || area.height <= 0 {
+        return
+    }
+    buffer_set_str_clipped(buf, area.x, area.y, t.content, t.style, area.width)
+}
+
+# widget_height_Text(t) — always 1 (a single line).
+fn widget_height_Text(t: Text) -> int { return 1 }
+
+# widget_width_Text(t) — the length of the content (in bytes).
+fn widget_width_Text(t: Text) -> int { return t.content.len() }
+
+# ============================================================================
+# Block widget — a border with an optional title.
+# ============================================================================
+#
+# The border is drawn with the basic ASCII box-drawing characters:
+#   - + for corners
+#   - - for horizontal edges
+#   - | for vertical edges
+#
+# (The unicode box-drawing chars ─ │ ┌ ┐ └ ┘ arrive in a future
+# perfection stage — the v0.73.0-alpha version uses ASCII for max
+# terminal compatibility and to keep the differential test simple.)
+#
+# The title is placed at the top edge, starting at column 2 (one space
+# after the top-left corner). If the title is wider than area.width - 4,
+# it is clipped.
+#
+# The Block does NOT render any children — it's just a border + title.
+# The caller can use it as a container by rendering children into a
+# sub-rect (e.g., area with x+1, y+1, width-2, height-2).
+
+struct Block {
+    title: str,
+    style: Style,
+}
+
+# block_new(title, style) — construct a Block. title may be "" (no title).
+fn block_new(title: str, style: Style) -> Block {
+    let b: Block = Block { title: title, style: style }
+    return b
+}
+
+# block_render_into(buf, area, b) — internal: the pure rendering logic.
+# Walks the perimeter of area and writes the box-drawing characters.
+# Does NOT clear the interior (the caller may want to keep the existing
+# content).
+fn block_render_into(mut buf: Buffer, area: Rect, b: Block) -> void {
+    if area.width < 2 || area.height < 2 {
+        # Too small to draw a border; render nothing.
+        return
+    }
+    let x0: int = area.x
+    let y0: int = area.y
+    let x1: int = area.x + area.width - 1
+    let y1: int = area.y + area.height - 1
+    # Corners.
+    buffer_set_cell(buf, x0, y0, cell_new("+", b.style))
+    buffer_set_cell(buf, x1, y0, cell_new("+", b.style))
+    buffer_set_cell(buf, x0, y1, cell_new("+", b.style))
+    buffer_set_cell(buf, x1, y1, cell_new("+", b.style))
+    # Top + bottom edges.
+    let mut x: int = x0 + 1
+    while x < x1 {
+        buffer_set_cell(buf, x, y0, cell_new("-", b.style))
+        buffer_set_cell(buf, x, y1, cell_new("-", b.style))
+        x = x + 1
+    }
+    # Left + right edges.
+    let mut y: int = y0 + 1
+    while y < y1 {
+        buffer_set_cell(buf, x0, y, cell_new("|", b.style))
+        buffer_set_cell(buf, x1, y, cell_new("|", b.style))
+        y = y + 1
+    }
+    # Title — placed at (x0 + 2, y0), clipped to area.width - 4.
+    if b.title.len() > 0 {
+        buffer_set_str_clipped(buf, x0 + 2, y0, b.title, b.style, area.width - 4)
+    }
+}
+
+# widget_render_Block(buf, area, b) — render the block border into buf
+# at area. (Same as block_render_into — provided for trait-convention
+# consistency.)
+fn widget_render_Block(mut buf: Buffer, area: Rect, b: Block) -> void {
+    block_render_into(buf, area, b)
+}
+
+# widget_height_Block(b) — the natural height is 3 (one row of border,
+# one row of content, one row of border). The caller usually overrides
+# this by passing a larger area.
+fn widget_height_Block(b: Block) -> int { return 3 }
+
+# widget_width_Block(b) — the natural width is title length + 4 (one
+# column of border, one space, the title, one space, one column of
+# border). Minimum 2.
+fn widget_width_Block(b: Block) -> int {
+    let w: int = b.title.len() + 4
+    if w < 2 { return 2 }
+    return w
+}
+
+# ============================================================================
+# Paragraph widget — multi-line text with word wrap.
+# ============================================================================
+#
+# The paragraph splits `content` into words (split on spaces) and lays
+# them out line by line, breaking when the next word would exceed
+# `area.width`. The paragraph does NOT do hyphenation or fancy wrapping
+# — a word longer than area.width is placed on its own line and clipped.
+#
+# Lines beyond area.height are dropped (the paragraph is clipped to the
+# area, not scrolled).
+
+struct Paragraph {
+    content: str,
+    style: Style,
+}
+
+# paragraph_new(content, style) — construct a Paragraph.
+fn paragraph_new(content: str, style: Style) -> Paragraph {
+    let p: Paragraph = Paragraph { content: content, style: style }
+    return p
+}
+
+# paragraph_split_words(s) — internal: split s on spaces, returning a
+# list of words. Multiple consecutive spaces collapse to a single
+# space (matches str.split(" ") behaviour for empty strings).
+fn paragraph_split_words(s: str) -> list[str] {
+    return s.split(" ")
+}
+
+# paragraph_layout_lines(p, max_width) — internal: lay out the paragraph
+# words into lines, each no wider than max_width. Returns the list of
+# line strings (no trailing spaces; the renderer pads to area.width if
+# needed — but the v0.73.0-alpha renderer just emits the words and lets
+# the trailing cells keep their previous content).
+fn paragraph_layout_lines(p: Paragraph, max_width: int) -> list[str] {
+    let lines: list[str] = []
+    if max_width <= 0 {
+        return lines
+    }
+    let words: list[str] = paragraph_split_words(p.content)
+    let mut current: str = ""
+    let mut i: int = 0
+    while i < words.len() {
+        let w: str = words.get(i)
+        if w.len() == 0 {
+            # Skip empty words (collapsed spaces).
+            i = i + 1
+            continue
+        }
+        if current.len() == 0 {
+            current = w
+        } else if current.len() + 1 + w.len() <= max_width {
+            current = current + " " + w
+        } else {
+            lines.push(current)
+            current = w
+        }
+        # If current word alone exceeds max_width, push it as its own line.
+        if current.len() > max_width {
+            lines.push(current)
+            current = ""
+        }
+        i = i + 1
+    }
+    if current.len() > 0 {
+        lines.push(current)
+    }
+    return lines
+}
+
+# widget_render_Paragraph(buf, area, p) — render the paragraph into buf
+# at area. The paragraph fills the area top-to-bottom; lines beyond
+# area.height are dropped.
+fn widget_render_Paragraph(mut buf: Buffer, area: Rect, p: Paragraph) -> void {
+    if area.width <= 0 || area.height <= 0 {
+        return
+    }
+    let lines: list[str] = paragraph_layout_lines(p, area.width)
+    let mut y: int = area.y
+    let mut i: int = 0
+    while i < lines.len() && y < area.y + area.height {
+        buffer_set_str_clipped(buf, area.x, y, lines.get(i), p.style, area.width)
+        i = i + 1
+        y = y + 1
+    }
+}
+
+# widget_height_Paragraph(p) — the natural height is the number of lines
+# the paragraph would occupy at width 80 (the conventional default
+# terminal width). The caller usually overrides this by passing a
+# specific area.
+fn widget_height_Paragraph(p: Paragraph) -> int {
+    let lines: list[str] = paragraph_layout_lines(p, 80)
+    return lines.len()
+}
+
+# widget_width_Paragraph(p) — the natural width is the length of the
+# longest line at width 80. The caller usually overrides.
+fn widget_width_Paragraph(p: Paragraph) -> int {
+    let lines: list[str] = paragraph_layout_lines(p, 80)
+    let mut max: int = 0
+    let mut i: int = 0
+    while i < lines.len() {
+        if lines.get(i).len() > max {
+            max = lines.get(i).len()
+        }
+        i = i + 1
+    }
+    return max
+}
+
+# ============================================================================
+# Layout helpers — split a Rect into rows / columns.
+# ============================================================================
+#
+# These are NOT widgets themselves; they're geometry helpers that the
+# caller uses to compute the area for each child. The caller then
+# renders each child into its area.
+#
+# Layout convention (matching ratatui): a layout direction (horizontal
+# or vertical) and a list of integer "constraints" (the relative sizes
+# of each child). The constraints are normalised to fractions of the
+# total available space, then converted to pixel sizes.
+
+# layout_split_horizontal(area, constraints) — split `area` vertically
+# (i.e., into rows stacked top to bottom). Returns a list of Rects,
+# one per constraint. The constraints are integer weights (e.g., [1, 2, 1]
+# splits the area into 3 rows with relative heights 1:2:1).
+#
+# Each returned Rect has the same x and width as `area`; the y and
+# height are the split result.
+fn layout_split_horizontal(area: Rect, constraints: list[int]) -> list[Rect] {
+    let rects: list[Rect] = []
+    if constraints.len() == 0 {
+        return rects
+    }
+    # Sum the constraints.
+    let mut total: int = 0
+    let mut i: int = 0
+    while i < constraints.len() {
+        let c: int = constraints.get(i)
+        if c < 0 {
+            # Treat negative constraints as 0 (defensive).
+            total = total + 0
+        } else {
+            total = total + c
+        }
+        i = i + 1
+    }
+    if total <= 0 {
+        # All-zero constraints; return area.len() equal-height rects.
+        let each: int = area.height / constraints.len()
+        let mut y: int = area.y
+        let mut j: int = 0
+        while j < constraints.len() {
+            rects.push(rect_new(area.x, y, area.width, each))
+            y = y + each
+            j = j + 1
+        }
+        return rects
+    }
+    # Distribute.
+    let mut y: int = area.y
+    let mut k: int = 0
+    while k < constraints.len() {
+        let c: int = constraints.get(k)
+        let mut h: int = 0
+        if c > 0 {
+            h = area.height * c / total
+        }
+        rects.push(rect_new(area.x, y, area.width, h))
+        y = y + h
+        k = k + 1
+    }
+    return rects
+}
+
+# layout_split_vertical(area, constraints) — split `area` horizontally
+# (i.e., into columns placed left to right). Returns a list of Rects,
+# one per constraint. Each returned Rect has the same y and height as
+# `area`; the x and width are the split result.
+fn layout_split_vertical(area: Rect, constraints: list[int]) -> list[Rect] {
+    let rects: list[Rect] = []
+    if constraints.len() == 0 {
+        return rects
+    }
+    let mut total: int = 0
+    let mut i: int = 0
+    while i < constraints.len() {
+        let c: int = constraints.get(i)
+        if c < 0 {
+            total = total + 0
+        } else {
+            total = total + c
+        }
+        i = i + 1
+    }
+    if total <= 0 {
+        let each: int = area.width / constraints.len()
+        let mut x: int = area.x
+        let mut j: int = 0
+        while j < constraints.len() {
+            rects.push(rect_new(x, area.y, each, area.height))
+            x = x + each
+            j = j + 1
+        }
+        return rects
+    }
+    let mut x: int = area.x
+    let mut k: int = 0
+    while k < constraints.len() {
+        let c: int = constraints.get(k)
+        let mut w: int = 0
+        if c > 0 {
+            w = area.width * c / total
+        }
+        rects.push(rect_new(x, area.y, w, area.height))
+        x = x + w
+        k = k + 1
+    }
+    return rects
+}
+
+# ============================================================================
+# Convenience — render a complete TUI frame in one call.
+# ============================================================================
+#
+# tui_render_full(buf) — emit the buffer to stdout AND reset the cursor
+# to the row AFTER the buffer's last row. This is the standard "end of
+# frame" emit: the next println (if any) appears below the rendered
+# TUI, not on top of it.
+
+fn tui_render_full(buf: Buffer) -> void uses IO {
+    buffer_render(buf)
+    # Move cursor just past the last row of the buffer.
+    print(cursor_move_to(0, buf.height))
+}
