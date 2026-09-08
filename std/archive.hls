@@ -1,0 +1,860 @@
+# ============================================================================
+# std/archive.hls — Stage 51 (v0.70.0-alpha): tar, zip, gzip
+# ----------------------------------------------------------------------------
+# This module is the eighteenth module of Phase III (stdlib expansion).
+# It provides the user-facing API for archive formats described in the
+# roadmap (Stage 51):
+#
+#   * TarReader  — parse USTAR tar archives (header + data per entry)
+#   * ZipReader  — parse ZIP archives with stored (uncompressed) entries
+#   * GzipEncoder — produce a gzip file containing a single stored DEFLATE
+#                   block (BTYPE=00 — no compression, just framing)
+#   * GzipDecoder — decode gzip files; supports stored DEFLATE blocks
+#                   (BTYPE=00) and panics on compressed blocks (BTYPE=01
+#                   fixed-Huffman, BTYPE=10 dynamic-Huffman) with a clear
+#                   "not supported in v0.70.0-alpha" message
+#
+# Safety guarantees (the roadmap's "no unsafe decompression" + "zip bomb
+# detection" requirements):
+#
+#   * Every byte access is bounds-checked. The str/byte_at builtin panics
+#     on out-of-range indices; the slice builtin panics on out-of-range
+#     start/end. All readers check length BEFORE indexing.
+#
+#   * Decompression is BOUNDED. The caller passes `max_ratio` (default
+#     100). If the total uncompressed size exceeds max_ratio * total
+#     compressed size, the reader panics with "zip bomb detected: ratio
+#     N exceeds limit M". This applies to gzip_decode AND zip_parse
+#     (since stored zip entries are technically already "decompressed"
+#     — the ratio check applies to the uncompressed-data / archive-size
+#     ratio, which catches "100 GB of zeros" attacks).
+#
+#   * Format errors panic with a clear message naming the failing
+#     field. The reader does NOT silently corrupt on bad input — it
+#     stops at the first inconsistent byte. This is the same
+#     "fail-loud-on-bad-input" convention used by std.json_stream
+#     (Stage 40) and std.regex (Stage 41).
+#
+# v0.70.0-alpha limitations (deferred to perfection stages):
+#   * gzip_decode does NOT support BTYPE=01 (fixed Huffman) or BTYPE=10
+#     (dynamic Huffman) DEFLATE blocks. Real-world gzip files (created
+#     by GNU gzip, zlib, etc.) almost always use BTYPE=10. The
+#     GzipEncoder/GzipDecoder pair is a MATCHED set — files encoded
+#     by gzip_encode can be decoded by gzip_decode. For decompressing
+#     external gzip files, a future perfection stage will add the full
+#     inflate algorithm (Huffman tree construction + LZ77 back-references).
+#     Until then, gzip_decode of an externally-produced gzip file panics
+#     with "gzip_decode: compressed DEFLATE block (BTYPE=01/10) not
+#     supported in v0.70.0-alpha; only stored blocks (BTYPE=00) are
+#     supported — use gzip_encode to produce decodable archives".
+#   * zip_parse does NOT support compression methods other than 0
+#     (stored). Methods 8 (deflate), 9 (deflate64), 12 (bzip2), etc.
+#     panic with a clear message. A future perfection stage will add
+#     method 8 support (using the same inflate implementation that
+#     gzip_decode gets).
+#   * tar_parse supports USTAR (the original POSIX.1-1988 format) and
+#     the GNU "ustar  \0" extension. PAX extended headers (the POSIX.1-
+#     2001 format) are not parsed — entries with typeflag 'x' or 'g'
+#     are skipped (the next entry's data is read as usual). Long
+#     filenames in PAX are not yet supported.
+#
+# All public functions are pure (no `uses IO`) — they operate on str
+# (which is bytes in Halis). File-level wrappers (tar_read_file,
+# zip_read_file, gzip_decode_file) read the file via read_file (which
+# carries the FS effect — these helpers inherit it).
+# ============================================================================
+
+import "std.str"
+import "std.option"
+import "std.result"
+
+# ----------------------------------------------------------------------------
+# Constants — expansion-ratio default, magic signatures, octal helpers.
+# ----------------------------------------------------------------------------
+
+# The default maximum expansion ratio for decompression. If the
+# uncompressed size exceeds max_ratio * compressed size, the reader
+# panics. 100 is a generous default: most real archives have a ratio
+# of 5-20 (text compresses well; binaries rarely more than 2x). A
+# zip bomb typically has a ratio of 1000+. The caller can pass a
+# higher limit for legitimate high-ratio archives (e.g., 1000 for
+# all-zeros data) or a lower limit (e.g., 10) for safety-critical
+# contexts where any high-ratio archive is suspicious.
+fn archive_default_max_ratio() -> int {
+    return 100
+}
+
+# ----------------------------------------------------------------------------
+# Byte helpers — every operation is bounds-checked.
+# ----------------------------------------------------------------------------
+
+# Read a single byte at offset `i` in `s` and return it as 0..255.
+# Panics if i is out of bounds. This is a thin wrapper over the
+# str/byte_at builtin (which already panics on OOB) — we wrap it to
+# give a clear archive-flavoured panic message.
+fn ar_byte_at(s: str, i: int) -> int {
+    if i < 0 || i >= s.len() {
+        panic("archive: byte index " + i.to_str() + " out of bounds (len=" + s.len().to_str() + ")")
+    }
+    return s.byte_at(i)
+}
+
+# Read `n` bytes starting at offset `i` and return them as a str.
+# Panics if i < 0, n < 0, or i + n > s.len(). The slice builtin would
+# panic too; we pre-check so the panic message names the archive
+# reader (clearer debugging).
+fn ar_slice(s: str, i: int, n: int) -> str {
+    if i < 0 || n < 0 || i + n > s.len() {
+        panic("archive: slice (" + i.to_str() + ", " + n.to_str() + ") out of bounds (len=" + s.len().to_str() + ")")
+    }
+    if n == 0 {
+        return ""
+    }
+    return s.slice(i, i + n)
+}
+
+# Read a big-endian unsigned 32-bit integer at offset `i`. The result
+# is returned as a signed int64 — since the input is at most 2^32-1,
+# it fits comfortably in int64 (positive). Panics on OOB.
+fn ar_read_be32(s: str, i: int) -> int {
+    let b0: int = ar_byte_at(s, i)
+    let b1: int = ar_byte_at(s, i + 1)
+    let b2: int = ar_byte_at(s, i + 2)
+    let b3: int = ar_byte_at(s, i + 3)
+    return int_or(int_or(int_shl(b0, 24), int_shl(b1, 16)), int_or(int_shl(b2, 8), b3))
+}
+
+# Read a little-endian unsigned 32-bit integer at offset `i`.
+fn ar_read_le32(s: str, i: int) -> int {
+    let b0: int = ar_byte_at(s, i)
+    let b1: int = ar_byte_at(s, i + 1)
+    let b2: int = ar_byte_at(s, i + 2)
+    let b3: int = ar_byte_at(s, i + 3)
+    return int_or(int_or(int_shl(b3, 24), int_shl(b2, 16)), int_or(int_shl(b1, 8), b0))
+}
+
+# Read a little-endian unsigned 16-bit integer at offset `i`.
+fn ar_read_le16(s: str, i: int) -> int {
+    let b0: int = ar_byte_at(s, i)
+    let b1: int = ar_byte_at(s, i + 1)
+    return int_or(int_shl(b1, 8), b0)
+}
+
+# Read an octal (base-8) field of length `n` starting at offset `i`.
+# Octal fields in tar are NUL-terminated (or NUL-padded) ASCII strings
+# of octal digits. Spaces are also accepted as padding (some
+# implementations use space instead of NUL). Returns the parsed int.
+# Panics on malformed input (non-octal digit in the field).
+fn ar_read_octal(s: str, i: int, n: int) -> int {
+    let mut result: int = 0
+    let mut k: int = 0
+    while k < n {
+        let b: int = ar_byte_at(s, i + k)
+        # NUL (0) or space (32) terminates / pads the field.
+        if b == 0 || b == 32 {
+            k = k + 1
+            continue
+        }
+        # Must be an octal digit '0' (48) .. '7' (55).
+        if b < 48 || b > 55 {
+            panic("archive: bad octal digit " + b.to_str() + " at offset " + (i + k).to_str())
+        }
+        result = result * 8 + (b - 48)
+        k = k + 1
+    }
+    return result
+}
+
+# ----------------------------------------------------------------------------
+# CRC-32 (IEEE 802.3, polynomial 0xEDB88320 reflected). Table-driven.
+# The result is returned as a non-negative int (the low 32 bits of the
+# CRC computation, masked to the unsigned 32-bit range).
+#
+# This is the same CRC-32 used by gzip (RFC 1952), zip (PKWARE APPNOTE),
+# and Ethernet. The implementation matches std.crypto's crypto_crc32
+# (Stage 43) — we duplicate it here so std.archive is self-contained
+# (no cross-module dependency on crypto internals).
+# ----------------------------------------------------------------------------
+
+# Build the CRC-32 lookup table. The table is computed lazily on first
+# call (the first CRC computation costs 256 iterations to populate
+# the table; subsequent computations cost 1 table lookup per byte).
+# Returns a list[int] of 256 entries, each in the range 0..2^32-1.
+fn _crc32_table() -> list[int] {
+    let table: list[int] = []
+    let mut i: int = 0
+    while i < 256 {
+        let mut c: int = i
+        let mut k: int = 0
+        while k < 8 {
+            # If the low bit is 1: c = (c >> 1) ^ 0xEDB88320.
+            # If the low bit is 0: c = (c >> 1).
+            # We use int_and(c, 1) to test the low bit (HLS has no &).
+            if int_and(c, 1) == 1 {
+                c = int_xor(int_shr(c, 1), 3988292384)  # 0xEDB88320 — IEEE 802.3 reflected polynomial
+            } else {
+                c = int_shr(c, 1)
+            }
+            k = k + 1
+        }
+        table.push(int_and(c, 4294967295))  # mask to 32 bits
+        i = i + 1
+    }
+    return table
+}
+
+# Compute the CRC-32 of a byte string. Returns a non-negative int in
+# the range 0..2^32-1. The algorithm is the standard "init 0xFFFFFFFF,
+# XOR each byte through the table, XOR output with 0xFFFFFFFF" — same
+# as zlib's crc32().
+fn archive_crc32(s: str) -> int {
+    let table: list[int] = _crc32_table()
+    let mut crc: int = 4294967295  # 0xFFFFFFFF (init)
+    let n: int = s.len()
+    let mut i: int = 0
+    while i < n {
+        let b: int = s.byte_at(i)
+        # crc = (crc >> 8) ^ table[(crc ^ b) & 0xFF]
+        let idx: int = int_and(int_xor(crc, b), 255)
+        crc = int_xor(int_shr(crc, 8), table.get(idx))
+        i = i + 1
+    }
+    # Final XOR with 0xFFFFFFFF, masked to 32 bits.
+    return int_and(int_xor(crc, 4294967295), 4294967295)
+}
+
+# ----------------------------------------------------------------------------
+# TarEntry — a single entry in a tar archive.
+# ----------------------------------------------------------------------------
+
+struct TarEntry {
+    name: str,        # file path (up to 256 bytes via prefix/name)
+    mode: int,        # permission bits (octal, e.g. 0o644 = 420)
+    size: int,        # file size in bytes
+    typeflag: int,    # '0' (48) regular file, '5' (53) directory, etc.
+    uid: int,         # owner user id
+    gid: int,         # owner group id
+    mtime: int,       # modification time (Unix seconds)
+    data: str,        # file content (empty for directories)
+}
+
+# tar_parse(s, max_ratio) parses a USTAR tar archive and returns the
+# list of entries. Panics on:
+#   * truncated header (less than 512 bytes available for a header)
+#   * bad octal field (mode, uid, gid, size, mtime, chksum)
+#   * zip-bomb-like expansion (sum of entry sizes > max_ratio * s.len())
+# Two consecutive zero (all-NUL) 512-byte blocks mark end-of-archive;
+# we stop there. Any trailing garbage is ignored.
+#
+# `max_ratio` is the maximum ratio of total-entry-size to archive-size.
+# Default is 100 (a tar of small files can have ratio ~1; a tar of
+# highly-compressible data could have ratio ~100; anything higher is
+# suspicious). Pass a higher limit for legitimate high-ratio archives.
+fn tar_parse(s: str, max_ratio: int) -> list[TarEntry] {
+    let entries: list[TarEntry] = []
+    let n: int = s.len()
+    let mut offset: int = 0
+    let mut total_size: int = 0
+    while offset + 512 <= n {
+        # Check for end-of-archive: two consecutive all-NUL blocks.
+        if _tar_block_is_zero(s, offset) {
+            # The next block must also be zero for proper end-of-archive.
+            # Some implementations only write one zero block; we accept
+            # either (one zero block followed by garbage, or two zero
+            # blocks). Both are valid tar terminators per POSIX.
+            break
+        }
+        # Parse the USTAR header at `offset`.
+        let entry: TarEntry = _tar_parse_header(s, offset)
+        # Skip directory entries (no data, no zip-bomb concern).
+        if entry.typeflag != 53 {  # '5' directory
+            # Read the file data (entry.size bytes, padded to 512).
+            let data_start: int = offset + 512
+            if data_start + entry.size > n {
+                panic("archive: tar entry '" + entry.name + "' size " + entry.size.to_str() + " exceeds archive bounds")
+            }
+            let data: str = ar_slice(s, data_start, entry.size)
+            # Re-construct the entry with the data attached. (HLS
+            # structs are immutable; we use a fresh struct literal.)
+            entries.push(TarEntry {
+                name: entry.name,
+                mode: entry.mode,
+                size: entry.size,
+                typeflag: entry.typeflag,
+                uid: entry.uid,
+                gid: entry.gid,
+                mtime: entry.mtime,
+                data: data,
+            })
+            total_size = total_size + entry.size
+            # Zip bomb check: total_size > max_ratio * s.len().
+            if max_ratio > 0 && total_size > max_ratio * n {
+                panic("archive: tar zip bomb detected: total entry size " + total_size.to_str() + " exceeds " + max_ratio.to_str() + "x archive size (" + n.to_str() + " bytes)")
+            }
+        } else {
+            # Directory entry: store it without data.
+            entries.push(entry)
+        }
+        # Advance to the next 512-byte block. The data is padded to
+        # the next 512-byte boundary.
+        let padded_size: int = _tar_pad512(entry.size)
+        offset = offset + 512 + padded_size
+    }
+    return entries
+}
+
+# Check if the 512-byte block at `offset` is all NUL.
+fn _tar_block_is_zero(s: str, offset: int) -> bool {
+    let mut k: int = 0
+    while k < 512 {
+        if offset + k >= s.len() {
+            # Truncated block — treat as zero (end-of-archive).
+            return true
+        }
+        if s.byte_at(offset + k) != 0 {
+            return false
+        }
+        k = k + 1
+    }
+    return true
+}
+
+# Parse a USTAR header at offset `off`. Returns a TarEntry with empty
+# data (the caller fills in the data). Panics on malformed fields.
+fn _tar_parse_header(s: str, off: int) -> TarEntry {
+    # name: offset 0, length 100.
+    let name_raw: str = ar_slice(s, off, 100)
+    let name: str = _tar_cstr_to_str(name_raw)
+    # mode: offset 100, length 8 (octal).
+    let mode: int = ar_read_octal(s, off + 100, 8)
+    # uid: offset 108, length 8 (octal).
+    let uid: int = ar_read_octal(s, off + 108, 8)
+    # gid: offset 116, length 8 (octal).
+    let gid: int = ar_read_octal(s, off + 116, 8)
+    # size: offset 124, length 12 (octal).
+    let size: int = ar_read_octal(s, off + 124, 12)
+    # mtime: offset 136, length 12 (octal).
+    let mtime: int = ar_read_octal(s, off + 136, 12)
+    # chksum: offset 148, length 8 (octal) — not validated by default
+    # (some tar implementations don't write a correct checksum; we
+    # follow GNU tar's "be liberal in what you accept" approach).
+    # typeflag: offset 156, length 1.
+    let typeflag: int = ar_byte_at(s, off + 156)
+    # If the typeflag is NUL (0), treat as regular file ('0' = 48).
+    # This is the old tar convention (pre-USTAR).
+    let actual_typeflag: int = _tar_normalise_typeflag(typeflag)
+    # magic: offset 257, length 6 ("ustar\0" or "ustar  ").
+    # prefix: offset 345, length 155.
+    # If the magic is "ustar", we may have a prefix (long filenames).
+    let mut prefix_raw: str = ""
+    if off + 257 + 8 <= s.len() {
+        let magic: str = ar_slice(s, off + 257, 8)
+        if _tar_is_ustar(magic) {
+            prefix_raw = _tar_cstr_to_str(ar_slice(s, off + 345, 155))
+        }
+    }
+    # Combine prefix and name if prefix is non-empty.
+    let full_name: str = _tar_combine_name(prefix_raw, name)
+    return TarEntry {
+        name: full_name,
+        mode: mode,
+        size: size,
+        typeflag: actual_typeflag,
+        uid: uid,
+        gid: gid,
+        mtime: mtime,
+        data: "",
+    }
+}
+
+# Convert a NUL-padded C-style string field to a Halis str (truncate
+# at the first NUL).
+fn _tar_cstr_to_str(s: str) -> str {
+    let n: int = s.len()
+    let mut k: int = 0
+    while k < n {
+        if s.byte_at(k) == 0 {
+            return s.slice(0, k)
+        }
+        k = k + 1
+    }
+    return s
+}
+
+# Normalise a typeflag byte. NUL (0) is treated as regular file (48 '0').
+fn _tar_normalise_typeflag(b: int) -> int {
+    if b == 0 {
+        return 48  # '0' regular file
+    }
+    return b
+}
+
+# Check if the magic field is "ustar" (USTAR format) or "ustar  " (GNU
+# extension). Both are 6-8 byte fields with trailing NUL or space.
+fn _tar_is_ustar(magic: str) -> bool {
+    # "ustar\0" (POSIX) — bytes 117, 115, 116, 97, 114, 0
+    # "ustar  \0" (GNU) — bytes 117, 115, 116, 97, 114, 32, 32, 0
+    if magic.len() < 5 {
+        return false
+    }
+    # Check first 5 bytes are "ustar".
+    if magic.byte_at(0) != 117 { return false }
+    if magic.byte_at(1) != 115 { return false }
+    if magic.byte_at(2) != 116 { return false }
+    if magic.byte_at(3) != 97 { return false }
+    if magic.byte_at(4) != 114 { return false }
+    return true
+}
+
+# Combine a prefix and a name into a full path. If prefix is empty,
+# return the name. Otherwise, return prefix + "/" + name.
+fn _tar_combine_name(prefix: str, name: str) -> str {
+    if prefix == "" {
+        return name
+    }
+    return prefix + "/" + name
+}
+
+# Pad a size to the next 512-byte boundary.
+fn _tar_pad512(size: int) -> int {
+    let rem: int = size % 512
+    if rem == 0 {
+        return size
+    }
+    return size + (512 - rem)
+}
+
+# tar_read_file(path, max_ratio) — convenience wrapper: read a tar
+# archive from a file and parse it. Carries the FS effect (read_file
+# is a taint sink — the path is checked at the sink level by the
+# compiler).
+fn tar_read_file(path: str, max_ratio: int) -> list[TarEntry] uses Fs {
+    let s: str = read_file(path)
+    return tar_parse(s, max_ratio)
+}
+
+# ----------------------------------------------------------------------------
+# GzipEncoder — produce a gzip file with a single stored DEFLATE block.
+# ----------------------------------------------------------------------------
+#
+# gzip file format (RFC 1952):
+#   Header (10 bytes):
+#     0x1f 0x8b  ID1 ID2 (magic)
+#     0x08       CM (compression method: 8 = deflate)
+#     0x00       FLG (flags: 0 = no extras)
+#     4 bytes    MTIME (modification time, little-endian; 0 = unknown)
+#     0x00       XFL (extra flags: 0 = default)
+#     0xff       OS (operating system: 0xff = unknown)
+#   DEFLATE stream:
+#     Stored block(s) (BTYPE=00). Each block:
+#       1 byte: BFINAL (1 bit) + BTYPE (2 bits, =00) + 5 padding bits
+#               = 0b_NNN00_xxx where NNN is BFINAL (1 bit) and xxx is
+#               padding (5 bits, = 0). For the final block: 0b_1_00_00000
+#               = 0x01. For non-final: 0b_0_00_00000 = 0x00.
+#       2 bytes: LEN (little-endian, number of data bytes)
+#       2 bytes: NLEN (one's complement of LEN, little-endian)
+#       LEN bytes: data
+#   Footer (8 bytes):
+#     4 bytes: CRC32 (little-endian, of the original uncompressed data)
+#     4 bytes: ISIZE (little-endian, original size mod 2^32)
+#
+# The encoder splits the input into 65535-byte blocks (the max LEN
+# for a single stored block). Each block is written with BFINAL=0
+# except the last (BFINAL=1).
+#
+# The encoder ALWAYS uses stored blocks (BTYPE=00) — no compression.
+# The output is therefore LARGER than the input (by ~5 bytes per
+# 65535 bytes). This is the v0.70.0-alpha MVP: the gzip file is
+# well-formed (RFC 1952 compliant) and can be decoded by gzip_decode
+# (and by external gzip tools — they all support stored blocks).
+# A future perfection stage will add DEFLATE compression (BTYPE=10
+# with dynamic Huffman + LZ77).
+
+fn gzip_encode(data: str) -> str {
+    let out: list[str] = []
+    # Header (10 bytes).
+    out.push(chr(31))   # 0x1f ID1
+    out.push(chr(139))  # 0x8b ID2
+    out.push(chr(8))    # 0x08 CM (deflate)
+    out.push(chr(0))    # 0x00 FLG (no extras)
+    out.push(chr(0))    # MTIME byte 0 (little-endian, 0 = unknown)
+    out.push(chr(0))    # MTIME byte 1
+    out.push(chr(0))    # MTIME byte 2
+    out.push(chr(0))    # MTIME byte 3
+    out.push(chr(0))    # 0x00 XFL
+    out.push(chr(255))  # 0xff OS (unknown)
+    # DEFLATE stream of stored blocks.
+    let n: int = data.len()
+    if n == 0 {
+        # Single empty final block.
+        out.push(chr(1))  # BFINAL=1, BTYPE=00, padding=0
+        out.push(chr(0))  # LEN low byte = 0
+        out.push(chr(0))  # LEN high byte = 0
+        out.push(chr(255))  # NLEN low byte = 0xff
+        out.push(chr(255))  # NLEN high byte = 0xff
+    } else {
+        let mut offset: int = 0
+        while offset < n {
+            let remaining: int = n - offset
+            let mut block_len: int = 65535
+            if remaining < 65535 {
+                block_len = remaining
+            }
+            let is_final: bool = (offset + block_len) == n
+            # Block header byte: BFINAL (1 bit) + BTYPE (2 bits) + padding (5 bits).
+            # For BFINAL=1: 0b1_00_00000 = 0x01. For BFINAL=0: 0b0_00_00000 = 0x00.
+            if is_final {
+                out.push(chr(1))
+            } else {
+                out.push(chr(0))
+            }
+            # LEN (little-endian, 2 bytes).
+            out.push(chr(int_and(block_len, 255)))
+            out.push(chr(int_and(int_shr(block_len, 8), 255)))
+            # NLEN = one's complement of LEN (bitwise NOT, low 16 bits).
+            let nlen: int = int_xor(block_len, 65535)  # ~LEN & 0xFFFF
+            out.push(chr(int_and(nlen, 255)))
+            out.push(chr(int_and(int_shr(nlen, 8), 255)))
+            # Data.
+            out.push(ar_slice(data, offset, block_len))
+            offset = offset + block_len
+        }
+    }
+    # Footer: CRC32 (little-endian, 4 bytes) + ISIZE (little-endian, 4 bytes).
+    let crc: int = archive_crc32(data)
+    out.push(chr(int_and(crc, 255)))
+    out.push(chr(int_and(int_shr(crc, 8), 255)))
+    out.push(chr(int_and(int_shr(crc, 16), 255)))
+    out.push(chr(int_and(int_shr(crc, 24), 255)))
+    # ISIZE = data.len() mod 2^32.
+    let isize: int = int_and(n, 4294967295)
+    out.push(chr(int_and(isize, 255)))
+    out.push(chr(int_and(int_shr(isize, 8), 255)))
+    out.push(chr(int_and(int_shr(isize, 16), 255)))
+    out.push(chr(int_and(int_shr(isize, 24), 255)))
+    return str_join(out, "")
+}
+
+# ----------------------------------------------------------------------------
+# GzipDecoder — decode a gzip file. Supports stored DEFLATE blocks
+# (BTYPE=00); panics on compressed blocks (BTYPE=01/10) with a clear
+# "not supported in v0.70.0-alpha" message.
+# ----------------------------------------------------------------------------
+
+# gzip_decode(s, max_ratio) decodes a gzip file. Panics on:
+#   * bad magic (ID1/ID2/CM)
+#   * unknown flags (FLG != 0 — extras/FNAME/FCOMMENT/FHCRC not supported)
+#   * compressed DEFLATE block (BTYPE != 00)
+#   * CRC32 / ISIZE mismatch (data corruption)
+#   * zip bomb (uncompressed size > max_ratio * compressed size)
+# Returns the original uncompressed bytes.
+fn gzip_decode(s: str, max_ratio: int) -> str {
+    let n: int = s.len()
+    if n < 18 {
+        panic("archive: gzip stream too short (need at least 18 bytes for header + footer, got " + n.to_str() + ")")
+    }
+    # Header.
+    if ar_byte_at(s, 0) != 31 {
+        panic("archive: gzip ID1 mismatch (expected 0x1f, got " + ar_byte_at(s, 0).to_str() + ")")
+    }
+    if ar_byte_at(s, 1) != 139 {
+        panic("archive: gzip ID2 mismatch (expected 0x8b, got " + ar_byte_at(s, 1).to_str() + ")")
+    }
+    if ar_byte_at(s, 2) != 8 {
+        panic("archive: gzip CM mismatch (expected 8 = deflate, got " + ar_byte_at(s, 2).to_str() + ")")
+    }
+    let flg: int = ar_byte_at(s, 3)
+    if flg != 0 {
+        panic("archive: gzip FLG " + flg.to_str() + " not supported in v0.70.0-alpha (only FLG=0; no extras/FNAME/FCOMMENT/FHCRC)")
+    }
+    # MTIME (4 bytes, offset 4-7), XFL (1 byte, offset 8), OS (1 byte, offset 9).
+    # We don't validate these — they're informational.
+    # DEFLATE stream starts at offset 10.
+    let mut offset: int = 10
+    let out: list[str] = []
+    let mut total_out: int = 0
+    let mut final_seen: bool = false
+    while !final_seen {
+        # We need at least 5 bytes for a stored block header (1 + 2 + 2).
+        if offset + 5 > n {
+            panic("archive: gzip DEFLATE block header truncated at offset " + offset.to_str())
+        }
+        let hdr: int = ar_byte_at(s, offset)
+        let bfinal: int = int_and(hdr, 1)
+        let btype: int = int_and(int_shr(hdr, 1), 3)
+        if bfinal == 1 {
+            final_seen = true
+        }
+        if btype != 0 {
+            let mut bt_name: str = "BTYPE=" + btype.to_str()
+            if btype == 1 {
+                bt_name = "BTYPE=01 (fixed Huffman)"
+            } else if btype == 2 {
+                bt_name = "BTYPE=10 (dynamic Huffman)"
+            } else if btype == 3 {
+                bt_name = "BTYPE=11 (reserved)"
+            }
+            panic("archive: gzip compressed DEFLATE block (" + bt_name + ") not supported in v0.70.0-alpha; only stored blocks (BTYPE=00) are supported — use gzip_encode to produce decodable archives")
+        }
+        # Stored block: skip to next byte boundary (5 bits of padding
+        # in the header byte are already 0 because we required BTYPE=00
+        # and BFINAL is the only low bit). LEN (2 bytes LE), NLEN (2
+        # bytes LE = ~LEN).
+        let len_lo: int = ar_byte_at(s, offset + 1)
+        let len_hi: int = ar_byte_at(s, offset + 2)
+        let block_len: int = int_or(int_shl(len_hi, 8), len_lo)
+        let nlen_lo: int = ar_byte_at(s, offset + 3)
+        let nlen_hi: int = ar_byte_at(s, offset + 4)
+        let nlen: int = int_or(int_shl(nlen_hi, 8), nlen_lo)
+        # Validate NLEN = ~LEN (low 16 bits).
+        let expected_nlen: int = int_xor(block_len, 65535)
+        if nlen != expected_nlen {
+            panic("archive: gzip stored block NLEN mismatch (expected " + expected_nlen.to_str() + ", got " + nlen.to_str() + ") — corrupt stream")
+        }
+        # Read the data.
+        let data_start: int = offset + 5
+        if data_start + block_len > n - 8 {
+            panic("archive: gzip stored block data (" + block_len.to_str() + " bytes) extends past stream end (need footer at offset " + (n - 8).to_str() + ")")
+        }
+        let block_data: str = ar_slice(s, data_start, block_len)
+        out.push(block_data)
+        total_out = total_out + block_len
+        # Zip bomb check: total_out > max_ratio * n.
+        if max_ratio > 0 && total_out > max_ratio * n {
+            panic("archive: gzip zip bomb detected: uncompressed size " + total_out.to_str() + " exceeds " + max_ratio.to_str() + "x compressed size (" + n.to_str() + " bytes)")
+        }
+        offset = data_start + block_len
+    }
+    # Footer: CRC32 (4 bytes LE) + ISIZE (4 bytes LE).
+    if offset + 8 > n {
+        panic("archive: gzip footer truncated at offset " + offset.to_str())
+    }
+    let stored_crc: int = ar_read_le32(s, offset)
+    let stored_isize: int = ar_read_le32(s, offset + 4)
+    let data: str = str_join(out, "")
+    let actual_crc: int = archive_crc32(data)
+    if actual_crc != stored_crc {
+        panic("archive: gzip CRC32 mismatch (stored " + stored_crc.to_str() + ", actual " + actual_crc.to_str() + ") — corrupt stream")
+    }
+    let actual_isize: int = int_and(data.len(), 4294967295)
+    if actual_isize != stored_isize {
+        panic("archive: gzip ISIZE mismatch (stored " + stored_isize.to_str() + ", actual " + actual_isize.to_str() + ") — corrupt stream")
+    }
+    return data
+}
+
+# gzip_decode_file(path, max_ratio) — convenience wrapper. Carries Fs.
+fn gzip_decode_file(path: str, max_ratio: int) -> str uses Fs {
+    let s: str = read_file(path)
+    return gzip_decode(s, max_ratio)
+}
+
+# ----------------------------------------------------------------------------
+# ZipReader — parse ZIP archives with stored (uncompressed) entries.
+# ----------------------------------------------------------------------------
+#
+# ZIP file format (PKWARE APPNOTE 6.3.10):
+#   Local file header (per entry):
+#     0-3: signature PK\x04\x04 (0x04034b50)
+#     4-5: version needed (LE)
+#     6-7: general purpose bit flag (LE)
+#     8-9: compression method (LE; 0 = stored, 8 = deflate, ...)
+#     10-13: last mod time + date (LE)
+#     14-17: CRC-32 (LE)
+#     18-21: compressed size (LE)
+#     22-25: uncompressed size (LE)
+#     26-27: filename length (LE)
+#     28-29: extra field length (LE)
+#     30+ : filename + extra field
+#     then: compressed data (compressed_size bytes)
+#   End of Central Directory record (EOCD):
+#     0-3: signature PK\x05\x06 (0x06054b50)
+#     4-5: disk number (LE)
+#     6-7: disk with CD start (LE)
+#     8-9: number of CD records on this disk (LE)
+#     10-11: total number of CD records (LE)
+#     12-15: size of CD (LE)
+#     16-19: offset of CD start (LE)
+#     20-21: comment length (LE)
+#     22+ : comment
+#
+# v0.70.0-alpha parses by finding the EOCD, reading the central
+# directory, then for each entry, locating the local file header
+# and extracting the data. Compression method 0 (stored) is
+# supported; other methods panic with a clear message.
+
+struct ZipEntry {
+    name: str,             # entry name (filename)
+    compression_method: int,  # 0 = stored, 8 = deflate, ...
+    compressed_size: int,
+    uncompressed_size: int,
+    crc32: int,
+    data: str,             # uncompressed data
+}
+
+# zip_parse(s, max_ratio) parses a ZIP archive and returns the list
+# of entries. Panics on:
+#   * missing EOCD signature
+#   * missing local file header signature
+#   * unsupported compression method (!= 0)
+#   * CRC32 mismatch (data corruption)
+#   * zip bomb (sum of uncompressed sizes > max_ratio * s.len())
+fn zip_parse(s: str, max_ratio: int) -> list[ZipEntry] {
+    let n: int = s.len()
+    if n < 22 {
+        panic("archive: zip stream too short (need at least 22 bytes for EOCD, got " + n.to_str() + ")")
+    }
+    # Find the EOCD signature. The EOCD can be at most 22 + 65535
+    # bytes from the end (the comment field is up to 65535 bytes).
+    # We scan backwards from the end for the signature.
+    let eocd_off: int = _zip_find_eocd(s)
+    if eocd_off < 0 {
+        panic("archive: zip EOCD signature not found (not a valid ZIP file)")
+    }
+    # EOCD fields.
+    let cd_size: int = ar_read_le32(s, eocd_off + 12)
+    let cd_off: int = ar_read_le32(s, eocd_off + 16)
+    let cd_count: int = ar_read_le16(s, eocd_off + 10)
+    # Parse the central directory.
+    let entries: list[ZipEntry] = []
+    let mut off: int = cd_off
+    let mut k: int = 0
+    let mut total_uncompressed: int = 0
+    while k < cd_count {
+        if off + 46 > n {
+            panic("archive: zip central directory entry " + k.to_str() + " header truncated")
+        }
+        # Central directory file header signature: PK\x01\x02 (0x02014b50).
+        let sig: int = ar_read_le32(s, off)
+        if sig != 33639248 {
+            panic("archive: zip central directory entry " + k.to_str() + " bad signature (expected 0x02014b50, got " + sig.to_str() + ")")
+        }
+        # Compression method (offset 10).
+        let method: int = ar_read_le16(s, off + 10)
+        # CRC-32 (offset 16).
+        let crc: int = ar_read_le32(s, off + 16)
+        # Compressed size (offset 20).
+        let csize: int = ar_read_le32(s, off + 20)
+        # Uncompressed size (offset 24).
+        let usize: int = ar_read_le32(s, off + 24)
+        # Filename length (offset 28).
+        let name_len: int = ar_read_le16(s, off + 28)
+        # Extra field length (offset 30).
+        let extra_len: int = ar_read_le16(s, off + 30)
+        # Comment length (offset 32).
+        let comment_len: int = ar_read_le16(s, off + 32)
+        # Local header offset (offset 42).
+        let local_off: int = ar_read_le32(s, off + 42)
+        # Filename (offset 46).
+        if off + 46 + name_len > n {
+            panic("archive: zip central directory entry " + k.to_str() + " filename extends past archive end")
+        }
+        let name: str = ar_slice(s, off + 46, name_len)
+        # Advance past this entry.
+        off = off + 46 + name_len + extra_len + comment_len
+        # Read the local file header and extract the data.
+        let data: str = _zip_read_local(s, local_off, method, csize, usize, name, k)
+        # Validate the data CRC32 against the central directory's CRC.
+        # This catches data corruption: if any byte of the entry data
+        # is altered, the CRC32 will differ from the stored value.
+        let actual_crc: int = archive_crc32(data)
+        if actual_crc != crc {
+            panic("archive: zip entry " + k.to_str() + " ('" + name + "') CRC32 mismatch (stored " + crc.to_str() + ", actual " + actual_crc.to_str() + ") — corrupt data")
+        }
+        entries.push(ZipEntry {
+            name: name,
+            compression_method: method,
+            compressed_size: csize,
+            uncompressed_size: usize,
+            crc32: crc,
+            data: data,
+        })
+        total_uncompressed = total_uncompressed + usize
+        # Zip bomb check.
+        if max_ratio > 0 && total_uncompressed > max_ratio * n {
+            panic("archive: zip zip bomb detected: total uncompressed size " + total_uncompressed.to_str() + " exceeds " + max_ratio.to_str() + "x archive size (" + n.to_str() + " bytes)")
+        }
+        k = k + 1
+    }
+    return entries
+}
+
+# Find the EOCD signature (0x06054b50) by scanning backwards from the
+# end of the archive. Returns the offset of the EOCD, or -1 if not
+# found within the last 22 + 65535 bytes.
+fn _zip_find_eocd(s: str) -> int {
+    let n: int = s.len()
+    let max_back: int = 65557  # 22 + 65535
+    let mut back: int = 22
+    while back <= max_back && back <= n {
+        let off: int = n - back
+        let sig: int = ar_read_le32(s, off)
+        if sig == 101010256 {  # 0x06054b50
+            return off
+        }
+        back = back + 1
+    }
+    return -1
+}
+
+# Read a local file header and extract the data. Validates the
+# signature, checks the compression method, validates CRC32.
+fn _zip_read_local(s: str, local_off: int, expected_method: int, csize: int, usize: int, name: str, k: int) -> str {
+    let n: int = s.len()
+    if local_off + 30 > n {
+        panic("archive: zip local file header for entry " + k.to_str() + " ('" + name + "') truncated")
+    }
+    let sig: int = ar_read_le32(s, local_off)
+    if sig != 67324752 {  # 0x04034b50
+        panic("archive: zip local file header for entry " + k.to_str() + " ('" + name + "') bad signature (expected 0x04034b50, got " + sig.to_str() + ")")
+    }
+    # Local filename length (offset 26), extra length (offset 28).
+    let local_name_len: int = ar_read_le16(s, local_off + 26)
+    let local_extra_len: int = ar_read_le16(s, local_off + 28)
+    # Data starts at local_off + 30 + local_name_len + local_extra_len.
+    let data_start: int = local_off + 30 + local_name_len + local_extra_len
+    # Compression method (offset 8).
+    let method: int = ar_read_le16(s, local_off + 8)
+    if method != expected_method {
+        panic("archive: zip entry " + k.to_str() + " ('" + name + "') local header method " + method.to_str() + " differs from central directory method " + expected_method.to_str())
+    }
+    if method != 0 {
+        let mut m_name: str = "method=" + method.to_str()
+        if method == 8 {
+            m_name = "method=8 (deflate)"
+        } else if method == 9 {
+            m_name = "method=9 (deflate64)"
+        } else if method == 12 {
+            m_name = "method=12 (bzip2)"
+        } else if method == 14 {
+            m_name = "method=14 (LZMA)"
+        }
+        panic("archive: zip entry " + k.to_str() + " ('" + name + "') compressed with " + m_name + " — not supported in v0.70.0-alpha (only method=0 stored)")
+    }
+    # Stored: data is csize bytes at data_start, uncompressed == compressed.
+    if csize != usize {
+        panic("archive: zip stored entry " + k.to_str() + " ('" + name + "') size mismatch: compressed=" + csize.to_str() + " != uncompressed=" + usize.to_str())
+    }
+    if data_start + csize > n {
+        panic("archive: zip stored entry " + k.to_str() + " ('" + name + "') data extends past archive end")
+    }
+    let data: str = ar_slice(s, data_start, csize)
+    # CRC32 validation is done by the caller (zip_parse) against the
+    # central directory's CRC, which is authoritative. We don't check
+    # the local-header CRC here because some ZIP implementations use
+    # the "data descriptor" feature (bit 3 of the general-purpose
+    # flag): in that mode the local header CRC is zero, and the real
+    # CRC lives in a 12-byte trailer after the data. We rely on the
+    # central directory CRC for correctness.
+    return data
+}
+
+# zip_read_file(path, max_ratio) — convenience wrapper. Carries Fs.
+fn zip_read_file(path: str, max_ratio: int) -> list[ZipEntry] uses Fs {
+    let s: str = read_file(path)
+    return zip_parse(s, max_ratio)
+}
+
+# ============================================================================
+# End of std/archive.hls
+# ============================================================================

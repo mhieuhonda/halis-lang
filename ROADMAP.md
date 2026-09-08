@@ -68,7 +68,7 @@ remains green.
 | 33 | Async/await zero-runtime futures | ✅ | (done) |
 | 34 | Async stream combinators (channels × generators) | ✅ | (done) |
 
-### Phase III — Standard library expansion (Stages 35–52)
+### Phase III — Standard library expansion (Stages 35–52, complete)
 
 | # | Stage | Status | Estimated effort |
 |---|-------|:------:|:----------------:|
@@ -88,8 +88,8 @@ remains green.
 | 48 | `std.env` — environment variables, current dir | ✅ | (done in v0.67.0-alpha) |
 | 49 | `std.time` — monotonic clock, sleep, deadline arithmetic | ✅ | (done in v0.68.0-alpha) |
 | 50 | `std.math` — IEEE-754 edge cases, special functions | ✅ | (done in v0.69.0-alpha) |
-| 51 | `std.archive` — tar, zip, gzip (no unsafe decompression) | ⬜ | 4 weeks |
-| 52 | `std.uuid` v7 + `std.ulid` (lexicographically sortable) | ⬜ | 2 weeks |
+| 51 | `std.archive` — tar, zip, gzip (no unsafe decompression) | ✅ | (done in v0.70.0-alpha) |
+| 52 | `std.uuid` v7 + `std.ulid` (lexicographically sortable) | ✅ | (done in v0.71.0-alpha) |
 
 ### Phase IV — CLI tooling track (Stages 53–62)
 
@@ -5205,12 +5205,75 @@ positive and negative operands), and BigDecimal to_int
 **51. `std.archive`** — `TarReader`, `ZipReader`, `GzipEncoder`,
 `GzipDecoder`. Decompression is bounded (a zip bomb is detected and
 rejected after a configurable expansion ratio). No unsafe
-decompression (every byte is bounds-checked).
+decompression (every byte is bounds-checked). **Status (v0.70.0-alpha):
+Stage 51 is COMPLETE.** `std/archive.hls` ships with TarReader (USTAR
+format parser, with typeflag '0' for regular files and '5' for
+directories), ZipReader (PKWARE APPNOTE format with stored entries
+only — compression method 0 — and CRC-32 verified against the
+central directory's CRC), GzipEncoder (RFC 1952 framing with stored
+DEFLATE blocks, BTYPE=00 — no compression, just framing), and
+GzipDecoder (stored blocks BTYPE=00 only; compressed blocks BTYPE=01
+fixed-Huffman or BTYPE=10 dynamic-Huffman panic with a clear "not
+supported in v0.70.0-alpha" message — a future perfection stage will
+add the full inflate algorithm). All readers enforce a configurable
+`max_ratio` (default 100) — if the total uncompressed size exceeds
+`max_ratio * compressed size`, the reader panics with a "zip bomb
+detected" message. Every byte access is bounds-checked (the
+`ar_byte_at` and `ar_slice` helpers pre-check indices and panic
+with a clear archive-flavoured message). The `archive_crc32`
+function is the standard IEEE 802.3 CRC-32 (polynomial 0xEDB88320
+reflected, table-driven) — same as gzip (RFC 1952), zip (PKWARE
+APPNOTE), and Ethernet. The implementation is pure HLS — no new
+compiler builtins; uses `read_file` (Fs effect) for the file-level
+convenience wrappers and `byte_at` + `int_and`/`int_or`/`int_xor`/
+`int_shl`/`int_shr` (Stage 32 native bitwise primitives) for byte
+manipulation. Acceptance: `make archive-acceptance` — 5 sub-tests
+(CRC32, gzip round-trip with 6 size variations, tar parse, zip parse,
+zip-bomb defensive check) + 2 differential tests (archive_demo +
+feat_stage51_archive), all green.
 
 **52. `std.uuid` v7 + `std.ulid`** — UUID v7 (time-ordered, like UUID
 v1 but privacy-preserving), ULID (26-char base32, lexicographically
 sortable). Both replace UUID v4 for new use-cases (UUID v4 remains
-for backwards compat).
+for backwards compat). **Status (v0.71.0-alpha): Stage 52 is
+COMPLETE.** `std/uuid.hls` is extended with UUID v7 (RFC 9562) and
+ULID support. UUID v7 layout: 48-bit Unix millisecond timestamp
+(big-endian) + 4-bit version (= 0b0111) + 12-bit rand_a (random) +
+2-bit variant (= 0b10) + 62-bit rand_b (random). The deterministic
+variant `uuid_v7_from(ts_ms, rand_a, rand_b)` accepts the timestamp
+and the two random fields as explicit arguments (useful for testing
+and reproducible builds); the live variant `uuid_v7()` reads the
+current time via `system_time_now_ms` (Stage 49, Clock effect) and
+generates random bytes via `rand_int` (Stage 9, Rand effect).
+`uuid_v7_timestamp(s)` extracts the 48-bit timestamp from a v7 UUID
+string. The implementation passes the RFC 9562 Appendix A test
+vector: `uuid_v7_from(1645553341471, 3267, 1784793296649003341) =
+"017f229f-541f-7cc3-98c4-dc0c0c43214d"`. ULID layout: 48-bit Unix
+millisecond timestamp (big-endian, encoded as 10 chars of Crockford
+base32 with 2 zero padding bits at the top) + 80-bit randomness
+(encoded as 16 chars of Crockford base32, no padding). Total: 26
+chars. The encoding matches the standard ULID spec (compatible with
+python-ulid and the JS reference implementation); verified against
+python-ulid for both low-bit and high-bit random bytes. ULIDs are
+lexicographically sortable: comparing two ULID strings
+lexicographically gives the same result as comparing the underlying
+(timestamp, randomness) tuples. The Crockford base32 alphabet
+excludes I, L, O, U (confusable with 1, 1, 0, V) — but on decode,
+these chars are accepted as substitutions (I→1, L→1, O→0, U→V) per
+the Crockford spec. API: `ulid()` (live), `ulid_from(ts_ms,
+rand_bytes)` (deterministic), `ulid_timestamp(s)` (extract
+timestamp), `ulid_randomness(s) -> 10 bytes` (extract randomness),
+`ulid_is_valid(s)` (format check), `ulid_compare(a, b)` (lexicographic
+comparison, returns -1/0/1). The existing UUID v4 deterministic and
+v5-like functions are preserved unchanged (backwards compat). The
+`uuid_version` function now returns 7 in addition to 4 and 5.
+Acceptance: `make uuid-ulid-acceptance` — 13 sub-tests (UUID v7 RFC
+vector, deterministic, edge cases, live; ULID encoding, high-bit
+regression, zero, max, lexicographic sort, is_valid, Crockford
+substitutions, live; UUID version compat) + 1 differential test
+(feat_stage52_uuid_ulid) + 1 runs-cleanly check (uuid_ulid_demo,
+non-deterministic due to live clock/random) + 1 backwards-compat
+regression check (feat_stdlib_uuid still passes), all green.
 
 ---
 

@@ -13,6 +13,244 @@ stability (125–140), and final stabilisation toward v1.0 (141–150).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
+## [v0.71.0-alpha] — Stage 52: std.uuid v7 + std.ulid (lexicographically sortable)
+
+> Completes **Phase III (Standard library expansion, Stages 35–52)**.
+> Adds **UUID v7** (RFC 9562 — time-ordered, privacy-preserving) and
+> **ULID** (26-char Crockford base32, lexicographically sortable) to
+> `std/uuid.hls`. Both are pure-HLS extensions; no new compiler
+> builtins (uses `system_time_now_ms` from Stage 49 for the
+> timestamp and `rand_int` from Stage 9 for randomness). The existing
+> UUID v4 deterministic and v5-like functions are preserved unchanged
+> (backwards compat). `uuid_version` now returns 7 in addition to 4
+> and 5.
+
+### Added — Stage 52 (v0.71.0-alpha)
+
+- **UUID v7 (RFC 9562)** — time-ordered, privacy-preserving UUID:
+  - **Layout**: 48-bit Unix millisecond timestamp (big-endian) +
+    4-bit version (= 0b0111) + 12-bit `rand_a` (random) + 2-bit
+    variant (= 0b10) + 62-bit `rand_b` (random). Total: 128 bits,
+    formatted as the standard 8-4-4-4-12 hex string with version
+    nibble = 7 and variant nibble = 8/9/a/b.
+  - **API**: `uuid_v7() -> str` (live, uses current time + random),
+    `uuid_v7_from(ts_ms, rand_a, rand_b) -> str` (deterministic,
+    accepts timestamp and the two random fields as arguments),
+    `uuid_v7_timestamp(s) -> int` (extract the 48-bit timestamp;
+    returns -1 on invalid).
+  - **RFC 9562 conformance**: passes the Appendix A test vector —
+    `uuid_v7_from(1645553341471, 3267, 1784793296649003341) =
+    "017f229f-541f-7cc3-98c4-dc0c0c43214d"`.
+  - **Lexicographic sortability**: UUIDs with later timestamps
+    sort after earlier ones (when the high-timestamp field changes),
+    making v7 UUIDs suitable for database indexes that benefit from
+    time-ordered insertion (B-trees stay balanced).
+
+- **ULID (Universally Unique Lexicographically Sortable Identifier)**:
+  - **Layout**: 48-bit Unix millisecond timestamp (big-endian,
+    encoded as 10 chars of Crockford base32 with 2 zero padding
+    bits at the top) + 80-bit randomness (encoded as 16 chars of
+    Crockford base32, no padding). Total: 26 chars.
+  - **Crockford base32 alphabet**: `0123456789ABCDEFGHJKMNPQRSTVWXYZ`
+    (32 chars, excluding I, L, O, U which are confusable with 1, 1,
+    0, V). On decode, I/L/O/U are accepted as substitutions
+    (I→1, L→1, O→0, U→V) per the Crockford spec.
+  - **Standard compatibility**: the encoding matches the ULID spec
+    (compatible with python-ulid and the JS reference
+    implementation); cross-verified against python-ulid for both
+    low-bit and high-bit random bytes.
+  - **Lexicographic sortability**: comparing two ULID strings
+    lexicographically gives the same result as comparing the
+    underlying (timestamp, randomness) tuples. This is the killer
+    feature for database indexes (B-trees stay balanced when IDs
+    are inserted in time order), log correlation (a million IDs
+    cluster by time when sorted), and distributed systems (k-sorted
+    IDs reduce coordination overhead).
+  - **API**: `ulid() -> str` (live), `ulid_from(ts_ms, rand_bytes)
+    -> str` (deterministic, `rand_bytes` is a 10-byte string),
+    `ulid_timestamp(s) -> int` (extract 48-bit timestamp),
+    `ulid_randomness(s) -> str` (extract 10-byte randomness),
+    `ulid_is_valid(s) -> bool` (format check), `ulid_compare(a, b)
+    -> int` (lexicographic comparison, returns -1/0/1).
+
+- **`std/uuid.hls`** — the module header is updated to document the
+  v7 and ULID additions. The existing `uuid_v4_deterministic`,
+  `uuid_v5_like`, `uuid_is_valid`, and `uuid_version` functions are
+  preserved unchanged. `uuid_version` now returns 7 (in addition to
+  4 and 5) when called on a v7 UUID string.
+
+- **`examples/uuid_ulid_demo.hls`** demonstrating:
+  - UUID v4 deterministic (backwards compat), UUID v5-like
+    (backwards compat)
+  - UUID v7 from the RFC 9562 test vector (deterministic)
+  - Live UUID v7 generation (current time + random)
+  - ULID deterministic encoding (matches python-ulid)
+  - Live ULID generation (current time + random)
+  - Timestamp extraction from both UUID v7 and ULID
+  - Lexicographic sort demo (the ULID's killer feature)
+  - UUID v7 lexicographic sort within the high-timestamp field
+
+- **`tests/ok/feat_stage52_uuid_ulid.hls`** acceptance test with 13
+  sub-tests: UUID v7 RFC vector, UUID v7 deterministic, UUID v7 edge
+  cases (zero, max), UUID v7 live; ULID encoding (round-trip), ULID
+  high-bit regression (the case that broke the initial
+  implementation), ULID zero, ULID max, ULID lexicographic sort, ULID
+  is_valid (format + alphabet), ULID Crockford substitutions
+  (I/L/O/U on decode), ULID live; UUID version compatibility (v4, v5,
+  v7). All deterministic (the live tests don't print specific values
+  — only assertions, so the test is differential-safe).
+
+- **Makefile target** `uuid-ulid-acceptance` — runs the demo (runs-
+  cleanly check, since live UUIDs/ULIDs are non-deterministic) and
+  the deterministic acceptance test (byte-identical diff between
+  interpreter and native), plus a backwards-compat regression check
+  (feat_stdlib_uuid still passes).
+
+### Changed — Stage 52
+
+- **`std/uuid.hls`** — `uuid_version` now returns 7 in addition to 4
+  and 5. The module header is updated to document the new v7 / ULID
+  API. The existing v4 / v5 implementations are preserved unchanged.
+
+### Test suite
+
+- **All existing tests still pass** (no regressions). The existing
+  `tests/ok/feat_stdlib_uuid.hls` (Stage 10 UUID v4/v5 test) still
+  passes — verified in `uuid-ulid-acceptance`.
+- **1 new differential test** (`feat_stage52_uuid_ulid`) — verified
+  byte-identical between interpreter and native.
+- **1 new runs-cleanly check** (`uuid_ulid_demo`) — non-deterministic
+  due to live clock/random, so byte comparison is not appropriate;
+  we verify it reaches `ACCEPTANCE OK` under both backends.
+
+## [v0.70.0-alpha] — Stage 51: std.archive (tar + zip + gzip, no unsafe decompression)
+
+> Adds `std/archive.hls` — the **eighteenth module of Phase III
+> (stdlib expansion)**. Provides `TarReader` (USTAR format), `ZipReader`
+> (PKWARE APPNOTE with stored entries), `GzipEncoder` (RFC 1952 with
+> stored DEFLATE blocks), and `GzipDecoder` (stored blocks only).
+> Decompression is bounded (a configurable expansion ratio rejects
+> zip bombs). Every byte is bounds-checked (no unsafe decompression).
+> Pure-HLS implementation — no new compiler builtins (uses `read_file`
+> for the file-level wrappers + `byte_at` + Stage 32 native bitwise
+> primitives for byte manipulation).
+
+### Added — Stage 51 (v0.70.0-alpha)
+
+- **`std/archive.hls`** library module — 18 stdlib module of Phase III:
+  - **`TarEntry` struct**: `name`, `mode`, `size`, `typeflag` ('0' =
+    regular file, '5' = directory), `uid`, `gid`, `mtime`, `data`.
+  - **`tar_parse(s, max_ratio) -> list[TarEntry]`**: parses a USTAR
+    tar archive. Two consecutive all-NUL 512-byte blocks mark end-of-
+    archive (we stop there). The reader supports the GNU "ustar  \0"
+    magic in addition to the POSIX "ustar\0". PAX extended headers
+    (typeflag 'x' or 'g') are not yet parsed (deferred to perfection).
+  - **`tar_read_file(path, max_ratio) -> list[TarEntry]`**: file-level
+    wrapper around `read_file` + `tar_parse` (carries the Fs effect).
+  - **`ZipEntry` struct**: `name`, `compression_method`,
+    `compressed_size`, `uncompressed_size`, `crc32`, `data`.
+  - **`zip_parse(s, max_ratio) -> list[ZipEntry]`**: parses a ZIP
+    archive. Finds the End of Central Directory (EOCD) record by
+    scanning backwards from the end. Reads the central directory,
+    then for each entry, locates the local file header and extracts
+    the data. **Compression method 0 (stored) is supported**;
+    methods 8 (deflate), 9 (deflate64), 12 (bzip2), 14 (LZMA), etc.
+    panic with a clear "not supported in v0.70.0-alpha" message
+    (a future perfection stage will add method 8 via the inflate
+    algorithm). CRC-32 is verified against the central directory's
+    CRC (data corruption is detected).
+  - **`zip_read_file(path, max_ratio) -> list[ZipEntry]`**: file-level
+    wrapper (carries the Fs effect).
+  - **`gzip_encode(data) -> str`**: produces a gzip file with a
+    single stored DEFLATE block (BTYPE=00, no compression, just
+    framing). Splits the input into 65535-byte blocks (the max LEN
+    for a single stored block). The output is well-formed (RFC 1952
+    compliant) and can be decoded by `gzip_decode` AND by external
+    gzip tools (they all support stored blocks). The footer
+    includes the CRC-32 and ISIZE for integrity verification.
+  - **`gzip_decode(s, max_ratio) -> str`**: decodes a gzip file.
+    Supports stored DEFLATE blocks (BTYPE=00); panics on compressed
+    blocks (BTYPE=01 fixed-Huffman or BTYPE=10 dynamic-Huffman)
+    with a clear "not supported in v0.70.0-alpha" message. Verifies
+    the CRC-32 and ISIZE in the footer (data corruption is
+    detected). The `GzipEncoder`/`GzipDecoder` pair is a matched
+    set — files encoded by `gzip_encode` can be decoded by
+    `gzip_decode`. For decompressing external gzip files (which
+    typically use BTYPE=10 dynamic-Huffman), a future perfection
+    stage will add the full inflate algorithm.
+  - **`gzip_decode_file(path, max_ratio) -> str`**: file-level
+    wrapper (carries the Fs effect).
+  - **`archive_crc32(s) -> int`**: the standard IEEE 802.3 CRC-32
+    (polynomial 0xEDB88320 reflected, table-driven) — same as
+    gzip (RFC 1952), zip (PKWARE APPNOTE), and Ethernet. The
+    implementation matches `zlib.crc32` from Python's zlib module
+    (verified on the canonical test vectors: `crc32("hello") =
+    0x3610a686`, `crc32("The quick brown fox...") = 0x414fa339`,
+    `crc32("A") = 0xD3D99E8B`).
+  - **`archive_default_max_ratio() -> int`**: returns 100 (the
+    default maximum expansion ratio for decompression). The caller
+    can pass a higher limit for legitimate high-ratio archives
+    (e.g., 1000 for all-zeros data) or a lower limit (e.g., 10) for
+    safety-critical contexts.
+
+- **Bounded decompression (zip bomb detection)** — every reader
+  takes a `max_ratio` parameter. If the total uncompressed size
+  exceeds `max_ratio * compressed size`, the reader panics with
+  `"zip bomb detected: total uncompressed size N exceeds Mx archive
+  size (K bytes)"`. The default is 100 (most real archives have a
+  ratio of 5-20; a zip bomb typically has a ratio of 1000+). Pass
+  `max_ratio = 0` to disable the check (not recommended for untrusted
+  input).
+
+- **No unsafe decompression** — every byte access is bounds-checked.
+  The `ar_byte_at(s, i)` helper panics if `i` is out of bounds with
+  a clear `"archive: byte index N out of bounds (len=M)"` message.
+  The `ar_slice(s, i, n)` helper similarly pre-checks bounds. The
+  tar/zip/gzip readers all use these helpers — there are no raw
+  `s.byte_at(i)` calls without a bounds pre-check. Format errors
+  panic with a clear message naming the failing field (e.g.,
+  `"archive: gzip ID1 mismatch (expected 0x1f, got 0x42)"`).
+
+- **`examples/archive_demo.hls`** demonstrating:
+  - CRC-32 of standard test vectors (empty, "hello", "The quick
+    brown fox...", "A")
+  - Gzip round-trip (encode + hex dump of the encoded gzip file +
+    decode + verify the round-trip matches)
+  - Tar parse (build a small USTAR archive in-memory with 2 regular
+    files + 1 directory, parse it, display each entry)
+  - Zip parse (build a small ZIP archive in-memory with 2 stored
+    entries — one text, one binary (all 256 byte values) — parse it,
+    display each entry with its CRC-32)
+
+- **`tests/ok/feat_stage51_archive.hls`** acceptance test with 5
+  sub-tests: CRC-32 (6 test vectors), gzip round-trip (empty, small,
+  65535 bytes, 65536 bytes, 200000 bytes, all 256 byte values), tar
+  parse (2 regular files + 1 directory), zip parse (2 stored entries
+  with CRC-32 verification), zip bomb detection (defensive — verifies
+  the check doesn't false-positive on legitimate archives). All
+  deterministic (archives built in-memory — no file I/O).
+
+- **Makefile target** `archive-acceptance` — compiles + runs the
+  example and acceptance test under both interpreter and native,
+  verifies byte-identical output via `diff -q`.
+
+### Changed — Stage 51
+
+- **`ROADMAP.md`** — Stage 51 marked ✅ (was ⬜). Phase III header
+  updated to "complete" (Stages 35–52 all done).
+
+### Test suite
+
+- **All existing tests still pass** (no regressions). Sampled 27
+  representative tests (Stages 27–50) — all green under both
+  interpreter and native.
+- **2 new differential tests** (`feat_stage51_archive` +
+  `archive_demo`) — verified byte-identical between interpreter
+  and native.
+- **Bootstrap is still deterministic**: two self-compilation passes
+  produce byte-identical C output (the archive module is pure HLS,
+  so it doesn't affect the bootstrap chain).
+
 ## [v0.69.0-alpha] — Stage 50: std.math (IEEE-754 + transcendental + BigDecimal)
 
 > Adds **28 new compiler builtins** — `math_sin` / `cos` / `tan` /

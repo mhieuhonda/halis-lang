@@ -1,20 +1,38 @@
 # ============================================================================
-# std/uuid.hls — Deterministic UUID generation for Halis
+# std/uuid.hls — UUID generation for Halis
 # ----------------------------------------------------------------------------
-# Pure-HLS UUID v4-style generator. Because HLS v0.3 has no entropy source,
-# these are NOT cryptographically random UUIDs — they are deterministic
-# derivations from (namespace, counter) inputs, suitable for content
-# addressing, log correlation IDs, and similar non-security uses.
+# Stage 10 (v0.13.0-alpha): Deterministic UUID v4-style generator.
+#   Because HLS v0.3 has no entropy source, these are NOT cryptographically
+#   random UUIDs — they are deterministic derivations from (namespace,
+#   counter) inputs, suitable for content addressing, log correlation IDs,
+#   and similar non-security uses.
 #
-# Implementation: FNV-1a 64-bit hash of (namespace || ":" || counter) is
-# taken as the 128-bit UUID material (the hash gives 64 bits, then a
-# second hash of the digest string gives the high 64 bits — to get 128
-# bits of material total).
+#   Implementation: FNV-1a 64-bit hash of (namespace || ":" || counter) is
+#   taken as the 128-bit UUID material (the hash gives 64 bits, then a
+#   second hash of the digest string gives the high 64 bits — to get 128
+#   bits of material total).
+#
+# Stage 52 (v0.71.0-alpha): UUID v7 (RFC 9562) + ULID.
+#   UUID v7 is time-ordered (48-bit Unix millisecond timestamp + 74 random
+#   bits) — privacy-preserving (no MAC address leak like v1) and indexable
+#   (unlike v4 which is fully random). ULID is similar (48-bit timestamp +
+#   80-bit randomness, 26-char Crockford base32 encoding that's
+#   lexicographically sortable).
 #
 # Helpers provided:
 #   uuid_v4_deterministic(namespace, counter) -> str   ("xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx")
 #   uuid_v5_like(namespace, name)             -> str   (deterministic SHA-like)
 #   uuid_is_valid(s)                          -> bool  (format check)
+#   uuid_version(s)                           -> int   (4, 5, or 7; 0 on invalid)
+#   uuid_v7()                                 -> str   (time-ordered, RFC 9562)
+#   uuid_v7_from(ts_ms, rand_a, rand_b)       -> str   (deterministic v7 variant)
+#   uuid_v7_timestamp(s)                      -> int   (extract Unix ms; -1 on invalid)
+#   ulid()                                    -> str   (26-char Crockford base32)
+#   ulid_from(ts_ms, rand_bytes)              -> str   (deterministic ULID variant)
+#   ulid_timestamp(s)                         -> int   (extract Unix ms; -1 on invalid)
+#   ulid_randomness(s)                        -> str   (10-byte randomness)
+#   ulid_is_valid(s)                          -> bool  (format check)
+#   ulid_compare(a, b)                        -> int   (lexicographic; -1/0/1)
 # ============================================================================
 
 import "std.str"
@@ -117,13 +135,14 @@ fn uuid_is_valid(s: str) -> bool {
     return true
 }
 
-# uuid_version(s) returns 4 or 5 (or 0 on invalid) based on the version nibble.
+# uuid_version(s) returns 4, 5, or 7 (or 0 on invalid) based on the
+# version nibble at position 14.
 fn uuid_version(s: str) -> int {
     if !uuid_is_valid(s) {
         return 0
     }
     let v: int = hex_digit_value(s.byte_at(14))
-    if v == 4 || v == 5 {
+    if v == 4 || v == 5 || v == 7 {
         return v
     }
     return 0
@@ -133,4 +152,409 @@ fn is_hex_digit(c: int) -> bool {
     return (c >= 48 && c <= 57)
         || (c >= 65 && c <= 70)
         || (c >= 97 && c <= 102)
+}
+
+# ============================================================================
+# Stage 52 (v0.71.0-alpha): UUID v7 + ULID
+# ----------------------------------------------------------------------------
+# UUID v7 (RFC 9562): time-ordered, privacy-preserving. The 48-bit Unix
+# millisecond timestamp makes UUIDs sortable (UUID v1's privacy leak of
+# the MAC address is gone; UUID v4's complete randomness makes indexing
+# hard). The 74 random bits (12 in rand_a + 62 in rand_b) make UUIDs
+# unique within the same millisecond (a 1-in-2^74 collision is
+# astronomically unlikely even across billions of IDs per millisecond).
+#
+# ULID (Universally Unique Lexicographically Sortable Identifier):
+# 48-bit Unix millisecond timestamp + 80 bits of randomness, encoded as
+# 26 chars in Crockford's base32 alphabet (no I, L, O, U to avoid
+# confusion with 1, 1, 0, V). The base32 encoding is monotonically
+# sortable: comparing two ULID strings lexicographically gives the same
+# result as comparing the underlying timestamps (with ties broken by
+# the randomness, which is also monotonically sortable as bytes).
+#
+# Both v7 UUIDs and ULIDs are "time-ordered" — newer IDs sort after
+# older ones. This is critical for database indexes (B-trees stay
+# balanced when IDs are inserted in time order), for log correlation
+# (you can sort a million IDs and they cluster by time), and for
+# distributed systems (k-sorted IDs reduce coordination overhead).
+#
+# Both use system_time_now_ms() (Stage 49, Clock effect) for the
+# timestamp and rand_int(256) (Stage 9, Rand effect) for randomness.
+# A deterministic variant is provided for testing (uuid_v7_from /
+# ulid_from) which takes the timestamp and randomness as arguments.
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# UUID v7 (RFC 9562)
+# ----------------------------------------------------------------------------
+
+# uuid_v7() returns a 36-character UUID v7 string. The timestamp is the
+# current Unix millisecond time (from system_time_now_ms); the random
+# bits are fresh random bytes (from rand_int). The string format is
+# the standard 8-4-4-4-12 hex with the version nibble = 7 and the
+# variant nibble = 8/9/a/b (high 2 bits = 0b10).
+fn uuid_v7() -> str uses Clock, Rand {
+    let ts_ms: int = system_time_now_ms()
+    return uuid_v7_from(ts_ms, _rand_int_12bits(), _rand_int_62bits())
+}
+
+# uuid_v7_from(ts_ms, rand_a, rand_b) is the deterministic variant.
+# rand_a is 12 bits (0..4095). rand_b is 62 bits
+# (0..4611686018427387903 = 2^62 - 1). Same (ts_ms, rand_a, rand_b)
+# always produces the same UUID. Useful for testing and for
+# reproducible builds.
+fn uuid_v7_from(ts_ms: int, rand_a: int, rand_b: int) -> str {
+    # Layout (128 bits, 8-4-4-4-12 hex string):
+    #   Field 1 (32 bits): ts_ms bits 16..47 (high 32 bits of timestamp)
+    #   Field 2 (16 bits): ts_ms bits 0..15 (low 16 bits of timestamp)
+    #   Field 3 (16 bits): ver(4) + rand_a(12) = 0x7XXX
+    #   Field 4 (16 bits): var(2) + rand_b high(14) = 0b10XXXXXXXXXXXXX
+    #   Field 5 (48 bits): rand_b low(48)
+    # Mask the inputs to their declared bit widths (defensive —
+    # out-of-range inputs would corrupt the format).
+    let ts: int = int_and(ts_ms, 281474976710655)  # 2^48 - 1
+    let ra: int = int_and(rand_a, 4095)            # 2^12 - 1
+    let rb: int = int_and(rand_b, 4611686018427387903)  # 2^62 - 1
+    # Field 1: high 32 bits of timestamp = ts >> 16.
+    let f1: int = int_and(int_shr(ts, 16), 4294967295)
+    # Field 2: low 16 bits of timestamp = ts & 0xFFFF.
+    let f2: int = int_and(ts, 65535)
+    # Field 3: (0x7 << 12) | rand_a = 0x7000 | ra.
+    let f3: int = int_or(28672, ra)  # 0x7000 = 0b0111_0000_0000_0000
+    # Field 4: (0b10 << 14) | (rand_b >> 48). The high 14 bits of rand_b
+    # go in field 4 (after the 2-bit variant). 0b10 << 14 = 0x8000 = 32768.
+    let f4: int = int_or(32768, int_and(int_shr(rb, 48), 16383))  # 0x8000 = 0b10_00_0000_0000_0000
+    # Field 5: low 48 bits of rand_b.
+    let f5: int = int_and(rb, 281474976710655)  # 2^48 - 1
+    # Format as 8-4-4-4-12 hex.
+    return _hex32(f1) + "-" + _hex16(f2) + "-" + _hex16(f3) + "-" + _hex16(f4) + "-" + _hex48(f5)
+}
+
+# uuid_v7_timestamp(s) extracts the 48-bit Unix millisecond timestamp
+# from a UUID v7 string. Returns -1 if the string is not a valid v7
+# UUID (the version nibble must be 7).
+fn uuid_v7_timestamp(s: str) -> int {
+    if !uuid_is_valid(s) {
+        return -1
+    }
+    if hex_digit_value(s.byte_at(14)) != 7 {
+        return -1
+    }
+    # Field 1 is the high 32 bits, field 2 is the low 16 bits.
+    let f1: int = _hex_str_to_int(s, 0, 8)
+    let f2: int = _hex_str_to_int(s, 9, 4)
+    return int_or(int_shl(f1, 16), f2)
+}
+
+# ----------------------------------------------------------------------------
+# ULID — Universally Unique Lexicographically Sortable Identifier.
+# ----------------------------------------------------------------------------
+
+# Crockford's base32 alphabet. No I, L, O, U (confusable with 1, 1, 0, V).
+# 32 chars: 0-9, A-Z minus I, L, O, U = 10 + 22 = 32.
+fn _ulid_alphabet() -> str {
+    return "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+}
+
+# ulid() returns a 26-character ULID string. The timestamp is the
+# current Unix millisecond time; the randomness is 10 fresh random
+# bytes. The string is monotonically sortable (lexicographic
+# comparison matches timestamp order, with ties broken by the
+# random bytes).
+fn ulid() -> str uses Clock, Rand {
+    let ts_ms: int = system_time_now_ms()
+    let rand_bytes: str = _rand_bytes(10)
+    return ulid_from(ts_ms, rand_bytes)
+}
+
+# ulid_from(ts_ms, rand_bytes) is the deterministic variant. ts_ms is
+# the 48-bit Unix millisecond timestamp. rand_bytes is a 10-byte
+# string of random data (the caller is responsible for providing
+# suitable randomness — e.g., from rand_int(256) per byte, or from
+# a cryptographic source if available). Same (ts_ms, rand_bytes)
+# always produces the same ULID.
+#
+# The encoding follows the standard ULID spec (compatible with
+# python-ulid, the JS reference, and all other ULID implementations):
+#   * The 48-bit timestamp is encoded as 10 chars of Crockford base32.
+#     Since 10 chars * 5 bits = 50 bits but the timestamp is only 48
+#     bits, the top 2 bits of the 50-bit value are zero (i.e., the
+#     timestamp is the bottom 48 bits of the 50-bit value, with 2 zero
+#     padding bits at the top).
+#   * The 80-bit randomness is encoded as 16 chars (80 / 5 = 16 exactly,
+#     no padding). The 10 random bytes are processed in 2 chunks of
+#     5 bytes each; each 5-byte chunk (40 bits) produces 8 chars.
+fn ulid_from(ts_ms: int, rand_bytes: str) -> str {
+    if rand_bytes.len() != 10 {
+        panic("ulid_from: rand_bytes must be exactly 10 bytes, got " + rand_bytes.len().to_str())
+    }
+    let ts: int = int_and(ts_ms, 281474976710655)  # 2^48 - 1
+    let alphabet: str = _ulid_alphabet()
+    let out: list[str] = []
+    # Encode the 48-bit timestamp as 10 chars (with 2 zero padding
+    # bits at the TOP of the 50-bit value). For 10 chars, char i
+    # (0..9) reads bits (5 * (9 - i)) to (5 * (9 - i) + 4) of ts.
+    # Since ts < 2^48, bits 48-49 are 0 (padding), and char 0 (which
+    # reads bits 45-49) gets bits 45-47 of ts + 2 zero bits.
+    let mut i: int = 0
+    while i < 10 {
+        let shift: int = 5 * (9 - i)
+        let char_val: int = int_and(int_shr(ts, shift), 31)
+        out.push(alphabet.slice(char_val, char_val + 1))
+        i = i + 1
+    }
+    # Encode the 80-bit randomness as 16 chars (no padding — 80 / 5 = 16 exactly).
+    # Process 2 chunks of 5 bytes each. Each chunk (40 bits) produces 8 chars.
+    let mut chunk_idx: int = 0
+    while chunk_idx < 2 {
+        let mut chunk: int = 0
+        let mut k: int = 0
+        while k < 5 {
+            let b: int = rand_bytes.byte_at(chunk_idx * 5 + k)
+            chunk = int_or(int_shl(chunk, 8), b)
+            k = k + 1
+        }
+        # chunk is now 40 bits. Split into 8 5-bit groups, MSB first.
+        let mut j: int = 0
+        while j < 8 {
+            let shift: int = 35 - 5 * j
+            let char_val: int = int_and(int_shr(chunk, shift), 31)
+            out.push(alphabet.slice(char_val, char_val + 1))
+            j = j + 1
+        }
+        chunk_idx = chunk_idx + 1
+    }
+    return str_join(out, "")
+}
+
+# ulid_timestamp(s) extracts the 48-bit Unix millisecond timestamp
+# from a ULID string. Returns -1 if the string is not a valid ULID.
+#
+# The first 10 chars encode the timestamp as a 50-bit value (with
+# the timestamp in the bottom 48 bits and 2 zero padding bits at
+# the top). We decode the 50-bit value and mask to 48 bits.
+fn ulid_timestamp(s: str) -> int {
+    if !ulid_is_valid(s) {
+        return -1
+    }
+    # The first 10 chars encode the timestamp (with 2 zero padding
+    # bits at the top of the 50-bit value).
+    let mut ts_50: int = 0
+    let mut i: int = 0
+    while i < 10 {
+        let c: int = s.byte_at(i)
+        let v: int = _ulid_decode_char(c)
+        if v < 0 {
+            return -1
+        }
+        ts_50 = int_or(int_shl(ts_50, 5), v)
+        i = i + 1
+    }
+    # Mask to the bottom 48 bits (discard the top 2 padding bits, which
+    # should be 0 for a valid ULID).
+    return int_and(ts_50, 281474976710655)  # 2^48 - 1
+}
+
+# ulid_randomness(s) extracts the 80-bit randomness as a 10-byte
+# string. Returns the empty string if the input is not a valid ULID.
+#
+# The last 16 chars encode the 80-bit randomness (no padding — 80 / 5
+# = 16 exactly). We decode the 16 chars in two 8-char halves (40 bits
+# each, fits in int64). Each 8-char half produces 5 bytes.
+fn ulid_randomness(s: str) -> str {
+    if !ulid_is_valid(s) {
+        return ""
+    }
+    let out: list[str] = []
+    # Decode chars 10-17 (8 chars = 40 bits = 5 bytes), then chars 18-25.
+    let mut chunk_idx: int = 0
+    while chunk_idx < 2 {
+        let mut chunk: int = 0
+        let mut j: int = 0
+        while j < 8 {
+            let c: int = s.byte_at(10 + chunk_idx * 8 + j)
+            let v: int = _ulid_decode_char(c)
+            if v < 0 {
+                return ""
+            }
+            chunk = int_or(int_shl(chunk, 5), v)
+            j = j + 1
+        }
+        # chunk is now 40 bits. Extract 5 bytes (big-endian).
+        let mut k: int = 4
+        while k >= 0 {
+            out.push(chr(int_and(int_shr(chunk, k * 8), 255)))
+            k = k - 1
+        }
+        chunk_idx = chunk_idx + 1
+    }
+    return str_join(out, "")
+}
+
+# ulid_is_valid(s) checks whether s matches the ULID format:
+# exactly 26 chars, all in Crockford's base32 alphabet. Does NOT
+# check the 2 padding bits (we accept any value there).
+fn ulid_is_valid(s: str) -> bool {
+    if s.len() != 26 {
+        return false
+    }
+    let mut i: int = 0
+    while i < 26 {
+        let c: int = s.byte_at(i)
+        if _ulid_decode_char(c) < 0 {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+# ulid_compare(a, b) compares two ULIDs lexicographically. Returns
+# -1 if a < b, 0 if a == b, 1 if a > b. Since ULIDs are encoded
+# monotonically (sort by char = sort by timestamp then randomness),
+# this is equivalent to comparing the underlying (timestamp,
+# randomness) tuples. If either string is not a valid ULID, the
+# comparison falls back to plain string comparison.
+fn ulid_compare(a: str, b: str) -> int {
+    if a == b {
+        return 0
+    }
+    if a < b {
+        return -1
+    }
+    return 1
+}
+
+# ----------------------------------------------------------------------------
+# Internal helpers for UUID v7 / ULID.
+# ----------------------------------------------------------------------------
+
+# Generate 12 random bits using rand_int(4096).
+fn _rand_int_12bits() -> int uses Rand {
+    return rand_int(4096)
+}
+
+# Generate 62 random bits. We can't call rand_int(2^62) directly
+# (the builtin takes int, but 2^62 is huge — we'd risk modulo bias
+# and implementation-defined behaviour). Instead, we generate 4
+# random 16-bit values and combine them into 62 bits (with the top
+# 2 bits being zero — masked out to ensure the result is in 0..2^62-1).
+fn _rand_int_62bits() -> int uses Rand {
+    let a: int = rand_int(16384)  # 14 bits (0..16383)
+    let b: int = rand_int(65536)  # 16 bits (0..65535)
+    let c: int = rand_int(65536)  # 16 bits (0..65535)
+    let d: int = rand_int(65536)  # 16 bits (0..65535)
+    # Combine: a (14) | b (16) | c (16) | d (16) = 62 bits total.
+    let result: int = int_or(
+        int_or(int_shl(a, 48), int_shl(b, 32)),
+        int_or(int_shl(c, 16), d)
+    )
+    return int_and(result, 4611686018427387903)  # mask to 62 bits
+}
+
+# Generate n random bytes as a str. Each byte is rand_int(256).
+fn _rand_bytes(n: int) -> str uses Rand {
+    let out: list[str] = []
+    let mut i: int = 0
+    while i < n {
+        out.push(chr(rand_int(256)))
+        i = i + 1
+    }
+    return str_join(out, "")
+}
+
+# Decode a single Crockford base32 char (case-insensitive) to 0..31.
+# Returns -1 on invalid char. Maps I -> 1, L -> 1, O -> 0, U -> V
+# (per the Crockford spec — these substitutions are accepted on input).
+fn _ulid_decode_char(c: int) -> int {
+    # 0..9 → 0..9
+    if c >= 48 && c <= 57 {
+        return c - 48
+    }
+    # A-Z (uppercase) → 10..31 (with I, L, O, U excluded; they map to
+    # 1, 1, 0, V respectively).
+    if c >= 65 && c <= 90 {
+        # A=10, B=11, ..., H=17, I→1, J=18, K=19, L→1, M=20, N=21, O→0,
+        # P=22, Q=23, R=24, S=25, T=26, U→V, V=27, W=28, X=29, Y=30, Z=31.
+        if c == 73 {
+            return 1   # I → 1
+        }
+        if c == 76 {
+            return 1   # L → 1
+        }
+        if c == 79 {
+            return 0   # O → 0
+        }
+        if c == 85 {
+            return 27  # U → V (value of V)
+        }
+        # Otherwise, look up by position in the alphabet.
+        let alphabet: str = _ulid_alphabet()
+        let mut i: int = 0
+        while i < 32 {
+            if alphabet.byte_at(i) == c {
+                return i
+            }
+            i = i + 1
+        }
+        return -1
+    }
+    # a-z (lowercase) — map to uppercase and recurse.
+    if c >= 97 && c <= 122 {
+        return _ulid_decode_char(c - 32)
+    }
+    return -1
+}
+
+# Format a 32-bit int as 8 lowercase hex chars (big-endian).
+fn _hex32(v: int) -> str {
+    let digits: str = "0123456789abcdef"
+    let out: list[str] = []
+    let mut k: int = 7
+    while k >= 0 {
+        let nibble: int = int_and(int_shr(v, k * 4), 15)
+        out.push(digits.slice(nibble, nibble + 1))
+        k = k - 1
+    }
+    return str_join(out, "")
+}
+
+# Format a 16-bit int as 4 lowercase hex chars (big-endian).
+fn _hex16(v: int) -> str {
+    let digits: str = "0123456789abcdef"
+    let out: list[str] = []
+    let mut k: int = 3
+    while k >= 0 {
+        let nibble: int = int_and(int_shr(v, k * 4), 15)
+        out.push(digits.slice(nibble, nibble + 1))
+        k = k - 1
+    }
+    return str_join(out, "")
+}
+
+# Format a 48-bit int as 12 lowercase hex chars (big-endian).
+fn _hex48(v: int) -> str {
+    let digits: str = "0123456789abcdef"
+    let out: list[str] = []
+    let mut k: int = 11
+    while k >= 0 {
+        let nibble: int = int_and(int_shr(v, k * 4), 15)
+        out.push(digits.slice(nibble, nibble + 1))
+        k = k - 1
+    }
+    return str_join(out, "")
+}
+
+# Parse n hex chars (starting at offset i in string s) as a non-negative
+# int. Returns 0 if any char is not a hex digit (lenient; the caller
+# should validate first if needed).
+fn _hex_str_to_int(s: str, i: int, n: int) -> int {
+    let mut result: int = 0
+    let mut k: int = 0
+    while k < n {
+        let v: int = hex_digit_value(s.byte_at(i + k))
+        result = int_or(int_shl(result, 4), v)
+        k = k + 1
+    }
+    return result
 }

@@ -1,0 +1,349 @@
+# examples/archive_demo.hls — Stage 51 (v0.70.0-alpha): std.archive demo.
+#
+# Demonstrates:
+#   - archive_crc32 (IEEE 802.3 CRC-32 of a string)
+#   - gzip_encode + gzip_decode round-trip (with hex dump of the
+#     encoded gzip file)
+#   - tar_parse (build a small tar archive in-memory and parse it)
+#   - zip_parse (build a small zip archive in-memory and parse it)
+#
+# All built archive formats are constructed in-memory (no file I/O
+# required) so the demo is fully deterministic and differential-safe
+# (interpreter == native).
+
+import "std.archive"
+import "std.str"
+import "std.hex"
+
+# ----------------------------------------------------------------------------
+# Helpers — build archive formats in-memory for the demo.
+# ----------------------------------------------------------------------------
+
+# Build a 256-byte string with all byte values 0..255 in order.
+fn all_bytes() -> str {
+    let out: list[str] = []
+    let mut i: int = 0
+    while i < 256 {
+        out.push(chr(i))
+        i = i + 1
+    }
+    return str_join(out, "")
+}
+
+# Hex-dump a string (16 bytes per line, with offset + ASCII).
+fn hex_dump(s: str) -> void uses IO {
+    let n: int = s.len()
+    let mut i: int = 0
+    while i < n {
+        # Offset (8 hex digits).
+        let off_str: str = hex_encode(chr(int_and(int_shr(i, 24), 255))
+            + chr(int_and(int_shr(i, 16), 255))
+            + chr(int_and(int_shr(i, 8), 255))
+            + chr(int_and(i, 255)))
+        print("  " + off_str + "  ")
+        # 16 bytes hex.
+        let mut j: int = 0
+        while j < 16 && i + j < n {
+            let b: int = s.byte_at(i + j)
+            let h: str = hex_encode(chr(b))
+            print(h + " ")
+            j = j + 1
+        }
+        # Pad to align if last line is short.
+        while j < 16 {
+            print("   ")
+            j = j + 1
+        }
+        print(" |")
+        # 16 bytes ASCII (printable only).
+        j = 0
+        while j < 16 && i + j < n {
+            let b: int = s.byte_at(i + j)
+            if b >= 32 && b <= 126 {
+                print(chr(b))
+            } else {
+                print(".")
+            }
+            j = j + 1
+        }
+        println("|")
+        i = i + 16
+    }
+}
+
+# ----------------------------------------------------------------------------
+# Tar builder — for the demo only (the std library is a reader API).
+# ----------------------------------------------------------------------------
+
+fn tar_octal_field(value: int, n: int) -> str {
+    let digits: str = "01234567"
+    let mut v: int = value
+    let rev: list[str] = []
+    if v == 0 {
+        rev.push("0")
+    }
+    while v > 0 {
+        rev.push(digits.slice(v % 8, v % 8 + 1))
+        v = v / 8
+    }
+    let fwd: list[str] = []
+    let mut i: int = rev.len() - 1
+    while i >= 0 {
+        fwd.push(rev.get(i))
+        i = i - 1
+    }
+    let oct_str: str = str_join(fwd, "")
+    let pad_len: int = n - 1 - oct_str.len()
+    if pad_len < 0 {
+        return oct_str.slice(0, n - 1) + chr(0)
+    }
+    return str_repeat("0", pad_len) + oct_str + chr(0)
+}
+
+fn tar_pad_field(s: str, n: int) -> str {
+    let len_s: int = s.len()
+    if len_s >= n {
+        return s.slice(0, n)
+    }
+    return s + str_repeat(chr(0), n - len_s)
+}
+
+fn tar_header(name: str, mode: int, size: int, typeflag: int) -> str {
+    let out: list[str] = []
+    out.push(tar_pad_field(name, 100))
+    out.push(tar_octal_field(mode, 8))
+    out.push(tar_octal_field(1000, 8))
+    out.push(tar_octal_field(1000, 8))
+    out.push(tar_octal_field(size, 12))
+    out.push(tar_octal_field(0, 12))
+    out.push(str_repeat(" ", 8))
+    out.push(chr(typeflag))
+    out.push(str_repeat(chr(0), 100))
+    out.push("ustar" + chr(0))
+    out.push("00")
+    out.push(tar_pad_field("user", 32))
+    out.push(tar_pad_field("group", 32))
+    out.push(tar_octal_field(0, 8))
+    out.push(tar_octal_field(0, 8))
+    out.push(str_repeat(chr(0), 155))
+    out.push(str_repeat(chr(0), 12))
+    let h: str = str_join(out, "")
+    if h.len() != 512 {
+        panic("tar_header: header length is " + h.len().to_str())
+    }
+    return h
+}
+
+fn build_demo_tar() -> str {
+    let parts: list[str] = []
+    # "Hello, tar!\n" is 12 bytes; pad to 512 with 500 NUL bytes.
+    parts.push(tar_header("README.txt", 420, 12, 48))
+    parts.push("Hello, tar!\n")
+    parts.push(str_repeat(chr(0), 500))
+    # "DATA!" is 5 bytes; pad to 512 with 507 NUL bytes.
+    parts.push(tar_header("data.bin", 420, 5, 48))
+    parts.push("DATA!")
+    parts.push(str_repeat(chr(0), 507))
+    parts.push(str_repeat(chr(0), 1024))
+    return str_join(parts, "")
+}
+
+# ----------------------------------------------------------------------------
+# Zip builder — for the demo only.
+# ----------------------------------------------------------------------------
+
+fn zip_le16(v: int) -> str {
+    return chr(int_and(v, 255)) + chr(int_and(int_shr(v, 8), 255))
+}
+
+fn zip_le32(v: int) -> str {
+    return chr(int_and(v, 255))
+        + chr(int_and(int_shr(v, 8), 255))
+        + chr(int_and(int_shr(v, 16), 255))
+        + chr(int_and(int_shr(v, 24), 255))
+}
+
+fn zip_local_header(name: str, crc: int, csize: int, usize: int) -> str {
+    let out: list[str] = []
+    out.push(chr(80) + chr(75) + chr(3) + chr(4))
+    out.push(chr(20) + chr(0))
+    out.push(chr(0) + chr(0))
+    out.push(chr(0) + chr(0))
+    out.push(chr(0) + chr(0))
+    out.push(chr(0) + chr(0))
+    out.push(zip_le32(crc))
+    out.push(zip_le32(csize))
+    out.push(zip_le32(usize))
+    out.push(zip_le16(name.len()))
+    out.push(chr(0) + chr(0))
+    out.push(name)
+    return str_join(out, "")
+}
+
+fn zip_central_header(name: str, crc: int, csize: int, usize: int, local_off: int) -> str {
+    let out: list[str] = []
+    out.push(chr(80) + chr(75) + chr(1) + chr(2))
+    out.push(chr(20) + chr(0))
+    out.push(chr(20) + chr(0))
+    out.push(chr(0) + chr(0))
+    out.push(chr(0) + chr(0))
+    out.push(chr(0) + chr(0))
+    out.push(chr(0) + chr(0))
+    out.push(zip_le32(crc))
+    out.push(zip_le32(csize))
+    out.push(zip_le32(usize))
+    out.push(zip_le16(name.len()))
+    out.push(chr(0) + chr(0))
+    out.push(chr(0) + chr(0))
+    out.push(chr(0) + chr(0))
+    out.push(chr(0) + chr(0))
+    out.push(chr(0) + chr(0) + chr(0) + chr(0))
+    out.push(zip_le32(local_off))
+    out.push(name)
+    return str_join(out, "")
+}
+
+fn zip_eocd(num_entries: int, cd_size: int, cd_off: int) -> str {
+    let out: list[str] = []
+    out.push(chr(80) + chr(75) + chr(5) + chr(6))
+    out.push(chr(0) + chr(0))
+    out.push(chr(0) + chr(0))
+    out.push(zip_le16(num_entries))
+    out.push(zip_le16(num_entries))
+    out.push(zip_le32(cd_size))
+    out.push(zip_le32(cd_off))
+    out.push(chr(0) + chr(0))
+    return str_join(out, "")
+}
+
+fn build_demo_zip() -> str {
+    let parts: list[str] = []
+    let name1: str = "greeting.txt"
+    let data1: str = "Hello from ZIP!"
+    let crc1: int = archive_crc32(data1)
+    let local1: str = zip_local_header(name1, crc1, data1.len(), data1.len())
+    let off1: int = 0
+    parts.push(local1)
+    parts.push(data1)
+    let off2: int = off1 + local1.len() + data1.len()
+    let name2: str = "binary.dat"
+    let data2: str = all_bytes()
+    let crc2: int = archive_crc32(data2)
+    let local2: str = zip_local_header(name2, crc2, data2.len(), data2.len())
+    parts.push(local2)
+    parts.push(data2)
+    let cd_start: int = off2 + local2.len() + data2.len()
+    let cd1: str = zip_central_header(name1, crc1, data1.len(), data1.len(), off1)
+    let cd2: str = zip_central_header(name2, crc2, data2.len(), data2.len(), off2)
+    let cd_size: int = cd1.len() + cd2.len()
+    parts.push(cd1)
+    parts.push(cd2)
+    parts.push(zip_eocd(2, cd_size, cd_start))
+    return str_join(parts, "")
+}
+
+# ----------------------------------------------------------------------------
+# Main demo.
+# ----------------------------------------------------------------------------
+
+fn main() -> int uses IO {
+    println("=== Stage 51 (v0.70.0-alpha): std.archive demo ===")
+    println("")
+
+    # --- CRC-32 ---
+    println("--- CRC-32 (IEEE 802.3, table-driven) ---")
+    println("crc32(\"\")                                 = " + archive_crc32("").to_str())
+    println("crc32(\"hello\")                            = " + archive_crc32("hello").to_str() + "  (0x3610a686)")
+    println("crc32(\"The quick brown fox...\")          = " + archive_crc32("The quick brown fox jumps over the lazy dog").to_str() + "  (0x414fa339)")
+    println("")
+
+    # --- Gzip round-trip ---
+    println("--- Gzip round-trip (RFC 1952, stored DEFLATE blocks) ---")
+    let original: str = "This is the original content that we will gzip-encode and gzip-decode."
+    let encoded: str = gzip_encode(original)
+    println("original (" + original.len().to_str() + " bytes): '" + original + "'")
+    println("gzip_encoded (" + encoded.len().to_str() + " bytes):")
+    hex_dump(encoded)
+    let decoded: str = gzip_decode(encoded, archive_default_max_ratio())
+    println("gzip_decoded (" + decoded.len().to_str() + " bytes): '" + decoded + "'")
+    println("round-trip OK: " + (original == decoded).to_str())
+    println("")
+
+    # --- Tar parse ---
+    println("--- Tar parse (USTAR format) ---")
+    let tar: str = build_demo_tar()
+    println("tar archive size: " + tar.len().to_str() + " bytes")
+    let entries: list[TarEntry] = tar_parse(tar, archive_default_max_ratio())
+    println("entries: " + entries.len().to_str())
+    let mut i: int = 0
+    while i < entries.len() {
+        let e: TarEntry = entries.get(i)
+        let mut kind: str = "regular file"
+        if e.typeflag == 53 {
+            kind = "directory"
+        }
+        println("  [" + i.to_str() + "] " + e.name + "  (" + kind + ", " + e.size.to_str() + " bytes, mode 0o" + _oct_str(e.mode) + ")")
+        if e.typeflag == 48 {
+            println("      data: '" + e.data + "'")
+        }
+        i = i + 1
+    }
+    println("")
+
+    # --- Zip parse ---
+    println("--- Zip parse (stored entries, method=0) ---")
+    let zip: str = build_demo_zip()
+    println("zip archive size: " + zip.len().to_str() + " bytes")
+    let zentries: list[ZipEntry] = zip_parse(zip, archive_default_max_ratio())
+    println("entries: " + zentries.len().to_str())
+    i = 0
+    while i < zentries.len() {
+        let e: ZipEntry = zentries.get(i)
+        println("  [" + i.to_str() + "] " + e.name + "  (method=" + e.compression_method.to_str() + ", csize=" + e.compressed_size.to_str() + ", usize=" + e.uncompressed_size.to_str() + ", crc32=0x" + _hex32(e.crc32) + ")")
+        if e.uncompressed_size <= 64 {
+            println("      data: '" + e.data + "'")
+        } else {
+            println("      data: " + e.uncompressed_size.to_str() + " bytes (first 32 bytes shown)")
+            println("      data: '" + e.data.slice(0, 32) + "...'")
+        }
+        i = i + 1
+    }
+    println("")
+
+    println("ACCEPTANCE OK: Stage 51 — std.archive (tar + zip + gzip)")
+    return 0
+}
+
+# Format an int as a 4-byte lowercase hex string (for CRC32 display).
+fn _hex32(v: int) -> str {
+    let digits: str = "0123456789abcdef"
+    let out: list[str] = []
+    let mut k: int = 7
+    while k >= 0 {
+        let nibble: int = int_and(int_shr(v, k * 4), 15)
+        out.push(digits.slice(nibble, nibble + 1))
+        k = k - 1
+    }
+    return str_join(out, "")
+}
+
+# Format an int as an octal string (for mode display).
+fn _oct_str(v: int) -> str {
+    let digits: str = "01234567"
+    let mut x: int = v
+    let rev: list[str] = []
+    if x == 0 {
+        rev.push("0")
+    }
+    while x > 0 {
+        rev.push(digits.slice(x % 8, x % 8 + 1))
+        x = x / 8
+    }
+    let fwd: list[str] = []
+    let mut i: int = rev.len() - 1
+    while i >= 0 {
+        fwd.push(rev.get(i))
+        i = i - 1
+    }
+    return str_join(fwd, "")
+}

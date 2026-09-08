@@ -1978,3 +1978,96 @@ time-acceptance: bin/hlc
 	@echo "  differential (interpreter == native) verified green."
 
 .PHONY: time-acceptance
+
+# ============================================================================
+# Stage 51 (v0.70.0-alpha): std.archive -- TarReader, ZipReader,
+# GzipEncoder, GzipDecoder with bounded decompression (zip bomb detection).
+# Pure-HLS implementation (no new compiler builtins) — uses read_file
+# (Fs effect) + byte_at + int_and/or/xor/shl/shr (Stage 32).
+# ============================================================================
+
+# Stage 51 archive demo is deterministic (all archive formats are
+# built in-memory — no live data). The differential test compares
+# interpreter and native output byte-for-byte.
+archive-acceptance: bin/hlc
+	@$(PYTHON) boot/boot.py examples/archive_demo.hls > /tmp/arch_demo_interp.txt 2>&1
+	@bin/hlc examples/archive_demo.hls /tmp/arch_demo.c 2>/dev/null
+	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/arch_demo /tmp/arch_demo.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
+	@/tmp/arch_demo > /tmp/arch_demo_nat.txt 2>&1
+	@diff -q /tmp/arch_demo_interp.txt /tmp/arch_demo_nat.txt >/dev/null 2>&1 \
+		|| (echo "FAIL: archive_demo differential mismatch" && false)
+	@$(PYTHON) boot/boot.py tests/ok/feat_stage51_archive.hls > /tmp/s51_interp.txt 2>&1
+	@bin/hlc tests/ok/feat_stage51_archive.hls /tmp/s51.c 2>/dev/null
+	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/s51 /tmp/s51.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
+	@/tmp/s51 > /tmp/s51_nat.txt 2>&1
+	@diff -q /tmp/s51_interp.txt /tmp/s51_nat.txt >/dev/null 2>&1 \
+		|| (echo "FAIL: feat_stage51_archive differential mismatch" && false)
+	@rm -f /tmp/arch_demo /tmp/arch_demo.c /tmp/arch_demo_interp.txt /tmp/arch_demo_nat.txt \
+		/tmp/s51 /tmp/s51.c /tmp/s51_interp.txt /tmp/s51_nat.txt
+	@echo ""
+	@echo "ACCEPTANCE OK: Stage 51 -- std.archive (tar + zip + gzip)"
+	@echo "  TarReader (USTAR format, typeflag '0' regular file + '5' directory)"
+	@echo "  ZipReader (stored entries, method=0, CRC32 verified against central directory)"
+	@echo "  GzipEncoder (RFC 1952 framing, stored DEFLATE blocks BTYPE=00)"
+	@echo "  GzipDecoder (stored blocks BTYPE=00; compressed blocks BTYPE=01/10 panic)"
+	@echo "  archive_crc32 (IEEE 802.3 polynomial 0xEDB88320, table-driven)"
+	@echo "  Bounded decompression (configurable max_ratio, default 100; zip bomb panic)"
+	@echo "  No unsafe decompression (every byte bounds-checked)"
+	@echo "  Pure-HLS implementation (no new compiler builtins)"
+	@echo "  differential (interpreter == native) verified green."
+
+.PHONY: archive-acceptance
+
+# ============================================================================
+# Stage 52 (v0.71.0-alpha): std.uuid v7 + std.ulid. UUID v7 (RFC 9562)
+# is time-ordered (48-bit Unix ms + 74 random bits). ULID is 26-char
+# Crockford base32 (lexicographically sortable). Both use
+# system_time_now_ms (Stage 49, Clock) + rand_int (Stage 9, Rand).
+# Pure-HLS implementation (no new compiler builtins).
+# ============================================================================
+
+# Stage 52 uuid_ulid demo prints LIVE UUIDs/ULIDs (current time + random),
+# so it is non-deterministic. We verify it RUNS cleanly under both
+# backends (exit 0, prints ACCEPTANCE OK), but do NOT compare output
+# byte-for-byte (the live values differ between interpreter and native).
+# The deterministic differential test uses feat_stage52_uuid_ulid.hls
+# (no live-data printing in the assertions — only format / sort / round-trip
+# checks, which are deterministic).
+uuid-ulid-acceptance: bin/hlc
+	@# Verify the demo runs cleanly under both backends (exit 0 + ACCEPTANCE OK).
+	@$(PYTHON) boot/boot.py examples/uuid_ulid_demo.hls > /tmp/uuid_demo_interp.txt 2>&1
+	@bin/hlc examples/uuid_ulid_demo.hls /tmp/uuid_demo.c 2>/dev/null
+	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/uuid_demo /tmp/uuid_demo.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
+	@/tmp/uuid_demo > /tmp/uuid_demo_nat.txt 2>&1
+	@tail -n 1 /tmp/uuid_demo_interp.txt | grep -q "ACCEPTANCE OK" \
+		|| (echo "FAIL: uuid_ulid_demo interpreter did not reach ACCEPTANCE OK" && false)
+	@tail -n 1 /tmp/uuid_demo_nat.txt | grep -q "ACCEPTANCE OK" \
+		|| (echo "FAIL: uuid_ulid_demo native did not reach ACCEPTANCE OK" && false)
+	@# The deterministic differential is on feat_stage52_uuid_ulid.hls.
+	@$(PYTHON) boot/boot.py tests/ok/feat_stage52_uuid_ulid.hls > /tmp/s52_interp.txt 2>&1
+	@bin/hlc tests/ok/feat_stage52_uuid_ulid.hls /tmp/s52.c 2>/dev/null
+	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/s52 /tmp/s52.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
+	@/tmp/s52 > /tmp/s52_nat.txt 2>&1
+	@diff -q /tmp/s52_interp.txt /tmp/s52_nat.txt >/dev/null 2>&1 \
+		|| (echo "FAIL: feat_stage52_uuid_ulid differential mismatch" && false)
+	@# Verify existing uuid test still passes (backwards compat).
+	@$(PYTHON) boot/boot.py tests/ok/feat_stdlib_uuid.hls > /tmp/s10_uuid_interp.txt 2>&1
+	@tail -n 1 /tmp/s10_uuid_interp.txt | grep -q "OK: uuid" \
+		|| (echo "FAIL: feat_stdlib_uuid backwards-compat regression" && false)
+	@rm -f /tmp/uuid_demo /tmp/uuid_demo.c /tmp/uuid_demo_interp.txt /tmp/uuid_demo_nat.txt \
+		/tmp/s52 /tmp/s52.c /tmp/s52_interp.txt /tmp/s52_nat.txt \
+		/tmp/s10_uuid_interp.txt
+	@echo ""
+	@echo "ACCEPTANCE OK: Stage 52 -- std.uuid v7 + std.ulid"
+	@echo "  UUID v7 (RFC 9562): 48-bit Unix ms timestamp + 12-bit rand_a + 62-bit rand_b"
+	@echo "  UUID v7 API: uuid_v7() (live), uuid_v7_from(ts_ms, rand_a, rand_b), uuid_v7_timestamp(s)"
+	@echo "  ULID: 48-bit Unix ms timestamp + 80-bit randomness, 26-char Crockford base32"
+	@echo "  ULID API: ulid() (live), ulid_from(ts_ms, rand_bytes), ulid_timestamp(s),"
+	@echo "    ulid_randomness(s) -> 10 bytes, ulid_is_valid(s), ulid_compare(a, b)"
+	@echo "  Both use system_time_now_ms (Clock) + rand_int (Rand) — no new compiler builtins"
+	@echo "  Pure-HLS implementation (extensions to std/uuid.hls; v4/v5 unchanged)"
+	@echo "  ULID encoding matches python-ulid and the JS reference implementation"
+	@echo "  Lexicographically sortable (the killer feature for database indexes / log correlation)"
+	@echo "  differential (interpreter == native) verified green."
+
+.PHONY: uuid-ulid-acceptance

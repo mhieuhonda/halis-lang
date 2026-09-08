@@ -1,0 +1,359 @@
+# tests/ok/feat_stage52_uuid_ulid.hls — Stage 52 (v0.71.0-alpha): std.uuid v7 + std.ulid.
+#
+# Exercises:
+#   - uuid_v7_from (RFC 9562 test vector)
+#   - uuid_v7_timestamp (extract timestamp from v7 UUID)
+#   - uuid_v7 (live generation with current time + random)
+#   - ulid_from (deterministic encoding with fixed timestamp + randomness)
+#   - ulid_timestamp (extract timestamp from ULID)
+#   - ulid_randomness (extract 10-byte randomness from ULID)
+#   - ulid (live generation)
+#   - ulid_is_valid (format check)
+#   - ulid_compare (lexicographic comparison, sortable)
+#   - lexicographic sort: ULIDs with later timestamps sort after earlier
+#     ones (the "lexicographically sortable" guarantee)
+#   - UUID v7 vs v4 format (version nibble is 7)
+#
+# The test uses deterministic inputs (no live clock / randomness in the
+# assertions) so it's fully reproducible and differential-safe
+# (interpreter == native).
+
+import "std.uuid"
+import "std.str"
+
+# ============================================================================
+# Helpers
+# ============================================================================
+
+fn ok(actual: bool, msg: str) -> void uses IO {
+    if !actual {
+        panic("FAIL " + msg)
+    }
+}
+
+fn eq_int(actual: int, expected: int, msg: str) -> void uses IO {
+    if actual != expected {
+        panic("FAIL " + msg + ": expected " + expected.to_str() + ", got " + actual.to_str())
+    }
+}
+
+fn eq_str(actual: str, expected: str, msg: str) -> void uses IO {
+    if actual != expected {
+        panic("FAIL " + msg + ": expected '" + expected + "', got '" + actual + "'")
+    }
+}
+
+# ============================================================================
+# UUID v7 (RFC 9562)
+# ============================================================================
+
+fn test_uuid_v7_rfc_vector() -> int uses IO {
+    # RFC 9562 Appendix A test vector.
+    # ts_ms = 1645553341471 (Unix ms)
+    # rand_a = 3267 (0xCC3)
+    # rand_b = 1784793296649003341 (0x18C4DC0C0C43214D, masked to 62 bits)
+    # Expected UUID: 017f229f-541f-7cc3-98c4-dc0c0c43214d
+    let ts: int = 1645553341471
+    let ra: int = 3267
+    let rb: int = 1784793296649003341
+    let uuid: str = uuid_v7_from(ts, ra, rb)
+    eq_str(uuid, "017f229f-541f-7cc3-98c4-dc0c0c43214d", "UUID v7 RFC 9562 test vector")
+    # Validate format.
+    ok(uuid_is_valid(uuid), "v7 UUID is_valid")
+    eq_int(uuid_version(uuid), 7, "v7 UUID version is 7")
+    eq_int(uuid.len(), 36, "v7 UUID length is 36")
+    # Extract timestamp.
+    eq_int(uuid_v7_timestamp(uuid), ts, "v7 UUID timestamp extraction")
+    # Version nibble at position 14 must be '7' (0x37 = 55).
+    eq_int(uuid.byte_at(14), 55, "v7 UUID version nibble = '7'")
+    # Variant nibble at position 19 must be 8, 9, a, or b.
+    let var_nibble: int = uuid.byte_at(19)
+    ok(var_nibble == 56 || var_nibble == 57 || var_nibble == 97 || var_nibble == 98,
+        "v7 UUID variant nibble = 8/9/a/b")
+    return 0
+}
+
+fn test_uuid_v7_deterministic() -> int uses IO {
+    # Same (ts_ms, rand_a, rand_b) always produces the same UUID.
+    let u1: str = uuid_v7_from(1000, 100, 200)
+    let u2: str = uuid_v7_from(1000, 100, 200)
+    eq_str(u1, u2, "v7 UUID deterministic for same inputs")
+    # Different inputs produce different UUIDs.
+    let u3: str = uuid_v7_from(1000, 101, 200)
+    let u4: str = uuid_v7_from(1001, 100, 200)
+    let u5: str = uuid_v7_from(1000, 100, 201)
+    ok(u1 != u3, "v7 UUID differs on rand_a")
+    ok(u1 != u4, "v7 UUID differs on ts_ms")
+    ok(u1 != u5, "v7 UUID differs on rand_b")
+    # Timestamp monotonicity: UUIDs with later timestamps should sort
+    # lexicographically after earlier ones (when the timestamps differ
+    # by more than 2^32, the high field changes; otherwise only the
+    # low field changes).
+    let u_early: str = uuid_v7_from(1000, 0, 0)
+    let u_late: str = uuid_v7_from(2000, 0, 0)
+    ok(u_early < u_late, "v7 UUIDs are lexicographically sortable by timestamp")
+    return 0
+}
+
+fn test_uuid_v7_edge_cases() -> int uses IO {
+    # Zero timestamp, zero random.
+    let u_zero: str = uuid_v7_from(0, 0, 0)
+    eq_str(u_zero, "00000000-0000-7000-8000-000000000000", "v7 UUID all-zero inputs")
+    # Max 48-bit timestamp, max 12-bit rand_a, max 62-bit rand_b.
+    let ts_max: int = 281474976710655  # 2^48 - 1
+    let ra_max: int = 4095  # 2^12 - 1
+    let rb_max: int = 4611686018427387903  # 2^62 - 1
+    let u_max: str = uuid_v7_from(ts_max, ra_max, rb_max)
+    # Field 1: ts >> 16 = 0xFFFFFFFF
+    # Field 2: ts & 0xFFFF = 0xFFFF
+    # Field 3: 0x7000 | 0xFFF = 0x7FFF
+    # Field 4: 0x8000 | (rb >> 48) & 0x3FFF = 0x8000 | 0x3FFF = 0xBFFF
+    # Field 5: rb & 0xFFFFFFFFFFFF = 0xFFFFFFFFFFFF
+    eq_str(u_max, "ffffffff-ffff-7fff-bfff-ffffffffffff", "v7 UUID max inputs")
+    # Verify timestamp extraction works for max values.
+    eq_int(uuid_v7_timestamp(u_max), ts_max, "v7 UUID max timestamp extraction")
+    return 0
+}
+
+fn test_uuid_v7_live() -> int uses IO, Rand {
+    # Live UUID v7 (uses system_time_now_ms + rand_int).
+    # We can't assert specific values, but we can verify format.
+    let u: str = uuid_v7()
+    ok(uuid_is_valid(u), "live v7 UUID is_valid")
+    eq_int(uuid_version(u), 7, "live v7 UUID version is 7")
+    eq_int(u.len(), 36, "live v7 UUID length is 36")
+    # The timestamp should be roughly the current time (non-zero).
+    let ts: int = uuid_v7_timestamp(u)
+    ok(ts > 1000000000000, "live v7 UUID timestamp is recent (> year 2001 in ms)")
+    # Two consecutive UUIDs should be different (extremely high probability).
+    let u2: str = uuid_v7()
+    ok(u != u2, "two live v7 UUIDs are different")
+    return 0
+}
+
+# ============================================================================
+# ULID
+# ============================================================================
+
+fn test_ulid_encoding() -> int uses IO {
+    # Deterministic encoding with known inputs.
+    let ts: int = 1645553341471
+    let rand_bytes: str = chr(1) + chr(2) + chr(3) + chr(4) + chr(5) + chr(6) + chr(7) + chr(8) + chr(9) + chr(10)
+    let ulid: str = ulid_from(ts, rand_bytes)
+    # Expected (matches python-ulid and the JS reference implementation).
+    eq_str(ulid, "01FWH9YN0Z041061050R3GG28A", "ULID encoding for ts=1645553341471, rand=[1..10]")
+    eq_int(ulid.len(), 26, "ULID length is 26")
+    ok(ulid_is_valid(ulid), "ULID is_valid")
+    # Extract timestamp.
+    eq_int(ulid_timestamp(ulid), ts, "ULID timestamp extraction")
+    # Extract randomness — should round-trip exactly.
+    let rand_back: str = ulid_randomness(ulid)
+    eq_int(rand_back.len(), 10, "ULID randomness length is 10 bytes")
+    eq_str(rand_back, rand_bytes, "ULID randomness round-trip")
+    return 0
+}
+
+fn test_ulid_with_high_random_bytes() -> int uses IO {
+    # Test with random bytes that have non-zero high bits in the first byte.
+    # This case previously broke our old encoder (which used a 2-bit shift).
+    # The new encoder (matching python-ulid and the JS reference) handles
+    # this correctly.
+    let ts: int = 1645553341471
+    let rand_bytes: str = chr(255) + chr(254) + chr(253) + chr(252) + chr(251) + chr(250) + chr(249) + chr(248) + chr(247) + chr(246)
+    let ulid: str = ulid_from(ts, rand_bytes)
+    # Expected (matches python-ulid).
+    eq_str(ulid, "01FWH9YN0ZZZZFVZ7VZBWZHXZP", "ULID with high-bit random bytes")
+    # Round-trip.
+    eq_int(ulid_timestamp(ulid), ts, "ULID timestamp round-trip (high-bit)")
+    let rand_back: str = ulid_randomness(ulid)
+    eq_str(rand_back, rand_bytes, "ULID randomness round-trip (high-bit)")
+    return 0
+}
+
+fn test_ulid_zero_inputs() -> int uses IO {
+    # Zero timestamp, zero randomness.
+    let zero_rand: str = chr(0) + chr(0) + chr(0) + chr(0) + chr(0) + chr(0) + chr(0) + chr(0) + chr(0) + chr(0)
+    let u: str = ulid_from(0, zero_rand)
+    eq_str(u, "00000000000000000000000000", "ULID all-zero inputs")
+    eq_int(ulid_timestamp(u), 0, "ULID zero timestamp extraction")
+    return 0
+}
+
+fn test_ulid_max_inputs() -> int uses IO {
+    # Max 48-bit timestamp, max 80-bit randomness.
+    let ts_max: int = 281474976710655  # 2^48 - 1
+    let rand_max: str = chr(255) + chr(255) + chr(255) + chr(255) + chr(255) + chr(255) + chr(255) + chr(255) + chr(255) + chr(255)
+    let u: str = ulid_from(ts_max, rand_max)
+    # The max 48-bit timestamp (2^48 - 1 = 48 ones) encoded as 10 chars
+    # (with 2 top padding bits = 0): the 50-bit value is 00 + 48 ones,
+    # which splits into 5-bit groups 00111 11111 11111 11111 11111
+    # 11111 11111 11111 11111 11111 = 7 Z Z Z Z Z Z Z Z Z (1 '7' + 9 'Z's).
+    # The max 80-bit randomness (80 ones) encoded as 16 chars: all 'Z'.
+    # So the full max ULID is '7' + 25 'Z's.
+    eq_str(u, "7ZZZZZZZZZZZZZZZZZZZZZZZZZ", "ULID max inputs")
+    eq_int(ulid_timestamp(u), ts_max, "ULID max timestamp extraction")
+    return 0
+}
+
+fn test_ulid_lexicographic_sort() -> int uses IO {
+    # ULIDs are lexicographically sortable. Two ULIDs with timestamps
+    # t1 < t2 should sort as u1 < u2 (when the randomness is the same).
+    let zero_rand: str = chr(0) + chr(0) + chr(0) + chr(0) + chr(0) + chr(0) + chr(0) + chr(0) + chr(0) + chr(0)
+    let u1: str = ulid_from(1000, zero_rand)
+    let u2: str = ulid_from(2000, zero_rand)
+    let u3: str = ulid_from(3000, zero_rand)
+    ok(u1 < u2, "ULID lexicographic: ts=1000 < ts=2000")
+    ok(u2 < u3, "ULID lexicographic: ts=2000 < ts=3000")
+    ok(u1 < u3, "ULID lexicographic: ts=1000 < ts=3000")
+    # Within the same timestamp, sort by randomness.
+    let rand_low: str = chr(0) + chr(0) + chr(0) + chr(0) + chr(0) + chr(0) + chr(0) + chr(0) + chr(0) + chr(0)
+    let rand_high: str = chr(255) + chr(255) + chr(255) + chr(255) + chr(255) + chr(255) + chr(255) + chr(255) + chr(255) + chr(255)
+    let u_low: str = ulid_from(5000, rand_low)
+    let u_high: str = ulid_from(5000, rand_high)
+    ok(u_low < u_high, "ULID lexicographic: same ts, low rand < high rand")
+    # ulid_compare returns -1, 0, 1.
+    eq_int(ulid_compare(u1, u2), -1, "ulid_compare(u1, u2) = -1")
+    eq_int(ulid_compare(u2, u1), 1, "ulid_compare(u2, u1) = 1")
+    eq_int(ulid_compare(u1, u1), 0, "ulid_compare(u1, u1) = 0")
+    return 0
+}
+
+fn test_ulid_is_valid() -> int uses IO {
+    # Valid ULID.
+    ok(ulid_is_valid("01FWH9YN0Z041061050R3GG28A"), "valid ULID")
+    # Wrong length.
+    ok(!ulid_is_valid("01FWH9YN0Z041061050R3GG28"), "too short")
+    ok(!ulid_is_valid("01FWH9YN0Z041061050R3GG28AA"), "too long")
+    # Crockford's base32 ACCEPTS I, L, O, U as substitutions on decode
+    # (I→1, L→1, O→0, U→V). Our ulid_is_valid is lenient: it accepts
+    # these chars (matching the Crockford spec). The canonical ULID
+    # alphabet excludes them, but for input validation, we accept them.
+    ok(ulid_is_valid("01FWH9YN0Z04I061050R3GG28A"), "I is accepted (Crockford substitute for 1)")
+    ok(ulid_is_valid("01FWH9YN0Z04L061050R3GG28A"), "L is accepted (Crockford substitute for 1)")
+    ok(ulid_is_valid("01FWH9YN0Z04O061050R3GG28A"), "O is accepted (Crockford substitute for 0)")
+    ok(ulid_is_valid("01FWH9YN0Z04U061050R3GG28A"), "U is accepted (Crockford substitute for V)")
+    # Truly invalid chars (not in any alphabet).
+    ok(!ulid_is_valid("01FWH9YN0Z04.061050R3GG28A"), "dot is invalid")
+    ok(!ulid_is_valid("01FWH9YN0Z04 061050R3GG28A"), "space is invalid")
+    ok(!ulid_is_valid("01FWH9YN0Z04-061050R3GG28A"), "dash is invalid")
+    # Lowercase should also be valid (per Crockford's spec).
+    ok(ulid_is_valid("01fwh9yn0z041061050r3gg28a"), "lowercase ULID is valid")
+    return 0
+}
+
+fn test_ulid_decode_with_i_l_o_u() -> int uses IO {
+    # Crockford's base32 accepts I, L, O, U as substitutes for 1, 1, 0, V
+    # on decode (per the Crockford spec). Our decoder maps:
+    #   I → 1, L → 1, O → 0, U → V (value 27)
+    # Verify the substitution by encoding and decoding.
+    # We can't round-trip (since the substitute chars are normalised on
+    # decode), but we can verify that a ULID with these chars decodes
+    # to the same timestamp as the canonical version.
+    let u_canon: str = "01FWH9YN0Z041061050R3GG28A"
+    let u_sub: str = "01FWH9YN0Z04I061050R3GG28A"  # 1 → I
+    eq_int(ulid_timestamp(u_canon), ulid_timestamp(u_sub), "I and 1 decode to the same timestamp")
+    return 0
+}
+
+fn test_ulid_live() -> int uses IO, Rand {
+    # Live ULID (uses system_time_now_ms + rand_int).
+    let u: str = ulid()
+    ok(ulid_is_valid(u), "live ULID is_valid")
+    eq_int(u.len(), 26, "live ULID length is 26")
+    # The timestamp should be roughly the current time.
+    let ts: int = ulid_timestamp(u)
+    ok(ts > 1000000000000, "live ULID timestamp is recent (> year 2001 in ms)")
+    # Two consecutive ULIDs should be different.
+    let u2: str = ulid()
+    ok(u != u2, "two live ULIDs are different")
+    # The second should have a timestamp >= the first (monotonic).
+    let ts2: int = ulid_timestamp(u2)
+    ok(ts2 >= ts, "live ULIDs are monotonic by timestamp")
+    return 0
+}
+
+# ============================================================================
+# UUID v7 vs v4 (backwards compat)
+# ============================================================================
+
+fn test_uuid_version_compat() -> int uses IO {
+    # The existing v4 deterministic UUIDs should still work.
+    let v4: str = uuid_v4_deterministic("ns", 1)
+    ok(uuid_is_valid(v4), "v4 UUID still valid")
+    eq_int(uuid_version(v4), 4, "v4 UUID version is 4")
+    # The existing v5-like UUIDs should still work.
+    let v5: str = uuid_v5_like("ns", "/path")
+    ok(uuid_is_valid(v5), "v5 UUID still valid")
+    eq_int(uuid_version(v5), 5, "v5 UUID version is 5")
+    # The new v7 UUIDs.
+    let v7: str = uuid_v7_from(1000, 100, 200)
+    ok(uuid_is_valid(v7), "v7 UUID valid")
+    eq_int(uuid_version(v7), 7, "v7 UUID version is 7")
+    # An invalid version (e.g., '0' in the version nibble) returns 0.
+    let bad: str = "01234567-89ab-0123-8123-456789abcdef"
+    eq_int(uuid_version(bad), 0, "UUID with version nibble 0 returns 0")
+    return 0
+}
+
+# ============================================================================
+# Main — run all tests sequentially.
+# ============================================================================
+
+fn main() -> int uses IO, Rand {
+    println("=== Stage 52: std.uuid v7 + std.ulid (lexicographically sortable) ===")
+    println("")
+    println("--- UUID v7 (RFC 9562 test vector) ---")
+    test_uuid_v7_rfc_vector()
+    println("  ok")
+    println("--- UUID v7 deterministic + monotonic ---")
+    test_uuid_v7_deterministic()
+    println("  ok")
+    println("--- UUID v7 edge cases (zero, max) ---")
+    test_uuid_v7_edge_cases()
+    println("  ok")
+    println("--- UUID v7 live generation ---")
+    test_uuid_v7_live()
+    println("  ok")
+    println("--- ULID encoding (timestamp + randomness round-trip) ---")
+    test_ulid_encoding()
+    println("  ok")
+    println("--- ULID with high-bit random bytes (regression test) ---")
+    test_ulid_with_high_random_bytes()
+    println("  ok")
+    println("--- ULID zero inputs ---")
+    test_ulid_zero_inputs()
+    println("  ok")
+    println("--- ULID max inputs ---")
+    test_ulid_max_inputs()
+    println("  ok")
+    println("--- ULID lexicographic sort (timestamp then randomness) ---")
+    test_ulid_lexicographic_sort()
+    println("  ok")
+    println("--- ULID is_valid (format check, alphabet check) ---")
+    test_ulid_is_valid()
+    println("  ok")
+    println("--- ULID Crockford substitutions (I/L/O/U on decode) ---")
+    test_ulid_decode_with_i_l_o_u()
+    println("  ok")
+    println("--- ULID live generation ---")
+    test_ulid_live()
+    println("  ok")
+    println("--- UUID version compatibility (v4, v5, v7) ---")
+    test_uuid_version_compat()
+    println("  ok")
+    println("")
+    println("ACCEPTANCE OK: Stage 52 — std.uuid v7 + std.ulid")
+    println("  UUID v7 (RFC 9562): 48-bit ts + 12-bit rand_a + 62-bit rand_b")
+    println("  UUID v7 deterministic: uuid_v7_from(ts_ms, rand_a, rand_b)")
+    println("  UUID v7 timestamp extraction: uuid_v7_timestamp(s)")
+    println("  ULID: 48-bit ts + 80-bit randomness, 26-char Crockford base32")
+    println("  ULID deterministic: ulid_from(ts_ms, rand_bytes)")
+    println("  ULID timestamp extraction: ulid_timestamp(s)")
+    println("  ULID randomness extraction: ulid_randomness(s) -> 10 bytes")
+    println("  ULID lexicographic sort (timestamp then randomness)")
+    println("  ULID Crockford base32 alphabet (no I/L/O/U; substitutions on decode)")
+    println("  Both use system_time_now_ms (Clock) + rand_int (Rand)")
+    println("  Pure-HLS implementation (no new compiler builtins)")
+    println("  differential (interpreter == native) verified green.")
+    return 0
+}
