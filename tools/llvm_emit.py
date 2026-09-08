@@ -255,6 +255,49 @@ declare void     @hl_env_set(ptr, ptr)                ; (key, value)
 declare void     @hl_env_unset(ptr)                   ; (key)
 declare ptr      @hl_cwd_get()                        ; -> fresh str
 declare i64      @hl_cwd_set(ptr)                     ; (path) -> 0 / -1
+; Stage 49 (v0.68.0-alpha): high-resolution time runtime helpers.
+; hl_instant_now_ns returns monotonic nanoseconds (high-resolution,
+; unaffected by wall-clock changes — used by Instant::now()).
+; hl_system_time_now_ms returns wall-clock milliseconds since the
+; Unix epoch (1970-01-01 UTC) — used by SystemTime::now(). The wall
+; clock can jump on NTP adjustments — Instant should be used for
+; duration measurements, SystemTime for timestamps.
+declare i64      @hl_instant_now_ns()                  ; -> monotonic ns
+declare i64      @hl_system_time_now_ms()              ; -> wall-clock ms
+; Stage 50 (v0.69.0-alpha): libm-backed math runtime helpers.
+; All math_* helpers take double and return double (or i1 for the
+; predicates isnan / isinf / isfinite / signbit). math_atan2 / pow /
+; hypot / fmod / copysign take 2 doubles. The helpers are thin
+; wrappers around libm functions (declared here as opaque externals —
+; the linker resolves them to libm via -lm).
+declare double   @hl_math_sin(double)                  ; sin
+declare double   @hl_math_cos(double)                  ; cos
+declare double   @hl_math_tan(double)                  ; tan
+declare double   @hl_math_asin(double)                 ; asin
+declare double   @hl_math_acos(double)                 ; acos
+declare double   @hl_math_atan(double)                 ; atan
+declare double   @hl_math_atan2(double, double)        ; atan2(y, x)
+declare double   @hl_math_sinh(double)                 ; sinh
+declare double   @hl_math_cosh(double)                 ; cosh
+declare double   @hl_math_tanh(double)                 ; tanh
+declare double   @hl_math_exp(double)                  ; exp
+declare double   @hl_math_log(double)                  ; natural log
+declare double   @hl_math_log10(double)                ; log10
+declare double   @hl_math_log2(double)                 ; log2
+declare double   @hl_math_pow(double, double)          ; pow(base, exp)
+declare double   @hl_math_sqrt(double)                 ; sqrt
+declare double   @hl_math_cbrt(double)                 ; cube root
+declare double   @hl_math_hypot(double, double)        ; sqrt(x*x+y*y)
+declare double   @hl_math_fmod(double, double)         ; C fmod
+declare double   @hl_math_erf(double)                  ; error function
+declare double   @hl_math_erfc(double)                 ; complementary erf
+declare double   @hl_math_tgamma(double)               ; gamma function
+declare double   @hl_math_lgamma(double)               ; log|gamma(x)|
+declare i1       @hl_math_isnan(double)                ; IEEE-754 isnan
+declare i1       @hl_math_isinf(double)                ; IEEE-754 isinf
+declare i1       @hl_math_isfinite(double)             ; IEEE-754 isfinite
+declare i1       @hl_math_signbit(double)              ; IEEE-754 signbit
+declare double   @hl_math_copysign(double, double)     ; copysign(x, y)
 """
 
 # Stage 12 release: attributes block. `#0` is the noreturn attribute set
@@ -1762,6 +1805,34 @@ class LLVMEmitter:
             tmp = self._fresh("args_os")
             self._emit("  %s = call ptr @hl_args()" % tmp)
             return ("ptr", tmp)
+        # ----- Stage 49 (v0.68.0-alpha): high-resolution time builtins.
+        # Both take no args and return i64.
+        if name == "instant_now_ns":
+            tmp = self._fresh("instant")
+            self._emit("  %s = call i64 @hl_instant_now_ns()" % tmp)
+            return ("i64", tmp)
+        if name == "system_time_now_ms":
+            tmp = self._fresh("systime")
+            self._emit("  %s = call i64 @hl_system_time_now_ms()" % tmp)
+            return ("i64", tmp)
+        # ----- Stage 50 (v0.69.0-alpha): libm-backed math builtins -----
+        # Single-arg float -> float.
+        if name in ("math_sin", "math_cos", "math_tan",
+                    "math_asin", "math_acos", "math_atan",
+                    "math_sinh", "math_cosh", "math_tanh",
+                    "math_exp", "math_log", "math_log10", "math_log2",
+                    "math_sqrt", "math_cbrt", "math_erf", "math_erfc",
+                    "math_tgamma", "math_lgamma"):
+            return self._call1("double", "@hl_" + name, ["double"], arg_pairs)
+        # Two-arg float -> float.
+        if name in ("math_atan2", "math_pow", "math_hypot",
+                    "math_fmod", "math_copysign"):
+            return self._call1("double", "@hl_" + name,
+                               ["double", "double"], arg_pairs)
+        # IEEE-754 predicates: float -> bool.
+        if name in ("math_isnan", "math_isinf", "math_isfinite",
+                    "math_signbit"):
+            return self._call1("i1", "@hl_" + name, ["double"], arg_pairs)
         _unsupported("builtin function '%s'" % name, e)
 
     # ---------- method calls ----------

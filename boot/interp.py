@@ -2004,6 +2004,88 @@ class Interp:
             # the logical str version) but in Halis str = bytes
             # already, so they currently alias.
             return self.argv
+        # ----- Stage 49 (v0.68.0-alpha): high-resolution time builtins -----
+        # instant_now_ns() — monotonic nanoseconds. Python's
+        # time.monotonic_ns() returns an int that never decreases
+        # (modulo wrap at int64 — ~292 years). Used by Instant::now().
+        if name == "instant_now_ns":
+            return int(time.monotonic_ns())
+        # system_time_now_ms() — wall-clock milliseconds since the
+        # Unix epoch (1970-01-01 UTC). Python's time.time() returns a
+        # float; we multiply by 1000 and truncate to int. The wall
+        # clock can jump on NTP adjustments.
+        if name == "system_time_now_ms":
+            return int(time.time() * 1000.0)
+        # ----- Stage 50 (v0.69.0-alpha): libm-backed math builtins -----
+        # All delegate to Python's math module (which wraps libm on
+        # CPython). NaN/Inf/signed-zero/subnormal handling matches
+        # IEEE-754 because Python's float is C double, and math.*
+        # calls libm directly. The native Halis runtime links -lm
+        # and calls the same libm functions, so differential parity
+        # (interpreter == native) holds bit-for-bit on the same
+        # platform (libm is platform-consistent on Linux x86-64 /
+        # aarch64 / riscv64 — we don't claim cross-platform parity).
+        if name == "math_sin":
+            return math.sin(args[0])
+        if name == "math_cos":
+            return math.cos(args[0])
+        if name == "math_tan":
+            return math.tan(args[0])
+        if name == "math_asin":
+            return math.asin(args[0])
+        if name == "math_acos":
+            return math.acos(args[0])
+        if name == "math_atan":
+            return math.atan(args[0])
+        if name == "math_atan2":
+            return math.atan2(args[0], args[1])
+        if name == "math_sinh":
+            return math.sinh(args[0])
+        if name == "math_cosh":
+            return math.cosh(args[0])
+        if name == "math_tanh":
+            return math.tanh(args[0])
+        if name == "math_exp":
+            return math.exp(args[0])
+        if name == "math_log":
+            return math.log(args[0])
+        if name == "math_log10":
+            return math.log10(args[0])
+        if name == "math_log2":
+            return math.log2(args[0])
+        if name == "math_pow":
+            return math.pow(args[0], args[1])
+        if name == "math_sqrt":
+            return math.sqrt(args[0])
+        if name == "math_cbrt":
+            # Python's math module added cbrt in 3.11; we require
+            # 3.12+ (boot.py guard), so it's available.
+            return math.cbrt(args[0])
+        if name == "math_hypot":
+            return math.hypot(args[0], args[1])
+        if name == "math_fmod":
+            return math.fmod(args[0], args[1])
+        if name == "math_erf":
+            return math.erf(args[0])
+        if name == "math_erfc":
+            return math.erfc(args[0])
+        if name == "math_tgamma":
+            return math.gamma(args[0])
+        if name == "math_lgamma":
+            return math.lgamma(args[0])
+        if name == "math_isnan":
+            return math.isnan(args[0])
+        if name == "math_isinf":
+            return math.isinf(args[0])
+        if name == "math_isfinite":
+            return math.isfinite(args[0])
+        if name == "math_signbit":
+            # Python's math.copysign(1.0, x) returns 1.0 for positive
+            # (incl +0.0) and -1.0 for negative (incl -0.0). signbit
+            # is true iff the sign bit is set (negative or -0.0).
+            return math.copysign(1.0, args[0]) < 0.0
+        if name == "math_copysign":
+            return math.copysign(args[0], args[1])
         # ----- Stage 16 (v0.27.0-alpha): concurrency builtins -----
         # chan_new() -> Chan[T] — a fresh, empty channel.
         if name == "chan_new":

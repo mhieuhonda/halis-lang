@@ -348,6 +348,29 @@ BUILTIN_FNS = {
     # wraps args_os with taint_mark per element).
     "env_get", "env_has", "env_set", "env_unset",
     "cwd_get", "cwd_set", "args_os",
+    # Stage 49 (v0.68.0-alpha): high-resolution time builtins.
+    # instant_now_ns() returns monotonic nanoseconds (high-resolution,
+    # unaffected by wall-clock changes — used for Instant::now() and
+    # short-duration measurements). system_time_now_ms() returns wall-
+    # clock milliseconds since the Unix epoch (1970-01-01 UTC) — used
+    # for SystemTime::now() and timestamps). Both carry Clock.
+    "instant_now_ns", "system_time_now_ms",
+    # Stage 50 (v0.69.0-alpha): libm-backed math builtins.
+    # All math_* builtins are pure (no effects, deterministic) — they
+    # delegate to libm on the native side and to Python's math module
+    # in the interpreter. NaN / Inf / signed-zero / subnormal handling
+    # matches IEEE-754 (libm is the canonical implementation). The
+    # stdlib (std/math.hls) provides the user-facing wrappers like
+    # math_sin / math_cos / math_exp / etc. (already named the same
+    # way at the stdlib level; the builtins are the low-level hooks).
+    "math_sin", "math_cos", "math_tan",
+    "math_asin", "math_acos", "math_atan", "math_atan2",
+    "math_sinh", "math_cosh", "math_tanh",
+    "math_exp", "math_log", "math_log10", "math_log2",
+    "math_pow", "math_sqrt", "math_cbrt", "math_hypot", "math_fmod",
+    "math_erf", "math_erfc", "math_tgamma", "math_lgamma",
+    "math_isnan", "math_isinf", "math_isfinite", "math_signbit",
+    "math_copysign",
 }
 
 # Stage 9 (v0.20.0-alpha — release): per-builtin effect mapping.
@@ -477,6 +500,18 @@ BUILTIN_EFFECTS = {
     "cwd_get":              {"Proc"},
     "cwd_set":              {"Proc"},
     "args_os":              {"Proc"},
+    # Stage 49 (v0.68.0-alpha): high-resolution time builtins — both
+    # carry Clock. instant_now_ns reads the monotonic clock (same family
+    # as clock_ms); system_time_now_ms reads the wall clock (which can
+    # jump backwards on NTP adjustments — Instant should be used for
+    # duration measurements, SystemTime for timestamps).
+    "instant_now_ns":       {"Clock"},
+    "system_time_now_ms":   {"Clock"},
+    # NOTE: Stage 50 (v0.69.0-alpha) math_* builtins are PURE (no
+    # effects) — they do not appear in BUILTIN_EFFECTS. libm is a pure
+    # function library: sin(x) on the same x always returns the same
+    # value, with no side effects on program state. NaN/Inf are values,
+    # not effects.
     # Builtin METHODS with effects (the first method-level effects —
     # previously all I/O lived in builtin functions):
     "chan.send":     {"Conc"},
@@ -3151,6 +3186,83 @@ class Checker:
             need(0)
             self.edges[self.cur_fn].add("b:args_os")
             return "list[str]"
+        # ----- Stage 49 (v0.68.0-alpha): high-resolution time builtins -----
+        # instant_now_ns() -> int — monotonic nanoseconds (high-res).
+        # Used by Instant::now(). Pure-HLS Duration arithmetic is
+        # layered on top (Duration is a struct in std/time.hls).
+        if name == "instant_now_ns":
+            need(0)
+            self.edges[self.cur_fn].add("b:instant_now_ns")
+            return "int"
+        # system_time_now_ms() -> int — wall-clock milliseconds since
+        # the Unix epoch (1970-01-01 UTC). Used by SystemTime::now().
+        # The wall clock can jump on NTP adjustments — use Instant for
+        # duration measurements.
+        if name == "system_time_now_ms":
+            need(0)
+            self.edges[self.cur_fn].add("b:system_time_now_ms")
+            return "int"
+        # ----- Stage 50 (v0.69.0-alpha): libm-backed math builtins -----
+        # All math_* builtins take float args and return float (or bool
+        # for the predicates isnan/isinf/isfinite/signbit). math_atan2
+        # and math_hypot and math_fmod and math_copysign take 2 floats;
+        # math_pow takes (base, exp) as 2 floats. The rest take 1 float.
+        # math_lgamma is special — it returns the SIGN of the gamma via
+        # a separate call (the C library has lgamma_r that takes an
+        # int* sign argument). For HLS we return only the LOG of the
+        # absolute value (callers who need the sign can compute it via
+        # tgamma() if x is positive — lgamma is for large magnitudes
+        # where gamma overflows). math_lgamma here == Python's
+        # math.lgamma == C's lgamma (without the sign — the sign is
+        # available separately via the signbit of tgamma(x)).
+        if name in ("math_sin", "math_cos", "math_tan",
+                    "math_asin", "math_acos", "math_atan",
+                    "math_sinh", "math_cosh", "math_tanh",
+                    "math_exp", "math_log", "math_log10", "math_log2",
+                    "math_sqrt", "math_cbrt", "math_erf", "math_erfc",
+                    "math_tgamma", "math_lgamma"):
+            need(1)
+            argt(0, "float")
+            self.edges[self.cur_fn].add("b:" + name)
+            return "float"
+        # Two-argument math builtins.
+        if name == "math_atan2":
+            need(2)
+            argt(0, "float")
+            argt(1, "float")
+            self.edges[self.cur_fn].add("b:math_atan2")
+            return "float"
+        if name == "math_pow":
+            need(2)
+            argt(0, "float")
+            argt(1, "float")
+            self.edges[self.cur_fn].add("b:math_pow")
+            return "float"
+        if name == "math_hypot":
+            need(2)
+            argt(0, "float")
+            argt(1, "float")
+            self.edges[self.cur_fn].add("b:math_hypot")
+            return "float"
+        if name == "math_fmod":
+            need(2)
+            argt(0, "float")
+            argt(1, "float")
+            self.edges[self.cur_fn].add("b:math_fmod")
+            return "float"
+        if name == "math_copysign":
+            need(2)
+            argt(0, "float")
+            argt(1, "float")
+            self.edges[self.cur_fn].add("b:math_copysign")
+            return "float"
+        # IEEE-754 predicates — pure, take a float, return a bool.
+        if name in ("math_isnan", "math_isinf", "math_isfinite",
+                    "math_signbit"):
+            need(1)
+            argt(0, "float")
+            self.edges[self.cur_fn].add("b:" + name)
+            return "bool"
         # ----- Stage 16 (v0.27.0-alpha): concurrency builtins -----
         # chan_new() -> Chan[T] — contextual typing (same pattern as
         # map_new()): the surrounding let/param/return type supplies T.

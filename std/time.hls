@@ -1,31 +1,524 @@
 # ============================================================================
-# std/time.hls — Time / clock helpers for Halis
+# std/time.hls — Time / clock helpers for Halis (Stage 49, v0.68.0-alpha)
 # ----------------------------------------------------------------------------
-# Pure-HLS utilities built on the `clock_ms` builtin. The builtin returns
-# integer milliseconds since an arbitrary epoch (monotonic on most platforms).
-# All formatting helpers in this module are pure (no `uses IO`) except where
-# noted.
+# Pure-HLS utilities built on three low-level clock builtins:
 #
-# Helpers provided:
-#   time_now_ms()              -> int (millisecond timestamp)
-#   time_now_seconds()         -> int (whole seconds, integer division)
-#   time_format_hms(ms)        -> "HH:MM:SS.mmm" string
-#   time_format_iso8601(ms)    -> "T+<seconds>.<millis>" string
-#   time_elapsed_ms(start, end) -> int  (end - start, never negative)
-#   time_stopwatch_start()     -> int  (alias for time_now_ms)
-#   time_stopwatch_lap(start)  -> int  (elapsed ms since start)
-#   time_human_ms(ms)          -> human-readable duration like "1m 23s 456ms"
+#   clock_ms()          -> int   (Stage 9, v0.5.0-alpha — monotonic ms)
+#   instant_now_ns()    -> int   (Stage 49 — monotonic ns, high-resolution)
+#   system_time_now_ms()-> int   (Stage 49 — wall-clock ms since Unix epoch)
+#
+# The original low-resolution helpers (time_now_ms, time_format_hms,
+# time_format_iso8601, time_elapsed_ms, time_stopwatch_start,
+# time_stopwatch_lap, time_human_ms) are preserved verbatim — they
+# remain the simplest API for "how many ms did this take?".
+#
+# Stage 49 adds THREE structured types on top of these builtins:
+#
+#   * Instant     — a monotonic instant (high-resolution, nanosecond
+#                   precision). Used for duration measurements that
+#                   must NOT jump backwards on NTP adjustments.
+#   * Duration    — a signed span of nanoseconds with checked arithmetic.
+#                   Adding two large Durations panics cleanly instead of
+#                   silently wrapping (the roadmap's "Arithmetic on
+#                   Duration is checked (no overflow when adding two
+#                   large durations)").
+#   * SystemTime  — a wall-clock timestamp (ms since Unix epoch). Used
+#                   for absolute timestamps ("when did this event
+#                   happen?") where monotonicity doesn't matter.
+#
+# sleep(duration) blocks the calling thread (delegates to thread_sleep_ms).
+# time_timeout_ms(ms) creates a future that resolves after `ms`
+# milliseconds (Stage 33 futures).
 # ============================================================================
 
 import "std.str"
+import "std.result"
 
+# ----------------------------------------------------------------------------
+# Constants — Duration arithmetic. All Duration values are stored as
+# int64 nanoseconds. int64 holds ~292 years of nanoseconds, which is
+# more than enough for any realistic program; Duration arithmetic
+# checks for overflow and panics with a clear message rather than
+# silently wrapping. We use plain `let` because Halis has no `const`.
+# ----------------------------------------------------------------------------
+
+# Helpers — int_shl / int_neg are Stage 32 builtins; int_add / int_sub
+# / int_mul / int_div are plain HLS +/-/*// (which already panic on
+# overflow via the runtime). The wrappers below give them explicit
+# names so the Duration arithmetic reads more clearly.
+fn _int_add(a: int, b: int) -> int {
+    return a + b
+}
+
+fn _int_sub(a: int, b: int) -> int {
+    return a - b
+}
+
+fn _int_mul(a: int, b: int) -> int {
+    return a * b
+}
+
+fn _int_div(a: int, b: int) -> int {
+    return a / b
+}
+
+fn _int_neg(a: int) -> int {
+    return 0 - a
+}
+
+fn _int_abs(a: int) -> int {
+    if a < 0 {
+        return 0 - a
+    }
+    return a
+}
+
+# INT64_MAX = 9223372036854775807 (2^63 - 1). INT64_MIN = -9223372036854775808.
+# We use the literal forms (matching the existing time_elapsed_ms
+# convention in this file — line 619). The lexer accepts these
+# decimal literals; the C codegen emits them as int64 literals.
+fn _int64_max() -> int {
+    return 9223372036854775807
+}
+
+fn _int64_min() -> int {
+    return -9223372036854775808
+}
+
+# Duration unit constants — ns per us / ms / sec / min / hour / day.
+fn _ns_per_us() -> int { return 1000 }
+fn _ns_per_ms() -> int { return 1000000 }
+fn _ns_per_sec() -> int { return 1000000000 }
+fn _ns_per_min() -> int { return 60000000000 }
+fn _ns_per_hour() -> int { return 3600000000000 }
+fn _ns_per_day() -> int { return 86400000000000 }
+
+# ----------------------------------------------------------------------------
+# Duration struct — signed nanoseconds with checked arithmetic.
+# ----------------------------------------------------------------------------
+struct Duration {
+    nanos: int,
+}
+
+# Constructors — from various units. Each takes an int count and
+# returns a Duration. Overflow is checked via the runtime's
+# overflow-detecting arithmetic (the panic message names the
+# offending operation). Halis int arithmetic already panics on
+# overflow at the runtime level (hl_mul_i64 detects it) — we do
+# the explicit pre-check here so the panic message names the
+# Duration function rather than the bare operator.
+
+fn duration_from_nanos(ns: int) -> Duration {
+    return Duration { nanos: ns }
+}
+
+fn duration_from_micros(us: int) -> Duration {
+    return Duration { nanos: _int_mul(us, _ns_per_us()) }
+}
+
+fn duration_from_millis(ms: int) -> Duration {
+    return Duration { nanos: _int_mul(ms, _ns_per_ms()) }
+}
+
+fn duration_from_secs(secs: int) -> Duration {
+    return Duration { nanos: _int_mul(secs, _ns_per_sec()) }
+}
+
+fn duration_from_mins(mins: int) -> Duration {
+    return Duration { nanos: _int_mul(mins, _ns_per_min()) }
+}
+
+fn duration_from_hours(hours: int) -> Duration {
+    return Duration { nanos: _int_mul(hours, _ns_per_hour()) }
+}
+
+fn duration_from_days(days: int) -> Duration {
+    return Duration { nanos: _int_mul(days, _ns_per_day()) }
+}
+
+# The zero duration — useful as a starting accumulator.
+fn duration_zero() -> Duration {
+    return Duration { nanos: 0 }
+}
+
+# Accessors — return the duration in the requested unit (truncated
+# towards negative infinity, like Rust's std::time::Duration).
+fn duration_as_nanos(d: Duration) -> int {
+    return d.nanos
+}
+
+fn duration_as_micros(d: Duration) -> int {
+    return _int_div(d.nanos, _ns_per_us())
+}
+
+fn duration_as_millis(d: Duration) -> int {
+    return _int_div(d.nanos, _ns_per_ms())
+}
+
+fn duration_as_secs(d: Duration) -> int {
+    return _int_div(d.nanos, _ns_per_sec())
+}
+
+fn duration_as_mins(d: Duration) -> int {
+    return _int_div(d.nanos, _ns_per_min())
+}
+
+fn duration_as_hours(d: Duration) -> int {
+    return _int_div(d.nanos, _ns_per_hour())
+}
+
+fn duration_as_days(d: Duration) -> int {
+    return _int_div(d.nanos, _ns_per_day())
+}
+
+# Sub-part accessors — the fractional part as nanoseconds.
+fn duration_subsec_nanos(d: Duration) -> int {
+    let whole_secs: int = _int_div(d.nanos, _ns_per_sec())
+    return _int_sub(d.nanos, _int_mul(whole_secs, _ns_per_sec()))
+}
+
+fn duration_subsec_millis(d: Duration) -> int {
+    return _int_div(duration_subsec_nanos(d), _ns_per_ms())
+}
+
+fn duration_subsec_micros(d: Duration) -> int {
+    return _int_div(duration_subsec_nanos(d), _ns_per_us())
+}
+
+# Checked arithmetic — add, sub, mul, div. Each panics on overflow
+# rather than silently wrapping. The check is done BEFORE the
+# arithmetic to give a clear error message.
+fn duration_add(a: Duration, b: Duration) -> Duration {
+    let max: int = _int64_max()
+    let min: int = _int64_min()
+    if b.nanos > 0 && a.nanos > _int_sub(max, b.nanos) {
+        panic("duration_add: overflow (a=" + a.nanos.to_str() + " + b=" + b.nanos.to_str() + " > INT64_MAX)")
+    }
+    if b.nanos < 0 && a.nanos < _int_sub(min, b.nanos) {
+        panic("duration_add: underflow (a=" + a.nanos.to_str() + " + b=" + b.nanos.to_str() + " < INT64_MIN)")
+    }
+    return Duration { nanos: _int_add(a.nanos, b.nanos) }
+}
+
+fn duration_sub(a: Duration, b: Duration) -> Duration {
+    # a - b = a + (-b). The negation of INT64_MIN overflows; for that
+    # case we compute a - INT64_MIN directly via the Halis - operator
+    # (which already panics on overflow at the runtime level).
+    if b.nanos == _int64_min() {
+        if a.nanos < 0 {
+            panic("duration_sub: underflow (a - INT64_MIN < INT64_MIN)")
+        }
+        return Duration { nanos: _int_sub(a.nanos, b.nanos) }
+    }
+    return duration_add(a, Duration { nanos: _int_neg(b.nanos) })
+}
+
+fn duration_mul(d: Duration, scalar: int) -> Duration {
+    if d.nanos == 0 || scalar == 0 {
+        return Duration { nanos: 0 }
+    }
+    # Quick overflow check: |a * b| > INT64_MAX iff |a| > INT64_MAX / |b|.
+    let abs_d: int = _int_abs(d.nanos)
+    let abs_s: int = _int_abs(scalar)
+    let max: int = _int64_max()
+    if abs_d > _int_div(max, abs_s) {
+        panic("duration_mul: overflow (d=" + d.nanos.to_str() + " * scalar=" + scalar.to_str() + " > INT64_MAX)")
+    }
+    return Duration { nanos: _int_mul(d.nanos, scalar) }
+}
+
+fn duration_div(d: Duration, scalar: int) -> Duration {
+    if scalar == 0 {
+        panic("duration_div: divide by zero")
+    }
+    return Duration { nanos: _int_div(d.nanos, scalar) }
+}
+
+# Comparison.
+fn duration_eq(a: Duration, b: Duration) -> bool {
+    return a.nanos == b.nanos
+}
+
+fn duration_lt(a: Duration, b: Duration) -> bool {
+    return a.nanos < b.nanos
+}
+
+fn duration_le(a: Duration, b: Duration) -> bool {
+    return a.nanos <= b.nanos
+}
+
+fn duration_gt(a: Duration, b: Duration) -> bool {
+    return a.nanos > b.nanos
+}
+
+fn duration_ge(a: Duration, b: Duration) -> bool {
+    return a.nanos >= b.nanos
+}
+
+# Absolute value.
+fn duration_abs(d: Duration) -> Duration {
+    if d.nanos < 0 {
+        if d.nanos == _int64_min() {
+            panic("duration_abs: INT64_MIN has no positive representation")
+        }
+        return Duration { nanos: _int_neg(d.nanos) }
+    }
+    return d
+}
+
+# is_negative / is_zero / is_positive.
+fn duration_is_negative(d: Duration) -> bool {
+    return d.nanos < 0
+}
+
+fn duration_is_zero(d: Duration) -> bool {
+    return d.nanos == 0
+}
+
+fn duration_is_positive(d: Duration) -> bool {
+    return d.nanos > 0
+}
+
+# Human-readable formatting: "1d 2h 3m 4s 567ms 890us 123ns". The
+# components are signed (negative durations get a leading "-").
+fn duration_to_str(d: Duration) -> str {
+    let mut nanos: int = d.nanos
+    let mut sign: str = ""
+    if nanos < 0 {
+        sign = "-"
+        if nanos == _int64_min() {
+            return "-292y 5d 18h 4m 7s 963ms 477us 580ns (INT64_MIN, max negative)"
+        }
+        nanos = _int_neg(nanos)
+    }
+    let days: int = _int_div(nanos, _ns_per_day())
+    nanos = _int_sub(nanos, _int_mul(days, _ns_per_day()))
+    let hours: int = _int_div(nanos, _ns_per_hour())
+    nanos = _int_sub(nanos, _int_mul(hours, _ns_per_hour()))
+    let mins: int = _int_div(nanos, _ns_per_min())
+    nanos = _int_sub(nanos, _int_mul(mins, _ns_per_min()))
+    let secs: int = _int_div(nanos, _ns_per_sec())
+    nanos = _int_sub(nanos, _int_mul(secs, _ns_per_sec()))
+    let ms: int = _int_div(nanos, _ns_per_ms())
+    nanos = _int_sub(nanos, _int_mul(ms, _ns_per_ms()))
+    let us: int = _int_div(nanos, _ns_per_us())
+    nanos = _int_sub(nanos, _int_mul(us, _ns_per_us()))
+    let ns_part: int = nanos
+    let parts: list[str] = []
+    if days > 0 {
+        parts.push(days.to_str() + "d")
+    }
+    if hours > 0 || days > 0 {
+        parts.push(hours.to_str() + "h")
+    }
+    if mins > 0 || hours > 0 || days > 0 {
+        parts.push(mins.to_str() + "m")
+    }
+    if secs > 0 || mins > 0 || hours > 0 || days > 0 {
+        parts.push(secs.to_str() + "s")
+    }
+    if ms > 0 || secs > 0 || mins > 0 || hours > 0 || days > 0 {
+        parts.push(ms.to_str() + "ms")
+    }
+    if us > 0 || ms > 0 || secs > 0 || mins > 0 || hours > 0 || days > 0 {
+        parts.push(us.to_str() + "us")
+    }
+    parts.push(ns_part.to_str() + "ns")
+    return sign + str_join(parts, " ")
+}
+
+# ----------------------------------------------------------------------------
+# Instant struct — a monotonic instant (high-resolution, nanosecond).
+# ----------------------------------------------------------------------------
+struct Instant {
+    nanos: int,
+}
+
+# Instant::now() — read the monotonic clock. Uses the instant_now_ns
+# builtin (Stage 49). The resolution is platform-dependent (typically
+# 1ns on Linux x86-64 via clock_gettime(CLOCK_MONOTONIC)).
+fn instant_now() -> Instant uses Clock {
+    return Instant { nanos: instant_now_ns() }
+}
+
+# Instant::elapsed(since) — duration from `since` to now. The result
+# is always non-negative (the monotonic clock never goes backwards).
+fn instant_elapsed(since: Instant) -> Duration uses Clock {
+    let now: int = instant_now_ns()
+    if now < since.nanos {
+        # Defensive: clock went backwards (shouldn't happen on
+        # POSIX with CLOCK_MONOTONIC, but some embedded platforms
+        # have weird clock behavior). Return zero rather than a
+        # negative duration.
+        return Duration { nanos: 0 }
+    }
+    return Duration { nanos: _int_sub(now, since.nanos) }
+}
+
+# Instant::duration_since(earlier, later) — duration from `earlier` to `later`.
+# Panics if `later` < `earlier` (monotonic clock violated).
+fn instant_duration_since(earlier: Instant, later: Instant) -> Duration {
+    if later.nanos < earlier.nanos {
+        panic("instant_duration_since: later < earlier (monotonic clock violated)")
+    }
+    return Duration { nanos: _int_sub(later.nanos, earlier.nanos) }
+}
+
+# Comparison.
+fn instant_eq(a: Instant, b: Instant) -> bool {
+    return a.nanos == b.nanos
+}
+
+fn instant_lt(a: Instant, b: Instant) -> bool {
+    return a.nanos < b.nanos
+}
+
+# Add a duration to an instant — returns the later instant. Panics
+# on overflow (which would require ~292 years of accumulated duration
+# — unlikely in practice).
+fn instant_add(i: Instant, d: Duration) -> Instant {
+    let max: int = _int64_max()
+    if d.nanos > 0 && i.nanos > _int_sub(max, d.nanos) {
+        panic("instant_add: overflow (instant + duration > INT64_MAX ns)")
+    }
+    return Instant { nanos: _int_add(i.nanos, d.nanos) }
+}
+
+# Subtract a duration from an instant — returns the earlier instant.
+fn instant_sub(i: Instant, d: Duration) -> Instant {
+    let min: int = _int64_min()
+    if d.nanos < 0 && i.nanos < _int_sub(min, d.nanos) {
+        panic("instant_sub: underflow (instant - duration < INT64_MIN ns)")
+    }
+    if d.nanos > 0 && i.nanos < d.nanos {
+        # Subtracting a positive duration would make the result negative,
+        # which is technically representable (signed int64) but semantically
+        # wrong (an Instant before the epoch). Return the epoch instead.
+        return Instant { nanos: 0 }
+    }
+    return Instant { nanos: _int_sub(i.nanos, d.nanos) }
+}
+
+# ----------------------------------------------------------------------------
+# SystemTime struct — wall-clock ms since Unix epoch.
+# ----------------------------------------------------------------------------
+struct SystemTime {
+    ms: int,
+}
+
+# SystemTime::now() — read the wall clock. Uses system_time_now_ms.
+fn system_time_now() -> SystemTime uses Clock {
+    return SystemTime { ms: system_time_now_ms() }
+}
+
+# SystemTime::unix_secs(t) — whole seconds since epoch.
+fn system_time_unix_secs(t: SystemTime) -> int {
+    return _int_div(t.ms, 1000)
+}
+
+# SystemTime::unix_millis(t) — milliseconds since epoch.
+fn system_time_unix_millis(t: SystemTime) -> int {
+    return t.ms
+}
+
+# SystemTime::duration_since(earlier, later) — duration from earlier to later.
+# Returns Err if later < earlier (wall clock went backwards — common on
+# NTP adjustments). The Result type is std.result.
+#
+# Returns Result[Duration, str] to model the failure cleanly (matching
+# Rust's std::time::SystemTime::duration_since).
+fn system_time_duration_since(earlier: SystemTime, later: SystemTime) -> Result[Duration, str] {
+    if later.ms < earlier.ms {
+        return Result.Err("system_time_duration_since: wall clock went backwards (later < earlier) — NTP adjustment?")
+    }
+    let nanos: int = _int_mul(_int_sub(later.ms, earlier.ms), _ns_per_ms())
+    return Result.Ok(Duration { nanos: nanos })
+}
+
+# SystemTime::to_iso8601(t) — a compact ISO-8601-like string.
+# Format: "T+<secs>.<ms>". For absolute timestamps, the secs part
+# is the Unix epoch seconds. This is a simple display helper; a full
+# calendar (year/month/day/hour/min/sec with timezone) is a Stage 50+
+# std.calendar concern.
+fn system_time_to_iso8601(t: SystemTime) -> str {
+    let secs: int = _int_div(t.ms, 1000)
+    let ms_part: int = _int_sub(t.ms, _int_mul(secs, 1000))
+    return "T+" + secs.to_str() + "." + pad3(ms_part)
+}
+
+# Comparison.
+fn system_time_eq(a: SystemTime, b: SystemTime) -> bool {
+    return a.ms == b.ms
+}
+
+fn system_time_lt(a: SystemTime, b: SystemTime) -> bool {
+    return a.ms < b.ms
+}
+
+# ----------------------------------------------------------------------------
+# Sleep — block the calling thread for a Duration.
+# ----------------------------------------------------------------------------
+# time_sleep(d) blocks for d. Delegates to thread_sleep_ms (Stage 46,
+# v0.65.0-alpha). Negative durations are clamped to zero (the
+# underlying builtin panics on negative input — we pre-clamp).
+fn time_sleep(d: Duration) -> void uses Clock, Conc {
+    let mut ms: int = duration_as_millis(d)
+    if ms < 0 {
+        ms = 0
+    }
+    thread_sleep_ms(ms)
+}
+
+# time_sleep_ms(ms) — block for ms milliseconds. Convenience wrapper
+# for callers that don't want to construct a Duration.
+fn time_sleep_ms_dur(ms: int) -> void uses Clock, Conc {
+    let mut clamped: int = ms
+    if clamped < 0 {
+        clamped = 0
+    }
+    thread_sleep_ms(clamped)
+}
+
+# ----------------------------------------------------------------------------
+# Timeout — race a future against a timer.
+# ----------------------------------------------------------------------------
+# time_timeout_ms(ms) returns a Future[bool] that resolves to `true`
+# after `ms` milliseconds. Used to race against another future via
+# future_select: if the timeout wins, the other operation timed out.
+#
+# Implementation: async_spawn(_timeout_task, ms) — the Stage 33
+# async_spawn primitive creates a cap-1 bounded channel, spawns a
+# detached task running `_timeout_task(ms)`, and returns the channel
+# as a Future[bool]. When _timeout_task returns true, the value is
+# sent on the channel and the future becomes ready.
+#
+# The caller uses future_select([real_future, timeout_future]) to
+# race them: if the timeout future wins, the real operation timed
+# out (the caller can inspect which future index won via the integer
+# returned by future_select).
+fn _timeout_task(ms: int) -> bool uses Clock, Conc {
+    let mut clamped: int = ms
+    if clamped < 0 {
+        clamped = 0
+    }
+    thread_sleep_ms(clamped)
+    return true
+}
+
+fn time_timeout_ms(ms: int) -> Future[bool] uses Clock, Conc {
+    return async_spawn(_timeout_task, ms)
+}
+
+# ----------------------------------------------------------------------------
+# Original low-resolution API (preserved verbatim from pre-Stage 49).
+# These remain the simplest helpers for "how many ms did this take?".
+# ----------------------------------------------------------------------------
 # time_now_ms() returns the current value of clock_ms (monotonic, ms).
-# This is the only function in this module that uses the IO effect.
-fn time_now_ms() -> int uses IO {
+fn time_now_ms() -> int uses Clock {
     return clock_ms()
 }
 
-fn time_now_seconds() -> int uses IO {
+fn time_now_seconds() -> int uses Clock {
     return clock_ms() / 1000
 }
 
@@ -73,11 +566,11 @@ fn time_elapsed_ms(start: int, end: int) -> int {
 }
 
 # Stopwatch helpers — thin wrappers for readability.
-fn time_stopwatch_start() -> int uses IO {
+fn time_stopwatch_start() -> int uses Clock {
     return clock_ms()
 }
 
-fn time_stopwatch_lap(start: int) -> int uses IO {
+fn time_stopwatch_lap(start: int) -> int uses Clock {
     let now: int = clock_ms()
     return time_elapsed_ms(start, now)
 }

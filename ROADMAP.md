@@ -86,8 +86,8 @@ remains green.
 | 46 | `std.thread` — OS threads (preemptive scheduler) | ✅ | (done in v0.65.0-alpha) |
 | 47 | `std.process` — spawn, pipe, signal, exit-code | ✅ | (done in v0.66.0-alpha) |
 | 48 | `std.env` — environment variables, current dir | ✅ | (done in v0.67.0-alpha) |
-| 49 | `std.time` — monotonic clock, sleep, deadline arithmetic | ⬜ | 3 weeks |
-| 50 | `std.math` — IEEE-754 edge cases, special functions | ⬜ | 5 weeks |
+| 49 | `std.time` — monotonic clock, sleep, deadline arithmetic | ✅ | (done in v0.68.0-alpha) |
+| 50 | `std.math` — IEEE-754 edge cases, special functions | ✅ | (done in v0.69.0-alpha) |
 | 51 | `std.archive` — tar, zip, gzip (no unsafe decompression) | ⬜ | 4 weeks |
 | 52 | `std.uuid` v7 + `std.ulid` (lexicographically sortable) | ⬜ | 2 weeks |
 
@@ -4994,14 +4994,213 @@ native) verified on env_get/has/set/unset (round-trip), cwd_get/set
 (round-trip via /tmp), cwd_set with nonexistent path (returns -1),
 args_os count, and all stdlib wrappers.
 
-**49. `std.time`** — `Instant` (monotonic), `Duration`,
-`SystemTime` (wall clock), `sleep`, `timeout`. Arithmetic on
-`Duration` is checked (no overflow when adding two large durations).
+**49. `std.time`** ✅ (release v0.68.0-alpha) — `Instant`
+(monotonic, high-resolution), `Duration` (signed nanoseconds with
+**checked arithmetic** — adding two large Durations panics cleanly
+instead of silently wrapping, satisfying the roadmap's "no overflow
+when adding two large durations" requirement), `SystemTime` (wall
+clock, ms since Unix epoch), `sleep`, `timeout`. Adds **two new
+compiler builtins** (`instant_now_ns`, `system_time_now_ms`) wired
+through all four code-paths (boot checker, boot interpreter,
+self-hosted compiler C codegen + C runtime, LLVM IR emit). Both
+carry the `Clock` effect (matching the existing `clock_ms` from
+Stage 9). `instant_now_ns` returns monotonic nanoseconds via
+`clock_gettime(CLOCK_MONOTONIC)` on POSIX (Python's
+`time.monotonic_ns()` in the interpreter) — the resolution is
+platform-dependent (typically 1ns on Linux x86-64).
+`system_time_now_ms` returns wall-clock milliseconds since the
+Unix epoch via `clock_gettime(CLOCK_REALTIME)` on POSIX (Python's
+`time.time() * 1000` in the interpreter) — the wall clock can
+jump on NTP adjustments, so `Instant` (not `SystemTime`) should
+be used for duration measurements.
 
-**50. `std.math`** — IEEE-754 edge cases (NaN, Inf, signed zero,
-subnormals), `sin`/`cos`/`tan`/`exp`/`log`/`sqrt`, special functions
-(`erf`, `gamma`, `lgamma`), arbitrary-precision `BigDecimal` (no
-floating-point error).
+`std/time.hls` is pure HLS on top of these two builtins. It
+preserves the original low-resolution helpers (`time_now_ms`,
+`time_format_hms`, `time_format_iso8601`, `time_elapsed_ms`,
+`time_stopwatch_start`, `time_stopwatch_lap`, `time_human_ms`)
+verbatim for backwards compatibility, then adds three structured
+types:
+
+  * **`Instant`** — a monotonic instant (nanosecond precision).
+    `instant_now()` reads the monotonic clock;
+    `instant_elapsed(since: Instant) -> Duration` measures the
+    elapsed duration since a prior instant (always non-negative
+    — the monotonic clock never goes backwards);
+    `instant_duration_since(earlier, later)` panics if `later <
+    earlier` (monotonic clock violated); `instant_add(i, d)`
+    / `instant_sub(i, d)` add / subtract a Duration, panicking
+    on overflow (~292 years of accumulated duration).
+  * **`Duration`** — a signed span of nanoseconds. Constructors
+    `duration_from_secs / mins / hours / days / millis / micros /
+    nanos`. Accessors `duration_as_secs / mins / hours / days /
+    millis / micros / nanos`. Sub-second accessors
+    `duration_subsec_nanos / millis / micros`. **Checked
+    arithmetic**: `duration_add` panics on overflow BEFORE the
+    arithmetic (the check is `b > 0 && a > max - b`, giving a
+    clear error message instead of the runtime's generic
+    overflow panic); `duration_sub`, `duration_mul`, `duration_div`
+    likewise pre-check. Comparison `eq / lt / le / gt / ge`.
+    Helpers `abs / is_zero / is_negative / is_positive / to_str`
+    (the `to_str` format is "1d 2h 3m 4s 567ms 890us 123ns",
+    signed for negative durations).
+  * **`SystemTime`** — a wall-clock timestamp. `system_time_now()`
+    reads the wall clock; `system_time_unix_secs(t) -> int` /
+    `system_time_unix_millis(t) -> int` return the absolute
+    timestamp; `system_time_to_iso8601(t) -> str` produces a
+    compact `"T+<secs>.<ms>"` display (a full calendar with
+    year/month/day/hour/min/sec is a Stage 50+ `std.calendar`
+    concern); `system_time_duration_since(earlier, later) ->
+    Result[Duration, str]` returns `Err` if the wall clock went
+    backwards (matching Rust's `SystemTime::duration_since`
+    failure mode — NTP adjustments can cause this).
+
+The **`time_sleep(d: Duration)`** helper wraps the existing
+`thread_sleep_ms` builtin (Stage 46) — it converts the Duration
+to milliseconds and clamps negative durations to zero. The
+**`time_timeout_ms(ms: int) -> Future[bool]`** helper creates a
+future that resolves to `true` after `ms` milliseconds; it uses
+the Stage 33 `async_spawn` primitive to spawn a task that calls
+`thread_sleep_ms` then returns `true`. The caller races the
+timeout against another future via `future_select([real_future,
+timeout_future])` — if the timeout future wins, the real
+operation timed out.
+
+Differential parity (interpreter == native) verified on: low-
+level builtins (instant_now_ns positive & monotonic;
+system_time_now_ms > 2020-01-01), Instant now / elapsed /
+duration_since / comparison / add / sub, Duration constructors
+(from_secs / mins / hours / days / millis / micros / nanos /
+zero), Duration accessors (as_nanos / micros / millis / secs /
+mins / hours / days, subsec_nanos / millis / micros), Duration
+checked arithmetic (add / sub / mul / div, no panic on small
+inputs), Duration negative arithmetic (is_negative / abs),
+Duration comparison (eq / lt / le / gt / ge), Duration to_str,
+SystemTime now / unix_secs / unix_millis (with the natural
+exclusion of to_iso8601 from the byte-differential because it
+contains the actual timestamp — verified by structure instead),
+SystemTime duration_since OK case, SystemTime duration_since
+backwards-clock Err case, SystemTime comparison, time_sleep
+(actual sleep >= 40ms when asked for 50ms, with 5s upper bound),
+time_timeout_ms (await waited >= 20ms when asked for 30ms), and
+the original low-resolution API (time_now_ms, time_format_hms,
+time_format_iso8601, time_elapsed_ms with the clamp + overflow
+guard, time_human_ms, time_stopwatch_start / lap).
+
+**50. `std.math`** ✅ (release v0.69.0-alpha) — IEEE-754 edge cases
+(NaN, Inf, signed zero, subnormals), `sin` / `cos` / `tan` /
+`exp` / `log` / `sqrt`, special functions (`erf`, `erfc`,
+`tgamma`, `lgamma`), arbitrary-precision `BigDecimal` (no
+floating-point error). Adds **28 new compiler builtins** —
+all pure (no effects, deterministic), all delegating to libm on
+the native side (the C runtime links `-lm`), and to Python's
+`math` module in the interpreter (which also wraps libm on
+CPython, so differential parity holds bit-for-bit on the same
+platform).
+
+The builtins:
+
+  * **Trigonometric** (1 float → float): `math_sin`,
+    `math_cos`, `math_tan`, `math_asin`, `math_acos`,
+    `math_atan`, `math_atan2(y, x)`, `math_sinh`, `math_cosh`,
+    `math_tanh`.
+  * **Exponential / logarithmic**: `math_exp`, `math_log`
+    (natural), `math_log10`, `math_log2`, `math_pow(base, exp)`.
+  * **Power / root**: `math_sqrt` (replaces the previous HLS
+    Newton's-method implementation — was O(64) per call, libm
+    is O(1) on x86-64 with hardware `sqrtss`), `math_cbrt`
+    (cube root, handles negative inputs correctly),
+    `math_hypot(x, y)` (computes √(x²+y²) without intermediate
+    overflow), `math_fmod(x, y)` (C fmod — truncated division),
+    `math_copysign(x, y)` (returns x with the sign of y).
+  * **Special functions**: `math_erf` (error function),
+    `math_erfc` (complementary erf = 1 - erf), `math_tgamma`
+    (gamma function — `tgamma(5) = 4! = 24`), `math_lgamma`
+    (natural log of |gamma(x)| — `lgamma(5) = log(24) =
+    3.178…`).
+  * **IEEE-754 predicates** (1 float → bool): `math_isnan`,
+    `math_isinf`, `math_isfinite`, `math_signbit`. These are
+    the canonical IEEE-754 queries: `isnan(NaN) = true`;
+    `isinf(+Inf) = isinf(-Inf) = true`; `isfinite(1.0) = true`
+    but `isfinite(NaN) = isfinite(Inf) = false`; `signbit(-0.0)
+    = true` (distinguishes -0.0 from +0.0 — the only way to
+    observe the sign of zero).
+
+The native runtime emits each `math_*` builtin as a thin
+`static inline` wrapper around the corresponding libm function
+(`hl_math_sin(double x) { return sin(x); }`), so the optimiser
+can inline the wrapper at `-O2` and the call site reads as a
+direct libm call. The LLVM IR emit declares each `math_*` as an
+opaque external (`declare double @hl_math_sin(double)`) — the
+linker resolves them to libm via `-lm`. The interpreter calls
+Python's `math` module directly (Python's float is C double, so
+the bit-level behaviour matches libm exactly on the same
+platform).
+
+`std/math.hls` is pure HLS on top of these builtins. The
+existing low-level helpers (`math_abs_int`, `math_abs_float`,
+`math_min_int`, `math_max_int`, `math_min_float`,
+`math_max_float`, `math_clamp_int`, `math_power_int`,
+`math_power_float`, `math_floor`, `math_ceil`, `math_round`,
+`math_sum_int`, `math_sum_float`, `math_avg_float`) are
+preserved verbatim. The previous Newton's-method `math_sqrt`
+HLS function is removed (the builtin supersedes it —
+`BUILTIN_FNS` takes precedence in the call resolver, so any
+call site reading `math_sqrt(x)` now resolves to the libm
+version). New helpers:
+
+  * **Constants**: `math_pi()`, `math_e()`, `math_pos_inf()`,
+    `math_neg_inf()`, `math_nan()`. These return the closest
+    `double` to the constant (e.g., `math_pi() =
+    3.141592653589793`).
+  * **`BigDecimal`** — arbitrary-precision decimal arithmetic,
+    pure HLS (no builtins, no libm). The struct is
+    `{ sign: int (-1/0/+1), digits: list[int] (each 0..9,
+    most-significant first), scale: int (number of digits
+    after the decimal point; negative scale means trailing
+    zeros before the decimal point) }`. Constructors
+    `bigdecimal_zero`, `bigdecimal_from_int(n)`,
+    `bigdecimal_from_str(s)` (parses `"123"`, `"-12.34"`,
+    `"0.001"`, `"1.5e3"` — returns `Result[BigDecimal, str]`).
+    Renderers `bigdecimal_to_str(bd)`, `bigdecimal_to_int(bd)`
+    (truncates toward zero). Arithmetic `bigdecimal_add(a, b)`,
+    `bigdecimal_sub(a, b)`, `bigdecimal_mul(a, b)` (schoolbook
+    O(n*m); no `div` yet — deferred to Stage 53+ when long
+    division is needed). Comparison `bigdecimal_eq / lt / gt /
+    le / ge`. Helpers `bigdecimal_neg`, `bigdecimal_abs`,
+    `bigdecimal_is_zero`. All arithmetic is **exact** — the
+    canonical IEEE-754 counter-example `0.1 + 0.2 == 0.3` holds
+    (versus IEEE-754 which gives `0.30000000000000004`).
+
+The `BigDecimal` is intended for financial / accounting
+applications where IEEE-754 double precision is unacceptable.
+It's NOT optimized for speed — performance is the goal of the
+`std.bignum` module (Stage 50+ perfection or a future stage).
+The current implementation uses `list[int]` of single decimal
+digits (no packing into larger cells) for simplicity and
+clarity.
+
+Differential parity (interpreter == native) verified on:
+IEEE-754 predicates (isnan(NaN) / isnan(0)=false /
+isinf(+Inf) / isinf(-Inf) / isfinite(1) / isfinite(Inf)=false /
+signbit(-1) / signbit(-0.0) / signbit(1)=false), constants
+(math_pi / math_e / math_pos_inf / math_neg_inf / math_nan),
+trigonometric (sin / cos / tan at 0, sin(pi/2)=1, cos(pi)=-1,
+sin(pi)=0, asin / acos / atan / atan2 / sinh / cosh / tanh),
+exponential / logarithmic (exp(0)=1, exp(1)=e, log(1)=0,
+log(e)=1, log10(1000)=3, log2(8)=3, pow(2,10)=1024, pow(10,3)=
+1000), power / root (sqrt(4)=2, sqrt(9)=3, sqrt(2),
+cbrt(27)=3, cbrt(-8)=-2, hypot(3,4)=5, fmod(10,3)=1,
+fmod(-10,3)=-1, copysign(3,-1)=-3, copysign(3,1)=3), special
+functions (erf(0)=0, erfc(0)=1, tgamma(5)=24, tgamma(1)=1,
+tgamma(2)=1, lgamma(5)=log(24), lgamma(1)=0), BigDecimal
+constructors (from_int for 0/123/-456, from_str for "0"/"123"
+/"-12.34"/"0.001"/"1.5e3"), BigDecimal add (0.1+0.2=0.3
+exact, 123+456=579, -5+3=-2, -5+5=0), BigDecimal sub (100-50=
+50, 50-100=-50, 0.3-0.1=0.2 exact), BigDecimal mul (100*99=
+9900, 0.1*0.1=0.01 exact, -5*3=-15, -5*-3=15), BigDecimal neg
+/ abs, BigDecimal comparison (eq / lt / gt / le / ge with
+positive and negative operands), and BigDecimal to_int
+(truncation toward zero for positive and negative values).
 
 **51. `std.archive`** — `TarReader`, `ZipReader`, `GzipEncoder`,
 `GzipDecoder`. Decompression is bounded (a zip bomb is detected and

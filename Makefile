@@ -1888,3 +1888,93 @@ env-acceptance: bin/hlc
 	@echo "  differential (interpreter == native) verified green."
 
 .PHONY: env-acceptance
+
+# ============================================================================
+# Stage 49 (v0.68.0-alpha): std.time -- Instant, Duration, SystemTime,
+# sleep, timeout. Two new compiler builtins (instant_now_ns,
+# system_time_now_ms) wired through all four code-paths.
+# ============================================================================
+
+# ============================================================================
+# Stage 50 (v0.69.0-alpha): std.math -- IEEE-754 + libm-backed
+# transcendental + special functions + BigDecimal. 28 new builtins.
+# ============================================================================
+math-acceptance: bin/hlc
+	@$(PYTHON) boot/boot.py examples/math_demo.hls > /tmp/math_interp.txt 2>&1
+	@bin/hlc examples/math_demo.hls /tmp/math_demo.c 2>/dev/null
+	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/math_demo /tmp/math_demo.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
+	@/tmp/math_demo > /tmp/math_nat.txt 2>&1
+	@diff -q /tmp/math_interp.txt /tmp/math_nat.txt >/dev/null 2>&1 \
+		|| (echo "FAIL: math_demo differential mismatch" && false)
+	@$(PYTHON) boot/boot.py tests/ok/feat_stage50_math.hls > /tmp/s50_interp.txt 2>&1
+	@bin/hlc tests/ok/feat_stage50_math.hls /tmp/s50.c 2>/dev/null
+	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/s50 /tmp/s50.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
+	@/tmp/s50 > /tmp/s50_nat.txt 2>&1
+	@diff -q /tmp/s50_interp.txt /tmp/s50_nat.txt >/dev/null 2>&1 \
+		|| (echo "FAIL: feat_stage50_math differential mismatch" && false)
+	@rm -f /tmp/math_demo /tmp/math_demo.c /tmp/math_interp.txt /tmp/math_nat.txt \
+		/tmp/s50 /tmp/s50.c /tmp/s50_interp.txt /tmp/s50_nat.txt
+	@echo ""
+	@echo "ACCEPTANCE OK: Stage 50 -- std.math (IEEE-754 + transcendental + BigDecimal)"
+	@echo "  IEEE-754 predicates: math_isnan / isinf / isfinite / signbit"
+	@echo "  Trig: math_sin / cos / tan / asin / acos / atan / atan2 / sinh / cosh / tanh"
+	@echo "  Exp/log: math_exp / log / log10 / log2 / pow"
+	@echo "  Power/root: math_sqrt / cbrt / hypot / fmod / copysign"
+	@echo "  Special: math_erf / erfc / tgamma / lgamma"
+	@echo "  Constants: math_pi / math_e / math_pos_inf / math_neg_inf / math_nan"
+	@echo "  BigDecimal (pure HLS): from_int / from_str / to_str / to_int /"
+	@echo "    add / sub / mul / neg / abs / eq / lt / gt / le / ge / is_zero"
+	@echo "  28 new builtins wired through all 4 code-paths (checker/interp/hlc/llvm)"
+	@echo "  differential (interpreter == native) verified green."
+
+.PHONY: math-acceptance
+
+# ============================================================================
+# Stage 49 (v0.68.0-alpha): std.time -- Instant, Duration, SystemTime,
+# sleep, timeout. Two new compiler builtins (instant_now_ns,
+# system_time_now_ms) wired through all four code-paths.
+#
+# Note: time_demo.hls prints actual timestamps (non-deterministic) so
+# it is excluded from the differential byte-comparison. The acceptance
+# test uses feat_stage49_time.hls (deterministic — only prints section
+# markers and "ok"). The demo is invoked to verify it RUNS cleanly
+# (exit 0) under both interpreter and native.
+# ============================================================================
+time-acceptance: bin/hlc
+	@# Verify time_demo runs cleanly under both paths (exit 0).
+	@$(PYTHON) boot/boot.py examples/time_demo.hls > /tmp/time_demo_interp.txt 2>&1
+	@bin/hlc examples/time_demo.hls /tmp/time_demo.c 2>/dev/null
+	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/time_demo /tmp/time_demo.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
+	@/tmp/time_demo > /tmp/time_demo_nat.txt 2>&1
+	@# Both must end with the ACCEPTANCE OK line (verifies they ran to completion).
+	@tail -n 1 /tmp/time_demo_interp.txt | grep -q "ACCEPTANCE OK" \
+		|| (echo "FAIL: time_demo interpreter did not reach ACCEPTANCE OK" && false)
+	@tail -n 1 /tmp/time_demo_nat.txt | grep -q "ACCEPTANCE OK" \
+		|| (echo "FAIL: time_demo native did not reach ACCEPTANCE OK" && false)
+	@# The deterministic differential is on feat_stage49_time.hls.
+	@$(PYTHON) boot/boot.py tests/ok/feat_stage49_time.hls > /tmp/s49_interp.txt 2>&1
+	@bin/hlc tests/ok/feat_stage49_time.hls /tmp/s49.c 2>/dev/null
+	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/s49 /tmp/s49.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
+	@/tmp/s49 > /tmp/s49_nat.txt 2>&1
+	@diff -q /tmp/s49_interp.txt /tmp/s49_nat.txt >/dev/null 2>&1 \
+		|| (echo "FAIL: feat_stage49_time differential mismatch" && false)
+	@rm -f /tmp/time_demo /tmp/time_demo.c /tmp/time_demo_interp.txt /tmp/time_demo_nat.txt \
+		/tmp/s49 /tmp/s49.c /tmp/s49_interp.txt /tmp/s49_nat.txt
+	@echo ""
+	@echo "ACCEPTANCE OK: Stage 49 -- std.time (Instant, Duration, SystemTime, sleep, timeout)"
+	@echo "  instant_now_ns (monotonic ns; Clock) + system_time_now_ms (wall-clock ms; Clock)"
+	@echo "  Instant struct: now / elapsed / duration_since / eq / lt / add(Duration) / sub(Duration)"
+	@echo "  Duration struct: from_secs / mins / millis / micros / nanos"
+	@echo "  Duration accessors: as_nanos / as_micros / as_millis / as_secs / as_mins / as_hours / as_days"
+	@echo "  Duration subsec: subsec_nanos / subsec_millis / subsec_micros"
+	@echo "  Duration checked arithmetic: add / sub / mul / div (panics on overflow)"
+	@echo "  Duration comparison: eq / lt / le / gt / ge"
+	@echo "  Duration helpers: abs / is_zero / is_negative / is_positive / to_str"
+	@echo "  SystemTime struct: now / unix_secs / unix_millis / to_iso8601"
+	@echo "  SystemTime::duration_since -> Result[Duration, str] (Err on backwards wall clock)"
+	@echo "  time_sleep(Duration) blocks the calling thread (wraps thread_sleep_ms)"
+	@echo "  time_timeout_ms(ms) -> Future[bool] (race a future against a timer)"
+	@echo "  two new builtins wired through all 4 code-paths (checker/interp/hlc/llvm)"
+	@echo "  differential (interpreter == native) verified green."
+
+.PHONY: time-acceptance

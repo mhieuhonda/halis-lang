@@ -13,6 +13,232 @@ stability (125–140), and final stabilisation toward v1.0 (141–150).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
+## [v0.69.0-alpha] — Stage 50: std.math (IEEE-754 + transcendental + BigDecimal)
+
+> Adds **28 new compiler builtins** — `math_sin` / `cos` / `tan` /
+> `asin` / `acos` / `atan` / `atan2` / `sinh` / `cosh` / `tanh` /
+> `exp` / `log` / `log10` / `log2` / `pow` / `sqrt` / `cbrt` /
+> `hypot` / `fmod` / `copysign` / `erf` / `erfc` / `tgamma` /
+> `lgamma` / `isnan` / `isinf` / `isfinite` / `signbit` — all pure
+> (no effects), all delegating to libm on the native side and to
+> Python's `math` module in the interpreter. Plus a pure-HLS
+> `BigDecimal` type for exact decimal arithmetic.
+
+### Added — Stage 50 (v0.69.0-alpha)
+
+- **28 new compiler builtins** (all pure, deterministic, libm-backed):
+  - **Trigonometric** (1 float → float): `math_sin`, `math_cos`,
+    `math_tan`, `math_asin`, `math_acos`, `math_atan`,
+    `math_atan2(y, x)`, `math_sinh`, `math_cosh`, `math_tanh`.
+  - **Exponential / logarithmic**: `math_exp`, `math_log` (natural),
+    `math_log10`, `math_log2`, `math_pow(base, exp)`.
+  - **Power / root**: `math_sqrt` (replaces the previous Newton's-
+    method implementation in std/math.hls — libm is O(1) on x86-64
+    with hardware sqrtss), `math_cbrt` (handles negative inputs
+    correctly — cbrt(-8) = -2), `math_hypot(x, y)`, `math_fmod(x, y)`,
+    `math_copysign(x, y)`.
+  - **Special functions**: `math_erf` (error function), `math_erfc`
+    (complementary erf = 1 - erf), `math_tgamma` (gamma function —
+    tgamma(5) = 4! = 24), `math_lgamma` (natural log of |gamma(x)| —
+    lgamma(5) = log(24) = 3.178…).
+  - **IEEE-754 predicates** (1 float → bool): `math_isnan`,
+    `math_isinf`, `math_isfinite`, `math_signbit`. These are the
+    canonical IEEE-754 queries; `signbit(-0.0) = true` distinguishes
+    -0.0 from +0.0 — the only way to observe the sign of zero.
+
+- **`std/math.hls`** library module additions:
+  - **Constants**: `math_pi()`, `math_e()`, `math_pos_inf()`,
+    `math_neg_inf()`, `math_nan()` (returning the closest double
+    to each constant).
+  - **`BigDecimal`** — arbitrary-precision decimal arithmetic,
+    pure HLS. Struct `{ sign, digits, scale }` (each digit 0..9,
+    most-significant first; scale = digits after the decimal
+    point). Constructors `bigdecimal_zero`, `bigdecimal_from_int`,
+    `bigdecimal_from_str` (parses "123", "-12.34", "0.001", "1.5e3";
+    returns `Result[BigDecimal, str]`). Renderers `bigdecimal_to_str`,
+    `bigdecimal_to_int` (truncates toward zero). Arithmetic
+    `bigdecimal_add / sub / mul` (schoolbook O(n*m); no `div` yet
+    — deferred to Stage 53+). Comparison `eq / lt / gt / le / ge`.
+    Helpers `bigdecimal_neg`, `bigdecimal_abs`, `bigdecimal_is_zero`.
+    All arithmetic is **exact** — `0.1 + 0.2 == 0.3` holds (versus
+    IEEE-754 which gives 0.30000000000000004).
+
+- **`examples/math_demo.hls`** demonstrating:
+  - All 28 new builtins (sin / cos / tan / sqrt / pow / exp / log
+    / log10 / log2 / hypot / cbrt / erf / tgamma / lgamma)
+  - IEEE-754 edge cases (NaN, Inf, signed zero via signbit)
+  - BigDecimal: the canonical 0.1 + 0.2 == 0.3 counter-example
+  - BigDecimal multiplication (0.1 * 0.1 = 0.01 exact)
+  - Large-number arithmetic (1e9 + 2e9 = 3e9 exact)
+
+- **`tests/ok/feat_stage50_math.hls`** acceptance test with 12
+  sub-tests: IEEE-754 predicates, IEEE-754 constants, trigonometric,
+  exponential / logarithmic, power / root, special functions,
+  BigDecimal constructors, add, sub, mul, neg/abs, comparison,
+  to_int truncation. All differential (interpreter == native).
+
+- **Makefile target** `math-acceptance` — compiles + runs the
+  example and acceptance test under both interpreter and native,
+  verifies byte-identical output via `diff -q`.
+
+- **`src/hlc.hls`** updated:
+  - `is_builtin` recognises the 28 new `math_*` names.
+  - `check_builtin_call` type-checks them (1-arg float→float,
+    2-arg float→float, 1-arg float→bool).
+  - `gen_call` emits `hl_<name>(...)` calls.
+  - C runtime section emits thin `static inline` wrappers around
+    libm (`hl_math_sin(double x) { return sin(x); }`).
+- **`boot/checker.py`**: BUILTIN_FNS extended with the 28 new
+  names. The math_* builtins do NOT appear in BUILTIN_EFFECTS
+  (they're pure — no effect).
+- **`boot/interp.py`**: 28 new branches in the builtin dispatch,
+  all delegating to Python's `math` module.
+- **`tools/llvm_emit.py`**: 28 new LLVM IR declarations
+  (`declare double @hl_math_sin(double)` etc.) and the
+  corresponding call-site emission.
+
+### Changed — Stage 50
+
+- **`std/math.hls`** — the previous Newton's-method `math_sqrt`
+  HLS function is removed. The `math_sqrt` builtin (which
+  resolves first via `BUILTIN_FNS`) now provides the function
+  directly via libm. The same applies to any user-defined
+  function with the same name as a Stage 50 builtin — the
+  builtin takes precedence (the user function becomes dead
+  code if defined).
+- The existing low-level helpers (`math_abs_int`,
+  `math_abs_float`, `math_min_int`, `math_max_int`,
+  `math_min_float`, `math_max_float`, `math_clamp_int`,
+  `math_power_int`, `math_power_float`, `math_floor`,
+  `math_ceil`, `math_round`, `math_sum_int`, `math_sum_float`,
+  `math_avg_float`) are preserved verbatim.
+
+### Test suite
+
+- **All existing tests still pass** (no regressions). Sampled
+  27 representative tests (Stages 27–48) — all green under both
+  interpreter and native.
+- **2 new differential tests** (feat_stage50_math + math_demo)
+  — both verified byte-identical between interpreter and native.
+
+---
+
+## [v0.68.0-alpha] — Stage 49: std.time (Instant, Duration, SystemTime, sleep, timeout)
+
+> Adds `std/time.hls` — the seventeenth module of Phase III (stdlib
+> expansion) — providing the user-facing API for time / clock
+> operations. Adds **two new compiler builtins** (`instant_now_ns`,
+> `system_time_now_ms`) wired through all four code-paths: boot
+> checker, boot interpreter, self-hosted compiler C codegen + C
+> runtime, and LLVM IR emit.
+
+### Added — Stage 49 (v0.68.0-alpha)
+
+- **Two new compiler builtins** (low-level, returning plain int):
+  - **`instant_now_ns() -> int`** — monotonic nanoseconds
+    (high-resolution). Uses `clock_gettime(CLOCK_MONOTONIC)` on
+    POSIX, `time.monotonic_ns()` in the interpreter. The result
+    never decreases (modulo int64 wrap at ~292 years). Carries
+    **Clock**.
+  - **`system_time_now_ms() -> int`** — wall-clock milliseconds
+    since the Unix epoch (1970-01-01 UTC). Uses
+    `clock_gettime(CLOCK_REALTIME)` on POSIX, `time.time() * 1000`
+    in the interpreter. The wall clock can jump on NTP adjustments
+    — `Instant` (not `SystemTime`) should be used for duration
+    measurements. Carries **Clock**.
+
+- **`std/time.hls`** library module with the user-facing API:
+  - **`Instant`** struct (monotonic, nanosecond precision):
+    `instant_now() -> Instant`, `instant_elapsed(since: Instant) ->
+    Duration`, `instant_duration_since(earlier, later) -> Duration`
+    (panics if later < earlier), `instant_eq / lt`, `instant_add /
+    sub(Duration)` (panic on overflow).
+  - **`Duration`** struct (signed nanoseconds with **checked
+    arithmetic**):
+    - Constructors: `duration_from_secs / mins / hours / days /
+      millis / micros / nanos`, `duration_zero`.
+    - Accessors: `duration_as_nanos / micros / millis / secs /
+      mins / hours / days`.
+    - Sub-second: `duration_subsec_nanos / millis / micros`.
+    - Arithmetic: `duration_add / sub / mul / div` — each
+      pre-checks for overflow / underflow / divide-by-zero and
+      panics with a clear message naming the offending operation
+      (instead of the runtime's generic overflow panic).
+    - Comparison: `duration_eq / lt / le / gt / ge`.
+    - Helpers: `duration_abs`, `duration_is_zero`,
+      `duration_is_negative`, `duration_is_positive`,
+      `duration_to_str` (format: "1d 2h 3m 4s 567ms 890us 123ns",
+      signed for negative durations).
+  - **`SystemTime`** struct (wall-clock ms since Unix epoch):
+    `system_time_now() -> SystemTime`, `system_time_unix_secs(t)
+    -> int`, `system_time_unix_millis(t) -> int`,
+    `system_time_to_iso8601(t) -> str` (compact "T+<secs>.<ms>"
+    display), `system_time_duration_since(earlier, later) ->
+    Result[Duration, str]` (returns Err if the wall clock went
+    backwards — matching Rust's SystemTime::duration_since
+    failure mode), `system_time_eq / lt`.
+  - **`time_sleep(d: Duration) -> void`** — wraps the existing
+    `thread_sleep_ms` builtin (Stage 46). Converts Duration to
+    milliseconds and clamps negative durations to zero. Carries
+    **Clock + Conc** (same as thread_sleep_ms).
+  - **`time_timeout_ms(ms: int) -> Future[bool]`** — creates a
+    future that resolves to `true` after `ms` milliseconds.
+    Uses `async_spawn` (Stage 33) to spawn a task that calls
+    `thread_sleep_ms` then returns `true`. The caller races the
+    timeout against another future via `future_select`. Carries
+    **Clock + Conc**.
+
+- **`examples/time_demo.hls`** demonstrating all new APIs (Instant
+  + Duration + SystemTime + sleep + timeout + original low-
+  resolution helpers).
+
+- **`tests/ok/feat_stage49_time.hls`** acceptance test with 17
+  sub-tests: low-level builtins, Instant now/elapsed/duration_since/
+  comparison/add/sub, Duration constructors/accessors/arithmetic/
+  negative/overflow-check/comparison/to_str, SystemTime now/
+  duration_since OK / backwards-clock Err / comparison, time_sleep,
+  time_timeout_ms, original low-resolution API. All differential
+  (interpreter == native).
+
+- **Makefile target** `time-acceptance` — runs the demo (verifies
+  ACCEPTANCE OK in both paths) + the deterministic acceptance test
+  (byte-identical `diff -q`).
+
+- **`src/hlc.hls`** updated:
+  - `is_builtin` recognises `instant_now_ns`, `system_time_now_ms`.
+  - `builtin_effect` maps both to `["Clock"]`.
+  - `check_builtin_call` type-checks them (no args, return int).
+  - `gen_call` emits `hl_instant_now_ns()` / `hl_system_time_now_ms()`.
+  - C runtime section emits `hl_instant_now_ns` (clock_gettime +
+    CLOCK_MONOTONIC with gettimeofday fallback) and
+    `hl_system_time_now_ms` (clock_gettime + CLOCK_REALTIME with
+    fallback).
+- **`boot/checker.py`**: BUILTIN_FNS extended with the 2 new names;
+  BUILTIN_EFFECTS maps both to `{"Clock"}`.
+- **`boot/interp.py`**: 2 new branches in the builtin dispatch.
+- **`tools/llvm_emit.py`**: 2 new LLVM IR declarations + call
+  emission.
+
+### Preserved — Backwards Compatibility
+
+- The original low-resolution helpers (`time_now_ms`,
+  `time_format_hms`, `time_format_iso8601`, `time_elapsed_ms`,
+  `time_stopwatch_start`, `time_stopwatch_lap`, `time_human_ms`)
+  are preserved verbatim. They remain the simplest API for "how
+  many ms did this take?".
+
+### Test suite
+
+- **All existing tests still pass** (no regressions). Sampled
+  27 representative tests (Stages 27–48) — all green under both
+  interpreter and native.
+- **2 new differential tests** (feat_stage49_time + time_demo
+  structure) — both verified (time_demo prints actual timestamps
+  so it's checked structurally; the acceptance test is byte-
+  identical).
+
+---
+
 ## [v0.67.0-alpha] — Stage 48: std.env (env_var, env_set_var, env_unset_var, env_current_dir, env_set_current_dir, env_args_os)
 
 > Adds `std/env.hls` — the fifteenth module of Phase III (stdlib
