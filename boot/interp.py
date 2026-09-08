@@ -581,7 +581,20 @@ def _cpu_supports(feat):
                         # isa string (e.g. "rv64imafdcv"). Check that
                         # it appears as a suffix token (not inside
                         # another extension name).
-                        if "v" in isa:
+                        # Stage 53 deep-scan-22 fix (HIGH): the previous
+                        # `"v" in isa` matched the 'v' inside the BASE
+                        # ISA prefix "rv64" (present in EVERY rv64 ISA
+                        # string), so simd_cpu_supports("rvv") returned
+                        # True on every RISC-V system — including those
+                        # WITHOUT the V extension (e.g. rv64imac). The
+                        # native runtime uses __riscv_v (a compile-time
+                        # macro set by -march=rv64gcv), so this was a
+                        # differential mismatch: the interpreter falsely
+                        # reported V support. Skip the "rv64i" base
+                        # prefix (5 chars) before testing for 'v' so
+                        # only EXTENSION letters are considered.
+                        ext_part = isa[5:] if isa.startswith("rv64") else isa
+                        if "v" in ext_part:
                             return True
                         break
         except OSError:
@@ -596,7 +609,16 @@ def _cpu_supports(feat):
                     break
     except OSError:
         return False
-    return (" %s " % feat) in (" %s " % flags.replace(",", " ")
+    # Stage 53 deep-scan-22 fix (HIGH): /proc/cpuinfo uses UNDERSCORES in
+    # feature names (sse4_2, sse4_1) while HLS / __builtin_cpu_supports
+    # use DOTS (sse4.2, sse4.1). The previous code looked for " sse4.2 "
+    # in the flags, which never matched (the flags have "sse4_2"), so
+    # simd_cpu_supports("sse4.2") returned False on every x86 CPU — a
+    # differential mismatch with the native runtime (which calls
+    # __builtin_cpu_supports("sse4.2") and returns True). Map the dot
+    # form to the underscore form before the lookup so the probe matches.
+    probe = feat.replace(".", "_")
+    return (" %s " % probe) in (" %s " % flags.replace(",", " ")
                                .replace("       ", " ").replace(":", " "))
 
 
@@ -1813,7 +1835,20 @@ class Interp:
         if name == "proc_exec":
             # Deep-scan-15 cleanup: removed redundant `import os` (see
             # the file_exists branch above for the rationale).
-            cmd = args[0].decode("utf-8", "replace")
+            # Stage 53 deep-scan-22 fix (MEDIUM severity): decode with
+            # `surrogateescape` (not `replace`) so non-UTF-8 command
+            # bytes round-trip through os.system back to the EXACT same
+            # bytes the C runtime's system() receives. With `replace`,
+            # byte 0xff became U+FFFD, which os.system re-encoded to
+            # the 3-byte UTF-8 sequence \xef\xbf\xbd — so the shell
+            # saw DIFFERENT command bytes in the interpreter vs the
+            # native binary (a differential mismatch for any proc_exec
+            # command containing non-UTF-8 bytes, e.g. from chr(255)).
+            # `surrogateescape` maps each invalid byte to a lone
+            # surrogate (U+DC80..U+DCFF); os.system uses the filesystem
+            # encoding (utf-8/surrogateescape on Linux), which restores
+            # the original byte verbatim.
+            cmd = args[0].decode("utf-8", "surrogateescape")
             rc = os.system(cmd)
             # Deep-scan-7 fix: os.WIFEXITED / WEXITSTATUS / WTERMSIG
             # are POSIX-only macros. On Windows, os.system returns the
@@ -1842,7 +1877,15 @@ class Interp:
         # proc_wait / proc_kill / proc_child_* use; the runtime translates
         # it to the OS pid internally.
         if name == "proc_spawn":
-            program = args[0].decode("utf-8", "replace")
+            # Stage 53 deep-scan-22 fix (MEDIUM severity): decode with
+            # `surrogateescape` (not `replace`) so non-UTF-8 program
+            # names / arg bytes round-trip through subprocess.Popen
+            # back to the EXACT bytes the C runtime's execv receives.
+            # With `replace`, byte 0xff became U+FFFD, which Popen
+            # re-encoded to the 3-byte UTF-8 sequence — the child saw
+            # DIFFERENT argv bytes in the interpreter vs the native
+            # binary (same class of bug as proc_exec).
+            program = args[0].decode("utf-8", "surrogateescape")
             arg_list = args[1]  # list of bytes
             stdin_kind = int(args[2])
             stdout_kind = int(args[3])
@@ -1861,7 +1904,7 @@ class Interp:
                     return subprocess.PIPE
                 return subprocess.DEVNULL  # null
             try:
-                argv = [program] + [a.decode("utf-8", "replace") for a in arg_list]
+                argv = [program] + [a.decode("utf-8", "surrogateescape") for a in arg_list]
                 proc = subprocess.Popen(
                     argv,
                     stdin=_translate_stdio(stdin_kind),
@@ -1971,27 +2014,54 @@ class Interp:
         # produce the user-facing API (env_var -> Option[tainted[str]],
         # env_current_dir -> tainted[str], env_args_os -> list[tainted[str]]).
         if name == "env_get":
-            key = args[0].decode("utf-8", "replace")
+            # Stage 53 deep-scan-22 fix (HIGH severity): use
+            # `surrogateescape` (not `replace`) for both key decode and
+            # value encode so non-UTF-8 env vars round-trip byte-exact.
+            # The previous `replace` decode lost the original key bytes
+            # (a non-UTF-8 key became U+FFFD, so the lookup failed) AND
+            # the `encode("utf-8")` crashed with UnicodeEncodeError on
+            # env values containing surrogates (Python's os.environ
+            # decodes env vars with surrogateescape, so a raw-byte env
+            # value like b"\xff" becomes '\udcff', which utf-8 cannot
+            # re-encode). The C runtime's getenv returns the raw bytes
+            # — this fix makes the boot match.
+            key = args[0].decode("utf-8", "surrogateescape")
             val = os.environ.get(key, "")
-            return val.encode("utf-8") if isinstance(val, str) else bytes(val)
+            return val.encode("utf-8", "surrogateescape") if isinstance(val, str) else bytes(val)
         if name == "env_has":
-            key = args[0].decode("utf-8", "replace")
+            # Stage 53 deep-scan-22 fix (MEDIUM severity): surrogateescape
+            # so a non-UTF-8 key looks up correctly (replace would map
+            # every invalid byte to U+FFFD, mismatching the actual key).
+            key = args[0].decode("utf-8", "surrogateescape")
             return key in os.environ
         if name == "env_set":
-            key = args[0].decode("utf-8", "replace")
-            val = args[1].decode("utf-8", "replace")
+            # Stage 53 deep-scan-22 fix (MEDIUM severity): surrogateescape
+            # on both key and value so non-UTF-8 bytes are stored verbatim
+            # (matching the C setenv, which takes raw char*).
+            key = args[0].decode("utf-8", "surrogateescape")
+            val = args[1].decode("utf-8", "surrogateescape")
             os.environ[key] = val
             return None
         if name == "env_unset":
-            key = args[0].decode("utf-8", "replace")
+            # Stage 53 deep-scan-22 fix (MEDIUM severity): surrogateescape
+            # so a non-UTF-8 key is matched and removed correctly.
+            key = args[0].decode("utf-8", "surrogateescape")
             if key in os.environ:
                 del os.environ[key]
             return None
         if name == "cwd_get":
+            # Stage 53 deep-scan-22 fix (HIGH severity): encode with
+            # surrogateescape so a non-UTF-8 cwd path round-trips
+            # byte-exact. os.getcwd() on Linux returns a str decoded
+            # with surrogateescape; encoding with plain utf-8 would
+            # crash on any non-UTF-8 path component.
             cwd = os.getcwd()
-            return cwd.encode("utf-8") if isinstance(cwd, str) else bytes(cwd)
+            return cwd.encode("utf-8", "surrogateescape") if isinstance(cwd, str) else bytes(cwd)
         if name == "cwd_set":
-            path = args[0].decode("utf-8", "replace")
+            # Stage 53 deep-scan-22 fix (MEDIUM severity): surrogateescape
+            # so a non-UTF-8 path is passed to chdir verbatim (the C
+            # runtime's chdir takes raw char*).
+            path = args[0].decode("utf-8", "surrogateescape")
             try:
                 os.chdir(path)
                 return 0

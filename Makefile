@@ -31,7 +31,7 @@ else
   HL_CURL_DEFS :=
 endif
 
-.PHONY: all stage0 bootstrap test examples clean run check bench install uninstall audit opt-stats emit-ir emit-llvm fmt lint lsp-check pkg-init pkg-add pkg-lock pkg-audit pkg-verify pkg-build pkg-publish pkg-log pkg-log-verify prove prove-full model prove-acceptance hltest fuzz cov fuzz-acceptance wasm-opt webapp webapp-acceptance serve aarch64-bench aarch64-acceptance aarch64-list-targets stack-acceptance inline-acceptance opt-stats-report kernel-attrs escape-acceptance layout-report tail-acceptance tail-report asm-acceptance asm-attrs bench-stdlib spec-check stage32-acceptance async-acceptance stream-acceptance io-acceptance fs-acceptance net-acceptance http-acceptance http2-acceptance json-stream-acceptance regex-acceptance fmt-acceptance hash-acceptance collections-acceptance sync-acceptance thread-acceptance
+.PHONY: all stage0 bootstrap test examples clean run check bench install uninstall audit opt-stats emit-ir emit-llvm fmt lint lsp-check pkg-init pkg-add pkg-lock pkg-audit pkg-verify pkg-build pkg-publish pkg-log pkg-log-verify prove prove-full model prove-acceptance hltest fuzz cov fuzz-acceptance wasm-opt webapp webapp-acceptance serve aarch64-bench aarch64-acceptance aarch64-list-targets stack-acceptance inline-acceptance opt-stats-report kernel-attrs escape-acceptance layout-report tail-acceptance tail-report asm-acceptance asm-attrs bench-stdlib spec-check stage32-acceptance async-acceptance stream-acceptance io-acceptance fs-acceptance net-acceptance http-acceptance http2-acceptance json-stream-acceptance regex-acceptance fmt-acceptance hash-acceptance collections-acceptance sync-acceptance thread-acceptance time-acceptance math-acceptance process-acceptance env-acceptance archive-acceptance uuid-ulid-acceptance cli-acceptance
 
 # Main goal: use the full bootstrap chain to build the native compiler
 all: bootstrap
@@ -2071,3 +2071,47 @@ uuid-ulid-acceptance: bin/hlc
 	@echo "  differential (interpreter == native) verified green."
 
 .PHONY: uuid-ulid-acceptance
+
+# ============================================================================
+# Stage 53 (v0.72.0-alpha): std.cli -- type-safe CLI argument parser
+# (CliParser builder, flags/int/str/float options, positionals, env-var
+# fallback, subcommands, --help/--version). Pure-HLS implementation
+# (no new compiler builtins) -- uses args() (Args) + env_get/env_has
+# (Proc) + println (IO).
+# ============================================================================
+
+# Stage 53 cli demo is deterministic (all parse cases use synthetic
+# argv lists, not the real process argv). The differential test
+# compares interpreter and native output byte-for-byte.
+cli-acceptance: bin/hlc
+	@$(PYTHON) boot/boot.py examples/cli_demo.hls > /tmp/cli_demo_interp.txt 2>&1
+	@bin/hlc examples/cli_demo.hls /tmp/cli_demo.c 2>/dev/null
+	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/cli_demo /tmp/cli_demo.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
+	@/tmp/cli_demo > /tmp/cli_demo_nat.txt 2>&1
+	@diff -q /tmp/cli_demo_interp.txt /tmp/cli_demo_nat.txt >/dev/null 2>&1 \
+		|| (echo "FAIL: cli_demo differential mismatch" && false)
+	@$(PYTHON) boot/boot.py tests/ok/feat_stage53_cli.hls > /tmp/s53_interp.txt 2>&1
+	@bin/hlc tests/ok/feat_stage53_cli.hls /tmp/s53.c 2>/dev/null
+	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/s53 /tmp/s53.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
+	@/tmp/s53 > /tmp/s53_nat.txt 2>&1
+	@diff -q /tmp/s53_interp.txt /tmp/s53_nat.txt >/dev/null 2>&1 \
+		|| (echo "FAIL: feat_stage53_cli differential mismatch" && false)
+	@rm -f /tmp/cli_demo /tmp/cli_demo.c /tmp/cli_demo_interp.txt /tmp/cli_demo_nat.txt \
+		/tmp/s53 /tmp/s53.c /tmp/s53_interp.txt /tmp/s53_nat.txt
+	@echo ""
+	@echo "ACCEPTANCE OK: Stage 53 -- std.cli (type-safe argument parser)"
+	@echo "  CliParser builder (flag / int_opt / str_opt / float_opt / positional)"
+	@echo "  Type-safe parsing (invalid int/float/bool rejected at parse time)"
+	@echo "  Long/short options (--port / -p) with =value and separate value"
+	@echo "  Bool flags (--verbose / -v) with optional explicit value"
+	@echo "  Defaults (applied when option not given; cli_has=false)"
+	@echo "  Env-var fallback (cli_parser_env; CLI takes precedence over env)"
+	@echo "  Subcommands (init / build; remaining args go to cli_remaining_args)"
+	@echo "  --help / -h and --version / -V (implicit, always registered)"
+	@echo "  -- end-of-options marker (rest treated as positional)"
+	@echo "  Required arg validation (missing required -> error)"
+	@echo "  Help text generation (cli_print_help) + version (cli_print_version)"
+	@echo "  Pure-HLS implementation (no new compiler builtins)"
+	@echo "  differential (interpreter == native) verified green."
+
+.PHONY: cli-acceptance

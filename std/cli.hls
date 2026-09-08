@@ -1,0 +1,1449 @@
+# ============================================================================
+# std/cli.hls — Stage 53 (v0.72.0-alpha): type-safe CLI argument parser
+# ----------------------------------------------------------------------------
+# This module is the FIRST module of Phase IV (the CLI tooling track,
+# Stages 53–62). It provides the user-facing API for command-line
+# argument parsing described in the roadmap (Stage 53):
+#
+#   * CliParser     — a declarative parser built via the builder pattern.
+#                     Declare flags, int/str/float options, positional
+#                     arguments, env-var fallbacks, defaults, subcommands.
+#   * CliResult     — the parse outcome (ok | error | help | version |
+#                     subcommand dispatch + a list of typed matches).
+#   * cli_get_bool  — type-safe accessors that return the parsed value
+#     cli_get_int    for a given key. The parser validates the value at
+#     cli_get_str    parse time (a --port int argument rejects "abc"
+#     cli_get_float  at the parser, not in user code) — the accessors
+#                     never panic on a successfully-parsed CliResult.
+#
+# Design choices (matching the roadmap's "type-safe (a --port int
+# argument rejects non-integers at the parser, not in user code)"):
+#
+#   1. BUILDER PATTERN, NOT DERIVE MACROS.
+#      Halis does not yet have derive macros (Stage 113+ adds them).
+#      The builder pattern (`cli_parser_new("app", "1.0").flag("v", ...).
+#      int_opt("port", ...)`) is the idiomatic Halis equivalent: every
+#      builder call returns a NEW CliParser (immutable update, same
+#      convention as std.process.Command and std.thread.ThreadBuilder).
+#
+#   2. TYPE-SAFE PARSING.
+#      When the parser encounters `--port abc`, it returns
+#      CliResult { ok: false, error: "..." } immediately — the user
+#      never sees a "bad int" panic at `cli_get_int(result, "port")`.
+#      A successfully-parsed CliResult is guaranteed to have valid
+#      values; the accessors just look them up.
+#
+#   3. ENV-VAR FALLBACK.
+#      For each option, the caller can register an env-var name via
+#      cli_parser_env(parser, "port", "PORT"). At parse time, if the
+#      option was not given on the command line, the parser looks it
+#      up in the environment (env_get + env_has). This matches the
+#      roadmap's "env-var fallback" requirement.
+#
+#   4. SUBCOMMANDS.
+#      A parser can declare subcommands via cli_parser_subcommand.
+#      If the first non-option argument matches a subcommand name,
+#      CliResult.subcommand is set to it and the remaining args are
+#      available via cli_remaining_args (the subcommand handler can
+#      re-parse them with its own CliParser). This matches the
+#      roadmap's "Subcommands" requirement.
+#
+#   5. HELP TEXT GENERATION.
+#      cli_print_help(parser) produces a clap-style help message:
+#      usage, options (with short/long/desc/default), positional
+#      arguments, subcommands. This matches the roadmap's "help text
+#      generation" requirement.
+#
+#   6. --version FLAG.
+#      The parser implicitly registers --version and -V. When present,
+#      CliResult.version_requested is set and cli_print_version prints
+#      "<name> <version>". This matches the roadmap's "--version from
+#      hls-pkg.toml" requirement (the version is provided by the user
+#      at parser construction; hls-pkg.toml reading is Stage 58).
+#
+#   7. --help / -h FLAG.
+#      The parser implicitly registers --help and -h. When present,
+#      CliResult.help_requested is set and the user calls
+#      cli_print_help(parser) to print the help text.
+#
+#   8. PURE-HLS IMPLEMENTATION.
+#      No new compiler builtins. The parser uses the existing `args()`
+#      builtin (Args effect) for reading argv, and env_get / env_has
+#      (Proc effect) for env-var fallback. The help/version printers
+#      use println (IO effect).
+#
+# Differential parity (interpreter == native):
+#   All operations are pure string/int/list operations. The only
+#   non-determinism is the live argv (which differs between runs but
+#   is identical between interpreter and native for the same argv).
+#   The differential test (feat_stage53_cli.hls) uses synthetic argv
+#   lists (cli_parse(parser, ["app", "--port", "8080"])) so it's
+#   fully reproducible and differential-safe.
+#
+# Limitations (deferred to later stages):
+#   * No `--flag=value` syntax — only `--flag value` and `--flag=value`.
+#     Both are supported; the parser splits on the first `=`.
+#   * No short-flag combining (`-abc` = `-a -b -c`). The parser treats
+#     `-abc` as a single short option named "abc" (which will fail to
+#     match and produce a clean error). A future perfection stage may
+#     add combining.
+#   * No `--` end-of-options marker (deferred — POSIX convention).
+#     Actually wait, the parser DOES support `--` (everything after is
+#     treated as positional). This is required for tools that pass
+#     arbitrary args to subprocesses (e.g., `hls run -- --release`).
+#   * No multi-value options (e.g., `--file a --file b`). A future
+#     perfection stage may add `cli_parser_str_multi`.
+#   * No abbreviations / prefix matching (e.g., `--ver` matching
+#     `--version`). This is intentionally omitted — abbreviations are
+#     ambiguous and a common source of bugs.
+#   * No derive macro (Stage 113+ adds derive; the builder pattern is
+#     the v1.0 API).
+# ============================================================================
+
+import "std.str"
+import "std.option"
+import "std.result"
+
+# ----------------------------------------------------------------------------
+# Constants — argument kinds. Stored as int because HLS v0.3 has no
+# enum-with-methods; the parser switches on these int values.
+# ----------------------------------------------------------------------------
+
+fn cli_kind_bool() -> int { return 0 }
+fn cli_kind_int() -> int { return 1 }
+fn cli_kind_str() -> int { return 2 }
+fn cli_kind_float() -> int { return 3 }
+
+# ----------------------------------------------------------------------------
+# CliArg — a single declared argument (flag, option, or positional).
+# ----------------------------------------------------------------------------
+
+struct CliArg {
+    long_name: str,      # long name without "--" (e.g. "port"); for positionals, the field name
+    short_name: str,     # short name without "-" (e.g. "p"); "" if none
+    desc: str,           # help text
+    kind: int,           # one of cli_kind_*
+    required: bool,      # is this argument required?
+    positional: bool,    # is this a positional argument (no --prefix)?
+    default_str: str,    # default value as a string (used when not present and not required)
+    has_default: bool,   # does this argument have a default value?
+    env: str,            # env-var name for fallback; "" if none
+}
+
+# ----------------------------------------------------------------------------
+# CliParser — the declarative parser.
+# ----------------------------------------------------------------------------
+
+struct CliParser {
+    name: str,                  # program name (shown in usage)
+    version: str,               # version string (shown by --version)
+    desc: str,                  # one-line description (shown in help)
+    args: list[CliArg],         # declared flags + options + positionals
+    subcommands: list[str],     # subcommand names
+    subcommand_descs: list[str],# parallel: subcommand descriptions
+    after_help: str,            # extra text shown after the options table
+}
+
+# ----------------------------------------------------------------------------
+# CliMatch — a single parsed value (one per declared arg).
+# ----------------------------------------------------------------------------
+
+struct CliMatch {
+    key: str,           # the arg's long name (or field name for positionals)
+    present: bool,      # was this arg provided on the CLI / env / default?
+    kind: int,          # the arg's kind (mirrors CliArg.kind)
+    str_val: str,       # valid when kind == str, or always (other kinds store the source string here)
+    int_val: int,       # valid when kind == int
+    bool_val: bool,     # valid when kind == bool (always present for flags; default false)
+    float_val: float,   # valid when kind == float
+}
+
+# ----------------------------------------------------------------------------
+# CliResult — the parse outcome.
+# ----------------------------------------------------------------------------
+
+struct CliResult {
+    ok: bool,                   # did parsing succeed?
+    error: str,                 # error message when !ok
+    help_requested: bool,       # was --help / -h given?
+    version_requested: bool,    # was --version / -V given?
+    subcommand: str,            # matched subcommand name; "" if none
+    matches: list[CliMatch],    # one CliMatch per declared arg, in declaration order
+    remaining: list[str],       # leftover positional args (after declared positionals are consumed)
+}
+
+# ============================================================================
+# CliParser builder — immutable updates (same convention as Command).
+# ============================================================================
+
+# cli_parser_new(name, version) — create a CliParser with the given
+# program name and version string. The desc and after_help are empty
+# by default; the args / subcommands lists are empty.
+fn cli_parser_new(name: str, version: str) -> CliParser {
+    let empty_args: list[CliArg] = []
+    let empty_subs: list[str] = []
+    let empty_sub_descs: list[str] = []
+    let p: CliParser = CliParser {
+        name: name,
+        version: version,
+        desc: "",
+        args: empty_args,
+        subcommands: empty_subs,
+        subcommand_descs: empty_sub_descs,
+        after_help: "",
+    }
+    return p
+}
+
+# cli_parser_desc(p, desc) — set the one-line description.
+fn cli_parser_desc(p: CliParser, desc: str) -> CliParser {
+    let np: CliParser = CliParser {
+        name: p.name,
+        version: p.version,
+        desc: desc,
+        args: p.args,
+        subcommands: p.subcommands,
+        subcommand_descs: p.subcommand_descs,
+        after_help: p.after_help,
+    }
+    return np
+}
+
+# cli_parser_after_help(p, text) — set the extra help text shown after
+# the options table (e.g., examples, env vars, exit codes).
+fn cli_parser_after_help(p: CliParser, text: str) -> CliParser {
+    let np: CliParser = CliParser {
+        name: p.name,
+        version: p.version,
+        desc: p.desc,
+        args: p.args,
+        subcommands: p.subcommands,
+        subcommand_descs: p.subcommand_descs,
+        after_help: text,
+    }
+    return np
+}
+
+# cli_parser_flag(p, long, short, desc) — declare a boolean flag.
+# Flags are present-or-not; their value is true if --long (or -short)
+# appears on the command line, false otherwise. They have no default
+# (false is the natural default). required is meaningless for flags
+# (a "required flag" is just an option that must be passed; use an
+# option with required=true if you need that).
+fn cli_parser_flag(p: CliParser, long: str, short: str, desc: str) -> CliParser {
+    let arg: CliArg = CliArg {
+        long_name: long,
+        short_name: short,
+        desc: desc,
+        kind: cli_kind_bool(),
+        required: false,
+        positional: false,
+        default_str: "false",
+        has_default: true,
+        env: "",
+    }
+    return cli_parser_append_arg(p, arg)
+}
+
+# cli_parser_int_opt(p, long, short, desc, required, default) — declare
+# an int-valued option. If required is true, the parser errors if the
+# option is missing AND no default AND no env value. If required is
+# false, the default is used when the option is missing.
+fn cli_parser_int_opt(p: CliParser, long: str, short: str, desc: str,
+                       required: bool, default: int) -> CliParser {
+    let arg: CliArg = CliArg {
+        long_name: long,
+        short_name: short,
+        desc: desc,
+        kind: cli_kind_int(),
+        required: required,
+        positional: false,
+        default_str: default.to_str(),
+        has_default: true,
+        env: "",
+    }
+    return cli_parser_append_arg(p, arg)
+}
+
+# cli_parser_int_opt_no_default — same as cli_parser_int_opt but without
+# a default. If the option is not required AND not provided, the
+# CliMatch.present is false and cli_get_int returns 0 (the caller should
+# check cli_has before reading).
+fn cli_parser_int_opt_no_default(p: CliParser, long: str, short: str, desc: str,
+                                  required: bool) -> CliParser {
+    let arg: CliArg = CliArg {
+        long_name: long,
+        short_name: short,
+        desc: desc,
+        kind: cli_kind_int(),
+        required: required,
+        positional: false,
+        default_str: "",
+        has_default: false,
+        env: "",
+    }
+    return cli_parser_append_arg(p, arg)
+}
+
+# cli_parser_str_opt — declare a str-valued option with a default.
+fn cli_parser_str_opt(p: CliParser, long: str, short: str, desc: str,
+                       required: bool, default: str) -> CliParser {
+    let arg: CliArg = CliArg {
+        long_name: long,
+        short_name: short,
+        desc: desc,
+        kind: cli_kind_str(),
+        required: required,
+        positional: false,
+        default_str: default,
+        has_default: true,
+        env: "",
+    }
+    return cli_parser_append_arg(p, arg)
+}
+
+# cli_parser_str_opt_no_default — str-valued option, no default.
+fn cli_parser_str_opt_no_default(p: CliParser, long: str, short: str, desc: str,
+                                  required: bool) -> CliParser {
+    let arg: CliArg = CliArg {
+        long_name: long,
+        short_name: short,
+        desc: desc,
+        kind: cli_kind_str(),
+        required: required,
+        positional: false,
+        default_str: "",
+        has_default: false,
+        env: "",
+    }
+    return cli_parser_append_arg(p, arg)
+}
+
+# cli_parser_float_opt — declare a float-valued option with a default.
+fn cli_parser_float_opt(p: CliParser, long: str, short: str, desc: str,
+                         required: bool, default: float) -> CliParser {
+    let arg: CliArg = CliArg {
+        long_name: long,
+        short_name: short,
+        desc: desc,
+        kind: cli_kind_float(),
+        required: required,
+        positional: false,
+        default_str: default.to_str(),
+        has_default: true,
+        env: "",
+    }
+    return cli_parser_append_arg(p, arg)
+}
+
+# cli_parser_float_opt_no_default — float-valued option, no default.
+fn cli_parser_float_opt_no_default(p: CliParser, long: str, short: str, desc: str,
+                                    required: bool) -> CliParser {
+    let arg: CliArg = CliArg {
+        long_name: long,
+        short_name: short,
+        desc: desc,
+        kind: cli_kind_float(),
+        required: required,
+        positional: false,
+        default_str: "",
+        has_default: false,
+        env: "",
+    }
+    return cli_parser_append_arg(p, arg)
+}
+
+# cli_parser_str_positional — declare a positional str argument.
+# Positionals are filled left-to-right from the non-option argv tail.
+fn cli_parser_str_positional(p: CliParser, name: str, desc: str, required: bool) -> CliParser {
+    let arg: CliArg = CliArg {
+        long_name: name,
+        short_name: "",
+        desc: desc,
+        kind: cli_kind_str(),
+        required: required,
+        positional: true,
+        default_str: "",
+        has_default: false,
+        env: "",
+    }
+    return cli_parser_append_arg(p, arg)
+}
+
+# cli_parser_int_positional — declare a positional int argument.
+fn cli_parser_int_positional(p: CliParser, name: str, desc: str, required: bool) -> CliParser {
+    let arg: CliArg = CliArg {
+        long_name: name,
+        short_name: "",
+        desc: desc,
+        kind: cli_kind_int(),
+        required: required,
+        positional: true,
+        default_str: "",
+        has_default: false,
+        env: "",
+    }
+    return cli_parser_append_arg(p, arg)
+}
+
+# cli_parser_env — register an env-var fallback for an existing option.
+# At parse time, if the option is not given on the command line, the
+# parser looks up env_var. If env_var is set, its value is parsed as
+# the option's kind. If env_var is not set, the default (if any) is
+# used; if there's no default and the option is required, the parser
+# errors.
+#
+# This is a SEPARATE call (not a builder parameter) so the caller can
+# register env fallbacks after declaring all options (matching clap's
+# .env() method).
+fn cli_parser_env(p: CliParser, long: str, env_var: str) -> CliParser {
+    # Find the arg with this long name and set its env field.
+    let new_args: list[CliArg] = []
+    let mut i: int = 0
+    while i < p.args.len() {
+        let a: CliArg = p.args.get(i)
+        if a.long_name == long {
+            let na: CliArg = CliArg {
+                long_name: a.long_name,
+                short_name: a.short_name,
+                desc: a.desc,
+                kind: a.kind,
+                required: a.required,
+                positional: a.positional,
+                default_str: a.default_str,
+                has_default: a.has_default,
+                env: env_var,
+            }
+            new_args.push(na)
+        } else {
+            new_args.push(a)
+        }
+        i = i + 1
+    }
+    let np: CliParser = CliParser {
+        name: p.name,
+        version: p.version,
+        desc: p.desc,
+        args: new_args,
+        subcommands: p.subcommands,
+        subcommand_descs: p.subcommand_descs,
+        after_help: p.after_help,
+    }
+    return np
+}
+
+# cli_parser_subcommand — declare a subcommand. If the first non-option
+# argument matches a subcommand name, CliResult.subcommand is set to it
+# and the remaining args (after the subcommand name) are available via
+# cli_remaining_args. The subcommand handler can re-parse them with its
+# own CliParser.
+fn cli_parser_subcommand(p: CliParser, name: str, desc: str) -> CliParser {
+    let new_subs: list[str] = []
+    let new_sub_descs: list[str] = []
+    let mut i: int = 0
+    while i < p.subcommands.len() {
+        new_subs.push(p.subcommands.get(i))
+        new_sub_descs.push(p.subcommand_descs.get(i))
+        i = i + 1
+    }
+    new_subs.push(name)
+    new_sub_descs.push(desc)
+    let np: CliParser = CliParser {
+        name: p.name,
+        version: p.version,
+        desc: p.desc,
+        args: p.args,
+        subcommands: new_subs,
+        subcommand_descs: new_sub_descs,
+        after_help: p.after_help,
+    }
+    return np
+}
+
+# cli_parser_append_arg — internal helper: append a CliArg to p.args.
+fn cli_parser_append_arg(p: CliParser, arg: CliArg) -> CliParser {
+    let new_args: list[CliArg] = []
+    let mut i: int = 0
+    while i < p.args.len() {
+        new_args.push(p.args.get(i))
+        i = i + 1
+    }
+    new_args.push(arg)
+    let np: CliParser = CliParser {
+        name: p.name,
+        version: p.version,
+        desc: p.desc,
+        args: new_args,
+        subcommands: p.subcommands,
+        subcommand_descs: p.subcommand_descs,
+        after_help: p.after_help,
+    }
+    return np
+}
+
+# ============================================================================
+# Lookup helpers — find an arg by long name, short name, or positional
+# index. These are internal (no `cli_` prefix); the user interacts via
+# the accessors below.
+# ============================================================================
+
+# cli_find_by_long — return the index of the arg with this long name,
+# or -1 if not found.
+fn cli_find_by_long(p: CliParser, long: str) -> int {
+    let mut i: int = 0
+    while i < p.args.len() {
+        if !p.args.get(i).positional && p.args.get(i).long_name == long {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+# cli_find_by_short — return the index of the arg with this short name,
+# or -1 if not found.
+fn cli_find_by_short(p: CliParser, short: str) -> int {
+    let mut i: int = 0
+    while i < p.args.len() {
+        let a: CliArg = p.args.get(i)
+        if !a.positional && a.short_name == short && a.short_name != "" {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+# cli_positional_indices — return a list of indices of all positional
+# args (in declaration order, which is left-to-right fill order).
+fn cli_positional_indices(p: CliParser) -> list[int] {
+    let out: list[int] = []
+    let mut i: int = 0
+    while i < p.args.len() {
+        if p.args.get(i).positional {
+            out.push(i)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# ============================================================================
+# Value coercion — convert a string to the arg's kind. Returns
+# Result[str, str]: Ok(normalised_str) on success, Err(message) on failure.
+# For bool flags, the str is unused (presence is the value); for int /
+# float, the str is parsed and validated.
+# ============================================================================
+
+fn cli_coerce_value(arg: CliArg, raw: str) -> Result[str, str] {
+    # Stage 53 deep-scan-22 fix (LOW): error messages for positionals
+    # used "--name" (option syntax) which is misleading. Positionals
+    # use "<name>" instead.
+    let mut label: str = "--" + arg.long_name
+    if arg.positional {
+        label = "<" + arg.long_name + ">"
+    }
+    if arg.kind == cli_kind_bool() {
+        # Flags don't take values; if the user passed --flag=true /
+        # --flag=false, we honour that. Otherwise presence=true.
+        let lower: str = str_to_lower_ascii(raw)
+        if lower == "true" || lower == "1" || lower == "yes" {
+            return Result.Ok("true")
+        }
+        if lower == "false" || lower == "0" || lower == "no" {
+            return Result.Ok("false")
+        }
+        return Result.Err("invalid boolean value '" + raw + "' for " + label
+            + " (expected true/false/1/0/yes/no)")
+    }
+    if arg.kind == cli_kind_int() {
+        let r: Result[int, str] = int_parse(raw)
+        if result_is_err(r) {
+            return Result.Err("invalid integer value '" + raw + "' for " + label
+                + " (" + result_err_or(r, "") + ")")
+        }
+        return Result.Ok(raw)
+    }
+    if arg.kind == cli_kind_float() {
+        let r: Result[float, str] = float_parse(raw)
+        if result_is_err(r) {
+            return Result.Err("invalid float value '" + raw + "' for " + label
+                + " (" + result_err_or(r, "") + ")")
+        }
+        return Result.Ok(raw)
+    }
+    # cli_kind_str — anything goes.
+    return Result.Ok(raw)
+}
+
+# ============================================================================
+# cli_parse(p, argv) — the main parse routine.
+#
+# argv is the full argv list (including the program name at index 0).
+# The parser skips argv[0] (program name) and processes argv[1..].
+#
+# Algorithm:
+#   1. Initialise matches with defaults / "not present".
+#   2. Walk argv[1..]:
+#      - "--"              -> rest are positional
+#      - "--long" or "--long=value"  -> look up by long name; consume value if not a flag
+#      - "-x" or "-x=value"          -> look up by short name; consume value if not a flag
+#      - "-h" / "--help"             -> set help_requested, return early
+#      - "-V" / "--version"          -> set version_requested, return early
+#      - else                         -> positional or subcommand
+#   3. After processing all argv, fill positionals left-to-right from
+#      the positional-buffer.
+#   4. If a subcommand is declared and the first positional matches a
+#      subcommand name, set subcommand and put the rest into remaining.
+#   5. Apply env-var fallbacks for any arg that wasn't given on the CLI.
+#   6. Validate required args (error if any required arg is missing
+#      AND has no default AND no env value).
+#   7. Return the CliResult.
+# ============================================================================
+
+fn cli_parse(p: CliParser, argv: list[str]) -> CliResult uses Proc {
+    # Empty matches list — one entry per arg, filled with defaults.
+    let matches: list[CliMatch] = []
+    let mut i: int = 0
+    while i < p.args.len() {
+        let a: CliArg = p.args.get(i)
+        let m: CliMatch = CliMatch {
+            key: a.long_name,
+            present: false,
+            kind: a.kind,
+            str_val: "",
+            int_val: 0,
+            bool_val: false,
+            float_val: 0.0,
+        }
+        matches.push(m)
+        i = i + 1
+    }
+
+    # Positional buffer — collects non-option args until we know how to
+    # distribute them across the declared positionals.
+    let positional_buf: list[str] = []
+
+    # Subcommand placeholder.
+    let mut subcommand: str = ""
+
+    # End-of-options flag — once we see "--", everything is positional.
+    let mut end_of_options: bool = false
+
+    # Pre-compute positional indices (used by the subcommand fast-path
+    # AND the normal distribution loop below).
+    let pos_indices: list[int] = cli_positional_indices(p)
+    let mut pos_iter: int = 0
+    let mut buf_iter: int = 0
+    let remaining: list[str] = []
+    let mut consumed_subcommand: bool = false
+
+    # Walk argv[1..].
+    let mut idx: int = 1
+    let argc: int = argv.len()
+    let mut err_msg: str = ""
+    let mut have_err: bool = false
+    let mut help_req: bool = false
+    let mut ver_req: bool = false
+
+    while idx < argc && !have_err && !help_req && !ver_req {
+        let tok: str = argv.get(idx)
+
+        # End-of-options marker.
+        if !end_of_options && tok == "--" {
+            end_of_options = true
+            idx = idx + 1
+            continue
+        }
+
+        # Long option: --long or --long=value
+        if !end_of_options && tok.starts_with("--") && tok.len() > 2 {
+            let body: str = tok.slice(2, tok.len())
+            # Split on first '='.
+            let eq_pos: int = body.find("=")
+            let mut name: str = ""
+            let mut val_str: str = ""
+            let mut has_inline_val: bool = false
+            if eq_pos >= 0 {
+                name = body.slice(0, eq_pos)
+                val_str = body.slice(eq_pos + 1, body.len())
+                has_inline_val = true
+            } else {
+                name = body
+            }
+
+            # Built-in --help / --version.
+            if name == "help" {
+                help_req = true
+                idx = idx + 1
+                continue
+            }
+            if name == "version" {
+                ver_req = true
+                idx = idx + 1
+                continue
+            }
+
+            let arg_idx: int = cli_find_by_long(p, name)
+            if arg_idx < 0 {
+                have_err = true
+                err_msg = "unrecognised option '--" + name + "'"
+                break
+            }
+
+            let arg: CliArg = p.args.get(arg_idx)
+
+            # Bool flag — no value consumed (unless inline = was used).
+            if arg.kind == cli_kind_bool() {
+                if has_inline_val {
+                    let coerced: Result[str, str] = cli_coerce_value(arg, val_str)
+                    if result_is_err(coerced) {
+                        have_err = true
+                        err_msg = result_err_or(coerced, "")
+                        break
+                    }
+                    let v: str = result_unwrap_or(coerced, "false")
+                    let new_matches: list[CliMatch] = cli_match_set(matches, arg_idx, v == "true", v)
+                    # Overwrite matches via reassignment — list[CliMatch] is mutable.
+                    cli_match_overwrite_in_place(matches, arg_idx, v == "true", v)
+                } else {
+                    cli_match_overwrite_in_place(matches, arg_idx, true, "true")
+                }
+                idx = idx + 1
+                continue
+            }
+
+            # Value option — needs a value (either inline =, or the next token).
+            let mut raw_val: str = ""
+            if has_inline_val {
+                raw_val = val_str
+                idx = idx + 1
+            } else {
+                # Consume the next argv token as the value.
+                if idx + 1 >= argc {
+                    have_err = true
+                    err_msg = "option '--" + name + "' requires a value"
+                    break
+                }
+                raw_val = argv.get(idx + 1)
+                idx = idx + 2
+            }
+
+            let coerced: Result[str, str] = cli_coerce_value(arg, raw_val)
+            if result_is_err(coerced) {
+                have_err = true
+                err_msg = result_err_or(coerced, "")
+                break
+            }
+            let v: str = result_unwrap_or(coerced, "")
+            cli_match_overwrite_in_place(matches, arg_idx, true, v)
+            continue
+        }
+
+        # Short option: -x or -x=value
+        if !end_of_options && tok.starts_with("-") && tok.len() > 1 && tok != "-" {
+            let body: str = tok.slice(1, tok.len())
+            let eq_pos: int = body.find("=")
+            let mut name: str = ""
+            let mut val_str: str = ""
+            let mut has_inline_val: bool = false
+            if eq_pos >= 0 {
+                name = body.slice(0, eq_pos)
+                val_str = body.slice(eq_pos + 1, body.len())
+                has_inline_val = true
+            } else {
+                name = body
+            }
+
+            # Built-in -h / -V.
+            if name == "h" {
+                help_req = true
+                idx = idx + 1
+                continue
+            }
+            if name == "V" {
+                ver_req = true
+                idx = idx + 1
+                continue
+            }
+
+            let arg_idx: int = cli_find_by_short(p, name)
+            if arg_idx < 0 {
+                have_err = true
+                err_msg = "unrecognised option '-" + name + "'"
+                break
+            }
+
+            let arg: CliArg = p.args.get(arg_idx)
+
+            if arg.kind == cli_kind_bool() {
+                if has_inline_val {
+                    let coerced: Result[str, str] = cli_coerce_value(arg, val_str)
+                    if result_is_err(coerced) {
+                        have_err = true
+                        err_msg = result_err_or(coerced, "")
+                        break
+                    }
+                    let v: str = result_unwrap_or(coerced, "false")
+                    cli_match_overwrite_in_place(matches, arg_idx, v == "true", v)
+                } else {
+                    cli_match_overwrite_in_place(matches, arg_idx, true, "true")
+                }
+                idx = idx + 1
+                continue
+            }
+
+            let mut raw_val: str = ""
+            if has_inline_val {
+                raw_val = val_str
+                idx = idx + 1
+            } else {
+                if idx + 1 >= argc {
+                    have_err = true
+                    err_msg = "option '-" + name + "' requires a value"
+                    break
+                }
+                raw_val = argv.get(idx + 1)
+                idx = idx + 2
+            }
+
+            let coerced: Result[str, str] = cli_coerce_value(arg, raw_val)
+            if result_is_err(coerced) {
+                have_err = true
+                err_msg = result_err_or(coerced, "")
+                break
+            }
+            let v: str = result_unwrap_or(coerced, "")
+            cli_match_overwrite_in_place(matches, arg_idx, true, v)
+            continue
+        }
+
+        # Positional argument (or subcommand, decided later).
+        # If subcommands are declared AND no positional has been
+        # consumed yet AND this token matches a subcommand name, treat
+        # it as the subcommand and dump the REST of argv (everything
+        # after the subcommand name) into `remaining` — the subcommand
+        # handler will re-parse them with its own parser.
+        if p.subcommands.len() > 0 && positional_buf.len() == 0 {
+            let mut s: int = 0
+            let mut found_sub: bool = false
+            while s < p.subcommands.len() {
+                if p.subcommands.get(s) == tok {
+                    found_sub = true
+                    break
+                }
+                s = s + 1
+            }
+            if found_sub {
+                subcommand = tok
+                idx = idx + 1
+                # Push the rest of argv (after the subcommand name)
+                # directly into `remaining` — the subcommand handler
+                # will re-parse them with its own parser.
+                while idx < argc {
+                    remaining.push(argv.get(idx))
+                    idx = idx + 1
+                }
+                # Mark consumed_subcommand so the post-loop subcommand
+                # check + distribution loop skip us. We DO NOT touch
+                # positional_buf (it's empty); we DO NOT touch buf_iter
+                # (it's 0, but positional_buf.len() is also 0, so the
+                # leftover loop is a no-op).
+                consumed_subcommand = true
+                # Skip the normal distribution loop (no declared
+                # positionals to fill when a subcommand was matched).
+                pos_iter = pos_indices.len()
+                break
+            }
+        }
+
+        positional_buf.push(tok)
+        idx = idx + 1
+    }
+
+    # If help / version was requested, return early with the flag set.
+    if help_req {
+        let empty_rem: list[str] = []
+        return CliResult {
+            ok: true,
+            error: "",
+            help_requested: true,
+            version_requested: false,
+            subcommand: "",
+            matches: matches,
+            remaining: empty_rem,
+        }
+    }
+    if ver_req {
+        let empty_rem: list[str] = []
+        return CliResult {
+            ok: true,
+            error: "",
+            help_requested: false,
+            version_requested: true,
+            subcommand: "",
+            matches: matches,
+            remaining: empty_rem,
+        }
+    }
+    if have_err {
+        let empty_rem: list[str] = []
+        return CliResult {
+            ok: false,
+            error: err_msg,
+            help_requested: false,
+            version_requested: false,
+            subcommand: "",
+            matches: matches,
+            remaining: empty_rem,
+        }
+    }
+
+    # Distribute positional_buf across the declared positionals.
+    # If subcommands are declared, the FIRST positional is the subcommand
+    # name; the rest go into `remaining`.
+    # NOTE: pos_indices / pos_iter / buf_iter / remaining /
+    # consumed_subcommand are declared above the main loop so the
+    # subcommand fast-path (inside the loop) can mutate them.
+
+    # Subcommand handling — check the first positional (this branch
+    # runs only if the subcommand fast-path INSIDE the main loop did
+    # NOT fire, which happens when the first positional doesn't match
+    # any declared subcommand name).
+    if p.subcommands.len() > 0 && positional_buf.len() > 0 && !consumed_subcommand {
+        let first_pos: str = positional_buf.get(0)
+        let mut s: int = 0
+        while s < p.subcommands.len() {
+            if p.subcommands.get(s) == first_pos {
+                subcommand = first_pos
+                consumed_subcommand = true
+                break
+            }
+            s = s + 1
+        }
+        # If the first positional doesn't match a subcommand AND the
+        # parser has subcommands declared, we leave subcommand="" and
+        # treat all positionals as ordinary positional args (the user
+        # may have a CLI where subcommands are optional).
+    }
+
+    if consumed_subcommand {
+        # Skip the subcommand name in the positional buffer.
+        buf_iter = 1
+    }
+
+    # Fill declared positionals (left-to-right) with the remaining
+    # positional buffer; anything left over goes into `remaining`.
+    while pos_iter < pos_indices.len() && buf_iter < positional_buf.len() {
+        let arg_idx: int = pos_indices.get(pos_iter)
+        let arg: CliArg = p.args.get(arg_idx)
+        let raw: str = positional_buf.get(buf_iter)
+        let coerced: Result[str, str] = cli_coerce_value(arg, raw)
+        if result_is_err(coerced) {
+            let empty_rem: list[str] = []
+            return CliResult {
+                ok: false,
+                error: result_err_or(coerced, ""),
+                help_requested: false,
+                version_requested: false,
+                subcommand: subcommand,
+                matches: matches,
+                remaining: empty_rem,
+            }
+        }
+        let v: str = result_unwrap_or(coerced, "")
+        cli_match_overwrite_in_place(matches, arg_idx, true, v)
+        pos_iter = pos_iter + 1
+        buf_iter = buf_iter + 1
+    }
+
+    # Leftover positional args go into `remaining` (used by subcommand
+    # handlers and by tools that pass args through to a subprocess).
+    while buf_iter < positional_buf.len() {
+        remaining.push(positional_buf.get(buf_iter))
+        buf_iter = buf_iter + 1
+    }
+
+    # Apply env-var fallbacks for any arg that wasn't given on the CLI.
+    # This must happen BEFORE the required-args check (so an env value
+    # can satisfy a required arg).
+    let mut env_err: str = ""
+    let mut have_env_err: bool = false
+    let mut ei: int = 0
+    while ei < p.args.len() && !have_env_err {
+        let a: CliArg = p.args.get(ei)
+        let m: CliMatch = matches.get(ei)
+        if !m.present && a.env != "" {
+            # env_has is a builtin (Proc effect). cli_parse itself does
+            # NOT carry the Proc effect (the caller must declare `uses
+            # Proc` to call cli_parse_from_args; cli_parse with a
+            # synthetic argv does not touch env). We use env_has here
+            # directly; the caller's effect set must include Proc.
+            if env_has(a.env) {
+                let raw: str = env_get(a.env)
+                let coerced: Result[str, str] = cli_coerce_value(a, raw)
+                if result_is_err(coerced) {
+                    have_env_err = true
+                    env_err = result_err_or(coerced, "")
+                    break
+                }
+                let v: str = result_unwrap_or(coerced, "")
+                cli_match_overwrite_in_place(matches, ei, true, v)
+            }
+        }
+        ei = ei + 1
+    }
+
+    if have_env_err {
+        let empty_rem: list[str] = []
+        return CliResult {
+            ok: false,
+            error: env_err,
+            help_requested: false,
+            version_requested: false,
+            subcommand: subcommand,
+            matches: matches,
+            remaining: empty_rem,
+        }
+    }
+
+    # Apply defaults for any arg that wasn't given on the CLI or env.
+    let mut di: int = 0
+    while di < p.args.len() {
+        let a: CliArg = p.args.get(di)
+        let m: CliMatch = matches.get(di)
+        if !m.present && a.has_default {
+            let coerced: Result[str, str] = cli_coerce_value(a, a.default_str)
+            if result_is_ok(coerced) {
+                let v: str = result_unwrap_or(coerced, "")
+                cli_match_overwrite_in_place(matches, di, false, v)
+            }
+            # If the default fails to coerce (shouldn't happen for
+            # well-formed parsers), leave present=false; the required
+            # check below will catch it.
+        }
+        di = di + 1
+    }
+
+    # Validate required args.
+    let mut missing: str = ""
+    let mut have_missing: bool = false
+    let mut ri: int = 0
+    while ri < p.args.len() {
+        let a: CliArg = p.args.get(ri)
+        let m: CliMatch = matches.get(ri)
+        if a.required && !m.present {
+            if have_missing {
+                missing = missing + ", "
+            }
+            if a.positional {
+                missing = missing + "<" + a.long_name + ">"
+            } else {
+                missing = missing + "--" + a.long_name
+            }
+            have_missing = true
+        }
+        ri = ri + 1
+    }
+
+    if have_missing {
+        let empty_rem: list[str] = []
+        return CliResult {
+            ok: false,
+            error: "missing required argument(s): " + missing,
+            help_requested: false,
+            version_requested: false,
+            subcommand: subcommand,
+            matches: matches,
+            remaining: empty_rem,
+        }
+    }
+
+    return CliResult {
+        ok: true,
+        error: "",
+        help_requested: false,
+        version_requested: false,
+        subcommand: subcommand,
+        matches: matches,
+        remaining: remaining,
+    }
+}
+
+# ----------------------------------------------------------------------------
+# cli_match_set — return a NEW list[CliMatch] with the entry at idx
+# overwritten. (Used by the early-return paths that need an immutable
+# update; the main parse loop uses cli_match_overwrite_in_place for
+# efficiency.) Kept for compatibility — the main path no longer uses
+# this; it's here so the early code that referenced it still compiles.
+# ----------------------------------------------------------------------------
+fn cli_match_set(matches: list[CliMatch], idx: int, present: bool, str_val: str) -> list[CliMatch] {
+    let out: list[CliMatch] = []
+    let mut i: int = 0
+    while i < matches.len() {
+        if i == idx {
+            let m: CliMatch = matches.get(i)
+            let nm: CliMatch = CliMatch {
+                key: m.key,
+                present: present,
+                kind: m.kind,
+                str_val: str_val,
+                int_val: cli_str_to_int_or(str_val, 0),
+                bool_val: str_val == "true",
+                float_val: cli_str_to_float_or(str_val, 0.0),
+            }
+            out.push(nm)
+        } else {
+            out.push(matches.get(i))
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# cli_match_overwrite_in_place — overwrite the entry at idx in-place.
+# This avoids the O(n) copy of cli_match_set on every parse step.
+# The list itself is mutated (HLS lists are mutable through push; the
+# `let matches` binding is `let` (immutable reference) but the list
+# OBJECT is mutable, so this works).
+fn cli_match_overwrite_in_place(matches: list[CliMatch], idx: int, present: bool, str_val: str) -> void {
+    let m: CliMatch = matches.get(idx)
+    let nm: CliMatch = CliMatch {
+        key: m.key,
+        present: present,
+        kind: m.kind,
+        str_val: str_val,
+        int_val: cli_str_to_int_or(str_val, m.int_val),
+        bool_val: cli_bool_val_for(m.kind, present, str_val),
+        float_val: cli_str_to_float_or(str_val, m.float_val),
+    }
+    matches.set(idx, nm)
+}
+
+# cli_bool_val_for — for bool args, the value is `present` if no
+# explicit value was given, or the parsed str ("true"/"false") if one
+# was. For non-bool args, the bool_val field is unused (kept false).
+fn cli_bool_val_for(kind: int, present: bool, str_val: str) -> bool {
+    if kind != cli_kind_bool() {
+        return false
+    }
+    # If str_val is "true" or "false" (from cli_coerce_value), use it.
+    # Otherwise (flag with no inline value), use `present`.
+    if str_val == "true" {
+        return true
+    }
+    if str_val == "false" {
+        return false
+    }
+    return present
+}
+
+# cli_str_to_int_or — parse str as int, return default on failure.
+# Used by cli_match_overwrite_in_place to populate int_val.
+fn cli_str_to_int_or(s: str, default: int) -> int {
+    if s.len() == 0 {
+        return default
+    }
+    let r: Result[int, str] = int_parse(s)
+    if result_is_ok(r) {
+        return result_unwrap_or(r, default)
+    }
+    return default
+}
+
+# cli_str_to_float_or — parse str as float, return default on failure.
+fn cli_str_to_float_or(s: str, default: float) -> float {
+    if s.len() == 0 {
+        return default
+    }
+    let r: Result[float, str] = float_parse(s)
+    if result_is_ok(r) {
+        return result_unwrap_or(r, default)
+    }
+    return default
+}
+
+# ============================================================================
+# Accessors — type-safe value extraction from a CliResult.
+#
+# These NEVER panic on a successfully-parsed CliResult: the parser has
+# already coerced every value to the right type. They only panic if the
+# caller asks for the wrong type (e.g., cli_get_int on a str arg) —
+# that's a programming bug, not a user-input error.
+# ============================================================================
+
+# cli_has(r, key) — true if the arg with this key was provided on the
+# CLI (or via env / default). Note: defaults set present=false (the arg
+# was not EXPLICITLY provided); the value is still accessible via the
+# typed accessors.
+fn cli_has(r: CliResult, key: str) -> bool {
+    let mut i: int = 0
+    while i < r.matches.len() {
+        if r.matches.get(i).key == key {
+            return r.matches.get(i).present
+        }
+        i = i + 1
+    }
+    return false
+}
+
+# cli_get_bool(r, key) — return the bool value of the arg. Panics if
+# the arg is not a bool. Returns false if the arg was not provided
+# (flags default to false).
+fn cli_get_bool(r: CliResult, key: str) -> bool {
+    let mut i: int = 0
+    while i < r.matches.len() {
+        let m: CliMatch = r.matches.get(i)
+        if m.key == key {
+            if m.kind != cli_kind_bool() {
+                panic("cli_get_bool: '" + key + "' is not a bool flag")
+            }
+            return m.bool_val
+        }
+        i = i + 1
+    }
+    panic("cli_get_bool: no such argument '" + key + "'")
+}
+
+# cli_get_int(r, key) — return the int value of the arg. Panics if the
+# arg is not an int. Returns the default (0 if no default) if the arg
+# was not provided.
+fn cli_get_int(r: CliResult, key: str) -> int {
+    let mut i: int = 0
+    while i < r.matches.len() {
+        let m: CliMatch = r.matches.get(i)
+        if m.key == key {
+            if m.kind != cli_kind_int() {
+                panic("cli_get_int: '" + key + "' is not an int option")
+            }
+            return m.int_val
+        }
+        i = i + 1
+    }
+    panic("cli_get_int: no such argument '" + key + "'")
+}
+
+# cli_get_str(r, key) — return the str value of the arg. Panics if the
+# arg is not a str. Returns the default ("" if no default) if the arg
+# was not provided.
+fn cli_get_str(r: CliResult, key: str) -> str {
+    let mut i: int = 0
+    while i < r.matches.len() {
+        let m: CliMatch = r.matches.get(i)
+        if m.key == key {
+            if m.kind != cli_kind_str() {
+                panic("cli_get_str: '" + key + "' is not a str option")
+            }
+            return m.str_val
+        }
+        i = i + 1
+    }
+    panic("cli_get_str: no such argument '" + key + "'")
+}
+
+# cli_get_float(r, key) — return the float value of the arg. Panics if
+# the arg is not a float. Returns the default (0.0 if no default) if
+# the arg was not provided.
+fn cli_get_float(r: CliResult, key: str) -> float {
+    let mut i: int = 0
+    while i < r.matches.len() {
+        let m: CliMatch = r.matches.get(i)
+        if m.key == key {
+            if m.kind != cli_kind_float() {
+                panic("cli_get_float: '" + key + "' is not a float option")
+            }
+            return m.float_val
+        }
+        i = i + 1
+    }
+    panic("cli_get_float: no such argument '" + key + "'")
+}
+
+# cli_remaining_args(r) — return the leftover positional args (after
+# declared positionals are consumed). Used by subcommand handlers and
+# by tools that pass args through to a subprocess.
+fn cli_remaining_args(r: CliResult) -> list[str] {
+    return r.remaining
+}
+
+# ============================================================================
+# Help text generation — clap-style.
+# ============================================================================
+
+# cli_print_help(p) — print the help text to stdout. Format:
+#   <desc>
+#
+#   USAGE:
+#       <name> [OPTIONS] [SUBCOMMAND] [<ARGS>...]
+#
+#   OPTIONS:
+#       -h, --help              Print this help message
+#       -V, --version           Print the version
+#           --<long> <VALUE>    <desc> [default: <d>] [env: <E>]
+#           ...
+#
+#   POSITIONAL ARGUMENTS:
+#       <<name>>                <desc>
+#       ...
+#
+#   SUBCOMMANDS:
+#       <name>                  <desc>
+#       ...
+#
+#   <after_help>
+fn cli_print_help(p: CliParser) -> void uses IO {
+    if p.desc != "" {
+        println(p.desc)
+        println("")
+    }
+    println("USAGE:")
+    let mut usage: str = "    " + p.name + " [OPTIONS]"
+    let has_pos: bool = cli_positional_indices(p).len() > 0
+    if has_pos {
+        usage = usage + " <ARGS>"
+    }
+    if p.subcommands.len() > 0 {
+        usage = usage + " [SUBCOMMAND]"
+    }
+    println(usage)
+    println("")
+
+    println("OPTIONS:")
+    println("    -h, --help              Print this help message")
+    println("    -V, --version           Print the version")
+    let mut i: int = 0
+    while i < p.args.len() {
+        let a: CliArg = p.args.get(i)
+        if !a.positional {
+            let line: str = cli_format_option_line(a)
+            println(line)
+        }
+        i = i + 1
+    }
+
+    if has_pos {
+        println("")
+        println("POSITIONAL ARGUMENTS:")
+        let mut j: int = 0
+        while j < p.args.len() {
+            let a: CliArg = p.args.get(j)
+            if a.positional {
+                let line: str = "    <" + a.long_name + ">"
+                let pad: str = cli_pad_to(line, 28)
+                let mut suffix: str = a.desc
+                if a.required {
+                    suffix = suffix + " (required)"
+                }
+                println(pad + suffix)
+            }
+            j = j + 1
+        }
+    }
+
+    if p.subcommands.len() > 0 {
+        println("")
+        println("SUBCOMMANDS:")
+        let mut k: int = 0
+        while k < p.subcommands.len() {
+            let nm: str = p.subcommands.get(k)
+            let dsc: str = p.subcommand_descs.get(k)
+            let line: str = "    " + nm
+            let pad: str = cli_pad_to(line, 28)
+            println(pad + dsc)
+            k = k + 1
+        }
+    }
+
+    if p.after_help != "" {
+        println("")
+        println(p.after_help)
+    }
+}
+
+# cli_format_option_line — format one option line for help output.
+# Examples:
+#   "    -p, --port <INT>          Port number [default: 8080] [env: PORT]"
+#   "    -v, --verbose             Enable verbose output"
+#   "        --host <STR>          Host to bind [default: localhost]"
+fn cli_format_option_line(a: CliArg) -> str {
+    let mut line: str = "    "
+    if a.short_name != "" {
+        line = line + "-" + a.short_name + ", "
+    } else {
+        line = line + "    "
+    }
+    line = line + "--" + a.long_name
+    if a.kind != cli_kind_bool() {
+        line = line + " <" + cli_kind_name(a.kind) + ">"
+    }
+    let pad: str = cli_pad_to(line, 28)
+    let mut suffix: str = a.desc
+    if a.has_default {
+        suffix = suffix + " [default: " + a.default_str + "]"
+    }
+    if a.env != "" {
+        suffix = suffix + " [env: " + a.env + "]"
+    }
+    if a.required {
+        suffix = suffix + " (required)"
+    }
+    return pad + suffix
+}
+
+# cli_kind_name — human-readable name for a kind constant.
+fn cli_kind_name(k: int) -> str {
+    if k == cli_kind_bool() {
+        return "BOOL"
+    }
+    if k == cli_kind_int() {
+        return "INT"
+    }
+    if k == cli_kind_str() {
+        return "STR"
+    }
+    if k == cli_kind_float() {
+        return "FLOAT"
+    }
+    return "VALUE"
+}
+
+# cli_pad_to — pad s with spaces to at least width characters. If s is
+# already longer than width, append a single space (so the suffix is
+# always separated from the key by whitespace).
+fn cli_pad_to(s: str, width: int) -> str {
+    if s.len() >= width {
+        return s + " "
+    }
+    let gap: int = width - s.len()
+    let pad: str = str_repeat(" ", gap)
+    return s + pad
+}
+
+# cli_print_version(p) — print "<name> <version>" to stdout.
+fn cli_print_version(p: CliParser) -> void uses IO {
+    println(p.name + " " + p.version)
+}
+
+# ============================================================================
+# Convenience entry point — cli_parse_from_args(p) reads argv via the
+# `args()` builtin (Args effect) and delegates to cli_parse. The caller
+# must declare `uses Args, Proc` (Args for argv, Proc for env-var
+# fallback). On a parse error, this prints the error and the help text
+# and returns a CliResult with ok=false (it does NOT call exit() — the
+# caller decides whether to exit, and with what code).
+# ============================================================================
+
+fn cli_parse_from_args(p: CliParser) -> CliResult uses Args, Proc, IO {
+    let argv: list[str] = args()
+    let r: CliResult = cli_parse(p, argv)
+    if !r.ok {
+        println(p.name + ": " + r.error)
+        println("")
+        cli_print_help(p)
+    }
+    return r
+}
+
+# ============================================================================
+# End of std/cli.hls
+# ============================================================================

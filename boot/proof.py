@@ -1059,7 +1059,25 @@ def const_eval(e, consts):
                     q = abs(l) // abs(r)
                     q = q if (l >= 0) == (r >= 0) else -q
                     return l - q * r
-                return l % r
+                # Stage 53 deep-scan-22 fix (MEDIUM severity): float %
+                # must use math.fmod (truncated modulo — sign of the
+                # dividend), matching f64_mod in interp.py and the C
+                # runtime's hl_fmod (which calls libm fmod). Python's
+                # built-in % operator on floats uses FLOORED modulo
+                # (sign of the divisor), so -7.0 % 3.0 = 2.0 in Python
+                # but math.fmod(-7.0, 3.0) = -1.0. A contract using
+                # float % would const-eval to a different value than
+                # the runtime produces — a soundness gap (const-eval
+                # says "satisfied" but runtime panics with --contracts).
+                # Note: after the args_are_const fix above, float
+                # params no longer trigger const_eval via the checker,
+                # but this path is still reachable for tools that call
+                # const_eval directly.
+                try:
+                    import math
+                    return math.fmod(l, r)
+                except (ValueError, TypeError):
+                    return None
             if op == "==":
                 return l == r
             if op == "!=":
@@ -1088,11 +1106,26 @@ def const_eval(e, consts):
 
 
 def args_are_const(fn, arg_exprs):
-    """If every argument expression is a literal (int/float/bool/str),
-    return {param_name: value}; else None."""
+    """If every argument expression is a literal (int/bool/str),
+    return {param_name: value}; else None.
+
+    Stage 53 deep-scan-22 fix (HIGH severity): differential mismatch
+    with the native const-eval (src/hlc.hls args_const_hlc). The
+    native rejects FLOAT params (returns false for `pt == "float"`,
+    falling through to the `else { return false }` branch), so a
+    contracted fn called with float literals is NOT constant-evaluated
+    by the native — the precondition defers to runtime. The boot
+    previously accepted float literals and const-evaluated the
+    contract, so a provably-false float contract (e.g.
+    `fn f(x: float) requires x > 5.0` called with `f(1.0)`) produced
+    a compile error in the boot but compiled cleanly in the native
+    (deferred to runtime, which then ran "ok" without --contracts).
+    Removing "float" from the accepted literal kinds makes the boot
+    defer float contracts to runtime, matching the native byte-for-
+    byte in differential testing."""
     consts = {}
     for (pn, pt, _), a in zip(fn["params"], arg_exprs):
-        if not isinstance(a, dict) or a.get("k") not in ("int", "float", "bool", "str"):
+        if not isinstance(a, dict) or a.get("k") not in ("int", "bool", "str"):
             return None
         consts[pn] = a["v"]
     return consts

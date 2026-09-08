@@ -379,7 +379,18 @@ def run_cli():
         )
         return 2
     path = rest[0]
-    prog_args = [a.encode("utf-8") for a in rest]
+    # Stage 53 deep-scan-22 fix (MEDIUM): encode program args with
+    # `surrogateescape` (not plain utf-8) so non-UTF-8 argv bytes round-
+    # trip byte-exact. Python's sys.argv is decoded with surrogateescape
+    # on Linux (the filesystem encoding), so a non-UTF-8 arg (e.g. a
+    # filename with 0xff) becomes a str with lone surrogates — and
+    # `str.encode("utf-8")` raises UnicodeEncodeError on lone surrogates,
+    # crashing the boot before the program even runs. The C runtime's
+    # hl_init_args takes raw `char** argv` (no decoding), so this was a
+    # differential mismatch: the native binary handled non-UTF-8 args
+    # fine, the boot crashed. `surrogateescape` restores the original
+    # bytes verbatim (matching the C behaviour).
+    prog_args = [a.encode("utf-8", "surrogateescape") for a in rest]
     try:
         program = load_program(path)
     except HLError as ex:

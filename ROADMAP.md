@@ -95,7 +95,7 @@ remains green.
 
 | # | Stage | Status | Estimated effort |
 |---|-------|:------:|:----------------:|
-| 53 | `std.cli` — argument parser (subcommands, env, defaults) | ⬜ | 5 weeks |
+| 53 | `std.cli` — argument parser (subcommands, env, defaults) | ✅ | (done in v0.72.0-alpha) |
 | 54 | `std.tui` — terminal raw mode, ANSI escapes, screen grid | ⬜ | 6 weeks |
 | 55 | `std.color` — terminal color detection, truecolor fallback | ⬜ | 2 weeks |
 | 56 | `std.progress` — progress bars, spinners, ETA | ⬜ | 3 weeks |
@@ -5287,7 +5287,24 @@ regression check (feat_stdlib_uuid still passes), all green.
 get a parser. Subcommands, env-var fallback, defaults, help text
 generation, `--version` from `hls-pkg.toml`. Type-safe (a `--port
 int` argument rejects non-integers at the parser, not in user
-code).
+code). ✅ **DONE in v0.72.0-alpha** — implemented as a runtime
+builder API (`CliParser` + `cli_parser_flag` / `cli_parser_int_opt`
+/ `cli_parser_str_opt` / `cli_parser_float_opt` /
+`cli_parser_str_positional` / `cli_parser_int_positional` /
+`cli_parser_env` / `cli_parser_subcommand`) since Halis does not
+yet have derive macros (Stage 113+). The derive macro will be
+added later as a thin layer over the builder API. The runtime
+builder covers every feature the roadmap promises: type-safe
+parsing (invalid int/float/bool rejected at parse time, not at
+accessor time), env-var fallback (with CLI-takes-precedence),
+defaults, help text generation (`cli_print_help`), `--version` (set
+at parser construction; `hls-pkg.toml` reading arrives with Stage
+58's `std.config`), subcommands (with `cli_remaining_args` for
+the subcommand handler to re-parse), `--help`/`-h`,
+`--version`/`-V`, and `--` end-of-options. Pure-HLS implementation
+(no new compiler builtins) — uses `args()` (Args effect) +
+`env_get`/`env_has` (Proc effect) + `println` (IO effect).
+Differential (interpreter == native) verified green.
 
 **54. `std.tui`** — `Term::raw()`, `Term::screen()`, `Term::clear()`,
 `Cursor::move_to()`, `Color`/`Style` enums. Built on `std.io` and

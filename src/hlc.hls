@@ -4644,13 +4644,30 @@ fn iv_top() -> IVal {
     return IVal { lo: INF_LO(), hi: INF_HI() }
 }
 
+# Stage 53 deep-scan-22 fix (HIGH): interval-arithmetic helpers must not
+# crash the compiler when their fixed-point int64 arithmetic would
+# overflow. Previously, `requires a == 5000000000000000000 && b == ...`
+# with a body `a + b` (or `a * b`, or `-a + b` with a == INT64_MIN)
+# panicked the compiler during the proof pass with "integer overflow"
+# — the interp's Python proof engine (arbitrary precision) handled it
+# fine, so this was also a differential mismatch. The fix is the
+# standard pre-check: if the operation would overflow int64, return
+# TOP for the affected bound (the prover loses precision but does not
+# crash). Sentinel bounds (INF_LO/INF_HI) are excluded as before.
+
 fn iv_add(a: IVal, b: IVal) -> IVal {
     let mut lo: int = INF_LO()
     if a.lo != INF_LO() && b.lo != INF_LO() {
+        if (b.lo > 0 && a.lo > INF_HI() - b.lo) || (b.lo < 0 && a.lo < INF_LO() - b.lo) {
+            return iv_top()
+        }
         lo = a.lo + b.lo
     }
     let mut hi: int = INF_HI()
     if a.hi != INF_HI() && b.hi != INF_HI() {
+        if (b.hi > 0 && a.hi > INF_HI() - b.hi) || (b.hi < 0 && a.hi < INF_LO() - b.hi) {
+            return iv_top()
+        }
         hi = a.hi + b.hi
     }
     return IVal { lo: lo, hi: hi }
@@ -4659,10 +4676,16 @@ fn iv_add(a: IVal, b: IVal) -> IVal {
 fn iv_sub(a: IVal, b: IVal) -> IVal {
     let mut lo: int = INF_LO()
     if a.lo != INF_LO() && b.hi != INF_HI() {
+        if (b.hi < 0 && a.lo > INF_HI() + b.hi) || (b.hi > 0 && a.lo < INF_LO() + b.hi) {
+            return iv_top()
+        }
         lo = a.lo - b.hi
     }
     let mut hi: int = INF_HI()
     if a.hi != INF_HI() && b.lo != INF_LO() {
+        if (b.lo < 0 && a.hi > INF_HI() + b.lo) || (b.lo > 0 && a.hi < INF_LO() + b.lo) {
+            return iv_top()
+        }
         hi = a.hi - b.lo
     }
     return IVal { lo: lo, hi: hi }
@@ -4672,6 +4695,15 @@ fn iv_mul(a: IVal, b: IVal) -> IVal {
     # Conservative: any sentinel bound (or a product corner that itself
     # hits a sentinel) yields TOP.
     if a.lo == INF_LO() || a.hi == INF_HI() || b.lo == INF_LO() || b.hi == INF_HI() {
+        return iv_top()
+    }
+    # Stage 53 deep-scan-22 fix (HIGH): guard each product corner against
+    # int64 overflow BEFORE computing. |x*y| > INT64_MAX iff (|x|,|y|!=0
+    # and |x| > INT64_MAX / |y|). INT64_MIN * anything other than 0/1
+    # also overflows (it is folded to TOP, the sentinel-equals-result
+    # case below was previously dead code because the panic fired first).
+    if !iv_mul_ok(a.lo, b.lo) || !iv_mul_ok(a.lo, b.hi)
+        || !iv_mul_ok(a.hi, b.lo) || !iv_mul_ok(a.hi, b.hi) {
         return iv_top()
     }
     let c1: int = a.lo * b.lo
@@ -4705,13 +4737,45 @@ fn iv_mul(a: IVal, b: IVal) -> IVal {
     return IVal { lo: lo, hi: hi }
 }
 
+# iv_mul_ok: would a * b fit in int64 without overflow? Used by iv_mul.
+fn iv_mul_ok(a: int, b: int) -> bool {
+    if a == 0 || b == 0 {
+        return true
+    }
+    # INT64_MIN (== INF_LO) * x: only x == 0 (handled above) or x == 1
+    # avoids overflow (and x == 1 yields INT64_MIN itself — sentinel).
+    if a == INF_LO() {
+        return b == 1
+    }
+    if b == INF_LO() {
+        return a == 1
+    }
+    let mut aa: int = a
+    if aa < 0 {
+        aa = -aa
+    }
+    let mut bb: int = b
+    if bb < 0 {
+        bb = -bb
+    }
+    return aa <= INF_HI() / bb
+}
+
 fn iv_neg(a: IVal) -> IVal {
     let mut lo: int = INF_LO()
     if a.hi != INF_HI() {
+        # Stage 53 deep-scan-22 fix (HIGH): -INT64_MIN overflows int64.
+        # When a.hi is INT64_MIN (== INF_LO sentinel), the negation
+        # crashes the compiler; return TOP instead (loses precision).
+        if a.hi == INF_LO() {
+            return iv_top()
+        }
         lo = -a.hi
     }
     let mut hi: int = INF_HI()
     if a.lo != INF_LO() {
+        # a.lo is not INT64_MIN here (excluded by the outer test), so
+        # -a.lo is in [-INT64_MAX, INT64_MAX] — no overflow possible.
         hi = -a.lo
     }
     return IVal { lo: lo, hi: hi }
@@ -5373,8 +5437,17 @@ fn annotate_stmts(ctx: Ctx, stmts: list[int], facts: map[str, IVal],
                 if is_const_range(ctx, s.iter) {
                     # deep-scan-10: range(a, b) iterates a..b-1 - the old
                     # [0, count-1] was wrong on BOTH bounds when a != 0.
-                    f_body2.set(s.name, IVal { lo: const_range_a(ctx, s.iter),
-                                               hi: const_range_b(ctx, s.iter) - 1 })
+                    # Stage 53 deep-scan-22 fix (HIGH): if b == INT64_MIN,
+                    # b - 1 overflows int64 and crashes the compiler
+                    # (range(a, INT64_MIN) is empty for any a >= INT64_MIN,
+                    # so the loop var has no value — set TOP).
+                    let rb: int = const_range_b(ctx, s.iter)
+                    if rb == INF_LO() {
+                        f_body2.set(s.name, iv_top())
+                    } else {
+                        f_body2.set(s.name, IVal { lo: const_range_a(ctx, s.iter),
+                                                   hi: rb - 1 })
+                    }
                 } else {
                     # deep-scan-10: iterating a list yields arbitrary
                     # element values - TOP, not [0, +inf).
@@ -5887,28 +5960,61 @@ fn expr_const_val(ctx: Ctx, e: int, consts: map[str, int]) -> int {
         return consts.get_or(n.name, 0)
     }
     if n.kind == "un" && n.op == "-" {
-        return -expr_const_val(ctx, n.left, consts)
+        let v: int = expr_const_val(ctx, n.left, consts)
+        # Stage 53 deep-scan-22 fix (HIGH): -INT64_MIN overflows int64
+        # and crashed the compiler when a `requires -a > 0` clause was
+        # const-evaluated with a == INT64_MIN. The interp's Python
+        # const_eval uses arbitrary precision; we cannot match exactly,
+        # so return INF_HI as a sentinel — the downstream comparison
+        # may give a wrong answer in the corner case, but the compiler
+        # no longer crashes (and runtime --contracts checking still
+        # catches actual violations).
+        if v == INF_LO() {
+            return INF_HI()
+        }
+        return -v
     }
     if n.kind == "bin" {
         let lv: int = expr_const_val(ctx, n.left, consts)
         let rv: int = expr_const_val(ctx, n.right, consts)
         if n.op == "+" {
+            # Stage 53 deep-scan-22 fix (HIGH): same overflow class as
+            # iv_add. Return INF_HI sentinel on overflow.
+            if (rv > 0 && lv > INF_HI() - rv) || (rv < 0 && lv < INF_LO() - rv) {
+                return INF_HI()
+            }
             return lv + rv
         }
         if n.op == "-" {
+            if (rv < 0 && lv > INF_HI() + rv) || (rv > 0 && lv < INF_LO() + rv) {
+                return INF_HI()
+            }
             return lv - rv
         }
         if n.op == "*" {
+            if !iv_mul_ok(lv, rv) {
+                return INF_HI()
+            }
             return lv * rv
         }
         if n.op == "/" {
             if rv == 0 {
                 return 0
             }
+            # Stage 53 deep-scan-22 fix (HIGH): INT64_MIN / -1 is the
+            # unique division overflow corner (mirrors hl_div_i64).
+            if lv == INF_LO() && rv == -1 {
+                return INF_HI()
+            }
             return lv / rv
         }
         if n.op == "%" {
             if rv == 0 {
+                return 0
+            }
+            # Stage 53 deep-scan-22 fix (HIGH): INT64_MIN % -1 panics
+            # in hl_mod_i64 even though the mathematical result is 0.
+            if lv == INF_LO() && rv == -1 {
                 return 0
             }
             return lv % rv
@@ -11106,7 +11212,15 @@ fn runtime_lines() -> list[str] {
     # exit code (0 on success, 1..255 on failure, 128+signum on signal
     # kill). Consumes the cmd argument. The checker enforces that the
     # command is not tainted (proc_exec is a taint sink).
+    #
+    # Stage 53 deep-scan-22 fix (MEDIUM): fflush(stdout) before system()
+    # so the child's output ordering matches the parent's println output.
+    # Without this, block-buffered stdout (when piped to a file or
+    # another process) delays the parent's println output until after
+    # the child's printf output appears — a differential mismatch with
+    # the interpreter (which uses Python's line-buffered sys.stdout).
     r.push("static int64_t hl_proc_exec(hl_str* cmd) {")
+    r.push("    fflush(stdout);")
     r.push("    int rc = system(cmd->data);")
     r.push("    hl_str_release(cmd);")
     r.push("    if (rc == -1) {")
@@ -11197,6 +11311,12 @@ fn runtime_lines() -> list[str] {
     r.push("        hl_list_release(args);")
     r.push("        return -1;")
     r.push("    }")
+    # Stage 53 deep-scan-22 fix (MEDIUM): fflush stdout before fork() so
+    # the child's output ordering matches the parent's println output
+    # (same rationale as hl_proc_exec above). Without this, block-buffered
+    # stdout delays the parent's pending println until after the child's
+    # output appears — a differential mismatch with the interpreter.
+    r.push("    fflush(stdout);")
     r.push("    pid_t pid = fork();")
     r.push("    if (pid < 0) {")
     r.push("        if (in_pipe[0] != -1) close(in_pipe[0]);")
@@ -12251,6 +12371,32 @@ fn local_c(ctx: Ctx, name: str) -> str {
         panic("internal codegen error: variable not found " + name)
     }
     return cn
+}
+
+# c_field_name(name) — mangle a HLS struct field name into a valid C
+# identifier. HLS allows field names that collide with C reserved
+# words (long, short, int, char, double, float, default, void,
+# unsigned, signed, register, volatile, const, static, extern, auto,
+# break, case, continue, do, else, for, goto, if, return, sizeof,
+# struct, switch, typedef, union, while, inline, restrict, _Bool,
+# _Complex, _Imaginary). The C codegen would fail to compile if
+# these were emitted verbatim as field names. We prefix ALL field
+# names with "f_" uniformly — every field declaration, field access,
+# field assignment, constructor parameter, release call, and clone
+# call uses c_field_name — so the mangling is invisible to the HLS
+# source (the HLS code still writes `obj.long`, the C code uses
+# `obj->f_long`).
+#
+# This fixes a HIGH-severity soundness bug discovered during the
+# Stage 53 deep scan: a struct field named `long` or `short` (which
+# are perfectly valid HLS identifiers) produced C code that failed
+# to compile with errors like "expected identifier or '(' before
+# 'long'". The fix is uniform mangling — no field name can collide
+# with a C keyword, ever.
+#
+# Stage 53 deep-scan fix (HIGH severity).
+fn c_field_name(name: str) -> str {
+    return "f_" + name
 }
 
 # ============================================================================
@@ -15152,7 +15298,7 @@ fn gen_expr(ctx: Ctx, e: int) -> str {
         return gen_unbox(ctx, ctx.exprs[e].t, getter + "(" + lst + ", " + idx + ")")
     }
     if k == "field" {
-        return "(" + gen_expr(ctx, ctx.exprs[e].left) + ")->" + ctx.exprs[e].name
+        return "(" + gen_expr(ctx, ctx.exprs[e].left) + ")->" + c_field_name(ctx.exprs[e].name)
     }
     if k == "call" {
         return gen_call(ctx, e)
@@ -18197,7 +18343,7 @@ fn gen_assign(ctx: Ctx, s: StmtN, ind: str) -> void {
         let base_t: str = ctx.exprs[ctx.exprs[tgt].left].t
         let base: str = gen_expr(ctx, ctx.exprs[tgt].left)
         let ftype: str = ctx.exprs[tgt].t
-        let fname: str = ctx.exprs[tgt].name
+        let fname: str = c_field_name(ctx.exprs[tgt].name)
         if is_ptr_t(ctx, ftype) {
             # Materialise the base once (calling it twice would
             # double-evaluate), then store-then-release.
@@ -18533,7 +18679,7 @@ fn gen_one_struct_full(ctx: Ctx, c_name: str, st: StructInfo, targs: list[str]) 
         } else {
             inst_ftype = ftype
         }
-        out.push("    " + c_type(ctx, inst_ftype) + " " + st.fields.get(j) + ";")
+        out.push("    " + c_type(ctx, inst_ftype) + " " + c_field_name(st.fields.get(j)) + ";")
         j = j + 1
     }
     out.push("} " + c_name + ";")
@@ -18554,8 +18700,9 @@ fn gen_one_struct_full(ctx: Ctx, c_name: str, st: StructInfo, targs: list[str]) 
         } else {
             inst_ftype = ftype
         }
-        ptypes_c.push(c_type(ctx, inst_ftype) + " " + st.fields.get(j2))
-        assigns.push("    p->" + st.fields.get(j2) + " = " + st.fields.get(j2) + ";")
+        let cfn: str = c_field_name(st.fields.get(j2))
+        ptypes_c.push(c_type(ctx, inst_ftype) + " " + cfn)
+        assigns.push("    p->" + cfn + " = " + cfn + ";")
         j2 = j2 + 1
     }
     out.push("static " + c_name + "* usf_new_" + c_name + "(" + join(ptypes_c, ", ") + ") {")
@@ -18593,7 +18740,7 @@ fn gen_struct_release_lines(ctx: Ctx, c_name: str, st: StructInfo, targs: list[s
             inst_ftype = ftype
         }
         if is_ptr_t(ctx, inst_ftype) {
-            out.push("        " + release_call(ctx, inst_ftype, "p->" + st.fields.get(j)) + ";")
+            out.push("        " + release_call(ctx, inst_ftype, "p->" + c_field_name(st.fields.get(j))) + ";")
         }
         j = j + 1
     }
@@ -19158,7 +19305,8 @@ fn gen_clone_struct_lines(ctx: Ctx, tt: str) -> list[str] {
         if st.typeparams.len() > 0 && targs.len() == st.typeparams.len() {
             inst_ftype = instantiate_type(ftype, st.typeparams, targs)
         }
-        out.push("    r->" + st.fields.get(j) + " = " + clone_expr_for(ctx, inst_ftype, "p->" + st.fields.get(j)) + ";")
+        let cfn: str = c_field_name(st.fields.get(j))
+        out.push("    r->" + cfn + " = " + clone_expr_for(ctx, inst_ftype, "p->" + cfn) + ";")
         j = j + 1
     }
     out.push("    return r;")

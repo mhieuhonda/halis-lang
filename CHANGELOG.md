@@ -13,6 +13,183 @@ stability (125–140), and final stabilisation toward v1.0 (141–150).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
+## [v0.72.0-alpha] — Stage 53: std.cli (type-safe CLI argument parser)
+
+> Opens **Phase IV (CLI tooling track, Stages 53–62)**.
+> Adds `std.cli` — a type-safe argument parser with subcommands,
+> env-var fallback, defaults, help text generation, and `--version`.
+> Pure-HLS implementation (no new compiler builtins): uses `args()`
+> (Args effect) for argv, `env_get`/`env_has` (Proc effect) for
+> env-var fallback, and `println` (IO effect) for help/version
+> output. The API is a runtime builder pattern (`CliParser` +
+> `cli_parser_flag` / `cli_parser_int_opt` / `cli_parser_str_opt` /
+> `cli_parser_float_opt` / `cli_parser_str_positional` /
+> `cli_parser_int_positional` / `cli_parser_env` /
+> `cli_parser_subcommand`). The roadmap's `cli::Parser` derive macro
+> will be added later as a thin layer over this builder API when
+> derive macros arrive (Stage 113+).
+
+### Added — Stage 53 (v0.72.0-alpha)
+
+- **Type-safe argument parsing** — `--port int` arguments reject
+  non-integers at PARSE time, not at accessor time:
+  - `cli_parse(parser, ["app", "--port=abc"])` returns
+    `CliResult { ok: false, error: "invalid integer value 'abc' for
+    --port (invalid character in integer literal)" }`.
+  - The type-safe accessors (`cli_get_bool`, `cli_get_int`,
+    `cli_get_str`, `cli_get_float`) NEVER panic on a
+    successfully-parsed `CliResult` — the parser has already
+    coerced every value to the right type. They only panic if the
+    caller asks for the wrong type (e.g., `cli_get_int` on a str
+    arg) — that's a programming bug, not a user-input error.
+
+- **CliParser builder** — immutable-update pattern (same convention
+  as `std.process.Command` and `std.thread.ThreadBuilder`):
+  - `cli_parser_new(name, version) -> CliParser`
+  - `cli_parser_desc(p, desc) -> CliParser`
+  - `cli_parser_after_help(p, text) -> CliParser`
+  - `cli_parser_flag(p, long, short, desc) -> CliParser` — bool flag
+  - `cli_parser_int_opt(p, long, short, desc, required, default) -> CliParser`
+  - `cli_parser_int_opt_no_default(p, long, short, desc, required) -> CliParser`
+  - `cli_parser_str_opt(p, long, short, desc, required, default) -> CliParser`
+  - `cli_parser_str_opt_no_default(p, long, short, desc, required) -> CliParser`
+  - `cli_parser_float_opt(p, long, short, desc, required, default) -> CliParser`
+  - `cli_parser_float_opt_no_default(p, long, short, desc, required) -> CliParser`
+  - `cli_parser_str_positional(p, name, desc, required) -> CliParser`
+  - `cli_parser_int_positional(p, name, desc, required) -> CliParser`
+  - `cli_parser_env(p, long, env_var) -> CliParser` — register env fallback
+  - `cli_parser_subcommand(p, name, desc) -> CliParser`
+
+- **Argument syntax supported**:
+  - Long options: `--port 8080` (separate value) and `--port=8080`
+    (inline value).
+  - Short options: `-p 8080` (separate value) and `-p=8080` (inline
+    value).
+  - Bool flags: `--verbose` / `-v` (presence = true) and
+    `--verbose=true` / `--verbose=false` / `--verbose=1` / `--verbose=0`
+    (explicit value).
+  - `--` end-of-options marker: everything after `--` is treated as
+    a positional argument (so `app -- --weird-filename` puts
+    `--weird-filename` into the `input` positional, not interpreted
+    as an option).
+  - `-` (single dash) is treated as a positional argument (matching
+    the Unix convention of using `-` to mean stdin).
+
+- **Built-in flags (always registered)**:
+  - `--help` / `-h` — sets `CliResult.help_requested`; the caller
+    calls `cli_print_help(parser)` to print the help text.
+  - `--version` / `-V` — sets `CliResult.version_requested`; the
+    caller calls `cli_print_version(parser)` to print
+    `<name> <version>`.
+
+- **Env-var fallback** — for any option, the caller can register an
+  env-var name via `cli_parser_env(parser, "port", "PORT")`. At
+  parse time, if the option was not given on the command line, the
+  parser looks it up in the environment. CLI takes precedence over
+  env, env takes precedence over default.
+
+- **Subcommands** — `cli_parser_subcommand(parser, "init",
+  "Initialize a new project")` declares a subcommand. If the first
+  non-option argument matches a subcommand name,
+  `CliResult.subcommand` is set to it and the remaining args are
+  available via `cli_remaining_args(result)` — the subcommand
+  handler can re-parse them with its own `CliParser`.
+
+- **Defaults** — int/str/float options can have a default value.
+  When the option is not given on the CLI AND not in env, the
+  default is used. `cli_has(result, key)` distinguishes "provided
+  on CLI or env" (`true`) from "default" (`false`); the typed
+  accessors always return the value (provided or default).
+
+- **Required arg validation** — `cli_parser_int_opt(..., required=true, ...)`
+  and `cli_parser_str_positional(..., required=true)` mark args as
+  required. At parse time, if a required arg is missing AND has no
+  default AND no env value, the parser returns
+  `CliResult { ok: false, error: "missing required argument(s):
+  --name, <input>" }`.
+
+- **Help text generation** — `cli_print_help(parser)` produces a
+  clap-style help message: usage, options table (with short/long/
+  desc/default/env/required annotations), positional arguments
+  table, subcommands table, and the optional after-help text.
+
+- **Type-safe accessors**:
+  - `cli_get_bool(result, key) -> bool` — panics if the arg is not a bool
+  - `cli_get_int(result, key) -> int` — panics if the arg is not an int
+  - `cli_get_str(result, key) -> str` — panics if the arg is not a str
+  - `cli_get_float(result, key) -> float` — panics if the arg is not a float
+  - `cli_has(result, key) -> bool` — true if the arg was provided on
+    CLI or env (false if it's a default)
+  - `cli_remaining_args(result) -> list[str]` — leftover positionals
+    (after declared positionals are consumed; used by subcommand
+    handlers)
+
+- **Convenience entry point** — `cli_parse_from_args(parser)` reads
+  argv via the `args()` builtin (Args effect) and delegates to
+  `cli_parse`. On a parse error, it prints the error and the help
+  text. The caller decides whether to exit, and with what code.
+
+- **Differential parity (interpreter == native)** — all operations
+  are pure string/int/list operations. The differential test
+  (`tests/ok/feat_stage53_cli.hls`) uses synthetic argv lists so
+  it's fully reproducible and byte-identical between backends.
+
+- **Demo** — `examples/cli_demo.hls` exercises every feature with
+  12 parse cases (typical invocation, short option, defaults,
+  --help, -V, subcommand init, subcommand build with extra args,
+  -- end-of-options, invalid int, unknown option, float value,
+  short option with =value).
+
+- **Acceptance test** — `tests/ok/feat_stage53_cli.hls` covers 22
+  test cases: typical invocation, short option, defaults, --help,
+  --version, subcommand init, subcommand build with extra args,
+  -- end-of-options, invalid int/float rejection, unknown option
+  rejection, valid float, short option with =value, bool flag with
+  explicit value, missing required rejection, env-var fallback,
+  cli_has vs default, int positional, help output smoke test,
+  version output smoke test, bool flag presence, option missing
+  value error.
+
+### Changed — Stage 53 (v0.72.0-alpha)
+
+- **Makefile** — added `cli-acceptance` target that runs the demo
+  and acceptance test under both backends (interpreter + native)
+  and verifies byte-identical output. Added `cli-acceptance` to
+  the top-level `.PHONY` line.
+
+- **ROADMAP.md** — marked Stage 53 as ✅ complete in the Phase IV
+  table and added a detailed description of the implementation to
+  the Stages 53–62 section.
+
+### Limitations (deferred to later stages)
+
+- **No `cli::Parser` derive macro** — the runtime builder API is
+  the v1.0 API. The derive macro arrives with Stage 113+ (derive
+  macros); it will be a thin layer that generates builder calls
+  from struct declarations.
+
+- **No short-flag combining** (`-abc` = `-a -b -c`) — the parser
+  treats `-abc` as a single short option named "abc" (which will
+  fail to match and produce a clean error). A future perfection
+  stage may add combining.
+
+- **No multi-value options** (e.g., `--file a --file b`) — a future
+  perfection stage may add `cli_parser_str_multi`.
+
+- **No abbreviations / prefix matching** (e.g., `--ver` matching
+  `--version`) — intentionally omitted; abbreviations are ambiguous
+  and a common source of bugs.
+
+- **No `--version` from `hls-pkg.toml`** — the version is provided
+  by the user at parser construction (`cli_parser_new(name,
+  version)`). Reading it from `hls-pkg.toml` arrives with Stage
+  58's `std.config`.
+
+- **`cli_parse_from_args` calls `cli_print_help` on error** —
+  this is convenient but may surprise callers who want to handle
+  errors themselves. Use `cli_parse(parser, args())` directly if
+  you want full control.
+
 ## [v0.71.0-alpha] — Stage 52: std.uuid v7 + std.ulid (lexicographically sortable)
 
 > Completes **Phase III (Standard library expansion, Stages 35–52)**.
