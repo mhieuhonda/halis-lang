@@ -202,7 +202,7 @@ def tokenize(src):
                     # >= 4300 digits raise ValueError, which used to escape
                     # as a raw traceback (not an HLError) and crash the CLI.
                     raise HLError("integer literal too large: %s digits"
-                                  % len(text), line, col)
+                                  % len(text), line, col) from None
                 if iv > 9223372036854775808:
                     # Up to 2^63 exactly is allowed THROUGH the lexer: the
                     # parser folds `-` + `9223372036854775808` into the int64

@@ -766,7 +766,7 @@ class Interp:
                     if not self._truthy(self.eval_expr(fn["ensures"], env)):
                         raise HLPanic("contract violation: ensures of '%s' "
                                       "(function postcondition failed at "
-                                      "runtime)" % fn["name"], self.line)
+                                      "runtime)" % fn["name"], self.line) from None
                 return r.value
             finally:
                 # Deep-scan-15 fix (LOW severity / defensive): the prior
@@ -823,7 +823,7 @@ class Interp:
                 Interp._libc = ctypes.CDLL(None)
             except OSError as ex:
                 raise HLPanic("cannot load libc for extern call: %s" % ex,
-                              getattr(self, "line", 0))
+                              getattr(self, "line", 0)) from None
         return self._libc
 
     def call_extern(self, fn, args):
@@ -853,7 +853,7 @@ class Interp:
             c_fn = getattr(libc, name)
         except AttributeError:
             raise HLPanic("extern function not found in libc: %s" % name,
-                          getattr(self, "line", 0))
+                          getattr(self, "line", 0)) from None
         # Set up the argument types.
         c_argtypes = []
         c_args = []
@@ -918,14 +918,14 @@ class Interp:
                 except AttributeError:
                     raise HLPanic(
                         "extern function not found in libc: %s" % name,
-                        getattr(self, "line", 0))
+                        getattr(self, "line", 0)) from None
                 Interp._extern_cache[cache_key] = c_fn
         # Call.
         try:
             result = c_fn(*c_args)
         except Exception as ex:
             raise HLPanic("extern call to '%s' failed: %s" % (name, ex),
-                          getattr(self, "line", 0))
+                          getattr(self, "line", 0)) from None
         # Convert the return value back to HLS runtime values.
         if ret == "int":
             return int(result) if result is not None else 0
@@ -1471,7 +1471,7 @@ class Interp:
                 with open(resolved, "rb") as f:
                     return f.read()
             except OSError:
-                raise HLPanic("cannot open file: %s" % to_display(args[0]), line)
+                raise HLPanic("cannot open file: %s" % to_display(args[0]), line) from None
         # Stage 10-beta: read_file_tainted(path) — same as read_file but
         # the returned str is wrapped as tainted[str]. The wrapper dict
         # format is identical to taint_mark's output.
@@ -1482,7 +1482,7 @@ class Interp:
                     content = f.read()
                 return {"tainted": True, "value": content}
             except OSError:
-                raise HLPanic("cannot open file: %s" % to_display(args[0]), line)
+                raise HLPanic("cannot open file: %s" % to_display(args[0]), line) from None
         # Stage 10 release: read_line() -> tainted[str] — third taint source.
         # Reads one line from stdin (newline stripped). The result is always
         # tainted because stdin is untrusted input. EOF returns an empty
@@ -1503,7 +1503,7 @@ class Interp:
                     f.write(args[1])
                 return None
             except OSError:
-                raise HLPanic("cannot write file: %s" % to_display(args[0]), line)
+                raise HLPanic("cannot write file: %s" % to_display(args[0]), line) from None
         if name == "args":
             # BUG (deep-scan-5): this returned a fresh list COPY on every
             # call, but the native runtime returns THE process-global list
@@ -1589,14 +1589,14 @@ class Interp:
                         else str(e).encode("utf-8") for e in entries]
             except OSError:
                 raise HLPanic("fs_read_dir: cannot list directory: %s"
-                              % to_display(args[0]), line)
+                              % to_display(args[0]), line) from None
         if name == "fs_size":
             resolved = _sandbox_check(args[0])
             try:
                 return os.path.getsize(resolved)
             except OSError:
                 raise HLPanic("fs_size: cannot stat: %s"
-                              % to_display(args[0]), line)
+                              % to_display(args[0]), line) from None
         if name == "fs_is_dir":
             resolved = _sandbox_check(args[0])
             # os.path.isdir returns False for non-existent paths
@@ -1610,7 +1610,7 @@ class Interp:
                 os.chmod(resolved, mode)
             except OSError:
                 raise HLPanic("fs_set_perms: cannot chmod: %s"
-                              % to_display(args[0]), line)
+                              % to_display(args[0]), line) from None
             return None
         # ----- Stage 8-alpha: ownership primitives -----
         # drop(x): semantically releases x. In Stage-0 (Python), the underlying
@@ -1696,7 +1696,7 @@ class Interp:
                               % to_display(args[0]), line)
             except socket.gaierror as ex:
                 raise HLPanic("net_lookup: DNS resolution failed for %s: %s"
-                              % (to_display(args[0]), str(ex)), line)
+                              % (to_display(args[0]), str(ex)), line) from None
             except OSError as ex:
                 # Deep-scan fix (C2): connection timeouts, refused
                 # connections, and other non-gaierror OSErrors used to
@@ -1704,7 +1704,7 @@ class Interp:
                 # runtime panicked cleanly. Catch the broader OSError
                 # family for differential parity.
                 raise HLPanic("net_lookup: network error for %s: %s"
-                              % (to_display(args[0]), str(ex)), line)
+                              % (to_display(args[0]), str(ex)), line) from None
         # ----- Stage 37 (v0.56.0-alpha): TCP / UDP / TLS builtins -----
         # The interpreter mirrors the C runtime exactly so differential
         # testing (interpreter == native) is byte-exact. All builtins
@@ -1868,9 +1868,9 @@ class Interp:
                 raise HLPanic("net_tls_get: curl not installed (libcurl "
                               "backend requires the curl CLI for the "
                               "interpreter; the native runtime links "
-                              "libcurl directly)", line)
+                              "libcurl directly)", line) from None
             except subprocess.TimeoutExpired:
-                raise HLPanic("net_tls_get: timeout for %s" % url, line)
+                raise HLPanic("net_tls_get: timeout for %s" % url, line) from None
         # proc_exec(cmd: str) -> int — run a shell command. Returns the
         # exit code (0 on success, 1..255 on failure). Uses os.system()
         # so the command runs in a subshell, matching the C runtime's
@@ -1958,10 +1958,10 @@ class Interp:
                 )
             except FileNotFoundError:
                 raise HLPanic("proc_spawn: program not found: %s"
-                              % to_display(args[0]), line)
+                              % to_display(args[0]), line) from None
             except OSError as ex:
                 raise HLPanic("proc_spawn: %s: %s"
-                              % (to_display(args[0]), str(ex)), line)
+                              % (to_display(args[0]), str(ex)), line) from None
             # Allocate a Halis-level pid (monotonic counter, starting at 1).
             if not hasattr(self, "proc_next_pid") or self.proc_next_pid < 1:
                 self.proc_next_pid = 1

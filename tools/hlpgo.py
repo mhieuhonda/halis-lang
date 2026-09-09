@@ -82,7 +82,7 @@ def parse_profile(path: str) -> Tuple[Dict[str, int], str]:
         except ValueError:
             raise ValueError(
                 f"malformed count for site '{site_id}' in {path}: "
-                f"{count_str!r}")
+                f"{count_str!r}") from None
         counts[site_id] = counts.get(site_id, 0) + count
     return counts, version
 

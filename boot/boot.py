@@ -130,7 +130,7 @@ def load_program(entry_path):
             with open(abs_path, "rb") as f:
                 src = f.read()
         except OSError:
-            raise HLError("cannot open file: %s" % abs_path, 0, 0)
+            raise HLError("cannot open file: %s" % abs_path, 0, 0) from None
         # BUG-20 fix: removed the redundant `except HLError: raise` block —
         # catching an exception only to re-raise it unchanged is a no-op.
         toks = tokenize(src)

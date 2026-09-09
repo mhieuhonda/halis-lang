@@ -330,7 +330,7 @@ def parse_manifest(path: str) -> Dict:
         try:
             lines.append(_strip_toml_comment(line))
         except ValueError as ex:
-            raise ValueError("manifest: %s (in line: %r)" % (ex, line))
+            raise ValueError("manifest: %s (in line: %r)" % (ex, line)) from ex
     src = "\n".join(lines)
 
     # Parse into a tree of section -> key -> value.
@@ -490,7 +490,7 @@ def _parse_value(src: str, i: int) -> Tuple[object, int]:
                         cp = int(src[j + 2:j + 6], 16)
                         out.append(chr(cp))
                     except ValueError:
-                        raise ValueError("invalid \\u escape at offset %d" % j)
+                        raise ValueError("invalid \\u escape at offset %d" % j) from None
                     j += 6
                 elif nxt == 'U' and j + 10 <= n:
                     # \UXXXXXXXX — 8 hex digits
@@ -498,7 +498,7 @@ def _parse_value(src: str, i: int) -> Tuple[object, int]:
                         cp = int(src[j + 2:j + 10], 16)
                         out.append(chr(cp))
                     except ValueError:
-                        raise ValueError("invalid \\U escape at offset %d" % j)
+                        raise ValueError("invalid \\U escape at offset %d" % j) from None
                     j += 10
                 else:
                     # Unknown escape — preserve the char after the backslash.
