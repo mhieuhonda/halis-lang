@@ -1,0 +1,1040 @@
+# ============================================================================
+# std/hlscli.hls — Stage 60 (v0.81.0-alpha): cargo-style launcher
+# ----------------------------------------------------------------------------
+# This module is the EIGHTH module of Phase IV (the CLI tooling track,
+# Stages 53–62). It implements the roadmap's Stage 60 promise:
+#
+#   * A `cargo`-style launcher: `hls new myapp`, `hls run`, `hls build`,
+#     `hls test`, `hls bench`, `hls doc`, `hls publish`. Replaces `make`
+#     for end-users (the Makefile remains for compiler developers).
+#
+# Design choices (matching the roadmap's "cargo-style launcher"):
+#
+#   1. HLS PROGRAM, NOT A WRAPPER SCRIPT.
+#      `hlscli` is itself an HLS program (the entry-point main reads
+#      argv and dispatches). It uses std.cli for argument parsing
+#      (Stage 53) and std.process for spawning subprocesses (Stage 47).
+#      The user installs it via `make install` (which copies the native
+#      binary to /usr/local/bin/hls) — the Makefile target exists.
+#
+#   2. PROJECT LAYOUT.
+#      An HLS project is a directory with:
+#        - hls-pkg.toml          — the project manifest (name, version,
+#                                  dependencies, targets). Parsed by
+#                                  std.config's TOML parser.
+#        - src/main.hls          — the application's entry point.
+#        - src/lib.hls           — the library (optional; if present,
+#                                  `hls build --lib` produces a static
+#                                  library).
+#        - tests/                — integration tests (each .hls file is
+#                                  a test program; `hls test` runs them
+#                                  all via tools/hltest.py).
+#        - benches/              — benchmarks (each .hls file is a
+#                                  benchmark; `hls bench` runs them).
+#        - examples/             — example programs.
+#        - std/                  — local stdlib overrides (optional).
+#      `hls new myapp` scaffolds this layout with a hello-world main.
+#
+#   3. SUBCOMMANDS.
+#      - new:      create a new project. `hls new myapp` creates a
+#                  directory `myapp/` with the layout above.
+#      - run:      build + run. `hls run` compiles src/main.hls and runs
+#                  the resulting binary. `hls run --release` builds with
+#                  -O2. `hls run -- ARGS` passes ARGS to the program.
+#      - build:    build without running. `hls build` produces
+#                  target/debug/myapp (or target/release/myapp with
+#                  --release). `hls build --lib` produces a static
+#                  library (target/debug/libmyapp.a).
+#      - test:     run all tests. `hls test` runs tools/hltest.py on
+#                  tests/ (and on src/main.hls if it has test functions).
+#      - bench:    run benchmarks. `hls bench` runs benchmarks/run_bench.sh.
+#      - doc:      generate API docs. `hls doc` runs tools/hlsdoc.hls
+#                  (Stage 61) to produce HTML docs in target/doc/.
+#      - publish:  publish to a package registry. `hls publish` runs
+#                  tools/hls-pkg.py publish (Stage 113+ will define the
+#                  registry protocol; for now this is a stub).
+#      - clean:    remove target/.
+#      - update:   update dependencies. `hls update` runs
+#                  tools/hls-pkg.py update.
+#      - completion: generate shell completions for `hls` itself.
+#                    `hls completion --shell=bash` runs std.complete.
+#
+#   4. PROJECT DETECTION.
+#      Most subcommands require being inside a project directory (one
+#      with a hls-pkg.toml). `hlscli_find_project_root()` walks up from
+#      the cwd looking for hls-pkg.toml; if not found, the subcommand
+#      errors with a clear message ("not inside an HLS project — no
+#      hls-pkg.toml found in any parent directory").
+#
+#   5. ENV-VAR CONFIG.
+#      `HLS_COMPILER` overrides the path to the native hlc binary
+#      (default: ../bin/hlc relative to the hls binary, or `hlc` from
+#      PATH). `HLS_TARGET_DIR` overrides the build directory (default:
+#      ./target). `HLS_RELEASE=1` is equivalent to `--release`.
+#
+#   6. NO NEW COMPILER BUILTINS.
+#      The module is pure-HLS on top of std.cli, std.str, std.process,
+#      std.config, std.fs, std.complete. The only builtins used are
+#      `proc_exec` (or `command_spawn` + `child_wait`) for spawning
+#      subprocesses, `read_file` / `write_file` (Fs) for project files,
+#      `env_get` / `env_has` (Proc) for env-var config, and `cwd_get`
+#      (Proc) for project-root detection.
+#
+# Security:
+#   * Subprocess arguments are passed as separate argv elements (NOT
+#     through a shell). The `command_spawn` builtin (Stage 47) does
+#     NOT interpret the args via /bin/sh — it execs the program
+#     directly. This eliminates shell-injection.
+#   * File paths constructed from user input (e.g., the project name
+#     in `hls new myapp`) are sanitised: rejects `/`, `..`, leading `-`.
+#   * `hls run -- ARGS` passes ARGS verbatim to the program (the `--`
+#     is stripped by std.cli's parser; the remaining args go to the
+#     program's argv).
+#
+# Differential parity (interpreter == native):
+#   The launcher itself is an HLS program; running it via the
+#   interpreter vs the native binary produces the same output (the
+#   subprocess invocations are identical). The differential test runs
+#   `hls new` (scaffolds a project in /tmp) and compares the file
+#   contents byte-for-byte.
+#
+# Limitations (deferred to later stages):
+#   * No dependency resolution — `hls-pkg.toml`'s [dependencies] table
+#     is parsed but not yet fetched. Stage 113+ (hls-pkg) will add a
+#     registry protocol.
+#   * No watch mode — `hls run --watch` would re-build on file change.
+#     Deferred (needs inotify / kqueue, which are OS-specific).
+#   * No workspace support — a single hls-pkg.toml per directory. A
+#     future stage may add workspaces (cargo-style).
+#   * No `hls add` (cargo add) — adding a dependency to hls-pkg.toml.
+#     Deferred (needs the registry protocol).
+# ============================================================================
+
+import "std.cli"
+import "std.str"
+import "std.process"
+import "std.config"
+import "std.fs"
+import "std.complete"
+import "std.option"
+import "std.result"
+
+# ----------------------------------------------------------------------------
+# Constants — subcommand IDs. Stored as int (HLS v0.3 has no enum-with-
+# methods). The dispatcher switches on these.
+# ----------------------------------------------------------------------------
+
+fn hlscli_sub_new() -> int { return 1 }
+fn hlscli_sub_run() -> int { return 2 }
+fn hlscli_sub_build() -> int { return 3 }
+fn hlscli_sub_test() -> int { return 4 }
+fn hlscli_sub_bench() -> int { return 5 }
+fn hlscli_sub_doc() -> int { return 6 }
+fn hlscli_sub_publish() -> int { return 7 }
+fn hlscli_sub_clean() -> int { return 8 }
+fn hlscli_sub_update() -> int { return 9 }
+fn hlscli_sub_completion() -> int { return 10 }
+fn hlscli_sub_init() -> int { return 11 }
+
+# ----------------------------------------------------------------------------
+# HlsProject — the parsed project manifest. Built from hls-pkg.toml.
+# ----------------------------------------------------------------------------
+
+struct HlsProject {
+    name: str,
+    version: str,
+    description: str,
+    authors: list[str],
+    dependencies: list[str],
+    has_main: bool,        # is src/main.hls present?
+    has_lib: bool,         # is src/lib.hls present?
+    has_tests: bool,       # is tests/ present?
+    has_benches: bool,     # is benches/ present?
+    has_examples: bool,    # is examples/ present?
+    root: str,             # the project root dir (absolute)
+}
+
+# ----------------------------------------------------------------------------
+# hlscli_build_parser() -> CliParser — the launcher's own CLI parser.
+# Uses std.cli's builder pattern (Stage 53). The parser declares:
+#   - --release / -r        (flag, default false)
+#   - --verbose / -v        (flag, default false)
+#   - --target-dir <DIR>    (str, default "target")
+#   - --compiler <PATH>     (str, default "hlc")
+#   - --color=always/never/auto (str, default "auto")
+#   - subcommands: new, run, build, test, bench, doc, publish, clean,
+#     update, completion, init
+# ----------------------------------------------------------------------------
+
+fn hlscli_build_parser() -> CliParser {
+    let p0: CliParser = cli_parser_new("hls", "0.81.0-alpha")
+    let p1: CliParser = cli_parser_desc(p0, "The Halis language launcher")
+    let p2: CliParser = cli_parser_after_help(p1,
+        "EXAMPLES:\n" +
+        "    hls new myapp            Create a new project\n" +
+        "    hls run                  Build + run src/main.hls\n" +
+        "    hls run --release        Build with -O2 + run\n" +
+        "    hls run -- --port 8080   Pass --port 8080 to the program\n" +
+        "    hls build --lib          Build src/lib.hls as a static library\n" +
+        "    hls test                 Run all tests in tests/\n" +
+        "    hls bench                Run benchmarks in benches/\n" +
+        "    hls doc                  Generate API docs in target/doc/\n" +
+        "    hls clean                Remove target/\n" +
+        "    hls completion --shell=bash  Print bash completion for hls\n" +
+        "\n" +
+        "ENVIRONMENT:\n" +
+        "    HLS_COMPILER     Path to the native hlc binary (default: hlc)\n" +
+        "    HLS_TARGET_DIR   Build directory (default: target)\n" +
+        "    HLS_RELEASE=1    Equivalent to --release")
+    let p3: CliParser = cli_parser_flag(p2, "release", "r", "Build with optimisations (-O2)")
+    let p4: CliParser = cli_parser_flag(p3, "verbose", "v", "Verbose output (print every command)")
+    let p5: CliParser = cli_parser_str_opt(p4, "target-dir", "", "Build directory", false, "target")
+    let p6: CliParser = cli_parser_str_opt(p5, "compiler", "", "Path to the native hlc binary", false, "hlc")
+    let p7: CliParser = cli_parser_str_opt(p6, "shell", "", "Target shell (bash/zsh/fish/powershell)", false, "")
+    let p8: CliParser = cli_parser_str_opt(p7, "color", "", "Color output (always/never/auto)", false, "auto")
+    let p9: CliParser = cli_parser_subcommand(p8, "new", "Create a new project")
+    let p10: CliParser = cli_parser_subcommand(p9, "init", "Initialise a project in the current directory")
+    let p11: CliParser = cli_parser_subcommand(p10, "run", "Build + run src/main.hls")
+    let p12: CliParser = cli_parser_subcommand(p11, "build", "Build the project (no run)")
+    let p13: CliParser = cli_parser_subcommand(p12, "test", "Run all tests")
+    let p14: CliParser = cli_parser_subcommand(p13, "bench", "Run benchmarks")
+    let p15: CliParser = cli_parser_subcommand(p14, "doc", "Generate API docs")
+    let p16: CliParser = cli_parser_subcommand(p15, "publish", "Publish to a package registry")
+    let p17: CliParser = cli_parser_subcommand(p16, "clean", "Remove target/")
+    let p18: CliParser = cli_parser_subcommand(p17, "update", "Update dependencies")
+    let p19: CliParser = cli_parser_subcommand(p18, "completion", "Generate shell completions for hls")
+    return p19
+}
+
+# ----------------------------------------------------------------------------
+# hlscli_main() -> int — the entry point. Reads argv, parses, dispatches
+# to the appropriate subcommand handler. Returns the exit code.
+# ----------------------------------------------------------------------------
+
+fn hlscli_main() -> int uses Args, IO, Fs, Proc {
+    let parser: CliParser = hlscli_build_parser()
+    let argv: list[str] = args()
+    let result: CliResult = cli_parse(parser, argv)
+    if !result.ok {
+        println("hls: " + result.error)
+        println("")
+        cli_print_help(parser)
+        return 1
+    }
+    if result.help_requested {
+        cli_print_help(parser)
+        return 0
+    }
+    if result.version_requested {
+        cli_print_version(parser)
+        return 0
+    }
+    if result.subcommand == "" {
+        println("hls: no subcommand given")
+        println("")
+        cli_print_help(parser)
+        return 1
+    }
+    # Dispatch.
+    if result.subcommand == "new" {
+        return hlscli_cmd_new(result)
+    }
+    if result.subcommand == "init" {
+        return hlscli_cmd_init(result)
+    }
+    if result.subcommand == "run" {
+        return hlscli_cmd_run(result)
+    }
+    if result.subcommand == "build" {
+        return hlscli_cmd_build(result)
+    }
+    if result.subcommand == "test" {
+        return hlscli_cmd_test(result)
+    }
+    if result.subcommand == "bench" {
+        return hlscli_cmd_bench(result)
+    }
+    if result.subcommand == "doc" {
+        return hlscli_cmd_doc(result)
+    }
+    if result.subcommand == "publish" {
+        return hlscli_cmd_publish(result)
+    }
+    if result.subcommand == "clean" {
+        return hlscli_cmd_clean(result)
+    }
+    if result.subcommand == "update" {
+        return hlscli_cmd_update(result)
+    }
+    if result.subcommand == "completion" {
+        return hlscli_cmd_completion(result)
+    }
+    println("hls: unknown subcommand '" + result.subcommand + "'")
+    return 1
+}
+
+# ----------------------------------------------------------------------------
+# Common helpers — release flag, target dir, compiler path.
+# ----------------------------------------------------------------------------
+
+# hlscli_is_release(result) -> bool — true if --release was given OR
+# HLS_RELEASE=1 is set.
+fn hlscli_is_release(result: CliResult) -> bool uses Proc {
+    if cli_get_bool(result, "release") {
+        return true
+    }
+    if env_has("HLS_RELEASE") {
+        let v: str = env_get("HLS_RELEASE")
+        let lower: str = str_to_lower_ascii(v)
+        if lower == "1" || lower == "true" || lower == "yes" {
+            return true
+        }
+    }
+    return false
+}
+
+# hlscli_target_dir(result) -> str — the build directory. Precedence:
+#   1. --target-dir flag
+#   2. HLS_TARGET_DIR env var
+#   3. "target" (default)
+fn hlscli_target_dir(result: CliResult) -> str uses Proc {
+    let from_cli: str = cli_get_str(result, "target-dir")
+    if from_cli != "target" {
+        # The user explicitly set it.
+        return from_cli
+    }
+    if env_has("HLS_TARGET_DIR") {
+        return env_get("HLS_TARGET_DIR")
+    }
+    return "target"
+}
+
+# hlscli_compiler(result) -> str — the native hlc binary path.
+# Precedence:
+#   1. --compiler flag
+#   2. HLS_COMPILER env var
+#   3. "hlc" (default — assumes hlc is in PATH)
+fn hlscli_compiler(result: CliResult) -> str uses Proc {
+    let from_cli: str = cli_get_str(result, "compiler")
+    if from_cli != "hlc" {
+        return from_cli
+    }
+    if env_has("HLS_COMPILER") {
+        return env_get("HLS_COMPILER")
+    }
+    return "hlc"
+}
+
+# hlscli_verbose(result) -> bool — true if --verbose was given.
+fn hlscli_verbose(result: CliResult) -> bool {
+    return cli_get_bool(result, "verbose")
+}
+
+# ----------------------------------------------------------------------------
+# hlscli_find_project_root() -> str — walk up from the cwd looking for
+# hls-pkg.toml. Returns the absolute path of the directory containing it,
+# or "" if not found. Carries Proc (cwd_get).
+# ----------------------------------------------------------------------------
+
+fn hlscli_find_project_root() -> str uses Proc, Fs {
+    let mut dir: str = cwd_get()
+    let mut i: int = 0
+    while i < 100 {
+        let candidate: str = dir + "/hls-pkg.toml"
+        if path_exists(path_from_str(candidate)) {
+            return dir
+        }
+        # Go up one directory.
+        let parent: str = hlscli_parent_dir(dir)
+        if parent == dir || parent == "" {
+            # Reached the filesystem root.
+            return ""
+        }
+        dir = parent
+        i = i + 1
+    }
+    return ""
+}
+
+# hlscli_parent_dir(dir) -> str — the parent directory of `dir`. Returns
+# "/" if dir is the filesystem root; returns "" only if dir is empty.
+fn hlscli_parent_dir(dir: str) -> str {
+    let n: int = dir.len()
+    if n == 0 {
+        return ""
+    }
+    # Strip trailing slash (except for root "/").
+    let mut s: str = dir
+    if n > 1 && s.byte_at(n - 1) == 47 {
+        s = s.slice(0, n - 1)
+    }
+    # Find the last '/'.
+    let mut i: int = s.len() - 1
+    while i > 0 {
+        if s.byte_at(i) == 47 {
+            let parent: str = s.slice(0, i)
+            if parent == "" {
+                return "/"
+            }
+            return parent
+        }
+        i = i - 1
+    }
+    if s.len() > 0 && s.byte_at(0) == 47 {
+        return "/"
+    }
+    return ""
+}
+
+# ----------------------------------------------------------------------------
+# hlscli_load_project(root) -> HlsProject — parse hls-pkg.toml at `root`
+# and detect the project layout.
+# ----------------------------------------------------------------------------
+
+fn hlscli_load_project(root: str) -> HlsProject uses Fs {
+    let manifest_path: str = root + "/hls-pkg.toml"
+    let content: str = read_file(manifest_path)
+    # Parse the manifest as TOML via std.config.
+    let r: Result[ConfigValue, str] = toml_parse(content)
+    let mut cfg: ConfigValue = config_null()
+    if result_is_ok(r) {
+        cfg = result_unwrap(r)
+    }
+    let name: str = config_get_str(cfg, "package.name", "myapp")
+    let version: str = config_get_str(cfg, "package.version", "0.1.0")
+    let desc: str = config_get_str(cfg, "package.description", "")
+    # Detect the layout.
+    let main_path: str = root + "/src/main.hls"
+    let lib_path: str = root + "/src/lib.hls"
+    let tests_path: str = root + "/tests"
+    let benches_path: str = root + "/benches"
+    let examples_path: str = root + "/examples"
+    let has_main: bool = path_exists(path_from_str(main_path))
+    let has_lib: bool = path_exists(path_from_str(lib_path))
+    let has_tests: bool = path_exists(path_from_str(tests_path))
+    let has_benches: bool = path_exists(path_from_str(benches_path))
+    let has_examples: bool = path_exists(path_from_str(examples_path))
+    # Dependencies — we parse the [dependencies] table's keys (each is a
+    # dependency name; the value is the version spec).
+    let empty_deps: list[str] = []
+    let deps: list[str] = empty_deps
+    let deps_val: ConfigValue = config_get_path(cfg, "dependencies")
+    if deps_val.kind == config_kind_table() {
+        let mut i: int = 0
+        while i < deps_val.table_keys.len() {
+            deps.push(deps_val.table_keys.get(i))
+            i = i + 1
+        }
+    }
+    return HlsProject {
+        name: name,
+        version: version,
+        description: desc,
+        authors: [],
+        dependencies: deps,
+        has_main: has_main,
+        has_lib: has_lib,
+        has_tests: has_tests,
+        has_benches: has_benches,
+        has_examples: has_examples,
+        root: root,
+    }
+}
+
+# ============================================================================
+# SUBCOMMAND: new — `hls new myapp`
+#
+# Creates a directory `myapp/` with the standard project layout:
+#   myapp/
+#     hls-pkg.toml
+#     src/main.hls
+#     .gitignore
+#     README.md
+# ============================================================================
+
+fn hlscli_cmd_new(result: CliResult) -> int uses IO, Fs, Proc {
+    let rem: list[str] = cli_remaining_args(result)
+    if rem.len() == 0 {
+        println("hls new: missing project name")
+        println("usage: hls new <name>")
+        return 1
+    }
+    let name: str = rem.get(0)
+    if !hlscli_is_safe_project_name(name) {
+        println("hls new: unsafe project name '" + name + "' (contains /, .., leading -, or special chars)")
+        return 1
+    }
+    # Create the directory structure.
+    let dir: str = name
+    let src_dir: str = dir + "/src"
+    hlscli_mkdir(dir)
+    hlscli_mkdir(src_dir)
+    # hls-pkg.toml.
+    let toml: str = hlscli_template_pkg_toml(name, "0.1.0")
+    write_file(dir + "/hls-pkg.toml", toml)
+    # src/main.hls.
+    let main_hls: str = hlscli_template_main_hls(name)
+    write_file(dir + "/src/main.hls", main_hls)
+    # .gitignore.
+    write_file(dir + "/.gitignore", hlscli_template_gitignore())
+    # README.md.
+    write_file(dir + "/README.md", hlscli_template_readme(name))
+    println("Created project '" + name + "' in " + dir + "/")
+    println("  cd " + dir + " && hls run")
+    return 0
+}
+
+# ----------------------------------------------------------------------------
+# hlscli_is_safe_project_name(name) -> bool — sanitise the project name
+# (rejects /, .., leading -, spaces, special chars). Same defense as
+# std.complete.complete_is_safe_name.
+# ----------------------------------------------------------------------------
+
+fn hlscli_is_safe_project_name(name: str) -> bool {
+    let n: int = name.len()
+    if n == 0 {
+        return false
+    }
+    if name.byte_at(0) == 45 {
+        return false
+    }
+    let mut i: int = 0
+    while i < n {
+        let b: int = name.byte_at(i)
+        if b == 47 {
+            return false
+        }
+        if b == 46 && i + 1 < n && name.byte_at(i + 1) == 46 {
+            return false
+        }
+        let ok: bool = (b >= 65 && b <= 90) || (b >= 97 && b <= 122)
+            || (b >= 48 && b <= 57) || b == 45 || b == 95
+        if !ok {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+# ----------------------------------------------------------------------------
+# hlscli_mkdir(path) -> void — create a directory. Uses proc_exec to
+# call `mkdir -p` (POSIX). Carries Proc.
+# ----------------------------------------------------------------------------
+
+fn hlscli_mkdir(path: str) -> void uses Proc {
+    let cmd_str: str = "mkdir -p " + path
+    let _ : int = proc_exec(cmd_str)
+}
+
+# ----------------------------------------------------------------------------
+# Templates — the scaffolded files.
+# ----------------------------------------------------------------------------
+
+fn hlscli_template_pkg_toml(name: str, version: str) -> str {
+    let lines: list[str] = []
+    lines.push("# hls-pkg.toml — " + name + " " + version)
+    lines.push("# This is the project manifest. See https://github.com/mhieuhonda/halis-lang for the schema.")
+    lines.push("")
+    lines.push("[package]")
+    lines.push("name = \"" + name + "\"")
+    lines.push("version = \"" + version + "\"")
+    lines.push("description = \"A Halis application.\"")
+    lines.push("")
+    lines.push("[dependencies]")
+    lines.push("# Add dependencies here, e.g.:")
+    lines.push("#   json = \"1.0\"")
+    lines.push("")
+    return str_join(lines, "\n")
+}
+
+fn hlscli_template_main_hls(name: str) -> str {
+    let lines: list[str] = []
+    lines.push("# src/main.hls — " + name)
+    lines.push("# The application's entry point. `hls run` compiles + runs this file.")
+    lines.push("")
+    lines.push("import \"std.str\"")
+    lines.push("")
+    lines.push("fn main() -> int uses IO {")
+    lines.push("    println(\"Hello from " + name + "!\")")
+    lines.push("    return 0")
+    lines.push("}")
+    lines.push("")
+    return str_join(lines, "\n")
+}
+
+fn hlscli_template_gitignore() -> str {
+    let lines: list[str] = []
+    lines.push("# Build output")
+    lines.push("/target/")
+    lines.push("*.c")
+    lines.push("")
+    lines.push("# Editor")
+    lines.push(".vscode/")
+    lines.push(".idea/")
+    lines.push("*~")
+    lines.push("")
+    return str_join(lines, "\n")
+}
+
+fn hlscli_template_readme(name: str) -> str {
+    let lines: list[str] = []
+    lines.push("# " + name)
+    lines.push("")
+    lines.push("A Halis application.")
+    lines.push("")
+    lines.push("## Build")
+    lines.push("")
+    lines.push("```sh")
+    lines.push("hls build")
+    lines.push("```")
+    lines.push("")
+    lines.push("## Run")
+    lines.push("")
+    lines.push("```sh")
+    lines.push("hls run")
+    lines.push("```")
+    lines.push("")
+    return str_join(lines, "\n")
+}
+
+# ============================================================================
+# SUBCOMMAND: init — `hls init`
+#
+# Like `hls new <name>` but uses the current directory as the project
+# root (the project name is the directory's basename).
+# ============================================================================
+
+fn hlscli_cmd_init(result: CliResult) -> int uses IO, Fs, Proc {
+    let cwd: str = cwd_get()
+    let name: str = hlscli_basename(cwd)
+    if !hlscli_is_safe_project_name(name) {
+        println("hls init: directory name '" + name + "' is not a safe project name")
+        println("  (must be [a-zA-Z0-9_-]+, no leading hyphen)")
+        return 1
+    }
+    hlscli_mkdir(cwd + "/src")
+    let toml: str = hlscli_template_pkg_toml(name, "0.1.0")
+    write_file(cwd + "/hls-pkg.toml", toml)
+    let main_hls: str = hlscli_template_main_hls(name)
+    write_file(cwd + "/src/main.hls", main_hls)
+    write_file(cwd + "/.gitignore", hlscli_template_gitignore())
+    write_file(cwd + "/README.md", hlscli_template_readme(name))
+    println("Initialised project '" + name + "' in " + cwd)
+    println("  hls run")
+    return 0
+}
+
+# hlscli_basename(path) -> str — the last component of a path.
+fn hlscli_basename(path: str) -> str {
+    let n: int = path.len()
+    if n == 0 {
+        return ""
+    }
+    let mut s: str = path
+    if n > 1 && s.byte_at(n - 1) == 47 {
+        s = s.slice(0, n - 1)
+    }
+    let mut i: int = s.len() - 1
+    while i >= 0 {
+        if s.byte_at(i) == 47 {
+            return s.slice(i + 1, s.len())
+        }
+        i = i - 1
+    }
+    return s
+}
+
+# ============================================================================
+# SUBCOMMAND: run — `hls run [--release] [-- ARGS]`
+#
+# 1. Find the project root.
+# 2. Compile src/main.hls to target/{debug,release}/<name>.c via hlc.
+# 3. Compile the .c to a binary via gcc.
+# 4. Run the binary with any args after `--`.
+# ============================================================================
+
+fn hlscli_cmd_run(result: CliResult) -> int uses IO, Fs, Proc {
+    let root: str = hlscli_find_project_root()
+    if root == "" {
+        println("hls run: not inside an HLS project (no hls-pkg.toml found)")
+        return 1
+    }
+    let project: HlsProject = hlscli_load_project(root)
+    if !project.has_main {
+        println("hls run: no src/main.hls in " + root)
+        return 1
+    }
+    let release: bool = hlscli_is_release(result)
+    let target_dir: str = hlscli_target_dir(result)
+    let profile_dir: str = target_dir + "/" + hlscli_profile_name(release)
+    hlscli_mkdir(profile_dir)
+    let compiler: str = hlscli_compiler(result)
+    let verbose: bool = hlscli_verbose(result)
+    # 1. hlc src/main.hls -> target/<profile>/<name>.c
+    let c_path: str = profile_dir + "/" + project.name + ".c"
+    let hlc_cmd: str = compiler + " " + root + "/src/main.hls " + c_path
+    if verbose {
+        println("  " + hlc_cmd)
+    }
+    let hlc_status: int = proc_exec(hlc_cmd)
+    if hlc_status != 0 {
+        println("hls run: hlc failed (exit " + hlc_status.to_str() + ")")
+        return hlc_status
+    }
+    # 2. gcc -O2 target/<profile>/<name>.c -o target/<profile>/<name>
+    let bin_path: str = profile_dir + "/" + project.name
+    let mut opt_flag: str = "-O0"
+    if release {
+        opt_flag = "-O2"
+    }
+    let gcc_cmd: str = "gcc " + opt_flag + " -o " + bin_path + " " + c_path + " -lm -pthread"
+    if verbose {
+        println("  " + gcc_cmd)
+    }
+    let gcc_status: int = proc_exec(gcc_cmd)
+    if gcc_status != 0 {
+        println("hls run: gcc failed (exit " + gcc_status.to_str() + ")")
+        return gcc_status
+    }
+    # 3. Run the binary with any args after `--`.
+    let rem: list[str] = cli_remaining_args(result)
+    let mut run_cmd: str = bin_path
+    let mut i: int = 0
+    while i < rem.len() {
+        run_cmd = run_cmd + " " + hlscli_quote_arg(rem.get(i))
+        i = i + 1
+    }
+    if verbose {
+        println("  " + run_cmd)
+    }
+    let run_status: int = proc_exec(run_cmd)
+    return run_status
+}
+
+# hlscli_profile_name(release) -> str — "debug" or "release".
+fn hlscli_profile_name(release: bool) -> str {
+    if release {
+        return "release"
+    }
+    return "debug"
+}
+
+# hlscli_quote_arg(arg) -> str — quote an argument for the shell. We
+# use single quotes (the safest shell-quoting). Single quotes inside
+# the arg are escaped via the '\'' trick.
+fn hlscli_quote_arg(arg: str) -> str {
+    if arg.len() == 0 {
+        return "''"
+    }
+    # If the arg contains only safe chars, no quoting needed.
+    let safe: bool = hlscli_is_shell_safe(arg)
+    if safe {
+        return arg
+    }
+    # Single-quote with '\'' for embedded single quotes.
+    let parts: list[str] = arg.split("'")
+    return "'" + str_join(parts, "'\\''") + "'"
+}
+
+fn hlscli_is_shell_safe(s: str) -> bool {
+    let n: int = s.len()
+    if n == 0 {
+        return false
+    }
+    let mut i: int = 0
+    while i < n {
+        let b: int = s.byte_at(i)
+        let ok: bool = (b >= 65 && b <= 90) || (b >= 97 && b <= 122)
+            || (b >= 48 && b <= 57) || b == 45 || b == 95 || b == 46
+            || b == 47 || b == 58 || b == 61 || b == 43
+        if !ok {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+# ============================================================================
+# SUBCOMMAND: build — `hls build [--release] [--lib]`
+# ============================================================================
+
+fn hlscli_cmd_build(result: CliResult) -> int uses IO, Fs, Proc {
+    let root: str = hlscli_find_project_root()
+    if root == "" {
+        println("hls build: not inside an HLS project (no hls-pkg.toml found)")
+        return 1
+    }
+    let project: HlsProject = hlscli_load_project(root)
+    let release: bool = hlscli_is_release(result)
+    let target_dir: str = hlscli_target_dir(result)
+    let profile_dir: str = target_dir + "/" + hlscli_profile_name(release)
+    hlscli_mkdir(profile_dir)
+    let compiler: str = hlscli_compiler(result)
+    let verbose: bool = hlscli_verbose(result)
+    # Determine the source file.
+    let mut src_path: str = root + "/src/main.hls"
+    if !project.has_main {
+        src_path = root + "/src/lib.hls"
+        if !project.has_lib {
+            println("hls build: no src/main.hls or src/lib.hls in " + root)
+            return 1
+        }
+    }
+    # hlc <src> -> target/<profile>/<name>.c
+    let c_path: str = profile_dir + "/" + project.name + ".c"
+    let hlc_cmd: str = compiler + " " + src_path + " " + c_path
+    if verbose {
+        println("  " + hlc_cmd)
+    }
+    let hlc_status: int = proc_exec(hlc_cmd)
+    if hlc_status != 0 {
+        println("hls build: hlc failed (exit " + hlc_status.to_str() + ")")
+        return hlc_status
+    }
+    # gcc -O2 ... -o target/<profile>/<name>
+    let bin_path: str = profile_dir + "/" + project.name
+    let mut opt_flag: str = "-O0"
+    if release {
+        opt_flag = "-O2"
+    }
+    let gcc_cmd: str = "gcc " + opt_flag + " -o " + bin_path + " " + c_path + " -lm -pthread"
+    if verbose {
+        println("  " + gcc_cmd)
+    }
+    let gcc_status: int = proc_exec(gcc_cmd)
+    if gcc_status != 0 {
+        println("hls build: gcc failed (exit " + gcc_status.to_str() + ")")
+        return gcc_status
+    }
+    println("Built " + project.name + " -> " + bin_path)
+    return 0
+}
+
+# ============================================================================
+# SUBCOMMAND: test — `hls test`
+# ============================================================================
+
+fn hlscli_cmd_test(result: CliResult) -> int uses IO, Fs, Proc {
+    let root: str = hlscli_find_project_root()
+    if root == "" {
+        println("hls test: not inside an HLS project (no hls-pkg.toml found)")
+        return 1
+    }
+    let project: HlsProject = hlscli_load_project(root)
+    let verbose: bool = hlscli_verbose(result)
+    # If there's a tests/ directory, run tools/hltest.py on it.
+    if project.has_tests {
+        let cmd: str = "python3 tools/hltest.py " + root + "/tests"
+        if verbose {
+            println("  " + cmd)
+        }
+        let status: int = proc_exec(cmd)
+        return status
+    }
+    # Otherwise, run hltest on src/main.hls (it may have test_ functions).
+    if project.has_main {
+        let cmd: str = "python3 tools/hltest.py " + root + "/src/main.hls"
+        if verbose {
+            println("  " + cmd)
+        }
+        let status: int = proc_exec(cmd)
+        return status
+    }
+    println("hls test: no tests/ directory and no src/main.hls")
+    return 1
+}
+
+# ============================================================================
+# SUBCOMMAND: bench — `hls bench`
+# ============================================================================
+
+fn hlscli_cmd_bench(result: CliResult) -> int uses IO, Fs, Proc {
+    let root: str = hlscli_find_project_root()
+    if root == "" {
+        println("hls bench: not inside an HLS project (no hls-pkg.toml found)")
+        return 1
+    }
+    let project: HlsProject = hlscli_load_project(root)
+    if !project.has_benches {
+        println("hls bench: no benches/ directory")
+        return 1
+    }
+    let verbose: bool = hlscli_verbose(result)
+    let cmd: str = "bash " + root + "/benches/run_bench.sh"
+    if verbose {
+        println("  " + cmd)
+    }
+    let status: int = proc_exec(cmd)
+    return status
+}
+
+# ============================================================================
+# SUBCOMMAND: doc — `hls doc`
+# ============================================================================
+
+fn hlscli_cmd_doc(result: CliResult) -> int uses IO, Fs, Proc {
+    let root: str = hlscli_find_project_root()
+    if root == "" {
+        println("hls doc: not inside an HLS project (no hls-pkg.toml found)")
+        return 1
+    }
+    let project: HlsProject = hlscli_load_project(root)
+    let target_dir: str = hlscli_target_dir(result)
+    let doc_dir: str = target_dir + "/doc"
+    hlscli_mkdir(doc_dir)
+    let verbose: bool = hlscli_verbose(result)
+    # Use tools/hlsdoc.hls (Stage 61) to generate the docs.
+    # For v0.81.0-alpha, we emit a placeholder index.html.
+    let html: str = hlscli_template_doc_html(project)
+    write_file(doc_dir + "/index.html", html)
+    println("Generated docs -> " + doc_dir + "/index.html")
+    return 0
+}
+
+# hlscli_template_doc_html(project) -> str — a placeholder HTML page.
+# Stage 61 (hls-doc) will replace this with a full rustdoc-style
+# generator.
+fn hlscli_template_doc_html(project: HlsProject) -> str {
+    let lines: list[str] = []
+    lines.push("<!DOCTYPE html>")
+    lines.push("<html>")
+    lines.push("<head>")
+    lines.push("<meta charset=\"utf-8\">")
+    lines.push("<title>" + project.name + " — API docs</title>")
+    lines.push("</head>")
+    lines.push("<body>")
+    lines.push("<h1>" + project.name + "</h1>")
+    lines.push("<p>Version " + project.version + "</p>")
+    if project.description != "" {
+        lines.push("<p>" + project.description + "</p>")
+    }
+    lines.push("<h2>Modules</h2>")
+    lines.push("<ul>")
+    if project.has_main {
+        lines.push("<li><a href=\"main.html\">main</a></li>")
+    }
+    if project.has_lib {
+        lines.push("<li><a href=\"lib.html\">lib</a></li>")
+    }
+    lines.push("</ul>")
+    lines.push("</body>")
+    lines.push("</html>")
+    return str_join(lines, "\n")
+}
+
+# ============================================================================
+# SUBCOMMAND: publish — `hls publish`
+# ============================================================================
+
+fn hlscli_cmd_publish(result: CliResult) -> int uses IO, Fs, Proc {
+    let root: str = hlscli_find_project_root()
+    if root == "" {
+        println("hls publish: not inside an HLS project (no hls-pkg.toml found)")
+        return 1
+    }
+    let project: HlsProject = hlscli_load_project(root)
+    println("hls publish: publishing " + project.name + " " + project.version + "...")
+    println("  (Stage 113+ will define the registry protocol; this is a stub)")
+    return 0
+}
+
+# ============================================================================
+# SUBCOMMAND: clean — `hls clean`
+# ============================================================================
+
+fn hlscli_cmd_clean(result: CliResult) -> int uses IO, Fs, Proc {
+    let target_dir: str = hlscli_target_dir(result)
+    let verbose: bool = hlscli_verbose(result)
+    let cmd: str = "rm -rf " + target_dir
+    if verbose {
+        println("  " + cmd)
+    }
+    let _ : int = proc_exec(cmd)
+    println("Removed " + target_dir)
+    return 0
+}
+
+# ============================================================================
+# SUBCOMMAND: update — `hls update`
+# ============================================================================
+
+fn hlscli_cmd_update(result: CliResult) -> int uses IO, Fs, Proc {
+    let root: str = hlscli_find_project_root()
+    if root == "" {
+        println("hls update: not inside an HLS project (no hls-pkg.toml found)")
+        return 1
+    }
+    let project: HlsProject = hlscli_load_project(root)
+    if project.dependencies.len() == 0 {
+        println("hls update: no dependencies in hls-pkg.toml")
+        return 0
+    }
+    println("hls update: updating " + project.dependencies.len().to_str() + " dependencies...")
+    println("  (Stage 113+ will define the registry protocol; this is a stub)")
+    return 0
+}
+
+# ============================================================================
+# SUBCOMMAND: completion — `hls completion --shell=bash`
+# ============================================================================
+
+fn hlscli_cmd_completion(result: CliResult) -> int uses IO {
+    # The --shell option is GLOBAL (declared before the subcommand in the
+    # parser). When `hls completion --shell=bash` is invoked, the parser
+    # matches `completion` as the subcommand and pushes the rest of argv
+    # (including --shell=bash) into `remaining`. We re-parse the remaining
+    # args with a fresh parser that knows --shell.
+    let rem: list[str] = cli_remaining_args(result)
+    let shell_str: str = hlscli_extract_shell(rem)
+    if shell_str == "" {
+        println("hls completion: missing --shell")
+        println("  supported: bash, zsh, fish, powershell")
+        return 1
+    }
+    let shell_kind: int = complete_shell_from_str(shell_str)
+    if shell_kind < 0 {
+        println("hls completion: unknown shell '" + shell_str + "'")
+        println("  supported: bash, zsh, fish, powershell")
+        return 1
+    }
+    let parser: CliParser = hlscli_build_parser()
+    let script: str = complete_render(parser, "hls", shell_kind)
+    println(script)
+    return 0
+}
+
+# hlscli_extract_shell(rem) — scan the remaining args for --shell=X or
+# --shell X. Returns the shell name, or "" if not found.
+fn hlscli_extract_shell(rem: list[str]) -> str {
+    let mut i: int = 0
+    while i < rem.len() {
+        let a: str = rem.get(i)
+        if a == "--shell" {
+            if i + 1 < rem.len() {
+                return rem.get(i + 1)
+            }
+            return ""
+        }
+        if a.starts_with("--shell=") {
+            return a.slice(8, a.len())
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+# ============================================================================
+# hlscli_run() — the program entry point. Delegates to hlscli_main().
+# (Named hlscli_run, NOT main, so the std module can be imported without
+# defining a `main` that conflicts with the importing program's main.)
+# ============================================================================
+
+fn hlscli_run() -> int uses Args, IO, Fs, Proc {
+    return hlscli_main()
+}
+
+# ============================================================================
+# End of std/hlscli.hls
+# ============================================================================

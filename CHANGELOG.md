@@ -13,6 +13,199 @@ stability (125–140), and final stabilisation toward v1.0 (141–150).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
+## [v0.82.0-alpha] — Stage 61: std.hlsdoc (rustdoc-style API docs generator)
+
+> Continues **Phase IV (CLI tooling track, Stages 53–62)**.
+> Adds `std.hlsdoc` — a pure-HLS rustdoc-style API doc generator. Reads
+> `#`-comment doc blocks (HLS uses `#` for line comments; the doc-comment
+> convention is contiguous `#`-comment lines immediately above a
+> declaration), extracts top-level `fn`/`struct`/`enum`/`impl`
+> declarations + their doc comments, and renders a complete HTML page
+> with cross-references, search index, and type signatures. Output is
+> static HTML (no JS runtime framework — a small embedded vanilla-JS
+> script implements client-side search, ~20 lines).
+>
+> Implements the roadmap's Stage 61 promise:
+> - `hlsdoc_parse_module(name, source)` — pure parser: extracts DocItems
+>   (kind, name, signature, doc, line). Brace-depth tracking skips
+>   methods/fields inside impl/struct/enum blocks (the impl is one
+>   DocItem; its methods are not separately documented in v0.82.0-alpha).
+> - `hlsdoc_render_html(module)` — pure renderer: complete HTML page
+>   with `<style>` (CSS badges per kind), `<header>` (module name + item
+>   count), `<input type="search">`, `<main>` with one `<section>` per
+>   item (id=lowercased-name, kind badge, `<pre class="signature">`,
+>   `<div class="doc">` with paragraph-split doc, source line number),
+>   and an embedded `<script>` for client-side search.
+> - Cross-references: `[name]` in a doc comment becomes
+>   `<a href="#name">name</a>` if `name` is a declared item in the
+>   module; otherwise literal `[name]` (no broken links).
+> - Section headers: `## Title` in a doc comment becomes
+>   `<h3>Title</h3>` (paragraph-split so the header is its own block).
+> - `hlsdoc_render_search_index(module)` — JSON array of
+>   {name, kind, signature, anchor, line} entries (for cross-module
+>   search aggregation in a future stage).
+> - `hlsdoc_render_summary(module)` — plain-text listing (for terminals
+>   without a browser).
+> - `hlsdoc_escape_html(s)` — security-critical: escapes `& < > " '`
+>   (defense-in-depth against XSS via malicious doc comments).
+> - `hlsdoc_escape_json(s)` — JSON string escaping (quotes, backslashes,
+>   control bytes).
+> - `hlsdoc_write_html(module, path)` / `hlsdoc_write_search_index(...)`
+>   — Fs effect (write_file); write to disk.
+>
+> No new compiler builtins — pure-HLS on top of `std.str`, `std.option`,
+> `std.result`, and the `write_file` builtin (Fs).
+>
+> **Acceptance**: `make hlsdoc-acceptance` runs the demo + acceptance
+> test differentially (interpreter == native) — both PASS.
+> 25/25 tests in `tests/ok/feat_stage61_hlsdoc.hls` PASS.
+
+## [v0.81.0-alpha] — Stage 60: std.hlscli (cargo-style launcher)
+
+> Continues **Phase IV (CLI tooling track, Stages 53–62)**.
+> Adds `std.hlscli` — a cargo-style launcher that replaces `make` for
+> end-users (the Makefile remains for compiler developers). The launcher
+> is itself an HLS program (`hlscli_run()` is the entry point); the
+> user installs it via `make install` (which compiles `std/hlscli.hls`
+> to a native binary and copies it to `/usr/local/bin/hls`).
+>
+> Implements the roadmap's Stage 60 promise:
+> - Subcommands: `new` / `init` / `run` / `build` / `test` / `bench` /
+>   `doc` / `publish` / `clean` / `update` / `completion`.
+> - `hls new <name>` scaffolds a project: `hls-pkg.toml` (parsed by
+>   std.config's TOML parser), `src/main.hls` (hello-world template),
+>   `.gitignore`, `README.md`.
+> - `hls run` compiles `src/main.hls` via the native `hlc` binary +
+>   `gcc`, then runs the resulting binary. `--release` builds with
+>   `-O2`. `hls run -- ARGS` passes ARGS to the program.
+> - `hls build` compiles without running. `hls build --lib` builds
+>   `src/lib.hls` as a static library (if present).
+> - `hls test` runs `tools/hltest.py` on `tests/` (or `src/main.hls` if
+>   no `tests/` dir).
+> - `hls bench` runs `benches/run_bench.sh`.
+> - `hls doc` generates API docs in `target/doc/` (via std.hlsdoc —
+>   Stage 61).
+> - `hls clean` removes `target/`.
+> - `hls completion --shell=bash|zsh|fish|powershell` generates shell
+>   completions for `hls` itself (via std.complete — Stage 59).
+> - Project detection: `hlscli_find_project_root()` walks up from the
+>   cwd looking for `hls-pkg.toml`; errors with a clear message if not
+>   found.
+> - Env-var config: `HLS_COMPILER` (path to hlc), `HLS_TARGET_DIR`
+>   (build dir), `HLS_RELEASE=1` (equivalent to `--release`).
+> - Profile selection: `debug` (default, `-O0`) / `release` (`-O2`).
+>
+> Security: subprocess spawning uses `proc_exec` (NOT a shell wrapper —
+> direct exec; no shell-injection). `hlscli_is_safe_project_name`
+> rejects `/`, `..`, leading `-`, spaces, dots (path-traversal defense).
+> `hlscli_quote_arg` shell-quotes args (single-quote with `'\''` trick).
+>
+> No new compiler builtins — pure-HLS on top of `std.cli`,
+> `std.process`, `std.config`, `std.fs`, `std.complete`, and the
+> `proc_exec` / `read_file` / `write_file` / `env_get` / `env_has` /
+> `cwd_get` builtins.
+>
+> **Acceptance**: `make hlscli-acceptance` runs the demo + acceptance
+> test differentially (interpreter == native) — both PASS.
+> 25/25 tests in `tests/ok/feat_stage60_hlscli.hls` PASS.
+
+## [v0.80.0-alpha] — Stage 59: std.complete (shell-completion generator)
+
+> Continues **Phase IV (CLI tooling track, Stages 53–62)**.
+> Adds `std.complete` — a pure-HLS shell-completion generator. Given a
+> `cli::CliParser` definition, produces a completion script for bash /
+> zsh / fish / powershell that knows every subcommand, flag, and arg.
+>
+> Implements the roadmap's Stage 59 promise:
+> - `complete_render(parser, name, shell)` — pure dispatcher (no IO):
+>   delegates to the shell-specific renderer.
+> - **Bash**: `complete -F _name name` mechanism. Emits a `_name()`
+>   function that handles: value-option file completion (via
+>   `compgen -f`), long-option completion (via `compgen -W`), short-
+>   option completion, and subcommand completion.
+> - **Zsh**: `#compdef name` mechanism. Emits a `_name()` function
+>   with `_arguments` spec (long/short option synonyms, value-type
+>   annotations `:int`/`:float`/`:file`, descriptions) and `_values`
+>   for subcommands.
+> - **Fish**: `complete -c name -l/-s/-d/-r` lines (one per option).
+>   Fish's native completion system; no function needed.
+> - **PowerShell**: `Register-ArgumentCompleter` mechanism. Emits a
+>   scriptblock that inspects `$wordToComplete` and suggests long
+>   options, short options, and subcommands via CompletionResult.
+> - Per-shell string-literal escaping: `complete_escape_bash` /
+>   `_zsh` / `_fish` (single-quote → `'\''`) and
+>   `complete_escape_powershell` (single-quote → `''`). Defense-in-
+>   depth against shell-code injection via malicious descriptions.
+> - `complete_install(parser, name, shell, install_dir)` — Fs effect
+>   (write_file); writes the script to the canonical install path.
+>   `complete_is_safe_name` rejects unsafe names (`/`, `..`, leading
+>   `-`, spaces) — path-traversal defense.
+> - `complete_shell_from_str(s)` — case-insensitive parse (`bash`/`sh`,
+>   `zsh`, `fish`, `powershell`/`pwsh`/`ps`).
+> - `complete_list_shells()` — human-readable listing + install paths.
+>
+> No new compiler builtins — pure-HLS on top of `std.cli`, `std.str`,
+> and the `write_file` builtin (Fs).
+>
+> **Acceptance**: `make complete-acceptance` runs the demo + acceptance
+> test differentially (interpreter == native) — both PASS.
+> 21/21 tests in `tests/ok/feat_stage59_complete.hls` PASS.
+
+## [v0.79.0-alpha] — Stage 58: std.config (layered config loader)
+
+> Continues **Phase IV (CLI tooling track, Stages 53–62)**.
+> Adds `std.config` — a layered config loader implementing the
+> 12-factor / cargo / viper convention: **defaults < file < env < CLI**.
+> Pure-HLS TOML parser (the preferred format), JSON config (via
+> std.json), env-var overlay with type coercion, dotted-path lookup,
+> and round-trip TOML serialisation.
+>
+> Implements the roadmap's Stage 58 promise:
+> - **ConfigSchema builder** (immutable updates): `config_schema_new()`
+>   + `str_key` / `int_key` / `float_key` / `bool_key` (with defaults)
+>   + `_no_default` variants (required) + `env(key, env_name)` (explicit
+>   env-var override). `impl ConfigSchema` method twins (.str_key /
+>   .int_key / ... / .env).
+> - **Pure-HLS TOML parser** (`toml_parse`): tables (`[section]`,
+>   `[section.sub]` dotted headers), inline tables (`{a = 1, b = 2}`),
+>   arrays (`[1, 2, 3]`, `["a", "b"]`), strings (basic `"..."` with
+>   `\n \t \r \\ \" \uXXXX \UXXXXXXXX`, literal `'...'` verbatim,
+>   multi-line basic `"""..."""` with line-continuation, multi-line
+>   literal `'''...'''`), ints (decimal, `0x` hex, `0o` octal, `0b`
+>   binary, `_` underscores), floats (`1.0`, `1.5e10`, `inf`, `nan`),
+>   bools (`true`/`false`), comments (`# ...`), quoted keys (`"my-key"`,
+>   `'another.key'`).
+> - **JSON config** (`config_parse_json`): delegates to std.json for
+>   content starting with `{`.
+> - **Layered loading** (`config_load(schema, file_content, env_prefix)`):
+>   Layer 1 = defaults; Layer 2 = file (overrides defaults); Layer 3 =
+>   env (overrides file). Env-var name derivation: `PREFIX_SECTION_KEY`
+>   (e.g., `MYAPP_SERVER_PORT` → `server.port`).
+> - **Type coercion** (`config_coerce_str` / `config_coerce_value`):
+>   str → int/float/bool, int → float/bool, float → int, bool → int.
+>   Coercion failures are load errors (NOT panics) — the caller
+>   decides how to handle them.
+> - **Dotted-path lookup** (`config_get_path`, `config_get_str` /
+>   `_int` / `_float` / `_bool`): walks the nested table tree; returns
+>   the default if the path is missing or the value is the wrong type
+>   (lenient — same convention as std.cli's accessors).
+> - **`config_set_str` / `_int` / `_float` / `_bool`** — mutate cfg
+>   in-place (for the CLI overlay; the caller applies it after loading).
+> - **`config_serialize(cfg)`** — round-trip TOML serialisation (for
+>   `hls config init`).
+> - **`config_describe(schema)`** — human-readable schema listing.
+> - **`config_load_file(schema, path, env_prefix)`** — Fs effect
+>   (read_file); convenience for loading from disk.
+> - **ConfigLoadError** — structured error (layer / key / message).
+>
+> No new compiler builtins — pure-HLS on top of `std.str`, `std.option`,
+> `std.result`, `std.json`, and the `read_file` (Fs) + `env_get` /
+> `env_has` (Proc) builtins.
+>
+> **Acceptance**: `make config-acceptance` runs the demo + acceptance
+> test differentially (interpreter == native) — both PASS.
+> 30/30 tests in `tests/ok/feat_stage58_config.hls` PASS.
+
 ## [v0.78.0-alpha] — Stage 63: std.http_router (HTTP routing: path params, query, middleware, sub-routers)
 
 > Begins **Phase V (web application track, Stages 63–76)**.

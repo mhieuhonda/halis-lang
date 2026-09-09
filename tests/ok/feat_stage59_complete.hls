@@ -1,0 +1,531 @@
+# tests/ok/feat_stage59_complete.hls — Stage 59 (v0.80.0-alpha): std.complete.
+#
+# Exercises:
+#   - Shell kinds: bash / zsh / fish / powershell.
+#   - complete_render(parser, name, shell) — the dispatcher.
+#   - Bash completion: _init_completion, compgen -W (long/short opts),
+#     compgen -f (file completion for value options), subcommand list.
+#   - Zsh completion: #compdef header, _arguments spec with -l/-s/-d/-r,
+#     _values for subcommands, value-type annotations (:int/:float/:file).
+#   - Fish completion: complete -c name -l/-s/-d/-r, subcommand lines.
+#   - PowerShell completion: Register-ArgumentCompleter, scriptblock,
+#     Get-ChildItem for file completion, $opts arrays.
+#   - complete_shell_from_str — parse shell name (case-insensitive).
+#   - complete_shell_name — canonical name lookup.
+#   - complete_escape_bash / _zsh / _fish / _powershell — string-literal
+#     escaping (single quotes doubled).
+#   - complete_install_filename — conventional filename per shell.
+#   - complete_install_path — dir + filename join.
+#   - complete_is_safe_name — rejects unsafe names (/, .., leading -).
+#   - complete_list_shells — human-readable listing.
+#
+# The test uses synthetic CliParser values and fixed shell kinds so the
+# output is fully reproducible and differential-safe (interpreter ==
+# native).
+
+import "std.complete"
+import "std.cli"
+import "std.str"
+
+# ============================================================================
+# Helpers
+# ============================================================================
+
+fn ok(actual: bool, msg: str) -> void uses IO {
+    if !actual {
+        panic("FAIL " + msg)
+    }
+}
+
+fn eq_int(actual: int, expected: int, msg: str) -> void uses IO {
+    if actual != expected {
+        panic("FAIL " + msg + ": expected " + expected.to_str() + ", got " + actual.to_str())
+    }
+}
+
+fn eq_str(actual: str, expected: str, msg: str) -> void uses IO {
+    if actual != expected {
+        panic("FAIL " + msg + ": expected '" + expected + "', got '" + actual + "'")
+    }
+}
+
+fn contains(haystack: str, needle: str) -> bool {
+    return haystack.contains(needle)
+}
+
+# ============================================================================
+# Build a test parser (mirrors Stage 53's acceptance parser).
+# ============================================================================
+
+fn build_test_parser() -> CliParser {
+    let p0: CliParser = cli_parser_new("myapp", "1.2.3")
+    let p1: CliParser = cli_parser_desc(p0, "Test app for Stage 59")
+    let p2: CliParser = cli_parser_flag(p1, "verbose", "v", "Enable verbose output")
+    let p3: CliParser = cli_parser_int_opt(p2, "port", "p", "Port number", false, 8080)
+    let p4: CliParser = cli_parser_str_opt(p3, "config", "c", "Config file", false, "")
+    let p5: CliParser = cli_parser_float_opt(p4, "timeout", "t", "Timeout seconds", false, 30.0)
+    let p6: CliParser = cli_parser_str_positional(p5, "input", "Input file", true)
+    let p7: CliParser = cli_parser_subcommand(p6, "init", "Initialize the project")
+    let p8: CliParser = cli_parser_subcommand(p7, "build", "Build the project")
+    return p8
+}
+
+# ============================================================================
+# Test 1: shell kind constants + name lookup.
+# ============================================================================
+
+fn test_shell_kinds() -> int uses IO {
+    eq_str(complete_shell_name(complete_shell_bash()), "bash", "kinds: bash")
+    eq_str(complete_shell_name(complete_shell_zsh()), "zsh", "kinds: zsh")
+    eq_str(complete_shell_name(complete_shell_fish()), "fish", "kinds: fish")
+    eq_str(complete_shell_name(complete_shell_powershell()), "powershell", "kinds: powershell")
+    eq_str(complete_shell_name(99), "unknown", "kinds: unknown -> 'unknown'")
+    return 0
+}
+
+# ============================================================================
+# Test 2: complete_shell_from_str — parse shell name.
+# ============================================================================
+
+fn test_shell_from_str() -> int uses IO {
+    eq_int(complete_shell_from_str("bash"), complete_shell_bash(), "from_str: bash")
+    eq_int(complete_shell_from_str("BASH"), complete_shell_bash(), "from_str: BASH (uppercase)")
+    eq_int(complete_shell_from_str("sh"), complete_shell_bash(), "from_str: sh -> bash")
+    eq_int(complete_shell_from_str("zsh"), complete_shell_zsh(), "from_str: zsh")
+    eq_int(complete_shell_from_str("ZSH"), complete_shell_zsh(), "from_str: ZSH (uppercase)")
+    eq_int(complete_shell_from_str("fish"), complete_shell_fish(), "from_str: fish")
+    eq_int(complete_shell_from_str("powershell"), complete_shell_powershell(), "from_str: powershell")
+    eq_int(complete_shell_from_str("pwsh"), complete_shell_powershell(), "from_str: pwsh -> powershell")
+    eq_int(complete_shell_from_str("ps"), complete_shell_powershell(), "from_str: ps -> powershell")
+    eq_int(complete_shell_from_str("unknown"), -1, "from_str: unknown -> -1")
+    return 0
+}
+
+# ============================================================================
+# Test 3: bash completion — structure.
+# ============================================================================
+
+fn test_bash_structure() -> int uses IO {
+    let p: CliParser = build_test_parser()
+    let script: str = complete_render(p, "myapp", complete_shell_bash())
+    # Header comment.
+    ok(contains(script, "Bash completion for myapp"), "bash: header")
+    ok(contains(script, "/etc/bash_completion.d/myapp"), "bash: install path hint")
+    # Function definition.
+    ok(contains(script, "_myapp() {"), "bash: function def")
+    # _init_completion call.
+    ok(contains(script, "_init_completion"), "bash: _init_completion call")
+    # Case statement for value options.
+    ok(contains(script, "case \"$prev\" in"), "bash: case statement")
+    # --port and -p should be in the case.
+    ok(contains(script, "--port|-p)"), "bash: --port|-p in case")
+    ok(contains(script, "--config|-c)"), "bash: --config|-c in case")
+    # compgen -f for file completion.
+    ok(contains(script, "compgen -f"), "bash: compgen -f for file completion")
+    # Long options block.
+    ok(contains(script, "if [[ \"$cur\" == --* ]]"), "bash: long opts condition")
+    ok(contains(script, "--help --version --verbose --port --config"), "bash: long opts list")
+    # Short options block.
+    ok(contains(script, "if [[ \"$cur\" == -* ]]"), "bash: short opts condition")
+    ok(contains(script, "-h -V -v -p -c"), "bash: short opts list")
+    # Subcommands.
+    ok(contains(script, "local subs=\"init build\""), "bash: subcommand list")
+    # Register.
+    ok(contains(script, "complete -F _myapp myapp"), "bash: register line")
+    return 0
+}
+
+# ============================================================================
+# Test 4: bash completion — no subcommands.
+# ============================================================================
+
+fn test_bash_no_subcommands() -> int uses IO {
+    let p0: CliParser = cli_parser_new("simple", "1.0.0")
+    let p1: CliParser = cli_parser_flag(p0, "verbose", "v", "Verbose")
+    let script: str = complete_render(p1, "simple", complete_shell_bash())
+    # No subcommand list.
+    ok(!contains(script, "local subs="), "bash_no_sub: no subs line")
+    # Falls back to file completion.
+    ok(contains(script, "compgen -f -- \"$cur\""), "bash_no_sub: file completion fallback")
+    return 0
+}
+
+# ============================================================================
+# Test 5: zsh completion — structure.
+# ============================================================================
+
+fn test_zsh_structure() -> int uses IO {
+    let p: CliParser = build_test_parser()
+    let script: str = complete_render(p, "myapp", complete_shell_zsh())
+    # #compdef header.
+    ok(contains(script, "#compdef myapp"), "zsh: #compdef header")
+    ok(contains(script, "/usr/local/share/zsh/site-functions/_myapp"), "zsh: install path hint")
+    # Function definition.
+    ok(contains(script, "_myapp() {"), "zsh: function def")
+    # _arguments spec.
+    ok(contains(script, "_arguments"), "zsh: _arguments call")
+    # Help / version options.
+    ok(contains(script, "Print help message"), "zsh: help description")
+    ok(contains(script, "Print version"), "zsh: version description")
+    # User options with value-type annotations.
+    ok(contains(script, ":int"), "zsh: int value type for --port")
+    ok(contains(script, ":file"), "zsh: file value type for --config")
+    ok(contains(script, ":float"), "zsh: float value type for --timeout")
+    # User option descriptions.
+    ok(contains(script, "Enable verbose output"), "zsh: verbose description")
+    ok(contains(script, "Port number"), "zsh: port description")
+    # Subcommands via _values.
+    ok(contains(script, "subs=("), "zsh: subs array")
+    ok(contains(script, "init[Initialize the project]"), "zsh: init subcommand")
+    ok(contains(script, "build[Build the project]"), "zsh: build subcommand")
+    ok(contains(script, "_values 'subcommand'"), "zsh: _values call")
+    # Final autoload.
+    ok(contains(script, "_myapp \"$@\""), "zsh: autoload call")
+    return 0
+}
+
+# ============================================================================
+# Test 6: fish completion — structure.
+# ============================================================================
+
+fn test_fish_structure() -> int uses IO {
+    let p: CliParser = build_test_parser()
+    let script: str = complete_render(p, "myapp", complete_shell_fish())
+    # Header.
+    ok(contains(script, "fish completion for myapp"), "fish: header")
+    ok(contains(script, "~/.config/fish/completions/myapp.fish"), "fish: install path")
+    # Help / version.
+    ok(contains(script, "complete -c myapp -l help -s h -d 'Print help message'"), "fish: help")
+    ok(contains(script, "complete -c myapp -l version -s V -d 'Print version'"), "fish: version")
+    # User options.
+    ok(contains(script, "complete -c myapp -l verbose -s v -d 'Enable verbose output'"), "fish: verbose")
+    ok(contains(script, "complete -c myapp -l port -s p"), "fish: port (with -r)")
+    ok(contains(script, "-r"), "fish: -r flag for value options")
+    # Subcommands.
+    ok(contains(script, "__fish_use_subcommand"), "fish: subcommand guard")
+    ok(contains(script, "-a 'init'"), "fish: init subcommand")
+    ok(contains(script, "-a 'build'"), "fish: build subcommand")
+    ok(contains(script, "Initialize the project"), "fish: init description")
+    ok(contains(script, "Build the project"), "fish: build description")
+    return 0
+}
+
+# ============================================================================
+# Test 7: powershell completion — structure.
+# ============================================================================
+
+fn test_powershell_structure() -> int uses IO {
+    let p: CliParser = build_test_parser()
+    let script: str = complete_render(p, "myapp", complete_shell_powershell())
+    # Header.
+    ok(contains(script, "PowerShell completion for myapp"), "ps: header")
+    ok(contains(script, "Invoke-Expression"), "ps: install hint")
+    # ScriptBlock.
+    ok(contains(script, "$myapp_completer = {"), "ps: scriptblock def")
+    ok(contains(script, "param($wordToComplete, $commandAst, $cursorPosition)"), "ps: param block")
+    # Switch for value options.
+    ok(contains(script, "switch ($previous)"), "ps: switch statement")
+    ok(contains(script, "'--port'"), "ps: --port case")
+    ok(contains(script, "'--config'"), "ps: --config case")
+    ok(contains(script, "Get-ChildItem"), "ps: Get-ChildItem for file completion")
+    # Long options.
+    ok(contains(script, "$wordToComplete.StartsWith('--')"), "ps: long opts condition")
+    ok(contains(script, "$opts = @('--help'"), "ps: long opts array")
+    # Short options.
+    ok(contains(script, "$wordToComplete.StartsWith('-')"), "ps: short opts condition")
+    ok(contains(script, "$opts = @('-h'"), "ps: short opts array")
+    # Subcommands.
+    ok(contains(script, "$subs = @('init'"), "ps: subs array")
+    # Register.
+    ok(contains(script, "Register-ArgumentCompleter -Native -CommandName myapp"), "ps: register")
+    return 0
+}
+
+# ============================================================================
+# Test 8: complete_render dispatcher — unknown shell.
+# ============================================================================
+
+fn test_unknown_shell() -> int uses IO {
+    let p: CliParser = build_test_parser()
+    let script: str = complete_render(p, "myapp", 99)
+    ok(contains(script, "unknown shell kind 99"), "unknown: error message")
+    return 0
+}
+
+# ============================================================================
+# Test 9: complete_escape_bash — single-quote escaping.
+# ============================================================================
+
+fn test_escape_bash() -> int uses IO {
+    # Single quote -> '\'' (close, escaped quote, reopen).
+    eq_str(complete_escape_bash("simple"), "simple", "esc_bash: simple unchanged")
+    eq_str(complete_escape_bash("it's"), "it'\\''s", "esc_bash: single quote escaped")
+    eq_str(complete_escape_bash("'quoted'"), "'\\''quoted'\\''", "esc_bash: leading/trailing quotes")
+    eq_str(complete_escape_bash(""), "", "esc_bash: empty unchanged")
+    return 0
+}
+
+# ============================================================================
+# Test 10: complete_escape_zsh — same as bash.
+# ============================================================================
+
+fn test_escape_zsh() -> int uses IO {
+    eq_str(complete_escape_zsh("simple"), "simple", "esc_zsh: simple unchanged")
+    eq_str(complete_escape_zsh("it's"), "it'\\''s", "esc_zsh: single quote escaped")
+    return 0
+}
+
+# ============================================================================
+# Test 11: complete_escape_fish — same as bash.
+# ============================================================================
+
+fn test_escape_fish() -> int uses IO {
+    eq_str(complete_escape_fish("simple"), "simple", "esc_fish: simple unchanged")
+    eq_str(complete_escape_fish("it's"), "it'\\''s", "esc_fish: single quote escaped")
+    return 0
+}
+
+# ============================================================================
+# Test 12: complete_escape_powershell — single quote doubled.
+# ============================================================================
+
+fn test_escape_powershell() -> int uses IO {
+    eq_str(complete_escape_powershell("simple"), "simple", "esc_ps: simple unchanged")
+    eq_str(complete_escape_powershell("it's"), "it''s", "esc_ps: single quote doubled")
+    eq_str(complete_escape_powershell("'quoted'"), "''quoted''", "esc_ps: leading/trailing quotes doubled")
+    eq_str(complete_escape_powershell(""), "", "esc_ps: empty unchanged")
+    return 0
+}
+
+# ============================================================================
+# Test 13: complete_install_filename — conventional filename per shell.
+# ============================================================================
+
+fn test_install_filename() -> int uses IO {
+    eq_str(complete_install_filename("myapp", complete_shell_bash()), "myapp", "filename: bash = myapp")
+    eq_str(complete_install_filename("myapp", complete_shell_zsh()), "_myapp", "filename: zsh = _myapp")
+    eq_str(complete_install_filename("myapp", complete_shell_fish()), "myapp.fish", "filename: fish = myapp.fish")
+    eq_str(complete_install_filename("myapp", complete_shell_powershell()), "myapp.ps1", "filename: ps = myapp.ps1")
+    return 0
+}
+
+# ============================================================================
+# Test 14: complete_install_path — dir + filename join.
+# ============================================================================
+
+fn test_install_path() -> int uses IO {
+    eq_str(complete_install_path("/etc/bash_completion.d", "myapp"),
+        "/etc/bash_completion.d/myapp", "install_path: bash dir")
+    eq_str(complete_install_path("/usr/local/share/zsh/site-functions", "_myapp"),
+        "/usr/local/share/zsh/site-functions/_myapp", "install_path: zsh dir")
+    eq_str(complete_install_path("/etc/bash_completion.d/", "myapp"),
+        "/etc/bash_completion.d/myapp", "install_path: trailing slash stripped")
+    eq_str(complete_install_path("", "myapp"), "myapp", "install_path: empty dir = filename")
+    return 0
+}
+
+# ============================================================================
+# Test 15: complete_is_safe_name — sanitise program name.
+# ============================================================================
+
+fn test_safe_name() -> int uses IO {
+    # Safe names.
+    ok(complete_is_safe_name("myapp"), "safe: myapp")
+    ok(complete_is_safe_name("my-app"), "safe: my-app")
+    ok(complete_is_safe_name("my_app"), "safe: my_app")
+    ok(complete_is_safe_name("a1b2c3"), "safe: a1b2c3")
+    # Unsafe names.
+    ok(!complete_is_safe_name(""), "unsafe: empty")
+    ok(!complete_is_safe_name("my/app"), "unsafe: contains /")
+    ok(!complete_is_safe_name("my..app"), "unsafe: contains ..")
+    ok(!complete_is_safe_name("../etc/passwd"), "unsafe: traversal")
+    ok(!complete_is_safe_name("-foo"), "unsafe: leading hyphen")
+    ok(!complete_is_safe_name("my app"), "unsafe: contains space")
+    ok(!complete_is_safe_name("my;app"), "unsafe: contains semicolon")
+    return 0
+}
+
+# ============================================================================
+# Test 16: complete_list_shells — human-readable listing.
+# ============================================================================
+
+fn test_list_shells() -> int uses IO {
+    let listing: str = complete_list_shells()
+    ok(contains(listing, "Supported shells:"), "list: header")
+    ok(contains(listing, "bash"), "list: bash")
+    ok(contains(listing, "zsh"), "list: zsh")
+    ok(contains(listing, "fish"), "list: fish")
+    ok(contains(listing, "powershell"), "list: powershell")
+    ok(contains(listing, "/etc/bash_completion.d/<name>"), "list: bash install path")
+    ok(contains(listing, "~/.config/fish/completions/<name>.fish"), "list: fish install path")
+    return 0
+}
+
+# ============================================================================
+# Test 17: complete_install — write file to disk (Fs effect).
+# ============================================================================
+
+fn test_install() -> int uses IO, Fs {
+    let p: CliParser = build_test_parser()
+    complete_install(p, "myapp", complete_shell_bash(), "/tmp")
+    # Read back and verify.
+    let content: str = read_file("/tmp/myapp")
+    ok(contains(content, "Bash completion for myapp"), "install: file content has header")
+    ok(contains(content, "complete -F _myapp myapp"), "install: file content has register line")
+    return 0
+}
+
+# ============================================================================
+# Test 18: bash completion — only long options (no short).
+# ============================================================================
+
+fn test_bash_only_long() -> int uses IO {
+    let p0: CliParser = cli_parser_new("longonly", "1.0.0")
+    let p1: CliParser = cli_parser_str_opt(p0, "config", "", "Config file", false, "")
+    let script: str = complete_render(p1, "longonly", complete_shell_bash())
+    # The --config option should be in the long opts list.
+    ok(contains(script, "--config"), "bash_long: --config in long opts")
+    # No short opts (only -h and -V).
+    ok(contains(script, "-h -V"), "bash_long: only -h -V in short opts")
+    return 0
+}
+
+# ============================================================================
+# Test 19: bash completion — only short options (no long).
+# ============================================================================
+
+fn test_bash_only_short() -> int uses IO {
+    let p0: CliParser = cli_parser_new("shortonly", "1.0.0")
+    let p1: CliParser = cli_parser_flag(p0, "", "v", "Verbose")
+    let script: str = complete_render(p1, "shortonly", complete_shell_bash())
+    # The -v option should be in the short opts list.
+    ok(contains(script, "-h -V -v"), "bash_short: -v in short opts")
+    return 0
+}
+
+# ============================================================================
+# Test 20: zsh completion — no subcommands.
+# ============================================================================
+
+fn test_zsh_no_subcommands() -> int uses IO {
+    let p0: CliParser = cli_parser_new("simple", "1.0.0")
+    let p1: CliParser = cli_parser_flag(p0, "verbose", "v", "Verbose")
+    let script: str = complete_render(p1, "simple", complete_shell_zsh())
+    # No _values call.
+    ok(!contains(script, "_values"), "zsh_no_sub: no _values call")
+    # _arguments without -C (no subcommand state).
+    ok(contains(script, "_arguments -C $opts"), "zsh_no_sub: _arguments without subcommand state")
+    return 0
+}
+
+# ============================================================================
+# Test 21: differential safety — same parser, same output.
+# This test re-renders the same parser twice and verifies the outputs
+# are byte-identical (the generators are pure functions of the parser).
+# ============================================================================
+
+fn test_differential_safety() -> int uses IO {
+    let p: CliParser = build_test_parser()
+    let bash1: str = complete_render(p, "myapp", complete_shell_bash())
+    let bash2: str = complete_render(p, "myapp", complete_shell_bash())
+    eq_str(bash1, bash2, "diff: bash output deterministic")
+    let zsh1: str = complete_render(p, "myapp", complete_shell_zsh())
+    let zsh2: str = complete_render(p, "myapp", complete_shell_zsh())
+    eq_str(zsh1, zsh2, "diff: zsh output deterministic")
+    let fish1: str = complete_render(p, "myapp", complete_shell_fish())
+    let fish2: str = complete_render(p, "myapp", complete_shell_fish())
+    eq_str(fish1, fish2, "diff: fish output deterministic")
+    let ps1: str = complete_render(p, "myapp", complete_shell_powershell())
+    let ps2: str = complete_render(p, "myapp", complete_shell_powershell())
+    eq_str(ps1, ps2, "diff: powershell output deterministic")
+    return 0
+}
+
+# ============================================================================
+# Main — run all tests sequentially.
+# ============================================================================
+
+fn main() -> int uses IO, Fs {
+    println("=== Stage 59: std.complete (shell-completion generator) ===")
+    println("")
+    println("--- shell kind constants + name lookup ---")
+    test_shell_kinds()
+    println("  ok")
+    println("--- complete_shell_from_str (parse shell name) ---")
+    test_shell_from_str()
+    println("  ok")
+    println("--- bash completion structure ---")
+    test_bash_structure()
+    println("  ok")
+    println("--- bash completion: no subcommands ---")
+    test_bash_no_subcommands()
+    println("  ok")
+    println("--- zsh completion structure ---")
+    test_zsh_structure()
+    println("  ok")
+    println("--- fish completion structure ---")
+    test_fish_structure()
+    println("  ok")
+    println("--- powershell completion structure ---")
+    test_powershell_structure()
+    println("  ok")
+    println("--- complete_render: unknown shell ---")
+    test_unknown_shell()
+    println("  ok")
+    println("--- complete_escape_bash ---")
+    test_escape_bash()
+    println("  ok")
+    println("--- complete_escape_zsh ---")
+    test_escape_zsh()
+    println("  ok")
+    println("--- complete_escape_fish ---")
+    test_escape_fish()
+    println("  ok")
+    println("--- complete_escape_powershell ---")
+    test_escape_powershell()
+    println("  ok")
+    println("--- complete_install_filename ---")
+    test_install_filename()
+    println("  ok")
+    println("--- complete_install_path ---")
+    test_install_path()
+    println("  ok")
+    println("--- complete_is_safe_name ---")
+    test_safe_name()
+    println("  ok")
+    println("--- complete_list_shells ---")
+    test_list_shells()
+    println("  ok")
+    println("--- complete_install (Fs effect) ---")
+    test_install()
+    println("  ok")
+    println("--- bash: only long options ---")
+    test_bash_only_long()
+    println("  ok")
+    println("--- bash: only short options ---")
+    test_bash_only_short()
+    println("  ok")
+    println("--- zsh: no subcommands ---")
+    test_zsh_no_subcommands()
+    println("  ok")
+    println("--- differential safety (same parser, same output) ---")
+    test_differential_safety()
+    println("  ok")
+    println("")
+    println("ACCEPTANCE OK: Stage 59 — std.complete (shell-completion generator)")
+    println("  Shell kinds: bash / zsh / fish / powershell")
+    println("  complete_render(parser, name, shell) dispatcher (pure, no IO)")
+    println("  Bash: _init_completion + compgen -W (long/short opts) + compgen -f (files)")
+    println("  Zsh: #compdef + _arguments spec + _values for subcommands + value types")
+    println("  Fish: complete -c name -l/-s/-d/-r lines + subcommand lines")
+    println("  PowerShell: Register-ArgumentCompleter + scriptblock + Get-ChildItem")
+    println("  complete_shell_from_str (case-insensitive: bash/sh, zsh, fish, pwsh/ps)")
+    println("  complete_escape_bash/zsh/fish (single quote -> '\\'\\'') + powershell (doubled)")
+    println("  complete_install_filename (per-shell convention) + complete_install_path")
+    println("  complete_is_safe_name (rejects /, .., leading -, spaces, special chars)")
+    println("  complete_list_shells (human-readable listing + install paths)")
+    println("  complete_install (Fs effect — write_file to canonical path)")
+    println("  Pure-HLS implementation (no new compiler builtins)")
+    println("  differential (interpreter == native) verified green.")
+    return 0
+}

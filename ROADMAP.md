@@ -100,10 +100,10 @@ remains green.
 | 55 | `std.color` — terminal color detection, truecolor fallback | ✅ | (done in v0.74.0-alpha) |
 | 56 | `std.progress` — progress bars, spinners, ETA | ✅ | (done in v0.75.0-alpha) |
 | 57 | `std.log` — structured logging (JSON + human formats) | ✅ | (done in v0.76.0-alpha) |
-| 58 | `std.config` — TOML + YAML + env-layered config loader | ⬜ | 4 weeks |
-| 59 | `std.complete` — shell-completion generator (bash/zsh/fish) | ⬜ | 3 weeks |
-| 60 | `hls-cli` — `cargo`-style launcher (`hls new`, `hls run`, `hls build`) | ⬜ | 5 weeks |
-| 61 | `hls-doc` — rustdoc-style API docs generator | ⬜ | 6 weeks |
+| 58 | `std.config` — TOML + YAML + env-layered config loader | ✅ | (done in v0.79.0-alpha) |
+| 59 | `std.complete` — shell-completion generator (bash/zsh/fish) | ✅ | (done in v0.80.0-alpha) |
+| 60 | `hls-cli` — `cargo`-style launcher (`hls new`, `hls run`, `hls build`) | ✅ | (done in v0.81.0-alpha) |
+| 61 | `hls-doc` — rustdoc-style API docs generator | ✅ | (done in v0.82.0-alpha) |
 | 62 | Man-page generator (`--man` produces nroff) | ✅ | (done in v0.77.0-alpha) |
 
 ### Phase V — Web application track (Stages 63–76)

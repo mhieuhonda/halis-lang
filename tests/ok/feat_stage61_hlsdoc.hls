@@ -1,0 +1,592 @@
+# tests/ok/feat_stage61_hlsdoc.hls — Stage 61 (v0.82.0-alpha): std.hlsdoc.
+#
+# Exercises:
+#   - hlsdoc_parse_module — parse HLS source into a DocModule.
+#   - hlsdoc_render_html — render a DocModule as a complete HTML page.
+#   - hlsdoc_render_summary — plain-text summary.
+#   - hlsdoc_render_search_index — JSON search index.
+#   - hlsdoc_escape_html — HTML metacharacter escaping.
+#   - hlsdoc_escape_json — JSON string escaping.
+#   - hlsdoc_split_paragraphs — paragraph splitting.
+#   - hlsdoc_module_has_item — cross-reference resolution.
+#   - hlsdoc_render_cross_refs — [name] -> <a href="#name">name</a>.
+#   - hlsdoc_extract_name — extract the declared name from a sig line.
+#   - hlsdoc_kind_name — human-readable kind name.
+#   - hlsdoc_anchor — lowercased anchor.
+#   - hlsdoc_write_html / hlsdoc_write_search_index — Fs effect (write_file).
+#
+# The test uses synthetic HLS source strings so the output is fully
+# reproducible and differential-safe (interpreter == native).
+
+import "std.hlsdoc"
+import "std.str"
+
+# ============================================================================
+# Helpers
+# ============================================================================
+
+fn ok(actual: bool, msg: str) -> void uses IO {
+    if !actual {
+        panic("FAIL " + msg)
+    }
+}
+
+fn eq_int(actual: int, expected: int, msg: str) -> void uses IO {
+    if actual != expected {
+        panic("FAIL " + msg + ": expected " + expected.to_str() + ", got " + actual.to_str())
+    }
+}
+
+fn eq_str(actual: str, expected: str, msg: str) -> void uses IO {
+    if actual != expected {
+        panic("FAIL " + msg + ": expected '" + expected + "', got '" + actual + "'")
+    }
+}
+
+fn contains(haystack: str, needle: str) -> bool {
+    return haystack.contains(needle)
+}
+
+# ============================================================================
+# Test source — a small HLS module with various declaration kinds + doc
+# comments.
+# ============================================================================
+
+fn build_test_source() -> str {
+    let src: str = "# A test module for Stage 61.\n" +
+        "# This is the second line of the module doc.\n\n" +
+        "# Add two integers.\n" +
+        "# Returns the sum.\n" +
+        "# See [sub] for subtraction.\n" +
+        "fn add(a: int, b: int) -> int {\n" +
+        "    return a + b\n" +
+        "}\n\n" +
+        "# Subtract b from a.\n" +
+        "# See [add] for addition.\n" +
+        "fn sub(a: int, b: int) -> int {\n" +
+        "    return a - b\n" +
+        "}\n\n" +
+        "# A user record.\n" +
+        "# Fields: name, age.\n" +
+        "struct User {\n" +
+        "    name: str,\n" +
+        "    age: int,\n" +
+        "}\n\n" +
+        "# An option type.\n" +
+        "enum Option[T] {\n" +
+        "    Some(T),\n" +
+        "    None\n" +
+        "}\n\n" +
+        "# impl User block.\n" +
+        "impl User {\n" +
+        "    fn greet(self: User) -> str {\n" +
+        "        return self.name\n" +
+        "    }\n" +
+        "}\n"
+    return src
+}
+
+# ============================================================================
+# Test 1: hlsdoc_parse_module — basic parsing.
+# ============================================================================
+
+fn test_parse_basic() -> int uses IO {
+    let src: str = build_test_source()
+    let m: DocModule = hlsdoc_parse_module("test", src)
+    # Should have 5 items: add (fn), sub (fn), User (struct), Option (enum), User (impl).
+    eq_int(m.items.len(), 5, "parse: 5 items")
+    eq_str(m.name, "test", "parse: module name=test")
+    # Check the first item (add).
+    let add: DocItem = m.items.get(0)
+    eq_str(add.name, "add", "parse: item[0].name=add")
+    eq_int(add.kind, hlsdoc_kind_fn(), "parse: item[0].kind=fn")
+    ok(contains(add.signature, "fn add(a: int, b: int)"), "parse: item[0].signature")
+    ok(contains(add.doc, "Add two integers"), "parse: item[0].doc has 'Add two integers'")
+    ok(contains(add.doc, "Returns the sum"), "parse: item[0].doc has 'Returns the sum'")
+    ok(contains(add.doc, "[sub]"), "parse: item[0].doc has [sub] cross-ref")
+    return 0
+}
+
+# ============================================================================
+# Test 2: hlsdoc_parse_module — struct / enum / impl detection.
+# ============================================================================
+
+fn test_parse_kinds() -> int uses IO {
+    let src: str = build_test_source()
+    let m: DocModule = hlsdoc_parse_module("test", src)
+    # add (fn), sub (fn), User (struct), Option (enum), User (impl).
+    eq_int(m.items.get(0).kind, hlsdoc_kind_fn(), "kinds: add is fn")
+    eq_int(m.items.get(1).kind, hlsdoc_kind_fn(), "kinds: sub is fn")
+    eq_int(m.items.get(2).kind, hlsdoc_kind_struct(), "kinds: User is struct")
+    eq_int(m.items.get(3).kind, hlsdoc_kind_enum(), "kinds: Option is enum")
+    eq_int(m.items.get(4).kind, hlsdoc_kind_impl(), "kinds: impl User is impl")
+    return 0
+}
+
+# ============================================================================
+# Test 3: hlsdoc_parse_module — line numbers.
+# ============================================================================
+
+fn test_parse_lines() -> int uses IO {
+    let src: str = build_test_source()
+    let m: DocModule = hlsdoc_parse_module("test", src)
+    # add is on line 7 (1-indexed: line 1 is the first '# A test module'
+    # comment; the fn add declaration is on line 7).
+    eq_int(m.items.get(0).line, 7, "lines: add on line 7")
+    # sub is on line 13.
+    eq_int(m.items.get(1).line, 13, "lines: sub on line 13")
+    # User struct on line 19.
+    eq_int(m.items.get(2).line, 19, "lines: User struct on line 19")
+    return 0
+}
+
+# ============================================================================
+# Test 4: hlsdoc_render_html — HTML structure.
+# ============================================================================
+
+fn test_render_html_structure() -> int uses IO {
+    let src: str = build_test_source()
+    let m: DocModule = hlsdoc_parse_module("test", src)
+    let html: str = hlsdoc_render_html(m)
+    # DOCTYPE + html.
+    ok(contains(html, "<!DOCTYPE html>"), "html: has DOCTYPE")
+    ok(contains(html, "<html lang=\"en\">"), "html: has <html lang=en>")
+    # Head.
+    ok(contains(html, "<meta charset=\"utf-8\">"), "html: has charset meta")
+    ok(contains(html, "<title>test — Halis API docs</title>"), "html: title")
+    ok(contains(html, "<style>"), "html: has <style>")
+    # Header.
+    ok(contains(html, "<h1>test</h1>"), "html: h1 = module name")
+    ok(contains(html, "5 items"), "html: item count")
+    # Search box.
+    ok(contains(html, "<input type=\"search\""), "html: search input")
+    # Items.
+    ok(contains(html, "<section id=\"add\">"), "html: add section")
+    ok(contains(html, "<section id=\"sub\">"), "html: sub section")
+    ok(contains(html, "<section id=\"user\">"), "html: user section")
+    ok(contains(html, "<section id=\"option\">"), "html: option section")
+    # Badges.
+    ok(contains(html, "<span class=\"badge fn\">fn</span>"), "html: fn badge")
+    ok(contains(html, "<span class=\"badge struct\">struct</span>"), "html: struct badge")
+    ok(contains(html, "<span class=\"badge enum\">enum</span>"), "html: enum badge")
+    ok(contains(html, "<span class=\"badge impl\">impl</span>"), "html: impl badge")
+    # Signatures.
+    ok(contains(html, "<pre class=\"signature\">"), "html: signature pre")
+    # Doc paragraphs.
+    ok(contains(html, "<div class=\"doc\">"), "html: doc div")
+    ok(contains(html, "Add two integers"), "html: add doc")
+    # Source lines.
+    ok(contains(html, "Line 7"), "html: add line number")
+    # Search script.
+    ok(contains(html, "<script>"), "html: has script")
+    ok(contains(html, "search-input"), "html: script references search-input")
+    return 0
+}
+
+# ============================================================================
+# Test 5: hlsdoc_render_html — cross-references.
+# ============================================================================
+
+fn test_render_cross_refs() -> int uses IO {
+    let src: str = build_test_source()
+    let m: DocModule = hlsdoc_parse_module("test", src)
+    let html: str = hlsdoc_render_html(m)
+    # The [sub] cross-ref in add's doc should become an <a> link.
+    ok(contains(html, "<a href=\"#sub\">sub</a>"), "cross_ref: [sub] -> <a href=#sub>sub</a>")
+    # The [add] cross-ref in sub's doc should become an <a> link.
+    ok(contains(html, "<a href=\"#add\">add</a>"), "cross_ref: [add] -> <a href=#add>add</a>")
+    return 0
+}
+
+# ============================================================================
+# Test 6: hlsdoc_render_html — no cross-ref for unknown names.
+# ============================================================================
+
+fn test_render_no_unknown_cross_ref() -> int uses IO {
+    let src: str = "# Doc with [unknown] reference.\nfn foo() -> int { return 0 }\n"
+    let m: DocModule = hlsdoc_parse_module("test", src)
+    let html: str = hlsdoc_render_html(m)
+    # [unknown] should NOT become an <a> link (it's not a declared item).
+    ok(!contains(html, "<a href=\"#unknown\">"), "no_unknown: [unknown] not linked")
+    # But it should still appear as literal text.
+    ok(contains(html, "[unknown]"), "no_unknown: [unknown] literal text preserved")
+    return 0
+}
+
+# ============================================================================
+# Test 7: hlsdoc_escape_html — HTML metacharacter escaping.
+# ============================================================================
+
+fn test_escape_html() -> int uses IO {
+    eq_str(hlsdoc_escape_html("simple"), "simple", "esc_html: simple unchanged")
+    eq_str(hlsdoc_escape_html("a & b"), "a &amp; b", "esc_html: & -> &amp;")
+    eq_str(hlsdoc_escape_html("a < b"), "a &lt; b", "esc_html: < -> &lt;")
+    eq_str(hlsdoc_escape_html("a > b"), "a &gt; b", "esc_html: > -> &gt;")
+    eq_str(hlsdoc_escape_html("say \"hi\""), "say &quot;hi&quot;", "esc_html: \" -> &quot;")
+    eq_str(hlsdoc_escape_html("it's"), "it&#39;s", "esc_html: ' -> &#39;")
+    eq_str(hlsdoc_escape_html(""), "", "esc_html: empty unchanged")
+    return 0
+}
+
+# ============================================================================
+# Test 8: hlsdoc_escape_html — security (script injection blocked).
+# ============================================================================
+
+fn test_escape_html_security() -> int uses IO {
+    let malicious: str = "<script>alert('xss')</script>"
+    let escaped: str = hlsdoc_escape_html(malicious)
+    ok(!contains(escaped, "<script>"), "sec: <script> not present after escape")
+    ok(contains(escaped, "&lt;script&gt;"), "sec: <script> escaped to &lt;script&gt;")
+    return 0
+}
+
+# ============================================================================
+# Test 9: hlsdoc_escape_json — JSON string escaping.
+# ============================================================================
+
+fn test_escape_json() -> int uses IO {
+    eq_str(hlsdoc_escape_json("simple"), "simple", "esc_json: simple unchanged")
+    eq_str(hlsdoc_escape_json("say \"hi\""), "say \\\"hi\\\"", "esc_json: \" -> \\\"")
+    eq_str(hlsdoc_escape_json("back\\slash"), "back\\\\slash", "esc_json: \\ -> \\\\")
+    eq_str(hlsdoc_escape_json("new\nline"), "new\\nline", "esc_json: newline -> \\n")
+    eq_str(hlsdoc_escape_json("tab\tchar"), "tab\\tchar", "esc_json: tab -> \\t")
+    return 0
+}
+
+# ============================================================================
+# Test 10: hlsdoc_split_paragraphs — split on blank lines.
+# ============================================================================
+
+fn test_split_paragraphs() -> int uses IO {
+    let text: str = "Para 1 line 1.\nPara 1 line 2.\n\nPara 2.\n\nPara 3."
+    let paras: list[str] = hlsdoc_split_paragraphs(text)
+    eq_int(paras.len(), 3, "split: 3 paragraphs")
+    eq_str(paras.get(0), "Para 1 line 1.\nPara 1 line 2.", "split: paragraph 1")
+    eq_str(paras.get(1), "Para 2.", "split: paragraph 2")
+    eq_str(paras.get(2), "Para 3.", "split: paragraph 3")
+    return 0
+}
+
+# ============================================================================
+# Test 11: hlsdoc_module_has_item — cross-reference resolution.
+# ============================================================================
+
+fn test_module_has_item() -> int uses IO {
+    let src: str = build_test_source()
+    let m: DocModule = hlsdoc_parse_module("test", src)
+    ok(hlsdoc_module_has_item(m, "add"), "has_item: add")
+    ok(hlsdoc_module_has_item(m, "sub"), "has_item: sub")
+    ok(hlsdoc_module_has_item(m, "User"), "has_item: User")
+    ok(hlsdoc_module_has_item(m, "Option"), "has_item: Option")
+    ok(!hlsdoc_module_has_item(m, "nonexistent"), "has_item: nonexistent -> false")
+    return 0
+}
+
+# ============================================================================
+# Test 12: hlsdoc_extract_name — extract declared name from sig line.
+# ============================================================================
+
+fn test_extract_name() -> int uses IO {
+    eq_str(hlsdoc_extract_name("fn foo() -> int", 3), "foo", "extract: fn foo")
+    eq_str(hlsdoc_extract_name("fn bar(x: int) -> int", 3), "bar", "extract: fn bar with args")
+    eq_str(hlsdoc_extract_name("struct User {", 7), "User", "extract: struct User")
+    eq_str(hlsdoc_extract_name("enum Option[T] {", 5), "Option", "extract: enum Option[T]")
+    eq_str(hlsdoc_extract_name("impl User {", 5), "User", "extract: impl User")
+    return 0
+}
+
+# ============================================================================
+# Test 13: hlsdoc_kind_name — human-readable kind name.
+# ============================================================================
+
+fn test_kind_name() -> int uses IO {
+    eq_str(hlsdoc_kind_name(hlsdoc_kind_fn()), "fn", "kind: fn")
+    eq_str(hlsdoc_kind_name(hlsdoc_kind_struct()), "struct", "kind: struct")
+    eq_str(hlsdoc_kind_name(hlsdoc_kind_enum()), "enum", "kind: enum")
+    eq_str(hlsdoc_kind_name(hlsdoc_kind_impl()), "impl", "kind: impl")
+    eq_str(hlsdoc_kind_name(hlsdoc_kind_const()), "const", "kind: const")
+    eq_str(hlsdoc_kind_name(99), "item", "kind: unknown -> item")
+    return 0
+}
+
+# ============================================================================
+# Test 14: hlsdoc_anchor — lowercased anchor.
+# ============================================================================
+
+fn test_anchor() -> int uses IO {
+    eq_str(hlsdoc_anchor("add"), "add", "anchor: add")
+    eq_str(hlsdoc_anchor("User"), "user", "anchor: User -> user")
+    eq_str(hlsdoc_anchor("Option"), "option", "anchor: Option -> option")
+    return 0
+}
+
+# ============================================================================
+# Test 15: hlsdoc_render_summary — plain-text summary.
+# ============================================================================
+
+fn test_render_summary() -> int uses IO {
+    let src: str = build_test_source()
+    let m: DocModule = hlsdoc_parse_module("test", src)
+    let summary: str = hlsdoc_render_summary(m)
+    ok(contains(summary, "Module: test"), "summary: module name")
+    ok(contains(summary, "Items: 5"), "summary: item count")
+    ok(contains(summary, "fn add"), "summary: add fn")
+    ok(contains(summary, "struct User"), "summary: User struct")
+    ok(contains(summary, "enum Option"), "summary: Option enum")
+    ok(contains(summary, "impl User"), "summary: User impl")
+    return 0
+}
+
+# ============================================================================
+# Test 16: hlsdoc_render_search_index — JSON search index.
+# ============================================================================
+
+fn test_render_search_index() -> int uses IO {
+    let src: str = build_test_source()
+    let m: DocModule = hlsdoc_parse_module("test", src)
+    let json: str = hlsdoc_render_search_index(m)
+    ok(contains(json, "["), "search_index: starts with [")
+    ok(contains(json, "]"), "search_index: ends with ]")
+    ok(contains(json, "\"name\": \"add\""), "search_index: add entry")
+    ok(contains(json, "\"kind\": \"fn\""), "search_index: fn kind")
+    ok(contains(json, "\"kind\": \"struct\""), "search_index: struct kind")
+    ok(contains(json, "\"kind\": \"enum\""), "search_index: enum kind")
+    ok(contains(json, "\"anchor\": \"add\""), "search_index: add anchor")
+    ok(contains(json, "\"line\": 7"), "search_index: add line number")
+    return 0
+}
+
+# ============================================================================
+# Test 17: hlsdoc_write_html — write HTML to disk (Fs effect).
+# ============================================================================
+
+fn test_write_html() -> int uses IO, Fs {
+    let src: str = build_test_source()
+    let m: DocModule = hlsdoc_parse_module("test", src)
+    hlsdoc_write_html(m, "/tmp/feat_stage61_test.html")
+    # Read back and verify.
+    let content: str = read_file("/tmp/feat_stage61_test.html")
+    ok(contains(content, "<!DOCTYPE html>"), "write: file has DOCTYPE")
+    ok(contains(content, "<title>test — Halis API docs</title>"), "write: file has title")
+    ok(contains(content, "<section id=\"add\">"), "write: file has add section")
+    return 0
+}
+
+# ============================================================================
+# Test 18: hlsdoc_write_search_index — write JSON to disk (Fs effect).
+# ============================================================================
+
+fn test_write_search_index() -> int uses IO, Fs {
+    let src: str = build_test_source()
+    let m: DocModule = hlsdoc_parse_module("test", src)
+    hlsdoc_write_search_index(m, "/tmp/feat_stage61_search.json")
+    let content: str = read_file("/tmp/feat_stage61_search.json")
+    ok(contains(content, "\"name\": \"add\""), "write_index: file has add entry")
+    return 0
+}
+
+# ============================================================================
+# Test 19: hlsdoc_parse_module — no doc comments.
+# ============================================================================
+
+fn test_parse_no_docs() -> int uses IO {
+    let src: str = "fn foo() -> int {\n    return 0\n}\n"
+    let m: DocModule = hlsdoc_parse_module("test", src)
+    eq_int(m.items.len(), 1, "no_docs: 1 item")
+    let item: DocItem = m.items.get(0)
+    eq_str(item.name, "foo", "no_docs: name=foo")
+    eq_str(item.doc, "", "no_docs: empty doc")
+    return 0
+}
+
+# ============================================================================
+# Test 20: hlsdoc_parse_module — empty source.
+# ============================================================================
+
+fn test_parse_empty() -> int uses IO {
+    let m: DocModule = hlsdoc_parse_module("empty", "")
+    eq_int(m.items.len(), 0, "empty: 0 items")
+    return 0
+}
+
+# ============================================================================
+# Test 21: hlsdoc_parse_module — section headers in doc.
+# ============================================================================
+
+fn test_parse_section_headers() -> int uses IO {
+    let src: str = "# A function with sections.\n" +
+        "## Examples\n" +
+        "# foo(1, 2) -> 3\n" +
+        "fn foo(a: int, b: int) -> int {\n    return a + b\n}\n"
+    let m: DocModule = hlsdoc_parse_module("test", src)
+    let item: DocItem = m.items.get(0)
+    ok(contains(item.doc, "## Examples"), "sections: doc has '## Examples'")
+    return 0
+}
+
+# ============================================================================
+# Test 22: hlsdoc_render_html — section headers rendered as <h3>.
+# ============================================================================
+
+fn test_render_section_headers() -> int uses IO {
+    let src: str = "# A function with sections.\n" +
+        "## Examples\n" +
+        "# foo(1, 2) -> 3\n" +
+        "fn foo(a: int, b: int) -> int {\n    return a + b\n}\n"
+    let m: DocModule = hlsdoc_parse_module("test", src)
+    let html: str = hlsdoc_render_html(m)
+    # The '## Examples' should become <h3>Examples</h3>.
+    ok(contains(html, "<h3>Examples</h3>"), "render_sections: <h3>Examples</h3>")
+    return 0
+}
+
+# ============================================================================
+# Test 23: hlsdoc_render_html — HTML escaping in doc comments.
+# ============================================================================
+
+fn test_render_escape_in_doc() -> int uses IO {
+    let src: str = "# Doc with <script> and & characters.\nfn foo() -> int { return 0 }\n"
+    let m: DocModule = hlsdoc_parse_module("test", src)
+    let html: str = hlsdoc_render_html(m)
+    # The <script> in the doc should be escaped (not present as a tag).
+    ok(!contains(html, "<script>alert"), "esc_in_doc: <script> not in doc")
+    ok(contains(html, "&lt;script&gt;"), "esc_in_doc: <script> escaped in doc")
+    ok(contains(html, "&amp; characters"), "esc_in_doc: & escaped in doc")
+    return 0
+}
+
+# ============================================================================
+# Test 24: hlsdoc_parse_module — impl block methods.
+# ============================================================================
+
+fn test_parse_impl_methods() -> int uses IO {
+    let src: str = "# impl User block.\n" +
+        "impl User {\n" +
+        "    # Greet the user.\n" +
+        "    fn greet(self: User) -> str {\n" +
+        "        return self.name\n" +
+        "    }\n" +
+        "}\n"
+    let m: DocModule = hlsdoc_parse_module("test", src)
+    # The impl block is one item; its methods are NOT separately parsed
+    # (they're inside the impl block, which our simplified parser
+    # doesn't recurse into). The impl itself is one DocItem.
+    eq_int(m.items.len(), 1, "impl_methods: 1 item (the impl block)")
+    eq_str(m.items.get(0).name, "User", "impl_methods: impl User")
+    return 0
+}
+
+# ============================================================================
+# Test 25: differential safety — same source, same output.
+# ============================================================================
+
+fn test_differential_safety() -> int uses IO {
+    let src: str = build_test_source()
+    let m1: DocModule = hlsdoc_parse_module("test", src)
+    let m2: DocModule = hlsdoc_parse_module("test", src)
+    eq_int(m1.items.len(), m2.items.len(), "diff: same item count")
+    let html1: str = hlsdoc_render_html(m1)
+    let html2: str = hlsdoc_render_html(m2)
+    eq_str(html1, html2, "diff: same HTML output")
+    return 0
+}
+
+# ============================================================================
+# Main — run all tests sequentially.
+# ============================================================================
+
+fn main() -> int uses IO, Fs {
+    println("=== Stage 61: std.hlsdoc (rustdoc-style API docs generator) ===")
+    println("")
+    println("--- hlsdoc_parse_module (basic parsing) ---")
+    test_parse_basic()
+    println("  ok")
+    println("--- hlsdoc_parse_module (struct/enum/impl detection) ---")
+    test_parse_kinds()
+    println("  ok")
+    println("--- hlsdoc_parse_module (line numbers) ---")
+    test_parse_lines()
+    println("  ok")
+    println("--- hlsdoc_render_html (HTML structure) ---")
+    test_render_html_structure()
+    println("  ok")
+    println("--- hlsdoc_render_html (cross-references) ---")
+    test_render_cross_refs()
+    println("  ok")
+    println("--- hlsdoc_render_html (no unknown cross-refs) ---")
+    test_render_no_unknown_cross_ref()
+    println("  ok")
+    println("--- hlsdoc_escape_html (metacharacter escaping) ---")
+    test_escape_html()
+    println("  ok")
+    println("--- hlsdoc_escape_html (security: script injection blocked) ---")
+    test_escape_html_security()
+    println("  ok")
+    println("--- hlsdoc_escape_json ---")
+    test_escape_json()
+    println("  ok")
+    println("--- hlsdoc_split_paragraphs ---")
+    test_split_paragraphs()
+    println("  ok")
+    println("--- hlsdoc_module_has_item (cross-ref resolution) ---")
+    test_module_has_item()
+    println("  ok")
+    println("--- hlsdoc_extract_name ---")
+    test_extract_name()
+    println("  ok")
+    println("--- hlsdoc_kind_name ---")
+    test_kind_name()
+    println("  ok")
+    println("--- hlsdoc_anchor ---")
+    test_anchor()
+    println("  ok")
+    println("--- hlsdoc_render_summary (plain-text) ---")
+    test_render_summary()
+    println("  ok")
+    println("--- hlsdoc_render_search_index (JSON) ---")
+    test_render_search_index()
+    println("  ok")
+    println("--- hlsdoc_write_html (Fs effect) ---")
+    test_write_html()
+    println("  ok")
+    println("--- hlsdoc_write_search_index (Fs effect) ---")
+    test_write_search_index()
+    println("  ok")
+    println("--- hlsdoc_parse_module (no doc comments) ---")
+    test_parse_no_docs()
+    println("  ok")
+    println("--- hlsdoc_parse_module (empty source) ---")
+    test_parse_empty()
+    println("  ok")
+    println("--- hlsdoc_parse_module (section headers in doc) ---")
+    test_parse_section_headers()
+    println("  ok")
+    println("--- hlsdoc_render_html (section headers as <h3>) ---")
+    test_render_section_headers()
+    println("  ok")
+    println("--- hlsdoc_render_html (HTML escaping in doc comments) ---")
+    test_render_escape_in_doc()
+    println("  ok")
+    println("--- hlsdoc_parse_module (impl block methods) ---")
+    test_parse_impl_methods()
+    println("  ok")
+    println("--- differential safety (same source, same output) ---")
+    test_differential_safety()
+    println("  ok")
+    println("")
+    println("ACCEPTANCE OK: Stage 61 — std.hlsdoc (rustdoc-style API docs generator)")
+    println("  hlsdoc_parse_module (extracts fn/struct/enum/impl + doc comments)")
+    println("  Doc comment convention: '# ' lines above a declaration")
+    println("  hlsdoc_render_html (complete HTML page with <style> + <script>)")
+    println("  Cross-references: [name] -> <a href=#name> if name is a declared item")
+    println("  Section headers: '## Title' -> <h3>Title</h3>")
+    println("  Search index (JSON) + embedded vanilla JS search (no framework)")
+    println("  hlsdoc_escape_html (security: & < > \" ' escaped, script injection blocked)")
+    println("  hlsdoc_escape_json (JSON string escaping incl. control bytes)")
+    println("  hlsdoc_split_paragraphs + hlsdoc_module_has_item + hlsdoc_extract_name")
+    println("  hlsdoc_render_summary (plain-text listing)")
+    println("  hlsdoc_write_html / hlsdoc_write_search_index (Fs effect)")
+    println("  Pure-HLS implementation (no new compiler builtins)")
+    println("  differential (interpreter == native) verified green.")
+    return 0
+}

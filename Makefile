@@ -2417,3 +2417,163 @@ http-router-acceptance: bin/hlc
 	@echo "  differential (interpreter == native) verified green."
 
 .PHONY: http-router-acceptance
+# ============================================================================
+# Stage 58 (v0.79.0-alpha): std.config -- layered config loader
+# (defaults < file < env < CLI). Pure-HLS TOML parser + JSON config +
+# env-var overlay + type coercion + dotted-path lookup. No new builtins.
+# ============================================================================
+
+config-acceptance: bin/hlc
+	@$(PYTHON) boot/boot.py examples/config_demo.hls > /tmp/config_demo_interp.txt 2>&1
+	@bin/hlc examples/config_demo.hls /tmp/config_demo.c 2>/dev/null
+	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/config_demo /tmp/config_demo.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
+	@/tmp/config_demo > /tmp/config_demo_nat.txt 2>&1
+	@diff -q /tmp/config_demo_interp.txt /tmp/config_demo_nat.txt >/dev/null 2>&1 \
+		|| (echo "FAIL: config_demo differential mismatch" && false)
+	@$(PYTHON) boot/boot.py tests/ok/feat_stage58_config.hls > /tmp/s58_interp.txt 2>&1
+	@bin/hlc tests/ok/feat_stage58_config.hls /tmp/s58.c 2>/dev/null
+	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/s58 /tmp/s58.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
+	@/tmp/s58 > /tmp/s58_nat.txt 2>&1
+	@diff -q /tmp/s58_interp.txt /tmp/s58_nat.txt >/dev/null 2>&1 \
+		|| (echo "FAIL: feat_stage58_config differential mismatch" && false)
+	@rm -f /tmp/config_demo /tmp/config_demo.c /tmp/config_demo_interp.txt /tmp/config_demo_nat.txt \
+		/tmp/s58 /tmp/s58.c /tmp/s58_interp.txt /tmp/s58_nat.txt /tmp/feat_stage58_test.toml /tmp/config_demo.toml
+	@echo ""
+	@echo "ACCEPTANCE OK: Stage 58 -- std.config (layered config loader)"
+	@echo "  ConfigSchema builder (str/int/float/bool keys + no_default + env override)"
+	@echo "  impl ConfigSchema method twins (.str_key/.int_key/.float_key/.bool_key/.env)"
+	@echo "  Pure-HLS TOML parser (tables, dotted headers, inline tables, arrays,"
+	@echo "    multi-line strings, literal strings, comments, quoted keys,"
+	@echo "    hex/oct/bin ints, inf/nan, exponential floats)"
+	@echo "  JSON config (delegates to std.json for content starting with '{')"
+	@echo "  Layered loading: defaults < file < env (env wins)"
+	@echo "  Type coercion (str->int/float/bool, int->float/bool, float->int, bool->int)"
+	@echo "  Dotted-path lookup + config_has / config_set_str/int/float/bool (CLI overlay)"
+	@echo "  config_serialize (round-trip TOML) + config_describe (schema listing)"
+	@echo "  config_load_file (Fs effect) + config_load (Proc for env)"
+	@echo "  ConfigLoadError (layer / key / message) for structured error reporting"
+	@echo "  Env-var name derivation (PREFIX_SECTION_KEY) + explicit env_name override"
+	@echo "  Pure-HLS implementation (no new compiler builtins)"
+	@echo "  differential (interpreter == native) verified green."
+
+.PHONY: config-acceptance
+
+# ============================================================================
+# Stage 59 (v0.80.0-alpha): std.complete -- shell-completion generator
+# (bash/zsh/fish/powershell). Pure-HLS generators + per-shell escaping.
+# ============================================================================
+
+complete-acceptance: bin/hlc
+	@$(PYTHON) boot/boot.py examples/complete_demo.hls > /tmp/complete_demo_interp.txt 2>&1
+	@bin/hlc examples/complete_demo.hls /tmp/complete_demo.c 2>/dev/null
+	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/complete_demo /tmp/complete_demo.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
+	@/tmp/complete_demo > /tmp/complete_demo_nat.txt 2>&1
+	@diff -q /tmp/complete_demo_interp.txt /tmp/complete_demo_nat.txt >/dev/null 2>&1 \
+		|| (echo "FAIL: complete_demo differential mismatch" && false)
+	@$(PYTHON) boot/boot.py tests/ok/feat_stage59_complete.hls > /tmp/s59_interp.txt 2>&1
+	@bin/hlc tests/ok/feat_stage59_complete.hls /tmp/s59.c 2>/dev/null
+	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/s59 /tmp/s59.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
+	@/tmp/s59 > /tmp/s59_nat.txt 2>&1
+	@diff -q /tmp/s59_interp.txt /tmp/s59_nat.txt >/dev/null 2>&1 \
+		|| (echo "FAIL: feat_stage59_complete differential mismatch" && false)
+	@rm -f /tmp/complete_demo /tmp/complete_demo.c /tmp/complete_demo_interp.txt /tmp/complete_demo_nat.txt \
+		/tmp/s59 /tmp/s59.c /tmp/s59_interp.txt /tmp/s59_nat.txt /tmp/myapp /tmp/_myapp /tmp/myapp.fish
+	@echo ""
+	@echo "ACCEPTANCE OK: Stage 59 -- std.complete (shell-completion generator)"
+	@echo "  Shell kinds: bash / zsh / fish / powershell"
+	@echo "  complete_render(parser, name, shell) dispatcher (pure, no IO)"
+	@echo "  Bash: _init_completion + compgen -W (long/short opts) + compgen -f (files)"
+	@echo "  Zsh: #compdef + _arguments spec + _values for subcommands + value types"
+	@echo "  Fish: complete -c name -l/-s/-d/-r lines + subcommand lines"
+	@echo "  PowerShell: Register-ArgumentCompleter + scriptblock + Get-ChildItem"
+	@echo "  complete_shell_from_str (case-insensitive: bash/sh, zsh, fish, pwsh/ps)"
+	@echo "  complete_escape_bash/zsh/fish (single quote -> '\'') + powershell (doubled)"
+	@echo "  complete_install_filename (per-shell convention) + complete_install_path"
+	@echo "  complete_is_safe_name (rejects /, .., leading -, spaces, special chars)"
+	@echo "  complete_list_shells (human-readable listing + install paths)"
+	@echo "  complete_install (Fs effect -- write_file to canonical path)"
+	@echo "  Pure-HLS implementation (no new compiler builtins)"
+	@echo "  differential (interpreter == native) verified green."
+
+.PHONY: complete-acceptance
+
+# ============================================================================
+# Stage 60 (v0.81.0-alpha): std.hlscli -- cargo-style launcher
+# (new/init/run/build/test/bench/doc/publish/clean/update/completion).
+# ============================================================================
+
+hlscli-acceptance: bin/hlc
+	@$(PYTHON) boot/boot.py examples/hlscli_demo.hls > /tmp/hlscli_demo_interp.txt 2>&1
+	@bin/hlc examples/hlscli_demo.hls /tmp/hlscli_demo.c 2>/dev/null
+	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/hlscli_demo /tmp/hlscli_demo.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
+	@/tmp/hlscli_demo > /tmp/hlscli_demo_nat.txt 2>&1
+	@diff -q /tmp/hlscli_demo_interp.txt /tmp/hlscli_demo_nat.txt >/dev/null 2>&1 \
+		|| (echo "FAIL: hlscli_demo differential mismatch" && false)
+	@$(PYTHON) boot/boot.py tests/ok/feat_stage60_hlscli.hls > /tmp/s60_interp.txt 2>&1
+	@bin/hlc tests/ok/feat_stage60_hlscli.hls /tmp/s60.c 2>/dev/null
+	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/s60 /tmp/s60.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
+	@/tmp/s60 > /tmp/s60_nat.txt 2>&1
+	@diff -q /tmp/s60_interp.txt /tmp/s60_nat.txt >/dev/null 2>&1 \
+		|| (echo "FAIL: feat_stage60_hlscli differential mismatch" && false)
+	@rm -f /tmp/hlscli_demo /tmp/hlscli_demo.c /tmp/hlscli_demo_interp.txt /tmp/hlscli_demo_nat.txt \
+		/tmp/s60 /tmp/s60.c /tmp/s60_interp.txt /tmp/s60_nat.txt
+	@rm -rf /tmp/test_load_proj
+	@echo ""
+	@echo "ACCEPTANCE OK: Stage 60 -- std.hlscli (cargo-style launcher)"
+	@echo "  hlscli_build_parser (11 subcommands + 6 global options)"
+	@echo "  hlscli_main dispatcher (reads argv, parses, dispatches)"
+	@echo "  Subcommands: new / init / run / build / test / bench / doc /"
+	@echo "    publish / clean / update / completion"
+	@echo "  Project scaffolding (hls-pkg.toml + src/main.hls + .gitignore + README.md)"
+	@echo "  hlscli_find_project_root (walk up looking for hls-pkg.toml)"
+	@echo "  hlscli_load_project (parse hls-pkg.toml via std.config's TOML parser)"
+	@echo "  hlscli_is_safe_project_name (rejects /, .., leading -, spaces, dots)"
+	@echo "  hlscli_quote_arg / hlscli_is_shell_safe (shell quoting)"
+	@echo "  hlscli_template_* (pkg_toml / main_hls / gitignore / readme / doc_html)"
+	@echo "  Env-var config (HLS_COMPILER / HLS_TARGET_DIR / HLS_RELEASE)"
+	@echo "  Profile selection (debug / release via --release or HLS_RELEASE=1)"
+	@echo "  Subprocess spawning via proc_exec (NOT a shell wrapper -- direct exec)"
+	@echo "  Pure-HLS implementation (no new compiler builtins)"
+	@echo "  differential (interpreter == native) verified green."
+
+.PHONY: hlscli-acceptance
+
+# ============================================================================
+# Stage 61 (v0.82.0-alpha): std.hlsdoc -- rustdoc-style API docs generator
+# (reads # doc comments, produces HTML with cross-refs + search index).
+# ============================================================================
+
+hlsdoc-acceptance: bin/hlc
+	@$(PYTHON) boot/boot.py examples/hlsdoc_demo.hls > /tmp/hlsdoc_demo_interp.txt 2>&1
+	@bin/hlc examples/hlsdoc_demo.hls /tmp/hlsdoc_demo.c 2>/dev/null
+	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/hlsdoc_demo /tmp/hlsdoc_demo.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
+	@/tmp/hlsdoc_demo > /tmp/hlsdoc_demo_nat.txt 2>&1
+	@diff -q /tmp/hlsdoc_demo_interp.txt /tmp/hlsdoc_demo_nat.txt >/dev/null 2>&1 \
+		|| (echo "FAIL: hlsdoc_demo differential mismatch" && false)
+	@$(PYTHON) boot/boot.py tests/ok/feat_stage61_hlsdoc.hls > /tmp/s61_interp.txt 2>&1
+	@bin/hlc tests/ok/feat_stage61_hlsdoc.hls /tmp/s61.c 2>/dev/null
+	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/s61 /tmp/s61.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
+	@/tmp/s61 > /tmp/s61_nat.txt 2>&1
+	@diff -q /tmp/s61_interp.txt /tmp/s61_nat.txt >/dev/null 2>&1 \
+		|| (echo "FAIL: feat_stage61_hlsdoc differential mismatch" && false)
+	@rm -f /tmp/hlsdoc_demo /tmp/hlsdoc_demo.c /tmp/hlsdoc_demo_interp.txt /tmp/hlsdoc_demo_nat.txt \
+		/tmp/s61 /tmp/s61.c /tmp/s61_interp.txt /tmp/s61_nat.txt \
+		/tmp/hlsdoc_demo.html /tmp/hlsdoc_demo_search.json \
+		/tmp/feat_stage61_test.html /tmp/feat_stage61_search.json
+	@echo ""
+	@echo "ACCEPTANCE OK: Stage 61 -- std.hlsdoc (rustdoc-style API docs generator)"
+	@echo "  hlsdoc_parse_module (extracts fn/struct/enum/impl + doc comments)"
+	@echo "  Doc comment convention: # lines above a declaration"
+	@echo "  hlsdoc_render_html (complete HTML page with <style> + <script>)"
+	@echo "  Cross-references: [name] -> <a href=#name> if name is a declared item"
+	@echo "  Section headers: ## Title -> <h3>Title</h3>"
+	@echo "  Search index (JSON) + embedded vanilla JS search (no framework)"
+	@echo "  hlsdoc_escape_html (security: ampersand lt gt quot apos escaped, script injection blocked)"
+	@echo "  hlsdoc_escape_json (JSON string escaping incl. control bytes)"
+	@echo "  hlsdoc_split_paragraphs + hlsdoc_module_has_item + hlsdoc_extract_name"
+	@echo "  hlsdoc_render_summary (plain-text listing)"
+	@echo "  hlsdoc_write_html / hlsdoc_write_search_index (Fs effect)"
+	@echo "  Pure-HLS implementation (no new compiler builtins)"
+	@echo "  differential (interpreter == native) verified green."
+
+.PHONY: hlsdoc-acceptance

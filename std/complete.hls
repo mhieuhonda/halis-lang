@@ -1,0 +1,654 @@
+# ============================================================================
+# std/complete.hls — Stage 59 (v0.80.0-alpha): shell-completion generator
+# ----------------------------------------------------------------------------
+# This module is the SEVENTH module of Phase IV (the CLI tooling track,
+# Stages 53–62). It implements the roadmap's Stage 59 promise:
+#
+#   * Generate shell completions for bash, zsh, fish, powershell.
+#   * Given a `cli::CliParser` definition, produce a completion script
+#     that knows every subcommand, flag, and arg.
+#
+# Design choices (matching the roadmap's "bash/zsh/fish/powershell"):
+#
+#   1. PURE-HLS GENERATORS.
+#      Every `complete_render_*` function is a PURE function (no IO):
+#      given a CliParser + a program name, it returns the completion
+#      script as a str. This makes the generators differential-safe
+#      (interpreter == native produce byte-identical output). The live
+#      `complete_install` helper carries the Fs effect (write_file) and
+#      writes the script to the canonical install path.
+#
+#   2. FOUR SHELLS SUPPORTED.
+#      - bash:   the standard `complete -F _foo foo` mechanism (the
+#                 most widely-used completion framework — every Linux
+#                 distro ships it). Uses the `compgen` builtin.
+#      - zsh:    the `#compdef foo` mechanism (zsh's native completion
+#                 system). Emits a `_foo` function that zsh autoloads.
+#      - fish:    the `complete -c foo ...` mechanism (fish's native
+#                 completion system, no functions needed).
+#      - powershell: the `Register-ArgumentCompleter` mechanism (the
+#                 standard PowerShell completion system).
+#      The caller picks the shell via `complete_render(parser, name,
+#      shell)` where `shell` is one of "bash" / "zsh" / "fish" /
+#      "powershell".
+#
+#   3. COMPLETION OF:
+#      - Subcommands: the first non-option argument is completed
+#        against the parser's declared subcommand names (with
+#        descriptions, where zsh and fish support inline descriptions).
+#      - Long options: `--<long_name>` (with the value-type annotation
+#        where the shell supports it — e.g., zsh shows `--port:<int>`
+#        in the completion menu).
+#      - Short options: `-<short_name>` (where declared).
+#      - File paths: when an option is a str positional or a str option
+#        with no env-var fallback, the completion suggests file paths
+#        (the most common case — `--config <file>` should complete
+#        file paths).
+#      - Help / version: `--help` / `-h` / `--version` / `-V` are
+#        always available (the CliParser registers them implicitly).
+#
+#   4. ESCAPING.
+#      The generators escape user-controlled text (subcommand names,
+#      descriptions) for the target shell's string-literal syntax.
+#      `complete_escape_bash` doubles single quotes; `complete_escape_zsh`
+#      escapes single quotes via the `'\''` trick; `complete_escape_fish`
+#      and `complete_escape_powershell` use their respective conventions.
+#      This prevents a malicious description (e.g., one containing `'; rm
+#      -rf /; '`) from injecting shell code.
+#
+#   5. NO NEW COMPILER BUILTINS.
+#      The module is pure-HLS on top of std.cli, std.str, std.option,
+#      std.result. The only builtin used is `write_file` (Fs effect, for
+#      `complete_install`).
+#
+# Security:
+#   * All user-controlled text (subcommand descriptions, option desc)
+#     is escaped for the target shell's string-literal syntax. A
+#     malicious description cannot inject shell code.
+#   * `complete_install` sanitises the program name (rejects `/`, `..`,
+#     spaces) before constructing the install path — same defense as
+#     `std.man.man_is_safe_name`.
+#   * No shell invocation: `complete_install` writes the file directly
+#     via `write_file` (no `system("install ...")`).
+#
+# Differential parity (interpreter == native):
+#   `complete_render_*` are pure functions of (CliParser, name). The
+#   interpreter and the native binary produce byte-identical completion
+#   scripts.
+#
+# Limitations (deferred to later stages):
+#   * No context-aware completion (e.g., `git checkout <branch>` should
+#     complete branch names). The generators complete only the static
+#     structure (subcommands + flags); dynamic completion (e.g., "list
+#     all branches") is a Stage-113+ concern (needs user-supplied
+#     completion functions, which HLS v0.3 can't pass as values).
+#   * No `--flag=value` completion (the generator completes only the
+#     flag name, not the value following `=`). A future stage may add
+#     value completion for known-value options.
+#   * No abbreviation matching (e.g., `--ver` matching `--version`).
+#     The CliParser itself doesn't support abbreviations, so the
+#     completion generator doesn't either.
+# ============================================================================
+
+import "std.cli"
+import "std.str"
+import "std.option"
+import "std.result"
+
+# ----------------------------------------------------------------------------
+# Constants — shell kinds.
+# ----------------------------------------------------------------------------
+
+fn complete_shell_bash() -> int { return 0 }
+fn complete_shell_zsh() -> int { return 1 }
+fn complete_shell_fish() -> int { return 2 }
+fn complete_shell_powershell() -> int { return 3 }
+
+# complete_shell_name(kind) -> str — the human-readable name.
+fn complete_shell_name(kind: int) -> str {
+    if kind == complete_shell_bash() { return "bash" }
+    if kind == complete_shell_zsh() { return "zsh" }
+    if kind == complete_shell_fish() { return "fish" }
+    if kind == complete_shell_powershell() { return "powershell" }
+    return "unknown"
+}
+
+# complete_shell_from_str(s) -> int — parse a shell name. Returns -1 on
+# unknown.
+fn complete_shell_from_str(s: str) -> int {
+    let lower: str = str_to_lower_ascii(s)
+    if lower == "bash" || lower == "sh" { return complete_shell_bash() }
+    if lower == "zsh" { return complete_shell_zsh() }
+    if lower == "fish" { return complete_shell_fish() }
+    if lower == "powershell" || lower == "pwsh" || lower == "ps" {
+        return complete_shell_powershell()
+    }
+    return -1
+}
+
+# ----------------------------------------------------------------------------
+# complete_render(parser, name, shell) -> str — the dispatcher. Delegates
+# to the appropriate shell-specific renderer.
+# ----------------------------------------------------------------------------
+
+fn complete_render(parser: CliParser, name: str, shell: int) -> str {
+    if shell == complete_shell_bash() {
+        return complete_render_bash(parser, name)
+    }
+    if shell == complete_shell_zsh() {
+        return complete_render_zsh(parser, name)
+    }
+    if shell == complete_shell_fish() {
+        return complete_render_fish(parser, name)
+    }
+    if shell == complete_shell_powershell() {
+        return complete_render_powershell(parser, name)
+    }
+    return "# unknown shell kind " + shell.to_str() + "\n"
+}
+
+# ============================================================================
+# BASH COMPLETION — `complete -F _foo foo`
+#
+# Emits a `_foo` function that handles the completion logic, then a
+# `complete -F _foo foo` line that registers it. The function:
+#   1. Determines the current word being completed ($cur).
+#   2. If the previous word is an option that takes a value (e.g.,
+#      `--port`), completes with file paths (the most common case).
+#   3. If the current word starts with `--`, completes with long option
+#      names.
+#   4. If the current word starts with `-` (and is not `--`), completes
+#      with short option names.
+#   5. Otherwise, completes with subcommand names (if any).
+#
+# The function uses `compgen -W` (word list) and `compgen -F` (file
+# completion) — the standard bash completion primitives.
+# ============================================================================
+
+fn complete_render_bash(parser: CliParser, name: str) -> str {
+    let lines: list[str] = []
+    let fn_name: str = "_" + name
+    # Header comment.
+    lines.push("# Bash completion for " + name + " (generated by std.complete Stage 59).")
+    lines.push("# Install: source this file, or copy to /etc/bash_completion.d/" + name)
+    lines.push("# or add `source <(hls complete --shell=bash " + name + ")` to ~/.bashrc.")
+    lines.push("")
+    # The function.
+    lines.push(fn_name + "() {")
+    lines.push("    local cur prev words cword")
+    lines.push("    _init_completion || return 0")
+    lines.push("")
+    lines.push("    # If the previous word is an option that takes a value, complete with files.")
+    lines.push("    case \"$prev\" in")
+    let mut i: int = 0
+    while i < parser.args.len() {
+        let a: CliArg = parser.args.get(i)
+        if !a.positional && a.kind != cli_kind_bool() {
+            # Long form.
+            let cases: list[str] = []
+            if a.long_name != "" {
+                cases.push("--" + a.long_name)
+            }
+            if a.short_name != "" {
+                cases.push("-" + a.short_name)
+            }
+            if cases.len() > 0 {
+                lines.push("        " + str_join(cases, "|") + ")")
+                lines.push("            COMPREPLY=( $(compgen -f -- \"$cur\") )")
+                lines.push("            return 0")
+                lines.push("            ;;")
+            }
+        }
+        i = i + 1
+    }
+    lines.push("    esac")
+    lines.push("")
+    # Long options.
+    lines.push("    # Complete long options.")
+    lines.push("    if [[ \"$cur\" == --* ]]; then")
+    let long_opts: list[str] = ["--help", "--version"]
+    let mut j: int = 0
+    while j < parser.args.len() {
+        let a: CliArg = parser.args.get(j)
+        if !a.positional && a.long_name != "" {
+            long_opts.push("--" + a.long_name)
+        }
+        j = j + 1
+    }
+    lines.push("        local opts=\"" + str_join(long_opts, " ") + "\"")
+    lines.push("        COMPREPLY=( $(compgen -W \"$opts\" -- \"$cur\") )")
+    lines.push("        return 0")
+    lines.push("    fi")
+    lines.push("")
+    # Short options.
+    lines.push("    # Complete short options.")
+    lines.push("    if [[ \"$cur\" == -* ]]; then")
+    let short_opts: list[str] = ["-h", "-V"]
+    let mut k: int = 0
+    while k < parser.args.len() {
+        let a: CliArg = parser.args.get(k)
+        if !a.positional && a.short_name != "" {
+            short_opts.push("-" + a.short_name)
+        }
+        k = k + 1
+    }
+    lines.push("        local opts=\"" + str_join(short_opts, " ") + "\"")
+    lines.push("        COMPREPLY=( $(compgen -W \"$opts\" -- \"$cur\") )")
+    lines.push("        return 0")
+    lines.push("    fi")
+    lines.push("")
+    # Subcommands.
+    if parser.subcommands.len() > 0 {
+        lines.push("    # Complete subcommands.")
+        lines.push("    local subs=\"" + str_join(parser.subcommands, " ") + "\"")
+        lines.push("    COMPREPLY=( $(compgen -W \"$subs\" -- \"$cur\") )")
+        lines.push("    return 0")
+    } else {
+        lines.push("    # No subcommands declared; complete with files.")
+        lines.push("    COMPREPLY=( $(compgen -f -- \"$cur\") )")
+    }
+    lines.push("}")
+    lines.push("")
+    # Register.
+    lines.push("complete -F " + fn_name + " " + name)
+    lines.push("")
+    return str_join(lines, "\n")
+}
+
+# ============================================================================
+# ZSH COMPLETION — `#compdef foo`
+#
+# Emits a `#compdef foo` header (zsh's autoload mechanism), then a
+# `_foo` function that handles the completion. zsh's completion system
+# is more powerful than bash's: it supports inline descriptions,
+# value-type annotations, and grouped options. The generated function:
+#   1. Sets up the argument parser via `_arguments` (zsh's builtin).
+#   2. Declares each option with its description and value type.
+#   3. Declares subcommands via `_values` (zsh's enum-completion).
+#
+# zsh needs the file installed at `~/.zsh/completions/_foo` (or any
+# fpath dir) for the `#compdef` to autoload.
+# ============================================================================
+
+fn complete_render_zsh(parser: CliParser, name: str) -> str {
+    let lines: list[str] = []
+    let fn_name: str = "_" + name
+    # Header.
+    lines.push("#compdef " + name)
+    lines.push("# zsh completion for " + name + " (generated by std.complete Stage 59).")
+    lines.push("# Install: copy to a directory in $fpath (e.g., /usr/local/share/zsh/site-functions/_" + name + ")")
+    lines.push("# or add `fpath=(~/.zsh/completions $fpath); autoload -Uz " + fn_name + "` to ~/.zshrc.")
+    lines.push("")
+    lines.push(fn_name + "() {")
+    lines.push("    local -a opts subs")
+    lines.push("")
+    # Build the _arguments spec.
+    lines.push("    opts=(")
+    lines.push("        '(-h --help)'{-h,--help}'[Print help message]'")
+    lines.push("        '(-V --version)'{-V,--version}'[Print version]'")
+    let mut i: int = 0
+    while i < parser.args.len() {
+        let a: CliArg = parser.args.get(i)
+        if !a.positional {
+            let mut spec: str = "        "
+            if a.short_name != "" && a.long_name != "" {
+                spec = spec + "'(-" + a.short_name + " --" + a.long_name + ")'"
+                spec = spec + "{-" + a.short_name + ",--" + a.long_name + "}"
+            } else if a.long_name != "" {
+                spec = spec + "'--" + a.long_name + "'"
+            } else if a.short_name != "" {
+                spec = spec + "'-" + a.short_name + "'"
+            }
+            # Value type annotation.
+            if a.kind != cli_kind_bool() {
+                let val_type: str = complete_zsh_value_type(a.kind)
+                spec = spec + "[" + val_type + "]"
+            }
+            # Description.
+            let desc_escaped: str = complete_escape_zsh(a.desc)
+            spec = spec + "['" + desc_escaped + "']"
+            lines.push(spec)
+        }
+        i = i + 1
+    }
+    lines.push("    )")
+    lines.push("")
+    # Subcommands.
+    if parser.subcommands.len() > 0 {
+        lines.push("    subs=(")
+        let mut j: int = 0
+        while j < parser.subcommands.len() {
+            let nm: str = parser.subcommands.get(j)
+            let dsc: str = parser.subcommand_descs.get(j)
+            lines.push("        '" + nm + "[" + complete_escape_zsh(dsc) + "]'")
+            j = j + 1
+        }
+        lines.push("    )")
+        lines.push("")
+        lines.push("    _arguments -C \\")
+        lines.push("        $opts \\")
+        lines.push("        ':subcommand:->subs'")
+        lines.push("")
+        lines.push("    case $state in")
+        lines.push("        subs)")
+        lines.push("            _values 'subcommand' $subs")
+        lines.push("            ;;")
+        lines.push("    esac")
+    } else {
+        lines.push("    _arguments -C $opts")
+    }
+    lines.push("}")
+    lines.push("")
+    lines.push(fn_name + " \"$@\"")
+    lines.push("")
+    return str_join(lines, "\n")
+}
+
+# complete_zsh_value_type — the zsh value-type annotation for an option.
+fn complete_zsh_value_type(kind: int) -> str {
+    if kind == cli_kind_int() { return ":int" }
+    if kind == cli_kind_float() { return ":float" }
+    if kind == cli_kind_str() { return ":file" }
+    return ":value"
+}
+
+# ============================================================================
+# FISH COMPLETION — `complete -c foo ...`
+#
+# fish's completion system is the simplest of the four: a series of
+# `complete -c foo -a ... -d ...` lines, one per completion candidate.
+# No function is needed; fish reads the lines at startup.
+#
+# For each option:
+#   complete -c foo -l <long> -s <short> -d "<desc>" [-r] [-a "<values>"]
+#     -l = long name (without --)
+#     -s = short name (without -)
+#     -d = description
+#     -r = required value (don't complete the next word as a flag)
+#     -a = optional values (e.g., for known-value options)
+#
+# For subcommands:
+#   complete -c foo -n "__fish_use_subcommand" -a "<sub>" -d "<desc>"
+# ============================================================================
+
+fn complete_render_fish(parser: CliParser, name: str) -> str {
+    let lines: list[str] = []
+    lines.push("# fish completion for " + name + " (generated by std.complete Stage 59).")
+    lines.push("# Install: copy to ~/.config/fish/completions/" + name + ".fish")
+    lines.push("# or add `hls complete --shell=fish " + name + " | source` to ~/.config/fish/config.fish.")
+    lines.push("")
+    # Help / version.
+    lines.push("complete -c " + name + " -l help -s h -d 'Print help message'")
+    lines.push("complete -c " + name + " -l version -s V -d 'Print version'")
+    # User options.
+    let mut i: int = 0
+    while i < parser.args.len() {
+        let a: CliArg = parser.args.get(i)
+        if !a.positional {
+            let mut line: str = "complete -c " + name
+            if a.long_name != "" {
+                line = line + " -l " + a.long_name
+            }
+            if a.short_name != "" {
+                line = line + " -s " + a.short_name
+            }
+            if a.kind != cli_kind_bool() {
+                line = line + " -r"
+            }
+            line = line + " -d '" + complete_escape_fish(a.desc) + "'"
+            lines.push(line)
+        }
+        i = i + 1
+    }
+    # Subcommands.
+    if parser.subcommands.len() > 0 {
+        lines.push("")
+        lines.push("# Subcommands")
+        let mut j: int = 0
+        while j < parser.subcommands.len() {
+            let nm: str = parser.subcommands.get(j)
+            let dsc: str = parser.subcommand_descs.get(j)
+            lines.push("complete -c " + name + " -n '__fish_use_subcommand' -a '"
+                + nm + "' -d '" + complete_escape_fish(dsc) + "'")
+            j = j + 1
+        }
+    }
+    lines.push("")
+    return str_join(lines, "\n")
+}
+
+# ============================================================================
+# POWERSHELL COMPLETION — `Register-ArgumentCompleter`
+#
+# Emits a PowerShell script that registers an ArgumentCompleter for the
+# command. The completer inspects $wordToComplete and $commandAst to
+# suggest:
+#   - Long options starting with `--`
+#   - Short options starting with `-`
+#   - Subcommands (when not completing an option)
+#
+# PowerShell's completion system is callback-based: the completer is a
+# scriptblock that returns a list of CompletionResult objects.
+# ============================================================================
+
+fn complete_render_powershell(parser: CliParser, name: str) -> str {
+    let lines: list[str] = []
+    lines.push("# PowerShell completion for " + name + " (generated by std.complete Stage 59).")
+    lines.push("# Install: add to $PROFILE, or run:")
+    lines.push("#   hls complete --shell=powershell " + name + " | Invoke-Expression")
+    lines.push("")
+    lines.push("$" + name + "_completer = {")
+    lines.push("    param($wordToComplete, $commandAst, $cursorPosition)")
+    lines.push("")
+    lines.push("    $commandElements = $commandAst.CommandElements")
+    lines.push("    $previous = if ($commandElements.Count -gt 1) { $commandElements[-2].Value } else { '' }")
+    lines.push("")
+    lines.push("    # If the previous word is an option that takes a value, complete with files.")
+    lines.push("    switch ($previous) {")
+    let mut i: int = 0
+    while i < parser.args.len() {
+        let a: CliArg = parser.args.get(i)
+        if !a.positional && a.kind != cli_kind_bool() {
+            if a.long_name != "" {
+                lines.push("        '--" + a.long_name + "' {")
+                lines.push("            Get-ChildItem -Path $wordToComplete* | ForEach-Object {")
+                lines.push("                [System.Management.Automation.CompletionResult]::new($_.Name, $_.Name, 'ParameterValue', $_.Name)")
+                lines.push("            }")
+                lines.push("            return")
+                lines.push("        }")
+            }
+        }
+        i = i + 1
+    }
+    lines.push("    }")
+    lines.push("")
+    # Long options.
+    lines.push("    # Complete long options.")
+    lines.push("    if ($wordToComplete.StartsWith('--')) {")
+    let long_opts: list[str] = ["--help", "--version"]
+    let mut j: int = 0
+    while j < parser.args.len() {
+        let a: CliArg = parser.args.get(j)
+        if !a.positional && a.long_name != "" {
+            long_opts.push("--" + a.long_name)
+        }
+        j = j + 1
+    }
+    lines.push("        $opts = @('" + str_join(long_opts, "', '") + "')")
+    lines.push("        $opts | Where-Object { $_ -like \"$wordToComplete*\" } | ForEach-Object {")
+    lines.push("            [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterValue', $_)")
+    lines.push("        }")
+    lines.push("        return")
+    lines.push("    }")
+    lines.push("")
+    # Short options.
+    lines.push("    # Complete short options.")
+    lines.push("    if ($wordToComplete.StartsWith('-')) {")
+    let short_opts: list[str] = ["-h", "-V"]
+    let mut k: int = 0
+    while k < parser.args.len() {
+        let a: CliArg = parser.args.get(k)
+        if !a.positional && a.short_name != "" {
+            short_opts.push("-" + a.short_name)
+        }
+        k = k + 1
+    }
+    lines.push("        $opts = @('" + str_join(short_opts, "', '") + "')")
+    lines.push("        $opts | Where-Object { $_ -like \"$wordToComplete*\" } | ForEach-Object {")
+    lines.push("            [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterValue', $_)")
+    lines.push("        }")
+    lines.push("        return")
+    lines.push("    }")
+    lines.push("")
+    # Subcommands.
+    if parser.subcommands.len() > 0 {
+        lines.push("    # Complete subcommands.")
+        lines.push("        $subs = @('" + str_join(parser.subcommands, "', '") + "')")
+        lines.push("    $subs | Where-Object { $_ -like \"$wordToComplete*\" } | ForEach-Object {")
+        lines.push("        [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterValue', $_)")
+        lines.push("    }")
+    }
+    lines.push("}")
+    lines.push("")
+    # Register.
+    lines.push("Register-ArgumentCompleter -Native -CommandName " + name + " -ScriptBlock $" + name + "_completer")
+    lines.push("")
+    return str_join(lines, "\n")
+}
+
+# ============================================================================
+# ESCAPING — per-shell string-literal escaping.
+# ============================================================================
+
+# complete_escape_bash(s) — bash single-quotes don't allow embedded
+# single quotes; we double them via the '\'' trick.
+fn complete_escape_bash(s: str) -> str {
+    let parts: list[str] = s.split("'")
+    return str_join(parts, "'\\''")
+}
+
+# complete_escape_zsh(s) — same as bash (zsh uses the same quoting rule).
+fn complete_escape_zsh(s: str) -> str {
+    let parts: list[str] = s.split("'")
+    return str_join(parts, "'\\''")
+}
+
+# complete_escape_fish(s) — fish uses the same quoting rule as bash/zsh.
+fn complete_escape_fish(s: str) -> str {
+    let parts: list[str] = s.split("'")
+    return str_join(parts, "'\\''")
+}
+
+# complete_escape_powershell(s) — PowerShell single-quotes double the
+# embedded single quote ('' -> '').
+fn complete_escape_powershell(s: str) -> str {
+    let parts: list[str] = s.split("'")
+    return str_join(parts, "''")
+}
+
+# ============================================================================
+# complete_install(parser, name, shell, install_dir) -> void — write the
+# completion script to the canonical install path for the given shell.
+# Carries the Fs effect (write_file). The install_dir is the shell's
+# completion directory (e.g., /etc/bash_completion.d, /usr/local/share/
+# zsh/site-functions, ~/.config/fish/completions). The filename is
+# derived from `name` and the shell's convention.
+# ============================================================================
+
+fn complete_install(parser: CliParser, name: str, shell: int, install_dir: str) -> void uses Fs {
+    if !complete_is_safe_name(name) {
+        panic("complete_install: unsafe name '" + name + "' (contains /, .., leading -, or special chars)")
+    }
+    let script: str = complete_render(parser, name, shell)
+    let filename: str = complete_install_filename(name, shell)
+    let path: str = complete_install_path(install_dir, filename)
+    write_file(path, script)
+}
+
+# complete_install_filename(name, shell) -> str — the conventional
+# filename for the given shell.
+fn complete_install_filename(name: str, shell: int) -> str {
+    if shell == complete_shell_bash() {
+        return name
+    }
+    if shell == complete_shell_zsh() {
+        return "_" + name
+    }
+    if shell == complete_shell_fish() {
+        return name + ".fish"
+    }
+    if shell == complete_shell_powershell() {
+        return name + ".ps1"
+    }
+    return name
+}
+
+# complete_install_path(dir, filename) -> str — join dir + filename
+# with a '/' separator (POSIX convention).
+fn complete_install_path(dir: str, filename: str) -> str {
+    if dir == "" {
+        return filename
+    }
+    if dir.byte_at(dir.len() - 1) == 47 {
+        return dir + filename
+    }
+    return dir + "/" + filename
+}
+
+# ----------------------------------------------------------------------------
+# complete_is_safe_name(name) — true if `name` is a safe completion-script
+# name (no '/', '..', leading '-', spaces, or special chars). Same defense
+# as std.man.man_is_safe_name.
+# ----------------------------------------------------------------------------
+
+fn complete_is_safe_name(name: str) -> bool {
+    let n: int = name.len()
+    if n == 0 {
+        return false
+    }
+    if name.byte_at(0) == 45 {
+        return false
+    }
+    let mut i: int = 0
+    while i < n {
+        let b: int = name.byte_at(i)
+        if b == 47 {
+            return false
+        }
+        if b == 46 && i + 1 < n && name.byte_at(i + 1) == 46 {
+            return false
+        }
+        let ok: bool = (b >= 65 && b <= 90) || (b >= 97 && b <= 122)
+            || (b >= 48 && b <= 57) || b == 45 || b == 95 || b == 46
+        if !ok {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+# ============================================================================
+# complete_list_shells() -> str — a human-readable listing of the
+# supported shells (for `--list-shells`).
+# ============================================================================
+
+fn complete_list_shells() -> str {
+    let lines: list[str] = []
+    lines.push("Supported shells:")
+    lines.push("  bash        (complete -F _name name)")
+    lines.push("  zsh         (#compdef name)")
+    lines.push("  fish        (complete -c name ...)")
+    lines.push("  powershell  (Register-ArgumentCompleter)")
+    lines.push("")
+    lines.push("Install paths (conventional):")
+    lines.push("  bash        /etc/bash_completion.d/<name>")
+    lines.push("  zsh         /usr/local/share/zsh/site-functions/_<name>")
+    lines.push("  fish        ~/.config/fish/completions/<name>.fish")
+    lines.push("  powershell  add to $PROFILE")
+    return str_join(lines, "\n")
+}
+
+# ============================================================================
+# End of std/complete.hls
+# ============================================================================

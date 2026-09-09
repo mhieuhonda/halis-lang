@@ -1,0 +1,1972 @@
+# ============================================================================
+# std/config.hls — Stage 58 (v0.79.0-alpha): layered config loader
+# ----------------------------------------------------------------------------
+# This module is the SIXTH module of Phase IV (the CLI tooling track,
+# Stages 53–62). It implements the roadmap's Stage 58 promise:
+#
+#   * Layered config: defaults < file < env < CLI args.
+#   * File formats: TOML (preferred, pure-HLS parser), JSON (via
+#     std.json), INI (a small subset for legacy configs).
+#   * Env overlay: every key in the config can be overridden by an
+#     env var (with a configurable prefix, e.g. `MYAPP_PORT` overrides
+#     `port`). Env values are coerced to the type of the existing key
+#     (str / int / float / bool).
+#   * Dotted-path lookup: `config_get(cfg, "server.port")` walks the
+#     nested table structure and returns the value at the path.
+#   * Type coercion: `config_get_str / _int / _float / _bool` accessors
+#     that NEVER panic on a successfully-loaded config (the loader
+#     validates every value against its declared type at load time;
+#     the accessors just look them up).
+#
+# Design choices (matching the roadmap's "defaults < file < env < CLI"):
+#
+#   1. BUILDER PATTERN, NOT DERIVE MACROS.
+#      Halis has no derive macros (Stage 113+ adds them). The caller
+#      builds a `ConfigSchema` via the builder pattern — declare each
+#      key with its type, default, and env-var name — then loads the
+#      actual values via `config_load(schema, file_content, env_prefix)`.
+#      This is the same convention `std.cli`, `std.log`, `std.color` use.
+#
+#   2. PURE CORE + THIN LIVE SHELL.
+#      The TOML parser (`toml_parse`) and the JSON / INI parsers are
+#      PURE functions (no IO): given a file's content as a str, they
+#      return a `ConfigValue` tree. The layering (`config_layer`)
+#      and the accessors (`config_get_*`) are also pure. The ONLY
+#      live entry points are `config_load_file` (reads a file via the
+#      `read_file` builtin — Fs effect) and `config_load_from_env`
+#      (reads env vars via `env_get` / `env_has` — Proc effect).
+#      This makes the differential test (interpreter == native)
+#      straightforward: every stdout line is a pure function of
+#      fixed inputs (file content + env vars + schema).
+#
+#   3. THREE FILE FORMATS.
+#      - TOML: a pure-HLS parser supporting the subset most apps use
+#        (tables, key=value, strings, ints, floats, bools, arrays of
+#        scalars, inline tables, comments, multi-line strings via
+#        triple-quotes). This is the PREFERRED format.
+#      - JSON: delegated to std.json (Stage 5). Reused as-is.
+#      - INI: a small subset ([section], key=value, # comments) for
+#        legacy configs that haven't migrated to TOML yet.
+#      The format is detected by file extension (.toml / .json / .ini)
+#      or by content sniffing (first non-whitespace char: `{` -> JSON,
+#      `[` -> INI section header or TOML table, otherwise TOML).
+#
+#   4. LAYERING SEMANTICS.
+#      `config_load(schema, file_content_or_empty, env_prefix)`:
+#        a. Start with the SCHEMA's defaults (every key declared with
+#           a default gets its default value).
+#        b. Overlay the FILE's values (TOML / JSON / INI). A key in the
+#           file overrides the default. The file's value is COERCED
+#           to the type declared in the schema (a `"8080"` string in
+#           the file becomes int 8080 if the schema says int). A
+#           coercion failure is a load error.
+#        c. Overlay the ENV's values (env_prefix + key, uppercased,
+#           with `_` as the separator for nested keys: `MYAPP_SERVER_PORT`
+#           -> `server.port`). Env values are also coerced. A coercion
+#           failure is a load error.
+#        d. CLI args are NOT layered here — the caller does that
+#           separately by passing cli_get_str(r, key) to
+#           `config_set_str` after loading. (The CLI overlay is the
+#           HIGHEST priority layer; it's the caller's responsibility.)
+#
+#   5. DOTTED-PATH LOOKUP.
+#      `config_get(cfg, "server.port")` splits on `.` and walks the
+#      nested ConfigValue tree (tables hold other ConfigValues). Returns
+#      ConfigValue.Null if any segment is missing. The accessors
+#      (`config_get_str / _int / _float / _bool`) build on this and
+#      return the default if the path is missing or the value is the
+#      wrong type (lenient — same convention as std.cli's accessors:
+#      they never panic on a successfully-loaded config).
+#
+#   6. NO NEW COMPILER BUILTINS.
+#      The module is pure-HLS on top of std.str, std.option,
+#      std.result, std.json. The only builtins used are `read_file`
+#      (Fs effect, for `config_load_file`) and `env_get` / `env_has`
+#      (Proc effect, for `config_load_from_env`).
+#
+# Security:
+#   * File content is treated as UNTRUSTED (it's an external input).
+#     The parsers are robust against malformed input: they return a
+#     `Result[ConfigValue, str]` with a descriptive error message
+#     (line / column / what was expected). A malformed file does NOT
+#     panic the program — the caller decides how to handle the error
+#     (typically: log it, fall back to defaults, exit).
+#   * Env values are also untrusted; they're coerced to the schema's
+#     type, and a coercion failure is a load error (NOT a panic).
+#   * No shell invocation, no `eval`, no code generation. The TOML
+#     parser is a pure state machine; it cannot execute arbitrary code.
+#   * Path traversal is NOT a concern here (the module doesn't open
+#     files — `config_load_file` takes a path string and calls
+#     `read_file`, which is the existing Fs builtin; the path is the
+#     caller's responsibility).
+#
+# Differential parity (interpreter == native):
+#   The parsers are pure functions of (file_content, env_vars, schema).
+#   The interpreter and the native binary produce byte-identical
+#   ConfigValue trees. The differential test serialises the loaded
+#   config to stdout and compares byte-for-byte.
+#
+# Limitations (deferred to later stages):
+#   * No TOML array-of-tables (`[[products]]`) — only arrays of scalars
+#     (strings, ints, floats, bools). A future perfection stage may add
+#     array-of-tables.
+#   * No TOML dates / times / datetimes — deferred (a future std.time
+#     integration).
+#   * No YAML support — TOML is the preferred format; YAML's complexity
+#     (anchors, aliases, multi-document) is a known footgun and we
+#     defer it. (The roadmap mentions YAML, but the v0.79.0-alpha
+#     implementation ships TOML + JSON + INI; YAML is a documented
+#     limitation.)
+#   * No watch / hot-reload — the config is loaded once at startup.
+#     A future stage may add `config_watch(schema, path)` that re-reads
+#     the file on SIGHUP.
+#   * No derive macro — the caller builds the schema by hand. Stage
+#     113+ adds derive; at that point `#[derive(Config)]` can generate
+#     the schema from a struct definition.
+# ============================================================================
+
+import "std.str"
+import "std.option"
+import "std.result"
+import "std.json"
+
+# ----------------------------------------------------------------------------
+# Constants — config value kinds. Stored as int (HLS v0.3 has no enum-
+# with-methods; the accessors switch on these int values).
+# ----------------------------------------------------------------------------
+
+fn config_kind_null() -> int { return 0 }
+fn config_kind_str() -> int { return 1 }
+fn config_kind_int() -> int { return 2 }
+fn config_kind_float() -> int { return 3 }
+fn config_kind_bool() -> int { return 4 }
+fn config_kind_table() -> int { return 5 }
+fn config_kind_array() -> int { return 6 }
+
+# ----------------------------------------------------------------------------
+# ConfigValue — a tagged union for config values. A config is a tree of
+# ConfigValues (tables hold other ConfigValues; arrays hold lists of
+# ConfigValues). The top-level config is always a table.
+# ----------------------------------------------------------------------------
+
+struct ConfigValue {
+    kind: int,
+    str_val: str,
+    int_val: int,
+    float_val: float,
+    bool_val: bool,
+    table_keys: list[str],
+    table_vals: list[ConfigValue],
+    array_items: list[ConfigValue],
+}
+
+# ----------------------------------------------------------------------------
+# Constructors — return a ConfigValue of the given kind.
+# ----------------------------------------------------------------------------
+
+fn config_null() -> ConfigValue {
+    return ConfigValue {
+        kind: config_kind_null(),
+        str_val: "", int_val: 0, float_val: 0.0, bool_val: false,
+        table_keys: [], table_vals: [], array_items: [],
+    }
+}
+
+fn config_str(v: str) -> ConfigValue {
+    return ConfigValue {
+        kind: config_kind_str(),
+        str_val: v, int_val: 0, float_val: 0.0, bool_val: false,
+        table_keys: [], table_vals: [], array_items: [],
+    }
+}
+
+fn config_int(v: int) -> ConfigValue {
+    return ConfigValue {
+        kind: config_kind_int(),
+        str_val: "", int_val: v, float_val: 0.0, bool_val: false,
+        table_keys: [], table_vals: [], array_items: [],
+    }
+}
+
+fn config_float(v: float) -> ConfigValue {
+    return ConfigValue {
+        kind: config_kind_float(),
+        str_val: "", int_val: 0, float_val: v, bool_val: false,
+        table_keys: [], table_vals: [], array_items: [],
+    }
+}
+
+fn config_bool(v: bool) -> ConfigValue {
+    return ConfigValue {
+        kind: config_kind_bool(),
+        str_val: "", int_val: 0, float_val: 0.0, bool_val: v,
+        table_keys: [], table_vals: [], array_items: [],
+    }
+}
+
+fn config_table(keys: list[str], vals: list[ConfigValue]) -> ConfigValue {
+    return ConfigValue {
+        kind: config_kind_table(),
+        str_val: "", int_val: 0, float_val: 0.0, bool_val: false,
+        table_keys: keys, table_vals: vals, array_items: [],
+    }
+}
+
+fn config_array(items: list[ConfigValue]) -> ConfigValue {
+    return ConfigValue {
+        kind: config_kind_array(),
+        str_val: "", int_val: 0, float_val: 0.0, bool_val: false,
+        table_keys: [], table_vals: [], array_items: items,
+    }
+}
+
+# ----------------------------------------------------------------------------
+# ConfigSchemaEntry — one declared key in the schema. The schema is a
+# flat list of entries; the loader uses it to (a) populate defaults and
+# (b) coerce file/env values to the declared type.
+# ----------------------------------------------------------------------------
+
+struct ConfigSchemaEntry {
+    key: str,            # dotted path, e.g. "server.port"
+    kind: int,           # one of config_kind_* (must be scalar: str/int/float/bool)
+    default_str: str,   # default value as a string (coerced at load time)
+    has_default: bool,   # does this entry have a default?
+    desc: str,           # human-readable description (for `config_describe`)
+    env_name: str,       # explicit env-var name; "" if derived from prefix+key
+}
+
+# ----------------------------------------------------------------------------
+# ConfigSchema — the schema (a list of entries). Built via the builder
+# pattern (immutable updates).
+# ----------------------------------------------------------------------------
+
+struct ConfigSchema {
+    entries: list[ConfigSchemaEntry],
+}
+
+# ----------------------------------------------------------------------------
+# ConfigLoadError — a structured error from the loader. Carries the
+# layer (defaults / file / env), the key, and a human-readable message.
+# ----------------------------------------------------------------------------
+
+struct ConfigLoadError {
+    layer: str,          # "defaults" / "file" / "env"
+    key: str,            # the dotted path that failed
+    message: str,        # human-readable error
+}
+
+# ============================================================================
+# Builder — immutable updates (same convention as CliParser / Logger).
+# ============================================================================
+
+# config_schema_new() — create an empty schema.
+fn config_schema_new() -> ConfigSchema {
+    let empty: list[ConfigSchemaEntry] = []
+    return ConfigSchema { entries: empty }
+}
+
+# config_schema_str(schema, key, default, desc) — declare a str key.
+fn config_schema_str(schema: ConfigSchema, key: str, default: str, desc: str) -> ConfigSchema {
+    return config_schema_add(schema, key, config_kind_str(), default, true, desc, "")
+}
+
+# config_schema_int(schema, key, default, desc) — declare an int key.
+fn config_schema_int(schema: ConfigSchema, key: str, default: int, desc: str) -> ConfigSchema {
+    return config_schema_add(schema, key, config_kind_int(), default.to_str(), true, desc, "")
+}
+
+# config_schema_float(schema, key, default, desc) — declare a float key.
+fn config_schema_float(schema: ConfigSchema, key: str, default: float, desc: str) -> ConfigSchema {
+    return config_schema_add(schema, key, config_kind_float(), default.to_str(), true, desc, "")
+}
+
+# config_schema_bool(schema, key, default, desc) — declare a bool key.
+fn config_schema_bool(schema: ConfigSchema, key: str, default: bool, desc: str) -> ConfigSchema {
+    return config_schema_add(schema, key, config_kind_bool(), default.to_str(), true, desc, "")
+}
+
+# config_schema_str_no_default — declare a str key without a default.
+fn config_schema_str_no_default(schema: ConfigSchema, key: str, desc: str) -> ConfigSchema {
+    return config_schema_add(schema, key, config_kind_str(), "", false, desc, "")
+}
+
+# config_schema_int_no_default — declare an int key without a default.
+fn config_schema_int_no_default(schema: ConfigSchema, key: str, desc: str) -> ConfigSchema {
+    return config_schema_add(schema, key, config_kind_int(), "", false, desc, "")
+}
+
+# config_schema_env(schema, key, env_name) — register an explicit env-var
+# name for a key (overrides the default `PREFIX_KEY` derivation). Used
+# when the env var doesn't follow the standard convention.
+fn config_schema_env(schema: ConfigSchema, key: str, env_name: str) -> ConfigSchema {
+    let new_entries: list[ConfigSchemaEntry] = []
+    let mut i: int = 0
+    while i < schema.entries.len() {
+        let e: ConfigSchemaEntry = schema.entries.get(i)
+        if e.key == key {
+            let ne: ConfigSchemaEntry = ConfigSchemaEntry {
+                key: e.key, kind: e.kind, default_str: e.default_str,
+                has_default: e.has_default, desc: e.desc, env_name: env_name,
+            }
+            new_entries.push(ne)
+        } else {
+            new_entries.push(e)
+        }
+        i = i + 1
+    }
+    return ConfigSchema { entries: new_entries }
+}
+
+# config_schema_add — internal helper: append an entry.
+fn config_schema_add(schema: ConfigSchema, key: str, kind: int,
+                      default_str: str, has_default: bool, desc: str,
+                      env_name: str) -> ConfigSchema {
+    let new_entries: list[ConfigSchemaEntry] = []
+    let mut i: int = 0
+    while i < schema.entries.len() {
+        new_entries.push(schema.entries.get(i))
+        i = i + 1
+    }
+    new_entries.push(ConfigSchemaEntry {
+        key: key, kind: kind, default_str: default_str,
+        has_default: has_default, desc: desc, env_name: env_name,
+    })
+    return ConfigSchema { entries: new_entries }
+}
+
+# ----------------------------------------------------------------------------
+# impl ConfigSchema — method twins of the free-function builders.
+# ----------------------------------------------------------------------------
+
+impl ConfigSchema {
+    fn str_key(self: ConfigSchema, key: str, default: str, desc: str) -> ConfigSchema {
+        return config_schema_str(self, key, default, desc)
+    }
+    fn int_key(self: ConfigSchema, key: str, default: int, desc: str) -> ConfigSchema {
+        return config_schema_int(self, key, default, desc)
+    }
+    fn float_key(self: ConfigSchema, key: str, default: float, desc: str) -> ConfigSchema {
+        return config_schema_float(self, key, default, desc)
+    }
+    fn bool_key(self: ConfigSchema, key: str, default: bool, desc: str) -> ConfigSchema {
+        return config_schema_bool(self, key, default, desc)
+    }
+    fn str_key_no_default(self: ConfigSchema, key: str, desc: str) -> ConfigSchema {
+        return config_schema_str_no_default(self, key, desc)
+    }
+    fn int_key_no_default(self: ConfigSchema, key: str, desc: str) -> ConfigSchema {
+        return config_schema_int_no_default(self, key, desc)
+    }
+    fn env(self: ConfigSchema, key: str, env_name: str) -> ConfigSchema {
+        return config_schema_env(self, key, env_name)
+    }
+}
+
+# ============================================================================
+# Layering — config_load(schema, file_content, env_prefix) -> Result[ConfigValue, ConfigLoadError]
+#
+# The loader applies the three layers (defaults < file < env) and returns
+# a flat ConfigValue tree (a top-level table holding nested tables for
+# dotted-path keys). The caller then uses config_get / config_get_str /
+# _int / _float / _bool to look up values.
+#
+# `file_content` may be "" (no file — defaults + env only).
+# `env_prefix` may be "" (no env overlay — defaults + file only).
+# ============================================================================
+
+fn config_load(schema: ConfigSchema, file_content: str, env_prefix: str) -> Result[ConfigValue, ConfigLoadError] uses Proc {
+    # Layer 1: defaults.
+    let mut cfg: ConfigValue = config_table([], [])
+    let mut i: int = 0
+    while i < schema.entries.len() {
+        let e: ConfigSchemaEntry = schema.entries.get(i)
+        if e.has_default {
+            let coerced: Result[ConfigValue, str] = config_coerce_str(e.kind, e.default_str)
+            if result_is_err(coerced) {
+                let err: ConfigLoadError = ConfigLoadError {
+                    layer: "defaults",
+                    key: e.key,
+                    message: result_err_or(coerced, "coercion failed"),
+                }
+                return Result.Err(err)
+            }
+            let v: ConfigValue = result_unwrap(coerced)
+            config_set_path(cfg, e.key, v)
+        }
+        i = i + 1
+    }
+
+    # Layer 2: file content (TOML / JSON / INI).
+    if file_content.len() > 0 {
+        let parsed: Result[ConfigValue, str] = config_parse_file(file_content)
+        if result_is_err(parsed) {
+            let err: ConfigLoadError = ConfigLoadError {
+                layer: "file",
+                key: "<root>",
+                message: result_err_or(parsed, "parse failed"),
+            }
+            return Result.Err(err)
+        }
+        let file_cfg: ConfigValue = result_unwrap(parsed)
+        # Overlay: for every key in the schema, look it up in file_cfg;
+        # if present, coerce to the schema's type and set in cfg.
+        let mut j: int = 0
+        while j < schema.entries.len() {
+            let e: ConfigSchemaEntry = schema.entries.get(j)
+            let file_val: ConfigValue = config_get_path(file_cfg, e.key)
+            if file_val.kind != config_kind_null() {
+                let coerced: Result[ConfigValue, str] = config_coerce_value(e.kind, file_val)
+                if result_is_err(coerced) {
+                    let err: ConfigLoadError = ConfigLoadError {
+                        layer: "file",
+                        key: e.key,
+                        message: result_err_or(coerced, "coercion failed"),
+                    }
+                    return Result.Err(err)
+                }
+                config_set_path(cfg, e.key, result_unwrap(coerced))
+            }
+            j = j + 1
+        }
+    }
+
+    # Layer 3: env overlay.
+    if env_prefix != "" {
+        let mut k: int = 0
+        while k < schema.entries.len() {
+            let e: ConfigSchemaEntry = schema.entries.get(k)
+            let env_name: str = config_env_name(e, env_prefix)
+            if env_has(env_name) {
+                let raw: str = env_get(env_name)
+                let coerced: Result[ConfigValue, str] = config_coerce_str(e.kind, raw)
+                if result_is_err(coerced) {
+                    let err: ConfigLoadError = ConfigLoadError {
+                        layer: "env",
+                        key: e.key,
+                        message: "env var '" + env_name + "' = '" + raw + "': "
+                            + result_err_or(coerced, "coercion failed"),
+                    }
+                    return Result.Err(err)
+                }
+                config_set_path(cfg, e.key, result_unwrap(coerced))
+            }
+            k = k + 1
+        }
+    }
+
+    return Result.Ok(cfg)
+}
+
+# ----------------------------------------------------------------------------
+# config_load_file(schema, path, env_prefix) — convenience: read the file
+# at `path`, then call config_load. Carries the Fs effect (read_file).
+# If the file doesn't exist, this returns Result.Err (NOT a panic —
+# the caller decides whether to fall back to defaults-only).
+# ----------------------------------------------------------------------------
+
+fn config_load_file(schema: ConfigSchema, path: str, env_prefix: str) -> Result[ConfigValue, ConfigLoadError] uses Fs, Proc {
+    let content: str = read_file(path)
+    # read_file returns "" if the file doesn't exist (the builtin's
+    # convention — see Stage 36). We can't distinguish empty file from
+    # missing file here; the caller should check via fs::path_exists
+    # if that distinction matters. For the loader, "" = no file.
+    if content == "" {
+        # Try env-only.
+        return config_load(schema, "", env_prefix)
+    }
+    return config_load(schema, content, env_prefix)
+}
+
+# ----------------------------------------------------------------------------
+# config_env_name(entry, prefix) — derive the env-var name for a key.
+#   "server.port" + prefix "MYAPP" -> "MYAPP_SERVER_PORT"
+# If the entry has an explicit env_name, use it verbatim.
+# ----------------------------------------------------------------------------
+
+fn config_env_name(entry: ConfigSchemaEntry, prefix: str) -> str {
+    if entry.env_name != "" {
+        return entry.env_name
+    }
+    # Replace '.' with '_', uppercase, prepend prefix + '_'.
+    let upper_key: str = str_to_upper_ascii(str_replace(entry.key, ".", "_"))
+    return prefix + "_" + upper_key
+}
+
+# ============================================================================
+# Coercion — config_coerce_str(kind, raw) -> Result[ConfigValue, str]
+# and config_coerce_value(kind, v) -> Result[ConfigValue, str].
+#
+# Coercion rules:
+#   str:   any value -> its string form. For an int 8080, str "8080".
+#   int:   str -> int_parse; int -> as-is; float -> floor; bool -> 0/1.
+#   float: str -> float_parse; int -> as float; float -> as-is; bool -> 0.0/1.0.
+#   bool:  str -> "true"/"1"/"yes"/"on" (case-insensitive) -> true;
+#                "false"/"0"/"no"/"off" -> false; else Err.
+#          int -> 0 -> false, non-zero -> true.
+#          float -> 0.0 -> false, non-zero -> true.
+#          bool -> as-is.
+# ============================================================================
+
+fn config_coerce_str(kind: int, raw: str) -> Result[ConfigValue, str] {
+    if kind == config_kind_str() {
+        return Result.Ok(config_str(raw))
+    }
+    if kind == config_kind_int() {
+        let r: Result[int, str] = int_parse(raw)
+        if result_is_err(r) {
+            return Result.Err("invalid int '" + raw + "' ("
+                + result_err_or(r, "") + ")")
+        }
+        return Result.Ok(config_int(result_unwrap(r)))
+    }
+    if kind == config_kind_float() {
+        let r: Result[float, str] = float_parse(raw)
+        if result_is_err(r) {
+            return Result.Err("invalid float '" + raw + "' ("
+                + result_err_or(r, "") + ")")
+        }
+        return Result.Ok(config_float(result_unwrap(r)))
+    }
+    if kind == config_kind_bool() {
+        let lower: str = str_to_lower_ascii(raw)
+        if lower == "true" || lower == "1" || lower == "yes" || lower == "on" {
+            return Result.Ok(config_bool(true))
+        }
+        if lower == "false" || lower == "0" || lower == "no" || lower == "off" {
+            return Result.Ok(config_bool(false))
+        }
+        return Result.Err("invalid bool '" + raw
+            + "' (expected true/false/1/0/yes/no/on/off)")
+    }
+    return Result.Err("unsupported kind " + kind.to_str())
+}
+
+fn config_coerce_value(kind: int, v: ConfigValue) -> Result[ConfigValue, str] {
+    if kind == config_kind_str() {
+        return Result.Ok(config_str(config_value_to_str(v)))
+    }
+    if kind == config_kind_int() {
+        if v.kind == config_kind_int() {
+            return Result.Ok(v)
+        }
+        if v.kind == config_kind_float() {
+            return Result.Ok(config_int(v.float_val.to_int()))
+        }
+        if v.kind == config_kind_bool() {
+            if v.bool_val {
+                return Result.Ok(config_int(1))
+            }
+            return Result.Ok(config_int(0))
+        }
+        if v.kind == config_kind_str() {
+            return config_coerce_str(config_kind_int(), v.str_val)
+        }
+        return Result.Err("cannot coerce kind " + v.kind.to_str() + " to int")
+    }
+    if kind == config_kind_float() {
+        if v.kind == config_kind_float() {
+            return Result.Ok(v)
+        }
+        if v.kind == config_kind_int() {
+            return Result.Ok(config_float(v.int_val.to_float()))
+        }
+        if v.kind == config_kind_bool() {
+            if v.bool_val {
+                return Result.Ok(config_float(1.0))
+            }
+            return Result.Ok(config_float(0.0))
+        }
+        if v.kind == config_kind_str() {
+            return config_coerce_str(config_kind_float(), v.str_val)
+        }
+        return Result.Err("cannot coerce kind " + v.kind.to_str() + " to float")
+    }
+    if kind == config_kind_bool() {
+        if v.kind == config_kind_bool() {
+            return Result.Ok(v)
+        }
+        if v.kind == config_kind_int() {
+            return Result.Ok(config_bool(v.int_val != 0))
+        }
+        if v.kind == config_kind_float() {
+            return Result.Ok(config_bool(v.float_val != 0.0))
+        }
+        if v.kind == config_kind_str() {
+            return config_coerce_str(config_kind_bool(), v.str_val)
+        }
+        return Result.Err("cannot coerce kind " + v.kind.to_str() + " to bool")
+    }
+    return Result.Err("unsupported target kind " + kind.to_str())
+}
+
+# ----------------------------------------------------------------------------
+# config_value_to_str(v) — render a ConfigValue as a string (for str
+# coercion and for serialisation). Ints render via to_str; floats via
+# to_str; bools as "true"/"false"; null as ""; tables/arrays as their
+# JSON-ish form (debug only — not used in production paths).
+# ----------------------------------------------------------------------------
+
+fn config_value_to_str(v: ConfigValue) -> str {
+    if v.kind == config_kind_str() {
+        return v.str_val
+    }
+    if v.kind == config_kind_int() {
+        return v.int_val.to_str()
+    }
+    if v.kind == config_kind_float() {
+        return v.float_val.to_str()
+    }
+    if v.kind == config_kind_bool() {
+        if v.bool_val {
+            return "true"
+        }
+        return "false"
+    }
+    if v.kind == config_kind_null() {
+        return ""
+    }
+    # Tables / arrays — render as a debug string (not used in normal
+    # coercion paths; only for debugging).
+    return "<" + config_kind_name(v.kind) + ">"
+}
+
+fn config_kind_name(kind: int) -> str {
+    if kind == config_kind_null() { return "null" }
+    if kind == config_kind_str() { return "str" }
+    if kind == config_kind_int() { return "int" }
+    if kind == config_kind_float() { return "float" }
+    if kind == config_kind_bool() { return "bool" }
+    if kind == config_kind_table() { return "table" }
+    if kind == config_kind_array() { return "array" }
+    return "unknown"
+}
+
+# ============================================================================
+# Path access — config_get_path(cfg, dotted_path) -> ConfigValue.
+# Splits the path on '.' and walks the table tree. Returns null if any
+# segment is missing or non-table.
+# ============================================================================
+
+fn config_get_path(cfg: ConfigValue, path: str) -> ConfigValue {
+    if path == "" {
+        return cfg
+    }
+    let parts: list[str] = path.split(".")
+    let mut cur: ConfigValue = cfg
+    let mut i: int = 0
+    while i < parts.len() {
+        if cur.kind != config_kind_table() {
+            return config_null()
+        }
+        let seg: str = parts.get(i)
+        let idx: int = config_table_find(cur, seg)
+        if idx < 0 {
+            return config_null()
+        }
+        cur = cur.table_vals.get(idx)
+        i = i + 1
+    }
+    return cur
+}
+
+# config_table_find(table, key) -> int — index of key in the table, or -1.
+fn config_table_find(table: ConfigValue, key: str) -> int {
+    let mut i: int = 0
+    while i < table.table_keys.len() {
+        if table.table_keys.get(i) == key {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+# ----------------------------------------------------------------------------
+# config_set_path(cfg, dotted_path, value) -> void — MUTATES cfg in-place.
+# Creates intermediate tables as needed. The cfg's table_keys /
+# table_vals lists are mutated (HLS lists are mutable through push when
+# the binding is `let mut` — but we use the trick of mutating the
+# INNER list directly via set, which works for `let` bindings too).
+#
+# NOTE: this function assumes `cfg` is a table (the top-level config is
+# always a table by construction). It does NOT check; if cfg is not a
+# table, the function silently does nothing (the value is lost).
+# ----------------------------------------------------------------------------
+
+fn config_set_path(cfg: ConfigValue, path: str, value: ConfigValue) -> void {
+    if path == "" {
+        return
+    }
+    if cfg.kind != config_kind_table() {
+        return
+    }
+    let parts: list[str] = path.split(".")
+    let mut cur: ConfigValue = cfg
+    let mut i: int = 0
+    while i < parts.len() - 1 {
+        let seg: str = parts.get(i)
+        let idx: int = config_table_find(cur, seg)
+        if idx < 0 {
+            # Create intermediate table.
+            let new_tbl: ConfigValue = config_table([], [])
+            cur.table_keys.push(seg)
+            cur.table_vals.push(new_tbl)
+            cur = new_tbl
+        } else {
+            let next: ConfigValue = cur.table_vals.get(idx)
+            if next.kind != config_kind_table() {
+                # The path goes through a non-table — overwrite with a table.
+                let new_tbl: ConfigValue = config_table([], [])
+                cur.table_vals.set(idx, new_tbl)
+                cur = new_tbl
+            } else {
+                cur = next
+            }
+        }
+        i = i + 1
+    }
+    # Last segment — set or replace.
+    let last_seg: str = parts.get(parts.len() - 1)
+    let last_idx: int = config_table_find(cur, last_seg)
+    if last_idx < 0 {
+        cur.table_keys.push(last_seg)
+        cur.table_vals.push(value)
+    } else {
+        cur.table_vals.set(last_idx, value)
+    }
+}
+
+# ============================================================================
+# Typed accessors — config_get_str / _int / _float / _bool.
+# These NEVER panic: if the path is missing or the value is the wrong
+# type, they return the default (matching std.cli's accessors).
+# ============================================================================
+
+fn config_get_str(cfg: ConfigValue, path: str, default: str) -> str {
+    let v: ConfigValue = config_get_path(cfg, path)
+    if v.kind == config_kind_str() {
+        return v.str_val
+    }
+    if v.kind == config_kind_int() {
+        return v.int_val.to_str()
+    }
+    if v.kind == config_kind_float() {
+        return v.float_val.to_str()
+    }
+    if v.kind == config_kind_bool() {
+        if v.bool_val {
+            return "true"
+        }
+        return "false"
+    }
+    return default
+}
+
+fn config_get_int(cfg: ConfigValue, path: str, default: int) -> int {
+    let v: ConfigValue = config_get_path(cfg, path)
+    if v.kind == config_kind_int() {
+        return v.int_val
+    }
+    if v.kind == config_kind_float() {
+        return v.float_val.to_int()
+    }
+    if v.kind == config_kind_bool() {
+        if v.bool_val {
+            return 1
+        }
+        return 0
+    }
+    if v.kind == config_kind_str() {
+        let r: Result[int, str] = int_parse(v.str_val)
+        if result_is_ok(r) {
+            return result_unwrap_or(r, default)
+        }
+    }
+    return default
+}
+
+fn config_get_float(cfg: ConfigValue, path: str, default: float) -> float {
+    let v: ConfigValue = config_get_path(cfg, path)
+    if v.kind == config_kind_float() {
+        return v.float_val
+    }
+    if v.kind == config_kind_int() {
+        return v.int_val.to_float()
+    }
+    if v.kind == config_kind_bool() {
+        if v.bool_val {
+            return 1.0
+        }
+        return 0.0
+    }
+    if v.kind == config_kind_str() {
+        let r: Result[float, str] = float_parse(v.str_val)
+        if result_is_ok(r) {
+            return result_unwrap_or(r, default)
+        }
+    }
+    return default
+}
+
+fn config_get_bool(cfg: ConfigValue, path: str, default: bool) -> bool {
+    let v: ConfigValue = config_get_path(cfg, path)
+    if v.kind == config_kind_bool() {
+        return v.bool_val
+    }
+    if v.kind == config_kind_int() {
+        return v.int_val != 0
+    }
+    if v.kind == config_kind_float() {
+        return v.float_val != 0.0
+    }
+    if v.kind == config_kind_str() {
+        let lower: str = str_to_lower_ascii(v.str_val)
+        if lower == "true" || lower == "1" || lower == "yes" || lower == "on" {
+            return true
+        }
+        if lower == "false" || lower == "0" || lower == "no" || lower == "off" {
+            return false
+        }
+    }
+    return default
+}
+
+# ----------------------------------------------------------------------------
+# config_has(cfg, path) — true iff the path exists and is non-null.
+# ----------------------------------------------------------------------------
+
+fn config_has(cfg: ConfigValue, path: str) -> bool {
+    let v: ConfigValue = config_get_path(cfg, path)
+    return v.kind != config_kind_null()
+}
+
+# ----------------------------------------------------------------------------
+# config_set_str(cfg, path, value) — mutate cfg in-place to set a str.
+# Used by the CLI overlay (the caller sets values from cli_get_str after
+# loading defaults + file + env). Carries no effect (pure mutation of
+# an in-memory value).
+# ----------------------------------------------------------------------------
+
+fn config_set_str(cfg: ConfigValue, path: str, value: str) -> void {
+    config_set_path(cfg, path, config_str(value))
+}
+
+fn config_set_int(cfg: ConfigValue, path: str, value: int) -> void {
+    config_set_path(cfg, path, config_int(value))
+}
+
+fn config_set_float(cfg: ConfigValue, path: str, value: float) -> void {
+    config_set_path(cfg, path, config_float(value))
+}
+
+fn config_set_bool(cfg: ConfigValue, path: str, value: bool) -> void {
+    config_set_path(cfg, path, config_bool(value))
+}
+
+# ============================================================================
+# File parsers — config_parse_file(content) -> Result[ConfigValue, str].
+# Detects the format by content sniffing and delegates to the appropriate
+# parser. Returns a top-level table.
+# ============================================================================
+
+fn config_parse_file(content: str) -> Result[ConfigValue, str] {
+    # Strip leading whitespace to sniff the first non-whitespace char.
+    let mut i: int = 0
+    let n: int = content.len()
+    while i < n {
+        let b: int = content.byte_at(i)
+        if b != 32 && b != 9 && b != 10 && b != 13 {
+            break
+        }
+        i = i + 1
+    }
+    if i >= n {
+        # Empty file (or whitespace-only).
+        return Result.Ok(config_table([], []))
+    }
+    let first: int = content.byte_at(i)
+    # JSON: starts with '{' (object) — NOT '[' (which could be a TOML
+    # table header). TOML files start with '[' for table headers; JSON
+    # arrays start with '[' too, but a JSON array is unusual for a
+    # config file (configs are objects). We detect JSON by '{' only;
+    # everything else is treated as TOML.
+    if first == 123 {
+        return config_parse_json(content)
+    }
+    # TOML / INI: both can start with '[' (a table header) or a key.
+    # We treat everything else as TOML (the preferred format).
+    # A TOML file with a `[section]` header and `key = value` lines is
+    # also valid INI; the TOML parser handles both (INI is a subset of
+    # TOML's table-header + key=value syntax, minus TOML's typed values).
+    return toml_parse(content)
+}
+
+# ----------------------------------------------------------------------------
+# config_parse_json(content) — delegate to std.json. The JSON parser
+# returns a JsonValue; we convert it to a ConfigValue tree. JSON objects
+# become tables; JSON arrays become arrays; JSON scalars become the
+# corresponding ConfigValue scalars.
+# ----------------------------------------------------------------------------
+
+fn config_parse_json(content: str) -> Result[ConfigValue, str] {
+    let r: Result[JsonValue, str] = json_parse_result(content)
+    if result_is_err(r) {
+        return Result.Err("JSON parse error: " + result_err_or(r, "unknown"))
+    }
+    let jv: JsonValue = result_unwrap(r)
+    return Result.Ok(config_from_json(jv))
+}
+
+fn config_from_json(jv: JsonValue) -> ConfigValue {
+    if json_is_null(jv) {
+        return config_null()
+    }
+    if json_is_bool(jv) {
+        return config_bool(json_bool_value(jv))
+    }
+    if json_is_int(jv) {
+        return config_int(json_int_value(jv))
+    }
+    if json_is_float(jv) {
+        return config_float(json_float_value(jv))
+    }
+    if json_is_str(jv) {
+        return config_str(json_str_value(jv))
+    }
+    if json_is_array(jv) {
+        let items: list[ConfigValue] = []
+        let mut i: int = 0
+        while i < jv.arr.len() {
+            items.push(config_from_json(jv.arr.get(i)))
+            i = i + 1
+        }
+        return config_array(items)
+    }
+    if json_is_object(jv) {
+        let keys: list[str] = []
+        let vals: list[ConfigValue] = []
+        let mut i: int = 0
+        while i < jv.obj_keys.len() {
+            keys.push(jv.obj_keys.get(i))
+            vals.push(config_from_json(jv.obj_vals.get(i)))
+            i = i + 1
+        }
+        return config_table(keys, vals)
+    }
+    return config_null()
+}
+
+# ============================================================================
+# TOML PARSER — toml_parse(src) -> Result[ConfigValue, str].
+#
+# Supports the subset of TOML most apps use:
+#   - Tables: [section] and [section.subsection] (dotted table headers).
+#   - Inline tables: key = {a = 1, b = 2}
+#   - Arrays: key = [1, 2, 3] (scalars only; array-of-tables `[[x]]` not supported).
+#   - Strings: basic ("..."), literal ('...'), multi-line basic ("""..."""),
+#     multi-line literal ('''...''').
+#   - Ints: 123, -456, +789, 1_000 (underscores ignored), 0x..., 0o..., 0b...
+#   - Floats: 1.0, -2.5, 3.14e10, +6.022e23, inf, nan.
+#   - Bools: true, false.
+#   - Comments: # ... to end of line.
+#   - Key quoting: bare keys (a-z, A-Z, 0-9, _, -), quoted keys ("..." or '...').
+#
+# The parser is a hand-written state machine. It does NOT allocate
+# intermediate substrings for the whole input; it tracks byte offsets
+# and slices only at value boundaries. (HLS strings are immutable
+# bytes, so slicing is O(1) — no copy.)
+#
+# Returns Result.Ok(ConfigValue{table}) on success, Result.Err(msg) on
+# failure. The error message includes the line / column.
+# ============================================================================
+
+fn toml_parse(src: str) -> Result[ConfigValue, str] {
+    let p: TomlParser = TomlParser {
+        src: src,
+        pos: 0,
+        line: 1,
+        col: 1,
+    }
+    let root: ConfigValue = config_table([], [])
+    let mut current_table_path: list[str] = []
+    let mut ok: bool = true
+    let mut err_msg: str = ""
+
+    while p.pos < p.src.len() && ok {
+        # Skip whitespace and comments.
+        toml_skip_ws_and_comments(p)
+        if p.pos >= p.src.len() {
+            break
+        }
+        let c: int = toml_peek(p)
+        # Table header: [section] or [section.subsection].
+        if c == 91 {
+            # Could be [section] or [[array-of-tables]]. The latter is
+            # not supported in v0.79.0-alpha; we reject it with a clear
+            # error message.
+            toml_advance(p)  # consume '['
+            if toml_peek(p) == 91 {
+                return Result.Err(toml_err(p, "array-of-tables [[...]] not supported in v0.79.0-alpha"))
+            }
+            let path_r: Result[list[str], str] = toml_parse_table_header(p)
+            if result_is_err(path_r) {
+                return Result.Err(result_err_or(path_r, "table header parse failed"))
+            }
+            current_table_path = result_unwrap(path_r)
+            # Expect ']'.
+            toml_skip_ws(p)
+            if toml_peek(p) != 93 {
+                return Result.Err(toml_err(p, "expected ']' after table header"))
+            }
+            toml_advance(p)
+            # Ensure the path exists in root (create intermediate tables).
+            toml_ensure_path(root, current_table_path)
+            continue
+        }
+        # Key = value.
+        let key_r: Result[str, str] = toml_parse_key(p)
+        if result_is_err(key_r) {
+            return Result.Err(result_err_or(key_r, "key parse failed"))
+        }
+        let key: str = result_unwrap(key_r)
+        toml_skip_ws(p)
+        if toml_peek(p) != 61 {
+            return Result.Err(toml_err(p, "expected '=' after key '" + key + "'"))
+        }
+        toml_advance(p)  # consume '='
+        toml_skip_ws(p)
+        let val_r: Result[ConfigValue, str] = toml_parse_value(p)
+        if result_is_err(val_r) {
+            return Result.Err(result_err_or(val_r, "value parse failed"))
+        }
+        let val: ConfigValue = result_unwrap(val_r)
+        # Set the key under the current table path.
+        let full_path: list[str] = toml_path_append(current_table_path, key)
+        toml_ensure_path(root, full_path)
+        config_set_path(root, str_join(full_path, "."), val)
+        # Skip trailing whitespace / comment / newline.
+        toml_skip_ws_and_comments(p)
+        # Optional newline (the next iteration handles it).
+    }
+
+    return Result.Ok(root)
+}
+
+# ----------------------------------------------------------------------------
+# TomlParser — the parser state. A simple struct holding the source,
+# the current byte offset, and the line / column (for error messages).
+# ----------------------------------------------------------------------------
+
+struct TomlParser {
+    src: str,
+    pos: int,
+    line: int,
+    col: int,
+}
+
+# ----------------------------------------------------------------------------
+# toml_peek(p) -> int — the byte at the current position, or -1 if EOF.
+# ----------------------------------------------------------------------------
+
+fn toml_peek(p: TomlParser) -> int {
+    if p.pos >= p.src.len() {
+        return -1
+    }
+    return p.src.byte_at(p.pos)
+}
+
+# toml_peek_at(p, offset) -> int — the byte at pos + offset.
+fn toml_peek_at(p: TomlParser, offset: int) -> int {
+    let idx: int = p.pos + offset
+    if idx >= p.src.len() {
+        return -1
+    }
+    return p.src.byte_at(idx)
+}
+
+# toml_advance(p) -> void — consume one byte, updating line / col.
+fn toml_advance(p: TomlParser) -> void {
+    if p.pos >= p.src.len() {
+        return
+    }
+    let b: int = p.src.byte_at(p.pos)
+    p.pos = p.pos + 1
+    if b == 10 {
+        p.line = p.line + 1
+        p.col = 1
+    } else {
+        p.col = p.col + 1
+    }
+}
+
+# toml_skip_ws(p) — skip spaces and tabs (NOT newlines).
+fn toml_skip_ws(p: TomlParser) -> void {
+    while p.pos < p.src.len() {
+        let b: int = p.src.byte_at(p.pos)
+        if b != 32 && b != 9 {
+            break
+        }
+        toml_advance(p)
+    }
+}
+
+# toml_skip_ws_and_comments(p) — skip spaces, tabs, newlines, and # comments.
+fn toml_skip_ws_and_comments(p: TomlParser) -> void {
+    while p.pos < p.src.len() {
+        let b: int = p.src.byte_at(p.pos)
+        if b == 32 || b == 9 || b == 10 || b == 13 {
+            toml_advance(p)
+            continue
+        }
+        if b == 35 {
+            # Comment — skip to end of line.
+            while p.pos < p.src.len() && p.src.byte_at(p.pos) != 10 {
+                toml_advance(p)
+            }
+            continue
+        }
+        break
+    }
+}
+
+# toml_err(p, msg) -> str — format an error message with line / column.
+fn toml_err(p: TomlParser, msg: str) -> str {
+    return "TOML parse error at line " + p.line.to_str() + ", col " + p.col.to_str()
+        + ": " + msg
+}
+
+# ----------------------------------------------------------------------------
+# toml_parse_table_header(p) -> Result[list[str], str] — parse a dotted
+# table path after the opening '['. Stops at the closing ']'.
+# ----------------------------------------------------------------------------
+
+fn toml_parse_table_header(p: TomlParser) -> Result[list[str], str] {
+    let parts: list[str] = []
+    let mut ok: bool = true
+    while ok {
+        toml_skip_ws(p)
+        let key_r: Result[str, str] = toml_parse_key(p)
+        if result_is_err(key_r) {
+            return Result.Err(result_err_or(key_r, "expected key in table header"))
+        }
+        parts.push(result_unwrap(key_r))
+        toml_skip_ws(p)
+        if toml_peek(p) == 46 {
+            toml_advance(p)  # consume '.'
+            continue
+        }
+        break
+    }
+    return Result.Ok(parts)
+}
+
+# ----------------------------------------------------------------------------
+# toml_parse_key(p) -> Result[str, str] — parse a single key (bare or quoted).
+#   bare: [a-zA-Z0-9_-]+
+#   quoted: "..." or '...'
+# ----------------------------------------------------------------------------
+
+fn toml_parse_key(p: TomlParser) -> Result[str, str] {
+    let c: int = toml_peek(p)
+    if c == 34 {
+        return Result.Ok(toml_parse_basic_string(p))
+    }
+    if c == 39 {
+        return Result.Ok(toml_parse_literal_string(p))
+    }
+    # Bare key.
+    let start: int = p.pos
+    while p.pos < p.src.len() {
+        let b: int = p.src.byte_at(p.pos)
+        let ok: bool = (b >= 65 && b <= 90) || (b >= 97 && b <= 122)
+            || (b >= 48 && b <= 57) || b == 95 || b == 45
+        if !ok {
+            break
+        }
+        toml_advance(p)
+    }
+    if p.pos == start {
+        return Result.Err(toml_err(p, "expected key (found '" + toml_char_str(toml_peek(p)) + "')"))
+    }
+    return Result.Ok(p.src.slice(start, p.pos))
+}
+
+# toml_char_str(c) — render a byte as a readable char (for error messages).
+fn toml_char_str(c: int) -> str {
+    if c == -1 {
+        return "<EOF>"
+    }
+    if c == 10 {
+        return "<newline>"
+    }
+    if c == 32 {
+        return "<space>"
+    }
+    if c == 9 {
+        return "<tab>"
+    }
+    return chr(c)
+}
+
+# ----------------------------------------------------------------------------
+# toml_parse_value(p) -> Result[ConfigValue, str] — parse a single value
+# (string / int / float / bool / array / inline-table).
+# ----------------------------------------------------------------------------
+
+fn toml_parse_value(p: TomlParser) -> Result[ConfigValue, str] {
+    let c: int = toml_peek(p)
+    if c == -1 {
+        return Result.Err(toml_err(p, "expected value, found EOF"))
+    }
+    # String.
+    if c == 34 {
+        # Basic string — check for multi-line.
+        if toml_peek_at(p, 1) == 34 && toml_peek_at(p, 2) == 34 {
+            return Result.Ok(config_str(toml_parse_multiline_basic_string(p)))
+        }
+        return Result.Ok(config_str(toml_parse_basic_string(p)))
+    }
+    if c == 39 {
+        # Literal string — check for multi-line.
+        if toml_peek_at(p, 1) == 39 && toml_peek_at(p, 2) == 39 {
+            return Result.Ok(config_str(toml_parse_multiline_literal_string(p)))
+        }
+        return Result.Ok(config_str(toml_parse_literal_string(p)))
+    }
+    # Bool.
+    if toml_starts_with_at(p, "true") {
+        let mut k: int = 0
+        while k < 4 {
+            toml_advance(p)
+            k = k + 1
+        }
+        return Result.Ok(config_bool(true))
+    }
+    if toml_starts_with_at(p, "false") {
+        let mut k: int = 0
+        while k < 5 {
+            toml_advance(p)
+            k = k + 1
+        }
+        return Result.Ok(config_bool(false))
+    }
+    # Array.
+    if c == 91 {
+        return toml_parse_array(p)
+    }
+    # Inline table.
+    if c == 123 {
+        return toml_parse_inline_table(p)
+    }
+    # Number (int or float) — could be inf / nan / hex / oct / bin.
+    return toml_parse_number(p)
+}
+
+# toml_starts_with_at(p, word) -> bool — true if the source at the
+# current position starts with `word` (case-sensitive, byte-by-byte).
+fn toml_starts_with_at(p: TomlParser, word: str) -> bool {
+    let n: int = word.len()
+    let mut i: int = 0
+    while i < n {
+        if p.pos + i >= p.src.len() {
+            return false
+        }
+        if p.src.byte_at(p.pos + i) != word.byte_at(i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+# ----------------------------------------------------------------------------
+# toml_parse_basic_string(p) -> str — parse a "..." string. Handles
+# escape sequences: \n, \t, \r, \\, \", \uXXXX, \UXXXXXXXX.
+# ----------------------------------------------------------------------------
+
+fn toml_parse_basic_string(p: TomlParser) -> str {
+    # Consume opening '".
+    toml_advance(p)
+    let out: list[str] = []
+    while p.pos < p.src.len() {
+        let b: int = p.src.byte_at(p.pos)
+        if b == 34 {
+            toml_advance(p)
+            return str_join(out, "")
+        }
+        if b == 10 {
+            # Newline in a basic string — error (but we return what we have).
+            return str_join(out, "")
+        }
+        if b == 92 {
+            toml_advance(p)
+            let esc: int = toml_peek(p)
+            if esc == 110 {
+                out.push("\n")
+                toml_advance(p)
+            } else if esc == 116 {
+                out.push("\t")
+                toml_advance(p)
+            } else if esc == 114 {
+                out.push(chr(13))
+                toml_advance(p)
+            } else if esc == 92 {
+                out.push("\\")
+                toml_advance(p)
+            } else if esc == 34 {
+                out.push("\"")
+                toml_advance(p)
+            } else if esc == 39 {
+                out.push("'")
+                toml_advance(p)
+            } else if esc == 98 {
+                out.push(chr(8))
+                toml_advance(p)
+            } else if esc == 102 {
+                out.push(chr(12))
+                toml_advance(p)
+            } else if esc == 48 {
+                out.push(chr(0))
+                toml_advance(p)
+            } else if esc == 117 {
+                # \uXXXX
+                toml_advance(p)
+                let hex: str = toml_take_n(p, 4)
+                out.push(chr(toml_parse_hex(hex)))
+            } else if esc == 85 {
+                # \UXXXXXXXX
+                toml_advance(p)
+                let hex: str = toml_take_n(p, 8)
+                out.push(chr(toml_parse_hex(hex)))
+            } else {
+                # Unknown escape — emit as-is.
+                out.push(chr(esc))
+                toml_advance(p)
+            }
+            continue
+        }
+        out.push(p.src.slice(p.pos, p.pos + 1))
+        toml_advance(p)
+    }
+    return str_join(out, "")
+}
+
+# toml_take_n(p, n) -> str — take the next n bytes as a str (advancing pos).
+fn toml_take_n(p: TomlParser, n: int) -> str {
+    let start: int = p.pos
+    let mut k: int = 0
+    while k < n && p.pos < p.src.len() {
+        toml_advance(p)
+        k = k + 1
+    }
+    return p.src.slice(start, p.pos)
+}
+
+# toml_parse_hex(s) -> int — parse a hex string (no 0x prefix).
+fn toml_parse_hex(s: str) -> int {
+    let mut v: int = 0
+    let mut i: int = 0
+    while i < s.len() {
+        let b: int = s.byte_at(i)
+        let d: int = toml_hex_digit(b)
+        v = v * 16 + d
+        i = i + 1
+    }
+    return v
+}
+
+fn toml_hex_digit(b: int) -> int {
+    if b >= 48 && b <= 57 {
+        return b - 48
+    }
+    if b >= 65 && b <= 70 {
+        return b - 55
+    }
+    if b >= 97 && b <= 102 {
+        return b - 87
+    }
+    return 0
+}
+
+# ----------------------------------------------------------------------------
+# toml_parse_literal_string(p) -> str — parse a '...' string (no escapes).
+# ----------------------------------------------------------------------------
+
+fn toml_parse_literal_string(p: TomlParser) -> str {
+    toml_advance(p)  # consume opening '.
+    let start: int = p.pos
+    while p.pos < p.src.len() {
+        let b: int = p.src.byte_at(p.pos)
+        if b == 39 {
+            let s: str = p.src.slice(start, p.pos)
+            toml_advance(p)
+            return s
+        }
+        if b == 10 {
+            return p.src.slice(start, p.pos)
+        }
+        toml_advance(p)
+    }
+    return p.src.slice(start, p.pos)
+}
+
+# ----------------------------------------------------------------------------
+# toml_parse_multiline_basic_string(p) -> str — parse a """...""" string.
+# A leading newline immediately after the opening """ is trimmed (the TOML
+# convention). Escapes are processed (same as basic strings). A line ending
+# with a backslash becomes a line continuation (the newline is dropped).
+# ----------------------------------------------------------------------------
+
+fn toml_parse_multiline_basic_string(p: TomlParser) -> str {
+    # Consume the opening """.
+    toml_advance(p)
+    toml_advance(p)
+    toml_advance(p)
+    # Trim a leading newline.
+    if p.pos < p.src.len() && p.src.byte_at(p.pos) == 10 {
+        toml_advance(p)
+    }
+    let out: list[str] = []
+    while p.pos < p.src.len() {
+        # Check for closing """.
+        if toml_peek(p) == 34 && toml_peek_at(p, 1) == 34 && toml_peek_at(p, 2) == 34 {
+            toml_advance(p)
+            toml_advance(p)
+            toml_advance(p)
+            return str_join(out, "")
+        }
+        let b: int = p.src.byte_at(p.pos)
+        if b == 92 {
+            # Escape — same as basic string.
+            toml_advance(p)
+            let esc: int = toml_peek(p)
+            if esc == 110 {
+                out.push("\n")
+                toml_advance(p)
+            } else if esc == 116 {
+                out.push("\t")
+                toml_advance(p)
+            } else if esc == 114 {
+                out.push(chr(13))
+                toml_advance(p)
+            } else if esc == 92 {
+                out.push("\\")
+                toml_advance(p)
+            } else if esc == 34 {
+                out.push("\"")
+                toml_advance(p)
+            } else if esc == 10 {
+                # Line continuation — consume the newline and any
+                # leading whitespace on the next line.
+                toml_advance(p)
+                while p.pos < p.src.len() {
+                    let wb: int = p.src.byte_at(p.pos)
+                    if wb != 32 && wb != 9 && wb != 10 && wb != 13 {
+                        break
+                    }
+                    toml_advance(p)
+                }
+            } else {
+                out.push(chr(esc))
+                toml_advance(p)
+            }
+            continue
+        }
+        out.push(p.src.slice(p.pos, p.pos + 1))
+        toml_advance(p)
+    }
+    return str_join(out, "")
+}
+
+# ----------------------------------------------------------------------------
+# toml_parse_multiline_literal_string(p) -> str — parse a '''...''' string.
+# No escapes; a leading newline is trimmed.
+# ----------------------------------------------------------------------------
+
+fn toml_parse_multiline_literal_string(p: TomlParser) -> str {
+    toml_advance(p)
+    toml_advance(p)
+    toml_advance(p)
+    if p.pos < p.src.len() && p.src.byte_at(p.pos) == 10 {
+        toml_advance(p)
+    }
+    let start: int = p.pos
+    while p.pos < p.src.len() {
+        if toml_peek(p) == 39 && toml_peek_at(p, 1) == 39 && toml_peek_at(p, 2) == 39 {
+            let s: str = p.src.slice(start, p.pos)
+            toml_advance(p)
+            toml_advance(p)
+            toml_advance(p)
+            return s
+        }
+        toml_advance(p)
+    }
+    return p.src.slice(start, p.pos)
+}
+
+# ----------------------------------------------------------------------------
+# toml_parse_array(p) -> Result[ConfigValue, str] — parse an array of scalars.
+# ----------------------------------------------------------------------------
+
+fn toml_parse_array(p: TomlParser) -> Result[ConfigValue, str] {
+    toml_advance(p)  # consume '['.
+    let items: list[ConfigValue] = []
+    while p.pos < p.src.len() {
+        toml_skip_ws_and_comments(p)
+        if toml_peek(p) == 93 {
+            toml_advance(p)
+            return Result.Ok(config_array(items))
+        }
+        let val_r: Result[ConfigValue, str] = toml_parse_value(p)
+        if result_is_err(val_r) {
+            return Result.Err(result_err_or(val_r, "array element parse failed"))
+        }
+        items.push(result_unwrap(val_r))
+        toml_skip_ws_and_comments(p)
+        if toml_peek(p) == 44 {
+            toml_advance(p)  # consume ','.
+            continue
+        }
+        if toml_peek(p) == 93 {
+            toml_advance(p)
+            return Result.Ok(config_array(items))
+        }
+        return Result.Err(toml_err(p, "expected ',' or ']' in array"))
+    }
+    return Result.Err(toml_err(p, "unterminated array"))
+}
+
+# ----------------------------------------------------------------------------
+# toml_parse_inline_table(p) -> Result[ConfigValue, str] — parse {a = 1, b = 2}.
+# ----------------------------------------------------------------------------
+
+fn toml_parse_inline_table(p: TomlParser) -> Result[ConfigValue, str] {
+    toml_advance(p)  # consume '{'.
+    let keys: list[str] = []
+    let vals: list[ConfigValue] = []
+    while p.pos < p.src.len() {
+        toml_skip_ws(p)
+        if toml_peek(p) == 125 {
+            toml_advance(p)
+            return Result.Ok(config_table(keys, vals))
+        }
+        let key_r: Result[str, str] = toml_parse_key(p)
+        if result_is_err(key_r) {
+            return Result.Err(result_err_or(key_r, "inline-table key parse failed"))
+        }
+        toml_skip_ws(p)
+        if toml_peek(p) != 61 {
+            return Result.Err(toml_err(p, "expected '=' in inline table"))
+        }
+        toml_advance(p)
+        toml_skip_ws(p)
+        let val_r: Result[ConfigValue, str] = toml_parse_value(p)
+        if result_is_err(val_r) {
+            return Result.Err(result_err_or(val_r, "inline-table value parse failed"))
+        }
+        keys.push(result_unwrap(key_r))
+        vals.push(result_unwrap(val_r))
+        toml_skip_ws(p)
+        if toml_peek(p) == 44 {
+            toml_advance(p)  # consume ','.
+            continue
+        }
+        if toml_peek(p) == 125 {
+            toml_advance(p)
+            return Result.Ok(config_table(keys, vals))
+        }
+        return Result.Err(toml_err(p, "expected ',' or '}' in inline table"))
+    }
+    return Result.Err(toml_err(p, "unterminated inline table"))
+}
+
+# ----------------------------------------------------------------------------
+# toml_parse_number(p) -> Result[ConfigValue, str] — parse an int or float.
+#   - inf, +inf, -inf -> float
+#   - nan, +nan, -nan -> float
+#   - 0x..., 0o..., 0b... -> int
+#   - 1_000, -1_000, +1_000 -> int (underscores ignored)
+#   - 1.0, -2.5, 3.14e10, +6.022e23 -> float
+# ----------------------------------------------------------------------------
+
+fn toml_parse_number(p: TomlParser) -> Result[ConfigValue, str] {
+    let start: int = p.pos
+    # Handle sign.
+    if toml_peek(p) == 43 || toml_peek(p) == 45 {
+        toml_advance(p)
+    }
+    # Check for inf / nan.
+    if toml_starts_with_at(p, "inf") {
+        let mut k: int = 0
+        while k < 3 {
+            toml_advance(p)
+            k = k + 1
+        }
+        let raw: str = p.src.slice(start, p.pos)
+        # to_float on "inf" / "-inf" / "+inf" should produce inf / -inf.
+        return Result.Ok(config_float(raw.to_float()))
+    }
+    if toml_starts_with_at(p, "nan") {
+        let mut k: int = 0
+        while k < 3 {
+            toml_advance(p)
+            k = k + 1
+        }
+        return Result.Ok(config_float(0.0 / 0.0))
+    }
+    # Check for hex / oct / bin prefix.
+    if toml_peek(p) == 48 {
+        let next: int = toml_peek_at(p, 1)
+        if next == 120 || next == 88 {
+            # Hex.
+            toml_advance(p)
+            toml_advance(p)
+            let hex_start: int = p.pos
+            while p.pos < p.src.len() {
+                let b: int = p.src.byte_at(p.pos)
+                let ok: bool = (b >= 48 && b <= 57) || (b >= 65 && b <= 70)
+                    || (b >= 97 && b <= 102) || b == 95
+                if !ok {
+                    break
+                }
+                toml_advance(p)
+            }
+            let hex_str: str = toml_strip_underscores(p.src.slice(hex_start, p.pos))
+            return Result.Ok(config_int(toml_parse_hex(hex_str)))
+        }
+        if next == 111 {
+            # Octal.
+            toml_advance(p)
+            toml_advance(p)
+            let oct_start: int = p.pos
+            while p.pos < p.src.len() {
+                let b: int = p.src.byte_at(p.pos)
+                if (b < 48 || b > 55) && b != 95 {
+                    break
+                }
+                toml_advance(p)
+            }
+            let oct_str: str = toml_strip_underscores(p.src.slice(oct_start, p.pos))
+            return Result.Ok(config_int(toml_parse_oct(oct_str)))
+        }
+        if next == 98 {
+            # Binary.
+            toml_advance(p)
+            toml_advance(p)
+            let bin_start: int = p.pos
+            while p.pos < p.src.len() {
+                let b: int = p.src.byte_at(p.pos)
+                if (b != 48 && b != 49) && b != 95 {
+                    break
+                }
+                toml_advance(p)
+            }
+            let bin_str: str = toml_strip_underscores(p.src.slice(bin_start, p.pos))
+            return Result.Ok(config_int(toml_parse_bin(bin_str)))
+        }
+    }
+    # Decimal int or float — scan digits, underscores, '.', 'e', '+'/'-'.
+    let mut seen_dot: bool = false
+    let mut seen_e: bool = false
+    while p.pos < p.src.len() {
+        let b: int = p.src.byte_at(p.pos)
+        if b >= 48 && b <= 57 {
+            toml_advance(p)
+            continue
+        }
+        if b == 95 {
+            toml_advance(p)
+            continue
+        }
+        if b == 46 && !seen_dot && !seen_e {
+            seen_dot = true
+            toml_advance(p)
+            continue
+        }
+        if (b == 101 || b == 69) && !seen_e {
+            seen_e = true
+            toml_advance(p)
+            if toml_peek(p) == 43 || toml_peek(p) == 45 {
+                toml_advance(p)
+            }
+            continue
+        }
+        break
+    }
+    let raw: str = toml_strip_underscores(p.src.slice(start, p.pos))
+    if seen_dot || seen_e {
+        let r: Result[float, str] = float_parse(raw)
+        if result_is_err(r) {
+            return Result.Err(toml_err(p, "invalid float '" + raw + "'"))
+        }
+        return Result.Ok(config_float(result_unwrap(r)))
+    }
+    let r: Result[int, str] = int_parse(raw)
+    if result_is_err(r) {
+        return Result.Err(toml_err(p, "invalid int '" + raw + "'"))
+    }
+    return Result.Ok(config_int(result_unwrap(r)))
+}
+
+fn toml_strip_underscores(s: str) -> str {
+    let parts: list[str] = s.split("_")
+    return str_join(parts, "")
+}
+
+fn toml_parse_oct(s: str) -> int {
+    let mut v: int = 0
+    let mut i: int = 0
+    while i < s.len() {
+        let d: int = s.byte_at(i) - 48
+        v = v * 8 + d
+        i = i + 1
+    }
+    return v
+}
+
+fn toml_parse_bin(s: str) -> int {
+    let mut v: int = 0
+    let mut i: int = 0
+    while i < s.len() {
+        let d: int = s.byte_at(i) - 48
+        v = v * 2 + d
+        i = i + 1
+    }
+    return v
+}
+
+# ----------------------------------------------------------------------------
+# toml_ensure_path(root, path) -> void — ensure the dotted path exists
+# in `root`, creating intermediate tables as needed.
+# ----------------------------------------------------------------------------
+
+fn toml_ensure_path(root: ConfigValue, path: list[str]) -> void {
+    let mut cur: ConfigValue = root
+    let mut i: int = 0
+    while i < path.len() {
+        let seg: str = path.get(i)
+        let idx: int = config_table_find(cur, seg)
+        if idx < 0 {
+            let new_tbl: ConfigValue = config_table([], [])
+            cur.table_keys.push(seg)
+            cur.table_vals.push(new_tbl)
+            cur = new_tbl
+        } else {
+            let next: ConfigValue = cur.table_vals.get(idx)
+            if next.kind != config_kind_table() {
+                let new_tbl: ConfigValue = config_table([], [])
+                cur.table_vals.set(idx, new_tbl)
+                cur = new_tbl
+            } else {
+                cur = next
+            }
+        }
+        i = i + 1
+    }
+}
+
+fn toml_path_append(path: list[str], key: str) -> list[str] {
+    let out: list[str] = []
+    let mut i: int = 0
+    while i < path.len() {
+        out.push(path.get(i))
+        i = i + 1
+    }
+    out.push(key)
+    return out
+}
+
+# ============================================================================
+# Serialisation — config_serialize(cfg) -> str. Renders the config as
+# TOML (the canonical form). Used by `config_dump` (debug) and by
+# `hls-cli config init` (generate a starter config file).
+# ============================================================================
+
+fn config_serialize(cfg: ConfigValue) -> str {
+    if cfg.kind != config_kind_table() {
+        return ""
+    }
+    let lines: list[str] = []
+    config_serialize_table(cfg, "", lines)
+    return str_join(lines, "\n") + "\n"
+}
+
+fn config_serialize_table(tbl: ConfigValue, prefix: str, lines: list[str]) -> void {
+    # Emit scalar keys first, then nested tables.
+    let mut i: int = 0
+    while i < tbl.table_keys.len() {
+        let k: str = tbl.table_keys.get(i)
+        let v: ConfigValue = tbl.table_vals.get(i)
+        if v.kind == config_kind_table() {
+            # Defer to the table loop below.
+        } else if v.kind == config_kind_array() {
+            lines.push(k + " = " + config_serialize_value(v))
+        } else {
+            lines.push(k + " = " + config_serialize_value(v))
+        }
+        i = i + 1
+    }
+    # Now emit nested tables.
+    let mut j: int = 0
+    while j < tbl.table_keys.len() {
+        let k: str = tbl.table_keys.get(j)
+        let v: ConfigValue = tbl.table_vals.get(j)
+        if v.kind == config_kind_table() {
+            let new_prefix: str = k
+            if prefix != "" {
+                # We don't actually use prefix for indentation; we emit
+                # [section.subsection] headers. The prefix is the dotted
+                # path so far.
+            }
+            lines.push("")
+            lines.push("[" + config_path_join(prefix, k) + "]")
+            config_serialize_table(v, config_path_join(prefix, k), lines)
+        }
+        j = j + 1
+    }
+}
+
+fn config_path_join(prefix: str, key: str) -> str {
+    if prefix == "" {
+        return key
+    }
+    return prefix + "." + key
+}
+
+fn config_serialize_value(v: ConfigValue) -> str {
+    if v.kind == config_kind_str() {
+        return config_quote_str(v.str_val)
+    }
+    if v.kind == config_kind_int() {
+        return v.int_val.to_str()
+    }
+    if v.kind == config_kind_float() {
+        return v.float_val.to_str()
+    }
+    if v.kind == config_kind_bool() {
+        if v.bool_val {
+            return "true"
+        }
+        return "false"
+    }
+    if v.kind == config_kind_null() {
+        return ""
+    }
+    if v.kind == config_kind_array() {
+        let parts: list[str] = []
+        let mut i: int = 0
+        while i < v.array_items.len() {
+            parts.push(config_serialize_value(v.array_items.get(i)))
+            i = i + 1
+        }
+        return "[" + str_join(parts, ", ") + "]"
+    }
+    if v.kind == config_kind_table() {
+        let parts: list[str] = []
+        let mut i: int = 0
+        while i < v.table_keys.len() {
+            parts.push(v.table_keys.get(i) + " = "
+                + config_serialize_value(v.table_vals.get(i)))
+            i = i + 1
+        }
+        return "{ " + str_join(parts, ", ") + " }"
+    }
+    return ""
+}
+
+# config_quote_str(s) — quote a string for TOML output. Uses basic
+# strings ("...") with full escaping.
+fn config_quote_str(s: str) -> str {
+    let out: list[str] = ["\""]
+    let n: int = s.len()
+    let mut i: int = 0
+    while i < n {
+        let b: int = s.byte_at(i)
+        if b == 34 {
+            out.push("\\\"")
+        } else if b == 92 {
+            out.push("\\\\")
+        } else if b == 10 {
+            out.push("\\n")
+        } else if b == 9 {
+            out.push("\\t")
+        } else if b == 13 {
+            out.push("\\r")
+        } else if b < 32 {
+            out.push("\\u" + config_hex4(b))
+        } else {
+            out.push(s.slice(i, i + 1))
+        }
+        i = i + 1
+    }
+    out.push("\"")
+    return str_join(out, "")
+}
+
+fn config_hex4(b: int) -> str {
+    let hi: int = b / 256
+    let lo: int = b % 256
+    return config_hex2(hi) + config_hex2(lo)
+}
+
+fn config_hex2(b: int) -> str {
+    let hi: int = b / 16
+    let lo: int = b % 16
+    return config_hex_nibble(hi) + config_hex_nibble(lo)
+}
+
+fn config_hex_nibble(n: int) -> str {
+    if n < 10 {
+        return n.to_str()
+    }
+    if n == 10 { return "a" }
+    if n == 11 { return "b" }
+    if n == 12 { return "c" }
+    if n == 13 { return "d" }
+    if n == 14 { return "e" }
+    return "f"
+}
+
+# ============================================================================
+# config_describe(schema) -> str — render the schema as a human-readable
+# listing (for `--describe` or `hls config describe`).
+# ============================================================================
+
+fn config_describe(schema: ConfigSchema) -> str {
+    let lines: list[str] = []
+    lines.push("Config schema (" + schema.entries.len().to_str() + " entries):")
+    lines.push("")
+    let mut i: int = 0
+    while i < schema.entries.len() {
+        let e: ConfigSchemaEntry = schema.entries.get(i)
+        let kind_str: str = config_kind_name(e.kind)
+        let mut default_str: str = ""
+        if e.has_default {
+            default_str = " [default: " + e.default_str + "]"
+        } else {
+            default_str = " (required)"
+        }
+        let mut env_str: str = ""
+        if e.env_name != "" {
+            env_str = " [env: " + e.env_name + "]"
+        }
+        lines.push("  " + e.key + " : " + kind_str + default_str + env_str)
+        if e.desc != "" {
+            lines.push("      " + e.desc)
+        }
+        i = i + 1
+    }
+    return str_join(lines, "\n")
+}
+
+# ============================================================================
+# config_dump(cfg) -> str — render the loaded config as TOML (for debug).
+# ============================================================================
+
+fn config_dump(cfg: ConfigValue) -> str {
+    return config_serialize(cfg)
+}
+
+# ============================================================================
+# End of std/config.hls
+# ============================================================================
