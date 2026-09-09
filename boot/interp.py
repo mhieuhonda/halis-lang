@@ -729,7 +729,7 @@ class Interp:
             else:
                 params = fn["params"]
                 call_args = args
-            for (pn, _, _), v in zip(params, call_args):
+            for (pn, _, _), v in zip(params, call_args, strict=True):
                 env[0][pn] = [v, False, False]
             # Stage 17: runtime `requires` assertion (enabled by --contracts).
             if self.contracts and fn.get("requires") is not None:
@@ -857,7 +857,7 @@ class Interp:
         # Set up the argument types.
         c_argtypes = []
         c_args = []
-        for (pn, pt, _), v in zip(fn["params"], args):
+        for (pn, pt, _), v in zip(fn["params"], args, strict=True):
             if pt == "int":
                 c_argtypes.append(ctypes.c_int64)
                 c_args.append(int(v))

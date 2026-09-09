@@ -610,7 +610,7 @@ def _inline_small(mod: HLIRModule):
                 rename: Dict[str, Tuple] = {}
                 # ins.args[1:] are the call's argument SSA references.
                 call_args = ins.args[1:]
-                for (pname, _ptype), arg in zip(callee.params, call_args):
+                for (pname, _ptype), arg in zip(callee.params, call_args, strict=True):
                     rename["v_" + pname] = arg
                 # Rename every dest in the callee body to a fresh name, and
                 # rewrite every var reference via the rename map (chained:

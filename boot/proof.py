@@ -1124,7 +1124,7 @@ def args_are_const(fn, arg_exprs):
     defer float contracts to runtime, matching the native byte-for-
     byte in differential testing."""
     consts = {}
-    for (pn, pt, _), a in zip(fn["params"], arg_exprs):
+    for (pn, pt, _), a in zip(fn["params"], arg_exprs, strict=True):
         if not isinstance(a, dict) or a.get("k") not in ("int", "bool", "str"):
             return None
         consts[pn] = a["v"]

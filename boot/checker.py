@@ -211,7 +211,7 @@ def unify(pt, at, typeparams, type_map):
         if len(pargs) != len(aargs):
             return False
         ok = True
-        for p, a in zip(pargs, aargs):
+        for p, a in zip(pargs, aargs, strict=True):
             if not unify(p, a, typeparams, type_map):
                 ok = False
         return ok
@@ -772,7 +772,7 @@ class Checker:
         args = type_args(t)
         if len(tp) != len(args):
             return None
-        type_map = dict(zip(tp, args))
+        type_map = dict(zip(tp, args, strict=True))
         return (st, type_map)
 
     def resolve_enum(self, t):
@@ -786,7 +786,7 @@ class Checker:
         args = type_args(t)
         if len(tp) != len(args):
             return None
-        type_map = dict(zip(tp, args))
+        type_map = dict(zip(tp, args, strict=True))
         return (en, type_map)
 
     # ---------- lifecycle ----------
@@ -941,7 +941,7 @@ class Checker:
 
     def restore_moved(self, env, snap):
         """Restore moved-status from a snapshot (used when child scope exits)."""
-        for scope, snap_row in zip(env, snap):
+        for scope, snap_row in zip(env, snap, strict=False):
             for name, moved in snap_row.items():
                 if name in scope:
                     scope[name][2] = moved
@@ -971,7 +971,7 @@ class Checker:
         binding) is still allowed because check_assign's revive step
         clears the moved flag, so the idiomatic "drop then revive"
         pattern continues to work."""
-        for scope, snap_row in zip(env, snap):
+        for scope, snap_row in zip(env, snap, strict=False):
             for name, moved in snap_row.items():
                 if name in scope and moved:
                     scope[name][2] = True
@@ -2259,7 +2259,7 @@ class Checker:
         if typeparams and expected is not None and type_base(expected) == ename:
             eargs = type_args(expected)
             if len(eargs) == len(typeparams):
-                for tp, ea in zip(typeparams, eargs):
+                for tp, ea in zip(typeparams, eargs, strict=True):
                     type_map[tp] = ea
         first_at = []
         # Compute instantiated payload types for the first pass.
@@ -2269,7 +2269,7 @@ class Checker:
             inst_payloads_first = list(payloads)
         else:
             inst_payloads_first = [None] * len(payloads)
-        for a, pt, hint in zip(args, payloads, inst_payloads_first):
+        for a, pt, hint in zip(args, payloads, inst_payloads_first, strict=True):
             at = self.check_expr(a, env, hint)
             if at == "never":
                 self.err("never value cannot be used as an enum payload", e)
@@ -2299,7 +2299,7 @@ class Checker:
         # disagreement is a real type error. If the first-pass type
         # contained a placeholder ('?'), the contextual hint wasn't
         # available — error out with a clearer message.
-        for i, (a, pt) in enumerate(zip(args, inst_payloads)):
+        for i, (a, pt) in enumerate(zip(args, inst_payloads, strict=True)):
             at = first_at[i]
             if at == "never":
                 continue
@@ -2437,7 +2437,7 @@ class Checker:
         if typeparams and expected is not None and type_base(expected) == name:
             eargs = type_args(expected)
             if len(eargs) == len(typeparams):
-                for tp, ea in zip(typeparams, eargs):
+                for tp, ea in zip(typeparams, eargs, strict=True):
                     type_map[tp] = ea
         # Determine the struct's effective field types (instantiate or not).
         fields_with_defaults = st["fields"]
@@ -2581,7 +2581,7 @@ class Checker:
             # now also caches into it.)
             first_at = [None] * len(args)
             if fn.get("extern", False):
-                for i, (a, (pn, pt, _)) in enumerate(zip(args, fn["params"])):
+                for i, (a, (pn, pt, _)) in enumerate(zip(args, fn["params"], strict=True)):
                     # The argument type is checked below in the
                     # generic / non-generic loop. We do an EARLY
                     # check here only for the tainted-wrap case so
@@ -2621,7 +2621,7 @@ class Checker:
             typeparams = fn.get("typeparams", [])
             type_map = {}
             if typeparams:
-                for i, (a, (pn, pt, _)) in enumerate(zip(args, fn["params"])):
+                for i, (a, (pn, pt, _)) in enumerate(zip(args, fn["params"], strict=True)):
                     at = self.check_expr(a, env, None)
                     first_at[i] = at
                     if at == "never":
@@ -2632,7 +2632,7 @@ class Checker:
                         self.err("cannot infer type argument for %s; provide explicit types"
                                  % tp, e)
             # Type-check arguments against instantiated parameter types.
-            for i, (a, (pn, pt, _)) in enumerate(zip(args, fn["params"])):
+            for i, (a, (pn, pt, _)) in enumerate(zip(args, fn["params"], strict=True)):
                 if typeparams:
                     inst_pt = instantiate_type(pt, type_map)
                 else:
@@ -3388,7 +3388,7 @@ class Checker:
             if len(vargs) != len(params):
                 self.err("spawn() target %s expects %d arguments, got %d"
                          % (fname, len(params), len(vargs)), e)
-            for i, (a, (pn, pt, _)) in enumerate(zip(vargs, params)):
+            for i, (a, (pn, pt, _)) in enumerate(zip(vargs, params, strict=True)):
                 at = self.check_expr(a, env, pt)
                 if at == "never":
                     continue
@@ -3487,7 +3487,7 @@ class Checker:
             if len(vargs) != len(params):
                 self.err("async_spawn() target %s expects %d arguments, got %d"
                          % (fname, len(params), len(vargs)), e)
-            for i, (a, (pn, pt, _)) in enumerate(zip(vargs, params)):
+            for i, (a, (pn, pt, _)) in enumerate(zip(vargs, params, strict=True)):
                 at = self.check_expr(a, env, pt)
                 if at == "never":
                     continue
@@ -3856,7 +3856,7 @@ class Checker:
                          "the stream, got %d"
                          % (fname, len(params) - 1, len(vargs)), e)
             # Check the non-stream arguments.
-            for i, (a, (pn, pt, _)) in enumerate(zip(vargs, params[1:])):
+            for i, (a, (pn, pt, _)) in enumerate(zip(vargs, params[1:], strict=True)):
                 at = self.check_expr(a, env, pt)
                 if at == "never":
                     continue
@@ -3930,7 +3930,7 @@ class Checker:
             st = self.structs[base]
             if len(st["typeparams"]) != len(args):
                 return False
-            tmap = dict(zip(st["typeparams"], args))
+            tmap = dict(zip(st["typeparams"], args, strict=True))
             for _, ftype, _ in st["fields"]:
                 ft = instantiate_type(ftype, tmap) if tmap else ftype
                 if not self.clone_supported(ft, _seen):
@@ -3940,7 +3940,7 @@ class Checker:
             en = self.enums[base]
             if len(en["typeparams"]) != len(args):
                 return False
-            tmap = dict(zip(en["typeparams"], args))
+            tmap = dict(zip(en["typeparams"], args, strict=True))
             for _, payloads in en["variants"]:
                 for pt in payloads:
                     pti = instantiate_type(pt, tmap) if tmap else pt
@@ -3999,7 +3999,7 @@ class Checker:
             st = self.structs[base]
             if len(st["typeparams"]) != len(args):
                 return False
-            tmap = dict(zip(st["typeparams"], args))
+            tmap = dict(zip(st["typeparams"], args, strict=True))
             for _, ftype, _ in st["fields"]:
                 ft = instantiate_type(ftype, tmap) if tmap else ftype
                 if not self.type_is_send(ft, _seen):
@@ -4009,7 +4009,7 @@ class Checker:
             en = self.enums[base]
             if len(en["typeparams"]) != len(args):
                 return False
-            tmap = dict(zip(en["typeparams"], args))
+            tmap = dict(zip(en["typeparams"], args, strict=True))
             for _, payloads in en["variants"]:
                 for pt in payloads:
                     pti = instantiate_type(pt, tmap) if tmap else pt
@@ -4059,7 +4059,7 @@ class Checker:
             # spurious "use of moved value" errors.
             first_at = [None] * len(args)
             if typeparams:
-                for i, (a, (pn, pt, _)) in enumerate(zip(args, params)):
+                for i, (a, (pn, pt, _)) in enumerate(zip(args, params, strict=True)):
                     at = self.check_expr(a, env, None)
                     first_at[i] = at
                     if at == "never":
@@ -4068,7 +4068,7 @@ class Checker:
                 for tp in typeparams:
                     if tp not in type_map:
                         self.err("cannot infer type argument for %s.%s" % (tt_base, name), e)
-            for i, (a, (pn, pt, _)) in enumerate(zip(args, params)):
+            for i, (a, (pn, pt, _)) in enumerate(zip(args, params, strict=True)):
                 if type_map:
                     inst_pt = instantiate_type(pt, type_map)
                 else:
@@ -4189,7 +4189,7 @@ class Checker:
         if len(args) != len(ptypes):
             self.err("%s.%s expects %d arguments, got %d"
                      % (tt, name, len(ptypes), len(args)), e)
-        for a, pt in zip(args, ptypes):
+        for a, pt in zip(args, ptypes, strict=True):
             at = self.check_expr(a, env, pt)
             if at == "never":
                 continue
@@ -4237,7 +4237,7 @@ class Checker:
             sargs = type_args(scrut_t)
             if len(sargs) != len(typeparams):
                 self.err("invalid enum instantiation: %s" % scrut_t, e)
-            for tp, sa in zip(typeparams, sargs):
+            for tp, sa in zip(typeparams, sargs, strict=True):
                 type_map[tp] = sa
         # Check exhaustiveness and arm types.
         covered = set()
@@ -4286,7 +4286,7 @@ class Checker:
                         if v == pat["variant"]:
                             inst_payloads = [instantiate_type(p, type_map) if typeparams
                                              else p for p in payloads]
-                            for bname, btype in zip(pat["bindings"], inst_payloads):
+                            for bname, btype in zip(pat["bindings"], inst_payloads, strict=False):
                                 if bname == "_":
                                     continue
                                 # BUG-SC-2 fix: SPEC.md section 5 states that
@@ -4382,7 +4382,7 @@ class Checker:
             iargs = type_args(inner_t)
             if len(iargs) != len(typeparams):
                 self.err("invalid enum instantiation: %s" % inner_t, e)
-            for tp, ia in zip(typeparams, iargs):
+            for tp, ia in zip(typeparams, iargs, strict=True):
                 type_map[tp] = ia
             ok_payload = ok_variant[1][0]
             success_t = instantiate_type(ok_payload, type_map)
