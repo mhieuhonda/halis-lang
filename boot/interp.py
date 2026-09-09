@@ -1334,6 +1334,20 @@ class Interp:
                 return bool(os.isatty(args[0]))
             except (OSError, ValueError):
                 return False
+        # ----- Stage 57 (v0.76.0-alpha): process-identity builtins -----
+        # proc_pid() — the OS process id (the syslog TAG[PID] field).
+        # sys_hostname() — the host name (the syslog HOSTNAME field);
+        # os.uname().nodename is the POSIX source (socket.gethostname
+        # needs another import; uname is already importable via os).
+        # The "localhost" fallback mirrors the C runtime's total
+        # behaviour (no panic path).
+        if name == "proc_pid":
+            return int(os.getpid())
+        if name == "sys_hostname":
+            try:
+                return os.uname().nodename.encode("utf-8", "surrogateescape")
+            except (OSError, AttributeError):
+                return b"localhost"
         if name == "panic":
             raise HLPanic(args[0], line)
         if name == "exit":

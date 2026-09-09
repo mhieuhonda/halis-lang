@@ -13,6 +13,252 @@ stability (125–140), and final stabilisation toward v1.0 (141–150).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
+## [v0.76.0-alpha] — Stage 57: std.log (structured logging: human + JSON + syslog)
+
+> Continues **Phase IV (CLI tooling track, Stages 53–62)**.
+> Adds `std.log` — structured logging with three output formats
+> (human — colored, for TTY; JSON Lines — for log aggregation; syslog
+> RFC 3164 — for daemons), key-value pairs on every record, and log
+> level control via the `HLS_LOG` env var — plus TWO new compiler
+> builtins: `proc_pid() -> int` and `sys_hostname() -> str` (both
+> `Proc` — process-identity access, the same family as `env_get`;
+> they fill the syslog `TAG[PID]` and `HOSTNAME` fields). The
+> roadmap's `info!` / `warn!` / `error!` / `debug!` / `trace!`
+> "macros" map to functions (Halis has no macros until Stage 113+ —
+> the same convention `std.fmt` used for `format!`), available both
+> as free functions (`log_info(lg, msg)`) and `impl Logger` methods
+> (`lg.info("msg")`). Logs go to STDERR (the 12-factor / systemd
+> convention: stdout is the data pipeline, stderr is the operator
+> channel) via Stage 56's `eprintln` — which flushes stdout first, so
+> interleaved data + logs keep the caller's logical order.
+
+### Added — Stage 57 (v0.76.0-alpha)
+
+- **New compiler builtins** (wired through all four code-paths — C
+  backend, LLVM backend, Stage-0 interpreter, and the self-hosted
+  compiler's checker):
+  - `proc_pid() -> int` — the OS process id (the syslog `TAG[PID]`
+    field; 1..65535 on POSIX, never 0 for a live process).
+  - `sys_hostname() -> str` — the machine's host name (the syslog
+    `HOSTNAME` field; `"localhost"` fallback on any gethostname
+    failure — the function is total, no panic path).
+  - Both carry `Proc` (process-state access — the same family as
+    `env_get` / `cwd_get`). No arguments (nothing to taint), no
+    sinks. The values differ BETWEEN the interpreter process and the
+    native binary process (two different pids) — so `std.log`'s pure
+    renderers take them as explicit ARGUMENTS (differential-safe),
+    and only the live emit path reads the builtins.
+
+- **LogLevel** — the six-level ladder:
+  - `enum LogLevel { LogOff, LogError, LogWarn, LogInfo, LogDebug,
+    LogTrace }` — a total order (the int encoding IS the order):
+    `Off < Error < Warn < Info < Debug < Trace`.
+  - `log_level_eq / to_int / from_int / name / token`.
+    `log_level_token` is the 5-wide human-format token (`"ERROR"`,
+    `"WARN "`, `"INFO "`, `"DEBUG"`, `"TRACE"` — fixed width keeps
+    consecutive lines aligned).
+  - `log_level_from_str(s)` — the pure HLS_LOG parser:
+    off / error / warn / **warning** (alias) / info / debug / trace,
+    case-insensitive. An invalid or empty value falls back to INFO —
+    the lenient default: a typo must not silence the error channel.
+  - `log_enabled(lg, level)` — a record is emitted iff its level's
+    order is non-zero AND ≤ the Logger's level (a Logger at `Off`
+    enables nothing; `Off` as a record level is never emitted).
+
+- **LogFormat / LogColor**:
+  - `enum LogFormat { LogHuman, LogJson, LogSyslog }` + eq / to_int /
+    from_int / name / `log_format_from_str` (HLS_LOG_FORMAT: human /
+    json / syslog, case-insensitive, lenient human default).
+  - `enum LogColor { LogColorAuto, LogColorAlways, LogColorNever }` +
+    the same surface — the `--color=always / never / auto` flag
+    contract std.progress established in Stage 56 (`log_color_from_str`
+    parses the CLI flag value; `log_resolve_level` resolves Auto →
+    color only when stderr is a TTY, Always → the std.color env
+    detector, Never → no escapes).
+
+- **Logger** — the explicit configuration value (HLS has no global
+  mutable state — the level is threaded explicitly, which is what the
+  effect system's security story wants):
+  - `log_new() uses Proc` — the live constructor: level from
+    `HLS_LOG`, format from `HLS_LOG_FORMAT`, color auto, app `"app"`,
+    pid + hostname from the process (filled ONCE).
+  - `log_new_with(level, format, color, app_name)` — the PURE
+    constructor (tests / deterministic rendering; pid = 0,
+    hostname = `"localhost"`).
+  - Immutable builders (the receiver is unchanged):
+    `log_with_level / _format / _color / _app_name / _identity` +
+    the `impl Logger` method twins.
+
+- **LogRecord** — the pure record:
+  - `struct LogRecord { ts_ms, level, app, msg, keys, vals, pid,
+    hostname }`; `log_new_record(lg, level, msg, keys, vals, ts_ms)`
+    builds it from the Logger's identity + an EXPLICIT timestamp
+    (parallel `keys` / `vals` lists — the `std.json` `json_object`
+    convention; a length mismatch panics with a clear message).
+
+- **Timestamp math** (pure integer arithmetic — byte-identical
+  between interpreter and native):
+  - `log_epoch_ms_to_iso(ts_ms)` — ISO 8601 UTC with milliseconds:
+    `"2025-09-09T12:40:00.123Z"` (the Z suffix makes the UTC-only
+    policy explicit). Howard Hinnant's civil-from-days algorithm,
+    with an explicit floor-division helper (`log_floor_div`) — HLS's
+    `/` truncates like C — so pre-1970 timestamps render correctly
+    (`-1` → `"1969-12-31T23:59:59.999Z"`). Handles the leap days
+    (2000-02-29, 2024-02-29) and 2100 (NOT a leap year).
+  - `log_epoch_ms_to_rfc3164(ts_ms)` — the RFC 3164 timestamp:
+    `"Sep  9 12:40:00"` (UTC; the day is SPACE-padded — the RFC's
+    quirk).
+  - `log_days_to_civil(days)` — the encoded `YYYYMMDD` civil date;
+    `log_month_name(m)` — the 12 RFC abbreviations.
+
+- **JSON escaping** — `log_json_escape(s)` (the log-forging defense):
+  quote / backslash / `\n` `\r` `\t` short escapes; every other
+  control byte as `\u00XX` (lowercase hex); and the two
+  JSON-valid-but-JS-breaking separators **U+2028 / U+2029** (the
+  classic script-tag / eval-injection vector — detected at the byte
+  level: `E2 80 A8` / `E2 80 A9`, so a lookalike like `E2 80 A7`
+  passes through verbatim). UTF-8 passes through unchanged (legal
+  JSON). Multi-line messages CANNOT forge new JSON-Lines records
+  (every newline is escaped).
+
+- **The three renderers** (pure — the differential-safe core):
+  - `log_render_human(rec, level)` —
+    `2025-09-09T12:40:00.123Z INFO  myapp: server started port=8080 workers=4`:
+    ISO timestamp + 5-wide level token + `"app:"` + message + `k=v`
+    pairs. The level token is colored at the given ColorLevel
+    (ERROR red+bold, WARN yellow, INFO green, DEBUG blue, TRACE
+    magenta — the env_logger palette); at ColorNone the line is
+    completely escape-free (TERM=dumb safe; ERROR's bold applies only
+    at `>= Basic` — the std.progress discipline).
+  - `log_render_json(rec)` — one object per line (the JSON Lines
+    convention every aggregator ingests): fixed key order
+    (`ts`, `level`, `app`, `msg`, then the pairs in call order),
+    every string fully escaped.
+  - `log_render_syslog(rec)` — RFC 3164:
+    `<14>Sep  9 12:40:00 web01 myapp[1234]: server started port=8080`.
+    PRI = 8 + severity (user facility 1: error→3, warn→4, info→6,
+    debug/trace→7); pid == 0 omits `[PID]` (the pure constructor's
+    placeholder); the message part carries the kvs; no colors (a wire
+    format — escapes would corrupt it).
+  - `log_render(rec, format, level)` — the format dispatch.
+  - `log_kv_pairs(rec)` — the `k=v` tokens.
+
+- **The live emit path** (`uses IO, Clock, Proc` — the thin shells):
+  - `log_emit(lg, level, msg, keys, vals)` — the general emit:
+    `log_enabled` false → return immediately (zero work); the record
+    is built from the Logger's identity + the LIVE wall clock
+    (`system_time_now_ms`); the line renders via the Logger's format
+    (the human format resolves the color mode first); the line goes
+    to STDERR via `eprintln` (stdout is flushed first — data + logs
+    keep the caller's logical order).
+  - `log_log(lg, level, msg)` — the message-only general form.
+  - The five macro-style levels: `log_error / log_warn / log_info /
+    log_debug / log_trace` (free functions) and `log_*_kv`
+    (the structured forms) — the roadmap's `info!` / `warn!` /
+    `error!` / `debug!` / `trace!` mapped to functions.
+  - `impl Logger` methods: `.error(msg)` / `.warn(msg)` / `.info(msg)`
+    / `.debug(msg)` / `.trace(msg)` / `.error_kv(...)` / ... /
+    `.log(level, msg)` / `.log_kv(...)` / `.is_enabled(level)` /
+    `.render(rec, color_level)` + the `.with_*` builder twins — the
+    closest HLS gets to the macros before Stage 113+.
+
+- **Effect discipline**:
+  - Pure (no `uses` clause): everything except `log_new` /
+    `log_resolve_level` / the emits — all enums, all parsers, all
+    builders, `log_enabled`, `log_new_record`, ALL timestamp math,
+    `log_json_escape`, ALL renderers, `log_kv_pairs`.
+  - `uses Proc`: `log_new` (env + the two identity builtins);
+    `log_resolve_level` (isatty + the std.color env detector).
+  - `uses IO, Clock, Proc`: `log_emit` / `log_log` / the ten
+    level functions / the level methods (clock + color resolution +
+    the stderr write).
+
+- **Differential parity**:
+  - Every renderer is a pure function of (record, ColorLevel) with
+    fixed `ts_ms` / pid / hostname — byte-identical between the
+    interpreter and the native binary, INCLUDING the SGR spans
+    (`\x1b[31;1m` ERROR, `\x1b[33m` WARN, `\x1b[32m` INFO,
+    `\x1b[34m` DEBUG, `\x1b[35m` TRACE) and the PRI table
+    (11 / 12 / 14 / 15 / 15).
+  - The LIVE emit lines carry the wall clock + the real pid, which
+    differ between the interpreter process and the native binary
+    process BY DESIGN — `make log-acceptance` therefore compares
+    STDOUT ONLY (every stdout line is a pure render) and smoke-tests
+    the live path (exit 0). This is the same discipline Stage 49
+    applied to the live wall clock.
+  - The live smoke prints only RELATIVE assertions (`pid > 0`,
+    hostname non-empty) and env-derived values (identical between
+    the backends for the same invocation).
+
+### Acceptance — Stage 57 (v0.76.0-alpha)
+
+`make log-acceptance` runs:
+- `examples/log_demo.hls` — 9 sections (the three formats on one
+  record; every level in every format; the 6×5 filtering matrix;
+  the timestamp edge cases; the JSON-escaping table incl. U+2028 /
+  U+2029 built from raw bytes; the three parsers; the colored human
+  rendering at every ColorLevel; builders + methods; the live
+  section) — stdout differential + live smoke.
+- `tests/ok/feat_stage57_log.hls` — 11 sub-tests exercising every
+  public API:
+  1. `LogLevel` (eq / encode / decode / name / 5-wide token / parse
+     with the warning alias + lenient defaults).
+  2. `LogFormat` + `LogColor` (the full surface).
+  3. `log_enabled` — the full 6×5 matrix + Off-is-never-enabled.
+  4. Constructors + builders (immutable — the receiver is proven
+     unchanged) + the method twins + `.render` / `.is_enabled`
+     parity.
+  5. Timestamps (epoch 0 / 999 ms / −1 ms / the 2000 + 2024 leap
+     days / 2100-01-01 / the day boundary / all 12 months /
+     `log_days_to_civil` / `log_floor_div`).
+  6. `log_json_escape` (quote, backslash, `\n` `\t` `\r`, control
+     bytes, NUL, U+2028 / U+2029 + the lookalike that must NOT be
+     escaped, UTF-8 verbatim).
+  7. The human renderer — exact strings at ColorNone (escape-free)
+     AND at Basic (byte-exact SGR per level; 256 / truecolor degrade
+     to the identical basic palette).
+  8. The JSON renderer — exact strings (key order, escaping, the
+     hostile multi-line message, the empty-message edge).
+  9. The syslog renderer — exact strings (the PRI table, the
+     space-padded day, `TAG[PID]` with pid > 0, `TAG` without pid,
+     the localhost default, `log_syslog_severity`).
+  10. The format dispatch (`log_render` == each renderer).
+  11. The live smoke (`log_new`: pid > 0, hostname non-empty, the
+      env defaults; live emits through every level + format; level
+      suppression on the live path; the method form; Off silences
+      everything).
+  All sub-tests pass; both differential tests pass; both live smokes
+  exit 0.
+
+### New test files — Stage 57 (v0.76.0-alpha)
+
+- `tests/ok/feat_stage57_log.hls` — the 11-section suite above.
+- `tests/fail/fail_proc_pid_effect.hls` — `proc_pid()` without
+  `uses Proc`.
+- `tests/fail/fail_sys_hostname_effect.hls` — `sys_hostname()`
+  without `uses Proc`.
+
+### Limitations (deferred to later stages)
+
+- **KV values are str only** (int / bool / float values arrive with a
+  future perfection stage; callers `.to_str()` — JSON values then
+  render as strings, which every aggregator accepts).
+- **No per-module level filtering** (RUST_LOG's
+  `"info,hyper=warn"` directive syntax — needs module identity,
+  which arrives with hls-pkg; HLS_LOG takes a single level for
+  v0.76.0-alpha).
+- **No log rotation / file sink / network sink** (stderr only — the
+  daemon supervisor / container runtime owns rotation; a FileSink is
+  a std.io composition away).
+- **No EMA rate limiting / sampling** (needs float state).
+- **RFC 3164 only** (the structured-data RFC 5424 form is a future
+  perfection stage).
+- **UTC only** (no local timezone — needs a tz database; the
+  ISO-8601 Z suffix makes that explicit).
+- **The wasm32 backend does not support eprint / isatty / proc_pid /
+  sys_hostname** (no stderr / fd concept in the JS sandbox);
+  `std.log` is a native-backend module.
+
 ## [v0.75.0-alpha] — Stage 56: std.progress (progress bars, spinners, ETA)
 
 > Continues **Phase IV (CLI tooling track, Stages 53–62)**.

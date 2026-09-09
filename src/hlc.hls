@@ -2781,6 +2781,21 @@ fn is_builtin_fn(n: str) -> bool {
     # tqdm / indicatif convention) and suppress drawing when stderr
     # is not a TTY.
     || n == "eprint" || n == "eprintln" || n == "isatty"
+    # Stage 57 (v0.76.0-alpha): process-identity builtins for std.log.
+    # proc_pid() returns the OS process id (the syslog TAG[PID] field;
+    # 1..65535 on POSIX, never 0 for a live process). sys_hostname()
+    # returns the machine's host name (the syslog HOSTNAME field;
+    # "localhost" if gethostname fails). Both carry the Proc effect:
+    # they read the process's / host's identity — process-state access,
+    # the same effect family as env_get / cwd_get. Neither takes
+    # arguments (nothing to taint), and neither is a sink. Both are
+    # identical between the interpreter and the native binary FOR THE
+    # SAME PROCESS (the interpreter runs the program in-process, the
+    # native binary is the process — pid/hostname differ BETWEEN the
+    # two backends, so std.log's pure renderers take them as explicit
+    # arguments and the live emit path is the only thing that reads
+    # them; differential tests use fixed synthetic values).
+    || n == "proc_pid" || n == "sys_hostname"
 }
 
 fn list_has(list: list[str], x: str) -> bool {
@@ -3211,6 +3226,12 @@ fn builtin_effect(name: str) -> list[str] {
     # exactly like read_line observes stdin.
     if name == "eprint" || name == "eprintln" || name == "isatty" {
         return ["IO"]
+    }
+    # Stage 57 (v0.76.0-alpha): process-identity builtins — Proc (the
+    # process's / host's identity is process-state access, the same
+    # family as env_get / cwd_get).
+    if name == "proc_pid" || name == "sys_hostname" {
+        return ["Proc"]
     }
     # Stage 16 (v0.27.0-alpha): the concurrency effect. Every task /
     # channel operation carries `Conc`; a program must declare
@@ -7709,6 +7730,23 @@ fn check_builtin_call(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, 
         add_edge(ctx, cur, "b:isatty")
         return "bool"
     }
+    # Stage 57 (v0.76.0-alpha): process-identity builtins (no args).
+    # proc_pid() -> int — the OS process id (syslog TAG[PID]).
+    # sys_hostname() -> str — the host name (syslog HOSTNAME).
+    if name == "proc_pid" {
+        if nargs != 0 {
+            cerr(line, "proc_pid() takes no arguments")
+        }
+        add_edge(ctx, cur, "b:proc_pid")
+        return "int"
+    }
+    if name == "sys_hostname" {
+        if nargs != 0 {
+            cerr(line, "sys_hostname() takes no arguments")
+        }
+        add_edge(ctx, cur, "b:sys_hostname")
+        return "str"
+    }
     if name == "panic" {
         if nargs != 1 || argt.get(0) != "str" {
             cerr(line, "panic expects 1 str argument")
@@ -11096,6 +11134,31 @@ fn runtime_lines() -> list[str] {
     r.push("// Stage-0 interpreter byte-for-byte.")
     r.push("static bool hl_isatty(int64_t fd) {")
     r.push("    return isatty((int)fd);")
+    r.push("}")
+    r.push("")
+    # ----- Stage 57 (v0.76.0-alpha): process-identity runtime helpers -----
+    # getpid is declared in <unistd.h> (already included); gethostname
+    # likewise (POSIX; exposed by _DEFAULT_SOURCE, which gcc's default
+    # gnu17 mode defines). sys_hostname returns a FRESH str; the
+    # fallback "localhost" keeps the function total (a failed
+    # gethostname — truncated name, ENAMETOOLONG — never panics).
+    r.push("// Stage 57 (v0.76.0-alpha): hl_proc_pid — the OS process id")
+    r.push("// (the syslog TAG[PID] field). getpid never fails on POSIX.")
+    r.push("static int64_t hl_proc_pid(void) {")
+    r.push("    return (int64_t)getpid();")
+    r.push("}")
+    r.push("")
+    r.push("// Stage 57 (v0.76.0-alpha): hl_sys_hostname — the host name (the")
+    r.push("// syslog HOSTNAME field). Returns a fresh str; \"localhost\" on")
+    r.push("// any gethostname failure (kept total — no panic path).")
+    r.push("static hl_str* hl_sys_hostname(void) {")
+    r.push("    char buf[256];")
+    r.push("    if (gethostname(buf, sizeof(buf) - 1) != 0) {")
+    r.push("        return hl_str_from(\"localhost\", 9);")
+    r.push("    }")
+    r.push("    buf[sizeof(buf) - 1] = '\\0';")
+    r.push("    size_t n = strlen(buf);")
+    r.push("    return hl_str_from(buf, (int64_t)n);")
     r.push("}")
     r.push("")
     r.push("// hl_read_file: consumes the path, returns a fresh str. The temporary")
@@ -15617,6 +15680,14 @@ fn gen_call(ctx: Ctx, e: int) -> str {
     }
     if name == "isatty" {
         return "hl_isatty(" + gen_expr(ctx, ctx.exprs[e].args.get(0)) + ")"
+    }
+    # ----- Stage 57 (v0.76.0-alpha): process-identity builtins -----
+    # Both take no args; sys_hostname returns a fresh str.
+    if name == "proc_pid" {
+        return "hl_proc_pid()"
+    }
+    if name == "sys_hostname" {
+        return "hl_sys_hostname()"
     }
     if name == "panic" {
         return "hl_panic(" + gen_own_arg(ctx, ctx.exprs[e].args.get(0)) + ")"

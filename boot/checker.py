@@ -381,6 +381,16 @@ BUILTIN_FNS = {
     # when std.progress lands and the spinner needs it"). The stdlib
     # std/progress.hls builds the user-facing API on all three.
     "eprint", "eprintln", "isatty",
+    # Stage 57 (v0.76.0-alpha): process-identity builtins for std.log.
+    # proc_pid() -> int (the syslog TAG[PID] field; never 0 for a live
+    # process). sys_hostname() -> str (the syslog HOSTNAME field;
+    # "localhost" fallback). Both carry Proc (process-state access —
+    # the same family as env_get / cwd_get). No arguments, no sinks.
+    # The values differ BETWEEN the interpreter process and the native
+    # binary process (two different pids), so std.log's pure renderers
+    # take them as explicit arguments; only the live emit path reads
+    # them (differential tests use fixed synthetic values).
+    "proc_pid", "sys_hostname",
 }
 
 # Stage 9 (v0.20.0-alpha — release): per-builtin effect mapping.
@@ -407,6 +417,11 @@ BUILTIN_EFFECTS = {
     "eprint":      {"IO"},
     "eprintln":    {"IO"},
     "isatty":      {"IO"},
+    # Stage 57 (v0.76.0-alpha): process-identity builtins — Proc
+    # (the process's / host's identity is process-state access, the
+    # same family as env_get / cwd_get).
+    "proc_pid":     {"Proc"},
+    "sys_hostname": {"Proc"},
     "read_file":   {"Fs"},
     "write_file":  {"Fs"},
     "file_exists": {"Fs"},
@@ -2734,6 +2749,17 @@ class Checker:
             argt(0, "int")
             self.edges[self.cur_fn].add("b:isatty")
             return "bool"
+        # Stage 57 (v0.76.0-alpha): process-identity builtins (no args).
+        # proc_pid() -> int — the OS process id (syslog TAG[PID]).
+        # sys_hostname() -> str — the host name (syslog HOSTNAME).
+        if name == "proc_pid":
+            need(0)
+            self.edges[self.cur_fn].add("b:proc_pid")
+            return "int"
+        if name == "sys_hostname":
+            need(0)
+            self.edges[self.cur_fn].add("b:sys_hostname")
+            return "str"
         if name == "panic":
             need(1)
             # panic is NOT a taint sink — panicking with a tainted message

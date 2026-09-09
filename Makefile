@@ -31,7 +31,7 @@ else
   HL_CURL_DEFS :=
 endif
 
-.PHONY: all stage0 bootstrap test examples clean run check bench install uninstall audit opt-stats emit-ir emit-llvm fmt lint lsp-check pkg-init pkg-add pkg-lock pkg-audit pkg-verify pkg-build pkg-publish pkg-log pkg-log-verify prove prove-full model prove-acceptance hltest fuzz cov fuzz-acceptance wasm-opt webapp webapp-acceptance serve aarch64-bench aarch64-acceptance aarch64-list-targets stack-acceptance inline-acceptance opt-stats-report kernel-attrs escape-acceptance layout-report tail-acceptance tail-report asm-acceptance asm-attrs bench-stdlib spec-check stage32-acceptance async-acceptance stream-acceptance io-acceptance fs-acceptance net-acceptance http-acceptance http2-acceptance json-stream-acceptance regex-acceptance fmt-acceptance hash-acceptance collections-acceptance sync-acceptance thread-acceptance time-acceptance math-acceptance process-acceptance env-acceptance archive-acceptance uuid-ulid-acceptance cli-acceptance tui-acceptance color-acceptance progress-acceptance
+.PHONY: all stage0 bootstrap test examples clean run check bench install uninstall audit opt-stats emit-ir emit-llvm fmt lint lsp-check pkg-init pkg-add pkg-lock pkg-audit pkg-verify pkg-build pkg-publish pkg-log pkg-log-verify prove prove-full model prove-acceptance hltest fuzz cov fuzz-acceptance wasm-opt webapp webapp-acceptance serve aarch64-bench aarch64-acceptance aarch64-list-targets stack-acceptance inline-acceptance opt-stats-report kernel-attrs escape-acceptance layout-report tail-acceptance tail-report asm-acceptance asm-attrs bench-stdlib spec-check stage32-acceptance async-acceptance stream-acceptance io-acceptance fs-acceptance net-acceptance http-acceptance http2-acceptance json-stream-acceptance regex-acceptance fmt-acceptance hash-acceptance collections-acceptance sync-acceptance thread-acceptance time-acceptance math-acceptance process-acceptance env-acceptance archive-acceptance uuid-ulid-acceptance cli-acceptance tui-acceptance color-acceptance progress-acceptance log-acceptance
 
 # Main goal: use the full bootstrap chain to build the native compiler
 all: bootstrap
@@ -2258,3 +2258,55 @@ progress-acceptance: bin/hlc
 	@echo "  differential (interpreter == native) verified green."
 
 .PHONY: progress-acceptance
+
+# ============================================================================
+# Stage 57 (v0.76.0-alpha): std.log -- structured logging (human + JSON
+# + syslog formats, HLS_LOG level control). TWO new compiler builtins
+# (proc_pid: the syslog TAG[PID] field; sys_hostname: the HOSTNAME
+# field -- both Proc). Pure-HLS module on top of Stage 56's eprint /
+# isatty, Stage 55's std.color, Stage 48's env access, and Stage 49's
+# wall clock. Logs go to stderr (the 12-factor / systemd convention).
+# ============================================================================
+
+# Stage 57 differential note (DIFFERENT from the previous stages): the
+# LIVE emit lines carry the wall clock + the real pid, which differ
+# between the interpreter process and the native binary process BY
+# DESIGN. The differential comparison therefore covers STDOUT ONLY
+# (every stdout line is a pure function of fixed ts_ms / pid /
+# hostname / ColorLevel); the live stderr path is SMOKE-TESTED (the
+# program must exit 0 -- a crash, a panic, or a compile error fails
+# the acceptance). This is the same discipline Stage 49 applied to
+# the live wall clock.
+log-acceptance: bin/hlc
+	@$(PYTHON) boot/boot.py examples/log_demo.hls > /tmp/log_demo_interp.txt 2>/dev/null
+	@bin/hlc examples/log_demo.hls /tmp/log_demo.c 2>/dev/null
+	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/log_demo /tmp/log_demo.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
+	@/tmp/log_demo > /tmp/log_demo_nat.txt 2>/dev/null
+	@diff -q /tmp/log_demo_interp.txt /tmp/log_demo_nat.txt >/dev/null 2>&1 \
+		|| (echo "FAIL: log_demo differential mismatch (stdout)" && false)
+	@/tmp/log_demo >/dev/null 2>&1 || (echo "FAIL: log_demo live smoke" && false)
+	@$(PYTHON) boot/boot.py tests/ok/feat_stage57_log.hls > /tmp/s57_interp.txt 2>/dev/null
+	@bin/hlc tests/ok/feat_stage57_log.hls /tmp/s57.c 2>/dev/null
+	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/s57 /tmp/s57.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
+	@/tmp/s57 > /tmp/s57_nat.txt 2>/dev/null
+	@diff -q /tmp/s57_interp.txt /tmp/s57_nat.txt >/dev/null 2>&1 \
+		|| (echo "FAIL: feat_stage57_log differential mismatch (stdout)" && false)
+	@/tmp/s57 >/dev/null 2>&1 || (echo "FAIL: feat_stage57_log live smoke" && false)
+	@rm -f /tmp/log_demo /tmp/log_demo.c /tmp/log_demo_interp.txt /tmp/log_demo_nat.txt \
+		/tmp/s57 /tmp/s57.c /tmp/s57_interp.txt /tmp/s57_nat.txt
+	@echo ""
+	@echo "ACCEPTANCE OK: Stage 57 -- std.log (structured logging: human + JSON + syslog)"
+	@echo "  LogLevel ladder (Off < Error < Warn < Info < Debug < Trace) + log_enabled 6x5 matrix"
+	@echo "  info!/warn!/error!/debug!/trace! as functions + impl Logger methods (lg.info(...))"
+	@echo "  Structured key-value pairs (parallel lists) in all three formats"
+	@echo "  HLS_LOG level control (+ the warning alias; lenient info default)"
+	@echo "  HLS_LOG_FORMAT format control (human / json / syslog)"
+	@echo "  human: ISO-8601 UTC ms + 5-wide level token + colored (byte-exact SGR)"
+	@echo "  json: JSON Lines, fixed key order, full escaping (incl. U+2028/U+2029)"
+	@echo "  syslog: RFC 3164 (PRI / Mmm-dd / HOSTNAME / TAG[PID]:) via 2 new builtins"
+	@echo "  Timestamps: Hinnant civil-from-days, floor-division, leap-day + pre-epoch edges"
+	@echo "  Builders (immutable) + method twins + .render / .is_enabled parity"
+	@echo "  Live emits to stderr (12-factor convention); suppressed by level"
+	@echo "  differential (stdout, interpreter == native) + live smoke (exit 0) verified green."
+
+.PHONY: log-acceptance

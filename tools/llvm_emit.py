@@ -120,6 +120,10 @@ declare void     @hl_println(ptr)                   ; hl_str*
 declare void     @hl_eprint(ptr)                    ; hl_str* -> stderr
 declare void     @hl_eprintln(ptr)                  ; hl_str* -> stderr + '\n'
 declare i1       @hl_isatty(i64)                    ; (fd) -> bool
+; Stage 57 (v0.76.0-alpha): process-identity runtime helpers (syslog
+; TAG[PID] + HOSTNAME fields for std.log). Both take no arguments.
+declare i64      @hl_proc_pid()                     ; -> OS process id
+declare ptr      @hl_sys_hostname()                 ; -> fresh str host name
 
 ; strings
 declare ptr      @hl_str_alloc(i64)
@@ -1610,6 +1614,16 @@ class LLVMEmitter:
                                ["ptr"], arg_pairs)
         if name == "isatty":
             return self._call1("i1", "@hl_isatty", ["i64"], arg_pairs)
+        # ----- Stage 57 (v0.76.0-alpha): process-identity builtins.
+        # Both take no arguments (the empty arg_pairs call form).
+        if name == "proc_pid":
+            tmp = self._fresh("pid")
+            self._emit("  %s = call i64 @hl_proc_pid()" % tmp)
+            return ("i64", tmp)
+        if name == "sys_hostname":
+            tmp = self._fresh("hostname")
+            self._emit("  %s = call ptr @hl_sys_hostname()" % tmp)
+            return ("ptr", tmp)
         if name == "panic":
             # hl_panic never returns: emit call + unreachable so no
             # instructions follow in this block.

@@ -1,0 +1,360 @@
+# examples/log_demo.hls — Stage 57 (v0.76.0-alpha): std.log demo.
+#
+# This demo exercises every feature of std.log:
+#   - LogLevel / LogFormat / LogColor enums (encode / decode / names /
+#     parsing: HLS_LOG values, HLS_LOG_FORMAT values, --color values)
+#   - Level semantics: the Off < Error < Warn < Info < Debug < Trace
+#     order, log_enabled filtering at every logger level
+#   - The three formats rendering the SAME record:
+#       human  (colored level token; escape-free at ColorNone)
+#       json   (JSON Lines, full escaping — the log-forging defense)
+#       syslog (RFC 3164: PRI, Mmm-dd timestamp, HOSTNAME TAG[PID]:)
+#   - Structured key-value pairs (parallel lists) in all three formats
+#   - Timestamp math: ISO-8601 UTC with ms, RFC 3164, the epoch edge
+#     cases (0, -1, the 2024 / 2000 leap days, year boundaries)
+#   - JSON escaping: quotes, backslashes, control bytes, the
+#     JS-breaking U+2028 / U+2029 separators
+#   - Builders (immutable): with_level / with_format / with_color /
+#     with_app_name / with_identity (+ the method twins)
+#   - The live path: log_new() reading HLS_LOG / HLS_LOG_FORMAT and
+#     filling pid + hostname, then live emits through every level and
+#     format (the LIVE lines carry the wall clock + the real pid, so
+#     they go to STDERR and are NOT part of the deterministic stdout
+#     capture — the acceptance target compares stdout byte-for-byte
+#     and smoke-tests the live path's exit code; the pure renders
+#     above are the differential surface)
+#
+# The demo is differential-safe: every stdout line is a pure function
+# of fixed inputs (fixed ts_ms / pid / hostname / ColorLevel).
+
+import "std.log"
+import "std.str"
+
+# ----------------------------------------------------------------------------
+# Helper — print a header between sections.
+# ----------------------------------------------------------------------------
+
+fn section(title: str) -> void uses IO {
+    println("")
+    println("--- " + title + " ---")
+}
+
+# A fixed synthetic timestamp: 2025-09-09T12:40:00.123Z.
+fn demo_ts() -> int { return 1757421600123 }
+
+# A fixed synthetic identity (the pure-render pattern).
+fn demo_logger(level: LogLevel, format: LogFormat) -> Logger {
+    return log_with_identity(
+        log_new_with(level, format, LogColor.LogColorNever, "myapp"),
+        1234, "web01")
+}
+
+# ----------------------------------------------------------------------------
+# Demo 1 — The three formats, one record.
+# ----------------------------------------------------------------------------
+
+fn demo_formats() -> void uses IO {
+    section("Three formats, one record")
+
+    let lg: Logger = demo_logger(LogLevel.LogInfo, LogFormat.LogHuman)
+    let rec: LogRecord = log_new_record(lg, LogLevel.LogInfo,
+        "server started", ["port", "workers"], ["8080", "4"], demo_ts())
+
+    println("human : " + log_render_human(rec, ColorLevel.ColorNone))
+    println("json  : " + log_render_json(rec))
+    println("syslog: " + log_render_syslog(rec))
+}
+
+# ----------------------------------------------------------------------------
+# Demo 2 — Every level in every format.
+# ----------------------------------------------------------------------------
+
+fn demo_levels() -> void uses IO {
+    section("Every level, human + json + syslog")
+
+    let lg: Logger = demo_logger(LogLevel.LogTrace, LogFormat.LogHuman)
+    let levels: list[LogLevel] = [
+        LogLevel.LogError,
+        LogLevel.LogWarn,
+        LogLevel.LogInfo,
+        LogLevel.LogDebug,
+        LogLevel.LogTrace,
+    ]
+    let mut i: int = 0
+    while i < levels.len() {
+        let lv: LogLevel = levels.get(i)
+        let rec: LogRecord = log_new_record(lg, lv, "message for " + log_level_name(lv),
+            [], [], demo_ts() + i)
+        println("  " + log_render_human(rec, ColorLevel.ColorNone))
+        println("  " + log_render_json(rec))
+        println("  " + log_render_syslog(rec))
+        i = i + 1
+    }
+}
+
+# ----------------------------------------------------------------------------
+# Demo 3 — Level filtering (log_enabled at every logger level).
+# ----------------------------------------------------------------------------
+
+fn demo_filtering() -> void uses IO {
+    section("Level filtering (log_enabled)")
+
+    let levels: list[LogLevel] = [
+        LogLevel.LogOff,
+        LogLevel.LogError,
+        LogLevel.LogWarn,
+        LogLevel.LogInfo,
+        LogLevel.LogDebug,
+        LogLevel.LogTrace,
+    ]
+    let mut i: int = 0
+    while i < levels.len() {
+        let logger_level: LogLevel = levels.get(i)
+        let lg: Logger = log_new_with(logger_level, LogFormat.LogHuman,
+            LogColor.LogColorNever, "app")
+        let mut line: str = "logger=" + str_pad_right(log_level_name(logger_level), 5, " ")
+        line = line + " emits:"
+        if log_enabled(lg, LogLevel.LogError) { line = line + " error" }
+        if log_enabled(lg, LogLevel.LogWarn) { line = line + " warn" }
+        if log_enabled(lg, LogLevel.LogInfo) { line = line + " info" }
+        if log_enabled(lg, LogLevel.LogDebug) { line = line + " debug" }
+        if log_enabled(lg, LogLevel.LogTrace) { line = line + " trace" }
+        println("  " + line)
+        i = i + 1
+    }
+}
+
+# ----------------------------------------------------------------------------
+# Demo 4 — Timestamp math (ISO + RFC 3164 edge cases).
+# ----------------------------------------------------------------------------
+
+fn demo_timestamps() -> void uses IO {
+    section("Timestamps (ISO-8601 UTC + RFC 3164)")
+
+    let stamps: list[int] = [
+        0,                # the epoch
+        999,              # 999 ms into the epoch
+        -1,               # 1 ms BEFORE the epoch (floor-division)
+        951782400000,     # 2000-02-29 (the 400-year leap day)
+        1709164800000,    # 2024-02-29 (the 4-year leap day)
+        1757421600123,    # 2025-09-09T12:40:00.123Z
+        4102444800000,    # 2100-01-01 (2100 is NOT a leap year)
+        86399999,         # 1970-01-01T23:59:59.999Z (day boundary)
+    ]
+    let mut i: int = 0
+    while i < stamps.len() {
+        let ts: int = stamps.get(i)
+        println("  " + ts.to_str() + " -> " + log_epoch_ms_to_iso(ts)
+            + " | " + log_epoch_ms_to_rfc3164(ts))
+        i = i + 1
+    }
+
+    # The month table (RFC 3164 abbreviations).
+    let mut m: int = 2
+    let mut acc: str = log_month_name(1)
+    while m <= 12 {
+        acc = acc + " " + log_month_name(m)
+        m = m + 1
+    }
+    println("  months: " + acc)
+}
+
+# ----------------------------------------------------------------------------
+# Demo 5 — JSON escaping (the log-forging defense).
+# ----------------------------------------------------------------------------
+
+fn demo_json_escape() -> void uses IO {
+    section("JSON escaping")
+
+    println("  plain     : " + log_json_escape("hello world"))
+    println("  quote     : " + log_json_escape("say \"hi\""))
+    println("  backslash : " + log_json_escape("C:\\path\\file"))
+    println("  newline   : " + log_json_escape("line1\nline2"))
+    println("  tab       : " + log_json_escape("col1\tcol2"))
+    println("  cr        : " + log_json_escape("mac" + chr(13)))
+    println("  ctrl-0x01 : " + log_json_escape(chr(1) + "x"))
+    println("  ctrl-0x1f : " + log_json_escape("x" + chr(31)))
+
+    # U+2028 / U+2029 — JSON-valid but JS-breaking; the demo builds
+    # them from raw bytes (E2 80 A8 / E2 80 A9) so the source file
+    # stays pure ASCII.
+    let u2028: str = chr(226) + chr(128) + chr(168)
+    let u2029: str = chr(226) + chr(128) + chr(169)
+    println("  u2028     : " + log_json_escape("a" + u2028 + "b"))
+    println("  u2029     : " + log_json_escape("a" + u2029 + "b"))
+
+    # The full JSON line with a hostile message: multi-line forging
+    # is impossible — every newline is escaped.
+    let lg: Logger = demo_logger(LogLevel.LogWarn, LogFormat.LogJson)
+    let rec: LogRecord = log_new_record(lg, LogLevel.LogWarn,
+        "multi\nline \"forgery\"\nattack", ["path"], ["/var/log\\app"],
+        demo_ts())
+    println("  hostile   : " + log_render_json(rec))
+}
+
+# ----------------------------------------------------------------------------
+# Demo 6 — The parsers (HLS_LOG / HLS_LOG_FORMAT / --color).
+# ----------------------------------------------------------------------------
+
+fn demo_parsers() -> void uses IO {
+    section("Parsers (HLS_LOG / HLS_LOG_FORMAT / --color)")
+
+    let vals: list[str] = ["trace", "TRACE", "debug", "info", "warn",
+        "warning", "error", "off", "bogus", ""]
+    let mut i: int = 0
+    while i < vals.len() {
+        let v: str = vals.get(i)
+        println("  HLS_LOG=" + str_pad_right("'" + v + "'", 10, " ")
+            + " -> " + log_level_name(log_level_from_str(v)))
+        i = i + 1
+    }
+
+    let fmts: list[str] = ["human", "JSON", "json", "syslog", "bogus", ""]
+    let mut j: int = 0
+    while j < fmts.len() {
+        let v: str = fmts.get(j)
+        println("  HLS_LOG_FORMAT=" + str_pad_right("'" + v + "'", 9, " ")
+            + " -> " + log_format_name(log_format_from_str(v)))
+        j = j + 1
+    }
+
+    let colors: list[str] = ["always", "Never", "auto", "bogus", ""]
+    let mut k: int = 0
+    while k < colors.len() {
+        let v: str = colors.get(k)
+        println("  --color=" + str_pad_right("'" + v + "'", 8, " ")
+            + " -> " + log_color_name(log_color_from_str(v)))
+        k = k + 1
+    }
+}
+
+# ----------------------------------------------------------------------------
+# Demo 7 — Colored human rendering at every ColorLevel.
+# ----------------------------------------------------------------------------
+
+fn demo_colors() -> void uses IO {
+    section("Human rendering at every ColorLevel")
+
+    let lg: Logger = demo_logger(LogLevel.LogInfo, LogFormat.LogHuman)
+    let levels: list[LogLevel] = [
+        LogLevel.LogError,
+        LogLevel.LogWarn,
+        LogLevel.LogInfo,
+        LogLevel.LogDebug,
+        LogLevel.LogTrace,
+    ]
+
+    # ColorNone: completely escape-free (the SGR spans are dropped —
+    # only the fg-color styles are applied at >= Basic).
+    let mut i: int = 0
+    while i < levels.len() {
+        let lv: LogLevel = levels.get(i)
+        let rec: LogRecord = log_new_record(lg, lv, "level colors", [], [], demo_ts())
+        println("  none   " + log_render_human(rec, ColorLevel.ColorNone))
+        i = i + 1
+    }
+
+    # Basic: the level token carries its color (red+bold / yellow /
+    # green / blue / magenta). The escapes are shown via str_replace
+    # so the demo output stays printable (the raw bytes are the real
+    # ANSI sequences — running the demo in a terminal shows colors).
+    let mut j: int = 0
+    while j < levels.len() {
+        let lv: LogLevel = levels.get(j)
+        let rec: LogRecord = log_new_record(lg, lv, "level colors", [], [], demo_ts())
+        println("  basic  " + str_replace(log_render_human(rec, ColorLevel.ColorBasic),
+            chr(27), "<E>"))
+        j = j + 1
+    }
+}
+
+# ----------------------------------------------------------------------------
+# Demo 8 — Builders + the method form.
+# ----------------------------------------------------------------------------
+
+fn demo_builders() -> void uses IO {
+    section("Builders + method form")
+
+    let lg: Logger = log_new_with(LogLevel.LogInfo, LogFormat.LogHuman,
+        LogColor.LogColorNever, "app")
+    let lg2: Logger = lg.with_app_name("web01").with_identity(1234, "web01")
+        .with_format(LogFormat.LogSyslog).with_level(LogLevel.LogError)
+    println("  app=" + lg2.app_name + " pid=" + lg2.pid.to_str()
+        + " host=" + lg2.hostname + " level=" + log_level_name(lg2.level)
+        + " format=" + log_format_name(lg2.format))
+
+    # The receiver is unchanged (immutable builders).
+    println("  receiver unchanged: app=" + lg.app_name
+        + " pid=" + lg.pid.to_str() + " format=" + log_format_name(lg.format))
+
+    # The method renders through the logger's own format.
+    let rec: LogRecord = log_new_record(lg2, LogLevel.LogError,
+        "connection lost", ["retry"], ["3"], demo_ts())
+    println("  method render: " + lg2.render(rec, ColorLevel.ColorNone))
+    println("  is_enabled(trace)=" + lg2.is_enabled(LogLevel.LogTrace).to_str()
+        + " is_enabled(error)=" + lg2.is_enabled(LogLevel.LogError).to_str())
+}
+
+# ----------------------------------------------------------------------------
+# Demo 9 — The live path (log_new + emits; stderr, NOT differential).
+# ----------------------------------------------------------------------------
+
+fn demo_live() -> void uses IO, Clock, Proc {
+    section("Live logging (log_new + every level; stderr)")
+
+    # The live constructor: HLS_LOG / HLS_LOG_FORMAT + the real pid +
+    # hostname. The env values are identical between the interpreter
+    # and the native binary for the same invocation, so the level /
+    # format / app line is differential-safe. The pid + hostname are
+    # RELATIVE assertions only (the two backends run as two different
+    # processes — printing the live pid to stdout would diverge).
+    let lg: Logger = log_new()
+    println("  live logger: level=" + log_level_name(lg.level)
+        + " format=" + log_format_name(lg.format)
+        + " app=" + lg.app_name)
+    println("  pid > 0: " + (lg.pid > 0).to_str()
+        + ", hostname non-empty: " + (lg.hostname.len() > 0).to_str())
+
+    # Live emits: every level, plus the structured form. These lines
+    # go to STDERR with the LIVE wall clock — run the demo in a
+    # terminal (or with 2>&1) to see them; the acceptance target
+    # smoke-tests this path (exit 0) instead of diffing it.
+    log_error(lg, "live: disk almost full")
+    log_warn(lg, "live: retrying upstream")
+    log_info(lg, "live: server started")
+    log_debug(lg, "live: connection pool stats")
+    log_trace(lg, "live: entering handler")
+    log_info_kv(lg, "live: request served", ["path", "ms"], ["/api/v1", "12"])
+
+    # The JSON + syslog live forms (one of each).
+    let json_lg: Logger = lg.with_format(LogFormat.LogJson)
+    log_warn_kv(json_lg, "live json", ["src"], ["upstream"])
+    let sys_lg: Logger = lg.with_format(LogFormat.LogSyslog)
+    log_error(sys_lg, "live syslog")
+
+    # Level suppression on the live path: a Warn logger drops info.
+    let quiet: Logger = lg.with_level(LogLevel.LogWarn)
+    log_info(quiet, "this info line is SUPPRESSED (level=warn)")
+    log_error(quiet, "this error line is shown (error >= warn)")
+    println("  live emits complete (see stderr)")
+}
+
+# ----------------------------------------------------------------------------
+# Main — run every section in order.
+# ----------------------------------------------------------------------------
+
+fn main() -> int uses IO, Clock, Proc {
+    println("=== Stage 57: std.log — structured logging (human/JSON/syslog) ===")
+    demo_formats()
+    demo_levels()
+    demo_filtering()
+    demo_timestamps()
+    demo_json_escape()
+    demo_parsers()
+    demo_colors()
+    demo_builders()
+    demo_live()
+    println("")
+    println("demo complete.")
+    return 0
+}

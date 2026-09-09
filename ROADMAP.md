@@ -99,7 +99,7 @@ remains green.
 | 54 | `std.tui` — terminal raw mode, ANSI escapes, screen grid | ✅ | (done in v0.73.0-alpha) |
 | 55 | `std.color` — terminal color detection, truecolor fallback | ✅ | (done in v0.74.0-alpha) |
 | 56 | `std.progress` — progress bars, spinners, ETA | ✅ | (done in v0.75.0-alpha) |
-| 57 | `std.log` — structured logging (JSON + human formats) | ⬜ | 3 weeks |
+| 57 | `std.log` — structured logging (JSON + human formats) | ✅ | (done in v0.76.0-alpha) |
 | 58 | `std.config` — TOML + YAML + env-layered config loader | ⬜ | 4 weeks |
 | 59 | `std.complete` — shell-completion generator (bash/zsh/fish) | ⬜ | 3 weeks |
 | 60 | `hls-cli` — `cargo`-style launcher (`hls new`, `hls run`, `hls build`) | ⬜ | 5 weeks |
@@ -5700,7 +5700,60 @@ covers every feature the roadmap promises:
 **57. `std.log`** — `info!`, `warn!`, `error!`, `debug!`, `trace!`
 macros. Structured logging (key-value pairs). Output formats: human
 (colored, for TTY), JSON (for log aggregation), syslog (for
-daemons). Log level controlled by `HLS_LOG` env var.
+daemons). Log level controlled by `HLS_LOG` env var. ✅
+**DONE in v0.76.0-alpha** — implemented as `std/log.hls` (pure render
+core + thin live shell) with TWO new compiler builtins: `proc_pid()
+-> int` and `sys_hostname() -> str` (both Proc — process-identity
+access; they fill the syslog TAG[PID] and HOSTNAME fields). The API
+covers every feature the roadmap promises:
+
+  * **The macro-style levels** — `info!` / `warn!` / `error!` /
+    `debug!` / `trace!` map to FUNCTIONS (Halis has no macros until
+    Stage 113+ — the same convention std.fmt used for format!), in
+    both free-function form (`log_info(lg, msg)`) and `impl Logger`
+    method form (`lg.info("msg")` — the closest HLS gets to the
+    macros before they land) + the structured `_kv` variants
+    (`log_info_kv(lg, msg, keys, vals)` — parallel lists, the
+    std.json json_object convention).
+  * **Structured logging (key-value pairs)** — every record carries
+    keys/vals; the human format renders them `k=v` after the
+    message, JSON emits them as object fields, syslog appends them
+    to the message part.
+  * **Three output formats** — human (ISO-8601 UTC ms + 5-wide
+    level token + colored at the terminal: ERROR red+bold, WARN
+    yellow, INFO green, DEBUG blue, TRACE magenta — escape-free at
+    ColorNone), JSON (JSON Lines: one object per line, fixed key
+    order ts/level/app/msg/kvs, FULL escaping incl. the JS-breaking
+    U+2028/U+2029 — the log-forging defense: multi-line messages
+    cannot forge new records), syslog (RFC 3164: `<PRI>Mmm dd
+    HH:MM:SS HOSTNAME TAG[PID]: msg` — PRI = 8 + severity, the
+    space-padded day, pid 0 omits [PID]).
+  * **Log level controlled by `HLS_LOG`** — off / error / warn /
+    warning (alias) / info / debug / trace, case-insensitive; an
+    invalid value falls back to INFO (the lenient default — a typo
+    must not silence the error channel). `HLS_LOG_FORMAT` selects
+    human / json / syslog (default human).
+  * **Logger as an explicit value** — HLS has no global mutable
+    state; `log_new()` reads the env + fills pid/hostname once,
+    `log_new_with(...)` is the pure constructor, and the
+    `log_with_*` builders (immutable) + method twins reconfigure.
+  * **Logs go to stderr** (the 12-factor / systemd convention:
+    stdout is the data pipeline, stderr is the operator channel)
+    via Stage 56's eprintln — stdout is flushed first so data +
+    logs keep the caller's logical order.
+  * **Timestamp math** — Hinnant's civil-from-days with explicit
+    floor-division (HLS `/` truncates like C), so pre-1970
+    timestamps, the 2000/2024 leap days, and 2100 (not a leap
+    year) all render correctly — pure integer arithmetic,
+    byte-identical between interpreter and native.
+  * **Differential parity** — the renderers are pure functions of
+    (record, ColorLevel) with fixed ts/pid/hostname (verified
+    byte-for-byte by `make log-acceptance`, incl. the SGR spans and
+    the PRI table); the live emit lines carry the wall clock + the
+    real pid (which differ BETWEEN the two backends' processes by
+    design), so the acceptance compares stdout only and
+    smoke-tests the live path (exit 0) — the Stage 49 wall-clock
+    discipline. Bootstrap self-compilation remains deterministic.
 
 **58. `std.config`** — Layered config: defaults < file < env <
 CLI args. File formats: TOML (preferred), YAML, JSON. A `Config`

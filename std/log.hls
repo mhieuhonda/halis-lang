@@ -1,0 +1,1063 @@
+# ============================================================================
+# std/log.hls — Stage 57 (v0.76.0-alpha): structured logging
+# (human + JSON + syslog formats, HLS_LOG level control).
+# ----------------------------------------------------------------------------
+# This module is the FIFTH module of Phase IV (the CLI tooling track,
+# Stages 53–62). It implements the roadmap's Stage 57 promise:
+#
+#   * info!, warn!, error!, debug!, trace! "macros" — Halis has no
+#     macros yet (Stage 113+); the macro-style API maps to functions
+#     (the same convention std.fmt used for format!), both as free
+#     functions (`log_info(lg, msg)`) and as `impl Logger` methods
+#     (`lg.info("msg")` — the closest HLS gets to `info!("msg")`
+#     before macros land).
+#   * Structured logging (key-value pairs) — every emit takes parallel
+#     `keys` / `vals` lists (the std.json `json_object` convention);
+#     the human format renders them `k=v` after the message, JSON
+#     emits them as object fields, syslog appends them to the message
+#     part.
+#   * Output formats — human (colored, for TTY), JSON (for log
+#     aggregation), syslog (RFC 3164, for daemons).
+#   * Log level controlled by the HLS_LOG env var.
+#
+# Design choices:
+#
+#   1. TWO NEW COMPILER BUILTINS (the only ones in this stage):
+#      `proc_pid() -> int` and `sys_hostname() -> str` (both Proc —
+#      process-identity access, the same family as env_get). They fill
+#      the syslog TAG[PID] and HOSTNAME fields. The pure renderers
+#      take pid/hostname as ARGUMENTS (differential-safe); only the
+#      live emit path reads the builtins. Everything else builds on
+#      Stage 56's eprint (stderr writes) + isatty, Stage 55's std.color,
+#      Stage 48's env access, and Stage 49's wall clock.
+#
+#   2. PURE CORE + THIN LIVE SHELL (the std.color / std.progress
+#      pattern). A LogRecord is a pure value; the three renderers
+#      (log_render_human / _json / _syslog) are pure functions of
+#      (record, ColorLevel) — every timestamp is INTEGER math on the
+#      epoch-ms argument (Howard Hinnant's civil-from-days algorithm,
+#      floor-division adjusted so pre-1970 timestamps render
+#      correctly), so the interpreter and the native binary produce
+#      byte-identical lines. The live path (log_new / log_emit) reads
+#      env + clock + pid + hostname and writes to stderr.
+#
+#   3. LOGS GO TO STDERR (the 12-factor / systemd / slog convention:
+#      stdout is the program's DATA pipeline, stderr is the operator
+#      channel — and it composes with std.progress, which also draws
+#      on stderr). eprintln flushes stdout first, so interleaved
+#      data + logs keep the caller's logical order in a combined
+#      capture.
+#
+#   4. THE LEVEL IS A VALUE, NOT A GLOBAL. Halis has no global mutable
+#      state (by design — the security story of the effect system);
+#      a Logger is an explicit value threaded through the program.
+#      `log_new() uses Proc` reads HLS_LOG / HLS_LOG_FORMAT and fills
+#      pid + hostname once; `log_new_with(...)` is the pure
+#      constructor for tests / deterministic rendering.
+#
+#   5. THREE FORMATS, ONE RECORD.
+#      - human: `2026-09-09T10:00:00.123Z INFO  myapp: server started
+#        port=8080 workers=4` — ISO-8601 UTC timestamp, 5-wide level
+#        token, "app:" prefix, message, `k=v` pairs. Colored level
+#        token when the terminal supports it (ERROR red+bold, WARN
+#        yellow, INFO green, DEBUG blue, TRACE magenta — the
+#        env_logger palette); completely escape-free otherwise
+#        (TERM=dumb safe — the same discipline std.progress applies).
+#      - JSON: `{"ts":"2026-09-09T10:00:00.123Z","level":"info",
+#        "app":"myapp","msg":"server started","port":"8080"}` — one
+#        object per line (the JSON Lines convention every aggregator
+#        ingests), fixed key order (ts, level, app, msg, then the
+#        structured pairs in call order), full escaping (quote,
+#        backslash, control bytes as \u00XX with \n \r \t shortcuts,
+#        and \u2028 / \u2029 — the two JSON-valid-but-JS-breaking
+#        separators).
+#      - syslog: RFC 3164 — `<14>Sep  9 10:00:00 myhost myapp[1234]:
+#        server started port=8080`. PRI = 8 + severity (user
+#        facility 1: error→3 err, warn→4 warning, info→6
+#        informational, debug/trace→7 debug). The day field is
+#        space-padded ("Sep  9"), the RFC's quirk. pid == 0 omits
+#        "[PID]" (the pure constructor's placeholder), hostname
+#        defaults to "localhost".
+#
+#   6. LEVEL SEMANTICS. The six levels form a total order
+#      Off < Error < Warn < Info < Debug < Trace; a record is enabled
+#      iff its level's order is non-zero AND ≤ the Logger's level.
+#      HLS_LOG accepts: off / error / warn / warning (alias) / info /
+#      debug / trace, case-insensitive. An invalid or missing value
+#      falls back to INFO (the lenient default — a typo in HLS_LOG
+#      should not silence a daemon's error channel). HLS_LOG_FORMAT
+#      accepts human / json / syslog (default human).
+#
+# Security:
+#   * eprintln is a TAINT SINK (compiler-enforced): a tainted message
+#     cannot reach the terminal without an explicit taint_unwrap /
+#     sanitizer — the ANSI-injection protection of Stage 56.
+#   * Every escape sequence comes from FIXED strings (std.color's SGR
+#     spans; no user input is ever embedded in an escape).
+#   * The JSON renderer escapes EVERYTHING that could break a
+#     downstream parser or an embedding HTML page (control bytes,
+#     quotes, backslashes, U+2028 / U+2029) — a log-injection (log
+#     forging) defense: an attacker-controlled multi-line message
+#     cannot forge new log lines in the JSON format (newlines are
+#     escaped), and cannot break out of the string in the human
+#     format's kv rendering either (values render verbatim — the
+#     human format's multi-line messages are documented as trusted;
+#     the JSON format is the injection-proof one).
+#   * No path / command / env VALUE is ever written to the terminal —
+#     env access is limited to the two documented probes (HLS_LOG /
+#     HLS_LOG_FORMAT level+format names, never logged verbatim).
+#
+# Limitations (deferred to later stages):
+#   * KV values are str only (int / bool / float values arrive with a
+#     future perfection stage; callers .to_str() — the JSON values
+#     then render as strings, which every aggregator accepts).
+#   * No level-per-module filtering (RUST_LOG's "info,hyper=warn"
+#     directive syntax — needs module identity, which arrives with
+#     hls-pkg; HLS_LOG takes a single level for v0.76.0-alpha).
+#   * No log rotation / file sink / network sink (stderr only — the
+#     daemon supervisor / container runtime owns rotation; a
+#     FileSink is a std.io composition away).
+#   * No EMA rate limiting / sampling (needs float state).
+#   * The syslog renderer emits RFC 3164 (BSD) lines; RFC 5424
+#     (structured-data JSON in syslog) is a future perfection stage.
+#   * Timestamps are UTC only (no local timezone — needs a tz
+#     database; the ISO-8601 Z suffix makes that explicit).
+#   * The wasm32 backend does not support eprint / isatty /
+#     proc_pid / sys_hostname; std.log is a native-backend module.
+# ============================================================================
+
+import "std.str"
+import "std.color"
+
+# ----------------------------------------------------------------------------
+# LogLevel — the six-level ladder.
+# ----------------------------------------------------------------------------
+# Off < Error < Warn < Info < Debug < Trace (a total order; the integer
+# encoding is the order itself). A Logger at level L emits every level
+# with order <= order(L) (except Off, which emits nothing).
+
+enum LogLevel {
+    LogOff,      # 0 — nothing is emitted
+    LogError,    # 1 — error conditions (syslog err)
+    LogWarn,     # 2 — warning conditions (syslog warning)
+    LogInfo,     # 3 — informational (the default; syslog informational)
+    LogDebug,    # 4 — debug-level (syslog debug)
+    LogTrace,    # 5 — very fine-grained (syslog debug)
+}
+
+# log_level_eq(a, b) — match-based equality (the repo convention).
+fn log_level_eq(a: LogLevel, b: LogLevel) -> bool {
+    return match a {
+        LogLevel.LogOff =>
+            match b { LogLevel.LogOff => true, _ => false },
+        LogLevel.LogError =>
+            match b { LogLevel.LogError => true, _ => false },
+        LogLevel.LogWarn =>
+            match b { LogLevel.LogWarn => true, _ => false },
+        LogLevel.LogInfo =>
+            match b { LogLevel.LogInfo => true, _ => false },
+        LogLevel.LogDebug =>
+            match b { LogLevel.LogDebug => true, _ => false },
+        LogLevel.LogTrace =>
+            match b { LogLevel.LogTrace => true, _ => false },
+    }
+}
+
+# log_level_to_int(level) — encode as the order 0..5.
+fn log_level_to_int(level: LogLevel) -> int {
+    return match level {
+        LogLevel.LogOff => 0,
+        LogLevel.LogError => 1,
+        LogLevel.LogWarn => 2,
+        LogLevel.LogInfo => 3,
+        LogLevel.LogDebug => 4,
+        LogLevel.LogTrace => 5,
+    }
+}
+
+# log_level_from_int(i) — decode 0..5. Panics on out-of-range.
+fn log_level_from_int(i: int) -> LogLevel {
+    if i == 0 { return LogLevel.LogOff }
+    if i == 1 { return LogLevel.LogError }
+    if i == 2 { return LogLevel.LogWarn }
+    if i == 3 { return LogLevel.LogInfo }
+    if i == 4 { return LogLevel.LogDebug }
+    if i == 5 { return LogLevel.LogTrace }
+    panic("log_level_from_int: expected 0..5 (off/error/warn/info/debug/trace), got " + i.to_str())
+}
+
+# log_level_name(level) — the lowercase token used in JSON + HLS_LOG:
+# "off" / "error" / "warn" / "info" / "debug" / "trace".
+fn log_level_name(level: LogLevel) -> str {
+    return match level {
+        LogLevel.LogOff => "off",
+        LogLevel.LogError => "error",
+        LogLevel.LogWarn => "warn",
+        LogLevel.LogInfo => "info",
+        LogLevel.LogDebug => "debug",
+        LogLevel.LogTrace => "trace",
+    }
+}
+
+# log_level_token(level) — the 5-wide right-padded human-format token:
+# "ERROR", "WARN ", "INFO ", "DEBUG", "TRACE" (fixed width keeps
+# consecutive lines aligned; the pad keeps the join spacing stable).
+fn log_level_token(level: LogLevel) -> str {
+    if log_level_eq(level, LogLevel.LogError) {
+        return "ERROR"
+    }
+    if log_level_eq(level, LogLevel.LogWarn) {
+        return "WARN "
+    }
+    if log_level_eq(level, LogLevel.LogInfo) {
+        return "INFO "
+    }
+    if log_level_eq(level, LogLevel.LogDebug) {
+        return "DEBUG"
+    }
+    if log_level_eq(level, LogLevel.LogTrace) {
+        return "TRACE"
+    }
+    return "OFF  "
+}
+
+# log_level_from_str(s) — parse an HLS_LOG value (case-insensitive):
+# off / error / warn / warning (alias) / info / debug / trace.
+# Anything else (including "") falls back to INFO — the lenient
+# default: a typo must not silence the error channel. This is the
+# pure parse (the test suite calls it with synthetic values); the
+# live `log_new()` applies it to the env value.
+fn log_level_from_str(s: str) -> LogLevel {
+    let v: str = str_to_lower_ascii(s)
+    if v == "off" { return LogLevel.LogOff }
+    if v == "error" { return LogLevel.LogError }
+    if v == "warn" { return LogLevel.LogWarn }
+    if v == "warning" { return LogLevel.LogWarn }
+    if v == "info" { return LogLevel.LogInfo }
+    if v == "debug" { return LogLevel.LogDebug }
+    if v == "trace" { return LogLevel.LogTrace }
+    return LogLevel.LogInfo
+}
+
+# ----------------------------------------------------------------------------
+# LogFormat — the three output formats.
+# ----------------------------------------------------------------------------
+
+enum LogFormat {
+    LogHuman,     # 0 — colored, for TTY (the default)
+    LogJson,      # 1 — JSON Lines, for log aggregation
+    LogSyslog,    # 2 — RFC 3164, for daemons
+}
+
+# log_format_eq(a, b) — match-based equality.
+fn log_format_eq(a: LogFormat, b: LogFormat) -> bool {
+    return match a {
+        LogFormat.LogHuman =>
+            match b { LogFormat.LogHuman => true, _ => false },
+        LogFormat.LogJson =>
+            match b { LogFormat.LogJson => true, _ => false },
+        LogFormat.LogSyslog =>
+            match b { LogFormat.LogSyslog => true, _ => false },
+    }
+}
+
+# log_format_to_int(format) / log_format_from_int(i) — encode/decode 0..2.
+fn log_format_to_int(format: LogFormat) -> int {
+    return match format {
+        LogFormat.LogHuman => 0,
+        LogFormat.LogJson => 1,
+        LogFormat.LogSyslog => 2,
+    }
+}
+
+fn log_format_from_int(i: int) -> LogFormat {
+    if i == 0 { return LogFormat.LogHuman }
+    if i == 1 { return LogFormat.LogJson }
+    if i == 2 { return LogFormat.LogSyslog }
+    panic("log_format_from_int: expected 0..2 (human/json/syslog), got " + i.to_str())
+}
+
+# log_format_name(format) — "human" / "json" / "syslog".
+fn log_format_name(format: LogFormat) -> str {
+    return match format {
+        LogFormat.LogHuman => "human",
+        LogFormat.LogJson => "json",
+        LogFormat.LogSyslog => "syslog",
+    }
+}
+
+# log_format_from_str(s) — parse an HLS_LOG_FORMAT value
+# (case-insensitive). Anything else (including "") falls back to
+# human (the lenient default, same rationale as the level parse).
+fn log_format_from_str(s: str) -> LogFormat {
+    let v: str = str_to_lower_ascii(s)
+    if v == "human" { return LogFormat.LogHuman }
+    if v == "json" { return LogFormat.LogJson }
+    if v == "syslog" { return LogFormat.LogSyslog }
+    return LogFormat.LogHuman
+}
+
+# ----------------------------------------------------------------------------
+# LogColor — the --color=always / never / auto surface (the same
+# three-mode contract std.progress established in Stage 56).
+# ----------------------------------------------------------------------------
+
+enum LogColor {
+    LogColorAuto,     # 0 — color only when stderr is a TTY
+    LogColorAlways,   # 1 — force color (the env detector still applies)
+    LogColorNever,    # 2 — no escapes at all
+}
+
+# log_color_eq(a, b) — match-based equality.
+fn log_color_eq(a: LogColor, b: LogColor) -> bool {
+    return match a {
+        LogColor.LogColorAuto =>
+            match b { LogColor.LogColorAuto => true, _ => false },
+        LogColor.LogColorAlways =>
+            match b { LogColor.LogColorAlways => true, _ => false },
+        LogColor.LogColorNever =>
+            match b { LogColor.LogColorNever => true, _ => false },
+    }
+}
+
+# log_color_to_int(mode) / log_color_from_int(i) — encode/decode 0..2.
+fn log_color_to_int(mode: LogColor) -> int {
+    return match mode {
+        LogColor.LogColorAuto => 0,
+        LogColor.LogColorAlways => 1,
+        LogColor.LogColorNever => 2,
+    }
+}
+
+fn log_color_from_int(i: int) -> LogColor {
+    if i == 0 { return LogColor.LogColorAuto }
+    if i == 1 { return LogColor.LogColorAlways }
+    if i == 2 { return LogColor.LogColorNever }
+    panic("log_color_from_int: expected 0..2 (auto/always/never), got " + i.to_str())
+}
+
+# log_color_name(mode) — "auto" / "always" / "never".
+fn log_color_name(mode: LogColor) -> str {
+    return match mode {
+        LogColor.LogColorAuto => "auto",
+        LogColor.LogColorAlways => "always",
+        LogColor.LogColorNever => "never",
+    }
+}
+
+# log_color_from_str(s) — parse a --color=<value> CLI flag value
+# (case-insensitive). Bogus values map to Auto (the CLI library owns
+# the strict validation; the log library stays lenient — the same
+# contract as progress_color_from_str).
+fn log_color_from_str(s: str) -> LogColor {
+    let v: str = str_to_lower_ascii(s)
+    if v == "always" { return LogColor.LogColorAlways }
+    if v == "never" { return LogColor.LogColorNever }
+    return LogColor.LogColorAuto
+}
+
+# ----------------------------------------------------------------------------
+# Logger — the explicit configuration value.
+# ----------------------------------------------------------------------------
+# A Logger is a VALUE (Halis has no global mutable state — the level
+# is threaded explicitly, which is exactly what the effect system's
+# security story wants). `log_new()` reads the env + fills pid /
+# hostname ONCE; the pure constructor leaves the placeholders
+# (pid = 0, hostname = "localhost") for deterministic rendering.
+
+struct Logger {
+    level: LogLevel,      # the maximum emitted level (HLS_LOG)
+    format: LogFormat,    # human / json / syslog (HLS_LOG_FORMAT)
+    color: LogColor,      # auto / always / never (the --color surface)
+    app_name: str,        # the human "app:" prefix / syslog TAG
+    pid: int,             # the syslog TAG[PID] field (0 = omit)
+    hostname: str,        # the syslog HOSTNAME field
+}
+
+# log_new() — the live constructor: level from HLS_LOG, format from
+# HLS_LOG_FORMAT, color auto, app "app", pid + hostname from the
+# process. Carries Proc (env reads + the two identity builtins).
+fn log_new() -> Logger uses Proc {
+    let mut level: LogLevel = LogLevel.LogInfo
+    if env_has("HLS_LOG") {
+        level = log_level_from_str(env_get("HLS_LOG"))
+    }
+    let mut format: LogFormat = LogFormat.LogHuman
+    if env_has("HLS_LOG_FORMAT") {
+        format = log_format_from_str(env_get("HLS_LOG_FORMAT"))
+    }
+    return Logger {
+        level: level,
+        format: format,
+        color: LogColor.LogColorAuto,
+        app_name: "app",
+        pid: proc_pid(),
+        hostname: sys_hostname(),
+    }
+}
+
+# log_new_with(level, format, color, app_name) — the PURE constructor
+# (tests + deterministic rendering): pid = 0, hostname = "localhost".
+fn log_new_with(level: LogLevel, format: LogFormat, color: LogColor,
+    app_name: str) -> Logger {
+    return Logger {
+        level: level,
+        format: format,
+        color: color,
+        app_name: app_name,
+        pid: 0,
+        hostname: "localhost",
+    }
+}
+
+# ----------------------------------------------------------------------------
+# Builders (immutable update — the receiver is unchanged; the same
+# convention as cstyle_fg / progress_with_label).
+# ----------------------------------------------------------------------------
+
+# log_with_level(lg, level) — set the maximum emitted level.
+fn log_with_level(lg: Logger, level: LogLevel) -> Logger {
+    return Logger {
+        level: level, format: lg.format, color: lg.color,
+        app_name: lg.app_name, pid: lg.pid, hostname: lg.hostname,
+    }
+}
+
+# log_with_format(lg, format) — set the output format.
+fn log_with_format(lg: Logger, format: LogFormat) -> Logger {
+    return Logger {
+        level: lg.level, format: format, color: lg.color,
+        app_name: lg.app_name, pid: lg.pid, hostname: lg.hostname,
+    }
+}
+
+# log_with_color(lg, mode) — set the color mode.
+fn log_with_color(lg: Logger, mode: LogColor) -> Logger {
+    return Logger {
+        level: lg.level, format: lg.format, color: mode,
+        app_name: lg.app_name, pid: lg.pid, hostname: lg.hostname,
+    }
+}
+
+# log_with_app_name(lg, name) — set the app name (the syslog TAG).
+fn log_with_app_name(lg: Logger, name: str) -> Logger {
+    return Logger {
+        level: lg.level, format: lg.format, color: lg.color,
+        app_name: name, pid: lg.pid, hostname: lg.hostname,
+    }
+}
+
+# log_with_identity(lg, pid, hostname) — set the explicit identity
+# (the syslog TAG[PID] + HOSTNAME fields) for deterministic rendering.
+fn log_with_identity(lg: Logger, pid: int, hostname: str) -> Logger {
+    return Logger {
+        level: lg.level, format: lg.format, color: lg.color,
+        app_name: lg.app_name, pid: pid, hostname: hostname,
+    }
+}
+
+# log_enabled(lg, level) — would a record at this level be emitted?
+# (Pure; Off is never enabled, and a Logger at Off enables nothing.)
+fn log_enabled(lg: Logger, level: LogLevel) -> bool {
+    let o: int = log_level_to_int(level)
+    if o == 0 {
+        return false
+    }
+    return o <= log_level_to_int(lg.level)
+}
+
+# ----------------------------------------------------------------------------
+# LogRecord — the pure record the renderers consume.
+# ----------------------------------------------------------------------------
+
+struct LogRecord {
+    ts_ms: int,           # wall-clock ms since the Unix epoch
+    level: LogLevel,      # the record's level
+    app: str,             # the app name
+    msg: str,             # the message
+    keys: list[str],      # structured keys (parallel to vals)
+    vals: list[str],      # structured values (parallel to keys)
+    pid: int,             # the process id (0 = omit in syslog)
+    hostname: str,        # the host name
+}
+
+# log_new_record(lg, level, msg, keys, vals, ts_ms) — build the record
+# from the Logger's identity + the explicit timestamp (the pure path;
+# log_emit passes system_time_now_ms()). keys/vals lengths must match
+# (a mismatch is a caller bug — panic with a clear message).
+fn log_new_record(lg: Logger, level: LogLevel, msg: str,
+    keys: list[str], vals: list[str], ts_ms: int) -> LogRecord {
+    if keys.len() != vals.len() {
+        panic("log_new_record: keys and vals must have the same length (got "
+            + keys.len().to_str() + " keys, " + vals.len().to_str() + " vals)")
+    }
+    return LogRecord {
+        ts_ms: ts_ms,
+        level: level,
+        app: lg.app_name,
+        msg: msg,
+        keys: keys,
+        vals: vals,
+        pid: lg.pid,
+        hostname: lg.hostname,
+    }
+}
+
+# ----------------------------------------------------------------------------
+# Timestamp math (PURE integer arithmetic — byte-identical between
+# interpreter and native).
+# ----------------------------------------------------------------------------
+# civil_from_days: Howard Hinnant's algorithm (the standard
+# days-since-epoch → (y, m, d) mapping, used by every modern libc's
+# chrono). HLS's `/` is TRUNCATED division (C semantics), so the
+# floor-division the algorithm needs is written explicitly as
+# log_floor_div (b > 0) — which also keeps pre-1970 timestamps
+# (negative ms) rendering correctly.
+
+# log_floor_div(a, b) — floor(a / b) for b > 0 (HLS / truncates).
+fn log_floor_div(a: int, b: int) -> int {
+    let q: int = a / b
+    let r: int = a - q * b
+    if r < 0 {
+        return q - 1
+    }
+    return q
+}
+
+# log_days_to_civil(days) — days since 1970-01-01 → the encoded date
+# YYYYMMDD (e.g. 0 → 19700101; 19723 → 20240229 — the 2024 leap day).
+# Hinnant's civil_from_days, floor-adjusted.
+fn log_days_to_civil(days: int) -> int {
+    let z: int = days + 719468
+    let era: int = log_floor_div(z, 146097)
+    let doe: int = z - era * 146097
+    let yoe: int = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365
+    let y: int = yoe + era * 400
+    let doy: int = doe - (365 * yoe + yoe / 4 - yoe / 100)
+    let mp: int = (5 * doy + 2) / 153
+    let d: int = doy - (153 * mp + 2) / 5 + 1
+    let mut m: int = 0
+    if mp < 10 {
+        m = mp + 3
+    } else {
+        m = mp - 9
+    }
+    if m <= 2 {
+        return (y + 1) * 10000 + m * 100 + d
+    }
+    return y * 10000 + m * 100 + d
+}
+
+# log_pad2(n) / log_pad3(n) — zero-pad to 2 / 3 digits.
+fn log_pad2(n: int) -> str {
+    return str_pad_left(n.to_str(), 2, "0")
+}
+
+fn log_pad3(n: int) -> str {
+    return str_pad_left(n.to_str(), 3, "0")
+}
+
+# log_epoch_ms_to_iso(ts_ms) — ISO 8601 UTC, millisecond precision:
+# "YYYY-MM-DDTHH:MM:SS.mmmZ" (the Z suffix makes the UTC-only policy
+# explicit). Negative ts_ms (pre-1970) renders correctly via the
+# floor-division (e.g. -1 → 1969-12-31T23:59:59.999Z).
+fn log_epoch_ms_to_iso(ts_ms: int) -> str {
+    let days: int = log_floor_div(ts_ms, 86400000)
+    let ms_of_day: int = ts_ms - days * 86400000
+    let civil: int = log_days_to_civil(days)
+    let y: int = civil / 10000
+    let m: int = (civil - y * 10000) / 100
+    let d: int = civil - y * 10000 - m * 100
+    let secs_of_day: int = ms_of_day / 1000
+    let hh: int = secs_of_day / 3600
+    let mm: int = (secs_of_day - hh * 3600) / 60
+    let ss: int = secs_of_day - hh * 3600 - mm * 60
+    let mmm: int = ms_of_day - secs_of_day * 1000
+    return (y / 1000).to_str() + log_pad3(y - (y / 1000) * 1000) + "-"
+        + log_pad2(m) + "-" + log_pad2(d) + "T"
+        + log_pad2(hh) + ":" + log_pad2(mm) + ":" + log_pad2(ss)
+        + "." + log_pad3(mmm) + "Z"
+}
+
+# log_month_name(m) — the RFC 3164 month abbreviations (Jan..Dec).
+fn log_month_name(m: int) -> str {
+    if m == 1 { return "Jan" }
+    if m == 2 { return "Feb" }
+    if m == 3 { return "Mar" }
+    if m == 4 { return "Apr" }
+    if m == 5 { return "May" }
+    if m == 6 { return "Jun" }
+    if m == 7 { return "Jul" }
+    if m == 8 { return "Aug" }
+    if m == 9 { return "Sep" }
+    if m == 10 { return "Oct" }
+    if m == 11 { return "Nov" }
+    return "Dec"
+}
+
+# log_epoch_ms_to_rfc3164(ts_ms) — the RFC 3164 timestamp:
+# "Mmm dd HH:MM:SS" (UTC; the day is SPACE-padded — "Sep  9" — the
+# RFC's quirk; the year is omitted per the RFC's 3164 form).
+fn log_epoch_ms_to_rfc3164(ts_ms: int) -> str {
+    let days: int = log_floor_div(ts_ms, 86400000)
+    let ms_of_day: int = ts_ms - days * 86400000
+    let civil: int = log_days_to_civil(days)
+    let m: int = (civil - (civil / 10000) * 10000) / 100
+    let d: int = civil - (civil / 10000) * 10000 - m * 100
+    let secs_of_day: int = ms_of_day / 1000
+    let hh: int = secs_of_day / 3600
+    let mm: int = (secs_of_day - hh * 3600) / 60
+    let ss: int = secs_of_day - hh * 3600 - mm * 60
+    let day_str: str = str_pad_left(d.to_str(), 2, " ")
+    return log_month_name(m) + " " + day_str + " "
+        + log_pad2(hh) + ":" + log_pad2(mm) + ":" + log_pad2(ss)
+}
+
+# ----------------------------------------------------------------------------
+# JSON escaping (PURE — the log-forging defense).
+# ----------------------------------------------------------------------------
+# log_json_escape(s) — escape a str for a JSON string literal:
+#   "        →  \"
+#   \        →  \\
+#   \n \r \t →  the short escapes
+#   other bytes < 0x20 → \u00XX (lowercase hex)
+#   U+2028 / U+2029 (E2 80 A8 / E2 80 A9 in UTF-8) → \u2028 / \u2029
+#     (JSON-valid but JS-breaking — the classic script-tag /
+#     eval-injection vector; escaping them keeps the line safe to
+#     embed in an HTML page or eval in a JS context).
+# Everything else passes through verbatim (UTF-8 is legal JSON).
+
+fn log_hex2(b: int) -> str {
+    # two lowercase hex digits for 0..255
+    let hi: int = b / 16
+    let lo: int = b - hi * 16
+    let h: str = "0123456789abcdef".slice(hi, hi + 1)
+    let l: str = "0123456789abcdef".slice(lo, lo + 1)
+    return h + l
+}
+
+fn log_json_escape(s: str) -> str {
+    let parts: list[str] = []
+    let n: int = s.len()
+    let mut i: int = 0
+    while i < n {
+        let b: int = s.byte_at(i)
+        # The quote and the backslash.
+        if b == 34 {
+            parts.push("\\\"")
+            i = i + 1
+        } else {
+            if b == 92 {
+                parts.push("\\\\")
+                i = i + 1
+            } else {
+                # The short escapes.
+                if b == 10 {
+                    parts.push("\\n")
+                    i = i + 1
+                } else {
+                    if b == 13 {
+                        parts.push("\\r")
+                        i = i + 1
+                    } else {
+                        if b == 9 {
+                            parts.push("\\t")
+                            i = i + 1
+                        } else {
+                            # U+2028 / U+2029: the 3-byte UTF-8
+                            # sequences E2 80 A8 / E2 80 A9.
+                            if b == 226 && i + 2 < n
+                                && s.byte_at(i + 1) == 128
+                                && (s.byte_at(i + 2) == 168
+                                    || s.byte_at(i + 2) == 169) {
+                                if s.byte_at(i + 2) == 168 {
+                                    parts.push("\\u2028")
+                                } else {
+                                    parts.push("\\u2029")
+                                }
+                                i = i + 3
+                            } else {
+                                # Other control bytes → \u00XX.
+                                if b < 32 {
+                                    parts.push("\\u00" + log_hex2(b))
+                                    i = i + 1
+                                } else {
+                                    # Verbatim pass-through (1 byte).
+                                    parts.push(s.slice(i, i + 1))
+                                    i = i + 1
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return join(parts, "")
+}
+
+# ----------------------------------------------------------------------------
+# The level color palette (human format) + the color resolution.
+# ----------------------------------------------------------------------------
+
+# log_style_error() — red + bold. log_style_warn() — yellow.
+# log_style_info() — green. log_style_debug() — blue.
+# log_style_trace() — magenta. (The env_logger palette.)
+fn log_style_error() -> ColorStyle {
+    return cstyle_bold(cstyle_fg(cstyle_new(), color_red()))
+}
+
+fn log_style_warn() -> ColorStyle {
+    return cstyle_fg(cstyle_new(), color_yellow())
+}
+
+fn log_style_info() -> ColorStyle {
+    return cstyle_fg(cstyle_new(), color_green())
+}
+
+fn log_style_debug() -> ColorStyle {
+    return cstyle_fg(cstyle_new(), color_blue())
+}
+
+fn log_style_trace() -> ColorStyle {
+    return cstyle_fg(cstyle_new(), color_magenta())
+}
+
+# log_style_for_level(level) — the palette entry for a level.
+fn log_style_for_level(level: LogLevel) -> ColorStyle {
+    return match level {
+        LogLevel.LogError => log_style_error(),
+        LogLevel.LogWarn => log_style_warn(),
+        LogLevel.LogInfo => log_style_info(),
+        LogLevel.LogDebug => log_style_debug(),
+        LogLevel.LogTrace => log_style_trace(),
+        LogLevel.LogOff => cstyle_new(),
+    }
+}
+
+# log_resolve_level(mode) — the ColorLevel for a human-format emit:
+#   Never  → ColorNone (no escapes at all)
+#   Always → color_detect() (the std.color env detector)
+#   Auto   → color_detect() when stderr is a TTY, else ColorNone
+# (The same contract as progress_resolve_level — logs and bars agree
+# on one policy.) Carries IO (isatty) + Proc (env reads).
+fn log_resolve_level(mode: LogColor) -> ColorLevel uses IO, Proc {
+    if log_color_eq(mode, LogColor.LogColorNever) {
+        return ColorLevel.ColorNone
+    }
+    if log_color_eq(mode, LogColor.LogColorAlways) {
+        return color_detect()
+    }
+    if isatty(2) {
+        return color_detect()
+    }
+    return ColorLevel.ColorNone
+}
+
+# ----------------------------------------------------------------------------
+# The three renderers (PURE — the differential-safe core).
+# ----------------------------------------------------------------------------
+
+# log_kv_pairs(rec) — the "k=v" tokens joined with single spaces
+# ("port=8080 workers=4"); "" when there are no pairs. The human and
+# syslog formats append this after the message.
+fn log_kv_pairs(rec: LogRecord) -> str {
+    let parts: list[str] = []
+    let mut i: int = 0
+    while i < rec.keys.len() {
+        parts.push(rec.keys.get(i) + "=" + rec.vals.get(i))
+        i = i + 1
+    }
+    return join(parts, " ")
+}
+
+# log_render_human(rec, level) — the human line:
+#   2026-09-09T10:00:00.123Z INFO  myapp: server started port=8080
+# ISO-8601 UTC + the 5-wide level token + "app:" + message + kvs.
+# The level token is colored at the given ColorLevel (ERROR red+bold,
+# WARN yellow, INFO green, DEBUG blue, TRACE magenta); at ColorNone
+# the whole line is escape-free (TERM=dumb safe — the styles carry
+# only fg colors, which std.color drops at None; ERROR's bold is
+# applied only at >= Basic, the std.progress discipline).
+fn log_render_human(rec: LogRecord, level: ColorLevel) -> str {
+    let parts: list[str] = []
+    parts.push(log_epoch_ms_to_iso(rec.ts_ms))
+    let token: str = log_level_token(rec.level)
+    if color_level_ge(level, ColorLevel.ColorBasic) {
+        parts.push(color_render(token, log_style_for_level(rec.level), level))
+    } else {
+        parts.push(token)
+    }
+    parts.push(rec.app + ":")
+    parts.push(rec.msg)
+    let kv: str = log_kv_pairs(rec)
+    if kv != "" {
+        parts.push(kv)
+    }
+    return join(parts, " ")
+}
+
+# log_render_json(rec) — the JSON Lines line (one object per line):
+#   {"ts":"2026-09-09T10:00:00.123Z","level":"info","app":"myapp",
+#    "msg":"server started","port":"8080"}
+# Fixed key order (ts, level, app, msg, then the pairs in call order);
+# every string fully escaped (log_json_escape — the log-forging
+# defense: newlines cannot forge new records).
+fn log_render_json(rec: LogRecord) -> str {
+    let parts: list[str] = []
+    parts.push("\"ts\":\"" + log_json_escape(log_epoch_ms_to_iso(rec.ts_ms)) + "\"")
+    parts.push("\"level\":\"" + log_json_escape(log_level_name(rec.level)) + "\"")
+    parts.push("\"app\":\"" + log_json_escape(rec.app) + "\"")
+    parts.push("\"msg\":\"" + log_json_escape(rec.msg) + "\"")
+    let mut i: int = 0
+    while i < rec.keys.len() {
+        parts.push("\"" + log_json_escape(rec.keys.get(i)) + "\":\""
+            + log_json_escape(rec.vals.get(i)) + "\"")
+        i = i + 1
+    }
+    return "{" + join(parts, ",") + "}"
+}
+
+# log_syslog_severity(level) — the RFC 3164 severity (facility 1,
+# user): error → 3 (err), warn → 4 (warning), info → 6
+# (informational), debug / trace → 7 (debug).
+fn log_syslog_severity(level: LogLevel) -> int {
+    return match level {
+        LogLevel.LogError => 3,
+        LogLevel.LogWarn => 4,
+        LogLevel.LogInfo => 6,
+        LogLevel.LogDebug => 7,
+        LogLevel.LogTrace => 7,
+        LogLevel.LogOff => 7,
+    }
+}
+
+# log_render_syslog(rec) — the RFC 3164 line:
+#   <14>Sep  9 10:00:00 myhost myapp[1234]: server started port=8080
+# PRI = 8 + severity (user facility); pid == 0 omits "[PID]"
+# (the pure constructor's placeholder); the message part carries the
+# kvs. No colors (syslog is a wire format — escapes would corrupt it).
+fn log_render_syslog(rec: LogRecord) -> str {
+    let pri: int = 8 + log_syslog_severity(rec.level)
+    let mut tag: str = ""
+    if rec.pid > 0 {
+        tag = rec.app + "[" + rec.pid.to_str() + "]:"
+    } else {
+        tag = rec.app + ":"
+    }
+    let parts: list[str] = [rec.msg]
+    let kv: str = log_kv_pairs(rec)
+    if kv != "" {
+        parts.push(kv)
+    }
+    return "<" + pri.to_str() + ">" + log_epoch_ms_to_rfc3164(rec.ts_ms)
+        + " " + rec.hostname + " " + tag + " " + join(parts, " ")
+}
+
+# log_render(rec, format, level) — dispatch by format (pure).
+# (The ColorLevel argument applies to the human format only.)
+fn log_render(rec: LogRecord, format: LogFormat, level: ColorLevel) -> str {
+    return match format {
+        LogFormat.LogHuman => log_render_human(rec, level),
+        LogFormat.LogJson => log_render_json(rec),
+        LogFormat.LogSyslog => log_render_syslog(rec),
+    }
+}
+
+# ----------------------------------------------------------------------------
+# The live emit path (the thin IO shells).
+# ----------------------------------------------------------------------------
+# One protocol for every emit:
+#   1. log_enabled is false → return immediately (zero work).
+#   2. The record is built from the Logger's identity + the LIVE wall
+#      clock (system_time_now_ms — Clock).
+#   3. The line renders via the Logger's format (pure) — the human
+#      format resolves the color mode first (IO + Proc).
+#   4. The line goes to STDERR via eprintln (IO; stdout is flushed
+#      first, so data + logs keep the caller's logical order).
+#
+# The emitted line carries LIVE values (ts / pid / hostname) that
+# differ between the interpreter process and the native binary — the
+# pure render functions above are the differential surface; this path
+# is smoke-tested (exit 0) by the acceptance target.
+
+# log_emit(lg, level, msg, keys, vals) — the general emit.
+fn log_emit(lg: Logger, level: LogLevel, msg: str,
+    keys: list[str], vals: list[str]) -> void uses IO, Clock, Proc {
+    if !log_enabled(lg, level) {
+        return
+    }
+    let ts: int = system_time_now_ms()
+    let rec: LogRecord = log_new_record(lg, level, msg, keys, vals, ts)
+    let color_level: ColorLevel = log_resolve_level(lg.color)
+    eprintln(log_render(rec, lg.format, color_level))
+}
+
+# log_log(lg, level, msg) — the message-only general emit (the
+# roadmap's macro forms all funnel here).
+fn log_log(lg: Logger, level: LogLevel, msg: str) -> void uses IO, Clock, Proc {
+    log_emit(lg, level, msg, [], [])
+}
+
+# The five macro-style levels (free-function form — the roadmap's
+# info! / warn! / error! / debug! / trace! mapped to functions, the
+# same convention std.fmt used for format!).
+
+fn log_error(lg: Logger, msg: str) -> void uses IO, Clock, Proc {
+    log_log(lg, LogLevel.LogError, msg)
+}
+
+fn log_warn(lg: Logger, msg: str) -> void uses IO, Clock, Proc {
+    log_log(lg, LogLevel.LogWarn, msg)
+}
+
+fn log_info(lg: Logger, msg: str) -> void uses IO, Clock, Proc {
+    log_log(lg, LogLevel.LogInfo, msg)
+}
+
+fn log_debug(lg: Logger, msg: str) -> void uses IO, Clock, Proc {
+    log_log(lg, LogLevel.LogDebug, msg)
+}
+
+fn log_trace(lg: Logger, msg: str) -> void uses IO, Clock, Proc {
+    log_log(lg, LogLevel.LogTrace, msg)
+}
+
+# The structured key-value forms (parallel lists — the std.json
+# json_object convention).
+
+fn log_error_kv(lg: Logger, msg: str, keys: list[str], vals: list[str])
+    -> void uses IO, Clock, Proc {
+    log_emit(lg, LogLevel.LogError, msg, keys, vals)
+}
+
+fn log_warn_kv(lg: Logger, msg: str, keys: list[str], vals: list[str])
+    -> void uses IO, Clock, Proc {
+    log_emit(lg, LogLevel.LogWarn, msg, keys, vals)
+}
+
+fn log_info_kv(lg: Logger, msg: str, keys: list[str], vals: list[str])
+    -> void uses IO, Clock, Proc {
+    log_emit(lg, LogLevel.LogInfo, msg, keys, vals)
+}
+
+fn log_debug_kv(lg: Logger, msg: str, keys: list[str], vals: list[str])
+    -> void uses IO, Clock, Proc {
+    log_emit(lg, LogLevel.LogDebug, msg, keys, vals)
+}
+
+fn log_trace_kv(lg: Logger, msg: str, keys: list[str], vals: list[str])
+    -> void uses IO, Clock, Proc {
+    log_emit(lg, LogLevel.LogTrace, msg, keys, vals)
+}
+
+# ----------------------------------------------------------------------------
+# Method-call form — the roadmap's macro surface.
+# ----------------------------------------------------------------------------
+# `impl Logger { ... }` gives the closest HLS gets to the macros
+# before Stage 113+: the logger VALUE owns its level, and the emits
+# read as the familiar one-liners:
+#
+#   let lg: Logger = log_new()
+#   lg.error_kv("disk almost full", ["pct"], [(97).to_str()])
+#   lg.info("server started")
+#
+# The live methods carry IO + Clock + Proc; the pure helpers
+# (is_enabled / render) carry nothing.
+
+impl Logger {
+    # with_level(level) / with_format(format) / with_color(mode) /
+    # with_app_name(name) / with_identity(pid, hostname) — the
+    # immutable builders (method twins of the free functions).
+    fn with_level(self: Logger, level: LogLevel) -> Logger {
+        return log_with_level(self, level)
+    }
+
+    fn with_format(self: Logger, format: LogFormat) -> Logger {
+        return log_with_format(self, format)
+    }
+
+    fn with_color(self: Logger, mode: LogColor) -> Logger {
+        return log_with_color(self, mode)
+    }
+
+    fn with_app_name(self: Logger, name: str) -> Logger {
+        return log_with_app_name(self, name)
+    }
+
+    fn with_identity(self: Logger, pid: int, hostname: str) -> Logger {
+        return log_with_identity(self, pid, hostname)
+    }
+
+    # is_enabled(level) — would a record at this level be emitted?
+    fn is_enabled(self: Logger, level: LogLevel) -> bool {
+        return log_enabled(self, level)
+    }
+
+    # log(level, msg) / log_kv(level, msg, keys, vals) — the general
+    # emits (method form).
+    fn log(self: Logger, level: LogLevel, msg: str) -> void uses IO, Clock, Proc {
+        log_log(self, level, msg)
+    }
+
+    fn log_kv(self: Logger, level: LogLevel, msg: str,
+        keys: list[str], vals: list[str]) -> void uses IO, Clock, Proc {
+        log_emit(self, level, msg, keys, vals)
+    }
+
+    # error / warn / info / debug / trace — the roadmap's macro names
+    # (method form).
+    fn error(self: Logger, msg: str) -> void uses IO, Clock, Proc {
+        log_error(self, msg)
+    }
+
+    fn warn(self: Logger, msg: str) -> void uses IO, Clock, Proc {
+        log_warn(self, msg)
+    }
+
+    fn info(self: Logger, msg: str) -> void uses IO, Clock, Proc {
+        log_info(self, msg)
+    }
+
+    fn debug(self: Logger, msg: str) -> void uses IO, Clock, Proc {
+        log_debug(self, msg)
+    }
+
+    fn trace(self: Logger, msg: str) -> void uses IO, Clock, Proc {
+        log_trace(self, msg)
+    }
+
+    # error_kv / warn_kv / info_kv / debug_kv / trace_kv — the
+    # structured forms (method form).
+    fn error_kv(self: Logger, msg: str, keys: list[str], vals: list[str])
+        -> void uses IO, Clock, Proc {
+        log_error_kv(self, msg, keys, vals)
+    }
+
+    fn warn_kv(self: Logger, msg: str, keys: list[str], vals: list[str])
+        -> void uses IO, Clock, Proc {
+        log_warn_kv(self, msg, keys, vals)
+    }
+
+    fn info_kv(self: Logger, msg: str, keys: list[str], vals: list[str])
+        -> void uses IO, Clock, Proc {
+        log_info_kv(self, msg, keys, vals)
+    }
+
+    fn debug_kv(self: Logger, msg: str, keys: list[str], vals: list[str])
+        -> void uses IO, Clock, Proc {
+        log_debug_kv(self, msg, keys, vals)
+    }
+
+    fn trace_kv(self: Logger, msg: str, keys: list[str], vals: list[str])
+        -> void uses IO, Clock, Proc {
+        log_trace_kv(self, msg, keys, vals)
+    }
+
+    # render(rec, color_level) — the pure render through the Logger's
+    # own format (method form; for the human format pass the resolved
+    # ColorLevel).
+    fn render(self: Logger, rec: LogRecord, color_level: ColorLevel) -> str {
+        return log_render(rec, self.format, color_level)
+    }
+}

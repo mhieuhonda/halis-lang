@@ -1,0 +1,570 @@
+# tests/ok/feat_stage57_log.hls — Stage 57 (v0.76.0-alpha): std.log.
+#
+# Exercises every public API of std.log:
+#   - LogLevel: eq / to_int / from_int / name / token / from_str
+#     (the warning alias; case-insensitive; bogus + empty -> info)
+#   - LogFormat: eq / to_int / from_int / name / from_str
+#   - LogColor: eq / to_int / from_int / name / from_str
+#   - log_enabled: the full 6x6 filtering matrix
+#   - log_new_with (pure constructor) + the five builders
+#     (with_level / with_format / with_color / with_app_name /
+#     with_identity — immutable: the receiver is proven unchanged)
+#     + the method twins + .is_enabled / .render parity
+#   - Timestamps: log_epoch_ms_to_iso / log_epoch_ms_to_rfc3164 over
+#     the edge cases (epoch 0, 999 ms, -1 ms, the 2000 / 2024 leap
+#     days, 2100-01-01 — NOT a leap year, the day boundary) +
+#     log_month_name (all 12) + log_days_to_civil + log_floor_div
+#   - log_json_escape: the full table (quote, backslash, \n, \t, \r,
+#     control bytes \u00XX, the JS-breaking U+2028 / U+2029 built from
+#     raw bytes) + the hostile multi-line message (log-forging defense)
+#   - Renderers — exact strings:
+#     * human: every level at ColorNone (escape-free) and at Basic
+#       (byte-exact SGR: red+bold ERROR, yellow WARN, green INFO,
+#       blue DEBUG, magenta TRACE)
+#     * json: the fixed key order + escaping + the kv pairs
+#     * syslog: PRI per level (11/12/14/15/15), the space-padded day,
+#       TAG[PID] with pid > 0, TAG without pid when pid == 0
+#   - log_render dispatch (format selection) + log_kv_pairs
+#   - Live smoke: log_new() (pid > 0, hostname non-empty, level from
+#     the env — identical between the two backends), live emits through
+#     every level and format (stderr — NOT byte-compared: the live ts
+#     and pid necessarily differ between the interpreter and native
+#     processes; the pure renders above are the differential surface),
+#     level suppression on the live path
+#
+# All string assertions are byte-exact (pure functions of fixed
+# ts_ms / pid / hostname / ColorLevel). The differential test
+# (interpreter == native) is verified via the Makefile's
+# log-acceptance target.
+
+import "std.log"
+import "std.str"
+
+# ============================================================================
+# Helpers
+# ============================================================================
+
+fn ok(actual: bool, msg: str) -> void uses IO {
+    if !actual {
+        panic("FAIL " + msg)
+    }
+}
+
+fn eq_int(actual: int, expected: int, msg: str) -> void uses IO {
+    if actual != expected {
+        panic("FAIL " + msg + ": expected " + expected.to_str() + ", got " + actual.to_str())
+    }
+}
+
+fn eq_str(actual: str, expected: str, msg: str) -> void uses IO {
+    if actual != expected {
+        panic("FAIL " + msg + ": expected '" + expected + "' (" + expected.len().to_str() + " bytes), got '" + actual + "' (" + actual.len().to_str() + " bytes)")
+    }
+}
+
+fn eq_bool(actual: bool, expected: bool, msg: str) -> void uses IO {
+    if actual != expected {
+        panic("FAIL " + msg + ": expected " + expected.to_str() + ", got " + actual.to_str())
+    }
+}
+
+# A fixed synthetic timestamp: 2025-09-09T12:40:00.123Z.
+fn ts() -> int { return 1757421600123 }
+
+# A pure logger with a fixed identity (pid 1234, host web01).
+fn lg(level: LogLevel, format: LogFormat) -> Logger {
+    return log_with_identity(
+        log_new_with(level, format, LogColor.LogColorNever, "myapp"),
+        1234, "web01")
+}
+
+# ============================================================================
+# LogLevel — encoding, names, tokens, parsing.
+# ============================================================================
+
+fn test_log_level() -> int uses IO {
+    eq_int(log_level_to_int(LogLevel.LogOff), 0, "off 0")
+    eq_int(log_level_to_int(LogLevel.LogError), 1, "error 1")
+    eq_int(log_level_to_int(LogLevel.LogWarn), 2, "warn 2")
+    eq_int(log_level_to_int(LogLevel.LogInfo), 3, "info 3")
+    eq_int(log_level_to_int(LogLevel.LogDebug), 4, "debug 4")
+    eq_int(log_level_to_int(LogLevel.LogTrace), 5, "trace 5")
+
+    eq_bool(log_level_eq(LogLevel.LogInfo, LogLevel.LogInfo), true, "eq info")
+    eq_bool(log_level_eq(LogLevel.LogInfo, LogLevel.LogWarn), false, "neq info warn")
+
+    eq_int(log_level_to_int(log_level_from_int(5)), 5, "from_int roundtrip")
+    eq_int(log_level_to_int(log_level_from_int(0)), 0, "from_int 0")
+
+    eq_str(log_level_name(LogLevel.LogOff), "off", "name off")
+    eq_str(log_level_name(LogLevel.LogError), "error", "name error")
+    eq_str(log_level_name(LogLevel.LogWarn), "warn", "name warn")
+    eq_str(log_level_name(LogLevel.LogInfo), "info", "name info")
+    eq_str(log_level_name(LogLevel.LogDebug), "debug", "name debug")
+    eq_str(log_level_name(LogLevel.LogTrace), "trace", "name trace")
+
+    eq_str(log_level_token(LogLevel.LogError), "ERROR", "token error")
+    eq_str(log_level_token(LogLevel.LogWarn), "WARN ", "token warn (5-wide)")
+    eq_str(log_level_token(LogLevel.LogInfo), "INFO ", "token info (5-wide)")
+    eq_str(log_level_token(LogLevel.LogDebug), "DEBUG", "token debug")
+    eq_str(log_level_token(LogLevel.LogTrace), "TRACE", "token trace")
+    eq_int(log_level_token(LogLevel.LogError).len(), 5, "tokens are 5-wide")
+
+    # from_str: names + the warning alias, case-insensitive, lenient.
+    eq_int(log_level_to_int(log_level_from_str("trace")), 5, "parse trace")
+    eq_int(log_level_to_int(log_level_from_str("TRACE")), 5, "parse TRACE")
+    eq_int(log_level_to_int(log_level_from_str("Debug")), 4, "parse Debug")
+    eq_int(log_level_to_int(log_level_from_str("info")), 3, "parse info")
+    eq_int(log_level_to_int(log_level_from_str("warn")), 2, "parse warn")
+    eq_int(log_level_to_int(log_level_from_str("warning")), 2, "parse warning alias")
+    eq_int(log_level_to_int(log_level_from_str("error")), 1, "parse error")
+    eq_int(log_level_to_int(log_level_from_str("off")), 0, "parse off")
+    eq_int(log_level_to_int(log_level_from_str("bogus")), 3, "parse bogus -> info")
+    eq_int(log_level_to_int(log_level_from_str("")), 3, "parse empty -> info")
+    return 0
+}
+
+# ============================================================================
+# LogFormat + LogColor — encoding, names, parsing.
+# ============================================================================
+
+fn test_format_color() -> int uses IO {
+    eq_int(log_format_to_int(LogFormat.LogHuman), 0, "human 0")
+    eq_int(log_format_to_int(LogFormat.LogJson), 1, "json 1")
+    eq_int(log_format_to_int(LogFormat.LogSyslog), 2, "syslog 2")
+    eq_bool(log_format_eq(LogFormat.LogJson, LogFormat.LogJson), true, "fmt eq")
+    eq_bool(log_format_eq(LogFormat.LogJson, LogFormat.LogHuman), false, "fmt neq")
+    eq_int(log_format_to_int(log_format_from_int(2)), 2, "fmt from_int")
+    eq_str(log_format_name(LogFormat.LogHuman), "human", "fmt name human")
+    eq_str(log_format_name(LogFormat.LogJson), "json", "fmt name json")
+    eq_str(log_format_name(LogFormat.LogSyslog), "syslog", "fmt name syslog")
+    eq_int(log_format_to_int(log_format_from_str("json")), 1, "fmt parse json")
+    eq_int(log_format_to_int(log_format_from_str("SYSLOG")), 2, "fmt parse SYSLOG")
+    eq_int(log_format_to_int(log_format_from_str("Human")), 0, "fmt parse Human")
+    eq_int(log_format_to_int(log_format_from_str("bogus")), 0, "fmt parse bogus -> human")
+    eq_int(log_format_to_int(log_format_from_str("")), 0, "fmt parse empty -> human")
+
+    eq_int(log_color_to_int(LogColor.LogColorAuto), 0, "color auto 0")
+    eq_int(log_color_to_int(LogColor.LogColorAlways), 1, "color always 1")
+    eq_int(log_color_to_int(LogColor.LogColorNever), 2, "color never 2")
+    eq_bool(log_color_eq(LogColor.LogColorNever, LogColor.LogColorNever), true, "color eq")
+    eq_bool(log_color_eq(LogColor.LogColorNever, LogColor.LogColorAuto), false, "color neq")
+    eq_int(log_color_to_int(log_color_from_int(1)), 1, "color from_int")
+    eq_str(log_color_name(LogColor.LogColorAuto), "auto", "color name auto")
+    eq_str(log_color_name(LogColor.LogColorAlways), "always", "color name always")
+    eq_str(log_color_name(LogColor.LogColorNever), "never", "color name never")
+    eq_int(log_color_to_int(log_color_from_str("always")), 1, "color parse always")
+    eq_int(log_color_to_int(log_color_from_str("NEVER")), 2, "color parse NEVER")
+    eq_int(log_color_to_int(log_color_from_str("bogus")), 0, "color parse bogus -> auto")
+    eq_int(log_color_to_int(log_color_from_str("")), 0, "color parse empty -> auto")
+    return 0
+}
+
+# ============================================================================
+# log_enabled — the full filtering matrix.
+# ============================================================================
+
+fn test_filtering() -> int uses IO {
+    let logger_levels: list[LogLevel] = [
+        LogLevel.LogOff, LogLevel.LogError, LogLevel.LogWarn,
+        LogLevel.LogInfo, LogLevel.LogDebug, LogLevel.LogTrace,
+    ]
+    let record_levels: list[LogLevel] = [
+        LogLevel.LogError, LogLevel.LogWarn, LogLevel.LogInfo,
+        LogLevel.LogDebug, LogLevel.LogTrace,
+    ]
+    # expected[logger][record] — the order test.
+    let exp: list[str] = [
+        "00000",
+        "10000",
+        "11000",
+        "11100",
+        "11110",
+        "11111",
+    ]
+    let mut i: int = 0
+    while i < logger_levels.len() {
+        let l: Logger = log_new_with(logger_levels.get(i), LogFormat.LogHuman,
+            LogColor.LogColorNever, "app")
+        let mut row: str = ""
+        let mut j: int = 0
+        while j < record_levels.len() {
+            if log_enabled(l, record_levels.get(j)) {
+                row = row + "1"
+            } else {
+                row = row + "0"
+            }
+            j = j + 1
+        }
+        eq_str(row, exp.get(i), "filter matrix row " + i.to_str())
+        # Off is never enabled — even as a record level.
+        eq_bool(log_enabled(l, LogLevel.LogOff), false, "off never enabled")
+        i = i + 1
+    }
+    return 0
+}
+
+# ============================================================================
+# Constructors + builders (immutable) + method twins.
+# ============================================================================
+
+fn test_builders() -> int uses IO {
+    let base: Logger = log_new_with(LogLevel.LogInfo, LogFormat.LogHuman,
+        LogColor.LogColorNever, "app")
+    eq_int(base.pid, 0, "pure constructor pid placeholder")
+    eq_str(base.hostname, "localhost", "pure constructor hostname placeholder")
+
+    let lv: Logger = log_with_level(base, LogLevel.LogTrace)
+    eq_int(log_level_to_int(lv.level), 5, "with_level")
+    eq_int(log_level_to_int(base.level), 3, "with_level receiver unchanged")
+
+    let fm: Logger = log_with_format(base, LogFormat.LogSyslog)
+    eq_int(log_format_to_int(fm.format), 2, "with_format")
+    eq_int(log_format_to_int(base.format), 0, "with_format receiver unchanged")
+
+    let cl: Logger = log_with_color(base, LogColor.LogColorAlways)
+    eq_int(log_color_to_int(cl.color), 1, "with_color")
+    eq_int(log_color_to_int(base.color), 2, "with_color receiver unchanged")
+
+    let an: Logger = log_with_app_name(base, "web01")
+    eq_str(an.app_name, "web01", "with_app_name")
+    eq_str(base.app_name, "app", "with_app_name receiver unchanged")
+
+    let id: Logger = log_with_identity(base, 1234, "web01")
+    eq_int(id.pid, 1234, "with_identity pid")
+    eq_str(id.hostname, "web01", "with_identity hostname")
+    eq_int(base.pid, 0, "with_identity receiver unchanged")
+
+    # Method twins — byte-identical to the free functions.
+    let m: Logger = base.with_app_name("m").with_identity(77, "h")
+        .with_format(LogFormat.LogJson).with_level(LogLevel.LogError)
+        .with_color(LogColor.LogColorAlways)
+    eq_str(m.app_name, "m", "method with_app_name")
+    eq_int(m.pid, 77, "method with_identity")
+    eq_int(log_format_to_int(m.format), 1, "method with_format")
+    eq_int(log_level_to_int(m.level), 1, "method with_level")
+    eq_int(log_color_to_int(m.color), 1, "method with_color")
+    eq_bool(m.is_enabled(LogLevel.LogError), true, "method is_enabled true")
+    eq_bool(m.is_enabled(LogLevel.LogInfo), false, "method is_enabled false")
+
+    # .render parity with log_render at the logger's own format.
+    let rec: LogRecord = log_new_record(m, LogLevel.LogError, "msg", ["k"], ["v"], ts())
+    eq_str(m.render(rec, ColorLevel.ColorNone),
+        log_render(rec, LogFormat.LogJson, ColorLevel.ColorNone),
+        "method .render == log_render (json)")
+    return 0
+}
+
+# ============================================================================
+# Timestamp math — ISO + RFC 3164 over the edge cases.
+# ============================================================================
+
+fn test_timestamps() -> int uses IO {
+    # The epoch + sub-second.
+    eq_str(log_epoch_ms_to_iso(0), "1970-01-01T00:00:00.000Z", "iso epoch")
+    eq_str(log_epoch_ms_to_iso(999), "1970-01-01T00:00:00.999Z", "iso 999ms")
+    eq_str(log_epoch_ms_to_rfc3164(0), "Jan  1 00:00:00", "rfc epoch")
+    # Pre-epoch (the floor-division path).
+    eq_str(log_epoch_ms_to_iso(-1), "1969-12-31T23:59:59.999Z", "iso -1ms")
+    eq_str(log_epoch_ms_to_rfc3164(-1), "Dec 31 23:59:59", "rfc -1ms")
+    # Day boundary.
+    eq_str(log_epoch_ms_to_iso(86399999), "1970-01-01T23:59:59.999Z", "iso day boundary")
+    eq_str(log_epoch_ms_to_iso(86400000), "1970-01-02T00:00:00.000Z", "iso next day")
+    # The leap days.
+    eq_str(log_epoch_ms_to_iso(951782400000), "2000-02-29T00:00:00.000Z", "iso 2000 leap")
+    eq_str(log_epoch_ms_to_iso(1709164800000), "2024-02-29T00:00:00.000Z", "iso 2024 leap")
+    eq_str(log_epoch_ms_to_rfc3164(1709164800000), "Feb 29 00:00:00", "rfc 2024 leap")
+    # 2100 is NOT a leap year (the 400-year rule).
+    eq_str(log_epoch_ms_to_iso(4102444800000), "2100-01-01T00:00:00.000Z", "iso 2100")
+    # The demo timestamp.
+    eq_str(log_epoch_ms_to_iso(1757421600123), "2025-09-09T12:40:00.123Z", "iso demo ts")
+    eq_str(log_epoch_ms_to_rfc3164(1757421600123), "Sep  9 12:40:00", "rfc demo ts (space-padded day)")
+
+    # The civil-date encoding.
+    eq_int(log_days_to_civil(0), 19700101, "civil epoch")
+    eq_int(log_days_to_civil(19782), 20240229, "civil 2024-02-29")
+    eq_int(log_days_to_civil(-1), 19691231, "civil -1 day")
+    eq_int(log_days_to_civil(10957), 20000101, "civil 2000-01-01")
+
+    # The floor division (truncated-division adjustment).
+    eq_int(log_floor_div(7, 2), 3, "floor 7/2")
+    eq_int(log_floor_div(-7, 2), -4, "floor -7/2")
+    eq_int(log_floor_div(-6, 2), -3, "floor -6/2")
+    eq_int(log_floor_div(0, 5), 0, "floor 0/5")
+
+    # All 12 month abbreviations.
+    eq_str(log_month_name(1), "Jan", "Jan")
+    eq_str(log_month_name(2), "Feb", "Feb")
+    eq_str(log_month_name(3), "Mar", "Mar")
+    eq_str(log_month_name(4), "Apr", "Apr")
+    eq_str(log_month_name(5), "May", "May")
+    eq_str(log_month_name(6), "Jun", "Jun")
+    eq_str(log_month_name(7), "Jul", "Jul")
+    eq_str(log_month_name(8), "Aug", "Aug")
+    eq_str(log_month_name(9), "Sep", "Sep")
+    eq_str(log_month_name(10), "Oct", "Oct")
+    eq_str(log_month_name(11), "Nov", "Nov")
+    eq_str(log_month_name(12), "Dec", "Dec")
+    return 0
+}
+
+# ============================================================================
+# JSON escaping — the full table.
+# ============================================================================
+
+fn test_json_escape() -> int uses IO {
+    eq_str(log_json_escape("hello world"), "hello world", "json plain")
+    eq_str(log_json_escape("say \"hi\""), "say \\\"hi\\\"", "json quote")
+    eq_str(log_json_escape("C:\\path\\file"), "C:\\\\path\\\\file", "json backslash")
+    eq_str(log_json_escape("line1\nline2"), "line1\\nline2", "json newline")
+    eq_str(log_json_escape("col1\tcol2"), "col1\\tcol2", "json tab")
+    eq_str(log_json_escape("mac" + chr(13)), "mac\\r", "json cr")
+    eq_str(log_json_escape(chr(1) + "x"), "\\u0001x", "json ctrl 01")
+    eq_str(log_json_escape("x" + chr(31)), "x\\u001f", "json ctrl 1f")
+    eq_str(log_json_escape("x" + chr(0) + "y"), "x\\u0000y", "json NUL")
+
+    # U+2028 / U+2029 — built from raw bytes so the source stays ASCII.
+    let u2028: str = chr(226) + chr(128) + chr(168)
+    let u2029: str = chr(226) + chr(128) + chr(169)
+    eq_str(log_json_escape("a" + u2028 + "b"), "a\\u2028b", "json u2028")
+    eq_str(log_json_escape("a" + u2029 + "b"), "a\\u2029b", "json u2029")
+    # A lookalike that must NOT be escaped (E2 80 A7).
+    let lookalike: str = chr(226) + chr(128) + chr(167)
+    eq_str(log_json_escape("a" + lookalike + "b"), "a" + lookalike + "b", "json lookalike verbatim")
+
+    # UTF-8 passes through verbatim.
+    eq_str(log_json_escape("héllo → ☃"), "héllo → ☃", "json utf8 verbatim")
+    return 0
+}
+
+# ============================================================================
+# Renderers — exact strings.
+# ============================================================================
+
+fn test_render_human() -> int uses IO {
+    let e: str = chr(27)
+
+    # ColorNone: escape-free, aligned tokens.
+    let rec: LogRecord = log_new_record(lg(LogLevel.LogInfo, LogFormat.LogHuman),
+        LogLevel.LogInfo, "server started", ["port", "workers"], ["8080", "4"], ts())
+    eq_str(log_render_human(rec, ColorLevel.ColorNone),
+        "2025-09-09T12:40:00.123Z INFO  myapp: server started port=8080 workers=4",
+        "human info none")
+
+    # No kvs: no trailing space.
+    let rec2: LogRecord = log_new_record(lg(LogLevel.LogInfo, LogFormat.LogHuman),
+        LogLevel.LogInfo, "plain", [], [], ts())
+    eq_str(log_render_human(rec2, ColorLevel.ColorNone),
+        "2025-09-09T12:40:00.123Z INFO  myapp: plain", "human no kv")
+
+    # Every level at ColorNone (5-wide tokens).
+    let err: LogRecord = log_new_record(lg(LogLevel.LogInfo, LogFormat.LogHuman),
+        LogLevel.LogError, "m", [], [], ts())
+    eq_str(log_render_human(err, ColorLevel.ColorNone),
+        "2025-09-09T12:40:00.123Z ERROR myapp: m", "human error none")
+    let wrn: LogRecord = log_new_record(lg(LogLevel.LogInfo, LogFormat.LogHuman),
+        LogLevel.LogWarn, "m", [], [], ts())
+    eq_str(log_render_human(wrn, ColorLevel.ColorNone),
+        "2025-09-09T12:40:00.123Z WARN  myapp: m", "human warn none")
+    let dbg: LogRecord = log_new_record(lg(LogLevel.LogInfo, LogFormat.LogHuman),
+        LogLevel.LogDebug, "m", [], [], ts())
+    eq_str(log_render_human(dbg, ColorLevel.ColorNone),
+        "2025-09-09T12:40:00.123Z DEBUG myapp: m", "human debug none")
+    let trc: LogRecord = log_new_record(lg(LogLevel.LogInfo, LogFormat.LogHuman),
+        LogLevel.LogTrace, "m", [], [], ts())
+    eq_str(log_render_human(trc, ColorLevel.ColorNone),
+        "2025-09-09T12:40:00.123Z TRACE myapp: m", "human trace none")
+
+    # Basic: byte-exact SGR spans (red+bold / yellow / green / blue / magenta).
+    eq_str(log_render_human(err, ColorLevel.ColorBasic),
+        "2025-09-09T12:40:00.123Z " + e + "[31;1mERROR" + e + "[0m myapp: m",
+        "human error basic")
+    eq_str(log_render_human(wrn, ColorLevel.ColorBasic),
+        "2025-09-09T12:40:00.123Z " + e + "[33mWARN " + e + "[0m myapp: m",
+        "human warn basic")
+    eq_str(log_render_human(rec, ColorLevel.ColorBasic),
+        "2025-09-09T12:40:00.123Z " + e + "[32mINFO " + e + "[0m myapp: server started port=8080 workers=4",
+        "human info basic")
+    eq_str(log_render_human(dbg, ColorLevel.ColorBasic),
+        "2025-09-09T12:40:00.123Z " + e + "[34mDEBUG" + e + "[0m myapp: m",
+        "human debug basic")
+    eq_str(log_render_human(trc, ColorLevel.ColorBasic),
+        "2025-09-09T12:40:00.123Z " + e + "[35mTRACE" + e + "[0m myapp: m",
+        "human trace basic")
+
+    # 256 / truecolor: the same basic-palette colors (graceful
+    # degradation — no extra information appears).
+    eq_str(log_render_human(rec, ColorLevel.Color256),
+        log_render_human(rec, ColorLevel.ColorBasic), "human 256 == basic")
+    eq_str(log_render_human(rec, ColorLevel.ColorTruecolor),
+        log_render_human(rec, ColorLevel.ColorBasic), "human truecolor == basic")
+
+    # log_kv_pairs.
+    eq_str(log_kv_pairs(rec), "port=8080 workers=4", "kv pairs")
+    eq_str(log_kv_pairs(rec2), "", "kv pairs empty")
+    return 0
+}
+
+fn test_render_json() -> int uses IO {
+    let rec: LogRecord = log_new_record(lg(LogLevel.LogInfo, LogFormat.LogJson),
+        LogLevel.LogInfo, "server started", ["port", "workers"], ["8080", "4"], ts())
+    eq_str(log_render_json(rec),
+        "{\"ts\":\"2025-09-09T12:40:00.123Z\",\"level\":\"info\",\"app\":\"myapp\",\"msg\":\"server started\",\"port\":\"8080\",\"workers\":\"4\"}",
+        "json full record")
+
+    # Escaping inside the message + keys + values.
+    let hostile: LogRecord = log_new_record(lg(LogLevel.LogWarn, LogFormat.LogJson),
+        LogLevel.LogWarn, "multi\nline \"forgery\"", ["pa\\th"], ["/v/log"], ts())
+    eq_str(log_render_json(hostile),
+        "{\"ts\":\"2025-09-09T12:40:00.123Z\",\"level\":\"warn\",\"app\":\"myapp\",\"msg\":\"multi\\nline \\\"forgery\\\"\",\"pa\\\\th\":\"/v/log\"}",
+        "json hostile record")
+
+    # The empty-message edge.
+    let empty: LogRecord = log_new_record(lg(LogLevel.LogError, LogFormat.LogJson),
+        LogLevel.LogError, "", [], [], 0)
+    eq_str(log_render_json(empty),
+        "{\"ts\":\"1970-01-01T00:00:00.000Z\",\"level\":\"error\",\"app\":\"myapp\",\"msg\":\"\"}",
+        "json empty message")
+    return 0
+}
+
+fn test_render_syslog() -> int uses IO {
+    # INFO: PRI = 8 + 6 = 14; TAG[PID]; kvs in the message part.
+    let rec: LogRecord = log_new_record(lg(LogLevel.LogInfo, LogFormat.LogSyslog),
+        LogLevel.LogInfo, "server started", ["port", "workers"], ["8080", "4"], ts())
+    eq_str(log_render_syslog(rec),
+        "<14>Sep  9 12:40:00 web01 myapp[1234]: server started port=8080 workers=4",
+        "syslog info")
+
+    # The PRI table: error 11, warn 12, debug 15, trace 15.
+    let err: LogRecord = log_new_record(lg(LogLevel.LogInfo, LogFormat.LogSyslog),
+        LogLevel.LogError, "m", [], [], ts())
+    eq_str(log_render_syslog(err), "<11>Sep  9 12:40:00 web01 myapp[1234]: m",
+        "syslog error PRI 11")
+    let wrn: LogRecord = log_new_record(lg(LogLevel.LogInfo, LogFormat.LogSyslog),
+        LogLevel.LogWarn, "m", [], [], ts())
+    eq_str(log_render_syslog(wrn), "<12>Sep  9 12:40:00 web01 myapp[1234]: m",
+        "syslog warn PRI 12")
+    let dbg: LogRecord = log_new_record(lg(LogLevel.LogInfo, LogFormat.LogSyslog),
+        LogLevel.LogDebug, "m", [], [], ts())
+    eq_str(log_render_syslog(dbg), "<15>Sep  9 12:40:00 web01 myapp[1234]: m",
+        "syslog debug PRI 15")
+    let trc: LogRecord = log_new_record(lg(LogLevel.LogInfo, LogFormat.LogSyslog),
+        LogLevel.LogTrace, "m", [], [], ts())
+    eq_str(log_render_syslog(trc), "<15>Sep  9 12:40:00 web01 myapp[1234]: m",
+        "syslog trace PRI 15")
+
+    # pid == 0: TAG without [PID] (the pure constructor placeholder).
+    let nopid: Logger = log_new_with(LogLevel.LogInfo, LogFormat.LogSyslog,
+        LogColor.LogColorNever, "svc")
+    let rec2: LogRecord = log_new_record(nopid, LogLevel.LogError, "m", [], [], ts())
+    eq_str(log_render_syslog(rec2), "<11>Sep  9 12:40:00 localhost svc: m",
+        "syslog no pid + localhost default")
+
+    # The space-padded day (a single-digit day).
+    let day1: LogRecord = log_new_record(lg(LogLevel.LogInfo, LogFormat.LogSyslog),
+        LogLevel.LogInfo, "m", [], [], 0)
+    eq_str(log_render_syslog(day1), "<14>Jan  1 00:00:00 web01 myapp[1234]: m",
+        "syslog space-padded day")
+
+    # log_syslog_severity.
+    eq_int(log_syslog_severity(LogLevel.LogError), 3, "sev error 3")
+    eq_int(log_syslog_severity(LogLevel.LogWarn), 4, "sev warn 4")
+    eq_int(log_syslog_severity(LogLevel.LogInfo), 6, "sev info 6")
+    eq_int(log_syslog_severity(LogLevel.LogDebug), 7, "sev debug 7")
+    eq_int(log_syslog_severity(LogLevel.LogTrace), 7, "sev trace 7")
+    return 0
+}
+
+# ============================================================================
+# log_render — the format dispatch.
+# ============================================================================
+
+fn test_dispatch() -> int uses IO {
+    let rec: LogRecord = log_new_record(lg(LogLevel.LogWarn, LogFormat.LogHuman),
+        LogLevel.LogWarn, "dispatch", [], [], ts())
+    eq_str(log_render(rec, LogFormat.LogHuman, ColorLevel.ColorNone),
+        log_render_human(rec, ColorLevel.ColorNone), "dispatch human")
+    eq_str(log_render(rec, LogFormat.LogJson, ColorLevel.ColorNone),
+        log_render_json(rec), "dispatch json")
+    eq_str(log_render(rec, LogFormat.LogSyslog, ColorLevel.ColorNone),
+        log_render_syslog(rec), "dispatch syslog")
+    return 0
+}
+
+# ============================================================================
+# Live smoke — log_new + live emits (stderr) + suppression.
+# ============================================================================
+
+fn test_live_smoke() -> int uses IO, Clock, Proc {
+    # The live constructor: pid + hostname from the process (RELATIVE
+    # assertions — the Stage 49 pattern; the exact values differ
+    # between the interpreter and native processes by design).
+    let live: Logger = log_new()
+    ok(live.pid > 0, "live pid > 0")
+    ok(live.hostname.len() > 0, "live hostname non-empty")
+    # The env (unset in the test harness) yields the documented
+    # defaults — identical between the backends.
+    eq_int(log_level_to_int(live.level), 3, "live default level info (HLS_LOG unset)")
+    eq_int(log_format_to_int(live.format), 0, "live default format human (HLS_LOG_FORMAT unset)")
+
+    # Live emits: every level + the structured form + both alternate
+    # formats. These lines go to STDERR with the live wall clock —
+    # run the test with 2>&1 to see them; the differential comparison
+    # covers stdout (the pure renders above).
+    log_error(live, "live: error line")
+    log_warn(live, "live: warn line")
+    log_info(live, "live: info line")
+    log_debug(live, "live: debug line")
+    log_trace(live, "live: trace line")
+    log_info_kv(live, "live: structured", ["k"], ["v"])
+    log_warn_kv(live.with_format(LogFormat.LogJson), "live: json", ["k"], ["v"])
+    log_error(live.with_format(LogFormat.LogSyslog), "live: syslog")
+
+    # Suppression on the live path: a Warn logger drops info/debug.
+    let quiet: Logger = live.with_level(LogLevel.LogWarn)
+    log_info(quiet, "SUPPRESSED live info (level=warn)")
+    log_debug(quiet, "SUPPRESSED live debug (level=warn)")
+    log_error(quiet, "live: error still shown")
+
+    # The method form on the live path.
+    live.info("live: method form info")
+    quiet.error_kv("live: method form error kv", ["code"], ["7"])
+
+    # Off silences everything.
+    let off: Logger = live.with_level(LogLevel.LogOff)
+    log_error(off, "SUPPRESSED off error")
+    return 0
+}
+
+# ============================================================================
+# Main — run every section in order.
+# ============================================================================
+
+fn main() -> int uses IO, Clock, Proc {
+    println("=== Stage 57: std.log — structured logging (human/JSON/syslog) ===")
+    println("--- LogLevel ---")
+    test_log_level()
+    println("--- LogFormat + LogColor ---")
+    test_format_color()
+    println("--- log_enabled (6x5 matrix) ---")
+    test_filtering()
+    println("--- constructors + builders (immutable) + methods ---")
+    test_builders()
+    println("--- timestamps (ISO + RFC 3164 + leap days) ---")
+    test_timestamps()
+    println("--- JSON escaping ---")
+    test_json_escape()
+    println("--- human renderer (exact, none + basic SGR) ---")
+    test_render_human()
+    println("--- JSON renderer (exact) ---")
+    test_render_json()
+    println("--- syslog renderer (exact PRI / TAG) ---")
+    test_render_syslog()
+    println("--- format dispatch ---")
+    test_dispatch()
+    println("--- live smoke (log_new + emits to stderr + suppression) ---")
+    test_live_smoke()
+    println("ALL STAGE 57 TESTS PASSED")
+    return 0
+}
