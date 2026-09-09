@@ -623,7 +623,7 @@ def cmd_list_targets() -> int:
         if "march" in spec:
             print(f"      march: {spec['march']}, mabi: {spec['mabi']}")
         if spec.get("freestanding", False):
-            print(f"      freestanding: -nostdlib -nostartfiles -ffreestanding")
+            print("      freestanding: -nostdlib -nostartfiles -ffreestanding")
     print()
     print("Aliases (accepted by --target):")
     for alias, canonical in TARGET_ALIASES.items():

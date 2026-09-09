@@ -1978,7 +1978,7 @@ class Interp:
             proc = self.proc_children[hl_pid]
             try:
                 rc = proc.wait()
-            except OSError as ex:
+            except OSError:
                 return -1
             # rc is already the exit code (subprocess encodes signals
             # as -N; translate to 128 + signum for parity with proc_exec).

@@ -46,9 +46,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import os
 import re
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -323,8 +321,8 @@ def main():
             re.search(r"call\s+.*<[^>]*list_reverse[^>]*>", body_text)
         )
 
-        print(f"[spec-check] usf_list_reverse_int found in hlc binary: OK")
-        print(f"             hlc loop shape matches reference: "
+        print("[spec-check] usf_list_reverse_int found in hlc binary: OK")
+        print("             hlc loop shape matches reference: "
               f"{'OK' if hls_shape_ok else 'FAIL'}")
         print(f"             reference c_reverse_int shape valid: "
               f"{'OK' if ref_shape_ok else 'FAIL'}")

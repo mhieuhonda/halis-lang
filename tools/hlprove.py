@@ -213,7 +213,7 @@ def _z3_verdicts_py(path):
     to require a z3 BINARY on PATH; the module fallback makes the bridge
     usable everywhere the package is installed."""
     # Deep-scan-15 cleanup: the previous code had TWO imports —
-    # `import z3  # noqa: F401` (just to test importability) followed
+    # `import z3` (just to test importability) followed
     # by `import z3 as z` (the actual alias used below). The first
     # import is redundant: if z3 doesn't exist, both lines raise
     # ImportError; if it does, both succeed (Python caches modules
