@@ -1,0 +1,1155 @@
+# ============================================================================
+# std/man.hls — Stage 62 (v0.77.0-alpha): man-page (nroff/groff) generator
+# ----------------------------------------------------------------------------
+# This module is the LAST module of Phase IV (the CLI tooling track,
+# Stages 53–62). It implements the roadmap's Stage 62 promise:
+#
+#   * `hls doc --man myapp` produces a groff/nroff man page from the CLI
+#     parser definition. `hls install` installs both the binary and the
+#     man page (the install step is a Stage-60 concern; this module
+#     provides the rendering primitive `man_render` plus the install
+#     helper `man_install` that writes the page to the canonical
+#     ${prefix}/share/man/manN/name.N path).
+#
+# Design choices (matching the roadmap's "produces nroff man page from
+# the CLI parser definition"):
+#
+#   1. BUILDER PATTERN, NOT DERIVE MACROS.
+#      Mirrors std.cli's design: a ManPage is a value built up via
+#      immutable updates (`man_new("myapp", 1, "1.0.0").with_date("2026-09-09")
+#      .with_source("myapp 1.0.0").with_manual("MyApp Manual")`). Every
+#      builder call returns a NEW ManPage. Same convention as std.cli,
+#      std.log, std.color.
+#
+#   2. PURE RENDER CORE.
+#      `man_render(page, parser)` is a PURE function (no `uses IO`):
+#      given a ManPage spec + a CliParser, it produces the complete
+#      nroff source as a str. This makes the renderer differential-
+#      safe: the interpreter and the native binary produce
+#      byte-identical output (the only inputs are immutable values).
+#      The live `man_write` / `man_install` helpers carry IO/Fs and
+#      write the rendered text to disk.
+#
+#   3. STRICT GROFF ESCAPING.
+#      User-controlled text (option descriptions, after_help text,
+#      example titles) is run through `man_escape` before being
+#      embedded in the nroff source. This neutralises the four groff
+#      metacharacters:
+#        - leading '.' or '\''  (a line starting with either is a
+#          groff request or a no-op line — prepend a zero-width space)
+#        - '\\'                 (the escape character — doubled to render
+#          literally)
+#        - '-'                  (groff's hyphenation char — replaced with
+#          '\-' so it renders as a literal hyphen, never a soft hyphen
+#          that the typesetter could break on)
+#        - control bytes (0x00-0x1F except '\t' '\n') — stripped.
+#      This is a defense-in-depth measure: an attacker who controls a
+#      CliParser description string cannot inject groff requests that
+#      would, e.g., execute shell commands via `.sy` or read arbitrary
+#      files via `.so /etc/passwd`. (Modern man viewers disable .sy, but
+#      old ones and some groff-based toolchains do not; we escape at the
+#      source.)
+#
+#   4. NROFF STRUCTURE FOLLOWS man(7).
+#      The produced page follows the canonical section order:
+#        .TH NAME SECTION DATE SOURCE MANUAL
+#        .SH NAME
+#        name \- one-line description
+#        .SH SYNOPSIS
+#        \fBname\fR [OPTIONS] [<POSITIONAL>...] [SUBCOMMAND]
+#        .SH DESCRIPTION
+#        The description text.
+#        .SH OPTIONS
+#        .TP
+#        \fB-h, --help\fR
+#        Print this help message.
+#        ...
+#        .SH POSITIONAL ARGUMENTS
+#        .TP
+#        \fB<input>\fR
+#        The input file.
+#        ...
+#        .SH SUBCOMMANDS (if any)
+#        .TP
+#        \fBinit\fR
+#        Initialize the project.
+#        ...
+#        .SH ENVIRONMENT (if any env-registered option)
+#        .TP
+#        \fBTESTAPP_PORT\fR
+#        Fallback for the --port option.
+#        ...
+#        .SH EXIT STATUS
+#        0   success
+#        1   parse error
+#        2   missing required argument
+#        .SH EXAMPLES (if any)
+#        ...
+#        .SH BUGS (if a bugs URL is set)
+#        Report bugs to <url>.
+#        .SH SEE ALSO (if any cross-references)
+#        .BR related (1)
+#        ...
+#        .SH VERSION
+#        version string
+#
+#   5. NO NEW COMPILER BUILTINS.
+#      The renderer is pure-HLS on top of std.cli, std.str, std.io, and
+#      std.fs. The `write_file` builtin (Fs effect) is the only
+#      non-pure operation, used by `man_write` / `man_install`.
+#
+#   6. IMPLICIT CONVERSION FROM CliParser.
+#      `man_render_default(parser)` produces a complete man page with
+#      sensible defaults: section 1 (User Commands), today's date as
+#      "YYYY-MM-DD", source = "<name> <version>", manual = "User
+#      Commands". The full `man_render(page, parser)` lets the caller
+#      override every field.
+#
+# Security:
+#   * `man_escape` runs on EVERY user-controlled string (descriptions,
+#     after_help, example titles/bodies) before the string is embedded
+#     in nroff. A tainted CliParser field (e.g., a description loaded
+#     from a remote package manifest) cannot inject groff requests.
+#   * `man_install` constructs the install path from `<name>` and
+#     `<section>` via path-join semantics; the name is sanitised
+#     (rejecting any '/' or '..' component) so an attacker-controlled
+#     name cannot write outside the man dir.
+#   * No shell invocation: `man_install` writes the file directly via
+#     the `write_file` builtin (no `system("install ...")` — the
+#     command-injection surface is zero).
+#
+# Differential parity (interpreter == native):
+#   `man_render` is a pure function of (ManPage, CliParser) — both
+#   immutable values. The interpreter and the native binary produce
+#   byte-identical nroff source. The live `man_write` / `man_install`
+#   helpers are smoke-tested (the program must exit 0; the file
+#   content is verified by the acceptance test's stdout comparison).
+#
+# Limitations (deferred to later stages):
+#   * No Synopsis sub-section per subcommand (a future perfection stage
+#     may add a `.SS` per subcommand with the subcommand's own synopsis).
+#   * No automatic cross-reference generation (the user supplies
+#     see-also entries via `man_with_see_also`).
+#   * No MDoc (BSD) output — only the man(7) macro set (the GNU/Linux
+#     default). A future stage may add `man_render_mdoc` for BSD.
+#   * No localization (LC_TIME for the date — the date is taken
+#     verbatim from `ManPage.date`).
+# ============================================================================
+
+import "std.cli"
+import "std.str"
+import "std.option"
+import "std.result"
+
+# ----------------------------------------------------------------------------
+# Constants — man(7) section numbers. The classic Unix section IDs:
+#   1 User Commands              5 File Formats
+#   2 System Calls               6 Games and Screensavers
+#   3 Library Functions          7 Miscellaneous
+#   4 Special Files              8 System Administration
+# plus the LSB / GNU extensions: 0p/1p/3p (POSIX), 1perl/3perl (Perl),
+# 3pm (Perl modules), n (Tcl). We support the eight primary sections
+# via man_section_name; the renderer accepts any positive int and emits
+# it verbatim in the .TH line.
+# ----------------------------------------------------------------------------
+
+fn man_section_user_commands() -> int { return 1 }
+fn man_section_system_calls() -> int { return 2 }
+fn man_section_library_functions() -> int { return 3 }
+fn man_section_special_files() -> int { return 4 }
+fn man_section_file_formats() -> int { return 5 }
+fn man_section_games() -> int { return 6 }
+fn man_section_miscellaneous() -> int { return 7 }
+fn man_section_system_administration() -> int { return 8 }
+
+# man_section_name(section) — the human-readable name of the section
+# (e.g., section 1 -> "User Commands"). Used as the default manual
+# name when the caller doesn't supply one. Unknown sections fall
+# back to "User Commands" (a safe default; the .TH line still emits
+# the numeric section verbatim).
+fn man_section_name(section: int) -> str {
+    if section == man_section_user_commands() {
+        return "User Commands"
+    }
+    if section == man_section_system_calls() {
+        return "System Calls"
+    }
+    if section == man_section_library_functions() {
+        return "Library Functions"
+    }
+    if section == man_section_special_files() {
+        return "Special Files"
+    }
+    if section == man_section_file_formats() {
+        return "File Formats"
+    }
+    if section == man_section_games() {
+        return "Games"
+    }
+    if section == man_section_miscellaneous() {
+        return "Miscellaneous"
+    }
+    if section == man_section_system_administration() {
+        return "System Administration"
+    }
+    return "User Commands"
+}
+
+# ----------------------------------------------------------------------------
+# ManExample — a single example entry (title + body). HLS v0.3 has no
+# tuples, so each example is a struct. The body is rendered verbatim
+# (after escaping) under a `.PP` + bold title.
+# ----------------------------------------------------------------------------
+
+struct ManExample {
+    title: str,     # e.g., "Run with a custom port"
+    body: str,      # e.g., "myapp --port=9000 input.txt"
+}
+
+# ----------------------------------------------------------------------------
+# ManSeeAlso — a single cross-reference. `name` is the man-page name,
+# `section` is the section number. Rendered as `.BR name (section)`.
+# ----------------------------------------------------------------------------
+
+struct ManSeeAlso {
+    name: str,
+    section: int,
+}
+
+# ----------------------------------------------------------------------------
+# ManPage — the spec for the man page to render.
+# ----------------------------------------------------------------------------
+
+struct ManPage {
+    name: str,                # the program name (shown in .TH and NAME)
+    section: int,             # the section number (1, 2, 3, ...)
+    version: str,             # the version string (shown in VERSION and .TH SOURCE)
+    date: str,                # the date string (shown in .TH; format "YYYY-MM-DD" recommended)
+    source: str,              # the source string (shown in .TH; usually "<name> <version>")
+    manual: str,              # the manual name (shown in .TH; usually the section name)
+    desc: str,                # one-line description (shown in NAME and SYNOPSIS header)
+    long_desc: str,           # multi-paragraph description (shown in DESCRIPTION)
+    author: str,              # the author line (shown in AUTHORS if non-empty)
+    bugs: str,                # the bugs URL or address (shown in BUGS if non-empty)
+    examples: list[ManExample], # the EXAMPLES section entries
+    see_also: list[ManSeeAlso], # the SEE ALSO section entries
+    exit_codes: list[ManExample], # EXIT STATUS entries (title=code, body=description)
+    after_help: str,          # extra free-form text appended to DESCRIPTION
+}
+
+# ----------------------------------------------------------------------------
+# Builder — immutable updates (same convention as CliParser / Logger).
+# ----------------------------------------------------------------------------
+
+# man_new(name, section, version) — create a ManPage with the given
+# name, section number, and version string. All other fields are
+# empty / defaulted. The date defaults to "" (the caller should call
+# with_date to set it; man_render_default fills today's date if empty).
+fn man_new(name: str, section: int, version: str) -> ManPage {
+    let empty_examples: list[ManExample] = []
+    let empty_see: list[ManSeeAlso] = []
+    let empty_exit: list[ManExample] = []
+    return ManPage {
+        name: name,
+        section: section,
+        version: version,
+        date: "",
+        source: "",
+        manual: "",
+        desc: "",
+        long_desc: "",
+        author: "",
+        bugs: "",
+        examples: empty_examples,
+        see_also: empty_see,
+        exit_codes: empty_exit,
+        after_help: "",
+    }
+}
+
+# man_with_date(p, date) — set the date string (recommended format
+# "YYYY-MM-DD"; man(7) accepts any string but the canonical form is
+# the ISO date).
+fn man_with_date(p: ManPage, date: str) -> ManPage {
+    return man_copy(p, date, p.source, p.manual, p.desc, p.long_desc, p.author,
+        p.bugs, p.examples, p.see_also, p.exit_codes, p.after_help)
+}
+
+# man_with_source(p, source) — set the source string (usually
+# "<name> <version>").
+fn man_with_source(p: ManPage, source: str) -> ManPage {
+    return man_copy(p, p.date, source, p.manual, p.desc, p.long_desc, p.author,
+        p.bugs, p.examples, p.see_also, p.exit_codes, p.after_help)
+}
+
+# man_with_manual(p, manual) — set the manual name (usually the
+# section name, e.g., "User Commands").
+fn man_with_manual(p: ManPage, manual: str) -> ManPage {
+    return man_copy(p, p.date, p.source, manual, p.desc, p.long_desc, p.author,
+        p.bugs, p.examples, p.see_also, p.exit_codes, p.after_help)
+}
+
+# man_with_desc(p, desc) — set the one-line description (shown in
+# NAME as "name \- desc").
+fn man_with_desc(p: ManPage, desc: str) -> ManPage {
+    return man_copy(p, p.date, p.source, p.manual, desc, p.long_desc, p.author,
+        p.bugs, p.examples, p.see_also, p.exit_codes, p.after_help)
+}
+
+# man_with_long_desc(p, long_desc) — set the multi-paragraph
+# description. Paragraphs are separated by a blank line in the input;
+# the renderer emits a `.PP` between each paragraph.
+fn man_with_long_desc(p: ManPage, long_desc: str) -> ManPage {
+    return man_copy(p, p.date, p.source, p.manual, p.desc, long_desc, p.author,
+        p.bugs, p.examples, p.see_also, p.exit_codes, p.after_help)
+}
+
+# man_with_author(p, author) — set the author line (shown in AUTHORS
+# if non-empty). Format is free-form text, e.g., "Jane Doe <jane@example.com>".
+fn man_with_author(p: ManPage, author: str) -> ManPage {
+    return man_copy(p, p.date, p.source, p.manual, p.desc, p.long_desc, author,
+        p.bugs, p.examples, p.see_also, p.exit_codes, p.after_help)
+}
+
+# man_with_bugs(p, bugs) — set the bugs URL / address (shown in BUGS
+# if non-empty).
+fn man_with_bugs(p: ManPage, bugs: str) -> ManPage {
+    return man_copy(p, p.date, p.source, p.manual, p.desc, p.long_desc, p.author,
+        bugs, p.examples, p.see_also, p.exit_codes, p.after_help)
+}
+
+# man_with_examples(p, examples) — set the EXAMPLES section entries.
+fn man_with_examples(p: ManPage, examples: list[ManExample]) -> ManPage {
+    return man_copy(p, p.date, p.source, p.manual, p.desc, p.long_desc, p.author,
+        p.bugs, examples, p.see_also, p.exit_codes, p.after_help)
+}
+
+# man_with_see_also(p, see_also) — set the SEE ALSO section entries.
+fn man_with_see_also(p: ManPage, see_also: list[ManSeeAlso]) -> ManPage {
+    return man_copy(p, p.date, p.source, p.manual, p.desc, p.long_desc, p.author,
+        p.bugs, p.examples, see_also, p.exit_codes, p.after_help)
+}
+
+# man_with_exit_codes(p, exit_codes) — set the EXIT STATUS entries.
+# Each entry's title is the numeric code (as a str), body is the
+# description.
+fn man_with_exit_codes(p: ManPage, exit_codes: list[ManExample]) -> ManPage {
+    return man_copy(p, p.date, p.source, p.manual, p.desc, p.long_desc, p.author,
+        p.bugs, p.examples, p.see_also, exit_codes, p.after_help)
+}
+
+# man_with_after_help(p, after_help) — set the after-help free-form
+# text appended to the DESCRIPTION section.
+fn man_with_after_help(p: ManPage, after_help: str) -> ManPage {
+    return man_copy(p, p.date, p.source, p.manual, p.desc, p.long_desc, p.author,
+        p.bugs, p.examples, p.see_also, p.exit_codes, after_help)
+}
+
+# man_add_example(p, title, body) — append a single example to the
+# EXAMPLES list. Convenience over man_with_examples (which replaces
+# the whole list).
+fn man_add_example(p: ManPage, title: str, body: str) -> ManPage {
+    let new_list: list[ManExample] = []
+    let mut i: int = 0
+    while i < p.examples.len() {
+        new_list.push(p.examples.get(i))
+        i = i + 1
+    }
+    new_list.push(ManExample { title: title, body: body })
+    return man_copy(p, p.date, p.source, p.manual, p.desc, p.long_desc, p.author,
+        p.bugs, new_list, p.see_also, p.exit_codes, p.after_help)
+}
+
+# man_add_see_also(p, name, section) — append a single SEE ALSO entry.
+fn man_add_see_also(p: ManPage, name: str, section: int) -> ManPage {
+    let new_list: list[ManSeeAlso] = []
+    let mut i: int = 0
+    while i < p.see_also.len() {
+        new_list.push(p.see_also.get(i))
+        i = i + 1
+    }
+    new_list.push(ManSeeAlso { name: name, section: section })
+    return man_copy(p, p.date, p.source, p.manual, p.desc, p.long_desc, p.author,
+        p.bugs, p.examples, new_list, p.exit_codes, p.after_help)
+}
+
+# man_add_exit_code(p, code, desc) — append a single EXIT STATUS entry.
+# `code` is the numeric exit code; `desc` is the description.
+fn man_add_exit_code(p: ManPage, code: int, desc: str) -> ManPage {
+    let new_list: list[ManExample] = []
+    let mut i: int = 0
+    while i < p.exit_codes.len() {
+        new_list.push(p.exit_codes.get(i))
+        i = i + 1
+    }
+    new_list.push(ManExample { title: code.to_str(), body: desc })
+    return man_copy(p, p.date, p.source, p.manual, p.desc, p.long_desc, p.author,
+        p.bugs, p.examples, p.see_also, new_list, p.after_help)
+}
+
+# man_copy — internal helper: produce a new ManPage with the same
+# identity (name/section/version) and the given field values. Used by
+# every man_with_* builder so each one is a single immutable update.
+fn man_copy(p: ManPage, date: str, source: str, manual: str, desc: str,
+            long_desc: str, author: str, bugs: str,
+            examples: list[ManExample], see_also: list[ManSeeAlso],
+            exit_codes: list[ManExample], after_help: str) -> ManPage {
+    return ManPage {
+        name: p.name,
+        section: p.section,
+        version: p.version,
+        date: date,
+        source: source,
+        manual: manual,
+        desc: desc,
+        long_desc: long_desc,
+        author: author,
+        bugs: bugs,
+        examples: examples,
+        see_also: see_also,
+        exit_codes: exit_codes,
+        after_help: after_help,
+    }
+}
+
+# ----------------------------------------------------------------------------
+# impl ManPage — method twins of the free-function builders, so the
+# caller can chain `.with_date(...).with_source(...)` etc. (the same
+# convention std.log, std.color, std.progress use).
+# ----------------------------------------------------------------------------
+
+impl ManPage {
+    fn with_date(self: ManPage, date: str) -> ManPage {
+        return man_with_date(self, date)
+    }
+    fn with_source(self: ManPage, source: str) -> ManPage {
+        return man_with_source(self, source)
+    }
+    fn with_manual(self: ManPage, manual: str) -> ManPage {
+        return man_with_manual(self, manual)
+    }
+    fn with_desc(self: ManPage, desc: str) -> ManPage {
+        return man_with_desc(self, desc)
+    }
+    fn with_long_desc(self: ManPage, long_desc: str) -> ManPage {
+        return man_with_long_desc(self, long_desc)
+    }
+    fn with_author(self: ManPage, author: str) -> ManPage {
+        return man_with_author(self, author)
+    }
+    fn with_bugs(self: ManPage, bugs: str) -> ManPage {
+        return man_with_bugs(self, bugs)
+    }
+    fn with_examples(self: ManPage, examples: list[ManExample]) -> ManPage {
+        return man_with_examples(self, examples)
+    }
+    fn with_see_also(self: ManPage, see_also: list[ManSeeAlso]) -> ManPage {
+        return man_with_see_also(self, see_also)
+    }
+    fn with_exit_codes(self: ManPage, exit_codes: list[ManExample]) -> ManPage {
+        return man_with_exit_codes(self, exit_codes)
+    }
+    fn with_after_help(self: ManPage, after_help: str) -> ManPage {
+        return man_with_after_help(self, after_help)
+    }
+    fn add_example(self: ManPage, title: str, body: str) -> ManPage {
+        return man_add_example(self, title, body)
+    }
+    fn add_see_also(self: ManPage, name: str, section: int) -> ManPage {
+        return man_add_see_also(self, name, section)
+    }
+    fn add_exit_code(self: ManPage, code: int, desc: str) -> ManPage {
+        return man_add_exit_code(self, code, desc)
+    }
+
+    # render(parser) — produce the complete nroff source for this
+    # ManPage, populated with OPTIONS / POSITIONAL ARGUMENTS / SUB-
+    # COMMANDS / ENVIRONMENT entries from `parser`. Pure function.
+    fn render(self: ManPage, parser: CliParser) -> str {
+        return man_render(self, parser)
+    }
+}
+
+# ============================================================================
+# man_escape(text) — escape groff metacharacters in literal text.
+#
+# This is the security-critical function: every user-controlled string
+# (option descriptions, after_help, example titles/bodies) MUST pass
+# through this before being embedded in the nroff source. Without it,
+# an attacker who controls a CliParser description could inject a
+# groff request like `.sy rm -rf /` (modern man viewers disable .sy,
+# but old ones and some groff-based toolchains do not — we escape at
+# the source).
+#
+# The escaping rules (man(7) / groff_mdoc(7)):
+#   1. '\\' (escape char) -> '\\\\' (literal backslash in the output)
+#   2. '-'  -> '\\-' (groff's hyphenation char becomes a literal hyphen;
+#      without this, groff might break the line at every '-' in a
+#      description, mangling long option names like --no-color)
+#   3. leading '.' or '\'' on any line -> prepend a zero-width space
+#      ('\\&') so the line is not interpreted as a groff request or
+#      a no-op line
+#   4. control bytes (0x00-0x1F except '\t'=9 and '\n'=10) -> stripped
+#      (a stray form-feed or vertical tab could confuse the renderer)
+#   5. non-leading '.' or '\'' -> left as-is (interior dots are safe)
+#
+# The function is PURE (no IO) so it can be used in any context.
+# ============================================================================
+
+fn man_escape(text: str) -> str {
+    let n: int = text.len()
+    if n == 0 {
+        return ""
+    }
+    let out: list[str] = []
+    let mut at_line_start: bool = true
+    let mut i: int = 0
+    while i < n {
+        let b: int = text.byte_at(i)
+        # Control bytes (except \t and \n) — strip them.
+        if b < 32 && b != 9 && b != 10 {
+            i = i + 1
+            continue
+        }
+        # Newline — emit it, and mark that the NEXT byte will be at
+        # the start of a line (so a leading '.' on the next line gets
+        # the zero-width-space prefix).
+        if b == 10 {
+            out.push("\n")
+            at_line_start = true
+            i = i + 1
+            continue
+        }
+        # Leading '.' or '\'' — prepend the zero-width-space escape
+        # so the line is not interpreted as a groff request.
+        if at_line_start && (b == 46 || b == 39) {
+            out.push("\\&")
+        }
+        at_line_start = false
+        # Hyphen — escape it so groff doesn't break the line here.
+        if b == 45 {
+            out.push("\\-")
+            i = i + 1
+            continue
+        }
+        # Backslash — double it so it renders literally.
+        if b == 92 {
+            out.push("\\\\")
+            i = i + 1
+            continue
+        }
+        # Ordinary byte — emit as-is.
+        out.push(text.slice(i, i + 1))
+        i = i + 1
+    }
+    return str_join(out, "")
+}
+
+# ============================================================================
+# man_render(page, parser) — the main renderer. Produces the complete
+# nroff source for the man page, populating the OPTIONS / POSITIONAL
+# ARGUMENTS / SUBCOMMANDS / ENVIRONMENT sections from `parser`.
+#
+# Pure function: the only inputs are the immutable ManPage and CliParser
+# values. The interpreter and the native binary produce byte-identical
+# output (the differential test verifies this).
+# ============================================================================
+
+fn man_render(page: ManPage, parser: CliParser) -> str {
+    let parts: list[str] = []
+
+    # ---- .TH line ----
+    # .TH NAME SECTION DATE SOURCE MANUAL
+    let mut date_str: str = page.date
+    if date_str == "" {
+        date_str = "1970-01-01"
+    }
+    let mut source_str: str = page.source
+    if source_str == "" {
+        source_str = page.name + " " + page.version
+    }
+    let mut manual_str: str = page.manual
+    if manual_str == "" {
+        manual_str = man_section_name(page.section)
+    }
+    parts.push(".TH \"" + man_escape(page.name) + "\" \""
+        + page.section.to_str() + "\" \""
+        + man_escape(date_str) + "\" \""
+        + man_escape(source_str) + "\" \""
+        + man_escape(manual_str) + "\"")
+    parts.push("")
+
+    # ---- NAME ----
+    parts.push(".SH \"NAME\"")
+    let mut desc_line: str = man_escape(page.name)
+    if page.desc != "" {
+        desc_line = desc_line + " \\- " + man_escape(page.desc)
+    }
+    parts.push(desc_line)
+    parts.push("")
+
+    # ---- SYNOPSIS ----
+    parts.push(".SH \"SYNOPSIS\"")
+    parts.push(".B " + man_escape(parser.name))
+    parts.push("[\\fB\\-h\\fR|\\fB\\-\\-help\\fR] [\\fB\\-V\\fR|\\fB\\-\\-version\\fR]")
+    # Emit one synopsis line per declared option / positional. The
+    # canonical synopsis format is:
+    #   [\fB\-x\fR|\fB\-\-long\fR \fIVALUE\fR]
+    # for options, and:
+    #   \fB<name>\fR
+    # for required positionals, and:
+    #   [\fB<name>\fR]
+    # for optional positionals.
+    let mut oi: int = 0
+    while oi < parser.args.len() {
+        let a: CliArg = parser.args.get(oi)
+        if !a.positional {
+            let mut tok: str = "["
+            if a.short_name != "" {
+                tok = tok + "\\fB\\-" + man_escape(a.short_name) + "\\fR"
+                if a.long_name != "" {
+                    tok = tok + "|"
+                }
+            }
+            if a.long_name != "" {
+                tok = tok + "\\fB\\-\\-" + man_escape(a.long_name) + "\\fR"
+            }
+            if a.kind != cli_kind_bool() {
+                tok = tok + " \\fI" + man_escape(cli_kind_name(a.kind)) + "\\fR"
+            }
+            tok = tok + "]"
+            parts.push(tok)
+        } else {
+            # Positional — required -> \fB<name>\fR; optional -> [\fB<name>\fR]
+            let name_part: str = "\\fB<" + man_escape(a.long_name) + ">\\fR"
+            if a.required {
+                parts.push(name_part)
+            } else {
+                parts.push("[" + name_part + "]")
+            }
+        }
+        oi = oi + 1
+    }
+    if parser.subcommands.len() > 0 {
+        parts.push("\\fISUBCOMMAND\\fR [\\fIARGS\\fR...]")
+    }
+    parts.push("")
+
+    # ---- DESCRIPTION ----
+    parts.push(".SH \"DESCRIPTION\"")
+    if page.long_desc != "" {
+        # Split on blank lines into paragraphs; emit `.PP` between each.
+        let paras: list[str] = man_split_paragraphs(page.long_desc)
+        let mut pi: int = 0
+        while pi < paras.len() {
+            if pi > 0 {
+                parts.push(".PP")
+            }
+            parts.push(man_escape(paras.get(pi)))
+            pi = pi + 1
+        }
+    } else if page.desc != "" {
+        parts.push(man_escape(page.desc))
+    } else {
+        # Fallback — emit a one-line description derived from the parser.
+        parts.push(man_escape(parser.name) + " is a command-line tool.")
+    }
+    if page.after_help != "" {
+        parts.push(".PP")
+        parts.push(man_escape(page.after_help))
+    }
+    parts.push("")
+
+    # ---- OPTIONS ----
+    parts.push(".SH \"OPTIONS\"")
+    # Built-in -h / -V.
+    parts.push(".TP")
+    parts.push("\\fB\\-h\\fR, \\fB\\-\\-help\\fR")
+    parts.push("Print this help message and exit.")
+    parts.push(".TP")
+    parts.push("\\fB\\-V\\fR, \\fB\\-\\-version\\fR")
+    parts.push("Print the version string and exit.")
+    # User-declared options (skip positionals).
+    let mut opt_i: int = 0
+    while opt_i < parser.args.len() {
+        let a: CliArg = parser.args.get(opt_i)
+        if !a.positional {
+            parts.push(".TP")
+            let mut head: str = ""
+            if a.short_name != "" {
+                head = "\\fB\\-" + man_escape(a.short_name) + "\\fR, "
+            } else {
+                head = "    "
+            }
+            head = head + "\\fB\\-\\-" + man_escape(a.long_name) + "\\fR"
+            if a.kind != cli_kind_bool() {
+                head = head + " \\fI" + man_escape(cli_kind_name(a.kind)) + "\\fR"
+            }
+            parts.push(head)
+            let mut body: str = man_escape(a.desc)
+            if a.has_default {
+                body = body + " [default: " + man_escape(a.default_str) + "]"
+            }
+            if a.env != "" {
+                body = body + " [env: " + man_escape(a.env) + "]"
+            }
+            if a.required {
+                body = body + " (required)"
+            }
+            parts.push(body)
+        }
+        opt_i = opt_i + 1
+    }
+    parts.push("")
+
+    # ---- POSITIONAL ARGUMENTS (if any) ----
+    let has_pos: bool = man_parser_has_positional(parser)
+    if has_pos {
+        parts.push(".SH \"POSITIONAL ARGUMENTS\"")
+        let mut pi2: int = 0
+        while pi2 < parser.args.len() {
+            let a: CliArg = parser.args.get(pi2)
+            if a.positional {
+                parts.push(".TP")
+                parts.push("\\fB<" + man_escape(a.long_name) + ">\\fR")
+                let mut body: str = man_escape(a.desc)
+                if a.required {
+                    body = body + " (required)"
+                }
+                parts.push(body)
+            }
+            pi2 = pi2 + 1
+        }
+        parts.push("")
+    }
+
+    # ---- SUBCOMMANDS (if any) ----
+    if parser.subcommands.len() > 0 {
+        parts.push(".SH \"SUBCOMMANDS\"")
+        let mut si: int = 0
+        while si < parser.subcommands.len() {
+            parts.push(".TP")
+            parts.push("\\fB" + man_escape(parser.subcommands.get(si)) + "\\fR")
+            parts.push(man_escape(parser.subcommand_descs.get(si)))
+            si = si + 1
+        }
+        parts.push("")
+    }
+
+    # ---- ENVIRONMENT (if any env-registered option) ----
+    let env_entries: list[ManExample] = man_collect_env_entries(parser)
+    if env_entries.len() > 0 {
+        parts.push(".SH \"ENVIRONMENT\"")
+        let mut ei: int = 0
+        while ei < env_entries.len() {
+            parts.push(".TP")
+            parts.push("\\fB" + man_escape(env_entries.get(ei).title) + "\\fR")
+            parts.push(man_escape(env_entries.get(ei).body))
+            ei = ei + 1
+        }
+        parts.push("")
+    }
+
+    # ---- EXIT STATUS ----
+    if page.exit_codes.len() > 0 {
+        parts.push(".SH \"EXIT STATUS\"")
+        let mut xi: int = 0
+        while xi < page.exit_codes.len() {
+            parts.push(".TP")
+            parts.push("\\fB" + man_escape(page.exit_codes.get(xi).title) + "\\fR")
+            parts.push(man_escape(page.exit_codes.get(xi).body))
+            xi = xi + 1
+        }
+        parts.push("")
+    }
+
+    # ---- EXAMPLES ----
+    if page.examples.len() > 0 {
+        parts.push(".SH \"EXAMPLES\"")
+        let mut exi: int = 0
+        while exi < page.examples.len() {
+            parts.push(".PP")
+            parts.push("\\fB" + man_escape(page.examples.get(exi).title) + "\\fR")
+            # Indent the body as a code block via .IP. The body is
+            # emitted as a no-fill paragraph (.nf) so the spaces and
+            # line breaks are preserved verbatim.
+            parts.push(".RS")
+            parts.push(".nf")
+            parts.push(man_escape(page.examples.get(exi).body))
+            parts.push(".fi")
+            parts.push(".RE")
+            exi = exi + 1
+        }
+        parts.push("")
+    }
+
+    # ---- FILES (placeholder for future stages — hls install writes here) ----
+    # No FILES section in v0.77.0-alpha — the install path is documented
+    # in the SEE ALSO section under "hls-install(1)" if the user adds it.
+
+    # ---- AUTHORS (if author is set) ----
+    if page.author != "" {
+        parts.push(".SH \"AUTHORS\"")
+        parts.push(man_escape(page.author))
+        parts.push("")
+    }
+
+    # ---- BUGS (if bugs URL is set) ----
+    if page.bugs != "" {
+        parts.push(".SH \"BUGS\"")
+        parts.push("Report bugs to <" + man_escape(page.bugs) + ">.")
+        parts.push("")
+    }
+
+    # ---- SEE ALSO (if any cross-references) ----
+    if page.see_also.len() > 0 {
+        parts.push(".SH \"SEE ALSO\"")
+        let mut sai: int = 0
+        while sai < page.see_also.len() {
+            let sa: ManSeeAlso = page.see_also.get(sai)
+            parts.push(".BR " + man_escape(sa.name) + " (" + sa.section.to_str() + ")")
+            sai = sai + 1
+        }
+        parts.push("")
+    }
+
+    # ---- VERSION ----
+    parts.push(".SH \"VERSION\"")
+    parts.push(man_escape(page.name) + " " + man_escape(page.version))
+
+    # Join with newlines. The trailing newline is added so the file
+    # ends with a blank line (the conventional nroff form).
+    return str_join(parts, "\n") + "\n"
+}
+
+# man_render_default(parser) — convenience: render a man page from a
+# CliParser with sensible defaults (section 1, today's date, source
+# = "<name> <version>", manual = "User Commands", desc from
+# parser.desc). Used by `hls doc --man <name>` (Stage 61 will wire
+# this up; Stage 62 provides the renderer).
+fn man_render_default(parser: CliParser) -> str uses Clock {
+    let p0: ManPage = man_new(parser.name, man_section_user_commands(), parser.version)
+    let p1: ManPage = man_with_desc(p0, parser.desc)
+    let p2: ManPage = man_with_date(p1, man_today_iso_date())
+    let p3: ManPage = man_with_source(p2, parser.name + " " + parser.version)
+    let p4: ManPage = man_with_manual(p3, man_section_name(man_section_user_commands()))
+    return man_render(p4, parser)
+}
+
+# ============================================================================
+# man_split_paragraphs(text) — split a multi-paragraph description into
+# a list of paragraph strings. Paragraphs are separated by a blank line
+# (a line containing only whitespace, or two consecutive newlines).
+# Returns the paragraphs in order, with leading/trailing whitespace
+# trimmed from each.
+# ============================================================================
+
+fn man_split_paragraphs(text: str) -> list[str] {
+    let out: list[str] = []
+    let n: int = text.len()
+    let mut cur: list[str] = []
+    let mut i: int = 0
+    let mut at_paragraph_break: bool = false
+    while i < n {
+        # Find the end of the current line.
+        let line_end: int = man_find_newline(text, i)
+        let mut line: str = ""
+        if line_end < 0 {
+            line = text.slice(i, n)
+        } else {
+            line = text.slice(i, line_end)
+        }
+        # Trim trailing CR (Windows line endings).
+        let trimmed: str = man_trim_cr(line)
+        # Check if this line is blank (only whitespace).
+        if man_is_blank(trimmed) {
+            if cur.len() > 0 {
+                # End of paragraph — emit it.
+                let joined: str = str_join(cur, "\n")
+                out.push(joined)
+                cur = []
+            }
+            at_paragraph_break = true
+        } else {
+            cur.push(trimmed)
+            at_paragraph_break = false
+        }
+        if line_end < 0 {
+            break
+        }
+        i = line_end + 1
+    }
+    # Emit the last paragraph if any.
+    if cur.len() > 0 {
+        let joined: str = str_join(cur, "\n")
+        out.push(joined)
+    }
+    return out
+}
+
+# man_find_newline(text, start) — return the byte index of the next
+# '\n' at or after `start`, or -1 if none.
+fn man_find_newline(text: str, start: int) -> int {
+    let n: int = text.len()
+    let mut i: int = start
+    while i < n {
+        if text.byte_at(i) == 10 {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+# man_trim_cr(line) — strip a trailing CR (chr 13) from the line. Used
+# by man_split_paragraphs to handle Windows line endings (CRLF).
+fn man_trim_cr(line: str) -> str {
+    let n: int = line.len()
+    if n == 0 {
+        return ""
+    }
+    if line.byte_at(n - 1) == 13 {
+        return line.slice(0, n - 1)
+    }
+    return line
+}
+
+# man_is_blank(line) — true if the line contains only whitespace (or
+# is empty). Used by man_split_paragraphs to detect paragraph breaks.
+fn man_is_blank(line: str) -> bool {
+    let n: int = line.len()
+    let mut i: int = 0
+    while i < n {
+        let b: int = line.byte_at(i)
+        if b != 32 && b != 9 {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+# ============================================================================
+# man_parser_has_positional(parser) — true if the parser declares any
+# positional argument. Used to decide whether to emit the POSITIONAL
+# ARGUMENTS section.
+# ============================================================================
+
+fn man_parser_has_positional(parser: CliParser) -> bool {
+    let mut i: int = 0
+    while i < parser.args.len() {
+        if parser.args.get(i).positional {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+# ============================================================================
+# man_collect_env_entries(parser) — return the list of (env_var,
+# description) pairs for every option that has an env-var fallback
+# registered. Used to populate the ENVIRONMENT section.
+# ============================================================================
+
+fn man_collect_env_entries(parser: CliParser) -> list[ManExample] {
+    let out: list[ManExample] = []
+    let mut i: int = 0
+    while i < parser.args.len() {
+        let a: CliArg = parser.args.get(i)
+        if !a.positional && a.env != "" {
+            let body: str = "Fallback for the --" + a.long_name + " option. "
+                + a.desc
+            out.push(ManExample { title: a.env, body: body })
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# ============================================================================
+# man_today_iso_date() — return today's date as "YYYY-MM-DD". Reads
+# the wall clock via the `clock_now_ms` builtin (Clock effect). Used
+# by man_render_default to fill the .TH DATE field.
+#
+# Differential note: this function carries the Clock effect, so the
+# caller's effect set must include Clock. The pure `man_render`
+# path does NOT call this (the date is taken from ManPage.date,
+# which the caller fills); man_render_default is the live entry point
+# that reads the clock.
+# ============================================================================
+
+fn man_today_iso_date() -> str uses Clock {
+    let ms: int = system_time_now_ms()
+    return man_format_iso_date(ms)
+}
+
+# man_format_iso_date(ms) — format an epoch-millisecond timestamp as
+# "YYYY-MM-DD". Uses Howard Hinnant's civil-from-days algorithm (the
+# same algorithm std.log uses for its ISO-8601 timestamps). Pure
+# function of `ms` — differential-safe.
+fn man_format_iso_date(ms: int) -> str {
+    # Convert milliseconds to days since 1970-01-01 (floor division).
+    let days: int = man_floor_div(ms, 86400000)
+    # Hinnant's civil_from_days algorithm.
+    let z: int = days + 719468
+    let era: int = man_floor_div(z, 146097)  # 400-year era
+    let doe: int = z - era * 146097           # day of era [0, 146096]
+    let yoe: int = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365  # year of era
+    let y: int = yoe + era * 400
+    let doy: int = doe - (365 * yoe + yoe / 4 - yoe / 100)  # day of year [0, 365]
+    let mp: int = (5 * doy + 2) / 153  # month [0, 11]
+    let d: int = doy - (153 * mp + 2) / 5 + 1  # day of month [1, 31]
+    # month [1, 12] — HLS has no ternary, use an if statement.
+    let mut m: int = 0
+    if mp < 10 {
+        m = mp + 3
+    } else {
+        m = mp - 9
+    }
+    # year — January / February belong to the previous year. Hinnant's
+    # formula is `y += (m <= 2)`, i.e., if m <= 2 then year = y + 1.
+    # (The algorithm's `y` is the year starting in March.)
+    let mut year: int = 0
+    if m <= 2 {
+        year = y + 1
+    } else {
+        year = y
+    }
+    return man_pad4(year) + "-" + man_pad2(m) + "-" + man_pad2(d)
+}
+
+# man_floor_div(a, b) — floor division for ints. HLS's `/` operator
+# truncates toward zero (C semantics); we need floor division for
+# the date algorithm to handle pre-epoch timestamps correctly.
+fn man_floor_div(a: int, b: int) -> int {
+    let q: int = a / b
+    let r: int = a - q * b
+    if r != 0 && ((r < 0) != (b < 0)) {
+        return q - 1
+    }
+    return q
+}
+
+# man_pad4(n) — pad n to 4 digits with leading zeros (for the year).
+fn man_pad4(n: int) -> str {
+    if n < 0 {
+        return "-" + man_pad4(0 - n)
+    }
+    if n < 10 {
+        return "000" + n.to_str()
+    }
+    if n < 100 {
+        return "00" + n.to_str()
+    }
+    if n < 1000 {
+        return "0" + n.to_str()
+    }
+    return n.to_str()
+}
+
+# man_pad2(n) — pad n to 2 digits with leading zeros (for month / day).
+fn man_pad2(n: int) -> str {
+    if n < 10 {
+        return "0" + n.to_str()
+    }
+    return n.to_str()
+}
+
+# ============================================================================
+# Live I/O — man_write / man_install. These carry the Fs / IO effect
+# and write the rendered nroff source to disk. The pure `man_render`
+# path is independent of these (the differential test only compares
+# the rendered string, not the file content).
+# ============================================================================
+
+# man_write(content, path) — write the rendered nroff source to a
+# file at `path`. Creates or overwrites the file. The path is taken
+# verbatim (no sanitisation — the caller is responsible for the path;
+# `man_install` is the sanitised variant for the canonical install
+# path).
+fn man_write(content: str, path: str) -> void uses Fs {
+    write_file(path, content)
+}
+
+# man_install(content, name, section, prefix) — install the rendered
+# nroff source as a man page at the canonical path:
+#   ${prefix}/share/man/man${section}/${name}.${section}
+# `name` is sanitised: any '/' or '..' component is rejected (the
+# function panics) so an attacker-controlled name cannot write outside
+# the man dir. `section` must be in [1, 9] (panics otherwise).
+#
+# The directory is NOT created by this function — the caller (or the
+# install harness) must ensure `${prefix}/share/man/man${section}/`
+# exists. (Halis v0.3's fs module does not yet have a `mkdir -p`
+# builtin; Stage 60's hls-cli will add one.)
+fn man_install(content: str, name: str, section: int, prefix: str) -> void uses Fs {
+    # Sanitise the name — reject any path separator or traversal.
+    if !man_is_safe_name(name) {
+        panic("man_install: unsafe name '" + name + "' (contains '/' or '..')")
+    }
+    if section < 1 || section > 9 {
+        panic("man_install: section must be 1..9, got " + section.to_str())
+    }
+    let sec_str: str = section.to_str()
+    let path: str = prefix + "/share/man/man" + sec_str + "/" + name + "." + sec_str
+    write_file(path, content)
+}
+
+# man_is_safe_name(name) — true if `name` is a safe man-page name
+# (no '/', no '..', no leading '-' — the latter is a man(7) convention;
+# a name starting with '-' would be parsed as a flag by `man`). Safe
+# names are: letters, digits, hyphens (interior), underscores, dots
+# (interior). The empty name is unsafe.
+fn man_is_safe_name(name: str) -> bool {
+    let n: int = name.len()
+    if n == 0 {
+        return false
+    }
+    # Reject leading '-' (would be parsed as a flag by `man`).
+    if name.byte_at(0) == 45 {
+        return false
+    }
+    let mut i: int = 0
+    while i < n {
+        let b: int = name.byte_at(i)
+        # Reject '/' and '..' (path traversal).
+        if b == 47 {
+            return false
+        }
+        # Check for '..' (two consecutive dots).
+        if b == 46 && i + 1 < n && name.byte_at(i + 1) == 46 {
+            return false
+        }
+        # Allow: A-Z a-z 0-9 - _ .
+        let ok: bool = (b >= 65 && b <= 90) || (b >= 97 && b <= 122)
+            || (b >= 48 && b <= 57) || b == 45 || b == 95 || b == 46
+        if !ok {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+# ============================================================================
+# man_install_path(name, section, prefix) — return the canonical install
+# path for a man page (without writing). Used by `hls install` (Stage 60)
+# to plan the install layout. Pure function (no Fs effect).
+# Panics on unsafe name / section (same checks as man_install).
+# ============================================================================
+
+fn man_install_path(name: str, section: int, prefix: str) -> str {
+    if !man_is_safe_name(name) {
+        panic("man_install_path: unsafe name '" + name + "'")
+    }
+    if section < 1 || section > 9 {
+        panic("man_install_path: section must be 1..9, got " + section.to_str())
+    }
+    let sec_str: str = section.to_str()
+    return prefix + "/share/man/man" + sec_str + "/" + name + "." + sec_str
+}
+
+# ============================================================================
+# End of std/man.hls
+# ============================================================================

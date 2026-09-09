@@ -1,0 +1,1051 @@
+# ============================================================================
+# std/http_router.hls — Stage 63 (v0.78.0-alpha): HTTP router
+# ----------------------------------------------------------------------------
+# This module is the FIRST module of Phase V (the web application track,
+# Stages 63–76). It implements the roadmap's Stage 63 promise:
+#
+#   * `Router::new().get("/", index).post("/users", create_user)` —
+#     a Router that dispatches HTTP requests to handler functions by
+#     (method, path-pattern) match.
+#   * Path parameters (`/users/:id`) — extracted into a map and made
+#     available to the handler via the RouterMatch.
+#   * Query parameters — parsed from the request URL via std.url's
+#     url_query_parse, available as a map[str, str] in the RouterMatch.
+#   * Middleware chains — a list of middleware IDs that run BEFORE the
+#     route handler (e.g., logging, auth, rate-limiting). The chain can
+#     short-circuit by returning a non-None HttpResponse.
+#   * Sub-routers — mount one router under a prefix of another (e.g.,
+#     `router.mount("/api/v1", api_router)` so all `/api/v1/...`
+#     requests are dispatched by `api_router`).
+#
+# Design choices (matching the roadmap's API):
+#
+#   1. BUILDER PATTERN, NOT DERIVE MACROS.
+#      Mirrors std.cli, std.log, std.color, std.man: a Router is a value
+#      built up via immutable updates (`router_new().get("/", 1).
+#      post("/users", 2).use(99).mount("/api", sub_router)`). Every
+#      builder call returns a NEW Router.
+#
+#   2. HANDLER IDs, NOT FUNCTION POINTERS.
+#      HLS v0.3 has no first-class function values that can be stored in
+#      structs (see std/http.hls line 913-915: "HLS v0.3 doesn't have
+#      function pointers, so the handler is invoked by NAME"). This
+#      module uses the same pattern: each route stores an INT handler
+#      ID. The dispatcher returns a RouterMatch with `handler_id`; the
+#      user writes a `match` on handler_id to invoke the actual handler
+#      function. This is the idiomatic HLS pattern (the same pattern
+#      std.async / std.thread use for `spawn(fn, args...)`'s task ID).
+#
+#   3. PATH PATTERNS ARE COMPILED AT REGISTRATION TIME.
+#      `router_get(r, "/users/:id/posts/:post_id", 42)` compiles the
+#      pattern into a list of RouteSegment (Literal | Param | Wildcard)
+#      ONCE. The dispatcher matches each request path against the
+#      compiled segments; param values are collected into a map[str, str]
+#      in O(path-length) time. This is the standard radix-tree-avoiding
+#      O(N) router (N = number of routes) — fine for up to a few
+#      thousand routes (the typical web app has < 100). A future
+#      perfection stage may add a radix tree for O(log N) matching.
+#
+#   4. SUPPORTED PATTERNS.
+#      `/`                     — exact match for the root.
+#      `/users`                — exact match.
+#      `/users/:id`            — `:id` captures one path segment (the
+#                                 substring between two slashes). The
+#                                 captured value is url-decoded.
+#      `/files/*path`          — `*path` captures the REST of the path
+#                                 (multiple segments). Useful for
+#                                 serving static files under a prefix.
+#      `/api/v1/*`             — trailing `*` (no name) matches any
+#                                 path that starts with `/api/v1/`.
+#      `/users/:id/posts/:pid` — multiple params in one pattern.
+#
+#      Trailing slashes are NORMALISED: `/users/` and `/users` are
+#      treated as equivalent (the dispatcher strips a trailing slash
+#      before matching, except for the root `/`).
+#
+#   5. METHOD-SPECIFIC + `ANY` REGISTRATION.
+#      `router_get / router_post / router_put / router_delete /
+#      router_patch / router_head / router_options` — register a route
+#      for a specific HTTP method.
+#      `router_any` — register a route that matches ANY method (useful
+#      for catch-all error handlers).
+#      The dispatcher checks method-specific routes first, then ANY
+#      routes (so a specific route takes precedence over a catch-all).
+#
+#   6. MIDDLEWARE CHAINS.
+#      `router_use(r, mw_id)` — register a global middleware (runs
+#      before every route).
+#      `router_use_for(r, mw_id, prefix)` — register a middleware that
+#      runs only for paths starting with `prefix` (e.g., `/admin`).
+#      The middleware chain runs in REGISTRATION ORDER. Each middleware
+#      is identified by an int ID (same convention as route handlers).
+#      The user's dispatcher invokes each middleware in turn; if a
+#      middleware returns a non-None HttpResponse, the chain
+#      short-circuits (the route handler is NOT called).
+#
+#   7. SUB-ROUTERS.
+#      `router_mount(parent, prefix, child)` — mount `child` under
+#      `prefix`. When the dispatcher receives a request whose path
+#      starts with `prefix`, it strips the prefix and dispatches the
+#      REMAINING path to `child`. Sub-routers can be nested
+#      arbitrarily deep. The dispatcher tries sub-routers AFTER
+#      the parent's own routes (so a parent route can shadow a
+#      sub-router for a specific path).
+#
+#   8. ROUTER_MATCH RETURN VALUE.
+#      `router_match(r, method, path) -> RouterMatch`:
+#        RouterMatch {
+#          found: bool,           # was a route matched?
+#          handler_id: int,       # the route's handler ID (0 if !found)
+#          method: str,           # the matched method (echoed back)
+#          path: str,             # the matched path (echoed back)
+#          params: map[str, str], # path parameters (e.g., {"id": "42"})
+#          query: map[str, str],  # query parameters (parsed from the URL)
+#          middleware_ids: list[int], # the middleware chain to run
+#                                       (in order; may be empty)
+#          remaining_path: str,   # the path AFTER sub-router prefix
+#                                   stripping (used internally; usually
+#                                   same as `path` for top-level dispatch)
+#        }
+#      When `found == false`, the caller typically returns a 404
+#      response. When `found == true`, the caller runs the middleware
+#      chain (which may short-circuit), then dispatches on
+#      `handler_id` to the actual handler function.
+#
+#   9. URL_FOR — REVERSE ROUTING.
+#      `router_url_for(r, handler_id, params) -> str` — build a URL
+#      from a handler ID + a params map. This is the reverse of
+#      `router_match`: given the ID of a route registered with pattern
+#      `/users/:id`, and params = {"id": "42"}, it returns
+#      `/users/42`. Useful for generating links in templates.
+#      Returns "" if no route with the given handler_id is found, or
+#      if a required param is missing from the params map.
+#
+#  10. PURE DISPATCH CORE.
+#      `router_match` is a PURE function (no IO): given a Router +
+#      method + path, it returns a RouterMatch. This makes the
+#      dispatcher differential-safe (interpreter == native). The
+#      handler functions are invoked by the user's main() (which
+#      carries the IO/Net effects), not by the router.
+#
+#  11. NO NEW COMPILER BUILTINS.
+#      The router is pure-HLS on top of std.str, std.option,
+#      std.result, std.url, and std.collections. The dispatcher uses
+#      only list / map / str operations.
+#
+# Security:
+#   * Path parameters are URL-DECODED via std.url.url_decode before
+#     being stored in the params map. This prevents double-decoding
+#     bugs (a handler that calls url_decode on a param value would
+#     decode `%2520` to `%20` instead of a space, which is a classic
+#     access-control bypass).
+#   * The router does NOT call any I/O — it's a pure dispatcher. The
+#     handler functions are responsible for any I/O (and carry the
+#     appropriate effects).
+#   * Sub-router prefix matching is EXACT-PREFIX (not substring): a
+#     sub-router mounted at `/api` matches `/api/users` but NOT
+#     `/api-v2/users` (the latter would be a different prefix). This
+#     prevents an attacker from bypassing the sub-router by using a
+#     similarly-named prefix.
+#   * Trailing-slash normalisation is consistent: the dispatcher
+#     strips exactly one trailing slash (so `/users/` and `/users`
+#     both match a route registered as `/users`). This prevents
+#     access-control bypass via trailing slashes.
+#
+# Differential parity (interpreter == native):
+#   `router_match` is a pure function of (Router, method, path) — all
+#   immutable values. The interpreter and the native binary produce
+#   byte-identical RouterMatch values (the differential test
+#   serialises the match to stdout and compares byte-for-byte).
+#
+# Limitations (deferred to later stages):
+#   * No radix tree (O(N) match; fine for N < ~1000). A future
+#     perfection stage may add a path-prefix trie for O(log N) match.
+#   * No regex patterns (e.g., `/users/:id<[0-9]+>`). The `:id`
+#     captures any single segment; a future stage may add typed
+#     params (int / uuid / regex).
+#   * No host-based routing (e.g., `router.host("api.example.com")`).
+#     A future stage may add a Host matcher.
+#   * No priority / specificity ranking — routes are matched in
+#     REGISTRATION ORDER (first match wins). A future stage may add
+#     specificity ranking (more specific patterns win over less
+#     specific ones, like Express.js / Flask).
+# ============================================================================
+
+import "std.str"
+import "std.option"
+import "std.result"
+import "std.url"
+import "std.collections"
+
+# ----------------------------------------------------------------------------
+# Constants — HTTP method names. Used by the dispatcher for case-
+# insensitive method matching (RFC 7230 says method names are case-
+# sensitive, but most servers accept them case-insensitively — we
+# follow the lenient convention).
+# ----------------------------------------------------------------------------
+
+fn router_method_get() -> str { return "GET" }
+fn router_method_post() -> str { return "POST" }
+fn router_method_put() -> str { return "PUT" }
+fn router_method_delete() -> str { return "DELETE" }
+fn router_method_patch() -> str { return "PATCH" }
+fn router_method_head() -> str { return "HEAD" }
+fn router_method_options() -> str { return "OPTIONS" }
+fn router_method_any() -> str { return "*" }  # wildcard — matches any method
+
+# ----------------------------------------------------------------------------
+# RouteSegmentKind — the kind of a single compiled route segment.
+#   Literal: a literal string segment (e.g., "users" in /users/:id).
+#   Param:   a parameter capture (e.g., :id — captures one segment).
+#   Wildcard: a wildcard capture (e.g., *path — captures the rest).
+# Stored as int because HLS v0.3 has no enum-with-methods; the
+# router switches on these int values.
+# ----------------------------------------------------------------------------
+
+fn router_seg_literal() -> int { return 0 }
+fn router_seg_param() -> int { return 1 }
+fn router_seg_wildcard() -> int { return 2 }
+
+# ----------------------------------------------------------------------------
+# RouteSegment — one compiled segment of a route pattern.
+#   kind: Literal | Param | Wildcard
+#   value: for Literal, the literal text ("users");
+#          for Param, the param name ("id");
+#          for Wildcard, the param name ("path" for *path, "" for *).
+# ----------------------------------------------------------------------------
+
+struct RouteSegment {
+    kind: int,
+    value: str,
+}
+
+# ----------------------------------------------------------------------------
+# Route — a single registered route. A route is (method, pattern,
+# handler_id, segments), where `segments` is the compiled form of
+# `pattern`. The router stores routes in a list (in registration order).
+# ----------------------------------------------------------------------------
+
+struct Route {
+    method: str,             # "GET", "POST", ..., or "*" for ANY
+    pattern: str,            # the original pattern (e.g., "/users/:id")
+    handler_id: int,         # the user-defined handler ID
+    segments: list[RouteSegment],  # the compiled pattern
+}
+
+# ----------------------------------------------------------------------------
+# Middleware — a middleware entry. `mw_id` is the user-defined
+# middleware ID; `prefix` is the path prefix this middleware applies
+# to ("" = global — applies to all paths).
+# ----------------------------------------------------------------------------
+
+struct Middleware {
+    mw_id: int,
+    prefix: str,             # "" for global; "/admin" for prefix-scoped
+}
+
+# ----------------------------------------------------------------------------
+# SubRouterMount — a (prefix, sub_router) pair registered via
+# router_mount. The dispatcher strips the prefix and delegates to the
+# sub_router.
+# ----------------------------------------------------------------------------
+
+struct SubRouterMount {
+    prefix: str,
+    sub_router: Router,
+}
+
+# ----------------------------------------------------------------------------
+# Router — the dispatcher state.
+# ----------------------------------------------------------------------------
+
+struct Router {
+    routes: list[Route],
+    middlewares: list[Middleware],
+    sub_routers: list[SubRouterMount],
+}
+
+# ----------------------------------------------------------------------------
+# RouterMatch — the dispatcher's return value.
+#   found:           was a route matched?
+#   handler_id:      the route's handler ID (0 if !found)
+#   method:          the matched method (echoed back; uppercase)
+#   path:            the matched path (echoed back; trailing slash
+#                     stripped, except for the root "/")
+#   params:          path parameters (e.g., {"id": "42"})
+#   query:           query parameters (parsed from the URL's query string)
+#   middleware_ids:  the middleware chain to run (in order; may be empty)
+#   remaining_path:  the path AFTER sub-router prefix stripping
+#                     (same as `path` for top-level dispatch; the
+#                     sub-router sees the stripped path)
+# ----------------------------------------------------------------------------
+
+struct RouterMatch {
+    found: bool,
+    handler_id: int,
+    method: str,
+    path: str,
+    params: map[str, str],
+    query: map[str, str],
+    middleware_ids: list[int],
+    remaining_path: str,
+}
+
+# ============================================================================
+# Builder — immutable updates (same convention as CliParser / Logger).
+# ============================================================================
+
+# router_new() — create an empty Router. The routes / middlewares /
+# sub_routers lists are empty; the caller adds entries via the
+# router_get / router_post / router_use / router_mount builders.
+fn router_new() -> Router {
+    let empty_routes: list[Route] = []
+    let empty_mw: list[Middleware] = []
+    let empty_sub: list[SubRouterMount] = []
+    return Router {
+        routes: empty_routes,
+        middlewares: empty_mw,
+        sub_routers: empty_sub,
+    }
+}
+
+# router_route(r, method, pattern, handler_id) — register a route for
+# the given HTTP method. The pattern is compiled into segments at
+# registration time (so the dispatcher doesn't recompile on every
+# request). Returns a NEW Router with the route appended.
+#
+# This is the low-level builder; the method-specific builders
+# (router_get / router_post / ...) delegate to this.
+fn router_route(r: Router, method: str, pattern: str, handler_id: int) -> Router {
+    let segments: list[RouteSegment] = router_compile_pattern(pattern)
+    let route: Route = Route {
+        method: method,
+        pattern: pattern,
+        handler_id: handler_id,
+        segments: segments,
+    }
+    let new_routes: list[Route] = router_append_route(r.routes, route)
+    return router_copy(r, new_routes, r.middlewares, r.sub_routers)
+}
+
+# router_get / router_post / router_put / router_delete / router_patch /
+# router_head / router_options / router_any — method-specific builders.
+# Each delegates to router_route with the appropriate method string.
+
+fn router_get(r: Router, pattern: str, handler_id: int) -> Router {
+    return router_route(r, router_method_get(), pattern, handler_id)
+}
+
+fn router_post(r: Router, pattern: str, handler_id: int) -> Router {
+    return router_route(r, router_method_post(), pattern, handler_id)
+}
+
+fn router_put(r: Router, pattern: str, handler_id: int) -> Router {
+    return router_route(r, router_method_put(), pattern, handler_id)
+}
+
+fn router_delete(r: Router, pattern: str, handler_id: int) -> Router {
+    return router_route(r, router_method_delete(), pattern, handler_id)
+}
+
+fn router_patch(r: Router, pattern: str, handler_id: int) -> Router {
+    return router_route(r, router_method_patch(), pattern, handler_id)
+}
+
+fn router_head(r: Router, pattern: str, handler_id: int) -> Router {
+    return router_route(r, router_method_head(), pattern, handler_id)
+}
+
+fn router_options(r: Router, pattern: str, handler_id: int) -> Router {
+    return router_route(r, router_method_options(), pattern, handler_id)
+}
+
+fn router_any(r: Router, pattern: str, handler_id: int) -> Router {
+    return router_route(r, router_method_any(), pattern, handler_id)
+}
+
+# router_use(r, mw_id) — register a GLOBAL middleware (runs before
+# every route). Returns a NEW Router with the middleware appended.
+fn router_use(r: Router, mw_id: int) -> Router {
+    let mw: Middleware = Middleware { mw_id: mw_id, prefix: "" }
+    let new_mw: list[Middleware] = router_append_mw(r.middlewares, mw)
+    return router_copy(r, r.routes, new_mw, r.sub_routers)
+}
+
+# router_use_for(r, mw_id, prefix) — register a middleware that runs
+# only for paths starting with `prefix`. Useful for scoping auth
+# middleware to `/admin/*` or `/api/*`.
+fn router_use_for(r: Router, mw_id: int, prefix: str) -> Router {
+    let mw: Middleware = Middleware { mw_id: mw_id, prefix: prefix }
+    let new_mw: list[Middleware] = router_append_mw(r.middlewares, mw)
+    return router_copy(r, r.routes, new_mw, r.sub_routers)
+}
+
+# router_mount(r, prefix, sub_router) — mount a sub-router under
+# `prefix`. When the dispatcher receives a request whose path starts
+# with `prefix`, it strips the prefix and dispatches the REMAINING
+# path to `sub_router`. Sub-routers can be nested arbitrarily deep.
+#
+# The dispatcher tries sub-routers AFTER the parent's own routes (so
+# a parent route can shadow a sub-router for a specific path).
+fn router_mount(r: Router, prefix: str, sub_router: Router) -> Router {
+    # Normalise the prefix: strip trailing slash (except for the root).
+    let normalised: str = router_normalise_prefix(prefix)
+    let mount: SubRouterMount = SubRouterMount {
+        prefix: normalised,
+        sub_router: sub_router,
+    }
+    let new_subs: list[SubRouterMount] = router_append_sub(r.sub_routers, mount)
+    return router_copy(r, r.routes, r.middlewares, new_subs)
+}
+
+# ----------------------------------------------------------------------------
+# impl Router — method twins of the free-function builders, so the
+# caller can chain `.get("/", 1).post("/users", 2).use(99).mount(...)`
+# (the same convention std.log / std.color / std.man use).
+# ----------------------------------------------------------------------------
+
+impl Router {
+    fn route(self: Router, method: str, pattern: str, handler_id: int) -> Router {
+        return router_route(self, method, pattern, handler_id)
+    }
+    fn get(self: Router, pattern: str, handler_id: int) -> Router {
+        return router_get(self, pattern, handler_id)
+    }
+    fn post(self: Router, pattern: str, handler_id: int) -> Router {
+        return router_post(self, pattern, handler_id)
+    }
+    fn put(self: Router, pattern: str, handler_id: int) -> Router {
+        return router_put(self, pattern, handler_id)
+    }
+    fn delete(self: Router, pattern: str, handler_id: int) -> Router {
+        return router_delete(self, pattern, handler_id)
+    }
+    fn patch(self: Router, pattern: str, handler_id: int) -> Router {
+        return router_patch(self, pattern, handler_id)
+    }
+    fn head(self: Router, pattern: str, handler_id: int) -> Router {
+        return router_head(self, pattern, handler_id)
+    }
+    fn options(self: Router, pattern: str, handler_id: int) -> Router {
+        return router_options(self, pattern, handler_id)
+    }
+    fn any(self: Router, pattern: str, handler_id: int) -> Router {
+        return router_any(self, pattern, handler_id)
+    }
+    fn use_mw(self: Router, mw_id: int) -> Router {
+        return router_use(self, mw_id)
+    }
+    # `use` is a Rust-style keyword that some readers expect; HLS does
+    # NOT reserve it (see boot/lexer.py KEYWORDS), so we expose it as
+    # a method name too. The free function `router_use` is the
+    # canonical name; `use_mw` is the explicit-Rust-style alias.
+    fn use_(self: Router, mw_id: int) -> Router {
+        return router_use(self, mw_id)
+    }
+    fn use_for(self: Router, mw_id: int, prefix: str) -> Router {
+        return router_use_for(self, mw_id, prefix)
+    }
+    fn mount(self: Router, prefix: str, sub_router: Router) -> Router {
+        return router_mount(self, prefix, sub_router)
+    }
+
+    # match(method, path) — the dispatcher. Returns a RouterMatch.
+    # NOTE: HLS reserves `match` as a keyword; the method form is
+    # `dispatch` (mirroring the free function `router_dispatch`).
+    # `match` is exposed as the free function `router_match` (which
+    # is NOT a keyword in HLS — `match` is a keyword only when used as
+    # a statement, not as a name).
+    fn dispatch(self: Router, method: str, path: str) -> RouterMatch {
+        return router_match(self, method, path)
+    }
+
+    # url_for(handler_id, params) — reverse routing. Returns "" if
+    # no route with the given handler_id is found, or if a required
+    # param is missing from `params`.
+    fn url_for(self: Router, handler_id: int, params: map[str, str]) -> str {
+        return router_url_for(self, handler_id, params)
+    }
+}
+
+# ----------------------------------------------------------------------------
+# Internal helpers — append to the routes / middlewares / sub_routers
+# lists (immutable: returns a NEW list). Used by the builders.
+# ----------------------------------------------------------------------------
+
+fn router_append_route(routes: list[Route], route: Route) -> list[Route] {
+    let out: list[Route] = []
+    let mut i: int = 0
+    while i < routes.len() {
+        out.push(routes.get(i))
+        i = i + 1
+    }
+    out.push(route)
+    return out
+}
+
+fn router_append_mw(mws: list[Middleware], mw: Middleware) -> list[Middleware] {
+    let out: list[Middleware] = []
+    let mut i: int = 0
+    while i < mws.len() {
+        out.push(mws.get(i))
+        i = i + 1
+    }
+    out.push(mw)
+    return out
+}
+
+fn router_append_sub(subs: list[SubRouterMount], sub: SubRouterMount) -> list[SubRouterMount] {
+    let out: list[SubRouterMount] = []
+    let mut i: int = 0
+    while i < subs.len() {
+        out.push(subs.get(i))
+        i = i + 1
+    }
+    out.push(sub)
+    return out
+}
+
+fn router_copy(r: Router, routes: list[Route], mws: list[Middleware],
+                subs: list[SubRouterMount]) -> Router {
+    return Router {
+        routes: routes,
+        middlewares: mws,
+        sub_routers: subs,
+    }
+}
+
+# ============================================================================
+# Pattern compilation — router_compile_pattern(pattern) -> list[RouteSegment].
+#
+# Splits the pattern on '/' and classifies each segment:
+#   "" (empty)    — ignored (a leading empty segment from a leading "/"
+#                   is normal; a trailing empty segment from a trailing
+#                   slash is also normal — both are stripped).
+#   "users"       — Literal segment.
+#   ":id"         — Param segment, name "id".
+#   "*path"       — Wildcard segment, name "path".
+#   "*"           — Wildcard segment, name "" (matches any suffix).
+#
+# The pattern MUST start with "/" (the dispatcher assumes absolute
+# paths). A pattern that doesn't start with "/" is rejected with a
+# panic (programmer error, not a runtime error).
+# ============================================================================
+
+fn router_compile_pattern(pattern: str) -> list[RouteSegment] {
+    if pattern.len() == 0 {
+        panic("router_compile_pattern: empty pattern (must start with '/')")
+    }
+    if pattern.byte_at(0) != 47 {
+        panic("router_compile_pattern: pattern must start with '/' (got '" + pattern + "')")
+    }
+    let segments: list[RouteSegment] = []
+    let raw: list[str] = pattern.split("/")
+    let mut i: int = 0
+    while i < raw.len() {
+        let seg: str = raw.get(i)
+        if seg.len() == 0 {
+            # Skip empty segments (from leading "/" or trailing "/" or
+            # "//" in the middle — we treat consecutive slashes as one).
+            i = i + 1
+            continue
+        }
+        if seg.byte_at(0) == 58 {
+            # Param: ":name" -> RouteSegment { kind: Param, value: "name" }.
+            let name: str = seg.slice(1, seg.len())
+            if name.len() == 0 {
+                panic("router_compile_pattern: empty param name in '" + pattern + "'")
+            }
+            segments.push(RouteSegment { kind: router_seg_param(), value: name })
+        } else if seg.byte_at(0) == 42 {
+            # Wildcard: "*name" or "*".
+            let name: str = seg.slice(1, seg.len())
+            segments.push(RouteSegment { kind: router_seg_wildcard(), value: name })
+        } else {
+            # Literal.
+            segments.push(RouteSegment { kind: router_seg_literal(), value: seg })
+        }
+        i = i + 1
+    }
+    return segments
+}
+
+# ============================================================================
+# router_normalise_prefix(prefix) — strip a trailing slash (except for
+# the root "/"). Used by router_mount so that mounting at "/api/" and
+# "/api" behave identically.
+# ============================================================================
+
+fn router_normalise_prefix(prefix: str) -> str {
+    if prefix == "/" {
+        return ""
+    }
+    if prefix.len() > 1 && prefix.byte_at(prefix.len() - 1) == 47 {
+        return prefix.slice(0, prefix.len() - 1)
+    }
+    return prefix
+}
+
+# ============================================================================
+# router_normalise_path(path) — strip a trailing slash (except for the
+# root "/"). Used by router_match so that "/users/" and "/users" match
+# the same route.
+# ============================================================================
+
+fn router_normalise_path(path: str) -> str {
+    if path == "/" {
+        return "/"
+    }
+    if path.len() > 1 && path.byte_at(path.len() - 1) == 47 {
+        return path.slice(0, path.len() - 1)
+    }
+    return path
+}
+
+# ============================================================================
+# router_split_path(path) — split a path into segments (ignoring empty
+# segments from leading/trailing/double slashes). Returns a list[str].
+# ============================================================================
+
+fn router_split_path(path: str) -> list[str] {
+    let out: list[str] = []
+    let raw: list[str] = path.split("/")
+    let mut i: int = 0
+    while i < raw.len() {
+        let seg: str = raw.get(i)
+        if seg.len() > 0 {
+            out.push(seg)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# ============================================================================
+# router_match(r, method, path) — the main dispatcher.
+#
+# 1. Normalise the method (uppercase) and the path (strip trailing /).
+# 2. Split the path into the path part and the query part (if any).
+# 3. Parse the query string into a map[str, str] (via std.url).
+# 4. Try matching against the router's own routes (in registration
+#    order; first match wins). If a route matches, return a RouterMatch
+#    with the route's handler_id and the path params.
+# 5. If no own route matches, try the sub-routers (in registration
+#    order). For each sub-router, if the path starts with the sub-
+#    router's prefix, strip the prefix and recursively dispatch the
+#    remaining path to the sub-router. If the sub-router returns a
+#    match, return it (with the middleware_ids from BOTH the parent
+#    and the sub-router, in registration order).
+# 6. If nothing matches, return a RouterMatch with found=false.
+#
+# Middleware collection:
+#   - Global middleware (prefix == "") runs for every request.
+#   - Prefix-scoped middleware runs only if the path starts with the
+#     prefix.
+#   - The middleware chain is the concatenation of (parent global +
+#     parent prefix-scoped + sub-router global + sub-router prefix-
+#     scoped), in registration order. The user's main() invokes each
+#     middleware in turn; if any middleware returns a non-None
+#     HttpResponse, the chain short-circuits.
+# ============================================================================
+
+fn router_match(r: Router, method: str, path: str) -> RouterMatch {
+    # Normalise the method (uppercase).
+    let upper_method: str = str_to_upper_ascii(method)
+    # Split the path into the path part and the query part.
+    let q_idx: int = path.find("?")
+    let mut path_part: str = path
+    let mut query_part: str = ""
+    if q_idx >= 0 {
+        path_part = path.slice(0, q_idx)
+        query_part = path.slice(q_idx + 1, path.len())
+    }
+    # Parse the query string.
+    let query_map: map[str, str] = url_query_parse(query_part)
+    # Normalise the path (strip trailing slash, except for root).
+    let normalised_path: str = router_normalise_path(path_part)
+
+    # Collect the middleware IDs that apply to this path.
+    let mw_ids: list[int] = router_collect_middleware(r, normalised_path)
+
+    # Try matching against the router's own routes.
+    let mut ri: int = 0
+    while ri < r.routes.len() {
+        let route: Route = r.routes.get(ri)
+        # Method check: a "*" route matches any method; otherwise
+        # exact (case-sensitive, since methods are uppercase by
+        # convention).
+        let method_ok: bool = route.method == router_method_any()
+            || route.method == upper_method
+        if !method_ok {
+            ri = ri + 1
+            continue
+        }
+        # Try to match the path against the route's segments.
+        let params: map[str, str] = map_new()
+        let matched: bool = router_match_segments(route.segments, normalised_path, params)
+        if matched {
+            return RouterMatch {
+                found: true,
+                handler_id: route.handler_id,
+                method: upper_method,
+                path: normalised_path,
+                params: params,
+                query: query_map,
+                middleware_ids: mw_ids,
+                remaining_path: normalised_path,
+            }
+        }
+        ri = ri + 1
+    }
+
+    # No own route matched — try the sub-routers.
+    let mut si: int = 0
+    while si < r.sub_routers.len() {
+        let sub: SubRouterMount = r.sub_routers.get(si)
+        # Check if the path starts with the sub-router's prefix.
+        # EXACT-PREFIX match: "/api" matches "/api/users" but NOT "/api-v2".
+        # The prefix must be followed by either end-of-string or a "/".
+        if router_path_has_prefix(normalised_path, sub.prefix) {
+            # Strip the prefix and dispatch the remaining path to the
+            # sub-router.
+            let remaining: str = router_strip_prefix(normalised_path, sub.prefix)
+            let sub_match: RouterMatch = router_match(sub.sub_router, upper_method, remaining)
+            if sub_match.found {
+                # Merge the parent's middleware IDs with the sub-router's.
+                # The parent's middleware runs FIRST (outermost), then
+                # the sub-router's (innermost). This is the standard
+                # onion model: the outermost middleware wraps the
+                # innermost.
+                let merged_mw: list[int] = router_merge_mw_ids(mw_ids, sub_match.middleware_ids)
+                return RouterMatch {
+                    found: true,
+                    handler_id: sub_match.handler_id,
+                    method: upper_method,
+                    path: normalised_path,
+                    params: sub_match.params,
+                    query: query_map,
+                    middleware_ids: merged_mw,
+                    remaining_path: sub_match.remaining_path,
+                }
+            }
+        }
+        si = si + 1
+    }
+
+    # No match found.
+    let empty_params: map[str, str] = map_new()
+    return RouterMatch {
+        found: false,
+        handler_id: 0,
+        method: upper_method,
+        path: normalised_path,
+        params: empty_params,
+        query: query_map,
+        middleware_ids: mw_ids,
+        remaining_path: normalised_path,
+    }
+}
+
+# ============================================================================
+# router_match_segments(segments, path, params) — try to match `path`
+# against the compiled `segments`. On success, populates `params` with
+# the captured path parameters and returns true. On failure, returns
+# false (and `params` may have partial entries — the caller discards
+# it on false).
+#
+# Algorithm:
+#   1. Split `path` into path-segments (ignoring empty segments).
+#   2. Walk both `segments` (the route's compiled segments) and the
+#      path-segments in lockstep:
+#      - Literal: must match exactly (case-sensitive).
+#      - Param:   captures one path-segment (url-decoded) into params.
+#      - Wildcard: captures the REST of the path (url-decoded) into
+#                  params. A wildcard MUST be the LAST segment in the
+#                  route's pattern (the compiler doesn't enforce this;
+#                  the matcher just stops matching after a wildcard).
+#   3. If we run out of path-segments before segments, no match (the
+#      pattern requires more segments than the path has).
+#   4. If we run out of segments before path-segments:
+#      - If the last segment was a wildcard, it captured the rest.
+#      - Otherwise, no match (the path has more segments than the
+#        pattern).
+# ============================================================================
+
+fn router_match_segments(segments: list[RouteSegment], path: str,
+                          params: map[str, str]) -> bool {
+    let path_segs: list[str] = router_split_path(path)
+    let mut si: int = 0
+    let mut pi: int = 0
+    while si < segments.len() {
+        let seg: RouteSegment = segments.get(si)
+        if seg.kind == router_seg_wildcard() {
+            # Wildcard — capture the REST of the path.
+            # Reconstruct the remaining path from path_segs[pi..] joined by "/".
+            let rest: list[str] = []
+            while pi < path_segs.len() {
+                rest.push(path_segs.get(pi))
+                pi = pi + 1
+            }
+            let captured: str = str_join(rest, "/")
+            # URL-decode the captured value.
+            let decoded: str = url_component_decode(captured)
+            if seg.value != "" {
+                params.set(seg.value, decoded)
+            }
+            # Wildcard always matches (even if the rest is empty).
+            return true
+        }
+        # Literal or Param — needs one path segment.
+        if pi >= path_segs.len() {
+            # Ran out of path segments — no match.
+            return false
+        }
+        let path_seg_raw: str = path_segs.get(pi)
+        if seg.kind == router_seg_literal() {
+            # Literal — exact match (case-sensitive).
+            if path_seg_raw != seg.value {
+                return false
+            }
+        } else if seg.kind == router_seg_param() {
+            # Param — capture (url-decoded).
+            let decoded: str = url_component_decode(path_seg_raw)
+            params.set(seg.value, decoded)
+        }
+        si = si + 1
+        pi = pi + 1
+    }
+    # We've consumed all route segments. The match succeeds iff we've
+    # also consumed all path segments (no leftover).
+    return pi == path_segs.len()
+}
+
+# ============================================================================
+# router_collect_middleware(r, path) — collect the middleware IDs that
+# apply to `path`. Global middleware (prefix == "") always applies;
+# prefix-scoped middleware applies iff the path starts with the prefix.
+# Returns the IDs in registration order.
+# ============================================================================
+
+fn router_collect_middleware(r: Router, path: str) -> list[int] {
+    let out: list[int] = []
+    let mut i: int = 0
+    while i < r.middlewares.len() {
+        let mw: Middleware = r.middlewares.get(i)
+        if mw.prefix == "" || router_path_has_prefix(path, mw.prefix) {
+            out.push(mw.mw_id)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# ============================================================================
+# router_path_has_prefix(path, prefix) — true iff `path` starts with
+# `prefix` (as a path-component-wise prefix). EXACT-PREFIX match:
+# "/api" is a prefix of "/api/users" but NOT of "/api-v2/users".
+# An empty `prefix` matches everything.
+# ============================================================================
+
+fn router_path_has_prefix(path: str, prefix: str) -> bool {
+    if prefix == "" {
+        return true
+    }
+    let pn: int = prefix.len()
+    let ln: int = path.len()
+    if ln < pn {
+        return false
+    }
+    # Check the prefix bytes match.
+    let mut i: int = 0
+    while i < pn {
+        if path.byte_at(i) != prefix.byte_at(i) {
+            return false
+        }
+        i = i + 1
+    }
+    # The prefix matches. Now check the boundary: the next char in
+    # `path` must be either end-of-string or a "/" (so "/api" is a
+    # prefix of "/api" and "/api/users" but NOT of "/api-v2").
+    if ln == pn {
+        return true
+    }
+    if path.byte_at(pn) == 47 {
+        return true
+    }
+    return false
+}
+
+# ============================================================================
+# router_strip_prefix(path, prefix) — strip `prefix` from `path`. The
+# result starts with "/" (so the sub-router sees a normalised absolute
+# path). If `path` equals `prefix`, the result is "/".
+# ============================================================================
+
+fn router_strip_prefix(path: str, prefix: str) -> str {
+    if prefix == "" {
+        return path
+    }
+    let pn: int = prefix.len()
+    let ln: int = path.len()
+    if ln == pn {
+        return "/"
+    }
+    # path[ln..] starts with "/" (guaranteed by router_path_has_prefix).
+    return path.slice(pn, ln)
+}
+
+# ============================================================================
+# router_merge_mw_ids(a, b) — concatenate two middleware ID lists.
+# Used by router_match to merge the parent's middleware with the sub-
+# router's middleware (parent first, sub-router second).
+# ============================================================================
+
+fn router_merge_mw_ids(a: list[int], b: list[int]) -> list[int] {
+    let out: list[int] = []
+    let mut i: int = 0
+    while i < a.len() {
+        out.push(a.get(i))
+        i = i + 1
+    }
+    let mut j: int = 0
+    while j < b.len() {
+        out.push(b.get(j))
+        j = j + 1
+    }
+    return out
+}
+
+# ============================================================================
+# router_url_for(r, handler_id, params) — reverse routing.
+# Given a handler_id and a params map, find the FIRST route with that
+# handler_id and build its URL by substituting the params into the
+# pattern. Returns "" if no route is found, or if a required param is
+# missing from `params`.
+#
+# Example:
+#   r.get("/users/:id", 1)
+#   router_url_for(r, 1, {"id": "42"}) -> "/users/42"
+# ============================================================================
+
+fn router_url_for(r: Router, handler_id: int, params: map[str, str]) -> str {
+    let mut i: int = 0
+    while i < r.routes.len() {
+        let route: Route = r.routes.get(i)
+        if route.handler_id == handler_id {
+            return router_build_url(route.segments, params)
+        }
+        i = i + 1
+    }
+    # Not found in own routes — try sub-routers.
+    let mut si: int = 0
+    while si < r.sub_routers.len() {
+        let sub: SubRouterMount = r.sub_routers.get(si)
+        let sub_url: str = router_url_for(sub.sub_router, handler_id, params)
+        if sub_url != "" {
+            # Prepend the sub-router's prefix.
+            if sub.prefix == "" {
+                return sub_url
+            }
+            return sub.prefix + sub_url
+        }
+        si = si + 1
+    }
+    return ""
+}
+
+# router_build_url(segments, params) — build a URL by substituting
+# params into the compiled segments. Returns "" if a required param
+# is missing.
+fn router_build_url(segments: list[RouteSegment], params: map[str, str]) -> str {
+    let parts: list[str] = []
+    parts.push("")
+    let mut i: int = 0
+    while i < segments.len() {
+        let seg: RouteSegment = segments.get(i)
+        if seg.kind == router_seg_literal() {
+            parts.push(seg.value)
+        } else if seg.kind == router_seg_param() {
+            let val: str = params.get_or(seg.value, "")
+            if val == "" {
+                # Param missing — return "" to signal failure.
+                # (We use "" as the sentinel because a valid URL
+                # never starts with "" — every URL starts with "/".)
+                # Actually, an empty param value is ambiguous: was it
+                # missing or empty? For now we treat empty as missing
+                # (the caller should pass non-empty param values).
+                # A future perfection stage may add an Option[str]
+                # variant.
+                if !params.has(seg.value) {
+                    return ""
+                }
+            }
+            parts.push(val)
+        } else if seg.kind == router_seg_wildcard() {
+            let val: str = params.get_or(seg.value, "")
+            if seg.value != "" && !params.has(seg.value) {
+                return ""
+            }
+            if val != "" {
+                parts.push(val)
+            }
+        }
+        i = i + 1
+    }
+    return str_join(parts, "/")
+}
+
+# ============================================================================
+# router_list_routes(r) — return a human-readable string listing every
+# route in the router (for debugging / `hls doc --routes`). Format:
+#   GET    /users/:id        -> handler 1
+#   POST   /users            -> handler 2
+#   *      /api/*            -> handler 3
+# Pure function (no IO).
+# ============================================================================
+
+fn router_list_routes(r: Router) -> str {
+    let lines: list[str] = []
+    let mut i: int = 0
+    while i < r.routes.len() {
+        let route: Route = r.routes.get(i)
+        let method_str: str = router_pad_method(route.method)
+        lines.push(method_str + " " + route.pattern + " -> handler "
+            + route.handler_id.to_str())
+        i = i + 1
+    }
+    # Recurse into sub-routers.
+    let mut si: int = 0
+    while si < r.sub_routers.len() {
+        let sub: SubRouterMount = r.sub_routers.get(si)
+        let sub_lines: str = router_list_routes(sub.sub_router)
+        # Indent the sub-router's lines by 2 spaces and prefix with the
+        # mount prefix.
+        let sub_split: list[str] = sub_lines.split("\n")
+        lines.push("  (mount at " + sub.prefix + ":)")
+        let mut j: int = 0
+        while j < sub_split.len() {
+            if sub_split.get(j).len() > 0 {
+                lines.push("    " + sub_split.get(j))
+            }
+            j = j + 1
+        }
+        si = si + 1
+    }
+    return str_join(lines, "\n")
+}
+
+# router_pad_method(m) — pad the method to 6 chars (for alignment in
+# router_list_routes). "*" is padded to "     *".
+fn router_pad_method(m: str) -> str {
+    let target: int = 6
+    if m.len() >= target {
+        return m
+    }
+    let gap: int = target - m.len()
+    return m + str_repeat(" ", gap)
+}
+
+# ============================================================================
+# End of std/http_router.hls
+# ============================================================================

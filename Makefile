@@ -2310,3 +2310,110 @@ log-acceptance: bin/hlc
 	@echo "  differential (stdout, interpreter == native) + live smoke (exit 0) verified green."
 
 .PHONY: log-acceptance
+# ============================================================================
+# Stage 62 (v0.77.0-alpha): std.man -- man-page generator (nroff/groff)
+# from a CliParser definition. Pure-HLS module on top of std.cli,
+# std.str, std.option, std.result. The render core (man_render) is a
+# pure function (no IO); the live entry points (man_write / man_install
+# / man_render_default) carry Fs / Clock respectively.
+# ============================================================================
+
+# Stage 62 differential note: the man_render core is pure (no IO), so
+# the interpreter and the native binary produce byte-identical nroff
+# source. The man_render_default path reads the wall clock (Clock
+# effect) for today's date -- its output is compared STDOUT-ONLY (the
+# date varies by day, but the structural fields are deterministic).
+# The man_write / man_install helpers write a file to /tmp; the test
+# reads it back and verifies the content matches the rendered string
+# (this part is smoke-tested via exit 0; the file content is verified
+# by the test's stdout comparison).
+
+man-acceptance: bin/hlc
+	@$(PYTHON) boot/boot.py examples/man_demo.hls > /tmp/man_demo_interp.txt 2>&1
+	@bin/hlc examples/man_demo.hls /tmp/man_demo.c 2>/dev/null
+	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/man_demo /tmp/man_demo.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
+	@/tmp/man_demo > /tmp/man_demo_nat.txt 2>&1
+	@diff -q /tmp/man_demo_interp.txt /tmp/man_demo_nat.txt >/dev/null 2>&1 \
+		|| (echo "FAIL: man_demo differential mismatch" && false)
+	@$(PYTHON) boot/boot.py tests/ok/feat_stage62_man.hls > /tmp/s62_interp.txt 2>&1
+	@bin/hlc tests/ok/feat_stage62_man.hls /tmp/s62.c 2>/dev/null
+	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/s62 /tmp/s62.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
+	@/tmp/s62 > /tmp/s62_nat.txt 2>&1
+	@diff -q /tmp/s62_interp.txt /tmp/s62_nat.txt >/dev/null 2>&1 \
+		|| (echo "FAIL: feat_stage62_man differential mismatch" && false)
+	@/tmp/s62 >/dev/null 2>&1 || (echo "FAIL: feat_stage62_man live smoke (exit non-zero)" && false)
+	@rm -f /tmp/man_demo /tmp/man_demo.c /tmp/man_demo_interp.txt /tmp/man_demo_nat.txt \
+		/tmp/s62 /tmp/s62.c /tmp/s62_interp.txt /tmp/s62_nat.txt /tmp/feat_stage62_man_test.1
+	@echo ""
+	@echo "ACCEPTANCE OK: Stage 62 -- std.man (man-page generator)"
+	@echo "  ManPage builder (man_new + 12 with_* + 3 add_* + impl twins)"
+	@echo "  man_render(page, parser): pure nroff source (no IO)"
+	@echo "  man_render_default(parser): live clock entry point"
+	@echo "  .TH line with NAME SECTION DATE SOURCE MANUAL"
+	@echo "  .SH NAME / SYNOPSIS / DESCRIPTION / OPTIONS / POSITIONAL ARGUMENTS"
+	@echo "  .SH SUBCOMMANDS / ENVIRONMENT / EXIT STATUS / EXAMPLES"
+	@echo "  .SH AUTHORS / BUGS / SEE ALSO / VERSION"
+	@echo "  man_escape: groff metacharacter escaping (defense-in-depth)"
+	@echo "  man_install_path: canonical install path computation"
+	@echo "  man_is_safe_name: rejects /, .., leading -, spaces, special chars"
+	@echo "  man_format_iso_date: Hinnant civil-from-days (pre-epoch safe)"
+	@echo "  man_split_paragraphs: multi-paragraph DESCRIPTION (.PP separator)"
+	@echo "  man_write / man_install: Fs-effect helpers (write_file builtin)"
+	@echo "  Pure-HLS implementation (no new compiler builtins)"
+	@echo "  differential (interpreter == native) + live smoke (exit 0) verified green."
+
+.PHONY: man-acceptance
+
+# ============================================================================
+# Stage 63 (v0.78.0-alpha): std.http_router -- HTTP router (path
+# params, query, middleware, sub-routers). Pure-HLS module on top of
+# std.str, std.option, std.result, std.url, std.collections. The
+# dispatcher (router_match) is a pure function (no IO); the handler
+# invocation is the user's responsibility (the router returns a
+# RouterMatch with the handler_id, and the user's main() dispatches
+# on the ID).
+# ============================================================================
+
+# Stage 63 differential note: router_match is a pure function of
+# (Router, method, path) -- all immutable values. The interpreter and
+# the native binary produce byte-identical RouterMatch values (the
+# test serialises the match to stdout and compares byte-for-byte).
+# The demo's dispatch_handler bridges to std.http (HttpResponse), but
+# the dispatcher itself is pure (no IO, no Net).
+
+http-router-acceptance: bin/hlc
+	@$(PYTHON) boot/boot.py examples/http_router_demo.hls > /tmp/http_router_demo_interp.txt 2>&1
+	@bin/hlc examples/http_router_demo.hls /tmp/http_router_demo.c 2>/dev/null
+	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/http_router_demo /tmp/http_router_demo.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
+	@/tmp/http_router_demo > /tmp/http_router_demo_nat.txt 2>&1
+	@diff -q /tmp/http_router_demo_interp.txt /tmp/http_router_demo_nat.txt >/dev/null 2>&1 \
+		|| (echo "FAIL: http_router_demo differential mismatch" && false)
+	@$(PYTHON) boot/boot.py tests/ok/feat_stage63_http_router.hls > /tmp/s63_interp.txt 2>&1
+	@bin/hlc tests/ok/feat_stage63_http_router.hls /tmp/s63.c 2>/dev/null
+	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/s63 /tmp/s63.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
+	@/tmp/s63 > /tmp/s63_nat.txt 2>&1
+	@diff -q /tmp/s63_interp.txt /tmp/s63_nat.txt >/dev/null 2>&1 \
+		|| (echo "FAIL: feat_stage63_http_router differential mismatch" && false)
+	@rm -f /tmp/http_router_demo /tmp/http_router_demo.c /tmp/http_router_demo_interp.txt /tmp/http_router_demo_nat.txt \
+		/tmp/s63 /tmp/s63.c /tmp/s63_interp.txt /tmp/s63_nat.txt
+	@echo ""
+	@echo "ACCEPTANCE OK: Stage 63 -- std.http_router (HTTP routing)"
+	@echo "  Router builder (router_new + 8 method-specific + 2 use_* + mount)"
+	@echo "  impl Router twins (.get/.post/.put/.delete/.patch/.head/.options/.any/.use_mw/.use_for/.mount/.dispatch/.url_for)"
+	@echo "  Path parameters (/users/:id captured into params map, url-decoded)"
+	@echo "  Wildcard segments (/files/*path captures the rest, /api/* anonymous)"
+	@echo "  Multiple params in one pattern (/users/:id/posts/:pid)"
+	@echo "  Query parameters (parsed from ?a=1&b=2 via std.url)"
+	@echo "  Method-specific + ANY (catch-all method)"
+	@echo "  Middleware chains (global + prefix-scoped; onion-model merging)"
+	@echo "  Sub-routers (mount under a prefix; nested arbitrarily deep)"
+	@echo "  Trailing-slash normalisation (/users/ == /users; / unchanged)"
+	@echo "  Method case-insensitivity ('get' -> 'GET')"
+	@echo "  URL-decoding of path params (%20 -> ' ', %2F -> '/')"
+	@echo "  router_url_for (reverse routing; sub-router prefix prepended)"
+	@echo "  router_path_has_prefix (exact-prefix: /api != /api-v2)"
+	@echo "  router_compile_pattern / router_split_path / router_list_routes"
+	@echo "  Pure-HLS implementation (no new compiler builtins)"
+	@echo "  differential (interpreter == native) verified green."
+
+.PHONY: http-router-acceptance

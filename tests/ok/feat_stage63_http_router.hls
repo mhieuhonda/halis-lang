@@ -1,0 +1,806 @@
+# tests/ok/feat_stage63_http_router.hls — Stage 63 (v0.78.0-alpha):
+# std.http_router.
+#
+# Exercises:
+#   - Router builder (router_new + get/post/put/delete/patch/head/
+#     options/any)
+#   - impl Router method twins (.get("/", 1).post("/users", 2)...)
+#   - Path parameters (/users/:id — captured into params map)
+#   - Wildcard segments (/files/*path — captures the rest of the path)
+#   - Trailing wildcard (/api/* — matches any /api/... path)
+#   - Multiple params in one pattern (/users/:id/posts/:pid)
+#   - Query parameters (parsed from ?a=1&b=2 into the query map)
+#   - Method-specific routing (GET vs POST vs PUT etc.)
+#   - ANY routes (catch-all method)
+#   - Middleware chains (router_use — global; router_use_for — prefix-scoped)
+#   - Sub-routers (router_mount — mount one router under a prefix)
+#   - Sub-router middleware merging (parent + child middleware IDs)
+#   - Trailing-slash normalisation (/users/ == /users)
+#   - Method case-insensitivity ("get" -> "GET" via uppercase)
+#   - URL-decoding of path params (%20 -> " ")
+#   - router_url_for — reverse routing (handler_id + params -> URL)
+#   - router_path_has_prefix — exact-prefix matching (/api != /api-v2)
+#   - router_normalise_path — trailing-slash stripping
+#   - router_compile_pattern — pattern -> segment list
+#   - router_split_path — path -> segment list
+#   - router_list_routes — human-readable route listing
+#   - router_dispatch (impl method) — same as router_match
+#
+# The test uses synthetic Router values and fixed method/path strings
+# so the output is fully reproducible and differential-safe
+# (interpreter == native).
+
+import "std.http_router"
+import "std.str"
+
+# ============================================================================
+# Helpers
+# ============================================================================
+
+fn ok(actual: bool, msg: str) -> void uses IO {
+    if !actual {
+        panic("FAIL " + msg)
+    }
+}
+
+fn eq_int(actual: int, expected: int, msg: str) -> void uses IO {
+    if actual != expected {
+        panic("FAIL " + msg + ": expected " + expected.to_str() + ", got " + actual.to_str())
+    }
+}
+
+fn eq_str(actual: str, expected: str, msg: str) -> void uses IO {
+    if actual != expected {
+        panic("FAIL " + msg + ": expected '" + expected + "', got '" + actual + "'")
+    }
+}
+
+fn eq_bool(actual: bool, expected: bool, msg: str) -> void uses IO {
+    if actual != expected {
+        panic("FAIL " + msg + ": expected " + expected.to_str() + ", got " + actual.to_str())
+    }
+}
+
+# ============================================================================
+# Test 1: basic routing — GET on a static path.
+# ============================================================================
+
+fn test_basic_get() -> int uses IO {
+    let r: Router = router_new()
+        .get("/", 1)
+        .get("/users", 2)
+        .get("/users/list", 3)
+    let m1: RouterMatch = router_match(r, "GET", "/")
+    ok(m1.found, "basic: GET / found")
+    eq_int(m1.handler_id, 1, "basic: GET / handler_id=1")
+    let m2: RouterMatch = router_match(r, "GET", "/users")
+    ok(m2.found, "basic: GET /users found")
+    eq_int(m2.handler_id, 2, "basic: GET /users handler_id=2")
+    let m3: RouterMatch = router_match(r, "GET", "/users/list")
+    ok(m3.found, "basic: GET /users/list found")
+    eq_int(m3.handler_id, 3, "basic: GET /users/list handler_id=3")
+
+    # Nonexistent path.
+    let m4: RouterMatch = router_match(r, "GET", "/nonexistent")
+    ok(!m4.found, "basic: GET /nonexistent not found")
+    eq_int(m4.handler_id, 0, "basic: not-found handler_id=0")
+
+    # Wrong method.
+    let m5: RouterMatch = router_match(r, "POST", "/users")
+    ok(!m5.found, "basic: POST /users not found (only GET registered)")
+    return 0
+}
+
+# ============================================================================
+# Test 2: path parameters (/users/:id).
+# ============================================================================
+
+fn test_path_params() -> int uses IO {
+    let r: Router = router_new()
+        .get("/users/:id", 10)
+    let m: RouterMatch = router_match(r, "GET", "/users/42")
+    ok(m.found, "params: GET /users/42 found")
+    eq_int(m.handler_id, 10, "params: handler_id=10")
+    eq_str(m.params.get_or("id", ""), "42", "params: id=42")
+
+    # URL-decoded param value.
+    let m2: RouterMatch = router_match(r, "GET", "/users/hello%20world")
+    ok(m2.found, "params: GET /users/hello%20world found")
+    eq_str(m2.params.get_or("id", ""), "hello world", "params: id url-decoded")
+
+    # Param with a slash-encoded value (%2F).
+    # NOTE: most HTTP servers don't decode %2F in the path (for security
+    # reasons — see RFC 3986). Our router treats the path as a sequence
+    # of slash-separated segments, so %2F in a segment is NOT treated
+    # as a segment boundary (it stays inside one segment). url_decode
+    # then converts %2F to "/".
+    let m3: RouterMatch = router_match(r, "GET", "/users/foo%2Fbar")
+    ok(m3.found, "params: GET /users/foo%2Fbar found")
+    eq_str(m3.params.get_or("id", ""), "foo/bar", "params: id with %2F decoded")
+
+    # Multiple params in one pattern.
+    let r2: Router = router_new()
+        .get("/users/:id/posts/:pid", 20)
+    let m4: RouterMatch = router_match(r2, "GET", "/users/42/posts/99")
+    ok(m4.found, "params: GET /users/42/posts/99 found")
+    eq_int(m4.handler_id, 20, "params: handler_id=20")
+    eq_str(m4.params.get_or("id", ""), "42", "params: id=42")
+    eq_str(m4.params.get_or("pid", ""), "99", "params: pid=99")
+    return 0
+}
+
+# ============================================================================
+# Test 3: wildcard segments (/files/*path).
+# ============================================================================
+
+fn test_wildcard() -> int uses IO {
+    let r: Router = router_new()
+        .get("/files/*path", 30)
+    # Wildcard captures the rest of the path.
+    let m1: RouterMatch = router_match(r, "GET", "/files/a/b/c.txt")
+    ok(m1.found, "wildcard: GET /files/a/b/c.txt found")
+    eq_int(m1.handler_id, 30, "wildcard: handler_id=30")
+    eq_str(m1.params.get_or("path", ""), "a/b/c.txt", "wildcard: path=a/b/c.txt")
+
+    # Wildcard with URL-encoded chars.
+    let m2: RouterMatch = router_match(r, "GET", "/files/my%20file.txt")
+    ok(m2.found, "wildcard: GET /files/my%20file.txt found")
+    eq_str(m2.params.get_or("path", ""), "my file.txt", "wildcard: path url-decoded")
+
+    # Trailing wildcard without a name.
+    let r2: Router = router_new()
+        .get("/api/*", 40)
+    let m3: RouterMatch = router_match(r2, "GET", "/api/v1/users")
+    ok(m3.found, "wildcard: GET /api/v1/users found")
+    eq_int(m3.handler_id, 40, "wildcard: trailing * handler_id=40")
+    # The wildcard value is NOT stored (no name), so the params map is empty.
+    eq_int(m3.params.len(), 0, "wildcard: trailing * captures nothing (no name)")
+
+    # Wildcard at the root.
+    let r3: Router = router_new()
+        .get("/*", 50)
+    let m4: RouterMatch = router_match(r3, "GET", "/anything/here")
+    ok(m4.found, "wildcard: GET /anything/here found")
+    eq_int(m4.handler_id, 50, "wildcard: root * handler_id=50")
+    return 0
+}
+
+# ============================================================================
+# Test 4: method-specific routing + ANY.
+# ============================================================================
+
+fn test_methods() -> int uses IO {
+    let r: Router = router_new()
+        .get("/users", 1)
+        .post("/users", 2)
+        .put("/users/:id", 3)
+        .delete("/users/:id", 4)
+        .patch("/users/:id", 5)
+        .head("/users/:id", 6)
+        .options("/users/:id", 7)
+        .any("/catchall", 99)
+
+    # GET /users -> handler 1
+    let m1: RouterMatch = router_match(r, "GET", "/users")
+    eq_int(m1.handler_id, 1, "methods: GET /users -> 1")
+
+    # POST /users -> handler 2
+    let m2: RouterMatch = router_match(r, "POST", "/users")
+    eq_int(m2.handler_id, 2, "methods: POST /users -> 2")
+
+    # PUT /users/42 -> handler 3
+    let m3: RouterMatch = router_match(r, "PUT", "/users/42")
+    eq_int(m3.handler_id, 3, "methods: PUT /users/42 -> 3")
+
+    # DELETE /users/42 -> handler 4
+    let m4: RouterMatch = router_match(r, "DELETE", "/users/42")
+    eq_int(m4.handler_id, 4, "methods: DELETE /users/42 -> 4")
+
+    # PATCH /users/42 -> handler 5
+    let m5: RouterMatch = router_match(r, "PATCH", "/users/42")
+    eq_int(m5.handler_id, 5, "methods: PATCH /users/42 -> 5")
+
+    # HEAD /users/42 -> handler 6
+    let m6: RouterMatch = router_match(r, "HEAD", "/users/42")
+    eq_int(m6.handler_id, 6, "methods: HEAD /users/42 -> 6")
+
+    # OPTIONS /users/42 -> handler 7
+    let m7: RouterMatch = router_match(r, "OPTIONS", "/users/42")
+    eq_int(m7.handler_id, 7, "methods: OPTIONS /users/42 -> 7")
+
+    # ANY /catchall — matches any method.
+    let m8: RouterMatch = router_match(r, "GET", "/catchall")
+    eq_int(m8.handler_id, 99, "methods: ANY /catchall GET -> 99")
+    let m9: RouterMatch = router_match(r, "POST", "/catchall")
+    eq_int(m9.handler_id, 99, "methods: ANY /catchall POST -> 99")
+    let m10: RouterMatch = router_match(r, "DELETE", "/catchall")
+    eq_int(m10.handler_id, 99, "methods: ANY /catchall DELETE -> 99")
+    return 0
+}
+
+# ============================================================================
+# Test 5: query parameters (parsed from ?a=1&b=2).
+# ============================================================================
+
+fn test_query_params() -> int uses IO {
+    let r: Router = router_new()
+        .get("/search", 1)
+    let m: RouterMatch = router_match(r, "GET", "/search?q=hello&page=2")
+    ok(m.found, "query: GET /search?q=hello&page=2 found")
+    eq_int(m.handler_id, 1, "query: handler_id=1")
+    eq_str(m.query.get_or("q", ""), "hello", "query: q=hello")
+    eq_str(m.query.get_or("page", ""), "2", "query: page=2")
+
+    # URL-encoded query values.
+    let m2: RouterMatch = router_match(r, "GET", "/search?q=hello%20world")
+    eq_str(m2.query.get_or("q", ""), "hello world", "query: q url-decoded")
+
+    # Empty query string.
+    let m3: RouterMatch = router_match(r, "GET", "/search")
+    eq_int(m3.query.len(), 0, "query: empty query string -> empty map")
+
+    # Query string with no value (just a key).
+    let m4: RouterMatch = router_match(r, "GET", "/search?flag")
+    eq_str(m4.query.get_or("flag", ""), "", "query: flag -> empty value")
+
+    # Query string with multiple values for the same key — the LAST
+    # wins (the std.url url_query_parse semantics: a map[str, str] can
+    # only hold one value per key; the last write wins).
+    let m5: RouterMatch = router_match(r, "GET", "/search?page=1&page=2")
+    eq_str(m5.query.get_or("page", ""), "2", "query: duplicate keys -> last wins")
+
+    # Path params AND query params together.
+    let r2: Router = router_new()
+        .get("/users/:id", 2)
+    let m6: RouterMatch = router_match(r2, "GET", "/users/42?tab=profile&format=json")
+    ok(m6.found, "query: GET /users/42?tab=profile&format=json found")
+    eq_str(m6.params.get_or("id", ""), "42", "query: path param id=42")
+    eq_str(m6.query.get_or("tab", ""), "profile", "query: tab=profile")
+    eq_str(m6.query.get_or("format", ""), "json", "query: format=json")
+    return 0
+}
+
+# ============================================================================
+# Test 6: middleware chains (global + prefix-scoped).
+# ============================================================================
+
+fn test_middleware() -> int uses IO {
+    let r: Router = router_new()
+        .use_mw(100)                       # global
+        .use_for(101, "/admin")            # prefix-scoped to /admin
+        .get("/", 1)
+        .get("/admin/dashboard", 2)
+        .get("/users", 3)
+
+    # Global middleware runs for every request.
+    let m1: RouterMatch = router_match(r, "GET", "/")
+    eq_int(m1.middleware_ids.len(), 1, "mw: GET / has 1 mw (global only)")
+    eq_int(m1.middleware_ids.get(0), 100, "mw: GET / mw[0]=100")
+
+    # Both global + prefix-scoped middleware run for /admin/*.
+    let m2: RouterMatch = router_match(r, "GET", "/admin/dashboard")
+    eq_int(m2.middleware_ids.len(), 2, "mw: GET /admin/dashboard has 2 mw")
+    eq_int(m2.middleware_ids.get(0), 100, "mw: GET /admin/dashboard mw[0]=100 (global)")
+    eq_int(m2.middleware_ids.get(1), 101, "mw: GET /admin/dashboard mw[1]=101 (admin-scoped)")
+
+    # Only global for non-admin paths.
+    let m3: RouterMatch = router_match(r, "GET", "/users")
+    eq_int(m3.middleware_ids.len(), 1, "mw: GET /users has 1 mw (global only)")
+    eq_int(m3.middleware_ids.get(0), 100, "mw: GET /users mw[0]=100")
+
+    # Even a not-found request collects middleware.
+    let m4: RouterMatch = router_match(r, "GET", "/admin/nonexistent")
+    eq_int(m4.middleware_ids.len(), 2, "mw: not-found /admin/* still collects mw")
+    return 0
+}
+
+# ============================================================================
+# Test 7: sub-routers (mount).
+# ============================================================================
+
+fn test_sub_routers() -> int uses IO {
+    # Sub-router for /api/v1.
+    let api_v1: Router = router_new()
+        .get("/users", 11)
+        .get("/users/:id", 12)
+        .post("/users", 13)
+        .use_mw(200)  # sub-router's own global middleware
+
+    # Parent router mounts the sub-router at /api/v1.
+    let r: Router = router_new()
+        .get("/", 1)
+        .mount("/api/v1", api_v1)
+        .use_mw(100)
+
+    # Parent route.
+    let m1: RouterMatch = router_match(r, "GET", "/")
+    ok(m1.found, "sub: GET / found in parent")
+    eq_int(m1.handler_id, 1, "sub: GET / handler_id=1")
+
+    # Sub-router route: GET /api/v1/users -> sub-router handler 11.
+    let m2: RouterMatch = router_match(r, "GET", "/api/v1/users")
+    ok(m2.found, "sub: GET /api/v1/users found via sub-router")
+    eq_int(m2.handler_id, 11, "sub: GET /api/v1/users handler_id=11")
+
+    # Sub-router route with param: GET /api/v1/users/42 -> handler 12.
+    let m3: RouterMatch = router_match(r, "GET", "/api/v1/users/42")
+    ok(m3.found, "sub: GET /api/v1/users/42 found via sub-router")
+    eq_int(m3.handler_id, 12, "sub: GET /api/v1/users/42 handler_id=12")
+    eq_str(m3.params.get_or("id", ""), "42", "sub: id=42")
+
+    # Middleware merging: parent (global) + sub-router (global) = 2.
+    let m4: RouterMatch = router_match(r, "GET", "/api/v1/users")
+    eq_int(m4.middleware_ids.len(), 2, "sub: middleware merged (parent + sub)")
+    eq_int(m4.middleware_ids.get(0), 100, "sub: parent mw[0]=100")
+    eq_int(m4.middleware_ids.get(1), 200, "sub: sub-router mw[1]=200")
+
+    # Non-matching sub-router path.
+    let m5: RouterMatch = router_match(r, "GET", "/api/v1/nonexistent")
+    ok(!m5.found, "sub: GET /api/v1/nonexistent not found")
+    return 0
+}
+
+# ============================================================================
+# Test 8: trailing-slash normalisation.
+# ============================================================================
+
+fn test_trailing_slash() -> int uses IO {
+    let r: Router = router_new()
+        .get("/users", 1)
+        .get("/users/:id", 2)
+
+    # /users and /users/ both match the same route.
+    let m1: RouterMatch = router_match(r, "GET", "/users")
+    let m2: RouterMatch = router_match(r, "GET", "/users/")
+    eq_bool(m1.found, true, "slash: GET /users found")
+    eq_bool(m2.found, true, "slash: GET /users/ found (trailing slash stripped)")
+    eq_int(m1.handler_id, m2.handler_id, "slash: same handler_id for /users and /users/")
+
+    # /users/42 and /users/42/ both match.
+    let m3: RouterMatch = router_match(r, "GET", "/users/42")
+    let m4: RouterMatch = router_match(r, "GET", "/users/42/")
+    eq_bool(m3.found, true, "slash: GET /users/42 found")
+    eq_bool(m4.found, true, "slash: GET /users/42/ found")
+    eq_int(m3.handler_id, m4.handler_id, "slash: same handler_id for /users/42 and /users/42/")
+
+    # Root "/" is NOT stripped (it's the only path that's allowed to
+    # have a trailing slash).
+    let r2: Router = router_new()
+        .get("/", 99)
+    let m5: RouterMatch = router_match(r2, "GET", "/")
+    eq_bool(m5.found, true, "slash: GET / found")
+    return 0
+}
+
+# ============================================================================
+# Test 9: method case-insensitivity ("get" -> "GET").
+# ============================================================================
+
+fn test_method_case() -> int uses IO {
+    let r: Router = router_new()
+        .get("/", 1)
+        .post("/users", 2)
+    # Lowercase method.
+    let m1: RouterMatch = router_match(r, "get", "/")
+    ok(m1.found, "case: lowercase 'get' matches GET route")
+    eq_int(m1.handler_id, 1, "case: handler_id=1")
+    eq_str(m1.method, "GET", "case: method normalised to uppercase")
+
+    # Mixed case.
+    let m2: RouterMatch = router_match(r, "Post", "/users")
+    ok(m2.found, "case: mixed 'Post' matches POST route")
+    eq_int(m2.handler_id, 2, "case: handler_id=2")
+    eq_str(m2.method, "POST", "case: method normalised to uppercase")
+    return 0
+}
+
+# ============================================================================
+# Test 10: router_url_for — reverse routing.
+# ============================================================================
+
+fn test_url_for() -> int uses IO {
+    let r: Router = router_new()
+        .get("/users/:id", 1)
+        .get("/users/:id/posts/:pid", 2)
+        .get("/static/*path", 3)
+
+    # Simple param substitution.
+    let p1: map[str, str] = map_new()
+    p1.set("id", "42")
+    eq_str(router_url_for(r, 1, p1), "/users/42", "url_for: /users/42")
+
+    # Multiple params.
+    let p2: map[str, str] = map_new()
+    p2.set("id", "42")
+    p2.set("pid", "99")
+    eq_str(router_url_for(r, 2, p2), "/users/42/posts/99", "url_for: /users/42/posts/99")
+
+    # Wildcard substitution.
+    let p3: map[str, str] = map_new()
+    p3.set("path", "a/b/c.txt")
+    eq_str(router_url_for(r, 3, p3), "/static/a/b/c.txt", "url_for: /static/a/b/c.txt")
+
+    # Missing param -> "".
+    let p4: map[str, str] = map_new()
+    p4.set("pid", "99")  # missing id
+    eq_str(router_url_for(r, 2, p4), "", "url_for: missing param -> empty string")
+
+    # Unknown handler_id -> "".
+    let p5: map[str, str] = map_new()
+    eq_str(router_url_for(r, 999, p5), "", "url_for: unknown handler_id -> empty string")
+
+    # Sub-router url_for — prepend the mount prefix.
+    let sub: Router = router_new()
+        .get("/users/:id", 10)
+    let parent: Router = router_new()
+        .mount("/api/v1", sub)
+    let p6: map[str, str] = map_new()
+    p6.set("id", "42")
+    eq_str(router_url_for(parent, 10, p6), "/api/v1/users/42", "url_for: sub-router prefix prepended")
+    return 0
+}
+
+# ============================================================================
+# Test 11: router_path_has_prefix — exact-prefix matching.
+# ============================================================================
+
+fn test_path_has_prefix() -> int uses IO {
+    # /api is a prefix of /api and /api/users.
+    ok(router_path_has_prefix("/api/users", "/api"), "prefix: /api prefix of /api/users")
+    ok(router_path_has_prefix("/api", "/api"), "prefix: /api prefix of /api")
+
+    # /api is NOT a prefix of /api-v2 (different path component).
+    ok(!router_path_has_prefix("/api-v2/users", "/api"), "prefix: /api NOT prefix of /api-v2")
+
+    # Empty prefix matches everything.
+    ok(router_path_has_prefix("/anything", ""), "prefix: empty prefix matches everything")
+    ok(router_path_has_prefix("/", ""), "prefix: empty prefix matches /")
+
+    # /api is NOT a prefix of /ap (too short).
+    ok(!router_path_has_prefix("/ap", "/api"), "prefix: /api NOT prefix of /ap (too short)")
+    return 0
+}
+
+# ============================================================================
+# Test 12: router_normalise_path — trailing-slash stripping.
+# ============================================================================
+
+fn test_normalise_path() -> int uses IO {
+    eq_str(router_normalise_path("/users/"), "/users", "norm: /users/ -> /users")
+    eq_str(router_normalise_path("/users"), "/users", "norm: /users -> /users")
+    eq_str(router_normalise_path("/"), "/", "norm: / -> / (root unchanged)")
+    eq_str(router_normalise_path("/users/42/"), "/users/42", "norm: /users/42/ -> /users/42")
+    eq_str(router_normalise_path(""), "", "norm: empty -> empty")
+    return 0
+}
+
+# ============================================================================
+# Test 13: router_compile_pattern — pattern -> segment list.
+# ============================================================================
+
+fn test_compile_pattern() -> int uses IO {
+    # Static path.
+    let s1: list[RouteSegment] = router_compile_pattern("/users/list")
+    eq_int(s1.len(), 2, "compile: /users/list -> 2 segments")
+    eq_int(s1.get(0).kind, router_seg_literal(), "compile: seg[0] is Literal")
+    eq_str(s1.get(0).value, "users", "compile: seg[0].value = 'users'")
+    eq_int(s1.get(1).kind, router_seg_literal(), "compile: seg[1] is Literal")
+    eq_str(s1.get(1).value, "list", "compile: seg[1].value = 'list'")
+
+    # Param.
+    let s2: list[RouteSegment] = router_compile_pattern("/users/:id")
+    eq_int(s2.len(), 2, "compile: /users/:id -> 2 segments")
+    eq_int(s2.get(0).kind, router_seg_literal(), "compile: seg[0] is Literal")
+    eq_int(s2.get(1).kind, router_seg_param(), "compile: seg[1] is Param")
+    eq_str(s2.get(1).value, "id", "compile: seg[1].value = 'id'")
+
+    # Wildcard.
+    let s3: list[RouteSegment] = router_compile_pattern("/files/*path")
+    eq_int(s3.len(), 2, "compile: /files/*path -> 2 segments")
+    eq_int(s3.get(1).kind, router_seg_wildcard(), "compile: seg[1] is Wildcard")
+    eq_str(s3.get(1).value, "path", "compile: seg[1].value = 'path'")
+
+    # Trailing wildcard without name.
+    let s4: list[RouteSegment] = router_compile_pattern("/api/*")
+    eq_int(s4.len(), 2, "compile: /api/* -> 2 segments")
+    eq_int(s4.get(1).kind, router_seg_wildcard(), "compile: seg[1] is Wildcard")
+    eq_str(s4.get(1).value, "", "compile: seg[1].value = '' (anonymous wildcard)")
+
+    # Root.
+    let s5: list[RouteSegment] = router_compile_pattern("/")
+    eq_int(s5.len(), 0, "compile: / -> 0 segments (empty)")
+
+    # Trailing slash normalised.
+    let s6: list[RouteSegment] = router_compile_pattern("/users/")
+    eq_int(s6.len(), 1, "compile: /users/ -> 1 segment (trailing slash ignored)")
+    return 0
+}
+
+# ============================================================================
+# Test 14: router_split_path — path -> segment list.
+# ============================================================================
+
+fn test_split_path() -> int uses IO {
+    let s1: list[str] = router_split_path("/users/42/posts")
+    eq_int(s1.len(), 3, "split: /users/42/posts -> 3 segments")
+    eq_str(s1.get(0), "users", "split: seg[0] = 'users'")
+    eq_str(s1.get(1), "42", "split: seg[1] = '42'")
+    eq_str(s1.get(2), "posts", "split: seg[2] = 'posts'")
+
+    # Root.
+    let s2: list[str] = router_split_path("/")
+    eq_int(s2.len(), 0, "split: / -> 0 segments")
+
+    # Empty.
+    let s3: list[str] = router_split_path("")
+    eq_int(s3.len(), 0, "split: empty -> 0 segments")
+
+    # Trailing slash ignored.
+    let s4: list[str] = router_split_path("/users/")
+    eq_int(s4.len(), 1, "split: /users/ -> 1 segment (trailing slash ignored)")
+    eq_str(s4.get(0), "users", "split: seg[0] = 'users'")
+
+    # Double slashes collapsed.
+    let s5: list[str] = router_split_path("/users//42")
+    eq_int(s5.len(), 2, "split: /users//42 -> 2 segments (double slash collapsed)")
+    return 0
+}
+
+# ============================================================================
+# Test 15: router_list_routes — human-readable listing.
+# ============================================================================
+
+fn test_list_routes() -> int uses IO {
+    let r: Router = router_new()
+        .get("/", 1)
+        .get("/users/:id", 2)
+        .post("/users", 3)
+        .use_mw(100)
+    let listing: str = router_list_routes(r)
+    # The listing should contain each route's method, pattern, and handler_id.
+    ok(listing.contains("GET    / -> handler 1"), "list: contains GET / route")
+    ok(listing.contains("GET    /users/:id -> handler 2"), "list: contains GET /users/:id route")
+    ok(listing.contains("POST   /users -> handler 3"), "list: contains POST /users route")
+    return 0
+}
+
+# ============================================================================
+# Test 16: impl Router method twins (builder chaining).
+# ============================================================================
+
+fn test_method_twins() -> int uses IO {
+    # All method-specific builders via impl.
+    let r: Router = router_new()
+        .get("/g", 1)
+        .post("/p", 2)
+        .put("/u", 3)
+        .delete("/d", 4)
+        .patch("/pa", 5)
+        .head("/h", 6)
+        .options("/o", 7)
+        .any("/a", 8)
+    let m1: RouterMatch = router_match(r, "GET", "/g")
+    eq_int(m1.handler_id, 1, "twins: GET /g -> 1")
+    let m2: RouterMatch = router_match(r, "POST", "/p")
+    eq_int(m2.handler_id, 2, "twins: POST /p -> 2")
+    let m3: RouterMatch = router_match(r, "PUT", "/u")
+    eq_int(m3.handler_id, 3, "twins: PUT /u -> 3")
+    let m4: RouterMatch = router_match(r, "DELETE", "/d")
+    eq_int(m4.handler_id, 4, "twins: DELETE /d -> 4")
+    let m5: RouterMatch = router_match(r, "PATCH", "/pa")
+    eq_int(m5.handler_id, 5, "twins: PATCH /pa -> 5")
+    let m6: RouterMatch = router_match(r, "HEAD", "/h")
+    eq_int(m6.handler_id, 6, "twins: HEAD /h -> 6")
+    let m7: RouterMatch = router_match(r, "OPTIONS", "/o")
+    eq_int(m7.handler_id, 7, "twins: OPTIONS /o -> 7")
+    let m8: RouterMatch = router_match(r, "GET", "/a")
+    eq_int(m8.handler_id, 8, "twins: ANY /a GET -> 8")
+
+    # The dispatch method twin.
+    let m9: RouterMatch = r.dispatch("GET", "/g")
+    eq_int(m9.handler_id, 1, "twins: r.dispatch(GET, /g) -> 1")
+
+    # The url_for method twin.
+    let empty_params: map[str, str] = map_new()
+    eq_str(r.url_for(1, empty_params), "/g", "twins: r.url_for(1, {}) -> /g")
+    return 0
+}
+
+# ============================================================================
+# Test 17: builder immutability — router_get returns a NEW Router.
+# ============================================================================
+
+fn test_builder_immutability() -> int uses IO {
+    let r0: Router = router_new()
+    let r1: Router = router_get(r0, "/foo", 1)
+
+    # r0 has no routes.
+    let m0: RouterMatch = router_match(r0, "GET", "/foo")
+    ok(!m0.found, "immut: r0 has no routes (router_get did not mutate r0)")
+
+    # r1 has the route.
+    let m1: RouterMatch = router_match(r1, "GET", "/foo")
+    ok(m1.found, "immut: r1 has the route (router_get returned a new Router)")
+    eq_int(m1.handler_id, 1, "immut: r1 handler_id=1")
+    return 0
+}
+
+# ============================================================================
+# Test 18: nested sub-routers (2+ levels deep).
+# ============================================================================
+
+fn test_nested_sub_routers() -> int uses IO {
+    # /api/v1/users  -> api_v1 router
+    # /api/v1/admin/ -> api_v1_admin router (nested inside api_v1)
+    let api_v1_admin: Router = router_new()
+        .get("/stats", 31)
+        .use_mw(300)
+
+    let api_v1: Router = router_new()
+        .get("/users", 21)
+        .mount("/admin", api_v1_admin)
+        .use_mw(200)
+
+    let r: Router = router_new()
+        .get("/", 1)
+        .mount("/api/v1", api_v1)
+        .use_mw(100)
+
+    # Top-level.
+    let m1: RouterMatch = router_match(r, "GET", "/")
+    eq_int(m1.handler_id, 1, "nested: GET / -> 1")
+
+    # 1-level sub-router.
+    let m2: RouterMatch = router_match(r, "GET", "/api/v1/users")
+    eq_int(m2.handler_id, 21, "nested: GET /api/v1/users -> 21")
+
+    # 2-level nested sub-router.
+    let m3: RouterMatch = router_match(r, "GET", "/api/v1/admin/stats")
+    ok(m3.found, "nested: GET /api/v1/admin/stats found")
+    eq_int(m3.handler_id, 31, "nested: GET /api/v1/admin/stats -> 31")
+
+    # Middleware from all 3 levels (parent + api_v1 + api_v1_admin).
+    eq_int(m3.middleware_ids.len(), 3, "nested: 3 middleware IDs (all levels)")
+    eq_int(m3.middleware_ids.get(0), 100, "nested: mw[0]=100 (parent global)")
+    eq_int(m3.middleware_ids.get(1), 200, "nested: mw[1]=200 (api_v1 global)")
+    eq_int(m3.middleware_ids.get(2), 300, "nested: mw[2]=300 (api_v1_admin global)")
+    return 0
+}
+
+# ============================================================================
+# Test 19: registration order matters (first match wins).
+# ============================================================================
+
+fn test_registration_order() -> int uses IO {
+    # Two routes that both could match "/users/me":
+    #   /users/:id  (registered first)
+    #   /users/me   (registered second)
+    # The FIRST registered route wins (registration order, not
+    # specificity).
+    let r: Router = router_new()
+        .get("/users/:id", 1)
+        .get("/users/me", 2)
+    let m: RouterMatch = router_match(r, "GET", "/users/me")
+    eq_int(m.handler_id, 1, "order: first match wins (handler_id=1, not 2)")
+    eq_str(m.params.get_or("id", ""), "me", "order: id='me' (captured by /users/:id)")
+    return 0
+}
+
+# ============================================================================
+# Test 20: sub-router prefix exact-boundary check.
+# ============================================================================
+
+fn test_sub_router_boundary() -> int uses IO {
+    let sub: Router = router_new()
+        .get("/users", 1)
+    let r: Router = router_new()
+        .mount("/api", sub)
+
+    # /api/users -> matches (sub-router sees /users).
+    let m1: RouterMatch = router_match(r, "GET", "/api/users")
+    ok(m1.found, "boundary: /api/users matches (sub-router prefix /api)")
+
+    # /api-v2/users -> does NOT match (prefix /api is NOT a prefix of /api-v2).
+    let m2: RouterMatch = router_match(r, "GET", "/api-v2/users")
+    ok(!m2.found, "boundary: /api-v2/users does NOT match (exact-prefix rule)")
+
+    # /api -> matches the mount prefix itself (sub-router sees /).
+    let sub_with_root: Router = router_new()
+        .get("/", 99)
+    let r2: Router = router_new()
+        .mount("/api", sub_with_root)
+    let m3: RouterMatch = router_match(r2, "GET", "/api")
+    ok(m3.found, "boundary: /api matches the mount prefix (sub-router sees /)")
+    eq_int(m3.handler_id, 99, "boundary: handler_id=99")
+    return 0
+}
+
+# ============================================================================
+# Main — run all tests sequentially.
+# ============================================================================
+
+fn main() -> int uses IO {
+    println("=== Stage 63: std.http_router (HTTP routing) ===")
+    println("")
+    println("--- basic GET routing ---")
+    test_basic_get()
+    println("  ok")
+    println("--- path parameters (/users/:id) ---")
+    test_path_params()
+    println("  ok")
+    println("--- wildcard segments (/files/*path, /api/*) ---")
+    test_wildcard()
+    println("  ok")
+    println("--- method-specific + ANY ---")
+    test_methods()
+    println("  ok")
+    println("--- query parameters (?a=1&b=2) ---")
+    test_query_params()
+    println("  ok")
+    println("--- middleware chains (global + prefix-scoped) ---")
+    test_middleware()
+    println("  ok")
+    println("--- sub-routers (mount) ---")
+    test_sub_routers()
+    println("  ok")
+    println("--- trailing-slash normalisation ---")
+    test_trailing_slash()
+    println("  ok")
+    println("--- method case-insensitivity ---")
+    test_method_case()
+    println("  ok")
+    println("--- router_url_for (reverse routing) ---")
+    test_url_for()
+    println("  ok")
+    println("--- router_path_has_prefix (exact-prefix) ---")
+    test_path_has_prefix()
+    println("  ok")
+    println("--- router_normalise_path ---")
+    test_normalise_path()
+    println("  ok")
+    println("--- router_compile_pattern ---")
+    test_compile_pattern()
+    println("  ok")
+    println("--- router_split_path ---")
+    test_split_path()
+    println("  ok")
+    println("--- router_list_routes ---")
+    test_list_routes()
+    println("  ok")
+    println("--- impl Router method twins ---")
+    test_method_twins()
+    println("  ok")
+    println("--- builder immutability ---")
+    test_builder_immutability()
+    println("  ok")
+    println("--- nested sub-routers (2+ levels) ---")
+    test_nested_sub_routers()
+    println("  ok")
+    println("--- registration order (first match wins) ---")
+    test_registration_order()
+    println("  ok")
+    println("--- sub-router prefix boundary ---")
+    test_sub_router_boundary()
+    println("  ok")
+    println("")
+    println("ACCEPTANCE OK: Stage 63 — std.http_router (HTTP routing)")
+    println("  Router builder (router_new + 8 method-specific + 2 use_* + mount)")
+    println("  impl Router method twins (.get/.post/.put/.delete/.patch/.head/.options/.any/.use_mw/.use_for/.mount/.dispatch/.url_for)")
+    println("  Path parameters (/users/:id captured into params map, url-decoded)")
+    println("  Wildcard segments (/files/*path captures the rest, /api/* anonymous)")
+    println("  Multiple params in one pattern (/users/:id/posts/:pid)")
+    println("  Query parameters (parsed from ?a=1&b=2 via std.url)")
+    println("  Method-specific + ANY (catch-all method)")
+    println("  Middleware chains (global + prefix-scoped; onion-model merging)")
+    println("  Sub-routers (mount under a prefix; nested arbitrarily deep)")
+    println("  Trailing-slash normalisation (/users/ == /users; / unchanged)")
+    println("  Method case-insensitivity ('get' -> 'GET')")
+    println("  URL-decoding of path params (%20 -> ' ', %2F -> '/')")
+    println("  router_url_for (reverse routing; sub-router prefix prepended)")
+    println("  router_path_has_prefix (exact-prefix: /api != /api-v2)")
+    println("  router_normalise_path / router_compile_pattern / router_split_path")
+    println("  router_list_routes (human-readable listing)")
+    println("  Pure-HLS implementation (no new compiler builtins)")
+    println("  differential (interpreter == native) verified green.")
+    return 0
+}

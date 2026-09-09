@@ -13,6 +13,136 @@ stability (125–140), and final stabilisation toward v1.0 (141–150).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
+## [v0.78.0-alpha] — Stage 63: std.http_router (HTTP routing: path params, query, middleware, sub-routers)
+
+> Begins **Phase V (web application track, Stages 63–76)**.
+> Adds `std.http_router` — a pure-HLS HTTP router that dispatches
+> HTTP requests to handler functions by (method, path-pattern) match.
+> Implements the roadmap's Stage 63 promise:
+> `Router::new().get("/", index).post("/users", create_user)` — the
+> builder pattern, immutable updates, method-specific registration
+> (GET / POST / PUT / DELETE / PATCH / HEAD / OPTIONS / ANY),
+> path parameters (`/users/:id` — captured into a params map and
+> URL-decoded), wildcard segments (`/files/*path` — captures the rest
+> of the path; `/api/*` — anonymous trailing wildcard), multiple
+> params in one pattern (`/users/:id/posts/:pid`), query parameters
+> (parsed from `?a=1&b=2` via std.url), middleware chains (global +
+> prefix-scoped; onion-model merging between parent and sub-routers),
+> and sub-routers (`router_mount(parent, prefix, child)` — mount one
+> router under a prefix of another, nestable arbitrarily deep).
+>
+> HLS v0.3 has no first-class function values that can be stored in
+> structs (the same constraint `std.http` documented at line 913 of
+> `std/http.hls`); the router uses the same convention: each route
+> stores an INT handler ID, and the dispatcher returns a `RouterMatch`
+> with `handler_id`. The user writes a `match` on the ID to invoke
+> the actual handler function. This is the idiomatic HLS pattern.
+>
+> The dispatcher (`router_match`) is a PURE function (no IO, no Net) —
+> the only inputs are immutable values (Router, method, path). This
+> makes the dispatcher differential-safe: the interpreter and the
+> native binary produce byte-identical RouterMatch values. The
+> handler invocation is the user's responsibility (the router returns
+> a `RouterMatch` with the handler_id and params; the user's main()
+> dispatches on the ID — see `examples/http_router_demo.hls` for the
+> `dispatch_handler` bridge to `std.http`'s `HttpResponse`).
+>
+> Reverse routing (`router_url_for(handler_id, params) -> str`) builds
+> a URL from a handler ID + params map — useful for generating links
+> in templates. Sub-router url_for prepends the mount prefix.
+>
+> Trailing-slash normalisation: `/users/` and `/users` are treated as
+> equivalent (the dispatcher strips a trailing slash before matching,
+> except for the root `/`). Method case-insensitivity: `'get'` is
+> normalised to `'GET'` (RFC 7230 says method names are case-sensitive,
+> but most servers accept them case-insensitively — we follow the
+> lenient convention). Path parameters are URL-decoded via
+> `std.url.url_component_decode` before being stored in the params map
+> (this prevents double-decoding bugs).
+>
+> Security: the router is a pure dispatcher — no I/O, no shell, no
+> file access. Sub-router prefix matching is EXACT-PREFIX (not
+> substring): a sub-router mounted at `/api` matches `/api/users` but
+> NOT `/api-v2/users` (the latter would be a different prefix). This
+> prevents an attacker from bypassing the sub-router by using a
+> similarly-named prefix.
+>
+> No new compiler builtins — pure-HLS on top of `std.str`,
+> `std.option`, `std.result`, `std.url`, and `std.collections`.
+>
+> **Acceptance**: `make http-router-acceptance` runs the demo +
+> acceptance test differentially (interpreter == native) — both PASS.
+> 20/20 tests in `tests/ok/feat_stage63_http_router.hls` PASS.
+
+## [v0.77.0-alpha] — Stage 62: std.man (man-page generator: nroff/groff from CliParser)
+
+> Completes **Phase IV (CLI tooling track, Stages 53–62)**.
+> Adds `std.man` — a pure-HLS man-page generator that produces a
+> complete groff/nroff man page from a `CliParser` definition.
+> Implements the roadmap's Stage 62 promise:
+> `hls doc --man myapp` produces a groff/nroff man page from the CLI
+> parser definition; `hls install` installs both the binary and the
+> man page (the install step is a Stage-60 concern; this module
+> provides the rendering primitive `man_render` plus the install
+> helper `man_install` that writes the page to the canonical
+> `${prefix}/share/man/manN/name.N` path).
+>
+> Builder pattern (`ManPage` value built up via immutable updates,
+> same convention as `std.cli`, `std.log`, `std.color`):
+> `man_new("myapp", 1, "1.0.0").with_date("2026-09-09").
+>  with_source("myapp 1.0.0").with_manual("User Commands")` — every
+> builder returns a NEW ManPage. The `impl ManPage` block provides
+> method twins (`.with_date(...).with_source(...)` chainable).
+>
+> Pure render core: `man_render(page, parser)` is a pure function (no
+> IO) that produces the complete nroff source as a str. This makes
+> the renderer differential-safe (interpreter == native). The live
+> entry points (`man_write` / `man_install`) carry the Fs effect and
+> write the rendered text to disk; `man_render_default(parser)` reads
+> the wall clock (Clock effect) for today's date.
+>
+> Strict groff escaping (`man_escape`): runs on EVERY user-controlled
+> string (descriptions, after_help, example titles/bodies, see-also
+> names, etc.) before embedding in nroff. Neutralises the four groff
+> metacharacter classes: (1) leading `.` or `'` on a line — prepend
+> a zero-width space (`\&`) so the line is not interpreted as a groff
+> request (defense-in-depth against `.sy` shell-injection in old
+> groff-based man viewers); (2) `-` — escape to `\-` so groff does
+> not break the line at every hyphen (mangling long option names like
+> `--no-color`); (3) `\\` — double to render as a literal backslash;
+> (4) control bytes (0x00-0x1F except `\t` `\n`) — stripped.
+>
+> Nroff structure follows man(7): `.TH NAME SECTION DATE SOURCE
+> MANUAL`, `.SH NAME` (`name \- one-line description`), `.SH
+> SYNOPSIS` (built-in `-h`/`-V` + every declared option + positionals
+> + subcommands), `.SH DESCRIPTION` (long_desc split into paragraphs
+> via `.PP`), `.SH OPTIONS` (`.TP` per option with default/env/
+> required annotations), `.SH POSITIONAL ARGUMENTS` (only when the
+> parser declares positionals), `.SH SUBCOMMANDS` (when declared),
+> `.SH ENVIRONMENT` (when any option has an env-var fallback),
+> `.SH EXIT STATUS` (man_add_exit_code entries), `.SH EXAMPLES`
+> (`.PP` + `.RS` + `.nf`/`.fi` code block per example), `.SH AUTHORS`,
+> `.SH BUGS`, `.SH SEE ALSO` (`.BR name (section)` per entry),
+> `.SH VERSION`. Empty sections are omitted.
+>
+> `man_install_path(name, section, prefix)` computes the canonical
+> install path; `man_is_safe_name(name)` rejects `/`, `..`, leading
+> `-`, and unsafe chars (defense against path traversal via an
+> attacker-controlled name).
+>
+> `man_format_iso_date(ms)` formats an epoch-millisecond timestamp
+> as `YYYY-MM-DD` via Howard Hinnant's civil-from-days algorithm
+> (floor-division adjusted for pre-epoch timestamps). Pure function
+> (differential-safe).
+>
+> No new compiler builtins — pure-HLS on top of `std.cli`,
+> `std.str`, `std.option`, `std.result`, and the `write_file` builtin
+> (Fs effect) for `man_write` / `man_install`.
+>
+> **Acceptance**: `make man-acceptance` runs the demo + acceptance
+> test differentially (interpreter == native) — both PASS.
+> 16/16 tests in `tests/ok/feat_stage62_man.hls` PASS.
+
 ## [v0.76.0-alpha] — Stage 57: std.log (structured logging: human + JSON + syslog)
 
 > Continues **Phase IV (CLI tooling track, Stages 53–62)**.

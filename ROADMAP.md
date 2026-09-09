@@ -104,13 +104,13 @@ remains green.
 | 59 | `std.complete` — shell-completion generator (bash/zsh/fish) | ⬜ | 3 weeks |
 | 60 | `hls-cli` — `cargo`-style launcher (`hls new`, `hls run`, `hls build`) | ⬜ | 5 weeks |
 | 61 | `hls-doc` — rustdoc-style API docs generator | ⬜ | 6 weeks |
-| 62 | Man-page generator (`--man` produces nroff) | ⬜ | 2 weeks |
+| 62 | Man-page generator (`--man` produces nroff) | ✅ | (done in v0.77.0-alpha) |
 
 ### Phase V — Web application track (Stages 63–76)
 
 | # | Stage | Status | Estimated effort |
 |---|-------|:------:|:----------------:|
-| 63 | `std.http.router` — path params, middleware, sub-routers | ⬜ | 4 weeks |
+| 63 | `std.http.router` — path params, middleware, sub-routers | ✅ | (done in v0.78.0-alpha) |
 | 64 | `std.http.server` — multi-thread, keep-alive, HTTP/2 push | ⬜ | 5 weeks |
 | 65 | `std.websocket` — RFC 6455 server + client | ⬜ | 5 weeks |
 | 66 | `std.cookie` — signed cookies, SameSite, secure flag | ⬜ | 3 weeks |
