@@ -344,8 +344,13 @@ def main():
     print("== hltest: %d file(s), -j %d ==" % (len(files), args.jobs))
     t0 = time.perf_counter()
 
+    # BUG FIX: `all_results` was only initialised inside the single-process
+    # branch. The multiprocessing branch (args.jobs > 1) used `all_results.extend(...)`
+    # without first creating the list, raising UnboundLocalError on every
+    # parallel run (the default -j is os.cpu_count(), so this fired on any
+    # multi-core host unless the user passed -j 1).
+    all_results = []
     if args.jobs <= 1 or len(files) == 1:
-        all_results = []
         for f in files:
             all_results.extend(run_file(f, grep=args.grep))
     else:
