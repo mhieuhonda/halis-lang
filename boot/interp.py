@@ -2139,6 +2139,24 @@ class Interp:
         # (interpreter == native) holds bit-for-bit on the same
         # platform (libm is platform-consistent on Linux x86-64 /
         # aarch64 / riscv64 — we don't claim cross-platform parity).
+        # Deep-scan-20 fix (HIGH, interpreter/native parity): Python's
+        # math module raises ValueError on domain errors and
+        # OverflowError on range errors, where the C runtime (hlc.hls
+        # emits raw libm calls) returns NaN / ±inf. Uncaught, these
+        # killed the process with a raw Python traceback and exit 1
+        # while the native build printed a value and kept running.
+        # Map the raising family onto libm semantics.
+        def _libm(f, *a, **kw):
+            try:
+                return f(*a)
+            except ValueError:
+                # Domain error: C returns NaN (poles overridden by
+                # callers that pass on_domain=...).
+                return kw.get("on_domain", float("nan"))
+            except OverflowError:
+                # Range error: C returns ±HUGE_VAL.
+                return math.copysign(float("inf"), kw.get("signof", 1.0))
+
         if name == "math_sin":
             return math.sin(args[0])
         if name == "math_cos":
@@ -2146,31 +2164,44 @@ class Interp:
         if name == "math_tan":
             return math.tan(args[0])
         if name == "math_asin":
-            return math.asin(args[0])
+            return _libm(math.asin, args[0])
         if name == "math_acos":
-            return math.acos(args[0])
+            return _libm(math.acos, args[0])
         if name == "math_atan":
             return math.atan(args[0])
         if name == "math_atan2":
             return math.atan2(args[0], args[1])
         if name == "math_sinh":
-            return math.sinh(args[0])
+            return _libm(math.sinh, args[0], signof=args[0])
         if name == "math_cosh":
-            return math.cosh(args[0])
+            return _libm(math.cosh, args[0])
         if name == "math_tanh":
             return math.tanh(args[0])
         if name == "math_exp":
-            return math.exp(args[0])
+            return _libm(math.exp, args[0])
         if name == "math_log":
-            return math.log(args[0])
+            # C pole error: log(0) / log(-0.0) = -inf, not NaN.
+            if args[0] == 0:
+                return float("-inf")
+            return _libm(math.log, args[0])
         if name == "math_log10":
-            return math.log10(args[0])
+            if args[0] == 0:
+                return float("-inf")
+            return _libm(math.log10, args[0])
         if name == "math_log2":
-            return math.log2(args[0])
+            if args[0] == 0:
+                return float("-inf")
+            return _libm(math.log2, args[0])
         if name == "math_pow":
-            return math.pow(args[0], args[1])
+            # Estimate the C result's sign for range errors: only a
+            # negative base with an odd integral exponent overflows
+            # to -inf; everything else overflows to +inf.
+            _sg = 1.0
+            if args[0] < 0 and float(args[1]).is_integer() and int(args[1]) % 2 == 1:
+                _sg = -1.0
+            return _libm(math.pow, args[0], args[1], signof=_sg)
         if name == "math_sqrt":
-            return math.sqrt(args[0])
+            return _libm(math.sqrt, args[0])
         if name == "math_cbrt":
             # Python's math module added cbrt in 3.11; we require
             # 3.12+ (boot.py guard), so it's available.
@@ -2178,15 +2209,17 @@ class Interp:
         if name == "math_hypot":
             return math.hypot(args[0], args[1])
         if name == "math_fmod":
-            return math.fmod(args[0], args[1])
+            # C: fmod(x, 0) is a domain error -> NaN.
+            return _libm(math.fmod, args[0], args[1])
         if name == "math_erf":
             return math.erf(args[0])
         if name == "math_erfc":
             return math.erfc(args[0])
         if name == "math_tgamma":
-            return math.gamma(args[0])
+            return _libm(math.gamma, args[0])
         if name == "math_lgamma":
-            return math.lgamma(args[0])
+            # C poles (0, -1, -2, ...) yield +inf, not NaN.
+            return _libm(math.lgamma, args[0], on_domain=float("inf"))
         if name == "math_isnan":
             return math.isnan(args[0])
         if name == "math_isinf":

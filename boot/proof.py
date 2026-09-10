@@ -357,16 +357,24 @@ def _is_len_call(e):
 
 
 def _len_owner(e):
-    """Best-effort owner name for a len() call (for symbolic bounds)."""
+    """Best-effort owner name for a len() call (for symbolic bounds).
+
+    Deep-scan-20 soundness fix: only plain identifiers are valid
+    owners. The old code returned e.get("name") for ANY node — a
+    field access `p.items.len()` keyed its minlen fact on the bare
+    field name "items", which then collided with an unrelated
+    parameter named `items` and proved out-of-bounds accesses on it
+    (the native len_owner correctly returns "?" for field targets;
+    this restores boot/native parity)."""
     if not isinstance(e, dict):
         return "?"
     if e.get("k") == "call" and e.get("name") == "len":
         a = e.get("args") or []
-        if a and isinstance(a[0], dict):
+        if a and isinstance(a[0], dict) and a[0].get("k") == "ident":
             return a[0].get("name", "?")
     if e.get("k") == "method" and e.get("name") == "len":
         t = e.get("target")
-        if isinstance(t, dict):
+        if isinstance(t, dict) and t.get("k") == "ident":
             return t.get("name", "?")
     return "?"
 
@@ -621,6 +629,36 @@ def _drop_facts_for_owner(facts, tname):
             facts[var] = Interval(f.lo if not isinstance(f.lo, tuple) else None, None)
 
 
+def _collect_len_mutators(e, out):
+    """Deep-scan-20 soundness fix: collect the ident names whose length
+    is MUTATED by a list.pop()/list.push() method call anywhere inside
+    expression `e`. A minlen fact seeded from `requires xs.len() >= N`
+    used to survive `let _ = xs.pop()` (an expression statement never
+    ran the assignment invalidation path), so the prover kept proving
+    bounds checks dead on a list that had just shrunk — the native -O
+    fast build then emitted an unchecked out-of-bounds access."""
+    if not isinstance(e, dict):
+        return
+    if e.get("k") == "method" and e.get("name") in ("pop", "push"):
+        t = e.get("target")
+        if isinstance(t, dict) and t.get("k") == "ident":
+            out.append(t.get("name"))
+    for key in ("l", "r", "e", "cond", "idx", "scrut"):
+        _collect_len_mutators(e.get(key), out)
+    for a in (e.get("args") or []):
+        _collect_len_mutators(a, out)
+    for it in (e.get("items") or []):
+        _collect_len_mutators(it, out)
+    for fld in (e.get("fields") or []):
+        if isinstance(fld, dict):
+            _collect_len_mutators(fld.get("value"), out)
+    for arm in (e.get("arms") or []):
+        if isinstance(arm, dict):
+            _collect_len_mutators(arm.get("body") if not isinstance(arm.get("body"), list) else None, out)
+            _collect_len_mutators(arm.get("guard"), out)
+    _collect_len_mutators(e.get("target"), out)
+
+
 def _copy_facts(facts):
     """Deep copy of a facts dict (the __nz set and __minlen dict are
     mutable containers shared between branches otherwise)."""
@@ -819,6 +857,18 @@ def propagate_stmts(stmts, facts, depth=0):
             facts.update(after)
             continue
         propagate_stmt_exprs(s, facts)
+        # Deep-scan-20 soundness fix: list.pop()/push() inside this
+        # statement (expr statement, let value, condition...) mutates
+        # the receiver's length — invalidate its facts exactly like a
+        # reassignment would (see _collect_len_mutators).
+        _muts = []
+        for key in ("value", "cond", "iter", "e"):
+            _collect_len_mutators(s.get(key), _muts)
+        tgt = s.get("target")
+        if isinstance(tgt, dict):
+            _collect_len_mutators(tgt.get("idx"), _muts)
+        for tname in _muts:
+            _drop_facts_for_owner(facts, tname)
         if k == "let" or k == "assign":
             t = s.get("t") or s.get("vtype")
             tgt = s.get("target")

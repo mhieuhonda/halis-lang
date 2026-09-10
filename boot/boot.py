@@ -49,6 +49,21 @@ def _resolve_import(import_path, importing_file):
     """
     if import_path.startswith("std."):
         module_name = import_path[4:]
+        # Deep-scan-20 fix (HIGH, path traversal): the relative-path
+        # branch below rejects absolute paths and ".." segments, but
+        # this branch joined module_name into std/<name>.hls with no
+        # validation — `import "std.../deep/secret/priv"` resolved to
+        # std/../deep/secret/priv.hls and LOADED code from outside std/
+        # (and `os.path.join("std", "/abs")` discards "std" entirely,
+        # injecting an absolute path). Same local-file-inclusion vector
+        # deep-scan-19 closed for relative imports; guard it here too.
+        if not module_name:
+            raise SystemExit("error: import path must name a module after 'std.': %s" % import_path)
+        if module_name.startswith("/") or module_name.startswith("\\"):
+            raise SystemExit("error: import path must be relative, got absolute: %s" % import_path)
+        _mparts = module_name.replace("\\", "/").split("/")
+        if ".." in _mparts:
+            raise SystemExit("error: import path must not contain '..' segments: %s" % import_path)
         rel = os.path.join("std", module_name + ".hls")
         # Walk up from the importing file's directory.
         if importing_file:
@@ -494,6 +509,18 @@ def print_fast_report(program, checker):
             walk(e.get(key))
         for a in (e.get("args") or []):
             walk(a)
+        # Deep-scan-20 fix: propagate_stmt_exprs in boot/proof.py also
+        # annotates nodes inside list-literal items, struct-literal
+        # field values and a match scrutinee — walk() skipped them, so
+        # the report undercounted the proven-dead checks (the native
+        # -O fast build elides all of them; the report must match).
+        for it in (e.get("items") or []):
+            walk(it)
+        for fld in (e.get("fields") or []):
+            if isinstance(fld, dict):
+                walk(fld.get("value"))
+        if e.get("scrut") is not None:
+            walk(e.get("scrut"))
         if e.get("k") == "method":
             walk(e.get("target"))
         if e.get("k") == "index":
