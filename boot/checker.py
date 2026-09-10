@@ -1623,6 +1623,39 @@ class Checker:
             return True
         return False
 
+    def path_terminates(self, stmts, in_loop):
+        """Return True if executing `stmts` always exits the current path
+        via `return` (in any context) or `break`/`continue` (in a loop
+        context) or a `never`-typed expression.
+
+        Used by the `if` move-state union logic to skip moved-state
+        contributions from arms that always exit (their moves cannot
+        reach the post-if code). This is the move-state analogue of
+        `all_return`, extended to also cover `break`/`continue` (which
+        terminate the current path the same way `return` does for the
+        purpose of post-if reachability).
+        """
+        if not stmts:
+            return False
+        last = stmts[-1]
+        if last["k"] == "return":
+            return True
+        if in_loop and last["k"] in ("break", "continue"):
+            return True
+        if last["k"] == "expr" and last["e"].get("t") == "never":
+            return True
+        if last["k"] == "let" and last["value"].get("t") == "never":
+            return True
+        if last["k"] == "assign" and last["value"].get("t") == "never":
+            return True
+        if last["k"] == "if" and last["els"] is not None:
+            return (self.path_terminates(last["then"], in_loop) and
+                    self.path_terminates(last["els"], in_loop))
+        if last["k"] == "expr" and last["e"]["k"] == "match" and \
+           self.match_all_return(last["e"]):
+            return True
+        return False
+
     def match_all_return(self, e):
         # BUG-008 fix: arm["body"] is the result of parse_expr (parser.py:540)
         # — it's always an EXPRESSION node (call, match, bin, enumlit, …),
@@ -1673,24 +1706,42 @@ class Checker:
             # (`u_x = NULL` after drop/take). Sound fix: UNION the moved-
             # status across both arms (a binding is moved if it was moved
             # along any path).
+            #
+            # Reachability refinement: an arm that always exits (return /
+            # break / continue / never-typed expr) does NOT contribute its
+            # moved-state to the post-if state — its moves cannot reach
+            # the code after the `if`. Without this refinement, the
+            # idiomatic
+            #     `if cond { ch.send(take(x)); return; } use(x);`
+            # was rejected with a spurious "use of moved value" on `use(x)`,
+            # even though the only path that reaches `use(x)` is the one
+            # where `cond` was false (so `x` was never moved).
             snap = self.snapshot_moved(env)
             self.child(env)
             self.check_stmts(s["then"], env, fn, in_loop)
             env.pop()
             then_snap = self.snapshot_moved(env)
+            then_terminates = self.path_terminates(s["then"], in_loop)
             self.restore_moved(env, snap)
             if s["els"] is not None:
                 self.child(env)
                 self.check_stmts(s["els"], env, fn, in_loop)
                 env.pop()
                 else_snap = self.snapshot_moved(env)
+                else_terminates = self.path_terminates(s["els"], in_loop)
                 self.restore_moved(env, snap)
-                self.union_moved(env, then_snap)
-                self.union_moved(env, else_snap)
+                # Union each arm's moves ONLY if that arm can fall through
+                # to the post-if code. An arm that always exits cannot
+                # contribute moves to the post-if state.
+                if not then_terminates:
+                    self.union_moved(env, then_snap)
+                if not else_terminates:
+                    self.union_moved(env, else_snap)
             else:
                 # No else arm — equivalent to an empty else (no moves).
-                # Union just the then-arm state.
-                self.union_moved(env, then_snap)
+                # Union just the then-arm state (if it can fall through).
+                if not then_terminates:
+                    self.union_moved(env, then_snap)
         elif k == "while":
             self.loop_header += 1
             ct = self.check_expr(s["cond"], env, None)
