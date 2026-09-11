@@ -59,7 +59,7 @@ remains green.
 | 24 | `wasm-opt` integration + emscripten bridge | ✅ | 3 weeks |
 | 25 | AArch64 backend tuning (Apple Silicon, Graviton) | ✅ | 4 weeks |
 | 26 | RISC-V 64 backend (foundation for OS work) | ✅ | 5 weeks |
-| 27 | Inline assembly syntax (`asm!`) | ⬜ | 4 weeks |
+| 27 | Inline assembly syntax (`asm!`) | ✅ | (done in v0.50.0-alpha) |
 | 28 | Stack-frame layout control (for kernel code) | ✅ | 3 weeks |
 | 29 | `noinline`/`always_inline`/`cold`/`hot` attributes | ✅ | 2 weeks |
 | 30 | Boxed-vs-stack layout analysis (escape analysis) | ✅ | 5 weeks |
