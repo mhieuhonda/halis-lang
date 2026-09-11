@@ -31,7 +31,7 @@ else
   HL_CURL_DEFS :=
 endif
 
-.PHONY: all stage0 bootstrap test examples clean run check bench install uninstall audit opt-stats emit-ir emit-llvm fmt lint lsp-check pkg-init pkg-add pkg-lock pkg-audit pkg-verify pkg-build pkg-publish pkg-log pkg-log-verify prove prove-full model prove-acceptance hltest fuzz cov fuzz-acceptance wasm-opt webapp webapp-acceptance serve aarch64-bench aarch64-acceptance aarch64-list-targets stack-acceptance inline-acceptance opt-stats-report kernel-attrs escape-acceptance layout-report tail-acceptance tail-report asm-acceptance asm-attrs bench-stdlib spec-check stage32-acceptance async-acceptance stream-acceptance io-acceptance fs-acceptance net-acceptance http-acceptance http2-acceptance json-stream-acceptance regex-acceptance fmt-acceptance hash-acceptance collections-acceptance sync-acceptance thread-acceptance time-acceptance math-acceptance process-acceptance env-acceptance archive-acceptance uuid-ulid-acceptance cli-acceptance tui-acceptance color-acceptance progress-acceptance log-acceptance
+.PHONY: all stage0 bootstrap test examples clean run check bench install uninstall audit opt-stats emit-ir emit-llvm fmt lint lsp-check pkg-init pkg-add pkg-lock pkg-audit pkg-verify pkg-build pkg-publish pkg-log pkg-log-verify prove prove-full model prove-acceptance hltest fuzz cov fuzz-acceptance wasm-opt webapp webapp-acceptance serve aarch64-bench aarch64-acceptance aarch64-list-targets stack-acceptance inline-acceptance opt-stats-report kernel-attrs escape-acceptance layout-report tail-acceptance tail-report asm-acceptance asm-attrs bench-stdlib spec-check stage32-acceptance async-acceptance stream-acceptance io-acceptance fs-acceptance net-acceptance http-acceptance http2-acceptance json-stream-acceptance regex-acceptance fmt-acceptance hash-acceptance collections-acceptance sync-acceptance thread-acceptance time-acceptance math-acceptance process-acceptance env-acceptance archive-acceptance uuid-ulid-acceptance cli-acceptance tui-acceptance color-acceptance progress-acceptance log-acceptance http-server-acceptance websocket-acceptance cookie-acceptance
 
 # Main goal: use the full bootstrap chain to build the native compiler
 all: bootstrap
@@ -2645,3 +2645,166 @@ http-server-acceptance: bin/hlc
 	@echo "  differential (interpreter == native) verified green."
 
 .PHONY: http-server-acceptance
+
+# ============================================================================
+# Stage 65 (v0.84.0-alpha): std.websocket -- RFC 6455 WebSocket protocol
+# (server + client handshake, frame encode/decode, masking, close
+# handshake). Pure-HLS module on top of std.http, std.http2, std.bits,
+# std.sha1 (NEW this stage), std.base64, std.str, std.option,
+# std.result, std.net. Also adds std/sha1.hls (RFC 3174 / FIPS 180-4
+# SHA-1) -- required by RFC 6455 §1.3 for the Sec-WebSocket-Accept
+# derivation. Verified against the FIPS 180-4 test vectors and the
+# canonical RFC 6455 §1.3 example (client key dGhlIHNhbXBsZSBub25jZQ==
+# -> accept s3pPLMBiTxaQ9kYGzzhZRbK+xOo=). The pure pieces (handshake
+# key computation, frame encode/decode, masking, close-code parsing)
+# are differentially verified. The network pieces (live send/recv
+# helpers) are exercised in the demo but are NOT part of the
+# differential suite (binding a real port would be non-deterministic
+# in CI).
+# ============================================================================
+
+# Stage 65 differential note: the pure pieces of std.websocket
+# (accept-key computation, frame encode/decode, masking, close-code
+# parsing, HTTP handshake request/response rendering) are pure
+# functions of immutable inputs. The interpreter and the native binary
+# produce byte-identical output on the acceptance test. The demo
+# (examples/websocket_demo.hls) is also differentially verified (it
+# computes SHA-1 FIPS vectors, the RFC 6455 §1.3 accept-key example,
+# the full 101 response, upgrade validation, accept verification,
+# byte-level frame encoding with a fixed mask key, close-frame round
+# trip, full client-side handshake request, opcode/close-code names --
+# all deterministic, no actual network).
+
+websocket-acceptance: bin/hlc
+	@$(PYTHON) boot/boot.py examples/websocket_demo.hls > /tmp/ws_demo_interp.txt 2>&1
+	@bin/hlc examples/websocket_demo.hls /tmp/ws_demo.c 2>/dev/null
+	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/ws_demo /tmp/ws_demo.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
+	@/tmp/ws_demo > /tmp/ws_demo_nat.txt 2>&1
+	@diff -q /tmp/ws_demo_interp.txt /tmp/ws_demo_nat.txt >/dev/null 2>&1 \
+		|| (echo "FAIL: websocket_demo differential mismatch" && false)
+	@$(PYTHON) boot/boot.py tests/ok/feat_stage65_websocket.hls > /tmp/s65_interp.txt 2>&1
+	@bin/hlc tests/ok/feat_stage65_websocket.hls /tmp/s65.c 2>/dev/null
+	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/s65 /tmp/s65.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
+	@/tmp/s65 > /tmp/s65_nat.txt 2>&1
+	@diff -q /tmp/s65_interp.txt /tmp/s65_nat.txt >/dev/null 2>&1 \
+		|| (echo "FAIL: feat_stage65_websocket differential mismatch" && false)
+	@rm -f /tmp/ws_demo /tmp/ws_demo.c /tmp/ws_demo_interp.txt /tmp/ws_demo_nat.txt \
+		/tmp/s65 /tmp/s65.c /tmp/s65_interp.txt /tmp/s65_nat.txt
+	@echo ""
+	@echo "ACCEPTANCE OK: Stage 65 -- std.websocket (RFC 6455 WebSocket protocol)"
+	@echo "  std.sha1 (RFC 3174 / FIPS 180-4): sha1_hash / sha1_hex"
+	@echo "    verified against FIPS 180-4 test vectors (empty, 'abc', 448-bit, fox)"
+	@echo "  Server-side handshake:"
+	@echo "    ws_accept_key (RFC 6455 S1.3: base64(SHA-1(key + GUID)))"
+	@echo "    ws_handshake_response (101 Switching Protocols + subprotocol)"
+	@echo "    ws_validate_upgrade (RFC 6455 S4.1: method/version/headers validation)"
+	@echo "    ws_pick_subprotocol (first of comma-separated list)"
+	@echo "  Client-side handshake:"
+	@echo "    ws_generate_key (random 16-byte base64)"
+	@echo "    ws_handshake_request (full GET /path HTTP/1.1 Upgrade)"
+	@echo "    ws_validate_accept (MITM detection)"
+	@echo "    ws_validate_upgrade_response (verify 101 + Accept + subprotocol)"
+	@echo "  Frame encode/decode (RFC 6455 S5):"
+	@echo "    WsFrame { fin, opcode, masked, mask_key, payload }"
+	@echo "    ws_frame_encode_with_key (DETERMINISTIC for tests)"
+	@echo "    ws_frame_encode (random mask key when mask=true)"
+	@echo "    ws_frame_decode (RSV/opcode/control-frame validation;"
+	@echo "      Err('incomplete') for partial frames)"
+	@echo "    ws_frame_decode_length (total byte length; 0=partial; -1=oversized)"
+	@echo "    7-bit / 16-bit / 64-bit payload-length fields (S5.2)"
+	@echo "  Masking (RFC 6455 S5.3):"
+	@echo "    ws_apply_mask (XOR with mask_key[i mod 4]; involutive)"
+	@echo "    ws_generate_mask_key (random 4-byte mask key)"
+	@echo "  Close handshake (RFC 6455 S7):"
+	@echo "    ws_close_payload / ws_parse_close_payload (WsClosePayload struct)"
+	@echo "    ws_is_valid_close_code (S7.4.2: 1000-1003, 1007-1011, 3000-3999,"
+	@echo "      4000-4999 valid; 1004-1006, 1012-1015 reserved)"
+	@echo "  Connection helpers:"
+	@echo "    server-side: ws_send_text/binary/close/ping/pong (UNMASKED)"
+	@echo "    client-side: ws_send_text_masked/binary_masked/close_masked (MASKED)"
+	@echo "    ws_read_frame (bounded read loop; 32 reads max per frame)"
+	@echo "  Constants: opcodes, close codes, frame-size bounds, GUID"
+	@echo "  Diagnostics: ws_opcode_name, ws_close_code_name, ws_describe_frame"
+	@echo "  Pure-HLS implementation (no new compiler builtins)"
+	@echo "  differential (interpreter == native) verified green."
+
+.PHONY: websocket-acceptance
+
+# ============================================================================
+# Stage 66 (v0.85.0-alpha): std.cookie -- RFC 6265bis HTTP cookies
+# (parse Cookie header, serialise Set-Cookie, sign with HMAC-SHA1,
+# SameSite/Secure/HttpOnly attributes). Pure-HLS module on top of
+# std.http, std.bits, std.sha1 (NEW in Stage 65), std.base64,
+# std.str, std.option, std.result. The pure pieces (parse, serialise,
+# sign, verify, format-date, sanitize) are differentially verified.
+# The signing layer uses HMAC-SHA1 (RFC 2104) which the module
+# implements in pure HLS via std.bits + std.sha1. HMAC-SHA1 remains
+# secure per RFC 6221 §6 (SHA-1's collision weakness does NOT
+# compromise HMAC).
+# ============================================================================
+
+# Stage 66 differential note: the pure pieces of std.cookie (parse,
+# serialise, sign, verify, format-http-date, sanitize) are pure
+# functions of immutable inputs. The interpreter and the native binary
+# produce byte-identical output on the acceptance test. The demo
+# (examples/cookie_demo.hls) is also differentially verified (it
+# parses a Cookie header, builds a full SetCookie with every attribute,
+# signs + verifies + unwraps, formats HTTP dates on canonical vectors,
+# sanitises name/value, and does a full HTTP round-trip -- all
+# deterministic, no actual I/O).
+
+cookie-acceptance: bin/hlc
+	@$(PYTHON) boot/boot.py examples/cookie_demo.hls > /tmp/cookie_demo_interp.txt 2>&1
+	@bin/hlc examples/cookie_demo.hls /tmp/cookie_demo.c 2>/dev/null
+	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/cookie_demo /tmp/cookie_demo.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
+	@/tmp/cookie_demo > /tmp/cookie_demo_nat.txt 2>&1
+	@diff -q /tmp/cookie_demo_interp.txt /tmp/cookie_demo_nat.txt >/dev/null 2>&1 \
+		|| (echo "FAIL: cookie_demo differential mismatch" && false)
+	@$(PYTHON) boot/boot.py tests/ok/feat_stage66_cookie.hls > /tmp/s66_interp.txt 2>&1
+	@bin/hlc tests/ok/feat_stage66_cookie.hls /tmp/s66.c 2>/dev/null
+	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/s66 /tmp/s66.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
+	@/tmp/s66 > /tmp/s66_nat.txt 2>&1
+	@diff -q /tmp/s66_interp.txt /tmp/s66_nat.txt >/dev/null 2>&1 \
+		|| (echo "FAIL: feat_stage66_cookie differential mismatch" && false)
+	@rm -f /tmp/cookie_demo /tmp/cookie_demo.c /tmp/cookie_demo_interp.txt /tmp/cookie_demo_nat.txt \
+		/tmp/s66 /tmp/s66.c /tmp/s66_interp.txt /tmp/s66_nat.txt
+	@echo ""
+	@echo "ACCEPTANCE OK: Stage 66 -- std.cookie (RFC 6265bis HTTP cookies)"
+	@echo "  CookieJar parsing:"
+	@echo "    cookie_parse_request / cookie_parse_string (liberal: trims whitespace,"
+	@echo "      skips empty pairs, splits on FIRST '=' so values may contain '=')"
+	@echo "    cookie_get (FIRST match per RFC 6265 S5.4 longer-path precedence)"
+	@echo "    cookie_has / cookie_names (insertion order, deduplicated) / cookie_count"
+	@echo "  SetCookie builder + immutable setters:"
+	@echo "    cookie_new(name, value)"
+	@echo "    cookie_with_expires / _max_age / _domain / _path / _secure / _http_only / _same_site"
+	@echo "    (each returns a NEW SetCookie -- same idiom as std.cli, std.log,"
+	@echo "     std.http_router, std.http_server)"
+	@echo "  Serialisation:"
+	@echo "    cookie_serialize (canonical RFC 6265 S4.1.1 form;"
+	@echo "      attribute order: Expires/Max-Age/Domain/Path/Secure/HttpOnly/SameSite;"
+	@echo "      panics if result > 4096 bytes per RFC 6265 S6.1)"
+	@echo "    cookie_to_header (HttpHeader wrapper for response building)"
+	@echo "  SameSite constants (RFC 6265bis S5.2):"
+	@echo "    cookie_samesite_strict / lax / none / unset"
+	@echo "    cookie_samesite_is_valid (case-insensitive)"
+	@echo "  Sanitisation (RFC 6265 S4.1.1 grammar):"
+	@echo "    cookie_sanitize_name (rejects CTLs/;/,/=,\\\\,space/non-ASCII)"
+	@echo "    cookie_sanitize_value (allows '=' and space in values)"
+	@echo "  Signing (anti-tampering via HMAC-SHA1, RFC 2104):"
+	@echo "    cookie_hmac_sha1(key, msg) -> 20-byte digest (pure HLS via std.bits + std.sha1)"
+	@echo "    cookie_sign(sc, secret) -> SetCookie with value = '<orig>.<b64url(sig)>'"
+	@echo "    cookie_verify(sc, secret) -> bool (CONSTANT TIME comparison)"
+	@echo "    cookie_unwrap_signed(sc, secret) -> Result[str, str] (verify + extract)"
+	@echo "    cookie_const_time_eq (XOR every byte; OR; no short-circuit)"
+	@echo "  HTTP date formatting:"
+	@echo "    cookie_format_http_date(unix_ms) -> RFC 7231 S7.1.1.1 IMF-fixdate"
+	@echo "      (e.g. 'Sun, 06 Nov 1994 08:49:37 GMT')"
+	@echo "      uses Hinnant civil-from-days (same as std.log Stage 57)"
+	@echo "  Diagnostics: cookie_describe(sc)"
+	@echo "  Security model: SECURE + HTTP-ONLY + SAMESITE + SIGNED are"
+	@echo "    COMPLEMENTARY defenses (sniffing / XSS-hijack / CSRF / forgery)"
+	@echo "  Pure-HLS implementation (no new compiler builtins)"
+	@echo "  differential (interpreter == native) verified green."
+
+.PHONY: cookie-acceptance

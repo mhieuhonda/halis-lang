@@ -1,0 +1,241 @@
+# ============================================================================
+# examples/cookie_demo.hls — Stage 66 (v0.85.0-alpha): std.cookie
+# ----------------------------------------------------------------------------
+# Demonstrates every pure piece of the cookie API:
+#   * cookie_parse_string (multiple cookies, whitespace, duplicates)
+#   * cookie_get / cookie_has / cookie_names / cookie_count
+#   * cookie_new + every builder (expires, max_age, domain, path,
+#     secure, http_only, same_site) + immutable chaining
+#   * cookie_serialize (canonical RFC 6265 §4.1.1 form)
+#   * cookie_to_header (HttpHeader wrapper for response building)
+#   * cookie_sanitize_name / value (forbidden-char filtering)
+#   * cookie_sign / cookie_verify / cookie_unwrap_signed
+#     (signing, tamper detection, original-value recovery)
+#   * cookie_format_http_date (RFC 7231 IMF-fixdate)
+#   * cookie_describe (human-readable rendering)
+#   * Full HTTP round-trip: parse incoming Cookie header + emit
+#     Set-Cookie response headers
+#
+# The demo is pure (no actual I/O) so the differential test
+# (interpreter == native) produces byte-identical output.
+# ============================================================================
+
+import "std.cookie"
+import "std.http"
+import "std.str"
+
+# ============================================================================
+# Section 1: cookie_parse_string — parse a Cookie header value.
+# ============================================================================
+
+fn demo_parse() -> void uses IO {
+    println("--- cookie_parse_string ---")
+    let raw: str = "session=abc123; theme=dark; lang=vi"
+    println("  raw: " + raw)
+    let jar: CookieJar = cookie_parse_string(raw)
+    println("  count: " + cookie_count(jar).to_str())
+    println("  session = " + cookie_get(jar, "session"))
+    println("  theme   = " + cookie_get(jar, "theme"))
+    println("  lang    = " + cookie_get(jar, "lang"))
+    println("  missing = '" + cookie_get(jar, "missing") + "' (absent)")
+    let names: list[str] = cookie_names(jar)
+    print("  names:   [")
+    let mut i: int = 0
+    while i < names.len() {
+        if i > 0 {
+            print(", ")
+        }
+        print(names.get(i))
+        i = i + 1
+    }
+    println("]")
+    println("")
+    return
+}
+
+# ============================================================================
+# Section 2: cookie_new + every builder + cookie_serialize.
+# ============================================================================
+
+fn demo_build_and_serialize() -> void uses IO {
+    println("--- cookie_new + builders + cookie_serialize ---")
+    # Plain cookie.
+    let plain: SetCookie = cookie_new("sid", "abc123")
+    println("  plain:        " + cookie_serialize(plain))
+    # With every attribute.
+    let full: SetCookie = cookie_with_http_only(
+        cookie_with_secure(
+            cookie_with_path(
+                cookie_with_same_site(
+                    cookie_with_max_age(
+                        cookie_with_domain(
+                            cookie_with_expires(
+                                cookie_new("sid", "abc123"),
+                                "Sun, 06 Nov 1994 08:49:37 GMT"
+                            ),
+                            "example.com"
+                        ),
+                        3600
+                    ),
+                    "Lax"
+                ),
+                "/"
+            ),
+            true
+        ),
+        true
+    )
+    println("  full attrs:   " + cookie_serialize(full))
+    println("  describe:     " + cookie_describe(full))
+    println("")
+    return
+}
+
+# ============================================================================
+# Section 3: cookie_sign + cookie_verify + cookie_unwrap_signed.
+# ============================================================================
+
+fn demo_sign_verify() -> void uses IO {
+    println("--- cookie_sign + cookie_verify + cookie_unwrap_signed ---")
+    let secret: str = "super-secret-key-do-not-leak"
+    let original: SetCookie = cookie_with_http_only(
+        cookie_with_secure(cookie_new("session", "user=alice|role=admin"), true),
+        true
+    )
+    let signed: SetCookie = cookie_sign(original, secret)
+    println("  original value:   " + original.value)
+    println("  signed value:     " + signed.value)
+    println("  verify (correct): " + cookie_verify(signed, secret).to_str())
+
+    # Unwrap to recover the original.
+    let unwrapped: Result[str, str] = cookie_unwrap_signed(signed, secret)
+    if result_is_ok(unwrapped) {
+        println("  unwrapped:         " + result_unwrap(unwrapped))
+    }
+
+    # Tamper detection.
+    println("  verify (wrong secret): " + cookie_verify(signed, "wrong-secret").to_str())
+    println("")
+    return
+}
+
+# ============================================================================
+# Section 4: cookie_format_http_date — RFC 7231 IMF-fixdate.
+# ============================================================================
+
+fn demo_http_date() -> void uses IO {
+    println("--- cookie_format_http_date (RFC 7231 IMF-fixdate) ---")
+    println("  epoch:                 " + cookie_format_http_date(0))
+    println("  1994-11-06 08:49:37:   " + cookie_format_http_date(784111777000))
+    println("  2024-02-29 00:00:00:   " + cookie_format_http_date(1709164800000))
+    println("  2025-01-01 00:00:00:   " + cookie_format_http_date(1735689600000))
+    println("")
+    return
+}
+
+# ============================================================================
+# Section 5: cookie_sanitize_name / value.
+# ============================================================================
+
+fn demo_sanitize() -> void uses IO {
+    println("--- cookie_sanitize_name / value ---")
+    let dirty_name: str = "na;me,x=y"
+    let dirty_value: str = "val;ue,x=y"
+    println("  name  in:  '" + dirty_name + "'  out: '" + cookie_sanitize_name(dirty_name) + "'")
+    println("  value in:  '" + dirty_value + "'  out: '" + cookie_sanitize_value(dirty_value) + "'")
+    let ctrl: str = chr(0) + chr(1) + "abc" + chr(127)
+    println("  ctrl  in:  <ctrl bytes>'abc'<DEL>  out: '" + cookie_sanitize_value(ctrl) + "'")
+    println("")
+    return
+}
+
+# ============================================================================
+# Section 6: Full HTTP round-trip — parse Cookie + emit Set-Cookie.
+# ============================================================================
+
+fn demo_http_round_trip() -> void uses IO {
+    println("--- Full HTTP round-trip (parse Cookie + emit Set-Cookie) ---")
+    # Client sends a request with a signed session cookie.
+    let secret: str = "session-secret"
+    let original_session: SetCookie = cookie_with_http_only(
+        cookie_with_secure(cookie_new("session", "user=alice"), true),
+        true
+    )
+    let signed: SetCookie = cookie_sign(original_session, secret)
+    let mut req: HttpRequest = http_request_new("GET", "/dashboard")
+    req.version = "HTTP/1.1"
+    req.headers = http_header_add(req.headers, "Host", "example.com")
+    req.headers = http_header_add(req.headers, "Cookie", "session=" + signed.value + "; theme=dark")
+
+    # Server-side: parse the incoming Cookie header.
+    let jar: CookieJar = cookie_parse_request(req.headers)
+    let raw_session: str = cookie_get(jar, "session")
+    println("  incoming Cookie header: session=<signed>; theme=dark")
+    println("  parsed session (signed): " + raw_session)
+    println("  parsed theme:            " + cookie_get(jar, "theme"))
+
+    # Verify + extract the original.
+    let signed_sc: SetCookie = SetCookie {
+        name: "session",
+        value: raw_session,
+        expires: "",
+        max_age: -1,
+        domain: "",
+        path: "",
+        is_secure: true,
+        is_http_only: true,
+        same_site: ""
+    }
+    let r: Result[str, str] = cookie_unwrap_signed(signed_sc, secret)
+    if result_is_ok(r) {
+        println("  verified session value: " + result_unwrap(r))
+    } else {
+        println("  verify failed: " + result_err_or(r, ""))
+    }
+
+    # Build a response with a refreshed Set-Cookie.
+    let mut resp: HttpResponse = http_response_new(200)
+    resp.body = "Welcome back, Alice!"
+    let refreshed: SetCookie = cookie_with_http_only(
+        cookie_with_secure(
+            cookie_with_path(
+                cookie_with_max_age(
+                    cookie_with_same_site(
+                        cookie_sign(cookie_new("session", "user=alice"), secret),
+                        "Lax"
+                    ),
+                    3600
+                ),
+                "/"
+            ),
+            true
+        ),
+        true
+    )
+    resp.headers = http_header_add(resp.headers, "Content-Type", "text/plain")
+    resp.headers = http_header_add(resp.headers, cookie_to_header(refreshed).name, cookie_to_header(refreshed).value)
+    println("  response Set-Cookie:    " + cookie_to_header(refreshed).value)
+    println("")
+    return
+}
+
+# ============================================================================
+# Main — run every demo section.
+# ============================================================================
+
+fn main() -> int uses IO {
+    println("================================================================")
+    println("Stage 66 (v0.85.0-alpha): std.cookie (RFC 6265bis)")
+    println("================================================================")
+    println("")
+    demo_parse()
+    demo_build_and_serialize()
+    demo_sign_verify()
+    demo_http_date()
+    demo_sanitize()
+    demo_http_round_trip()
+    println("================================================================")
+    println("Stage 66 demo complete (pure — differential-safe).")
+    println("================================================================")
+    return 0
+}

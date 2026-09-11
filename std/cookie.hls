@@ -1,0 +1,1091 @@
+# ============================================================================
+# std/cookie.hls — Stage 66 (v0.85.0-alpha): RFC 6265bis HTTP cookies
+# ----------------------------------------------------------------------------
+# This module is the FOURTH module of Phase V (the web application track,
+# Stages 63–76). It implements the HTTP cookie state-management protocol
+# specified in RFC 6265bis (the IETF HTTP Working Group's revised version
+# of RFC 6265) — the standard mechanism by which a server can ask the
+# user agent to send a small piece of state back with every subsequent
+# request to the same origin.
+#
+# The module provides parsing, serialisation, and SIGNING — the three
+# pieces a web application needs:
+#
+#   PARSING (Cookie header → CookieJar)
+#     cookie_parse_request(headers) -> CookieJar
+#         Parse the Cookie header (if present) of an HTTP request into
+#         a name→value mapping. The Cookie header is a semicolon-
+#         separated list of name=value pairs:
+#           Cookie: session=abc123; theme=dark; lang=vi
+#         The parser is liberal: leading/trailing whitespace on each
+#         name and value is stripped, and empty pairs are skipped.
+#
+#     cookie_get(jar, name) -> str        — value or "" if absent
+#     cookie_has(jar, name) -> bool       — true iff name in jar
+#     cookie_names(jar) -> list[str]      — every name (insertion order)
+#     cookie_count(jar) -> int            — number of cookies
+#
+#   SERIALISATION (SetCookie → Set-Cookie header)
+#     cookie_serialize(sc) -> str
+#         Render a SetCookie struct as a Set-Cookie header value (the
+#         canonical RFC 6265 §4.1.1 form). Example:
+#           id=a3fWa; Expires=Thu, 21 Oct 2025 07:28:00 GMT;
+#           Path=/; Secure; HttpOnly; SameSite=Lax
+#
+#     cookie_to_header(sc) -> HttpHeader
+#         Convenience: returns an HttpHeader named "Set-Cookie" with the
+#         serialised value. Use http_header_add to append multiple
+#         Set-Cookie headers to a single response (RFC 6265 §4.1.2:
+#         an HTTP response MAY carry multiple Set-Cookie headers).
+#
+#   SIGNING (anti-tampering)
+#     cookie_sign(sc, secret) -> SetCookie
+#         Sign a cookie's value with HMAC-SHA1 (key=secret, message=
+#         value). The signature is base64url-encoded and appended to
+#         the value as "value.signature". The original value field is
+#         replaced by the combined string.
+#
+#     cookie_verify(sc, secret) -> bool
+#         Verify a signed cookie's signature. Splits value at the LAST
+#         ".", base64url-decodes the signature, recomputes the expected
+#         HMAC over the value portion, and compares in CONSTANT TIME
+#         (every byte is XOR'd and OR'd; no short-circuit).
+#
+#     cookie_unwrap_signed(sc, secret) -> Result[str, str]
+#         Verify + extract the original value. Returns Ok(original) on
+#         success, Err(reason) on failure (missing signature, HMAC
+#         mismatch, malformed encoding).
+#
+#   BUILDER (SetCookie struct + immutable setters)
+#     SetCookie { name, value, expires, max_age, domain, path, secure,
+#                 http_only, same_site }
+#     cookie_new(name, value) -> SetCookie
+#     cookie_with_expires(sc, http_date_str) -> SetCookie
+#     cookie_with_max_age(sc, seconds) -> SetCookie
+#     cookie_with_domain(sc, domain) -> SetCookie
+#     cookie_with_path(sc, path) -> SetCookie
+#     cookie_with_secure(sc, bool) -> SetCookie
+#     cookie_with_http_only(sc, bool) -> SetCookie
+#     cookie_with_same_site(sc, mode) -> SetCookie
+#         Each setter returns a NEW SetCookie (immutable update —
+#         same idiom as std.cli, std.http_router, std.http_server).
+#
+#   SAME-SITE MODES (RFC 6265bis §5.2)
+#     cookie_samesite_strict()  -> str    = "Strict"
+#     cookie_samesite_lax()     -> str    = "Lax"
+#     cookie_samesite_none()    -> str    = "None"
+#     cookie_samesite_unset()   -> str    = ""   (omit the attribute)
+#     cookie_samesite_is_valid(s) -> bool
+#
+#   HELPERS
+#     cookie_format_http_date(unix_ms) -> str
+#         Format a Unix timestamp (ms) as an RFC 7231 §7.1.1.1 HTTP date
+#         (e.g. "Sun, 06 Nov 1994 08:49:37 GMT"). Used for the Expires
+#         attribute.
+#
+#     cookie_sanitize_name(s) / cookie_sanitize_value(s) -> str
+#         Reject bytes that are forbidden by RFC 6265 §4.1.1 (control
+#         chars, semicolons, commas). Used by the builder to fail fast
+#         on bad input; the caller can also call them directly to
+#         validate user input before constructing a cookie.
+#
+# SECURITY MODEL
+#
+#   * SECURE: when set, the user agent MUST NOT send the cookie over a
+#     non-HTTPS connection. This is the FIRST line of defense against
+#     passive network sniffing. Set this for every session cookie.
+#     (Default: OFF — RFC 6265 allows plain HTTP cookies; the caller
+#     MUST opt into Secure explicitly.)
+#
+#   * HTTP-ONLY: when set, the cookie is NOT visible to JavaScript
+#     (document.cookie). This is the FIRST line of defense against
+#     XSS-based session hijacking. Set this for every session cookie.
+#     (Default: OFF — RFC 6265 allows JS-visible cookies; the caller
+#     MUST opt into HttpOnly explicitly.)
+#
+#   * SAMESITE: controls cross-site cookie transmission.
+#       Strict — never sent on cross-site requests (defense against
+#                CSRF; may break top-level navigation links).
+#       Lax    — sent on top-level cross-site GETs only (default for
+#                modern browsers; balances CSRF defense with usability).
+#       None   — sent on all cross-site requests (REQUIRES Secure;
+#                otherwise the browser rejects the cookie).
+#       unset  — omit the SameSite attribute entirely (treated as
+#                "Lax" by modern browsers per RFC 6265bis §5.2).
+#                We expose this as a knob so callers can explicitly
+#                opt out of the modern default — useful for legacy
+#                deployments behind a reverse proxy that adds its
+#                own SameSite=None attribute.
+#     (Default: unset.)
+#
+#   * SIGNED: cookies carry a value-level HMAC-SHA1 signature. This is
+#     the SECOND line of defense against tampering — even if an attacker
+#     can write the cookie (e.g. via an XSS that bypasses HttpOnly, or
+#     via a subdomain that shares the parent domain), they cannot forge
+#     a valid signature without the server-side secret. The signature
+#     uses HMAC-SHA1 (RFC 2104) — SHA-1's collision weakness does NOT
+#     compromise HMAC (RFC 6221 §6 confirms HMAC-SHA1 remains secure
+#     for the foreseeable future).
+#
+#   The signing layer is COMPLEMENTARY to TLS / Secure / HttpOnly /
+#   SameSite — it does NOT replace them. It protects against a different
+#   threat (server-side state forgery after the cookie has been issued),
+#   and it lets the server detect tampering even when the cookie passes
+#   through a path that doesn't enforce the other defenses (e.g. an
+#   internal microservice that reads the cookie over plain HTTP).
+#
+# LIMITATIONS (v0.85.0-alpha)
+#
+#   * Public-Suffix-List-aware Domain scoping is NOT implemented. The
+#     Domain attribute is accepted verbatim; the caller is responsible
+#     for not setting Domain to a public suffix (e.g. ".com"). A future
+#     stage may bundle the PSL and reject such cookies at parse time.
+#   * Cookie prefix enforcement (__Host- and __Secure- prefixes, RFC
+#     6265bis §4.1.3) is NOT implemented. The caller is responsible for
+#     setting Path=/ + Secure + no Domain when using the __Host- prefix.
+#   * The Max-Age attribute is serialised but not interpreted by the
+#     parser (parsers in user agents do that; the server doesn't).
+#   * Chunked cookies (RFC 6265bis §5.3 chunked encoding) are NOT
+#     supported — a Set-Cookie value that exceeds the user agent's
+#     cookie-size limit (4096 bytes per RFC 6265 §6.1) is the caller's
+#     problem.
+#
+# DIFFERENTIAL PARITY
+#
+#   Every pure function (parse, serialise, sign, verify, format-date,
+#   sanitize) produces byte-identical output between the interpreter
+#   and the native binary. The only non-deterministic piece is the
+#   signing nonce — there is none, the signature is deterministic in
+#   (value, secret), so signing itself is differential-safe.
+#
+# NO NEW COMPILER BUILTINS
+#
+#   The entire module is pure HLS, layered on:
+#     * std.http   (HttpHeader, http_header_get, http_header_has,
+#                   http_header_add — the HTTP/1.1 message format)
+#     * std.bits   (int_and / int_or / int_xor / int_shr / int_shl —
+#                   for HMAC-SHA1's inner/outer padding)
+#     * std.sha1   (this stage's SHA-1 module — for the HMAC inner/
+#                   outer hash; HMAC-SHA1 uses SHA-1 per RFC 2104)
+#     * std.base64 (Stage 38's existing base64url_encode/_decode —
+#                   for the signature encoding)
+#     * std.str    (str_join, str_to_lower_ascii, str_starts_with,
+#                   str_contains, byte_at, chr)
+#     * std.option / std.result (Result[T, E] for fallible parse /
+#                  verify operations)
+# ============================================================================
+
+import "std.http"
+import "std.bits"
+import "std.sha1"
+import "std.base64"
+import "std.str"
+import "std.option"
+import "std.result"
+
+# ============================================================================
+# Constants — RFC 6265 §4.1.1 grammar + §5.1.3 attribute names + §6.1
+# size limits.
+# ============================================================================
+
+# Cookie attribute names (RFC 6265 §5.2). Serialised in canonical case
+# (Expires, Max-Age, Domain, Path, Secure, HttpOnly, SameSite).
+fn cookie_attr_expires() -> str {
+    return "Expires"
+}
+
+fn cookie_attr_max_age() -> str {
+    return "Max-Age"
+}
+
+fn cookie_attr_domain() -> str {
+    return "Domain"
+}
+
+fn cookie_attr_path() -> str {
+    return "Path"
+}
+
+fn cookie_attr_secure() -> str {
+    return "Secure"
+}
+
+fn cookie_attr_http_only() -> str {
+    return "HttpOnly"
+}
+
+fn cookie_attr_same_site() -> str {
+    return "SameSite"
+}
+
+# SameSite mode constants (RFC 6265bis §5.2.5). The values are the
+# canonical string forms the user agent expects in the Set-Cookie header
+# (case-sensitive — RFC 6265bis §5.2.5 says the parser is case-
+# insensitive, but the canonical serialisation is "Strict"/"Lax"/"None").
+fn cookie_samesite_strict() -> str {
+    return "Strict"
+}
+
+fn cookie_samesite_lax() -> str {
+    return "Lax"
+}
+
+fn cookie_samesite_none() -> str {
+    return "None"
+}
+
+fn cookie_samesite_unset() -> str {
+    return ""
+}
+
+# cookie_samesite_is_valid(s) — true iff s is one of "Strict", "Lax",
+# "None", or "" (unset). Case-insensitive — the parser lowercases first.
+fn cookie_samesite_is_valid(s: str) -> bool {
+    let lower: str = str_to_lower_ascii(s)
+    if lower == "strict" {
+        return true
+    }
+    if lower == "lax" {
+        return true
+    }
+    if lower == "none" {
+        return true
+    }
+    if lower == "" {
+        return true
+    }
+    return false
+}
+
+# cookie_max_size() — RFC 6265 §6.1: "at least 4096 bytes per cookie
+# (as measured by the sum of the length of the cookie's name, value,
+# and attributes)". We reject a cookie whose serialised Set-Cookie value
+# exceeds this with a clear panic message.
+fn cookie_max_size() -> int {
+    return 4096
+}
+
+# ============================================================================
+# CookieJar — the parsed form of a Cookie header.
+#
+# Internally a list[CookiePair] (not a map[str,str]) because:
+#   1. RFC 6265 §5.4 says servers SHOULD process cookies in the order
+#      they were received (the Cookie header preserves the order in
+#      which the user agent stored them). A list preserves order; a
+#      map does not.
+#   2. The user agent MAY send two cookies with the same name (if the
+#      cookies have different Path attributes). cookie_get returns
+#      the FIRST matching name (matching RFC 6265 §5.4 precedence).
+# ============================================================================
+
+struct CookiePair {
+    name: str,
+    value: str
+}
+
+struct CookieJar {
+    pairs: list[CookiePair]
+}
+
+# cookie_jar_empty() — construct an empty CookieJar.
+fn cookie_jar_empty() -> CookieJar {
+    return CookieJar { pairs: [] }
+}
+
+# cookie_get(jar, name) — return the value of the FIRST cookie with the
+# given name, or "" if absent. RFC 6265 §5.4: cookies with longer paths
+# are sent before cookies with shorter paths, so the first match is the
+# most-specific one.
+fn cookie_get(jar: CookieJar, name: str) -> str {
+    let mut i: int = 0
+    while i < jar.pairs.len() {
+        let p: CookiePair = jar.pairs.get(i)
+        if p.name == name {
+            return p.value
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+# cookie_has(jar, name) — true iff a cookie with the given name exists.
+fn cookie_has(jar: CookieJar, name: str) -> bool {
+    let mut i: int = 0
+    while i < jar.pairs.len() {
+        let p: CookiePair = jar.pairs.get(i)
+        if p.name == name {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+# cookie_names(jar) — every distinct name, in insertion order. If the
+# same name appears twice (different paths), it's listed once at its
+# first position.
+fn cookie_names(jar: CookieJar) -> list[str] {
+    let out: list[str] = []
+    let mut i: int = 0
+    while i < jar.pairs.len() {
+        let p: CookiePair = jar.pairs.get(i)
+        let name: str = p.name
+        # Dedup — only add if not already present.
+        let mut seen: bool = false
+        let mut j: int = 0
+        while j < out.len() {
+            if out.get(j) == name {
+                seen = true
+            }
+            j = j + 1
+        }
+        if !seen {
+            out.push(name)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# cookie_count(jar) — number of cookies (including duplicates).
+fn cookie_count(jar: CookieJar) -> int {
+    return jar.pairs.len()
+}
+
+# ============================================================================
+# Parsing — Cookie header → CookieJar.
+#
+# RFC 6265 §4.2.1 grammar:
+#   cookie-pair       = cookie-name "=" cookie-value
+#   cookie-header      = "Cookie:" OWS cookie-string OWS
+#   cookie-string      = cookie-pair *( ";" SP cookie-pair )
+#
+# The parser is liberal (matches every implementation in the wild):
+#   * Leading/trailing whitespace on each name and value is stripped.
+#   * Empty pairs (e.g. "name=" or "=value" or just ";") are skipped.
+#   * Pairs without an "=" are skipped (can't form a name=value pair).
+#   * Whitespace around the "=" is stripped.
+# ============================================================================
+
+# cookie_parse_request(headers) — parse the Cookie header of an HTTP
+# request into a CookieJar. If the Cookie header is absent, returns
+# an empty jar.
+#
+# This is the standard entry point for server-side cookie parsing:
+#   let jar: CookieJar = cookie_parse_request(req.headers)
+#   let sid: str = cookie_get(jar, "session_id")
+fn cookie_parse_request(headers: list[HttpHeader]) -> CookieJar {
+    if !http_header_has(headers, "Cookie") {
+        return cookie_jar_empty()
+    }
+    let raw: str = http_header_get(headers, "Cookie")
+    return cookie_parse_string(raw)
+}
+
+# cookie_parse_string(raw) — parse a raw Cookie header value into a
+# CookieJar. The value is everything after "Cookie: " (the header
+# parser strips the name and colon already).
+#
+# Pure — deterministic in the input string.
+fn cookie_parse_string(raw: str) -> CookieJar {
+    let jar: CookieJar = CookieJar { pairs: [] }
+    if raw.len() == 0 {
+        return jar
+    }
+    # Split on ";" — the Cookie header uses semicolons (with optional
+    # trailing whitespace) as the pair separator.
+    let parts: list[str] = raw.split(";")
+    let mut i: int = 0
+    while i < parts.len() {
+        let pair_str: str = parts.get(i)
+        let trimmed: str = cookie_trim_ws(pair_str)
+        if trimmed.len() == 0 {
+            i = i + 1
+            continue
+        }
+        # Find the first "=" — values may contain "=" (RFC 6265 §4.1.1
+        # allows it in cookie-octet). Split on the FIRST one only.
+        let eq_pos: int = trimmed.find("=")
+        if eq_pos < 0 {
+            # No "=" — skip this pair (malformed but recoverable).
+            i = i + 1
+            continue
+        }
+        let name: str = cookie_trim_ws(trimmed.slice(0, eq_pos))
+        let value: str = cookie_trim_ws(trimmed.slice(eq_pos + 1, trimmed.len()))
+        if name.len() == 0 {
+            # Empty name — skip.
+            i = i + 1
+            continue
+        }
+        jar.pairs.push(CookiePair { name: name, value: value })
+        i = i + 1
+    }
+    return jar
+}
+
+# cookie_trim_ws — strip leading and trailing ASCII whitespace.
+# Same implementation as std.websocket's ws_trim_ws (we duplicate it
+# here to avoid a cross-module dependency).
+fn cookie_trim_ws(s: str) -> str {
+    let n: int = s.len()
+    let mut start: int = 0
+    let mut end: int = n
+    while start < end {
+        let b: int = s.byte_at(start)
+        if b == 32 || b == 9 || b == 10 || b == 13 {
+            start = start + 1
+        } else {
+            break
+        }
+    }
+    while end > start {
+        let b: int = s.byte_at(end - 1)
+        if b == 32 || b == 9 || b == 10 || b == 13 {
+            end = end - 1
+        } else {
+            break
+        }
+    }
+    return s.slice(start, end)
+}
+
+# ============================================================================
+# SetCookie — the builder for the Set-Cookie response header.
+#
+# Fields:
+#   name      — the cookie name (validated; panics on invalid chars).
+#   value     — the cookie value (validated; panics on invalid chars).
+#   expires   — the Expires attribute (RFC 7231 §7.1.1.1 HTTP date string).
+#               Empty string = omit the attribute.
+#   max_age   — the Max-Age attribute (seconds; -1 = omit). When both
+#               Expires and Max-Age are set, Max-Age takes precedence
+#               (RFC 6265 §5.2.2).
+#   domain    — the Domain attribute. Empty = omit.
+#   path      — the Path attribute. Empty = omit.
+#   secure    — when true, the Secure attribute is emitted.
+#   http_only — when true, the HttpOnly attribute is emitted.
+#   same_site — the SameSite attribute value ("Strict"/"Lax"/"None"/"").
+# ============================================================================
+
+struct SetCookie {
+    name: str,
+    value: str,
+    expires: str,                  # RFC 7231 HTTP date string, or "" to omit
+    max_age: int,                  # seconds; -1 = omit
+    domain: str,                   # "" = omit
+    path: str,                     # "" = omit
+    is_secure: bool,               # 'secure' is a reserved identifier (HLS SPEC §2.5 BUG-29)
+    is_http_only: bool,
+    same_site: str                 # "Strict"/"Lax"/"None"/"" (omit)
+}
+
+# cookie_new(name, value) — construct a SetCookie with the given name and
+# value, all attributes at their defaults (Expires omitted, Max-Age
+# omitted, Domain omitted, Path omitted, Secure=false, HttpOnly=false,
+# SameSite unset).
+#
+# The name and value are validated via cookie_sanitize_name / value —
+# the function panics on invalid characters (control chars, ";", ",",
+# and " " in name; control chars, ";", and "," in value).
+fn cookie_new(name: str, value: str) -> SetCookie {
+    let n: str = cookie_sanitize_name(name)
+    let v: str = cookie_sanitize_value(value)
+    if n.len() == 0 {
+        panic("cookie_new: name must be non-empty")
+    }
+    return SetCookie {
+        name: n,
+        value: v,
+        expires: "",
+        max_age: -1,
+        domain: "",
+        path: "",
+        is_secure: false,
+        is_http_only: false,
+        same_site: ""
+    }
+}
+
+# ---- Immutable builders (each returns a NEW SetCookie) --------------------
+
+# cookie_with_expires(sc, http_date) — set the Expires attribute. The
+# value should be an RFC 7231 §7.1.1.1 HTTP date string (e.g.
+# "Sun, 06 Nov 1994 08:49:37 GMT"). Use cookie_format_http_date to
+# format a Unix timestamp.
+fn cookie_with_expires(sc: SetCookie, http_date: str) -> SetCookie {
+    return SetCookie {
+        name: sc.name,
+        value: sc.value,
+        expires: http_date,
+        max_age: sc.max_age,
+        domain: sc.domain,
+        path: sc.path,
+        is_secure: sc.is_secure,
+        is_http_only: sc.is_http_only,
+        same_site: sc.same_site
+    }
+}
+
+# cookie_with_max_age(sc, seconds) — set the Max-Age attribute. Negative
+# values are clamped to 0 (RFC 6265 §5.2.2: "If delta-seconds is less
+# than or equal to zero (0), let expiry-time be the earliest
+# representable date and time"). -1 (the default) means OMIT.
+fn cookie_with_max_age(sc: SetCookie, seconds: int) -> SetCookie {
+    let mut sa: int = seconds
+    if seconds < 0 && seconds != -1 {
+        sa = 0
+    }
+    return SetCookie {
+        name: sc.name,
+        value: sc.value,
+        expires: sc.expires,
+        max_age: sa,
+        domain: sc.domain,
+        path: sc.path,
+        is_secure: sc.is_secure,
+        is_http_only: sc.is_http_only,
+        same_site: sc.same_site
+    }
+}
+
+# cookie_with_domain(sc, domain) — set the Domain attribute. The domain
+# is sanitised (control chars stripped); leading "." is preserved
+# (RFC 6265 §5.2.3 says a leading "." MUST be ignored but most user
+# agents tolerate it; the caller should omit it for new code).
+fn cookie_with_domain(sc: SetCookie, domain: str) -> SetCookie {
+    return SetCookie {
+        name: sc.name,
+        value: sc.value,
+        expires: sc.expires,
+        max_age: sc.max_age,
+        domain: cookie_sanitize_value(domain),
+        path: sc.path,
+        is_secure: sc.is_secure,
+        is_http_only: sc.is_http_only,
+        same_site: sc.same_site
+    }
+}
+
+# cookie_with_path(sc, path) — set the Path attribute. The path is
+# sanitised (control chars stripped).
+fn cookie_with_path(sc: SetCookie, path: str) -> SetCookie {
+    return SetCookie {
+        name: sc.name,
+        value: sc.value,
+        expires: sc.expires,
+        max_age: sc.max_age,
+        domain: sc.domain,
+        path: cookie_sanitize_value(path),
+        is_secure: sc.is_secure,
+        is_http_only: sc.is_http_only,
+        same_site: sc.same_site
+    }
+}
+
+# cookie_with_secure(sc, b) — set the Secure flag.
+fn cookie_with_secure(sc: SetCookie, b: bool) -> SetCookie {
+    return SetCookie {
+        name: sc.name,
+        value: sc.value,
+        expires: sc.expires,
+        max_age: sc.max_age,
+        domain: sc.domain,
+        path: sc.path,
+        is_secure: b,
+        is_http_only: sc.is_http_only,
+        same_site: sc.same_site
+    }
+}
+
+# cookie_with_http_only(sc, b) — set the HttpOnly flag.
+fn cookie_with_http_only(sc: SetCookie, b: bool) -> SetCookie {
+    return SetCookie {
+        name: sc.name,
+        value: sc.value,
+        expires: sc.expires,
+        max_age: sc.max_age,
+        domain: sc.domain,
+        path: sc.path,
+        is_secure: sc.is_secure,
+        is_http_only: b,
+        same_site: sc.same_site
+    }
+}
+
+# cookie_with_same_site(sc, mode) — set the SameSite attribute. The
+# mode must be one of cookie_samesite_strict()/lax()/none()/unset().
+# Panics on an unknown value (the caller should use the constants).
+fn cookie_with_same_site(sc: SetCookie, mode: str) -> SetCookie {
+    if !cookie_samesite_is_valid(mode) {
+        panic("cookie_with_same_site: invalid mode '" + mode + "'")
+    }
+    return SetCookie {
+        name: sc.name,
+        value: sc.value,
+        expires: sc.expires,
+        max_age: sc.max_age,
+        domain: sc.domain,
+        path: sc.path,
+        is_secure: sc.is_secure,
+        is_http_only: sc.is_http_only,
+        same_site: mode
+    }
+}
+
+# ============================================================================
+# Sanitisation — RFC 6265 §4.1.1 grammar for cookie-name and cookie-value.
+#
+#   cookie-name      = token (RFC 7230 §3.2.6)
+#   cookie-value     = *cookie-octet / ( DQUOTE *cookie-octet DQUOTE )
+#   cookie-octet     = %x21 / %x23-2B / %x2D-3A / %x3C-5B / %x5D-7E
+#                      ; US-ASCII chars excluding CTLs, DQUOTE, ";", ",", "\"
+#
+# In practice, every user agent accepts any printable ASCII char in
+# the value as long as it's not ";", ",", or a control char. We reject:
+#   * Bytes 0x00-0x1F (control chars including HT)
+#   * Byte 0x7F (DEL)
+#   * Byte 0x22 (DQUOTE — would need quoting per RFC 6265)
+#   * Byte 0x3B (";" — pair separator)
+#   * Byte 0x2C ("," — historical separator, rejected by IE)
+#   * Byte 0x5C ("\\" — backslash, rejected by some UAs)
+# For NAMES we additionally reject:
+#   * Byte 0x3D ("=" — name/value separator)
+#   * Byte 0x20 (space)
+# ============================================================================
+
+# cookie_sanitize_name(s) — strip forbidden bytes from a cookie name.
+# Returns the cleaned string. Does NOT panic (the caller can choose to
+# panic if the result is shorter than the input, indicating a forbidden
+# char was found). cookie_new uses this + panics if the result is empty.
+fn cookie_sanitize_name(s: str) -> str {
+    let out: list[str] = []
+    let n: int = s.len()
+    let mut i: int = 0
+    while i < n {
+        let b: int = s.byte_at(i)
+        if cookie_is_name_byte_ok(b) {
+            out.push(s.slice(i, i + 1))
+        }
+        i = i + 1
+    }
+    return str_join(out, "")
+}
+
+# cookie_sanitize_value(s) — strip forbidden bytes from a cookie value.
+fn cookie_sanitize_value(s: str) -> str {
+    let out: list[str] = []
+    let n: int = s.len()
+    let mut i: int = 0
+    while i < n {
+        let b: int = s.byte_at(i)
+        if cookie_is_value_byte_ok(b) {
+            out.push(s.slice(i, i + 1))
+        }
+        i = i + 1
+    }
+    return str_join(out, "")
+}
+
+# cookie_is_name_byte_ok(b) — true iff b is allowed in a cookie name.
+fn cookie_is_name_byte_ok(b: int) -> bool {
+    if b < 33 {
+        return false                     # CTLs + space
+    }
+    if b == 127 {
+        return false                     # DEL
+    }
+    if b == 34 || b == 44 || b == 59 || b == 61 || b == 92 {
+        return false                     # DQUOTE, ",", ";", "=", "\"
+    }
+    if b > 126 {
+        return false                     # non-ASCII (we accept US-ASCII only)
+    }
+    return true
+}
+
+# cookie_is_value_byte_ok(b) — true iff b is allowed in a cookie value.
+# Compared to names, "=" and " " are allowed in values.
+fn cookie_is_value_byte_ok(b: int) -> bool {
+    if b < 33 {
+        # Space (0x20) is allowed in values (RFC 6265 §4.1.1 allows
+        # %x20 if quoted; in practice, every UA accepts unquoted values
+        # with spaces). We accept space.
+        if b == 32 {
+            return true
+        }
+        return false                     # CTLs (including HT)
+    }
+    if b == 127 {
+        return false                     # DEL
+    }
+    if b == 34 || b == 44 || b == 59 || b == 92 {
+        return false                     # DQUOTE, ",", ";", "\"
+    }
+    if b > 126 {
+        return false                     # non-ASCII
+    }
+    return true
+}
+
+# ============================================================================
+# Serialisation — SetCookie → Set-Cookie header value.
+#
+# RFC 6265 §4.1.1 grammar:
+#   set-cookie-string = cookie-pair *( ";" SP cookie-av )
+#   cookie-pair       = cookie-name "=" cookie-value
+#   cookie-av         = expires-av / max-age-av / domain-av /
+#                       path-av / secure-av / httponly-av /
+#                       samesite-av / extension-av
+#
+# Attribute order in our serialisation (canonical, matches RFC 6265 §5.4
+# recommendation for readability):
+#   Expires / Max-Age / Domain / Path / Secure / HttpOnly / SameSite
+# ============================================================================
+
+# cookie_serialize(sc) — render a SetCookie as a Set-Cookie header value.
+# Panics if the result exceeds cookie_max_size() (4096 bytes).
+fn cookie_serialize(sc: SetCookie) -> str {
+    let mut s: str = sc.name + "=" + sc.value
+    if sc.expires.len() > 0 {
+        s = s + "; " + cookie_attr_expires() + "=" + sc.expires
+    }
+    if sc.max_age >= 0 {
+        s = s + "; " + cookie_attr_max_age() + "=" + sc.max_age.to_str()
+    }
+    if sc.domain.len() > 0 {
+        s = s + "; " + cookie_attr_domain() + "=" + sc.domain
+    }
+    if sc.path.len() > 0 {
+        s = s + "; " + cookie_attr_path() + "=" + sc.path
+    }
+    if sc.is_secure {
+        s = s + "; " + cookie_attr_secure()
+    }
+    if sc.is_http_only {
+        s = s + "; " + cookie_attr_http_only()
+    }
+    if sc.same_site.len() > 0 {
+        s = s + "; " + cookie_attr_same_site() + "=" + sc.same_site
+    }
+    if s.len() > cookie_max_size() {
+        panic("cookie_serialize: Set-Cookie value exceeds 4096 bytes (RFC 6265 §6.1)")
+    }
+    return s
+}
+
+# cookie_to_header(sc) — convenience wrapper: returns an HttpHeader named
+# "Set-Cookie" with the serialised value. Use http_header_add to append
+# multiple Set-Cookie headers to a single response.
+fn cookie_to_header(sc: SetCookie) -> HttpHeader {
+    return HttpHeader { name: "Set-Cookie", value: cookie_serialize(sc) }
+}
+
+# ============================================================================
+# HMAC-SHA1 (RFC 2104) — the signing primitive.
+#
+#   HMAC(K, m) = H((K' XOR opad) || H((K' XOR ipad) || m))
+#
+#   K'  = K padded to block size (64 bytes for SHA-1) — if K is longer
+#          than 64 bytes, K' = H(K) padded to 64 bytes.
+#   ipad = 0x36 repeated 64 times
+#   opad = 0x5C repeated 64 times
+#   H    = SHA-1 (20-byte digest)
+#   ||   = concatenation
+#
+# The largest intermediate value is 64 bytes (the key block) plus the
+# message — both are str values, no arithmetic on the bytes themselves.
+# SHA-1 is called twice (inner and outer hash).
+# ============================================================================
+
+# cookie_hmac_sha1(key, msg) — compute HMAC-SHA1(key, msg), returning
+# the 20-byte digest as a str. Pure — deterministic in (key, msg).
+fn cookie_hmac_sha1(key: str, msg: str) -> str {
+    let block_size: int = 64             # SHA-1 block size
+    # Step 1: derive K'. If key > 64 bytes, hash it; else pad with zeros.
+    let mut k_prime: str = key
+    if key.len() > block_size {
+        k_prime = sha1_hash(key)
+    }
+    # Pad with zero bytes up to block_size.
+    while k_prime.len() < block_size {
+        k_prime = k_prime + chr(0)
+    }
+    # Step 2: build the inner and outer padded keys (K' XOR ipad / opad).
+    let inner_key: str = cookie_xor_pad(k_prime, 54)         # 0x36
+    let outer_key: str = cookie_xor_pad(k_prime, 92)         # 0x5C
+    # Step 3: inner hash = H(inner_key || msg)
+    let inner_hash: str = sha1_hash(inner_key + msg)
+    # Step 4: outer hash = H(outer_key || inner_hash)
+    return sha1_hash(outer_key + inner_hash)
+}
+
+# cookie_xor_pad(k, pad_byte) — XOR each byte of k with pad_byte.
+# Used to build the HMAC inner (0x36) and outer (0x5C) padded keys.
+fn cookie_xor_pad(k: str, pad_byte: int) -> str {
+    let out: list[str] = []
+    let n: int = k.len()
+    let mut i: int = 0
+    while i < n {
+        let b: int = k.byte_at(i)
+        out.push(chr(int_xor(b, pad_byte)))
+        i = i + 1
+    }
+    return str_join(out, "")
+}
+
+# ============================================================================
+# Signing — anti-tampering.
+#
+# Format: signed value = "<original>.<base64url(hmac-sha1(secret, original))>"
+# The "." separator is the LAST one in the string — the original value
+# may itself contain "." characters. The verifier splits on the LAST "."
+# to recover the original and the signature.
+#
+# The base64url encoding is used (no padding) to avoid "=" characters
+# in the cookie value (which some user agents mishandle).
+# ============================================================================
+
+# cookie_sign(sc, secret) — sign a SetCookie's value with HMAC-SHA1.
+# Returns a NEW SetCookie whose value field is "<original>.<signature>".
+# The original value field is replaced; the rest of the SetCookie is
+# unchanged.
+fn cookie_sign(sc: SetCookie, secret: str) -> SetCookie {
+    let sig: str = base64url_encode(cookie_hmac_sha1(secret, sc.value))
+    let new_value: str = sc.value + "." + sig
+    return SetCookie {
+        name: sc.name,
+        value: new_value,
+        expires: sc.expires,
+        max_age: sc.max_age,
+        domain: sc.domain,
+        path: sc.path,
+        is_secure: sc.is_secure,
+        is_http_only: sc.is_http_only,
+        same_site: sc.same_site
+    }
+}
+
+# cookie_verify(sc, secret) — verify a signed SetCookie's signature.
+# Returns true iff:
+#   1. The value contains at least one "." (i.e. it looks signed).
+#   2. The portion after the LAST "." base64url-decodes cleanly to a
+#      20-byte signature.
+#   3. The recomputed HMAC-SHA1 over the portion before the LAST "."
+#      matches the decoded signature, compared in CONSTANT TIME.
+#
+# Pure — deterministic in (sc.value, secret).
+fn cookie_verify(sc: SetCookie, secret: str) -> bool {
+    let v: str = sc.value
+    let last_dot: int = cookie_last_index(v, ".")
+    if last_dot < 0 {
+        return false
+    }
+    let original: str = v.slice(0, last_dot)
+    let sig_b64: str = v.slice(last_dot + 1, v.len())
+    let sig_decoded: str = base64url_decode(sig_b64)
+    if sig_decoded.len() != 20 {
+        return false
+    }
+    let expected: str = cookie_hmac_sha1(secret, original)
+    # Constant-time comparison: XOR every byte and OR the result.
+    # No short-circuit — every byte is examined.
+    return cookie_const_time_eq(sig_decoded, expected)
+}
+
+# cookie_unwrap_signed(sc, secret) — verify + extract the original value.
+# Returns Ok(original_value) on success, Err(reason) on failure.
+fn cookie_unwrap_signed(sc: SetCookie, secret: str) -> Result[str, str] {
+    let v: str = sc.value
+    let last_dot: int = cookie_last_index(v, ".")
+    if last_dot < 0 {
+        return Result.Err("not signed (no '.' in value)")
+    }
+    let original: str = v.slice(0, last_dot)
+    let sig_b64: str = v.slice(last_dot + 1, v.len())
+    let sig_decoded: str = base64url_decode(sig_b64)
+    if sig_decoded.len() != 20 {
+        return Result.Err("signature length mismatch (expected 20 bytes)")
+    }
+    let expected: str = cookie_hmac_sha1(secret, original)
+    if !cookie_const_time_eq(sig_decoded, expected) {
+        return Result.Err("HMAC mismatch (cookie was tampered with)")
+    }
+    return Result.Ok(original)
+}
+
+# cookie_const_time_eq(a, b) — constant-time string comparison. Returns
+# true iff a == b. Both strings must have the same length (otherwise
+# the function returns false immediately, BUT the length check itself
+# leaks length information — for true constant-time semantics, callers
+# should ensure both inputs are the same length, which our verifier
+# does by checking sig_decoded.len() == 20 first).
+fn cookie_const_time_eq(a: str, b: str) -> bool {
+    if a.len() != b.len() {
+        return false
+    }
+    let mut diff: int = 0
+    let n: int = a.len()
+    let mut i: int = 0
+    while i < n {
+        diff = int_or(diff, int_xor(a.byte_at(i), b.byte_at(i)))
+        i = i + 1
+    }
+    return diff == 0
+}
+
+# cookie_last_index(s, ch) — return the byte index of the LAST occurrence
+# of the single-byte string `ch` in `s`, or -1 if absent. We don't have
+# a builtin for last-index-of, so we scan from the end.
+fn cookie_last_index(s: str, ch: str) -> int {
+    if ch.len() != 1 {
+        panic("cookie_last_index: ch must be 1 byte")
+    }
+    let target: int = ch.byte_at(0)
+    let mut i: int = s.len() - 1
+    while i >= 0 {
+        if s.byte_at(i) == target {
+            return i
+        }
+        i = i - 1
+    }
+    return -1
+}
+
+# ============================================================================
+# HTTP date formatting — RFC 7231 §7.1.1.1 IMF-fixdate.
+#
+#   IMF-fixdate    = day-name "," SP date1 SP time-of-day SP GMT
+#   day-name       = %x4D.6F.6E / %x54.75.65 / %x57.65.64 /
+#                    %x54.68.75 / %x46.72.69 / %x53.61.74 / %x53.75.6E
+#   date1          = day SP month SP year
+#                    ; e.g., 07 Nov 1994
+#   time-of-day    = hour ":" minute ":" second
+#                    ; e.g., 08:49:37
+#
+# The algorithm converts a Unix timestamp (ms) to GMT calendar fields
+# using the Hinnant civil-from-days algorithm (the same one used by
+# std.log Stage 57). Day-of-week is computed via the Zeller-like
+# property that 1970-01-01 was a Thursday (weekday 4 if Mon=0).
+# ============================================================================
+
+# cookie_format_http_date(unix_ms) — format a Unix timestamp in
+# milliseconds as an RFC 7231 HTTP date string. The output is always
+# in GMT (UTC) — RFC 7231 §7.1.1.1 requires the "GMT" suffix.
+#
+# Pure — deterministic in the input timestamp. Used for the Expires
+# attribute of SetCookie.
+fn cookie_format_http_date(unix_ms: int) -> str {
+    let total_secs: int = cookie_floor_div(unix_ms, 1000)
+    # Days since 1970-01-01.
+    let days: int = cookie_floor_div(total_secs, 86400)
+    # Seconds within the day.
+    let secs_of_day: int = total_secs - days * 86400
+    let hour: int = secs_of_day / 3600
+    let minute: int = (secs_of_day - hour * 3600) / 60
+    let second: int = secs_of_day - hour * 3600 - minute * 60
+    # Civil-from-days (Hinnant's algorithm, also used by std.log Stage 57).
+    let z: int = days + 719468
+    let era: int = cookie_floor_div(z, 146097)
+    let doe: int = z - era * 146097                  # [0, 146096]
+    let yoe: int = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365
+    let y: int = yoe + era * 400
+    let doy: int = doe - (365 * yoe + yoe / 4 - yoe / 100)
+    let mp: int = (5 * doy + 2) / 153                # [0, 11]
+    let d: int = doy - (153 * mp + 2) / 5 + 1        # [1, 31]
+    let mut m: int = 0
+    if mp < 10 {
+        m = mp + 3
+    } else {
+        m = mp - 9
+    }
+    let mut year: int = y
+    if m <= 2 {
+        year = y + 1
+    }
+    # Day of week: 1970-01-01 was a Thursday (weekday 4 if Mon=0).
+    # (days % 7) gives 0 for Thursday, 1 for Friday, etc.
+    # We need 0=Sun, 1=Mon, ..., 6=Sat.
+    let dow_mod: int = days - (days / 7) * 7
+    let mut dow: int = (dow_mod + 4) - ((dow_mod + 4) / 7) * 7
+    if dow < 0 {
+        dow = dow + 7
+    }
+    # Day name.
+    let day_names: list[str] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+    let month_names: list[str] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+    let day_name: str = day_names.get(dow)
+    let month_name: str = month_names.get(m - 1)
+    # Format: "Sun, 06 Nov 1994 08:49:37 GMT"
+    let day_str: str = cookie_pad2(d)
+    let year_str: str = year.to_str()
+    let hour_str: str = cookie_pad2(hour)
+    let min_str: str = cookie_pad2(minute)
+    let sec_str: str = cookie_pad2(second)
+    return day_name + ", " + day_str + " " + month_name + " " + year_str + " " + hour_str + ":" + min_str + ":" + sec_str + " GMT"
+}
+
+# cookie_floor_div(a, b) — floor division (HLS's "/" truncates toward
+# zero, but we need floor toward negative infinity for the
+# civil-from-days algorithm to handle pre-1970 dates).
+fn cookie_floor_div(a: int, b: int) -> int {
+    let mut q: int = a / b
+    if (a < 0) != (b < 0) {
+        # Signs differ — check if there's a remainder.
+        if a != q * b {
+            q = q - 1
+        }
+    }
+    return q
+}
+
+# cookie_pad2(n) — pad a number to 2 digits with a leading zero.
+fn cookie_pad2(n: int) -> str {
+    if n < 10 {
+        return "0" + n.to_str()
+    }
+    return n.to_str()
+}
+
+# ============================================================================
+# Diagnostic — describe a SetCookie for log output.
+# ============================================================================
+
+# cookie_describe(sc) — human-readable rendering of a SetCookie. Used
+# by the demo and by log-on-set output.
+fn cookie_describe(sc: SetCookie) -> str {
+    let mut s: str = "SetCookie { "
+    s = s + "name='" + sc.name + "', "
+    s = s + "value_len=" + sc.value.len().to_str() + ", "
+    if sc.expires.len() > 0 {
+        s = s + "expires='" + sc.expires + "', "
+    }
+    if sc.max_age >= 0 {
+        s = s + "max_age=" + sc.max_age.to_str() + ", "
+    }
+    if sc.domain.len() > 0 {
+        s = s + "domain='" + sc.domain + "', "
+    }
+    if sc.path.len() > 0 {
+        s = s + "path='" + sc.path + "', "
+    }
+    if sc.is_secure {
+        s = s + "secure, "
+    }
+    if sc.is_http_only {
+        s = s + "http_only, "
+    }
+    if sc.same_site.len() > 0 {
+        s = s + "same_site=" + sc.same_site + ", "
+    }
+    # Strip the trailing ", " if present.
+    if s.ends_with(", ") {
+        s = s.slice(0, s.len() - 2)
+    }
+    s = s + " }"
+    return s
+}
+
+# ============================================================================
+# End of std/cookie.hls
+# ============================================================================

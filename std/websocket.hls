@@ -1,0 +1,1224 @@
+# ============================================================================
+# std/websocket.hls — Stage 65 (v0.84.0-alpha): RFC 6455 WebSocket protocol
+# ----------------------------------------------------------------------------
+# This module is the THIRD module of Phase V (the web application track,
+# Stages 63–76). It implements the WebSocket protocol specified in
+# RFC 6455 (December 2011) — the standard wire protocol for full-duplex,
+# bidirectional communication between a web client (browser) and a server
+# over a single TCP connection.
+#
+# The module provides BOTH server-side and client-side functionality:
+#
+#   SERVER-SIDE HANDSHAKE
+#     ws_accept_key(client_key: str) -> str
+#         Compute the Sec-WebSocket-Accept value from the client's
+#         Sec-WebSocket-Key, per RFC 6455 §1.3:
+#           base64(SHA-1(client_key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))
+#         This is the value the server sends back in the 101 Switching
+#         Protocols response.
+#
+#     ws_handshake_response(client_key: str, subprotocol: str) -> str
+#         Build a complete 101 Switching Protocols HTTP response,
+#         including the Upgrade, Connection, Sec-WebSocket-Accept,
+#         and (optionally) Sec-WebSocket-Protocol headers.
+#
+#     ws_validate_upgrade(req: HttpRequest) -> Result[str, str]
+#         Validate an incoming HTTP request is a valid WebSocket
+#         upgrade request. Returns Ok(accept_key) on success, Err(reason)
+#         on failure (missing headers, wrong method, wrong version, etc.).
+#
+#   CLIENT-SIDE HANDSHAKE
+#     ws_generate_key() -> str
+#         Generate a random 16-byte Sec-WebSocket-Key, base64-encoded.
+#         Uses rand_int (Stage 9, Rand effect) for the 16 random bytes.
+#
+#     ws_handshake_request(host: str, port: int, path: str, key: str,
+#                          subprotocol: str) -> str
+#         Build a complete HTTP/1.1 Upgrade request to open a WebSocket
+#         connection.
+#
+#     ws_validate_accept(server_accept: str, client_key: str) -> bool
+#         Verify that the server's Sec-WebSocket-Accept value matches
+#         the locally-computed value. Detects MITM attacks that hijack
+#         the upgrade without re-computing the accept key.
+#
+#   FRAME ENCODE / DECODE (RFC 6455 §5)
+#     ws_frame_t / ws_opcode_* constants for the 4 opcodes:
+#       continuation (0x0), text (0x1), binary (0x2), close (0x8),
+#       ping (0x9), pong (0xA).
+#
+#     ws_frame_encode(opcode: int, payload: str, mask: bool) -> str
+#         Encode a single WebSocket frame. The mask flag indicates
+#         whether the payload is masked (client→server frames MUST be
+#         masked; server→client frames MUST NOT be masked per RFC 6455
+#         §5.1). The masking key is generated via rand_int when mask=true.
+#
+#     ws_frame_encode_with_key(opcode: int, payload: str, mask_key: str) -> str
+#         Deterministic variant: caller provides the 4-byte mask key.
+#         Used by tests so the output is byte-reproducible.
+#
+#     ws_frame_decode(s: str) -> Result[WsFrame, str]
+#         Parse a single WebSocket frame from the input buffer. Returns
+#         Ok(WsFrame) if a complete frame is present; returns Err("incomplete")
+#         if the buffer doesn't yet contain a full frame (caller should
+#         read more bytes and retry); returns Err("protocol error: ...")
+#         on a malformed frame (RSV bits set, reserved opcode, etc.).
+#
+#     ws_frame_decode_length(s: str) -> int
+#         Given a buffer that begins with a WebSocket frame, return the
+#         TOTAL byte length of that frame (header + mask key + payload).
+#         Returns 0 if the buffer doesn't yet contain enough bytes to
+#         determine the length. Useful for the read loop: read until
+#         buffer.len() >= ws_frame_decode_length(buffer).
+#
+#   CONNECTION HELPERS
+#     ws_send_text(stream: TcpStream, msg: str) -> int  (server side)
+#     ws_send_binary(stream: TcpStream, data: str) -> int  (server side)
+#     ws_send_text_masked(stream: TcpStream, msg: str) -> int  (client side)
+#     ws_send_close(stream: TcpStream, code: int, reason: str) -> int
+#     ws_send_ping(stream: TcpStream, payload: str) -> int
+#     ws_send_pong(stream: TcpStream, payload: str) -> int
+#         Convenience wrappers that encode + write a single frame.
+#
+#     ws_read_frame(stream: TcpStream) -> Result[WsFrame, str]
+#         Read + decode a single WebSocket frame from a TcpStream.
+#         Reads in a bounded loop until a complete frame is available
+#         (or the connection closes).
+#
+#   CLOSE HANDSHAKE (RFC 6455 §7)
+#     ws_close_code_* constants for the standard close codes
+#       (1000 normal closure, 1001 going away, 1002 protocol error,
+#        1003 unsupported data, 1007 invalid UTF-8, 1008 policy
+#        violation, 1009 message too big, 1011 internal error).
+#
+#     ws_close_frame(code: int, reason: str) -> str
+#         Build the payload of a Close frame: 2-byte big-endian status
+#         code + UTF-8 reason string. Used by both encode helpers.
+#
+#     ws_parse_close_payload(payload: str) -> Result[(int, str), str]
+#         Parse a Close frame payload back into (code, reason). Returns
+#         Err if the payload is malformed.
+#
+# ARCHITECTURE
+#
+#   The WebSocket wire format (RFC 6455 §5):
+#
+#      0                   1                   2                   3
+#      0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+#     +-+-+-+-+-------+-+-------------+-------------------------------+
+#     |F|R|R|R| opcode|M| Payload len |    Extended payload length    |
+#     |I|S|S|S|  (4)  |A|     (7)     |             (16/64)           |
+#     |N|V|V|V|       |S|             |   (if payload len==126/127)   |
+#     | |1|2|3|       |K|             |                               |
+#     +-+-+-+-+-------+-+-------------+ - - - - - - - - - - - - - - - +
+#     |     Extended payload length continued, if payload len == 127  |
+#     + - - - - - - - - - - - - - - - +-------------------------------+
+#     |                               |Masking-key, if MASK set to 1  |
+#     +-------------------------------+-------------------------------+
+#     | Masking-key (continued)       |          Payload Data         |
+#     +-------------------------------- - - - - - - - - - - - - - - - +
+#     :                     Payload Data continued ...                :
+#     + - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - +
+#     |                     Payload Data continued ...                |
+#     +---------------------------------------------------------------+
+#
+#   * FIN (1 bit): set on the final fragment of a message.
+#   * RSV1-3 (3 bits): reserved, MUST be 0 unless negotiated otherwise.
+#   * opcode (4 bits): 0x0 continuation, 0x1 text, 0x2 binary, 0x8 close,
+#                      0x9 ping, 0xA pong.
+#   * MASK (1 bit): set if the payload is masked. CLIENT→SERVER frames
+#                   MUST set this; SERVER→CLIENT frames MUST NOT.
+#   * Payload len (7 bits): 0-125 = the length directly;
+#                           126 = next 2 bytes are the length (16-bit BE);
+#                           127 = next 8 bytes are the length (64-bit BE).
+#   * Masking-key (32 bits, only if MASK=1): 4 bytes used to XOR the payload.
+#   * Payload Data: the actual message bytes (XOR'd with the mask if MASK=1).
+#
+#   Masking: each byte of payload is XOR'd with mask_key[i mod 4]. The
+#   mask is REQUIRED for client→server frames (RFC 6455 §5.1) to prevent
+#   cache-poisoning attacks on intermediaries. The server-side read path
+#   un-mask the payload automatically.
+#
+#   Fragmentation: a message may be split across multiple frames (FIN=0
+#   on intermediate frames; FIN=1 on the final frame). This module
+#   handles individual frames; the caller is responsible for assembling
+#   fragments into messages (a future stage may add a ws_read_message
+#   helper).
+#
+# LIMITATIONS (v0.84.0-alpha)
+#
+#   * TLS (`wss://`) is NOT supported directly — same limitation as
+#     Stage 64's http_server. Deploy behind a reverse proxy (nginx /
+#     caddy) that terminates TLS and forwards plain `ws://` to the
+#     HLS server. When a future stage adds `tls_listen`, ws_connect
+#     will gain a wss:// variant.
+#   * Per-message compression (RFC 7692) is NOT supported. Add the
+#     Sec-WebSocket-Extensions header only after a future stage
+#     implements the inflate/deflate path.
+#   * Subprotocol negotiation: the API surface accepts a subprotocol
+#     string; the user is responsible for picking one. No built-in
+#     registry of well-known subprotocols.
+#   * Fragmentation: this module handles INDIVIDUAL frames. A higher-
+#     level `ws_read_message` helper that assembles fragments is
+#     deferred to a perfection stage.
+#
+# DIFFERENTIAL PARITY
+#
+#   Every pure function (handshake key computation, frame encode / decode,
+#   masking, close-code parsing) produces byte-identical output between
+#   the interpreter and the native binary. The only non-deterministic
+#   piece is ws_generate_key (which calls rand_int); the differential
+#   test exercises the deterministic variant (ws_accept_key on a fixed
+#   input) instead.
+#
+# NO NEW COMPILER BUILTINS
+#
+#   The entire module is pure HLS, layered on:
+#     * std.http   (HttpRequest / HttpResponse / http_header_get /
+#                   http_response_new / http_serialize_response /
+#                   http_crlf — the HTTP/1.1 message format)
+#     * std.http2 (http2_encode_length_24, http2_encode_stream_id_31 —
+#                  byte decomposition via arithmetic; reused from
+#                  Stage 39's HTTP/2 frame encoders)
+#     * std.bits  (int_and / int_or / int_xor / int_shr / int_shl —
+#                  Stage 32's native bitwise builtins)
+#     * std.sha1  (this stage's new SHA-1 module)
+#     * std.base64 (Stage 38's existing base64_encode / base64_decode)
+#     * std.str   (str_join, str_starts_with, byte_at, chr)
+#     * std.net   (TcpStream read/write — for the live network helpers)
+#     * std.option / std.result (Result[T, E] for fallible decode)
+# ============================================================================
+
+import "std.http"
+import "std.http2"
+import "std.bits"
+import "std.sha1"
+import "std.base64"
+import "std.str"
+import "std.option"
+import "std.result"
+import "std.net"
+
+# ============================================================================
+# Constants — the WebSocket GUID (RFC 6455 §1.3), opcodes, close codes,
+# and protocol bounds.
+# ============================================================================
+
+# ws_guid — the magic UUID that the server appends to the client's
+# Sec-WebSocket-Key before SHA-1'ing. RFC 6455 §1.3:
+#   "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+# This GUID is intentionally chosen to be a non-routing, non-allocated
+# UUID — it serves only to make the SHA-1 input distinct from any
+# conceivable natural string.
+fn ws_guid() -> str {
+    return "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+}
+
+# ---- Opcodes (RFC 6455 §5.2) ----------------------------------------------
+# The opcode is the low 4 bits of the first byte. 0x3-0x7 and 0xB-0xF
+# are reserved and MUST be rejected by the receiver.
+
+fn ws_opcode_continuation() -> int {
+    return 0
+}
+
+fn ws_opcode_text() -> int {
+    return 1
+}
+
+fn ws_opcode_binary() -> int {
+    return 2
+}
+
+fn ws_opcode_close() -> int {
+    return 8
+}
+
+fn ws_opcode_ping() -> int {
+    return 9
+}
+
+fn ws_opcode_pong() -> int {
+    return 10
+}
+
+# ws_is_control_opcode(op) — control frames are 0x8..0xF. They MUST NOT
+# be fragmented (RFC 6455 §5.4) and their payload MUST be <= 125 bytes
+# (RFC 6455 §5.5).
+fn ws_is_control_opcode(op: int) -> bool {
+    return op >= 8 && op <= 15
+}
+
+# ws_is_reserved_opcode(op) — 0x3..0x7 and 0xB..0xF are reserved.
+# Receiving one is a protocol error (RFC 6455 §7.4.1, code 1002).
+fn ws_is_reserved_opcode(op: int) -> bool {
+    if op >= 3 && op <= 7 {
+        return true
+    }
+    if op >= 11 && op <= 15 {
+        return true
+    }
+    return false
+}
+
+# ws_is_valid_opcode(op) — true iff opcode is one of 0, 1, 2, 8, 9, 10.
+fn ws_is_valid_opcode(op: int) -> bool {
+    if op < 0 || op > 15 {
+        return false
+    }
+    if ws_is_reserved_opcode(op) {
+        return false
+    }
+    return true
+}
+
+# ---- Close codes (RFC 6455 §7.4) -----------------------------------------
+
+fn ws_close_normal() -> int {
+    return 1000
+}
+
+fn ws_close_going_away() -> int {
+    return 1001
+}
+
+fn ws_close_protocol_error() -> int {
+    return 1002
+}
+
+fn ws_close_unsupported_data() -> int {
+    return 1003
+}
+
+fn ws_close_no_status() -> int {
+    return 1005
+}
+
+fn ws_close_abnormal() -> int {
+    return 1006
+}
+
+fn ws_close_invalid_utf8() -> int {
+    return 1007
+}
+
+fn ws_close_policy_violation() -> int {
+    return 1008
+}
+
+fn ws_close_too_big() -> int {
+    return 1009
+}
+
+fn ws_close_internal_error() -> int {
+    return 1011
+}
+
+# ws_is_valid_close_code(code) — true iff code is one of the standard
+# 1000-1003, 1007-1011, or in the 3000-4999 application/private range
+# (RFC 6455 §7.4.2). 1004-1006, 1012-1014, 1015 are reserved (MUST NOT
+# be sent on the wire).
+fn ws_is_valid_close_code(code: int) -> bool {
+    # 1000-1003: standard range.
+    if code >= 1000 && code <= 1003 {
+        return true
+    }
+    # 1004-1006: reserved, MUST NOT appear on the wire.
+    if code >= 1004 && code <= 1006 {
+        return false
+    }
+    # 1007-1011: standard range (UTF-8, policy, too big, extension, error).
+    if code >= 1007 && code <= 1011 {
+        return true
+    }
+    # 1012-1014: reserved.
+    if code >= 1012 && code <= 1014 {
+        return false
+    }
+    # 1015: reserved (TLS handshake failure — must not appear).
+    if code == 1015 {
+        return false
+    }
+    # 3000-3999: application-defined (IANA registry).
+    if code >= 3000 && code <= 3999 {
+        return true
+    }
+    # 4000-4999: private use (RFC 6455 §7.4.2).
+    if code >= 4000 && code <= 4999 {
+        return true
+    }
+    return false
+}
+
+# ---- Frame size bounds ---------------------------------------------------
+# These bounds protect against memory exhaustion attacks (RFC 6455 §10.4:
+# "Implementations SHOULD verify that the input is within a reasonable
+# size before processing it").
+
+# ws_max_frame_size() — hard limit on a single frame's total byte size
+# (header + mask + payload). Default: 16 MiB. A frame claiming a larger
+# size is rejected with Err("frame too large").
+fn ws_max_frame_size() -> int {
+    return 16777216                  # 16 MiB
+}
+
+# ws_max_payload_size() — hard limit on a single frame's payload. Default:
+# 16 MiB. Frames with extended-length fields claiming a payload larger
+# than this are rejected.
+fn ws_max_payload_size() -> int {
+    return 16777216                  # 16 MiB
+}
+
+# ============================================================================
+# WsFrame — the parsed form of a single WebSocket frame.
+#
+# Fields:
+#   fin      — true iff the FIN bit was set (final fragment).
+#   opcode   — the 4-bit opcode (0..15, validated to be in the allowed set).
+#   masked   — true iff the MASK bit was set.
+#   mask_key — the 4-byte mask key (empty string if masked=false).
+#   payload  — the (un-masked) payload bytes.
+# ============================================================================
+
+struct WsFrame {
+    fin: bool,
+    opcode: int,
+    masked: bool,
+    mask_key: str,
+    payload: str
+}
+
+# ============================================================================
+# Masking — RFC 6455 §5.3.
+#
+# Masking is a per-byte XOR with the 4-byte mask key. The mask is applied
+# to the payload bytes ONLY (not the header). The mask key is generated
+# by the client and MUST be cryptographically random (RFC 6455 §10.8:
+# "the masking key MUST be derived from a strong source of entropy").
+#
+# In Halis, rand_int(256) is backed by /dev/urandom on the native path
+# (and Python's random module on the interpreter path — NOT cryptographic
+# but the interpreter is only used for development). For production use,
+# a future stage may add a `crypto_random_bytes` builtin backed by
+# getrandom(2) — the same underlying source.
+# ============================================================================
+
+# ws_apply_mask(payload, mask_key) — XOR each byte of payload with
+# mask_key[i mod 4]. The result is the same length as payload. The
+# operation is its own inverse: applying the mask twice yields the
+# original payload (XOR is involutive). Used both for masking (client
+# side) and un-masking (server side).
+fn ws_apply_mask(payload: str, mask_key: str) -> str {
+    if mask_key.len() != 4 {
+        panic("ws_apply_mask: mask key must be 4 bytes")
+    }
+    let m0: int = mask_key.byte_at(0)
+    let m1: int = mask_key.byte_at(1)
+    let m2: int = mask_key.byte_at(2)
+    let m3: int = mask_key.byte_at(3)
+    let out: list[str] = []
+    let n: int = payload.len()
+    let mut i: int = 0
+    while i < n {
+        let b: int = payload.byte_at(i)
+        let mod4: int = i - (i / 4) * 4
+        let mut mk: int = m0
+        if mod4 == 1 {
+            mk = m1
+        } else if mod4 == 2 {
+            mk = m2
+        } else if mod4 == 3 {
+            mk = m3
+        }
+        out.push(chr(int_xor(b, mk)))
+        i = i + 1
+    }
+    return str_join(out, "")
+}
+
+# ws_generate_mask_key() — generate a random 4-byte mask key. Uses
+# rand_int(256) four times. The Rand effect propagates up to the caller.
+fn ws_generate_mask_key() -> str uses Rand {
+    return chr(rand_int(256)) + chr(rand_int(256)) + chr(rand_int(256)) + chr(rand_int(256))
+}
+
+# ============================================================================
+# Frame ENCODING — RFC 6455 §5.2.
+# ============================================================================
+
+# ws_encode_length_7_or_16_or_64 — the payload-length field encoder.
+# Returns (length_field_bytes, extended_length_bytes) — the first byte
+# is the 7-bit length-or-marker, the rest is the 16- or 64-bit extended
+# length when the payload exceeds 125 bytes.
+#
+# HLS doesn't have bitwise operators on int literals; we use std.bits
+# (which delegates to int_and / int_shr — single C operations since
+# Stage 32).
+fn ws_encode_length_marker(payload_len: int) -> int {
+    if payload_len <= 125 {
+        return payload_len
+    }
+    if payload_len <= 65535 {
+        return 126
+    }
+    return 127
+}
+
+# ws_encode_extended_length(payload_len) — return the extended-length
+# bytes (0 bytes if payload <= 125; 2 bytes if payload <= 65535; 8 bytes
+# otherwise). Big-endian. The 64-bit case uses int_shr to extract each
+# byte (the maximum payload is ws_max_payload_size(), 16 MiB — the high
+# 4 bytes are always 0, but the encoder emits all 8 for spec compliance).
+fn ws_encode_extended_length(payload_len: int) -> str {
+    if payload_len <= 125 {
+        return ""
+    }
+    if payload_len <= 65535 {
+        # 2-byte big-endian.
+        let hi: int = int_and(int_shr(payload_len, 8), 255)
+        let lo: int = int_and(payload_len, 255)
+        return chr(hi) + chr(lo)
+    }
+    # 8-byte big-endian. HLS int is int64, so the maximum value is
+    # 2^63 - 1 — well beyond the 16 MiB hard cap. The high 4 bytes
+    # are always 0 for our cap.
+    let b7: int = int_and(int_shr(payload_len, 56), 255)
+    let b6: int = int_and(int_shr(payload_len, 48), 255)
+    let b5: int = int_and(int_shr(payload_len, 40), 255)
+    let b4: int = int_and(int_shr(payload_len, 32), 255)
+    let b3: int = int_and(int_shr(payload_len, 24), 255)
+    let b2: int = int_and(int_shr(payload_len, 16), 255)
+    let b1: int = int_and(int_shr(payload_len, 8), 255)
+    let b0: int = int_and(payload_len, 255)
+    return chr(b7) + chr(b6) + chr(b5) + chr(b4) + chr(b3) + chr(b2) + chr(b1) + chr(b0)
+}
+
+# ws_frame_encode_with_key — encode a frame with a CALLER-SUPPLIED mask
+# key. The mask flag is set iff mask_key.len() == 4. This is the
+# DETERMINISTIC variant — tests use it so the output is byte-reproducible.
+#
+# Parameters:
+#   opcode   — the 4-bit opcode (validated; panics on reserved).
+#   payload  — the payload bytes (str).
+#   mask_key — "" for unmasked frames; a 4-byte str for masked frames.
+#
+# Returns the complete frame as a str.
+fn ws_frame_encode_with_key(opcode: int, payload: str, mask_key: str) -> str {
+    if !ws_is_valid_opcode(opcode) {
+        panic("ws_frame_encode: invalid opcode")
+    }
+    let masked: bool = mask_key.len() == 4
+    if mask_key.len() != 0 && mask_key.len() != 4 {
+        panic("ws_frame_encode: mask key must be 0 or 4 bytes")
+    }
+    if payload.len() > ws_max_payload_size() {
+        panic("ws_frame_encode: payload too large")
+    }
+    # Byte 0: FIN (0x80) | RSV1-3 (0) | opcode (4 bits).
+    let b0: int = int_or(128, opcode)             # FIN=1
+    # Byte 1: MASK (0x80 if masked) | payload-len (7 bits).
+    let marker: int = ws_encode_length_marker(payload.len())
+    let mut b1: int = marker
+    if masked {
+        b1 = int_or(128, marker)
+    }
+    let header: str = chr(b0) + chr(b1)
+    let ext_len: str = ws_encode_extended_length(payload.len())
+    let mut frame: str = header + ext_len
+    if masked {
+        frame = frame + mask_key
+    }
+    # Payload: XOR with mask_key if masked; otherwise as-is.
+    if masked {
+        let masked_payload: str = ws_apply_mask(payload, mask_key)
+        frame = frame + masked_payload
+    } else {
+        frame = frame + payload
+    }
+    return frame
+}
+
+# ws_frame_encode — encode a frame. The mask flag determines whether a
+# fresh random mask key is generated (mask=true) or no mask is applied
+# (mask=false). Used by client code (mask=true) and server code
+# (mask=false).
+fn ws_frame_encode(opcode: int, payload: str, mask: bool) -> str uses Rand {
+    if !mask {
+        return ws_frame_encode_with_key(opcode, payload, "")
+    }
+    let mk: str = ws_generate_mask_key()
+    return ws_frame_encode_with_key(opcode, payload, mk)
+}
+
+# ============================================================================
+# Frame DECODING — RFC 6455 §5.2.
+# ============================================================================
+
+# ws_frame_decode_length(s) — return the total byte length of the frame
+# at the start of `s`, OR 0 if the buffer doesn't yet contain enough
+# bytes to determine the length (caller should read more and retry).
+#
+# This is a pure function — it does not consume the input. The caller
+# is responsible for slicing off the frame after decoding.
+fn ws_frame_decode_length(s: str) -> int {
+    if s.len() < 2 {
+        return 0
+    }
+    let b1: int = s.byte_at(1)
+    let masked: bool = int_and(b1, 128) != 0
+    let len7: int = int_and(b1, 127)
+    # Header so far: 2 bytes.
+    let mut total: int = 2
+    if len7 == 126 {
+        # Need 2 more bytes for the 16-bit extended length.
+        if s.len() < 4 {
+            return 0
+        }
+        total = total + 2
+    } else if len7 == 127 {
+        # Need 8 more bytes for the 64-bit extended length.
+        if s.len() < 10 {
+            return 0
+        }
+        total = total + 8
+    }
+    if masked {
+        total = total + 4
+    }
+    # Now compute the payload length.
+    let payload_len: int = ws_decode_payload_len_from_header(s, len7)
+    if payload_len < 0 {
+        return 0
+    }
+    if payload_len > ws_max_payload_size() {
+        # Frame claims a payload larger than the cap. The caller should
+        # reject this as a protocol error (we return -1 to signal
+        # "oversized"; the read loop in ws_read_frame treats this as
+        # a hard error).
+        return -1
+    }
+    total = total + payload_len
+    return total
+}
+
+# ws_decode_payload_len_from_header — given the input buffer and the
+# 7-bit length-or-marker, compute the actual payload length. Returns
+# -1 if the extended-length field isn't fully present yet.
+fn ws_decode_payload_len_from_header(s: str, len7: int) -> int {
+    if len7 <= 125 {
+        return len7
+    }
+    if len7 == 126 {
+        # 16-bit big-endian, bytes 2..3.
+        if s.len() < 4 {
+            return -1
+        }
+        let hi: int = s.byte_at(2)
+        let lo: int = s.byte_at(3)
+        return hi * 256 + lo
+    }
+    # 127: 64-bit big-endian, bytes 2..9.
+    if s.len() < 10 {
+        return -1
+    }
+    # For our cap (16 MiB), the high 4 bytes are always 0. We still
+    # decode them — if any are non-zero, the payload exceeds our cap
+    # (the caller will reject with ws_max_payload_size).
+    let b3: int = s.byte_at(2)
+    let b4: int = s.byte_at(3)
+    let b5: int = s.byte_at(4)
+    let b6: int = s.byte_at(5)
+    # If any high byte is non-zero, the payload is > 2^32 — definitely
+    # over our cap. Return a large sentinel (2^31) so the caller rejects.
+    if b3 != 0 || b4 != 0 || b5 != 0 || b6 != 0 {
+        return 2147483647
+    }
+    # Low 4 bytes (big-endian).
+    let b7: int = s.byte_at(6)
+    let b8: int = s.byte_at(7)
+    let b9: int = s.byte_at(8)
+    let b10: int = s.byte_at(9)
+    return ((b7 * 256 + b8) * 256 + b9) * 256 + b10
+}
+
+# ws_frame_decode(s) — parse a single WebSocket frame from the input
+# buffer. Returns:
+#   Ok(WsFrame) on success (payload is un-masked if MASK was set).
+#   Err("incomplete") if the buffer doesn't contain a full frame.
+#   Err("protocol error: ...") on a malformed frame.
+#
+# Pure function — does not consume the input. The caller is responsible
+# for slicing off the frame.
+fn ws_frame_decode(s: str) -> Result[WsFrame, str] {
+    let total: int = ws_frame_decode_length(s)
+    if total == 0 {
+        return Result.Err("incomplete")
+    }
+    if total < 0 {
+        return Result.Err("protocol error: frame too large")
+    }
+    if s.len() < total {
+        return Result.Err("incomplete")
+    }
+    # Now we have a complete frame. Parse it.
+    let b0: int = s.byte_at(0)
+    let b1: int = s.byte_at(1)
+    let fin: bool = int_and(b0, 128) != 0
+    let rsv1: int = int_and(b0, 64)
+    let rsv2: int = int_and(b0, 32)
+    let rsv3: int = int_and(b0, 16)
+    # RSV bits MUST be 0 unless an extension was negotiated.
+    if rsv1 != 0 || rsv2 != 0 || rsv3 != 0 {
+        return Result.Err("protocol error: reserved bit set")
+    }
+    let opcode: int = int_and(b0, 15)
+    if !ws_is_valid_opcode(opcode) {
+        return Result.Err("protocol error: reserved opcode")
+    }
+    let masked: bool = int_and(b1, 128) != 0
+    let len7: int = int_and(b1, 127)
+    let payload_len: int = ws_decode_payload_len_from_header(s, len7)
+    if payload_len < 0 {
+        return Result.Err("protocol error: payload length decode failed")
+    }
+    if payload_len > ws_max_payload_size() {
+        return Result.Err("protocol error: payload too large")
+    }
+    # Control frames MUST NOT be fragmented (RFC 6455 §5.4).
+    if ws_is_control_opcode(opcode) {
+        if !fin {
+            return Result.Err("protocol error: control frame fragmented")
+        }
+        if payload_len > 125 {
+            return Result.Err("protocol error: control frame payload > 125 bytes")
+        }
+    }
+    # Locate the mask key + payload.
+    let mut mask_offset: int = 2
+    if len7 == 126 {
+        mask_offset = 4
+    } else if len7 == 127 {
+        mask_offset = 10
+    }
+    let mut mask_key: str = ""
+    if masked {
+        if s.len() < mask_offset + 4 {
+            return Result.Err("incomplete")
+        }
+        # Slice the mask key as 4 individual bytes — str.slice on a
+        # range that includes non-ASCII bytes is safe because we're
+        # working at the byte level.
+        mask_key = s.slice(mask_offset, mask_offset + 4)
+    }
+    let mut payload_offset: int = mask_offset
+    if masked {
+        payload_offset = mask_offset + 4
+    }
+    # Slice the payload bytes.
+    let payload_raw: str = s.slice(payload_offset, payload_offset + payload_len)
+    let mut payload: str = payload_raw
+    if masked {
+        payload = ws_apply_mask(payload_raw, mask_key)
+    }
+    let frame: WsFrame = WsFrame {
+        fin: fin,
+        opcode: opcode,
+        masked: masked,
+        mask_key: mask_key,
+        payload: payload
+    }
+    return Result.Ok(frame)
+}
+
+# ============================================================================
+# Handshake — RFC 6455 §1.2 (Opening Handshake) + §1.3 (Computing the
+# Accept Key).
+#
+# Server-side:
+#   1. Client sends an HTTP/1.1 GET request with these headers:
+#        Upgrade: websocket
+#        Connection: Upgrade
+#        Sec-WebSocket-Key: <16 random bytes, base64>
+#        Sec-WebSocket-Version: 13
+#        [Sec-WebSocket-Protocol: subproto1, subproto2]   (optional)
+#        [Sec-WebSocket-Extensions: ...]                  (optional)
+#   2. Server validates the request, computes the accept key, sends:
+#        HTTP/1.1 101 Switching Protocols
+#        Upgrade: websocket
+#        Connection: Upgrade
+#        Sec-WebSocket-Accept: <base64(SHA-1(key + GUID))>
+#        [Sec-WebSocket-Protocol: chosen]                (if requested)
+#
+# Client-side:
+#   1. Client generates a random 16-byte key, base64-encodes it, sends
+#      the upgrade request.
+#   2. Server's response must have:
+#        HTTP/1.1 101 Switching Protocols
+#        Upgrade: websocket
+#        Connection: Upgrade
+#        Sec-WebSocket-Accept: <base64(SHA-1(key + GUID))>
+#   3. Client verifies the accept key matches the locally-computed value.
+# ============================================================================
+
+# ws_accept_key(client_key) — compute the Sec-WebSocket-Accept value
+# from the client's Sec-WebSocket-Key. RFC 6455 §1.3:
+#   1. Concatenate the client key with the GUID
+#      "258EAFA5-E914-47DA-95CA-C5AB0DC85B11".
+#   2. Take the SHA-1 hash of the concatenation (20 bytes).
+#   3. Base64-encode the result (28 bytes, ending in "=" padding).
+#
+# Pure — deterministic in the client key.
+fn ws_accept_key(client_key: str) -> str {
+    let combined: str = client_key + ws_guid()
+    let digest: str = sha1_hash(combined)
+    return base64_encode(digest)
+}
+
+# ws_handshake_response — build a complete 101 Switching Protocols HTTP
+# response. The subprotocol parameter selects the negotiated subprotocol
+# (pass "" if no Sec-WebSocket-Protocol was requested).
+#
+# Pure — produces a canonical CRLF-terminated HTTP/1.1 response.
+fn ws_handshake_response(client_key: str, subprotocol: str) -> str {
+    let accept: str = ws_accept_key(client_key)
+    let crlf: str = http_crlf()
+    let mut resp: str = "HTTP/1.1 101 Switching Protocols" + crlf
+    resp = resp + "Upgrade: websocket" + crlf
+    resp = resp + "Connection: Upgrade" + crlf
+    resp = resp + "Sec-WebSocket-Accept: " + accept + crlf
+    if subprotocol.len() > 0 {
+        resp = resp + "Sec-WebSocket-Protocol: " + subprotocol + crlf
+    }
+    resp = resp + crlf
+    return resp
+}
+
+# ws_validate_upgrade(req) — validate an incoming HTTP request is a
+# valid WebSocket upgrade request. Returns:
+#   Ok(client_key) — the request is a valid upgrade; the caller should
+#                    send ws_handshake_response(client_key, subprotocol).
+#   Err(reason)    — the request is not a valid upgrade; the caller
+#                    should send a 400 Bad Request response with the
+#                    reason in the body.
+#
+# Validation (RFC 6455 §4.1):
+#   1. Method MUST be GET.
+#   2. HTTP version MUST be at least 1.1.
+#   3. Host header MUST be present.
+#   4. Upgrade header MUST contain "websocket" (case-insensitive).
+#   5. Connection header MUST contain "upgrade" (case-insensitive).
+#   6. Sec-WebSocket-Key MUST be present and non-empty.
+#   7. Sec-WebSocket-Version MUST be "13".
+fn ws_validate_upgrade(req: HttpRequest) -> Result[str, str] {
+    if req.method != "GET" {
+        return Result.Err("method must be GET")
+    }
+    if req.version != "HTTP/1.1" {
+        return Result.Err("HTTP version must be 1.1")
+    }
+    if !http_header_has(req.headers, "Host") {
+        return Result.Err("missing Host header")
+    }
+    let upgrade: str = str_to_lower_ascii(http_header_get(req.headers, "Upgrade"))
+    if !str_contains(upgrade, "websocket") {
+        return Result.Err("Upgrade header must contain 'websocket'")
+    }
+    let conn: str = str_to_lower_ascii(http_header_get(req.headers, "Connection"))
+    if !str_contains(conn, "upgrade") {
+        return Result.Err("Connection header must contain 'upgrade'")
+    }
+    let key: str = http_header_get(req.headers, "Sec-WebSocket-Key")
+    if key.len() == 0 {
+        return Result.Err("missing Sec-WebSocket-Key header")
+    }
+    let version: str = http_header_get(req.headers, "Sec-WebSocket-Version")
+    if version != "13" {
+        return Result.Err("Sec-WebSocket-Version must be 13")
+    }
+    return Result.Ok(key)
+}
+
+# ws_pick_subprotocol(req) — pick a subprotocol from the client's
+# Sec-WebSocket-Protocol header. The header is a comma-separated list
+# of subprotocol names (e.g. "chat, superchat"). The server picks ONE.
+#
+# This function returns the FIRST requested subprotocol (or "" if the
+# header is absent). Real applications should override this with their
+# own selection logic.
+fn ws_pick_subprotocol(req: HttpRequest) -> str {
+    let raw: str = http_header_get(req.headers, "Sec-WebSocket-Protocol")
+    if raw.len() == 0 {
+        return ""
+    }
+    # Split on comma, take the first item, strip whitespace.
+    let parts: list[str] = raw.split(",")
+    if parts.len() == 0 {
+        return ""
+    }
+    let first: str = parts.get(0)
+    # Strip leading/trailing whitespace. The str module doesn't have a
+    # dedicated trim function; we use a manual loop.
+    return ws_trim_ws(first)
+}
+
+# ws_trim_ws — strip leading and trailing ASCII whitespace.
+fn ws_trim_ws(s: str) -> str {
+    let n: int = s.len()
+    let mut start: int = 0
+    let mut end: int = n
+    while start < end {
+        let b: int = s.byte_at(start)
+        if b == 32 || b == 9 || b == 10 || b == 13 {
+            start = start + 1
+        } else {
+            break
+        }
+    }
+    while end > start {
+        let b: int = s.byte_at(end - 1)
+        if b == 32 || b == 9 || b == 10 || b == 13 {
+            end = end - 1
+        } else {
+            break
+        }
+    }
+    return s.slice(start, end)
+}
+
+# ---- Client-side handshake ------------------------------------------------
+
+# ws_generate_key() — generate a random 16-byte Sec-WebSocket-Key,
+# base64-encoded (24 chars including padding). Uses rand_int for the
+# 16 random bytes.
+fn ws_generate_key() -> str uses Rand {
+    let raw: str = chr(rand_int(256)) + chr(rand_int(256)) + chr(rand_int(256)) + chr(rand_int(256)) + chr(rand_int(256)) + chr(rand_int(256)) + chr(rand_int(256)) + chr(rand_int(256)) + chr(rand_int(256)) + chr(rand_int(256)) + chr(rand_int(256)) + chr(rand_int(256)) + chr(rand_int(256)) + chr(rand_int(256)) + chr(rand_int(256)) + chr(rand_int(256))
+    return base64_encode(raw)
+}
+
+# ws_handshake_request(host, port, path, key, subprotocol) — build a
+# complete HTTP/1.1 Upgrade request to open a WebSocket connection.
+#
+# Pure — produces a canonical CRLF-terminated HTTP/1.1 request.
+fn ws_handshake_request(host: str, port: int, path: str, key: str, subprotocol: str) -> str {
+    let crlf: str = http_crlf()
+    let mut host_hdr: str = host
+    if port != 80 {
+        host_hdr = host + ":" + port.to_str()
+    }
+    let mut req: str = "GET " + path + " HTTP/1.1" + crlf
+    req = req + "Host: " + host_hdr + crlf
+    req = req + "Upgrade: websocket" + crlf
+    req = req + "Connection: Upgrade" + crlf
+    req = req + "Sec-WebSocket-Key: " + key + crlf
+    req = req + "Sec-WebSocket-Version: 13" + crlf
+    if subprotocol.len() > 0 {
+        req = req + "Sec-WebSocket-Protocol: " + subprotocol + crlf
+    }
+    req = req + crlf
+    return req
+}
+
+# ws_validate_accept(server_accept, client_key) — verify the server's
+# Sec-WebSocket-Accept value matches the locally-computed value. Used
+# by the client to detect MITM attacks that hijack the upgrade without
+# re-computing the accept key.
+fn ws_validate_accept(server_accept: str, client_key: str) -> bool {
+    let expected: str = ws_accept_key(client_key)
+    return server_accept == expected
+}
+
+# ws_validate_upgrade_response(resp, client_key) — verify a 101 Switching
+# Protocols response from the server. Returns:
+#   Ok(subprotocol) — the response is valid; subprotocol is the negotiated
+#                     subprotocol ("" if none was offered).
+#   Err(reason)     — the response is invalid.
+fn ws_validate_upgrade_response(resp: HttpResponse, client_key: str) -> Result[str, str] {
+    if resp.status != 101 {
+        return Result.Err("expected 101 Switching Protocols, got " + resp.status.to_str())
+    }
+    let upgrade: str = str_to_lower_ascii(http_header_get(resp.headers, "Upgrade"))
+    if !str_contains(upgrade, "websocket") {
+        return Result.Err("Upgrade header must contain 'websocket'")
+    }
+    let conn: str = str_to_lower_ascii(http_header_get(resp.headers, "Connection"))
+    if !str_contains(conn, "upgrade") {
+        return Result.Err("Connection header must contain 'upgrade'")
+    }
+    let accept: str = http_header_get(resp.headers, "Sec-WebSocket-Accept")
+    if accept.len() == 0 {
+        return Result.Err("missing Sec-WebSocket-Accept header")
+    }
+    if !ws_validate_accept(accept, client_key) {
+        return Result.Err("Sec-WebSocket-Accept mismatch (possible MITM)")
+    }
+    let sub: str = http_header_get(resp.headers, "Sec-WebSocket-Protocol")
+    return Result.Ok(sub)
+}
+
+# ============================================================================
+# Close-frame payload helpers (RFC 6455 §7.1.6 / §5.5.1).
+#
+# The Close frame payload is:
+#   * 0 bytes (no status code; treated as 1005 "no status received"),
+#   * OR 2 bytes (just the status code, no reason),
+#   * OR 2 bytes + N bytes (status code + UTF-8 reason phrase).
+# ============================================================================
+
+# ws_close_payload(code, reason) — build the Close frame payload.
+# Returns the 2-byte big-endian status code + the UTF-8 reason phrase.
+# The reason MAY be empty (just the 2-byte code).
+fn ws_close_payload(code: int, reason: str) -> str {
+    if !ws_is_valid_close_code(code) {
+        panic("ws_close_payload: invalid close code")
+    }
+    let hi: int = int_and(int_shr(code, 8), 255)
+    let lo: int = int_and(code, 255)
+    return chr(hi) + chr(lo) + reason
+}
+
+# ============================================================================
+# WsClosePayload — the parsed form of a Close frame payload (code + reason).
+# Used by ws_parse_close_payload's return value. We use a struct (not a
+# tuple) because HLS v0.3 does not have tuple types — the SPEC.md
+# grammar has no `(T1, T2)` syntax.
+# ============================================================================
+
+struct WsClosePayload {
+    code: int,
+    reason: str
+}
+
+# ws_parse_close_payload(payload) — parse a Close frame payload back into
+# a WsClosePayload { code, reason }. Returns:
+#   Ok(WsClosePayload) — the payload was well-formed.
+#   Err("...")         — the payload was malformed (e.g. a single byte,
+#                       which is invalid per RFC 6455 §7.1.6).
+#
+# Empty payload (0 bytes) is treated as "no status code received" (1005)
+# per RFC 6455 §7.1.5. We surface this as Ok(WsClosePayload { code: 1005, reason: "" }).
+fn ws_parse_close_payload(payload: str) -> Result[WsClosePayload, str] {
+    if payload.len() == 0 {
+        return Result.Ok(WsClosePayload { code: ws_close_no_status(), reason: "" })
+    }
+    if payload.len() == 1 {
+        return Result.Err("close payload must be 0 or >=2 bytes (got 1)")
+    }
+    let hi: int = payload.byte_at(0)
+    let lo: int = payload.byte_at(1)
+    let code: int = hi * 256 + lo
+    if !ws_is_valid_close_code(code) {
+        return Result.Err("invalid close code: " + code.to_str())
+    }
+    let reason: str = payload.slice(2, payload.len())
+    return Result.Ok(WsClosePayload { code: code, reason: reason })
+}
+
+# ============================================================================
+# Connection helpers — encode + write a single frame on a TcpStream.
+#
+# These are the user-facing API for sending frames. The server-side
+# helpers (ws_send_text, ws_send_binary, ws_send_close, ws_send_ping,
+# ws_send_pong) send UNMASKED frames (RFC 6455 §5.1: server→client
+# frames MUST NOT be masked). The client-side helper (ws_send_text_masked)
+# sends MASKED frames (RFC 6455 §5.1: client→server frames MUST be masked).
+#
+# All helpers return the number of bytes written (or -1 on error from
+# the underlying TcpStream).
+# ============================================================================
+
+# ws_send_frame_unmasked — server-side: encode + write a frame without
+# a mask. Used by ws_send_text / ws_send_binary / ws_send_close / etc.
+fn ws_send_frame_unmasked(stream: TcpStream, opcode: int, payload: str) -> int uses IO, Net {
+    let frame: str = ws_frame_encode_with_key(opcode, payload, "")
+    return stream.write(frame)
+}
+
+# ws_send_frame_masked — client-side: encode + write a frame WITH a
+# random mask. Uses rand_int to generate the mask key.
+fn ws_send_frame_masked(stream: TcpStream, opcode: int, payload: str) -> int uses IO, Net, Rand {
+    let frame: str = ws_frame_encode(opcode, payload, true)
+    return stream.write(frame)
+}
+
+# ws_send_text — server-side: send a text frame.
+fn ws_send_text(stream: TcpStream, msg: str) -> int uses IO, Net {
+    return ws_send_frame_unmasked(stream, ws_opcode_text(), msg)
+}
+
+# ws_send_binary — server-side: send a binary frame.
+fn ws_send_binary(stream: TcpStream, data: str) -> int uses IO, Net {
+    return ws_send_frame_unmasked(stream, ws_opcode_binary(), data)
+}
+
+# ws_send_text_masked — client-side: send a masked text frame.
+fn ws_send_text_masked(stream: TcpStream, msg: str) -> int uses IO, Net, Rand {
+    return ws_send_frame_masked(stream, ws_opcode_text(), msg)
+}
+
+# ws_send_binary_masked — client-side: send a masked binary frame.
+fn ws_send_binary_masked(stream: TcpStream, data: str) -> int uses IO, Net, Rand {
+    return ws_send_frame_masked(stream, ws_opcode_binary(), data)
+}
+
+# ws_send_close — send a Close frame with the given status code and
+# reason. RFC 6455 §7.1.6: the status code is a 2-byte big-endian int,
+# followed by an optional UTF-8 reason phrase (up to 123 bytes — the
+# Close frame payload MUST be <= 125 bytes per §5.5).
+fn ws_send_close(stream: TcpStream, code: int, reason: str) -> int uses IO, Net {
+    let payload: str = ws_close_payload(code, reason)
+    return ws_send_frame_unmasked(stream, ws_opcode_close(), payload)
+}
+
+# ws_send_close_masked — client-side: send a masked Close frame.
+fn ws_send_close_masked(stream: TcpStream, code: int, reason: str) -> int uses IO, Net, Rand {
+    let payload: str = ws_close_payload(code, reason)
+    return ws_send_frame_masked(stream, ws_opcode_close(), payload)
+}
+
+# ws_send_ping — send a Ping frame. The payload is optional (RFC 6455
+# §5.5.2: control frame payloads MUST be <= 125 bytes).
+fn ws_send_ping(stream: TcpStream, payload: str) -> int uses IO, Net {
+    return ws_send_frame_unmasked(stream, ws_opcode_ping(), payload)
+}
+
+# ws_send_pong — send a Pong frame in response to a Ping. RFC 6455 §5.5.3:
+# a Pong frame MUST carry the EXACT payload that was in the Ping frame.
+fn ws_send_pong(stream: TcpStream, payload: str) -> int uses IO, Net {
+    return ws_send_frame_unmasked(stream, ws_opcode_pong(), payload)
+}
+
+# ws_read_frame — read + decode a single WebSocket frame from a TcpStream.
+# Returns Ok(WsFrame) on success, Err("...") on a parse error or EOF.
+#
+# The read loop:
+#   1. Peek the first 2 bytes (always present in a complete frame header).
+#   2. Compute the total frame length via ws_frame_decode_length.
+#   3. Read more bytes until the buffer holds the full frame.
+#   4. Decode via ws_frame_decode.
+fn ws_read_frame(stream: TcpStream) -> Result[WsFrame, str] uses IO, Net {
+    let mut buf: str = ""
+    # Loop until we have a complete frame or the connection closes.
+    let mut attempts: int = 0
+    while attempts < 32 {
+        attempts = attempts + 1
+        let total: int = ws_frame_decode_length(buf)
+        if total < 0 {
+            return Result.Err("frame too large")
+        }
+        if total > 0 && buf.len() >= total {
+            # We have the full frame — decode + return.
+            return ws_frame_decode(buf)
+        }
+        # Need more bytes.
+        let chunk: str = stream.read(net_max_recv())
+        if chunk.len() == 0 {
+            # Connection closed or error.
+            if buf.len() == 0 {
+                return Result.Err("connection closed")
+            }
+            return Result.Err("connection closed mid-frame")
+        }
+        buf = buf + chunk
+    }
+    return Result.Err("frame read timeout (too many reads)")
+}
+
+# ============================================================================
+# Observability — describe the protocol for diagnostics.
+# ============================================================================
+
+# ws_opcode_name(op) — return the human-readable name of an opcode.
+fn ws_opcode_name(op: int) -> str {
+    if op == 0 {
+        return "continuation"
+    }
+    if op == 1 {
+        return "text"
+    }
+    if op == 2 {
+        return "binary"
+    }
+    if op == 8 {
+        return "close"
+    }
+    if op == 9 {
+        return "ping"
+    }
+    if op == 10 {
+        return "pong"
+    }
+    return "reserved-" + op.to_str()
+}
+
+# ws_close_code_name(code) — return the human-readable name of a close code.
+fn ws_close_code_name(code: int) -> str {
+    if code == 1000 {
+        return "normal closure"
+    }
+    if code == 1001 {
+        return "going away"
+    }
+    if code == 1002 {
+        return "protocol error"
+    }
+    if code == 1003 {
+        return "unsupported data"
+    }
+    if code == 1005 {
+        return "no status received"
+    }
+    if code == 1006 {
+        return "abnormal closure"
+    }
+    if code == 1007 {
+        return "invalid UTF-8 payload"
+    }
+    if code == 1008 {
+        return "policy violation"
+    }
+    if code == 1009 {
+        return "message too big"
+    }
+    if code == 1010 {
+        return "mandatory extension"
+    }
+    if code == 1011 {
+        return "internal error"
+    }
+    if code == 1015 {
+        return "TLS handshake failure"
+    }
+    if code >= 3000 && code <= 3999 {
+        return "application close (" + code.to_str() + ")"
+    }
+    if code >= 4000 && code <= 4999 {
+        return "private close (" + code.to_str() + ")"
+    }
+    return "unknown (" + code.to_str() + ")"
+}
+
+# ws_describe_frame(frame) — human-readable rendering of a frame for
+# diagnostics.
+fn ws_describe_frame(frame: WsFrame) -> str {
+    let mut s: str = "WsFrame { "
+    s = s + "fin=" + frame.fin.to_str() + ", "
+    s = s + "opcode=" + ws_opcode_name(frame.opcode) + " (" + frame.opcode.to_str() + "), "
+    s = s + "masked=" + frame.masked.to_str() + ", "
+    s = s + "payload_len=" + frame.payload.len().to_str()
+    if frame.opcode == ws_opcode_close() {
+        let r: Result[WsClosePayload, str] = ws_parse_close_payload(frame.payload)
+        if result_is_ok(r) {
+            let cp: WsClosePayload = result_unwrap(r)
+            s = s + ", close_code=" + cp.code.to_str() + " (" + ws_close_code_name(cp.code) + ")"
+            if cp.reason.len() > 0 {
+                s = s + ", reason='" + cp.reason + "'"
+            }
+        }
+    }
+    s = s + " }"
+    return s
+}
+
+# ============================================================================
+# End of std/websocket.hls
+# ============================================================================

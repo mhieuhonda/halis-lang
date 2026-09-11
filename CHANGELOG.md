@@ -13,6 +13,188 @@ stability (125–140), and final stabilisation toward v1.0 (141–150).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
+## [v0.85.0-alpha] — Stage 66: std.cookie — signed cookies, SameSite, secure flag
+
+> Continues **Phase V (web application track, Stages 63–76)** — the
+> FOURTH module of the phase. Adds `std.cookie` — a pure-HLS
+> implementation of the HTTP cookie state-management protocol
+> (RFC 6265bis): parsing (Cookie header → CookieJar), serialisation
+> (SetCookie → Set-Cookie header), signing (anti-tampering via
+> HMAC-SHA1, RFC 2104), and the full set of security attributes
+> (Secure, HttpOnly, SameSite=Strict/Lax/None).
+>
+> Implements the roadmap's Stage 66 promise:
+> - `CookieJar` struct + `cookie_parse_request` / `cookie_parse_string`
+>   (liberal parser: trims whitespace, skips empty pairs, splits on
+>   FIRST "=" so values may contain "="). `cookie_get` returns the
+>   FIRST matching cookie (RFC 6265 §5.4 longer-path precedence).
+> - `SetCookie` struct + immutable builder API (`cookie_new` +
+>   `cookie_with_expires` / `_max_age` / `_domain` / `_path` /
+>   `_secure` / `_http_only` / `_same_site`). Each builder returns
+>   a NEW SetCookie (immutable updates — same idiom as std.cli,
+>   std.log, std.http_router, std.http_server).
+> - `cookie_serialize(sc) -> str` — canonical RFC 6265 §4.1.1 form
+>   (attribute order: Expires / Max-Age / Domain / Path / Secure /
+>   HttpOnly / SameSite). Panics if result exceeds 4096 bytes
+>   (RFC 6265 §6.1 size limit).
+> - `cookie_to_header(sc) -> HttpHeader` — convenience wrapper for
+>   appending to an HTTP response via `http_header_add` (RFC 6265
+>   §4.1.2 allows multiple Set-Cookie headers per response).
+> - SameSite constants: `cookie_samesite_strict/lax/none/unset()`
+>   + `cookie_samesite_is_valid(s)` (case-insensitive validation).
+> - Sanitisation: `cookie_sanitize_name(s)` / `cookie_sanitize_value(s)`
+>   filter out forbidden bytes (control chars, ";", ",", DQUOTE, "\\",
+>   DEL, non-ASCII) per RFC 6265 §4.1.1 grammar. Values allow "=" and
+>   space; names reject them.
+> - Signing: `cookie_hmac_sha1(key, msg) -> str` (RFC 2104 HMAC-SHA1,
+>   pure-HLS implementation using std.bits + std.sha1);
+>   `cookie_sign(sc, secret)` appends `.<base64url(hmac-sha1(secret,
+>   value))>` to the value; `cookie_verify(sc, secret)` splits at the
+>   LAST ".", base64url-decodes, recomputes the HMAC, and compares in
+>   CONSTANT TIME (every byte XOR'd and OR'd; no short-circuit).
+>   `cookie_unwrap_signed(sc, secret) -> Result[str, str]` verifies
+>   and extracts the original value. HMAC-SHA1 remains secure per
+>   RFC 6221 §6 (SHA-1's collision weakness does NOT compromise HMAC).
+> - `cookie_const_time_eq(a, b) -> bool` — constant-time comparison
+>   used by `cookie_verify` to prevent timing attacks on the signature.
+> - `cookie_format_http_date(unix_ms) -> str` — RFC 7231 §7.1.1.1
+>   IMF-fixdate (e.g. "Sun, 06 Nov 1994 08:49:37 GMT"). Pure integer
+>   arithmetic using the Hinnant civil-from-days algorithm (same as
+>   std.log Stage 57). Handles pre-1970 timestamps via floor-division.
+>   Verified against canonical vectors (epoch, 1994-11-06, 2024-02-29
+>   leap day, 2025-01-01).
+> - `cookie_describe(sc) -> str` — human-readable rendering for log
+>   output.
+>
+> Security model: SECURE + HTTP-ONLY + SAMESITE + SIGNED are
+> COMPLEMENTARY defenses, each protecting against a different threat
+> (passive sniffing / XSS-based session hijacking / CSRF / server-side
+> state forgery). The signing layer does NOT replace the other defenses
+> — it protects against a different threat (forgery after the cookie
+> has been issued).
+>
+> Pure-HLS implementation — no new compiler builtins. Layered on
+> std.http (HttpHeader, http_header_get/add/has, http_request_new,
+> http_response_new), std.bits (Stage 32 native bitwise for HMAC-SHA1
+> inner/outer padding), std.sha1 (this stage's NEW SHA-1 module from
+> Stage 65, used by HMAC-SHA1), std.base64 (Stage 38 base64url_encode/
+> decode for the signature), std.str / std.option / std.result.
+>
+> Acceptance (`make cookie-acceptance`): 17 sub-tests (parse, parse-
+> request, has/names, builders+serialise, to_header, sanitize,
+> samesite_valid, sign+verify, tamper_detection, const_time_eq,
+> format_http_date, describe, constants, same_site_validation,
+> max_age_clamp, hmac_vectors, http_round_trip), 2 differential
+> tests (cookie_demo + feat_stage66_cookie), all green. Bootstrap
+> self-compilation remains deterministic.
+
+## [v0.84.0-alpha] — Stage 65: std.websocket — RFC 6455 WebSocket protocol
+
+> Continues **Phase V (web application track, Stages 63–76)** — the
+> THIRD module of the phase. Adds `std.websocket` — a pure-HLS
+> implementation of the WebSocket protocol (RFC 6455) — the standard
+> wire protocol for full-duplex bidirectional communication between a
+> web client and a server over a single TCP connection. Provides BOTH
+> server-side and client-side functionality: handshake (HTTP Upgrade),
+> frame encode/decode (text/binary/close/ping/pong), masking, close
+> handshake, and validation of the Sec-WebSocket-Accept value.
+>
+> Also adds a NEW sub-module `std/sha1.hls` (~330 lines) implementing
+> RFC 3174 / FIPS 180-4 SHA-1, which the WebSocket handshake REQUIRES
+> (RFC 6455 §1.3 mandates SHA-1 + base64 for the accept-key
+> derivation). SHA-1 is cryptographically broken for collision
+> resistance (SHAttered, 2017) but is still REQUIRED by RFC 6455 §1.3 —
+> every WebSocket implementation on Earth uses SHA-1 here. Stage 65
+> uses SHA-1 ONLY for the WebSocket handshake; production code needing
+> a collision-resistant hash should wait for the SHA-2 family (Stage
+> 100+, Phase VII).
+>
+> Implements the roadmap's Stage 65 promise:
+> - `std.sha1`: `sha1_hash(data) -> str` (20-byte digest) +
+>   `sha1_hex(data) -> str` (40-char lowercase hex). Verified against
+>   the canonical FIPS 180-4 test vectors: `sha1_hex("")` =
+>   `da39a3ee5e6b4b0d3255bfef95601890afd80709`, `sha1_hex("abc")` =
+>   `a9993e364706816aba3e25717850c26c9cd0d89d`, etc. Pure HLS using
+>   std.bits (int_and/or/xor/shl/shr — Stage 32 native builtins).
+> - Server-side handshake: `ws_accept_key(client_key) -> str` computes
+>   `base64(SHA-1(client_key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))`.
+>   Verified against the canonical RFC 6455 §1.3 example: client key
+>   `dGhlIHNhbXBsZSBub25jZQ==` → accept `s3pPLMBiTxaQ9kYGzzhZRbK+xOo=`.
+>   `ws_handshake_response(client_key, subprotocol)` builds the full
+>   101 Switching Protocols response. `ws_validate_upgrade(req)` checks
+>   RFC 6455 §4.1 (method=GET, version=HTTP/1.1, Host present,
+>   Upgrade contains "websocket", Connection contains "upgrade",
+>   Sec-WebSocket-Key present, Sec-WebSocket-Version="13" — case-
+>   insensitive). `ws_pick_subprotocol(req)` returns the FIRST
+>   requested subprotocol.
+> - Client-side handshake: `ws_generate_key()` (random 16-byte
+>   base64-encoded key, uses rand_int — Stage 9 Rand effect),
+>   `ws_handshake_request(host, port, path, key, subprotocol)`,
+>   `ws_validate_accept(server_accept, client_key)` (MITM detection),
+>   `ws_validate_upgrade_response(resp, client_key) -> Result[str, str]`
+>   (verify 101 status + Upgrade + Connection + Sec-WebSocket-Accept
+>   matches the locally-computed value).
+> - Frame encode/decode (RFC 6455 §5): `WsFrame { fin, opcode, masked,
+>   mask_key, payload }`. `ws_frame_encode_with_key(opcode, payload,
+>   mask_key)` — DETERMINISTIC encoder (caller-supplied mask key) for
+>   tests. `ws_frame_encode(opcode, payload, mask: bool)` — generates a
+>   random mask key when mask=true (client→server path) or no mask when
+>   mask=false (server→client path). `ws_frame_decode(s) -> Result[WsFrame,
+>   str]` — validates RSV bits (MUST be 0), opcode (rejects reserved
+>   0x3-0x7 + 0xB-0xF), control-frame constraints (RFC 6455 §5.4: control
+>   frames MUST NOT be fragmented; §5.5: payload ≤ 125 bytes). Returns
+>   `Err("incomplete")` for partial frames; `Err("protocol error: ...")`
+>   for malformed frames. `ws_frame_decode_length(s) -> int` returns the
+>   total byte length, 0 for partial header, -1 for oversized frames.
+>   Handles 7-bit / 16-bit / 64-bit payload-length fields (RFC 6455 §5.2).
+> - Masking (RFC 6455 §5.3): `ws_apply_mask(payload, mask_key)` — XOR
+>   with `mask_key[i mod 4]`. Involutive (masking twice = original).
+>   `ws_generate_mask_key()` — random 4-byte mask key (4x rand_int(256)).
+> - Close handshake (RFC 6455 §7): `ws_close_payload(code, reason)` +
+>   `ws_parse_close_payload(payload) -> Result[WsClosePayload, str]`
+>   (empty payload → code=1005 "no status received"; reserved codes
+>   1004-1006, 1012-1015 → Err). `ws_is_valid_close_code(code)` validates
+>   per RFC 6455 §7.4.2 (1000-1003, 1007-1011, 3000-3999 application,
+>   4000-4999 private use valid; 1004-1006, 1012-1015 reserved).
+> - Connection helpers: server-side (UNMASKED per RFC 6455 §5.1):
+>   `ws_send_text`/`ws_send_binary`/`ws_send_close`/`ws_send_ping`/
+>   `ws_send_pong`. Client-side (MASKED per §5.1): `ws_send_text_masked`/
+>   `ws_send_binary_masked`/`ws_send_close_masked`. `ws_read_frame(stream)
+>   -> Result[WsFrame, str]` — bounded read loop (max 32 reads per frame
+>   to prevent slowloris-style attacks on a fragmenting network).
+> - Constants: opcodes (`ws_opcode_continuation/text/binary/close/ping/pong`),
+>   close codes (`ws_close_normal/going_away/protocol_error/unsupported_data/
+>   no_status/abnormal/invalid_utf8/policy_violation/too_big/internal_error`),
+>   bounds (`ws_max_frame_size`/`ws_max_payload_size` = 16 MiB), GUID
+>   (`ws_guid` = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").
+> - Diagnostics: `ws_opcode_name(op)`, `ws_close_code_name(code)`,
+>   `ws_describe_frame(frame)`.
+>
+> TLS limitation: the same limitation as Stage 64's std.http_server applies
+> — `wss://` (TLS WebSocket) is NOT supported directly because std.net
+> provides only a client-side `tls_get`, not a server-side `tls_listen`.
+> Deploy behind a TLS-terminating reverse proxy (nginx, caddy) for
+> `wss://`. When a future stage adds `tls_listen`, the WebSocket module
+> will pick up TLS automatically.
+>
+> Pure-HLS implementation — no new compiler builtins. Layered on
+> std.http (HttpRequest/HttpResponse, http_header_get/has/add,
+> http_request_new, http_response_new, http_crlf), std.http2
+> (http2_encode_length_24, http2_encode_stream_id_31 — byte
+> decomposition via arithmetic; reused from Stage 39's HTTP/2 frame
+> encoders), std.bits (Stage 32 native bitwise), std.sha1 (this
+> stage's new module), std.base64 (Stage 38), std.str, std.option,
+> std.result, std.net (TcpStream read/write for the live network
+> helpers).
+>
+> Acceptance (`make websocket-acceptance`): 17 sub-tests (sha1_vectors,
+> accept_key, handshake_response, validate_upgrade, validate_accept,
+> validate_upgrade_response, pick_subprotocol, apply_mask, frame_encode,
+> frame_decode, frame_decode_length, close_payload, codes_and_opcodes,
+> describe, handshake_request, guid, constants), 2 differential tests
+> (websocket_demo + feat_stage65_websocket), all green. Bootstrap
+> self-compilation remains deterministic.
+
 ## [v0.83.0-alpha] — Stage 64: std.http_server — multi-threaded HTTP server
 
 > Begins **Phase V (web application track, Stages 63–76)** — the

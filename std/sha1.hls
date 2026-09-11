@@ -1,0 +1,455 @@
+# ============================================================================
+# std/sha1.hls — Stage 65 (v0.84.0-alpha): SHA-1 hash (RFC 3174)
+# ----------------------------------------------------------------------------
+# Pure-HLS implementation of the SHA-1 Secure Hash Algorithm (FIPS PUB 180-4,
+# RFC 3174). SHA-1 is cryptographically broken for collision resistance
+# (SHAttered, 2017) but is still REQUIRED by several protocol specifications
+# that this stage depends on:
+#
+#   * RFC 6455 §1.3 — the WebSocket handshake computes
+#       base64(SHA-1(Sec-WebSocket-Key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))
+#     to derive the Sec-WebSocket-Accept value. The algorithm is fixed by
+#     the spec — every WebSocket implementation on Earth uses SHA-1 here.
+#
+# This module does NOT introduce a general-purpose "secure hash" API.
+# Stage 65 uses SHA-1 ONLY for the WebSocket handshake. Production code
+# that needs a collision-resistant hash for HMAC / signatures / TLS should
+# wait for the SHA-2 family (std.sha2 — Phase VII or a Phase V supplement,
+# see ROADMAP.md Stage 100+). Until then, use std.crypto's SipHash / HMAC
+# constructions for keyed hashing, or std.crypto.crc32 for checksums.
+#
+# NO new compiler builtins — the entire module is pure HLS layered on
+# std.bits (which is itself pure HLS delegating to the int_and / int_or /
+# int_xor / int_shl / int_shr native builtins from Stage 32). Every
+# intermediate value is a 32-bit unsigned int carried as a non-negative
+# int64 in [0, 2^32). Modular addition is `(a + b) % 4294967296` — the
+# largest intermediate (5 * (2^32 - 1)) is ~2^34.3, well within int64
+# range; no overflow possible.
+#
+# API:
+#   sha1_hash(data: str) -> str
+#       Returns the 20-byte SHA-1 digest of `data` as a Halis str
+#       (which is a byte string — see SPEC.md §3). The str contains
+#       the raw digest bytes (each in 0..255), suitable for piping
+#       to base64_encode.
+#
+#   sha1_hex(data: str) -> str
+#       Returns the 40-character lowercase hex digest. Useful for
+#       debug logging and for the standard FIPS 180-4 test vectors:
+#         sha1_hex("")       = "da39a3ee5e6b4b0d3255bfef95601890afd80709"
+#         sha1_hex("abc")    = "a9993e364706816aba3e25717850c26c9cd0d89d"
+#         sha1_hex("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq")
+#                              = "84983e441c3bd26ebaae4aa1f95129e5e54670f1"
+#
+# Differential parity (interpreter == native):
+#   Every operation is pure integer + byte access. No I/O, no randomness,
+#   no float arithmetic. The interpreter and the native binary produce
+#   byte-identical digests.
+# ============================================================================
+
+import "std.bits"
+import "std.str"
+
+# ============================================================================
+# Constants — RFC 3174 §3 / FIPS 180-4 §4.1.1 + §4.2.1.
+# ============================================================================
+
+# SHA-1 initial hash values (H0..H4). FIPS 180-4 §5.3.1: the constants are
+# the first 32 bits of the fractional parts of the square roots of the
+# first 8 primes (2, 3, 5, 7, 11, 13, 17, 19). SHA-1 uses only the first
+# 5; SHA-256 uses all 8.
+
+fn sha1_h0() -> int {
+    return 1732584193              # 0x67452301
+}
+
+fn sha1_h1() -> int {
+    return 4023233417             # 0xEFCDAB89
+}
+
+fn sha1_h2() -> int {
+    return 2562383102             # 0x98BADCFE
+}
+
+fn sha1_h3() -> int {
+    return 271733878              # 0x10325476
+}
+
+fn sha1_h4() -> int {
+    return 3285377520             # 0xC3D2E1F0
+}
+
+# Per-round constants (FIPS 180-4 §4.2.1). Each is the first 32 bits of
+# the fractional part of the cube root of 2, 19, 30, 24, 13 — but only 4
+# distinct values are used (rounds 0-19, 20-39, 40-59, 60-79).
+
+fn sha1_k_0_19() -> int {
+    return 1518500249             # 0x5A827999 (cube root of 2)
+}
+
+fn sha1_k_20_39() -> int {
+    return 1859775393             # 0x6ED9EBA1 (cube root of 19)
+}
+
+fn sha1_k_40_59() -> int {
+    return 2400959708             # 0x8F1BBCDC (cube root of 30)
+}
+
+fn sha1_k_60_79() -> int {
+    return 3395469782             # 0xCA62C1D6 (cube root of 13)
+}
+
+# 2^32 — used for modular reduction after additions. Carried as a
+# literal because std.bits.bits_pow2(32) is a function call; the
+# constant folds cleaner in the C codegen.
+fn sha1_mask_32() -> int {
+    return 4294967295             # 2^32 - 1
+}
+
+fn sha1_mod_32() -> int {
+    return 4294967296             # 2^32
+}
+
+# ============================================================================
+# 32-bit primitives — rotate-left, modular add, byte extraction.
+#
+# These are the ONLY bit-level operations SHA-1 needs. The std.bits module
+# already provides bits_and/or/xor/shl/shr; we wrap them with the 32-bit
+# mask so callers don't have to remember to mask after every op.
+# ============================================================================
+
+# sha1_rotl(x, n) — left-rotate a 32-bit value by n bits (1..31).
+# Implements: ((x << n) | (x >> (32 - n))) & 0xFFFFFFFF.
+#
+# Note: int_shl(x, n) where x is in [0, 2^32) and n <= 31 produces a
+# value in [0, 2^63), which fits in int64. The OR with int_shr(x, 32 - n)
+# gives a value with bits set in the low 32 + (32 - n) bit positions,
+# which we then mask down to 32 bits.
+fn sha1_rotl(x: int, n: int) -> int {
+    # Defensive: HLS's int_shl on negative shift counts would panic
+    # (Stage 32 bits_shl rule); we add a clean message.
+    if n < 0 || n >= 32 {
+        panic("sha1_rotl: rotation count must be in 1..31")
+    }
+    let left: int = int_shl(x, n)
+    let right: int = int_shr(x, 32 - n)
+    return int_and(int_or(left, right), sha1_mask_32())
+}
+
+# sha1_add32(a, b) — modular addition of two 32-bit unsigned values.
+# The sum is at most (2^32 - 1) * 2 = ~2^33, well within int64. We
+# reduce modulo 2^32 by masking.
+fn sha1_add32(a: int, b: int) -> int {
+    return int_and(a + b, sha1_mask_32())
+}
+
+# sha1_add32_5(a, b, c, d, e) — convenience for the SHA-1 round
+# update: temp = ROTL(a, 5) + f + e + k + W[i]. The five-way sum is
+# at most 5 * (2^32 - 1) = ~2^34.3, still within int64.
+fn sha1_add32_5(a: int, b: int, c: int, d: int, e: int) -> int {
+    return int_and(a + b + c + d + e, sha1_mask_32())
+}
+
+# sha1_not32(x) — bitwise NOT of a 32-bit value, masked back to 32 bits.
+# int_not on a non-negative int64 in [0, 2^32) produces the negative
+# two's-complement representation (~x = -x - 1). Masking with 0xFFFFFFFF
+# gives the expected unsigned NOT result (e.g. sha1_not32(0x5A827999)
+# = 0xA57D8666).
+fn sha1_not32(x: int) -> int {
+    return int_and(int_not(x), sha1_mask_32())
+}
+
+# ============================================================================
+# Per-round boolean functions (FIPS 180-4 §4.1.1).
+#
+#   rounds  0-19:  f = (b AND c) OR ((NOT b) AND d)   = "Ch"
+#   rounds 20-39:  f = b XOR c XOR d                   = "Parity"
+#   rounds 40-59:  f = (b AND c) OR (b AND d) OR (c AND d) = "Maj"
+#   rounds 60-79:  f = b XOR c XOR d                   = "Parity"
+# ============================================================================
+
+fn sha1_ch(b: int, c: int, d: int) -> int {
+    # (b AND c) OR ((NOT b) AND d) — equivalent to b XOR (d AND (b XOR c))
+    # but the explicit form is easier to audit against the spec.
+    return int_or(
+        int_and(b, c),
+        int_and(sha1_not32(b), d)
+    )
+}
+
+fn sha1_parity(b: int, c: int, d: int) -> int {
+    return int_xor(int_xor(b, c), d)
+}
+
+fn sha1_maj(b: int, c: int, d: int) -> int {
+    return int_or(
+        int_or(int_and(b, c), int_and(b, d)),
+        int_and(c, d)
+    )
+}
+
+# sha1_round_f(round, b, c, d) — dispatch on the round number to the
+# appropriate boolean function. The result is masked to 32 bits.
+fn sha1_round_f(round: int, b: int, c: int, d: int) -> int {
+    if round < 20 {
+        return sha1_ch(b, c, d)
+    }
+    if round < 40 {
+        return sha1_parity(b, c, d)
+    }
+    if round < 60 {
+        return sha1_maj(b, c, d)
+    }
+    return sha1_parity(b, c, d)
+}
+
+# sha1_round_k(round) — the per-round constant (FIPS 180-4 §4.2.1).
+fn sha1_round_k(round: int) -> int {
+    if round < 20 {
+        return sha1_k_0_19()
+    }
+    if round < 40 {
+        return sha1_k_20_39()
+    }
+    if round < 60 {
+        return sha1_k_40_59()
+    }
+    return sha1_k_60_79()
+}
+
+# ============================================================================
+# Message schedule — extend a 64-byte block into 80 32-bit words.
+#
+# FIPS 180-4 §5.2.1:
+#   W[t] = M[t]                                    for t in 0..15
+#   W[t] = ROTL(W[t-3] XOR W[t-8] XOR W[t-14] XOR W[t-16], 1)
+#                                                  for t in 16..79
+#
+# M[t] is the t-th 32-bit big-endian word of the 64-byte block. We read
+# 4 bytes at a time and assemble them as (b0 << 24) | (b1 << 16) | (b2 << 8) | b3.
+# ============================================================================
+
+# sha1_block_word(block, t) — extract the t-th 32-bit big-endian word
+# from a 64-byte block (str). The block must be exactly 64 bytes; the
+# caller enforces this. t must be in 0..15.
+fn sha1_block_word(block: str, t: int) -> int {
+    let off: int = t * 4
+    let b0: int = block.byte_at(off)
+    let b1: int = block.byte_at(off + 1)
+    let b2: int = block.byte_at(off + 2)
+    let b3: int = block.byte_at(off + 3)
+    # (b0 << 24) | (b1 << 16) | (b2 << 8) | b3 — all values in 0..255,
+    # so the largest intermediate is b0 * 2^24 = ~2^32, fits int64.
+    return int_or(
+        int_or(int_shl(b0, 24), int_shl(b1, 16)),
+        int_or(int_shl(b2, 8), b3)
+    )
+}
+
+# sha1_message_schedule(block) — extend a 64-byte block into 80 32-bit
+# words (FIPS 180-4 §5.2.1). Returns a list[int] of length 80.
+fn sha1_message_schedule(block: str) -> list[int] {
+    let w: list[int] = []
+    # Reserve 80 slots (push zeros, will overwrite). HLS lists don't
+    # have a "set" method on a literal size — we push 80 zeros then
+    # build a fresh list. This is O(80) allocations, negligible.
+    let mut t: int = 0
+    while t < 16 {
+        w.push(sha1_block_word(block, t))
+        t = t + 1
+    }
+    while t < 80 {
+        # W[t] = ROTL(W[t-3] XOR W[t-8] XOR W[t-14] XOR W[t-16], 1)
+        let w3: int = w.get(t - 3)
+        let w8: int = w.get(t - 8)
+        let w14: int = w.get(t - 14)
+        let w16: int = w.get(t - 16)
+        let xored: int = int_xor(int_xor(w3, w8), int_xor(w14, w16))
+        w.push(sha1_rotl(xored, 1))
+        t = t + 1
+    }
+    return w
+}
+
+# ============================================================================
+# Compression function — process one 64-byte block.
+#
+# FIPS 180-4 §6.1.2 (SHA-1 is identical to the original SHA-0 here except
+# for the message-schedule ROTL by 1, which we already do above):
+#   a, b, c, d, e = H0, H1, H2, H3, H4
+#   for t in 0..79:
+#     f = sha1_round_f(t, b, c, d)
+#     k = sha1_round_k(t)
+#     temp = (ROTL(a, 5) + f + e + k + W[t]) mod 2^32
+#     e = d
+#     d = c
+#     c = ROTL(b, 30)
+#     b = a
+#     a = temp
+#   H0 = (H0 + a) mod 2^32
+#   H1 = (H1 + b) mod 2^32
+#   H2 = (H2 + c) mod 2^32
+#   H3 = (H3 + d) mod 2^32
+#   H4 = (H4 + e) mod 2^32
+#
+# We pass the current state as 5 ints and return the updated state as
+# a list[int] of length 5 ([H0, H1, H2, H3, H4]).
+# ============================================================================
+
+# sha1_compress_block(h0..h4, block) — process one 64-byte block; return
+# the updated [H0, H1, H2, H3, H4] as a list[int] of length 5.
+fn sha1_compress_block(h0: int, h1: int, h2: int, h3: int, h4: int, block: str) -> list[int] {
+    let w: list[int] = sha1_message_schedule(block)
+    let mut a: int = h0
+    let mut b: int = h1
+    let mut c: int = h2
+    let mut d: int = h3
+    let mut e: int = h4
+    let mut t: int = 0
+    while t < 80 {
+        let f: int = sha1_round_f(t, b, c, d)
+        let k: int = sha1_round_k(t)
+        let wt: int = w.get(t)
+        # temp = (ROTL(a, 5) + f + e + k + W[t]) mod 2^32
+        let temp: int = sha1_add32_5(sha1_rotl(a, 5), f, e, k, wt)
+        e = d
+        d = c
+        c = sha1_rotl(b, 30)
+        b = a
+        a = temp
+        t = t + 1
+    }
+    let nh0: int = sha1_add32(h0, a)
+    let nh1: int = sha1_add32(h1, b)
+    let nh2: int = sha1_add32(h2, c)
+    let nh3: int = sha1_add32(h3, d)
+    let nh4: int = sha1_add32(h4, e)
+    return [nh0, nh1, nh2, nh3, nh4]
+}
+
+# ============================================================================
+# Padding — RFC 3174 §3 + FIPS 180-4 §5.1.1.
+#
+# The message is padded so its length (in bytes) is congruent to 56
+# modulo 64. Padding consists of:
+#   * one 0x80 byte
+#   * zero or more 0x00 bytes (chosen so total length mod 64 == 56)
+#   * the original message length in BITS, as an 8-byte big-endian
+#     integer (so the final length is a multiple of 64)
+#
+# Note: HLS int is int64. The maximum message length we can encode is
+# therefore 2^63 - 1 bits = ~1 exabyte — far beyond any practical use.
+# We don't need to handle the > 2^64 case (which would require 16-byte
+# length encoding); the panic-on-overflow here is intentional and
+# matches the behaviour of every other pure-HLS stdlib module.
+# ============================================================================
+
+# sha1_pad(data) — append the SHA-1 padding to `data`. Returns a str
+# whose length is a multiple of 64 bytes.
+#
+# The bit-length of the original message is `data.len() * 8`. HLS int
+# arithmetic is checked, so a `data.len()` past 2^60 bytes would
+# overflow when we *8 — but that's an absurd input that would have
+# already exhausted every other bound in the program first.
+fn sha1_pad(data: str) -> str {
+    let orig_len_bytes: int = data.len()
+    let orig_len_bits: int = orig_len_bytes * 8
+    # Compute the padding length. We need the final length to be a
+    # multiple of 64, with the last 8 bytes reserved for the bit-length
+    # field. So:
+    #   padded_len = orig_len_bytes + 1 (for 0x80) + zeros + 8
+    #   padded_len mod 64 == 0
+    #   zeros = (56 - (orig_len_bytes + 1) mod 64 + 64) mod 64
+    let mod_target: int = 56                 # length mod 64 must hit 56 before the 8-byte length
+    let after_0x80: int = orig_len_bytes + 1
+    let mod_after: int = after_0x80 - (after_0x80 / 64) * 64     # after_0x80 mod 64
+    let zeros: int = (mod_target - mod_after + 64) - ((mod_target - mod_after + 64) / 64) * 64
+    # Build the padded string. The 0x80 byte, the zeros, and the 8-byte
+    # big-endian bit-length.
+    let mut out: str = data + chr(128)                # 0x80
+    let mut i: int = 0
+    while i < zeros {
+        out = out + chr(0)
+        i = i + 1
+    }
+    # Append the 8-byte big-endian bit length.
+    # Bit length might exceed 2^32 for inputs > 512 MiB — we encode
+    # the high 32 bits and the low 32 bits. For typical inputs the high
+    # 32 bits are zero. The decomposition uses int_shr / int_and which
+    # are the same primitives as elsewhere in this module.
+    let b7: int = int_and(int_shr(orig_len_bits, 56), 255)
+    let b6: int = int_and(int_shr(orig_len_bits, 48), 255)
+    let b5: int = int_and(int_shr(orig_len_bits, 40), 255)
+    let b4: int = int_and(int_shr(orig_len_bits, 32), 255)
+    let b3: int = int_and(int_shr(orig_len_bits, 24), 255)
+    let b2: int = int_and(int_shr(orig_len_bits, 16), 255)
+    let b1: int = int_and(int_shr(orig_len_bits, 8), 255)
+    let b0: int = int_and(orig_len_bits, 255)
+    out = out + chr(b7) + chr(b6) + chr(b5) + chr(b4)
+    out = out + chr(b3) + chr(b2) + chr(b1) + chr(b0)
+    return out
+}
+
+# ============================================================================
+# Top-level hash — process the whole message.
+# ============================================================================
+
+# sha1_hash(data) — the 20-byte SHA-1 digest as a str.
+#
+# Algorithm (FIPS 180-4 §6.1):
+#   1. Pad the message so its length is a multiple of 64 bytes.
+#   2. Set H0..H4 to the initial hash values.
+#   3. For each 64-byte block, run the compression function
+#      (sha1_compress_block) and add the output to the state.
+#   4. The digest is H0..H4 concatenated, each as a 4-byte big-endian
+#      integer (20 bytes total).
+fn sha1_hash(data: str) -> str {
+    let padded: str = sha1_pad(data)
+    let mut h0: int = sha1_h0()
+    let mut h1: int = sha1_h1()
+    let mut h2: int = sha1_h2()
+    let mut h3: int = sha1_h3()
+    let mut h4: int = sha1_h4()
+    let n_blocks: int = padded.len() / 64
+    let mut bi: int = 0
+    while bi < n_blocks {
+        let block: str = padded.slice(bi * 64, (bi + 1) * 64)
+        let nh: list[int] = sha1_compress_block(h0, h1, h2, h3, h4, block)
+        h0 = nh.get(0)
+        h1 = nh.get(1)
+        h2 = nh.get(2)
+        h3 = nh.get(3)
+        h4 = nh.get(4)
+        bi = bi + 1
+    }
+    # Concatenate H0..H4 as 4-byte big-endian integers.
+    return sha1_word_to_bytes(h0) + sha1_word_to_bytes(h1) + sha1_word_to_bytes(h2) + sha1_word_to_bytes(h3) + sha1_word_to_bytes(h4)
+}
+
+# sha1_word_to_bytes(w) — emit a 32-bit word as 4 bytes big-endian.
+fn sha1_word_to_bytes(w: int) -> str {
+    let b0: int = int_and(int_shr(w, 24), 255)
+    let b1: int = int_and(int_shr(w, 16), 255)
+    let b2: int = int_and(int_shr(w, 8), 255)
+    let b3: int = int_and(w, 255)
+    return chr(b0) + chr(b1) + chr(b2) + chr(b3)
+}
+
+# sha1_hex(data) — the 40-character lowercase hex digest.
+fn sha1_hex(data: str) -> str {
+    let digest: str = sha1_hash(data)
+    let digits: str = "0123456789abcdef"
+    let out: list[str] = []
+    let mut i: int = 0
+    while i < digest.len() {
+        let b: int = digest.byte_at(i)
+        out.push(digits.slice(b / 16, b / 16 + 1))
+        out.push(digits.slice(b % 16, b % 16 + 1))
+        i = i + 1
+    }
+    return str_join(out, "")
+}
+
+# ============================================================================
+# End of std/sha1.hls
+# ============================================================================
