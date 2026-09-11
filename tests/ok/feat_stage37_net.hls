@@ -22,6 +22,14 @@ import "std.net"
 import "std.str"
 import "std.option"
 import "std.result"
+# Deep-scan-20 fix (flaky test): the client retry loops below used to
+# busy-loop 50 times WITHOUT sleeping — under CPU contention (e.g.
+# hltest's multiprocessing pool running another file's tests at the
+# same time) the spawned server thread couldn't reach listen() before
+# the retries ran out, and the server's accept() timed out 30s later
+# ("accept failed"). Each retry now sleeps 10ms via the
+# thread_sleep_ms builtin, giving the scheduler real room; 50 attempts
+# x 10ms = 500ms is far more than a thread needs to bind.
 
 # ============================================================================
 # Section 1: DNS — net_lookup on "localhost" returns 127.0.0.1 on every
@@ -77,7 +85,7 @@ fn echo_client_raw(port: int) -> str uses Net {
 }
 
 # test_tcp_raw() — orchestrate: spawn the server, run the client, verify.
-fn test_tcp_raw() -> int uses IO, Net, Conc {
+fn test_tcp_raw() -> int uses IO, Net, Conc, Clock {
     let port: int = 18037
     let server_task: Task[int] = spawn(echo_server_raw, port)
     # Tiny sleep would be ideal here, but Stage 37 has no sleep builtin.
@@ -85,6 +93,8 @@ fn test_tcp_raw() -> int uses IO, Net, Conc {
     # block until we connect, so no race. The connect call may fail if
     # the server hasn't called listen() yet; in that case we retry a
     # bounded number of times.
+    # Deep-scan-20: ...and (see the import note) each retry now sleeps,
+    # so the server thread actually gets the CPU to reach listen().
     let mut echo: str = ""
     let mut attempts: int = 0
     while attempts < 50 {
@@ -92,6 +102,7 @@ fn test_tcp_raw() -> int uses IO, Net, Conc {
         if echo.len() > 0 {
             break
         }
+        thread_sleep_ms(10)
         attempts = attempts + 1
     }
     let _rc: int = server_task.join()
@@ -134,9 +145,12 @@ fn echo_client_std(port: int) -> str uses Net {
 }
 
 # test_tcp_std() — orchestrate the stdlib echo.
-fn test_tcp_std() -> int uses IO, Net, Conc {
+fn test_tcp_std() -> int uses IO, Net, Conc, Clock {
     let port: int = 18038
     let server_task: Task[int] = spawn(echo_server_std, port)
+    # Deep-scan-20: same retry/backoff fix as test_tcp_raw — the old
+    # busy-loop starved the just-spawned server thread under CPU
+    # contention and the accept timed out.
     let mut echo: str = ""
     let mut attempts: int = 0
     while attempts < 50 {
@@ -144,6 +158,7 @@ fn test_tcp_std() -> int uses IO, Net, Conc {
         if echo.len() > 0 {
             break
         }
+        thread_sleep_ms(10)
         attempts = attempts + 1
     }
     let _rc: int = server_task.join()

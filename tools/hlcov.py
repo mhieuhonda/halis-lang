@@ -78,6 +78,21 @@ def _count_blocks_in_stmt(s):
         for arm in (s.get("arms") or []):
             n += _count_blocks_in_stmts(arm.get("body") or [])
         return n
+    if k == "expr":
+        # Deep-scan-20 fix: the parser wraps a match-as-STATEMENT inside
+        # an {"k": "expr"} node, so the `match` branch above was dead
+        # and any function containing a match undercounted its static
+        # blocks (lcov BRF/BRH too) — a 2-arm match reported 1, not 3.
+        e = s.get("e")
+        if isinstance(e, dict) and e.get("k") == "match":
+            n = 1
+            for arm in (e.get("arms") or []):
+                body = arm.get("body")
+                if isinstance(body, list):
+                    n += _count_blocks_in_stmts(body)
+                elif isinstance(body, dict):
+                    n += 1
+            return n
     return 0
 
 

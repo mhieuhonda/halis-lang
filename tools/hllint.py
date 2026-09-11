@@ -215,6 +215,15 @@ def exprs_in_stmt(s):
         yield s["cond"]
     elif k == "for":
         yield s["iter"]
+    elif k == "asm":
+        # Deep-scan-20 fix: asm! operand expressions (in(reg) y,
+        # inout(reg) x, ...) reference their input bindings — without
+        # this, L001 flagged `let y: int = port * 2` used only inside
+        # asm!() as "never used" (false positive on the kernel/IRQ
+        # code the rule most needs to lint).
+        for op in s.get("operands") or []:
+            if isinstance(op, dict) and op.get("expr") is not None:
+                yield op["expr"]
 
 
 def all_exprs_in_stmts(stmts):
@@ -296,6 +305,27 @@ class Linter:
         for fname, fn in self.program["fns"].items():
             for e in all_exprs_in_stmts(fn["body"]):
                 collect_calls(e, called)
+        # Deep-scan-20 fix: functions used only as a spawn target were
+        # reported as "never called" — spawn(worker, 41) is a CALL node
+        # whose callee name is `spawn`; the function-VALUE argument is an
+        # ident the old collector never counted. Fired on every
+        # idiomatic concurrency program (feat_conc_spawn/chan/actor...).
+        # The checker rewrites the node after check (args= vargs), so
+        # look at BOTH the raw first arg and the spawn_fn annotation.
+        def _visit_spawn(node):
+            if not isinstance(node, dict):
+                return
+            if node.get("k") == "call" and node.get("name") in (
+                    "spawn", "async_spawn", "gen_spawn"):
+                if node.get("spawn_fn"):
+                    called.add(node["spawn_fn"])
+                args = node.get("args") or []
+                if args and isinstance(args[0], dict) \
+                        and args[0].get("k") == "ident":
+                    called.add(args[0]["name"])
+        for fname, fn in self.program["fns"].items():
+            for e in all_exprs_in_stmts(fn["body"]):
+                walk_expr(e, _visit_spawn)
         # BUG (deep-scan-5): struct field DEFAULT expressions can call
         # functions (e.g. `x: int = five()`) — a function called only
         # from a default was falsely reported as unused.
@@ -409,7 +439,41 @@ class Linter:
         or the prior check is inside a nested block), we DON'T warn.
         """
         UNWRAP_NAMES = {"result_unwrap", "option_unwrap"}
-        CHECK_PREFIXES = ("result_is_", "option_is_")
+        # Deep-scan-20 fix (HIGH): the polarity was inverted for the
+        # negative predicates. is_ok/is_some prove the value good in the
+        # THEN branch; is_err/is_none prove it good in the ELSE branch
+        # (and after the if when the then-branch terminates — the
+        # early-exit idiom). The old code marked the THEN branch for
+        # BOTH polarities: safe early-exit code was flagged while
+        # `if result_is_err(r) { result_unwrap(r) }` (which panics)
+        # sailed through.
+        OK_PREDICATES = ("result_is_ok", "option_is_some")
+        ERR_PREDICATES = ("result_is_err", "option_is_none")
+
+        def _cond_var(cond):
+            """(predicate-kind, checked-ident) for an is_*/is_* call cond."""
+            if cond and cond.get("k") == "call" and cond.get("args"):
+                arg = cond["args"][0]
+                if arg.get("k") == "ident":
+                    cn = cond.get("name", "")
+                    if cn in OK_PREDICATES:
+                        return ("ok", arg["name"])
+                    if cn in ERR_PREDICATES:
+                        return ("err", arg["name"])
+            return (None, None)
+
+        def _block_terminates(stmts):
+            """Does this block provably exit (return / panic / exit)?"""
+            for st in stmts or []:
+                k2 = st.get("k")
+                if k2 == "return":
+                    return True
+                if k2 == "expr":
+                    e2 = st.get("e")
+                    if isinstance(e2, dict) and e2.get("k") == "call" \
+                            and e2.get("name") in ("panic", "exit"):
+                        return True
+            return False
 
         def _walk_block(stmts, checked_vars):
             """Walk a flat statement list, mutating `checked_vars` (a set
@@ -419,49 +483,43 @@ class Linter:
             for s in stmts:
                 k = s.get("k")
                 if k == "let":
-                    # If the let value is `if cond { ... } else { ... }` and
-                    # the cond is `is_some(x)` / `is_ok(x)`, the let-bound
-                    # variable is implicitly safe to unwrap.
+                    # Deep-scan-20 fix: `let b = result_is_err(x)` merely
+                    # computes a bool — it does NOT make a later
+                    # unwrap(x) safe, and the old code marked x checked
+                    # for BOTH polarities (the negative one directly
+                    # contradicting the rule). Only the positive
+                    # predicates can (weakly) vouch for the value.
                     val = s.get("value")
                     if val and val.get("k") == "call":
                         cn = val.get("name", "")
-                        # Deep-scan-14 fix: ANY is_* predicate (is_ok /
-                        # is_err / is_some / is_none) establishes that
-                        # the value was checked — e.g. the early-exit
-                        # idiom `if result_is_err(x) { return 1 }` makes
-                        # a later unwrap safe. Matching the prefixes
-                        # (rather than only is_ok/is_some) removes a
-                        # false-positive class the old rule had (and
-                        # the CHECK_PREFIXES constant was dead).
-                        if cn.startswith(CHECK_PREFIXES):
-                            # The check argument might be `x` (ident).
-                            if val.get("args"):
-                                arg = val["args"][0]
-                                if arg.get("k") == "ident":
-                                    checked_vars.add(arg["name"])
-                    # New let invalidates the binding-name check status.
-                    # We add the let-bound name to the unchecked set
-                    # implicitly (we don't pre-populate anything).
+                        if cn in OK_PREDICATES and val.get("args"):
+                            arg = val["args"][0]
+                            if arg.get("k") == "ident":
+                                checked_vars.add(arg["name"])
                 elif k == "assign":
                     # An assignment to x clears x's checked status.
                     tgt = s.get("target")
                     if tgt and tgt.get("k") == "ident":
                         checked_vars.discard(tgt["name"])
                 elif k == "if":
-                    # If the condition is `is_some(x)` or `is_ok(x)`,
-                    # mark x as checked WITHIN the then-branch.
-                    cond = s.get("cond")
+                    # Deep-scan-20 fix: branch polarity. is_ok/is_some
+                    # marks the THEN branch; is_err/is_none marks the
+                    # ELSE branch (and the post-if code when the
+                    # then-branch terminates — the early-exit idiom
+                    # `if result_is_err(x) { return 1 }` makes a later
+                    # unwrap(x) safe).
+                    kind, cvar = _cond_var(s.get("cond"))
                     then_checked = set(checked_vars)
-                    if cond and cond.get("k") == "call":
-                        cn = cond.get("name", "")
-                        if cn.startswith(CHECK_PREFIXES) and cond.get("args"):
-                            arg = cond["args"][0]
-                            if arg.get("k") == "ident":
-                                then_checked.add(arg["name"])
+                    else_checked = set(checked_vars)
+                    if kind == "ok":
+                        then_checked.add(cvar)
+                    elif kind == "err":
+                        else_checked.add(cvar)
                     warns.extend(_walk_block(s.get("then", []) or [], then_checked))
                     if s.get("els"):
-                        # else-branch keeps the parent checked_vars.
-                        warns.extend(_walk_block(s["els"] or [], set(checked_vars)))
+                        warns.extend(_walk_block(s["els"] or [], else_checked))
+                    if kind == "err" and _block_terminates(s.get("then") or []):
+                        checked_vars.add(cvar)
                     continue
                 elif k == "while":
                     # Inside a while, the checked status from outside

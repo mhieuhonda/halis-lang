@@ -25,10 +25,15 @@ Supported C constructs (Stage 15 release):
   - Enum definitions (translates to HLS enums).
   - #include resolution (via --include search paths).
   - const/volatile qualifiers (stripped, but tracked for naming).
-  - Function-pointer parameters (synthesized as opaque int params).
   - Array parameters (decay to pointer; char[] -> str).
 
 Limitations:
+  - Function-pointer parameters are NOT supported: the declaration
+    regex cannot match a parameter list containing parentheses, so the
+    whole function is SKIPPED with a stderr warning (Deep-scan-20 fix —
+    the docstring previously claimed an opaque-int placeholder that was
+    never emitted; the `if "(" in last` branch in _parse_functions was
+    unreachable dead code).
   - Unions are not supported (HLS does not have unions).
   - Bitfields are not supported (HLS does not have bitfields).
   - Macros are not expanded (#define is ignored).
@@ -129,11 +134,19 @@ def _sanitize_field_name(name):
 
 
 def _strip_qualifiers(t):
-    """Strip const/volatile/restrict/static from a C type string."""
+    """Strip const/volatile/restrict/static from a C type string.
+
+    Deep-scan-20 fix: `extern` (and the GCC spellings __extension__,
+    __inline, __restrict, __const) were NOT stripped — `extern char
+    *getenv(const char *name);` mapped to an opaque `int` return
+    instead of `str`, handing HLS callers an int where the ABI returns
+    char*."""
     out = []
     for w in t.split():
         if w not in ("const", "volatile", "restrict", "static", "register",
-                     "inline", "_Noreturn"):
+                     "inline", "_Noreturn", "extern", "__extension__",
+                     "__inline", "__inline__", "__restrict", "__restrict__",
+                     "__const", "__volatile__"):
             out.append(w)
     return " ".join(out).strip()
 
@@ -202,6 +215,32 @@ def _resolve_includes(src, include_paths, seen):
     return "\n".join(out_lines)
 
 
+def _split_declarators(decl):
+    """Split a C declaration on TOP-LEVEL commas (bracket-aware).
+
+    Deep-scan-20 fix: `struct Point { int x, y; };` used to emit only
+    field `y` — the multi-declarator line was tokenised as one decl and
+    only the LAST token became the field name, silently dropping `x`
+    from the generated HLS struct and corrupting the FFI layout (the
+    field offsets computed against the original C struct go wrong;
+    without --abi-header there was zero diagnostic)."""
+    parts, depth, cur = [], 0, []
+    for ch in decl:
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        if ch == "," and depth == 0:
+            parts.append("".join(cur).strip())
+            cur = []
+        else:
+            cur.append(ch)
+    tail = "".join(cur).strip()
+    if tail:
+        parts.append(tail)
+    return parts
+
+
 def _parse_structs(src, decls):
     """Parse `struct Name { field1; field2; };` definitions.
 
@@ -215,11 +254,25 @@ def _parse_structs(src, decls):
         sname = m.group(1)
         body = m.group(2)
         fields = []
+        # Deep-scan-20 fix: expand multi-declarator lines first —
+        # `int x, y;` becomes two full declarations (`int x` + `int y`)
+        # sharing the first declarator's type. Pointer/array decorators
+        # on the later names ("int x, *y, z[4]") synthesise correctly.
+        raw_decls = []
         for field_decl in body.split(";"):
             field_decl = field_decl.strip()
             if not field_decl:
                 continue
-            # Each field decl: TYPE name [, name2, ...]
+            parts = _split_declarators(field_decl)
+            if len(parts) > 1 and len(parts[0].split()) >= 2:
+                type_prefix = " ".join(parts[0].split()[:-1])
+                raw_decls.append(parts[0])
+                for extra in parts[1:]:
+                    raw_decls.append((type_prefix + " " + extra).strip())
+            else:
+                raw_decls.append(field_decl)
+        for field_decl in raw_decls:
+            # Each field decl: TYPE name (single declarator)
             tokens = field_decl.split()
             if len(tokens) < 2:
                 continue

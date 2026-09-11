@@ -721,13 +721,18 @@ fn xxhash_round(acc: int, lane: int) -> int {
     return hash_u64_mul(r2, xxhash_prime1())
 }
 
-# xxhash_merge_round(acc, value) -> int. Used in finalisation:
-# multiply value by PRIME1, XOR into acc, rotate, multiply.
+# xxhash_merge_round(acc, value) -> int. Used in finalisation.
+# Deep-scan-20 fix (HIGH): follow the xxHash64 spec exactly —
+#     val = round(0, val); acc ^= val; acc = acc*PRIME1 + PRIME4
+# The old formula (value*PRIME1, XOR, rotl 17, *PRIME4 + PRIME1) used
+# the wrong multiplier before the XOR, an extra rotation, and swapped
+# primes — every digest for inputs >= 32 bytes was wrong vs the
+# reference implementation (short inputs never reach the merge, which
+# is why the acceptance test passed).
 fn xxhash_merge_round(acc: int, value: int) -> int {
-    let v: int = hash_u64_mul(value, xxhash_prime1())
+    let v: int = xxhash_round(0, value)
     let r: int = int_xor(acc, v)
-    let r2: int = hash_u64_rotl(r, 17)
-    return hash_u64_add(hash_u64_mul(r2, xxhash_prime4()), xxhash_prime1())
+    return hash_u64_add(hash_u64_mul(r, xxhash_prime1()), xxhash_prime4())
 }
 
 # xxhash_write(h, bytes) -> void. Accumulate bytes; process 32-byte
@@ -783,23 +788,35 @@ fn xxhash_finish(h: XxHasher) -> int {
     # Add the total length.
     result = hash_u64_add(result, h.total_len)
     # Process the remaining bytes in h.buf (0..31 bytes).
+    # Deep-scan-20 fix (HIGH): the old tail was structurally wrong —
+    # there was no 8-byte path at all, the 1-byte step ADDed where the
+    # spec XORs, and the 4-byte step used the wrong formula entirely
+    # (add + PRIME3 + rotl 17 + PRIME4 instead of xor + PRIME1 + rotl
+    # 23 + PRIME2 + PRIME3). Every digest under 32 bytes was wrong vs
+    # the reference (xxh64("a") = 0xd24ec4f1a98c6e5b). Spec §2.3:
+    #   8-byte: h ^= rnd(0, lane); h = rotl(h,27)*PRIME1 + PRIME4
+    #   4-byte: h ^= lane*PRIME1;  h = rotl(h,23)*PRIME2 + PRIME3
+    #   1-byte: h ^= byte*PRIME5;  h = rotl(h,11)*PRIME1
     let buf: str = h.buf
     let buf_len: int = buf.len()
     let mut i: int = 0
-    # Process 4-byte lanes first (if any).
-    # Spec: h = rotl(h + lane*PRIME3, 17) * PRIME4
+    while i + 8 <= buf_len {
+        let lane8: int = hash_read_u64_le(buf, i)
+        result = int_xor(result, xxhash_round(0, lane8))
+        result = hash_u64_rotl(result, 27)
+        result = hash_u64_add(hash_u64_mul(result, xxhash_prime1()), xxhash_prime4())
+        i = i + 8
+    }
     while i + 4 <= buf_len {
         let lane: int = hash_read_u32_le(buf, i)
-        result = hash_u64_add(result, hash_u64_mul(lane, xxhash_prime3()))
-        result = hash_u64_rotl(result, 17)
-        result = hash_u64_mul(result, xxhash_prime4())
+        result = int_xor(result, hash_u64_mul(lane, xxhash_prime1()))
+        result = hash_u64_rotl(result, 23)
+        result = hash_u64_add(hash_u64_mul(result, xxhash_prime2()), xxhash_prime3())
         i = i + 4
     }
-    # Process remaining bytes one at a time.
-    # Spec: h = rotl(h + byte*PRIME5, 11) * PRIME1
     while i < buf_len {
-        let lane: int = buf.byte_at(i)
-        result = hash_u64_add(result, hash_u64_mul(lane, xxhash_prime5()))
+        let byte: int = buf.byte_at(i)
+        result = int_xor(result, hash_u64_mul(byte, xxhash_prime5()))
         result = hash_u64_rotl(result, 11)
         result = hash_u64_mul(result, xxhash_prime1())
         i = i + 1

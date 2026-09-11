@@ -149,6 +149,31 @@ SIGNATURE_INPUTS = {
 }
 
 
+def _split_params(s):
+    """Split a parameter list on TOP-LEVEL commas only.
+
+    Deep-scan-20 fix: `params_raw.split(",")` broke every signature
+    containing a bracketed type — `map[str, str]` parsed as two params
+    ("map[str" + "str]"), corrupting the generated driver's arity and
+    failing ~4 stdlib functions (router_url_for, ...). Track bracket
+    depth instead."""
+    parts, depth, cur = [], 0, []
+    for ch in s:
+        if ch in "([<":
+            depth += 1
+        elif ch in ")]>":
+            depth -= 1
+        if ch == "," and depth == 0:
+            parts.append("".join(cur).strip())
+            cur = []
+        else:
+            cur.append(ch)
+    tail = "".join(cur).strip()
+    if tail:
+        parts.append(tail)
+    return parts
+
+
 def find_stdlib_functions():
     """Return [(module, fn_name, params, ret_type), ...] for every
     public function in std/*.hls. Skips functions in SKIP_FUNCS and
@@ -171,10 +196,10 @@ def find_stdlib_functions():
                 continue
             params_raw = (m.group(3) or "").strip()
             ret = (m.group(4) or "void").strip()
-            # parse params
+            # parse params (top-level commas only — see _split_params)
             params = []
             if params_raw:
-                for p in [p.strip() for p in params_raw.split(",")]:
+                for p in _split_params(params_raw):
                     if ":" in p:
                         _, ptype = p.split(":", 1)
                         params.append(ptype.strip())
@@ -185,7 +210,14 @@ def find_stdlib_functions():
 
 
 def gen_driver(module, fn_name, params, ret, iters):
-    """Generate a Halis driver that calls fn_name `iters` times."""
+    """Generate a Halis driver that calls fn_name `iters` times.
+
+    Returns the source text, or None when no SAFE default value can be
+    synthesized for a parameter type (deep-scan-20: the old code
+    substituted literal `0` for every unknown type — `async_block_on_int(
+    Future[int])` then failed to compile, spurious-failing ~732 of the
+    1550 stdlib functions and making the Stage-32 gate unusable). The
+    caller reports those as SKIPs instead of failures."""
     imports = [f'import "std.{module}"']
     # always need time for the measurement
     imports.append('import "std.time"')
@@ -196,13 +228,27 @@ def gen_driver(module, fn_name, params, ret, iters):
     if key in SIGNATURE_INPUTS:
         args = SIGNATURE_INPUTS[key]
     else:
-        # default: zero-init each param
-        defaults = {
-            "int": "0", "bool": "false", "float": "0.0",
-            "str": '""', "list[int]": "[]", "list[str]": "[]",
-            "list[float]": "[]", "list[bool]": "[]",
-        }
-        args = ", ".join(defaults.get(p, "0") for p in params)
+        # default: a SAFE zero/empty value per type family; anything we
+        # cannot construct generically (structs, enums, channels,
+        # futures, tainted wrappers, ...) is a SKIP, not a failure.
+        def _default(p):
+            if p == "int":
+                return "0"
+            if p == "bool":
+                return "false"
+            if p == "float":
+                return "0.0"
+            if p == "str":
+                return '""'
+            if p.startswith("list[") and p.endswith("]"):
+                return "[]"          # contextual type from the callee
+            if p.startswith("map[") and p.endswith("]"):
+                return "map_new()"   # contextual type from the callee
+            return None
+        vals = [_default(p) for p in params]
+        if any(v is None for v in vals):
+            return None
+        args = ", ".join(vals)
 
     # Build the call. void fns are called as a statement; everything
     # else is bound to a typed slot (Halis has no `let v = ...`).
@@ -267,6 +313,8 @@ def bootstrap_hlc():
 def bench_one(module, fn_name, params, ret, iters, tmpdir):
     """Compile + run a driver for one function. Return (us_per_call, error)."""
     src = gen_driver(module, fn_name, params, ret, iters)
+    if src is None:
+        return None, None  # SKIP: no safe default synthesizable
     hls_path = Path(tmpdir) / f"{fn_name}.hls"
     c_path = Path(tmpdir) / f"{fn_name}.c"
     bin_path = Path(tmpdir) / f"{fn_name}.bin"
@@ -355,11 +403,21 @@ def main():
 
     results = []
     failures = []
+    skipped = []
     with tempfile.TemporaryDirectory(prefix="hls-bench-") as tmpdir:
         for module, name, params, ret in fns:
             if args.verbose:
                 print(f"  ... {module}.{name}({', '.join(params)}) -> {ret}", end=" ", flush=True)
             us, err = bench_one(module, name, params, ret, args.iters, tmpdir)
+            if us is None and err is None:
+                # Deep-scan-20: no safe default value for a parameter —
+                # skip with a reason instead of a spurious FAIL.
+                if args.verbose:
+                    print("SKIP (no safe default for a parameter type)")
+                skipped.append((module, name))
+                results.append({"module": module, "fn": name, "us": None,
+                                "error": "skipped: no safe default"})
+                continue
             if err:
                 if args.verbose:
                     print(f"FAIL ({err})")
@@ -393,7 +451,7 @@ def main():
 
     n_slow = sum(1 for r in measured if r["us"] > args.threshold_us)
     print(f"\n{len(measured)} measured, {n_slow} over threshold, "
-          f"{len(failures)} failed.")
+          f"{len(skipped)} skipped (no safe default), {len(failures)} failed.")
 
     if args.json:
         Path(args.json).write_text(

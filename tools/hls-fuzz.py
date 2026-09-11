@@ -18,7 +18,7 @@ finding any semantic discrepancy between the two implementations.
 
 Usage:
   python3 tools/hls-fuzz.py --time 3600            # 1-hour smoke
-  python3 tools/hls-fuzz.py --jobs 4 --time 600    # 4 workers, 10 min
+  python3 tools/hls-fuzz.py --time 600             # 10-minute smoke
   python3 tools/hls-fuzz.py --seed 42 --n 1000     # deterministic
   python3 tools/hls-fuzz.py --minimize case.hls    # minimize a case
 """
@@ -324,15 +324,10 @@ def main():
     )
     ap.add_argument("--time", type=int, default=60,
                     help="run for this many seconds (default 60)")
-    ap.add_argument("--jobs", type=int, default=1,
-                    help="parallel workers (default 1 — each worker needs "
-                         "its own tmpdir and gcc invocation, so memory-bound)")
     ap.add_argument("--seed", type=int, default=None,
                     help="RNG seed (default: time-based)")
     ap.add_argument("--n", type=int, default=None,
                     help="max number of programs (default: unlimited)")
-    ap.add_argument("--max-depth", type=int, default=3,
-                    help="AST depth cap (default 3)")
     ap.add_argument("--corpus", default=os.path.join(REPO_ROOT, "fuzz-corpus"),
                     help="directory to save minimised divergent cases")
     ap.add_argument("--minimize", default=None,
@@ -357,8 +352,8 @@ def main():
     rng_seed = args.seed if args.seed is not None else int(time.time())
     rng = random.Random(rng_seed)
     if not args.quiet:
-        print("== hls-fuzz: seed=%d, time=%ds, jobs=%d ==" % (
-            rng_seed, args.time, args.jobs))
+        print("== hls-fuzz: seed=%d, time=%ds ==" % (
+            rng_seed, args.time))
 
     corpus_dir = args.corpus
     os.makedirs(corpus_dir, exist_ok=True)

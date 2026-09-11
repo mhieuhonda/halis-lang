@@ -450,6 +450,11 @@ fn jsonp_parse_number(p: JsonParser) -> JsonValue {
     if p.pos < n && p.src.byte_at(p.pos) == 46 {
         is_float = true
         p.pos = p.pos + 1
+        # Deep-scan-20 fix: the fraction needs at least ONE digit —
+        # "1." and "1.e5" are invalid JSON (RFC 8259: frac = "." 1*DIGIT)
+        # but were accepted (to_float parsed them). Mirror the exponent
+        # digit check below.
+        let frac_start: int = p.pos
         while p.pos < n {
             let c: int = p.src.byte_at(p.pos)
             if c >= 48 && c <= 57 {
@@ -457,6 +462,14 @@ fn jsonp_parse_number(p: JsonParser) -> JsonValue {
             } else {
                 break
             }
+        }
+        if frac_start >= p.src.len() {
+            jsonp_err(p, "invalid number (fraction has no digits)")
+            return json_int(0)
+        }
+        if p.src.byte_at(frac_start) < 48 || p.src.byte_at(frac_start) > 57 {
+            jsonp_err(p, "invalid number (fraction has no digits)")
+            return json_int(0)
         }
     }
     # exponent
@@ -743,6 +756,39 @@ fn json_stringify(v: JsonValue) -> str {
         }
         if v.fval == -pinf {
             return "null"
+        }
+        # Deep-scan-20 fix (HIGH): %.6f destroys small magnitudes —
+        # |x| < 1e-6 formatted as "0.000000" then trimmed to "0.0",
+        # silently corrupting round-trips (json_stringify(json_parse(
+        # "1e-7")) returned "0.0"). Emit exponent form for small
+        # magnitudes (RFC 8259 allows 1e-7 / 1.0e-7 / 2.5e-8).
+        let mut ax: float = v.fval
+        if ax < 0.0 {
+            ax = 0.0 - ax
+        }
+        if ax != 0.0 && ax < 0.000001 {
+            let mut m: float = ax
+            let mut e: int = 0
+            while m < 1.0 {
+                m = m * 10.0
+                e = e - 1
+            }
+            while m >= 10.0 {
+                m = m / 10.0
+                e = e + 1
+            }
+            if v.fval < 0.0 {
+                m = 0.0 - m
+            }
+            let mant: str = m.to_str()
+            let mut end: int = mant.len()
+            while end > 1 && mant.byte_at(end - 1) == 48 {
+                end = end - 1
+            }
+            if end > 0 && mant.byte_at(end - 1) == 46 {
+                return mant.slice(0, end) + "0e" + e.to_str()
+            }
+            return mant.slice(0, end) + "e" + e.to_str()
         }
         # Trim trailing zeros from %.6f to look like JSON numbers when possible.
         let raw: str = v.fval.to_str()

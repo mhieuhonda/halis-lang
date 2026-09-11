@@ -411,7 +411,8 @@ class HLSServer:
             el = prog.get("_error_line", 0)
             ec = prog.get("_error_col", 0)
             eline = el - 1 if el > 0 else 0
-            echar = ec - 1 if ec > 0 else 0
+            echar = self._byte_col_to_utf16(doc["text"], eline,
+                                            ec - 1 if ec > 0 else 0)
             diagnostics.append({
                 "range": {"start": {"line": eline, "character": echar},
                           "end": {"line": eline, "character": echar + 1}},
@@ -428,9 +429,12 @@ class HLSServer:
         except HLError as ex:
             line = ex.line - 1 if ex.line > 0 else 0
             col = ex.col - 1 if ex.col > 0 else 0
+            # Deep-scan-20: lexer columns are BYTES; LSP `character` is
+            # UTF-16 units — convert (see _byte_col_to_utf16).
+            c16 = self._byte_col_to_utf16(doc["text"], line, col)
             diagnostics.append({
-                "range": {"start": {"line": line, "character": col},
-                          "end": {"line": line, "character": col + 1}},
+                "range": {"start": {"line": line, "character": c16},
+                          "end": {"line": line, "character": c16 + 1}},
                 "severity": 1,
                 "source": "hls-checker",
                 "message": ex.msg,
@@ -480,6 +484,48 @@ class HLSServer:
             bi += 1
         return n
 
+    @staticmethod
+    def _byte_col_to_utf16(text, line0, col_byte):
+        """Convert a 0-based BYTE offset in a 0-indexed line to the LSP
+        UTF-16 `character` offset.
+
+        Deep-scan-20 fix (HIGH): outgoing positions (diagnostics,
+        references, rename edits) were emitted with raw lexer BYTE
+        columns as UTF-16 `character` values — on any line containing
+        non-ASCII text (a string literal, a comment) every following
+        position was shifted, and rename applied edits one character
+        too far right, silently corrupting the file."""
+        lines = text.split("\n")
+        if line0 < 0 or line0 >= len(lines):
+            return col_byte
+        line_bytes = lines[line0].encode("utf-8")
+        n = len(line_bytes)
+        end = col_byte if 0 <= col_byte <= n else n
+        units = 0
+        bi = 0
+        while bi < end:
+            b = line_bytes[bi]
+            if b < 0x80:
+                width = 1
+            elif b < 0xE0:
+                width = 2
+                units += 1
+                bi += width
+                continue
+            elif b < 0xF0:
+                width = 3
+                units += 1
+                bi += width
+                continue
+            else:
+                width = 4
+                units += 2
+                bi += width
+                continue
+            units += 1
+            bi += 1
+        return units
+
     def _doc_program(self, doc):
         """Return the parsed program of a doc, or None if the doc is
         missing, unparsed, or carries a syntax error (BUG-DS4-19: the
@@ -517,7 +563,37 @@ class HLSServer:
             return
         # Build the hover text: identifier name + (if known) its type.
         hover_text = "**%s**" % ident_name
-        type_info = self._lookup_type(prog, ident_name)
+        # Deep-scan-20 fix: resolve the identifier in the scope of the
+        # ENCLOSING function — same-named params of different functions
+        # (fn alpha(n: str) + fn beta(n: int)) used to resolve by dict
+        # order, showing the WRONG type on hover. Scan the tokens up to
+        # the hovered position and remember the nearest preceding `fn`
+        # declaration (best-effort: accurate for straight-line layouts).
+        current_fn = None
+        try:
+            _toks = tokenize(doc["text"].encode("utf-8"))
+            _expect_name = False
+            for t in _toks:
+                if t["k"] == "eof":
+                    break
+                if (t.get("line", 0), t.get("col", 0)) > (line, col):
+                    break
+                if t["k"] == "kw" and t["v"] == "fn":
+                    _expect_name = True
+                    continue
+                if _expect_name and t["k"] == "ident":
+                    current_fn = t["v"]
+                    _expect_name = False
+        except HLError:
+            current_fn = None
+        if current_fn is not None and current_fn not in prog.get("fns", {}):
+            # impl methods are registered as "Struct.method" — try the
+            # short-name match against registered keys.
+            for fkey in prog.get("fns", {}):
+                if fkey.split(".")[-1] == current_fn:
+                    current_fn = fkey
+                    break
+        type_info = self._lookup_type(prog, ident_name, current_fn=current_fn)
         if type_info:
             hover_text += "\n\n```\n%s: %s\n```" % (ident_name, type_info)
         self.send_response(msg_id, {
@@ -757,10 +833,15 @@ class HLSServer:
                 col = t.get("col", 1) - 1
                 # Reconstruct token length so the highlight covers the word.
                 tlen = len(t["v"]) if isinstance(t["v"], str) else len(t["v"])
+                # Deep-scan-20: lexer columns are BYTES; convert the
+                # start to UTF-16 units for the client. The identifier
+                # itself is ASCII, so its length in UTF-16 units equals
+                # its byte length.
+                c16 = self._byte_col_to_utf16(doc["text"], ln, col)
                 out.append({
                     "uri": uri,
-                    "range": {"start": {"line": ln, "character": col},
-                              "end": {"line": ln, "character": col + tlen}},
+                    "range": {"start": {"line": ln, "character": c16},
+                              "end": {"line": ln, "character": c16 + tlen}},
                 })
         return out
 
