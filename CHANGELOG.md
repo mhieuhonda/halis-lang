@@ -13,6 +13,154 @@ stability (125–140), and final stabilisation toward v1.0 (141–150).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
+## [v0.88.0-alpha] — Stage 69: std.template — compile-time HTML templates (XSS-safe)
+
+> Continues **Phase V (web application track, Stages 63–76)** — the
+> SEVENTH module of the phase. Adds `std.template` — a pure-HLS
+> implementation of a Mustache-like HTML template engine that is
+> XSS-safe by construction: every `{{var}}` interpolation is HTML-
+> escaped by default via `std.html.html_escape` (Stage 38). Rendering
+> raw HTML requires the explicit triple-mustache `{{{var}}}` opt-in —
+> the caller takes responsibility for having sanitised that value
+> upstream.
+>
+> The engine is "compile-time" in the sense that a template source
+> string is parsed ONCE into a `Template` AST (a tree of
+> `TemplateNode` values); subsequent renders walk the AST without
+> re-parsing. The AST is a pure value — it can be cached, shared
+> between threads, or stored in a long-lived registry. There is NO
+> code generation; the renderer is a straightforward tree-walking
+> interpreter over the AST.
+>
+> Implements the roadmap's Stage 69 promise:
+> - **Template syntax (Mustache-like):**
+>   - `{{name}}` — interpolate the scalar `name`, HTML-escaped by
+>     default. Missing values produce the empty string (matching
+>     Mustache's "missing = empty" semantics).
+>   - `{{{name}}}` — interpolate `name` RAW (NOT escaped). Explicit
+>     opt-in for trusted HTML; the caller is responsible for
+>     sanitising the value.
+>   - `{{#if cond}}A{{else}}B{{/if}}` — conditional. `cond` is
+>     truthy iff non-empty AND not "false" AND not "0". `{{else}}` is
+>     optional. Nesting is supported (the renderer tracks block depth
+>     up to `template_max_depth()` = 32).
+>   - `{{#each list}}A{{this}}{{@index}}{{else}}B{{/each}}` —
+>     iteration. `list` is a `list[str]` from `ctx.lists`. `{{this}}`
+>     is the current element; `{{@index}}` is the 0-based index;
+>     `{{else}}` is taken iff the list is empty.
+>   - `{{! comment }}` — comment, omitted from output entirely.
+>   - `{{> partial}}` — include a registered partial. Missing partials
+>     produce empty output (graceful degradation, matching Mustache).
+>   - `{{name | filter}}` — apply a filter before escaping. Built-in
+>     filters: `upper`, `lower`, `trim`, `default` (no-op). Unknown
+>     filters return the value unchanged. Filters DO NOT bypass
+>     escaping — the result is still HTML-escaped unless `{{{...}}}`
+>     is used.
+>
+> - **Parser (template_compile / template_validate):**
+>   - `template_compile(src) -> Result[Template, str]` — parse a
+>     template source string into a Template AST. Returns `Result.Err(msg)`
+>     with a byte-offset-bearing message on parse failure (unclosed `{{`,
+>     unbalanced `{{/if}}`, `{{else}}` outside a block, etc.).
+>   - `template_validate(src) -> Result[bool, str]` — check syntax
+>     without keeping the AST.
+>   - The parser is a single-pass recursive-descent state machine.
+>     Block tags (`#if` / `#each` / `else` / `/if` / `/each`) are
+>     handled via a `TemplateParseResult` struct carrying `(nodes,
+>     terminator, next_pos)` so the caller can resume after the
+>     closing tag.
+>
+> - **Renderer (template_render / _with_partials):**
+>   - `template_render(t, ctx) -> str` — render with no partials.
+>   - `template_render_with_partials(t, ctx, partials) -> str` —
+>     render with a `Partials` registry.
+>   - XSS-safe by construction: every `{{var}}` is HTML-escaped via
+>     `std.html.html_escape` (Stage 38). There is NO path through the
+>     renderer that produces unescaped output unless the caller
+>     explicitly opts in via `{{{var}}}`.
+>
+> - **AST introspection:**
+>   - `template_describe(t) -> str` — human-readable summary of the
+>     AST (per-node, indented for blocks). Used by tests and by the
+>     demo to verify the parser produced the expected AST shape.
+>   - `template_node_count(t) -> int` — total nodes including nested
+>     branches.
+>   - `template_top_level_node_count(t) -> int` — top-level only.
+>   - `template_validate_filter(name) -> bool` — checks if a filter
+>     name is recognised.
+>
+> - **Partials registry:**
+>   - `struct Partials { templates: map[str, Template] }`.
+>   - `partials_new() / _register(p, name, src) / _register_compiled(p,
+>     name, t) / _has(p, name) / _get(p, name) -> Option[Template] /
+>     _count(p)`.
+>   - Partials are compiled at REGISTRATION time (not at render time),
+>     so a malicious partial can only fail-fast at registration — it
+>     cannot inject at render time.
+>
+> - **TemplateContext:**
+>   - `struct TemplateContext { scalars: map[str, str], lists:
+>     map[str, list[str]] }` — two maps because HLS maps are
+>     homogeneous in the value type.
+>   - `template_context_new() / _set(ctx, key, value) / _set_list(ctx,
+>     key, list) / _get(ctx, key) -> str / _get_list(ctx, key) ->
+>     list[str]`.
+>
+> Security model: DEFAULT-ESCAPE + RAW-OPT-IN + NO-EVAL are
+> COMPLEMENTARY defenses (XSS / injection / SSTI):
+> - **DEFAULT-ESCAPE:** every `{{var}}` is HTML-escaped via
+>   `std.html.html_escape` (Stage 38). This escapes `&`, `<`, `>`, `"`,
+>   `'`, and `/` per OWASP.
+> - **RAW-OPT-IN:** `{{{var}}}` is a deliberate footgun. The caller
+>   MUST ensure the value is sanitised. The renderer does NOT
+>   re-validate. This is the standard design choice (Mustache,
+>   Handlebars, Go templates all have this pattern).
+> - **NO-EVAL (SSTI prevention):** the renderer does NOT evaluate
+>   expressions, only variable lookups. There is no `{{eval}}` or
+>   `{{7*7}}`. The only way to get dynamic content is to pass it via
+>   the context. SSTI is therefore impossible by construction.
+>
+> Limitations (deferred to later stages):
+> - CONTEXT-AWARE ESCAPING is NOT implemented (the renderer uses the
+>   same `html_escape` for both text content and attribute values;
+>   safe but not optimal). A future stage may add separate escape
+>   functions for JS, URL, CSS contexts.
+> - CUSTOM FILTERS are NOT supported (the built-in filters `upper`,
+>   `lower`, `trim`, `default` are hardcoded). A future stage may add
+>   a filter registry.
+> - TEMPLATE INHERITANCE / BLOCKS is NOT implemented (no
+>   `{{#block}}` / `{{#extends}}` mechanism like Handlebars or Twig).
+>   Use partials for now.
+> - HELPERS (higher-order functions in templates) are NOT supported
+>   because HLS does not have function pointers yet.
+> - WHITESPACE CONTROL is limited: no `{{- ... -}}` syntax to strip
+>   surrounding whitespace.
+>
+> Pure-HLS implementation — no new compiler builtins. Layered on
+> `std.html` (html_escape — Stage 38), `std.str` (str_join,
+> str_to_lower_ascii, str_to_upper_ascii, str_repeat), `std.option`
+> (Option[T]), `std.result` (Result[T, E]), `std.list`. The parser
+> and renderer are pure functions of immutable inputs; the output is
+> byte-identical between the interpreter and the native binary (no
+> Rand, no I/O — fully deterministic).
+>
+> **Acceptance test:** `tests/ok/feat_stage69_template.hls` (~510
+> lines, 16 tests, all PASS) exercises every piece of the API:
+> parser (compile, validate), renderer (scalar, raw, if, each, nested,
+> comment, partial, filter), parse errors (14 negative cases),
+> introspection (describe, node_count, top_level_node_count,
+> validate_filter), constants, end-to-end HTML page rendering.
+>
+> **Demo:** `examples/template_demo.hls` (~210 lines) demonstrates
+> scalar interpolation (XSS-safe), raw interpolation (opt-in),
+> conditionals + iteration, filters, partials (table with header +
+> rows from list), parse errors, AST introspection, end-to-end HTML
+> page rendering.
+>
+> **Makefile target:** `make template-acceptance` — runs the demo and
+> the acceptance test differentially (interpreter == native for both),
+> then prints the feature summary.
+
 ## [v0.87.0-alpha] — Stage 68: std.csrf — double-submit + sync-token CSRF protection
 
 > Continues **Phase V (web application track, Stages 63–76)** — the

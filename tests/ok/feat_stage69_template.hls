@@ -1,0 +1,584 @@
+# tests/ok/feat_stage69_template.hls — Stage 69 (v0.88.0-alpha):
+# std.template — compile-time HTML templates (XSS-safe).
+#
+# Exercises:
+#   - template_compile (parse success / failure with byte offset)
+#   - template_render (scalar interpolation; HTML-escaped)
+#   - template_render (raw interpolation; NOT escaped — opt-in)
+#   - {{#if cond}} / {{else}} / {{/if}} (truthiness rules)
+#   - {{#each list}} / {{this}} / {{@index}} / {{else}} / {{/each}}
+#   - {{! comment }} (omitted from output)
+#   - {{> partial}} (lookup in Partials registry)
+#   - {{name | filter}} (upper / lower / trim / default / unknown)
+#   - template_describe (introspection — AST shape summary)
+#   - template_node_count / template_top_level_node_count
+#   - template_validate / template_validate_filter
+#   - Partials registry: partials_new / partials_register / partials_has /
+#     partials_get / partials_count / partials_register_compiled
+#   - TemplateContext: template_context_new / _set / _set_list / _get /
+#     _get_list
+#
+# Negative cases:
+#   - unclosed {{ tag
+#   - unclosed {{{ tag
+#   - empty {{{}}} tag
+#   - empty partial name {{>}}
+#   - {{#if}} missing condition
+#   - {{#each}} missing list name
+#   - {{#if}} missing {{/if}}
+#   - {{#if}} closed by {{/each}}
+#   - {{else}} outside a block
+#   - {{/if}} outside a block
+#   - unknown block {{#foo}}
+#   - unknown block end {{/foo}}
+#
+# The output is fully deterministic (no Rand, no I/O) so the
+# differential test (interpreter == native) produces byte-identical output.
+
+import "std.template"
+import "std.html"
+import "std.str"
+import "std.option"
+import "std.result"
+import "std.list"
+
+# ============================================================================
+# Helpers — assertion primitives (same pattern as feat_stage66/67/68).
+# ============================================================================
+
+fn ok(actual: bool, msg: str) -> void uses IO {
+    if !actual {
+        panic("FAIL " + msg)
+    }
+}
+
+fn eq_int(actual: int, expected: int, msg: str) -> void uses IO {
+    if actual != expected {
+        panic("FAIL " + msg + ": expected " + expected.to_str() + ", got " + actual.to_str())
+    }
+}
+
+fn eq_str(actual: str, expected: str, msg: str) -> void uses IO {
+    if actual != expected {
+        panic("FAIL " + msg + ": expected '" + expected + "', got '" + actual + "'")
+    }
+}
+
+fn eq_bool(actual: bool, expected: bool, msg: str) -> void uses IO {
+    if actual != expected {
+        panic("FAIL " + msg + ": expected " + expected.to_str() + ", got " + actual.to_str())
+    }
+}
+
+# ============================================================================
+# Test 1: template_compile success — basic text + variable
+# ============================================================================
+
+fn test_compile_basic() -> int uses IO {
+    let r: Result[Template, str] = template_compile("Hello, {{name}}!")
+    ok(result_is_ok(r), "compile basic ok")
+    let t: Template = result_unwrap(r)
+    eq_int(template_top_level_node_count(t), 3, "top-level node count")
+    eq_int(template_node_count(t), 3, "total node count")
+    return 0
+}
+
+# ============================================================================
+# Test 2: template_render — basic scalar interpolation (HTML-escaped)
+# ============================================================================
+
+fn test_render_basic() -> int uses IO {
+    let t: Template = result_unwrap(template_compile("Hello, {{name}}!"))
+    let ctx: TemplateContext = template_context_new()
+    template_context_set(ctx, "name", "world")
+    eq_str(template_render(t, ctx), "Hello, world!", "basic interpolation")
+
+    # XSS — the value is HTML-escaped by default.
+    let ctx2: TemplateContext = template_context_new()
+    template_context_set(ctx2, "name", "<script>alert('xss')</script>")
+    eq_str(template_render(t, ctx2),
+           "Hello, &lt;script&gt;alert(&#39;xss&#39;)&lt;&#x2F;script&gt;!",
+           "XSS escaped by default")
+
+    # Missing value → empty string (Mustache semantics).
+    let ctx3: TemplateContext = template_context_new()
+    eq_str(template_render(t, ctx3), "Hello, !", "missing value = empty")
+    return 0
+}
+
+# ============================================================================
+# Test 3: raw interpolation {{{name}}} — NOT escaped (opt-in)
+# ============================================================================
+
+fn test_render_raw() -> int uses IO {
+    let t: Template = result_unwrap(template_compile("Hello, {{{name}}}!"))
+    let ctx: TemplateContext = template_context_new()
+    template_context_set(ctx, "name", "<b>world</b>")
+    eq_str(template_render(t, ctx), "Hello, <b>world</b>!", "raw interpolation not escaped")
+
+    # Raw with no spaces: {{{name}}}
+    let t2: Template = result_unwrap(template_compile("{{{x}}}"))
+    let ctx2: TemplateContext = template_context_new()
+    template_context_set(ctx2, "x", "raw")
+    eq_str(template_render(t2, ctx2), "raw", "raw no-space")
+    return 0
+}
+
+# ============================================================================
+# Test 4: {{#if cond}} / {{else}} / {{/if}} — truthiness rules
+# ============================================================================
+
+fn test_if() -> int uses IO {
+    let src: str = "{{#if cond}}YES{{else}}NO{{/if}}"
+    let t: Template = result_unwrap(template_compile(src))
+
+    # truthy: "true", "1", "yes", any non-empty non-"false" non-"0" string
+    let cases_truthy: list[str] = ["true", "1", "yes", "false_is_not_true", "0.0"]
+    let mut i: int = 0
+    while i < cases_truthy.len() {
+        let ctx: TemplateContext = template_context_new()
+        template_context_set(ctx, "cond", cases_truthy.get(i))
+        eq_str(template_render(t, ctx), "YES", "if truthy: " + cases_truthy.get(i))
+        i = i + 1
+    }
+
+    # falsy: "", "false", "0", missing
+    let cases_falsy: list[str] = ["", "false", "0"]
+    i = 0
+    while i < cases_falsy.len() {
+        let ctx: TemplateContext = template_context_new()
+        template_context_set(ctx, "cond", cases_falsy.get(i))
+        eq_str(template_render(t, ctx), "NO", "if falsy: '" + cases_falsy.get(i) + "'")
+        i = i + 1
+    }
+
+    # missing key is falsy
+    let ctx_missing: TemplateContext = template_context_new()
+    eq_str(template_render(t, ctx_missing), "NO", "if missing = falsy")
+    return 0
+}
+
+# ============================================================================
+# Test 5: {{#if cond}} without else — empty output when false
+# ============================================================================
+
+fn test_if_no_else() -> int uses IO {
+    let src: str = "A{{#if cond}}B{{/if}}C"
+    let t: Template = result_unwrap(template_compile(src))
+    let ctx_t: TemplateContext = template_context_new()
+    template_context_set(ctx_t, "cond", "true")
+    eq_str(template_render(t, ctx_t), "ABC", "if true, no else")
+
+    let ctx_f: TemplateContext = template_context_new()
+    template_context_set(ctx_f, "cond", "false")
+    eq_str(template_render(t, ctx_f), "AC", "if false, no else")
+    return 0
+}
+
+# ============================================================================
+# Test 6: {{#each list}} with {{this}} and {{@index}}
+# ============================================================================
+
+fn test_each() -> int uses IO {
+    let src: str = "{{#each items}}[{{@index}}:{{this}}]{{/each}}"
+    let t: Template = result_unwrap(template_compile(src))
+    let ctx: TemplateContext = template_context_new()
+    template_context_set_list(ctx, "items", ["a", "b", "c"])
+    eq_str(template_render(t, ctx), "[0:a][1:b][2:c]", "each with this + index")
+    return 0
+}
+
+# ============================================================================
+# Test 7: {{#each list}} with {{else}} for empty list
+# ============================================================================
+
+fn test_each_empty() -> int uses IO {
+    let src: str = "{{#each items}}ITEM{{else}}NONE{{/each}}"
+    let t: Template = result_unwrap(template_compile(src))
+
+    # non-empty
+    let ctx1: TemplateContext = template_context_new()
+    template_context_set_list(ctx1, "items", ["x"])
+    eq_str(template_render(t, ctx1), "ITEM", "each non-empty -> then branch")
+
+    # empty list
+    let ctx2: TemplateContext = template_context_new()
+    template_context_set_list(ctx2, "items", [])
+    eq_str(template_render(t, ctx2), "NONE", "each empty -> else branch")
+
+    # missing list -> empty -> else branch
+    let ctx3: TemplateContext = template_context_new()
+    eq_str(template_render(t, ctx3), "NONE", "each missing -> else branch")
+    return 0
+}
+
+# ============================================================================
+# Test 8: nested {{#each}} inside {{#if}}
+# ============================================================================
+
+fn test_nested() -> int uses IO {
+    let src: str = "{{#if show}}{{#each items}}({{this}}){{/each}}{{/if}}"
+    let t: Template = result_unwrap(template_compile(src))
+    let ctx: TemplateContext = template_context_new()
+    template_context_set(ctx, "show", "true")
+    template_context_set_list(ctx, "items", ["a", "b"])
+    eq_str(template_render(t, ctx), "(a)(b)", "nested if + each")
+
+    # show=false → entire block skipped
+    let ctx2: TemplateContext = template_context_new()
+    template_context_set(ctx2, "show", "false")
+    template_context_set_list(ctx2, "items", ["a", "b"])
+    eq_str(template_render(t, ctx2), "", "nested if false -> empty")
+
+    # show=true but items empty → if renders but each renders empty
+    let ctx3: TemplateContext = template_context_new()
+    template_context_set(ctx3, "show", "true")
+    template_context_set_list(ctx3, "items", [])
+    eq_str(template_render(t, ctx3), "", "nested if true but each empty")
+    return 0
+}
+
+# ============================================================================
+# Test 9: {{! comment }} — omitted from output
+# ============================================================================
+
+fn test_comment() -> int uses IO {
+    let src: str = "A{{! this is a comment }}B"
+    let t: Template = result_unwrap(template_compile(src))
+    let ctx: TemplateContext = template_context_new()
+    eq_str(template_render(t, ctx), "AB", "comment omitted")
+
+    # Multi-line comment
+    let src2: str = "A{{! line one\nline two }}B"
+    let t2: Template = result_unwrap(template_compile(src2))
+    eq_str(template_render(t2, ctx), "AB", "multi-line comment omitted")
+    return 0
+}
+
+# ============================================================================
+# Test 10: {{> partial}} — partial include via Partials registry
+# ============================================================================
+
+fn test_partial() -> int uses IO {
+    let partials: Partials = partials_new()
+    let reg: Result[bool, str] = partials_register(partials, "greeting", "Hello, {{name}}!")
+    ok(result_is_ok(reg), "partials_register ok")
+    ok(partials_has(partials, "greeting"), "partials_has")
+    eq_int(partials_count(partials), 1, "partials_count = 1")
+
+    let t: Template = result_unwrap(template_compile("[{{> greeting}}]"))
+    let ctx: TemplateContext = template_context_new()
+    template_context_set(ctx, "name", "world")
+    eq_str(template_render_with_partials(t, ctx, partials), "[Hello, world!]", "partial include")
+
+    # Missing partial -> empty string (graceful)
+    let t2: Template = result_unwrap(template_compile("[{{> missing}}]"))
+    eq_str(template_render_with_partials(t2, ctx, partials), "[]", "missing partial = empty")
+
+    # Partial inside #each — {{this}} is the current element
+    let partials2: Partials = partials_new()
+    let reg2: Result[bool, str] = partials_register(partials2, "row", "<li>{{this}}</li>")
+    ok(result_is_ok(reg2), "partials_register row ok")
+    let t3: Template = result_unwrap(template_compile("<ul>{{#each items}}{{> row}}{{/each}}</ul>"))
+    let ctx3: TemplateContext = template_context_new()
+    template_context_set_list(ctx3, "items", ["a", "b", "c"])
+    eq_str(template_render_with_partials(t3, ctx3, partials2),
+           "<ul><li>a</li><li>b</li><li>c</li></ul>",
+           "partial inside each")
+    return 0
+}
+
+# ============================================================================
+# Test 11: {{name | filter}} — upper / lower / trim / default
+# ============================================================================
+
+fn test_filters() -> int uses IO {
+    # upper
+    let t_up: Template = result_unwrap(template_compile("{{name | upper}}"))
+    let ctx_up: TemplateContext = template_context_new()
+    template_context_set(ctx_up, "name", "hello")
+    eq_str(template_render(t_up, ctx_up), "HELLO", "filter upper")
+
+    # lower
+    let t_lo: Template = result_unwrap(template_compile("{{name | lower}}"))
+    let ctx_lo: TemplateContext = template_context_new()
+    template_context_set(ctx_lo, "name", "HELLO")
+    eq_str(template_render(t_lo, ctx_lo), "hello", "filter lower")
+
+    # trim
+    let t_tr: Template = result_unwrap(template_compile("{{name | trim}}"))
+    let ctx_tr: TemplateContext = template_context_new()
+    template_context_set(ctx_tr, "name", "  hi  ")
+    eq_str(template_render(t_tr, ctx_tr), "hi", "filter trim")
+
+    # default — no-op (missing = "")
+    let t_de: Template = result_unwrap(template_compile("[{{name | default}}]"))
+    let ctx_de: TemplateContext = template_context_new()
+    eq_str(template_render(t_de, ctx_de), "[]", "filter default no-op for missing")
+
+    # unknown filter — graceful (returns value unchanged)
+    let t_un: Template = result_unwrap(template_compile("{{name | unknownfilter}}"))
+    let ctx_un: TemplateContext = template_context_new()
+    template_context_set(ctx_un, "name", "hi")
+    eq_str(template_render(t_un, ctx_un), "hi", "unknown filter graceful")
+
+    # filter + escaping still applies
+    let t_esc: Template = result_unwrap(template_compile("{{name | upper}}"))
+    let ctx_esc: TemplateContext = template_context_new()
+    template_context_set(ctx_esc, "name", "<hi>")
+    eq_str(template_render(t_esc, ctx_esc), "&lt;HI&gt;", "filter + escape")
+
+    # validate_filter
+    ok(template_validate_filter("upper"), "validate upper")
+    ok(template_validate_filter("lower"), "validate lower")
+    ok(template_validate_filter("trim"), "validate trim")
+    ok(template_validate_filter("default"), "validate default")
+    ok(template_validate_filter("bogus") == false, "validate bogus rejected")
+    return 0
+}
+
+# ============================================================================
+# Test 12: parse errors — unclosed tags, mismatched blocks, etc.
+# ============================================================================
+
+fn test_parse_errors() -> int uses IO {
+    # unclosed {{
+    let r1: Result[Template, str] = template_compile("hello {{ world")
+    ok(result_is_err(r1), "unclosed {{ rejected")
+
+    # unclosed {{{
+    let r2: Result[Template, str] = template_compile("hello {{{ world")
+    ok(result_is_err(r2), "unclosed {{{ rejected")
+
+    # empty {{{}}}
+    let r3: Result[Template, str] = template_compile("{{{}}}")
+    ok(result_is_err(r3), "empty {{{}}} rejected")
+
+    # empty partial name {{>}}
+    let r4: Result[Template, str] = template_compile("{{>}}")
+    ok(result_is_err(r4), "empty partial name rejected")
+
+    # {{#if}} missing condition
+    let r5: Result[Template, str] = template_compile("{{#if}}A{{/if}}")
+    ok(result_is_err(r5), "#if missing condition rejected")
+
+    # {{#each}} missing list name
+    let r6: Result[Template, str] = template_compile("{{#each}}A{{/each}}")
+    ok(result_is_err(r6), "#each missing list name rejected")
+
+    # {{#if}} missing {{/if}}
+    let r7: Result[Template, str] = template_compile("{{#if cond}}A")
+    ok(result_is_err(r7), "#if missing {{/if}} rejected")
+
+    # {{#if}} closed by {{/each}}
+    let r8: Result[Template, str] = template_compile("{{#if cond}}A{{/each}}")
+    ok(result_is_err(r8), "#if closed by /each rejected")
+
+    # {{else}} outside a block
+    let r9: Result[Template, str] = template_compile("A{{else}}B")
+    ok(result_is_err(r9), "else outside block rejected")
+
+    # {{/if}} outside a block
+    let r10: Result[Template, str] = template_compile("A{{/if}}")
+    ok(result_is_err(r10), "/if outside block rejected")
+
+    # unknown block {{#foo}}
+    let r11: Result[Template, str] = template_compile("{{#foo x}}A{{/foo}}")
+    ok(result_is_err(r11), "unknown block #foo rejected")
+
+    # unknown block end {{/foo}}
+    let r12: Result[Template, str] = template_compile("{{#if cond}}A{{/foo}}")
+    ok(result_is_err(r12), "unknown block end /foo rejected")
+
+    # empty variable name before filter
+    let r13: Result[Template, str] = template_compile("{{| upper}}")
+    ok(result_is_err(r13), "empty var before filter rejected")
+
+    # empty filter name
+    let r14: Result[Template, str] = template_compile("{{name |}}")
+    ok(result_is_err(r14), "empty filter name rejected")
+
+    # template_validate agrees with template_compile
+    ok(result_is_ok(template_validate("hello {{name}}")), "validate ok")
+    ok(result_is_err(template_validate("hello {{ world")), "validate err")
+    return 0
+}
+
+# ============================================================================
+# Test 13: template_describe — AST introspection
+# ============================================================================
+
+fn test_describe() -> int uses IO {
+    let t: Template = result_unwrap(template_compile("Hello, {{name}}!{{#if show}}A{{/if}}"))
+    let d: str = template_describe(t)
+    ok(d.contains("Template"), "describe has header")
+    ok(d.contains("top-level nodes"), "describe has node count")
+    ok(d.contains("text"), "describe has text kind")
+    ok(d.contains("var"), "describe has var kind")
+    ok(d.contains("if"), "describe has if kind")
+    return 0
+}
+
+# ============================================================================
+# Test 14: template_node_count — nested counting
+# ============================================================================
+
+fn test_node_count() -> int uses IO {
+    # "A{{#if c}}B{{#each items}}({{this}}){{/each}}{{/if}}D"
+    # top-level: text, if, text = 3
+    # inside if: text, each = 2
+    # inside each: text, var, text = 3
+    # total = 3 + 2 + 3 = 8
+    let t: Template = result_unwrap(template_compile("A{{#if c}}B{{#each items}}({{this}}){{/each}}{{/if}}D"))
+    eq_int(template_top_level_node_count(t), 3, "top-level count = 3")
+    eq_int(template_node_count(t), 8, "total node count = 8")
+    return 0
+}
+
+# ============================================================================
+# Test 15: constants — markers and limits
+# ============================================================================
+
+fn test_constants() -> int uses IO {
+    eq_str(template_open_tag(), "{{", "open tag")
+    eq_str(template_close_tag(), "}}", "close tag")
+    eq_str(template_raw_open_tag(), "{{{", "raw open tag")
+    eq_str(template_raw_close_tag(), "}}}", "raw close tag")
+    eq_str(template_comment_marker(), "!", "comment marker")
+    eq_str(template_partial_marker(), ">", "partial marker")
+    eq_str(template_filter_separator(), "|", "filter separator")
+    eq_str(template_block_if(), "#if", "block if")
+    eq_str(template_block_each(), "#each", "block each")
+    eq_str(template_block_else(), "else", "block else")
+    eq_str(template_block_end(), "/", "block end")
+    eq_str(template_this_var(), "this", "this var")
+    eq_str(template_index_var(), "@index", "index var")
+    eq_int(template_max_depth(), 32, "max depth 32")
+    eq_int(template_max_nodes(), 65536, "max nodes 65536")
+
+    # Node kind constants
+    eq_str(template_kind_text(), "text", "kind text")
+    eq_str(template_kind_var(), "var", "kind var")
+    eq_str(template_kind_raw(), "raw", "kind raw")
+    eq_str(template_kind_if(), "if", "kind if")
+    eq_str(template_kind_each(), "each", "kind each")
+    eq_str(template_kind_comment(), "comment", "kind comment")
+    eq_str(template_kind_partial(), "partial", "kind partial")
+    eq_str(template_kind_filter(), "filter", "kind filter")
+    return 0
+}
+
+# ============================================================================
+# Test 16: end-to-end — render a realistic HTML page
+# ============================================================================
+
+fn test_end_to_end() -> int uses IO {
+    let src: str = "<!DOCTYPE html>\n<html>\n<head><title>{{title | upper}}</title></head>\n<body>\n<h1>{{title}}</h1>\n{{#if user}}\n<p>Welcome, <b>{{user}}</b>! ({{role}})</p>\n{{else}}\n<p><a href=\"/login\">Login</a></p>\n{{/if}}\n<ul>\n{{#each items}}<li>{{@index}}: {{this}}</li>\n{{/each}}\n</ul>\n</body>\n</html>"
+    let t: Template = result_unwrap(template_compile(src))
+
+    # Logged-in user
+    let ctx: TemplateContext = template_context_new()
+    template_context_set(ctx, "title", "my page")
+    template_context_set(ctx, "user", "<alice>")
+    template_context_set(ctx, "role", "admin")
+    template_context_set_list(ctx, "items", ["a", "b"])
+    let out: str = template_render(t, ctx)
+    # title should be uppercased AND escaped
+    ok(out.contains("<title>MY PAGE</title>"), "title uppercased")
+    # user should be HTML-escaped (no raw <>)
+    ok(out.contains("&lt;alice&gt;"), "user escaped")
+    # the "if user" branch should be taken
+    ok(out.contains("Welcome"), "if branch taken")
+    # the "else" branch should NOT be taken
+    ok(!out.contains("/login"), "else branch not taken")
+    # each iteration
+    ok(out.contains("0: a"), "each item 0")
+    ok(out.contains("1: b"), "each item 1")
+
+    # Logged-out user
+    let ctx2: TemplateContext = template_context_new()
+    template_context_set(ctx2, "title", "my page")
+    # no user → else branch
+    template_context_set_list(ctx2, "items", [])
+    let out2: str = template_render(t, ctx2)
+    ok(out2.contains("/login"), "else branch taken when no user")
+    ok(!out2.contains("Welcome"), "if branch not taken when no user")
+    # items list is empty → no <li> items
+    ok(!out2.contains("0: "), "no items when empty list")
+    return 0
+}
+
+# ============================================================================
+# Dispatcher
+# ============================================================================
+
+fn run_tests() -> int uses IO {
+    println("=== Stage 69 acceptance: std.template ===")
+    let mut passed: int = 0
+    let tests: list[str] = [
+        "test_compile_basic",
+        "test_render_basic",
+        "test_render_raw",
+        "test_if",
+        "test_if_no_else",
+        "test_each",
+        "test_each_empty",
+        "test_nested",
+        "test_comment",
+        "test_partial",
+        "test_filters",
+        "test_parse_errors",
+        "test_describe",
+        "test_node_count",
+        "test_constants",
+        "test_end_to_end"
+    ]
+    let mut i: int = 0
+    while i < tests.len() {
+        let name: str = tests.get(i)
+        println("RUN  " + name)
+        if name == "test_compile_basic" {
+            let _r: int = test_compile_basic()
+        } else if name == "test_render_basic" {
+            let _r: int = test_render_basic()
+        } else if name == "test_render_raw" {
+            let _r: int = test_render_raw()
+        } else if name == "test_if" {
+            let _r: int = test_if()
+        } else if name == "test_if_no_else" {
+            let _r: int = test_if_no_else()
+        } else if name == "test_each" {
+            let _r: int = test_each()
+        } else if name == "test_each_empty" {
+            let _r: int = test_each_empty()
+        } else if name == "test_nested" {
+            let _r: int = test_nested()
+        } else if name == "test_comment" {
+            let _r: int = test_comment()
+        } else if name == "test_partial" {
+            let _r: int = test_partial()
+        } else if name == "test_filters" {
+            let _r: int = test_filters()
+        } else if name == "test_parse_errors" {
+            let _r: int = test_parse_errors()
+        } else if name == "test_describe" {
+            let _r: int = test_describe()
+        } else if name == "test_node_count" {
+            let _r: int = test_node_count()
+        } else if name == "test_constants" {
+            let _r: int = test_constants()
+        } else if name == "test_end_to_end" {
+            let _r: int = test_end_to_end()
+        }
+        println("PASS " + name)
+        passed = passed + 1
+        i = i + 1
+    }
+    println("")
+    println("=== " + passed.to_str() + "/" + tests.len().to_str() + " tests PASSED ===")
+    return 0
+}
+
+fn main() -> int uses IO {
+    return run_tests()
+}

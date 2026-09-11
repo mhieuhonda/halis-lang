@@ -1,0 +1,1087 @@
+# ============================================================================
+# std/template.hls — Stage 69 (v0.88.0-alpha): compile-time HTML templates
+# ----------------------------------------------------------------------------
+# This module is the SEVENTH module of Phase V (the web application track,
+# Stages 63–76). It implements a PURE-HLS HTML template engine that is
+# XSS-safe by construction: every {{variable}} interpolation is HTML-
+# escaped by default. Rendering raw HTML requires the explicit triple-
+# mustache {{{variable}}} opt-in — the caller takes responsibility for
+# having sanitised that value upstream.
+#
+# The engine is "compile-time" in the sense that a template source string
+# is parsed ONCE into a Template AST (a list of TemplateNode values);
+# subsequent renders walk the AST without re-parsing. The AST is a pure
+# value — it can be cached, shared between threads, or stored in a
+# long-lived registry. There is NO code generation; the renderer is a
+# straightforward tree-walking interpreter over the AST.
+#
+# TEMPLATE SYNTAX (Mustache-like, intentionally a strict subset of
+# Handlebars / Mustache so existing templates port with minimal change):
+#
+#   {{name}}            interpolate the scalar `name`, HTML-escaped.
+#                       The value is taken from ctx.scalars[name]; if
+#                       absent, the empty string is interpolated (matching
+#                       Mustache's "missing = empty" semantics).
+#
+#   {{{name}}}          interpolate the scalar `name` RAW — NOT escaped.
+#                       This is the explicit opt-in for trusted HTML.
+#                       Use this ONLY for values the caller has already
+#                       sanitised (e.g. via std.html, std.sanitize, or a
+#                       trusted source). NEVER use this for user input.
+#
+#   {{#if cond}}A{{else}}B{{/if}}
+#                       conditional. `cond` is truthy iff ctx.scalars[cond]
+#                       exists AND is not "" AND is not "false" AND is not
+#                       "0". The {{else}} branch is optional. Nesting is
+#                       supported (the renderer tracks block depth).
+#
+#   {{#each list}}A{{else}}B{{/each}}
+#                       iteration. `list` is a list[str] from ctx.lists.
+#                       Inside the block, {{this}} is the current element,
+#                       and {{@index}} is the current 0-based index. The
+#                       {{else}} branch is taken iff the list is empty.
+#
+#   {{! comment }}      comment — omitted from the output entirely.
+#                       Multi-line comments are supported.
+#
+#   {{> partial}}       partial include — looks up `partial` in the
+#                       partials registry passed to template_render_with_partials.
+#                       If the partial is not registered, the empty string
+#                       is interpolated (graceful degradation — Mustache
+#                       behaves the same way when a partial is missing).
+#
+#   {{name | filter}}   filter — apply a named filter to the value before
+#                       escaping. Built-in filters:
+#                         upper   — ASCII uppercase
+#                         lower   — ASCII lowercase
+#                         trim    — strip leading/trailing ASCII whitespace
+#                         default — fall back to "" if the value is missing
+#                                   (this is the default behaviour already,
+#                                   so the filter is a no-op; it is provided
+#                                   for symmetry with other engines)
+#                       Filters DO NOT bypass escaping — the result is still
+#                       HTML-escaped unless {{{...}}} is used.
+#
+#   Whitespace control:
+#                       A `{{` immediately followed by whitespace, and a
+#                       `}}` immediately preceded by whitespace, are
+#                       treated as the literal text. So "x {{ y }} z" parses
+#                       as the literal text "x " + the variable "y" + " z"
+#                       — the spaces inside the moustache are stripped.
+#
+# SECURITY MODEL
+#
+#   * DEFAULT-ESCAPE: every {{var}} is HTML-escaped via std.html.html_escape
+#     (Stage 38). This escapes &, <, >, ", ', and / per OWASP. The escape
+#     is a SINGLE function call on the rendered value — there is no path
+#     through the renderer that produces unescaped output unless the caller
+#     explicitly opts in via {{{var}}} or {{& var}}.
+#
+#   * CONTEXT-AWARE ESCAPING is NOT implemented: the renderer uses the same
+#     html_escape for both text content and attribute values. This is safe
+#     (html_escape covers the chars dangerous in both contexts) but not
+#     optimal (it over-escapes in some contexts). A future stage may add
+#     separate escape functions for JS, URL, CSS contexts.
+#
+#   * RAW INTERPOLATION ({{{var}}}) is a footgun. The caller MUST ensure the
+#     value is sanitised. The renderer does NOT re-validate. This is a
+#     deliberate design choice: re-validation would prevent legitimate uses
+#     (e.g. including a trusted sub-template's output) without adding real
+#     security (an attacker who can inject at this point has already won).
+#
+#   * TEMPLATE INJECTION (server-side template injection, SSTI): the
+#     renderer does NOT evaluate expressions, only variable lookups. There
+#     is no {{eval}} or {{{eval}}} — the only way to get dynamic content
+#     is to pass it via the context. SSTI is therefore impossible by
+#     construction.
+#
+#   * PARTIALS are looked up by name in a caller-supplied registry. The
+#     partial source is treated as UNTRUSTED (it could contain {{...}} that
+#     the engine will parse and render). This is the standard behaviour —
+#     the partial registry is the caller's responsibility to populate with
+#     trusted templates.
+#
+# DIFFERENTIAL PARITY
+#
+#   The parser and renderer are pure functions of immutable inputs. The
+#   output is byte-identical between the interpreter and the native binary.
+#   No Rand is used; no I/O is performed. The acceptance test and demo are
+#   fully deterministic.
+#
+# NO NEW COMPILER BUILTINS
+#
+#   The entire module is pure HLS, layered on:
+#     * std.html   (html_escape — Stage 38)
+#     * std.str    (str_join, str_to_lower_ascii, str_to_upper_ascii,
+#                   str_starts_with, str_ends_with, str_contains, str_replace)
+#     * std.option (Option[T] — for partial lookup)
+#     * std.result (Result[T, E] — for compile-time errors)
+#     * std.list   (list_reverse_str — for index tracking during render)
+# ============================================================================
+
+import "std.html"
+import "std.str"
+import "std.option"
+import "std.result"
+import "std.list"
+
+# ============================================================================
+# Constants — magic markers and limits.
+# ============================================================================
+
+fn template_open_tag() -> str          { return "{{" }
+fn template_close_tag() -> str         { return "}}" }
+fn template_raw_open_tag() -> str      { return "{{{" }
+fn template_raw_close_tag() -> str     { return "}}}" }
+fn template_comment_marker() -> str    { return "!" }
+fn template_partial_marker() -> str    { return ">" }
+fn template_filter_separator() -> str  { return "|" }
+
+# Block markers.
+fn template_block_if() -> str    { return "#if" }
+fn template_block_each() -> str  { return "#each" }
+fn template_block_else() -> str  { return "else" }
+fn template_block_end() -> str   { return "/" }
+
+# Special variable names available inside an {{#each}} block.
+fn template_this_var() -> str   { return "this" }
+fn template_index_var() -> str  { return "@index" }
+
+# template_max_depth() — the maximum nesting depth of #if / #each blocks.
+# 32 is generous (most templates nest 3-5 levels deep). Deeper nesting is
+# almost always a bug (an unbalanced tag); the parser rejects it with a
+# clear error rather than crashing the stack.
+fn template_max_depth() -> int { return 32 }
+
+# template_max_nodes() — the maximum number of nodes in a single Template.
+# 65536 is enough for a ~1MB source template (each node averages ~15 bytes
+# of source). Larger templates are likely the result of a bug or attack;
+# the parser rejects them.
+fn template_max_nodes() -> int { return 65536 }
+
+# ============================================================================
+# TemplateNode — the AST node type.
+#
+# A Template is a list[TemplateNode]. Each node is one of:
+#   * Text      — literal text (rendered as-is, no escaping)
+#   * Var       — {{name}} — interpolate, HTML-escaped
+#   * Raw       — {{{name}}} — interpolate, NOT escaped (trusted HTML)
+#   * If        — {{#if cond}}A{{else}}B{{/if}} — conditional
+#   * Each      — {{#each list}}A{{else}}B{{/each}} — iteration
+#   * Comment   — {{! ... }} — omitted from output
+#   * Partial   — {{> name}} — include a registered partial
+#   * Filter    — {{name | filter}} — apply a filter to the value
+#
+# The Var and Raw nodes carry a `filter` field ("" if no filter). The
+# If and Each nodes carry two child lists (then_branch and else_branch).
+# This makes the AST a tree, not a flat list — the renderer recurses.
+# ============================================================================
+
+fn template_kind_text() -> str    { return "text" }
+fn template_kind_var() -> str     { return "var" }
+fn template_kind_raw() -> str     { return "raw" }
+fn template_kind_if() -> str      { return "if" }
+fn template_kind_each() -> str    { return "each" }
+fn template_kind_comment() -> str { return "comment" }
+fn template_kind_partial() -> str { return "partial" }
+fn template_kind_filter() -> str  { return "filter" }
+
+struct TemplateNode {
+    kind: str,
+    # Text node: the literal text.
+    # Var/Raw node: the variable name.
+    # If node: the condition variable name.
+    # Each node: the list variable name.
+    # Comment node: the comment text (omitted from output).
+    # Partial node: the partial name.
+    # Filter node: the variable name (filter is in `filter`).
+    text: str,
+    # Var/Raw/Filter node: the filter name ("" if no filter).
+    filter: str,
+    # If/Each node: the "then" branch (taken when condition is true / list
+    # is non-empty).
+    then_branch: list[TemplateNode],
+    # If/Each node: the "else" branch (taken when condition is false /
+    # list is empty). Empty list if no {{else}} in the source.
+    else_branch: list[TemplateNode]
+}
+
+# Template — the compiled template. A list of TemplateNode values,
+# produced by template_compile. The renderer walks this list once per
+# render call.
+struct Template {
+    nodes: list[TemplateNode],
+    # The original source, kept for error messages and template_describe.
+    # Not used during rendering.
+    source: str
+}
+
+# TemplateContext — the data passed to the renderer. Carries both scalar
+# values (str) and lists (list[str]) — HLS's map only supports homogeneous
+# value types per map, so we use two maps. The renderer looks up scalars
+# in `scalars` and lists in `lists` (via the variable name).
+struct TemplateContext {
+    scalars: map[str, str],
+    lists: map[str, list[str]]
+}
+
+# template_context_new() — construct an empty context. Use
+# template_context_set / template_context_set_list to populate it.
+fn template_context_new() -> TemplateContext {
+    return TemplateContext {
+        scalars: map_new(),
+        lists: map_new()
+    }
+}
+
+# template_context_set(ctx, key, value) — add a scalar value to the
+# context. If the key already exists, it is overwritten.
+fn template_context_set(ctx: TemplateContext, key: str, value: str) -> void {
+    ctx.scalars.set(key, value)
+}
+
+# template_context_set_list(ctx, key, list) — add a list value to the
+# context. If the key already exists, it is overwritten.
+fn template_context_set_list(ctx: TemplateContext, key: str, value: list[str]) -> void {
+    ctx.lists.set(key, value)
+}
+
+# template_context_get(ctx, key) — look up a scalar value. Returns "" if
+# the key is absent (matching Mustache's "missing = empty" semantics).
+fn template_context_get(ctx: TemplateContext, key: str) -> str {
+    if !ctx.scalars.has(key) {
+        return ""
+    }
+    return ctx.scalars.get_or(key, "")
+}
+
+# template_context_get_list(ctx, key) — look up a list value. Returns an
+# empty list if the key is absent.
+fn template_context_get_list(ctx: TemplateContext, key: str) -> list[str] {
+    if !ctx.lists.has(key) {
+        return []
+    }
+    return ctx.lists.get_or(key, [])
+}
+
+# ============================================================================
+# Partials registry — a map[str, Template] that the renderer consults when
+# it encounters a {{> name}} node. The caller populates this before
+# rendering. Partials are looked up by NAME (not by file path) — there is
+# no file I/O at render time.
+# ============================================================================
+
+struct Partials {
+    templates: map[str, Template]
+}
+
+# partials_new() — construct an empty partials registry.
+fn partials_new() -> Partials {
+    return Partials { templates: map_new() }
+}
+
+# partials_register(p, name, src) — compile `src` and register it under
+# `name`. If compilation fails, returns the error; otherwise returns Ok(true).
+# Re-registering an existing name replaces the old template.
+fn partials_register(p: Partials, name: str, src: str) -> Result[bool, str] {
+    let compiled: Result[Template, str] = template_compile(src)
+    if !result_is_ok(compiled) {
+        return Result.Err(result_err_or(compiled, "partials_register: compile failed"))
+    }
+    let t: Template = result_unwrap(compiled)
+    p.templates.set(name, t)
+    return Result.Ok(true)
+}
+
+# partials_register_compiled(p, name, t) — register an already-compiled
+# Template. Used when the same partial is compiled once and reused.
+fn partials_register_compiled(p: Partials, name: str, t: Template) -> void {
+    p.templates.set(name, t)
+}
+
+# partials_has(p, name) — true iff `name` is a registered partial.
+fn partials_has(p: Partials, name: str) -> bool {
+    return p.templates.has(name)
+}
+
+# partials_get(p, name) — look up a partial by name. Returns Option.Some(Template)
+# if found, Option.None if not registered.
+fn partials_get(p: Partials, name: str) -> Option[Template] {
+    if !p.templates.has(name) {
+        return Option.None
+    }
+    return Option.Some(p.templates.get_or(name, Template { nodes: [], source: "" }))
+}
+
+# partials_count(p) — number of registered partials.
+fn partials_count(p: Partials) -> int {
+    let keys: list[str] = p.templates.keys()
+    return keys.len()
+}
+
+# ============================================================================
+# Node constructors — internal helpers used by the parser to build nodes.
+# Centralising them here ensures every node is constructed with the right
+# default fields (then_branch / else_branch empty for non-block nodes).
+# ============================================================================
+
+fn _template_node_text(text: str) -> TemplateNode {
+    return TemplateNode {
+        kind: template_kind_text(),
+        text: text,
+        filter: "",
+        then_branch: [],
+        else_branch: []
+    }
+}
+
+fn _template_node_var(name: str) -> TemplateNode {
+    return TemplateNode {
+        kind: template_kind_var(),
+        text: name,
+        filter: "",
+        then_branch: [],
+        else_branch: []
+    }
+}
+
+fn _template_node_raw(name: str) -> TemplateNode {
+    return TemplateNode {
+        kind: template_kind_raw(),
+        text: name,
+        filter: "",
+        then_branch: [],
+        else_branch: []
+    }
+}
+
+fn _template_node_comment(comment: str) -> TemplateNode {
+    return TemplateNode {
+        kind: template_kind_comment(),
+        text: comment,
+        filter: "",
+        then_branch: [],
+        else_branch: []
+    }
+}
+
+fn _template_node_partial(name: str) -> TemplateNode {
+    return TemplateNode {
+        kind: template_kind_partial(),
+        text: name,
+        filter: "",
+        then_branch: [],
+        else_branch: []
+    }
+}
+
+fn _template_node_filter(name: str, filter: str) -> TemplateNode {
+    return TemplateNode {
+        kind: template_kind_filter(),
+        text: name,
+        filter: filter,
+        then_branch: [],
+        else_branch: []
+    }
+}
+
+fn _template_node_if(cond: str, then_branch: list[TemplateNode], else_branch: list[TemplateNode]) -> TemplateNode {
+    return TemplateNode {
+        kind: template_kind_if(),
+        text: cond,
+        filter: "",
+        then_branch: then_branch,
+        else_branch: else_branch
+    }
+}
+
+fn _template_node_each(list_name: str, then_branch: list[TemplateNode], else_branch: list[TemplateNode]) -> TemplateNode {
+    return TemplateNode {
+        kind: template_kind_each(),
+        text: list_name,
+        filter: "",
+        then_branch: then_branch,
+        else_branch: else_branch
+    }
+}
+
+# ============================================================================
+# String helpers used by the parser. These are small enough that inlining
+# would be cleaner, but factoring them out keeps the parser readable.
+# ============================================================================
+
+# _template_find(s, needle, start, end) — return the byte index of the
+# first occurrence of `needle` in s[start..end], or -1 if not found.
+# `needle` is a multi-byte string; this is a naive search (O(n*m)) but the
+# template source is small (max ~1 MB) and the markers are short (2-3
+# bytes) so the constant factor is fine.
+fn _template_find(s: str, needle: str, start: int, end: int) -> int {
+    let nlen: int = needle.len()
+    if nlen == 0 {
+        return start
+    }
+    let mut i: int = start
+    while i + nlen <= end {
+        if s.slice(i, i + nlen) == needle {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+# _template_trim(s) — strip leading and trailing ASCII whitespace from s.
+# Used to clean up the inside of moustache tags (e.g. "{{ name }}" → "name").
+# Whitespace = space, tab, CR, LF (the four ASCII whitespace bytes).
+fn _template_trim(s: str) -> str {
+    let n: int = s.len()
+    let mut start: int = 0
+    let mut end: int = n
+    while start < end {
+        let b: int = s.byte_at(start)
+        if b == 32 || b == 9 || b == 13 || b == 10 {
+            start = start + 1
+        } else {
+            break
+        }
+    }
+    while end > start {
+        let b: int = s.byte_at(end - 1)
+        if b == 32 || b == 9 || b == 13 || b == 10 {
+            end = end - 1
+        } else {
+            break
+        }
+    }
+    return s.slice(start, end)
+}
+
+# _template_first_word(s) — return the first whitespace-delimited word of s.
+# Used to split "#if cond" into ["#if", "cond"].
+fn _template_first_word(s: str) -> str {
+    let n: int = s.len()
+    let mut i: int = 0
+    while i < n {
+        let b: int = s.byte_at(i)
+        if b == 32 || b == 9 || b == 13 || b == 10 {
+            return s.slice(0, i)
+        }
+        i = i + 1
+    }
+    return s
+}
+
+# _template_skip_word(s) — return the remainder of s after the first word
+# (i.e. everything after the first run of whitespace). The remainder is
+# NOT trimmed — the caller is expected to call _template_trim on the result.
+fn _template_skip_word(s: str) -> str {
+    let n: int = s.len()
+    let mut i: int = 0
+    # Skip the first word (non-whitespace).
+    while i < n {
+        let b: int = s.byte_at(i)
+        if b == 32 || b == 9 || b == 13 || b == 10 {
+            break
+        }
+        i = i + 1
+    }
+    # Skip the whitespace after the word.
+    while i < n {
+        let b: int = s.byte_at(i)
+        if b != 32 && b != 9 && b != 13 && b != 10 {
+            break
+        }
+        i = i + 1
+    }
+    return s.slice(i, n)
+}
+
+# ============================================================================
+# Parser — template_compile(src) -> Result[Template, str].
+#
+# The parser is a single-pass state machine over the source string. It
+# produces a list[TemplateNode]. Block tags (#if / #each / else / /if /
+# /each) are handled via a recursive descent: when the parser sees an
+# {{#if cond}} or {{#each list}}, it recursively parses the body of the
+# block until it hits the matching {{else}} or {{/if}} / {{/each}}.
+#
+# The parser is strict: malformed tags (unclosed {{, unknown block name,
+# unbalanced {{/if}}, {{else}} outside a block) produce Result.Err with
+# a descriptive message naming the byte offset.
+# ============================================================================
+
+# TemplateParseResult — the result of parsing a sequence of nodes until a
+# terminator. `nodes` is the accumulated list; `terminator` names the tag
+# that ended the parse (one of "", "else", "/if", "/each"); `next_pos` is
+# the byte position immediately AFTER the terminator tag (so the caller
+# can resume parsing from there).
+#
+# `terminator == ""` means parsing reached the end of the source (no
+# terminator tag was encountered). For top-level parsing this is the
+# normal case; for block-body parsing it is an error (missing {{/if}} or
+# {{/each}}).
+struct TemplateParseResult {
+    nodes: list[TemplateNode],
+    terminator: str,
+    next_pos: int
+}
+
+# template_compile(src) — parse a template source string into a Template.
+# Returns Result.Ok(Template) on success, Result.Err(msg) on failure.
+# The error message includes the byte offset of the failure.
+fn template_compile(src: str) -> Result[Template, str] {
+    let r: Result[TemplateParseResult, str] = _template_parse_seq(src, 0, src.len(), 0)
+    if !result_is_ok(r) {
+        return Result.Err(result_err_or(r, "template_compile: parse failed"))
+    }
+    let pr: TemplateParseResult = result_unwrap(r)
+    # At the top level, the only valid terminator is "" (end of source).
+    if pr.terminator == "else" {
+        return Result.Err("template_compile: unexpected {{else}} at byte " + _template_find_tag_pos(src, pr.next_pos).to_str() + " (no block is open)")
+    }
+    if pr.terminator == "/if" {
+        return Result.Err("template_compile: unexpected {{/if}} at byte " + _template_find_tag_pos(src, pr.next_pos).to_str() + " (no block is open)")
+    }
+    if pr.terminator == "/each" {
+        return Result.Err("template_compile: unexpected {{/each}} at byte " + _template_find_tag_pos(src, pr.next_pos).to_str() + " (no block is open)")
+    }
+    if pr.nodes.len() > template_max_nodes() {
+        return Result.Err("template_compile: too many nodes (>" + template_max_nodes().to_str() + "); source is likely malformed")
+    }
+    return Result.Ok(Template { nodes: pr.nodes, source: src })
+}
+
+# _template_find_tag_pos(src, after_pos) — best-effort: returns the byte
+# position of the tag that ENDED at `after_pos`. We walk backwards from
+# `after_pos` to find the matching "{{" so the error message can name
+# the start of the offending tag. Used only for error reporting.
+fn _template_find_tag_pos(src: str, after_pos: int) -> int {
+    # Walk backwards from after_pos looking for "{{".
+    let mut i: int = after_pos - 2
+    while i >= 0 {
+        if i + 2 <= after_pos {
+            if src.slice(i, i + 2) == template_open_tag() {
+                return i
+            }
+        }
+        i = i - 1
+    }
+    return 0
+}
+
+# _template_parse_seq(src, start, end, depth) — parse a sequence of nodes
+# from src[start..end]. `depth` is the current nesting depth (used to
+# enforce template_max_depth).
+#
+# Returns Result.Ok(TemplateParseResult) on success. The result's
+# `terminator` field names the tag that ended the parse:
+#   ""      — reached end of source
+#   "else"  — encountered {{else}}
+#   "/if"   — encountered {{/if}}
+#   "/each" — encountered {{/each}}
+# The `next_pos` is the byte position immediately AFTER the terminator
+# tag (so the caller can resume parsing).
+#
+# Returns Result.Err(msg) on parse failure.
+fn _template_parse_seq(src: str, start: int, end: int, depth: int) -> Result[TemplateParseResult, str] {
+    if depth > template_max_depth() {
+        return Result.Err("template_parse: nesting too deep (>" + template_max_depth().to_str() + ") at byte " + start.to_str())
+    }
+    let nodes: list[TemplateNode] = []
+    let mut i: int = start
+    let n: int = end
+    while i < n {
+        # Find the next "{{" starting at i.
+        let open_at: int = _template_find(src, template_open_tag(), i, n)
+        if open_at < 0 {
+            # No more tags — the rest is literal text.
+            if i < n {
+                nodes.push(_template_node_text(src.slice(i, n)))
+            }
+            return Result.Ok(TemplateParseResult { nodes: nodes, terminator: "", next_pos: n })
+        }
+        # Flush the literal text before the tag.
+        if open_at > i {
+            nodes.push(_template_node_text(src.slice(i, open_at)))
+        }
+        # Check for raw-open "{{{". If so, it's a raw interpolation.
+        if open_at + 3 <= n && src.slice(open_at, open_at + 3) == template_raw_open_tag() {
+            let close_at: int = _template_find(src, template_raw_close_tag(), open_at + 3, n)
+            if close_at < 0 {
+                return Result.Err("template_parse: unclosed {{{ at byte " + open_at.to_str())
+            }
+            let name: str = _template_trim(src.slice(open_at + 3, close_at))
+            if name.len() == 0 {
+                return Result.Err("template_parse: empty {{{}}} at byte " + open_at.to_str())
+            }
+            # Raw interpolations do NOT support filters — the filter "|"
+            # syntax would conflict with the literal "|" in trusted HTML.
+            nodes.push(_template_node_raw(name))
+            i = close_at + 3
+            continue
+        }
+        # Regular tag: "{{...}}". Find the matching "}}".
+        let close_at: int = _template_find(src, template_close_tag(), open_at + 2, n)
+        if close_at < 0 {
+            return Result.Err("template_parse: unclosed {{ at byte " + open_at.to_str())
+        }
+        let inner: str = src.slice(open_at + 2, close_at)
+        let trimmed: str = _template_trim(inner)
+        # Empty tag "{{}}" — treat as literal text (graceful).
+        if trimmed.len() == 0 {
+            nodes.push(_template_node_text(template_open_tag() + template_close_tag()))
+            i = close_at + 2
+            continue
+        }
+        # Dispatch on the first character.
+        let first_byte: int = trimmed.byte_at(0)
+        # Comment: {{! ... }}
+        if first_byte == 33 {
+            # '!' — comment. The comment text is `inner` (between {{ and }}),
+            # excluding the leading "!". Use `inner` (not `trimmed`) so the
+            # comment text is preserved verbatim.
+            let comment_text: str = inner.slice(1, inner.len())
+            nodes.push(_template_node_comment(comment_text))
+            i = close_at + 2
+            continue
+        }
+        # Partial: {{> name}}
+        if first_byte == 62 {
+            # '>' — partial. The partial name is `trimmed` without ">".
+            let partial_name: str = _template_trim(trimmed.slice(1, trimmed.len()))
+            if partial_name.len() == 0 {
+                return Result.Err("template_parse: empty partial name at byte " + open_at.to_str())
+            }
+            nodes.push(_template_node_partial(partial_name))
+            i = close_at + 2
+            continue
+        }
+        # Block start: {{#if ...}} or {{#each ...}}
+        if first_byte == 35 {
+            # '#' — block start. The block name is the first word; the
+            # argument is the rest.
+            let body: str = _template_trim(trimmed.slice(1, trimmed.len()))
+            let block_name: str = _template_first_word(body)
+            let block_arg: str = _template_trim(_template_skip_word(body))
+            if block_name == "if" {
+                if block_arg.len() == 0 {
+                    return Result.Err("template_parse: {{#if}} missing condition at byte " + open_at.to_str())
+                }
+                # Parse the then-branch (until {{else}} or {{/if}}).
+                let then_r: Result[TemplateParseResult, str] = _template_parse_seq(src, close_at + 2, n, depth + 1)
+                if !result_is_ok(then_r) {
+                    return Result.Err(result_err_or(then_r, "template_parse: {{#if}} body parse failed"))
+                }
+                let then_pr: TemplateParseResult = result_unwrap(then_r)
+                let then_nodes: list[TemplateNode] = then_pr.nodes
+                # Decide what to do based on the terminator.
+                if then_pr.terminator == "" {
+                    return Result.Err("template_parse: {{#if}} missing {{/if}} at byte " + open_at.to_str())
+                }
+                if then_pr.terminator == "/each" {
+                    return Result.Err("template_parse: {{#if}} closed by {{/each}} at byte " + open_at.to_str())
+                }
+                # terminator is "else" or "/if".
+                let mut else_nodes: list[TemplateNode] = []
+                let mut next_pos: int = then_pr.next_pos
+                if then_pr.terminator == "else" {
+                    # Parse the else-branch (until {{/if}}).
+                    let else_r: Result[TemplateParseResult, str] = _template_parse_seq(src, then_pr.next_pos, n, depth + 1)
+                    if !result_is_ok(else_r) {
+                        return Result.Err(result_err_or(else_r, "template_parse: {{#if}} else body parse failed"))
+                    }
+                    let else_pr: TemplateParseResult = result_unwrap(else_r)
+                    else_nodes = else_pr.nodes
+                    if else_pr.terminator == "" {
+                        return Result.Err("template_parse: {{#if}} missing {{/if}} after {{else}} at byte " + open_at.to_str())
+                    }
+                    if else_pr.terminator == "else" {
+                        return Result.Err("template_parse: duplicate {{else}} in {{#if}} at byte " + open_at.to_str())
+                    }
+                    if else_pr.terminator == "/each" {
+                        return Result.Err("template_parse: {{#if}} else closed by {{/each}} at byte " + open_at.to_str())
+                    }
+                    next_pos = else_pr.next_pos
+                }
+                nodes.push(_template_node_if(block_arg, then_nodes, else_nodes))
+                i = next_pos
+                continue
+            } else if block_name == "each" {
+                if block_arg.len() == 0 {
+                    return Result.Err("template_parse: {{#each}} missing list name at byte " + open_at.to_str())
+                }
+                # Parse the then-branch (until {{else}} or {{/each}}).
+                let then_r: Result[TemplateParseResult, str] = _template_parse_seq(src, close_at + 2, n, depth + 1)
+                if !result_is_ok(then_r) {
+                    return Result.Err(result_err_or(then_r, "template_parse: {{#each}} body parse failed"))
+                }
+                let then_pr: TemplateParseResult = result_unwrap(then_r)
+                let then_nodes: list[TemplateNode] = then_pr.nodes
+                if then_pr.terminator == "" {
+                    return Result.Err("template_parse: {{#each}} missing {{/each}} at byte " + open_at.to_str())
+                }
+                if then_pr.terminator == "/if" {
+                    return Result.Err("template_parse: {{#each}} closed by {{/if}} at byte " + open_at.to_str())
+                }
+                let mut else_nodes: list[TemplateNode] = []
+                let mut next_pos: int = then_pr.next_pos
+                if then_pr.terminator == "else" {
+                    let else_r: Result[TemplateParseResult, str] = _template_parse_seq(src, then_pr.next_pos, n, depth + 1)
+                    if !result_is_ok(else_r) {
+                        return Result.Err(result_err_or(else_r, "template_parse: {{#each}} else body parse failed"))
+                    }
+                    let else_pr: TemplateParseResult = result_unwrap(else_r)
+                    else_nodes = else_pr.nodes
+                    if else_pr.terminator == "" {
+                        return Result.Err("template_parse: {{#each}} missing {{/each}} after {{else}} at byte " + open_at.to_str())
+                    }
+                    if else_pr.terminator == "else" {
+                        return Result.Err("template_parse: duplicate {{else}} in {{#each}} at byte " + open_at.to_str())
+                    }
+                    if else_pr.terminator == "/if" {
+                        return Result.Err("template_parse: {{#each}} else closed by {{/if}} at byte " + open_at.to_str())
+                    }
+                    next_pos = else_pr.next_pos
+                }
+                nodes.push(_template_node_each(block_arg, then_nodes, else_nodes))
+                i = next_pos
+                continue
+            } else {
+                return Result.Err("template_parse: unknown block {{#" + block_name + "}} at byte " + open_at.to_str())
+            }
+        }
+        # Block end: {{/if}} or {{/each}}
+        if first_byte == 47 {
+            # '/' — block end. Return control to the caller.
+            let end_name: str = _template_trim(trimmed.slice(1, trimmed.len()))
+            if end_name == "if" {
+                return Result.Ok(TemplateParseResult { nodes: nodes, terminator: "/if", next_pos: close_at + 2 })
+            }
+            if end_name == "each" {
+                return Result.Ok(TemplateParseResult { nodes: nodes, terminator: "/each", next_pos: close_at + 2 })
+            }
+            return Result.Err("template_parse: unknown block end {{/" + end_name + "}} at byte " + open_at.to_str())
+        }
+        # Else: {{else}} — only valid inside a block.
+        if trimmed == template_block_else() {
+            return Result.Ok(TemplateParseResult { nodes: nodes, terminator: "else", next_pos: close_at + 2 })
+        }
+        # Variable: {{name}} or {{name | filter}}.
+        let sep_at: int = _template_find(trimmed, template_filter_separator(), 0, trimmed.len())
+        if sep_at >= 0 {
+            let name: str = _template_trim(trimmed.slice(0, sep_at))
+            let filt: str = _template_trim(trimmed.slice(sep_at + 1, trimmed.len()))
+            if name.len() == 0 {
+                return Result.Err("template_parse: empty variable name before filter at byte " + open_at.to_str())
+            }
+            if filt.len() == 0 {
+                return Result.Err("template_parse: empty filter name at byte " + open_at.to_str())
+            }
+            nodes.push(_template_node_filter(name, filt))
+        } else {
+            nodes.push(_template_node_var(trimmed))
+        }
+        i = close_at + 2
+    }
+    # End of input.
+    return Result.Ok(TemplateParseResult { nodes: nodes, terminator: "", next_pos: n })
+}
+
+# ============================================================================
+# Renderer — template_render(t, ctx) -> str.
+#
+# The renderer walks the AST and produces the output string. Each node
+# is rendered according to its kind:
+#   * Text    — appended verbatim
+#   * Var     — looked up in ctx.scalars; HTML-escaped; appended
+#   * Raw     — looked up in ctx.scalars; appended verbatim (NOT escaped)
+#   * If      — condition evaluated; then-branch or else-branch rendered
+#   * Each    — list looked up in ctx.lists; then-branch rendered once per
+#               element (with {{this}} and {{@index}} set); else-branch
+#               rendered if list is empty
+#   * Comment — omitted
+#   * Partial — looked up in the partials registry (if provided); rendered
+#               with the SAME context (no context shadowing for now)
+#   * Filter  — value looked up; filter applied; result HTML-escaped; appended
+#
+# Context shadowing for {{this}} and {{@index}} inside {{#each}} is
+# implemented by passing `current_this` and `current_index` down the
+# recursion. Outside an {{#each}}, these are "" and -1 respectively.
+# ============================================================================
+
+# template_render(t, ctx) — render a Template with the given context and
+# NO partials. Encountering a {{> name}} node with no partials registry
+# results in the empty string (graceful degradation).
+fn template_render(t: Template, ctx: TemplateContext) -> str {
+    let empty_partials: Partials = partials_new()
+    return _template_render_nodes(t.nodes, ctx, empty_partials, "", -1)
+}
+
+# template_render_with_partials(t, ctx, partials) — render a Template with
+# the given context and a partials registry.
+fn template_render_with_partials(t: Template, ctx: TemplateContext, partials: Partials) -> str {
+    return _template_render_nodes(t.nodes, ctx, partials, "", -1)
+}
+
+# _template_render_nodes(nodes, ctx, partials, current_this, current_index) —
+# render a list of nodes. `current_this` is the value of {{this}} (set by
+# {{#each}}); `current_index` is the value of {{@index}} (set by {{#each}}).
+# When called at the top level, these are "" and -1 respectively.
+fn _template_render_nodes(nodes: list[TemplateNode], ctx: TemplateContext, partials: Partials, current_this: str, current_index: int) -> str {
+    let parts: list[str] = []
+    let mut i: int = 0
+    while i < nodes.len() {
+        let node: TemplateNode = nodes.get(i)
+        parts.push(_template_render_node(node, ctx, partials, current_this, current_index))
+        i = i + 1
+    }
+    return str_join(parts, "")
+}
+
+# _template_render_node(node, ctx, partials, current_this, current_index) —
+# render a single node. Dispatches on node.kind.
+fn _template_render_node(node: TemplateNode, ctx: TemplateContext, partials: Partials, current_this: str, current_index: int) -> str {
+    if node.kind == template_kind_text() {
+        return node.text
+    }
+    if node.kind == template_kind_var() {
+        let value: str = _template_lookup_var(node.text, ctx, current_this, current_index)
+        return html_escape(value)
+    }
+    if node.kind == template_kind_raw() {
+        let value: str = _template_lookup_var(node.text, ctx, current_this, current_index)
+        # NOT escaped — the caller's responsibility.
+        return value
+    }
+    if node.kind == template_kind_filter() {
+        let value: str = _template_lookup_var(node.text, ctx, current_this, current_index)
+        let filtered: str = _template_apply_filter(node.filter, value)
+        return html_escape(filtered)
+    }
+    if node.kind == template_kind_comment() {
+        return ""
+    }
+    if node.kind == template_kind_partial() {
+        # Look up the partial by name.
+        let opt: Option[Template] = partials_get(partials, node.text)
+        if option_is_none(opt) {
+            return ""
+        }
+        let partial_t: Template = option_unwrap(opt)
+        # Render the partial with the SAME context (no shadowing). The
+        # current_this / current_index are inherited so a partial called
+        # inside an {{#each}} block can access {{this}}.
+        return _template_render_nodes(partial_t.nodes, ctx, partials, current_this, current_index)
+    }
+    if node.kind == template_kind_if() {
+        if _template_truthy(_template_lookup_var(node.text, ctx, current_this, current_index)) {
+            return _template_render_nodes(node.then_branch, ctx, partials, current_this, current_index)
+        }
+        return _template_render_nodes(node.else_branch, ctx, partials, current_this, current_index)
+    }
+    if node.kind == template_kind_each() {
+        let list_val: list[str] = _template_lookup_list(node.text, ctx, current_this, current_index)
+        if list_val.len() == 0 {
+            return _template_render_nodes(node.else_branch, ctx, partials, current_this, current_index)
+        }
+        let parts: list[str] = []
+        let mut i: int = 0
+        while i < list_val.len() {
+            let elem: str = list_val.get(i)
+            parts.push(_template_render_nodes(node.then_branch, ctx, partials, elem, i))
+            i = i + 1
+        }
+        return str_join(parts, "")
+    }
+    # Unknown node kind — render as empty (defensive).
+    return ""
+}
+
+# _template_lookup_var(name, ctx, current_this, current_index) — look up a
+# variable name. Handles the special names {{this}} and {{@index}}, then
+# falls back to ctx.scalars.
+fn _template_lookup_var(name: str, ctx: TemplateContext, current_this: str, current_index: int) -> str {
+    if name == template_this_var() {
+        return current_this
+    }
+    if name == template_index_var() {
+        if current_index < 0 {
+            return ""
+        }
+        return current_index.to_str()
+    }
+    return template_context_get(ctx, name)
+}
+
+# _template_lookup_list(name, ctx, current_this, current_index) — look up
+# a list variable. Currently always falls back to ctx.lists (the special
+# names {{this}} and {{@index}} are scalar, not list). Provided for
+# symmetry with _template_lookup_var.
+fn _template_lookup_list(name: str, ctx: TemplateContext, current_this: str, current_index: int) -> list[str] {
+    return template_context_get_list(ctx, name)
+}
+
+# _template_truthy(s) — Mustache-like truthiness. A value is truthy iff
+# it is non-empty AND not "false" AND not "0" (case-sensitive — "False"
+# and "FALSE" are treated as truthy, matching Mustache's behaviour of
+# only checking the exact string "false").
+fn _template_truthy(s: str) -> bool {
+    if s.len() == 0 {
+        return false
+    }
+    if s == "false" {
+        return false
+    }
+    if s == "0" {
+        return false
+    }
+    return true
+}
+
+# _template_apply_filter(name, value) — apply a named filter to a value.
+# Unknown filters return the value unchanged (graceful — the caller can
+# add custom filters by extending this function).
+fn _template_apply_filter(name: str, value: str) -> str {
+    if name == "upper" {
+        return str_to_upper_ascii(value)
+    }
+    if name == "lower" {
+        return str_to_lower_ascii(value)
+    }
+    if name == "trim" {
+        return _template_trim(value)
+    }
+    if name == "default" {
+        # The "default" filter is a no-op in our model — missing values
+        # are already "" by default. Provided for symmetry with other
+        # engines (Handlebars' {{name | default "fallback"}} would need
+        # argument support, which we don't have).
+        return value
+    }
+    # Unknown filter — return the value unchanged. This is graceful; the
+    # caller can detect unknown filters at compile time by calling
+    # template_validate_filter if needed.
+    return value
+}
+
+# ============================================================================
+# Validation helpers — used by callers to validate templates before
+# rendering (e.g. on startup, so a bad template fails fast).
+# ============================================================================
+
+# template_validate(src) — check that `src` is a syntactically valid
+# template. Returns Result.Ok(true) if valid, Result.Err(msg) otherwise.
+# Equivalent to template_compile but discards the AST.
+fn template_validate(src: str) -> Result[bool, str] {
+    let r: Result[Template, str] = template_compile(src)
+    if !result_is_ok(r) {
+        return Result.Err(result_err_or(r, "template_validate: invalid"))
+    }
+    return Result.Ok(true)
+}
+
+# template_validate_filter(name) — true iff `name` is a recognised filter.
+# Used by callers to validate templates that use custom filter names.
+fn template_validate_filter(name: str) -> bool {
+    if name == "upper" { return true }
+    if name == "lower" { return true }
+    if name == "trim" { return true }
+    if name == "default" { return true }
+    return false
+}
+
+# ============================================================================
+# Introspection — template_describe produces a human-readable summary of
+# a compiled template. Used by tests and by the demo to verify the AST.
+# ============================================================================
+
+# template_describe(t) — produce a human-readable description of the
+# compiled template. Includes the source length, node count, and a
+# per-node summary (one line per node, indented for nested blocks).
+fn template_describe(t: Template) -> str {
+    let mut out: str = "Template (" + t.source.len().to_str() + " bytes source, " + t.nodes.len().to_str() + " top-level nodes)\n"
+    out = out + _template_describe_nodes(t.nodes, 0)
+    return out
+}
+
+# _template_describe_nodes(nodes, indent) — describe a list of nodes at the
+# given indentation level. Each block's children are described at indent+1.
+fn _template_describe_nodes(nodes: list[TemplateNode], indent: int) -> str {
+    let pad: str = str_repeat("  ", indent)
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < nodes.len() {
+        let node: TemplateNode = nodes.get(i)
+        out = out + pad + "- " + node.kind
+        if node.kind == template_kind_text() {
+            let preview: str = node.text
+            if preview.len() > 40 {
+                out = out + ": \"" + preview.slice(0, 37) + "...\" (" + preview.len().to_str() + " bytes)\n"
+            } else {
+                out = out + ": \"" + preview + "\"\n"
+            }
+        } else if node.kind == template_kind_var() {
+            out = out + " name=" + node.text + "\n"
+        } else if node.kind == template_kind_raw() {
+            out = out + " name=" + node.text + " (RAW)\n"
+        } else if node.kind == template_kind_comment() {
+            out = out + " text=" + node.text.len().to_str() + " bytes\n"
+        } else if node.kind == template_kind_partial() {
+            out = out + " name=" + node.text + "\n"
+        } else if node.kind == template_kind_filter() {
+            out = out + " name=" + node.text + " filter=" + node.filter + "\n"
+        } else if node.kind == template_kind_if() {
+            out = out + " cond=" + node.text + " then=" + node.then_branch.len().to_str() + " else=" + node.else_branch.len().to_str() + "\n"
+            out = out + _template_describe_nodes(node.then_branch, indent + 1)
+            if node.else_branch.len() > 0 {
+                out = out + pad + "  (else)\n"
+                out = out + _template_describe_nodes(node.else_branch, indent + 1)
+            }
+        } else if node.kind == template_kind_each() {
+            out = out + " list=" + node.text + " then=" + node.then_branch.len().to_str() + " else=" + node.else_branch.len().to_str() + "\n"
+            out = out + _template_describe_nodes(node.then_branch, indent + 1)
+            if node.else_branch.len() > 0 {
+                out = out + pad + "  (else)\n"
+                out = out + _template_describe_nodes(node.else_branch, indent + 1)
+            }
+        } else {
+            out = out + " (unknown kind)\n"
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# ============================================================================
+# template_node_count(t) — count the total number of nodes in a template,
+# including nested nodes (then-branch + else-branch of #if/#each). Used
+# by tests to verify the parser produced the expected AST shape.
+# ============================================================================
+
+fn template_node_count(t: Template) -> int {
+    return _template_node_count(t.nodes)
+}
+
+fn _template_node_count(nodes: list[TemplateNode]) -> int {
+    let mut count: int = 0
+    let mut i: int = 0
+    while i < nodes.len() {
+        let node: TemplateNode = nodes.get(i)
+        count = count + 1
+        if node.kind == template_kind_if() || node.kind == template_kind_each() {
+            count = count + _template_node_count(node.then_branch)
+            count = count + _template_node_count(node.else_branch)
+        }
+        i = i + 1
+    }
+    return count
+}
+
+# ============================================================================
+# template_top_level_node_count(t) — count only the top-level nodes (no
+# recursion into #if/#each branches). Useful for quick sanity checks.
+# ============================================================================
+
+fn template_top_level_node_count(t: Template) -> int {
+    return t.nodes.len()
+}

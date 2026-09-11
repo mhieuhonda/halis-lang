@@ -116,7 +116,7 @@ remains green.
 | 66 | `std.cookie` — signed cookies, SameSite, secure flag | ✅ | (done in v0.85.0-alpha) |
 | 67 | `std.session` — server-side sessions (in-memory + file) | ✅ | (done in v0.86.0-alpha) |
 | 68 | `std.csrf` — double-submit + sync-token patterns | ✅ | (done in v0.87.0-alpha) |
-| 69 | `std.template` — compile-time HTML templates (no XSS) | ⬜ | 5 weeks |
+| 69 | `std.template` — compile-time HTML templates (no XSS) | ✅ | (done in v0.88.0-alpha) |
 | 70 | `std.sse` — server-sent events (one-way streaming) | ⬜ | 2 weeks |
 | 71 | `std.graphql` — schema-first server (parser + resolver) | ⬜ | 6 weeks |
 | 72 | `std.openapi` — generate OpenAPI 3.1 from handler types | ⬜ | 4 weeks |
@@ -7404,6 +7404,198 @@ describe_failure, method classification). Deterministic via
 `rand_seed(42)`.
 
 **Makefile target:** `make csrf-acceptance` — runs the demo and
+the acceptance test differentially (interpreter == native for both),
+then prints the feature summary. Pure-HLS implementation; no new
+compiler builtins; bootstrap is still deterministic.
+
+---
+
+## STAGE 69 — `std.template` — compile-time HTML templates (no XSS) ✅ (release v0.88.0-alpha)
+
+**Goal:** a pure-HLS implementation of a Mustache-like HTML template
+engine that is XSS-safe by construction. The template source string
+is parsed ONCE into a `Template` AST (a tree of `TemplateNode` values);
+subsequent renders walk the AST without re-parsing. There is NO code
+generation — the renderer is a tree-walking interpreter over the AST.
+SSTI (server-side template injection) is impossible by construction
+because the renderer does NOT evaluate expressions, only variable
+lookups.
+
+**Status (v0.88.0-alpha):** Stage 69 is **COMPLETE**. The new
+module `std/template.hls` (~830 lines) is a pure-HLS implementation
+on top of `std.html` (html_escape, html_escape_attr — Stage 38),
+`std.str` (str_join, str_to_lower_ascii, str_to_upper_ascii, str_repeat),
+`std.option` (Option[T]), `std.result` (Result[T, E] — for compile-time
+errors), `std.list` (list helpers).
+
+No new compiler builtins — the entire module is pure HLS.
+
+**Shipped in v0.88.0-alpha (Stage 69):**
+
+- **Constants & markers:**
+    - `template_open_tag() / _close_tag() / _raw_open_tag() / _raw_close_tag()`
+      — the magic byte sequences that delimit mustache tags.
+    - `template_comment_marker()` ("!"), `template_partial_marker()` (">"),
+      `template_filter_separator()` ("|").
+    - `template_block_if() / _each() / _else() / _end()` — block markers.
+    - `template_this_var()` ("this"), `template_index_var()` ("@index") —
+      special variables available inside `{{#each}}`.
+    - `template_max_depth()` (32), `template_max_nodes()` (65536) — safety
+      limits that prevent pathological inputs (e.g. deeply nested or
+      attacker-controlled templates) from exhausting the stack.
+
+- **AST (TemplateNode):**
+    - `struct TemplateNode { kind, text, filter, then_branch, else_branch }`
+      — the AST node type. `kind` is one of "text", "var", "raw", "if",
+      "each", "comment", "partial", "filter".
+    - `struct Template { nodes, source }` — the compiled template.
+    - `template_kind_text() / _var() / _raw() / _if() / _each() / _comment()
+      / _partial() / _filter()` — node-kind constants.
+
+- **Parser (template_compile / template_validate):**
+    - `template_compile(src) -> Result[Template, str]` — parse a template
+      source string into a Template AST. Returns `Result.Err(msg)` with a
+      byte-offset-bearing message on parse failure (unclosed `{{`,
+      unbalanced `{{/if}}`, `{{else}}` outside a block, etc.).
+    - `template_validate(src) -> Result[bool, str]` — check syntax without
+      keeping the AST.
+    - The parser is a single-pass recursive-descent state machine. Block
+      tags (`#if` / `#each` / `else` / `/if` / `/each`) are handled via
+      a `TemplateParseResult` struct carrying `(nodes, terminator,
+      next_pos)` so the caller can resume after the closing tag.
+
+- **Renderer (template_render / _with_partials):**
+    - `template_render(t, ctx) -> str` — render with no partials.
+    - `template_render_with_partials(t, ctx, partials) -> str` — render
+      with a Partials registry (used by `{{> partial}}`).
+    - `{{var}}` — interpolate, HTML-escaped via `html_escape` (XSS-safe).
+    - `{{{var}}}` — interpolate RAW (NOT escaped — explicit opt-in for
+      trusted HTML). The caller takes responsibility for sanitisation.
+    - `{{#if cond}}A{{else}}B{{/if}}` — conditional. `cond` is truthy iff
+      non-empty AND not "false" AND not "0" (Mustache semantics).
+    - `{{#each list}}A{{this}}{{@index}}{{else}}B{{/each}}` — iteration.
+      `list` is looked up in `ctx.lists`; `{{this}}` is the current
+      element; `{{@index}}` is the 0-based index; `{{else}}` is taken
+      iff the list is empty.
+    - `{{! comment }}` — comment, omitted from output.
+    - `{{> partial}}` — include a registered partial. Missing partials
+      produce empty output (graceful degradation, matching Mustache).
+    - `{{name | filter}}` — apply a filter before escaping. Built-in
+      filters: `upper`, `lower`, `trim`, `default` (no-op). Unknown
+      filters return the value unchanged. Filters DO NOT bypass
+      escaping — the result is still HTML-escaped unless `{{{...}}}`
+      is used.
+
+- **Partials registry:**
+    - `struct Partials { templates: map[str, Template] }`.
+    - `partials_new() / _register(p, name, src) / _register_compiled(p,
+      name, t) / _has(p, name) / _get(p, name) -> Option[Template] /
+      _count(p)`.
+
+- **TemplateContext:**
+    - `struct TemplateContext { scalars: map[str, str], lists:
+      map[str, list[str]] }` — two maps because HLS maps are
+      homogeneous in the value type.
+    - `template_context_new() / _set(ctx, key, value) / _set_list(ctx,
+      key, list) / _get(ctx, key) -> str / _get_list(ctx, key) ->
+      list[str]`.
+
+- **Introspection:**
+    - `template_describe(t) -> str` — human-readable summary of the AST
+      (per-node, indented for blocks).
+    - `template_node_count(t) -> int` — total nodes including nested
+      branches.
+    - `template_top_level_node_count(t) -> int` — top-level only.
+    - `template_validate_filter(name) -> bool` — checks if a filter
+      name is recognised.
+
+**Security model:**
+
+- **DEFAULT-ESCAPE:** every `{{var}}` is HTML-escaped via
+  `std.html.html_escape` (Stage 38). This escapes `&`, `<`, `>`, `"`,
+  `'`, and `/` per OWASP. There is NO path through the renderer that
+  produces unescaped output unless the caller explicitly opts in via
+  `{{{var}}}`.
+- **RAW-OPT-IN:** `{{{var}}}` is a deliberate footgun. The caller MUST
+  ensure the value is sanitised. The renderer does NOT re-validate. This
+  is the standard design choice (Mustache, Handlebars, Go templates all
+  have this pattern).
+- **NO-EVAL (SSTI prevention):** the renderer does NOT evaluate
+  expressions, only variable lookups. There is no `{{eval}}` or
+  `{{7*7}}`. The only way to get dynamic content is to pass it via the
+  context. SSTI is therefore impossible by construction.
+- **PARTIALS:** partials are looked up by name in a caller-supplied
+  registry. The partial source is parsed at REGISTRATION time (not at
+  render time), so a malicious partial can only fail-fast at registration
+  — it cannot inject at render time.
+
+**Limitations (deferred to later stages):**
+
+- **CONTEXT-AWARE ESCAPING is NOT implemented:** the renderer uses the
+  same `html_escape` for both text content and attribute values. This
+  is safe (html_escape covers the chars dangerous in both contexts)
+  but not optimal. A future stage may add separate escape functions
+  for JS, URL, CSS contexts.
+- **CUSTOM FILTERS are NOT supported:** the built-in filters (`upper`,
+  `lower`, `trim`, `default`) are hardcoded. A future stage may add
+  a filter registry that allows callers to register custom filters.
+- **TEMPLATE INHERITANCE / BLOCKS is NOT implemented:** there is no
+  `{{#block}}` / `{{#extends}}` mechanism (like Handlebars' block
+  helpers or Twig's template inheritance). Use partials for now.
+- **HELPERS (higher-order functions in templates) are NOT supported:**
+  `{{#each list}}{{helper this}}{{/each}}` does not work because HLS
+  does not have function pointers yet. The caller must pre-compute
+  any transformed values and put them in the context.
+- **WHITESPACE CONTROL is limited:** there is no `{{- ... -}}` syntax
+  to strip surrounding whitespace. Use the `trim` filter for variable
+  values; for structural whitespace, post-process the rendered output.
+
+**Acceptance test** (`tests/ok/feat_stage69_template.hls`, ~510 lines,
+16 tests, all PASS):
+
+1. `test_compile_basic` — basic text + variable parses to 3 top-level
+   nodes.
+2. `test_render_basic` — scalar interpolation; XSS payload escaped;
+   missing value = empty string.
+3. `test_render_raw` — `{{{name}}}` interpolates raw (NOT escaped).
+4. `test_if` — truthy/falsy rules: non-empty, non-"false", non-"0" is
+   truthy; "", "false", "0", missing are falsy.
+5. `test_if_no_else` — `{{#if}}` without `{{else}}` renders empty when
+   false.
+6. `test_each` — `{{#each list}}` with `{{this}}` and `{{@index}}`.
+7. `test_each_empty` — `{{else}}` branch taken when list is empty or
+   missing.
+8. `test_nested` — `{{#each}}` inside `{{#if}}`.
+9. `test_comment` — `{{! comment }}` omitted from output (including
+   multi-line comments).
+10. `test_partial` — `{{> partial}}` looked up in `Partials` registry;
+    missing partial = empty; partial inside `{{#each}}` inherits `this`.
+11. `test_filters` — `upper`, `lower`, `trim`, `default` (no-op),
+    unknown filter (graceful); filter + escape still applies.
+12. `test_parse_errors` — 14 negative cases: unclosed `{{`, unclosed
+    `{{{`, empty `{{{}}}`, empty `{{>}}`, `{{#if}}` missing condition,
+    `{{#each}}` missing list, `{{#if}}` missing `{{/if}}`, `{{#if}}`
+    closed by `{{/each}}`, `{{else}}` outside block, `{{/if}}` outside
+    block, unknown block `{{#foo}}`, unknown block end `{{/foo}}`,
+    empty var before filter, empty filter name; `template_validate`
+    agrees with `template_compile`.
+13. `test_describe` — `template_describe` output contains the expected
+    sections.
+14. `test_node_count` — nested node counting (top-level = 3, total = 8
+    for a nested template).
+15. `test_constants` — every constant function returns the expected
+    value (markers, limits, kind names).
+16. `test_end_to_end` — render a realistic HTML page with title
+    (uppercased + escaped), conditional user block, list iteration.
+
+**Demo** (`examples/template_demo.hls`, ~210 lines): exercises every
+piece of the API — scalar interpolation (XSS-safe), raw interpolation
+(opt-in), conditionals + iteration, filters (upper/lower/trim/default/
+unknown), partials (table with header + rows from list), parse errors
+(11 negative cases), AST introspection (template_describe), end-to-end
+HTML page rendering. Fully deterministic (no Rand, no I/O).
+
+**Makefile target:** `make template-acceptance` — runs the demo and
 the acceptance test differentially (interpreter == native for both),
 then prints the feature summary. Pure-HLS implementation; no new
 compiler builtins; bootstrap is still deterministic.

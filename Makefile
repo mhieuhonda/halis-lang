@@ -31,7 +31,7 @@ else
   HL_CURL_DEFS :=
 endif
 
-.PHONY: all stage0 bootstrap test examples clean run check bench install uninstall audit opt-stats emit-ir emit-llvm fmt lint lsp-check pkg-init pkg-add pkg-lock pkg-audit pkg-verify pkg-build pkg-publish pkg-log pkg-log-verify prove prove-full model prove-acceptance hltest fuzz cov fuzz-acceptance wasm-opt webapp webapp-acceptance serve aarch64-bench aarch64-acceptance aarch64-list-targets stack-acceptance inline-acceptance opt-stats-report kernel-attrs escape-acceptance layout-report tail-acceptance tail-report asm-acceptance asm-attrs bench-stdlib spec-check stage32-acceptance async-acceptance stream-acceptance io-acceptance fs-acceptance net-acceptance http-acceptance http2-acceptance json-stream-acceptance regex-acceptance fmt-acceptance hash-acceptance collections-acceptance sync-acceptance thread-acceptance time-acceptance math-acceptance process-acceptance env-acceptance archive-acceptance uuid-ulid-acceptance cli-acceptance tui-acceptance color-acceptance progress-acceptance log-acceptance http-server-acceptance websocket-acceptance cookie-acceptance session-acceptance csrf-acceptance
+.PHONY: all stage0 bootstrap test examples clean run check bench install uninstall audit opt-stats emit-ir emit-llvm fmt lint lsp-check pkg-init pkg-add pkg-lock pkg-audit pkg-verify pkg-build pkg-publish pkg-log pkg-log-verify prove prove-full model prove-acceptance hltest fuzz cov fuzz-acceptance wasm-opt webapp webapp-acceptance serve aarch64-bench aarch64-acceptance aarch64-list-targets stack-acceptance inline-acceptance opt-stats-report kernel-attrs escape-acceptance layout-report tail-acceptance tail-report asm-acceptance asm-attrs bench-stdlib spec-check stage32-acceptance async-acceptance stream-acceptance io-acceptance fs-acceptance net-acceptance http-acceptance http2-acceptance json-stream-acceptance regex-acceptance fmt-acceptance hash-acceptance collections-acceptance sync-acceptance thread-acceptance time-acceptance math-acceptance process-acceptance env-acceptance archive-acceptance uuid-ulid-acceptance cli-acceptance tui-acceptance color-acceptance progress-acceptance log-acceptance http-server-acceptance websocket-acceptance cookie-acceptance session-acceptance csrf-acceptance template-acceptance
 
 # Main goal: use the full bootstrap chain to build the native compiler
 all: bootstrap
@@ -2943,3 +2943,66 @@ csrf-acceptance: bin/hlc
 	@echo "  differential (interpreter == native) verified green."
 
 .PHONY: csrf-acceptance
+
+# ============================================================================
+# Stage 69 (v0.88.0-alpha): std.template -- compile-time HTML templates
+# (XSS-safe by construction). Pure-HLS module on top of std.html
+# (html_escape — Stage 38), std.str, std.option, std.result, std.list.
+# A Mustache-like template engine: {{var}} (HTML-escaped by default),
+# {{{var}}} (raw, explicit opt-in for trusted HTML), {{#if}}/{{else}}/{{/if}},
+# {{#each}}/{{this}}/{{@index}}/{{else}}/{{/each}}, {{! comment }},
+# {{> partial}} (registered partials), {{name | filter}} (upper/lower/trim/
+# default). The template source is parsed ONCE into a Template AST (a
+# tree of TemplateNode values); subsequent renders walk the AST without
+# re-parsing. NO code generation; the renderer is a tree-walking
+# interpreter. SSTI is impossible by construction (no eval; only variable
+# lookups).
+# ============================================================================
+
+# Stage 69 differential note: all pieces of std.template are pure functions
+# of immutable inputs. The interpreter and the native binary produce byte-
+# identical output on both the demo and the acceptance test.
+
+template-acceptance: bin/hlc
+	@$(PYTHON) boot/boot.py examples/template_demo.hls > /tmp/tmpl_demo_interp.txt 2>&1
+	@bin/hlc examples/template_demo.hls /tmp/tmpl_demo.c 2>/dev/null
+	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/tmpl_demo /tmp/tmpl_demo.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
+	@/tmp/tmpl_demo > /tmp/tmpl_demo_nat.txt 2>&1
+	@diff -q /tmp/tmpl_demo_interp.txt /tmp/tmpl_demo_nat.txt >/dev/null 2>&1 \
+		|| (echo "FAIL: template_demo differential mismatch" && false)
+	@$(PYTHON) boot/boot.py tests/ok/feat_stage69_template.hls > /tmp/s69_interp.txt 2>&1
+	@bin/hlc tests/ok/feat_stage69_template.hls /tmp/s69.c 2>/dev/null
+	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/s69 /tmp/s69.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
+	@/tmp/s69 > /tmp/s69_nat.txt 2>&1
+	@diff -q /tmp/s69_interp.txt /tmp/s69_nat.txt >/dev/null 2>&1 \
+		|| (echo "FAIL: feat_stage69_template differential mismatch" && false)
+	@rm -f /tmp/tmpl_demo /tmp/tmpl_demo.c /tmp/tmpl_demo_interp.txt /tmp/tmpl_demo_nat.txt \
+		/tmp/s69 /tmp/s69.c /tmp/s69_interp.txt /tmp/s69_nat.txt
+	@echo ""
+	@echo "ACCEPTANCE OK: Stage 69 -- std.template (compile-time HTML templates)"
+	@echo "  Parser (template_compile / template_validate):"
+	@echo "    {{var}}       -- variable, HTML-escaped by default"
+	@echo "    {{{var}}}     -- raw interpolation, NOT escaped (opt-in)"
+	@echo "    {{#if c}}A{{else}}B{{/if}} -- conditional (truthy: non-empty non-false non-0)"
+	@echo "    {{#each l}}A{{this}}{{@index}}{{else}}B{{/each}} -- iteration"
+	@echo "    {{! comment }}   -- omitted from output"
+	@echo "    {{> partial}}    -- include registered partial"
+	@echo "    {{name | filter}} -- upper / lower / trim / default / unknown"
+	@echo "  Renderer:"
+	@echo "    template_render (no partials) / template_render_with_partials"
+	@echo "    XSS-safe by construction (every {{var}} escaped via std.html.html_escape)"
+	@echo "    SSTI impossible (no eval; only variable lookups)"
+	@echo "  AST introspection:"
+	@echo "    template_describe (per-node summary, indented for blocks)"
+	@echo "    template_node_count / template_top_level_node_count"
+	@echo "  Partials registry:"
+	@echo "    Partials + partials_new / _register / _register_compiled"
+	@echo "    partials_has / _get / _count"
+	@echo "  TemplateContext:"
+	@echo "    template_context_new / _set / _set_list / _get / _get_list"
+	@echo "  Security model: DEFAULT-ESCAPE + RAW-OPT-IN + NO-EVAL are"
+	@echo "    COMPLEMENTARY defenses (XSS / injection / SSTI)"
+	@echo "  Pure-HLS implementation (no new compiler builtins)"
+	@echo "  differential (interpreter == native) verified green."
+
+.PHONY: template-acceptance

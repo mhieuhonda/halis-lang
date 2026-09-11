@@ -1,0 +1,290 @@
+# ============================================================================
+# examples/template_demo.hls — Stage 69 (v0.88.0-alpha): std.template
+# ----------------------------------------------------------------------------
+# Demonstrates every piece of the template API:
+#   * template_compile / template_validate (parse template source)
+#   * template_render (scalar interpolation; HTML-escaped by default)
+#   * template_render_with_partials (with a Partials registry)
+#   * {{{raw}}} interpolation (explicit opt-in for trusted HTML)
+#   * {{#if cond}} / {{else}} / {{/if}} (truthiness rules)
+#   * {{#each list}} / {{this}} / {{@index}} / {{else}} / {{/each}}
+#   * {{! comment }} (omitted from output)
+#   * {{> partial}} (include a registered partial)
+#   * {{name | filter}} (upper / lower / trim / default / unknown)
+#   * template_describe (AST introspection)
+#   * template_node_count / template_top_level_node_count
+#   * Partials registry: partials_new / partials_register / partials_count
+#   * TemplateContext: template_context_new / _set / _set_list / _get
+#
+# The output is fully deterministic (no Rand, no I/O) so the
+# differential test (interpreter == native) produces byte-identical output.
+# ============================================================================
+
+import "std.template"
+import "std.html"
+import "std.str"
+import "std.option"
+import "std.result"
+import "std.list"
+
+# ============================================================================
+# Section 1: scalar interpolation + XSS-safe escaping
+# ============================================================================
+
+fn demo_scalar() -> void uses IO {
+    println("--- Scalar interpolation (XSS-safe) ---")
+    let t: Template = result_unwrap(template_compile("Hello, {{name}}!"))
+    let ctx: TemplateContext = template_context_new()
+    template_context_set(ctx, "name", "world")
+    println("  render:                       " + template_render(t, ctx))
+
+    # XSS — the value is HTML-escaped by default.
+    let ctx2: TemplateContext = template_context_new()
+    template_context_set(ctx2, "name", "<script>alert('xss')</script>")
+    println("  render with XSS payload:      " + template_render(t, ctx2))
+
+    # Missing value -> empty string.
+    let ctx3: TemplateContext = template_context_new()
+    println("  render with missing value:    " + template_render(t, ctx3))
+
+    # Raw interpolation — explicit opt-in for trusted HTML.
+    let tr: Template = result_unwrap(template_compile("Hello, {{{name}}}!"))
+    let ctx4: TemplateContext = template_context_new()
+    template_context_set(ctx4, "name", "<b>world</b>")
+    println("  raw {{{name}}} (NOT escaped): " + template_render(tr, ctx4))
+    println("")
+    return
+}
+
+# ============================================================================
+# Section 2: conditionals + iteration
+# ============================================================================
+
+fn demo_control_flow() -> void uses IO {
+    println("--- Conditionals + iteration ---")
+    let src: str = "{{#if logged_in}}Welcome back, {{user}}!{{#if admin}} (admin){{/if}}{{else}}Please log in.{{/if}}"
+    let t: Template = result_unwrap(template_compile(src))
+
+    # logged-in admin
+    let ctx1: TemplateContext = template_context_new()
+    template_context_set(ctx1, "logged_in", "true")
+    template_context_set(ctx1, "user", "alice")
+    template_context_set(ctx1, "admin", "1")
+    println("  admin:    " + template_render(t, ctx1))
+
+    # logged-in non-admin
+    let ctx2: TemplateContext = template_context_new()
+    template_context_set(ctx2, "logged_in", "true")
+    template_context_set(ctx2, "user", "bob")
+    template_context_set(ctx2, "admin", "")
+    println("  user:     " + template_render(t, ctx2))
+
+    # not logged in
+    let ctx3: TemplateContext = template_context_new()
+    template_context_set(ctx3, "logged_in", "")
+    println("  guest:    " + template_render(t, ctx3))
+
+    # iteration
+    let each_src: str = "items: {{#each items}}[{{@index}}={{this}}]{{else}}(empty){{/each}}"
+    let te: Template = result_unwrap(template_compile(each_src))
+
+    let ctx4: TemplateContext = template_context_new()
+    template_context_set_list(ctx4, "items", ["apple", "banana", "cherry"])
+    println("  list:     " + template_render(te, ctx4))
+
+    let ctx5: TemplateContext = template_context_new()
+    template_context_set_list(ctx5, "items", [])
+    println("  empty:    " + template_render(te, ctx5))
+    println("")
+    return
+}
+
+# ============================================================================
+# Section 3: filters
+# ============================================================================
+
+fn demo_filters() -> void uses IO {
+    println("--- Filters ---")
+    let cases: list[str] = [
+        "{{name | upper}}",
+        "{{name | lower}}",
+        "{{name | trim}}",
+        "{{name | default}}",
+        "{{name | bogus}}"
+    ]
+    let ctx: TemplateContext = template_context_new()
+    template_context_set(ctx, "name", "  Hello World  ")
+    let mut i: int = 0
+    while i < cases.len() {
+        let t: Template = result_unwrap(template_compile(cases.get(i)))
+        println("  " + cases.get(i) + " -> '" + template_render(t, ctx) + "'")
+        i = i + 1
+    }
+    # Filter + escaping still applies
+    let t_esc: Template = result_unwrap(template_compile("{{name | upper}}"))
+    let ctx2: TemplateContext = template_context_new()
+    template_context_set(ctx2, "name", "<hi>")
+    println("  {{<hi> | upper}} -> '" + template_render(t_esc, ctx2) + "'  (escaped + uppercased)")
+    println("")
+    return
+}
+
+# ============================================================================
+# Section 4: partials
+# ============================================================================
+
+fn demo_partials() -> void uses IO {
+    println("--- Partials ---")
+    let partials: Partials = partials_new()
+    let reg1: Result[bool, str] = partials_register(partials, "row", "<tr><td>{{@index}}</td><td>{{this}}</td></tr>")
+    ok_reg(reg1, "register row")
+    let reg2: Result[bool, str] = partials_register(partials, "header", "<th>#</th><th>Name</th>")
+    ok_reg(reg2, "register header")
+    println("  registered " + partials_count(partials).to_str() + " partials")
+
+    let table_src: str = "<table>\n<thead><tr>{{> header}}</tr></thead>\n<tbody>\n{{#each users}}{{> row}}\n{{/each}}</tbody>\n</table>"
+    let t: Template = result_unwrap(template_compile(table_src))
+    let ctx: TemplateContext = template_context_new()
+    template_context_set_list(ctx, "users", ["alice", "bob", "carol"])
+    println("  table render:")
+    let lines: list[str] = template_render_with_partials(t, ctx, partials).split("\n")
+    let mut i: int = 0
+    while i < lines.len() {
+        println("    " + lines.get(i))
+        i = i + 1
+    }
+    println("")
+    return
+}
+
+# Helper for partials_register result.
+fn ok_reg(r: Result[bool, str], name: str) -> void uses IO {
+    if !result_is_ok(r) {
+        panic("FAIL partials_register " + name + ": " + result_err_or(r, "?"))
+    }
+}
+
+# ============================================================================
+# Section 5: parse errors — show that bad templates are rejected
+# ============================================================================
+
+fn demo_parse_errors() -> void uses IO {
+    println("--- Parse errors ---")
+    let bad: list[str] = [
+        "unclosed {{ tag:           hello {{ world",
+        "unclosed {{{ tag:          hello {{{ world",
+        "empty {{{}}}:              {{{}}}",
+        "empty partial name:        {{>}}",
+        "#if missing condition:     {{#if}}A{{/if}}",
+        "#each missing list name:   {{#each}}A{{/each}}",
+        "#if missing /if:           {{#if c}}A",
+        "#if closed by /each:       {{#if c}}A{{/each}}",
+        "else outside block:        A{{else}}B",
+        "/if outside block:         A{{/if}}",
+        "unknown block #foo:        {{#foo x}}A{{/foo}}"
+    ]
+    let mut i: int = 0
+    while i < bad.len() {
+        let line: str = bad.get(i)
+        # Split on the first "  :" boundary to get label vs source.
+        let colon_at: int = line.find(":")
+        let label: str = line.slice(0, colon_at + 1)
+        let src: str = _trim_after_colon(line, colon_at)
+        let r: Result[Template, str] = template_compile(src)
+        if result_is_err(r) {
+            println("  " + label + " REJECTED (ok)")
+        } else {
+            println("  " + label + " ACCEPTED (BUG)")
+        }
+        i = i + 1
+    }
+    println("")
+    return
+}
+
+# _trim_after_colon(line, colon_at) — extract the source string after the
+# label. The label ends with ":" possibly followed by spaces; we strip them.
+fn _trim_after_colon(line: str, colon_at: int) -> str {
+    let n: int = line.len()
+    let mut i: int = colon_at + 1
+    while i < n {
+        let b: int = line.byte_at(i)
+        if b != 32 && b != 9 {
+            break
+        }
+        i = i + 1
+    }
+    return line.slice(i, n)
+}
+
+# ============================================================================
+# Section 6: AST introspection — template_describe
+# ============================================================================
+
+fn demo_describe() -> void uses IO {
+    println("--- AST introspection (template_describe) ---")
+    let src: str = "<ul>\n{{#each items}}\n  <li>{{@index}}: {{this}}</li>\n{{/each}}\n</ul>"
+    let t: Template = result_unwrap(template_compile(src))
+    println("  source: " + src.len().to_str() + " bytes")
+    println("  top-level nodes: " + template_top_level_node_count(t).to_str())
+    println("  total nodes:     " + template_node_count(t).to_str())
+    println("")
+    println("  AST:")
+    let desc_lines: list[str] = template_describe(t).split("\n")
+    let mut i: int = 0
+    while i < desc_lines.len() {
+        if desc_lines.get(i).len() > 0 {
+            println("    " + desc_lines.get(i))
+        }
+        i = i + 1
+    }
+    println("")
+    return
+}
+
+# ============================================================================
+# Section 7: end-to-end — render a realistic HTML page
+# ============================================================================
+
+fn demo_end_to_end() -> void uses IO {
+    println("--- End-to-end: HTML page ---")
+    let src: str = "<!DOCTYPE html>\n<html>\n<head><title>{{title}}</title></head>\n<body>\n<h1>{{title}}</h1>\n{{#if user}}\n<p>Welcome, <b>{{user}}</b>! (role: {{role}})</p>\n<ul>\n{{#each perms}}<li>{{@index}}: {{this}}</li>\n{{/each}}\n</ul>\n{{else}}\n<p><a href=\"/login\">Login</a></p>\n{{/if}}\n<footer>Generated by Halis std.template</footer>\n</body>\n</html>"
+    let t: Template = result_unwrap(template_compile(src))
+
+    let ctx: TemplateContext = template_context_new()
+    template_context_set(ctx, "title", "Dashboard <v2>")
+    template_context_set(ctx, "user", "<alice>")
+    template_context_set(ctx, "role", "admin")
+    template_context_set_list(ctx, "perms", ["read", "write", "delete"])
+    let out: str = template_render(t, ctx)
+    let lines: list[str] = out.split("\n")
+    let mut i: int = 0
+    while i < lines.len() {
+        println("  " + lines.get(i))
+        i = i + 1
+    }
+    println("")
+    return
+}
+
+# ============================================================================
+# Dispatcher
+# ============================================================================
+
+fn main() -> int uses IO {
+    println("============================================")
+    println("Stage 69 (v0.88.0-alpha): std.template demo")
+    println("============================================")
+    println("")
+    demo_scalar()
+    demo_control_flow()
+    demo_filters()
+    demo_partials()
+    demo_parse_errors()
+    demo_describe()
+    demo_end_to_end()
+    println("============================================")
+    println("Stage 69 demo: all sections complete.")
+    println("============================================")
+    return 0
+}
