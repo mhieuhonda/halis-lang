@@ -1612,7 +1612,6 @@ class WasmEmitter:
         out.append(OP_LOOP); out.append(BLOCK_VOID)
         self._frames += 2
         block_frame = self._frames - 2
-        loop_frame = self._frames - 1
         out.append(OP_LOCAL_GET); out += uleb(var_idx)
         out.append(OP_LOCAL_GET); out += uleb(end_idx)
         out.append(OP_I64_GE_S)
