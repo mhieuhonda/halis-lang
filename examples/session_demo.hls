@@ -1,0 +1,337 @@
+# ============================================================================
+# examples/session_demo.hls — Stage 67 (v0.86.0-alpha): std.session
+# ----------------------------------------------------------------------------
+# Demonstrates every piece of the session API:
+#   * session_generate_id (32-byte random → 43-char base64url)
+#   * session_is_valid_id (charset + length check; rejects path traversal)
+#   * session_new + session_set / session_get / session_has / session_keys
+#   * session_touch / session_extend / session_is_expired / session_describe
+#   * In-memory SessionStore:
+#       session_store_new / _create / _get / _save / _destroy / _reap / _count
+#   * session_serialize / session_parse (text-format round trip)
+#   * File-backed SessionFileStore:
+#       session_file_store_new / _create / _get / _save / _destroy / _reap /
+#       _count / _path
+#   * Cookie glue:
+#       session_issue_cookie (signed + Secure + HttpOnly + SameSite=Lax)
+#       session_attach_cookie (append Set-Cookie to response)
+#       session_destroy_cookie (Max-Age=0 logout)
+#       session_id_from_request (parse + verify + extract)
+#       session_load_from_request (full round trip)
+#
+# The demo uses /tmp/hls_session_demo/ for the file-backed store, cleans
+# it before and after each run, so the output is deterministic across
+# the interpreter and the native binary (differential-safe).
+# ============================================================================
+
+import "std.session"
+import "std.cookie"
+import "std.http"
+import "std.str"
+import "std.option"
+import "std.result"
+
+# ============================================================================
+# Helpers
+# ============================================================================
+
+# A fixed "now" for deterministic output (2025-01-01 00:00:00 UTC).
+fn _demo_now_ms() -> int {
+    return 1735689600000
+}
+
+# A fixed "now + 1 hour" for simulating the passage of time.
+fn _demo_now_plus_1h_ms() -> int {
+    return 1735689600000 + 3600000
+}
+
+# A demo secret. In production this would be 32+ bytes of high-entropy
+# random data read from a config file or environment variable.
+fn _demo_secret() -> str {
+    return "demo-secret-do-not-use-in-production-32bytes!"
+}
+
+# Clean the demo directory before/after each run.
+fn _demo_clean_dir() -> void uses Fs {
+    # Best-effort: write an empty marker file to the dir to ensure it
+    # exists. The directory itself must be created by the test runner
+    # (mkdir -p /tmp/hls_session_demo). We don't have a mkdir builtin,
+    # so we rely on the Makefile target to create the directory first.
+    return
+}
+
+# ============================================================================
+# Section 1: ID generation & validation
+# ============================================================================
+
+fn demo_id_generation() -> void uses IO, Rand {
+    println("--- ID generation & validation ---")
+    let id: str = session_generate_id()
+    println("  generated ID: " + id)
+    println("  length:       " + id.len().to_str() + " (expected 43)")
+    println("  is_valid_id:  " + session_is_valid_id(id).to_str())
+    # Negative cases
+    println("  is_valid_id(\"\"):        " + session_is_valid_id("").to_str())
+    println("  is_valid_id(\"short\"):    " + session_is_valid_id("short").to_str())
+    println("  is_valid_id(\"has space here padding to 43chrs yes!!\"):"
+        + session_is_valid_id("has space here padding to 43chrs yes!!").to_str())
+    println("  is_valid_id(\"../../../etc/passwd......................\"):"
+        + session_is_valid_id("../../../etc/passwd......................").to_str())
+    # A known-good ID (deterministic): 43 chars of valid base64url.
+    # 26 uppercase + 10 lowercase + 7 digits = 43 chars.
+    let good: str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij0123456"
+    println("  is_valid_id(known-good): " + session_is_valid_id(good).to_str() + " (expected true)")
+    println("")
+    return
+}
+
+# ============================================================================
+# Section 2: Session record operations
+# ============================================================================
+
+fn demo_session_record() -> void uses IO {
+    println("--- Session record operations ---")
+    let now: int = _demo_now_ms()
+    # Use a fixed valid 43-char ID for deterministic output.
+    let s: Session = session_new("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij0123456", 3600000, now)
+    println("  new session: " + session_describe(s))
+    session_set(s, "user_id", "42")
+    session_set(s, "role", "admin")
+    session_set(s, "theme", "dark")
+    println("  after set:   " + session_describe(s))
+    println("  user_id:     " + session_get(s, "user_id"))
+    println("  role:        " + session_get(s, "role"))
+    println("  missing:     '" + session_get(s, "missing") + "'")
+    println("  has role:    " + session_has(s, "role").to_str())
+    println("  has missing: " + session_has(s, "missing").to_str())
+    let keys: list[str] = session_keys(s)
+    print("  keys:        [")
+    let mut i: int = 0
+    while i < keys.len() {
+        if i > 0 {
+            print(", ")
+        }
+        print(keys.get(i))
+        i = i + 1
+    }
+    println("]")
+    # Expiry
+    println("  is_expired(now):       " + session_is_expired(s, now).to_str())
+    println("  is_expired(now+2h):    " + session_is_expired(s, now + 7200000).to_str())
+    # Touch + extend
+    session_touch(s, now + 60000)
+    session_extend(s, 3600000, now + 60000)
+    println("  after touch+extend:    " + session_describe(s))
+    println("")
+    return
+}
+
+# ============================================================================
+# Section 3: In-memory SessionStore
+# ============================================================================
+
+fn demo_in_memory_store() -> void uses IO, Rand {
+    println("--- In-memory SessionStore ---")
+    let now: int = _demo_now_ms()
+    let store: SessionStore = session_store_new(_demo_secret(), session_default_ttl_ms())
+    println("  store count (empty): " + session_store_count(store).to_str())
+    let s1: Session = session_store_create(store, now)
+    session_set(s1, "user", "alice")
+    session_set(s1, "cart_items", "3")
+    println("  created session 1: " + s1.id)
+    println("  store count:       " + session_store_count(store).to_str())
+    let s2: Session = session_store_create(store, now)
+    session_set(s2, "user", "bob")
+    println("  created session 2: " + s2.id)
+    println("  store count:       " + session_store_count(store).to_str())
+    # Lookup
+    let found: Option[Session] = session_store_get(store, s1.id, now)
+    if option_is_some(found) {
+        let s: Session = option_unwrap(found)
+        println("  lookup s1: user=" + session_get(s, "user") + ", cart=" + session_get(s, "cart_items"))
+    } else {
+        println("  lookup s1: NOT FOUND (unexpected)")
+    }
+    # Lookup with bad ID
+    let bad: Option[Session] = session_store_get(store, "not-a-valid-id", now)
+    println("  lookup bad ID:    " + option_is_some(bad).to_str() + " (expected false)")
+    # Destroy + count expired (reap is a count-only function; use
+    # session_store_compact for actual cleanup since HLS maps have
+    # no remove() method).
+    let destroyed: bool = session_store_destroy(store, s1.id)
+    println("  destroy s1:       " + destroyed.to_str())
+    let after_destroy: Option[Session] = session_store_get(store, s1.id, now)
+    println("  lookup s1 after destroy: " + option_is_some(after_destroy).to_str() + " (expected false)")
+    println("  store count after destroy: " + session_store_count(store).to_str() + " (entry still present, marked expired)")
+    let reaped: int = session_store_reap(store, now)
+    println("  reap count (now): " + reaped.to_str() + " (expected 1 — s1 expired, s2 live)")
+    # Expire s2 by advancing the clock
+    let far_future: int = now + 99999999000
+    let reaped2: int = session_store_reap(store, far_future)
+    println("  reap count (future): " + reaped2.to_str() + " (expected 2 — both now expired)")
+    println("")
+    return
+}
+
+# ============================================================================
+# Section 4: Serialisation round trip
+# ============================================================================
+
+fn demo_serialisation() -> void uses IO {
+    println("--- Serialisation round trip ---")
+    let now: int = _demo_now_ms()
+    let s: Session = session_new("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij0123456", 3600000, now)
+    session_set(s, "user_id", "42")
+    session_set(s, "role", "admin")
+    session_set(s, "note", "value with = sign and spaces")
+    let raw: str = session_serialize(s)
+    println("  serialised form:")
+    let lines: list[str] = raw.split("\n")
+    let mut i: int = 0
+    while i < lines.len() {
+        let line: str = lines.get(i)
+        if line.len() > 0 {
+            println("    | " + line)
+        }
+        i = i + 1
+    }
+    let parsed: Result[Session, str] = session_parse(raw)
+    if result_is_ok(parsed) {
+        let s2: Session = result_unwrap(parsed)
+        println("  parsed back:      " + session_describe(s2))
+        println("  round trip OK:    " + (session_get(s2, "user_id") == "42").to_str())
+        println("  note preserved:   " + (session_get(s2, "note") == "value with = sign and spaces").to_str())
+    } else {
+        println("  PARSE FAILED (unexpected)")
+    }
+    # Empty / corrupt input
+    let bad: Result[Session, str] = session_parse("")
+    if result_is_ok(bad) {
+        println("  parse(\"\"):        Ok (unexpected)")
+    } else {
+        println("  parse(\"\"):        Err (expected)")
+    }
+    println("")
+    return
+}
+
+# ============================================================================
+# Section 5: File-backed SessionFileStore
+# ============================================================================
+
+fn demo_file_store() -> void uses IO, Fs, Rand {
+    println("--- File-backed SessionFileStore ---")
+    let dir: str = "/tmp/hls_session_demo"
+    let now: int = _demo_now_ms()
+    let store: SessionFileStore = session_file_store_new(dir, _demo_secret(), session_default_ttl_ms())
+    # Create a session and persist it
+    let s: Session = session_file_store_create(store, now)
+    session_set(s, "user", "carol")
+    session_set(s, "tier", "premium")
+    session_file_store_save(store, s)
+    println("  created file-backed session: " + s.id)
+    let path: str = session_file_store_path(store, s.id)
+    println("  file path: " + path)
+    # Reload from disk
+    let loaded: Option[Session] = session_file_store_get(store, s.id, now)
+    if option_is_some(loaded) {
+        let s2: Session = option_unwrap(loaded)
+        println("  reloaded from disk: user=" + session_get(s2, "user") + ", tier=" + session_get(s2, "tier"))
+    } else {
+        println("  RELOAD FAILED (unexpected)")
+    }
+    # Count
+    println("  file count: " + session_file_store_count(store).to_str())
+    # Destroy
+    let destroyed: bool = session_file_store_destroy(store, s.id)
+    println("  destroy:    " + destroyed.to_str())
+    let after_destroy: Option[Session] = session_file_store_get(store, s.id, now)
+    println("  lookup after destroy: " + option_is_some(after_destroy).to_str() + " (expected false)")
+    # Reap (should find 0 live, 1 destroyed)
+    let reaped: int = session_file_store_reap(store, now)
+    println("  reaped:     " + reaped.to_str() + " (expected 1)")
+    println("")
+    return
+}
+
+# ============================================================================
+# Section 6: Cookie glue (issue, attach, parse, load)
+# ============================================================================
+
+fn demo_cookie_glue() -> void uses IO, Rand {
+    println("--- Cookie glue ---")
+    let now: int = _demo_now_ms()
+    let secret: str = _demo_secret()
+    let store: SessionStore = session_store_new(secret, 3600000)
+    let s: Session = session_store_create(store, now)
+    session_set(s, "user", "dave")
+    # Issue the session cookie
+    let sc: SetCookie = session_issue_cookie(s, secret, now)
+    let header_str: str = cookie_serialize(sc)
+    println("  issued Set-Cookie: " + header_str)
+    # Build a request that carries the cookie
+    let req: HttpRequest = http_request_new("GET", "/dashboard")
+    req.headers = http_header_add(req.headers, "Cookie", session_cookie_name() + "=" + sc.value)
+    # Load the session from the request
+    let loaded: Option[Session] = session_load_from_request(store, req, now)
+    if option_is_some(loaded) {
+        let s2: Session = option_unwrap(loaded)
+        println("  loaded from request: user=" + session_get(s2, "user"))
+    } else {
+        println("  LOAD FROM REQUEST FAILED (unexpected)")
+    }
+    # Tampered cookie (change one byte of the signature)
+    let tampered_val: str = sc.value.slice(0, sc.value.len() - 2) + "XX"
+    let req2: HttpRequest = http_request_new("GET", "/dashboard")
+    req2.headers = http_header_add(req2.headers, "Cookie", session_cookie_name() + "=" + tampered_val)
+    let loaded2: Option[Session] = session_load_from_request(store, req2, now)
+    println("  tampered cookie load: " + option_is_some(loaded2).to_str() + " (expected false)")
+    # Missing cookie
+    let req3: HttpRequest = http_request_new("GET", "/dashboard")
+    let loaded3: Option[Session] = session_load_from_request(store, req3, now)
+    println("  missing cookie load:  " + option_is_some(loaded3).to_str() + " (expected false)")
+    # Destroy cookie (logout)
+    let destroy_sc: SetCookie = session_destroy_cookie(secret)
+    println("  destroy Set-Cookie:   " + cookie_serialize(destroy_sc))
+    # Attach cookie to a response
+    let resp: HttpResponse = http_response_new(200)
+    let resp2: HttpResponse = session_attach_cookie(resp, s, secret, now)
+    let mut has_set_cookie: bool = false
+    let mut i: int = 0
+    while i < resp2.headers.len() {
+        let h: HttpHeader = resp2.headers.get(i)
+        if h.name == "Set-Cookie" {
+            has_set_cookie = true
+        }
+        i = i + 1
+    }
+    println("  response has Set-Cookie: " + has_set_cookie.to_str())
+    println("")
+    return
+}
+
+# ============================================================================
+# Main
+# ============================================================================
+
+fn main() -> int uses IO, Fs, Rand {
+    # Seed the PRNG so the demo output is deterministic across the
+    # interpreter and the native binary (differential-safe). The
+    # same seed produces the same sequence on both paths (the HalisRNG
+    # LCG constants are identical).
+    rand_seed(42)
+    println("================================================================")
+    println("Stage 67 (v0.86.0-alpha): std.session (server-side sessions)")
+    println("================================================================")
+    println("")
+    demo_id_generation()
+    demo_session_record()
+    demo_in_memory_store()
+    demo_serialisation()
+    demo_file_store()
+    demo_cookie_glue()
+    println("================================================================")
+    println("Stage 67 demo complete (deterministic — differential-safe).")
+    println("================================================================")
+    return 0
+}

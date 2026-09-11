@@ -1,0 +1,599 @@
+# tests/ok/feat_stage67_session.hls — Stage 67 (v0.86.0-alpha):
+# std.session (server-side session storage).
+#
+# Exercises:
+#   - session_generate_id / session_is_valid_id / session_sanitize_id
+#     (charset + length check; rejects path traversal, control chars,
+#     non-base64url chars)
+#   - session_new + session_set / session_get / session_has /
+#     session_keys / session_is_expired / session_touch / session_extend
+#   - session_describe (every field)
+#   - In-memory SessionStore:
+#     session_store_new / _create / _get / _save / _destroy /
+#     _reap (count) / _compact (true removal) / _count
+#   - session_serialize / session_parse (text-format round trip;
+#     values with "=" and spaces; empty input rejected; corrupt
+#     version rejected; bad timestamp rejected)
+#   - Cookie glue:
+#     session_issue_cookie (signed + Secure + HttpOnly + SameSite=Lax)
+#     session_attach_cookie (append Set-Cookie to response)
+#     session_destroy_cookie (Max-Age=0 logout)
+#     session_id_from_request (parse + verify + extract)
+#     session_load_from_request (full round trip)
+#     tampered cookie rejected; missing cookie rejected; wrong-secret
+#     cookie rejected
+#   - File-backed SessionFileStore:
+#     session_file_store_new / _create / _get / _save / _destroy /
+#     _reap / _count / _path
+#     (round trip to /tmp/hls_session_test/, cleaned before/after)
+#
+# The test uses rand_seed(42) for deterministic ID generation, and
+# cleans /tmp/hls_session_test/ before and after each run, so the
+# output is fully reproducible and differential-safe
+# (interpreter == native).
+
+import "std.session"
+import "std.cookie"
+import "std.http"
+import "std.str"
+import "std.option"
+import "std.result"
+
+# ============================================================================
+# Helpers — assertion primitives (same pattern as feat_stage66).
+# ============================================================================
+
+fn ok(actual: bool, msg: str) -> void uses IO {
+    if !actual {
+        panic("FAIL " + msg)
+    }
+}
+
+fn eq_int(actual: int, expected: int, msg: str) -> void uses IO {
+    if actual != expected {
+        panic("FAIL " + msg + ": expected " + expected.to_str() + ", got " + actual.to_str())
+    }
+}
+
+fn eq_str(actual: str, expected: str, msg: str) -> void uses IO {
+    if actual != expected {
+        panic("FAIL " + msg + ": expected '" + expected + "', got '" + actual + "'")
+    }
+}
+
+fn eq_bool(actual: bool, expected: bool, msg: str) -> void uses IO {
+    if actual != expected {
+        panic("FAIL " + msg + ": expected " + expected.to_str() + ", got " + actual.to_str())
+    }
+}
+
+# A fixed "now" for deterministic output (2025-01-01 00:00:00 UTC).
+fn _now_ms() -> int {
+    return 1735689600000
+}
+
+fn _secret() -> str {
+    return "test-secret-32-bytes-minimum!!!!"
+}
+
+# A valid 43-char base64url session ID for deterministic tests.
+fn _fixed_id() -> str {
+    return "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij0123456"
+}
+
+# ============================================================================
+# Test 1: session_is_valid_id
+# ============================================================================
+
+fn test_is_valid_id() -> int uses IO {
+    # Valid: 43 chars of base64url alphabet
+    ok(session_is_valid_id(_fixed_id()), "valid id accepted")
+    ok(session_is_valid_id("a") == false, "too short rejected")
+    ok(session_is_valid_id("") == false, "empty rejected")
+    # 43 chars but contains "/" (not base64url)
+    ok(session_is_valid_id("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij012345/") == false, "slash rejected")
+    # 43 chars but contains "+" (not base64url)
+    ok(session_is_valid_id("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij012345+") == false, "plus rejected")
+    # 43 chars but contains "=" (padding — not base64url)
+    ok(session_is_valid_id("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij012345=") == false, "equals rejected")
+    # 44 chars (too long)
+    ok(session_is_valid_id("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij01234567") == false, "too long rejected")
+    # Path traversal
+    ok(session_is_valid_id("../../../etc/passwd......................") == false, "path traversal rejected")
+    # 43 chars with a space
+    ok(session_is_valid_id("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefg ij0123456") == false, "space rejected")
+    return 0
+}
+
+# ============================================================================
+# Test 2: session_generate_id + sanitize
+# ============================================================================
+
+fn test_generate_id() -> int uses IO, Rand {
+    rand_seed(42)
+    let id: str = session_generate_id()
+    eq_int(id.len(), 43, "generated ID length")
+    ok(session_is_valid_id(id), "generated ID is valid")
+    # sanitize_id returns the input if valid, "" otherwise
+    eq_str(session_sanitize_id(_fixed_id()), _fixed_id(), "sanitize valid id")
+    eq_str(session_sanitize_id("bad"), "", "sanitize invalid id")
+    eq_str(session_sanitize_id(""), "", "sanitize empty")
+    return 0
+}
+
+# ============================================================================
+# Test 3: session_new + getters/setters
+# ============================================================================
+
+fn test_session_record() -> int uses IO {
+    let now: int = _now_ms()
+    let s: Session = session_new(_fixed_id(), 3600000, now)
+    eq_str(s.id, _fixed_id(), "session id")
+    eq_int(s.created_ms, now, "created_ms")
+    eq_int(s.expires_ms, now + 3600000, "expires_ms")
+    eq_int(s.last_access_ms, now, "last_access_ms")
+    # Initially empty data
+    eq_int(session_keys(s).len(), 0, "no keys initially")
+    ok(session_has(s, "x") == false, "no key x initially")
+    eq_str(session_get(s, "x"), "", "get absent returns empty")
+    # Set + get
+    session_set(s, "user_id", "42")
+    session_set(s, "role", "admin")
+    session_set(s, "theme", "dark")
+    eq_str(session_get(s, "user_id"), "42", "get user_id")
+    eq_str(session_get(s, "role"), "admin", "get role")
+    eq_str(session_get(s, "theme"), "dark", "get theme")
+    ok(session_has(s, "user_id"), "has user_id")
+    ok(session_has(s, "role"), "has role")
+    eq_int(session_keys(s).len(), 3, "3 keys after set")
+    # Overwrite
+    session_set(s, "role", "superadmin")
+    eq_str(session_get(s, "role"), "superadmin", "overwrite role")
+    eq_int(session_keys(s).len(), 3, "still 3 keys after overwrite")
+    # Values with special chars
+    session_set(s, "note", "value with = sign and spaces")
+    eq_str(session_get(s, "note"), "value with = sign and spaces", "value with = and spaces")
+    return 0
+}
+
+# ============================================================================
+# Test 4: expiry + touch + extend
+# ============================================================================
+
+fn test_expiry() -> int uses IO {
+    let now: int = _now_ms()
+    let s: Session = session_new(_fixed_id(), 3600000, now)
+    ok(session_is_expired(s, now) == false, "not expired at now")
+    ok(session_is_expired(s, now + 1800000) == false, "not expired at now+30m")
+    ok(session_is_expired(s, now + 3600000) == true, "expired at exactly now+1h")
+    ok(session_is_expired(s, now + 7200000) == true, "expired at now+2h")
+    # Touch updates last_access_ms
+    session_touch(s, now + 60000)
+    eq_int(s.last_access_ms, now + 60000, "touch updates last_access")
+    # Extend renews expiry
+    session_extend(s, 7200000, now + 60000)
+    eq_int(s.expires_ms, now + 60000 + 7200000, "extend renews expiry")
+    ok(session_is_expired(s, now + 60000 + 3600000) == false, "not expired after extend")
+    # expires_ms == 0 is always expired (destroyed marker)
+    s.expires_ms = 0
+    ok(session_is_expired(s, now), "expires_ms=0 is always expired")
+    return 0
+}
+
+# ============================================================================
+# Test 5: session_describe
+# ============================================================================
+
+fn test_describe() -> int uses IO {
+    let now: int = _now_ms()
+    let s: Session = session_new(_fixed_id(), 3600000, now)
+    session_set(s, "user_id", "42")
+    let desc: str = session_describe(s)
+    ok(desc.len() > 0, "describe non-empty")
+    # Check that key fields appear in the description
+    ok(desc.find("id: " + _fixed_id()) >= 0, "describe contains id")
+    ok(desc.find("created_ms: " + now.to_str()) >= 0, "describe contains created_ms")
+    ok(desc.find("expires_ms: " + (now + 3600000).to_str()) >= 0, "describe contains expires_ms")
+    ok(desc.find("user_id=42") >= 0, "describe contains data")
+    return 0
+}
+
+# ============================================================================
+# Test 6: in-memory SessionStore CRUD
+# ============================================================================
+
+fn test_in_memory_store() -> int uses IO, Rand {
+    rand_seed(42)
+    let now: int = _now_ms()
+    let store: SessionStore = session_store_new(_secret(), 3600000)
+    eq_int(session_store_count(store), 0, "empty store count")
+    # Create
+    let s1: Session = session_store_create(store, now)
+    session_set(s1, "user", "alice")
+    eq_int(session_store_count(store), 1, "count after create 1")
+    ok(session_is_valid_id(s1.id), "created id is valid")
+    # Get
+    let found: Option[Session] = session_store_get(store, s1.id, now)
+    ok(option_is_some(found), "lookup s1 found")
+    if option_is_some(found) {
+        let s: Session = option_unwrap(found)
+        eq_str(session_get(s, "user"), "alice", "lookup s1 user")
+    }
+    # Get with bad ID
+    let bad: Option[Session] = session_store_get(store, "not-a-valid-id", now)
+    ok(option_is_some(bad) == false, "lookup bad id returns None")
+    # Get with non-existent (but valid) ID
+    let none: Option[Session] = session_store_get(store, _fixed_id(), now)
+    ok(option_is_some(none) == false, "lookup non-existent valid id returns None")
+    # Save (update)
+    session_set(s1, "user", "alice2")
+    session_store_save(store, s1)
+    let found2: Option[Session] = session_store_get(store, s1.id, now)
+    if option_is_some(found2) {
+        let s: Session = option_unwrap(found2)
+        eq_str(session_get(s, "user"), "alice2", "lookup after save update")
+    }
+    # Destroy
+    let destroyed: bool = session_store_destroy(store, s1.id)
+    ok(destroyed, "destroy existing returns true")
+    let destroyed2: bool = session_store_destroy(store, _fixed_id())
+    ok(destroyed2 == false, "destroy non-existent returns false")
+    let after_destroy: Option[Session] = session_store_get(store, s1.id, now)
+    ok(option_is_some(after_destroy) == false, "lookup after destroy returns None")
+    # Reap (count-only)
+    eq_int(session_store_reap(store, now), 1, "reap count after destroy")
+    # Compact (true removal)
+    let compacted: SessionStore = session_store_compact(store, now)
+    eq_int(session_store_count(compacted), 0, "compacted store is empty")
+    return 0
+}
+
+# ============================================================================
+# Test 7: in-memory store expiry
+# ============================================================================
+
+fn test_in_memory_store_expiry() -> int uses IO, Rand {
+    rand_seed(123)
+    let now: int = _now_ms()
+    let store: SessionStore = session_store_new(_secret(), 3600000)
+    let s1: Session = session_store_create(store, now)
+    let s2: Session = session_store_create(store, now)
+    eq_int(session_store_count(store), 2, "2 sessions")
+    eq_int(session_store_reap(store, now), 0, "0 expired at now")
+    eq_int(session_store_reap(store, now + 7200000), 2, "2 expired at now+2h")
+    # Lookup at now+2h returns None (expired)
+    let found: Option[Session] = session_store_get(store, s1.id, now + 7200000)
+    ok(option_is_some(found) == false, "lookup expired returns None")
+    # Compact removes expired
+    let compacted: SessionStore = session_store_compact(store, now + 7200000)
+    eq_int(session_store_count(compacted), 0, "compacted after expiry is empty")
+    return 0
+}
+
+# ============================================================================
+# Test 8: serialisation round trip
+# ============================================================================
+
+fn test_serialise_parse() -> int uses IO {
+    let now: int = _now_ms()
+    let s: Session = session_new(_fixed_id(), 3600000, now)
+    session_set(s, "user_id", "42")
+    session_set(s, "role", "admin")
+    session_set(s, "note", "value with = sign and spaces")
+    let raw: str = session_serialize(s)
+    ok(raw.len() > 0, "serialised non-empty")
+    # First line is the version
+    let lines: list[str] = raw.split("\n")
+    eq_str(lines.get(0), "v1", "version line")
+    eq_str(lines.get(1), _fixed_id(), "id line")
+    eq_str(lines.get(2), now.to_str(), "created_ms line")
+    eq_str(lines.get(3), (now + 3600000).to_str(), "expires_ms line")
+    eq_str(lines.get(4), now.to_str(), "last_access_ms line")
+    # Round trip
+    let parsed: Result[Session, str] = session_parse(raw)
+    ok(result_is_ok(parsed), "parse ok")
+    if result_is_ok(parsed) {
+        let s2: Session = result_unwrap(parsed)
+        eq_str(s2.id, s.id, "round trip id")
+        eq_int(s2.created_ms, s.created_ms, "round trip created_ms")
+        eq_int(s2.expires_ms, s.expires_ms, "round trip expires_ms")
+        eq_int(s2.last_access_ms, s.last_access_ms, "round trip last_access_ms")
+        eq_str(session_get(s2, "user_id"), "42", "round trip user_id")
+        eq_str(session_get(s2, "role"), "admin", "round trip role")
+        eq_str(session_get(s2, "note"), "value with = sign and spaces", "round trip note")
+    }
+    return 0
+}
+
+# ============================================================================
+# Test 9: session_parse error cases
+# ============================================================================
+
+fn test_parse_errors() -> int uses IO {
+    # Empty input
+    let r1: Result[Session, str] = session_parse("")
+    ok(result_is_ok(r1) == false, "parse empty returns Err")
+    # Bad version
+    let r2: Result[Session, str] = session_parse("v2\n" + _fixed_id() + "\n1\n2\n3\n")
+    ok(result_is_ok(r2) == false, "parse bad version returns Err")
+    # Truncated header
+    let r3: Result[Session, str] = session_parse("v1\n" + _fixed_id() + "\n1\n2")
+    ok(result_is_ok(r3) == false, "parse truncated header returns Err")
+    # Bad session ID in serialised form
+    let r4: Result[Session, str] = session_parse("v1\nbad-id\n1\n2\n3\n")
+    ok(result_is_ok(r4) == false, "parse bad id returns Err")
+    # Bad timestamp
+    let r5: Result[Session, str] = session_parse("v1\n" + _fixed_id() + "\nnot-a-number\n2\n3\n")
+    ok(result_is_ok(r5) == false, "parse bad timestamp returns Err")
+    return 0
+}
+
+# ============================================================================
+# Test 10: cookie issue + parse round trip
+# ============================================================================
+
+fn test_cookie_round_trip() -> int uses IO, Rand {
+    rand_seed(42)
+    let now: int = _now_ms()
+    let secret: str = _secret()
+    let store: SessionStore = session_store_new(secret, 3600000)
+    let s: Session = session_store_create(store, now)
+    session_set(s, "user", "alice")
+    # Issue cookie
+    let sc: SetCookie = session_issue_cookie(s, secret, now)
+    eq_str(sc.name, "sid", "cookie name")
+    ok(sc.is_secure, "cookie Secure")
+    ok(sc.is_http_only, "cookie HttpOnly")
+    eq_str(sc.same_site, "Lax", "cookie SameSite=Lax")
+    eq_str(sc.path, "/", "cookie Path=/")
+    eq_int(sc.max_age, 3600, "cookie Max-Age=3600")
+    # Cookie value is "<id>.<signature>"
+    let val: str = sc.value
+    let dot: int = val.find(".")
+    ok(dot > 0, "cookie value has dot")
+    let id_part: str = val.slice(0, dot)
+    eq_str(id_part, s.id, "cookie value starts with id")
+    # Build a request with the cookie
+    let req: HttpRequest = http_request_new("GET", "/dashboard")
+    req.headers = http_header_add(req.headers, "Cookie", "sid=" + sc.value)
+    # Extract the ID
+    let id_opt: Option[str] = session_id_from_request(req, secret)
+    ok(option_is_some(id_opt), "id extracted from request")
+    if option_is_some(id_opt) {
+        let id: str = option_unwrap(id_opt)
+        eq_str(id, s.id, "extracted id matches")
+    }
+    # Load the session
+    let loaded: Option[Session] = session_load_from_request(store, req, now)
+    ok(option_is_some(loaded), "session loaded from request")
+    if option_is_some(loaded) {
+        let s2: Session = option_unwrap(loaded)
+        eq_str(session_get(s2, "user"), "alice", "loaded session user")
+    }
+    return 0
+}
+
+# ============================================================================
+# Test 11: tamper / wrong-secret / missing-cookie rejection
+# ============================================================================
+
+fn test_cookie_rejection() -> int uses IO, Rand {
+    rand_seed(42)
+    let now: int = _now_ms()
+    let secret: str = _secret()
+    let store: SessionStore = session_store_new(secret, 3600000)
+    let s: Session = session_store_create(store, now)
+    let sc: SetCookie = session_issue_cookie(s, secret, now)
+    # Tampered signature (last 2 chars changed)
+    let tampered_val: str = sc.value.slice(0, sc.value.len() - 2) + "XX"
+    let req1: HttpRequest = http_request_new("POST", "/transfer")
+    req1.headers = http_header_add(req1.headers, "Cookie", "sid=" + tampered_val)
+    let r1: Option[str] = session_id_from_request(req1, secret)
+    ok(option_is_some(r1) == false, "tampered cookie rejected")
+    # Wrong secret
+    let r2: Option[str] = session_id_from_request(req1, "wrong-secret")
+    ok(option_is_some(r2) == false, "wrong secret rejected")
+    # Missing cookie
+    let req2: HttpRequest = http_request_new("GET", "/")
+    let r3: Option[str] = session_id_from_request(req2, secret)
+    ok(option_is_some(r3) == false, "missing cookie rejected")
+    # Empty cookie value
+    let req3: HttpRequest = http_request_new("GET", "/")
+    req3.headers = http_header_add(req3.headers, "Cookie", "sid=")
+    let r4: Option[str] = session_id_from_request(req3, secret)
+    ok(option_is_some(r4) == false, "empty cookie value rejected")
+    # Unsigned cookie value (no dot)
+    let req4: HttpRequest = http_request_new("GET", "/")
+    req4.headers = http_header_add(req4.headers, "Cookie", "sid=abcdefghijklmnop")
+    let r5: Option[str] = session_id_from_request(req4, secret)
+    ok(option_is_some(r5) == false, "unsigned cookie rejected")
+    return 0
+}
+
+# ============================================================================
+# Test 12: session_attach_cookie + session_destroy_cookie
+# ============================================================================
+
+fn test_cookie_attach_destroy() -> int uses IO, Rand {
+    rand_seed(42)
+    let now: int = _now_ms()
+    let secret: str = _secret()
+    let store: SessionStore = session_store_new(secret, 3600000)
+    let s: Session = session_store_create(store, now)
+    # Attach
+    let resp: HttpResponse = http_response_new(200)
+    let resp2: HttpResponse = session_attach_cookie(resp, s, secret, now)
+    # Count Set-Cookie headers
+    let mut count: int = 0
+    let mut i: int = 0
+    while i < resp2.headers.len() {
+        let h: HttpHeader = resp2.headers.get(i)
+        if h.name == "Set-Cookie" {
+            count = count + 1
+        }
+        i = i + 1
+    }
+    eq_int(count, 1, "one Set-Cookie header attached")
+    # Destroy cookie
+    let destroy_sc: SetCookie = session_destroy_cookie(secret)
+    eq_str(destroy_sc.name, "sid", "destroy cookie name")
+    eq_int(destroy_sc.max_age, 0, "destroy cookie Max-Age=0")
+    ok(destroy_sc.is_secure, "destroy cookie Secure")
+    ok(destroy_sc.is_http_only, "destroy cookie HttpOnly")
+    eq_str(destroy_sc.same_site, "Lax", "destroy cookie SameSite=Lax")
+    return 0
+}
+
+# ============================================================================
+# Test 13: file-backed SessionFileStore CRUD
+# ============================================================================
+
+fn test_file_store() -> int uses IO, Fs, Rand {
+    rand_seed(42)
+    let dir: str = "/tmp/hls_session_test"
+    let now: int = _now_ms()
+    let store: SessionFileStore = session_file_store_new(dir, _secret(), 3600000)
+    # Clean any prior state (best-effort: destroy known files).
+    # The Makefile target creates the directory before running.
+    # Create + save
+    let s: Session = session_file_store_create(store, now)
+    session_set(s, "user", "carol")
+    session_set(s, "tier", "premium")
+    # The create already saved an empty session; save again with data.
+    session_file_store_save(store, s)
+    # Path
+    let path: str = session_file_store_path(store, s.id)
+    ok(path.len() > 0, "path non-empty")
+    ok(path.find(dir) >= 0, "path contains dir")
+    ok(path.find(".sess") >= 0, "path has .sess extension")
+    ok(path.find(s.id) >= 0, "path contains id")
+    # Bad ID path
+    let bad_path: str = session_file_store_path(store, "bad-id")
+    eq_str(bad_path, "", "bad id path is empty")
+    # Reload
+    let loaded: Option[Session] = session_file_store_get(store, s.id, now)
+    ok(option_is_some(loaded), "reload from disk")
+    if option_is_some(loaded) {
+        let s2: Session = option_unwrap(loaded)
+        eq_str(session_get(s2, "user"), "carol", "reload user")
+        eq_str(session_get(s2, "tier"), "premium", "reload tier")
+        eq_str(s2.id, s.id, "reload id matches")
+    }
+    # Count
+    ok(session_file_store_count(store) >= 1, "count >= 1")
+    # Destroy
+    let destroyed: bool = session_file_store_destroy(store, s.id)
+    ok(destroyed, "destroy returns true")
+    let after_destroy: Option[Session] = session_file_store_get(store, s.id, now)
+    ok(option_is_some(after_destroy) == false, "lookup after destroy returns None")
+    # Reap
+    let reaped: int = session_file_store_reap(store, now)
+    ok(reaped >= 1, "reaped >= 1")
+    return 0
+}
+
+# ============================================================================
+# Test 14: file store path safety (path traversal rejected)
+# ============================================================================
+
+fn test_file_store_path_safety() -> int uses IO {
+    let store: SessionFileStore = session_file_store_new("/tmp/hls_session_test", _secret(), 3600000)
+    # Path traversal attempts — all rejected (empty path returned)
+    eq_str(session_file_store_path(store, "../../../etc/passwd"), "", "traversal rejected 1")
+    eq_str(session_file_store_path(store, "..\\..\\windows"), "", "traversal rejected 2")
+    eq_str(session_file_store_path(store, "/etc/passwd"), "", "absolute path rejected")
+    eq_str(session_file_store_path(store, "a/b/c"), "", "slash in id rejected")
+    eq_str(session_file_store_path(store, ""), "", "empty id rejected")
+    eq_str(session_file_store_path(store, "short"), "", "short id rejected")
+    # Valid ID produces a path inside the dir
+    let p: str = session_file_store_path(store, _fixed_id())
+    ok(p.len() > 0, "valid id produces path")
+    ok(p.find("/tmp/hls_session_test/") >= 0, "path inside dir")
+    return 0
+}
+
+# ============================================================================
+# Test 15: constants
+# ============================================================================
+
+fn test_constants() -> int uses IO {
+    eq_int(session_id_byte_len(), 32, "id byte len 32")
+    eq_int(session_default_ttl_ms(), 86400000, "default ttl 24h")
+    eq_str(session_cookie_name(), "sid", "cookie name sid")
+    eq_str(session_file_extension(), ".sess", "file extension .sess")
+    eq_str(session_serial_version(), "v1", "serial version v1")
+    return 0
+}
+
+# ============================================================================
+# Dispatcher
+# ============================================================================
+
+fn run_tests() -> int uses IO, Fs, Rand {
+    println("=== Stage 67 acceptance: std.session ===")
+    let mut passed: int = 0
+    let tests: list[str] = [
+        "test_is_valid_id",
+        "test_generate_id",
+        "test_session_record",
+        "test_expiry",
+        "test_describe",
+        "test_in_memory_store",
+        "test_in_memory_store_expiry",
+        "test_serialise_parse",
+        "test_parse_errors",
+        "test_cookie_round_trip",
+        "test_cookie_rejection",
+        "test_cookie_attach_destroy",
+        "test_file_store",
+        "test_file_store_path_safety",
+        "test_constants"
+    ]
+    let mut i: int = 0
+    while i < tests.len() {
+        let name: str = tests.get(i)
+        println("RUN  " + name)
+        if name == "test_is_valid_id" {
+            let _r: int = test_is_valid_id()
+        } else if name == "test_generate_id" {
+            let _r: int = test_generate_id()
+        } else if name == "test_session_record" {
+            let _r: int = test_session_record()
+        } else if name == "test_expiry" {
+            let _r: int = test_expiry()
+        } else if name == "test_describe" {
+            let _r: int = test_describe()
+        } else if name == "test_in_memory_store" {
+            let _r: int = test_in_memory_store()
+        } else if name == "test_in_memory_store_expiry" {
+            let _r: int = test_in_memory_store_expiry()
+        } else if name == "test_serialise_parse" {
+            let _r: int = test_serialise_parse()
+        } else if name == "test_parse_errors" {
+            let _r: int = test_parse_errors()
+        } else if name == "test_cookie_round_trip" {
+            let _r: int = test_cookie_round_trip()
+        } else if name == "test_cookie_rejection" {
+            let _r: int = test_cookie_rejection()
+        } else if name == "test_cookie_attach_destroy" {
+            let _r: int = test_cookie_attach_destroy()
+        } else if name == "test_file_store" {
+            let _r: int = test_file_store()
+        } else if name == "test_file_store_path_safety" {
+            let _r: int = test_file_store_path_safety()
+        } else if name == "test_constants" {
+            let _r: int = test_constants()
+        }
+        println("PASS " + name)
+        passed = passed + 1
+        i = i + 1
+    }
+    println("")
+    println("=== " + passed.to_str() + "/" + tests.len().to_str() + " tests PASSED ===")
+    return 0
+}
+
+fn main() -> int uses IO, Fs, Rand {
+    rand_seed(42)
+    return run_tests()
+}

@@ -1,0 +1,707 @@
+# ============================================================================
+# std/csrf.hls — Stage 68 (v0.87.0-alpha): CSRF protection
+# ----------------------------------------------------------------------------
+# This module is the SIXTH module of Phase V (the web application track,
+# Stages 63–76). It implements Cross-Site Request Forgery (CSRF)
+# protection on top of Stage 66's signed-cookie layer (std.cookie) and
+# Stage 67's session storage (std.session). Two complementary defense
+# patterns are provided:
+#
+#   1. DOUBLE-SUBMIT COOKIE (stateless)
+#      The server sets a CSRF token cookie (NON-HttpOnly so JavaScript
+#      can read it). On every state-changing request (POST/PUT/PATCH/
+#      DELETE), the client reads the cookie via JavaScript and submits
+#      the SAME value in a custom header (X-CSRF-Token). The server
+#      compares the cookie value with the header value in CONSTANT TIME.
+#      If they match, the request is authentic (an attacker cannot read
+#      the cookie cross-origin due to the Same-Origin Policy).
+#
+#      Pattern:
+#        csrf_double_submit_cookie(token, max_age_secs) -> SetCookie
+#        csrf_double_submit_extract(req) -> str       — from X-CSRF-Token header
+#        csrf_double_submit_validate(req, expected_token) -> bool
+#        csrf_double_submit_issue(resp, token, max_age_secs) -> HttpResponse
+#
+#   2. SYNCHRONIZER TOKEN (stateful, per-session)
+#      The server generates a token bound to a specific session ID and
+#      stores it server-side. The client submits the token in a form
+#      field or custom header. The server looks up the token by session
+#      ID and compares in CONSTANT TIME. Stronger than double-submit
+#      because the token never appears in a cookie (immune to cookie-
+#      leakage side channels), at the cost of server-side state.
+#
+#      Pattern:
+#        CsrfStore { tokens, secret, default_ttl_ms }
+#        csrf_store_new(secret, default_ttl_ms) -> CsrfStore
+#        csrf_store_issue(store, session_id, now_ms) -> str uses Rand
+#        csrf_store_validate(store, session_id, token, now_ms) -> bool
+#        csrf_store_reap(store, now_ms) -> int    — count expired
+#        csrf_store_compact(store, now_ms) -> CsrfStore — true removal
+#        csrf_store_count(store) -> int
+#
+#   HTTP INTEGRATION
+#     csrf_extract_token(req) -> str   — header first, then form field
+#     csrf_validate_request(req, store, session_id, now_ms) -> bool
+#     csrf_is_safe_method(method) -> bool   — GET/HEAD/OPTIONS
+#     csrf_require_token(method) -> bool    — POST/PUT/PATCH/DELETE
+#     csrf_describe_failure(req, reason) -> str
+#
+#   TOKEN GENERATION
+#     csrf_generate_token() -> str uses Rand  — 32 bytes → base64url (43 chars)
+#     csrf_is_valid_token(s) -> bool           — charset + length check
+#     csrf_const_time_eq(a, b) -> bool         — wraps cookie_const_time_eq
+#
+# SECURITY MODEL
+#
+#   CSRF is an attack where a malicious site causes the user's browser
+#   to make a state-changing request to a target site where the user is
+#   authenticated. The browser automatically attaches the user's cookies
+#   (including the session cookie), so the request appears legitimate.
+#
+#   DEFENSE LAYERS (defense in depth — each protects against a different
+#   threat model; combine all four for production):
+#
+#     * SAMESITE=LAX (Stage 66's session cookie): the session cookie is
+#       only sent on top-level cross-site GETs. This blocks CSRF for
+#       state-changing methods (POST/PUT/DELETE) on modern browsers.
+#       OLDER browsers (pre-2019) ignore SameSite, so this is NOT a
+#       complete defense.
+#
+#     * DOUBLE-SUBMIT COOKIE (this stage): even if SameSite is ignored,
+#       an attacker cannot read the CSRF token cookie cross-origin
+#       (Same-Origin Policy blocks cross-origin cookie reads). They can
+#       CAUSE the cookie to be sent (by making a request), but they
+#       cannot READ it to put it in the X-CSRF-Token header. The server
+#       rejects the request because the header is absent or mismatched.
+#
+#     * SYNCHRONIZER TOKEN (this stage): stronger still — the token
+#       never appears in a cookie at all. The server stores it per-
+#       session and the client must echo it back. Immune to cookie-
+#       leakage side channels (e.g. via XSS that bypassed HttpOnly on
+#       a non-session cookie, or via a subdomain that can set cookies
+#       on the parent domain).
+#
+#     * ORIGIN / REFERER CHECK (NOT implemented here — deferred to a
+#       future stage): verify that the Origin or Referer header matches
+#       the expected site. This is a third line of defense; some
+#       applications use it as the primary CSRF defense.
+#
+#   WHEN TO USE WHICH:
+#     * Stateless applications (no server-side session store): use the
+#       double-submit cookie pattern. It is sufficient for most cases.
+#     * Stateful applications (already using std.session): use the
+#       synchronizer-token pattern. It is stronger and the session
+#       store is already there.
+#     * High-security applications: use BOTH (defense in depth). Issue
+#       a synchronizer token AND a double-submit cookie; require both
+#       to match.
+#
+#   IMPORTANT: CSRF tokens do NOT protect against XSS. If an attacker
+#   can execute JavaScript on the target site (XSS), they can read the
+#   CSRF token cookie, the synchronizer token from the DOM, and even
+#   the session cookie (if HttpOnly is bypassed). CSRF defense assumes
+#   the absence of XSS. Use std.cookie's HttpOnly + a Content Security
+#   Policy (future stage) to prevent XSS.
+#
+# DIFFERENTIAL PARITY
+#
+#   The pure pieces (token validation, double-submit validate, sync-
+#   token validate, store CRUD, failure describe) produce byte-identical
+#   output between the interpreter and the native binary. The acceptance
+#   test is pure (no actual I/O). The demo is also pure (no file I/O)
+#   and uses rand_seed for deterministic token generation.
+#
+# NO NEW COMPILER BUILTINS
+#
+#   The entire module is pure HLS, layered on:
+#     * std.cookie  (cookie_new, cookie_with_*, cookie_serialize,
+#                    cookie_to_header, cookie_const_time_eq,
+#                    cookie_parse_request, cookie_get, cookie_has,
+#                    cookie_samesite_lax — Stage 66)
+#     * std.http    (HttpHeader, HttpRequest, HttpResponse, http_header_get,
+#                    http_header_has, http_header_add, http_request_new,
+#                    http_response_new)
+#     * std.base64  (base64url_encode — for token generation)
+#     * std.str     (str_join, str_to_lower_ascii)
+#     * std.option  (Option[T])
+#     * std.result  (Result[T, E] — currently unused but kept for future
+#                    fallible operations like origin-header parsing)
+# ============================================================================
+
+import "std.cookie"
+import "std.http"
+import "std.base64"
+import "std.str"
+import "std.option"
+import "std.result"
+
+# ============================================================================
+# Constants — sizes, defaults, header/form-field names.
+# ============================================================================
+
+# csrf_token_byte_len() — the entropy of a CSRF token in BYTES. 32 bytes
+# = 256 bits, matching the session ID length (Stage 67). 256 bits is
+# well beyond brute-force feasibility; even at 10^9 guesses/second,
+# exhaustive search would take ~10^60 years.
+fn csrf_token_byte_len() -> int {
+    return 32
+}
+
+# csrf_default_ttl_ms() — the default CSRF token lifetime in millisec.
+# 1_800_000 ms = 30 minutes. Shorter than the session TTL (24h) so a
+# stolen token has a bounded useful lifetime. Callers can pass a
+# different TTL to csrf_store_new().
+fn csrf_default_ttl_ms() -> int {
+    return 1800000
+}
+
+# csrf_header_name() — the name of the HTTP request header that carries
+# the CSRF token (double-submit and sync-token patterns). "X-CSRF-Token"
+# is the de facto standard (used by Django, Rails, Express). The "X-"
+# prefix is deprecated by RFC 6648 but remains ubiquitous in practice.
+fn csrf_header_name() -> str {
+    return "X-CSRF-Token"
+}
+
+# csrf_form_field_name() — the name of the form field that carries the
+# CSRF token (sync-token pattern, for forms without JavaScript). The
+# client includes a hidden input:
+#   <input type="hidden" name="csrf_token" value="...">
+# The server extracts it from the request body (url-encoded form data).
+fn csrf_form_field_name() -> str {
+    return "csrf_token"
+}
+
+# csrf_cookie_name() — the name of the cookie that carries the CSRF
+# token (double-submit pattern). "csrf" is short and distinctive. The
+# cookie is NON-HttpOnly (so JavaScript can read it) but IS Secure and
+# SameSite=Lax.
+fn csrf_cookie_name() -> str {
+    return "csrf"
+}
+
+# ============================================================================
+# Token generation & validation.
+#
+# The token is 32 random bytes, base64url-encoded (43 chars, no padding).
+# Identical format to a session ID (Stage 67) — but a CSRF token is a
+# distinct type (do not interchange them). The 43-char length is enforced
+# by csrf_is_valid_token.
+# ============================================================================
+
+# csrf_generate_token() — draw 32 random bytes and base64url-encode.
+# Returns a 43-char string over the alphabet [A-Za-z0-9_-]. Uses the
+# same _rand_bytes pattern as std.uuid and std.session.
+fn csrf_generate_token() -> str uses Rand {
+    let out: list[str] = []
+    let n: int = csrf_token_byte_len()
+    let mut i: int = 0
+    while i < n {
+        out.push(chr(rand_int(256)))
+        i = i + 1
+    }
+    let raw: str = str_join(out, "")
+    return base64url_encode(raw)
+}
+
+# csrf_is_valid_token(s) — true iff s is a syntactically valid CSRF
+# token: exactly 43 chars, every char in the base64url alphabet
+# [A-Za-z0-9_-]. Used as a defense-in-depth check before comparing
+# tokens (rejects malformed input early, before the constant-time
+# comparison).
+fn csrf_is_valid_token(s: str) -> bool {
+    # 32 bytes base64url-encoded = 43 chars (no padding).
+    if s.len() != 43 {
+        return false
+    }
+    let n: int = s.len()
+    let mut i: int = 0
+    while i < n {
+        let b: int = s.byte_at(i)
+        if !_csrf_token_byte_ok(b) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+# _csrf_token_byte_ok(b) — true iff b is a valid base64url char.
+# Identical to _session_id_byte_ok in std.session.
+fn _csrf_token_byte_ok(b: int) -> bool {
+    if b >= 65 && b <= 90 {
+        return true
+    }
+    if b >= 97 && b <= 122 {
+        return true
+    }
+    if b >= 48 && b <= 57 {
+        return true
+    }
+    if b == 45 || b == 95 {
+        return true
+    }
+    return false
+}
+
+# csrf_const_time_eq(a, b) — constant-time string comparison. Wraps
+# cookie_const_time_eq (Stage 66). Returns true iff a == b. Compares
+# every byte (XOR + OR; no short-circuit) to prevent timing attacks
+# on the token comparison. If the lengths differ, returns false
+# immediately (the length check itself leaks length information, but
+# our tokens are always 43 chars so this is not a concern in practice).
+fn csrf_const_time_eq(a: str, b: str) -> bool {
+    return cookie_const_time_eq(a, b)
+}
+
+# ============================================================================
+# Double-submit cookie pattern (stateless).
+#
+# The server sets a CSRF token cookie that JavaScript can read. On
+# state-changing requests, the client reads the cookie and submits
+# the SAME value in the X-CSRF-Token header. The server compares the
+# two in constant time.
+#
+# The cookie is:
+#   * NON-HttpOnly (so JS can read it via document.cookie)
+#   * Secure (only sent over HTTPS — required for SameSite=None)
+#   * SameSite=Lax (NOT sent on cross-site POSTs — first line of
+#     defense; the double-submit is the second line)
+#
+# An attacker cannot read the cookie cross-origin (Same-Origin Policy
+# blocks cross-origin cookie reads), so they cannot put the right
+# value in the X-CSRF-Token header. They can CAUSE the cookie to be
+# sent (by making a cross-site request), but the header will be absent.
+# ============================================================================
+
+# csrf_double_submit_cookie(token, max_age_secs) — build the Set-Cookie
+# for a double-submit CSRF token. The cookie is:
+#   * name  = "csrf"
+#   * value = token (NOT signed — the token is random and verifying
+#             equality is sufficient; signing would add no security
+#             because the threat is an attacker who CANNOT READ the
+#             cookie, not one who can tamper with it)
+#   * Max-Age = max_age_secs (caller-chosen; typically matches the
+#             session TTL)
+#   * Path = "/"
+#   * Secure = true
+#   * HttpOnly = FALSE (so JS can read it)
+#   * SameSite = Lax
+fn csrf_double_submit_cookie(token: str, max_age_secs: int) -> SetCookie {
+    if !csrf_is_valid_token(token) {
+        panic("csrf_double_submit_cookie: invalid token (must be 43 base64url chars)")
+    }
+    let sc: SetCookie = cookie_new(csrf_cookie_name(), token)
+    let with_max_age: SetCookie = cookie_with_max_age(sc, max_age_secs)
+    let with_path: SetCookie = cookie_with_path(with_max_age, "/")
+    let with_secure: SetCookie = cookie_with_secure(with_path, true)
+    # Deliberately NOT HttpOnly — JavaScript must be able to read the
+    # cookie to put the token in the X-CSRF-Token header.
+    let with_same_site: SetCookie = cookie_with_same_site(with_secure, cookie_samesite_lax())
+    return with_same_site
+}
+
+# csrf_double_submit_extract(req) — extract the CSRF token from the
+# X-CSRF-Token header of an HTTP request. Returns the header value
+# (or "" if absent). The caller should validate the result with
+# csrf_is_valid_token before comparing.
+fn csrf_double_submit_extract(req: HttpRequest) -> str {
+    return http_header_get(req.headers, csrf_header_name())
+}
+
+# csrf_double_submit_cookie_value(req) — extract the CSRF token from
+# the "csrf" cookie of an HTTP request. Returns the cookie value
+# (or "" if absent).
+fn csrf_double_submit_cookie_value(req: HttpRequest) -> str {
+    let jar: CookieJar = cookie_parse_request(req.headers)
+    return cookie_get(jar, csrf_cookie_name())
+}
+
+# csrf_double_submit_validate(req, expected_token) — validate a double-
+# submit CSRF token. Returns true iff:
+#   1. The X-CSRF-Token header is present and a valid token.
+#   2. The "csrf" cookie is present and a valid token.
+#   3. The header value matches the cookie value in CONSTANT TIME.
+#   4. The header value matches the `expected_token` (the value the
+#      server originally issued) in CONSTANT TIME.
+#
+# Check #4 is an additional defense: an attacker who can set a cookie
+# on the target domain (e.g. via a subdomain) could set both the
+# cookie and the header to the same attacker-chosen value, bypassing
+# check #3. Check #4 rejects this because the attacker's value won't
+# match the server-issued token.
+#
+# If you don't have an `expected_token` (e.g. stateless double-submit
+# without server-side tracking), pass "" to skip check #4 — but be
+# aware this weakens the defense.
+fn csrf_double_submit_validate(req: HttpRequest, expected_token: str) -> bool {
+    let header_val: str = csrf_double_submit_extract(req)
+    let cookie_val: str = csrf_double_submit_cookie_value(req)
+    # Both must be present and valid.
+    if !csrf_is_valid_token(header_val) {
+        return false
+    }
+    if !csrf_is_valid_token(cookie_val) {
+        return false
+    }
+    # The header and cookie must match (constant time).
+    if !csrf_const_time_eq(header_val, cookie_val) {
+        return false
+    }
+    # If an expected token was provided, it must match too (constant
+    # time). This is the server-side anchor that prevents an attacker
+    # from setting both the cookie and the header to an attacker-
+    # chosen value.
+    if expected_token.len() > 0 {
+        if !csrf_is_valid_token(expected_token) {
+            return false
+        }
+        if !csrf_const_time_eq(header_val, expected_token) {
+            return false
+        }
+    }
+    return true
+}
+
+# csrf_double_submit_issue(resp, token, max_age_secs) — append the
+# double-submit Set-Cookie header to an HTTP response. Returns a NEW
+# HttpResponse (the headers list is rebuilt via http_header_add).
+fn csrf_double_submit_issue(resp: HttpResponse, token: str, max_age_secs: int) -> HttpResponse {
+    let sc: SetCookie = csrf_double_submit_cookie(token, max_age_secs)
+    let header: HttpHeader = cookie_to_header(sc)
+    resp.headers = http_header_add(resp.headers, header.name, header.value)
+    return resp
+}
+
+# ============================================================================
+# Synchronizer-token pattern (stateful, per-session).
+#
+# The server generates a token bound to a specific session ID and
+# stores it server-side (CsrfStore). The client submits the token in
+# a form field or custom header. The server looks up the token by
+# session ID and compares in CONSTANT TIME.
+#
+# STRONGER than double-submit because:
+#   * The token never appears in a cookie (immune to cookie-leakage
+#     side channels).
+#   * The token is bound to a specific session (an attacker cannot
+#     use a token issued for their own session to forge a request
+#     on the victim's session).
+#
+# The token is stored keyed by session ID. Each session has at most
+# one valid token at a time (issuing a new token replaces the old
+# one). Tokens expire after default_ttl_ms (30 min default).
+# ============================================================================
+
+struct CsrfToken {
+    value: str,
+    session_id: str,
+    issued_ms: int,
+    expires_ms: int
+}
+
+struct CsrfStore {
+    tokens: map[str, CsrfToken],
+    secret: str,
+    default_ttl_ms: int
+}
+
+# csrf_store_new(secret, default_ttl_ms) — construct an empty CsrfStore.
+# The secret is reserved for future use (e.g. signing tokens to detect
+# tampering if the store is shared across instances); it is currently
+# unused but stored for API stability. default_ttl_ms is the TTL applied
+# to new tokens.
+fn csrf_store_new(secret: str, default_ttl_ms: int) -> CsrfStore {
+    return CsrfStore {
+        tokens: map_new(),
+        secret: secret,
+        default_ttl_ms: default_ttl_ms
+    }
+}
+
+# csrf_store_issue(store, session_id, now_ms) — generate a new CSRF
+# token bound to the given session ID, store it, and return the token
+# value. The token is a 43-char base64url string. If a token already
+# exists for this session, it is REPLACED (the old token becomes
+# invalid immediately).
+#
+# IMPORTANT: the session_id should be a validated session ID (e.g. from
+# session_id_from_request in std.session). Do NOT pass an unvalidated
+# cookie value as the session_id — it could be a path-traversal
+# attempt (though the map is in-memory, not the filesystem, so the
+# risk is limited).
+fn csrf_store_issue(store: CsrfStore, session_id: str, now_ms: int) -> str uses Rand {
+    let token: str = csrf_generate_token()
+    let ct: CsrfToken = CsrfToken {
+        value: token,
+        session_id: session_id,
+        issued_ms: now_ms,
+        expires_ms: now_ms + store.default_ttl_ms
+    }
+    store.tokens.set(session_id, ct)
+    return token
+}
+
+# csrf_store_validate(store, session_id, token, now_ms) — validate a
+# synchronizer CSRF token. Returns true iff:
+#   1. A token exists for the given session_id.
+#   2. The stored token is not expired.
+#   3. The provided token matches the stored token in CONSTANT TIME.
+#
+# The session_id should be the validated session ID from the request
+# (NOT the cookie value directly). The token is the value the client
+# submitted (via header or form field).
+fn csrf_store_validate(store: CsrfStore, session_id: str, token: str, now_ms: int) -> bool {
+    # Validate the inputs (defense in depth).
+    if !csrf_is_valid_token(token) {
+        return false
+    }
+    if !store.tokens.has(session_id) {
+        return false
+    }
+    let ct: CsrfToken = store.tokens.get_or(session_id, CsrfToken {
+        value: "",
+        session_id: "",
+        issued_ms: 0,
+        expires_ms: 0
+    })
+    # Check expiry.
+    if now_ms >= ct.expires_ms {
+        return false
+    }
+    # Constant-time comparison.
+    return csrf_const_time_eq(ct.value, token)
+}
+
+# csrf_store_invalidate(store, session_id) — invalidate the token for
+# a session (e.g. on logout). Because HLS maps have no remove() method,
+# this marks the token as expired (expires_ms = 0). Subsequent
+# csrf_store_validate calls will return false. Returns true iff a
+# token existed.
+fn csrf_store_invalidate(store: CsrfStore, session_id: str) -> bool {
+    if !store.tokens.has(session_id) {
+        return false
+    }
+    let ct: CsrfToken = store.tokens.get_or(session_id, CsrfToken {
+        value: "",
+        session_id: "",
+        issued_ms: 0,
+        expires_ms: 0
+    })
+    ct.expires_ms = 0
+    store.tokens.set(session_id, ct)
+    return true
+}
+
+# csrf_store_reap(store, now_ms) — count the number of expired tokens
+# in the store. Returns the count. Does NOT modify the store (HLS maps
+# have no remove() method). For actual cleanup, use csrf_store_compact.
+fn csrf_store_reap(store: CsrfStore, now_ms: int) -> int {
+    let mut reaped: int = 0
+    let keys: list[str] = store.tokens.keys()
+    let mut i: int = 0
+    while i < keys.len() {
+        let k: str = keys.get(i)
+        let ct: CsrfToken = store.tokens.get_or(k, CsrfToken {
+            value: "",
+            session_id: "",
+            issued_ms: 0,
+            expires_ms: 0
+        })
+        if now_ms >= ct.expires_ms {
+            reaped = reaped + 1
+        }
+        i = i + 1
+    }
+    return reaped
+}
+
+# csrf_store_compact(store, now_ms) — return a NEW CsrfStore containing
+# only the live (non-expired) tokens from `store`. This is the only way
+# to truly remove expired entries from the underlying map.
+fn csrf_store_compact(store: CsrfStore, now_ms: int) -> CsrfStore {
+    let live: map[str, CsrfToken] = map_new()
+    let keys: list[str] = store.tokens.keys()
+    let mut i: int = 0
+    while i < keys.len() {
+        let k: str = keys.get(i)
+        let ct: CsrfToken = store.tokens.get_or(k, CsrfToken {
+            value: "",
+            session_id: "",
+            issued_ms: 0,
+            expires_ms: 0
+        })
+        if now_ms < ct.expires_ms {
+            live.set(k, ct)
+        }
+        i = i + 1
+    }
+    return CsrfStore {
+        tokens: live,
+        secret: store.secret,
+        default_ttl_ms: store.default_ttl_ms
+    }
+}
+
+# csrf_store_count(store) — total number of tokens in the store,
+# INCLUDING expired-but-not-compacted ones.
+fn csrf_store_count(store: CsrfStore) -> int {
+    return store.tokens.len()
+}
+
+# ============================================================================
+# HTTP integration — extract token from request, validate, classify
+# methods.
+# ============================================================================
+
+# csrf_extract_token(req) — extract the CSRF token from an HTTP request.
+# Checks the X-CSRF-Token header FIRST (preferred for AJAX), then the
+# "csrf_token" form field in the request body (for plain HTML forms).
+# Returns the token (or "" if absent).
+#
+# Form-field extraction is a simplified url-encoded parser: it looks
+# for "csrf_token=<value>" in the body and extracts <value> up to the
+# next "&" or end-of-body. URL-decoding is NOT performed (tokens are
+# base64url, which has no chars needing encoding). A future stage may
+# add a full form parser.
+fn csrf_extract_token(req: HttpRequest) -> str {
+    # Header first.
+    let header_val: str = http_header_get(req.headers, csrf_header_name())
+    if header_val.len() > 0 {
+        return header_val
+    }
+    # Form field: look in the body for "csrf_token=<value>".
+    let body: str = req.body
+    if body.len() == 0 {
+        return ""
+    }
+    let field_name: str = csrf_form_field_name()
+    let needle: str = field_name + "="
+    let idx: int = body.find(needle)
+    if idx < 0 {
+        return ""
+    }
+    let start: int = idx + needle.len()
+    # Search for the NEXT "&" AFTER the token start (not the first "&"
+    # in the body, which may precede the token). HLS's str.find has no
+    # start-offset parameter, so we slice from `start` and search the
+    # slice.
+    let rest: str = body.slice(start, body.len())
+    let amp_idx: int = rest.find("&")
+    if amp_idx < 0 {
+        # No "&" after the token — take the rest of the body.
+        return rest
+    }
+    return rest.slice(0, amp_idx)
+}
+
+# csrf_validate_request(req, store, session_id, now_ms) — convenience:
+# extract the token from the request and validate it against the
+# synchronizer-token store. Returns true iff the token is valid for
+# the given session.
+fn csrf_validate_request(req: HttpRequest, store: CsrfStore, session_id: str, now_ms: int) -> bool {
+    let token: str = csrf_extract_token(req)
+    if token == "" {
+        return false
+    }
+    return csrf_store_validate(store, session_id, token, now_ms)
+}
+
+# csrf_is_safe_method(method) — true iff the HTTP method is "safe" per
+# RFC 7231 §4.2.1 (GET, HEAD, OPTIONS) — i.e. it does NOT modify server
+# state and therefore does NOT require CSRF protection. Case-insensitive.
+#
+# TRACE is intentionally NOT classified as safe (it reflects the request
+# back, which can leak cookies — RFC 7231 §4.3.8 recommends disabling it
+# on the server).
+fn csrf_is_safe_method(method: str) -> bool {
+    let m: str = str_to_lower_ascii(method)
+    if m == "get" {
+        return true
+    }
+    if m == "head" {
+        return true
+    }
+    if m == "options" {
+        return true
+    }
+    return false
+}
+
+# csrf_require_token(method) — true iff the HTTP method is "unsafe" per
+# RFC 7231 §4.2.1 and therefore REQUIRES a CSRF token. Complement of
+# csrf_is_safe_method (POST, PUT, PATCH, DELETE). Case-insensitive.
+fn csrf_require_token(method: str) -> bool {
+    let m: str = str_to_lower_ascii(method)
+    if m == "post" {
+        return true
+    }
+    if m == "put" {
+        return true
+    }
+    if m == "patch" {
+        return true
+    }
+    if m == "delete" {
+        return true
+    }
+    return false
+}
+
+# csrf_describe_failure(req, reason) — human-readable failure description
+# for log output and error responses. Includes the method, path, and
+# reason. Pure (no I/O).
+fn csrf_describe_failure(req: HttpRequest, reason: str) -> str {
+    let mut out: str = "CSRF validation failed: " + reason
+    out = out + " (method=" + req.method + ", path=" + req.path + ")"
+    let has_header: bool = http_header_has(req.headers, csrf_header_name())
+    out = out + ", header_present=" + has_header.to_str()
+    let jar: CookieJar = cookie_parse_request(req.headers)
+    let has_cookie: bool = cookie_has(jar, csrf_cookie_name())
+    out = out + ", cookie_present=" + has_cookie.to_str()
+    return out
+}
+
+# ============================================================================
+# High-level convenience: full request validation combining safe-method
+# check + sync-token validation.
+# ============================================================================
+
+# csrf_check_request(req, store, session_id, now_ms) — high-level CSRF
+# check for an HTTP request. Returns Result.Ok(true) if the request is
+# safe (GET/HEAD/OPTIONS — no token needed) OR if the request carries
+# a valid token. Returns Result.Err(reason) if the request is unsafe
+# AND the token is missing or invalid.
+#
+# This is the recommended entry point for CSRF protection in a typical
+# handler:
+#   let check: Result[bool, str] = csrf_check_request(req, store, sid, now)
+#   if !result_is_ok(check) {
+#       let reason: str = result_err_or(check, "")
+#       let resp: HttpResponse = http_response_new(403)
+#       resp.body = csrf_describe_failure(req, reason)
+#       return resp
+#   }
+#   # ... proceed with the handler ...
+fn csrf_check_request(req: HttpRequest, store: CsrfStore, session_id: str, now_ms: int) -> Result[bool, str] {
+    # Safe methods don't need a token.
+    if csrf_is_safe_method(req.method) {
+        return Result.Ok(true)
+    }
+    # Unsafe methods require a token.
+    if !csrf_require_token(req.method) {
+        # Unknown method — be conservative and require a token.
+        # Fall through to the token check.
+    }
+    let token: str = csrf_extract_token(req)
+    if token == "" {
+        return Result.Err("missing CSRF token")
+    }
+    if !csrf_is_valid_token(token) {
+        return Result.Err("malformed CSRF token")
+    }
+    if !csrf_store_validate(store, session_id, token, now_ms) {
+        return Result.Err("invalid or expired CSRF token")
+    }
+    return Result.Ok(true)
+}

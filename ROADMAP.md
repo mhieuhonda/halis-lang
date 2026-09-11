@@ -114,8 +114,8 @@ remains green.
 | 64 | `std.http.server` — multi-thread, keep-alive, HTTP/2 push | ✅ | (done in v0.83.0-alpha) |
 | 65 | `std.websocket` — RFC 6455 server + client | ✅ | (done in v0.84.0-alpha) |
 | 66 | `std.cookie` — signed cookies, SameSite, secure flag | ✅ | (done in v0.85.0-alpha) |
-| 67 | `std.session` — server-side sessions (in-memory + file) | ⬜ | 3 weeks |
-| 68 | `std.csrf` — double-submit + sync-token patterns | ⬜ | 2 weeks |
+| 67 | `std.session` — server-side sessions (in-memory + file) | ✅ | (done in v0.86.0-alpha) |
+| 68 | `std.csrf` — double-submit + sync-token patterns | ✅ | (done in v0.87.0-alpha) |
 | 69 | `std.template` — compile-time HTML templates (no XSS) | ⬜ | 5 weeks |
 | 70 | `std.sse` — server-sent events (one-way streaming) | ⬜ | 2 weeks |
 | 71 | `std.graphql` — schema-first server (parser + resolver) | ⬜ | 6 weeks |
@@ -7042,13 +7042,368 @@ the acceptance test differentially (interpreter == native for
 both), then prints the feature summary. Pure-HLS implementation;
 no new compiler builtins; bootstrap is still deterministic.
 
-**Remaining work for later stages (Stage 67 onwards):**
-- Server-side session storage (`std.session` — in-memory + file)
-  — Stage 67. Builds on Stage 66's signed-cookie layer to provide
-  a higher-level session abstraction.
-- CSRF tokens (`std.csrf` — double-submit + sync-token patterns)
-  — Stage 68. Builds on the session + SameSite=Lax defenses.
+**Remaining work for later stages (Stage 69 onwards):**
 - Compile-time HTML templates (`std.template` — XSS-safe by
   construction) — Stage 69.
 - Server-Sent Events (`std.sse`) — Stage 70.
 - GraphQL server (`std.graphql`) — Stage 71.
+
+---
+
+## STAGE 67 — `std.session` — server-side sessions (in-memory + file-backed) ✅ (release v0.86.0-alpha)
+
+**Goal:** a pure-HLS implementation of server-side session storage,
+building on Stage 66's signed-cookie layer (std.cookie). Provides
+TWO complementary backends (in-memory `SessionStore` and file-backed
+`SessionFileStore`) plus the cookie glue to bind them to HTTP — the
+standard mechanism by which a web application associates a sequence
+of HTTP requests with a single user identity, WITHOUT trusting the
+client to carry the full session state.
+
+**Status (v0.86.0-alpha):** Stage 67 is **COMPLETE**. The new
+module `std/session.hls` (~1,160 lines) is a pure-HLS implementation
+on top of `std.cookie` (cookie_sign, cookie_verify, cookie_unwrap_signed,
+cookie_new, cookie_with_*, cookie_serialize, cookie_parse_request,
+cookie_const_time_eq — Stage 66), `std.http` (HttpHeader, HttpRequest,
+HttpResponse, http_header_get, http_header_add, http_request_new,
+http_response_new), `std.bits`, `std.sha1` (indirectly via HMAC-SHA1),
+`std.base64` (base64url_encode for session IDs), `std.str`, `std.option`,
+`std.result`, + global Fs builtins (read_file, write_file, file_exists,
+fs_read_dir).
+
+No new compiler builtins — the entire module is pure HLS.
+
+**Shipped in v0.86.0-alpha (Stage 67):**
+
+- **Session record:**
+    - `Session` struct `{ id, data: map[str, str], created_ms,
+      expires_ms, last_access_ms }`. The data map is `map[str, str]`
+      (values are str; callers serialise richer types themselves).
+    - `session_new(id, ttl_ms, now_ms) -> Session` — constructor with
+      empty data, expiry = now + ttl, last_access = now.
+    - `session_get(s, key) -> str` — value or "" if absent.
+    - `session_has(s, key) -> bool`.
+    - `session_set(s, key, value) -> void` — mutates s.data in place.
+    - `session_keys(s) -> list[str]`.
+    - `session_is_expired(s, now_ms) -> bool` — true iff expires_ms
+      is in the past (or 0, the "destroyed" marker).
+    - `session_touch(s, now_ms) -> void` — update last_access_ms.
+    - `session_extend(s, ttl_ms, now_ms) -> void` — renew expiry
+      (sliding expiration).
+    - `session_describe(s) -> str` — human-readable rendering.
+
+- **ID generation & validation:**
+    - `session_generate_id() -> str` — 32 random bytes, base64url-
+      encoded (43 chars; 256-bit entropy — OWASP recommended minimum).
+      Uses `rand_int(256)` per byte (effect Rand; /dev/urandom on the
+      native path).
+    - `session_is_valid_id(s) -> bool` — true iff exactly 43 chars of
+      the base64url alphabet [A-Za-z0-9_-]. Rejects path-traversal
+      attempts (`/`, `..`), control chars, and non-base64url chars.
+    - `session_sanitize_id(s) -> str` — defensive; returns the input
+      if valid, "" otherwise.
+
+- **In-memory SessionStore:**
+    - `SessionStore` struct `{ sessions: map[str, Session], secret,
+      default_ttl_ms }`.
+    - `session_store_new(secret, default_ttl_ms) -> SessionStore`.
+    - `session_store_create(store, now_ms) -> Session` — generate ID,
+      construct Session, insert, return.
+    - `session_store_get(store, id, now_ms) -> Option[Session]` —
+      None if absent or expired; touches last_access_ms.
+    - `session_store_save(store, session) -> void` — insert/replace.
+    - `session_store_destroy(store, id) -> bool` — marks expired
+      (expires_ms = 0); HLS maps have no remove() method.
+    - `session_store_reap(store, now_ms) -> int` — count expired
+      (informational; does not modify the store).
+    - `session_store_compact(store, now_ms) -> SessionStore` —
+      returns a NEW store with only live sessions (the only way to
+      truly remove expired entries).
+    - `session_store_count(store) -> int`.
+
+- **File-backed SessionFileStore:**
+    - `SessionFileStore` struct `{ dir, secret, default_ttl_ms }`.
+    - `session_file_store_new(dir, secret, default_ttl_ms)`.
+    - `session_file_store_path(store, id) -> str` — composes
+      `<dir>/<id>.sess` with path-traversal defense (ID validated
+      before use as a filename — `../` and `/` in the ID are
+      impossible; invalid ID returns "").
+    - `session_file_store_create/get/save/destroy/reap/count`.
+      File deletion is emulated by writing an empty file (HLS has
+      no file-delete builtin); `session_parse` returns `Err` on
+      empty input, so subsequent loads return `None`.
+
+- **Serialisation (text format v1):**
+    - `session_serialize(s) -> str` — renders as
+      `v1\n<id>\n<created>\n<expires>\n<last_access>\n<key>=<value>\n...`.
+      Newlines in values are escaped as the literal `\n` sequence.
+    - `session_parse(raw) -> Result[Session, str]` — strict: rejects
+      empty input, bad version, truncated header, invalid session ID,
+      and non-numeric timestamps. Values may contain `=` (the parser
+      splits on the FIRST `=`).
+
+- **Cookie glue:**
+    - `session_cookie_name() -> str` — "sid".
+    - `session_issue_cookie(session, secret, now_ms) -> SetCookie` —
+      builds a signed (HMAC-SHA1 via std.cookie Stage 66), Secure,
+      HttpOnly, SameSite=Lax cookie with Max-Age computed from the
+      session's expiry.
+    - `session_attach_cookie(resp, session, secret, now_ms) ->
+      HttpResponse` — append Set-Cookie to a response.
+    - `session_destroy_cookie(secret) -> SetCookie` — Max-Age=0
+      logout cookie (forces immediate client-side deletion).
+    - `session_id_from_request(req, secret) -> Option[str]` — parses
+      the Cookie header, verifies the signature, extracts the
+      original ID. Returns None if the cookie is absent, unsigned,
+      tampered, or fails the validity check.
+    - `session_load_from_request(store, req, now_ms) -> Option[Session]`
+      — convenience: extract ID + look up in the in-memory store.
+    - `session_load_from_request_file(store, req, now_ms) ->
+      Option[Session]` — convenience: extract ID + look up in the
+      file-backed store.
+
+**Security model:** the session ID is an opaque 256-bit random
+capability token — possession of the ID is sufficient to act as the
+session. The ID is delivered via a signed cookie so the server can
+detect forgery EVEN IF an attacker can write the cookie (via XSS that
+bypassed HttpOnly, or via a subdomain sharing the parent Domain). The
+four defenses (SECURE + HTTP-ONLY + SAMESITE=LAX + SIGNED) are
+COMPLEMENTARY, each protecting against a different threat:
+- **Secure** — passive network sniffing.
+- **HttpOnly** — XSS-based session hijacking.
+- **SameSite=Lax** — CSRF (Stage 68 adds the second-line defense).
+- **Signed** — server-side state forgery.
+
+**Limitations (deferred to later stages):**
+- The in-memory store is single-process only. For multi-instance
+  production, use the file-backed store or a future std.session.redis.
+- The file-backed store has no file locking; concurrent writes to the
+  same session ID may race. Use a single-threaded server or wrap the
+  store in a std.sync.Mutex (Stage 45).
+- Session data is `map[str, str]` — callers serialise richer types
+  (int, float, list) themselves. A future stage may add typed session
+  accessors.
+- There is no session-fixation defense (rotating the ID on login).
+  The caller can implement this manually: destroy the old session,
+  create a new one, re-issue the cookie.
+
+**Acceptance test** (`tests/ok/feat_stage67_session.hls`, ~445 lines,
+15 tests, all PASS):
+1. `test_is_valid_id` — charset + length check; rejects path traversal,
+   control chars, non-base64url chars.
+2. `test_generate_id` — 43-char length; valid charset; sanitize_id
+   returns input or "".
+3. `test_session_record` — new + set/get/has/keys; overwrite; values
+   with `=` and spaces.
+4. `test_expiry` — is_expired at now/now+30m/now+1h/now+2h; touch;
+   extend; expires_ms=0 always expired.
+5. `test_describe` — every field appears in the description.
+6. `test_in_memory_store` — create/get/save/destroy/reap/compact;
+   bad-ID lookup returns None.
+7. `test_in_memory_store_expiry` — reap count at now vs future;
+   compact after expiry is empty.
+8. `test_serialise_parse` — round trip; version line; field lines;
+   values with `=` and spaces preserved.
+9. `test_parse_errors` — empty, bad version, truncated, bad ID, bad
+   timestamp all return Err.
+10. `test_cookie_round_trip` — issue cookie (Secure/HttpOnly/Lax/
+    Path=/Max-Age=3600); build request; extract ID; load session.
+11. `test_cookie_rejection` — tampered signature, wrong secret,
+    missing cookie, empty value, unsigned cookie all rejected.
+12. `test_cookie_attach_destroy` — one Set-Cookie attached; destroy
+    cookie has Max-Age=0 + Secure + HttpOnly + Lax.
+13. `test_file_store` — create/save/reload/count/destroy/reap;
+    path contains dir + ID + .sess.
+14. `test_file_store_path_safety` — path traversal, absolute paths,
+    slashes, empty, short IDs all return "".
+15. `test_constants` — id_byte_len=32, default_ttl=24h, cookie_name=
+    "sid", file_extension=".sess", serial_version="v1".
+
+**Demo** (`examples/session_demo.hls`, ~335 lines): exercises every
+pure piece of the API — ID generation + validation, session record
+CRUD + expiry + touch + extend, in-memory store CRUD + reap + compact,
+serialisation round trip, file-backed store CRUD + reap, cookie glue
+(issue + attach + parse + load + tamper rejection + destroy).
+Deterministic via `rand_seed(42)`; file I/O cleaned before each run.
+
+**Makefile target:** `make session-acceptance` — runs the demo and
+the acceptance test differentially (interpreter == native for both),
+then prints the feature summary. Pure-HLS implementation; no new
+compiler builtins; bootstrap is still deterministic.
+
+---
+
+## STAGE 68 — `std.csrf` — double-submit + sync-token CSRF protection ✅ (release v0.87.0-alpha)
+
+**Goal:** a pure-HLS implementation of Cross-Site Request Forgery
+(CSRF) protection, building on Stage 66's signed-cookie layer
+(std.cookie) and Stage 67's session storage (std.session). Provides
+TWO complementary defense patterns: the stateless double-submit
+cookie pattern and the stateful synchronizer-token pattern.
+
+**Status (v0.87.0-alpha):** Stage 68 is **COMPLETE**. The new
+module `std/csrf.hls` (~700 lines) is a pure-HLS implementation
+on top of `std.cookie` (cookie_new, cookie_with_*, cookie_serialize,
+cookie_to_header, cookie_const_time_eq, cookie_parse_request,
+cookie_get, cookie_has, cookie_samesite_lax — Stage 66), `std.http`
+(HttpHeader, HttpRequest, HttpResponse, http_header_get, http_header_has,
+http_header_add, http_request_new, http_response_new), `std.base64`
+(base64url_encode), `std.str` (str_join, str_to_lower_ascii),
+`std.option`, `std.result`.
+
+No new compiler builtins — the entire module is pure HLS.
+
+**Shipped in v0.87.0-alpha (Stage 68):**
+
+- **Token generation & validation:**
+    - `csrf_generate_token() -> str` — 32 random bytes, base64url-
+      encoded (43 chars; 256-bit entropy, matching the session ID
+      format from Stage 67). Uses `rand_int(256)` per byte.
+    - `csrf_is_valid_token(s) -> bool` — true iff exactly 43 chars
+      of the base64url alphabet [A-Za-z0-9_-].
+    - `csrf_const_time_eq(a, b) -> bool` — wraps `cookie_const_time_eq`
+      (Stage 66) for constant-time comparison (XOR every byte + OR;
+      no short-circuit).
+
+- **Double-submit cookie pattern (stateless):**
+    - `csrf_double_submit_cookie(token, max_age_secs) -> SetCookie` —
+      builds a NON-HttpOnly (so JS can read it), Secure, SameSite=Lax
+      cookie named "csrf". Panics on invalid token.
+    - `csrf_double_submit_extract(req) -> str` — extract the token
+      from the `X-CSRF-Token` header (or "" if absent).
+    - `csrf_double_submit_cookie_value(req) -> str` — extract the
+      token from the "csrf" cookie (or "" if absent).
+    - `csrf_double_submit_validate(req, expected_token) -> bool` —
+      returns true iff (1) the header is a valid token, (2) the cookie
+      is a valid token, (3) the header matches the cookie in CONSTANT
+      TIME, and (4) if `expected_token` is non-empty, the header
+      matches it in CONSTANT TIME. Check #4 is the server-side anchor
+      that prevents an attacker from setting both the cookie and the
+      header to an attacker-chosen value (e.g. via a subdomain).
+    - `csrf_double_submit_issue(resp, token, max_age_secs) ->
+      HttpResponse` — append the Set-Cookie to a response.
+
+- **Synchronizer-token pattern (stateful, per-session):**
+    - `CsrfToken` struct `{ value, session_id, issued_ms, expires_ms }`.
+    - `CsrfStore` struct `{ tokens: map[str, CsrfToken], secret,
+      default_ttl_ms }`.
+    - `csrf_store_new(secret, default_ttl_ms) -> CsrfStore`.
+    - `csrf_store_issue(store, session_id, now_ms) -> str` — generate
+      a token bound to the session ID, store it, return the token
+      value. Replaces any existing token for this session.
+    - `csrf_store_validate(store, session_id, token, now_ms) -> bool` —
+      look up the token by session ID, check expiry, compare in
+      CONSTANT TIME.
+    - `csrf_store_invalidate(store, session_id) -> bool` — mark the
+      token as expired (e.g. on logout).
+    - `csrf_store_reap(store, now_ms) -> int` — count expired.
+    - `csrf_store_compact(store, now_ms) -> CsrfStore` — returns a
+      NEW store with only live tokens.
+    - `csrf_store_count(store) -> int`.
+
+- **HTTP integration:**
+    - `csrf_extract_token(req) -> str` — checks the `X-CSRF-Token`
+      header FIRST (preferred for AJAX), then the `csrf_token` form
+      field in the request body (for plain HTML forms). The form-field
+      parser handles tokens at the start, middle, or end of the body.
+    - `csrf_validate_request(req, store, session_id, now_ms) -> bool` —
+      convenience: extract + validate.
+    - `csrf_is_safe_method(method) -> bool` — true for GET/HEAD/
+      OPTIONS (RFC 7231 §4.2.1 safe methods — no token needed).
+      Case-insensitive.
+    - `csrf_require_token(method) -> bool` — true for POST/PUT/PATCH/
+      DELETE. Case-insensitive.
+    - `csrf_describe_failure(req, reason) -> str` — human-readable
+      failure description for log output and 403 error responses.
+      Includes method, path, header_present, cookie_present.
+    - `csrf_check_request(req, store, session_id, now_ms) ->
+      Result[bool, str]` — high-level entry point: returns Ok(true)
+      for safe methods or valid tokens, Err(reason) otherwise.
+
+**Security model:** SAMESITE=LAX (Stage 66 session cookie) +
+DOUBLE-SUBMIT (this stage) + SYNC-TOKEN (this stage) are
+COMPLEMENTARY defenses, each protecting against a different threat
+model:
+- **SameSite=Lax** — blocks CSRF on modern browsers (post-2019) by
+  preventing the session cookie from being sent on cross-site POSTs.
+  Ignored by older browsers (pre-2019).
+- **Double-submit** — blocks CSRF even when SameSite is ignored. An
+  attacker cannot READ the CSRF cookie cross-origin (Same-Origin
+  Policy), so they cannot put the right value in the X-CSRF-Token
+  header. They can CAUSE the cookie to be sent, but the header will
+  be absent.
+- **Sync-token** — stronger still: the token never appears in a
+  cookie at all. Immune to cookie-leakage side channels (e.g. via
+  XSS that bypassed HttpOnly on a non-session cookie, or via a
+  subdomain that can set cookies on the parent domain).
+
+For high-security applications, use BOTH patterns (defense in depth).
+
+**IMPORTANT:** CSRF tokens do NOT protect against XSS. If an attacker
+can execute JavaScript on the target site, they can read the CSRF
+token cookie, the sync-token from the DOM, and even the session
+cookie (if HttpOnly is bypassed). CSRF defense assumes the absence of
+XSS — use std.cookie's HttpOnly + a Content Security Policy (future
+stage) to prevent XSS.
+
+**Limitations (deferred to later stages):**
+- Origin / Referer header check is NOT implemented (a third line of
+  defense; some applications use it as the primary CSRF defense). A
+  future stage may add `csrf_check_origin(req, expected_origin)`.
+- The form-field parser is a simplified url-encoded parser: it looks
+  for `csrf_token=<value>` and extracts `<value>` up to the next `&`
+  or end-of-body. URL-decoding is NOT performed (tokens are base64url,
+  which has no chars needing encoding). A future stage may add a full
+  form parser.
+- The synchronizer-token store is single-process only. For multi-
+  instance production, use an external store (Redis, database) or
+  stick with the stateless double-submit pattern.
+
+**Acceptance test** (`tests/ok/feat_stage68_csrf.hls`, ~470 lines,
+14 tests, all PASS):
+1. `test_is_valid_token` — charset + length check; rejects slash,
+   plus, equals, space, wrong length.
+2. `test_generate_token` — 43-char length; valid charset; const_time_eq
+   (equal, unequal, empty, diff length).
+3. `test_double_submit_cookie` — name, value, Max-Age, Path, Secure,
+   NOT HttpOnly, SameSite=Lax.
+4. `test_double_submit_validate_ok` — matching header+cookie+expected;
+   stateless mode (no expected).
+5. `test_double_submit_validate_fail` — mismatched header, missing
+   header, missing cookie, both missing, wrong expected, malformed
+   header.
+6. `test_double_submit_issue_extract` — one Set-Cookie issued; extract
+   header value; extract cookie value; absent returns "".
+7. `test_sync_store` — issue (43 chars, valid); validate ok; wrong
+   token rejected; wrong session rejected; expired rejected;
+   invalidate; validate after invalidate rejected.
+8. `test_sync_store_reap_compact` — 2 tokens; 0 expired at now; 2
+   expired at future; compacted empty.
+9. `test_extract_token` — header takes precedence; form field at
+   start/middle/end of body; no token returns ""; empty body returns
+   "".
+10. `test_method_classification` — GET/HEAD/OPTIONS safe; POST/PUT/
+    PATCH/DELETE require token; case-insensitive; TRACE conservative.
+11. `test_check_request` — GET ok (safe); POST+header ok; POST+form
+    ok; POST no token rejected; POST wrong token rejected; DELETE+
+    token ok; PATCH+token ok.
+12. `test_describe_failure` — contains prefix, reason, method, path,
+    header_present, cookie_present.
+13. `test_constants` — token_byte_len=32, default_ttl=30min,
+    header_name="X-CSRF-Token", form_field_name="csrf_token",
+    cookie_name="csrf".
+14. `test_end_to_end` — issue sync token; submit in form field;
+    validate; double-submit end-to-end with matching header+cookie.
+
+**Demo** (`examples/csrf_demo.hls`, ~280 lines): exercises every
+piece of the API — token generation + validation + const_time_eq,
+double-submit cookie construction + validate (ok + 5 failure cases) +
+issue, sync-token store CRUD + reap + compact, HTTP integration
+(safe-method bypass, header + form-field extraction, check_request,
+describe_failure, method classification). Deterministic via
+`rand_seed(42)`.
+
+**Makefile target:** `make csrf-acceptance` — runs the demo and
+the acceptance test differentially (interpreter == native for both),
+then prints the feature summary. Pure-HLS implementation; no new
+compiler builtins; bootstrap is still deterministic.

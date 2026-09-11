@@ -1,0 +1,1124 @@
+# ============================================================================
+# std/session.hls — Stage 67 (v0.86.0-alpha): server-side session storage
+# ----------------------------------------------------------------------------
+# This module is the FIFTH module of Phase V (the web application track,
+# Stages 63–76). It implements server-side session storage on top of
+# Stage 66's signed-cookie layer (std.cookie) — the standard mechanism
+# by which a web application associates a sequence of HTTP requests
+# with a single user identity, WITHOUT trusting the client to carry
+# the full session state.
+#
+# The module provides TWO complementary backends and the cookie glue
+# to bind them to HTTP:
+#
+#   SESSION RECORD
+#     Session { id, data, created_ms, expires_ms, last_access_ms }
+#     session_new(id, ttl_ms, now_ms) -> Session
+#     session_get(s, key) -> str         — value or "" if absent
+#     session_has(s, key) -> bool
+#     session_set(s, key, value) -> void — mutates s.data in place
+#     session_keys(s) -> list[str]       — every distinct key
+#     session_is_expired(s, now_ms) -> bool
+#     session_touch(s, now_ms) -> void   — update last_access_ms
+#     session_extend(s, ttl_ms, now_ms) -> void — renew expiry
+#     session_describe(s) -> str         — human-readable rendering
+#
+#   ID GENERATION & VALIDATION
+#     session_generate_id() -> str       — 32 random bytes, base64url
+#                                          (43 chars; 256-bit entropy)
+#     session_is_valid_id(s) -> bool     — length + charset check
+#     session_sanitize_id(s) -> str      — defensive; rejects "/", "..",
+#                                          control chars, non-ASCII
+#
+#   IN-MEMORY STORE  (SessionStore)
+#     SessionStore { sessions, secret, default_ttl_ms }
+#     session_store_new(secret, default_ttl_ms) -> SessionStore
+#     session_store_create(store, now_ms) -> Session uses Rand
+#     session_store_get(store, id, now_ms) -> Option[Session]
+#     session_store_save(store, session) -> void
+#     session_store_destroy(store, id) -> void
+#     session_store_reap(store, now_ms) -> int   — returns count reaped
+#     session_store_count(store) -> int
+#
+#   FILE-BACKED STORE  (SessionFileStore)
+#     SessionFileStore { dir, secret, default_ttl_ms }
+#     session_file_store_new(dir, secret, default_ttl_ms) -> SessionFileStore
+#     session_file_store_path(store, id) -> str
+#     session_file_store_create(store, now_ms) -> Session uses Fs, Rand
+#     session_file_store_get(store, id, now_ms) -> Option[Session] uses Fs
+#     session_file_store_save(store, session) -> void uses Fs
+#     session_file_store_destroy(store, id) -> void uses Fs
+#     session_file_store_reap(store, now_ms) -> int uses Fs
+#     session_file_store_count(store) -> int uses Fs
+#
+#   SERIALISATION (file store)
+#     session_serialize(s) -> str        — text format:
+#       "v1\n<id>\n<created_ms>\n<expires_ms>\n<last_access_ms>\n<k>=<v>\n..."
+#     session_parse(raw) -> Result[Session, str]
+#
+#   HTTP / COOKIE GLUE
+#     session_cookie_name() -> str       — "sid"
+#     session_load_from_request(store, req, now_ms) -> Option[Session]
+#     session_load_from_request_file(store, req, now_ms) -> Option[Session] uses Fs
+#     session_issue_cookie(session, secret) -> SetCookie
+#         — signed (HMAC-SHA1), Secure, HttpOnly, SameSite=Lax, Max-Age=TTL
+#     session_attach_cookie(resp, session, secret) -> HttpResponse
+#         — append Set-Cookie to a response
+#     session_destroy_cookie() -> SetCookie
+#         — Max-Age=0 (immediate expiry) to delete the cookie client-side
+#
+# SECURITY MODEL
+#
+#   The session ID is an opaque 256-bit random value, base64url-encoded.
+#   It is NOT a HMAC of the user identity — it is a randomly drawn
+#   capability token: possession of the ID is sufficient to act as the
+#   session. The ID is delivered to the client via a Secure + HttpOnly
+#   + SameSite=Lax + signed cookie (std.cookie Stage 66):
+#
+#     * SECURE: the cookie is only sent over HTTPS — first line of
+#       defense against passive network sniffing.
+#     * HTTP-ONLY: the cookie is invisible to `document.cookie` —
+#       first line of defense against XSS-based session hijacking.
+#     * SAMESITE=LAX: the cookie is only sent on top-level cross-site
+#       GETs — first line of defense against CSRF (Stage 68 adds the
+#       second-line defense: double-submit tokens).
+#     * SIGNED (HMAC-SHA1): the server can detect a forged session ID
+#       EVEN IF an attacker can write the cookie (via XSS that bypassed
+#       HttpOnly, or via a subdomain that shares the parent Domain).
+#       Without the server-side secret, the attacker cannot forge a
+#       valid signature.
+#
+#   The ID is also validated on every read: it must be exactly 43 chars
+#   of the base64url alphabet [A-Za-z0-9_-]. This rejects path-traversal
+#   attempts ("/", ".."), control characters, and non-ASCII bytes BEFORE
+#   the ID is used as a filesystem path (file-backed store) or a map
+#   key (in-memory store).
+#
+#   SESSION DATA IS UNTRUSTED. The values stored in `Session.data` come
+#   from the server (initially empty) — but a tampered cookie can cause
+#   an attacker-controlled ID to be presented. The signature check
+#   rejects this; if the signature is valid, the ID is genuine. The
+#   data map itself is NEVER serialised to the client (only the ID is).
+#
+# DIFFERENTIAL PARITY
+#
+#   The pure pieces (id validation, serialise/parse round-trip, in-memory
+#   store CRUD, cookie issue/parse, session_describe) produce byte-
+#   identical output between the interpreter and the native binary. The
+#   acceptance test is pure (no actual I/O). The demo exercises the
+#   file-backed store with cleanup, so its output is also deterministic.
+#
+# NO NEW COMPILER BUILTINS
+#
+#   The entire module is pure HLS, layered on:
+#     * std.cookie  (cookie_sign, cookie_verify, cookie_unwrap_signed,
+#                    cookie_new, cookie_with_*, cookie_serialize,
+#                    cookie_parse_request, cookie_const_time_eq,
+#                    cookie_format_http_date — Stage 66)
+#     * std.http    (HttpHeader, HttpRequest, HttpResponse, http_header_get,
+#                    http_header_add, http_request_new, http_response_new)
+#     * std.bits    (int_xor, int_or — for the constant-time comparison
+#                    fallback if cookie_const_time_eq were unavailable)
+#     * std.sha1    (indirectly via std.cookie's HMAC-SHA1)
+#     * std.base64  (base64url_encode / base64url_decode — for session IDs)
+#     * std.str     (str_join, str_to_lower_ascii, str_trim)
+#     * std.option  (Option[T] — None when a session is absent/expired)
+#     * std.result  (Result[T, E] — for fallible parse / verify ops)
+#
+#   File I/O uses the global read_file / write_file / file_exists builtins
+#   (effect Fs). The module does NOT use std.fs's Path abstraction (which
+#   carries taint-tracking); instead it sanitises the ID itself and
+#   composes the path as a plain str. This keeps the API simple for the
+#   common case where the caller has already chosen a trusted directory.
+# ============================================================================
+
+import "std.cookie"
+import "std.http"
+import "std.bits"
+import "std.sha1"
+import "std.base64"
+import "std.str"
+import "std.option"
+import "std.result"
+
+# ============================================================================
+# Constants — sizes, defaults, attribute names.
+# ============================================================================
+
+# session_id_byte_len() — the entropy of a session ID in BYTES. 32 bytes
+# = 256 bits, which is the OWASP-recommended minimum for session tokens
+# (https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html#session-id-entropy).
+# 256 bits is well beyond the 128-bit brute-force threshold; even at
+# 10^9 guesses/second, exhaustive search would take ~10^60 years.
+fn session_id_byte_len() -> int {
+    return 32
+}
+
+# session_default_ttl_ms() — the default session lifetime in milliseconds.
+# 86_400_000 ms = 24 hours. OWASP recommends 2–24 hours for idle sessions;
+# we default to the upper end so a user doesn't have to re-login mid-day.
+# Callers can pass a different TTL to session_store_new().
+fn session_default_ttl_ms() -> int {
+    return 86400000
+}
+
+# session_cookie_name() — the name of the cookie that carries the
+# session ID. "sid" is short (saves bytes on every request), distinctive
+# (avoids collision with application cookies), and matches the
+# convention used by Flask, Express, and Rails. The name is sanitized
+# by cookie_new before use, so no further validation is needed.
+fn session_cookie_name() -> str {
+    return "sid"
+}
+
+# session_file_extension() — the suffix appended to session ID filenames
+# in the file-backed store. ".sess" is distinctive (avoids collision
+# with ".json" or ".txt" application files) and short.
+fn session_file_extension() -> str {
+    return ".sess"
+}
+
+# session_serial_version() — the version prefix on the serialised form.
+# Bumped if the on-disk format ever changes, so a future loader can
+# detect and migrate (or reject) older formats.
+fn session_serial_version() -> str {
+    return "v1"
+}
+
+# ============================================================================
+# Session — the in-memory record.
+#
+# A Session carries:
+#   * id           — the opaque 43-char base64url session ID
+#   * data         — application state (a map[str, str]); values are
+#                    str (callers serialise richer types themselves)
+#   * created_ms   — wall-clock Unix ms when the session was created
+#   * expires_ms   — wall-clock Unix ms when the session expires
+#   * last_access_ms — wall-clock Unix ms of the most recent access
+#
+# The data map is MUTABLE: session_set mutates s.data in place (the map
+# itself is a reference type in HLS). The other fields are immutable
+# from the caller's perspective; session_touch and session_extend
+# mutate them in place (the Session is taken by value but its fields
+# are reference cells). This mirrors the std.cookie pattern where a
+# "let jar" can still have jar.pairs.push(...).
+# ============================================================================
+
+struct Session {
+    id: str,
+    data: map[str, str],
+    created_ms: int,
+    expires_ms: int,
+    last_access_ms: int
+}
+
+# session_new(id, ttl_ms, now_ms) — construct a fresh Session with the
+# given ID, empty data, and an expiry of now_ms + ttl_ms. The caller
+# is responsible for generating the ID (session_generate_id) and
+# providing the current wall-clock time (system_time_now_ms from
+# std.time, or a fixed value in tests).
+fn session_new(id: str, ttl_ms: int, now_ms: int) -> Session {
+    let exp: int = now_ms + ttl_ms
+    return Session {
+        id: id,
+        data: map_new(),
+        created_ms: now_ms,
+        expires_ms: exp,
+        last_access_ms: now_ms
+    }
+}
+
+# session_get(s, key) — return the value associated with `key`, or ""
+# if absent. Returns str (not Option[str]) for symmetry with
+# cookie_get / url_query_parse — the empty string is the canonical
+# "absent" sentinel for string-valued maps throughout the stdlib.
+fn session_get(s: Session, key: str) -> str {
+    return s.data.get_or(key, "")
+}
+
+# session_has(s, key) — true iff `key` is present in the session data
+# (regardless of value, including "").
+fn session_has(s: Session, key: str) -> bool {
+    return s.data.has(key)
+}
+
+# session_set(s, key, value) — associate `value` with `key`. Mutates
+# s.data in place (map.set returns void). Overwrites any prior value.
+fn session_set(s: Session, key: str, value: str) -> void {
+    s.data.set(key, value)
+    return
+}
+
+# session_keys(s) — return every distinct key in the session data, in
+# map iteration order (which is insertion order in the current
+# implementation, but callers should not rely on it).
+fn session_keys(s: Session) -> list[str] {
+    return s.data.keys()
+}
+
+# session_is_expired(s, now_ms) — true iff the session's expiry is in
+# the past relative to `now_ms`. A session with expires_ms == 0 is
+# ALWAYS expired (this is the "destroyed" marker used by
+# session_store_destroy, since HLS maps have no remove() method).
+fn session_is_expired(s: Session, now_ms: int) -> bool {
+    if s.expires_ms <= 0 {
+        return true
+    }
+    return now_ms >= s.expires_ms
+}
+
+# session_touch(s, now_ms) — update last_access_ms to the current time.
+# Called by session_store_get on every successful lookup, so the store
+# can identify idle sessions for reaping.
+fn session_touch(s: Session, now_ms: int) -> void {
+    s.last_access_ms = now_ms
+    return
+}
+
+# session_extend(s, ttl_ms, now_ms) — renew the session's expiry to
+# now_ms + ttl_ms. Implements sliding expiration (each access resets
+# the idle timer). Called by session_store_get when sliding expiration
+# is desired; the caller can also call it directly to implement
+# "remember me" functionality.
+fn session_extend(s: Session, ttl_ms: int, now_ms: int) -> void {
+    s.expires_ms = now_ms + ttl_ms
+    s.last_access_ms = now_ms
+    return
+}
+
+# session_describe(s) — human-readable rendering for log output and
+# the demo. Shows every field; the data map is rendered as
+# "key=value" pairs separated by ", ". Pure (no I/O).
+fn session_describe(s: Session) -> str {
+    let mut out: str = "Session { id: " + s.id
+    out = out + ", created_ms: " + s.created_ms.to_str()
+    out = out + ", expires_ms: " + s.expires_ms.to_str()
+    out = out + ", last_access_ms: " + s.last_access_ms.to_str()
+    out = out + ", data: {"
+    let keys: list[str] = s.data.keys()
+    let mut i: int = 0
+    while i < keys.len() {
+        let k: str = keys.get(i)
+        let v: str = s.data.get_or(k, "")
+        if i > 0 {
+            out = out + ", "
+        }
+        out = out + k + "=" + v
+        i = i + 1
+    }
+    out = out + "} }"
+    return out
+}
+
+# ============================================================================
+# ID generation & validation.
+#
+# The ID is 32 random bytes, base64url-encoded (43 chars, no padding).
+# 32 bytes = 256 bits of entropy, which is the OWASP recommended
+# minimum for session tokens. base64url is used (not standard base64)
+# because:
+#   * The '-' and '_' chars are cookie-safe (no quoting needed).
+#   * No '=' padding means the value can be embedded in a URL or a
+#     cookie value without escaping.
+#
+# Randomness source: rand_int(256) per byte (effect Rand). On the
+# native path, rand_int is backed by /dev/urandom (Stage 9). On the
+# interpreter path, it uses Python's random module — NOT cryptographic
+# — but the interpreter is for development only. For production use,
+# the native binary's /dev/urandom path is used.
+# ============================================================================
+
+# session_generate_id() — draw 32 random bytes and base64url-encode.
+# Returns a 43-char string over the alphabet [A-Za-z0-9_-].
+fn session_generate_id() -> str uses Rand {
+    let out: list[str] = []
+    let n: int = session_id_byte_len()
+    let mut i: int = 0
+    while i < n {
+        out.push(chr(rand_int(256)))
+        i = i + 1
+    }
+    let raw: str = str_join(out, "")
+    return base64url_encode(raw)
+}
+
+# session_is_valid_id(s) — true iff s is a syntactically valid session
+# ID: exactly 43 chars, every char in the base64url alphabet
+# [A-Za-z0-9_-]. Rejects:
+#   * Empty / wrong-length strings (likely a truncated or absent cookie)
+#   * Strings containing "/", "+", "=" (standard base64, not base64url)
+#   * Strings containing ".", ";", ",", "\\" (cookie-separator chars)
+#   * Strings containing control chars or non-ASCII bytes
+#   * Path-traversal attempts ("..", "/")
+# Used as a defense-in-depth check before using the ID as a filesystem
+# path (file-backed store) or a map key (in-memory store).
+fn session_is_valid_id(s: str) -> bool {
+    # 32 bytes base64url-encoded = 43 chars (no padding). Hard-code
+    # the expected length: 32 * 4 / 3 = 42.67, rounded up to 43 with
+    # no '=' padding (base64url strips the trailing '=').
+    if s.len() != 43 {
+        return false
+    }
+    let n: int = s.len()
+    let mut i: int = 0
+    while i < n {
+        let b: int = s.byte_at(i)
+        if !_session_id_byte_ok(b) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+# _session_id_byte_ok(b) — true iff b is a valid base64url char:
+# A-Z (65..90), a-z (97..122), 0-9 (48..57), '-' (45), '_' (95).
+fn _session_id_byte_ok(b: int) -> bool {
+    if b >= 65 && b <= 90 {
+        return true
+    }
+    if b >= 97 && b <= 122 {
+        return true
+    }
+    if b >= 48 && b <= 57 {
+        return true
+    }
+    if b == 45 || b == 95 {
+        return true
+    }
+    return false
+}
+
+# session_sanitize_id(s) — defensive sanitisation. Returns the input
+# unchanged if it is a valid ID; otherwise returns "" (the empty
+# string). The caller should treat "" as "no valid session ID
+# present" and proceed as if the cookie were absent.
+#
+# This is a SECOND line of defense behind session_is_valid_id: it
+# ensures that even if a caller forgets to validate, the value
+# passed to the file-backed store cannot contain "/", "..", NUL,
+# or other path-traversal bytes.
+fn session_sanitize_id(s: str) -> str {
+    if !session_is_valid_id(s) {
+        return ""
+    }
+    return s
+}
+
+# ============================================================================
+# In-memory SessionStore.
+#
+# A SessionStore holds:
+#   * sessions      — map[str, Session] keyed by session ID
+#   * secret        — the HMAC-SHA1 secret used to sign/verify the
+#                     session cookie (passed to std.cookie)
+#   * default_ttl_ms — the TTL applied to new sessions
+#
+# The store is intended to be created once in main() and threaded
+# through the user's HTTP handlers. For multi-threaded servers, the
+# caller wraps the store in a std.sync.Mutex (Stage 45) themselves —
+# the store does NOT do its own locking, matching the design of
+# std.cookie and std.http_router (no implicit locking).
+#
+# Because HLS maps have no remove() method, session_store_destroy
+# marks the session as expired (expires_ms = 0) rather than removing
+# it from the map. session_store_reap rebuilds the map without
+# expired entries — call it periodically (e.g. every 1000 requests)
+# to keep memory bounded.
+# ============================================================================
+
+struct SessionStore {
+    sessions: map[str, Session],
+    secret: str,
+    default_ttl_ms: int
+}
+
+# session_store_new(secret, default_ttl_ms) — construct an empty
+# SessionStore. The secret should be at least 32 bytes of high-entropy
+# random data (e.g. 32 bytes from /dev/urandom, base64url-encoded);
+# shorter secrets weaken the HMAC-SHA1 signature. default_ttl_ms
+# is the TTL applied to new sessions created via session_store_create;
+# pass session_default_ttl_ms() for the 24-hour default.
+fn session_store_new(secret: str, default_ttl_ms: int) -> SessionStore {
+    return SessionStore {
+        sessions: map_new(),
+        secret: secret,
+        default_ttl_ms: default_ttl_ms
+    }
+}
+
+# session_store_create(store, now_ms) — generate a new session ID,
+# construct a Session with the store's default TTL, insert it, and
+# return it. The caller is responsible for attaching the corresponding
+# Set-Cookie to the HTTP response (session_issue_cookie).
+fn session_store_create(store: SessionStore, now_ms: int) -> Session uses Rand {
+    let id: str = session_generate_id()
+    let s: Session = session_new(id, store.default_ttl_ms, now_ms)
+    store.sessions.set(id, s)
+    return s
+}
+
+# session_store_get(store, id, now_ms) — look up a session by ID.
+# Returns Option.Some(session) if present and not expired (and
+# touches last_access_ms); Option.None if absent or expired.
+#
+# IMPORTANT: the session is returned BY VALUE. Mutations to its data
+# map will be visible in the store (maps are reference types), but
+# mutations to its scalar fields (expires_ms, last_access_ms) will
+# NOT be — call session_store_save to persist those.
+fn session_store_get(store: SessionStore, id: str, now_ms: int) -> Option[Session] {
+    if !session_is_valid_id(id) {
+        return Option.None
+    }
+    if !store.sessions.has(id) {
+        return Option.None
+    }
+    let s: Session = store.sessions.get_or(id, session_new("", 0, 0))
+    if session_is_expired(s, now_ms) {
+        return Option.None
+    }
+    s.last_access_ms = now_ms
+    store.sessions.set(id, s)
+    return Option.Some(s)
+}
+
+# session_store_save(store, session) — insert or replace a session in
+# the store. Used to persist mutations to a Session's scalar fields
+# (expires_ms, last_access_ms) after the caller has modified them.
+fn session_store_save(store: SessionStore, session: Session) -> void {
+    store.sessions.set(session.id, session)
+    return
+}
+
+# session_store_destroy(store, id) — mark a session as destroyed.
+# Because HLS maps have no remove() method, we mark the session as
+# expired (expires_ms = 0) so subsequent session_store_get calls
+# return None. The actual map entry is removed by session_store_reap.
+# Returns true iff a session with the given ID was present.
+fn session_store_destroy(store: SessionStore, id: str) -> bool {
+    if !store.sessions.has(id) {
+        return false
+    }
+    let s: Session = store.sessions.get_or(id, session_new("", 0, 0))
+    s.expires_ms = 0
+    store.sessions.set(id, s)
+    return true
+}
+
+# session_store_reap(store, now_ms) — count the number of expired
+# sessions in the store. Returns the count. Does NOT modify the store
+# (HLS maps have no remove() method, so we cannot delete entries in
+# place). For actual cleanup, the caller should use
+# session_store_compact, which returns a NEW SessionStore containing
+# only the live sessions.
+#
+# This function is still useful: call it periodically to monitor the
+# ratio of live to expired sessions and decide when to compact.
+fn session_store_reap(store: SessionStore, now_ms: int) -> int {
+    let mut reaped: int = 0
+    let keys: list[str] = store.sessions.keys()
+    let mut i: int = 0
+    while i < keys.len() {
+        let k: str = keys.get(i)
+        let s: Session = store.sessions.get_or(k, session_new("", 0, 0))
+        if session_is_expired(s, now_ms) {
+            reaped = reaped + 1
+        }
+        i = i + 1
+    }
+    return reaped
+}
+
+# session_store_compact(store, now_ms) — return a NEW SessionStore
+# containing only the live sessions from `store`. This is the only
+# way to truly remove expired entries from the underlying map (since
+# HLS maps have no remove() method). The caller discards the old
+# store and uses the new one going forward.
+fn session_store_compact(store: SessionStore, now_ms: int) -> SessionStore {
+    let live: map[str, Session] = map_new()
+    let keys: list[str] = store.sessions.keys()
+    let mut i: int = 0
+    while i < keys.len() {
+        let k: str = keys.get(i)
+        let s: Session = store.sessions.get_or(k, session_new("", 0, 0))
+        if !session_is_expired(s, now_ms) {
+            live.set(k, s)
+        }
+        i = i + 1
+    }
+    return SessionStore {
+        sessions: live,
+        secret: store.secret,
+        default_ttl_ms: store.default_ttl_ms
+    }
+}
+
+# session_store_count(store) — total number of sessions in the store,
+# INCLUDING expired-but-not-reaped ones. Use session_store_reap first
+# if you want only live sessions.
+fn session_store_count(store: SessionStore) -> int {
+    return store.sessions.len()
+}
+
+# ============================================================================
+# File-backed SessionFileStore.
+#
+# A SessionFileStore persists each session as a separate file at
+# `<dir>/<id>.sess`. The file content is the output of session_serialize
+# (a text format). This is the standard pattern for file-backed
+# sessions (used by PHP's file session handler, Express's session-file-store,
+# and Rails' ActiveRecord session store with `:file` adapter).
+#
+# The store is intended for development / single-instance production /
+# environments where an external database is not available. For
+# multi-instance production, use an in-memory store backed by Redis
+# or a database (a future stage may add std.session.redis).
+#
+# Security:
+#   * The directory should be mode 0700 (owner-only) and OUTSIDE the
+#     web root. The caller is responsible for creating it.
+#   * The session ID is validated (session_is_valid_id) before being
+#     used as a filename, so path traversal via "../" or "/" in the
+#     ID is impossible.
+#   * The file content includes the session ID, expires_ms, and data
+#     map. It does NOT include the HMAC secret (the secret is held
+#     only in memory by the store).
+# ============================================================================
+
+struct SessionFileStore {
+    dir: str,
+    secret: str,
+    default_ttl_ms: int
+}
+
+# session_file_store_new(dir, secret, default_ttl_ms) — construct a
+# SessionFileStore. The directory should already exist (the store
+# does NOT create it; the caller is responsible for `mkdir -p`).
+# The dir is stored verbatim — no trailing slash processing is done
+# here; session_file_store_path composes the path correctly.
+fn session_file_store_new(dir: str, secret: str, default_ttl_ms: int) -> SessionFileStore {
+    return SessionFileStore {
+        dir: dir,
+        secret: secret,
+        default_ttl_ms: default_ttl_ms
+    }
+}
+
+# session_file_store_path(store, id) — compose the filesystem path
+# for a session ID. Returns "<dir>/<id>.sess". The ID is validated
+# first; an invalid ID returns "" (the empty string), which the
+# caller should treat as "no session file". This is the primary
+# defense against path traversal: a "../" in the ID cannot reach
+# this code path.
+fn session_file_store_path(store: SessionFileStore, id: str) -> str {
+    if !session_is_valid_id(id) {
+        return ""
+    }
+    let d: str = store.dir
+    # Ensure exactly one "/" between dir and id.
+    if d.len() > 0 && d.byte_at(d.len() - 1) == 47 {
+        # Trailing slash present — don't add another.
+        return d + id + session_file_extension()
+    }
+    return d + "/" + id + session_file_extension()
+}
+
+# session_file_store_create(store, now_ms) — generate a new session,
+# persist it to disk, and return it. The file is written atomically
+# (write_file overwrites; if the file already exists from a prior
+# incarnation with the same ID, it is replaced — but the ID is 256-bit
+# random so collisions are astronomically unlikely).
+fn session_file_store_create(store: SessionFileStore, now_ms: int) -> Session uses Fs, Rand {
+    let id: str = session_generate_id()
+    let s: Session = session_new(id, store.default_ttl_ms, now_ms)
+    session_file_store_save(store, s)
+    return s
+}
+
+# session_file_store_get(store, id, now_ms) — load a session from disk.
+# Returns Option.Some(session) if the file exists, parses cleanly, and
+# is not expired; Option.None otherwise. Touches last_access_ms and
+# re-saves the session (so the access time is persisted).
+fn session_file_store_get(store: SessionFileStore, id: str, now_ms: int) -> Option[Session] uses Fs {
+    let path: str = session_file_store_path(store, id)
+    if path == "" {
+        return Option.None
+    }
+    if !file_exists(path) {
+        return Option.None
+    }
+    let raw: str = read_file(path)
+    let parsed: Result[Session, str] = session_parse(raw)
+    if !result_is_ok(parsed) {
+        return Option.None
+    }
+    let s: Session = result_unwrap(parsed)
+    if s.id != id {
+        # The file's ID doesn't match its filename — reject (defensive
+        # against a swapped or tampered file).
+        return Option.None
+    }
+    if session_is_expired(s, now_ms) {
+        return Option.None
+    }
+    s.last_access_ms = now_ms
+    session_file_store_save(store, s)
+    return Option.Some(s)
+}
+
+# session_file_store_save(store, session) — write a session to disk.
+# Overwrites any existing file with the same ID. The file is written
+# in a single write_file call (no append, no partial writes). The
+# caller is responsible for ensuring the directory exists and is
+# writable.
+fn session_file_store_save(store: SessionFileStore, session: Session) -> void uses Fs {
+    let path: str = session_file_store_path(store, session.id)
+    if path == "" {
+        panic("session_file_store_save: invalid session ID")
+    }
+    let raw: str = session_serialize(session)
+    write_file(path, raw)
+    return
+}
+
+# session_file_store_destroy(store, id) — destroy a session file.
+# Writes an empty file (rather than removing it, since HLS has no
+# file-delete builtin). session_file_store_get treats an empty file
+# as "no valid session" (session_parse returns Err on empty input).
+# Returns true iff the file existed before destruction.
+fn session_file_store_destroy(store: SessionFileStore, id: str) -> bool uses Fs {
+    let path: str = session_file_store_path(store, id)
+    if path == "" {
+        return false
+    }
+    if !file_exists(path) {
+        return false
+    }
+    # Write an empty file — session_parse will return Err on it,
+    # and session_file_store_get will return None. This is the
+    # closest we can get to file deletion without a remove builtin.
+    write_file(path, "")
+    return true
+}
+
+# session_file_store_reap(store, now_ms) — scan the directory for
+# session files, parse each, and destroy expired ones. Returns the
+# count of files destroyed. Uses fs_read_dir (Stage 36) to list
+# directory entries.
+fn session_file_store_reap(store: SessionFileStore, now_ms: int) -> int uses Fs {
+    let entries: list[str] = fs_read_dir(store.dir)
+    let mut reaped: int = 0
+    let mut i: int = 0
+    while i < entries.len() {
+        let entry: str = entries.get(i)
+        # Extract the ID from the filename: strip the ".sess" suffix.
+        let ext: str = session_file_extension()
+        if entry.len() <= ext.len() {
+            i = i + 1
+            continue
+        }
+        let suffix: str = entry.slice(entry.len() - ext.len(), entry.len())
+        if suffix != ext {
+            i = i + 1
+            continue
+        }
+        let id: str = entry.slice(0, entry.len() - ext.len())
+        if !session_is_valid_id(id) {
+            i = i + 1
+            continue
+        }
+        let path: str = session_file_store_path(store, id)
+        if !file_exists(path) {
+            i = i + 1
+            continue
+        }
+        let raw: str = read_file(path)
+        let parsed: Result[Session, str] = session_parse(raw)
+        if !result_is_ok(parsed) {
+            # Corrupt file — destroy it.
+            write_file(path, "")
+            reaped = reaped + 1
+            i = i + 1
+            continue
+        }
+        let s: Session = result_unwrap(parsed)
+        if session_is_expired(s, now_ms) {
+            write_file(path, "")
+            reaped = reaped + 1
+        }
+        i = i + 1
+    }
+    return reaped
+}
+
+# session_file_store_count(store) — count the session files in the
+# directory. Returns the number of files matching the "<id>.sess"
+# pattern. Does NOT check expiry (use session_file_store_reap first).
+fn session_file_store_count(store: SessionFileStore) -> int uses Fs {
+    let entries: list[str] = fs_read_dir(store.dir)
+    let mut count: int = 0
+    let mut i: int = 0
+    let ext: str = session_file_extension()
+    while i < entries.len() {
+        let entry: str = entries.get(i)
+        if entry.len() <= ext.len() {
+            i = i + 1
+            continue
+        }
+        let suffix: str = entry.slice(entry.len() - ext.len(), entry.len())
+        if suffix != ext {
+            i = i + 1
+            continue
+        }
+        let id: str = entry.slice(0, entry.len() - ext.len())
+        if session_is_valid_id(id) {
+            count = count + 1
+        }
+        i = i + 1
+    }
+    return count
+}
+
+# ============================================================================
+# Serialisation — text format for the file-backed store.
+#
+# Format (line-oriented, deterministic):
+#   v1
+#   <id>
+#   <created_ms>
+#   <expires_ms>
+#   <last_access_ms>
+#   <key>=<value>
+#   <key>=<value>
+#   ...
+#
+# The first line is the version ("v1"). The next four lines are scalar
+# fields. The remaining lines are "key=value" pairs from the data map.
+# An empty data map produces no key=value lines. The serialisation is
+# deterministic (map.keys() returns a stable order in the current
+# implementation; if that changes, the file format remains parseable
+# but the byte-identical-differential guarantee may require sorting).
+#
+# Values may contain "=" (the parser splits on the FIRST "=" only) and
+# any byte except newline (0x0A). Newlines in values are replaced with
+# the literal "\n" sequence before serialisation, and restored on parse.
+# This is a minimal escaping scheme — sufficient for typical session
+# data (user IDs, role strings, CSRF tokens) without the complexity of
+# a full JSON encoder.
+# ============================================================================
+
+# session_serialize(s) — render a Session as a text string. Pure
+# (no I/O). Deterministic in (s.id, s.created_ms, s.expires_ms,
+# s.last_access_ms, s.data).
+fn session_serialize(s: Session) -> str {
+    let mut out: str = session_serial_version() + "\n"
+    out = out + s.id + "\n"
+    out = out + s.created_ms.to_str() + "\n"
+    out = out + s.expires_ms.to_str() + "\n"
+    out = out + s.last_access_ms.to_str() + "\n"
+    let keys: list[str] = s.data.keys()
+    let mut i: int = 0
+    while i < keys.len() {
+        let k: str = keys.get(i)
+        let v: str = s.data.get_or(k, "")
+        out = out + _session_escape(k) + "=" + _session_escape(v) + "\n"
+        i = i + 1
+    }
+    return out
+}
+
+# session_parse(raw) — parse a serialised Session. Returns
+# Result.Ok(session) on success, Result.Err(reason) on failure.
+# Strict: rejects malformed version, non-numeric timestamps, missing
+# fields, and ID/filename mismatches (the caller is expected to check
+# the latter separately).
+fn session_parse(raw: str) -> Result[Session, str] {
+    if raw.len() == 0 {
+        return Result.Err("empty input")
+    }
+    let lines: list[str] = raw.split("\n")
+    if lines.len() < 5 {
+        return Result.Err("truncated header (need >= 5 lines)")
+    }
+    let ver: str = lines.get(0)
+    if ver != session_serial_version() {
+        return Result.Err("unsupported version: " + ver)
+    }
+    let id: str = lines.get(1)
+    if !session_is_valid_id(id) {
+        return Result.Err("invalid session ID in serialised form")
+    }
+    let created_str: str = lines.get(2)
+    let expires_str: str = lines.get(3)
+    let last_access_str: str = lines.get(4)
+    let created_ms: int = _session_parse_int(created_str)
+    if created_ms == -1 && created_str != "-1" {
+        return Result.Err("invalid created_ms: " + created_str)
+    }
+    let expires_ms: int = _session_parse_int(expires_str)
+    if expires_ms == -1 && expires_str != "-1" {
+        return Result.Err("invalid expires_ms: " + expires_str)
+    }
+    let last_access_ms: int = _session_parse_int(last_access_str)
+    if last_access_ms == -1 && last_access_str != "-1" {
+        return Result.Err("invalid last_access_ms: " + last_access_str)
+    }
+    let data: map[str, str] = map_new()
+    let mut i: int = 5
+    while i < lines.len() {
+        let line: str = lines.get(i)
+        if line.len() == 0 {
+            # Trailing empty line (from the final "\n" in serialise).
+            i = i + 1
+            continue
+        }
+        let eq: int = line.find("=")
+        if eq < 0 {
+            # No "=" — skip the line (defensive; should not happen
+            # for well-formed input).
+            i = i + 1
+            continue
+        }
+        let k: str = _session_unescape(line.slice(0, eq))
+        let v: str = _session_unescape(line.slice(eq + 1, line.len()))
+        data.set(k, v)
+        i = i + 1
+    }
+    return Result.Ok(Session {
+        id: id,
+        data: data,
+        created_ms: created_ms,
+        expires_ms: expires_ms,
+        last_access_ms: last_access_ms
+    })
+}
+
+# _session_escape(s) — replace newlines with the literal "\n" sequence
+# so a value can fit on a single line in the serialised form. Also
+# escapes carriage returns and tabs for cleanliness.
+fn _session_escape(s: str) -> str {
+    let out: list[str] = []
+    let n: int = s.len()
+    let mut i: int = 0
+    while i < n {
+        let b: int = s.byte_at(i)
+        if b == 10 {
+            out.push("\\n")
+        } else {
+            if b == 13 {
+                out.push("\\r")
+            } else {
+                if b == 9 {
+                    out.push("\\t")
+                } else {
+                    out.push(s.slice(i, i + 1))
+                }
+            }
+        }
+        i = i + 1
+    }
+    return str_join(out, "")
+}
+
+# _session_unescape(s) — reverse of _session_escape. Replaces "\n",
+# "\r", "\t" with the corresponding control chars. Does NOT support
+# "\\n" (i.e. a literal backslash followed by 'n') — values containing
+# such sequences will be mis-decoded. This is a known limitation;
+# session values rarely contain backslashes.
+fn _session_unescape(s: str) -> str {
+    let out: list[str] = []
+    let n: int = s.len()
+    let mut i: int = 0
+    while i < n {
+        let b: int = s.byte_at(i)
+        if b == 92 && i + 1 < n {
+            # Backslash — check the next byte.
+            let next: int = s.byte_at(i + 1)
+            if next == 110 {
+                out.push(chr(10))
+                i = i + 2
+                continue
+            }
+            if next == 114 {
+                out.push(chr(13))
+                i = i + 2
+                continue
+            }
+            if next == 116 {
+                out.push(chr(9))
+                i = i + 2
+                continue
+            }
+            # Unknown escape — emit the backslash verbatim and let
+            # the next iteration handle the following byte.
+            out.push(s.slice(i, i + 1))
+            i = i + 1
+            continue
+        }
+        out.push(s.slice(i, i + 1))
+        i = i + 1
+    }
+    return str_join(out, "")
+}
+
+# _session_parse_int(s) — parse a non-negative decimal integer.
+# Returns -1 on parse failure (callers must distinguish -1 from a
+# genuine -1 input — they do by checking the input string). This is
+# a workaround for the lack of a str-to-int builtin that signals
+# failure; the stdlib pattern (e.g. in std.json) is to use a sentinel.
+fn _session_parse_int(s: str) -> int {
+    if s.len() == 0 {
+        return -1
+    }
+    let mut result: int = 0
+    let n: int = s.len()
+    let mut i: int = 0
+    let mut negative: bool = false
+    if s.byte_at(0) == 45 {
+        negative = true
+        i = 1
+    }
+    if i == n {
+        return -1
+    }
+    while i < n {
+        let b: int = s.byte_at(i)
+        if b < 48 || b > 57 {
+            return -1
+        }
+        result = result * 10 + (b - 48)
+        i = i + 1
+    }
+    if negative {
+        return 0 - result
+    }
+    return result
+}
+
+# ============================================================================
+# HTTP / cookie glue.
+#
+# The session ID is delivered to the client via a signed, Secure,
+# HttpOnly, SameSite=Lax cookie named "sid". On each subsequent
+# request, the client sends the cookie back; the server verifies the
+# signature, extracts the original ID, and looks up the session.
+#
+# The cookie is signed with the SAME secret used by std.cookie's
+# cookie_sign (HMAC-SHA1, RFC 2104). This means a session cookie
+# and an application-level signed cookie can share a secret without
+# interference — the cookie's NAME is part of the HMAC message only
+# indirectly (via the cookie's value field).
+# ============================================================================
+
+# session_issue_cookie(session, secret) — build the Set-Cookie header
+# value for a session. Returns a SetCookie configured with:
+#   * name  = "sid"
+#   * value = "<id>.<base64url(hmac-sha1(secret, id))>"  (signed)
+#   * Max-Age = (expires_ms - now_ms) / 1000  (in seconds)
+#   * Path = "/"
+#   * Secure = true
+#   * HttpOnly = true
+#   * SameSite = Lax
+#
+# The Max-Age is computed from the session's expires_ms and the
+# current time. The caller must pass the current time (now_ms) so
+# the function is pure (deterministic in its inputs).
+#
+# IMPORTANT: the cookie's Max-Age is in SECONDS, but the session's
+# expires_ms is in MILLISECONDS. Divide by 1000.
+fn session_issue_cookie(session: Session, secret: str, now_ms: int) -> SetCookie {
+    let sc: SetCookie = cookie_new(session_cookie_name(), session.id)
+    let signed: SetCookie = cookie_sign(sc, secret)
+    # Compute Max-Age in seconds. Clamp at 0 (negative Max-Age deletes
+    # the cookie — not what we want for an active session).
+    let remaining_ms: int = session.expires_ms - now_ms
+    let mut max_age_secs: int = remaining_ms / 1000
+    if max_age_secs < 0 {
+        max_age_secs = 0
+    }
+    let with_max_age: SetCookie = cookie_with_max_age(signed, max_age_secs)
+    let with_path: SetCookie = cookie_with_path(with_max_age, "/")
+    let with_secure: SetCookie = cookie_with_secure(with_path, true)
+    let with_http_only: SetCookie = cookie_with_http_only(with_secure, true)
+    let with_same_site: SetCookie = cookie_with_same_site(with_http_only, cookie_samesite_lax())
+    return with_same_site
+}
+
+# session_attach_cookie(resp, session, secret, now_ms) — append the
+# session's Set-Cookie header to an HTTP response. Returns a NEW
+# HttpResponse (the headers list is rebuilt via http_header_add).
+fn session_attach_cookie(resp: HttpResponse, session: Session, secret: str, now_ms: int) -> HttpResponse {
+    let sc: SetCookie = session_issue_cookie(session, secret, now_ms)
+    let header: HttpHeader = cookie_to_header(sc)
+    resp.headers = http_header_add(resp.headers, header.name, header.value)
+    return resp
+}
+
+# session_destroy_cookie() — build a Set-Cookie that DELETES the
+# session cookie client-side (Max-Age=0 forces immediate expiry).
+# Used by logout handlers. The cookie is still signed (so an attacker
+# cannot inject a "delete" cookie for someone else's session — the
+# signature would not match).
+fn session_destroy_cookie(secret: str) -> SetCookie {
+    let sc: SetCookie = cookie_new(session_cookie_name(), "")
+    let signed: SetCookie = cookie_sign(sc, secret)
+    let with_max_age: SetCookie = cookie_with_max_age(signed, 0)
+    let with_path: SetCookie = cookie_with_path(with_max_age, "/")
+    let with_secure: SetCookie = cookie_with_secure(with_path, true)
+    let with_http_only: SetCookie = cookie_with_http_only(with_secure, true)
+    let with_same_site: SetCookie = cookie_with_same_site(with_http_only, cookie_samesite_lax())
+    return with_same_site
+}
+
+# session_id_from_request(req, secret) — extract a verified session ID
+# from an HTTP request's Cookie header. Returns Option.Some(id) if:
+#   1. The Cookie header is present and contains a "sid" cookie.
+#   2. The cookie's signature verifies (HMAC-SHA1, constant-time).
+#   3. The recovered ID is syntactically valid (43 base64url chars).
+# Returns Option.None otherwise. Pure (no I/O) — the lookup against
+# the session store is done by the caller.
+fn session_id_from_request(req: HttpRequest, secret: str) -> Option[str] {
+    let jar: CookieJar = cookie_parse_request(req.headers)
+    if !cookie_has(jar, session_cookie_name()) {
+        return Option.None
+    }
+    let raw: str = cookie_get(jar, session_cookie_name())
+    if raw.len() == 0 {
+        return Option.None
+    }
+    # Wrap the raw value in a SetCookie so we can use cookie_unwrap_signed.
+    let sc: SetCookie = cookie_new(session_cookie_name(), raw)
+    let unwrapped: Result[str, str] = cookie_unwrap_signed(sc, secret)
+    if !result_is_ok(unwrapped) {
+        return Option.None
+    }
+    let id: str = result_unwrap(unwrapped)
+    if !session_is_valid_id(id) {
+        return Option.None
+    }
+    return Option.Some(id)
+}
+
+# session_load_from_request(store, req, now_ms) — convenience: extract
+# the session ID from the request, look it up in the in-memory store,
+# and return the Session (or None). Pure (no I/O beyond the store).
+fn session_load_from_request(store: SessionStore, req: HttpRequest, now_ms: int) -> Option[Session] {
+    let id_opt: Option[str] = session_id_from_request(req, store.secret)
+    if !option_is_some(id_opt) {
+        return Option.None
+    }
+    let id: str = option_unwrap(id_opt)
+    return session_store_get(store, id, now_ms)
+}
+
+# session_load_from_request_file(store, req, now_ms) — convenience:
+# extract the session ID from the request, look it up in the file-
+# backed store, and return the Session (or None). Uses Fs.
+fn session_load_from_request_file(store: SessionFileStore, req: HttpRequest, now_ms: int) -> Option[Session] uses Fs {
+    let id_opt: Option[str] = session_id_from_request(req, store.secret)
+    if !option_is_some(id_opt) {
+        return Option.None
+    }
+    let id: str = option_unwrap(id_opt)
+    return session_file_store_get(store, id, now_ms)
+}

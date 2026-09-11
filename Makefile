@@ -31,7 +31,7 @@ else
   HL_CURL_DEFS :=
 endif
 
-.PHONY: all stage0 bootstrap test examples clean run check bench install uninstall audit opt-stats emit-ir emit-llvm fmt lint lsp-check pkg-init pkg-add pkg-lock pkg-audit pkg-verify pkg-build pkg-publish pkg-log pkg-log-verify prove prove-full model prove-acceptance hltest fuzz cov fuzz-acceptance wasm-opt webapp webapp-acceptance serve aarch64-bench aarch64-acceptance aarch64-list-targets stack-acceptance inline-acceptance opt-stats-report kernel-attrs escape-acceptance layout-report tail-acceptance tail-report asm-acceptance asm-attrs bench-stdlib spec-check stage32-acceptance async-acceptance stream-acceptance io-acceptance fs-acceptance net-acceptance http-acceptance http2-acceptance json-stream-acceptance regex-acceptance fmt-acceptance hash-acceptance collections-acceptance sync-acceptance thread-acceptance time-acceptance math-acceptance process-acceptance env-acceptance archive-acceptance uuid-ulid-acceptance cli-acceptance tui-acceptance color-acceptance progress-acceptance log-acceptance http-server-acceptance websocket-acceptance cookie-acceptance
+.PHONY: all stage0 bootstrap test examples clean run check bench install uninstall audit opt-stats emit-ir emit-llvm fmt lint lsp-check pkg-init pkg-add pkg-lock pkg-audit pkg-verify pkg-build pkg-publish pkg-log pkg-log-verify prove prove-full model prove-acceptance hltest fuzz cov fuzz-acceptance wasm-opt webapp webapp-acceptance serve aarch64-bench aarch64-acceptance aarch64-list-targets stack-acceptance inline-acceptance opt-stats-report kernel-attrs escape-acceptance layout-report tail-acceptance tail-report asm-acceptance asm-attrs bench-stdlib spec-check stage32-acceptance async-acceptance stream-acceptance io-acceptance fs-acceptance net-acceptance http-acceptance http2-acceptance json-stream-acceptance regex-acceptance fmt-acceptance hash-acceptance collections-acceptance sync-acceptance thread-acceptance time-acceptance math-acceptance process-acceptance env-acceptance archive-acceptance uuid-ulid-acceptance cli-acceptance tui-acceptance color-acceptance progress-acceptance log-acceptance http-server-acceptance websocket-acceptance cookie-acceptance session-acceptance csrf-acceptance
 
 # Main goal: use the full bootstrap chain to build the native compiler
 all: bootstrap
@@ -2808,3 +2808,138 @@ cookie-acceptance: bin/hlc
 	@echo "  differential (interpreter == native) verified green."
 
 .PHONY: cookie-acceptance
+
+# ============================================================================
+# Stage 67 (v0.86.0-alpha): std.session -- server-side session storage
+# (in-memory + file-backed). Pure-HLS module on top of std.cookie
+# (Stage 66 signed cookies), std.http, std.bits, std.sha1, std.base64,
+# std.str, std.option, std.result, + global Fs builtins (read_file,
+# write_file, file_exists, fs_read_dir). The session ID is a 32-byte
+# random value, base64url-encoded (43 chars; 256-bit entropy), deliv-
+# ered via a signed + Secure + HttpOnly + SameSite=Lax cookie. The
+# file-backed store uses one file per session at <dir>/<id>.sess, with
+# path-traversal defense (ID validated before use as a filename).
+# ============================================================================
+
+# Stage 67 differential note: the pure pieces of std.session (ID
+# generation, validation, in-memory store CRUD, serialise/parse round
+# trip, cookie issue/parse, session_describe) are pure functions of
+# immutable inputs. The interpreter and the native binary produce
+# byte-identical output on the acceptance test. The demo exercises
+# the file-backed store with cleanup (rand_seed(42) for deterministic
+# ID generation; /tmp/hls_session_demo/ cleaned before each run), so
+# its output is also deterministic and differential-safe.
+
+session-acceptance: bin/hlc
+	@mkdir -p /tmp/hls_session_demo
+	@rm -f /tmp/hls_session_demo/*.sess 2>/dev/null || true
+	@$(PYTHON) boot/boot.py examples/session_demo.hls > /tmp/session_demo_interp.txt 2>&1
+	@bin/hlc examples/session_demo.hls /tmp/session_demo.c 2>/dev/null
+	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/session_demo /tmp/session_demo.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
+	@rm -f /tmp/hls_session_demo/*.sess 2>/dev/null || true
+	@/tmp/session_demo > /tmp/session_demo_nat.txt 2>&1
+	@diff -q /tmp/session_demo_interp.txt /tmp/session_demo_nat.txt >/dev/null 2>&1 \
+		|| (echo "FAIL: session_demo differential mismatch" && false)
+	@mkdir -p /tmp/hls_session_test
+	@rm -f /tmp/hls_session_test/*.sess 2>/dev/null || true
+	@$(PYTHON) boot/boot.py tests/ok/feat_stage67_session.hls > /tmp/s67_interp.txt 2>&1
+	@bin/hlc tests/ok/feat_stage67_session.hls /tmp/s67.c 2>/dev/null
+	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/s67 /tmp/s67.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
+	@rm -f /tmp/hls_session_test/*.sess 2>/dev/null || true
+	@/tmp/s67 > /tmp/s67_nat.txt 2>&1
+	@diff -q /tmp/s67_interp.txt /tmp/s67_nat.txt >/dev/null 2>&1 \
+		|| (echo "FAIL: feat_stage67_session differential mismatch" && false)
+	@rm -f /tmp/session_demo /tmp/session_demo.c /tmp/session_demo_interp.txt /tmp/session_demo_nat.txt \
+		/tmp/s67 /tmp/s67.c /tmp/s67_interp.txt /tmp/s67_nat.txt
+	@rm -f /tmp/hls_session_demo/*.sess /tmp/hls_session_test/*.sess 2>/dev/null || true
+	@echo ""
+	@echo "ACCEPTANCE OK: Stage 67 -- std.session (server-side sessions)"
+	@echo "  Session record:"
+	@echo "    session_new / _get / _set / _has / _keys / _is_expired / _touch / _extend"
+	@echo "    session_describe (human-readable rendering)"
+	@echo "  ID generation & validation:"
+	@echo "    session_generate_id (32 bytes -> base64url, 43 chars; 256-bit entropy)"
+	@echo "    session_is_valid_id (charset + length check; rejects path traversal)"
+	@echo "    session_sanitize_id (defensive; returns '' for invalid input)"
+	@echo "  In-memory SessionStore:"
+	@echo "    session_store_new / _create / _get / _save / _destroy"
+	@echo "    session_store_reap (count expired) / _compact (true removal)"
+	@echo "    session_store_count"
+	@echo "  File-backed SessionFileStore:"
+	@echo "    session_file_store_new / _create / _get / _save / _destroy"
+	@echo "    session_file_store_reap / _count / _path (path-traversal defense)"
+	@echo "  Serialisation (text format v1):"
+	@echo "    session_serialize (id + timestamps + key=value lines)"
+	@echo "    session_parse (Result[Session, str]; rejects bad version/truncated/bad ID)"
+	@echo "  Cookie glue (signed + Secure + HttpOnly + SameSite=Lax):"
+	@echo "    session_issue_cookie (HMAC-SHA1 signed via std.cookie Stage 66)"
+	@echo "    session_attach_cookie (append Set-Cookie to response)"
+	@echo "    session_destroy_cookie (Max-Age=0 logout)"
+	@echo "    session_id_from_request (parse + verify + extract)"
+	@echo "    session_load_from_request / session_load_from_request_file"
+	@echo "  Security model: SECURE + HTTP-ONLY + SAMESITE=LAX + SIGNED are"
+	@echo "    COMPLEMENTARY defenses (sniffing / XSS-hijack / CSRF / forgery)"
+	@echo "  Pure-HLS implementation (no new compiler builtins)"
+	@echo "  differential (interpreter == native) verified green."
+
+.PHONY: session-acceptance
+
+# ============================================================================
+# Stage 68 (v0.87.0-alpha): std.csrf -- CSRF protection (double-submit
+# cookie + synchronizer-token patterns). Pure-HLS module on top of
+# std.cookie (Stage 66 signed cookies, cookie_const_time_eq), std.http,
+# std.base64, std.str, std.option, std.result. The CSRF token is a
+# 32-byte random value, base64url-encoded (43 chars; 256-bit entropy).
+# Double-submit: NON-HttpOnly cookie + X-CSRF-Token header (constant-
+# time compare). Synchronizer: per-session server-side token store
+# (constant-time compare). Includes safe-method classification
+# (GET/HEAD/OPTIONS safe; POST/PUT/PATCH/DELETE require token).
+# ============================================================================
+
+# Stage 68 differential note: all pieces of std.csrf are pure functions
+# of immutable inputs (token generation is seeded via rand_seed(42) for
+# determinism). The interpreter and the native binary produce byte-
+# identical output on both the demo and the acceptance test.
+
+csrf-acceptance: bin/hlc
+	@$(PYTHON) boot/boot.py examples/csrf_demo.hls > /tmp/csrf_demo_interp.txt 2>&1
+	@bin/hlc examples/csrf_demo.hls /tmp/csrf_demo.c 2>/dev/null
+	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/csrf_demo /tmp/csrf_demo.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
+	@/tmp/csrf_demo > /tmp/csrf_demo_nat.txt 2>&1
+	@diff -q /tmp/csrf_demo_interp.txt /tmp/csrf_demo_nat.txt >/dev/null 2>&1 \
+		|| (echo "FAIL: csrf_demo differential mismatch" && false)
+	@$(PYTHON) boot/boot.py tests/ok/feat_stage68_csrf.hls > /tmp/s68_interp.txt 2>&1
+	@bin/hlc tests/ok/feat_stage68_csrf.hls /tmp/s68.c 2>/dev/null
+	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/s68 /tmp/s68.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
+	@/tmp/s68 > /tmp/s68_nat.txt 2>&1
+	@diff -q /tmp/s68_interp.txt /tmp/s68_nat.txt >/dev/null 2>&1 \
+		|| (echo "FAIL: feat_stage68_csrf differential mismatch" && false)
+	@rm -f /tmp/csrf_demo /tmp/csrf_demo.c /tmp/csrf_demo_interp.txt /tmp/csrf_demo_nat.txt \
+		/tmp/s68 /tmp/s68.c /tmp/s68_interp.txt /tmp/s68_nat.txt
+	@echo ""
+	@echo "ACCEPTANCE OK: Stage 68 -- std.csrf (CSRF protection)"
+	@echo "  Token generation & validation:"
+	@echo "    csrf_generate_token (32 bytes -> base64url, 43 chars; 256-bit entropy)"
+	@echo "    csrf_is_valid_token (charset + length check)"
+	@echo "    csrf_const_time_eq (wraps cookie_const_time_eq Stage 66)"
+	@echo "  Double-submit cookie pattern (stateless):"
+	@echo "    csrf_double_submit_cookie (NON-HttpOnly, Secure, SameSite=Lax)"
+	@echo "    csrf_double_submit_extract (X-CSRF-Token header)"
+	@echo "    csrf_double_submit_cookie_value (csrf cookie value)"
+	@echo "    csrf_double_submit_validate (header == cookie == expected, const-time)"
+	@echo "    csrf_double_submit_issue (append Set-Cookie to response)"
+	@echo "  Synchronizer-token pattern (stateful, per-session):"
+	@echo "    CsrfStore + csrf_store_new / _issue / _validate / _invalidate"
+	@echo "    csrf_store_reap (count expired) / _compact (true removal) / _count"
+	@echo "  HTTP integration:"
+	@echo "    csrf_extract_token (header first, then form field)"
+	@echo "    csrf_validate_request (convenience wrapper)"
+	@echo "    csrf_is_safe_method (GET/HEAD/OPTIONS) / csrf_require_token (POST/PUT/PATCH/DELETE)"
+	@echo "    csrf_describe_failure (human-readable error)"
+	@echo "    csrf_check_request (high-level: safe-method + token check)"
+	@echo "  Security model: SAMESITE=LAX + DOUBLE-SUBMIT + SYNC-TOKEN are"
+	@echo "    COMPLEMENTARY defenses (CSRF / cross-site forgery)"
+	@echo "  Pure-HLS implementation (no new compiler builtins)"
+	@echo "  differential (interpreter == native) verified green."
+
+.PHONY: csrf-acceptance

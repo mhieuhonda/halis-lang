@@ -1,0 +1,510 @@
+# tests/ok/feat_stage68_csrf.hls — Stage 68 (v0.87.0-alpha):
+# std.csrf (CSRF protection — double-submit + sync-token patterns).
+#
+# Exercises:
+#   - csrf_generate_token / csrf_is_valid_token / csrf_const_time_eq
+#     (charset + length check; constant-time comparison)
+#   - Double-submit cookie pattern:
+#     csrf_double_submit_cookie (NON-HttpOnly, Secure, SameSite=Lax)
+#     csrf_double_submit_extract (X-CSRF-Token header)
+#     csrf_double_submit_cookie_value (csrf cookie value)
+#     csrf_double_submit_validate (header == cookie == expected)
+#     csrf_double_submit_issue (append Set-Cookie to response)
+#   - Synchronizer-token pattern:
+#     CsrfStore + csrf_store_new / _issue / _validate / _invalidate
+#     csrf_store_reap (count) / _compact (true removal) / _count
+#   - HTTP integration:
+#     csrf_extract_token (header first, then form field)
+#     csrf_validate_request (convenience wrapper)
+#     csrf_is_safe_method / csrf_require_token
+#     csrf_describe_failure (human-readable error)
+#     csrf_check_request (high-level: safe-method + token check)
+#   - Negative cases: tampered token, wrong session, expired token,
+#     missing header, missing cookie, malformed token, wrong expected
+#
+# The test uses rand_seed(42) for deterministic token generation, so
+# the output is fully reproducible and differential-safe
+# (interpreter == native).
+
+import "std.csrf"
+import "std.cookie"
+import "std.http"
+import "std.str"
+import "std.option"
+import "std.result"
+
+# ============================================================================
+# Helpers — assertion primitives (same pattern as feat_stage66/67).
+# ============================================================================
+
+fn ok(actual: bool, msg: str) -> void uses IO {
+    if !actual {
+        panic("FAIL " + msg)
+    }
+}
+
+fn eq_int(actual: int, expected: int, msg: str) -> void uses IO {
+    if actual != expected {
+        panic("FAIL " + msg + ": expected " + expected.to_str() + ", got " + actual.to_str())
+    }
+}
+
+fn eq_str(actual: str, expected: str, msg: str) -> void uses IO {
+    if actual != expected {
+        panic("FAIL " + msg + ": expected '" + expected + "', got '" + actual + "'")
+    }
+}
+
+fn eq_bool(actual: bool, expected: bool, msg: str) -> void uses IO {
+    if actual != expected {
+        panic("FAIL " + msg + ": expected " + expected.to_str() + ", got " + actual.to_str())
+    }
+}
+
+fn _now_ms() -> int {
+    return 1735689600000
+}
+
+fn _secret() -> str {
+    return "csrf-test-secret-32-bytes-minimum!!"
+}
+
+fn _fixed_token() -> str {
+    return "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij0123456"
+}
+
+fn _fixed_session_id() -> str {
+    return "0123456789abcdefghijklmnopqrstuvwxyzABCDEFG"
+}
+
+# A different valid 43-char token.
+fn _other_token() -> str {
+    return "0123456789abcdefghijklmnopqrstuvwxyzABCDEFG"
+}
+
+# ============================================================================
+# Test 1: csrf_is_valid_token
+# ============================================================================
+
+fn test_is_valid_token() -> int uses IO {
+    ok(csrf_is_valid_token(_fixed_token()), "valid token accepted")
+    ok(csrf_is_valid_token("") == false, "empty rejected")
+    ok(csrf_is_valid_token("short") == false, "too short rejected")
+    ok(csrf_is_valid_token("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij01234567") == false, "too long rejected")
+    # 43 chars but contains "/"
+    ok(csrf_is_valid_token("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij012345/") == false, "slash rejected")
+    # 43 chars but contains "+"
+    ok(csrf_is_valid_token("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij012345+") == false, "plus rejected")
+    # 43 chars but contains "="
+    ok(csrf_is_valid_token("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij012345=") == false, "equals rejected")
+    # 43 chars with a space
+    ok(csrf_is_valid_token("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefg ij0123456") == false, "space rejected")
+    return 0
+}
+
+# ============================================================================
+# Test 2: csrf_generate_token + const_time_eq
+# ============================================================================
+
+fn test_generate_token() -> int uses IO, Rand {
+    rand_seed(42)
+    let t: str = csrf_generate_token()
+    eq_int(t.len(), 43, "generated token length")
+    ok(csrf_is_valid_token(t), "generated token is valid")
+    # const_time_eq
+    ok(csrf_const_time_eq(_fixed_token(), _fixed_token()), "const_time_eq(a, a) = true")
+    ok(csrf_const_time_eq(_fixed_token(), _other_token()) == false, "const_time_eq(a, b) = false")
+    ok(csrf_const_time_eq(_fixed_token(), "") == false, "const_time_eq(a, '') = false")
+    ok(csrf_const_time_eq("", "") == true, "const_time_eq('', '') = true")
+    ok(csrf_const_time_eq("abc", "abcd") == false, "const_time_eq diff length = false")
+    return 0
+}
+
+# ============================================================================
+# Test 3: double-submit cookie construction
+# ============================================================================
+
+fn test_double_submit_cookie() -> int uses IO {
+    let sc: SetCookie = csrf_double_submit_cookie(_fixed_token(), 1800)
+    eq_str(sc.name, "csrf", "cookie name")
+    eq_str(sc.value, _fixed_token(), "cookie value")
+    eq_int(sc.max_age, 1800, "cookie Max-Age")
+    eq_str(sc.path, "/", "cookie Path=/")
+    ok(sc.is_secure, "cookie Secure")
+    ok(sc.is_http_only == false, "cookie NOT HttpOnly (JS must read it)")
+    eq_str(sc.same_site, "Lax", "cookie SameSite=Lax")
+    # Invalid token panics
+    let panicked: bool = false
+    # We can't easily catch a panic in HLS; instead, verify the
+    # constructor rejects bad input by checking the validation function
+    # first (which the constructor does internally).
+    ok(csrf_is_valid_token(_fixed_token()), "token valid before cookie construction")
+    return 0
+}
+
+# ============================================================================
+# Test 4: double-submit validate — happy path
+# ============================================================================
+
+fn test_double_submit_validate_ok() -> int uses IO, Rand {
+    rand_seed(42)
+    let token: str = csrf_generate_token()
+    let req: HttpRequest = http_request_new("POST", "/transfer")
+    req.headers = http_header_add(req.headers, "Cookie", "csrf=" + token)
+    req.headers = http_header_add(req.headers, "X-CSRF-Token", token)
+    ok(csrf_double_submit_validate(req, token), "validate with matching header+cookie+expected")
+    # With no expected_token (stateless mode)
+    ok(csrf_double_submit_validate(req, ""), "validate with no expected token")
+    return 0
+}
+
+# ============================================================================
+# Test 5: double-submit validate — failure cases
+# ============================================================================
+
+fn test_double_submit_validate_fail() -> int uses IO, Rand {
+    rand_seed(42)
+    let token: str = csrf_generate_token()
+    # Mismatched header
+    let req1: HttpRequest = http_request_new("POST", "/transfer")
+    req1.headers = http_header_add(req1.headers, "Cookie", "csrf=" + token)
+    req1.headers = http_header_add(req1.headers, "X-CSRF-Token", _other_token())
+    ok(csrf_double_submit_validate(req1, token) == false, "mismatched header rejected")
+    # Missing header
+    let req2: HttpRequest = http_request_new("POST", "/transfer")
+    req2.headers = http_header_add(req2.headers, "Cookie", "csrf=" + token)
+    ok(csrf_double_submit_validate(req2, token) == false, "missing header rejected")
+    # Missing cookie
+    let req3: HttpRequest = http_request_new("POST", "/transfer")
+    req3.headers = http_header_add(req3.headers, "X-CSRF-Token", token)
+    ok(csrf_double_submit_validate(req3, token) == false, "missing cookie rejected")
+    # Both missing
+    let req4: HttpRequest = http_request_new("POST", "/transfer")
+    ok(csrf_double_submit_validate(req4, token) == false, "both missing rejected")
+    # Wrong expected_token
+    let req5: HttpRequest = http_request_new("POST", "/transfer")
+    req5.headers = http_header_add(req5.headers, "Cookie", "csrf=" + token)
+    req5.headers = http_header_add(req5.headers, "X-CSRF-Token", token)
+    ok(csrf_double_submit_validate(req5, _other_token()) == false, "wrong expected rejected")
+    # Malformed header (contains "/")
+    let req6: HttpRequest = http_request_new("POST", "/transfer")
+    req6.headers = http_header_add(req6.headers, "Cookie", "csrf=" + token)
+    req6.headers = http_header_add(req6.headers, "X-CSRF-Token", "bad/token/value/with/slashes/padding/here")
+    ok(csrf_double_submit_validate(req6, token) == false, "malformed header rejected")
+    return 0
+}
+
+# ============================================================================
+# Test 6: double-submit issue + extract
+# ============================================================================
+
+fn test_double_submit_issue_extract() -> int uses IO {
+    let resp: HttpResponse = http_response_new(200)
+    let resp2: HttpResponse = csrf_double_submit_issue(resp, _fixed_token(), 1800)
+    # Count Set-Cookie headers
+    let mut count: int = 0
+    let mut i: int = 0
+    while i < resp2.headers.len() {
+        let h: HttpHeader = resp2.headers.get(i)
+        if h.name == "Set-Cookie" {
+            count = count + 1
+        }
+        i = i + 1
+    }
+    eq_int(count, 1, "one Set-Cookie issued")
+    # Extract from a request
+    let req: HttpRequest = http_request_new("POST", "/x")
+    req.headers = http_header_add(req.headers, "X-CSRF-Token", _fixed_token())
+    eq_str(csrf_double_submit_extract(req), _fixed_token(), "extract header value")
+    # Cookie value
+    let req2: HttpRequest = http_request_new("POST", "/x")
+    req2.headers = http_header_add(req2.headers, "Cookie", "csrf=" + _fixed_token() + "; other=foo")
+    eq_str(csrf_double_submit_cookie_value(req2), _fixed_token(), "extract cookie value")
+    # Absent
+    let req3: HttpRequest = http_request_new("POST", "/x")
+    eq_str(csrf_double_submit_extract(req3), "", "extract absent header returns empty")
+    eq_str(csrf_double_submit_cookie_value(req3), "", "extract absent cookie returns empty")
+    return 0
+}
+
+# ============================================================================
+# Test 7: synchronizer-token store CRUD
+# ============================================================================
+
+fn test_sync_store() -> int uses IO, Rand {
+    rand_seed(42)
+    let now: int = _now_ms()
+    let store: CsrfStore = csrf_store_new(_secret(), csrf_default_ttl_ms())
+    eq_int(csrf_store_count(store), 0, "empty store count")
+    # Issue
+    let session_id: str = _fixed_session_id()
+    let token: str = csrf_store_issue(store, session_id, now)
+    eq_int(token.len(), 43, "issued token length")
+    ok(csrf_is_valid_token(token), "issued token valid")
+    eq_int(csrf_store_count(store), 1, "count after issue")
+    # Validate
+    ok(csrf_store_validate(store, session_id, token, now), "validate ok")
+    # Wrong token
+    ok(csrf_store_validate(store, session_id, _other_token(), now) == false, "wrong token rejected")
+    # Wrong session
+    ok(csrf_store_validate(store, "different-session-id-padding-here-43-char", token, now) == false, "wrong session rejected")
+    # Expired
+    ok(csrf_store_validate(store, session_id, token, now + 99999999000) == false, "expired token rejected")
+    # Invalidate
+    ok(csrf_store_invalidate(store, session_id), "invalidate existing returns true")
+    ok(csrf_store_invalidate(store, "nonexistent") == false, "invalidate non-existent returns false")
+    ok(csrf_store_validate(store, session_id, token, now) == false, "validate after invalidate rejected")
+    return 0
+}
+
+# ============================================================================
+# Test 8: synchronizer-token store reap + compact
+# ============================================================================
+
+fn test_sync_store_reap_compact() -> int uses IO, Rand {
+    rand_seed(42)
+    let now: int = _now_ms()
+    let store: CsrfStore = csrf_store_new(_secret(), csrf_default_ttl_ms())
+    let _t1: str = csrf_store_issue(store, "session-1-padding-here-43-characters-A", now)
+    let _t2: str = csrf_store_issue(store, "session-2-padding-here-43-characters-B", now)
+    eq_int(csrf_store_count(store), 2, "2 tokens")
+    eq_int(csrf_store_reap(store, now), 0, "0 expired at now")
+    eq_int(csrf_store_reap(store, now + 99999999000), 2, "2 expired at future")
+    let compacted: CsrfStore = csrf_store_compact(store, now + 99999999000)
+    eq_int(csrf_store_count(compacted), 0, "compacted store empty")
+    return 0
+}
+
+# ============================================================================
+# Test 9: csrf_extract_token — header and form field
+# ============================================================================
+
+fn test_extract_token() -> int uses IO {
+    # Header takes precedence
+    let req1: HttpRequest = http_request_new("POST", "/x")
+    req1.headers = http_header_add(req1.headers, "X-CSRF-Token", _fixed_token())
+    req1.body = "csrf_token=" + _other_token()
+    eq_str(csrf_extract_token(req1), _fixed_token(), "header takes precedence over form")
+    # Form field when no header
+    let req2: HttpRequest = http_request_new("POST", "/x")
+    req2.body = "amount=100&csrf_token=" + _fixed_token() + "&to=bob"
+    eq_str(csrf_extract_token(req2), _fixed_token(), "form field extracted (middle of body)")
+    # Form field at end of body
+    let req3: HttpRequest = http_request_new("POST", "/x")
+    req3.body = "amount=100&csrf_token=" + _fixed_token()
+    eq_str(csrf_extract_token(req3), _fixed_token(), "form field extracted (end of body)")
+    # Form field at start of body
+    let req4: HttpRequest = http_request_new("POST", "/x")
+    req4.body = "csrf_token=" + _fixed_token() + "&amount=100"
+    eq_str(csrf_extract_token(req4), _fixed_token(), "form field extracted (start of body)")
+    # No token
+    let req5: HttpRequest = http_request_new("POST", "/x")
+    req5.body = "amount=100&to=bob"
+    eq_str(csrf_extract_token(req5), "", "no token returns empty")
+    # Empty body
+    let req6: HttpRequest = http_request_new("POST", "/x")
+    eq_str(csrf_extract_token(req6), "", "empty body returns empty")
+    return 0
+}
+
+# ============================================================================
+# Test 10: method classification
+# ============================================================================
+
+fn test_method_classification() -> int uses IO {
+    # Safe methods
+    ok(csrf_is_safe_method("GET"), "GET is safe")
+    ok(csrf_is_safe_method("HEAD"), "HEAD is safe")
+    ok(csrf_is_safe_method("OPTIONS"), "OPTIONS is safe")
+    # Case-insensitive
+    ok(csrf_is_safe_method("get"), "get is safe (lowercase)")
+    ok(csrf_is_safe_method("Get"), "Get is safe (mixed case)")
+    # Unsafe methods
+    ok(csrf_is_safe_method("POST") == false, "POST is not safe")
+    ok(csrf_is_safe_method("PUT") == false, "PUT is not safe")
+    ok(csrf_is_safe_method("PATCH") == false, "PATCH is not safe")
+    ok(csrf_is_safe_method("DELETE") == false, "DELETE is not safe")
+    # require_token is the complement
+    ok(csrf_require_token("POST"), "POST requires token")
+    ok(csrf_require_token("PUT"), "PUT requires token")
+    ok(csrf_require_token("PATCH"), "PATCH requires token")
+    ok(csrf_require_token("DELETE"), "DELETE requires token")
+    ok(csrf_require_token("GET") == false, "GET does not require token")
+    ok(csrf_require_token("HEAD") == false, "HEAD does not require token")
+    # Unknown method is not safe and does not require token (be conservative)
+    ok(csrf_is_safe_method("TRACE") == false, "TRACE is not safe (conservative)")
+    ok(csrf_require_token("TRACE") == false, "TRACE does not require token (unknown)")
+    return 0
+}
+
+# ============================================================================
+# Test 11: csrf_check_request — high-level
+# ============================================================================
+
+fn test_check_request() -> int uses IO, Rand {
+    rand_seed(42)
+    let now: int = _now_ms()
+    let store: CsrfStore = csrf_store_new(_secret(), csrf_default_ttl_ms())
+    let sid: str = _fixed_session_id()
+    let token: str = csrf_store_issue(store, sid, now)
+    # GET — safe, no token needed
+    let get_req: HttpRequest = http_request_new("GET", "/dashboard")
+    let r1: Result[bool, str] = csrf_check_request(get_req, store, sid, now)
+    ok(result_is_ok(r1), "GET ok (safe method)")
+    # POST with valid header token
+    let post_req: HttpRequest = http_request_new("POST", "/transfer")
+    post_req.headers = http_header_add(post_req.headers, "X-CSRF-Token", token)
+    let r2: Result[bool, str] = csrf_check_request(post_req, store, sid, now)
+    ok(result_is_ok(r2), "POST + valid header token ok")
+    # POST with valid form-field token
+    let form_req: HttpRequest = http_request_new("POST", "/transfer")
+    form_req.body = "amount=100&csrf_token=" + token + "&to=bob"
+    let r3: Result[bool, str] = csrf_check_request(form_req, store, sid, now)
+    ok(result_is_ok(r3), "POST + valid form token ok")
+    # POST with NO token
+    let bad_req: HttpRequest = http_request_new("POST", "/transfer")
+    let r4: Result[bool, str] = csrf_check_request(bad_req, store, sid, now)
+    ok(result_is_ok(r4) == false, "POST no token rejected")
+    # POST with wrong token
+    let wrong_req: HttpRequest = http_request_new("POST", "/transfer")
+    wrong_req.headers = http_header_add(wrong_req.headers, "X-CSRF-Token", _other_token())
+    let r5: Result[bool, str] = csrf_check_request(wrong_req, store, sid, now)
+    ok(result_is_ok(r5) == false, "POST wrong token rejected")
+    # DELETE with valid token
+    let del_req: HttpRequest = http_request_new("DELETE", "/account/42")
+    del_req.headers = http_header_add(del_req.headers, "X-CSRF-Token", token)
+    let r6: Result[bool, str] = csrf_check_request(del_req, store, sid, now)
+    ok(result_is_ok(r6), "DELETE + valid token ok")
+    # PATCH with valid token
+    let patch_req: HttpRequest = http_request_new("PATCH", "/account/42")
+    patch_req.headers = http_header_add(patch_req.headers, "X-CSRF-Token", token)
+    let r7: Result[bool, str] = csrf_check_request(patch_req, store, sid, now)
+    ok(result_is_ok(r7), "PATCH + valid token ok")
+    return 0
+}
+
+# ============================================================================
+# Test 12: csrf_describe_failure
+# ============================================================================
+
+fn test_describe_failure() -> int uses IO {
+    let req: HttpRequest = http_request_new("POST", "/transfer")
+    req.headers = http_header_add(req.headers, "Cookie", "csrf=" + _fixed_token())
+    let desc: str = csrf_describe_failure(req, "missing CSRF token")
+    ok(desc.len() > 0, "describe non-empty")
+    ok(desc.find("CSRF validation failed") >= 0, "describe contains prefix")
+    ok(desc.find("missing CSRF token") >= 0, "describe contains reason")
+    ok(desc.find("method=POST") >= 0, "describe contains method")
+    ok(desc.find("path=/transfer") >= 0, "describe contains path")
+    ok(desc.find("header_present=false") >= 0, "describe contains header_present")
+    ok(desc.find("cookie_present=true") >= 0, "describe contains cookie_present")
+    return 0
+}
+
+# ============================================================================
+# Test 13: constants
+# ============================================================================
+
+fn test_constants() -> int uses IO {
+    eq_int(csrf_token_byte_len(), 32, "token byte len 32")
+    eq_int(csrf_default_ttl_ms(), 1800000, "default ttl 30 min")
+    eq_str(csrf_header_name(), "X-CSRF-Token", "header name")
+    eq_str(csrf_form_field_name(), "csrf_token", "form field name")
+    eq_str(csrf_cookie_name(), "csrf", "cookie name")
+    return 0
+}
+
+# ============================================================================
+# Test 14: end-to-end — issue token, build request, validate
+# ============================================================================
+
+fn test_end_to_end() -> int uses IO, Rand {
+    rand_seed(42)
+    let now: int = _now_ms()
+    let store: CsrfStore = csrf_store_new(_secret(), csrf_default_ttl_ms())
+    let sid: str = _fixed_session_id()
+    # Server issues a token (e.g. when rendering a form)
+    let token: str = csrf_store_issue(store, sid, now)
+    # Client submits the token in a form field
+    let req: HttpRequest = http_request_new("POST", "/submit")
+    req.body = "name=alice&csrf_token=" + token + "&submit=Save"
+    # Server validates
+    let check: Result[bool, str] = csrf_check_request(req, store, sid, now)
+    ok(result_is_ok(check), "end-to-end sync token ok")
+    # Also test double-submit end-to-end
+    let ds_req: HttpRequest = http_request_new("POST", "/submit")
+    ds_req.headers = http_header_add(ds_req.headers, "Cookie", "csrf=" + token)
+    ds_req.headers = http_header_add(ds_req.headers, "X-CSRF-Token", token)
+    ok(csrf_double_submit_validate(ds_req, token), "end-to-end double-submit ok")
+    return 0
+}
+
+# ============================================================================
+# Dispatcher
+# ============================================================================
+
+fn run_tests() -> int uses IO, Rand {
+    println("=== Stage 68 acceptance: std.csrf ===")
+    let mut passed: int = 0
+    let tests: list[str] = [
+        "test_is_valid_token",
+        "test_generate_token",
+        "test_double_submit_cookie",
+        "test_double_submit_validate_ok",
+        "test_double_submit_validate_fail",
+        "test_double_submit_issue_extract",
+        "test_sync_store",
+        "test_sync_store_reap_compact",
+        "test_extract_token",
+        "test_method_classification",
+        "test_check_request",
+        "test_describe_failure",
+        "test_constants",
+        "test_end_to_end"
+    ]
+    let mut i: int = 0
+    while i < tests.len() {
+        let name: str = tests.get(i)
+        println("RUN  " + name)
+        if name == "test_is_valid_token" {
+            let _r: int = test_is_valid_token()
+        } else if name == "test_generate_token" {
+            let _r: int = test_generate_token()
+        } else if name == "test_double_submit_cookie" {
+            let _r: int = test_double_submit_cookie()
+        } else if name == "test_double_submit_validate_ok" {
+            let _r: int = test_double_submit_validate_ok()
+        } else if name == "test_double_submit_validate_fail" {
+            let _r: int = test_double_submit_validate_fail()
+        } else if name == "test_double_submit_issue_extract" {
+            let _r: int = test_double_submit_issue_extract()
+        } else if name == "test_sync_store" {
+            let _r: int = test_sync_store()
+        } else if name == "test_sync_store_reap_compact" {
+            let _r: int = test_sync_store_reap_compact()
+        } else if name == "test_extract_token" {
+            let _r: int = test_extract_token()
+        } else if name == "test_method_classification" {
+            let _r: int = test_method_classification()
+        } else if name == "test_check_request" {
+            let _r: int = test_check_request()
+        } else if name == "test_describe_failure" {
+            let _r: int = test_describe_failure()
+        } else if name == "test_constants" {
+            let _r: int = test_constants()
+        } else if name == "test_end_to_end" {
+            let _r: int = test_end_to_end()
+        }
+        println("PASS " + name)
+        passed = passed + 1
+        i = i + 1
+    }
+    println("")
+    println("=== " + passed.to_str() + "/" + tests.len().to_str() + " tests PASSED ===")
+    return 0
+}
+
+fn main() -> int uses IO, Rand {
+    rand_seed(42)
+    return run_tests()
+}

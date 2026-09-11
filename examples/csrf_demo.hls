@@ -1,0 +1,267 @@
+# ============================================================================
+# examples/csrf_demo.hls — Stage 68 (v0.87.0-alpha): std.csrf
+# ----------------------------------------------------------------------------
+# Demonstrates every piece of the CSRF protection API:
+#   * csrf_generate_token (32-byte random → 43-char base64url)
+#   * csrf_is_valid_token (charset + length check)
+#   * csrf_const_time_eq (wraps cookie_const_time_eq)
+#
+#   Double-submit cookie pattern (stateless):
+#     * csrf_double_submit_cookie (NON-HttpOnly, Secure, SameSite=Lax)
+#     * csrf_double_submit_extract (X-CSRF-Token header)
+#     * csrf_double_submit_cookie_value (csrf cookie value)
+#     * csrf_double_submit_validate (constant-time compare)
+#     * csrf_double_submit_issue (append Set-Cookie to response)
+#
+#   Synchronizer-token pattern (stateful, per-session):
+#     * CsrfStore + csrf_store_new / _issue / _validate / _invalidate
+#     * csrf_store_reap (count) / _compact (true removal) / _count
+#
+#   HTTP integration:
+#     * csrf_extract_token (header first, then form field)
+#     * csrf_validate_request (convenience wrapper)
+#     * csrf_is_safe_method / csrf_require_token
+#     * csrf_describe_failure (human-readable error)
+#     * csrf_check_request (high-level: safe-method + token check)
+#
+# The demo uses rand_seed(42) for deterministic token generation, so
+# the output is fully reproducible across the interpreter and the
+# native binary (differential-safe).
+# ============================================================================
+
+import "std.csrf"
+import "std.cookie"
+import "std.http"
+import "std.str"
+import "std.option"
+import "std.result"
+
+# ============================================================================
+# Helpers
+# ============================================================================
+
+fn _now_ms() -> int {
+    return 1735689600000
+}
+
+fn _secret() -> str {
+    return "csrf-demo-secret-32-bytes-minimum!"
+}
+
+# A valid 43-char base64url token for deterministic tests.
+fn _fixed_token() -> str {
+    return "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij0123456"
+}
+
+fn _fixed_session_id() -> str {
+    return "0123456789abcdefghijklmnopqrstuvwxyzABCDEFG"
+}
+
+# ============================================================================
+# Section 1: token generation & validation
+# ============================================================================
+
+fn demo_token_generation() -> void uses IO, Rand {
+    println("--- Token generation & validation ---")
+    let token: str = csrf_generate_token()
+    println("  generated token: " + token)
+    println("  length:          " + token.len().to_str() + " (expected 43)")
+    println("  is_valid_token:  " + csrf_is_valid_token(token).to_str())
+    # Negative cases
+    println("  is_valid_token(\"\"):        " + csrf_is_valid_token("").to_str())
+    println("  is_valid_token(\"short\"):    " + csrf_is_valid_token("short").to_str())
+    println("  is_valid_token(\"has space here padding to 43chrs yes!!\"):"
+        + csrf_is_valid_token("has space here padding to 43chrs yes!!").to_str())
+    # Valid token
+    println("  is_valid_token(known-good): " + csrf_is_valid_token(_fixed_token()).to_str())
+    # Constant-time equality
+    println("  const_time_eq(a, a): " + csrf_const_time_eq(_fixed_token(), _fixed_token()).to_str())
+    let other: str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij0123457"
+    println("  const_time_eq(a, b): " + csrf_const_time_eq(_fixed_token(), other).to_str())
+    println("")
+    return
+}
+
+# ============================================================================
+# Section 2: double-submit cookie pattern
+# ============================================================================
+
+fn demo_double_submit() -> void uses IO, Rand {
+    println("--- Double-submit cookie pattern ---")
+    let token: str = csrf_generate_token()
+    println("  token: " + token)
+    # Build the cookie
+    let sc: SetCookie = csrf_double_submit_cookie(token, 1800)
+    println("  Set-Cookie: " + cookie_serialize(sc))
+    println("  is_http_only: " + sc.is_http_only.to_str() + " (expected false — JS must read it)")
+    println("  is_secure:    " + sc.is_secure.to_str())
+    println("  same_site:    " + sc.same_site)
+    # Build a request that carries both the cookie and the header
+    let req: HttpRequest = http_request_new("POST", "/transfer")
+    req.headers = http_header_add(req.headers, "Cookie", "csrf=" + token)
+    req.headers = http_header_add(req.headers, "X-CSRF-Token", token)
+    println("  header value:   " + csrf_double_submit_extract(req))
+    println("  cookie value:   " + csrf_double_submit_cookie_value(req))
+    println("  validate (ok):  " + csrf_double_submit_validate(req, token).to_str())
+    # Mismatched header
+    let req2: HttpRequest = http_request_new("POST", "/transfer")
+    req2.headers = http_header_add(req2.headers, "Cookie", "csrf=" + token)
+    req2.headers = http_header_add(req2.headers, "X-CSRF-Token", "different-token-value-padding-to-43-chars")
+    println("  validate (mismatched header): " + csrf_double_submit_validate(req2, token).to_str() + " (expected false)")
+    # Missing header
+    let req3: HttpRequest = http_request_new("POST", "/transfer")
+    req3.headers = http_header_add(req3.headers, "Cookie", "csrf=" + token)
+    println("  validate (missing header):    " + csrf_double_submit_validate(req3, token).to_str() + " (expected false)")
+    # Missing cookie
+    let req4: HttpRequest = http_request_new("POST", "/transfer")
+    req4.headers = http_header_add(req4.headers, "X-CSRF-Token", token)
+    println("  validate (missing cookie):    " + csrf_double_submit_validate(req4, token).to_str() + " (expected false)")
+    # Wrong expected_token (server-side anchor)
+    let req5: HttpRequest = http_request_new("POST", "/transfer")
+    req5.headers = http_header_add(req5.headers, "Cookie", "csrf=" + token)
+    req5.headers = http_header_add(req5.headers, "X-CSRF-Token", token)
+    println("  validate (wrong expected):    " + csrf_double_submit_validate(req5, "wrong-token-value-padding-to-43-characters").to_str() + " (expected false)")
+    # Issue cookie to a response
+    let resp: HttpResponse = http_response_new(200)
+    let resp2: HttpResponse = csrf_double_submit_issue(resp, token, 1800)
+    let mut has_set_cookie: bool = false
+    let mut i: int = 0
+    while i < resp2.headers.len() {
+        let h: HttpHeader = resp2.headers.get(i)
+        if h.name == "Set-Cookie" {
+            has_set_cookie = true
+        }
+        i = i + 1
+    }
+    println("  response has Set-Cookie: " + has_set_cookie.to_str())
+    println("")
+    return
+}
+
+# ============================================================================
+# Section 3: synchronizer-token pattern
+# ============================================================================
+
+fn demo_sync_token() -> void uses IO, Rand {
+    println("--- Synchronizer-token pattern ---")
+    let now: int = _now_ms()
+    let store: CsrfStore = csrf_store_new(_secret(), csrf_default_ttl_ms())
+    println("  store count (empty): " + csrf_store_count(store).to_str())
+    # Issue a token for a session
+    let session_id: str = _fixed_session_id()
+    let token: str = csrf_store_issue(store, session_id, now)
+    println("  issued token:        " + token)
+    println("  store count:         " + csrf_store_count(store).to_str())
+    # Validate
+    let ok1: bool = csrf_store_validate(store, session_id, token, now)
+    println("  validate (ok):       " + ok1.to_str())
+    # Wrong token
+    let ok2: bool = csrf_store_validate(store, session_id, "wrong-token-value-padding-to-43-characters", now)
+    println("  validate (wrong):    " + ok2.to_str() + " (expected false)")
+    # Wrong session
+    let ok3: bool = csrf_store_validate(store, "different-session-id-padding-here-43-char", token, now)
+    println("  validate (wrong sid):" + ok3.to_str() + " (expected false)")
+    # Expired
+    let ok4: bool = csrf_store_validate(store, session_id, token, now + 99999999000)
+    println("  validate (expired):  " + ok4.to_str() + " (expected false)")
+    # Invalidate
+    let inv: bool = csrf_store_invalidate(store, session_id)
+    println("  invalidate:          " + inv.to_str())
+    let ok5: bool = csrf_store_validate(store, session_id, token, now)
+    println("  validate (after inv):" + ok5.to_str() + " (expected false)")
+    # Reap + compact
+    let token2: str = csrf_store_issue(store, "another-session-id-padding-here-43-charac", now)
+    println("  issued token 2:      " + token2)
+    let reaped: int = csrf_store_reap(store, now + 99999999000)
+    println("  reap count (future): " + reaped.to_str() + " (expected 2)")
+    let compacted: CsrfStore = csrf_store_compact(store, now + 99999999000)
+    println("  compacted count:     " + csrf_store_count(compacted).to_str() + " (expected 0)")
+    println("")
+    return
+}
+
+# ============================================================================
+# Section 4: HTTP integration
+# ============================================================================
+
+fn demo_http_integration() -> void uses IO, Rand {
+    println("--- HTTP integration ---")
+    let now: int = _now_ms()
+    let store: CsrfStore = csrf_store_new(_secret(), csrf_default_ttl_ms())
+    let session_id: str = _fixed_session_id()
+    let token: str = csrf_store_issue(store, session_id, now)
+    # Safe method (GET) — no token needed
+    let get_req: HttpRequest = http_request_new("GET", "/dashboard")
+    let check1: Result[bool, str] = csrf_check_request(get_req, store, session_id, now)
+    if result_is_ok(check1) {
+        println("  GET request:        OK (safe method, no token needed)")
+    } else {
+        println("  GET request:        BLOCKED (unexpected)")
+    }
+    # Unsafe method (POST) with valid token in header
+    let post_req: HttpRequest = http_request_new("POST", "/transfer")
+    post_req.headers = http_header_add(post_req.headers, "X-CSRF-Token", token)
+    let check2: Result[bool, str] = csrf_check_request(post_req, store, session_id, now)
+    if result_is_ok(check2) {
+        println("  POST + header:      OK")
+    } else {
+        println("  POST + header:      BLOCKED (unexpected)")
+    }
+    # Unsafe method (POST) with valid token in form field
+    let form_req: HttpRequest = http_request_new("POST", "/transfer")
+    form_req.body = "amount=100&csrf_token=" + token + "&to=bob"
+    let check3: Result[bool, str] = csrf_check_request(form_req, store, session_id, now)
+    if result_is_ok(check3) {
+        println("  POST + form field:  OK")
+    } else {
+        println("  POST + form field:  BLOCKED (unexpected)")
+    }
+    # Unsafe method (POST) with NO token
+    let bad_req: HttpRequest = http_request_new("POST", "/transfer")
+    let check4: Result[bool, str] = csrf_check_request(bad_req, store, session_id, now)
+    if result_is_ok(check4) {
+        println("  POST no token:      OK (unexpected)")
+    } else {
+        let reason: str = result_err_or(check4, "")
+        println("  POST no token:      BLOCKED — " + csrf_describe_failure(bad_req, reason))
+    }
+    # Unsafe method (DELETE) with wrong token
+    let del_req: HttpRequest = http_request_new("DELETE", "/account/42")
+    del_req.headers = http_header_add(del_req.headers, "X-CSRF-Token", "wrong-token-value-padding-to-43-characters")
+    let check5: Result[bool, str] = csrf_check_request(del_req, store, session_id, now)
+    if result_is_ok(check5) {
+        println("  DELETE wrong token: OK (unexpected)")
+    } else {
+        let reason: str = result_err_or(check5, "")
+        println("  DELETE wrong token: BLOCKED — " + csrf_describe_failure(del_req, reason))
+    }
+    # Method classification
+    println("  is_safe_method(GET):    " + csrf_is_safe_method("GET").to_str())
+    println("  is_safe_method(HEAD):   " + csrf_is_safe_method("HEAD").to_str())
+    println("  is_safe_method(POST):   " + csrf_is_safe_method("POST").to_str())
+    println("  is_safe_method(DELETE): " + csrf_is_safe_method("DELETE").to_str())
+    println("  require_token(POST):    " + csrf_require_token("POST").to_str())
+    println("  require_token(GET):     " + csrf_require_token("GET").to_str())
+    println("")
+    return
+}
+
+# ============================================================================
+# Main
+# ============================================================================
+
+fn main() -> int uses IO, Rand {
+    rand_seed(42)
+    println("================================================================")
+    println("Stage 68 (v0.87.0-alpha): std.csrf (CSRF protection)")
+    println("================================================================")
+    println("")
+    demo_token_generation()
+    demo_double_submit()
+    demo_sync_token()
+    demo_http_integration()
+    println("================================================================")
+    println("Stage 68 demo complete (deterministic — differential-safe).")
+    println("================================================================")
+    return 0
+}
