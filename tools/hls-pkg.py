@@ -648,7 +648,18 @@ def _fmt_value(v) -> str:
     if isinstance(v, str):
         # BUG (deep-scan-5): backslashes were not escaped, so a value
         # containing one grew a backslash on every write/parse round-trip.
-        return '"%s"' % v.replace('\\', '\\\\').replace('"', '\\"')
+        # Deep-scan-20 fix: control characters (\n, \r, \t, \b, \f) are
+        # legal TOML escapes and are DECODED by parse_manifest — but they
+        # were re-emitted RAW, so a value like "note\n#1 issue" produced
+        # a literal newline inside the quoted string; when the wrapped
+        # continuation line contained '#', the per-line comment stripper
+        # ate it and the manifest became unparseable. Escape them on
+        # write like every TOML serialiser.
+        out = (v.replace('\\', '\\\\').replace('"', '\\"')
+                .replace("\n", "\\n").replace("\r", "\\r")
+                .replace("\t", "\\t").replace("\b", "\\b")
+                .replace("\f", "\\f"))
+        return '"%s"' % out
     if isinstance(v, bool):
         return "true" if v else "false"
     if isinstance(v, int):
@@ -1114,7 +1125,8 @@ def cmd_lock(args):
         except Exception as ex:
             print("FAILED: %s" % ex)
             return 1
-        sha = sha256_file(resolved_path)
+        sha = _sha256_directory(resolved_path) if os.path.isdir(resolved_path) \
+            else sha256_file(resolved_path)
         declared, computed = extract_effects(resolved_path)
         # Stage 13 release: record the resolved version + commit hash so
         # `verify` can detect a moved tag (TOCTOU on the git cache).

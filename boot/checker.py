@@ -4397,6 +4397,23 @@ class Checker:
                     self.err("enum %s has no variant %s" % (ename, pv), arm)
                 v, payloads = variant
                 covered.add(v)
+                # Deep-scan-20 fix (HIGH, llvm backend): annotate the arm
+                # for the LLVM emitter's match lowering — variant_idx
+                # (the DECLARATION index), and binds (name, instantiated
+                # type) per payload. Without these the emitter emitted no
+                # switch at all (first arm executed unconditionally) and
+                # never bound the payload slots, returning garbage for
+                # every match expression reaching --emit llvm.
+                for vi, (vname3, _) in enumerate(edef["variants"]):
+                    if vname3 == v:
+                        arm["variant_idx"] = vi
+                        break
+                if pat["has_paren"] and len(pat["bindings"]) == len(payloads):
+                    inst_pl = [instantiate_type(p, type_map) if typeparams
+                               else p for p in payloads]
+                    arm["binds"] = [(bn, bt) for bn, bt in
+                                     zip(pat["bindings"], inst_pl)
+                                     if bn != "_"]
                 # Check binding count.
                 if pat["has_paren"] and len(pat["bindings"]) != len(payloads):
                     self.err("variant %s has %d payloads, but pattern binds %d"
@@ -4560,6 +4577,17 @@ class Checker:
         e["t"] = success_t
         e["err_variant"] = err_variant[0]
         e["ok_variant"] = ok_variant[0]
+        # Deep-scan-20 fix (HIGH, llvm backend): annotate the Ok
+        # variant's DECLARATION index and the success payload type so
+        # the LLVM emitter switches on the real tag. Its defaults
+        # (qmark_ok_idx=0, qmark_ok_type="int") took the Ok path on an
+        # Err value whenever Ok wasn't the first declared variant, and
+        # read the payload through the wrong accessor.
+        for vi, (vname2, _) in enumerate(edef["variants"]):
+            if vname2 == ok_variant[0]:
+                e["qmark_ok_idx"] = vi
+                break
+        e["qmark_ok_type"] = success_t
         return success_t
 
     # ---------- effects (Stage 9-alpha: fine-grained, set-based) ----------

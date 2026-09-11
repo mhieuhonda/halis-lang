@@ -648,7 +648,14 @@ class LLVMEmitter:
         if entry is None:
             slot = self._fresh("l")
             ty = hls_type_to_llvm(hls_ty)
-            self._emit("  %s = alloca %s" % (slot, ty))
+            # Deep-scan-20 fix: allocate lazily-discovered slots in the
+            # ENTRY block via the deferred-splice mechanism — an alloca
+            # emitted at the current point (e.g. a match-arm payload
+            # bind inside a while body) re-executes on every iteration
+            # and grows the stack (allocas are reclaimed only at
+            # function return). Same rule the result-slot fix
+            # (deep-scan-12) applies.
+            self._entry_allocas.append((slot, ty))
             entry = (slot, ty)
             self._slot_pool[key] = entry
         return entry
@@ -1088,33 +1095,39 @@ class LLVMEmitter:
             lbl = arm_records[i][1]
             self._emit("%s:" % lbl)
             # Bind the payload (if any) — the checker annotates the
-            # pattern's binding name and the variant's payload type.
-            if arm.get("bind_name") and arm.get("payload_type"):
+            # pattern's binding names and the variant's instantiated
+            # payload types (deep-scan-20: 'binds' covers multi-payload
+            # variants like Op.Add(a, b); the legacy single-payload
+            # 'bind_name'/'payload_type' pair is kept as a fallback).
+            binds = arm.get("binds")
+            if not binds and arm.get("bind_name") and arm.get("payload_type"):
+                binds = [(arm["bind_name"], arm["payload_type"])]
+            if binds:
                 payload_ptr = self._fresh("ap")
                 self._emit("  %s = call ptr @hl_enum_payload(ptr %s)" % (payload_ptr, scrut))
-                ptype = arm["payload_type"]
-                slot, slot_ty = self._get_slot(arm["bind_name"], ptype)
-                self._locals[arm["bind_name"]] = (slot, slot_ty)
-                if ptype == "int" or ptype.startswith("tainted[int]"):
-                    ptmp = self._fresh("pv")
-                    self._emit("  %s = call i64 @hl_struct_get_i64(ptr %s, i64 0)"
-                               % (ptmp, payload_ptr))
-                    self._emit("  store i64 %s, ptr %s" % (ptmp, slot))
-                elif ptype == "float" or ptype.startswith("tainted[float]"):
-                    ptmp = self._fresh("pv")
-                    self._emit("  %s = call double @hl_struct_get_f64(ptr %s, i64 0)"
-                               % (ptmp, payload_ptr))
-                    self._emit("  store double %s, ptr %s" % (ptmp, slot))
-                elif ptype == "bool" or ptype.startswith("tainted[bool]"):
-                    ptmp = self._fresh("pv")
-                    self._emit("  %s = call i1 @hl_struct_get_bool(ptr %s, i64 0)"
-                               % (ptmp, payload_ptr))
-                    self._emit("  store i1 %s, ptr %s" % (ptmp, slot))
-                else:
-                    ptmp = self._fresh("pv")
-                    self._emit("  %s = call ptr @hl_struct_get_ptr(ptr %s, i64 0)"
-                               % (ptmp, payload_ptr))
-                    self._emit("  store ptr %s, ptr %s" % (ptmp, slot))
+                for fi, (bname, ptype) in enumerate(binds):
+                    slot, slot_ty = self._get_slot(bname, ptype)
+                    self._locals[bname] = (slot, slot_ty)
+                    if ptype == "int" or ptype.startswith("tainted[int]"):
+                        ptmp = self._fresh("pv")
+                        self._emit("  %s = call i64 @hl_struct_get_i64(ptr %s, i64 %d)"
+                                   % (ptmp, payload_ptr, fi))
+                        self._emit("  store i64 %s, ptr %s" % (ptmp, slot))
+                    elif ptype == "float" or ptype.startswith("tainted[float]"):
+                        ptmp = self._fresh("pv")
+                        self._emit("  %s = call double @hl_struct_get_f64(ptr %s, i64 %d)"
+                                   % (ptmp, payload_ptr, fi))
+                        self._emit("  store double %s, ptr %s" % (ptmp, slot))
+                    elif ptype == "bool" or ptype.startswith("tainted[bool]"):
+                        ptmp = self._fresh("pv")
+                        self._emit("  %s = call i1 @hl_struct_get_bool(ptr %s, i64 %d)"
+                                   % (ptmp, payload_ptr, fi))
+                        self._emit("  store i1 %s, ptr %s" % (ptmp, slot))
+                    else:
+                        ptmp = self._fresh("pv")
+                        self._emit("  %s = call ptr @hl_struct_get_ptr(ptr %s, i64 %d)"
+                                   % (ptmp, payload_ptr, fi))
+                        self._emit("  store ptr %s, ptr %s" % (ptmp, slot))
             # Lower the arm body. The HLS match arm body is a single
             # EXPRESSION (the parser's `parse_expr`), not a list of
             # statements. Deep-scan-7 fix: the old code iterated
@@ -1143,6 +1156,10 @@ class LLVMEmitter:
                 arm_result_val = "0" if llvm_ret_ty != "ptr" else "null"
             # Deep-scan-7 fix: store the arm result to the per-match slot.
             # Cast the value to the match's result type if needed.
+            # Deep-scan-20 fix: an arm whose body DIVERGES (panic ->
+            # unreachable) leaves no current block — the old code still
+            # emitted `store` + `br` AFTER the unreachable terminator,
+            # producing invalid IR (llvm-as rejects it).
             if arm_result_ty != llvm_ret_ty:
                 # Coerce — same logic as the assignment path.
                 # Deep-scan-15 fix: the previous call had the first two
@@ -1154,9 +1171,9 @@ class LLVMEmitter:
                 # file use the correct order; this one diverged.
                 arm_result_val = self._coerce(
                     arm_result_ty, arm_result_val, llvm_ret_ty)
-            self._emit("  store %s %s, ptr %s"
-                       % (llvm_ret_ty, arm_result_val, result_slot))
             if self._cur_block is not None:
+                self._emit("  store %s %s, ptr %s"
+                           % (llvm_ret_ty, arm_result_val, result_slot))
                 self._emit("  br label %%%s" % end_lbl)
             arm_records[i][2] = arm_result_ty
             arm_records[i][3] = self._cur_block  # may be None if arm diverged

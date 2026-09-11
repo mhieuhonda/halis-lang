@@ -22,6 +22,7 @@ propagation. The goal is correctness and predictability, not peak
 performance — the C compiler's `-O2` is still the primary optimiser.
 """
 from __future__ import annotations
+import re
 from typing import Dict, Set, List, Tuple
 from . import (HLIRModule, HLIRFunction, Instr,
                OP_CONST, OP_BINOP, OP_UNOP, OP_LOAD, OP_STORE,
@@ -762,11 +763,15 @@ def _licm(irf: HLIRFunction):
     """
     # First, identify loops. A loop is a sequence of blocks where the
     # last block jumps back to the first (the cond). The cond block's
-    # name ends with "_cond" (set by IRBuilder._new_block with prefix
-    # "while_cond" or "for_cond").
+    # name is "while_cond<N>" or "for_cond<N>" (IRBuilder._new_block
+    # appends a numeric counter).
+    # Deep-scan-20 fix: the old predicate `name.endswith("_cond")` can
+    # NEVER match — _new_block formats "%s%d" ("while_cond3"), so pass 5
+    # was dead code on every program. Match the numbered form exactly.
+    _cond_re = re.compile(r"(?:while|for)_cond\d+$")
     for caller_block_idx in range(len(irf.blocks)):
         cond = irf.blocks[caller_block_idx]
-        if not cond.name.endswith("_cond"):
+        if not _cond_re.match(cond.name):
             continue
         # Find the body of this loop: blocks from cond_index+1 until the
         # block whose terminator jumps back to cond.
@@ -820,13 +825,21 @@ def _licm(irf: HLIRFunction):
 def _is_hoistable(ins: Instr, loop_defined: Set[str]) -> bool:
     """True if `ins` is a pure op whose operands are all defined outside
     the loop (so the result is loop-invariant)."""
-    # Only hoist pure operations.
-    PURE_OPS = {OP_CONST, OP_UNOP, OP_LOAD, "list_new", "struct_new",
-                "struct_get", "map_get", "list_len"}
-    # OP_BINOP is pure in the sense of "doesn't write memory", but it can
-    # PANIC on overflow/div-zero — hoisting it out of a loop that never
-    # executes would panic on a program that should have run cleanly.
-    # So we DO NOT hoist OP_BINOP (matches the DCE classification).
+    # Deep-scan-20 fix (soundness): the old PURE_OPS set was unsound
+    # once the loop-detection matcher above actually fired:
+    #   * OP_UNOP — unary `-` panics on INT64_MIN (the DCE pass
+    #     classifies it impure for exactly this reason); hoisting it out
+    #     of a zero-iteration loop panics a clean program.
+    #   * struct_get / map_get — a struct_set/map_set inside the loop
+    #     can change the read value between iterations.
+    #   * list_new — fresh-object identity per iteration (hoisting
+    #     reuses ONE list across all iterations).
+    #   * list_len — push/pop inside the loop change it.
+    #   * OP_BINOP — can panic on overflow / division by zero (also
+    #     excluded by the DCE classification).
+    # Only truly position- and value-independent ops remain: constants
+    # and SSA copies of loop-external bindings.
+    PURE_OPS = {OP_CONST, OP_LOAD}
     if ins.op not in PURE_OPS:
         return False
     # OP_STORE inside a loop is never invariant (it mutates state).

@@ -540,6 +540,9 @@ class WasmEmitter:
         # depth = how many br's to jump out of to reach the loop's continue
         # target (the loop header) or break target (the block after the loop).
         self._loop_stack: List[Tuple[int, int]] = []
+        # Deep-scan-20: wasm frame counter for br-depth computation
+        # (reset per function in _emit_function; see break/continue).
+        self._frames = 0
         # Linear-memory layout.
         #   [0..3]   = __heap_ptr (i32), initialised to STR_BASE_END.
         #   [4..]    = string literal pool.
@@ -705,8 +708,15 @@ class WasmEmitter:
         # f64.convert_i64_s instruction). Implements int.to_float().
         idx_int_to_float = self._add_helper("hl_int_to_float", [I64], [F64])
         idx_panic = self._add_helper("hl_panic", [I32], [])
-        idx_abort = self._add_helper("hl_abort", [I32], [])
-        idx_exit = self._add_helper("hl_exit", [I32], [])
+        # Deep-scan-20 fix: abort(code) takes an HLS int (i64) — the
+        # helper was declared with an i32 param (same i64/i32 mismatch
+        # as hl_exit; the call site pushes i64).
+        idx_abort = self._add_helper("hl_abort", [I64], [])
+        # Deep-scan-20 fix: exit(code) takes an HLS int (i64) — the
+        # helper was declared with an i32 param, so the call site pushed
+        # i64 and the module failed validation ("call[0] expected type
+        # i32, found i64"). Take the code as i64 (ignored by the trap).
+        idx_exit = self._add_helper("hl_exit", [I64], [])
         # Now emit each body. We append the code in the SAME ORDER as the
         # add_function calls above (the code section must mirror the
         # function section's order).
@@ -1211,9 +1221,15 @@ class WasmEmitter:
         body.append(OP_I32_GE_S)
         body.append(OP_BR_IF); body += uleb(1)
         # byte = s.data[4+i]   → local 5 (digit scratch; does NOT clobber sign)
-        body.append(OP_LOCAL_GET); body += uleb(0)
+        # Deep-scan-20 fix (HIGH): the load address was computed as a bare
+        # `i + 4` — the pushed `s` stayed stranded under it on the stack
+        # (silently discarded by the loop's br 0), so the helper parsed
+        # ABSOLUTE linear memory instead of the string. "123".to_int()
+        # returned 0. Compute s + (4 + i) like every other str helper.
         body.append(OP_LOCAL_GET); body += uleb(2)
         body.append(OP_I32_CONST); body += sleb(4)
+        body.append(OP_I32_ADD)
+        body.append(OP_LOCAL_GET); body += uleb(0)
         body.append(OP_I32_ADD)
         body.append(OP_I32_LOAD8_U); body.append(0x00); body += sleb(0)
         body.append(OP_LOCAL_TEE); body += uleb(5)
@@ -1316,12 +1332,13 @@ class WasmEmitter:
         self.mod.add_code([], bytes(body))
 
     def _emit_hl_exit(self, idx: int):
-        # In a browser, there's no exit(). In Node, the glue can read
-        # the return value of _start. For the alpha, hl_exit is a
-        # no-op (the exit code parameter is in a local, not on the
-        # stack, so we just return void).
+        # Deep-scan-20 fix (HIGH): hl_exit used to be an empty body —
+        # `exit(42)` was silently swallowed and execution continued
+        # past the exit call (diverging from every other backend).
+        # A wasm trap is the closest alpha semantics to "halt now"; the
+        # Node glue can catch the trap and exit with the code.
         body = bytearray()
-        # No instructions needed — empty body returns void.
+        body.append(OP_UNREACHABLE)
         self.mod.add_code([], bytes(body))
 
     # ---------- user function emission ----------
@@ -1334,6 +1351,15 @@ class WasmEmitter:
         self._locals = {}
         self._local_count = 0
         self._loop_stack = []
+        # (name, hls_type) -> (local idx, wasm valtype); filled by
+        # _emit_function (deep-scan-20 sibling-scope binding fix).
+        self._binding_pool: Dict[Tuple[str, str], Tuple[int, int]] = {}
+        # Deep-scan-20: absolute count of wasm block/loop/if frames
+        # currently open inside the function body. br depths for
+        # break/continue are computed from it at the branch SITE, so an
+        # if (or any nested block) between the loop header and the
+        # branch no longer breaks the depth arithmetic.
+        self._frames = 0
         # Build the type signature.
         param_valtypes = [hls_to_wasm_valtype(p[1]) for p in fn["params"]]
         result_valtypes = hls_to_wasm_result(ret_type)
@@ -1349,19 +1375,34 @@ class WasmEmitter:
         # function header, not inline).
         collected: List[Tuple[str, str]] = []
         self._collect_bindings(fn["body"], collected)
-        # Assign local indices to each binding. Skip duplicates (same name
-        # in sibling scopes can share — HLS forbids shadowing in nested
-        # scopes too, so this is just defensive).
-        seen_names = set()
+        # Assign local indices to each binding.
+        # Deep-scan-20 fix (MED): deduplicate pre-collected bindings by
+        # (name, valtype), NOT name alone. The checker allows the same
+        # name with DIFFERENT types in sibling scopes (if/else arms —
+        # each arm pops its child scope); name-only dedup reused the
+        # first binding's local with the wrong valtype ("local.set
+        # expected type i64, found i32.const"). Each (name, type) pair
+        # gets its own local; the let statement re-points _locals[name]
+        # to the right entry when it is lowered (sibling scopes never
+        # overlap at runtime).
+        seen_keys = set()
         local_decls: List[Tuple[int, int]] = []  # (count, valtype)
+        # (name, hls_type) -> (idx, wasm_valtype)
+        self._binding_pool: Dict[Tuple[str, str], Tuple[int, int]] = {}
         for bname, btype in collected:
-            if bname in seen_names:
+            key = (bname, btype)
+            if key in seen_keys:
                 continue
-            seen_names.add(bname)
+            seen_keys.add(key)
             idx = self._local_count
             self._local_count += 1
-            self._locals[bname] = (idx, hls_to_wasm_valtype(btype))
-            local_decls.append((1, hls_to_wasm_valtype(btype)))
+            vty = hls_to_wasm_valtype(btype)
+            self._binding_pool[key] = (idx, vty)
+            local_decls.append((1, vty))
+            # First sighting of this NAME becomes the default mapping;
+            # `let` statements re-point it as they are lowered.
+            if bname not in self._locals:
+                self._locals[bname] = (idx, vty)
         # Lower the body.
         body = bytearray()
         for stmt in fn["body"]:
@@ -1405,6 +1446,12 @@ class WasmEmitter:
         if k == "let":
             # Evaluate the value, store into the local.
             self._lower_expr(stmt["value"], out)
+            # Deep-scan-20: re-point the name mapping at THIS binding's
+            # (name, type) entry — same name with a different type in a
+            # sibling scope must use its own local (see _emit_function).
+            bkey = (stmt["name"], stmt["t"])
+            if bkey in self._binding_pool:
+                self._locals[stmt["name"]] = self._binding_pool[bkey]
             idx, ty = self._locals[stmt["name"]]
             out.append(OP_LOCAL_SET); out += uleb(idx)
         elif k == "assign":
@@ -1422,19 +1469,30 @@ class WasmEmitter:
         elif k == "break":
             if not self._loop_stack:
                 raise HLError("break outside loop", stmt.get("line", 0), 0)
-            # br to the BREAK depth (the block AFTER the loop).
-            _, break_depth = self._loop_stack[-1]
-            out.append(OP_BR); out += uleb(break_depth)
+            # Deep-scan-20 fix (HIGH): compute the br depth at the
+            # branch site. The old code recorded fixed depths at the
+            # loop header — a `break`/`continue` inside an `if` (an extra
+            # open frame) emitted `br 0`/`br 1`, turning continue into
+            # "exit the if" and break into a loop back-edge (the loop
+            # never terminated). Entries on the loop stack are now
+            # ABSOLUTE frame indices (break_frame, continue_frame);
+            # depth = frames_open - 1 - target (0 = innermost).
+            break_frame, _ = self._loop_stack[-1]
+            out.append(OP_BR); out += uleb(self._frames - 1 - break_frame)
         elif k == "continue":
             if not self._loop_stack:
                 raise HLError("continue outside loop", stmt.get("line", 0), 0)
-            cont_depth, _ = self._loop_stack[-1]
-            out.append(OP_BR); out += uleb(cont_depth)
+            _, cont_frame = self._loop_stack[-1]
+            out.append(OP_BR); out += uleb(self._frames - 1 - cont_frame)
         elif k == "expr":
             self._lower_expr(stmt["e"], out)
             # If the expression produced a value, drop it.
+            # Deep-scan-20 fix (HIGH): panic()/exit() are typed `never`
+            # but their wasm helpers return void — dropping on the empty
+            # stack produced "not enough arguments on the stack for drop".
+            # Never-typed statements leave nothing to drop.
             t = stmt["e"].get("t", "void")
-            if t != "void":
+            if t not in ("void", "never"):
                 out.append(OP_DROP)
         else:
             raise HLError(
@@ -1458,8 +1516,10 @@ class WasmEmitter:
         self._lower_expr(stmt["cond"], out)
         # if (void) ... else ... end
         out.append(OP_IF); out.append(BLOCK_VOID)
-        # Save the loop stack — break/continue inside the if still
-        # target the enclosing loop, so the depths don't change.
+        self._frames += 1
+        # (Deep-scan-20: the if is an extra wasm frame — the frame
+        # counter lets break/continue inside it recompute their br
+        # depths correctly.)
         for s in stmt["then"]:
             self._lower_stmt(s, out)
         if stmt.get("els"):
@@ -1467,6 +1527,7 @@ class WasmEmitter:
             for s in stmt["els"]:
                 self._lower_stmt(s, out)
         out.append(OP_END)
+        self._frames -= 1
 
     def _lower_while(self, stmt: Dict, out: bytearray):
         # wasm pattern:
@@ -1477,22 +1538,30 @@ class WasmEmitter:
         #       br 0  (loop)
         #     end
         #   end
-        # Continue depth = 0 (the innermost loop).
-        # Break depth = 1 (out of the block).
+        # Deep-scan-20: loop-stack entries are ABSOLUTE frame indices;
+        # break/continue recompute their br depth at the branch site so
+        # intervening `if` frames (or nested loops) stay correct.
         out.append(OP_BLOCK); out.append(BLOCK_VOID)
         out.append(OP_LOOP); out.append(BLOCK_VOID)
+        self._frames += 2
+        # Deep-scan-20: loop-stack entries are now ABSOLUTE frame
+        # indices: the block (break target) opened at _frames-2, the
+        # loop (continue target) at _frames-1.
+        block_frame = self._frames - 2
+        loop_frame = self._frames - 1
         # cond
         self._lower_expr(stmt["cond"], out)
         out.append(OP_I32_EQZ)
         out.append(OP_BR_IF); out += uleb(1)  # break out of block
         # body
-        self._loop_stack.append((0, 1))
+        self._loop_stack.append((block_frame, loop_frame))
         for s in stmt["body"]:
             self._lower_stmt(s, out)
         self._loop_stack.pop()
         out.append(OP_BR); out += uleb(0)  # loop back
         out.append(OP_END)  # loop
         out.append(OP_END)  # block
+        self._frames -= 2
 
     def _lower_for(self, stmt: Dict, out: bytearray):
         # The alpha supports `for x in range(a, b)` only. The iter must
@@ -1541,14 +1610,37 @@ class WasmEmitter:
         #   end
         out.append(OP_BLOCK); out.append(BLOCK_VOID)
         out.append(OP_LOOP); out.append(BLOCK_VOID)
+        self._frames += 2
+        block_frame = self._frames - 2
+        loop_frame = self._frames - 1
         out.append(OP_LOCAL_GET); out += uleb(var_idx)
         out.append(OP_LOCAL_GET); out += uleb(end_idx)
         out.append(OP_I64_GE_S)
         out.append(OP_BR_IF); out += uleb(1)
-        self._loop_stack.append((0, 1))
+        # Deep-scan-20 fix (HIGH): wrap the body in its own block so a
+        # `continue` branches to the INCREMENT, not the loop header —
+        # the old layout (continue = br to the loop frame) skipped
+        # `var = var + 1`, so `for i in range(0, 3) { continue }` spun
+        # forever. Layout:
+        #   block (break target)
+        #     loop
+        #       (var >= end) br_if 1
+        #       block (continue target)
+        #         body
+        #       end
+        #       var = var + 1
+        #       br 0
+        #     end
+        #   end
+        out.append(OP_BLOCK); out.append(BLOCK_VOID)
+        self._frames += 1
+        cont_frame = self._frames - 1
+        self._loop_stack.append((block_frame, cont_frame))
         for s in stmt["body"]:
             self._lower_stmt(s, out)
         self._loop_stack.pop()
+        out.append(OP_END)  # inner continue-target block
+        self._frames -= 1
         out.append(OP_LOCAL_GET); out += uleb(var_idx)
         out.append(OP_I64_CONST); out += sleb(1)
         out.append(OP_I64_ADD)
@@ -1556,6 +1648,7 @@ class WasmEmitter:
         out.append(OP_BR); out += uleb(0)
         out.append(OP_END)  # loop
         out.append(OP_END)  # block
+        self._frames -= 2
 
     # ---------- expression lowering ----------
 
@@ -1602,18 +1695,22 @@ class WasmEmitter:
             # wasm: l  if (i32) r  else i32.const 0  end
             self._lower_expr(e["l"], out)
             out.append(OP_IF); out.append(I32)
+            self._frames += 1  # deep-scan-20: the if is an open frame
             self._lower_expr(e["r"], out)
             out.append(OP_ELSE)
             out.append(OP_I32_CONST); out += sleb(0)
             out.append(OP_END)
+            self._frames -= 1
             return
         if op == "||":
             self._lower_expr(e["l"], out)
             out.append(OP_IF); out.append(I32)
+            self._frames += 1  # deep-scan-20: the if is an open frame
             out.append(OP_I32_CONST); out += sleb(1)
             out.append(OP_ELSE)
             self._lower_expr(e["r"], out)
             out.append(OP_END)
+            self._frames -= 1
             return
         # Special-case: str + str -> hl_str_concat.
         lt = e["l"].get("t", "")
@@ -1842,8 +1939,12 @@ class WasmEmitter:
         if has_main:
             body.append(OP_CALL); out_args = uleb(self.func_index["main"])
             body += out_args
-            # main returns int (i64); drop it.
-            body.append(OP_DROP)
+            # Deep-scan-20 fix (HIGH): the checker allows `fn main()` with
+            # NO return type (void) — an unconditional OP_DROP after the
+            # call left the validation error "not enough arguments on the
+            # stack for drop". Only drop when main actually returns int.
+            if self.program["fns"]["main"]["ret"] != "void":
+                body.append(OP_DROP)
         else:
             # No main: just return.
             pass
