@@ -950,7 +950,12 @@ fn lex(ctx: Ctx) -> void {
                 # comment: # to end of line
                 # BUG-016 fix: track column past the comment, so error messages
                 # on a later token on the same line report the right column.
-                while i < n && src.byte_at(i) != 10 {
+                # Deep-scan-20 fix (boot/native parity): stop at `\r` as
+                # well as `\n` — in a CR-only file the boot lexer (fixed
+                # in deep-scan-11) ends the comment at the `\r` and lexes
+                # the rest of the line, while this loop swallowed
+                # everything after the comment (boot/native divergence).
+                while i < n && src.byte_at(i) != 10 && src.byte_at(i) != 13 {
                     i = i + 1
                     col = col + 1
                 }
@@ -2381,7 +2386,10 @@ fn parse_unary(ctx: Ctx, allow_struct: bool) -> int {
 fn can_index(k: str) -> bool {
     # Deep-scan-10: qmark results are indexable (g()?[0] used to detach
     # the [0] into a stray statement).
-    return k == "ident" || k == "field" || k == "index" || k == "call" || k == "method" || k == "fieldcall" || k == "qmark"
+    # Deep-scan-20: listlit and match results are indexable too
+    # ([10, 20, 30][1] used to detach the index into a stray
+    # statement) — mirrors boot/parser.py's postfix tuple.
+    return k == "ident" || k == "field" || k == "index" || k == "call" || k == "method" || k == "fieldcall" || k == "qmark" || k == "listlit" || k == "match"
 }
 
 fn parse_postfix(ctx: Ctx, allow_struct: bool) -> int {
@@ -4968,6 +4976,15 @@ fn seed_from_requires(ctx: Ctx, e: int, f: FnInfo,
             set_minlen(facts_lenhi, owner, k)
             return
         }
+    }
+    # Deep-scan-20 soundness fix: the len-on-RIGHT forms must FLIP the
+    # operator before seeding minlen (K <= s.len() means len >= K).
+    # The old code fed `K >= s.len()` / `K > s.len()` straight into
+    # set_minlen — treating an UPPER bound on the length as a lower
+    # bound, so `requires 10 >= s.len()` proved byte_at(9) safe on an
+    # empty string under -O fast (boot's proof.py flips correctly via
+    # its flip map; this restores the mirror).
+    if op == "<=" || op == "<" || op == "==" {
         if is_len_of(ctx, r) && ln.kind == "int" {
             let owner2: str = len_owner(ctx, r)
             let mut k2: int = ln.ival
@@ -5352,6 +5369,44 @@ fn const_range_count(ctx: Ctx, e: int) -> int {
     return 0
 }
 
+# Deep-scan-20 soundness fix: collect identifiers whose length is
+# MUTATED by a list.pop()/list.push() method call anywhere inside the
+# expression. `let _ = xs.pop()` used to keep the requires-seeded
+# minlen and prove bounds checks dead on a list that had just shrunk —
+# the native -O fast build then emitted an unchecked out-of-bounds
+# access. Mirror of boot/proof.py _collect_len_mutators.
+fn collect_len_mutators(ctx: Ctx, e: int, out: list[str], depth: int) -> void {
+    if e < 0 || depth > 64 {
+        return
+    }
+    let n: ExprN = ctx.exprs[e]
+    if n.kind == "method" && (n.mop == "list.pop" || n.mop == "list.push") {
+        let t: ExprN = ctx.exprs[n.left]
+        if t.kind == "ident" {
+            out.push(t.name)
+        }
+    }
+    collect_len_mutators(ctx, n.left, out, depth + 1)
+    collect_len_mutators(ctx, n.right, out, depth + 1)
+    if n.kind != "match" {
+        let mut i: int = 0
+        while i < n.args.len() {
+            collect_len_mutators(ctx, n.args.get(i), out, depth + 1)
+            i = i + 1
+        }
+    } else {
+        # match: n.args holds arm INDICES — walk arm bodies and the
+        # scrutinee (n.left) instead (deep-scan-15 rule).
+        let mut a2: int = 0
+        while a2 < n.args.len() {
+            let arm: MatchArm = ctx.match_arms.get(n.args.get(a2))
+            collect_len_mutators(ctx, arm.body, out, depth + 1)
+            a2 = a2 + 1
+        }
+        collect_len_mutators(ctx, n.left, out, depth + 1)
+    }
+}
+
 # annotate_stmts: walk statements, updating facts for int lets/assigns,
 # if/else joins, for-range bounds; annotate every expression.
 #
@@ -5527,6 +5582,26 @@ fn annotate_stmts(ctx: Ctx, stmts: list[int], facts: map[str, IVal],
             if tgt.kind == "index" {
                 annotate_exprs(ctx, tgt.right, facts, facts_lenhi, nz, 0)
             }
+        }
+        # Deep-scan-20 soundness fix: list.pop()/list.push() inside this
+        # statement (expr statement, let value, condition, index expr)
+        # mutates the receiver's length — invalidate its value-derived
+        # facts exactly like a reassignment would. Mirror of the
+        # boot/proof.py fix.
+        let muts: list[str] = []
+        collect_len_mutators(ctx, s.value, muts, 0)
+        collect_len_mutators(ctx, s.cond, muts, 0)
+        collect_len_mutators(ctx, s.e, muts, 0)
+        if s.target >= 0 {
+            let tgt3: ExprN = ctx.exprs[s.target]
+            if tgt3.kind == "index" {
+                collect_len_mutators(ctx, tgt3.right, muts, 0)
+            }
+        }
+        let mut mi2: int = 0
+        while mi2 < muts.len() {
+            invalidate_value_facts(nz, facts_lenhi, muts.get(mi2))
+            mi2 = mi2 + 1
         }
         # Update facts from let / assign. Deep-scan-10 (Stage-17
         # perfection): the VALUE-fact invalidation (nz / minlen /
@@ -7479,6 +7554,13 @@ fn check_spawn_call(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int) ->
         i = i + 1
     }
     add_edge(ctx, cur, "b:spawn")
+    # Deep-scan-20 soundness fix: the spawned function's RETURN value
+    # crosses the task boundary at join() — it must be Send too.
+    # Mirror of the boot/checker.py fix (spawn returning a non-Send
+    # Task[...] smuggled a join handle across the boundary).
+    if !type_is_send(ctx, tf.ret, []) {
+        cerr(line, "spawn() target " + fname + " returns " + tf.ret + ", which is not Send: the result crosses the task boundary at join() (a Task join handle must stay with its spawner)")
+    }
     # Deep-scan-10 soundness fix: the spawned function IS a callee — its
     # effects must reach the spawner's computed set (the spawner CAUSES
     # the task's effects; struct defaults already get synthetic edges for
@@ -8699,6 +8781,12 @@ fn check_async_spawn_call(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: i
         i = i + 1
     }
     add_edge(ctx, cur, "b:async_spawn")
+    # Deep-scan-20 soundness fix: same rule as spawn — the future's
+    # result value crosses the task boundary at await(), so the return
+    # type must be Send. Mirror of the boot/checker.py fix.
+    if !type_is_send(ctx, tf.ret, []) {
+        cerr(line, "async_spawn() target " + fname + " returns " + tf.ret + ", which is not Send: the result crosses the task boundary at await()")
+    }
     add_edge(ctx, cur, fname)
     ctx.exprs[e].args = vargs
     ctx.exprs[e].mkey = "async_spawn"
@@ -9998,6 +10086,7 @@ fn runtime_lines() -> list[str] {
     # and the joined task has just finished (race between the join waiter
     # re-checking t->done and another thread's deadlock_check).
     r.push("static int64_t g_rt_done_unjoined = 0;   // tasks done but not yet joined")
+    r.push("static int64_t g_rt_join_waiters = 0;   // threads currently blocked in join (deep-scan-20)")
     r.push("static hl_chan* g_rt_chans  = NULL; // live-channel registry (guarded by g_rt_mu)")
     r.push("")
     r.push("// Deadlock check — call with g_rt_mu HELD, before blocking.")
@@ -10016,8 +10105,14 @@ fn runtime_lines() -> list[str] {
     r.push("    int64_t alive = g_rt_tasks + 1;   // +1: the main thread")
     r.push("    if (g_rt_blocked != alive) return;")
     r.push("    // Stage 33: if any task is done but not yet joined, a join")
-    r.push("    // waiter can proceed — not a deadlock.")
-    r.push("    if (g_rt_done_unjoined > 0) return;")
+    r.push("    // waiter can proceed — not a deadlock. Deep-scan-20 fix:")
+    r.push("    // only when a thread is ACTUALLY blocked in join(). The old")
+    r.push("    // unconditional guard also excused real deadlocks where a")
+    r.push("    // finished-but-never-joined task existed and every remaining")
+    r.push("    // thread was blocked on an empty channel — the runtime then")
+    r.push("    // hung forever instead of reporting the deadlock (boot/native")
+    r.push("    // divergence: the interpreter panicked correctly).")
+    r.push("    if (g_rt_done_unjoined > 0 && g_rt_join_waiters > 0) return;")
     r.push("    for (hl_chan* c = g_rt_chans; c; c = c->reg_next) {")
     r.push("        if (c->head && c->waiters > 0) return;       // a consumer can proceed")
     r.push("        if (c->send_waiters > 0 && c->count < c->cap) return;  // a woken sender can proceed")
@@ -10549,9 +10644,11 @@ fn runtime_lines() -> list[str] {
     r.push("    }")
     r.push("    while (!t->done) {")
     r.push("        g_rt_blocked++;")
+    r.push("        g_rt_join_waiters++;   // deep-scan-20: deadlock_check keys off this")
     r.push("        hl_rt_deadlock_check();")
     r.push("        pthread_cond_wait(&g_rt_cv, &g_rt_mu);")
     r.push("        g_rt_blocked--;")
+    r.push("        g_rt_join_waiters--;")
     r.push("    }")
     r.push("    t->joined = true;")
     r.push("    g_rt_done_unjoined--;   // Stage 33: this task is now joined")
@@ -10890,7 +10987,22 @@ fn runtime_lines() -> list[str] {
     r.push("    if (l->elem_free) l->elem_free(old);")
     r.push("}")
     r.push("")
+    r.push("// Deep-scan-20: forward declaration — hl_range (below) panics on")
+    r.push("// oversized ranges but hl_panic is defined further down the runtime.")
+    r.push("static void hl_panic(hl_str* msg);")
     r.push("static hl_list* hl_range(int64_t a, int64_t b) {")
+    r.push("    // Deep-scan-20 fix (boot/native parity): the interpreter caps")
+    r.push("    // range() at 1,000,000 elements (deep-scan-7, clean panic)")
+    r.push("    // but the native runtime happily built the full list —")
+    r.push("    // range(0, 1500000) ran natively and exited 101 under boot.")
+    r.push("    // Mirror the cap so both backends agree.")
+    r.push("    int64_t count = b > a ? b - a : 0;")
+    r.push("    if (count > 1000000) {")
+    r.push("        char buf[192];")
+    r.push("        snprintf(buf, sizeof(buf), \"range(%lld, %lld) would produce %lld elements (limit 1000000) - use an explicit counter loop for large ranges\",")
+    r.push("                 (long long)a, (long long)b, (long long)count);")
+    r.push("        hl_panic(hl_str_from(buf, (int64_t)strlen(buf)));")
+    r.push("    }")
     r.push("    hl_list* l = hl_list_new(free);")
     r.push("    for (int64_t i = a; i < b; i++) hl_list_push(l, hl_box_i64(i));")
     r.push("    return l;")

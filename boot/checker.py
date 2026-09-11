@@ -856,6 +856,21 @@ class Checker:
                 self.require_type(pt, fn, "parameter type")
             if fn["ret"] != "void" and not self.type_exists(fn["ret"], fn):
                 self.err("return type does not exist: %s" % fn["ret"], fn)
+            # Deep-scan-20 fix (MED): extern (FFI) RETURN types were only
+            # checked for existence — `extern fn f() -> list[int]` passed
+            # the decl check, then the call-site FFI validation only
+            # re-checked the PARAMS, so the interpreter's ctypes path
+            # returned a raw int where the type system claimed a list,
+            # and the first list op died with a raw Python TypeError
+            # (outside the HLError discipline). Validate the ret type
+            # at the declaration, same rule as params.
+            if fn.get("extern", False):
+                if fn["ret"] not in ("int", "float", "bool", "str", "void"):
+                    self.err(
+                        "extern fn '%s' returns %s — extern fn returns must "
+                        "be int / float / bool / str / void (use a "
+                        "string-encoded form for complex data)"
+                        % (fn["name"], fn["ret"]), fn)
             self.edges[key] = set()
             self.cur_typeparams = set()
         if "main" not in self.fns:
@@ -1078,12 +1093,22 @@ class Checker:
                              "functions yet (the layout would depend on "
                              "the type instantiation); drop the attribute "
                              "here" % attr, s)
-                elif s["k"] in ("if", "while"):
-                    visit(s["body"])
-                    if s["k"] == "if" and s.get("els"):
+                # Deep-scan-20 fix (HIGH, crash): `if` statements were
+                # visited with s["body"] — the parser emits "then"/"els"
+                # for ifs, so ANY generic function containing an `if`
+                # crashed the checker with KeyError('body'). Split the
+                # cases and also walk match arms (arms carry bodies).
+                elif s["k"] == "if":
+                    visit(s["then"])
+                    if s.get("els"):
                         visit(s["els"])
+                elif s["k"] == "while":
+                    visit(s["body"])
                 elif s["k"] == "for":
                     visit(s["body"])
+                elif s["k"] == "match":
+                    for arm in (s.get("arms") or []):
+                        visit(arm.get("body") or [])
         visit(fn["body"])
 
     def _esc_candidate(self, s):
@@ -1251,6 +1276,18 @@ class Checker:
             self._esc_expr(e["idx"], cand, False, "index expression")
             return
         if k == "call":
+            # Deep-scan-20 fix (LOW, consistency): `len(xs)` is the call
+            # spelling of the borrow-safe `xs.len()` method — the method
+            # branch whitelists the receiver, but the call branch walked
+            # all args with safe=False, so the identical operation forced
+            # a #[stack] / auto candidate to the heap layout purely by
+            # spelling. Treat the builtin len() receiver as borrow-safe.
+            if e.get("rc") == ("builtin", "len") and (e.get("args") or []):
+                self._esc_expr(e["args"][0], cand, True, "len() argument")
+                for a in e["args"][1:]:
+                    self._esc_expr(a, cand, False,
+                                   "argument of call 'len()'")
+                return
             for a in e.get("args", []):
                 self._esc_expr(a, cand, False,
                                "argument of call '%s()'" % e.get("name", "?"))
@@ -1695,7 +1732,13 @@ class Checker:
             self.check_assign(s, env)
         elif k == "if":
             ct = self.check_expr(s["cond"], env, None)
-            if ct != "bool":
+            # Deep-scan-20 fix (LOW): `never` is the bottom type — a
+            # condition that provably diverges (panic("dead")) is dead
+            # code, not a type error. bin/un/all_return already treat
+            # never as bottom; the condition checks were the only strict
+            # equality sites (while false positive: `while panic(...) {}`
+            # was rejected as "got never").
+            if ct not in ("bool", "never"):
                 self.err("if condition must be bool, got %s" % ct, s)
             # Deep-scan-16 HIGH-severity soundness fix: a binding moved
             # inside EITHER arm may be moved at runtime (the arm could
@@ -1746,7 +1789,9 @@ class Checker:
             self.loop_header += 1
             ct = self.check_expr(s["cond"], env, None)
             self.loop_header -= 1
-            if ct != "bool":
+            # Deep-scan-20 fix (LOW): same bottom-type rule as `if` —
+            # a `never` condition is dead code, not a type error.
+            if ct not in ("bool", "never"):
                 self.err("while condition must be bool, got %s" % ct, s)
             # Deep-scan-16 HIGH-severity soundness fix: the loop body may
             # execute >= 1 time. A binding moved inside the body (drop/take)
@@ -3467,6 +3512,18 @@ class Checker:
                         "take(x) (ownership transfer). Data-race freedom: no "
                         "owned value may be simultaneously released by two "
                         "threads." % (what, i + 2), a)
+            # Deep-scan-20 fix (HIGH, soundness): the spawned function's
+            # RETURN value crosses the task boundary at join() — it must
+            # be Send too. Arguments were checked but the return wasn't,
+            # so `spawn(make_task)` with `fn make_task() -> Task[int]`
+            # smuggled a non-Send join handle across the boundary that
+            # argument checking would have rejected (mirrors the native
+            # checker in hlc.hls).
+            if not self.type_is_send(tfn["ret"]):
+                self.err("spawn() target %s returns %s, which is not Send: "
+                         "the result crosses the task boundary at join() "
+                         "(a Task join handle must stay with its spawner)"
+                         % (fname, tfn["ret"]), e)
             self.edges[self.cur_fn].add("b:spawn")
             # Deep-scan-10 soundness fix: the spawned function IS a
             # callee — its effects must reach the spawner's computed
@@ -3556,6 +3613,13 @@ class Checker:
                         "%d reads it directly — pass clone(x) or take(x). "
                         "Data-race freedom: no owned value may be simultaneously "
                         "released by two threads." % (what, i + 2), a)
+            # Deep-scan-20 fix (HIGH, soundness): same rule as spawn —
+            # the future's result value crosses the task boundary at
+            # await(), so the return type must be Send.
+            if not self.type_is_send(tfn["ret"]):
+                self.err("async_spawn() target %s returns %s, which is not "
+                         "Send: the result crosses the task boundary at "
+                         "await()" % (fname, tfn["ret"]), e)
             self.edges[self.cur_fn].add("b:async_spawn")
             # The spawned function's effects reach the spawner (same
             # soundness rule as spawn).
@@ -3924,6 +3988,14 @@ class Checker:
                              "argument %d reads it directly — pass clone(x) "
                              "or take(x)" % (what, i + 2), a)
             self.edges[self.cur_fn].add("b:gen_spawn")
+            # Deep-scan-20 fix (LOW/MED, consistency): stream_new()
+            # rejects non-Send element types, but gen_spawn — which also
+            # creates the stream and hands it to the spawned generator
+            # task — performed no such check. Apply the same rule.
+            if not self.type_is_send(stream_inner(stream_t)):
+                self.err("gen_spawn() stream element type %s is not Send: "
+                         "values cross the task boundary through the "
+                         "stream" % stream_inner(stream_t), e)
             self.edges[self.cur_fn].add(fname)
             # Rewrite: drop the fn-name argument; codegen prepends the
             # created stream to the remaining args.
@@ -4294,6 +4366,11 @@ class Checker:
         covered = set()
         has_wildcard = False
         arm_types = []
+        # Deep-scan-20: post-match move-state = union of every
+        # fall-through arm's moves (collected while checking, applied
+        # AFTER the loop so later arms are checked against the clean
+        # pre-match state, exactly like if-arms).
+        arm_posts = []
         for arm in e["arms"]:
             pat = arm["pattern"]
             if pat["k"] == "wildcard":
@@ -4328,6 +4405,14 @@ class Checker:
                     self.err("variant %s requires %d payload bindings"
                              % (pv, len(payloads)), arm)
             # Check arm body in a new scope with the bindings.
+            # Deep-scan-20 fix (MED, parity with if-arms): each match arm
+            # must isolate move-state. A take/drop in an earlier arm
+            # permanently marked the binding moved, so a later, mutually
+            # EXCLUSIVE arm got a spurious "use of moved value" — the
+            # identical program with the arms swapped was accepted.
+            # Snapshot -> check -> restore -> union the arm's moves into
+            # the post-match state (same protocol as if-arms above).
+            arm_pre = self.snapshot_moved(env)
             self.child(env)
             if pat["k"] != "wildcard":
                 # Bind payload values.
@@ -4357,6 +4442,14 @@ class Checker:
             body_t = self.check_expr(arm["body"], env, expected)
             arm["body_t"] = body_t
             env.pop()
+            # Deep-scan-20: restore the pre-arm move-state (a later,
+            # mutually exclusive arm must be checked against the clean
+            # pre-match state); a `never` body diverges and cannot
+            # contribute moves to the post-match state.
+            arm_post = self.snapshot_moved(env)
+            self.restore_moved(env, arm_pre)
+            if body_t != "never":
+                arm_posts.append(arm_post)
             if body_t == "never":
                 arm_types.append(None)
             else:
@@ -4368,6 +4461,11 @@ class Checker:
             if missing:
                 self.err("match is not exhaustive; missing: %s"
                          % ", ".join(sorted(missing)), e)
+        # Deep-scan-20: apply the union of the fall-through arms' moves
+        # to the post-match state (sound direction: a binding moved in
+        # ANY arm is moved after the match).
+        for arm_post in arm_posts:
+            self.union_moved(env, arm_post)
         # All arm types must agree.
         non_never = [t for t in arm_types if t is not None]
         if not non_never:

@@ -236,6 +236,13 @@ class ConcRuntime:
         self.blocked = 0       # threads currently blocked in recv/select/join/send
         self.msgs = 0          # total pending messages across all channels
         self.next_id = 0
+        # Deep-scan-20: mirror the native Stage-33 counters so the
+        # deadlock verdicts agree — done_unjoined counts finished tasks
+        # nobody joined yet; join_waiters counts threads currently
+        # blocked INSIDE join(). A done-but-unjoined task only excuses a
+        # deadlock when a join waiter can actually proceed on it.
+        self.done_unjoined = 0
+        self.join_waiters = 0
         # Live-channel registry (for the deadlock scan). HLChan.__del__
         # deregisters; see the soundness note there.
         self.chans = []
@@ -273,6 +280,16 @@ class ConcRuntime:
         anyway)."""
         alive = self.tasks_alive + 1  # +1: the main thread
         if self.blocked != alive:
+            return
+        # Deep-scan-20 fix (MED, parity + correctness): a finished-but-
+        # unjoined task only means "not a deadlock" when a thread is
+        # ACTUALLY blocked in join() and will proceed on it. The old
+        # check (no guard at all, opposite of the native's overly broad
+        # one) panicked while the native hung; with this mirrored guard
+        # both sides now report the same verdict: a program whose every
+        # remaining thread blocks on an empty channel with an abandoned
+        # done task is a REAL deadlock and panics on both backends.
+        if self.done_unjoined > 0 and self.join_waiters > 0:
             return
         for c in self.chans:
             if c.q and c.waiters > 0:
@@ -365,10 +382,13 @@ class ConcRuntime:
                 raise HLPanic("task already joined", line)
             while not task.done:
                 self.blocked += 1
+                self.join_waiters += 1
                 self.deadlock_check()
                 self.cv.wait()
                 self.blocked -= 1
+                self.join_waiters -= 1
             task.joined = True
+            self.done_unjoined -= 1
             return task.result
 
     def task_finished(self, task, result):
@@ -376,6 +396,7 @@ class ConcRuntime:
             task.result = result
             task.done = True
             self.tasks_alive -= 1
+            self.done_unjoined += 1
             self.cv.notify_all()
 
 

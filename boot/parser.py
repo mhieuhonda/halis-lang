@@ -1073,12 +1073,16 @@ class Parser:
                 else:
                     e = {"k": "field", "target": e, "name": name["v"],
                          "line": dot["line"]}
-            elif self.at_sym("[") and e["k"] in ("ident", "field", "index", "call", "method", "fieldcall", "qmark"):
+            elif self.at_sym("[") and e["k"] in ("ident", "field", "index", "call", "method", "fieldcall", "qmark", "listlit", "match"):
                 # Deep-scan-10 fix: `qmark` joins the indexable forms —
                 # `g()?[0]` used to detach the `[0]` into a stray
                 # statement (inconsistent with `g()?.x`, which worked).
-                # `listlit` (indexing a fresh list literal) and `match`
-                # results are also indexable values.
+                # Deep-scan-20 fix: the comment claimed `listlit` and
+                # `match` results were indexable but the tuple omitted
+                # them — `[10, 20, 30][1]` detached the index into a
+                # stray statement with a misleading error at the NEXT
+                # line. Add both spellings (mirrored in hlc.hls
+                # can_index); the checker type-checks them fine.
                 lb = self.next()
                 idx = self.parse_expr()
                 self.eat_sym("]")
