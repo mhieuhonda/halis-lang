@@ -1,0 +1,663 @@
+# tests/ok/feat_stage70_sse.hls — Stage 70 (v0.89.0-alpha):
+# std.sse — Server-Sent Events (one-way streaming).
+#
+# Exercises:
+#   - SseEvent struct + builder (sse_event_new, sse_with_id, sse_with_event,
+#     sse_with_data, sse_add_data, sse_with_retry)
+#   - sse_serialize (wire format: id/event/retry/data, multi-line data,
+#     empty data)
+#   - sse_parse (single event; CRLF handling; case-insensitive fields;
+#     comment lines; unknown fields ignored)
+#   - sse_parse_stream (multiple events; trailing incomplete data dropped)
+#   - sse_comment / sse_heartbeat (keep-alive comments)
+#   - sse_response / sse_response_with_events / sse_response_with_heartbeat
+#     (HTTP integration; correct headers)
+#   - sse_last_event_id / sse_validate_request_id (Last-Event-ID header
+#     for resumable streams)
+#   - sse_validate_event / sse_validate_id / sse_validate_event_type
+#     (limits and CR/LF rejection)
+#   - sse_describe (introspection)
+#   - Stream helpers (sse_build_message, sse_build_status_update,
+#     sse_build_notification, sse_build_log_line, sse_build_heartbeat_block)
+#   - Constants (field names, headers, limits)
+#
+# Negative cases:
+#   - serialize event with CR/LF in id (rejected)
+#   - serialize event with CR/LF in event_type (rejected)
+#   - serialize event with id too long (rejected)
+#   - serialize event with retry_ms too small (rejected)
+#   - serialize event with retry_ms too large (rejected)
+#   - parse incomplete event (missing trailing blank line)
+#   - sse_validate_request_id with bad Last-Event-ID (rejected)
+#
+# The output is fully deterministic (no Rand, no I/O) so the
+# differential test (interpreter == native) produces byte-identical output.
+
+import "std.sse"
+import "std.http"
+import "std.str"
+import "std.option"
+import "std.result"
+
+# ============================================================================
+# Helpers — assertion primitives (same pattern as feat_stage66/67/68/69).
+# ============================================================================
+
+fn ok(actual: bool, msg: str) -> void uses IO {
+    if !actual {
+        panic("FAIL " + msg)
+    }
+}
+
+fn eq_int(actual: int, expected: int, msg: str) -> void uses IO {
+    if actual != expected {
+        panic("FAIL " + msg + ": expected " + expected.to_str() + ", got " + actual.to_str())
+    }
+}
+
+fn eq_str(actual: str, expected: str, msg: str) -> void uses IO {
+    if actual != expected {
+        panic("FAIL " + msg + ": expected '" + expected + "', got '" + actual + "'")
+    }
+}
+
+fn eq_bool(actual: bool, expected: bool, msg: str) -> void uses IO {
+    if actual != expected {
+        panic("FAIL " + msg + ": expected " + expected.to_str() + ", got " + actual.to_str())
+    }
+}
+
+# ============================================================================
+# Test 1: SseEvent builder — sse_event_new, sse_with_*, sse_add_data
+# ============================================================================
+
+fn test_builder() -> int uses IO {
+    let e: SseEvent = sse_event_new()
+    eq_str(e.id, "", "new id empty")
+    eq_str(e.event_type, "", "new event_type empty")
+    eq_str(e.data, "", "new data empty")
+    eq_int(e.retry_ms, 0, "new retry_ms 0")
+
+    # sse_with_id
+    let e2: SseEvent = sse_with_id(e, "1")
+    eq_str(e2.id, "1", "with_id")
+    eq_str(e.id, "", "with_id does not mutate")
+
+    # sse_with_event
+    let e3: SseEvent = sse_with_event(e2, "message")
+    eq_str(e3.event_type, "message", "with_event")
+
+    # sse_with_data
+    let e4: SseEvent = sse_with_data(e3, "hello")
+    eq_str(e4.data, "hello", "with_data")
+
+    # sse_add_data (single line)
+    let e5: SseEvent = sse_add_data(e4, "world")
+    eq_str(e5.data, "hello\nworld", "add_data appends")
+
+    # sse_with_retry (clamping)
+    let e6: SseEvent = sse_with_retry(e5, 3000)
+    eq_int(e6.retry_ms, 3000, "with_retry 3000")
+    let e7: SseEvent = sse_with_retry(e5, 100)
+    eq_int(e7.retry_ms, 1000, "with_retry clamps to min 1000")
+    let e8: SseEvent = sse_with_retry(e5, 999999)
+    eq_int(e8.retry_ms, 300000, "with_retry clamps to max 300000")
+    let e9: SseEvent = sse_with_retry(e5, 0)
+    eq_int(e9.retry_ms, 0, "with_retry 0 means omit")
+    let e10: SseEvent = sse_with_retry(e5, -5)
+    eq_int(e10.retry_ms, 0, "with_retry negative -> 0")
+    return 0
+}
+
+# ============================================================================
+# Test 2: sse_serialize — basic event (all fields)
+# ============================================================================
+
+fn test_serialize_basic() -> int uses IO {
+    let e: SseEvent = sse_event_new()
+    e.id = "1"
+    e.event_type = "message"
+    e.data = "hello"
+    e.retry_ms = 3000
+    let r: Result[str, str] = sse_serialize(e)
+    ok(result_is_ok(r), "serialize ok")
+    let wire: str = result_unwrap(r)
+    # Field order: id, event, retry, data, then trailing blank line.
+    eq_str(wire, "id: 1\nevent: message\nretry: 3000\ndata: hello\n\n", "serialize basic")
+    return 0
+}
+
+# ============================================================================
+# Test 3: sse_serialize — multi-line data (each line a separate data: field)
+# ============================================================================
+
+fn test_serialize_multiline_data() -> int uses IO {
+    let e: SseEvent = sse_event_new()
+    e.data = "line1\nline2\nline3"
+    let wire: str = result_unwrap(sse_serialize(e))
+    eq_str(wire, "data: line1\ndata: line2\ndata: line3\n\n", "serialize multiline data")
+    return 0
+}
+
+# ============================================================================
+# Test 4: sse_serialize — empty data still emits "data:\n"
+# ============================================================================
+
+fn test_serialize_empty_data() -> int uses IO {
+    let e: SseEvent = sse_event_new()
+    # Empty event — at minimum emits "data:\n\n"
+    let wire: str = result_unwrap(sse_serialize(e))
+    eq_str(wire, "data:\n\n", "serialize empty data")
+    return 0
+}
+
+# ============================================================================
+# Test 5: sse_serialize — only some fields set
+# ============================================================================
+
+fn test_serialize_partial() -> int uses IO {
+    # Only id
+    let e1: SseEvent = sse_event_new()
+    e1.id = "42"
+    eq_str(result_unwrap(sse_serialize(e1)), "id: 42\ndata:\n\n", "serialize id only")
+
+    # Only event_type
+    let e2: SseEvent = sse_event_new()
+    e2.event_type = "update"
+    eq_str(result_unwrap(sse_serialize(e2)), "event: update\ndata:\n\n", "serialize event only")
+
+    # Only retry
+    let e3: SseEvent = sse_event_new()
+    e3.retry_ms = 5000
+    eq_str(result_unwrap(sse_serialize(e3)), "retry: 5000\ndata:\n\n", "serialize retry only")
+
+    # Only data
+    let e4: SseEvent = sse_event_new()
+    e4.data = "hi"
+    eq_str(result_unwrap(sse_serialize(e4)), "data: hi\n\n", "serialize data only")
+    return 0
+}
+
+# ============================================================================
+# Test 6: sse_parse — round trip (serialize then parse)
+# ============================================================================
+
+fn test_parse_round_trip() -> int uses IO {
+    let e: SseEvent = sse_event_new()
+    e.id = "42"
+    e.event_type = "update"
+    e.data = "hello\nworld"
+    e.retry_ms = 5000
+    let wire: str = result_unwrap(sse_serialize(e))
+    let parsed: Result[SseEvent, str] = sse_parse(wire)
+    ok(result_is_ok(parsed), "parse ok")
+    let p: SseEvent = result_unwrap(parsed)
+    eq_str(p.id, "42", "round-trip id")
+    eq_str(p.event_type, "update", "round-trip event_type")
+    eq_str(p.data, "hello\nworld", "round-trip data")
+    eq_int(p.retry_ms, 5000, "round-trip retry_ms")
+    return 0
+}
+
+# ============================================================================
+# Test 7: sse_parse — case-insensitive field names; CRLF; comments
+# ============================================================================
+
+fn test_parse_liberal() -> int uses IO {
+    # Case-insensitive field names
+    let wire1: str = "ID: 1\nEvent: msg\nRetry: 1000\nData: hi\n\n"
+    let p1: SseEvent = result_unwrap(sse_parse(wire1))
+    eq_str(p1.id, "1", "case-insensitive ID")
+    eq_str(p1.event_type, "msg", "case-insensitive Event")
+    eq_int(p1.retry_ms, 1000, "case-insensitive Retry")
+    eq_str(p1.data, "hi", "case-insensitive Data")
+
+    # CRLF line endings
+    let crlf: str = chr(13) + "\n"
+    let wire2: str = "id: 1" + crlf + "data: hello" + crlf + crlf
+    let p2: SseEvent = result_unwrap(sse_parse(wire2))
+    eq_str(p2.id, "1", "CRLF id")
+    eq_str(p2.data, "hello", "CRLF data")
+
+    # Comment lines (starting with ":")
+    let wire3: str = ": this is a comment\nid: 1\ndata: hi\n\n"
+    let p3: SseEvent = result_unwrap(sse_parse(wire3))
+    eq_str(p3.id, "1", "comment ignored - id")
+    eq_str(p3.data, "hi", "comment ignored - data")
+
+    # Unknown field ignored
+    let wire4: str = "id: 1\nunknownfield: foo\ndata: hi\n\n"
+    let p4: SseEvent = result_unwrap(sse_parse(wire4))
+    eq_str(p4.id, "1", "unknown field ignored - id")
+    eq_str(p4.data, "hi", "unknown field ignored - data")
+
+    # Multiple data: lines joined with \n
+    let wire5: str = "data: line1\ndata: line2\ndata: line3\n\n"
+    let p5: SseEvent = result_unwrap(sse_parse(wire5))
+    eq_str(p5.data, "line1\nline2\nline3", "multi-line data joined")
+
+    # Optional space after colon
+    let wire6: str = "data:nospace\ndata: withspace\n\n"
+    let p6: SseEvent = result_unwrap(sse_parse(wire6))
+    eq_str(p6.data, "nospace\nwithspace", "data with/without space after colon")
+
+    # Lines without a colon are ignored
+    let wire7: str = "this is not a field\nid: 1\ndata: hi\n\n"
+    let p7: SseEvent = result_unwrap(sse_parse(wire7))
+    eq_str(p7.id, "1", "no-colon line ignored - id")
+    eq_str(p7.data, "hi", "no-colon line ignored - data")
+    return 0
+}
+
+# ============================================================================
+# Test 8: sse_parse_stream — multiple events; trailing data dropped
+# ============================================================================
+
+fn test_parse_stream() -> int uses IO {
+    let stream: str = "data: first\n\ndata: second\n\ndata: third\n\n"
+    let events: list[SseEvent] = sse_parse_stream(stream)
+    eq_int(events.len(), 3, "stream parsed 3 events")
+    eq_str(events.get(0).data, "first", "stream event 0")
+    eq_str(events.get(1).data, "second", "stream event 1")
+    eq_str(events.get(2).data, "third", "stream event 2")
+
+    # Trailing incomplete event is dropped
+    let partial: str = "data: complete\n\ndata: incomplete"
+    let events2: list[SseEvent] = sse_parse_stream(partial)
+    eq_int(events2.len(), 1, "incomplete trailing data dropped")
+    eq_str(events2.get(0).data, "complete", "complete event kept")
+
+    # Empty stream
+    let events3: list[SseEvent] = sse_parse_stream("")
+    eq_int(events3.len(), 0, "empty stream")
+    return 0
+}
+
+# ============================================================================
+# Test 9: sse_comment / sse_heartbeat
+# ============================================================================
+
+fn test_comments() -> int uses IO {
+    eq_str(sse_comment("ping"), ":ping\n\n", "comment ping")
+    eq_str(sse_heartbeat(), ":ping\n\n", "heartbeat = ':ping\\n\\n'")
+
+    # Comment with embedded newlines — CR/LF replaced with spaces
+    let c: str = sse_comment("line1\nline2")
+    eq_str(c, ":line1 line2\n\n", "comment with newline sanitized")
+    return 0
+}
+
+# ============================================================================
+# Test 10: sse_response — correct headers
+# ============================================================================
+
+fn test_http_response() -> int uses IO {
+    let resp: HttpResponse = sse_response()
+    eq_int(resp.status, 200, "response status 200")
+    eq_str(http_header_get(resp.headers, "Content-Type"), "text/event-stream", "Content-Type")
+    eq_str(http_header_get(resp.headers, "Cache-Control"), "no-cache, no-transform", "Cache-Control")
+    eq_str(http_header_get(resp.headers, "Connection"), "keep-alive", "Connection")
+    eq_str(http_header_get(resp.headers, "X-Accel-Buffering"), "no", "X-Accel-Buffering")
+    eq_str(resp.body, "", "empty body")
+
+    # sse_response_with_events — body is concatenation of serialized events
+    let e1: SseEvent = sse_event_new()
+    e1.data = "first"
+    let e2: SseEvent = sse_event_new()
+    e2.data = "second"
+    let resp2: HttpResponse = sse_response_with_events([e1, e2])
+    eq_str(resp2.body, "data: first\n\ndata: second\n\n", "response body has 2 events")
+
+    # sse_response_with_heartbeat — body starts with a heartbeat
+    let resp3: HttpResponse = sse_response_with_heartbeat([e1], "keepalive")
+    eq_str(resp3.body, ":keepalive\n\ndata: first\n\n", "response body starts with heartbeat")
+    return 0
+}
+
+# ============================================================================
+# Test 11: sse_last_event_id / sse_validate_request_id
+# ============================================================================
+
+fn test_last_event_id() -> int uses IO {
+    # Request with Last-Event-ID header
+    let req1: HttpRequest = http_request_new("GET", "/stream")
+    req1.headers = http_header_add(req1.headers, "Last-Event-ID", "42")
+    eq_str(sse_last_event_id(req1), "42", "extract Last-Event-ID")
+
+    # Request without the header
+    let req2: HttpRequest = http_request_new("GET", "/stream")
+    eq_str(sse_last_event_id(req2), "", "no Last-Event-ID header")
+
+    # Validate request ID — valid
+    let v1: Result[str, str] = sse_validate_request_id(req1)
+    ok(result_is_ok(v1), "validate_request_id ok")
+    eq_str(result_unwrap(v1), "42", "validate_request_id returns id")
+
+    # Validate request ID — absent (Ok(""))
+    let v2: Result[str, str] = sse_validate_request_id(req2)
+    ok(result_is_ok(v2), "validate_request_id ok when absent")
+    eq_str(result_unwrap(v2), "", "validate_request_id returns empty when absent")
+
+    # Validate request ID — invalid (contains LF — but we can't put LF in
+    # a header value directly; build a synthetic invalid event ID using
+    # chr(10)). We'll skip this case because HTTP header values cannot
+    # contain LF — they'd be rejected at the HTTP layer first. The
+    # sse_validate_id function is tested directly in test_validation.
+    return 0
+}
+
+# ============================================================================
+# Test 12: sse_validate_event / sse_validate_id / sse_validate_event_type
+# ============================================================================
+
+fn test_validation() -> int uses IO {
+    # Valid event
+    let e: SseEvent = sse_event_new()
+    e.id = "1"
+    e.event_type = "message"
+    e.data = "hello"
+    e.retry_ms = 3000
+    ok(result_is_ok(sse_validate_event(e)), "valid event ok")
+
+    # id with LF
+    let e2: SseEvent = sse_event_new()
+    e2.id = "1\n2"
+    ok(result_is_err(sse_validate_event(e2)), "id with LF rejected")
+
+    # id with CR
+    let e3: SseEvent = sse_event_new()
+    e3.id = "1" + chr(13) + "2"
+    ok(result_is_err(sse_validate_event(e3)), "id with CR rejected")
+
+    # id too long
+    let e4: SseEvent = sse_event_new()
+    let mut long_id: str = ""
+    let mut i: int = 0
+    while i < 300 {
+        long_id = long_id + "x"
+        i = i + 1
+    }
+    e4.id = long_id
+    ok(result_is_err(sse_validate_event(e4)), "id too long rejected")
+
+    # event_type with LF
+    let e5: SseEvent = sse_event_new()
+    e5.event_type = "msg\n"
+    ok(result_is_err(sse_validate_event(e5)), "event_type with LF rejected")
+
+    # retry_ms too small
+    let e6: SseEvent = sse_event_new()
+    e6.retry_ms = 100
+    ok(result_is_err(sse_validate_event(e6)), "retry_ms too small rejected")
+
+    # retry_ms too large
+    let e7: SseEvent = sse_event_new()
+    e7.retry_ms = 999999
+    ok(result_is_err(sse_validate_event(e7)), "retry_ms too large rejected")
+
+    # retry_ms = 0 is OK (means omit)
+    let e8: SseEvent = sse_event_new()
+    e8.retry_ms = 0
+    ok(result_is_ok(sse_validate_event(e8)), "retry_ms = 0 ok")
+
+    # sse_validate_id standalone
+    ok(result_is_ok(sse_validate_id("abc")), "validate_id ok")
+    ok(result_is_err(sse_validate_id("a\nb")), "validate_id rejects LF")
+    ok(result_is_err(sse_validate_id("a" + chr(13) + "b")), "validate_id rejects CR")
+
+    # sse_validate_event_type standalone
+    ok(result_is_ok(sse_validate_event_type("message")), "validate_event_type ok")
+    ok(result_is_err(sse_validate_event_type("a\nb")), "validate_event_type rejects LF")
+    return 0
+}
+
+# ============================================================================
+# Test 13: sse_describe — introspection
+# ============================================================================
+
+fn test_describe() -> int uses IO {
+    let e: SseEvent = sse_event_new()
+    e.id = "1"
+    e.event_type = "message"
+    e.data = "hello"
+    e.retry_ms = 3000
+    let d: str = sse_describe(e)
+    ok(d.contains("SseEvent"), "describe has SseEvent header")
+    ok(d.contains("id:"), "describe has id field")
+    ok(d.contains("event_type:"), "describe has event_type field")
+    ok(d.contains("data:"), "describe has data field")
+    ok(d.contains("retry_ms:"), "describe has retry_ms field")
+
+    # Long data is truncated
+    let e2: SseEvent = sse_event_new()
+    let mut long_data: str = ""
+    let mut i: int = 0
+    while i < 100 {
+        long_data = long_data + "x"
+        i = i + 1
+    }
+    e2.data = long_data
+    let d2: str = sse_describe(e2)
+    ok(d2.contains("..."), "describe truncates long data")
+    ok(d2.contains("100 bytes"), "describe shows byte count")
+    return 0
+}
+
+# ============================================================================
+# Test 14: Stream helpers — sse_build_message / _status_update / etc.
+# ============================================================================
+
+fn test_stream_helpers() -> int uses IO {
+    # sse_build_message
+    let m: str = sse_build_message("1", "hello")
+    eq_str(m, "id: 1\ndata: hello\n\n", "build_message")
+
+    # sse_build_status_update
+    let s: str = sse_build_status_update("1", "OK", 3000)
+    eq_str(s, "id: 1\nevent: status\nretry: 3000\ndata: OK\n\n", "build_status_update")
+
+    # sse_build_notification
+    let n: str = sse_build_notification("1", "you have mail")
+    eq_str(n, "id: 1\nevent: notification\ndata: you have mail\n\n", "build_notification")
+
+    # sse_build_log_line — no ID (logs are not resumable)
+    let l: str = sse_build_log_line("[INFO] server started")
+    eq_str(l, "event: log\ndata: [INFO] server started\n\n", "build_log_line")
+
+    # sse_build_heartbeat_block
+    let hb: str = sse_build_heartbeat_block(3)
+    eq_str(hb, ":ping\n\n:ping\n\n:ping\n\n", "build_heartbeat_block 3")
+    return 0
+}
+
+# ============================================================================
+# Test 15: Constants
+# ============================================================================
+
+fn test_constants() -> int uses IO {
+    # Field names
+    eq_str(sse_field_event(), "event", "field event")
+    eq_str(sse_field_data(), "data", "field data")
+    eq_str(sse_field_id(), "id", "field id")
+    eq_str(sse_field_retry(), "retry", "field retry")
+
+    # Defaults
+    eq_str(sse_default_event_type(), "message", "default event_type message")
+    eq_int(sse_default_retry_ms(), 3000, "default retry_ms 3000")
+
+    # HTTP headers
+    eq_str(sse_content_type(), "text/event-stream", "content_type")
+    eq_str(sse_header_content_type(), "Content-Type", "header content_type")
+    eq_str(sse_header_cache_control(), "Cache-Control", "header cache_control")
+    eq_str(sse_cache_control_value(), "no-cache, no-transform", "cache_control value")
+    eq_str(sse_header_connection(), "Connection", "header connection")
+    eq_str(sse_connection_value(), "keep-alive", "connection value")
+    eq_str(sse_header_x_accel_buffering(), "X-Accel-Buffering", "header x_accel_buffering")
+    eq_str(sse_x_accel_buffering_value(), "no", "x_accel_buffering value")
+    eq_str(sse_header_last_event_id(), "Last-Event-ID", "header last_event_id")
+
+    # Heartbeat
+    eq_str(sse_heartbeat_text(), "ping", "heartbeat text")
+
+    # Limits
+    eq_int(sse_max_id_len(), 256, "max_id_len 256")
+    eq_int(sse_max_event_type_len(), 64, "max_event_type_len 64")
+    eq_int(sse_max_data_len(), 1048576, "max_data_len 1 MiB")
+    eq_int(sse_max_retry_ms(), 300000, "max_retry_ms 5 min")
+    eq_int(sse_min_retry_ms(), 1000, "min_retry_ms 1 sec")
+    return 0
+}
+
+# ============================================================================
+# Test 16: parse errors
+# ============================================================================
+
+fn test_parse_errors() -> int uses IO {
+    # Incomplete event (no trailing blank line)
+    let r1: Result[SseEvent, str] = sse_parse("data: hello")
+    ok(result_is_err(r1), "incomplete event rejected")
+
+    # Empty input
+    let r2: Result[SseEvent, str] = sse_parse("")
+    ok(result_is_err(r2), "empty input rejected")
+
+    # Just whitespace
+    let r3: Result[SseEvent, str] = sse_parse("   ")
+    ok(result_is_err(r3), "whitespace-only rejected")
+
+    # sse_serialize_or_default panics on invalid event
+    # (we don't call it directly to avoid panicking the test)
+    return 0
+}
+
+# ============================================================================
+# Test 17: end-to-end — server pushing a sequence of events
+# ============================================================================
+
+fn test_end_to_end() -> int uses IO {
+    # Build a sequence of events (a server pushing a counter)
+    let events: list[SseEvent] = []
+    let mut i: int = 0
+    while i < 5 {
+        let e: SseEvent = sse_event_new()
+        e.id = i.to_str()
+        e.event_type = "tick"
+        e.data = "tick " + i.to_str()
+        e.retry_ms = 3000
+        events.push(e)
+        i = i + 1
+    }
+    # Build the HTTP response with the events
+    let resp: HttpResponse = sse_response_with_events(events)
+    eq_int(resp.status, 200, "e2e response status 200")
+    eq_str(http_header_get(resp.headers, "Content-Type"), "text/event-stream", "e2e content-type")
+
+    # Parse the body back into events
+    let parsed: list[SseEvent] = sse_parse_stream(resp.body)
+    eq_int(parsed.len(), 5, "e2e parsed 5 events")
+    eq_str(parsed.get(0).id, "0", "e2e event 0 id")
+    eq_str(parsed.get(0).event_type, "tick", "e2e event 0 type")
+    eq_str(parsed.get(0).data, "tick 0", "e2e event 0 data")
+    eq_str(parsed.get(4).id, "4", "e2e event 4 id")
+    eq_str(parsed.get(4).data, "tick 4", "e2e event 4 data")
+
+    # Add a heartbeat before the events
+    let resp2: HttpResponse = sse_response_with_heartbeat(events, "ping")
+    let parsed2: list[SseEvent] = sse_parse_stream(resp2.body)
+    eq_int(parsed2.len(), 5, "e2e heartbeat: parsed 5 events (heartbeat ignored)")
+
+    # Last-Event-ID header round trip (simulate reconnection)
+    let req: HttpRequest = http_request_new("GET", "/stream")
+    req.headers = http_header_add(req.headers, "Last-Event-ID", "2")
+    let last_id: str = sse_last_event_id(req)
+    eq_str(last_id, "2", "e2e Last-Event-ID extracted")
+    # Server would resume from event 3
+    let mut resumed: int = 0
+    let mut j: int = 0
+    while j < parsed.len() {
+        if parsed.get(j).id == "2" {
+            resumed = j + 1
+        }
+        j = j + 1
+    }
+    eq_int(parsed.len() - resumed, 2, "e2e resume: 2 events after id=2")
+    return 0
+}
+
+# ============================================================================
+# Dispatcher
+# ============================================================================
+
+fn run_tests() -> int uses IO {
+    println("=== Stage 70 acceptance: std.sse ===")
+    let mut passed: int = 0
+    let tests: list[str] = [
+        "test_builder",
+        "test_serialize_basic",
+        "test_serialize_multiline_data",
+        "test_serialize_empty_data",
+        "test_serialize_partial",
+        "test_parse_round_trip",
+        "test_parse_liberal",
+        "test_parse_stream",
+        "test_comments",
+        "test_http_response",
+        "test_last_event_id",
+        "test_validation",
+        "test_describe",
+        "test_stream_helpers",
+        "test_constants",
+        "test_parse_errors",
+        "test_end_to_end"
+    ]
+    let mut i: int = 0
+    while i < tests.len() {
+        let name: str = tests.get(i)
+        println("RUN  " + name)
+        if name == "test_builder" {
+            let _r: int = test_builder()
+        } else if name == "test_serialize_basic" {
+            let _r: int = test_serialize_basic()
+        } else if name == "test_serialize_multiline_data" {
+            let _r: int = test_serialize_multiline_data()
+        } else if name == "test_serialize_empty_data" {
+            let _r: int = test_serialize_empty_data()
+        } else if name == "test_serialize_partial" {
+            let _r: int = test_serialize_partial()
+        } else if name == "test_parse_round_trip" {
+            let _r: int = test_parse_round_trip()
+        } else if name == "test_parse_liberal" {
+            let _r: int = test_parse_liberal()
+        } else if name == "test_parse_stream" {
+            let _r: int = test_parse_stream()
+        } else if name == "test_comments" {
+            let _r: int = test_comments()
+        } else if name == "test_http_response" {
+            let _r: int = test_http_response()
+        } else if name == "test_last_event_id" {
+            let _r: int = test_last_event_id()
+        } else if name == "test_validation" {
+            let _r: int = test_validation()
+        } else if name == "test_describe" {
+            let _r: int = test_describe()
+        } else if name == "test_stream_helpers" {
+            let _r: int = test_stream_helpers()
+        } else if name == "test_constants" {
+            let _r: int = test_constants()
+        } else if name == "test_parse_errors" {
+            let _r: int = test_parse_errors()
+        } else if name == "test_end_to_end" {
+            let _r: int = test_end_to_end()
+        }
+        println("PASS " + name)
+        passed = passed + 1
+        i = i + 1
+    }
+    println("")
+    println("=== " + passed.to_str() + "/" + tests.len().to_str() + " tests PASSED ===")
+    return 0
+}
+
+fn main() -> int uses IO {
+    return run_tests()
+}

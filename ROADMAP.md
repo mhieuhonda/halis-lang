@@ -117,7 +117,7 @@ remains green.
 | 67 | `std.session` — server-side sessions (in-memory + file) | ✅ | (done in v0.86.0-alpha) |
 | 68 | `std.csrf` — double-submit + sync-token patterns | ✅ | (done in v0.87.0-alpha) |
 | 69 | `std.template` — compile-time HTML templates (no XSS) | ✅ | (done in v0.88.0-alpha) |
-| 70 | `std.sse` — server-sent events (one-way streaming) | ⬜ | 2 weeks |
+| 70 | `std.sse` — server-sent events (one-way streaming) | ✅ | (done in v0.89.0-alpha) |
 | 71 | `std.graphql` — schema-first server (parser + resolver) | ⬜ | 6 weeks |
 | 72 | `std.openapi` — generate OpenAPI 3.1 from handler types | ⬜ | 4 weeks |
 | 73 | `std.jsffi` — bind to JavaScript globals from `wasm32` | ⬜ | 5 weeks |
@@ -7599,3 +7599,289 @@ HTML page rendering. Fully deterministic (no Rand, no I/O).
 the acceptance test differentially (interpreter == native for both),
 then prints the feature summary. Pure-HLS implementation; no new
 compiler builtins; bootstrap is still deterministic.
+
+---
+
+## STAGE 70 — `std.sse` — Server-Sent Events (one-way streaming) ✅ (release v0.89.0-alpha)
+
+**Goal:** a pure-HLS implementation of the Server-Sent Events protocol
+specified by the HTML5 / WHATWG Living Standard (§9.2). SSE is the
+standard wire protocol for one-way streaming from a server to a browser
+over a single HTTP/1.1 connection. Unlike WebSocket (Stage 65, RFC 6455),
+SSE is UNIDIRECTIONAL: the server pushes events; the client cannot send
+messages back over the same connection. This makes SSE simpler than
+WebSocket: it works over plain HTTP (no Upgrade handshake, no framing,
+no mask), it auto-reconnects (the browser retries on disconnect,
+carrying the Last-Event-ID header so the server can resume the stream),
+and it is natively supported by `EventSource` in JavaScript.
+
+**Status (v0.89.0-alpha):** Stage 70 is **COMPLETE**. The new module
+`std/sse.hls` (~770 lines) is a pure-HLS implementation on top of
+`std.http` (HttpHeader, HttpRequest, HttpResponse, http_header_get,
+http_header_has, http_header_add, http_request_new, http_response_new —
+Stage 38), `std.str` (str_join, str_replace, str_to_lower_ascii),
+`std.option` (Option[T]), `std.result` (Result[T, E] — for parse errors
+and validation, plus the existing `int_parse` helper).
+
+No new compiler builtins — the entire module is pure HLS.
+
+**Shipped in v0.89.0-alpha (Stage 70):**
+
+- **SseEvent struct + builder:**
+    - `struct SseEvent { id, event_type, data, retry_ms }` — the four
+      fields defined by the HTML5 spec. Any field may be empty/zero
+      (meaning "do not emit this field").
+    - `sse_event_new() -> SseEvent` — empty event.
+    - `sse_event_new_data(data) -> SseEvent` — event with just data (the
+      most common case — a server pushing a message without an ID or
+      type).
+    - `sse_with_id(e, id) / sse_with_event(e, event_type) /
+      sse_with_data(e, data) / sse_add_data(e, line) / sse_with_retry(e,
+      retry_ms)` — immutable setters that return a NEW SseEvent (the
+      original is not mutated). `sse_add_data` appends a line (joined
+      with `\n`); `sse_with_retry` clamps the value to
+      `[sse_min_retry_ms, sse_max_retry_ms]` (0 means "omit the field").
+
+- **Wire format serialiser (HTML5 §9.2):**
+    - `sse_serialize(e) -> Result[str, str]` — render the event as wire
+      format. Returns `Result.Err(msg)` if the event fails validation.
+      Fields are emitted in this order: `id`, `event`, `retry`, `data`,
+      then the trailing blank line `\n\n` that dispatches the event.
+      Multi-line data is split on `\n` and each line is emitted as a
+      separate `data:` field. Empty data still emits `data:\n\n` (the
+      client dispatches an event with empty data).
+    - `sse_serialize_or_default(e) -> str` — convenience that panics on
+      validation failure. Use only when the event is known-good.
+
+- **Parser:**
+    - `sse_parse(s) -> Result[SseEvent, str]` — parse a single event.
+      Returns `Result.Err` if the input is not a complete event (missing
+      trailing `\n\n`). The parser is liberal (matches every
+      implementation in the wild):
+        * CRLF line endings are accepted (the trailing CR is stripped).
+        * Field names are case-INsensitive (per HTML5 §9.2 — `field` is
+          matched case-insensitively; we lowercase before comparing).
+        * Leading/trailing whitespace around the field value is stripped.
+        * A single leading space after the colon is stripped (per spec).
+        * Lines without a `:` (or with no field name) are ignored.
+        * Comments (lines starting with `:`) are ignored.
+        * Multiple `data:` lines are joined with `\n`.
+        * If the same field appears multiple times, the LAST value wins
+          (except for `data:`, which APPENDS).
+        * Invalid `retry:` values are ignored (the spec says ignore).
+        * Unknown fields are ignored.
+    - `sse_parse_stream(s) -> list[SseEvent]` — parse a stream of
+      events. Splits on `\n\n`, parses each chunk as a single event.
+      Incomplete trailing data is silently dropped. Per the HTML5 spec,
+      events with no populated fields (e.g. heartbeats) are filtered
+      out — they parse to an empty SseEvent and are not dispatched.
+
+- **Comments & heartbeats:**
+    - `sse_comment(text) -> str` — render a comment line (`: text\n\n`).
+      CR/LF in the text are replaced with spaces (defensive). Used for
+      advisory comments in the stream.
+    - `sse_heartbeat() -> str` — the conventional heartbeat (`:ping\n\n`).
+      Servers send this periodically (every 15-30 seconds) to keep the
+      connection alive through proxies that would otherwise close idle
+      connections after 30-60 seconds.
+    - `sse_build_heartbeat_block(count) -> str` — `count` consecutive
+      heartbeats (used by tests and the demo).
+
+- **HTTP integration:**
+    - `sse_response() -> HttpResponse` — build an empty SSE response
+      (200 OK, Content-Type: text/event-stream, Cache-Control:
+      no-cache no-transform, Connection: keep-alive, X-Accel-Buffering:
+      no). The body is empty — the caller writes events to it as they
+      occur.
+    - `sse_response_with_events(events) -> HttpResponse` — build an SSE
+      response pre-populated with the given events. The body is the
+      concatenation of every event's serialised wire format.
+    - `sse_response_with_heartbeat(events, heartbeat_text) -> HttpResponse`
+      — build an SSE response that includes a heartbeat comment BEFORE
+      the events. Used to keep the connection alive between bursts.
+
+- **Last-Event-ID (resumable streams):**
+    - `sse_last_event_id(req) -> str` — extract the Last-Event-ID header
+      from an HTTP request. Returns "" if absent.
+    - `sse_validate_request_id(req) -> Result[str, str]` — extract and
+      validate the Last-Event-ID header. Returns `Result.Ok(id)` if
+      present and valid, `Result.Ok("")` if absent (no error — the
+      client is connecting for the first time), or `Result.Err(msg)` if
+      present but invalid.
+
+- **Validation:**
+    - `sse_validate_event(e) -> Result[bool, str]` — check the event's
+      fields against the limits. Rejects CR/LF in id/event_type, ids
+      longer than `sse_max_id_len()` (256), event_types longer than
+      `sse_max_event_type_len()` (64), data larger than
+      `sse_max_data_len()` (1 MiB), retry_ms outside
+      `[sse_min_retry_ms, sse_max_retry_ms]` (or non-zero outside the
+      range).
+    - `sse_validate_id(id) -> Result[bool, str]` — standalone ID validator.
+    - `sse_validate_event_type(t) -> Result[bool, str]` — standalone
+      event-type validator.
+
+- **Introspection:**
+    - `sse_describe(e) -> str` — human-readable summary. One line per
+      field; the data field is truncated to 60 chars if longer.
+
+- **Stream helpers (common patterns):**
+    - `sse_build_message(id, msg) -> str` — a "message" event (the
+      default event type — dispatched to the client's onmessage).
+    - `sse_build_status_update(id, status, retry_ms) -> str` — a
+      "status" event with retry interval.
+    - `sse_build_notification(id, msg) -> str` — a "notification" event.
+    - `sse_build_log_line(line) -> str` — a "log" event. Has no ID (log
+      lines are not resumable — if the connection drops, the client does
+      not need to re-receive old log lines).
+
+- **Constants:**
+    - Field names: `sse_field_event()` ("event"), `sse_field_data()`
+      ("data"), `sse_field_id()` ("id"), `sse_field_retry()` ("retry").
+    - Defaults: `sse_default_event_type()` ("message"),
+      `sse_default_retry_ms()` (3000 — Chrome's default).
+    - HTTP headers: `sse_content_type()` ("text/event-stream"),
+      `sse_header_content_type()`, `sse_header_cache_control()`,
+      `sse_cache_control_value()` ("no-cache, no-transform" — the
+      no-transform is CRITICAL to prevent proxies from gzipping the
+      response, which would break streaming), `sse_header_connection()`,
+      `sse_connection_value()` ("keep-alive"),
+      `sse_header_x_accel_buffering()` (nginx-specific — disables
+      response buffering), `sse_x_accel_buffering_value()` ("no"),
+      `sse_header_last_event_id()`.
+    - Heartbeat: `sse_heartbeat_text()` ("ping").
+    - Limits: `sse_max_id_len()` (256), `sse_max_event_type_len()` (64),
+      `sse_max_data_len()` (1 MiB), `sse_max_retry_ms()` (300000 = 5
+      min), `sse_min_retry_ms()` (1000 = 1 sec).
+    - CR helper: `sse_cr()` — the CR character as a 1-byte string. HLS
+      does NOT support the `\r` escape in string literals, so it is
+      built via `chr(13)` (matching the convention in std.http).
+
+**Security model:**
+
+- **NO ORIGIN CHECK:** this module does NOT verify the Origin header.
+  SSE is subject to the same-origin policy by default (the browser only
+  allows EventSource connections from the same origin as the page).
+  Cross-origin SSE is possible if the server sends CORS headers
+  (Access-Control-Allow-Origin); that is the caller's responsibility.
+
+- **NO AUTH CHECK:** the caller is responsible for authenticating the
+  request before opening an SSE stream. The Last-Event-ID header is
+  client-controlled and MUST be validated before use.
+
+- **ID VALIDATION:** the event ID is included in the Last-Event-ID
+  header by the client. A malicious client could send a crafted ID
+  (e.g. with embedded newlines or path-traversal sequences) to attack
+  the server's resume logic. The serialiser REJECTS event IDs containing
+  CR or LF (returning Result.Err) and the parser does the same. The
+  caller should ALSO validate the Last-Event-ID header before using it
+  (`sse_validate_request_id`).
+
+- **DATA INJECTION:** the data field is multi-line (each line prefixed
+  with `data: `). The serialiser splits the data on `\n` and emits each
+  line separately. This prevents a malicious value containing `\n\n`
+  from being interpreted as the end of the event. The serialiser does
+  NOT escape other characters — the data is sent verbatim. If the data
+  is intended for HTML, the caller MUST escape it (e.g. via
+  `std.template` Stage 69 or `std.html` Stage 38) before passing it to
+  SSE.
+
+**Limitations (deferred to later stages):**
+
+- **NO ACTUAL STREAMING I/O:** this module produces the wire format and
+  HTTP response, but does NOT actually push events to a TCP socket.
+  The caller is responsible for writing the response body to the
+  underlying TCP stream (via `std.net` Stage 37 or `std.http_server`
+  Stage 64). A future stage may add a `sse_serve` helper that wraps
+  the HTTP server and pushes events from a generator function.
+
+- **NO EVENT BUFFERING:** the server does not buffer events for clients
+  that are not currently connected. If a client disconnects, events
+  fired during the disconnection are LOST (unless the server stores
+  them externally and uses the Last-Event-ID header to replay). A
+  future stage may add an `SseBuffer` struct that retains the last N
+  events and replays them on reconnection.
+
+- **NO EVENT SOURCE PATTERN:** the module does NOT implement the
+  EventSource client-side API (that's a browser feature). It only
+  implements the SERVER side of SSE.
+
+- **NO COMPRESSION:** the response is sent uncompressed. SSE does not
+  benefit much from compression (events are typically small and
+  frequent), and compression breaks streaming (the compressor buffers
+  data). The `Cache-Control: no-transform` header is set to prevent
+  proxies from compressing the response.
+
+- **NO MULTI-INSTANCE BROADCAST:** the module does not provide a way
+  to broadcast an event to multiple connected clients across multiple
+  server instances. The caller is responsible for implementing a pub/sub
+  layer (e.g. via Redis pub/sub) if they need cross-instance
+  broadcasting.
+
+**Acceptance test** (`tests/ok/feat_stage70_sse.hls`, ~620 lines, 17
+tests, all PASS):
+
+1. `test_builder` — `sse_event_new` (all fields empty), `sse_with_id`
+   (does not mutate original), `sse_with_event`, `sse_with_data`,
+   `sse_add_data` (appends with `\n`), `sse_with_retry` (clamping:
+   3000 preserved, 100 → 1000 min, 999999 → 300000 max, 0 → omit,
+   -5 → 0).
+2. `test_serialize_basic` — full event (all fields) produces expected
+   wire format.
+3. `test_serialize_multiline_data` — multi-line data split into separate
+   `data:` fields.
+4. `test_serialize_empty_data` — empty event still emits `data:\n\n`.
+5. `test_serialize_partial` — only some fields set (id only, event only,
+   retry only, data only).
+6. `test_parse_round_trip` — serialize then parse produces the same
+   event.
+7. `test_parse_liberal` — case-insensitive field names (ID/Event/Retry/
+   Data); CRLF line endings; comment lines ignored; unknown fields
+   ignored; multiple `data:` lines joined with `\n`; optional space
+   after colon; lines without a colon ignored.
+8. `test_parse_stream` — multiple events; trailing incomplete data
+   dropped; empty stream.
+9. `test_comments` — `sse_comment("ping")` = `:ping\n\n`; `sse_heartbeat()`
+   = `:ping\n\n`; comment with embedded newline sanitised.
+10. `test_http_response` — `sse_response()` has the correct status (200)
+    and headers (Content-Type: text/event-stream, Cache-Control:
+    no-cache no-transform, Connection: keep-alive, X-Accel-Buffering:
+    no); `sse_response_with_events` body is the concatenation of
+    serialised events; `sse_response_with_heartbeat` body starts with
+    the heartbeat.
+11. `test_last_event_id` — extract Last-Event-ID header; absent header
+    returns ""; `sse_validate_request_id` returns Ok(id) when present
+    and valid, Ok("") when absent.
+12. `test_validation` — valid event OK; id with LF/CR rejected; id too
+    long rejected; event_type with LF rejected; retry_ms too small/large
+    rejected; retry_ms = 0 OK; `sse_validate_id` / `sse_validate_event_type`
+    standalone.
+13. `test_describe` — output contains SseEvent header + id/event_type/
+    data/retry_ms; long data truncated to 60 chars with byte count.
+14. `test_stream_helpers` — `sse_build_message`, `sse_build_status_update`,
+    `sse_build_notification`, `sse_build_log_line`, `sse_build_heartbeat_block(3)`.
+15. `test_constants` — every constant function returns the expected
+    value (field names, defaults, headers, limits).
+16. `test_parse_errors` — incomplete event rejected; empty input rejected;
+    whitespace-only rejected.
+17. `test_end_to_end` — server pushes 5 tick events; HTTP response has
+    status 200 + correct Content-Type; parse body back into 5 events;
+    add heartbeat before events (parsed events still 5 — heartbeats
+    filtered); Last-Event-ID round trip (client reconnects with id=2,
+    server resumes with events 3 and 4).
+
+**Demo** (`examples/sse_demo.hls`, ~310 lines): exercises every piece
+of the API — SseEvent builder + serialization (empty, full, multi-line,
+immutability, retry clamping), parsing (round trip, case-insensitive,
+CRLF, comments, multi-line), sse_parse_stream (multiple events,
+heartbeats filtered, trailing partial dropped), comments & heartbeats,
+HTTP integration (sse_response headers, sse_response_with_events body,
+sse_response_with_heartbeat), Last-Event-ID (extract + validate),
+validation (valid event, id with LF/CR, retry too small/large, validate_id),
+stream helpers, end-to-end counter stream with Last-Event-ID resume.
+Fully deterministic (no Rand, no I/O).
+
+**Makefile target:** `make sse-acceptance` — runs the demo and the
+acceptance test differentially (interpreter == native for both), then
+prints the feature summary. Pure-HLS implementation; no new compiler
+builtins; bootstrap is still deterministic.

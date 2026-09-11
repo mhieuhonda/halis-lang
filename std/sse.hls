@@ -1,0 +1,848 @@
+# ============================================================================
+# std/sse.hls — Stage 70 (v0.89.0-alpha): Server-Sent Events (SSE)
+# ----------------------------------------------------------------------------
+# This module is the EIGHTH module of Phase V (the web application track,
+# Stages 63–76). It implements the Server-Sent Events protocol specified
+# by the HTML5 / WHATWG Living Standard — the standard wire protocol for
+# one-way streaming from a server to a browser over a single HTTP/1.1
+# connection.
+#
+# Unlike WebSocket (Stage 65, RFC 6455), SSE is UNIDIRECTIONAL: the server
+# pushes events; the client cannot send messages back over the same
+# connection (it uses a separate HTTP request for any client→server traffic).
+# This makes SSE simpler than WebSocket:
+#   * It works over plain HTTP (no Upgrade handshake, no framing, no mask)
+#   * It auto-reconnects (the browser retries the connection on disconnect,
+#     carrying the Last-Event-ID header so the server can resume the stream)
+#   * It is natively supported by EventSource in JavaScript
+#
+# WIRE FORMAT (HTML5 §9.2):
+#
+#   An SSE stream is a sequence of EVENTS separated by blank lines
+#   (a blank line = two consecutive LF bytes "\n\n"). Each event is
+#   composed of one or more FIELD LINES terminated by "\n":
+#
+#     event: <type>   sets the event type (default is "message")
+#     data: <line>    appends a line to the event's data; multiple
+#                     data: lines are joined with "\n" to form the
+#                     event's data field
+#     id: <id>        sets the event's ID (used for resumable streams)
+#     retry: <ms>     sets the reconnection interval (in milliseconds)
+#
+#   Lines starting with ":" are COMMENTS (ignored by the client). Used
+#   for heartbeats — a periodic ": ping\n\n" keeps the connection alive
+#   through proxies that would otherwise close idle connections.
+#
+#   Lines without a ":" (or with no field name) are ignored by the client.
+#
+#   Each event is terminated by a BLANK LINE ("\n\n"). The client does
+#   NOT dispatch the event until it sees the blank line — this is how it
+#   tells apart multiple data: lines in one event from data: lines in
+#   separate events.
+#
+#   CRLF ("\r\n") line endings are accepted: the parser strips a trailing
+#   CR before processing each line. The serialiser always emits LF (the
+#   spec recommends LF for compatibility).
+#
+# HTTP RESPONSE:
+#
+#   Content-Type: text/event-stream
+#   Cache-Control: no-cache, no-transform  (no-transform is critical —
+#                                          some proxies gzip SSE streams,
+#                                          which BREAKS the streaming
+#                                          semantics because the client
+#                                          cannot dispatch events until
+#                                          the buffer fills up)
+#   Connection: keep-alive                (the connection is held open
+#                                          for the duration of the stream)
+#   X-Accel-Buffering: no                 (disables nginx's response
+#                                          buffering — without this, nginx
+#                                          buffers the entire response
+#                                          before sending it, breaking SSE)
+#
+# SECURITY MODEL
+#
+#   * NO ORIGIN CHECK: this module does NOT verify the Origin header of
+#     the request. SSE is subject to the same-origin policy by default
+#     (the browser only allows EventSource connections from the same
+#     origin as the page). Cross-origin SSE is possible if the server
+#     sends CORS headers (Access-Control-Allow-Origin); that is the
+#     caller's responsibility.
+#
+#   * NO AUTH CHECK: the caller is responsible for authenticating the
+#     request before opening an SSE stream. The Last-Event-ID header is
+#     client-controlled and MUST be validated before use.
+#
+#   * ID VALIDATION: the event ID is included in the Last-Event-ID header
+#     by the client. A malicious client could send a crafted ID (e.g.
+#     with embedded newlines or path-traversal sequences) to attack the
+#     server's resume logic. The serialiser REJECTS event IDs containing
+#     CR or LF (returning Result.Err) and the parser does the same. The
+#     caller should ALSO validate the Last-Event-ID header before using
+#     it (sse_validate_id).
+#
+#   * DATA INJECTION: the data field is multi-line (each line prefixed
+#     with "data: "). The serialiser splits the data on "\n" and emits
+#     each line separately. This prevents a malicious value containing
+#     "\n\n" from being interpreted as the end of the event. The
+#     serialiser does NOT escape other characters — the data is sent
+#     verbatim. If the data is intended for HTML, the caller MUST escape
+#     it (e.g. via std.template or std.html) before passing it to SSE.
+#
+# DIFFERENTIAL PARITY
+#
+#   The serialiser, parser, and HTTP integration are pure functions of
+#   immutable inputs. The output is byte-identical between the interpreter
+#   and the native binary. No Rand is used; no I/O is performed. The
+#   acceptance test and demo are fully deterministic.
+#
+# NO NEW COMPILER BUILTINS
+#
+#   The entire module is pure HLS, layered on:
+#     * std.http   (HttpHeader, HttpRequest, HttpResponse, http_header_get,
+#                   http_header_has, http_header_add, http_request_new,
+#                   http_response_new — Stage 38)
+#     * std.str    (str_join, str_replace, str_starts_with, str_ends_with,
+#                   str_contains, str_to_lower_ascii, str_count)
+#     * std.option (Option[T])
+#     * std.result (Result[T, E] — for parse errors and validation)
+# ============================================================================
+
+import "std.http"
+import "std.str"
+import "std.option"
+import "std.result"
+
+# ============================================================================
+# Constants — SSE field names, headers, limits.
+# ============================================================================
+
+# sse_field_event() — the field name for the event type. "event: <type>"
+# sets the type of the event; the client dispatches the event to a
+# listener registered for that type (or to the default "message" listener
+# if no event: field is present).
+fn sse_field_event() -> str { return "event" }
+
+# sse_field_data() — the field name for the event data. "data: <line>"
+# appends a line to the event's data; multiple data: lines are joined
+# with "\n" by the client.
+fn sse_field_data() -> str { return "data" }
+
+# sse_field_id() — the field name for the event ID. "id: <id>" sets the
+# event's ID; the client stores it as the "last event ID" and includes
+# it in the Last-Event-ID header of subsequent reconnection attempts.
+fn sse_field_id() -> str { return "id" }
+
+# sse_field_retry() — the field name for the reconnection interval.
+# "retry: <ms>" sets the reconnection interval in milliseconds; the
+# client uses this as the delay before reconnecting after a disconnect.
+fn sse_field_retry() -> str { return "retry" }
+
+# sse_default_event_type() — the default event type dispatched by the
+# client when no "event:" field is present. The client's "onmessage"
+# listener receives these events.
+fn sse_default_event_type() -> str { return "message" }
+
+# sse_default_retry_ms() — the default reconnection interval if the
+# server does not send a "retry:" field. The HTML5 spec does not
+# mandate a specific value; 3000ms is a common default (used by Chrome).
+fn sse_default_retry_ms() -> int { return 3000 }
+
+# sse_content_type() — the Content-Type for SSE responses. The HTML5
+# spec REQUIRES "text/event-stream"; the client rejects the stream if
+# the Content-Type is anything else (a defence against XSS via SSE).
+fn sse_content_type() -> str { return "text/event-stream" }
+
+# sse_header_content_type() — the HTTP header name for Content-Type.
+fn sse_header_content_type() -> str { return "Content-Type" }
+
+# sse_header_cache_control() — the HTTP header name for Cache-Control.
+fn sse_header_cache_control() -> str { return "Cache-Control" }
+
+# sse_cache_control_value() — the value to send for Cache-Control on
+# an SSE response. "no-cache" prevents intermediate proxies from
+# caching the response. "no-transform" prevents them from modifying
+# the response body (e.g. gzipping), which would BREAK the streaming
+# semantics. "no-transform" is CRITICAL — without it, some proxies
+# buffer the response, breaking SSE.
+fn sse_cache_control_value() -> str { return "no-cache, no-transform" }
+
+# sse_header_connection() — the HTTP header name for Connection.
+fn sse_header_connection() -> str { return "Connection" }
+
+# sse_connection_value() — the value to send for Connection on an SSE
+# response. "keep-alive" tells the client and proxies to hold the
+# connection open for the duration of the stream.
+fn sse_connection_value() -> str { return "keep-alive" }
+
+# sse_header_x_accel_buffering() — the nginx-specific header that
+# disables response buffering. Without this, nginx buffers the entire
+# SSE response before sending it, breaking SSE. Other servers ignore
+# this header (it is nginx-specific).
+fn sse_header_x_accel_buffering() -> str { return "X-Accel-Buffering" }
+
+# sse_x_accel_buffering_value() — "no" disables nginx response buffering.
+fn sse_x_accel_buffering_value() -> str { return "no" }
+
+# sse_header_last_event_id() — the HTTP header name for Last-Event-ID.
+# The client sends this header on reconnection, carrying the ID of the
+# last event it received. The server uses it to resume the stream from
+# that point.
+fn sse_header_last_event_id() -> str { return "Last-Event-ID" }
+
+# sse_heartbeat_text() — the comment text used by sse_heartbeat().
+# ": ping\n\n" is the conventional heartbeat; the client ignores it
+# but it keeps the connection alive through idle-timeout proxies.
+fn sse_heartbeat_text() -> str { return "ping" }
+
+# sse_max_id_len() — the maximum byte length of an event ID. 256 is
+# generous (event IDs are typically short integers or UUIDs); longer
+# IDs are almost certainly the result of a bug or attack.
+fn sse_max_id_len() -> int { return 256 }
+
+# sse_max_event_type_len() — the maximum byte length of an event type.
+# 64 is generous (event types are typically short identifiers like
+# "message", "update", "notification").
+fn sse_max_event_type_len() -> int { return 64 }
+
+# sse_max_data_len() — the maximum byte length of an event's data field.
+# 1 MiB matches std.http's http_max_body(). Larger events are split
+# into multiple events by the caller.
+fn sse_max_data_len() -> int { return 1048576 }
+
+# sse_max_retry_ms() — the maximum reconnection interval. 5 minutes
+# (300000ms) is a sensible upper bound; longer intervals would make
+# the client appear unresponsive to network recovery.
+fn sse_max_retry_ms() -> int { return 300000 }
+
+# sse_min_retry_ms() — the minimum reconnection interval. 1 second
+# (1000ms) is a sensible lower bound; shorter intervals would cause
+# the client to hammer the server on disconnect.
+fn sse_min_retry_ms() -> int { return 1000 }
+
+# ============================================================================
+# SseEvent — the event struct. Carries all four fields defined by the
+# HTML5 spec: id, event, data, retry_ms. Any field may be empty/zero
+# (meaning "do not emit this field").
+# ============================================================================
+
+struct SseEvent {
+    # The event ID. Empty string means "do not emit an id: field". The
+    # client stores this as the "last event ID" and sends it back in the
+    # Last-Event-ID header on reconnection.
+    id: str,
+    # The event type. Empty string means "do not emit an event: field"
+    # (the client dispatches the event to the default "message" listener).
+    event_type: str,
+    # The event data. May contain newlines — the serialiser splits on
+    # "\n" and emits each line as a separate "data:" field. Empty
+    # string still emits "data:\n\n" (the client dispatches an event
+    # with empty data).
+    data: str,
+    # The reconnection interval in milliseconds. 0 means "do not emit
+    # a retry: field". Negative values are clamped to sse_min_retry_ms().
+    retry_ms: int
+}
+
+# sse_event_new() — construct an empty event. All fields are empty/zero.
+# Use sse_with_* to populate it.
+fn sse_event_new() -> SseEvent {
+    return SseEvent {
+        id: "",
+        event_type: "",
+        data: "",
+        retry_ms: 0
+    }
+}
+
+# sse_event_new_data(data) — construct an event with just data. The
+# most common case — a server pushing a message without an ID or type.
+fn sse_event_new_data(data: str) -> SseEvent {
+    return SseEvent {
+        id: "",
+        event_type: "",
+        data: data,
+        retry_ms: 0
+    }
+}
+
+# sse_with_id(e, id) — return a copy of e with the id field set.
+# HLS structs are by-reference, so we build a new struct explicitly
+# (the same pattern std.cookie uses for cookie_with_*).
+fn sse_with_id(e: SseEvent, id: str) -> SseEvent {
+    return SseEvent {
+        id: id,
+        event_type: e.event_type,
+        data: e.data,
+        retry_ms: e.retry_ms
+    }
+}
+
+# sse_with_event(e, event_type) — return a copy of e with the event_type
+# field set. The event_type is the name the client dispatches the event
+# to (e.g. addEventListener("update", ...) receives events with
+# event_type="update").
+fn sse_with_event(e: SseEvent, event_type: str) -> SseEvent {
+    return SseEvent {
+        id: e.id,
+        event_type: event_type,
+        data: e.data,
+        retry_ms: e.retry_ms
+    }
+}
+
+# sse_with_data(e, data) — return a copy of e with the data field set.
+# REPLACES any existing data. Use sse_add_data to APPEND a line.
+fn sse_with_data(e: SseEvent, data: str) -> SseEvent {
+    return SseEvent {
+        id: e.id,
+        event_type: e.event_type,
+        data: data,
+        retry_ms: e.retry_ms
+    }
+}
+
+# sse_add_data(e, line) — return a copy of e with `line` appended to the
+# data field (joined with "\n" if there's already data). Used for multi-
+# line events: each call adds one line, and the serialiser emits each
+# line as a separate "data:" field.
+fn sse_add_data(e: SseEvent, line: str) -> SseEvent {
+    let mut new_data: str = e.data
+    if new_data.len() == 0 {
+        new_data = line
+    } else {
+        new_data = new_data + "\n" + line
+    }
+    return SseEvent {
+        id: e.id,
+        event_type: e.event_type,
+        data: new_data,
+        retry_ms: e.retry_ms
+    }
+}
+
+# sse_with_retry(e, retry_ms) — return a copy of e with the retry_ms
+# field set. The client uses this as the reconnection interval. Values
+# outside [sse_min_retry_ms, sse_max_retry_ms] are clamped.
+fn sse_with_retry(e: SseEvent, retry_ms: int) -> SseEvent {
+    let mut v: int = retry_ms
+    if v < 0 {
+        v = 0
+    }
+    if v > 0 && v < sse_min_retry_ms() {
+        v = sse_min_retry_ms()
+    }
+    if v > sse_max_retry_ms() {
+        v = sse_max_retry_ms()
+    }
+    return SseEvent {
+        id: e.id,
+        event_type: e.event_type,
+        data: e.data,
+        retry_ms: v
+    }
+}
+
+# ============================================================================
+# Serialiser — sse_serialize(event) -> Result[str, str].
+#
+# Produces the canonical wire format for a single event, terminated by
+# "\n\n" (the blank line that dispatches the event). Returns Result.Err
+# if the event fails validation (id/event_type too long, data too large,
+# id or event_type contains CR/LF).
+#
+# The serialiser emits fields in this order: id, event, retry, data.
+# This is the conventional order (matching most server implementations);
+# the client does not care about order, but a consistent order makes the
+# output deterministic and easy to test.
+# ============================================================================
+
+# sse_serialize(e) -> Result[str, str] — render the event as wire format.
+# Returns Result.Err(msg) if the event fails validation.
+fn sse_serialize(e: SseEvent) -> Result[str, str] {
+    let v: Result[bool, str] = sse_validate_event(e)
+    if !result_is_ok(v) {
+        return Result.Err(result_err_or(v, "sse_serialize: invalid event"))
+    }
+    let mut out: str = ""
+    # id field (only if non-empty).
+    if e.id.len() > 0 {
+        out = out + sse_field_id() + ": " + e.id + "\n"
+    }
+    # event field (only if non-empty).
+    if e.event_type.len() > 0 {
+        out = out + sse_field_event() + ": " + e.event_type + "\n"
+    }
+    # retry field (only if > 0).
+    if e.retry_ms > 0 {
+        out = out + sse_field_retry() + ": " + e.retry_ms.to_str() + "\n"
+    }
+    # data field — always emitted, even if empty. Multi-line data is
+    # split on "\n" and each line is emitted as a separate "data:" line.
+    if e.data.len() == 0 {
+        out = out + sse_field_data() + ":\n"
+    } else {
+        let lines: list[str] = e.data.split("\n")
+        let mut i: int = 0
+        while i < lines.len() {
+            out = out + sse_field_data() + ": " + lines.get(i) + "\n"
+            i = i + 1
+        }
+    }
+    # Trailing blank line dispatches the event.
+    out = out + "\n"
+    return Result.Ok(out)
+}
+
+# sse_serialize_or_default(e) -> str — convenience: serialize and panic
+# on validation failure. Use this ONLY when the event is known-good
+# (e.g. constructed via the sse_event_new / sse_with_* API, which
+# pre-validates). For untrusted events, use sse_serialize and handle
+# the Result.Err.
+fn sse_serialize_or_default(e: SseEvent) -> str {
+    let r: Result[str, str] = sse_serialize(e)
+    if !result_is_ok(r) {
+        panic("sse_serialize_or_default: " + result_err_or(r, "invalid event"))
+    }
+    return result_unwrap(r)
+}
+
+# ============================================================================
+# Comments & heartbeats — used to keep the connection alive through
+# idle-timeout proxies. A comment is a line starting with ":". The client
+# ignores comments entirely (they do not dispatch events).
+# ============================================================================
+
+# sse_cr() — the CR character as a 1-byte string. HLS does NOT support
+# the \r escape in string literals, so we build it via chr(13). Matches
+# the convention in std.http (http_cr_str).
+fn sse_cr() -> str { return chr(13) }
+
+# sse_comment(text) -> str — render a comment line. The text MUST NOT
+# contain CR or LF (the serialiser does NOT split it). Returns the wire
+# format ": text\n\n" (the trailing "\n\n" makes it a complete block
+# the client can ignore without waiting for more data).
+fn sse_comment(text: str) -> str {
+    # Defensive: replace any CR/LF with spaces. Comments are advisory;
+    # if the text contains newlines, the behaviour is undefined.
+    let safe: str = str_replace(str_replace(text, "\n", " "), sse_cr(), " ")
+    return ":" + safe + "\n\n"
+}
+
+# sse_heartbeat() -> str — the conventional heartbeat: ": ping\n\n".
+# Servers send this periodically (e.g. every 15-30 seconds) to keep the
+# connection alive through proxies that would otherwise close idle
+# connections after 30-60 seconds.
+fn sse_heartbeat() -> str {
+    return sse_comment(sse_heartbeat_text())
+}
+
+# ============================================================================
+# Validation — sse_validate_event(e) -> Result[bool, str].
+#
+# Checks the event's fields against the limits. Returns Result.Ok(true)
+# if valid, Result.Err(msg) otherwise. Used by the serialiser to fail
+# fast on bad input; callers can also call it directly to validate
+# before serialising.
+# ============================================================================
+
+fn sse_validate_event(e: SseEvent) -> Result[bool, str] {
+    # id must not contain CR or LF (would break the wire format).
+    if e.id.contains("\n") {
+        return Result.Err("sse_validate_event: id contains LF")
+    }
+    if e.id.contains(sse_cr()) {
+        return Result.Err("sse_validate_event: id contains CR")
+    }
+    if e.id.len() > sse_max_id_len() {
+        return Result.Err("sse_validate_event: id too long (>" + sse_max_id_len().to_str() + " bytes)")
+    }
+    # event_type must not contain CR or LF, and must be within the limit.
+    if e.event_type.contains("\n") {
+        return Result.Err("sse_validate_event: event_type contains LF")
+    }
+    if e.event_type.contains(sse_cr()) {
+        return Result.Err("sse_validate_event: event_type contains CR")
+    }
+    if e.event_type.len() > sse_max_event_type_len() {
+        return Result.Err("sse_validate_event: event_type too long (>" + sse_max_event_type_len().to_str() + " bytes)")
+    }
+    # data must be within the limit.
+    if e.data.len() > sse_max_data_len() {
+        return Result.Err("sse_validate_event: data too large (>" + sse_max_data_len().to_str() + " bytes)")
+    }
+    # retry_ms must be 0 or within [min, max]. (0 means "do not emit".)
+    if e.retry_ms < 0 {
+        return Result.Err("sse_validate_event: retry_ms is negative")
+    }
+    if e.retry_ms > 0 && e.retry_ms < sse_min_retry_ms() {
+        return Result.Err("sse_validate_event: retry_ms too small (<" + sse_min_retry_ms().to_str() + "); use 0 to omit")
+    }
+    if e.retry_ms > sse_max_retry_ms() {
+        return Result.Err("sse_validate_event: retry_ms too large (>" + sse_max_retry_ms().to_str() + ")")
+    }
+    return Result.Ok(true)
+}
+
+# sse_validate_id(id) -> Result[bool, str] — validate an event ID. Used
+# by callers to validate the Last-Event-ID header before using it.
+fn sse_validate_id(id: str) -> Result[bool, str] {
+    if id.contains("\n") {
+        return Result.Err("sse_validate_id: contains LF")
+    }
+    if id.contains(sse_cr()) {
+        return Result.Err("sse_validate_id: contains CR")
+    }
+    if id.len() > sse_max_id_len() {
+        return Result.Err("sse_validate_id: too long (>" + sse_max_id_len().to_str() + " bytes)")
+    }
+    return Result.Ok(true)
+}
+
+# sse_validate_event_type(t) -> Result[bool, str] — validate an event type.
+fn sse_validate_event_type(t: str) -> Result[bool, str] {
+    if t.contains("\n") {
+        return Result.Err("sse_validate_event_type: contains LF")
+    }
+    if t.contains(sse_cr()) {
+        return Result.Err("sse_validate_event_type: contains CR")
+    }
+    if t.len() > sse_max_event_type_len() {
+        return Result.Err("sse_validate_event_type: too long (>" + sse_max_event_type_len().to_str() + " bytes)")
+    }
+    return Result.Ok(true)
+}
+
+# ============================================================================
+# Parser — sse_parse(s) -> Result[SseEvent, str].
+#
+# Parses the wire format of a SINGLE event. The input MUST be a complete
+# event (terminated by "\n\n"). For parsing a stream of events, use
+# sse_parse_stream.
+#
+# The parser is liberal (matches every implementation in the wild):
+#   * CRLF line endings are accepted (the trailing CR is stripped).
+#   * Field names are case-INsensitive (per HTML5 §9.2 — "field" is
+#     matched case-insensitively; we lowercase before comparing).
+#   * Leading/trailing whitespace around the field value is stripped.
+#   * Lines without a ":" (or with no field name) are ignored.
+#   * Comments (lines starting with ":") are ignored.
+#   * Multiple "data:" lines are joined with "\n".
+#   * If the same field appears multiple times, the LAST value wins
+#     (except for "data:", which APPENDS).
+# ============================================================================
+
+# sse_parse(s) -> Result[SseEvent, str] — parse a single event. Returns
+# Result.Err if the input is not a complete event (missing trailing
+# "\n\n").
+fn sse_parse(s: str) -> Result[SseEvent, str] {
+    # The input must end with "\n\n" (or CRLF+CRLF) to be a complete event.
+    # We accept either; the parser strips trailing CRs.
+    if !s.ends_with("\n\n") && !s.ends_with(sse_cr() + "\n" + sse_cr() + "\n") {
+        return Result.Err("sse_parse: incomplete event (missing trailing blank line)")
+    }
+    let e: SseEvent = sse_event_new()
+    let lines: list[str] = s.split("\n")
+    let mut data_parts: list[str] = []
+    let mut i: int = 0
+    while i < lines.len() {
+        let mut line: str = lines.get(i)
+        # Strip trailing CR (CRLF handling).
+        if line.ends_with(sse_cr()) {
+            line = line.slice(0, line.len() - 1)
+        }
+        # Blank line ends the event (the trailing "\n\n" produces a
+        # final empty line). We don't break here — the spec says
+        # dispatching happens at the blank line, but the parser can
+        # just keep going (the trailing empty lines contribute nothing).
+        if line.len() == 0 {
+            i = i + 1
+            continue
+        }
+        # Comment line (starts with ":").
+        if line.byte_at(0) == 58 {
+            i = i + 1
+            continue
+        }
+        # Find the first ":" (the field separator).
+        let colon_at: int = line.find(":")
+        if colon_at < 0 {
+            # No ":" — ignore the line per the spec.
+            i = i + 1
+            continue
+        }
+        let field: str = str_to_lower_ascii(line.slice(0, colon_at))
+        # The value starts after the ":"; if the next char is a space,
+        # strip it (the spec says a single leading space is stripped).
+        let mut value: str = line.slice(colon_at + 1, line.len())
+        if value.len() > 0 && value.byte_at(0) == 32 {
+            value = value.slice(1, value.len())
+        }
+        # Dispatch on the field name.
+        if field == sse_field_id() {
+            e.id = value
+        } else if field == sse_field_event() {
+            e.event_type = value
+        } else if field == sse_field_data() {
+            data_parts.push(value)
+        } else if field == sse_field_retry() {
+            let parsed: Result[int, str] = int_parse(value)
+            if result_is_ok(parsed) {
+                e.retry_ms = result_unwrap(parsed)
+            }
+            # Invalid retry values are ignored per the spec.
+        }
+        # Unknown fields are ignored per the spec.
+        i = i + 1
+    }
+    # Join the data parts with "\n".
+    if data_parts.len() > 0 {
+        e.data = str_join(data_parts, "\n")
+    }
+    return Result.Ok(e)
+}
+
+# sse_parse_stream(s) -> list[SseEvent] — parse a stream of events.
+# Returns a list of every complete event in `s`. Incomplete trailing
+# data is silently dropped (the caller should buffer it and re-parse
+# when more data arrives).
+#
+# Per the HTML5 spec, an event is only DISPATCHED if it has at least
+# one populated field (data, id, retry_ms, or event_type). Events that
+# consist entirely of comment lines (e.g. heartbeats) produce an empty
+# SseEvent and are filtered out. This matches browser behaviour —
+# EventSource does not fire onmessage for heartbeats.
+#
+# This is the standard entry point for parsing the body of an SSE
+# response. It splits the body on "\n\n" and parses each chunk as a
+# single event.
+fn sse_parse_stream(s: str) -> list[SseEvent] {
+    let events: list[SseEvent] = []
+    let mut i: int = 0
+    let n: int = s.len()
+    while i < n {
+        # Find the next "\n\n" (the event terminator).
+        let end: int = _sse_find_blank_line(s, i, n)
+        if end < 0 {
+            # No more complete events.
+            return events
+        }
+        # The chunk is s[i..end+2] (including the trailing "\n\n").
+        # sse_parse expects the trailing blank line, so we include it.
+        let chunk: str = s.slice(i, end + 2)
+        let parsed: Result[SseEvent, str] = sse_parse(chunk)
+        if result_is_ok(parsed) {
+            let e: SseEvent = result_unwrap(parsed)
+            # Filter out empty events (only comment lines or whitespace).
+            # Per the HTML5 spec, an event is dispatched iff it has at
+            # least one populated field. Heartbeats (":ping\n\n") parse
+            # to an empty event and are dropped here.
+            if _sse_event_is_dispatched(e) {
+                events.push(e)
+            }
+        }
+        i = end + 2
+    }
+    return events
+}
+
+# _sse_event_is_dispatched(e) — true iff e has at least one populated
+# field (data, id, retry_ms, or event_type). Used by sse_parse_stream
+# to filter out comment-only "phantom" events (e.g. heartbeats).
+fn _sse_event_is_dispatched(e: SseEvent) -> bool {
+    if e.data.len() > 0 {
+        return true
+    }
+    if e.id.len() > 0 {
+        return true
+    }
+    if e.retry_ms > 0 {
+        return true
+    }
+    if e.event_type.len() > 0 {
+        return true
+    }
+    return false
+}
+
+# _sse_find_blank_line(s, start, end) — find the byte index of the
+# FIRST "\n\n" in s[start..end]. Returns -1 if not found. CRLF ("\r\n\r\n")
+# is also accepted (we search for "\n\n" and accept the chunk if the
+# bytes immediately before the first "\n" are "\r" — sse_parse strips
+# trailing CRs).
+fn _sse_find_blank_line(s: str, start: int, end: int) -> int {
+    let mut i: int = start
+    while i + 1 < end {
+        if s.byte_at(i) == 10 && s.byte_at(i + 1) == 10 {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+# ============================================================================
+# HTTP integration — build SSE responses and extract the Last-Event-ID.
+# ============================================================================
+
+# sse_response() -> HttpResponse — build an empty SSE response (200 OK,
+# Content-Type: text/event-stream, Cache-Control: no-cache no-transform,
+# Connection: keep-alive, X-Accel-Buffering: no). The body is empty —
+# the caller writes events to it as they occur.
+#
+# This is the standard entry point for opening an SSE stream. The caller
+# writes events to the response body as they occur (in the web server
+# integration, this means writing to the underlying TCP stream).
+fn sse_response() -> HttpResponse {
+    let mut resp: HttpResponse = http_response_new(200)
+    resp.headers = http_header_add(resp.headers, sse_header_content_type(), sse_content_type())
+    resp.headers = http_header_add(resp.headers, sse_header_cache_control(), sse_cache_control_value())
+    resp.headers = http_header_add(resp.headers, sse_header_connection(), sse_connection_value())
+    resp.headers = http_header_add(resp.headers, sse_header_x_accel_buffering(), sse_x_accel_buffering_value())
+    return resp
+}
+
+# sse_response_with_events(events) -> HttpResponse — build an SSE response
+# pre-populated with the given events. The body is the concatenation of
+# every event's serialised wire format. Useful for testing and for
+# "burst" streams (a small finite set of events).
+fn sse_response_with_events(events: list[SseEvent]) -> HttpResponse {
+    let resp: HttpResponse = sse_response()
+    let parts: list[str] = []
+    let mut i: int = 0
+    while i < events.len() {
+        let e: SseEvent = events.get(i)
+        parts.push(sse_serialize_or_default(e))
+        i = i + 1
+    }
+    resp.body = str_join(parts, "")
+    return resp
+}
+
+# sse_response_with_heartbeat(events, heartbeat_text) -> HttpResponse —
+# build an SSE response that includes a heartbeat comment BEFORE the
+# events. Used to keep the connection alive between bursts of events.
+fn sse_response_with_heartbeat(events: list[SseEvent], heartbeat_text: str) -> HttpResponse {
+    let resp: HttpResponse = sse_response()
+    let parts: list[str] = []
+    parts.push(sse_comment(heartbeat_text))
+    let mut i: int = 0
+    while i < events.len() {
+        let e: SseEvent = events.get(i)
+        parts.push(sse_serialize_or_default(e))
+        i = i + 1
+    }
+    resp.body = str_join(parts, "")
+    return resp
+}
+
+# sse_last_event_id(req) -> str — extract the Last-Event-ID header from
+# an HTTP request. Returns "" if the header is absent. The caller should
+# validate the result with sse_validate_id before using it.
+#
+# This is the standard entry point for resumable streams: the client
+# sends the Last-Event-ID header on reconnection, carrying the ID of the
+# last event it received. The server uses it to resume the stream from
+# that point (e.g. by looking up events with IDs > Last-Event-ID in a
+# database).
+fn sse_last_event_id(req: HttpRequest) -> str {
+    return http_header_get(req.headers, sse_header_last_event_id())
+}
+
+# sse_validate_request_id(req) -> Result[str, str] — extract and validate
+# the Last-Event-ID header. Returns Result.Ok(id) if present and valid,
+# Result.Ok("") if absent (no error — the client is connecting for the
+# first time), or Result.Err(msg) if present but invalid.
+fn sse_validate_request_id(req: HttpRequest) -> Result[str, str] {
+    let id: str = sse_last_event_id(req)
+    if id.len() == 0 {
+        return Result.Ok("")
+    }
+    let v: Result[bool, str] = sse_validate_id(id)
+    if !result_is_ok(v) {
+        return Result.Err(result_err_or(v, "sse_validate_request_id: invalid Last-Event-ID"))
+    }
+    return Result.Ok(id)
+}
+
+# ============================================================================
+# Introspection — sse_describe produces a human-readable summary of an
+# event. Used by tests and by the demo to verify the event's fields.
+# ============================================================================
+
+# sse_describe(e) -> str — produce a human-readable description of the
+# event. One line per field (id, event, data, retry), with the data
+# field truncated to 60 chars if longer.
+fn sse_describe(e: SseEvent) -> str {
+    let mut out: str = "SseEvent\n"
+    out = out + "  id:          '" + e.id + "'\n"
+    out = out + "  event_type:  '" + e.event_type + "'\n"
+    if e.data.len() > 60 {
+        out = out + "  data:        '" + e.data.slice(0, 57) + "...' (" + e.data.len().to_str() + " bytes)\n"
+    } else {
+        out = out + "  data:        '" + e.data + "'\n"
+    }
+    out = out + "  retry_ms:    " + e.retry_ms.to_str() + "\n"
+    return out
+}
+
+# ============================================================================
+# Stream helpers — build common SSE patterns (status updates, log tails).
+# ============================================================================
+
+# sse_build_status_update(id, status, retry_ms) -> str — build a single
+# "status" event. A convenience for the common case of pushing a status
+# string with an ID and a retry interval. Returns the wire format string.
+fn sse_build_status_update(id: str, status: str, retry_ms: int) -> str {
+    let e: SseEvent = sse_event_new()
+    e.id = id
+    e.event_type = "status"
+    e.data = status
+    e.retry_ms = retry_ms
+    return sse_serialize_or_default(e)
+}
+
+# sse_build_message(id, msg) -> str — build a single "message" event
+# (the default event type — the client dispatches it to the onmessage
+# listener). Returns the wire format string.
+fn sse_build_message(id: str, msg: str) -> str {
+    let e: SseEvent = sse_event_new()
+    e.id = id
+    e.data = msg
+    return sse_serialize_or_default(e)
+}
+
+# sse_build_notification(id, msg) -> str — build a single "notification"
+# event. Returns the wire format string.
+fn sse_build_notification(id: str, msg: str) -> str {
+    let e: SseEvent = sse_event_new()
+    e.id = id
+    e.event_type = "notification"
+    e.data = msg
+    return sse_serialize_or_default(e)
+}
+
+# sse_build_log_line(line) -> str — build a single "log" event. Has no
+# ID (log lines are not resumable — if the connection drops, the client
+# does not need to re-receive old log lines). Returns the wire format
+# string.
+fn sse_build_log_line(line: str) -> str {
+    let e: SseEvent = sse_event_new()
+    e.event_type = "log"
+    e.data = line
+    return sse_serialize_or_default(e)
+}
+
+# sse_build_heartbeat_block(count) -> str — build a block of `count`
+# consecutive heartbeats. Used by tests and by the demo to verify the
+# heartbeat format.
+fn sse_build_heartbeat_block(count: int) -> str {
+    let hb: str = sse_heartbeat()
+    let parts: list[str] = []
+    let mut i: int = 0
+    while i < count {
+        parts.push(hb)
+        i = i + 1
+    }
+    return str_join(parts, "")
+}

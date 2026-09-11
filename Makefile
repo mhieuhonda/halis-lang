@@ -31,7 +31,7 @@ else
   HL_CURL_DEFS :=
 endif
 
-.PHONY: all stage0 bootstrap test examples clean run check bench install uninstall audit opt-stats emit-ir emit-llvm fmt lint lsp-check pkg-init pkg-add pkg-lock pkg-audit pkg-verify pkg-build pkg-publish pkg-log pkg-log-verify prove prove-full model prove-acceptance hltest fuzz cov fuzz-acceptance wasm-opt webapp webapp-acceptance serve aarch64-bench aarch64-acceptance aarch64-list-targets stack-acceptance inline-acceptance opt-stats-report kernel-attrs escape-acceptance layout-report tail-acceptance tail-report asm-acceptance asm-attrs bench-stdlib spec-check stage32-acceptance async-acceptance stream-acceptance io-acceptance fs-acceptance net-acceptance http-acceptance http2-acceptance json-stream-acceptance regex-acceptance fmt-acceptance hash-acceptance collections-acceptance sync-acceptance thread-acceptance time-acceptance math-acceptance process-acceptance env-acceptance archive-acceptance uuid-ulid-acceptance cli-acceptance tui-acceptance color-acceptance progress-acceptance log-acceptance http-server-acceptance websocket-acceptance cookie-acceptance session-acceptance csrf-acceptance template-acceptance
+.PHONY: all stage0 bootstrap test examples clean run check bench install uninstall audit opt-stats emit-ir emit-llvm fmt lint lsp-check pkg-init pkg-add pkg-lock pkg-audit pkg-verify pkg-build pkg-publish pkg-log pkg-log-verify prove prove-full model prove-acceptance hltest fuzz cov fuzz-acceptance wasm-opt webapp webapp-acceptance serve aarch64-bench aarch64-acceptance aarch64-list-targets stack-acceptance inline-acceptance opt-stats-report kernel-attrs escape-acceptance layout-report tail-acceptance tail-report asm-acceptance asm-attrs bench-stdlib spec-check stage32-acceptance async-acceptance stream-acceptance io-acceptance fs-acceptance net-acceptance http-acceptance http2-acceptance json-stream-acceptance regex-acceptance fmt-acceptance hash-acceptance collections-acceptance sync-acceptance thread-acceptance time-acceptance math-acceptance process-acceptance env-acceptance archive-acceptance uuid-ulid-acceptance cli-acceptance tui-acceptance color-acceptance progress-acceptance log-acceptance http-server-acceptance websocket-acceptance cookie-acceptance session-acceptance csrf-acceptance template-acceptance sse-acceptance
 
 # Main goal: use the full bootstrap chain to build the native compiler
 all: bootstrap
@@ -3006,3 +3006,69 @@ template-acceptance: bin/hlc
 	@echo "  differential (interpreter == native) verified green."
 
 .PHONY: template-acceptance
+
+# ============================================================================
+# Stage 70 (v0.89.0-alpha): std.sse -- Server-Sent Events (one-way
+# streaming, HTML5 §9.2). Pure-HLS module on top of std.http (Stage 38),
+# std.str, std.option, std.result. Implements the SSE wire format:
+# event/data/id/retry fields, multi-line data (each line a separate
+# "data:" field), comments (": text"), heartbeats (": ping"). Provides
+# the SseEvent builder, sse_serialize (wire format), sse_parse (single
+# event) / sse_parse_stream (multiple events, heartbeats filtered),
+# sse_response (HTTP 200, Content-Type: text/event-stream, Cache-Control:
+# no-cache no-transform, Connection: keep-alive, X-Accel-Buffering: no),
+# sse_last_event_id / sse_validate_request_id (Last-Event-ID header for
+# resumable streams). Stream helpers: sse_build_message / _status_update
+# / _notification / _log_line / _heartbeat_block.
+# ============================================================================
+
+# Stage 70 differential note: all pieces of std.sse are pure functions
+# of immutable inputs. The interpreter and the native binary produce
+# byte-identical output on both the demo and the acceptance test.
+
+sse-acceptance: bin/hlc
+	@$(PYTHON) boot/boot.py examples/sse_demo.hls > /tmp/sse_demo_interp.txt 2>&1
+	@bin/hlc examples/sse_demo.hls /tmp/sse_demo.c 2>/dev/null
+	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/sse_demo /tmp/sse_demo.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
+	@/tmp/sse_demo > /tmp/sse_demo_nat.txt 2>&1
+	@diff -q /tmp/sse_demo_interp.txt /tmp/sse_demo_nat.txt >/dev/null 2>&1 \
+		|| (echo "FAIL: sse_demo differential mismatch" && false)
+	@$(PYTHON) boot/boot.py tests/ok/feat_stage70_sse.hls > /tmp/s70_interp.txt 2>&1
+	@bin/hlc tests/ok/feat_stage70_sse.hls /tmp/s70.c 2>/dev/null
+	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/s70 /tmp/s70.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
+	@/tmp/s70 > /tmp/s70_nat.txt 2>&1
+	@diff -q /tmp/s70_interp.txt /tmp/s70_nat.txt >/dev/null 2>&1 \
+		|| (echo "FAIL: feat_stage70_sse differential mismatch" && false)
+	@rm -f /tmp/sse_demo /tmp/sse_demo.c /tmp/sse_demo_interp.txt /tmp/sse_demo_nat.txt \
+		/tmp/s70 /tmp/s70.c /tmp/s70_interp.txt /tmp/s70_nat.txt
+	@echo ""
+	@echo "ACCEPTANCE OK: Stage 70 -- std.sse (Server-Sent Events)"
+	@echo "  Event builder (SseEvent struct):"
+	@echo "    sse_event_new / sse_event_new_data"
+	@echo "    sse_with_id / _with_event / _with_data / _add_data / _with_retry (clamping)"
+	@echo "  Wire format (HTML5 §9.2):"
+	@echo "    sse_serialize (id/event/retry/data fields; multi-line data; empty data)"
+	@echo "    sse_parse (single event; case-insensitive; CRLF; comments; unknown ignored)"
+	@echo "    sse_parse_stream (multiple events; heartbeats filtered; partial trailing dropped)"
+	@echo "  Comments & heartbeats:"
+	@echo "    sse_comment (': text\n\n'; CR/LF sanitized)"
+	@echo "    sse_heartbeat (':ping\n\n'; keep-alive through idle proxies)"
+	@echo "  HTTP integration:"
+	@echo "    sse_response (200, Content-Type: text/event-stream,"
+	@echo "      Cache-Control: no-cache no-transform, Connection: keep-alive,"
+	@echo "      X-Accel-Buffering: no)"
+	@echo "    sse_response_with_events / sse_response_with_heartbeat"
+	@echo "    sse_last_event_id / sse_validate_request_id (Last-Event-ID for resume)"
+	@echo "  Validation:"
+	@echo "    sse_validate_event (limits + CR/LF rejection)"
+	@echo "    sse_validate_id / sse_validate_event_type"
+	@echo "  Introspection & stream helpers:"
+	@echo "    sse_describe (per-event summary, data truncated to 60 chars)"
+	@echo "    sse_build_message / _status_update / _notification / _log_line"
+	@echo "    sse_build_heartbeat_block (count heartbeats)"
+	@echo "  Security model: NO-ORIGIN-CHECK + NO-AUTH-CHECK + ID-VALIDATION"
+	@echo "    + DATA-INJECTION-PREVENTION (multi-line data split on \n)"
+	@echo "  Pure-HLS implementation (no new compiler builtins)"
+	@echo "  differential (interpreter == native) verified green."
+
+.PHONY: sse-acceptance

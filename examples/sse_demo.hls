@@ -1,0 +1,382 @@
+# ============================================================================
+# examples/sse_demo.hls — Stage 70 (v0.89.0-alpha): std.sse
+# ----------------------------------------------------------------------------
+# Demonstrates every piece of the Server-Sent Events API:
+#   * SseEvent builder: sse_event_new / sse_with_id / sse_with_event /
+#     sse_with_data / sse_add_data / sse_with_retry (clamping)
+#   * sse_serialize (wire format: id/event/retry/data fields, multi-line
+#     data, empty data)
+#   * sse_parse (single event round trip; case-insensitive fields; CRLF;
+#     comment lines; unknown fields ignored)
+#   * sse_parse_stream (multiple events; trailing data dropped; heartbeats
+#     filtered out)
+#   * sse_comment / sse_heartbeat (keep-alive comments)
+#   * sse_response / sse_response_with_events / sse_response_with_heartbeat
+#     (HTTP integration; correct headers)
+#   * sse_last_event_id / sse_validate_request_id (Last-Event-ID header
+#     for resumable streams)
+#   * sse_validate_event / sse_validate_id / sse_validate_event_type
+#     (limits; CR/LF rejection)
+#   * sse_describe (introspection)
+#   * Stream helpers: sse_build_message / sse_build_status_update /
+#     sse_build_notification / sse_build_log_line / sse_build_heartbeat_block
+#
+# The output is fully deterministic (no Rand, no I/O) so the
+# differential test (interpreter == native) produces byte-identical output.
+# ============================================================================
+
+import "std.sse"
+import "std.http"
+import "std.str"
+import "std.option"
+import "std.result"
+
+# ============================================================================
+# Section 1: SseEvent builder + serialization
+# ============================================================================
+
+fn demo_builder() -> void uses IO {
+    println("--- SseEvent builder + serialization ---")
+    # Empty event
+    let e0: SseEvent = sse_event_new()
+    println("  empty event wire:")
+    println("    " + _show_wire(result_unwrap(sse_serialize(e0))))
+
+    # Full event
+    let e1: SseEvent = sse_with_id(sse_event_new(), "1")
+    let e2: SseEvent = sse_with_event(e1, "message")
+    let e3: SseEvent = sse_with_data(e2, "hello\nworld")
+    let e4: SseEvent = sse_with_retry(e3, 3000)
+    println("  full event wire:")
+    println("    " + _show_wire(result_unwrap(sse_serialize(e4))))
+
+    # Multi-line data — each line becomes a separate "data:" field
+    let e5: SseEvent = sse_with_data(sse_event_new(), "line1\nline2\nline3")
+    println("  multi-line data wire:")
+    println("    " + _show_wire(result_unwrap(sse_serialize(e5))))
+
+    # Builder immutability — the original event is not mutated
+    let e6: SseEvent = sse_event_new()
+    let _unused: SseEvent = sse_with_id(e6, "42")
+    println("  immutability: original id after sse_with_id = '" + e6.id + "' (expected '')")
+
+    # retry_ms clamping
+    let small: SseEvent = sse_with_retry(sse_event_new(), 100)
+    let large: SseEvent = sse_with_retry(sse_event_new(), 999999)
+    let neg: SseEvent = sse_with_retry(sse_event_new(), -5)
+    println("  retry 100 -> " + small.retry_ms.to_str() + " (clamped to min 1000)")
+    println("  retry 999999 -> " + large.retry_ms.to_str() + " (clamped to max 300000)")
+    println("  retry -5 -> " + neg.retry_ms.to_str() + " (negative -> 0)")
+    println("")
+    return
+}
+
+# _show_wire(s) — render a wire-format string with \n -> \n + indent
+# so multi-line output is readable in the demo.
+fn _show_wire(s: str) -> str {
+    # Replace trailing "\n\n" with a single marker for clarity, then
+    # split on \n and join with " | ".
+    let parts: list[str] = s.split("\n")
+    return str_join(parts, " | ")
+}
+
+# ============================================================================
+# Section 2: Parsing — round trip, case-insensitive, CRLF, comments
+# ============================================================================
+
+fn demo_parse() -> void uses IO {
+    println("--- Parsing ---")
+    # Round trip
+    let e: SseEvent = sse_with_data(sse_with_id(sse_event_new(), "42"), "hello")
+    let wire: str = result_unwrap(sse_serialize(e))
+    let parsed: SseEvent = result_unwrap(sse_parse(wire))
+    println("  round trip:  id=" + parsed.id + " data=" + parsed.data)
+
+    # Case-insensitive field names
+    let wire_ci: str = "ID: 1\nEvent: msg\nRetry: 1000\nData: hi\n\n"
+    let p_ci: SseEvent = result_unwrap(sse_parse(wire_ci))
+    println("  case-insens: id=" + p_ci.id + " event=" + p_ci.event_type + " retry=" + p_ci.retry_ms.to_str() + " data=" + p_ci.data)
+
+    # CRLF line endings
+    let crlf: str = chr(13) + "\n"
+    let wire_crlf: str = "id: 1" + crlf + "data: hello" + crlf + crlf
+    let p_crlf: SseEvent = result_unwrap(sse_parse(wire_crlf))
+    println("  CRLF:        id=" + p_crlf.id + " data=" + p_crlf.data)
+
+    # Comment line ignored
+    let wire_c: str = ": this is a comment\nid: 1\ndata: hi\n\n"
+    let p_c: SseEvent = result_unwrap(sse_parse(wire_c))
+    println("  comment:     id=" + p_c.id + " data=" + p_c.data)
+
+    # Multi-line data joined with \n
+    let wire_ml: str = "data: line1\ndata: line2\ndata: line3\n\n"
+    let p_ml: SseEvent = result_unwrap(sse_parse(wire_ml))
+    println("  multiline:   data='" + p_ml.data + "'")
+    println("")
+    return
+}
+
+# ============================================================================
+# Section 3: sse_parse_stream — multiple events; heartbeats filtered
+# ============================================================================
+
+fn demo_parse_stream() -> void uses IO {
+    println("--- sse_parse_stream ---")
+    let stream: str = "data: first\n\ndata: second\n\ndata: third\n\n"
+    let events: list[SseEvent] = sse_parse_stream(stream)
+    println("  parsed " + events.len().to_str() + " events from stream")
+    let mut i: int = 0
+    while i < events.len() {
+        println("    event " + i.to_str() + ": data=" + events.get(i).data)
+        i = i + 1
+    }
+
+    # Heartbeats are filtered out (they parse to empty events)
+    let hb_stream: str = ":ping\n\ndata: real\n\n:ping\n\ndata: also real\n\n"
+    let events2: list[SseEvent] = sse_parse_stream(hb_stream)
+    println("  with heartbeats: parsed " + events2.len().to_str() + " events (heartbeats filtered)")
+
+    # Trailing incomplete data is dropped
+    let partial: str = "data: complete\n\ndata: incomplete"
+    let events3: list[SseEvent] = sse_parse_stream(partial)
+    println("  with trailing partial: parsed " + events3.len().to_str() + " events (incomplete dropped)")
+    println("")
+    return
+}
+
+# ============================================================================
+# Section 4: Comments & heartbeats — keep-alive
+# ============================================================================
+
+fn demo_heartbeats() -> void uses IO {
+    println("--- Comments & heartbeats ---")
+    println("  sse_comment('ping'):")
+    println("    '" + sse_comment("ping") + "'")
+    println("  sse_heartbeat():")
+    println("    '" + sse_heartbeat() + "'")
+    println("  sse_comment with embedded newline (sanitized):")
+    println("    '" + sse_comment("line1\nline2") + "'")
+    println("  sse_build_heartbeat_block(3):")
+    println("    '" + sse_build_heartbeat_block(3) + "'")
+    println("")
+    return
+}
+
+# ============================================================================
+# Section 5: HTTP integration — sse_response, headers, body
+# ============================================================================
+
+fn demo_http() -> void uses IO {
+    println("--- HTTP integration ---")
+    let resp: HttpResponse = sse_response()
+    println("  sse_response() status: " + resp.status.to_str())
+    println("  headers:")
+    let mut i: int = 0
+    while i < resp.headers.len() {
+        let h: HttpHeader = resp.headers.get(i)
+        println("    " + h.name + ": " + h.value)
+        i = i + 1
+    }
+
+    # sse_response_with_events
+    let e1: SseEvent = sse_with_data(sse_with_id(sse_event_new(), "1"), "first")
+    let e2: SseEvent = sse_with_data(sse_with_id(sse_event_new(), "2"), "second")
+    let resp2: HttpResponse = sse_response_with_events([e1, e2])
+    println("  sse_response_with_events body:")
+    let lines: list[str] = resp2.body.split("\n")
+    let mut j: int = 0
+    while j < lines.len() {
+        if lines.get(j).len() > 0 {
+            println("    " + lines.get(j))
+        } else {
+            println("    (blank line)")
+        }
+        j = j + 1
+    }
+
+    # sse_response_with_heartbeat
+    let resp3: HttpResponse = sse_response_with_heartbeat([e1], "keepalive")
+    println("  sse_response_with_heartbeat body (first line): '" + resp3.body.split("\n").get(0) + "'")
+    println("")
+    return
+}
+
+# ============================================================================
+# Section 6: Last-Event-ID header for resumable streams
+# ============================================================================
+
+fn demo_last_event_id() -> void uses IO {
+    println("--- Last-Event-ID (resumable streams) ---")
+    # Simulate a client reconnecting with a Last-Event-ID header
+    let req: HttpRequest = http_request_new("GET", "/stream")
+    req.headers = http_header_add(req.headers, "Last-Event-ID", "42")
+    let last_id: str = sse_last_event_id(req)
+    println("  Last-Event-ID header: '" + last_id + "'")
+
+    # Validate the ID
+    let v: Result[str, str] = sse_validate_request_id(req)
+    if result_is_ok(v) {
+        println("  validated: '" + result_unwrap(v) + "' is valid")
+    } else {
+        println("  invalid: " + result_err_or(v, "?"))
+    }
+
+    # Request without the header (first connection)
+    let req2: HttpRequest = http_request_new("GET", "/stream")
+    let v2: Result[str, str] = sse_validate_request_id(req2)
+    println("  no header: validated = '" + result_unwrap(v2) + "' (empty is OK)")
+    println("")
+    return
+}
+
+# ============================================================================
+# Section 7: Validation — limits & CR/LF rejection
+# ============================================================================
+
+fn demo_validation() -> void uses IO {
+    println("--- Validation ---")
+    # Valid event
+    let e: SseEvent = sse_with_data(sse_with_id(sse_event_new(), "1"), "hello")
+    let v: Result[bool, str] = sse_validate_event(e)
+    println("  valid event:                " + _ok_str(v))
+
+    # ID with LF
+    let e2: SseEvent = sse_with_id(sse_event_new(), "1\n2")
+    println("  id with LF:                 " + _err_str(sse_validate_event(e2)))
+
+    # ID with CR
+    let e3: SseEvent = sse_with_id(sse_event_new(), "1" + chr(13) + "2")
+    println("  id with CR:                 " + _err_str(sse_validate_event(e3)))
+
+    # retry too small (set directly to bypass sse_with_retry's clamping)
+    let e4: SseEvent = sse_event_new()
+    e4.retry_ms = 100
+    println("  retry 100 (< min 1000):     " + _err_str(sse_validate_event(e4)))
+
+    # retry too large
+    let e5: SseEvent = sse_event_new()
+    e5.retry_ms = 999999
+    println("  retry 999999 (> max 300k):  " + _err_str(sse_validate_event(e5)))
+
+    # sse_validate_id standalone
+    println("  validate_id('abc'):         " + _ok_str(sse_validate_id("abc")))
+    println("  validate_id('a\\nb'):         " + _err_str(sse_validate_id("a\nb")))
+    println("")
+    return
+}
+
+fn _ok_str(r: Result[bool, str]) -> str {
+    if result_is_ok(r) {
+        return "OK"
+    }
+    return "ERR: " + result_err_or(r, "?")
+}
+
+fn _err_str(r: Result[bool, str]) -> str {
+    if result_is_err(r) {
+        return "REJECTED (" + result_err_or(r, "?") + ")"
+    }
+    return "ACCEPTED (BUG)"
+}
+
+# ============================================================================
+# Section 8: Stream helpers — common event patterns
+# ============================================================================
+
+fn demo_stream_helpers() -> void uses IO {
+    println("--- Stream helpers ---")
+    println("  sse_build_message:")
+    println("    " + _show_wire(sse_build_message("1", "hello")))
+    println("  sse_build_status_update:")
+    println("    " + _show_wire(sse_build_status_update("1", "OK", 3000)))
+    println("  sse_build_notification:")
+    println("    " + _show_wire(sse_build_notification("1", "you have mail")))
+    println("  sse_build_log_line (no ID — logs are not resumable):")
+    println("    " + _show_wire(sse_build_log_line("[INFO] server started")))
+    println("")
+    return
+}
+
+# ============================================================================
+# Section 9: End-to-end — a server pushing a counter
+# ============================================================================
+
+fn demo_end_to_end() -> void uses IO {
+    println("--- End-to-end: counter stream ---")
+    # Build 5 tick events
+    let events: list[SseEvent] = []
+    let mut i: int = 0
+    while i < 5 {
+        let e: SseEvent = sse_with_retry(
+            sse_with_data(
+                sse_with_event(
+                    sse_with_id(sse_event_new(), i.to_str()),
+                    "tick"),
+                "tick " + i.to_str()),
+            3000)
+        events.push(e)
+        i = i + 1
+    }
+
+    # Build the HTTP response
+    let resp: HttpResponse = sse_response_with_events(events)
+    println("  HTTP response: " + resp.status.to_str() + " " + http_header_get(resp.headers, "Content-Type"))
+    println("  body wire format:")
+    let lines: list[str] = resp.body.split("\n")
+    let mut j: int = 0
+    while j < lines.len() {
+        if lines.get(j).len() == 0 {
+            println("    (blank line)")
+        } else {
+            println("    " + lines.get(j))
+        }
+        j = j + 1
+    }
+
+    # Parse the body back into events
+    let parsed: list[SseEvent] = sse_parse_stream(resp.body)
+    println("  parsed " + parsed.len().to_str() + " events from body")
+
+    # Simulate Last-Event-ID reconnection
+    let req: HttpRequest = http_request_new("GET", "/stream")
+    req.headers = http_header_add(req.headers, "Last-Event-ID", "2")
+    let last_id: str = sse_last_event_id(req)
+    println("  client reconnects with Last-Event-ID=" + last_id)
+
+    # Resume from event 3 (the event AFTER id=2)
+    let mut resumed_count: int = 0
+    let mut k: int = 0
+    while k < parsed.len() {
+        if parsed.get(k).id == last_id {
+            resumed_count = parsed.len() - (k + 1)
+        }
+        k = k + 1
+    }
+    println("  server resumes with " + resumed_count.to_str() + " events (ids 3 and 4)")
+    println("")
+    return
+}
+
+# ============================================================================
+# Dispatcher
+# ============================================================================
+
+fn main() -> int uses IO {
+    println("============================================")
+    println("Stage 70 (v0.89.0-alpha): std.sse demo")
+    println("============================================")
+    println("")
+    demo_builder()
+    demo_parse()
+    demo_parse_stream()
+    demo_heartbeats()
+    demo_http()
+    demo_last_event_id()
+    demo_validation()
+    demo_stream_helpers()
+    demo_end_to_end()
+    println("============================================")
+    println("Stage 70 demo: all sections complete.")
+    println("============================================")
+    return 0
+}
