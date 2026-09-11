@@ -13,6 +13,124 @@ stability (125–140), and final stabilisation toward v1.0 (141–150).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
+## [v0.83.0-alpha] — Stage 64: std.http_server — multi-threaded HTTP server
+
+> Begins **Phase V (web application track, Stages 63–76)** — the
+> SECOND module of the phase (Stage 63 delivered `std.http_router`
+> in v0.78.0-alpha). Adds `std.http_server` — a multi-threaded
+> HTTP/1.1 keep-alive server with HTTP/2 preface dispatch, a
+> work-stealing thread pool (bounded `Chan[TcpStream]` work queue
+> with `2 * workers` capacity for backpressure), graceful shutdown
+> (Mutex-guarded shutdown flag + inflight counter + Condvar +
+> drain wait), and TLS-termination configuration hooks (recorded
+> for future use; until `tls_listen` is added, deploy behind a
+> reverse proxy).
+>
+> Implements the roadmap's Stage 64 promise:
+> - `HttpServerConfig` builder — 12 setters (host/port/workers/backlog/
+>   keep_alive_max/keep_alive_timeout_ms/read_timeout_ms/max_body/
+>   graceful_shutdown_ms/http2/tls/alpn). Each returns a NEW config
+>   (immutable updates; same idiom as std.cli, std.log, std.http_router).
+> - `HttpServer { config, router, shutdown_mu+flag, inflight_mu+cv+count }`.
+>   The shutdown flag is a Mutex-guarded bool (NOT a OnceCellBool —
+>   that's set-once and would prevent tests from resetting between
+>   sub-tests).
+> - `http_server_new(config, router)` — constructor (no bind).
+> - Graceful shutdown: `http_server_is_shutting_down` /
+>   `request_shutdown` / `clear_shutdown` (Mutex-guarded flag);
+>   `http_server_inflight_begin` / `end` / `get`
+>   (Mutex+Condvar-protected counter); `http_server_wait_inflight`
+>   (drain wait; 50ms polling; returns 0=drained, 1=timeout).
+> - HTTP/2 preface detection: `http_server_http2_preface()` returns
+>   the 24-byte RFC 7540 §3.5 magic (`PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n`,
+>   constructed via `chr(13) + "\n"` because HLS string literals
+>   don't support `\r`); `http_server_is_http2_preface(first_bytes)`
+>   is a pure prefix check (returns true iff buffer is ≥ 24 bytes
+>   AND starts with the preface magic).
+> - HTTP/2 minimal handshake: `http_server_handle_http2_conn` sends
+>   a SETTINGS frame, ACKs the client's SETTINGS proactively, reads
+>   frames in a bounded loop (max 10 attempts), sends a minimal 200
+>   OK response on stream 1 as a single DATA frame (END_STREAM) with
+>   a static "HTTP/2 supported" body, then sends a GOAWAY to close.
+>   Full HTTP/2 request multiplexing (HEADERS parsing, HPACK
+>   decoding, stream lifecycle, flow control) is deferred to a
+>   later alpha — Stage 64 delivers DETECTION + the SETTINGS
+>   handshake, proving the server can negotiate HTTP/2 and produce
+>   a valid frame sequence. Reuses `std.http2`'s
+>   `http2_encode_length_24` / `http2_encode_stream_id_31` helpers
+>   (HLS doesn't have bitwise operators on int literals; std.http2
+>   already solved byte decomposition via arithmetic `/` and `%`).
+> - HTTP/1.1 keep-alive loop: `http_server_handle_http1_conn`
+>   (and the prefix-aware variant `http_server_handle_http1_conn_with_prefix`)
+>   reads requests in a bounded loop until `keep_alive_max` is
+>   reached, the client closes, or a parse error occurs. Each
+>   iteration: read → parse → dispatch → decide keep-alive → set
+>   `Connection` / `Keep-Alive` headers → serialise → write →
+>   continue or close. On shutdown flag: stops reading new requests
+>   (current response is already written; connection closes cleanly).
+> - `http_server_should_keep_alive(req, config, request_count)` —
+>   RFC 7230 §6.3 / §6.6 semantics: HTTP/1.0 default=close (keep-alive
+>   only if explicit `Connection: keep-alive`), HTTP/1.1 default=keep-alive
+>   (close only if explicit `Connection: close`). Header value is
+>   lowercased before substring check (case-insensitive). `keep_alive_max`
+>   cap (default 100) forces close after Nth request on a connection
+>   (prevents memory creep). Unknown versions are conservatively closed.
+> - `http_server_route_request(server, request)` — bridge between
+>   `std.http_router` (pure dispatcher) and the user's handler. Calls
+>   `router_match` → on no match returns 404 → on match calls the
+>   default `http_server_dispatch(match, request)`. Default dispatch
+>   returns a 200 OK with a plain-text body describing the match
+>   (handler ID, method, path, params). Real programs define their
+>   own `http_server_dispatch` (single-file programs shadow the
+>   stdlib default at link time, matching Stage 38's `http_handle`
+>   pattern).
+> - Worker pool: `http_server_worker_loop` — each worker pulls a
+>   connection from the shared bounded `Chan[TcpStream]` work queue
+>   (capacity `2 * workers` — the standard Go/Rust backpressure
+>   pattern). When full, the accept loop blocks on `work_queue.send()`,
+>   which fills the OS backlog, which drops new SYNs at the kernel
+>   level. Worker calls `inflight_begin` before handling and
+>   `inflight_end` after — so `wait_inflight` knows when every active
+>   connection has drained. On shutdown, the accept loop sends N
+>   "poison pill" connections (`TcpStream { fd: -1 }`) — one per
+>   worker — to unblock the `recv()` calls (HLS v0.3 doesn't have a
+>   `chan_close` builtin). The worker checks `fd <= 0` and exits
+>   cleanly.
+> - `http_server_serve(server)` — production entry point: bind via
+>   `tcp_listen_or`, create the work queue, spawn N workers, accept
+>   loop (`work_queue.send(take(conn))` — take transfers ownership
+>   across the task boundary, required by HLS's data-race-freedom
+>   rule for owned types), on shutdown close listener + send poison
+>   pills + join all workers.
+> - TLS termination (documented limitation): the current `std.net`
+>   provides `tls_get(host, port, path)` (CLIENT-side HTTPS GET) but
+>   NOT a `tls_listen(host, port, cert, key)` builtin for SERVER-side
+>   TLS. For v0.83.0-alpha, `http_server_config_tls(cert, key)` RECORDS
+>   the TLS configuration (cert path, key path, ALPN protocols) but
+>   the server itself listens on PLAIN TCP. The intended deployment
+>   is `internet ──HTTPS──> nginx/caddy ──HTTP──> hls http_server`
+>   (reverse proxy terminates TLS, sets `X-Forwarded-Proto: https`,
+>   forwards plain HTTP — standard pattern for Go/Node/Python/Rust
+>   app servers). When a future stage adds `tls_listen`, the server
+>   will use the recorded TLS config directly — no breaking API change.
+> - `http_server_work_queue_capacity(workers)` — the `2 * workers`
+>   backpressure formula (minimum 2 for `workers <= 1`).
+> - `http_server_describe_config(config)` — human-readable rendering
+>   for `hls serve --print-config` and log-on-startup output.
+>
+> No new compiler builtins — pure-HLS on top of std.http, std.http_router,
+> std.http2, std.net, std.sync, std.thread, std.str, std.option,
+> std.result.
+>
+> **Acceptance**: `make http-server-acceptance` runs the demo +
+> acceptance test differentially (interpreter == native) — both
+> PASS. 14/14 tests in `tests/ok/feat_stage64_http_server.hls` PASS.
+> The demo `examples/http_server_demo.hls` is also differentially
+> verified (it constructs configs, dispatches requests via
+> router_match + a user dispatch handler, exercises the shutdown
+> flag, and renders the HTTP/2 frame byte layout — all deterministic,
+> no actual port bind). Bootstrap is still deterministic.
+
 ## [v0.82.0-alpha] — Stage 61: std.hlsdoc (rustdoc-style API docs generator)
 
 > Continues **Phase IV (CLI tooling track, Stages 53–62)**.

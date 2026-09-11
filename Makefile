@@ -2577,3 +2577,71 @@ hlsdoc-acceptance: bin/hlc
 	@echo "  differential (interpreter == native) verified green."
 
 .PHONY: hlsdoc-acceptance
+
+# ============================================================================
+# Stage 64 (v0.83.0-alpha): std.http_server -- multi-threaded HTTP
+# server (keep-alive, work-stealing thread pool, graceful shutdown,
+# HTTP/2 preface detection, TLS-termination configuration hooks).
+# Pure-HLS module on top of std.http, std.http_router, std.http2,
+# std.net, std.sync, std.thread. The pure pieces (config builder,
+# HTTP/2 preface detection, keep-alive decision, dispatch wrapper,
+# shutdown flag mechanics, inflight counter) are differentially
+# verified. The network pieces (accept loop, worker pool, real HTTP/2
+# handshake) are exercised in the demo and the manual test, but are
+# NOT part of the differential suite (binding a real port would be
+# non-deterministic in CI).
+# ============================================================================
+
+# Stage 64 differential note: the pure pieces of std.http_server
+# (config, preface detection, keep-alive decision, dispatch wrapper,
+# shutdown flag, inflight counter) are pure functions of immutable
+# inputs. The interpreter and the native binary produce byte-identical
+# output on the acceptance test. The demo (examples/http_server_demo.hls)
+# is also differentially verified (it constructs configs, dispatches
+# requests via router_match + a user dispatch handler, exercises the
+# shutdown flag, and renders the HTTP/2 frame byte layout -- all
+# deterministic, no actual port bind).
+
+http-server-acceptance: bin/hlc
+	@$(PYTHON) boot/boot.py examples/http_server_demo.hls > /tmp/http_server_demo_interp.txt 2>&1
+	@bin/hlc examples/http_server_demo.hls /tmp/http_server_demo.c 2>/dev/null
+	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/http_server_demo /tmp/http_server_demo.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
+	@/tmp/http_server_demo > /tmp/http_server_demo_nat.txt 2>&1
+	@diff -q /tmp/http_server_demo_interp.txt /tmp/http_server_demo_nat.txt >/dev/null 2>&1 \
+		|| (echo "FAIL: http_server_demo differential mismatch" && false)
+	@$(PYTHON) boot/boot.py tests/ok/feat_stage64_http_server.hls > /tmp/s64_interp.txt 2>&1
+	@bin/hlc tests/ok/feat_stage64_http_server.hls /tmp/s64.c 2>/dev/null
+	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/s64 /tmp/s64.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
+	@/tmp/s64 > /tmp/s64_nat.txt 2>&1
+	@diff -q /tmp/s64_interp.txt /tmp/s64_nat.txt >/dev/null 2>&1 \
+		|| (echo "FAIL: feat_stage64_http_server differential mismatch" && false)
+	@rm -f /tmp/http_server_demo /tmp/http_server_demo.c /tmp/http_server_demo_interp.txt /tmp/http_server_demo_nat.txt \
+		/tmp/s64 /tmp/s64.c /tmp/s64_interp.txt /tmp/s64_nat.txt
+	@echo ""
+	@echo "ACCEPTANCE OK: Stage 64 -- std.http_server (multi-threaded HTTP server)"
+	@echo "  HttpServerConfig builder (12 setters: host/port/workers/backlog/keep_alive_max/"
+	@echo "    keep_alive_timeout_ms/read_timeout_ms/max_body/graceful_shutdown_ms/http2/tls/alpn)"
+	@echo "  HttpServer { config, router, shutdown_mu+flag, inflight_mu+cv+count }"
+	@echo "  http_server_new (constructor; no bind)"
+	@echo "  http_server_is_shutting_down / request_shutdown / clear_shutdown (Mutex-guarded flag)"
+	@echo "  http_server_inflight_begin/end/get (Mutex+Condvar-protected counter)"
+	@echo "  http_server_wait_inflight (drain wait; 50ms polling; 0=drained, 1=timeout)"
+	@echo "  http_server_http2_preface (RFC 7540 S3.5 24-byte magic, exact byte verification)"
+	@echo "  http_server_is_http2_preface (full match, preface+extra, HTTP/1.1 rejection,"
+	@echo "    short buffer rejection, empty rejection, almost-preface rejection)"
+	@echo "  http_server_should_keep_alive (HTTP/1.0 default=close, HTTP/1.1 default=keep-alive,"
+	@echo "    Connection: close/keep-alive header, case-insensitive, max-keepalive cap)"
+	@echo "  http_server_route_request (router_match + default http_server_dispatch)"
+	@echo "  http_server_handle_http1_conn (HTTP/1.1 keep-alive loop, multi-request)"
+	@echo "  http_server_handle_http2_conn (HTTP/2 SETTINGS + ACK + DATA + GOAWAY frame sequence)"
+	@echo "  http_server_handle_conn (preface detection dispatch; HTTP/2 vs HTTP/1.1)"
+	@echo "  http_server_worker_loop (worker pool; bounded Chan[TcpStream] work queue;"
+	@echo "    poison-pill fd<=0 sentinel for clean worker exit)"
+	@echo "  http_server_serve (bind + accept loop + spawn N workers + graceful shutdown)"
+	@echo "  http_server_work_queue_capacity (2*workers backpressure formula)"
+	@echo "  http_server_describe_config (human-readable rendering for --print-config)"
+	@echo "  HTTP/2 frame encoders verified byte-level (SETTINGS, SETTINGS_ACK, GOAWAY, DATA on stream 1)"
+	@echo "  Pure-HLS implementation (no new compiler builtins)"
+	@echo "  differential (interpreter == native) verified green."
+
+.PHONY: http-server-acceptance

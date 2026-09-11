@@ -1,0 +1,543 @@
+# tests/ok/feat_stage64_http_server.hls — Stage 64 (v0.83.0-alpha):
+# std.http_server.
+#
+# Exercises:
+#   - HttpServerConfig builder (defaults + every override)
+#   - http_server_describe_config (human-readable rendering)
+#   - http_server_http2_preface (the 24-byte RFC 7540 magic)
+#   - http_server_is_http2_preface (preface detection: full match,
+#     preface+extra, HTTP/1.1 first bytes, short buffer, empty)
+#   - http_server_should_keep_alive (HTTP/1.0/1.1, Connection header
+#     semantics, max-keepalive cap, unknown version)
+#   - http_server_new (server construction)
+#   - http_server_is_shutting_down (initial state, after request,
+#     after clear)
+#   - http_server_request_shutdown / http_server_clear_shutdown
+#   - http_server_inflight_begin/end/get (counter mechanics)
+#   - http_server_wait_inflight (drain wait; immediate return on 0)
+#   - http_server_route_request (router + default dispatch)
+#   - http_server_work_queue_capacity (workers=0,1,4,16)
+#   - http_server_default_* constants (workers, backlog, keep-alive
+#     max, keep-alive timeout, read timeout, max body, graceful)
+#   - http_server_describe_config with HTTP/2 enabled/disabled and
+#     TLS enabled/disabled (label rendering)
+#
+# The test is pure (no actual port bind) so the output is fully
+# reproducible and differential-safe (interpreter == native).
+
+import "std.http_server"
+import "std.http"
+import "std.http_router"
+import "std.str"
+
+# ============================================================================
+# Helpers — assertion primitives (same pattern as feat_stage63).
+# ============================================================================
+
+fn ok(actual: bool, msg: str) -> void uses IO {
+    if !actual {
+        panic("FAIL " + msg)
+    }
+}
+
+fn eq_int(actual: int, expected: int, msg: str) -> void uses IO {
+    if actual != expected {
+        panic("FAIL " + msg + ": expected " + expected.to_str() + ", got " + actual.to_str())
+    }
+}
+
+fn eq_str(actual: str, expected: str, msg: str) -> void uses IO {
+    if actual != expected {
+        panic("FAIL " + msg + ": expected '" + expected + "', got '" + actual + "'")
+    }
+}
+
+fn eq_bool(actual: bool, expected: bool, msg: str) -> void uses IO {
+    if actual != expected {
+        panic("FAIL " + msg + ": expected " + expected.to_str() + ", got " + actual.to_str())
+    }
+}
+
+# Build a test router (used by multiple tests).
+fn build_test_router() -> Router {
+    return router_new()
+        .get("/", 1)
+        .get("/users", 2)
+        .post("/users", 3)
+        .get("/users/:id", 4)
+        .put("/users/:id", 5)
+        .delete("/users/:id", 6)
+        .get("/healthz", 7)
+}
+
+# ============================================================================
+# Test 1: default config — every field has the documented default.
+# ============================================================================
+
+fn test_default_config() -> int uses IO {
+    let c: HttpServerConfig = http_server_config_new()
+    eq_str(c.host, "127.0.0.1", "default: host")
+    eq_int(c.port, 8080, "default: port")
+    eq_int(c.workers, 4, "default: workers")
+    eq_int(c.backlog, 128, "default: backlog")
+    eq_int(c.keep_alive_max, 100, "default: keep_alive_max")
+    eq_int(c.keep_alive_timeout_ms, 15000, "default: keep_alive_timeout_ms")
+    eq_int(c.read_timeout_ms, 30000, "default: read_timeout_ms")
+    eq_int(c.max_body, 1048576, "default: max_body")
+    eq_int(c.graceful_shutdown_ms, 5000, "default: graceful_shutdown_ms")
+    eq_bool(c.enable_http2, true, "default: enable_http2")
+    eq_bool(c.enable_tls, false, "default: enable_tls")
+    eq_str(c.tls_cert_path, "", "default: tls_cert_path")
+    eq_str(c.tls_key_path, "", "default: tls_key_path")
+    eq_int(c.tls_alpn.len(), 0, "default: tls_alpn empty")
+    return 0
+}
+
+# ============================================================================
+# Test 2: config builder overrides — every setter applies its value.
+# ============================================================================
+
+fn test_config_overrides() -> int uses IO {
+    let c0: HttpServerConfig = http_server_config_new()
+    let c1: HttpServerConfig = http_server_config_host(c0, "0.0.0.0")
+    eq_str(c1.host, "0.0.0.0", "override: host")
+    eq_int(c1.port, 8080, "override: port unchanged")
+    let c2: HttpServerConfig = http_server_config_port(c1, 3000)
+    eq_int(c2.port, 3000, "override: port")
+    let c3: HttpServerConfig = http_server_config_workers(c2, 8)
+    eq_int(c3.workers, 8, "override: workers")
+    let c4: HttpServerConfig = http_server_config_backlog(c3, 1024)
+    eq_int(c4.backlog, 1024, "override: backlog")
+    let c5: HttpServerConfig = http_server_config_keep_alive_max(c4, 1000)
+    eq_int(c5.keep_alive_max, 1000, "override: keep_alive_max")
+    let c6: HttpServerConfig = http_server_config_keep_alive_timeout_ms(c5, 30000)
+    eq_int(c6.keep_alive_timeout_ms, 30000, "override: keep_alive_timeout_ms")
+    let c7: HttpServerConfig = http_server_config_read_timeout_ms(c6, 60000)
+    eq_int(c7.read_timeout_ms, 60000, "override: read_timeout_ms")
+    let c8: HttpServerConfig = http_server_config_max_body(c7, 10485760)
+    eq_int(c8.max_body, 10485760, "override: max_body")
+    let c9: HttpServerConfig = http_server_config_graceful_shutdown_ms(c8, 10000)
+    eq_int(c9.graceful_shutdown_ms, 10000, "override: graceful_shutdown_ms")
+    let c10: HttpServerConfig = http_server_config_http2(c9, false)
+    eq_bool(c10.enable_http2, false, "override: enable_http2=false")
+    let c11: HttpServerConfig = http_server_config_http2(c10, true)
+    eq_bool(c11.enable_http2, true, "override: enable_http2=true (round trip)")
+    let c12: HttpServerConfig = http_server_config_tls(c11, "/etc/cert.pem", "/etc/key.pem")
+    eq_bool(c12.enable_tls, true, "override: enable_tls")
+    eq_str(c12.tls_cert_path, "/etc/cert.pem", "override: tls_cert_path")
+    eq_str(c12.tls_key_path, "/etc/key.pem", "override: tls_key_path")
+    let alpn: list[str] = ["h2", "http/1.1"]
+    let c13: HttpServerConfig = http_server_config_alpn(c12, alpn)
+    eq_int(c13.tls_alpn.len(), 2, "override: tls_alpn length")
+    eq_str(c13.tls_alpn.get(0), "h2", "override: tls_alpn[0]")
+    eq_str(c13.tls_alpn.get(1), "http/1.1", "override: tls_alpn[1]")
+    return 0
+}
+
+# ============================================================================
+# Test 3: default constants — the documented values.
+# ============================================================================
+
+fn test_default_constants() -> int uses IO {
+    eq_int(http_server_default_workers(), 4, "const: default_workers")
+    eq_int(http_server_default_backlog(), 128, "const: default_backlog")
+    eq_int(http_server_default_keep_alive_max(), 100, "const: default_keep_alive_max")
+    eq_int(http_server_default_keep_alive_timeout_ms(), 15000, "const: default_keep_alive_timeout_ms")
+    eq_int(http_server_default_read_timeout_ms(), 30000, "const: default_read_timeout_ms")
+    eq_int(http_server_default_max_body(), 1048576, "const: default_max_body")
+    eq_int(http_server_default_graceful_shutdown_ms(), 5000, "const: default_graceful_shutdown_ms")
+    return 0
+}
+
+# ============================================================================
+# Test 4: work-queue capacity — the 2x-workers backpressure formula.
+# ============================================================================
+
+fn test_work_queue_capacity() -> int uses IO {
+    eq_int(http_server_work_queue_capacity(0), 2, "wq: workers=0 (floor)")
+    eq_int(http_server_work_queue_capacity(1), 2, "wq: workers=1")
+    eq_int(http_server_work_queue_capacity(2), 4, "wq: workers=2")
+    eq_int(http_server_work_queue_capacity(4), 8, "wq: workers=4")
+    eq_int(http_server_work_queue_capacity(8), 16, "wq: workers=8")
+    eq_int(http_server_work_queue_capacity(16), 32, "wq: workers=16")
+    eq_int(http_server_work_queue_capacity(100), 200, "wq: workers=100")
+    return 0
+}
+
+# ============================================================================
+# Test 5: HTTP/2 preface — the 24-byte magic.
+# ============================================================================
+
+fn test_http2_preface() -> int uses IO {
+    let preface: str = http_server_http2_preface()
+    eq_int(preface.len(), 24, "preface: length=24 bytes")
+    # Verify the bytes match RFC 7540 §3.5:
+    #   P R I   *   H T T P / 2 . 0 \r \n \r \n S M \r \n \r \n
+    eq_int(preface.byte_at(0), 80, "preface[0]='P'")      # 'P'
+    eq_int(preface.byte_at(1), 82, "preface[1]='R'")      # 'R'
+    eq_int(preface.byte_at(2), 73, "preface[2]='I'")      # 'I'
+    eq_int(preface.byte_at(3), 32, "preface[3]=' '")      # space
+    eq_int(preface.byte_at(4), 42, "preface[4]='*'")      # '*'
+    eq_int(preface.byte_at(5), 32, "preface[5]=' '")      # space
+    eq_int(preface.byte_at(6), 72, "preface[6]='H'")      # 'H'
+    eq_int(preface.byte_at(7), 84, "preface[7]='T'")      # 'T'
+    eq_int(preface.byte_at(10), 47, "preface[10]='/'")    # '/'
+    eq_int(preface.byte_at(11), 50, "preface[11]='2'")    # '2'
+    eq_int(preface.byte_at(12), 46, "preface[12]='.'")    # '.'
+    eq_int(preface.byte_at(13), 48, "preface[13]='0'")    # '0'
+    eq_int(preface.byte_at(14), 13, "preface[14]=CR")     # \r
+    eq_int(preface.byte_at(15), 10, "preface[15]=LF")     # \n
+    eq_int(preface.byte_at(16), 13, "preface[16]=CR")     # \r
+    eq_int(preface.byte_at(17), 10, "preface[17]=LF")    # \n
+    eq_int(preface.byte_at(18), 83, "preface[18]='S'")   # 'S'
+    eq_int(preface.byte_at(19), 77, "preface[19]='M'")   # 'M'
+    eq_int(preface.byte_at(20), 13, "preface[20]=CR")    # \r
+    eq_int(preface.byte_at(21), 10, "preface[21]=LF")    # \n
+    eq_int(preface.byte_at(22), 13, "preface[22]=CR")    # \r
+    eq_int(preface.byte_at(23), 10, "preface[23]=LF")    # \n
+    return 0
+}
+
+# ============================================================================
+# Test 6: HTTP/2 preface detection — http_server_is_http2_preface.
+# ============================================================================
+
+fn test_http2_preface_detection() -> int uses IO {
+    let preface: str = http_server_http2_preface()
+    # Full preface alone — should match.
+    eq_bool(http_server_is_http2_preface(preface), true, "detect: full preface")
+    # Preface + extra bytes — should still match (prefix check).
+    let with_extra: str = preface + "extra"
+    eq_bool(http_server_is_http2_preface(with_extra), true, "detect: preface + extra")
+    # HTTP/1.1 GET request — should NOT match.
+    let h1_get: str = "GET / HTTP/1.1" + chr(13) + "\nHost: x" + chr(13) + "\n" + chr(13) + "\n"
+    eq_bool(http_server_is_http2_preface(h1_get), false, "detect: HTTP/1.1 GET")
+    # HTTP/1.1 POST request — should NOT match.
+    let h1_post: str = "POST /submit HTTP/1.1" + chr(13) + "\n"
+    eq_bool(http_server_is_http2_preface(h1_post), false, "detect: HTTP/1.1 POST")
+    # Too-short buffer — should NOT match (preface is 24 bytes; a
+    # 14-byte buffer cannot contain it).
+    let short: str = "PRI * HTTP/2.0"
+    eq_bool(http_server_is_http2_preface(short), false, "detect: short buffer (14 bytes)")
+    # Empty buffer — should NOT match.
+    eq_bool(http_server_is_http2_preface(""), false, "detect: empty buffer")
+    # Single byte — should NOT match.
+    eq_bool(http_server_is_http2_preface("P"), false, "detect: single byte")
+    # Almost-preface but last byte differs — should NOT match.
+    let almost: str = preface.slice(0, 23) + "X"
+    eq_bool(http_server_is_http2_preface(almost), false, "detect: almost-preface (last byte wrong)")
+    # Exactly 24 bytes but all 'X' — should NOT match.
+    let all_x: str = "XXXXXXXXXXXXXXXXXXXXXXXX"
+    eq_bool(http_server_is_http2_preface(all_x), false, "detect: 24 X's")
+    return 0
+}
+
+# ============================================================================
+# Test 7: keep-alive decision — RFC 7230 §6.3 / §6.6 semantics.
+# ============================================================================
+
+fn test_keep_alive_decision() -> int uses IO {
+    let c: HttpServerConfig = http_server_config_new()
+    # HTTP/1.1 default = keep-alive (no Connection header).
+    let req11: HttpRequest = http_request_new("GET", "/")
+    eq_bool(http_server_should_keep_alive(req11, c, 1), true, "ka: HTTP/1.1 default = keep-alive")
+    # HTTP/1.1 + Connection: close -> close.
+    let req11_close: HttpRequest = http_request_new("GET", "/")
+    req11_close.headers = http_header_add(req11_close.headers, "Connection", "close")
+    eq_bool(http_server_should_keep_alive(req11_close, c, 1), false, "ka: HTTP/1.1 + close = close")
+    # HTTP/1.1 + Connection: keep-alive -> keep-alive.
+    let req11_ka: HttpRequest = http_request_new("GET", "/")
+    req11_ka.headers = http_header_add(req11_ka.headers, "Connection", "keep-alive")
+    eq_bool(http_server_should_keep_alive(req11_ka, c, 1), true, "ka: HTTP/1.1 + keep-alive = keep-alive")
+    # HTTP/1.1 + Connection: CLOSE (uppercase) -> still close (case-insensitive).
+    let req11_upper: HttpRequest = http_request_new("GET", "/")
+    req11_upper.headers = http_header_add(req11_upper.headers, "Connection", "CLOSE")
+    eq_bool(http_server_should_keep_alive(req11_upper, c, 1), false, "ka: HTTP/1.1 + CLOSE (upper) = close")
+    # HTTP/1.0 default = close.
+    let req10: HttpRequest = http_request_new("GET", "/")
+    req10.version = "HTTP/1.0"
+    eq_bool(http_server_should_keep_alive(req10, c, 1), false, "ka: HTTP/1.0 default = close")
+    # HTTP/1.0 + Connection: keep-alive -> keep-alive.
+    let req10_ka: HttpRequest = http_request_new("GET", "/")
+    req10_ka.version = "HTTP/1.0"
+    req10_ka.headers = http_header_add(req10_ka.headers, "Connection", "keep-alive")
+    eq_bool(http_server_should_keep_alive(req10_ka, c, 1), true, "ka: HTTP/1.0 + keep-alive = keep-alive")
+    # HTTP/1.0 + Connection: close -> close.
+    let req10_close: HttpRequest = http_request_new("GET", "/")
+    req10_close.version = "HTTP/1.0"
+    req10_close.headers = http_header_add(req10_close.headers, "Connection", "close")
+    eq_bool(http_server_should_keep_alive(req10_close, c, 1), false, "ka: HTTP/1.0 + close = close")
+    # Max-keepalive cap reached -> close.
+    eq_bool(http_server_should_keep_alive(req11, c, 100), false, "ka: count=100 (max) = close")
+    eq_bool(http_server_should_keep_alive(req11, c, 99), true, "ka: count=99 (under max) = keep-alive")
+    # Unknown version -> conservative close.
+    let req_unknown: HttpRequest = http_request_new("GET", "/")
+    req_unknown.version = "HTTP/9.9"
+    eq_bool(http_server_should_keep_alive(req_unknown, c, 1), false, "ka: unknown version = close")
+    # Custom keep_alive_max override.
+    let c2: HttpServerConfig = http_server_config_keep_alive_max(c, 10)
+    eq_bool(http_server_should_keep_alive(req11, c2, 10), false, "ka: custom max=10, count=10 = close")
+    eq_bool(http_server_should_keep_alive(req11, c2, 9), true, "ka: custom max=10, count=9 = keep-alive")
+    return 0
+}
+
+# ============================================================================
+# Test 8: server construction + shutdown flag.
+# ============================================================================
+
+fn test_server_shutdown_flag() -> int uses IO, Conc {
+    let r: Router = build_test_router()
+    let c: HttpServerConfig = http_server_config_new()
+    let s: HttpServer = http_server_new(c, r)
+    # Initial state: not shutting down.
+    eq_bool(http_server_is_shutting_down(s), false, "shutdown: initial=false")
+    # Set the shutdown flag.
+    http_server_request_shutdown(s)
+    eq_bool(http_server_is_shutting_down(s), true, "shutdown: after request=true")
+    # Clear the shutdown flag.
+    http_server_clear_shutdown(s)
+    eq_bool(http_server_is_shutting_down(s), false, "shutdown: after clear=false")
+    # Re-set the flag (round trip).
+    http_server_request_shutdown(s)
+    eq_bool(http_server_is_shutting_down(s), true, "shutdown: re-set=true")
+    return 0
+}
+
+# ============================================================================
+# Test 9: inflight counter mechanics.
+# ============================================================================
+
+fn test_inflight_counter() -> int uses IO, Conc {
+    let r: Router = build_test_router()
+    let c: HttpServerConfig = http_server_config_new()
+    let s: HttpServer = http_server_new(c, r)
+    # Initial state: 0 inflight.
+    eq_int(http_server_inflight_get(s), 0, "inflight: initial=0")
+    # Begin one.
+    http_server_inflight_begin(s)
+    eq_int(http_server_inflight_get(s), 1, "inflight: after begin=1")
+    # Begin another.
+    http_server_inflight_begin(s)
+    eq_int(http_server_inflight_get(s), 2, "inflight: after 2 begins=2")
+    # End one.
+    http_server_inflight_end(s)
+    eq_int(http_server_inflight_get(s), 1, "inflight: after 1 end=1")
+    # End the other.
+    http_server_inflight_end(s)
+    eq_int(http_server_inflight_get(s), 0, "inflight: after 2 ends=0")
+    # End on zero — should NOT go negative (guarded).
+    http_server_inflight_end(s)
+    eq_int(http_server_inflight_get(s), 0, "inflight: end on zero stays 0")
+    return 0
+}
+
+# ============================================================================
+# Test 10: wait_inflight — immediate return when already drained.
+# ============================================================================
+
+fn test_wait_inflight_drained() -> int uses IO, Conc, Clock {
+    let r: Router = build_test_router()
+    let c: HttpServerConfig = http_server_config_new()
+    let s: HttpServer = http_server_new(c, r)
+    # Already drained — should return 0 immediately.
+    let rc: int = http_server_wait_inflight(s, 1000)
+    eq_int(rc, 0, "wait: drained returns 0")
+    # Add one inflight — wait_inflight should return 1 (timeout).
+    http_server_inflight_begin(s)
+    let rc2: int = http_server_wait_inflight(s, 100)
+    eq_int(rc2, 1, "wait: 1 inflight after 100ms returns 1 (timeout)")
+    # Clean up.
+    http_server_inflight_end(s)
+    return 0
+}
+
+# ============================================================================
+# Test 11: route_request — router + default dispatch.
+# ============================================================================
+
+fn test_route_request() -> int uses IO, Conc {
+    let r: Router = build_test_router()
+    let c: HttpServerConfig = http_server_config_new()
+    let s: HttpServer = http_server_new(c, r)
+    # GET / — handler_id 1 (default dispatch returns 200 with match info).
+    let req1: HttpRequest = http_request_new("GET", "/")
+    let resp1: HttpResponse = http_server_route_request(s, req1)
+    eq_int(resp1.status, 200, "route: GET / status=200")
+    # GET /nonexistent — 404 (no route matched).
+    let req2: HttpRequest = http_request_new("GET", "/nonexistent")
+    let resp2: HttpResponse = http_server_route_request(s, req2)
+    eq_int(resp2.status, 404, "route: GET /nonexistent status=404")
+    # POST /users — handler_id 3.
+    let req3: HttpRequest = http_request_new("POST", "/users")
+    let resp3: HttpResponse = http_server_route_request(s, req3)
+    eq_int(resp3.status, 200, "route: POST /users status=200 (default dispatch)")
+    # The default dispatch body contains "handler_id=3".
+    ok(str_contains(resp3.body, "handler_id=3"), "route: POST /users body contains handler_id=3")
+    # GET /users/42 — handler_id 4, params[id]=42.
+    let req4: HttpRequest = http_request_new("GET", "/users/42")
+    let resp4: HttpResponse = http_server_route_request(s, req4)
+    eq_int(resp4.status, 200, "route: GET /users/42 status=200")
+    ok(str_contains(resp4.body, "handler_id=4"), "route: GET /users/42 body contains handler_id=4")
+    ok(str_contains(resp4.body, "id=42"), "route: GET /users/42 body contains param id=42")
+    return 0
+}
+
+# ============================================================================
+# Test 12: describe_config — rendering for different configurations.
+# ============================================================================
+
+fn test_describe_config() -> int uses IO {
+    let c1: HttpServerConfig = http_server_config_new()
+    let s1: str = http_server_describe_config(c1)
+    ok(str_contains(s1, "127.0.0.1:8080"), "describe: default bind")
+    ok(str_contains(s1, "HTTP/2:       enabled"), "describe: HTTP/2 enabled")
+    ok(str_contains(s1, "TLS:          disabled"), "describe: TLS disabled")
+    # HTTP/2 disabled.
+    let c2_real: HttpServerConfig = http_server_config_http2(http_server_config_new(), false)
+    let s2: str = http_server_describe_config(c2_real)
+    ok(str_contains(s2, "HTTP/2:       disabled"), "describe: HTTP/2 disabled")
+    # TLS enabled with cert path.
+    let c3: HttpServerConfig = http_server_config_tls(http_server_config_new(), "/cert.pem", "/key.pem")
+    let s3: str = http_server_describe_config(c3)
+    ok(str_contains(s3, "TLS:          enabled (cert=/cert.pem)"), "describe: TLS enabled with cert path")
+    return 0
+}
+
+# ============================================================================
+# Test 13: HTTP/2 frame encoder byte-level verification.
+# ============================================================================
+
+# Construct a SETTINGS frame manually and compare against the expected
+# 9-byte sequence. We can't call http_server_send_http2_settings
+# (it writes to a TcpStream), so we verify the byte layout described
+# in the function's docstring: length=0 (3 bytes), type=4, flags=0,
+# stream=0 (4 bytes) = 00 00 00 04 00 00 00 00 00.
+fn test_http2_frame_layout() -> int uses IO {
+    # Reconstruct the SETTINGS frame using std.http2's encoders (the
+    # same ones http_server_send_http2_settings uses).
+    let settings_frame: str = http2_encode_length_24(0) + chr(4) + chr(0) + http2_encode_stream_id_31(0)
+    eq_int(settings_frame.len(), 9, "frame: SETTINGS length=9 bytes")
+    eq_int(settings_frame.byte_at(0), 0, "frame: SETTINGS[0]=0x00 (length high)")
+    eq_int(settings_frame.byte_at(1), 0, "frame: SETTINGS[1]=0x00 (length mid)")
+    eq_int(settings_frame.byte_at(2), 0, "frame: SETTINGS[2]=0x00 (length low)")
+    eq_int(settings_frame.byte_at(3), 4, "frame: SETTINGS[3]=0x04 (type=SETTINGS)")
+    eq_int(settings_frame.byte_at(4), 0, "frame: SETTINGS[4]=0x00 (flags=0)")
+    eq_int(settings_frame.byte_at(5), 0, "frame: SETTINGS[5]=0x00 (stream high)")
+    eq_int(settings_frame.byte_at(6), 0, "frame: SETTINGS[6]=0x00 (stream mid)")
+    eq_int(settings_frame.byte_at(7), 0, "frame: SETTINGS[7]=0x00 (stream low)")
+    eq_int(settings_frame.byte_at(8), 0, "frame: SETTINGS[8]=0x00 (stream lowest)")
+    # SETTINGS ACK: same but flags=0x01.
+    let ack_frame: str = http2_encode_length_24(0) + chr(4) + chr(1) + http2_encode_stream_id_31(0)
+    eq_int(ack_frame.byte_at(4), 1, "frame: SETTINGS_ACK[4]=0x01 (ACK flag)")
+    # GOAWAY: length=8, type=7, flags=0, stream=0, payload=8 zero bytes.
+    let goaway_header: str = http2_encode_length_24(8) + chr(7) + chr(0) + http2_encode_stream_id_31(0)
+    eq_int(goaway_header.byte_at(3), 7, "frame: GOAWAY[3]=0x07 (type=GOAWAY)")
+    eq_int(goaway_header.byte_at(0), 0, "frame: GOAWAY[0]=0x00 (length high)")
+    eq_int(goaway_header.byte_at(2), 8, "frame: GOAWAY[2]=0x08 (length low=8)")
+    # DATA on stream 1: type=0, flags=1 (END_STREAM), stream=1.
+    let data_header: str = http2_encode_length_24(47) + chr(0) + chr(1) + http2_encode_stream_id_31(1)
+    eq_int(data_header.byte_at(3), 0, "frame: DATA[3]=0x00 (type=DATA)")
+    eq_int(data_header.byte_at(4), 1, "frame: DATA[4]=0x01 (END_STREAM)")
+    # stream_id=1: lowest byte should be 1, high bytes 0.
+    eq_int(data_header.byte_at(5), 0, "frame: DATA[5]=0x00 (stream high)")
+    eq_int(data_header.byte_at(6), 0, "frame: DATA[6]=0x00 (stream mid)")
+    eq_int(data_header.byte_at(7), 0, "frame: DATA[7]=0x00 (stream low)")
+    eq_int(data_header.byte_at(8), 1, "frame: DATA[8]=0x01 (stream=1)")
+    # length=47 in 3 bytes big-endian: 0x00 0x00 0x2F.
+    eq_int(data_header.byte_at(0), 0, "frame: DATA[0]=0x00 (length high)")
+    eq_int(data_header.byte_at(1), 0, "frame: DATA[1]=0x00 (length mid)")
+    eq_int(data_header.byte_at(2), 47, "frame: DATA[2]=0x2F (length low=47)")
+    return 0
+}
+
+# ============================================================================
+# Test 14: HTTP/2 preface is RFC 7540 §3.5 exact.
+# ============================================================================
+
+fn test_preface_exact_bytes() -> int uses IO {
+    let p: str = http_server_http2_preface()
+    # Verify the exact byte sequence from RFC 7540 §3.5:
+    #   50 52 49 20 2a 20 48 54 54 50 2f 32 2e 30 0d 0a 0d 0a 53 4d 0d 0a 0d 0a
+    let expected: list[int] = [80, 82, 73, 32, 42, 32, 72, 84, 84, 80, 47, 50, 46, 48, 13, 10, 13, 10, 83, 77, 13, 10, 13, 10]
+    eq_int(p.len(), expected.len(), "preface: length matches RFC")
+    let mut i: int = 0
+    while i < expected.len() {
+        eq_int(p.byte_at(i), expected.get(i), "preface[" + i.to_str() + "] matches RFC")
+        i = i + 1
+    }
+    return 0
+}
+
+# ============================================================================
+# Main — run every test, report PASS/FAIL.
+# ============================================================================
+
+fn run_tests() -> int uses IO, Conc, Clock {
+    println("=== Stage 64 acceptance: std.http_server ===")
+    let mut passed: int = 0
+    let mut failed: int = 0
+    # Each test function returns 0 on success, panics on failure.
+    # We wrap each in a marker so a panic prints which test failed.
+    let tests: list[str] = [
+        "test_default_config",
+        "test_config_overrides",
+        "test_default_constants",
+        "test_work_queue_capacity",
+        "test_http2_preface",
+        "test_http2_preface_detection",
+        "test_keep_alive_decision",
+        "test_server_shutdown_flag",
+        "test_inflight_counter",
+        "test_wait_inflight_drained",
+        "test_route_request",
+        "test_describe_config",
+        "test_http2_frame_layout",
+        "test_preface_exact_bytes"
+    ]
+    let mut i: int = 0
+    while i < tests.len() {
+        let name: str = tests.get(i)
+        println("RUN  " + name)
+        # Dispatch on the test name — HLS doesn't have function
+        # pointers, so we use an if-else chain.
+        if name == "test_default_config" {
+            let _r: int = test_default_config()
+        } else if name == "test_config_overrides" {
+            let _r: int = test_config_overrides()
+        } else if name == "test_default_constants" {
+            let _r: int = test_default_constants()
+        } else if name == "test_work_queue_capacity" {
+            let _r: int = test_work_queue_capacity()
+        } else if name == "test_http2_preface" {
+            let _r: int = test_http2_preface()
+        } else if name == "test_http2_preface_detection" {
+            let _r: int = test_http2_preface_detection()
+        } else if name == "test_keep_alive_decision" {
+            let _r: int = test_keep_alive_decision()
+        } else if name == "test_server_shutdown_flag" {
+            let _r: int = test_server_shutdown_flag()
+        } else if name == "test_inflight_counter" {
+            let _r: int = test_inflight_counter()
+        } else if name == "test_wait_inflight_drained" {
+            let _r: int = test_wait_inflight_drained()
+        } else if name == "test_route_request" {
+            let _r: int = test_route_request()
+        } else if name == "test_describe_config" {
+            let _r: int = test_describe_config()
+        } else if name == "test_http2_frame_layout" {
+            let _r: int = test_http2_frame_layout()
+        } else if name == "test_preface_exact_bytes" {
+            let _r: int = test_preface_exact_bytes()
+        }
+        println("PASS " + name)
+        passed = passed + 1
+        i = i + 1
+    }
+    println("")
+    println("=== " + passed.to_str() + "/" + tests.len().to_str() + " tests PASSED ===")
+    return 0
+}
+
+fn main() -> int uses IO, Conc, Clock {
+    return run_tests()
+}

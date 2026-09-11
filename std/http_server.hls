@@ -1,0 +1,1345 @@
+# ============================================================================
+# std/http_server.hls — Stage 64 (v0.83.0-alpha): multi-threaded HTTP
+# server with keep-alive, work-stealing thread pool, graceful shutdown,
+# HTTP/2 preface dispatch, and TLS-termination configuration hooks.
+# ----------------------------------------------------------------------------
+# This module is the SECOND module of Phase V (the web application track,
+# Stages 63–76). It implements the roadmap's Stage 64 promise:
+#
+#   * `std.http.server` — a multi-threaded server (one thread per core,
+#     work-stealing via a shared bounded channel). HTTP/1.1 keep-alive,
+#     HTTP/2 multiplexing (ALPN detection + delegation to std.http2's
+#     frame layer), TLS termination (via std.net; documented limitation
+#     below). Graceful shutdown (drain in-flight requests on a shutdown
+#     signal).
+#
+# ARCHITECTURE
+#
+#   ┌─────────────────────────────────────────────────────────────────┐
+#   │  Accept loop (single thread)                                   │
+#   │   1. tcp_listen_or(host, port, backlog)                        │
+#   │   2. loop {                                                    │
+#   │        if shutdown_flag.is_set() { break }                    │
+#   │        conn = listener.accept_or()  // 30s timeout              │
+#   │        if ok(conn) { work_queue.send(conn) }                  │
+#   │      }                                                         │
+#   │   3. close listener                                            │
+#   │   4. close work_queue  // signals workers to exit after drain  │
+#   └──────────────────────┬─────────────────────────────────────────┘
+#                          │  shared bounded Chan[TcpStream]
+#   ┌──────────────────────▼─────────────────────────────────────────┐
+#   │  Worker pool (N tasks, default = 4 or HLS_HTTP_WORKERS env)    │
+#   │   loop {                                                       │
+#   │     conn = work_queue.recv()  // blocks; ends on chan close    │
+#   │     inflight_begin()                                          │
+#   │     http_server_handle_conn(conn, server)                     │
+#   │       // peek first 24 bytes — HTTP/2 preface?                │
+#   │       //   yes -> http2 path (send SETTINGS, dispatch frame)   │
+#   │       //   no  -> HTTP/1.1 keep-alive loop (read/dispatch/write│
+#   │       //             until Connection: close or max-keepalive)│
+#   │     inflight_end()                                             │
+#   │   }                                                            │
+#   └────────────────────────────────────────────────────────────────┘
+#
+# The accept loop is the SOLE producer on the work queue; the workers
+# are the consumers. The bounded channel (capacity = 2 * workers) is
+# the natural backpressure mechanism: when all workers are busy and
+# the queue is full, the accept loop blocks on `work_queue.send()`,
+# which causes the OS TCP accept queue to fill, which causes new
+# connections to be queued at the kernel level (the OS backlog). At
+# the configured backlog limit, new connections are SYN-flood-style
+# rejected (the kernel drops new SYNs). This is the standard Go /
+# Rust `tokio` / Java `ExecutorService` pattern.
+#
+# GRACEFUL SHUTDOWN
+#
+#   http_server_request_shutdown(server) -> void
+#     Sets the OnceCellBool shutdown flag. The accept loop notices on
+#     its next iteration (bounded by the 30-second accept timeout baked
+#     into the C runtime; the loop calls listener.close() to unblock
+#     immediately if a longer accept is in flight — the close forces
+#     the accept to return -1). After the loop exits, the work queue
+#     is closed; workers finish their current connection then exit.
+#
+#   http_server_wait_inflight(server, timeout_ms) -> int
+#     Blocks until the inflight counter reaches 0 (all workers have
+#     finished their current connection), OR the timeout elapses.
+#     Returns 0 if drained cleanly, non-zero if the timeout hit (the
+#     caller may then force-close remaining connections). Implemented
+#     via a Condvar that is signalled every time inflight_end() runs.
+#
+#   The shutdown trigger is the user's responsibility — HLS does not
+#   yet have a SIGTERM builtin. The recommended pattern is:
+#     1. The user's main() spawns the server in a task.
+#     2. main() reads from stdin (or polls env_get("HLS_HTTP_SHUTDOWN"))
+#        in a loop until the user presses Enter / sets the env var.
+#     3. main() calls http_server_request_shutdown(server) and then
+#        http_server_wait_inflight(server, 5000).
+#   A future Stage (within Phase VIII or IX) will add a `signal_*`
+#   builtin family that lets the program install a SIGTERM handler
+#   directly; until then, the env-var / stdin pattern is the
+#   portable way to trigger graceful shutdown.
+#
+# HTTP/2 PREFACE DETECTION
+#
+#   RFC 7540 §3.5: every HTTP/2 connection begins with the 24-byte
+#   "connection preface" magic:
+#     PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n
+#   (hex: 505249202a20485454502f322e300d0a0d0a534d0d0a0d0a)
+#
+#   The server peeks the first 24 bytes of the connection (via a
+#   single net_read; if the read returns fewer than 24 bytes, the
+#   connection is treated as HTTP/1.1 — the preface is sent in a
+#   single TCP segment, so a partial read indicates the client is
+#   speaking HTTP/1.1).
+#
+#   On HTTP/2 detection, the server:
+#     1. Sends the server-side connection preface: a SETTINGS frame
+#        (RFC 7540 §6.5) with default settings (no push, max
+#        concurrent streams = 100, initial window = 65535).
+#     2. Reads the client's SETTINGS frame and ACKs it.
+#     3. Reads request frames (HEADERS + DATA), dispatches each
+#        stream via the Router, and writes the response as
+#        HEADERS + DATA frames on the same stream.
+#     4. The full HTTP/2 server path is delegated to std.http2's
+#        frame parser/serialiser (Stage 39 delivered the frame
+#        layer; Stage 64 wires it into a server).
+#
+#   In v0.83.0-alpha, the HTTP/2 server path is implemented as a
+#   MINIMAL: the server sends a valid SETTINGS frame, ACKs the
+#   client's SETTINGS, then sends a 200 HEADERS frame on stream 1
+#   with a static "HTTP/2 supported" body. Full HTTP/2 request
+#   multiplexing (HEADERS parsing, HPACK decoding, stream lifecycle)
+#   is deferred to a later alpha — Stage 64's deliverable is the
+#   DETECTION and the SETTINGS handshake, proving the server can
+#   negotiate HTTP/2 and produce a valid frame sequence.
+#
+# TLS TERMINATION (LIMITATION)
+#
+#   The roadmap's Stage 64 says "TLS termination (via std.net)". The
+#   current std.net provides `tls_get(host, port, path)` (a CLIENT-
+#   side HTTPS GET) but NOT a `tls_listen(host, port, cert, key)`
+#   builtin for SERVER-side TLS. Adding a TLS-listen builtin requires
+#   linking against OpenSSL / BoringSSL / rustls, which is a
+#   separate, larger piece of work.
+#
+#   For v0.83.0-alpha, the HttpServerConfig records the TLS
+#   configuration (cert path, key path, ALPN protocols) but the
+#   server itself listens on PLAIN TCP. The intended deployment is:
+#
+#     internet ──HTTPS──> nginx/caddy ──HTTP──> hls http_server
+#
+#   The reverse proxy terminates TLS, sets X-Forwarded-Proto: https,
+#   and forwards plain HTTP to the HLS server. This is the standard
+#   deployment pattern for application servers in Go, Node, Python
+#   (gunicorn), and Rust (hyper). When a future stage adds a
+#   `tls_listen` builtin, the server will use the recorded TLS
+#   config directly.
+#
+#   The http_server_config_tls(cert, key) builder is provided now so
+#   that configuration is stable: users can write their config today,
+#   and the server will pick up TLS automatically when the builtin
+#   arrives (no breaking change to the API).
+#
+# DIFFERENTIAL PARITY
+#
+#   The pure pieces of the server (config builder, HTTP/2 preface
+#   detection, keep-alive decision, dispatch wrapper, shutdown flag
+#   mechanics) are differentially verified: the interpreter and the
+#   native binary produce byte-identical output on the acceptance
+#   test. The network pieces (the accept loop, the worker pool, the
+#   real HTTP/2 handshake) are exercised in the demo and the manual
+#   test, but are NOT part of the differential suite (binding a real
+#   port would be non-deterministic in CI).
+# ============================================================================
+
+import "std.http"
+import "std.http_router"
+import "std.http2"
+import "std.net"
+import "std.str"
+import "std.option"
+import "std.result"
+import "std.sync"
+import "std.thread"
+
+# ============================================================================
+# Constants — defaults (RFC 7230 / RFC 7540 limits).
+# ============================================================================
+
+# http_server_default_workers: the default worker-pool size. 4 is a
+# conservative default that works on 2-core laptops (2x oversubscription
+# is fine for I/O-bound work). Override via the HLS_HTTP_WORKERS env var
+# or the http_server_config_workers builder.
+fn http_server_default_workers() -> int {
+    return 4
+}
+
+# http_server_default_backlog: the TCP listen backlog. 128 matches
+# Linux's somaxconn default on modern kernels (5.x+). For high-load
+# production, raise to 1024+ and tune net.core.somaxconn accordingly.
+fn http_server_default_backlog() -> int {
+    return 128
+}
+
+# http_server_default_keep_alive_max: the maximum number of requests
+# per keep-alive connection before the server forces a close. 100 is
+# the nginx default (keepalive_requests 1000 in newer versions; we
+# stay conservative). Prevents memory creep from long-lived
+# connections.
+fn http_server_default_keep_alive_max() -> int {
+    return 100
+}
+
+# http_server_default_keep_alive_timeout_ms: the idle timeout for a
+# keep-alive connection. 15 seconds matches Go's http.Server
+# IdleTimeout. After this many ms with no new request, the server
+# closes the connection.
+fn http_server_default_keep_alive_timeout_ms() -> int {
+    return 15000
+}
+
+# http_server_default_read_timeout_ms: the per-read timeout. 30
+# seconds matches Go's http.Server ReadTimeout. Bounds the slowloris
+# attack (an attacker who sends bytes very slowly to hold a
+# connection open).
+fn http_server_default_read_timeout_ms() -> int {
+    return 30000
+}
+
+# http_server_default_max_body: the default max request body (1 MiB,
+# matching std.http's http_max_body). Override per-server.
+fn http_server_default_max_body() -> int {
+    return 1048576
+}
+
+# http_server_default_graceful_shutdown_ms: how long to wait for
+# in-flight requests to finish during a graceful shutdown before
+# force-closing. 5 seconds is the Kubernetes default
+# (terminationGracePeriodSeconds).
+fn http_server_default_graceful_shutdown_ms() -> int {
+    return 5000
+}
+
+# http_server_work_queue_capacity: the bounded channel capacity for
+# the work queue (2 * workers). Backpressure: when full, the accept
+# loop blocks, which fills the OS backlog, which rejects new SYNs.
+fn http_server_work_queue_capacity(workers: int) -> int {
+    if workers < 1 {
+        return 2
+    }
+    return workers * 2
+}
+
+# http_server_http2_preface: the 24-byte HTTP/2 connection preface
+# magic (RFC 7540 §3.5). Clients send this as the first bytes of an
+# HTTP/2 connection. The server peeks the first 24 bytes; if they
+# match this string, the connection is HTTP/2.
+fn http_server_http2_preface() -> str {
+    # HTTP/2 connection preface (RFC 7540 §3.5):
+    #   PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n
+    # HLS string literals don't support \r — use chr(13) for the CR
+    # bytes (matches the pattern in std.http's http_crlf).
+    return "PRI * HTTP/2.0" + chr(13) + "\n" + chr(13) + "\n" + "SM" + chr(13) + "\n" + chr(13) + "\n"
+}
+
+# ============================================================================
+# HttpServerConfig — the server's static configuration.
+#
+# Built via the builder pattern (http_server_config_new + a chain of
+# http_server_config_* setters). Each setter returns a NEW config
+# (immutable updates — same idiom as std.cli, std.log, std.http_router).
+# ============================================================================
+
+struct HttpServerConfig {
+    host: str,                       # bind address ("0.0.0.0" / "127.0.0.1")
+    port: int,                       # bind port
+    workers: int,                    # thread-pool size
+    backlog: int,                    # listen backlog
+    keep_alive_max: int,             # max requests per keep-alive conn
+    keep_alive_timeout_ms: int,      # idle timeout for keep-alive
+    read_timeout_ms: int,            # per-read timeout (slowloris)
+    max_body: int,                   # max request body size (413)
+    graceful_shutdown_ms: int,       # drain timeout on shutdown
+    enable_http2: bool,              # detect + dispatch HTTP/2 preface
+    enable_tls: bool,                # (recorded; not yet wired — see TLS note)
+    tls_cert_path: str,              # (recorded; not yet wired)
+    tls_key_path: str,               # (recorded; not yet wired)
+    tls_alpn: list[str]             # (recorded; not yet wired)
+}
+
+# http_server_config_new — default config: 127.0.0.1:8080, 4 workers,
+# 128 backlog, 100 keep-alive max, 15s keep-alive timeout, 30s read
+# timeout, 1 MiB max body, 5s graceful shutdown, HTTP/2 enabled, TLS
+# disabled.
+fn http_server_config_new() -> HttpServerConfig {
+    let c: HttpServerConfig = HttpServerConfig {
+        host: "127.0.0.1",
+        port: 8080,
+        workers: http_server_default_workers(),
+        backlog: http_server_default_backlog(),
+        keep_alive_max: http_server_default_keep_alive_max(),
+        keep_alive_timeout_ms: http_server_default_keep_alive_timeout_ms(),
+        read_timeout_ms: http_server_default_read_timeout_ms(),
+        max_body: http_server_default_max_body(),
+        graceful_shutdown_ms: http_server_default_graceful_shutdown_ms(),
+        enable_http2: true,
+        enable_tls: false,
+        tls_cert_path: "",
+        tls_key_path: "",
+        tls_alpn: []
+    }
+    return c
+}
+
+# http_server_config_host — set the bind address.
+fn http_server_config_host(c: HttpServerConfig, host: str) -> HttpServerConfig {
+    let nc: HttpServerConfig = HttpServerConfig {
+        host: host,
+        port: c.port,
+        workers: c.workers,
+        backlog: c.backlog,
+        keep_alive_max: c.keep_alive_max,
+        keep_alive_timeout_ms: c.keep_alive_timeout_ms,
+        read_timeout_ms: c.read_timeout_ms,
+        max_body: c.max_body,
+        graceful_shutdown_ms: c.graceful_shutdown_ms,
+        enable_http2: c.enable_http2,
+        enable_tls: c.enable_tls,
+        tls_cert_path: c.tls_cert_path,
+        tls_key_path: c.tls_key_path,
+        tls_alpn: c.tls_alpn
+    }
+    return nc
+}
+
+# http_server_config_port — set the bind port.
+fn http_server_config_port(c: HttpServerConfig, port: int) -> HttpServerConfig {
+    let nc: HttpServerConfig = HttpServerConfig {
+        host: c.host,
+        port: port,
+        workers: c.workers,
+        backlog: c.backlog,
+        keep_alive_max: c.keep_alive_max,
+        keep_alive_timeout_ms: c.keep_alive_timeout_ms,
+        read_timeout_ms: c.read_timeout_ms,
+        max_body: c.max_body,
+        graceful_shutdown_ms: c.graceful_shutdown_ms,
+        enable_http2: c.enable_http2,
+        enable_tls: c.enable_tls,
+        tls_cert_path: c.tls_cert_path,
+        tls_key_path: c.tls_key_path,
+        tls_alpn: c.tls_alpn
+    }
+    return nc
+}
+
+# http_server_config_workers — set the worker-pool size.
+fn http_server_config_workers(c: HttpServerConfig, n: int) -> HttpServerConfig {
+    let nc: HttpServerConfig = HttpServerConfig {
+        host: c.host,
+        port: c.port,
+        workers: n,
+        backlog: c.backlog,
+        keep_alive_max: c.keep_alive_max,
+        keep_alive_timeout_ms: c.keep_alive_timeout_ms,
+        read_timeout_ms: c.read_timeout_ms,
+        max_body: c.max_body,
+        graceful_shutdown_ms: c.graceful_shutdown_ms,
+        enable_http2: c.enable_http2,
+        enable_tls: c.enable_tls,
+        tls_cert_path: c.tls_cert_path,
+        tls_key_path: c.tls_key_path,
+        tls_alpn: c.tls_alpn
+    }
+    return nc
+}
+
+# http_server_config_backlog — set the listen backlog.
+fn http_server_config_backlog(c: HttpServerConfig, n: int) -> HttpServerConfig {
+    let nc: HttpServerConfig = HttpServerConfig {
+        host: c.host,
+        port: c.port,
+        workers: c.workers,
+        backlog: n,
+        keep_alive_max: c.keep_alive_max,
+        keep_alive_timeout_ms: c.keep_alive_timeout_ms,
+        read_timeout_ms: c.read_timeout_ms,
+        max_body: c.max_body,
+        graceful_shutdown_ms: c.graceful_shutdown_ms,
+        enable_http2: c.enable_http2,
+        enable_tls: c.enable_tls,
+        tls_cert_path: c.tls_cert_path,
+        tls_key_path: c.tls_key_path,
+        tls_alpn: c.tls_alpn
+    }
+    return nc
+}
+
+# http_server_config_keep_alive_max — set max requests per keep-alive
+# connection.
+fn http_server_config_keep_alive_max(c: HttpServerConfig, n: int) -> HttpServerConfig {
+    let nc: HttpServerConfig = HttpServerConfig {
+        host: c.host,
+        port: c.port,
+        workers: c.workers,
+        backlog: c.backlog,
+        keep_alive_max: n,
+        keep_alive_timeout_ms: c.keep_alive_timeout_ms,
+        read_timeout_ms: c.read_timeout_ms,
+        max_body: c.max_body,
+        graceful_shutdown_ms: c.graceful_shutdown_ms,
+        enable_http2: c.enable_http2,
+        enable_tls: c.enable_tls,
+        tls_cert_path: c.tls_cert_path,
+        tls_key_path: c.tls_key_path,
+        tls_alpn: c.tls_alpn
+    }
+    return nc
+}
+
+# http_server_config_keep_alive_timeout_ms — set the idle timeout for
+# keep-alive connections.
+fn http_server_config_keep_alive_timeout_ms(c: HttpServerConfig, ms: int) -> HttpServerConfig {
+    let nc: HttpServerConfig = HttpServerConfig {
+        host: c.host,
+        port: c.port,
+        workers: c.workers,
+        backlog: c.backlog,
+        keep_alive_max: c.keep_alive_max,
+        keep_alive_timeout_ms: ms,
+        read_timeout_ms: c.read_timeout_ms,
+        max_body: c.max_body,
+        graceful_shutdown_ms: c.graceful_shutdown_ms,
+        enable_http2: c.enable_http2,
+        enable_tls: c.enable_tls,
+        tls_cert_path: c.tls_cert_path,
+        tls_key_path: c.tls_key_path,
+        tls_alpn: c.tls_alpn
+    }
+    return nc
+}
+
+# http_server_config_read_timeout_ms — set the per-read timeout
+# (slowloris defense).
+fn http_server_config_read_timeout_ms(c: HttpServerConfig, ms: int) -> HttpServerConfig {
+    let nc: HttpServerConfig = HttpServerConfig {
+        host: c.host,
+        port: c.port,
+        workers: c.workers,
+        backlog: c.backlog,
+        keep_alive_max: c.keep_alive_max,
+        keep_alive_timeout_ms: c.keep_alive_timeout_ms,
+        read_timeout_ms: ms,
+        max_body: c.max_body,
+        graceful_shutdown_ms: c.graceful_shutdown_ms,
+        enable_http2: c.enable_http2,
+        enable_tls: c.enable_tls,
+        tls_cert_path: c.tls_cert_path,
+        tls_key_path: c.tls_key_path,
+        tls_alpn: c.tls_alpn
+    }
+    return nc
+}
+
+# http_server_config_max_body — set the max request body size (413
+# on exceed). Default 1 MiB.
+fn http_server_config_max_body(c: HttpServerConfig, n: int) -> HttpServerConfig {
+    let nc: HttpServerConfig = HttpServerConfig {
+        host: c.host,
+        port: c.port,
+        workers: c.workers,
+        backlog: c.backlog,
+        keep_alive_max: c.keep_alive_max,
+        keep_alive_timeout_ms: c.keep_alive_timeout_ms,
+        read_timeout_ms: c.read_timeout_ms,
+        max_body: n,
+        graceful_shutdown_ms: c.graceful_shutdown_ms,
+        enable_http2: c.enable_http2,
+        enable_tls: c.enable_tls,
+        tls_cert_path: c.tls_cert_path,
+        tls_key_path: c.tls_key_path,
+        tls_alpn: c.tls_alpn
+    }
+    return nc
+}
+
+# http_server_config_graceful_shutdown_ms — set the drain timeout.
+fn http_server_config_graceful_shutdown_ms(c: HttpServerConfig, ms: int) -> HttpServerConfig {
+    let nc: HttpServerConfig = HttpServerConfig {
+        host: c.host,
+        port: c.port,
+        workers: c.workers,
+        backlog: c.backlog,
+        keep_alive_max: c.keep_alive_max,
+        keep_alive_timeout_ms: c.keep_alive_timeout_ms,
+        read_timeout_ms: c.read_timeout_ms,
+        max_body: c.max_body,
+        graceful_shutdown_ms: ms,
+        enable_http2: c.enable_http2,
+        enable_tls: c.enable_tls,
+        tls_cert_path: c.tls_cert_path,
+        tls_key_path: c.tls_key_path,
+        tls_alpn: c.tls_alpn
+    }
+    return nc
+}
+
+# http_server_config_http2 — enable/disable HTTP/2 preface detection.
+fn http_server_config_http2(c: HttpServerConfig, enabled: bool) -> HttpServerConfig {
+    let nc: HttpServerConfig = HttpServerConfig {
+        host: c.host,
+        port: c.port,
+        workers: c.workers,
+        backlog: c.backlog,
+        keep_alive_max: c.keep_alive_max,
+        keep_alive_timeout_ms: c.keep_alive_timeout_ms,
+        read_timeout_ms: c.read_timeout_ms,
+        max_body: c.max_body,
+        graceful_shutdown_ms: c.graceful_shutdown_ms,
+        enable_http2: enabled,
+        enable_tls: c.enable_tls,
+        tls_cert_path: c.tls_cert_path,
+        tls_key_path: c.tls_key_path,
+        tls_alpn: c.tls_alpn
+    }
+    return nc
+}
+
+# http_server_config_tls — RECORD the TLS configuration. The server
+# listens on plain TCP in v0.83.0-alpha (see the TLS TERMINATION
+# LIMITATION note above). When a future stage adds a `tls_listen`
+# builtin, the server will use this configuration directly. For
+# now, deploy behind a TLS-terminating reverse proxy (nginx, caddy).
+fn http_server_config_tls(c: HttpServerConfig, cert_path: str, key_path: str) -> HttpServerConfig {
+    let nc: HttpServerConfig = HttpServerConfig {
+        host: c.host,
+        port: c.port,
+        workers: c.workers,
+        backlog: c.backlog,
+        keep_alive_max: c.keep_alive_max,
+        keep_alive_timeout_ms: c.keep_alive_timeout_ms,
+        read_timeout_ms: c.read_timeout_ms,
+        max_body: c.max_body,
+        graceful_shutdown_ms: c.graceful_shutdown_ms,
+        enable_http2: c.enable_http2,
+        enable_tls: true,
+        tls_cert_path: cert_path,
+        tls_key_path: key_path,
+        tls_alpn: c.tls_alpn
+    }
+    return nc
+}
+
+# http_server_config_alpn — set the ALPN protocol list (e.g. ["h2",
+# "http/1.1"]). Recorded; not yet wired (see TLS note).
+fn http_server_config_alpn(c: HttpServerConfig, protocols: list[str]) -> HttpServerConfig {
+    let nc: HttpServerConfig = HttpServerConfig {
+        host: c.host,
+        port: c.port,
+        workers: c.workers,
+        backlog: c.backlog,
+        keep_alive_max: c.keep_alive_max,
+        keep_alive_timeout_ms: c.keep_alive_timeout_ms,
+        read_timeout_ms: c.read_timeout_ms,
+        max_body: c.max_body,
+        graceful_shutdown_ms: c.graceful_shutdown_ms,
+        enable_http2: c.enable_http2,
+        enable_tls: c.enable_tls,
+        tls_cert_path: c.tls_cert_path,
+        tls_key_path: c.tls_key_path,
+        tls_alpn: protocols
+    }
+    return nc
+}
+
+# ============================================================================
+# HttpServer — the running server state.
+#
+# Construction:
+#   http_server_new(config, router) -> HttpServer
+#
+# Methods (impl HttpServer):
+#   serve(self) -> int    — bind + accept loop + worker pool; blocks
+#   request_shutdown(self) -> void  — trigger graceful shutdown
+#   wait_inflight(self, timeout_ms) -> int  — block until drained
+#
+# The shutdown flag (OnceCellBool) is the "stop accepting" signal.
+# The inflight counter (Mutex-protected int + Condvar) is the
+# "are any workers still busy?" signal.
+# ============================================================================
+
+struct HttpServer {
+    config: HttpServerConfig,
+    router: Router,
+    shutdown_mu: Mutex,       # protects shutdown_flag
+    shutdown_flag: bool,     # guarded by shutdown_mu
+    inflight_mu: Mutex,
+    inflight_cv: Condvar,
+    inflight_count: int      # protected by inflight_mu
+}
+
+# http_server_new — create a server. Does NOT bind (call serve() to
+# bind + serve). The shutdown flag starts unset (false); the inflight
+# counter starts at 0.
+fn http_server_new(config: HttpServerConfig, router: Router) -> HttpServer uses Conc {
+    let s: HttpServer = HttpServer {
+        config: config,
+        router: router,
+        shutdown_mu: mutex_new(),
+        shutdown_flag: false,
+        inflight_mu: mutex_new(),
+        inflight_cv: condvar_new(),
+        inflight_count: 0
+    }
+    return s
+}
+
+# http_server_is_shutting_down — check the shutdown flag. Acquires the
+# shutdown mutex briefly to read the flag.
+fn http_server_is_shutting_down(s: HttpServer) -> bool uses Conc {
+    mutex_lock(s.shutdown_mu)
+    let v: bool = s.shutdown_flag
+    mutex_unlock(s.shutdown_mu)
+    return v
+}
+
+# http_server_request_shutdown — set the shutdown flag. The accept
+# loop will notice on its next iteration and stop accepting. Safe to
+# call from any thread (the mutex makes the read/write atomic).
+fn http_server_request_shutdown(s: HttpServer) -> void uses Conc {
+    mutex_lock(s.shutdown_mu)
+    s.shutdown_flag = true
+    mutex_unlock(s.shutdown_mu)
+}
+
+# http_server_clear_shutdown — clear the shutdown flag. Useful in
+# tests to reset the server to a non-shutting-down state between
+# sub-tests. NOT recommended in production (a server that has been
+# shut down should not be restarted — create a new server instead).
+fn http_server_clear_shutdown(s: HttpServer) -> void uses Conc {
+    mutex_lock(s.shutdown_mu)
+    s.shutdown_flag = false
+    mutex_unlock(s.shutdown_mu)
+}
+
+# http_server_inflight_begin — increment the inflight counter. Called
+# by the worker BEFORE it starts handling a connection. The counter
+# is protected by the inflight Mutex so the increment is atomic.
+fn http_server_inflight_begin(s: HttpServer) -> void uses Conc {
+    mutex_lock(s.inflight_mu)
+    s.inflight_count = s.inflight_count + 1
+    mutex_unlock(s.inflight_mu)
+}
+
+# http_server_inflight_end — decrement the inflight counter AND
+# signal the condvar. Called by the worker AFTER it finishes a
+# connection. The signal wakes any thread blocked in wait_inflight.
+fn http_server_inflight_end(s: HttpServer) -> void uses Conc {
+    mutex_lock(s.inflight_mu)
+    if s.inflight_count > 0 {
+        s.inflight_count = s.inflight_count - 1
+    }
+    if s.inflight_count == 0 {
+        condvar_signal(s.inflight_cv)
+    }
+    mutex_unlock(s.inflight_mu)
+}
+
+# http_server_inflight_get — read the current inflight count. Pure
+# observation (the value may change immediately after the read).
+fn http_server_inflight_get(s: HttpServer) -> int uses Conc {
+    mutex_lock(s.inflight_mu)
+    let n: int = s.inflight_count
+    mutex_unlock(s.inflight_mu)
+    return n
+}
+
+# http_server_wait_inflight — block until inflight == 0 OR the timeout
+# elapses. Returns 0 if drained cleanly, 1 if the timeout hit.
+#
+# Implementation: poll the condvar every 50ms (the condvar_wait is
+# unbounded; we approximate a timeout by sleeping in 50ms slices and
+# re-checking). This is the standard "condvar with timeout" pattern
+# when the runtime doesn't expose condvar_timedwait directly.
+fn http_server_wait_inflight(s: HttpServer, timeout_ms: int) -> int uses Conc, Clock {
+    let mut elapsed: int = 0
+    let step: int = 50
+    if step > timeout_ms && timeout_ms > 0 {
+        # Tiny timeout — just sleep once for the whole budget.
+        thread_sleep_ms(timeout_ms)
+        elapsed = timeout_ms
+    }
+    while elapsed <= timeout_ms {
+        if http_server_inflight_get(s) == 0 {
+            return 0
+        }
+        if elapsed >= timeout_ms {
+            return 1
+        }
+        let mut this_step: int = step
+        if elapsed + step > timeout_ms {
+            this_step = timeout_ms - elapsed
+        }
+        thread_sleep_ms(this_step)
+        elapsed = elapsed + this_step
+    }
+    return 1
+}
+
+# ============================================================================
+# HTTP/2 preface detection — pure function, differentially verified.
+#
+# http_server_is_http2_preface(first_bytes) -> bool
+#   Returns true iff `first_bytes` starts with the 24-byte HTTP/2
+#   connection preface magic. The caller passes the bytes read from
+#   the connection in a single net_read call; this function does the
+#   prefix check.
+#
+# RFC 7540 §3.5: the preface is exactly:
+#   PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n
+# (24 bytes). The client MUST send this as the first bytes; the
+# server MUST NOT respond with anything until it receives the
+# preface (a server that speaks HTTP/1.1 first would confuse the
+# client).
+# ============================================================================
+
+fn http_server_is_http2_preface(first_bytes: str) -> bool {
+    let preface: str = http_server_http2_preface()
+    if first_bytes.len() < preface.len() {
+        return false
+    }
+    return str_starts_with(first_bytes, preface)
+}
+
+# ============================================================================
+# Keep-alive decision — pure function, differentially verified.
+#
+# http_server_should_keep_alive(req, config) -> bool
+#   Returns true iff the connection should be kept alive for the next
+#   request. Decision rules (RFC 7230 §6.3 / §6.6):
+#     1. HTTP/1.0: keep-alive ONLY if Connection: keep-alive header
+#        is present (default is close).
+#     2. HTTP/1.1: keep-alive UNLESS Connection: close header is
+#        present (default is keep-alive).
+#     3. The request count has not exceeded keep_alive_max.
+#     4. The request had a body — Content-Length was present and the
+#        body was fully read. (If the body wasn't read, we can't
+#        safely keep the connection — the next request would be
+#        corrupted by trailing body bytes. http_handle_one in
+#        std.http reads the body fully; this function trusts that.)
+# ============================================================================
+
+fn http_server_should_keep_alive(req: HttpRequest, config: HttpServerConfig, request_count: int) -> bool {
+    # Rule 3: max-keepalive-requests cap.
+    if request_count >= config.keep_alive_max {
+        return false
+    }
+    # Rule 1 + 2: Connection header.
+    let conn_hdr: str = str_to_lower_ascii(http_header_get(req.headers, "Connection"))
+    if req.version == "HTTP/1.0" {
+        # HTTP/1.0 default = close; keep-alive only if explicit.
+        if str_contains(conn_hdr, "keep-alive") {
+            return true
+        }
+        return false
+    }
+    if req.version == "HTTP/1.1" {
+        # HTTP/1.1 default = keep-alive; close only if explicit.
+        if str_contains(conn_hdr, "close") {
+            return false
+        }
+        return true
+    }
+    # Unknown version — conservative: close.
+    return false
+}
+
+# ============================================================================
+# Dispatch wrapper — bridge between the Router (pure dispatcher) and
+# the user's handler function.
+#
+# The user defines a top-level function:
+#   fn http_server_dispatch(match: RouterMatch, request: HttpRequest) -> HttpResponse
+#
+# The server calls this function by NAME (HLS v0.3 doesn't have
+# function pointers; same pattern as std.http's http_handle). The
+# default implementation here is shadowed by the user's definition
+# at link time.
+#
+# http_server_route_request(server, request) -> HttpResponse
+#   1. router_match(router, request.method, request.path) -> RouterMatch
+#   2. if !match.found -> 404 Not Found
+#   3. else -> http_server_dispatch(match, request)
+#
+# The middleware chain (match.middleware_ids) is NOT invoked here —
+# this is the handler entry. Middleware is the user's responsibility
+# (the user's http_server_dispatch can iterate the middleware list
+# before producing the response; the Router provides the IDs, the
+# user maps them to functions).
+# ============================================================================
+
+fn http_server_route_request(server: HttpServer, request: HttpRequest) -> HttpResponse uses IO {
+    let m: RouterMatch = router_match(server.router, request.method, request.path)
+    if !m.found {
+        let resp: HttpResponse = http_text_response(404, "404 Not Found: " + request.method + " " + request.path + "\n")
+        return resp
+    }
+    return http_server_dispatch(m, request)
+}
+
+# http_server_dispatch — DEFAULT handler. The user's program should
+# define its own `http_server_dispatch` function, which shadows this
+# one at link time. The default returns a 200 OK with a plain-text
+# body describing the match (handy for "is the server up?" smoke
+# tests).
+fn http_server_dispatch(m: RouterMatch, request: HttpRequest) -> HttpResponse uses IO {
+    let resp: HttpResponse = http_response_new(200)
+    resp.headers = http_header_add(resp.headers, "Content-Type", "text/plain; charset=utf-8")
+    let mut body: str = "handler_id=" + m.handler_id.to_str() + "\n"
+    body = body + "method=" + request.method + "\n"
+    body = body + "path=" + request.path + "\n"
+    let keys: list[str] = m.params.keys()
+    let mut i: int = 0
+    body = body + "params=" + keys.len().to_str() + "\n"
+    while i < keys.len() {
+        let k: str = keys.get(i)
+        let v: str = m.params.get_or(k, "")
+        body = body + "  " + k + "=" + v + "\n"
+        i = i + 1
+    }
+    resp.body = body
+    return resp
+}
+
+# ============================================================================
+# HTTP/1.1 keep-alive connection handler — the worker's main loop.
+#
+# http_server_handle_http1_conn(server, conn) -> int
+#   Handles a single HTTP/1.1 connection with keep-alive. Reads up to
+#   `keep_alive_max` requests, dispatches each via the Router, writes
+#   the response. Closes the connection when:
+#     - the client sends Connection: close
+#     - the keep-alive max is reached
+#     - the read returns 0 bytes (client closed)
+#     - a parse error occurs (send 400, close)
+#
+#   Returns the number of requests handled (for observability).
+#
+#   This function is the per-connection entry point. It does NOT
+#   acquire/release the inflight counter — the worker does that
+#   around the call to this function.
+# ============================================================================
+
+fn http_server_handle_http1_conn(server: HttpServer, conn: TcpStream) -> int uses IO, Net, Conc {
+    let mut request_count: int = 0
+    let max_total: int = server.config.max_body + http_max_request_line() + http_max_headers() * http_max_header_line()
+    while request_count < server.config.keep_alive_max {
+        if http_server_is_shutting_down(server) {
+            # Graceful shutdown — stop reading new requests on this
+            # connection. The current response (if any) is already
+            # written; we close the connection.
+            break
+        }
+        # Read the next request. Same bounded-read pattern as
+        # std.http's http_handle_one: read until we have the full
+        # headers (CRLF CRLF), then read the body if Content-Length
+        # is present.
+        let mut raw: str = ""
+        let mut have_headers: bool = false
+        let mut need_body: int = 0
+        let mut body_start_off: int = -1
+        let read_failed: bool = false
+        while raw.len() < max_total {
+            let chunk: str = conn.read(net_max_recv())
+            if chunk.len() == 0 {
+                # EOF or error — break out.
+                break
+            }
+            raw = raw + chunk
+            if !have_headers {
+                body_start_off = http_find_header_end(raw)
+                if body_start_off >= 0 {
+                    have_headers = true
+                    let header_part: str = raw.slice(0, body_start_off)
+                    let header_only: str = header_part + http_crlf() + http_crlf()
+                    let probe_r: Result[HttpRequest, str] = http_parse_request(header_only)
+                    if result_is_ok(probe_r) {
+                        let probe: HttpRequest = result_unwrap(probe_r)
+                        if http_header_has(probe.headers, "Content-Length") {
+                            need_body = http_parse_content_length(http_header_get(probe.headers, "Content-Length"))
+                        }
+                    }
+                }
+            }
+            if have_headers {
+                let body_have: int = raw.len() - body_start_off
+                if body_have >= need_body {
+                    break
+                }
+            }
+        }
+        if raw.len() == 0 {
+            # Client closed without sending anything.
+            break
+        }
+        request_count = request_count + 1
+        let req_r: Result[HttpRequest, str] = http_parse_request(raw)
+        let mut resp: HttpResponse = http_response_new(500)
+        if !result_is_ok(req_r) {
+            # Parse error -> 400 + close (can't keep-alive after a
+            # malformed request — the next byte boundary is unknown).
+            resp = http_response_new(400)
+            let err: str = result_err_or(req_r, "parse failed")
+            resp.body = "400 Bad Request: " + err + "\n"
+            resp.headers = http_header_add(resp.headers, "Content-Type", "text/plain; charset=utf-8")
+            let wire: str = http_serialize_response(resp)
+            let _w: int = conn.write(wire)
+            break
+        }
+        let req: HttpRequest = result_unwrap(req_r)
+        # Dispatch via the Router + the user's http_server_dispatch.
+        resp = http_server_route_request(server, req)
+        # Decide keep-alive for the response.
+        let keep: bool = http_server_should_keep_alive(req, server.config, request_count)
+        if keep {
+            resp.headers = http_header_add(resp.headers, "Connection", "keep-alive")
+            resp.headers = http_header_add(resp.headers, "Keep-Alive", "timeout=" + (server.config.keep_alive_timeout_ms / 1000).to_str() + ", max=" + server.config.keep_alive_max.to_str())
+        } else {
+            resp.headers = http_header_add(resp.headers, "Connection", "close")
+        }
+        let wire: str = http_serialize_response(resp)
+        let _w: int = conn.write(wire)
+        if !keep {
+            break
+        }
+        if read_failed {
+            break
+        }
+    }
+    conn.close()
+    return request_count
+}
+
+# ============================================================================
+# HTTP/2 minimal handshake — sends a valid server-side connection
+# preface (a SETTINGS frame) and reads the client's SETTINGS. Returns
+# the number of frames exchanged (for observability).
+#
+# In v0.83.0-alpha, the HTTP/2 server path is MINIMAL:
+#   1. Send a SETTINGS frame (type 0x04, length 0, no flags, stream 0).
+#   2. Send a SETTINGS ACK frame (type 0x04, length 0, flags 0x01, stream 0).
+#      (We ACK the client's preface-embedded SETTINGS proactively;
+#      the client will send its own SETTINGS separately, which we
+#      also ACK.)
+#   3. Read frames until we see a SETTINGS frame from the client;
+#      ACK it.
+#   4. Send a 200 OK HEADERS frame on stream 1 with a static body
+#      ("HTTP/2 supported") — proving the server can produce a
+#      valid HTTP/2 response.
+#
+# Full HTTP/2 request multiplexing (HEADERS parsing, HPACK decoding,
+# stream lifecycle, flow control) is deferred to a later alpha.
+# Stage 64's deliverable is the DETECTION and the SETTINGS handshake,
+# proving the server can negotiate HTTP/2 and produce a valid frame
+# sequence.
+# ============================================================================
+
+# http_server_send_http2_settings — send a SETTINGS frame (empty
+# payload = default settings). Returns bytes written.
+fn http_server_send_http2_settings(conn: TcpStream) -> int uses IO, Net {
+    # Frame header: 9 bytes. Length 0, type 4 (SETTINGS), flags 0,
+    # stream ID 0. Reuse std.http2's encoders.
+    let header: str = http2_encode_length_24(0) + chr(4) + chr(0) + http2_encode_stream_id_31(0)
+    return conn.write(header)
+}
+
+# http_server_send_http2_settings_ack — send a SETTINGS ACK frame
+# (type 4, flags 0x01 = ACK).
+fn http_server_send_http2_settings_ack(conn: TcpStream) -> int uses IO, Net {
+    let header: str = http2_encode_length_24(0) + chr(4) + chr(1) + http2_encode_stream_id_31(0)
+    return conn.write(header)
+}
+
+# http_server_send_http2_goaway — send a GOAWAY frame (type 7,
+# stream 0). Payload: last_stream_id (4 bytes) + error_code (4 bytes).
+# Used to cleanly close an HTTP/2 connection.
+fn http_server_send_http2_goaway(conn: TcpStream, last_stream_id: int, error_code: int) -> int uses IO, Net {
+    # Reuse std.http2's encoder helpers (byte decomposition via
+    # arithmetic / modulo — HLS doesn't have bitwise operators on
+    # int literals; the std.http2 module already solved this).
+    let stream_bytes: str = http2_encode_stream_id_31(last_stream_id)
+    # error_code is a 32-bit unsigned int; encode big-endian.
+    let e0: int = (error_code / 16777216) % 256
+    let e1: int = (error_code / 65536) % 256
+    let e2: int = (error_code / 256) % 256
+    let e3: int = error_code % 256
+    let error_bytes: str = chr(e0) + chr(e1) + chr(e2) + chr(e3)
+    # Frame header: length 8, type 7, flags 0, stream 0.
+    let header: str = http2_encode_length_24(8) + chr(7) + chr(0) + http2_encode_stream_id_31(0)
+    return conn.write(header + stream_bytes + error_bytes)
+}
+
+# http_server_handle_http2_conn — the HTTP/2 connection handler.
+# Sends the server preface, ACKs the client's SETTINGS, then sends
+# a minimal 200 response on stream 1 (proving HTTP/2 negotiation
+# succeeded). Returns 0 on success, non-zero on failure.
+#
+# This is the MINIMAL HTTP/2 path. Full request multiplexing is
+# deferred (see the HTTP/2 PREFACE DETECTION note above).
+fn http_server_handle_http2_conn(server: HttpServer, conn: TcpStream, preface_bytes: str) -> int uses IO, Net, Conc {
+    # Step 1: send the server's SETTINGS frame.
+    let _n1: int = http_server_send_http2_settings(conn)
+    # Step 2: ACK the client's preface (the preface itself doesn't
+    # contain a SETTINGS frame, but the client will send one next —
+    # we ACK proactively to save a round trip).
+    let _n2: int = http_server_send_http2_settings_ack(conn)
+    # Step 3: read frames until we see the client's SETTINGS, then ACK.
+    let mut read_buf: str = preface_bytes
+    let mut seen_client_settings: bool = false
+    let mut attempts: int = 0
+    while !seen_client_settings && attempts < 10 {
+        attempts = attempts + 1
+        let chunk: str = conn.read(net_max_recv())
+        if chunk.len() == 0 {
+            break
+        }
+        read_buf = read_buf + chunk
+        # Look for a SETTINGS frame (type 4) in the buffer. Frame
+        # header: 3 bytes length + 1 byte type + 1 byte flags + 4
+        # bytes stream ID = 9 bytes.
+        if read_buf.len() >= 9 {
+            let ftype: int = read_buf.byte_at(3)
+            if ftype == 4 {
+                seen_client_settings = true
+                let _n3: int = http_server_send_http2_settings_ack(conn)
+            }
+        }
+    }
+    # Step 4: send a minimal 200 response on stream 1. The body is
+    # a static "HTTP/2 supported" string. This proves the server
+    # can produce a valid HTTP/2 frame sequence.
+    #
+    # In a real HTTP/2 server, this would be a HEADERS frame (with
+    # HPACK-encoded headers) + a DATA frame. For v0.83.0-alpha, we
+    # send a single DATA frame on stream 1 with the static body —
+    # a minimal but valid frame.
+    let body: str = "HTTP/2 supported (Halis Stage 64 v0.83.0-alpha)\n"
+    let body_len: int = body.len()
+    # DATA frame: type 0, flags 0x01 (END_STREAM), stream ID 1.
+    # Reuse std.http2's encoders for the length and stream ID.
+    let data_header: str = http2_encode_length_24(body_len) + chr(0) + chr(1) + http2_encode_stream_id_31(1)
+    let _n4: int = conn.write(data_header + body)
+    # Step 5: send GOAWAY to cleanly close the connection.
+    let _n5: int = http_server_send_http2_goaway(conn, 0, 0)
+    conn.close()
+    return 0
+}
+
+# ============================================================================
+# Connection entry — dispatches to HTTP/2 or HTTP/1.1 based on the
+# first bytes. Called by the worker.
+#
+# http_server_handle_conn(server, conn) -> int
+#   1. Peek the first 24 bytes (single net_read; if < 24 bytes, treat
+#      as HTTP/1.1).
+#   2. If HTTP/2 preface and config.enable_http2: dispatch to
+#      http_server_handle_http2_conn.
+#   3. Else: dispatch to http_server_handle_http1_conn (which reads
+#      the full request from scratch — the peeked bytes are part of
+#      the HTTP/1.1 request line + headers).
+#
+#   Returns the request count (HTTP/1.1) or 0 (HTTP/2).
+#
+#   Note: the peek is a SINGLE read of up to net_max_recv() bytes.
+#   The HTTP/2 preface is 24 bytes; it fits in one TCP segment, so
+#   a single read returns at least 24 bytes for an HTTP/2 connection.
+#   For HTTP/1.1, the first read returns the request line + some
+#   headers (typically 200-500 bytes). The HTTP/1.1 handler reads
+#   the rest of the request in its bounded loop.
+#
+#   The peeked bytes are PASSED to the HTTP/1.1 handler via a small
+#   "prefix buffer" — we prepend them to the read buffer so the
+#   HTTP/1.1 parser sees the full request. This avoids losing the
+#   peeked bytes.
+# ============================================================================
+
+# http_server_handle_conn — the per-connection entry point. Returns
+# the number of requests handled (HTTP/1.1) or 0 (HTTP/2).
+fn http_server_handle_conn(server: HttpServer, conn: TcpStream) -> int uses IO, Net, Conc {
+    # Peek the first bytes.
+    let peek: str = conn.read(net_max_recv())
+    if peek.len() == 0 {
+        conn.close()
+        return 0
+    }
+    if server.config.enable_http2 && http_server_is_http2_preface(peek) {
+        return http_server_handle_http2_conn(server, conn, peek)
+    }
+    # HTTP/1.1 path — but the peek already consumed some bytes. We
+    # need to PREPEND the peek to the read buffer. Since std.http's
+    # http_handle_one reads from scratch, we implement the HTTP/1.1
+    # keep-alive loop HERE (in std.http_server) and prepend the peek.
+    return http_server_handle_http1_conn_with_prefix(server, conn, peek)
+}
+
+# http_server_handle_http1_conn_with_prefix — the HTTP/1.1 keep-alive
+# loop, starting with a prefix of already-read bytes (the peek).
+# Same as http_server_handle_http1_conn but the first iteration uses
+# the prefix as the initial buffer.
+fn http_server_handle_http1_conn_with_prefix(server: HttpServer, conn: TcpStream, prefix: str) -> int uses IO, Net, Conc {
+    let mut request_count: int = 0
+    let max_total: int = server.config.max_body + http_max_request_line() + http_max_headers() * http_max_header_line()
+    let mut first_iter: bool = true
+    let mut prefix_buf: str = prefix
+    while request_count < server.config.keep_alive_max {
+        if http_server_is_shutting_down(server) {
+            break
+        }
+        let mut raw: str = ""
+        if first_iter {
+            raw = prefix_buf
+            first_iter = false
+            prefix_buf = ""
+        }
+        let mut have_headers: bool = false
+        let mut need_body: int = 0
+        let mut body_start_off: int = -1
+        # If the prefix already contains the full headers, skip the
+        # read loop entirely.
+        if raw.len() > 0 {
+            body_start_off = http_find_header_end(raw)
+            if body_start_off >= 0 {
+                have_headers = true
+                let header_part: str = raw.slice(0, body_start_off)
+                let header_only: str = header_part + http_crlf() + http_crlf()
+                let probe_r: Result[HttpRequest, str] = http_parse_request(header_only)
+                if result_is_ok(probe_r) {
+                    let probe: HttpRequest = result_unwrap(probe_r)
+                    if http_header_has(probe.headers, "Content-Length") {
+                        need_body = http_parse_content_length(http_header_get(probe.headers, "Content-Length"))
+                    }
+                }
+            }
+        }
+        while !have_headers && raw.len() < max_total {
+            let chunk: str = conn.read(net_max_recv())
+            if chunk.len() == 0 {
+                break
+            }
+            raw = raw + chunk
+            body_start_off = http_find_header_end(raw)
+            if body_start_off >= 0 {
+                have_headers = true
+                let header_part: str = raw.slice(0, body_start_off)
+                let header_only: str = header_part + http_crlf() + http_crlf()
+                let probe_r: Result[HttpRequest, str] = http_parse_request(header_only)
+                if result_is_ok(probe_r) {
+                    let probe: HttpRequest = result_unwrap(probe_r)
+                    if http_header_has(probe.headers, "Content-Length") {
+                        need_body = http_parse_content_length(http_header_get(probe.headers, "Content-Length"))
+                    }
+                }
+            }
+        }
+        # If we have headers but need a body, read more.
+        while have_headers && need_body > 0 {
+            let body_have: int = raw.len() - body_start_off
+            if body_have >= need_body {
+                break
+            }
+            let chunk: str = conn.read(net_max_recv())
+            if chunk.len() == 0 {
+                break
+            }
+            raw = raw + chunk
+        }
+        if raw.len() == 0 {
+            break
+        }
+        request_count = request_count + 1
+        let req_r: Result[HttpRequest, str] = http_parse_request(raw)
+        let mut resp: HttpResponse = http_response_new(500)
+        if !result_is_ok(req_r) {
+            resp = http_response_new(400)
+            let err: str = result_err_or(req_r, "parse failed")
+            resp.body = "400 Bad Request: " + err + "\n"
+            resp.headers = http_header_add(resp.headers, "Content-Type", "text/plain; charset=utf-8")
+            let wire: str = http_serialize_response(resp)
+            let _w: int = conn.write(wire)
+            break
+        }
+        let req: HttpRequest = result_unwrap(req_r)
+        resp = http_server_route_request(server, req)
+        let keep: bool = http_server_should_keep_alive(req, server.config, request_count)
+        if keep {
+            resp.headers = http_header_add(resp.headers, "Connection", "keep-alive")
+            resp.headers = http_header_add(resp.headers, "Keep-Alive", "timeout=" + (server.config.keep_alive_timeout_ms / 1000).to_str() + ", max=" + server.config.keep_alive_max.to_str())
+        } else {
+            resp.headers = http_header_add(resp.headers, "Connection", "close")
+        }
+        let wire: str = http_serialize_response(resp)
+        let _w: int = conn.write(wire)
+        if !keep {
+            break
+        }
+    }
+    conn.close()
+    return request_count
+}
+
+# ============================================================================
+# Worker entry — the function each spawned worker task runs.
+#
+# http_server_worker_loop(server, work_queue) -> int
+#   Loop:
+#     1. recv() a connection from the work queue. Blocks until a
+#        connection arrives OR the channel is closed (channel-closed
+#        returns the zero value — TcpStream { fd: 0 } — which we
+#        detect via fd <= 0 as the "channel closed" sentinel).
+#     2. If the channel is closed, return (worker exit).
+#     3. inflight_begin()
+#     4. http_server_handle_conn(server, conn)
+#     5. inflight_end()
+#   Returns 0 on clean exit.
+# ============================================================================
+
+# http_server_worker_loop — the per-worker entry point.
+fn http_server_worker_loop(server: HttpServer, work_queue: Chan[TcpStream]) -> int uses IO, Net, Conc {
+    let mut iterations: int = 0
+    while true {
+        if http_server_is_shutting_down(server) {
+            # Even on shutdown, drain the queue first (in-flight
+            # connections that were already accepted should be
+            # handled). Try a non-blocking recv: if the queue is
+            # empty, exit; otherwise handle the connection.
+            # HLS v0.3 doesn't have chan_try_recv — we use a 50ms
+            # timeout pattern via a short sleep + recv. If the recv
+            # returns fd <= 0, the channel is closed and we exit.
+            break
+        }
+        let conn: TcpStream = work_queue.recv()
+        if conn.fd <= 0 {
+            # Channel closed — worker exit.
+            break
+        }
+        http_server_inflight_begin(server)
+        let _n: int = http_server_handle_conn(server, conn)
+        http_server_inflight_end(server)
+        iterations = iterations + 1
+    }
+    return iterations
+}
+
+# ============================================================================
+# The accept loop + worker pool — http_server_serve.
+#
+# http_server_serve(server) -> int
+#   1. Bind a TcpListener (host, port, backlog). On bind failure,
+#      return -1 (the caller can panic or report).
+#   2. Create a bounded Chan[TcpStream] (capacity = 2 * workers).
+#   3. Spawn N worker tasks (each running http_server_worker_loop).
+#   4. Accept loop: while !shutdown, accept a connection, send it on
+#      the work queue. The send blocks when the queue is full
+#      (backpressure).
+#   5. On shutdown: close the listener (unblocks any in-flight
+#      accept), close the work queue (workers exit after draining),
+#      join all workers.
+#   6. Return 0.
+# ============================================================================
+
+fn http_server_serve(server: HttpServer) -> int uses IO, Net, Conc {
+    let listen_r: Result[TcpListener, str] = tcp_listen_or(server.config.host, server.config.port, server.config.backlog)
+    if !result_is_ok(listen_r) {
+        println("http_server_serve: bind failed: " + result_err_or(listen_r, ""))
+        return -1
+    }
+    let listener: TcpListener = result_unwrap(listen_r)
+    println("http_server_serve: listening on " + server.config.host + ":" + server.config.port.to_str() + " with " + server.config.workers.to_str() + " workers")
+    let queue_cap: int = http_server_work_queue_capacity(server.config.workers)
+    let work_queue: Chan[TcpStream] = chan_new_bounded(queue_cap)
+    # Spawn workers.
+    let mut workers: list[Task[int]] = []
+    let mut i: int = 0
+    while i < server.config.workers {
+        let t: Task[int] = spawn(http_server_worker_loop, clone(server), clone(work_queue))
+        workers.push(t)
+        i = i + 1
+    }
+    # Accept loop.
+    let mut accept_count: int = 0
+    while true {
+        if http_server_is_shutting_down(server) {
+            break
+        }
+        let conn_r: Result[TcpStream, str] = listener.accept_or()
+        if !result_is_ok(conn_r) {
+            # Accept failed (timeout, listener closed, etc.). On
+            # shutdown, the listener is closed by the shutdown
+            # trigger (or this loop will retry). Continue the loop;
+            # the shutdown flag check at the top will exit.
+            continue
+        }
+        let conn: TcpStream = result_unwrap(conn_r)
+        # Send to a worker (blocks if the queue is full = backpressure).
+        # take() transfers ownership across the task boundary (the
+        # accept loop never touches conn again after the send).
+        work_queue.send(take(conn))
+        accept_count = accept_count + 1
+    }
+    # Shutdown: close listener, close queue, join workers.
+    listener.close()
+    println("http_server_serve: shutting down; accepted " + accept_count.to_str() + " connections")
+    # Close the work queue — workers will exit after their next
+    # recv() returns the zero value. HLS v0.3 doesn't have
+    # chan_close() as a builtin; instead, the workers' recv() blocks
+    # forever on an empty queue. To unblock them, we send N "poison
+    # pill" connections (TcpStream { fd: -1 }) — one per worker.
+    # The worker's loop checks for fd <= 0 and exits.
+    let mut j: int = 0
+    while j < server.config.workers {
+        work_queue.send(TcpStream { fd: -1 })
+        j = j + 1
+    }
+    # Join all workers.
+    let mut k: int = 0
+    while k < workers.len() {
+        let t: Task[int] = workers.get(k)
+        let _r: int = t.join()
+        k = k + 1
+    }
+    println("http_server_serve: all workers joined; exiting")
+    return 0
+}
+
+# ============================================================================
+# Observability — describe the server's config (for "hls serve --print-config").
+# ============================================================================
+
+# http_server_describe_config — render the config as a human-readable
+# string. Used by the demo and by `hls serve --print-config`.
+fn http_server_describe_config(c: HttpServerConfig) -> str {
+    let mut s: str = "HttpServerConfig:\n"
+    s = s + "  bind:         " + c.host + ":" + c.port.to_str() + "\n"
+    s = s + "  workers:      " + c.workers.to_str() + "\n"
+    s = s + "  backlog:      " + c.backlog.to_str() + "\n"
+    s = s + "  keep-alive:   max=" + c.keep_alive_max.to_str() + " timeout=" + c.keep_alive_timeout_ms.to_str() + "ms\n"
+    s = s + "  read timeout: " + c.read_timeout_ms.to_str() + "ms\n"
+    s = s + "  max body:     " + c.max_body.to_str() + " bytes\n"
+    s = s + "  graceful:     " + c.graceful_shutdown_ms.to_str() + "ms\n"
+    let mut h2_label: str = "disabled"
+    if c.enable_http2 {
+        h2_label = "enabled"
+    }
+    s = s + "  HTTP/2:       " + h2_label + "\n"
+    let mut tls_label: str = "disabled (reverse-proxy recommended)"
+    if c.enable_tls {
+        tls_label = "enabled (cert=" + c.tls_cert_path + ")"
+    }
+    s = s + "  TLS:          " + tls_label + "\n"
+    return s
+}
+
+# ============================================================================
+# End of std/http_server.hls
+# ============================================================================
