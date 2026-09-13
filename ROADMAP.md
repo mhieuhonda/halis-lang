@@ -119,7 +119,7 @@ remains green.
 | 69 | `std.template` — compile-time HTML templates (no XSS) | ✅ | (done in v0.88.0-alpha) |
 | 70 | `std.sse` — server-sent events (one-way streaming) | ✅ | (done in v0.89.0-alpha) |
 | 71 | `std.graphql` — schema-first server (parser + resolver) | ✅ | (done in v0.90.0-alpha) |
-| 72 | `std.openapi` — generate OpenAPI 3.1 from handler types | ⬜ | 4 weeks |
+| 72 | `std.openapi` — generate OpenAPI 3.1 from handler types | ✅ | (done in v0.91.0-alpha) |
 | 73 | `std.jsffi` — bind to JavaScript globals from `wasm32` | ⬜ | 5 weeks |
 | 74 | `std.dom` — server-side rendering (no client JS needed) | ⬜ | 4 weeks |
 | 75 | `hls-serve` — `webpack-dev-server` equivalent for HLS | ⬜ | 5 weeks |
@@ -8061,6 +8061,161 @@ POST/GET/400 flow, and the SDL round trip + JSON export. Fully
 deterministic (no Rand, no I/O beyond println).
 
 **Makefile target:** `make graphql-acceptance` — runs the demo and
+the acceptance test differentially (interpreter == native for both),
+then prints the feature summary. Pure-HLS implementation; no new
+compiler builtins; bootstrap is still deterministic.
+
+---
+
+## STAGE 72 — `std.openapi` — OpenAPI 3.1 from handler types ✅ (release v0.91.0-alpha)
+
+**Goal:** generate an OpenAPI 3.1 specification from the router's
+type signatures — every handler's request and response types become
+JSON Schema entries; the spec is served at `/openapi.json` and
+`/docs` (Swagger UI). HLS has no reflection, so "type signatures"
+are declared explicitly with descriptor builders and attached to the
+router by handler_id — the bridge guarantees the spec and the router
+agree on every documented endpoint.
+
+**Status (v0.91.0-alpha):** Stage 72 is **COMPLETE**. The new module
+`std/openapi.hls` (~1,750 lines) is a pure-HLS implementation on top
+of `std.json` (JsonValue + json_stringify + json_parse_result —
+Stage 10), `std.str`, `std.http` (HttpResponse + header helpers —
+Stage 38), `std.http_router` (Router/Route/router_mount — Stage 63),
+and `std.html` (html_escape for the page <head> — Stage 38).
+
+No new compiler builtins — the entire module is pure HLS.
+
+**Shipped in v0.91.0-alpha (Stage 72):**
+
+- **JSON Schema builders (JSON Schema 2020-12, the OpenAPI 3.1
+  dialect):** `OpenApiSchema` with typed constructors (`oa_empty`,
+  `oa_int`, `oa_int32`, `oa_float`, `oa_str`, `oa_str_format`,
+  `oa_bool`, `oa_str_enum`, `oa_array`, `oa_object` + `oa_prop`,
+  `oa_ref`) and immutable setters (`oa_nullable`,
+  `oa_with_description`, `oa_with_example`). Nullable values render
+  as 3.1-style type arrays (`"type": ["string", "null"]`), NOT the
+  3.0 `nullable: true`. Rendering (`oa_schema_to_json`) is
+  deterministic. **Every setter copies first** — HLS structs are
+  by-reference, so alias-then-mutate would corrupt the caller's
+  value; the tests verify the immutability of every builder class.
+
+- **Operation model:** `OpenApiParameter` (query/path/header,
+  path parameters forced required), `OpenApiRequestBody`,
+  `OpenApiResponse`, and `OpenApiOperation` with immutable setters
+  (summary, description, tags, parameters, request body, responses
+  with duplicate-status replacement, deprecated) — available as free
+  functions AND `impl` method forms for fluent chains.
+
+- **The ROUTER BRIDGE:** `oa_path_from_pattern` ("/users/:id" ->
+  "/users/{id}", `*` -> `{path}`); `openapi_from_router` walks the
+  Router's routes (recursing into sub-router mounts with their
+  prefixes): patterns become OpenAPI paths, implied `:param`
+  segments auto-generate required string path parameters (explicit
+  declarations win), operations attach through `OpenApiBinding`
+  (handler_id -> operation), ANY-wildcard routes use the operation's
+  declared method, unbound routes are SKIPPED (internal endpoints
+  stay undocumented), and bindings matching no route are an ERROR
+  (the spec must never document an endpoint the router cannot
+  dispatch).
+
+- **Document + validation:** `OpenApiDoc` (info/servers/operations/
+  components.schemas) with immutable builders;
+  `openapi_doc_add_operation` rejects duplicate path+method and
+  duplicate operationId; `openapi_validate` checks the spec's
+  invariants (path shape, responses present + described, path
+  template <-> declared parameters, required path parameters, `$ref`
+  targets resolve recursively).
+
+- **Rendering:** `openapi_to_json` / `openapi_to_json_str` emit the
+  full document with deterministic key order; paths group operations
+  by path (first-seen order) then method (lower-case keys — paths
+  keep their case).
+
+- **Serving:** `openapi_json_response` (/openapi.json — 200 +
+  application/json) and `openapi_docs_response` (/docs — Swagger UI
+  with the spec embedded INLINE so the page works from file:// too);
+  `openapi_docs_html_url` is the URL-fetching variant. **Script-
+  injection defence:** every `"</"` inside an embedded spec is
+  rewritten to `"<\/"` (a valid JSON escape) so string values can
+  never terminate the `<script>` block; `oa_js_string` applies
+  quote/backslash/breaker escaping for the URL variant. html_escape
+  is deliberately NOT used inside script contexts (it corrupts
+  URLs — "/" becomes "&#x2F;").
+
+**Security model:**
+
+- **THE SPEC CANNOT LIE:** bindings that match no route are
+  rejected; duplicate operations are rejected; the path templates
+  and the declared parameters must agree exactly.
+
+- **SCRIPT-INJECTION DEFENCE:** embedded specs escape the `</`
+  sequence (JSON stays valid); the URL variant escapes quotes,
+  backslashes, and the breaker sequence.
+
+- **NO SECRETS:** the document contains only what the caller
+  declares; nothing is introspected from the running program.
+
+**Limitations (deferred to later stages):**
+
+- **ONE MEDIA TYPE per request/response** (application/json); full
+  content-negotiation matrices arrive with the API-client stage.
+
+- **NO examples/links/webhooks/securitySchemes** objects (the auth
+  wiring stage will add securitySchemes).
+
+- **NO spec DIFFING or version migration** (OpenAPI 3.0 output can
+  be produced by post-processing the JSON — not automated yet).
+
+**Acceptance test** (`tests/ok/feat_stage72_openapi.hls`, ~800
+lines, 14 tests, all PASS):
+
+1. `test_schema_builders` — constructor kinds, formats, enum values,
+   array items, object properties, required flags.
+2. `test_schema_render` — exact JSON renderings (types, formats,
+   enums, items, properties + required, 3.1 nullable type arrays,
+   $ref, empty, descriptions, examples, nesting).
+3. `test_immutability` — every builder class (schema, operation,
+   request body, parameter, document) leaves its receiver untouched;
+   enum lists are copied; duplicate schemas replace by name.
+4. `test_pattern_conversion` — `:param` -> `{param}`, wildcards,
+   mixed patterns, leading params, parameter extraction.
+5. `test_doc_builders` — chaining, duplicate path+method rejection,
+   duplicate operationId rejection, empty operationId never
+   collides.
+6. `test_router_bridge` — 6 routes -> 5 documented operations (one
+   internal route skipped); pattern conversion; implied path
+   parameters; explicit query parameters survive; sub-router mount
+   contributes prefixed routes; the bridged document validates.
+7. `test_bridge_errors` — unbound bindings rejected; two routes
+   rendering to the same path+method rejected.
+8. `test_render_document` — top-level key order, info fields, path
+   grouping order, lower-case method keys, requestBody rendering,
+   response insertion order, no-content responses, tags.
+9. `test_validation` — 7 rejection cases (path shape, missing
+   responses, missing descriptions, undeclared template parameters,
+   orphan path parameters, dangling $refs — flat and nested) + a
+   valid document passing.
+10. `test_serving` — /openapi.json (status, content type, body ==
+    render), /docs (doctype, swagger div, bundle script, inline
+    spec), the URL variant.
+11. `test_docs_injection` — the `</script>` breaker is neutralised
+    inside the embedded spec; the escaped spec still parses as JSON.
+12. `test_js_string` — quote/backslash/breaker escaping rules.
+13. `test_constants` — version, locations, media types, status
+    codes, methods, kind codes, the template-to-pattern inverse.
+14. `test_end_to_end` — router + bindings + schemas -> validate ->
+    render -> serve; the rendered document round-trips through
+    std.json with path keys and implied parameters intact.
+
+**Demo** (`examples/openapi_demo.hls`, ~330 lines): a pet-shop API —
+six routes (including a mounted sub-router and an internal
+undocumented route), five named schemas (with enums, nullable
+fields, format hints, examples, and $refs), the bridge, validation,
+the complete JSON render, both serving endpoints, the script-
+injection defence, and an immutability check. Fully deterministic.
+
+**Makefile target:** `make openapi-acceptance` — runs the demo and
 the acceptance test differentially (interpreter == native for both),
 then prints the feature summary. Pure-HLS implementation; no new
 compiler builtins; bootstrap is still deterministic.

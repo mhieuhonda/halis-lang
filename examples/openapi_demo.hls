@@ -1,0 +1,259 @@
+# examples/openapi_demo.hls — Stage 72 (v0.91.0-alpha):
+# std.openapi demo — OpenAPI 3.1 generation from handler types.
+#
+# This demo exercises every piece of the std.openapi API:
+#   - JSON Schema builders (oa_int / oa_str / oa_str_enum / oa_array /
+#     oa_object / oa_ref / oa_nullable / with_description /
+#     with_example) — including the 3.1-style nullable type arrays
+#   - the ROUTER BRIDGE (openapi_from_router): a std.http_router
+#     Router with path params, a wildcard, and a MOUNTED SUB-ROUTER;
+#     bindings attach operations by handler_id; implied path
+#     parameters are auto-generated; an unbound internal route stays
+#     out of the spec
+#   - document assembly (openapi_doc_new + with_description /
+#     with_server / with_schema) — every builder is verified immutable
+#   - openapi_validate (the spec's invariants)
+#   - openapi_to_json_str rendering (deterministic key order)
+#   - serving: /openapi.json (openapi_json_response) and /docs
+#     (openapi_docs_response — Swagger UI with the spec embedded
+#     INLINE), plus the URL variant
+#   - the script-injection defence ("</" -> "<\/")
+#
+# The demo is PURE (no sockets) so the differential test
+# (interpreter == native) produces byte-identical output. Wiring
+# openapi_json_response / openapi_docs_response into an
+# std.http_server handler turns it into a live spec server.
+
+import "std.openapi"
+import "std.http"
+import "std.http_router"
+import "std.json"
+import "std.str"
+import "std.option"
+import "std.result"
+
+# ----------------------------------------------------------------------------
+# The demo API: a pet shop served by a router with six routes.
+# ----------------------------------------------------------------------------
+
+fn demo_router() -> Router {
+    let sub: Router = router_new()
+        .get("/reviews/:rid", 6)      # mounts under /pets -> /pets/reviews/{rid}
+    return router_new()
+        .get("/pets", 1)
+        .post("/pets", 2)
+        .get("/pets/:id", 3)
+        .put("/pets/:id", 4)
+        .delete("/pets/:id", 5)
+        .get("/admin/metrics", 9)     # unbound: internal, not documented
+        .mount("/pets", sub)
+}
+
+# The named schemas — every handler's request/response types become
+# JSON Schema entries here (the roadmap's promise).
+fn demo_schemas(doc: OpenApiDoc) -> OpenApiDoc {
+    let pet: OpenApiSchema = oa_object([
+        oa_prop("id", oa_int(), true),
+        oa_prop("name", oa_str(), true),
+        oa_prop("kind", oa_str_enum(["cat", "dog", "owl"]), true),
+        oa_prop("weight_kg", oa_nullable(oa_float()), false),
+        oa_prop("photo_urls", oa_array(oa_str_format("uri")), false),
+        oa_prop("owner", oa_ref("Owner"), false)
+    ]).with_description("A pet in the shop")
+    let owner: OpenApiSchema = oa_object([
+        oa_prop("id", oa_int(), true),
+        oa_prop("name", oa_str(), true),
+        oa_prop("email", oa_str_format("email"), true)
+    ])
+    let review: OpenApiSchema = oa_object([
+        oa_prop("id", oa_int(), true),
+        oa_prop("stars", oa_int32().with_example("5"), true),
+        oa_prop("comment", oa_nullable(oa_str()), false)
+    ])
+    let create_pet: OpenApiSchema = oa_object([
+        oa_prop("name", oa_str(), true),
+        oa_prop("kind", oa_str_enum(["cat", "dog", "owl"]), true),
+        oa_prop("weight_kg", oa_nullable(oa_float()), false)
+    ]).with_example("{\"name\":\"Mia\",\"kind\":\"owl\"}")
+    let error: OpenApiSchema = oa_object([
+        oa_prop("error", oa_str(), true),
+        oa_prop("message", oa_str(), true)
+    ])
+    return doc.with_schema("Pet", pet)
+        .with_schema("Owner", owner)
+        .with_schema("Review", review)
+        .with_schema("CreatePetRequest", create_pet)
+        .with_schema("ErrorResponse", error)
+}
+
+# The bindings — handler_id -> the operation that documents it.
+fn demo_bindings() -> list[OpenApiBinding] {
+    let bindings: list[OpenApiBinding] = []
+    bindings.push(oa_binding(1, oa_operation("GET", "/pets", "listPets")
+        .with_summary("List pets")
+        .with_tag("pets")
+        .with_param(oa_query_param("q",
+            oa_nullable(oa_str()).with_description("name filter")))
+        .with_param(oa_query_param("limit", oa_int32()))
+        .with_response(oa_response_json(200, "The pets",
+            oa_array(oa_ref("Pet"))))))
+    bindings.push(oa_binding(2, oa_operation("POST", "/pets", "createPet")
+        .with_summary("Create a pet")
+        .with_tag("pets")
+        .with_request_body(oa_request_body(
+            oa_ref("CreatePetRequest")).required())
+        .with_response(oa_response_json(201, "Created", oa_ref("Pet")))
+        .with_response(oa_response_json(400, "Bad input",
+            oa_ref("ErrorResponse")))))
+    bindings.push(oa_binding(3, oa_operation("GET", "/pets/{id}", "getPet")
+        .with_summary("Fetch one pet")
+        .with_tag("pets")
+        .with_response(oa_response_json(200, "The pet", oa_ref("Pet")))
+        .with_response(oa_response_json(404, "No such pet",
+            oa_ref("ErrorResponse")))))
+    bindings.push(oa_binding(4, oa_operation("PUT", "/pets/{id}", "updatePet")
+        .with_summary("Replace a pet")
+        .with_tag("pets")
+        .with_request_body(oa_request_body(
+            oa_ref("CreatePetRequest")).required())
+        .with_response(oa_response_json(200, "Updated", oa_ref("Pet")))
+        .with_response(oa_response_json(404, "No such pet",
+            oa_ref("ErrorResponse")))))
+    bindings.push(oa_binding(5, oa_operation("DELETE", "/pets/{id}",
+        "deletePet")
+        .with_summary("Delete a pet")
+        .with_tag("pets")
+        .with_response(oa_response(204, "Deleted"))))
+    bindings.push(oa_binding(6, oa_operation("GET", "/reviews/{rid}",
+        "getReview")
+        .with_summary("Fetch one review")
+        .with_tag("reviews")
+        .with_response(oa_response_json(200, "The review",
+            oa_ref("Review")))))
+    return bindings
+}
+
+# ----------------------------------------------------------------------------
+# Demo sections.
+# ----------------------------------------------------------------------------
+
+fn demo_schema_builders() -> void uses IO {
+    println("=== 1. JSON Schema builders (OpenAPI 3.1 / JSON Schema 2020-12) ===")
+    let s: OpenApiSchema = oa_object([
+        oa_prop("id", oa_int(), true),
+        oa_prop("name", oa_str(), true),
+        oa_prop("email", oa_nullable(oa_str_format("email")), false),
+        oa_prop("role", oa_str_enum(["admin", "user"]), true),
+        oa_prop("tags", oa_array(oa_str()), false)
+    ])
+    println(json_stringify(oa_schema_to_json(s)))
+    println("")
+}
+
+fn demo_bridge() -> void uses IO {
+    println("=== 2. The router bridge (router -> OpenAPI paths) ===")
+    let router: Router = demo_router()
+    println("--- registered routes ---")
+    println(router_list_routes(router))
+    let br: Result[OpenApiDoc, str] = openapi_from_router(router,
+        demo_bindings(), "Petshop API", "1.0.0")
+    if result_is_err(br) {
+        let m: str = result_err_or(br, "")
+        panic("bridge failed: " + m)
+    }
+    let doc: OpenApiDoc = demo_schemas(result_unwrap(br))
+        .with_description("The Stage 72 demo pet shop")
+        .with_server("https://pets.example.com")
+        .with_server("http://localhost:8080")
+    println("--- bridged + validated ---")
+    println("operations: " + openapi_doc_operation_count(doc).to_str()
+        + "  schemas: " + openapi_doc_schema_count(doc).to_str())
+    let v: Result[bool, str] = openapi_validate(doc)
+    let mut vmsg: str = "ok"
+    if result_is_err(v) {
+        vmsg = result_err_or(v, "")
+    }
+    println("validate: " + vmsg)
+    println("")
+}
+
+fn demo_render() -> void uses IO {
+    println("=== 3. Rendering (deterministic key order) ===")
+    let br: Result[OpenApiDoc, str] = openapi_from_router(demo_router(),
+        demo_bindings(), "Petshop API", "1.0.0")
+    let doc: OpenApiDoc = demo_schemas(result_unwrap(br))
+    let json: str = openapi_to_json_str(doc)
+    println(json)
+    println("")
+}
+
+fn demo_serving() -> void uses IO {
+    println("=== 4. Serving /openapi.json and /docs ===")
+    let br: Result[OpenApiDoc, str] = openapi_from_router(demo_router(),
+        demo_bindings(), "Petshop API", "1.0.0")
+    let doc: OpenApiDoc = demo_schemas(result_unwrap(br))
+    let jr: HttpResponse = openapi_json_response(doc)
+    println("/openapi.json -> " + jr.status.to_str() + " "
+        + http_header_get(jr.headers, "Content-Type") + " ("
+        + jr.body.len().to_str() + " bytes)")
+    let dr: HttpResponse = openapi_docs_response(doc, "Petshop API")
+    println("/docs          -> " + dr.status.to_str() + " "
+        + http_header_get(dr.headers, "Content-Type") + " ("
+        + dr.body.len().to_str() + " bytes)")
+    println("docs embeds the spec inline: "
+        + dr.body.contains("spec: {\"openapi\":\"3.1.0\"").to_str())
+    println("docs uses Swagger UI: "
+        + dr.body.contains("swagger-ui-bundle.js").to_str())
+    println("URL variant:    "
+        + openapi_docs_html_url("/openapi.json", "Petshop API")
+            .contains("url: '/openapi.json'").to_str())
+    println("")
+}
+
+fn demo_injection_defence() -> void uses IO {
+    println("=== 5. The script-injection defence ===")
+    let doc: OpenApiDoc = openapi_doc_new("Evil", "1")
+        .with_schema("Evil", oa_object([oa_prop("x",
+            oa_str().with_description("a </script> breaker"), true)]))
+    let html: str = openapi_docs_html(doc, "Evil")
+    let at: int = html.find("spec: ")
+    let end: int = html.find(", deepLinking")
+    println("raw '</script>' inside spec: "
+        + (!html.slice(at, end).contains("</script>")).to_str())
+    println("escaped form present:          "
+        + html.contains("<\\/script>").to_str())
+    let start: int = at + 6
+    let spec: str = html.slice(start, end)
+    println("escaped spec still valid JSON: "
+        + result_is_ok(json_parse_result(spec)).to_str())
+    println("")
+}
+
+fn demo_immutability() -> void uses IO {
+    println("=== 6. Immutability (structs are by-reference — builders copy) ===")
+    let op: OpenApiOperation = oa_operation("GET", "/x", "x")
+    let _chained: OpenApiOperation = op.with_summary("s")
+        .with_tag("t").with_response(oa_response(200, "ok"))
+    println("receiver untouched: summary="
+        + (op.summary.len() == 0).to_str() + " tags="
+        + op.tags.len().to_str() + " responses="
+        + op.responses.len().to_str())
+    println("")
+}
+
+fn main() -> int uses IO {
+    println("==============================================")
+    println("  Halis OpenAPI — Stage 72 (v0.91.0-alpha)")
+    println("  OpenAPI 3.1 from handler types, pure HLS")
+    println("==============================================")
+    println("")
+    demo_schema_builders()
+    demo_bridge()
+    demo_render()
+    demo_serving()
+    demo_injection_defence()
+    demo_immutability()
+    println("Done. Pure-HLS implementation (no new compiler")
+    println("builtins); the differential test is green.")
+    return 0
+}

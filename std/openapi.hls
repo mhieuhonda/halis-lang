@@ -1,0 +1,1647 @@
+# ============================================================================
+# std/openapi.hls — Stage 72 (v0.91.0-alpha): OpenAPI 3.1 generator
+# ----------------------------------------------------------------------------
+# This module is the TENTH module of Phase V (the web application
+# track, Stages 63–76). It generates an OpenAPI 3.1 document from
+# HANDLER TYPE SIGNATURES — the roadmap's promise:
+#
+#   "Generate an OpenAPI 3.1 spec from the router's type signatures.
+#    Every handler's request and response types become JSON Schema
+#    entries. The spec is served at /openapi.json and /docs (Swagger
+#    UI)."
+#
+# HLS has no reflection, so "type signatures" are declared EXPLICITLY
+# with descriptor builders (the same approach std.cli / std.graphql
+# use): an OpenApiOperation describes one handler — its method, path,
+# parameters, request body schema, and response schemas — and the
+# JSON Schema entries are composed from OpenApiSchema values built
+# with typed constructors (oa_int / oa_str / oa_array / oa_object /
+# oa_ref / ...).
+#
+# THE ROUTER BRIDGE: openapi_from_router walks a std.http_router
+# Router (Stage 63), converts route patterns to OpenAPI paths
+# ("/users/:id" -> "/users/{id}"), auto-generates the path
+# parameters the pattern implies, and attaches the operation bound to
+# each route's handler_id. A route without a binding is skipped
+# (internal routes stay out of the public spec).
+#
+# SERVING: openapi_json_response renders the document at
+# /openapi.json; openapi_docs_response renders a Swagger UI page at
+# /docs (the spec is embedded inline, so the page also works from
+# file:// without a second request).
+#
+# OUTPUT FORMAT: OpenAPI 3.1.0 — schemas are JSON Schema 2020-12
+# objects; nullable values are expressed as type arrays
+# (["string", "null"]) per 3.1, NOT the 3.0 "nullable: true".
+#
+# DIFFERENTIAL PARITY
+#
+#   Every function is pure HLS (no IO, no Net, no Rand). The JSON
+#   rendering is byte-identical between the interpreter and the
+#   native binary (deterministic key order: the insertion order of
+#   the builders).
+#
+# NO NEW COMPILER BUILTINS
+#
+#   Layered on:
+#     * std.json   (JsonValue + json_stringify + json_parse — Stage 10)
+#     * std.str    (str_replace, str_starts_with, str_ends_with,
+#                   str_join, str_contains)
+#     * std.http   (HttpRequest, HttpResponse, http_header_add,
+#                   http_response_new, http_html_response — Stage 38)
+#     * std.http_router (Router, Route, router helpers — Stage 63)
+# ============================================================================
+
+import "std.json"
+import "std.str"
+import "std.option"
+import "std.result"
+import "std.http"
+import "std.http_router"
+import "std.html"
+
+# ============================================================================
+# Constants — OpenAPI version, locations, content types, status codes.
+# ============================================================================
+
+# oa_version() — the OpenAPI version this module emits.
+fn oa_version() -> str { return "3.1.0" }
+
+# oa_content_type_json() — the JSON media type.
+fn oa_content_type_json() -> str { return "application/json" }
+
+# oa_in_query() / oa_in_path() / oa_in_header() — parameter locations.
+fn oa_in_query() -> str { return "query" }
+fn oa_in_path() -> str { return "path" }
+fn oa_in_header() -> str { return "header" }
+
+# oa_status_ok() / oa_status_created() / oa_status_no_content() /
+# oa_status_bad_request() / oa_status_not_found() — common response
+# codes (documentation convenience; any int is legal).
+fn oa_status_ok() -> int { return 200 }
+fn oa_status_created() -> int { return 201 }
+fn oa_status_no_content() -> int { return 204 }
+fn oa_status_bad_request() -> int { return 400 }
+fn oa_status_not_found() -> int { return 404 }
+
+# oa_method_get() .. oa_method_delete() — the five documented methods
+# (HEAD/OPTIONS are legal but rarely documented).
+fn oa_method_get() -> str { return "GET" }
+fn oa_method_post() -> str { return "POST" }
+fn oa_method_put() -> str { return "PUT" }
+fn oa_method_patch() -> str { return "PATCH" }
+fn oa_method_delete() -> str { return "DELETE" }
+
+# oa_kind_* — OpenApiSchema kind codes.
+fn oa_kind_empty() -> int { return 0 }      # no type (any value)
+fn oa_kind_int() -> int { return 1 }        # JSON "integer"
+fn oa_kind_float() -> int { return 2 }      # JSON "number"
+fn oa_kind_string() -> int { return 3 }     # JSON "string"
+fn oa_kind_boolean() -> int { return 4 }    # JSON "boolean"
+fn oa_kind_array() -> int { return 5 }      # JSON "array"
+fn oa_kind_object() -> int { return 6 }     # JSON "object"
+fn oa_kind_ref() -> int { return 7 }        # $ref to components/schemas
+fn oa_kind_enum_str() -> int { return 8 }   # string enum
+
+# ============================================================================
+# OpenApiSchema — a JSON Schema 2020-12 value (the OpenAPI 3.1
+# schema dialect). Kinds are flat; nesting goes through `items`
+# (arrays) and `properties` (objects), which hold nested schemas by
+# value. $ref schemas reference named components.
+# ============================================================================
+
+# OpenApiProperty — one object property: name, schema, required flag.
+struct OpenApiProperty {
+    name: str,
+    schema: OpenApiSchema,
+    required: bool
+}
+
+# OpenApiSchema — see the kind codes above. `format` carries
+# "int64"/"int32"/"float"/"double"/"date-time"/... ; `nullable` turns
+# the rendered type into a ["T","null"] array (OpenAPI 3.1 style);
+# `example_json` is a rendered JSON value embedded verbatim.
+struct OpenApiSchema {
+    kind: int,
+    format: str,
+    ref_name: str,
+    description: str,
+    enum_values: list[str],
+    items: list[OpenApiSchema],
+    properties: list[OpenApiProperty],
+    example_json: str,
+    nullable: bool
+}
+
+# oa_empty() — the unconstrained schema ({}); renders as {}.
+fn oa_empty() -> OpenApiSchema {
+    return OpenApiSchema {
+        kind: oa_kind_empty(),
+        format: "",
+        ref_name: "",
+        description: "",
+        enum_values: [],
+        items: [],
+        properties: [],
+        example_json: "",
+        nullable: false
+    }
+}
+
+# oa_int() — a 64-bit integer (HLS int is i64; format "int64").
+fn oa_int() -> OpenApiSchema {
+    let s: OpenApiSchema = oa_empty()
+    s.kind = oa_kind_int()
+    s.format = "int64"
+    return s
+}
+
+# oa_int32() — a 32-bit integer.
+fn oa_int32() -> OpenApiSchema {
+    let s: OpenApiSchema = oa_int()
+    s.format = "int32"
+    return s
+}
+
+# oa_float() — an IEEE-754 number (HLS float is f64; format "double").
+fn oa_float() -> OpenApiSchema {
+    let s: OpenApiSchema = oa_empty()
+    s.kind = oa_kind_float()
+    s.format = "double"
+    return s
+}
+
+# oa_str() — a string.
+fn oa_str() -> OpenApiSchema {
+    let s: OpenApiSchema = oa_empty()
+    s.kind = oa_kind_string()
+    return s
+}
+
+# oa_str_format(format) — a string with a format hint
+# ("date-time", "uuid", "byte", "binary", "password").
+fn oa_str_format(format: str) -> OpenApiSchema {
+    let s: OpenApiSchema = oa_str()
+    s.format = format
+    return s
+}
+
+# oa_bool() — a boolean.
+fn oa_bool() -> OpenApiSchema {
+    let s: OpenApiSchema = oa_empty()
+    s.kind = oa_kind_boolean()
+    return s
+}
+
+# oa_str_enum(values) — a string with a fixed set of allowed values
+# (renders "enum": [...]). The values are copied.
+fn oa_str_enum(values: list[str]) -> OpenApiSchema {
+    let s: OpenApiSchema = oa_str()
+    s.kind = oa_kind_enum_str()
+    let mut copy: list[str] = []
+    let mut i: int = 0
+    while i < values.len() {
+        copy.push(values.get(i))
+        i = i + 1
+    }
+    s.enum_values = copy
+    return s
+}
+
+# oa_array(item) — an array whose elements match `item`.
+fn oa_array(item: OpenApiSchema) -> OpenApiSchema {
+    let s: OpenApiSchema = oa_empty()
+    s.kind = oa_kind_array()
+    s.items.push(item)
+    return s
+}
+
+# oa_prop(name, schema, required) — build an object property.
+fn oa_prop(name: str, schema: OpenApiSchema, required: bool)
+    -> OpenApiProperty {
+    return OpenApiProperty {
+        name: name,
+        schema: schema,
+        required: required
+    }
+}
+
+
+# oa_copy_schema(s) — a DEEP copy (new struct + new lists). The
+# immutable setters below copy first, so the ORIGINAL is never
+# mutated (HLS structs are by-reference — aliasing then mutating
+# would corrupt the caller's value).
+fn oa_copy_schema(s: OpenApiSchema) -> OpenApiSchema {
+    let items: list[OpenApiSchema] = []
+    let mut i: int = 0
+    while i < s.items.len() {
+        items.push(oa_copy_schema(s.items.get(i)))
+        i = i + 1
+    }
+    let props: list[OpenApiProperty] = []
+    let mut j: int = 0
+    while j < s.properties.len() {
+        let p: OpenApiProperty = s.properties.get(j)
+        props.push(OpenApiProperty {
+            name: p.name,
+            schema: oa_copy_schema(p.schema),
+            required: p.required
+        })
+        j = j + 1
+    }
+    let enums: list[str] = []
+    let mut k: int = 0
+    while k < s.enum_values.len() {
+        enums.push(s.enum_values.get(k))
+        k = k + 1
+    }
+    return OpenApiSchema {
+        kind: s.kind,
+        format: s.format,
+        ref_name: s.ref_name,
+        description: s.description,
+        enum_values: enums,
+        items: items,
+        properties: props,
+        example_json: s.example_json,
+        nullable: s.nullable
+    }
+}
+
+# oa_copy_param(p) — copy a parameter.
+fn oa_copy_param(p: OpenApiParameter) -> OpenApiParameter {
+    return OpenApiParameter {
+        name: p.name,
+        location: p.location,
+        required: p.required,
+        schema: oa_copy_schema(p.schema),
+        description: p.description
+    }
+}
+
+# oa_copy_body(b) — copy a request body.
+fn oa_copy_body(b: OpenApiRequestBody) -> OpenApiRequestBody {
+    return OpenApiRequestBody {
+        content_type: b.content_type,
+        schema: oa_copy_schema(b.schema),
+        required: b.required,
+        description: b.description
+    }
+}
+
+# oa_copy_response(r) — copy a response.
+fn oa_copy_response(r: OpenApiResponse) -> OpenApiResponse {
+    return OpenApiResponse {
+        status: r.status,
+        description: r.description,
+        schema: oa_copy_schema(r.schema)
+    }
+}
+
+# oa_copy_operation(op) — a deep copy of an operation.
+fn oa_copy_operation(op: OpenApiOperation) -> OpenApiOperation {
+    let tags: list[str] = []
+    let mut i: int = 0
+    while i < op.tags.len() {
+        tags.push(op.tags.get(i))
+        i = i + 1
+    }
+    let params: list[OpenApiParameter] = []
+    let mut j: int = 0
+    while j < op.parameters.len() {
+        params.push(oa_copy_param(op.parameters.get(j)))
+        j = j + 1
+    }
+    let bodies: list[OpenApiRequestBody] = []
+    let mut k: int = 0
+    while k < op.request_body.len() {
+        bodies.push(oa_copy_body(op.request_body.get(k)))
+        k = k + 1
+    }
+    let responses: list[OpenApiResponse] = []
+    let mut m: int = 0
+    while m < op.responses.len() {
+        responses.push(oa_copy_response(op.responses.get(m)))
+        m = m + 1
+    }
+    return OpenApiOperation {
+        method: op.method,
+        path: op.path,
+        operation_id: op.operation_id,
+        summary: op.summary,
+        description: op.description,
+        tags: tags,
+        parameters: params,
+        request_body: bodies,
+        responses: responses,
+        deprecated: op.deprecated
+    }
+}
+
+# oa_object(props) — an object with the given properties.
+fn oa_object(props: list[OpenApiProperty]) -> OpenApiSchema {
+    let s: OpenApiSchema = oa_empty()
+    s.kind = oa_kind_object()
+    let mut copy: list[OpenApiProperty] = []
+    let mut i: int = 0
+    while i < props.len() {
+        copy.push(props.get(i))
+        i = i + 1
+    }
+    s.properties = copy
+    return s
+}
+
+# oa_ref(name) — a $ref to "#/components/schemas/<name>".
+fn oa_ref(name: str) -> OpenApiSchema {
+    let s: OpenApiSchema = oa_empty()
+    s.kind = oa_kind_ref()
+    s.ref_name = name
+    return s
+}
+
+# oa_nullable(s) — allow null (OpenAPI 3.1: "type": ["T", "null"]).
+fn oa_nullable(s: OpenApiSchema) -> OpenApiSchema {
+    let out: OpenApiSchema = oa_copy_schema(s)
+    out.nullable = true
+    return out
+}
+
+# oa_with_description(s, description) — attach a description.
+fn oa_with_description(s: OpenApiSchema, description: str)
+    -> OpenApiSchema {
+    let out: OpenApiSchema = oa_copy_schema(s)
+    out.description = description
+    return out
+}
+
+# oa_with_example(s, example_json) — attach a rendered JSON example.
+fn oa_with_example(s: OpenApiSchema, example_json: str) -> OpenApiSchema {
+    let out: OpenApiSchema = oa_copy_schema(s)
+    out.example_json = example_json
+    return out
+}
+
+# oa_schema_to_json(s) — render a schema as a JSON Schema 2020-12
+# object (JsonValue). Key order is deterministic: type/format first,
+# then enum, items, properties + required, description, example.
+fn oa_schema_to_json(s: OpenApiSchema) -> JsonValue {
+    let keys: list[str] = []
+    let vals: list[JsonValue] = []
+    # type / $ref
+    if s.kind == oa_kind_ref() {
+        keys.push("$ref")
+        vals.push(json_str("#/components/schemas/" + s.ref_name))
+    } else {
+        let mut t: str = ""
+        if s.kind == oa_kind_int() {
+            t = "integer"
+        } else if s.kind == oa_kind_float() {
+            t = "number"
+        } else if s.kind == oa_kind_string() || s.kind == oa_kind_enum_str() {
+            t = "string"
+        } else if s.kind == oa_kind_boolean() {
+            t = "boolean"
+        } else if s.kind == oa_kind_array() {
+            t = "array"
+        } else if s.kind == oa_kind_object() {
+            t = "object"
+        }
+        if t.len() > 0 {
+            if s.nullable {
+                keys.push("type")
+                vals.push(json_array([json_str(t), json_str("null")]))
+            } else {
+                keys.push("type")
+                vals.push(json_str(t))
+            }
+        }
+    }
+    if s.format.len() > 0 {
+        keys.push("format")
+        vals.push(json_str(s.format))
+    }
+    if s.kind == oa_kind_enum_str() && s.enum_values.len() > 0 {
+        let ev: list[JsonValue] = []
+        let mut i: int = 0
+        while i < s.enum_values.len() {
+            ev.push(json_str(s.enum_values.get(i)))
+            i = i + 1
+        }
+        keys.push("enum")
+        vals.push(json_array(ev))
+    }
+    if s.kind == oa_kind_array() && s.items.len() > 0 {
+        keys.push("items")
+        vals.push(oa_schema_to_json(s.items.get(0)))
+    }
+    if s.kind == oa_kind_object() && s.properties.len() > 0 {
+        let pk: list[str] = []
+        let pv: list[JsonValue] = []
+        let mut i: int = 0
+        while i < s.properties.len() {
+            let p: OpenApiProperty = s.properties.get(i)
+            pk.push(p.name)
+            pv.push(oa_schema_to_json(p.schema))
+            i = i + 1
+        }
+        keys.push("properties")
+        vals.push(json_object(pk, pv))
+        let req: list[JsonValue] = []
+        let mut j: int = 0
+        while j < s.properties.len() {
+            if s.properties.get(j).required {
+                req.push(json_str(s.properties.get(j).name))
+            }
+            j = j + 1
+        }
+        if req.len() > 0 {
+            keys.push("required")
+            vals.push(json_array(req))
+        }
+    }
+    if s.description.len() > 0 {
+        keys.push("description")
+        vals.push(json_str(s.description))
+    }
+    if s.example_json.len() > 0 {
+        let ex: Result[JsonValue, str] = json_parse_result(s.example_json)
+        if result_is_ok(ex) {
+            keys.push("example")
+            vals.push(result_unwrap(ex))
+        }
+    }
+    return json_object(keys, vals)
+}
+
+# ============================================================================
+# Parameters, request bodies, responses, operations.
+# ============================================================================
+
+# OpenApiParameter — one operation parameter: name, location
+# (query/path/header), required (path parameters are ALWAYS required
+# per the spec — the renderer forces it), schema, description.
+struct OpenApiParameter {
+    name: str,
+    location: str,
+    required: bool,
+    schema: OpenApiSchema,
+    description: str
+}
+
+# oa_param(name, location, schema) — build a parameter.
+fn oa_param(name: str, location: str, schema: OpenApiSchema)
+    -> OpenApiParameter {
+    return OpenApiParameter {
+        name: name,
+        location: location,
+        required: location == oa_in_path(),
+        schema: schema,
+        description: ""
+    }
+}
+
+# oa_query_param(name, schema) — the common query-parameter case.
+fn oa_query_param(name: str, schema: OpenApiSchema) -> OpenApiParameter {
+    return oa_param(name, oa_in_query(), schema)
+}
+
+# oa_header_param(name, schema) — the header-parameter case.
+fn oa_header_param(name: str, schema: OpenApiSchema) -> OpenApiParameter {
+    return oa_param(name, oa_in_header(), schema)
+}
+
+# oa_param_with_description(p, description) — immutable setter.
+fn oa_param_with_description(p: OpenApiParameter, description: str)
+    -> OpenApiParameter {
+    let out: OpenApiParameter = oa_copy_param(p)
+    out.description = description
+    return out
+}
+
+# oa_param_required(p) — immutable setter: mark required.
+fn oa_param_required(p: OpenApiParameter) -> OpenApiParameter {
+    let out: OpenApiParameter = oa_copy_param(p)
+    out.required = true
+    return out
+}
+
+# OpenApiRequestBody — the request body: one media type + schema.
+struct OpenApiRequestBody {
+    content_type: str,
+    schema: OpenApiSchema,
+    required: bool,
+    description: str
+}
+
+# oa_request_body(schema) — an application/json request body.
+fn oa_request_body(schema: OpenApiSchema) -> OpenApiRequestBody {
+    return OpenApiRequestBody {
+        content_type: oa_content_type_json(),
+        schema: schema,
+        required: false,
+        description: ""
+    }
+}
+
+# oa_body_required(b) — immutable setter: the body is required.
+fn oa_body_required(b: OpenApiRequestBody) -> OpenApiRequestBody {
+    let out: OpenApiRequestBody = oa_copy_body(b)
+    out.required = true
+    return out
+}
+
+# oa_body_with_description(b, description) — immutable setter.
+fn oa_body_with_description(b: OpenApiRequestBody, description: str)
+    -> OpenApiRequestBody {
+    let out: OpenApiRequestBody = oa_copy_body(b)
+    out.description = description
+    return out
+}
+
+# OpenApiResponse — one response: status code, description, and an
+# optional response-body schema.
+struct OpenApiResponse {
+    status: int,
+    description: str,
+    schema: OpenApiSchema
+}
+
+# oa_response(status, description) — a response without a body.
+fn oa_response(status: int, description: str) -> OpenApiResponse {
+    return OpenApiResponse {
+        status: status,
+        description: description,
+        schema: oa_empty()
+    }
+}
+
+# oa_response_json(status, description, schema) — a JSON response.
+fn oa_response_json(status: int, description: str, schema: OpenApiSchema)
+    -> OpenApiResponse {
+    let r: OpenApiResponse = oa_response(status, description)
+    r.schema = schema
+    return r
+}
+
+# OpenApiOperation — one documented endpoint: method + path +
+# operationId + parameters + request body + responses + tags.
+struct OpenApiOperation {
+    method: str,
+    path: str,
+    operation_id: str,
+    summary: str,
+    description: str,
+    tags: list[str],
+    parameters: list[OpenApiParameter],
+    request_body: list[OpenApiRequestBody],
+    responses: list[OpenApiResponse],
+    deprecated: bool
+}
+
+# oa_operation(method, path, operation_id) — an empty operation.
+fn oa_operation(method: str, path: str, operation_id: str)
+    -> OpenApiOperation {
+    return OpenApiOperation {
+        method: method,
+        path: path,
+        operation_id: operation_id,
+        summary: "",
+        description: "",
+        tags: [],
+        parameters: [],
+        request_body: [],
+        responses: [],
+        deprecated: false
+    }
+}
+
+# oa_with_summary(op, summary) — immutable setter.
+fn oa_with_summary(op: OpenApiOperation, summary: str) -> OpenApiOperation {
+    let out: OpenApiOperation = oa_copy_operation(op)
+    out.summary = summary
+    return out
+}
+
+# oa_with_description_op(op, description) — immutable setter (the _op
+# suffix disambiguates from the schema variant).
+fn oa_with_description_op(op: OpenApiOperation, description: str)
+    -> OpenApiOperation {
+    let out: OpenApiOperation = oa_copy_operation(op)
+    out.description = description
+    return out
+}
+
+# oa_with_tag(op, tag) — immutable setter: append a tag.
+fn oa_with_tag(op: OpenApiOperation, tag: str) -> OpenApiOperation {
+    let out: OpenApiOperation = oa_copy_operation(op)
+    out.tags.push(tag)
+    return out
+}
+
+# oa_with_param(op, param) — immutable setter: append a parameter.
+fn oa_with_param(op: OpenApiOperation, param: OpenApiParameter)
+    -> OpenApiOperation {
+    let out: OpenApiOperation = oa_copy_operation(op)
+    out.parameters.push(oa_copy_param(param))
+    return out
+}
+
+# oa_with_request_body(op, body) — immutable setter: set the body
+# (replaces any previous one).
+fn oa_with_request_body(op: OpenApiOperation, body: OpenApiRequestBody)
+    -> OpenApiOperation {
+    let out: OpenApiOperation = oa_copy_operation(op)
+    out.request_body = []
+    out.request_body.push(oa_copy_body(body))
+    return out
+}
+
+# oa_with_response(op, response) — immutable setter: append a
+# response (duplicate status codes replace the earlier entry).
+fn oa_with_response(op: OpenApiOperation, response: OpenApiResponse)
+    -> OpenApiOperation {
+    let out: OpenApiOperation = oa_copy_operation(op)
+    let mut cleaned: list[OpenApiResponse] = []
+    let mut i: int = 0
+    while i < out.responses.len() {
+        if out.responses.get(i).status != response.status {
+            cleaned.push(out.responses.get(i))
+        }
+        i = i + 1
+    }
+    cleaned.push(oa_copy_response(response))
+    out.responses = cleaned
+    return out
+}
+
+# oa_deprecated(op) — immutable setter: mark deprecated.
+fn oa_deprecated(op: OpenApiOperation) -> OpenApiOperation {
+    let out: OpenApiOperation = oa_copy_operation(op)
+    out.deprecated = true
+    return out
+}
+
+# oa_operation_has_parameter(op, name) — does the operation declare a
+# parameter with this name (any location)?
+fn oa_operation_has_parameter(op: OpenApiOperation, name: str) -> bool {
+    let mut i: int = 0
+    while i < op.parameters.len() {
+        if op.parameters.get(i).name == name {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+# ============================================================================
+# END OF PART 1 — schema + operation model. PART 2 (document, router
+# bridge, rendering, serving) follows.
+# ============================================================================
+
+
+# ============================================================================
+# PART 2 — the document model, the ROUTER BRIDGE, JSON rendering,
+# and the /openapi.json + /docs serving helpers.
+# ============================================================================
+
+# OpenApiNamedSchema — one components/schemas entry.
+struct OpenApiNamedSchema {
+    name: str,
+    schema: OpenApiSchema
+}
+
+# OpenApiDoc — the whole document: info + servers + operations +
+# named schemas.
+struct OpenApiDoc {
+    title: str,
+    version: str,
+    description: str,
+    servers: list[str],
+    operations: list[OpenApiOperation],
+    schemas: list[OpenApiNamedSchema]
+}
+
+# oa_copy_doc(doc) — copy the document (new struct + new lists; the
+# operations inside are already immutable by construction).
+fn oa_copy_doc(doc: OpenApiDoc) -> OpenApiDoc {
+    let servers: list[str] = []
+    let mut i: int = 0
+    while i < doc.servers.len() {
+        servers.push(doc.servers.get(i))
+        i = i + 1
+    }
+    let operations: list[OpenApiOperation] = []
+    let mut j: int = 0
+    while j < doc.operations.len() {
+        operations.push(doc.operations.get(j))
+        j = j + 1
+    }
+    let schemas: list[OpenApiNamedSchema] = []
+    let mut k: int = 0
+    while k < doc.schemas.len() {
+        let named: OpenApiNamedSchema = doc.schemas.get(k)
+        schemas.push(OpenApiNamedSchema {
+            name: named.name,
+            schema: oa_copy_schema(named.schema)
+        })
+        k = k + 1
+    }
+    return OpenApiDoc {
+        title: doc.title,
+        version: doc.version,
+        description: doc.description,
+        servers: servers,
+        operations: operations,
+        schemas: schemas
+    }
+}
+
+# openapi_doc_new(title, version) — an empty document.
+fn openapi_doc_new(title: str, version: str) -> OpenApiDoc {
+    return OpenApiDoc {
+        title: title,
+        version: version,
+        description: "",
+        servers: [],
+        operations: [],
+        schemas: []
+    }
+}
+
+# openapi_doc_with_description(doc, description) — immutable setter.
+fn openapi_doc_with_description(doc: OpenApiDoc, description: str)
+    -> OpenApiDoc {
+    let out: OpenApiDoc = oa_copy_doc(doc)
+    out.description = description
+    return out
+}
+
+# openapi_doc_with_server(doc, url) — append a server URL.
+fn openapi_doc_with_server(doc: OpenApiDoc, url: str) -> OpenApiDoc {
+    let out: OpenApiDoc = oa_copy_doc(doc)
+    out.servers.push(url)
+    return out
+}
+
+# openapi_doc_with_schema(doc, name, schema) — append (or replace) a
+# named schema in components/schemas.
+fn openapi_doc_with_schema(doc: OpenApiDoc, name: str,
+    schema: OpenApiSchema) -> OpenApiDoc {
+    let out: OpenApiDoc = oa_copy_doc(doc)
+    let mut cleaned: list[OpenApiNamedSchema] = []
+    let mut i: int = 0
+    while i < out.schemas.len() {
+        if out.schemas.get(i).name != name {
+            cleaned.push(out.schemas.get(i))
+        }
+        i = i + 1
+    }
+    cleaned.push(OpenApiNamedSchema {
+        name: name,
+        schema: oa_copy_schema(schema)
+    })
+    out.schemas = cleaned
+    return out
+}
+
+# openapi_doc_add_operation(doc, op) — append an operation. Rejects
+# duplicates (same path + method, or a repeated operationId) by
+# returning Result.Err — silent overwriting would corrupt the spec.
+fn openapi_doc_add_operation(doc: OpenApiDoc, op: OpenApiOperation)
+    -> Result[OpenApiDoc, str] {
+    let mut i: int = 0
+    while i < doc.operations.len() {
+        let existing: OpenApiOperation = doc.operations.get(i)
+        if existing.path == op.path && existing.method == op.method {
+            let m: str = "duplicate operation for " + op.method + " "
+                + op.path
+            return Result.Err(m)
+        }
+        if existing.operation_id == op.operation_id
+            && op.operation_id.len() > 0 {
+            let m2: str = "duplicate operationId '" + op.operation_id + "'"
+            return Result.Err(m2)
+        }
+        i = i + 1
+    }
+    let out: OpenApiDoc = oa_copy_doc(doc)
+    out.operations.push(oa_copy_operation(op))
+    return Result.Ok(out)
+}
+
+# openapi_doc_operation_count(doc) — number of documented operations.
+fn openapi_doc_operation_count(doc: OpenApiDoc) -> int {
+    return doc.operations.len()
+}
+
+# openapi_doc_schema_count(doc) — number of named schemas.
+fn openapi_doc_schema_count(doc: OpenApiDoc) -> int {
+    return doc.schemas.len()
+}
+
+# ----------------------------------------------------------------------------
+# Pattern conversion — router patterns to OpenAPI paths.
+# ----------------------------------------------------------------------------
+
+# oa_path_from_pattern(pattern) — convert a std.http_router pattern
+# ("/users/:id", "/files/*path") to an OpenAPI path template
+# ("/users/{id}", "/files/{path}"). Each ":name" segment becomes
+# "{name}"; a trailing "*" wildcard becomes "{path}" (Swagger's
+# convention for catch-alls).
+fn oa_path_from_pattern(pattern: str) -> str {
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < pattern.len() {
+        let b: int = pattern.byte_at(i)
+        if b == 58 && (i == 0 || pattern.byte_at(i - 1) == 47) {
+            # ":name" -> "{name}"
+            out = out + "{"
+            i = i + 1
+            let mut name: str = ""
+            while i < pattern.len() && pattern.byte_at(i) != 47 {
+                name = name + pattern.slice(i, i + 1)
+                i = i + 1
+            }
+            out = out + name + "}"
+        } else if b == 42 && (i == 0 || pattern.byte_at(i - 1) == 47) {
+            # "*" wildcard -> "{path}" (skip to the end; router
+            # wildcards are always trailing).
+            out = out + "{path}"
+            while i < pattern.len() {
+                i = i + 1
+            }
+        } else {
+            out = out + pattern.slice(i, i + 1)
+            i = i + 1
+        }
+    }
+    return out
+}
+
+# oa_pattern_params(pattern) — the parameter names a router pattern
+# implies ("/users/:id/files/:fid" -> ["id", "fid"]; a trailing "*"
+# yields "path").
+fn oa_pattern_params(pattern: str) -> list[str] {
+    let out: list[str] = []
+    let mut i: int = 0
+    while i < pattern.len() {
+        let b: int = pattern.byte_at(i)
+        if b == 58 && (i == 0 || pattern.byte_at(i - 1) == 47) {
+            i = i + 1
+            let mut name: str = ""
+            while i < pattern.len() && pattern.byte_at(i) != 47 {
+                name = name + pattern.slice(i, i + 1)
+                i = i + 1
+            }
+            if name.len() > 0 {
+                out.push(name)
+            }
+        } else if b == 42 && (i == 0 || pattern.byte_at(i - 1) == 47) {
+            out.push("path")
+            while i < pattern.len() {
+                i = i + 1
+            }
+        } else {
+            i = i + 1
+        }
+    }
+    return out
+}
+
+# ----------------------------------------------------------------------------
+# The ROUTER BRIDGE — openapi_from_router.
+# ----------------------------------------------------------------------------
+
+# OpenApiBinding — pairs a handler_id with the operation that
+# documents it. The bridge walks the Router's routes and attaches the
+# bound operation to each matching route; routes without a binding
+# are skipped (internal endpoints stay out of the public spec).
+struct OpenApiBinding {
+    handler_id: int,
+    op: OpenApiOperation
+}
+
+# oa_binding(handler_id, op) — build a binding.
+fn oa_binding(handler_id: int, op: OpenApiOperation) -> OpenApiBinding {
+    return OpenApiBinding {
+        handler_id: handler_id,
+        op: oa_copy_operation(op)
+    }
+}
+
+# openapi_from_router(router, bindings, title, version)
+# -> Result[OpenApiDoc, str] — build the document from the router's
+# registered routes:
+#   * each route's pattern becomes an OpenAPI path (oa_path_from_pattern)
+#   * each ":param" the pattern implies becomes a REQUIRED path
+#     parameter (string schema) — unless the bound operation already
+#     declares a parameter with that name (the explicit one wins)
+#   * the bound operation's method is preferred; a route registered
+#     with the ANY wildcard ("*") uses the operation's own method
+#   * unbound routes are skipped; bound handlers with no route are an
+#     ERROR (the spec would document an endpoint the router never
+#     dispatches — a silent lie)
+# Sub-router mounts contribute their routes under the mount prefix.
+fn openapi_from_router(router: Router, bindings: list[OpenApiBinding],
+    title: str, version: str) -> Result[OpenApiDoc, str] {
+    let mut doc: OpenApiDoc = openapi_doc_new(title, version)
+    let mut added: list[int] = []
+    let r: Result[OpenApiDoc, str] = oa_bridge_walk(router, bindings, "",
+        doc, added)
+    if result_is_err(r) {
+        let m: str = result_err_or(r, "")
+        return Result.Err(m)
+    }
+    doc = result_unwrap(r)
+    # Every binding must correspond to at least one route.
+    let mut bi: int = 0
+    while bi < bindings.len() {
+        let want: int = bindings.get(bi).handler_id
+        let mut seen: bool = false
+        let mut ai: int = 0
+        while ai < added.len() {
+            if added.get(ai) == want {
+                seen = true
+            }
+            ai = ai + 1
+        }
+        if !seen {
+            let m2: str = "binding for handler " + want.to_str()
+                + " matches no route"
+            return Result.Err(m2)
+        }
+        bi = bi + 1
+    }
+    return Result.Ok(doc)
+}
+
+# oa_bridge_walk — the recursive bridge worker (mount prefixes are
+# prepended to sub-router patterns).
+fn oa_bridge_walk(router: Router, bindings: list[OpenApiBinding],
+    prefix: str, doc: OpenApiDoc, added: list[int])
+    -> Result[OpenApiDoc, str] {
+    let mut out: OpenApiDoc = doc
+    let mut ri: int = 0
+    while ri < router.routes.len() {
+        let route: Route = router.routes.get(ri)
+        # Find the binding for this route's handler.
+        let mut bound: int = -1
+        let mut bi: int = 0
+        while bi < bindings.len() {
+            if bindings.get(bi).handler_id == route.handler_id {
+                bound = bi
+            }
+            bi = bi + 1
+        }
+        if bound < 0 {
+            # Internal route: not documented.
+            ri = ri + 1
+            continue
+        }
+        let op: OpenApiOperation = bindings.get(bound).op
+        # Method: the route's method wins unless it is the ANY
+        # wildcard, in which case the operation's declared method is
+        # the documentation truth.
+        let mut method: str = route.method
+        if method == router_method_any() {
+            method = op.method
+        }
+        # Path: prefix + pattern, converted to the OpenAPI form.
+        let full_pattern: str = prefix + route.pattern
+        let path: str = oa_path_from_pattern(full_pattern)
+        # Build the documented operation: a copy with the resolved
+        # method/path, plus the implied path parameters.
+        let mut merged: OpenApiOperation = oa_copy_operation(op)
+        merged.method = method
+        merged.path = path
+        let implied: list[str] = oa_pattern_params(full_pattern)
+        let mut pi: int = 0
+        while pi < implied.len() {
+            let pname: str = implied.get(pi)
+            if !oa_operation_has_parameter(merged, pname) {
+                let p: OpenApiParameter = oa_param(pname, oa_in_path(),
+                    oa_str())
+                merged.parameters.push(p)
+            }
+            pi = pi + 1
+        }
+        let ar: Result[OpenApiDoc, str] = openapi_doc_add_operation(out,
+            merged)
+        if result_is_err(ar) {
+            let m: str = result_err_or(ar, "")
+            return Result.Err(m)
+        }
+        out = result_unwrap(ar)
+        added.push(route.handler_id)
+        ri = ri + 1
+    }
+    # Recurse into mounted sub-routers.
+    let mut si: int = 0
+    while si < router.sub_routers.len() {
+        let sub: SubRouterMount = router.sub_routers.get(si)
+        let subr: Result[OpenApiDoc, str] = oa_bridge_walk(sub.sub_router,
+            bindings, prefix + sub.prefix, out, added)
+        if result_is_err(subr) {
+            let m2: str = result_err_or(subr, "")
+            return Result.Err(m2)
+        }
+        out = result_unwrap(subr)
+        si = si + 1
+    }
+    return Result.Ok(out)
+}
+
+# ----------------------------------------------------------------------------
+# Rendering — the full OpenAPI 3.1 document as JSON.
+# ----------------------------------------------------------------------------
+
+# oa_operation_to_json(op) — render one operation object (the value
+# under paths.{path}.{method}).
+fn oa_operation_to_json(op: OpenApiOperation) -> JsonValue {
+    let keys: list[str] = []
+    let vals: list[JsonValue] = []
+    if op.operation_id.len() > 0 {
+        keys.push("operationId")
+        vals.push(json_str(op.operation_id))
+    }
+    if op.summary.len() > 0 {
+        keys.push("summary")
+        vals.push(json_str(op.summary))
+    }
+    if op.description.len() > 0 {
+        keys.push("description")
+        vals.push(json_str(op.description))
+    }
+    if op.tags.len() > 0 {
+        let tv: list[JsonValue] = []
+        let mut i: int = 0
+        while i < op.tags.len() {
+            tv.push(json_str(op.tags.get(i)))
+            i = i + 1
+        }
+        keys.push("tags")
+        vals.push(json_array(tv))
+    }
+    if op.parameters.len() > 0 {
+        let pv: list[JsonValue] = []
+        let mut j: int = 0
+        while j < op.parameters.len() {
+            let p: OpenApiParameter = op.parameters.get(j)
+            let k: list[str] = []
+            let v: list[JsonValue] = []
+            k.push("name")
+            v.push(json_str(p.name))
+            k.push("in")
+            v.push(json_str(p.location))
+            if p.required || p.location == oa_in_path() {
+                k.push("required")
+                v.push(json_bool(true))
+            }
+            if p.description.len() > 0 {
+                k.push("description")
+                v.push(json_str(p.description))
+            }
+            k.push("schema")
+            v.push(oa_schema_to_json(p.schema))
+            pv.push(json_object(k, v))
+            j = j + 1
+        }
+        keys.push("parameters")
+        vals.push(json_array(pv))
+    }
+    if op.request_body.len() > 0 {
+        let b: OpenApiRequestBody = op.request_body.get(0)
+        let bk: list[str] = []
+        let bv: list[JsonValue] = []
+        if b.description.len() > 0 {
+            bk.push("description")
+            bv.push(json_str(b.description))
+        }
+        if b.required {
+            bk.push("required")
+            bv.push(json_bool(true))
+        }
+        bk.push("content")
+        bv.push(json_object([b.content_type],
+            [json_object(["schema"], [oa_schema_to_json(b.schema)])]))
+        keys.push("requestBody")
+        vals.push(json_object(bk, bv))
+    }
+    if op.responses.len() > 0 {
+        let rk: list[str] = []
+        let rv: list[JsonValue] = []
+        let mut k2: int = 0
+        while k2 < op.responses.len() {
+            let resp: OpenApiResponse = op.responses.get(k2)
+            let ek: list[str] = []
+            let ev: list[JsonValue] = []
+            ek.push("description")
+            ev.push(json_str(resp.description))
+            if resp.schema.kind != oa_kind_empty()
+                || resp.schema.ref_name.len() > 0 {
+                ek.push("content")
+                ev.push(json_object([oa_content_type_json()],
+                    [json_object(["schema"],
+                        [oa_schema_to_json(resp.schema)])]))
+            }
+            rk.push(resp.status.to_str())
+            rv.push(json_object(ek, ev))
+            k2 = k2 + 1
+        }
+        keys.push("responses")
+        vals.push(json_object(rk, rv))
+    }
+    if op.deprecated {
+        keys.push("deprecated")
+        vals.push(json_bool(true))
+    }
+    return json_object(keys, vals)
+}
+
+# openapi_to_json(doc) — the complete document as a JsonValue:
+# {openapi, info{title,version,description?}, servers?,
+#  paths{...}, components{schemas}?}. Rendering is deterministic
+# (insertion order); paths group operations by path then method.
+fn openapi_to_json(doc: OpenApiDoc) -> JsonValue {
+    let keys: list[str] = []
+    let vals: list[JsonValue] = []
+    keys.push("openapi")
+    vals.push(json_str(oa_version()))
+    # info
+    let ik: list[str] = []
+    let iv: list[JsonValue] = []
+    ik.push("title")
+    iv.push(json_str(doc.title))
+    ik.push("version")
+    iv.push(json_str(doc.version))
+    if doc.description.len() > 0 {
+        ik.push("description")
+        iv.push(json_str(doc.description))
+    }
+    keys.push("info")
+    vals.push(json_object(ik, iv))
+    # servers
+    if doc.servers.len() > 0 {
+        let sv: list[JsonValue] = []
+        let mut i: int = 0
+        while i < doc.servers.len() {
+            sv.push(json_object(["url"], [json_str(doc.servers.get(i))]))
+            i = i + 1
+        }
+        keys.push("servers")
+        vals.push(json_array(sv))
+    }
+    # paths: collect distinct paths (in first-seen order), then group.
+    let path_names: list[str] = []
+    let mut pi: int = 0
+    while pi < doc.operations.len() {
+        let p: str = doc.operations.get(pi).path
+        let mut seen: bool = false
+        let mut si: int = 0
+        while si < path_names.len() {
+            if path_names.get(si) == p {
+                seen = true
+            }
+            si = si + 1
+        }
+        if !seen {
+            path_names.push(p)
+        }
+        pi = pi + 1
+    }
+    let pk: list[str] = []
+    let pv: list[JsonValue] = []
+    let mut pni: int = 0
+    while pni < path_names.len() {
+        let path: str = path_names.get(pni)
+        let mk: list[str] = []
+        let mv: list[JsonValue] = []
+        let mut oi: int = 0
+        while oi < doc.operations.len() {
+            let op: OpenApiOperation = doc.operations.get(oi)
+            if op.path == path {
+                # Method keys are lower-case per the OpenAPI spec
+                # ("get", "post"); PATH keys keep their exact case
+                # (paths are case-sensitive).
+                mk.push(str_to_lower_ascii(op.method))
+                mv.push(oa_operation_to_json(op))
+            }
+            oi = oi + 1
+        }
+        pk.push(path)
+        pv.push(json_object(mk, mv))
+        pni = pni + 1
+    }
+    keys.push("paths")
+    vals.push(json_object(pk, pv))
+    # components.schemas
+    if doc.schemas.len() > 0 {
+        let sk: list[str] = []
+        let svv: list[JsonValue] = []
+        let mut sci: int = 0
+        while sci < doc.schemas.len() {
+            let named: OpenApiNamedSchema = doc.schemas.get(sci)
+            sk.push(named.name)
+            svv.push(oa_schema_to_json(named.schema))
+            sci = sci + 1
+        }
+        keys.push("components")
+        vals.push(json_object(["schemas"], [json_object(sk, svv)]))
+    }
+    return json_object(keys, vals)
+}
+
+# openapi_to_json_str(doc) — the document as a compact JSON string
+# (the /openapi.json body).
+fn openapi_to_json_str(doc: OpenApiDoc) -> str {
+    return json_stringify(openapi_to_json(doc))
+}
+
+# ----------------------------------------------------------------------------
+# Serving — /openapi.json and /docs (Swagger UI).
+# ----------------------------------------------------------------------------
+
+# openapi_json_response(doc) — the /openapi.json response: 200 +
+# application/json + the rendered document.
+fn openapi_json_response(doc: OpenApiDoc) -> HttpResponse {
+    let resp: HttpResponse = http_response_new(200)
+    let headers: list[HttpHeader] = http_header_add(resp.headers,
+        "Content-Type", oa_content_type_json())
+    resp.headers = headers
+    resp.body = openapi_to_json_str(doc)
+    return resp
+}
+
+# oa_docs_head(title) — the Swagger UI <head> block (CSS + the
+# unpkg CDN bundle; the page needs network access for the assets).
+fn oa_docs_head(title: str) -> str {
+    return "<head><meta charset=\"utf-8\"><meta name=\"viewport\" "
+        + "content=\"width=device-width, initial-scale=1\"><title>"
+        + html_escape(title) + "</title>"
+        + "<link rel=\"stylesheet\" "
+        + "href=\"https://unpkg.com/swagger-ui-dist@5/swagger-ui.css\">"
+        + "</head>"
+}
+
+# openapi_docs_html(doc, title) — the /docs page: a standalone
+# Swagger UI document with the spec EMBEDDED INLINE (no second
+# request to /openapi.json — the page also works from file://).
+# The JSON is embedded as the `spec` member of the SwaggerUIBundle
+# options; every "</" in the rendered JSON is rewritten to "<\/"
+# (a VALID JSON escape) so string values can never terminate the
+# enclosing <script> block — the script-injection defence.
+fn openapi_docs_html(doc: OpenApiDoc, title: str) -> str {
+    # The spec is embedded inside a <script> block. JSON does not
+    # escape "/" — a string value containing "</script>" would
+    # terminate the block early (script-tag injection). Replacing
+    # every "</" with "<\/" keeps the JSON valid (\/ is the standard
+    # escape for "/") and makes the sequence impossible.
+    let spec: str = str_replace(openapi_to_json_str(doc), "</", "<\\/")
+    return "<!DOCTYPE html><html lang=\"en\">"
+        + oa_docs_head(title)
+        + "<body><div id=\"swagger-ui\"></div>"
+        + "<script src=\"https://unpkg.com/swagger-ui-dist@5/"
+        + "swagger-ui-bundle.js\"></script>"
+        + "<script> window.onload = function () { "
+        + "window.ui = SwaggerUIBundle({ "
+        + "dom_id: '#swagger-ui', "
+        + "spec: " + spec + ", "
+        + "deepLinking: true, "
+        + "showExtensions: true, "
+        + "showCommonExtensions: true "
+        + "}); }; </script></body></html>"
+}
+
+# oa_js_string(s) — escape a string for embedding inside a
+# single-quoted JavaScript string literal: backslash and quote are
+# escaped; "</" is broken up so the sequence can never terminate the
+# enclosing <script> block. (HTML escaping is WRONG here — it would
+# corrupt URLs; JS escaping is the correct rule.)
+fn oa_js_string(s: str) -> str {
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < s.len() {
+        let b: int = s.byte_at(i)
+        if b == 92 {  # backslash
+            out = out + "\\\\"
+        } else if b == 39 {  # single quote
+            out = out + "\\'"
+        } else if b == 60 && i + 1 < s.len()
+            && s.byte_at(i + 1) == 47 {  # "</" — script-tag breaker
+            out = out + "<\\/"
+            # Consume BOTH bytes of "</" (the trailing loop increment
+            # covers the '<'; this one skips the '/').
+            i = i + 1
+        } else {
+            out = out + s.slice(i, i + 1)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# openapi_docs_html_url(spec_url, title) — the URL variant: the page
+# fetches the spec from spec_url (the conventional /docs +
+# /openapi.json pair).
+fn openapi_docs_html_url(spec_url: str, title: str) -> str {
+    return "<!DOCTYPE html><html lang=\"en\">"
+        + oa_docs_head(title)
+        + "<body><div id=\"swagger-ui\"></div>"
+        + "<script src=\"https://unpkg.com/swagger-ui-dist@5/"
+        + "swagger-ui-bundle.js\"></script>"
+        + "<script> window.onload = function () { "
+        + "window.ui = SwaggerUIBundle({ "
+        + "dom_id: '#swagger-ui', "
+        + "url: '" + oa_js_string(spec_url) + "', "
+        + "deepLinking: true "
+        + "}); }; </script></body></html>"
+}
+
+# openapi_docs_response(doc, title) — the /docs response: 200 +
+# text/html + the Swagger UI page (inline spec).
+fn openapi_docs_response(doc: OpenApiDoc, title: str) -> HttpResponse {
+    let resp: HttpResponse = http_response_new(200)
+    let headers: list[HttpHeader] = http_header_add(resp.headers,
+        "Content-Type", "text/html; charset=utf-8")
+    resp.headers = headers
+    resp.body = openapi_docs_html(doc, title)
+    return resp
+}
+
+# ----------------------------------------------------------------------------
+# Validation — sanity checks a document should pass before serving.
+# ----------------------------------------------------------------------------
+
+# openapi_validate(doc) -> Result[bool, str] — check the invariants
+# the OpenAPI 3.1 spec demands: every operation has at least one
+# response; every path starts with "/"; every path parameter
+# referenced in the path template is declared; every declared path
+# parameter appears in the template; every oa_ref target exists in
+# components/schemas; every response has a description.
+fn openapi_validate(doc: OpenApiDoc) -> Result[bool, str] {
+    let mut i: int = 0
+    while i < doc.operations.len() {
+        let op: OpenApiOperation = doc.operations.get(i)
+        if !op.path.starts_with("/") {
+            let m: str = "operation '" + op.operation_id + "': path '"
+                + op.path + "' must start with '/'"
+            return Result.Err(m)
+        }
+        if op.responses.len() == 0 {
+            let m2: str = "operation '" + op.operation_id
+                + "' has no responses"
+            return Result.Err(m2)
+        }
+        let mut rj: int = 0
+        while rj < op.responses.len() {
+            if op.responses.get(rj).description.len() == 0 {
+                let m3: str = "operation '" + op.operation_id
+                    + "': response "
+                    + op.responses.get(rj).status.to_str()
+                    + " has no description"
+                return Result.Err(m3)
+            }
+            rj = rj + 1
+        }
+        # Path template parameters: declared <-> referenced.
+        let template: list[str] = oa_pattern_params(
+            oa_template_to_pattern(op.path))
+        let mut ti: int = 0
+        while ti < template.len() {
+            let tname: str = template.get(ti)
+            if !oa_operation_has_parameter(op, tname) {
+                let m4: str = "operation '" + op.operation_id
+                    + "': path parameter '{" + tname
+                    + "}' is not declared"
+                return Result.Err(m4)
+            }
+            ti = ti + 1
+        }
+        let mut pi2: int = 0
+        while pi2 < op.parameters.len() {
+            let p: OpenApiParameter = op.parameters.get(pi2)
+            if p.location == oa_in_path() {
+                let mut found: bool = false
+                let mut tk: int = 0
+                while tk < template.len() {
+                    if template.get(tk) == p.name {
+                        found = true
+                    }
+                    tk = tk + 1
+                }
+                if !found {
+                    let m5: str = "operation '" + op.operation_id
+                        + "': declared path parameter '" + p.name
+                        + "' does not appear in the path template"
+                    return Result.Err(m5)
+                }
+                if !p.required {
+                    let m6: str = "operation '" + op.operation_id
+                        + "': path parameter '" + p.name
+                        + "' must be required"
+                    return Result.Err(m6)
+                }
+            }
+            pi2 = pi2 + 1
+        }
+        # $ref targets exist.
+        let ref_err: str = oa_validate_refs(op, doc)
+        if ref_err.len() > 0 {
+            return Result.Err(ref_err)
+        }
+        i = i + 1
+    }
+    return Result.Ok(true)
+}
+
+# oa_template_to_pattern(path) — convert an OpenAPI path template
+# back to a router pattern ("/users/{id}" -> "/users/:id") so
+# oa_pattern_params can extract the template parameters.
+fn oa_template_to_pattern(path: str) -> str {
+    return str_replace(str_replace(path, "{", ":"), "}", "")
+}
+
+# oa_validate_refs(op, doc) — "" if every $ref inside the operation
+# resolves to a named schema; otherwise an error message.
+fn oa_validate_refs(op: OpenApiOperation, doc: OpenApiDoc) -> str {
+    let mut out: str = ""
+    # Parameters.
+    let mut i: int = 0
+    while i < op.parameters.len() {
+        out = out + oa_check_schema_refs(op.parameters.get(i).schema, doc,
+            op.operation_id)
+        i = i + 1
+    }
+    # Request body.
+    let mut j: int = 0
+    while j < op.request_body.len() {
+        out = out + oa_check_schema_refs(op.request_body.get(j).schema,
+            doc, op.operation_id)
+        j = j + 1
+    }
+    # Responses.
+    let mut k: int = 0
+    while k < op.responses.len() {
+        out = out + oa_check_schema_refs(op.responses.get(k).schema, doc,
+            op.operation_id)
+        k = k + 1
+    }
+    return out
+}
+
+# oa_check_schema_refs(schema, doc, op_id) — recursively verify $refs.
+fn oa_check_schema_refs(schema: OpenApiSchema, doc: OpenApiDoc,
+    op_id: str) -> str {
+    if schema.kind == oa_kind_ref() {
+        let mut found: bool = false
+        let mut i: int = 0
+        while i < doc.schemas.len() {
+            if doc.schemas.get(i).name == schema.ref_name {
+                found = true
+            }
+            i = i + 1
+        }
+        if !found {
+            let m: str = "operation '" + op_id + "': $ref target '"
+                + schema.ref_name + "' is not in components/schemas"
+            return m
+        }
+        return ""
+    }
+    let out: str = ""
+    let mut j: int = 0
+    while j < schema.items.len() {
+        let sub: str = oa_check_schema_refs(schema.items.get(j), doc, op_id)
+        if sub.len() > 0 {
+            return sub
+        }
+        j = j + 1
+    }
+    let mut k: int = 0
+    while k < schema.properties.len() {
+        let sub2: str = oa_check_schema_refs(
+            schema.properties.get(k).schema, doc, op_id)
+        if sub2.len() > 0 {
+            return sub2
+        }
+        k = k + 1
+    }
+    return out
+}
+
+
+# ============================================================================
+# Method forms — impl blocks mirror the free functions so builder
+# chains read fluently (the std.progress / std.log convention):
+#   oa_operation("GET", "/users/{id}", "getUser").with_summary("...")
+#     .with_param(oa_query_param("q", oa_str()))
+#     .with_response(oa_response_json(200, "ok", oa_ref("User")))
+# ============================================================================
+
+impl OpenApiSchema {
+    # nullable() — allow null (3.1 type array).
+    fn nullable(self: OpenApiSchema) -> OpenApiSchema {
+        return oa_nullable(self)
+    }
+
+    # with_description(description) — attach a description.
+    fn with_description(self: OpenApiSchema, description: str)
+        -> OpenApiSchema {
+        return oa_with_description(self, description)
+    }
+
+    # with_example(example_json) — attach a rendered JSON example.
+    fn with_example(self: OpenApiSchema, example_json: str)
+        -> OpenApiSchema {
+        return oa_with_example(self, example_json)
+    }
+}
+
+impl OpenApiParameter {
+    # with_description(description) — attach a description.
+    fn with_description(self: OpenApiParameter, description: str)
+        -> OpenApiParameter {
+        return oa_param_with_description(self, description)
+    }
+
+    # required() — mark the parameter required.
+    fn required(self: OpenApiParameter) -> OpenApiParameter {
+        return oa_param_required(self)
+    }
+}
+
+impl OpenApiRequestBody {
+    # required() — the body is required.
+    fn required(self: OpenApiRequestBody) -> OpenApiRequestBody {
+        return oa_body_required(self)
+    }
+
+    # with_description(description) — attach a description.
+    fn with_description(self: OpenApiRequestBody, description: str)
+        -> OpenApiRequestBody {
+        return oa_body_with_description(self, description)
+    }
+}
+
+impl OpenApiOperation {
+    # with_summary(summary) — one-line summary.
+    fn with_summary(self: OpenApiOperation, summary: str)
+        -> OpenApiOperation {
+        return oa_with_summary(self, summary)
+    }
+
+    # with_description(description) — long description.
+    fn with_description(self: OpenApiOperation, description: str)
+        -> OpenApiOperation {
+        return oa_with_description_op(self, description)
+    }
+
+    # with_tag(tag) — append a tag.
+    fn with_tag(self: OpenApiOperation, tag: str) -> OpenApiOperation {
+        return oa_with_tag(self, tag)
+    }
+
+    # with_param(param) — append a parameter.
+    fn with_param(self: OpenApiOperation, param: OpenApiParameter)
+        -> OpenApiOperation {
+        return oa_with_param(self, param)
+    }
+
+    # with_request_body(body) — set the request body.
+    fn with_request_body(self: OpenApiOperation, body: OpenApiRequestBody)
+        -> OpenApiOperation {
+        return oa_with_request_body(self, body)
+    }
+
+    # with_response(response) — append/replace a response by status.
+    fn with_response(self: OpenApiOperation, response: OpenApiResponse)
+        -> OpenApiOperation {
+        return oa_with_response(self, response)
+    }
+
+    # deprecated() — mark the operation deprecated.
+    fn deprecated(self: OpenApiOperation) -> OpenApiOperation {
+        return oa_deprecated(self)
+    }
+}
+
+impl OpenApiDoc {
+    # with_description(description) — the API description.
+    fn with_description(self: OpenApiDoc, description: str)
+        -> OpenApiDoc {
+        return openapi_doc_with_description(self, description)
+    }
+
+    # with_server(url) — append a server URL.
+    fn with_server(self: OpenApiDoc, url: str) -> OpenApiDoc {
+        return openapi_doc_with_server(self, url)
+    }
+
+    # with_schema(name, schema) — add/replace a named schema.
+    fn with_schema(self: OpenApiDoc, name: str, schema: OpenApiSchema)
+        -> OpenApiDoc {
+        return openapi_doc_with_schema(self, name, schema)
+    }
+}

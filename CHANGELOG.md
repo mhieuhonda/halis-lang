@@ -13,6 +13,122 @@ stability (125–140), and final stabilisation toward v1.0 (141–150).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
+## [v0.91.0-alpha] — Stage 72: std.openapi — OpenAPI 3.1 from handler types
+
+> Continues **Phase V (web application track, Stages 63–76)** — the
+> TENTH module of the phase. Adds `std.openapi` — a pure-HLS OpenAPI
+> 3.1 generator: handler type signatures become JSON Schema entries,
+> the router bridge converts `std.http_router` routes into documented
+> paths, and the spec is served at `/openapi.json` and `/docs`
+> (Swagger UI) — exactly the roadmap's Stage 72 promise.
+>
+> HLS has no reflection, so "type signatures" are declared explicitly
+> with descriptor builders (the std.cli / std.graphql approach):
+> `OpenApiSchema` values compose typed JSON Schema 2020-12 entries
+> (`oa_int` / `oa_str` / `oa_str_enum` / `oa_array` / `oa_object` /
+> `oa_ref` / `oa_nullable`), and `OpenApiOperation` values describe
+> one handler each (method, path, parameters, request body schema,
+> response schemas).
+
+Implements the roadmap's Stage 72 promise:
+
+- **JSON Schema builders (OpenAPI 3.1 / JSON Schema 2020-12):**
+  - `OpenApiSchema { kind, format, ref_name, description,
+    enum_values, items, properties, example_json, nullable }` with
+    constructors `oa_empty` / `oa_int` / `oa_int32` / `oa_float` /
+    `oa_str` / `oa_str_format` / `oa_bool` / `oa_str_enum` /
+    `oa_array` / `oa_object` (+ `oa_prop`) / `oa_ref`, and immutable
+    setters `oa_nullable` / `oa_with_description` / `oa_with_example`.
+  - `oa_schema_to_json` renders deterministic JSON Schema objects.
+    Nullable values use the 3.1 style — `"type": ["string", "null"]`
+    type arrays, NOT the 3.0 `nullable: true`.
+  - **Every setter copies first** (HLS structs are by-reference —
+    alias-then-mutate would corrupt the caller's value; the
+    copy-first discipline is explicitly verified by the tests).
+
+- **Operation model:**
+  - `OpenApiParameter` (`oa_param` / `oa_query_param` /
+    `oa_header_param` + setters; path parameters are forced required),
+    `OpenApiRequestBody` (`oa_request_body` + `oa_body_required` /
+    description), `OpenApiResponse` (`oa_response` /
+    `oa_response_json`).
+  - `OpenApiOperation` + `oa_with_summary` / `oa_with_description_op`
+    / `oa_with_tag` / `oa_with_param` / `oa_with_request_body` /
+    `oa_with_response` (duplicate status codes replace) /
+    `oa_deprecated` — free functions AND `impl` method forms so
+    builder chains read fluently.
+
+- **The ROUTER BRIDGE (the core promise):**
+  - `oa_path_from_pattern` converts router patterns to OpenAPI path
+    templates (`/users/:id` -> `/users/{id}`, `*` -> `{path}`);
+    `oa_pattern_params` extracts the implied parameters.
+  - `openapi_from_router(router, bindings, title, version)` walks the
+    Router: patterns become paths, implied `:param` segments
+    auto-generate REQUIRED path parameters (unless the bound operation
+    declares them), operations attach by handler_id
+    (`OpenApiBinding`), ANY-wildcard routes use the operation's
+    method, sub-router mounts contribute prefixed routes, unbound
+    routes are SKIPPED (internal endpoints stay out of the spec), and
+    bindings matching no route are an ERROR (the spec must not lie).
+  - `openapi_doc_add_operation` rejects duplicate path+method and
+    duplicate operationId.
+
+- **Validation — `openapi_validate`:** every operation has responses,
+  every response has a description, paths start with "/", the path
+  template's parameters are declared (and vice versa), path
+  parameters are required, and every `$ref` target resolves in
+  components/schemas — recursively through array items and object
+  properties.
+
+- **Rendering — `openapi_to_json` / `openapi_to_json_str`:** the full
+  document (`openapi`, `info`, `servers`, `paths`,
+  `components.schemas`) with deterministic key order; paths group
+  operations by path (first-seen order) then method (lower-case keys
+  per the spec; path keys keep their case — paths are case-sensitive).
+
+- **Serving:**
+  - `openapi_json_response(doc)` — `/openapi.json`: 200 +
+    application/json.
+  - `openapi_docs_response(doc, title)` — `/docs`: a standalone
+    Swagger UI page with the spec embedded INLINE (works from
+    file:// too); `openapi_docs_html_url(spec_url, title)` is the
+    URL-fetching variant.
+  - **Script-injection defence:** every `"</"` inside the embedded
+    spec is rewritten to `"<\/"` — a VALID JSON escape — so string
+    values can never terminate the enclosing `<script>` block;
+    `oa_js_string` applies the same rule (plus quote/backslash
+    escaping) to the URL variant. html_escape is deliberately NOT
+    used inside script contexts (it would corrupt URLs).
+
+- **Constants:** `oa_version` ("3.1.0"), locations
+  (`oa_in_query/path/header`), media types, common status codes,
+  the five method names, kind codes, and `oa_template_to_pattern`
+  (the inverse of the path conversion).
+
+**Acceptance test** (`tests/ok/feat_stage72_openapi.hls`, 14 tests,
+all PASS): schema builders + rendering (types, formats, enums,
+items, properties + required, nullable type arrays, $ref, examples);
+immutability of EVERY builder class; pattern conversion; the document
+model + duplicate rejection; the router bridge (auto path params,
+ANY routes, sub-router mounts, skipped internal routes, unbound
+binding errors, duplicate-after-bridge detection); rendering details
+(key order, grouping, requestBody, no-content responses, tags);
+validation (7 rejection cases + a valid document); serving; the
+script-injection defence; `oa_js_string`; constants; and an
+end-to-end router -> bindings -> schemas -> validate -> render ->
+serve flow whose output round-trips through std.json.
+
+**Demo** (`examples/openapi_demo.hls`, ~330 lines): a pet-shop API —
+six routes including a mounted sub-router and an internal (undocumented)
+route, five named schemas, the bridge, validation, the full JSON
+render, both serving endpoints, the injection defence, and an
+immutability check. Fully deterministic.
+
+**Makefile target:** `make openapi-acceptance` — runs the demo and
+the acceptance test differentially (interpreter == native for both),
+then prints the feature summary. Pure-HLS implementation; no new
+compiler builtins; bootstrap is still deterministic.
+
 ## [v0.90.0-alpha] — Stage 71: std.graphql — schema-first GraphQL server
 
 > Continues **Phase V (web application track, Stages 63–76)** — the

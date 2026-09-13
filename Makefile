@@ -31,7 +31,7 @@ else
   HL_CURL_DEFS :=
 endif
 
-.PHONY: all stage0 bootstrap test examples clean run check bench install uninstall audit opt-stats emit-ir emit-llvm fmt lint lsp-check pkg-init pkg-add pkg-lock pkg-audit pkg-verify pkg-build pkg-publish pkg-log pkg-log-verify prove prove-full model prove-acceptance hltest fuzz cov fuzz-acceptance wasm-opt webapp webapp-acceptance serve aarch64-bench aarch64-acceptance aarch64-list-targets stack-acceptance inline-acceptance opt-stats-report kernel-attrs escape-acceptance layout-report tail-acceptance tail-report asm-acceptance asm-attrs bench-stdlib spec-check stage32-acceptance async-acceptance stream-acceptance io-acceptance fs-acceptance net-acceptance http-acceptance http2-acceptance json-stream-acceptance regex-acceptance fmt-acceptance hash-acceptance collections-acceptance sync-acceptance thread-acceptance time-acceptance math-acceptance process-acceptance env-acceptance archive-acceptance uuid-ulid-acceptance cli-acceptance tui-acceptance color-acceptance progress-acceptance log-acceptance http-server-acceptance websocket-acceptance cookie-acceptance session-acceptance csrf-acceptance template-acceptance sse-acceptance graphql-acceptance
+.PHONY: all stage0 bootstrap test examples clean run check bench install uninstall audit opt-stats emit-ir emit-llvm fmt lint lsp-check pkg-init pkg-add pkg-lock pkg-audit pkg-verify pkg-build pkg-publish pkg-log pkg-log-verify prove prove-full model prove-acceptance hltest fuzz cov fuzz-acceptance wasm-opt webapp webapp-acceptance serve aarch64-bench aarch64-acceptance aarch64-list-targets stack-acceptance inline-acceptance opt-stats-report kernel-attrs escape-acceptance layout-report tail-acceptance tail-report asm-acceptance asm-attrs bench-stdlib spec-check stage32-acceptance async-acceptance stream-acceptance io-acceptance fs-acceptance net-acceptance http-acceptance http2-acceptance json-stream-acceptance regex-acceptance fmt-acceptance hash-acceptance collections-acceptance sync-acceptance thread-acceptance time-acceptance math-acceptance process-acceptance env-acceptance archive-acceptance uuid-ulid-acceptance cli-acceptance tui-acceptance color-acceptance progress-acceptance log-acceptance http-server-acceptance websocket-acceptance cookie-acceptance session-acceptance csrf-acceptance template-acceptance sse-acceptance graphql-acceptance openapi-acceptance
 
 # Main goal: use the full bootstrap chain to build the native compiler
 all: bootstrap
@@ -3122,3 +3122,55 @@ graphql-acceptance: bin/hlc
 	@echo "  differential (interpreter == native) verified green."
 
 .PHONY: graphql-acceptance
+
+# openapi-acceptance: Stage 72 gate — the demo AND the acceptance
+# test run differentially (interpreter == native), proving the whole
+# OpenAPI pipeline (schema builders -> router bridge -> validate ->
+# render -> serve) is deterministic.
+openapi-acceptance: bin/hlc
+	@$(PYTHON) boot/boot.py examples/openapi_demo.hls > /tmp/oa_demo_interp.txt 2>&1
+	@bin/hlc examples/openapi_demo.hls /tmp/oa_demo.c 2>/dev/null
+	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/oa_demo /tmp/oa_demo.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
+	@/tmp/oa_demo > /tmp/oa_demo_nat.txt 2>&1
+	@diff -q /tmp/oa_demo_interp.txt /tmp/oa_demo_nat.txt >/dev/null 2>&1 \
+		|| (echo "FAIL: openapi_demo differential mismatch" && false)
+	@$(PYTHON) boot/boot.py tests/ok/feat_stage72_openapi.hls > /tmp/s72_interp.txt 2>&1
+	@bin/hlc tests/ok/feat_stage72_openapi.hls /tmp/s72.c 2>/dev/null
+	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/s72 /tmp/s72.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
+	@/tmp/s72 > /tmp/s72_nat.txt 2>&1
+	@diff -q /tmp/s72_interp.txt /tmp/s72_nat.txt >/dev/null 2>&1 \
+		|| (echo "FAIL: feat_stage72_openapi differential mismatch" && false)
+	@rm -f /tmp/oa_demo /tmp/oa_demo.c /tmp/oa_demo_interp.txt /tmp/oa_demo_nat.txt \
+		/tmp/s72 /tmp/s72.c /tmp/s72_interp.txt /tmp/s72_nat.txt
+	@echo ""
+	@echo "ACCEPTANCE OK: Stage 72 -- std.openapi (OpenAPI 3.1 from handler types)"
+	@echo "  JSON Schema builders (3.1 / JSON Schema 2020-12):"
+	@echo "    oa_int/int32/float/str/str_format/bool/str_enum/array/object/ref"
+	@echo "    oa_nullable (type arrays, NOT 3.0 nullable:true), with_description,"
+	@echo "    with_example; oa_schema_to_json (deterministic key order)"
+	@echo "  Operation model:"
+	@echo "    oa_operation + with_summary/description/tag/param/request_body/"
+	@echo "    response/deprecated (free fns + impl method forms); duplicate"
+	@echo "    response statuses replace"
+	@echo "  Router bridge (the roadmap's promise):"
+	@echo "    openapi_from_router: ':param' -> '{param}' path conversion,"
+	@echo "    implied path parameters auto-generated (required, string),"
+	@echo "    handler_id bindings, ANY routes use the operation's method,"
+	@echo "    sub-router mounts contribute prefixed routes, unbound routes"
+	@echo "    skipped, unbound bindings rejected"
+	@echo "  Document: openapi_doc_new + with_description/server/schema;"
+	@echo "    add_operation rejects duplicate path+method / operationId"
+	@echo "  Validation: path shape, responses present + described,"
+	@echo "    path-template <-> declared parameters, required path params,"
+	@echo "    $ref targets resolve (recursively)"
+	@echo "  Rendering: openapi_to_json (paths grouped by path then method,"
+	@echo "    lower-case method keys, components.schemas, servers, info)"
+	@echo "  Serving: openapi_json_response (/openapi.json) and"
+	@echo "    openapi_docs_response (/docs Swagger UI, spec embedded INLINE)"
+	@echo "    + the URL variant; '</' escaped to '<\/' in embedded specs"
+	@echo "    (script-injection defence, JSON still valid)"
+	@echo "  Immutability: every builder copies (structs are by-reference)"
+	@echo "  Pure-HLS implementation (no new compiler builtins)"
+	@echo "  differential (interpreter == native) verified green."
+
+.PHONY: openapi-acceptance

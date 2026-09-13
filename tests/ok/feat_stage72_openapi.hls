@@ -1,0 +1,727 @@
+# tests/ok/feat_stage72_openapi.hls — Stage 72 (v0.91.0-alpha):
+# std.openapi — OpenAPI 3.1 generation from handler type signatures.
+#
+# Exercises:
+#   - JSON Schema builders (oa_int/oa_int32/oa_float/oa_str/
+#     oa_str_format/oa_bool/oa_str_enum/oa_array/oa_object/oa_ref/
+#     oa_nullable/oa_with_description/oa_with_example + oa_prop)
+#   - JSON Schema rendering (types, formats, enums, items,
+#     properties + required, 3.1-style nullable type arrays, $ref,
+#     examples)
+#   - IMMUTABILITY: every builder returns a new value and never
+#     mutates its receiver (HLS structs are by-reference — the
+#     copy-first setters are verified explicitly)
+#   - Operation model (oa_operation + with_summary/with_description/
+#     with_tag/with_param/with_request_body/with_response/deprecated,
+#     free functions AND method forms; duplicate-status replacement)
+#   - Pattern conversion (oa_path_from_pattern: :id -> {id}, * ->
+#     {path}; oa_pattern_params)
+#   - The ROUTER BRIDGE (openapi_from_router): patterns become OpenAPI
+#     paths, implied path parameters auto-generate, bound operations
+#     attach by handler_id, ANY routes use the operation's method,
+#     sub-router mounts contribute prefixed routes, unbound routes
+#     are skipped, unbound bindings are an error
+#   - Document rendering (openapi_to_json / openapi_to_json_str):
+#     deterministic key order, paths grouped by path then method,
+#     components.schemas, servers, info
+#   - Validation (openapi_validate): path shape, responses present,
+#     response descriptions, path-template <-> declared parameters,
+#     required path parameters, $ref targets resolve
+#   - Serving: openapi_json_response (/openapi.json) and
+#     openapi_docs_response (/docs — Swagger UI with the spec
+#     embedded INLINE), openapi_docs_html_url (the URL variant)
+#   - The script-injection defence: "</" inside the embedded spec is
+#     rewritten to "<\/" (a valid JSON escape) so string values can
+#     never terminate the <script> block
+#   - Constants
+#
+# Negative cases:
+#   - openapi_doc_add_operation rejects duplicate path+method and
+#     duplicate operationId
+#   - openapi_from_router rejects bindings with no matching route
+#   - openapi_validate rejects every listed invariant
+#   - oa_js_string escapes quotes, backslashes, and the "</" sequence
+#
+# The output is fully deterministic (no Rand, no I/O beyond println)
+# so the differential test (interpreter == native) is byte-identical.
+
+import "std.openapi"
+import "std.http"
+import "std.http_router"
+import "std.json"
+import "std.str"
+import "std.option"
+import "std.result"
+
+# ============================================================================
+# Helpers — assertion primitives (same pattern as feat_stage66..71).
+# ============================================================================
+
+fn ok(actual: bool, msg: str) -> void uses IO {
+    if !actual {
+        panic("FAIL " + msg)
+    }
+}
+
+fn eq_int(actual: int, expected: int, msg: str) -> void uses IO {
+    if actual != expected {
+        panic("FAIL " + msg + ": expected " + expected.to_str() + ", got " + actual.to_str())
+    }
+}
+
+fn eq_str(actual: str, expected: str, msg: str) -> void uses IO {
+    if actual != expected {
+        panic("FAIL " + msg + ": expected '" + expected + "', got '" + actual + "'")
+    }
+}
+
+fn eq_bool(actual: bool, expected: bool, msg: str) -> void uses IO {
+    if actual != expected {
+        panic("FAIL " + msg + ": expected " + expected.to_str() + ", got " + actual.to_str())
+    }
+}
+
+fn contains(actual: str, sub: str, msg: str) -> void uses IO {
+    if !actual.contains(sub) {
+        panic("FAIL " + msg + ": expected to contain '" + sub + "', got '" + actual + "'")
+    }
+}
+
+# ============================================================================
+# Test 1: schema builders + kinds.
+# ============================================================================
+
+fn test_schema_builders() -> int uses IO {
+    eq_int(oa_int().kind, oa_kind_int(), "int kind")
+    eq_str(oa_int().format, "int64", "int format")
+    eq_str(oa_int32().format, "int32", "int32 format")
+    eq_int(oa_float().kind, oa_kind_float(), "float kind")
+    eq_str(oa_float().format, "double", "float format")
+    eq_int(oa_str().kind, oa_kind_string(), "str kind")
+    eq_str(oa_str_format("date-time").format, "date-time", "str format")
+    eq_int(oa_bool().kind, oa_kind_boolean(), "bool kind")
+    eq_int(oa_str_enum(["a", "b"]).kind, oa_kind_enum_str(), "enum kind")
+    eq_int(oa_str_enum(["a", "b"]).enum_values.len(), 2, "enum values")
+    eq_int(oa_array(oa_int()).kind, oa_kind_array(), "array kind")
+    eq_int(oa_array(oa_int()).items.len(), 1, "array items count")
+    eq_int(oa_ref("User").kind, oa_kind_ref(), "ref kind")
+    eq_str(oa_ref("User").ref_name, "User", "ref name")
+    eq_int(oa_empty().kind, oa_kind_empty(), "empty kind")
+    let obj: OpenApiSchema = oa_object([
+        oa_prop("a", oa_int(), true),
+        oa_prop("b", oa_str(), false)
+    ])
+    eq_int(obj.kind, oa_kind_object(), "object kind")
+    eq_int(obj.properties.len(), 2, "object properties")
+    eq_bool(obj.properties.get(0).required, true, "required flag")
+    eq_bool(obj.properties.get(1).required, false, "optional flag")
+    return 0
+}
+
+# ============================================================================
+# Test 2: JSON Schema rendering.
+# ============================================================================
+
+fn test_schema_render() -> int uses IO {
+    eq_str(json_stringify(oa_schema_to_json(oa_int())),
+        "{\"type\":\"integer\",\"format\":\"int64\"}", "int render")
+    eq_str(json_stringify(oa_schema_to_json(oa_str())),
+        "{\"type\":\"string\"}", "str render")
+    eq_str(json_stringify(oa_schema_to_json(oa_bool())),
+        "{\"type\":\"boolean\"}", "bool render")
+    eq_str(json_stringify(oa_schema_to_json(oa_nullable(oa_str()))),
+        "{\"type\":[\"string\",\"null\"]}", "3.1 nullable type array")
+    eq_str(json_stringify(oa_schema_to_json(oa_str_enum(["red", "green"]))),
+        "{\"type\":\"string\",\"enum\":[\"red\",\"green\"]}", "enum render")
+    eq_str(json_stringify(oa_schema_to_json(oa_array(oa_int()))),
+        "{\"type\":\"array\",\"items\":{\"type\":\"integer\",\"format\":\"int64\"}}",
+        "array render")
+    eq_str(json_stringify(oa_schema_to_json(oa_ref("User"))),
+        "{\"$ref\":\"#/components/schemas/User\"}", "ref render")
+    eq_str(json_stringify(oa_schema_to_json(oa_empty())),
+        "{}", "empty render")
+    eq_str(json_stringify(oa_schema_to_json(
+        oa_str().with_description("a name"))),
+        "{\"type\":\"string\",\"description\":\"a name\"}", "description")
+    eq_str(json_stringify(oa_schema_to_json(
+        oa_int().with_example("42"))),
+        "{\"type\":\"integer\",\"format\":\"int64\",\"example\":42}",
+        "example parsed and embedded")
+    let obj: OpenApiSchema = oa_object([
+        oa_prop("id", oa_int(), true),
+        oa_prop("nick", oa_nullable(oa_str()), false)
+    ])
+    eq_str(json_stringify(oa_schema_to_json(obj)),
+        "{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\",\"format\":\"int64\"},"
+        + "\"nick\":{\"type\":[\"string\",\"null\"]}},\"required\":[\"id\"]}",
+        "object render with required")
+    # Nested: array of objects with an array property.
+    let nested: OpenApiSchema = oa_array(oa_object([
+        oa_prop("tags", oa_array(oa_str()), true)
+    ]))
+    contains(json_stringify(oa_schema_to_json(nested)),
+        "\"items\":{\"type\":\"object\"", "nested array-of-object")
+    return 0
+}
+
+# ============================================================================
+# Test 3: immutability — builders never mutate their receiver.
+# ============================================================================
+
+fn test_immutability() -> int uses IO {
+    # Schema setters.
+    let base: OpenApiSchema = oa_str()
+    let _d: OpenApiSchema = base.with_description("changed")
+    let _n: OpenApiSchema = base.nullable()
+    let _e: OpenApiSchema = base.with_example("\"x\"")
+    eq_int(base.description.len(), 0, "with_description does not mutate")
+    eq_bool(base.nullable, false, "nullable does not mutate")
+    eq_int(base.example_json.len(), 0, "with_example does not mutate")
+    # Enum values list is copied.
+    let vals: list[str] = []
+    vals.push("a")
+    let en: OpenApiSchema = oa_str_enum(vals)
+    vals.push("b")
+    eq_int(en.enum_values.len(), 1, "enum values copied")
+    # Operation setters.
+    let op: OpenApiOperation = oa_operation("GET", "/x", "x")
+    let op2: OpenApiOperation = op.with_summary("s").with_tag("t")
+        .with_tag("t2").with_param(oa_query_param("q", oa_str()))
+        .with_response(oa_response(200, "ok"))
+        .with_response(oa_response(404, "no"))
+        .deprecated()
+    eq_int(op.summary.len(), 0, "with_summary does not mutate")
+    eq_int(op.tags.len(), 0, "with_tag does not mutate")
+    eq_int(op.parameters.len(), 0, "with_param does not mutate")
+    eq_int(op.responses.len(), 0, "with_response does not mutate")
+    eq_bool(op.deprecated, false, "deprecated does not mutate")
+    eq_int(op2.tags.len(), 2, "chained tags accumulate")
+    eq_int(op2.responses.len(), 2, "chained responses accumulate")
+    # with_response replaces duplicate status codes (the replacement
+    # lands at the END of the list; order is otherwise preserved).
+    let op3: OpenApiOperation = op2.with_response(oa_response(200, "new"))
+    eq_int(op3.responses.len(), 2, "duplicate status replaced")
+    eq_str(op3.responses.get(1).description, "new", "replacement present")
+    eq_str(op3.responses.get(0).description, "no", "other kept in place")
+    # Request body setters.
+    let body: OpenApiRequestBody = oa_request_body(oa_str())
+    let _b2: OpenApiRequestBody = body.required().with_description("d")
+    eq_bool(body.required, false, "body required does not mutate")
+    eq_int(body.description.len(), 0, "body description does not mutate")
+    # Parameter setters.
+    let p: OpenApiParameter = oa_query_param("q", oa_str())
+    let _p2: OpenApiParameter = p.required().with_description("d")
+    eq_bool(p.required, false, "param required does not mutate")
+    # Doc setters.
+    let doc: OpenApiDoc = openapi_doc_new("T", "1.0.0")
+    let _d2: OpenApiDoc = doc.with_description("d").with_server("http://x")
+        .with_schema("S", oa_str())
+    eq_int(doc.description.len(), 0, "doc description does not mutate")
+    eq_int(doc.servers.len(), 0, "doc servers do not mutate")
+    eq_int(doc.schemas.len(), 0, "doc schemas do not mutate")
+    # with_schema replaces by name.
+    let doc2: OpenApiDoc = doc.with_schema("S", oa_str())
+        .with_schema("S", oa_int())
+    eq_int(doc2.schemas.len(), 1, "schema replaced by name")
+    eq_int(doc2.schemas.get(0).schema.kind, oa_kind_int(), "replacement wins")
+    return 0
+}
+
+# ============================================================================
+# Test 4: pattern conversion.
+# ============================================================================
+
+fn test_pattern_conversion() -> int uses IO {
+    eq_str(oa_path_from_pattern("/users"), "/users", "plain path")
+    eq_str(oa_path_from_pattern("/users/:id"), "/users/{id}", "param path")
+    eq_str(oa_path_from_pattern("/users/:id/files/:fid"),
+        "/users/{id}/files/{fid}", "two params")
+    eq_str(oa_path_from_pattern("/files/*"), "/files/{path}", "wildcard")
+    eq_str(oa_path_from_pattern("/a/:x/b/*"), "/a/{x}/b/{path}",
+        "mixed params and wildcard")
+    let ps: list[str] = oa_pattern_params("/users/:id/files/:fid")
+    eq_int(ps.len(), 2, "param count")
+    eq_str(ps.get(0), "id", "param 0")
+    eq_str(ps.get(1), "fid", "param 1")
+    eq_int(oa_pattern_params("/static/*").len(), 1, "wildcard param")
+    eq_str(oa_pattern_params("/static/*").get(0), "path", "wildcard name")
+    eq_int(oa_pattern_params("/plain").len(), 0, "no params")
+    # Leading colon (path ":x" — a weird but legal router pattern).
+    eq_str(oa_path_from_pattern(":x"), "{x}", "leading param")
+    return 0
+}
+
+# ============================================================================
+# Test 5: the document model + duplicate rejection.
+# ============================================================================
+
+fn test_doc_builders() -> int uses IO {
+    let doc: OpenApiDoc = openapi_doc_new("Demo API", "2.1.0")
+        .with_description("A demo")
+        .with_server("https://api.example.com")
+        .with_server("http://localhost:8080")
+    eq_str(doc.title, "Demo API", "title")
+    eq_str(doc.version, "2.1.0", "version")
+    eq_int(doc.servers.len(), 2, "servers")
+    # add_operation is immutable: chain the results (adding to the
+    # ORIGINAL twice is legal — it never saw the first operation).
+    let op: OpenApiOperation = oa_operation("GET", "/a", "a")
+    let r1: Result[OpenApiDoc, str] = openapi_doc_add_operation(doc, op)
+    ok(result_is_ok(r1), "first add ok")
+    let doc1: OpenApiDoc = result_unwrap(r1)
+    eq_int(doc1.operations.len(), 1, "operation stored")
+    # Duplicate path+method (against the accumulated doc).
+    let dup: OpenApiOperation = oa_operation("GET", "/a", "other")
+    contains(result_err_or(openapi_doc_add_operation(doc1, dup), ""),
+        "duplicate operation for GET /a", "duplicate path+method")
+    # Same path, different method is fine.
+    let other_method: OpenApiOperation = oa_operation("POST", "/a", "b")
+    let r2: Result[OpenApiDoc, str] = openapi_doc_add_operation(doc1,
+        other_method)
+    ok(result_is_ok(r2), "same path other method ok")
+    let doc2: OpenApiDoc = result_ununwrap(r2)
+    # Duplicate operationId.
+    let dup_id: OpenApiOperation = oa_operation("GET", "/b", "a")
+    contains(result_err_or(openapi_doc_add_operation(doc2, dup_id), ""),
+        "duplicate operationId 'a'", "duplicate operationId")
+    # Empty operationId never collides.
+    let anon1: OpenApiOperation = oa_operation("GET", "/c", "")
+    let anon2: OpenApiOperation = oa_operation("GET", "/d", "")
+    let r3: Result[OpenApiDoc, str] = openapi_doc_add_operation(doc2, anon1)
+    ok(result_is_ok(r3), "anon id 1")
+    ok(result_is_ok(openapi_doc_add_operation(result_ununwrap(r3), anon2)),
+        "anon id 2")
+    return 0
+}
+
+# ============================================================================
+# Test 6: the router bridge.
+# ============================================================================
+
+fn bridge_doc() -> Result[OpenApiDoc, str] {
+    let router: Router = router_new()
+        .get("/users", 1)
+        .post("/users", 2)
+        .get("/users/:id", 3)
+        .delete("/users/:id", 4)
+        .get("/internal/health", 9)
+    let sub: Router = router_new()
+        .get("/items/:iid", 5)
+    let mounted: Router = router_mount(router, "/shop", sub)
+    let bindings: list[OpenApiBinding] = []
+    bindings.push(oa_binding(1, oa_operation("GET", "/users", "listUsers")
+        .with_summary("List users")
+        .with_tag("users")
+        .with_param(oa_query_param("q",
+            oa_nullable(oa_str()).with_description("filter")))
+        .with_response(oa_response_json(200, "The users",
+            oa_array(oa_ref("User"))))))
+    bindings.push(oa_binding(2, oa_operation("POST", "/users", "createUser")
+        .with_request_body(oa_request_body(oa_ref("User")).required())
+        .with_response(oa_response_json(201, "Created", oa_ref("User")))
+        .with_response(oa_response(400, "Bad input"))))
+    bindings.push(oa_binding(3, oa_operation("GET", "/users/{id}", "getUser")
+        .with_summary("Fetch one user")
+        .with_response(oa_response_json(200, "The user", oa_ref("User")))
+        .with_response(oa_response(404, "Not found"))))
+    bindings.push(oa_binding(4, oa_operation("DELETE", "/users/{id}",
+        "deleteUser")
+        .with_response(oa_response(204, "Deleted"))))
+    bindings.push(oa_binding(5, oa_operation("GET", "/shop/items/{iid}",
+        "getItem")
+        .with_response(oa_response_json(200, "The item", oa_ref("Item")))))
+    return openapi_from_router(mounted, bindings, "Shop API", "1.2.3")
+}
+
+fn test_router_bridge() -> int uses IO {
+    let r: Result[OpenApiDoc, str] = bridge_doc()
+    if result_is_err(r) {
+        let m: str = result_err_or(r, "")
+        panic("FAIL bridge: " + m)
+    }
+    let doc: OpenApiDoc = result_unwrap(r)
+    # 6 routes registered, 5 bound (the /internal/health route is
+    # unbound and therefore skipped).
+    eq_int(openapi_doc_operation_count(doc), 5, "bound operations")
+    # Patterns converted; implied path params auto-generated.
+    let json: str = openapi_to_json_str(doc)
+    contains(json, "\"/users/{id}\"", "param path converted")
+    contains(json, "\"/shop/items/{iid}\"", "sub-router prefix + param")
+    contains(json, "\"name\":\"id\",\"in\":\"path\",\"required\":true",
+        "implied path parameter")
+    contains(json, "\"name\":\"iid\",\"in\":\"path\",\"required\":true",
+        "sub-router implied parameter")
+    # Explicit query parameter survived.
+    contains(json, "\"name\":\"q\",\"in\":\"query\"", "explicit query param")
+    contains(json, "\"description\":\"filter\"", "param description")
+    # Internal route absent.
+    ok(!json.contains("internal"), "unbound route skipped")
+    # Validation passes once the schemas exist.
+    let doc2: OpenApiDoc = doc.with_schema("User", oa_object([
+        oa_prop("id", oa_int(), true),
+        oa_prop("name", oa_str(), true)
+    ])).with_schema("Item", oa_object([
+        oa_prop("iid", oa_str(), true)
+    ]))
+    let v: Result[bool, str] = openapi_validate(doc2)
+    ok(result_is_ok(v), "bridged doc validates")
+    return 0
+}
+
+# ============================================================================
+# Test 7: bridge error cases.
+# ============================================================================
+
+fn test_bridge_errors() -> int uses IO {
+    # A binding whose handler matches no route.
+    let router: Router = router_new().get("/a", 1)
+    let bindings: list[OpenApiBinding] = []
+    bindings.push(oa_binding(1, oa_operation("GET", "/a", "a")))
+    bindings.push(oa_binding(77, oa_operation("GET", "/ghost", "ghost")))
+    contains(result_err_or(openapi_from_router(router, bindings, "T", "1"), ""),
+        "binding for handler 77 matches no route", "unbound binding")
+    # Duplicate operations after bridge: a top-level route and a
+    # mounted sub-router route both render to "/x/{a}" GET.
+    let sub: Router = router_new()
+        .get("/:a", 6)
+    let router2: Router = router_new()
+        .get("/x/:a", 5)
+    let mounted: Router = router_mount(router2, "/x", sub)
+    let b2: list[OpenApiBinding] = []
+    b2.push(oa_binding(5, oa_operation("GET", "/one", "one")))
+    b2.push(oa_binding(6, oa_operation("GET", "/two", "two")))
+    contains(result_err_or(openapi_from_router(mounted, b2, "T", "1"), ""),
+        "duplicate operation", "distinct routes same rendered path")
+    return 0
+}
+
+# ============================================================================
+# Test 8: document rendering details.
+# ============================================================================
+
+fn test_render_document() -> int uses IO {
+    let r: Result[OpenApiDoc, str] = bridge_doc()
+    let doc: OpenApiDoc = result_unwrap(r)
+    let json: str = openapi_to_json_str(doc)
+    # Top-level shape + key order.
+    contains(json, "{\"openapi\":\"3.1.0\",\"info\":{", "version + info first")
+    contains(json, "\"title\":\"Shop API\",\"version\":\"1.2.3\"",
+        "info fields")
+    # Paths grouped: /users before /users/{id} (first-seen order),
+    # methods lower-cased inside.
+    let users_idx: int = json.find("\"/users\":{")
+    let users_id_idx: int = json.find("\"/users/{id}\":{")
+    ok(users_idx >= 0 && users_id_idx > users_idx, "path grouping order")
+    contains(json, "\"get\":{\"operationId\":\"getUser\"", "method lower-case")
+    # Request body rendering.
+    contains(json, "\"requestBody\":{\"required\":true,\"content\":"
+        + "{\"application/json\":{\"schema\":{\"$ref\":"
+        + "\"#/components/schemas/User\"}}}}", "request body render")
+    # Responses: 201 before 400 (insertion order).
+    let c201: int = json.find("\"201\":{\"description\":\"Created\"")
+    let c400: int = json.find("\"400\":{\"description\":\"Bad input\"")
+    ok(c201 >= 0 && c400 > c201, "response insertion order")
+    # The 204 response has no content (empty schema omitted).
+    contains(json, "\"204\":{\"description\":\"Deleted\"}}", "no-content response")
+    # Tags.
+    contains(json, "\"tags\":[\"users\"]", "tags render")
+    # Docs counts.
+    eq_int(openapi_doc_operation_count(doc), 5, "operation count")
+    eq_int(openapi_doc_schema_count(doc), 0, "schema count before adding")
+    return 0
+}
+
+# ============================================================================
+# Test 9: validation.
+# ============================================================================
+
+fn test_validation() -> int uses IO {
+    # Path must start with "/".
+    let d1: OpenApiOperation = oa_operation("GET", "nope", "x")
+        .with_response(oa_response(200, "ok"))
+    contains(result_err_or(openapi_validate(
+        result_ununwrap(openapi_doc_add_operation(openapi_doc_new("T", "1"), d1))), ""),
+        "must start with '/'", "path shape")
+    # Every operation needs at least one response.
+    let d2: OpenApiOperation = oa_operation("GET", "/x", "x")
+    contains(result_err_or(openapi_validate(
+        result_ununwrap(openapi_doc_add_operation(openapi_doc_new("T", "1"), d2))), ""),
+        "has no responses", "responses required")
+    # Response descriptions are mandatory.
+    let d3: OpenApiOperation = oa_operation("GET", "/x", "x")
+        .with_response(oa_response(200, ""))
+    contains(result_err_or(openapi_validate(
+        result_ununwrap(openapi_doc_add_operation(openapi_doc_new("T", "1"), d3))), ""),
+        "has no description", "response description")
+    # Path template parameters must be declared.
+    let d4: OpenApiOperation = oa_operation("GET", "/users/{id}", "x")
+        .with_response(oa_response(200, "ok"))
+    contains(result_err_or(openapi_validate(
+        result_ununwrap(openapi_doc_add_operation(openapi_doc_new("T", "1"), d4))), ""),
+        "path parameter '{id}' is not declared", "undeclared template param")
+    # Declared path parameters must appear in the template.
+    let d5: OpenApiOperation = oa_operation("GET", "/users", "x")
+        .with_param(oa_param("id", oa_in_path(), oa_str()))
+        .with_response(oa_response(200, "ok"))
+    contains(result_err_or(openapi_validate(
+        result_ununwrap(openapi_doc_add_operation(openapi_doc_new("T", "1"), d5))), ""),
+        "does not appear in the path template", "orphan path param")
+    # $ref targets must exist.
+    let d6: OpenApiOperation = oa_operation("GET", "/x", "x")
+        .with_response(oa_response_json(200, "ok", oa_ref("Ghost")))
+    contains(result_err_or(openapi_validate(
+        result_ununwrap(openapi_doc_add_operation(openapi_doc_new("T", "1"), d6))), ""),
+        "$ref target 'Ghost' is not in components/schemas", "dangling ref")
+    # Nested $refs (inside array items / object properties) too.
+    let d7: OpenApiOperation = oa_operation("GET", "/x", "x")
+        .with_response(oa_response_json(200, "ok",
+            oa_array(oa_object([oa_prop("u", oa_ref("Ghost"), true)]))))
+    contains(result_err_or(openapi_validate(
+        result_ununwrap(openapi_doc_add_operation(openapi_doc_new("T", "1"), d7))), ""),
+        "$ref target 'Ghost' is not in components/schemas", "nested dangling ref")
+    # A valid document passes.
+    let r: Result[OpenApiDoc, str] = bridge_doc()
+    let good: OpenApiDoc = result_ununwrap(r).with_schema("User", oa_int())
+        .with_schema("Item", oa_int())
+    ok(result_is_ok(openapi_validate(good)), "valid document passes")
+    return 0
+}
+
+# ============================================================================
+# Test 10: serving — /openapi.json + /docs.
+# ============================================================================
+
+fn test_serving() -> int uses IO {
+    let r: Result[OpenApiDoc, str] = bridge_doc()
+    let doc: OpenApiDoc = result_ununwrap(r)
+    # /openapi.json
+    let jr: HttpResponse = openapi_json_response(doc)
+    eq_int(jr.status, 200, "json status")
+    eq_str(http_header_get(jr.headers, "Content-Type"),
+        "application/json", "json content type")
+    eq_str(jr.body, openapi_to_json_str(doc), "json body matches render")
+    # /docs
+    let dr: HttpResponse = openapi_docs_response(doc, "Shop")
+    eq_int(dr.status, 200, "docs status")
+    eq_str(http_header_get(dr.headers, "Content-Type"),
+        "text/html; charset=utf-8", "docs content type")
+    contains(dr.body, "<!DOCTYPE html>", "doctype")
+    contains(dr.body, "<div id=\"swagger-ui\"></div>", "swagger div")
+    contains(dr.body, "swagger-ui-bundle.js", "bundle script")
+    contains(dr.body, "spec: {\"openapi\":\"3.1.0\"", "inline spec embedded")
+    # The URL variant references the spec URL.
+    let hu: str = openapi_docs_html_url("/openapi.json", "Shop")
+    contains(hu, "url: '/openapi.json'", "url variant")
+    ok(!hu.contains("spec: {"), "url variant has no inline spec")
+    return 0
+}
+
+# ============================================================================
+# Test 11: the script-injection defence.
+# ============================================================================
+
+fn test_docs_injection() -> int uses IO {
+    let doc: OpenApiDoc = openapi_doc_new("T", "1")
+        .with_schema("Evil", oa_object([oa_prop("x",
+            oa_str().with_description("breaks </script> here"), true)]))
+    let html: str = openapi_docs_html(doc, "T")
+    # The raw breaker sequence never appears after the spec start.
+    let spec_at: int = html.find("spec: ")
+    ok(spec_at >= 0, "spec found")
+    ok(!html.slice(spec_at, html.len()).contains("</script> here"),
+        "breaker neutralised inside the spec")
+    contains(html, "<\\/script>", "escaped form present")
+    # The escaped spec is still valid JSON.
+    let start: int = html.find("spec: ") + 6
+    let end: int = html.find(", deepLinking")
+    let spec_json: str = html.slice(start, end)
+    ok(result_is_ok(json_parse_result(spec_json)),
+        "escaped spec still parses")
+    return 0
+}
+
+# ============================================================================
+# Test 12: oa_js_string.
+# ============================================================================
+
+fn test_js_string() -> int uses IO {
+    eq_str(oa_js_string("plain"), "plain", "plain")
+    eq_str(oa_js_string("it's"), "it\\'s", "quote escaped")
+    eq_str(oa_js_string("a\\b"), "a\\\\b", "backslash escaped")
+    eq_str(oa_js_string("</script>"), "<\\/script>", "breaker escaped")
+    eq_str(oa_js_string("</x"), "<\\/x", "any </ sequence escaped")
+    eq_str(oa_js_string("<b>not-a-breaker"), "<b>not-a-breaker",
+        "lone < untouched")
+    return 0
+}
+
+# ============================================================================
+# Test 13: constants.
+# ============================================================================
+
+fn test_constants() -> int uses IO {
+    eq_str(oa_version(), "3.1.0", "version")
+    eq_str(oa_content_type_json(), "application/json", "json media type")
+    eq_str(oa_in_query(), "query", "in query")
+    eq_str(oa_in_path(), "path", "in path")
+    eq_str(oa_in_header(), "header", "in header")
+    eq_int(oa_status_ok(), 200, "200")
+    eq_int(oa_status_created(), 201, "201")
+    eq_int(oa_status_no_content(), 204, "204")
+    eq_int(oa_status_bad_request(), 400, "400")
+    eq_int(oa_status_not_found(), 404, "404")
+    eq_str(oa_method_get(), "GET", "GET")
+    eq_str(oa_method_post(), "POST", "POST")
+    eq_str(oa_method_put(), "PUT", "PUT")
+    eq_str(oa_method_patch(), "PATCH", "PATCH")
+    eq_str(oa_method_delete(), "DELETE", "DELETE")
+    eq_int(oa_kind_empty(), 0, "kind empty")
+    eq_int(oa_kind_ref(), 7, "kind ref")
+    eq_str(oa_template_to_pattern("/u/{id}"), "/u/:id", "template back to pattern")
+    return 0
+}
+
+# ============================================================================
+# Test 14: end-to-end — router + bindings + schemas -> validate ->
+# render -> serve, exactly as an application would.
+# ============================================================================
+
+fn test_end_to_end() -> int uses IO {
+    let router: Router = router_new()
+        .get("/ping", 1)
+        .post("/pets", 2)
+        .get("/pets/:id", 3)
+    let bindings: list[OpenApiBinding] = []
+    bindings.push(oa_binding(1, oa_operation("GET", "/ping", "ping")
+        .with_summary("Liveness probe")
+        .with_response(oa_response_json(200, "pong",
+            oa_object([oa_prop("ok", oa_bool(), true)])))))
+    bindings.push(oa_binding(2, oa_operation("POST", "/pets", "createPet")
+        .with_tag("pets")
+        .with_request_body(oa_request_body(oa_ref("Pet")).required())
+        .with_response(oa_response_json(201, "Created", oa_ref("Pet")))))
+    bindings.push(oa_binding(3, oa_operation("GET", "/pets/{id}", "getPet")
+        .with_tag("pets")
+        .with_response(oa_response_json(200, "The pet", oa_ref("Pet")))
+        .with_response(oa_response(404, "No such pet"))))
+    let dr: Result[OpenApiDoc, str] = openapi_from_router(router, bindings,
+        "Petstore", "1.0.0")
+    if result_is_err(dr) {
+        let m: str = result_err_or(dr, "")
+        panic("FAIL e2e bridge: " + m)
+    }
+    let doc: OpenApiDoc = result_ununwrap(dr)
+        .with_description("The demo petstore")
+        .with_server("https://pets.example.com")
+        .with_schema("Pet", oa_object([
+            oa_prop("id", oa_int(), true),
+            oa_prop("name", oa_str(), true),
+            oa_prop("kind", oa_str_enum(["cat", "dog", "owl"]), true),
+            oa_prop("weight", oa_nullable(oa_float()), false)
+        ]))
+    # Validate + render + serve.
+    let v: Result[bool, str] = openapi_validate(doc)
+    if result_is_err(v) {
+        let m2: str = result_err_or(v, "")
+        panic("FAIL e2e validate: " + m2)
+    }
+    let json_resp: HttpResponse = openapi_json_response(doc)
+    eq_int(json_resp.status, 200, "e2e /openapi.json status")
+    contains(json_resp.body, "\"openapi\":\"3.1.0\"", "e2e version")
+    contains(json_resp.body, "\"enum\":[\"cat\",\"dog\",\"owl\"]",
+        "e2e enum schema")
+    contains(json_resp.body, "\"type\":[\"number\",\"null\"]",
+        "e2e nullable schema")
+    let docs_resp: HttpResponse = openapi_docs_response(doc, "Petstore")
+    eq_int(docs_resp.status, 200, "e2e /docs status")
+    contains(docs_resp.body, "<title>Petstore</title>", "e2e docs title")
+    contains(docs_resp.body, "spec: {\"openapi\":\"3.1.0\"", "e2e inline spec")
+    # The rendered document round-trips through std.json.
+    let parsed: Result[JsonValue, str] = json_parse_result(json_resp.body)
+    ok(result_is_ok(parsed), "e2e spec is valid JSON")
+    let root: JsonValue = result_unwrap(parsed)
+    eq_str(json_object_get(root, "openapi").sval, "3.1.0", "e2e round trip")
+    let paths: JsonValue = json_object_get(root, "paths")
+    ok(json_object_has(paths, "/pets/{id}"), "e2e path key survives")
+    let get_op: JsonValue = json_object_get(
+        json_object_get(paths, "/pets/{id}"), "get")
+    let params: JsonValue = json_object_get(get_op, "parameters")
+    eq_int(params.arr.len(), 1, "e2e implied parameter count")
+    eq_str(json_object_get(params.arr.get(0), "name").sval, "id",
+        "e2e implied parameter name")
+    return 0
+}
+
+# result_ununwrap — local alias to keep call sites short (unwrap after
+# a result_is_err check).
+fn result_ununwrap(r: Result[OpenApiDoc, str]) -> OpenApiDoc {
+    return result_unwrap(r)
+}
+
+# ============================================================================
+# Runner.
+# ============================================================================
+
+fn run_tests() -> int uses IO {
+    let mut passed: int = 0
+    let tests: list[str] = [
+        "test_schema_builders",
+        "test_schema_render",
+        "test_immutability",
+        "test_pattern_conversion",
+        "test_doc_builders",
+        "test_router_bridge",
+        "test_bridge_errors",
+        "test_render_document",
+        "test_validation",
+        "test_serving",
+        "test_docs_injection",
+        "test_js_string",
+        "test_constants",
+        "test_end_to_end"
+    ]
+    let mut i: int = 0
+    while i < tests.len() {
+        let name: str = tests.get(i)
+        println("RUN  " + name)
+        if name == "test_schema_builders" {
+            let _r: int = test_schema_builders()
+        } else if name == "test_schema_render" {
+            let _r: int = test_schema_render()
+        } else if name == "test_immutability" {
+            let _r: int = test_immutability()
+        } else if name == "test_pattern_conversion" {
+            let _r: int = test_pattern_conversion()
+        } else if name == "test_doc_builders" {
+            let _r: int = test_doc_builders()
+        } else if name == "test_router_bridge" {
+            let _r: int = test_router_bridge()
+        } else if name == "test_bridge_errors" {
+            let _r: int = test_bridge_errors()
+        } else if name == "test_render_document" {
+            let _r: int = test_render_document()
+        } else if name == "test_validation" {
+            let _r: int = test_validation()
+        } else if name == "test_serving" {
+            let _r: int = test_serving()
+        } else if name == "test_docs_injection" {
+            let _r: int = test_docs_injection()
+        } else if name == "test_js_string" {
+            let _r: int = test_js_string()
+        } else if name == "test_constants" {
+            let _r: int = test_constants()
+        } else if name == "test_end_to_end" {
+            let _r: int = test_end_to_end()
+        }
+        println("PASS " + name)
+        passed = passed + 1
+        i = i + 1
+    }
+    println("")
+    println("=== " + passed.to_str() + "/" + tests.len().to_str() + " tests PASSED ===")
+    return 0
+}
+
+fn main() -> int uses IO {
+    return run_tests()
+}
