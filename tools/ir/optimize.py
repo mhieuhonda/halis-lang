@@ -24,7 +24,7 @@ performance — the C compiler's `-O2` is still the primary optimiser.
 from __future__ import annotations
 import re
 from typing import Dict, Set, List, Tuple
-from . import (HLIRModule, HLIRFunction, Instr,
+from . import (HLIRModule, HLIRFunction, Instr, Block,
                OP_CONST, OP_BINOP, OP_UNOP, OP_LOAD, OP_STORE,
                OP_CALL, OP_METHOD, OP_BUILTIN, OP_BRANCH, OP_JUMP,
                OP_RETURN, OP_PANIC, OP_LIST_GET)
@@ -769,43 +769,88 @@ def _licm(irf: HLIRFunction):
     # NEVER match — _new_block formats "%s%d" ("while_cond3"), so pass 5
     # was dead code on every program. Match the numbered form exactly.
     _cond_re = re.compile(r"(?:while|for)_cond\d+$")
+    # Deep-scan-24 fix (HIGH): compute the loop body as a proper NATURAL
+    # LOOP over the CFG instead of scanning block-creation order for the
+    # first jump-back-to-cond. The old scan had two failure modes:
+    #   1. Under-approximation: block CREATION order interleaves (the
+    #      while-lowering creates while_cond/while_body/while_end up
+    #      front, THEN lowers the body), so a nested `continue` block —
+    #      created after while_end — was the "first jump-to-cond block".
+    #      The scan stopped there, and `loop_defined` missed every
+    #      definition in the REST of the loop body. LICM then hoisted a
+    #      `load` of a binding that the missed blocks redefined — a
+    #      silent miscompilation (verified: hoisted `w = load x` out of a
+    #      loop whose fall-through redefined x, freezing x's entry value).
+    #   2. Over-approximation: when no jump-to-cond block followed in
+    #      creation order, the scan ran past the loop into unrelated
+    #      blocks.
+    # The natural-loop algorithm: a back edge is t -> h where t jumps to
+    # the header h; loop(h, t) = { h, t } plus every block that can
+    # reach t without passing through h (computed backwards over
+    # predecessors from all back-edge sources). This is exact for these
+    # reducible loops, handles MULTIPLE back edges (continue), and can
+    # neither under- nor over-run.
+    def _term_labels(blk):
+        if blk.terminator is None:
+            return []
+        if blk.terminator.op in (OP_JUMP, OP_BRANCH) and blk.terminator.args:
+            return [a[1] for a in blk.terminator.args if a[0] == "label"]
+        return []
+
     for caller_block_idx in range(len(irf.blocks)):
         cond = irf.blocks[caller_block_idx]
         if not _cond_re.match(cond.name):
             continue
-        # Find the body of this loop: blocks from cond_index+1 until the
-        # block whose terminator jumps back to cond.
-        loop_blocks: Set[str] = {cond.name}
-        end_idx = caller_block_idx
-        for j in range(caller_block_idx + 1, len(irf.blocks)):
-            blk = irf.blocks[j]
-            loop_blocks.add(blk.name)
-            end_idx = j
-            if blk.terminator and blk.terminator.op == OP_JUMP \
-                    and blk.terminator.args \
-                    and blk.terminator.args[0][0] == "label" \
-                    and blk.terminator.args[0][1] == cond.name:
-                break
-        # The preheader is the block immediately before the cond block.
+        # Predecessor map (rebuilt per header — cheap at this scale and
+        # keeps the pass self-contained).
+        preds: Dict[str, List[str]] = {}
+        by_name: Dict[str, Block] = {}
+        for blk in irf.blocks:
+            by_name[blk.name] = blk
+            for lbl in _term_labels(blk):
+                preds.setdefault(lbl, []).append(blk.name)
+        # Back-edge sources: any block (other than the preheader) whose
+        # terminator jumps to this cond. The preheader is the block
+        # immediately before the cond block in creation order — its
+        # jump to cond is the ENTRY edge, not a back edge.
         preheader = irf.blocks[caller_block_idx - 1] if caller_block_idx > 0 else None
         if preheader is None:
             continue  # no preheader available (shouldn't happen for real loops)
-
-        # Collect SSA names defined INSIDE the loop. Any name in this set
-        # is NOT loop-invariant by definition.
+        back_edges = [blk.name for blk in irf.blocks
+                      if blk.name != preheader.name
+                      and cond.name in _term_labels(blk)]
+        if not back_edges:
+            continue  # not actually a loop header (no back edge)
+        # Natural loop: walk predecessors backwards from the back-edge
+        # sources, never crossing the header.
+        loop_blocks: Set[str] = {cond.name}
+        worklist = list(back_edges)
+        while worklist:
+            name = worklist.pop()
+            if name in loop_blocks:
+                continue
+            loop_blocks.add(name)
+            worklist.extend(preds.get(name, []))
+        # Collect SSA names defined INSIDE the loop (over the WHOLE
+        # natural loop). Any name in this set is NOT loop-invariant.
         loop_defined: Set[str] = set()
-        for j in range(caller_block_idx, end_idx + 1):
-            blk = irf.blocks[j]
-            for ins in blk.instrs:
-                if ins.dest:
-                    loop_defined.add(ins.dest)
-
+        for blk in irf.blocks:
+            if blk.name in loop_blocks:
+                for ins in blk.instrs:
+                    if ins.dest:
+                        loop_defined.add(ins.dest)
         # Deep-scan fix (O5): ONLY hoist from the loop's IMMEDIATE body
-        # block (the last one in the loop, whose terminator is the back-
-        # edge to cond). Hoisting from nested if/else/endif blocks would
-        # be unsafe because those blocks may not execute on every iter.
-        # The immediate body block is irf.blocks[end_idx].
-        body = irf.blocks[end_idx]
+        # block — the fall-through back-edge block (the last block the
+        # body lowering produced, whose terminator is the back-edge to
+        # cond). Hoisting from nested if/else/continue blocks would be
+        # unsafe because those blocks may not execute on every iter.
+        # With several back edges (continue), the fall-through one is
+        # the max-index back-edge source: the builder emits it after
+        # all nested control flow of the body.
+        back_edge_blocks = [by_name[n] for n in back_edges]
+        body = max(back_edge_blocks,
+                   key=lambda b: irf.blocks.index(b)) \
+            if len(back_edge_blocks) > 1 else back_edge_blocks[0]
         hoisted: List[Instr] = []
         remaining: List[Instr] = []
         for ins in body.instrs:

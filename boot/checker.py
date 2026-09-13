@@ -191,6 +191,27 @@ def _instantiate_type(t, type_map, depth):
     return t
 
 
+def _type_mentions_typeparam(pt, typeparams):
+    """True iff any type param name appears in `pt` as a whole identifier
+    (word-boundary matched, so typeparam 'T' matches 'list[T]' and
+    'map[T, int]' but not 'list[str]')."""
+    idc = set("abcdefghijklmnopqrstuvwxyz"
+              "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_")
+    for tp in typeparams:
+        i = 0
+        while True:
+            j = pt.find(tp, i)
+            if j < 0:
+                break
+            before_ok = j == 0 or pt[j - 1] not in idc
+            k = j + len(tp)
+            after_ok = k >= len(pt) or pt[k] not in idc
+            if before_ok and after_ok:
+                return True
+            i = j + 1
+    return False
+
+
 def unify(pt, at, typeparams, type_map):
     """Match a parameter type `pt` against an argument type `at`, binding
     any type params in `typeparams` to concrete types in `type_map`."""
@@ -1610,7 +1631,18 @@ class Checker:
                      "comparisons and len() are allowed)" % name, e)
         if k == "method":
             name = e.get("name", "")
-            if name == "len":
+            # Deep-scan-24 fix: only the ARG-LESS builtin `.len()` is a
+            # pure contract construct. The old shortcut whitelisted ANY
+            # method node named 'len' and skipped its args entirely, so a
+            # user-defined `impl P { fn len(self: P, n: int) -> int }`
+            # allowed `requires p.len(double(2)) > 0` to compile — the
+            # call to `double` hidden in the args was never walked (the
+            # effect checker cannot catch a pure user fn there, so the
+            # contract silently called a user function, violating SPEC
+            # §26.1). When args are present, fall through to the error:
+            # the walk below still descends into the target so the user
+            # gets the precise "calls method" diagnostic.
+            if name == "len" and not (e.get("args") or []):
                 self.check_contract_purity(e.get("target"), fn, which)
                 return
             self.err("contract expression calls method '%s' — contracts "
@@ -2718,7 +2750,20 @@ class Checker:
             type_map = {}
             if typeparams:
                 for i, (a, (pn, pt, _)) in enumerate(zip(args, fn["params"], strict=True)):
-                    at = self.check_expr(a, env, None)
+                    # Deep-scan-24 fix: pass the parameter type as the
+                    # contextual hint when it does not mention any type
+                    # parameter — mirroring the non-generic path (which
+                    # checks every arg against inst_pt). The old code
+                    # checked EVERY arg with hint=None, so a concrete
+                    # `list[int]` parameter of a generic fn rejected an
+                    # empty literal `[]` ("empty list literal requires a
+                    # type in the surrounding context") even though the
+                    # non-generic call of the same shape was accepted —
+                    # an inconsistent false rejection. A param whose type
+                    # carries a typeparam (e.g. list[T]) still gets no
+                    # hint: it cannot be resolved from the literal alone.
+                    hint = None if _type_mentions_typeparam(pt, typeparams) else pt
+                    at = self.check_expr(a, env, hint)
                     first_at[i] = at
                     if at == "never":
                         continue
@@ -2792,11 +2837,12 @@ class Checker:
         # Stage 10-alpha: taint-sink enforcement.
         # For each SINK builtin, before we type-check the args, run a pass
         # that rejects `tainted[T]` values being passed to sink argument
-        # positions. We do this AFTER the regular argt() call so the
-        # underlying type error message takes precedence (e.g. passing
-        # an int to print already errors as "expected str, got int"; we
-        # only need the taint error for the case where the type is
-        # otherwise fine but the value is tainted).
+        # positions. This replaces (not wraps) the regular argt() call at
+        # every sink site: it enforces the expected type AND the taint
+        # rule in one place. Deep-scan-24 fix: the taint diagnostic is
+        # checked FIRST — since every sink wants a concrete untainted
+        # type, checking the plain type match first made the actionable
+        # taint-sink message (with sanitize_* guidance) unreachable.
         #
         # Deep-scan-8 fix: the original implementation ONLY checked for
         # taint — it did not validate that the argument's type matched
@@ -2810,12 +2856,17 @@ class Checker:
             at = self.check_expr(arg, env, want)
             if at == "never":
                 return at  # never propagates; let the caller handle
-            # Deep-scan-8: enforce the expected type. Previously only
-            # taint was checked, so `print(42)` / `read_file(42)` /
-            # `exit("foo")` compiled and crashed at runtime.
-            if want is not None and at != want:
-                self.err("%s expects argument %d to be %s, got %s"
-                         % (name, arg_idx + 1, want, at), e)
+            # Deep-scan-24 fix: check taint BEFORE the plain type
+            # mismatch. Every sink passes a concrete untainted `want`
+            # (e.g. "str") and `tainted[str] != str`, so the old order
+            # ("wants str, got tainted[str]") fired first and the
+            # detailed taint-sink diagnostic below — with its
+            # sanitize_* / taint_unwrap() guidance — was UNREACHABLE for
+            # every sink call site (verified: fail_taint_print.hls and
+            # 20+ other sink tests all reported the generic message).
+            # Both orders reject the program; this order reports the
+            # actionable one. A non-tainted type mismatch (e.g. int)
+            # still falls through to the plain message.
             if is_tainted_type(at):
                 self.err(
                     "taint-sink violation: %s argument %d is tainted[%s] "
@@ -2826,6 +2877,9 @@ class Checker:
                     "std.sanitize, or taint_unwrap() if you accept the "
                     "risk)" %
                     (name, arg_idx + 1, list_taint_inner(at)), e)
+            if want is not None and at != want:
+                self.err("%s expects argument %d to be %s, got %s"
+                         % (name, arg_idx + 1, want, at), e)
             return at
 
         if name in ("print", "println", "eprint", "eprintln"):
@@ -4509,6 +4563,7 @@ class Checker:
         err_variant = None
         ok_variant = None
         n_err_candidates = 0
+        n_ok_candidates = 0
         for v, payloads in edef["variants"]:
             if v == "Err" and len(payloads) == 1:
                 err_variant = (v, payloads)
@@ -4518,8 +4573,10 @@ class Checker:
                 n_err_candidates += 1
             elif v == "Ok" and len(payloads) == 1:
                 ok_variant = (v, payloads)
+                n_ok_candidates += 1
             elif v == "Some" and len(payloads) == 1:
                 ok_variant = (v, payloads)
+                n_ok_candidates += 1
             else:
                 # BUG (deep-scan-5): a third variant beyond the ok/err pair
                 # can match NEITHER arm at runtime — the interpreter would
@@ -4534,6 +4591,15 @@ class Checker:
         if n_err_candidates > 1:
             self.err("? operator requires enum %s to declare EITHER 'Err' "
                      "OR 'None' as its error variant, not both" % ename, e)
+        # BUG (deep-scan-24): the same hazard existed for the ok variant —
+        # an enum declaring BOTH 'Ok(P)' and 'Some(P)' passed the checker
+        # (ok_variant silently kept the last one), and `?` on the other
+        # variant panicked at runtime ("matched neither ok nor err
+        # variant"). Reject the ambiguity at check time, mirroring the
+        # n_err_candidates guard.
+        if n_ok_candidates > 1:
+            self.err("? operator requires enum %s to declare EITHER 'Ok' "
+                     "OR 'Some' as its ok variant, not both" % ename, e)
         if err_variant is None:
             self.err("? operator requires enum %s to have an 'Err' (1 payload) or 'None' variant"
                      % ename, e)

@@ -13,6 +13,117 @@ stability (125–140), and final stabilisation toward v1.0 (141–150).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
+## [v0.92.2-alpha] — deep-scan-24: 14 fixes across the boot compiler, self-hosted codegen and HLIR tooling
+
+> Fourth systematic super-scan. This pass combined differential
+> fuzzing, three independent code reviews (checker, runtime, tooling)
+> and empirical reproducers for every finding. Fourteen genuine defects
+> fixed; zero regressions (the full 25-section suite, 600-test hltest,
+> LLVM suite and 40+ acceptance targets stay green).
+
+### Fixed — boot checker (`boot/checker.py`)
+
+- **`?` operator ok-variant ambiguity (HIGH).** An enum declaring BOTH
+  `Ok(P)` and `Some(P)` passed the checker (`ok_variant` silently kept
+  the last one) and `?` on the other variant panicked at runtime —
+  the mirror image of the deep-scan-5 Err/None ambiguity. Now rejected
+  at check time (`n_ok_candidates` guard); self-hosted compiler fixed
+  symmetrically.
+- **Contract purity bypass via user-defined `len` (MEDIUM).** The
+  purity walk whitelisted ANY method named `len` and skipped its
+  arguments, so `requires p.len(double(2)) > 0` compiled cleanly while
+  calling the user function `double` (invisible to the effect checker
+  when `double` is pure). Only the arg-less builtin `.len()` is now
+  whitelisted.
+- **Unreachable taint-sink diagnostic (MEDIUM).** Every sink passes a
+  concrete untainted `want`, and `tainted[str] != str`, so the plain
+  type-mismatch error always fired first — the actionable
+  "taint-sink violation … use sanitize_*" message (80 lines of
+  threat-model comments) could never appear. Taint is now checked
+  first; both orders reject the program.
+- **Generic calls rejected empty list literals for concrete params
+  (LOW).** The generic-inference loop checked every argument with no
+  contextual hint, so `first_or([1, 2], [])` failed with "empty list
+  literal requires a type in the surrounding context" while the
+  identical non-generic call was accepted. Concrete parameter types
+  (those mentioning no type parameter) now provide the hint, matching
+  the non-generic path — in both the boot checker and the self-hosted
+  compiler.
+
+### Fixed — self-hosted codegen (`src/hlc.hls`)
+
+- **Generic list element reads returned boxed pointers (HIGH).**
+  Inside a generic fn body, `xs.get(i)` / `xs[i]` / `xs.pop()` used the
+  RAW type annotation (the type param `T`) for the unbox dispatch, so
+  the identity `hl_unbox_ptr` was emitted and the boxed pointer was
+  returned as the int64 VALUE (e.g. `94444786390144`). The sibling
+  paths (`push`/`set`/`map.set`) already instantiated via `inst_t()`;
+  the three read paths were missed. Interpreter and native now agree.
+
+### Fixed — boot interpreter (`boot/interp.py`)
+
+- **`_cpu_supports()` missed the last /proc/cpuinfo flag (HIGH).**
+  The padded-substring probe demanded a space on both sides of the
+  token but left the trailing newline in place, so a feature that was
+  the LAST flag on the line (e.g. `... avx2\n`) never matched — the
+  interpreter reported "no AVX2" while the native runtime (via
+  `__builtin_cpu_supports`) disagreed. Tokenised with `split()`.
+- **`math_pow(±0.0, y<0)` / `math_tgamma(±0.0)` returned NaN (HIGH
+  parity).** C99 Annex F poles return ±inf (sign follows the zero);
+  the interpreter's ValueError→NaN mapping diverged from the native
+  raw-libm build (verified against glibc). Poles are now special-cased.
+- **Socket fd leak on failed connect/bind/udp-open (LOW).** A refused
+  `net_tcp_connect` (or failed `bind`/`listen`) leaked the created
+  socket; a retrying program exhausted the fd limit. Sockets are now
+  closed on the error path, mirroring the C runtime.
+
+### Fixed — proof engine (`boot/proof.py`)
+
+- **Integer assignments never recomputed interval facts.** `assign`
+  statements carry no `t` of their own (the type lives on the lvalue,
+  annotated by `check_lvalue`), so the int-recompute branch was dead
+  for `y = 5`-style code: the same program proved its div/zero check
+  dead via `let y: int = 5` but kept every runtime check via
+  `y = 5`. Assigns now recompute (sound in both directions; strictly
+  more elisions).
+
+### Fixed — HLIR tooling (`tools/ir/`)
+
+- **`for`-loop `continue` skipped the counter increment (HIGH).**
+  The IR builder kept the condition block as the `continue` target and
+  emitted the increment inline at the end of the body's fall-through,
+  so a `continue` re-checked the condition WITHOUT incrementing — an
+  infinite loop in the IR (the same bug class fixed in the wasm
+  backend in deep-scan-20 and in the LLVM backend as BUG-DS4-5).
+  A dedicated `for_inc` block is now the continue target.
+- **LICM used first-jump-to-cond block-order scanning (HIGH).**
+  Block creation order interleaves, so a nested `continue` block ended
+  the scan early and `loop_defined` missed every definition in the
+  rest of the loop body — LICM then hoisted a `load` of a binding the
+  missed blocks redefined (silent miscompilation, reproduced). The
+  pass now computes proper natural loops over the CFG (all back edges,
+  predecessor walk) and hoists only from the fall-through back-edge
+  block.
+
+### Fixed — tooling & tests
+
+- **`hlwasm.py`: missing `Set` import** (pyflakes F821 — the
+  deep-scan-23 jsffi tree-shaking helper annotated `Set[str]` without
+  importing it; any import of the module crashed on Python < 3.9
+  semantics and linters flagged it).
+- **`hlwasm.py`: emcc bridge exported non-existent symbols.**
+  `EXPORTED_FUNCTIONS=[_hl_main,__start,_hl_alloc]` referenced symbols
+  the compiled C does not define (hlc emits plain `main`); newer emcc
+  builds fail on undefined exported symbols. Now exports `[_main]`.
+- **`examples/thread_demo.hls`: flaky differential.** The demo printed
+  RAW per-worker sleep times (50 vs 51 ms across backends) despite
+  declaring its output deterministic; the times are now bucketed to
+  50 ms like the wall-clock line.
+- **New regression tests:** `tests/fail/fail_qmark_ok_ambig.hls`,
+  `tests/fail/fail_contract_len_args.hls`,
+  `tests/ok/feat_deep_scan24_generic_empty.hls`,
+  `tests/ok/feat_deep_scan24_generic_codegen.hls`.
+
 ## [v0.92.0-alpha] — Stage 73: std.jsffi — JavaScript FFI for the wasm32 target
 
 > Continues **Phase V (web application track, Stages 63–76)** — the

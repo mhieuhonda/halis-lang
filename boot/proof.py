@@ -875,6 +875,18 @@ def propagate_stmts(stmts, facts, depth=0):
             tname = None
             if isinstance(tgt, dict) and tgt.get("k") == "ident":
                 tname = tgt.get("name")
+                # Deep-scan-24 fix: an `assign` statement carries no
+                # type of its own (s["t"] / s["vtype"] are let-only);
+                # the lvalue's static type is annotated on the TARGET
+                # by check_lvalue. The old lookup therefore always saw
+                # t=None for assigns, so the int branch below was DEAD
+                # for `y = 5`-style assignments: facts were invalidated
+                # but never recomputed — the same program proved dead
+                # checks via `let y: int = 5` but kept every runtime
+                # check via `y = 5` (verified; sound-but-imprecise).
+                # Read the type off the target so assigns recompute too.
+                if t is None and k == "assign":
+                    t = tgt.get("t")
             elif k == "let":
                 tname = s.get("name")
             if tname and (t == "int"):

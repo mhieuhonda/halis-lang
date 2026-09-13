@@ -638,9 +638,17 @@ def _cpu_supports(feat):
     # differential mismatch with the native runtime (which calls
     # __builtin_cpu_supports("sse4.2") and returns True). Map the dot
     # form to the underscore form before the lookup so the probe matches.
+    # Deep-scan-24 fix (HIGH): TOKENISE the flags line instead of doing
+    # padded substring searches. The old string normalisation left the
+    # trailing "\n" (and tabs) in place while the search pattern demands
+    # a space on BOTH sides of the token, so a feature that happened to
+    # be the LAST flag on the line (e.g. "... avx2\n") never matched —
+    # the interpreter then reported "no AVX2" while the native runtime
+    # (via __builtin_cpu_supports) reported support, the exact
+    # differential mismatch this probe exists to prevent. split()
+    # handles spaces, tabs, commas and the newline uniformly.
     probe = feat.replace(".", "_")
-    return (" %s " % probe) in (" %s " % flags.replace(",", " ")
-                               .replace("       ", " ").replace(":", " "))
+    return probe in flags.replace(",", " ").split()
 
 
 class Interp:
@@ -1742,6 +1750,7 @@ class Interp:
             import socket as _sock
             host = args[0].decode("utf-8", "replace")
             port = int(args[1])
+            s = None
             try:
                 infos = _sock.getaddrinfo(host, port, _sock.AF_INET,
                                           _sock.SOCK_STREAM)
@@ -1753,12 +1762,24 @@ class Interp:
                 s.connect(sa)
                 return self._net_register(s)
             except OSError:
+                # Deep-scan-24 fix: close the created socket when the
+                # connect (or settimeout) fails. The old handler leaked
+                # the fd — a program retrying refused connections in a
+                # loop exhausted the process fd limit, while the native
+                # runtime (closes the fd on failure) kept running. The
+                # mirror must fail the same way AND leak nothing.
+                if s is not None:
+                    try:
+                        s.close()
+                    except OSError:
+                        pass
                 return -1
         if name == "net_tcp_listen":
             import socket as _sock
             host = args[0].decode("utf-8", "replace")
             port = int(args[1])
             backlog = int(args[2])
+            s = None
             try:
                 s = _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM)
                 s.setsockopt(_sock.SOL_SOCKET, _sock.SO_REUSEADDR, 1)
@@ -1766,6 +1787,14 @@ class Interp:
                 s.listen(backlog)
                 return self._net_register(s)
             except OSError:
+                # Deep-scan-24 fix: same leak as net_tcp_connect —
+                # close the socket when bind/listen fails (e.g. port
+                # already in use) instead of leaking the fd.
+                if s is not None:
+                    try:
+                        s.close()
+                    except OSError:
+                        pass
                 return -1
         if name == "net_tcp_accept":
             fd = int(args[0])
@@ -1818,11 +1847,19 @@ class Interp:
             return None
         if name == "net_udp_open":
             import socket as _sock
+            s = None
             try:
                 s = _sock.socket(_sock.AF_INET, _sock.SOCK_DGRAM)
                 s.settimeout(5)
                 return self._net_register(s)
             except OSError:
+                # Deep-scan-24 fix: close on failure (settimeout/register
+                # error) instead of leaking the fd.
+                if s is not None:
+                    try:
+                        s.close()
+                    except OSError:
+                        pass
                 return -1
         if name == "net_udp_send_to":
             fd = int(args[0])
@@ -2214,6 +2251,17 @@ class Interp:
                 return float("-inf")
             return _libm(math.log2, args[0])
         if name == "math_pow":
+            # Deep-scan-24 fix (interpreter/native parity): C99 Annex F
+            # pole rule — pow(+-0, y<0) returns +-inf (the sign follows
+            # the zero's sign when y is an odd integer, +inf otherwise),
+            # NOT NaN. Python's math.pow raises ValueError at the pole
+            # and _libm mapped that to NaN, so the interpreter printed
+            # `nan` where the native build printed `inf` / `-inf`
+            # (verified against glibc). Mirror the C rule exactly.
+            if args[0] == 0 and args[1] < 0:
+                if args[1] == math.floor(args[1]) and int(args[1]) % 2 != 0:
+                    return math.copysign(float("inf"), args[0])
+                return float("inf")
             # Estimate the C result's sign for range errors: only a
             # negative base with an odd integral exponent overflows
             # to -inf; everything else overflows to +inf.
@@ -2237,6 +2285,14 @@ class Interp:
         if name == "math_erfc":
             return math.erfc(args[0])
         if name == "math_tgamma":
+            # Deep-scan-24 fix (interpreter/native parity): C99 Annex F
+            # pole rule — tgamma(+-0) returns +-inf (sign follows the
+            # zero's sign: tgamma(+0)=+inf, tgamma(-0)=-inf), NOT NaN.
+            # Python's math.gamma raises ValueError at the pole and
+            # _libm mapped that to NaN; the native build (raw libm)
+            # prints `inf` / `-inf` (verified against glibc).
+            if args[0] == 0:
+                return math.copysign(float("inf"), args[0])
             return _libm(math.gamma, args[0])
         if name == "math_lgamma":
             # C poles (0, -1, -2, ...) yield +inf, not NaN.

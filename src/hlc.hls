@@ -7192,6 +7192,31 @@ fn check_structlit(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, exp
     return name
 }
 
+# type_mentions_typeparam: true iff any type param name appears in the
+# type string as a WHOLE identifier (so 'T' matches "list[T]" and
+# "map[str, T]" but not "list[str]"). Deep-scan-24: used to decide
+# whether a generic fn's parameter type can serve as the contextual
+# hint for its argument (mirrors the boot checker's
+# _type_mentions_typeparam).
+fn type_mentions_typeparam(pt: str, tps: list[str]) -> bool {
+    let mut cur: str = ""
+    let mut i: int = 0
+    while i < pt.len() {
+        let c: int = pt.byte_at(i)
+        let is_id: bool = (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57) || c == 95
+        if is_id {
+            cur = cur + chr(c)
+        } else {
+            if list_contains_str(tps, cur) {
+                return true
+            }
+            cur = ""
+        }
+        i = i + 1
+    }
+    return list_contains_str(tps, cur)
+}
+
 fn check_call(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, expected: str) -> str {
     let name: str = ctx.exprs[e].name
     let mut line: int = ctx.exprs[e].line
@@ -7232,7 +7257,19 @@ fn check_call(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, expected
         if typeparams.len() > 0 {
             let mut ai: int = 0
             while ai < ctx.exprs[e].args.len() {
-                let at: str = check_expr(ctx, env, cur, ctx.exprs[e].args.get(ai), "")
+                # Deep-scan-24 fix (mirrors the boot checker): pass the
+                # parameter type as the contextual hint when it does not
+                # mention any type parameter — so a concrete `list[int]`
+                # parameter of a generic fn accepts an empty list
+                # literal, consistent with the non-generic path (which
+                # checks every arg against inst_pt). Typeparam-carrying
+                # params still get no hint ("" — the literal alone
+                # cannot resolve them).
+                let mut hint: str = ""
+                if !type_mentions_typeparam(f.ptypes.get(ai), typeparams) {
+                    hint = f.ptypes.get(ai)
+                }
+                let at: str = check_expr(ctx, env, cur, ctx.exprs[e].args.get(ai), hint)
                 first_at.set(ai, at)
                 if at != "never" {
                     unify_into(ctx, f.ptypes.get(ai), at, typeparams, targs)
@@ -9611,6 +9648,7 @@ fn check_qmark(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, expecte
     let mut ok_v: str = ""
     let mut ok_payload: str = ""
     let mut err_candidates: int = 0
+    let mut ok_candidates: int = 0
     let mut vi: int = 0
     while vi < en.variants.len() {
         let v: str = en.variants.get(vi)
@@ -9629,11 +9667,13 @@ fn check_qmark(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, expecte
         if v == "Ok" && pl.len() == 1 {
             ok_v = v
             ok_payload = pl.get(0)
+            ok_candidates = ok_candidates + 1
             matched = true
         }
         if v == "Some" && pl.len() == 1 {
             ok_v = v
             ok_payload = pl.get(0)
+            ok_candidates = ok_candidates + 1
             matched = true
         }
         # BUG (deep-scan-5): a third variant beyond the ok/err pair can
@@ -9649,6 +9689,13 @@ fn check_qmark(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, expecte
     # panics at runtime. Reject the ambiguity.
     if err_candidates > 1 {
         cerr(ctx.exprs[e].line, "? operator requires enum " + ename + " to declare EITHER 'Err' OR 'None' as its error variant, not both")
+    }
+    # BUG (deep-scan-24): the mirror-image hazard for the OK variant —
+    # declaring BOTH 'Ok(P)' and 'Some(P)' silently kept only the last
+    # one and `?` on the other read the wrong union arm. Reject the
+    # ambiguity (matches the boot checker's n_ok_candidates guard).
+    if ok_candidates > 1 {
+        cerr(ctx.exprs[e].line, "? operator requires enum " + ename + " to declare EITHER 'Ok' OR 'Some' as its ok variant, not both")
     }
     if err_v == "" {
         cerr(ctx.exprs[e].line, "? operator requires enum " + ename + " to have an 'Err' (1 payload) or 'None' variant")
@@ -15634,7 +15681,13 @@ fn gen_expr(ctx: Ctx, e: int) -> str {
         if ctx.fast_mode && ctx.exprs[e].bnd_safe {
             getter = "hl_list_get_unchecked"
         }
-        return gen_unbox(ctx, ctx.exprs[e].t, getter + "(" + lst + ", " + idx + ")")
+        # Deep-scan-24 fix (HIGH): instantiate the element type before
+        # the unbox dispatch — inside a generic fn the checker's raw
+        # annotation is the TYPE PARAM (e.g. T for `xs: list[T]`), so
+        # gen_unbox dispatched to the identity hl_unbox_ptr and the
+        # boxed pointer was returned as the value (same class as the
+        # list.get fix above).
+        return gen_unbox(ctx, inst_t(ctx, ctx.exprs[e].t), getter + "(" + lst + ", " + idx + ")")
     }
     if k == "field" {
         return "(" + gen_expr(ctx, ctx.exprs[e].left) + ")->" + c_field_name(ctx.exprs[e].name)
@@ -17223,7 +17276,17 @@ fn gen_method(ctx: Ctx, e: int) -> str {
         return "hl_list_push(" + t0 + ", " + gen_store_val(ctx, et, av, af) + ")"
     }
     if op == "list.get" {
-        return gen_unbox(ctx, ctx.exprs[e].t, "hl_list_get(" + t0 + ", " + args + ")")
+        # Deep-scan-24 fix (HIGH): the element type MUST be resolved
+        # through the current instantiation context before the unbox
+        # dispatch. The raw checker annotation on a generic fn's body is
+        # the TYPE PARAM itself (e.g. T in `fn first[T](xs: list[T]) ->
+        # T { return xs.get(0) }`), so gen_unbox saw "T" (not "int")
+        # and emitted the identity hl_unbox_ptr — the boxed pointer was
+        # returned as the int64 VALUE (garbage like 94444786390144).
+        # Every sibling path (push/set/pop, map.set) already instantiates
+        # via inst_t(); this one was missed. Matches the interpreter,
+        # which yields the element value.
+        return gen_unbox(ctx, inst_t(ctx, ctx.exprs[e].t), "hl_list_get(" + t0 + ", " + args + ")")
     }
     if op == "list.set" {
         let et: str = list_elem_t(inst_t(ctx, ctx.exprs[ctx.exprs[e].left].t))
@@ -17246,7 +17309,11 @@ fn gen_method(ctx: Ctx, e: int) -> str {
         if et == "bool" {
             return "hl_list_pop_bool(" + t0 + ")"
         }
-        return gen_unbox(ctx, ctx.exprs[e].t, "hl_list_pop(" + t0 + ")")
+        # Deep-scan-24 fix: instantiate the element type before the unbox
+        # dispatch (same hazard as list.get above — a generic body's raw
+        # expr type is the type param, which dispatched to the identity
+        # hl_unbox_ptr and returned the boxed pointer as the value).
+        return gen_unbox(ctx, inst_t(ctx, ctx.exprs[e].t), "hl_list_pop(" + t0 + ")")
     }
     if op == "map.len" {
         return "hl_map_len(" + t0 + ")"

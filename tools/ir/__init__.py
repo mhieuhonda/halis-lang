@@ -301,12 +301,20 @@ class IRBuilder:
         elif k == "for":
             # Lower `for v: T in iter { body }` as:
             #   t_iter = <iter>
-            #   t_len = list_len(t_iter)
             #   t_i = 0
-            #   while t_i < t_len:
-            #     v = list_get(t_iter, t_i)
-            #     body
-            #     t_i = t_i + 1
+            #   for_cond:  while t_i < list_len(t_iter):
+            #   for_body:  v = list_get(t_iter, t_i); body
+            #   for_inc:   t_i = t_i + 1; -> for_cond      (continue target)
+            #   for_end:
+            # Deep-scan-24 fix (HIGH): the `continue` target must be the
+            # INCREMENT block, not the condition block. The increment
+            # used to be emitted inline at the end of the body's
+            # fall-through block, so a `continue` branched straight to
+            # the re-check WITHOUT incrementing the index — the IR
+            # represented an infinite loop that re-read the same element
+            # forever (the same bug class fixed in the wasm backend
+            # (deep-scan-20) and the LLVM backend (BUG-DS4-5), both of
+            # which use a dedicated for_inc block). Mirror that shape.
             iter_name = self._lower_expr(stmt["iter"], irf)
             # Deep-scan-14: no initial OP_LIST_LEN snapshot — the loop
             # condition re-reads the CURRENT length every iteration
@@ -316,6 +324,7 @@ class IRBuilder:
             self._emit(OP_CONST, [("lit", 0)], stmt.get("line", 0), dest=i_name)
             cond_block = self._new_block(irf, "for_cond")
             body_block = self._new_block(irf, "for_body")
+            inc_block = self._new_block(irf, "for_inc")
             end_block = self._new_block(irf, "for_end")
             self._current.terminator = Instr(None, OP_JUMP,
                                              [("label", cond_block.name)], 0)
@@ -341,11 +350,17 @@ class IRBuilder:
             v_name = "v_%s" % stmt["var"]
             self._emit(OP_LIST_GET, [("var", iter_name), ("var", i_name)],
                        stmt.get("line", 0), dest=v_name)
-            self._loop_stack.append((cond_block.name, end_block.name))
+            # `continue` targets the increment block (NOT the condition):
+            # it must still bump the index before the re-check.
+            self._loop_stack.append((inc_block.name, end_block.name))
             for s in stmt["body"]:
                 self._lower_stmt(s, irf)
             self._loop_stack.pop()
-            # Increment loop counter.
+            if not self._current.terminator:
+                self._current.terminator = Instr(None, OP_JUMP,
+                                                 [("label", inc_block.name)], 0)
+            # Increment block — also the `continue` target.
+            self._current = inc_block
             inc = self._emit(OP_BINOP,
                              [("op", "+"), ("var", i_name), ("lit", 1)],
                              stmt.get("line", 0))
@@ -356,9 +371,8 @@ class IRBuilder:
             # was never updated — representing an infinite loop in the IR.
             self._emit(OP_STORE, [("var", inc), ("name", stmt["var"] + "__i")],
                        stmt.get("line", 0), dest=i_name)
-            if not self._current.terminator:
-                self._current.terminator = Instr(None, OP_JUMP,
-                                                 [("label", cond_block.name)], 0)
+            self._current.terminator = Instr(None, OP_JUMP,
+                                             [("label", cond_block.name)], 0)
             self._current = end_block
         elif k == "break":
             if not self._loop_stack:

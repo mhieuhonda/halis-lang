@@ -62,7 +62,7 @@ import os
 import struct
 import subprocess
 import sys
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 # Resolve HLError whether we are imported from boot.py (sys.path has the
 # repo root) or run directly from the tools/ directory.
@@ -2696,8 +2696,17 @@ def compile_via_emscripten(input_hls: str, output_base: str,
     The emcc invocation:
       1. hlc <input.hls> <tmp.c>     (HLS -> portable ANSI C)
       2. emcc -O<level> -s WASM=1 -s ENVIRONMENT=web,node \
-             -s EXPORTED_FUNCTIONS=[_hl_main,_start,_hl_alloc] \
+             -s EXPORTED_FUNCTIONS=[_main] \
              -o <output_base>.js <tmp.c>    (emcc emits both .js + .wasm)
+
+    Deep-scan-24 fix: the export list previously requested _hl_main,
+    __start and _hl_alloc — symbols the compiled C does NOT define (hlc
+    emits a plain `int main(...)`, and the hl_alloc helper only exists
+    in the FREESTANDING wasm backend, not in the C runtime). Newer emcc
+    builds fail with "undefined exported symbol" on such names, so the
+    bridge silently degraded to the freestanding fallback. Export the
+    one symbol that exists (_main, the hlc entry point); ccall/cwrap in
+    EXPORTED_RUNTIME_METHODS cover the JS-side marshalling needs.
 
     The emcc-generated .js glue replaces our compact glue — it provides
     full libc access (printf, malloc, file IO, etc.). Our compact glue
@@ -2734,7 +2743,7 @@ def compile_via_emscripten(input_hls: str, output_base: str,
     js_out = output_base + ".js"
     cmd = [emcc, o_flag, "-s", "WASM=1",
            "-s", "ENVIRONMENT=web,node",
-           "-s", "EXPORTED_FUNCTIONS=[_hl_main,__start,_hl_alloc]",
+           "-s", "EXPORTED_FUNCTIONS=[_main]",
            "-s", "EXPORTED_RUNTIME_METHODS=[ccall,cwrap,UTF8ToString,stringToUTF8]",
            "-o", js_out, tmp_c, "-lm"]
     r = subprocess.run(cmd, capture_output=True)
