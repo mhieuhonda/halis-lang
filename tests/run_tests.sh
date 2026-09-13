@@ -1373,13 +1373,25 @@ if python3 tools/hlwasm.py examples/web_app_1000loc.hls "$TMP/webapp24" >"$TMP/w
         bad "wasm24: webapp JS glue is $js_size bytes (>= 8 KB)"
     fi
     # Check wasm-opt reduction: compare --wasm-opt off vs --wasm-opt auto.
+    # Deep-scan-23: the emitter now prunes never-called extern "js"
+    # imports up-front, so the optimizer starts from a smaller module and
+    # its RELATIVE reduction is lower even though the absolute result is
+    # identical (9488 bytes; the pre-pruning pipeline was 14592 -> 9488 =
+    # 35.0%). The gate drops to 25% to keep measuring optimizer work on
+    # the improved baseline; the absolute < 10 KB cap below guards the
+    # end-to-end outcome.
     if python3 tools/hlwasm.py examples/web_app_1000loc.hls "$TMP/webapp24_noopt" --wasm-opt off >"$TMP/webapp24_noopt.log" 2>&1; then
         raw_size=$(stat -c %s "$TMP/webapp24_noopt.wasm" 2>/dev/null || stat -f %z "$TMP/webapp24_noopt.wasm")
         reduction_pct=$(python3 -c "print(round(($raw_size - $wasm_size) * 100.0 / $raw_size, 1))")
-        if python3 -c "import sys; sys.exit(0 if $reduction_pct >= 30.0 else 1)"; then
-            ok "wasm24: wasm-opt reduction is ${reduction_pct}% (>= 30%)"
+        if python3 -c "import sys; sys.exit(0 if $reduction_pct >= 25.0 else 1)"; then
+            ok "wasm24: wasm-opt reduction is ${reduction_pct}% (>= 25%)"
         else
-            bad "wasm24: wasm-opt reduction is ${reduction_pct}% (< 30%)"
+            bad "wasm24: wasm-opt reduction is ${reduction_pct}% (< 25%)"
+        fi
+        if [ "$wasm_size" -lt 10240 ]; then
+            ok "wasm24: optimized webapp wasm is $wasm_size bytes (< 10 KB absolute)"
+        else
+            bad "wasm24: optimized webapp wasm is $wasm_size bytes (>= 10 KB absolute)"
         fi
     else
         bad "wasm24: --wasm-opt off build failed"

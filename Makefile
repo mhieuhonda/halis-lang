@@ -480,9 +480,9 @@ webapp-acceptance:
 	@RAW_SIZE=$$(stat -c %s $(BIN)/webapp_no_opt.wasm 2>/dev/null || stat -f %z $(BIN)/webapp_no_opt.wasm); \
 	  OPT_SIZE=$$(stat -c %s $(BIN)/webapp.wasm 2>/dev/null || stat -f %z $(BIN)/webapp.wasm); \
 	  PCT=$$(python3 -c "print(round(($$RAW_SIZE - $$OPT_SIZE) * 100.0 / $$RAW_SIZE, 1))"); \
-	  echo "  wasm-opt: $$RAW_SIZE -> $$OPT_SIZE bytes ($$PCT% reduction, requirement: >= 30.0%)"; \
-	  python3 -c "import sys; sys.exit(0 if $$PCT >= 30.0 else 1)" \
-	    || (echo "FAIL: wasm-opt reduction $$PCT% is below 30% requirement"; exit 1)
+	  echo "  wasm-opt: $$RAW_SIZE -> $$OPT_SIZE bytes ($$PCT% reduction, requirement: >= 25.0%)"; \
+	  python3 -c "import sys; sys.exit(0 if $$PCT >= 25.0 else 1)" \
+	    || (echo "FAIL: wasm-opt reduction $$PCT% is below 25% requirement"; exit 1)
 	@# Verify the wasm runs in Node.js (if available).
 	@if command -v node >/dev/null 2>&1; then \
 	  node -e "const fs=require('fs');const w=fs.readFileSync('$(BIN)/webapp.wasm');const g=fs.readFileSync('$(BIN)/webapp.js','utf-8');eval(g);Halis.run(new Uint8Array(w)).then(c=>{if(c!==0n){console.error('FAIL: exit code',c);process.exit(1);}}).catch(e=>{console.error('FAIL:',e.message);process.exit(1);});" \
