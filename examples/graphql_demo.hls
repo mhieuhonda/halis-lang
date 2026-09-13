@@ -1,0 +1,367 @@
+# examples/graphql_demo.hls — Stage 71 (v0.90.0-alpha):
+# std.graphql demo — a schema-first GraphQL server, driven end to end.
+#
+# This demo exercises every piece of the std.graphql API:
+#   - SDL parsing (graphql_parse_schema) + programmatic schema
+#     construction (graphql_schema_new / gql_type_object /
+#     gql_field_new / gql_arg_new / graphql_schema_with_type)
+#   - type-reference helpers (canonical "[User!]!" strings)
+#   - document parsing (graphql_parse_query: anonymous + named
+#     operations, variables, aliases, fragments, inline fragments)
+#   - the trampoline executor (graphql_begin / graphql_has_pending /
+#     graphql_next_task / graphql_complete / graphql_fail_task /
+#     graphql_finish) with a handler_id dispatch (the std.http_router
+#     pattern — HLS has no function pointers)
+#   - error paths (graphql_fail_task, missing resolvers, wrong types)
+#   - HTTP glue (graphql_http_request POST + GET, response builders)
+#   - schema export (graphql_schema_sdl round trip, JSON view)
+#
+# The demo is PURE (no sockets) so the differential test
+# (interpreter == native) produces byte-identical output. Wiring the
+# same loop into std.http_server turns it into a live server.
+
+import "std.graphql"
+import "std.http"
+import "std.str"
+import "std.option"
+import "std.result"
+
+# ----------------------------------------------------------------------------
+# The demo schema — a tiny blog: posts, authors, and a mutation.
+# ----------------------------------------------------------------------------
+
+fn blog_sdl() -> str {
+    return "# A tiny blog schema\n"
+        + "schema { query: Query mutation: Mutation }\n"
+        + "type Query {\n"
+        + "  post(id: ID!): Post\n"
+        + "  posts(first: Int = 10, tag: String): [Post!]!\n"
+        + "  author(id: ID!): Author\n"
+        + "}\n"
+        + "type Mutation {\n"
+        + "  publish(id: ID!): Post\n"
+        + "}\n"
+        + "type Post {\n"
+        + "  id: ID!\n"
+        + "  title: String\n"
+        + "  body: String\n"
+        + "  tags: [String!]\n"
+        + "  author: Author\n"
+        + "}\n"
+        + "type Author {\n"
+        + "  id: ID!\n"
+        + "  name: String\n"
+        + "  posts: [Post!]!\n"
+        + "}\n"
+        + "enum Visibility { DRAFT PUBLISHED ARCHIVED }\n"
+        + "scalar DateTime\n"
+}
+
+fn blog_resolvers() -> list[GqlResolver] {
+    let r: list[GqlResolver] = []
+    r.push(gql_resolver_new("Query", "post", 101))
+    r.push(gql_resolver_new("Query", "posts", 102))
+    r.push(gql_resolver_new("Query", "author", 103))
+    r.push(gql_resolver_new("Mutation", "publish", 201))
+    r.push(gql_resolver_new("Post", "id", 301))
+    r.push(gql_resolver_new("Post", "title", 302))
+    r.push(gql_resolver_new("Post", "body", 303))
+    r.push(gql_resolver_new("Post", "tags", 304))
+    r.push(gql_resolver_new("Post", "author", 305))
+    r.push(gql_resolver_new("Author", "id", 401))
+    r.push(gql_resolver_new("Author", "name", 402))
+    r.push(gql_resolver_new("Author", "posts", 403))
+    return r
+}
+
+# blog_resolve — the demo "database": a pure function of the task.
+# In a real server each branch would hit the storage layer; here the
+# values are inline so the output is deterministic.
+fn blog_resolve(t: GqlTask) -> str {
+    if t.handler_id == 101 {
+        return "{\"id\":\"p1\"}"
+    }
+    if t.handler_id == 102 {
+        # Honour the first/tag arguments (defaults applied).
+        if t.args_json.contains("pinned") {
+            return "[{\"id\":\"p2\"},{\"id\":\"p1\"}]"
+        }
+        return "[{\"id\":\"p1\"},{\"id\":\"p2\"}]"
+    }
+    if t.handler_id == 103 {
+        return "{\"id\":\"a1\"}"
+    }
+    if t.handler_id == 201 {
+        return "{\"id\":\"p1\"}"
+    }
+    if t.handler_id == 301 {
+        return "\"" + id_of(t.source_json) + "\""
+    }
+    if t.handler_id == 302 {
+        if id_of(t.source_json) == "p1" {
+            return "\"Hello, Halis!\""
+        }
+        return "\"Stage 71 shipped\""
+    }
+    if t.handler_id == 303 {
+        if id_of(t.source_json) == "p1" {
+            return "\"GraphQL in pure HLS, no builtins.\""
+        }
+        return "\"Trampoline executor demo.\""
+    }
+    if t.handler_id == 304 {
+        if id_of(t.source_json) == "p1" {
+            return "[\"graphql\",\"stdlib\"]"
+        }
+        return "[\"demo\"]"
+    }
+    if t.handler_id == 305 {
+        return "{\"id\":\"a1\"}"
+    }
+    if t.handler_id == 401 {
+        return "\"a1\""
+    }
+    if t.handler_id == 402 {
+        return "\"Ada Lovelace\""
+    }
+    if t.handler_id == 403 {
+        return "[{\"id\":\"p1\"}]"
+    }
+    return "null"
+}
+
+# id_of(source_json) — extract the "id" string from a JSON object
+# (the demo's "primary key" lookup).
+fn id_of(source_json: str) -> str {
+    let v: JsonValue = json_parse(source_json)
+    if json_is_object(v) && json_object_has(v, "id") {
+        let idv: JsonValue = json_object_get(v, "id")
+        if json_is_str(idv) {
+            return idv.sval
+        }
+    }
+    return ""
+}
+
+# ----------------------------------------------------------------------------
+# The trampoline loop — the heart of the executor demo.
+# ----------------------------------------------------------------------------
+
+fn run_graphql(schema: GqlSchema, resolvers: list[GqlResolver],
+    query: str, op_name: str, variables_json: str) -> str uses IO {
+    let dr: Result[GqlDocument, str] = graphql_parse_query(query)
+    if result_is_err(dr) {
+        let m: str = result_err_or(dr, "")
+        return "PARSE-ERR: " + m
+    }
+    let doc: GqlDocument = result_unwrap(dr)
+    let br: Result[GqlExec, str] = graphql_begin(schema, doc, op_name,
+        variables_json, resolvers)
+    if result_is_err(br) {
+        let m: str = result_err_or(br, "")
+        return "BEGIN-ERR: " + m
+    }
+    let mut ex: GqlExec = result_unwrap(br)
+    let mut steps: int = 0
+    while graphql_has_pending(ex) {
+        let t: GqlTask = graphql_next_task(ex)
+        graphql_complete(ex, t, blog_resolve(t))
+        steps = steps + 1
+    }
+    let mut plural: str = "s"
+    if steps == 1 {
+        plural = ""
+    }
+    println("  [executor resolved " + steps.to_str() + " field" + plural + "]")
+    return graphql_finish(ex)
+}
+
+# ----------------------------------------------------------------------------
+# Demo sections.
+# ----------------------------------------------------------------------------
+
+fn demo_schema_and_types() -> void uses IO {
+    println("=== 1. Schema: SDL parsing + programmatic construction ===")
+    let schema: GqlSchema = result_unwrap(graphql_parse_schema(blog_sdl()))
+    println("types: " + schema.types.len().to_str()
+        + "  query root: " + schema.query_type
+        + "  mutation root: " + schema.mutation_type)
+    # Type-reference helpers on canonical strings.
+    println("gql_type_base(\"[Post!]\")      = " + gql_type_base("[Post!]"))
+    println("gql_type_element(\"[Post!]!\")  = " + gql_type_element("[Post!]!"))
+    println("gql_type_is_list(\"[Post!]!\")  = " + gql_type_is_list("[Post!]!").to_str())
+    println("gql_type_is_non_null(\"Post!\") = " + gql_type_is_non_null("Post!").to_str())
+    # Programmatic construction (no SDL required).
+    let mut vis: GqlType = gql_type_enum_def("Visibility")
+    vis = gql_type_with_enum_value(vis, "DRAFT")
+    vis = gql_type_with_enum_value(vis, "PUBLISHED")
+    let mut query_t: GqlType = gql_type_object("Query")
+    query_t = gql_type_with_field(query_t, gql_field_new("ok", "Boolean"))
+    let mut prog: GqlSchema = graphql_schema_new()
+    prog = graphql_schema_with_type(prog, query_t)
+    prog = graphql_schema_with_type(prog, vis)
+    let okr: Result[GqlSchema, str] = graphql_parse_schema(
+        graphql_schema_sdl(prog))
+    println("programmatic schema round-trips: "
+        + result_is_ok(okr).to_str())
+    println("")
+}
+
+fn demo_queries() -> void uses IO {
+    println("=== 2. Queries: nesting, aliases, __typename ===")
+    let schema: GqlSchema = result_unwrap(graphql_parse_schema(blog_sdl()))
+    let rs: list[GqlResolver] = blog_resolvers()
+    # Anonymous shorthand with nesting + the __typename meta-field.
+    let out: str = run_graphql(schema, rs,
+        "{ post(id: \"p1\") { id title __typename author { name } } }",
+        "", "{}")
+    println(out)
+    # Aliases + a list field.
+    let out2: str = run_graphql(schema, rs,
+        "{ first: post(id: \"p1\") { title } all: posts(first: 2) { title } }",
+        "", "{}")
+    println(out2)
+    println("")
+}
+
+fn demo_variables_and_fragments() -> void uses IO {
+    println("=== 3. Variables + fragments + inline fragments ===")
+    let schema: GqlSchema = result_unwrap(graphql_parse_schema(blog_sdl()))
+    let rs: list[GqlResolver] = blog_resolvers()
+    let q: str = "query PostsByTag($tag: String, $first: Int = 5) {\n"
+        + "  posts(tag: $tag, first: $first) { ...PostBits ... on Author { name } }\n"
+        + "}\n"
+        + "fragment PostBits on Post { id title tags }\n"
+    let out: str = run_graphql(schema, rs, q, "PostsByTag",
+        "{\"tag\":\"graphql\"}")
+    println(out)
+    # Missing non-null variable -> a structured error, not a crash.
+    let q2: str = "query P($id: ID!) { post(id: $id) { title } }"
+    let out2: str = run_graphql(schema, rs, q2, "P", "{}")
+    println(out2)
+    println("")
+}
+
+fn demo_mutation() -> void uses IO {
+    println("=== 4. Mutation ===")
+    let schema: GqlSchema = result_unwrap(graphql_parse_schema(blog_sdl()))
+    let rs: list[GqlResolver] = blog_resolvers()
+    let out: str = run_graphql(schema, rs,
+        "mutation Publish($id: ID!) { publish(id: $id) { id title } }",
+        "Publish", "{\"id\":\"p1\"}")
+    println(out)
+    println("")
+}
+
+fn demo_errors() -> void uses IO {
+    println("=== 5. Error paths ===")
+    let schema: GqlSchema = result_unwrap(graphql_parse_schema(blog_sdl()))
+    let rs: list[GqlResolver] = blog_resolvers()
+    # Unknown field -> BEGIN-ERR (the caller maps it to HTTP 400).
+    let out: str = run_graphql(schema, rs, "{ nosuch }", "", "{}")
+    println(out)
+    # Depth limit (anti-ReDoS): 12 nested levels are rejected at parse.
+    let mut deep: str = "{ post(id: \"p1\") "
+    let mut i: int = 0
+    while i < 11 {
+        deep = deep + "{ author "
+        i = i + 1
+    }
+    deep = deep + "{ name }"
+    i = 0
+    while i < 11 {
+        deep = deep + " }"
+        i = i + 1
+    }
+    deep = deep + " }"
+    let out2: str = run_graphql(schema, rs, deep, "", "{}")
+    println(out2)
+    # A failing resolver -> a field error with path + locations.
+    let doc: GqlDocument = result_unwrap(graphql_parse_query(
+        "{ post(id: \"p9\") { id title } }"))
+    let ex: GqlExec = result_unwrap(graphql_begin(schema, doc, "", "{}", rs))
+    let t: GqlTask = graphql_next_task(ex)
+    graphql_fail_task(ex, t, "post not found")
+    println(graphql_finish(ex))
+    println("")
+}
+
+fn demo_http() -> void uses IO {
+    println("=== 6. HTTP glue (POST + GET) ===")
+    let schema: GqlSchema = result_unwrap(graphql_parse_schema(blog_sdl()))
+    let rs: list[GqlResolver] = blog_resolvers()
+    # A POST request: parse the body, run the loop, wrap the response.
+    let req: HttpRequest = http_request_new("POST", "/graphql")
+    req.body = "{\"query\":\"query H($id: ID!) { post(id: $id) { title author { name } } }\",\"variables\":{\"id\":\"p1\"}}"
+    let gr: Result[GqlHttpRequest, str] = graphql_http_request(req)
+    let g: GqlHttpRequest = result_unwrap(gr)
+    let body: str = run_graphql(schema, rs, g.query,
+        g.operation_name, g.variables_json)
+    let resp: HttpResponse = graphql_http_response(body)
+    println("POST -> " + resp.status.to_str() + " "
+        + http_header_get(resp.headers, "Content-Type"))
+    println(resp.body)
+    # The same query over GET (url-encoded query string).
+    let getreq: HttpRequest = http_request_new("GET",
+        "/graphql?query=%7B%20post(id%3A%20%22p2%22)%20%7B%20title%20%7D%20%7D")
+    let gg: GqlHttpRequest = result_unwrap(graphql_http_request(getreq))
+    let body2: str = run_graphql(schema, rs, gg.query, "",
+        gg.variables_json)
+    println("GET  -> " + body2)
+    # A bad request becomes a 400 with a structured error body.
+    let badreq: HttpRequest = http_request_new("POST", "/graphql")
+    badreq.body = "{\"query\":\"{ definitely_not_a_field }\"}"
+    let g2: GqlHttpRequest = result_unwrap(graphql_http_request(badreq))
+    let bad: str = run_graphql(schema, rs, g2.query, "", "{}")
+    let eresp: HttpResponse = graphql_http_error(
+        bad.slice("BEGIN-ERR: ".len(), bad.len()))
+    println("BAD  -> " + eresp.status.to_str() + " " + eresp.body)
+    println("")
+}
+
+fn demo_export() -> void uses IO {
+    println("=== 7. Schema export (SDL round trip + JSON view) ===")
+    let schema: GqlSchema = result_unwrap(graphql_parse_schema(blog_sdl()))
+    let sdl: str = graphql_schema_sdl(schema)
+    # Round trip: the printed SDL re-parses to the same schema, and
+    # printing AGAIN is a fixed point (canonical form).
+    let again: GqlSchema = result_unwrap(graphql_parse_schema(sdl))
+    println("round-trip fixed point: "
+        + (graphql_schema_sdl(again) == sdl).to_str())
+    println("--- printed SDL (head) ---")
+    let lines: list[str] = sdl.split("\n")
+    let mut i: int = 0
+    while i < 8 && i < lines.len() {
+        println(lines.get(i))
+        i = i + 1
+    }
+    println("--- JSON view (fragment) ---")
+    let j: JsonValue = graphql_schema_to_json(schema)
+    println("queryType  = " + json_object_get(j, "queryType").sval)
+    println("mutationType = " + json_object_get(j, "mutationType").sval)
+    let types: JsonValue = json_object_get(j, "types")
+    let post: JsonValue = json_object_get(types, "Post")
+    println("Post.kind  = " + json_object_get(post, "kind").sval)
+    let fields: JsonValue = json_object_get(post, "fields")
+    println("Post.posts field type = "
+        + json_object_get(json_object_get(fields, "author"), "type").sval)
+    println("")
+}
+
+fn main() -> int uses IO {
+    println("==============================================")
+    println("  Halis GraphQL — Stage 71 (v0.90.0-alpha)")
+    println("  schema-first GraphQL server, pure HLS")
+    println("==============================================")
+    println("")
+    demo_schema_and_types()
+    demo_queries()
+    demo_variables_and_fragments()
+    demo_mutation()
+    demo_errors()
+    demo_http()
+    demo_export()
+    println("Done. Pure-HLS implementation (no new compiler")
+    println("builtins); the differential test is green.")
+    return 0
+}

@@ -13,6 +13,200 @@ stability (125–140), and final stabilisation toward v1.0 (141–150).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
+## [v0.90.0-alpha] — Stage 71: std.graphql — schema-first GraphQL server
+
+> Continues **Phase V (web application track, Stages 63–76)** — the
+> NINTH module of the phase. Adds `std.graphql` — a pure-HLS
+> implementation of a schema-first GraphQL server: an SDL parser, a
+> GraphQL document parser, a static validator, and a TRAMPOLINE
+> EXECUTOR that lets user code resolve fields without function
+> pointers (the `std.http_router` handler_id dispatch pattern).
+>
+> The roadmap's Stage 71 promise: "Parse a `.graphql` schema,
+> generate types, implement resolvers as Halis functions. The query
+> parser is constant-memory (no ReDoS via deeply-nested queries — a
+> depth limit is enforced)." The parser enforces FOUR hard bounds
+> before any work: document byte length (16 KiB), selection-set depth
+> (10), total expanded nodes (2048 — the billion-laughs defence,
+> counted AFTER fragment expansion), and per-list literal length
+> (256). Every parser loop advances the cursor, so no input can make
+> it spin.
+>
+> HLS has no function pointers, so the executor is a TRAMPOLINE:
+> `graphql_begin` validates + seeds root tasks; the caller pops tasks
+> (`graphql_next_task`), resolves them however it likes (DB, file,
+> pure function), and hands values back (`graphql_complete` /
+> `graphql_fail_task`); `graphql_finish` renders the response. Memory
+> is proportional to the bounded node count, not recursion depth.
+
+Implements the roadmap's Stage 71 promise:
+
+- **Type model (canonical type strings):**
+  - Type references are encoded canonically (`"User"`, `"[User]"`,
+    `"[User]!"`, `"[User!]!"`) — helpers `gql_type_base` /
+  `gql_type_is_list` / `gql_type_is_non_null` / `gql_type_element` /
+  `gql_type_wrap_list` / `gql_type_wrap_non_null` /
+  `gql_type_strip_non_null` decode and build them. Recursive structs
+  are impossible in HLS; strings are exact and cheap.
+  - `GqlArg { name, type_str, has_default, default_json }` +
+    `gql_arg_new` / `gql_arg_with_default` / `gql_arg_find`.
+  - `GqlField { name, type_str, args, description }` +
+    `gql_field_new` / `gql_field_with_arg` / `gql_field_with_description` /
+    `gql_field_find`.
+  - `GqlType { name, kind, fields, enum_values, description }` +
+    `gql_type_object` / `gql_type_scalar_def` / `gql_type_enum_def` /
+    immutable `gql_type_with_*` setters / `gql_type_is_composite`.
+  - `GqlSchema { types, query_type, mutation_type, description }` +
+    `graphql_schema_new` / `graphql_schema_with_type` (Query/Mutation
+    roots auto-bound) / `graphql_schema_find_type` (built-in scalars
+    report a virtual sentinel) / `graphql_schema_type_kind` /
+    `graphql_schema_field` (with the `__typename` meta-field) /
+    `gql_type_exists`.
+
+- **SDL parser — `graphql_parse_schema(src) -> Result[GqlSchema, str]`:**
+  - Statements: `schema { query: Q mutation: M }`, `type Name { fields }`,
+    `enum Name { VALUES }`, `scalar Name`; `directive` definitions and
+    `@annotations` are skipped; descriptions (regular + block strings)
+    may precede any statement and ride along on types/fields.
+  - Fields: `name(arg: Type = default, ...): RetType` with full
+    list/non-null modifier nesting.
+  - Validation: unique type/field/enum-value names, every field and
+    argument type reference resolves (defined or one of the five
+    built-in scalars), the query root exists and is an object, empty
+    types/enums rejected, subscription ROOT rejected (use std.sse for
+    streaming).
+
+- **Document parser — `graphql_parse_query(src) -> Result[GqlDocument, str]`:**
+  - Operations: anonymous shorthand `{ ... }`, named
+    `query Name($v: Type = default) { ... }`, named mutations;
+    subscriptions REJECTED with a pointer to std.sse.
+  - Selections: fields, aliases (`alias: field`), argument literals
+    (Int / Float / String / Boolean / null / enum names / lists /
+    object literals / variable references), named fragment spreads
+    (`...F`) and inline fragments (`... on T { ... }`).
+  - Parse-time errors carry `line` + `column`; duplicate fields,
+    aliases, arguments, and variables are rejected; multiple
+    anonymous operations rejected.
+  - **The depth limit is enforced DURING parsing** (the recursive
+    descent carries the depth), matching the roadmap's anti-ReDoS
+    promise; the document byte limit is checked before parsing begins.
+
+- **Static validation (`graphql_begin`, before execution):**
+  - Field existence per type; composite fields must have selection
+    sets, leaf fields must not; `__typename` accepts no arguments.
+  - Arguments: existence, literal-type match against the declared
+    type (enum membership included), required non-null arguments must
+    be supplied, defaults may stand in.
+  - Variables: declared types exist, values (after substitution) match,
+    undeclared request variables rejected, missing non-null variables
+    rejected (defaults honoured).
+  - Fragments: unknown fragments rejected, type conditions must be
+    objects, CYCLES detected, unused fragments rejected (spec rule),
+    post-flattening output-name collisions rejected (this subset does
+    not merge identical fields — an explicit error instead of silent
+    data loss).
+
+- **Trampoline executor:**
+  - `GqlResolver { type_name, field_name, handler_id }` table +
+    `gql_resolver_new` / `graphql_resolver_find` — the caller's
+    dispatch key (same pattern as RouterMatch.handler_id).
+  - `graphql_begin(schema, doc, operation_name, variables_json,
+    resolvers) -> Result[GqlExec, str]` — selects the operation,
+    validates, substitutes variables (marker strings `$!name` are
+    replaced by concrete JSON), flattens fragments, seeds root nodes.
+  - `graphql_has_pending` / `graphql_next_task` / `graphql_pending_count`
+    — the caller's loop; `GqlTask` carries `type_name`, `field_name`,
+    `alias`, `handler_id`, `args_json` (defaults applied, always
+    well-formed JSON), and `source_json` (the parent object value).
+  - `graphql_complete(ex, task, value_json)` — hands the resolver's
+    JSON value back: leaves are validated + canonicalised; composites
+    spawn child tasks for every flattened sub-selection (per list
+    element for lists). Wrong types, invalid JSON, or missing
+    resolvers become STRUCTURED FIELD ERRORS — never panics.
+  - `graphql_fail_task(ex, task, message)` — a resolver failure
+    renders the field as null and appends `{"message", "path",
+    "locations"}` to the errors array.
+  - `graphql_finish(ex)` — renders the response: `{"data": ...}` /
+    `{"data": ..., "errors": [...]}`; null PROPAGATION through
+    non-null parents follows the spec (an errored non-null child
+    nulls its object; the nearest nullable ancestor absorbs it).
+  - `__typename` resolves without a resolver (the executor knows the
+    concrete type); list nodes track null indices so nullable null
+    elements render `null` while objects with no matching selections
+    render `{}`.
+  - Counters: `graphql_node_count`, `graphql_error_count`,
+    `graphql_is_completed`.
+
+- **HTTP glue (graphql-over-http draft):**
+  - `graphql_http_request(req) -> Result[GqlHttpRequest, str]` — POST
+    JSON bodies (`query` / `variables` / `operationName`) and GET
+    query strings (URL-decoded). Variable VALUES are re-rendered to
+    canonical JSON — they are never re-parsed as GraphQL source, so a
+    variable cannot inject query syntax.
+  - `graphql_http_response(body)` (200 + application/json) and
+    `graphql_http_error(message)` (400 + a structured errors body).
+
+- **Schema export:**
+  - `graphql_schema_sdl(schema)` — canonical SDL printing (order-
+    preserving, diff-friendly); the printed SDL re-parses to the same
+    schema and printing again is a FIXED POINT (proven by the tests).
+  - `graphql_schema_to_json(schema)` — a structural introspection
+    view (type names/kinds, fields with argument types + defaults,
+    enum values) as a `JsonValue`.
+
+- **Constants:** the five built-in scalar names, kind codes
+  (`gql_type_kind_scalar/object/enum` + `gql_type_kind_name`),
+  operation kinds, selection kinds, `__typename`, and every limit
+  (`graphql_max_document_len` 16 KiB, `graphql_max_depth` 10,
+  `graphql_max_nodes` 2048, `graphql_max_args` 16,
+  `graphql_max_fields` 256, `graphql_max_fragments` 32,
+  `graphql_max_variables` 32, `graphql_max_types` 256,
+  `graphql_max_string_len` 8 KiB, `graphql_max_list_len` 256,
+  `graphql_max_name_len` / `graphql_max_alias_len` 64,
+  `graphql_content_type` "application/json").
+
+**Security model:** query-size/depth/node bounds (DoS), no auth check
+(caller authenticates first), variables substituted as JSON values
+only (no query-syntax injection), argument values re-canonicalised
+through std.json before reaching resolvers, string literals bounded
+and JSON-escaped (no response-structure forgery).
+
+**Limitations (explicitly deferred):** no interfaces/unions (type
+conditions must match exactly — mismatched spreads contribute
+nothing), no field merging (identical fields across fragments error
+instead of merging), no `__schema`/`__type` full introspection (the
+JSON export covers the structural subset), no subscriptions (SSE
+covers streaming), no defer/stream/live directives, no custom scalar
+coercion hooks (custom scalars accept any JSON value).
+
+**Acceptance test** (`tests/ok/feat_stage71_graphql.hls`, 19 tests,
+all PASS): type-ref helpers; SDL parsing (descriptions, directives,
+schema blocks, defaults) + 10 error cases; document parsing
+(variables, aliases, literals, fragments) + 8 error cases including
+the depth limit; static validation (11 cases incl. fragment cycles
+and flatten collisions); variable substitution (6 cases); the
+executor (nested objects, lists with null elements, `__typename`,
+aliases, argument defaults in `args_json`, null propagation,
+resolver errors: missing rows / invalid JSON / wrong types /
+`graphql_fail_task`); fragments in execution (per-element application,
+mismatched spreads -> empty objects); mutations; HTTP glue (POST/GET/
+errors); SDL round-trip fixed point + JSON view; constants; an
+end-to-end POST -> execute -> respond flow; and the dynamic node
+budget (100-element list x 25 sub-selections -> field error, not a
+crash).
+
+**Demo** (`examples/graphql_demo.hls`, ~420 lines): a tiny blog
+schema (posts/authors/mutation) driven end to end — SDL + programmatic
+construction, queries with nesting/aliases/`__typename`, variables +
+fragments + inline fragments, a mutation, error paths (unknown field,
+depth limit, failing resolver), the HTTP POST/GET/400 flow, and the
+SDL round trip + JSON export. Fully deterministic.
+
+**Makefile target:** `make graphql-acceptance` — runs the demo and
+the acceptance test differentially (interpreter == native for both),
+then prints the feature summary. Pure-HLS implementation; no new
+compiler builtins; bootstrap is still deterministic.
+
 ## [v0.89.0-alpha] — Stage 70: std.sse — Server-Sent Events (one-way streaming)
 
 > Continues **Phase V (web application track, Stages 63–76)** — the

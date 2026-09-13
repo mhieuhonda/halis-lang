@@ -31,7 +31,7 @@ else
   HL_CURL_DEFS :=
 endif
 
-.PHONY: all stage0 bootstrap test examples clean run check bench install uninstall audit opt-stats emit-ir emit-llvm fmt lint lsp-check pkg-init pkg-add pkg-lock pkg-audit pkg-verify pkg-build pkg-publish pkg-log pkg-log-verify prove prove-full model prove-acceptance hltest fuzz cov fuzz-acceptance wasm-opt webapp webapp-acceptance serve aarch64-bench aarch64-acceptance aarch64-list-targets stack-acceptance inline-acceptance opt-stats-report kernel-attrs escape-acceptance layout-report tail-acceptance tail-report asm-acceptance asm-attrs bench-stdlib spec-check stage32-acceptance async-acceptance stream-acceptance io-acceptance fs-acceptance net-acceptance http-acceptance http2-acceptance json-stream-acceptance regex-acceptance fmt-acceptance hash-acceptance collections-acceptance sync-acceptance thread-acceptance time-acceptance math-acceptance process-acceptance env-acceptance archive-acceptance uuid-ulid-acceptance cli-acceptance tui-acceptance color-acceptance progress-acceptance log-acceptance http-server-acceptance websocket-acceptance cookie-acceptance session-acceptance csrf-acceptance template-acceptance sse-acceptance
+.PHONY: all stage0 bootstrap test examples clean run check bench install uninstall audit opt-stats emit-ir emit-llvm fmt lint lsp-check pkg-init pkg-add pkg-lock pkg-audit pkg-verify pkg-build pkg-publish pkg-log pkg-log-verify prove prove-full model prove-acceptance hltest fuzz cov fuzz-acceptance wasm-opt webapp webapp-acceptance serve aarch64-bench aarch64-acceptance aarch64-list-targets stack-acceptance inline-acceptance opt-stats-report kernel-attrs escape-acceptance layout-report tail-acceptance tail-report asm-acceptance asm-attrs bench-stdlib spec-check stage32-acceptance async-acceptance stream-acceptance io-acceptance fs-acceptance net-acceptance http-acceptance http2-acceptance json-stream-acceptance regex-acceptance fmt-acceptance hash-acceptance collections-acceptance sync-acceptance thread-acceptance time-acceptance math-acceptance process-acceptance env-acceptance archive-acceptance uuid-ulid-acceptance cli-acceptance tui-acceptance color-acceptance progress-acceptance log-acceptance http-server-acceptance websocket-acceptance cookie-acceptance session-acceptance csrf-acceptance template-acceptance sse-acceptance graphql-acceptance
 
 # Main goal: use the full bootstrap chain to build the native compiler
 all: bootstrap
@@ -3072,3 +3072,53 @@ sse-acceptance: bin/hlc
 	@echo "  differential (interpreter == native) verified green."
 
 .PHONY: sse-acceptance
+
+# graphql-acceptance: Stage 71 gate — the demo AND the acceptance
+# test run differentially (interpreter == native), proving the whole
+# GraphQL pipeline (SDL parse -> query parse -> validate -> variables
+# -> trampoline execute -> render) is deterministic.
+graphql-acceptance: bin/hlc
+	@$(PYTHON) boot/boot.py examples/graphql_demo.hls > /tmp/gql_demo_interp.txt 2>&1
+	@bin/hlc examples/graphql_demo.hls /tmp/gql_demo.c 2>/dev/null
+	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/gql_demo /tmp/gql_demo.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
+	@/tmp/gql_demo > /tmp/gql_demo_nat.txt 2>&1
+	@diff -q /tmp/gql_demo_interp.txt /tmp/gql_demo_nat.txt >/dev/null 2>&1 \
+		|| (echo "FAIL: graphql_demo differential mismatch" && false)
+	@$(PYTHON) boot/boot.py tests/ok/feat_stage71_graphql.hls > /tmp/s71_interp.txt 2>&1
+	@bin/hlc tests/ok/feat_stage71_graphql.hls /tmp/s71.c 2>/dev/null
+	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/s71 /tmp/s71.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
+	@/tmp/s71 > /tmp/s71_nat.txt 2>&1
+	@diff -q /tmp/s71_interp.txt /tmp/s71_nat.txt >/dev/null 2>&1 \
+		|| (echo "FAIL: feat_stage71_graphql differential mismatch" && false)
+	@rm -f /tmp/gql_demo /tmp/gql_demo.c /tmp/gql_demo_interp.txt /tmp/gql_demo_nat.txt \
+		/tmp/s71 /tmp/s71.c /tmp/s71_interp.txt /tmp/s71_nat.txt
+	@echo ""
+	@echo "ACCEPTANCE OK: Stage 71 -- std.graphql (schema-first GraphQL server)"
+	@echo "  SDL parser (type/enum/scalar/schema blocks, descriptions, directives skipped):"
+	@echo "    graphql_parse_schema -> Result[GqlSchema, str]"
+	@echo "    validation: unique types/fields/enum values, known type refs, Query root"
+	@echo "  Document parser:"
+	@echo "    graphql_parse_query: anonymous shorthand, named query/mutation,"
+	@echo "      variables + defaults, aliases, argument literals, fragments,"
+	@echo "      inline fragments; subscriptions REJECTED (use std.sse)"
+	@echo "  Anti-ReDoS bounds (the roadmap's constant-memory promise):"
+	@echo "    document 16 KiB / depth 10 / nodes 2048 (post-expansion)"
+	@echo "    / list literals 256 / args 16 / fragments 32 / variables 32"
+	@echo "  Static validation:"
+	@echo "    field existence, leaf-vs-composite selection sets, argument"
+	@echo "    names/types/required, variable declaration, fragment usage,"
+	@echo "    cycle detection, post-flatten collisions"
+	@echo "  Trampoline executor (no fn pointers - std.http_router pattern):"
+	@echo "    graphql_begin/has_pending/next_task/complete/fail_task/finish"
+	@echo "    GqlResolver table -> handler_id; args_json with defaults applied;"
+	@echo "    source_json parent values; __typename meta-field"
+	@echo "    null propagation through non-null parents; errors with"
+	@echo "    message + path + locations; dynamic node budget -> field error"
+	@echo "  HTTP glue: graphql_http_request (POST JSON + GET query string),"
+	@echo "    graphql_http_response / graphql_http_error (400)"
+	@echo "  Schema export: graphql_schema_sdl (canonical, round-trip fixed"
+	@echo "    point), graphql_schema_to_json (structural introspection view)"
+	@echo "  Pure-HLS implementation (no new compiler builtins)"
+	@echo "  differential (interpreter == native) verified green."
+
+.PHONY: graphql-acceptance

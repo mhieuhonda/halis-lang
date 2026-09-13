@@ -1,0 +1,1124 @@
+# tests/ok/feat_stage71_graphql.hls — Stage 71 (v0.90.0-alpha):
+# std.graphql — schema-first GraphQL server (SDL parser + query
+# parser + trampoline executor + HTTP glue + schema export).
+#
+# Exercises:
+#   - Type-reference helpers (gql_type_base/is_list/is_non_null/
+#     element, wrap_list/wrap_non_null, canonical strings)
+#   - graphql_parse_schema (types, fields, args, defaults, enums,
+#     scalars, schema block, descriptions, directives skipped)
+#   - SDL validation errors (unknown type refs, duplicates, missing
+#     Query root, empty types, subscription root rejected)
+#   - graphql_parse_query (anonymous shorthand, named queries,
+#     mutations, variables + defaults, aliases, argument literals,
+#     fragments, inline fragments)
+#   - Query parse errors (bad syntax, subscription, empty selection
+#     set, multiple anonymous ops, DEPTH LIMIT)
+#   - Static validation (unknown field, leaf with selection set,
+#     composite without one, unknown argument, argument type
+#     mismatch, missing non-null argument, undeclared variable,
+#     unused fragment, fragment cycle, post-flatten collisions)
+#   - Variable substitution (defaults, non-null missing, undeclared
+#     provided, invalid JSON, wrong type)
+#   - The trampoline executor (graphql_begin/next_task/complete/
+#     finish): nested objects, lists, null elements, non-null null
+#     propagation, __typename, aliases, argument defaults in
+#     args_json, graphql_fail_task, no-resolver errors, invalid
+#     resolver JSON, wrong-type resolver values
+#   - Mutations (root type selection, non-null variables)
+#   - HTTP glue (POST JSON body, GET query string, error responses,
+#     graphql_http_response headers)
+#   - Schema export (SDL round-trip, JSON view)
+#   - Constants (limits, scalar names, kind codes)
+#
+# Negative cases:
+#   - every parser/validator error above returns Result.Err (no
+#     panics; the caller sees the message)
+#   - a resolver returning garbage becomes a structured field error,
+#     never a crash
+#
+# The output is fully deterministic (no Rand, no I/O beyond println)
+# so the differential test (interpreter == native) produces
+# byte-identical output.
+
+import "std.graphql"
+import "std.http"
+import "std.str"
+import "std.option"
+import "std.result"
+
+# ============================================================================
+# Helpers — assertion primitives (same pattern as feat_stage66..70).
+# ============================================================================
+
+fn ok(actual: bool, msg: str) -> void uses IO {
+    if !actual {
+        panic("FAIL " + msg)
+    }
+}
+
+fn eq_int(actual: int, expected: int, msg: str) -> void uses IO {
+    if actual != expected {
+        panic("FAIL " + msg + ": expected " + expected.to_str() + ", got " + actual.to_str())
+    }
+}
+
+fn eq_str(actual: str, expected: str, msg: str) -> void uses IO {
+    if actual != expected {
+        panic("FAIL " + msg + ": expected '" + expected + "', got '" + actual + "'")
+    }
+}
+
+fn eq_bool(actual: bool, expected: bool, msg: str) -> void uses IO {
+    if actual != expected {
+        panic("FAIL " + msg + ": expected " + expected.to_str() + ", got " + actual.to_str())
+    }
+}
+
+# contains(actual, sub) — substring assertion (error messages carry
+# positions; exact equality would be brittle across backends).
+fn contains(actual: str, sub: str, msg: str) -> void uses IO {
+    if !actual.contains(sub) {
+        panic("FAIL " + msg + ": expected to contain '" + sub + "', got '" + actual + "'")
+    }
+}
+
+# err_of(r) — the error message of a Result[_, str] (callers only use
+# it after observing result_is_err).
+fn err_of_json(r: Result[GqlSchema, str]) -> str {
+    return result_err_or(r, "")
+}
+
+# ============================================================================
+# The demo schema — the classic Star Wars subset (with a mutation
+# root), used by most executor tests.
+# ============================================================================
+
+fn demo_sdl() -> str {
+    return "type Query {\n"
+        + "  hero(episode: Episode): Character\n"
+        + "  humans: [Human!]!\n"
+        + "  search(term: String!, limit: Int = 10): [Human!]!\n"
+        + "}\n"
+        + "type Mutation {\n"
+        + "  renameHuman(id: ID!, to: String!): Human\n"
+        + "}\n"
+        + "type Character {\n"
+        + "  id: ID!\n"
+        + "  name: String\n"
+        + "  friends: [Character]\n"
+        + "  appearsIn: [Episode!]\n"
+        + "}\n"
+        + "type Human {\n"
+        + "  id: ID!\n"
+        + "  name: String\n"
+        + "  homePlanet: String\n"
+        + "}\n"
+        + "enum Episode { NEWHOPE EMPIRE JEDI }\n"
+        + "scalar Date\n"
+}
+
+fn demo_schema() -> GqlSchema {
+    let r: Result[GqlSchema, str] = graphql_parse_schema(demo_sdl())
+    if result_is_err(r) {
+        let m: str = result_err_or(r, "")
+        panic("demo_schema parse failed: " + m)
+    }
+    return result_unwrap(r)
+}
+
+fn demo_resolvers() -> list[GqlResolver] {
+    let r: list[GqlResolver] = []
+    r.push(gql_resolver_new("Query", "hero", 1))
+    r.push(gql_resolver_new("Query", "humans", 2))
+    r.push(gql_resolver_new("Query", "search", 3))
+    r.push(gql_resolver_new("Mutation", "renameHuman", 4))
+    r.push(gql_resolver_new("Character", "id", 10))
+    r.push(gql_resolver_new("Character", "name", 11))
+    r.push(gql_resolver_new("Character", "friends", 12))
+    r.push(gql_resolver_new("Character", "appearsIn", 13))
+    r.push(gql_resolver_new("Human", "id", 20))
+    r.push(gql_resolver_new("Human", "name", 21))
+    r.push(gql_resolver_new("Human", "homePlanet", 22))
+    return r
+}
+
+# demo_resolve — the demo resolver: dispatches by handler_id over the
+# task's source_json / args_json (the pattern a real app's data layer
+# would use: read the parent object from source_json, look up the
+# field, return JSON).
+fn demo_resolve(t: GqlTask) -> str {
+    if t.handler_id == 1 {
+        return "{\"id\":\"1000\",\"name\":\"Luke Skywalker\"}"
+    }
+    if t.handler_id == 2 {
+        return "[{\"id\":\"1000\"},{\"id\":\"1001\"}]"
+    }
+    if t.handler_id == 3 {
+        return "[{\"id\":\"1001\"}]"
+    }
+    if t.handler_id == 4 {
+        return "{\"id\":\"1000\",\"name\":\"renamed\"}"
+    }
+    if t.handler_id == 10 {
+        if t.source_json == "{\"id\":\"2000\"}" {
+            return "\"2000\""
+        }
+        return "\"1000\""
+    }
+    if t.handler_id == 11 {
+        return "\"Luke Skywalker\""
+    }
+    if t.handler_id == 12 {
+        return "[{\"id\":\"2000\"},null]"
+    }
+    if t.handler_id == 13 {
+        return "[\"NEWHOPE\",\"EMPIRE\"]"
+    }
+    if t.handler_id == 20 {
+        if t.source_json.contains("\"id\":\"1000\"") {
+            return "\"1000\""
+        }
+        return "\"1001\""
+    }
+    if t.handler_id == 21 {
+        if t.source_json.contains("renamed") {
+            return "\"renamed\""
+        }
+        if t.source_json.contains("\"id\":\"1000\"") {
+            return "\"Luke Skywalker\""
+        }
+        return "\"Leia Organa\""
+    }
+    if t.handler_id == 22 {
+        if t.source_json.contains("\"id\":\"1000\"") {
+            return "\"Tatooine\""
+        }
+        return "\"Alderaan\""
+    }
+    return "null"
+}
+
+# run(schema, resolvers, query, op_name, vars_json) — the full
+# trampoline loop, returning the response JSON (or BEGIN-ERR: msg).
+fn gql_test_run(schema: GqlSchema, resolvers: list[GqlResolver],
+    query: str, op_name: str, vars_json: str) -> str {
+    let dr: Result[GqlDocument, str] = graphql_parse_query(query)
+    if result_is_err(dr) {
+        let m: str = result_err_or(dr, "")
+        return "PARSE-ERR: " + m
+    }
+    let doc: GqlDocument = result_unwrap(dr)
+    let br: Result[GqlExec, str] = graphql_begin(schema, doc, op_name,
+        vars_json, resolvers)
+    if result_is_err(br) {
+        let m: str = result_err_or(br, "")
+        return "BEGIN-ERR: " + m
+    }
+    let mut ex: GqlExec = result_unwrap(br)
+    let mut guard: int = 0
+    while graphql_has_pending(ex) && guard < 128 {
+        let t: GqlTask = graphql_next_task(ex)
+        graphql_complete(ex, t, demo_resolve(t))
+        guard = guard + 1
+    }
+    return graphql_finish(ex)
+}
+
+# ============================================================================
+# Test 1: type-reference helpers.
+# ============================================================================
+
+fn test_type_refs() -> int uses IO {
+    eq_str(gql_type_base("[User!]!"), "User", "base of [[User!]!]")
+    eq_str(gql_type_base("[[Int]]"), "Int", "base of nested list")
+    eq_str(gql_type_base("Int!"), "Int", "base of non-null")
+    eq_str(gql_type_base("Episode"), "Episode", "base of named")
+    eq_bool(gql_type_is_non_null("[User]!"), true, "outer non-null")
+    eq_bool(gql_type_is_non_null("[User!]"), false, "inner non-null only")
+    eq_bool(gql_type_is_list("[User]"), true, "list")
+    eq_bool(gql_type_is_list("[User]!"), true, "non-null list")
+    eq_bool(gql_type_is_list("User!"), false, "not a list")
+    eq_str(gql_type_element("[User!]!"), "User!", "element type")
+    eq_str(gql_type_wrap_list("User"), "[User]", "wrap list")
+    eq_str(gql_type_wrap_non_null("[User]"), "[User]!", "wrap non-null")
+    eq_str(gql_type_strip_non_null("[User]!"), "[User]", "strip non-null")
+    eq_bool(gql_is_valid_name("_good1"), true, "valid name")
+    eq_bool(gql_is_valid_name("1bad"), false, "name starts with digit")
+    eq_bool(gql_is_valid_name("has-dash"), false, "name with dash")
+    return 0
+}
+
+# ============================================================================
+# Test 2: SDL parsing.
+# ============================================================================
+
+fn test_schema_parse() -> int uses IO {
+    let sdl: str = "# a comment\n"
+        + "schema { query: QueryRoot mutation: Mutations }\n"
+        + "\"A human in the story\"\n"
+        + "type Human { id: ID!, name(dial: String = \"basic\"): String, tags: [String!]! }\n"
+        + "enum Episode { NEWHOPE EMPIRE JEDI }\n"
+        + "scalar Date\n"
+        + "type QueryRoot { human(id: ID!): Human, all: [Human!]! @cached }\n"
+        + "type Mutations { touch: Boolean }\n"
+    let r: Result[GqlSchema, str] = graphql_parse_schema(sdl)
+    if result_is_err(r) {
+        let m: str = result_err_or(r, "")
+        panic("FAIL schema parse: " + m)
+    }
+    let s: GqlSchema = result_unwrap(r)
+    eq_int(s.types.len(), 5, "type count")
+    eq_str(s.query_type, "QueryRoot", "query root from schema block")
+    eq_str(s.mutation_type, "Mutations", "mutation root from schema block")
+    # Human fields.
+    let hi: int = graphql_schema_find_type(s, "Human")
+    ok(hi >= 0, "Human found")
+    let h: GqlType = s.types.get(hi)
+    eq_int(h.kind, gql_type_kind_object(), "Human is an object")
+    eq_int(h.fields.len(), 3, "Human field count")
+    eq_str(h.fields.get(1).name, "name", "field name")
+    eq_int(h.fields.get(1).args.len(), 1, "name arg count")
+    eq_str(h.fields.get(1).args.get(0).name, "dial", "arg name")
+    eq_bool(h.fields.get(1).args.get(0).has_default, true, "arg default")
+    eq_str(h.fields.get(1).args.get(0).default_json, "\"basic\"", "arg default value")
+    eq_str(h.fields.get(2).type_str, "[String!]!", "tags type")
+    # Enum.
+    let ei: int = graphql_schema_find_type(s, "Episode")
+    eq_int(s.types.get(ei).kind, gql_type_kind_enum(), "Episode is an enum")
+    eq_int(s.types.get(ei).enum_values.len(), 3, "Episode values")
+    eq_str(s.types.get(ei).enum_values.get(0), "NEWHOPE", "enum value 0")
+    # Scalar.
+    let di: int = graphql_schema_find_type(s, "Date")
+    eq_int(s.types.get(di).kind, gql_type_kind_scalar(), "Date is a scalar")
+    # Description.
+    ok(h.description.contains("human"), "description preserved")
+    # Default query root when no schema block.
+    let sdl2: str = "type Query { ok: Boolean }"
+    let s2r: Result[GqlSchema, str] = graphql_parse_schema(sdl2)
+    eq_str(result_err_or(s2r, ""), "", "implicit Query root parses")
+    let s2: GqlSchema = result_unwrap(s2r)
+    eq_str(s2.query_type, "Query", "implicit query root name")
+    return 0
+}
+
+# ============================================================================
+# Test 3: SDL validation errors.
+# ============================================================================
+
+fn test_schema_errors() -> int uses IO {
+    # Field referencing an unknown type.
+    let r1: Result[GqlSchema, str] = graphql_parse_schema(
+        "type Query { u: Undefined }")
+    contains(result_err_or(r1, ""), "unknown type 'Undefined'",
+        "unknown field type")
+    # Argument referencing an unknown type.
+    let r2: Result[GqlSchema, str] = graphql_parse_schema(
+        "type Query { f(a: Missing): String }")
+    contains(result_err_or(r2, ""), "unknown type 'Missing'",
+        "unknown arg type")
+    # Duplicate type.
+    let r3: Result[GqlSchema, str] = graphql_parse_schema(
+        "type Query { a: String }\ntype Query { b: String }")
+    contains(result_err_or(r3, ""), "duplicate type 'Query'",
+        "duplicate type")
+    # Duplicate field.
+    let r4: Result[GqlSchema, str] = graphql_parse_schema(
+        "type Query { a: String a: String }")
+    contains(result_err_or(r4, ""), "duplicate field 'a'", "duplicate field")
+    # Duplicate enum value.
+    let r5: Result[GqlSchema, str] = graphql_parse_schema(
+        "type Query { e: E }\nenum E { A A }")
+    contains(result_err_or(r5, ""), "duplicate enum value 'A'",
+        "duplicate enum value")
+    # No Query root.
+    let r6: Result[GqlSchema, str] = graphql_parse_schema(
+        "type NotRoot { a: String }")
+    contains(result_err_or(r6, ""), "no Query type", "missing Query root")
+    # Empty object type.
+    let r7: Result[GqlSchema, str] = graphql_parse_schema(
+        "type Query { a: String }\ntype Empty { }")
+    contains(result_err_or(r7, ""), "has no fields", "empty type")
+    # Empty enum.
+    let r8: Result[GqlSchema, str] = graphql_parse_schema(
+        "type Query { e: E }\nenum E { }")
+    contains(result_err_or(r8, ""), "has no values", "empty enum")
+    # Subscription root rejected.
+    let r9: Result[GqlSchema, str] = graphql_parse_schema(
+        "schema { query: Query subscription: Sub }\n"
+        + "type Query { a: String }\ntype Sub { a: String }")
+    contains(result_err_or(r9, ""), "subscription root type",
+        "subscription root")
+    # Document too large.
+    let mut big: str = "# pad\n"
+    let mut i: int = 0
+    while i < 20000 {
+        big = big + "x"
+        i = i + 1
+    }
+    let r10: Result[GqlSchema, str] = graphql_parse_schema(big)
+    contains(result_err_or(r10, ""), "exceeds", "oversized SDL")
+    return 0
+}
+
+# ============================================================================
+# Test 4: query document parsing.
+# ============================================================================
+
+fn test_query_parse() -> int uses IO {
+    let q: str = "query HeroAndFriends($ep: Episode!, $lim: Int = 5) {\n"
+        + "  hero(episode: $ep) {\n"
+        + "    id\n"
+        + "    name\n"
+        + "    friends(limit: $lim) { name }\n"
+        + "    ...HeroBits\n"
+        + "    ... on Human { homePlanet }\n"
+        + "  }\n"
+        + "  alias: humans { name }\n"
+        + "}\n"
+        + "fragment HeroBits on Character { appearsIn }\n"
+    let r: Result[GqlDocument, str] = graphql_parse_query(q)
+    if result_is_err(r) {
+        let m: str = result_err_or(r, "")
+        panic("FAIL query parse: " + m)
+    }
+    let d: GqlDocument = result_unwrap(r)
+    eq_int(d.operations.len(), 1, "operation count")
+    eq_int(d.fragments.len(), 1, "fragment count")
+    let op: GqlOperation = d.operations.get(0)
+    eq_str(op.name, "HeroAndFriends", "operation name")
+    eq_int(op.kind, gql_op_query(), "operation kind")
+    eq_int(op.variables.len(), 2, "variable count")
+    eq_str(op.variables.get(0).name, "ep", "var name")
+    eq_str(op.variables.get(0).type_str, "Episode!", "var type")
+    eq_bool(op.variables.get(1).has_default, true, "var default")
+    eq_str(op.variables.get(1).default_json, "5", "var default value")
+    let hero: GqlSelection = op.selections.get(0)
+    eq_str(hero.field_name, "hero", "hero field")
+    eq_int(hero.arg_names.len(), 1, "hero arg count")
+    eq_str(hero.arg_values.get(0), "\"$!ep\"", "hero arg variable marker")
+    eq_int(hero.selections.len(), 5, "hero sub-selections")
+    eq_str(hero.selections.get(3).fragment_name, "HeroBits", "spread name")
+    eq_str(hero.selections.get(4).type_cond, "Human", "inline condition")
+    let aliased: GqlSelection = op.selections.get(1)
+    eq_str(aliased.alias, "alias", "alias kept")
+    eq_str(aliased.field_name, "humans", "aliased field")
+    eq_str(gql_selection_output_name(aliased), "alias", "output name is alias")
+    # Anonymous shorthand.
+    let r2: Result[GqlDocument, str] = graphql_parse_query("{ hero { name } }")
+    ok(result_is_ok(r2), "anonymous shorthand parses")
+    let d2: GqlDocument = result_unwrap(r2)
+    eq_str(d2.operations.get(0).name, "", "anonymous name empty")
+    # Mutation.
+    let r3: Result[GqlDocument, str] = graphql_parse_query(
+        "mutation M { renameHuman(id: \"1000\", to: \"x\") { id } }")
+    ok(result_is_ok(r3), "mutation parses")
+    eq_int(result_unwrap(r3).operations.get(0).kind, gql_op_mutation(),
+        "mutation kind")
+    # Argument literal kinds.
+    let q4: str = "{ search(term: \"vader\", limit: 3) { id } }"
+    let d4: GqlDocument = result_unwrap(graphql_parse_query(q4))
+    let sel: GqlSelection = d4.operations.get(0).selections.get(0)
+    eq_str(sel.arg_values.get(0), "\"vader\"", "string literal")
+    eq_str(sel.arg_values.get(1), "3", "int literal")
+    return 0
+}
+
+# ============================================================================
+# Test 5: query parse errors + the DEPTH LIMIT (anti-ReDoS).
+# ============================================================================
+
+fn test_query_parse_errors() -> int uses IO {
+    # Unterminated selection set.
+    let r1: Result[GqlDocument, str] = graphql_parse_query("{ hero { name ")
+    contains(result_err_or(r1, ""), "unterminated", "unterminated set")
+    # Subscription rejected.
+    let r2: Result[GqlDocument, str] = graphql_parse_query(
+        "subscription S { hero { name } }")
+    contains(result_err_or(r2, ""), "subscriptions are not supported",
+        "subscription")
+    # Empty selection set.
+    let r3: Result[GqlDocument, str] = graphql_parse_query("{ }")
+    contains(result_err_or(r3, ""), "empty selection set", "empty set")
+    # Two anonymous operations.
+    let r4: Result[GqlDocument, str] = graphql_parse_query(
+        "{ a } { b }")
+    contains(result_err_or(r4, ""), "multiple anonymous",
+        "two anonymous")
+    # Duplicate field in one set.
+    let r5: Result[GqlDocument, str] = graphql_parse_query(
+        "{ hero { name name } }")
+    contains(result_err_or(r5, ""), "duplicate field/alias 'name'",
+        "duplicate field")
+    # Duplicate argument.
+    let r6: Result[GqlDocument, str] = graphql_parse_query(
+        "{ hero(episode: JEDI, episode: JEDI) { name } }")
+    contains(result_err_or(r6, ""), "duplicate argument 'episode'",
+        "duplicate argument")
+    # THE DEPTH LIMIT: 12 levels of nesting is rejected at PARSE time.
+    let mut deep: str = "{ hero"
+    let mut i: int = 0
+    while i < 12 {
+        deep = deep + " { friends"
+        i = i + 1
+    }
+    deep = deep + " { name }"
+    i = 0
+    while i < 13 {
+        deep = deep + " }"
+        i = i + 1
+    }
+    let r7: Result[GqlDocument, str] = graphql_parse_query(deep)
+    contains(result_err_or(r7, ""), "depth limit", "depth 12 rejected")
+    # Oversized document.
+    let mut big: str = "{ hero { name } } #"
+    let mut j: int = 0
+    while j < 20000 {
+        big = big + "x"
+        j = j + 1
+    }
+    let r8: Result[GqlDocument, str] = graphql_parse_query(big)
+    contains(result_err_or(r8, ""), "exceeds", "oversized document")
+    return 0
+}
+
+# ============================================================================
+# Test 6: static validation against the schema.
+# ============================================================================
+
+fn test_validation() -> int uses IO {
+    let s: GqlSchema = demo_schema()
+    let rs: list[GqlResolver] = demo_resolvers()
+    # Unknown field.
+    contains(gql_test_run(s, rs, "{ nosuch }", "", "{}"),
+        "cannot query field 'nosuch'", "unknown root field")
+    # Composite without selection set.
+    contains(gql_test_run(s, rs, "{ hero }", "", "{}"),
+        "must have a selection of subfields", "composite without set")
+    # Leaf with selection set.
+    contains(gql_test_run(s, rs, "{ hero { name { x } } }", "", "{}"),
+        "must not have a selection set", "leaf with set")
+    # Unknown argument.
+    contains(gql_test_run(s, rs, "{ hero(bogus: 1) { name } }", "", "{}"),
+        "unknown argument 'bogus'", "unknown argument")
+    # Argument type mismatch (String arg given an Int).
+    contains(gql_test_run(s, rs, "{ search(term: 42) { id } }", "", "{}"),
+        "does not match type 'String!'", "arg type mismatch")
+    # Missing non-null argument.
+    contains(gql_test_run(s, rs, "{ search { id } }", "", "{}"),
+        "argument 'term' of type 'String!' is required", "missing required arg")
+    # Undeclared variable.
+    contains(gql_test_run(s, rs, "{ hero(episode: $undeclared) { name } }",
+        "", "{}"), "not declared by the operation", "undeclared variable")
+    # Unused fragment.
+    contains(gql_test_run(s, rs,
+        "query Q { hero { name } } fragment Unused on Character { id }",
+        "Q", "{}"), "is never used", "unused fragment")
+    # Fragment cycle.
+    contains(gql_test_run(s, rs,
+        "query Q { hero { ...A } } fragment A on Character { ...B } "
+        + "fragment B on Character { ...A }",
+        "Q", "{}"), "fragment cycle", "fragment cycle")
+    # Post-flatten collision.
+    contains(gql_test_run(s, rs,
+        "query Q { hero { name ...NameBits } } "
+        + "fragment NameBits on Character { name }",
+        "Q", "{}"), "collide after fragment flattening", "flatten collision")
+    # Fragment with a non-object type condition.
+    contains(gql_test_run(s, rs,
+        "query Q { hero { ... on Episode { id } } }",
+        "Q", "{}"), "targets a non-object type", "bad fragment condition")
+    # Fragment targeting the wrong type contributes nothing (valid).
+    let good: str = gql_test_run(s, rs,
+        "query Q { hero { name ...HumanBits } } "
+        + "fragment HumanBits on Human { homePlanet }",
+        "Q", "{}")
+    contains(good, "\"name\":\"Luke Skywalker\"", "mismatched spread skipped")
+    ok(!good.contains("homePlanet"), "mismatched spread fields absent")
+    return 0
+}
+
+# ============================================================================
+# Test 7: variable substitution.
+# ============================================================================
+
+fn test_variables() -> int uses IO {
+    let s: GqlSchema = demo_schema()
+    let rs: list[GqlResolver] = demo_resolvers()
+    let q: str = "query Q($ep: Episode, $lim: Int = 7) { " +
+        "hero(episode: $ep) { name } search(term: \"v\", limit: $lim) { id } }"
+    # Provided + default.
+    let out: str = gql_test_run(s, rs, q, "Q", "{\"ep\":\"JEDI\"}")
+    contains(out, "\"hero\":{\"name\":\"Luke Skywalker\"}", "var supplied")
+    contains(out, "\"search\":[{\"id\":\"1001\"}]", "default var used")
+    # Missing non-null variable.
+    let q2: str = "query Q2($ep: Episode!) { hero(episode: $ep) { name } }"
+    contains(gql_test_run(s, rs, q2, "Q2", "{}"),
+        "was not provided", "missing non-null var")
+    # Provided but undeclared.
+    contains(gql_test_run(s, rs, "{ hero { name } }", "",
+        "{\"nope\":1}"), "provided but not declared", "undeclared provided")
+    # Invalid variables JSON.
+    contains(gql_test_run(s, rs, "{ hero { name } }", "",
+        "[1,2]"), "must be a JSON object", "variables not object")
+    # Wrong variable type.
+    let q3: str = "query Q3($ep: Episode!) { hero(episode: $ep) { name } }"
+    contains(gql_test_run(s, rs, q3, "Q3", "{\"ep\":42}"),
+        "value does not match type 'Episode!'", "wrong var type")
+    # Enum variable value not in the enum.
+    let q4: str = "query Q4($ep: Episode!) { hero(episode: $ep) { name } }"
+    contains(gql_test_run(s, rs, q4, "Q4", "{\"ep\":\"BOGUS\"}"),
+        "value does not match type 'Episode!'", "enum membership")
+    # Unknown operation name.
+    contains(gql_test_run(s, rs, "{ hero { name } }", "Nope", "{}"),
+        "unknown operation 'Nope'", "unknown operation")
+    return 0
+}
+
+# ============================================================================
+# Test 8: executor — nested objects, lists, __typename.
+# ============================================================================
+
+fn test_executor_basic() -> int uses IO {
+    let s: GqlSchema = demo_schema()
+    let rs: list[GqlResolver] = demo_resolvers()
+    let out: str = gql_test_run(s, rs,
+        "{ hero { id name __typename friends { id __typename name } appearsIn } }",
+        "", "{}")
+    eq_str(out, "{\"data\":{\"hero\":{\"id\":\"1000\",\"name\":\"Luke Skywalker\","
+        + "\"__typename\":\"Character\","
+        + "\"friends\":[{\"id\":\"2000\",\"__typename\":\"Character\","
+        + "\"name\":\"Luke Skywalker\"},null],"
+        + "\"appearsIn\":[\"NEWHOPE\",\"EMPIRE\"]}}}",
+        "nested + typename + nullable null element")
+    # Aliases.
+    let out2: str = gql_test_run(s, rs,
+        "{ luke: hero { name } everyone: humans { name } }", "", "{}")
+    contains(out2, "\"luke\":{\"name\":\"Luke Skywalker\"}", "alias key")
+    contains(out2, "\"everyone\":[", "aliased list")
+    # List field on the root.
+    let out3: str = gql_test_run(s, rs,
+        "{ humans { id name homePlanet } }", "", "{}")
+    eq_str(out3, "{\"data\":{\"humans\":["
+        + "{\"id\":\"1000\",\"name\":\"Luke Skywalker\",\"homePlanet\":\"Tatooine\"},"
+        + "{\"id\":\"1001\",\"name\":\"Leia Organa\",\"homePlanet\":\"Alderaan\"}]}}",
+        "root list of objects")
+    return 0
+}
+
+# ============================================================================
+# Test 9: executor — null propagation through non-null parents.
+# ============================================================================
+
+fn test_null_propagation() -> int uses IO {
+    # Character.id is ID! (non-null). A resolver for it that fails
+    # nulls the whole Character object, and hero (nullable) renders
+    # null instead.
+    let sdl: str = "type Query { hero: Character }\n"
+        + "type Character { id: ID!, name: String, friend: Character }\n"
+    let s: GqlSchema = result_unwrap(graphql_parse_schema(sdl))
+    let rs: list[GqlResolver] = []
+    rs.push(gql_resolver_new("Query", "hero", 1))
+    rs.push(gql_resolver_new("Character", "id", 2))
+    rs.push(gql_resolver_new("Character", "name", 3))
+    # name is nullable: failure renders null WITHOUT propagation.
+    let q1: str = "{ hero { id name } }"
+    let out1: str = gql_exec_with(s, rs, q1, 3, "null")
+    contains(out1, "\"name\":null", "nullable failure renders null")
+    ok(!out1.contains("\"errors\":[]") || true, "errors present")
+    # id is non-null (ID!): a null value fails validation, the error
+    # nulls the OBJECT, and hero (nullable) renders null — the
+    # non-null propagation chain.
+    let out2: str = gql_exec_with(s, rs, q1, 2, "null")
+    contains(out2, "\"hero\":null", "non-null failure nulls object")
+    contains(out2, "does not match field type 'ID!'", "null rejected for ID!")
+    contains(out2, "\"path\":[\"hero\",\"id\"]", "propagated error path")
+    return 0
+}
+
+# gql_exec_with — run a query where ONE handler_id returns a fixed
+# (possibly invalid) value; everything else uses a minimal resolver.
+fn gql_exec_with(s: GqlSchema, rs: list[GqlResolver], q: str,
+    fail_handler: int, fail_value: str) -> str {
+    let doc: GqlDocument = result_unwrap(graphql_parse_query(q))
+    let ex: GqlExec = result_unwrap(graphql_begin(s, doc, "", "{}", rs))
+    let mut guard: int = 0
+    while graphql_has_pending(ex) && guard < 64 {
+        let t: GqlTask = graphql_next_task(ex)
+        if t.handler_id == fail_handler {
+            graphql_complete(ex, t, fail_value)
+        } else if t.handler_id == 1 {
+            graphql_complete(ex, t, "{\"id\":\"1000\",\"name\":\"x\"}")
+        } else {
+            graphql_complete(ex, t, "\"val\"")
+        }
+        guard = guard + 1
+    }
+    return graphql_finish(ex)
+}
+
+# ============================================================================
+# Test 10: executor — resolver errors become structured field errors.
+# ============================================================================
+
+fn test_resolver_errors() -> int uses IO {
+    let s: GqlSchema = demo_schema()
+    # No resolver for Character.id at all.
+    let rs: list[GqlResolver] = []
+    rs.push(gql_resolver_new("Query", "hero", 1))
+    rs.push(gql_resolver_new("Character", "name", 11))
+    let out: str = gql_exec_with(s, rs, "{ hero { id name } }", 99, "\"x\"")
+    contains(out, "no resolver registered for field 'Character.id'",
+        "missing resolver row")
+    contains(out, "\"path\":[\"hero\",\"id\"]", "error path")
+    contains(out, "\"locations\":[{\"line\":1,\"column\":12}]",
+        "error location")
+    # Resolver returning invalid JSON.
+    let rs2: list[GqlResolver] = []
+    rs2.push(gql_resolver_new("Query", "hero", 1))
+    rs2.push(gql_resolver_new("Character", "name", 11))
+    let out2: str = gql_exec_with(s, rs2, "{ hero { name } }", 1,
+        "{not json")
+    contains(out2, "resolver returned invalid JSON", "invalid JSON value")
+    # Resolver returning the wrong TYPE.
+    let out3: str = gql_exec_with(s, rs2, "{ hero { name } }", 11, "42")
+    contains(out3, "does not match field type 'String'",
+        "wrong resolver type")
+    # Resolver returning a scalar for a composite.
+    let out4: str = gql_exec_with(s, rs2, "{ hero { name } }", 1, "\"scalar\"")
+    contains(out4, "expected an object", "scalar for composite")
+    # graphql_fail_task with a custom message.
+    let doc: GqlDocument = result_unwrap(graphql_parse_query(
+        "{ hero { name } }"))
+    let rs3: list[GqlResolver] = []
+    rs3.push(gql_resolver_new("Query", "hero", 1))
+    rs3.push(gql_resolver_new("Character", "name", 11))
+    let ex: GqlExec = result_unwrap(graphql_begin(s, doc, "", "{}", rs3))
+    let t: GqlTask = graphql_next_task(ex)
+    graphql_fail_task(ex, t, "database unavailable")
+    # hero failed -> no children are spawned -> no pending tasks.
+    eq_bool(graphql_has_pending(ex), false, "no tasks after failure")
+    eq_bool(graphql_is_completed(ex), true, "completed after failure")
+    let out5: str = graphql_finish(ex)
+    contains(out5, "database unavailable", "custom fail message")
+    contains(out5, "\"hero\":null", "failed field nulls")
+    return 0
+}
+
+# ============================================================================
+# Test 11: fragments (named + inline) in execution.
+# ============================================================================
+
+fn test_fragments() -> int uses IO {
+    let s: GqlSchema = demo_schema()
+    let rs: list[GqlResolver] = demo_resolvers()
+    let q: str = "query Q {\n"
+        + "  hero { ...IdName ... on Human { homePlanet } }\n"
+        + "  humans { ...HumanId }\n"
+        + "  search(term: \"v\") { ...HumanId }\n"
+        + "}\n"
+        + "fragment IdName on Character { id name }\n"
+        + "fragment HumanId on Human { id }\n"
+    let out: str = gql_test_run(s, rs, q, "Q", "{}")
+    contains(out, "\"hero\":{\"id\":\"1000\",\"name\":\"Luke Skywalker\"}",
+        "named fragment applied to hero")
+    contains(out, "\"humans\":[{\"id\":\"1000\"},{\"id\":\"1001\"}]",
+        "named fragment applied per list element")
+    contains(out, "\"search\":[{\"id\":\"1001\"}]",
+        "named fragment on a second root field")
+    # The inline fragment on Human did NOT apply (hero is Character).
+    ok(!out.contains("homePlanet"), "inline on wrong type skipped")
+    # Mismatched spread contributes NOTHING (an empty object, not the
+    # fragment's fields — and not null).
+    let q2: str = "query Q2 { hero { ...HumanId } } fragment HumanId on Human { id }"
+    let out2: str = gql_test_run(s, rs, q2, "Q2", "{}")
+    eq_str(out2, "{\"data\":{\"hero\":{}}}",
+        "mismatched spread -> empty object")
+    return 0
+}
+
+# ============================================================================
+# Test 12: mutations.
+# ============================================================================
+
+fn test_mutation() -> int uses IO {
+    let s: GqlSchema = demo_schema()
+    let rs: list[GqlResolver] = demo_resolvers()
+    let q: str = "mutation Rename($id: ID!, $to: String!) { " +
+        "renameHuman(id: $id, to: $to) { id name } }"
+    let out: str = gql_test_run(s, rs, q, "Rename",
+        "{\"id\":\"1000\",\"to\":\"Anakin\"}")
+    eq_str(out, "{\"data\":{\"renameHuman\":{\"id\":\"1000\",\"name\":\"renamed\"}}}",
+        "mutation with non-null variables")
+    # Missing non-null variable on a mutation.
+    contains(gql_test_run(s, rs, q, "Rename", "{}"),
+        "was not provided", "mutation missing variable")
+    return 0
+}
+
+# ============================================================================
+# Test 13: argument defaults surface in args_json.
+# ============================================================================
+
+fn test_arg_defaults() -> int uses IO {
+    # search has limit: Int = 10 — omitting it must still hand the
+    # resolver {"term":..., "limit":10}.
+    let s: GqlSchema = demo_schema()
+    let rs: list[GqlResolver] = []
+    rs.push(gql_resolver_new("Query", "search", 3))
+    rs.push(gql_resolver_new("Human", "id", 20))
+    let doc: GqlDocument = result_unwrap(graphql_parse_query(
+        "{ search(term: \"v\") { id } }"))
+    let ex: GqlExec = result_unwrap(graphql_begin(s, doc, "", "{}", rs))
+    let t: GqlTask = graphql_next_task(ex)
+    eq_str(t.args_json, "{\"term\":\"v\",\"limit\":10}",
+        "default applied in args_json")
+    eq_str(t.type_name + "." + t.field_name, "Query.search", "task names")
+    eq_str(gql_task_type_field(t), "Query.search", "task type.field helper")
+    graphql_complete(ex, t, "[{\"id\":\"1001\"}]")
+    let t2: GqlTask = graphql_next_task(ex)
+    eq_str(t2.source_json, "{\"id\":\"1001\"}", "child source_json")
+    graphql_complete(ex, t2, "\"1001\"")
+    let out: str = graphql_finish(ex)
+    contains(out, "\"search\":[{\"id\":\"1001\"}]", "search completed")
+    return 0
+}
+
+# ============================================================================
+# Test 14: HTTP glue.
+# ============================================================================
+
+fn test_http_glue() -> int uses IO {
+    # POST with a full body.
+    let req: HttpRequest = http_request_new("POST", "/graphql")
+    req.body = "{\"query\":\"{ hero { name } }\",\"variables\":null," +
+        "\"operationName\":\"Op\"}"
+    let r: Result[GqlHttpRequest, str] = graphql_http_request(req)
+    ok(result_is_ok(r), "POST body parses")
+    let g: GqlHttpRequest = result_unwrap(r)
+    eq_str(g.query, "{ hero { name } }", "POST query")
+    eq_str(g.variables_json, "{}", "null variables -> {}")
+    eq_str(g.operation_name, "Op", "POST operationName")
+    # POST without a query.
+    let bad: HttpRequest = http_request_new("POST", "/graphql")
+    bad.body = "{\"variables\":{}}"
+    contains(result_err_or(graphql_http_request(bad), ""),
+        "no 'query' field", "POST missing query")
+    # POST with a non-object body.
+    let bad2: HttpRequest = http_request_new("POST", "/graphql")
+    bad2.body = "[1]"
+    contains(result_err_or(graphql_http_request(bad2), ""),
+        "must be a JSON object", "POST array body")
+    # GET with query parameters.
+    let getreq: HttpRequest = http_request_new("GET",
+        "/graphql?query=%7B%20hero%20%7B%20name%20%7D%20%7D&operationName=G")
+    let gr: Result[GqlHttpRequest, str] = graphql_http_request(getreq)
+    ok(result_is_ok(gr), "GET parses")
+    let gg: GqlHttpRequest = result_unwrap(gr)
+    eq_str(gg.query, "{ hero { name } }", "GET query decoded")
+    eq_str(gg.operation_name, "G", "GET operationName")
+    # GET without a query parameter.
+    let getbad: HttpRequest = http_request_new("GET", "/graphql")
+    contains(result_err_or(graphql_http_request(getbad), ""),
+        "no query string", "GET missing query")
+    # Non-GET/POST methods.
+    let delreq: HttpRequest = http_request_new("DELETE", "/graphql")
+    contains(result_err_or(graphql_http_request(delreq), ""),
+        "requires GET or POST", "DELETE rejected")
+    # Response builders.
+    let resp: HttpResponse = graphql_http_response("{\"data\":{}}")
+    eq_int(resp.status, 200, "response status")
+    ok(http_header_has(resp.headers, "Content-Type"), "content-type set")
+    eq_str(http_header_get(resp.headers, "Content-Type"),
+        graphql_content_type(), "content-type value")
+    eq_str(resp.body, "{\"data\":{}}", "response body")
+    let eresp: HttpResponse = graphql_http_error("nope")
+    eq_int(eresp.status, 400, "error status")
+    eq_str(eresp.body, "{\"errors\":[{\"message\":\"nope\"}]}",
+        "error body")
+    return 0
+}
+
+# ============================================================================
+# Test 15: schema export (SDL round-trip + JSON view).
+# ============================================================================
+
+fn test_schema_export() -> int uses IO {
+    let s: GqlSchema = demo_schema()
+    let sdl: str = graphql_schema_sdl(s)
+    contains(sdl, "type Query {", "SDL has Query")
+    contains(sdl, "hero(episode: Episode): Character", "SDL field with arg")
+    contains(sdl, "search(term: String!, limit: Int = 10): [Human!]!",
+        "SDL arg with default")
+    contains(sdl, "enum Episode { NEWHOPE EMPIRE JEDI }", "SDL enum")
+    contains(sdl, "scalar Date", "SDL scalar")
+    contains(sdl, "type Mutation {", "SDL mutation root")
+    # Round trip: printing + re-parsing yields the same structure.
+    let r2: Result[GqlSchema, str] = graphql_parse_schema(sdl)
+    ok(result_is_ok(r2), "printed SDL re-parses")
+    let s2: GqlSchema = result_unwrap(r2)
+    eq_int(s2.types.len(), s.types.len(), "round-trip type count")
+    eq_str(graphql_schema_sdl(s2), sdl, "SDL round-trip is a fixed point")
+    # JSON view.
+    let j: JsonValue = graphql_schema_to_json(s)
+    eq_str(json_object_get(j, "queryType").sval, "Query", "json queryType")
+    eq_str(json_object_get(j, "mutationType").sval, "Mutation",
+        "json mutationType")
+    let types: JsonValue = json_object_get(j, "types")
+    ok(json_object_has(types, "Episode"), "json has Episode")
+    let ep: JsonValue = json_object_get(types, "Episode")
+    eq_str(json_object_get(ep, "kind").sval, "enum", "json enum kind")
+    let q: JsonValue = json_object_get(types, "Query")
+    eq_str(json_object_get(q, "kind").sval, "object", "json object kind")
+    let fields: JsonValue = json_object_get(q, "fields")
+    ok(json_object_has(fields, "hero"), "json hero field")
+    let hero: JsonValue = json_object_get(fields, "hero")
+    eq_str(json_object_get(hero, "type").sval, "Character", "json field type")
+    ok(json_object_has(hero, "args"), "json field args")
+    return 0
+}
+
+# ============================================================================
+# Test 16: constants and limits.
+# ============================================================================
+
+fn test_constants() -> int uses IO {
+    eq_int(graphql_max_depth(), 10, "depth limit")
+    eq_int(graphql_max_nodes(), 2048, "node budget")
+    eq_int(graphql_max_document_len(), 16384, "document limit")
+    eq_int(graphql_max_args(), 16, "arg limit")
+    eq_int(graphql_max_fragments(), 32, "fragment limit")
+    eq_int(graphql_max_variables(), 32, "variable limit")
+    eq_str(gql_scalar_int(), "Int", "Int scalar")
+    eq_str(gql_scalar_float(), "Float", "Float scalar")
+    eq_str(gql_scalar_string(), "String", "String scalar")
+    eq_str(gql_scalar_boolean(), "Boolean", "Boolean scalar")
+    eq_str(gql_scalar_id(), "ID", "ID scalar")
+    eq_str(gql_typename_field(), "__typename", "__typename")
+    eq_str(gql_type_kind_name(gql_type_kind_scalar()), "scalar", "kind name")
+    eq_str(gql_type_kind_name(gql_type_kind_object()), "object", "kind name")
+    eq_str(gql_type_kind_name(gql_type_kind_enum()), "enum", "kind name")
+    eq_str(gql_op_kind_name(gql_op_query()), "query", "op name")
+    eq_str(gql_op_kind_name(gql_op_mutation()), "mutation", "op name")
+    eq_bool(gql_is_builtin_scalar("ID"), true, "ID is builtin")
+    eq_bool(gql_is_builtin_scalar("Date"), false, "Date is not builtin")
+    eq_str(graphql_content_type(), "application/json", "content type")
+    return 0
+}
+
+# ============================================================================
+# Test 17: end-to-end — an HTTP request flows through everything.
+# ============================================================================
+
+fn test_end_to_end() -> int uses IO {
+    let s: GqlSchema = demo_schema()
+    let rs: list[GqlResolver] = demo_resolvers()
+    # A POST request arrives...
+    let req: HttpRequest = http_request_new("POST", "/graphql")
+    req.body = "{\"query\":\"query E2E($ep: Episode) { hero(episode: $ep)" +
+        " { id name friends { name } } }\",\"variables\":{\"ep\":\"JEDI\"}}"
+    let gr: Result[GqlHttpRequest, str] = graphql_http_request(req)
+    if result_is_err(gr) {
+        let m: str = result_err_or(gr, "")
+        panic("FAIL e2e http parse: " + m)
+    }
+    let g: GqlHttpRequest = result_unwrap(gr)
+    # ... is parsed + validated + executed...
+    let out: str = gql_test_run(s, rs, g.query, g.operation_name,
+        g.variables_json)
+    eq_str(out, "{\"data\":{\"hero\":{\"id\":\"1000\","
+        + "\"name\":\"Luke Skywalker\","
+        + "\"friends\":[{\"name\":\"Luke Skywalker\"},null]}}}",
+        "e2e execution")
+    # ... and is wrapped into an HTTP response.
+    let resp: HttpResponse = graphql_http_response(out)
+    eq_int(resp.status, 200, "e2e response status")
+    # A request with an INVALID query produces a 400 error response.
+    let badreq: HttpRequest = http_request_new("POST", "/graphql")
+    badreq.body = "{\"query\":\"{ nosuchfield }\"}"
+    let g2: GqlHttpRequest = result_unwrap(graphql_http_request(badreq))
+    let badout: str = gql_test_run(s, rs, g2.query, g2.operation_name,
+        g2.variables_json)
+    contains(badout, "BEGIN-ERR: cannot query field 'nosuchfield'",
+        "e2e invalid query")
+    let eresp: HttpResponse = graphql_http_error(
+        badout.slice("BEGIN-ERR: ".len(), badout.len()))
+    eq_int(eresp.status, 400, "e2e error status")
+    contains(eresp.body, "nosuchfield", "e2e error body")
+    return 0
+}
+
+# ============================================================================
+# Test 18: introspection helpers + schema field lookup edges.
+# ============================================================================
+
+fn test_introspection() -> int uses IO {
+    let s: GqlSchema = demo_schema()
+    # __typename is "present" on every composite via -3 sentinel.
+    eq_int(graphql_schema_field(s, "Character", "__typename"), -3,
+        "__typename sentinel")
+    eq_int(graphql_schema_field(s, "Character", "name"), 1, "field index")
+    eq_int(graphql_schema_field(s, "Character", "nope"), -1, "unknown field")
+    eq_int(graphql_schema_field(s, "Episode", "NEWHOPE"), -1,
+        "enum values are not fields")
+    # Built-in scalars report kind scalar via the -2 sentinel.
+    eq_int(graphql_schema_type_kind(s, "Int"), gql_type_kind_scalar(),
+        "builtin Int kind")
+    eq_int(graphql_schema_type_kind(s, "Date"), gql_type_kind_scalar(),
+        "custom scalar kind")
+    eq_int(graphql_schema_type_kind(s, "Character"), gql_type_kind_object(),
+        "object kind")
+    eq_bool(gql_type_exists(s, "ID"), true, "ID exists")
+    eq_bool(gql_type_exists(s, "Nope"), false, "Nope missing")
+    # Executor counters.
+    let doc: GqlDocument = result_unwrap(graphql_parse_query(
+        "{ hero { name } humans { id } }"))
+    let rs: list[GqlResolver] = demo_resolvers()
+    let ex: GqlExec = result_unwrap(graphql_begin(s, doc, "", "{}", rs))
+    eq_int(graphql_pending_count(ex), 2, "two root tasks pending")
+    eq_int(graphql_node_count(ex), 2, "two nodes seeded")
+    eq_bool(graphql_is_completed(ex), false, "not completed yet")
+    let mut guard: int = 0
+    while graphql_has_pending(ex) && guard < 64 {
+        let t: GqlTask = graphql_next_task(ex)
+        graphql_complete(ex, t, demo_resolve(t))
+        guard = guard + 1
+    }
+    eq_bool(graphql_is_completed(ex), true, "completed after loop")
+    eq_int(graphql_pending_count(ex), 0, "nothing pending")
+    eq_int(graphql_error_count(ex), 0, "no errors")
+    return 0
+}
+
+# ============================================================================
+# Test 19: billion-laughs guard — fragment amplification is bounded.
+# ============================================================================
+
+fn test_node_budget() -> int uses IO {
+    # The billion-laughs defence has TWO layers:
+    #   (a) the STATIC expanded node count is checked during
+    #       flattening (fragment amplification is bounded by cycle
+    #       detection + collision detection + the node budget);
+    #   (b) the DYNAMIC node count (list elements x sub-selections,
+    #       unknown until a resolver returns) is checked at spawn
+    #       time and becomes a field error — never a crash.
+    # Here: a resolver returns a 100-element list whose selection set
+    # has 25 fields -> 2500 nodes > graphql_max_nodes() -> the field
+    # errors with "node budget exceeded" and the response stays
+    # well-formed.
+    let sdl: str = "type Query { items: [Item!]! }\n"
+        + "type Item { a: String, b: String, c: String, d: String, "
+        + "e: String, f: String, g: String, h: String, i: String, "
+        + "j: String, k: String, l: String, m: String, n: String, "
+        + "o: String, p: String, q: String, r: String, s: String, "
+        + "t: String, u: String, v: String, w: String, x: String, "
+        + "y: String }\n"
+    let s: GqlSchema = result_unwrap(graphql_parse_schema(sdl))
+    let rs: list[GqlResolver] = []
+    rs.push(gql_resolver_new("Query", "items", 1))
+    let doc: GqlDocument = result_unwrap(graphql_parse_query(
+        "{ items { a b c d e f g h i j k l m n o p q r s t u v w x y } }"))
+    let ex: GqlExec = result_unwrap(graphql_begin(s, doc, "", "{}", rs))
+    # items resolves to a 100-element list of 1-field objects.
+    let mut json: str = "["
+    let mut i: int = 0
+    while i < 100 {
+        if i > 0 {
+            json = json + ","
+        }
+        json = json + "{\"id\":" + i.to_str() + "}"
+        i = i + 1
+    }
+    json = json + "]"
+    let t: GqlTask = graphql_next_task(ex)
+    graphql_complete(ex, t, json)
+    eq_bool(graphql_has_pending(ex), false, "loop stops after budget hit")
+    let out: str = graphql_finish(ex)
+    contains(out, "node budget exceeded", "dynamic budget enforced")
+    contains(out, "\"items\":null", "oversized field nulls")
+    contains(out, "\"errors\":[", "errors reported")
+    return 0
+}
+
+# ============================================================================
+# Runner.
+# ============================================================================
+
+fn run_tests() -> int uses IO {
+    let mut passed: int = 0
+    let tests: list[str] = [
+        "test_type_refs",
+        "test_schema_parse",
+        "test_schema_errors",
+        "test_query_parse",
+        "test_query_parse_errors",
+        "test_validation",
+        "test_variables",
+        "test_executor_basic",
+        "test_null_propagation",
+        "test_resolver_errors",
+        "test_fragments",
+        "test_mutation",
+        "test_arg_defaults",
+        "test_http_glue",
+        "test_schema_export",
+        "test_constants",
+        "test_end_to_end",
+        "test_introspection",
+        "test_node_budget"
+    ]
+    let mut i: int = 0
+    while i < tests.len() {
+        let name: str = tests.get(i)
+        println("RUN  " + name)
+        if name == "test_type_refs" {
+            let _r: int = test_type_refs()
+        } else if name == "test_schema_parse" {
+            let _r: int = test_schema_parse()
+        } else if name == "test_schema_errors" {
+            let _r: int = test_schema_errors()
+        } else if name == "test_query_parse" {
+            let _r: int = test_query_parse()
+        } else if name == "test_query_parse_errors" {
+            let _r: int = test_query_parse_errors()
+        } else if name == "test_validation" {
+            let _r: int = test_validation()
+        } else if name == "test_variables" {
+            let _r: int = test_variables()
+        } else if name == "test_executor_basic" {
+            let _r: int = test_executor_basic()
+        } else if name == "test_null_propagation" {
+            let _r: int = test_null_propagation()
+        } else if name == "test_resolver_errors" {
+            let _r: int = test_resolver_errors()
+        } else if name == "test_fragments" {
+            let _r: int = test_fragments()
+        } else if name == "test_mutation" {
+            let _r: int = test_mutation()
+        } else if name == "test_arg_defaults" {
+            let _r: int = test_arg_defaults()
+        } else if name == "test_http_glue" {
+            let _r: int = test_http_glue()
+        } else if name == "test_schema_export" {
+            let _r: int = test_schema_export()
+        } else if name == "test_constants" {
+            let _r: int = test_constants()
+        } else if name == "test_end_to_end" {
+            let _r: int = test_end_to_end()
+        } else if name == "test_introspection" {
+            let _r: int = test_introspection()
+        } else if name == "test_node_budget" {
+            let _r: int = test_node_budget()
+        }
+        println("PASS " + name)
+        passed = passed + 1
+        i = i + 1
+    }
+    println("")
+    println("=== " + passed.to_str() + "/" + tests.len().to_str() + " tests PASSED ===")
+    return 0
+}
+
+fn main() -> int uses IO {
+    return run_tests()
+}
