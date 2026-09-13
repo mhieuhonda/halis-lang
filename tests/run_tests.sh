@@ -393,8 +393,13 @@ if "$TMP/hlc1" --pgo-generate "$PGO_F" "$TMP/pgo_gen.c" >/dev/null 2>&1 \
         bad "pgo-use: trained compile failed"
     fi
     # Unflagged builds must contain zero PGO machinery.
+    # Deep-scan-23 fix: the second grep read "$TMP/$name.c" but `name`
+    # is never assigned in this phase (a set -u crash), and no plain
+    # build existed to inspect. Compile PGO_F WITHOUT any --pgo flag
+    # and verify the output carries no counters or hints.
     if grep -q "__hlc_pgo_counts" "$TMP/pgo_gen.c" \
-            && ! grep -q "__hlc_pgo_counts\|__builtin_expect" "$TMP/$name.c" 2>/dev/null; then
+            && "$TMP/hlc1" "$PGO_F" "$TMP/pgo_plain.c" >/dev/null 2>&1 \
+            && ! grep -q "__hlc_pgo_counts\|__builtin_expect" "$TMP/pgo_plain.c" 2>/dev/null; then
         ok "pgo: unflagged build has zero instrumentation"
     else
         bad "pgo: instrumentation leaked into an unflagged build"
