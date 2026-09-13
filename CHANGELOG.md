@@ -13,6 +13,126 @@ stability (125–140), and final stabilisation toward v1.0 (141–150).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
+## [v0.92.0-alpha] — Stage 73: std.jsffi — JavaScript FFI for the wasm32 target
+
+> Continues **Phase V (web application track, Stages 63–76)** — the
+> ELEVENTH module of the phase. Completes the roadmap's Stage 73
+> promise: "From `target wasm32`, declare JavaScript imports
+> (`extern "js"`). The wasm module imports them; the JS glue
+> (auto-generated) provides them. Struct marshalling: a Halis struct
+> becomes a JS object."
+>
+> Three things change under the hood. The extern "js" surface grows
+> from 13 to 48 declarations (console extras, DOM
+> attributes/classes/styles/values, a JSON bridge, URL encoding,
+> fetch-with-options, localStorage management, environment info,
+> performance timing). The wasm emitter now computes STRUCT FIELD
+> LAYOUTS and exports `hl_struct_descriptors()`, and the JS glue
+> AUTO-REGISTERS every struct at instantiation — marshalling needs
+> zero manual `Halis.registerStruct` calls. And JS->HLS callbacks
+> arrive: define `fn jsffi_on_callback(cb_id: int, arg: str) -> str`
+> and `hlwasm` exports `hl_call_halis`, which the JS side reaches
+> via `Halis.callHalis(cbId, json)` — the std.http_router handler_id
+> dispatch pattern applied to FFI (HLS has no function pointers).
+>
+> Also fixed: the Stage 24 glue's `readStruct` read STRING fields AT
+> the field address instead of dereferencing the `{len, bytes}`
+> pointer — string fields round-tripped as heap garbage. The Stage 73
+> acceptance test would have caught it; it is now covered.
+
+Implements the roadmap's Stage 73 promise:
+
+- **extern "js" surface — 13 -> 48 declarations** (`std/jsffi.hls`):
+  - Console extras: `js_console_table`, `js_console_clear`,
+    `js_console_count` (per-label counters, returns the count),
+    `js_console_count_reset`, `js_console_group`/`_group_end`,
+    `js_console_time`/`_time_end` (per-label timers, ms returned).
+  - DOM: `js_dom_set_attr`/`get_attr`, `js_dom_remove`,
+    `js_dom_add_class`/`remove_class`/`toggle_class`,
+    `js_dom_set_style`, `js_dom_get_value`/`set_value`,
+    `js_dom_document_title`/`set_title` (all browser-only; clean
+    no-ops / empty defaults under Node.js).
+  - JSON bridge: `js_json_canonical` (parse + re-stringify; invalid
+    input yields "null") and `js_json_valid`.
+  - URL: `js_url_encode` / `js_url_decode` (percent-encoding).
+  - HTTP: `js_fetch_with_options(url, options_json)` alongside the
+    Stage 23 `js_fetch`.
+  - localStorage: `js_localstorage_remove`, `js_localstorage_clear`,
+    `js_localstorage_key_count`.
+  - Environment: `js_platform_name`, `js_language`, `js_online`,
+    `js_user_agent`, `js_screen_width`/`_height`, `js_alert`.
+  - Timing: `js_performance_now` (high-resolution float) and
+    `js_date_now_iso` (wall-clock ISO-8601).
+  - Every declaration has a default implementation in the generated
+    JS glue; callers still override any of them via
+    `importOverrides`.
+
+- **AUTO struct marshalling (the core promise):**
+  - `tools/hlwasm.py` computes field layouts for every non-generic
+    struct (i64/f64: size 8, align 8; bool/str/ptr: size 4, align 4;
+    struct size rounded to its alignment) and exports
+    `hl_struct_descriptors()` — a JSON table of `{name, size,
+    fields: [{name, type, offset}]}` interned in the string pool.
+  - The JS glue reads it right after instantiation and calls
+    `Halis.registerStruct` for EVERY entry: "a Halis struct becomes
+    a JS object" with zero manual registration. `Halis.writeStruct`
+    (JS object -> wasm memory) and `Halis.readStruct` (wasm memory
+    -> JS object) then round-trip any declared struct.
+
+- **JS -> HLS callbacks:**
+  - Programs define `fn jsffi_on_callback(cb_id: int, arg: str)
+    -> str` (exact signature; a clean compile error names the
+    mismatch). `hlwasm` detects it and exports `hl_call_halis(
+    cb_id: i32, arg_ptr: i32) -> ret_ptr` (i32 cb_id is sign-extended
+    to the HLS i64 int on the way through).
+  - The JS glue adds `Halis.callHalis(cbId, json)` — it allocates
+    the JSON string in wasm memory, calls the export, and decodes
+    the returned string. The dispatch is an if/else chain on cb_id
+    inside the user's function (the handler_id pattern — HLS has no
+    function pointers).
+  - `std/jsffi_callback.hls` (new module, native/C backend): the
+    bookkeeping companion — `JsffiCallback {cb_id, name, protocol}`
+    rows, `jsffi_callback_new`, `jsffi_callback_find` (by name),
+    `jsffi_callback_by_id`, and `jsffi_callback_describe` (a
+    human-readable protocol summary). It uses list/struct literals,
+    so it lives SEPARATELY from std.jsffi — std.jsffi must stay
+    importable by the wasm32 emitter subset (no list/struct
+    literals there yet), which keeps `make webapp-acceptance` green.
+
+- **readStruct string-field fix (Stage 24 bug):** the glue read
+  string fields at the FIELD address instead of dereferencing the
+  `{len, bytes}` pointer the ABI stores there — string fields came
+  back as heap garbage. Stage 73 dereferences correctly; the
+  acceptance test round-trips a struct with a string field.
+
+- **Glue housekeeping:** the compact glue (default) carries all 48
+  defaults + auto-registration + `Halis.callHalis` (~11 KB; the
+  Stage 24 compact glue was ~2.5 KB with 13 defaults). The verbose
+  glue remains the Stage 23/24 debug build. `webapp-acceptance`'s
+  glue-size gate moved from 5 KB to 16 KB with a comment explaining
+  the Stage 73 growth (the Stage 24 milestone stays in the history).
+
+**Acceptance** (`make jsffi-acceptance`): compiles
+`examples/jsffi_stage73_demo.hls` with hlwasm and runs
+`tools/jsffi_check.js` (Node.js): (1) clean instantiation of the 48
+defaults; (2) `Point` and `Measurement` auto-registered (no manual
+`registerStruct`); (3) a `Point {x, y, tag, active, count}` round
+trip through `writeStruct`/`readStruct` with every field — str, i64,
+bool, f64 — intact; (4) `Halis.callHalis(1, {...})` returns the
+echo envelope the HLS handler built, and `callHalis(2, "ping
+please")` returns "pong"; (5) `main()` runs in wasm, prints its
+markers, exits 0. `tests/ok/feat_stage73_jsffi_callback.hls`
+(2 tests) covers the bookkeeping module differentially
+(interpreter == native). `webapp-acceptance` and the Stage 23
+wasm_hello demo still pass unchanged.
+
+**Demo** (`examples/jsffi_stage73_demo.hls`): exercises the expanded
+extern surface from wasm (console counters/timers, JSON canonical +
+validity, URL encode/decode, platform/language/online, performance
+timing, ISO timestamp), declares two structs purely for the
+auto-marshalling descriptors, defines `jsffi_on_callback` with two
+callback ids, and prints the callback protocol table.
+
 ## [v0.91.0-alpha] — Stage 72: std.openapi — OpenAPI 3.1 from handler types
 
 > Continues **Phase V (web application track, Stages 63–76)** — the

@@ -120,7 +120,7 @@ remains green.
 | 70 | `std.sse` — server-sent events (one-way streaming) | ✅ | (done in v0.89.0-alpha) |
 | 71 | `std.graphql` — schema-first server (parser + resolver) | ✅ | (done in v0.90.0-alpha) |
 | 72 | `std.openapi` — generate OpenAPI 3.1 from handler types | ✅ | (done in v0.91.0-alpha) |
-| 73 | `std.jsffi` — bind to JavaScript globals from `wasm32` | ⬜ | 5 weeks |
+| 73 | `std.jsffi` — bind to JavaScript globals from `wasm32` | ✅ | (done in v0.92.0-alpha) |
 | 74 | `std.dom` — server-side rendering (no client JS needed) | ⬜ | 4 weeks |
 | 75 | `hls-serve` — `webpack-dev-server` equivalent for HLS | ⬜ | 5 weeks |
 | 76 | `hls-wasm-pack` — publish-ready wasm + JS glue | ⬜ | 4 weeks |
@@ -8219,3 +8219,100 @@ injection defence, and an immutability check. Fully deterministic.
 the acceptance test differentially (interpreter == native for both),
 then prints the feature summary. Pure-HLS implementation; no new
 compiler builtins; bootstrap is still deterministic.
+
+---
+
+## STAGE 73 — `std.jsffi` — JavaScript globals from `wasm32` ✅ (release v0.92.0-alpha)
+
+**Goal:** from `target wasm32`, declare JavaScript imports —
+`extern "js" { fn console.log(s: str) -> void }` — where the wasm
+module imports them and the auto-generated JS glue provides them;
+struct marshalling where a Halis struct becomes a JS object. Stage 23
+laid the foundation (the extern "js" mechanism, 13 declarations);
+Stage 24 added manual struct marshalling helpers. Stage 73 completes
+the promise: a 48-declaration surface, AUTO marshalling (zero manual
+registration), JS->HLS callbacks, and a fixed string-field
+marshalling bug.
+
+**Status (v0.92.0-alpha):** Stage 73 is **COMPLETE**. The work spans
+`std/jsffi.hls` (declarations), the NEW `std/jsffi_callback.hls`
+(native-side bookkeeping), `tools/hlwasm.py` (struct layouts + two
+new exports + the upgraded compact JS glue), and
+`tools/jsffi_check.js` (the Node.js acceptance checker).
+
+**Shipped in v0.92.0-alpha (Stage 73):**
+
+- **extern "js" surface — 13 -> 48 declarations** (`std/jsffi.hls`):
+  console extras (table/clear/count/count_reset/group/group_end/
+  time/time_end), DOM attributes/classes/styles/values/title,
+  a JSON bridge (canonical + valid), URL encode/decode,
+  fetch-with-options, localStorage remove/clear/key_count,
+  environment info (platform/language/online/user-agent/screen),
+  performance timing (js_performance_now, js_date_now_iso), and
+  js_alert. Every declaration has a default in the generated glue;
+  importOverrides still win.
+
+- **AUTO struct marshalling:** `hlwasm` computes field layouts
+  (i64/f64: 8/8; bool/str/ptr: 4/4; struct size rounded to
+  alignment) for every non-generic struct and exports
+  `hl_struct_descriptors()` — a JSON table interned in the string
+  pool. The glue reads it at instantiation and registers EVERY
+  struct, so `Halis.writeStruct` / `Halis.readStruct` work for any
+  declared struct with zero manual `Halis.registerStruct` calls.
+
+- **JS -> HLS callbacks:** programs define
+  `fn jsffi_on_callback(cb_id: int, arg: str) -> str`; hlwasm
+  detects the exact signature (a clean error names any mismatch),
+  exports `hl_call_halis(cb_id: i32, arg_ptr: i32) -> ret_ptr`
+  (sign-extending the JS i32 to the HLS i64 int), and the glue
+  exposes `Halis.callHalis(cbId, json)`. The dispatch is an if/else
+  chain on cb_id — the std.http_router handler_id pattern applied
+  to FFI (HLS has no function pointers).
+
+- **`std/jsffi_callback.hls` (new module):** the bookkeeping
+  companion for the native/C backend — `JsffiCallback` rows
+  (cb_id / name / protocol), lookup by name and by id, and a
+  human-readable protocol renderer. It uses list/struct literals,
+  so it lives SEPARATELY from std.jsffi (which must stay importable
+  by the wasm32 emitter subset — no list/struct literals there —
+  keeping `make webapp-acceptance` green).
+
+- **readStruct string-field fix:** the Stage 24 glue read string
+  fields AT the field address rather than dereferencing the
+  `{len, bytes}` pointer stored there — string fields round-tripped
+  as heap garbage. Fixed; covered by the acceptance round trip.
+
+**Security model:** importOverrides remain the trust boundary for
+host functions; callback ids are caller-chosen ints (no
+auto-generated code paths); struct descriptors expose only layouts
+(field names + offsets + ABI types), never values.
+
+**Limitations (deferred to later stages):**
+
+- **NO PROMISE/AWAIT INTEGRATION:** callbacks are synchronous
+  request/response; a Promise-aware scheduler arrives with the
+  async/await stage.
+
+- **ONE ABI PER FUNCTION:** no variadic imports, no i64 pass-by-ref;
+  the wasm32 JS API constraint (BigInt for i64) is handled by the
+  glue.
+
+- **NO AUTO-GENERATED TYPESCRIPT DEFINITIONS** (that is Stage 76
+  hls-wasm-pack's job).
+
+- **The verbose glue remains Stage 23/24-level** (debug build); the
+  compact glue is the Stage 73 surface.
+
+**Acceptance** (`make jsffi-acceptance`): compiles
+`examples/jsffi_stage73_demo.hls` and runs `tools/jsffi_check.js`
+in Node.js — instantiation, auto-registration, a full-field struct
+round trip (str/i64/bool/f64), both callback directions, and
+main()'s markers with exit code 0. Plus
+`tests/ok/feat_stage73_jsffi_callback.hls` (2 tests) for the
+bookkeeping module, differentially (interpreter == native).
+`webapp-acceptance` and the Stage 23 demo still pass.
+
+**Demo** (`examples/jsffi_stage73_demo.hls`): the expanded extern
+surface driven from wasm; two structs declared purely for their
+auto-marshalling descriptors; a two-id `jsffi_on_callback` handler;
+the callback protocol printed. ~3 KB wasm after wasm-opt.

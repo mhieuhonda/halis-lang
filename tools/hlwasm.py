@@ -556,6 +556,14 @@ class WasmEmitter:
         self._str_pool_end = self.STR_BASE
         # Map extern block ABI -> handled. We support "js" only.
         self._js_externs: Dict[str, Tuple[List[str], str]] = {}
+        # Stage 73 (v0.92.0-alpha): struct field layouts (name ->
+        # [(field_name, wasm_abi_type, offset)]) and total sizes,
+        # computed by _compute_struct_layouts() for every non-generic
+        # struct. They feed the hl_struct_descriptors export so the JS
+        # glue can AUTO-register marshalling descriptors ("a Halis
+        # struct becomes a JS object", the roadmap's Stage 73 promise).
+        self._struct_layouts: Dict[str, List[Tuple[str, str, int]]] = {}
+        self._struct_sizes: Dict[str, int] = {}
 
     # ---------- string pool ----------
 
@@ -602,11 +610,21 @@ class WasmEmitter:
         # hl_alloc, etc.). These are defined functions, so they come after
         # imports in the function index space.
         self._emit_runtime_helpers()
+        # Step 0 (Stage 73): compute struct field layouts for the
+        # auto-marshalling descriptors.
+        self._compute_struct_layouts()
         # Step 4: emit user functions.
         for fname, fn in self.program["fns"].items():
             if fn.get("extern", False):
                 continue  # extern decls are imports, not defined funcs
             self._emit_function(fname, fn)
+        # Step 4b (Stage 73): the JS interop exports —
+        #   hl_struct_descriptors() -> str ptr  (auto-registered on the
+        #                                     JS side at instantiation)
+        #   hl_call_halis(cb_id, arg_ptr) -> ret ptr (JS->HLS callbacks;
+        #                                     only when the program
+        #                                     defines jsffi_on_callback)
+        self._emit_stage73_helpers()
         # Step 5: emit the _start entry point.
         self._emit_start()
         # Step 6: emit memory + exports.
@@ -638,6 +656,132 @@ class WasmEmitter:
             self.mod.add_data(offset, rec)
         # Done — assemble the binary.
         return self.mod.final_bytes()
+
+    # ---------- Stage 73: struct layouts + JS interop exports ----------
+
+    def _compute_struct_layouts(self):
+        """Stage 73: compute field offsets for every non-generic struct.
+
+        The wasm ABI passes structs as i32 pointers (the same convention
+        as the C backend), so the emitter never needed a layout before.
+        Stage 73 introduces AUTO-MARSHALLING: the JSON descriptor
+        emitted by hl_struct_descriptors() must agree with the JS glue's
+        reader (Halis.readStruct), so the layout is computed HERE and
+        shipped to the JS side at instantiation time.
+
+        Layout rules (mirroring the glue's sz()/readStruct):
+          int    -> i64, size 8, align 8
+          float  -> f64, size 8, align 8
+          bool   -> i32, size 4, align 4
+          str    -> i32 pointer, size 4, align 4
+          other  -> i32 pointer (nested struct / list / map / enum),
+                    size 4, align 4
+        The struct size is rounded up to its alignment (max field
+        align). Generic structs are skipped (they monomorphise at use
+        sites, which this emitter does not lower anyway).
+        """
+        for name in sorted(self.program.get("structs", {}) or {}):
+            st = self.program["structs"][name]
+            if st.get("typeparams"):
+                continue
+            off = 0
+            max_align = 4
+            fields: List[Tuple[str, str, int]] = []
+            for (fname, ftype, _default) in st["fields"]:
+                if ftype == "int":
+                    wty, size = "i64", 8
+                elif ftype == "float":
+                    wty, size = "f64", 8
+                elif ftype == "bool":
+                    wty, size = "bool", 4
+                elif ftype == "str":
+                    wty, size = "str", 4
+                else:
+                    # Nested struct / list / map / enum / generic: the
+                    # wasm ABI passes them as raw i32 pointers.
+                    wty, size = "ptr", 4
+                align = size
+                off = (off + align - 1) & ~(align - 1)
+                fields.append((fname, wty, off))
+                off += size
+                if align > max_align:
+                    max_align = align
+            size = (off + max_align - 1) & ~(max_align - 1)
+            self._struct_layouts[name] = fields
+            self._struct_sizes[name] = size
+
+    def _struct_descriptors_json(self) -> bytes:
+        """Render the struct-layout table as compact JSON (the body of
+        the hl_struct_descriptors() return string). Field order follows
+        the struct definition order; structs are sorted by name so the
+        output is deterministic."""
+        import json as _json
+        out = []
+        for name in sorted(self._struct_layouts.keys()):
+            fields = [
+                {"name": fn, "type": wt, "offset": off}
+                for (fn, wt, off) in self._struct_layouts[name]
+            ]
+            out.append({
+                "name": name,
+                "size": self._struct_sizes[name],
+                "fields": fields,
+            })
+        return _json.dumps(out, separators=(",", ":")).encode("utf-8")
+
+    def _emit_stage73_helpers(self):
+        """Stage 73: emit the JS interop exports.
+
+        hl_struct_descriptors() -> str ptr
+            Returns the JSON layout table for every non-generic struct
+            in the program. The JS glue reads it right after
+            instantiation and calls Halis.registerStruct for each entry
+            — "a Halis struct becomes a JS object" with ZERO manual
+            registration.
+
+        hl_call_halis(cb_id: i32, arg_ptr: i32) -> ret ptr
+            The JS->HLS callback entry. Emitted ONLY when the program
+            defines ``fn jsffi_on_callback(cb_id: int, arg: str) -> str``
+            (a plain HLS function — the user's dispatch table, the
+            std.http_router handler_id pattern applied to FFI). The JS
+            side reaches it through Halis.callHalis(cbId, json).
+        """
+        # --- hl_struct_descriptors ---
+        if self._struct_layouts:
+            json_bytes = self._struct_descriptors_json()
+            off = self._intern_str(json_bytes)
+            idx = self._add_helper("hl_struct_descriptors", [], [I32])
+            body = bytearray()
+            body.append(OP_I32_CONST); body += sleb(off)
+            # NOTE: WasmModule.final_bytes appends the function's
+            # closing OP_END itself — do NOT add one here.
+            self.mod.add_code([], bytes(body))
+            self.mod.add_export("hl_struct_descriptors", 0x00, idx)
+        # --- hl_call_halis ---
+        fns = self.program["fns"]
+        cb = fns.get("jsffi_on_callback")
+        if cb is not None and not cb.get("extern", False):
+            params = cb.get("params", [])
+            ok_sig = (len(params) == 2 and params[0][1] == "int"
+                      and params[1][1] == "str"
+                      and cb.get("ret") == "str")
+            if not ok_sig:
+                raise HLError(
+                    "jsffi_on_callback must have the exact signature "
+                    "fn jsffi_on_callback(cb_id: int, arg: str) -> str "
+                    "(found a different shape)", cb.get("line", 0), 0)
+            idx_cb = self.func_index["jsffi_on_callback"]
+            idx = self._add_helper("hl_call_halis", [I32, I32], [I32])
+            body = bytearray()
+            # cb_id arrives as i32 (JS numbers); the HLS fn takes int
+            # (i64) — sign-extend on the way through.
+            body.append(OP_LOCAL_GET); body += uleb(0)
+            body.append(OP_I64_EXTEND_I32_S)
+            body.append(OP_LOCAL_GET); body += uleb(1)
+            body.append(OP_CALL); body += uleb(idx_cb)
+            # final_bytes appends the closing OP_END.
+            self.mod.add_code([], bytes(body))
+            self.mod.add_export("hl_call_halis", 0x00, idx)
 
     # ---------- imports ----------
 
@@ -2251,7 +2395,7 @@ HTML_RUNNER = r"""<!DOCTYPE html>
 # pointers (same as the C ABI), and the JS side uses these helpers to
 # convert to/from JS objects. The user's ``extern "js"`` function takes
 # the i32 pointer and calls ``Halis.readStruct`` to get a JS object.
-JS_GLUE_COMPACT = r"""/* Halis wasm32 glue (Stage 24, v0.43.0-alpha) -- compact build. */
+JS_GLUE_COMPACT = r"""/* Halis wasm32 glue (Stage 73, v0.92.0-alpha) -- compact build. */
 (function(G){var H=G.Halis=G.Halis||{};
 var TD=new TextDecoder("utf-8"),TE=new TextEncoder();
 function rs(m,p){var dv=new DataView(m.buffer);var l=dv.getInt32(p,true);
@@ -2266,7 +2410,10 @@ if(f.type==="i64"){o[f.name]=dv.getBigInt64(v,true);}
 else if(f.type==="i32"){o[f.name]=dv.getInt32(v,true);}
 else if(f.type==="f64"){o[f.name]=dv.getFloat64(v,true);}
 else if(f.type==="bool"){o[f.name]=dv.getInt32(v,true)!==0;}
-else if(f.type==="str"){o[f.name]=rs(m,v);}
+else if(f.type==="str"){/* Stage 73 fix: the field holds a POINTER
+to {i32 len, bytes} — dereference it before reading the string
+(the Stage 24 version read the string AT the field address). */
+var fp=dv.getInt32(v,true);o[f.name]=rs(m,fp);}
 else if(f.type==="ptr"){o[f.name]=dv.getInt32(v,true);}}
 return o;};
 H.writeStruct=function(a,obj,n){var d=H.structs[n];if(!d)throw new Error("unknown struct: "+n);
@@ -2314,15 +2461,110 @@ return ws(m,inst.exports.hl_alloc,"{}");},
 js_json_to_struct:function(j,n){var m=inst.exports.memory;var nm=rs(m,n);
 if(H.structs&&H.structs[nm])try{return H.writeStruct(inst.exports.hl_alloc,JSON.parse(rs(m,j)),nm);}catch(e){}
 return 0;},
-js_call_with_struct:function(f,p,n){return 0;}};
+js_call_with_struct:function(f,p,n){return 0;},
+/* Stage 73 (v0.92.0-alpha) std.jsffi defaults. */
+js_console_table:function(m){console.table(rs(inst.exports.memory,m));},
+js_console_clear:function(){console.clear();},
+js_console_count:function(l){var k=rs(inst.exports.memory,l);
+H._counts=H._counts||{};H._counts[k]=(H._counts[k]||0)+1;
+console.log(k+": "+H._counts[k]);return BigInt(H._counts[k]);},
+js_console_count_reset:function(l){var k=rs(inst.exports.memory,l);
+if(H._counts)delete H._counts[k];},
+js_console_group:function(l){console.group(rs(inst.exports.memory,l));},
+js_console_group_end:function(){console.groupEnd();},
+js_console_time:function(l){H._timers=H._timers||{};
+H._timers[rs(inst.exports.memory,l)]=Date.now();},
+js_console_time_end:function(l){var k=rs(inst.exports.memory,l);
+H._timers=H._timers||{};var t0=H._timers[k]||Date.now();delete H._timers[k];
+var ms=Date.now()-t0;console.log(k+": "+ms+"ms");return BigInt(ms);},
+js_dom_set_attr:function(i,n,v){if(typeof document==="undefined")return;
+var m=inst.exports.memory;var e=document.getElementById(rs(m,i));
+if(e)e.setAttribute(rs(m,n),rs(m,v));},
+js_dom_get_attr:function(i,n){var m=inst.exports.memory;
+if(typeof document==="undefined")return ws(m,inst.exports.hl_alloc,"");
+var e=document.getElementById(rs(m,i));
+return ws(m,inst.exports.hl_alloc,e?String(e.getAttribute(rs(m,n))||""):"");},
+js_dom_remove:function(i){if(typeof document==="undefined")return;
+var m=inst.exports.memory;var e=document.getElementById(rs(m,i));
+if(e)e.remove();},
+js_dom_add_class:function(i,c){if(typeof document==="undefined")return;
+var m=inst.exports.memory;var e=document.getElementById(rs(m,i));
+if(e)e.classList.add(rs(m,c));},
+js_dom_remove_class:function(i,c){if(typeof document==="undefined")return;
+var m=inst.exports.memory;var e=document.getElementById(rs(m,i));
+if(e)e.classList.remove(rs(m,c));},
+js_dom_toggle_class:function(i,c){if(typeof document==="undefined")return false;
+var m=inst.exports.memory;var e=document.getElementById(rs(m,i));
+if(!e)return false;return e.classList.toggle(rs(m,c));},
+js_dom_set_style:function(i,p,v){if(typeof document==="undefined")return;
+var m=inst.exports.memory;var e=document.getElementById(rs(m,i));
+if(e)e.style.setProperty(rs(m,p),rs(m,v));},
+js_dom_get_value:function(i){var m=inst.exports.memory;
+if(typeof document==="undefined")return ws(m,inst.exports.hl_alloc,"");
+var e=document.getElementById(rs(m,i));
+return ws(m,inst.exports.hl_alloc,e?String(e.value||""):"");},
+js_dom_set_value:function(i,v){if(typeof document==="undefined")return;
+var m=inst.exports.memory;var e=document.getElementById(rs(m,i));
+if(e)e.value=rs(m,v);},
+js_dom_document_title:function(){var m=inst.exports.memory;
+return ws(m,inst.exports.hl_alloc,typeof document==="undefined"?"":String(document.title||""));},
+js_dom_set_title:function(t){if(typeof document==="undefined")return;
+var m=inst.exports.memory;document.title=rs(m,t);},
+js_json_canonical:function(s){var m=inst.exports.memory;
+try{return ws(m,inst.exports.hl_alloc,JSON.stringify(JSON.parse(rs(m,s))));}
+catch(e){return ws(m,inst.exports.hl_alloc,"null");}},
+js_json_valid:function(s){var m=inst.exports.memory;
+try{JSON.parse(rs(m,s));return true;}catch(e){return false;}},
+js_url_encode:function(s){var m=inst.exports.memory;
+return ws(m,inst.exports.hl_alloc,encodeURIComponent(rs(m,s)));},
+js_url_decode:function(s){var m=inst.exports.memory;
+try{return ws(m,inst.exports.hl_alloc,decodeURIComponent(rs(m,s)));}
+catch(e){return ws(m,inst.exports.hl_alloc,"");}},
+js_fetch_with_options:function(u,o){throw new Error("js_fetch_with_options: override via importOverrides");},
+js_localstorage_remove:function(k){if(typeof localStorage==="undefined")return;
+var m=inst.exports.memory;localStorage.removeItem(rs(m,k));},
+js_localstorage_clear:function(){if(typeof localStorage!=="undefined")localStorage.clear();},
+js_localstorage_key_count:function(){if(typeof localStorage==="undefined")return BigInt(0);
+return BigInt(localStorage.length);},
+js_platform_name:function(){var m=inst.exports.memory;
+var n=typeof navigator!=="undefined"?String(navigator.platform||"node"):"unknown";
+return ws(m,inst.exports.hl_alloc,n);},
+js_language:function(){var m=inst.exports.memory;
+var n=typeof navigator!=="undefined"?String(navigator.language||"en"):"en";
+return ws(m,inst.exports.hl_alloc,n);},
+js_online:function(){return typeof navigator!=="undefined"?navigator.onLine!==false:true;},
+js_user_agent:function(){var m=inst.exports.memory;
+var n=typeof navigator!=="undefined"?String(navigator.userAgent||""):"node";
+return ws(m,inst.exports.hl_alloc,n);},
+js_screen_width:function(){if(typeof screen==="undefined")return BigInt(0);
+return BigInt(screen.width|0);},
+js_screen_height:function(){if(typeof screen==="undefined")return BigInt(0);
+return BigInt(screen.height|0);},
+js_alert:function(m){if(typeof alert!=="undefined")alert(rs(inst.exports.memory,m));},
+js_performance_now:function(){return (typeof performance!=="undefined"?performance.now():Date.now());},
+js_date_now_iso:function(){var m=inst.exports.memory;
+return ws(m,inst.exports.hl_alloc,new Date().toISOString());}};
 if(ov)for(var k in ov)env[k]=ov[k];
 var mod;if(wb instanceof WebAssembly.Module)mod=wb;
 else if(typeof wb==="string"){var r=await fetch(wb);var b=await r.arrayBuffer();
 mod=await WebAssembly.compile(b);}
 else if(wb instanceof ArrayBuffer||wb instanceof Uint8Array)mod=await WebAssembly.compile(wb);
 else throw new Error("Halis.instantiate: expected bytes/URL");
-inst=await WebAssembly.instantiate(mod,{env:env});H._mem=inst.exports.memory;
+inst=await WebAssembly.instantiate(mod,{env:env});H._mem=inst.exports.memory;H._inst=inst;
+/* Stage 73: AUTO-REGISTER struct descriptors. If the module exports
+hl_struct_descriptors(), every struct in the Halis program is
+registered for marshalling with zero manual setup — "a Halis struct
+becomes a JS object". */
+if(typeof inst.exports.hl_struct_descriptors==="function"){
+try{var d=JSON.parse(rs(inst.exports.memory,inst.exports.hl_struct_descriptors()));
+for(var di=0;di<d.length;di++)H.registerStruct(d[di].name,d[di].fields);}catch(e){}}
 return{instance:inst,module:mod};};
+H.callHalis=async function(cbId,argJson){
+if(!H._inst||typeof H._inst.exports.hl_call_halis!=="function")
+throw new Error("hl_call_halis export missing: define fn jsffi_on_callback(cb_id: int, arg: str) -> str in the Halis program");
+var m=H._inst.exports.memory;
+var ap=ws(m,H._inst.exports.hl_alloc,String(argJson));
+return rs(m,H._inst.exports.hl_call_halis(cbId,ap));};
 H.run=async function(wb,ov){var r=await H.instantiate(wb,ov);
 if(typeof r.instance.exports.hl_main==="function")return r.instance.exports.hl_main();
 if(typeof r.instance.exports._start==="function")r.instance.exports._start();return 0;};
