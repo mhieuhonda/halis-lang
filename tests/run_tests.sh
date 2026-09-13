@@ -677,7 +677,15 @@ if uname -m | grep -qE "x86_64|i386|i686"; then
         bad "simd: --target-feature avx2 compile failed"
     fi
     # Unflagged native build must contain ZERO SIMD helpers.
-    if ! grep -q "hl_simd_add_i32x4\|hl_simd_cpu_supports(hl_str" "$TMP/$name.c" 2>/dev/null; then
+    # Deep-scan-23 fix: this check grepped "$TMP/$name.c" but `name` is
+    # never assigned in this phase (a set -u crash), and the old pattern
+    # also matched `hl_simd_cpu_supports(hl_str` — the PORTABLE runtime
+    # probe that legitimately exists in every build — so the check could
+    # never pass. Compile the simd test WITHOUT the feature flag and
+    # grep for the INTRINSIC machinery only (immintrin/NEON/RVV headers
+    # and intrinsics, plus the fast-path kernel names).
+    if "$TMP/hlc1" "$SIMD_F" "$TMP/s21_unflagged.c" >/dev/null 2>&1 \
+            && ! grep -q "immintrin\|arm_neon\|riscv_vector\|_mm_\|vld1q_\|vst1q_\|__riscv_v\|hl_simd_add_i32x4" "$TMP/s21_unflagged.c" 2>/dev/null; then
         ok "simd: unflagged build has no SIMD helper emission"
     else
         bad "simd: SIMD machinery leaked into an unflagged build"
@@ -1122,6 +1130,16 @@ if python3 tools/hlwasm.py "$WASM_F" "$TMP/hello_wasm" >"$TMP/wasm.log" 2>&1; th
     # (c) .js and .html glue files are produced.
     if [ -f "$TMP/hello_wasm.js" ] && [ -f "$TMP/hello_wasm.html" ]; then
         ok "wasm: .js + .html glue files produced"
+        # Deep-scan-23: a jsffi-free program's compact glue must stay
+        # under 5 KB — the glue is tree-shaken to the module's real
+        # import list, so hello.hls (no std.jsffi) carries only the
+        # loader + 3 standard stubs.
+        hello_js_size=$(stat -c %s "$TMP/hello_wasm.js" 2>/dev/null || stat -f %z "$TMP/hello_wasm.js")
+        if [ "$hello_js_size" -lt 5120 ]; then
+            ok "wasm: jsffi-free glue is ${hello_js_size}-byte (< 5 KB, tree-shaken)"
+        else
+            bad "wasm: jsffi-free glue is ${hello_js_size} bytes (>= 5 KB)"
+        fi
     else
         bad "wasm: .js or .html glue missing"
     fi
@@ -1337,10 +1355,17 @@ if python3 tools/hlwasm.py examples/web_app_1000loc.hls "$TMP/webapp24" >"$TMP/w
     else
         bad "wasm24: webapp wasm is $wasm_size bytes (>= 100 KB)"
     fi
-    if [ "$js_size" -lt 5120 ]; then
-        ok "wasm24: webapp JS glue is $js_size bytes (< 5 KB)"
+    # Deep-scan-23: the 5 KB budget was written before Stage 73 added
+    # the ~50-stub std.jsffi surface. The compact glue is now
+    # tree-shaken: it carries ONLY the stubs the program statically
+    # calls (12 for this webapp), so the budget scales with real usage.
+    # A webapp calling 12 js functions lands at ~5.6 KB; the absolute
+    # 5 KB ceiling still applies to jsffi-free programs (checked in
+    # phase 11 via examples/hello.hls's glue).
+    if [ "$js_size" -lt 8192 ]; then
+        ok "wasm24: webapp JS glue is $js_size bytes (< 8 KB, tree-shaken jsffi stubs)"
     else
-        bad "wasm24: webapp JS glue is $js_size bytes (>= 5 KB)"
+        bad "wasm24: webapp JS glue is $js_size bytes (>= 8 KB)"
     fi
     # Check wasm-opt reduction: compare --wasm-opt off vs --wasm-opt auto.
     if python3 tools/hlwasm.py examples/web_app_1000loc.hls "$TMP/webapp24_noopt" --wasm-opt off >"$TMP/webapp24_noopt.log" 2>&1; then

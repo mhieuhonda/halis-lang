@@ -456,6 +456,31 @@ class WasmModule:
 # WasmEmitter — walks the checked HLS AST and emits wasm code
 # ============================================================================
 
+def _called_fn_names(node) -> Set[str]:
+    """Every plain-call NAME appearing anywhere in a boot-AST program
+    value (dicts/lists, recursively). Deep-scan-23: the wasm emitter
+    lowers every function in the program, so an extern "js" import must
+    be declared iff SOME emitted call may reference it — i.e. iff a
+    call node with that name exists anywhere in the same program dict
+    the emitter walks (function bodies, struct defaults, everything).
+    Sound by construction; independent of the checker's edge bookkeeping.
+    """
+    acc: Set[str] = set()
+    stack = [node]
+    while stack:
+        cur = stack.pop()
+        if isinstance(cur, dict):
+            k = cur.get("k")
+            if k == "call" and isinstance(cur.get("name"), str):
+                acc.add(cur["name"])
+            elif k == "methodcall" and isinstance(cur.get("name"), str):
+                acc.add(cur["name"])
+            stack.extend(cur.values())
+        elif isinstance(cur, (list, tuple)):
+            stack.extend(cur)
+    return acc
+
+
 class WasmEmitter:
     """Walks a checked HLS program AST and emits a WasmModule.
 
@@ -802,10 +827,18 @@ class WasmEmitter:
         self.func_index["hl_js_f64_to_str"] = idx
         # Record their function indices (0, 1, 2 — they're the first imports).
         # User-declared extern "js" functions.
+        # Deep-scan-23: declare only the externs the program ACTUALLY
+        # calls somewhere (a static walk of the same AST the emitter
+        # lowers). Importing std.jsffi wholesale no longer drags its
+        # whole FFI surface into every wasm module and its JS glue —
+        # only the imports that can truly be referenced are emitted.
+        called = _called_fn_names(self.program)
         for ext in self.program.get("externs", []):
             if ext["abi"] != "js":
                 continue
             for fn in ext["decls"]:
+                if fn["name"] not in called:
+                    continue
                 param_valtypes = [hls_to_wasm_valtype(p[1]) for p in fn["params"]]
                 result_valtypes = hls_to_wasm_result(fn["ret"])
                 ty = self.mod.add_type(param_valtypes, result_valtypes)
@@ -2429,8 +2462,7 @@ else if(f.type==="str"){var sp=ws(m,a,String(val));dv.setInt32(v,sp,true);}
 else if(f.type==="ptr"){dv.setInt32(v,val|0,true);}}
 return p;};
 H.registerStruct=function(n,d){H.structs=H.structs||{};H.structs[n]=d;};
-H.instantiate=async function(wb,ov){var inst;var env={
-hl_js_println:function(p){console.log(rs(inst.exports.memory,p));},
+H.instantiate=async function(wb,ov){var inst;var env={hl_js_println:function(p){console.log(rs(inst.exports.memory,p));},
 hl_js_print:function(p){var s=rs(inst.exports.memory,p);
 if(typeof process!=="undefined"&&process.stdout)process.stdout.write(s);
 else if(typeof document!=="undefined"){var o=document.getElementById("halis-out");
@@ -2438,112 +2470,8 @@ if(o)o.appendChild(document.createTextNode(s));}else console.log(s);},
 hl_js_f64_to_str:function(f){var s=String(f);
 if(s.indexOf(".")<0&&s.indexOf("e")<0&&s.indexOf("i")<0&&s.indexOf("N")<0)s+=".0";
 return ws(inst.exports.memory,inst.exports.hl_alloc,s);},
-/* std.jsffi defaults (Stage 24). */
-js_console_log:function(p){console.log(rs(inst.exports.memory,p));},
-js_console_warn:function(p){console.warn(rs(inst.exports.memory,p));},
-js_console_error:function(p){console.error(rs(inst.exports.memory,p));},
-js_dom_set_text:function(i,t){if(typeof document==="undefined")return;
-var m=inst.exports.memory;var e=document.getElementById(rs(m,i));if(e)e.textContent=rs(m,t);},
-js_dom_append:function(i,h){if(typeof document==="undefined")return;
-var m=inst.exports.memory;var e=document.getElementById(rs(m,i));if(e)e.insertAdjacentHTML("beforeend",rs(m,h));},
-js_random:function(){return Math.random();},
-js_random_int:function(mx){return BigInt(Math.floor(Math.random()*Number(mx)));},
-js_fetch:function(u){throw new Error("js_fetch: override via importOverrides");},
-js_localstorage_get:function(k){if(typeof localStorage==="undefined")return 0;
-var m=inst.exports.memory;return ws(m,inst.exports.hl_alloc,localStorage.getItem(rs(m,k))||"");},
-js_localstorage_set:function(k,v){if(typeof localStorage==="undefined")return;
-var m=inst.exports.memory;localStorage.setItem(rs(m,k),rs(m,v));},
-js_now_ms:function(){return BigInt(Date.now());},
-js_set_timeout:function(ms){return BigInt(0);},
-js_struct_to_json:function(p,n){var m=inst.exports.memory;var nm=rs(m,n);
-if(H.structs&&H.structs[nm])return ws(m,inst.exports.hl_alloc,JSON.stringify(H.readStruct(p,nm)));
-return ws(m,inst.exports.hl_alloc,"{}");},
-js_json_to_struct:function(j,n){var m=inst.exports.memory;var nm=rs(m,n);
-if(H.structs&&H.structs[nm])try{return H.writeStruct(inst.exports.hl_alloc,JSON.parse(rs(m,j)),nm);}catch(e){}
-return 0;},
-js_call_with_struct:function(f,p,n){return 0;},
-/* Stage 73 (v0.92.0-alpha) std.jsffi defaults. */
-js_console_table:function(m){console.table(rs(inst.exports.memory,m));},
-js_console_clear:function(){console.clear();},
-js_console_count:function(l){var k=rs(inst.exports.memory,l);
-H._counts=H._counts||{};H._counts[k]=(H._counts[k]||0)+1;
-console.log(k+": "+H._counts[k]);return BigInt(H._counts[k]);},
-js_console_count_reset:function(l){var k=rs(inst.exports.memory,l);
-if(H._counts)delete H._counts[k];},
-js_console_group:function(l){console.group(rs(inst.exports.memory,l));},
-js_console_group_end:function(){console.groupEnd();},
-js_console_time:function(l){H._timers=H._timers||{};
-H._timers[rs(inst.exports.memory,l)]=Date.now();},
-js_console_time_end:function(l){var k=rs(inst.exports.memory,l);
-H._timers=H._timers||{};var t0=H._timers[k]||Date.now();delete H._timers[k];
-var ms=Date.now()-t0;console.log(k+": "+ms+"ms");return BigInt(ms);},
-js_dom_set_attr:function(i,n,v){if(typeof document==="undefined")return;
-var m=inst.exports.memory;var e=document.getElementById(rs(m,i));
-if(e)e.setAttribute(rs(m,n),rs(m,v));},
-js_dom_get_attr:function(i,n){var m=inst.exports.memory;
-if(typeof document==="undefined")return ws(m,inst.exports.hl_alloc,"");
-var e=document.getElementById(rs(m,i));
-return ws(m,inst.exports.hl_alloc,e?String(e.getAttribute(rs(m,n))||""):"");},
-js_dom_remove:function(i){if(typeof document==="undefined")return;
-var m=inst.exports.memory;var e=document.getElementById(rs(m,i));
-if(e)e.remove();},
-js_dom_add_class:function(i,c){if(typeof document==="undefined")return;
-var m=inst.exports.memory;var e=document.getElementById(rs(m,i));
-if(e)e.classList.add(rs(m,c));},
-js_dom_remove_class:function(i,c){if(typeof document==="undefined")return;
-var m=inst.exports.memory;var e=document.getElementById(rs(m,i));
-if(e)e.classList.remove(rs(m,c));},
-js_dom_toggle_class:function(i,c){if(typeof document==="undefined")return false;
-var m=inst.exports.memory;var e=document.getElementById(rs(m,i));
-if(!e)return false;return e.classList.toggle(rs(m,c));},
-js_dom_set_style:function(i,p,v){if(typeof document==="undefined")return;
-var m=inst.exports.memory;var e=document.getElementById(rs(m,i));
-if(e)e.style.setProperty(rs(m,p),rs(m,v));},
-js_dom_get_value:function(i){var m=inst.exports.memory;
-if(typeof document==="undefined")return ws(m,inst.exports.hl_alloc,"");
-var e=document.getElementById(rs(m,i));
-return ws(m,inst.exports.hl_alloc,e?String(e.value||""):"");},
-js_dom_set_value:function(i,v){if(typeof document==="undefined")return;
-var m=inst.exports.memory;var e=document.getElementById(rs(m,i));
-if(e)e.value=rs(m,v);},
-js_dom_document_title:function(){var m=inst.exports.memory;
-return ws(m,inst.exports.hl_alloc,typeof document==="undefined"?"":String(document.title||""));},
-js_dom_set_title:function(t){if(typeof document==="undefined")return;
-var m=inst.exports.memory;document.title=rs(m,t);},
-js_json_canonical:function(s){var m=inst.exports.memory;
-try{return ws(m,inst.exports.hl_alloc,JSON.stringify(JSON.parse(rs(m,s))));}
-catch(e){return ws(m,inst.exports.hl_alloc,"null");}},
-js_json_valid:function(s){var m=inst.exports.memory;
-try{JSON.parse(rs(m,s));return true;}catch(e){return false;}},
-js_url_encode:function(s){var m=inst.exports.memory;
-return ws(m,inst.exports.hl_alloc,encodeURIComponent(rs(m,s)));},
-js_url_decode:function(s){var m=inst.exports.memory;
-try{return ws(m,inst.exports.hl_alloc,decodeURIComponent(rs(m,s)));}
-catch(e){return ws(m,inst.exports.hl_alloc,"");}},
-js_fetch_with_options:function(u,o){throw new Error("js_fetch_with_options: override via importOverrides");},
-js_localstorage_remove:function(k){if(typeof localStorage==="undefined")return;
-var m=inst.exports.memory;localStorage.removeItem(rs(m,k));},
-js_localstorage_clear:function(){if(typeof localStorage!=="undefined")localStorage.clear();},
-js_localstorage_key_count:function(){if(typeof localStorage==="undefined")return BigInt(0);
-return BigInt(localStorage.length);},
-js_platform_name:function(){var m=inst.exports.memory;
-var n=typeof navigator!=="undefined"?String(navigator.platform||"node"):"unknown";
-return ws(m,inst.exports.hl_alloc,n);},
-js_language:function(){var m=inst.exports.memory;
-var n=typeof navigator!=="undefined"?String(navigator.language||"en"):"en";
-return ws(m,inst.exports.hl_alloc,n);},
-js_online:function(){return typeof navigator!=="undefined"?navigator.onLine!==false:true;},
-js_user_agent:function(){var m=inst.exports.memory;
-var n=typeof navigator!=="undefined"?String(navigator.userAgent||""):"node";
-return ws(m,inst.exports.hl_alloc,n);},
-js_screen_width:function(){if(typeof screen==="undefined")return BigInt(0);
-return BigInt(screen.width|0);},
-js_screen_height:function(){if(typeof screen==="undefined")return BigInt(0);
-return BigInt(screen.height|0);},
-js_alert:function(m){if(typeof alert!=="undefined")alert(rs(inst.exports.memory,m));},
-js_performance_now:function(){return (typeof performance!=="undefined"?performance.now():Date.now());},
-js_date_now_iso:function(){var m=inst.exports.memory;
-return ws(m,inst.exports.hl_alloc,new Date().toISOString());}};
+/* std.jsffi defaults — injected per-import by generate_js_glue(). */
+__EXTRA_ENV_STUBS__};
 if(ov)for(var k in ov)env[k]=ov[k];
 var mod;if(wb instanceof WebAssembly.Module)mod=wb;
 else if(typeof wb==="string"){var r=await fetch(wb);var b=await r.arrayBuffer();
@@ -2571,18 +2499,147 @@ if(typeof r.instance.exports._start==="function")r.instance.exports._start();ret
 })(typeof globalThis!=="undefined"?globalThis:(typeof window!=="undefined"?window:global));
 """
 
+# JS_GLUE_COMPACT_STUBS — the per-import default stubs removed from the
+# compact template above (deep-scan-23 tree-shaking). generate_js_glue()
+# re-injects ONLY the stubs the compiled module actually imports, so a
+# program that never uses std.jsffi gets a ~3 KB glue instead of an
+# 11 KB one; jsffi-heavy programs grow only as needed.
+JS_GLUE_COMPACT_STUBS = {
+    "js_console_log": r"""function(p){console.log(rs(inst.exports.memory,p));}""",
+    "js_console_warn": r"""function(p){console.warn(rs(inst.exports.memory,p));}""",
+    "js_console_error": r"""function(p){console.error(rs(inst.exports.memory,p));}""",
+    "js_dom_set_text": r"""function(i,t){if(typeof document==="undefined")return;
+var m=inst.exports.memory;var e=document.getElementById(rs(m,i));if(e)e.textContent=rs(m,t);}""",
+    "js_dom_append": r"""function(i,h){if(typeof document==="undefined")return;
+var m=inst.exports.memory;var e=document.getElementById(rs(m,i));if(e)e.insertAdjacentHTML("beforeend",rs(m,h));}""",
+    "js_random": r"""function(){return Math.random();}""",
+    "js_random_int": r"""function(mx){return BigInt(Math.floor(Math.random()*Number(mx)));}""",
+    "js_fetch": r"""function(u){throw new Error("js_fetch: override via importOverrides");}""",
+    "js_localstorage_get": r"""function(k){if(typeof localStorage==="undefined")return 0;
+var m=inst.exports.memory;return ws(m,inst.exports.hl_alloc,localStorage.getItem(rs(m,k))||"");}""",
+    "js_localstorage_set": r"""function(k,v){if(typeof localStorage==="undefined")return;
+var m=inst.exports.memory;localStorage.setItem(rs(m,k),rs(m,v));}""",
+    "js_now_ms": r"""function(){return BigInt(Date.now());}""",
+    "js_set_timeout": r"""function(ms){return BigInt(0);}""",
+    "js_struct_to_json": r"""function(p,n){var m=inst.exports.memory;var nm=rs(m,n);
+if(H.structs&&H.structs[nm])return ws(m,inst.exports.hl_alloc,JSON.stringify(H.readStruct(p,nm)));
+return ws(m,inst.exports.hl_alloc,"{}");}""",
+    "js_json_to_struct": r"""function(j,n){var m=inst.exports.memory;var nm=rs(m,n);
+if(H.structs&&H.structs[nm])try{return H.writeStruct(inst.exports.hl_alloc,JSON.parse(rs(m,j)),nm);}catch(e){}
+return 0;}""",
+    "js_call_with_struct": r"""function(f,p,n){return 0;}""",
+    "js_console_table": r"""function(m){console.table(rs(inst.exports.memory,m));}""",
+    "js_console_clear": r"""function(){console.clear();}""",
+    "js_console_count": r"""function(l){var k=rs(inst.exports.memory,l);
+H._counts=H._counts||{};H._counts[k]=(H._counts[k]||0)+1;
+console.log(k+": "+H._counts[k]);return BigInt(H._counts[k]);}""",
+    "js_console_count_reset": r"""function(l){var k=rs(inst.exports.memory,l);
+if(H._counts)delete H._counts[k];}""",
+    "js_console_group": r"""function(l){console.group(rs(inst.exports.memory,l));}""",
+    "js_console_group_end": r"""function(){console.groupEnd();}""",
+    "js_console_time": r"""function(l){H._timers=H._timers||{};
+H._timers[rs(inst.exports.memory,l)]=Date.now();}""",
+    "js_console_time_end": r"""function(l){var k=rs(inst.exports.memory,l);
+H._timers=H._timers||{};var t0=H._timers[k]||Date.now();delete H._timers[k];
+var ms=Date.now()-t0;console.log(k+": "+ms+"ms");return BigInt(ms);}""",
+    "js_dom_set_attr": r"""function(i,n,v){if(typeof document==="undefined")return;
+var m=inst.exports.memory;var e=document.getElementById(rs(m,i));
+if(e)e.setAttribute(rs(m,n),rs(m,v));}""",
+    "js_dom_get_attr": r"""function(i,n){var m=inst.exports.memory;
+if(typeof document==="undefined")return ws(m,inst.exports.hl_alloc,"");
+var e=document.getElementById(rs(m,i));
+return ws(m,inst.exports.hl_alloc,e?String(e.getAttribute(rs(m,n))||""):"");}""",
+    "js_dom_remove": r"""function(i){if(typeof document==="undefined")return;
+var m=inst.exports.memory;var e=document.getElementById(rs(m,i));
+if(e)e.remove();}""",
+    "js_dom_add_class": r"""function(i,c){if(typeof document==="undefined")return;
+var m=inst.exports.memory;var e=document.getElementById(rs(m,i));
+if(e)e.classList.add(rs(m,c));}""",
+    "js_dom_remove_class": r"""function(i,c){if(typeof document==="undefined")return;
+var m=inst.exports.memory;var e=document.getElementById(rs(m,i));
+if(e)e.classList.remove(rs(m,c));}""",
+    "js_dom_toggle_class": r"""function(i,c){if(typeof document==="undefined")return false;
+var m=inst.exports.memory;var e=document.getElementById(rs(m,i));
+if(!e)return false;return e.classList.toggle(rs(m,c));}""",
+    "js_dom_set_style": r"""function(i,p,v){if(typeof document==="undefined")return;
+var m=inst.exports.memory;var e=document.getElementById(rs(m,i));
+if(e)e.style.setProperty(rs(m,p),rs(m,v));}""",
+    "js_dom_get_value": r"""function(i){var m=inst.exports.memory;
+if(typeof document==="undefined")return ws(m,inst.exports.hl_alloc,"");
+var e=document.getElementById(rs(m,i));
+return ws(m,inst.exports.hl_alloc,e?String(e.value||""):"");}""",
+    "js_dom_set_value": r"""function(i,v){if(typeof document==="undefined")return;
+var m=inst.exports.memory;var e=document.getElementById(rs(m,i));
+if(e)e.value=rs(m,v);}""",
+    "js_dom_document_title": r"""function(){var m=inst.exports.memory;
+return ws(m,inst.exports.hl_alloc,typeof document==="undefined"?"":String(document.title||""));}""",
+    "js_dom_set_title": r"""function(t){if(typeof document==="undefined")return;
+var m=inst.exports.memory;document.title=rs(m,t);}""",
+    "js_json_canonical": r"""function(s){var m=inst.exports.memory;
+try{return ws(m,inst.exports.hl_alloc,JSON.stringify(JSON.parse(rs(m,s))));}
+catch(e){return ws(m,inst.exports.hl_alloc,"null");}}""",
+    "js_json_valid": r"""function(s){var m=inst.exports.memory;
+try{JSON.parse(rs(m,s));return true;}catch(e){return false;}}""",
+    "js_url_encode": r"""function(s){var m=inst.exports.memory;
+return ws(m,inst.exports.hl_alloc,encodeURIComponent(rs(m,s)));}""",
+    "js_url_decode": r"""function(s){var m=inst.exports.memory;
+try{return ws(m,inst.exports.hl_alloc,decodeURIComponent(rs(m,s)));}
+catch(e){return ws(m,inst.exports.hl_alloc,"");}}""",
+    "js_fetch_with_options": r"""function(u,o){throw new Error("js_fetch_with_options: override via importOverrides");}""",
+    "js_localstorage_remove": r"""function(k){if(typeof localStorage==="undefined")return;
+var m=inst.exports.memory;localStorage.removeItem(rs(m,k));}""",
+    "js_localstorage_clear": r"""function(){if(typeof localStorage!=="undefined")localStorage.clear();}""",
+    "js_localstorage_key_count": r"""function(){if(typeof localStorage==="undefined")return BigInt(0);
+return BigInt(localStorage.length);}""",
+    "js_platform_name": r"""function(){var m=inst.exports.memory;
+var n=typeof navigator!=="undefined"?String(navigator.platform||"node"):"unknown";
+return ws(m,inst.exports.hl_alloc,n);}""",
+    "js_language": r"""function(){var m=inst.exports.memory;
+var n=typeof navigator!=="undefined"?String(navigator.language||"en"):"en";
+return ws(m,inst.exports.hl_alloc,n);}""",
+    "js_online": r"""function(){return typeof navigator!=="undefined"?navigator.onLine!==false:true;}""",
+    "js_user_agent": r"""function(){var m=inst.exports.memory;
+var n=typeof navigator!=="undefined"?String(navigator.userAgent||""):"node";
+return ws(m,inst.exports.hl_alloc,n);}""",
+    "js_screen_width": r"""function(){if(typeof screen==="undefined")return BigInt(0);
+return BigInt(screen.width|0);}""",
+    "js_screen_height": r"""function(){if(typeof screen==="undefined")return BigInt(0);
+return BigInt(screen.height|0);}""",
+    "js_alert": r"""function(m){if(typeof alert!=="undefined")alert(rs(inst.exports.memory,m));}""",
+    "js_performance_now": r"""function(){return (typeof performance!=="undefined"?performance.now():Date.now());}""",
+    "js_date_now_iso": r"""function(){var m=inst.exports.memory;
+return ws(m,inst.exports.hl_alloc,new Date().toISOString());}""",
+}
 
-def generate_js_glue(verbose: bool = False) -> str:
+
+def generate_js_glue(verbose: bool = False,
+                     imports: Optional[List[str]] = None) -> str:
     """Return the JS glue source.
 
-    Stage 24: the compact glue (default) is ~2.5 KB and includes the
-    struct-marshalling API (Halis.readStruct, Halis.writeStruct,
-    Halis.registerStruct). The verbose glue (~5.5 KB, the Stage 23
-    version) is kept for debugging — pass ``verbose=True``.
+    Stage 24: the compact glue (default) includes the struct-marshalling
+    API (Halis.readStruct, Halis.writeStruct, Halis.registerStruct).
+    The verbose glue (the Stage 23 version) is kept for debugging — pass
+    ``verbose=True``.
+
+    Deep-scan-23: ``imports`` is the wasm module's declared import names
+    (emitter.mod.imports). The compact glue re-injects ONLY the std.jsffi
+    default stubs the module actually imports, so the glue size scales
+    with the program's real JS surface instead of carrying every Stage 73
+    stub unconditionally. ``imports=None`` keeps every stub (used by the
+    emscripten bridge, whose import section is not ours).
     """
     if verbose:
         return JS_GLUE
-    return JS_GLUE_COMPACT
+    if imports is None:
+        wanted = set(JS_GLUE_COMPACT_STUBS)
+    else:
+        wanted = set(imports)
+    parts = []
+    for name in JS_GLUE_COMPACT_STUBS:
+        if name in wanted:
+            parts.append(name + ':' + JS_GLUE_COMPACT_STUBS[name])
+    extra = ',\n'.join(parts) + (',' if parts else '')
+    return JS_GLUE_COMPACT.replace('__EXTRA_ENV_STUBS__', extra)
 
 
 def generate_html_runner(title: str, wasm_name: str, js_name: str,
@@ -2793,8 +2850,10 @@ def compile_program(input_hls: str, output_base: str,
         sys.stderr.write("wrote %s (%d bytes)\n" % (wasm_path, len(wasm_bytes)))
     if emit_js:
         js_path = output_base + ".js"
+        import_names = [n for (_m, n, _k, _t) in emitter.mod.imports]
         with open(js_path, "w") as f:
-            f.write(generate_js_glue(verbose=(glue_style == "verbose")))
+            f.write(generate_js_glue(verbose=(glue_style == "verbose"),
+                                     imports=import_names))
         sys.stderr.write("wrote %s (%d bytes)\n" % (js_path, os.path.getsize(js_path)))
     if emit_html:
         html_path = output_base + ".html"

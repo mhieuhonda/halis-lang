@@ -113,6 +113,11 @@ lsp-check:
 # hltest: run every test_* function in the given .hls files (or dirs).
 # Usage: make hltest [F=tests/ok] [GREP=map] [J=4] [JUNIT=out.xml]
 hltest:
+	# deep-scan-23: the session file-store tests write .sess files to
+	# /tmp/hls_session_test; create it (session-acceptance already did
+	# this) and clear stale files so runs stay deterministic.
+	@mkdir -p /tmp/hls_session_test
+	@rm -f /tmp/hls_session_test/*.sess 2>/dev/null || true
 	@test -n "$(F)" || F=tests/ok; \
 	  if [ -n "$(GREP)" ]; then G="--grep $(GREP)"; fi; \
 	  if [ -n "$(JUNIT)" ]; then J="--junit $(JUNIT)"; fi; \
@@ -122,7 +127,8 @@ hltest:
 # hls-fuzz: AST-level differential fuzzer. Default 60s smoke run;
 # CI runs `make fuzz-acceptance` for the 1-hour acceptance run.
 fuzz:
-	@$(PYTHON) tools/hls-fuzz.py --time $(or $(TIME),60) --seed $(or $(SEED),)
+	@if [ -n "$(SEED)" ]; then S="--seed $(SEED)"; else S=""; fi; \
+	$(PYTHON) tools/hls-fuzz.py --time $(or $(TIME),60) $$S
 
 # fuzz-acceptance: the Stage 18 acceptance criterion — fuzzer runs for
 # 1 hour without finding any semantic discrepancy between the
@@ -633,7 +639,10 @@ prove-full:
 
 # Exhaustive finite-state model checking of a transition fn
 model:
-	@python3 tools/hlmodel.py $(F) --fn $(FN) [--invariant $(INV)] [--init $(INIT)]
+	@if [ -z "$(F)" ] || [ -z "$(FN)" ]; then echo "Usage: make model F=file.hls FN=transition_fn [INV=invariant_fn] [INIT=Enum.Variant]" && false; fi; \
+	if [ -n "$(INV)" ]; then I="--invariant $(INV)"; else I=""; fi; \
+	if [ -n "$(INIT)" ]; then S="--init $(INIT)"; else S=""; fi; \
+	python3 tools/hlmodel.py $(F) --fn $(FN) $$I $$S
 
 # The Stage 17 acceptance example (HMAC envelope, fully proven hot path)
 prove-acceptance:

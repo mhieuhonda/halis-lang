@@ -375,6 +375,14 @@ struct Ctx {
     # count, dropped functions, generic instantiation dedup, total
     # functions before/after) to stderr after codegen.
     lto_stats: bool,
+    # deep-scan-23: multi-return splice support. While the inliner
+    # emits a callee whose body has early returns, every `return`
+    # statement lowers to an assignment on lto_splice_temp followed by
+    # a jump to lto_splice_label (the tail label emitted after the
+    # spliced body). Both are "" when no splice is in progress.
+    lto_splice_temp: str,
+    lto_splice_label: str,
+    lto_label_n: int,
     # ---- Stage 21 (v0.37.0-alpha): SIMD vectorisation ----
     # target_feature: --target-feature sse4.2|avx2|neon — enables the
     # std.simd intrinsic fast paths in gen_call and const-folds
@@ -507,6 +515,7 @@ fn new_ctx(src: str) -> Ctx {
         lto_mode: false, lto_calls: map_new(), lto_fn_start: map_new(),
         lto_inline_n: 0, lto_dropped: 0, lto_inlined_report: [],
         lto_threshold: 0, lto_stats: false,
+        lto_splice_temp: "", lto_splice_label: "", lto_label_n: 0,
         target_feature: "", simd_helpers_main: [], simd_helpers_alt: [],
         simd_helpers_plain: [], simd_helpers_neon: [], simd_helpers_rvv: [],
         simd_helper_names: [],
@@ -13839,11 +13848,11 @@ fn simd_emit_i32x4_ew(ctx: Ctx, name: str, intrinsic: str) -> void {
     m.push("    I32x4* x = x_p;")
     m.push("    I32x4* y = y_p;")
     m.push("    I32x4* r = usf_new_I32x4(0, 0);")
-    m.push("    __m128i va = _mm_set_epi64x(x->b, x->a);")
-    m.push("    __m128i vb = _mm_set_epi64x(y->b, y->a);")
+    m.push("    __m128i va = _mm_set_epi64x(x->f_b, x->f_a);")
+    m.push("    __m128i vb = _mm_set_epi64x(y->f_b, y->f_a);")
     m.push("    __m128i c = " + intrinsic + "(va, vb);")
-    m.push("    r->a = _mm_cvtsi128_si64(c);")
-    m.push("    r->b = _mm_cvtsi128_si64(_mm_unpackhi_epi64(c, c));")
+    m.push("    r->f_a = _mm_cvtsi128_si64(c);")
+    m.push("    r->f_b = _mm_cvtsi128_si64(_mm_unpackhi_epi64(c, c));")
     m.push("    hl_release_I32x4(x);")
     m.push("    hl_release_I32x4(y);")
     m.push("    return r;")
@@ -13852,10 +13861,10 @@ fn simd_emit_i32x4_ew(ctx: Ctx, name: str, intrinsic: str) -> void {
     a.push("static I32x4* hl_" + name + "(I32x4* x_p, I32x4* y_p) {")
     a.push("    I32x4* x = x_p; I32x4* y = y_p;")
     a.push("    I32x4* r = usf_new_I32x4(0, 0);")
-    a.push("    int32_t la[4] = { (int32_t)(uint32_t)x->a, (int32_t)(uint32_t)(x->a >> 32),")
-    a.push("                       (int32_t)(uint32_t)x->b, (int32_t)(uint32_t)(x->b >> 32) };")
-    a.push("    int32_t lb[4] = { (int32_t)(uint32_t)y->a, (int32_t)(uint32_t)(y->a >> 32),")
-    a.push("                       (int32_t)(uint32_t)y->b, (int32_t)(uint32_t)(y->b >> 32) };")
+    a.push("    int32_t la[4] = { (int32_t)(uint32_t)x->f_a, (int32_t)(uint32_t)(x->f_a >> 32),")
+    a.push("                       (int32_t)(uint32_t)x->f_b, (int32_t)(uint32_t)(x->f_b >> 32) };")
+    a.push("    int32_t lb[4] = { (int32_t)(uint32_t)y->f_a, (int32_t)(uint32_t)(y->f_a >> 32),")
+    a.push("                       (int32_t)(uint32_t)y->f_b, (int32_t)(uint32_t)(y->f_b >> 32) };")
     if name == "simd_i32x4_min" {
         a.push("    int32_t lr[4];")
         a.push("    for (int k = 0; k < 4; k++) lr[k] = la[k] < lb[k] ? la[k] : lb[k];")
@@ -13872,8 +13881,8 @@ fn simd_emit_i32x4_ew(ctx: Ctx, name: str, intrinsic: str) -> void {
         a.push("    uint32_t lr[4];")
         a.push("    for (int k = 0; k < 4; k++) lr[k] = (uint32_t)((uint64_t)(uint32_t)la[k] " + c_op + " (uint64_t)(uint32_t)lb[k]);")
     }
-    a.push("    r->a = (int64_t)((uint64_t)(uint32_t)lr[0] | ((uint64_t)(uint32_t)lr[1] << 32));")
-    a.push("    r->b = (int64_t)((uint64_t)(uint32_t)lr[2] | ((uint64_t)(uint32_t)lr[3] << 32));")
+    a.push("    r->f_a = (int64_t)((uint64_t)(uint32_t)lr[0] | ((uint64_t)(uint32_t)lr[1] << 32));")
+    a.push("    r->f_b = (int64_t)((uint64_t)(uint32_t)lr[2] | ((uint64_t)(uint32_t)lr[3] << 32));")
     a.push("    hl_release_I32x4(x); hl_release_I32x4(y);")
     a.push("    return r;")
     a.push("}")
@@ -13893,10 +13902,10 @@ fn simd_emit_f64x2_ew(ctx: Ctx, name: str, intrinsic: str) -> void {
     m.push("__attribute__((target(\"" + ctx.target_feature + "\"))) static F64x2* hl_" + name + "(F64x2* x_p, F64x2* y_p) {")
     m.push("    F64x2* x = x_p; F64x2* y = y_p;")
     m.push("    F64x2* r = usf_new_F64x2(0.0, 0.0);")
-    m.push("    __m128d va = _mm_loadu_pd(&x->a);")
-    m.push("    __m128d vb = _mm_loadu_pd(&y->a);")
+    m.push("    __m128d va = _mm_loadu_pd(&x->f_a);")
+    m.push("    __m128d vb = _mm_loadu_pd(&y->f_a);")
     m.push("    __m128d c = " + intrinsic + "(va, vb);")
-    m.push("    _mm_storeu_pd(&r->a, c);")
+    m.push("    _mm_storeu_pd(&r->f_a, c);")
     m.push("    hl_release_F64x2(x); hl_release_F64x2(y);")
     m.push("    return r;")
     m.push("}")
@@ -13904,8 +13913,8 @@ fn simd_emit_f64x2_ew(ctx: Ctx, name: str, intrinsic: str) -> void {
     a.push("static F64x2* hl_" + name + "(F64x2* x_p, F64x2* y_p) {")
     a.push("    F64x2* x = x_p; F64x2* y = y_p;")
     a.push("    F64x2* r = usf_new_F64x2(0.0, 0.0);")
-    a.push("    r->a = x->a " + c_op + " y->a;")
-    a.push("    r->b = x->b " + c_op + " y->b;")
+    a.push("    r->f_a = x->f_a " + c_op + " y->f_a;")
+    a.push("    r->f_b = x->f_b " + c_op + " y->f_b;")
     a.push("    hl_release_F64x2(x); hl_release_F64x2(y);")
     a.push("    return r;")
     a.push("}")
@@ -13947,13 +13956,13 @@ fn simd_emit_neon_i32x4_ew(ctx: Ctx, name: str, intrinsic: str) -> void {
     # little-endian: lane 0 = low 32 bits of a, lane 1 = high 32 bits
     # of a, lane 2 = low 32 bits of b, lane 3 = high 32 bits of b.
     # vreinterpretq_s32_s64 reinterprets the int64x2_t as int32x4_t.
-    m.push("    int64x2_t va = vld1q_s64((const int64_t*)&x->a);")
-    m.push("    int64x2_t vb = vld1q_s64((const int64_t*)&y->a);")
+    m.push("    int64x2_t va = vld1q_s64((const int64_t*)&x->f_a);")
+    m.push("    int64x2_t vb = vld1q_s64((const int64_t*)&y->f_a);")
     m.push("    int32x4_t va32 = vreinterpretq_s32_s64(va);")
     m.push("    int32x4_t vb32 = vreinterpretq_s32_s64(vb);")
     m.push("    int32x4_t c = " + intrinsic + "(va32, vb32);")
     m.push("    int64x2_t c64 = vreinterpretq_s64_s32(c);")
-    m.push("    vst1q_s64((int64_t*)&r->a, c64);")
+    m.push("    vst1q_s64((int64_t*)&r->f_a, c64);")
     m.push("    hl_release_I32x4(x); hl_release_I32x4(y);")
     m.push("    return r;")
     m.push("}")
@@ -13961,10 +13970,10 @@ fn simd_emit_neon_i32x4_ew(ctx: Ctx, name: str, intrinsic: str) -> void {
     a.push("static I32x4* hl_" + name + "(I32x4* x_p, I32x4* y_p) {")
     a.push("    I32x4* x = x_p; I32x4* y = y_p;")
     a.push("    I32x4* r = usf_new_I32x4(0, 0);")
-    a.push("    int32_t la[4] = { (int32_t)(uint32_t)x->a, (int32_t)(uint32_t)(x->a >> 32),")
-    a.push("                       (int32_t)(uint32_t)x->b, (int32_t)(uint32_t)(x->b >> 32) };")
-    a.push("    int32_t lb[4] = { (int32_t)(uint32_t)y->a, (int32_t)(uint32_t)(y->a >> 32),")
-    a.push("                       (int32_t)(uint32_t)y->b, (int32_t)(uint32_t)(y->b >> 32) };")
+    a.push("    int32_t la[4] = { (int32_t)(uint32_t)x->f_a, (int32_t)(uint32_t)(x->f_a >> 32),")
+    a.push("                       (int32_t)(uint32_t)x->f_b, (int32_t)(uint32_t)(x->f_b >> 32) };")
+    a.push("    int32_t lb[4] = { (int32_t)(uint32_t)y->f_a, (int32_t)(uint32_t)(y->f_a >> 32),")
+    a.push("                       (int32_t)(uint32_t)y->f_b, (int32_t)(uint32_t)(y->f_b >> 32) };")
     if name == "simd_i32x4_min" {
         a.push("    int32_t lr[4];")
         a.push("    for (int k = 0; k < 4; k++) lr[k] = la[k] < lb[k] ? la[k] : lb[k];")
@@ -13981,8 +13990,8 @@ fn simd_emit_neon_i32x4_ew(ctx: Ctx, name: str, intrinsic: str) -> void {
         a.push("    uint32_t lr[4];")
         a.push("    for (int k = 0; k < 4; k++) lr[k] = (uint32_t)((uint64_t)(uint32_t)la[k] " + c_op + " (uint64_t)(uint32_t)lb[k]);")
     }
-    a.push("    r->a = (int64_t)((uint64_t)(uint32_t)lr[0] | ((uint64_t)(uint32_t)lr[1] << 32));")
-    a.push("    r->b = (int64_t)((uint64_t)(uint32_t)lr[2] | ((uint64_t)(uint32_t)lr[3] << 32));")
+    a.push("    r->f_a = (int64_t)((uint64_t)(uint32_t)lr[0] | ((uint64_t)(uint32_t)lr[1] << 32));")
+    a.push("    r->f_b = (int64_t)((uint64_t)(uint32_t)lr[2] | ((uint64_t)(uint32_t)lr[3] << 32));")
     a.push("    hl_release_I32x4(x); hl_release_I32x4(y);")
     a.push("    return r;")
     a.push("}")
@@ -14002,10 +14011,10 @@ fn simd_emit_neon_f64x2_ew(ctx: Ctx, name: str, intrinsic: str) -> void {
     m.push("static F64x2* hl_" + name + "(F64x2* x_p, F64x2* y_p) {")
     m.push("    F64x2* x = x_p; F64x2* y = y_p;")
     m.push("    F64x2* r = usf_new_F64x2(0.0, 0.0);")
-    m.push("    float64x2_t va = vld1q_f64((const double*)&x->a);")
-    m.push("    float64x2_t vb = vld1q_f64((const double*)&y->a);")
+    m.push("    float64x2_t va = vld1q_f64((const double*)&x->f_a);")
+    m.push("    float64x2_t vb = vld1q_f64((const double*)&y->f_a);")
     m.push("    float64x2_t c = " + intrinsic + "(va, vb);")
-    m.push("    vst1q_f64((double*)&r->a, c);")
+    m.push("    vst1q_f64((double*)&r->f_a, c);")
     m.push("    hl_release_F64x2(x); hl_release_F64x2(y);")
     m.push("    return r;")
     m.push("}")
@@ -14013,8 +14022,8 @@ fn simd_emit_neon_f64x2_ew(ctx: Ctx, name: str, intrinsic: str) -> void {
     a.push("static F64x2* hl_" + name + "(F64x2* x_p, F64x2* y_p) {")
     a.push("    F64x2* x = x_p; F64x2* y = y_p;")
     a.push("    F64x2* r = usf_new_F64x2(0.0, 0.0);")
-    a.push("    r->a = x->a " + c_op + " y->a;")
-    a.push("    r->b = x->b " + c_op + " y->b;")
+    a.push("    r->f_a = x->f_a " + c_op + " y->f_a;")
+    a.push("    r->f_b = x->f_b " + c_op + " y->f_b;")
     a.push("    hl_release_F64x2(x); hl_release_F64x2(y);")
     a.push("    return r;")
     a.push("}")
@@ -14064,10 +14073,10 @@ fn simd_emit_rvv_i32x4_ew(ctx: Ctx, name: str, intrinsic: str) -> void {
     m.push("    I32x4* x = x_p; I32x4* y = y_p;")
     m.push("    I32x4* r = usf_new_I32x4(0, 0);")
     m.push("    /* RVV 1.0: vl=4 (4 i32 lanes at LMUL=1, VLEN>=128). */")
-    m.push("    vint32m1_t va = __riscv_vle32_v_i32m1((const int32_t*)&x->a, 4);")
-    m.push("    vint32m1_t vb = __riscv_vle32_v_i32m1((const int32_t*)&y->a, 4);")
+    m.push("    vint32m1_t va = __riscv_vle32_v_i32m1((const int32_t*)&x->f_a, 4);")
+    m.push("    vint32m1_t vb = __riscv_vle32_v_i32m1((const int32_t*)&y->f_a, 4);")
     m.push("    vint32m1_t c = " + intrinsic + "(va, vb, 4);")
-    m.push("    __riscv_vse32_v_i32m1((int32_t*)&r->a, c, 4);")
+    m.push("    __riscv_vse32_v_i32m1((int32_t*)&r->f_a, c, 4);")
     m.push("    hl_release_I32x4(x); hl_release_I32x4(y);")
     m.push("    return r;")
     m.push("}")
@@ -14075,10 +14084,10 @@ fn simd_emit_rvv_i32x4_ew(ctx: Ctx, name: str, intrinsic: str) -> void {
     a.push("static I32x4* hl_" + name + "(I32x4* x_p, I32x4* y_p) {")
     a.push("    I32x4* x = x_p; I32x4* y = y_p;")
     a.push("    I32x4* r = usf_new_I32x4(0, 0);")
-    a.push("    int32_t la[4] = { (int32_t)(uint32_t)x->a, (int32_t)(uint32_t)(x->a >> 32),")
-    a.push("                       (int32_t)(uint32_t)x->b, (int32_t)(uint32_t)(x->b >> 32) };")
-    a.push("    int32_t lb[4] = { (int32_t)(uint32_t)y->a, (int32_t)(uint32_t)(y->a >> 32),")
-    a.push("                       (int32_t)(uint32_t)y->b, (int32_t)(uint32_t)(y->b >> 32) };")
+    a.push("    int32_t la[4] = { (int32_t)(uint32_t)x->f_a, (int32_t)(uint32_t)(x->f_a >> 32),")
+    a.push("                       (int32_t)(uint32_t)x->f_b, (int32_t)(uint32_t)(x->f_b >> 32) };")
+    a.push("    int32_t lb[4] = { (int32_t)(uint32_t)y->f_a, (int32_t)(uint32_t)(y->f_a >> 32),")
+    a.push("                       (int32_t)(uint32_t)y->f_b, (int32_t)(uint32_t)(y->f_b >> 32) };")
     if name == "simd_i32x4_min" {
         a.push("    int32_t lr[4];")
         a.push("    for (int k = 0; k < 4; k++) lr[k] = la[k] < lb[k] ? la[k] : lb[k];")
@@ -14095,8 +14104,8 @@ fn simd_emit_rvv_i32x4_ew(ctx: Ctx, name: str, intrinsic: str) -> void {
         a.push("    uint32_t lr[4];")
         a.push("    for (int k = 0; k < 4; k++) lr[k] = (uint32_t)((uint64_t)(uint32_t)la[k] " + c_op + " (uint64_t)(uint32_t)lb[k]);")
     }
-    a.push("    r->a = (int64_t)((uint64_t)(uint32_t)lr[0] | ((uint64_t)(uint32_t)lr[1] << 32));")
-    a.push("    r->b = (int64_t)((uint64_t)(uint32_t)lr[2] | ((uint64_t)(uint32_t)lr[3] << 32));")
+    a.push("    r->f_a = (int64_t)((uint64_t)(uint32_t)lr[0] | ((uint64_t)(uint32_t)lr[1] << 32));")
+    a.push("    r->f_b = (int64_t)((uint64_t)(uint32_t)lr[2] | ((uint64_t)(uint32_t)lr[3] << 32));")
     a.push("    hl_release_I32x4(x); hl_release_I32x4(y);")
     a.push("    return r;")
     a.push("}")
@@ -14117,10 +14126,10 @@ fn simd_emit_rvv_f64x2_ew(ctx: Ctx, name: str, intrinsic: str) -> void {
     m.push("    F64x2* x = x_p; F64x2* y = y_p;")
     m.push("    F64x2* r = usf_new_F64x2(0.0, 0.0);")
     m.push("    /* RVV 1.0: vl=2 (2 f64 lanes at LMUL=1, VLEN>=128). */")
-    m.push("    vfloat64m1_t va = __riscv_vle64_v_f64m1((const double*)&x->a, 2);")
-    m.push("    vfloat64m1_t vb = __riscv_vle64_v_f64m1((const double*)&y->a, 2);")
+    m.push("    vfloat64m1_t va = __riscv_vle64_v_f64m1((const double*)&x->f_a, 2);")
+    m.push("    vfloat64m1_t vb = __riscv_vle64_v_f64m1((const double*)&y->f_a, 2);")
     m.push("    vfloat64m1_t c = " + intrinsic + "(va, vb, 2);")
-    m.push("    __riscv_vse64_v_f64m1((double*)&r->a, c, 2);")
+    m.push("    __riscv_vse64_v_f64m1((double*)&r->f_a, c, 2);")
     m.push("    hl_release_F64x2(x); hl_release_F64x2(y);")
     m.push("    return r;")
     m.push("}")
@@ -14128,8 +14137,8 @@ fn simd_emit_rvv_f64x2_ew(ctx: Ctx, name: str, intrinsic: str) -> void {
     a.push("static F64x2* hl_" + name + "(F64x2* x_p, F64x2* y_p) {")
     a.push("    F64x2* x = x_p; F64x2* y = y_p;")
     a.push("    F64x2* r = usf_new_F64x2(0.0, 0.0);")
-    a.push("    r->a = x->a " + c_op + " y->a;")
-    a.push("    r->b = x->b " + c_op + " y->b;")
+    a.push("    r->f_a = x->f_a " + c_op + " y->f_a;")
+    a.push("    r->f_b = x->f_b " + c_op + " y->f_b;")
     a.push("    hl_release_F64x2(x); hl_release_F64x2(y);")
     a.push("    return r;")
     a.push("}")
@@ -14703,8 +14712,8 @@ fn simd_emit_helper(ctx: Ctx, name: str) -> void {
         b.push("            hl_die(\"simd i32x4 lane out of range\");")
         b.push("    }")
         b.push("    I32x4* r = usf_new_I32x4(0, 0);")
-        b.push("    r->a = (int64_t)((uint32_t)v[0] | ((uint64_t)(uint32_t)v[1] << 32));")
-        b.push("    r->b = (int64_t)((uint32_t)v[2] | ((uint64_t)(uint32_t)v[3] << 32));")
+        b.push("    r->f_a = (int64_t)((uint32_t)v[0] | ((uint64_t)(uint32_t)v[1] << 32));")
+        b.push("    r->f_b = (int64_t)((uint32_t)v[2] | ((uint64_t)(uint32_t)v[3] << 32));")
         b.push("    hl_list_release(xs);")
         b.push("    return r;")
         b.push("}")
@@ -14753,8 +14762,8 @@ fn simd_emit_helper(ctx: Ctx, name: str) -> void {
         b.push("    hl_list* xs = xs_p;")
         b.push("    I32x4* v = v_p;")
         b.push("    if (i < 0 || i + 4 > xs->len) hl_die(\"simd scatter out of bounds\");")
-        b.push("    int64_t lane[4] = { (int64_t)(int32_t)(uint32_t)v->a, (int64_t)(int32_t)(uint32_t)(v->a >> 32),")
-        b.push("                       (int64_t)(int32_t)(uint32_t)v->b, (int64_t)(int32_t)(uint32_t)(v->b >> 32) };")
+        b.push("    int64_t lane[4] = { (int64_t)(int32_t)(uint32_t)v->f_a, (int64_t)(int32_t)(uint32_t)(v->f_a >> 32),")
+        b.push("                       (int64_t)(int32_t)(uint32_t)v->f_b, (int64_t)(int32_t)(uint32_t)(v->f_b >> 32) };")
         b.push("    for (int k = 0; k < 4; k++) {")
         b.push("        if (xs->elem_free) xs->elem_free(xs->items[i + k]);")
         b.push("        xs->items[i + k] = hl_box_i64(lane[k]);")
@@ -14772,9 +14781,9 @@ fn simd_emit_helper(ctx: Ctx, name: str) -> void {
         b.push("    F64x2* v = v_p;")
         b.push("    if (i < 0 || i + 2 > xs->len) hl_die(\"simd scatter out of bounds\");")
         b.push("    if (xs->elem_free) xs->elem_free(xs->items[i]);")
-        b.push("    xs->items[i] = hl_box_f64(v->a);")
+        b.push("    xs->items[i] = hl_box_f64(v->f_a);")
         b.push("    if (xs->elem_free) xs->elem_free(xs->items[i + 1]);")
-        b.push("    xs->items[i + 1] = hl_box_f64(v->b);")
+        b.push("    xs->items[i + 1] = hl_box_f64(v->f_b);")
         b.push("    hl_release_F64x2(v);")
         b.push("    hl_list_release(xs);")
         b.push("}")
@@ -15324,7 +15333,15 @@ fn lto_can_inline(ctx: Ctx, key: str) -> bool {
     if f.requires_e != -1 || f.ensures_e != -1 {
         return false
     }
-    if lto_single_return(ctx, f) == -1 {
+    # deep-scan-23: multi-return callees are inlinable now — the splice
+    # path lowers every return (early or trailing) to an assignment on
+    # a pre-declared result temp + a jump to a tail label. The old gate
+    # (single-return-only) stopped inlining list_sort_int_asc after the
+    # Stage 32 rewrite added the `if n == 0 { return [] }` guard — the
+    # Stage 20 LTO acceptance caught the regression. A non-void fn with
+    # ZERO returns is still rejected (it cannot produce a value).
+    let rets: int = lto_count_returns_deep(ctx, f.body)
+    if rets == 0 && f.ret != "void" {
         return false
     }
     # The trailing return's VALUE must be bindable (a `return panic(...)`
@@ -15451,6 +15468,48 @@ fn lto_emit_inline(ctx: Ctx, key: str, e: int, ind: str) -> str {
     # would resolve the caller's same-named binding (wrong key). The
     # inlined body uses the sound heap layout instead.
     ctx.in_inline_clone = ctx.in_inline_clone + 1
+    # deep-scan-23: multi-return splice path. rkind == -1 here means
+    # the body has early returns (or a non-trailing single return) —
+    # lto_can_inline already allowed it. Pre-declare the result temp,
+    # arm the gen_stmt return hook, emit the WHOLE body, then the tail
+    # label; every callee return becomes `temp = value; goto label;`
+    # (or a bare `goto` for void). Ownership wrapping at each return
+    # site matches the real return path exactly.
+    if rkind == -1 {
+        let mut temp: str = ""
+        if f.ret != "void" {
+            temp = fresh_tmp(ctx, "hl_ir")
+            let mut zero: str = "0"
+            if is_ptr_t(ctx, f.ret) {
+                zero = "NULL"
+            }
+            ctx.out.push(ind + c_type(ctx, f.ret) + " " + temp + " = " + zero + ";")
+        }
+        let label: str = "hl_ltail_" + ctx.lto_label_n.to_str()
+        ctx.lto_label_n = ctx.lto_label_n + 1
+        ctx.lto_splice_temp = temp
+        ctx.lto_splice_label = label
+        let mut bi: int = 0
+        while bi < f.body.len() {
+            gen_stmt(ctx, f.body.get(bi), ind)
+            bi = bi + 1
+        }
+        ctx.lto_splice_temp = ""
+        ctx.lto_splice_label = ""
+        ctx.out.push(ind + label + ":;")
+        # Stage 30: the inlined callee body is fully generated —
+        # re-enable stack-layout codegen for the caller.
+        ctx.in_inline_clone = ctx.in_inline_clone - 1
+        # ---- 4. restore the caller's gen_locals view.
+        let mut ri: int = 0
+        while ri < save_names.len() {
+            let nm: str = save_names.get(ri)
+            let sv: str = save_vals.get(ri)
+            ctx.gen_locals.set(nm, sv)
+            ri = ri + 1
+        }
+        return temp
+    }
     let body_n: int = f.body.len()
     let mut gen_n: int = body_n
     if rkind == 1 || rkind == 2 {
@@ -18014,7 +18073,39 @@ fn gen_stmt(ctx: Ctx, sidx: int, ind: str) -> void {
         flush_null_after(ctx, ind)
         clear_hoists(ctx)
     } else if s.kind == "return" {
-        if s.value == -1 {
+        # deep-scan-23: LTO multi-return splice — while the inliner is
+        # splicing a callee with early returns, a `return` lowers to an
+        # assignment on the splice result temp + a jump to the splice
+        # tail label. Ownership wrapping mirrors the real return path
+        # (fresh transfer vs borrowed retain via own_wrap), moved-value
+        # nulls flush before the jump, and `never`-typed values stay
+        # bare calls (they terminate the process; no jump follows).
+        if ctx.lto_splice_label != "" {
+            if s.value == -1 {
+                flush_null_after(ctx, ind)
+                ctx.out.push(ind + "goto " + ctx.lto_splice_label + ";")
+            } else if ctx.exprs[s.value].t == "never" {
+                let nv: str = gen_expr_maybe_inline(ctx, s.value, ind)
+                ctx.out.push(ind + nv + ";")
+            } else {
+                let v: str = gen_expr_maybe_inline(ctx, s.value, ind)
+                let fresh: bool = expr_fresh(ctx, s.value)
+                let rv: str = own_wrap(ctx, ctx.exprs[s.value].t, v, fresh)
+                if ctx.null_after.len() > 0 {
+                    let rt: str = ctx.exprs[s.value].t
+                    let rt_c: str = c_type(ctx, rt)
+                    let tmp: str = fresh_tmp(ctx, "hlc_rv")
+                    ctx.out.push(ind + "{ " + rt_c + " " + tmp + " = " + rv + ";")
+                    flush_null_after(ctx, ind + "    ")
+                    ctx.out.push(ind + "    " + ctx.lto_splice_temp + " = " + tmp + ";")
+                    ctx.out.push(ind + "    goto " + ctx.lto_splice_label + "; }")
+                } else {
+                    ctx.out.push(ind + ctx.lto_splice_temp + " = " + rv + ";")
+                    flush_null_after(ctx, ind)
+                    ctx.out.push(ind + "goto " + ctx.lto_splice_label + ";")
+                }
+            }
+        } else if s.value == -1 {
             ctx.out.push(ind + "return;")
         } else if ctx.tail_label != "" && tail_is_self_call(ctx, s.value, ctx.cur_fn) {
             # Stage 31 (v0.48.0-alpha): #[tail_call] — a VERIFIED tail
@@ -18356,7 +18447,10 @@ fn gen_asm(ctx: Ctx, s: StmtN, ind: str) -> void {
     if !list_contains_str(s.asm_options, "nomem") {
         clobbers.push("\"memory\"")
     }
-    # Translate the template: {N} -> %N, {{ -> {, }} -> }, $ -> $$.
+    # Translate the template: {N} -> %N, ${N} -> $%cN (deep-scan-23 fix:
+    # plain `%N` on x86 AT&T already prints immediates WITH the `$`
+    # prefix, so a literal `$` in front of `%N` produces `$$imm` and a
+    # PIE link failure), {{ -> {, }} -> }, lone $ passes through.
     let translated: str = translate_asm_template(s.asm_template, gcc_indices)
     # Emit the GCC extended asm.
     let mut volatile_kw: str = "__volatile__ "
@@ -18477,6 +18571,14 @@ fn translate_asm_constraint(op: AsmOperand) -> str {
 # `%<gcc_indices[N]>` so the source-template `{0}` / `{1}` map to
 # the right GCC operand number regardless of in/out order.
 #
+# The immediate-operand form `${N}` is rewritten to `$%c<N>`: the
+# explicit `$` is the AT&T immediate prefix and GCC's `%c` modifier
+# prints the constant WITHOUT punctuation. Emitting the historical
+# `$%N` broke on modern GCC because plain `%N` for an `"i"`
+# constraint already emits the `$` itself, producing `$$42` — the
+# assembler then treats it as a reference to an undefined symbol
+# named `$42` and PIE linking fails (deep-scan-23, GCC 14).
+#
 # BUG-FIX (Stage 27): the original `gcc_indices` was filled only
 # during the OUTPUTS pass, leaving inputs at "-1" until the inputs
 # pass — but translate_asm_template runs AFTER both passes, so the
@@ -18545,11 +18647,31 @@ fn translate_asm_template(template: str, gcc_indices: list[str]) -> str {
             # through unchanged (it stays `%%` in the C string).
             parts.push("%")
             i = i + 1
+        } else if c == 36 && i + 1 < template.len() && template.byte_at(i + 1) == 123 {
+            # deep-scan-23 fix: `$` immediately followed by `{N}` — the
+            # HLS immediate-operand form (`${1}`). Emit `$%c<N>` (see
+            # the doc comment above): `$%N` would print `$$imm` on
+            # targets where GCC prefixes immediates with `$` itself.
+            let mut j: int = i + 2
+            while j < template.len() && template.byte_at(j) != 125 {
+                j = j + 1
+            }
+            let body: str = template.slice(i + 2, j)
+            let n: int = body.to_int()
+            if n >= 0 && n < gcc_indices.len() {
+                parts.push("$%c" + gcc_indices.get(n))
+            } else {
+                # Out-of-range — the checker already rejected this;
+                # emit as-is (will be a C compile error, which is
+                # what we want for an unreachable codegen path).
+                parts.push("$%c" + body)
+            }
+            i = j + 1
         } else {
-            # All other bytes (including `$` — which is NOT special in
-            # GCC's extended-asm template; AT&T syntax uses `$` for
-            # immediate values like `$0x60`, and GCC passes it through
-            # verbatim) pass through unchanged.
+            # All other bytes (including a lone `$` — which is NOT
+            # special in GCC's extended-asm template; AT&T syntax uses
+            # it for immediate values like `$0x60`, and GCC passes it
+            # through verbatim) pass through unchanged.
             parts.push(template.slice(i, i + 1))
             i = i + 1
         }
@@ -19541,7 +19663,11 @@ fn gen_clone_list_lines(ctx: Ctx, tt: str) -> list[str] {
     let m: str = c_type_name(tt)
     out.push("// clone(" + tt + ") — deep copy with fresh boxes / cloned elements.")
     out.push("static hl_list* hl_clone_" + m + "(hl_list* l) {")
+    out.push("    void* memo = hl_clone_memo_get((void*)l);")
+    out.push("    if (memo) return (hl_list*)hl_retain(memo);")
+    out.push("    hl_clone_enter();")
     out.push("    hl_list* r = hl_list_new(" + elem_free_fn(ctx, elem) + ");")
+    out.push("    hl_clone_memo_put((void*)l, (void*)r);")
     out.push("    for (int64_t i = 0; i < l->len; i++) {")
     if elem == "int" {
         out.push("        hl_list_push(r, hl_box_i64(hl_unbox_i64(l->items[i])));")
@@ -19553,6 +19679,7 @@ fn gen_clone_list_lines(ctx: Ctx, tt: str) -> list[str] {
         out.push("        hl_list_push(r, " + clone_expr_for(ctx, elem, "(" + c_type(ctx, elem) + ")l->items[i]") + ");")
     }
     out.push("    }")
+    out.push("    hl_clone_leave();")
     out.push("    return r;")
     out.push("}")
     out.push("")
@@ -19566,7 +19693,11 @@ fn gen_clone_map_lines(ctx: Ctx, tt: str) -> list[str] {
     let m: str = c_type_name(tt)
     out.push("// clone(" + tt + ") — deep copy with cloned keys and values.")
     out.push("static hl_map* hl_clone_" + m + "(hl_map* m) {")
+    out.push("    void* memo = hl_clone_memo_get((void*)m);")
+    out.push("    if (memo) return (hl_map*)hl_retain(memo);")
+    out.push("    hl_clone_enter();")
     out.push("    hl_map* r = hl_map_new(" + elem_free_fn(ctx, vt) + ");")
+    out.push("    hl_clone_memo_put((void*)m, (void*)r);")
     out.push("    for (int64_t i = 0; i < m->len; i++) {")
     out.push("        hl_str* k = m->order[i];")
     out.push("        void* v = hl_map_borrow(m, k);")
@@ -19581,6 +19712,7 @@ fn gen_clone_map_lines(ctx: Ctx, tt: str) -> list[str] {
         out.push("        hl_map_set(r, hl_clone_str(k), " + clone_expr_for(ctx, vt, "(" + c_type(ctx, vt) + ")v") + ");")
     }
     out.push("    }")
+    out.push("    hl_clone_leave();")
     out.push("    return r;")
     out.push("}")
     out.push("")
@@ -19596,9 +19728,13 @@ fn gen_clone_struct_lines(ctx: Ctx, tt: str) -> list[str] {
     let m: str = c_type_name(tt)
     out.push("// clone(" + tt + ") — deep copy of every field.")
     out.push("static " + m + "* hl_clone_" + m + "(" + m + "* p) {")
+    out.push("    void* memo = hl_clone_memo_get((void*)p);")
+    out.push("    if (memo) return (" + m + "*)hl_retain(memo);")
+    out.push("    hl_clone_enter();")
     out.push("    " + m + "* r = (" + m + "*)malloc(sizeof(" + m + "));")
     out.push("    if (!r) hl_die(\"out of memory\");")
     out.push("    r->refcnt = 1;")
+    out.push("    hl_clone_memo_put((void*)p, (void*)r);")
     let mut j: int = 0
     while j < st.fields.len() {
         let ftype: str = st.ftypes.get(j)
@@ -19610,6 +19746,7 @@ fn gen_clone_struct_lines(ctx: Ctx, tt: str) -> list[str] {
         out.push("    r->" + cfn + " = " + clone_expr_for(ctx, inst_ftype, "p->" + cfn) + ";")
         j = j + 1
     }
+    out.push("    hl_clone_leave();")
     out.push("    return r;")
     out.push("}")
     out.push("")
@@ -19627,9 +19764,13 @@ fn gen_clone_enum_lines(ctx: Ctx, tt: str) -> list[str] {
     let m: str = c_type_name(tt)
     out.push("// clone(" + tt + ") — deep copy of the active variant's payloads.")
     out.push("static " + m + "* hl_clone_" + m + "(" + m + "* p) {")
+    out.push("    void* memo = hl_clone_memo_get((void*)p);")
+    out.push("    if (memo) return (" + m + "*)hl_retain(memo);")
+    out.push("    hl_clone_enter();")
     out.push("    " + m + "* r = (" + m + "*)malloc(sizeof(" + m + "));")
     out.push("    if (!r) hl_die(\"out of memory\");")
     out.push("    r->refcnt = 1;")
+    out.push("    hl_clone_memo_put((void*)p, (void*)r);")
     out.push("    r->tag = p->tag;")
     out.push("    switch (p->tag) {")
     let mut vi: int = 0
@@ -19656,6 +19797,7 @@ fn gen_clone_enum_lines(ctx: Ctx, tt: str) -> list[str] {
     }
     out.push("        default: break;")
     out.push("    }")
+    out.push("    hl_clone_leave();")
     out.push("    return r;")
     out.push("}")
     out.push("")
@@ -19663,8 +19805,62 @@ fn gen_clone_enum_lines(ctx: Ctx, tt: str) -> list[str] {
 }
 
 # gen_clone_bodies: bodies for every registered clone instantiation.
+#
+# deep-scan-23 (this scan): the helpers are wrapped in per-thread cycle
+# detection (hl_clone_memo_* below). A user-constructed cyclic value —
+# `let mut n = Node{children:[]}; n.children.push(n)` — previously made
+# the generated native code recurse without bound (SIGSEGV), while the
+# interpreter's deep_clone handled the same value via its `_seen` map
+# (see boot/interp.py). The memo restores native/interpreter parity:
+# revisiting an in-progress source object returns its partially built
+# clone (+1 owned), which both breaks cycles and preserves intra-clone
+# aliasing. The table is emptied when the outermost clone finishes, so
+# every top-level clone() starts with fresh semantics. `__thread`
+# storage keeps spawned threads isolated (no locks; each thread owns
+# its own memo + depth).
 fn gen_clone_bodies(ctx: Ctx) -> list[str] {
     let mut out: list[str] = []
+    if ctx.clone_insts.len() > 0 {
+        out.push("// ---- deep-scan-23: per-thread cycle detection for clone() ----")
+        out.push("#define HL_CLONE_MEMO_BUCKETS 1024")
+        out.push("typedef struct hl_clone_memo_node {")
+        out.push("    void* orig;")
+        out.push("    void* copy;")
+        out.push("    struct hl_clone_memo_node* next;")
+        out.push("} hl_clone_memo_node;")
+        out.push("static __thread hl_clone_memo_node* hl_clone_memo[HL_CLONE_MEMO_BUCKETS];")
+        out.push("static __thread int hl_clone_depth = 0;")
+        out.push("static size_t hl_clone_memo_hash(void* p) {")
+        out.push("    uintptr_t v = (uintptr_t)p;")
+        out.push("    return (size_t)((v >> 4) * 2654435761u % HL_CLONE_MEMO_BUCKETS);")
+        out.push("}")
+        out.push("static void* hl_clone_memo_get(void* p) {")
+        out.push("    hl_clone_memo_node* n = hl_clone_memo[hl_clone_memo_hash(p)];")
+        out.push("    for (; n; n = n->next) { if (n->orig == p) return n->copy; }")
+        out.push("    return NULL;")
+        out.push("}")
+        out.push("static void hl_clone_memo_put(void* o, void* c) {")
+        out.push("    hl_clone_memo_node* n = (hl_clone_memo_node*)malloc(sizeof(hl_clone_memo_node));")
+        out.push("    if (!n) hl_die(\"out of memory\");")
+        out.push("    n->orig = o; n->copy = c;")
+        out.push("    size_t h = hl_clone_memo_hash(o);")
+        out.push("    n->next = hl_clone_memo[h];")
+        out.push("    hl_clone_memo[h] = n;")
+        out.push("}")
+        out.push("static void hl_clone_memo_clear(void) {")
+        out.push("    for (int i = 0; i < HL_CLONE_MEMO_BUCKETS; i++) {")
+        out.push("        hl_clone_memo_node* n = hl_clone_memo[i];")
+        out.push("        while (n) { hl_clone_memo_node* nx = n->next; free(n); n = nx; }")
+        out.push("        hl_clone_memo[i] = NULL;")
+        out.push("    }")
+        out.push("}")
+        out.push("static void hl_clone_enter(void) { hl_clone_depth++; }")
+        out.push("static void hl_clone_leave(void) {")
+        out.push("    hl_clone_depth--;")
+        out.push("    if (hl_clone_depth <= 0) { hl_clone_memo_clear(); hl_clone_depth = 0; }")
+        out.push("}")
+        out.push("")
+    }
     let mut i: int = 0
     while i < ctx.clone_insts.len() {
         let t: str = ctx.clone_insts.get(i)

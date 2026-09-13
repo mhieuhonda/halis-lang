@@ -149,6 +149,18 @@ def run_file(filepath, grep=None):
         # not needed here.
         check(program)
     except HLError as ex:
+        # Deep-scan-23 fix: a MODULE (no `fn main`) is not a standalone
+        # program — the checker legitimately rejects it with "missing
+        # main function", but that is not a test failure. Recursive
+        # discovery (--dir) walks into helper subdirectories such as
+        # tests/ok/modules/ (imported by feat_import.hls), which the
+        # non-recursive run_tests.sh glob never touches. Record a SKIP
+        # for module-shaped files instead of a FAIL; any OTHER type
+        # error in the module still fails the run.
+        if "missing main function" in str(ex):
+            results.append(TestResult(filepath, "<module>", "skip",
+                                      "module without fn main", 0.0))
+            return results
         results.append(TestResult(filepath, "<check>", "fail",
                                   "type error: %s" % ex, 0.0))
         return results
