@@ -116,8 +116,17 @@ def format_source(src: bytes) -> str:
     try:
         toks = tokenize(src)
     except HLError as ex:
+        # Deep-scan-25 fix (HIGH, data corruption): the previous fallback
+        # decoded with errors="replace" (U+FFFD for every bad byte) and
+        # the -w writer re-encoded as latin-1 with errors="replace", so
+        # an UNPARSEABLE file was silently REWRITTEN IN PLACE with its
+        # UTF-8 sequences mangled (é → e9, ☕ → "?"), exit code 0.
+        # Decode losslessly with latin-1 instead — a 1:1 byte↔char map,
+        # so the writer's latin-1 encode reproduces the original bytes
+        # EXACTLY and -w becomes a content no-op (the warning below is
+        # still printed so the user knows the file needs fixing).
         sys.stderr.write("warning: %s\n" % ex)
-        return src.decode("utf-8", errors="replace")
+        return src.decode("latin-1")
     comments = _extract_comments(src)
 
     out_lines = []

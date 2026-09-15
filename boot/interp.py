@@ -14,6 +14,7 @@ Runtime values:
 import ctypes
 import math
 import os
+import platform
 import subprocess
 import sys
 import threading
@@ -454,8 +455,14 @@ def f64_div(a, b):
         # sign test `(a > 0) == (b >= 0)` treated +0.0 and -0.0 the same
         # (both pass `>= 0`), producing the wrong sign of infinity when
         # the divisor was -0.0. Use math.copysign to distinguish them.
-        if a == 0 or a != a:
-            return float("nan")
+        # Deep-scan-25 fix (interpreter/native parity): an x86-64 divide
+        # with a NaN numerator PROPAGATES the input NaN (quieted) rather
+        # than synthesising the default QNaN, and 0.0/0.0 raises the
+        # hardware default QNaN (sign bit SET on x86-64). Mirror both.
+        if a != a:
+            return a
+        if a == 0:
+            return _NAN_DEFAULT
         # copysign(1.0, x) returns 1.0 for +x (incl. +0.0) and -1.0 for -x
         # (incl. -0.0). Result is +inf iff signs of a and b agree.
         same_sign = math.copysign(1.0, a) == math.copysign(1.0, b)
@@ -466,7 +473,12 @@ def f64_mod(a, b):
     try:
         return math.fmod(a, b)
     except ValueError:
-        return float("nan")
+        # Deep-scan-25 fix (interpreter/native parity): C fmod(x, 0) is a
+        # domain error that yields the hardware default QNaN (sign bit
+        # set on x86-64); a NaN numerator propagates unchanged.
+        if a != a:
+            return a
+        return _NAN_DEFAULT
 
 
 def parse_int(s, line):
@@ -495,7 +507,31 @@ def parse_int(s, line):
     return v
 
 
+# Deep-scan-25 fix (interpreter/native parity): the sign of a NaN.
+# C's printf("%.6f", nan) prints "-nan" when the NaN's sign bit is set
+# and "nan" otherwise, while Python's "%f" % nan ALWAYS prints "nan"
+# (it ignores the sign bit). On x86-64 every freshly-created invalid
+# NaN (0.0/0.0, inf-inf, sqrt(-1), fmod(x, 0), ...) has the sign bit
+# SET (the hardware default QNaN is 0xFFF8000000000000), so the native
+# binary printed "-nan" where the boot interpreter printed "nan".
+# On aarch64 the hardware default QNaN is positive (0x7FF8000000000000),
+# so the synthesised default NaN must follow the host architecture to
+# stay byte-identical with the native runtime on every platform.
+def _platform_default_qnan():
+    m = platform.machine().lower()
+    if m in ("x86_64", "amd64"):
+        return float.fromhex("-nan")   # x86-64 hardware default QNaN
+    return float("nan")                # aarch64/riscv64 default QNaN
+
+
+_NAN_DEFAULT = _platform_default_qnan()
+
+
 def fmt_float(v):
+    if v != v:  # NaN — mirror C printf's sign-aware rendering
+        if math.copysign(1.0, v) < 0.0:
+            return b"-nan"
+        return b"nan"
     return ("%.6f" % v).encode("ascii")
 
 
@@ -1149,7 +1185,11 @@ class Interp:
             args = [self.eval_expr(a, env) for a in e["args"]]
             if rc[0] == "user":
                 return self.call_fn(rc[1], args)
-            return self.builtin(rc[1], args)
+            # Deep-scan-25: pass the argument NODES so boundary builtins
+            # (stream_send / future_ready) can apply the syntactic
+            # clone(...) exemption — the same rule builtin_method applies
+            # for chan.send (mirrors the native gen_own_arg).
+            return self.builtin(rc[1], args, e["args"])
         if k == "field":
             return self.eval_expr(e["target"], env)[e["name"]]
         if k == "method":
@@ -1325,7 +1365,7 @@ class Interp:
         raise HLPanic("unknown operator: %s" % op, self.line)
 
     # ---------- builtins ----------
-    def builtin(self, name, args):
+    def builtin(self, name, args, arg_nodes=None):
         line = self.line
         if name == "print":
             self.out.write(args[0])
@@ -2208,9 +2248,10 @@ class Interp:
             try:
                 return f(*a)
             except ValueError:
-                # Domain error: C returns NaN (poles overridden by
-                # callers that pass on_domain=...).
-                return kw.get("on_domain", float("nan"))
+                # Domain error: C returns the hardware default QNaN
+                # (sign bit set on x86-64 — deep-scan-25 parity fix;
+                # poles overridden by callers that pass on_domain=...).
+                return kw.get("on_domain", _NAN_DEFAULT)
             except OverflowError:
                 # Range error: C returns ±HUGE_VAL.
                 return math.copysign(float("inf"), kw.get("signof", 1.0))
@@ -2222,9 +2263,12 @@ class Interp:
         if name == "math_tan":
             return math.tan(args[0])
         if name == "math_asin":
-            return _libm(math.asin, args[0])
+            # Deep-scan-25: glibc's asin/acos invalid-input path returns a
+            # POSITIVE NaN (via __math_invalid), unlike sqrt/log/fmod whose
+            # domain errors yield the sign-bit-set default QNaN on x86-64.
+            return _libm(math.asin, args[0], on_domain=float("nan"))
         if name == "math_acos":
-            return _libm(math.acos, args[0])
+            return _libm(math.acos, args[0], on_domain=float("nan"))
         if name == "math_atan":
             return math.atan(args[0])
         if name == "math_atan2":
@@ -2245,7 +2289,9 @@ class Interp:
         if name == "math_log10":
             if args[0] == 0:
                 return float("-inf")
-            return _libm(math.log10, args[0])
+            # Deep-scan-25: glibc log10's domain error returns a POSITIVE
+            # NaN (same __math_invalid path as asin/acos) — override.
+            return _libm(math.log10, args[0], on_domain=float("nan"))
         if name == "math_log2":
             if args[0] == 0:
                 return float("-inf")
@@ -2345,7 +2391,23 @@ class Interp:
         # future. Create a cap-1 chan and send the value; the recv()
         # in await() will find it instantly.
         if name == "future_ready":
+            # Deep-scan-25 fix (soundness, interpreter/native parity):
+            # the value crosses a task boundary at await(), so — exactly
+            # like chan.send and the native gen_own_arg — an owned value
+            # must be deep-copied here unless the argument is
+            # syntactically clone(...) (already a private copy). The
+            # old code sent the CALLER'S list/dict by reference: the
+            # producer could mutate it after future_ready() and the
+            # consumer would observe the mutation (a cross-thread data
+            # race the Send/boundary system exists to prevent).
             v = args[0]
+            is_clone = False
+            if arg_nodes:
+                a0 = arg_nodes[0]
+                if a0.get("k") == "call" and a0.get("name") == "clone":
+                    is_clone = True
+            if not is_clone and isinstance(v, (list, dict)):
+                v = self.deep_clone(v)
             ch = HLChan(1)
             self.conc.register(ch)
             self.conc.send(ch, v)
@@ -2383,9 +2445,22 @@ class Interp:
             s = args[0]
             v = args[1]
             # Boundary ownership: deep-clone owned values unless fresh.
-            # The checker already rejected bare ident reads of owned
-            # types; if we reach here, the value is either a primitive,
-            # a clone(...) result, or a fresh expression result.
+            # Deep-scan-25 fix (soundness, interpreter/native parity):
+            # the comment previously claimed "the checker already
+            # rejected bare ident reads; if we reach here the value is
+            # a primitive, a clone(...) result, or a fresh expression
+            # result" — but a METHOD-call result like xs.get(0) is an
+            # alias into the caller's list, and the checker's rule only
+            # rejects ident/field/index nodes. chan.send and the native
+            # codegen (gen_own_arg) deep-copy at this boundary; mirror
+            # them exactly (same clone(...) exemption as chan.send).
+            is_clone = False
+            if arg_nodes:
+                a1 = arg_nodes[1]
+                if a1.get("k") == "call" and a1.get("name") == "clone":
+                    is_clone = True
+            if not is_clone and isinstance(v, (list, dict)):
+                v = self.deep_clone(v)
             self.conc.send(s, v)
             return None
         # stream_recv(s: Stream[T]) -> T — block until a value is available.

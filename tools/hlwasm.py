@@ -190,6 +190,7 @@ OP_I64_REM_S = 0x81
 OP_I64_REM_U = 0x82
 OP_I64_AND = 0x83
 OP_I64_OR = 0x84
+OP_I64_XOR = 0x85
 OP_F64_ADD = 0xA0
 OP_F64_SUB = 0xA1
 OP_F64_MUL = 0xA2
@@ -894,6 +895,20 @@ class WasmEmitter:
         # i64 and the module failed validation ("call[0] expected type
         # i32, found i64"). Take the code as i64 (ignored by the trap).
         idx_exit = self._add_helper("hl_exit", [I64], [])
+        # Deep-scan-25 fix (soundness): CHECKED ARITHMETIC. The SPEC
+        # (§7 "every operation is checked") and the C runtime panic on
+        # int64 overflow, but the wasm backend emitted bare i64.add /
+        # i64.sub / i64.mul, which WRAP silently — a wasm binary printed
+        # INT64_MAX+1 as INT64_MIN where the interpreter and the native
+        # binary panic. Add overflow-checking helpers (same convention
+        # as _emit_hl_int_abs: trap on the overflow event, never wrap).
+        # i64.div_s / i64.rem_s already trap on /0 and INT64_MIN/-1
+        # (div), matching the HLS panics; rem is checked explicitly
+        # because wasm DEFINES INT64_MIN % -1 == 0 where HLS panics.
+        idx_add = self._add_helper("hl_checked_add", [I64, I64], [I64])
+        idx_sub = self._add_helper("hl_checked_sub", [I64, I64], [I64])
+        idx_mul = self._add_helper("hl_checked_mul", [I64, I64], [I64])
+        idx_rem = self._add_helper("hl_checked_rem", [I64, I64], [I64])
         # Now emit each body. We append the code in the SAME ORDER as the
         # add_function calls above (the code section must mirror the
         # function section's order).
@@ -914,6 +929,10 @@ class WasmEmitter:
         self._emit_hl_panic(idx_panic)
         self._emit_hl_abort(idx_abort)
         self._emit_hl_exit(idx_exit)
+        self._emit_hl_checked_add(idx_add)
+        self._emit_hl_checked_sub(idx_sub)
+        self._emit_hl_checked_mul(idx_mul)
+        self._emit_hl_checked_rem(idx_rem)
 
     # ---- helper: hl_alloc(n: i32) -> ptr ----
     # Reads the heap pointer from HEAP_PTR_ADDR, returns it, then advances
@@ -1518,6 +1537,144 @@ class WasmEmitter:
         body.append(OP_UNREACHABLE)
         self.mod.add_code([], bytes(body))
 
+    # ---- helpers: hl_checked_add / hl_checked_sub / hl_checked_mul /
+    #               hl_checked_rem — overflow-checked int64 arithmetic ----
+    # Deep-scan-25 fix (soundness): the SPEC mandates checked int64
+    # arithmetic ("every operation is checked"); the C runtime panics
+    # and the boot interpreter raises HLPanic, but the wasm backend
+    # used bare i64.add/sub/mul, which WRAP silently. These helpers
+    # TRAP on the overflow event — the established wasm convention
+    # (see _emit_hl_int_abs): a visible halt beats a silent wrong
+    # answer. Locals: 0 = a (param), 1 = b (param), 2 = r, 3 = scratch.
+    # Overflow identities (two's complement):
+    #   add overflows iff ((a ^ r) & (b ^ r)) < 0
+    #   sub overflows iff ((a ^ b) & (a ^ r)) < 0
+    #   mul overflows iff b != 0 and b != -1 and r / b != a
+    #     (b == 0 can't overflow; b == -1 only overflows for INT64_MIN,
+    #     which is special-cased; i64.div_s below then can't trap)
+    #   INT64_MIN % -1 overflows: wasm DEFINES it as 0, HLS panics.
+    def _emit_hl_checked_add(self, idx: int):
+        body = bytearray()
+        # r = a + b
+        body.append(OP_LOCAL_GET); body += uleb(0)
+        body.append(OP_LOCAL_GET); body += uleb(1)
+        body.append(OP_I64_ADD)
+        body.append(OP_LOCAL_SET); body += uleb(2)
+        # scratch = (a ^ r) & (b ^ r)
+        body.append(OP_LOCAL_GET); body += uleb(0)
+        body.append(OP_LOCAL_GET); body += uleb(2)
+        body.append(OP_I64_XOR)
+        body.append(OP_LOCAL_GET); body += uleb(1)
+        body.append(OP_LOCAL_GET); body += uleb(2)
+        body.append(OP_I64_XOR)
+        body.append(OP_I64_AND)
+        body.append(OP_LOCAL_SET); body += uleb(3)
+        # if scratch < 0: unreachable (overflow)
+        body.append(OP_LOCAL_GET); body += uleb(3)
+        body.append(OP_I64_CONST); body += sleb(0)
+        body.append(OP_I64_LT_S)
+        body.append(OP_IF); body.append(BLOCK_VOID)
+        body.append(OP_UNREACHABLE)
+        body.append(OP_END)
+        # return r
+        body.append(OP_LOCAL_GET); body += uleb(2)
+        self.mod.add_code([(2, I64)], bytes(body))
+
+    def _emit_hl_checked_sub(self, idx: int):
+        body = bytearray()
+        # r = a - b
+        body.append(OP_LOCAL_GET); body += uleb(0)
+        body.append(OP_LOCAL_GET); body += uleb(1)
+        body.append(OP_I64_SUB)
+        body.append(OP_LOCAL_SET); body += uleb(2)
+        # scratch = (a ^ b) & (a ^ r)
+        body.append(OP_LOCAL_GET); body += uleb(0)
+        body.append(OP_LOCAL_GET); body += uleb(1)
+        body.append(OP_I64_XOR)
+        body.append(OP_LOCAL_GET); body += uleb(0)
+        body.append(OP_LOCAL_GET); body += uleb(2)
+        body.append(OP_I64_XOR)
+        body.append(OP_I64_AND)
+        body.append(OP_LOCAL_SET); body += uleb(3)
+        # if scratch < 0: unreachable (overflow)
+        body.append(OP_LOCAL_GET); body += uleb(3)
+        body.append(OP_I64_CONST); body += sleb(0)
+        body.append(OP_I64_LT_S)
+        body.append(OP_IF); body.append(BLOCK_VOID)
+        body.append(OP_UNREACHABLE)
+        body.append(OP_END)
+        # return r
+        body.append(OP_LOCAL_GET); body += uleb(2)
+        self.mod.add_code([(2, I64)], bytes(body))
+
+    def _emit_hl_checked_mul(self, idx: int):
+        body = bytearray()
+        # if b == 0: return 0 (a * 0 never overflows)
+        body.append(OP_LOCAL_GET); body += uleb(1)
+        body.append(OP_I64_EQZ)
+        body.append(OP_IF); body.append(BLOCK_VOID)
+        body.append(OP_I64_CONST); body += sleb(0)
+        body.append(OP_RETURN)
+        body.append(OP_END)
+        # if b == -1:
+        #   if a == INT64_MIN: unreachable (overflow)
+        #   else: return 0 - a
+        body.append(OP_LOCAL_GET); body += uleb(1)
+        body.append(OP_I64_CONST); body += sleb(-1)
+        body.append(OP_I64_EQ)
+        body.append(OP_IF); body.append(BLOCK_VOID)
+        body.append(OP_LOCAL_GET); body += uleb(0)
+        body.append(OP_I64_CONST); body += sleb(-9223372036854775808)
+        body.append(OP_I64_EQ)
+        body.append(OP_IF); body.append(BLOCK_VOID)
+        body.append(OP_UNREACHABLE)
+        body.append(OP_END)
+        body.append(OP_I64_CONST); body += sleb(0)
+        body.append(OP_LOCAL_GET); body += uleb(0)
+        body.append(OP_I64_SUB)
+        body.append(OP_RETURN)
+        body.append(OP_END)
+        # r = a * b
+        body.append(OP_LOCAL_GET); body += uleb(0)
+        body.append(OP_LOCAL_GET); body += uleb(1)
+        body.append(OP_I64_MUL)
+        body.append(OP_LOCAL_SET); body += uleb(2)
+        # if r / b != a: unreachable (overflow). b is neither 0 (early
+        # return) nor -1 (special-cased), so div_s cannot trap here.
+        body.append(OP_LOCAL_GET); body += uleb(2)
+        body.append(OP_LOCAL_GET); body += uleb(1)
+        body.append(OP_I64_DIV_S)
+        body.append(OP_LOCAL_GET); body += uleb(0)
+        body.append(OP_I64_NE)
+        body.append(OP_IF); body.append(BLOCK_VOID)
+        body.append(OP_UNREACHABLE)
+        body.append(OP_END)
+        # return r
+        body.append(OP_LOCAL_GET); body += uleb(2)
+        self.mod.add_code([(2, I64)], bytes(body))
+
+    def _emit_hl_checked_rem(self, idx: int):
+        body = bytearray()
+        # HLS panics on INT64_MIN % -1 (C UB); wasm defines it as 0.
+        # if a == INT64_MIN and b == -1: unreachable.
+        body.append(OP_LOCAL_GET); body += uleb(0)
+        body.append(OP_I64_CONST); body += sleb(-9223372036854775808)
+        body.append(OP_I64_EQ)
+        body.append(OP_IF); body.append(BLOCK_VOID)
+        body.append(OP_LOCAL_GET); body += uleb(1)
+        body.append(OP_I64_CONST); body += sleb(-1)
+        body.append(OP_I64_EQ)
+        body.append(OP_IF); body.append(BLOCK_VOID)
+        body.append(OP_UNREACHABLE)
+        body.append(OP_END)
+        body.append(OP_END)
+        # a % b (i64.rem_s traps on b == 0, matching the HLS
+        # division-by-zero panic-as-trap convention).
+        body.append(OP_LOCAL_GET); body += uleb(0)
+        body.append(OP_LOCAL_GET); body += uleb(1)
+        body.append(OP_I64_REM_S)
+        self.mod.add_code([], bytes(body))
+
     # ---------- user function emission ----------
 
     def _emit_function(self, fname: str, fn: Dict):
@@ -1902,7 +2059,10 @@ class WasmEmitter:
         # Dispatch on the operator + the operand type.
         if op == "+":
             if _taint_inner(lt) == "int":
-                out.append(OP_I64_ADD)
+                # Deep-scan-25 fix: overflow-checked (SPEC §7) — traps
+                # instead of silently wrapping.
+                out.append(OP_CALL)
+                out += uleb(self.func_index["hl_checked_add"])
             elif _taint_inner(lt) == "float":
                 out.append(OP_F64_ADD)
             else:
@@ -1910,14 +2070,18 @@ class WasmEmitter:
                               % lt, e.get("line", 0), 0)
         elif op == "-":
             if _taint_inner(lt) == "int":
-                out.append(OP_I64_SUB)
+                # Deep-scan-25 fix: overflow-checked (SPEC §7).
+                out.append(OP_CALL)
+                out += uleb(self.func_index["hl_checked_sub"])
             elif _taint_inner(lt) == "float":
                 out.append(OP_F64_SUB)
             else:
                 raise HLError("'-' on %s not supported" % lt, e.get("line", 0), 0)
         elif op == "*":
             if _taint_inner(lt) == "int":
-                out.append(OP_I64_MUL)
+                # Deep-scan-25 fix: overflow-checked (SPEC §7).
+                out.append(OP_CALL)
+                out += uleb(self.func_index["hl_checked_mul"])
             elif _taint_inner(lt) == "float":
                 out.append(OP_F64_MUL)
             else:
@@ -1931,7 +2095,10 @@ class WasmEmitter:
                 raise HLError("'/' on %s not supported" % lt, e.get("line", 0), 0)
         elif op == "%":
             if _taint_inner(lt) == "int":
-                out.append(OP_I64_REM_S)
+                # Deep-scan-25 fix: INT64_MIN % -1 must halt (HLS
+                # overflow panic), which wasm's rem_s defines as 0.
+                out.append(OP_CALL)
+                out += uleb(self.func_index["hl_checked_rem"])
             else:
                 raise HLError("'%%' on %s not supported" % lt, e.get("line", 0), 0)
         elif op == "==":
@@ -2000,11 +2167,14 @@ class WasmEmitter:
         if op == "-":
             t = e["e"].get("t", "")
             if _taint_inner(t) == "int":
-                # Compute 0 - x. Push 0 FIRST (deeper), then x, then sub.
-                # (i64.sub pops b then a and computes a - b; a must be deeper.)
+                # Compute 0 - x via the CHECKED sub (deep-scan-25 fix:
+                # 0 - INT64_MIN must halt, not wrap to INT64_MIN).
+                # Push 0 FIRST (deeper), then x — i64.sub pops b then a
+                # and computes a - b; a must be deeper.
                 out.append(OP_I64_CONST); out += sleb(0)
                 self._lower_expr(e["e"], out)
-                out.append(OP_I64_SUB)  # 0 - x = -x
+                out.append(OP_CALL)
+                out += uleb(self.func_index["hl_checked_sub"])
             elif _taint_inner(t) == "float":
                 out.append(OP_F64_CONST); out += struct.pack("<d", 0.0)
                 self._lower_expr(e["e"], out)

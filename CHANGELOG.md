@@ -13,6 +13,174 @@ stability (125–140), and final stabilisation toward v1.0 (141–150).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
+## [v0.92.3-alpha] — deep-scan-25: 21 fixes across both compilers, the runtimes, stdlib and tooling
+
+> Fifth systematic super-scan. This pass paired three independent
+> parallel code reviews (boot checker, Python tooling, stdlib-vs-spec
+> vector verification) with a hand-built differential probe battery
+> (numeric edges, NaN signs, string/list/map boundaries, bitwise ops,
+> casts) and the existing suites. Twenty-one genuine defects fixed;
+> zero regressions: stage-1/2 (327/327), differential interp-vs-native
+> (180/180), native hlc compile-all (180/180), bootstrap determinism,
+> LLVM suite 13/13, memcheck RSS delta 0, fuzz 0 divergences, hllint
+> and hlfmt-idempotency clean, spec-check/LSP-smoke/hlprove/hlmodel
+> green. Nine new regression tests pin every fix.
+
+### Fixed — soundness (boot compiler + self-hosted checker, both backends)
+
+- **`chan_new()` bypassed the Conc effect (HIGH, boot only).** The
+  `BUILTIN_EFFECTS` entry existed but the call-graph edge was never
+  added, so `fn mk() -> Chan[int] { return chan_new() }` compiled as
+  PURE — a hole the self-hosted checker never had. The edge is now
+  registered (`fail_chan_new_effect` pins it).
+- **`stream_send` / `future_ready` sent owned values by reference
+  across the task boundary (HIGH, boot only).** A method-call result
+  like `xs.get(0)` aliases the caller's list; the boot interpreter's
+  two stream builtins skipped the boundary deep-copy that `chan.send`,
+  `spawn`, `async_spawn`, `gen_spawn` and the native `gen_own_arg`
+  path all perform, so a producer mutation after the send was visible
+  to the consumer — the exact cross-thread data race the Send/boundary
+  system exists to prevent. Both boundaries now deep-copy (with the
+  same syntactic `clone(...)` exemption as `chan.send`).
+- **`stream_close` on non-int streams type-confused (MEDIUM).** The
+  builtin sends the INT64_MIN sentinel in BOTH backends, so closing a
+  `Stream[str]` handed an integer to the receiver as a str (interpreter:
+  raw traceback; native: a bogus integer reaching the pointer release
+  helper). Both checkers now reject it; non-int producers send their
+  own sentinel via `stream_send` (`fail_stream_close_nonint` pins it).
+- **`future_poll` hard-coded the built-in Option shape (LOW).** A
+  user-defined `enum Option[T]` with a different shape checked clean
+  and then never matched at runtime ("match: no arm matched"). Both
+  checkers validate the `None`/`Some(T)` shape at every call site
+  (`fail_future_poll_option_shape` pins it).
+- **Self-hosted checker parity (MEDIUM).** `hlc.hls`'s checker was
+  missing the stream_send bare-read rejection, the stream_close
+  non-int rejection and the future_poll Option-shape validation the
+  boot checker has; all three are now mirrored (boot rejects, hlc
+  rejects, byte-identical messages modulo formatting).
+
+### Fixed — native runtime & self-hosted codegen
+
+- **`hl_float_to_int` accepted exactly 2^63 (HIGH).** The range check
+  used `v > 9.2233720368547757e18`, but that literal rounds to exactly
+  2^63 as a double, so `v == 2^63` slipped into `(int64_t)v` —
+  undefined behaviour that silently produced INT64_MAX where the boot
+  interpreter panics. The check is now `>= 2^63` (there are no doubles
+  strictly between INT64_MAX and 2^63).
+- **`future_ready` codegen emitted uncompilable C for non-literal
+  arguments (HIGH).** The per-site static helper referenced the
+  argument expression LEXICALLY, so any local reference
+  (`future_ready(ys)` -> `hl_retain(u_ys)`) produced "undeclared
+  identifier" C; only primitive literals ever worked. The helper now
+  takes the value as a parameter, evaluated at the call site.
+- **`stream_send` / `future_ready` codegen boundary (HIGH).** The
+  native path own-wrapped (RETAINED) borrowed composites instead of
+  deep-copying them — a retain does not copy, so the aliasing race the
+  boot interpreter just got fixed also existed natively. Both now
+  mirror the `chan.send` boundary: channels share, clone(...)/literals/
+  fresh results pass raw, borrowed composites deep-copy via
+  `hl_clone_<t>`.
+- **std. import resolution from outside the repo tree (LOW).** The
+  `repo_root` heuristic (the entry file's parent directory) failed for
+  `hlc /tmp/demo.hls out.c` even when invoked from the repository
+  root. The resolver now also tries the invoking cwd as a repository
+  anchor (declared honestly: `uses IO, Proc` propagates through
+  `load_file_into` to `main`).
+
+### Fixed — interpreter/native differential parity
+
+- **NaN sign (MEDIUM).** C's printf prints `-nan` when a NaN's sign
+  bit is set; Python's `%f` prints `nan` unconditionally, and the
+  interpreter's f64_div/f64_mod/_libm handlers synthesised a POSITIVE
+  `float('nan')` where the x86-64 FPU produces the sign-bit-set
+  default QNaN for every invalid operation (0/0, inf-inf, sqrt(-1),
+  fmod(x, 0), ...). The interpreter now synthesises the platform's
+  hardware default QNaN (negative on x86-64, positive on aarch64),
+  propagates NaN numerators in division, and `fmt_float` renders the
+  sign like C's printf. glibc's per-function quirks (asin/acos/log10
+  return POSITIVE NaN via __math_invalid) are mirrored with explicit
+  `on_domain` overrides.
+
+### Fixed — stdlib
+
+- **`std.json` astral UTF-8 (HIGH).** `jsonp_push_utf8` subtracted
+  0x10000 from the codepoint and shifted the DIFFERENCE for every
+  4-byte component — the subtract trick belongs to UTF-16 surrogate
+  maths, not the UTF-8 byte layout, so EVERY `\uD8xx\uDxxx` pair
+  decoded to invalid UTF-8 (U+1D11E emitted `f0 8d 84 9e` instead of
+  `f0 9d 84 9e`). Now mirrors the correct formula from
+  `std/json_stream.hls` (the promised backport).
+- **`std.json` small-float round-trips (MEDIUM).** The exponent-form
+  threshold (1e-6) sat below `%.6f`'s precision floor, so the band
+  [1e-6, 1e-4) lost most of its value (1.5e-6 stringified as
+  "0.000002" — a 33% error). The threshold is now 1e-4; the exponent
+  path keeps ~7 significant digits and round-trips exactly.
+- **`std.regex` `regex_split` zero-width matches (MEDIUM).** The
+  zero-width branch advanced pos WITHOUT emitting the skipped byte, so
+  the parts no longer concatenated back to the input ("abc" split on
+  "b*" returned five EMPTY parts — the letters vanished). The loop now
+  keeps a segment start and mirrors Python `re.split`'s zero-width
+  rule exactly (verified against Python for eight patterns).
+- **`std.math` bigdecimal ordering (MEDIUM).** The magnitude
+  comparator behind `bigdecimal_lt/gt/le/ge` used "the longer digit
+  list wins" after equal prefixes, so `eq(1.5, 1.50)` was true while
+  `lt(1.5, 1.50)` was ALSO true — a broken total order. Magnitudes
+  now scale-align the shorter digit list (all-zero tail = equal,
+  non-zero tail = longer strictly larger).
+
+### Fixed — tooling
+
+- **`tools/hlwasm.py` silent arithmetic wrap (HIGH).** The wasm
+  backend emitted bare `i64.add/sub/mul`, which WRAP silently where
+  the SPEC mandates checked arithmetic — INT64_MAX+1 printed as
+  INT64_MIN with exit 0. New `hl_checked_add/sub/mul/rem` helpers trap
+  on overflow (the established `_emit_hl_int_abs` convention);
+  `i64.rem_s`'s defined INT64_MIN % -1 == 0 now traps too, matching
+  the HLS panic. Node-verified for all four helpers and regression-run
+  on the hello example.
+- **`tools/ir/optimize.py` LICM hoisted into non-dominating blocks
+  (HIGH).** The preheader was "the block before the cond in creation
+  order" and back edges were "every other predecessor" — both wrong
+  when the preceding statement ends in nested control flow: hoisted
+  instructions landed in a block that never executes on the taken
+  path (reads of undefined SSA values). The pass now computes real
+  dominators, classifies back edges with the textbook definition
+  (h dominates t), and hoists only into the UNIQUE loop-external
+  predecessor (bailing out otherwise).
+- **`tools/hlfmt.py` `-w` corrupted unparseable files (HIGH).** The
+  HLError fallback decoded with errors="replace" and the writer
+  re-encoded as latin-1 with errors="replace", so a file that failed
+  tokenization was REWRITTEN IN PLACE with mangled UTF-8 (é -> 0xE9,
+  emoji -> "?"), exit 0. The fallback now round-trips losslessly
+  (latin-1), making `-w` a content no-op for broken files.
+- **`tools/hllint.py` L005 skipped if/while conditions and for
+  iterables (MEDIUM).** The condition is evaluated BEFORE the branches,
+  but the if/while/for handlers `continue`d before the unwrap scan, so
+  `if result_unwrap(r) > 0` was never flagged. Conditions/iterables
+  are now scanned with the incoming checked-set; the cfaware
+  regression expectation (exactly 3 warnings) still holds.
+- **`tools/hlwasm_opt.py` raw traceback on malformed input (LOW).**
+  optimize() now reports a one-line clean error, matching every
+  sibling tool.
+
+### Added — regression tests
+
+- `tests/ok/feat_deep_scan25_checked_casts.hls` — float.to_int at the
+  2^63 boundary (panics differentially; in-range edges pinned).
+- `tests/ok/feat_deep_scan25_json_utf8.hls` — exact bytes for the four
+  surrogate-pair boundary codepoints + round-trip stability.
+- `tests/ok/feat_deep_scan25_regex_split.hls` — Python-parity splits
+  for b*/x*/a*/a? plus comma max_parts/trailing behaviour.
+- `tests/ok/feat_deep_scan25_bigdec_compare.hls` — the full total-order
+  matrix across scales and signs.
+- `tests/ok/feat_deep_scan25_nan_parity.hls` — platform-stable NaN/Inf
+  facts (which ops are NaN, C99 pole signs, fmt rendering).
+- `tests/ok/feat_deep_scan25_boundary_clone.hls` — stream_send /
+  future_ready / chan.send boundary copy semantics.
+- `tests/fail/fail_chan_new_effect.hls`,
+  `tests/fail/fail_stream_close_nonint.hls`,
+  `tests/fail/fail_future_poll_option_shape.hls`.
+
 ## [v0.92.2-alpha] — deep-scan-24: 14 fixes across the boot compiler, self-hosted codegen and HLIR tooling
 
 > Fourth systematic super-scan. This pass combined differential

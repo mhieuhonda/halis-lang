@@ -797,33 +797,78 @@ def _licm(irf: HLIRFunction):
             return [a[1] for a in blk.terminator.args if a[0] == "label"]
         return []
 
-    for caller_block_idx in range(len(irf.blocks)):
-        cond = irf.blocks[caller_block_idx]
-        if not _cond_re.match(cond.name):
-            continue
-        # Predecessor map (rebuilt per header — cheap at this scale and
-        # keeps the pass self-contained).
-        preds: Dict[str, List[str]] = {}
-        by_name: Dict[str, Block] = {}
-        for blk in irf.blocks:
-            by_name[blk.name] = blk
-            for lbl in _term_labels(blk):
+    # Deep-scan-25 fix (HIGH, miscompilation): the preheader used to be
+    # "the block immediately before the cond in CREATION order" and the
+    # back edges were "every other predecessor of the cond". When the
+    # preceding statement ends in nested control flow, the creation-order
+    # predecessor is NOT the real entry edge — the actual preheader is a
+    # different block (e.g. a previous statement's while_end/endif), which
+    # then got misclassified as a BACK EDGE, and hoisted instructions
+    # landed in a block that never executes on the taken path: reads of
+    # UNDEFINED SSA values (repro: an `if 1 == 2 {...}` statement before
+    # a `while` loop made the optimiser emit `%t = const 5` inside the
+    # dead then-branch while the loop body read `%t`).
+    # Fix: identify back edges with real DOMINATORS (an edge t -> h is a
+    # back edge iff h dominates t — the textbook definition), take the
+    # natural loop as {h} ∪ {blocks reaching a back-edge source without
+    # passing through h}, and hoist ONLY into the UNIQUE loop-external
+    # predecessor of h (the structural preheader, which provably
+    # dominates the header for such single-entry natural loops). Bail
+    # out (no hoisting) when the preheader is not unique. CFGs here are
+    # tens of blocks, so the O(n²) iterative dominator solve is cheap.
+    blocks = irf.blocks
+    names = [b.name for b in blocks]
+    name_set = set(names)
+    entry = names[0]
+
+    preds: Dict[str, List[str]] = {}
+    by_name: Dict[str, Block] = {}
+    for blk in blocks:
+        by_name[blk.name] = blk
+        for lbl in _term_labels(blk):
+            if lbl in name_set:
                 preds.setdefault(lbl, []).append(blk.name)
-        # Back-edge sources: any block (other than the preheader) whose
-        # terminator jumps to this cond. The preheader is the block
-        # immediately before the cond block in creation order — its
-        # jump to cond is the ENTRY edge, not a back edge.
-        preheader = irf.blocks[caller_block_idx - 1] if caller_block_idx > 0 else None
-        if preheader is None:
-            continue  # no preheader available (shouldn't happen for real loops)
-        back_edges = [blk.name for blk in irf.blocks
-                      if blk.name != preheader.name
-                      and cond.name in _term_labels(blk)]
+
+    # Iterative dominator sets. dom(entry) = {entry}; dom(n) = {n} ∪ ⋂ dom(p)
+    # over predecessors p. Unreachable blocks keep the TOP set (∩-identity),
+    # which cannot corrupt real paths.
+    all_names = set(names)
+    dom: Dict[str, Set[str]] = {n: set(all_names) for n in names}
+    if names:
+        dom[entry] = {entry}
+    changed = True
+    while changed:
+        changed = False
+        for n in names:
+            if n == entry:
+                continue
+            ps = preds.get(n, [])
+            if ps:
+                new = set(all_names)
+                for p in ps:
+                    new &= dom[p]
+                new.add(n)
+            else:
+                new = set(all_names)
+            if new != dom[n]:
+                dom[n] = new
+                changed = True
+
+    for hblk in blocks:
+        if not _cond_re.match(hblk.name):
+            continue
+        h = hblk.name
+        h_preds = preds.get(h, [])
+        if not h_preds:
+            continue
+        # Back edges: t -> h where h dominates t (textbook definition —
+        # exact for these reducible loops, handles multiple back edges).
+        back_edges = [t for t in h_preds if h in dom.get(t, set())]
         if not back_edges:
             continue  # not actually a loop header (no back edge)
-        # Natural loop: walk predecessors backwards from the back-edge
-        # sources, never crossing the header.
-        loop_blocks: Set[str] = {cond.name}
+        # Natural loop: {h} plus every block that reaches a back-edge
+        # source without passing through h (walk predecessors backwards).
+        loop_blocks: Set[str] = {h}
         worklist = list(back_edges)
         while worklist:
             name = worklist.pop()
@@ -831,6 +876,13 @@ def _licm(irf: HLIRFunction):
                 continue
             loop_blocks.add(name)
             worklist.extend(preds.get(name, []))
+        # Structural preheader: the UNIQUE loop-external predecessor.
+        # Zero external preds (self-loop only) or several (irreducible /
+        # unexpected CFG) -> do not hoist.
+        external = [p for p in h_preds if p not in loop_blocks]
+        if len(external) != 1:
+            continue
+        preheader = by_name[external[0]]
         # Collect SSA names defined INSIDE the loop (over the WHOLE
         # natural loop). Any name in this set is NOT loop-invariant.
         loop_defined: Set[str] = set()

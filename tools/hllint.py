@@ -475,6 +475,30 @@ class Linter:
                         return True
             return False
 
+        def _scan_unwrap_exprs(exprs, cvars):
+            """Deep-scan-25 fix (L005 false negative): shared unwrap-scan
+            helper. Flags `result_unwrap(x)` / `option_unwrap(x)` calls
+            whose argument identifier is not in the checked-set `cvars`."""
+            for e in exprs:
+                if e is None:
+                    continue
+
+                def visit(node):
+                    if node.get("k") == "call" and node.get("name") in UNWRAP_NAMES:
+                        args = node.get("args", [])
+                        if not args:
+                            return
+                        arg = args[0]
+                        # Only flag if the argument is an identifier
+                        # that hasn't been recently checked.
+                        if arg.get("k") == "ident":
+                            if arg["name"] not in cvars:
+                                self._warn("L005", node.get("line", 0),
+                                           "explicit unwrap of '%s' without prior "
+                                           "is_ok/is_some check in this block"
+                                           % arg["name"])
+                walk_expr(e, visit)
+
         def _walk_block(stmts, checked_vars):
             """Walk a flat statement list, mutating `checked_vars` (a set
             of variable names whose Result/Option value was recently
@@ -508,6 +532,13 @@ class Linter:
                     # then-branch terminates — the early-exit idiom
                     # `if result_is_err(x) { return 1 }` makes a later
                     # unwrap(x) safe).
+                    # Deep-scan-25 fix (L005 false negative): the condition
+                    # itself is evaluated BEFORE the branches — an unsafe
+                    # `if result_unwrap(r) > 0 { ... }` used to slip
+                    # through unvisited because the branch `continue`d
+                    # before the generic unwrap scan. Scan the condition
+                    # with the incoming checked-set.
+                    _scan_unwrap_exprs([s["cond"]], checked_vars)
                     kind, cvar = _cond_var(s.get("cond"))
                     then_checked = set(checked_vars)
                     else_checked = set(checked_vars)
@@ -524,28 +555,22 @@ class Linter:
                 elif k == "while":
                     # Inside a while, the checked status from outside
                     # doesn't apply (loop body may execute zero times).
+                    # Deep-scan-25 fix (L005 false negative): scan the
+                    # loop condition too (first evaluation happens with
+                    # the incoming checked-set, before any body run).
+                    _scan_unwrap_exprs([s["cond"]], checked_vars)
                     warns.extend(_walk_block(s.get("body", []) or [], set()))
                     continue
                 elif k == "for":
+                    # Deep-scan-25 fix (L005 false negative): scan the
+                    # iterable expression (evaluated once, before the
+                    # body — same context as the incoming checked-set).
+                    _scan_unwrap_exprs([s["iter"]], checked_vars)
                     warns.extend(_walk_block(s.get("body", []) or [], set()))
                     continue
                 # Look for unwrap calls in this statement's expressions.
                 for e in exprs_in_stmt(s):
-                    def visit(node):
-                        if node.get("k") == "call" and node.get("name") in UNWRAP_NAMES:
-                            args = node.get("args", [])
-                            if not args:
-                                return
-                            arg = args[0]
-                            # Only flag if the argument is an identifier
-                            # that hasn't been recently checked.
-                            if arg.get("k") == "ident":
-                                if arg["name"] not in checked_vars:
-                                    self._warn("L005", node.get("line", 0),
-                                               "explicit unwrap of '%s' without prior "
-                                               "is_ok/is_some check in this block"
-                                               % arg["name"])
-                    walk_expr(e, visit)
+                    _scan_unwrap_exprs([e], checked_vars)
             return warns
         for fname, fn in self.program["fns"].items():
             _walk_block(fn["body"], set())

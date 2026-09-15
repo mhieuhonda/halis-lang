@@ -3481,11 +3481,17 @@ class Checker:
         # ----- Stage 16 (v0.27.0-alpha): concurrency builtins -----
         # chan_new() -> Chan[T] — contextual typing (same pattern as
         # map_new()): the surrounding let/param/return type supplies T.
+        # Deep-scan-25 fix (soundness): register the Conc effect edge.
+        # The BUILTIN_EFFECTS entry existed but the call-graph edge was
+        # never added, so `fn mk() -> Chan[int] { return chan_new() }`
+        # compiled as PURE — a hole the native compiler (hlc.hls, which
+        # does add the b:chan_new edge) never had.
         if name == "chan_new":
             need(0)
             if expected is None or not is_chan(expected):
                 self.err("chan_new() requires a 'Chan[T]' type in the "
                          "surrounding context", e)
+            self.edges[self.cur_fn].add("b:chan_new")
             return expected
         # chan_new_bounded(cap: int) -> Chan[T] — Stage-16 perfection
         # (v0.29.0-alpha): a bounded channel whose send blocks while it
@@ -3714,11 +3720,29 @@ class Checker:
             return expected
         # future_poll(fut: Future[T]) -> Option[T] — non-blocking poll.
         # Returns Some(v) if the future is ready, None otherwise.
+        # Deep-scan-25 fix (soundness): the runtime hard-codes the
+        # built-in Option shape ({"enum": "Option", "var": "Some"/"None"}).
+        # A user-defined enum Option[T] with a different shape used to
+        # pass the check and then never match at runtime ("match: no arm
+        # matched"). Validate the shape whenever an Option enum exists.
         if name == "future_poll":
             need(1)
             at = argt(0, None)
             if not is_future(at):
                 self.err("future_poll() expects a Future[T], got %s" % at, e)
+            if "Option" in self.enums:
+                odef = self.enums["Option"]
+                has_some = False
+                has_none = False
+                for vname, payloads in odef["variants"]:
+                    if vname == "Some" and len(payloads) == 1:
+                        has_some = True
+                    if vname == "None" and len(payloads) == 0:
+                        has_none = True
+                if not (has_some and has_none) or len(odef["variants"]) != 2:
+                    self.err("future_poll() requires the built-in Option "
+                             "shape 'enum Option[T] { None, Some(T) }' — the "
+                             "program's Option enum does not match it", e)
             self.edges[self.cur_fn].add("b:future_poll")
             return "Option[%s]" % future_inner(at)
         # future_select(futs: list[Future[T]]) -> int — race multiple
@@ -3809,17 +3833,26 @@ class Checker:
         # stream_close(s: Stream[T]) — signal end-of-stream by sending a
         # sentinel. The sentinel convention is per-element-type (documented
         # in std/stream.hls). For int streams, the sentinel is INT64_MIN.
-        # The builtin itself just records the edge; the actual sentinel
-        # send happens in the producer (the user calls stream_send with
-        # the sentinel value). This builtin is a no-op at the runtime
-        # level — it exists so the type checker can validate that the
-        # user remembered to close the stream (a stream without a close
-        # call leaks the producer task). Lint stage 35+ will enforce this.
+        # Deep-scan-25 fix (soundness): the builtin — in BOTH backends
+        # (boot interp and the native codegen, which emits
+        # hl_chan_send_i64(s, INT64_MIN)) — sends the INT64_MIN sentinel
+        # unconditionally. On a non-int stream that value is read back
+        # as the element type: the interpreter then type-confuses (raw
+        # Python traceback) and the native binary hands a bogus integer
+        # to the release helper of a pointer type (memory corruption).
+        # Reject stream_close on non-int streams: non-int producers
+        # signal end-of-stream by sending their own sentinel value via
+        # stream_send, exactly as std/stream.hls documents.
         if name == "stream_close":
             need(1)
             st = argt(0, None)
             if not is_stream(st):
                 self.err("stream_close() expects Stream[T], got %s" % st, e)
+            if stream_inner(st) != "int":
+                self.err("stream_close() only supports Stream[int] (it sends "
+                         "the INT64_MIN sentinel); for Stream[%s] send your "
+                         "own end-of-stream value via stream_send instead"
+                         % stream_inner(st), e)
             self.edges[self.cur_fn].add("b:stream_close")
             return "void"
         # stream_map_int(in_s: Stream[int], fn_name) -> Stream[int] —

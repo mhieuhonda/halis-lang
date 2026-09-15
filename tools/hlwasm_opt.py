@@ -1643,9 +1643,20 @@ def main() -> int:
     with open(args.input, "rb") as f:
         wasm_bytes = f.read()
     report: dict = {}
-    optimized = optimize(wasm_bytes, level=args.level,
-                         external_wasm_opt=args.external_wasm_opt,
-                         report=report)
+    # Deep-scan-25 fix: malformed input used to escape as a raw Python
+    # traceback (e.g. ValueError "not a wasm binary (magic mismatch)").
+    # Every sibling tool prints a one-line clean error for bad input —
+    # mirror that (the output file is only written on success, so no
+    # corruption was possible; this is purely an error-reporting fix).
+    try:
+        optimized = optimize(wasm_bytes, level=args.level,
+                             external_wasm_opt=args.external_wasm_opt,
+                             report=report)
+    except (ValueError, IndexError, KeyError, TypeError, NotImplementedError,
+            OSError) as ex:
+        sys.stderr.write("error: %s: not a valid wasm module (%s)\n"
+                         % (args.input, ex))
+        return 1
     with open(args.output, "wb") as f:
         f.write(optimized)
     if args.report:
