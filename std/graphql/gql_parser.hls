@@ -1,0 +1,1029 @@
+# ============================================================================
+# std/graphql/gql_parser.hls - verbatim slice of the original std/graphql.hls
+# (lines 625..1647), split for maintainability. Loaded via the
+# std/graphql.hls facade; not part of the public import API.
+# ============================================================================
+
+fn graphql_schema_find_type(s: GqlSchema, name: str) -> int {
+    if name.len() == 0 {
+        return -1
+    }
+    let mut i: int = 0
+    while i < s.types.len() {
+        if s.types.get(i).name == name {
+            return i
+        }
+        i = i + 1
+    }
+    # Built-in scalars are implicit — report a virtual index -2 so
+    # callers can distinguish "known builtin" from "unknown".
+    if gql_is_builtin_scalar(name) {
+        return -2
+    }
+    return -1
+}
+
+# gql_type_exists(s, name) — true iff the named type is defined in
+# the schema OR is one of the five built-in scalars.
+fn gql_type_exists(s: GqlSchema, name: str) -> bool {
+    let idx: int = graphql_schema_find_type(s, name)
+    return idx >= 0 || idx == -2
+}
+
+# graphql_schema_type_kind(s, name) — the kind code for a named type,
+# or -1 if the type does not exist in the schema. Built-in scalars
+# report gql_type_kind_scalar().
+fn graphql_schema_type_kind(s: GqlSchema, name: str) -> int {
+    let idx: int = graphql_schema_find_type(s, name)
+    if idx >= 0 {
+        return s.types.get(idx).kind
+    }
+    if idx == -2 {
+        return gql_type_kind_scalar()
+    }
+    return -1
+}
+
+# graphql_schema_field(s, type_name, field_name) — index of the field
+# within the named object type, or -1. Handles the __typename
+# meta-field (every composite type has it).
+fn graphql_schema_field(s: GqlSchema, type_name: str, field_name: str) -> int {
+    let idx: int = graphql_schema_find_type(s, type_name)
+    if idx < 0 {
+        return -1
+    }
+    if field_name == gql_typename_field() {
+        return -3
+    }
+    let t: GqlType = s.types.get(idx)
+    if t.kind != gql_type_kind_object() {
+        return -1
+    }
+    return gql_field_find(t.fields, field_name)
+}
+
+# ============================================================================
+# PART B — the shared parser core + the SDL parser.
+#
+# One cursor struct (GqlParser) serves both the SDL parser and the
+# document parser: it tracks byte position plus line/column for error
+# messages. Every loop advances the cursor by at least one byte, so
+# parsing is linear in the document length (no backtracking, no
+# catastrophic alternation — the anti-ReDoS guarantee).
+# ============================================================================
+
+# GqlParser — cursor over a GraphQL source document.
+struct GqlParser {
+    src: str,
+    pos: int,
+    line: int,
+    col: int
+}
+
+# gqlp_new(src) — a parser positioned at the start of the source.
+fn gqlp_new(src: str) -> GqlParser {
+    return GqlParser { src: src, pos: 0, line: 1, col: 1 }
+}
+
+# gqlp_err(p, msg) — format a parser error with line/column info.
+fn gqlp_err(p: GqlParser, msg: str) -> str {
+    return msg + " (at line " + p.line.to_str() + ", column "
+        + p.col.to_str() + ")"
+}
+
+# gqlp_peek(p) — the byte at the cursor, or -1 at end of input.
+fn gqlp_peek(p: GqlParser) -> int {
+    if p.pos >= p.src.len() {
+        return -1
+    }
+    return p.src.byte_at(p.pos)
+}
+
+# gqlp_peek_at(p, off) — the byte `off` positions ahead, or -1.
+fn gqlp_peek_at(p: GqlParser, off: int) -> int {
+    let i: int = p.pos + off
+    if i >= p.src.len() || i < 0 {
+        return -1
+    }
+    return p.src.byte_at(i)
+}
+
+# gqlp_at_end(p) — true iff the cursor is at (or past) the end.
+fn gqlp_at_end(p: GqlParser) -> bool {
+    return p.pos >= p.src.len()
+}
+
+# gqlp_advance(p) — consume one byte, tracking line/column.
+fn gqlp_advance(p: GqlParser) -> void {
+    if p.pos >= p.src.len() {
+        return
+    }
+    let b: int = p.src.byte_at(p.pos)
+    p.pos = p.pos + 1
+    if b == 10 {
+        p.line = p.line + 1
+        p.col = 1
+    } else {
+        p.col = p.col + 1
+    }
+}
+
+# gqlp_is_ws(b) — a GraphQL insignificant byte: whitespace or the
+# optional comma (GraphQL treats commas exactly like whitespace).
+fn gqlp_is_ws(b: int) -> bool {
+    return b == 32 || b == 9 || b == 10 || b == 13 || b == 44
+}
+
+# gqlp_skip_ws(p) — skip whitespace, commas, and "#" comments. Always
+# advances (or reaches end), so callers cannot loop without progress.
+fn gqlp_skip_ws(p: GqlParser) -> void {
+    let mut guard: int = 0
+    while guard < graphql_max_document_len() * 2 {
+        let b: int = gqlp_peek(p)
+        if b == -1 {
+            return
+        }
+        if gqlp_is_ws(b) {
+            gqlp_advance(p)
+        } else if b == 35 {  # '#'
+            # Comment: skip to end of line.
+            let mut c: int = gqlp_peek(p)
+            while c != -1 && c != 10 {
+                gqlp_advance(p)
+                c = gqlp_peek(p)
+            }
+        } else {
+            return
+        }
+        guard = guard + 1
+    }
+}
+
+# gqlp_expect(p, tok) — consume the exact token (a punctuator or a
+# keyword) after skipping whitespace; Result.Err with position info
+# otherwise.
+fn gqlp_expect(p: GqlParser, tok: str) -> Result[bool, str] {
+    gqlp_skip_ws(p)
+    let mut i: int = 0
+    while i < tok.len() {
+        let want: int = tok.byte_at(i)
+        let got: int = gqlp_peek_at(p, i)
+        if got != want {
+            return Result.Err(gqlp_err(p, "expected '" + tok + "'"))
+        }
+        i = i + 1
+    }
+    i = 0
+    while i < tok.len() {
+        gqlp_advance(p)
+        i = i + 1
+    }
+    return Result.Ok(true)
+}
+
+# gqlp_peek_name(p) — peek WITHOUT consuming: if the cursor is at a
+# name, return it; "" otherwise. Peeking first lets the caller choose
+# between statement keywords and field names.
+fn gqlp_peek_name(p: GqlParser) -> str {
+    gqlp_skip_ws(p)
+    let b: int = gqlp_peek(p)
+    if !((b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b == 95) {
+        return ""
+    }
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < graphql_max_name_len() + 1 {
+        let c: int = gqlp_peek_at(p, i)
+        if !((c >= 65 && c <= 90) || (c >= 97 && c <= 122)
+            || (c >= 48 && c <= 57) || c == 95) {
+            break
+        }
+        out = out + chr(c)
+        i = i + 1
+    }
+    return out
+}
+
+# gqlp_read_name(p) — consume a name; Result.Err if none is present.
+fn gqlp_read_name(p: GqlParser) -> Result[str, str] {
+    let name: str = gqlp_peek_name(p)
+    if name.len() == 0 {
+        return Result.Err(gqlp_err(p, "expected a name"))
+    }
+    let mut i: int = 0
+    while i < name.len() {
+        gqlp_advance(p)
+        i = i + 1
+    }
+    return Result.Ok(name)
+}
+
+# gqlp_read_number_token(p) — consume an IntValue/FloatValue token and
+# return it verbatim (GraphQL number grammar is JSON-compatible, so
+# the token can be embedded directly in rendered JSON).
+fn gqlp_read_number_token(p: GqlParser) -> str {
+    gqlp_skip_ws(p)
+    let mut out: str = ""
+    # Optional sign.
+    let b: int = gqlp_peek(p)
+    if b == 45 || b == 43 {  # '-' or '+' (GraphQL allows '-' only, but
+        # accepting '+' is harmless and matches the JSON number rule
+        # used by variable substitution).
+        out = out + chr(b)
+        gqlp_advance(p)
+    }
+    # Integer part: at least one digit.
+    let mut digits: int = 0
+    let mut c: int = gqlp_peek(p)
+    while c >= 48 && c <= 57 {
+        out = out + chr(c)
+        gqlp_advance(p)
+        digits = digits + 1
+        c = gqlp_peek(p)
+    }
+    if digits == 0 {
+        return ""
+    }
+    # Fraction: '.' followed by at least one digit.
+    if gqlp_peek(p) == 46 {
+        let nxt: int = gqlp_peek_at(p, 1)
+        if nxt >= 48 && nxt <= 57 {
+            out = out + "."
+            gqlp_advance(p)
+            c = gqlp_peek(p)
+            while c >= 48 && c <= 57 {
+                out = out + chr(c)
+                gqlp_advance(p)
+                c = gqlp_peek(p)
+            }
+        }
+    }
+    # Exponent: [eE][+-]?digits.
+    c = gqlp_peek(p)
+    if c == 101 || c == 69 {
+        let nxt: int = gqlp_peek_at(p, 1)
+        let nxt2: int = gqlp_peek_at(p, 2)
+        let has_digits: bool = (nxt >= 48 && nxt <= 57)
+            || ((nxt == 43 || nxt == 45) && nxt2 >= 48 && nxt2 <= 57)
+        if has_digits {
+            out = out + "e"
+            gqlp_advance(p)
+            c = gqlp_peek(p)
+            if c == 43 || c == 45 {
+                out = out + chr(c)
+                gqlp_advance(p)
+            }
+            c = gqlp_peek(p)
+            while c >= 48 && c <= 57 {
+                out = out + chr(c)
+                gqlp_advance(p)
+                c = gqlp_peek(p)
+            }
+        }
+    }
+    return out
+}
+
+# gqlp_read_string(p) — consume a StringValue (regular "..." with
+# \u escapes passed through verbatim, or block """...""" with escapes
+# passed through). Returns the RAW inner text (the JSON quoting is
+# applied by the value renderer, which re-escapes properly).
+fn gqlp_read_string(p: GqlParser) -> Result[str, str] {
+    gqlp_skip_ws(p)
+    let b: int = gqlp_peek(p)
+    if b != 34 {
+        return Result.Err(gqlp_err(p, "expected a string"))
+    }
+    # Block string: three consecutive quotes.
+    if gqlp_peek_at(p, 1) == 34 && gqlp_peek_at(p, 2) == 34 {
+        gqlp_advance(p)
+        gqlp_advance(p)
+        gqlp_advance(p)
+        let mut out: str = ""
+        let mut guard: int = 0
+        while guard < graphql_max_string_len() * 2 {
+            if gqlp_at_end(p) {
+                return Result.Err(gqlp_err(p, "unterminated block string"))
+            }
+            if gqlp_peek(p) == 34 && gqlp_peek_at(p, 1) == 34
+                && gqlp_peek_at(p, 2) == 34 {
+                gqlp_advance(p)
+                gqlp_advance(p)
+                gqlp_advance(p)
+                return Result.Ok(out)
+            }
+            out = out + chr(gqlp_peek(p))
+            gqlp_advance(p)
+            guard = guard + 1
+        }
+        return Result.Err(gqlp_err(p, "block string too long"))
+    }
+    # Regular string.
+    gqlp_advance(p)
+    let mut out: str = ""
+    let mut guard: int = 0
+    while guard < graphql_max_string_len() * 2 {
+        let c: int = gqlp_peek(p)
+        if c == -1 {
+            return Result.Err(gqlp_err(p, "unterminated string"))
+        }
+        if c == 10 {
+            return Result.Err(gqlp_err(p, "line break in string"))
+        }
+        if c == 34 {
+            gqlp_advance(p)
+            return Result.Ok(out)
+        }
+        if c == 92 {  # backslash — escape pair
+            let e: int = gqlp_peek_at(p, 1)
+            if e == 34 || e == 92 || e == 47 || e == 98 || e == 102
+                || e == 110 || e == 114 || e == 116 {
+                out = out + chr(c) + chr(e)
+                gqlp_advance(p)
+                gqlp_advance(p)
+            } else if e == 117 {  # \uXXXX
+                out = out + chr(c) + chr(e)
+                gqlp_advance(p)
+                gqlp_advance(p)
+                let mut k: int = 0
+                while k < 4 {
+                    let h: int = gqlp_peek(p)
+                    if (h >= 48 && h <= 57) || (h >= 97 && h <= 102)
+                        || (h >= 65 && h <= 70) {
+                        out = out + chr(h)
+                        gqlp_advance(p)
+                    } else {
+                        return Result.Err(gqlp_err(p, "bad \\u escape"))
+                    }
+                    k = k + 1
+                }
+            } else {
+                return Result.Err(gqlp_err(p, "bad escape in string"))
+            }
+        } else if c < 32 {
+            return Result.Err(gqlp_err(p, "control char in string"))
+        } else {
+            out = out + chr(c)
+            gqlp_advance(p)
+        }
+        guard = guard + 1
+    }
+    return Result.Err(gqlp_err(p, "string too long"))
+}
+
+# gqlp_skip_directives(p) — best-effort skip of directive annotations
+# ("@deprecated(reason: "...")"). Directives carry no execution
+# semantics in this subset; they are skipped so real-world SDL parses.
+# A directive is '@' name + optional balanced argument list.
+fn gqlp_skip_directives(p: GqlParser) -> void {
+    let mut guard: int = 0
+    while guard < 16 {
+        gqlp_skip_ws(p)
+        if gqlp_peek(p) != 64 {  # '@'
+            return
+        }
+        gqlp_advance(p)
+        let nm: Result[str, str] = gqlp_read_name(p)
+        if result_is_err(nm) {
+            return
+        }
+        # Optional ( ... ) with nested brackets — skip balanced.
+        gqlp_skip_ws(p)
+        if gqlp_peek(p) == 40 {  # '('
+            let mut depth: int = 0
+            let mut inner: int = 0
+            while inner < graphql_max_document_len() {
+                let c: int = gqlp_peek(p)
+                if c == -1 {
+                    return
+                }
+                if c == 40 {
+                    depth = depth + 1
+                } else if c == 41 {
+                    depth = depth - 1
+                    gqlp_advance(p)
+                    if depth == 0 {
+                        break
+                    }
+                    continue
+                }
+                gqlp_advance(p)
+                inner = inner + 1
+            }
+        }
+        guard = guard + 1
+    }
+}
+
+# gqlp_parse_type_ref(p) — parse a GraphQL type reference into its
+# canonical string form: Name, [inner], with any number of "!"
+# wrappers. Result.Err on malformed input.
+fn gqlp_parse_type_ref(p: GqlParser) -> Result[str, str] {
+    gqlp_skip_ws(p)
+    let b: int = gqlp_peek(p)
+    if b == 91 {  # '['
+        gqlp_advance(p)
+        let inner: Result[str, str] = gqlp_parse_type_ref(p)
+        if result_is_err(inner) {
+            return Result.Err(result_err_or(inner, "bad list type"))
+        }
+        let close: Result[bool, str] = gqlp_expect(p, "]")
+        if result_is_err(close) {
+            return Result.Err(result_err_or(close, "expected ']'"))
+        }
+        let mut t: str = "[" + result_unwrap(inner) + "]"
+        gqlp_skip_ws(p)
+        while gqlp_peek(p) == 33 {  # '!'
+            gqlp_advance(p)
+            t = t + "!"
+            gqlp_skip_ws(p)
+        }
+        return Result.Ok(t)
+    }
+    let nm: Result[str, str] = gqlp_read_name(p)
+    if result_is_err(nm) {
+        return Result.Err(gqlp_err(p, "expected a type name"))
+    }
+    let name: str = result_unwrap(nm)
+    if !gql_is_valid_name(name) {
+        return Result.Err(gqlp_err(p, "invalid type name: '" + name + "'"))
+    }
+    let mut t: str = name
+    gqlp_skip_ws(p)
+    while gqlp_peek(p) == 33 {  # '!'
+        gqlp_advance(p)
+        t = t + "!"
+        gqlp_skip_ws(p)
+    }
+    return Result.Ok(t)
+}
+
+# ============================================================================
+# Value literals — shared by SDL defaults and document arguments.
+#
+# A parsed value is rendered IMMEDIATELY as a JSON value string, with
+# one exception: variable references are rendered as the marker string
+# "$!name" (a JSON string containing the marker) and substituted at
+# graphql_begin time. graphql_validate_value re-checks the rendered
+# JSON against the declared GraphQL type.
+# ============================================================================
+
+# gql_json_quote(s) — quote + escape a raw string as JSON via
+# std.json's canonical encoder (single source of escaping truth).
+fn gql_json_quote(s: str) -> str {
+    return json_stringify(json_str(s))
+}
+
+# gqlp_parse_value(p) — parse one GraphQL value literal and render it
+# as a JSON value string. Result.Err on malformed input. Values:
+#   $name            -> "$!name" (marker; substituted later)
+#   Int/Float        -> number token verbatim
+#   "..." / """..."""-> JSON-quoted string
+#   true/false/null  -> JSON keyword
+#   EnumName         -> JSON-quoted string (enum values serialise as
+#                       strings on the wire; graphql_validate_value
+#                       checks membership against the enum type)
+#   [a, b]           -> JSON array (bounded by graphql_max_list_len)
+#   { k: v, ... }    -> JSON object (keys rendered as JSON strings)
+fn gqlp_parse_value(p: GqlParser) -> Result[str, str] {
+    gqlp_skip_ws(p)
+    let b: int = gqlp_peek(p)
+    # Variable reference.
+    if b == 36 {  # '$'
+        gqlp_advance(p)
+        let nm: Result[str, str] = gqlp_read_name(p)
+        if result_is_err(nm) {
+            return Result.Err(gqlp_err(p, "expected a variable name"))
+        }
+        return Result.Ok(gql_json_quote(gql_var_marker()
+            + result_unwrap(nm)))
+    }
+    # Number.
+    if (b >= 48 && b <= 57) || b == 45 || b == 43 {
+        let tok: str = gqlp_read_number_token(p)
+        if tok.len() == 0 {
+            return Result.Err(gqlp_err(p, "bad number"))
+        }
+        return Result.Ok(tok)
+    }
+    # String.
+    if b == 34 {
+        let s: Result[str, str] = gqlp_read_string(p)
+        if result_is_err(s) {
+            return Result.Err(result_err_or(s, "bad string"))
+        }
+        return Result.Ok(gql_json_quote(result_unwrap(s)))
+    }
+    # Keywords / enum names / list / object.
+    if b == 91 {  # '['
+        gqlp_advance(p)
+        let mut out: str = "["
+        let mut n: int = 0
+        let mut guard: int = 0
+        while guard < graphql_max_list_len() * 2 {
+            gqlp_skip_ws(p)
+            if gqlp_peek(p) == 93 {  # ']'
+                gqlp_advance(p)
+                return Result.Ok(out + "]")
+            }
+            if gqlp_at_end(p) {
+                return Result.Err(gqlp_err(p, "unterminated list"))
+            }
+            if n > 0 {
+                out = out + ","
+            }
+            let v: Result[str, str] = gqlp_parse_value(p)
+            if result_is_err(v) {
+                return Result.Err(result_err_or(v, "bad list element"))
+            }
+            out = out + result_unwrap(v)
+            n = n + 1
+            guard = guard + 1
+        }
+        return Result.Err(gqlp_err(p, "list too long"))
+    }
+    if b == 123 {  # '{'
+        gqlp_advance(p)
+        let mut out: str = "{"
+        let mut n: int = 0
+        let mut guard: int = 0
+        while guard < graphql_max_args() * 2 {
+            gqlp_skip_ws(p)
+            if gqlp_peek(p) == 125 {  # '}'
+                gqlp_advance(p)
+                return Result.Ok(out + "}")
+            }
+            if gqlp_at_end(p) {
+                return Result.Err(gqlp_err(p, "unterminated object"))
+            }
+            let k: Result[str, str] = gqlp_read_name(p)
+            if result_is_err(k) {
+                return Result.Err(gqlp_err(p, "expected object key"))
+            }
+            let colon: Result[bool, str] = gqlp_expect(p, ":")
+            if result_is_err(colon) {
+                return Result.Err(result_err_or(colon, "expected ':'"))
+            }
+            let v: Result[str, str] = gqlp_parse_value(p)
+            if result_is_err(v) {
+                return Result.Err(result_err_or(v, "bad object value"))
+            }
+            if n > 0 {
+                out = out + ","
+            }
+            out = out + gql_json_quote(result_unwrap(k)) + ":"
+                + result_unwrap(v)
+            n = n + 1
+            guard = guard + 1
+        }
+        return Result.Err(gqlp_err(p, "object literal too long"))
+    }
+    # true / false / null / enum name.
+    let nm: Result[str, str] = gqlp_read_name(p)
+    if result_is_err(nm) {
+        return Result.Err(gqlp_err(p, "expected a value"))
+    }
+    let name: str = result_unwrap(nm)
+    if name == "true" || name == "false" || name == "null" {
+        return Result.Ok(name)
+    }
+    return Result.Ok(gql_json_quote(name))
+}
+
+# ============================================================================
+# The SDL parser — graphql_parse_schema(src) -> Result[GqlSchema, str].
+#
+# Grammar accepted (whitespace-insensitive, "#" comments, "," ignored):
+#   schema { query: QueryName  mutation: MutationName }
+#   type Name { field(args): Type  ... }
+#   field: name ( arg: Type = default, ... ) : TypeRef
+#   enum Name { VALUE1 VALUE2 ... }
+#   scalar Name
+#   directive definitions and @annotations are skipped
+#   descriptions: leading "..." / """...""" before type/field/enum
+# ============================================================================
+
+# gqlp_parse_field_def(p) — parse one field of a type body after the
+# optional description has been read: name, optional (args), ':',
+# type ref.
+fn gqlp_parse_field_def(p: GqlParser) -> Result[GqlField, str] {
+    let nm: Result[str, str] = gqlp_read_name(p)
+    if result_is_err(nm) {
+        return Result.Err(gqlp_err(p, "expected a field name"))
+    }
+    let name: str = result_unwrap(nm)
+    if !gql_is_valid_name(name) {
+        return Result.Err(gqlp_err(p, "invalid field name: '" + name + "'"))
+    }
+    let mut field: GqlField = gql_field_new(name, "")
+    # Argument list.
+    gqlp_skip_ws(p)
+    if gqlp_peek(p) == 40 {  # '('
+        gqlp_advance(p)
+        let mut nargs: int = 0
+        let mut guard: int = 0
+        while guard < graphql_max_args() {
+            gqlp_skip_ws(p)
+            if gqlp_peek(p) == 41 {  # ')'
+                gqlp_advance(p)
+                break
+            }
+            if gqlp_at_end(p) {
+                return Result.Err(gqlp_err(p, "unterminated argument list"))
+            }
+            if nargs >= graphql_max_args() {
+                return Result.Err(gqlp_err(p, "too many arguments"))
+            }
+            let an: Result[str, str] = gqlp_read_name(p)
+            if result_is_err(an) {
+                return Result.Err(gqlp_err(p, "expected an argument name"))
+            }
+            let colon: Result[bool, str] = gqlp_expect(p, ":")
+            if result_is_err(colon) {
+                return Result.Err(result_err_or(colon, "expected ':'"))
+            }
+            let tr: Result[str, str] = gqlp_parse_type_ref(p)
+            if result_is_err(tr) {
+                return Result.Err(result_err_or(tr, "bad argument type"))
+            }
+            let mut arg: GqlArg = gql_arg_new(result_unwrap(an),
+                result_unwrap(tr))
+            gqlp_skip_directives(p)
+            gqlp_skip_ws(p)
+            if gqlp_peek(p) == 61 {  # '='
+                gqlp_advance(p)
+                let dv: Result[str, str] = gqlp_parse_value(p)
+                if result_is_err(dv) {
+                    return Result.Err(result_err_or(dv,
+                        "bad default value"))
+                }
+                arg = gql_arg_with_default(arg, result_unwrap(dv))
+            }
+            field = gql_field_with_arg(field, arg)
+            nargs = nargs + 1
+            guard = guard + 1
+        }
+    }
+    # Return type.
+    let colon: Result[bool, str] = gqlp_expect(p, ":")
+    if result_is_err(colon) {
+        return Result.Err(result_err_or(colon, "expected ':' after field"))
+    }
+    gqlp_skip_directives(p)
+    let tr: Result[str, str] = gqlp_parse_type_ref(p)
+    if result_is_err(tr) {
+        return Result.Err(result_err_or(tr, "bad field type"))
+    }
+    field.type_str = result_unwrap(tr)
+    gqlp_skip_directives(p)
+    return Result.Ok(field)
+}
+
+# gqlp_parse_type_body(p, t) — parse the '{ ... }' body of an object
+# type (fields, each with an optional leading description string).
+fn gqlp_parse_type_body(p: GqlParser, t: GqlType) -> Result[GqlType, str] {
+    let open: Result[bool, str] = gqlp_expect(p, "{")
+    if result_is_err(open) {
+        return Result.Err(result_err_or(open, "expected '{'"))
+    }
+    let mut out: GqlType = t
+    let mut nfields: int = 0
+    let mut guard: int = 0
+    while guard < graphql_max_fields() {
+        gqlp_skip_ws(p)
+        if gqlp_peek(p) == 125 {  # '}'
+            gqlp_advance(p)
+            return Result.Ok(out)
+        }
+        if gqlp_at_end(p) {
+            return Result.Err(gqlp_err(p, "unterminated type body"))
+        }
+        if nfields >= graphql_max_fields() {
+            return Result.Err(gqlp_err(p, "too many fields"))
+        }
+        # Optional description string before the field.
+        let mut desc: str = ""
+        gqlp_skip_ws(p)
+        if gqlp_peek(p) == 34 {
+            let d: Result[str, str] = gqlp_read_string(p)
+            if result_is_err(d) {
+                return Result.Err(result_err_or(d, "bad description"))
+            }
+            desc = result_unwrap(d)
+        }
+        let f: Result[GqlField, str] = gqlp_parse_field_def(p)
+        if result_is_err(f) {
+            return Result.Err(result_err_or(f, "bad field definition"))
+        }
+        let mut fld: GqlField = result_unwrap(f)
+        if desc.len() > 0 {
+            fld = gql_field_with_description(fld, desc)
+        }
+        # Duplicate field names are a schema error.
+        if gql_field_find(out.fields, fld.name) >= 0 {
+            return Result.Err(gqlp_err(p, "duplicate field '" + fld.name
+                + "' in type '" + out.name + "'"))
+        }
+        out = gql_type_with_field(out, fld)
+        nfields = nfields + 1
+        guard = guard + 1
+    }
+    return Result.Err(gqlp_err(p, "type body too long"))
+}
+
+# graphql_parse_schema(src) — parse a GraphQL SDL document into a
+# GqlSchema. Validates: unique type names, known field/argument type
+# bases (defined or built-in), the root query type exists and is an
+# object, enum values are unique and name-valid.
+fn graphql_parse_schema(src: str) -> Result[GqlSchema, str] {
+    if src.len() > graphql_max_document_len() {
+        return Result.Err("schema SDL exceeds "
+            + graphql_max_document_len().to_str() + " bytes")
+    }
+    let p: GqlParser = gqlp_new(src)
+    let mut schema: GqlSchema = graphql_schema_new()
+    let mut guard: int = 0
+    while guard < graphql_max_types() * 4 {
+        gqlp_skip_ws(p)
+        if gqlp_at_end(p) {
+            break
+        }
+        # Optional leading description string (regular or block
+        # form) consumed before the statement keyword (spec:
+        # descriptions may precede type/enum/scalar/schema
+        # definitions). Attached to the following type when the
+        # statement is a type definition.
+        let mut pending_desc: str = ""
+        if gqlp_peek(p) == 34 {
+            let d: Result[str, str] = gqlp_read_string(p)
+            if result_is_err(d) {
+                return Result.Err(result_err_or(d, "bad description"))
+            }
+            pending_desc = result_unwrap(d)
+            gqlp_skip_ws(p)
+            if gqlp_at_end(p) {
+                return Result.Err(gqlp_err(p,
+                    "description at end of schema"))
+            }
+        }
+        let kw: str = gqlp_peek_name(p)
+        if kw == "schema" {
+            gqlp_advance(p)
+            gqlp_advance(p)
+            gqlp_advance(p)
+            gqlp_advance(p)
+            gqlp_advance(p)
+            gqlp_advance(p)
+            let open: Result[bool, str] = gqlp_expect(p, "{")
+            if result_is_err(open) {
+                return Result.Err(result_err_or(open, "expected '{'"))
+            }
+            let mut inner: int = 0
+            while inner < 8 {
+                gqlp_skip_ws(p)
+                if gqlp_peek(p) == 125 {  # '}'
+                    gqlp_advance(p)
+                    break
+                }
+                if gqlp_at_end(p) {
+                    return Result.Err(gqlp_err(p, "unterminated schema"))
+                }
+                let op: Result[str, str] = gqlp_read_name(p)
+                if result_is_err(op) {
+                    return Result.Err(gqlp_err(p, "expected query/mutation"))
+                }
+                let colon: Result[bool, str] = gqlp_expect(p, ":")
+                if result_is_err(colon) {
+                    return Result.Err(result_err_or(colon, "expected ':'"))
+                }
+                let tn: Result[str, str] = gqlp_read_name(p)
+                if result_is_err(tn) {
+                    return Result.Err(result_err_or(tn, "expected a type name"))
+                }
+                let opname: str = result_unwrap(op)
+                let tname: str = result_unwrap(tn)
+                if opname == "query" {
+                    schema.query_type = tname
+                } else if opname == "mutation" {
+                    schema.mutation_type = tname
+                } else if opname == "subscription" {
+                    # Parsed but unsupported (needs streaming transport).
+                    return Result.Err(gqlp_err(p,
+                        "subscription root type is not supported"
+                        + " (use std.sse for streaming)"))
+                } else {
+                    return Result.Err(gqlp_err(p, "unknown schema operation '"
+                        + opname + "'"))
+                }
+                inner = inner + 1
+            }
+        } else if kw == "type" {
+            let mut skip: int = 0
+            while skip < 4 {
+                gqlp_advance(p)
+                skip = skip + 1
+            }
+            let nm: Result[str, str] = gqlp_read_name(p)
+            if result_is_err(nm) {
+                return Result.Err(gqlp_err(p, "expected a type name"))
+            }
+            let name: str = result_unwrap(nm)
+            if !gql_is_valid_name(name) {
+                return Result.Err(gqlp_err(p, "invalid type name"))
+            }
+            if graphql_schema_find_type(schema, name) >= 0 {
+                return Result.Err(gqlp_err(p, "duplicate type '" + name + "'"))
+            }
+            gqlp_skip_directives(p)
+            let mut t: GqlType = gql_type_object(name)
+            if pending_desc.len() > 0 {
+                t = gql_type_with_description(t, pending_desc)
+            }
+            let body: Result[GqlType, str] = gqlp_parse_type_body(p, t)
+            if result_is_err(body) {
+                return Result.Err(result_err_or(body, "bad type body"))
+            }
+            t = result_unwrap(body)
+            if t.fields.len() == 0 {
+                return Result.Err(gqlp_err(p, "object type '" + name
+                    + "' has no fields"))
+            }
+            schema = graphql_schema_with_type(schema, t)
+        } else if kw == "enum" {
+            let mut skip: int = 0
+            while skip < 4 {
+                gqlp_advance(p)
+                skip = skip + 1
+            }
+            let nm: Result[str, str] = gqlp_read_name(p)
+            if result_is_err(nm) {
+                return Result.Err(gqlp_err(p, "expected an enum name"))
+            }
+            let name: str = result_unwrap(nm)
+            if graphql_schema_find_type(schema, name) >= 0 {
+                return Result.Err(gqlp_err(p, "duplicate type '" + name + "'"))
+            }
+            let open: Result[bool, str] = gqlp_expect(p, "{")
+            if result_is_err(open) {
+                return Result.Err(result_err_or(open, "expected '{'"))
+            }
+            let mut t: GqlType = gql_type_enum_def(name)
+            let mut guard2: int = 0
+            while guard2 < graphql_max_fields() {
+                gqlp_skip_ws(p)
+                if gqlp_peek(p) == 125 {  # '}'
+                    gqlp_advance(p)
+                    break
+                }
+                if gqlp_at_end(p) {
+                    return Result.Err(gqlp_err(p, "unterminated enum"))
+                }
+                let vn: Result[str, str] = gqlp_read_name(p)
+                if result_is_err(vn) {
+                    return Result.Err(gqlp_err(p, "expected an enum value"))
+                }
+                let vname: str = result_unwrap(vn)
+                if !gql_is_valid_name(vname) {
+                    return Result.Err(gqlp_err(p, "invalid enum value"))
+                }
+                let mut vi: int = 0
+                let mut dup: bool = false
+                while vi < t.enum_values.len() {
+                    if t.enum_values.get(vi) == vname {
+                        dup = true
+                    }
+                    vi = vi + 1
+                }
+                if dup {
+                    return Result.Err(gqlp_err(p, "duplicate enum value '"
+                        + vname + "'"))
+                }
+                t = gql_type_with_enum_value(t, vname)
+                gqlp_skip_directives(p)
+                guard2 = guard2 + 1
+            }
+            if t.enum_values.len() == 0 {
+                return Result.Err(gqlp_err(p, "enum '" + name
+                    + "' has no values"))
+            }
+            schema = graphql_schema_with_type(schema, t)
+        } else if kw == "scalar" {
+            let mut skip: int = 0
+            while skip < 6 {
+                gqlp_advance(p)
+                skip = skip + 1
+            }
+            let nm: Result[str, str] = gqlp_read_name(p)
+            if result_is_err(nm) {
+                return Result.Err(gqlp_err(p, "expected a scalar name"))
+            }
+            let name: str = result_unwrap(nm)
+            if graphql_schema_find_type(schema, name) >= 0 {
+                return Result.Err(gqlp_err(p, "duplicate type '" + name + "'"))
+            }
+            gqlp_skip_directives(p)
+            schema = graphql_schema_with_type(schema,
+                gql_type_scalar_def(name))
+        } else if kw == "directive" {
+            # Skip a directive definition entirely: read to the next
+            # top-level keyword or end (best effort, bounded).
+            let mut skip: int = 0
+            while skip < 10 {
+                gqlp_advance(p)
+                skip = skip + 1
+            }
+            let mut guard2: int = 0
+            while guard2 < graphql_max_document_len() {
+                gqlp_skip_ws(p)
+                let nxt: str = gqlp_peek_name(p)
+                if nxt == "schema" || nxt == "type" || nxt == "enum"
+                    || nxt == "scalar" || nxt == "directive" {
+                    break
+                }
+                if gqlp_at_end(p) {
+                    break
+                }
+                gqlp_advance(p)
+                guard2 = guard2 + 1
+            }
+        } else {
+            if kw.len() == 0 {
+                return Result.Err(gqlp_err(p,
+                    "unexpected character in schema"))
+            }
+            return Result.Err(gqlp_err(p, "unexpected schema statement '"
+                + kw + "'"))
+        }
+        guard = guard + 1
+    }
+    # Cross-validate the schema.
+    let qidx: int = graphql_schema_find_type(schema, schema.query_type)
+    if qidx < 0 {
+        return Result.Err("schema has no Query type ('" + schema.query_type
+            + "' is not defined)")
+    }
+    if schema.types.get(qidx).kind != gql_type_kind_object() {
+        return Result.Err("the query root type must be an object type")
+    }
+    if schema.mutation_type.len() > 0 {
+        let midx: int = graphql_schema_find_type(schema, schema.mutation_type)
+        if midx < 0 {
+            return Result.Err("schema has no Mutation type ('"
+                + schema.mutation_type + "' is not defined)")
+        }
+        if schema.types.get(midx).kind != gql_type_kind_object() {
+            return Result.Err("the mutation root type must be an object type")
+        }
+    }
+    # Every field/argument type must resolve to a known base type.
+    let mut ti: int = 0
+    while ti < schema.types.len() {
+        let t: GqlType = schema.types.get(ti)
+        let mut fi: int = 0
+        while fi < t.fields.len() {
+            let f: GqlField = t.fields.get(fi)
+            let base: str = gql_type_base(f.type_str)
+            if !gql_type_exists(schema, base) {
+                return Result.Err("field '" + t.name + "." + f.name
+                    + "' references unknown type '" + base + "'")
+            }
+            let mut ai: int = 0
+            while ai < f.args.len() {
+                let a: GqlArg = f.args.get(ai)
+                let abase: str = gql_type_base(a.type_str)
+                if !gql_type_exists(schema, abase) {
+                    return Result.Err("argument '" + t.name + "." + f.name
+                        + "." + a.name + "' references unknown type '"
+                        + abase + "'")
+                }
+                ai = ai + 1
+            }
+            fi = fi + 1
+        }
+        ti = ti + 1
+    }
+    return Result.Ok(schema)
+}
+
+# ============================================================================
+# PART C — the document parser (queries, mutations, fragments).
+#
+# Grammar accepted:
+#   query Name($var: Type = default) { selections }    named query
+#   mutation Name { selections }                       named mutation
+#   { selections }                                     anonymous shorthand
+#   fragment FragName on TypeName { selections }       named fragment
+#   subscription ...                                   REJECTED (needs a
+#                                                      streaming transport)
+# selection:
+#   field(arg: value, ...)                             leaf / sub-selections
+#   alias: field(arg: value, ...) { ... }
+#   ...FragmentName                                    fragment spread
+#   ... on TypeName { ... }                            inline fragment
+#
+# The depth limit is enforced DURING parsing (not after): the
+# recursive descent carries the current depth and refuses to go
+# deeper than graphql_max_depth().
+# ============================================================================
+
+# GqlVariable — one variable definition of an operation.

@@ -1,0 +1,419 @@
+# ============================================================================
+# std/regex/regex_exec.hls - verbatim slice of the original std/regex.hls
+# (lines 1524..1936), split for maintainability. Loaded via the
+# std/regex.hls facade; not part of the public import API.
+# ============================================================================
+
+fn regex_add_state_to_set(re: Regex, set: list[int], state_idx: int, caps: list[int], text: str, pos: int) -> void {
+    if state_idx < 0 || state_idx >= re.states.len() {
+        return
+    }
+    if regex_set_has(set, state_idx) {
+        return
+    }
+    regex_set_add(set, state_idx)
+    let st: RegexState = re.states.get(state_idx)
+    if st.kind == regex_st_epsilon() {
+        regex_add_state_to_set(re, set, st.out1, caps, text, pos)
+        regex_add_state_to_set(re, set, st.out2, caps, text, pos)
+    } else if st.kind == regex_st_save() {
+        let slot: int = st.group_id
+        if slot < caps.len() {
+            caps.set(slot, pos)
+        }
+        regex_add_state_to_set(re, set, st.out1, caps, text, pos)
+    } else if st.kind == regex_st_anchor_start() {
+        # ^ matches only at position 0 (start of text).
+        if pos == 0 {
+            regex_add_state_to_set(re, set, st.out1, caps, text, pos)
+        }
+    } else if st.kind == regex_st_anchor_end() {
+        # $ matches only at the end of text.
+        if pos == text.len() {
+            regex_add_state_to_set(re, set, st.out1, caps, text, pos)
+        }
+    } else if st.kind == regex_st_word_boundary() {
+        # \b matches at a boundary between a word byte and a non-word byte.
+        if regex_word_boundary_at(text, pos) {
+            regex_add_state_to_set(re, set, st.out1, caps, text, pos)
+        }
+    } else if st.kind == regex_st_nonword_boundary() {
+        if !regex_word_boundary_at(text, pos) {
+            regex_add_state_to_set(re, set, st.out1, caps, text, pos)
+        }
+    }
+    # LITERAL / ANY / CLASS / MATCH are non-epsilon: leave the state
+    # in the set; the outer loop will consume a byte and advance.
+}
+
+# regex_word_boundary_at(text, pos) -> bool. True if pos is at a
+# word boundary (between a word byte and a non-word byte, or at the
+# start/end of text adjacent to a word byte).
+fn regex_word_boundary_at(text: str, pos: int) -> bool {
+    let before: bool = pos > 0 && regex_is_word_byte(text.byte_at(pos - 1))
+    let after: bool = pos < text.len() && regex_is_word_byte(text.byte_at(pos))
+    return before != after
+}
+
+# regex_is_word_byte(b) -> bool. True for [A-Za-z0-9_].
+fn regex_is_word_byte(b: int) -> bool {
+    if b >= 65 && b <= 90 {
+        return true
+    }
+    if b >= 97 && b <= 122 {
+        return true
+    }
+    if b >= 48 && b <= 57 {
+        return true
+    }
+    if b == 95 {
+        return true
+    }
+    return false
+}
+
+# ============================================================================
+# Bitmap helpers — list[int] as a bitset.
+# ============================================================================
+
+fn regex_set_has(set: list[int], idx: int) -> bool {
+    if idx < 0 {
+        return false
+    }
+    let word: int = idx / 64
+    let bit: int = idx % 64
+    if word >= set.len() {
+        return false
+    }
+    return int_and(set.get(word), int_shl(1, bit)) != 0
+}
+
+fn regex_set_add(mut set: list[int], idx: int) -> void {
+    if idx < 0 {
+        return
+    }
+    let word: int = idx / 64
+    let bit: int = idx % 64
+    if word >= set.len() {
+        return
+    }
+    set.set(word, int_or(set.get(word), int_shl(1, bit)))
+}
+
+fn regex_set_empty(set: list[int]) -> bool {
+    let mut i: int = 0
+    while i < set.len() {
+        if set.get(i) != 0 {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+# ============================================================================
+# List helpers (only `list_filled` — `list_contains_int` and
+# `list_concat_int` come from std.list).
+# ============================================================================
+
+fn list_filled(n: int, v: int) -> list[int] {
+    let out: list[int] = []
+    let mut i: int = 0
+    while i < n {
+        out.push(v)
+        i = i + 1
+    }
+    return out
+}
+
+# ============================================================================
+# Public API — is_match / find / find_all / groups / replace / split.
+# ============================================================================
+
+# regex_is_match(re, text) -> bool.
+fn regex_is_match(re: Regex, text: str) -> bool {
+    let mut start: int = 0
+    let n: int = text.len()
+    while start <= n {
+        let m: Option[RegexMatch] = regex_run(re, text, start)
+        if option_is_some(m) {
+            return true
+        }
+        start = start + 1
+    }
+    return false
+}
+
+# regex_find(re, text) -> Option[RegexMatch]. Find the leftmost
+# longest match of `re` in `text`.
+fn regex_find(re: Regex, text: str) -> Option[RegexMatch] {
+    let mut start: int = 0
+    let n: int = text.len()
+    while start <= n {
+        let m: Option[RegexMatch] = regex_run(re, text, start)
+        if option_is_some(m) {
+            return m
+        }
+        start = start + 1
+    }
+    return Option.None
+}
+
+# regex_find_at(re, text, start) -> Option[RegexMatch]. Find a match
+# at the specific position `start`. Returns Option.None if no match
+# begins at exactly that position.
+#
+# Deep-scan-21 fix (MEDIUM, safety): validate `start`. For
+# `start < 0` or `start > text.len()`, return Option.None instead
+# of letting the simulation read out-of-bounds bytes (the Python
+# interpreter would panic with "string access out of bounds"; the
+# C codegen would read before the buffer — undefined behavior).
+fn regex_find_at(re: Regex, text: str, start: int) -> Option[RegexMatch] {
+    if start < 0 || start > text.len() {
+        return Option.None
+    }
+    return regex_run(re, text, start)
+}
+
+# regex_find_all(re, text, max_results) -> list[RegexMatch]. Find all
+# non-overlapping matches. max_results <= 0 means unbounded.
+fn regex_find_all(re: Regex, text: str, max_results: int) -> list[RegexMatch] {
+    let out: list[RegexMatch] = []
+    let mut pos: int = 0
+    let n: int = text.len()
+    while pos <= n {
+        if max_results > 0 && out.len() >= max_results {
+            break
+        }
+        let m: Option[RegexMatch] = regex_run(re, text, pos)
+        if !option_is_some(m) {
+            pos = pos + 1
+            continue
+        }
+        let match_v: RegexMatch = option_unwrap(m)
+        out.push(match_v)
+        if match_v.end > pos {
+            pos = match_v.end
+        } else {
+            pos = pos + 1
+        }
+    }
+    return out
+}
+
+# regex_match_text(re, text) -> Option[str]. Return the matched substring.
+fn regex_match_text(re: Regex, text: str) -> Option[str] {
+    let m: Option[RegexMatch] = regex_find(re, text)
+    if !option_is_some(m) {
+        return Option.None
+    }
+    let mv: RegexMatch = option_unwrap(m)
+    return Option.Some(text.slice(mv.start, mv.end))
+}
+
+# regex_groups(re, text) -> Option[list[str]]. Return the capture
+# groups as a list of strings.
+fn regex_groups(re: Regex, text: str) -> Option[list[str]] {
+    let m: Option[RegexMatch] = regex_find(re, text)
+    if !option_is_some(m) {
+        return Option.None
+    }
+    let mv: RegexMatch = option_unwrap(m)
+    return Option.Some(regex_match_groups_strings(re, text, mv))
+}
+
+fn regex_match_groups_strings(re: Regex, text: str, m: RegexMatch) -> list[str] {
+    let out: list[str] = []
+    let mut i: int = 0
+    while i < m.groups.len() {
+        let span: RegexGroupSpan = m.groups.get(i)
+        # Deep-scan-20 fix (HIGH): the NFA's shared capture vector can
+        # yield INVERTED spans (start > end) for groups under
+        # quantifiers — `regex_groups(re, "(\\w+(\\.)?)+", "a.b.c")`
+        # used to reach text.slice(start, end) and PANIC ("invalid
+        # string slice") on a public Option-returning API. Treat an
+        # inverted or out-of-range span as a non-participating group
+        # (the same class as start/end < 0) and yield "" instead.
+        if span.start < 0 || span.end < 0 || span.start > span.end || span.end > text.len() {
+            out.push("")
+        } else {
+            out.push(text.slice(span.start, span.end))
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# regex_replace(re, text, replacement) -> str. Replace the FIRST match.
+fn regex_replace(re: Regex, text: str, replacement: str) -> str {
+    let m: Option[RegexMatch] = regex_find(re, text)
+    if !option_is_some(m) {
+        return text
+    }
+    let mv: RegexMatch = option_unwrap(m)
+    let groups: list[str] = regex_match_groups_strings(re, text, mv)
+    let expanded: str = regex_expand_replacement(replacement, groups)
+    return text.slice(0, mv.start) + expanded + text.slice(mv.end, text.len())
+}
+
+# regex_replace_all(re, text, replacement) -> str. Replace every
+# non-overlapping match.
+fn regex_replace_all(re: Regex, text: str, replacement: str) -> str {
+    let mut out: str = ""
+    let mut pos: int = 0
+    let n: int = text.len()
+    while pos <= n {
+        let m: Option[RegexMatch] = regex_run(re, text, pos)
+        if !option_is_some(m) {
+            if pos < n {
+                out = out + text.slice(pos, pos + 1)
+            }
+            pos = pos + 1
+            continue
+        }
+        let mv: RegexMatch = option_unwrap(m)
+        out = out + text.slice(pos, mv.start)
+        let groups: list[str] = regex_match_groups_strings(re, text, mv)
+        out = out + regex_expand_replacement(replacement, groups)
+        if mv.end > pos {
+            pos = mv.end
+        } else {
+            if pos < n {
+                out = out + text.slice(pos, pos + 1)
+            }
+            pos = pos + 1
+        }
+    }
+    return out
+}
+
+# regex_expand_replacement(replacement, groups) -> str. Expand $0, $1..$9
+# in the replacement string. $$ is a literal $.
+fn regex_expand_replacement(replacement: str, groups: list[str]) -> str {
+    let mut out: str = ""
+    let n: int = replacement.len()
+    let mut i: int = 0
+    while i < n {
+        let b: int = replacement.byte_at(i)
+        if b == 36 && i + 1 < n {
+            let next_b: int = replacement.byte_at(i + 1)
+            if next_b == 36 {
+                out = out + "$"
+                i = i + 2
+                continue
+            }
+            if next_b >= 48 && next_b <= 57 {
+                let gid: int = next_b - 48
+                if gid < groups.len() {
+                    out = out + groups.get(gid)
+                }
+                i = i + 2
+                continue
+            }
+            out = out + "$"
+            i = i + 1
+            continue
+        }
+        out = out + chr(b)
+        i = i + 1
+    }
+    return out
+}
+
+# regex_split(re, text, max_parts) -> list[str]. Split `text` at
+# every match of `re`. max_parts <= 0 means unbounded. max_parts > 0
+# caps the TOTAL number of parts (the last part is the remainder).
+#
+# Deep-scan-25 fix (MEDIUM, correctness): the zero-width branch used to
+# advance pos by one WITHOUT emitting the skipped byte, so splitting
+# "abc" on "b*" returned ['', '', '', '', ''] — the letters vanished
+# (the parts no longer concatenated back to the input). The loop now
+# keeps `last` = start of the still-unemitted segment and mirrors
+# Python re.split's zero-width rule exactly: an empty match at p emits
+# text[last..p] and moves the scan to p+1 WITHOUT consuming the byte —
+# the byte joins the NEXT segment (it is re-emitted as part of a later
+# segment, so parts + separators always reconstruct the input).
+#   regex_split(b*, "abc") -> ["", "a", "", "c", ""]   (Python parity)
+#   regex_split(x*, "abc") -> ["", "a", "b", "c", ""]
+#   regex_split(a*, "aab") -> ["", "", "b", ""]
+fn regex_split(re: Regex, text: str, max_parts: int) -> list[str] {
+    let out: list[str] = []
+    let n: int = text.len()
+    let mut last: int = 0
+    let mut pos: int = 0
+    while pos <= n {
+        if max_parts > 0 && out.len() >= max_parts - 1 {
+            out.push(text.slice(last, n))
+            return out
+        }
+        let m: Option[RegexMatch] = regex_find_from(re, text, pos)
+        if !option_is_some(m) {
+            # No more matches — push the remainder.
+            out.push(text.slice(last, n))
+            return out
+        }
+        let mv: RegexMatch = option_unwrap(m)
+        if mv.end > mv.start {
+            # Non-empty match: emit text[last..mv.start] as a part and
+            # jump past the match (the match itself is the separator).
+            out.push(text.slice(last, mv.start))
+            last = mv.end
+            pos = mv.end
+        } else {
+            # Zero-width match: emit text[last..mv.start], keep `last`
+            # at the match position and advance the SCAN by one byte —
+            # the skipped byte stays unemitted and joins the next
+            # segment (Python re.split semantics; also guarantees
+            # termination on always-empty patterns).
+            out.push(text.slice(last, mv.start))
+            last = mv.start
+            pos = mv.start + 1
+        }
+    }
+    # Scan exhausted: push whatever segment is still unemitted.
+    out.push(text.slice(last, n))
+    return out
+}
+
+# regex_find_from(re, text, pos) -> Option[RegexMatch]. Find the
+# leftmost-longest match of `re` in `text` starting the search at
+# or after position `pos`. The returned match's start is >= pos.
+fn regex_find_from(re: Regex, text: str, pos: int) -> Option[RegexMatch] {
+    let mut start: int = pos
+    let n: int = text.len()
+    while start <= n {
+        let m: Option[RegexMatch] = regex_run(re, text, start)
+        if option_is_some(m) {
+            return m
+        }
+        start = start + 1
+    }
+    return Option.None
+}
+
+# ============================================================================
+# Convenience: regex_match_to_str — debug-friendly formatting.
+# ============================================================================
+
+# regex_match_to_str(m, text) -> str. Format a RegexMatch as
+# "match[start..end, group0='...', group1='...']". For debugging.
+fn regex_match_to_str(m: RegexMatch, text: str) -> str {
+    let mut out: str = "match[" + m.start.to_str() + ".." + m.end.to_str()
+    let mut i: int = 0
+    while i < m.groups.len() {
+        let span: RegexGroupSpan = m.groups.get(i)
+        let mut s: str = ""
+        if span.start < 0 || span.end < 0 {
+            s = "<none>"
+        } else {
+            s = "'" + text.slice(span.start, span.end) + "'"
+        }
+        out = out + ", group" + i.to_str() + "=" + s
+        i = i + 1
+    }
+    out = out + "]"
+    return out
+}
+# ============================================================================
+# End of std/regex.hls
+# ============================================================================

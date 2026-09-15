@@ -1,0 +1,317 @@
+# ============================================================================
+# std/graphql/gql_sdl.hls - verbatim slice of the original std/graphql.hls
+# (lines 3619..3929), split for maintainability. Loaded via the
+# std/graphql.hls facade; not part of the public import API.
+# ============================================================================
+
+fn graphql_finish(ex: GqlExec) -> str {
+    # Data object from the root nodes.
+    let mut keys: list[str] = []
+    let mut vals: list[str] = []
+    let mut i: int = 0
+    while i < ex.nodes.len() {
+        let n: GqlNode = ex.nodes.get(i)
+        if n.parent_id == -1 {
+            keys.push(gql_selection_output_name_of_node(n))
+            vals.push(gqlx_render_node(ex, i))
+        }
+        i = i + 1
+    }
+    let mut data: str = "{"
+    let mut k: int = 0
+    while k < keys.len() {
+        if k > 0 {
+            data = data + ","
+        }
+        data = data + gql_json_quote(keys.get(k)) + ":" + vals.get(k)
+        k = k + 1
+    }
+    data = data + "}"
+    # Errors array.
+    let mut errs: str = "["
+    let mut e: int = 0
+    while e < ex.errors.len() {
+        if e > 0 {
+            errs = errs + ","
+        }
+        errs = errs + ex.errors.get(e)
+        e = e + 1
+    }
+    errs = errs + "]"
+    if ex.errors.len() == 0 {
+        return "{\"data\":" + data + "}"
+    }
+    if ex.data_failed {
+        return "{\"errors\":" + errs + "}"
+    }
+    return "{\"data\":" + data + ",\"errors\":" + errs + "}"
+}
+
+# ----------------------------------------------------------------------------
+# HTTP glue — the graphql-over-http wire forms (POST JSON body + GET
+# query string), returning plain values so the caller's trampoline
+# loop stays in charge. Pure functions of the request.
+# ----------------------------------------------------------------------------
+
+# GqlHttpRequest — the parsed GraphQL HTTP request.
+struct GqlHttpRequest {
+    query: str,
+    variables_json: str,
+    operation_name: str
+}
+
+# graphql_http_request(req) — extract {query, variables,
+# operationName} from an HttpRequest: POST bodies are JSON objects;
+# GET requests carry them as URL query parameters (url-encoded). The
+# variables VALUE is re-rendered to canonical JSON (never re-parsed
+# as GraphQL source, so variables cannot inject query syntax).
+fn graphql_http_request(req: HttpRequest) -> Result[GqlHttpRequest, str] {
+    let method: str = str_to_lower_ascii(req.method)
+    if method == "post" {
+        let body: str = req.body
+        if body.trim().len() == 0 {
+            return Result.Err("POST body is empty")
+        }
+        let pr: Result[JsonValue, str] = json_parse_result(body)
+        if result_is_err(pr) {
+            return Result.Err("POST body is not valid JSON")
+        }
+        let v: JsonValue = result_unwrap(pr)
+        if !json_is_object(v) {
+            return Result.Err("POST body must be a JSON object")
+        }
+        if !json_object_has(v, "query") {
+            return Result.Err("POST body has no 'query' field")
+        }
+        let qv: JsonValue = json_object_get(v, "query")
+        if !json_is_str(qv) {
+            return Result.Err("'query' must be a string")
+        }
+        let mut vars_json: str = "{}"
+        if json_object_has(v, "variables") {
+            let vv: JsonValue = json_object_get(v, "variables")
+            if json_is_null(vv) {
+                vars_json = "{}"
+            } else if json_is_object(vv) {
+                vars_json = json_stringify(vv)
+            } else {
+                return Result.Err("'variables' must be an object or null")
+            }
+        }
+        let mut opname: str = ""
+        if json_object_has(v, "operationName") {
+            let ov: JsonValue = json_object_get(v, "operationName")
+            if !json_is_null(ov) {
+                if !json_is_str(ov) {
+                    return Result.Err("'operationName' must be a string")
+                }
+                opname = ov.sval
+            }
+        }
+        return Result.Ok(GqlHttpRequest {
+            query: qv.sval,
+            variables_json: vars_json,
+            operation_name: opname
+        })
+    }
+    if method == "get" {
+        # Query parameters: ?query=...&variables=...&operationName=...
+        let mut qs: str = ""
+        let qi: int = req.path.find("?")
+        if qi >= 0 {
+            qs = req.path.slice(qi + 1, req.path.len())
+        }
+        if qs.len() == 0 {
+            return Result.Err("GET request has no query string")
+        }
+        let params: map[str, str] = url_query_parse(qs)
+        let q: str = params.get_or("query", "")
+        if q.len() == 0 {
+            return Result.Err("GET request has no 'query' parameter")
+        }
+        let vars_json: str = params.get_or("variables", "{}")
+        let opname: str = params.get_or("operationName", "")
+        return Result.Ok(GqlHttpRequest {
+            query: q,
+            variables_json: vars_json,
+            operation_name: opname
+        })
+    }
+    return Result.Err("GraphQL over HTTP requires GET or POST (got '"
+        + req.method + "')")
+}
+
+# graphql_http_response(body_json) — wrap a rendered GraphQL response
+# in an HttpResponse (200 + application/json).
+fn graphql_http_response(body_json: str) -> HttpResponse {
+    let resp: HttpResponse = http_response_new(200)
+    let headers: list[HttpHeader] = http_header_add(resp.headers,
+        "Content-Type", graphql_content_type())
+    resp.headers = headers
+    resp.body = body_json
+    return resp
+}
+
+# graphql_http_error(message) — a request-level error response (400 +
+# a single-entry errors array; used for parse/validation failures).
+fn graphql_http_error(message: str) -> HttpResponse {
+    let body: str = "{\"errors\":[{\"message\":"
+        + gql_json_quote(message) + "}]}"
+    let resp: HttpResponse = http_response_new(400)
+    let headers: list[HttpHeader] = http_header_add(resp.headers,
+        "Content-Type", graphql_content_type())
+    resp.headers = headers
+    resp.body = body
+    return resp
+}
+
+# ----------------------------------------------------------------------------
+# Schema export — canonical SDL printing + a JSON view for tooling.
+# The SDL printer round-trips what graphql_parse_schema accepts
+# (descriptions and directives are not preserved: directives are
+# skipped on parse, descriptions ride along on fields/types).
+# ----------------------------------------------------------------------------
+
+# graphql_schema_sdl(schema) — render the schema as canonical SDL:
+#   schema { query: Q mutation: M }
+#   type T { field(arg: Type = default): RetType ... }
+#   enum E { A B }
+#   scalar S
+# Field order, argument order, and enum value order are preserved
+# (the SDL round trip is deterministic and diff-friendly).
+fn graphql_schema_sdl(schema: GqlSchema) -> str {
+    let mut out: str = ""
+    if schema.mutation_type.len() > 0 {
+        out = out + "schema {\n  query: " + schema.query_type
+            + "\n  mutation: " + schema.mutation_type + "\n}\n\n"
+    }
+    let mut i: int = 0
+    while i < schema.types.len() {
+        let t: GqlType = schema.types.get(i)
+        if t.kind == gql_type_kind_scalar() {
+            out = out + "scalar " + t.name + "\n\n"
+        } else if t.kind == gql_type_kind_enum() {
+            out = out + "enum " + t.name + " {"
+            let mut v: int = 0
+            while v < t.enum_values.len() {
+                out = out + " " + t.enum_values.get(v)
+                v = v + 1
+            }
+            out = out + " }\n\n"
+        } else {
+            out = out + "type " + t.name + " {\n"
+            let mut f: int = 0
+            while f < t.fields.len() {
+                let fld: GqlField = t.fields.get(f)
+                out = out + "  " + fld.name
+                if fld.args.len() > 0 {
+                    out = out + "("
+                    let mut a: int = 0
+                    while a < fld.args.len() {
+                        let arg: GqlArg = fld.args.get(a)
+                        if a > 0 {
+                            out = out + ", "
+                        }
+                        out = out + arg.name + ": " + arg.type_str
+                        if arg.has_default {
+                            out = out + " = " + arg.default_json
+                        }
+                        a = a + 1
+                    }
+                    out = out + ")"
+                }
+                out = out + ": " + fld.type_str + "\n"
+                f = f + 1
+            }
+            out = out + "}\n\n"
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# graphql_schema_to_json(schema) — a JSON view of the schema for dev
+# tooling (the structural subset of introspection: type names, kinds,
+# fields with their argument types and defaults, enum values).
+fn graphql_schema_to_json(schema: GqlSchema) -> JsonValue {
+    let mut type_keys: list[str] = []
+    let mut type_vals: list[JsonValue] = []
+    let mut i: int = 0
+    while i < schema.types.len() {
+        let t: GqlType = schema.types.get(i)
+        let mut fkeys: list[str] = []
+        let mut fvals: list[JsonValue] = []
+        fkeys.push("name")
+        fvals.push(json_str(t.name))
+        fkeys.push("kind")
+        fvals.push(json_str(gql_type_kind_name(t.kind)))
+        if t.kind == gql_type_kind_object() {
+            let mut field_keys: list[str] = []
+            let mut field_vals: list[JsonValue] = []
+            let mut f: int = 0
+            while f < t.fields.len() {
+                let fld: GqlField = t.fields.get(f)
+                let mut fk: list[str] = []
+                let mut fv: list[JsonValue] = []
+                fk.push("name")
+                fv.push(json_str(fld.name))
+                fk.push("type")
+                fv.push(json_str(fld.type_str))
+                if fld.args.len() > 0 {
+                    let mut ak: list[str] = []
+                    let mut av: list[JsonValue] = []
+                    let mut a: int = 0
+                    while a < fld.args.len() {
+                        let arg: GqlArg = fld.args.get(a)
+                        let mut k1: list[str] = []
+                        let mut v1: list[JsonValue] = []
+                        k1.push("name")
+                        v1.push(json_str(arg.name))
+                        k1.push("type")
+                        v1.push(json_str(arg.type_str))
+                        if arg.has_default {
+                            k1.push("defaultValue")
+                            v1.push(json_str(arg.default_json))
+                        }
+                        ak.push(arg.name)
+                        av.push(json_object(k1, v1))
+                        a = a + 1
+                    }
+                    fk.push("args")
+                    fv.push(json_object(ak, av))
+                }
+                field_keys.push(fld.name)
+                field_vals.push(json_object(fk, fv))
+                f = f + 1
+            }
+            fkeys.push("fields")
+            fvals.push(json_object(field_keys, field_vals))
+        }
+        if t.kind == gql_type_kind_enum() {
+            let mut ek: list[str] = []
+            let mut ev: list[JsonValue] = []
+            let mut v: int = 0
+            while v < t.enum_values.len() {
+                ek.push(t.enum_values.get(v))
+                ev.push(json_str(t.enum_values.get(v)))
+                v = v + 1
+            }
+            fkeys.push("enumValues")
+            fvals.push(json_object(ek, ev))
+        }
+        type_keys.push(t.name)
+        type_vals.push(json_object(fkeys, fvals))
+        i = i + 1
+    }
+    let mut rkeys: list[str] = []
+    let mut rvals: list[JsonValue] = []
+    rkeys.push("queryType")
+    rvals.push(json_str(schema.query_type))
+    if schema.mutation_type.len() > 0 {
+        rkeys.push("mutationType")
+        rvals.push(json_str(schema.mutation_type))
+    }
+    rkeys.push("types")
+    rvals.push(json_object(type_keys, type_vals))
+    return json_object(rkeys, rvals)
+}

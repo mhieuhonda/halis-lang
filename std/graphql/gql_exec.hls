@@ -1,0 +1,1111 @@
+# ============================================================================
+# std/graphql/gql_exec.hls - verbatim slice of the original std/graphql.hls
+# (lines 2514..3618), split for maintainability. Loaded via the
+# std/graphql.hls facade; not part of the public import API.
+# ============================================================================
+
+struct GqlResolver {
+    type_name: str,
+    field_name: str,
+    handler_id: int
+}
+
+# gql_resolver_new(type_name, field_name, handler_id) — table row.
+fn gql_resolver_new(type_name: str, field_name: str, handler_id: int)
+    -> GqlResolver {
+    return GqlResolver {
+        type_name: type_name,
+        field_name: field_name,
+        handler_id: handler_id
+    }
+}
+
+# graphql_resolver_find(resolvers, type_name, field_name) — the
+# handler_id for a field, or -1 if the table has no row for it.
+fn graphql_resolver_find(resolvers: list[GqlResolver], type_name: str,
+    field_name: str) -> int {
+    let mut i: int = 0
+    while i < resolvers.len() {
+        let r: GqlResolver = resolvers.get(i)
+        if r.type_name == type_name && r.field_name == field_name {
+            return r.handler_id
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+# ----------------------------------------------------------------------------
+# The trampoline executor.
+# ----------------------------------------------------------------------------
+
+# GqlTask — one pending resolver call, handed to the caller by
+# graphql_next_task. The caller resolves it and calls
+# graphql_complete (or graphql_fail_task).
+struct GqlTask {
+    node_id: int,
+    handler_id: int,
+    type_name: str,
+    field_name: str,
+    alias: str,
+    args_json: str,
+    source_json: str
+}
+
+# gql_task_type_field(t) — "Type.field", for logging/dispatch.
+fn gql_task_type_field(t: GqlTask) -> str {
+    return t.type_name + "." + t.field_name
+}
+
+# GqlNode — the executor's tree of field values. Leaf nodes carry a
+# canonical JSON value; composite nodes carry children (spawned when
+# the resolver's value arrives). node_id doubles as the index into
+# GqlExec.nodes, so parent/child links are plain ints.
+struct GqlNode {
+    node_id: int,
+    parent_id: int,
+    parent_key: str,
+    parent_is_list: bool,
+    type_name: str,
+    field_name: str,
+    alias: str,
+    field_type: str,
+    line: int,
+    col: int,
+    is_composite: bool,
+    is_error: bool,
+    value_json: str,
+    is_list: bool,
+    list_len: int,
+    done: bool,
+    children: list[int],
+    arg_names: list[str],
+    arg_values: list[str],
+    source_json: str,
+    sub_selections: list[GqlSelection],
+    list_nulls: list[int]
+}
+
+# GqlExec — the executor state, driven by the caller's trampoline
+# loop. `tasks` is an append-only work list; `task_head` is the index
+# of the next undispatched task (a FIFO without shifting).
+struct GqlExec {
+    schema: GqlSchema,
+    doc: GqlDocument,
+    resolvers: list[GqlResolver],
+    vars: map[str, str],
+    op_kind: int,
+    op_name: str,
+    nodes: list[GqlNode],
+    tasks: list[GqlTask],
+    task_head: int,
+    errors: list[str],
+    node_count: int,
+    data_failed: bool,
+    completed: bool
+}
+
+# graphql_has_pending(ex) — true iff the trampoline loop has work.
+fn graphql_has_pending(ex: GqlExec) -> bool {
+    return ex.task_head < ex.tasks.len()
+}
+
+# graphql_pending_count(ex) — how many tasks remain (progress bars,
+# bounded-execution assertions).
+fn graphql_pending_count(ex: GqlExec) -> int {
+    return ex.tasks.len() - ex.task_head
+}
+
+# graphql_node_count(ex) — total nodes created so far (bounded by
+# graphql_max_nodes for the static part; the dynamic part — list
+# elements — is checked at spawn time and converted to field errors).
+fn graphql_node_count(ex: GqlExec) -> int {
+    return ex.nodes.len()
+}
+
+# graphql_error_count(ex) — errors collected so far.
+fn graphql_error_count(ex: GqlExec) -> int {
+    return ex.errors.len()
+}
+
+# graphql_is_completed(ex) — true once every root node is done.
+fn graphql_is_completed(ex: GqlExec) -> bool {
+    return ex.completed
+}
+
+# gqlx_error_json(message, path_json, line, col) — render one entry
+# of the "errors" array: {"message", "path", "locations"}.
+fn gqlx_error_json(message: str, path_json: str, line: int, col: int)
+    -> str {
+    return "{\"message\":" + gql_json_quote(message) + ",\"path\":"
+        + path_json + ",\"locations\":[{\"line\":" + line.to_str()
+        + ",\"column\":" + col.to_str() + "}]}"
+}
+
+# gqlx_node_path(ex, node_id) — the JSON array of the node's response
+# path: alternating output names and list indices, from the root.
+fn gqlx_node_path(ex: GqlExec, node_id: int) -> str {
+    let mut parts: list[str] = []
+    let mut cur: int = node_id
+    let mut guard: int = 0
+    while cur >= 0 && guard < graphql_max_nodes() {
+        let n: GqlNode = ex.nodes.get(cur)
+        if n.parent_is_list {
+            parts.push(n.parent_key)
+        } else {
+            parts.push(gql_json_quote(n.parent_key))
+        }
+        cur = n.parent_id
+        guard = guard + 1
+    }
+    # Reverse (parts are leaf -> root; the spec wants root -> leaf).
+    let mut out: str = "["
+    let mut i: int = parts.len() - 1
+    while i >= 0 {
+        out = out + parts.get(i)
+        if i > 0 {
+            out = out + ","
+        }
+        i = i - 1
+    }
+    return out + "]"
+}
+
+# gqlx_spawn_task(ex, node) — enqueue the resolver call for a node.
+fn gqlx_spawn_task(ex: GqlExec, node: GqlNode) -> void {
+    let handler_id: int = graphql_resolver_find(ex.resolvers,
+        node.type_name, node.field_name)
+    if handler_id < 0 {
+        # No resolver row: this is a configuration error — report it as
+        # a field error rather than crashing the executor.
+        node.is_error = true
+        node.value_json = "null"
+        node.done = true
+        ex.errors.push(gqlx_error_json(
+            "no resolver registered for field '" + node.type_name + "."
+            + node.field_name + "'", gqlx_node_path(ex, node.node_id),
+            node.line, node.col))
+        return
+    }
+    # Args JSON: defaults applied for absent arguments.
+    let mut arg_keys: list[str] = []
+    let mut arg_vals: list[str] = []
+    let ti: int = graphql_schema_find_type(ex.schema, node.type_name)
+    let fi: int = gql_field_find(ex.schema.types.get(ti).fields,
+        node.field_name)
+    let f: GqlField = ex.schema.types.get(ti).fields.get(fi)
+    let mut ai: int = 0
+    while ai < f.args.len() {
+        let a: GqlArg = f.args.get(ai)
+        let mut supplied: bool = false
+        let mut si: int = 0
+        while si < node.arg_names.len() {
+            if node.arg_names.get(si) == a.name {
+                arg_keys.push(a.name)
+                arg_vals.push(node.arg_values.get(si))
+                supplied = true
+            }
+            si = si + 1
+        }
+        if !supplied {
+            if a.has_default {
+                arg_keys.push(a.name)
+                arg_vals.push(a.default_json)
+            } else if gql_type_is_non_null(a.type_str) {
+                node.is_error = true
+                node.value_json = "null"
+                node.done = true
+                ex.errors.push(gqlx_error_json(
+                    "required argument '" + a.name + "' was not supplied",
+                    gqlx_node_path(ex, node.node_id), node.line, node.col))
+                return
+            }
+            # Nullable + no default: omitted from args_json entirely.
+        }
+        ai = ai + 1
+    }
+    let mut args_json: str = "{"
+    let mut k: int = 0
+    while k < arg_keys.len() {
+        if k > 0 {
+            args_json = args_json + ","
+        }
+        args_json = args_json + gql_json_quote(arg_keys.get(k)) + ":"
+            + arg_vals.get(k)
+        k = k + 1
+    }
+    args_json = args_json + "}"
+    # Source JSON: the parent's completed value ("" for root).
+    let source_json: str = node.source_json
+    ex.tasks.push(GqlTask {
+        node_id: node.node_id,
+        handler_id: handler_id,
+        type_name: node.type_name,
+        field_name: node.field_name,
+        alias: node.alias,
+        args_json: args_json,
+        source_json: source_json
+    })
+}
+
+# ----------------------------------------------------------------------------
+# graphql_begin — validate the operation, substitute variables, flatten
+# fragments, and seed the executor with the root-level tasks.
+# ----------------------------------------------------------------------------
+
+# gqlx_static_check(schema, doc, op) — schema-relative static
+# validation of ONE operation (fields exist, leaves are scalars,
+# composites have selection sets, arguments match). Runs BEFORE
+# variable substitution; marker values ("$!x") are skipped.
+fn gqlx_static_check(schema: GqlSchema, doc: GqlDocument,
+    op: GqlOperation) -> Result[bool, str] {
+    # Root type for the operation kind.
+    let mut root: str = schema.query_type
+    if op.kind == gql_op_mutation() {
+        root = schema.mutation_type
+        if root.len() == 0 {
+            return Result.Err("the schema has no mutation root type")
+        }
+    }
+    let root_kind: int = graphql_schema_type_kind(schema, root)
+    if root_kind != gql_type_kind_object() {
+        return Result.Err("the " + gql_op_kind_name(op.kind)
+            + " root type '" + root + "' is not an object type")
+    }
+    # Variables: declared types must exist.
+    let mut vi: int = 0
+    while vi < op.variables.len() {
+        let v: GqlVariable = op.variables.get(vi)
+        if !gql_type_exists(schema, gql_type_base(v.type_str)) {
+            return Result.Err("variable '$" + v.name + "' has unknown type '"
+                + v.type_str + "'")
+        }
+        vi = vi + 1
+    }
+    # Selections (recursively).
+    let counter: list[int] = []
+    counter.push(0)
+    let flatr: Result[list[GqlSelection], str] = gqlx_flatten(schema,
+        doc, root, op.selections, [], 1, counter)
+    if result_is_err(flatr) {
+        return Result.Err(result_err_or(flatr, "cannot flatten"))
+    }
+    let selr: Result[bool, str] = gqlx_check_selections(schema, doc,
+        root, result_unwrap(flatr), op)
+    if result_is_err(selr) {
+        return Result.Err(result_err_or(selr, "invalid selection"))
+    }
+    return Result.Ok(true)
+}
+
+# gqlx_check_selections(schema, doc, type_name, flat, op) — validate
+# flattened field selections against their type. Selections arriving
+# here are already flattened (spread/inline expanded), so every entry
+# is a field. Sub-selections are flattened per the FIELD's return type
+# before recursing.
+fn gqlx_check_selections(schema: GqlSchema, doc: GqlDocument,
+    type_name: str, flat: list[GqlSelection], op: GqlOperation)
+    -> Result[bool, str] {
+    let mut i: int = 0
+    while i < flat.len() {
+        let sel: GqlSelection = flat.get(i)
+        # __typename: always legal on a composite type, no args.
+        if sel.field_name == gql_typename_field() {
+            if sel.arg_names.len() > 0 {
+                return Result.Err("__typename accepts no arguments")
+            }
+            if sel.selections.len() > 0 {
+                return Result.Err("__typename must not have a selection set")
+            }
+            i = i + 1
+            continue
+        }
+        let fi: int = graphql_schema_field(schema, type_name,
+            sel.field_name)
+        if fi == -1 {
+            return Result.Err("cannot query field '" + sel.field_name
+                + "' on type '" + type_name + "'")
+        }
+        if fi == -3 {
+            return Result.Err("__typename handled above (unreachable)")
+        }
+        let t: GqlType = schema.types.get(
+            graphql_schema_find_type(schema, type_name))
+        let f: GqlField = t.fields.get(fi)
+        # Leaf vs composite.
+        let base: str = gql_type_base(f.type_str)
+        let base_kind: int = graphql_schema_type_kind(schema, base)
+        let want_composite: bool = base_kind == gql_type_kind_object()
+        if want_composite && sel.selections.len() == 0 {
+            return Result.Err("field '" + sel.field_name + "' of type '"
+                + f.type_str + "' must have a selection of subfields")
+        }
+        if !want_composite && sel.selections.len() > 0 {
+            return Result.Err("field '" + sel.field_name + "' of type '"
+                + f.type_str + "' must not have a selection set")
+        }
+        # Arguments.
+        let mut ai: int = 0
+        while ai < sel.arg_names.len() {
+            let an: str = sel.arg_names.get(ai)
+            let av: str = sel.arg_values.get(ai)
+            let declared: int = gql_arg_find(f.args, an)
+            if declared < 0 {
+                return Result.Err("unknown argument '" + an + "' on field '"
+                    + type_name + "." + sel.field_name + "'")
+            }
+            let a: GqlArg = f.args.get(declared)
+            # Marker (variable reference): check the variable exists.
+            if av.len() >= 2 && av.slice(0, 2) == "\"$" {
+                let inner: str = av.slice(2, av.len() - 1)
+                if inner.len() > 1 && inner.slice(0, 1) == "!" {
+                    let vname: str = inner.slice(1, inner.len())
+                    if graphql_find_variable(op, vname) < 0 {
+                        return Result.Err("variable '$" + vname
+                            + "' is not declared by the operation")
+                    }
+                }
+            } else {
+                # Concrete literal: check against the declared type.
+                let vr: Result[JsonValue, str] = json_parse_result(av)
+                if result_is_err(vr) {
+                    return Result.Err("argument '" + an + "' is not a valid"
+                        + " value")
+                }
+                let vv: JsonValue = result_unwrap(vr)
+                if !gqlx_value_matches(schema, vv, a.type_str) {
+                    return Result.Err("argument '" + an + "' value does not"
+                        + " match type '" + a.type_str + "'")
+                }
+            }
+            ai = ai + 1
+        }
+        # Non-null arguments without defaults must be supplied.
+        let mut di: int = 0
+        while di < f.args.len() {
+            let a: GqlArg = f.args.get(di)
+            if gql_type_is_non_null(a.type_str) && !a.has_default {
+                let mut supplied: bool = false
+                let mut si: int = 0
+                while si < sel.arg_names.len() {
+                    if sel.arg_names.get(si) == a.name {
+                        supplied = true
+                    }
+                    si = si + 1
+                }
+                if !supplied {
+                    return Result.Err("argument '" + a.name + "' of type '"
+                        + a.type_str + "' is required but was not supplied")
+                }
+            }
+            di = di + 1
+        }
+        # Recurse into sub-selections (flatten for the field's type).
+        if sel.selections.len() > 0 {
+            let counter: list[int] = []
+            counter.push(0)
+            let subr: Result[list[GqlSelection], str] = gqlx_flatten(
+                schema, doc, base, sel.selections, [], 2, counter)
+            if result_is_err(subr) {
+                return Result.Err(result_err_or(subr,
+                    "cannot flatten sub-selections of '" + sel.field_name
+                    + "'"))
+            }
+            let rec: Result[bool, str] = gqlx_check_selections(schema,
+                doc, base, result_unwrap(subr), op)
+            if result_is_err(rec) {
+                return Result.Err(result_err_or(rec, "invalid selection"))
+            }
+        }
+        i = i + 1
+    }
+    return Result.Ok(true)
+}
+
+# graphql_find_variable(op, name) — index of the declared variable, -1.
+fn graphql_find_variable(op: GqlOperation, name: str) -> int {
+    let mut i: int = 0
+    while i < op.variables.len() {
+        if op.variables.get(i).name == name {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+# graphql_begin(schema, doc, operation_name, variables_json, resolvers)
+# — select + validate + prepare an operation for execution. Returns
+# Result.Err(msg) for any validation failure (the caller turns it into
+# a 400-style GraphQL error response). On success the trampoline loop
+# can start: while graphql_has_pending(ex) { ... }.
+fn graphql_begin(schema: GqlSchema, doc: GqlDocument, operation_name: str,
+    variables_json: str, resolvers: list[GqlResolver])
+    -> Result[GqlExec, str] {
+    # Select the operation.
+    let mut op_idx: int = -1
+    if operation_name.len() == 0 {
+        if doc.operations.len() == 1 {
+            op_idx = 0
+        } else {
+            return Result.Err("operationName is required when the document"
+                + " contains multiple operations")
+        }
+    } else {
+        op_idx = graphql_find_operation(doc, operation_name)
+        if op_idx < 0 {
+            return Result.Err("unknown operation '" + operation_name + "'")
+        }
+    }
+    let op: GqlOperation = doc.operations.get(op_idx)
+    # Static validation (fields, types, arguments, fragments).
+    let check: Result[bool, str] = gqlx_static_check(schema, doc, op)
+    if result_is_err(check) {
+        return Result.Err(result_err_or(check, "invalid document"))
+    }
+    # Variable substitution.
+    let varsr: Result[map[str, str], str] = gqlx_substitute_vars(schema,
+        doc, op, variables_json)
+    if result_is_err(varsr) {
+        return Result.Err(result_err_or(varsr, "bad variables"))
+    }
+    let vars: map[str, str] = result_unwrap(varsr)
+    # Validate substituted values against the declared variable types.
+    let mut vi: int = 0
+    while vi < op.variables.len() {
+        let v: GqlVariable = op.variables.get(vi)
+        let val_json: str = vars.get_or(v.name, "null")
+        let valr: Result[JsonValue, str] = json_parse_result(val_json)
+        if result_is_err(valr) {
+            return Result.Err("variable '$" + v.name + "' has an invalid"
+                + " JSON value")
+        }
+        let val: JsonValue = result_unwrap(valr)
+        if !gqlx_value_matches(schema, val, v.type_str) {
+            return Result.Err("variable '$" + v.name + "' value does not"
+                + " match type '" + v.type_str + "'")
+        }
+        vi = vi + 1
+    }
+    # Unused fragments are a document error (spec rule
+    # no-unused-fragments).
+    let mut fi: int = 0
+    while fi < doc.fragments.len() {
+        let frag: GqlFragment = doc.fragments.get(fi)
+        if !gqlx_fragment_used(doc, op, frag.name) {
+            return Result.Err("fragment '..." + frag.name + "' is never"
+                + " used by the operation")
+        }
+        fi = fi + 1
+    }
+    # Build the executor.
+    let mut ex: GqlExec = GqlExec {
+        schema: schema,
+        doc: doc,
+        resolvers: resolvers,
+        vars: vars,
+        op_kind: op.kind,
+        op_name: op.name,
+        nodes: [],
+        tasks: [],
+        task_head: 0,
+        errors: [],
+        node_count: 0,
+        data_failed: false,
+        completed: false
+    }
+    # Flatten + seed the root selections.
+    let mut root: str = schema.query_type
+    if op.kind == gql_op_mutation() {
+        root = schema.mutation_type
+    }
+    let counter: list[int] = []
+    counter.push(0)
+    let flatr: Result[list[GqlSelection], str] = gqlx_flatten(schema,
+        doc, root, op.selections, [], 1, counter)
+    if result_is_err(flatr) {
+        return Result.Err(result_err_or(flatr, "cannot flatten"))
+    }
+    let flat: list[GqlSelection] = result_unwrap(flatr)
+    let mut i: int = 0
+    while i < flat.len() {
+        let sel: GqlSelection = flat.get(i)
+        let r: Result[bool, str] = gqlx_seed_node(ex, schema, doc, vars,
+            -1, gql_selection_output_name(sel), false, root, sel, "{}")
+        if result_is_err(r) {
+            return Result.Err(result_err_or(r, "cannot begin"))
+        }
+        i = i + 1
+    }
+    gqlx_check_completion(ex)
+    return Result.Ok(ex)
+}
+
+# gqlx_fragment_used(doc, op, frag_name) — true iff the operation (or
+# a fragment it transitively uses) spreads the named fragment.
+fn gqlx_fragment_used(doc: GqlDocument, op: GqlOperation, frag_name: str)
+    -> bool {
+    # Walk the operation's selections (and any fragments they spread,
+    # transitively) looking for the name.
+    let seen: list[str] = []
+    let work: list[GqlSelection] = []
+    let mut i: int = 0
+    while i < op.selections.len() {
+        work.push(op.selections.get(i))
+        i = i + 1
+    }
+    let mut guard: int = 0
+    while work.len() > 0 && guard < graphql_max_nodes() {
+        let sel: GqlSelection = work.pop()
+        if sel.kind == gql_sel_spread() {
+            if sel.fragment_name == frag_name {
+                return true
+            }
+            # Already-expanded guard (fragment cycles were rejected
+            # during flattening; this is belt-and-braces).
+            let mut s: int = 0
+            let mut known: bool = false
+            while s < seen.len() {
+                if seen.get(s) == sel.fragment_name {
+                    known = true
+                }
+                s = s + 1
+            }
+            if !known {
+                seen.push(sel.fragment_name)
+                let fi: int = graphql_find_fragment(doc, sel.fragment_name)
+                if fi >= 0 {
+                    let frag: GqlFragment = doc.fragments.get(fi)
+                    let mut j: int = 0
+                    while j < frag.selections.len() {
+                        work.push(frag.selections.get(j))
+                        j = j + 1
+                    }
+                }
+            }
+        } else if sel.kind == gql_sel_inline() {
+            let mut j: int = 0
+            while j < sel.selections.len() {
+                work.push(sel.selections.get(j))
+                j = j + 1
+            }
+        } else {
+            # Plain field: descend into its sub-selection set.
+            let mut j: int = 0
+            while j < sel.selections.len() {
+                work.push(sel.selections.get(j))
+                j = j + 1
+            }
+        }
+        guard = guard + 1
+    }
+    return false
+}
+
+# gqlx_seed_node(ex, schema, doc, vars, parent_id, parent_key,
+#                parent_is_list, type_name, sel, source_json) — create
+# one node for a flattened field selection and either resolve it
+# directly (__typename) or enqueue its resolver task. Result.Err only
+# for the dynamic node budget (converted to a field error at spawn
+# time for non-root nodes; the root path returns Err).
+fn gqlx_seed_node(ex: GqlExec, schema: GqlSchema, doc: GqlDocument,
+    vars: map[str, str], parent_id: int, parent_key: str,
+    parent_is_list: bool, type_name: str, sel: GqlSelection,
+    source_json: str) -> Result[bool, str] {
+    if ex.nodes.len() >= graphql_max_nodes() {
+        return Result.Err("node budget exceeded ("
+            + graphql_max_nodes().to_str() + ")")
+    }
+    let node_id: int = ex.nodes.len()
+    # Field type from the schema (or String for __typename).
+    let mut field_type: str = ""
+    if sel.field_name == gql_typename_field() {
+        field_type = gql_scalar_string()
+    } else {
+        let tidx: int = graphql_schema_find_type(schema, type_name)
+        let t: GqlType = schema.types.get(tidx)
+        field_type = t.fields.get(gql_field_find(t.fields,
+            sel.field_name)).type_str
+    }
+    let base: str = gql_type_base(field_type)
+    let base_kind: int = graphql_schema_type_kind(schema, base)
+    let is_composite: bool = base_kind == gql_type_kind_object()
+    # Substitute variables into the argument values NOW (rendered
+    # marker strings -> concrete JSON values).
+    let mut arg_names: list[str] = []
+    let mut arg_values: list[str] = []
+    let mut i: int = 0
+    while i < sel.arg_names.len() {
+        arg_names.push(sel.arg_names.get(i))
+        arg_values.push(gqlx_apply_vars(sel.arg_values.get(i), vars))
+        i = i + 1
+    }
+    let mut subs: list[GqlSelection] = []
+    let mut si: int = 0
+    while si < sel.selections.len() {
+        subs.push(sel.selections.get(si))
+        si = si + 1
+    }
+    let node: GqlNode = GqlNode {
+        node_id: node_id,
+        parent_id: parent_id,
+        parent_key: parent_key,
+        parent_is_list: parent_is_list,
+        type_name: type_name,
+        field_name: sel.field_name,
+        alias: sel.alias,
+        field_type: field_type,
+        line: sel.line,
+        col: sel.col,
+        is_composite: is_composite,
+        is_error: false,
+        value_json: "",
+        is_list: false,
+        list_len: 0,
+        done: false,
+        children: [],
+        arg_names: arg_names,
+        arg_values: arg_values,
+        source_json: source_json,
+        sub_selections: subs,
+        list_nulls: []
+    }
+    ex.nodes.push(node)
+    if parent_id >= 0 {
+        let parent: GqlNode = ex.nodes.get(parent_id)
+        parent.children.push(node_id)
+    }
+    # __typename resolves immediately (the executor knows the type).
+    if sel.field_name == gql_typename_field() {
+        node.value_json = gql_json_quote(type_name)
+        node.done = true
+        return Result.Ok(true)
+    }
+    gqlx_spawn_task(ex, node)
+    return Result.Ok(true)
+}
+
+# ----------------------------------------------------------------------------
+# graphql_next_task / graphql_complete / graphql_fail_task — the
+# trampoline loop primitives.
+# ----------------------------------------------------------------------------
+
+# graphql_next_task(ex) — pop the next pending resolver call. Panics
+# if none is pending (call graphql_has_pending first, mirroring
+# list.pop's panic-on-empty contract).
+fn graphql_next_task(ex: GqlExec) -> GqlTask {
+    if ex.task_head >= ex.tasks.len() {
+        panic("graphql_next_task: no pending task")
+    }
+    let t: GqlTask = ex.tasks.get(ex.task_head)
+    ex.task_head = ex.task_head + 1
+    return t
+}
+
+# graphql_complete(ex, task, value_json) — hand a resolver's value
+# back to the executor. `value_json` must be a JSON value (object,
+# array, scalar, or null) matching the field's declared type;
+# mismatches become field errors (the field renders null + an errors
+# entry) rather than panics — a buggy resolver must not take the
+# server down.
+fn graphql_complete(ex: GqlExec, task: GqlTask, value_json: str) -> void {
+    let node: GqlNode = ex.nodes.get(task.node_id)
+    # Parse + canonicalise.
+    let vr: Result[JsonValue, str] = json_parse_result(value_json)
+    if result_is_err(vr) {
+        graphql_fail_task(ex, task, "resolver returned invalid JSON: "
+            + result_err_or(vr, ""))
+        return
+    }
+    let v: JsonValue = result_unwrap(vr)
+    # Leaf fields: validate + store the canonical rendering.
+    if !node.is_composite {
+        if !gqlx_value_matches(ex.schema, v, node.field_type) {
+            graphql_fail_task(ex, task, "resolver value does not match"
+                + " field type '" + node.field_type + "'")
+            return
+        }
+        node.value_json = json_stringify(v)
+        node.done = true
+        gqlx_propagate_done(ex, node.node_id)
+        return
+    }
+    # Composite fields.
+    let nullable_t: str = gql_type_strip_non_null(node.field_type)
+    let is_list_t: bool = gql_type_is_list(nullable_t)
+    if json_is_null(v) {
+        if gql_type_is_non_null(node.field_type) {
+            graphql_fail_task(ex, task, "cannot return null for"
+                + " non-nullable field '" + node.type_name + "."
+                + node.field_name + "'")
+            return
+        }
+        node.value_json = "null"
+        node.done = true
+        gqlx_propagate_done(ex, node.node_id)
+        return
+    }
+    if is_list_t {
+        if !json_is_array(v) {
+            graphql_fail_task(ex, task, "resolver value does not match"
+                + " field type '" + node.field_type + "' (expected a list)")
+            return
+        }
+        let elem_t: str = gql_type_element(nullable_t)
+        let elem_base: str = gql_type_base(elem_t)
+        let items: list[JsonValue] = v.arr
+        node.is_list = true
+        node.list_len = items.len()
+        # Flatten the sub-selections ONCE (they are the same for every
+        # list element); validation already checked them statically.
+        let counter: list[int] = []
+        counter.push(0)
+        let subr: Result[list[GqlSelection], str] = gqlx_flatten(
+            ex.schema, ex.doc, elem_base, node.sub_selections, [], 2,
+            counter)
+        if result_is_err(subr) {
+            node.is_error = true
+            ex.errors.push(gqlx_error_json(result_err_or(subr,
+                "bad sub-selections"), gqlx_node_path(ex, node.node_id),
+                node.line, node.col))
+            node.value_json = "null"
+            node.done = true
+            gqlx_propagate_done(ex, node.node_id)
+            return
+        }
+        let flat: list[GqlSelection] = result_unwrap(subr)
+        let mut i: int = 0
+        while i < items.len() {
+            let item: JsonValue = items.get(i)
+            if json_is_null(item) {
+                if gql_type_is_non_null(elem_t) {
+                    node.is_error = true
+                    ex.errors.push(gqlx_error_json("cannot return null"
+                        + " for non-nullable list elements of field '"
+                        + node.type_name + "." + node.field_name + "'",
+                        gqlx_node_path(ex, node.node_id), node.line,
+                        node.col))
+                    break
+                }
+                # Nullable null element: renders as null in the list
+                # (no children are seeded for it — recorded so the
+                # renderer can tell it apart from an object whose
+                # flattened selections contributed nothing).
+                node.list_nulls.push(i)
+                i = i + 1
+                continue
+            }
+            if !json_is_object(item) {
+                node.is_error = true
+                ex.errors.push(gqlx_error_json("list element of field '"
+                    + node.type_name + "." + node.field_name
+                    + "' is not an object", gqlx_node_path(ex,
+                    node.node_id), node.line, node.col))
+                break
+            }
+            # Seed children for every flattened sub-selection, once per
+            # element. The element's JSON is the child's source_json.
+            let src: str = json_stringify(item)
+            let mut k: int = 0
+            let mut broke: bool = false
+            while k < flat.len() {
+                let sel: GqlSelection = flat.get(k)
+                let sr: Result[bool, str] = gqlx_seed_node(ex, ex.schema,
+                    ex.doc, ex.vars, node.node_id,
+                    i.to_str(), true, elem_base, sel, src)
+                if result_is_err(sr) {
+                    # Dynamic node budget exceeded: field error, not crash.
+                    node.is_error = true
+                    ex.errors.push(gqlx_error_json(result_err_or(sr,
+                        "node budget exceeded"), gqlx_node_path(ex,
+                        node.node_id), node.line, node.col))
+                    broke = true
+                    break
+                }
+                k = k + 1
+            }
+            if broke {
+                break
+            }
+            i = i + 1
+        }
+        if node.is_error {
+            node.value_json = "null"
+            node.done = true
+        } else if node.children.len() == 0 {
+            # Empty list (or all-null elements with no children seeded).
+            node.value_json = "[]"
+            node.done = true
+        }
+        gqlx_propagate_done(ex, node.node_id)
+        return
+    }
+    # Single object.
+    if !json_is_object(v) {
+        graphql_fail_task(ex, task, "resolver value does not match field"
+            + " type '" + node.field_type + "' (expected an object)")
+        return
+    }
+    let base: str = gql_type_base(node.field_type)
+    let counter: list[int] = []
+    counter.push(0)
+    let subr: Result[list[GqlSelection], str] = gqlx_flatten(
+        ex.schema, ex.doc, base, node.sub_selections,
+        [], 2, counter)
+    if result_is_err(subr) {
+        graphql_fail_task(ex, task, result_err_or(subr, "bad sub-selections"))
+        return
+    }
+    let flat: list[GqlSelection] = result_unwrap(subr)
+    let src: str = json_stringify(v)
+    let mut k: int = 0
+    while k < flat.len() {
+        let sel: GqlSelection = flat.get(k)
+        let sr: Result[bool, str] = gqlx_seed_node(ex, ex.schema,
+            ex.doc, ex.vars, node.node_id,
+            gql_selection_output_name(sel), false, base, sel, src)
+        if result_is_err(sr) {
+            graphql_fail_task(ex, task, result_err_or(sr,
+                "node budget exceeded"))
+            return
+        }
+        k = k + 1
+    }
+    if node.children.len() == 0 {
+        # No sub-selections (validation forbids this, but be robust):
+        # an empty object.
+        node.value_json = "{}"
+        node.done = true
+    }
+    gqlx_propagate_done(ex, node.node_id)
+}
+
+# graphql_fail_task(ex, task, message) — record a field error: the
+# field renders null and a structured entry joins "errors".
+fn graphql_fail_task(ex: GqlExec, task: GqlTask, message: str) -> void {
+    let node: GqlNode = ex.nodes.get(task.node_id)
+    node.is_error = true
+    node.value_json = "null"
+    node.done = true
+    ex.errors.push(gqlx_error_json(message,
+        gqlx_node_path(ex, node.node_id), node.line, node.col))
+    gqlx_propagate_done(ex, node.node_id)
+}
+
+# gqlx_propagate_done(ex, node_id) — mark completion upward: a node is
+# done when it is done itself and every child is done; when a parent
+# becomes done, recurse. Root completion sets ex.completed.
+fn gqlx_propagate_done(ex: GqlExec, node_id: int) -> void {
+    let mut cur: int = node_id
+    let mut guard: int = 0
+    while cur >= 0 && guard < graphql_max_nodes() {
+        let n: GqlNode = ex.nodes.get(cur)
+        if !n.done {
+            # A composite becomes done when every child is done.
+            if n.children.len() > 0 {
+                let mut all_done: bool = true
+                let mut i: int = 0
+                while i < n.children.len() {
+                    let c: GqlNode = ex.nodes.get(n.children.get(i))
+                    if !c.done {
+                        all_done = false
+                    }
+                    i = i + 1
+                }
+                if all_done {
+                    n.done = true
+                } else {
+                    return
+                }
+            } else {
+                return
+            }
+        }
+        cur = n.parent_id
+        guard = guard + 1
+    }
+    gqlx_check_completion(ex)
+}
+
+# gqlx_check_completion(ex) — completed iff every ROOT node is done.
+fn gqlx_check_completion(ex: GqlExec) -> void {
+    let mut all_done: bool = true
+    let mut i: int = 0
+    while i < ex.nodes.len() {
+        let n: GqlNode = ex.nodes.get(i)
+        if n.parent_id == -1 && !n.done {
+            all_done = false
+        }
+        i = i + 1
+    }
+    if all_done && ex.nodes.len() > 0 {
+        ex.completed = true
+    }
+}
+
+# ============================================================================
+# END OF PART D2 — executor core. Part E (render/finish, HTTP glue,
+# schema export) follows.
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# Rendering — build the response JSON from the node tree. Null
+# propagation for non-nullable parents happens HERE (render time):
+# an errored child nulls its parent only when the parent's field type
+# is non-null, cascading up to the nearest nullable ancestor.
+# ----------------------------------------------------------------------------
+
+# gqlx_render_node(ex, node_id) — render one node as a JSON value
+# string (leaf value, object, or list). Children of list nodes render
+# by index; children of object nodes render by output name.
+fn gqlx_render_node(ex: GqlExec, node_id: int) -> str {
+    let n: GqlNode = ex.nodes.get(node_id)
+    # Leaf: the canonical value the resolver produced.
+    if !n.is_composite {
+        return n.value_json
+    }
+    # List node.
+    if n.is_list {
+        if n.is_error {
+            return "null"
+        }
+        # Render each index 0..list_len; an index with no children (a
+        # null element) renders as null.
+        let mut out: str = "["
+        let mut i: int = 0
+        while i < n.list_len {
+            if i > 0 {
+                out = out + ","
+            }
+            # A recorded null index renders null; an index with
+            # children renders the element object; any OTHER index had
+            # an object value whose flattened selections contributed
+            # nothing (e.g. only mismatched fragment spreads) — an
+            # empty object, per the spec.
+            let mut is_null: bool = false
+            let mut z: int = 0
+            while z < n.list_nulls.len() {
+                if n.list_nulls.get(z) == i {
+                    is_null = true
+                }
+                z = z + 1
+            }
+            if is_null {
+                out = out + "null"
+                i = i + 1
+                continue
+            }
+            let mut rendered: bool = false
+            let mut k: int = 0
+            while k < n.children.len() {
+                let cid: int = n.children.get(k)
+                let c: GqlNode = ex.nodes.get(cid)
+                if c.parent_is_list && c.parent_key == i.to_str() {
+                    out = out + gqlx_render_element(ex, n, i)
+                    rendered = true
+                    k = n.children.len()
+                }
+                k = k + 1
+            }
+            if !rendered {
+                out = out + "{}"
+            }
+            i = i + 1
+        }
+        return out + "]"
+    }
+    # Object node.
+    if n.is_error {
+        return "null"
+    }
+    return gqlx_render_object(ex, node_id)
+}
+
+# gqlx_render_element(ex, list_node, index) — render one list element
+# object: the element's children (all sub-selections seeded for this
+# index) keyed by their output names.
+fn gqlx_render_element(ex: GqlExec, list_node: GqlNode, index: int)
+    -> str {
+    let mut keys: list[str] = []
+    let mut vals: list[str] = []
+    let mut any_error: bool = false
+    let mut k: int = 0
+    while k < list_node.children.len() {
+        let cid: int = list_node.children.get(k)
+        let c: GqlNode = ex.nodes.get(cid)
+        if c.parent_is_list && c.parent_key == index.to_str() {
+            keys.push(gql_selection_output_name_of_node(c))
+            if c.is_error && gql_type_is_non_null(c.field_type) {
+                any_error = true
+            }
+            vals.push(gqlx_render_node(ex, cid))
+        }
+        k = k + 1
+    }
+    if any_error {
+        return "null"
+    }
+    let mut out: str = "{"
+    let mut i: int = 0
+    while i < keys.len() {
+        if i > 0 {
+            out = out + ","
+        }
+        out = out + gql_json_quote(keys.get(i)) + ":" + vals.get(i)
+        i = i + 1
+    }
+    return out + "}"
+}
+
+# gqlx_render_object(ex, node_id) — render an object node's children
+# keyed by output name. If a child errored and this node's field type
+# is NON-NULL, the object itself collapses to null (propagation).
+fn gqlx_render_object(ex: GqlExec, node_id: int) -> str {
+    let n: GqlNode = ex.nodes.get(node_id)
+    let mut keys: list[str] = []
+    let mut vals: list[str] = []
+    let mut any_error: bool = false
+    let mut k: int = 0
+    while k < n.children.len() {
+        let cid: int = n.children.get(k)
+        let c: GqlNode = ex.nodes.get(cid)
+        keys.push(gql_selection_output_name_of_node(c))
+        if c.is_error && gql_type_is_non_null(c.field_type) {
+            # Non-null child failed: this object becomes null.
+            any_error = true
+        }
+        vals.push(gqlx_render_node(ex, cid))
+        k = k + 1
+    }
+    if any_error {
+        return "null"
+    }
+    let mut out: str = "{"
+    let mut i: int = 0
+    while i < keys.len() {
+        if i > 0 {
+            out = out + ","
+        }
+        out = out + gql_json_quote(keys.get(i)) + ":" + vals.get(i)
+        i = i + 1
+    }
+    return out + "}"
+}
+
+# gql_selection_output_name_of_node(n) — alias or field name of a node.
+fn gql_selection_output_name_of_node(n: GqlNode) -> str {
+    if n.alias.len() > 0 {
+        return n.alias
+    }
+    return n.field_name
+}
+
+# graphql_finish(ex) — render the full GraphQL response JSON:
+#   {"data": {...}}                         when there are no errors
+#   {"data": {...}, "errors": [...]}        with field errors
+#   {"errors": [...]}                       when execution never
+#                                           produced data (the caller
+#                                           can also detect this via
+#                                           graphql_begin's Result.Err)
+# Calling finish before every task is completed renders the partial
+# data collected so far (useful for timeouts).

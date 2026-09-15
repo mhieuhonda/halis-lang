@@ -1,0 +1,730 @@
+# ============================================================================
+# std/config/config_toml.hls - verbatim slice of the original std/config.hls
+# (lines 1059..1783), split for maintainability. Loaded via the
+# std/config.hls facade; not part of the public import API.
+# ============================================================================
+
+struct TomlParser {
+    src: str,
+    pos: int,
+    line: int,
+    col: int,
+}
+
+# ----------------------------------------------------------------------------
+# toml_peek(p) -> int — the byte at the current position, or -1 if EOF.
+# ----------------------------------------------------------------------------
+
+fn toml_peek(p: TomlParser) -> int {
+    if p.pos >= p.src.len() {
+        return -1
+    }
+    return p.src.byte_at(p.pos)
+}
+
+# toml_peek_at(p, offset) -> int — the byte at pos + offset.
+fn toml_peek_at(p: TomlParser, offset: int) -> int {
+    let idx: int = p.pos + offset
+    if idx >= p.src.len() {
+        return -1
+    }
+    return p.src.byte_at(idx)
+}
+
+# toml_advance(p) -> void — consume one byte, updating line / col.
+fn toml_advance(p: TomlParser) -> void {
+    if p.pos >= p.src.len() {
+        return
+    }
+    let b: int = p.src.byte_at(p.pos)
+    p.pos = p.pos + 1
+    if b == 10 {
+        p.line = p.line + 1
+        p.col = 1
+    } else {
+        p.col = p.col + 1
+    }
+}
+
+# toml_skip_ws(p) — skip spaces and tabs (NOT newlines).
+fn toml_skip_ws(p: TomlParser) -> void {
+    while p.pos < p.src.len() {
+        let b: int = p.src.byte_at(p.pos)
+        if b != 32 && b != 9 {
+            break
+        }
+        toml_advance(p)
+    }
+}
+
+# toml_skip_ws_and_comments(p) — skip spaces, tabs, newlines, and # comments.
+fn toml_skip_ws_and_comments(p: TomlParser) -> void {
+    while p.pos < p.src.len() {
+        let b: int = p.src.byte_at(p.pos)
+        if b == 32 || b == 9 || b == 10 || b == 13 {
+            toml_advance(p)
+            continue
+        }
+        if b == 35 {
+            # Comment — skip to end of line.
+            while p.pos < p.src.len() && p.src.byte_at(p.pos) != 10 {
+                toml_advance(p)
+            }
+            continue
+        }
+        break
+    }
+}
+
+# toml_err(p, msg) -> str — format an error message with line / column.
+fn toml_err(p: TomlParser, msg: str) -> str {
+    return "TOML parse error at line " + p.line.to_str() + ", col " + p.col.to_str()
+        + ": " + msg
+}
+
+# ----------------------------------------------------------------------------
+# toml_parse_table_header(p) -> Result[list[str], str] — parse a dotted
+# table path after the opening '['. Stops at the closing ']'.
+# ----------------------------------------------------------------------------
+
+fn toml_parse_table_header(p: TomlParser) -> Result[list[str], str] {
+    let parts: list[str] = []
+    let mut ok: bool = true
+    while ok {
+        toml_skip_ws(p)
+        let key_r: Result[str, str] = toml_parse_key(p)
+        if result_is_err(key_r) {
+            return Result.Err(result_err_or(key_r, "expected key in table header"))
+        }
+        parts.push(result_unwrap(key_r))
+        toml_skip_ws(p)
+        if toml_peek(p) == 46 {
+            toml_advance(p)  # consume '.'
+            continue
+        }
+        break
+    }
+    return Result.Ok(parts)
+}
+
+# ----------------------------------------------------------------------------
+# toml_parse_key(p) -> Result[str, str] — parse a single key (bare or quoted).
+#   bare: [a-zA-Z0-9_-]+
+#   quoted: "..." or '...'
+# ----------------------------------------------------------------------------
+
+fn toml_parse_key(p: TomlParser) -> Result[str, str] {
+    let c: int = toml_peek(p)
+    if c == 34 {
+        return Result.Ok(toml_parse_basic_string(p))
+    }
+    if c == 39 {
+        return Result.Ok(toml_parse_literal_string(p))
+    }
+    # Bare key.
+    let start: int = p.pos
+    while p.pos < p.src.len() {
+        let b: int = p.src.byte_at(p.pos)
+        let ok: bool = (b >= 65 && b <= 90) || (b >= 97 && b <= 122)
+            || (b >= 48 && b <= 57) || b == 95 || b == 45
+        if !ok {
+            break
+        }
+        toml_advance(p)
+    }
+    if p.pos == start {
+        return Result.Err(toml_err(p, "expected key (found '" + toml_char_str(toml_peek(p)) + "')"))
+    }
+    return Result.Ok(p.src.slice(start, p.pos))
+}
+
+# toml_char_str(c) — render a byte as a readable char (for error messages).
+fn toml_char_str(c: int) -> str {
+    if c == -1 {
+        return "<EOF>"
+    }
+    if c == 10 {
+        return "<newline>"
+    }
+    if c == 32 {
+        return "<space>"
+    }
+    if c == 9 {
+        return "<tab>"
+    }
+    return chr(c)
+}
+
+# ----------------------------------------------------------------------------
+# toml_parse_value(p) -> Result[ConfigValue, str] — parse a single value
+# (string / int / float / bool / array / inline-table).
+# ----------------------------------------------------------------------------
+
+fn toml_parse_value(p: TomlParser) -> Result[ConfigValue, str] {
+    let c: int = toml_peek(p)
+    if c == -1 {
+        return Result.Err(toml_err(p, "expected value, found EOF"))
+    }
+    # String.
+    if c == 34 {
+        # Basic string — check for multi-line.
+        if toml_peek_at(p, 1) == 34 && toml_peek_at(p, 2) == 34 {
+            return Result.Ok(config_str(toml_parse_multiline_basic_string(p)))
+        }
+        return Result.Ok(config_str(toml_parse_basic_string(p)))
+    }
+    if c == 39 {
+        # Literal string — check for multi-line.
+        if toml_peek_at(p, 1) == 39 && toml_peek_at(p, 2) == 39 {
+            return Result.Ok(config_str(toml_parse_multiline_literal_string(p)))
+        }
+        return Result.Ok(config_str(toml_parse_literal_string(p)))
+    }
+    # Bool.
+    if toml_starts_with_at(p, "true") {
+        let mut k: int = 0
+        while k < 4 {
+            toml_advance(p)
+            k = k + 1
+        }
+        return Result.Ok(config_bool(true))
+    }
+    if toml_starts_with_at(p, "false") {
+        let mut k: int = 0
+        while k < 5 {
+            toml_advance(p)
+            k = k + 1
+        }
+        return Result.Ok(config_bool(false))
+    }
+    # Array.
+    if c == 91 {
+        return toml_parse_array(p)
+    }
+    # Inline table.
+    if c == 123 {
+        return toml_parse_inline_table(p)
+    }
+    # Number (int or float) — could be inf / nan / hex / oct / bin.
+    return toml_parse_number(p)
+}
+
+# toml_starts_with_at(p, word) -> bool — true if the source at the
+# current position starts with `word` (case-sensitive, byte-by-byte).
+fn toml_starts_with_at(p: TomlParser, word: str) -> bool {
+    let n: int = word.len()
+    let mut i: int = 0
+    while i < n {
+        if p.pos + i >= p.src.len() {
+            return false
+        }
+        if p.src.byte_at(p.pos + i) != word.byte_at(i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+# ----------------------------------------------------------------------------
+# toml_parse_basic_string(p) -> str — parse a "..." string. Handles
+# escape sequences: \n, \t, \r, \\, \", \uXXXX, \UXXXXXXXX.
+# ----------------------------------------------------------------------------
+
+fn toml_parse_basic_string(p: TomlParser) -> str {
+    # Consume opening '".
+    toml_advance(p)
+    let out: list[str] = []
+    while p.pos < p.src.len() {
+        let b: int = p.src.byte_at(p.pos)
+        if b == 34 {
+            toml_advance(p)
+            return str_join(out, "")
+        }
+        if b == 10 {
+            # Newline in a basic string — error (but we return what we have).
+            return str_join(out, "")
+        }
+        if b == 92 {
+            toml_advance(p)
+            let esc: int = toml_peek(p)
+            if esc == 110 {
+                out.push("\n")
+                toml_advance(p)
+            } else if esc == 116 {
+                out.push("\t")
+                toml_advance(p)
+            } else if esc == 114 {
+                out.push(chr(13))
+                toml_advance(p)
+            } else if esc == 92 {
+                out.push("\\")
+                toml_advance(p)
+            } else if esc == 34 {
+                out.push("\"")
+                toml_advance(p)
+            } else if esc == 39 {
+                out.push("'")
+                toml_advance(p)
+            } else if esc == 98 {
+                out.push(chr(8))
+                toml_advance(p)
+            } else if esc == 102 {
+                out.push(chr(12))
+                toml_advance(p)
+            } else if esc == 48 {
+                out.push(chr(0))
+                toml_advance(p)
+            } else if esc == 117 {
+                # \uXXXX
+                toml_advance(p)
+                let hex: str = toml_take_n(p, 4)
+                out.push(chr(toml_parse_hex(hex)))
+            } else if esc == 85 {
+                # \UXXXXXXXX
+                toml_advance(p)
+                let hex: str = toml_take_n(p, 8)
+                out.push(chr(toml_parse_hex(hex)))
+            } else {
+                # Unknown escape — emit as-is.
+                out.push(chr(esc))
+                toml_advance(p)
+            }
+            continue
+        }
+        out.push(p.src.slice(p.pos, p.pos + 1))
+        toml_advance(p)
+    }
+    return str_join(out, "")
+}
+
+# toml_take_n(p, n) -> str — take the next n bytes as a str (advancing pos).
+fn toml_take_n(p: TomlParser, n: int) -> str {
+    let start: int = p.pos
+    let mut k: int = 0
+    while k < n && p.pos < p.src.len() {
+        toml_advance(p)
+        k = k + 1
+    }
+    return p.src.slice(start, p.pos)
+}
+
+# toml_parse_hex(s) -> int — parse a hex string (no 0x prefix).
+fn toml_parse_hex(s: str) -> int {
+    let mut v: int = 0
+    let mut i: int = 0
+    while i < s.len() {
+        let b: int = s.byte_at(i)
+        let d: int = toml_hex_digit(b)
+        v = v * 16 + d
+        i = i + 1
+    }
+    return v
+}
+
+fn toml_hex_digit(b: int) -> int {
+    if b >= 48 && b <= 57 {
+        return b - 48
+    }
+    if b >= 65 && b <= 70 {
+        return b - 55
+    }
+    if b >= 97 && b <= 102 {
+        return b - 87
+    }
+    return 0
+}
+
+# ----------------------------------------------------------------------------
+# toml_parse_literal_string(p) -> str — parse a '...' string (no escapes).
+# ----------------------------------------------------------------------------
+
+fn toml_parse_literal_string(p: TomlParser) -> str {
+    toml_advance(p)  # consume opening '.
+    let start: int = p.pos
+    while p.pos < p.src.len() {
+        let b: int = p.src.byte_at(p.pos)
+        if b == 39 {
+            let s: str = p.src.slice(start, p.pos)
+            toml_advance(p)
+            return s
+        }
+        if b == 10 {
+            return p.src.slice(start, p.pos)
+        }
+        toml_advance(p)
+    }
+    return p.src.slice(start, p.pos)
+}
+
+# ----------------------------------------------------------------------------
+# toml_parse_multiline_basic_string(p) -> str — parse a """...""" string.
+# A leading newline immediately after the opening """ is trimmed (the TOML
+# convention). Escapes are processed (same as basic strings). A line ending
+# with a backslash becomes a line continuation (the newline is dropped).
+# ----------------------------------------------------------------------------
+
+fn toml_parse_multiline_basic_string(p: TomlParser) -> str {
+    # Consume the opening """.
+    toml_advance(p)
+    toml_advance(p)
+    toml_advance(p)
+    # Trim a leading newline.
+    if p.pos < p.src.len() && p.src.byte_at(p.pos) == 10 {
+        toml_advance(p)
+    }
+    let out: list[str] = []
+    while p.pos < p.src.len() {
+        # Check for closing """.
+        if toml_peek(p) == 34 && toml_peek_at(p, 1) == 34 && toml_peek_at(p, 2) == 34 {
+            toml_advance(p)
+            toml_advance(p)
+            toml_advance(p)
+            return str_join(out, "")
+        }
+        let b: int = p.src.byte_at(p.pos)
+        if b == 92 {
+            # Escape — same as basic string.
+            toml_advance(p)
+            let esc: int = toml_peek(p)
+            if esc == 110 {
+                out.push("\n")
+                toml_advance(p)
+            } else if esc == 116 {
+                out.push("\t")
+                toml_advance(p)
+            } else if esc == 114 {
+                out.push(chr(13))
+                toml_advance(p)
+            } else if esc == 92 {
+                out.push("\\")
+                toml_advance(p)
+            } else if esc == 34 {
+                out.push("\"")
+                toml_advance(p)
+            } else if esc == 10 {
+                # Line continuation — consume the newline and any
+                # leading whitespace on the next line.
+                toml_advance(p)
+                while p.pos < p.src.len() {
+                    let wb: int = p.src.byte_at(p.pos)
+                    if wb != 32 && wb != 9 && wb != 10 && wb != 13 {
+                        break
+                    }
+                    toml_advance(p)
+                }
+            } else {
+                out.push(chr(esc))
+                toml_advance(p)
+            }
+            continue
+        }
+        out.push(p.src.slice(p.pos, p.pos + 1))
+        toml_advance(p)
+    }
+    return str_join(out, "")
+}
+
+# ----------------------------------------------------------------------------
+# toml_parse_multiline_literal_string(p) -> str — parse a '''...''' string.
+# No escapes; a leading newline is trimmed.
+# ----------------------------------------------------------------------------
+
+fn toml_parse_multiline_literal_string(p: TomlParser) -> str {
+    toml_advance(p)
+    toml_advance(p)
+    toml_advance(p)
+    if p.pos < p.src.len() && p.src.byte_at(p.pos) == 10 {
+        toml_advance(p)
+    }
+    let start: int = p.pos
+    while p.pos < p.src.len() {
+        if toml_peek(p) == 39 && toml_peek_at(p, 1) == 39 && toml_peek_at(p, 2) == 39 {
+            let s: str = p.src.slice(start, p.pos)
+            toml_advance(p)
+            toml_advance(p)
+            toml_advance(p)
+            return s
+        }
+        toml_advance(p)
+    }
+    return p.src.slice(start, p.pos)
+}
+
+# ----------------------------------------------------------------------------
+# toml_parse_array(p) -> Result[ConfigValue, str] — parse an array of scalars.
+# ----------------------------------------------------------------------------
+
+fn toml_parse_array(p: TomlParser) -> Result[ConfigValue, str] {
+    toml_advance(p)  # consume '['.
+    let items: list[ConfigValue] = []
+    while p.pos < p.src.len() {
+        toml_skip_ws_and_comments(p)
+        if toml_peek(p) == 93 {
+            toml_advance(p)
+            return Result.Ok(config_array(items))
+        }
+        let val_r: Result[ConfigValue, str] = toml_parse_value(p)
+        if result_is_err(val_r) {
+            return Result.Err(result_err_or(val_r, "array element parse failed"))
+        }
+        items.push(result_unwrap(val_r))
+        toml_skip_ws_and_comments(p)
+        if toml_peek(p) == 44 {
+            toml_advance(p)  # consume ','.
+            continue
+        }
+        if toml_peek(p) == 93 {
+            toml_advance(p)
+            return Result.Ok(config_array(items))
+        }
+        return Result.Err(toml_err(p, "expected ',' or ']' in array"))
+    }
+    return Result.Err(toml_err(p, "unterminated array"))
+}
+
+# ----------------------------------------------------------------------------
+# toml_parse_inline_table(p) -> Result[ConfigValue, str] — parse {a = 1, b = 2}.
+# ----------------------------------------------------------------------------
+
+fn toml_parse_inline_table(p: TomlParser) -> Result[ConfigValue, str] {
+    toml_advance(p)  # consume '{'.
+    let keys: list[str] = []
+    let vals: list[ConfigValue] = []
+    while p.pos < p.src.len() {
+        toml_skip_ws(p)
+        if toml_peek(p) == 125 {
+            toml_advance(p)
+            return Result.Ok(config_table(keys, vals))
+        }
+        let key_r: Result[str, str] = toml_parse_key(p)
+        if result_is_err(key_r) {
+            return Result.Err(result_err_or(key_r, "inline-table key parse failed"))
+        }
+        toml_skip_ws(p)
+        if toml_peek(p) != 61 {
+            return Result.Err(toml_err(p, "expected '=' in inline table"))
+        }
+        toml_advance(p)
+        toml_skip_ws(p)
+        let val_r: Result[ConfigValue, str] = toml_parse_value(p)
+        if result_is_err(val_r) {
+            return Result.Err(result_err_or(val_r, "inline-table value parse failed"))
+        }
+        keys.push(result_unwrap(key_r))
+        vals.push(result_unwrap(val_r))
+        toml_skip_ws(p)
+        if toml_peek(p) == 44 {
+            toml_advance(p)  # consume ','.
+            continue
+        }
+        if toml_peek(p) == 125 {
+            toml_advance(p)
+            return Result.Ok(config_table(keys, vals))
+        }
+        return Result.Err(toml_err(p, "expected ',' or '}' in inline table"))
+    }
+    return Result.Err(toml_err(p, "unterminated inline table"))
+}
+
+# ----------------------------------------------------------------------------
+# toml_parse_number(p) -> Result[ConfigValue, str] — parse an int or float.
+#   - inf, +inf, -inf -> float
+#   - nan, +nan, -nan -> float
+#   - 0x..., 0o..., 0b... -> int
+#   - 1_000, -1_000, +1_000 -> int (underscores ignored)
+#   - 1.0, -2.5, 3.14e10, +6.022e23 -> float
+# ----------------------------------------------------------------------------
+
+fn toml_parse_number(p: TomlParser) -> Result[ConfigValue, str] {
+    let start: int = p.pos
+    # Handle sign.
+    if toml_peek(p) == 43 || toml_peek(p) == 45 {
+        toml_advance(p)
+    }
+    # Check for inf / nan.
+    if toml_starts_with_at(p, "inf") {
+        let mut k: int = 0
+        while k < 3 {
+            toml_advance(p)
+            k = k + 1
+        }
+        let raw: str = p.src.slice(start, p.pos)
+        # to_float on "inf" / "-inf" / "+inf" should produce inf / -inf.
+        return Result.Ok(config_float(raw.to_float()))
+    }
+    if toml_starts_with_at(p, "nan") {
+        let mut k: int = 0
+        while k < 3 {
+            toml_advance(p)
+            k = k + 1
+        }
+        return Result.Ok(config_float(0.0 / 0.0))
+    }
+    # Check for hex / oct / bin prefix.
+    if toml_peek(p) == 48 {
+        let next: int = toml_peek_at(p, 1)
+        if next == 120 || next == 88 {
+            # Hex.
+            toml_advance(p)
+            toml_advance(p)
+            let hex_start: int = p.pos
+            while p.pos < p.src.len() {
+                let b: int = p.src.byte_at(p.pos)
+                let ok: bool = (b >= 48 && b <= 57) || (b >= 65 && b <= 70)
+                    || (b >= 97 && b <= 102) || b == 95
+                if !ok {
+                    break
+                }
+                toml_advance(p)
+            }
+            let hex_str: str = toml_strip_underscores(p.src.slice(hex_start, p.pos))
+            return Result.Ok(config_int(toml_parse_hex(hex_str)))
+        }
+        if next == 111 {
+            # Octal.
+            toml_advance(p)
+            toml_advance(p)
+            let oct_start: int = p.pos
+            while p.pos < p.src.len() {
+                let b: int = p.src.byte_at(p.pos)
+                if (b < 48 || b > 55) && b != 95 {
+                    break
+                }
+                toml_advance(p)
+            }
+            let oct_str: str = toml_strip_underscores(p.src.slice(oct_start, p.pos))
+            return Result.Ok(config_int(toml_parse_oct(oct_str)))
+        }
+        if next == 98 {
+            # Binary.
+            toml_advance(p)
+            toml_advance(p)
+            let bin_start: int = p.pos
+            while p.pos < p.src.len() {
+                let b: int = p.src.byte_at(p.pos)
+                if (b != 48 && b != 49) && b != 95 {
+                    break
+                }
+                toml_advance(p)
+            }
+            let bin_str: str = toml_strip_underscores(p.src.slice(bin_start, p.pos))
+            return Result.Ok(config_int(toml_parse_bin(bin_str)))
+        }
+    }
+    # Decimal int or float — scan digits, underscores, '.', 'e', '+'/'-'.
+    let mut seen_dot: bool = false
+    let mut seen_e: bool = false
+    while p.pos < p.src.len() {
+        let b: int = p.src.byte_at(p.pos)
+        if b >= 48 && b <= 57 {
+            toml_advance(p)
+            continue
+        }
+        if b == 95 {
+            toml_advance(p)
+            continue
+        }
+        if b == 46 && !seen_dot && !seen_e {
+            seen_dot = true
+            toml_advance(p)
+            continue
+        }
+        if (b == 101 || b == 69) && !seen_e {
+            seen_e = true
+            toml_advance(p)
+            if toml_peek(p) == 43 || toml_peek(p) == 45 {
+                toml_advance(p)
+            }
+            continue
+        }
+        break
+    }
+    let raw: str = toml_strip_underscores(p.src.slice(start, p.pos))
+    if seen_dot || seen_e {
+        let r: Result[float, str] = float_parse(raw)
+        if result_is_err(r) {
+            return Result.Err(toml_err(p, "invalid float '" + raw + "'"))
+        }
+        return Result.Ok(config_float(result_unwrap(r)))
+    }
+    let r: Result[int, str] = int_parse(raw)
+    if result_is_err(r) {
+        return Result.Err(toml_err(p, "invalid int '" + raw + "'"))
+    }
+    return Result.Ok(config_int(result_unwrap(r)))
+}
+
+fn toml_strip_underscores(s: str) -> str {
+    let parts: list[str] = s.split("_")
+    return str_join(parts, "")
+}
+
+fn toml_parse_oct(s: str) -> int {
+    let mut v: int = 0
+    let mut i: int = 0
+    while i < s.len() {
+        let d: int = s.byte_at(i) - 48
+        v = v * 8 + d
+        i = i + 1
+    }
+    return v
+}
+
+fn toml_parse_bin(s: str) -> int {
+    let mut v: int = 0
+    let mut i: int = 0
+    while i < s.len() {
+        let d: int = s.byte_at(i) - 48
+        v = v * 2 + d
+        i = i + 1
+    }
+    return v
+}
+
+# ----------------------------------------------------------------------------
+# toml_ensure_path(root, path) -> void — ensure the dotted path exists
+# in `root`, creating intermediate tables as needed.
+# ----------------------------------------------------------------------------
+
+fn toml_ensure_path(root: ConfigValue, path: list[str]) -> void {
+    let mut cur: ConfigValue = root
+    let mut i: int = 0
+    while i < path.len() {
+        let seg: str = path.get(i)
+        let idx: int = config_table_find(cur, seg)
+        if idx < 0 {
+            let new_tbl: ConfigValue = config_table([], [])
+            cur.table_keys.push(seg)
+            cur.table_vals.push(new_tbl)
+            cur = new_tbl
+        } else {
+            let next: ConfigValue = cur.table_vals.get(idx)
+            if next.kind != config_kind_table() {
+                let new_tbl: ConfigValue = config_table([], [])
+                cur.table_vals.set(idx, new_tbl)
+                cur = new_tbl
+            } else {
+                cur = next
+            }
+        }
+        i = i + 1
+    }
+}
+
+fn toml_path_append(path: list[str], key: str) -> list[str] {
+    let out: list[str] = []
+    let mut i: int = 0
+    while i < path.len() {
+        out.push(path.get(i))
+        i = i + 1
+    }
+    out.push(key)
+    return out
+}
+
+# ============================================================================
+# Serialisation — config_serialize(cfg) -> str. Renders the config as
+# TOML (the canonical form). Used by `config_dump` (debug) and by
+# `hls-cli config init` (generate a starter config file).
+# ============================================================================

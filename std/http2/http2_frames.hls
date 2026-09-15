@@ -1,0 +1,500 @@
+# ============================================================================
+# std/http2/http2_frames.hls - verbatim slice of the original std/http2.hls
+# (lines 153..646), split for maintainability. Loaded via the
+# std/http2.hls facade; not part of the public import API.
+# ============================================================================
+
+# ============================================================================
+# Constants — frame types (RFC 7540 §6).
+#
+# HTTP/2 frame types are 8-bit integers. We expose them as named
+# functions returning int (HLS has no const) so callers can write
+# `http2_frame_type_data()` instead of `0`. The set is fixed by
+# the RFC; future RFCs (e.g. HTTP/3) do NOT add to this list
+# (HTTP/3 uses QUIC streams, not HTTP/2 frames).
+# ============================================================================
+
+fn http2_frame_type_data() -> int { return 0 }
+fn http2_frame_type_headers() -> int { return 1 }
+fn http2_frame_type_priority() -> int { return 2 }
+fn http2_frame_type_rst_stream() -> int { return 3 }
+fn http2_frame_type_settings() -> int { return 4 }
+fn http2_frame_type_push_promise() -> int { return 5 }
+fn http2_frame_type_ping() -> int { return 6 }
+fn http2_frame_type_goaway() -> int { return 7 }
+fn http2_frame_type_window_update() -> int { return 8 }
+fn http2_frame_type_continuation() -> int { return 9 }
+
+# Frame type name (for diagnostics). Returns "UNKNOWN" for an
+# unrecognised type — RFC 7540 §5.5 says implementations MUST
+# ignore unknown frame types, so the parser does NOT reject them
+# (it returns the frame with the type field set; the caller decides
+# whether to act or skip). The name function is for human-readable
+# logging only.
+fn http2_frame_type_name(t: int) -> str {
+    if t == 0 { return "DATA" }
+    if t == 1 { return "HEADERS" }
+    if t == 2 { return "PRIORITY" }
+    if t == 3 { return "RST_STREAM" }
+    if t == 4 { return "SETTINGS" }
+    if t == 5 { return "PUSH_PROMISE" }
+    if t == 6 { return "PING" }
+    if t == 7 { return "GOAWAY" }
+    if t == 8 { return "WINDOW_UPDATE" }
+    if t == 9 { return "CONTINUATION" }
+    return "UNKNOWN"
+}
+
+# ============================================================================
+# Constants — frame flags (RFC 7540 §6).
+#
+# Each frame type defines its own flag bits; we expose the common
+# ones (END_STREAM, ACK, END_HEADERS, PADDED, PRIORITY) by name.
+# Reserved bits (1 << 6, 1 << 7) MUST be ignored on receive and
+# left as 0 on send (RFC 7540 §4.1).
+# ============================================================================
+
+fn http2_flag_end_stream() -> int { return 1 }
+fn http2_flag_ack() -> int { return 1 }
+fn http2_flag_end_headers() -> int { return 4 }
+fn http2_flag_padded() -> int { return 8 }
+fn http2_flag_priority() -> int { return 32 }
+
+# ============================================================================
+# Constants — error codes (RFC 7540 §7).
+# ============================================================================
+
+fn http2_err_no_error() -> int { return 0 }
+fn http2_err_protocol_error() -> int { return 1 }
+fn http2_err_internal_error() -> int { return 2 }
+fn http2_err_flow_control_error() -> int { return 3 }
+fn http2_err_settings_timeout() -> int { return 4 }
+fn http2_err_stream_closed() -> int { return 5 }
+fn http2_err_frame_size_error() -> int { return 6 }
+fn http2_err_refused_stream() -> int { return 7 }
+fn http2_err_cancel() -> int { return 8 }
+fn http2_err_compression_error() -> int { return 9 }
+fn http2_err_connect_error() -> int { return 10 }
+fn http2_err_enhance_your_calm() -> int { return 11 }
+fn http2_err_inadequate_security() -> int { return 12 }
+fn http2_err_http_1_1_required() -> int { return 13 }
+
+# Error code name (for diagnostics).
+fn http2_err_name(c: int) -> str {
+    if c == 0 { return "NO_ERROR" }
+    if c == 1 { return "PROTOCOL_ERROR" }
+    if c == 2 { return "INTERNAL_ERROR" }
+    if c == 3 { return "FLOW_CONTROL_ERROR" }
+    if c == 4 { return "SETTINGS_TIMEOUT" }
+    if c == 5 { return "STREAM_CLOSED" }
+    if c == 6 { return "FRAME_SIZE_ERROR" }
+    if c == 7 { return "REFUSED_STREAM" }
+    if c == 8 { return "CANCEL" }
+    if c == 9 { return "COMPRESSION_ERROR" }
+    if c == 10 { return "CONNECT_ERROR" }
+    if c == 11 { return "ENHANCE_YOUR_CALM" }
+    if c == 12 { return "INADEQUATE_SECURITY" }
+    if c == 13 { return "HTTP_1_1_REQUIRED" }
+    return "UNKNOWN_ERROR"
+}
+
+# ============================================================================
+# Constants — SETTINGS parameter IDs (RFC 7540 §6.5.2).
+# ============================================================================
+
+fn http2_settings_header_table_size() -> int { return 1 }
+fn http2_settings_enable_push() -> int { return 2 }
+fn http2_settings_max_concurrent_streams() -> int { return 3 }
+fn http2_settings_initial_window_size() -> int { return 4 }
+fn http2_settings_max_frame_size() -> int { return 5 }
+fn http2_settings_max_header_list_size() -> int { return 6 }
+
+# ============================================================================
+# Limits (RFC 7540 defaults).
+# ============================================================================
+
+# http2_default_header_table_size: the default size of the HPACK
+# dynamic table, in bytes. RFC 7541 §4.2 sets this to 4096. A peer
+# can shrink it via SETTINGS HEADER_TABLE_SIZE (a smaller value
+# forces the receiver to evict entries; a larger value is granted
+# only if the receiver's own SETTINGS allows it).
+fn http2_default_header_table_size() -> int { return 4096 }
+
+# http2_default_initial_window_size: the default per-stream flow
+# control window. RFC 7540 §6.5.2 sets this to 65535. A peer can
+# raise it via SETTINGS INITIAL_WINDOW_SIZE (max 2^31 - 1).
+fn http2_default_initial_window_size() -> int { return 65535 }
+
+# http2_default_max_frame_size: the default maximum payload of a
+# single frame. RFC 7540 §6.5.2 sets this to 16384 (16 KiB). A
+# peer can raise it via SETTINGS MAX_FRAME_SIZE (max 16777215,
+# i.e. 16 MiB).
+fn http2_default_max_frame_size() -> int { return 16384 }
+
+# http2_max_allowed_frame_size: the absolute maximum value of
+# MAX_FRAME_SIZE that a peer can request (RFC 7540 §6.5.2).
+fn http2_max_allowed_frame_size() -> int { return 16777215 }
+
+# http2_max_frame_payload: the upper bound the parser will accept
+# (matches the RFC absolute max — peers that try to send a frame
+# larger than this get FRAME_SIZE_ERROR). This is the absolute
+# cap; the per-connection negotiated MAX_FRAME_SIZE may be smaller.
+fn http2_max_frame_payload() -> int { return 16777215 }
+
+# http2_max_header_list_size: the default cap on the total size of
+# a decoded header list (sum of name + value lengths + 32 bytes
+# overhead per header, per RFC 7540 §10.5.1). A peer that sends
+# a header block that decodes to more than this is rejected with
+# PROTOCOL_ERROR (defends against header-based DoS — see CVE-
+# 2018-1000008 in nghttp2 for an analogous advisory).
+fn http2_max_header_list_size() -> int { return 1048576 }
+
+# http2_connection_preface: the 24-byte magic string every HTTP/2
+# client sends as the first bytes of a connection (RFC 7540 §3.5).
+# Used by `http2_recv_preface` to verify the client speaks HTTP/2
+# (rejects HTTP/1.x clients that try to send a request line).
+fn http2_connection_preface() -> str {
+    return "PRI * HTTP/2.0" + http_crlf() + http_crlf() + "SM" + http_crlf() + http_crlf()
+}
+
+# http2_alpn_h2: the ALPN token for HTTP/2 over TLS (RFC 7540
+# §9.2). Pass this string to a TLS layer that supports ALPN
+# negotiation (e.g. libssl, libcurl, or a future Stage 65
+# std.tls module). The TLS handshake will negotiate this token
+# iff the server also speaks HTTP/2; otherwise the handshake
+# either falls back to HTTP/1.1 over TLS or fails.
+fn http2_alpn_h2() -> str { return "h2" }
+
+# http2_alpn_h2c: the ALPN token for HTTP/2 over cleartext
+# (RFC 7540 §3.2 — used with the Upgrade: h2c header). h2c is
+# NOT a valid ALPN token (ALPN is TLS-only); the "h2c" string
+# is used in the Upgrade header and the HTTP2-Settings header
+# of the Upgrade request.
+fn http2_alpn_h2c() -> str { return "h2c" }
+
+# ============================================================================
+# Data types — Http2Frame.
+#
+# The frame header is 9 bytes (RFC 7540 §4.1):
+#
+#   +-----------------------------------------------+
+#   |                 Length (24)                   |
+#   +---------------+---------------+---------------+
+#   |   Type (8)    |   Flags (8)   |
+#   +-+-------------+---------------+-------------------------------+
+#   |R|                 Stream Identifier (31)                     |
+#   +-+-------------------------------------------------------------+
+#
+# HLS has no 24-bit or 31-bit type — we store the length as int
+# (which is 64-bit), the type as int, the flags as int, and the
+# stream id as int (with the reserved R bit stripped on decode and
+# set to 0 on encode). The payload is a str (byte buffer).
+# ============================================================================
+
+struct Http2Frame {
+    length: int,
+    frame_type: int,
+    flags: int,
+    stream_id: int,
+    payload: str
+}
+
+# http2_frame_new(t, flags, stream_id, payload) — construct a frame
+# with the length field auto-computed from the payload length.
+fn http2_frame_new(frame_type: int, flags: int, stream_id: int, payload: str) -> Http2Frame {
+    return Http2Frame {
+        length: payload.len(),
+        frame_type: frame_type,
+        flags: flags,
+        stream_id: stream_id,
+        payload: payload
+    }
+}
+
+# ============================================================================
+# 24-bit length / 31-bit stream id helpers.
+#
+# HLS's int is 64-bit signed. We use arithmetic equivalents of the
+# bit operations (x % 256 for the low byte, (x / 256) % 256 for the
+# middle byte, etc.) and `std.bits` for the native-backed bitwise
+# builtins where the performance matters (frame parsing is hot —
+# every byte of an HTTP/2 connection goes through here).
+#
+# Length encoding (24-bit, big-endian):
+#   byte 0: (length / 65536) % 256   (high byte)
+#   byte 1: (length / 256)   % 256   (middle byte)
+#   byte 2:  length           % 256   (low byte)
+#
+# Stream id encoding (31-bit, big-endian, with reserved R bit at
+# position 32 — always 0 on send, ignored on receive):
+#   byte 0: (stream_id / 16777216) % 256   (high byte)
+#   byte 1: (stream_id / 65536)    % 256
+#   byte 2: (stream_id / 256)      % 256
+#   byte 3:  stream_id              % 256   (low byte)
+# ============================================================================
+
+# http2_encode_length_24(length) -> 3-byte str (big-endian).
+fn http2_encode_length_24(length: int) -> str {
+    let b0: int = (length / 65536) % 256
+    let b1: int = (length / 256) % 256
+    let b2: int = length % 256
+    return chr(b0) + chr(b1) + chr(b2)
+}
+
+# http2_decode_length_24(s) -> int. Reads 3 bytes from the start of
+# s. Caller must ensure s.len() >= 3.
+fn http2_decode_length_24(s: str) -> int {
+    let b0: int = s.byte_at(0)
+    let b1: int = s.byte_at(1)
+    let b2: int = s.byte_at(2)
+    return b0 * 65536 + b1 * 256 + b2
+}
+
+# http2_encode_stream_id_31(stream_id) -> 4-byte str (big-endian,
+# high bit cleared — the R bit is always 0 on send).
+fn http2_encode_stream_id_31(stream_id: int) -> str {
+    # Mask to 31 bits (clear the R bit at position 32). The
+    # int_and with 0x7FFFFFFF is the canonical way; bits_and with
+    # the bit pattern would also work but is slower.
+    let masked: int = int_and(stream_id, 2147483647)
+    let b0: int = (masked / 16777216) % 256
+    let b1: int = (masked / 65536) % 256
+    let b2: int = (masked / 256) % 256
+    let b3: int = masked % 256
+    return chr(b0) + chr(b1) + chr(b2) + chr(b3)
+}
+
+# http2_decode_stream_id_31(s) -> int. Reads 4 bytes from the start
+# of s, masks off the R bit. Caller must ensure s.len() >= 4.
+fn http2_decode_stream_id_31(s: str) -> int {
+    let b0: int = s.byte_at(0)
+    let b1: int = s.byte_at(1)
+    let b2: int = s.byte_at(2)
+    let b3: int = s.byte_at(3)
+    let raw: int = b0 * 16777216 + b1 * 65536 + b2 * 256 + b3
+    return int_and(raw, 2147483647)
+}
+
+# ============================================================================
+# Frame parser — http2_parse_frame(s) -> Result[Http2Frame, str].
+#
+# Parses ONE frame from the start of s. The first 9 bytes are the
+# frame header; the remaining `length` bytes are the payload.
+#
+# Returns:
+#   Result.Ok(frame)       on success (frame.length = payload.len()).
+#   Result.Err(msg)        on a parse error (frame header too short,
+#                          payload shorter than declared length,
+#                          length > max_frame_payload).
+#
+# Does NOT enforce semantic rules (frame type vs flags, stream id
+# parity, etc.) — that's the connection layer's job. The parser is
+# a pure wire-format decoder.
+# ============================================================================
+
+fn http2_parse_frame(s: str) -> Result[Http2Frame, str] {
+    if s.len() < 9 {
+        return Result.Err("http2_parse_frame: short header (got "
+            + s.len().to_str() + " bytes, need 9)")
+    }
+    let length: int = http2_decode_length_24(s)
+    if length > http2_max_frame_payload() {
+        return Result.Err("http2_parse_frame: payload too large ("
+            + length.to_str() + " > max "
+            + http2_max_frame_payload().to_str() + ")")
+    }
+    let frame_type: int = s.byte_at(3)
+    let flags: int = s.byte_at(4)
+    let stream_id: int = http2_decode_stream_id_31(s.slice(5, 9))
+    if s.len() < 9 + length {
+        return Result.Err("http2_parse_frame: short payload (have "
+            + (s.len() - 9).to_str() + " bytes, need "
+            + length.to_str() + ")")
+    }
+    let payload: str = s.slice(9, 9 + length)
+    return Result.Ok(Http2Frame {
+        length: length,
+        frame_type: frame_type,
+        flags: flags,
+        stream_id: stream_id,
+        payload: payload
+    })
+}
+
+# http2_serialize_frame(f) -> str. Produces the canonical 9-byte
+# header + payload wire format. The output is byte-identical
+# between the interpreter and the native binary (pure function,
+# no I/O).
+fn http2_serialize_frame(f: Http2Frame) -> str {
+    let header: str = http2_encode_length_24(f.length)
+        + chr(f.frame_type)
+        + chr(f.flags)
+        + http2_encode_stream_id_31(f.stream_id)
+    return header + f.payload
+}
+
+# ============================================================================
+# SETTINGS frame — Http2Settings struct + encode/decode.
+#
+# The SETTINGS frame (RFC 7540 §6.5) carries configuration
+# parameters as a sequence of 6-byte pairs: 2-byte ID (big-endian)
+# + 4-byte value (big-endian). The frame is sent:
+#
+#   * by the client, immediately after the connection preface;
+#   * by the server, immediately after receiving the client
+#     preface (no payload — server's SETTINGS is its own).
+#
+# Each side MUST acknowledge the other's SETTINGS with a SETTINGS
+# frame with the ACK flag set and empty payload. ACK is a single
+# SETTINGS frame per received SETTINGS — multiple SETTINGS frames
+# in flight produce multiple ACKs in order.
+# ============================================================================
+
+struct Http2Settings {
+    header_table_size: int,
+    enable_push: int,
+    max_concurrent_streams: int,
+    initial_window_size: int,
+    max_frame_size: int,
+    max_header_list_size: int
+}
+
+# http2_settings_default() — the RFC 7540 default values. Used
+# by both client and server before exchanging SETTINGS.
+fn http2_settings_default() -> Http2Settings {
+    return Http2Settings {
+        header_table_size: http2_default_header_table_size(),
+        enable_push: 1,
+        max_concurrent_streams: 0,  # 0 means "unlimited" — RFC 7540 §6.5.2
+        initial_window_size: http2_default_initial_window_size(),
+        max_frame_size: http2_default_max_frame_size(),
+        max_header_list_size: 0     # 0 means "unlimited" — RFC 7540 §6.5.2
+    }
+}
+
+# http2_settings_encode(s) -> str. Produces the 6-byte-per-pair
+# payload for a SETTINGS frame (NOT including the 9-byte frame
+# header — the caller wraps this in http2_frame_new). Returns
+# only the parameters that differ from the default (to keep the
+# frame small; a peer that doesn't receive a parameter assumes
+# the default).
+fn http2_settings_encode(s: Http2Settings) -> str {
+    let parts: list[str] = []
+    # Always emit all known parameters — peers can ignore ones
+    # that match the default. This keeps the encoder simple
+    # (no diff logic) and the payload small enough (36 bytes
+    # for all 6 parameters).
+    if s.header_table_size != http2_default_header_table_size() {
+        parts.push(http2_settings_pair(http2_settings_header_table_size(), s.header_table_size))
+    }
+    if s.enable_push != 1 {
+        parts.push(http2_settings_pair(http2_settings_enable_push(), s.enable_push))
+    }
+    if s.max_concurrent_streams != 0 {
+        parts.push(http2_settings_pair(http2_settings_max_concurrent_streams(), s.max_concurrent_streams))
+    }
+    if s.initial_window_size != http2_default_initial_window_size() {
+        parts.push(http2_settings_pair(http2_settings_initial_window_size(), s.initial_window_size))
+    }
+    if s.max_frame_size != http2_default_max_frame_size() {
+        parts.push(http2_settings_pair(http2_settings_max_frame_size(), s.max_frame_size))
+    }
+    if s.max_header_list_size != 0 {
+        parts.push(http2_settings_pair(http2_settings_max_header_list_size(), s.max_header_list_size))
+    }
+    return str_join(parts, "")
+}
+
+# http2_settings_pair(id, value) — encode a single 6-byte parameter
+# pair. The ID is 2 bytes big-endian; the value is 4 bytes big-
+# endian. The value is masked to 32 bits (the SETTINGS values are
+# all unsigned 32-bit).
+fn http2_settings_pair(id: int, value: int) -> str {
+    let id_hi: int = (id / 256) % 256
+    let id_lo: int = id % 256
+    let masked: int = int_and(value, 4294967295)
+    let v0: int = (masked / 16777216) % 256
+    let v1: int = (masked / 65536) % 256
+    let v2: int = (masked / 256) % 256
+    let v3: int = masked % 256
+    return chr(id_hi) + chr(id_lo) + chr(v0) + chr(v1) + chr(v2) + chr(v3)
+}
+
+# http2_settings_decode(payload) -> Result[Http2Settings, str].
+#
+# Parses a SETTINGS frame's payload (NOT the full frame — just the
+# 6-byte-pair payload). Returns Result.Ok(settings) on success,
+# Result.Err(msg) on:
+#   * payload length not a multiple of 6 (FRAME_SIZE_ERROR);
+#   * unknown parameter ID (RFC 7540 §6.5.1 — MUST ignore, but
+#     we surface it as a warning in the error message; the
+#     caller decides whether to abort);
+#   * value out of range (e.g. ENABLE_PUSH not 0 or 1, or
+#     INITIAL_WINDOW_SIZE > 2^31 - 1).
+fn http2_settings_decode(payload: str) -> Result[Http2Settings, str] {
+    if payload.len() % 6 != 0 {
+        return Result.Err("http2_settings_decode: payload not a multiple of 6 (got "
+            + payload.len().to_str() + ")")
+    }
+    let mut s: Http2Settings = http2_settings_default()
+    let mut i: int = 0
+    while i + 6 <= payload.len() {
+        let id_hi: int = payload.byte_at(i)
+        let id_lo: int = payload.byte_at(i + 1)
+        let id: int = id_hi * 256 + id_lo
+        let v0: int = payload.byte_at(i + 2)
+        let v1: int = payload.byte_at(i + 3)
+        let v2: int = payload.byte_at(i + 4)
+        let v3: int = payload.byte_at(i + 5)
+        let value: int = v0 * 16777216 + v1 * 65536 + v2 * 256 + v3
+        if id == http2_settings_header_table_size() {
+            s.header_table_size = value
+        } else if id == http2_settings_enable_push() {
+            if value != 0 && value != 1 {
+                return Result.Err("http2_settings_decode: ENABLE_PUSH must be 0 or 1 (got "
+                    + value.to_str() + ")")
+            }
+            s.enable_push = value
+        } else if id == http2_settings_max_concurrent_streams() {
+            s.max_concurrent_streams = value
+        } else if id == http2_settings_initial_window_size() {
+            if value > 2147483647 {
+                return Result.Err("http2_settings_decode: INITIAL_WINDOW_SIZE > 2^31-1")
+            }
+            s.initial_window_size = value
+        } else if id == http2_settings_max_frame_size() {
+            if value < 16384 || value > 16777215 {
+                return Result.Err("http2_settings_decode: MAX_FRAME_SIZE out of range ("
+                    + value.to_str() + ")")
+            }
+            s.max_frame_size = value
+        } else if id == http2_settings_max_header_list_size() {
+            s.max_header_list_size = value
+        } else {
+            # Unknown parameter — RFC 7540 §6.5.1 says MUST ignore.
+            # We don't return an error; just skip the pair.
+        }
+        i = i + 6
+    }
+    return Result.Ok(s)
+}
+
+# ============================================================================
+# HPACK — static table (RFC 7541 Appendix A, 61 entries).
+#
+# Each entry is a (name, value) pair. The value is the empty string
+# for entries that have no fixed value (the entry is a header NAME
+# only — the actual value comes from the wire).
+# ============================================================================
+
+struct HpackStaticEntry {
+    name: str,
+    value: str
+}
+
+# http2_hpack_static_table() -> list[HpackStaticEntry].
+# Returns the 61-entry static table from RFC 7541 Appendix A.
+# Index 1 (the first entry) corresponds to the header
+# `:authority` with empty value. Index 61 is `www-authenticate`.
+# Index 0 is reserved (RFC 7541 §2.3 — used to signal "indexed
+# header field representation" with the high bit set).

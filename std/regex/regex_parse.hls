@@ -1,0 +1,714 @@
+# ============================================================================
+# std/regex/regex_parse.hls - verbatim slice of the original std/regex.hls
+# (lines 353..1060), split for maintainability. Loaded via the
+# std/regex.hls facade; not part of the public import API.
+# ============================================================================
+
+fn regex_add_state(mut p: RegexParser, st: RegexState) -> int {
+    if p.states.len() >= regex_max_states() {
+        p.err = "regex error: pattern produces more than " + regex_max_states().to_str() + " NFA states (limit; the pattern is too complex)"
+        return -1
+    }
+    p.states.push(st)
+    return p.states.len() - 1
+}
+
+fn regex_add_class(mut p: RegexParser, cls: RegexCharClass) -> int {
+    p.classes.push(cls)
+    return p.classes.len() - 1
+}
+
+# regex_alloc_group(p) -> int. Allocate the next capture group id.
+# Returns -1 on overflow.
+fn regex_alloc_group(mut p: RegexParser) -> int {
+    if p.next_group >= regex_max_groups() {
+        p.err = "regex error: more than " + regex_max_groups().to_str() + " capture groups (limit)"
+        return -1
+    }
+    let g: int = p.next_group
+    p.next_group = p.next_group + 1
+    return g
+}
+
+# ============================================================================
+# Fragment construction helpers.
+# ============================================================================
+
+# regex_frag_literal(p, byte) -> RegexFrag. Match a single literal byte.
+fn regex_frag_literal(mut p: RegexParser, byte: int) -> RegexFrag {
+    let mut st: RegexState = regex_state_new(regex_st_literal())
+    st.byte = byte
+    let idx: int = regex_add_state(p, st)
+    if p.err != "" {
+        return regex_frag_empty()
+    }
+    return RegexFrag {
+        start: idx, dangling_out1: [idx], dangling_out2: []
+    }
+}
+
+# regex_frag_any(p) -> RegexFrag. Match any byte except '\n' (no DOTALL).
+fn regex_frag_any(mut p: RegexParser) -> RegexFrag {
+    let st: RegexState = regex_state_new(regex_st_any())
+    let idx: int = regex_add_state(p, st)
+    if p.err != "" {
+        return regex_frag_empty()
+    }
+    return RegexFrag {
+        start: idx, dangling_out1: [idx], dangling_out2: []
+    }
+}
+
+# regex_frag_class(p, cls) -> RegexFrag. Match a character class.
+fn regex_frag_class(mut p: RegexParser, cls: RegexCharClass) -> RegexFrag {
+    let cid: int = regex_add_class(p, cls)
+    let mut st: RegexState = regex_state_new(regex_st_class())
+    st.class_id = cid
+    let idx: int = regex_add_state(p, st)
+    if p.err != "" {
+        return regex_frag_empty()
+    }
+    return RegexFrag {
+        start: idx, dangling_out1: [idx], dangling_out2: []
+    }
+}
+
+# regex_frag_epsilon(p) -> RegexFrag. An empty fragment that matches
+# nothing (used for empty alternation arms and empty groups).
+fn regex_frag_epsilon(mut p: RegexParser) -> RegexFrag {
+    let st: RegexState = regex_state_new(regex_st_epsilon())
+    let idx: int = regex_add_state(p, st)
+    if p.err != "" {
+        return regex_frag_empty()
+    }
+    return RegexFrag {
+        start: idx, dangling_out1: [idx], dangling_out2: []
+    }
+}
+
+# regex_frag_save(p, group_id, inner) -> RegexFrag. Wrap a fragment
+# with two SAVE states — one to record the start of the group, one
+# to record the end.
+fn regex_frag_save(mut p: RegexParser, group_id: int, inner: RegexFrag) -> RegexFrag {
+    # SAVE for the start of the group.
+    let mut save_start: RegexState = regex_state_new(regex_st_save())
+    save_start.group_id = group_id * 2
+    let save_start_idx: int = regex_add_state(p, save_start)
+    if p.err != "" {
+        return regex_frag_empty()
+    }
+    regex_state_set_out1(p, save_start_idx, inner.start)
+
+    # SAVE for the end of the group.
+    let mut save_end: RegexState = regex_state_new(regex_st_save())
+    save_end.group_id = group_id * 2 + 1
+    let save_end_idx: int = regex_add_state(p, save_end)
+    if p.err != "" {
+        return regex_frag_empty()
+    }
+    regex_patch(p, inner, save_end_idx)
+
+    return RegexFrag {
+        start: save_start_idx,
+        dangling_out1: [save_end_idx],
+        dangling_out2: []
+    }
+}
+
+# regex_frag_anchor(p, kind) -> RegexFrag. Build a zero-width anchor
+# state.
+fn regex_frag_anchor(mut p: RegexParser, kind: int) -> RegexFrag {
+    let st: RegexState = regex_state_new(kind)
+    let idx: int = regex_add_state(p, st)
+    if p.err != "" {
+        return regex_frag_empty()
+    }
+    return RegexFrag {
+        start: idx, dangling_out1: [idx], dangling_out2: []
+    }
+}
+
+# ============================================================================
+# Fragment combination helpers (Thompson construction).
+# ============================================================================
+
+# regex_patch(p, frag, target) — patch all of frag's dangling
+# out-transitions to point at `target`.
+fn regex_patch(mut p: RegexParser, frag: RegexFrag, target: int) -> void {
+    let mut i: int = 0
+    while i < frag.dangling_out1.len() {
+        regex_state_set_out1(p, frag.dangling_out1.get(i), target)
+        i = i + 1
+    }
+    let mut j: int = 0
+    while j < frag.dangling_out2.len() {
+        regex_state_set_out2(p, frag.dangling_out2.get(j), target)
+        j = j + 1
+    }
+}
+
+# regex_frag_concat(p, a, b) -> RegexFrag. Concatenate two fragments.
+fn regex_frag_concat(p: RegexParser, a: RegexFrag, b: RegexFrag) -> RegexFrag {
+    regex_patch(p, a, b.start)
+    return RegexFrag {
+        start: a.start,
+        dangling_out1: b.dangling_out1,
+        dangling_out2: b.dangling_out2
+    }
+}
+
+# regex_frag_alt(p, a, b) -> RegexFrag. Alternation: a|b.
+fn regex_frag_alt(mut p: RegexParser, a: RegexFrag, b: RegexFrag) -> RegexFrag {
+    let fork_st: RegexState = regex_state_new(regex_st_epsilon())
+    let fork_idx: int = regex_add_state(p, fork_st)
+    if p.err != "" {
+        return regex_frag_empty()
+    }
+    regex_state_set_out1(p, fork_idx, a.start)
+    regex_state_set_out2(p, fork_idx, b.start)
+    let combined: list[int] = list_concat_int(a.dangling_out1, b.dangling_out1)
+    let combined2: list[int] = list_concat_int(a.dangling_out2, b.dangling_out2)
+    return RegexFrag {
+        start: fork_idx, dangling_out1: combined, dangling_out2: combined2
+    }
+}
+
+# regex_frag_star(p, inner) -> RegexFrag. Kleene star: inner*.
+# Construction:
+#   fork (epsilon):
+#     fork.out1 = inner.start (try one more)
+#     fork.out2 = -1 (dangling — exit)
+#   inner.dangling -> fork_idx (loop back)
+# So the new fragment's dangling is fork.out2, which is dangling_out2 = [fork_idx].
+fn regex_frag_star(mut p: RegexParser, inner: RegexFrag) -> RegexFrag {
+    let fork_st: RegexState = regex_state_new(regex_st_epsilon())
+    let fork_idx: int = regex_add_state(p, fork_st)
+    if p.err != "" {
+        return regex_frag_empty()
+    }
+    regex_state_set_out1(p, fork_idx, inner.start)
+    regex_patch(p, inner, fork_idx)
+    return RegexFrag {
+        start: fork_idx, dangling_out1: [], dangling_out2: [fork_idx]
+    }
+}
+
+# regex_frag_plus(p, inner) -> RegexFrag. Plus: inner+.
+# Construction:
+#   inner.dangling -> fork_idx (loop back)
+#   fork.out1 = inner.start (loop back)
+#   fork.out2 = -1 (dangling — exit)
+# So the new fragment's dangling is fork.out2, in dangling_out2 = [fork_idx].
+fn regex_frag_plus(mut p: RegexParser, inner: RegexFrag) -> RegexFrag {
+    let fork_st: RegexState = regex_state_new(regex_st_epsilon())
+    let fork_idx: int = regex_add_state(p, fork_st)
+    if p.err != "" {
+        return regex_frag_empty()
+    }
+    regex_patch(p, inner, fork_idx)
+    regex_state_set_out1(p, fork_idx, inner.start)
+    return RegexFrag {
+        start: inner.start, dangling_out1: [], dangling_out2: [fork_idx]
+    }
+}
+
+# regex_frag_question(p, inner) -> RegexFrag. Question mark: inner?.
+# Construction:
+#   fork.out1 = inner.start (try inner)
+#   fork.out2 = -1 (dangling — skip inner)
+#   inner.dangling -> (dangling — exit after inner)
+# So the new fragment's dangling is the union of fork.out2 and inner.dangling.
+fn regex_frag_question(mut p: RegexParser, inner: RegexFrag) -> RegexFrag {
+    let fork_st: RegexState = regex_state_new(regex_st_epsilon())
+    let fork_idx: int = regex_add_state(p, fork_st)
+    if p.err != "" {
+        return regex_frag_empty()
+    }
+    regex_state_set_out1(p, fork_idx, inner.start)
+    let combined_out2: list[int] = list_concat_int(inner.dangling_out2, [fork_idx])
+    return RegexFrag {
+        start: fork_idx,
+        dangling_out1: inner.dangling_out1,
+        dangling_out2: combined_out2
+    }
+}
+
+# regex_frag_repeat(p, inner, min_n, max_n) -> RegexFrag. Repeat
+# inner between min_n and max_n times. max_n == -1 means unbounded.
+fn regex_frag_repeat(mut p: RegexParser, inner: RegexFrag, min_n: int, max_n: int) -> RegexFrag {
+    if min_n < 0 {
+        regex_err_pos(p, "repeat count {n,m}: n must be >= 0")
+        return regex_frag_empty()
+    }
+    if max_n != -1 && max_n < min_n {
+        regex_err_pos(p, "repeat count {n,m}: m must be >= n")
+        return regex_frag_empty()
+    }
+    if min_n > regex_max_rep() {
+        regex_err_pos(p, "repeat count {n,m}: n exceeds limit " + regex_max_rep().to_str())
+        return regex_frag_empty()
+    }
+    if max_n > regex_max_rep() {
+        regex_err_pos(p, "repeat count {n,m}: m exceeds limit " + regex_max_rep().to_str())
+        return regex_frag_empty()
+    }
+    # Build the "min copies" part: inner inner ... inner (min_n times).
+    let mut out: RegexFrag = regex_frag_epsilon(p)
+    if p.err != "" {
+        return regex_frag_empty()
+    }
+    let mut i: int = 0
+    while i < min_n {
+        let copy: RegexFrag = regex_frag_clone(p, inner)
+        if p.err != "" {
+            return regex_frag_empty()
+        }
+        out = regex_frag_concat(p, out, copy)
+        i = i + 1
+    }
+    if max_n == -1 {
+        let star: RegexFrag = regex_frag_star(p, inner)
+        out = regex_frag_concat(p, out, star)
+    } else {
+        let extra: int = max_n - min_n
+        let mut j: int = 0
+        while j < extra {
+            let copy: RegexFrag = regex_frag_clone(p, inner)
+            if p.err != "" {
+                return regex_frag_empty()
+            }
+            let opt: RegexFrag = regex_frag_question(p, copy)
+            out = regex_frag_concat(p, out, opt)
+            j = j + 1
+        }
+    }
+    return out
+}
+
+# ============================================================================
+# Fragment cloning — used by regex_frag_repeat to expand {n,m}.
+# Walks the subgraph from `frag.start` and copies every reachable
+# state, rewriting out1/out2 to point at the copies.
+# ============================================================================
+
+# regex_frag_clone(p, frag) -> RegexFrag. Deep-clone the sub-NFA
+# reachable from frag.start.
+#
+# The algorithm is a worklist BFS. We maintain two parallel lists:
+# `old_indices` (the original state indices) and `new_indices` (the
+# new state indices, allocated as copies are made). We start with
+# frag.start; for each popped state, we allocate a copy, record the
+# mapping, and enqueue the children. After the BFS, we patch the
+# copies' out1/out2 using the mapping.
+#
+# The worklist is a list[int] used as a stack (pop from end); the
+# order of allocation doesn't matter as long as the patches are
+# consistent.
+fn regex_frag_clone(mut p: RegexParser, frag: RegexFrag) -> RegexFrag {
+    if frag.start < 0 {
+        return frag
+    }
+    let old_indices: list[int] = []
+    let new_indices: list[int] = []
+    # Worklist of old state indices to clone.
+    let worklist: list[int] = [frag.start]
+    while worklist.len() > 0 {
+        let cur_old: int = worklist.pop()
+        # Skip if already cloned.
+        if list_contains_int(old_indices, cur_old) {
+            continue
+        }
+        let old_st: RegexState = p.states.get(cur_old)
+        let mut new_st: RegexState = regex_state_new(old_st.kind)
+        new_st.byte = old_st.byte
+        new_st.class_id = old_st.class_id
+        new_st.group_id = old_st.group_id
+        let new_idx: int = regex_add_state(p, new_st)
+        if p.err != "" {
+            return regex_frag_empty()
+        }
+        old_indices.push(cur_old)
+        new_indices.push(new_idx)
+        if old_st.out1 >= 0 {
+            worklist.push(old_st.out1)
+        }
+        if old_st.out2 >= 0 {
+            worklist.push(old_st.out2)
+        }
+    }
+    # Patch the copies' out1/out2 using the old->new mapping.
+    let mut i: int = 0
+    while i < old_indices.len() {
+        let cur_old: int = old_indices.get(i)
+        let cur_new: int = new_indices.get(i)
+        let old_st: RegexState = p.states.get(cur_old)
+        let new_out1: int = regex_clone_remap(old_indices, new_indices, old_st.out1)
+        let new_out2: int = regex_clone_remap(old_indices, new_indices, old_st.out2)
+        regex_state_set_out1(p, cur_new, new_out1)
+        regex_state_set_out2(p, cur_new, new_out2)
+        i = i + 1
+    }
+    # Build the new dangling lists.
+    let mut new_dangling1: list[int] = []
+    let mut d: int = 0
+    while d < frag.dangling_out1.len() {
+        new_dangling1.push(regex_clone_remap(old_indices, new_indices, frag.dangling_out1.get(d)))
+        d = d + 1
+    }
+    let mut new_dangling2: list[int] = []
+    let mut e: int = 0
+    while e < frag.dangling_out2.len() {
+        new_dangling2.push(regex_clone_remap(old_indices, new_indices, frag.dangling_out2.get(e)))
+        e = e + 1
+    }
+    let new_start: int = regex_clone_remap(old_indices, new_indices, frag.start)
+    return RegexFrag {
+        start: new_start,
+        dangling_out1: new_dangling1,
+        dangling_out2: new_dangling2
+    }
+}
+
+# regex_clone_remap(old_indices, new_indices, old_idx) -> int.
+# Look up the new index for an old index in the clone mapping.
+fn regex_clone_remap(old_indices: list[int], new_indices: list[int], old_idx: int) -> int {
+    if old_idx < 0 {
+        return -1
+    }
+    let mut i: int = 0
+    while i < old_indices.len() {
+        if old_indices.get(i) == old_idx {
+            return new_indices.get(i)
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+# ============================================================================
+# Pattern parser — recursive descent.
+# ============================================================================
+
+# regex_parse_alternation(p) -> RegexFrag. Parse a|b|c.
+fn regex_parse_alternation(mut p: RegexParser) -> RegexFrag {
+    let mut current: RegexFrag = regex_parse_concat(p)
+    if p.err != "" {
+        return current
+    }
+    while p.pos < p.pattern.len() && p.pattern.byte_at(p.pos) == 124 {
+        p.pos = p.pos + 1
+        let right: RegexFrag = regex_parse_concat(p)
+        if p.err != "" {
+            return current
+        }
+        current = regex_frag_alt(p, current, right)
+    }
+    return current
+}
+
+# regex_parse_concat(p) -> RegexFrag. Parse a sequence of repeat-units.
+fn regex_parse_concat(mut p: RegexParser) -> RegexFrag {
+    let mut out: RegexFrag = regex_frag_epsilon(p)
+    if p.err != "" {
+        return out
+    }
+    while p.pos < p.pattern.len() {
+        let c: int = p.pattern.byte_at(p.pos)
+        # Stop at alternation or close-paren.
+        if c == 124 || c == 41 {
+            break
+        }
+        let unit: RegexFrag = regex_parse_repeat(p)
+        if p.err != "" {
+            return out
+        }
+        out = regex_frag_concat(p, out, unit)
+    }
+    return out
+}
+
+# regex_parse_repeat(p) -> RegexFrag. Parse an atom followed by an
+# optional quantifier.
+fn regex_parse_repeat(mut p: RegexParser) -> RegexFrag {
+    let inner: RegexFrag = regex_parse_atom(p)
+    if p.err != "" {
+        return inner
+    }
+    if p.pos >= p.pattern.len() {
+        return inner
+    }
+    let c: int = p.pattern.byte_at(p.pos)
+    if c == 42 { # '*'
+        p.pos = p.pos + 1
+        let _lazy: bool = regex_consume_lazy(p)
+        return regex_frag_star(p, inner)
+    }
+    if c == 43 { # '+'
+        p.pos = p.pos + 1
+        let _lazy2: bool = regex_consume_lazy(p)
+        return regex_frag_plus(p, inner)
+    }
+    if c == 63 { # '?'
+        p.pos = p.pos + 1
+        let _lazy3: bool = regex_consume_lazy(p)
+        return regex_frag_question(p, inner)
+    }
+    if c == 123 { # '{'
+        return regex_parse_brace_repeat(p, inner)
+    }
+    return inner
+}
+
+# regex_consume_lazy(p) -> bool. If the next byte is '?', consume it
+# and return true (lazy quantifier). Otherwise return false.
+fn regex_consume_lazy(mut p: RegexParser) -> bool {
+    if p.pos < p.pattern.len() && p.pattern.byte_at(p.pos) == 63 {
+        p.pos = p.pos + 1
+        return true
+    }
+    return false
+}
+
+# regex_parse_brace_repeat(p, inner) -> RegexFrag. Parse {n}, {n,}, {n,m}.
+fn regex_parse_brace_repeat(mut p: RegexParser, inner: RegexFrag) -> RegexFrag {
+    p.pos = p.pos + 1 # consume '{'
+    # Parse the first number (n).
+    let n_str_start: int = p.pos
+    while p.pos < p.pattern.len() {
+        let b: int = p.pattern.byte_at(p.pos)
+        if b < 48 || b > 57 {
+            break
+        }
+        p.pos = p.pos + 1
+    }
+    let n_str: str = p.pattern.slice(n_str_start, p.pos)
+    let mut min_n: int = 0
+    let mut max_n: int = 0
+    if n_str.len() > 0 {
+        min_n = regex_parse_uint(p, n_str)
+        if p.err != "" {
+            return inner
+        }
+        max_n = min_n
+    }
+    # Check for {n,} or {n,m}.
+    if p.pos < p.pattern.len() && p.pattern.byte_at(p.pos) == 44 {
+        p.pos = p.pos + 1
+        let m_str_start: int = p.pos
+        while p.pos < p.pattern.len() {
+            let b: int = p.pattern.byte_at(p.pos)
+            if b < 48 || b > 57 {
+                break
+            }
+            p.pos = p.pos + 1
+        }
+        let m_str: str = p.pattern.slice(m_str_start, p.pos)
+        if m_str.len() == 0 {
+            max_n = -1 # unbounded
+        } else {
+            max_n = regex_parse_uint(p, m_str)
+            if p.err != "" {
+                return inner
+            }
+        }
+    }
+    # Expect closing '}'.
+    if p.pos >= p.pattern.len() || p.pattern.byte_at(p.pos) != 125 {
+        regex_err_pos(p, "expected '}' to close {n,m}")
+        return inner
+    }
+    p.pos = p.pos + 1
+    let _lazy: bool = regex_consume_lazy(p)
+    return regex_frag_repeat(p, inner, min_n, max_n)
+}
+
+# regex_parse_uint(p, s) -> int. Parse a non-empty ASCII digit string.
+fn regex_parse_uint(p: RegexParser, s: str) -> int {
+    if s.len() == 0 {
+        return 0
+    }
+    let r: Result[int, str] = int_parse(s)
+    if !result_is_ok(r) {
+        p.err = "regex error: bad repeat count: " + s
+        return 0
+    }
+    return result_unwrap(r)
+}
+
+# regex_parse_atom(p) -> RegexFrag. Parse the smallest unit of a regex.
+fn regex_parse_atom(mut p: RegexParser) -> RegexFrag {
+    if p.pos >= p.pattern.len() {
+        regex_err_eof(p, "expected atom")
+        return regex_frag_empty()
+    }
+    let c: int = p.pattern.byte_at(p.pos)
+    # '(' or '(?:'
+    if c == 40 {
+        p.pos = p.pos + 1
+        # Check for (?: prefix.
+        if p.pos + 1 < p.pattern.len()
+        && p.pattern.byte_at(p.pos) == 63
+        && p.pattern.byte_at(p.pos + 1) == 58 {
+            p.pos = p.pos + 2
+            let inner: RegexFrag = regex_parse_alternation(p)
+            if p.err != "" {
+                return inner
+            }
+            if p.pos >= p.pattern.len() || p.pattern.byte_at(p.pos) != 41 {
+                regex_err_pos(p, "expected ')' to close (?:...)")
+                return inner
+            }
+            p.pos = p.pos + 1
+            return inner
+        }
+        # Capture group: allocate a new group id and wrap.
+        let gid: int = regex_alloc_group(p)
+        if p.err != "" {
+            return regex_frag_empty()
+        }
+        let inner: RegexFrag = regex_parse_alternation(p)
+        if p.err != "" {
+            return inner
+        }
+        if p.pos >= p.pattern.len() || p.pattern.byte_at(p.pos) != 41 {
+            regex_err_pos(p, "expected ')' to close (...)")
+            return inner
+        }
+        p.pos = p.pos + 1
+        return regex_frag_save(p, gid, inner)
+    }
+    # '[' — character class
+    if c == 91 {
+        return regex_parse_class(p)
+    }
+    # '.' — any byte
+    if c == 46 {
+        p.pos = p.pos + 1
+        return regex_frag_any(p)
+    }
+    # '^' — start anchor
+    if c == 94 {
+        p.pos = p.pos + 1
+        return regex_frag_anchor(p, regex_st_anchor_start())
+    }
+    # '$' — end anchor
+    if c == 36 {
+        p.pos = p.pos + 1
+        return regex_frag_anchor(p, regex_st_anchor_end())
+    }
+    # '\' — escape
+    if c == 92 {
+        return regex_parse_escape(p)
+    }
+    # '*+?' at the start of an atom is a syntax error.
+    if c == 42 || c == 43 || c == 63 || c == 124 || c == 41 || c == 125 {
+        regex_err_pos(p, "unexpected metacharacter '" + chr(c) + "'")
+        return regex_frag_empty()
+    }
+    # Literal byte.
+    p.pos = p.pos + 1
+    return regex_frag_literal(p, c)
+}
+
+# regex_parse_escape(p) -> RegexFrag. Parse a '\' escape.
+fn regex_parse_escape(mut p: RegexParser) -> RegexFrag {
+    p.pos = p.pos + 1
+    if p.pos >= p.pattern.len() {
+        regex_err_eof(p, "trailing backslash")
+        return regex_frag_empty()
+    }
+    let c: int = p.pattern.byte_at(p.pos)
+    p.pos = p.pos + 1
+    if c == 110 { # \n
+        return regex_frag_literal(p, 10) # \n
+    } # \n
+    if c == 116 { # \t
+        return regex_frag_literal(p, 9) # \t
+    } # \t
+    if c == 114 { # \r
+        return regex_frag_literal(p, 13) # \r
+    } # \r
+    if c == 102 { # \f
+        return regex_frag_literal(p, 12) # \f
+    } # \f
+    if c == 118 { # \v
+        return regex_frag_literal(p, 11) # \v
+    } # \v
+    if c == 48 { # \0
+        return regex_frag_literal(p, 0) # \0
+    } # \0
+    if c == 97 { # \a (bell)
+        return regex_frag_literal(p, 7) # \a (bell)
+    } # \a (bell)
+    if c == 100 || c == 68 {
+        let cls: RegexCharClass = regex_class_digit(c == 68)
+        return regex_frag_class(p, cls)
+    }
+    if c == 119 || c == 87 {
+        let cls: RegexCharClass = regex_class_word(c == 87)
+        return regex_frag_class(p, cls)
+    }
+    if c == 115 || c == 83 {
+        let cls: RegexCharClass = regex_class_space(c == 83)
+        return regex_frag_class(p, cls)
+    }
+    if c == 98 {
+        return regex_frag_anchor(p, regex_st_word_boundary())
+    }
+    if c == 66 {
+        return regex_frag_anchor(p, regex_st_nonword_boundary())
+    }
+    if c == 120 {
+        return regex_parse_hex_escape(p)
+    }
+    # Literal escape of a metacharacter.
+    return regex_frag_literal(p, c)
+}
+
+# regex_parse_hex_escape(p) -> RegexFrag. Parse \xNN or \x{NNNN...}.
+fn regex_parse_hex_escape(mut p: RegexParser) -> RegexFrag {
+    if p.pos >= p.pattern.len() {
+        regex_err_eof(p, "trailing \\x")
+        return regex_frag_empty()
+    }
+    if p.pattern.byte_at(p.pos) == 123 { # '{'
+        p.pos = p.pos + 1
+        let hex_start: int = p.pos
+        while p.pos < p.pattern.len() {
+            let b: int = p.pattern.byte_at(p.pos)
+            if b == 125 {
+                break
+            }
+            if !regex_is_hex_digit(b) {
+                regex_err_pos(p, "bad hex digit in \\x{...}")
+                return regex_frag_empty()
+            }
+            p.pos = p.pos + 1
+        }
+        if p.pos >= p.pattern.len() {
+            regex_err_eof(p, "unterminated \\x{...}")
+            return regex_frag_empty()
+        }
+        let hex_str: str = p.pattern.slice(hex_start, p.pos)
+        p.pos = p.pos + 1 # consume '}'
+        let cp: int = regex_parse_hex_int(p, hex_str)
+        return regex_emit_codepoint(p, cp)
+    }
+    # \xNN form — exactly 2 hex digits.
+    if p.pos + 1 >= p.pattern.len() {
+        regex_err_eof(p, "\\xNN needs two hex digits")
+        return regex_frag_empty()
+    }
+    let h1: int = p.pattern.byte_at(p.pos)
+    let h2: int = p.pattern.byte_at(p.pos + 1)
+    if !regex_is_hex_digit(h1) || !regex_is_hex_digit(h2) {
+        regex_err_pos(p, "\\xNN needs two hex digits")
+        return regex_frag_empty()
+    }
+    p.pos = p.pos + 2
+    let byte_val: int = regex_hex_digit_value(h1) * 16 + regex_hex_digit_value(h2)
+    return regex_frag_literal(p, byte_val)
+}
+
+# regex_emit_codepoint(p, cp) -> RegexFrag. Emit a codepoint as 1..4
+# UTF-8 byte literals.

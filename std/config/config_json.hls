@@ -1,0 +1,155 @@
+# ============================================================================
+# std/config/config_json.hls - verbatim slice of the original std/config.hls
+# (lines 909..1058), split for maintainability. Loaded via the
+# std/config.hls facade; not part of the public import API.
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+
+fn config_parse_json(content: str) -> Result[ConfigValue, str] {
+    let r: Result[JsonValue, str] = json_parse_result(content)
+    if result_is_err(r) {
+        return Result.Err("JSON parse error: " + result_err_or(r, "unknown"))
+    }
+    let jv: JsonValue = result_unwrap(r)
+    return Result.Ok(config_from_json(jv))
+}
+
+fn config_from_json(jv: JsonValue) -> ConfigValue {
+    if json_is_null(jv) {
+        return config_null()
+    }
+    if json_is_bool(jv) {
+        return config_bool(json_bool_value(jv))
+    }
+    if json_is_int(jv) {
+        return config_int(json_int_value(jv))
+    }
+    if json_is_float(jv) {
+        return config_float(json_float_value(jv))
+    }
+    if json_is_str(jv) {
+        return config_str(json_str_value(jv))
+    }
+    if json_is_array(jv) {
+        let items: list[ConfigValue] = []
+        let mut i: int = 0
+        while i < jv.arr.len() {
+            items.push(config_from_json(jv.arr.get(i)))
+            i = i + 1
+        }
+        return config_array(items)
+    }
+    if json_is_object(jv) {
+        let keys: list[str] = []
+        let vals: list[ConfigValue] = []
+        let mut i: int = 0
+        while i < jv.obj_keys.len() {
+            keys.push(jv.obj_keys.get(i))
+            vals.push(config_from_json(jv.obj_vals.get(i)))
+            i = i + 1
+        }
+        return config_table(keys, vals)
+    }
+    return config_null()
+}
+
+# ============================================================================
+# TOML PARSER — toml_parse(src) -> Result[ConfigValue, str].
+#
+# Supports the subset of TOML most apps use:
+#   - Tables: [section] and [section.subsection] (dotted table headers).
+#   - Inline tables: key = {a = 1, b = 2}
+#   - Arrays: key = [1, 2, 3] (scalars only; array-of-tables `[[x]]` not supported).
+#   - Strings: basic ("..."), literal ('...'), multi-line basic ("""..."""),
+#     multi-line literal ('''...''').
+#   - Ints: 123, -456, +789, 1_000 (underscores ignored), 0x..., 0o..., 0b...
+#   - Floats: 1.0, -2.5, 3.14e10, +6.022e23, inf, nan.
+#   - Bools: true, false.
+#   - Comments: # ... to end of line.
+#   - Key quoting: bare keys (a-z, A-Z, 0-9, _, -), quoted keys ("..." or '...').
+#
+# The parser is a hand-written state machine. It does NOT allocate
+# intermediate substrings for the whole input; it tracks byte offsets
+# and slices only at value boundaries. (HLS strings are immutable
+# bytes, so slicing is O(1) — no copy.)
+#
+# Returns Result.Ok(ConfigValue{table}) on success, Result.Err(msg) on
+# failure. The error message includes the line / column.
+# ============================================================================
+
+fn toml_parse(src: str) -> Result[ConfigValue, str] {
+    let p: TomlParser = TomlParser {
+        src: src,
+        pos: 0,
+        line: 1,
+        col: 1,
+    }
+    let root: ConfigValue = config_table([], [])
+    let mut current_table_path: list[str] = []
+    let mut ok: bool = true
+
+    while p.pos < p.src.len() && ok {
+        # Skip whitespace and comments.
+        toml_skip_ws_and_comments(p)
+        if p.pos >= p.src.len() {
+            break
+        }
+        let c: int = toml_peek(p)
+        # Table header: [section] or [section.subsection].
+        if c == 91 {
+            # Could be [section] or [[array-of-tables]]. The latter is
+            # not supported in v0.79.0-alpha; we reject it with a clear
+            # error message.
+            toml_advance(p)  # consume '['
+            if toml_peek(p) == 91 {
+                return Result.Err(toml_err(p, "array-of-tables [[...]] not supported in v0.79.0-alpha"))
+            }
+            let path_r: Result[list[str], str] = toml_parse_table_header(p)
+            if result_is_err(path_r) {
+                return Result.Err(result_err_or(path_r, "table header parse failed"))
+            }
+            current_table_path = result_unwrap(path_r)
+            # Expect ']'.
+            toml_skip_ws(p)
+            if toml_peek(p) != 93 {
+                return Result.Err(toml_err(p, "expected ']' after table header"))
+            }
+            toml_advance(p)
+            # Ensure the path exists in root (create intermediate tables).
+            toml_ensure_path(root, current_table_path)
+            continue
+        }
+        # Key = value.
+        let key_r: Result[str, str] = toml_parse_key(p)
+        if result_is_err(key_r) {
+            return Result.Err(result_err_or(key_r, "key parse failed"))
+        }
+        let key: str = result_unwrap(key_r)
+        toml_skip_ws(p)
+        if toml_peek(p) != 61 {
+            return Result.Err(toml_err(p, "expected '=' after key '" + key + "'"))
+        }
+        toml_advance(p)  # consume '='
+        toml_skip_ws(p)
+        let val_r: Result[ConfigValue, str] = toml_parse_value(p)
+        if result_is_err(val_r) {
+            return Result.Err(result_err_or(val_r, "value parse failed"))
+        }
+        let val: ConfigValue = result_unwrap(val_r)
+        # Set the key under the current table path.
+        let full_path: list[str] = toml_path_append(current_table_path, key)
+        toml_ensure_path(root, full_path)
+        config_set_path(root, str_join(full_path, "."), val)
+        # Skip trailing whitespace / comment / newline.
+        toml_skip_ws_and_comments(p)
+        # Optional newline (the next iteration handles it).
+    }
+
+    return Result.Ok(root)
+}
+
+# ----------------------------------------------------------------------------
+# TomlParser — the parser state. A simple struct holding the source,
+# the current byte offset, and the line / column (for error messages).
+# ----------------------------------------------------------------------------

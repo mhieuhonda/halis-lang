@@ -1,0 +1,353 @@
+# ============================================================================
+# std/http2/http2_stream.hls - verbatim slice of the original std/http2.hls
+# (lines 1281..1627), split for maintainability. Loaded via the
+# std/http2.hls facade; not part of the public import API.
+# ============================================================================
+
+fn http2_stream_state_open() -> int { return 3 }
+fn http2_stream_state_half_closed_local() -> int { return 4 }
+fn http2_stream_state_half_closed_remote() -> int { return 5 }
+fn http2_stream_state_closed() -> int { return 6 }
+
+fn http2_stream_state_name(s: int) -> str {
+    if s == 0 { return "idle" }
+    if s == 1 { return "reserved-local" }
+    if s == 2 { return "reserved-remote" }
+    if s == 3 { return "open" }
+    if s == 4 { return "half-closed-local" }
+    if s == 5 { return "half-closed-remote" }
+    if s == 6 { return "closed" }
+    return "unknown"
+}
+
+struct Http2Stream {
+    stream_id: int,
+    state: int,
+    # Per-stream flow control window (debits on DATA send,
+    # credits on DATA recv + WINDOW_UPDATE).
+    send_window: int,
+    recv_window: int,
+    # PRIORITY (RFC 7540 §5.3) — dependency + weight.
+    # Stored for the caller; not enforced by Stage 39.
+    priority_dep: int,    # stream id this depends on (0 = root)
+    priority_weight: int, # 1..256 (RFC 7540 §5.3.1)
+    priority_exclusive: bool
+}
+
+# http2_stream_new(stream_id, initial_window) -> Http2Stream.
+# New streams start in the idle state with the given flow control
+# window (from SETTINGS INITIAL_WINDOW_SIZE).
+fn http2_stream_new(stream_id: int, initial_window: int) -> Http2Stream {
+    return Http2Stream {
+        stream_id: stream_id,
+        state: http2_stream_state_idle(),
+        send_window: initial_window,
+        recv_window: initial_window,
+        priority_dep: 0,
+        priority_weight: 16,    # RFC 7540 §5.3.5 default
+        priority_exclusive: false
+    }
+}
+
+# http2_stream_open(mut stream) -> void.
+# Transition idle -> open. Used when the stream's first HEADERS
+# frame is sent or received.
+fn http2_stream_open(mut stream: Http2Stream) -> void {
+    stream.state = http2_stream_state_open()
+}
+
+# http2_stream_close_local(mut stream) -> void.
+# Transition to half-closed-local (we sent END_STREAM) or closed
+# (if we were already half-closed-remote).
+fn http2_stream_close_local(mut stream: Http2Stream) -> void {
+    if stream.state == http2_stream_state_open() {
+        stream.state = http2_stream_state_half_closed_local()
+    } else if stream.state == http2_stream_state_half_closed_remote() {
+        stream.state = http2_stream_state_closed()
+    }
+}
+
+# http2_stream_close_remote(mut stream) -> void.
+# Transition to half-closed-remote (peer sent END_STREAM) or
+# closed (if we were already half-closed-local).
+fn http2_stream_close_remote(mut stream: Http2Stream) -> void {
+    if stream.state == http2_stream_state_open() {
+        stream.state = http2_stream_state_half_closed_remote()
+    } else if stream.state == http2_stream_state_half_closed_local() {
+        stream.state = http2_stream_state_closed()
+    }
+}
+
+# http2_stream_reset(mut stream) -> void.
+# Force-close the stream (RST_STREAM sent or received).
+fn http2_stream_reset(mut stream: Http2Stream) -> void {
+    stream.state = http2_stream_state_closed()
+}
+
+# http2_stream_is_closed(stream) -> bool.
+fn http2_stream_is_closed(stream: Http2Stream) -> bool {
+    return stream.state == http2_stream_state_closed()
+}
+
+# http2_stream_can_send_data(stream) -> bool.
+# Returns true iff the stream can accept outgoing DATA frames.
+# (i.e. is in open or half-closed-remote state, AND has a
+# positive send_window).
+fn http2_stream_can_send_data(stream: Http2Stream) -> bool {
+    if stream.state != http2_stream_state_open()
+        && stream.state != http2_stream_state_half_closed_remote() {
+        return false
+    }
+    return stream.send_window > 0
+}
+
+# ============================================================================
+# Connection — Http2Connection struct.
+#
+# Tracks the connection-level state: the next stream id to
+# allocate, the connection-level flow window, the SETTINGS of
+# both peers, and the list of active streams.
+#
+# Stage 39 does NOT perform real I/O — the connection struct is
+# a stateful container that the caller drives (read frame from
+# TCP, dispatch to connection method, write response frame to
+# TCP). The acceptance test exercises the state machine in
+# isolation; the multi-threaded server that uses this struct
+# is Stage 64 (std.http.server).
+# ============================================================================
+
+struct Http2Connection {
+    # True iff this is the client side (stream ids are odd).
+    # False iff this is the server side (stream ids are even).
+    is_client: bool,
+    # The next stream id to allocate (odd for client, even for server).
+    # Per RFC 7540 §5.1.1, a stream id MUST NOT be reused after close.
+    next_stream_id: int,
+    # Connection-level flow control window (RFC 7540 §6.9.1).
+    # Initialised to the default of 65535 (separate from the
+    # per-stream windows).
+    conn_send_window: int,
+    conn_recv_window: int,
+    # Local settings (what we announced to the peer).
+    local_settings: Http2Settings,
+    # Peer settings (what the peer announced to us).
+    peer_settings: Http2Settings,
+    # Active streams (key = stream id; we use a list since HLS has
+    # no int-keyed map — a small linear search is fine for the
+    # 100-stream case typical of an HTTP/2 connection).
+    streams: list[Http2Stream],
+    # The HPACK dynamic table (shared between encoder and decoder;
+    # one table per direction — RFC 7541 §4.2). Stage 39 uses a
+    # single table for both directions (correct for h2c-first-
+    # request; a real implementation would have separate encode
+    # and decode tables, but for the test workloads the single-
+    # table approach is byte-identical).
+    hpack_table: HpackDynamicTable,
+    # True iff we've sent our SETTINGS frame (used by the helper
+    # that drives the connection — Stage 39 just records the flag).
+    settings_sent: bool,
+    # True iff we've received the peer's SETTINGS frame.
+    settings_received: bool,
+    # The number of SETTINGS ACKs we owe the peer (incremented
+    # when we receive a SETTINGS frame, decremented when we send
+    # an ACK frame).
+    settings_acks_owed: int
+}
+
+# http2_connection_new(is_client) -> Http2Connection.
+# Construct a new connection with default settings and the correct
+# next_stream_id (1 for client, 2 for server — RFC 7540 §5.1.1).
+fn http2_connection_new(is_client: bool) -> Http2Connection {
+    let mut next_id: int = 1
+    if !is_client {
+        next_id = 2
+    }
+    return Http2Connection {
+        is_client: is_client,
+        next_stream_id: next_id,
+        conn_send_window: http2_default_initial_window_size(),
+        conn_recv_window: http2_default_initial_window_size(),
+        local_settings: http2_settings_default(),
+        peer_settings: http2_settings_default(),
+        streams: [],
+        hpack_table: http2_hpack_dynamic_table_new(http2_default_header_table_size()),
+        settings_sent: false,
+        settings_received: false,
+        settings_acks_owed: 0
+    }
+}
+
+# http2_connection_alloc_stream(mut conn, headers, end_stream) -> int.
+# Allocate a new stream id, create the stream, transition it to
+# open, and return the stream id. Used by the caller before
+# sending a HEADERS frame.
+fn http2_connection_alloc_stream(mut conn: Http2Connection, end_stream: bool) -> int {
+    let sid: int = conn.next_stream_id
+    let stream: Http2Stream = http2_stream_new(sid, conn.local_settings.initial_window_size)
+    http2_stream_open(stream)
+    if end_stream {
+        http2_stream_close_local(stream)
+    }
+    conn.streams.push(stream)
+    conn.next_stream_id = conn.next_stream_id + 2
+    return sid
+}
+
+# http2_connection_find_stream(conn, stream_id) -> Option[Http2Stream].
+# Returns the stream with the given id, or Option.None if not found.
+fn http2_connection_find_stream(conn: Http2Connection, stream_id: int) -> Option[Http2Stream] {
+    let mut i: int = 0
+    while i < conn.streams.len() {
+        if conn.streams.get(i).stream_id == stream_id {
+            return Option.Some(conn.streams.get(i))
+        }
+        i = i + 1
+    }
+    return Option.None
+}
+
+# http2_connection_apply_settings(mut conn, settings) -> void.
+# Apply the peer's SETTINGS to the connection. Adjusts the
+# HPACK dynamic table size and the per-stream windows if
+# INITIAL_WINDOW_SIZE changed (RFC 7540 §6.9.2 — a SETTINGS
+# INITIAL_WINDOW_SIZE update causes a delta to be applied to
+# ALL active streams).
+fn http2_connection_apply_settings(mut conn: Http2Connection, settings: Http2Settings) -> void {
+    let old_iws: int = conn.peer_settings.initial_window_size
+    conn.peer_settings = settings
+    http2_hpack_dynamic_table_set_max_size(conn.hpack_table, settings.header_table_size)
+    if settings.initial_window_size != old_iws {
+        let delta: int = settings.initial_window_size - old_iws
+        let mut i: int = 0
+        while i < conn.streams.len() {
+            let s: Http2Stream = conn.streams.get(i)
+            s.send_window = s.send_window + delta
+            # If the delta makes the window negative, the stream
+            # is in error (RFC 7540 §6.9.2 — "an endpoint MUST NOT
+            # allow a window to exceed 2^31-1, but a SETTINGS
+            # update can make an existing window negative"). The
+            # caller should send RST_STREAM with FLOW_CONTROL_ERROR.
+            i = i + 1
+        }
+    }
+}
+
+# http2_connection_send_data(mut conn, stream_id, n) -> Result[int, str].
+# Debit n bytes from the stream's send window and the connection's
+# send window. Returns Result.Ok(0) on success, Result.Err(msg) on
+# insufficient window (caller should buffer or wait for
+# WINDOW_UPDATE).
+fn http2_connection_send_data(mut conn: Http2Connection, stream_id: int, n: int) -> Result[int, str] {
+    let stream_opt: Option[Http2Stream] = http2_connection_find_stream(conn, stream_id)
+    if option_is_none(stream_opt) {
+        return Result.Err("http2_connection_send_data: unknown stream " + stream_id.to_str())
+    }
+    let stream: Http2Stream = option_unwrap(stream_opt)
+    if stream.state != http2_stream_state_open()
+        && stream.state != http2_stream_state_half_closed_remote() {
+        return Result.Err("http2_connection_send_data: stream not open (state="
+            + http2_stream_state_name(stream.state) + ")")
+    }
+    if stream.send_window < n {
+        return Result.Err("http2_connection_send_data: stream window exhausted (have "
+            + stream.send_window.to_str() + ", need " + n.to_str() + ")")
+    }
+    if conn.conn_send_window < n {
+        return Result.Err("http2_connection_send_data: connection window exhausted (have "
+            + conn.conn_send_window.to_str() + ", need " + n.to_str() + ")")
+    }
+    stream.send_window = stream.send_window - n
+    conn.conn_send_window = conn.conn_send_window - n
+    # Persist the updated stream back into the connection's list.
+    http2_connection_update_stream(conn, stream)
+    return Result.Ok(0)
+}
+
+# http2_connection_recv_window_update(mut conn, stream_id, n) -> void.
+# Credit n bytes to the stream's send window (if stream_id > 0)
+# or the connection's send window (if stream_id == 0). Used when
+# receiving a WINDOW_UPDATE frame.
+fn http2_connection_recv_window_update(mut conn: Http2Connection, stream_id: int, n: int) -> void {
+    if stream_id == 0 {
+        conn.conn_send_window = conn.conn_send_window + n
+        return
+    }
+    let stream_opt: Option[Http2Stream] = http2_connection_find_stream(conn, stream_id)
+    if option_is_none(stream_opt) {
+        return
+    }
+    let stream: Http2Stream = option_unwrap(stream_opt)
+    stream.send_window = stream.send_window + n
+    http2_connection_update_stream(conn, stream)
+}
+
+# http2_connection_update_stream(mut conn, stream) -> void.
+# Replace the stream with the matching id in conn.streams with
+# the given (mutated) stream struct. (HLS structs are by-value;
+# mutations don't propagate back through the list automatically.)
+fn http2_connection_update_stream(mut conn: Http2Connection, stream: Http2Stream) -> void {
+    let mut i: int = 0
+    while i < conn.streams.len() {
+        if conn.streams.get(i).stream_id == stream.stream_id {
+            let new_list: list[Http2Stream] = []
+            let mut j: int = 0
+            while j < conn.streams.len() {
+                if j == i {
+                    new_list.push(stream)
+                } else {
+                    new_list.push(conn.streams.get(j))
+                }
+                j = j + 1
+            }
+            conn.streams = new_list
+            return
+        }
+        i = i + 1
+    }
+}
+
+# ============================================================================
+# Frame constructors — high-level helpers that build specific frame
+# types. Each returns an Http2Frame ready to be serialised and sent.
+# ============================================================================
+
+# http2_make_settings_frame(settings) -> Http2Frame.
+# Build a SETTINGS frame carrying the given parameters. The ACK
+# flag is NOT set (use http2_make_settings_ack_frame for that).
+fn http2_make_settings_frame(settings: Http2Settings) -> Http2Frame {
+    let payload: str = http2_settings_encode(settings)
+    return http2_frame_new(http2_frame_type_settings(), 0, 0, payload)
+}
+
+# http2_make_settings_ack_frame() -> Http2Frame.
+# Build an empty SETTINGS frame with the ACK flag set.
+fn http2_make_settings_ack_frame() -> Http2Frame {
+    return http2_frame_new(http2_frame_type_settings(), http2_flag_ack(), 0, "")
+}
+
+# http2_make_ping_frame(opaque_data) -> Http2Frame.
+# Build a PING frame. The payload MUST be exactly 8 bytes
+# (RFC 7540 §6.7). The stream id MUST be 0.
+fn http2_make_ping_frame(opaque_data: str) -> Http2Frame {
+    if opaque_data.len() != 8 {
+        panic("http2_make_ping_frame: opaque_data must be 8 bytes (got "
+            + opaque_data.len().to_str() + ")")
+    }
+    return http2_frame_new(http2_frame_type_ping(), 0, 0, opaque_data)
+}
+
+# http2_make_ping_ack_frame(opaque_data) -> Http2Frame.
+# Build a PING frame with the ACK flag set (echoes the opaque
+# data back to the sender).
+fn http2_make_ping_ack_frame(opaque_data: str) -> Http2Frame {
+    if opaque_data.len() != 8 {
+        panic("http2_make_ping_ack_frame: opaque_data must be 8 bytes")
+    }
+    return http2_frame_new(http2_frame_type_ping(), http2_flag_ack(), 0, opaque_data)
+}
+
+# http2_make_goaway_frame(last_stream_id, error_code, debug_data) -> Http2Frame.
+# Build a GOAWAY frame (RFC 7540 §6.8). The payload is:
+#   4 bytes: last stream id (31-bit, R bit reserved)
+#   4 bytes: error code (32-bit)
+#   N bytes: debug data (optional, UTF-8 for humans)

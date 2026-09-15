@@ -1,0 +1,338 @@
+# ============================================================================
+# std/http2/http2_conn.hls - verbatim slice of the original std/http2.hls
+# (lines 1628..1959), split for maintainability. Loaded via the
+# std/http2.hls facade; not part of the public import API.
+# ============================================================================
+
+fn http2_make_goaway_frame(last_stream_id: int, error_code: int, debug_data: str) -> Http2Frame {
+    let payload: str = http2_encode_stream_id_31(last_stream_id)
+        + chr((error_code / 16777216) % 256)
+        + chr((error_code / 65536) % 256)
+        + chr((error_code / 256) % 256)
+        + chr(error_code % 256)
+        + debug_data
+    return http2_frame_new(http2_frame_type_goaway(), 0, 0, payload)
+}
+
+# http2_make_rst_stream_frame(stream_id, error_code) -> Http2Frame.
+# Build a RST_STREAM frame (RFC 7540 §6.4). Payload is a 4-byte
+# error code.
+fn http2_make_rst_stream_frame(stream_id: int, error_code: int) -> Http2Frame {
+    if stream_id == 0 {
+        panic("http2_make_rst_stream_frame: stream_id must not be 0")
+    }
+    let payload: str = chr((error_code / 16777216) % 256)
+        + chr((error_code / 65536) % 256)
+        + chr((error_code / 256) % 256)
+        + chr(error_code % 256)
+    return http2_frame_new(http2_frame_type_rst_stream(), 0, stream_id, payload)
+}
+
+# http2_make_window_update_frame(stream_id, increment) -> Http2Frame.
+# Build a WINDOW_UPDATE frame (RFC 7540 §6.9). Payload is a 31-bit
+# increment. stream_id 0 means connection-level.
+fn http2_make_window_update_frame(stream_id: int, increment: int) -> Http2Frame {
+    let payload: str = http2_encode_stream_id_31(increment)
+    return http2_frame_new(http2_frame_type_window_update(), 0, stream_id, payload)
+}
+
+# http2_make_headers_frame(stream_id, headers, end_stream, end_headers) -> Http2Frame.
+# Build a HEADERS frame (RFC 7540 §6.2). The headers are HPACK-
+# encoded (literal, no indexing — see http2_hpack_encode_header_block).
+# end_stream sets END_STREAM (the request has no body); end_headers
+# sets END_HEADERS (the headers are complete — no CONTINUATION
+# follows).
+fn http2_make_headers_frame(stream_id: int, headers: list[HttpHeader], end_stream: bool, end_headers: bool) -> Http2Frame {
+    let block: str = http2_hpack_encode_header_block(headers)
+    let mut flags: int = 0
+    if end_stream {
+        flags = int_or(flags, http2_flag_end_stream())
+    }
+    if end_headers {
+        flags = int_or(flags, http2_flag_end_headers())
+    }
+    return http2_frame_new(http2_frame_type_headers(), flags, stream_id, block)
+}
+
+# http2_make_data_frame(stream_id, data, end_stream) -> Http2Frame.
+# Build a DATA frame (RFC 7540 §6.1). The payload is the raw
+# bytes (NOT HPACK-encoded — DATA frames carry the body).
+fn http2_make_data_frame(stream_id: int, data: str, end_stream: bool) -> Http2Frame {
+    let mut flags: int = 0
+    if end_stream {
+        flags = int_or(flags, http2_flag_end_stream())
+    }
+    return http2_frame_new(http2_frame_type_data(), flags, stream_id, data)
+}
+
+# http2_make_push_promise_frame(stream_id, promised_stream_id, headers) -> Http2Frame.
+# Build a PUSH_PROMISE frame (RFC 7540 §6.6). The payload is:
+#   4 bytes: promised stream id (31-bit, R bit reserved)
+#   N bytes: HPACK-encoded header block (the synthetic request)
+# END_HEADERS is always set (Stage 39 does not split PUSH_PROMISE
+# across CONTINUATION).
+fn http2_make_push_promise_frame(stream_id: int, promised_stream_id: int, headers: list[HttpHeader]) -> Http2Frame {
+    let block: str = http2_hpack_encode_header_block(headers)
+    let payload: str = http2_encode_stream_id_31(promised_stream_id) + block
+    return http2_frame_new(http2_frame_type_push_promise(), http2_flag_end_headers(), stream_id, payload)
+}
+
+# http2_make_priority_frame(stream_id, dep, weight, exclusive) -> Http2Frame.
+# Build a PRIORITY frame (RFC 7540 §6.3). The payload is:
+#   4 bytes: dependency stream id (31-bit) + exclusive bit (high)
+#   1 byte: weight (1..256, encoded as 0..255)
+fn http2_make_priority_frame(stream_id: int, dep: int, weight: int, exclusive: bool) -> Http2Frame {
+    let mut dep_with_e: int = int_and(dep, 2147483647)
+    if exclusive {
+        dep_with_e = int_or(dep_with_e, 2147483648)
+    }
+    let payload: str = chr((dep_with_e / 16777216) % 256)
+        + chr((dep_with_e / 65536) % 256)
+        + chr((dep_with_e / 256) % 256)
+        + chr(dep_with_e % 256)
+        + chr(int_and(weight - 1, 255))
+    return http2_frame_new(http2_frame_type_priority(), 0, stream_id, payload)
+}
+
+# ============================================================================
+# Frame payload parsers — extract the typed fields from a parsed frame.
+# These are pure-HLS decoders that operate on the payload str.
+# ============================================================================
+
+# http2_parse_rst_stream_payload(payload) -> Result[int, str].
+# Returns the error code. Payload MUST be 4 bytes.
+fn http2_parse_rst_stream_payload(payload: str) -> Result[int, str] {
+    if payload.len() != 4 {
+        return Result.Err("RST_STREAM payload must be 4 bytes (got "
+            + payload.len().to_str() + ")")
+    }
+    let b0: int = payload.byte_at(0)
+    let b1: int = payload.byte_at(1)
+    let b2: int = payload.byte_at(2)
+    let b3: int = payload.byte_at(3)
+    return Result.Ok(b0 * 16777216 + b1 * 65536 + b2 * 256 + b3)
+}
+
+# http2_parse_window_update_payload(payload) -> Result[int, str].
+# Returns the increment. Payload MUST be 4 bytes.
+fn http2_parse_window_update_payload(payload: str) -> Result[int, str] {
+    if payload.len() != 4 {
+        return Result.Err("WINDOW_UPDATE payload must be 4 bytes (got "
+            + payload.len().to_str() + ")")
+    }
+    return Result.Ok(http2_decode_stream_id_31(payload))
+}
+
+# http2_parse_goaway_payload(payload) -> Result[Http2GoawayFrame, str].
+# Parses a GOAWAY frame's payload into a typed struct.
+struct Http2GoawayFrame {
+    last_stream_id: int,
+    error_code: int,
+    debug_data: str
+}
+
+fn http2_parse_goaway_payload(payload: str) -> Result[Http2GoawayFrame, str] {
+    if payload.len() < 8 {
+        return Result.Err("GOAWAY payload must be >= 8 bytes (got "
+            + payload.len().to_str() + ")")
+    }
+    let last_sid: int = http2_decode_stream_id_31(payload)
+    let b0: int = payload.byte_at(4)
+    let b1: int = payload.byte_at(5)
+    let b2: int = payload.byte_at(6)
+    let b3: int = payload.byte_at(7)
+    let err_code: int = b0 * 16777216 + b1 * 65536 + b2 * 256 + b3
+    let mut debug: str = ""
+    if payload.len() > 8 {
+        debug = payload.slice(8, payload.len())
+    }
+    return Result.Ok(Http2GoawayFrame {
+        last_stream_id: last_sid,
+        error_code: err_code,
+        debug_data: debug
+    })
+}
+
+# http2_parse_ping_payload(payload) -> Result[str, str].
+# Returns the opaque data. Payload MUST be 8 bytes.
+fn http2_parse_ping_payload(payload: str) -> Result[str, str] {
+    if payload.len() != 8 {
+        return Result.Err("PING payload must be 8 bytes (got "
+            + payload.len().to_str() + ")")
+    }
+    return Result.Ok(payload)
+}
+
+# http2_parse_push_promise_payload(payload) -> Result[Http2PushPromiseFrame, str].
+# Parses a PUSH_PROMISE frame's payload into a typed struct.
+struct Http2PushPromiseFrame {
+    promised_stream_id: int,
+    header_block: str
+}
+
+fn http2_parse_push_promise_payload(payload: str) -> Result[Http2PushPromiseFrame, str] {
+    if payload.len() < 4 {
+        return Result.Err("PUSH_PROMISE payload must be >= 4 bytes (got "
+            + payload.len().to_str() + ")")
+    }
+    let promised_sid: int = http2_decode_stream_id_31(payload)
+    let mut block: str = ""
+    if payload.len() > 4 {
+        block = payload.slice(4, payload.len())
+    }
+    return Result.Ok(Http2PushPromiseFrame {
+        promised_stream_id: promised_sid,
+        header_block: block
+    })
+}
+
+# http2_parse_priority_payload(payload) -> Result[Http2PriorityFrame, str].
+# Parses a PRIORITY frame's payload into a typed struct.
+struct Http2PriorityFrame {
+    dependency_stream_id: int,
+    weight: int,
+    exclusive: bool
+}
+
+fn http2_parse_priority_payload(payload: str) -> Result[Http2PriorityFrame, str] {
+    if payload.len() != 5 {
+        return Result.Err("PRIORITY payload must be 5 bytes (got "
+            + payload.len().to_str() + ")")
+    }
+    let dep_raw: int = payload.byte_at(0) * 16777216
+        + payload.byte_at(1) * 65536
+        + payload.byte_at(2) * 256
+        + payload.byte_at(3)
+    let exclusive: bool = int_and(dep_raw, 2147483648) != 0
+    let dep: int = int_and(dep_raw, 2147483647)
+    let weight: int = payload.byte_at(4) + 1   # 0..255 stored, 1..256 actual
+    return Result.Ok(Http2PriorityFrame {
+        dependency_stream_id: dep,
+        weight: weight,
+        exclusive: exclusive
+    })
+}
+
+# ============================================================================
+# Connection preface — verification helper.
+# ============================================================================
+
+# http2_verify_client_preface(s) -> Result[int, str].
+# Verifies that s starts with the HTTP/2 client connection preface
+# (the 24-byte magic string). Returns Result.Ok(24) (the number
+# of bytes consumed) on success, Result.Err(msg) on failure.
+# A failure indicates either an HTTP/1.x client (which would send
+# a request line instead) or a corrupted connection.
+fn http2_verify_client_preface(s: str) -> Result[int, str] {
+    let preface: str = http2_connection_preface()
+    if s.len() < preface.len() {
+        return Result.Err("http2_verify_client_preface: short input (have "
+            + s.len().to_str() + ", need " + preface.len().to_str() + ")")
+    }
+    let actual: str = s.slice(0, preface.len())
+    if actual != preface {
+        return Result.Err("http2_verify_client_preface: preface mismatch")
+    }
+    return Result.Ok(preface.len())
+}
+
+# ============================================================================
+# High-level helpers — convenience entry points.
+# ============================================================================
+
+# http2_hpack_decode_block(block) -> Result[list[HttpHeader], str].
+# Convenience wrapper: decode a header block with a fresh dynamic
+# table (no incremental indexing state shared with the caller).
+# Used by the acceptance test to verify the round-trip property
+# of the encoder + decoder.
+fn http2_hpack_decode_block(block: str) -> Result[list[HttpHeader], str] {
+    let table: HpackDynamicTable = http2_hpack_dynamic_table_new(http2_default_header_table_size())
+    return http2_hpack_decode_header_block(block, table)
+}
+
+# http2_client_initiate_connection(settings) -> list[Http2Frame].
+# Returns the initial frame sequence a client sends on a new
+# HTTP/2 connection:
+#   1. The 24-byte connection preface (NOT a frame — returned as
+#      the "settings_sent" flag on the connection; the caller
+#      writes the raw bytes to the socket before sending any
+#      frames).
+#   2. The client's SETTINGS frame.
+#   3. (After the server's SETTINGS frame arrives, the client
+#      sends a SETTINGS ACK.)
+#
+# This helper returns ONLY the SETTINGS frame; the caller writes
+# the preface bytes separately (via http2_connection_preface()).
+fn http2_client_initiate_connection(settings: Http2Settings) -> list[Http2Frame] {
+    return [http2_make_settings_frame(settings)]
+}
+
+# http2_server_initiate_connection(local_settings) -> list[Http2Frame].
+# Returns the server's initial SETTINGS frame. The server does
+# NOT send a connection preface (only the client does — RFC 7540
+# §3.4). After the client's preface + SETTINGS arrives, the
+# server sends its own SETTINGS, then a SETTINGS ACK for the
+# client's SETTINGS.
+fn http2_server_initiate_connection(local_settings: Http2Settings) -> list[Http2Frame] {
+    return [http2_make_settings_frame(local_settings)]
+}
+
+# http2_alpn_negotiate(offered_protocols, supported_protocols) -> Option[str].
+# ALPN negotiation (RFC 7301 §3.2): the client offers a list of
+# protocols; the server picks the FIRST one in the client's list
+# that it also supports. Returns Option.Some(token) on agreement,
+# Option.None on no overlap. The caller passes the result to the
+# TLS layer to indicate the negotiated protocol.
+#
+# Stage 39 does NOT perform TLS itself — this is a pure-HLS
+# helper for the negotiation logic. The actual TLS handshake is
+# at the reverse-proxy layer (or a future Stage 65 std.tls module
+# that links libssl). The "h2" token means HTTP/2 over TLS; the
+# "h2c" token means HTTP/2 over cleartext (used with the Upgrade
+# mechanism, not ALPN).
+fn http2_alpn_negotiate(offered: list[str], supported: list[str]) -> Option[str] {
+    let mut i: int = 0
+    while i < offered.len() {
+        let candidate: str = offered.get(i)
+        let mut j: int = 0
+        while j < supported.len() {
+            if candidate == supported.get(j) {
+                return Option.Some(candidate)
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return Option.None
+}
+
+# ============================================================================
+# Pure decoder for a complete SETTINGS frame (frame wrapper).
+# Used by the acceptance test to verify a SETTINGS frame
+# round-trips through encode -> serialize -> parse -> decode.
+# ============================================================================
+
+# http2_decode_settings_frame(frame) -> Result[Http2Settings, str].
+# Verifies the frame is a SETTINGS frame with no ACK flag, then
+# decodes the payload.
+fn http2_decode_settings_frame(frame: Http2Frame) -> Result[Http2Settings, str] {
+    if frame.frame_type != http2_frame_type_settings() {
+        return Result.Err("expected SETTINGS frame, got "
+            + http2_frame_type_name(frame.frame_type))
+    }
+    if int_and(frame.flags, http2_flag_ack()) != 0 {
+        if frame.payload.len() != 0 {
+            return Result.Err("SETTINGS ACK with non-empty payload")
+        }
+        return Result.Err("SETTINGS ACK frame — use http2_settings_decode on the original")
+    }
+    return http2_settings_decode(frame.payload)
+}
+
+# http2_is_settings_ack(frame) -> bool.
+# Returns true iff frame is a SETTINGS frame with the ACK flag set.
+fn http2_is_settings_ack(frame: Http2Frame) -> bool {
+    return frame.frame_type == http2_frame_type_settings()
+        && int_and(frame.flags, http2_flag_ack()) != 0
+        && frame.payload.len() == 0
+}

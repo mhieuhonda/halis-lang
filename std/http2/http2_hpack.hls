@@ -1,0 +1,640 @@
+# ============================================================================
+# std/http2/http2_hpack.hls - verbatim slice of the original std/http2.hls
+# (lines 647..1280), split for maintainability. Loaded via the
+# std/http2.hls facade; not part of the public import API.
+# ============================================================================
+
+fn http2_hpack_static_table() -> list[HpackStaticEntry] {
+    return [
+        HpackStaticEntry { name: ":authority", value: "" },
+        HpackStaticEntry { name: ":method", value: "GET" },
+        HpackStaticEntry { name: ":method", value: "POST" },
+        HpackStaticEntry { name: ":path", value: "/" },
+        HpackStaticEntry { name: ":path", value: "/index.html" },
+        HpackStaticEntry { name: ":scheme", value: "http" },
+        HpackStaticEntry { name: ":scheme", value: "https" },
+        HpackStaticEntry { name: ":status", value: "200" },
+        HpackStaticEntry { name: ":status", value: "204" },
+        HpackStaticEntry { name: ":status", value: "206" },
+        HpackStaticEntry { name: ":status", value: "304" },
+        HpackStaticEntry { name: ":status", value: "400" },
+        HpackStaticEntry { name: ":status", value: "404" },
+        HpackStaticEntry { name: ":status", value: "500" },
+        HpackStaticEntry { name: "accept-charset", value: "" },
+        HpackStaticEntry { name: "accept-encoding", value: "gzip, deflate" },
+        HpackStaticEntry { name: "accept-language", value: "" },
+        HpackStaticEntry { name: "accept-ranges", value: "" },
+        HpackStaticEntry { name: "accept", value: "" },
+        HpackStaticEntry { name: "access-control-allow-origin", value: "" },
+        HpackStaticEntry { name: "age", value: "" },
+        HpackStaticEntry { name: "allow", value: "" },
+        HpackStaticEntry { name: "authorization", value: "" },
+        HpackStaticEntry { name: "cache-control", value: "" },
+        HpackStaticEntry { name: "content-disposition", value: "" },
+        HpackStaticEntry { name: "content-encoding", value: "" },
+        HpackStaticEntry { name: "content-language", value: "" },
+        HpackStaticEntry { name: "content-length", value: "" },
+        HpackStaticEntry { name: "content-location", value: "" },
+        HpackStaticEntry { name: "content-range", value: "" },
+        HpackStaticEntry { name: "content-type", value: "" },
+        HpackStaticEntry { name: "cookie", value: "" },
+        HpackStaticEntry { name: "date", value: "" },
+        HpackStaticEntry { name: "etag", value: "" },
+        HpackStaticEntry { name: "expect", value: "" },
+        HpackStaticEntry { name: "expires", value: "" },
+        HpackStaticEntry { name: "from", value: "" },
+        HpackStaticEntry { name: "host", value: "" },
+        HpackStaticEntry { name: "if-match", value: "" },
+        HpackStaticEntry { name: "if-modified-since", value: "" },
+        HpackStaticEntry { name: "if-none-match", value: "" },
+        HpackStaticEntry { name: "if-range", value: "" },
+        HpackStaticEntry { name: "if-unmodified-since", value: "" },
+        HpackStaticEntry { name: "last-modified", value: "" },
+        HpackStaticEntry { name: "link", value: "" },
+        HpackStaticEntry { name: "location", value: "" },
+        HpackStaticEntry { name: "max-forwards", value: "" },
+        HpackStaticEntry { name: "proxy-authenticate", value: "" },
+        HpackStaticEntry { name: "proxy-authorization", value: "" },
+        HpackStaticEntry { name: "range", value: "" },
+        HpackStaticEntry { name: "referer", value: "" },
+        HpackStaticEntry { name: "refresh", value: "" },
+        HpackStaticEntry { name: "retry-after", value: "" },
+        HpackStaticEntry { name: "server", value: "" },
+        HpackStaticEntry { name: "set-cookie", value: "" },
+        HpackStaticEntry { name: "strict-transport-security", value: "" },
+        HpackStaticEntry { name: "transfer-encoding", value: "" },
+        HpackStaticEntry { name: "user-agent", value: "" },
+        HpackStaticEntry { name: "vary", value: "" },
+        HpackStaticEntry { name: "via", value: "" },
+        HpackStaticEntry { name: "www-authenticate", value: "" }
+    ]
+}
+
+# http2_hpack_static_lookup(index) -> Result[HpackStaticEntry, str].
+# Returns the static table entry at the given 1-based index
+# (RFC 7541 §2.3.1 — index 0 is reserved). Returns Err for
+# out-of-range indices.
+fn http2_hpack_static_lookup(index: int) -> Result[HpackStaticEntry, str] {
+    if index < 1 || index > 61 {
+        return Result.Err("http2_hpack_static_lookup: index out of range ("
+            + index.to_str() + "; valid 1..61)")
+    }
+    let table: list[HpackStaticEntry] = http2_hpack_static_table()
+    return Result.Ok(table.get(index - 1))
+}
+
+# ============================================================================
+# HPACK — dynamic table.
+#
+# The dynamic table is a FIFO of (name, value) entries. The total
+# size is the sum of (name.len() + value.len() + 32) per entry
+# (RFC 7541 §4.1 — the 32-byte overhead accounts for the entry's
+# fixed-size metadata in C implementations; HLS doesn't have that
+# overhead, but the accounting is identical so peers agree on size).
+#
+# When a new entry is added that would exceed the table size limit,
+# entries are evicted from the END (oldest first) until the new
+# entry fits. If the new entry alone is larger than the limit, the
+# table is cleared and the new entry is NOT added (RFC 7541 §4.4).
+# ============================================================================
+
+struct HpackDynamicTable {
+    entries: list[HpackStaticEntry],  # name+value pairs; reuse HpackStaticEntry struct
+    size: int,                        # sum of (name.len + value.len + 32) per entry
+    max_size: int                     # current size limit (from SETTINGS or dynamic update)
+}
+
+# http2_hpack_dynamic_table_new(max_size) -> HpackDynamicTable.
+# Construct an empty dynamic table with the given initial size
+# limit (typically http2_default_header_table_size()).
+fn http2_hpack_dynamic_table_new(max_size: int) -> HpackDynamicTable {
+    return HpackDynamicTable {
+        entries: [],
+        size: 0,
+        max_size: max_size
+    }
+}
+
+# http2_hpack_entry_size(name, value) -> int. The size of an entry
+# is name.len() + value.len() + 32 (RFC 7541 §4.1).
+fn http2_hpack_entry_size(name: str, value: str) -> int {
+    return name.len() + value.len() + 32
+}
+
+# http2_hpack_dynamic_table_add(table, name, value) -> void.
+# Add a new entry to the FRONT of the dynamic table. Evicts from
+# the END (oldest first) until the new entry fits. If the new
+# entry alone is larger than max_size, the table is cleared and
+# the entry is NOT added (RFC 7541 §4.4 — "An entry larger than
+# the maximum size causes the table to be emptied of all existing
+# entries, and the new entry not to be inserted").
+#
+# This function mutates the table struct (entries list, size).
+fn http2_hpack_dynamic_table_add(mut table: HpackDynamicTable, name: str, value: str) -> void {
+    let entry_size: int = http2_hpack_entry_size(name, value)
+    # If the entry alone exceeds max_size, clear the table and skip.
+    if entry_size > table.max_size {
+        table.entries = []
+        table.size = 0
+        return
+    }
+    # Evict from the end (oldest) until the new entry fits.
+    while table.size + entry_size > table.max_size && table.entries.len() > 0 {
+        let last: HpackStaticEntry = table.entries.get(table.entries.len() - 1)
+        table.size = table.size - http2_hpack_entry_size(last.name, last.value)
+        # HLS lists have no .take(n) method — we rebuild the list
+        # without the last element via a copy loop.
+        table.entries = http2_list_drop_last(table.entries)
+    }
+    # Prepend the new entry (newest at index 0).
+    let new_list: list[HpackStaticEntry] = [HpackStaticEntry { name: name, value: value }]
+    let mut i: int = 0
+    while i < table.entries.len() {
+        new_list.push(table.entries.get(i))
+        i = i + 1
+    }
+    table.entries = new_list
+    table.size = table.size + entry_size
+}
+
+# http2_list_drop_last(lst) -> list. Returns a copy of lst without
+# its last element. Panics on empty (caller must check len > 0
+# before calling — RFC 7541's eviction loop does).
+fn http2_list_drop_last(lst: list[HpackStaticEntry]) -> list[HpackStaticEntry] {
+    let out: list[HpackStaticEntry] = []
+    let mut i: int = 0
+    while i < lst.len() - 1 {
+        out.push(lst.get(i))
+        i = i + 1
+    }
+    return out
+}
+
+# http2_hpack_dynamic_table_lookup(table, index) -> Result[HpackStaticEntry, str].
+# Returns the dynamic table entry at the given 1-based index
+# (index 1 is the newest entry). Out-of-range returns Err.
+fn http2_hpack_dynamic_table_lookup(table: HpackDynamicTable, index: int) -> Result[HpackStaticEntry, str] {
+    if index < 1 || index > table.entries.len() {
+        return Result.Err("http2_hpack_dynamic_table_lookup: index out of range ("
+            + index.to_str() + "; valid 1.." + table.entries.len().to_str() + ")")
+    }
+    return Result.Ok(table.entries.get(index - 1))
+}
+
+# http2_hpack_dynamic_table_set_max_size(mut table, new_max) -> void.
+# Update the max_size and evict from the end until size <= max_size.
+# Used when a SETTINGS HEADER_TABLE_SIZE update is received.
+fn http2_hpack_dynamic_table_set_max_size(mut table: HpackDynamicTable, new_max: int) -> void {
+    table.max_size = new_max
+    while table.size > new_max && table.entries.len() > 0 {
+        let last: HpackStaticEntry = table.entries.get(table.entries.len() - 1)
+        table.size = table.size - http2_hpack_entry_size(last.name, last.value)
+        table.entries = http2_list_drop_last(table.entries)
+    }
+}
+
+# ============================================================================
+# HPACK — decoder struct.
+#
+# HLS structs have REFERENCE semantics (SPEC §2.1 — Name is "Name*"
+# in the C ABI). This means a function that takes a HpackDecoder
+# and mutates its `pos` / `err` fields will be seen by the caller.
+# This is the same pattern that std/json.hls uses (JsonParser).
+#
+# The decoder holds:
+#   * block — the HPACK header block bytes (read-only).
+#   * pos   — the current byte offset (advanced as we decode).
+#   * err   — "" on success; non-empty on a parse error.
+#
+# Decode functions return their value directly (int or str); on
+# error they return a sentinel (0 / "") and set `err`. Callers
+# MUST check `err` after each decode call.
+# ============================================================================
+
+struct HpackDecoder {
+    block: str,
+    pos: int,
+    err: str
+}
+
+# http2_hpack_decoder_new(block) -> HpackDecoder. Construct a fresh
+# decoder over the given header block bytes.
+fn http2_hpack_decoder_new(block: str) -> HpackDecoder {
+    return HpackDecoder { block: block, pos: 0, err: "" }
+}
+
+# http2_hpack_decoder_set_err(d, msg) -> void. Records an error if
+# one is not already set (the first error wins — RFC 7541 §4.3 says
+# the connection MUST be torn down with COMPRESSION_ERROR after the
+# first malformed header block; subsequent decode calls become no-ops).
+fn http2_hpack_decoder_set_err(mut d: HpackDecoder, msg: str) -> void {
+    if d.err == "" {
+        d.err = msg
+    }
+}
+
+# ============================================================================
+# HPACK — integer decoder (RFC 7541 §5.1).
+#
+# An HPACK integer is encoded in N bits, where N is the prefix
+# length (1-8). The high (8-N) bits of the first byte are the
+# "flag" bits of the header field representation; the low N bits
+# are the integer's first "digit". If those N bits are all 1s
+# (the maximum value for N bits), the integer continues in
+# subsequent bytes as a varint (7 bits per byte, MSB = continue).
+#
+# Example (5-bit prefix, value 1337):
+#   first byte: XXX 11111   (low 5 bits all 1s -> multi-byte)
+#   byte 2:    1 0010101   (MSB=1 continue; low 7 bits = 21)
+#   byte 3:    0 0001010   (MSB=0 last; low 7 bits = 10)
+#   value = 31 + 21*128 + 10 = 1337
+#
+# The decoder takes (d, prefix_bits) and returns the integer value.
+# On success, d.pos is advanced past the integer. On error, d.err
+# is set and the function returns 0.
+# ============================================================================
+
+# http2_hpack_decode_integer(d, prefix_bits) -> int.
+fn http2_hpack_decode_integer(mut d: HpackDecoder, prefix_bits: int) -> int {
+    if d.err != "" {
+        return 0
+    }
+    if d.pos >= d.block.len() {
+        http2_hpack_decoder_set_err(d, "http2_hpack_decode_integer: pos past end of input")
+        return 0
+    }
+    if prefix_bits < 1 || prefix_bits > 8 {
+        http2_hpack_decoder_set_err(d, "http2_hpack_decode_integer: prefix_bits out of range ("
+            + prefix_bits.to_str() + "; valid 1..8)")
+        return 0
+    }
+    # The max value of the N-bit prefix is (1 << N) - 1.
+    let prefix_max: int = bits_pow2(prefix_bits) - 1
+    let first_byte: int = d.block.byte_at(d.pos)
+    # Mask off the high (8 - prefix_bits) bits — they're not part of
+    # the integer. bits_and with prefix_max achieves this.
+    let mut value: int = int_and(first_byte, prefix_max)
+    d.pos = d.pos + 1
+    if value < prefix_max {
+        # Single-byte integer — return immediately.
+        return value
+    }
+    # Multi-byte: read continuation bytes (7 bits + MSB=continue).
+    let mut shift: int = 0
+    while d.pos < d.block.len() {
+        let b: int = d.block.byte_at(d.pos)
+        d.pos = d.pos + 1
+        let lower7: int = int_and(b, 127)
+        # value += lower7 << shift. Use int_shl for the shift.
+        # Overflow check: if shift >= 56, we'd overflow int64.
+        if shift >= 56 {
+            http2_hpack_decoder_set_err(d, "http2_hpack_decode_integer: integer too large (shift >= 56)")
+            return 0
+        }
+        value = value + int_shl(lower7, shift)
+        shift = shift + 7
+        # MSB=0 means this is the last byte.
+        if int_and(b, 128) == 0 {
+            return value
+        }
+    }
+    http2_hpack_decoder_set_err(d, "http2_hpack_decode_integer: truncated multi-byte integer")
+    return 0
+}
+
+# http2_hpack_encode_integer(value, prefix_bits, prefix_flags) -> str.
+# Encodes `value` with `prefix_bits`-bit prefix; the high
+# (8 - prefix_bits) bits of the first byte are set to
+# `prefix_flags` (the representation's flag bits — e.g. 0x00 for
+# "Literal Header Field without Indexing", 0x40 for "with
+# incremental indexing", 0x10 for "Never Indexed"). The low
+# prefix_bits are the integer.
+fn http2_hpack_encode_integer(value: int, prefix_bits: int, prefix_flags: int) -> str {
+    let prefix_max: int = bits_pow2(prefix_bits) - 1
+    if value < prefix_max {
+        return chr(int_or(prefix_flags, value))
+    }
+    # Multi-byte: first byte has the prefix set to all 1s.
+    let parts: list[str] = [chr(int_or(prefix_flags, prefix_max))]
+    let mut remaining: int = value - prefix_max
+    while remaining >= 128 {
+        # Low 7 bits + MSB=1 (continue).
+        let low7: int = int_and(remaining, 127)
+        parts.push(chr(int_or(128, low7)))
+        remaining = remaining / 128
+    }
+    # Final byte: low 7 bits + MSB=0 (last).
+    parts.push(chr(int_and(remaining, 127)))
+    return str_join(parts, "")
+}
+
+# ============================================================================
+# HPACK — string decoder (RFC 7541 §5.2).
+#
+# A header string is encoded as:
+#   * 1 bit: H (Huffman-coded flag).
+#   * 7 bits: length (or prefix for multi-byte length).
+#   * length bytes: the string (literal if H=0, Huffman-coded if H=1).
+#
+# Huffman coding is the documented deferral — we accept H=1 but
+# set d.err so callers know to fall back. The literal decoder
+# (H=0) is straightforward: read length, take that many bytes.
+# ============================================================================
+
+# http2_hpack_decode_string(d) -> str.
+# Returns the decoded string. On error, returns "" and sets d.err.
+fn http2_hpack_decode_string(mut d: HpackDecoder) -> str {
+    if d.err != "" {
+        return ""
+    }
+    if d.pos >= d.block.len() {
+        http2_hpack_decoder_set_err(d, "http2_hpack_decode_string: pos past end of input")
+        return ""
+    }
+    let first_byte: int = d.block.byte_at(d.pos)
+    let huffman: bool = int_and(first_byte, 128) != 0
+    let length: int = http2_hpack_decode_integer(d, 7)
+    if d.err != "" {
+        return ""
+    }
+    if huffman {
+        # Deferred: Huffman decoding (RFC 7541 Appendix B). The
+        # bit-table is 257 entries; we deliberately don't ship it
+        # in Stage 39 to keep the module's source code reviewable.
+        # A future Stage will add the table.
+        http2_hpack_decoder_set_err(d, "http2_hpack_decode_string: Huffman strings not yet supported (deferred to a future stage)")
+        return ""
+    }
+    if d.pos + length > d.block.len() {
+        http2_hpack_decoder_set_err(d, "http2_hpack_decode_string: truncated string (have "
+            + (d.block.len() - d.pos).to_str() + " bytes, need "
+            + length.to_str() + ")")
+        return ""
+    }
+    let value: str = d.block.slice(d.pos, d.pos + length)
+    d.pos = d.pos + length
+    return value
+}
+
+# http2_hpack_encode_string(s) -> str. Encodes a string literal
+# (H=0, prefix 7 bits for length, then the raw bytes). The encoder
+# never uses Huffman — that keeps the output deterministic and
+# byte-identical between the interpreter and the native binary
+# (Huffman would require the same lookup table on both sides,
+# which is exactly the deferred complexity we avoid).
+fn http2_hpack_encode_string(s: str) -> str {
+    let length: int = s.len()
+    let len_encoded: str = http2_hpack_encode_integer(length, 7, 0)
+    return len_encoded + s
+}
+
+# ============================================================================
+# HPACK — header block decoder.
+#
+# A header block is a sequence of header field representations
+# (RFC 7541 §6). Each starts with a flag byte:
+#
+#   1XXXXXXX   Indexed Header Field (RFC 7541 §6.1)
+#   01XXXXXX   Literal Header Field with Incremental Indexing (§6.2.1)
+#   0000XXXX   Literal Header Field without Indexing (§6.2.2)
+#   0001XXXX   Literal Header Field Never Indexed (§6.2.3)
+#   001XXXXX   Dynamic Table Size Update (§6.3)
+#
+# The decoder walks the block, dispatching on the flag byte, and
+# produces a list[HttpHeader] (reusing the std.http struct). The
+# dynamic table is mutated by "Incremental Indexing" reps.
+# ============================================================================
+
+# http2_hpack_decode_header_block(block, mut table) -> Result[list[HttpHeader], str].
+#
+# Decodes a header block (the payload of a HEADERS or CONTINUATION
+# frame, or the concatenation of a HEADERS + CONTINUATION sequence).
+# The dynamic table is mutated in place for "Incremental Indexing"
+# reps (RFC 7541 §6.2.1).
+fn http2_hpack_decode_header_block(block: str, mut table: HpackDynamicTable) -> Result[list[HttpHeader], str] {
+    let d: HpackDecoder = http2_hpack_decoder_new(block)
+    let headers: list[HttpHeader] = []
+    let mut total_size: int = 0
+    while d.pos < d.block.len() && d.err == "" {
+        let flag: int = d.block.byte_at(d.pos)
+        # 6.1 Indexed Header Field (high bit set: 0x80 mask).
+        if int_and(flag, 128) != 0 {
+            # Indexed; the index is the low 7 bits.
+            let idx: int = http2_hpack_decode_integer(d, 7)
+            if d.err != "" {
+                return Result.Err("hpack: indexed rep: " + d.err)
+            }
+            if idx == 0 {
+                return Result.Err("hpack: indexed rep: index 0 is reserved")
+            }
+            let lookup_r: Result[HpackStaticEntry, str] = http2_hpack_lookup_index(idx, table)
+            if !result_is_ok(lookup_r) {
+                return Result.Err("hpack: indexed rep: " + result_err_or(lookup_r, ""))
+            }
+            let entry: HpackStaticEntry = result_unwrap(lookup_r)
+            headers.push(HttpHeader { name: entry.name, value: entry.value })
+            total_size = total_size + http2_hpack_entry_size(entry.name, entry.value)
+        }
+        # 6.3 Dynamic Table Size Update (0x20 mask).
+        else if int_and(flag, 224) == 32 {
+            let new_max: int = http2_hpack_decode_integer(d, 5)
+            if d.err != "" {
+                return Result.Err("hpack: table size update: " + d.err)
+            }
+            if new_max > table.max_size {
+                return Result.Err("hpack: table size update larger than negotiated max ("
+                    + new_max.to_str() + " > " + table.max_size.to_str() + ")")
+            }
+            http2_hpack_dynamic_table_set_max_size(table, new_max)
+        }
+        # 6.2.1 Literal with Incremental Indexing (0x40 mask).
+        else if int_and(flag, 192) == 64 {
+            let name_idx: int = http2_hpack_decode_integer(d, 6)
+            if d.err != "" {
+                return Result.Err("hpack: literal+idx: " + d.err)
+            }
+            let mut name: str = ""
+            let mut value: str = ""
+            if name_idx == 0 {
+                # Literal name follows.
+                name = http2_hpack_decode_string(d)
+                if d.err != "" {
+                    return Result.Err("hpack: literal+idx name: " + d.err)
+                }
+            } else {
+                let lookup_r: Result[HpackStaticEntry, str] = http2_hpack_lookup_index(name_idx, table)
+                if !result_is_ok(lookup_r) {
+                    return Result.Err("hpack: literal+idx name lookup: " + result_err_or(lookup_r, ""))
+                }
+                name = result_unwrap(lookup_r).name
+            }
+            value = http2_hpack_decode_string(d)
+            if d.err != "" {
+                return Result.Err("hpack: literal+idx value: " + d.err)
+            }
+            headers.push(HttpHeader { name: name, value: value })
+            total_size = total_size + http2_hpack_entry_size(name, value)
+            http2_hpack_dynamic_table_add(table, name, value)
+        }
+        # 6.2.2/6.2.3 Literal without Indexing / Never Indexed (0x00 or 0x10 mask).
+        else if int_and(flag, 240) == 0 || int_and(flag, 240) == 16 {
+            let name_idx: int = http2_hpack_decode_integer(d, 4)
+            if d.err != "" {
+                return Result.Err("hpack: literal: " + d.err)
+            }
+            let mut name: str = ""
+            let mut value: str = ""
+            if name_idx == 0 {
+                name = http2_hpack_decode_string(d)
+                if d.err != "" {
+                    return Result.Err("hpack: literal name: " + d.err)
+                }
+            } else {
+                let lookup_r: Result[HpackStaticEntry, str] = http2_hpack_lookup_index(name_idx, table)
+                if !result_is_ok(lookup_r) {
+                    return Result.Err("hpack: literal name lookup: " + result_err_or(lookup_r, ""))
+                }
+                name = result_unwrap(lookup_r).name
+            }
+            value = http2_hpack_decode_string(d)
+            if d.err != "" {
+                return Result.Err("hpack: literal value: " + d.err)
+            }
+            headers.push(HttpHeader { name: name, value: value })
+            total_size = total_size + http2_hpack_entry_size(name, value)
+            # "without indexing" / "never indexed" — do NOT add to the table.
+        }
+        else {
+            return Result.Err("hpack: unknown representation (flag byte 0x"
+                + int_to_hex2(flag) + ")")
+        }
+        # Header list DoS protection (RFC 7540 §10.5.1).
+        if total_size > http2_max_header_list_size() {
+            return Result.Err("hpack: header list exceeds max_header_list_size ("
+                + total_size.to_str() + " > " + http2_max_header_list_size().to_str() + ")")
+        }
+    }
+    if d.err != "" {
+        return Result.Err(d.err)
+    }
+    return Result.Ok(headers)
+}
+
+# http2_hpack_lookup_index(idx, table) -> Result[HpackStaticEntry, str].
+# Index 1..61 = static table; 62.. = dynamic table (62 is the newest
+# dynamic entry). Returns Err if the index is 0 or out of range.
+fn http2_hpack_lookup_index(idx: int, table: HpackDynamicTable) -> Result[HpackStaticEntry, str] {
+    if idx == 0 {
+        return Result.Err("http2_hpack_lookup_index: index 0 is reserved")
+    }
+    if idx <= 61 {
+        return http2_hpack_static_lookup(idx)
+    }
+    return http2_hpack_dynamic_table_lookup(table, idx - 61)
+}
+
+# int_to_hex2(n) — 2-digit lowercase hex of n's low byte. For
+# diagnostics only (the "unknown representation" error message).
+fn http2_hex_digit(x: int) -> str {
+    if x < 10 { return chr(48 + x) }
+    return chr(97 + (x - 10))
+}
+
+fn int_to_hex2(n: int) -> str {
+    let lo: int = n % 16
+    let hi: int = (n / 16) % 16
+    return http2_hex_digit(hi) + http2_hex_digit(lo)
+}
+
+# ============================================================================
+# HPACK — header block encoder (literal, no indexing).
+#
+# The simplest valid HPACK encoder: every header is emitted as a
+# "Literal Header Field without Indexing" (RFC 7541 §6.2.2). This
+# is what an HTTP/2 client sends on the FIRST request of a
+# connection (the dynamic table is empty, so indexing buys
+# nothing). Subsequent requests on the same connection could use
+# incremental indexing for repeated headers (e.g. :method: GET),
+# but Stage 39 ships only the literal encoder — it's the
+# minimal correct encoder and is byte-for-byte deterministic
+# (no shared state between encoder and decoder).
+# ============================================================================
+
+# http2_hpack_encode_header_block(headers) -> str.
+# Encodes a list of HttpHeader as a literal-without-indexing
+# header block. The output is a valid HPACK header block — a
+# peer's decoder will produce the same list of HttpHeader.
+#
+# Format per header (RFC 7541 §6.2.2):
+#   0000 0000    (flag byte; name_index = 0 means literal name follows)
+#   <name length (7-bit prefix, H=0)>
+#   <name bytes>
+#   <value length (7-bit prefix, H=0)>
+#   <value bytes>
+fn http2_hpack_encode_header_block(headers: list[HttpHeader]) -> str {
+    let parts: list[str] = []
+    let mut i: int = 0
+    while i < headers.len() {
+        let h: HttpHeader = headers.get(i)
+        # Try static table lookup for the name (saves a few bytes if
+        # the name is one of the 61 static entries). We only match
+        # by name (not by name+value) — value is always literal.
+        let static_idx: int = http2_hpack_static_find_name(h.name)
+        if static_idx > 0 {
+            # Literal without indexing, indexed name (RFC 7541 §6.2.2
+            # form 2: 0000XXXX where XXXX is the static index).
+            let idx_bytes: str = http2_hpack_encode_integer(static_idx, 4, 0)
+            let val_bytes: str = http2_hpack_encode_string(h.value)
+            parts.push(idx_bytes + val_bytes)
+        } else {
+            # Literal without indexing, literal name (RFC 7541 §6.2.2
+            # form 1: 00000000 prefix; then name; then value).
+            let name_bytes: str = http2_hpack_encode_string(h.name)
+            let val_bytes: str = http2_hpack_encode_string(h.value)
+            parts.push(chr(0) + name_bytes + val_bytes)
+        }
+        i = i + 1
+    }
+    return str_join(parts, "")
+}
+
+# http2_hpack_static_find_name(name) -> int.
+# Returns the 1-based static table index of the first entry whose
+# name matches (case-insensitive). Returns 0 if no match. Used by
+# the encoder to emit indexed-name literals for the common
+# pseudo-headers and well-known header names.
+fn http2_hpack_static_find_name(name: str) -> int {
+    let lower: str = str_to_lower_ascii(name)
+    let table: list[HpackStaticEntry] = http2_hpack_static_table()
+    let mut i: int = 0
+    while i < table.len() {
+        if str_to_lower_ascii(table.get(i).name) == lower {
+            return i + 1
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+# ============================================================================
+# Stream state machine (RFC 7540 §5.1).
+#
+# Each HTTP/2 stream has a lifecycle:
+#
+#   idle -> open           (recv/send HEADERS)
+#   open -> half-closed-*  (recv/send END_STREAM)
+#   half-closed-remote -> closed   (recv END_STREAM / RST_STREAM)
+#   half-closed-local  -> closed   (send END_STREAM / RST_STREAM)
+#   open -> closed         (recv/send RST_STREAM)
+#   reserved-local -> half-closed-remote  (send PUSH_PROMISE)
+#   reserved-remote -> half-closed-local  (recv PUSH_PROMISE)
+#
+# Stage 39 tracks the state on the Http2Stream struct; the state
+# transition validation is in http2_stream_recv_event /
+# http2_stream_send_event (returns Err on an invalid transition).
+# ============================================================================
+
+# Stream states (RFC 7540 §5.1).
+fn http2_stream_state_idle() -> int { return 0 }
+fn http2_stream_state_reserved_local() -> int { return 1 }
+fn http2_stream_state_reserved_remote() -> int { return 2 }

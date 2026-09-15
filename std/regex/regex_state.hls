@@ -1,0 +1,241 @@
+# ============================================================================
+# std/regex/regex_state.hls - verbatim slice of the original std/regex.hls
+# (lines 118..352), split for maintainability. Loaded via the
+# std/regex.hls facade; not part of the public import API.
+# ============================================================================
+
+# ============================================================================
+# Constants — limits.
+# ============================================================================
+
+# REGEX_MAX_PATTERN: the maximum byte length of a regex pattern. 64
+# KiB is generous — the longest pattern in the test suite is < 100
+# bytes; even pathological inputs from fuzzing stay under 4 KiB.
+# The bound defends against a peer that sends a 1 GB pattern to
+# exhaust memory during NFA construction.
+fn regex_max_pattern() -> int {
+    return 65536
+}
+
+# REGEX_MAX_STATES: the maximum NFA state count. The construction
+# produces at most one state per pattern byte, so 64 KiB matches
+# the pattern limit.
+fn regex_max_states() -> int {
+    return 65536
+}
+
+# REGEX_MAX_GROUPS: the maximum number of capture groups. 256
+# matches PCRE's default; the bitmap for group start/end uses
+# O(groups) storage per match attempt.
+fn regex_max_groups() -> int {
+    return 256
+}
+
+# REGEX_MAX_REP: the maximum repeat count accepted in {n,m}. The
+# expansion of {n,m} into n concatenated copies is bounded by this
+# limit; a pattern like a{1,1000000} would otherwise exhaust
+# memory.
+fn regex_max_rep() -> int {
+    return 1024
+}
+
+# ============================================================================
+# State kinds — used by the NFA construction. The NFA is a directed
+# graph; each state has a kind, an optional payload (e.g. a byte
+# literal, a class id), and one or two outgoing transitions.
+# Epsilon transitions are encoded explicitly via EPSILON states.
+# ============================================================================
+
+fn regex_st_literal() -> int { # match exact byte
+    return 1 # match exact byte
+} # match exact byte
+fn regex_st_any() -> int { # match any byte (except \n)
+    return 2 # match any byte (except \n)
+} # match any byte (except \n)
+fn regex_st_class() -> int { # match a CharClass
+    return 3 # match a CharClass
+} # match a CharClass
+fn regex_st_epsilon() -> int { # epsilon transition
+    return 4 # epsilon transition
+} # epsilon transition
+fn regex_st_match() -> int { # accepting state
+    return 5 # accepting state
+} # accepting state
+fn regex_st_save() -> int { # save capture group index
+    return 6 # save capture group index
+} # save capture group index
+fn regex_st_anchor_start() -> int { # ^ zero-width
+    return 7 # ^ zero-width
+} # ^ zero-width
+fn regex_st_anchor_end() -> int { # $ zero-width
+    return 8 # $ zero-width
+} # $ zero-width
+fn regex_st_word_boundary() -> int { # \b zero-width
+    return 9 # \b zero-width
+} # \b zero-width
+fn regex_st_nonword_boundary() -> int { # \B zero-width
+    return 10 # \B zero-width
+} # \B zero-width
+
+# ============================================================================
+# CharClass — a set of bytes for [...] character classes.
+# ============================================================================
+
+struct RegexCharClass {
+    lows: list[int],
+    highs: list[int],
+    negate: bool
+}
+
+fn regex_charclass_new() -> RegexCharClass {
+    return RegexCharClass {
+        lows: [],
+        highs: [],
+        negate: false
+    }
+}
+
+# regex_charclass_add(cls, lo, hi) — add an inclusive byte range.
+fn regex_charclass_add(mut cls: RegexCharClass, lo: int, hi: int) -> void {
+    cls.lows.push(lo)
+    cls.highs.push(hi)
+}
+
+# regex_charclass_match(cls, byte) -> bool. True if `byte` is in the class.
+fn regex_charclass_match(cls: RegexCharClass, byte: int) -> bool {
+    let n: int = cls.lows.len()
+    let mut i: int = 0
+    let mut hit: bool = false
+    while i < n {
+        if byte >= cls.lows.get(i) && byte <= cls.highs.get(i) {
+            hit = true
+            break
+        }
+        i = i + 1
+    }
+    if cls.negate {
+        return !hit
+    }
+    return hit
+}
+
+# ============================================================================
+# NFA state.
+# ============================================================================
+
+struct RegexState {
+    kind: int,
+    byte: int,
+    class_id: int,
+    group_id: int,
+    out1: int,
+    out2: int
+}
+
+fn regex_state_new(kind: int) -> RegexState {
+    return RegexState {
+        kind: kind,
+        byte: 0,
+        class_id: 0,
+        group_id: 0,
+        out1: -1,
+        out2: -1
+    }
+}
+
+# ============================================================================
+# Regex — the compiled NFA.
+# ============================================================================
+
+struct Regex {
+    pattern: str,
+    states: list[RegexState],
+    classes: list[RegexCharClass],
+    num_groups: int,
+    start: int,
+    accept: int
+}
+
+# ============================================================================
+# RegexMatch — the result of a successful match.
+# ============================================================================
+
+struct RegexGroupSpan {
+    start: int,
+    end: int
+}
+
+struct RegexMatch {
+    start: int,
+    end: int,
+    groups: list[RegexGroupSpan]
+}
+
+# ============================================================================
+# Internal parser + NFA-builder state.
+# ============================================================================
+
+# A "fragment" of compiled NFA code (used during Thompson
+# construction). A fragment has a start state and a list of
+# "dangling" out-transitions that need to be patched to point at
+# the next state.
+struct RegexFrag {
+    start: int,
+    dangling_out1: list[int],
+    dangling_out2: list[int]
+}
+
+fn regex_frag_empty() -> RegexFrag {
+    return RegexFrag {
+        start: -1, dangling_out1: [], dangling_out2: []
+    }
+}
+
+# The parser cursor over the pattern bytes.
+struct RegexParser {
+    pattern: str,
+    pos: int,
+    states: list[RegexState],
+    classes: list[RegexCharClass],
+    next_group: int,
+    err: str
+}
+
+# ============================================================================
+# Compile-error helpers.
+# ============================================================================
+
+fn regex_err_pos(mut p: RegexParser, msg: str) -> void {
+    p.err = "regex error at byte " + p.pos.to_str() + ": " + msg
+}
+
+fn regex_err_eof(mut p: RegexParser, msg: str) -> void {
+    p.err = "regex error: unexpected end of pattern: " + msg
+}
+
+# ============================================================================
+# State-field helpers — HLS forbids `p.states.get(idx).field = v`
+# (the LHS must start from a variable). Use these helpers to
+# mutate state fields through a temporary local struct.
+# ============================================================================
+
+# regex_state_set_out1(p, idx, val) — set states[idx].out1 = val.
+fn regex_state_set_out1(mut p: RegexParser, idx: int, val: int) -> void {
+    let mut st: RegexState = p.states.get(idx)
+    st.out1 = val
+    p.states.set(idx, st)
+}
+
+# regex_state_set_out2(p, idx, val) — set states[idx].out2 = val.
+fn regex_state_set_out2(mut p: RegexParser, idx: int, val: int) -> void {
+    let mut st: RegexState = p.states.get(idx)
+    st.out2 = val
+    p.states.set(idx, st)
+}
+
+# ============================================================================
+# NFA construction primitives.
+# ============================================================================
+
+# regex_add_state(p, st) -> int. Append a state to the NFA and return
+# its index. Returns -1 on overflow.
