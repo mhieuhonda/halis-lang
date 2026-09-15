@@ -287,21 +287,30 @@ halis-lang/
 ├── SPEC.md              # Language constitution (full v0.30 spec)
 ├── ROADMAP.md           # 150-stage roadmap to v1.0
 ├── SECURITY.md          # Threat model & security policy
-├── boot/                # Stage-0: bootstrap seed (pure Python, ~3,200 lines)
-│   ├── lexer.py         #   lexer (~150 lines)
-│   ├── parser.py        #   syntax → AST (~620 lines)
-│   ├── checker.py       #   type check + effects + taint analysis (~1,500 lines)
-│   ├── interp.py        #   evaluator (reference semantics, ~660 lines)
-│   └── boot.py          #   CLI (~290 lines)
+├── boot/                # Stage-0: bootstrap seed (pure Python)
+│   ├── lexer.py         #   lexer
+│   ├── parser.py        #   syntax → AST
+│   ├── checker.py       #   facade → boot/checking/ (helpers + 8 Checker mixins)
+│   ├── interp.py        #   facade → boot/interp_parts/ (rt + 6 Interp mixins)
+│   └── boot.py          #   CLI
 ├── src/
-│   └── hlc.hls          # ★ COMPILER written 100% in HLS (~6,000 lines)
-│                        #   lexer → parser → checker → C codegen → self-compile
-├── std/                 # Standard library (Stage 6 + Stage 10, in HLS)
+│   ├── hlc.hls          # ★ COMPILER written 100% in HLS — entry point that
+│   │                    #   imports the modules below (lexer → parser →
+│   │                    #   checker → C codegen → self-compile)
+│   └── hlc/             # compiler modules (loaded via `import "hlc/*.hls"`):
+│                        #   types · lexer · parser · checker · proof ·
+│                        #   check_expr · check_call · check_match · runtime ·
+│                        #   codegen · pgo · simd · lto · gen_expr · gen_stmt ·
+│                        #   gen_fn · main
+├── std/                 # Standard library (in HLS); large modules are a thin
+│                        #   facade + internal parts under std/<mod>/
 ├── examples/            # hello, fibonacci, primes, wordcount, secure_demo, ...
 ├── tests/
-│   ├── ok/              #   112 valid programs (incl. safe panics + Stage 30/31 demos)
-│   ├── fail/            #   104 programs that MUST be rejected (types/effects/taint/escape)
-│   └── run_tests.sh     #   720 assertions: ok/fail/differential/bootstrap fixed-point
+│   ├── ok/              #   valid programs (incl. safe panics + Stage 30/31 demos)
+│   ├── fail/            #   programs that MUST be rejected (types/effects/taint/escape)
+│   ├── suites/          #   test suites sourced by run_tests.sh
+│   └── run_tests.sh     #   runner: ok/fail/differential/bootstrap fixed-point
+├── mk/                  # Makefile stage sections (included in original order)
 ├── Makefile             # bootstrap · test · run · examples · audit · opt-stats · emit-ir · emit-llvm
 └── bin/                 # (generated) native hlc
 ```

@@ -73,13 +73,24 @@ you are the owner.
 ### File layout
 
 ```
-src/hlc.hls              # The compiler, written 100% in HLS
-boot/                    # Stage-0 bootstrap seed (pure Python)
-std/                     # Standard library modules (pure HLS)
+src/hlc.hls              # The compiler entry point (imports src/hlc/*.hls)
+src/hlc/                 # Compiler modules: types, lexer, parser, checker,
+                         # proof, check_expr, check_call, check_match,
+                         # runtime, codegen, pgo, simd, lto, gen_expr,
+                         # gen_stmt, gen_fn, main
+boot/                    # Stage-0 bootstrap seed (pure Python);
+                         # checker.py/interp.py are facades over the
+                         # boot/checking/ and boot/interp_parts/ packages
+std/                     # Standard library modules (pure HLS); large
+                         # modules are a facade + internal parts under
+                         # std/<module>/
 examples/                # Demonstration programs
 tests/ok/                # Valid programs (must compile + run)
 tests/fail/              # Programs that MUST be rejected
-tests/run_tests.sh       # Differential test runner
+tests/run_tests.sh       # Differential test runner (sources tests/suites/)
+tests/suites/            # Test suites, one per stage group
+Makefile                 # Core targets; stage sections live in mk/
+mk/                      # Makefile stage sections (included in order)
 ```
 
 ### Standard library modules
@@ -123,7 +134,7 @@ Format:
 
 Areas used in this repo:
 - `stdlib:`  — changes to `std/`
-- `compiler:` — changes to `src/hlc.hls`
+- `compiler:` — changes to `src/hlc.hls` / `src/hlc/`
 - `boot:`    — changes to `boot/`
 - `tests:`   — changes to `tests/`
 - `docs:`    — documentation only
