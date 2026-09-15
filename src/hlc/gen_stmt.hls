@@ -1,0 +1,1888 @@
+# ============================================================================
+# hlc/gen_stmt.hls — part of the hlc compiler (split from the original single-file
+# src/hlc.hls). This file is loaded via `import "hlc/gen_stmt.hls"` from src/hlc.hls.
+# Section 5f — CODEGEN: statements, match, asm, assignments.
+# NOTE: content is byte-identical to the original src/hlc.hls line range
+#       17379..19260 - module split is purely structural, zero code changes.
+# ============================================================================
+fn gen_method(ctx: Ctx, e: int) -> str {
+    if ctx.exprs[e].muser {
+        # Stage 8-beta: the self parameter owns one retain of the
+        # receiver (the method may mutate through the shared pointer;
+        # the retain is released when the method returns).
+        let recv_fresh: bool = expr_fresh(ctx, ctx.exprs[e].left)
+        let t0: str = gen_expr(ctx, ctx.exprs[e].left)
+        let recv: str = own_wrap(ctx, ctx.exprs[ctx.exprs[e].left].t, t0, recv_fresh)
+        let rest: str = gen_own_args_c(ctx, e)
+        # Stage 20: count the emitted out-of-line method call.
+        lto_note_call(ctx, ctx.exprs[e].mkey)
+        if ctx.exprs[e].args.len() == 0 {
+            return "usf_" + c_fn_name(ctx.exprs[e].mkey) + "(" + recv + ")"
+        }
+        return "usf_" + c_fn_name(ctx.exprs[e].mkey) + "(" + recv + ", " + rest + ")"
+    }
+    let op: str = ctx.exprs[e].mop
+    # Stage 30 (v0.47.0-alpha): stack-layout receivers. The escape
+    # analysis proved the binding never escapes, so .len / .get / .set
+    # lower to the typed array accessors (no hl_list, no boxing, no
+    # refcount). push/pop can never reach here — the checker rejects
+    # them on #[stack] bindings and the auto analysis demotes such
+    # bindings to the heap layout.
+    if ctx.exprs[ctx.exprs[e].left].kind == "ident" && is_stack_var(ctx, ctx.exprs[ctx.exprs[e].left].name) {
+        if op == "list.len" {
+            return stack_cap_of(ctx, ctx.exprs[ctx.exprs[e].left].name).to_str()
+        }
+        if op == "list.get" {
+            let sarr: str = local_c(ctx, ctx.exprs[ctx.exprs[e].left].name)
+            let sidx: str = gen_expr(ctx, ctx.exprs[e].args.get(0))
+            let scap: int = stack_cap_of(ctx, ctx.exprs[ctx.exprs[e].left].name)
+            return "hlc_sg_" + stack_elem_suffix(ctx.exprs[e].t) + "(" + sarr + ", " + sidx + ", " + scap.to_str() + ")"
+        }
+        if op == "list.set" {
+            let sarr: str = local_c(ctx, ctx.exprs[ctx.exprs[e].left].name)
+            let sidx: str = gen_expr(ctx, ctx.exprs[e].args.get(0))
+            let sval: str = gen_expr(ctx, ctx.exprs[e].args.get(1))
+            let scap: int = stack_cap_of(ctx, ctx.exprs[ctx.exprs[e].left].name)
+            let set_suffix: str = stack_elem_suffix(list_elem_t(inst_t(ctx, ctx.exprs[ctx.exprs[e].left].t)))
+            return "hlc_ss_" + set_suffix + "(" + sarr + ", " + sidx + ", " + scap.to_str() + ", " + sval + ")"
+        }
+    }
+    let t0: str = gen_expr(ctx, ctx.exprs[e].left)
+    let args: str = gen_args_c(ctx, e)
+    if op == "str.len" {
+        return "hl_str_len(" + t0 + ")"
+    }
+    if op == "str.byte_at" {
+        # Stage 17: -O fast — a bounds-proven access uses the unchecked
+        # form.
+        if ctx.fast_mode && ctx.exprs[e].bnd_safe {
+            return "hl_str_byte_at_unchecked(" + t0 + ", " + args + ")"
+        }
+        return "hl_str_byte_at(" + t0 + ", " + args + ")"
+    }
+    if op == "str.slice" {
+        if ctx.fast_mode && ctx.exprs[e].bnd_safe {
+            return "hl_str_slice_unchecked(" + t0 + ", " + args + ")"
+        }
+        return "hl_str_slice(" + t0 + ", " + args + ")"
+    }
+    if op == "str.find" {
+        return "hl_str_find(" + t0 + ", " + args + ")"
+    }
+    if op == "str.contains" {
+        return "hl_str_contains(" + t0 + ", " + args + ")"
+    }
+    if op == "str.starts_with" {
+        return "hl_str_starts_with(" + t0 + ", " + args + ")"
+    }
+    if op == "str.ends_with" {
+        return "hl_str_ends_with(" + t0 + ", " + args + ")"
+    }
+    if op == "str.split" {
+        return "hl_str_split(" + t0 + ", " + args + ")"
+    }
+    if op == "str.trim" {
+        return "hl_str_trim(" + t0 + ")"
+    }
+    if op == "str.to_int" {
+        return "hl_str_to_int(" + t0 + ")"
+    }
+    if op == "str.to_float" {
+        return "hl_str_to_double(" + t0 + ")"
+    }
+    if op == "str.to_str" {
+        return t0
+    }
+    if op == "int.to_str" {
+        return "hl_str_from_int64(" + t0 + ")"
+    }
+    if op == "int.to_float" {
+        return "((double)(" + t0 + "))"
+    }
+    if op == "int.abs" {
+        return "hl_abs_i64(" + t0 + ")"
+    }
+    if op == "float.to_str" {
+        return "hl_str_from_double(" + t0 + ")"
+    }
+    if op == "float.to_int" {
+        return "hl_float_to_int(" + t0 + ")"
+    }
+    if op == "float.abs" {
+        return "(((" + t0 + ") < 0) ? -(" + t0 + ") : (" + t0 + "))"
+    }
+    if op == "bool.to_str" {
+        return "hl_str_from_bool(" + t0 + ")"
+    }
+    if op == "list.len" {
+        return "hl_list_len(" + t0 + ")"
+    }
+    if op == "list.push" {
+        # The value is stored into the container: the list owns one
+        # retain (fresh raw / borrowed retain-wrapped / prim boxed).
+        let et: str = list_elem_t(inst_t(ctx, ctx.exprs[ctx.exprs[e].left].t))
+        let aidx: int = ctx.exprs[e].args.get(0)
+        let av: str = gen_expr(ctx, aidx)
+        let af: bool = expr_fresh(ctx, aidx)
+        return "hl_list_push(" + t0 + ", " + gen_store_val(ctx, et, av, af) + ")"
+    }
+    if op == "list.get" {
+        # Deep-scan-24 fix (HIGH): the element type MUST be resolved
+        # through the current instantiation context before the unbox
+        # dispatch. The raw checker annotation on a generic fn's body is
+        # the TYPE PARAM itself (e.g. T in `fn first[T](xs: list[T]) ->
+        # T { return xs.get(0) }`), so gen_unbox saw "T" (not "int")
+        # and emitted the identity hl_unbox_ptr — the boxed pointer was
+        # returned as the int64 VALUE (garbage like 94444786390144).
+        # Every sibling path (push/set/pop, map.set) already instantiates
+        # via inst_t(); this one was missed. Matches the interpreter,
+        # which yields the element value.
+        return gen_unbox(ctx, inst_t(ctx, ctx.exprs[e].t), "hl_list_get(" + t0 + ", " + args + ")")
+    }
+    if op == "list.set" {
+        let et: str = list_elem_t(inst_t(ctx, ctx.exprs[ctx.exprs[e].left].t))
+        let ai: str = gen_expr(ctx, ctx.exprs[e].args.get(0))
+        let aidx: int = ctx.exprs[e].args.get(1)
+        let av: str = gen_expr(ctx, aidx)
+        let af: bool = expr_fresh(ctx, aidx)
+        return "hl_list_set(" + t0 + ", " + ai + ", " + gen_store_val(ctx, et, av, af) + ")"
+    }
+    if op == "list.pop" {
+        # Primitive element lists use the typed pops (the box is freed
+        # inside); pointer elements transfer ownership of the element.
+        let et: str = list_elem_t(inst_t(ctx, ctx.exprs[ctx.exprs[e].left].t))
+        if et == "int" {
+            return "hl_list_pop_i64(" + t0 + ")"
+        }
+        if et == "float" {
+            return "hl_list_pop_f64(" + t0 + ")"
+        }
+        if et == "bool" {
+            return "hl_list_pop_bool(" + t0 + ")"
+        }
+        # Deep-scan-24 fix: instantiate the element type before the unbox
+        # dispatch (same hazard as list.get above — a generic body's raw
+        # expr type is the type param, which dispatched to the identity
+        # hl_unbox_ptr and returned the boxed pointer as the value).
+        return gen_unbox(ctx, inst_t(ctx, ctx.exprs[e].t), "hl_list_pop(" + t0 + ")")
+    }
+    if op == "map.len" {
+        return "hl_map_len(" + t0 + ")"
+    }
+    if op == "map.set" {
+        # Key and value are stored into the map: it owns one retain of
+        # each (fresh raw / borrowed retain-wrapped / prim boxed).
+        let mt: str = inst_t(ctx, ctx.exprs[ctx.exprs[e].left].t)
+        let vt: str = map_val_t(mt)
+        let kidx: int = ctx.exprs[e].args.get(0)
+        let ak: str = gen_expr(ctx, kidx)
+        let kf: bool = expr_fresh(ctx, kidx)
+        let vidx: int = ctx.exprs[e].args.get(1)
+        let av: str = gen_expr(ctx, vidx)
+        let vf: bool = expr_fresh(ctx, vidx)
+        let kw: str = own_wrap(ctx, "str", ak, kf)
+        return "hl_map_set(" + t0 + ", " + kw + ", " + gen_store_val(ctx, vt, av, vf) + ")"
+    }
+    if op == "map.get_or" {
+        # Primitive-valued maps use the typed getters (the default is
+        # passed by value — no boxing, no refcount traffic). Pointer-
+        # valued maps use hl_map_get_own: the default arrives owned and
+        # the result is returned owned.
+        let mt: str = inst_t(ctx, ctx.exprs[ctx.exprs[e].left].t)
+        let vt: str = map_val_t(mt)
+        let ak: str = gen_expr(ctx, ctx.exprs[e].args.get(0))
+        let ad_idx: int = ctx.exprs[e].args.get(1)
+        let ad: str = gen_expr(ctx, ad_idx)
+        if vt == "int" {
+            return "hl_map_get_i64(" + t0 + ", " + ak + ", " + ad + ")"
+        }
+        if vt == "float" {
+            return "hl_map_get_f64(" + t0 + ", " + ak + ", " + ad + ")"
+        }
+        if vt == "bool" {
+            return "hl_map_get_bool(" + t0 + ", " + ak + ", " + ad + ")"
+        }
+        let adf: bool = expr_fresh(ctx, ad_idx)
+        let adw: str = own_wrap(ctx, vt, ad, adf)
+        return "((" + c_type(ctx, vt) + ")hl_map_get_own(" + t0 + ", " + ak + ", " + adw + "))"
+    }
+    if op == "map.has" {
+        return "hl_map_has(" + t0 + ", " + args + ")"
+    }
+    if op == "map.keys" {
+        return "hl_map_keys(" + t0 + ")"
+    }
+    # ----- Stage 16 (v0.27.0-alpha): Chan / Task methods -----
+    if op == "chan.send" || op == "chan.try_send" {
+        # Boundary ownership rule (same as spawn): a value crossing the
+        # task boundary must arrive PRIVATE. Provably-private values
+        # pass raw: a str literal (fresh allocation), clone(...) (a
+        # private deep copy), and any FRESH expression result — user fn
+        # calls return hl_retain-ed values (the callee's return wrapper
+        # adds the retain), `+` concats / to_str() allocate, struct/enum
+        # literals allocate. NON-fresh values (e.g. list.get(i), which
+        # returns a borrow of the element the list still owns) are
+        # deep-copied at the boundary — no refcount may be touched by
+        # two threads. Deep-scan-10 fix: fresh values were previously
+        # cloned too, and the fresh original was never released (a leak
+        # on every ch.send(a + b)).
+        # v0.29.0-alpha: try_send mirrors send exactly; the runtime
+        # releases the private copy when a full bounded channel refuses.
+        let mt: str = inst_t(ctx, ctx.exprs[ctx.exprs[e].left].t)
+        let celem: str = chan_inner_t(mt)
+        let vidx: int = ctx.exprs[e].args.get(0)
+        let cex: str = gen_expr(ctx, vidx)
+        let argkind: str = ctx.exprs[vidx].kind
+        let is_clone_call: bool = argkind == "call" && ctx.exprs[vidx].mkey == "clone"
+        let mut sendf: str = "hl_chan_send"
+        if op == "chan.try_send" {
+            sendf = "hl_chan_try_send"
+        }
+        if celem == "int" {
+            return sendf + "_i64(" + t0 + ", " + cex + ")"
+        }
+        if celem == "float" {
+            return sendf + "_f64(" + t0 + ", " + cex + ")"
+        }
+        if celem == "bool" {
+            return sendf + "_i64(" + t0 + ", " + cex + " ? 1 : 0)"
+        }
+        # Channels cross by sharing (atomic refcount); provably private
+        # values (clone(...), literals, fresh expression results) pass raw.
+        if is_chan_t(celem) || is_clone_call || argkind == "str" || expr_fresh(ctx, vidx) {
+            return sendf + "_ptr(" + t0 + ", (void*)" + cex + ")"
+        }
+        # Borrowed composites (list.get(i) results, ...): defensive deep
+        # copy — the value may be aliased by the sender's container.
+        let ct: str = strip_taint(celem)
+        register_clone(ctx, ct)
+        return sendf + "_ptr(" + t0 + ", (void*)" + clone_expr_for(ctx, ct, cex) + ")"
+    }
+    if op == "chan.recv" {
+        # Message ownership transfers to the receiver (fresh result).
+        let mt: str = inst_t(ctx, ctx.exprs[ctx.exprs[e].left].t)
+        let celem: str = chan_inner_t(mt)
+        if celem == "int" {
+            return "hl_chan_recv_i64(" + t0 + ")"
+        }
+        if celem == "float" {
+            return "hl_chan_recv_f64(" + t0 + ")"
+        }
+        if celem == "bool" {
+            return "(hl_chan_recv_i64(" + t0 + ") != 0)"
+        }
+        return "((" + c_type(ctx, celem) + ")hl_chan_recv_ptr(" + t0 + "))"
+    }
+    if op == "chan.recv_or" {
+        # Non-blocking recv (v0.29.0-alpha): the pending message if one
+        # exists, else the caller's default. The result is fresh either
+        # way: the message transfers its retain, or the default arrives
+        # OWNED (own_wrap adds a retain for borrowed expressions; a
+        # message being available makes the runtime release that retain
+        # via the channel's elem_release — which owns exactly this type).
+        let mt: str = inst_t(ctx, ctx.exprs[ctx.exprs[e].left].t)
+        let celem: str = chan_inner_t(mt)
+        let didx: int = ctx.exprs[e].args.get(0)
+        let dexpr: str = gen_expr(ctx, didx)
+        let dfresh: bool = expr_fresh(ctx, didx)
+        if celem == "int" {
+            return "hl_chan_recv_or_i64(" + t0 + ", " + dexpr + ")"
+        }
+        if celem == "float" {
+            return "hl_chan_recv_or_f64(" + t0 + ", " + dexpr + ")"
+        }
+        if celem == "bool" {
+            return "(hl_chan_recv_or_i64(" + t0 + ", " + dexpr + " ? 1 : 0) != 0)"
+        }
+        let dw: str = own_wrap(ctx, celem, dexpr, dfresh)
+        return "((" + c_type(ctx, celem) + ")hl_chan_recv_or_ptr(" + t0 + ", (void*)" + dw + "))"
+    }
+    if op == "chan.len" {
+        return "hl_chan_len(" + t0 + ")"
+    }
+    if op == "task.join" {
+        # Result ownership transfers to the joiner (fresh result). The
+        # mutex-ordered done-signal guarantees the task's own releases
+        # happen-before the joiner touches the result.
+        let mt: str = inst_t(ctx, ctx.exprs[ctx.exprs[e].left].t)
+        let rt: str = task_inner_t(mt)
+        if rt == "int" {
+            return "hl_task_join_i64(" + t0 + ")"
+        }
+        if rt == "float" {
+            return "hl_task_join_f64(" + t0 + ")"
+        }
+        if rt == "bool" {
+            return "(hl_task_join_i64(" + t0 + ") != 0)"
+        }
+        if rt == "void" {
+            return "hl_task_join_void(" + t0 + ")"
+        }
+        return "((" + c_type(ctx, rt) + ")hl_task_join_ptr(" + t0 + "))"
+    }
+    panic("internal codegen error: unknown method " + op)
+    return ""
+}
+
+fn gen_listlit(ctx: Ctx, e: int) -> str {
+    # Stage 8-beta: list literals are emitted INLINE as a GCC statement
+    # expression. The old implementation emitted a separate `hl_lit_N`
+    # helper function per literal, but the element expressions were
+    # generated in the ENCLOSING function's context — any element that
+    # referenced a local variable produced a C identifier that does not
+    # exist inside the helper (BUG: `[a, b, 30]` with locals a, b failed
+    # to compile natively). Inlining also gives the literal a natural
+    # ownership story: the fresh list owns one retain of each element
+    # (fresh raw / borrowed retain-wrapped / prim boxed).
+    let elem: str = list_elem_t(inst_t(ctx, ctx.exprs[e].t))
+    let tmp: str = fresh_tmp(ctx, "hlc_ll")
+    let block: list[str] = []
+    block.push("({")
+    block.push("    hl_list* " + tmp + " = hl_list_new(" + elem_free_fn(ctx, elem) + ");")
+    let mut i: int = 0
+    while i < ctx.exprs[e].args.len() {
+        let aidx: int = ctx.exprs[e].args.get(i)
+        let v: str = gen_expr(ctx, aidx)
+        let fresh: bool = expr_fresh(ctx, aidx)
+        block.push("    hl_list_push(" + tmp + ", " + gen_store_val(ctx, elem, v, fresh) + ");")
+        i = i + 1
+    }
+    block.push("    " + tmp + ";")
+    block.push("})")
+    return join(block, "\n")
+}
+
+fn gen_structlit(ctx: Ctx, e: int) -> str {
+    let st: StructInfo = ctx.structs.get_or(ctx.exprs[e].name, dummy_struct())
+    # Substitute type params from current instantiation context.
+    let mut t: str = ctx.exprs[e].t
+    if ctx.cur_typeparams.len() > 0 && ctx.cur_targs.len() == ctx.cur_typeparams.len() {
+        t = instantiate_type(ctx.exprs[e].t, ctx.cur_typeparams, ctx.cur_targs)
+    }
+    # Record the (now concrete) instantiation for codegen.
+    if st.typeparams.len() > 0 && type_is_concrete(ctx, t) && !list_has(ctx.struct_insts, t) {
+        ctx.struct_insts.push(t)
+    }
+    # Compute the constructor name (mangled if generic).
+    let ctor_name: str = "usf_new_" + c_type_name(t)
+    # Collect provided field values. The constructor stores its params
+    # raw, so each pointer-typed field value must arrive OWNED
+    # (Stage 8-beta): fresh raw, borrowed retain-wrapped.
+    let parts: list[str] = []
+    let provided: list[str] = ctx.exprs[e].ffields
+    let mut fi: int = 0
+    while fi < provided.len() {
+        let fidx: int = struct_field_index(st, provided.get(fi))
+        let ftype: str = instantiate_field_type(st, fidx, t)
+        let aidx: int = ctx.exprs[e].args.get(fi)
+        let av: str = gen_expr(ctx, aidx)
+        let af: bool = expr_fresh(ctx, aidx)
+        parts.push(own_wrap(ctx, ftype, av, af))
+        fi = fi + 1
+    }
+    # For each remaining declared field with a default, evaluate the default
+    # (in the calling context) and pass it. The constructor stores its params
+    # raw, so the default must arrive OWNED: fresh defaults pass raw, but
+    # borrowed defaults (e.g. `args()` which returns the process-lifetime
+    # global list) must be retain-wrapped — otherwise the struct's release
+    # would decrement the global's refcount (BUG deep-scan-5: a default
+    # like `argv: list[str] = args()` used to silently release the global
+    # args list when the struct was dropped, freeing it for the rest of
+    # the program). Use own_wrap with the instantiated field type so the
+    # retain is balanced by the struct's release.
+    let mut pi: int = provided.len()
+    while pi < st.fields.len() {
+        let dflt_idx: int = st.fdefaults.get(pi)
+        if dflt_idx == -1 {
+            panic("internal codegen error: missing required field " + st.fields.get(pi) + " in struct literal")
+        }
+        let dflt_ftype: str = instantiate_field_type(st, pi, t)
+        let dflt_c: str = gen_expr(ctx, dflt_idx)
+        let dflt_fresh: bool = expr_fresh(ctx, dflt_idx)
+        parts.push(own_wrap(ctx, dflt_ftype, dflt_c, dflt_fresh))
+        pi = pi + 1
+    }
+    return ctor_name + "(" + join(parts, ", ") + ")"
+}
+
+# struct_field_index: find a field's index in a StructInfo (-1 if absent).
+fn struct_field_index(st: StructInfo, name: str) -> int {
+    let mut i: int = 0
+    while i < st.fields.len() {
+        if st.fields.get(i) == name {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+# instantiate_field_type: substitute a struct's type params for one field
+# using the concrete instantiation `t` (e.g. Box[int] -> field T becomes int).
+fn instantiate_field_type(st: StructInfo, fidx: int, t: str) -> str {
+    if fidx < 0 || fidx >= st.fields.len() {
+        return "int"
+    }
+    let ftype: str = st.ftypes.get(fidx)
+    if st.typeparams.len() == 0 {
+        return ftype
+    }
+    let targs: list[str] = type_args(t)
+    if targs.len() != st.typeparams.len() {
+        return ftype
+    }
+    return instantiate_type(ftype, st.typeparams, targs)
+}
+
+fn gen_enumlit(ctx: Ctx, e: int) -> str {
+    # The enum type is ctx.exprs[e].t (e.g., "Option[int]" or "Color").
+    # Substitute type params from current instantiation context.
+    let mut t: str = ctx.exprs[e].t
+    if ctx.cur_typeparams.len() > 0 && ctx.cur_targs.len() == ctx.cur_typeparams.len() {
+        t = instantiate_type(ctx.exprs[e].t, ctx.cur_typeparams, ctx.cur_targs)
+    }
+    # Record the (now concrete) instantiation for codegen.
+    let en: EnumInfo = ctx.enums.get_or(ctx.exprs[e].enum_name, dummy_enum())
+    if en.typeparams.len() > 0 && type_is_concrete(ctx, t) && !list_has(ctx.enum_insts, t) {
+        ctx.enum_insts.push(t)
+    }
+    # The constructor function name is "usf_make_" + c_type_name(t) + "" + "_" + variant.
+    let ctor_name: str = "usf_make_" + c_type_name(t) + "_" + ctx.exprs[e].variant
+    # The constructor stores its payloads raw, so each pointer-typed
+    # payload must arrive OWNED (Stage 8-beta).
+    let parts: list[str] = []
+    let mut i: int = 0
+    while i < ctx.exprs[e].args.len() {
+        let aidx: int = ctx.exprs[e].args.get(i)
+        let av: str = gen_expr(ctx, aidx)
+        let af: bool = expr_fresh(ctx, aidx)
+        let pt: str = enum_payload_type(en, ctx.exprs[e].variant, i, t)
+        parts.push(own_wrap(ctx, pt, av, af))
+        i = i + 1
+    }
+    return ctor_name + "(" + join(parts, ", ") + ")"
+}
+
+# enum_payload_type: the instantiated payload type for variant `vname`,
+# payload index `pidx`, of the concrete enum instantiation `t`.
+fn enum_payload_type(en: EnumInfo, vname: str, pidx: int, t: str) -> str {
+    let mut vidx: int = -1
+    let mut i: int = 0
+    while i < en.variants.len() {
+        if en.variants.get(i) == vname {
+            vidx = i
+        }
+        i = i + 1
+    }
+    if vidx < 0 {
+        return "int"
+    }
+    let payloads: list[str] = en.payloads.get(vidx)
+    if pidx < 0 || pidx >= payloads.len() {
+        return "int"
+    }
+    let pt: str = payloads.get(pidx)
+    if en.typeparams.len() == 0 {
+        return pt
+    }
+    let targs: list[str] = type_args(t)
+    if targs.len() != en.typeparams.len() {
+        return pt
+    }
+    return instantiate_type(pt, en.typeparams, targs)
+}
+
+# gen_match_expr — emit a GCC statement expression for a match in expression
+# position. Each arm is checked via tag comparison; the matching arm's body
+# is the result.
+fn gen_match_expr(ctx: Ctx, e: int) -> str {
+    # The scrutinee's type (e.g., "Color" or "Option[int]") — use the
+    # scrutinee expression's type, not the match's result type.
+    # Substitute type params from current instantiation context (for generic
+    # function instantiations).
+    let raw_scrut_t: str = ctx.exprs[ctx.exprs[e].left].t
+    let mut scrut_t: str = raw_scrut_t
+    if ctx.cur_typeparams.len() > 0 && ctx.cur_targs.len() == ctx.cur_typeparams.len() {
+        scrut_t = instantiate_type(raw_scrut_t, ctx.cur_typeparams, ctx.cur_targs)
+    }
+    let ename: str = type_base(scrut_t)
+    let scrut_c: str = gen_expr(ctx, ctx.exprs[e].left)
+    # BUG (deep-scan-5): match arm bindings are scoped to the arm only
+    # (SPEC §5: "Pattern bindings in `match` arms introduce a new scope:
+    # each arm's bindings shadow the outer scope for the duration of that
+    # arm only"). Each arm binding becomes a C local declared inside the
+    # match's statement expression — it goes OUT of C scope when the
+    # statement expression exits. The codegen's `gen_locals` map is flat
+    # (HLS name -> latest C name) and doesn't track C scope, so without
+    # restoration, post-match references to an outer binding with the
+    # same name as an arm binding resolved to the arm's now-dead C name
+    # — producing `error: 'u_x_3' undeclared` from gcc. Snapshot
+    # `gen_locals` BEFORE the arm-binding loop and restore it AFTER, so
+    # post-match references resolve back to the outer binding's C name.
+    # (`gen_counts` is NOT restored — arm bindings still consumed unique
+    # counter values, so a later `let` with the same HLS name gets a
+    # fresh C name that does not collide with the arm's.)
+    let saved_locals: map[str, str] = map_new()
+    let saved_keys: list[str] = ctx.gen_locals.keys()
+    let mut si: int = 0
+    while si < saved_keys.len() {
+        let sk: str = saved_keys.get(si)
+        saved_locals.set(sk, ctx.gen_locals.get_or(sk, ""))
+        si = si + 1
+    }
+    # The statement expression uses a tmp variable for the scrutinee.
+    # Stage 8-beta: when the scrutinee is a FRESH value (call result,
+    # literal, ...), this tmp owns it — a cleanup attribute releases it
+    # at the end of the statement expression. When it is borrowed, the
+    # binding that owns it stays responsible.
+    let scrut_fresh: bool = expr_fresh(ctx, ctx.exprs[e].left)
+    let tmp_name: str = fresh_tmp(ctx, "hlc_m")
+    let block: list[str] = []
+    block.push("({")
+    if is_ptr_t(ctx, scrut_t) && scrut_fresh {
+        block.push("    " + c_type(ctx, scrut_t) + " " + tmp_name
+        + " __attribute__((cleanup(" + cleanup_fn_for(ctx, scrut_t) + "))) = " + scrut_c + ";")
+    } else {
+        block.push("    " + c_type(ctx, scrut_t) + " " + tmp_name + " = " + scrut_c + ";")
+    }
+    # BUG-004 fix: if the match result type is `never` (e.g. all arms
+    # are panic/exit), we must NOT declare a `hlc_m_r` accumulator —
+    # `never` is not a valid C type. Emit the dispatch without an
+    # accumulator and without a trailing `hlc_m_r;` value.
+    #
+    # Stage 43 fix: same applies when the match result type is `void` —
+    # `void hlc_m_r;` is invalid C (a variable cannot have void type).
+    # This case arises when a void function uses a match expression to
+    # dispatch (e.g. `fn hasher_write(h, b) -> void { match h { ... } }`).
+    let match_t: str = ctx.exprs[e].t
+    let is_never: bool = match_t == "never"
+    let is_void: bool = match_t == "void"
+    let no_accum: bool = is_never || is_void
+    if !no_accum {
+        block.push("    " + c_type(ctx, match_t) + " hlc_m_r;")
+    }
+    block.push("    if (0) {}")
+    let mut has_wildcard: bool = false
+    let mut i: int = 0
+    while i < ctx.exprs[e].args.len() {
+        let arm_idx: int = ctx.exprs[e].args.get(i)
+        let arm: MatchArm = ctx.match_arms.get(arm_idx)
+        if arm.pat_kind == "wildcard" {
+            has_wildcard = true
+            block.push("    else {")
+            # Stage 8-beta: arm-local hoisting — fresh pointer values in
+            # borrowed positions within the arm body are materialised
+            # INSIDE the arm block (they may reference the pattern
+            # bindings, which only exist here).
+            collect_hoist(ctx, arm.body)
+            hoist_all(ctx, block, "        ")
+            if arm.body_t != "never" && arm.body_t != "void" {
+                # Stage 8-beta: the arm result is OWNED — own-wrap borrow
+                # bodies with a retain so hlc_m_r always owns one retain.
+                let bv: str = gen_expr(ctx, arm.body)
+                let bf: bool = expr_fresh(ctx, arm.body)
+                block.push("        hlc_m_r = " + own_wrap(ctx, arm.body_t, bv, bf) + ";")
+            } else {
+                block.push("        " + gen_expr(ctx, arm.body) + ";")
+            }
+            clear_hoists(ctx)
+            block.push("    }")
+        } else {
+            let cond: str = tmp_name + "->tag == " + ename + "__TAG_" + arm.variant + "_" + c_type_name(scrut_t)
+            block.push("    else if (" + cond + ") {")
+            # Bind payload values.
+            let en: EnumInfo = ctx.enums.get_or(ename, dummy_enum())
+            let mut vi: int = 0
+            let mut vidx: int = -1
+            while vi < en.variants.len() {
+                if en.variants.get(vi) == arm.variant {
+                    vidx = vi
+                }
+                vi = vi + 1
+            }
+            let payloads: list[str] = en.payloads.get(vidx)
+            # Compute instantiated payload types.
+            let typeparams: list[str] = en.typeparams
+            let targs: list[str] = type_args(scrut_t)
+            let mut bi: int = 0
+            while bi < arm.bindings.len() {
+                let bname: str = arm.bindings.get(bi)
+                if bname != "_" {
+                    let pt: str = payloads.get(bi)
+                    let mut inst_pt: str = ""
+                    if typeparams.len() > 0 {
+                        inst_pt = instantiate_type(pt, typeparams, targs)
+                    } else {
+                        inst_pt = pt
+                    }
+                    let cn: str = fresh_local(ctx, bname)
+                    # Enum payloads are stored DIRECTLY in the C union (not
+                    # boxed), so we access them directly without unboxing.
+                    # The union has per-variant structs: data.<Variant>.v<i>.
+                    block.push("        " + c_type(ctx, inst_pt) + " " + cn + " = " + tmp_name + "->data." + arm.variant + ".v" + bi.to_str() + ";")
+                }
+                bi = bi + 1
+            }
+            if arm.body_t != "never" && arm.body_t != "void" {
+                # Stage 8-beta: arm-local hoisting (see wildcard arm), then
+                # own-wrap borrow bodies so hlc_m_r always owns one retain.
+                collect_hoist(ctx, arm.body)
+                hoist_all(ctx, block, "        ")
+                let bv: str = gen_expr(ctx, arm.body)
+                let bf: bool = expr_fresh(ctx, arm.body)
+                block.push("        hlc_m_r = " + own_wrap(ctx, arm.body_t, bv, bf) + ";")
+                clear_hoists(ctx)
+            } else {
+                collect_hoist(ctx, arm.body)
+                hoist_all(ctx, block, "        ")
+                block.push("        " + gen_expr(ctx, arm.body) + ";")
+                clear_hoists(ctx)
+            }
+            block.push("    }")
+        }
+        i = i + 1
+    }
+    # Only emit the fall-through "no arm matched" trap when no wildcard arm
+    # is present — a wildcard already catches all unmatched cases.
+    if !has_wildcard {
+        block.push("    else { hl_die(\"match: no arm matched (internal)\"); }")
+    }
+    if !no_accum {
+        block.push("    hlc_m_r;")
+    }
+    block.push("})")
+    # BUG (deep-scan-5): restore gen_locals to the pre-match state so
+    # post-match references to outer bindings (that may have been
+    # shadowed by arm bindings) resolve back to the outer binding's
+    # C name. The arm bindings' C names went out of scope when the
+    # statement expression exited; without this restore, local_c(name)
+    # would return those dead names and gcc would fail.
+    ctx.gen_locals = saved_locals
+    # Append the block to the output (as a multi-line statement expression
+    # embedded in the surrounding expression). We need to return the joined
+    # string for inline use. Statement expressions can span lines.
+    return join(block, "\n")
+}
+
+# gen_qmark_expr — emit a statement expression for `expr?`.
+fn gen_qmark_expr(ctx: Ctx, e: int) -> str {
+    let inner_t: str = ctx.exprs[ctx.exprs[e].left].t
+    let ename: str = type_base(inner_t)
+    let inner_c: str = gen_expr(ctx, ctx.exprs[e].left)
+    let ok_v: str = ctx.exprs[e].ok_variant
+    let err_v: str = ctx.exprs[e].err_variant
+    let success_t: str = ctx.exprs[e].t
+    let tmp_name: str = fresh_tmp(ctx, "hlc_q")
+    # Stage 8-beta ownership discipline for `?`:
+    #   * When the inner value is FRESH, this tmp owns it — a cleanup
+    #     attribute releases the Result at the end of the statement
+    #     expression (success path) .
+    #   * Error path: `return hl_retain(tmp)` — the +1 goes to the caller
+    #     and the cleanup (or the owning binding, for borrowed inners)
+    #     balances it. This works uniformly for both fresh and borrowed
+    #     inner values.
+    #   * Success path: the payload is borrowed from the enum, so the
+    #     result gets an explicit retain — the enum's own release (via
+    #     the cleanup or its binding) cannot free it underneath us.
+    let inner_fresh: bool = expr_fresh(ctx, ctx.exprs[e].left)
+    let block: list[str] = []
+    block.push("({")
+    if is_ptr_t(ctx, inner_t) && inner_fresh {
+        block.push("    " + c_type(ctx, inner_t) + " " + tmp_name
+        + " __attribute__((cleanup(" + cleanup_fn_for(ctx, inner_t) + "))) = " + inner_c + ";")
+    } else {
+        block.push("    " + c_type(ctx, inner_t) + " " + tmp_name + " = " + inner_c + ";")
+    }
+    block.push("    if (" + tmp_name + "->tag == " + ename + "__TAG_" + err_v + "_" + c_type_name(inner_t) + ") {")
+    block.push("        return hl_retain(" + tmp_name + ");")
+    block.push("    }")
+    # Success variant's payload is at data.<ok_v>.v0.
+    if is_ptr_t(ctx, success_t) {
+        block.push("    " + c_type(ctx, success_t) + " hlc_q_r = hl_retain(" + tmp_name + "->data." + ok_v + ".v0);")
+    } else {
+        block.push("    " + c_type(ctx, success_t) + " hlc_q_r = " + tmp_name + "->data." + ok_v + ".v0;")
+    }
+    block.push("    hlc_q_r;")
+    block.push("})")
+    return join(block, "\n")
+}
+
+# --- C statement generation ---
+
+# gen_tail_jump (Stage 31, v0.48.0-alpha): lower one VERIFIED tail
+# self-call to the constant-stack loop jump. The verifier already
+# proved (a) this expression is the entire return value of a
+# #[tail_call] fn and (b) every argument is primitive-typed. The
+# emission mirrors a call's evaluation order exactly:
+#   1. every argument expression is evaluated into a fresh temp,
+#      left to right (side effects + panics happen in source order);
+#   2. the parameter locals are rebound from the temps (plain copies —
+#      no refcounts, no aliasing);
+#   3. `goto hl_tail_restart` — a jmp, not a call. The frame never
+#      grows: fib_tail(1_000_000) uses the same stack as fib_tail(1).
+fn gen_tail_jump(ctx: Ctx, e: int, ind: str) -> void {
+    let f: FnInfo = ctx.fns.get_or(ctx.cur_fn, dummy_fn())
+    let n: ExprN = ctx.exprs[e]
+    ctx.out.push(ind + "{")
+    let temps: list[str] = []
+    let mut i: int = 0
+    while i < n.args.len() {
+        let tmp: str = fresh_tmp(ctx, "hlc_tc")
+        temps.push(tmp)
+        ctx.out.push(ind + "    " + c_type(ctx, f.ptypes.get(i)) + " " + tmp
+        + " = " + gen_expr(ctx, n.args.get(i)) + ";")
+        i = i + 1
+    }
+    let mut j: int = 0
+    while j < temps.len() {
+        ctx.out.push(ind + "    " + ctx.tail_params.get(j) + " = " + temps.get(j) + ";")
+        j = j + 1
+    }
+    ctx.out.push(ind + "    goto " + ctx.tail_label + ";")
+    ctx.out.push(ind + "}")
+}
+
+fn gen_stmt(ctx: Ctx, sidx: int, ind: str) -> void {
+    let s: StmtN = ctx.stmts[sidx]
+    if s.kind == "let" {
+        # Stage 30 (v0.47.0-alpha): stack layout. The escape analysis
+        # proved this binding never escapes its creating function, so
+        # the list literal becomes a typed C array in the frame — zero
+        # heap objects, zero refcount traffic. Elements are emitted as
+        # SEPARATE sequenced assignments (not a braced initializer) so
+        # evaluation order (and the order of any element panic) is
+        # exactly the interpreter's left-to-right order.
+        if is_stack_var(ctx, s.name) && ctx.exprs[s.value].kind == "listlit" {
+            let cn: str = fresh_local(ctx, s.name)
+            let et: str = list_elem_t(s.vtype)
+            let cap: int = stack_cap_of(ctx, s.name)
+            ctx.out.push(ind + c_type(ctx, et) + " " + cn + "[" + cap.to_str() + "];")
+            let mut i: int = 0
+            while i < ctx.exprs[s.value].args.len() {
+                let aidx: int = ctx.exprs[s.value].args.get(i)
+                let v: str = gen_expr(ctx, aidx)
+                ctx.out.push(ind + cn + "[" + i.to_str() + "] = " + v + ";")
+                i = i + 1
+            }
+            flush_null_after(ctx, ind)
+            clear_hoists(ctx)
+            return
+        }
+        # Stage 8-beta: hoist fresh pointer subexpressions consumed in
+        # borrowed positions within the RHS, then bind. Pointer-typed
+        # bindings get a cleanup attribute — released exactly at C block
+        # exit (covers break/continue/return automatically).
+        collect_hoist(ctx, s.value)
+        hoist_all(ctx, ctx.out, ind)
+        let cn: str = fresh_local(ctx, s.name)
+        let fresh: bool = expr_fresh(ctx, s.value)
+        # Stage 20 (v0.36.0-alpha): --lto — a call to an inlinable
+        # function in let-position is inlined (body generated at this
+        # statement; the result temp stands in for the call result).
+        let v: str = gen_expr_maybe_inline(ctx, s.value, ind)
+        # BUG-004 fix: if the RHS expression is `never`-typed (panic/exit/
+        # all-never match), the C call returns void — we must not bind it
+        # to a variable. Emit just the side-effect call.
+        if ctx.exprs[s.value].t == "never" {
+            ctx.out.push(ind + v + ";")
+        } else {
+            let wrapped: str = own_wrap(ctx, s.vtype, v, fresh)
+            if is_ptr_t(ctx, s.vtype) {
+                ctx.out.push(ind + c_type(ctx, s.vtype) + " " + cn
+                + " __attribute__((cleanup(" + cleanup_fn_for(ctx, s.vtype) + "))) = " + wrapped + ";")
+            } else {
+                ctx.out.push(ind + c_type(ctx, s.vtype) + " " + cn + " = " + wrapped + ";")
+            }
+        }
+        flush_null_after(ctx, ind)
+        clear_hoists(ctx)
+    } else if s.kind == "assign" {
+        gen_assign(ctx, s, ind)
+    } else if s.kind == "if" {
+        collect_hoist(ctx, s.cond)
+        hoist_all(ctx, ctx.out, ind)
+        let c: str = gen_expr(ctx, s.cond)
+        # Stage 19 (v0.35.0-alpha): PGO. Two profile sites per if: the
+        # true-path count and the false-path count (ids are deterministic
+        # per function: b:<fn>:<n>). Under --pgo-generate both paths get
+        # counter increments (an else clause is synthesised when absent);
+        # under --pgo-use a strongly-biased condition is wrapped with
+        # __builtin_expect so gcc lays the hot path fall-through.
+        let true_id: str = "b:" + ctx.cur_fn + ":" + ctx.pgo_fn_branch_n.to_str()
+        let false_id: str = "b:" + ctx.cur_fn + ":" + (ctx.pgo_fn_branch_n + 1).to_str()
+        ctx.pgo_fn_branch_n = ctx.pgo_fn_branch_n + 2
+        let true_idx: int = pgo_site(ctx, true_id)
+        let false_idx: int = pgo_site(ctx, false_id)
+        let mut cond_c: str = c
+        let hint: int = pgo_branch_hint(ctx, true_id, false_id)
+        if hint >= 0 {
+            cond_c = pgo_wrap_expect(c, hint)
+        }
+        ctx.out.push(ind + "if (" + cond_c + ") {")
+        if ctx.pgo_gen {
+            ctx.out.push(ind + "    __hlc_pgo_counts[" + true_idx.to_str() + "]++;")
+        }
+        gen_stmts(ctx, s.body, ind + "    ")
+        if s.else_body.len() > 0 {
+            ctx.out.push(ind + "} else {")
+            if ctx.pgo_gen {
+                ctx.out.push(ind + "    __hlc_pgo_counts[" + false_idx.to_str() + "]++;")
+            }
+            gen_stmts(ctx, s.else_body, ind + "    ")
+        } else if ctx.pgo_gen {
+            # No else branch in the source: synthesise one purely to
+            # count the false path (semantically a no-op).
+            ctx.out.push(ind + "} else {")
+            ctx.out.push(ind + "    __hlc_pgo_counts[" + false_idx.to_str() + "]++;")
+        }
+        ctx.out.push(ind + "}")
+        flush_null_after(ctx, ind)
+        clear_hoists(ctx)
+    } else if s.kind == "while" {
+        collect_hoist(ctx, s.cond)
+        # If the condition contains hoisted temps, the plain `while (c)`
+        # form would evaluate them ONCE before the loop — a semantic
+        # change (fresh subexpressions must be re-evaluated per
+        # iteration). Use the `while (1) { temps; if (!c) break; ... }`
+        # transform so the temps (and their releases) are per-iteration.
+        #
+        # SCAN-C fix: hoist_all was called BEFORE pushing `while (1) {`,
+        # so the hoisted temps were emitted OUTSIDE the loop body —
+        # contradicting the adjacent comment. A condition like
+        # `while len(f()) > 0` (where `f()` returns a fresh list) used
+        # to call `f()` only ONCE before the loop, then reuse the same
+        # stale pointer every iteration — leading to infinite loops or
+        # use-after-free if the list was mutated. Emit the temps AFTER
+        # the `while (1) {` line so they re-execute per iteration.
+        #
+        # Stage 19: PGO — one loop back-edge site per while
+        # (l:<fn>:<n>), counted at the top of the body; the condition is
+        # __builtin_expect-hinted from the back-edge count under
+        # --pgo-use (a loop that never iterated -> expect 0).
+        let backedge_id: str = "l:" + ctx.cur_fn + ":" + ctx.pgo_fn_loop_n.to_str()
+        ctx.pgo_fn_loop_n = ctx.pgo_fn_loop_n + 1
+        let backedge_idx: int = pgo_site(ctx, backedge_id)
+        let lhint: int = pgo_loop_hint(ctx, backedge_id)
+        if ctx.hoist_map.keys().len() > 0 {
+            ctx.out.push(ind + "while (1) {")
+            hoist_all(ctx, ctx.out, ind + "    ")
+            let c: str = gen_expr(ctx, s.cond)
+            let mut break_c: str = "if (!(" + c + ")) break;"
+            if lhint == 1 {
+                break_c = "if (!" + pgo_wrap_expect(c, 1) + ") break;"
+            } else if lhint == 0 {
+                break_c = "if (!" + pgo_wrap_expect(c, 0) + ") break;"
+            }
+            ctx.out.push(ind + "    " + break_c)
+            if ctx.pgo_gen {
+                ctx.out.push(ind + "    __hlc_pgo_counts[" + backedge_idx.to_str() + "]++;")
+            }
+            gen_stmts(ctx, s.body, ind + "    ")
+            ctx.out.push(ind + "}")
+        } else {
+            let c: str = gen_expr(ctx, s.cond)
+            let mut cond_c: str = c
+            if lhint >= 0 {
+                cond_c = pgo_wrap_expect(c, lhint)
+            }
+            ctx.out.push(ind + "while (" + cond_c + ") {")
+            if ctx.pgo_gen {
+                ctx.out.push(ind + "    __hlc_pgo_counts[" + backedge_idx.to_str() + "]++;")
+            }
+            gen_stmts(ctx, s.body, ind + "    ")
+            ctx.out.push(ind + "}")
+        }
+        flush_null_after(ctx, ind)
+        clear_hoists(ctx)
+    } else if s.kind == "for" {
+        # Stage 30 (v0.47.0-alpha): for-in over a stack-allocated list.
+        # The iterable is a typed frame array: iterate it directly. The
+        # loop variable is re-declared per iteration (fresh C block
+        # scope, matching the heap path); the length is the compile-time
+        # capacity (push is impossible on a stack binding, so the
+        # per-iteration bounds re-check is unnecessary).
+        if ctx.exprs[s.iter].kind == "ident" && is_stack_var(ctx, ctx.exprs[s.iter].name) {
+            let iv: str = fresh_tmp(ctx, "hlc_i")
+            let cn: str = fresh_local(ctx, s.name)
+            let arr: str = local_c(ctx, ctx.exprs[s.iter].name)
+            let cap: int = stack_cap_of(ctx, ctx.exprs[s.iter].name)
+            ctx.out.push(ind + "{")
+            ctx.out.push(ind + "    int64_t " + iv + ";")
+            # Stage 19: PGO — one loop back-edge site per for
+            # (l:<fn>:<n>), counted at the top of the body; site-id
+            # consumption matches the heap path exactly.
+            let backedge_id: str = "l:" + ctx.cur_fn + ":" + ctx.pgo_fn_loop_n.to_str()
+            ctx.pgo_fn_loop_n = ctx.pgo_fn_loop_n + 1
+            let backedge_idx: int = pgo_site(ctx, backedge_id)
+            let lhint: int = pgo_loop_hint(ctx, backedge_id)
+            let mut for_cond: str = iv + " < " + cap.to_str()
+            if lhint >= 0 {
+                for_cond = pgo_wrap_expect(for_cond, lhint)
+            }
+            ctx.out.push(ind + "    for (" + iv + " = 0; " + for_cond + "; " + iv + "++) {")
+            if ctx.pgo_gen {
+                ctx.out.push(ind + "        __hlc_pgo_counts[" + backedge_idx.to_str() + "]++;")
+            }
+            ctx.out.push(ind + "        " + c_type(ctx, s.vtype) + " " + cn + " = " + arr + "[" + iv + "];")
+            gen_stmts(ctx, s.body, ind + "        ")
+            ctx.out.push(ind + "    }")
+            ctx.out.push(ind + "}")
+            flush_null_after(ctx, ind)
+            clear_hoists(ctx)
+            return
+        }
+        collect_hoist(ctx, s.iter)
+        hoist_all(ctx, ctx.out, ind + "    ")
+        let it_c: str = gen_expr(ctx, s.iter)
+        let it_fresh: bool = expr_fresh(ctx, s.iter)
+        let itn: str = fresh_tmp(ctx, "hlc_it")
+        let itn_len: str = fresh_tmp(ctx, "hlc_n")
+        let iv: str = fresh_tmp(ctx, "hlc_i")
+        ctx.out.push(ind + "{")
+        # Stage 8-beta: when the iterable is FRESH (call result, literal),
+        # this loop owns it — the itn temp carries a cleanup attribute and
+        # is released after the loop (including on break). A borrowed
+        # iterable stays owned by its binding.
+        if it_fresh {
+            ctx.out.push(ind + "    hl_list* " + itn
+            + " __attribute__((cleanup(hl_cleanup_list))) = " + it_c + ";")
+        } else {
+            ctx.out.push(ind + "    hl_list* " + itn + " = " + it_c + ";")
+        }
+        ctx.out.push(ind + "    int64_t " + itn_len + " = hl_list_len(" + itn + ");")
+        ctx.out.push(ind + "    int64_t " + iv + ";")
+        # Stage 19: PGO — for-loop back-edge site (l:<fn>:<n>). The
+        # counter is the first statement of the loop body; the C for
+        # condition gets an __builtin_expect hint under --pgo-use.
+        let backedge_id: str = "l:" + ctx.cur_fn + ":" + ctx.pgo_fn_loop_n.to_str()
+        ctx.pgo_fn_loop_n = ctx.pgo_fn_loop_n + 1
+        let backedge_idx: int = pgo_site(ctx, backedge_id)
+        let lhint: int = pgo_loop_hint(ctx, backedge_id)
+        let mut for_cond: str = iv + " < " + itn_len
+        if lhint >= 0 {
+            for_cond = pgo_wrap_expect(for_cond, lhint)
+        }
+        ctx.out.push(ind + "    for (" + iv + " = 0; " + for_cond + "; " + iv + "++) {")
+        if ctx.pgo_gen {
+            ctx.out.push(ind + "        __hlc_pgo_counts[" + backedge_idx.to_str() + "]++;")
+        }
+        # BUG-SC-4 fix: if the loop body shrinks the list (e.g. xs.pop()),
+        # hl_list_get(itn, iv) would panic with "array access out of bounds".
+        # Bounds-check before access and break if the list is now shorter
+        # than the snapshotted length (matching the interpreter's behavior).
+        ctx.out.push(ind + "        if (" + iv + " >= hl_list_len(" + itn + ")) break;")
+        let cn: str = fresh_local(ctx, s.name)
+        let mut elem: str = s.vtype
+        # Stage 8-beta: a pointer-typed loop variable borrows the element
+        # from the list — the binding retains it and a cleanup releases it
+        # at the end of each iteration (C re-declares the variable in a
+        # fresh block scope per iteration). The list keeps its own retain.
+        if is_ptr_t(ctx, elem) {
+            ctx.out.push(ind + "        " + c_type(ctx, elem) + " " + cn
+            + " __attribute__((cleanup(" + cleanup_fn_for(ctx, elem) + ")))"
+            + " = hl_retain(" + gen_unbox(ctx, elem, "hl_list_get(" + itn + ", " + iv + ")") + ");")
+        } else {
+            ctx.out.push(ind + "        " + c_type(ctx, elem) + " " + cn
+            + " = " + gen_unbox(ctx, elem, "hl_list_get(" + itn + ", " + iv + ")") + ";")
+        }
+        gen_stmts(ctx, s.body, ind + "        ")
+        ctx.out.push(ind + "    }")
+        ctx.out.push(ind + "}")
+        flush_null_after(ctx, ind)
+        clear_hoists(ctx)
+    } else if s.kind == "return" {
+        # deep-scan-23: LTO multi-return splice — while the inliner is
+        # splicing a callee with early returns, a `return` lowers to an
+        # assignment on the splice result temp + a jump to the splice
+        # tail label. Ownership wrapping mirrors the real return path
+        # (fresh transfer vs borrowed retain via own_wrap), moved-value
+        # nulls flush before the jump, and `never`-typed values stay
+        # bare calls (they terminate the process; no jump follows).
+        if ctx.lto_splice_label != "" {
+            if s.value == -1 {
+                flush_null_after(ctx, ind)
+                ctx.out.push(ind + "goto " + ctx.lto_splice_label + ";")
+            } else if ctx.exprs[s.value].t == "never" {
+                let nv: str = gen_expr_maybe_inline(ctx, s.value, ind)
+                ctx.out.push(ind + nv + ";")
+            } else {
+                let v: str = gen_expr_maybe_inline(ctx, s.value, ind)
+                let fresh: bool = expr_fresh(ctx, s.value)
+                let rv: str = own_wrap(ctx, ctx.exprs[s.value].t, v, fresh)
+                if ctx.null_after.len() > 0 {
+                    let rt: str = ctx.exprs[s.value].t
+                    let rt_c: str = c_type(ctx, rt)
+                    let tmp: str = fresh_tmp(ctx, "hlc_rv")
+                    ctx.out.push(ind + "{ " + rt_c + " " + tmp + " = " + rv + ";")
+                    flush_null_after(ctx, ind + "    ")
+                    ctx.out.push(ind + "    " + ctx.lto_splice_temp + " = " + tmp + ";")
+                    ctx.out.push(ind + "    goto " + ctx.lto_splice_label + "; }")
+                } else {
+                    ctx.out.push(ind + ctx.lto_splice_temp + " = " + rv + ";")
+                    flush_null_after(ctx, ind)
+                    ctx.out.push(ind + "goto " + ctx.lto_splice_label + ";")
+                }
+            }
+        } else if s.value == -1 {
+            ctx.out.push(ind + "return;")
+        } else if ctx.tail_label != "" && tail_is_self_call(ctx, s.value, ctx.cur_fn) {
+            # Stage 31 (v0.48.0-alpha): #[tail_call] — a VERIFIED tail
+            # self-call. The checker proved this expression is the
+            # entire return value and the body needs no cleanup at the
+            # jump, so lower it to the parameter-rebinding loop jump
+            # instead of a C call (constant stack at any depth).
+            gen_tail_jump(ctx, s.value, ind)
+        } else {
+            # BUG-004 fix: if the return value expression is `never`-typed
+            # (e.g. `return panic("...")` or `return match_all_never`),
+            # emit just the side-effect call without a `return <value>;`
+            # wrapper (the value is void and the surrounding code is
+            # unreachable anyway — the call itself exits the process).
+            # Stage 20: --lto — return-position calls inline too.
+            let v: str = gen_expr_maybe_inline(ctx, s.value, ind)
+            if ctx.exprs[s.value].t == "never" {
+                ctx.out.push(ind + v + ";")
+            } else {
+                # Stage 8-beta ownership on return:
+                #   * A BORROWED pointer value (an ident) gets one retain —
+                #     the caller owns it; the binding's own retain is
+                #     released by its cleanup as the scope exits.
+                #   * A FRESH value transfers its inherent retain.
+                #   * If the value moved bindings out via take(), null
+                #     them BEFORE the return (an `x = NULL` after the
+                #     return would be unreachable).
+                let fresh: bool = expr_fresh(ctx, s.value)
+                let rv: str = own_wrap(ctx, ctx.exprs[s.value].t, v, fresh)
+                # Stage-17 perfection (v0.30.0-alpha): under --contracts
+                # the ENSURES assertion is checked at EVERY return, with
+                # `result` bound to the return value (the interpreter
+                # already checks both clauses; the native backend
+                # previously checked requires only — a documented gap,
+                # now closed). The value is materialised into a temp so
+                # the postcondition sees exactly what the caller gets.
+                let mut want_ens: bool = false
+                if ctx.contracts_mode && ctx.cur_fn != "" {
+                    let ef: FnInfo = ctx.fns.get_or(ctx.cur_fn, dummy_fn())
+                    if ef.ensures_e >= 0 {
+                        want_ens = true
+                    }
+                }
+                if want_ens {
+                    let rt: str = ctx.exprs[s.value].t
+                    let rt_c: str = c_type(ctx, rt)
+                    let tmp: str = fresh_tmp(ctx, "hlc_rv")
+                    ctx.out.push(ind + "{ " + rt_c + " " + tmp + " = " + rv + ";")
+                    flush_null_after(ctx, ind + "    ")
+                    let ef2: FnInfo = ctx.fns.get_or(ctx.cur_fn, dummy_fn())
+                    ctx.gen_locals.set("result", tmp)
+                    ctx.out.push(ind + "    if (!(" + gen_expr(ctx, ef2.ensures_e)
+                    + ")) hl_die(\"contract violation: ensures of '"
+                    + ef2.name + "' (function postcondition failed at runtime)\");")
+                    ctx.out.push(ind + "    return " + tmp + "; }")
+                } else if ctx.null_after.len() > 0 {
+                    let rt: str = ctx.exprs[s.value].t
+                    let rt_c: str = c_type(ctx, rt)
+                    if rt == "void" {
+                        ctx.out.push(ind + v + ";")
+                    } else {
+                        let tmp: str = fresh_tmp(ctx, "hlc_rv")
+                        ctx.out.push(ind + "{ " + rt_c + " " + tmp + " = " + rv + ";")
+                        flush_null_after(ctx, ind + "    ")
+                        ctx.out.push(ind + "    return " + tmp + "; }")
+                    }
+                } else {
+                    ctx.out.push(ind + "return " + rv + ";")
+                }
+            }
+        }
+    } else if s.kind == "break" {
+        ctx.out.push(ind + "break;")
+    } else if s.kind == "continue" {
+        ctx.out.push(ind + "continue;")
+    } else if s.kind == "expr" {
+        collect_hoist(ctx, s.e)
+        hoist_all(ctx, ctx.out, ind)
+        # Stage 8-beta: a discarded FRESH pointer value (e.g. `make();`
+        # or a match used as a statement) still owns one retain — wrap it
+        # in a cleanup temp so it is released instead of leaked.
+        if is_ptr_t(ctx, ctx.exprs[s.e].t) && expr_fresh(ctx, s.e) {
+            let tmp: str = fresh_tmp(ctx, "hlc_ed")
+            ctx.out.push(ind + "{ " + c_type(ctx, ctx.exprs[s.e].t) + " " + tmp
+            + " __attribute__((cleanup(" + cleanup_fn_for(ctx, ctx.exprs[s.e].t) + "))) = "
+            + gen_expr_maybe_inline(ctx, s.e, ind) + "; }")
+        } else {
+            # Stage 20: --lto — expression-statement calls inline (void
+            # callees or discarded results).
+            ctx.out.push(ind + gen_expr_maybe_inline(ctx, s.e, ind) + ";")
+        }
+        flush_null_after(ctx, ind)
+        clear_hoists(ctx)
+    } else if s.kind == "asm" {
+        # Stage 27 (v0.50.0-alpha): inline-assembly statement.
+        # Lowered to GCC's extended-asm syntax:
+        #
+        #   __asm__ __volatile__("template"
+        #       : [outputs]
+        #       : [inputs]
+        #       : [clobbers]
+        #       : [options]);
+        #
+        # The template `{0}` / `{1}` placeholders are rewritten to
+        # GCC's positional `%0` / `%1` (a single `%` requires `%%` in
+        # GCC AT&T syntax — we honour that translation too). The
+        # `__volatile__` qualifier is omitted under `options(pure)`
+        # (gcc may legitimately elide a pure asm whose outputs are
+        # unused). `options(noreturn)` emits an `__builtin_unreachable()`
+        # immediately after the asm (gcc then knows the function does
+        # not fall through, which matches the `all_return` analysis).
+        gen_asm(ctx, s, ind)
+    } else {
+        panic("internal codegen error: unknown statement " + s.kind)
+    }
+}
+
+# Stage 27 (v0.50.0-alpha): asm! codegen — lower an inline-assembly
+# statement to GCC's extended-asm syntax. The translation rules:
+#
+#   template:
+#     `{N}`           -> `%N`        (positional operand)
+#     `{{`            -> `{`         (literal brace)
+#     `}}`            -> `}`         (literal brace)
+#     `$`             -> `$$`        (GCC requires `$$` for a literal `$`
+#                                    in AT&T syntax — we accept both
+#                                    `$` and `$$` in the source and
+#                                    normalise to `$$`)
+#
+#   operand constraint:
+#     `reg`           -> `r`         (any general-purpose register)
+#     `mem`           -> `m`         (memory operand)
+#     `imm`           -> `i`         (immediate constant)
+#     string form     -> verbatim    (e.g. "eax" -> "a", "ecx" -> "c",
+#                                    "edx" -> "d" — GCC's constraint
+#                                    letters; the HLS source uses the
+#                                    register name and we translate the
+#                                    common x86-64 names; unknown names
+#                                    pass through verbatim after
+#                                    lowercasing)
+#
+#   direction prefix:
+#     `in`            -> (no prefix) input operand, e.g. "r"(x)
+#     `out`           -> `=`         write-only output, e.g. "=r"(x)
+#     `inout`         -> `+`         read-write output, e.g. "+r"(x)
+#     `late_out`      -> `=&`        early-clobber write-only output
+#                                    (the `&` modifier tells gcc the
+#                                    output is written BEFORE all inputs
+#                                    are consumed, so it must NOT alias
+#                                    any input register)
+#
+#   options:
+#     `pure`          -> omit `__volatile__`
+#     `nomem`         -> no "memory" clobber (the default adds it)
+#     `noreturn`      -> emit `__builtin_unreachable();` after the asm
+#     `preserves_flags` -> no "cc" clobber (the default adds it)
+#     `nostack`       -> no stack clobber (the default adds nothing for
+#                        stack — accepted for source compatibility)
+#     `attsyntax`     -> accepted; gcc default is AT&T, so this is a
+#                        no-op on x86-64
+#
+# The operand list order matches GCC's positional layout: outputs
+# first (in source order), then inputs. `{0}` references the first
+# operand, `{1}` the second, etc. — so an `in(reg) x, out(reg) y`
+# pair has `{0}` = `x` (input, listed after the output `y` in the C
+# asm form) and `{1}` = `y` (output, listed first). The HLS source
+# can use whichever operand order the user prefers; the codegen
+# re-orders them to match GCC's expectations and rewrites the
+# template placeholders accordingly.
+#
+# However, to keep the implementation simple and the source-vs-asm
+# mapping intuitive, we LAY OUT operands in source order: outputs
+# first (in their source order), then inputs (in their source order).
+# A source `in(reg) x, out(reg) y` becomes `outputs=[y], inputs=[x]`
+# — so `{0}` references `y` (the first output) and `{1}` references
+# `x` (the first input). This matches GCC's positional operand
+# numbering EXACTLY, so the source template `{0}` / `{1}` map
+# directly to `%0` / `%1` in the emitted C. The Stage 27 acceptance
+# test (tests/ok/feat_stage27_asm.hls) verifies this with an inb()
+# helper whose template `{0}, {1}` references the output then the
+# input — the produced assembly shows `in %1, %0` (AT&T source-dst).
+fn gen_asm(ctx: Ctx, s: StmtN, ind: str) -> void {
+    # Hoist fresh pointer subexpressions that appear in `in` operands
+    # (so they're materialised into temps with cleanup attributes
+    # before the asm). Pointer-typed operands are REJECTED by the
+    # checker (only int/float/bool are allowed), so this is mostly a
+    # no-op for correctness but keeps the ownership analysis happy.
+    let mut k: int = 0
+    while k < s.asm_operands.len() {
+        let op: AsmOperand = s.asm_operands.get(k)
+        if op.dir == "in" {
+            collect_hoist(ctx, op.expr_idx)
+        }
+        k = k + 1
+    }
+    hoist_all(ctx, ctx.out, ind)
+    # Stage 27 deep-scan fix: list-index lvalues (`xs[0]`) cannot be
+    # used directly as GCC asm output operands because `gen_expr`
+    # produces `hl_unbox_i64(hl_list_get(xs, 0))` — a TEMPORARY value,
+    # not an lvalue. GCC would emit `"+r"(hl_unbox_i64(hl_list_get(xs, 0)))`
+    # which compiles but the write doesn't propagate back to the list.
+    #
+    # The fix: for each out/inout/late_out operand whose lvalue is a
+    # list index, materialise a fresh C temp BEFORE the asm:
+    #   int64_t hl_asm_t0 = hl_unbox_i64(hl_list_get(xs, 0));   // inout only
+    # Then use `hl_asm_t0` as the asm operand. After the asm:
+    #   hl_list_set(xs, 0, hl_box_i64(hl_asm_t0));
+    # This mirrors what gen_assign does for `xs[0] = v` (it emits
+    # `hl_list_set(xs, 0, ...)` rather than `xs[0] = ...`).
+    #
+    # Struct-field lvalues (`s.x` or `(s)->x`) DO work directly as GCC
+    # asm output operands — GCC's lvalue rules handle struct field
+    # access through a pointer correctly. Only list-index lvalues need
+    # the temp workaround.
+    #
+    # The temp-name list is parallel to s.asm_operands: temp_names[j]
+    # is "" if operand j doesn't need a temp (ident/field lvalue, or
+    # an `in` operand), or the temp variable name if it does.
+    let temp_names: list[str] = []
+    let temp_lists: list[str] = []
+    let temp_indices: list[str] = []
+    let temp_setters: list[int] = [] # index into temp_lists/temp_indices for the post-asm writeback
+    let mut j0: int = 0
+    while j0 < s.asm_operands.len() {
+        temp_names.push("")
+        temp_lists.push("")
+        temp_indices.push("")
+        j0 = j0 + 1
+    }
+    # Emit the temps for index-lvalue operands (in source order).
+    let mut j: int = 0
+    while j < s.asm_operands.len() {
+        let op: AsmOperand = s.asm_operands.get(j)
+        if op.dir != "in" {
+            let ek: str = ctx.exprs[op.expr_idx].kind
+            if ek == "index" {
+                # The lvalue is `xs[i]`. Generate a temp.
+                let lhs_e: int = ctx.exprs[op.expr_idx].left
+                let idx_e: int = ctx.exprs[op.expr_idx].right
+                let lst_c: str = gen_expr(ctx, lhs_e)
+                let idx_c: str = gen_expr(ctx, idx_e)
+                let tmp: str = fresh_tmp(ctx, "hlc_asm_t")
+                let elem_t: str = ctx.exprs[op.expr_idx].t
+                let c_t: str = c_type(ctx, elem_t)
+                if op.dir == "inout" {
+                    # inout: read the old value into the temp.
+                    let old_v: str = gen_unbox(ctx, elem_t, "hl_list_get(" + lst_c + ", " + idx_c + ")")
+                    ctx.out.push(ind + c_t + " " + tmp + " = " + old_v + ";")
+                } else {
+                    # out / late_out: write-only. Leave the temp
+                    # uninitialized — GCC will warn under -Wmaybe-
+                    # uninitialized, but the asm is guaranteed to
+                    # write to it (the checker rejects `pure`-with-
+                    # no-outputs, so an output operand exists).
+                    ctx.out.push(ind + c_t + " " + tmp + ";")
+                }
+                temp_names.set(j, tmp)
+                temp_lists.set(j, lst_c)
+                temp_indices.set(j, idx_c)
+                temp_setters.push(j)
+            }
+        }
+        j = j + 1
+    }
+    # Build the outputs and inputs lists (in GCC positional order:
+    # outputs first, then inputs).
+    let outputs: list[str] = []
+    let inputs: list[str] = []
+    # We need to record the operand index (in source order) -> its
+    # position in the GCC operand list (0..N-1) so we can rewrite
+    # template placeholders. The HLS list[str] is used as a "scratch
+    # array" indexed by source-order position, holding the GCC
+    # operand index as a string ("0", "1", ...). This avoids needing
+    # a list[int] field on StmtN (the existing StmtN layout uses
+    # list[int] for stmts/exprs but a dedicated field for asm would
+    # bloat the struct for every non-asm statement).
+    let mut gcc_indices: list[str] = []
+    let mut next_idx: int = 0
+    # First pass: outputs (out/inout/late_out) in source order.
+    let mut j_out: int = 0
+    while j_out < s.asm_operands.len() {
+        let op: AsmOperand = s.asm_operands.get(j_out)
+        if op.dir != "in" {
+            let cstr: str = translate_asm_constraint(op)
+            # Use the temp if one was allocated (list-index lvalue),
+            # otherwise use the lvalue expression directly.
+            let mut ce: str = ""
+            let tmp_name: str = temp_names.get(j_out)
+            if tmp_name != "" {
+                ce = tmp_name
+            } else {
+                ce = gen_expr(ctx, op.expr_idx)
+            }
+            outputs.push("\"" + cstr + "\"(" + ce + ")")
+            gcc_indices.push(next_idx.to_str())
+            next_idx = next_idx + 1
+        } else {
+            gcc_indices.push("-1")
+        }
+        j_out = j_out + 1
+    }
+    # Second pass: inputs in source order.
+    let mut j2: int = 0
+    while j2 < s.asm_operands.len() {
+        let op: AsmOperand = s.asm_operands.get(j2)
+        if op.dir == "in" {
+            let cstr: str = translate_asm_constraint(op)
+            let ce: str = gen_expr(ctx, op.expr_idx)
+            inputs.push("\"" + cstr + "\"(" + ce + ")")
+            # Record the GCC index for this source-order position.
+            gcc_indices.set(j2, next_idx.to_str())
+            next_idx = next_idx + 1
+        }
+        j2 = j2 + 1
+    }
+    # Build the Clobber list. Default: "cc" (condition codes) and
+    # "memory" (the asm may read/write memory). Options can suppress:
+    #   nomem             -> no "memory"
+    #   preserves_flags   -> no "cc"
+    #
+    # Stage 27 perfection (v0.50.2-alpha) deep-scan-17: the previous
+    # comment claimed "A 'cc' clobber is also suppressed if the asm
+    # has no operands at all (a bare asm! with no operands never
+    # writes flags)" — but the code NEVER implemented that suppression
+    # (it always adds "cc" unless `preserves_flags` is set). The safe
+    # behaviour is to KEEP the cc clobber for ALL asm! blocks, because
+    # a bare `asm!("cpuid")` or `asm!("add %al, %al")` may write
+    # RFLAGS. The user MUST opt out via `options(preserves_flags)`
+    # when they know the asm doesn't touch flags. The comment is now
+    # fixed to match the code's safe behaviour.
+    #
+    # Each clobber is emitted as a quoted C string literal (GCC's
+    # extended-asm syntax requires the clobber list entries to be
+    # string literals: "cc", "memory", "eax", ...).
+    let clobbers: list[str] = []
+    if !list_contains_str(s.asm_options, "preserves_flags") {
+        clobbers.push("\"cc\"")
+    }
+    if !list_contains_str(s.asm_options, "nomem") {
+        clobbers.push("\"memory\"")
+    }
+    # Translate the template: {N} -> %N, ${N} -> $%cN (deep-scan-23 fix:
+    # plain `%N` on x86 AT&T already prints immediates WITH the `$`
+    # prefix, so a literal `$` in front of `%N` produces `$$imm` and a
+    # PIE link failure), {{ -> {, }} -> }, lone $ passes through.
+    let translated: str = translate_asm_template(s.asm_template, gcc_indices)
+    # Emit the GCC extended asm.
+    let mut volatile_kw: str = "__volatile__ "
+    if list_contains_str(s.asm_options, "pure") {
+        volatile_kw = ""
+    }
+    let outputs_str: str = join_str_list(outputs, ", ")
+    let inputs_str: str = join_str_list(inputs, ", ")
+    let clobbers_str: str = join_str_list(clobbers, ", ")
+    # GCC syntax: __asm__ __volatile__("template" : outputs : inputs : clobbers)
+    # If outputs is empty, the colon is still required.
+    let mut line: str = ind + "__asm__ " + volatile_kw + "("
+    # Quote the template (escape any embedded quotes/backslashes).
+    line = line + c_str_literal(translated)
+    line = line + " : " + outputs_str
+    line = line + " : " + inputs_str
+    line = line + " : " + clobbers_str
+    line = line + ");"
+    ctx.out.push(line)
+    # noreturn: emit __builtin_unreachable() so gcc knows the code
+    # after the asm is dead (eliminates the implicit `return` at the
+    # end of the fn).
+    if list_contains_str(s.asm_options, "noreturn") {
+        ctx.out.push(ind + "__builtin_unreachable();")
+    }
+    # Stage 27 deep-scan fix: write back the temp values for any
+    # list-index lvalue operands. The temp was used as the GCC asm
+    # output operand (above); now we copy it back to the list element
+    # via `hl_list_set` (mirroring gen_assign's pattern for index
+    # assignment).
+    let mut si: int = 0
+    while si < temp_setters.len() {
+        let op_idx: int = temp_setters.get(si)
+        let op: AsmOperand = s.asm_operands.get(op_idx)
+        let tmp_name: str = temp_names.get(op_idx)
+        let lst_c: str = temp_lists.get(op_idx)
+        let idx_c: str = temp_indices.get(op_idx)
+        let elem_t: str = ctx.exprs[op.expr_idx].t
+        # hl_list_set releases the old element itself; the new value
+        # must arrive OWNED (one retain). For primitive types
+        # (int/float/bool) the runtime boxes them via hl_box_i64 etc.
+        let boxed: str = gen_store_val(ctx, elem_t, tmp_name, false)
+        ctx.out.push(ind + "hl_list_set(" + lst_c + ", " + idx_c + ", " + boxed + ");")
+        si = si + 1
+    }
+    flush_null_after(ctx, ind)
+    clear_hoists(ctx)
+}
+
+# translate_asm_constraint: convert an HLS asm! constraint to the GCC
+# constraint string. See gen_asm for the full table.
+fn translate_asm_constraint(op: AsmOperand) -> str {
+    let c: str = op.constraint
+    # Compute the direction prefix. GCC requires outputs to start
+    # with `=` (write-only) or `+` (read-write), and a late-clobber
+    # output adds `&` (the operand is written before all inputs are
+    # consumed, so it must not alias any input register). The prefix
+    # applies to BOTH bare constraints (`out(reg) x` -> "=r") and
+    # specific-register string forms (`out("eax") x` -> "=a").
+    let mut prefix: str = ""
+    if op.dir == "out" {
+        prefix = "="
+    } else if op.dir == "inout" {
+        prefix = "+"
+    } else if op.dir == "late_out" {
+        prefix = "=&"
+    }
+    # `dir == "in"` has no prefix.
+    let mut body: str = c
+    if op.is_constraint_str {
+        # String form — translate known x86-64 register names to GCC
+        # constraint letters. GCC constraints are case-sensitive:
+        #   "a" = eax/rax   "b" = ebx/rbx   "c" = ecx/rcx
+        #   "d" = edx/rdx   "D" = edi/rdi   "S" = esi/rsi
+        # Unknown register names pass through verbatim (GCC accepts
+        # things like "r" / "=r" / "+r" / "=&r" as well as multi-letter
+        # constraints; the user takes responsibility for the validity).
+        if c == "eax" || c == "rax" {
+            body = "a"
+        } else if c == "ebx" || c == "rbx" {
+            body = "b"
+        } else if c == "ecx" || c == "rcx" {
+            body = "c"
+        } else if c == "edx" || c == "rdx" {
+            body = "d"
+        } else if c == "esi" || c == "rsi" {
+            body = "S"
+        } else if c == "edi" || c == "rdi" {
+            body = "D"
+        }
+        # If the user already prefixed the constraint with `=` or `+`,
+        # don't add another (e.g. `out("=r") x` -> "=r", not "==r").
+        # This is rare but supports users who want fine control.
+        if c.len() >= 1 && (c.byte_at(0) == 61 || c.byte_at(0) == 43) {
+            return c
+        }
+    } else {
+        # Bare register-class form.
+        if c == "reg" {
+            body = "r"
+        } else if c == "mem" {
+            body = "m"
+        } else if c == "imm" {
+            body = "i"
+        }
+    }
+    return prefix + body
+}
+
+# translate_asm_template: rewrite the HLS asm! template (which uses
+# `{N}` placeholders) to the GCC form (which uses `%N` positional
+# placeholders, `%%` for a literal `%`, and `{{` / `}}` for literal
+# braces). gcc_indices is the source-order list of GCC positional
+# indices (the source operand at position K has GCC index
+# gcc_indices[K], as a string; -1 means "this is an input that was
+# listed after the outputs in source order — the GCC index was
+# assigned during the second pass"). We rewrite `{N}` to
+# `%<gcc_indices[N]>` so the source-template `{0}` / `{1}` map to
+# the right GCC operand number regardless of in/out order.
+#
+# The immediate-operand form `${N}` is rewritten to `$%c<N>`: the
+# explicit `$` is the AT&T immediate prefix and GCC's `%c` modifier
+# prints the constant WITHOUT punctuation. Emitting the historical
+# `$%N` broke on modern GCC because plain `%N` for an `"i"`
+# constraint already emits the `$` itself, producing `$$42` — the
+# assembler then treats it as a reference to an undefined symbol
+# named `$42` and PIE linking fails (deep-scan-23, GCC 14).
+#
+# BUG-FIX (Stage 27): the original `gcc_indices` was filled only
+# during the OUTPUTS pass, leaving inputs at "-1" until the inputs
+# pass — but translate_asm_template runs AFTER both passes, so the
+# indices are all set. The function below looks up gcc_indices[N]
+# for each {N} placeholder.
+fn translate_asm_template(template: str, gcc_indices: list[str]) -> str {
+    let parts: list[str] = []
+    let mut i: int = 0
+    while i < template.len() {
+        let c: int = template.byte_at(i)
+        if c == 123 {
+            # `{` — could be `{{` or `{N}`.
+            if i + 1 < template.len() && template.byte_at(i + 1) == 123 {
+                parts.push("{")
+                i = i + 2
+            } else {
+                # find `}`
+                let mut j: int = i + 1
+                while j < template.len() && template.byte_at(j) != 125 {
+                    j = j + 1
+                }
+                # j is at `}` (or end-of-string).
+                let body: str = template.slice(i + 1, j)
+                # body is a number; look up gcc_indices[body.to_int()].
+                let n: int = body.to_int()
+                if n >= 0 && n < gcc_indices.len() {
+                    parts.push("%" + gcc_indices.get(n))
+                } else {
+                    # Out-of-range — the checker already rejected this;
+                    # emit as-is (will be a C compile error, which is
+                    # what we want for an unreachable codegen path).
+                    parts.push("%" + body)
+                }
+                i = j + 1
+            }
+        } else if c == 125 {
+            if i + 1 < template.len() && template.byte_at(i + 1) == 125 {
+                parts.push("}")
+                i = i + 2
+            } else {
+                # Should have been rejected by the checker; emit as-is.
+                parts.push("}")
+                i = i + 1
+            }
+        } else if c == 34 {
+            # `"` — escape for the C string literal.
+            parts.push("\\\"")
+            i = i + 1
+        } else if c == 92 {
+            # `\` — escape for the C string literal.
+            parts.push("\\\\")
+            i = i + 1
+        } else if c == 37 {
+            # `%` — GCC's extended-asm template uses `%` as the operand
+            # placeholder escape character:
+            #   `%0`      — operand 0 (positional)
+            #   `%b0`     — operand 0 in byte form (modifier `b`)
+            #   `%w0`     — operand 0 in word form (modifier `w`)
+            #   `%k0`     — operand 0 in dword form (modifier `k`)
+            #   `%q0`     — operand 0 in qword form (modifier `q`)
+            #   `%%`      — literal `%`
+            # The user can write any of these DIRECTLY in the template
+            # (in addition to the HLS `{N}` placeholder syntax). We
+            # pass `%` through verbatim — GCC handles the escape. The
+            # only special case is `%%` (literal `%`), which we pass
+            # through unchanged (it stays `%%` in the C string).
+            parts.push("%")
+            i = i + 1
+        } else if c == 36 && i + 1 < template.len() && template.byte_at(i + 1) == 123 {
+            # deep-scan-23 fix: `$` immediately followed by `{N}` — the
+            # HLS immediate-operand form (`${1}`). Emit `$%c<N>` (see
+            # the doc comment above): `$%N` would print `$$imm` on
+            # targets where GCC prefixes immediates with `$` itself.
+            let mut j: int = i + 2
+            while j < template.len() && template.byte_at(j) != 125 {
+                j = j + 1
+            }
+            let body: str = template.slice(i + 2, j)
+            let n: int = body.to_int()
+            if n >= 0 && n < gcc_indices.len() {
+                parts.push("$%c" + gcc_indices.get(n))
+            } else {
+                # Out-of-range — the checker already rejected this;
+                # emit as-is (will be a C compile error, which is
+                # what we want for an unreachable codegen path).
+                parts.push("$%c" + body)
+            }
+            i = j + 1
+        } else {
+            # All other bytes (including a lone `$` — which is NOT
+            # special in GCC's extended-asm template; AT&T syntax uses
+            # it for immediate values like `$0x60`, and GCC passes it
+            # through verbatim) pass through unchanged.
+            parts.push(template.slice(i, i + 1))
+            i = i + 1
+        }
+    }
+    return join(parts, "")
+}
+
+# join_str_list: join a list[str] with a separator. Mirrors the
+# boot's str.join — used by the asm codegen to build the
+# outputs/inputs/clobbers lists. The runtime `join` builtin already
+# exists, but it accepts list[str] directly; this wrapper is kept
+# for parity with the source-named convention used in gen_asm.
+fn join_str_list(xs: list[str], sep: str) -> str {
+    return join(xs, sep)
+}
+
+# c_str_literal: produce a C string literal (just the quoted form,
+# WITHOUT a wrapping hl_cstr() helper call) from an HLS string value.
+# Used by the asm codegen to embed the translated template into the C
+# source. (The existing c_str_lit helper produces `hl_cstr("...")`
+# which is a string-builder runtime call — we need a raw C literal
+# here because the GCC extended-asm syntax expects a bare string
+# token, not a function-call expression.)
+fn c_str_literal(s: str) -> str {
+    let parts: list[str] = []
+    parts.push("\"")
+    let mut i: int = 0
+    while i < s.len() {
+        let c: int = s.byte_at(i)
+        if c == 34 {
+            parts.push("\\\"")
+        } else if c == 92 {
+            parts.push("\\\\")
+        } else if c == 10 {
+            parts.push("\\n")
+        } else if c == 9 {
+            parts.push("\\t")
+        } else if c == 13 {
+            parts.push("\\r")
+        } else if c < 32 || c > 126 {
+            # Octal escape for non-printable bytes.
+            parts.push("\\" + ((c / 64) % 8).to_str() + ((c / 8) % 8).to_str() + (c % 8).to_str())
+        } else {
+            parts.push(s.slice(i, i + 1))
+        }
+        i = i + 1
+    }
+    parts.push("\"")
+    return join(parts, "")
+}
+
+fn gen_stmts(ctx: Ctx, stmts: list[int], ind: str) -> void {
+    let mut i: int = 0
+    while i < stmts.len() {
+        gen_stmt(ctx, stmts.get(i), ind)
+        i = i + 1
+    }
+}
+
+fn gen_assign(ctx: Ctx, s: StmtN, ind: str) -> void {
+    let tgt: int = s.target
+    collect_hoist(ctx, s.value)
+    # Hoist fresh subexpressions of the assignment TARGET too (e.g. a
+    # call result whose field is assigned: `f().name = "x"`).
+    collect_hoist(ctx, tgt)
+    hoist_all(ctx, ctx.out, ind)
+    let v: str = gen_expr(ctx, s.value)
+    # BUG-004 fix: if the RHS is `never`-typed (e.g. `x = panic("...")`),
+    # emit just the side-effect call without the assignment — the assignment
+    # target is unreachable code.
+    if ctx.exprs[s.value].t == "never" {
+        ctx.out.push(ind + v + ";")
+        flush_null_after(ctx, ind)
+        clear_hoists(ctx)
+        return
+    }
+    let fresh: bool = expr_fresh(ctx, s.value)
+    if ctx.exprs[tgt].kind == "ident" {
+        let cn: str = local_c(ctx, ctx.exprs[tgt].name)
+        let tgt_t: str = ctx.exprs[tgt].t
+        if is_ptr_t(ctx, tgt_t) {
+            # Stage 8-beta: release the old value AFTER storing the new
+            # one (self-assignment safe: the new value is retained or
+            # fresh before the old pointer is released).
+            let wrapped: str = own_wrap(ctx, tgt_t, v, fresh)
+            ctx.out.push(ind + "{ " + c_type(ctx, tgt_t) + " __hl_old = " + cn + "; "
+            + cn + " = " + wrapped + "; " + release_call(ctx, tgt_t, "__hl_old") + "; }")
+        } else {
+            ctx.out.push(ind + cn + " = " + v + ";")
+        }
+    } else if ctx.exprs[tgt].kind == "field" {
+        let base_t: str = ctx.exprs[ctx.exprs[tgt].left].t
+        let base: str = gen_expr(ctx, ctx.exprs[tgt].left)
+        let ftype: str = ctx.exprs[tgt].t
+        let fname: str = c_field_name(ctx.exprs[tgt].name)
+        if is_ptr_t(ctx, ftype) {
+            # Materialise the base once (calling it twice would
+            # double-evaluate), then store-then-release.
+            let bt: str = fresh_tmp(ctx, "hlc_fb")
+            let wrapped: str = own_wrap(ctx, ftype, v, fresh)
+            ctx.out.push(ind + "{ " + c_type(ctx, base_t) + " " + bt + " = " + base + ";")
+            ctx.out.push(ind + "  " + c_type(ctx, ftype) + " __hl_old = " + bt + "->" + fname + ";")
+            ctx.out.push(ind + "  " + bt + "->" + fname + " = " + wrapped + ";")
+            ctx.out.push(ind + "  " + release_call(ctx, ftype, "__hl_old") + "; }")
+        } else {
+            ctx.out.push(ind + "(" + base + ")->" + fname + " = " + v + ";")
+        }
+    } else {
+        # Stage 30 (v0.47.0-alpha): index assignment on a stack-allocated
+        # binding — xs[i] = v lowers to the typed bounds-checked setter
+        # (the value is a primitive C scalar, no boxing, no ownership
+        # transfer — the array element owns nothing).
+        if ctx.exprs[ctx.exprs[tgt].left].kind == "ident" && is_stack_var(ctx, ctx.exprs[ctx.exprs[tgt].left].name) {
+            let sarr: str = local_c(ctx, ctx.exprs[ctx.exprs[tgt].left].name)
+            let sidx: str = gen_expr(ctx, ctx.exprs[tgt].right)
+            let scap: int = stack_cap_of(ctx, ctx.exprs[ctx.exprs[tgt].left].name)
+            let set_suffix: str = stack_elem_suffix(list_elem_t(ctx.exprs[ctx.exprs[tgt].left].t))
+            ctx.out.push(ind + "hlc_ss_" + set_suffix + "(" + sarr + ", " + sidx + ", " + scap.to_str() + ", " + v + ");")
+            flush_null_after(ctx, ind)
+            clear_hoists(ctx)
+            return
+        }
+        let elem_t: str = list_elem_t(ctx.exprs[ctx.exprs[tgt].left].t)
+        let lst: str = gen_expr(ctx, ctx.exprs[tgt].left)
+        let idx: str = gen_expr(ctx, ctx.exprs[tgt].right)
+        # hl_list_set releases the old element itself (store-then-release
+        # inside the runtime); the new value arrives owned.
+        let wrapped: str = gen_store_val(ctx, elem_t, v, fresh)
+        ctx.out.push(ind + "hl_list_set(" + lst + ", " + idx + ", " + wrapped + ");")
+    }
+    flush_null_after(ctx, ind)
+    clear_hoists(ctx)
+}
+
+# --- Function generation ---
+
+fn gen_reset_fn(ctx: Ctx) -> void {
+    ctx.gen_locals = map_new()
+    ctx.gen_counts = map_new()
+    ctx.hoist_map = map_new()
+    ctx.null_after = []
+    ctx.cur_fn = ""
+    # Stage 31 (v0.48.0-alpha): clear the tail-call codegen state — the
+    # next function starts with no loop label and no rebind targets (an
+    # LTO inline clone generated afterwards can never see a stale label).
+    ctx.tail_label = ""
+    ctx.tail_params = []
+    # Stage 19 (v0.35.0-alpha): reset the per-function branch / loop
+    # site-id sequence numbers (site ids embed them: b:<fn>:<n>).
+    ctx.pgo_fn_branch_n = 0
+    ctx.pgo_fn_loop_n = 0
+}
+
+# gen_param_locals: Stage 8-beta — function parameters OWN one retain of
+# each argument. C cannot attach a cleanup attribute to a parameter, so
+# the signature uses a `<name>_p` parameter and the body starts with a
+# local `u_<name>` copy carrying the cleanup attribute. The body's code
+# references the local (via gen_locals), never the raw parameter.
+fn gen_param_locals(ctx: Ctx, f: FnInfo, ptypes_c: list[str], param_local_names: list[str], sig_params: list[str]) -> void {
+    let mut i: int = 0
+    while i < f.params.len() {
+        let cn: str = fresh_local(ctx, f.params.get(i))
+        param_local_names.push(cn)
+        sig_params.push(ptypes_c.get(i) + " " + cn + "_p")
+        i = i + 1
+    }
+}
+
+# emit_param_local_decls: emit the `u_x = u_x_p` declarations (with
+# cleanups for pointer types) at the top of a function body.
+fn emit_param_local_decls(ctx: Ctx, f: FnInfo, inst_ptypes: list[str], param_local_names: list[str]) -> void {
+    let mut i: int = 0
+    while i < f.params.len() {
+        let cn: str = param_local_names.get(i)
+        let pt: str = inst_ptypes.get(i)
+        if is_ptr_t(ctx, pt) {
+            ctx.out.push("    " + c_type(ctx, pt) + " " + cn
+            + " __attribute__((cleanup(" + cleanup_fn_for(ctx, pt) + "))) = " + cn + "_p;")
+        } else {
+            ctx.out.push("    " + c_type(ctx, pt) + " " + cn + " = " + cn + "_p;")
+        }
+        i = i + 1
+    }
+}
+
+# fn_has_elisions: does any expression in the fn body carry a proof
+# annotation? Under -O fast such fns MUST emit their entry requires
+# assertion — an elided check is only sound when the precondition that
+# proved it is enforced (see SPEC §26.4).
+fn fn_has_elisions(ctx: Ctx, stmts: list[int]) -> bool {
+    let mut i: int = 0
+    while i < stmts.len() {
+        let s: StmtN = ctx.stmts.get(stmts.get(i))
+        if stmt_exprs_have_elisions(ctx, s.value) {
+            return true
+        }
+        if stmt_exprs_have_elisions(ctx, s.cond) {
+            return true
+        }
+        if stmt_exprs_have_elisions(ctx, s.iter) {
+            return true
+        }
+        if stmt_exprs_have_elisions(ctx, s.e) {
+            return true
+        }
+        if s.target >= 0 {
+            if exprs_have_elisions(ctx, s.target) {
+                return true
+            }
+        }
+        if stmts_have_elisions(ctx, s.body) {
+            return true
+        }
+        if stmts_have_elisions(ctx, s.else_body) {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn stmts_have_elisions(ctx: Ctx, stmts: list[int]) -> bool {
+    let mut i: int = 0
+    while i < stmts.len() {
+        let s: StmtN = ctx.stmts.get(stmts.get(i))
+        if stmt_exprs_have_elisions(ctx, s.value) {
+            return true
+        }
+        if stmt_exprs_have_elisions(ctx, s.cond) {
+            return true
+        }
+        if stmt_exprs_have_elisions(ctx, s.iter) {
+            return true
+        }
+        if stmt_exprs_have_elisions(ctx, s.e) {
+            return true
+        }
+        if s.target >= 0 {
+            if exprs_have_elisions(ctx, s.target) {
+                return true
+            }
+        }
+        if stmts_have_elisions(ctx, s.body) {
+            return true
+        }
+        if stmts_have_elisions(ctx, s.else_body) {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn stmt_exprs_have_elisions(ctx: Ctx, e: int) -> bool {
+    return exprs_have_elisions(ctx, e)
+}
+
+fn exprs_have_elisions(ctx: Ctx, e: int) -> bool {
+    if e < 0 {
+        return false
+    }
+    let n: ExprN = ctx.exprs[e]
+    if n.ovf_safe || n.div_safe || n.bnd_safe {
+        return true
+    }
+    if exprs_have_elisions(ctx, n.left) {
+        return true
+    }
+    if exprs_have_elisions(ctx, n.right) {
+        return true
+    }
+    # Deep-scan-15 fix (MEDIUM-HIGH severity, soundness): same bug as
+    # tail_check_expr / lto_expr_has_qmark — for a `match` node,
+    # `n.args` holds arm indices, NOT expression indices. Walk arms
+    # via the MatchArm table; walk the generic args only for non-match.
+    if n.kind != "match" {
+        let mut i: int = 0
+        while i < n.args.len() {
+            if exprs_have_elisions(ctx, n.args.get(i)) {
+                return true
+            }
+            i = i + 1
+        }
+    }
+    if n.kind == "match" {
+        let mut a: int = 0
+        while a < n.args.len() {
+            let arm: MatchArm = ctx.match_arms.get(n.args.get(a))
+            if exprs_have_elisions(ctx, arm.body) {
+                return true
+            }
+            a = a + 1
+        }
+    }
+    return false
+}

@@ -1,0 +1,656 @@
+# ============================================================================
+# hlc/lto.hls — part of the hlc compiler (split from the original single-file
+# src/hlc.hls). This file is loaded via `import "hlc/lto.hls"` from src/hlc.hls.
+# Section 5d — LTO: reachability, inliner, PGO profile dump.
+# NOTE: content is byte-identical to the original src/hlc.hls line range
+#       15125..15774 - module split is purely structural, zero code changes.
+# ============================================================================
+fn pgo_dump_lines(ctx: Ctx) -> list[str] {
+    let out: list[str] = []
+    let n: int = ctx.pgo_site_ids.len()
+    if n == 0 {
+        # No profile sites at all — emit a no-op dumper so the atexit
+        # registration still links.
+        out.push("// ===== Stage 19: PGO profile dumper (no sites) =====")
+        out.push("static void __hlc_pgo_dump(void) { }")
+        out.push("")
+        return out
+    }
+    out.push("// ===== Stage 19: PGO site-id table + profile dumper =====")
+    out.push("static const char* __hlc_pgo_names[" + n.to_str() + "] = {")
+    # Emit the ids in rows of 4 to keep line lengths sane.
+    let mut i: int = 0
+    while i < n {
+        let mut row: str = "    \"" + ctx.pgo_site_ids.get(i) + "\","
+        if i + 1 < n {
+            row = row + " \"" + ctx.pgo_site_ids.get(i + 1) + "\","
+        }
+        if i + 2 < n {
+            row = row + " \"" + ctx.pgo_site_ids.get(i + 2) + "\","
+        }
+        if i + 3 < n {
+            row = row + " \"" + ctx.pgo_site_ids.get(i + 3) + "\","
+        }
+        out.push(row)
+        i = i + 4
+    }
+    out.push("};")
+    out.push("")
+    out.push("static void __hlc_pgo_dump(void) {")
+    out.push("    const char* path = getenv(\"HLS_PGO_FILE\");")
+    out.push("    if (!path || !path[0]) path = \"default.hlcprof\";")
+    out.push("    /* HLS_PGO_MERGE=1: ADD this run's counters to an existing")
+    out.push("       profile instead of overwriting it - a training workload")
+    out.push("       of N program runs then accumulates one merged profile. */")
+    out.push("    const char* merge = getenv(\"HLS_PGO_MERGE\");")
+    out.push("    if (merge && merge[0] == '1') {")
+    out.push("        FILE* r = fopen(path, \"r\");")
+    out.push("        if (r) {")
+    out.push("            char buf[512];")
+    out.push("            while (fgets(buf, sizeof buf, r)) {")
+    out.push("                char* sp = strchr(buf, ' ');")
+    out.push("                if (!sp) continue;")
+    out.push("                *sp = 0;")
+    out.push("                long long c = strtoll(sp + 1, NULL, 10);")
+    out.push("                for (int i = 0; i < " + n.to_str() + "; i++) {")
+    out.push("                    if (strcmp(__hlc_pgo_names[i], buf) == 0) {")
+    out.push("                        if (c > 0) __hlc_pgo_counts[i] += (uint64_t)c;")
+    out.push("                        break;")
+    out.push("                    }")
+    out.push("                }")
+    out.push("            }")
+    out.push("            fclose(r);")
+    out.push("        }")
+    out.push("    }")
+    out.push("    FILE* f = fopen(path, \"w\");")
+    out.push("    if (!f) return; /* best-effort: profiling must never crash the program */")
+    out.push("    for (int i = 0; i < " + n.to_str() + "; i++) {")
+    out.push("        if (__hlc_pgo_counts[i] > 0) {")
+    out.push("            fprintf(f, \"%s %llu\\n\", __hlc_pgo_names[i],")
+    out.push("                    (unsigned long long)__hlc_pgo_counts[i]);")
+    out.push("        }")
+    out.push("    }")
+    out.push("    fclose(f);")
+    out.push("}")
+    out.push("")
+    return out
+}
+
+# ============================================================================
+# STAGE 20 (v0.36.0-alpha): LINK-TIME OPTIMISATION ACROSS "CRATES"
+# ----------------------------------------------------------------------------
+# The merged program (entry + every transitive import) is ONE compilation
+# unit, so "cross-crate" optimisation happens at the whole-program level:
+#   1. cross-crate inlining — a small single-return function from an
+#      imported module is inlined at statement-level call positions
+#      (let / return / expression statement); the callee's body is
+#      generated inline with per-site unique temps, the args get the
+#      same own-wrap treatment a real call gives them, and the return
+#      expression is bound through the same own-wrap the return path
+#      uses — so ownership semantics are bit-for-bit preserved.
+#   2. whole-program DCE — functions not reachable from main (plus the
+#      struct-default / contract / spawn roots) are not emitted at all;
+#      a function whose EVERY call site was inlined is dropped as well
+#      ("inlined and the standalone definition is dropped").
+#   3. generic specialisation dedup — instantiations are keyed by the
+#      mangled name, so two modules instantiating the same generic with
+#      the same type args share ONE specialisation (the collection is
+#      already keyed; --lto reports how many duplicate requests were
+#      collapsed).
+# ============================================================================
+
+# lto_reachable: the set of function keys reachable from the roots via
+# the CHECKER's call graph (ctx.edges — includes method calls, spawn
+# targets and struct-default exprs via the "" synthetic caller).
+# Roots: main + every callee of "" (top-level exprs: struct defaults).
+fn lto_reachable(ctx: Ctx) -> list[str] {
+    let visited: map[str, bool] = map_new()
+    let work: list[str] = []
+    work.push("main")
+    # "" callees: struct default field expressions are checked with the
+    # empty caller key; their callees must stay (constructors for ALL
+    # structs are emitted unconditionally).
+    if ctx.edges.has("") {
+        let ec: list[str] = ctx.edges.get_or("", [])
+        let mut i: int = 0
+        while i < ec.len() {
+            work.push(ec.get(i))
+            i = i + 1
+        }
+    }
+    while work.len() > 0 {
+        let k: str = work.pop()
+        if k == "" || k.len() < 1 {
+            continue
+        }
+        if k.len() >= 2 && k.slice(0, 2) == "b:" {
+            continue
+        }
+        if visited.has(k) {
+            continue
+        }
+        visited.set(k, true)
+        if ctx.edges.has(k) {
+            let outs: list[str] = ctx.edges.get_or(k, [])
+            let mut j: int = 0
+            while j < outs.len() {
+                work.push(outs.get(j))
+                j = j + 1
+            }
+        }
+    }
+    return visited.keys()
+}
+
+# lto_count_stmts: recursive statement count (for the inline budget).
+fn lto_count_stmts(ctx: Ctx, stmts: list[int]) -> int {
+    let mut n: int = 0
+    let mut i: int = 0
+    while i < stmts.len() {
+        let s: StmtN = ctx.stmts[stmts.get(i)]
+        n = n + 1
+        n = n + lto_count_stmts(ctx, s.body)
+        n = n + lto_count_stmts(ctx, s.else_body)
+        i = i + 1
+    }
+    return n
+}
+
+# lto_callee_local_names: collect every name the callee body will
+# register in gen_locals (let bindings + for loop variables, at any
+# nesting depth) so the caller's entries can be saved and restored.
+fn lto_callee_local_names(ctx: Ctx, stmts: list[int], out: list[str]) -> void {
+    let mut i: int = 0
+    while i < stmts.len() {
+        let s: StmtN = ctx.stmts[stmts.get(i)]
+        if s.kind == "let" {
+            out.push(s.name)
+        }
+        if s.kind == "for" {
+            out.push(s.name)
+        }
+        lto_callee_local_names(ctx, s.body, out)
+        lto_callee_local_names(ctx, s.else_body, out)
+        i = i + 1
+    }
+}
+
+# lto_expr_has_qmark: does this expression subtree contain the `?`
+# operator (qmark nodes lower to a return inside a statement expr)?
+fn lto_expr_has_qmark(ctx: Ctx, e: int) -> bool {
+    if e == -1 {
+        return false
+    }
+    let ex: ExprN = ctx.exprs[e]
+    if ex.kind == "qmark" {
+        return true
+    }
+    if lto_expr_has_qmark(ctx, ex.left) {
+        return true
+    }
+    if lto_expr_has_qmark(ctx, ex.right) {
+        return true
+    }
+    # Deep-scan-15 fix (MEDIUM-HIGH severity, soundness): for non-match
+    # nodes, `n.args` is a list of child expression indices — walk them.
+    # For match, `n.args` is a list of arm INDICES (into ctx.match_arms)
+    # and must be walked via `ctx.match_arms[arm_idx].body`. The previous
+    # code unconditionally walked `n.args` as expressions, silently
+    # walking unrelated nodes (or panicking) for match — meaning an
+    # LTO inline-decision could be made on bogus qmark-presence data
+    # and drop a qmark that the inline clone needed.
+    if ex.kind != "match" {
+        let mut i: int = 0
+        while i < ex.args.len() {
+            if lto_expr_has_qmark(ctx, ex.args.get(i)) {
+                return true
+            }
+            i = i + 1
+        }
+    } else {
+        # match: walk each arm body via the MatchArm table.
+        let mut ai: int = 0
+        while ai < ex.args.len() {
+            let arm: MatchArm = ctx.match_arms.get(ex.args.get(ai))
+            if arm.body >= 0 && lto_expr_has_qmark(ctx, arm.body) {
+                return true
+            }
+            ai = ai + 1
+        }
+    }
+    return false
+}
+
+# lto_body_has_qmark: any statement (at any depth) whose expressions
+# contain a qmark — including match arms (their arm bodies are
+# statements; match-as-expression scrutinee is an expr arg).
+fn lto_body_has_qmark(ctx: Ctx, stmts: list[int]) -> bool {
+    let mut i: int = 0
+    while i < stmts.len() {
+        let s: StmtN = ctx.stmts[stmts.get(i)]
+        if s.value != -1 && lto_expr_has_qmark(ctx, s.value) {
+            return true
+        }
+        if s.target != -1 && lto_expr_has_qmark(ctx, s.target) {
+            return true
+        }
+        if s.cond != -1 && lto_expr_has_qmark(ctx, s.cond) {
+            return true
+        }
+        if s.iter != -1 && lto_expr_has_qmark(ctx, s.iter) {
+            return true
+        }
+        if s.e != -1 && lto_expr_has_qmark(ctx, s.e) {
+            return true
+        }
+        if lto_body_has_qmark(ctx, s.body) {
+            return true
+        }
+        if lto_body_has_qmark(ctx, s.else_body) {
+            return true
+        }
+        # match statement: arms hold (cond?, body) — the arm payloads are
+        # statement lists reachable via match_arms indexes stored in the
+        # stmt's args? MatchArm bodies are found through s.e (the match
+        # expr index); its arms list is ctx.exprs[s.e].args -> arm ids.
+        if s.kind == "match" || s.e != -1 {
+            let mex: ExprN = ctx.exprs[s.e]
+            if mex.kind == "match" {
+                if lto_expr_has_qmark(ctx, mex.left) {
+                    return true
+                }
+                let mut ai: int = 0
+                while ai < mex.args.len() {
+                    let arm: MatchArm = ctx.match_arms[mex.args.get(ai)]
+                    # arm.body is an EXPRESSION index (not a stmt list).
+                    if lto_expr_has_qmark(ctx, arm.body) {
+                        return true
+                    }
+                    ai = ai + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return false
+}
+
+# lto_count_returns_deep: count return statements at EVERY nesting
+# depth (an early return nested inside an if/while CANNOT be inlined —
+# emitted inside the caller it would return from the CALLER).
+fn lto_count_returns_deep(ctx: Ctx, stmts: list[int]) -> int {
+    let mut n: int = 0
+    let mut i: int = 0
+    while i < stmts.len() {
+        let s: StmtN = ctx.stmts[stmts.get(i)]
+        if s.kind == "return" {
+            n = n + 1
+        }
+        n = n + lto_count_returns_deep(ctx, s.body)
+        n = n + lto_count_returns_deep(ctx, s.else_body)
+        i = i + 1
+    }
+    return n
+}
+
+# lto_single_return: exactly ONE return in the WHOLE statement tree, and
+# it is the LAST top-level statement (non-void: with a value; void:
+# either no return at all, or a trailing bare `return;`). Any early /
+# nested return disqualifies the callee from inlining.
+fn lto_single_return(ctx: Ctx, f: FnInfo) -> int {
+    # returns: 0 = void, no return; 1 = non-void trailing return with
+    # value; 2 = void trailing bare return; -1 = NOT inlinable.
+    let n: int = f.body.len()
+    if n == 0 {
+        if f.ret == "void" {
+            return 0
+        }
+        return -1
+    }
+    let rets: int = lto_count_returns_deep(ctx, f.body)
+    if rets == 0 {
+        if f.ret == "void" {
+            return 0
+        }
+        return -1
+    }
+    if rets != 1 {
+        return -1
+    }
+    # The single return must be the LAST top-level statement.
+    let last: StmtN = ctx.stmts[f.body.get(n - 1)]
+    if last.kind != "return" {
+        return -1
+    }
+    if f.ret == "void" {
+        if last.value == -1 {
+            return 2
+        }
+        return -1
+    }
+    if last.value == -1 {
+        return -1
+    }
+    return 1
+}
+
+# lto_is_recursive: true when key can reach itself through the checker's
+# call graph (direct or mutual recursion — never inline those).
+fn lto_is_recursive(ctx: Ctx, key: str) -> bool {
+    if !ctx.edges.has(key) {
+        return false
+    }
+    let visited: map[str, bool] = map_new()
+    let work: list[str] = []
+    let outs: list[str] = ctx.edges.get_or(key, [])
+    let mut i: int = 0
+    while i < outs.len() {
+        work.push(outs.get(i))
+        i = i + 1
+    }
+    while work.len() > 0 {
+        let k: str = work.pop()
+        if k == key {
+            return true
+        }
+        if k == "" || (k.len() >= 2 && k.slice(0, 2) == "b:") {
+            continue
+        }
+        if visited.has(k) {
+            continue
+        }
+        visited.set(k, true)
+        if ctx.edges.has(k) {
+            let o2: list[str] = ctx.edges.get_or(k, [])
+            let mut j: int = 0
+            while j < o2.len() {
+                work.push(o2.get(j))
+                j = j + 1
+            }
+        }
+    }
+    return false
+}
+
+# LTO_INLINE_MAX_SITES: total inline expansions per program (bloat
+# guard). LTO_INLINE_MAX_STMTS: per-callee statement budget.
+# Stage 20 perfection (v0.39.0-alpha): the per-callee budget is
+# tunable via --lto-threshold=N (ctx.lto_threshold > 0 overrides
+# the default of 30).
+fn LTO_INLINE_MAX_SITES() -> int {
+    return 100
+}
+fn LTO_INLINE_MAX_STMTS() -> int {
+    return 30
+}
+fn lto_inline_stmts_budget(ctx: Ctx) -> int {
+    if ctx.lto_threshold > 0 {
+        return ctx.lto_threshold
+    }
+    return LTO_INLINE_MAX_STMTS()
+}
+
+# lto_can_inline: the inlinability predicate.
+fn lto_can_inline(ctx: Ctx, key: str) -> bool {
+    if !ctx.lto_mode {
+        return false
+    }
+    if key == "main" {
+        return false
+    }
+    if !ctx.fns.has(key) {
+        return false
+    }
+    let f: FnInfo = ctx.fns.get_or(key, dummy_fn())
+    if f.is_extern {
+        return false
+    }
+    if f.is_method {
+        return false
+    }
+    if f.typeparams.len() > 0 {
+        return false
+    }
+    if f.ret == "never" {
+        return false
+    }
+    # Stage 29 (v0.46.0-alpha): #[inline(never)] forbids inlining at
+    # every call site — return false immediately (the user's explicit
+    # annotation overrides every other consideration). The C signature
+    # carries __attribute__((noinline)) as a SECOND layer of defence
+    # (gcc will refuse to inline even if the LTO inliner missed it).
+    if f.attr_inline == "never" {
+        return false
+    }
+    # Stage 31 (v0.48.0-alpha): #[tail_call] functions are NEVER
+    # inlined. Their bodies contain the label + parameter-rebinding
+    # goto of the tail-call loop: splicing that body into a caller
+    # would (a) duplicate the label across two inline expansions (a C
+    # compile error) and (b) turn the constant-stack loop back into
+    # call machinery. Every call site stays out-of-line — which also
+    # keeps lto_calls[key] >= 1, so phase-B DCE can never drop the
+    # standalone body that contains the loop.
+    if f.attr_tail_call {
+        return false
+    }
+    # Contracted functions keep their standalone bodies (the requires /
+    # ensures checks and -O fast elisions interplay with the fn boundary;
+    # inlining them is deferred).
+    if f.requires_e != -1 || f.ensures_e != -1 {
+        return false
+    }
+    # deep-scan-23: multi-return callees are inlinable now — the splice
+    # path lowers every return (early or trailing) to an assignment on
+    # a pre-declared result temp + a jump to a tail label. The old gate
+    # (single-return-only) stopped inlining list_sort_int_asc after the
+    # Stage 32 rewrite added the `if n == 0 { return [] }` guard — the
+    # Stage 20 LTO acceptance caught the regression. A non-void fn with
+    # ZERO returns is still rejected (it cannot produce a value).
+    let rets: int = lto_count_returns_deep(ctx, f.body)
+    if rets == 0 && f.ret != "void" {
+        return false
+    }
+    # The trailing return's VALUE must be bindable (a `return panic(...)`
+    # in a non-never fn lowers to a bare call, which cannot feed the
+    # result temp).
+    let rn: int = f.body.len()
+    if rn > 0 {
+        let lastst: StmtN = ctx.stmts[f.body.get(rn - 1)]
+        if lastst.kind == "return" && lastst.value != -1 {
+            if ctx.exprs[lastst.value].t == "never" {
+                return false
+            }
+        }
+    }
+    # The `?` operator lowers to a `return` INSIDE a C statement
+    # expression — splicing such a body into the caller would return
+    # from the CALLER. Callees containing ? are never inlined.
+    if lto_body_has_qmark(ctx, f.body) {
+        return false
+    }
+    # Stage 29 (v0.46.0-alpha): #[inline(always)] BYPASSES the
+    # per-callee statement budget AND the per-program inline-site cap
+    # (LTO_INLINE_MAX_SITES). The user's explicit annotation
+    # overrides the heuristic. The recursion check stays (inlining
+    # a recursive function would loop forever) and so does the
+    # never-return check.
+    if f.attr_inline == "always" {
+        if lto_is_recursive(ctx, key) {
+            return false
+        }
+        return true
+    }
+    if lto_count_stmts(ctx, f.body) > lto_inline_stmts_budget(ctx) {
+        return false
+    }
+    if lto_is_recursive(ctx, key) {
+        return false
+    }
+    if ctx.lto_inline_n >= LTO_INLINE_MAX_SITES() {
+        return false
+    }
+    return true
+}
+
+# lto_note_call: count an emitted out-of-line call (gen_call / method /
+# spawn trampoline) so phase-B DCE knows the standalone body is needed.
+fn lto_note_call(ctx: Ctx, key: str) -> void {
+    if !ctx.lto_mode {
+        return
+    }
+    let cur: int = ctx.lto_calls.get_or(key, 0)
+    ctx.lto_calls.set(key, cur + 1)
+}
+
+# gen_expr_maybe_inline: the statement-position inline hook. Falls back
+# to a plain gen_expr when LTO is off or the callee is not inlinable.
+fn gen_expr_maybe_inline(ctx: Ctx, e: int, ind: str) -> str {
+    if !ctx.lto_mode {
+        return gen_expr(ctx, e)
+    }
+    if ctx.exprs[e].kind != "call" || !ctx.exprs[e].muser {
+        return gen_expr(ctx, e)
+    }
+    let key: str = ctx.exprs[e].mkey
+    if !lto_can_inline(ctx, key) {
+        return gen_expr(ctx, e)
+    }
+    return lto_emit_inline(ctx, key, e, ind)
+}
+
+# lto_emit_inline: generate the callee's body AT the call site and
+# return the C expression holding the call result ("" for void).
+fn lto_emit_inline(ctx: Ctx, key: str, e: int, ind: str) -> str {
+    let f: FnInfo = ctx.fns.get_or(key, dummy_fn())
+    ctx.lto_inline_n = ctx.lto_inline_n + 1
+    if !list_has(ctx.lto_inlined_report, key) {
+        ctx.lto_inlined_report.push(key)
+    }
+    let rkind: int = lto_single_return(ctx, f)
+    # ---- 1. argument temps (one owned retain each — exactly what a
+    # real call passes; pointer params carry a cleanup attribute so the
+    # temp is released at the enclosing C block exit, like param locals).
+    let save_names: list[str] = []
+    lto_callee_local_names(ctx, f.body, save_names)
+    let mut pi: int = 0
+    while pi < f.params.len() {
+        save_names.push(f.params.get(pi))
+        pi = pi + 1
+    }
+    let save_vals: list[str] = []
+    let mut si: int = 0
+    while si < save_names.len() {
+        if ctx.gen_locals.has(save_names.get(si)) {
+            save_vals.push(ctx.gen_locals.get_or(save_names.get(si), ""))
+        } else {
+            save_vals.push("")
+        }
+        si = si + 1
+    }
+    let mut ai: int = 0
+    while ai < f.params.len() {
+        let pname: str = f.params.get(ai)
+        let ptype: str = inst_t(ctx, f.ptypes.get(ai))
+        let arg_e: int = ctx.exprs[e].args.get(ai)
+        let fresh: bool = expr_fresh(ctx, arg_e)
+        let v: str = gen_expr(ctx, arg_e)
+        let wrapped: str = own_wrap(ctx, ptype, v, fresh)
+        let tname: str = fresh_tmp(ctx, "hl_iv")
+        if is_ptr_t(ctx, ptype) {
+            ctx.out.push(ind + c_type(ctx, ptype) + " " + tname
+            + " __attribute__((cleanup(" + cleanup_fn_for(ctx, ptype) + "))) = " + wrapped + ";")
+        } else {
+            ctx.out.push(ind + c_type(ctx, ptype) + " " + tname + " = " + wrapped + ";")
+        }
+        ctx.gen_locals.set(pname, tname)
+        ai = ai + 1
+    }
+    # ---- 2. the callee body statements. The trailing return is NOT
+    # emitted (a `return` inside the caller would return from the
+    # CALLER); its expression becomes the result binding below.
+    # Stage 30 (v0.47.0-alpha): suppress stack-layout codegen while the
+    # callee body is generated inline — layout keys are per SOURCE
+    # function and ctx.cur_fn here is the CALLER, so a stack-lookup
+    # would resolve the caller's same-named binding (wrong key). The
+    # inlined body uses the sound heap layout instead.
+    ctx.in_inline_clone = ctx.in_inline_clone + 1
+    # deep-scan-23: multi-return splice path. rkind == -1 here means
+    # the body has early returns (or a non-trailing single return) —
+    # lto_can_inline already allowed it. Pre-declare the result temp,
+    # arm the gen_stmt return hook, emit the WHOLE body, then the tail
+    # label; every callee return becomes `temp = value; goto label;`
+    # (or a bare `goto` for void). Ownership wrapping at each return
+    # site matches the real return path exactly.
+    if rkind == -1 {
+        let mut temp: str = ""
+        if f.ret != "void" {
+            temp = fresh_tmp(ctx, "hl_ir")
+            let mut zero: str = "0"
+            if is_ptr_t(ctx, f.ret) {
+                zero = "NULL"
+            }
+            ctx.out.push(ind + c_type(ctx, f.ret) + " " + temp + " = " + zero + ";")
+        }
+        let label: str = "hl_ltail_" + ctx.lto_label_n.to_str()
+        ctx.lto_label_n = ctx.lto_label_n + 1
+        ctx.lto_splice_temp = temp
+        ctx.lto_splice_label = label
+        let mut bi: int = 0
+        while bi < f.body.len() {
+            gen_stmt(ctx, f.body.get(bi), ind)
+            bi = bi + 1
+        }
+        ctx.lto_splice_temp = ""
+        ctx.lto_splice_label = ""
+        ctx.out.push(ind + label + ":;")
+        # Stage 30: the inlined callee body is fully generated —
+        # re-enable stack-layout codegen for the caller.
+        ctx.in_inline_clone = ctx.in_inline_clone - 1
+        # ---- 4. restore the caller's gen_locals view.
+        let mut ri: int = 0
+        while ri < save_names.len() {
+            let nm: str = save_names.get(ri)
+            let sv: str = save_vals.get(ri)
+            ctx.gen_locals.set(nm, sv)
+            ri = ri + 1
+        }
+        return temp
+    }
+    let body_n: int = f.body.len()
+    let mut gen_n: int = body_n
+    if rkind == 1 || rkind == 2 {
+        gen_n = body_n - 1
+    }
+    let mut bi: int = 0
+    while bi < gen_n {
+        gen_stmt(ctx, f.body.get(bi), ind)
+        bi = bi + 1
+    }
+    # ---- 3. result binding (non-void): the trailing return's
+    # expression, own-wrapped exactly like the real return path.
+    let mut ret_temp: str = ""
+    if rkind == 1 {
+        let last: StmtN = ctx.stmts[f.body.get(body_n - 1)]
+        let rv: str = gen_expr(ctx, last.value)
+        let rfresh: bool = expr_fresh(ctx, last.value)
+        let rwrapped: str = own_wrap(ctx, f.ret, rv, rfresh)
+        ret_temp = fresh_tmp(ctx, "hl_ir")
+        ctx.out.push(ind + c_type(ctx, f.ret) + " " + ret_temp + " = " + rwrapped + ";")
+    }
+    # Stage 30: the inlined callee body (and its result expression) are
+    # fully generated — re-enable stack-layout codegen for the caller.
+    ctx.in_inline_clone = ctx.in_inline_clone - 1
+    # ---- 4. restore the caller's gen_locals view (the callee's `let`
+    # registrations must not shadow the caller's bindings after the
+    # inline site; the result binding above already resolved).
+    let mut ri: int = 0
+    while ri < save_names.len() {
+        let nm: str = save_names.get(ri)
+        let sv: str = save_vals.get(ri)
+        # HLS maps have no remove; setting "" unbinds (local_c's
+        # get_or("") panics exactly like an absent key).
+        ctx.gen_locals.set(nm, sv)
+        ri = ri + 1
+    }
+    return ret_temp
+}

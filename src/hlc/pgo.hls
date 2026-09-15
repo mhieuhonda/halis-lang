@@ -1,0 +1,317 @@
+# ============================================================================
+# hlc/pgo.hls — part of the hlc compiler (split from the original single-file
+# src/hlc.hls). This file is loaded via `import "hlc/pgo.hls"` from src/hlc.hls.
+# Section 5b — PGO profile loading/hints and per-function C attributes.
+# NOTE: content is byte-identical to the original src/hlc.hls line range
+#       13688..13997 - module split is purely structural, zero code changes.
+# ============================================================================
+fn pgo_site(ctx: Ctx, id: str) -> int {
+    if !ctx.pgo_gen && !pgo_has_profile(ctx) {
+        return 0
+    }
+    if ctx.pgo_site_map.has(id) {
+        return ctx.pgo_site_map.get_or(id, 0)
+    }
+    ctx.pgo_site_ids.push(id)
+    let idx: int = ctx.pgo_site_ids.len() - 1
+    ctx.pgo_site_map.set(id, idx)
+    return idx
+}
+
+# PGO_MAX_SITES: the fixed counter array size in the generated C. hlc
+# refuses to instrument programs with more profile sites than this.
+fn PGO_MAX_SITES() -> int {
+    return 65536
+}
+
+# pgo_load_profile: parse a .hlcprof file (one "<site_id> <count>" pair
+# per line) into ctx.pgo_counts. Returns an error message or "" on
+# success. The format is deliberately line-based plain text: portable,
+# diffable, and debuggable.
+fn pgo_load_profile(ctx: Ctx, content: str) -> str {
+    let mut i: int = 0
+    let n: int = content.len()
+    let mut sites: int = 0
+    while i < n {
+        # id = bytes up to the first space (32).
+        let id_start: int = i
+        while i < n && content.byte_at(i) != 32 && content.byte_at(i) != 10 {
+            i = i + 1
+        }
+        let id: str = content.slice(id_start, i)
+        if id.len() == 0 {
+            if i < n && content.byte_at(i) == 10 {
+                i = i + 1
+            }
+            continue
+        }
+        if i >= n || content.byte_at(i) != 32 {
+            return "malformed profile line (no count) near offset " + i.to_str()
+        }
+        # skip spaces.
+        while i < n && content.byte_at(i) == 32 {
+            i = i + 1
+        }
+        let num_start: int = i
+        while i < n && content.byte_at(i) >= 48 && content.byte_at(i) <= 57 {
+            i = i + 1
+        }
+        if num_start == i {
+            return "malformed profile count for site '" + id + "'"
+        }
+        let count: int = int(content.slice(num_start, i))
+        ctx.pgo_counts.set(id, count)
+        sites = sites + 1
+        # skip to end of line.
+        while i < n && content.byte_at(i) != 10 {
+            i = i + 1
+        }
+        if i < n {
+            i = i + 1
+        }
+    }
+    if sites == 0 {
+        return "profile contains no sites"
+    }
+    # Total calls = sum of all function-entry counts ("e:<fnkey>").
+    let keys: list[str] = ctx.pgo_counts.keys()
+    let mut total: int = 0
+    let mut ki: int = 0
+    while ki < keys.len() {
+        let k: str = keys.get(ki)
+        if k.len() > 2 && k.slice(0, 2) == "e:" {
+            total = total + ctx.pgo_counts.get_or(k, 0)
+        }
+        ki = ki + 1
+    }
+    ctx.pgo_total_calls = total
+    return ""
+}
+
+# pgo_site_count: the profile count for a site id (0 when absent).
+fn pgo_site_count(ctx: Ctx, id: str) -> int {
+    return ctx.pgo_counts.get_or(id, 0)
+}
+
+# pgo_has_profile: is a --pgo-use profile loaded?
+fn pgo_has_profile(ctx: Ctx) -> bool {
+    return ctx.pgo_counts.keys().len() > 0
+}
+
+# pgo_branch_hint: expected value for an if-condition's
+# __builtin_expect, or -1 when no hint should be emitted.
+# Bias thresholds: >= 90% taken -> expect 1; <= 10% taken -> expect 0.
+fn pgo_branch_hint(ctx: Ctx, true_id: str, false_id: str) -> int {
+    if !pgo_has_profile(ctx) {
+        return -1
+    }
+    let t: int = pgo_site_count(ctx, true_id)
+    let f: int = pgo_site_count(ctx, false_id)
+    let total: int = t + f
+    if total <= 0 {
+        return -1
+    }
+    if t * 10 >= total * 9 {
+        return 1
+    }
+    if t * 10 <= total {
+        return 0
+    }
+    return -1
+}
+
+# pgo_loop_hint: expected value for a loop condition (or -1 for no hint).
+# A loop that never iterated in the profile is likely dead -> expect 0;
+# one that iterated -> expect 1 (the common case keeps the body hot).
+fn pgo_loop_hint(ctx: Ctx, backedge_id: str) -> int {
+    if !pgo_has_profile(ctx) {
+        return -1
+    }
+    if pgo_site_count(ctx, backedge_id) <= 0 {
+        return 0
+    }
+    return 1
+}
+
+# pgo_wrap_expect: wrap a C condition expression with __builtin_expect.
+fn pgo_wrap_expect(cond: str, expected: int) -> str {
+    return "__builtin_expect((" + cond + "), " + expected.to_str() + ")"
+}
+
+# pgo_fn_is_hot: is this function hot per the loaded profile?
+# Hot = at least 1000 entries AND at least 2% of all function entries.
+fn pgo_fn_is_hot(ctx: Ctx, key: str) -> bool {
+    if !pgo_has_profile(ctx) || ctx.pgo_total_calls <= 0 {
+        return false
+    }
+    let c: int = pgo_site_count(ctx, "e:" + key)
+    if c < 1000 {
+        return false
+    }
+    return c * 50 >= ctx.pgo_total_calls
+}
+
+# pgo_fn_is_cold: the function was never called in the profile.
+fn pgo_fn_is_cold(ctx: Ctx, key: str) -> bool {
+    if !pgo_has_profile(ctx) {
+        return false
+    }
+    return pgo_site_count(ctx, "e:" + key) == 0
+}
+
+# pgo_fn_attr: the C attribute prefix for a function signature under
+# --pgo-use ("" when none).
+fn pgo_fn_attr(ctx: Ctx, key: str) -> str {
+    if pgo_fn_is_hot(ctx, key) {
+        return "__attribute__((hot)) "
+    }
+    if pgo_fn_is_cold(ctx, key) {
+        return "__attribute__((cold)) "
+    }
+    return ""
+}
+
+# pgo_fn_inline: should this function get the `static inline` hint?
+# True when the profile marks it hot AND its emitted body is small
+# (<= 40 lines) — the per-call-site inlining threshold, realised as a
+# hint gcc honours at every call site of the function.
+fn pgo_fn_inline(ctx: Ctx, key: str) -> bool {
+    if !pgo_fn_is_hot(ctx, key) {
+        return false
+    }
+    if !ctx.pgo_fn_sizes.has(key) {
+        return false
+    }
+    return ctx.pgo_fn_sizes.get_or(key, 0) <= 40
+}
+
+# ============================================================================
+# STAGE 28 + 29 (v0.45.0-alpha + v0.46.0-alpha): function attribute prefixes
+# ----------------------------------------------------------------------------
+# fn_attr_prefix(ctx, f) returns the C attribute prefix to attach to a
+# function signature. It combines:
+#   - Stage 29 inline / hot / cold attrs (override PGO when set)
+#   - Stage 28 no_red_zone / irq_handler attrs (frame layout)
+#   - Stage 19 PGO hints (only when no explicit override)
+#
+# The order matters: `static inline __attribute__((always_inline))`
+# MUST come before the function name; `__attribute__((hot))` / `((cold))`
+# / `((optimize("no-red-zone")))` / `((interrupt))` are independent and
+# can be appended. The caller writes:
+#     out.push(fn_attr_prefix(ctx, f, key) + sig + " {")
+#
+# For prototypes, use fn_attr_prefix the same way — the C attribute
+# syntax allows the same attributes on prototypes as on definitions.
+#
+# The PGO `static inline` hint is ONLY added when:
+#   - attr_inline == "" (no explicit always/never)
+#   - pgo_fn_inline(key) is true (hot + small body)
+# When attr_inline == "always", we emit `static inline
+# __attribute__((always_inline))` (gcc requires the `inline` keyword
+# alongside the attribute for it to take effect). When attr_inline ==
+# "never", we emit `__attribute__((noinline))` (no `static inline`).
+# ============================================================================
+
+# fn_inline_attr: the inline-related prefix (may be empty).
+fn fn_inline_attr(ctx: Ctx, f: FnInfo, key: str) -> str {
+    if f.attr_inline == "always" {
+        # Stage 29 (v0.46.0-alpha): #[inline(always)] forces inlining
+        # at every call site. gcc requires both `inline` and
+        # __attribute__((always_inline)) for the hint to take effect.
+        return "static inline __attribute__((always_inline)) "
+    }
+    if f.attr_inline == "never" {
+        # Stage 29: #[inline(never)] forbids inlining at every call
+        # site (the LTO phase-B inliner also honours this — see
+        # lto_can_inline). gcc emits __attribute__((noinline)).
+        return "__attribute__((noinline)) "
+    }
+    # No explicit override — consult the PGO profile (--pgo-use) for
+    # the hot-small-function `static inline` hint.
+    if pgo_fn_inline(ctx, key) {
+        return "static inline "
+    }
+    return ""
+}
+
+# fn_hotcold_attr: the hot/cold attribute prefix (may be empty).
+fn fn_hotcold_attr(ctx: Ctx, f: FnInfo, key: str) -> str {
+    if f.attr_hot {
+        return "__attribute__((hot)) "
+    }
+    if f.attr_cold {
+        return "__attribute__((cold)) "
+    }
+    # No explicit override — consult PGO.
+    return pgo_fn_attr(ctx, key)
+}
+
+# fn_frame_attr: Stage 28 stack-frame attributes. Always emitted —
+# when the host C compiler does not support a given attribute (e.g.
+# clang on a non-x86-64 host rejecting `target("no-red-zone")`), it
+# emits a warning that the user can suppress with -Wno-attributes.
+#
+# `irq_handler` automatically disables the x86-64 red zone for that
+# function (gcc emits IRETQ semantics which forbid red-zone use); the
+# separate `no_red_zone` attribute is for the case where a function
+# is NOT an interrupt handler but still wants to be red-zone-free (e.g.
+# a signal handler trampoline).
+fn fn_frame_attr(ctx: Ctx, f: FnInfo) -> str {
+    let mut s: str = ""
+    if f.attr_no_red_zone && !f.attr_irq_handler {
+        # x86-64 System V ABI reserves a 128-byte "red zone" below RSP
+        # that leaf functions may use without decrementing RSP. The
+        # CPU may push an exception / interrupt frame at any point
+        # inside the red zone, corrupting it. gcc's `optimize`
+        # attribute accepts `no-red-zone` and disables it for this
+        # function. (`target("no-red-zone")` is NOT a recognised
+        # target attribute on x86-64; `optimize("no-red-zone")` is
+        # the correct syntax.) gcc emits a `-Wattributes` warning
+        # that the attribute "may be ineffective" — this is a
+        # limitation of gcc's per-function optimise-attribute
+        # machinery; the actual codegen DOES apply the flag. The
+        # acceptance gate compiles with -Wno-attributes.
+        s = s + "__attribute__((optimize(\"no-red-zone\"))) "
+    }
+    if f.attr_irq_handler {
+        # gcc's `interrupt` attribute on x86-64 makes the function
+        # save+restore every caller-saved register (RAX, RCX, RDX, RSI,
+        # RDI, R8-R11 + XMM0-15) and return via IRETQ instead of RET.
+        # It also implicitly disables the red zone (the IRETQ frame
+        # could be corrupted by a red-zone write). The fn must take a
+        # single POINTER parameter (the saved frame pointer; gcc
+        # populates it from the RSP at the interrupt entry) and return
+        # void. The Stage 28 checker validates this signature.
+        s = s + "__attribute__((interrupt)) "
+    }
+    return s
+}
+
+# fn_attr_prefix: the combined C attribute prefix for a function
+# signature (inline + hot/cold + frame). Used by gen_fn_body,
+# gen_proto_lines, and gen_fn_inst_lines.
+fn fn_attr_prefix(ctx: Ctx, f: FnInfo, key: str) -> str {
+    return fn_inline_attr(ctx, f, key)
+    + fn_hotcold_attr(ctx, f, key)
+    + fn_frame_attr(ctx, f)
+}
+
+# ============================================================================
+# STAGE 21 (v0.37.0-alpha): SIMD INTRINSIC FAST PATHS (--target-feature)
+# ----------------------------------------------------------------------------
+# Under --target-feature sse4.2|avx2, calls to the std.simd kernels
+# (matched by name AND argument types, so user-defined functions with
+# different signatures are never hijacked) are redirected to C helpers
+# with per-function target attributes using native vector intrinsics —
+# identical semantics to the portable HLS implementation (per-lane
+# wrapping arithmetic, range-checked lane entry, 4-wide gather/scatter
+# bounds checks). Programs compiled without the flag, or for an
+# architecture without matching intrinsics, use the scalar C fallback
+# (still much faster than the bit-by-bit portable HLS path).
+# NEON (aarch64) intrinsic tuning is Stage 25 ("AArch64 backend tuning").
+# ============================================================================
+
+# simd_redirectable: does this call site look like the std.simd kernel?
+# Name match AND argument-type match (the flat namespace convention:
+# std.simd owns the simd_* prefix; a user fn with a different signature
+# is never redirected).

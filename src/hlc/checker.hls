@@ -1,0 +1,2052 @@
+# ============================================================================
+# hlc/checker.hls — part of the hlc compiler (split from the original single-file
+# src/hlc.hls). This file is loaded via `import "hlc/checker.hls"` from src/hlc.hls.
+# Section 4a — CHECKER core: type table, bindings/ownership, effects, unify, escape analysis, tail-call verifier, check_program driver.
+# NOTE: content is byte-identical to the original src/hlc.hls line range
+#       2653..4698 - module split is purely structural, zero code changes.
+# ============================================================================
+# 4. CHECKER — type check + effects analysis (the security heart)
+# ----------------------------------------------------------------------------
+
+fn cerr(line: int, msg: str) -> void {
+    panic("type error: " + msg + " (line " + line.to_str() + ")")
+}
+
+fn is_builtin_fn(n: str) -> bool {
+    return n == "print" || n == "println" || n == "panic" || n == "exit"
+    || n == "str" || n == "int" || n == "len" || n == "range"
+    || n == "map_new" || n == "read_file" || n == "write_file"
+    || n == "args" || n == "clock_ms" || n == "chr"
+    || n == "file_exists"
+        # Stage 36 (v0.55.0-alpha): filesystem metadata builtins.
+        # All carry the Fs effect and are taint sinks (the path arg
+        # is index 0). The implementation mirrors file_exists / read_file.
+    || n == "fs_read_dir" || n == "fs_size" || n == "fs_is_dir"
+    || n == "fs_set_perms"
+        # Stage 8-alpha ownership primitives
+    || n == "drop" || n == "clone" || n == "take"
+        # Stage 10-alpha taint primitives
+    || n == "tainted_args" || n == "taint_mark" || n == "taint_unwrap"
+        # Stage 10-beta: more taint sources
+    || n == "read_file_tainted"
+        # Stage 10 release: read_line — third taint source (stdin)
+    || n == "read_line"
+        # Stage 9 release (v0.20.0-alpha): Net / Rand / Proc builtins
+    || n == "net_lookup" || n == "rand_int" || n == "rand_float"
+    || n == "rand_seed" || n == "proc_exec"
+        # Stage 37 (v0.56.0-alpha): TCP / UDP / TLS builtins — all
+        # carry the Net effect (already declared for net_lookup above);
+        # the host/path arguments are taint sinks (see check_builtin_call
+        # below). The stdlib (std.net) wraps the int fd values returned
+        # by these builtins in TcpStream / TcpListener / UdpSocket /
+        # TlsClient structs.
+    || n == "net_tcp_connect" || n == "net_tcp_listen"
+    || n == "net_tcp_accept" || n == "net_read" || n == "net_write"
+    || n == "net_close" || n == "net_udp_open"
+    || n == "net_udp_send_to" || n == "net_udp_recv_from"
+    || n == "net_tls_get"
+        # Stage 16 (v0.27.0-alpha): concurrency builtins. Stage-16
+        # perfection (v0.29.0-alpha) adds chan_new_bounded.
+    || n == "chan_new" || n == "chan_new_bounded" || n == "spawn" || n == "select"
+        # Stage 33 (v0.52.0-alpha): async/await builtins.
+    || n == "async_spawn" || n == "await" || n == "future_ready"
+    || n == "future_poll" || n == "future_select"
+        # Stage 34 (v0.53.0-alpha): async stream builtins.
+    || n == "stream_new" || n == "stream_send" || n == "stream_recv"
+    || n == "stream_try_recv" || n == "stream_len" || n == "stream_close"
+    || n == "stream_map_int" || n == "stream_filter_int"
+    || n == "stream_take_int" || n == "stream_fold_int"
+    || n == "stream_merge_int" || n == "stream_flat_map_int"
+    || n == "gen_spawn"
+        # Stage 19 (v0.35.0-alpha): O(n) string join — see boot/checker.py.
+        # hlc itself joins the whole generated C file through this builtin
+        # (the old accumulating HLS-level join was quadratic and dominated
+        # the bootstrap's compile time).
+    || n == "join"
+    # Stage 21 (v0.37.0-alpha): SIMD feature dispatch builtins.
+    || n == "has_feature" || n == "simd_cpu_supports"
+    # Stage 32 (v0.51.0-alpha): native bitwise primitives. Halis has
+    # no `&`, `|`, `^`, `~`, `<<`, `>>` operators in its grammar —
+    # these builtins map directly to single C operations, eliminating
+    # the O(64) bit-by-bit emulation loops that std/bits.hls previously
+    # used (each loop iterated 64 times, called bits_get/bits_pow2 on
+    # every iteration, and dominated Stage 32 benchmark timing).
+    || n == "int_and" || n == "int_or" || n == "int_xor" || n == "int_not"
+    || n == "int_shl" || n == "int_shr" || n == "int_sar"
+    || n == "int_popcount" || n == "int_clz" || n == "int_ctz"
+    # Stage 46 (v0.65.0-alpha): thread / scheduling builtins.
+    # thread_sleep_ms(ms) blocks the calling thread for N ms
+    # (carries Clock + Conc). thread_yield() hints the scheduler
+    # (carries Conc). thread_current_id() returns a non-zero int
+    # identifying the calling thread (carries Conc). The actual ID
+    # value is implementation-defined and may differ between the
+    # interpreter and native — callers must only rely on the
+    # property "different threads get different IDs".
+    || n == "thread_sleep_ms" || n == "thread_yield" || n == "thread_current_id"
+    # Stage 47 (v0.66.0-alpha): process management builtins.
+    # proc_spawn forks+execs a child with configurable stdio
+    # (0=Inherit / 1=Pipe / 2=Null). proc_wait blocks until the
+    # child exits and returns the encoded exit status (same
+    # encoding as proc_exec). proc_kill sends SIGTERM. The three
+    # proc_child_* builtins manage the parent end of the child's
+    # stdio pipes. All carry the Proc effect; proc_spawn's program
+    # argument is a taint sink (command injection — same threat
+    # as proc_exec).
+    || n == "proc_spawn" || n == "proc_wait" || n == "proc_kill"
+    || n == "proc_child_write" || n == "proc_child_read"
+    || n == "proc_child_close"
+    # Stage 48 (v0.67.0-alpha): environment + cwd builtins.
+    # env_get reads an env var (returns "" if not found). env_has
+    # checks existence. env_set / env_unset mutate the env. cwd_get
+    # reads the cwd. cwd_set mutates the cwd. args_os is the
+    # os-string version of args. All carry the Proc effect (env / cwd
+    # access is process-state access). The KEY arguments of env_get /
+    # env_has / env_set / env_unset are taint sinks (info disclosure /
+    # env injection); the path argument of cwd_set is a taint sink
+    # (directory traversal). The stdlib std/env.hls provides the
+    # user-facing API: env_var (Option[tainted[str]] built from
+    # env_has + env_get), env_set_var, env_unset_var, env_current_dir
+    # (tainted[str] wraps cwd_get), env_set_current_dir, env_args_os
+    # (list[tainted[str]] wraps args_os + taint_mark).
+    || n == "env_get" || n == "env_has" || n == "env_set" || n == "env_unset"
+    || n == "cwd_get" || n == "cwd_set" || n == "args_os"
+    # Stage 49 (v0.68.0-alpha): high-resolution time builtins.
+    # instant_now_ns() returns monotonic nanoseconds (high-resolution,
+    # unaffected by wall-clock changes — used for Instant::now() and
+    # short-duration measurements). system_time_now_ms() returns wall-
+    # clock milliseconds since the Unix epoch (1970-01-01 UTC) — used
+    # for SystemTime::now() and timestamps). Both carry Clock.
+    || n == "instant_now_ns" || n == "system_time_now_ms"
+    # Stage 50 (v0.69.0-alpha): libm-backed math builtins.
+    # All math_* builtins are pure (no effects, deterministic) — they
+    # delegate to libm on the native side and to Python's math module
+    # in the interpreter. NaN / Inf / signed-zero / subnormal handling
+    # matches IEEE-754 (libm is the canonical implementation). The
+    # stdlib (std/math.hls) provides the user-facing API names like
+    # math_sin / math_cos / math_exp / etc. (the builtins ARE the
+    # user-facing API — they shadow any user-defined function with
+    # the same name in BUILTIN_FNS check order).
+    || n == "math_sin" || n == "math_cos" || n == "math_tan"
+    || n == "math_asin" || n == "math_acos" || n == "math_atan"
+    || n == "math_atan2" || n == "math_sinh" || n == "math_cosh"
+    || n == "math_tanh" || n == "math_exp" || n == "math_log"
+    || n == "math_log10" || n == "math_log2" || n == "math_pow"
+    || n == "math_sqrt" || n == "math_cbrt" || n == "math_hypot"
+    || n == "math_fmod" || n == "math_erf" || n == "math_erfc"
+    || n == "math_tgamma" || n == "math_lgamma" || n == "math_isnan"
+    || n == "math_isinf" || n == "math_isfinite" || n == "math_signbit"
+    || n == "math_copysign"
+    # Stage 56 (v0.75.0-alpha): stderr + TTY-detection builtins.
+    # eprint / eprintln write to STDERR (consuming the str argument,
+    # exactly like print / println consume theirs for stdout). They
+    # flush stdout FIRST so interleaved stdout/stderr output stays in
+    # the caller's logical order (stdout is block-buffered when
+    # redirected — without the flush, every stderr line would land
+    # before every stdout line in the combined capture). Both carry
+    # the IO effect and are taint sinks (same threat as print: a
+    # tainted message lets an attacker inject ANSI escapes into the
+    # terminal). isatty(fd) reports whether a file descriptor refers
+    # to a terminal (the TTY detection std.color's v0.74.0-alpha
+    # limitations deferred to "Stage 56+ when std.progress lands and
+    # the spinner needs it"). It carries the IO effect (querying a
+    # stream's state is an I/O observation). The stdlib
+    # std/progress.hls builds the user-facing API on all three:
+    # progress bars draw to stderr (data goes to stdout — the
+    # tqdm / indicatif convention) and suppress drawing when stderr
+    # is not a TTY.
+    || n == "eprint" || n == "eprintln" || n == "isatty"
+    # Stage 57 (v0.76.0-alpha): process-identity builtins for std.log.
+    # proc_pid() returns the OS process id (the syslog TAG[PID] field;
+    # 1..65535 on POSIX, never 0 for a live process). sys_hostname()
+    # returns the machine's host name (the syslog HOSTNAME field;
+    # "localhost" if gethostname fails). Both carry the Proc effect:
+    # they read the process's / host's identity — process-state access,
+    # the same effect family as env_get / cwd_get. Neither takes
+    # arguments (nothing to taint), and neither is a sink. Both are
+    # identical between the interpreter and the native binary FOR THE
+    # SAME PROCESS (the interpreter runs the program in-process, the
+    # native binary is the process — pid/hostname differ BETWEEN the
+    # two backends, so std.log's pure renderers take them as explicit
+    # arguments and the live emit path is the only thing that reads
+    # them; differential tests use fixed synthetic values).
+    || n == "proc_pid" || n == "sys_hostname"
+}
+
+fn list_has(list: list[str], x: str) -> bool {
+    let mut i: int = 0
+    while i < list.len() {
+        if list.get(i) == x {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn type_exists(ctx: Ctx, t: str) -> bool {
+    if t == "int" || t == "float" || t == "bool" || t == "str" {
+        return true
+    }
+    if list_has(ctx.cur_typeparams, t) {
+        return true
+    }
+    if is_list_t(t) {
+        return type_exists(ctx, list_elem_t(t))
+    }
+    if is_map_t(t) {
+        return type_exists(ctx, map_val_t(t))
+    }
+    if is_taint_t(t) {
+        # Stage 10-alpha: tainted[T] is a built-in generic wrapper; the
+        # inner type must exist but `tainted` itself needs no struct/enum.
+        return type_exists(ctx, taint_inner_t(t))
+    }
+    if is_chan_t(t) {
+        # Stage 16: Chan[T] is a built-in generic wrapper.
+        return type_exists(ctx, chan_inner_t(t))
+    }
+    if is_task_t(t) {
+        # Stage 16: Task[R] is a built-in generic wrapper (R may be void).
+        if task_inner_t(t) == "void" {
+            return true
+        }
+        return type_exists(ctx, task_inner_t(t))
+    }
+    # Stage 33 (v0.52.0-alpha): Future[T] — built-in generic wrapper.
+    if is_future_t(t) {
+        return type_exists(ctx, future_inner_t(t))
+    }
+    # Stage 34 (v0.53.0-alpha): Stream[T] — built-in generic wrapper.
+    if is_stream_t(t) {
+        return type_exists(ctx, stream_inner_t(t))
+    }
+    let base: str = type_base(t)
+    let args: list[str] = type_args(t)
+    if ctx.structs.has(base) {
+        let st: StructInfo = ctx.structs.get_or(base, dummy_struct())
+        if st.typeparams.len() != args.len() {
+            return false
+        }
+        let mut i: int = 0
+        while i < args.len() {
+            if !type_exists(ctx, args.get(i)) {
+                return false
+            }
+            i = i + 1
+        }
+        return true
+    }
+    if ctx.enums.has(base) {
+        let en: EnumInfo = ctx.enums.get_or(base, dummy_enum())
+        if en.typeparams.len() != args.len() {
+            return false
+        }
+        let mut i: int = 0
+        while i < args.len() {
+            if !type_exists(ctx, args.get(i)) {
+                return false
+            }
+            i = i + 1
+        }
+        return true
+    }
+    return false
+}
+
+fn require_type(ctx: Ctx, t: str, line: int, what: str) -> void {
+    if t == "void" {
+        cerr(line, "cannot use 'void' as " + what)
+    }
+    if !type_exists(ctx, t) {
+        cerr(line, "type does not exist: " + t)
+    }
+}
+
+# resolve_struct(ctx, t) returns the (StructInfo, type_map) if t is a
+# (possibly generic) struct type. Otherwise returns a struct whose name is "".
+fn resolve_struct(ctx: Ctx, t: str) -> StructInfo {
+    let base: str = type_base(t)
+    if !ctx.structs.has(base) {
+        return dummy_struct()
+    }
+    let st: StructInfo = ctx.structs.get_or(base, dummy_struct())
+    let args: list[str] = type_args(t)
+    if st.typeparams.len() != args.len() {
+        return dummy_struct()
+    }
+    # If non-generic, just return the struct (no type map).
+    if st.typeparams.len() == 0 {
+        return st
+    }
+    # For generic struct, return the struct; the caller will need to know
+    # the type args (it can extract them from `t`).
+    return st
+}
+
+# build_type_map(ctx, typeparams, args) — returns a parallel list of typeargs
+# corresponding to typeparams (used by callers that need to instantiate).
+# (We use lists since HLS has no map of str->str.)
+
+fn dummy_binding() -> Binding {
+    return Binding {
+        t: "", is_mut: false, moved: false
+    }
+}
+
+fn lookup_binding(env: list[map[str, Binding]], name: str) -> Binding {
+    let mut i: int = env.len() - 1
+    while i >= 0 {
+        if env.get(i).has(name) {
+            return env.get(i).get_or(name, dummy_binding())
+        }
+        i = i - 1
+    }
+    return dummy_binding()
+}
+
+fn lookup_exists(env: list[map[str, Binding]], name: str) -> bool {
+    let mut i: int = env.len() - 1
+    while i >= 0 {
+        if env.get(i).has(name) {
+            return true
+        }
+        i = i - 1
+    }
+    return false
+}
+
+# --- Stage 8-alpha ownership helpers (v0.4.0-alpha) ---
+# Bindings carry a `moved` flag (Stage 8-alpha). These helpers mutate the flag
+# in place (HLS maps are mutable through .set()).
+
+fn mark_moved(env: list[map[str, Binding]], name: str) -> bool {
+    let mut i: int = env.len() - 1
+    while i >= 0 {
+        if env.get(i).has(name) {
+            let b: Binding = env.get(i).get_or(name, dummy_binding())
+            env.get(i).set(name, Binding {
+                t: b.t, is_mut: b.is_mut, moved: true
+            })
+            return true
+        }
+        i = i - 1
+    }
+    return false
+}
+
+fn revive_binding(env: list[map[str, Binding]], name: str) -> bool {
+    let mut i: int = env.len() - 1
+    while i >= 0 {
+        if env.get(i).has(name) {
+            let b: Binding = env.get(i).get_or(name, dummy_binding())
+            env.get(i).set(name, Binding {
+                t: b.t, is_mut: b.is_mut, moved: false
+            })
+            return true
+        }
+        i = i - 1
+    }
+    return false
+}
+
+# BUG-003 fix: snapshot_moved / restore_moved mirror Stage-0's snapshot/
+# restore for the `moved` flag. They are used around `if`/`while`/`for`
+# bodies so that moves done inside a child scope don't leak out — the
+# branch may not execute, so any binding "moved" inside should still be
+# considered unmoved after the construct completes.
+#
+# Snapshot format: a list of (scope_index, name, moved) tuples. We use
+# a flat list of strings "i|name|0|1" because HLS maps require str keys.
+fn snapshot_moved(env: list[map[str, Binding]]) -> list[str] {
+    let snap: list[str] = []
+    let mut i: int = 0
+    while i < env.len() {
+        let scope: map[str, Binding] = env.get(i)
+        let names: list[str] = scope.keys()
+        let mut j: int = 0
+        while j < names.len() {
+            let nm: str = names.get(j)
+            let b: Binding = scope.get_or(nm, dummy_binding())
+            let mut mv: str = "0"
+            if b.moved {
+                mv = "1"
+            }
+            snap.push(i.to_str() + "|" + nm + "|" + mv)
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return snap
+}
+
+fn restore_moved(env: list[map[str, Binding]], snap: list[str]) -> void {
+    let mut i: int = 0
+    while i < snap.len() {
+        let entry: str = snap.get(i)
+        # Format is "scope_idx|name|0or1". Identifier names never contain '|',
+        # so split("|") yields exactly 3 parts. (If a future name contains '|',
+        # the snapshot format would need to change — but identifiers can't.)
+        let parts: list[str] = entry.split("|")
+        if parts.len() < 3 {
+            i = i + 1
+            continue
+        }
+        let scope_idx: int = parts.get(0).to_int()
+        let nm: str = parts.get(1)
+        let mv_str: str = parts.get(2)
+        if scope_idx < env.len() {
+            let scope: map[str, Binding] = env.get(scope_idx)
+            if scope.has(nm) {
+                let b: Binding = scope.get_or(nm, dummy_binding())
+                let mut mv: bool = false
+                if mv_str == "1" {
+                    mv = true
+                }
+                scope.set(nm, Binding {
+                    t: b.t, is_mut: b.is_mut, moved: mv
+                })
+            }
+        }
+        i = i + 1
+    }
+}
+
+# Deep-scan-16 HIGH-severity soundness fix: union_moved ORs the moved-status
+# from `snap` (representing ONE possible execution path) into `env`. A
+# binding is treated as moved after the construct if it was moved along ANY
+# path — e.g. inside either arm of an `if`, or after one iteration of a
+# loop body (which re-executes at runtime).
+#
+# The previous behaviour (snapshot + full restore_moved) treated every
+# if-arm / loop body as if it might execute ZERO times (post-construct
+# state = pre-construct state). That is unsound: at runtime, an if-arm
+# MAY execute and a loop body MAY iterate >= 1 time, leaving the binding
+# nulled in the native codegen (drop/take push the local to null_after,
+# so `u_x = NULL` is emitted at statement end). Post-construct uses of
+# the binding then read NULL and segfault.
+#
+# The conservative union (a binding is moved if it COULD be moved along
+# any path) is SOUND: it rejects post-construct uses whose runtime safety
+# cannot be proven. Reassignment via `x = ...` (a `mut` binding) is
+# still allowed because check_assign's revive step clears the moved
+# flag, so the idiomatic "drop then revive" pattern continues to work.
+fn union_moved(env: list[map[str, Binding]], snap: list[str]) -> void {
+    let mut i: int = 0
+    while i < snap.len() {
+        let entry: str = snap.get(i)
+        let parts: list[str] = entry.split("|")
+        if parts.len() < 3 {
+            i = i + 1
+            continue
+        }
+        let scope_idx: int = parts.get(0).to_int()
+        let nm: str = parts.get(1)
+        let mv_str: str = parts.get(2)
+        if mv_str != "1" {
+            i = i + 1
+            continue
+        }
+        if scope_idx < env.len() {
+            let scope: map[str, Binding] = env.get(scope_idx)
+            if scope.has(nm) {
+                let b: Binding = scope.get_or(nm, dummy_binding())
+                # Only set moved=true; never clear (this is a UNION).
+                scope.set(nm, Binding {
+                    t: b.t, is_mut: b.is_mut, moved: true
+                })
+            }
+        }
+        i = i + 1
+    }
+}
+
+# is_owned_type: True if values of this type are heap-owned and subject to
+# move tracking. Primitives (int/float/bool) are Copy — passing them is fine.
+fn is_owned_type(t: str) -> bool {
+    if t == "int" || t == "float" || t == "bool" || t == "void" || t == "never" {
+        return false
+    }
+    return true
+}
+
+# is_clone_supported: True if clone() supports this type. Stage 8-beta
+# (v0.19.0-alpha) expands clone() to EVERY owned type — str, list, map,
+# struct, enum, tainted[...] — via per-instantiation codegen helpers
+# (hl_clone_<mangled-type>) and the interpreter's deep_clone.
+fn is_clone_supported(t: str) -> bool {
+    if t == "str" {
+        return true
+    }
+    if is_list_t(t) {
+        return is_clone_supported(list_elem_t(t))
+    }
+    if is_map_t(t) {
+        return is_clone_supported(map_val_t(t))
+    }
+    if is_taint_t(t) {
+        return is_clone_supported(taint_inner_t(t))
+    }
+    # struct / enum / any other owned type
+    return true
+}
+
+fn add_edge(ctx: Ctx, cur: str, callee: str) -> void {
+    if !ctx.edges.has(cur) {
+        ctx.edges.set(cur, [])
+    }
+    ctx.edges.get_or(cur, []).push(callee)
+}
+
+# --- Stage 9-alpha: fine-grained effects helpers (v0.5.0-alpha) ---
+
+# builtin_effect(name) — the BUILTIN_EFFECTS table encoded as a function
+# (HLS has no map-of-sets). Returns the list of effects a builtin requires
+# (empty for pure builtins). Single-element lists today; future-proof for
+# multi-effect builtins.
+fn builtin_effect(name: str) -> list[str] {
+    if name == "print" || name == "println" {
+        return["IO"]
+    }
+    if name == "read_file" || name == "write_file" || name == "file_exists" {
+        return["Fs"]
+    }
+    # Stage 36 (v0.55.0-alpha): filesystem metadata builtins — all Fs.
+    if name == "fs_read_dir" || name == "fs_size" || name == "fs_is_dir"
+    || name == "fs_set_perms" {
+        return["Fs"]
+    }
+    # Stage 10-beta: read_file_tainted is a taint source with the Fs effect.
+    if name == "read_file_tainted" {
+        return["Fs"]
+    }
+    # Stage 10 release: read_line is a taint source with the IO effect
+    # (reads from stdin; stdin is untrusted input).
+    if name == "read_line" {
+        return["IO"]
+    }
+    if name == "clock_ms" {
+        return["Clock"]
+    }
+    # Stage 46 (v0.65.0-alpha): thread / scheduling builtins.
+    # thread_sleep_ms carries BOTH Clock (it observes the wall clock
+    # for the sleep duration) AND Conc (it interacts with the
+    # concurrency runtime's blocked-thread accounting, so the
+    # deadlock detector's invariants still hold). thread_yield and
+    # thread_current_id carry Conc only.
+    if name == "thread_sleep_ms" {
+        return["Clock", "Conc"]
+    }
+    if name == "thread_yield" || name == "thread_current_id" {
+        return["Conc"]
+    }
+    if name == "args" || name == "tainted_args" {
+        # Stage 10-alpha: tainted_args carries the same Args effect as args.
+        return["Args"]
+    }
+    if name == "exit" {
+        return["Exit"]
+    }
+    # Stage 9 release (v0.20.0-alpha): Net / Rand / Proc builtins.
+    # Net, Rand, Proc are independent effects — NOT part of the IO
+    # family. A program must declare them explicitly to use these
+    # builtins; the fixpoint in check_effects enforces the subset rule.
+    if name == "net_lookup" {
+        return["Net"]
+    }
+    # Stage 37 (v0.56.0-alpha): TCP / UDP / TLS builtins — all carry
+    # the Net effect. The taint-sink enforcement (see check_builtin_call
+    # below) prevents tainted hosts/paths from reaching any of them;
+    # the effect discipline controls CAPABILITY (a function without
+    # `uses Net` cannot call ANY networking primitive).
+    if name == "net_tcp_connect" || name == "net_tcp_listen"
+    || name == "net_tcp_accept" || name == "net_read"
+    || name == "net_write" || name == "net_close"
+    || name == "net_udp_open" || name == "net_udp_send_to"
+    || name == "net_udp_recv_from" || name == "net_tls_get" {
+        return["Net"]
+    }
+    if name == "rand_int" || name == "rand_float" || name == "rand_seed" {
+        return["Rand"]
+    }
+    if name == "proc_exec" {
+        return["Proc"]
+    }
+    # Stage 47 (v0.66.0-alpha): process management builtins — all
+    # carry the existing Proc effect (same as proc_exec). A function
+    # that spawns / waits / kills / pipes must declare `uses Proc`.
+    if name == "proc_spawn" || name == "proc_wait" || name == "proc_kill"
+    || name == "proc_child_write" || name == "proc_child_read"
+    || name == "proc_child_close" {
+        return["Proc"]
+    }
+    # Stage 48 (v0.67.0-alpha): environment + cwd builtins — all
+    # carry the Proc effect (environment / cwd access is process-state
+    # access). Using Proc keeps the effect algebra simple (no new
+    # effect family) and matches the convention that proc_exec is the
+    # canonical Proc builtin (anything interacting with the process's
+    # external state — args, env, cwd, subprocess — carries Proc).
+    if name == "env_get" || name == "env_has" || name == "env_set"
+    || name == "env_unset" || name == "cwd_get" || name == "cwd_set"
+    || name == "args_os" {
+        return["Proc"]
+    }
+    # Stage 49 (v0.68.0-alpha): high-resolution time builtins — both
+    # carry Clock. instant_now_ns reads the monotonic clock (same
+    # effect family as clock_ms); system_time_now_ms reads the wall
+    # clock (which can jump on NTP adjustments — Instant should be
+    # used for duration measurements, SystemTime for timestamps).
+    # Stage 50 math_* builtins are NOT here — they are pure (no
+    # effect), so they fall through to the empty default.
+    if name == "instant_now_ns" || name == "system_time_now_ms" {
+        return["Clock"]
+    }
+    # Stage 56 (v0.75.0-alpha): stderr + TTY-detection builtins.
+    # eprint / eprintln write to stderr (IO — the same effect family
+    # as print / println; the effect algebra does not distinguish
+    # WHICH stream is written, only THAT a stream is written). isatty
+    # queries a file descriptor's stream state — an I/O observation
+    # (IO), not a process-state access (Proc): it reads no env var,
+    # no cwd, no child; it observes the process's own I/O streams,
+    # exactly like read_line observes stdin.
+    if name == "eprint" || name == "eprintln" || name == "isatty" {
+        return["IO"]
+    }
+    # Stage 57 (v0.76.0-alpha): process-identity builtins — Proc (the
+    # process's / host's identity is process-state access, the same
+    # family as env_get / cwd_get).
+    if name == "proc_pid" || name == "sys_hostname" {
+        return["Proc"]
+    }
+    # Stage 16 (v0.27.0-alpha): the concurrency effect. Every task /
+    # channel operation carries `Conc`; a program must declare
+    # `uses Conc` to use them. Builtin METHODS with effects are keyed
+    # here by their op names ("chan.send", "chan.try_send",
+    # "chan.recv", "chan.recv_or", "chan.len", "task.join") — the
+    # fixpoint treats them exactly like builtin fns.
+    if name == "chan_new" || name == "chan_new_bounded" || name == "spawn" || name == "select"
+    || name == "chan.send" || name == "chan.try_send" || name == "chan.recv"
+    || name == "chan.recv_or" || name == "chan.len" || name == "task.join" {
+        return["Conc"]
+    }
+    # Stage 33 (v0.52.0-alpha): async/await — all carry Conc.
+    if name == "async_spawn" || name == "await" || name == "future_ready"
+    || name == "future_poll" || name == "future_select" {
+        return["Conc"]
+    }
+    # Stage 34 (v0.53.0-alpha): async streams — all carry Conc.
+    if name == "stream_new" || name == "stream_send" || name == "stream_recv"
+    || name == "stream_try_recv" || name == "stream_len" || name == "stream_close"
+    || name == "stream_map_int" || name == "stream_filter_int"
+    || name == "stream_take_int" || name == "stream_fold_int"
+    || name == "stream_merge_int" || name == "stream_flat_map_int"
+    || name == "gen_spawn" {
+        return["Conc"]
+    }
+    # taint_mark / taint_unwrap are pure (no effect; just wrap/unwrap).
+    return[] # pure builtin
+}
+
+# effects_add(eff, key, e) — set-style insert into eff[key]'s list.
+# Returns true if the set grew (used by the fixpoint to detect change).
+fn effects_add(eff: map[str, list[str]], key: str, e: str) -> bool {
+    if !eff.has(key) {
+        eff.set(key, [])
+    }
+    let lst: list[str] = eff.get_or(key, [])
+    if !list_has(lst, e) {
+        lst.push(e)
+        return true
+    }
+    return false
+}
+
+# fmt_effects(effs) — pretty-print an effect set for error messages.
+# Empty set renders as "(none - pure)".
+fn fmt_effects(effs: list[str]) -> str {
+    if effs.len() == 0 {
+        return "(none - pure)"
+    }
+    return join(effs, ", ")
+}
+
+# --- unify: try to match a parameter type `pt` against an argument type `at`,
+# binding type params from `tps` to concrete types in `targs_out` (parallel to
+# `tps`). Returns true if unification succeeded for any type params.
+# targs_out is a parallel list: targs_out[i] is the inferred type for tps[i]
+# (or "" if not yet inferred).
+# ---
+
+fn unify_into(ctx: Ctx, pt: str, at: str, tps: list[str], targs_out: list[str]) -> void {
+    # Exact-match case: pt is a type param.
+    let mut i: int = 0
+    while i < tps.len() {
+        if pt == tps.get(i) {
+            # If already bound, prefer the existing binding (the first one wins
+            # for simplicity; conflicts will be caught by the arg type check).
+            if targs_out.get(i) == "" {
+                targs_out.set(i, at)
+            }
+            return
+        }
+        i = i + 1
+    }
+    if is_list_t(pt) && is_list_t(at) {
+        unify_into(ctx, list_elem_t(pt), list_elem_t(at), tps, targs_out)
+        return
+    }
+    if is_map_t(pt) && is_map_t(at) {
+        unify_into(ctx, map_val_t(pt), map_val_t(at), tps, targs_out)
+        return
+    }
+    if is_taint_t(pt) && is_taint_t(at) {
+        unify_into(ctx, taint_inner_t(pt), taint_inner_t(at), tps, targs_out)
+        return
+    }
+    # Same base name — recurse into args.
+    let pb: str = type_base(pt)
+    let ab: str = type_base(at)
+    # Both must have type args (i.e., be generic instantiations), and the
+    # base names must match.
+    if pb == ab && pt != pb && at != ab {
+        # Both are generic instantiations of the same user type.
+        let pa: list[str] = type_args(pt)
+        let aa: list[str] = type_args(at)
+        if pa.len() == aa.len() {
+            let mut j: int = 0
+            while j < pa.len() {
+                unify_into(ctx, pa.get(j), aa.get(j), tps, targs_out)
+                j = j + 1
+            }
+        }
+    }
+}
+
+# unify_into_offset: like unify_into but writes into a SLICE of targs_out
+# starting at `offset`. Used by check_method when inferring a method's own
+# type params (which sit AFTER the struct's type params in targs_out).
+# This avoids the BUG-002 throwaway-list issue where list_slice_from
+# returns a fresh list and unify_into's .set() mutations never propagate.
+fn unify_into_offset(ctx: Ctx, pt: str, at: str, tps: list[str], targs_out: list[str], offset: int) -> void {
+    # Exact-match case: pt is a type param.
+    let mut i: int = 0
+    while i < tps.len() {
+        if pt == tps.get(i) {
+            if targs_out.get(offset + i) == "" {
+                targs_out.set(offset + i, at)
+            }
+            return
+        }
+        i = i + 1
+    }
+    if is_list_t(pt) && is_list_t(at) {
+        unify_into_offset(ctx, list_elem_t(pt), list_elem_t(at), tps, targs_out, offset)
+        return
+    }
+    if is_map_t(pt) && is_map_t(at) {
+        unify_into_offset(ctx, map_val_t(pt), map_val_t(at), tps, targs_out, offset)
+        return
+    }
+    if is_taint_t(pt) && is_taint_t(at) {
+        unify_into_offset(ctx, taint_inner_t(pt), taint_inner_t(at), tps, targs_out, offset)
+        return
+    }
+    let pb: str = type_base(pt)
+    let ab: str = type_base(at)
+    if pb == ab && pt != pb && at != ab {
+        let pa: list[str] = type_args(pt)
+        let aa: list[str] = type_args(at)
+        if pa.len() == aa.len() {
+            let mut j: int = 0
+            while j < pa.len() {
+                unify_into_offset(ctx, pa.get(j), aa.get(j), tps, targs_out, offset)
+                j = j + 1
+            }
+        }
+    }
+}
+
+# --- Checker lifecycle ---
+
+# estimate_stack_size (Stage 28, v0.45.0-alpha): conservatively
+# estimate the function's stack frame size in bytes. Used to validate
+# the #[stack_size(N)] attribute — if the estimate exceeds N, the
+# checker raises a compile error (the body declares too many locals
+# or nests too many call sites for the bound).
+#
+# The estimate is an UPPER BOUND on the frame gcc will emit for the
+# type-correct HLS source:
+#
+#   - Each `let` binding in the body contributes sizeof(C type) bytes.
+#     Every HLS type lowers to a C scalar of 8 bytes (int64_t, double,
+#     or pointer). bool lowers to 1 byte but is rounded up to 8 for
+#     alignment. void contributes 0 (no slot needed).
+#   - Each `for` loop's iteration variable adds 8 bytes (a list element
+#     pointer + an index temp; we conservatively count 8 to keep the
+#     arithmetic simple — the runtime allocates 2 slots, not 1, but
+#     gcc may merge them into one slot).
+#   - Each nested call site adds 16 bytes (gcc spills the caller-saved
+#     registers + the return-address slot for very-deep call chains;
+#     this is the standard "call frame overhead" estimate used by gcc
+#     itself in its -Wframe-larger-than check).
+#   - Base overhead: 32 bytes (saved RBP, RBX, the frame pointer chain
+#     + alignment padding to 16 bytes).
+#
+# The estimate is intentionally simple: we walk every statement
+# (recursively into if/while/for bodies) and count occurrences. We
+# don't try to model scope slot-reuse — gcc may overlap two sibling
+# `let` slots, but the upper bound is what we want for a sound
+# guarantee (the actual frame is always <= the estimate, so
+# estimate <= N => frame <= N).
+#
+# Returns the estimate in bytes.
+fn estimate_stack_size(ctx: Ctx, f: FnInfo) -> int {
+    let mut bytes: int = 32 # base overhead (saved RBP / RBX / alignment)
+    # Each parameter local adds 8 bytes (the body's owned copy of the
+    # param; the signature's `<name>_p` is not in the frame, it's the
+    # incoming register/stack-slot per the C ABI).
+    let mut pi: int = 0
+    while pi < f.params.len() {
+        bytes = bytes + 8
+        pi = pi + 1
+    }
+    # Walk the body, accumulating locals + call-site overhead.
+    bytes = estimate_stack_size_stmts(ctx, f.body, bytes)
+    return bytes
+}
+
+# estimate_stack_size_stmts walks a statement list, mutates `bytes`
+# (passed by reference via the closure over the outer `bytes` —
+# HLS doesn't have closures, so we return the accumulated value
+# instead). The caller reassigns.
+fn estimate_stack_size_stmts(ctx: Ctx, stmts: list[int], mut bytes: int) -> int {
+    let mut i: int = 0
+    while i < stmts.len() {
+        bytes = estimate_stack_size_stmt(ctx, stmts.get(i), bytes)
+        i = i + 1
+    }
+    return bytes
+}
+
+fn estimate_stack_size_stmt(ctx: Ctx, sidx: int, mut bytes: int) -> int {
+    let s: StmtN = ctx.stmts[sidx]
+    if s.kind == "let" {
+        # Each let-binding contributes sizeof(C type). All HLS types
+        # lower to 8-byte C scalars (int64_t / double / pointer); bool
+        # lowers to 1 byte but is rounded up to 8 for alignment. void
+        # contributes 0 (an unreachable binding, after a panic).
+        if s.vtype == "void" {
+            # void bindings are unreachable; no slot needed.
+        } else {
+            bytes = bytes + 8
+        }
+    } else if s.kind == "for" {
+        # The for-loop adds an iteration variable (8 bytes) plus an
+        # index temp (8 bytes) plus the list iterator handle (8 bytes).
+        # Conservatively count 16 bytes for the loop's own overhead.
+        bytes = bytes + 16
+        bytes = estimate_stack_size_stmts(ctx, s.body, bytes)
+    } else if s.kind == "while" {
+        bytes = estimate_stack_size_stmts(ctx, s.body, bytes)
+    } else if s.kind == "if" {
+        bytes = estimate_stack_size_stmts(ctx, s.body, bytes)
+        if s.else_body.len() > 0 {
+            bytes = estimate_stack_size_stmts(ctx, s.else_body, bytes)
+        }
+    }
+    # match is an EXPRESSION (lives in s.e / s.value); its arms are
+    # walked by estimate_stack_calls (which recurses through match
+    # arms via n.args -> MatchArm.body).
+    #
+    # Statement-position call sites add 16 bytes each (the call frame
+    # overhead — gcc reserves a slot for the return address + the
+    # caller-saved register spills for very deep chains). We detect
+    # call sites by inspecting the statement's expression for a call
+    # node. This is conservative — many expressions are not calls.
+    # Deep-scan-15 fix (MEDIUM severity, soundness): the previous
+    # implementation only counted call sites in let (s.value),
+    # if/while (s.cond), and for (s.iter). It MISSED `return` (whose
+    # return-value expression is also in s.value) and `assign` (whose
+    # target and RHS expressions can both contain calls). This
+    # under-counted the frame for code like
+    #   return helper(a, b) + other(c);
+    #   x.y = setup(get_default());
+    # — undermining the #[stack_size(N)] soundness guarantee (a fn
+    # declared stack_size(8) could exceed 8 bytes when its return /
+    # assign sites had nested calls). Add explicit coverage for return
+    # and assign below; the let case is preserved as-is.
+    if s.e >= 0 {
+        bytes = bytes + estimate_stack_calls(ctx, s.e)
+    }
+    if s.value >= 0 && (s.kind == "let" || s.kind == "return") {
+        bytes = bytes + estimate_stack_calls(ctx, s.value)
+    }
+    if s.kind == "assign" {
+        if s.target >= 0 {
+            bytes = bytes + estimate_stack_calls(ctx, s.target)
+        }
+        if s.value >= 0 {
+            bytes = bytes + estimate_stack_calls(ctx, s.value)
+        }
+    }
+    if s.cond >= 0 && (s.kind == "if" || s.kind == "while") {
+        bytes = bytes + estimate_stack_calls(ctx, s.cond)
+    }
+    if s.iter >= 0 && s.kind == "for" {
+        bytes = bytes + estimate_stack_calls(ctx, s.iter)
+    }
+    return bytes
+}
+
+# estimate_stack_calls: count the number of call sites in an
+# expression tree (recursively). Each call site contributes 16 bytes
+# to the frame estimate (call frame overhead).
+fn estimate_stack_calls(ctx: Ctx, e: int) -> int {
+    if e < 0 {
+        return 0
+    }
+    let n: ExprN = ctx.exprs[e]
+    let mut calls: int = 0
+    if n.kind == "call" {
+        calls = calls + 16
+    }
+    if n.kind == "match" {
+        # match arms live in n.args (each is an index into
+        # ctx.match_arms). The arm body is an expression; recurse.
+        let mut ai: int = 0
+        while ai < n.args.len() {
+            let arm: MatchArm = ctx.match_arms[n.args.get(ai)]
+            calls = calls + estimate_stack_calls(ctx, arm.body)
+            ai = ai + 1
+        }
+    }
+    if n.left >= 0 {
+        calls = calls + estimate_stack_calls(ctx, n.left)
+    }
+    if n.right >= 0 {
+        calls = calls + estimate_stack_calls(ctx, n.right)
+    }
+    let mut i: int = 0
+    while i < n.args.len() {
+        if n.kind != "match" {
+            # For non-match, args are child expressions; for match they
+            # are arm indices (already handled above).
+            calls = calls + estimate_stack_calls(ctx, n.args.get(i))
+        }
+        i = i + 1
+    }
+    return calls
+}
+
+# ============================================================================
+# STAGE 30 (v0.47.0-alpha): boxed-vs-stack layout analysis (escape analysis)
+# ============================================================================
+#
+# A `list[T]` binding (T in {int, float, bool}) that does NOT escape its
+# creating function is allocated on the C stack as a typed array:
+#   * zero heap objects (no hl_list struct, no items buffer, no boxed
+#     elements — a 3-element list literal drops from 5 mallocs to 0),
+#   * zero refcount traffic (no cleanup attribute, no retain/release,
+#     no elem_free bookkeeping).
+#
+# The analysis is PROVEN SAFE, not assumed: a binding is stack-allocated
+# only when EVERY use in the function body is in a borrow-safe position —
+#   * receiver of the builtin .get(i) / .set(i, v) / .len() methods,
+#   * the base of an index expression xs[i] (read AND write),
+#   * the iterable of a for-in loop.
+# ANY other position (return, call argument, struct literal field, list
+# literal element, clone/take/drop argument, assignment source, operator
+# operand, match scrutinee...) is an escape — the binding keeps the
+# ordinary refcounted heap layout. The proof is enforced by the checker:
+# `#[stack]` on a binding with a single escaping use is a COMPILE ERROR
+# naming the escape site, so a stack-allocated value can NEVER outlive
+# its creating frame. `#[boxed]` forces the heap layout (an explicit
+# opt-out of the automatic analysis).
+#
+# Scope (documented limitations, conservative by design):
+#   * primitive element types only — list[str] / list[Point] elements
+#     are reference-counted and must stay boxed (pointer-element stack
+#     layout is future work),
+#   * list-literal initialisers only (the capacity is fixed at compile
+#     time by the literal length),
+#   * non-generic functions only (generic instantiations are generated
+#     under mangled keys; layout there would be instantiation-dependent),
+#   * push()/pop() are escapes (a fixed-capacity array cannot grow or
+#     shrink); under #[stack] they are compile errors.
+#
+# The analysis runs AFTER the bodies are checked (it reads the mop/muser
+# method tags check_method sets), and BEFORE codegen: the decisions are
+# recorded in ctx.layout_map ("<fn key>::<binding>" -> layout) which the
+# codegen consults at the let / method / index / for-in / assign sites.
+
+struct EscRec {
+    name: str, # binding name
+    line: int, # the let statement's line
+    cap: int, # fixed capacity (literal length; 0 for boxed records)
+    forced: bool, # #[stack] forced (escape = compile error)
+    boxed: bool, # #[boxed] forced heap
+    esc: str, # first escape reason ("" = escape-free so far)
+    esc_line: int, # line of the first escaping use
+    push: bool, # a .push() receiver use exists
+    push_line: int,
+    pop: bool, # a .pop() receiver use exists
+    pop_line: int
+}
+
+fn esc_find(recs: list[EscRec], name: str) -> int {
+    let mut i: int = 0
+    while i < recs.len() {
+        if recs.get(i).name == name {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+fn esc_prim_elem(t: str) -> bool {
+    return t == "int" || t == "float" || t == "bool"
+}
+
+# esc_candidate: is this let-stmt eligible for a layout decision?
+# Requires list[primitive] + a NON-EMPTY list-literal initialiser (the
+# capacity is fixed at compile time by the literal).
+fn esc_candidate(ctx: Ctx, s: StmtN) -> bool {
+    if !is_list_t(s.vtype) {
+        return false
+    }
+    if !esc_prim_elem(list_elem_t(s.vtype)) {
+        return false
+    }
+    if ctx.exprs[s.value].kind != "listlit" {
+        return false
+    }
+    return ctx.exprs[s.value].args.len() > 0
+}
+
+# escape_check_fn: run the Stage 30 analysis over one function. Records
+# the layout decisions on ctx; raises compile errors for #[stack]
+# violations (the soundness proof).
+fn escape_check_fn(ctx: Ctx, key: str) -> void {
+    let f: FnInfo = ctx.fns.get_or(key, dummy_fn())
+    if f.is_extern {
+        return
+    }
+    # Generic functions (and methods of generic structs) are generated
+    # per instantiation under mangled keys; a layout decision taken on
+    # the source key would not apply there. The automatic analysis is
+    # simply skipped; a forced attribute is a clear, documented error
+    # rather than a silent no-op.
+    let mut generic: bool = f.typeparams.len() > 0
+    if f.is_method && ctx.structs.has(f.struct_of) {
+        let st: StructInfo = ctx.structs.get_or(f.struct_of, dummy_struct())
+        if st.typeparams.len() > 0 {
+            generic = true
+        }
+    }
+    if generic {
+        esc_generic_scan(ctx, f.body)
+        return
+    }
+    let recs: list[EscRec] = []
+    esc_collect_stmts(ctx, f.body, recs)
+    esc_walk_stmts(ctx, f.body, recs)
+    # Decide + record. esc_line/push_line are inside the reason strings.
+    let mut i: int = 0
+    while i < recs.len() {
+        let r: EscRec = recs.get(i)
+        let lkey: str = key + "::" + r.name
+        if r.forced {
+            if r.esc != "" {
+                cerr(r.line, "#[stack] violated: '" + r.name + "' escapes its creating frame — " + r.esc
+                + " (line " + r.esc_line.to_str() + "). A stack-allocated value can NEVER outlive the function that created it: remove the escaping use or drop the attribute.")
+            }
+            if r.push {
+                cerr(r.line, "#[stack] violated: '" + r.name + "' uses push() (line " + r.push_line.to_str()
+                + ") — a stack-allocated list is fixed-capacity (capacity " + r.cap.to_str()
+                + ", taken from its literal). Use .get/.set within the capacity or drop the attribute.")
+            }
+            if r.pop {
+                cerr(r.line, "#[stack] violated: '" + r.name + "' uses pop() (line " + r.pop_line.to_str()
+                + ") — a stack-allocated list is fixed-capacity; its length is part of the layout and cannot shrink. Drop the attribute to use pop().")
+            }
+        }
+        ctx.layout_order.push(lkey)
+        if r.boxed {
+            ctx.layout_map.set(lkey, "boxed")
+            ctx.layout_why.set(lkey, "#[boxed] forced heap layout")
+            ctx.layout_cap.set(lkey, r.cap)
+        } else if r.esc == "" && !r.push && !r.pop {
+            ctx.layout_map.set(lkey, "stack")
+            if r.forced {
+                ctx.layout_why.set(lkey, "#[stack] forced (escape-free)")
+            } else {
+                ctx.layout_why.set(lkey, "escape-free (auto)")
+            }
+            ctx.layout_cap.set(lkey, r.cap)
+            ctx.layout_stack_n = ctx.layout_stack_n + 1
+        } else if r.push || r.pop {
+            ctx.layout_map.set(lkey, "heap-push")
+            let mut why: str = "uses push() (grows; incompatible with fixed capacity)"
+            if r.pop {
+                why = "uses pop() (shrinks; incompatible with fixed capacity)"
+            }
+            ctx.layout_why.set(lkey, why)
+            ctx.layout_cap.set(lkey, r.cap)
+        } else {
+            ctx.layout_map.set(lkey, "heap")
+            ctx.layout_why.set(lkey, "escapes: " + r.esc + " (line " + r.esc_line.to_str() + ")")
+            ctx.layout_cap.set(lkey, r.cap)
+        }
+        i = i + 1
+    }
+}
+
+# esc_generic_scan: reject #[stack]/#[boxed] inside generic functions.
+fn esc_generic_scan(ctx: Ctx, stmts: list[int]) -> void {
+    let mut i: int = 0
+    while i < stmts.len() {
+        let s: StmtN = ctx.stmts[stmts.get(i)]
+        if s.kind == "let" {
+            if s.attr_stack || s.attr_boxed {
+                let mut attr: str = "boxed"
+                if s.attr_stack {
+                    attr = "stack"
+                }
+                cerr(s.line, "#[" + attr + "] is not supported inside generic functions yet (the layout would depend on the type instantiation); drop the attribute here")
+            }
+        } else if s.kind == "if" {
+            esc_generic_scan(ctx, s.body)
+            if s.else_body.len() > 0 {
+                esc_generic_scan(ctx, s.else_body)
+            }
+        } else if s.kind == "while" {
+            esc_generic_scan(ctx, s.body)
+        } else if s.kind == "for" {
+            esc_generic_scan(ctx, s.body)
+        }
+        i = i + 1
+    }
+}
+
+# ---- Phase 1: collect candidate bindings + validate forced attrs ----
+
+fn esc_collect_stmts(ctx: Ctx, stmts: list[int], recs: list[EscRec]) -> void {
+    let mut i: int = 0
+    while i < stmts.len() {
+        let s: StmtN = ctx.stmts[stmts.get(i)]
+        if s.kind == "let" {
+            esc_collect_let(ctx, s, recs)
+        } else if s.kind == "if" {
+            esc_collect_stmts(ctx, s.body, recs)
+            if s.else_body.len() > 0 {
+                esc_collect_stmts(ctx, s.else_body, recs)
+            }
+        } else if s.kind == "while" {
+            esc_collect_stmts(ctx, s.body, recs)
+        } else if s.kind == "for" {
+            esc_collect_stmts(ctx, s.body, recs)
+        }
+        i = i + 1
+    }
+}
+
+fn esc_collect_let(ctx: Ctx, s: StmtN, recs: list[EscRec]) -> void {
+    if !s.attr_stack && !s.attr_boxed {
+        # Un-attributed: a silent auto-mode candidate.
+        if esc_candidate(ctx, s) {
+            recs.push(EscRec {
+                name: s.name, line: s.line,
+                cap: ctx.exprs[s.value].args.len(),
+                forced: false, boxed: false,
+                esc: "", esc_line: 0,
+                push: false, push_line: 0,
+                pop: false, pop_line: 0
+            })
+        }
+        return
+    }
+    let mut attr: str = "boxed"
+    if s.attr_stack {
+        attr = "stack"
+    }
+    if !is_list_t(s.vtype) {
+        cerr(s.line, "#[" + attr + "] applies to a list[T] binding; '" + s.name + "' has type '" + s.vtype + "'")
+    }
+    if s.attr_stack {
+        # #[stack] requirements: primitive elements, list-literal init
+        # (fixed capacity), non-empty literal (capacity > 0).
+        if !esc_prim_elem(list_elem_t(s.vtype)) {
+            cerr(s.line, "#[stack] requires a primitive element type (int / float / bool); '" + s.name + "' is '" + s.vtype
+            + "' whose elements are reference-counted (boxed) values — a documented Stage 30 limitation")
+        }
+        if ctx.exprs[s.value].kind != "listlit" {
+            cerr(s.line, "#[stack] requires a list-literal initializer (the capacity is fixed at compile time); '" + s.name
+            + "' is initialised from a call/expression")
+        } else if ctx.exprs[s.value].args.len() == 0 {
+            cerr(s.line, "#[stack] on an empty list literal has no capacity — every .get() would panic; use a non-empty literal or drop the attribute")
+        }
+    }
+    if esc_candidate(ctx, s) && !s.attr_boxed {
+        recs.push(EscRec {
+            name: s.name, line: s.line,
+            cap: ctx.exprs[s.value].args.len(),
+            forced: s.attr_stack, boxed: false,
+            esc: "", esc_line: 0,
+            push: false, push_line: 0,
+            pop: false, pop_line: 0
+        })
+    } else if s.attr_boxed && is_list_t(s.vtype) {
+        # #[boxed] is legal on any list binding (it only forces the heap
+        # side); record it for the layout report even when it is not a
+        # stack candidate.
+        let mut cap: int = 0
+        if ctx.exprs[s.value].kind == "listlit" {
+            cap = ctx.exprs[s.value].args.len()
+        }
+        recs.push(EscRec {
+            name: s.name, line: s.line,
+            cap: cap,
+            forced: false, boxed: true,
+            esc: "", esc_line: 0,
+            push: false, push_line: 0,
+            pop: false, pop_line: 0
+        })
+    }
+}
+
+# ---- Phase 2: classify every use of every candidate ----
+
+fn esc_walk_stmts(ctx: Ctx, stmts: list[int], recs: list[EscRec]) -> void {
+    let mut i: int = 0
+    while i < stmts.len() {
+        esc_walk_stmt(ctx, ctx.stmts[stmts.get(i)], recs)
+        i = i + 1
+    }
+}
+
+fn esc_walk_stmt(ctx: Ctx, s: StmtN, recs: list[EscRec]) -> void {
+    if s.kind == "let" {
+        if ctx.exprs[s.value].kind == "listlit" {
+            # Element expressions of any list literal. A candidate's own
+            # elements are primitive expressions (they cannot alias a
+            # tracked binding), but walk them anyway for uniformity —
+            # heap literals can contain anything.
+            let mut i: int = 0
+            while i < ctx.exprs[s.value].args.len() {
+                esc_expr(ctx, ctx.exprs[s.value].args.get(i), recs, false, "element of a list literal")
+                i = i + 1
+            }
+        } else {
+            esc_expr(ctx, s.value, recs, false, "initializer of '" + s.name + "'")
+        }
+    } else if s.kind == "assign" {
+        esc_walk_assign(ctx, s, recs)
+    } else if s.kind == "if" {
+        esc_expr(ctx, s.cond, recs, false, "if condition")
+        esc_walk_stmts(ctx, s.body, recs)
+        if s.else_body.len() > 0 {
+            esc_walk_stmts(ctx, s.else_body, recs)
+        }
+    } else if s.kind == "while" {
+        esc_expr(ctx, s.cond, recs, false, "while condition")
+        esc_walk_stmts(ctx, s.body, recs)
+    } else if s.kind == "for" {
+        # for-in iterable: a DIRECT ident reference to a tracked binding
+        # is the borrow-safe iterable position. Anything else (calls,
+        # field exprs...) is walked as an ordinary escaping position.
+        if !(ctx.exprs[s.iter].kind == "ident" && esc_find(recs, ctx.exprs[s.iter].name) >= 0) {
+            esc_expr(ctx, s.iter, recs, false, "for-in iterable")
+        }
+        esc_walk_stmts(ctx, s.body, recs)
+    } else if s.kind == "return" {
+        if s.value != -1 {
+            esc_expr(ctx, s.value, recs, false, "return value")
+        }
+    } else if s.kind == "expr" {
+        esc_expr(ctx, s.e, recs, false, "discarded expression value")
+    }
+    # break / continue: no expressions.
+}
+
+fn esc_walk_assign(ctx: Ctx, s: StmtN, recs: list[EscRec]) -> void {
+    let tgt: int = s.target
+    if ctx.exprs[tgt].kind == "ident" {
+        # Whole-binding reassignment of a tracked binding: the new value
+        # replaces the frame-resident storage — an escape (the binding
+        # can no longer be a plain stack array).
+        let ri: int = esc_find(recs, ctx.exprs[tgt].name)
+        if ri >= 0 {
+            let r: EscRec = recs.get(ri)
+            if r.esc == "" {
+                r.esc = "reassigned (assignment target)"
+                r.esc_line = ctx.exprs[tgt].line
+            }
+        }
+    } else if ctx.exprs[tgt].kind == "index" && ctx.exprs[ctx.exprs[tgt].left].kind == "ident" {
+        # xs[i] = v — the base binding is the index base (borrow-safe);
+        # only the index expression is an ordinary position.
+        esc_expr(ctx, ctx.exprs[tgt].right, recs, false, "index expression")
+    } else {
+        # Field assignment / nested index bases: the whole target chain
+        # is an ordinary position.
+        esc_expr(ctx, tgt, recs, false, "assignment target")
+    }
+    esc_expr(ctx, s.value, recs, false, "assigned value")
+}
+
+# esc_expr: walk an expression, classifying every occurrence of a
+# tracked binding. `safe=true` means the CURRENT position is
+# borrow-safe (receiver of .get/.set/.len, index base); method and
+# index nodes re-derive the flag for their own children, so the ambient
+# flag only matters when an ident node is reached directly.
+fn esc_expr(ctx: Ctx, e: int, recs: list[EscRec], safe: bool, why: str) -> void {
+    if e < 0 {
+        return
+    }
+    let n: ExprN = ctx.exprs[e]
+    if n.kind == "ident" {
+        let ri: int = esc_find(recs, n.name)
+        if ri >= 0 {
+            let r: EscRec = recs.get(ri)
+            if !safe && r.esc == "" {
+                r.esc = why
+                r.esc_line = n.line
+            }
+        }
+        return
+    }
+    if n.kind == "method" {
+        let mname: str = n.name
+        if !n.muser && (n.mop == "list.get" || n.mop == "list.set" || n.mop == "list.len") {
+            # Borrow-safe builtin list methods: receiver stays in-frame.
+            esc_expr(ctx, n.left, recs, true, "receiver")
+        } else if !n.muser && (n.mop == "list.push" || n.mop == "list.pop") && ctx.exprs[n.left].kind == "ident" {
+            # push/pop on a tracked binding: a dedicated growth/shrink
+            # use class (fixed capacity — cannot grow or shrink).
+            let ri: int = esc_find(recs, ctx.exprs[n.left].name)
+            if ri >= 0 {
+                let r: EscRec = recs.get(ri)
+                if n.mop == "list.push" && !r.push {
+                    r.push = true
+                    r.push_line = ctx.exprs[n.left].line
+                }
+                if n.mop == "list.pop" && !r.pop {
+                    r.pop = true
+                    r.pop_line = ctx.exprs[n.left].line
+                }
+            } else {
+                esc_expr(ctx, n.left, recs, false, "receiver of '" + mname + "()'")
+            }
+        } else {
+            # User method or non-list builtin: the receiver escapes.
+            esc_expr(ctx, n.left, recs, false, "receiver of '" + mname + "()'")
+        }
+        let mut i: int = 0
+        while i < n.args.len() {
+            esc_expr(ctx, n.args.get(i), recs, false, "argument of '" + mname + "()'")
+            i = i + 1
+        }
+        return
+    }
+    if n.kind == "index" {
+        # xs[i]: the base binding is borrow-safe (the read/write stays
+        # in-frame); the index expression is an ordinary position.
+        esc_expr(ctx, n.left, recs, true, "index base")
+        esc_expr(ctx, n.right, recs, false, "index expression")
+        return
+    }
+    if n.kind == "call" {
+        let mut i: int = 0
+        while i < n.args.len() {
+            esc_expr(ctx, n.args.get(i), recs, false, "argument of call '" + n.name + "()'")
+            i = i + 1
+        }
+        return
+    }
+    if n.kind == "match" {
+        # left = scrutinee; args = MatchArm indices.
+        esc_expr(ctx, n.left, recs, false, "match scrutinee")
+        let mut ai: int = 0
+        while ai < n.args.len() {
+            let arm: MatchArm = ctx.match_arms.get(n.args.get(ai))
+            esc_expr(ctx, arm.body, recs, false, "match arm body")
+            ai = ai + 1
+        }
+        return
+    }
+    if n.kind == "listlit" {
+        let mut i: int = 0
+        while i < n.args.len() {
+            esc_expr(ctx, n.args.get(i), recs, false, "element of a list literal")
+            i = i + 1
+        }
+        return
+    }
+    if n.kind == "structlit" {
+        let mut i: int = 0
+        while i < n.args.len() {
+            esc_expr(ctx, n.args.get(i), recs, false, "field of a struct literal")
+            i = i + 1
+        }
+        return
+    }
+    # Generic children: bin (left/right), un (left), qmark (left),
+    # field (left), fieldcall (left + args), enumlit (args = payloads).
+    if n.left >= 0 {
+        esc_expr(ctx, n.left, recs, false, why)
+    }
+    if n.right >= 0 {
+        esc_expr(ctx, n.right, recs, false, why)
+    }
+    let mut i: int = 0
+    while i < n.args.len() {
+        esc_expr(ctx, n.args.get(i), recs, false, why)
+        i = i + 1
+    }
+}
+
+# ============================================================================
+# STAGE 31 (v0.48.0-alpha): verified tail-call optimisation — VERIFIER
+# ============================================================================
+# #[tail_call] on a function asserts that every recursive call to it is
+# in VERIFIED tail position. "Verified" is a concrete, mechanical claim:
+#
+#   1. Position — every self-call must be the ENTIRE return expression
+#      (`return f(...)`), never nested inside an operator, an argument,
+#      a let binding or a discarded expression statement.
+#
+#   2. No cleanup — nothing needing release may be created between the
+#      (transformed) call and the function entry. The goto-based loop
+#      would skip any __attribute__((cleanup)) variable declared in the
+#      body, so the verifier proves the body CANNOT contain one:
+#        * parameters, return type and every let binding are
+#          int / float / bool (never refcounted);
+#        * every expression in the body is primitive-typed — the ONLY
+#          exception is a string LITERAL passed directly to
+#          panic / print / println (consume-builtins: the argument is
+#          transferred, never hoisted, never bound).
+#
+# Together these make the C-level transform sound BY CONSTRUCTION:
+# at the tail site the codegen evaluates the argument expressions into
+# fresh temps (in order), rebinds the parameter locals, and jumps to
+# the function entry label. No call, no stack growth, no cleanup debt.
+#
+# The interpreter mirrors the same transform as a trampoline
+# (boot/interp.py): a tail `return f(...)` raises TailCallSig, call_fn
+# rebinds the parameters and re-runs the body in the SAME Python frame.
+
+# tail_prim_t: the types a #[tail_call] function may flow through.
+fn tail_prim_t(t: str) -> bool {
+    return t == "int" || t == "float" || t == "bool"
+}
+
+# tail_is_self_call: is expression e a direct call to fn `key`?
+fn tail_is_self_call(ctx: Ctx, e: int, key: str) -> bool {
+    if e < 0 {
+        return false
+    }
+    let n: ExprN = ctx.exprs[e]
+    if n.kind != "call" {
+        return false
+    }
+    return n.muser && n.mkey == key
+}
+
+# tail_check_expr: verify one expression subtree of a #[tail_call] fn.
+# Every reachable node must be primitive-typed (void/never allowed for
+# statement-level calls); a self-call OUTSIDE a return value is the
+# "not in tail position" error. panic/print/println accept exactly one
+# string LITERAL argument (the consume-builtin exception).
+fn tail_check_expr(ctx: Ctx, e: int, key: str) -> void {
+    if e < 0 {
+        return
+    }
+    let n: ExprN = ctx.exprs[e]
+    if n.kind == "int" || n.kind == "float" || n.kind == "bool" || n.kind == "ident" {
+        return
+    }
+    if n.kind == "str" {
+        cerr(n.line, "#[tail_call] violated: '" + key + "' cannot use string values (line " + n.line.to_str() + ") — only int / float / bool may flow through a tail-call function (a string would need release at the loop jump; string LITERALS are only allowed as the direct argument of panic / print / println)")
+        return
+    }
+    if n.kind == "call" {
+        # A self-call outside a return-value position is never tail.
+        if n.muser && n.mkey == key {
+            cerr(n.line, "#[tail_call] violated: the recursive call to '" + key + "' at line " + n.line.to_str() + " is not in tail position — every recursive call must be the entire return expression (`return " + key + "(...)`)")
+            return
+        }
+        # Consume-builtin exception: panic / print / println / eprint /
+        # eprintln with ONE string literal argument (never hoisted,
+        # never bound, released by the callee — provably
+        # cleanup-free at the jump). Stage 56 (v0.75.0-alpha) added
+        # eprint / eprintln to the exception set: they consume their
+        # argument exactly like print / println do.
+        if !n.muser && (n.mkey == "panic" || n.mkey == "print" || n.mkey == "println"
+        || n.mkey == "eprint" || n.mkey == "eprintln") {
+            let mut ok: bool = n.args.len() == 1
+            if ok {
+                let a: ExprN = ctx.exprs[n.args.get(0)]
+                ok = a.kind == "str"
+            }
+            if !ok {
+                cerr(n.line, "#[tail_call] violated: the " + n.mkey + " call at line " + n.line.to_str() + " must take exactly one string LITERAL — a computed string would create a refcounted temporary needing cleanup between the tail call and the jump")
+            }
+            return
+        }
+        # Any other call: the RESULT must be primitive (or void/never
+        # for statement position), then walk the arguments.
+        if n.t != "void" && n.t != "never" && !tail_prim_t(n.t) {
+            cerr(n.line, "#[tail_call] violated: '" + key + "' contains a non-primitive expression of type '" + n.t + "' (line " + n.line.to_str() + ") — only int / float / bool values may flow through a tail-call function (refcounted values would need cleanup between the tail call and the jump)")
+            return
+        }
+        let mut i: int = 0
+        while i < n.args.len() {
+            tail_check_expr(ctx, n.args.get(i), key)
+            i = i + 1
+        }
+        return
+    }
+    if n.kind == "method" {
+        if n.t != "void" && n.t != "never" && !tail_prim_t(n.t) {
+            cerr(n.line, "#[tail_call] violated: '" + key + "' contains a non-primitive expression of type '" + n.t + "' (line " + n.line.to_str() + ") — only int / float / bool values may flow through a tail-call function")
+            return
+        }
+        tail_check_expr(ctx, n.left, key)
+        let mut j: int = 0
+        while j < n.args.len() {
+            tail_check_expr(ctx, n.args.get(j), key)
+            j = j + 1
+        }
+        return
+    }
+    # Every other node kind: the node's own type must be primitive.
+    if n.t != "void" && n.t != "never" && !tail_prim_t(n.t) {
+        cerr(n.line, "#[tail_call] violated: '" + key + "' contains a non-primitive expression of type '" + n.t + "' (line " + n.line.to_str() + ") — only int / float / bool values may flow through a tail-call function (refcounted values would need cleanup between the tail call and the jump)")
+        return
+    }
+    if n.left >= 0 {
+        tail_check_expr(ctx, n.left, key)
+    }
+    if n.right >= 0 {
+        tail_check_expr(ctx, n.right, key)
+    }
+    # Match arms: the scrutinee (left) already forces an enum — never
+    # primitive, so a match is always rejected — but walk the arm
+    # BODIES too so a self-call nested in an arm can never slip past
+    # the position check (mirror-parity with the boot checker, and
+    # future-proof if match-on-int ever lands).
+    if n.kind == "match" {
+        let mut ai: int = 0
+        while ai < n.args.len() {
+            let arm: MatchArm = ctx.match_arms.get(n.args.get(ai))
+            if arm.body >= 0 {
+                tail_check_expr(ctx, arm.body, key)
+            }
+            ai = ai + 1
+        }
+    }
+    # Deep-scan-15 fix (MEDIUM-HIGH severity, soundness): the previous
+    # code unconditionally walked `n.args` as if every entry were a
+    # child expression index. For a `match` node, `n.args` is a list
+    # of arm INDICES (into ctx.match_arms) — small integers like 0, 1,
+    # 2 — NOT expression indices. Walking them as expressions either
+    # crashed (out-of-bounds), or worse, silently walked UNRELATED
+    # expressions (if the arm index happened to be a valid ctx.exprs
+    # slot), causing the tail-call verifier to either flag false
+    # positives or miss real non-tail self-calls nested in arms.
+    # The arm bodies are already walked in the match-specific block
+    # above, so skip the generic args walk for match nodes (mirrors
+    # the discipline used by estimate_stack_calls and the boot checker).
+    if n.kind != "match" {
+        let mut k: int = 0
+        while k < n.args.len() {
+            tail_check_expr(ctx, n.args.get(k), key)
+            k = k + 1
+        }
+    }
+}
+
+# tail_check_stmts / tail_check_stmt: walk the body. Return statements
+# with a self-call VALUE are the verified tail sites (counted); every
+# other statement's expressions go through tail_check_expr.
+fn tail_check_stmts(ctx: Ctx, stmts: list[int], key: str, mut sites: int) -> int {
+    let mut i: int = 0
+    while i < stmts.len() {
+        sites = tail_check_stmt(ctx, stmts.get(i), key, sites)
+        i = i + 1
+    }
+    return sites
+}
+
+fn tail_check_stmt(ctx: Ctx, sidx: int, key: str, mut sites: int) -> int {
+    if sidx < 0 {
+        return sites
+    }
+    let s: StmtN = ctx.stmts.get(sidx)
+    if s.kind == "return" {
+        if s.value != -1 {
+            if tail_is_self_call(ctx, s.value, key) {
+                # The verified tail site. Its ARGUMENTS still go through
+                # the primitive-dataflow check (they are re-evaluated
+                # into temps at the jump).
+                let n: ExprN = ctx.exprs[s.value]
+                let mut i: int = 0
+                while i < n.args.len() {
+                    tail_check_expr(ctx, n.args.get(i), key)
+                    i = i + 1
+                }
+                sites = sites + 1
+            } else {
+                tail_check_expr(ctx, s.value, key)
+            }
+        }
+        return sites
+    }
+    if s.kind == "let" {
+        if !tail_prim_t(s.vtype) {
+            cerr(s.line, "#[tail_call] violated: '" + key + "' cannot bind non-primitive values — `let " + s.name + ": " + s.vtype + "` at line " + s.line.to_str() + ". A refcounted binding would need release at the loop jump, which the verified transform forbids (keep the body to int / float / bool)")
+        }
+        tail_check_expr(ctx, s.value, key)
+        return sites
+    }
+    if s.kind == "assign" {
+        tail_check_expr(ctx, s.target, key)
+        tail_check_expr(ctx, s.value, key)
+        return sites
+    }
+    if s.kind == "if" {
+        tail_check_expr(ctx, s.cond, key)
+        sites = tail_check_stmts(ctx, s.body, key, sites)
+        sites = tail_check_stmts(ctx, s.else_body, key, sites)
+        return sites
+    }
+    if s.kind == "while" {
+        tail_check_expr(ctx, s.cond, key)
+        sites = tail_check_stmts(ctx, s.body, key, sites)
+        return sites
+    }
+    if s.kind == "for" {
+        # for-in iterates a list — never primitive. Report at the iter.
+        tail_check_expr(ctx, s.iter, key)
+        sites = tail_check_stmts(ctx, s.body, key, sites)
+        return sites
+    }
+    if s.kind == "expr" {
+        tail_check_expr(ctx, s.e, key)
+        return sites
+    }
+    # break / continue / anything else: no expressions.
+    return sites
+}
+
+# tail_check_fn: the Stage 31 entry point — verify one #[tail_call] fn.
+fn tail_check_fn(ctx: Ctx, key: str) -> void {
+    let f: FnInfo = ctx.fns.get_or(key, dummy_fn())
+    if !f.attr_tail_call {
+        return
+    }
+    if f.is_extern {
+        cerr(f.line, "#[tail_call] cannot be applied to an extern function")
+        return
+    }
+    if f.is_method {
+        cerr(f.line, "#[tail_call] is not supported on methods yet ('" + f.name + "' is a method of '" + f.struct_of + "')")
+        return
+    }
+    if f.typeparams.len() > 0 {
+        cerr(f.line, "#[tail_call] is not supported on generic functions yet ('" + f.name + "' has type parameters) — instantiate a concrete wrapper instead")
+        return
+    }
+    if f.requires_e != -1 || f.ensures_e != -1 {
+        cerr(f.line, "#[tail_call] and contracts (requires / ensures) are mutually exclusive on '" + f.name + "' — the postcondition check would interpose cleanup between the tail call and the jump")
+        return
+    }
+    # Parameters: primitive only. The transform rebinds them in place;
+    # a refcounted parameter would need release at the jump.
+    let mut pi: int = 0
+    while pi < f.ptypes.len() {
+        let pt: str = f.ptypes.get(pi)
+        if !tail_prim_t(pt) {
+            cerr(f.line, "#[tail_call] on '" + f.name + "' requires all parameters to be int / float / bool; parameter '" + f.params.get(pi) + ": " + pt + "' is not — refcounted values would need cleanup between the tail call and the jump, which the verified transform forbids")
+        }
+        pi = pi + 1
+    }
+    # Return type: the loop feeds a value back; void has nothing to feed.
+    if !tail_prim_t(f.ret) {
+        cerr(f.line, "#[tail_call] on '" + f.name + "' requires the return type to be int / float / bool, not '" + f.ret + "' (a tail call must feed a value back through the loop)")
+    }
+    # Body: position + dataflow verification.
+    let sites: int = tail_check_stmts(ctx, f.body, key, 0)
+    if sites == 0 {
+        cerr(f.line, "#[tail_call] on '" + f.name + "' found no recursive call to itself — remove the attribute (the tail-call transform needs a self-call to turn into a loop)")
+        return
+    }
+    ctx.tail_sites.set(key, sites)
+}
+
+fn check_program(ctx: Ctx) -> void {
+    # 1. struct: field types
+    let keys_s: list[str] = ctx.structs.keys()
+    let mut si: int = 0
+    while si < keys_s.len() {
+        let st: StructInfo = ctx.structs.get_or(keys_s.get(si), dummy_struct())
+        ctx.cur_typeparams = st.typeparams
+        let mut fi: int = 0
+        while fi < st.ftypes.len() {
+            require_type(ctx, st.ftypes.get(fi), st.line, "struct field type")
+            fi = fi + 1
+        }
+        # Also check default-value expressions (must be of the declared type).
+        let mut di: int = 0
+        while di < st.fdefaults.len() {
+            if st.fdefaults.get(di) != -1 {
+                let env: list[map[str, Binding]] = []
+                env.push(map_new())
+                let vt: str = check_expr(ctx, env, "", st.fdefaults.get(di), st.ftypes.get(di))
+                if vt != "never" && vt != st.ftypes.get(di) {
+                    cerr(st.line, "default value of field " + st.fields.get(di) + " expects " + st.ftypes.get(di) + ", got " + vt)
+                }
+            }
+            di = di + 1
+        }
+        ctx.cur_typeparams = []
+        si = si + 1
+    }
+    # 2. enum: variant payload types
+    let keys_e: list[str] = ctx.enums.keys()
+    let mut ei: int = 0
+    while ei < keys_e.len() {
+        let en: EnumInfo = ctx.enums.get_or(keys_e.get(ei), dummy_enum())
+        ctx.cur_typeparams = en.typeparams
+        let mut vi: int = 0
+        while vi < en.variants.len() {
+            let pl: list[str] = en.payloads.get(vi)
+            let mut pi: int = 0
+            while pi < pl.len() {
+                require_type(ctx, pl.get(pi), en.line, "variant payload type")
+                pi = pi + 1
+            }
+            vi = vi + 1
+        }
+        ctx.cur_typeparams = []
+        ei = ei + 1
+    }
+    # 3. function declarations
+    let mut i: int = 0
+    while i < ctx.fn_order.len() {
+        let mut key: str = ctx.fn_order.get(i)
+        let f: FnInfo = ctx.fns.get_or(key, dummy_fn())
+        ctx.cur_typeparams = f.typeparams
+        if !f.is_method {
+            if is_builtin_fn(f.name) {
+                cerr(f.line, "cannot redefine builtin function: " + f.name)
+            }
+        } else {
+            if !ctx.structs.has(f.struct_of) {
+                cerr(f.line, "impl for non-existent struct: " + f.struct_of)
+            }
+            if f.params.len() == 0 {
+                cerr(f.line, "method must have 'self' as first parameter")
+            }
+            if f.params.get(0) != "self" || f.ptypes.get(0) != f.struct_of {
+                cerr(f.line, "method must have first parameter 'self: " + f.struct_of + "'")
+            }
+        }
+        let mut j: int = 0
+        while j < f.params.len() {
+            require_type(ctx, f.ptypes.get(j), f.line, "parameter type")
+            j = j + 1
+        }
+        if f.ret != "void" {
+            if !type_exists(ctx, f.ret) {
+                cerr(f.line, "return type does not exist: " + f.ret)
+            }
+        }
+        # Stage 28 (v0.45.0-alpha): validate the #[stack_size(N)] bound
+        # by statically estimating the function's frame size. The estimate
+        # is conservative: count every let-binding / for-loop var in the
+        # body (8 bytes each — every HLS type lowers to int64_t / double /
+        # pointer, all 8 bytes), add 16 bytes per nested call (gcc spills
+        # the caller-saved registers + return address slot), plus 32 bytes
+        # base overhead (saved RBP / RBX / frame pointer chain). The
+        # estimate is an UPPER BOUND — gcc may reuse slots across sibling
+        # scopes, so the actual frame can be smaller, but it can never be
+        # larger than this number for the type-correct HLS source. This
+        # makes #[stack_size(N)] a sound guarantee: if the estimate <= N
+        # then the emitted assembly's frame <= N.
+        if f.attr_stack_size >= 0 && !f.is_extern {
+            let est: int = estimate_stack_size(ctx, f)
+            if est > f.attr_stack_size {
+                cerr(f.line, "#[stack_size(" + f.attr_stack_size.to_str()
+                + ")] violated by function '" + f.name + "': estimated frame size is "
+                + est.to_str() + " bytes (the body declares too many locals or nests too many call sites for the bound). Reduce locals or raise the bound.")
+            }
+        }
+        # Stage 28: #[irq_handler] is only valid on fns with signature
+        # `fn(<single pointer param>) -> void` (gcc's interrupt attribute
+        # requires a single pointer parameter that receives the saved
+        # frame, and returns void).
+        if f.attr_irq_handler && !f.is_extern {
+            if f.ret != "void" {
+                cerr(f.line, "#[irq_handler] requires the function to return 'void' (gcc's interrupt attribute); '" + f.name + "' returns '" + f.ret + "'")
+            }
+            if f.params.len() != 1 {
+                cerr(f.line, "#[irq_handler] requires exactly one parameter (the saved-frame pointer); '" + f.name + "' has " + f.params.len().to_str())
+            } else {
+                # The single param MUST be a C pointer type (any HLS
+                # type that lowers to a C pointer: str, list[T], map[...],
+                # tainted[T]-of-pointer, Chan[T], Task[T], or any user
+                # struct). `int`, `float`, `bool`, `void` lower to scalars
+                # and are rejected.
+                let pt: str = f.ptypes.get(0)
+                if !is_ptr_type(pt) {
+                    cerr(f.line, "#[irq_handler] requires its parameter to be a pointer-typed value (str / list[T] / struct / Chan / Task / tainted[T] of pointer); '" + f.name + "' has '" + pt + "' which lowers to a non-pointer C type and gcc's interrupt attribute would reject the signature")
+                }
+            }
+        }
+        ctx.cur_typeparams = []
+        i = i + 1
+    }
+    # 4. main
+    if !ctx.fns.has("main") {
+        cerr(1, "missing main function")
+    }
+    let mf: FnInfo = ctx.fns.get_or("main", dummy_fn())
+    if mf.is_method {
+        cerr(mf.line, "main cannot be a method")
+    }
+    if mf.params.len() > 0 {
+        cerr(mf.line, "main cannot have parameters")
+    }
+    if mf.ret != "int" && mf.ret != "void" {
+        cerr(mf.line, "main must return 'int' or have no return type")
+    }
+    # 5. check function bodies
+    let mut bi: int = 0
+    while bi < ctx.fn_order.len() {
+        check_fn_body(ctx, ctx.fn_order.get(bi))
+        bi = bi + 1
+    }
+    # 5.5 Stage 30 (v0.47.0-alpha): boxed-vs-stack layout analysis.
+    # Runs AFTER the bodies are checked (the walker reads the mop/muser
+    # method tags check_method sets) and BEFORE codegen (the decisions
+    # are recorded on ctx.layout_map for the codegen hooks). Enforces
+    # the #[stack] soundness proof: a stack-allocated value can never
+    # outlive its creating frame.
+    let mut xi: int = 0
+    while xi < ctx.fn_order.len() {
+        escape_check_fn(ctx, ctx.fn_order.get(xi))
+        xi = xi + 1
+    }
+    # 5.6 Stage 31 (v0.48.0-alpha): verified tail-call optimisation.
+    # Runs after the bodies are checked (the walker reads the expression
+    # TYPES the checker annotated and the mkey tags check_call set).
+    # Verifies every #[tail_call] fn: tail position of every self-call,
+    # primitive-only dataflow (the "no cleanup needed between the call
+    # and the return" proof), and records the verified site count for
+    # the --opt-stats report.
+    let mut ti: int = 0
+    while ti < ctx.fn_order.len() {
+        tail_check_fn(ctx, ctx.fn_order.get(ti))
+        ti = ti + 1
+    }
+    # 6. effects analysis
+    check_effects(ctx)
+    # 7. collect all generic struct/enum instantiations used anywhere in
+    # the program (signatures, let bindings, expression types) so the codegen
+    # emits the corresponding C types.
+    collect_all_insts(ctx)
+}
+
+# collect_insts walks a single type string and records any generic struct /
+# enum instantiations it finds. Skips types that contain type parameters
+# (they're abstract, not instantiated).
+fn collect_insts(ctx: Ctx, t: str) -> void {
+    if t == "" || t == "int" || t == "float" || t == "bool" || t == "str" || t == "void" || t == "never" {
+        return
+    }
+    if is_list_t(t) {
+        collect_insts(ctx, list_elem_t(t))
+        return
+    }
+    if is_map_t(t) {
+        collect_insts(ctx, map_val_t(t))
+        return
+    }
+    if is_taint_t(t) {
+        collect_insts(ctx, taint_inner_t(t))
+        return
+    }
+    # Stage 16: recurse into the concurrency wrappers so that e.g. a
+    # `Chan[Point]` binding forces the Point instantiation (its release
+    # fn is referenced as the channel's elem_release).
+    if is_chan_t(t) {
+        collect_insts(ctx, chan_inner_t(t))
+        return
+    }
+    if is_task_t(t) {
+        collect_insts(ctx, task_inner_t(t))
+        return
+    }
+    # Stage 33/34: Future[T] and Stream[T] are channels under the hood;
+    # recurse so the element type's release fn is referenced.
+    if is_future_t(t) {
+        collect_insts(ctx, future_inner_t(t))
+        return
+    }
+    if is_stream_t(t) {
+        collect_insts(ctx, stream_inner_t(t))
+        return
+    }
+    let base: str = type_base(t)
+    let args: list[str] = type_args(t)
+    # Skip if the base isn't a known struct/enum — it's a type param.
+    if !ctx.structs.has(base) && !ctx.enums.has(base) {
+        return
+    }
+    # Skip if any arg is not concrete (contains a type param).
+    let mut i: int = 0
+    while i < args.len() {
+        if !type_is_concrete(ctx, args.get(i)) {
+            return
+        }
+        i = i + 1
+    }
+    if ctx.structs.has(base) {
+        let st: StructInfo = ctx.structs.get_or(base, dummy_struct())
+        if st.typeparams.len() > 0 && args.len() == st.typeparams.len() {
+            if !list_has(ctx.struct_insts, t) {
+                ctx.struct_insts.push(t)
+            }
+        }
+    } else if ctx.enums.has(base) {
+        let en: EnumInfo = ctx.enums.get_or(base, dummy_enum())
+        if en.typeparams.len() > 0 && args.len() == en.typeparams.len() {
+            if !list_has(ctx.enum_insts, t) {
+                ctx.enum_insts.push(t)
+            }
+        }
+    }
+    # Recurse into args.
+    let mut j: int = 0
+    while j < args.len() {
+        collect_insts(ctx, args.get(j))
+        j = j + 1
+    }
+}
+
+# type_is_concrete returns true if `t` doesn't contain any type parameters.
+fn type_is_concrete(ctx: Ctx, t: str) -> bool {
+    if t == "" {
+        return false
+    }
+    if t == "int" || t == "float" || t == "bool" || t == "str" || t == "void" || t == "never" {
+        return true
+    }
+    if is_list_t(t) {
+        return type_is_concrete(ctx, list_elem_t(t))
+    }
+    if is_map_t(t) {
+        return type_is_concrete(ctx, map_val_t(t))
+    }
+    if is_taint_t(t) {
+        return type_is_concrete(ctx, taint_inner_t(t))
+    }
+    let base: str = type_base(t)
+    let args: list[str] = type_args(t)
+    if !ctx.structs.has(base) && !ctx.enums.has(base) {
+        return false
+    }
+    let mut i: int = 0
+    while i < args.len() {
+        if !type_is_concrete(ctx, args.get(i)) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn collect_all_insts(ctx: Ctx) -> void {
+    # Function signatures.
+    let mut i: int = 0
+    while i < ctx.fn_order.len() {
+        let f: FnInfo = ctx.fns.get_or(ctx.fn_order.get(i), dummy_fn())
+        let mut j: int = 0
+        while j < f.ptypes.len() {
+            collect_insts(ctx, f.ptypes.get(j))
+            j = j + 1
+        }
+        collect_insts(ctx, f.ret)
+        i = i + 1
+    }
+    # Struct fields.
+    let sk: list[str] = ctx.structs.keys()
+    let mut si: int = 0
+    while si < sk.len() {
+        let st: StructInfo = ctx.structs.get_or(sk.get(si), dummy_struct())
+        let mut fi: int = 0
+        while fi < st.ftypes.len() {
+            collect_insts(ctx, st.ftypes.get(fi))
+            fi = fi + 1
+        }
+        si = si + 1
+    }
+    # Enum payloads.
+    let ek: list[str] = ctx.enums.keys()
+    let mut ei: int = 0
+    while ei < ek.len() {
+        let en: EnumInfo = ctx.enums.get_or(ek.get(ei), dummy_enum())
+        let mut vi: int = 0
+        while vi < en.variants.len() {
+            let pl: list[str] = en.payloads.get(vi)
+            let mut pi: int = 0
+            while pi < pl.len() {
+                collect_insts(ctx, pl.get(pi))
+                pi = pi + 1
+            }
+            vi = vi + 1
+        }
+        ei = ei + 1
+    }
+    # All expression types (after check).
+    let mut xi: int = 0
+    while xi < ctx.exprs.len() {
+        if ctx.exprs[xi].t != "" && ctx.exprs[xi].t != "never" {
+            collect_insts(ctx, ctx.exprs[xi].t)
+        }
+        xi = xi + 1
+    }
+    # All let vtypes + for vtypes.
+    let mut ssi: int = 0
+    while ssi < ctx.stmts.len() {
+        if ctx.stmts[ssi].vtype != "" {
+            collect_insts(ctx, ctx.stmts[ssi].vtype)
+        }
+        ssi = ssi + 1
+    }
+}
+
+fn dummy_struct() -> StructInfo {
+    return StructInfo {
+        name: "", fields: [], ftypes: [], fdefaults: [], typeparams: [], line: 0
+    }
+}
+
+fn dummy_enum() -> EnumInfo {
+    return EnumInfo {
+        name: "", variants: [], payloads: [], typeparams: [], line: 0
+    }
+}
+
+fn dummy_fn() -> FnInfo {
+    return FnInfo {
+        name: "", params: [], ptypes: [], pmuts: [], ret: "void",
+        effects: [], is_pure: false, body: [], is_method: false, struct_of: "",
+        typeparams: [], line: 0, is_extern: false,
+        requires_e: -1, ensures_e: -1,
+        attr_stack_size: -1, attr_no_red_zone: false, attr_irq_handler: false,
+        attr_inline: "", attr_hot: false, attr_cold: false,
+        attr_tail_call: false
+    }
+}

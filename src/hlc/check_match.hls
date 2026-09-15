@@ -1,0 +1,456 @@
+# ============================================================================
+# hlc/check_match.hls — part of the hlc compiler (split from the original single-file
+# src/hlc.hls). This file is loaded via `import "hlc/check_match.hls"` from src/hlc.hls.
+# Section 4e — CHECKER: match exhaustiveness, ? propagation, effect collection.
+# NOTE: content is byte-identical to the original src/hlc.hls line range
+#       9620..10069 - module split is purely structural, zero code changes.
+# ============================================================================
+fn check_match(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, expected: str) -> str {
+    let scrut_t: str = check_expr(ctx, env, cur, ctx.exprs[e].left, "")
+    if scrut_t == "never" {
+        cerr(ctx.exprs[e].line, "never value cannot be used in match")
+    }
+    let ename: str = type_base(scrut_t)
+    if !ctx.enums.has(ename) {
+        cerr(ctx.exprs[e].line, "match scrutinee must be an enum, got " + scrut_t)
+    }
+    let en: EnumInfo = ctx.enums.get_or(ename, dummy_enum())
+    let typeparams: list[str] = en.typeparams
+    let targs: list[str] = []
+    let mut ti: int = 0
+    while ti < typeparams.len() {
+        targs.push("")
+        ti = ti + 1
+    }
+    if typeparams.len() > 0 {
+        let sargs: list[str] = type_args(scrut_t)
+        if sargs.len() == typeparams.len() {
+            let mut j: int = 0
+            while j < sargs.len() {
+                targs.set(j, sargs.get(j))
+                j = j + 1
+            }
+        } else {
+            cerr(ctx.exprs[e].line, "invalid enum instantiation: " + scrut_t)
+        }
+    }
+    # Check exhaustiveness and arm types.
+    let covered: list[str] = []
+    let mut has_wildcard: bool = false
+    let mut wildcard_idx: int = -1 # SCAN-C: track position for non-last check
+    let arm_types: list[str] = []
+    let mut arm_n: int = 0
+    while arm_n < ctx.exprs[e].args.len() {
+        let arm_idx: int = ctx.exprs[e].args.get(arm_n)
+        let arm: MatchArm = ctx.match_arms.get(arm_idx)
+        if arm.pat_kind == "wildcard" {
+            has_wildcard = true
+            # SCAN-C fix: a wildcard arm not in the LAST position
+            # generates invalid C (the codegen emits `if (...) {...}
+            # else {...} else if (...) {...}` — the trailing `else if`
+            # has no matching `if`). Reject at check time with a clear
+            # error rather than letting gcc emit a confusing parse error.
+            if arm_n < ctx.exprs[e].args.len() - 1 {
+                cerr(arm.line, "wildcard arm must be the last arm in a match (found at position " + arm_n.to_str() + " of " + ctx.exprs[e].args.len().to_str() + ")")
+            }
+            wildcard_idx = arm_n
+        } else {
+            # Deep-scan-10: a bare pattern resolves against the
+            # scrutinee's enum (arm references the list's struct, so the
+            # field write mutates the stored arm).
+            if arm.enum_name == "" {
+                arm.enum_name = ename
+            }
+            if arm.enum_name != ename {
+                cerr(arm.line, "match arm pattern belongs to enum " + arm.enum_name + ", not " + ename)
+            }
+            # Find variant index.
+            let mut vidx: int = -1
+            let mut vi: int = 0
+            while vi < en.variants.len() {
+                if en.variants.get(vi) == arm.variant {
+                    vidx = vi
+                }
+                vi = vi + 1
+            }
+            if vidx == -1 {
+                cerr(arm.line, "enum " + ename + " has no variant " + arm.variant)
+            }
+            let payloads: list[str] = en.payloads.get(vidx)
+            if arm.has_paren && arm.bindings.len() != payloads.len() {
+                cerr(arm.line, "variant " + arm.variant + " has " + payloads.len().to_str() + " payloads, but pattern binds " + arm.bindings.len().to_str())
+            }
+            if !arm.has_paren && payloads.len() != 0 {
+                cerr(arm.line, "variant " + arm.variant + " requires " + payloads.len().to_str() + " payload bindings")
+            }
+            covered.push(arm.variant)
+        }
+        # Check arm body in a new scope with the bindings.
+        env.push(map_new())
+        if arm.pat_kind != "wildcard" {
+            # Bind payload values.
+            if arm.has_paren {
+                let mut vidx2: int = -1
+                let mut vi2: int = 0
+                while vi2 < en.variants.len() {
+                    if en.variants.get(vi2) == arm.variant {
+                        vidx2 = vi2
+                    }
+                    vi2 = vi2 + 1
+                }
+                let payloads2: list[str] = en.payloads.get(vidx2)
+                let mut bi: int = 0
+                while bi < payloads2.len() {
+                    let pt: str = payloads2.get(bi)
+                    let mut inst_pt: str = ""
+                    if typeparams.len() > 0 {
+                        inst_pt = instantiate_type(pt, typeparams, targs)
+                    } else {
+                        inst_pt = pt
+                    }
+                    let bname: str = arm.bindings.get(bi)
+                    if bname != "_" {
+                        # BUG-SC-2 fix: SPEC.md section 5 states that match-arm
+                        # bindings INTRODUCE a new scope and may shadow outer
+                        # bindings for the duration of the arm. We now only
+                        # reject duplicates WITHIN the same arm (e.g. E.Foo(a, a)),
+                        # not shadowing of outer bindings.
+                        if env.get(env.len() - 1).has(bname) {
+                            cerr(arm.line, "duplicate binding name in match arm: " + bname)
+                        }
+                        env.get(env.len() - 1).set(bname, Binding {
+                            t: inst_pt, is_mut: false, moved: false
+                        })
+                    }
+                    bi = bi + 1
+                }
+            }
+        }
+        let body_t: str = check_expr(ctx, env, cur, arm.body, expected)
+        let mut arm_m: MatchArm = ctx.match_arms.get(arm_idx)
+        arm_m.body_t = body_t
+        ctx.match_arms.set(arm_idx, arm_m)
+        env.pop()
+        if body_t != "never" {
+            arm_types.push(body_t)
+        }
+        arm_n = arm_n + 1
+    }
+    # Exhaustiveness check.
+    if !has_wildcard {
+        let mut missing: list[str] = []
+        let mut vi3: int = 0
+        while vi3 < en.variants.len() {
+            let v: str = en.variants.get(vi3)
+            let mut found: bool = false
+            let mut ci: int = 0
+            while ci < covered.len() {
+                if covered.get(ci) == v {
+                    found = true
+                }
+                ci = ci + 1
+            }
+            if !found {
+                missing.push(v)
+            }
+            vi3 = vi3 + 1
+        }
+        if missing.len() > 0 {
+            cerr(ctx.exprs[e].line, "match is not exhaustive; missing: " + join(missing, ", "))
+        }
+    }
+    # All arm types must agree.
+    # NOTE (deep-scan-9 / Stage 16): do NOT write ctx.exprs[e].t here —
+    # the CALLER (check_expr's match branch) assigns the return value to
+    # the same field. Writing it in BOTH places made the generated C
+    # release the OLD field value twice (field assignment lowers to
+    # `release old, store new`): the inner write freed the node's
+    # initial "", then the caller's write released the stale pointer —
+    # a heap-use-after-free in the native compiler that only surfaced
+    # on match-heavy programs (feat_clone_deep). The interpreter was
+    # unaffected (Python rebinds, no refcount dance).
+    if arm_types.len() == 0 {
+        return "never"
+    }
+    let first: str = arm_types.get(0)
+    let mut ai: int = 1
+    while ai < arm_types.len() {
+        if arm_types.get(ai) != first {
+            cerr(ctx.exprs[e].line, "match arms have different types: " + first + " and " + arm_types.get(ai))
+        }
+        ai = ai + 1
+    }
+    return first
+}
+
+# --- `?` operator ---
+
+fn check_qmark(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, expected: str) -> str {
+    let inner_t: str = check_expr(ctx, env, cur, ctx.exprs[e].left, "")
+    # Stage 27 perfection (v0.50.3-alpha) deep-scan-18: BUG-06 fix.
+    # Propagate `never` instead of erroring (bottom-type rule). A `?`
+    # on a never-typed expression is dead code (the expression diverged).
+    if inner_t == "never" {
+        ctx.exprs[e].t = "never"
+        return "never"
+    }
+    let ename: str = type_base(inner_t)
+    if !ctx.enums.has(ename) {
+        cerr(ctx.exprs[e].line, "? operator requires an enum type, got " + inner_t)
+    }
+    let en: EnumInfo = ctx.enums.get_or(ename, dummy_enum())
+    # Find error variant (Err with 1 payload, or None with 0) and ok variant
+    # (Ok or Some with 1 payload).
+    let mut err_v: str = ""
+    let mut ok_v: str = ""
+    let mut ok_payload: str = ""
+    let mut err_candidates: int = 0
+    let mut ok_candidates: int = 0
+    let mut vi: int = 0
+    while vi < en.variants.len() {
+        let v: str = en.variants.get(vi)
+        let pl: list[str] = en.payloads.get(vi)
+        let mut matched: bool = false
+        if v == "Err" && pl.len() == 1 {
+            err_v = v
+            err_candidates = err_candidates + 1
+            matched = true
+        }
+        if v == "None" && pl.len() == 0 {
+            err_v = v
+            err_candidates = err_candidates + 1
+            matched = true
+        }
+        if v == "Ok" && pl.len() == 1 {
+            ok_v = v
+            ok_payload = pl.get(0)
+            ok_candidates = ok_candidates + 1
+            matched = true
+        }
+        if v == "Some" && pl.len() == 1 {
+            ok_v = v
+            ok_payload = pl.get(0)
+            ok_candidates = ok_candidates + 1
+            matched = true
+        }
+        # BUG (deep-scan-5): a third variant beyond the ok/err pair can
+        # match NEITHER arm at runtime — the generated code would read
+        # garbage union bytes. Reject at check time.
+        if !matched {
+            cerr(ctx.exprs[e].line, "? operator requires enum " + ename + " to have exactly the ok variant (Ok/Some) and error variant (Err/None); found extra variant '" + v + "'")
+        }
+        vi = vi + 1
+    }
+    # BUG (deep-scan-5): declaring BOTH 'Err' and 'None' is ambiguous —
+    # the scan silently keeps only the last one and `?` on the other
+    # panics at runtime. Reject the ambiguity.
+    if err_candidates > 1 {
+        cerr(ctx.exprs[e].line, "? operator requires enum " + ename + " to declare EITHER 'Err' OR 'None' as its error variant, not both")
+    }
+    # BUG (deep-scan-24): the mirror-image hazard for the OK variant —
+    # declaring BOTH 'Ok(P)' and 'Some(P)' silently kept only the last
+    # one and `?` on the other read the wrong union arm. Reject the
+    # ambiguity (matches the boot checker's n_ok_candidates guard).
+    if ok_candidates > 1 {
+        cerr(ctx.exprs[e].line, "? operator requires enum " + ename + " to declare EITHER 'Ok' OR 'Some' as its ok variant, not both")
+    }
+    if err_v == "" {
+        cerr(ctx.exprs[e].line, "? operator requires enum " + ename + " to have an 'Err' (1 payload) or 'None' variant")
+    }
+    if ok_v == "" {
+        cerr(ctx.exprs[e].line, "? operator requires enum " + ename + " to have an 'Ok' or 'Some' variant (1 payload)")
+    }
+    # Compute the success value type (instantiated).
+    let mut success_t: str = ""
+    let mut err_payload_t: str = ""
+    if en.typeparams.len() > 0 {
+        let sargs: list[str] = type_args(inner_t)
+        success_t = instantiate_type(ok_payload, en.typeparams, sargs)
+        # BUG-3 fix: compute the error payload type too, so we can verify
+        # it matches the enclosing function's error type argument.
+        if err_v == "Err" {
+            # Find the Err variant's payload type from the enum definition.
+            let mut ei: int = 0
+            while ei < en.variants.len() {
+                if en.variants.get(ei) == "Err" {
+                    err_payload_t = instantiate_type(en.payloads.get(ei).get(0), en.typeparams, sargs)
+                }
+                ei = ei + 1
+            }
+        }
+    } else {
+        success_t = ok_payload
+        if err_v == "Err" {
+            let mut ei: int = 0
+            while ei < en.variants.len() {
+                if en.variants.get(ei) == "Err" {
+                    err_payload_t = en.payloads.get(ei).get(0)
+                }
+                ei = ei + 1
+            }
+        }
+    }
+    # Check that the enclosing function returns an enum of the same base.
+    let cur_ret: str = ctx.cur_fn_ret
+    if cur_ret == "void" {
+        cerr(ctx.exprs[e].line, "? operator cannot be used in a void function")
+    }
+    let cur_ret_base: str = type_base(cur_ret)
+    if cur_ret_base != ename {
+        cerr(ctx.exprs[e].line, "? operator: enclosing function returns " + cur_ret + ", cannot propagate " + ename)
+    }
+    # BUG-3 fix: verify the error payload type matches the enclosing
+    # function's error type argument.
+    if err_payload_t != "" {
+        let cur_ret_args: list[str] = type_args(cur_ret)
+        if cur_ret_args.len() > 0 {
+            let fn_err_t: str = cur_ret_args.get(cur_ret_args.len() - 1)
+            if err_payload_t != fn_err_t {
+                cerr(ctx.exprs[e].line, "? operator: error payload type " + err_payload_t + " does not match enclosing function's error type " + fn_err_t + " (in return type " + cur_ret + ")")
+            }
+        }
+    }
+    # NOTE (deep-scan-9): same as check_match — no internal .t write; the
+    # caller (check_expr's qmark branch) owns the field assignment.
+    ctx.exprs[e].err_variant = err_v
+    ctx.exprs[e].ok_variant = ok_v
+    return success_t
+}
+
+# callee_effect_list: the effect REQUIREMENT contributed by a callee —
+# builtin table for "b:" nodes, the extern's DECLARED effects for extern
+# fns (they have no body, so their computed set is always empty — the
+# declared set IS the requirement), otherwise the computed fixpoint set.
+fn callee_effect_list(ctx: Ctx, c: str, eff: map[str, list[str]]) -> list[str] {
+    if c.starts_with("b:") {
+        return builtin_effect(c.slice(2, c.len()))
+    }
+    let cf: FnInfo = ctx.fns.get_or(c, dummy_fn())
+    if cf.is_extern {
+        return cf.effects
+    }
+    return eff.get_or(c, [])
+}
+
+fn check_effects(ctx: Ctx) -> void {
+    # Stage 9-alpha: fine-grained effects & capabilities.
+    # eff[key] = computed list of effects the body of `key` requires.
+    # A function passes iff its declared effects (f.effects) is a superset
+    # of the computed effects.
+    let eff: map[str, list[str]] = map_new()
+    let mut i0: int = 0
+    while i0 < ctx.fn_order.len() {
+        let key0: str = ctx.fn_order.get(i0)
+        eff.set(key0, [])
+        i0 = i0 + 1
+    }
+
+    # Monotone fixpoint: union in each callee's computed effect set.
+    let mut changed: bool = true
+    while changed {
+        changed = false
+        let mut i: int = 0
+        while i < ctx.fn_order.len() {
+            let key: str = ctx.fn_order.get(i)
+            let edges: list[str] = ctx.edges.get_or(key, [])
+            let mut j: int = 0
+            while j < edges.len() {
+                let c: str = edges.get(j)
+                let mut new_eff: list[str] = callee_effect_list(ctx, c, eff)
+                let mut k: int = 0
+                while k < new_eff.len() {
+                    if effects_add(eff, key, new_eff.get(k)) {
+                        changed = true
+                    }
+                    k = k + 1
+                }
+                j = j + 1
+            }
+            i = i + 1
+        }
+    }
+
+    # Stage 9-beta: publish the computed effect set per function so an
+    # external auditor (hlc --audit) can print the capability tree.
+    let mut ic: int = 0
+    while ic < ctx.fn_order.len() {
+        let keyc: str = ctx.fn_order.get(ic)
+        ctx.computed_effects.set(keyc, eff.get_or(keyc, []))
+        ic = ic + 1
+    }
+
+    # Capability check: declared ⊇ computed.
+    # Stage 9-beta: also enforce that a function declared `pure` transitively
+    # calls nothing effectful (its computed effect set must be empty).
+    let mut i2: int = 0
+    while i2 < ctx.fn_order.len() {
+        let key2: str = ctx.fn_order.get(i2)
+        let f: FnInfo = ctx.fns.get_or(key2, dummy_fn())
+        let computed: list[str] = eff.get_or(key2, [])
+        # Stage 9-beta: `pure` enforcement — a `pure` function must have an
+        # empty computed effect set (no transitive effectful callees).
+        if f.is_pure && computed.len() > 0 {
+            # Find the first edge that contributes any effect.
+            let edges: list[str] = ctx.edges.get_or(key2, [])
+            let mut j2: int = 0
+            let mut found: bool = false
+            while j2 < edges.len() && !found {
+                let c: str = edges.get(j2)
+                let mut c_eff: list[str] = callee_effect_list(ctx, c, eff)
+                if c_eff.len() > 0 {
+                    let mut nm: str = c
+                    if c.starts_with("b:") {
+                        nm = c.slice(2, c.len())
+                    }
+                    cerr(f.line,
+                    "function '" + f.name + "' is declared 'pure' but calls '" +
+                    nm + "' which requires effect '" + c_eff.get(0) +
+                    "' (declared pure but callee chain is not pure)")
+                    found = true
+                }
+                j2 = j2 + 1
+            }
+            if !found {
+                cerr(f.line,
+                "function '" + f.name + "' is declared 'pure' but transitively " +
+                "uses effects " + fmt_effects(computed) +
+                " (declared pure but callee chain is not pure)")
+            }
+        }
+        # Walk each effect in `computed`; if any is missing from f.effects,
+        # find a witness edge and report.
+        let mut ci: int = 0
+        let mut found_violation: bool = false
+        while ci < computed.len() && !found_violation {
+            let ce: str = computed.get(ci)
+            if !list_has(f.effects, ce) {
+                # Find the first edge that contributes this effect.
+                let edges: list[str] = ctx.edges.get_or(key2, [])
+                let mut j2: int = 0
+                while j2 < edges.len() && !found_violation {
+                    let c: str = edges.get(j2)
+                    let mut c_eff: list[str] = callee_effect_list(ctx, c, eff)
+                    if list_has(c_eff, ce) {
+                        let mut nm: str = c
+                        if c.starts_with("b:") {
+                            nm = c.slice(2, c.len())
+                        }
+                        cerr(f.line,
+                        "function '" + f.name + "' calls '" + nm +
+                        "' which requires effect '" + ce +
+                        "' not declared (declared: " + fmt_effects(f.effects) +
+                        "; missing: " + ce + ")")
+                        found_violation = true
+                    }
+                    j2 = j2 + 1
+                }
+            }
+            ci = ci + 1
+        }
+        i2 = i2 + 1
+    }
+}
+
+# ------------------------------------------------------------------------
+# 4b. C RUNTIME (embedded directly — generated from the tested runtime)
+# ------------------------------------------------------------------------

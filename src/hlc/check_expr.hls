@@ -1,0 +1,1439 @@
+# ============================================================================
+# hlc/check_expr.hls — part of the hlc compiler (split from the original single-file
+# src/hlc.hls). This file is loaded via `import "hlc/check_expr.hls"` from src/hlc.hls.
+# Section 4c — CHECKER: statement/expression type checking.
+# NOTE: content is byte-identical to the original src/hlc.hls line range
+#       6262..7694 - module split is purely structural, zero code changes.
+# ============================================================================
+fn check_fn_body(ctx: Ctx, key: str) -> void {
+    let f: FnInfo = ctx.fns.get_or(key, dummy_fn())
+    let saved_ret: str = ctx.cur_fn_ret
+    let saved_tp: list[str] = ctx.cur_typeparams
+    # Stage 17 (v0.28.0-alpha): validate the contracts (and, for
+    # contracted fns, run the interval proof pass over the body).
+    check_contracts_hlc(ctx, key, f)
+    # Stage 15-beta: extern fns have NO body — they are forward declarations
+    # for C functions. Skip body checking and the "must return on all paths"
+    # check. They still participate in effects analysis (their declared
+    # effects propagate to callers).
+    if f.is_extern {
+        ctx.cur_fn_ret = saved_ret
+        ctx.cur_typeparams = saved_tp
+        return
+    }
+    ctx.cur_fn_ret = f.ret
+    ctx.cur_typeparams = f.typeparams
+    let env: list[map[str, Binding]] = []
+    let scope0: map[str, Binding] = map_new()
+    if f.is_method {
+        scope0.set(f.params.get(0), Binding {
+            t: f.ptypes.get(0), is_mut: f.pmuts.get(0), moved: false
+        })
+        let mut i: int = 1
+        while i < f.params.len() {
+            scope0.set(f.params.get(i), Binding {
+                t: f.ptypes.get(i), is_mut: f.pmuts.get(i), moved: false
+            })
+            i = i + 1
+        }
+    } else {
+        let mut i: int = 0
+        while i < f.params.len() {
+            let pn: str = f.params.get(i)
+            if scope0.has(pn) {
+                cerr(f.line, "duplicate parameter name: " + pn)
+            }
+            scope0.set(pn, Binding {
+                t: f.ptypes.get(i), is_mut: f.pmuts.get(i), moved: false
+            })
+            i = i + 1
+        }
+    }
+    env.push(scope0)
+    check_stmts(ctx, env, key, f, f.body, false)
+    if f.ret != "void" {
+        if !all_return(ctx, f.body) {
+            cerr(f.line, "function '" + f.name + "' does not return on all paths")
+        }
+    }
+    # Stage 17: the interval proof pass runs AFTER the body was checked
+    # (the annotations read ctx.exprs[e].t).
+    run_proof_pass_hlc(ctx, f)
+    ctx.cur_fn_ret = saved_ret
+    ctx.cur_typeparams = saved_tp
+}
+
+fn all_return(ctx: Ctx, stmts: list[int]) -> bool {
+    if stmts.len() == 0 {
+        return false
+    }
+    let last: int = stmts.get(stmts.len() - 1)
+    let mut k: str = ctx.stmts[last].kind
+    if k == "return" {
+        return true
+    }
+    if k == "expr" && ctx.exprs[ctx.stmts[last].e].t == "never" {
+        return true
+    }
+    # BUG-SC-5 fix: a `let` or `assign` whose RHS is `never`-typed
+    # (e.g. `let x: int = panic("...")`) always diverges, so the
+    # function returns on all paths. Previously this was rejected with
+    # a spurious "does not return on all paths" error.
+    if k == "let" && ctx.exprs[ctx.stmts[last].value].t == "never" {
+        return true
+    }
+    if k == "assign" && ctx.exprs[ctx.stmts[last].value].t == "never" {
+        return true
+    }
+    if k == "if" {
+        if ctx.stmts[last].else_body.len() > 0 {
+            return all_return(ctx, ctx.stmts[last].body) && all_return(ctx, ctx.stmts[last].else_body)
+        }
+    }
+    if k == "expr" && ctx.exprs[ctx.stmts[last].e].kind == "match" {
+        if match_all_return(ctx, ctx.stmts[last].e) {
+            return true
+        }
+    }
+    # Stage 27 (v0.50.0-alpha): an asm! with `options(noreturn)` as
+    # the last statement always diverges (the codegen emits
+    # __builtin_unreachable() right after the asm; gcc knows the
+    # function never falls through to the implicit return).
+    if k == "asm" {
+        if list_contains_str(ctx.stmts[last].asm_options, "noreturn") {
+            return true
+        }
+    }
+    return false
+}
+
+fn match_all_return(ctx: Ctx, e: int) -> bool {
+    let mut i: int = 0
+    while i < ctx.exprs[e].args.len() {
+        let arm_idx: int = ctx.exprs[e].args.get(i)
+        let arm: MatchArm = ctx.match_arms.get(arm_idx)
+        # BUG-009 fix: removed dead `let body_k: str = ctx.stmts[0].kind`
+        # line — that accessed the FIRST statement in the entire program
+        # (not the arm body's statement) and was unused. The actual check
+        # below uses arm.body_t which is the arm body's type (set during
+        # check_match).
+        # arm.body is an expression index; we check if it's a return wrapped
+        # in an expression-statement. But arms are expressions — they don't
+        # contain return statements directly. So a match can only be a
+        # "return on all paths" if all arms are `never`-typed (e.g., all arms
+        # are calls to `panic()`). Otherwise we cannot prove it returns.
+        # For simplicity, treat all arms that have body_t == "never" as
+        # returning.
+        if arm.body_t != "never" {
+            return false
+        }
+        i = i + 1
+    }
+    return ctx.exprs[e].args.len() > 0
+}
+
+fn check_stmts(ctx: Ctx, env: list[map[str, Binding]], cur: str, f: FnInfo, stmts: list[int], in_loop: bool) -> void {
+    let mut i: int = 0
+    while i < stmts.len() {
+        check_stmt(ctx, env, cur, f, stmts.get(i), in_loop)
+        i = i + 1
+    }
+}
+
+fn check_stmt(ctx: Ctx, env: list[map[str, Binding]], cur: str, f: FnInfo, sidx: int, in_loop: bool) -> void {
+    let s: StmtN = ctx.stmts[sidx]
+    if s.kind == "let" {
+        require_type(ctx, s.vtype, s.line, "variable type")
+        if lookup_exists(env, s.name) {
+            cerr(s.line, "shadowing not allowed: " + s.name)
+        }
+        let vt: str = check_expr(ctx, env, cur, s.value, s.vtype)
+        if vt == "never" {
+            # `let x: T = panic()` is sound: x is unreachable.
+            env.get(env.len() - 1).set(s.name, Binding {
+                t: s.vtype, is_mut: s.is_mut, moved: false
+            })
+            return
+        }
+        if vt != s.vtype {
+            cerr(s.line, "type mismatch: declared " + s.vtype + " but got " + vt)
+        }
+        env.get(env.len() - 1).set(s.name, Binding {
+            t: s.vtype, is_mut: s.is_mut, moved: false
+        })
+    } else if s.kind == "assign" {
+        check_assign(ctx, env, cur, s)
+    } else if s.kind == "if" {
+        let ct: str = check_expr(ctx, env, cur, s.cond, "")
+        if ct != "bool" {
+            cerr(s.line, "if condition must be bool, got " + ct)
+        }
+        # Deep-scan-16 HIGH-severity soundness fix: a binding moved inside
+        # EITHER arm may be moved at runtime (the arm could have executed).
+        # The previous snapshot+full-restore treated post-if state as
+        # pre-if state — a binding moved in an if-arm compiled cleanly
+        # through subsequent uses, but at runtime the native codegen had
+        # already nulled the local (`u_x = NULL` after drop/take).
+        # Sound fix: UNION the moved-status across both arms (a binding
+        # is moved if it was moved along any path).
+        let snap: list[str] = snapshot_moved(env)
+        env.push(map_new())
+        check_stmts(ctx, env, cur, f, s.body, in_loop)
+        env.pop()
+        let then_snap: list[str] = snapshot_moved(env)
+        restore_moved(env, snap)
+        if s.else_body.len() > 0 {
+            env.push(map_new())
+            check_stmts(ctx, env, cur, f, s.else_body, in_loop)
+            env.pop()
+            let else_snap: list[str] = snapshot_moved(env)
+            restore_moved(env, snap)
+            union_moved(env, then_snap)
+            union_moved(env, else_snap)
+        } else {
+            # No else arm — equivalent to an empty else (no moves).
+            union_moved(env, then_snap)
+        }
+    } else if s.kind == "while" {
+        ctx.loop_header = ctx.loop_header + 1
+        let ct: str = check_expr(ctx, env, cur, s.cond, "")
+        ctx.loop_header = ctx.loop_header - 1
+        if ct != "bool" {
+            cerr(s.line, "while condition must be bool, got " + ct)
+        }
+        # Deep-scan-16 HIGH-severity soundness fix: the loop body may
+        # execute >= 1 time. A binding moved inside the body (drop/take)
+        # is nulled at runtime after the first iteration. Post-loop uses
+        # of the binding read NULL and segfault. The previous snapshot+
+        # restore cleared moves done in the body, so
+        #   `while true { take(xs); break } let y = xs[0]`
+        # compiled cleanly but crashed at runtime.
+        # Sound fix: do NOT restore moves done in the body. The
+        # idiomatic "drop then revive via mut reassignment" pattern
+        # still works because check_assign's revive step clears the
+        # moved flag.
+        let snap: list[str] = snapshot_moved(env)
+        env.push(map_new())
+        check_stmts(ctx, env, cur, f, s.body, true)
+        env.pop()
+        # No restore_moved — moves done in the body propagate to
+        # post-loop state (soundness: assume the body executed).
+    } else if s.kind == "for" {
+        ctx.loop_header = ctx.loop_header + 1
+        let it: str = check_expr(ctx, env, cur, s.iter, "")
+        ctx.loop_header = ctx.loop_header - 1
+        if !is_list_t(it) {
+            cerr(s.line, "for-in expression must be a list, got " + it)
+        }
+        let mut elem: str = list_elem_t(it)
+        if s.vtype != elem {
+            cerr(s.line, "variable type " + s.vtype + " does not match element " + elem)
+        }
+        # Deep-scan-16: same soundness fix as `while` — a binding moved
+        # inside the for-body may be nulled at runtime after the first
+        # iteration. Post-loop uses must be rejected.
+        let snap: list[str] = snapshot_moved(env)
+        env.push(map_new())
+        # BUG (deep-scan-5): the `let` branch rejects shadowing but the
+        # `for` branch never checked — a loop variable could silently
+        # shadow an outer binding (SPEC §4: no shadowing).
+        if lookup_exists(env, s.name) {
+            cerr(s.line, "cannot shadow outer variable with the loop variable: " + s.name)
+        }
+        env.get(env.len() - 1).set(s.name, Binding {
+            t: elem, is_mut: false, moved: false
+        })
+        check_stmts(ctx, env, cur, f, s.body, true)
+        env.pop()
+        # No restore_moved — moves done in the body propagate.
+    } else if s.kind == "return" {
+        if f.ret == "void" {
+            if s.value != -1 {
+                cerr(s.line, "void function cannot return a value")
+            }
+        } else {
+            if s.value == -1 {
+                cerr(s.line, "function returning " + f.ret + " must return a value")
+            }
+            let vt: str = check_expr(ctx, env, cur, s.value, f.ret)
+            if vt != f.ret && vt != "never" {
+                cerr(s.line, "return type mismatch: expected " + f.ret + ", got " + vt)
+            }
+        }
+    } else if s.kind == "break" {
+        if !in_loop {
+            cerr(s.line, "break only allowed inside a loop")
+        }
+    } else if s.kind == "continue" {
+        if !in_loop {
+            cerr(s.line, "continue only allowed inside a loop")
+        }
+    } else if s.kind == "expr" {
+        check_expr(ctx, env, cur, s.e, "")
+    } else if s.kind == "asm" {
+        # Stage 27 (v0.50.0-alpha): inline-assembly statement.
+        check_asm(ctx, env, cur, s)
+    } else {
+        cerr(s.line, "unknown statement: " + s.kind)
+    }
+}
+
+# Stage 27 (v0.50.0-alpha): asm! checker (self-hosted mirror of the
+# boot checker). Validates:
+#   * Template {N} placeholders reference an existing operand.
+#   * `in` operands are primitive (int/float/bool).
+#   * `out`/`inout`/`late_out` operands are mutable primitive lvalues.
+#   * `pure` requires at least one output; `noreturn` forbids outputs.
+#   * Constraint names: bare register classes (reg/mem/imm) and the
+#     specific-register string form ("eax"/"a"/...).
+# On success the operand's HLS type is annotated on the corresponding
+# ExprN.t so the codegen can emit the right C type in the GCC extended
+# asm operand list.
+fn check_asm(ctx: Ctx, env: list[map[str, Binding]], cur: str, s: StmtN) -> void {
+    let template: str = s.asm_template
+    let operands: list[AsmOperand] = s.asm_operands
+    let options: list[str] = s.asm_options
+    let n_ops: int = operands.len()
+    # 1) Template {N} placeholder validation.
+    let mut i: int = 0
+    while i < template.len() {
+        let c: int = template.byte_at(i)
+        if c == 123 {
+            # `{` — could be `{{` (literal) or `{N}` (placeholder).
+            if i + 1 < template.len() && template.byte_at(i + 1) == 123 {
+                i = i + 2
+            } else {
+                # find the matching `}`
+                let mut j: int = i + 1
+                while j < template.len() && template.byte_at(j) != 125 {
+                    j = j + 1
+                }
+                if j >= template.len() {
+                    cerr(s.line, "asm! template has unterminated '{' (no matching '}'): " + template)
+                }
+                let body: str = template.slice(i + 1, j)
+                let n: int = parse_placeholder_int(ctx, body, s.line)
+                if n < 0 || n >= n_ops {
+                    cerr(s.line, "asm! template placeholder {" + body + "} is out of range (have " + n_ops.to_str() + " operand(s))")
+                }
+                i = j + 1
+            }
+        } else if c == 125 {
+            # `}` — must be `}}` (literal).
+            if i + 1 < template.len() && template.byte_at(i + 1) == 125 {
+                i = i + 2
+            } else {
+                cerr(s.line, "asm! template has lone '}' (use '}}' for a literal '}'): " + template)
+            }
+        } else {
+            i = i + 1
+        }
+    }
+    # 2) Per-operand validation.
+    let mut has_output: bool = false
+    let mut k: int = 0
+    while k < operands.len() {
+        let op: AsmOperand = operands.get(k)
+        let d: str = op.dir
+        if d != "in" && d != "out" && d != "inout" && d != "late_out" {
+            cerr(op.line, "asm! operand direction '" + d + "' is unknown")
+        }
+        if d != "in" {
+            has_output = true
+        }
+        # Constraint validation. The codegen does the final translation;
+        # the checker rejects unknown bare register classes.
+        let c: str = op.constraint
+        if !op.is_constraint_str {
+            if c != "reg" && c != "mem" && c != "imm" {
+                cerr(op.line, "asm! constraint '" + c + "' is unknown (bare constraints: reg, mem, imm; for a specific register use a string like \"eax\")")
+            }
+            # Stage 27 perfection (v0.50.2-alpha) deep-scan-17:
+            # `imm` is an immediate-constant constraint — it cannot be
+            # used as an output (you can't write to a constant). Reject
+            # `imm` on out/inout/late_out at check time so the user
+            # gets a clear HLS error instead of an opaque GCC error.
+            if c == "imm" && d != "in" {
+                cerr(op.line, "asm! constraint 'imm' cannot be used with direction '" + d + "' — an immediate is a compile-time constant and cannot be written to")
+            }
+        } else {
+            # Stage 27 perfection (v0.50.2-alpha) deep-scan-17:
+            # String-form constraint (a register name like "eax" or a
+            # GCC constraint letter like "a"). Validate against an
+            # allowlist of known x86-64 register names + GCC single-
+            # letter constraints; reject anything else with a clear
+            # HLS error (otherwise the malformed constraint silently
+            # reaches GCC, which produces an opaque C compile error
+            # with no source-line attribution).
+            #
+            # The codegen's translate_asm_constraint is case-sensitive
+            # (only lowercase register names are translated to GCC
+            # constraint letters; unknown forms pass through verbatim).
+            # So we validate `c` AS-IS, without lowercasing — this
+            # matches the codegen's behaviour and rejects typos like
+            # "EAX" (which would silently pass through to GCC and
+            # produce a malformed constraint).
+            #
+            # If the user already prefixed the constraint with `=` or
+            # `+`, strip the prefix before checking (the codegen has
+            # special-case logic to skip re-adding the prefix when one
+            # is already present). `&` is the late-clobber marker.
+            let mut body: str = c
+            let mut prefix_ch: str = ""
+            if c.len() >= 1 && (c.byte_at(0) == 61 || c.byte_at(0) == 43) {
+                prefix_ch = c.slice(0, 1)
+                body = c.slice(1, c.len())
+                if body.len() >= 1 && body.byte_at(0) == 38 {
+                    # '&' (38) — late-clobber marker, strip for the body check.
+                    body = body.slice(1, body.len())
+                }
+            }
+            if !is_known_asm_constraint(body) {
+                cerr(op.line, "asm! constraint '" + c + "' is not a recognised x86-64 register name or GCC constraint letter (known: eax/rax/ebx/rbx/ecx/rcx/edx/rdx/esi/rsi/edi/rdi, or single-letter GCC constraints a/b/c/d/D/S/q/r/A)")
+            }
+            # Direction-vs-prefix consistency: `in("=r") x` is wrong
+            # (`=` means write-only output). `in("+r") x` is also wrong.
+            if d == "in" && (prefix_ch == "=" || prefix_ch == "+") {
+                cerr(op.line, "asm! constraint '" + c + "' has a direction prefix '" + prefix_ch + "' but is used with `in` (input operands have no prefix — drop the '" + prefix_ch + "')")
+            }
+            if d == "out" && prefix_ch == "+" {
+                cerr(op.line, "asm! constraint '" + c + "' has prefix '+' (read-write) but is used with `out` (write-only) — use `inout` if you want read-write")
+            }
+        }
+        if d == "in" {
+            # `in` operands: any primitive-typed expression.
+            let vt: str = check_expr(ctx, env, cur, op.expr_idx, "")
+            if vt != "int" && vt != "float" && vt != "bool" {
+                cerr(op.line, "asm! `in` operand must be a primitive (int/float/bool), got " + vt)
+            }
+        } else {
+            # out/inout/late_out — must be a mutable lvalue.
+            let ek: str = ctx.exprs[op.expr_idx].kind
+            if ek != "ident" && ek != "field" && ek != "index" {
+                cerr(op.line, "asm! " + d + " operand must be an lvalue (variable/field/index), got " + ek)
+            }
+            let mut root: int = op.expr_idx
+            while ctx.exprs[root].kind == "field" || ctx.exprs[root].kind == "index" {
+                root = ctx.exprs[root].left
+            }
+            let b: Binding = lookup_binding(env, ctx.exprs[root].name)
+            if b.t == "" {
+                cerr(op.line, "variable does not exist: " + ctx.exprs[root].name)
+            }
+            # `out(reg) x` writes to x — if x is an ident, x must be mut.
+            # (field/index assignments mutate through a reference, no
+            # mut needed — mirrors check_assign's semantics.)
+            if ctx.exprs[op.expr_idx].kind == "ident" && !b.is_mut {
+                cerr(op.line, "asm! " + d + " operand must be a `mut` binding (cannot write to immutable variable " + ctx.exprs[root].name + ")")
+            }
+            if d == "inout" {
+                if b.moved {
+                    cerr(op.line, "asm! inout operand uses a moved value: " + ctx.exprs[root].name)
+                }
+            }
+            let tt: str = check_lvalue(ctx, env, cur, op.expr_idx)
+            if tt != "int" && tt != "float" && tt != "bool" {
+                cerr(op.line, "asm! " + d + " operand must be a primitive (int/float/bool), got " + tt)
+            }
+        }
+        k = k + 1
+    }
+    # 3) Option validation.
+    # Stage 27 perfection (v0.50.2-alpha) deep-scan-17: reject
+    # duplicate option names — the asm silently accepts duplicates,
+    # which is a foot-gun (a user who fat-fingers `options(nomem,
+    # nomem)` gets no signal that they probably meant `options(nomem,
+    # preserves_flags)`).
+    let mut m: int = 0
+    while m < options.len() {
+        let opt: str = options.get(m)
+        if opt != "pure" && opt != "nomem" && opt != "noreturn"
+        && opt != "preserves_flags" && opt != "nostack"
+        && opt != "attsyntax" {
+            cerr(s.line, "unknown asm! option '" + opt + "' (known: pure, nomem, noreturn, preserves_flags, nostack, attsyntax)")
+        }
+        # Check for duplicates: scan the rest of the list for the same option.
+        let mut m2: int = m + 1
+        while m2 < options.len() {
+            if options.get(m2) == opt {
+                cerr(s.line, "asm! option '" + opt + "' appears more than once in the options list (duplicates are a no-op but usually indicate a typo)")
+            }
+            m2 = m2 + 1
+        }
+        m = m + 1
+    }
+    if list_contains_str(options, "pure") && list_contains_str(options, "noreturn") {
+        cerr(s.line, "asm! options `pure` and `noreturn` are contradictory — `pure` says the asm may be elided if its outputs are unused, but `noreturn` says it doesn't fall through (eliding it would silently turn a noreturn into a return)")
+    }
+    # Stage 27 perfection (v0.50.2-alpha) deep-scan-17:
+    # `pure` without `nomem` is contradictory — `pure` says no side
+    # effects, but the default `"memory"` clobber says it may read/
+    # write memory. Rust's `asm!` requires `pure` to be paired with
+    # `nomem`; we follow the same rule for soundness.
+    if list_contains_str(options, "pure") && !list_contains_str(options, "nomem") {
+        cerr(s.line, "asm! with `options(pure)` requires `nomem` too — a pure asm must not have memory side effects (the default \"memory\" clobber would contradict `pure`)")
+    }
+    if list_contains_str(options, "pure") && !has_output {
+        cerr(s.line, "asm! with `options(pure)` requires at least one output operand (a pure asm with no outputs is dead code — gcc would legitimately delete it)")
+    }
+    if list_contains_str(options, "noreturn") && has_output {
+        cerr(s.line, "asm! with `options(noreturn)` cannot have output operands (the asm does not fall through, so the outputs would never be observed)")
+    }
+}
+
+# is_known_asm_constraint: returns true iff `body` is a recognised
+# x86-64 register name or GCC single-letter constraint that the
+# codegen can lower. Used by check_asm's string-form constraint
+# validation (deep-scan-17). Keeping the allowlist here (next to
+# the checker) rather than in the codegen ensures the checker and
+# the codegen agree on what's valid.
+fn is_known_asm_constraint(body: str) -> bool {
+    # GCC single-letter constraints (x86-64).
+    if body == "a" || body == "b" || body == "c" || body == "d" {
+        return true
+    }
+    if body == "D" || body == "S" || body == "q" || body == "r" {
+        return true
+    }
+    if body == "f" || body == "t" || body == "u" || body == "y" || body == "x" {
+        return true
+    }
+    if body == "A" || body == "Q" || body == "R" || body == "m" || body == "i" {
+        return true
+    }
+    if body == "n" || body == "F" || body == "I" || body == "J" || body == "K" {
+        return true
+    }
+    if body == "L" || body == "M" || body == "N" || body == "O" || body == "P" {
+        return true
+    }
+    if body == "g" || body == "X" || body == "p" || body == "v" || body == "z" {
+        return true
+    }
+    # x86-64 register names (the codegen's translate_asm_constraint
+    # maps these to GCC constraint letters; see that function for the
+    # full table). r8-r15 are NOT mapped by the codegen but GCC accepts
+    # them via the `q`/`r` constraint letters, so we allow the user to
+    # specify them by name for clarity.
+    if body == "eax" || body == "rax" {
+        return true
+    }
+    if body == "ebx" || body == "rbx" {
+        return true
+    }
+    if body == "ecx" || body == "rcx" {
+        return true
+    }
+    if body == "edx" || body == "rdx" {
+        return true
+    }
+    if body == "esi" || body == "rsi" {
+        return true
+    }
+    if body == "edi" || body == "rdi" {
+        return true
+    }
+    if body == "rbp" || body == "rsp" {
+        return true
+    }
+    if body == "al" || body == "bl" || body == "cl" || body == "dl" {
+        return true
+    }
+    if body == "ah" || body == "bh" || body == "ch" || body == "dh" {
+        return true
+    }
+    if body == "ax" || body == "bx" || body == "cx" || body == "dx" {
+        return true
+    }
+    if body == "si" || body == "di" || body == "bp" || body == "sp" {
+        return true
+    }
+    if body == "r8" || body == "r9" || body == "r10" || body == "r11" {
+        return true
+    }
+    if body == "r12" || body == "r13" || body == "r14" || body == "r15" {
+        return true
+    }
+    return false
+}
+
+# parse_placeholder_int: parse a non-negative integer from a string
+# (an asm! template placeholder body, like "0" from "{0}").
+# Returns -1 on parse failure (caller reports a clear error).
+fn parse_placeholder_int(ctx: Ctx, s: str, line: int) -> int {
+    if s.len() == 0 {
+        return -1
+    }
+    # Stage 27 perfection (v0.50.3-alpha) deep-scan-18: BUG-07 fix.
+    # A pathological placeholder body like "{12345678901234567890}"
+    # (20+ digits) would overflow int64 during accumulation
+    # (v = v * 10 + ...) and crash the self-hosted checker with a
+    # raw i64_mul panic — instead of the intended "placeholder out
+    # of range" error. Cap the loop at 18 digits (the maximum
+    # number of digits in a non-negative int64 is 19, but any
+    # program with > 10^18 asm! operands is absurd — 18 digits is
+    # safe and produces a clean error for the malicious input).
+    # Any reasonable program has fewer than a million operands.
+    if s.len() > 18 {
+        return -1
+    }
+    let mut v: int = 0
+    let mut i: int = 0
+    while i < s.len() {
+        let c: int = s.byte_at(i)
+        if c < 48 || c > 57 {
+            return -1
+        }
+        v = v * 10 + (c - 48)
+        i = i + 1
+    }
+    return v
+}
+
+# list_contains_str: linear membership test on a list[str]. Used by
+# the asm! checker for the options list (small enough that the linear
+# scan is fine).
+fn list_contains_str(xs: list[str], v: str) -> bool {
+    let mut i: int = 0
+    while i < xs.len() {
+        if xs.get(i) == v {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn check_assign(ctx: Ctx, env: list[map[str, Binding]], cur: str, s: StmtN) -> void {
+    let tgt: int = s.target
+    let mut root: int = tgt
+    while ctx.exprs[root].kind == "field" || ctx.exprs[root].kind == "index" {
+        root = ctx.exprs[root].left
+    }
+    let b: Binding = lookup_binding(env, ctx.exprs[root].name)
+    if b.t == "" {
+        cerr(s.line, "variable does not exist: " + ctx.exprs[root].name)
+    }
+    # Stage 8-alpha: use-after-move check on the LHS root.
+    # Whole-binding assignment (`x = ...`) on a `let mut` binding is allowed
+    # and revives the binding; field/index assignment requires the binding
+    # to be unmoved (because reading x.field reads x).
+    if b.moved {
+        if ctx.exprs[tgt].kind == "ident" {
+            if !b.is_mut {
+                cerr(s.line, "cannot reassign immutable variable: " + ctx.exprs[root].name)
+            }
+            # otherwise OK — will be revived below
+        } else {
+            cerr(s.line, "use of moved value: " + ctx.exprs[root].name)
+        }
+    } else {
+        if ctx.exprs[tgt].kind == "ident" && !b.is_mut {
+            cerr(s.line, "cannot reassign immutable variable: " + ctx.exprs[root].name)
+        }
+    }
+    let tt: str = check_lvalue(ctx, env, cur, tgt)
+    let vt: str = check_expr(ctx, env, cur, s.value, tt)
+    if vt == "never" {
+        return
+    }
+    if vt != tt {
+        cerr(s.line, "type mismatch on assignment: expected " + tt + ", got " + vt)
+    }
+    # Stage 8-alpha: revive the binding on whole-binding assignment.
+    if ctx.exprs[tgt].kind == "ident" {
+        let _ok: bool = revive_binding(env, ctx.exprs[root].name)
+    }
+}
+
+fn check_lvalue(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int) -> str {
+    if ctx.exprs[e].kind == "ident" {
+        # Stage 8-beta: annotate the lvalue's type so the codegen can
+        # emit release/retain for assignments by static type.
+        ctx.exprs[e].t = lookup_binding(env, ctx.exprs[e].name).t
+        return ctx.exprs[e].t
+    }
+    if ctx.exprs[e].kind == "field" {
+        let bt: str = check_expr(ctx, env, cur, ctx.exprs[e].left, "")
+        let st: StructInfo = resolve_struct(ctx, bt)
+        if st.name == "" {
+            cerr(ctx.exprs[e].line, "cannot access field on type " + bt)
+        }
+        let mut i: int = 0
+        while i < st.fields.len() {
+            if st.fields.get(i) == ctx.exprs[e].name {
+                # If the struct is generic, instantiate the field type.
+                # Stage 8-beta: annotate the lvalue's type for codegen.
+                let mut ft: str = st.ftypes.get(i)
+                if st.typeparams.len() > 0 {
+                    let targs: list[str] = type_args(bt)
+                    ft = instantiate_type(st.ftypes.get(i), st.typeparams, targs)
+                }
+                ctx.exprs[e].t = ft
+                return ft
+            }
+            i = i + 1
+        }
+        cerr(ctx.exprs[e].line, "struct " + st.name + " has no field " + ctx.exprs[e].name)
+    }
+    if ctx.exprs[e].kind == "index" {
+        let tt: str = check_expr(ctx, env, cur, ctx.exprs[e].left, "")
+        if !is_list_t(tt) {
+            cerr(ctx.exprs[e].line, "cannot use index on type " + tt)
+        }
+        let it: str = check_expr(ctx, env, cur, ctx.exprs[e].right, "")
+        if it != "int" {
+            cerr(ctx.exprs[e].line, "index must be int, got " + it)
+        }
+        let et: str = list_elem_t(tt)
+        ctx.exprs[e].t = et
+        return et
+    }
+    cerr(ctx.exprs[e].line, "invalid lvalue")
+    return ""
+}
+
+fn check_expr(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, expected: str) -> str {
+    let mut k: str = ctx.exprs[e].kind
+    if k == "int" {
+        if ctx.exprs[e].op == "big" {
+            cerr(ctx.exprs[e].line, "integer literal too large (exceeds int64)")
+        }
+        ctx.exprs[e].t = "int"
+    } else if k == "float" {
+        ctx.exprs[e].t = "float"
+    } else if k == "bool" {
+        ctx.exprs[e].t = "bool"
+    } else if k == "str" {
+        ctx.exprs[e].t = "str"
+    } else if k == "ident" {
+        let b: Binding = lookup_binding(env, ctx.exprs[e].name)
+        if b.t != "" {
+            # Stage 8-alpha: use-after-move check
+            if b.moved {
+                cerr(ctx.exprs[e].line, "use of moved value: " + ctx.exprs[e].name)
+            }
+            ctx.exprs[e].t = b.t
+        } else if ctx.enums.has(ctx.exprs[e].name) {
+            cerr(ctx.exprs[e].line, "enum name '" + ctx.exprs[e].name + "' cannot be used as a value")
+        } else if ctx.structs.has(ctx.exprs[e].name) {
+            cerr(ctx.exprs[e].line, "struct name '" + ctx.exprs[e].name + "' cannot be used as a value")
+        } else {
+            cerr(ctx.exprs[e].line, "variable does not exist: " + ctx.exprs[e].name)
+        }
+    } else if k == "bin" {
+        ctx.exprs[e].t = check_bin(ctx, env, cur, e)
+    } else if k == "un" {
+        let vt: str = check_expr(ctx, env, cur, ctx.exprs[e].left, "")
+        if ctx.exprs[e].op == "!" {
+            if vt != "bool" {
+                cerr(ctx.exprs[e].line, "operator ! expects bool, got " + vt)
+            }
+            ctx.exprs[e].t = "bool"
+        } else {
+            # Stage 43 deep-scan fix: propagate `never` for unary minus
+            # (e.g. `-panic("...")` should type-check as `never`).
+            if vt == "never" {
+                ctx.exprs[e].t = "never"
+            } else {
+                if vt != "int" && vt != "float" {
+                    cerr(ctx.exprs[e].line, "operator - expects int/float, got " + vt)
+                }
+                ctx.exprs[e].t = vt
+            }
+        }
+    } else if k == "index" {
+        let tt: str = check_expr(ctx, env, cur, ctx.exprs[e].left, "")
+        # Stage 27 perfection (v0.50.3-alpha) deep-scan-18: BUG-06 fix.
+        # Propagate `never` instead of erroring (bottom-type rule).
+        if tt == "never" {
+            ctx.exprs[e].t = "never"
+            return "never"
+        }
+        if !is_list_t(tt) {
+            cerr(ctx.exprs[e].line, "cannot use index on type " + tt)
+        }
+        let it: str = check_expr(ctx, env, cur, ctx.exprs[e].right, "")
+        if it != "int" {
+            cerr(ctx.exprs[e].line, "index must be int, got " + it)
+        }
+        ctx.exprs[e].t = list_elem_t(tt)
+    } else if k == "field" {
+        # Disambiguate: if target is `ident` matching an enum name (and no
+        # variable with that name), this is an enum variant with no payload.
+        if ctx.exprs[ctx.exprs[e].left].kind == "ident" && ctx.enums.has(ctx.exprs[ctx.exprs[e].left].name) && !lookup_exists(env, ctx.exprs[ctx.exprs[e].left].name) {
+            check_enum_variant(ctx, env, cur, e, expected, false)
+        } else {
+            let tt: str = check_expr(ctx, env, cur, ctx.exprs[e].left, "")
+            # Stage 27 perfection (v0.50.3-alpha) deep-scan-18: BUG-06 fix.
+            # Propagate `never` instead of erroring (bottom-type rule).
+            if tt == "never" {
+                ctx.exprs[e].t = "never"
+                return "never"
+            }
+            let st: StructInfo = resolve_struct(ctx, tt)
+            if st.name == "" {
+                cerr(ctx.exprs[e].line, "cannot access field on type " + tt)
+            }
+            let mut i: int = 0
+            while i < st.fields.len() {
+                if st.fields.get(i) == ctx.exprs[e].name {
+                    if st.typeparams.len() > 0 {
+                        let targs: list[str] = type_args(tt)
+                        ctx.exprs[e].t = instantiate_type(st.ftypes.get(i), st.typeparams, targs)
+                    } else {
+                        ctx.exprs[e].t = st.ftypes.get(i)
+                    }
+                    break
+                }
+                i = i + 1
+            }
+            if ctx.exprs[e].t == "" {
+                cerr(ctx.exprs[e].line, "struct " + st.name + " has no field " + ctx.exprs[e].name)
+            }
+        }
+    } else if k == "fieldcall" {
+        # Disambiguate: enum variant with payload OR method call.
+        if ctx.exprs[ctx.exprs[e].left].kind == "ident" && ctx.enums.has(ctx.exprs[ctx.exprs[e].left].name) && !lookup_exists(env, ctx.exprs[ctx.exprs[e].left].name) {
+            check_enum_variant(ctx, env, cur, e, expected, true)
+        } else {
+            # Rewrite as a method call.
+            ctx.exprs[e].kind = "method"
+            ctx.exprs[e].t = check_method(ctx, env, cur, e)
+        }
+    } else if k == "method" {
+        ctx.exprs[e].t = check_method(ctx, env, cur, e)
+    } else if k == "call" {
+        ctx.exprs[e].t = check_call(ctx, env, cur, e, expected)
+    } else if k == "listlit" {
+        ctx.exprs[e].t = check_listlit(ctx, env, cur, e, expected)
+    } else if k == "structlit" {
+        ctx.exprs[e].t = check_structlit(ctx, env, cur, e, expected)
+    } else if k == "match" {
+        ctx.exprs[e].t = check_match(ctx, env, cur, e, expected)
+    } else if k == "qmark" {
+        ctx.exprs[e].t = check_qmark(ctx, env, cur, e, expected)
+    } else if k == "enumlit" {
+        # Already rewritten during a previous visit.
+        # Re-derive the type from the stored enum_name + variant.
+        let en: EnumInfo = ctx.enums.get_or(ctx.exprs[e].enum_name, dummy_enum())
+        if en.name == "" {
+            cerr(ctx.exprs[e].line, "enum does not exist: " + ctx.exprs[e].enum_name)
+        }
+        # We need the contextual type to recover the instantiation. Try
+        # `expected` first.
+        if expected != "" && type_base(expected) == en.name {
+            ctx.exprs[e].t = expected
+        } else {
+            ctx.exprs[e].t = ctx.exprs[e].enum_name
+        }
+    } else {
+        cerr(ctx.exprs[e].line, "unknown expression: " + k)
+    }
+    return ctx.exprs[e].t
+}
+
+fn check_bin(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int) -> str {
+    let mut line: int = ctx.exprs[e].line
+    let lt: str = check_expr(ctx, env, cur, ctx.exprs[e].left, "")
+    let rt: str = check_expr(ctx, env, cur, ctx.exprs[e].right, "")
+    # Stage 27 perfection (v0.50.3-alpha) deep-scan-18: BUG-06 fix.
+    # `never` is the bottom type — it should be compatible with every
+    # type (the rest of the expression is unreachable, e.g.
+    # `panic("...") + 1` is dead code after the panic). The previous
+    # code rejected `never` operands — a false positive that broke
+    # dead-code patterns. The fix: propagate `never` instead of
+    # erroring. Mirrors the boot checker fix in boot/checker.py.
+    if lt == "never" || rt == "never" {
+        return "never"
+    }
+    let op: str = ctx.exprs[e].op
+    if op == "||" || op == "&&" {
+        if lt != "bool" || rt != "bool" {
+            cerr(line, "operator " + op + " expects bool, got " + lt + " and " + rt)
+        }
+        return "bool"
+    }
+    if op == "==" || op == "!=" {
+        if lt != rt || (lt != "int" && lt != "float" && lt != "bool" && lt != "str") {
+            cerr(line, "cannot compare == between " + lt + " and " + rt)
+        }
+        return "bool"
+    }
+    if op == "<" || op == "<=" || op == ">" || op == ">=" {
+        if lt != rt || (lt != "int" && lt != "float" && lt != "str") {
+            cerr(line, "cannot compare ordering between " + lt + " and " + rt)
+        }
+        return "bool"
+    }
+    if op == "+" {
+        if lt == "int" && rt == "int" {
+            return "int"
+        }
+        if lt == "float" && rt == "float" {
+            return "float"
+        }
+        if lt == "str" && rt == "str" {
+            return "str"
+        }
+        cerr(line, "operator + does not support " + lt + " and " + rt)
+    }
+    if op == "-" || op == "*" || op == "/" || op == "%" {
+        if lt == "int" && rt == "int" {
+            return "int"
+        }
+        if lt == "float" && rt == "float" {
+            return "float"
+        }
+        cerr(line, "operator " + op + " does not support " + lt + " and " + rt)
+    }
+    cerr(line, "unknown operator: " + op)
+    return ""
+}
+
+fn check_listlit(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, expected: str) -> str {
+    let mut elem: str = ""
+    if is_list_t(expected) {
+        elem = list_elem_t(expected)
+    }
+    if elem == "" {
+        if ctx.exprs[e].args.len() == 0 {
+            cerr(ctx.exprs[e].line, "empty list literal requires a type in the surrounding context")
+        }
+        elem = check_expr(ctx, env, cur, ctx.exprs[e].args.get(0), "")
+        if elem == "void" || elem == "never" {
+            cerr(ctx.exprs[e].line, "list element cannot have type " + elem)
+        }
+    }
+    let mut i: int = 0
+    while i < ctx.exprs[e].args.len() {
+        let vt: str = check_expr(ctx, env, cur, ctx.exprs[e].args.get(i), elem)
+        if vt != elem {
+            cerr(ctx.exprs[e].line, "list element mismatch: expected " + elem + ", got " + vt)
+        }
+        i = i + 1
+    }
+    return "list[" + elem + "]"
+}
+
+fn check_structlit(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, expected: str) -> str {
+    let name: str = ctx.exprs[e].name
+    let mut line: int = ctx.exprs[e].line
+    if !ctx.structs.has(name) {
+        cerr(line, "struct does not exist: " + name)
+    }
+    let st: StructInfo = ctx.structs.get_or(name, dummy_struct())
+    let typeparams: list[str] = st.typeparams
+    # Build the type_map for generic instantiation (if applicable).
+    let targs: list[str] = []
+    let mut i: int = 0
+    while i < typeparams.len() {
+        targs.push("")
+        i = i + 1
+    }
+    if typeparams.len() > 0 && expected != "" && type_base(expected) == name {
+        let eargs: list[str] = type_args(expected)
+        if eargs.len() == typeparams.len() {
+            let mut j: int = 0
+            while j < eargs.len() {
+                targs.set(j, eargs.get(j))
+                j = j + 1
+            }
+        }
+    }
+    # Validate field names match declared order (and required fields present).
+    let provided: list[str] = ctx.exprs[e].ffields
+    let declared: list[str] = st.fields
+    let mut pi: int = 0
+    while pi < provided.len() {
+        if pi >= declared.len() || declared.get(pi) != provided.get(pi) {
+            let mut want: str = "<end>"
+            if pi < declared.len() {
+                want = declared.get(pi)
+            }
+            cerr(line, "struct literal field order mismatch at position " + pi.to_str() + ": expected '" + want + "', got '" + provided.get(pi) + "'")
+        }
+        pi = pi + 1
+    }
+    if provided.len() > declared.len() {
+        cerr(line, "struct literal " + name + " has too many fields")
+    }
+    # Required (non-defaulted) fields must be present.
+    let mut di: int = 0
+    while di < declared.len() {
+        let has_default: bool = st.fdefaults.get(di) != -1
+        let is_required: bool = !has_default
+        let is_provided: bool = di < provided.len()
+        if is_required && !is_provided {
+            cerr(line, "struct literal missing required field '" + declared.get(di) + "'")
+        }
+        di = di + 1
+    }
+    # Type-check each provided field against the instantiated declared type.
+    let mut fi: int = 0
+    while fi < provided.len() {
+        let decl_ftype: str = st.ftypes.get(fi)
+        let mut inst_ftype: str = ""
+        if typeparams.len() > 0 {
+            inst_ftype = instantiate_type(decl_ftype, typeparams, targs)
+        } else {
+            inst_ftype = decl_ftype
+        }
+        let vt: str = check_expr(ctx, env, cur, ctx.exprs[e].args.get(fi), inst_ftype)
+        if vt != inst_ftype {
+            cerr(line, "field type " + st.fields.get(fi) + " mismatch: expected " + inst_ftype + ", got " + vt)
+        }
+        # If generic, try to infer type args from provided field values.
+        if typeparams.len() > 0 {
+            unify_into(ctx, decl_ftype, vt, typeparams, targs)
+        }
+        fi = fi + 1
+    }
+    # If generic and any type arg is still unbound, error.
+    if typeparams.len() > 0 {
+        let mut ti: int = 0
+        while ti < typeparams.len() {
+            if targs.get(ti) == "" {
+                cerr(line, "cannot infer type argument for struct " + name + "; provide a contextual type")
+            }
+            ti = ti + 1
+        }
+        let inst_t: str = name + "[" + join(targs, ", ") + "]"
+        # Record this struct instantiation for codegen — only if all type
+        # args are concrete (not type params of an enclosing generic).
+        if type_is_concrete(ctx, inst_t) && !list_has(ctx.struct_insts, inst_t) {
+            ctx.struct_insts.push(inst_t)
+        }
+        return inst_t
+    }
+    return name
+}
+
+# type_mentions_typeparam: true iff any type param name appears in the
+# type string as a WHOLE identifier (so 'T' matches "list[T]" and
+# "map[str, T]" but not "list[str]"). Deep-scan-24: used to decide
+# whether a generic fn's parameter type can serve as the contextual
+# hint for its argument (mirrors the boot checker's
+# _type_mentions_typeparam).
+fn type_mentions_typeparam(pt: str, tps: list[str]) -> bool {
+    let mut cur: str = ""
+    let mut i: int = 0
+    while i < pt.len() {
+        let c: int = pt.byte_at(i)
+        let is_id: bool = (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57) || c == 95
+        if is_id {
+            cur = cur + chr(c)
+        } else {
+            if list_contains_str(tps, cur) {
+                return true
+            }
+            cur = ""
+        }
+        i = i + 1
+    }
+    return list_contains_str(tps, cur)
+}
+
+fn check_call(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, expected: str) -> str {
+    let name: str = ctx.exprs[e].name
+    let mut line: int = ctx.exprs[e].line
+    if is_builtin_fn(name) {
+        ctx.exprs[e].muser = false
+        ctx.exprs[e].mkey = name
+        return check_builtin_call(ctx, env, cur, e, name, expected)
+    }
+    if ctx.fns.has(name) {
+        let f: FnInfo = ctx.fns.get_or(name, dummy_fn())
+        if f.is_method {
+            cerr(line, "method must be called through an object: " + name)
+        }
+        ctx.exprs[e].muser = true
+        ctx.exprs[e].mkey = name
+        add_edge(ctx, cur, name)
+        if ctx.exprs[e].args.len() != f.params.len() {
+            cerr(line, "function " + name + " expects " + f.params.len().to_str() + " arguments, got " + ctx.exprs[e].args.len().to_str())
+        }
+        # Generic function: infer type args from argument types.
+        let typeparams: list[str] = f.typeparams
+        let targs: list[str] = []
+        let mut ti: int = 0
+        while ti < typeparams.len() {
+            targs.push("")
+            ti = ti + 1
+        }
+        # BUG-A2 fix: cache first-pass types per argument so we don't re-run
+        # check_expr on the same argument in the second pass. Calling
+        # check_expr twice would re-execute side effects (drop/take move-
+        # marking) and produce a spurious "use of moved value" error.
+        let first_at: list[str] = []
+        let mut fai: int = 0
+        while fai < ctx.exprs[e].args.len() {
+            first_at.push("")
+            fai = fai + 1
+        }
+        if typeparams.len() > 0 {
+            let mut ai: int = 0
+            while ai < ctx.exprs[e].args.len() {
+                # Deep-scan-24 fix (mirrors the boot checker): pass the
+                # parameter type as the contextual hint when it does not
+                # mention any type parameter — so a concrete `list[int]`
+                # parameter of a generic fn accepts an empty list
+                # literal, consistent with the non-generic path (which
+                # checks every arg against inst_pt). Typeparam-carrying
+                # params still get no hint ("" — the literal alone
+                # cannot resolve them).
+                let mut hint: str = ""
+                if !type_mentions_typeparam(f.ptypes.get(ai), typeparams) {
+                    hint = f.ptypes.get(ai)
+                }
+                let at: str = check_expr(ctx, env, cur, ctx.exprs[e].args.get(ai), hint)
+                first_at.set(ai, at)
+                if at != "never" {
+                    unify_into(ctx, f.ptypes.get(ai), at, typeparams, targs)
+                }
+                ai = ai + 1
+            }
+            let mut ti2: int = 0
+            while ti2 < typeparams.len() {
+                if targs.get(ti2) == "" {
+                    # BUG-013 fix: name the unbound type-param (e.g. "T") instead
+                    # of just the function name — so the user knows WHICH type
+                    # param of a multi-param generic is unbound.
+                    cerr(line, "cannot infer type argument '" + typeparams.get(ti2) + "' for " + name + "; provide explicit types")
+                }
+                ti2 = ti2 + 1
+            }
+            # Record this generic function instantiation for codegen.
+            let inst_str: str = name + "|" + join(targs, ",")
+            if !list_has(ctx.fn_insts, inst_str) {
+                ctx.fn_insts.push(inst_str)
+            }
+            # Store the inferred concrete type args on the call node so the
+            # codegen can use the mangled function name.
+            ctx.exprs[e].inst_targs = targs
+            # Also set mkey to the mangled name so gen_call uses the right name.
+            ctx.exprs[e].mkey = c_mangled_fn_name(name, typeparams, targs)
+        } else {
+            ctx.exprs[e].mkey = name
+        }
+        # Type-check arguments against instantiated parameter types.
+        let mut i: int = 0
+        while i < ctx.exprs[e].args.len() {
+            let mut inst_pt: str = ""
+            if typeparams.len() > 0 {
+                inst_pt = instantiate_type(f.ptypes.get(i), typeparams, targs)
+            } else {
+                inst_pt = f.ptypes.get(i)
+            }
+            # Reuse the first-pass type whenever it already matches the
+            # instantiated parameter type — avoids re-running check_expr
+            # (which would re-execute side effects like drop/take).
+            let mut at: str = first_at.get(i)
+            if at == "" {
+                at = check_expr(ctx, env, cur, ctx.exprs[e].args.get(i), inst_pt)
+            }
+            if at == "never" {
+                i = i + 1
+                continue
+            }
+            if at != inst_pt {
+                cerr(line, "argument '" + f.params.get(i) + "' of " + name + " expects " + inst_pt + ", got " + at)
+            }
+            i = i + 1
+        }
+        # Stage 17 (v0.28.0-alpha): call-site contract checking — if the
+        # callee declares `requires` and every argument is a literal, the
+        # precondition is constant-evaluated HERE; a provably-false
+        # requires is a compile error at the call site.
+        if f.requires_e >= 0 && ctx.exprs[e].args.len() == f.params.len() {
+            let consts: map[str, int] = map_new()
+            let sconsts: map[str, str] = map_new()
+            if args_const_hlc(ctx, f, e, consts, sconsts) {
+                let verdict: int = const_eval_hlc(ctx, f.requires_e, consts, sconsts)
+                if verdict == 0 {
+                    cerr(line, "contract violation at call site: requires of '" + name + "' evaluates to FALSE for these literal arguments")
+                }
+            }
+        }
+        if typeparams.len() > 0 {
+            return instantiate_type(f.ret, typeparams, targs)
+        }
+        return f.ret
+    }
+    cerr(line, "function does not exist: " + name)
+    return ""
+}
+
+# ============================================================================
+# Stage 16 (v0.27.0-alpha): concurrency checker helpers
+# ============================================================================
+
+# type_is_send — the Send rule set (the Send/Sync equivalent, layered on
+# the Stage 8 ownership system):
+#   - primitives and str: Send
+#   - Chan[T]: Send iff T is Send (channels are the sharing primitive)
+#   - Task[R]: NOT Send (a join handle must stay with its spawner)
+#   - list/map/tainted: Send iff the element type is Send
+#   - struct/enum: Send iff every field/payload type is Send
+# list_append_clone(xs, x) — a NEW list with x appended (keeps the caller's
+# list immutable; used for the coinductive cycle detection in
+# type_is_send / clone_supported).
+fn list_append_clone(xs: list[str], x: str) -> list[str] {
+    let out: list[str] = []
+    let mut i: int = 0
+    while i < xs.len() {
+        out.push(xs.get(i))
+        i = i + 1
+    }
+    out.push(x)
+    return out
+}
+
+# type_is_send(ctx, t, seen) — returns true iff values of type t may cross
+# a task boundary. `seen` carries the types already under inspection
+# (coinductive cycle detection for recursive structs).
+fn type_is_send(ctx: Ctx, t: str, seen: list[str]) -> bool {
+    if list_has(seen, t) {
+        return true
+    }
+    if t == "int" || t == "float" || t == "bool" || t == "str" || t == "void" || t == "never" {
+        return true
+    }
+    if list_has(ctx.cur_typeparams, t) {
+        # Deep-scan-10 soundness fix: an unresolved type parameter is NOT
+        # provably Send (the generic body is never re-checked at the
+        # instantiation; Task is non-Send). Conservative-DENY.
+        return false
+    }
+    let seen2: list[str] = list_append_clone(seen, t)
+    if is_chan_t(t) {
+        return type_is_send(ctx, chan_inner_t(t), seen2)
+    }
+    if is_task_t(t) {
+        return false
+    }
+    # Stage 33: Future[T] is Send iff T is Send (a future IS a channel).
+    if is_future_t(t) {
+        return type_is_send(ctx, future_inner_t(t), seen2)
+    }
+    # Stage 34: Stream[T] is Send iff T is Send.
+    if is_stream_t(t) {
+        return type_is_send(ctx, stream_inner_t(t), seen2)
+    }
+    if is_list_t(t) {
+        return type_is_send(ctx, list_elem_t(t), seen2)
+    }
+    if is_map_t(t) {
+        return type_is_send(ctx, map_val_t(t), seen2)
+    }
+    if is_taint_t(t) {
+        return type_is_send(ctx, taint_inner_t(t), seen2)
+    }
+    let base: str = type_base(t)
+    let args: list[str] = type_args(t)
+    if ctx.structs.has(base) {
+        let st: StructInfo = ctx.structs.get_or(base, dummy_struct())
+        if st.typeparams.len() != args.len() {
+            return false
+        }
+        let mut i: int = 0
+        while i < st.ftypes.len() {
+            let ft: str = instantiate_type(st.ftypes.get(i), st.typeparams, args)
+            if !type_is_send(ctx, ft, seen2) {
+                return false
+            }
+            i = i + 1
+        }
+        return true
+    }
+    if ctx.enums.has(base) {
+        let en: EnumInfo = ctx.enums.get_or(base, dummy_enum())
+        if en.typeparams.len() != args.len() {
+            return false
+        }
+        let mut v: int = 0
+        while v < en.variants.len() {
+            let pays: list[str] = en.payloads.get(v)
+            let mut p: int = 0
+            while p < pays.len() {
+                let pt: str = instantiate_type(pays.get(p), en.typeparams, args)
+                if !type_is_send(ctx, pt, seen2) {
+                    return false
+                }
+                p = p + 1
+            }
+            v = v + 1
+        }
+        return true
+    }
+    return true
+}
+
+# clone_supported — struct-aware clone support (Stage 16). A Chan clones
+# by SHARING (atomic refcount + 1 — that is the point of a channel). A
+# Task[R] join handle cannot be cloned (single-consumer: join() exactly
+# once), and any composite containing a Task is not cloneable either.
+# Mirrors boot/checker.py's Checker.clone_supported.
+fn clone_supported(ctx: Ctx, t: str, seen: list[str]) -> bool {
+    if list_has(seen, t) {
+        return true
+    }
+    if t == "int" || t == "float" || t == "bool" || t == "str" || t == "void" || t == "never" {
+        return true
+    }
+    if is_chan_t(t) {
+        return true
+    }
+    if is_task_t(t) {
+        return false
+    }
+    # Stage 33/34: Future[T] and Stream[T] clone by SHARING (atomic
+    # refcount +1 — same as a channel; both ARE channels under the hood).
+    if is_future_t(t) || is_stream_t(t) {
+        return true
+    }
+    let seen2: list[str] = list_append_clone(seen, t)
+    if is_list_t(t) {
+        return clone_supported(ctx, list_elem_t(t), seen2)
+    }
+    if is_map_t(t) {
+        return clone_supported(ctx, map_val_t(t), seen2)
+    }
+    if is_taint_t(t) {
+        return clone_supported(ctx, taint_inner_t(t), seen2)
+    }
+    let base: str = type_base(t)
+    let args: list[str] = type_args(t)
+    if ctx.structs.has(base) {
+        let st: StructInfo = ctx.structs.get_or(base, dummy_struct())
+        if st.typeparams.len() != args.len() {
+            return false
+        }
+        let mut i: int = 0
+        while i < st.ftypes.len() {
+            let ft: str = instantiate_type(st.ftypes.get(i), st.typeparams, args)
+            if !clone_supported(ctx, ft, seen2) {
+                return false
+            }
+            i = i + 1
+        }
+        return true
+    }
+    if ctx.enums.has(base) {
+        let en: EnumInfo = ctx.enums.get_or(base, dummy_enum())
+        if en.typeparams.len() != args.len() {
+            return false
+        }
+        let mut v: int = 0
+        while v < en.variants.len() {
+            let pays: list[str] = en.payloads.get(v)
+            let mut p: int = 0
+            while p < pays.len() {
+                let pt: str = instantiate_type(pays.get(p), en.typeparams, args)
+                if !clone_supported(ctx, pt, seen2) {
+                    return false
+                }
+                p = p + 1
+            }
+            v = v + 1
+        }
+        return true
+    }
+    return true
+}
+
+# check_spawn_call — validate spawn(f, a1, ..., aN) and rewrite the node.
+# Rules enforced here (the Stage 16 acceptance criteria):
+#   1. The target f must be a non-generic, non-method, non-extern user fn.
+#   2. Every argument type must be Send (Task handles are not Send).
+#   3. Every OWNED argument must be a FRESH expression (a literal, call
+#      result, clone(x), take(x), composite, ...) — a bare variable /
+#      field / index read is a cross-thread sharing error.
+# After checking, the node is rewritten: the fn-name argument is removed
+# and the target key is recorded in mkey (mirroring the Python checker).
+fn check_spawn_call(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int) -> str {
+    let mut line: int = ctx.exprs[e].line
+    let nargs: int = ctx.exprs[e].args.len()
+    if nargs < 1 {
+        cerr(line, "spawn() expects a function name followed by its arguments")
+    }
+    let fn_arg: int = ctx.exprs[e].args.get(0)
+    if ctx.exprs[fn_arg].kind != "ident" {
+        cerr(line, "spawn() argument 1 must be a function name (an identifier)")
+    }
+    let fname: str = ctx.exprs[fn_arg].name
+    if is_builtin_fn(fname) {
+        cerr(line, "spawn() target cannot be a builtin function: " + fname)
+    }
+    if !ctx.fns.has(fname) {
+        cerr(line, "spawn() target function does not exist: " + fname)
+    }
+    let tf: FnInfo = ctx.fns.get_or(fname, dummy_fn())
+    if tf.is_method {
+        cerr(line, "spawn() target cannot be a method: " + fname + " (methods need a self receiver — spawn a free function)")
+    }
+    if tf.typeparams.len() > 0 {
+        cerr(line, "spawn() of generic functions is not supported yet: " + fname + " (wrap it in a non-generic fn)")
+    }
+    if tf.is_extern {
+        cerr(line, "spawn() of extern (FFI) functions is not supported")
+    }
+    let vargs: list[int] = []
+    let mut si: int = 1
+    while si < ctx.exprs[e].args.len() {
+        vargs.push(ctx.exprs[e].args.get(si))
+        si = si + 1
+    }
+    if vargs.len() != tf.params.len() {
+        cerr(line, "spawn() target " + fname + " expects " + tf.params.len().to_str() + " arguments, got " + vargs.len().to_str())
+    }
+    let mut i: int = 0
+    while i < vargs.len() {
+        let aidx: int = vargs.get(i)
+        let pt: str = tf.ptypes.get(i)
+        let at: str = check_expr(ctx, env, cur, aidx, pt)
+        if at != "never" && at != pt {
+            cerr(line, "spawn() argument '" + tf.params.get(i) + "' of " + fname + " expects " + pt + ", got " + at)
+        }
+        # Send rule: Task handles cannot cross a task boundary.
+        if !type_is_send(ctx, pt, []) {
+            cerr(line, "type " + pt + " is not Send: values of this type cannot cross a task boundary (a Task join handle must stay with its spawner)")
+        }
+        # Data-race-freedom rule: a bare binding read (ident / field /
+        # index) of an OWNED value is a cross-thread sharing error —
+        # reject it. This mirrors the Python checker EXACTLY (same three
+        # syntactic forms); every other form is allowed at check time and
+        # hardened at runtime by the boundary deep-copy in gen_spawn_call.
+        if is_owned_type(pt) {
+            let akind: str = ctx.exprs[aidx].kind
+            if akind == "ident" || akind == "field" || akind == "index" {
+                let mut what: str = "a borrowed value"
+                if akind == "ident" {
+                    what = "variable '" + ctx.exprs[aidx].name + "'"
+                }
+                cerr(line, "cannot share " + what + " across tasks: spawn() argument " + (i + 2).to_str() + " reads it directly — pass clone(x) (private copy) or take(x) (ownership transfer). Data-race freedom: no owned value may be simultaneously released by two threads.")
+            }
+        }
+        i = i + 1
+    }
+    add_edge(ctx, cur, "b:spawn")
+    # Deep-scan-20 soundness fix: the spawned function's RETURN value
+    # crosses the task boundary at join() — it must be Send too.
+    # Mirror of the boot/checker.py fix (spawn returning a non-Send
+    # Task[...] smuggled a join handle across the boundary).
+    if !type_is_send(ctx, tf.ret, []) {
+        cerr(line, "spawn() target " + fname + " returns " + tf.ret + ", which is not Send: the result crosses the task boundary at join() (a Task join handle must stay with its spawner)")
+    }
+    # Deep-scan-10 soundness fix: the spawned function IS a callee — its
+    # effects must reach the spawner's computed set (the spawner CAUSES
+    # the task's effects; struct defaults already get synthetic edges for
+    # exactly this reason). Mirror of the boot/checker.py fix.
+    add_edge(ctx, cur, fname)
+    # Rewrite the node: drop the fn-name argument; record the target key
+    # in mop (mkey stays "spawn" so gen_call dispatches to the spawn
+    # codegen path, which reads the target from mop).
+    ctx.exprs[e].args = vargs
+    ctx.exprs[e].mkey = "spawn"
+    ctx.exprs[e].mop = fname
+    return "Task[" + tf.ret + "]"
+}

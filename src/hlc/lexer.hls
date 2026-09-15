@@ -1,0 +1,276 @@
+# ============================================================================
+# hlc/lexer.hls — part of the hlc compiler (split from the original single-file
+# src/hlc.hls). This file is loaded via `import "hlc/lexer.hls"` from src/hlc.hls.
+# Section 2 — LEXER: source text -> token stream.
+# NOTE: content is byte-identical to the original src/hlc.hls line range
+#       846..1114 - module split is purely structural, zero code changes.
+# ============================================================================
+# 2. LEXER
+# ----------------------------------------------------------------------------
+
+fn mk_tok(kind: str, value: str, line: int, col: int) -> Tok {
+    return Tok {
+        kind: kind, value: value, line: line, col: col
+    }
+}
+
+fn lex_err(msg: str, line: int, col: int) -> void {
+    panic("lex error: " + msg + " (line " + line.to_str() + ":" + col.to_str() + ")")
+}
+
+# str_contains_inf: does a float literal text evaluate to infinity?
+# (Deep-scan-10: cheap conservative test - an exponent >= 400 or a
+# mantissa with > 309 significant digits overflows double range.)
+fn str_contains_inf(t: str) -> bool {
+    let epos: int = str_find_ch(t, 101)
+    let mut p: int = epos
+    if p == -1 {
+        p = str_find_ch(t, 69)
+    }
+    if p == -1 {
+        return t.len() > 320
+    }
+    # exponent magnitude
+    let mut q: int = p + 1
+    let mut neg: bool = false
+    if q < t.len() && (t.byte_at(q) == 43 || t.byte_at(q) == 45) {
+        if t.byte_at(q) == 45 {
+            neg = true
+        }
+        q = q + 1
+    }
+    let mut mag: int = 0
+    while q < t.len() {
+        mag = mag * 10 + (t.byte_at(q) - 48)
+        if mag > 100000 {
+            mag = 100000
+        }
+        q = q + 1
+    }
+    if neg {
+        return false
+    }
+    return mag > 308
+}
+
+fn str_find_ch(t: str, ch: int) -> int {
+    let mut i: int = 0
+    while i < t.len() {
+        if t.byte_at(i) == ch {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+# int_lit_over_range: an INT literal string whose value exceeds 2^63
+# exactly (the parser folds `-`+2^63 into int64 min; anything larger has
+# no int64 representation at all).
+fn int_lit_over_range(t: str) -> bool {
+    # Compare digit strings against "9223372036854775808" (2^63).
+    let lim: str = "9223372036854775808"
+    let s: str = t
+    let mut si: int = 0
+    # strip leading zeros
+    while si + 1 < s.len() && s.byte_at(si) == 48 {
+        si = si + 1
+    }
+    let s2: str = s.slice(si, s.len())
+    if s2.len() != lim.len() {
+        return s2.len() > lim.len()
+    }
+    return s2 > lim
+}
+
+fn lex(ctx: Ctx) -> void {
+    let src: str = ctx.src
+    let n: int = src.len()
+    let mut i: int = 0
+    let mut line: int = 1
+    let mut col: int = 1
+    while i < n {
+        let c: int = src.byte_at(i)
+        # whitespace. Deep-scan-10: a lone \r (CR-only files) is a LINE
+        # TERMINATOR (CRLF: the following \n handles it).
+        if c == 32 || c == 9 {
+            col = col + 1
+            i = i + 1
+        } else if c == 13 {
+            if i + 1 < n && src.byte_at(i + 1) == 10 {
+                col = col + 1
+            } else {
+                line = line + 1
+                col = 1
+            }
+            i = i + 1
+        } else if c == 10 {
+            line = line + 1
+            col = 1
+            i = i + 1
+        } else if c == 35 {
+            # Stage 28+29 (v0.45.0-alpha): `#[` introduces an attribute
+            # list (e.g. `#[inline(always)]`, `#[irq_handler]`). `#`
+            # followed by anything else (including end-of-line) is a
+            # line comment as before. The `#` is consumed here as a
+            # sym token; the `[` is left for the normal symbol path so
+            # the parser sees `#` immediately followed by `[`.
+            if i + 1 < n && src.byte_at(i + 1) == 91 {
+                ctx.toks.push(mk_tok("sym", "#", line, col))
+                col = col + 1
+                i = i + 1
+            } else {
+                # comment: # to end of line
+                # BUG-016 fix: track column past the comment, so error messages
+                # on a later token on the same line report the right column.
+                # Deep-scan-20 fix (boot/native parity): stop at `\r` as
+                # well as `\n` — in a CR-only file the boot lexer (fixed
+                # in deep-scan-11) ends the comment at the `\r` and lexes
+                # the rest of the line, while this loop swallowed
+                # everything after the comment (boot/native divergence).
+                while i < n && src.byte_at(i) != 10 && src.byte_at(i) != 13 {
+                    i = i + 1
+                    col = col + 1
+                }
+            }
+        } else if is_ident_start(c) {
+            let mut j: int = i
+            while j < n && is_ident_char(src.byte_at(j)) {
+                j = j + 1
+            }
+            let word: str = src.slice(i, j)
+            if is_keyword(word) {
+                ctx.toks.push(mk_tok("kw", word, line, col))
+            } else {
+                ctx.toks.push(mk_tok("ident", word, line, col))
+            }
+            col = col + (j - i)
+            i = j
+        } else if is_digit(c) {
+            let mut j: int = i
+            while j < n && (is_digit(src.byte_at(j)) || src.byte_at(j) == 95) {
+                j = j + 1
+            }
+            let mut is_f: bool = false
+            if j < n && src.byte_at(j) == 46 && j + 1 < n && is_digit(src.byte_at(j + 1)) {
+                is_f = true
+                j = j + 1
+                while j < n && (is_digit(src.byte_at(j)) || src.byte_at(j) == 95) {
+                    j = j + 1
+                }
+            }
+            # SCAN-C fix: scientific notation. After the integer or
+            # fractional part, accept optional `e`/`E` + optional
+            # `+`/`-` + digits. Mirrors the Stage-0 lexer fix in
+            # boot/lexer.py.
+            if j < n && (src.byte_at(j) == 101 || src.byte_at(j) == 69) {
+                let mut k: int = j + 1
+                if k < n && (src.byte_at(k) == 43 || src.byte_at(k) == 45) {
+                    k = k + 1
+                }
+                if k < n && is_digit(src.byte_at(k)) {
+                    is_f = true
+                    j = k
+                    while j < n && (is_digit(src.byte_at(j)) || src.byte_at(j) == 95) {
+                        j = j + 1
+                    }
+                }
+            }
+            # Deep-scan-10: digits immediately followed by identifier
+            # characters (0x1F, 123abc) are rejected with a clear error
+            # (they used to split into two tokens and confuse the parser).
+            if j < n && is_ident_start(src.byte_at(j)) {
+                lex_err("invalid numeric literal '" + src.slice(i, j + 1)
+                + "' (digits followed by letters - HLS has no hex/adjoined-letter literals)", line, col)
+            }
+            let text: str = filter_us(src.slice(i, j))
+            if is_f {
+                # Deep-scan-10: a float literal that overflows to
+                # infinity (1e400) is rejected (mirrors the Stage-0 fix).
+                if str_contains_inf(text) {
+                    lex_err("float literal overflows to infinity: " + src.slice(i, j), line, col)
+                }
+                ctx.toks.push(mk_tok("float", text, line, col))
+            } else {
+                # Deep-scan-10: int literals out of the lexer range are
+                # rejected (up to 2^63 exactly is allowed through - the
+                # parser folds `-` + 9223372036854775808 into int64 min;
+                # a bare 2^63 is rejected by the checker's literal rule).
+                if int_lit_over_range(text) {
+                    lex_err("integer literal out of int64 range: " + src.slice(i, j), line, col)
+                }
+                ctx.toks.push(mk_tok("int", text, line, col))
+            }
+            col = col + (j - i)
+            i = j
+        } else if c == 34 {
+            # string
+            let ln: int = line
+            let cl: int = col
+            i = i + 1
+            col = col + 1
+            let parts: list[str] = []
+            let mut closed: bool = false
+            while i < n {
+                let ch: int = src.byte_at(i)
+                if ch == 34 {
+                    i = i + 1
+                    col = col + 1
+                    closed = true
+                    break
+                }
+                if ch == 92 {
+                    if i + 1 >= n {
+                        lex_err("unterminated string", ln, cl)
+                    }
+                    # BUG-020 fix: `e` is never reassigned — remove misleading `mut`.
+                    let e: int = src.byte_at(i + 1)
+                    if e == 110 {
+                        parts.push(chr(10))
+                    } else if e == 116 {
+                        parts.push(chr(9))
+                    } else if e == 92 {
+                        parts.push(chr(92))
+                    } else if e == 34 {
+                        parts.push(chr(34))
+                    } else {
+                        lex_err("invalid escape sequence", ln, cl)
+                    }
+                    i = i + 2
+                    col = col + 2
+                } else {
+                    if ch < 32 {
+                        lex_err("string contains invalid control character", ln, cl)
+                    }
+                    parts.push(src.slice(i, i + 1))
+                    col = col + 1
+                    i = i + 1
+                }
+            }
+            if !closed {
+                lex_err("unterminated string", ln, cl)
+            }
+            ctx.toks.push(mk_tok("str", join(parts, ""), ln, cl))
+        } else {
+            # operator / symbol — try two-char first
+            let mut two: str = ""
+            if i + 2 <= n {
+                two = src.slice(i, i + 2)
+            }
+            if two == "->" || two == "==" || two == "!=" || two == "<=" || two == ">=" || two == "&&" || two == "||" || two == "=>" {
+                ctx.toks.push(mk_tok("sym", two, line, col))
+                i = i + 2
+                col = col + 2
+            } else if c == 40 || c == 41 || c == 123 || c == 125 || c == 91 || c == 93 || c == 44 || c == 58 || c == 46 || c == 60 || c == 62 || c == 43 || c == 45 || c == 42 || c == 47 || c == 37 || c == 33 || c == 61 || c == 63 {
+                ctx.toks.push(mk_tok("sym", chr(c), line, col))
+                i = i + 1
+                col = col + 1
+            } else {
+                lex_err("invalid character", line, col)
+            }
+        }
+    }
+    ctx.toks.push(mk_tok("eof", "", line, col))
+}
+
+# ----------------------------------------------------------------------------

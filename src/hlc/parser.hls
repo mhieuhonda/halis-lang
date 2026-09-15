@@ -1,0 +1,1545 @@
+# ============================================================================
+# hlc/parser.hls — part of the hlc compiler (split from the original single-file
+# src/hlc.hls). This file is loaded via `import "hlc/parser.hls"` from src/hlc.hls.
+# Section 3 — PARSER: token stream -> AST (ExprN/StmtN).
+# NOTE: content is byte-identical to the original src/hlc.hls line range
+#       1115..2652 - module split is purely structural, zero code changes.
+# ============================================================================
+# 3. PARSER
+# ----------------------------------------------------------------------------
+
+fn nx_expr(ctx: Ctx, kind: str, line: int) -> int {
+    let mut e: ExprN = ExprN {
+        kind: kind, op: "", name: "", sval: "", ival: 0, fval: 0.0,
+        bval: false, left: -1, right: -1, args: [], ffields: [], t: "",
+        muser: false, mkey: "", mop: "", enum_name: "", variant: "",
+        err_variant: "", ok_variant: "", inst_targs: [], line: line,
+        ovf_safe: false, div_safe: false, bnd_safe: false
+    }
+    ctx.exprs.push(e)
+    return ctx.exprs.len() - 1
+}
+
+fn nx_stmt(ctx: Ctx, kind: str, line: int) -> int {
+    let s: StmtN = StmtN {
+        kind: kind, name: "", vtype: "", is_mut: false, value: -1,
+        target: -1, cond: -1, body: [], else_body: [], iter: -1, e: -1,
+        line: line,
+        attr_stack: false, attr_boxed: false,
+        asm_template: "", asm_operands: [], asm_options: []
+    }
+    ctx.stmts.push(s)
+    return ctx.stmts.len() - 1
+}
+
+fn nx_match_arm(ctx: Ctx, pat_kind: str, enum_name: str, variant: str,
+bindings: list[str], has_paren: bool, body: int, line: int) -> int {
+    let arm: MatchArm = MatchArm {
+        pat_kind: pat_kind, enum_name: enum_name, variant: variant,
+        bindings: bindings, has_paren: has_paren, body: body, body_t: "",
+        line: line
+    }
+    ctx.match_arms.push(arm)
+    return ctx.match_arms.len() - 1
+}
+
+fn perr(ctx: Ctx, msg: str) -> void {
+    let t: Tok = ctx.toks.get(ctx.pos)
+    panic("syntax error: " + msg + " (line " + t.line.to_str() + ":" + t.col.to_str() + ")")
+}
+
+fn perr_at(ctx: Ctx, msg: str, t: Tok) -> void {
+    panic("syntax error: " + msg + " (line " + t.line.to_str() + ":" + t.col.to_str() + ")")
+}
+
+fn tok_desc(ctx: Ctx) -> str {
+    let t: Tok = ctx.toks.get(ctx.pos)
+    if t.kind == "eof" {
+        return "end of file"
+    }
+    return "'" + t.value + "'"
+}
+
+fn at_sym(ctx: Ctx, v: str) -> bool {
+    let t: Tok = ctx.toks.get(ctx.pos)
+    return t.kind == "sym" && t.value == v
+}
+
+fn at_kw(ctx: Ctx, v: str) -> bool {
+    let t: Tok = ctx.toks.get(ctx.pos)
+    return t.kind == "kw" && t.value == v
+}
+
+# at_ident returns true iff the current token is an identifier with the
+# given name. Used to disambiguate the `_` wildcard (which the lexer
+# tokenizes as an ident because `_` is a valid ident-start character).
+fn at_ident(ctx: Ctx, v: str) -> bool {
+    let t: Tok = ctx.toks.get(ctx.pos)
+    return t.kind == "ident" && t.value == v
+}
+
+fn eat_sym(ctx: Ctx, v: str) -> void {
+    if !at_sym(ctx, v) {
+        perr(ctx, "expected symbol '" + v + "' but got " + tok_desc(ctx))
+    }
+    ctx.pos = ctx.pos + 1
+}
+
+fn eat_kw(ctx: Ctx, v: str) -> void {
+    if !at_kw(ctx, v) {
+        perr(ctx, "expected keyword '" + v + "' but got " + tok_desc(ctx))
+    }
+    ctx.pos = ctx.pos + 1
+}
+
+fn eat_ident(ctx: Ctx) -> str {
+    let t: Tok = ctx.toks.get(ctx.pos)
+    if t.kind != "ident" {
+        perr(ctx, "expected identifier but got " + tok_desc(ctx))
+    }
+    # BUG-SC-4 fix: reject reserved identifiers (secure / trait) — they
+    # are reserved for future keywords per SPEC section 2.5. boot/parser.py
+    # (BUG-29 fix) already rejects these; hlc.hls must match.
+    if t.value == "secure" || t.value == "trait" {
+        perr_at(ctx, "'" + t.value + "' is a reserved identifier and cannot be used as a name (it will become a keyword in a future stage)", t)
+    }
+    ctx.pos = ctx.pos + 1
+    return t.value
+}
+
+fn peek2_is(ctx: Ctx, v: str) -> bool {
+    if ctx.pos + 1 >= ctx.toks.len() {
+        return false
+    }
+    let t: Tok = ctx.toks.get(ctx.pos + 1)
+    return t.kind == "sym" && t.value == v
+}
+
+# --- Type parsing: returns a canonical type string ---
+
+fn parse_type(ctx: Ctx, allow_void: bool) -> str {
+    let t: Tok = ctx.toks.get(ctx.pos)
+    if t.kind != "ident" {
+        perr(ctx, "expected type but got " + tok_desc(ctx))
+    }
+    let base: str = t.value
+    ctx.pos = ctx.pos + 1
+    if base == "list" {
+        eat_sym(ctx, "[")
+        let inner: str = parse_type(ctx, false)
+        eat_sym(ctx, "]")
+        return "list[" + inner + "]"
+    }
+    if base == "map" {
+        eat_sym(ctx, "[")
+        let kt: str = eat_ident(ctx)
+        if kt != "str" {
+            perr_at(ctx, "map key in v0.3 must be 'str'", t)
+        }
+        eat_sym(ctx, ",")
+        let vt: str = parse_type(ctx, false)
+        eat_sym(ctx, "]")
+        return "map[str, " + vt + "]"
+    }
+    # Stage 10-alpha: built-in taint wrapper `tainted[T]`.
+    if base == "tainted" {
+        eat_sym(ctx, "[")
+        let inner: str = parse_type(ctx, false)
+        eat_sym(ctx, "]")
+        return "tainted[" + inner + "]"
+    }
+    # Stage 16 (v0.27.0-alpha): built-in concurrency wrappers.
+    if base == "Chan" {
+        eat_sym(ctx, "[")
+        let inner: str = parse_type(ctx, false)
+        eat_sym(ctx, "]")
+        if inner == "void" {
+            perr_at(ctx, "Chan[T] element type cannot be void", t)
+        }
+        return "Chan[" + inner + "]"
+    }
+    if base == "Task" {
+        eat_sym(ctx, "[")
+        let inner: str = parse_type(ctx, true)
+        eat_sym(ctx, "]")
+        return "Task[" + inner + "]"
+    }
+    # Stage 33 (v0.52.0-alpha): Future[T] — async/await wrapper.
+    if base == "Future" {
+        eat_sym(ctx, "[")
+        let inner: str = parse_type(ctx, false)
+        eat_sym(ctx, "]")
+        if inner == "void" {
+            perr_at(ctx, "Future[T] element type cannot be void", t)
+        }
+        return "Future[" + inner + "]"
+    }
+    # Stage 34 (v0.53.0-alpha): Stream[T] — async stream wrapper.
+    if base == "Stream" {
+        eat_sym(ctx, "[")
+        let inner: str = parse_type(ctx, false)
+        eat_sym(ctx, "]")
+        if inner == "void" {
+            perr_at(ctx, "Stream[T] element type cannot be void", t)
+        }
+        return "Stream[" + inner + "]"
+    }
+    if base == "int" || base == "float" || base == "bool" || base == "str" {
+        return base
+    }
+    if base == "void" {
+        if !allow_void {
+            perr_at(ctx, "void can only be used as a return type", t)
+        }
+        return "void"
+    }
+    # User-defined type — could be generic instantiation: Name[T1, T2, ...]
+    if at_sym(ctx, "[") {
+        eat_sym(ctx, "[")
+        let args: list[str] = []
+        while !at_sym(ctx, "]") {
+            args.push(parse_type(ctx, false))
+            if at_sym(ctx, ",") {
+                ctx.pos = ctx.pos + 1
+            } else if !at_sym(ctx, "]") {
+                perr(ctx, "expected ',' or ']' in type arguments")
+            }
+        }
+        eat_sym(ctx, "]")
+        return base + "[" + join(args, ", ") + "]"
+    }
+    return base
+}
+
+# Parse `[T, U, ...]` after a function/struct/enum name — returns the list of
+# type parameter names. If the next token is not `[`, returns an empty list.
+fn parse_typeparams(ctx: Ctx) -> list[str] {
+    let out: list[str] = []
+    if !at_sym(ctx, "[") {
+        return out
+    }
+    eat_sym(ctx, "[")
+    while !at_sym(ctx, "]") {
+        let t: Tok = ctx.toks.get(ctx.pos)
+        if t.kind != "ident" {
+            perr(ctx, "expected type parameter name but got " + tok_desc(ctx))
+        }
+        # Deep-scan-10 soundness fix: a type parameter named after a
+        # builtin type hijacks instantiation (type_map is consulted
+        # before the primitive table), so `fn f[int](x: int)` accepted
+        # a str argument. Mirror of the boot/parser.py fix.
+        if t.value == "int" || t.value == "float" || t.value == "bool"
+        || t.value == "str" || t.value == "void" || t.value == "list"
+        || t.value == "map" || t.value == "tainted" || t.value == "Chan"
+        || t.value == "Task" || t.value == "Option" || t.value == "Result" {
+            perr_at(ctx, "type parameter cannot be named '" + t.value
+            + "' (it is a builtin type name and would shadow it)", t)
+        }
+        ctx.pos = ctx.pos + 1
+        out.push(t.value)
+        if at_sym(ctx, ",") {
+            ctx.pos = ctx.pos + 1
+        } else if !at_sym(ctx, "]") {
+            perr(ctx, "expected ',' or ']' in type parameters")
+        }
+    }
+    eat_sym(ctx, "]")
+    return out
+}
+
+# --- Program parsing ---
+
+# reset_cur_attrs (Stage 28+29, v0.45.0-alpha): clear the per-fn
+# attribute cache to defaults. Called after every top-level declaration
+# so the next fn (if un-attributed) doesn't inherit the previous fn's
+# attrs. Idempotent — safe to call when the cache is already clear.
+fn reset_cur_attrs(ctx: Ctx) -> void {
+    ctx.cur_attrs_stack_size = -1
+    ctx.cur_attrs_no_red_zone = false
+    ctx.cur_attrs_irq_handler = false
+    ctx.cur_attrs_inline = ""
+    ctx.cur_attrs_hot = false
+    ctx.cur_attrs_cold = false
+    # Stage 31 (v0.48.0-alpha): reset the tail-call attribute too — an
+    # un-attributed fn never inherits the previous fn's #[tail_call].
+    ctx.cur_attrs_tail_call = false
+    # Stage 30: let-binding attrs are reset by parse_let itself (they
+    # apply to exactly one statement); also clear here for belt-and-
+    # braces so no state leaks between declarations.
+    ctx.cur_let_stack = false
+    ctx.cur_let_boxed = false
+}
+
+# parse_attributes (Stage 28+29, v0.45.0-alpha): parse one or more
+# `#[attr1, attr2(arg), ...]` lists and merge them into ctx.cur_attrs_*.
+# Each list is `#` `[` attr (`,` attr)* `]` where each `attr` is one of:
+#
+#   inline(always)   - Stage 29: force inline at every call site
+#   inline(never)    - Stage 29: the function is never inlined
+#   hot              - Stage 29: mark the function hot (overrides PGO)
+#   cold             - Stage 29: mark the function cold (overrides PGO)
+#   no_red_zone      - Stage 28: disable the x86-64 red zone
+#   irq_handler      - Stage 28: emit an IRET-compatible frame
+#   stack_size(N)    - Stage 28: assert the fn's frame is <= N bytes
+#   tail_call        - Stage 31: assert every recursive call is in
+#                      verified tail position; the codegen emits a
+#                      parameter-rebinding goto (a jmp, not a call)
+#
+# Multiple `#[...]` lists may precede a single fn (each accumulates).
+# Within a single list, a duplicate attribute is a compile error.
+# `hot` and `cold` are mutually exclusive (compile error if both set).
+# `inline(always)` and `inline(never)` are mutually exclusive.
+# `tail_call` is mutually exclusive with `irq_handler` (an interrupt
+# frame must return via IRETQ, not jump) and with `inline(always)`
+# (the loop transform and call-site inlining contradict each other).
+fn parse_attributes(ctx: Ctx) -> void {
+    while at_sym(ctx, "#") {
+        let hash_tok: Tok = ctx.toks.get(ctx.pos)
+        eat_sym(ctx, "#")
+        eat_sym(ctx, "[")
+        while !at_sym(ctx, "]") {
+            let attr_name: str = eat_ident(ctx)
+            if attr_name == "inline" {
+                # inline(always) or inline(never)
+                eat_sym(ctx, "(")
+                let mode: str = eat_ident(ctx)
+                eat_sym(ctx, ")")
+                if mode != "always" && mode != "never" {
+                    perr_at(ctx, "unknown inline mode '" + mode + "' (expected 'always' or 'never')", hash_tok)
+                }
+                if ctx.cur_attrs_inline != "" && ctx.cur_attrs_inline != mode {
+                    perr_at(ctx, "conflicting inline attributes (was '" + ctx.cur_attrs_inline + "', now '" + mode + "')", hash_tok)
+                }
+                # Stage 31: inline(always) contradicts the tail-call loop
+                # transform (order-independent check — whichever attr is
+                # parsed first catches the conflict here).
+                if mode == "always" && ctx.cur_attrs_tail_call {
+                    perr_at(ctx, "'tail_call' and 'inline(always)' are mutually exclusive (a tail-call loop cannot also be inlined at every call site)", hash_tok)
+                }
+                ctx.cur_attrs_inline = mode
+            } else if attr_name == "hot" {
+                if ctx.cur_attrs_cold {
+                    perr_at(ctx, "'hot' and 'cold' are mutually exclusive", hash_tok)
+                }
+                ctx.cur_attrs_hot = true
+            } else if attr_name == "cold" {
+                if ctx.cur_attrs_hot {
+                    perr_at(ctx, "'hot' and 'cold' are mutually exclusive", hash_tok)
+                }
+                ctx.cur_attrs_cold = true
+            } else if attr_name == "no_red_zone" {
+                ctx.cur_attrs_no_red_zone = true
+            } else if attr_name == "irq_handler" {
+                if ctx.cur_attrs_tail_call {
+                    perr_at(ctx, "'tail_call' and 'irq_handler' are mutually exclusive (an interrupt frame must return via IRETQ, never jump)", hash_tok)
+                }
+                ctx.cur_attrs_irq_handler = true
+            } else if attr_name == "tail_call" {
+                # Stage 31 (v0.48.0-alpha): verified tail-call optimisation.
+                # The attribute is an ASSERTION: the checker proves every
+                # recursive call sits in tail position with no cleanup
+                # between the call and the return, and the codegen lowers
+                # each verified site to a parameter-rebinding goto —
+                # constant stack at any recursion depth.
+                if ctx.cur_attrs_irq_handler {
+                    perr_at(ctx, "'tail_call' and 'irq_handler' are mutually exclusive (an interrupt frame must return via IRETQ, never jump)", hash_tok)
+                }
+                if ctx.cur_attrs_inline == "always" {
+                    perr_at(ctx, "'tail_call' and 'inline(always)' are mutually exclusive (a tail-call loop cannot also be inlined at every call site)", hash_tok)
+                }
+                ctx.cur_attrs_tail_call = true
+            } else if attr_name == "stack_size" {
+                eat_sym(ctx, "(")
+                let nt: Tok = ctx.toks.get(ctx.pos)
+                if nt.kind != "int" {
+                    perr_at(ctx, "stack_size expects an integer byte count but got " + tok_desc(ctx), nt)
+                }
+                ctx.pos = ctx.pos + 1
+                let n: int = int(nt.value)
+                if n < 0 {
+                    perr_at(ctx, "stack_size must be non-negative", nt)
+                }
+                eat_sym(ctx, ")")
+                # If multiple stack_size attrs appear, the LAST wins
+                # (the user's intent is to refine; we don't accumulate).
+                ctx.cur_attrs_stack_size = n
+            } else if attr_name == "stack" || attr_name == "boxed" {
+                # Stage 30 (v0.47.0-alpha): #[stack] / #[boxed] are
+                # LET-BINDING attributes (they control the boxed-vs-stack
+                # layout of a list[T] value), not function attributes.
+                # Placing one before a fn is a clear user error — point
+                # them at the let statement form.
+                perr_at(ctx, "'" + attr_name + "' is a let-binding attribute — place it inside a function, directly before a 'let' statement (e.g. #[" + attr_name + "] let xs: list[int] = [1, 2, 3])", hash_tok)
+            } else {
+                perr_at(ctx, "unknown attribute '" + attr_name + "' (known: inline(always), inline(never), hot, cold, no_red_zone, irq_handler, stack_size(N), tail_call)", hash_tok)
+            }
+            if at_sym(ctx, ",") {
+                ctx.pos = ctx.pos + 1
+            } else if !at_sym(ctx, "]") {
+                perr(ctx, "expected ',' or ']' in attribute list")
+            }
+        }
+        eat_sym(ctx, "]")
+    }
+}
+
+fn parse_program(ctx: Ctx) -> void {
+    while ctx.toks.get(ctx.pos).kind != "eof" {
+        let t: Tok = ctx.toks.get(ctx.pos)
+        # Stage 28+29 (v0.45.0-alpha): a top-level `#[...]` attribute
+        # list applies to the following `fn` (the only declaration
+        # that currently accepts attributes). parse_attributes
+        # populates ctx.cur_attrs_*; parse_fn reads those fields.
+        # reset_cur_attrs is called at the END of every iteration so
+        # the NEXT declaration starts with cleared attrs (an
+        # un-attributed fn never inherits the previous fn's attrs).
+        if t.kind == "sym" && t.value == "#" {
+            parse_attributes(ctx)
+            continue
+        }
+        if t.kind == "kw" && t.value == "struct" {
+            let st: StructInfo = parse_struct(ctx)
+            if ctx.structs.has(st.name) || ctx.enums.has(st.name) {
+                perr_at(ctx, "duplicate type name: " + st.name, t)
+            }
+            ctx.structs.set(st.name, st)
+        } else if t.kind == "kw" && t.value == "enum" {
+            let en: EnumInfo = parse_enum(ctx)
+            if ctx.enums.has(en.name) || ctx.structs.has(en.name) {
+                perr_at(ctx, "duplicate type name: " + en.name, t)
+            }
+            ctx.enums.set(en.name, en)
+        } else if t.kind == "kw" && t.value == "impl" {
+            parse_impl(ctx)
+        } else if t.kind == "kw" && t.value == "fn" {
+            let f: FnInfo = parse_fn(ctx, "")
+            if ctx.fns.has(f.name) {
+                perr_at(ctx, "duplicate function name: " + f.name, t)
+            }
+            ctx.fns.set(f.name, f)
+            ctx.fn_order.push(f.name)
+        } else if t.kind == "kw" && t.value == "import" {
+            eat_kw(ctx, "import")
+            let pt: Tok = ctx.toks.get(ctx.pos)
+            if pt.kind != "str" {
+                perr_at(ctx, "import expects a string path", pt)
+            }
+            ctx.pos = ctx.pos + 1
+            ctx.imports.push(pt.value)
+        } else if t.kind == "kw" && t.value == "extern" {
+            # Stage 15-beta: extern "C" { ... } block.
+            parse_extern_block(ctx)
+        } else {
+            perr_at(ctx, "only struct/enum/impl/fn/import/extern declarations allowed at top level", t)
+        }
+        # Reset the per-fn attribute cache after every iteration so
+        # the next fn (if un-attributed) doesn't inherit the previous
+        # fn's attributes.
+        reset_cur_attrs(ctx)
+    }
+}
+
+fn parse_struct(ctx: Ctx) -> StructInfo {
+    let t0: Tok = ctx.toks.get(ctx.pos)
+    eat_kw(ctx, "struct")
+    let name: str = eat_ident(ctx)
+    let typeparams: list[str] = parse_typeparams(ctx)
+    eat_sym(ctx, "{")
+    let fields: list[str] = []
+    let ftypes: list[str] = []
+    let fdefaults: list[int] = []
+    let mut seen_default: bool = false
+    while !at_sym(ctx, "}") {
+        let ft: str = eat_ident(ctx)
+        eat_sym(ctx, ":")
+        let ty: str = parse_type(ctx, false)
+        let mut dflt_idx: int = -1
+        if at_sym(ctx, "=") {
+            ctx.pos = ctx.pos + 1
+            dflt_idx = parse_expr(ctx, true)
+            seen_default = true
+        } else if seen_default {
+            perr_at(ctx, "struct field without default cannot follow a defaulted field: " + ft, t0)
+        }
+        fields.push(ft)
+        ftypes.push(ty)
+        fdefaults.push(dflt_idx)
+        if at_sym(ctx, ",") {
+            ctx.pos = ctx.pos + 1
+        } else if !at_sym(ctx, "}") {
+            perr(ctx, "expected ',' or '}' in struct definition")
+        }
+    }
+    eat_sym(ctx, "}")
+    if fields.len() == 0 {
+        perr_at(ctx, "struct must have at least one field", t0)
+    }
+    return StructInfo {
+        name: name, fields: fields, ftypes: ftypes, fdefaults: fdefaults,
+        typeparams: typeparams, line: t0.line
+    }
+}
+
+fn parse_enum(ctx: Ctx) -> EnumInfo {
+    let t0: Tok = ctx.toks.get(ctx.pos)
+    eat_kw(ctx, "enum")
+    let name: str = eat_ident(ctx)
+    let typeparams: list[str] = parse_typeparams(ctx)
+    eat_sym(ctx, "{")
+    let variants: list[str] = []
+    let payloads: list[list[str]] = []
+    let mut seen: map[str, bool] = map_new()
+    while !at_sym(ctx, "}") {
+        let vt: Tok = ctx.toks.get(ctx.pos)
+        if vt.kind != "ident" {
+            perr_at(ctx, "expected variant name but got " + tok_desc(ctx), vt)
+        }
+        ctx.pos = ctx.pos + 1
+        let vname: str = vt.value
+        if seen.has(vname) {
+            perr_at(ctx, "duplicate variant name in enum: " + vname, vt)
+        }
+        seen.set(vname, true)
+        let mut pl: list[str] = []
+        if at_sym(ctx, "(") {
+            eat_sym(ctx, "(")
+            while !at_sym(ctx, ")") {
+                pl.push(parse_type(ctx, false))
+                if at_sym(ctx, ",") {
+                    ctx.pos = ctx.pos + 1
+                } else if !at_sym(ctx, ")") {
+                    perr(ctx, "expected ',' or ')' in variant payloads")
+                }
+            }
+            eat_sym(ctx, ")")
+        }
+        variants.push(vname)
+        payloads.push(pl)
+        if at_sym(ctx, ",") {
+            ctx.pos = ctx.pos + 1
+        } else if !at_sym(ctx, "}") {
+            perr(ctx, "expected ',' or '}' in enum definition")
+        }
+    }
+    eat_sym(ctx, "}")
+    if variants.len() == 0 {
+        perr_at(ctx, "enum must have at least one variant", t0)
+    }
+    return EnumInfo {
+        name: name, variants: variants, payloads: payloads,
+        typeparams: typeparams, line: t0.line
+    }
+}
+
+fn parse_impl(ctx: Ctx) -> void {
+    eat_kw(ctx, "impl")
+    let sname: str = eat_ident(ctx)
+    eat_sym(ctx, "{")
+    while !at_sym(ctx, "}") {
+        # Stage 28+29: methods may carry a `#[...]` attribute list
+        # (applies to the following fn). Mirrors the top-level handling
+        # in parse_program.
+        if at_sym(ctx, "#") {
+            parse_attributes(ctx)
+            continue
+        }
+        if !at_kw(ctx, "fn") {
+            perr(ctx, "only fn definitions allowed inside impl")
+        }
+        let fn_t0: Tok = ctx.toks.get(ctx.pos)
+        let f: FnInfo = parse_fn(ctx, sname)
+        let key: str = sname + "." + f.name
+        if ctx.fns.has(key) {
+            perr_at(ctx, "duplicate method name: " + key, fn_t0)
+        }
+        ctx.fns.set(key, f)
+        ctx.fn_order.push(key)
+        if !ctx.methods_of.has(sname) {
+            ctx.methods_of.set(sname, [])
+        }
+        ctx.methods_of.get_or(sname, []).push(key)
+        reset_cur_attrs(ctx)
+    }
+    eat_sym(ctx, "}")
+}
+
+fn parse_fn(ctx: Ctx, impl_struct: str) -> FnInfo {
+    let t0: Tok = ctx.toks.get(ctx.pos)
+    eat_kw(ctx, "fn")
+    let name: str = eat_ident(ctx)
+    let typeparams: list[str] = parse_typeparams(ctx)
+    eat_sym(ctx, "(")
+    let params: list[str] = []
+    let ptypes: list[str] = []
+    let pmuts: list[bool] = []
+    while !at_sym(ctx, ")") {
+        let mut is_mut: bool = false
+        if at_kw(ctx, "mut") {
+            ctx.pos = ctx.pos + 1
+            is_mut = true
+        }
+        let pn: str = eat_ident(ctx)
+        eat_sym(ctx, ":")
+        let pt: str = parse_type(ctx, false)
+        params.push(pn)
+        ptypes.push(pt)
+        pmuts.push(is_mut)
+        if at_sym(ctx, ",") {
+            ctx.pos = ctx.pos + 1
+        } else if !at_sym(ctx, ")") {
+            perr(ctx, "expected ',' or ')' in parameters")
+        }
+    }
+    eat_sym(ctx, ")")
+    let mut ret: str = "void"
+    if at_sym(ctx, "->") {
+        ctx.pos = ctx.pos + 1
+        ret = parse_type(ctx, true)
+    }
+    # Stage 9-beta: explicit `pure` keyword for documentation/linting.
+    # `pure` and `uses` are mutually exclusive. The checker enforces that
+    # a `pure` function's body transitively calls nothing effectful.
+    let mut is_pure: bool = false
+    if at_kw(ctx, "pure") {
+        ctx.pos = ctx.pos + 1
+        is_pure = true
+    }
+    # Stage 9-alpha: fine-grained effects. `uses IO` is a blanket alias
+    # for the entire IO family (expanded at parse time). Other recognized
+    # effects: Fs, Clock, Args, Exit. Reserved: Net, Rand, Proc.
+    let mut effects: list[str] = []
+    if at_kw(ctx, "uses") {
+        if is_pure {
+            perr(ctx, "'pure' and 'uses' are mutually exclusive (a pure function declares no effects)")
+        }
+        ctx.pos = ctx.pos + 1
+        while true {
+            let e: str = eat_ident(ctx)
+            # Stage 9 release (v0.20.0-alpha): Net, Rand, Proc are now
+            # active effects with builtins (net_lookup, rand_int,
+            # rand_float, rand_seed, proc_exec). No reserved effects remain.
+            if e != "IO" && e != "Fs" && e != "Clock" && e != "Args" && e != "Exit"
+            && e != "Net" && e != "Rand" && e != "Proc" && e != "Conc" {
+                perr(ctx, "unknown effect '" + e + "'; known effects: IO, Fs, Clock, Args, Exit, Net, Rand, Proc, Conc")
+            }
+            if !list_has(effects, e) {
+                effects.push(e)
+            }
+            # `IO` is the blanket alias — expand to the full IO family.
+            # Net, Rand, Proc, Conc are NOT part of the IO family — a program
+            # must declare them explicitly to use the corresponding builtins.
+            if e == "IO" {
+                let mut k: int = 0
+                let fam: list[str] = ["IO", "Fs", "Clock", "Args", "Exit"]
+                while k < fam.len() {
+                    let fe: str = fam.get(k)
+                    if !list_has(effects, fe) {
+                        effects.push(fe)
+                    }
+                    k = k + 1
+                }
+            }
+            if at_sym(ctx, ",") {
+                ctx.pos = ctx.pos + 1
+                continue
+            }
+            break
+        }
+    }
+    # Stage 17 (v0.28.0-alpha): contract clauses come BEFORE the body
+    # block — parse them first.
+    let contracts: list[int] = parse_contracts(ctx)
+    let body: list[int] = parse_block(ctx)
+    # Stage 28+29 (v0.45.0-alpha): default-constructed attrs (the
+    # parse_fn caller — parse_program / parse_impl — already consumed
+    # any leading attribute list via parse_fn_with_attrs).
+    return FnInfo {
+        name: name, params: params, ptypes: ptypes, pmuts: pmuts,
+        ret: ret, effects: effects, is_pure: is_pure, body: body,
+        is_method: impl_struct != "", struct_of: impl_struct,
+        typeparams: typeparams, line: t0.line, is_extern: false,
+        requires_e: contracts.get(0), ensures_e: contracts.get(1),
+        attr_stack_size: ctx.cur_attrs_stack_size,
+        attr_no_red_zone: ctx.cur_attrs_no_red_zone,
+        attr_irq_handler: ctx.cur_attrs_irq_handler,
+        attr_inline: ctx.cur_attrs_inline,
+        attr_hot: ctx.cur_attrs_hot,
+        attr_cold: ctx.cur_attrs_cold,
+        attr_tail_call: ctx.cur_attrs_tail_call
+    }
+}
+
+# parse_contracts — Stage 17 (v0.28.0-alpha): parse any number of
+# `requires <expr>` clauses followed by any number of `ensures <expr>`
+# clauses; multiple clauses of one kind are combined with && into a
+# single expression index (-1 = none). Parsed with allow_struct=false
+# so a struct literal cannot be confused with the fn body's `{`.
+fn parse_contracts(ctx: Ctx) -> list[int] {
+    let mut req_e: int = -1
+    let mut ens_e: int = -1
+    let mut seen_ens: bool = false
+    while true {
+        if at_kw(ctx, "requires") && !seen_ens {
+            ctx.pos = ctx.pos + 1
+            let x: int = parse_expr(ctx, false)
+            if req_e == -1 {
+                req_e = x
+            } else {
+                let combined: int = nx_expr(ctx, "bin", ctx.exprs[x].line)
+                ctx.exprs[combined].op = "&&"
+                ctx.exprs[combined].left = req_e
+                ctx.exprs[combined].right = x
+                req_e = combined
+            }
+        } else if at_kw(ctx, "ensures") {
+            ctx.pos = ctx.pos + 1
+            seen_ens = true
+            let y: int = parse_expr(ctx, false)
+            if ens_e == -1 {
+                ens_e = y
+            } else {
+                let combined2: int = nx_expr(ctx, "bin", ctx.exprs[y].line)
+                ctx.exprs[combined2].op = "&&"
+                ctx.exprs[combined2].left = ens_e
+                ctx.exprs[combined2].right = y
+                ens_e = combined2
+            }
+        } else {
+            break
+        }
+    }
+    let out: list[int] = []
+    out.push(req_e)
+    out.push(ens_e)
+    return out
+}
+
+# Stage 15-beta: parse `extern "C" { fn ... }` block.
+# Each fn declaration has NO body (just a signature). The `uses IO` (or
+# `pure`) clause is REQUIRED — FFI is unsafe by default.
+fn parse_extern_block(ctx: Ctx) -> void {
+    let t0: Tok = ctx.toks.get(ctx.pos)
+    eat_kw(ctx, "extern")
+    let abi_tok: Tok = ctx.toks.get(ctx.pos)
+    if abi_tok.kind != "str" {
+        perr_at(ctx, "expected ABI string (e.g. \"C\") after 'extern'", abi_tok)
+    }
+    ctx.pos = ctx.pos + 1
+    let abi: str = abi_tok.value
+    if abi != "C" {
+        perr_at(ctx, "unsupported ABI '" + abi + "'; only \"C\" is supported today", abi_tok)
+    }
+    eat_sym(ctx, "{")
+    while !at_sym(ctx, "}") {
+        if !at_kw(ctx, "fn") {
+            perr(ctx, "extern block can only contain fn declarations")
+        }
+        # Parse the fn signature (no body). We reuse parse_fn but it
+        # requires a body — so we parse up to the effects clause, then
+        # skip the body parse for extern fns.
+        let ft0: Tok = ctx.toks.get(ctx.pos)
+        eat_kw(ctx, "fn")
+        let name: str = eat_ident(ctx)
+        let typeparams: list[str] = parse_typeparams(ctx)
+        eat_sym(ctx, "(")
+        let params: list[str] = []
+        let ptypes: list[str] = []
+        let pmuts: list[bool] = []
+        while !at_sym(ctx, ")") {
+            let mut is_mut: bool = false
+            if at_kw(ctx, "mut") {
+                ctx.pos = ctx.pos + 1
+                is_mut = true
+            }
+            let pn: str = eat_ident(ctx)
+            eat_sym(ctx, ":")
+            let pt: str = parse_type(ctx, false)
+            params.push(pn)
+            ptypes.push(pt)
+            pmuts.push(is_mut)
+            if at_sym(ctx, ",") {
+                ctx.pos = ctx.pos + 1
+            } else if !at_sym(ctx, ")") {
+                perr(ctx, "expected ',' or ')' in parameters")
+            }
+        }
+        eat_sym(ctx, ")")
+        let mut ret: str = "void"
+        if at_sym(ctx, "->") {
+            ctx.pos = ctx.pos + 1
+            ret = parse_type(ctx, true)
+        }
+        let mut is_pure: bool = false
+        if at_kw(ctx, "pure") {
+            ctx.pos = ctx.pos + 1
+            is_pure = true
+        }
+        let mut effects: list[str] = []
+        if at_kw(ctx, "uses") {
+            if is_pure {
+                perr(ctx, "'pure' and 'uses' are mutually exclusive (a pure function declares no effects)")
+            }
+            ctx.pos = ctx.pos + 1
+            while true {
+                let e: str = eat_ident(ctx)
+                # Stage 9 release (v0.20.0-alpha): Net, Rand, Proc are
+                # active effects. No reserved effects remain.
+                if e != "IO" && e != "Fs" && e != "Clock" && e != "Args" && e != "Exit"
+                && e != "Net" && e != "Rand" && e != "Proc" && e != "Conc" {
+                    perr(ctx, "unknown effect '" + e + "'; known effects: IO, Fs, Clock, Args, Exit, Net, Rand, Proc, Conc")
+                }
+                if !list_has(effects, e) {
+                    effects.push(e)
+                }
+                if e == "IO" {
+                    let mut k: int = 0
+                    let fam: list[str] = ["IO", "Fs", "Clock", "Args", "Exit"]
+                    while k < fam.len() {
+                        let fe: str = fam.get(k)
+                        if !list_has(effects, fe) {
+                            effects.push(fe)
+                        }
+                        k = k + 1
+                    }
+                }
+                if at_sym(ctx, ",") {
+                    ctx.pos = ctx.pos + 1
+                    continue
+                }
+                break
+            }
+        }
+        # Extern fns MUST declare `uses IO` (or `pure`) — FFI is unsafe by default.
+        if effects.len() == 0 && !is_pure {
+            perr_at(ctx, "extern fn '" + name + "' must declare `uses IO` (or `pure`) — FFI is unsafe by default", t0)
+        }
+        if ctx.fns.has(name) {
+            perr_at(ctx, "duplicate function name: " + name, t0)
+        }
+        # Stage 17: extern fns may carry contracts (a requires on an
+        # extern documents the C side's precondition and is checked at
+        # call sites with literal arguments).
+        let contracts_ext: list[int] = parse_contracts(ctx)
+        let empty_body: list[int] = []
+        ctx.fns.set(name, FnInfo {
+            name: name, params: params, ptypes: ptypes, pmuts: pmuts,
+            ret: ret, effects: effects, is_pure: is_pure, body: empty_body,
+            is_method: false, struct_of: "", typeparams: typeparams,
+            line: ft0.line, is_extern: true,
+            requires_e: contracts_ext.get(0), ensures_e: contracts_ext.get(1),
+            attr_stack_size: -1, attr_no_red_zone: false, attr_irq_handler: false,
+            attr_inline: "", attr_hot: false, attr_cold: false,
+            attr_tail_call: false
+        })
+        ctx.fn_order.push(name)
+    }
+    eat_sym(ctx, "}")
+}
+
+fn parse_block(ctx: Ctx) -> list[int] {
+    eat_sym(ctx, "{")
+    let mut out: list[int] = []
+    while !at_sym(ctx, "}") {
+        out.push(parse_stmt(ctx))
+    }
+    eat_sym(ctx, "}")
+    return out
+}
+
+# --- Statement parsing ---
+
+fn parse_stmt(ctx: Ctx) -> int {
+    let t: Tok = ctx.toks.get(ctx.pos)
+    # Stage 30 (v0.47.0-alpha): a `#[stack]` / `#[boxed]` attribute
+    # list directly before a statement applies to a `let` binding
+    # (the only statement that accepts attributes). The lexer emits a
+    # bare `#` token ONLY when it is immediately followed by `[`
+    # (any other `#` starts a line comment), so seeing sym `#` here is
+    # unambiguous.
+    if t.kind == "sym" && t.value == "#" {
+        parse_let_attrs(ctx)
+        let nt: Tok = ctx.toks.get(ctx.pos)
+        if !(nt.kind == "kw" && nt.value == "let") {
+            perr_at(ctx, "#[stack]/#[boxed] attributes apply to a 'let' binding", t)
+        }
+        return parse_let(ctx)
+    }
+    if t.kind == "kw" {
+        if t.value == "let" {
+            return parse_let(ctx)
+        }
+        # Stage 27 (v0.50.0-alpha): `asm!` inline-assembly statement.
+        if t.value == "asm" {
+            return parse_asm_stmt(ctx)
+        }
+        if t.value == "return" {
+            ctx.pos = ctx.pos + 1
+            let idx: int = nx_stmt(ctx, "return", t.line)
+            if at_sym(ctx, "}") {
+                ctx.stmts[idx].value = -1
+            } else {
+                ctx.stmts[idx].value = parse_expr(ctx, true)
+            }
+            return idx
+        }
+        if t.value == "if" {
+            return parse_if(ctx)
+        }
+        if t.value == "while" {
+            ctx.pos = ctx.pos + 1
+            let cond: int = parse_expr(ctx, false)
+            let body: list[int] = parse_block(ctx)
+            let idx: int = nx_stmt(ctx, "while", t.line)
+            ctx.stmts[idx].cond = cond
+            ctx.stmts[idx].body = body
+            return idx
+        }
+        if t.value == "for" {
+            ctx.pos = ctx.pos + 1
+            let vn: str = eat_ident(ctx)
+            eat_sym(ctx, ":")
+            let vt: str = parse_type(ctx, false)
+            eat_kw(ctx, "in")
+            let it: int = parse_expr(ctx, false)
+            let body: list[int] = parse_block(ctx)
+            let idx: int = nx_stmt(ctx, "for", t.line)
+            ctx.stmts[idx].name = vn
+            ctx.stmts[idx].vtype = vt
+            ctx.stmts[idx].iter = it
+            ctx.stmts[idx].body = body
+            return idx
+        }
+        if t.value == "break" {
+            ctx.pos = ctx.pos + 1
+            return nx_stmt(ctx, "break", t.line)
+        }
+        if t.value == "continue" {
+            ctx.pos = ctx.pos + 1
+            return nx_stmt(ctx, "continue", t.line)
+        }
+        if t.value == "match" {
+            # match as an expression statement
+            let e: int = parse_match(ctx)
+            let idx: int = nx_stmt(ctx, "expr", t.line)
+            ctx.stmts[idx].e = e
+            return idx
+        }
+        if t.value == "struct" || t.value == "impl" || t.value == "enum" || t.value == "fn" {
+            perr_at(ctx, "declaration of " + t.value + " only allowed at top level", t)
+        }
+        perr_at(ctx, "keyword cannot start a statement: " + t.value, t)
+    }
+    # expression / assignment
+    let mut e: int = parse_expr(ctx, true)
+    if at_sym(ctx, "=") {
+        let eq: Tok = ctx.toks.get(ctx.pos)
+        ctx.pos = ctx.pos + 1
+        let ek: str = ctx.exprs[e].kind
+        if ek != "ident" && ek != "field" && ek != "index" {
+            perr_at(ctx, "left side of assignment must be variable/field/index", eq)
+        }
+        if ek == "field" || ek == "index" {
+            require_ident_root(ctx, e)
+        }
+        let val: int = parse_expr(ctx, true)
+        let idx: int = nx_stmt(ctx, "assign", eq.line)
+        ctx.stmts[idx].target = e
+        ctx.stmts[idx].value = val
+        return idx
+    }
+    let ek2: str = ctx.exprs[e].kind
+    # Deep-scan-10: `foo()?` as a statement is the idiomatic error-
+    # propagate-and-discard form (mirror of the boot/parser.py fix).
+    if ek2 != "call" && ek2 != "method" && ek2 != "fieldcall" && ek2 != "match" && ek2 != "qmark" {
+        perr(ctx, "expression as statement must be a function/method call")
+    }
+    let idx: int = nx_stmt(ctx, "expr", ctx.exprs[e].line)
+    ctx.stmts[idx].e = e
+    return idx
+}
+
+fn require_ident_root(ctx: Ctx, e: int) -> void {
+    let mut k: str = ctx.exprs[e].kind
+    if k == "field" || k == "index" {
+        require_ident_root(ctx, ctx.exprs[e].left)
+    } else if k != "ident" {
+        perr(ctx, "left side of assignment must start from a variable")
+    }
+}
+
+fn parse_let(ctx: Ctx) -> int {
+    let t: Tok = ctx.toks.get(ctx.pos)
+    ctx.pos = ctx.pos + 1
+    let mut is_mut: bool = false
+    if at_kw(ctx, "mut") {
+        ctx.pos = ctx.pos + 1
+        is_mut = true
+    }
+    let name: str = eat_ident(ctx)
+    eat_sym(ctx, ":")
+    let ty: str = parse_type(ctx, false)
+    eat_sym(ctx, "=")
+    let val: int = parse_expr(ctx, true)
+    let idx: int = nx_stmt(ctx, "let", t.line)
+    ctx.stmts[idx].name = name
+    ctx.stmts[idx].vtype = ty
+    ctx.stmts[idx].is_mut = is_mut
+    ctx.stmts[idx].value = val
+    # Stage 30 (v0.47.0-alpha): snapshot the #[stack] / #[boxed]
+    # let-binding layout attributes (set by parse_let_attrs via
+    # parse_stmt) onto the statement, then reset the cache so the
+    # next let never inherits them.
+    ctx.stmts[idx].attr_stack = ctx.cur_let_stack
+    ctx.stmts[idx].attr_boxed = ctx.cur_let_boxed
+    ctx.cur_let_stack = false
+    ctx.cur_let_boxed = false
+    return idx
+}
+
+# parse_let_attrs (Stage 30, v0.47.0-alpha): parse one or more
+# `#[stack]` / `#[boxed]` attribute lists that apply to the FOLLOWING
+# `let` binding (called from parse_stmt). Only the two layout
+# attributes are accepted here — fn-level attributes (inline, hot,
+# ...) belong before a fn declaration and are rejected with a pointer.
+# The two are mutually exclusive. The caller (parse_stmt) verifies the
+# next token is `let`.
+fn parse_let_attrs(ctx: Ctx) -> void {
+    while at_sym(ctx, "#") {
+        let hash_tok: Tok = ctx.toks.get(ctx.pos)
+        eat_sym(ctx, "#")
+        eat_sym(ctx, "[")
+        while !at_sym(ctx, "]") {
+            let attr_name: str = eat_ident(ctx)
+            if attr_name == "stack" {
+                if ctx.cur_let_boxed {
+                    perr_at(ctx, "'stack' and 'boxed' are mutually exclusive", hash_tok)
+                }
+                ctx.cur_let_stack = true
+            } else if attr_name == "boxed" {
+                if ctx.cur_let_stack {
+                    perr_at(ctx, "'stack' and 'boxed' are mutually exclusive", hash_tok)
+                }
+                ctx.cur_let_boxed = true
+            } else if attr_name == "tail_call" {
+                # Stage 31 (v0.48.0-alpha): #[tail_call] is a FUNCTION
+                # attribute — placing it before a let is a clear user
+                # error; point them at the fn declaration form.
+                perr_at(ctx, "'tail_call' is a function attribute — place it directly before a 'fn' declaration (e.g. #[tail_call] fn fib_tail(n: int, a: int, b: int) -> int { ... })", hash_tok)
+            } else {
+                perr_at(ctx, "unknown let-binding attribute '" + attr_name + "' (known: stack, boxed; function attributes go before a fn declaration)", hash_tok)
+            }
+            if at_sym(ctx, ",") {
+                ctx.pos = ctx.pos + 1
+            } else if !at_sym(ctx, "]") {
+                perr(ctx, "expected ',' or ']' in attribute list")
+            }
+        }
+        eat_sym(ctx, "]")
+    }
+}
+
+# Stage 27 (v0.50.0-alpha): inline-assembly statement parser.
+#
+# Grammar (mirrors the boot parser):
+#
+#   asm_stmt := "asm" "!" "(" string_lit
+#                 ("," operand)*
+#                 ("," "options" "(" option_name ("," option_name)* ")")?
+#                 ")"
+#
+#   operand := direction "(" constraint ")" lvalue_or_expr
+#
+#   direction := "in" | "out" | "inout" | "late_out"
+#               (`in` is a keyword and is matched by at_kw; the others
+#                are bare identifiers and are matched by at_ident.)
+#
+#   constraint := IDENT ("reg"|"mem"|"imm") | STRING ("eax","a",...)
+#                 A bare register-class name is matched as an IDENT
+#                 token; a specific-register form is a string literal.
+#
+#   option_name := "pure" | "nomem" | "noreturn" | "preserves_flags" |
+#                  "nostack" | "attsyntax"
+#
+# The lvalue_or_expr is a full expression for `in` (any value of a
+# primitive type — int/float/bool — that fits in a register); for
+# out/inout/late_out it is parsed as an expression and the checker
+# restricts it to ident/field/index lvalues. We parse it as a full
+# expression here so the parser is uniform; the checker enforces the
+# lvalue restriction (which is type-driven, not syntax-driven).
+fn parse_asm_stmt(ctx: Ctx) -> int {
+    let t: Tok = ctx.toks.get(ctx.pos)
+    # consume `asm`
+    ctx.pos = ctx.pos + 1
+    # consume `!`
+    if !at_sym(ctx, "!") {
+        perr_at(ctx, "expected '!' after 'asm' (inline-assembly statement)", t)
+    }
+    ctx.pos = ctx.pos + 1
+    eat_sym(ctx, "(")
+    # The first operand is the assembly template (a string literal).
+    let tplt_tok: Tok = ctx.toks.get(ctx.pos)
+    if tplt_tok.kind != "str" {
+        perr_at(ctx, "asm! template must be a string literal", tplt_tok)
+    }
+    ctx.pos = ctx.pos + 1
+    let template: str = tplt_tok.value
+    let operands: list[AsmOperand] = []
+    let options: list[str] = []
+    # Operands + options follow.
+    while at_sym(ctx, ",") {
+        ctx.pos = ctx.pos + 1
+        # Options section: `options(pure, nomem, ...)`.
+        if at_ident(ctx, "options") {
+            ctx.pos = ctx.pos + 1
+            eat_sym(ctx, "(")
+            while !at_sym(ctx, ")") {
+                # An option name is normally an identifier (`nomem`,
+                # `noreturn`, ...). The exception is `pure`, which is
+                # a reserved keyword (Stage 9-beta). Accept both forms
+                # — the asm! options list is a separate namespace.
+                let opt_tok: Tok = ctx.toks.get(ctx.pos)
+                let mut opt: str = ""
+                if opt_tok.kind == "ident" || opt_tok.kind == "kw" {
+                    opt = opt_tok.value
+                    ctx.pos = ctx.pos + 1
+                } else {
+                    perr_at(ctx, "expected an option name (pure, nomem, noreturn, preserves_flags, nostack, attsyntax) but got " + tok_desc(ctx), opt_tok)
+                }
+                if opt != "pure" && opt != "nomem" && opt != "noreturn"
+                && opt != "preserves_flags" && opt != "nostack"
+                && opt != "attsyntax" {
+                    perr(ctx, "unknown asm! option '" + opt + "' (known: pure, nomem, noreturn, preserves_flags, nostack, attsyntax)")
+                }
+                options.push(opt)
+                if at_sym(ctx, ",") {
+                    ctx.pos = ctx.pos + 1
+                } else if !at_sym(ctx, ")") {
+                    perr(ctx, "expected ',' or ')' in options list")
+                }
+            }
+            eat_sym(ctx, ")")
+        } else {
+            # Direction.
+            let mut dir: str = ""
+            if at_kw(ctx, "in") {
+                dir = "in"
+                ctx.pos = ctx.pos + 1
+            } else if at_ident(ctx, "out") {
+                dir = "out"
+                ctx.pos = ctx.pos + 1
+            } else if at_ident(ctx, "inout") {
+                dir = "inout"
+                ctx.pos = ctx.pos + 1
+            } else if at_ident(ctx, "late_out") {
+                dir = "late_out"
+                ctx.pos = ctx.pos + 1
+            } else {
+                perr(ctx, "expected asm! operand direction (in/out/inout/late_out), got " + tok_desc(ctx))
+            }
+            eat_sym(ctx, "(")
+            # Constraint: IDENT or string literal.
+            let ct_tok: Tok = ctx.toks.get(ctx.pos)
+            let mut constraint: str = ""
+            let mut is_cstr: bool = false
+            if ct_tok.kind == "str" {
+                is_cstr = true
+                constraint = ct_tok.value
+                ctx.pos = ctx.pos + 1
+            } else if ct_tok.kind == "ident" {
+                constraint = ct_tok.value
+                ctx.pos = ctx.pos + 1
+            } else {
+                perr_at(ctx, "expected asm! constraint (a register class like 'reg' or a string like \"eax\"), got " + tok_desc(ctx), ct_tok)
+            }
+            eat_sym(ctx, ")")
+            # The lvalue (for out/inout/late_out) or expression (for in).
+            let e_idx: int = parse_expr(ctx, true)
+            let ek: str = ctx.exprs[e_idx].kind
+            # Snapshot the operand's lvalue shape (var/var_kind).
+            let mut op_var: str = ""
+            let mut op_var_kind: str = ""
+            # The expression index is ALWAYS recorded — for `in` it's
+            # the input value expression; for out/inout/late_out it's
+            # the lvalue expression (checker uses it to walk the
+            # binding root and codegen uses it to emit the C operand).
+            let operand_expr_idx: int = e_idx
+            if dir == "in" {
+                # `in` keeps the expression as the input value.
+            } else {
+                # out/inout/late_out — the operand must be an lvalue.
+                if ek != "ident" && ek != "field" && ek != "index" {
+                    perr(ctx, "asm! " + dir + " operand must be an lvalue (variable/field/index), got " + ek)
+                }
+                if ek == "ident" {
+                    op_var = ctx.exprs[e_idx].name
+                    op_var_kind = "ident"
+                } else if ek == "field" {
+                    op_var = ctx.exprs[e_idx].name
+                    op_var_kind = "field"
+                } else {
+                    op_var = ""
+                    op_var_kind = "index"
+                }
+            }
+            operands.push(AsmOperand {
+                dir: dir,
+                constraint: constraint,
+                is_constraint_str: is_cstr,
+                var: op_var,
+                var_kind: op_var_kind,
+                expr_idx: operand_expr_idx,
+                line: t.line
+            })
+        }
+    }
+    eat_sym(ctx, ")")
+    let idx: int = nx_stmt(ctx, "asm", t.line)
+    ctx.stmts[idx].asm_template = template
+    ctx.stmts[idx].asm_operands = operands
+    ctx.stmts[idx].asm_options = options
+    return idx
+}
+
+fn parse_if(ctx: Ctx) -> int {
+    let t: Tok = ctx.toks.get(ctx.pos)
+    ctx.pos = ctx.pos + 1
+    let cond: int = parse_expr(ctx, false)
+    let then_b: list[int] = parse_block(ctx)
+    let mut else_b: list[int] = []
+    if at_kw(ctx, "else") {
+        ctx.pos = ctx.pos + 1
+        if at_kw(ctx, "if") {
+            else_b.push(parse_if(ctx))
+        } else {
+            else_b = parse_block(ctx)
+        }
+    }
+    let idx: int = nx_stmt(ctx, "if", t.line)
+    ctx.stmts[idx].cond = cond
+    ctx.stmts[idx].body = then_b
+    ctx.stmts[idx].else_body = else_b
+    return idx
+}
+
+# --- Expression parsing ---
+
+fn parse_expr(ctx: Ctx, allow_struct: bool) -> int {
+    return parse_bin(ctx, 0, allow_struct)
+}
+
+fn op_at_level(level: int, op: str) -> bool {
+    if level == 0 {
+        return op == "||"
+    }
+    if level == 1 {
+        return op == "&&"
+    }
+    if level == 2 {
+        return op == "==" || op == "!="
+    }
+    if level == 3 {
+        return op == "<" || op == "<=" || op == ">" || op == ">="
+    }
+    if level == 4 {
+        return op == "+" || op == "-"
+    }
+    return op == "*" || op == "/" || op == "%"
+}
+
+fn parse_bin(ctx: Ctx, level: int, allow_struct: bool) -> int {
+    if level >= 6 {
+        return parse_unary(ctx, allow_struct)
+    }
+    let mut left: int = parse_bin(ctx, level + 1, allow_struct)
+    while true {
+        let t: Tok = ctx.toks.get(ctx.pos)
+        if t.kind != "sym" {
+            break
+        }
+        if !op_at_level(level, t.value) {
+            break
+        }
+        ctx.pos = ctx.pos + 1
+        let right: int = parse_bin(ctx, level + 1, allow_struct)
+        let idx: int = nx_expr(ctx, "bin", t.line)
+        ctx.exprs[idx].op = t.value
+        ctx.exprs[idx].left = left
+        ctx.exprs[idx].right = right
+        left = idx
+    }
+    return left
+}
+
+fn parse_unary(ctx: Ctx, allow_struct: bool) -> int {
+    let t: Tok = ctx.toks.get(ctx.pos)
+    if t.kind == "sym" && (t.value == "!" || t.value == "-") {
+        ctx.pos = ctx.pos + 1
+        let mut e: int = parse_unary(ctx, allow_struct)
+        if t.value == "-" && ctx.exprs[e].kind == "int" && ctx.exprs[e].op == "big" {
+            ctx.exprs[e].op = ""
+            return e
+        }
+        let idx: int = nx_expr(ctx, "un", t.line)
+        ctx.exprs[idx].op = t.value
+        ctx.exprs[idx].left = e
+        return idx
+    }
+    return parse_postfix(ctx, allow_struct)
+}
+
+fn can_index(k: str) -> bool {
+    # Deep-scan-10: qmark results are indexable (g()?[0] used to detach
+    # the [0] into a stray statement).
+    # Deep-scan-20: listlit and match results are indexable too
+    # ([10, 20, 30][1] used to detach the index into a stray
+    # statement) — mirrors boot/parser.py's postfix tuple.
+    return k == "ident" || k == "field" || k == "index" || k == "call" || k == "method" || k == "fieldcall" || k == "qmark" || k == "listlit" || k == "match"
+}
+
+fn parse_postfix(ctx: Ctx, allow_struct: bool) -> int {
+    let mut e: int = parse_primary(ctx, allow_struct)
+    while true {
+        let t: Tok = ctx.toks.get(ctx.pos)
+        if t.kind != "sym" {
+            break
+        }
+        if t.value == "." {
+            ctx.pos = ctx.pos + 1
+            let name: str = eat_ident(ctx)
+            if at_sym(ctx, "(") {
+                let args: list[int] = parse_args(ctx)
+                let idx: int = nx_expr(ctx, "fieldcall", t.line)
+                ctx.exprs[idx].name = name
+                ctx.exprs[idx].left = e
+                ctx.exprs[idx].args = args
+                e = idx
+            } else {
+                let idx: int = nx_expr(ctx, "field", t.line)
+                ctx.exprs[idx].name = name
+                ctx.exprs[idx].left = e
+                e = idx
+            }
+        } else if t.value == "[" && can_index(ctx.exprs[e].kind) {
+            ctx.pos = ctx.pos + 1
+            let idx_e: int = parse_expr(ctx, true)
+            eat_sym(ctx, "]")
+            let idx: int = nx_expr(ctx, "index", t.line)
+            ctx.exprs[idx].left = e
+            ctx.exprs[idx].right = idx_e
+            e = idx
+        } else if t.value == "(" && ctx.exprs[e].kind == "ident" {
+            let args: list[int] = parse_args(ctx)
+            let idx: int = nx_expr(ctx, "call", ctx.exprs[e].line)
+            ctx.exprs[idx].name = ctx.exprs[e].name
+            ctx.exprs[idx].args = args
+            e = idx
+        } else if t.value == "?" {
+            ctx.pos = ctx.pos + 1
+            let idx: int = nx_expr(ctx, "qmark", t.line)
+            ctx.exprs[idx].left = e
+            e = idx
+        } else {
+            break
+        }
+    }
+    return e
+}
+
+fn parse_args(ctx: Ctx) -> list[int] {
+    eat_sym(ctx, "(")
+    let mut out: list[int] = []
+    while !at_sym(ctx, ")") {
+        out.push(parse_expr(ctx, true))
+        if at_sym(ctx, ",") {
+            ctx.pos = ctx.pos + 1
+        } else if !at_sym(ctx, ")") {
+            perr(ctx, "expected ',' or ')' in arguments")
+        }
+    }
+    eat_sym(ctx, ")")
+    return out
+}
+
+fn parse_match(ctx: Ctx) -> int {
+    let t: Tok = ctx.toks.get(ctx.pos)
+    eat_kw(ctx, "match")
+    let scrut: int = parse_expr(ctx, false)
+    eat_sym(ctx, "{")
+    let arm_idxs: list[int] = []
+    while !at_sym(ctx, "}") {
+        let arm_line_tok: Tok = ctx.toks.get(ctx.pos)
+        let mut pat_kind: str = ""
+        let mut enum_name: str = ""
+        let mut variant: str = ""
+        let mut bindings: list[str] = []
+        let mut has_paren: bool = false
+        # BUG-SC-16 fix: `_` is ALWAYS tokenized as an ident (byte 95 is a
+        # valid ident-start char), never as a sym. The `at_sym(ctx, "_")`
+        # check is dead code — removed for clarity (same as boot/parser.py
+        # BUG-001 fix / BUG-18 cleanup).
+        if at_ident(ctx, "_") {
+            ctx.pos = ctx.pos + 1
+            pat_kind = "wildcard"
+        } else {
+            pat_kind = "variant"
+            # Deep-scan-10: a BARE variant pattern (no `Enum.` prefix) is
+            # accepted per the SPEC §5 grammar; the checker resolves the
+            # enum from the scrutinee's type (mirror of boot/parser.py).
+            enum_name = eat_ident(ctx)
+            variant = ""
+            if at_sym(ctx, ".") {
+                eat_sym(ctx, ".")
+                variant = eat_ident(ctx)
+            } else {
+                variant = enum_name
+                enum_name = ""
+            }
+            if at_sym(ctx, "(") {
+                has_paren = true
+                eat_sym(ctx, "(")
+                while !at_sym(ctx, ")") {
+                    if at_ident(ctx, "_") {
+                        ctx.pos = ctx.pos + 1
+                        bindings.push("_")
+                    } else {
+                        bindings.push(eat_ident(ctx))
+                    }
+                    if at_sym(ctx, ",") {
+                        ctx.pos = ctx.pos + 1
+                    } else if !at_sym(ctx, ")") {
+                        perr(ctx, "expected ',' or ')' in variant pattern")
+                    }
+                }
+                eat_sym(ctx, ")")
+            }
+        }
+        eat_sym(ctx, "=>")
+        let body: int = parse_expr(ctx, true)
+        let arm_idx: int = nx_match_arm(ctx, pat_kind, enum_name, variant, bindings,
+        has_paren, body, arm_line_tok.line)
+        arm_idxs.push(arm_idx)
+        if at_sym(ctx, ",") {
+            ctx.pos = ctx.pos + 1
+        } else if !at_sym(ctx, "}") {
+            perr(ctx, "expected ',' or '}' in match arms")
+        }
+    }
+    eat_sym(ctx, "}")
+    let idx: int = nx_expr(ctx, "match", t.line)
+    ctx.exprs[idx].left = scrut
+    ctx.exprs[idx].args = arm_idxs
+    return idx
+}
+
+fn parse_primary(ctx: Ctx, allow_struct: bool) -> int {
+    let t: Tok = ctx.toks.get(ctx.pos)
+    if t.kind == "int" {
+        ctx.pos = ctx.pos + 1
+        let idx: int = nx_expr(ctx, "int", t.line)
+        # BUG-015 fix: strip leading zeros before the length check, so that
+        # a 20-char literal like "09223372036854775808" (= 2^63 with a leading
+        # zero) is treated as 19-char "9223372036854775808" — matching Stage-0's
+        # behaviour. Stage-0 uses Python int() which strips leading zeros
+        # automatically; the self-hosted uses string comparison so it must do
+        # so explicitly.
+        let mut v: str = t.value
+        let mut stripped: str = v
+        while stripped.len() > 1 && stripped.byte_at(0) == 48 {
+            stripped = stripped.slice(1, stripped.len())
+        }
+        v = stripped
+        if v.len() > 19 {
+            perr_at(ctx, "integer literal too large (exceeds int64)", t)
+        } else if v.len() == 19 && v > "9223372036854775808" {
+            perr_at(ctx, "integer literal too large (exceeds int64)", t)
+        } else if v.len() == 19 && v == "9223372036854775808" {
+            ctx.exprs[idx].ival = -9223372036854775808
+            ctx.exprs[idx].op = "big"
+        } else {
+            ctx.exprs[idx].ival = v.to_int()
+        }
+        return idx
+    }
+    if t.kind == "float" {
+        ctx.pos = ctx.pos + 1
+        let idx: int = nx_expr(ctx, "float", t.line)
+        ctx.exprs[idx].fval = t.value.to_float()
+        return idx
+    }
+    if t.kind == "str" {
+        ctx.pos = ctx.pos + 1
+        let idx: int = nx_expr(ctx, "str", t.line)
+        ctx.exprs[idx].sval = t.value
+        return idx
+    }
+    if t.kind == "kw" && (t.value == "true" || t.value == "false") {
+        ctx.pos = ctx.pos + 1
+        let idx: int = nx_expr(ctx, "bool", t.line)
+        ctx.exprs[idx].bval = t.value == "true"
+        return idx
+    }
+    if t.kind == "kw" && t.value == "match" {
+        return parse_match(ctx)
+    }
+    if t.kind == "ident" {
+        if allow_struct && peek2_is(ctx, "{") {
+            return parse_struct_lit(ctx)
+        }
+        ctx.pos = ctx.pos + 1
+        let idx: int = nx_expr(ctx, "ident", t.line)
+        ctx.exprs[idx].name = t.value
+        return idx
+    }
+    if t.kind == "sym" && t.value == "(" {
+        ctx.pos = ctx.pos + 1
+        let mut e: int = parse_expr(ctx, true)
+        eat_sym(ctx, ")")
+        return e
+    }
+    if t.kind == "sym" && t.value == "[" {
+        ctx.pos = ctx.pos + 1
+        let items: list[int] = []
+        while !at_sym(ctx, "]") {
+            items.push(parse_expr(ctx, true))
+            if at_sym(ctx, ",") {
+                ctx.pos = ctx.pos + 1
+            } else if !at_sym(ctx, "]") {
+                perr(ctx, "expected ',' or ']' in list literal")
+            }
+        }
+        eat_sym(ctx, "]")
+        let idx: int = nx_expr(ctx, "listlit", t.line)
+        ctx.exprs[idx].args = items
+        return idx
+    }
+    perr(ctx, "expected expression but got " + tok_desc(ctx))
+    return -1
+}
+
+fn parse_struct_lit(ctx: Ctx) -> int {
+    let t: Tok = ctx.toks.get(ctx.pos)
+    let name: str = t.value
+    ctx.pos = ctx.pos + 1
+    eat_sym(ctx, "{")
+    let fnames: list[str] = []
+    let fexprs: list[int] = []
+    while !at_sym(ctx, "}") {
+        let fname: str = eat_ident(ctx)
+        eat_sym(ctx, ":")
+        fnames.push(fname)
+        fexprs.push(parse_expr(ctx, true))
+        if at_sym(ctx, ",") {
+            ctx.pos = ctx.pos + 1
+        } else if !at_sym(ctx, "}") {
+            perr(ctx, "expected ',' or '}' in struct literal")
+        }
+    }
+    eat_sym(ctx, "}")
+    let idx: int = nx_expr(ctx, "structlit", t.line)
+    ctx.exprs[idx].name = name
+    ctx.exprs[idx].ffields = fnames
+    ctx.exprs[idx].args = fexprs
+    return idx
+}
+
+# ----------------------------------------------------------------------------

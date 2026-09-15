@@ -1,0 +1,1931 @@
+# ============================================================================
+# hlc/check_call.hls — part of the hlc compiler (split from the original single-file
+# src/hlc.hls). This file is loaded via `import "hlc/check_call.hls"` from src/hlc.hls.
+# Section 4d — CHECKER: builtin calls, spawn/async/stream calls, method calls.
+# NOTE: content is byte-identical to the original src/hlc.hls line range
+#       7695..9619 - module split is purely structural, zero code changes.
+# ============================================================================
+fn check_builtin_call(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, name: str, expected: str) -> str {
+    let mut line: int = ctx.exprs[e].line
+    # Stage 16 (v0.27.0-alpha): spawn(f, a1, ..., aN) — the FIRST argument
+    # is a function NAME (identifier), not a value. It must be handled
+    # BEFORE the generic argument-evaluation loop below (which would try
+    # to resolve it as a variable and fail).
+    if name == "spawn" {
+        return check_spawn_call(ctx, env, cur, e)
+    }
+    # Stage 33 (v0.52.0-alpha): async_spawn(f, args...) — like spawn, but
+    # returns Future[R] instead of Task[R].
+    if name == "async_spawn" {
+        return check_async_spawn_call(ctx, env, cur, e)
+    }
+    # Stage 34 (v0.53.0-alpha): gen_spawn(f, args...) -> Stream[T] —
+    # the target takes the Stream as its first param.
+    if name == "gen_spawn" {
+        return check_gen_spawn_call(ctx, env, cur, e, expected)
+    }
+    # Stage 34: stream_map_int / stream_filter_int / stream_fold_int /
+    # stream_flat_map_int — each takes a Stream + a function name.
+    if name == "stream_map_int" || name == "stream_filter_int"
+    || name == "stream_fold_int" || name == "stream_flat_map_int" {
+        return check_stream_combinator_call(ctx, env, cur, e, name, expected)
+    }
+    # Stage 21 (v0.37.0-alpha): has_feature("avx2") -> bool — a
+    # compile-time constant (const-folded by the codegen from the
+    # --target-feature flag), so the argument must be a STRING LITERAL.
+    # Pure (no effects). Mirrors cfg(feature) dispatch.
+    if name == "has_feature" {
+        if ctx.exprs[e].args.len() != 1 {
+            cerr(line, "has_feature() expects 1 argument (a feature name)")
+        }
+        if ctx.exprs[ctx.exprs[e].args.get(0)].kind != "str" {
+            cerr(line, "has_feature() expects a string literal (it is a compile-time constant)")
+        }
+        check_expr(ctx, env, cur, ctx.exprs[e].args.get(0), "str")
+        return "bool"
+    }
+    # Stage 21: simd_cpu_supports("avx2") -> bool — a runtime CPU probe
+    # (CPUID on x86; NEON compile-time check on aarch64). Pure.
+    if name == "simd_cpu_supports" {
+        if ctx.exprs[e].args.len() != 1 {
+            cerr(line, "simd_cpu_supports() expects 1 argument (a feature name)")
+        }
+        check_expr(ctx, env, cur, ctx.exprs[e].args.get(0), "str")
+        return "bool"
+    }
+    # Stage 19 (v0.35.0-alpha): join(list[str], sep) -> str — pure, O(n).
+    # Handled BEFORE the generic argument-evaluation loop so an empty
+    # list literal `[]` infers list[str] from the expected type.
+    if name == "join" {
+        if ctx.exprs[e].args.len() != 2 {
+            cerr(line, "join() expects 2 arguments (list[str], str)")
+        }
+        let at0: str = check_expr(ctx, env, cur, ctx.exprs[e].args.get(0), "list[str]")
+        if !is_list_t(at0) || list_elem_t(at0) != "str" {
+            cerr(line, "join() expects a list[str] as argument 1, got " + at0)
+        }
+        let at1: str = check_expr(ctx, env, cur, ctx.exprs[e].args.get(1), "str")
+        if at1 != "str" {
+            cerr(line, "join() expects a str separator as argument 2, got " + at1)
+        }
+        if at0 == "never" || at1 == "never" {
+            cerr(line, "never value cannot be used as an argument")
+        }
+        return "str"
+    }
+    # Stage 32 (v0.51.0-alpha): native bitwise builtins. Each takes
+    # int arguments and returns int; the shift count is masked to 6
+    # bits (0..63) at runtime to match C's UB-free behaviour.
+    if name == "int_and" || name == "int_or" || name == "int_xor" {
+        if ctx.exprs[e].args.len() != 2 {
+            cerr(line, name + "() expects 2 int arguments")
+        }
+        let a0: str = check_expr(ctx, env, cur, ctx.exprs[e].args.get(0), "int")
+        let a1: str = check_expr(ctx, env, cur, ctx.exprs[e].args.get(1), "int")
+        if a0 != "int" {
+            cerr(line, name + "() expects int as argument 1, got " + a0)
+        }
+        if a1 != "int" {
+            cerr(line, name + "() expects int as argument 2, got " + a1)
+        }
+        if a0 == "never" || a1 == "never" {
+            cerr(line, "never value cannot be used as an argument")
+        }
+        return "int"
+    }
+    if name == "int_not" {
+        if ctx.exprs[e].args.len() != 1 {
+            cerr(line, "int_not() expects 1 int argument")
+        }
+        let a0n: str = check_expr(ctx, env, cur, ctx.exprs[e].args.get(0), "int")
+        if a0n != "int" {
+            cerr(line, "int_not() expects int, got " + a0n)
+        }
+        if a0n == "never" {
+            cerr(line, "never value cannot be used as an argument")
+        }
+        return "int"
+    }
+    if name == "int_shl" || name == "int_shr" || name == "int_sar" {
+        if ctx.exprs[e].args.len() != 2 {
+            cerr(line, name + "() expects 2 int arguments (value, shift)")
+        }
+        let a0s: str = check_expr(ctx, env, cur, ctx.exprs[e].args.get(0), "int")
+        let a1s: str = check_expr(ctx, env, cur, ctx.exprs[e].args.get(1), "int")
+        if a0s != "int" {
+            cerr(line, name + "() expects int value as argument 1, got " + a0s)
+        }
+        if a1s != "int" {
+            cerr(line, name + "() expects int shift count as argument 2, got " + a1s)
+        }
+        if a0s == "never" || a1s == "never" {
+            cerr(line, "never value cannot be used as an argument")
+        }
+        return "int"
+    }
+    if name == "int_popcount" || name == "int_clz" || name == "int_ctz" {
+        if ctx.exprs[e].args.len() != 1 {
+            cerr(line, name + "() expects 1 int argument")
+        }
+        let a0p: str = check_expr(ctx, env, cur, ctx.exprs[e].args.get(0), "int")
+        if a0p != "int" {
+            cerr(line, name + "() expects int, got " + a0p)
+        }
+        if a0p == "never" {
+            cerr(line, "never value cannot be used as an argument")
+        }
+        return "int"
+    }
+    let nargs: int = ctx.exprs[e].args.len()
+    let argt: list[str] = []
+    let mut i: int = 0
+    while i < nargs {
+        argt.push(check_expr(ctx, env, cur, ctx.exprs[e].args.get(i), ""))
+        i = i + 1
+    }
+    let mut j: int = 0
+    while j < nargs {
+        if argt.get(j) == "never" {
+            cerr(line, "never value cannot be used as an argument")
+        }
+        j = j + 1
+    }
+    # Stage 10-alpha: taint-sink enforcement.
+    # Reject tainted[T] at sink argument positions; user must explicitly
+    # untaint via taint_unwrap or a sanitizer (sanitize_html etc.).
+    # Stage 56 (v0.75.0-alpha): eprint / eprintln are sinks for the
+    # same reason print / println are — a tainted message written to
+    # the terminal lets an attacker inject ANSI escape sequences
+    # (terminal spoofing / title reprogramming / clipboard theft on
+    # some terminals). isatty takes an int fd (not a sink — the fd is
+    # a program-controlled constant, never attacker data; passing a
+    # tainted int would leak nothing anyway since the result only
+    # reveals whether the program's OWN descriptor is a terminal).
+    if name == "print" || name == "println" || name == "eprint" || name == "eprintln" {
+        # Deep-scan fix: check argument count BEFORE the taint check so
+        # `print()` (zero args) gives a clean error message instead of
+        # crashing on argt.get(0) out-of-bounds.
+        if nargs != 1 {
+            cerr(line, name + " expects 1 str argument")
+        }
+        if is_taint_t(argt.get(0)) {
+            cerr(line, "taint-sink violation: " + name + " argument 1 is " + argt.get(0) + " (tainted values must be sanitised before reaching a sink — use sanitize_html / sanitize_path / sanitize_sql_identifier / sanitize_sql_string / sanitize_command / sanitize_filename from std.sanitize, or taint_unwrap() if you accept the risk)")
+        }
+    }
+    if name == "exit" {
+        if nargs != 1 {
+            cerr(line, "exit expects 1 int argument")
+        }
+        if is_taint_t(argt.get(0)) {
+            cerr(line, "taint-sink violation: exit argument 1 is " + argt.get(0) + " (tainted values must be sanitised before reaching a sink)")
+        }
+    }
+    if name == "read_file" || name == "file_exists" || name == "read_file_tainted" {
+        if nargs != 1 {
+            cerr(line, name + "() expects 1 str argument")
+        }
+        if is_taint_t(argt.get(0)) {
+            cerr(line, "taint-sink violation: " + name + " argument 1 is " + argt.get(0) + " (tainted values must be sanitised before reaching a sink — use sanitize_path from std.sanitize, or taint_unwrap() if you accept the risk)")
+        }
+    }
+    # Stage 36 (v0.55.0-alpha): fs_read_dir / fs_size / fs_is_dir all
+    # take a single str path that must not be tainted (path-traversal /
+    # information-disclosure sink). fs_set_perms takes a path + a
+    # POSIX mode int (the mode is not a sink — only the path is).
+    if name == "fs_read_dir" || name == "fs_size" || name == "fs_is_dir" {
+        if nargs != 1 {
+            cerr(line, name + "() expects 1 str argument")
+        }
+        if is_taint_t(argt.get(0)) {
+            cerr(line, "taint-sink violation: " + name + " argument 1 is " + argt.get(0) + " (tainted values must be sanitised before reaching a sink — use sanitize_path from std.sanitize, or taint_unwrap() if you accept the risk)")
+        }
+    }
+    if name == "fs_set_perms" {
+        if nargs != 2 {
+            cerr(line, "fs_set_perms() expects 2 arguments: str path, int mode")
+        }
+        if is_taint_t(argt.get(0)) {
+            cerr(line, "taint-sink violation: fs_set_perms argument 1 (path) is " + argt.get(0) + " (tainted values must be sanitised before reaching a sink — a tainted path would chmod an attacker-chosen file)")
+        }
+    }
+    if name == "write_file" {
+        if nargs != 2 {
+            cerr(line, "write_file() expects 2 str arguments")
+        }
+        if is_taint_t(argt.get(0)) {
+            cerr(line, "taint-sink violation: write_file argument 1 (path) is " + argt.get(0) + " (tainted values must be sanitised before reaching a sink)")
+        }
+        if is_taint_t(argt.get(1)) {
+            cerr(line, "taint-sink violation: write_file argument 2 (content) is " + argt.get(1) + " (tainted values must be sanitised before reaching a sink)")
+        }
+    }
+    if name == "print" || name == "println" || name == "eprint" || name == "eprintln" {
+        if nargs != 1 || argt.get(0) != "str" {
+            cerr(line, name + " expects 1 str argument")
+        }
+        # Edge name reflects the ACTUAL builtin (b:print / b:eprint / ...)
+        # so the --audit output lists which stream family was written.
+        # builtin_effect resolves all four to ["IO"].
+        add_edge(ctx, cur, "b:" + name)
+        return "void"
+    }
+    # Stage 56 (v0.75.0-alpha): isatty(fd: int) -> bool — true when the
+    # file descriptor refers to a terminal. Carries IO (a stream-state
+    # observation). 0 = stdin, 1 = stdout, 2 = stderr (the POSIX fd
+    # convention); other descriptors work too (whatever the process
+    # opened). Negative fds are simply not terminals (isatty(2) in C
+    # returns 0 for EBADF — no panic, no UB).
+    if name == "isatty" {
+        if nargs != 1 || argt.get(0) != "int" {
+            cerr(line, "isatty expects 1 int argument (the file descriptor: 0 = stdin, 1 = stdout, 2 = stderr)")
+        }
+        add_edge(ctx, cur, "b:isatty")
+        return "bool"
+    }
+    # Stage 57 (v0.76.0-alpha): process-identity builtins (no args).
+    # proc_pid() -> int — the OS process id (syslog TAG[PID]).
+    # sys_hostname() -> str — the host name (syslog HOSTNAME).
+    if name == "proc_pid" {
+        if nargs != 0 {
+            cerr(line, "proc_pid() takes no arguments")
+        }
+        add_edge(ctx, cur, "b:proc_pid")
+        return "int"
+    }
+    if name == "sys_hostname" {
+        if nargs != 0 {
+            cerr(line, "sys_hostname() takes no arguments")
+        }
+        add_edge(ctx, cur, "b:sys_hostname")
+        return "str"
+    }
+    if name == "panic" {
+        if nargs != 1 || argt.get(0) != "str" {
+            cerr(line, "panic expects 1 str argument")
+        }
+        return "never"
+    }
+    if name == "exit" {
+        if nargs != 1 || argt.get(0) != "int" {
+            cerr(line, "exit expects 1 int argument")
+        }
+        add_edge(ctx, cur, "b:exit")
+        return "never"
+    }
+    if name == "str" {
+        if nargs != 1 {
+            cerr(line, "str() expects 1 argument")
+        }
+        let a0: str = argt.get(0)
+        if a0 != "int" && a0 != "float" && a0 != "bool" && a0 != "str" {
+            cerr(line, "str() does not support type " + a0)
+        }
+        return "str"
+    }
+    if name == "int" {
+        if nargs != 1 || argt.get(0) != "str" {
+            cerr(line, "int() expects 1 str argument")
+        }
+        return "int"
+    }
+    if name == "len" {
+        if nargs != 1 {
+            cerr(line, "len() expects 1 argument")
+        }
+        let a0: str = argt.get(0)
+        if a0 != "str" && !is_list_t(a0) && !is_map_t(a0) {
+            cerr(line, "len() does not support type " + a0)
+        }
+        return "int"
+    }
+    if name == "range" {
+        if nargs != 2 || argt.get(0) != "int" || argt.get(1) != "int" {
+            cerr(line, "range() expects 2 int arguments")
+        }
+        return "list[int]"
+    }
+    if name == "map_new" {
+        if nargs != 0 {
+            cerr(line, "map_new() takes no arguments")
+        }
+        if expected == "" || !is_map_t(expected) {
+            cerr(line, "map_new() requires a 'map[str, T]' type in the surrounding context")
+        }
+        return expected
+    }
+    if name == "read_file" {
+        if nargs != 1 || argt.get(0) != "str" {
+            cerr(line, "read_file() expects 1 str argument")
+        }
+        add_edge(ctx, cur, "b:read_file")
+        return "str"
+    }
+    # Stage 10-beta: read_file_tainted(path) — same as read_file but the
+    # returned str is wrapped as tainted[str]. Second taint source after
+    # tainted_args; covers user-controlled content read from a file.
+    if name == "read_file_tainted" {
+        if nargs != 1 || argt.get(0) != "str" {
+            cerr(line, "read_file_tainted() expects 1 str argument")
+        }
+        add_edge(ctx, cur, "b:read_file_tainted")
+        return "tainted[str]"
+    }
+    # Stage 10 release: read_line() -> tainted[str] — third taint source.
+    # Reads a single line from stdin (newline stripped); the result is
+    # always tainted because stdin is untrusted input. Carries the IO
+    # effect (same family as print/println).
+    if name == "read_line" {
+        if nargs != 0 {
+            cerr(line, "read_line() takes no arguments")
+        }
+        add_edge(ctx, cur, "b:read_line")
+        return "tainted[str]"
+    }
+    if name == "write_file" {
+        if nargs != 2 || argt.get(0) != "str" || argt.get(1) != "str" {
+            cerr(line, "write_file() expects 2 str arguments")
+        }
+        add_edge(ctx, cur, "b:write_file")
+        return "void"
+    }
+    if name == "args" {
+        if nargs != 0 {
+            cerr(line, "args() takes no arguments")
+        }
+        add_edge(ctx, cur, "b:args")
+        return "list[str]"
+    }
+    # Stage 10-alpha: tainted_args — like args() but each element is
+    # wrapped as tainted[str] (defined in std/taint.hls).
+    if name == "tainted_args" {
+        if nargs != 0 {
+            cerr(line, "tainted_args() takes no arguments")
+        }
+        add_edge(ctx, cur, "b:tainted_args")
+        return "list[tainted[str]]"
+    }
+    # Stage 10-alpha: taint_mark / taint_unwrap — generic wrap / unwrap.
+    if name == "taint_mark" {
+        if nargs != 1 {
+            cerr(line, "taint_mark() expects 1 argument")
+        }
+        let a0: str = argt.get(0)
+        if a0 == "void" {
+            cerr(line, "taint_mark() does not support void")
+        }
+        return "tainted[" + a0 + "]"
+    }
+    if name == "taint_unwrap" {
+        if nargs != 1 {
+            cerr(line, "taint_unwrap() expects 1 argument")
+        }
+        let a0: str = argt.get(0)
+        if !is_taint_t(a0) {
+            cerr(line, "taint_unwrap() expects a tainted[T] value, got " + a0)
+        }
+        return taint_inner_t(a0)
+    }
+    if name == "clock_ms" {
+        if nargs != 0 {
+            cerr(line, "clock_ms() takes no arguments")
+        }
+        add_edge(ctx, cur, "b:clock_ms")
+        return "int"
+    }
+    # Stage 46 (v0.65.0-alpha): thread / scheduling builtins.
+    # thread_sleep_ms(ms: int) -> void — blocks the calling thread.
+    # The ms argument must be a non-negative int (literal negative
+    # values are compile errors; dynamic negative values panic at
+    # runtime).
+    if name == "thread_sleep_ms" {
+        if nargs != 1 || argt.get(0) != "int" {
+            cerr(line, "thread_sleep_ms() expects 1 int argument (ms)")
+        }
+        if ctx.exprs[ctx.exprs[e].args.get(0)].kind == "int"
+        && ctx.exprs[ctx.exprs[e].args.get(0)].ival < 0 {
+            cerr(line, "thread_sleep_ms() duration must be >= 0 (literal negative)")
+        }
+        add_edge(ctx, cur, "b:thread_sleep_ms")
+        return "void"
+    }
+    # thread_yield() -> void — hint the scheduler to switch.
+    if name == "thread_yield" {
+        if nargs != 0 {
+            cerr(line, "thread_yield() takes no arguments")
+        }
+        add_edge(ctx, cur, "b:thread_yield")
+        return "void"
+    }
+    # thread_current_id() -> int — non-zero thread identifier.
+    if name == "thread_current_id" {
+        if nargs != 0 {
+            cerr(line, "thread_current_id() takes no arguments")
+        }
+        add_edge(ctx, cur, "b:thread_current_id")
+        return "int"
+    }
+    if name == "chr" {
+        if nargs != 1 || argt.get(0) != "int" {
+            cerr(line, "chr() expects 1 int argument")
+        }
+        return "str"
+    }
+    if name == "file_exists" {
+        if nargs != 1 || argt.get(0) != "str" {
+            cerr(line, "file_exists() expects 1 str argument")
+        }
+        add_edge(ctx, cur, "b:file_exists")
+        return "bool"
+    }
+    # ----- Stage 36 (v0.55.0-alpha): filesystem metadata builtins -----
+    if name == "fs_read_dir" {
+        if nargs != 1 || argt.get(0) != "str" {
+            cerr(line, "fs_read_dir() expects 1 str argument")
+        }
+        add_edge(ctx, cur, "b:fs_read_dir")
+        return "list[str]"
+    }
+    if name == "fs_size" {
+        if nargs != 1 || argt.get(0) != "str" {
+            cerr(line, "fs_size() expects 1 str argument")
+        }
+        add_edge(ctx, cur, "b:fs_size")
+        return "int"
+    }
+    if name == "fs_is_dir" {
+        if nargs != 1 || argt.get(0) != "str" {
+            cerr(line, "fs_is_dir() expects 1 str argument")
+        }
+        add_edge(ctx, cur, "b:fs_is_dir")
+        return "bool"
+    }
+    if name == "fs_set_perms" {
+        if nargs != 2 || argt.get(0) != "str" || argt.get(1) != "int" {
+            cerr(line, "fs_set_perms() expects (str path, int mode)")
+        }
+        add_edge(ctx, cur, "b:fs_set_perms")
+        return "void"
+    }
+    # ----- Stage 8-alpha: ownership primitives (drop / clone / take) -----
+    if name == "drop" {
+        if nargs != 1 {
+            cerr(line, "drop() expects 1 argument")
+        }
+        if ctx.loop_header > 0 {
+            cerr(line, "drop() cannot be used inside a loop condition or iterable (the binding would be moved on every iteration)")
+        }
+        let at: str = argt.get(0)
+        if !is_owned_type(at) {
+            cerr(line, "drop() requires an owned (heap) type, got " + at)
+        }
+        # Argument must be a plain identifier so we can mark its binding.
+        let arg_idx: int = ctx.exprs[e].args.get(0)
+        if ctx.exprs[arg_idx].kind != "ident" {
+            cerr(line, "drop() requires a variable name (not an expression)")
+        }
+        let arg_name: str = ctx.exprs[arg_idx].name
+        if !mark_moved(env, arg_name) {
+            cerr(line, "drop() argument is not a binding: " + arg_name)
+        }
+        return "void"
+    }
+    if name == "clone" {
+        if nargs != 1 {
+            cerr(line, "clone() expects 1 argument")
+        }
+        let at2: str = argt.get(0)
+        if !is_owned_type(at2) {
+            cerr(line, "clone() requires an owned (heap) type, got " + at2)
+        }
+        # Stage 16: struct-aware clone support — a Task handle (or any
+        # composite containing one) cannot be cloned; a Chan clones by
+        # SHARING (atomic refcount + 1).
+        if !clone_supported(ctx, at2, []) {
+            cerr(line, "clone() on type " + at2 + " is not supported (Task join handles and composites containing them cannot be cloned)")
+        }
+        return at2
+    }
+    if name == "take" {
+        if nargs != 1 {
+            cerr(line, "take() expects 1 argument")
+        }
+        let at3: str = argt.get(0)
+        if !is_owned_type(at3) {
+            cerr(line, "take() requires an owned (heap) type, got " + at3)
+        }
+        # Stage 8-beta: a move inside a while/for condition or iterable
+        # would re-execute on every iteration (the binding is nulled in
+        # generated code after the first pass) — reject it up front.
+        if ctx.loop_header > 0 {
+            cerr(line, "take() cannot be used inside a loop condition or iterable (the binding would be moved on every iteration)")
+        }
+        let arg_idx3: int = ctx.exprs[e].args.get(0)
+        if ctx.exprs[arg_idx3].kind != "ident" {
+            cerr(line, "take() requires a variable name (not an expression)")
+        }
+        let arg_name3: str = ctx.exprs[arg_idx3].name
+        if !mark_moved(env, arg_name3) {
+            cerr(line, "take() argument is not a binding: " + arg_name3)
+        }
+        return at3
+    }
+    # ----- Stage 9 release (v0.20.0-alpha): Net / Rand / Proc builtins -----
+    # net_lookup(host: str) -> str — DNS A record lookup. The host
+    # argument is a taint sink (passing a tainted host would be a DNS
+    # rebinding vector — reject it like read_file does for paths).
+    if name == "net_lookup" {
+        if nargs != 1 || argt.get(0) != "str" {
+            cerr(line, "net_lookup() expects 1 str argument")
+        }
+        if is_taint_t(argt.get(0)) {
+            cerr(line, "taint-sink violation: net_lookup argument 1 is " + argt.get(0) + " (tainted values must be sanitised before reaching a sink — use sanitize_command from std.sanitize, or taint_unwrap() if you accept the risk)")
+        }
+        add_edge(ctx, cur, "b:net_lookup")
+        return "str"
+    }
+    # ----- Stage 37 (v0.56.0-alpha): TCP / UDP / TLS builtins -----
+    # Host / path arguments are taint sinks (SSRF, DNS rebinding,
+    # request smuggling). Data being SENT is NOT a sink (the user is
+    # the origin). Port is an int (untaintable). The fd argument of
+    # read/write/accept/send_to/recv_from/close is a primitive int
+    # (untaintable).
+    if name == "net_tcp_connect" {
+        if nargs != 2 || argt.get(0) != "str" || argt.get(1) != "int" {
+            cerr(line, "net_tcp_connect() expects (str host, int port)")
+        }
+        if is_taint_t(argt.get(0)) {
+            cerr(line, "taint-sink violation: net_tcp_connect argument 1 (host) is " + argt.get(0) + " (a tainted host enables SSRF + DNS rebinding — use sanitize_command, or taint_unwrap() if you accept the risk)")
+        }
+        add_edge(ctx, cur, "b:net_tcp_connect")
+        return "int"
+    }
+    if name == "net_tcp_listen" {
+        if nargs != 3 || argt.get(0) != "str" || argt.get(1) != "int"
+        || argt.get(2) != "int" {
+            cerr(line, "net_tcp_listen() expects (str host, int port, int backlog)")
+        }
+        if is_taint_t(argt.get(0)) {
+            cerr(line, "taint-sink violation: net_tcp_listen argument 1 (host) is " + argt.get(0) + " (a tainted host could bind an attacker-chosen interface — use sanitize_command, or taint_unwrap() if you accept the risk)")
+        }
+        add_edge(ctx, cur, "b:net_tcp_listen")
+        return "int"
+    }
+    if name == "net_tcp_accept" {
+        if nargs != 1 || argt.get(0) != "int" {
+            cerr(line, "net_tcp_accept() expects 1 int (listen fd)")
+        }
+        add_edge(ctx, cur, "b:net_tcp_accept")
+        return "int"
+    }
+    if name == "net_read" {
+        if nargs != 2 || argt.get(0) != "int" || argt.get(1) != "int" {
+            cerr(line, "net_read() expects (int fd, int n)")
+        }
+        add_edge(ctx, cur, "b:net_read")
+        return "str"
+    }
+    if name == "net_write" {
+        if nargs != 2 || argt.get(0) != "int" || argt.get(1) != "str" {
+            cerr(line, "net_write() expects (int fd, str data)")
+        }
+        add_edge(ctx, cur, "b:net_write")
+        return "int"
+    }
+    if name == "net_close" {
+        if nargs != 1 || argt.get(0) != "int" {
+            cerr(line, "net_close() expects 1 int (fd)")
+        }
+        add_edge(ctx, cur, "b:net_close")
+        return "void"
+    }
+    if name == "net_udp_open" {
+        if nargs != 0 {
+            cerr(line, "net_udp_open() takes no arguments")
+        }
+        add_edge(ctx, cur, "b:net_udp_open")
+        return "int"
+    }
+    if name == "net_udp_send_to" {
+        if nargs != 4 || argt.get(0) != "int" || argt.get(1) != "str"
+        || argt.get(2) != "int" || argt.get(3) != "str" {
+            cerr(line, "net_udp_send_to() expects (int fd, str host, int port, str data)")
+        }
+        if is_taint_t(argt.get(1)) {
+            cerr(line, "taint-sink violation: net_udp_send_to argument 2 (host) is " + argt.get(1) + " (a tainted host enables SSRF — use sanitize_command, or taint_unwrap() if you accept the risk)")
+        }
+        add_edge(ctx, cur, "b:net_udp_send_to")
+        return "int"
+    }
+    if name == "net_udp_recv_from" {
+        if nargs != 2 || argt.get(0) != "int" || argt.get(1) != "int" {
+            cerr(line, "net_udp_recv_from() expects (int fd, int n)")
+        }
+        add_edge(ctx, cur, "b:net_udp_recv_from")
+        return "str"
+    }
+    if name == "net_tls_get" {
+        if nargs != 3 || argt.get(0) != "str" || argt.get(1) != "int"
+        || argt.get(2) != "str" {
+            cerr(line, "net_tls_get() expects (str host, int port, str path)")
+        }
+        if is_taint_t(argt.get(0)) {
+            cerr(line, "taint-sink violation: net_tls_get argument 1 (host) is " + argt.get(0) + " (a tainted host enables SSRF — use sanitize_command, or taint_unwrap() if you accept the risk)")
+        }
+        if is_taint_t(argt.get(2)) {
+            cerr(line, "taint-sink violation: net_tls_get argument 3 (path) is " + argt.get(2) + " (a tainted path enables request smuggling — use sanitize_path, or taint_unwrap() if you accept the risk)")
+        }
+        add_edge(ctx, cur, "b:net_tls_get")
+        return "str"
+    }
+    # rand_int(max: int) -> int — uniform random int in [0, max).
+    if name == "rand_int" {
+        if nargs != 1 || argt.get(0) != "int" {
+            cerr(line, "rand_int() expects 1 int argument")
+        }
+        add_edge(ctx, cur, "b:rand_int")
+        return "int"
+    }
+    # rand_float() -> float — uniform random float in [0.0, 1.0).
+    if name == "rand_float" {
+        if nargs != 0 {
+            cerr(line, "rand_float() takes no arguments")
+        }
+        add_edge(ctx, cur, "b:rand_float")
+        return "float"
+    }
+    # rand_seed(s: int) -> void — seed the PRNG.
+    if name == "rand_seed" {
+        if nargs != 1 || argt.get(0) != "int" {
+            cerr(line, "rand_seed() expects 1 int argument")
+        }
+        add_edge(ctx, cur, "b:rand_seed")
+        return "void"
+    }
+    # proc_exec(cmd: str) -> int — run a shell command via system().
+    # The command is a taint sink (passing a tainted cmd is a command-
+    # injection vector — reject it like exit does for the exit code).
+    if name == "proc_exec" {
+        if nargs != 1 || argt.get(0) != "str" {
+            cerr(line, "proc_exec() expects 1 str argument")
+        }
+        if is_taint_t(argt.get(0)) {
+            cerr(line, "taint-sink violation: proc_exec argument 1 is " + argt.get(0) + " (tainted values must be sanitised before reaching a sink — use sanitize_command from std.sanitize, or taint_unwrap() if you accept the risk)")
+        }
+        add_edge(ctx, cur, "b:proc_exec")
+        return "int"
+    }
+    # ----- Stage 47 (v0.66.0-alpha): process management builtins -----
+    # proc_spawn(program: str, args: list[str], stdin_kind: int,
+    #            stdout_kind: int, stderr_kind: int) -> int.
+    # Returns the child pid (>= 1) or -1 on failure. The program
+    # argument is a taint sink (command injection — same threat as
+    # proc_exec). The args list elements are NOT sink-checked (they
+    # are passed as argv[1..] without shell interpretation). The
+    # stdio kinds are 0=Inherit, 1=Pipe, 2=Null.
+    if name == "proc_spawn" {
+        if nargs != 5 || argt.get(0) != "str" || argt.get(1) != "list[str]"
+        || argt.get(2) != "int" || argt.get(3) != "int"
+        || argt.get(4) != "int" {
+            cerr(line, "proc_spawn() expects (str program, list[str] args, int stdin_kind, int stdout_kind, int stderr_kind)")
+        }
+        if is_taint_t(argt.get(0)) {
+            cerr(line, "taint-sink violation: proc_spawn argument 1 (program) is " + argt.get(0) + " (a tainted program enables command injection — use sanitize_command from std.sanitize, or taint_unwrap() if you accept the risk)")
+        }
+        # Validate stdio kind literals at compile time (0/1/2).
+        let mut k_idx: int = 2
+        while k_idx <= 4 {
+            let arg_e: int = ctx.exprs[e].args.get(k_idx)
+            if ctx.exprs[arg_e].kind == "int"
+            && (ctx.exprs[arg_e].ival < 0 || ctx.exprs[arg_e].ival > 2) {
+                cerr(line, "proc_spawn() stdio kind (arg " + (k_idx + 1).to_str() + ") must be 0 (Inherit), 1 (Pipe), or 2 (Null), got literal " + ctx.exprs[arg_e].ival.to_str())
+            }
+            k_idx = k_idx + 1
+        }
+        add_edge(ctx, cur, "b:proc_spawn")
+        return "int"
+    }
+    # proc_wait(pid: int) -> int — block until child exits; return the
+    # encoded exit status (0..255 normal, 128+signum signal, -1 on
+    # error). The encoding matches proc_exec.
+    if name == "proc_wait" {
+        if nargs != 1 || argt.get(0) != "int" {
+            cerr(line, "proc_wait() expects 1 int argument (pid)")
+        }
+        add_edge(ctx, cur, "b:proc_wait")
+        return "int"
+    }
+    # proc_kill(pid: int) -> int — send SIGTERM. Returns 0 on success,
+    # -1 on error. Idempotent on already-exited children (treated as
+    # success by the runtime).
+    if name == "proc_kill" {
+        if nargs != 1 || argt.get(0) != "int" {
+            cerr(line, "proc_kill() expects 1 int argument (pid)")
+        }
+        add_edge(ctx, cur, "b:proc_kill")
+        return "int"
+    }
+    # proc_child_write(pid: int, data: str) -> int — write to the
+    # child's stdin pipe. Returns bytes written or -1 on error. The
+    # data is NOT a taint sink (the user is the origin of the data
+    # being sent to the child's stdin — same convention as net_write).
+    if name == "proc_child_write" {
+        if nargs != 2 || argt.get(0) != "int" || argt.get(1) != "str" {
+            cerr(line, "proc_child_write() expects (int pid, str data)")
+        }
+        add_edge(ctx, cur, "b:proc_child_write")
+        return "int"
+    }
+    # proc_child_read(pid: int, fd_kind: int, n: int) -> str — read up
+    # to n bytes from stdout (fd_kind=1) or stderr (fd_kind=2). Returns
+    # "" at EOF or error. fd_kind=0 (stdin) is rejected at runtime.
+    if name == "proc_child_read" {
+        if nargs != 3 || argt.get(0) != "int" || argt.get(1) != "int"
+        || argt.get(2) != "int" {
+            cerr(line, "proc_child_read() expects (int pid, int fd_kind, int n)")
+        }
+        add_edge(ctx, cur, "b:proc_child_read")
+        return "str"
+    }
+    # proc_child_close(pid: int, fd_kind: int) -> int — close the parent
+    # end of the child's stdio pipe. fd_kind: 0=stdin, 1=stdout, 2=stderr.
+    # Idempotent (closing a closed pipe returns 0).
+    if name == "proc_child_close" {
+        if nargs != 2 || argt.get(0) != "int" || argt.get(1) != "int" {
+            cerr(line, "proc_child_close() expects (int pid, int fd_kind)")
+        }
+        add_edge(ctx, cur, "b:proc_child_close")
+        return "int"
+    }
+    # ----- Stage 48 (v0.67.0-alpha): environment + cwd builtins -----
+    # env_get(key: str) -> str — read an env var. Returns the value
+    # or "" if not found. The key is a taint sink (info disclosure).
+    # The stdlib wrapper env_var(key) builds Option[tainted[str]] from
+    # env_has + env_get + taint_mark.
+    if name == "env_get" {
+        if nargs != 1 || argt.get(0) != "str" {
+            cerr(line, "env_get() expects 1 str argument (key)")
+        }
+        if is_taint_t(argt.get(0)) {
+            cerr(line, "taint-sink violation: env_get argument 1 (key) is " + argt.get(0) + " (a tainted key enables information disclosure — the attacker learns which env vars exist by observing behaviour; use sanitize_command or sanitize_path from std.sanitize, or taint_unwrap() if you accept the risk)")
+        }
+        add_edge(ctx, cur, "b:env_get")
+        return "str"
+    }
+    # env_has(key: str) -> bool — check if an env var exists. The key
+    # is a taint sink (info disclosure — same threat as env_get).
+    if name == "env_has" {
+        if nargs != 1 || argt.get(0) != "str" {
+            cerr(line, "env_has() expects 1 str argument (key)")
+        }
+        if is_taint_t(argt.get(0)) {
+            cerr(line, "taint-sink violation: env_has argument 1 (key) is " + argt.get(0) + " (a tainted key enables information disclosure — use sanitize_command or sanitize_filename from std.sanitize, or taint_unwrap() if you accept the risk)")
+        }
+        add_edge(ctx, cur, "b:env_has")
+        return "bool"
+    }
+    # env_set(key: str, value: str) -> void — set an env var. The key
+    # is a taint sink (env injection). The value is NOT a sink (the
+    # user is the origin of the value they're setting).
+    if name == "env_set" {
+        if nargs != 2 || argt.get(0) != "str" || argt.get(1) != "str" {
+            cerr(line, "env_set() expects (str key, str value)")
+        }
+        if is_taint_t(argt.get(0)) {
+            cerr(line, "taint-sink violation: env_set argument 1 (key) is " + argt.get(0) + " (a tainted key enables env injection — e.g. LD_PRELOAD, PATH, IFS; use sanitize_command or sanitize_filename from std.sanitize, or taint_unwrap() if you accept the risk)")
+        }
+        add_edge(ctx, cur, "b:env_set")
+        return "void"
+    }
+    # env_unset(key: str) -> void — unset an env var. The key is a
+    # taint sink (same threat as env_set).
+    if name == "env_unset" {
+        if nargs != 1 || argt.get(0) != "str" {
+            cerr(line, "env_unset() expects 1 str argument (key)")
+        }
+        if is_taint_t(argt.get(0)) {
+            cerr(line, "taint-sink violation: env_unset argument 1 (key) is " + argt.get(0) + " (a tainted key enables env injection — use sanitize_command or sanitize_filename from std.sanitize, or taint_unwrap() if you accept the risk)")
+        }
+        add_edge(ctx, cur, "b:env_unset")
+        return "void"
+    }
+    # cwd_get() -> str — read the cwd. No args. The stdlib wrapper
+    # env_current_dir() applies taint_mark to the result.
+    if name == "cwd_get" {
+        if nargs != 0 {
+            cerr(line, "cwd_get() takes no arguments")
+        }
+        add_edge(ctx, cur, "b:cwd_get")
+        return "str"
+    }
+    # cwd_set(path: str) -> int — change the cwd. Returns 0 on
+    # success, -1 on error. The path is a taint sink (directory
+    # traversal — same threat as read_file / write_file).
+    if name == "cwd_set" {
+        if nargs != 1 || argt.get(0) != "str" {
+            cerr(line, "cwd_set() expects 1 str argument (path)")
+        }
+        if is_taint_t(argt.get(0)) {
+            cerr(line, "taint-sink violation: cwd_set argument 1 (path) is " + argt.get(0) + " (a tainted path enables directory traversal — use sanitize_path from std.sanitize, or taint_unwrap() if you accept the risk)")
+        }
+        add_edge(ctx, cur, "b:cwd_set")
+        return "int"
+    }
+    # args_os() -> list[str] — the os-string version of args. The
+    # stdlib wrapper env_args_os() applies taint_mark per element to
+    # return list[tainted[str]].
+    if name == "args_os" {
+        if nargs != 0 {
+            cerr(line, "args_os() takes no arguments")
+        }
+        add_edge(ctx, cur, "b:args_os")
+        return "list[str]"
+    }
+    # ----- Stage 49 (v0.68.0-alpha): high-resolution time builtins -----
+    # instant_now_ns() -> int — monotonic nanoseconds. Used by Instant::now().
+    if name == "instant_now_ns" {
+        if nargs != 0 {
+            cerr(line, "instant_now_ns() takes no arguments")
+        }
+        add_edge(ctx, cur, "b:instant_now_ns")
+        return "int"
+    }
+    # system_time_now_ms() -> int — wall-clock ms since Unix epoch.
+    if name == "system_time_now_ms" {
+        if nargs != 0 {
+            cerr(line, "system_time_now_ms() takes no arguments")
+        }
+        add_edge(ctx, cur, "b:system_time_now_ms")
+        return "int"
+    }
+    # ----- Stage 50 (v0.69.0-alpha): libm-backed math builtins -----
+    # Single-argument float -> float builtins.
+    if name == "math_sin" || name == "math_cos" || name == "math_tan"
+    || name == "math_asin" || name == "math_acos" || name == "math_atan"
+    || name == "math_sinh" || name == "math_cosh" || name == "math_tanh"
+    || name == "math_exp" || name == "math_log" || name == "math_log10"
+    || name == "math_log2" || name == "math_sqrt" || name == "math_cbrt"
+    || name == "math_erf" || name == "math_erfc" || name == "math_tgamma"
+    || name == "math_lgamma" {
+        if nargs != 1 {
+            cerr(line, name + "() expects 1 float argument")
+        }
+        let at: str = check_expr(ctx, env, cur, ctx.exprs[e].args.get(0), "float")
+        if at != "float" {
+            cerr(line, name + "() expects float, got " + at)
+        }
+        add_edge(ctx, cur, "b:" + name)
+        return "float"
+    }
+    # Two-argument float builtins: math_atan2, math_pow, math_hypot,
+    # math_fmod, math_copysign.
+    if name == "math_atan2" || name == "math_pow" || name == "math_hypot"
+    || name == "math_fmod" || name == "math_copysign" {
+        if nargs != 2 {
+            cerr(line, name + "() expects 2 float arguments")
+        }
+        let a0: str = check_expr(ctx, env, cur, ctx.exprs[e].args.get(0), "float")
+        if a0 != "float" {
+            cerr(line, name + "() argument 1 expects float, got " + a0)
+        }
+        let a1: str = check_expr(ctx, env, cur, ctx.exprs[e].args.get(1), "float")
+        if a1 != "float" {
+            cerr(line, name + "() argument 2 expects float, got " + a1)
+        }
+        add_edge(ctx, cur, "b:" + name)
+        return "float"
+    }
+    # IEEE-754 predicates: float -> bool.
+    if name == "math_isnan" || name == "math_isinf"
+    || name == "math_isfinite" || name == "math_signbit" {
+        if nargs != 1 {
+            cerr(line, name + "() expects 1 float argument")
+        }
+        let at: str = check_expr(ctx, env, cur, ctx.exprs[e].args.get(0), "float")
+        if at != "float" {
+            cerr(line, name + "() expects float, got " + at)
+        }
+        add_edge(ctx, cur, "b:" + name)
+        return "bool"
+    }
+    # ----- Stage 16 (v0.27.0-alpha): concurrency builtins -----
+    # chan_new() -> Chan[T] — contextual typing (same pattern as map_new).
+    if name == "chan_new" {
+        if nargs != 0 {
+            cerr(line, "chan_new() takes no arguments")
+        }
+        if expected == "" || !is_chan_t(expected) {
+            cerr(line, "chan_new() requires a 'Chan[T]' type in the surrounding context")
+        }
+        add_edge(ctx, cur, "b:chan_new")
+        return expected
+    }
+    # chan_new_bounded(cap: int) -> Chan[T] — Stage-16 perfection
+    # (v0.29.0-alpha): a bounded channel whose send blocks while it
+    # holds `cap` messages (backpressure). A literal capacity < 1 is a
+    # COMPILE error; dynamic capacities are validated at runtime
+    # (clean panic 101).
+    if name == "chan_new_bounded" {
+        if nargs != 1 {
+            cerr(line, "chan_new_bounded() expects 1 int argument (the capacity)")
+        }
+        let a0: str = argt.get(0)
+        if a0 != "int" {
+            cerr(line, "chan_new_bounded() capacity expects int, got " + a0)
+        }
+        let capn: int = ctx.exprs[ctx.exprs[e].args.get(0)].ival
+        let capkind: str = ctx.exprs[ctx.exprs[e].args.get(0)].kind
+        if capkind == "int" && capn < 1 {
+            cerr(line, "chan_new_bounded() capacity must be >= 1, got literal " + capn.to_str())
+        }
+        if expected == "" || !is_chan_t(expected) {
+            cerr(line, "chan_new_bounded() requires a 'Chan[T]' type in the surrounding context")
+        }
+        add_edge(ctx, cur, "b:chan_new_bounded")
+        return expected
+    }
+    # select(chs: list[Chan[T]]) -> int — index of the first ready channel.
+    if name == "select" {
+        if nargs != 1 {
+            cerr(line, "select() expects 1 list[Chan[T]] argument")
+        }
+        let a0: str = argt.get(0)
+        if !is_list_t(a0) || !is_chan_t(list_elem_t(a0)) {
+            cerr(line, "select() expects a list[Chan[T]], got " + a0)
+        }
+        add_edge(ctx, cur, "b:select")
+        return "int"
+    }
+    # ----- Stage 33 (v0.52.0-alpha): async/await builtins -----
+    # await(fut: Future[T]) -> T
+    if name == "await" {
+        if nargs != 1 {
+            cerr(line, "await() expects 1 Future[T] argument")
+        }
+        let a0: str = argt.get(0)
+        if !is_future_t(a0) {
+            cerr(line, "await() expects a Future[T], got " + a0)
+        }
+        add_edge(ctx, cur, "b:await")
+        return future_inner_t(a0)
+    }
+    # future_ready(v: T) -> Future[T] — contextual typing.
+    if name == "future_ready" {
+        if nargs != 1 {
+            cerr(line, "future_ready() expects 1 argument")
+        }
+        if expected == "" || !is_future_t(expected) {
+            cerr(line, "future_ready() requires a 'Future[T]' type in the surrounding context")
+        }
+        let want_t: str = future_inner_t(expected)
+        let at: str = argt.get(0)
+        if at != "never" && at != want_t {
+            cerr(line, "future_ready() argument expects " + want_t + ", got " + at)
+        }
+        if !type_is_send(ctx, want_t, []) {
+            cerr(line, "type " + want_t + " is not Send: a future's value crosses a task boundary")
+        }
+        add_edge(ctx, cur, "b:future_ready")
+        return expected
+    }
+    # future_poll(fut: Future[T]) -> Option[T]
+    if name == "future_poll" {
+        if nargs != 1 {
+            cerr(line, "future_poll() expects 1 Future[T] argument")
+        }
+        let a0: str = argt.get(0)
+        if !is_future_t(a0) {
+            cerr(line, "future_poll() expects a Future[T], got " + a0)
+        }
+        # Deep-scan-25 fix (parity with the boot checker): the runtime
+        # hard-codes the built-in Option shape (Some/None), so a
+        # user-defined enum Option with a different shape would check
+        # clean and then never match at runtime. Validate the shape
+        # whenever an Option enum exists.
+        if ctx.enums.has("Option") {
+            let odef: EnumInfo = ctx.enums.get_or("Option", dummy_enum())
+            let mut has_some: bool = false
+            let mut has_none: bool = false
+            let mut vi: int = 0
+            while vi < odef.variants.len() {
+                let vn: str = odef.variants.get(vi)
+                let pl: list[str] = odef.payloads.get(vi)
+                if vn == "Some" && pl.len() == 1 {
+                    has_some = true
+                }
+                if vn == "None" && pl.len() == 0 {
+                    has_none = true
+                }
+                vi = vi + 1
+            }
+            if !(has_some && has_none) || odef.variants.len() != 2 {
+                cerr(line, "future_poll() requires the built-in Option shape 'enum Option[T] { None, Some(T) }' — the program's Option enum does not match it")
+            }
+        }
+        add_edge(ctx, cur, "b:future_poll")
+        return "Option[" + future_inner_t(a0) + "]"
+    }
+    # future_select(futs: list[Future[T]]) -> int
+    if name == "future_select" {
+        if nargs != 1 {
+            cerr(line, "future_select() expects 1 list[Future[T]] argument")
+        }
+        let a0: str = argt.get(0)
+        if !is_list_t(a0) || !is_future_t(list_elem_t(a0)) {
+            cerr(line, "future_select() expects a list[Future[T]], got " + a0)
+        }
+        add_edge(ctx, cur, "b:future_select")
+        return "int"
+    }
+    # ----- Stage 34 (v0.53.0-alpha): async stream builtins -----
+    # stream_new(cap: int) -> Stream[T] — contextual typing.
+    if name == "stream_new" {
+        if nargs != 1 {
+            cerr(line, "stream_new() expects 1 int argument")
+        }
+        let a0: str = argt.get(0)
+        if a0 != "never" && a0 != "int" {
+            cerr(line, "stream_new() capacity expects int, got " + a0)
+        }
+        if expected == "" || !is_stream_t(expected) {
+            cerr(line, "stream_new() requires a 'Stream[T]' type in the surrounding context")
+        }
+        if !type_is_send(ctx, stream_inner_t(expected), []) {
+            cerr(line, "stream_new() element type " + stream_inner_t(expected) + " is not Send")
+        }
+        add_edge(ctx, cur, "b:stream_new")
+        return expected
+    }
+    # stream_send(s: Stream[T], v: T) -> void
+    if name == "stream_send" {
+        if nargs != 2 {
+            cerr(line, "stream_send() expects 2 arguments")
+        }
+        let a0: str = argt.get(0)
+        if !is_stream_t(a0) {
+            cerr(line, "stream_send() argument 1 expects Stream[T], got " + a0)
+        }
+        let et: str = stream_inner_t(a0)
+        let a1: str = argt.get(1)
+        if a1 != "never" && a1 != et {
+            cerr(line, "stream_send() argument 2 expects " + et + ", got " + a1)
+        }
+        if !type_is_send(ctx, et, []) {
+            cerr(line, "type " + et + " is not Send: stream values cross a task boundary")
+        }
+        # Deep-scan-25 fix (parity with the boot checker): reject bare
+        # ident/field/index reads of owned element types — the same
+        # channel-send data-race rule chan.send enforces (the runtime
+        # deep-copies borrowed composites, but the syntactic rule gives
+        # the user a compile-time guarantee instead of a silent copy).
+        let vidx: int = ctx.exprs[e].args.get(1)
+        let vkind: str = ctx.exprs[vidx].kind
+        if is_owned_type(et) && (vkind == "ident" || vkind == "field" || vkind == "index") {
+            let mut what: str = "a borrowed value"
+            if vkind == "ident" {
+                what = "variable '" + ctx.exprs[vidx].name + "'"
+            }
+            cerr(line, "cannot share " + what + " across tasks: stream_send() reads it directly — pass clone(x) or take(x)")
+        }
+        add_edge(ctx, cur, "b:stream_send")
+        return "void"
+    }
+    # stream_recv(s: Stream[T]) -> T
+    if name == "stream_recv" {
+        if nargs != 1 {
+            cerr(line, "stream_recv() expects 1 Stream[T] argument")
+        }
+        let a0: str = argt.get(0)
+        if !is_stream_t(a0) {
+            cerr(line, "stream_recv() expects Stream[T], got " + a0)
+        }
+        add_edge(ctx, cur, "b:stream_recv")
+        return stream_inner_t(a0)
+    }
+    # stream_try_recv(s: Stream[T], default: T) -> T
+    if name == "stream_try_recv" {
+        if nargs != 2 {
+            cerr(line, "stream_try_recv() expects 2 arguments")
+        }
+        let a0: str = argt.get(0)
+        if !is_stream_t(a0) {
+            cerr(line, "stream_try_recv() argument 1 expects Stream[T], got " + a0)
+        }
+        let et: str = stream_inner_t(a0)
+        let a1: str = argt.get(1)
+        if a1 != "never" && a1 != et {
+            cerr(line, "stream_try_recv() argument 2 expects " + et + ", got " + a1)
+        }
+        add_edge(ctx, cur, "b:stream_try_recv")
+        return et
+    }
+    # stream_len(s: Stream[T]) -> int
+    if name == "stream_len" {
+        if nargs != 1 {
+            cerr(line, "stream_len() expects 1 Stream[T] argument")
+        }
+        let a0: str = argt.get(0)
+        if !is_stream_t(a0) {
+            cerr(line, "stream_len() expects Stream[T], got " + a0)
+        }
+        add_edge(ctx, cur, "b:stream_len")
+        return "int"
+    }
+    # stream_close(s: Stream[T]) -> void
+    if name == "stream_close" {
+        if nargs != 1 {
+            cerr(line, "stream_close() expects 1 Stream[T] argument")
+        }
+        let a0: str = argt.get(0)
+        if !is_stream_t(a0) {
+            cerr(line, "stream_close() expects Stream[T], got " + a0)
+        }
+        # Deep-scan-25 fix (parity with the boot checker): the builtin
+        # sends the INT64_MIN sentinel in BOTH backends, so non-int
+        # streams would type-confuse on recv. Non-int producers send
+        # their own sentinel via stream_send.
+        if is_stream_t(a0) && stream_inner_t(a0) != "int" {
+            cerr(line, "stream_close() only supports Stream[int] (it sends the INT64_MIN sentinel); for Stream[" + stream_inner_t(a0) + "] send your own end-of-stream value via stream_send instead")
+        }
+        add_edge(ctx, cur, "b:stream_close")
+        return "void"
+    }
+    # stream_take_int(in_s: Stream[int], n: int) -> Stream[int]
+    if name == "stream_take_int" {
+        if nargs != 2 {
+            cerr(line, "stream_take_int() expects 2 arguments")
+        }
+        let a0: str = argt.get(0)
+        if !is_stream_t(a0) || stream_inner_t(a0) != "int" {
+            cerr(line, "stream_take_int() argument 1 expects Stream[int], got " + a0)
+        }
+        let a1: str = argt.get(1)
+        if a1 != "never" && a1 != "int" {
+            cerr(line, "stream_take_int() argument 2 expects int, got " + a1)
+        }
+        if expected == "" || !is_stream_t(expected) || stream_inner_t(expected) != "int" {
+            cerr(line, "stream_take_int() requires a 'Stream[int]' type in the surrounding context")
+        }
+        add_edge(ctx, cur, "b:stream_take_int")
+        return expected
+    }
+    # stream_merge_int(a, b) -> Stream[int]
+    if name == "stream_merge_int" {
+        if nargs != 2 {
+            cerr(line, "stream_merge_int() expects 2 arguments")
+        }
+        let a0: str = argt.get(0)
+        let a1: str = argt.get(1)
+        if !is_stream_t(a0) || stream_inner_t(a0) != "int" {
+            cerr(line, "stream_merge_int() argument 1 expects Stream[int], got " + a0)
+        }
+        if !is_stream_t(a1) || stream_inner_t(a1) != "int" {
+            cerr(line, "stream_merge_int() argument 2 expects Stream[int], got " + a1)
+        }
+        if expected == "" || !is_stream_t(expected) || stream_inner_t(expected) != "int" {
+            cerr(line, "stream_merge_int() requires a 'Stream[int]' type in the surrounding context")
+        }
+        add_edge(ctx, cur, "b:stream_merge_int")
+        return expected
+    }
+    cerr(line, "unknown builtin function: " + name)
+    return ""
+}
+
+# Stage 33 (v0.52.0-alpha): check_async_spawn_call — mirrors
+# check_spawn_call but returns Future[R] instead of Task[R]. The target
+# function must NOT return void (a future carries a value).
+fn check_async_spawn_call(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int) -> str {
+    let mut line: int = ctx.exprs[e].line
+    let nargs: int = ctx.exprs[e].args.len()
+    if nargs < 1 {
+        cerr(line, "async_spawn() expects a function name followed by its arguments")
+    }
+    let fn_arg: int = ctx.exprs[e].args.get(0)
+    if ctx.exprs[fn_arg].kind != "ident" {
+        cerr(line, "async_spawn() argument 1 must be a function name (an identifier)")
+    }
+    let fname: str = ctx.exprs[fn_arg].name
+    if is_builtin_fn(fname) {
+        cerr(line, "async_spawn() target cannot be a builtin function: " + fname)
+    }
+    if !ctx.fns.has(fname) {
+        cerr(line, "async_spawn() target function does not exist: " + fname)
+    }
+    let tf: FnInfo = ctx.fns.get_or(fname, dummy_fn())
+    if tf.is_method {
+        cerr(line, "async_spawn() target cannot be a method: " + fname)
+    }
+    if tf.typeparams.len() > 0 {
+        cerr(line, "async_spawn() of generic functions is not supported yet: " + fname)
+    }
+    if tf.is_extern {
+        cerr(line, "async_spawn() of extern (FFI) functions is not supported")
+    }
+    if tf.ret == "void" {
+        cerr(line, "async_spawn() target " + fname + " returns void — a Future must carry a value (use plain spawn() for void tasks)")
+    }
+    let vargs: list[int] = []
+    let mut si: int = 1
+    while si < ctx.exprs[e].args.len() {
+        vargs.push(ctx.exprs[e].args.get(si))
+        si = si + 1
+    }
+    if vargs.len() != tf.params.len() {
+        cerr(line, "async_spawn() target " + fname + " expects " + tf.params.len().to_str() + " arguments, got " + vargs.len().to_str())
+    }
+    let mut i: int = 0
+    while i < vargs.len() {
+        let aidx: int = vargs.get(i)
+        let pt: str = tf.ptypes.get(i)
+        let at: str = check_expr(ctx, env, cur, aidx, pt)
+        if at != "never" && at != pt {
+            cerr(line, "async_spawn() argument '" + tf.params.get(i) + "' of " + fname + " expects " + pt + ", got " + at)
+        }
+        if !type_is_send(ctx, pt, []) {
+            cerr(line, "type " + pt + " is not Send: values of this type cannot cross a task boundary (async_spawn)")
+        }
+        if is_owned_type(pt) {
+            let akind: str = ctx.exprs[aidx].kind
+            if akind == "ident" || akind == "field" || akind == "index" {
+                let mut what: str = "a borrowed value"
+                if akind == "ident" {
+                    what = "variable '" + ctx.exprs[aidx].name + "'"
+                }
+                cerr(line, "cannot share " + what + " across tasks: async_spawn() argument " + (i + 2).to_str() + " reads it directly — pass clone(x) or take(x)")
+            }
+        }
+        i = i + 1
+    }
+    add_edge(ctx, cur, "b:async_spawn")
+    # Deep-scan-20 soundness fix: same rule as spawn — the future's
+    # result value crosses the task boundary at await(), so the return
+    # type must be Send. Mirror of the boot/checker.py fix.
+    if !type_is_send(ctx, tf.ret, []) {
+        cerr(line, "async_spawn() target " + fname + " returns " + tf.ret + ", which is not Send: the result crosses the task boundary at await()")
+    }
+    add_edge(ctx, cur, fname)
+    ctx.exprs[e].args = vargs
+    ctx.exprs[e].mkey = "async_spawn"
+    ctx.exprs[e].mop = fname
+    return "Future[" + tf.ret + "]"
+}
+
+# Stage 34 (v0.53.0-alpha): check_gen_spawn_call — gen_spawn(f, args...)
+# -> Stream[T]. The target function must take Stream[T] as its FIRST
+# parameter (the generator writes into this stream).
+fn check_gen_spawn_call(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, expected: str) -> str {
+    let mut line: int = ctx.exprs[e].line
+    let nargs: int = ctx.exprs[e].args.len()
+    if nargs < 1 {
+        cerr(line, "gen_spawn() expects a function name followed by its arguments")
+    }
+    let fn_arg: int = ctx.exprs[e].args.get(0)
+    if ctx.exprs[fn_arg].kind != "ident" {
+        cerr(line, "gen_spawn() argument 1 must be a function name (an identifier)")
+    }
+    let fname: str = ctx.exprs[fn_arg].name
+    if is_builtin_fn(fname) {
+        cerr(line, "gen_spawn() target cannot be a builtin function: " + fname)
+    }
+    if !ctx.fns.has(fname) {
+        cerr(line, "gen_spawn() target function does not exist: " + fname)
+    }
+    let tf: FnInfo = ctx.fns.get_or(fname, dummy_fn())
+    if tf.is_method || tf.typeparams.len() > 0 || tf.is_extern {
+        cerr(line, "gen_spawn() target must be a non-generic, non-extern free function: " + fname)
+    }
+    if expected == "" || !is_stream_t(expected) {
+        cerr(line, "gen_spawn() requires a 'Stream[T]' type in the surrounding context")
+    }
+    let stream_t: str = expected
+    if tf.params.len() < 1 || tf.ptypes.get(0) != stream_t {
+        cerr(line, "gen_spawn() target " + fname + " must take " + stream_t + " as its first parameter (the generator writes into this stream)")
+    }
+    let vargs: list[int] = []
+    let mut si: int = 1
+    while si < ctx.exprs[e].args.len() {
+        vargs.push(ctx.exprs[e].args.get(si))
+        si = si + 1
+    }
+    if vargs.len() != tf.params.len() - 1 {
+        cerr(line, "gen_spawn() target " + fname + " expects " + (tf.params.len() - 1).to_str() + " arguments after the stream, got " + vargs.len().to_str())
+    }
+    let mut i: int = 0
+    while i < vargs.len() {
+        let aidx: int = vargs.get(i)
+        let pt: str = tf.ptypes.get(i + 1)
+        let at: str = check_expr(ctx, env, cur, aidx, pt)
+        if at != "never" && at != pt {
+            cerr(line, "gen_spawn() argument '" + tf.params.get(i + 1) + "' of " + fname + " expects " + pt + ", got " + at)
+        }
+        if !type_is_send(ctx, pt, []) {
+            cerr(line, "type " + pt + " is not Send: gen_spawn() arguments cross a task boundary")
+        }
+        if is_owned_type(pt) {
+            let akind: str = ctx.exprs[aidx].kind
+            if akind == "ident" || akind == "field" || akind == "index" {
+                let mut what: str = "a borrowed value"
+                if akind == "ident" {
+                    what = "variable '" + ctx.exprs[aidx].name + "'"
+                }
+                cerr(line, "cannot share " + what + " across tasks: gen_spawn() argument " + (i + 2).to_str() + " reads it directly — pass clone(x) or take(x)")
+            }
+        }
+        i = i + 1
+    }
+    add_edge(ctx, cur, "b:gen_spawn")
+    add_edge(ctx, cur, fname)
+    ctx.exprs[e].args = vargs
+    ctx.exprs[e].mkey = "gen_spawn"
+    ctx.exprs[e].mop = fname
+    return expected
+}
+
+# Stage 34: check_stream_combinator_call — stream_map_int /
+# stream_filter_int / stream_fold_int / stream_flat_map_int.
+# Each takes a Stream[int] and a function name (the fn-name is
+# recorded in mop via the rewrite; the args list keeps only the
+# stream arg, plus the init value for fold).
+fn check_stream_combinator_call(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, name: str, expected: str) -> str {
+    let mut line: int = ctx.exprs[e].line
+    let nargs: int = ctx.exprs[e].args.len()
+    # Determine argument layout: map/filter/flat_map take (stream, fn_name);
+    # fold takes (stream, init, fn_name).
+    let fold_p: bool = name == "stream_fold_int"
+    if fold_p {
+        if nargs != 3 {
+            cerr(line, name + "() expects 3 arguments (stream, init, fn_name)")
+        }
+    } else {
+        if nargs != 2 {
+            cerr(line, name + "() expects 2 arguments (stream, fn_name)")
+        }
+    }
+    # Check the stream argument.
+    let stream_arg: int = ctx.exprs[e].args.get(0)
+    let st: str = check_expr(ctx, env, cur, stream_arg, "")
+    if !is_stream_t(st) || stream_inner_t(st) != "int" {
+        cerr(line, name + "() argument 1 expects Stream[int], got " + st)
+    }
+    # For fold, check the init argument.
+    let mut init_arg: int = -1
+    if fold_p {
+        init_arg = ctx.exprs[e].args.get(1)
+        let it: str = check_expr(ctx, env, cur, init_arg, "int")
+        if it != "never" && it != "int" {
+            cerr(line, "stream_fold_int() argument 2 expects int, got " + it)
+        }
+    }
+    # Check the function-name argument (index 1 for map/filter/flat_map,
+    # index 2 for fold).
+    let mut fn_arg_idx: int = 1
+    if fold_p {
+        fn_arg_idx = 2
+    }
+    let fn_arg: int = ctx.exprs[e].args.get(fn_arg_idx)
+    if ctx.exprs[fn_arg].kind != "ident" {
+        cerr(line, name + "() argument " + (fn_arg_idx + 1).to_str() + " must be a function name (an identifier)")
+    }
+    let fname: str = ctx.exprs[fn_arg].name
+    if is_builtin_fn(fname) {
+        cerr(line, name + "() target cannot be a builtin function: " + fname)
+    }
+    if !ctx.fns.has(fname) {
+        cerr(line, name + "() target function does not exist: " + fname)
+    }
+    let tf: FnInfo = ctx.fns.get_or(fname, dummy_fn())
+    if tf.is_method || tf.typeparams.len() > 0 || tf.is_extern {
+        cerr(line, name + "() target must be a non-generic, non-extern free function: " + fname)
+    }
+    # Validate the target's signature.
+    if name == "stream_map_int" || name == "stream_filter_int" {
+        if tf.params.len() != 1 || tf.ptypes.get(0) != "int" || tf.ret != "int" {
+            cerr(line, name + "() target " + fname + " must have signature fn(int) -> int")
+        }
+    } else if name == "stream_fold_int" {
+        if tf.params.len() != 2 || tf.ptypes.get(0) != "int" || tf.ptypes.get(1) != "int" || tf.ret != "int" {
+            cerr(line, "stream_fold_int() target " + fname + " must have signature fn(int, int) -> int")
+        }
+    } else if name == "stream_flat_map_int" {
+        if tf.params.len() != 1 || tf.ptypes.get(0) != "int" || tf.ret != "Stream[int]" {
+            cerr(line, "stream_flat_map_int() target " + fname + " must have signature fn(int) -> Stream[int]")
+        }
+    }
+    # For non-fold combinators, validate the expected return type.
+    if !fold_p {
+        if expected == "" || !is_stream_t(expected) || stream_inner_t(expected) != "int" {
+            cerr(line, name + "() requires a 'Stream[int]' type in the surrounding context")
+        }
+    }
+    add_edge(ctx, cur, "b:" + name)
+    add_edge(ctx, cur, fname)
+    # Rewrite: drop the fn-name argument, record the target.
+    let new_args: list[int] = [stream_arg]
+    if fold_p {
+        new_args.push(init_arg)
+    }
+    ctx.exprs[e].args = new_args
+    ctx.exprs[e].mkey = name
+    ctx.exprs[e].mop = fname
+    if fold_p {
+        return "int"
+    }
+    return expected
+}
+
+fn check_method(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int) -> str {
+    let name: str = ctx.exprs[e].name
+    let mut line: int = ctx.exprs[e].line
+    let tt: str = check_expr(ctx, env, cur, ctx.exprs[e].left, "")
+    # Stage 27 perfection (v0.50.3-alpha) deep-scan-18: BUG-06 fix.
+    # Propagate `never` instead of erroring (bottom-type rule). A
+    # method call on a never-typed receiver is dead code (the receiver
+    # diverged) — the call result is also never.
+    if tt == "never" {
+        ctx.exprs[e].t = "never"
+        return "never"
+    }
+    let nargs: int = ctx.exprs[e].args.len()
+    # User-defined struct method (resolve via base name).
+    let st: StructInfo = resolve_struct(ctx, tt)
+    if st.name != "" {
+        let tt_base: str = type_base(tt)
+        if ctx.methods_of.has(tt_base) {
+            let cands: list[str] = ctx.methods_of.get_or(tt_base, [])
+            let mut key: str = ""
+            let mut i: int = 0
+            while i < cands.len() {
+                let mut k: str = cands.get(i)
+                if ctx.fns.get_or(k, dummy_fn()).name == name {
+                    key = k
+                }
+                i = i + 1
+            }
+            if key == "" {
+                cerr(line, "struct " + tt_base + " has no method " + name)
+            }
+            ctx.exprs[e].muser = true
+            ctx.exprs[e].mkey = key
+            add_edge(ctx, cur, key)
+            let f: FnInfo = ctx.fns.get_or(key, dummy_fn())
+            let np: int = f.params.len() - 1
+            if nargs != np {
+                cerr(line, tt_base + "." + name + " expects " + np.to_str() + " arguments, got " + nargs.to_str())
+            }
+            # Build a type_map combining struct's type args + method's type params.
+            let type_map_tps: list[str] = []
+            let type_map_targs: list[str] = []
+            # Add the struct's type params first, bound to the actual type args.
+            let mut si: int = 0
+            while si < st.typeparams.len() {
+                type_map_tps.push(st.typeparams.get(si))
+                let targs_of_tt: list[str] = type_args(tt)
+                if si < targs_of_tt.len() {
+                    type_map_targs.push(targs_of_tt.get(si))
+                } else {
+                    type_map_targs.push("")
+                }
+                si = si + 1
+            }
+            # Then the method's own type params (initially unbound).
+            let mut mi: int = 0
+            while mi < f.typeparams.len() {
+                type_map_tps.push(f.typeparams.get(mi))
+                type_map_targs.push("")
+                mi = mi + 1
+            }
+            # Infer method's type params from arguments.
+            # BUG-A2 fix: cache first-pass types per argument so we don't
+            # re-run check_expr on the same argument in the second pass.
+            let first_at: list[str] = []
+            let mut fa_i: int = 0
+            while fa_i < nargs {
+                first_at.push("")
+                fa_i = fa_i + 1
+            }
+            if f.typeparams.len() > 0 {
+                let mut ai: int = 0
+                while ai < nargs {
+                    let at: str = check_expr(ctx, env, cur, ctx.exprs[e].args.get(ai), "")
+                    first_at.set(ai, at)
+                    if at != "never" {
+                        # pt is f.ptypes.get(ai+1) — instantiate struct type
+                        # params first, then unify with method type params.
+                        # NOTE (BUG-002 fix): we pass an explicit offset
+                        # (st.typeparams.len()) so unify_into_offset writes
+                        # directly into the method's portion of type_map_targs.
+                        let pt: str = f.ptypes.get(ai + 1)
+                        let inst_pt: str = instantiate_type(pt, st.typeparams, type_args(tt))
+                        unify_into_offset(ctx, inst_pt, at, f.typeparams, type_map_targs, st.typeparams.len())
+                    }
+                    ai = ai + 1
+                }
+                let mut ti: int = st.typeparams.len()
+                while ti < type_map_targs.len() {
+                    if type_map_targs.get(ti) == "" {
+                        cerr(line, "cannot infer type argument '" + f.typeparams.get(ti - st.typeparams.len()) + "' for " + tt_base + "." + name)
+                    }
+                    ti = ti + 1
+                }
+            }
+            # Type-check arguments against instantiated parameter types.
+            let mut ai2: int = 0
+            while ai2 < nargs {
+                let pt: str = f.ptypes.get(ai2 + 1)
+                let inst_pt: str = instantiate_type(pt, type_map_tps, type_map_targs)
+                # Reuse the first-pass type — avoids re-running check_expr.
+                let mut at: str = first_at.get(ai2)
+                if at == "" {
+                    at = check_expr(ctx, env, cur, ctx.exprs[e].args.get(ai2), inst_pt)
+                }
+                if at == "never" {
+                    ai2 = ai2 + 1
+                    continue
+                }
+                if at != inst_pt {
+                    cerr(line, "argument of " + tt_base + "." + name + " expects " + inst_pt + ", got " + at)
+                }
+                ai2 = ai2 + 1
+            }
+            # BUG-002 fix: if the method has its own type params (or the
+            # struct is generic), record this instantiation for codegen.
+            # The mangled name encodes BOTH the struct's type args (resolved
+            # from the receiver type) AND the method's inferred type args.
+            if f.typeparams.len() > 0 || st.typeparams.len() > 0 {
+                let mut all_targs: list[str] = []
+                # Struct's type args first.
+                let mut si2: int = 0
+                let targs_of_tt: list[str] = type_args(tt)
+                while si2 < st.typeparams.len() {
+                    if si2 < targs_of_tt.len() {
+                        all_targs.push(targs_of_tt.get(si2))
+                    } else {
+                        all_targs.push("")
+                    }
+                    si2 = si2 + 1
+                }
+                # Then method's own type args.
+                let mut mi2: int = st.typeparams.len()
+                while mi2 < type_map_targs.len() {
+                    all_targs.push(type_map_targs.get(mi2))
+                    mi2 = mi2 + 1
+                }
+                # Compose a combined typeparams list for the mangling.
+                let combined_tps: list[str] = []
+                let mut ci: int = 0
+                while ci < st.typeparams.len() {
+                    combined_tps.push(st.typeparams.get(ci))
+                    ci = ci + 1
+                }
+                let mut cj: int = 0
+                while cj < f.typeparams.len() {
+                    combined_tps.push(f.typeparams.get(cj))
+                    cj = cj + 1
+                }
+                let inst_str: str = key + "|" + join(all_targs, ",")
+                if !list_has(ctx.fn_insts, inst_str) {
+                    ctx.fn_insts.push(inst_str)
+                }
+                ctx.exprs[e].mkey = c_mangled_fn_name(key, combined_tps, all_targs)
+            }
+            return instantiate_type(f.ret, type_map_tps, type_map_targs)
+        }
+    }
+    # Builtin method: ptypes + ret table by target type
+    let ptypes: list[str] = []
+    let mut ret: str = ""
+    if tt == "str" {
+        if name == "len" {
+            ret = "int"
+        }
+        else if name == "byte_at" {
+            ptypes.push("int")
+            ret = "int"
+        }
+        else if name == "slice" {
+            ptypes.push("int")
+            ptypes.push("int")
+            ret = "str"
+        }
+        else if name == "find" {
+            ptypes.push("str")
+            ret = "int"
+        }
+        else if name == "contains" {
+            ptypes.push("str")
+            ret = "bool"
+        }
+        else if name == "starts_with" {
+            ptypes.push("str")
+            ret = "bool"
+        }
+        else if name == "ends_with" {
+            ptypes.push("str")
+            ret = "bool"
+        }
+        else if name == "split" {
+            ptypes.push("str")
+            ret = "list[str]"
+        }
+        else if name == "trim" {
+            ret = "str"
+        }
+        else if name == "to_int" {
+            ret = "int"
+        }
+        else if name == "to_float" {
+            ret = "float"
+        }
+        else if name == "to_str" {
+            ret = "str"
+        }
+        else {
+            cerr(line, "str has no method " + name)
+        }
+        ctx.exprs[e].mop = "str." + name
+    } else if tt == "int" {
+        if name == "to_str" {
+            ret = "str"
+        }
+        else if name == "to_float" {
+            ret = "float"
+        }
+        else if name == "abs" {
+            ret = "int"
+        }
+        else {
+            cerr(line, "int has no method " + name)
+        }
+        ctx.exprs[e].mop = "int." + name
+    } else if tt == "float" {
+        if name == "to_str" {
+            ret = "str"
+        }
+        else if name == "to_int" {
+            ret = "int"
+        }
+        else if name == "abs" {
+            ret = "float"
+        }
+        else {
+            cerr(line, "float has no method " + name)
+        }
+        ctx.exprs[e].mop = "float." + name
+    } else if tt == "bool" {
+        if name == "to_str" {
+            ret = "str"
+        }
+        else {
+            cerr(line, "bool has no method " + name)
+        }
+        ctx.exprs[e].mop = "bool." + name
+    } else if is_list_t(tt) {
+        let mut elem: str = list_elem_t(tt)
+        if name == "len" {
+            ret = "int"
+        }
+        else if name == "push" {
+            ptypes.push(elem)
+            ret = "void"
+        }
+        else if name == "get" {
+            ptypes.push("int")
+            ret = elem
+        }
+        else if name == "set" {
+            ptypes.push("int")
+            ptypes.push(elem)
+            ret = "void"
+        }
+        else if name == "pop" {
+            ret = elem
+        }
+        else {
+            cerr(line, "list has no method " + name)
+        }
+        ctx.exprs[e].mop = "list." + name
+    } else if is_map_t(tt) {
+        let vt: str = map_val_t(tt)
+        if name == "len" {
+            ret = "int"
+        }
+        else if name == "set" {
+            ptypes.push("str")
+            ptypes.push(vt)
+            ret = "void"
+        }
+        else if name == "get_or" {
+            ptypes.push("str")
+            ptypes.push(vt)
+            ret = vt
+        }
+        else if name == "has" {
+            ptypes.push("str")
+            ret = "bool"
+        }
+        else if name == "keys" {
+            ret = "list[str]"
+        }
+        else {
+            cerr(line, "map has no method " + name)
+        }
+        ctx.exprs[e].mop = "map." + name
+    } else if is_chan_t(tt) {
+        # Stage 16 (v0.27.0-alpha): Chan[T] methods. Stage-16 perfection
+        # (v0.29.0-alpha) adds the non-blocking pair try_send/recv_or.
+        let celem: str = chan_inner_t(tt)
+        if name == "len" {
+            ret = "int"
+        }
+        else if name == "recv" {
+            ret = celem
+        }
+        else if name == "recv_or" {
+            ptypes.push(celem)
+            ret = celem
+        }
+        else if name == "send" {
+            ptypes.push(celem)
+            ret = "void"
+        }
+        else if name == "try_send" {
+            ptypes.push(celem)
+            ret = "bool"
+        }
+        else {
+            cerr(line, "Chan has no method " + name + " (available: send, try_send, recv, recv_or, len)")
+        }
+        ctx.exprs[e].mop = "chan." + name
+    } else if is_task_t(tt) {
+        # Stage 16 (v0.27.0-alpha): Task[R].join() -> R.
+        if name != "join" {
+            cerr(line, "Task has no method " + name + " (available: join)")
+        }
+        ret = task_inner_t(tt)
+        ctx.exprs[e].mop = "task.join"
+    } else {
+        cerr(line, "cannot call method on type " + tt)
+    }
+    ctx.exprs[e].muser = false
+    # Stage 16: method-level effects + the channel-send data-race rule.
+    # These are the first builtin METHODS that carry an effect — the
+    # call-graph edge keeps the effects fixpoint sound for them.
+    # (v0.29.0-alpha: chan.try_send / chan.recv_or join the family.)
+    if ctx.exprs[e].mop == "chan.send" || ctx.exprs[e].mop == "chan.try_send"
+    || ctx.exprs[e].mop == "chan.recv" || ctx.exprs[e].mop == "chan.recv_or"
+    || ctx.exprs[e].mop == "chan.len" || ctx.exprs[e].mop == "task.join" {
+        add_edge(ctx, cur, "b:" + ctx.exprs[e].mop)
+    }
+    if(ctx.exprs[e].mop == "chan.send" || ctx.exprs[e].mop == "chan.try_send") && nargs >= 1 {
+        # Send rule: the message type must be Send (both the blocking
+        # send and the non-blocking try_send cross the task boundary)...
+        let vt: str = chan_inner_t(tt)
+        if !type_is_send(ctx, vt, []) {
+            cerr(line, "type " + vt + " is not Send: values of this type cannot cross a task boundary")
+        }
+    }
+    if nargs != ptypes.len() {
+        cerr(line, tt + "." + name + " expects " + ptypes.len().to_str() + " arguments, got " + nargs.to_str())
+    }
+    let mut i: int = 0
+    while i < nargs {
+        let at: str = check_expr(ctx, env, cur, ctx.exprs[e].args.get(i), ptypes.get(i))
+        if at != ptypes.get(i) {
+            cerr(line, "argument of " + tt + "." + name + " expects " + ptypes.get(i) + ", got " + at)
+        }
+        i = i + 1
+    }
+    # Stage 16 (part 2): the channel-send freshness rule runs AFTER the
+    # argument was type-checked — the syntactic form is what matters (a
+    # bare ident/field/index read), mirroring the Python checker exactly.
+    # (Running it earlier read stale annotation state and produced a
+    # divergence between the two checkers.) v0.29.0-alpha: try_send
+    # takes the message across the boundary the same way send does.
+    if(ctx.exprs[e].mop == "chan.send" || ctx.exprs[e].mop == "chan.try_send") && nargs >= 1 {
+        let vt2: str = chan_inner_t(tt)
+        let vidx: int = ctx.exprs[e].args.get(0)
+        let vkind: str = ctx.exprs[vidx].kind
+        if is_owned_type(vt2) && (vkind == "ident" || vkind == "field" || vkind == "index") {
+            let mut what: str = "a borrowed value"
+            if vkind == "ident" {
+                what = "variable '" + ctx.exprs[vidx].name + "'"
+            }
+            cerr(line, "cannot share " + what + " across tasks: " + ctx.exprs[e].mop + "(...) reads it directly — pass clone(x) (private copy) or take(x) (ownership transfer). Data-race freedom: no owned value may be simultaneously released by two threads.")
+        }
+    }
+    return ret
+}
+
+# --- Enum variant literal check (rewrites the node to enumlit) ---
+
+fn check_enum_variant(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, expected: str, with_args: bool) -> void {
+    let ename: str = ctx.exprs[ctx.exprs[e].left].name
+    let vname: str = ctx.exprs[e].name
+    let line: int = ctx.exprs[e].line
+    if !ctx.enums.has(ename) {
+        cerr(line, "enum does not exist: " + ename)
+    }
+    let en: EnumInfo = ctx.enums.get_or(ename, dummy_enum())
+    let mut vidx: int = -1
+    let mut i: int = 0
+    while i < en.variants.len() {
+        if en.variants.get(i) == vname {
+            vidx = i
+        }
+        i = i + 1
+    }
+    if vidx == -1 {
+        cerr(line, "enum " + ename + " has no variant " + vname)
+    }
+    let payloads: list[str] = en.payloads.get(vidx)
+    let mut nargs: int = 0
+    if with_args {
+        nargs = ctx.exprs[e].args.len()
+    }
+    if nargs != payloads.len() {
+        cerr(line, "variant " + vname + " of enum " + ename + " expects " + payloads.len().to_str() + " payloads, got " + nargs.to_str())
+    }
+    let typeparams: list[str] = en.typeparams
+    let targs: list[str] = []
+    let mut ti: int = 0
+    while ti < typeparams.len() {
+        targs.push("")
+        ti = ti + 1
+    }
+    # First pass: infer from args.
+    if typeparams.len() > 0 && with_args {
+        let mut ai: int = 0
+        while ai < nargs {
+            let at: str = check_expr(ctx, env, cur, ctx.exprs[e].args.get(ai), "")
+            if at != "never" {
+                unify_into(ctx, payloads.get(ai), at, typeparams, targs)
+            }
+            ai = ai + 1
+        }
+    }
+    # Second pass: try contextual expected type.
+    if typeparams.len() > 0 && expected != "" && type_base(expected) == ename {
+        let eargs: list[str] = type_args(expected)
+        if eargs.len() == typeparams.len() {
+            let mut j: int = 0
+            while j < eargs.len() {
+                if targs.get(j) == "" {
+                    targs.set(j, eargs.get(j))
+                }
+                j = j + 1
+            }
+        }
+    }
+    # If any type param is still unbound, error.
+    if typeparams.len() > 0 {
+        let mut ti2: int = 0
+        while ti2 < typeparams.len() {
+            if targs.get(ti2) == "" {
+                cerr(line, "cannot infer type argument for " + ename + "; provide a contextual type")
+            }
+            ti2 = ti2 + 1
+        }
+    }
+    # Type-check payloads against instantiated payload types.
+    let inst_payloads: list[str] = []
+    let mut pi: int = 0
+    while pi < payloads.len() {
+        if typeparams.len() > 0 {
+            inst_payloads.push(instantiate_type(payloads.get(pi), typeparams, targs))
+        } else {
+            inst_payloads.push(payloads.get(pi))
+        }
+        pi = pi + 1
+    }
+    if with_args {
+        let mut ai2: int = 0
+        while ai2 < nargs {
+            let at: str = check_expr(ctx, env, cur, ctx.exprs[e].args.get(ai2), inst_payloads.get(ai2))
+            if at == "never" {
+                ai2 = ai2 + 1
+                continue
+            }
+            if at != inst_payloads.get(ai2) {
+                cerr(line, "payload type mismatch: expected " + inst_payloads.get(ai2) + ", got " + at)
+            }
+            ai2 = ai2 + 1
+        }
+    }
+    # Rewrite the node to enumlit.
+    if typeparams.len() > 0 {
+        ctx.exprs[e].t = ename + "[" + join(targs, ", ") + "]"
+        # Record this enum instantiation for codegen — only if all type args
+        # are concrete.
+        let inst_t: str = ename + "[" + join(targs, ", ") + "]"
+        if type_is_concrete(ctx, inst_t) && !list_has(ctx.enum_insts, inst_t) {
+            ctx.enum_insts.push(inst_t)
+        }
+    } else {
+        ctx.exprs[e].t = ename
+    }
+    ctx.exprs[e].kind = "enumlit"
+    ctx.exprs[e].enum_name = ename
+    ctx.exprs[e].variant = vname
+}
+
+# --- match ---

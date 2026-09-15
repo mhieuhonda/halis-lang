@@ -1,0 +1,838 @@
+# ============================================================================
+# hlc/main.hls — part of the hlc compiler (split from the original single-file
+# src/hlc.hls). This file is loaded via `import "hlc/main.hls"` from src/hlc.hls.
+# Section 6 — MAIN: CLI entry, flag parsing, full pipeline.
+# NOTE: content is byte-identical to the original src/hlc.hls line range
+#       20522..21353 - module split is purely structural, zero code changes.
+# ============================================================================
+# 6. MAIN — full pipeline: LEX -> PARSE -> CHECK -> GEN -> WRITE C
+# ----------------------------------------------------------------------------
+
+# dir_of(path) returns the directory component of a path (everything before
+# the last '/'), or "." if the path has no slash.
+fn dir_of(path: str) -> str {
+    let mut i: int = path.len() - 1
+    while i >= 0 {
+        if path.byte_at(i) == 47 {
+            if i == 0 {
+                return "/"
+            }
+            return path.slice(0, i)
+        }
+        i = i - 1
+    }
+    return "."
+}
+
+# join_path(dir, rel) joins a directory and a relative path with a single
+# slash. Does NOT handle ".." — uses string concatenation.
+fn join_path(dir: str, rel: str) -> str {
+    if dir == "." {
+        return rel
+    }
+    if dir.len() == 0 {
+        return rel
+    }
+    if dir.byte_at(dir.len() - 1) == 47 {
+        return dir + rel
+    }
+    return dir + "/" + rel
+}
+
+# parent_dir(dir) returns the parent directory of dir.
+fn parent_dir(dir: str) -> str {
+    let mut i: int = dir.len() - 1
+    while i >= 0 {
+        if dir.byte_at(i) == 47 {
+            if i == 0 {
+                return "/"
+            }
+            return dir.slice(0, i)
+        }
+        i = i - 1
+    }
+    return "."
+}
+
+# resolve_import_path(imp, entry_dir, repo_root) returns the resolved file
+# path for an import, or "" if not found.
+fn resolve_import_path(imp: str, entry_dir: str, repo_root: str) -> str uses IO, Proc {
+    if imp.starts_with("std.") {
+        let module_name: str = imp.slice(4, imp.len())
+        let rel: str = "std/" + module_name + ".hls"
+        let mut d: str = entry_dir
+        let mut tries: int = 0
+        while tries < 5 {
+            let candidate: str = join_path(d, rel)
+            if file_exists(candidate) {
+                return candidate
+            }
+            let parent: str = parent_dir(d)
+            if parent == d {
+                break
+            }
+            d = parent
+            tries = tries + 1
+        }
+        let fallback: str = join_path(repo_root, rel)
+        if file_exists(fallback) {
+            return fallback
+        }
+        # Deep-scan-25 fix: also try the CURRENT WORKING DIRECTORY as a
+        # repository anchor. The repo_root heuristic (the entry file's
+        # parent directory) fails for any entry file that lives outside
+        # the repo tree — `hlc /tmp/demo.hls out.c` could not see its
+        # own std/ even when hlc was invoked from the repository root
+        # (the normal invocation). The boot compiler anchors std. imports
+        # on its own installation directory, which is always correct;
+        # the self-hosted CLI has no equivalent, so the invoking cwd is
+        # the best equivalent anchor.
+        let cwd: str = cwd_get()
+        if cwd != "" {
+            let cwd_candidate: str = join_path(cwd, rel)
+            if file_exists(cwd_candidate) {
+                return cwd_candidate
+            }
+        }
+        return ""
+    }
+    let direct: str = join_path(entry_dir, imp)
+    if file_exists(direct) {
+        return direct
+    }
+    return ""
+}
+
+# already_loaded(ctx, path) returns true if path has already been loaded.
+fn already_loaded(ctx: Ctx, path: str) -> bool {
+    let mut i: int = 0
+    while i < ctx.loaded_files.len() {
+        if ctx.loaded_files.get(i) == path {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+# load_file_into(ctx, abs_path) reads, lexes and parses abs_path into ctx.
+# Deep-scan-25: Prop — the std. resolver falls back to the invoking cwd
+# (cwd_get), so the Proc effect propagates from resolve_import_path.
+fn load_file_into(ctx: Ctx, abs_path: str) -> void uses IO, Proc {
+    if already_loaded(ctx, abs_path) {
+        return
+    }
+    ctx.loaded_files.push(abs_path)
+    let file_dir: str = dir_of(abs_path)
+    let saved_src: str = ctx.src
+    let saved_toks: list[Tok] = ctx.toks
+    let saved_pos: int = ctx.pos
+    let saved_imports: list[str] = ctx.imports
+    ctx.src = read_file(abs_path)
+    ctx.toks = []
+    ctx.pos = 0
+    ctx.imports = []
+    lex(ctx)
+    parse_program(ctx)
+    let my_imports: list[str] = ctx.imports
+    let mut i: int = 0
+    while i < my_imports.len() {
+        let imp: str = my_imports.get(i)
+        let resolved: str = resolve_import_path(imp, file_dir, ctx.repo_root)
+        if resolved == "" {
+            panic("module not found: " + imp)
+        }
+        load_file_into(ctx, resolved)
+        i = i + 1
+    }
+    ctx.src = saved_src
+    ctx.toks = saved_toks
+    ctx.pos = saved_pos
+    ctx.imports = saved_imports
+}
+
+fn main() -> int uses IO, Proc {
+    let argv: list[str] = args()
+    # Stage 17 (v0.28.0-alpha): CLI flags — hlc [flags] <input.hls> <output.c|->
+    #   --fast | -O fast   proof-driven check elision (the interval prover
+    #                       must have proven the check dead; anything
+    #                       unknown keeps its runtime check)
+    #   --contracts        emit runtime `requires` assertions at every
+    #                       contracted fn entry
+    # Stage 19 (v0.35.0-alpha):
+    #   --pgo-generate     instrument fn entries / branches / loop
+    #                       back-edges with counters; a .hlcprof profile is
+    #                       written at exit (HLS_PGO_FILE or default.hlcprof)
+    #   --pgo-use <file>   train the codegen with a .hlcprof profile:
+    #                       __builtin_expect hints, hot/cold attributes,
+    #                       static-inline hints on hot small functions
+    # Strip the flags first; `a` below is the positional-argument view.
+    let mut fast_mode: bool = false
+    let mut contracts_mode: bool = false
+    let mut pgo_gen: bool = false
+    let mut pgo_use_path: str = ""
+    let mut lto_mode: bool = false
+    # Stage 20 perfection (v0.39.0-alpha): --lto-stats and --lto-threshold.
+    let mut lto_stats: bool = false
+    let mut lto_threshold: int = 0
+    let mut target_feature: str = ""
+    # Stage 29 (v0.46.0-alpha): --opt-stats — print a per-function
+    # optimisation-decision report to stderr after codegen. Independent
+    # of --lto-stats (which is LTO-specific); --opt-stats covers the
+    # whole program (every function's inline/hot/cold decision,
+    # annotated vs PGO vs heuristic).
+    let mut opt_stats: bool = false
+    let a: list[str] = []
+    let mut ai: int = 1
+    while ai < argv.len() {
+        let tok: str = argv.get(ai)
+        if tok == "--fast" {
+            fast_mode = true
+        } else if tok == "--contracts" {
+            contracts_mode = true
+        } else if tok == "--pgo-generate" {
+            pgo_gen = true
+        } else if tok == "--lto" {
+            # Stage 20 (v0.36.0-alpha): link-time optimisation across
+            # crates — cross-crate inlining + whole-program DCE.
+            lto_mode = true
+        } else if tok == "--lto-stats" {
+            # Stage 20 perfection (v0.39.0-alpha): print a summary of
+            # LTO work (inline count, dropped functions, generic
+            # instantiation dedup, total functions before/after) to
+            # stderr after codegen. Implies --lto.
+            lto_mode = true
+            lto_stats = true
+        } else if tok == "--opt-stats" {
+            # Stage 29 (v0.46.0-alpha): print a per-function
+            # optimisation-decision report to stderr after codegen.
+            # Covers inline / hot / cold / noinline / irq_handler /
+            # no_red_zone / stack_size for every function in the
+            # program (annotated vs PGO-derived vs heuristic).
+            # Independent of --lto-stats (does NOT imply --lto).
+            opt_stats = true
+        } else if tok == "--lto-threshold" {
+            # Stage 20 perfection (v0.39.0-alpha): override the
+            # per-callee statement budget (default 30). Implies --lto.
+            if ai + 1 >= argv.len() {
+                println("error: --lto-threshold expects an integer (1..=200)")
+                return 2
+            }
+            let n_str: str = argv.get(ai + 1)
+            let n: int = int(n_str)
+            if n_str != n.to_str() || n < 1 || n > 200 {
+                println("error: --lto-threshold expects an integer in 1..=200 (got '" + n_str + "')")
+                return 2
+            }
+            lto_mode = true
+            lto_threshold = n
+            ai = ai + 1
+        } else if tok == "--target-feature" {
+            # Stage 21 (v0.37.0-alpha): enable the std.simd intrinsic
+            # fast paths + const-fold has_feature().
+            # Stage 26 (v0.49.0-alpha): also accept "rvv" for the
+            # RISC-V Vector (RVV) intrinsics.
+            if ai + 1 >= argv.len() {
+                println("error: --target-feature expects a feature name (sse4.2 | avx2 | neon | rvv)")
+                return 2
+            }
+            let feat: str = argv.get(ai + 1)
+            if feat == "+sse4.2" || feat == "sse4.2" {
+                target_feature = "sse4.2"
+            } else if feat == "+avx2" || feat == "avx2" {
+                target_feature = "avx2"
+            } else if feat == "+neon" || feat == "neon" {
+                target_feature = "neon"
+            } else if feat == "+rvv" || feat == "rvv" {
+                # Stage 26 (v0.49.0-alpha): RISC-V Vector extension.
+                # Enables the RVV intrinsic fast paths for std.simd
+                # kernels (the simd_emit_rvv_*_ew emitters push
+                # __riscv_vadd_vv_i32m1 / __riscv_vsub_vv_i32m1 /
+                # __riscv_vmul_vv_i32m1 / __riscv_vmin_vv_i32m1 /
+                # __riscv_vmax_vv_i32m1 / __riscv_vadd_vv_f64m1 /
+                # __riscv_vsub_vv_f64m1 / __riscv_vmul_vv_f64m1
+                # into the #elif __riscv && __riscv_v branch).
+                target_feature = "rvv"
+            } else if feat == "native" {
+                # Stage 21 perfection (v0.40.0-alpha): --target-feature
+                # native — auto-detect the host's best SIMD feature.
+                # On x86-64 hosts, picks avx2 (the strongest x86
+                # feature the std.simd intrinsic fast paths support
+                # today; AVX-512 tuning is post-1.0). On aarch64,
+                # picks neon (baseline on every ARMv8+ core). On
+                # RISC-V 64 hosts, picks rvv when the V extension is
+                # available (Stage 26). On other architectures, falls
+                # back to "" (portable path — no intrinsic fast paths
+                # emitted).
+                target_feature = simd_detect_native_feature()
+            } else {
+                println("error: unknown target feature '" + feat + "' (expected sse4.2 | avx2 | neon | rvv | native)")
+                return 2
+            }
+            ai = ai + 1
+        } else if tok == "--pgo-use" {
+            if ai + 1 >= argv.len() {
+                println("error: --pgo-use expects a profile file path")
+                return 2
+            }
+            pgo_use_path = argv.get(ai + 1)
+            ai = ai + 1
+        } else if tok == "-O" {
+            if ai + 1 < argv.len() && argv.get(ai + 1) == "fast" {
+                fast_mode = true
+                ai = ai + 1
+            } else {
+                println("error: -O expects 'fast' (the only level today)")
+                return 2
+            }
+        } else {
+            a.push(tok)
+        }
+        ai = ai + 1
+    }
+    # Stage 9-beta: `hlc --audit <file.hls>` prints the capability tree.
+    if argv.len() >= 2 && argv.get(1) == "--audit" {
+        if argv.len() < 3 {
+            println("usage: hlc --audit <input.hls>")
+            return 1
+        }
+        let entry_path: str = argv.get(2)
+        let src: str = read_file(entry_path)
+        let ctx: Ctx = new_ctx(src)
+        ctx.entry_dir = dir_of(entry_path)
+        ctx.repo_root = parent_dir(ctx.entry_dir)
+        lex(ctx)
+        parse_program(ctx)
+        let entry_imports: list[str] = ctx.imports
+        let mut i: int = 0
+        while i < entry_imports.len() {
+            let imp: str = entry_imports.get(i)
+            let resolved: str = resolve_import_path(imp, ctx.entry_dir, ctx.repo_root)
+            if resolved == "" {
+                println("error: module not found: " + imp)
+                return 1
+            }
+            load_file_into(ctx, resolved)
+            i = i + 1
+        }
+        check_program(ctx)
+        print_audit(ctx)
+        return 0
+    }
+    if a.len() < 2 {
+        println("usage: hlc [--fast | -O fast] [--contracts] [--pgo-generate] [--pgo-use <profile>]")
+        println("              [--lto] [--lto-stats] [--lto-threshold N] [--target-feature sse4.2|avx2|neon|rvv]")
+        println("              <input.hls> <output.c|->")
+        println("       hlc --audit <input.hls>")
+        return 1
+    }
+    let entry_path: str = a.get(0)
+    let src: str = read_file(entry_path)
+    let ctx: Ctx = new_ctx(src)
+    ctx.entry_dir = dir_of(entry_path)
+    ctx.repo_root = parent_dir(ctx.entry_dir)
+    ctx.fast_mode = fast_mode
+    ctx.contracts_mode = contracts_mode
+    ctx.pgo_gen = pgo_gen
+    ctx.lto_mode = lto_mode
+    ctx.lto_threshold = lto_threshold
+    ctx.lto_stats = lto_stats
+    ctx.opt_stats = opt_stats
+    ctx.target_feature = target_feature
+    # Stage 19: load the --pgo-use profile BEFORE codegen (the branch /
+    # fn-attribute hints consult it during generation).
+    if pgo_use_path != "" {
+        if !file_exists(pgo_use_path) {
+            println("error: --pgo-use: profile file not found: " + pgo_use_path)
+            return 2
+        }
+        let prof: str = read_file(pgo_use_path)
+        let perr: str = pgo_load_profile(ctx, prof)
+        if perr != "" {
+            println("error: --pgo-use: " + perr)
+            return 2
+        }
+    }
+    # Lex + parse the entry file.
+    lex(ctx)
+    parse_program(ctx)
+    # Process the entry file's imports (recursively loads transitive deps).
+    let entry_imports: list[str] = ctx.imports
+    let mut i: int = 0
+    while i < entry_imports.len() {
+        let imp: str = entry_imports.get(i)
+        let resolved: str = resolve_import_path(imp, ctx.entry_dir, ctx.repo_root)
+        if resolved == "" {
+            println("error: module not found: " + imp)
+            return 1
+        }
+        load_file_into(ctx, resolved)
+        i = i + 1
+    }
+    check_program(ctx)
+    let lines: list[str] = gen_program(ctx)
+    let code: str = join(lines, "\n")
+    let out_path: str = a.get(1)
+    if out_path == "-" {
+        print(code)
+        println("")
+    } else {
+        write_file(out_path, code)
+    }
+    # Stage 20 perfection (v0.39.0-alpha): --lto-stats — print a
+    # summary of LTO work to stderr. Only emitted under --lto-stats.
+    if ctx.lto_stats {
+        print_lto_stats(ctx)
+    }
+    # Stage 29 (v0.46.0-alpha): --opt-stats — print a per-function
+    # optimisation-decision report to stderr. Only emitted under
+    # --opt-stats. Independent of --lto-stats (covers the whole
+    # program even without LTO).
+    if ctx.opt_stats {
+        print_opt_stats(ctx)
+    }
+    return 0
+}
+
+# Stage 20 perfection (v0.39.0-alpha): print the LTO work summary.
+# Reports: total functions in the program, unreachable functions
+# dropped by phase-A DCE, fully-inlined functions dropped by phase-B
+# DCE, total inline expansions, distinct callees inlined, the
+# per-callee statement budget in effect, and the generic instantiation
+# count (instantiations emitted; the dedup means two modules
+# instantiating the same generic with the same type args share ONE
+# specialisation).
+#
+# Stats are printed to STDOUT after the C code is written to the
+# output file. When `out_path == "-"` (code to stdout), the stats
+# follow the code — callers wanting machine-parsed stats should use
+# a file output path.
+fn print_lto_stats(ctx: Ctx) -> void uses IO {
+    let total_fns: int = ctx.fn_order.len()
+    let inlined_keys: int = ctx.lto_inlined_report.len()
+    let dropped: int = ctx.lto_dropped
+    let inline_n: int = ctx.lto_inline_n
+    let budget: int = lto_inline_stmts_budget(ctx)
+    let gen_insts: int = ctx.fn_insts.len()
+    let struct_insts: int = ctx.struct_insts.len()
+    let enum_insts: int = ctx.enum_insts.len()
+    println("=== LTO stats ===")
+    println("  functions in program        : " + total_fns.to_str())
+    println("  inline expansions (sites)   : " + inline_n.to_str())
+    println("  distinct callees inlined    : " + inlined_keys.to_str())
+    println("  bodies dropped (phase A+B)  : " + dropped.to_str())
+    println("  inline stmt budget          : " + budget.to_str() + " (--lto-threshold)")
+    println("  generic fn instantiations   : " + gen_insts.to_str())
+    println("  generic struct instantiations: " + struct_insts.to_str())
+    println("  generic enum instantiations : " + enum_insts.to_str())
+    if inlined_keys > 0 {
+        println("  inlined callees:")
+        let mut i: int = 0
+        while i < inlined_keys {
+            println("    " + ctx.lto_inlined_report.get(i))
+            i = i + 1
+        }
+    }
+}
+
+# Stage 29 (v0.46.0-alpha): print the per-function optimisation-
+# decision report. For every function in the program, list:
+#   - the user's explicit annotations (#[inline(always)], #[hot], etc.)
+#   - the PGO-derived decision (when --pgo-use is active and no
+#     explicit annotation overrides it)
+#   - the final emitted C attribute(s) (what gen_fn_body wrote on
+#     the signature line)
+#   - for LTO, whether the function was inlined at any call site
+#
+# Acceptance gate: a test program with `#[inline(always)]` on `foo`
+# shows "ALWAYS" for foo; `#[inline(never)]` on `bar` shows "NEVER";
+# an un-annotated function shows "auto" (heuristic / PGO).
+#
+# Stats are printed to STDOUT after the C code is written to the
+# output file (same convention as print_lto_stats).
+fn print_opt_stats(ctx: Ctx) -> void uses IO {
+    let total: int = ctx.fn_order.len()
+    let mut inline_always: int = 0
+    let mut inline_never: int = 0
+    let mut hot_n: int = 0
+    let mut cold_n: int = 0
+    let mut irq_n: int = 0
+    let mut no_red_zone_n: int = 0
+    let mut stack_size_n: int = 0
+    let mut tail_call_n: int = 0
+    let mut tail_site_n: int = 0
+    let mut pgo_hot_n: int = 0
+    let mut pgo_cold_n: int = 0
+    let mut pgo_inline_n: int = 0
+    # Tally counters (HLS doesn't have closures, so we walk twice —
+    # once for the summary, once for the per-function table).
+    let mut i: int = 0
+    while i < ctx.fn_order.len() {
+        let key: str = ctx.fn_order.get(i)
+        let f: FnInfo = ctx.fns.get_or(key, dummy_fn())
+        if f.attr_inline == "always" {
+            inline_always = inline_always + 1
+        }
+        if f.attr_inline == "never" {
+            inline_never = inline_never + 1
+        }
+        if f.attr_hot {
+            hot_n = hot_n + 1
+        }
+        if f.attr_cold {
+            cold_n = cold_n + 1
+        }
+        if f.attr_irq_handler {
+            irq_n = irq_n + 1
+        }
+        if f.attr_no_red_zone {
+            no_red_zone_n = no_red_zone_n + 1
+        }
+        if f.attr_stack_size >= 0 {
+            stack_size_n = stack_size_n + 1
+        }
+        # Stage 31 (v0.48.0-alpha): verified tail-call functions.
+        if f.attr_tail_call {
+            tail_call_n = tail_call_n + 1
+            tail_site_n = tail_site_n + ctx.tail_sites.get_or(key, 0)
+        }
+        if f.attr_inline == "" && pgo_fn_is_hot(ctx, key) {
+            pgo_hot_n = pgo_hot_n + 1
+        }
+        if f.attr_inline == "" && pgo_fn_is_cold(ctx, key) {
+            pgo_cold_n = pgo_cold_n + 1
+        }
+        if f.attr_inline == "" && pgo_fn_inline(ctx, key) {
+            pgo_inline_n = pgo_inline_n + 1
+        }
+        i = i + 1
+    }
+    println("=== opt-stats ===")
+    println("  functions in program          : " + total.to_str())
+    println("  #[inline(always)] annotations: " + inline_always.to_str())
+    println("  #[inline(never)]  annotations: " + inline_never.to_str())
+    println("  #[hot]             annotations: " + hot_n.to_str())
+    println("  #[cold]            annotations: " + cold_n.to_str())
+    println("  #[irq_handler]     annotations: " + irq_n.to_str())
+    println("  #[no_red_zone]     annotations: " + no_red_zone_n.to_str())
+    println("  #[stack_size(N)]   annotations: " + stack_size_n.to_str())
+    println("  #[tail_call]       annotations: " + tail_call_n.to_str() + " (verified sites: " + tail_site_n.to_str() + ", stack O(1))")
+    if pgo_has_profile(ctx) {
+        println("  PGO-derived hot (no annotation): " + pgo_hot_n.to_str())
+        println("  PGO-derived cold (no annotation): " + pgo_cold_n.to_str())
+        println("  PGO-derived static-inline (no annotation): " + pgo_inline_n.to_str())
+    } else {
+        println("  PGO profile: (none loaded; --pgo-use <file> to enable)")
+    }
+    if ctx.lto_mode {
+        let inlined_n: int = ctx.lto_inlined_report.len()
+        let sites: int = ctx.lto_inline_n
+        let dropped: int = ctx.lto_dropped
+        println("  LTO inline expansions (sites) : " + sites.to_str())
+        println("  LTO distinct callees inlined : " + inlined_n.to_str())
+        println("  LTO bodies dropped (A+B)      : " + dropped.to_str())
+    } else {
+        println("  LTO: (disabled; --lto to enable)")
+    }
+    # Stage 30 (v0.47.0-alpha): layout summary. How many tracked
+    # list bindings ended up stack-allocated (zero heap objects, zero
+    # refcount traffic) vs boxed/heap. The tally itself is held in a
+    # #[stack] list — the compiler is the first customer of its own
+    # escape analysis (this binding is provably escape-free: every use
+    # below is a borrow-safe .get/.set receiver, so the C frame of
+    # usf_print_opt_stats carries a plain int64_t[4] instead of a
+    # refcounted heap list).
+    #[stack]
+    let lay_counts: list[int] = [0, 0, 0, 0]
+    if ctx.layout_order.len() > 0 {
+        let mut ci: int = 0
+        while ci < ctx.layout_order.len() {
+            let lay: str = ctx.layout_map.get_or(ctx.layout_order.get(ci), "?")
+            if lay == "stack" {
+                lay_counts.set(0, lay_counts.get(0) + 1)
+            } else if lay == "boxed" {
+                lay_counts.set(1, lay_counts.get(1) + 1)
+            } else if lay == "heap" {
+                lay_counts.set(2, lay_counts.get(2) + 1)
+            } else {
+                lay_counts.set(3, lay_counts.get(3) + 1)
+            }
+            ci = ci + 1
+        }
+        println("  stack-allocated list bindings  : " + lay_counts.get(0).to_str())
+        println("  boxed (forced heap) bindings   : " + lay_counts.get(1).to_str())
+        println("  heap (escaping) bindings       : " + lay_counts.get(2).to_str())
+        println("  heap (push/pop) bindings       : " + lay_counts.get(3).to_str())
+        println("  tracked list bindings          : " + ctx.layout_order.len().to_str())
+    }
+    println("")
+    println("  per-function decisions:")
+    println("    name                          inline      hot/cold    frame                source")
+    println("    ----                          ------      ---------   -----                ------")
+    # Stage 30 (v0.47.0-alpha): the column widths table is an
+    # UN-ANNOTATED list[int] binding whose every use below is a
+    # borrow-safe .get(i) receiver — the automatic escape analysis
+    # stack-allocates it with no attribute at all (the auto mode the
+    # whole Stage 30 optimisation runs on).
+    let widths: list[int] = [30, 11, 11, 20]
+    let mut j: int = 0
+    while j < ctx.fn_order.len() {
+        let key: str = ctx.fn_order.get(j)
+        let f: FnInfo = ctx.fns.get_or(key, dummy_fn())
+        # inline column
+        let mut inline_col: str = ""
+        if f.attr_inline == "always" {
+            inline_col = "ALWAYS"
+        } else if f.attr_inline == "never" {
+            inline_col = "NEVER"
+        } else if pgo_fn_inline(ctx, key) {
+            inline_col = "PGO-inline"
+        } else {
+            inline_col = "auto"
+        }
+        # hot/cold column
+        let mut hotcold_col: str = ""
+        if f.attr_hot {
+            hotcold_col = "HOT"
+        } else if f.attr_cold {
+            hotcold_col = "COLD"
+        } else if pgo_fn_is_hot(ctx, key) {
+            hotcold_col = "PGO-hot"
+        } else if pgo_fn_is_cold(ctx, key) {
+            hotcold_col = "PGO-cold"
+        } else {
+            hotcold_col = "-"
+        }
+        # frame column (irq_handler / no_red_zone / stack_size)
+        let mut frame_col: str = ""
+        if f.attr_irq_handler {
+            frame_col = frame_col + "irq "
+        }
+        if f.attr_no_red_zone {
+            frame_col = frame_col + "no-red-zone "
+        }
+        if f.attr_stack_size >= 0 {
+            frame_col = frame_col + "stack<=" + f.attr_stack_size.to_str()
+        }
+        if f.attr_tail_call {
+            let tc_n: int = ctx.tail_sites.get_or(key, 0)
+            frame_col = frame_col + "tail(" + tc_n.to_str() + ")"
+        }
+        if frame_col == "" {
+            frame_col = "-"
+        }
+        # source column (annotation vs PGO vs heuristic)
+        let mut source_col: str = ""
+        if f.attr_inline != "" || f.attr_hot || f.attr_cold
+        || f.attr_irq_handler || f.attr_no_red_zone || f.attr_stack_size >= 0
+        || f.attr_tail_call {
+            source_col = "annotated"
+        } else if pgo_fn_is_hot(ctx, key) || pgo_fn_is_cold(ctx, key) || pgo_fn_inline(ctx, key) {
+            source_col = "PGO"
+        } else {
+            source_col = "heuristic"
+        }
+        let padded_name: str = pad_right(key, widths.get(0))
+        let padded_inline: str = pad_right(inline_col, widths.get(1))
+        let padded_hotcold: str = pad_right(hotcold_col, widths.get(2))
+        let padded_frame: str = pad_right(frame_col, widths.get(3))
+        println("    " + padded_name + "  " + padded_inline + "  "
+        + padded_hotcold + "  " + padded_frame + "  " + source_col)
+        j = j + 1
+    }
+    # Stage 31 (v0.48.0-alpha): the verified tail-call decision table.
+    # One row per #[tail_call] function: the number of VERIFIED tail
+    # sites (each lowered to a parameter-rebinding goto — a jmp, not a
+    # call), the parameter count, and the return type.
+    if tail_call_n > 0 {
+        println("")
+        println("  verified tail calls (Stage 31):")
+        println("    name                          sites   params  ret      stack")
+        println("    ----                          -----   ------  ---      -----")
+        let mut tj: int = 0
+        while tj < ctx.fn_order.len() {
+            let key: str = ctx.fn_order.get(tj)
+            let f: FnInfo = ctx.fns.get_or(key, dummy_fn())
+            if f.attr_tail_call {
+                let tc_n: int = ctx.tail_sites.get_or(key, 0)
+                let padded_tname: str = pad_right(key, 29)
+                let padded_tsites: str = pad_right(tc_n.to_str(), 6)
+                let padded_tparams: str = pad_right(f.params.len().to_str(), 7)
+                let padded_tret: str = pad_right(f.ret, 8)
+                println("    " + padded_tname + "  " + padded_tsites + " "
+                + padded_tparams + " " + padded_tret + " constant")
+            }
+            tj = tj + 1
+        }
+    }
+    # Stage 30 (v0.47.0-alpha): the per-binding list-layout decision
+    # table. One row per tracked binding, in discovery order: the
+    # layout (STACK / BOXED / HEAP), the fixed capacity, and the reason
+    # (the first escape site for HEAP, #[stack]/#[boxed]/auto for the
+    # rest).
+    if ctx.layout_order.len() > 0 {
+        println("")
+        println("  list layout decisions (Stage 30):")
+        println("    binding                              layout     cap   reason")
+        println("    ------                              ------     ---   ------")
+        let mut lk_i: int = 0
+        while lk_i < ctx.layout_order.len() {
+            let lkey: str = ctx.layout_order.get(lk_i)
+            let lay: str = ctx.layout_map.get_or(lkey, "?")
+            let why: str = ctx.layout_why.get_or(lkey, "")
+            let capv: int = ctx.layout_cap.get_or(lkey, 0)
+            let mut disp_key: str = lkey
+            if disp_key.len() > 36 {
+                disp_key = disp_key.slice(0, 36)
+            }
+            let padded_lkey: str = pad_right(disp_key, 36)
+            let padded_lay: str = pad_right(lay, 9)
+            let padded_cap: str = pad_right(capv.to_str(), 5)
+            println("    " + padded_lkey + "  " + padded_lay + "  " + padded_cap + "  " + why)
+            lk_i = lk_i + 1
+        }
+    }
+}
+
+# Stage 9-beta: print the capability / effect tree of every function.
+# Mirrors boot.py's --audit output. Reads ctx.computed_effects (populated
+# by check_effects) and the per-function declared effect list.
+fn print_audit(ctx: Ctx) -> void uses IO {
+    let keys: list[str] = ctx.fn_order
+    let mut i: int = 0
+    println("==============================================================================")
+    println("  function                       declared                       computed")
+    println("==============================================================================")
+    while i < keys.len() {
+        let key: str = keys.get(i)
+        let f: FnInfo = ctx.fns.get_or(key, dummy_fn())
+        let declared: list[str] = f.effects
+        let computed: list[str] = ctx.computed_effects.get_or(key, [])
+        let mut decl_disp: str = ""
+        if f.is_pure {
+            decl_disp = "pure"
+        }
+        let mut j: int = 0
+        while j < declared.len() {
+            if decl_disp != "" {
+                decl_disp = decl_disp + ", "
+            }
+            decl_disp = decl_disp + declared.get(j)
+            j = j + 1
+        }
+        if decl_disp == "" {
+            decl_disp = "(none - pure)"
+        }
+        let mut comp_disp: str = ""
+        let mut k: int = 0
+        while k < computed.len() {
+            if comp_disp != "" {
+                comp_disp = comp_disp + ", "
+            }
+            comp_disp = comp_disp + computed.get(k)
+            k = k + 1
+        }
+        if comp_disp == "" {
+            comp_disp = "(none)"
+        }
+        # Pad the function name to 30 chars for alignment.
+        let padded: str = pad_right(key, 30)
+        let padded_decl: str = pad_right(decl_disp, 30)
+        println("  " + padded + "  " + padded_decl + "  " + comp_disp)
+        i = i + 1
+    }
+    println("==============================================================================")
+    println("  Active effects:    IO, Fs, Clock, Args, Exit, Net, Rand, Proc")
+    println("  `uses IO` expands to: {IO, Fs, Clock, Args, Exit}")
+    println("  Net, Rand, Proc are independent effects (not part of the IO")
+    println("  family) — declare them explicitly to use net_lookup /")
+    println("  rand_int / rand_float / rand_seed / proc_exec builtins.")
+    println("  No reserved effects (Stage 9 release).")
+    println("")
+    # Stage 10-beta: taint-flow audit extension. Scan the call graph for:
+    #   - functions calling taint sources (tainted_args, read_file_tainted, read_line)
+    #   - functions calling each taint sink
+    println("  Taint sources (builtins):  tainted_args, read_file_tainted,")
+    println("                              read_line")
+    println("  Taint sinks (builtins):    print, println, read_file,")
+    println("                            write_file, file_exists, exit,")
+    println("                            net_lookup, proc_exec")
+    println("  Explicit untaint:         taint_unwrap, std.sanitize.*")
+    println("")
+    # Find functions calling each taint source.
+    let mut targs_users: list[str] = []
+    let mut rft_users: list[str] = []
+    let mut rl_users: list[str] = []
+    let mut si: int = 0
+    while si < keys.len() {
+        let skey: str = keys.get(si)
+        let callees: list[str] = ctx.edges.get_or(skey, [])
+        let mut cj: int = 0
+        while cj < callees.len() {
+            let ce: str = callees.get(cj)
+            if ce == "b:tainted_args" {
+                if !list_has(targs_users, skey) {
+                    targs_users.push(skey)
+                }
+            }
+            if ce == "b:read_file_tainted" {
+                if !list_has(rft_users, skey) {
+                    rft_users.push(skey)
+                }
+            }
+            if ce == "b:read_line" {
+                if !list_has(rl_users, skey) {
+                    rl_users.push(skey)
+                }
+            }
+            cj = cj + 1
+        }
+        si = si + 1
+    }
+    if targs_users.len() > 0 {
+        println("  Functions calling tainted_args():")
+        let mut ti: int = 0
+        while ti < targs_users.len() {
+            println("    - " + targs_users.get(ti))
+            ti = ti + 1
+        }
+    } else {
+        println("  No function calls tainted_args() (no argv-taint sources in this program).")
+    }
+    if rft_users.len() > 0 {
+        println("  Functions calling read_file_tainted():")
+        let mut ri: int = 0
+        while ri < rft_users.len() {
+            println("    - " + rft_users.get(ri))
+            ri = ri + 1
+        }
+    } else {
+        println("  No function calls read_file_tainted().")
+    }
+    if rl_users.len() > 0 {
+        println("  Functions calling read_line():")
+        let mut li: int = 0
+        while li < rl_users.len() {
+            println("    - " + rl_users.get(li))
+            li = li + 1
+        }
+    } else {
+        println("  No function calls read_line().")
+    }
+}
+
+# Right-pad a string with spaces to width `n`. Truncates if longer than n.
+fn pad_right(s: str, n: int) -> str pure {
+    let sl: int = s.len()
+    if sl >= n {
+        return s.slice(0, n)
+    }
+    let mut out: str = s
+    let mut i: int = 0
+    while i < n - sl {
+        out = out + " "
+        i = i + 1
+    }
+    return out
+}
+# --- END ---
