@@ -23,6 +23,8 @@ Also here: the loop-invariant suggestion heuristics (for-loop bounds
 and while-condition textual invariants).
 """
 
+from .compat import zip_strict  # noqa: E402
+
 INT64_MIN = -(2 ** 63)
 INT64_MAX = 2 ** 63 - 1
 
@@ -1186,7 +1188,7 @@ def args_are_const(fn, arg_exprs):
     defer float contracts to runtime, matching the native byte-for-
     byte in differential testing."""
     consts = {}
-    for (pn, pt, _), a in zip(fn["params"], arg_exprs, strict=True):
+    for (pn, pt, _), a in zip_strict(fn["params"], arg_exprs):
         if not isinstance(a, dict) or a.get("k") not in ("int", "bool", "str"):
             return None
         consts[pn] = a["v"]

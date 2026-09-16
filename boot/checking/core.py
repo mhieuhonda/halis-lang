@@ -9,6 +9,7 @@ from .helpers import (
     is_taint, is_task, list_elem, map_val, stream_inner, taint_inner, task_inner, type_args,
     type_base,
 )
+from ..compat import zip_strict
 
 class CheckerCore(object):
     def __init__(self, program):
@@ -108,7 +109,7 @@ class CheckerCore(object):
         args = type_args(t)
         if len(tp) != len(args):
             return None
-        type_map = dict(zip(tp, args, strict=True))
+        type_map = dict(zip_strict(tp, args))
         return (st, type_map)
 
     def resolve_enum(self, t):
@@ -122,7 +123,7 @@ class CheckerCore(object):
         args = type_args(t)
         if len(tp) != len(args):
             return None
-        type_map = dict(zip(tp, args, strict=True))
+        type_map = dict(zip_strict(tp, args))
         return (en, type_map)
 
     # ---------- lifecycle ----------

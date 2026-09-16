@@ -13,7 +13,7 @@ stability (125–140), and final stabilisation toward v1.0 (141–150).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
-## [v0.92.4-alpha] — deep-scan-26: 4 fixes — three split regressions (FFI crash, sandbox crash, checker crash) + one CLI guard
+## [v0.92.4-alpha] — deep-scan-26: 6 fixes — three split regressions, CI unbroken on Python 3.8 (zip strict), interpreter flush parity, one CLI guard
 
 > Sixth systematic super-scan. This pass paired static analysis
 > (pyflakes over all 84 Python modules plus an AST walker for bare
@@ -22,14 +22,55 @@ new stdlib modules, tooling, examples, and CI/CD improvements.
 > against its pre-split monolith (76 checker methods, 63 interpreter
 > methods, 363 compiler functions, 74 wasm + 41 LLVM + 33 pkg + 41
 > wopt tool functions, 420 stdlib functions) to catch regressions the
-> test suite cannot reach. Runtime probes then exercised the exact
-> code paths the splits broke. Full verification after the fixes:
-> stage-1/2 (180/180 ok + 147/147 fail), differential interp-vs-native
-> (180/180), native hlc compile-all, bootstrap determinism, PGO
-> byte-identical, LLVM suite 13/13, memcheck RSS delta 0, fuzz 535
-> programs 0 divergences, all 39 stdlib acceptance targets green, 85
-> examples green, wasm webapp acceptance green, spec-check /
-> lsp-smoke / ll-validate green. Zero regressions introduced.
+> test suite cannot reach — and with a CI-forensics pass over the
+> GitHub Actions run history, which traced the long-red CI to three
+> independent root causes (ripgrep missing on runners; zip strict
+> on Python 3.8; stdout flush parity). Runtime probes then exercised
+> the exact code paths the splits broke. Full verification after the
+> fixes: stage-1/2 (180/180 ok + 147/147 fail), differential
+> interp-vs-native (180/180), native hlc compile-all, bootstrap
+> determinism, PGO byte-identical, LLVM suite 13/13, memcheck RSS
+> delta 0, fuzz 535 programs 0 divergences, all 39 stdlib acceptance
+> targets green, 85 examples green, wasm webapp acceptance green,
+> spec-check / lsp-smoke / ll-validate green, and the pure-Python
+> zip_strict branch exercised through the real boot.py entry point.
+> Zero regressions introduced.
+
+### Fixed — CI red since 2026-09-03: three independent root causes
+
+- **`zip(..., strict=True)` broke EVERY program on Python 3.8/3.9
+  (HIGH, CI 3.8 legs since d80af56, 2026-09-09).** The B905 cleanup
+  added the `strict=` keyword to 28 zip() calls across the boot
+  checker, proof engine, interpreter and two tools — but that keyword
+  requires Python 3.10+, and on 3.8/3.9 `zip()` takes no keyword
+  arguments at all, so every invocation died with `TypeError: zip()
+  takes no keyword arguments` (every CI 3.8 matrix leg red since the
+  commit landed). New `boot/compat.py` `zip_strict` helper implements
+  the exact builtin strict semantics in pure Python on < 3.10 and
+  delegates to the builtin on 3.10+; all 28 call sites (checker,
+  proof, interp, `tools/ir/optimize.py`,
+  `tools/llvm_parts/llvm_emit_calls.py`) now use it. The pure branch
+  was pinned through the real boot.py entry point (list/crypto/
+  proof demos + --check) with the 3.10+ fast path forced off.
+- **Interpreter vs native stdout interleaving diverged on Python
+  < 3.12 (MEDIUM, CI 3.11 legs — feat_deep_scan22_boot).** The native
+  runtime flushes stdout before `system()` / `fork()` (deep-scan-22),
+  but the interpreter-side half of that fix only aligned the BYTE
+  ENCODING (surrogateescape) and forgot the flush: `proc_exec` ran
+  `os.system(cmd)` with the program's println output still sitting in
+  Python's block buffer. Python 3.12 flushes stdout inside
+  `os.system()` itself; 3.8–3.11 do NOT — so on those versions the
+  child's output jumped BEFORE the entire buffered program output
+  (the CI diff: `nonutf8\xff=== Stage 53...` vs the native's correct
+  interleaving). `proc_exec` and `proc_spawn` now flush `self.out`
+  before spawning, mirroring the native `fflush(stdout)` exactly;
+  behaviour is version-independent.
+- **`tests/run_llvm_tests.sh` line 78 used `rg` (ripgrep), which
+  GitHub runners do not ship (LOW, CI since Stage 12).** The missing
+  binary made the "unsupported constructs fail CLEANLY" check
+  misclassify a correct clean-error result as a failure — the very
+  first CI-red root cause (fixed earlier by the plain-`grep` note;
+  verified green locally and re-verified in this pass).
 
 ### Fixed — regressions introduced by split(boot) (b9bfaf4)
 

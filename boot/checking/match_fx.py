@@ -7,6 +7,7 @@ from .. import proof as _proof
 from .helpers import (
     BUILTIN_EFFECTS, instantiate_type, type_args, type_base,
 )
+from ..compat import zip_strict
 
 class CheckerMatch_fx(object):
     def check_match(self, e, env, expected):
@@ -27,7 +28,7 @@ class CheckerMatch_fx(object):
             sargs = type_args(scrut_t)
             if len(sargs) != len(typeparams):
                 self.err("invalid enum instantiation: %s" % scrut_t, e)
-            for tp, sa in zip(typeparams, sargs, strict=True):
+            for tp, sa in zip_strict(typeparams, sargs):
                 type_map[tp] = sa
         # Check exhaustiveness and arm types.
         covered = set()
@@ -227,7 +228,7 @@ class CheckerMatch_fx(object):
             iargs = type_args(inner_t)
             if len(iargs) != len(typeparams):
                 self.err("invalid enum instantiation: %s" % inner_t, e)
-            for tp, ia in zip(typeparams, iargs, strict=True):
+            for tp, ia in zip_strict(typeparams, iargs):
                 type_map[tp] = ia
             ok_payload = ok_variant[1][0]
             success_t = instantiate_type(ok_payload, type_map)

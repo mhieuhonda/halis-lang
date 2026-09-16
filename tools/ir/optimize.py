@@ -28,6 +28,7 @@ from . import (HLIRModule, HLIRFunction, Instr, Block,
                OP_CONST, OP_BINOP, OP_UNOP, OP_LOAD, OP_STORE,
                OP_CALL, OP_METHOD, OP_BUILTIN, OP_BRANCH, OP_JUMP,
                OP_RETURN, OP_PANIC, OP_LIST_GET)
+from .zip_compat import zip_strict
 
 
 INT64_MAX = 9223372036854775807
@@ -611,7 +612,7 @@ def _inline_small(mod: HLIRModule):
                 rename: Dict[str, Tuple] = {}
                 # ins.args[1:] are the call's argument SSA references.
                 call_args = ins.args[1:]
-                for (pname, _ptype), arg in zip(callee.params, call_args, strict=True):
+                for (pname, _ptype), arg in zip_strict(callee.params, call_args):
                     rename["v_" + pname] = arg
                 # Rename every dest in the callee body to a fresh name, and
                 # rewrite every var reference via the rename map (chained:

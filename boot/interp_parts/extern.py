@@ -5,6 +5,7 @@ boot/interp_parts/interp.py - behavior is unchanged."""
 from .rt import (
     HLPanic, ctypes, threading,
 )
+from ..compat import zip_strict
 
 class InterpExtern(object):
     # ---------- extern (Stage 15) ----------
@@ -72,7 +73,7 @@ class InterpExtern(object):
         # Set up the argument types.
         c_argtypes = []
         c_args = []
-        for (pn, pt, _), v in zip(fn["params"], args, strict=True):
+        for (pn, pt, _), v in zip_strict(fn["params"], args):
             if pt == "int":
                 c_argtypes.append(ctypes.c_int64)
                 c_args.append(int(v))

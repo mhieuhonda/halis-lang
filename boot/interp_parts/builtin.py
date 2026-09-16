@@ -634,6 +634,16 @@ class InterpBuiltin(object):
             # encoding (utf-8/surrogateescape on Linux), which restores
             # the original byte verbatim.
             cmd = args[0].decode("utf-8", "surrogateescape")
+            # Deep-scan-26 fix (interpreter-side mirror of the native
+            # fflush(stdout) in hl_proc_exec): flush self.out BEFORE the
+            # child inherits fd 1, so the parent's pending println output
+            # keeps its logical position. Python 3.12+ flushes stdout in
+            # os.system() itself, but 3.8/3.9/3.10/3.11 do NOT — without
+            # this flush the child's output jumped BEFORE the whole
+            # buffered program output on those versions, a differential
+            # mismatch (feat_deep_scan22_boot failed on the CI 3.11 leg
+            # for exactly this reason).
+            self.out.flush()
             rc = os.system(cmd)
             # Deep-scan-7 fix: os.WIFEXITED / WEXITSTATUS / WTERMSIG
             # are POSIX-only macros. On Windows, os.system returns the
@@ -690,6 +700,12 @@ class InterpBuiltin(object):
                 return subprocess.DEVNULL  # null
             try:
                 argv = [program] + [a.decode("utf-8", "surrogateescape") for a in arg_list]
+                # Deep-scan-26 fix (interpreter-side mirror of the native
+                # fflush(stdout) before fork() in hl_proc_spawn): flush
+                # self.out BEFORE spawning so an inheriting child
+                # (stdout_kind 0) cannot jump ahead of the parent's
+                # buffered println output on Python < 3.12.
+                self.out.flush()
                 proc = subprocess.Popen(
                     argv,
                     stdin=_translate_stdio(stdin_kind),

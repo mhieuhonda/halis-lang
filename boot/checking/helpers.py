@@ -13,6 +13,7 @@ Side effect: annotates the AST so the evaluator can run quickly:
 """
 from ..lexer import HLError
 from .. import proof as _proof
+from ..compat import zip_strict
 
 INT64_MAX = 9223372036854775807
 
@@ -232,7 +233,7 @@ def unify(pt, at, typeparams, type_map):
         if len(pargs) != len(aargs):
             return False
         ok = True
-        for p, a in zip(pargs, aargs, strict=True):
+        for p, a in zip_strict(pargs, aargs):
             if not unify(p, a, typeparams, type_map):
                 ok = False
         return ok

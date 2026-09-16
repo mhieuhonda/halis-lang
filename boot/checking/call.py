@@ -10,6 +10,7 @@ from .helpers import (
     is_tainted_type, is_task, list_elem, list_taint_inner, map_val, stream_inner, taint_inner, task_inner,
     type_args, type_base, unify,
 )
+from ..compat import zip_strict
 
 class CheckerCall(object):
     def check_call(self, e, env, expected):
@@ -48,7 +49,7 @@ class CheckerCall(object):
             # now also caches into it.)
             first_at = [None] * len(args)
             if fn.get("extern", False):
-                for i, (a, (pn, pt, _)) in enumerate(zip(args, fn["params"], strict=True)):
+                for i, (a, (pn, pt, _)) in enumerate(zip_strict(args, fn["params"])):
                     # The argument type is checked below in the
                     # generic / non-generic loop. We do an EARLY
                     # check here only for the tainted-wrap case so
@@ -88,7 +89,7 @@ class CheckerCall(object):
             typeparams = fn.get("typeparams", [])
             type_map = {}
             if typeparams:
-                for i, (a, (pn, pt, _)) in enumerate(zip(args, fn["params"], strict=True)):
+                for i, (a, (pn, pt, _)) in enumerate(zip_strict(args, fn["params"])):
                     # Deep-scan-24 fix: pass the parameter type as the
                     # contextual hint when it does not mention any type
                     # parameter — mirroring the non-generic path (which
@@ -112,7 +113,7 @@ class CheckerCall(object):
                         self.err("cannot infer type argument for %s; provide explicit types"
                                  % tp, e)
             # Type-check arguments against instantiated parameter types.
-            for i, (a, (pn, pt, _)) in enumerate(zip(args, fn["params"], strict=True)):
+            for i, (a, (pn, pt, _)) in enumerate(zip_strict(args, fn["params"])):
                 if typeparams:
                     inst_pt = instantiate_type(pt, type_map)
                 else:
@@ -883,7 +884,7 @@ class CheckerCall(object):
             if len(vargs) != len(params):
                 self.err("spawn() target %s expects %d arguments, got %d"
                          % (fname, len(params), len(vargs)), e)
-            for i, (a, (pn, pt, _)) in enumerate(zip(vargs, params, strict=True)):
+            for i, (a, (pn, pt, _)) in enumerate(zip_strict(vargs, params)):
                 at = self.check_expr(a, env, pt)
                 if at == "never":
                     continue
@@ -994,7 +995,7 @@ class CheckerCall(object):
             if len(vargs) != len(params):
                 self.err("async_spawn() target %s expects %d arguments, got %d"
                          % (fname, len(params), len(vargs)), e)
-            for i, (a, (pn, pt, _)) in enumerate(zip(vargs, params, strict=True)):
+            for i, (a, (pn, pt, _)) in enumerate(zip_strict(vargs, params)):
                 at = self.check_expr(a, env, pt)
                 if at == "never":
                     continue
@@ -1397,7 +1398,7 @@ class CheckerCall(object):
                          "the stream, got %d"
                          % (fname, len(params) - 1, len(vargs)), e)
             # Check the non-stream arguments.
-            for i, (a, (pn, pt, _)) in enumerate(zip(vargs, params[1:], strict=True)):
+            for i, (a, (pn, pt, _)) in enumerate(zip_strict(vargs, params[1:])):
                 at = self.check_expr(a, env, pt)
                 if at == "never":
                     continue
@@ -1479,7 +1480,7 @@ class CheckerCall(object):
             st = self.structs[base]
             if len(st["typeparams"]) != len(args):
                 return False
-            tmap = dict(zip(st["typeparams"], args, strict=True))
+            tmap = dict(zip_strict(st["typeparams"], args))
             for _, ftype, _ in st["fields"]:
                 ft = instantiate_type(ftype, tmap) if tmap else ftype
                 if not self.clone_supported(ft, _seen):
@@ -1489,7 +1490,7 @@ class CheckerCall(object):
             en = self.enums[base]
             if len(en["typeparams"]) != len(args):
                 return False
-            tmap = dict(zip(en["typeparams"], args, strict=True))
+            tmap = dict(zip_strict(en["typeparams"], args))
             for _, payloads in en["variants"]:
                 for pt in payloads:
                     pti = instantiate_type(pt, tmap) if tmap else pt
@@ -1548,7 +1549,7 @@ class CheckerCall(object):
             st = self.structs[base]
             if len(st["typeparams"]) != len(args):
                 return False
-            tmap = dict(zip(st["typeparams"], args, strict=True))
+            tmap = dict(zip_strict(st["typeparams"], args))
             for _, ftype, _ in st["fields"]:
                 ft = instantiate_type(ftype, tmap) if tmap else ftype
                 if not self.type_is_send(ft, _seen):
@@ -1558,7 +1559,7 @@ class CheckerCall(object):
             en = self.enums[base]
             if len(en["typeparams"]) != len(args):
                 return False
-            tmap = dict(zip(en["typeparams"], args, strict=True))
+            tmap = dict(zip_strict(en["typeparams"], args))
             for _, payloads in en["variants"]:
                 for pt in payloads:
                     pti = instantiate_type(pt, tmap) if tmap else pt
@@ -1608,7 +1609,7 @@ class CheckerCall(object):
             # spurious "use of moved value" errors.
             first_at = [None] * len(args)
             if typeparams:
-                for i, (a, (pn, pt, _)) in enumerate(zip(args, params, strict=True)):
+                for i, (a, (pn, pt, _)) in enumerate(zip_strict(args, params)):
                     at = self.check_expr(a, env, None)
                     first_at[i] = at
                     if at == "never":
@@ -1617,7 +1618,7 @@ class CheckerCall(object):
                 for tp in typeparams:
                     if tp not in type_map:
                         self.err("cannot infer type argument for %s.%s" % (tt_base, name), e)
-            for i, (a, (pn, pt, _)) in enumerate(zip(args, params, strict=True)):
+            for i, (a, (pn, pt, _)) in enumerate(zip_strict(args, params)):
                 if type_map:
                     inst_pt = instantiate_type(pt, type_map)
                 else:
@@ -1738,7 +1739,7 @@ class CheckerCall(object):
         if len(args) != len(ptypes):
             self.err("%s.%s expects %d arguments, got %d"
                      % (tt, name, len(ptypes), len(args)), e)
-        for a, pt in zip(args, ptypes, strict=True):
+        for a, pt in zip_strict(args, ptypes):
             at = self.check_expr(a, env, pt)
             if at == "never":
                 continue

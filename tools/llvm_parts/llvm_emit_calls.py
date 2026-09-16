@@ -9,6 +9,7 @@ from llvm_common import (
     Dict, List, Tuple, _is_list, _is_map, _list_elem, _map_val, _taint_inner,
     _unsupported, hls_type_to_llvm,
 )
+from zip_compat import zip_strict
 
 class LLVMEmitterCalls(object):
     def _lower_call_typed(self, e: Dict) -> Tuple[str, str]:
@@ -39,7 +40,7 @@ class LLVMEmitterCalls(object):
             ["i64"] * len(arg_pairs))
         arg_str = ", ".join(
             "%s %s" % (pt, self._coerce(aty, aval, pt))
-            for (aty, aval), pt in zip(arg_pairs, param_tys, strict=True))
+            for (aty, aval), pt in zip_strict(arg_pairs, param_tys))
         if ret_ty == "void":
             self._emit("  call void @%s(%s)" % (name, arg_str))
             return ("void", "0")
@@ -52,7 +53,7 @@ class LLVMEmitterCalls(object):
         """Helper: emit `call ret_ty @sym(coerced args)` and return the
         (type, value) pair."""
         args = []
-        for (aty, aval), want in zip(arg_pairs, arg_tys, strict=True):
+        for (aty, aval), want in zip_strict(arg_pairs, arg_tys):
             args.append("%s %s" % (want, self._coerce(aty, aval, want)))
         arg_str = ", ".join(args)
         if ret_ty == "void":

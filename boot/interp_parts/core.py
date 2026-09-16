@@ -5,6 +5,7 @@ boot/interp_parts/interp.py - behavior is unchanged."""
 from .rt import (
     ConcRuntime, HLPanic, HalisRNG, ReturnSig, TailCallSig, sys, threading, to_display,
 )
+from ..compat import zip_strict
 
 class InterpCore(object):
     def __init__(self, program, argv, out, contracts=False):
@@ -113,7 +114,7 @@ class InterpCore(object):
             else:
                 params = fn["params"]
                 call_args = args
-            for (pn, _, _), v in zip(params, call_args, strict=True):
+            for (pn, _, _), v in zip_strict(params, call_args):
                 env[0][pn] = [v, False, False]
             # Stage 17: runtime `requires` assertion (enabled by --contracts).
             if self.contracts and fn.get("requires") is not None:

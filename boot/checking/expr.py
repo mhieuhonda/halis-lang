@@ -7,6 +7,7 @@ from .. import proof as _proof
 from .helpers import (
     INT64_MAX, instantiate_type, is_list, list_elem, type_args, type_base, unify,
 )
+from ..compat import zip_strict
 
 class CheckerExpr(object):
     def check_expr(self, e, env, expected):
@@ -168,7 +169,7 @@ class CheckerExpr(object):
         if typeparams and expected is not None and type_base(expected) == ename:
             eargs = type_args(expected)
             if len(eargs) == len(typeparams):
-                for tp, ea in zip(typeparams, eargs, strict=True):
+                for tp, ea in zip_strict(typeparams, eargs):
                     type_map[tp] = ea
         first_at = []
         # Compute instantiated payload types for the first pass.
@@ -178,7 +179,7 @@ class CheckerExpr(object):
             inst_payloads_first = list(payloads)
         else:
             inst_payloads_first = [None] * len(payloads)
-        for a, pt, hint in zip(args, payloads, inst_payloads_first, strict=True):
+        for a, pt, hint in zip_strict(args, payloads, inst_payloads_first):
             at = self.check_expr(a, env, hint)
             if at == "never":
                 self.err("never value cannot be used as an enum payload", e)
@@ -208,7 +209,7 @@ class CheckerExpr(object):
         # disagreement is a real type error. If the first-pass type
         # contained a placeholder ('?'), the contextual hint wasn't
         # available — error out with a clearer message.
-        for i, (a, pt) in enumerate(zip(args, inst_payloads, strict=True)):
+        for i, (a, pt) in enumerate(zip_strict(args, inst_payloads)):
             at = first_at[i]
             if at == "never":
                 continue
@@ -346,7 +347,7 @@ class CheckerExpr(object):
         if typeparams and expected is not None and type_base(expected) == name:
             eargs = type_args(expected)
             if len(eargs) == len(typeparams):
-                for tp, ea in zip(typeparams, eargs, strict=True):
+                for tp, ea in zip_strict(typeparams, eargs):
                     type_map[tp] = ea
         # Determine the struct's effective field types (instantiate or not).
         fields_with_defaults = st["fields"]
