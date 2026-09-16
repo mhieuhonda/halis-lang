@@ -1,0 +1,1639 @@
+# ============================================================================
+# std/dom.hls — Stage 74 (v0.93.0-alpha): server-side HTML DOM rendering
+# ----------------------------------------------------------------------------
+# This module is the ELEVENTH module of Phase V (the web application
+# track, Stages 63–76). It implements the roadmap's Stage 74 promise:
+#
+#   "Server-side rendering of HTML. A `dom::Element` tree is built in
+#    Halis, then serialised to HTML. No client-side JS required (the
+#    HTML is complete). Hydration (client-side JS takes over event
+#    handling) is a post-1.0 feature."
+#
+# The module provides a small, pure-HLS DOM tree: an immutable DomNode
+# value (a sum type — Element / Void / Text / Raw / Comment / Doctype /
+# Fragment) plus immutable builders, immutable mutators, and a pure
+# serialiser that walks the tree into a string. Layered entirely on
+# std.html (html_escape / _html_validate_name — Stage 38), std.str
+# (str_to_lower_ascii, str_replace, str_join), std.option, std.result,
+# and std.http (HttpResponse + http_html_response — Stage 38). NO new
+# compiler builtins.
+#
+# WHY A DOM (vs. std.template, Stage 69)?
+#
+#   std.template is a string template engine — Mustache-style {{var}}
+#   substitutions, conditions, loops, partials — the right tool when
+#   the page is mostly static text with holes for variables. std.dom is
+#   a TREE builder — the right tool when the page is built up
+#   programmatically with lots of conditional logic, when fragments
+#   are passed around between functions, when the same data structure
+#   must be inspected (counted, traversed) before being rendered, or
+#   when the output must be byte-stable across refactors (string
+#   concatenation is fragile; an immutable tree is not). The two
+#   modules compose: a template can be rendered into a DomNode.Raw and
+#   embedded verbatim, or a DomNode can be rendered into a str and
+#   passed as a template context value. Both are XSS-safe by default.
+#
+# SECURITY MODEL
+#
+#   * TEXT-NODE ESCAPING: every Text node's value is HTML-escaped via
+#     std.html.html_escape on serialisation (the same OWASP-safe escape
+#     used by std.template). &, <, >, ", ', and / are all escaped; no
+#     path through the serialiser produces raw text in element content
+#     unless the caller explicitly uses DomNode.Raw.
+#
+#   * ATTRIBUTE-VALUE ESCAPING: every attribute value is HTML-escaped
+#     via std.html.html_escape_attr (the same escape, used for attribute
+#     context). Names are validated by `_html_validate_name` (allows
+#     [A-Za-z][A-Za-z0-9_-]* only), blocking tag/attr injection via
+#     `<`, `>`, `"`, `'`, ` `, `=`, `/`, etc.
+#
+#   * RAW NODE (footgun): DomNode.Raw(s) inserts `s` VERBATIM into the
+#     output — NO escaping. The caller takes full responsibility for
+#     having sanitised `s`. This is the explicit opt-in for trusted
+#     HTML (sub-template output, server-generated markup, JSON LD
+#     blocks). NEVER use Raw for user input.
+#
+#   * COMMENT SAFETY: HTML5 disallows `-->` and `<!--` inside a
+#     comment; `--!>` is also forbidden. DomNode.Comment(s) sanitises
+#     `s` by replacing any `-` immediately followed by `-` or `>` with
+#     `- ` (a hyphen-space). This is minimal and safe: the comment
+#     cannot break out, and the round-trip is human-readable (only
+#     doubling hyphons — a tiny readability cost for an absolute
+#     invariant). The map is fixed: `--` -> `- -`, `->` -> `- >`. The
+#     comment is wrapped in `<!--` ... `-->`.
+#
+#   * VOID-TAG CORRECTNESS: HTML5 void elements (area, base, br, col,
+#     embed, hr, img, input, link, meta, param, source, track, wbr)
+#     MUST be emitted WITHOUT a closing tag — `<br></br>` is invalid
+#     HTML5. dom_element(tag, ...) panics if `tag` is a void tag (use
+#     dom_void instead); dom_void(tag, ...) panics if `tag` is NOT a
+#     void tag. This is a strict invariant: you cannot accidentally
+#     emit invalid HTML.
+#
+#   * DATA-* ATTRIBUTES: dom_data("foo", "bar") produces the attribute
+#     name `data-foo`. The `name` part is validated (so an attacker
+#     cannot inject `onclick` by passing a crafted `name`).
+#
+#   * SCRIPT / STYLE INLINE ESCAPING: inline <script> and <style>
+#     blocks can be terminated prematurely by the literal `</script>`
+#     or `</style>` sequence — the HTML5 parser does NOT respect JS
+#     or CSS string context. dom_script_inline and dom_style_inline
+#     rewrite `</script>` -> `<\/script>` (a valid JS escape that
+#     parses identically) and `</style>` -> `<\/style>` respectively,
+#     in both lowercase and uppercase forms. The body is then wrapped
+#     in a Raw node (script/style source is NOT HTML — escaping would
+#     corrupt it).
+#
+# DIFFERENTIAL PARITY
+#
+#   Every function is pure HLS (no IO, no Net, no Rand, no Fs, no Clock).
+#   The serialiser is a pure tree-walk; the output is byte-identical
+#   between the interpreter and the native binary. No I/O is performed
+#   beyond `println` in the demo. The acceptance test and demo are
+#   fully deterministic.
+#
+# NO NEW COMPILER BUILTINS
+#
+#   Layered on:
+#     * std.html (html_escape, html_escape_attr, _html_validate_name)
+#     * std.str   (str_to_lower_ascii, str_replace, str_join)
+#     * std.option (Option[T])
+#     * std.result (Result[T, E])
+#     * std.http  (HttpResponse, http_html_response — Stage 38; used
+#                  only by the HTTP convenience wrappers)
+# ============================================================================
+
+import "std.html"
+import "std.str"
+import "std.option"
+import "std.result"
+import "std.http"
+
+# ============================================================================
+# Constants — kind codes, the doctype string, the HTML5 void tag set.
+# ============================================================================
+
+# dom_kind_element() .. dom_kind_fragment() — DomNode variant kind codes
+# (used by dom_node_kind / dom_count_by_kind / dom_describe).
+fn dom_kind_element() -> int { return 1 }
+fn dom_kind_void() -> int { return 2 }
+fn dom_kind_text() -> int { return 3 }
+fn dom_kind_raw() -> int { return 4 }
+fn dom_kind_comment() -> int { return 5 }
+fn dom_kind_doctype() -> int { return 6 }
+fn dom_kind_fragment() -> int { return 7 }
+
+# dom_html5_doctype_str() — the HTML5 doctype declaration, exactly as
+# emitted by the serialiser for a DomNode.Doctype. Always "<!DOCTYPE html>"
+# (HTML5 simplification — no DTD URL, no PUBLIC identifier).
+fn dom_html5_doctype_str() -> str { return "<!DOCTYPE html>" }
+
+# dom_void_tag_list() — the HTML5 set of void elements (tags that
+# cannot have closing tags — `<br></br>` is invalid HTML5). Source:
+# https://html.spec.whatwg.org/#void-elements (14 elements as of 2024).
+# The list is hard-coded; the function returns a NEW list every call
+# so the caller cannot mutate a shared backing array.
+fn dom_void_tag_list() -> list[str] {
+    return [
+        "area",
+        "base",
+        "br",
+        "col",
+        "embed",
+        "hr",
+        "img",
+        "input",
+        "link",
+        "meta",
+        "param",
+        "source",
+        "track",
+        "wbr"
+    ]
+}
+
+# dom_is_void_tag(tag) — true iff `tag` (case-insensitive) is in the
+# HTML5 void-element set. Used by dom_element / dom_void to enforce
+# the void-vs-container invariant.
+fn dom_is_void_tag(tag: str) -> bool {
+    let lower: str = str_to_lower_ascii(tag)
+    let voids: list[str] = dom_void_tag_list()
+    let mut i: int = 0
+    while i < voids.len() {
+        if voids.get(i) == lower {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+# ============================================================================
+# DomAttr — one attribute: a name and a value. Names are validated at
+# construction (see dom_attr); values are escaped at render time.
+# ============================================================================
+
+struct DomAttr {
+    name: str,
+    value: str
+}
+
+# dom_attr(name, value) — construct a DomAttr. The name is validated
+# (calls _html_validate_name, which allows [A-Za-z][A-Za-z0-9_-]* and
+# panics on any character that could break out of the attribute
+# context — `<`, `>`, `"`, `'`, `=`, `/`, ` `, etc.). The value is
+# stored as-is; escaping happens at render time.
+fn dom_attr(name: str, value: str) -> DomAttr {
+    let safe: str = _html_validate_name(name)
+    return DomAttr { name: safe, value: value }
+}
+
+# dom_attr_true(name) — construct a boolean attribute that is PRESENT
+# (e.g. `disabled`, `checked`, `readonly`, `required`, `multiple`,
+# `autofocus`). The renderer emits just the name (no `=""`) — the
+# canonical HTML5 form for present booleans.
+#
+# Implementation note: the sentinel is chr(0) (NUL), a value no
+# legitimate attribute ever has. The renderer checks for this sentinel.
+fn dom_attr_true(name: str) -> DomAttr {
+    let safe: str = _html_validate_name(name)
+    return DomAttr { name: safe, value: chr(0) }
+}
+
+# dom_attr_false(name) — the absent form of a boolean attribute. The
+# renderer OMITS the attribute entirely (an empty-string boolean would
+# still be present, which is wrong for a "false" boolean).
+#
+# Implementation note: the sentinel is chr(1) (SOH).
+fn dom_attr_false(name: str) -> DomAttr {
+    let safe: str = _html_validate_name(name)
+    return DomAttr { name: safe, value: chr(1) }
+}
+
+# Attribute-name shorthand constructors. Each delegates to dom_attr
+# after picking the right name. The point is call-site readability:
+# `dom_class("btn")` reads better than `dom_attr("class", "btn")`.
+fn dom_class(value: str) -> DomAttr {
+    return dom_attr("class", value)
+}
+
+fn dom_id(value: str) -> DomAttr {
+    return dom_attr("id", value)
+}
+
+fn dom_href(value: str) -> DomAttr {
+    return dom_attr("href", value)
+}
+
+fn dom_src(value: str) -> DomAttr {
+    return dom_attr("src", value)
+}
+
+fn dom_alt(value: str) -> DomAttr {
+    return dom_attr("alt", value)
+}
+
+# dom_title_attr(value) — the `title` ATTRIBUTE (hover tooltip), not
+# the <title> ELEMENT (use dom_title for that).
+fn dom_title_attr(value: str) -> DomAttr {
+    return dom_attr("title", value)
+}
+
+# dom_name_attr(value) — the `name` attribute.
+fn dom_name_attr(value: str) -> DomAttr {
+    return dom_attr("name", value)
+}
+
+# dom_value_attr(value) — the `value` attribute.
+fn dom_value_attr(value: str) -> DomAttr {
+    return dom_attr("value", value)
+}
+
+fn dom_placeholder(value: str) -> DomAttr {
+    return dom_attr("placeholder", value)
+}
+
+# dom_type_attr(value) — the `type` attribute (e.g. "text", "submit",
+# "checkbox").
+fn dom_type_attr(value: str) -> DomAttr {
+    return dom_attr("type", value)
+}
+
+fn dom_rel(value: str) -> DomAttr {
+    return dom_attr("rel", value)
+}
+
+fn dom_lang(value: str) -> DomAttr {
+    return dom_attr("lang", value)
+}
+
+fn dom_charset(value: str) -> DomAttr {
+    return dom_attr("charset", value)
+}
+
+# dom_style_attr(value) — the inline `style` attribute. Named to
+# avoid clash with the <style> element builder.
+fn dom_style_attr(value: str) -> DomAttr {
+    return dom_attr("style", value)
+}
+
+# dom_role(value) — the ARIA `role` attribute.
+fn dom_role(value: str) -> DomAttr {
+    return dom_attr("role", value)
+}
+
+# dom_data(name, value) — a `data-{name}` attribute. The `name` part
+# is validated; the rendered attribute name is `data-{name}`. The
+# validation blocks the obvious attack (a caller passing `onclick`
+# as `name` to produce `data-onclick`, which is harmless — but a
+# caller passing `onclick" foo="bar` would be caught and rejected).
+fn dom_data(name: str, value: str) -> DomAttr {
+    let safe: str = _html_validate_name(name)
+    return DomAttr { name: "data-" + safe, value: value }
+}
+
+# dom_aria(name, value) — an `aria-{name}` attribute. Same defence.
+fn dom_aria(name: str, value: str) -> DomAttr {
+    let safe: str = _html_validate_name(name)
+    return DomAttr { name: "aria-" + safe, value: value }
+}
+
+# ============================================================================
+# DomNode — the tagged union. Every node is heap-allocated (per the
+# HLS enum memory model, SPEC §11b). The tree is BUILT with mutable
+# builders (push children onto a list, then wrap in an Element node);
+# once built, it should not be mutated — use the immutable `with_*`
+# mutators to derive a NEW tree.
+#
+# Variants:
+#   Element(tag, attrs, children) — a container element. tag is the
+#       element name (validated at construction; never a void tag —
+#       dom_element panics if you pass one).
+#   Void(tag, attrs) — a void element (no closing tag). tag must be a
+#       void tag (dom_void panics if you pass a non-void tag).
+#   Text(s) — HTML-escaped text content. The raw `s` is stored as-is;
+#       escaping happens at render time.
+#   Raw(s) — verbatim HTML; `s` is emitted as-is, NO escaping. The
+#       caller takes responsibility for `s` being safe.
+#   Comment(s) — an HTML comment. The `s` is sanitised at render time
+#       to prevent `-->` / `--!>` breakout.
+#   Doctype — the HTML5 doctype. Always serialises to "<!DOCTYPE html>".
+#   Fragment(children) — a list of children with no wrapping element.
+#       Renders as the concatenation of its children (no open/close tag).
+# ============================================================================
+
+enum DomNode {
+    Element(str, list[DomAttr], list[DomNode]),
+    Void(str, list[DomAttr]),
+    Text(str),
+    Raw(str),
+    Comment(str),
+    Doctype,
+    Fragment(list[DomNode])
+}
+
+# ----------------------------------------------------------------------------
+# Node constructors — the canonical builders.
+# ----------------------------------------------------------------------------
+
+fn dom_text(s: str) -> DomNode {
+    return DomNode.Text(s)
+}
+
+# dom_raw(s) — a Raw node. The string is emitted VERBATIM. Use this
+# ONLY for trusted HTML (sub-template output, server-generated markup,
+# JSON-LD blocks). NEVER for user input.
+fn dom_raw(s: str) -> DomNode {
+    return DomNode.Raw(s)
+}
+
+# dom_comment(s) — a Comment node. The `s` is sanitised at render
+# time so `-->` and `--!>` cannot break out of the comment.
+fn dom_comment(s: str) -> DomNode {
+    return DomNode.Comment(s)
+}
+
+# dom_doctype() — the HTML5 doctype node. Renders to "<!DOCTYPE html>".
+fn dom_doctype() -> DomNode {
+    return DomNode.Doctype
+}
+
+# dom_fragment(children) — a Fragment node. Renders as the
+# concatenation of `children` (no wrapping element).
+fn dom_fragment(children: list[DomNode]) -> DomNode {
+    return DomNode.Fragment(children)
+}
+
+# dom_element(tag, attrs, children) — an Element node. `tag` is
+# validated (the [A-Za-z][A-Za-z0-9_-]* rule). Panics if `tag` is a
+# void tag — use dom_void for those (the renderer would otherwise emit
+# `<br></br>`, which is invalid HTML5).
+fn dom_element(tag: str, attrs: list[DomAttr], children: list[DomNode]) -> DomNode {
+    let safe: str = _html_validate_name(tag)
+    if dom_is_void_tag(safe) {
+        panic("dom_element: '" + safe + "' is a void tag — use dom_void instead")
+    }
+    return DomNode.Element(safe, attrs, children)
+}
+
+# dom_void(tag, attrs) — a Void element node. `tag` must be a void
+# tag (case-insensitive); panics otherwise. The renderer emits `<tag
+# attrs>` with no closing tag.
+fn dom_void(tag: str, attrs: list[DomAttr]) -> DomNode {
+    let safe: str = _html_validate_name(tag)
+    if !dom_is_void_tag(safe) {
+        panic("dom_void: '" + safe + "' is NOT a void tag — use dom_element instead")
+    }
+    return DomNode.Void(safe, attrs)
+}
+
+# ----------------------------------------------------------------------------
+# Element constructors — shorthand builders for the common HTML
+# elements. The list is intentionally NOT exhaustive — Stage 74 covers
+# the common HTML5 surface; rare elements can be built via dom_element.
+# ----------------------------------------------------------------------------
+
+# --- Document structure ---
+
+fn dom_html(attrs: list[DomAttr], children: list[DomNode]) -> DomNode {
+    return dom_element("html", attrs, children)
+}
+
+fn dom_head(attrs: list[DomAttr], children: list[DomNode]) -> DomNode {
+    return dom_element("head", attrs, children)
+}
+
+fn dom_body(attrs: list[DomAttr], children: list[DomNode]) -> DomNode {
+    return dom_element("body", attrs, children)
+}
+
+# dom_title(text) — the <title> element with a single Text child.
+fn dom_title(text: str) -> DomNode {
+    return dom_element("title", [], [dom_text(text)])
+}
+
+# dom_title_attrs(attrs, text) — <title> with attributes (rare; XML lang).
+fn dom_title_attrs(attrs: list[DomAttr], text: str) -> DomNode {
+    return dom_element("title", attrs, [dom_text(text)])
+}
+
+fn dom_meta(attrs: list[DomAttr]) -> DomNode {
+    return dom_void("meta", attrs)
+}
+
+fn dom_link(attrs: list[DomAttr]) -> DomNode {
+    return dom_void("link", attrs)
+}
+
+# dom_script_attrs(attrs, children) — a <script> element with explicit
+# attributes and inline children. The children are usually a single
+# Raw node (script source is NOT HTML-escaped — `<` and `>` are
+# legal in JavaScript).
+fn dom_script_attrs(attrs: list[DomAttr], children: list[DomNode]) -> DomNode {
+    return dom_element("script", attrs, children)
+}
+
+# dom_script_src(src) — an external <script src=...>. Emits
+# `<script src="..."></script>` (the closing tag is REQUIRED — HTML5
+# parsers do not self-close script tags).
+fn dom_script_src(src: str) -> DomNode {
+    return dom_element("script", [dom_src(src)], [])
+}
+
+# dom_script_inline(code) — an inline <script> with the given source.
+# The `code` is wrapped in a Raw node (NOT escaped) — script source is
+# JavaScript, not HTML. The caller is responsible for ensuring the
+# source does not contain the literal `</script>` sequence (which
+# would terminate the element prematurely — the HTML5 parser scans
+# for `</script` case-insensitively and does not respect JS string
+# context). This helper rewrites `</script>` to `<\/script>` (a valid
+# JS escape that parses identically) in both lowercase and uppercase.
+fn dom_script_inline(code: str) -> DomNode {
+    let safe: str = _dom_escape_close_tag(code, "</script>")
+    return dom_element("script", [], [dom_raw(safe)])
+}
+
+# dom_style_inline(css) — an inline <style> with the given CSS. The
+# CSS is wrapped in a Raw node (NOT escaped) — CSS source is not HTML.
+# The helper rewrites `</style>` to `<\/style>` in both cases — the
+# same defence as for script.
+fn dom_style_inline(css: str) -> DomNode {
+    let safe: str = _dom_escape_close_tag(css, "</style>")
+    return dom_element("style", [], [dom_raw(safe)])
+}
+
+# _dom_escape_close_tag(s, close) — replace every occurrence of `close`
+# (case-insensitive) in `s` with `<\/` + close's tail (without the
+# leading `<`). For `close = "</script>"`, every `</script>` and
+# `</SCRIPT>` becomes `<\/script>` and `<\/SCRIPT>` respectively. The
+# rewrited string is a valid JS/CSS escape that parses identically but
+# does not terminate the element.
+fn _dom_escape_close_tag(s: str, close: str) -> str {
+    let lower: str = str_to_lower_ascii(close)
+    let upper: str = str_to_upper_ascii(close)
+    let mut out: str = str_replace(s, close, "<\\" + close.slice(1, close.len()))
+    out = str_replace(out, lower, "<\\" + lower.slice(1, lower.len()))
+    out = str_replace(out, upper, "<\\" + upper.slice(1, upper.len()))
+    return out
+}
+
+# --- Sectioning ---
+
+fn dom_section(attrs: list[DomAttr], children: list[DomNode]) -> DomNode {
+    return dom_element("section", attrs, children)
+}
+
+fn dom_article(attrs: list[DomAttr], children: list[DomNode]) -> DomNode {
+    return dom_element("article", attrs, children)
+}
+
+fn dom_header(attrs: list[DomAttr], children: list[DomNode]) -> DomNode {
+    return dom_element("header", attrs, children)
+}
+
+fn dom_footer(attrs: list[DomAttr], children: list[DomNode]) -> DomNode {
+    return dom_element("footer", attrs, children)
+}
+
+fn dom_nav(attrs: list[DomAttr], children: list[DomNode]) -> DomNode {
+    return dom_element("nav", attrs, children)
+}
+
+fn dom_aside(attrs: list[DomAttr], children: list[DomNode]) -> DomNode {
+    return dom_element("aside", attrs, children)
+}
+
+fn dom_main(attrs: list[DomAttr], children: list[DomNode]) -> DomNode {
+    return dom_element("main", attrs, children)
+}
+
+# --- Headings ---
+
+fn dom_h1(text: str, attrs: list[DomAttr]) -> DomNode {
+    return dom_element("h1", attrs, [dom_text(text)])
+}
+
+fn dom_h2(text: str, attrs: list[DomAttr]) -> DomNode {
+    return dom_element("h2", attrs, [dom_text(text)])
+}
+
+fn dom_h3(text: str, attrs: list[DomAttr]) -> DomNode {
+    return dom_element("h3", attrs, [dom_text(text)])
+}
+
+fn dom_h4(text: str, attrs: list[DomAttr]) -> DomNode {
+    return dom_element("h4", attrs, [dom_text(text)])
+}
+
+fn dom_h5(text: str, attrs: list[DomAttr]) -> DomNode {
+    return dom_element("h5", attrs, [dom_text(text)])
+}
+
+fn dom_h6(text: str, attrs: list[DomAttr]) -> DomNode {
+    return dom_element("h6", attrs, [dom_text(text)])
+}
+
+# --- Text content ---
+
+fn dom_p(text: str, attrs: list[DomAttr]) -> DomNode {
+    return dom_element("p", attrs, [dom_text(text)])
+}
+
+fn dom_p_nodes(attrs: list[DomAttr], children: list[DomNode]) -> DomNode {
+    return dom_element("p", attrs, children)
+}
+
+fn dom_span(text: str, attrs: list[DomAttr]) -> DomNode {
+    return dom_element("span", attrs, [dom_text(text)])
+}
+
+fn dom_span_nodes(attrs: list[DomAttr], children: list[DomNode]) -> DomNode {
+    return dom_element("span", attrs, children)
+}
+
+fn dom_div(attrs: list[DomAttr], children: list[DomNode]) -> DomNode {
+    return dom_element("div", attrs, children)
+}
+
+fn dom_pre(attrs: list[DomAttr], children: list[DomNode]) -> DomNode {
+    return dom_element("pre", attrs, children)
+}
+
+fn dom_blockquote(attrs: list[DomAttr], children: list[DomNode]) -> DomNode {
+    return dom_element("blockquote", attrs, children)
+}
+
+# dom_hr(attrs) — a <hr> void element (horizontal rule).
+fn dom_hr(attrs: list[DomAttr]) -> DomNode {
+    return dom_void("hr", attrs)
+}
+
+# --- Inline text ---
+
+# dom_a(href, text, attrs) — an <a> element with a single Text child.
+fn dom_a(href: str, text: str, attrs: list[DomAttr]) -> DomNode {
+    return dom_a_nodes(href, attrs, [dom_text(text)])
+}
+
+# dom_a_nodes(href, attrs, children) — an <a> with arbitrary children.
+fn dom_a_nodes(href: str, attrs: list[DomAttr], children: list[DomNode]) -> DomNode {
+    let merged: list[DomAttr] = _dom_attrs_prepend(dom_href(href), attrs)
+    return dom_element("a", merged, children)
+}
+
+fn dom_em(text: str, attrs: list[DomAttr]) -> DomNode {
+    return dom_element("em", attrs, [dom_text(text)])
+}
+
+fn dom_strong(text: str, attrs: list[DomAttr]) -> DomNode {
+    return dom_element("strong", attrs, [dom_text(text)])
+}
+
+fn dom_code(text: str, attrs: list[DomAttr]) -> DomNode {
+    return dom_element("code", attrs, [dom_text(text)])
+}
+
+fn dom_small(text: str, attrs: list[DomAttr]) -> DomNode {
+    return dom_element("small", attrs, [dom_text(text)])
+}
+
+fn dom_mark(text: str, attrs: list[DomAttr]) -> DomNode {
+    return dom_element("mark", attrs, [dom_text(text)])
+}
+
+# dom_abbr(text, title, attrs) — an <abbr title="..."> element.
+fn dom_abbr(text: str, title: str, attrs: list[DomAttr]) -> DomNode {
+    let merged: list[DomAttr] = _dom_attrs_prepend(dom_title_attr(title), attrs)
+    return dom_element("abbr", merged, [dom_text(text)])
+}
+
+fn dom_b(text: str, attrs: list[DomAttr]) -> DomNode {
+    return dom_element("b", attrs, [dom_text(text)])
+}
+
+fn dom_i(text: str, attrs: list[DomAttr]) -> DomNode {
+    return dom_element("i", attrs, [dom_text(text)])
+}
+
+fn dom_u(text: str, attrs: list[DomAttr]) -> DomNode {
+    return dom_element("u", attrs, [dom_text(text)])
+}
+
+fn dom_sub(text: str, attrs: list[DomAttr]) -> DomNode {
+    return dom_element("sub", attrs, [dom_text(text)])
+}
+
+fn dom_sup(text: str, attrs: list[DomAttr]) -> DomNode {
+    return dom_element("sup", attrs, [dom_text(text)])
+}
+
+# --- Lists ---
+
+fn dom_ul(attrs: list[DomAttr], children: list[DomNode]) -> DomNode {
+    return dom_element("ul", attrs, children)
+}
+
+fn dom_ol(attrs: list[DomAttr], children: list[DomNode]) -> DomNode {
+    return dom_element("ol", attrs, children)
+}
+
+fn dom_li(text: str, attrs: list[DomAttr]) -> DomNode {
+    return dom_element("li", attrs, [dom_text(text)])
+}
+
+fn dom_li_nodes(attrs: list[DomAttr], children: list[DomNode]) -> DomNode {
+    return dom_element("li", attrs, children)
+}
+
+fn dom_dl(attrs: list[DomAttr], children: list[DomNode]) -> DomNode {
+    return dom_element("dl", attrs, children)
+}
+
+fn dom_dt(text: str, attrs: list[DomAttr]) -> DomNode {
+    return dom_element("dt", attrs, [dom_text(text)])
+}
+
+fn dom_dd(text: str, attrs: list[DomAttr]) -> DomNode {
+    return dom_element("dd", attrs, [dom_text(text)])
+}
+
+# --- Tables ---
+
+fn dom_table(attrs: list[DomAttr], children: list[DomNode]) -> DomNode {
+    return dom_element("table", attrs, children)
+}
+
+fn dom_thead(attrs: list[DomAttr], children: list[DomNode]) -> DomNode {
+    return dom_element("thead", attrs, children)
+}
+
+fn dom_tbody(attrs: list[DomAttr], children: list[DomNode]) -> DomNode {
+    return dom_element("tbody", attrs, children)
+}
+
+fn dom_tfoot(attrs: list[DomAttr], children: list[DomNode]) -> DomNode {
+    return dom_element("tfoot", attrs, children)
+}
+
+fn dom_caption(text: str, attrs: list[DomAttr]) -> DomNode {
+    return dom_element("caption", attrs, [dom_text(text)])
+}
+
+fn dom_colgroup(attrs: list[DomAttr], children: list[DomNode]) -> DomNode {
+    return dom_element("colgroup", attrs, children)
+}
+
+# dom_col(attrs) — a <col> void element.
+fn dom_col(attrs: list[DomAttr]) -> DomNode {
+    return dom_void("col", attrs)
+}
+
+fn dom_tr(attrs: list[DomAttr], children: list[DomNode]) -> DomNode {
+    return dom_element("tr", attrs, children)
+}
+
+fn dom_th(text: str, attrs: list[DomAttr]) -> DomNode {
+    return dom_element("th", attrs, [dom_text(text)])
+}
+
+fn dom_th_nodes(attrs: list[DomAttr], children: list[DomNode]) -> DomNode {
+    return dom_element("th", attrs, children)
+}
+
+fn dom_td(text: str, attrs: list[DomAttr]) -> DomNode {
+    return dom_element("td", attrs, [dom_text(text)])
+}
+
+fn dom_td_nodes(attrs: list[DomAttr], children: list[DomNode]) -> DomNode {
+    return dom_element("td", attrs, children)
+}
+
+# --- Forms ---
+
+# dom_form(action, attrs, children) — a <form> with the action attribute
+# set; caller attrs are appended (so they can override action if needed).
+fn dom_form(action: str, attrs: list[DomAttr], children: list[DomNode]) -> DomNode {
+    let merged: list[DomAttr] = _dom_attrs_prepend(dom_attr("action", action), attrs)
+    return dom_element("form", merged, children)
+}
+
+# dom_label(for_id, text, attrs) — a <label> with the for attribute.
+fn dom_label(for_id: str, text: str, attrs: list[DomAttr]) -> DomNode {
+    let merged: list[DomAttr] = _dom_attrs_prepend(dom_attr("for", for_id), attrs)
+    return dom_element("label", merged, [dom_text(text)])
+}
+
+# dom_input(attrs) — an <input> void element.
+fn dom_input(attrs: list[DomAttr]) -> DomNode {
+    return dom_void("input", attrs)
+}
+
+# dom_button(text, attrs) — a <button> with text content.
+fn dom_button(text: str, attrs: list[DomAttr]) -> DomNode {
+    return dom_element("button", attrs, [dom_text(text)])
+}
+
+fn dom_button_nodes(attrs: list[DomAttr], children: list[DomNode]) -> DomNode {
+    return dom_element("button", attrs, children)
+}
+
+fn dom_select(attrs: list[DomAttr], children: list[DomNode]) -> DomNode {
+    return dom_element("select", attrs, children)
+}
+
+# dom_option(value, text, attrs) — an <option value=...>text</option>.
+fn dom_option(value: str, text: str, attrs: list[DomAttr]) -> DomNode {
+    let merged: list[DomAttr] = _dom_attrs_prepend(dom_value_attr(value), attrs)
+    return dom_element("option", merged, [dom_text(text)])
+}
+
+# dom_textarea(name, attrs, content) — a <textarea> element. The
+# `content` is HTML-escaped (textarea content is treated as text by
+# the parser, NOT as HTML — so escaping is correct). The `name`
+# attribute is set; caller attrs are appended.
+fn dom_textarea(name: str, attrs: list[DomAttr], content: str) -> DomNode {
+    let merged: list[DomAttr] = _dom_attrs_prepend(dom_name_attr(name), attrs)
+    return dom_element("textarea", merged, [dom_text(content)])
+}
+
+fn dom_fieldset(attrs: list[DomAttr], children: list[DomNode]) -> DomNode {
+    return dom_element("fieldset", attrs, children)
+}
+
+fn dom_legend(text: str, attrs: list[DomAttr]) -> DomNode {
+    return dom_element("legend", attrs, [dom_text(text)])
+}
+
+# --- Media ---
+
+# dom_img(src, alt, attrs) — an <img> void element with src and alt.
+fn dom_img(src: str, alt: str, attrs: list[DomAttr]) -> DomNode {
+    let base: list[DomAttr] = [dom_src(src), dom_alt(alt)]
+    let merged: list[DomAttr] = _dom_attrs_concat(base, attrs)
+    return dom_void("img", merged)
+}
+
+# dom_br() — a <br> void element (no attributes).
+fn dom_br() -> DomNode {
+    return dom_void("br", [])
+}
+
+# dom_br_attrs(attrs) — a <br> with attributes (rare; for ID/style hooks).
+fn dom_br_attrs(attrs: list[DomAttr]) -> DomNode {
+    return dom_void("br", attrs)
+}
+
+fn dom_figure(attrs: list[DomAttr], children: list[DomNode]) -> DomNode {
+    return dom_element("figure", attrs, children)
+}
+
+fn dom_figcaption(text: str, attrs: list[DomAttr]) -> DomNode {
+    return dom_element("figcaption", attrs, [dom_text(text)])
+}
+
+fn dom_picture(attrs: list[DomAttr], children: list[DomNode]) -> DomNode {
+    return dom_element("picture", attrs, children)
+}
+
+# dom_source(attrs) — a <source> void element.
+fn dom_source(attrs: list[DomAttr]) -> DomNode {
+    return dom_void("source", attrs)
+}
+
+# --- Interactive ---
+
+fn dom_details(attrs: list[DomAttr], children: list[DomNode]) -> DomNode {
+    return dom_element("details", attrs, children)
+}
+
+fn dom_summary(text: str, attrs: list[DomAttr]) -> DomNode {
+    return dom_element("summary", attrs, [dom_text(text)])
+}
+
+fn dom_dialog(attrs: list[DomAttr], children: list[DomNode]) -> DomNode {
+    return dom_element("dialog", attrs, children)
+}
+
+# ----------------------------------------------------------------------------
+# Attribute list helpers (internal) — used by the element builders to
+# prepend / concat attribute lists immutably.
+# ----------------------------------------------------------------------------
+
+# _dom_attrs_prepend(head, tail) — return a NEW attribute list with
+# `head` first followed by every element of `tail`. The two input
+# lists are not mutated.
+fn _dom_attrs_prepend(head: DomAttr, tail: list[DomAttr]) -> list[DomAttr] {
+    let out: list[DomAttr] = [head]
+    let mut i: int = 0
+    while i < tail.len() {
+        out.push(tail.get(i))
+        i = i + 1
+    }
+    return out
+}
+
+# _dom_attrs_concat(a, b) — return a NEW attribute list with every
+# element of `a` followed by every element of `b`. The two input
+# lists are not mutated.
+fn _dom_attrs_concat(a: list[DomAttr], b: list[DomAttr]) -> list[DomAttr] {
+    let out: list[DomAttr] = []
+    let mut i: int = 0
+    while i < a.len() {
+        out.push(a.get(i))
+        i = i + 1
+    }
+    let mut j: int = 0
+    while j < b.len() {
+        out.push(b.get(j))
+        j = j + 1
+    }
+    return out
+}
+
+# ----------------------------------------------------------------------------
+# Document-level helpers — the common case of "a complete HTML5 page".
+# ----------------------------------------------------------------------------
+
+# dom_html_document(title, body_children) — a complete HTML5 document:
+#   <!DOCTYPE html>
+#   <html>
+#     <head><title>{title}</title></head>
+#     <body>{body_children}</body>
+#   </html>
+# The head contains only the <title>. Use dom_html_document_with_head
+# for richer <head> contents (meta tags, links, scripts, styles).
+fn dom_html_document(title: str, body_children: list[DomNode]) -> DomNode {
+    let head: DomNode = dom_head([], [dom_title(title)])
+    let body: DomNode = dom_body([], body_children)
+    return dom_fragment([dom_doctype(), dom_html([], [head, body])])
+}
+
+# dom_html_document_with_head(title, head_extras, body_attrs, body_children)
+# — a complete HTML5 document with full control over the <head> and
+# the <body>'s attributes:
+#   <!DOCTYPE html>
+#   <html>
+#     <head>
+#       <title>{title}</title>
+#       {head_extras...}            # meta, link, script, style
+#     </head>
+#     <body {body_attrs}>
+#       {body_children...}
+#     </body>
+#   </html>
+fn dom_html_document_with_head(
+        title: str,
+        head_extras: list[DomNode],
+        body_attrs: list[DomAttr],
+        body_children: list[DomNode]) -> DomNode {
+    let head_children: list[DomNode] = _dom_children_prepend(dom_title(title), head_extras)
+    let head: DomNode = dom_head([], head_children)
+    let body: DomNode = dom_body(body_attrs, body_children)
+    return dom_fragment([dom_doctype(), dom_html([], [head, body])])
+}
+
+# _dom_children_prepend(head, tail) — return a NEW DomNode list with
+# `head` first followed by every element of `tail`. Used by
+# dom_html_document_with_head.
+fn _dom_children_prepend(head: DomNode, tail: list[DomNode]) -> list[DomNode] {
+    let out: list[DomNode] = [head]
+    let mut i: int = 0
+    while i < tail.len() {
+        out.push(tail.get(i))
+        i = i + 1
+    }
+    return out
+}
+
+# ----------------------------------------------------------------------------
+# Immutable mutators — return a NEW node; the receiver is unchanged.
+# Each match arm delegates to a per-variant helper so the arm itself
+# stays a single expression (HLS match arms are expressions, not blocks).
+# ----------------------------------------------------------------------------
+
+# dom_with_attr(node, attr) — return a copy of `node` with `attr`
+# appended to its attribute list. If `node` is not an Element or Void,
+# the call is a no-op (returns `node` unchanged).
+#
+# NOTE: this APPENDS the attribute; if you want to REPLACE an existing
+# attribute with the same name, use dom_attr_set.
+fn dom_with_attr(node: DomNode, attr: DomAttr) -> DomNode {
+    return match node {
+        DomNode.Element(tag, attrs, children) => _dom_with_attr_elem(tag, attrs, children, attr),
+        DomNode.Void(tag, attrs) => _dom_with_attr_void(tag, attrs, attr),
+        DomNode.Text(_) => node,
+        DomNode.Raw(_) => node,
+        DomNode.Comment(_) => node,
+        DomNode.Doctype => node,
+        DomNode.Fragment(_) => node
+    }
+}
+
+# _dom_with_attr_elem(tag, attrs, children, attr) — return a NEW
+# Element node with the same tag/children and an attribute list equal
+# to `attrs` plus `attr` appended. The input `attrs` is not mutated.
+fn _dom_with_attr_elem(tag: str, attrs: list[DomAttr], children: list[DomNode], attr: DomAttr) -> DomNode {
+    let copied: list[DomAttr] = _dom_attrs_copy(attrs)
+    copied.push(attr)
+    return DomNode.Element(tag, copied, children)
+}
+
+# _dom_with_attr_void(tag, attrs, attr) — same as above for a Void node.
+fn _dom_with_attr_void(tag: str, attrs: list[DomAttr], attr: DomAttr) -> DomNode {
+    let copied: list[DomAttr] = _dom_attrs_copy(attrs)
+    copied.push(attr)
+    return DomNode.Void(tag, copied)
+}
+
+# _dom_attrs_copy(attrs) — return a NEW list containing every element
+# of `attrs`. The input list is not mutated.
+fn _dom_attrs_copy(attrs: list[DomAttr]) -> list[DomAttr] {
+    let out: list[DomAttr] = []
+    let mut i: int = 0
+    while i < attrs.len() {
+        out.push(attrs.get(i))
+        i = i + 1
+    }
+    return out
+}
+
+# dom_with_attrs(node, attrs) — return a copy of `node` with each
+# attribute in `attrs` appended (in order). For Element / Void nodes;
+# no-op for other kinds.
+fn dom_with_attrs(node: DomNode, attrs: list[DomAttr]) -> DomNode {
+    let mut cur: DomNode = node
+    let mut i: int = 0
+    while i < attrs.len() {
+        cur = dom_with_attr(cur, attrs.get(i))
+        i = i + 1
+    }
+    return cur
+}
+
+# dom_with_child(node, child) — return a copy of `node` with `child`
+# appended to its children list. For Element and Fragment nodes;
+# no-op for other kinds.
+fn dom_with_child(node: DomNode, child: DomNode) -> DomNode {
+    return match node {
+        DomNode.Element(tag, attrs, children) => _dom_with_child_elem(tag, attrs, children, child),
+        DomNode.Fragment(children) => _dom_with_child_frag(children, child),
+        DomNode.Void(_, _) => node,
+        DomNode.Text(_) => node,
+        DomNode.Raw(_) => node,
+        DomNode.Comment(_) => node,
+        DomNode.Doctype => node
+    }
+}
+
+# _dom_with_child_elem(tag, attrs, children, child) — return a NEW
+# Element with `child` appended to `children`.
+fn _dom_with_child_elem(tag: str, attrs: list[DomAttr], children: list[DomNode], child: DomNode) -> DomNode {
+    let copied: list[DomNode] = _dom_children_copy(children)
+    copied.push(child)
+    return DomNode.Element(tag, attrs, copied)
+}
+
+# _dom_with_child_frag(children, child) — return a NEW Fragment with
+# `child` appended to `children`.
+fn _dom_with_child_frag(children: list[DomNode], child: DomNode) -> DomNode {
+    let copied: list[DomNode] = _dom_children_copy(children)
+    copied.push(child)
+    return DomNode.Fragment(copied)
+}
+
+# _dom_children_copy(children) — return a NEW list with every element
+# of `children`. The input list is not mutated.
+fn _dom_children_copy(children: list[DomNode]) -> list[DomNode] {
+    let out: list[DomNode] = []
+    let mut i: int = 0
+    while i < children.len() {
+        out.push(children.get(i))
+        i = i + 1
+    }
+    return out
+}
+
+# dom_with_children(node, children) — return a copy of `node` with
+# each child in `children` appended (in order).
+fn dom_with_children(node: DomNode, children: list[DomNode]) -> DomNode {
+    let mut cur: DomNode = node
+    let mut i: int = 0
+    while i < children.len() {
+        cur = dom_with_child(cur, children.get(i))
+        i = i + 1
+    }
+    return cur
+}
+
+# ----------------------------------------------------------------------------
+# Attribute lookup / replacement — case-insensitive name matching
+# (per RFC 7230 / HTML5: attribute names are case-insensitive in
+# HTML; we lowercase both sides for comparison).
+# ----------------------------------------------------------------------------
+
+# dom_attr_get(node, name) — return the value of the first attribute
+# with the given name (case-insensitive) on `node`. Returns "" if the
+# node has no such attribute or if the node is not an Element / Void.
+fn dom_attr_get(node: DomNode, name: str) -> str {
+    let lower: str = str_to_lower_ascii(name)
+    return match node {
+        DomNode.Element(_, attrs, _) => _dom_attrs_find_value(attrs, lower),
+        DomNode.Void(_, attrs) => _dom_attrs_find_value(attrs, lower),
+        DomNode.Text(_) => "",
+        DomNode.Raw(_) => "",
+        DomNode.Comment(_) => "",
+        DomNode.Doctype => "",
+        DomNode.Fragment(_) => ""
+    }
+}
+
+# dom_attr_has(node, name) — true iff `node` has an attribute with the
+# given name (case-insensitive). Returns false for non-Element / Void.
+fn dom_attr_has(node: DomNode, name: str) -> bool {
+    let lower: str = str_to_lower_ascii(name)
+    return match node {
+        DomNode.Element(_, attrs, _) => _dom_attrs_has(attrs, lower),
+        DomNode.Void(_, attrs) => _dom_attrs_has(attrs, lower),
+        DomNode.Text(_) => false,
+        DomNode.Raw(_) => false,
+        DomNode.Comment(_) => false,
+        DomNode.Doctype => false,
+        DomNode.Fragment(_) => false
+    }
+}
+
+# dom_attr_set(node, name, value) — return a copy of `node` with the
+# attribute `name` set to `value`. If the attribute already exists
+# (case-insensitive match), its value is REPLACED (preserving its
+# position in the list — so the rendering order is stable). If it
+# does not exist, it is APPENDED.
+#
+# For Element / Void nodes; no-op for other kinds.
+fn dom_attr_set(node: DomNode, name: str, value: str) -> DomNode {
+    let safe_name: str = _html_validate_name(name)
+    let lower: str = str_to_lower_ascii(safe_name)
+    return match node {
+        DomNode.Element(tag, attrs, children) => _dom_attr_set_elem(tag, attrs, children, lower, safe_name, value),
+        DomNode.Void(tag, attrs) => _dom_attr_set_void(tag, attrs, lower, safe_name, value),
+        DomNode.Text(_) => node,
+        DomNode.Raw(_) => node,
+        DomNode.Comment(_) => node,
+        DomNode.Doctype => node,
+        DomNode.Fragment(_) => node
+    }
+}
+
+# _dom_attr_set_elem(tag, attrs, children, lower, safe_name, value) —
+# the Element variant of dom_attr_set.
+fn _dom_attr_set_elem(tag: str, attrs: list[DomAttr], children: list[DomNode], lower: str, safe_name: str, value: str) -> DomNode {
+    let copied: list[DomAttr] = _dom_attrs_replace_or_append(attrs, lower, safe_name, value)
+    return DomNode.Element(tag, copied, children)
+}
+
+# _dom_attr_set_void(tag, attrs, lower, safe_name, value) — the Void variant.
+fn _dom_attr_set_void(tag: str, attrs: list[DomAttr], lower: str, safe_name: str, value: str) -> DomNode {
+    let copied: list[DomAttr] = _dom_attrs_replace_or_append(attrs, lower, safe_name, value)
+    return DomNode.Void(tag, copied)
+}
+
+# dom_attr_remove(node, name) — return a copy of `node` with every
+# attribute whose name matches (case-insensitive) removed. For
+# Element / Void; no-op for other kinds.
+fn dom_attr_remove(node: DomNode, name: str) -> DomNode {
+    let lower: str = str_to_lower_ascii(name)
+    return match node {
+        DomNode.Element(tag, attrs, children) => _dom_attr_remove_elem(tag, attrs, children, lower),
+        DomNode.Void(tag, attrs) => _dom_attr_remove_void(tag, attrs, lower),
+        DomNode.Text(_) => node,
+        DomNode.Raw(_) => node,
+        DomNode.Comment(_) => node,
+        DomNode.Doctype => node,
+        DomNode.Fragment(_) => node
+    }
+}
+
+# _dom_attr_remove_elem(tag, attrs, children, lower) — Element variant.
+fn _dom_attr_remove_elem(tag: str, attrs: list[DomAttr], children: list[DomNode], lower: str) -> DomNode {
+    let copied: list[DomAttr] = _dom_attrs_remove(attrs, lower)
+    return DomNode.Element(tag, copied, children)
+}
+
+# _dom_attr_remove_void(tag, attrs, lower) — Void variant.
+fn _dom_attr_remove_void(tag: str, attrs: list[DomAttr], lower: str) -> DomNode {
+    let copied: list[DomAttr] = _dom_attrs_remove(attrs, lower)
+    return DomNode.Void(tag, copied)
+}
+
+# ----------------------------------------------------------------------------
+# Internal helpers for attribute list manipulation. These operate on
+# the lowercased target name (passed by the caller to avoid re-lowercasing
+# in a loop).
+# ----------------------------------------------------------------------------
+
+# _dom_attrs_find_value(attrs, lower) — return the value of the first
+# attribute whose name (lowercased) equals `lower`. Returns "" if not
+# found.
+fn _dom_attrs_find_value(attrs: list[DomAttr], lower: str) -> str {
+    let mut i: int = 0
+    while i < attrs.len() {
+        let a: DomAttr = attrs.get(i)
+        if str_to_lower_ascii(a.name) == lower {
+            return a.value
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+# _dom_attrs_has(attrs, lower) — true iff any attribute's lowercased
+# name equals `lower`.
+fn _dom_attrs_has(attrs: list[DomAttr], lower: str) -> bool {
+    let mut i: int = 0
+    while i < attrs.len() {
+        if str_to_lower_ascii(attrs.get(i).name) == lower {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+# _dom_attrs_replace_or_append(attrs, lower, safe_name, value) —
+# return a NEW attribute list with the first attribute whose
+# lowercased name equals `lower` REPLACED with `DomAttr{safe_name,
+# value}` (at the same index), or, if no match is found, with a new
+# `DomAttr{safe_name, value}` APPENDED at the end. Other attributes
+# are copied unchanged.
+fn _dom_attrs_replace_or_append(
+        attrs: list[DomAttr],
+        lower: str,
+        safe_name: str,
+        value: str) -> list[DomAttr] {
+    let copied: list[DomAttr] = []
+    let mut replaced: bool = false
+    let mut i: int = 0
+    while i < attrs.len() {
+        let a: DomAttr = attrs.get(i)
+        if !replaced && str_to_lower_ascii(a.name) == lower {
+            copied.push(DomAttr { name: safe_name, value: value })
+            replaced = true
+        } else {
+            copied.push(a)
+        }
+        i = i + 1
+    }
+    if !replaced {
+        copied.push(DomAttr { name: safe_name, value: value })
+    }
+    return copied
+}
+
+# _dom_attrs_remove(attrs, lower) — return a NEW attribute list with
+# every attribute whose lowercased name equals `lower` removed.
+fn _dom_attrs_remove(attrs: list[DomAttr], lower: str) -> list[DomAttr] {
+    let copied: list[DomAttr] = []
+    let mut i: int = 0
+    while i < attrs.len() {
+        let a: DomAttr = attrs.get(i)
+        if str_to_lower_ascii(a.name) != lower {
+            copied.push(a)
+        }
+        i = i + 1
+    }
+    return copied
+}
+
+# ----------------------------------------------------------------------------
+# Node introspection — kind / tag / attrs / children / text value.
+# Pure accessors that return data extracted from the node.
+# ----------------------------------------------------------------------------
+
+# dom_node_kind(node) — return the kind code (dom_kind_element ..).
+fn dom_node_kind(node: DomNode) -> int {
+    return match node {
+        DomNode.Element(_, _, _) => dom_kind_element(),
+        DomNode.Void(_, _) => dom_kind_void(),
+        DomNode.Text(_) => dom_kind_text(),
+        DomNode.Raw(_) => dom_kind_raw(),
+        DomNode.Comment(_) => dom_kind_comment(),
+        DomNode.Doctype => dom_kind_doctype(),
+        DomNode.Fragment(_) => dom_kind_fragment()
+    }
+}
+
+# dom_is_element(node) — true iff `node` is an Element.
+fn dom_is_element(node: DomNode) -> bool {
+    return dom_node_kind(node) == dom_kind_element()
+}
+
+# dom_is_void(node) — true iff `node` is a Void element.
+fn dom_is_void(node: DomNode) -> bool {
+    return dom_node_kind(node) == dom_kind_void()
+}
+
+# dom_is_text(node) — true iff `node` is a Text node.
+fn dom_is_text(node: DomNode) -> bool {
+    return dom_node_kind(node) == dom_kind_text()
+}
+
+# dom_is_raw(node) — true iff `node` is a Raw node.
+fn dom_is_raw(node: DomNode) -> bool {
+    return dom_node_kind(node) == dom_kind_raw()
+}
+
+# dom_is_comment(node) — true iff `node` is a Comment node.
+fn dom_is_comment(node: DomNode) -> bool {
+    return dom_node_kind(node) == dom_kind_comment()
+}
+
+# dom_is_doctype(node) — true iff `node` is the Doctype node.
+fn dom_is_doctype(node: DomNode) -> bool {
+    return dom_node_kind(node) == dom_kind_doctype()
+}
+
+# dom_is_fragment(node) — true iff `node` is a Fragment.
+fn dom_is_fragment(node: DomNode) -> bool {
+    return dom_node_kind(node) == dom_kind_fragment()
+}
+
+# dom_tag(node) — the tag name for an Element or Void node; "" for
+# every other kind.
+fn dom_tag(node: DomNode) -> str {
+    return match node {
+        DomNode.Element(tag, _, _) => tag,
+        DomNode.Void(tag, _) => tag,
+        DomNode.Text(_) => "",
+        DomNode.Raw(_) => "",
+        DomNode.Comment(_) => "",
+        DomNode.Doctype => "",
+        DomNode.Fragment(_) => ""
+    }
+}
+
+# dom_attrs(node) — the attribute list of an Element or Void node;
+# the empty list for every other kind. NOTE: this returns the node's
+# OWN attribute list reference — do not mutate the returned list.
+fn dom_attrs(node: DomNode) -> list[DomAttr] {
+    return match node {
+        DomNode.Element(_, attrs, _) => attrs,
+        DomNode.Void(_, attrs) => attrs,
+        DomNode.Text(_) => [],
+        DomNode.Raw(_) => [],
+        DomNode.Comment(_) => [],
+        DomNode.Doctype => [],
+        DomNode.Fragment(_) => []
+    }
+}
+
+# dom_children(node) — the children list of an Element or Fragment;
+# the empty list for every other kind. NOTE: this returns the node's
+# OWN children list reference — do not mutate the returned list.
+fn dom_children(node: DomNode) -> list[DomNode] {
+    return match node {
+        DomNode.Element(_, _, children) => children,
+        DomNode.Void(_, _) => [],
+        DomNode.Text(_) => [],
+        DomNode.Raw(_) => [],
+        DomNode.Comment(_) => [],
+        DomNode.Doctype => [],
+        DomNode.Fragment(children) => children
+    }
+}
+
+# dom_text_value(node) — the string payload of a Text, Raw, or
+# Comment node; "" for every other kind. The payload is the RAW
+# stored value (NOT the rendered output) — for a Text node this is
+# the pre-escape input; for a Comment node this is the pre-sanitise
+# input.
+fn dom_text_value(node: DomNode) -> str {
+    return match node {
+        DomNode.Element(_, _, _) => "",
+        DomNode.Void(_, _) => "",
+        DomNode.Text(s) => s,
+        DomNode.Raw(s) => s,
+        DomNode.Comment(s) => s,
+        DomNode.Doctype => "",
+        DomNode.Fragment(_) => ""
+    }
+}
+
+# ----------------------------------------------------------------------------
+# Statistics — node count + describe (introspection for debugging and
+# tests). Pure tree walks; the output is byte-identical between
+# interpreter and native.
+# ----------------------------------------------------------------------------
+
+# dom_node_count(node) — the total number of nodes in the tree
+# (counting `node` itself plus every descendant). The root Fragment
+# counts itself (one node) — Fragment is a node too.
+fn dom_node_count(node: DomNode) -> int {
+    return match node {
+        DomNode.Element(_, _, children) => 1 + _dom_children_count(children),
+        DomNode.Void(_, _) => 1,
+        DomNode.Text(_) => 1,
+        DomNode.Raw(_) => 1,
+        DomNode.Comment(_) => 1,
+        DomNode.Doctype => 1,
+        DomNode.Fragment(children) => 1 + _dom_children_count(children)
+    }
+}
+
+# _dom_children_count(children) — the total node count of a list of
+# children (each child's dom_node_count, summed). The Fragment variant
+# does NOT count itself (it is just a list wrapper).
+fn _dom_children_count(children: list[DomNode]) -> int {
+    let mut total: int = 0
+    let mut i: int = 0
+    while i < children.len() {
+        total = total + dom_node_count(children.get(i))
+        i = i + 1
+    }
+    return total
+}
+
+# dom_count_by_kind(node, kind) — the number of nodes in the tree
+# (counting `node` itself plus every descendant) whose kind code
+# equals `kind`.
+fn dom_count_by_kind(node: DomNode, kind: int) -> int {
+    return match node {
+        DomNode.Element(_, _, children) => _dom_int_eq(dom_kind_element(), kind) + _dom_children_count_by_kind(children, kind),
+        DomNode.Void(_, _) => _dom_int_eq(dom_kind_void(), kind),
+        DomNode.Text(_) => _dom_int_eq(dom_kind_text(), kind),
+        DomNode.Raw(_) => _dom_int_eq(dom_kind_raw(), kind),
+        DomNode.Comment(_) => _dom_int_eq(dom_kind_comment(), kind),
+        DomNode.Doctype => _dom_int_eq(dom_kind_doctype(), kind),
+        DomNode.Fragment(children) => _dom_int_eq(dom_kind_fragment(), kind) + _dom_children_count_by_kind(children, kind)
+    }
+}
+
+# _dom_children_count_by_kind(children, kind) — sum of
+# dom_count_by_kind over each child.
+fn _dom_children_count_by_kind(children: list[DomNode], kind: int) -> int {
+    let mut total: int = 0
+    let mut i: int = 0
+    while i < children.len() {
+        total = total + dom_count_by_kind(children.get(i), kind)
+        i = i + 1
+    }
+    return total
+}
+
+# _dom_int_eq(a, b) — 1 if a == b else 0.
+fn _dom_int_eq(a: int, b: int) -> int {
+    if a == b {
+        return 1
+    }
+    return 0
+}
+
+# dom_describe(node) — a human-readable indented AST dump. Each line
+# is "kind: ...", followed by children indented by two spaces. The
+# output is deterministic — byte-identical between interpreter and
+# native. Useful for debugging and snapshot tests.
+fn dom_describe(node: DomNode) -> str {
+    return _dom_describe_indent(node, 0)
+}
+
+# _dom_describe_indent(node, depth) — the recursive core of
+# dom_describe. Each line is prefixed with `depth * "  "` (two spaces
+# per level). Returns the full description (no trailing newline).
+fn _dom_describe_indent(node: DomNode, depth: int) -> str {
+    return match node {
+        DomNode.Element(tag, attrs, children) => _dom_describe_element(tag, attrs, children, depth),
+        DomNode.Void(tag, attrs) => _dom_describe_void(tag, attrs, depth),
+        DomNode.Text(s) => _dom_describe_text("Text", s, depth),
+        DomNode.Raw(s) => _dom_describe_text("Raw", s, depth),
+        DomNode.Comment(s) => _dom_describe_text("Comment", s, depth),
+        DomNode.Doctype => _dom_indent(depth) + "Doctype",
+        DomNode.Fragment(children) => _dom_describe_fragment(children, depth)
+    }
+}
+
+# _dom_describe_element(tag, attrs, children, depth) — Element variant
+# of _dom_describe_indent.
+fn _dom_describe_element(tag: str, attrs: list[DomAttr], children: list[DomNode], depth: int) -> str {
+    let prefix: str = _dom_indent(depth)
+    let mut s: str = prefix + "Element(" + tag + ")"
+    if attrs.len() > 0 {
+        s = s + " attrs=" + attrs.len().to_str()
+    }
+    s = s + "\n" + _dom_describe_children_indent(children, depth + 1)
+    return s
+}
+
+# _dom_describe_void(tag, attrs, depth) — Void variant.
+fn _dom_describe_void(tag: str, attrs: list[DomAttr], depth: int) -> str {
+    let prefix: str = _dom_indent(depth)
+    let mut s: str = prefix + "Void(" + tag + ")"
+    if attrs.len() > 0 {
+        s = s + " attrs=" + attrs.len().to_str()
+    }
+    return s
+}
+
+# _dom_describe_text(label, s, depth) — Text / Raw / Comment variant.
+fn _dom_describe_text(label: str, s: str, depth: int) -> str {
+    return _dom_indent(depth) + label + "(" + s.len().to_str() + " bytes)"
+}
+
+# _dom_describe_fragment(children, depth) — Fragment variant.
+fn _dom_describe_fragment(children: list[DomNode], depth: int) -> str {
+    let prefix: str = _dom_indent(depth)
+    return prefix + "Fragment(" + children.len().to_str() + ")\n"
+        + _dom_describe_children_indent(children, depth + 1)
+}
+
+# _dom_describe_children_indent(children, depth) — describe every
+# child at the given indentation depth, joined with "\n".
+fn _dom_describe_children_indent(children: list[DomNode], depth: int) -> str {
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < children.len() {
+        if i > 0 {
+            out = out + "\n"
+        }
+        out = out + _dom_describe_indent(children.get(i), depth)
+        i = i + 1
+    }
+    return out
+}
+
+# _dom_indent(depth) — `depth` copies of "  " (two spaces). Returns ""
+# for depth=0.
+fn _dom_indent(depth: int) -> str {
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < depth {
+        out = out + "  "
+        i = i + 1
+    }
+    return out
+}
+
+# ----------------------------------------------------------------------------
+# Serialiser — pure tree walk; output is byte-identical between the
+# interpreter and the native binary.
+# ----------------------------------------------------------------------------
+
+# dom_render(node) — serialise `node` to an HTML string. The output is
+# complete HTML — no client-side JS is required to render it.
+fn dom_render(node: DomNode) -> str {
+    return match node {
+        DomNode.Element(tag, attrs, children) => _dom_render_element(tag, attrs, children),
+        DomNode.Void(tag, attrs) => _dom_render_void(tag, attrs),
+        DomNode.Text(s) => html_escape(s),
+        DomNode.Raw(s) => s,
+        DomNode.Comment(s) => "<!--" + _dom_sanitize_comment(s) + "-->",
+        DomNode.Doctype => dom_html5_doctype_str(),
+        DomNode.Fragment(children) => _dom_render_children(children)
+    }
+}
+
+# _dom_render_element(tag, attrs, children) — render an Element. Empty
+# elements are emitted as `<tag></tag>` (NOT self-closing `<tag/>` —
+# self-closing is invalid HTML5 for non-foreign elements; the
+# serialiser emits the canonical `<div></div>` form).
+fn _dom_render_element(tag: str, attrs: list[DomAttr], children: list[DomNode]) -> str {
+    let head: str = "<" + tag + _dom_render_attrs(attrs) + ">"
+    let body: str = _dom_render_children(children)
+    return head + body + "</" + tag + ">"
+}
+
+# _dom_render_void(tag, attrs) — render a Void element. No closing tag.
+fn _dom_render_void(tag: str, attrs: list[DomAttr]) -> str {
+    return "<" + tag + _dom_render_attrs(attrs) + ">"
+}
+
+# dom_render_children(children) — serialise a list of children to a
+# single string. Public alias for the internal helper.
+fn dom_render_children(children: list[DomNode]) -> str {
+    return _dom_render_children(children)
+}
+
+# _dom_render_children(children) — internal: the concatenation of
+# dom_render over each child.
+fn _dom_render_children(children: list[DomNode]) -> str {
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < children.len() {
+        out = out + dom_render(children.get(i))
+        i = i + 1
+    }
+    return out
+}
+
+# dom_render_attrs(attrs) — render an attribute list as a single
+# string: the concatenation of " name=\"value\"" for each attribute
+# (with a leading space). The value is HTML-escaped. Public alias.
+fn dom_render_attrs(attrs: list[DomAttr]) -> str {
+    return _dom_render_attrs(attrs)
+}
+
+# _dom_render_attrs(attrs) — internal: the concatenation of
+# _dom_render_attr over each attribute. The leading space per
+# attribute is intentional — the result is " k1=\"v1\" k2=\"v2\""
+# (with a leading space, ready to splice into `<tag` ... `>`).
+fn _dom_render_attrs(attrs: list[DomAttr]) -> str {
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < attrs.len() {
+        out = out + _dom_render_attr(attrs.get(i))
+        i = i + 1
+    }
+    return out
+}
+
+# dom_render_attr(attr) — render a single attribute as ` name="value"`
+# (with a leading space). The value is HTML-escaped. Public alias.
+fn dom_render_attr(attr: DomAttr) -> str {
+    return _dom_render_attr(attr)
+}
+
+# _dom_render_attr(attr) — internal: render one attribute. Boolean
+# attributes (constructed via dom_attr_true / dom_attr_false) are
+# detected by the sentinel value: chr(0) (NUL) means "present, emit
+# just the name"; chr(1) (SOH) means "absent, emit nothing". Other
+# values are HTML-escaped and emitted as ` name="value"`.
+fn _dom_render_attr(attr: DomAttr) -> str {
+    let v: str = attr.value
+    if v.len() == 1 {
+        let b: int = v.byte_at(0)
+        if b == 0 {
+            return " " + attr.name
+        }
+        if b == 1 {
+            return ""
+        }
+    }
+    return " " + attr.name + "=\"" + html_escape_attr(v) + "\""
+}
+
+# _dom_sanitize_comment(s) — replace any `-` immediately followed by
+# `-` or `>` so the comment cannot break out via `-->` / `--!>`. The
+# rewrite is: at a `-`, look at the next byte; if it is `-` or `>`,
+# emit `-` then ` ` (instead of the next byte), advance 2; otherwise
+# emit `-` and advance 1. This minimal rewrite preserves readability
+# (only the second byte of a dangerous pair is rewritten) and is a
+# total invariant — `-->` cannot appear in the output.
+fn _dom_sanitize_comment(s: str) -> str {
+    let n: int = s.len()
+    if n == 0 {
+        return ""
+    }
+    let out: list[str] = []
+    let mut i: int = 0
+    while i < n {
+        let c: int = s.byte_at(i)
+        if c == 45 {
+            if i + 1 < n {
+                let next: int = s.byte_at(i + 1)
+                if next == 45 || next == 62 {
+                    out.push("-")
+                    out.push(" ")
+                    i = i + 2
+                } else {
+                    out.push("-")
+                    i = i + 1
+                }
+            } else {
+                out.push("-")
+                i = i + 1
+            }
+        } else {
+            out.push(s.slice(i, i + 1))
+            i = i + 1
+        }
+    }
+    return str_join(out, "")
+}
+
+# ----------------------------------------------------------------------------
+# HTTP integration — convenience wrappers for std.http.
+# ----------------------------------------------------------------------------
+
+# dom_to_html_response(status, node) — render `node` and wrap the
+# result in an HTTP response with Content-Type: text/html; charset=utf-8.
+fn dom_to_html_response(status: int, node: DomNode) -> HttpResponse {
+    let body: str = dom_render(node)
+    return http_html_response(status, body)
+}
+
+# dom_html_response_ok(node) — render `node` as a 200 OK HTML response.
+fn dom_html_response_ok(node: DomNode) -> HttpResponse {
+    return dom_to_html_response(200, node)
+}
+
+# dom_html_response_not_found(node) — render `node` as a 404 HTML response.
+fn dom_html_response_not_found(node: DomNode) -> HttpResponse {
+    return dom_to_html_response(404, node)
+}
+
+# dom_html_response_bad_request(node) — render `node` as a 400 HTML response.
+fn dom_html_response_bad_request(node: DomNode) -> HttpResponse {
+    return dom_to_html_response(400, node)
+}
+
+# dom_html_response_server_error(node) — render `node` as a 500 HTML response.
+fn dom_html_response_server_error(node: DomNode) -> HttpResponse {
+    return dom_to_html_response(500, node)
+}
