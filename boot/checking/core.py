@@ -293,7 +293,7 @@ class CheckerCore(object):
 
     def restore_moved(self, env, snap):
         """Restore moved-status from a snapshot (used when child scope exits)."""
-        for scope, snap_row in zip(env, snap, strict=False):
+        for scope, snap_row in zip(env, snap):
             for name, moved in snap_row.items():
                 if name in scope:
                     scope[name][2] = moved
@@ -323,7 +323,7 @@ class CheckerCore(object):
         binding) is still allowed because check_assign's revive step
         clears the moved flag, so the idiomatic "drop then revive"
         pattern continues to work."""
-        for scope, snap_row in zip(env, snap, strict=False):
+        for scope, snap_row in zip(env, snap):
             for name, moved in snap_row.items():
                 if name in scope and moved:
                     scope[name][2] = True

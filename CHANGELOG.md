@@ -13,7 +13,7 @@ stability (125–140), and final stabilisation toward v1.0 (141–150).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
-## [v0.92.4-alpha] — deep-scan-26: 6 fixes — three split regressions, CI unbroken on Python 3.8 (zip strict), interpreter flush parity, one CLI guard
+## [v0.92.4-alpha] — deep-scan-26: 7 fixes — three split regressions, CI unbroken on Python 3.8 (zip strict ×2), interpreter flush parity, real-LLVM IR comment fix, one CLI guard
 
 > Sixth systematic super-scan. This pass paired static analysis
 > (pyflakes over all 84 Python modules plus an AST walker for bare
@@ -65,6 +65,26 @@ new stdlib modules, tooling, examples, and CI/CD improvements.
   interleaving). `proc_exec` and `proc_spawn` now flush `self.out`
   before spawning, mirroring the native `fflush(stdout)` exactly;
   behaviour is version-independent.
+- **`zip(..., strict=False)` hit the same Python 3.8/3.9 TypeError
+  (HIGH).** Four more zip() call sites (`boot/checking/core.py` ×2,
+  `boot/checking/match_fx.py`, `tools/wopt_parts/wopt_passes.py`) used
+  the `strict=False` form of the keyword — the DEFAULT behaviour, but
+  the keyword ITSELF still does not exist before 3.10, so
+  `restore_moved()` crashed on every `match` with a moved binding
+  (`TypeError: zip() takes no keyword arguments`). All four now use
+  plain `zip(...)` (strict=False IS the default; no helper needed).
+- **The emitted LLVM IR failed the REAL LLVM parser (MEDIUM, the
+  CI `llvm-as` best-effort step).** `RUNTIME_DECLS` in
+  `tools/llvm_parts/llvm_common.py` contained the comment text
+  `stderr + '\n'` inside a NON-raw Python string, so the escape became
+  a literal newline INSIDE the `;` comment — splitting the declaration
+  line and leaving a stray `'` as a top-level entity. Real llvm-as
+  rejected every module with `error: expected top-level entity` (the
+  structural validator only checks the documented defect classes, so
+  it never caught this). The comment now reads `stderr + newline`;
+  all six `tests/llvm` modules parse AND verify under a real LLVM
+  (22.x, opaque-pointer mode — the same mode the runner's llvm-as
+  uses).
 - **`tests/run_llvm_tests.sh` line 78 used `rg` (ripgrep), which
   GitHub runners do not ship (LOW, CI since Stage 12).** The missing
   binary made the "unsupported constructs fail CLEANLY" check

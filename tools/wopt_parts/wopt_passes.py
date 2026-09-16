@@ -36,7 +36,7 @@ def opt_dce(mod: WasmModule, report: dict):
     new_func_indices: Dict[int, int] = {}
     new_funcs: List[int] = []
     new_codes: List[Code] = []
-    for i, (ty, code) in enumerate(zip(mod.funcs, mod.codes, strict=False)):
+    for i, (ty, code) in enumerate(zip(mod.funcs, mod.codes)):
         old_idx = n_imports + i
         if old_idx in live:
             # The wasm function index space includes BOTH imports and

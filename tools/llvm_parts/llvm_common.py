@@ -118,7 +118,7 @@ declare void     @hl_println(ptr)                   ; hl_str*
 ; same ownership convention as hl_print / hl_println; they fflush
 ; stdout first in the C runtime). hl_isatty(fd) -> bool (i1).
 declare void     @hl_eprint(ptr)                    ; hl_str* -> stderr
-declare void     @hl_eprintln(ptr)                  ; hl_str* -> stderr + '\n'
+declare void     @hl_eprintln(ptr)                  ; hl_str* -> stderr + newline
 declare i1       @hl_isatty(i64)                    ; (fd) -> bool
 ; Stage 57 (v0.76.0-alpha): process-identity runtime helpers (syslog
 ; TAG[PID] + HOSTNAME fields for std.log). Both take no arguments.

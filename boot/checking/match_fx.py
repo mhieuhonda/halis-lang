@@ -107,7 +107,7 @@ class CheckerMatch_fx(object):
                         if v == pat["variant"]:
                             inst_payloads = [instantiate_type(p, type_map) if typeparams
                                              else p for p in payloads]
-                            for bname, btype in zip(pat["bindings"], inst_payloads, strict=False):
+                            for bname, btype in zip(pat["bindings"], inst_payloads):
                                 if bname == "_":
                                     continue
                                 # BUG-SC-2 fix: SPEC.md section 5 states that
