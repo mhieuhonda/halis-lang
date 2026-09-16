@@ -121,7 +121,7 @@ remains green.
 | 71 | `std.graphql` — schema-first server (parser + resolver) | ✅ | (done in v0.90.0-alpha) |
 | 72 | `std.openapi` — generate OpenAPI 3.1 from handler types | ✅ | (done in v0.91.0-alpha) |
 | 73 | `std.jsffi` — bind to JavaScript globals from `wasm32` | ✅ | (done in v0.92.0-alpha) |
-| 74 | `std.dom` — server-side rendering (no client JS needed) | ⬜ | 4 weeks |
+| 74 | `std.dom` — server-side rendering (no client JS needed) | ✅ | (done in v0.93.0-alpha) |
 | 75 | `hls-serve` — `webpack-dev-server` equivalent for HLS | ⬜ | 5 weeks |
 | 76 | `hls-wasm-pack` — publish-ready wasm + JS glue | ⬜ | 4 weeks |
 
@@ -8316,3 +8316,204 @@ bookkeeping module, differentially (interpreter == native).
 surface driven from wasm; two structs declared purely for their
 auto-marshalling descriptors; a two-id `jsffi_on_callback` handler;
 the callback protocol printed. ~3 KB wasm after wasm-opt.
+
+
+---
+
+## STAGE 74 — `std.dom` — Server-side HTML DOM rendering ✅ (release v0.93.0-alpha)
+
+> Continues **Phase V (web application track, Stages 63–76)** — the
+> TWELFTH module of the phase. Completes the roadmap's Stage 74
+> promise: "Server-side rendering of HTML. A `dom::Element` tree is
+> built in Halis, then serialised to HTML. No client-side JS required
+> (the HTML is complete). Hydration (client-side JS takes over event
+> handling) is a post-1.0 feature."
+
+The module provides a small, pure-HLS DOM tree — an immutable
+`DomNode` sum type (`Element` / `Void` / `Text` / `Raw` / `Comment`
+/ `Doctype` / `Fragment`) plus immutable builders, immutable
+mutators, and a pure serialiser that walks the tree into a string.
+Layered entirely on `std.html` (`html_escape`,
+`html_escape_attr`, `_html_validate_name` — Stage 38), `std.str`
+(`str_to_lower_ascii`, `str_replace`, `str_join`), `std.option`,
+`std.result`, and `std.http` (the HTTP convenience wrappers only).
+NO new compiler builtins.
+
+**Why a DOM (vs. `std.template`, Stage 69)?** Templates are a string
+template engine — the right tool when the page is mostly static text
+with holes for variables. `std.dom` is a TREE builder — the right
+tool when the page is built programmatically with lots of
+conditional logic, when fragments are passed around between
+functions, when the same data structure must be inspected
+(counted, traversed) before being rendered, or when the output must
+be byte-stable across refactors. The two modules compose: a
+template can be rendered into a `DomNode.Raw` and embedded verbatim,
+or a `DomNode` can be rendered into a `str` and passed as a template
+context value. Both are XSS-safe by default.
+
+**Shipped in v0.93.0-alpha (Stage 74):**
+
+- **`DomNode` sum type** — `Element(tag, attrs, children)` /
+  `Void(tag, attrs)` / `Text(s)` / `Raw(s)` / `Comment(s)` /
+  `Doctype` / `Fragment(children)`. The `DomAttr` struct holds a
+  name (validated at construction — only `[A-Za-z][A-Za-z0-9_-]*`
+  is accepted) and a value (escaped at render time). The tree is
+  heap-allocated (per the HLS enum memory model, SPEC §11b); the
+  children lists are mutable lists owned by their parent.
+
+- **Strict void-tag invariant** — `dom_element(tag, ...)` PANICS if
+  `tag` is one of the 14 HTML5 void elements (`area`, `base`, `br`,
+  `col`, `embed`, `hr`, `img`, `input`, `link`, `meta`, `param`,
+  `source`, `track`, `wbr`). `dom_void(tag, ...)` panics if `tag`
+  is NOT a void tag. The serialiser would otherwise emit invalid
+  HTML5 like `<br></br>`; the panic is the type-system-level
+  guarantee that you cannot accidentally emit invalid HTML.
+
+- **~50 element shorthand builders** — `dom_html` / `dom_head` /
+  `dom_body` / `dom_title` / `dom_meta` / `dom_link` /
+  `dom_script_attrs` / `dom_script_src` / `dom_script_inline` /
+  `dom_style_inline` + sectioning (`section`, `article`, `header`,
+  `footer`, `nav`, `aside`, `main`) + headings (`h1`..`h6`) +
+  text content (`p`, `span`, `div`, `pre`, `blockquote`, `hr`) +
+  inline text (`a`, `em`, `strong`, `code`, `small`, `mark`,
+  `abbr`, `b`, `i`, `u`, `sub`, `sup`) + lists (`ul`, `ol`, `li`,
+  `dl`, `dt`, `dd`) + tables (`table`, `thead`, `tbody`, `tfoot`,
+  `tr`, `th`, `td`, `caption`, `colgroup`, `col`) + forms (`form`,
+  `label`, `input`, `button`, `select`, `option`, `textarea`,
+  `fieldset`, `legend`) + media (`img`, `br`, `figure`,
+  `figcaption`, `picture`, `source`) + interactive (`details`,
+  `summary`, `dialog`).
+
+- **Attribute helpers** — `dom_attr(name, value)` (validates the
+  name; the value is stored as-is, escaped at render time) +
+  `dom_attr_true(name)` / `dom_attr_false(name)` for HTML5 boolean
+  attributes (present = emits just the name, no `="value"`; absent =
+  omits entirely — the canonical HTML5 form) + shorthand
+  constructors: `dom_class` / `dom_id` / `dom_href` / `dom_src` /
+  `dom_alt` / `dom_title_attr` / `dom_name_attr` / `dom_value_attr`
+  / `dom_placeholder` / `dom_type_attr` / `dom_rel` / `dom_lang` /
+  `dom_charset` / `dom_style_attr` / `dom_role` / `dom_data(name,
+  value)` (renders as `data-{name}`) / `dom_aria(name, value)`
+  (renders as `aria-{name}`).
+
+- **Document helpers** — `dom_html_document(title, body_children)`
+  (the common minimal case: `<!DOCTYPE html><html><head><title>...
+  </title></head><body>...</body></html>`) and
+  `dom_html_document_with_head(title, head_extras, body_attrs,
+  body_children)` (full control over `<head>` contents and the
+  `<body>`'s attributes).
+
+- **Immutable mutators** (copy-then-return; the receiver is
+  unchanged) — `dom_with_attr(node, attr)` (append a single
+  attribute), `dom_with_attrs(node, attrs)` (append a list),
+  `dom_with_child(node, child)` (append a single child),
+  `dom_with_children(node, children)` (append a list). For Element
+  and Void nodes (attribute mutators) / Element and Fragment nodes
+  (child mutators); no-op for other kinds. The HLS structs are
+  reference-typed, so the convention is "copy first, mutate the
+  copy, return the copy" — verified by the immutability test.
+
+- **Attribute lookup / replace / remove** (case-insensitive name
+  matching — HTML5 attribute names are case-insensitive; we lowercase
+  both sides for comparison) — `dom_attr_get(node, name)` (returns
+  the value of the first match, or `""`), `dom_attr_has(node, name)`
+  (returns true iff present), `dom_attr_set(node, name, value)`
+  (REPLACES the first match in-place — preserves position; or
+  APPENDS if not present), `dom_attr_remove(node, name)` (removes
+  every match).
+
+- **Introspection** — `dom_node_kind(node)` (returns the kind code:
+  `dom_kind_element`..`dom_kind_fragment`) + the predicates
+  `dom_is_element` / `dom_is_void` / `dom_is_text` / `dom_is_raw` /
+  `dom_is_comment` / `dom_is_doctype` / `dom_is_fragment` + the
+  accessors `dom_tag` / `dom_attrs` / `dom_children` /
+  `dom_text_value`.
+
+- **Statistics** — `dom_node_count(node)` (total nodes, counting
+  `node` itself plus every descendant; the root Fragment counts
+  itself — Fragment is a node too), `dom_count_by_kind(node, kind)`
+  (the count of nodes with a specific kind code),
+  `dom_describe(node)` (an indented AST dump — deterministic,
+  byte-identical between interpreter and native; useful for
+  debugging and snapshot tests).
+
+- **Serialiser** — `dom_render(node)` walks the tree into a single
+  HTML string. **Text** nodes are HTML-escaped via
+  `std.html.html_escape` (the OWASP-safe set: `&`, `<`, `>`, `"`,
+  `'`, `/`). **Raw** nodes are emitted verbatim (the explicit opt-in
+  for trusted HTML — caller responsibility). **Comment** nodes are
+  sanitised against `-->` / `--!>` breakout (a `-` followed by `-`
+  or `>` is rewritten to `- ` — a minimal, readable rewrite that
+  makes the dangerous sequence impossible). **Doctype** always
+  renders to `<!DOCTYPE html>`. **Void** elements are emitted
+  WITHOUT a closing tag (per HTML5). **Empty container elements**
+  are emitted as `<tag></tag>` (NOT self-closing `<tag/>` —
+  self-closing is invalid HTML5 for non-foreign elements; the
+  serialiser emits the canonical `<div></div>` form). **Fragment**
+  is the concatenation of its children (no wrapping tag). Public
+  aliases: `dom_render_children` / `dom_render_attrs` /
+  `dom_render_attr`.
+
+- **Inline `<script>` and `<style>` bodies are protected** — the
+  HTML5 parser scans for `</script` (case-insensitive) and does
+  NOT respect JS string context; a literal `</script>` inside a JS
+  string terminates the element prematurely. `dom_script_inline(code)`
+  and `dom_style_inline(css)` rewrite `</script>` and `</style>`
+  to `<\/script>` and `<\/style>` (in both lowercase and uppercase
+  forms) — a valid JS/CSS escape that parses identically but cannot
+  terminate the element. The body is then wrapped in a `Raw` node
+  (script/style source is NOT HTML — escaping would corrupt it).
+
+- **HTTP integration** — `dom_to_html_response(status, node)`
+  renders `node` and wraps the result in an HTTP response with
+  `Content-Type: text/html; charset=utf-8`. The status helpers
+  `dom_html_response_ok` (200) / `dom_html_response_bad_request`
+  (400) / `dom_html_response_not_found` (404) /
+  `dom_html_response_server_error` (500) cover the common cases.
+
+**Security model:**
+
+- **DEFAULT-ESCAPE:** every `Text` node's value is HTML-escaped on
+  serialisation. No path through the serialiser produces raw text in
+  element content unless the caller explicitly uses `DomNode.Raw`.
+
+- **ATTRIBUTE-VALUE ESCAPING:** every attribute value is HTML-escaped
+  via `html_escape_attr` (the same OWASP-safe escape, used for the
+  attribute context).
+
+- **NAME VALIDATION:** tag and attribute names are validated by
+  `_html_validate_name` (allows `[A-Za-z][A-Za-z0-9_-]*` only),
+  blocking tag/attr injection via `<`, `>`, `"`, `'`, ` `, `=`, `/`,
+  etc.
+
+- **RAW NODE (footgun):** `DomNode.Raw(s)` inserts `s` VERBATIM into
+  the output — NO escaping. The caller takes full responsibility
+  for having sanitised `s`. NEVER use `Raw` for user input.
+
+- **COMMENT SAFETY:** HTML5 disallows `-->` and `<!--` inside a
+  comment; `--!>` is also forbidden. `DomNode.Comment(s)` sanitises
+  `s` so the dangerous sequence cannot appear in the rendered body.
+
+- **VOID-TAG CORRECTNESS:** the strict panic-level invariant
+  guarantees you cannot accidentally emit invalid HTML5 like
+  `<br></br>`.
+
+**Differential parity:** every function is pure HLS (no IO, no Net,
+no Rand, no Fs, no Clock). The serialiser is a pure tree-walk; the
+output is byte-identical between the interpreter and the native
+binary. The acceptance test and demo are fully deterministic.
+
+**Acceptance** (`make dom-acceptance`): the demo AND the acceptance
+test run differentially (interpreter == native). The acceptance test
+(14 tests) covers: constants, node constructors, rendering,
+attribute helpers, ~50 element shorthand builders, document
+helpers, immutable mutators, attribute lookup / replace / remove,
+statistics, HTTP integration, XSS hardening (the security model),
+end-to-end realistic page, differential stress, and documented
+negative cases (panic-level invariants).
+
+**Demo** (`examples/dom_demo.hls`): 9 sections exercising the
+public API surface — basic nodes, boolean attributes, ~30 element
+shorthand builders, document helpers, immutable mutators,
+introspection, XSS hardening, HTTP integration, and a complete
+realistic landing page.
