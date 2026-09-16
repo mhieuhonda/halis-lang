@@ -44,4 +44,13 @@ def fix_makefile(path):
         f.write("\n".join(out) + "\n")
 
 if __name__ == "__main__":
-    fix_makefile(sys.argv[1] if len(sys.argv) > 1 else "Makefile")
+    arg = sys.argv[1] if len(sys.argv) > 1 else "Makefile"
+    if arg in ("-h", "--help"):
+        print("usage: fix_makefile_indent.py [Makefile]")
+        print("Convert leading 8-space recipe indentation to TABs (default: ./Makefile).")
+        sys.exit(0)
+    import os
+    if not os.path.isfile(arg):
+        print("fix_makefile_indent.py: cannot read: %s" % arg, file=sys.stderr)
+        sys.exit(1)
+    fix_makefile(arg)

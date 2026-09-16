@@ -103,6 +103,10 @@ def _sandbox_check(path_bytes):
     if resolved == sb:
         return resolved
     if not resolved.startswith(sb + b"/"):
+        # Late import: to_display lives in rt_num (which imports rt_core),
+        # so a module-level import here would be circular. Only needed on
+        # this error path, so resolve it lazily.
+        from .rt_num import to_display
         raise HLPanic("sandbox violation: path '%s' resolves outside the sandbox"
                       % to_display(path_bytes), 0)
     return resolved

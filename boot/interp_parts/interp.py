@@ -13,8 +13,3 @@ from .builtin_method import InterpBuiltin_method
 
 class Interp(InterpCore, InterpExec, InterpBuiltin, InterpSpawn, InterpExtern, InterpBuiltin_method):
     """Stage-0 evaluator (unchanged API)."""
-
-
-# Late binding: methods in the extern mixin reference the concrete
-# class by name (Interp._libc = ...); bind it now that it exists.
-InterpExtern.Interp = Interp

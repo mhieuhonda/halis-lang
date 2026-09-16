@@ -35,7 +35,7 @@ class InterpExtern(object):
             try:
                 # `None` loads the default C library (libc on Linux,
                 # msvcrt on Windows, libSystem on macOS).
-                Interp._libc = ctypes.CDLL(None)
+                InterpExtern._libc = ctypes.CDLL(None)
             except OSError as ex:
                 raise HLPanic("cannot load libc for extern call: %s" % ex,
                               getattr(self, "line", 0)) from None
@@ -122,11 +122,11 @@ class InterpExtern(object):
         # _extern_cache. The key is (name, argtypes, restype) so every
         # declared signature gets its own immutable prototype.
         cache_key = (name, tuple(c_argtypes), ret)
-        with Interp._extern_lock:
-            c_fn = Interp._extern_cache.get(cache_key)
+        with InterpExtern._extern_lock:
+            c_fn = InterpExtern._extern_cache.get(cache_key)
             if c_fn is None:
                 proto = ctypes.CFUNCTYPE(
-                    Interp._EXTERN_RESTYPES.get(ret, ctypes.c_void_p),
+                    InterpExtern._EXTERN_RESTYPES.get(ret, ctypes.c_void_p),
                     *c_argtypes)
                 try:
                     c_fn = proto((name, libc))
@@ -134,7 +134,7 @@ class InterpExtern(object):
                     raise HLPanic(
                         "extern function not found in libc: %s" % name,
                         getattr(self, "line", 0)) from None
-                Interp._extern_cache[cache_key] = c_fn
+                InterpExtern._extern_cache[cache_key] = c_fn
         # Call.
         try:
             result = c_fn(*c_args)

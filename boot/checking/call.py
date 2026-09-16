@@ -1439,11 +1439,11 @@ class CheckerCall(object):
         if t == "str":
             return True
         if is_list(t):
-            return Checker.is_clone_supported(list_elem(t))
+            return CheckerCall.is_clone_supported(list_elem(t))
         if is_map(t):
-            return Checker.is_clone_supported(map_val(t))
+            return CheckerCall.is_clone_supported(map_val(t))
         if is_taint(t):
-            return Checker.is_clone_supported(taint_inner(t))
+            return CheckerCall.is_clone_supported(taint_inner(t))
         # struct / enum / any other owned type
         return True
 

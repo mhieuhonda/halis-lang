@@ -13,6 +13,65 @@ stability (125–140), and final stabilisation toward v1.0 (141–150).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
+## [v0.92.4-alpha] — deep-scan-26: 4 fixes — three split regressions (FFI crash, sandbox crash, checker crash) + one CLI guard
+
+> Sixth systematic super-scan. This pass paired static analysis
+> (pyflakes over all 84 Python modules plus an AST walker for bare
+> excepts) with a novel SEMANTIC SPLIT AUDIT: every recent
+> "split for maintainability" commit was re-diffed body-by-body
+> against its pre-split monolith (76 checker methods, 63 interpreter
+> methods, 363 compiler functions, 74 wasm + 41 LLVM + 33 pkg + 41
+> wopt tool functions, 420 stdlib functions) to catch regressions the
+> test suite cannot reach. Runtime probes then exercised the exact
+> code paths the splits broke. Full verification after the fixes:
+> stage-1/2 (180/180 ok + 147/147 fail), differential interp-vs-native
+> (180/180), native hlc compile-all, bootstrap determinism, PGO
+> byte-identical, LLVM suite 13/13, memcheck RSS delta 0, fuzz 535
+> programs 0 divergences, all 39 stdlib acceptance targets green, 85
+> examples green, wasm webapp acceptance green, spec-check /
+> lsp-smoke / ll-validate green. Zero regressions introduced.
+
+### Fixed — regressions introduced by split(boot) (b9bfaf4)
+
+- **FFI extern calls crashed the interpreter with NameError (HIGH).**
+  `_get_libc()` / `call_extern()` in the new `boot/interp_parts/extern.py`
+  mixin still referenced the class by its pre-split module-global name
+  `Interp` — which no longer exists in that module's namespace. The
+  "late binding" (`InterpExtern.Interp = Interp`) only sets a CLASS
+  attribute, which method bodies cannot see, so EVERY extern call
+  through the Stage-0 interpreter raised `NameError: name 'Interp' is
+  not defined` before reaching ctypes (reproducer:
+  `python3 boot/boot.py examples/ffi_demo.hls`). The bodies now
+  reference their own mixin class (`InterpExtern._libc`,
+  `InterpExtern._extern_lock`, ...) which owns those attributes
+  directly; the obsolete late-binding line was removed from
+  `interp.py`. `examples/ffi_demo.hls` now runs green on the
+  interpreter.
+- **`Checker.is_clone_supported()` crashed on every composite type
+  (MEDIUM).** The static method's recursive branches in
+  `boot/checking/call.py` referenced `Checker.is_clone_supported(...)`;
+  post-split `Checker` is not a global of that module, so querying a
+  `list[...]` / `map[...]` / `tainted[...]` type raised NameError
+  (reproducer: `CheckerCall.is_clone_supported('list[int]')`). The
+  recursion now goes through the mixin's own name `CheckerCall`.
+- **Sandbox violations crashed with NameError instead of a clean
+  HLPanic (MEDIUM).** `_sandbox_check()`'s rejection path in
+  `boot/interp_parts/rt_core.py` calls `to_display()` — which lives in
+  `rt_num` (a module that imports `rt_core`, so a top-level import
+  would be circular). With a sandbox root set, ANY violating path
+  raised `NameError: name 'to_display' is not defined` instead of the
+  documented "sandbox violation: path ... resolves outside the
+  sandbox" panic. `to_display` is now imported lazily on the error
+  path only (zero cost on the happy path).
+
+### Fixed — tooling
+
+- **`scripts/fix_makefile_indent.py` crashed on `--help` / missing
+  files with a raw traceback (LOW).** The dev utility passed its first
+  argument straight to `open()`, so `--help` produced a confusing
+  FileNotFoundError traceback. It now answers `--help` / `-h` and
+  reports unreadable paths as a clean one-line error with exit 1.
+
 ## [v0.92.3-alpha] — deep-scan-25: 21 fixes across both compilers, the runtimes, stdlib and tooling
 
 > Fifth systematic super-scan. This pass paired three independent
