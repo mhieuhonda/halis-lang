@@ -1096,3 +1096,82 @@ jsffi-acceptance:
 	@echo "    Stage 24 compact-glue milestone stays in the history)"
 
 .PHONY: jsffi-acceptance
+
+
+# ============================================================================
+# Stage 74 (v0.93.0-alpha): std.dom -- server-side HTML DOM rendering.
+# Pure-HLS module (no new compiler builtins) -- uses std.html (html_escape,
+# html_escape_attr, _html_validate_name), std.str (str_to_lower_ascii,
+# str_replace, str_join), std.option, std.result, std.http (the HTTP
+# convenience wrappers only).
+# ============================================================================
+
+# dom-acceptance: Stage 74 gate -- the demo AND the acceptance test run
+# differentially (interpreter == native), proving the whole DOM pipeline
+# (DomNode enum + builders + immutable mutators + serialiser + HTTP
+# integration) is deterministic.
+dom-acceptance: bin/hlc
+	@$(PYTHON) boot/boot.py examples/dom_demo.hls > /tmp/dom_demo_interp.txt 2>&1
+	@bin/hlc examples/dom_demo.hls /tmp/dom_demo.c 2>/dev/null
+	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/dom_demo /tmp/dom_demo.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
+	@/tmp/dom_demo > /tmp/dom_demo_nat.txt 2>&1
+	@diff -q /tmp/dom_demo_interp.txt /tmp/dom_demo_nat.txt >/dev/null 2>&1 \
+		|| (echo "FAIL: dom_demo differential mismatch" && false)
+	@$(PYTHON) boot/boot.py tests/ok/feat_stage74_dom.hls > /tmp/s74_interp.txt 2>&1
+	@bin/hlc tests/ok/feat_stage74_dom.hls /tmp/s74.c 2>/dev/null
+	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/s74 /tmp/s74.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
+	@/tmp/s74 > /tmp/s74_nat.txt 2>&1
+	@diff -q /tmp/s74_interp.txt /tmp/s74_nat.txt >/dev/null 2>&1 \
+		|| (echo "FAIL: feat_stage74_dom differential mismatch" && false)
+	@rm -f /tmp/dom_demo /tmp/dom_demo.c /tmp/dom_demo_interp.txt /tmp/dom_demo_nat.txt \
+		/tmp/s74 /tmp/s74.c /tmp/s74_interp.txt /tmp/s74_nat.txt
+	@echo ""
+	@echo "ACCEPTANCE OK: Stage 74 -- std.dom (server-side HTML DOM rendering)"
+	@echo "  DomNode sum type (Element / Void / Text / Raw / Comment / Doctype / Fragment)"
+	@echo "    + DomAttr (name + value, validated)"
+	@echo "  Constructors: dom_text / dom_raw / dom_comment / dom_doctype /"
+	@echo "    dom_fragment / dom_element / dom_void"
+	@echo "  Strict void-tag invariant: dom_element panics on a void tag;"
+	@echo "    dom_void panics on a non-void tag (the renderer would otherwise"
+	@echo "    emit invalid HTML5 like <br></br>)"
+	@echo "  ~50 element shorthand builders: html / head / body / title / meta /"
+	@echo "    link / script (src + inline) / style (inline) + sectioning +"
+	@echo "    headings h1..h6 + p / span / div / pre / blockquote / hr + a /"
+	@echo "    em / strong / code / small / mark / abbr / b / i / u / sub / sup +"
+	@echo "    ul / ol / li / dl / dt / dd + table / thead / tbody / tfoot /"
+	@echo "    tr / th / td / caption / colgroup / col + form / label / input /"
+	@echo "    button / select / option / textarea / fieldset / legend + img /"
+	@echo "    br / figure / figcaption / picture / source + details / summary /"
+	@echo "    dialog"
+	@echo "  Attribute helpers: dom_attr / dom_attr_true (boolean present) /"
+	@echo "    dom_attr_false (boolean absent) / dom_class / dom_id / dom_href /"
+	@echo "    dom_src / dom_alt / dom_title_attr / dom_name_attr / dom_value_attr /"
+	@echo "    dom_placeholder / dom_type_attr / dom_rel / dom_lang / dom_charset /"
+	@echo "    dom_style_attr / dom_role / dom_data / dom_aria"
+	@echo "  Document helpers: dom_html_document (minimal) /"
+	@echo "    dom_html_document_with_head (full control over <head> and <body attrs>)"
+	@echo "  Immutable mutators (copy-then-return): dom_with_attr / dom_with_attrs /"
+	@echo "    dom_with_child / dom_with_children"
+	@echo "  Attribute lookup / replace / remove (case-insensitive): dom_attr_get /"
+	@echo "    dom_attr_has / dom_attr_set (replace-in-place or append) / dom_attr_remove"
+	@echo "  Introspection: dom_node_kind / dom_is_element / dom_is_void / dom_is_text /"
+	@echo "    dom_is_raw / dom_is_comment / dom_is_doctype / dom_is_fragment / dom_tag /"
+	@echo "    dom_attrs / dom_children / dom_text_value"
+	@echo "  Statistics: dom_node_count / dom_count_by_kind / dom_describe (indented AST)"
+	@echo "  Serialiser: dom_render (Text HTML-escaped; Raw verbatim; Comment"
+	@echo "    sanitised against --> / --!> breakout; Doctype; Void no closing tag;"
+	@echo "    empty element -> <tag></tag>; Fragment -> children concat)"
+	@echo "  Public render aliases: dom_render_children / dom_render_attrs / dom_render_attr"
+	@echo "  Inline <script> and <style> bodies: </script> and </style> are"
+	@echo "    rewritten to <\\/script> and <\\/style> (case-insensitive) -- preventing"
+	@echo "    premature element termination by the HTML5 parser"
+	@echo "  HTTP integration: dom_to_html_response + the 200 / 400 / 404 / 500"
+	@echo "    status helpers (Content-Type: text/html; charset=utf-8)"
+	@echo "  SECURITY: every Text node escaped (OWASP set &, <, >, \", ', /);"
+	@echo "    every attribute value escaped; tag/attr names validated"
+	@echo "    ([A-Za-z][A-Za-z0-9_-]*); Raw is the explicit opt-in for"
+	@echo "    trusted HTML; comments cannot break out via --> or --!>"
+	@echo "  Pure-HLS implementation (no new compiler builtins)"
+	@echo "  differential (interpreter == native) verified green."
+
+.PHONY: dom-acceptance
