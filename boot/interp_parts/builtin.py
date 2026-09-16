@@ -977,9 +977,24 @@ class InterpBuiltin(object):
         if name == "math_sqrt":
             return _libm(math.sqrt, args[0])
         if name == "math_cbrt":
-            # Python's math module added cbrt in 3.11; we require
-            # 3.12+ (boot.py guard), so it's available.
-            return math.cbrt(args[0])
+            # Python's math module added cbrt in 3.11, but the project
+            # (README + CI matrix) supports Python 3.8+. Deep-scan-26
+            # fix: on <= 3.10 compute the cube root with a pow-based
+            # estimate refined by two Newton steps
+            # (r <- r - (r^3 - x) / (3 r^2)) — sign-correct for
+            # negatives (C99 cbrt(-8) = -2, unlike pow), exact at the
+            # poles (cbrt(+-0) = +-0, cbrt(+-inf) = +-inf, cbrt(nan) =
+            # nan) and within 1 ulp of glibc's cbrt for normal doubles.
+            x = args[0]
+            if sys.version_info >= (3, 11):
+                return math.cbrt(x)
+            if x == 0.0 or not math.isfinite(x):
+                return x
+            ax = abs(x)
+            r = ax ** (1.0 / 3.0)
+            r = r - (r * r * r - ax) / (3.0 * r * r)
+            r = r - (r * r * r - ax) / (3.0 * r * r)
+            return math.copysign(r, x)
         if name == "math_hypot":
             return math.hypot(args[0], args[1])
         if name == "math_fmod":

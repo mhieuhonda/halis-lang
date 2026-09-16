@@ -13,7 +13,7 @@ stability (125–140), and final stabilisation toward v1.0 (141–150).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
-## [v0.92.4-alpha] — deep-scan-26: 7 fixes — three split regressions, CI unbroken on Python 3.8 (zip strict ×2), interpreter flush parity, real-LLVM IR comment fix, one CLI guard
+## [v0.92.4-alpha] — deep-scan-26: 8 fixes — three split regressions, CI unbroken on Python 3.8 (zip strict ×2, math.cbrt), interpreter flush parity, real-LLVM IR comment fix, one CLI guard
 
 > Sixth systematic super-scan. This pass paired static analysis
 > (pyflakes over all 84 Python modules plus an AST walker for bare
@@ -65,6 +65,19 @@ new stdlib modules, tooling, examples, and CI/CD improvements.
   interleaving). `proc_exec` and `proc_spawn` now flush `self.out`
   before spawning, mirroring the native `fflush(stdout)` exactly;
   behaviour is version-independent.
+- **`math_cbrt` crashed the interpreter on Python 3.8/3.9/3.10
+  (HIGH, CI 3.8 legs — feat_stage50_math).** Stage 50 bound the
+  builtin to `math.cbrt`, which exists only from 3.11, and justified
+  it with a "boot.py requires 3.12+" comment — but boot.py has NO
+  version guard and the README/CI contract is 3.8+, so every program
+  calling cbrt died with `AttributeError: module 'math' has no
+  attribute 'cbrt'`. On <= 3.10 the builtin now computes the cube
+  root with a pow-based estimate refined by two Newton steps —
+  sign-correct for negatives (C99: cbrt(-8) = -2), exact at the
+  poles (+-0, +-inf, nan) and within 1 ulp of glibc's cbrt for
+  normal doubles. Reproduced and verified on a real CPython 3.8.20:
+  ok 180/180, fail-reject 147/147, FFI demo, hlc self-compile of the
+  math suite, hlfmt/hllint and --emit llvm all green.
 - **`zip(..., strict=False)` hit the same Python 3.8/3.9 TypeError
   (HIGH).** Four more zip() call sites (`boot/checking/core.py` ×2,
   `boot/checking/match_fx.py`, `tools/wopt_parts/wopt_passes.py`) used
