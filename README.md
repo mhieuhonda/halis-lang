@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="Halis.png" alt="Halis logo" width="200">
+<img src="IMG_20260916_175951.jpg" alt="Halis logo" width="200">
 
 # Halis
 
