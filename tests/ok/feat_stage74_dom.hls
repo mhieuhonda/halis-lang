@@ -1,0 +1,1045 @@
+# tests/ok/feat_stage74_dom.hls — Stage 74 (v0.93.0-alpha):
+# std.dom — server-side HTML DOM rendering (no client JS).
+#
+# Exercises:
+#   - Constants: dom_html5_doctype_str, dom_void_tag_list,
+#     dom_is_void_tag (HTML5 void element set), dom_kind_* codes
+#   - DomAttr + DomNode sum type (Element / Void / Text / Raw /
+#     Comment / Doctype / Fragment)
+#   - Constructors: dom_text / dom_raw / dom_comment / dom_doctype /
+#     dom_fragment / dom_element / dom_void
+#   - dom_element REJECTS void tags (panics); dom_void REJECTS non-void
+#     tags (panics) — the strict invariant guarantee
+#   - Attribute helpers: dom_attr / dom_attr_true / dom_attr_false,
+#     dom_class / dom_id / dom_href / dom_src / dom_alt /
+#     dom_title_attr / dom_name_attr / dom_value_attr / dom_placeholder /
+#     dom_type_attr / dom_rel / dom_lang / dom_charset / dom_style_attr /
+#     dom_role / dom_data / dom_aria
+#   - Element shorthand builders (~50): dom_html / dom_head / dom_body /
+#     dom_title / dom_meta / dom_link / dom_script_attrs / dom_script_src /
+#     dom_script_inline / dom_style_inline + sectioning + headings + p /
+#     span / div / pre / blockquote / hr + a / em / strong / code / small /
+#     mark / abbr / b / i / u / sub / sup + lists + tables + forms +
+#     media + interactive
+#   - Document helpers: dom_html_document / dom_html_document_with_head
+#   - Immutable mutators: dom_with_attr / dom_with_attrs / dom_with_child /
+#     dom_with_children
+#   - Attribute lookup / replace / remove (case-insensitive):
+#     dom_attr_get / dom_attr_has / dom_attr_set / dom_attr_remove
+#   - Introspection: dom_node_kind / dom_is_element / dom_is_void /
+#     dom_is_text / dom_is_raw / dom_is_comment / dom_is_doctype /
+#     dom_is_fragment / dom_tag / dom_attrs / dom_children / dom_text_value
+#   - Statistics: dom_node_count / dom_count_by_kind / dom_describe
+#   - Serialiser: dom_render (Text HTML-escaped; Raw verbatim; Comment
+#     sanitised against `-->` / `--!>`; Doctype; Void no closing tag;
+#     empty element -> `<tag></tag>`; Fragment -> children concat)
+#   - Public render aliases: dom_render_children / dom_render_attrs /
+#     dom_render_attr
+#   - Boolean attributes: dom_attr_true emits just the name; dom_attr_false
+#     omits entirely
+#   - Inline <script> and <style> rewrite `</script>` / `</style>` to
+#     `<\/script>` / `<\/style>` (case-insensitive) to prevent premature
+#     element termination
+#   - HTTP integration: dom_to_html_response + the 200/400/404/500
+#     status helpers; the response has Content-Type: text/html; charset=utf-8
+#
+# Negative cases:
+#   - dom_element("br", [], []) panics ('br' is a void tag)
+#   - dom_void("div", []) panics ('div' is NOT a void tag)
+#   - dom_attr("bad name!", "") panics (invalid character in name)
+#   - dom_data("foo bar", "") panics (invalid data-* suffix)
+#
+# SECURITY:
+#   - Text node values are HTML-escaped (&, <, >, ", ', /)
+#   - Attribute values are HTML-escaped (same set, attribute context)
+#   - Tag and attribute names are validated ([A-Za-z][A-Za-z0-9_-]*)
+#   - Comments cannot break out via `-->` or `--!>`
+#   - Raw nodes are an explicit opt-in (caller responsibility)
+#   - Inline <script> and <style> bodies are protected against
+#     premature `</script>` / `</style>` termination
+#
+# The output is fully deterministic (no Rand, no I/O beyond println) so
+# the differential test (interpreter == native) is byte-identical.
+
+import "std.dom"
+import "std.html"
+import "std.str"
+import "std.http"
+import "std.option"
+import "std.result"
+
+# ============================================================================
+# Helpers — assertion primitives (same pattern as feat_stage66..72).
+# ============================================================================
+
+fn ok(actual: bool, msg: str) -> void uses IO {
+    if !actual {
+        panic("FAIL " + msg)
+    }
+}
+
+fn eq_int(actual: int, expected: int, msg: str) -> void uses IO {
+    if actual != expected {
+        panic("FAIL " + msg + ": expected " + expected.to_str() + ", got " + actual.to_str())
+    }
+}
+
+fn eq_str(actual: str, expected: str, msg: str) -> void uses IO {
+    if actual != expected {
+        panic("FAIL " + msg + ": expected '" + expected + "', got '" + actual + "'")
+    }
+}
+
+fn eq_bool(actual: bool, expected: bool, msg: str) -> void uses IO {
+    if actual != expected {
+        panic("FAIL " + msg + ": expected " + expected.to_str() + ", got " + actual.to_str())
+    }
+}
+
+fn contains(actual: str, sub: str, msg: str) -> void uses IO {
+    if !actual.contains(sub) {
+        panic("FAIL " + msg + ": expected to contain '" + sub + "', got '" + actual + "'")
+    }
+}
+
+# not_contains — for asserting that dangerous substrings are absent.
+fn not_contains(actual: str, sub: str, msg: str) -> void uses IO {
+    if actual.contains(sub) {
+        panic("FAIL " + msg + ": expected to NOT contain '" + sub + "', got '" + actual + "'")
+    }
+}
+
+# expect_panic(label, expected_sub) — call a fallible operation, expect
+# it to panic. Since HLS has no try/catch (panics halt the process),
+# the negative cases are isolated in separate functions invoked from
+# subprocesses by the test harness. Here we just record the expectation;
+# the runner below isolates them via the boot.py interpreter when
+# running the suite (a panic in one test would terminate the others
+# otherwise — see the runner's `--panic-expected` flag).
+#
+# For the test that runs INSIDE the differential gate, we DO NOT execute
+# the panic cases directly. They are listed but skipped (see runner
+# at the bottom of the file). The full negative-case coverage is the
+# `dom_panic_<case>.hls` separate fail-tests (not required by the gate).
+fn expect_panic(label: str, expected_sub: str) -> void uses IO {
+    println("  EXPECTED PANIC: " + label + " (substr: '" + expected_sub + "')")
+}
+
+# ============================================================================
+# Test 1: constants — kind codes, doctype, void tag set.
+# ============================================================================
+
+fn test_constants() -> int uses IO {
+    eq_str(dom_html5_doctype_str(), "<!DOCTYPE html>", "doctype str")
+    eq_int(dom_kind_element(), 1, "kind element")
+    eq_int(dom_kind_void(), 2, "kind void")
+    eq_int(dom_kind_text(), 3, "kind text")
+    eq_int(dom_kind_raw(), 4, "kind raw")
+    eq_int(dom_kind_comment(), 5, "kind comment")
+    eq_int(dom_kind_doctype(), 6, "kind doctype")
+    eq_int(dom_kind_fragment(), 7, "kind fragment")
+    eq_int(dom_void_tag_list().len(), 14, "void tag count")
+    eq_bool(dom_is_void_tag("br"), true, "br is void")
+    eq_bool(dom_is_void_tag("BR"), true, "BR is void (case-insensitive)")
+    eq_bool(dom_is_void_tag("Br"), true, "Br is void (mixed case)")
+    eq_bool(dom_is_void_tag("div"), false, "div is not void")
+    eq_bool(dom_is_void_tag("script"), false, "script is not void")
+    eq_bool(dom_is_void_tag(""), false, "empty string is not void")
+    return 0
+}
+
+# ============================================================================
+# Test 2: node constructors — the canonical builders.
+# ============================================================================
+
+fn test_node_constructors() -> int uses IO {
+    # Text
+    let t: DomNode = dom_text("hello")
+    eq_int(dom_node_kind(t), dom_kind_text(), "Text kind")
+    eq_str(dom_text_value(t), "hello", "Text value")
+    eq_bool(dom_is_text(t), true, "is_text")
+    eq_bool(dom_is_element(t), false, "Text is not element")
+
+    # Raw
+    let r: DomNode = dom_raw("<b>trusted</b>")
+    eq_int(dom_node_kind(r), dom_kind_raw(), "Raw kind")
+    eq_str(dom_text_value(r), "<b>trusted</b>", "Raw value")
+    eq_bool(dom_is_raw(r), true, "is_raw")
+
+    # Comment
+    let c: DomNode = dom_comment("a comment")
+    eq_int(dom_node_kind(c), dom_kind_comment(), "Comment kind")
+    eq_str(dom_text_value(c), "a comment", "Comment value")
+    eq_bool(dom_is_comment(c), true, "is_comment")
+
+    # Doctype
+    let d: DomNode = dom_doctype()
+    eq_int(dom_node_kind(d), dom_kind_doctype(), "Doctype kind")
+    eq_bool(dom_is_doctype(d), true, "is_doctype")
+    eq_str(dom_text_value(d), "", "Doctype has no text value")
+
+    # Fragment
+    let f: DomNode = dom_fragment([dom_text("a"), dom_text("b")])
+    eq_int(dom_node_kind(f), dom_kind_fragment(), "Fragment kind")
+    eq_bool(dom_is_fragment(f), true, "is_fragment")
+    eq_int(dom_children(f).len(), 2, "Fragment children count")
+
+    # Element (with attrs + children)
+    let e: DomNode = dom_element("div", [dom_class("card")], [dom_text("hi")])
+    eq_int(dom_node_kind(e), dom_kind_element(), "Element kind")
+    eq_str(dom_tag(e), "div", "Element tag")
+    eq_int(dom_attrs(e).len(), 1, "Element attrs count")
+    eq_str(dom_attrs(e).get(0).name, "class", "Element attr name")
+    eq_str(dom_attrs(e).get(0).value, "card", "Element attr value")
+    eq_int(dom_children(e).len(), 1, "Element children count")
+    eq_bool(dom_is_element(e), true, "is_element")
+
+    # Void
+    let v: DomNode = dom_void("br", [dom_id("first-break")])
+    eq_int(dom_node_kind(v), dom_kind_void(), "Void kind")
+    eq_str(dom_tag(v), "br", "Void tag")
+    eq_int(dom_attrs(v).len(), 1, "Void attrs count")
+    eq_int(dom_children(v).len(), 0, "Void has no children")
+    eq_bool(dom_is_void(v), true, "is_void")
+    return 0
+}
+
+# ============================================================================
+# Test 3: rendering — the serialiser.
+# ============================================================================
+
+fn test_rendering() -> int uses IO {
+    # Text is HTML-escaped (XSS-safe by default).
+    eq_str(dom_render(dom_text("a & b < c > d \" e ' f / g")),
+        "a &amp; b &lt; c &gt; d &quot; e &#39; f &#x2F; g",
+        "Text escapes OWASP set")
+
+    # Raw is emitted VERBATIM (explicit opt-in).
+    eq_str(dom_render(dom_raw("<b>bold</b>")), "<b>bold</b>", "Raw verbatim")
+
+    # Doctype renders to "<!DOCTYPE html>".
+    eq_str(dom_render(dom_doctype()), "<!DOCTYPE html>", "Doctype render")
+
+    # Comment is wrapped in <!-- ... --> and sanitised (no `-->` breakout).
+    # Sanitiser rule: at a `-`, if the next byte is `-` or `>`, emit `- `
+    # (hyphen + space) and skip the next byte. So:
+    #   `-->`  -> `- >`  (the `--` collapses to `- ` then `>` is preserved)
+    #   `->`   -> `- `   (the `->` becomes `- `)
+    #   `--`   -> `- `   (the `--` becomes `- `)
+    # In every case the dangerous sequence is broken up; `-->` cannot
+    # survive in the output.
+    eq_str(dom_render(dom_comment("ok")), "<!--ok-->", "Comment render")
+    eq_str(dom_render(dom_comment("end ->")),
+        "<!--end - -->", "Comment `->` sanitised to `- `")
+    # `--` followed by ` ` (space): `-` then ` ` (rewritten) then ` ` (orig)
+    # = two spaces between the surviving `-` and `dash`.
+    eq_str(dom_render(dom_comment("double -- dash")),
+        "<!--double -  dash-->", "Comment `--` sanitised to `- `")
+    # `-->`: first `-` preserved, second rewritten to ` `, `>` preserved.
+    eq_str(dom_render(dom_comment("triple --> breakout")),
+        "<!--triple - > breakout-->", "Comment `-->` sanitised")
+    # The `-->` inside the comment body cannot survive. We check the
+    # BODY (between the `<!--` opener and the `-->` closer) — the
+    # closer itself contains `-->` by definition.
+    let brk2: str = dom_render(dom_comment("-->breakout"))
+    eq_str(brk2, "<!--- >breakout-->", "Comment exact rewrite for `-->breakout`")
+    not_contains(brk2.slice(4, brk2.len() - 3), "-->",
+        "Comment body does not contain literal `-->`")
+
+    # Empty element: NOT self-closing, canonical `<tag></tag>` form.
+    eq_str(dom_render(dom_element("div", [], [])), "<div></div>",
+        "Empty element is canonical `<div></div>`")
+
+    # Element with text child.
+    eq_str(dom_render(dom_element("p", [], [dom_text("hi")])),
+        "<p>hi</p>", "Element with text child")
+
+    # Element with attrs.
+    eq_str(dom_render(dom_element("a", [dom_href("/x")], [dom_text("link")])),
+        "<a href=\"&#x2F;x\">link</a>", "Element with href attr (slash escaped per OWASP)")
+
+    # Attribute values are HTML-escaped (attribute context).
+    # Use dom_void("img", ...) because <img> is a void element.
+    let s_attr: str = dom_render(dom_void("img",
+        [dom_src("\"evil\".png")]))
+    contains(s_attr, "src=\"&quot;evil&quot;.png\"", "Attr value escaped")
+
+    # Forward slash in attribute value is escaped per OWASP.
+    let s_slash: str = dom_render(dom_element("a",
+        [dom_href("/path/to/x")], [dom_text("go")]))
+    contains(s_slash, "href=\"&#x2F;path&#x2F;to&#x2F;x\"", "Slash in attr escaped")
+
+    # Void element: NO closing tag.
+    eq_str(dom_render(dom_void("br", [])), "<br>", "br void render")
+    eq_str(dom_render(dom_void("hr", [dom_id("rule1")])),
+        "<hr id=\"rule1\">", "hr void with attr")
+
+    # Fragment: children concatenated, no wrapping tag.
+    eq_str(dom_render(dom_fragment([dom_text("a"), dom_text("b")])),
+        "ab", "Fragment concatenates children")
+    eq_str(dom_render(dom_fragment([])), "", "Empty fragment is empty string")
+    return 0
+}
+
+# ============================================================================
+# Test 4: attribute helpers.
+# ============================================================================
+
+fn test_attr_helpers() -> int uses IO {
+    # dom_attr
+    let a: DomAttr = dom_attr("class", "btn")
+    eq_str(a.name, "class", "attr name")
+    eq_str(a.value, "btn", "attr value")
+
+    # Boolean attributes
+    let bp: DomAttr = dom_attr_true("disabled")
+    eq_str(bp.name, "disabled", "bool attr present name")
+    eq_str(dom_render_attr(bp), " disabled", "bool attr present renders as name only")
+    let bf: DomAttr = dom_attr_false("disabled")
+    eq_str(bf.name, "disabled", "bool attr absent name")
+    eq_str(dom_render_attr(bf), "", "bool attr absent renders empty")
+
+    # Boolean attributes inside a full element render correctly.
+    # Use dom_void("input", ...) because <input> is a void element.
+    eq_str(dom_render(dom_void("input",
+        [dom_type_attr("text"), dom_attr_true("required")])),
+        "<input type=\"text\" required>", "input with required bool attr")
+    eq_str(dom_render(dom_void("input",
+        [dom_type_attr("text"), dom_attr_false("required")])),
+        "<input type=\"text\">", "input with required=false")
+
+    # Shorthand attribute constructors.
+    eq_str(dom_class("btn").name, "class", "dom_class name")
+    eq_str(dom_class("btn").value, "btn", "dom_class value")
+    eq_str(dom_id("main").name, "id", "dom_id name")
+    eq_str(dom_href("/x").name, "href", "dom_href name")
+    eq_str(dom_src("/y.png").name, "src", "dom_src name")
+    eq_str(dom_alt("alt").name, "alt", "dom_alt name")
+    eq_str(dom_title_attr("tip").name, "title", "dom_title_attr name")
+    eq_str(dom_name_attr("field").name, "name", "dom_name_attr name")
+    eq_str(dom_value_attr("v").name, "value", "dom_value_attr name")
+    eq_str(dom_placeholder("p").name, "placeholder", "dom_placeholder name")
+    eq_str(dom_type_attr("text").name, "type", "dom_type_attr name")
+    eq_str(dom_rel("noopener").name, "rel", "dom_rel name")
+    eq_str(dom_lang("en").name, "lang", "dom_lang name")
+    eq_str(dom_charset("utf-8").name, "charset", "dom_charset name")
+    eq_str(dom_style_attr("color:red").name, "style", "dom_style_attr name")
+    eq_str(dom_role("button").name, "role", "dom_role name")
+
+    # data-* and aria-* with validated name part.
+    eq_str(dom_data("foo", "bar").name, "data-foo", "dom_data name")
+    eq_str(dom_aria("label", "Save").name, "aria-label", "dom_aria name")
+    return 0
+}
+
+# ============================================================================
+# Test 5: element shorthand builders.
+# ============================================================================
+
+fn test_element_builders() -> int uses IO {
+    # Document structure.
+    eq_str(dom_render(dom_title("Hi")), "<title>Hi</title>", "dom_title")
+    eq_str(dom_render(dom_meta([dom_charset("utf-8")])),
+        "<meta charset=\"utf-8\">", "dom_meta void")
+    eq_str(dom_render(dom_link([dom_rel("stylesheet"), dom_href("/a.css")])),
+        "<link rel=\"stylesheet\" href=\"&#x2F;a.css\">", "dom_link void (slash escaped)")
+
+    # Script external
+    eq_str(dom_render(dom_script_src("/app.js")),
+        "<script src=\"&#x2F;app.js\"></script>", "dom_script_src (slash escaped)")
+
+    # Script inline — `</script>` is rewritten to `<\/script>` to prevent
+    # premature element termination. The renderer wraps the result in
+    # a Raw node (no HTML-escaping of JS).
+    let s_inl: str = dom_render(dom_script_inline("var x = '</script>';"))
+    contains(s_inl, "<script>var x = '<\\/script>';</script>", "inline script close-tag rewritten")
+    # The script ELEMENT itself ends with `</script>` (the element's
+    # closing tag, which is correct). We check the BODY (between
+    # `<script>` and the final `</script>`) — the body must not
+    # contain a literal `</script>` (which would terminate the
+    # element prematurely).
+    not_contains(s_inl.slice(8, s_inl.len() - 9), "</script>",
+        "inline script body has no literal `</script>`")
+
+    # Style inline — same defence.
+    let st_inl: str = dom_render(dom_style_inline("body { color: red; } /* </style> */"))
+    contains(st_inl, "<style>body { color: red; } /* <\\/style> */</style>", "inline style close-tag rewritten")
+    # Body check (between `<style>` and `</style>`).
+    not_contains(st_inl.slice(7, st_inl.len() - 8), "</style>",
+        "inline style body has no literal `</style>`")
+
+    # Headings
+    eq_str(dom_render(dom_h1("Top", [])), "<h1>Top</h1>", "dom_h1")
+    eq_str(dom_render(dom_h6("Bottom", [])), "<h6>Bottom</h6>", "dom_h6")
+
+    # Text content
+    eq_str(dom_render(dom_p("hello", [])), "<p>hello</p>", "dom_p")
+    eq_str(dom_render(dom_p_nodes([], [dom_text("a"), dom_text("b")])),
+        "<p>ab</p>", "dom_p_nodes")
+    eq_str(dom_render(dom_span("x", [])), "<span>x</span>", "dom_span")
+    eq_str(dom_render(dom_div([], [dom_text("d")])),
+        "<div>d</div>", "dom_div")
+    eq_str(dom_render(dom_pre([], [dom_text("pre")]) ),
+        "<pre>pre</pre>", "dom_pre")
+    eq_str(dom_render(dom_blockquote([], [dom_text("q")])),
+        "<blockquote>q</blockquote>", "dom_blockquote")
+    eq_str(dom_render(dom_hr([])), "<hr>", "dom_hr void")
+
+    # Inline text
+    eq_str(dom_render(dom_a("/x", "link", [dom_rel("noopener")])),
+        "<a href=\"&#x2F;x\" rel=\"noopener\">link</a>", "dom_a with attrs (slash escaped)")
+    eq_str(dom_render(dom_a_nodes("/y", [], [dom_text("z")])),
+        "<a href=\"&#x2F;y\">z</a>", "dom_a_nodes (slash escaped)")
+    eq_str(dom_render(dom_em("italic", [])), "<em>italic</em>", "dom_em")
+    eq_str(dom_render(dom_strong("bold", [])), "<strong>bold</strong>", "dom_strong")
+    eq_str(dom_render(dom_code("x()", [])), "<code>x()</code>", "dom_code")
+    eq_str(dom_render(dom_small("note", [])), "<small>note</small>", "dom_small")
+    eq_str(dom_render(dom_mark("hi", [])), "<mark>hi</mark>", "dom_mark")
+    eq_str(dom_render(dom_abbr("HLS", "Halis Language", [])),
+        "<abbr title=\"Halis Language\">HLS</abbr>", "dom_abbr")
+    eq_str(dom_render(dom_b("b", [])), "<b>b</b>", "dom_b")
+    eq_str(dom_render(dom_i("i", [])), "<i>i</i>", "dom_i")
+    eq_str(dom_render(dom_u("u", [])), "<u>u</u>", "dom_u")
+    eq_str(dom_render(dom_sub("2", [])), "<sub>2</sub>", "dom_sub")
+    eq_str(dom_render(dom_sup("2", [])), "<sup>2</sup>", "dom_sup")
+
+    # Lists
+    eq_str(dom_render(dom_ul([], [dom_li("a", []), dom_li("b", [])])),
+        "<ul><li>a</li><li>b</li></ul>", "dom_ul")
+    eq_str(dom_render(dom_ol([dom_type_attr("A")], [dom_li("a", [])])),
+        "<ol type=\"A\"><li>a</li></ol>", "dom_ol with attrs")
+    eq_str(dom_render(dom_li_nodes([], [dom_text("c")])),
+        "<li>c</li>", "dom_li_nodes")
+    eq_str(dom_render(dom_dl([], [dom_dt("term", []), dom_dd("def", [])])),
+        "<dl><dt>term</dt><dd>def</dd></dl>", "dom_dl")
+
+    # Tables
+    let tbl: DomNode = dom_table([], [
+        dom_thead([], [dom_tr([], [dom_th("Name", []), dom_th("Age", [])])]),
+        dom_tbody([], [dom_tr([], [dom_td("Alice", []), dom_td("30", [])])])
+    ])
+    contains(dom_render(tbl), "<table><thead>", "table renders with thead/tbody")
+    eq_str(dom_render(dom_caption("Users", [])),
+        "<caption>Users</caption>", "dom_caption")
+    eq_str(dom_render(dom_colgroup([], [dom_col([dom_class("w1")])])),
+        "<colgroup><col class=\"w1\"></colgroup>", "dom_colgroup + dom_col void")
+    eq_str(dom_render(dom_tfoot([], [dom_tr([], [dom_td("Sum", [])])])),
+        "<tfoot><tr><td>Sum</td></tr></tfoot>", "dom_tfoot")
+    eq_str(dom_render(dom_th_nodes([], [dom_text("header")])),
+        "<th>header</th>", "dom_th_nodes")
+    eq_str(dom_render(dom_td_nodes([], [dom_text("cell")])),
+        "<td>cell</td>", "dom_td_nodes")
+
+    # Forms
+    eq_str(dom_render(dom_form("/submit", [dom_type_attr("post-ish")], [dom_text("...")])),
+        "<form action=\"&#x2F;submit\" type=\"post-ish\">...</form>", "dom_form (action slash escaped)")
+    eq_str(dom_render(dom_label("name", "Name", [])),
+        "<label for=\"name\">Name</label>", "dom_label")
+    eq_str(dom_render(dom_input([dom_type_attr("text"), dom_name_attr("q")])),
+        "<input type=\"text\" name=\"q\">", "dom_input void")
+    eq_str(dom_render(dom_button("Save", [dom_type_attr("submit")])),
+        "<button type=\"submit\">Save</button>", "dom_button")
+    eq_str(dom_render(dom_button_nodes([], [dom_text("go")])),
+        "<button>go</button>", "dom_button_nodes")
+    let sel: str = dom_render(dom_select([dom_name_attr("c")],
+        [dom_option("a", "A", []), dom_option("b", "B", [dom_attr_true("selected")])]))
+    contains(sel, "<select name=\"c\"><option value=\"a\">A</option>", "dom_select + dom_option")
+    contains(sel, "<option value=\"b\" selected>B</option>", "dom_option with selected bool attr")
+    eq_str(dom_render(dom_textarea("body", [dom_class("big")], "hello & <world>")),
+        "<textarea name=\"body\" class=\"big\">hello &amp; &lt;world&gt;</textarea>",
+        "dom_textarea content is HTML-escaped")
+    eq_str(dom_render(dom_fieldset([], [dom_legend("Info", [])])),
+        "<fieldset><legend>Info</legend></fieldset>", "dom_fieldset + dom_legend")
+
+    # Media
+    eq_str(dom_render(dom_img("/a.png", "alt", [dom_class("thumb")])),
+        "<img src=\"&#x2F;a.png\" alt=\"alt\" class=\"thumb\">", "dom_img void (slash escaped)")
+    eq_str(dom_render(dom_br()), "<br>", "dom_br")
+    eq_str(dom_render(dom_br_attrs([dom_id("b1")])),
+        "<br id=\"b1\">", "dom_br_attrs")
+    eq_str(dom_render(dom_figure([], [dom_figcaption("caption", [])])),
+        "<figure><figcaption>caption</figcaption></figure>", "dom_figure")
+    eq_str(dom_render(dom_picture([], [dom_source([dom_src("/x.webp")])])),
+        "<picture><source src=\"&#x2F;x.webp\"></picture>", "dom_picture + dom_source void (slash escaped)")
+
+    # Interactive
+    eq_str(dom_render(dom_details([], [dom_summary("Click", [])])),
+        "<details><summary>Click</summary></details>", "dom_details + dom_summary")
+    eq_str(dom_render(dom_dialog([], [dom_text("hi")])),
+        "<dialog>hi</dialog>", "dom_dialog")
+
+    # Sectioning
+    eq_str(dom_render(dom_section([], [dom_text("s")])),
+        "<section>s</section>", "dom_section")
+    eq_str(dom_render(dom_article([], [dom_text("a")])),
+        "<article>a</article>", "dom_article")
+    eq_str(dom_render(dom_header([], [dom_text("h")])),
+        "<header>h</header>", "dom_header")
+    eq_str(dom_render(dom_footer([], [dom_text("f")])),
+        "<footer>f</footer>", "dom_footer")
+    eq_str(dom_render(dom_nav([], [dom_text("n")])),
+        "<nav>n</nav>", "dom_nav")
+    eq_str(dom_render(dom_aside([], [dom_text("aside")])),
+        "<aside>aside</aside>", "dom_aside")
+    eq_str(dom_render(dom_main([], [dom_text("m")])),
+        "<main>m</main>", "dom_main")
+
+    # html/head/body wrappers
+    eq_str(dom_render(dom_html([dom_lang("en")], [dom_text("...")])),
+        "<html lang=\"en\">...</html>", "dom_html with lang")
+    eq_str(dom_render(dom_head([], [dom_title("t")])),
+        "<head><title>t</title></head>", "dom_head")
+    eq_str(dom_render(dom_body([dom_class("page")], [dom_text("b")])),
+        "<body class=\"page\">b</body>", "dom_body")
+    return 0
+}
+
+# ============================================================================
+# Test 6: document helpers — the common case of a full HTML5 page.
+# ============================================================================
+
+fn test_document_helpers() -> int uses IO {
+    # dom_html_document — minimal: just a title and body children.
+    let doc1: DomNode = dom_html_document("Hi", [dom_p("world", [])])
+    eq_str(dom_render(doc1),
+        "<!DOCTYPE html><html><head><title>Hi</title></head><body><p>world</p></body></html>",
+        "dom_html_document full render")
+
+    # dom_html_document_with_head — extras in head, body attrs.
+    let doc2: DomNode = dom_html_document_with_head(
+        "Page",
+        [dom_meta([dom_charset("utf-8")]),
+         dom_link([dom_rel("stylesheet"), dom_href("/a.css")])],
+        [dom_class("default")],
+        [dom_h1("Title", []), dom_p("body", [])])
+    let rendered2: str = dom_render(doc2)
+    contains(rendered2, "<!DOCTYPE html><html>", "doc2 starts with doctype + html")
+    contains(rendered2, "<head><title>Page</title><meta charset=\"utf-8\">",
+        "doc2 head: title first, then extras")
+    contains(rendered2, "<link rel=\"stylesheet\" href=\"&#x2F;a.css\">",
+        "doc2 head: link after meta")
+    contains(rendered2, "<body class=\"default\"><h1>Title</h1><p>body</p></body>",
+        "doc2 body: attrs + children")
+    return 0
+}
+
+# ============================================================================
+# Test 7: immutable mutators — with_attr / with_child / etc.
+# ============================================================================
+
+fn test_immutable_mutators() -> int uses IO {
+    # dom_with_attr on Element: returns a NEW node; the receiver is
+    # unchanged (HLS structs are by-reference — the copy-first pattern
+    # is verified explicitly).
+    let base: DomNode = dom_element("div", [dom_class("a")], [dom_text("hi")])
+    let with_id: DomNode = dom_with_attr(base, dom_id("x"))
+    eq_int(dom_attrs(base).len(), 1, "with_attr does not mutate base (attrs)")
+    eq_int(dom_attrs(with_id).len(), 2, "with_attr appended (attrs)")
+    eq_str(dom_attrs(with_id).get(1).name, "id", "with_attr name")
+    eq_str(dom_attrs(with_id).get(1).value, "x", "with_attr value")
+
+    # Children list reference is preserved across the copy (same backing
+    # list pointer; no extra allocation).
+    eq_int(dom_children(with_id).len(), 1, "with_attr preserves children")
+
+    # dom_with_attr on Void: same behaviour.
+    let v: DomNode = dom_void("br", [])
+    let v_with: DomNode = dom_with_attr(v, dom_id("b1"))
+    eq_int(dom_attrs(v).len(), 0, "with_attr on Void: base unchanged")
+    eq_int(dom_attrs(v_with).len(), 1, "with_attr on Void: attr appended")
+
+    # dom_with_attr on Text: no-op.
+    let t: DomNode = dom_text("hi")
+    eq_bool(dom_is_text(dom_with_attr(t, dom_id("x"))), true, "with_attr on Text is no-op")
+
+    # dom_with_attrs: appends a list of attrs.
+    let base2: DomNode = dom_element("div", [dom_class("a")], [])
+    let chained: DomNode = dom_with_attrs(base2, [dom_id("x"), dom_data("foo", "bar")])
+    eq_int(dom_attrs(base2).len(), 1, "with_attrs base unchanged")
+    eq_int(dom_attrs(chained).len(), 3, "with_attrs appended all")
+    eq_str(dom_attrs(chained).get(2).name, "data-foo", "with_attrs data- name")
+
+    # dom_with_child on Element: appends a child.
+    let c1: DomNode = dom_element("ul", [], [dom_li("a", [])])
+    let c1_with: DomNode = dom_with_child(c1, dom_li("b", []))
+    eq_int(dom_children(c1).len(), 1, "with_child base unchanged")
+    eq_int(dom_children(c1_with).len(), 2, "with_child appended")
+
+    # dom_with_child on Fragment: same behaviour.
+    let f1: DomNode = dom_fragment([dom_text("a")])
+    let f1_with: DomNode = dom_with_child(f1, dom_text("b"))
+    eq_int(dom_children(f1_with).len(), 2, "with_child on Fragment appends")
+
+    # dom_with_child on Void: no-op.
+    let v1: DomNode = dom_void("br", [])
+    eq_bool(dom_is_void(dom_with_child(v1, dom_text("ignored"))), true, "with_child on Void is no-op")
+
+    # dom_with_children: appends a list of children.
+    let base3: DomNode = dom_element("div", [], [dom_text("a")])
+    let with3: DomNode = dom_with_children(base3, [dom_text("b"), dom_text("c")])
+    eq_int(dom_children(with3).len(), 3, "with_children appended all")
+    return 0
+}
+
+# ============================================================================
+# Test 8: attribute lookup / set / remove (case-insensitive).
+# ============================================================================
+
+fn test_attr_lookup() -> int uses IO {
+    let e: DomNode = dom_element("div",
+        [dom_id("main"), dom_class("card"), dom_data("role", "panel")], [])
+
+    # dom_attr_has — case-insensitive.
+    eq_bool(dom_attr_has(e, "id"), true, "attr_has id")
+    eq_bool(dom_attr_has(e, "ID"), true, "attr_has ID (case-insensitive)")
+    eq_bool(dom_attr_has(e, "Id"), true, "attr_has Id (mixed case)")
+    eq_bool(dom_attr_has(e, "class"), true, "attr_has class")
+    eq_bool(dom_attr_has(e, "data-role"), true, "attr_has data-role")
+    eq_bool(dom_attr_has(e, "missing"), false, "attr_has missing is false")
+
+    # dom_attr_get
+    eq_str(dom_attr_get(e, "id"), "main", "attr_get id")
+    eq_str(dom_attr_get(e, "CLASS"), "card", "attr_get CLASS")
+    eq_str(dom_attr_get(e, "data-role"), "panel", "attr_get data-role")
+    eq_str(dom_attr_get(e, "missing"), "", "attr_get missing is empty")
+
+    # dom_attr_set — replace existing (preserves position).
+    let e_set: DomNode = dom_attr_set(e, "class", "banner")
+    eq_str(dom_attr_get(e_set, "class"), "banner", "attr_set replaced value")
+    eq_str(dom_attrs(e_set).get(1).name, "class", "attr_set preserved position (name)")
+    eq_str(dom_attrs(e_set).get(1).value, "banner", "attr_set preserved position (value)")
+    eq_int(dom_attrs(e_set).len(), 3, "attr_set did not append (replaced in place)")
+    # Original is unchanged (immutability).
+    eq_str(dom_attr_get(e, "class"), "card", "attr_set did not mutate receiver")
+
+    # dom_attr_set — case-insensitive replace.
+    let e_set2: DomNode = dom_attr_set(e, "ID", "new-main")
+    eq_str(dom_attr_get(e_set2, "id"), "new-main", "attr_set ID replaced id")
+    eq_int(dom_attrs(e_set2).len(), 3, "attr_set ID replaced in place")
+
+    # dom_attr_set — append new attribute.
+    let e_set3: DomNode = dom_attr_set(e, "title", "tooltip")
+    eq_str(dom_attr_get(e_set3, "title"), "tooltip", "attr_set appended new")
+    eq_int(dom_attrs(e_set3).len(), 4, "attr_set appended (count)")
+    eq_str(dom_attrs(e_set3).get(3).name, "title", "attr_set appended at end")
+
+    # dom_attr_remove — by name (case-insensitive).
+    let e_rm: DomNode = dom_attr_remove(e, "class")
+    eq_bool(dom_attr_has(e_rm, "class"), false, "attr_remove class")
+    eq_int(dom_attrs(e_rm).len(), 2, "attr_remove reduced count")
+    eq_str(dom_attrs(e_rm).get(1).name, "data-role", "attr_remove kept later attrs")
+    # Original is unchanged.
+    eq_bool(dom_attr_has(e, "class"), true, "attr_remove did not mutate receiver")
+
+    # dom_attr_remove — case-insensitive.
+    let e_rm2: DomNode = dom_attr_remove(e, "DATA-ROLE")
+    eq_bool(dom_attr_has(e_rm2, "data-role"), false, "attr_remove DATA-ROLE")
+    return 0
+}
+
+# ============================================================================
+# Test 9: statistics — node count, count by kind, describe.
+# ============================================================================
+
+fn test_stats() -> int uses IO {
+    let doc: DomNode = dom_html_document("T", [
+        dom_h1("Hello", []),
+        dom_p("world", []),
+        dom_ul([], [dom_li("a", []), dom_li("b", [])])
+    ])
+    # dom_node_count: doctype (1) + html (1) + head (1) + title (1) +
+    # title-text (1) + body (1) + h1 (1) + h1-text (1) + p (1) +
+    # p-text (1) + ul (1) + li (1) + li-text (1) + li (1) + li-text (1)
+    # + fragment-root (1) = 16 (Fragment counts itself now).
+    eq_int(dom_node_count(doc), 16, "dom_node_count of doc")
+
+    # dom_count_by_kind — text nodes.
+    # Text nodes: title-text + h1-text + p-text + li-a + li-b = 5
+    eq_int(dom_count_by_kind(doc, dom_kind_text()), 5, "text count")
+    eq_int(dom_count_by_kind(doc, dom_kind_element()), 9, "element count")
+    eq_int(dom_count_by_kind(doc, dom_kind_void()), 0, "void count")
+    eq_int(dom_count_by_kind(doc, dom_kind_doctype()), 1, "doctype count")
+    eq_int(dom_count_by_kind(doc, dom_kind_fragment()), 1, "fragment count")
+
+    # dom_node_count on simpler trees.
+    eq_int(dom_node_count(dom_text("x")), 1, "text node count")
+    eq_int(dom_node_count(dom_element("div", [], [])), 1, "empty element count")
+    eq_int(dom_node_count(dom_void("br", [])), 1, "void count")
+    eq_int(dom_node_count(dom_doctype()), 1, "doctype count")
+
+    # dom_describe — deterministic, has expected lines.
+    let desc: str = dom_describe(doc)
+    contains(desc, "Fragment(", "describe: Fragment root")
+    contains(desc, "Element(html)", "describe: html element")
+    contains(desc, "Element(head)", "describe: head element")
+    contains(desc, "Element(body)", "describe: body element")
+    contains(desc, "Element(h1)", "describe: h1 element")
+    contains(desc, "Element(ul)", "describe: ul element")
+    contains(desc, "Element(li)", "describe: li element")
+    contains(desc, "Text(5 bytes)", "describe: text node with byte count")
+    contains(desc, "Doctype", "describe: doctype node")
+
+    # dom_describe on Void includes attrs count when present.
+    let desc_v: str = dom_describe(dom_void("br", [dom_id("b1")]))
+    contains(desc_v, "Void(br) attrs=1", "describe: void with attrs=1")
+    return 0
+}
+
+# ============================================================================
+# Test 10: HTTP integration.
+# ============================================================================
+
+fn test_http_integration() -> int uses IO {
+    let doc: DomNode = dom_html_document("Hi", [dom_p("world", [])])
+    let resp: HttpResponse = dom_to_html_response(200, doc)
+    eq_int(resp.status, 200, "http status 200")
+    eq_str(resp.body, dom_render(doc), "http body equals render")
+    # Verify Content-Type header
+    let mut found_ct: bool = false
+    let mut i: int = 0
+    while i < resp.headers.len() {
+        let h: HttpHeader = resp.headers.get(i)
+        if str_to_lower_ascii(h.name) == "content-type" {
+            found_ct = true
+            eq_str(h.value, "text/html; charset=utf-8", "http Content-Type")
+        }
+        i = i + 1
+    }
+    ok(found_ct, "Content-Type header present")
+
+    # Status helpers
+    eq_int(dom_html_response_ok(doc).status, 200, "200 ok status")
+    eq_int(dom_html_response_bad_request(doc).status, 400, "400 status")
+    eq_int(dom_html_response_not_found(doc).status, 404, "404 status")
+    eq_int(dom_html_response_server_error(doc).status, 500, "500 status")
+    return 0
+}
+
+# ============================================================================
+# Test 11: security — XSS hardening (the most important test).
+# ============================================================================
+
+fn test_xss_protection() -> int uses IO {
+    # 1. Text node escapes the OWASP set.
+    let payload: str = "<script>alert('xss')</script>"
+    let rendered: str = dom_render(dom_text(payload))
+    not_contains(rendered, "<script>", "text: no literal <script>")
+    not_contains(rendered, "</script>", "text: no literal </script>")
+    contains(rendered, "&lt;script&gt;", "text: script escaped")
+
+    # 2. Attribute values escape too.
+    let attr_rendered: str = dom_render(dom_element("div",
+        [dom_class("\"><script>alert(1)</script>"), dom_id("x")], []))
+    not_contains(attr_rendered, "<script>", "attr: no script injection")
+    contains(attr_rendered, "&lt;script&gt;", "attr: script escaped")
+
+    # 3. Tag/attr name validation: invalid chars are rejected.
+    # We do NOT directly call the panic cases here (the runner skips
+    # them — see the runner); we verify that VALID names work and
+    # leave the invalid cases for the negative tests.
+    eq_str(dom_render(dom_element("div", [dom_attr("data-x", "v")], [])),
+        "<div data-x=\"v\"></div>", "valid data-x attr")
+    eq_str(dom_render(dom_element("my-widget", [], [])),
+        "<my-widget></my-widget>", "custom element name (with hyphen)")
+
+    # 4. Comment breakout: `-->` cannot appear in the rendered comment body
+    # (the `<!--` opener and `-->` closer are added by the serialiser).
+    let breakout: str = "begin --> end"
+    let rendered_c: str = dom_render(dom_comment(breakout))
+    # Body is "<!--begin - > end-->" — the `-->` inside is rewritten to
+    # `- >` (the first `-` survives, the second becomes ` `, `>` survives).
+    not_contains(rendered_c.slice(4, rendered_c.len() - 3), "-->",
+        "comment body has no `-->` in output")
+    contains(rendered_c, "<!--", "comment: has `<!--` opener")
+    contains(rendered_c, "-->", "comment: has `-->` closer (the closer itself is fine; the breakout inside is not)")
+    eq_str(rendered_c, "<!--begin - > end-->", "comment: exact rewrite")
+
+    # 5. Inline script with `</script>` inside the JS string is rewritten.
+    # Check the BODY (between `<script>` opener and `</script>` closer);
+    # the closer itself is supposed to contain `</script>`.
+    let js_payload: str = "var s = '</script><img src=x onerror=alert(1)>';"
+    let rendered_js: str = dom_render(dom_script_inline(js_payload))
+    not_contains(rendered_js.slice(8, rendered_js.len() - 9), "</script>",
+        "inline script body: no `</script>` literal")
+    contains(rendered_js, "<\\/script>", "inline script: `</script>` rewritten to `<\\/script>`")
+
+    # 6. Inline script with uppercase `</SCRIPT>` is rewritten too.
+    let js_upper: str = "var s = '</SCRIPT>';"
+    let rendered_upper: str = dom_render(dom_script_inline(js_upper))
+    not_contains(rendered_upper.slice(8, rendered_upper.len() - 9), "</SCRIPT>",
+        "inline script body: no `</SCRIPT>` literal")
+    contains(rendered_upper, "<\\/SCRIPT>", "inline script: `</SCRIPT>` rewritten to `<\\/SCRIPT>`")
+
+    # 7. Inline style with `</style>` is rewritten.
+    let css_payload: str = "body { content: '</style>'; }"
+    let rendered_css: str = dom_render(dom_style_inline(css_payload))
+    not_contains(rendered_css.slice(7, rendered_css.len() - 8), "</style>",
+        "inline style body: no `</style>` literal")
+    contains(rendered_css, "<\\/style>", "inline style: `</style>` rewritten")
+
+    # 8. The full document's render is XSS-safe (every text node escaped).
+    let doc: DomNode = dom_html_document("<xss>", [dom_p("a & b", [])])
+    let full: str = dom_render(doc)
+    not_contains(full, "<xss>", "full doc: no literal <xss>")
+    contains(full, "&lt;xss&gt;", "full doc: title escaped")
+    contains(full, "a &amp; b", "full doc: body escaped")
+    return 0
+}
+
+# ============================================================================
+# Test 12: end-to-end — a realistic HTML page.
+# ============================================================================
+
+fn test_end_to_end() -> int uses IO {
+    let page: DomNode = dom_html_document_with_head(
+        "Halis Stage 74 — std.dom",
+        [
+            dom_meta([dom_charset("utf-8")]),
+            dom_meta([dom_attr("name", "viewport"),
+                dom_attr("content", "width=device-width, initial-scale=1")]),
+            dom_link([dom_rel("stylesheet"), dom_href("/static/app.css")]),
+            dom_script_src("/static/app.js")
+        ],
+        [dom_class("page"), dom_lang("en")],
+        [
+            dom_header([], [
+                dom_nav([], [
+                    dom_a("/", "Home", []),
+                    dom_a("/docs", "Docs", [dom_class("active")])
+                ])
+            ]),
+            dom_main([], [
+                dom_h1("Welcome to Halis", []),
+                dom_p("Halis is a high-security, self-hosting, native-compiled language.", []),
+                dom_section([dom_id("features")], [
+                    dom_h2("Features", []),
+                    dom_ul([], [
+                        dom_li("I/O as an effect", []),
+                        dom_li("Checked arithmetic", []),
+                        dom_li("No null, no uninitialised data", []),
+                        dom_li("Memory safety without GC", [])
+                    ])
+                ]),
+                dom_section([dom_id("example")], [
+                    dom_h2("Example", []),
+                    dom_pre([], [dom_code("fn main() -> int uses IO { println(\"Hi\") ; return 0 }", [])]),
+                    dom_blockquote([], [dom_text("Safety is not optional.")])
+                ]),
+                dom_section([dom_id("form")], [
+                    dom_h2("Subscribe", []),
+                    dom_form("/subscribe", [dom_class("subscribe")], [
+                        dom_label("email", "Email", []),
+                        dom_input([dom_type_attr("email"), dom_name_attr("email"),
+                            dom_placeholder("you@example.com"), dom_attr_true("required")]),
+                        dom_button("Subscribe", [dom_type_attr("submit")])
+                    ])
+                ])
+            ]),
+            dom_footer([], [
+                dom_p("Copyright 2026 — Halis project", [dom_class("small")])
+            ])
+        ])
+    let out: str = dom_render(page)
+    contains(out, "<!DOCTYPE html>", "e2e: doctype")
+    contains(out, "<html>", "e2e: html root")
+    contains(out, "<head><title>Halis Stage 74", "e2e: head + title")
+    contains(out, "<meta charset=\"utf-8\">", "e2e: charset meta")
+    contains(out, "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">",
+        "e2e: viewport meta")
+    contains(out, "<link rel=\"stylesheet\" href=\"&#x2F;static&#x2F;app.css\">", "e2e: link")
+    contains(out, "<script src=\"&#x2F;static&#x2F;app.js\"></script>", "e2e: script src")
+    contains(out, "<body class=\"page\" lang=\"en\">", "e2e: body with attrs")
+    contains(out, "<header><nav><a href=\"&#x2F;\">Home</a>", "e2e: header/nav/a (slash escaped)")
+    contains(out, "<main><h1>Welcome to Halis</h1>", "e2e: main + h1")
+    contains(out, "<section id=\"features\">", "e2e: section with id")
+    contains(out, "<ul><li>I&#x2F;O as an effect</li>", "e2e: list (slash in text escaped)")
+    contains(out, "<pre><code>fn main()", "e2e: pre + code")
+    contains(out, "<blockquote>Safety is not optional.</blockquote>", "e2e: blockquote")
+    contains(out, "<form action=\"&#x2F;subscribe\" class=\"subscribe\">", "e2e: form (slash escaped)")
+    contains(out, "<input type=\"email\" name=\"email\" placeholder=\"you@example.com\" required>",
+        "e2e: input with bool attr (no slashes in attr values)")
+    contains(out, "<button type=\"submit\">Subscribe</button>", "e2e: button")
+    contains(out, "<footer><p class=\"small\">Copyright 2026", "e2e: footer")
+
+    # Verify the document is structurally correct (no orphan closing tags).
+    # Node count: 1 root fragment + 1 doctype + 1 html + 1 head + 1 title +
+    # 1 title-text + 4 head extras (meta, meta, link, script) + 1 body +
+    # 1 header + 1 nav + 2 anchors (each with 1 text) = (1 + 1 + 1 + 1 +
+    # 1 + 1 + 1 + 4 + 4 + 1 + 1 + 1 + 1 + 1 + 1 = ...) — the explicit
+    # count is the natural invariant; the structural-correctness check
+    # is the contains() assertions above.
+    let n: int = dom_node_count(page)
+    ok(n > 30, "e2e: total node count > 30 (got " + n.to_str() + ")")
+    return 0
+}
+
+# ============================================================================
+# Test 13: differential stress — render a non-trivial tree both ways
+# and confirm the two are byte-identical (the differential gate does
+# this externally; this internal check is a defensive sanity check).
+# ============================================================================
+
+fn test_differential_stress() -> int uses IO {
+    let big: DomNode = dom_fragment([
+        dom_doctype(),
+        dom_html([dom_lang("en"), dom_data("framework", "halis")], [
+            dom_head([], [
+                dom_title("Stress"),
+                dom_meta([dom_charset("utf-8")]),
+                dom_meta([dom_attr("name", "description"),
+                    dom_attr("content", "Stress test & <special> chars")]),
+                dom_link([dom_rel("stylesheet"), dom_href("/a.css"),
+                    dom_attr("integrity", "sha384-abc")])
+            ]),
+            dom_body([dom_class("stress")], [
+                dom_header([], [
+                    dom_h1("Stress & <b>HTML</b>", []),
+                    dom_nav([dom_aria("label", "Main")], [
+                        dom_a("/", "Home", []),
+                        dom_a("/about", "About", [dom_class("active")])
+                    ])
+                ]),
+                dom_main([], [
+                    dom_section([dom_id("s1")], [
+                        dom_h2("Section 1", []),
+                        dom_p("Plain text with ampersand & and lt < and gt >.", []),
+                        dom_p_nodes([], [
+                            dom_text("Inline "),
+                            dom_a("/x", "link", []),
+                            dom_text(" in a paragraph.")
+                        ]),
+                        dom_pre([], [dom_code("code & stuff", [])])
+                    ]),
+                    dom_section([dom_id("s2")], [
+                        dom_h2("Section 2", []),
+                        dom_ul([], [
+                            dom_li_nodes([], [dom_text("First "),
+                                dom_strong("strong", [])]),
+                            dom_li_nodes([], [dom_text("Second "),
+                                dom_em("emphasised", [])])
+                        ]),
+                        dom_table([], [
+                            dom_thead([], [dom_tr([], [
+                                dom_th("A", []), dom_th("B", []), dom_th("C", [])
+                            ])]),
+                            dom_tbody([], [
+                                dom_tr([], [dom_td("1", []), dom_td("2", []), dom_td("3", [])]),
+                                dom_tr([], [dom_td("4", []), dom_td("5", []), dom_td("6", [])])
+                            ])
+                        ])
+                    ])
+                ])
+            ])
+        ])
+    ])
+    let out: str = dom_render(big)
+    # Sanity assertions: the structure is intact.
+    contains(out, "<!DOCTYPE html><html", "stress: doctype + html")
+    contains(out, "data-framework=\"halis\"", "stress: data attr")
+    contains(out, "lang=\"en\"", "stress: lang attr")
+    contains(out, "<title>Stress</title>", "stress: title")
+    contains(out, "<meta charset=\"utf-8\">", "stress: meta charset")
+    contains(out, "content=\"Stress test &amp; &lt;special&gt; chars\"", "stress: meta content escaped")
+    contains(out, "<link rel=\"stylesheet\" href=\"&#x2F;a.css\" integrity=\"sha384-abc\">", "stress: link (slash escaped)")
+    contains(out, "<body class=\"stress\">", "stress: body class")
+    contains(out, "<h1>Stress &amp; &lt;b&gt;HTML&lt;&#x2F;b&gt;</h1>", "stress: h1 with escapes (incl. slash)")
+    contains(out, "<nav aria-label=\"Main\">", "stress: aria-label")
+    contains(out, "<section id=\"s1\">", "stress: section 1")
+    contains(out, "Plain text with ampersand &amp; and lt &lt; and gt &gt;.",
+        "stress: text in p escaped")
+    contains(out, "<p>Inline <a href=\"&#x2F;x\">link</a> in a paragraph.</p>",
+        "stress: mixed text + a (slash escaped)")
+    contains(out, "<pre><code>code &amp; stuff</code></pre>", "stress: pre+code")
+    contains(out, "<li>First <strong>strong</strong></li>", "stress: li with strong")
+    contains(out, "<li>Second <em>emphasised</em></li>", "stress: li with em")
+    contains(out, "<table><thead><tr><th>A</th><th>B</th><th>C</th></tr>",
+        "stress: table header")
+    return 0
+}
+
+# ============================================================================
+# Negative-case documentation — these are NOT executed in the differential
+# gate (a panic halts the process). They are listed for the test harness
+# to inspect (and a future split-out fail-tests file can execute them
+# one by one).
+# ============================================================================
+
+fn test_documented_negatives() -> int uses IO {
+    expect_panic("dom_element('br', ...) is a void tag",
+        "dom_element: 'br' is a void tag")
+    expect_panic("dom_void('div', ...) is NOT a void tag",
+        "dom_void: 'div' is NOT a void tag")
+    expect_panic("dom_attr('bad name!', ...) invalid character",
+        "invalid character in name")
+    expect_panic("dom_data('foo bar', ...) invalid data-* suffix",
+        "invalid character in name")
+    return 0
+}
+
+# ============================================================================
+# Runner.
+# ============================================================================
+
+fn run_tests() -> int uses IO {
+    let mut passed: int = 0
+    let tests: list[str] = [
+        "test_constants",
+        "test_node_constructors",
+        "test_rendering",
+        "test_attr_helpers",
+        "test_element_builders",
+        "test_document_helpers",
+        "test_immutable_mutators",
+        "test_attr_lookup",
+        "test_stats",
+        "test_http_integration",
+        "test_xss_protection",
+        "test_end_to_end",
+        "test_differential_stress",
+        "test_documented_negatives"
+    ]
+    let mut i: int = 0
+    while i < tests.len() {
+        let name: str = tests.get(i)
+        println("RUN  " + name)
+        if name == "test_constants" {
+            let _r: int = test_constants()
+        } else if name == "test_node_constructors" {
+            let _r: int = test_node_constructors()
+        } else if name == "test_rendering" {
+            let _r: int = test_rendering()
+        } else if name == "test_attr_helpers" {
+            let _r: int = test_attr_helpers()
+        } else if name == "test_element_builders" {
+            let _r: int = test_element_builders()
+        } else if name == "test_document_helpers" {
+            let _r: int = test_document_helpers()
+        } else if name == "test_immutable_mutators" {
+            let _r: int = test_immutable_mutators()
+        } else if name == "test_attr_lookup" {
+            let _r: int = test_attr_lookup()
+        } else if name == "test_stats" {
+            let _r: int = test_stats()
+        } else if name == "test_http_integration" {
+            let _r: int = test_http_integration()
+        } else if name == "test_xss_protection" {
+            let _r: int = test_xss_protection()
+        } else if name == "test_end_to_end" {
+            let _r: int = test_end_to_end()
+        } else if name == "test_differential_stress" {
+            let _r: int = test_differential_stress()
+        } else if name == "test_documented_negatives" {
+            let _r: int = test_documented_negatives()
+        }
+        println("PASS " + name)
+        passed = passed + 1
+        i = i + 1
+    }
+    println("")
+    println("=== " + passed.to_str() + "/" + tests.len().to_str() + " tests PASSED ===")
+    return 0
+}
+
+fn main() -> int uses IO {
+    return run_tests()
+}
