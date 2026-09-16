@@ -1,0 +1,491 @@
+# ============================================================================
+# examples/dom_demo.hls — Stage 74 (v0.93.0-alpha): std.dom
+# ----------------------------------------------------------------------------
+# Demonstrates the std.dom API surface:
+#
+#   * DomNode sum type (Element / Void / Text / Raw / Comment / Doctype /
+#     Fragment) + DomAttr (name + value, validated)
+#   * Constructors: dom_text / dom_raw / dom_comment / dom_doctype /
+#     dom_fragment / dom_element / dom_void
+#   * Boolean attributes: dom_attr_true (emits just the name) /
+#     dom_attr_false (omits entirely)
+#   * Attribute helpers: dom_attr / dom_class / dom_id / dom_href / dom_src /
+#     dom_alt / dom_title_attr / dom_name_attr / dom_value_attr / dom_placeholder /
+#     dom_type_attr / dom_rel / dom_lang / dom_charset / dom_style_attr / dom_role /
+#     dom_data / dom_aria
+#   * ~50 element shorthand builders: dom_html / dom_head / dom_body / dom_title /
+#     dom_meta / dom_link / dom_script_attrs / dom_script_src / dom_script_inline /
+#     dom_style_inline + sectioning + headings + p/span/div/pre/blockquote/hr +
+#     a/em/strong/code/small/mark/abbr/b/i/u/sub/sup + lists + tables + forms +
+#     media + interactive
+#   * Document helpers: dom_html_document (minimal) / dom_html_document_with_head
+#     (full control over <head> and <body attrs>)
+#   * Immutable mutators: dom_with_attr / dom_with_attrs / dom_with_child /
+#     dom_with_children — copy-then-return, the receiver is unchanged
+#   * Attribute lookup / replace / remove (case-insensitive):
+#     dom_attr_get / dom_attr_has / dom_attr_set / dom_attr_remove
+#   * Introspection: dom_node_kind / dom_is_element / dom_is_void / dom_is_text /
+#     dom_is_raw / dom_is_comment / dom_is_doctype / dom_is_fragment / dom_tag /
+#     dom_attrs / dom_children / dom_text_value
+#   * Statistics: dom_node_count / dom_count_by_kind / dom_describe
+#   * Serialiser: dom_render (Text HTML-escaped; Raw verbatim; Comment sanitised
+#     against `-->` / `--!>`; Doctype; Void no closing tag; empty element ->
+#     `<tag></tag>`; Fragment -> children concat)
+#   * Public render aliases: dom_render_children / dom_render_attrs / dom_render_attr
+#   * Inline <script> and <style> rewrite `</script>` / `</style>` to
+#     `<\/script>` / `<\/style>` (case-insensitive) — preventing premature
+#     element termination
+#   * HTTP integration: dom_to_html_response + the 200/400/404/500 status helpers
+#
+# SECURITY: every Text node's value is HTML-escaped via std.html.html_escape
+# (the OWASP-safe escape). Every attribute value is escaped via
+# html_escape_attr. Tag and attribute names are validated (only
+# [A-Za-z][A-Za-z0-9_-]* allowed). Raw nodes are the explicit opt-in for
+# trusted HTML. Comments cannot break out via `-->` or `--!>`. Inline
+# <script> and <style> bodies are protected against premature close-tag
+# termination.
+#
+# The output is fully deterministic (no Rand, no I/O beyond println) so
+# the differential test (interpreter == native) is byte-identical.
+# ============================================================================
+
+import "std.dom"
+import "std.str"
+import "std.http"
+import "std.option"
+import "std.result"
+
+# ============================================================================
+# Section 1 — basic node construction + render
+# ============================================================================
+
+fn demo_basic() -> void uses IO {
+    println("--- Section 1: basic nodes ---")
+    # Text node — HTML-escaped (XSS-safe by default)
+    let t: DomNode = dom_text("Hello, <world> & welcome!")
+    println("  text:        " + dom_render(t))
+
+    # Raw node — verbatim (explicit opt-in for trusted HTML)
+    let r: DomNode = dom_raw("<b>bold</b> & <i>italic</i>")
+    println("  raw:         " + dom_render(r))
+
+    # Comment node — sanitised against `-->` breakout
+    let c: DomNode = dom_comment("a comment --> with dangerous bytes")
+    println("  comment:     " + dom_render(c))
+
+    # Doctype node — always "<!DOCTYPE html>"
+    let d: DomNode = dom_doctype()
+    println("  doctype:     " + dom_render(d))
+
+    # Fragment — children concatenated, no wrapping element
+    let f: DomNode = dom_fragment([dom_text("a"), dom_text("b"), dom_text("c")])
+    println("  fragment:    " + dom_render(f))
+
+    # Element — empty elements are `<tag></tag>` (not self-closing)
+    let e_empty: DomNode = dom_element("div", [], [])
+    println("  empty div:   " + dom_render(e_empty))
+
+    # Element with attrs and a text child
+    let e: DomNode = dom_element("a",
+        [dom_href("/path"), dom_class("link"), dom_id("go")],
+        [dom_text("click here")])
+    println("  anchor:      " + dom_render(e))
+
+    # Void element — NO closing tag (HTML5 correctness)
+    let v: DomNode = dom_void("br", [dom_id("first-break")])
+    println("  br:          " + dom_render(v))
+    println("")
+    return
+}
+
+# ============================================================================
+# Section 2 — boolean attributes (HTML5 form)
+# ============================================================================
+
+fn demo_boolean_attrs() -> void uses IO {
+    println("--- Section 2: boolean attributes ---")
+    # A present boolean attribute — emits just the name (no ="" value)
+    let present: DomNode = dom_void("input",
+        [dom_type_attr("checkbox"), dom_attr_true("checked"), dom_name_attr("agree")])
+    println("  present:     " + dom_render(present))
+
+    # An absent boolean attribute — omitted entirely
+    let absent: DomNode = dom_void("input",
+        [dom_type_attr("checkbox"), dom_attr_false("checked"), dom_name_attr("skip")])
+    println("  absent:      " + dom_render(absent))
+
+    # Boolean attribute on a non-void element (e.g. <details open>)
+    let details_open: DomNode = dom_details(
+        [dom_attr_true("open")],
+        [dom_summary("Click to expand", []), dom_p("hidden until open", [])])
+    println("  details:     " + dom_render(details_open))
+    println("")
+    return
+}
+
+# ============================================================================
+# Section 3 — element shorthand builders (the common HTML5 surface)
+# ============================================================================
+
+fn demo_element_builders() -> void uses IO {
+    println("--- Section 3: element shorthand builders ---")
+    let page: DomNode = dom_fragment([
+        # Sectioning
+        dom_header([], [dom_h1("Site title", [])]),
+        dom_nav([], [dom_a("/", "Home", []), dom_a("/about", "About", [])]),
+        dom_main([], [
+            # Headings
+            dom_h2("Section", []),
+            # Text content
+            dom_p("A paragraph with <em>HTML</em> chars: & < > \" ' /", []),
+            dom_div([dom_class("container")], [dom_text("in a div")]),
+            # Lists
+            dom_ul([], [
+                dom_li("first", []),
+                dom_li_nodes([], [dom_text("second "), dom_strong("bold", [])])
+            ]),
+            dom_ol([dom_type_attr("A")], [dom_li("ordered", [])]),
+            # Inline text
+            dom_p_nodes([], [
+                dom_text("mixed "),
+                dom_a("/x", "link", [dom_class("external")]),
+                dom_text(" and "),
+                dom_em("em", []),
+                dom_text(" and "),
+                dom_code("code()", [])
+            ]),
+            # Tables
+            dom_table([], [
+                dom_thead([], [dom_tr([], [
+                    dom_th("Name", []), dom_th("Age", [])
+                ])]),
+                dom_tbody([], [
+                    dom_tr([], [dom_td("Alice", []), dom_td("30", [])]),
+                    dom_tr([], [dom_td("Bob", []), dom_td("25", [])])
+                ])
+            ]),
+            # Forms
+            dom_form("/submit", [dom_class("subscribe")], [
+                dom_label("email", "Email", []),
+                dom_input([dom_type_attr("email"), dom_name_attr("email"),
+                    dom_placeholder("you@example.com"),
+                    dom_attr_true("required")]),
+                dom_button("Subscribe", [dom_type_attr("submit")])
+            ]),
+            # Media
+            dom_figure([], [
+                dom_img("/image.png", "An image", [dom_class("responsive")]),
+                dom_figcaption("Caption", [])
+            ]),
+            # Blockquote
+            dom_blockquote([], [dom_text("Safety is not optional.")])
+        ]),
+        dom_footer([], [dom_p("Copyright 2026", [])])
+    ])
+    println("  render:")
+    let lines: list[str] = dom_render(page).split("><")
+    let mut i: int = 0
+    while i < lines.len() {
+        if i == 0 {
+            println("    " + lines.get(i) + ">")
+        } else if i < lines.len() - 1 {
+            println("    >" + lines.get(i) + ">")
+        } else {
+            println("    >" + lines.get(i))
+        }
+        i = i + 1
+    }
+    println("")
+    return
+}
+
+# ============================================================================
+# Section 4 — document helpers (the common full-HTML-page case)
+# ============================================================================
+
+fn demo_documents() -> void uses IO {
+    println("--- Section 4: document helpers ---")
+    # Minimal document — just a title and body children
+    let minimal: DomNode = dom_html_document("Hello", [dom_p("world", [])])
+    println("  minimal:")
+    println("    " + dom_render(minimal))
+    println("")
+
+    # Full document — meta tags, links, scripts, body attrs
+    let full: DomNode = dom_html_document_with_head(
+        "Halis Stage 74 — std.dom demo",
+        [
+            dom_meta([dom_charset("utf-8")]),
+            dom_meta([
+                dom_attr("name", "viewport"),
+                dom_attr("content", "width=device-width, initial-scale=1")
+            ]),
+            dom_link([dom_rel("stylesheet"), dom_href("/static/app.css")]),
+            dom_script_src("/static/app.js"),
+            # Inline script with a `</script>` inside a JS string — rewritten
+            # to `<\/script>` to prevent premature element termination.
+            dom_script_inline("var payload = '</script><img src=x onerror=alert(1)> '; console.log(payload);"),
+            # Inline style with `</style>` inside a CSS comment — rewritten
+            dom_style_inline("body { color: red; } /* </style> */")
+        ],
+        [dom_class("page"), dom_lang("en")],
+        [
+            dom_header([], [dom_h1("Welcome", [])]),
+            dom_main([], [dom_p("Halis is a high-security, self-hosting, native-compiled language.", [])]),
+            dom_footer([], [dom_p("Copyright 2026 — Halis project", [])])
+        ])
+    let out: str = dom_render(full)
+    println("  full document (first 200 bytes):")
+    println("    " + out.slice(0, 200) + "...")
+    # Verify the inline-script rewrite happened
+    if out.contains("<\\/script>") {
+        println("    [OK] inline script rewrite: `</script>` -> `<\\/script>`")
+    } else {
+        println("    [BUG] inline script rewrite did NOT happen")
+    }
+    if out.contains("<\\/style>") {
+        println("    [OK] inline style rewrite: `</style>` -> `<\\/style>`")
+    } else {
+        println("    [BUG] inline style rewrite did NOT happen")
+    }
+    println("")
+    return
+}
+
+# ============================================================================
+# Section 5 — immutable mutators (copy-then-return)
+# ============================================================================
+
+fn demo_immutable_mutators() -> void uses IO {
+    println("--- Section 5: immutable mutators ---")
+    # Build a base element
+    let base: DomNode = dom_element("div", [dom_class("card")], [dom_text("original")])
+    println("  base:        " + dom_render(base))
+
+    # dom_with_attr — append an attribute (returns a NEW node)
+    let with_id: DomNode = dom_with_attr(base, dom_id("main"))
+    println("  with_id:     " + dom_render(with_id))
+    # Base is unchanged (immutability)
+    println("  base again:  " + dom_render(base) + "  (unchanged)")
+
+    # dom_with_child — append a child
+    let with_child: DomNode = dom_with_child(base, dom_text(" + appended"))
+    println("  with_child:  " + dom_render(with_child))
+
+    # dom_attr_set — replace an existing attribute (preserves position)
+    let with_class: DomNode = dom_attr_set(with_id, "class", "banner")
+    println("  set class:   " + dom_render(with_class))
+
+    # dom_attr_set — append a new attribute
+    let with_title: DomNode = dom_attr_set(with_class, "title", "tooltip")
+    println("  set title:   " + dom_render(with_title))
+
+    # dom_attr_remove — remove an attribute
+    let without_id: DomNode = dom_attr_remove(with_title, "id")
+    println("  remove id:   " + dom_render(without_id))
+    println("")
+    return
+}
+
+# ============================================================================
+# Section 6 — introspection (statistics + describe)
+# ============================================================================
+
+fn demo_introspection() -> void uses IO {
+    println("--- Section 6: introspection ---")
+    let doc: DomNode = dom_html_document("Stats", [
+        dom_h1("Title", []),
+        dom_p("Para", []),
+        dom_ul([], [dom_li("a", []), dom_li("b", [])]),
+        dom_br(),
+        dom_img("/x.png", "pic", [])
+    ])
+    println("  total node count:    " + dom_node_count(doc).to_str())
+    println("  element count:       " + dom_count_by_kind(doc, dom_kind_element()).to_str())
+    println("  void count:          " + dom_count_by_kind(doc, dom_kind_void()).to_str())
+    println("  text count:          " + dom_count_by_kind(doc, dom_kind_text()).to_str())
+    println("  comment count:       " + dom_count_by_kind(doc, dom_kind_comment()).to_str())
+    println("  doctype count:       " + dom_count_by_kind(doc, dom_kind_doctype()).to_str())
+    println("  fragment count:      " + dom_count_by_kind(doc, dom_kind_fragment()).to_str())
+    println("  describe AST:")
+    let lines: list[str] = dom_describe(doc).split("\n")
+    let mut i: int = 0
+    while i < lines.len() {
+        if lines.get(i).len() > 0 {
+            println("    " + lines.get(i))
+        }
+        i = i + 1
+    }
+    println("")
+    return
+}
+
+# ============================================================================
+# Section 7 — XSS hardening (the security model)
+# ============================================================================
+
+fn demo_xss_hardening() -> void uses IO {
+    println("--- Section 7: XSS hardening ---")
+    let payload: str = "<script>alert('xss')</script>"
+
+    # 1. Text node — escaped by default
+    println("  text payload:        " + dom_render(dom_text(payload)))
+    println("    (script tags escaped — no execution)")
+
+    # 2. Attribute value — escaped too
+    let attr_evil: DomNode = dom_element("div",
+        [dom_class("\">" + payload), dom_id("x")], [])
+    println("  attr payload:        " + dom_render(attr_evil))
+    println("    (attribute injection blocked)")
+
+    # 3. Raw node — explicit opt-in (caller responsibility)
+    let raw_trusted: DomNode = dom_raw("<b>trusted server markup</b>")
+    println("  raw (trusted):       " + dom_render(raw_trusted))
+    println("    (verbatim — opt-in only)")
+
+    # 4. Comment breakout blocked
+    let breakout: DomNode = dom_comment("end --> malicious")
+    println("  comment breakout:    " + dom_render(breakout))
+    println("    (`-->` inside rewritten — no premature close)")
+
+    # 5. Inline script body — `</script>` is rewritten to `<\\/script>`
+    let inline: DomNode = dom_script_inline("var s = '</script>';")
+    let rendered: str = dom_render(inline)
+    println("  inline script:       " + rendered)
+    if rendered.contains("<\\/script>") {
+        println("    [OK] `</script>` inside JS rewritten")
+    } else {
+        println("    [BUG] rewrite missing")
+    }
+    println("")
+    return
+}
+
+# ============================================================================
+# Section 8 — HTTP integration
+# ============================================================================
+
+fn demo_http() -> void uses IO {
+    println("--- Section 8: HTTP integration ---")
+    let page: DomNode = dom_html_document("Hi", [dom_p("world", [])])
+    let resp: HttpResponse = dom_html_response_ok(page)
+    println("  status:    " + resp.status.to_str())
+    println("  reason:    " + resp.reason)
+    println("  body bytes:" + resp.body.len().to_str())
+    let mut i: int = 0
+    while i < resp.headers.len() {
+        let h: HttpHeader = resp.headers.get(i)
+        println("  header:    " + h.name + ": " + h.value)
+        i = i + 1
+    }
+    println("  body first 60 bytes: " + resp.body.slice(0, 60))
+    println("")
+    return
+}
+
+# ============================================================================
+# Section 9 — end-to-end realistic page
+# ============================================================================
+
+fn demo_end_to_end() -> void uses IO {
+    println("--- Section 9: end-to-end realistic page ---")
+    let page: DomNode = dom_html_document_with_head(
+        "Halis — Stage 74 demo",
+        [
+            dom_meta([dom_charset("utf-8")]),
+            dom_meta([
+                dom_attr("name", "viewport"),
+                dom_attr("content", "width=device-width, initial-scale=1")
+            ]),
+            dom_meta([
+                dom_attr("name", "description"),
+                dom_attr("content", "Halis is a high-security, self-hosting language")
+            ]),
+            dom_link([dom_rel("stylesheet"), dom_href("/static/main.css")]),
+            dom_script_src("/static/main.js")
+        ],
+        [dom_class("landing"), dom_lang("en")],
+        [
+            dom_header([], [
+                dom_nav([dom_aria("label", "Main")], [
+                    dom_a("/", "Home", []),
+                    dom_a("/docs", "Docs", [dom_class("active")]),
+                    dom_a("/download", "Download", [])
+                ])
+            ]),
+            dom_main([], [
+                dom_section([dom_id("hero")], [
+                    dom_h1("Halis", []),
+                    dom_p("Safety is not optional.", [dom_class("tagline")]),
+                    dom_a("/download", "Get started", [dom_class("cta"),
+                        dom_role("button")])
+                ]),
+                dom_section([dom_id("features")], [
+                    dom_h2("Features", []),
+                    dom_ul([], [
+                        dom_li("I/O as an effect (compile-time guarantee)", []),
+                        dom_li("Checked arithmetic (no undefined behaviour)", []),
+                        dom_li("No null, no uninitialised data", []),
+                        dom_li("Memory safety without GC", []),
+                        dom_li("Self-hosting compiler (deterministic bootstrap)", [])
+                    ])
+                ]),
+                dom_section([dom_id("example")], [
+                    dom_h2("Example program", []),
+                    dom_pre([], [dom_code(
+                        "fn main() -> int uses IO {\n    println(\"Hello, Halis!\")\n    return 0\n}",
+                        [])])
+                ]),
+                dom_section([dom_id("subscribe")], [
+                    dom_h2("Stay informed", []),
+                    dom_p("Subscribe to the low-traffic announcements list.", []),
+                    dom_form("/subscribe", [], [
+                        dom_label("email", "Email", []),
+                        dom_input([dom_type_attr("email"), dom_name_attr("email"),
+                            dom_placeholder("you@example.com"),
+                            dom_attr_true("required")]),
+                        dom_button("Subscribe", [dom_type_attr("submit")])
+                    ])
+                ])
+            ]),
+            dom_footer([], [
+                dom_p("Copyright 2026 — Halis project", [dom_class("small")])
+            ])
+        ])
+    let out: str = dom_render(page)
+    println("  rendered bytes:      " + out.len().to_str())
+    println("  total nodes:        " + dom_node_count(page).to_str())
+    println("  element nodes:      " + dom_count_by_kind(page, dom_kind_element()).to_str())
+    println("  text nodes:         " + dom_count_by_kind(page, dom_kind_text()).to_str())
+    println("  void nodes:         " + dom_count_by_kind(page, dom_kind_void()).to_str())
+    println("  fragment nodes:     " + dom_count_by_kind(page, dom_kind_fragment()).to_str())
+    println("  doctype nodes:      " + dom_count_by_kind(page, dom_kind_doctype()).to_str())
+    println("  first 80 bytes:     " + out.slice(0, 80))
+    println("  last 80 bytes:      " + out.slice(out.len() - 80, out.len()))
+    println("")
+    return
+}
+
+# ============================================================================
+# Dispatcher
+# ============================================================================
+
+fn main() -> int uses IO {
+    println("============================================")
+    println("Stage 74 (v0.93.0-alpha): std.dom demo")
+    println("============================================")
+    println("")
+    demo_basic()
+    demo_boolean_attrs()
+    demo_element_builders()
+    demo_documents()
+    demo_immutable_mutators()
+    demo_introspection()
+    demo_xss_hardening()
+    demo_http()
+    demo_end_to_end()
+    println("============================================")
+    println("Stage 74 demo: all sections complete.")
+    println("============================================")
+    return 0
+}
