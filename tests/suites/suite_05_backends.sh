@@ -486,6 +486,57 @@ else
     bad "wasm24: tools/hlserve.py import failed"
 fi
 
+# (i-bis) Stage 75 (v0.94.0-alpha): the new modular hlserve_parts/
+# package is importable, the Stage 24 surface is preserved
+# (compile_bundle / FileWatcher / EventBus / DevHTTPHandler /
+# DevServer), and the new CLI flags are accepted. The dev server
+# is now the webpack-dev-server equivalent (WebSocket HMR, error
+# overlay, SPA fallback, HTTP proxy, HTTPS, gzip, public dir).
+if python3 -c "
+import sys
+sys.path.insert(0, 'tools')
+import hlserve
+# Stage 24 compat surface.
+assert hasattr(hlserve, 'main'), 'missing main'
+assert hasattr(hlserve, 'compile_bundle'), 'missing compile_bundle'
+assert hasattr(hlserve, 'FileWatcher'), 'missing FileWatcher'
+assert hasattr(hlserve, 'EventBus'), 'missing EventBus'
+assert hasattr(hlserve, 'DevHTTPHandler'), 'missing DevHTTPHandler'
+assert hasattr(hlserve, 'DevServer'), 'missing DevServer'
+# Stage 75 new modules are importable as top-level modules.
+sys.path.insert(0, 'tools/hlserve_parts')
+import hlserve_cli, hlserve_common, hlserve_config, hlserve_watcher
+import hlserve_compiler, hlserve_hmr, hlserve_overlay, hlserve_proxy
+import hlserve_tls, hlserve_server
+# CLI parser accepts the new flags.
+ap = hlserve_cli.build_arg_parser()
+args = ap.parse_args(['--open', '--https', '--proxy', '/api=http://localhost:3001'])
+assert args.open is True
+assert args.https is True
+assert args.proxy == ['/api=http://localhost:3001']
+print('OK')
+" 2>&1 | grep -q OK; then
+    ok "wasm75: hlserve Stage 24 surface preserved + 10 new modules + new CLI flags"
+else
+    bad "wasm75: hlserve Stage 75 surface check failed"
+fi
+
+# (i-ter) Stage 75: the serve-acceptance smoke test passes end-to-end
+# (imports, config TOML/JSON, WebSocket handshake + frames, FileWatcher,
+# compiler diagnostic parsing, overlay, proxy lookup, real HTTP server,
+# real WS handshake round-tripping the hello JSON frame).
+if make serve-acceptance >"$TMP/serve_acc75.log" 2>&1; then
+    if grep -q "ACCEPTANCE OK: Stage 75" "$TMP/serve_acc75.log"; then
+        ok "wasm75: make serve-acceptance runs end-to-end (10 test sections)"
+    else
+        bad "wasm75: make serve-acceptance did not print ACCEPTANCE OK"
+        tail -5 "$TMP/serve_acc75.log"
+    fi
+else
+    bad "wasm75: make serve-acceptance failed"
+    tail -15 "$TMP/serve_acc75.log"
+fi
+
 echo ""
 echo "=== 13. Stage 25: AArch64 backend tuning (NEON + PAC + BTI) ==="
 # Stage 25 (v0.44.0-alpha): the NEON intrinsic emission in src/hlc.hls

@@ -204,12 +204,37 @@ webapp-acceptance:
 
 # serve: start the hls serve dev server with live reload.
 # Usage: make serve [F=examples/hello.hls] [PORT=8080]
+# Stage 75 (v0.94.0-alpha): the dev server is now the full
+# `webpack-dev-server` equivalent -- WebSocket HMR, error overlay,
+# SPA history fallback, HTTP proxy, HTTPS, gzip, public dir, --open.
+# The CLI surface is preserved (Stage 24 flags still work); new flags:
+#   --open --https --history-fallback --no-history-fallback
+#   --compress --no-compress --public-dir DIR
+#   --proxy PREFIX=TARGET --hot-reload --no-hot-reload
+#   --overlay --no-overlay --verbose --quiet --color --no-color
+#   --listen HOST:PORT --watch-dirs DIR --debounce-ms N
+#   --config FILE
+# A `hls.serve.toml` (or `hls.serve.json`) in the cwd is auto-detected
+# and used as the default config; CLI flags override.
 serve:
 	@test -n "$(F)" || F=examples/hello.hls; \
 	  if [ -z "$(PORT)" ]; then PORT=8080; fi; \
 	  $(PYTHON) tools/hlserve.py --input $$F --bundle out --port $$PORT
 
-.PHONY: wasm-opt webapp webapp-acceptance serve
+# serve-acceptance: Stage 75 gate. Verifies the new dev server's full
+# feature set end-to-end: import surface (Stage 24 compat), config file
+# parsing (TOML + JSON), WebSocket handshake (RFC 6455 Sec-WebSocket-
+# Accept), frame encode/decode, FileWatcher mtime detection, compiler
+# diagnostic parsing, overlay injection, proxy longest-prefix lookup,
+# real HTTP server (overlay / SPA fallback / public dir / source /
+# banner / gzip), and a real WebSocket handshake that round-trips the
+# hello JSON frame.
+serve-acceptance:
+	@echo "[Stage 75 acceptance] running tests/serve_acceptance.py..."
+	@$(PYTHON) tests/serve_acceptance.py
+	@echo "ACCEPTANCE OK: Stage 75 -- hls-serve (webpack-dev-server equivalent)"
+
+.PHONY: wasm-opt webapp webapp-acceptance serve serve-acceptance
 
 # ============================================================================
 # Stage 25 (v0.44.0-alpha): AArch64 backend tuning (NEON + PAC + BTI)
