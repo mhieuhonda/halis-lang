@@ -122,7 +122,7 @@ remains green.
 | 72 | `std.openapi` — generate OpenAPI 3.1 from handler types | ✅ | (done in v0.91.0-alpha) |
 | 73 | `std.jsffi` — bind to JavaScript globals from `wasm32` | ✅ | (done in v0.92.0-alpha) |
 | 74 | `std.dom` — server-side rendering (no client JS needed) | ✅ | (done in v0.93.0-alpha) |
-| 75 | `hls-serve` — `webpack-dev-server` equivalent for HLS | ⬜ | 5 weeks |
+| 75 | `hls-serve` — `webpack-dev-server` equivalent for HLS | ✅ | 5 weeks (done in v0.94.0-alpha) |
 | 76 | `hls-wasm-pack` — publish-ready wasm + JS glue | ⬜ | 4 weeks |
 
 ### Phase VI — OS development foundation (Stages 77–96)
@@ -8517,3 +8517,211 @@ public API surface — basic nodes, boolean attributes, ~30 element
 shorthand builders, document helpers, immutable mutators,
 introspection, XSS hardening, HTTP integration, and a complete
 realistic landing page.
+
+---
+
+## STAGE 75 — `hls-serve` — webpack-dev-server equivalent ✅ (release v0.94.0-alpha)
+
+**Goal:** a `webpack-dev-server` equivalent for Halis web apps.
+Watches `.hls` files, recompiles on change, serves the result on
+`localhost:3000`, hot-reloads the browser tab.
+
+**Status (v0.94.0-alpha):** Stage 75 is **COMPLETE**. The Stage 24
+`tools/hlserve.py` was a minimal SSE-based live-reload server (~515
+lines, 1 file) that watched `.hls` files, recompiled on save, and
+pushed a `reload` event to the browser via Server-Sent Events. Stage
+75 elevates it to a full `webpack-dev-server` equivalent by:
+
+1. **Modularising** the implementation into `tools/hlserve_parts/`
+   (10 focused modules, mirroring the `tools/hlwasm_parts/` pattern
+   from Stage 70). The original `tools/hlserve.py` is now a thin
+   facade that re-exports the Stage 24 public API (`main`,
+   `compile_bundle`, `FileWatcher`, `EventBus`, `DevHTTPHandler`,
+   `DevServer`) so the existing `make serve` target and the
+   `suite_05_backends.sh` import test keep working unchanged.
+
+2. **Adding seven new major capabilities:**
+   - **WebSocket HMR (RFC 6455)** — replaces the SSE endpoint with
+     a bi-directional socket at `/ws`. The browser can push
+     `console.log` and uncaught errors back to the dev server's
+     terminal (the Stage 24 SSE was server-to-client only).
+   - **Compile-error overlay** — a self-contained CSS+JS overlay
+     injected into every served HTML page. Shows a modal with
+     file:line + severity + message on compile failure;
+     auto-dismisses on the next clean compile.
+   - **SPA history fallback** — non-asset paths (e.g. `/users/42`)
+     serve `index.html` so client-side routes work in a Halis SPA
+     (webpack-dev-server's `historyApiFallback` equivalent).
+   - **HTTP reverse proxy** — `--proxy /api=http://localhost:3001`
+     forwards matching requests to a backend dev server.
+     Longest-prefix match (`/api/v2` beats `/api`).
+   - **HTTPS with self-signed cert** — `--https` generates an
+     ephemeral RSA-2048 cert valid for `localhost` + `127.0.0.1`
+     (uses the optional `cryptography` package; falls back to
+     plain HTTP with a warning if not installed — no new hard
+     dependency).
+   - **gzip compression** — responses > 1 KB are gzipped when the
+     client sends `Accept-Encoding: gzip` (skips `application/wasm`
+     to avoid double-compression overhead).
+   - **Public static dir** — `--public-dir ./public` serves static
+     assets at `/static/*`.
+
+3. **Adding a TOML config-file layer** — `hls.serve.toml` (or
+   `hls.serve.json`) is auto-detected in the cwd; CLI flags override.
+   Uses stdlib `tomllib` on Python 3.11+; falls back to JSON parsing
+   on older Pythons.
+
+4. **Adding 13 new CLI flags** — `--listen`, `--open`, `--https`,
+   `--history-fallback`/`--no-history-fallback`, `--compress`/
+   `--no-compress`, `--public-dir`, `--proxy` (multi),
+   `--hot-reload`/`--no-hot-reload`, `--overlay`/`--no-overlay`,
+   `--verbose`, `--quiet`, `--color`/`--no-color`, `--watch-dirs`
+   (multi), `--debounce-ms`, `--config`, `--version`. All Stage 24
+   flags are preserved unchanged.
+
+5. **Hot reload (wasm module swap)** — on a successful recompile,
+     the browser receives a `hot-reload` event with the new wasm
+     URL. The overlay JS fetches the new wasm and calls
+     `Halis.hotReload(bytes)` (if defined; falls back to full page
+     reload). This preserves the JS-side state (counters, form
+     input, scroll position) across a code change — the same UX as
+     webpack-dev-server's HMR for JS modules.
+
+6. **Console forwarding** — the overlay hooks
+     `console.log/warn/error` and forwards each call to the dev
+     server over the WebSocket `log` channel. The dev server prints
+     them in its terminal (prefixed with `[client <id>:<level>]`)
+     so the user can see their wasm program's stdout without
+     switching to the browser DevTools.
+
+**Acceptance criteria (met):**
+
+- ✅ Watches `.hls` files and recompiles on change (debounced 200 ms).
+- ✅ Serves the result on `localhost:3000` (default port — the
+  roadmap's promise; the Stage 24 default was 8080).
+- ✅ Hot-reloads the browser tab — both via full page reload (the
+  Stage 24 behaviour) AND via wasm module swap (new Stage 75).
+- ✅ Compile-error overlay (file:line + severity + message).
+- ✅ WebSocket HMR (RFC 6455 — the `Sec-WebSocket-Accept` header
+  matches the spec's example key/value pair, verified by the
+  acceptance test).
+- ✅ SPA history fallback (non-asset paths serve `index.html`).
+- ✅ HTTP reverse proxy (`--proxy PREFIX=TARGET`).
+- ✅ HTTPS with self-signed cert (`--https`).
+- ✅ gzip compression (`--compress`).
+- ✅ Public static dir (`--public-dir`).
+- ✅ Auto-open browser (`--open`).
+- ✅ TOML config file (`hls.serve.toml`).
+- ✅ Stage 24 surface preserved exactly — `make serve`, the
+  `suite_05_backends.sh` import test, and the public API are all
+  unchanged.
+- ✅ No new hard dependencies (cryptography is optional; falls back
+  gracefully).
+- ✅ The Stage 27 deep-scan-18 path-traversal defence is carried
+  over (realpath-based symlink-traversal blocking).
+
+**Shipped in v0.94.0-alpha (Stage 75):**
+
+- `tools/hlserve_parts/__init__.py` — package marker.
+- `tools/hlserve_parts/hlserve_common.py` — repo-root resolution,
+  ANSI-colour timestamped logger, shared constants (HMR protocol
+  version, default ports, ignore-dirs, server banner).
+- `tools/hlserve_parts/hlserve_config.py` — `hls.serve.toml` /
+  `hls.serve.json` reader, `ServeConfig` dataclass, `ProxyRule`
+  validator, CLI-args-override-config merge.
+- `tools/hlserve_parts/hlserve_watcher.py` — debounced multi-
+  directory mtime poller with ignore patterns (skips `.git`,
+  `node_modules`, `target`, etc.) and thread-safe stop.
+- `tools/hlserve_parts/hlserve_compiler.py` — wraps
+  `hlwasm.compile_program`, parses the compiler's stderr into
+  structured `CompileError` records (file/line/col/severity/
+  message) for the overlay; measures `elapsed_ms`.
+- `tools/hlserve_parts/hlserve_hmr.py` — RFC 6455 WebSocket
+  server + HMR message bus. Implements handshake response
+  (`base64(sha1(key + GUID))`), frame encode/decode (7/16/64-bit
+  payload lengths, masking, opcodes text/binary/close/ping/pong),
+  per-client read loop, broadcast.
+- `tools/hlserve_parts/hlserve_overlay.py` — self-contained CSS+JS
+  overlay injected before `</body>`. Modal with file:line +
+  severity, status footer, console forwarder, error catcher, WS
+  auto-reconnect, wasm hot-swap.
+- `tools/hlserve_parts/hlserve_proxy.py` — minimal HTTP reverse
+  proxy (longest-prefix match, urllib, 32 KB chunked reads,
+  X-Forwarded-* headers, 502 on upstream failure).
+- `tools/hlserve_parts/hlserve_tls.py` — optional self-signed cert
+  (RSA-2048, `cryptography` optional, falls back to HTTP).
+- `tools/hlserve_parts/hlserve_server.py` — `HlsDevHTTPHandler`
+  + `HlsDevServer`. Routes `/`, `/ws`, `/static/*`, `/source`,
+  proxy dispatch, SPA fallback, bundle files (realpath-based
+  traversal defence), gzip compression, `Cache-Control: no-store`,
+  HTTP/1.1 keep-alive.
+- `tools/hlserve_parts/hlserve_cli.py` — argparse + main()
+  orchestrator. 13 new flags; loads `hls.serve.toml`; CLI
+  overrides; `--open` waits for port + opens browser; cleanup on
+  Ctrl+C.
+- `tools/hlserve.py` — rewritten as a thin 80-line facade that
+  re-exports the Stage 24 public API (preserves backward
+  compatibility).
+- `tests/serve_acceptance.py` — new Stage 75 acceptance gate (10
+  sections, 50+ assertions, runs end-to-end via `make
+  serve-acceptance`).
+- `mk/40-backends.mk` — adds `serve-acceptance` target; updates
+  the `serve` target's docstring with the new flags.
+- `Makefile` — adds `serve-acceptance` to the `.PHONY` list.
+- `tests/suites/suite_05_backends.sh` — adds 2 new checks
+  (`wasm75: hlserve Stage 24 surface preserved + 10 new modules +
+  new CLI flags` and `wasm75: make serve-acceptance runs
+  end-to-end`).
+- `examples/hls_serve_demo.hls` — demo web app that exercises the
+  Stage 73 `std.jsffi` surface; designed to be served with
+  `make serve F=examples/hls_serve_demo.hls PORT=3000` and edited
+  to test HMR / overlay / SPA fallback.
+- `CHANGELOG.md` — v0.94.0-alpha entry added.
+- `ROADMAP.md` — Stage 75 marked ✅.
+- `README.md` — feature list bumped to mention Stage 75.
+
+**Acceptance** (`make serve-acceptance`): runs
+`tests/serve_acceptance.py` — 10 sections, 50+ assertions, all
+PASS:
+
+1. Import surface — Stage 24 surface + 10 new modules importable.
+2. CLI parser — all new flags accepted.
+3. Config file — TOML + JSON parse into `ServeConfig` with proxy
+   rules, watch dirs, debounce; `ProxyRule` scheme validation.
+4. WebSocket protocol — handshake response produces the RFC 6455
+   spec's example accept key (`s3pPLMBiTxaQ9kYGzzhZRbK+xOo=`);
+   frame encode produces the correct FIN/opcode/length bytes for
+   small (5-byte) and large (200-byte) payloads.
+5. FileWatcher — fires on mtime change but not on seeded files;
+   correctly reports the changed file path.
+6. Compiler diagnostic parsing — 3 regex forms (`path:line:col:
+   sev`, `path:line: sev`, `path:line:`); `CompileError` overlay
+   dict shape is correct.
+7. Overlay injection — snippet placed before `</body>`; status
+   banner injected on failed compile; `overlay_enabled=False`
+   leaves HTML unchanged.
+8. Proxy rule lookup — longest-prefix wins (`/api/v2` beats
+   `/api`); no match returns None; exact prefix matches.
+9. End-to-end HTTP — real `HlsDevServer` on a free port: GET /
+   returns 200 + overlay injected; GET /out.wasm returns wasm
+   magic + `application/wasm` Content-Type; GET /static/logo.svg
+   serves from public dir + `image/svg+xml` Content-Type; GET
+   /deep/route falls back to index.html; GET /source serves the
+   HLS source; gzip Content-Encoding on responses > 1 KB;
+   failed-compile banner injected.
+10. End-to-end WebSocket — raw socket, manual handshake, reads
+    the `hello` JSON frame; verifies `version=1`, `server` field
+    contains `hls-serve`, `client_id` is an int, `time` is a
+    float.
+
+**Demo** (`examples/hls_serve_demo.hls`): a minimal Halis web
+app that exercises the Stage 73 `std.jsffi` surface. Declares a
+`Counter` struct for the auto-marshalling descriptors, defines
+`jsffi_on_callback` with two callback ids (ping/describe), times
+startup with `js_now_ms()`, and prints its callback protocol.
+Designed to be served with `make serve F=examples/hls_serve_demo.hls
+PORT=3000` — edit the file and save to test HMR (the wasm
+re-instantiates without a full page reload), introduce a syntax
+error to test the error overlay, visit `/deep/route` to test SPA
+fallback.
+
