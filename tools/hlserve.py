@@ -1,513 +1,84 @@
 #!/usr/bin/env python3
-"""hlserve.py — Stage 24 (v0.43.0-alpha): ``hls serve`` dev server.
+"""hlserve.py — Stage 75 (v0.94.0-alpha): ``hls serve`` dev server.
 
-A lightweight HTTP server + file watcher that re-compiles an HLS
-program to wasm on every ``.hls`` save and pushes the new bundle to
-the browser via Server-Sent Events (SSE) for live reload.
+The webpack-dev-server equivalent for Halis web apps. Watches ``.hls``
+files, recompiles on change, serves the result on ``localhost:3000``,
+hot-reloads the browser tab.
 
-Features:
-  * Watches ``.hls`` files in the cwd (and ``std/`` if present) for
-    changes; debounces 200 ms to avoid re-compiling mid-keystroke.
-  * Re-runs ``hlwasm`` on change (with the same ``--wasm-opt`` /
-    ``--glue`` / ``--target`` flags as the initial compile).
-  * Serves the bundle (``.wasm``, ``.js``, ``.html``) and the source
-    ``.hls`` files at ``/`` (browse to ``http://localhost:PORT/``).
-  * An SSE endpoint at ``/events`` pushes a ``reload`` event whenever
-    the bundle is re-compiled. The HTML runner auto-subscribes and
-    reloads on the event.
-  * Injects a small SSE-listener snippet into the served HTML so the
-    page auto-reloads.
+This is the public entrypoint. Implementation split into the
+``tools/hlserve_parts/`` package (mirrors the Stage 70 ``tools/
+hlwasm_parts/`` pattern). This module re-exports the original Stage 24
+public API (``main``, ``compile_bundle``, ``FileWatcher``, ``EventBus``,
+``DevHTTPHandler``, ``DevServer``) so existing callers (e.g. the Stage
+24 ``make serve`` target, the ``suite_05_backends.sh`` import test,
+``tools/hlwasm_parts/hwasm_glue_cli._start_dev_server``) keep working
+unchanged.
 
-Usage:
-  python3 tools/hlserve.py [--port PORT] [--bundle OUT_BASE] \\
-                            [--input FILE] [--target TRIPLE] \\
-                            [--wasm-opt auto|on|off] [--glue compact|verbose]
+Stage 75 features (new since Stage 24):
 
-  --port PORT       listen on this port (default 8080)
-  --bundle OUT_BASE  the output base path (default: ./out)
-  --input FILE      the .hls file to compile (default: examples/hello.hls)
-  --target TRIPLE   target triple (default: wasm32-unknown-unknown)
-  --wasm-opt MODE    optimization mode (default: auto)
-  --glue STYLE      glue style (default: compact)
+* **WebSocket HMR** — replaces the SSE endpoint with a bi-directional
+  RFC 6455 socket at ``/ws``. The browser can push ``console.log``
+  and uncaught errors back to the dev server.
+* **Hot reload** — the wasm module is hot-swapped in-place (the JS
+  glue keeps its state). Full reload only when the glue JS itself
+  changes.
+* **Compile-error overlay** — a self-contained CSS+JS overlay is
+  injected into every served HTML page; pops up on compile failure
+  with file:line + severity, auto-dismisses on the next clean
+  compile.
+* **SPA history fallback** — non-asset paths serve ``index.html``
+  (so client-side routes like ``/users/42`` work in a Halis SPA).
+* **HTTP reverse proxy** — ``--proxy /api=http://localhost:3001``
+  forwards matching requests to a backend dev server.
+* **HTTPS with self-signed cert** — ``--https`` generates an
+  ephemeral RSA-2048 cert (requires the optional ``cryptography``
+  package).
+* **gzip compression** — responses > 1 KB are gzipped when the client
+  advertises ``Accept-Encoding: gzip``.
+* **Public static dir** — ``--public-dir ./public`` serves static
+  assets at ``/static/*``.
+* **Auto-open browser** — ``--open`` opens a browser tab once the
+  server is ready.
+* **TOML config** — ``hls.serve.toml`` (or ``hls.serve.json``) next
+  to the project root holds all options; CLI flags override.
 
-The server runs in the foreground; press Ctrl+C to stop.
+Stage 24 surface (preserved exactly):
+
+* ``python3 tools/hlserve.py --input F --bundle out --port P``
+* ``--target``, ``--wasm-opt``, ``--glue``, ``--watch``
+* Class exports: ``main``, ``compile_bundle``, ``FileWatcher``,
+  ``EventBus``, ``DevHTTPHandler``, ``DevServer``.
 """
 from __future__ import annotations
 
-import argparse
-import http.server
 import os
-import socketserver
 import sys
-import threading
-import time
-from typing import List
 
-# Repo root for resolving tools.
-_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if _REPO_ROOT not in sys.path:
-    sys.path.insert(0, _REPO_ROOT)
-_TOOLS_DIR = os.path.join(_REPO_ROOT, "tools")
-if _TOOLS_DIR not in sys.path:
-    sys.path.insert(0, _TOOLS_DIR)
+# Re-export the modular implementation.
+_PKG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "hlserve_parts")
+if _PKG_DIR not in sys.path:
+    sys.path.insert(0, _PKG_DIR)
 
+from hlserve_cli import main  # noqa: F401,E402
 
-# ============================================================================
-# File watcher — debounce + queue recompiles.
-# ============================================================================
+# Stage 24 API surface (re-exported for backward compatibility).
+# The new equivalents are in hlserve_parts; these thin wrappers exist
+# so ``tools/hlwasm_parts/hwasm_glue_cli._start_dev_server`` and any
+# downstream user code that imports them still works.
+from hlserve_watcher import FileWatcher  # noqa: F401,E402
+from hlserve_compiler import compile_once as compile_bundle  # noqa: F401,E402
 
-class FileWatcher(threading.Thread):
-    """Watch .hls files in the cwd (and std/) and trigger a recompile
-    when they change. Debounces 200 ms to batch multi-file saves."""
+# ``EventBus`` was the Stage 24 SSE bus. Stage 75 replaces it with the
+# WebSocket ``HmrBus``; we provide a thin compatibility shim so old
+# imports work — the shim simply re-exposes ``HmrBus`` as ``EventBus``.
+from hlserve_hmr import HmrBus as EventBus  # noqa: F401,E402
 
-    def __init__(self, watch_dirs: List[str], on_change,
-                 debounce_ms: int = 200):
-        super().__init__(daemon=True)
-        self.watch_dirs = watch_dirs
-        self.on_change = on_change
-        self.debounce = debounce_ms / 1000.0
-        self._mtimes: dict = {}
-        self._stop = False
-        self._pending = False
-        self._lock = threading.Lock()
-
-    def run(self):
-        # Deep-scan-15 defensive: `last_change` is only assigned inside
-        # the `if changed:` branch, but is read below in the
-        # `if self._pending and (time.time() - last_change) >= ...`
-        # check. The two are always assigned together (the `_pending`
-        # flag is only set to True alongside `last_change = now`), so
-        # the read is safe at runtime — but static analyzers (pylint
-        # E0606) can't track the correlation. Initialize to 0.0 so
-        # the variable is provably defined on every code path.
-        last_change = 0.0
-        while not self._stop:
-            now = time.time()
-            changed = self._scan()
-            if changed:
-                with self._lock:
-                    self._pending = True
-                    last_change = now
-            # Check if we should fire (debounce elapsed).
-            time.sleep(0.05)
-            with self._lock:
-                if self._pending and (time.time() - last_change) >= self.debounce:
-                    self._pending = False
-                    try:
-                        self.on_change()
-                    except Exception as e:
-                        sys.stderr.write("hlserve: recompile failed: %s\n" % e)
-
-    def _scan(self) -> bool:
-        """Walk the watch dirs; return True if any .hls file's mtime changed."""
-        changed = False
-        for d in self.watch_dirs:
-            if not os.path.isdir(d):
-                continue
-            for root, dirs, files in os.walk(d):
-                # Skip hidden dirs (.git, .hls-pkg-cache, etc.).
-                dirs[:] = [x for x in dirs if not x.startswith(".")]
-                for fn in files:
-                    if not fn.endswith(".hls"):
-                        continue
-                    full = os.path.join(root, fn)
-                    try:
-                        m = os.path.getmtime(full)
-                    except OSError:
-                        continue
-                    prev = self._mtimes.get(full)
-                    if prev is None:
-                        self._mtimes[full] = m
-                    elif m != prev:
-                        self._mtimes[full] = m
-                        changed = True
-                        sys.stderr.write("hlserve: change detected: %s\n" % full)
-        return changed
-
-    def stop(self):
-        self._stop = True
-
-
-# ============================================================================
-# Compiler — invoke hlwasm.compile_program.
-# ============================================================================
-
-def compile_bundle(input_hls: str, output_base: str, target: str,
-                   wasm_opt: str, glue: str) -> bool:
-    """Compile the bundle. Returns True on success, False on failure."""
-    try:
-        from hlwasm import compile_program  # type: ignore
-    except ImportError:
-        sys.stderr.write("hlserve: cannot import hlwasm\n")
-        return False
-    # Suppress hlwasm's stderr noise during recompile — we'll print our own.
-    import io
-    import contextlib
-    err_buf = io.StringIO()
-    try:
-        with contextlib.redirect_stderr(err_buf):
-            rc = compile_program(
-                input_hls, output_base,
-                target=target,
-                wasm_opt=wasm_opt,
-                glue_style=glue)
-        if rc != 0:
-            sys.stderr.write("hlserve: compile failed (rc=%d):\n" % rc)
-            sys.stderr.write(err_buf.getvalue())
-            return False
-        sys.stderr.write(err_buf.getvalue())
-        return True
-    except Exception as e:
-        sys.stderr.write("hlserve: compile failed: %s\n" % e)
-        return False
-
-
-# ============================================================================
-# SSE event bus — push reload events to subscribed clients.
-# ============================================================================
-
-class EventBus:
-    """A simple SSE event bus. Subscribers are HTTP handlers; the bus
-    pushes ``reload`` events to all subscribers."""
-
-    def __init__(self):
-        self.subscribers: List = []
-        self._lock = threading.Lock()
-
-    def subscribe(self, handler):
-        with self._lock:
-            self.subscribers.append(handler)
-
-    def unsubscribe(self, handler):
-        with self._lock:
-            try:
-                self.subscribers.remove(handler)
-            except ValueError:
-                pass
-
-    def push(self, event: str, data: str = ""):
-        with self._lock:
-            subs = list(self.subscribers)
-        for s in subs:
-            try:
-                s.send(event, data)
-            except Exception:
-                pass
-
-
-# ============================================================================
-# HTTP server — serve the bundle + SSE endpoint + injected HTML.
-# ============================================================================
-
-SSE_LISTENER_SNIPPET = """<script>
-// Stage 24 hls serve — live reload via SSE
-(function(){
-  if (typeof EventSource === 'undefined') return; // browser doesn't support SSE
-  var src = new EventSource('/events');
-  src.addEventListener('reload', function(ev){
-    console.log('[hls serve] reload event received');
-    location.reload();
-  });
-  src.addEventListener('compile-error', function(ev){
-    console.error('[hls serve] compile error:', ev.data);
-  });
-})();
-</script>
-"""
-
-
-class SSEHandler:
-    """A per-client SSE handler. Sends events on the open connection."""
-
-    def __init__(self, wfile):
-        self.wfile = wfile
-        self.alive = True
-
-    def send(self, event: str, data: str = ""):
-        if not self.alive:
-            return
-        # Deep-scan-20 fix (HIGH, SSE injection): SSE fields are
-        # line-delimited; a `\r` or `\n` in `event` would inject a
-        # bogus `event:` field, and `\r` in `data` (only `\n` was
-        # split) would inject a `data:` field. Reject CR/LF in event
-        # names; normalise CRLF/CR to LF in data.
-        if "\n" in event or "\r" in event:
-            raise ValueError("SSE event name must not contain CR/LF "
-                             "(would inject a bogus event field)")
-        safe_data = data.replace("\r\n", "\n").replace("\r", "\n")
-        try:
-            payload = "event: %s\n" % event
-            for line in safe_data.split("\n"):
-                payload += "data: %s\n" % line
-            payload += "\n"
-            self.wfile.write(payload.encode("utf-8"))
-            self.wfile.flush()
-        except (BrokenPipeError, OSError):
-            self.alive = False
-
-
-class DevHTTPHandler(http.server.BaseHTTPRequestHandler):
-    """HTTP handler that serves the bundle + the SSE endpoint."""
-
-    # Class-level (shared) event bus, set by DevServer.
-    event_bus: EventBus = EventBus()
-    bundle_dir: str = "."
-    bundle_base: str = "out"
-    input_hls: str = "examples/hello.hls"
-    last_compile_ok: bool = True
-
-    def log_message(self, fmt, *args):
-        # Suppress default access logging; print our own prefix.
-        sys.stderr.write("[hls serve] %s - %s\n" % (self.address_string(),
-                                                   fmt % args))
-
-    def do_GET(self):
-        if self.path == "/events":
-            return self._handle_sse()
-        if self.path == "/" or self.path == "/index.html":
-            return self._serve_html()
-        if self.path == "/source":
-            return self._serve_source()
-        # Serve a file from the bundle dir.
-        return self._serve_file()
-
-    def _serve_html(self):
-        html_path = os.path.join(self.bundle_dir,
-                                 self.bundle_base + ".html")
-        if not os.path.isfile(html_path):
-            self.send_response(404)
-            self.send_header("Content-Type", "text/plain")
-            self.end_headers()
-            self.wfile.write(b"404: bundle .html not found. Has the "
-                             b"initial compile completed?\n")
-            return
-        with open(html_path, "rb") as f:
-            data = f.read()
-        # Inject the SSE listener snippet before </body>.
-        if b"</body>" in data:
-            data = data.replace(b"</body>",
-                                SSE_LISTENER_SNIPPET.encode("utf-8")
-                                + b"</body>")
-        else:
-            data += SSE_LISTENER_SNIPPET.encode("utf-8")
-        # Add a status banner if the last compile failed.
-        if not self.last_compile_ok:
-            banner = (b'<div style="background:#fee;color:#800;border-bottom:'
-                      b'1px solid #800;padding:0.5rem;">[hls serve] last '
-                      b'compile FAILED - fix the error and save to reload.'
-                      b'</div>')
-            if b"<body" in data:
-                idx = data.find(b">", data.find(b"<body")) + 1
-                data = data[:idx] + banner + data[idx:]
-        self.send_response(200)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(data)))
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        self.wfile.write(data)
-
-    def _serve_file(self):
-        # Strip leading /.
-        path = self.path.lstrip("/")
-        # Disallow path traversal.
-        if ".." in path.split("/"):
-            self.send_response(400)
-            self.end_headers()
-            return
-        full = os.path.join(self.bundle_dir, path)
-        # Stage 27 perfection (v0.50.3-alpha) deep-scan-18: BUG-11 fix.
-        # The previous path-traversal check blocked literal `..` path
-        # components but did NOT call os.path.realpath / os.path.normpath
-        # on the resolved path. A symlink inside bundle_dir pointing
-        # outside (e.g. bundle_dir/foo -> /etc) was followed by open()
-        # without detection — exposing arbitrary host files via HTTP.
-        # The fix: resolve both paths to their canonical realpaths and
-        # verify the resolved file is still inside the (resolved)
-        # bundle dir.
-        try:
-            real_full = os.path.realpath(full)
-            real_bundle = os.path.realpath(self.bundle_dir)
-        except OSError:
-            self.send_response(404)
-            self.send_header("Content-Type", "text/plain")
-            self.end_headers()
-            self.wfile.write(("404: %s not found in bundle dir\n" % path)
-                             .encode("utf-8"))
-            return
-        # The resolved path must equal or be a child of the bundle dir.
-        # Use os.sep to avoid matching a sibling like bundle_dir_evil.
-        if real_full != real_bundle and not real_full.startswith(real_bundle + os.sep):
-            self.send_response(403)
-            self.send_header("Content-Type", "text/plain")
-            self.end_headers()
-            self.wfile.write(("403: %s resolves outside bundle dir "
-                              "(symlink traversal blocked)\n" % path)
-                             .encode("utf-8"))
-            return
-        if not os.path.isfile(real_full):
-            self.send_response(404)
-            self.send_header("Content-Type", "text/plain")
-            self.end_headers()
-            self.wfile.write(("404: %s not found in bundle dir\n" % path)
-                             .encode("utf-8"))
-            return
-        with open(real_full, "rb") as f:
-            data = f.read()
-        ct = self._guess_content_type(path)
-        self.send_response(200)
-        self.send_header("Content-Type", ct)
-        self.send_header("Content-Length", str(len(data)))
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        self.wfile.write(data)
-
-    def _serve_source(self):
-        # Serve the HLS source file as plain text (for in-browser viewing).
-        full = self.input_hls
-        if not os.path.isfile(full):
-            self.send_response(404)
-            self.end_headers()
-            return
-        with open(full, "rb") as f:
-            data = f.read()
-        self.send_response(200)
-        self.send_header("Content-Type", "text/plain; charset=utf-8")
-        self.send_header("Content-Length", str(len(data)))
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        self.wfile.write(data)
-
-    def _handle_sse(self):
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream")
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("Connection", "keep-alive")
-        self.end_headers()
-        handler = SSEHandler(self.wfile)
-        DevHTTPHandler.event_bus.subscribe(handler)
-        # Send an initial "hello" event so the client knows we're connected.
-        handler.send("hello", "hls serve connected")
-        try:
-            while handler.alive:
-                time.sleep(0.5)
-        except (BrokenPipeError, OSError):
-            pass
-        finally:
-            DevHTTPHandler.event_bus.unsubscribe(handler)
-
-    def _guess_content_type(self, path: str) -> str:
-        ext = os.path.splitext(path)[1].lower()
-        return {
-            ".html": "text/html; charset=utf-8",
-            ".js": "application/javascript; charset=utf-8",
-            ".wasm": "application/wasm",
-            ".json": "application/json; charset=utf-8",
-            ".css": "text/css; charset=utf-8",
-            ".png": "image/png",
-            ".jpg": "image/jpeg",
-            ".svg": "image/svg+xml",
-        }.get(ext, "application/octet-stream")
-
-
-class DevServer(socketserver.ThreadingTCPServer):
-    allow_reuse_address = True
-    daemon_threads = True
-
-
-# ============================================================================
-# Orchestrator.
-# ============================================================================
-
-def main() -> int:
-    ap = argparse.ArgumentParser(
-        description="Stage 24 dev server (hls serve): watch .hls files, "
-                    "recompile on save, live-reload the browser.")
-    ap.add_argument("--port", type=int, default=8080,
-                    help="listen on this port (default: 8080)")
-    ap.add_argument("--bundle", default="out",
-                    help="output base path (default: ./out)")
-    ap.add_argument("--input", default="examples/hello.hls",
-                    help="the .hls file to compile (default: examples/hello.hls)")
-    ap.add_argument("--target", default="wasm32-unknown-unknown",
-                    help="target triple (default: wasm32-unknown-unknown)")
-    ap.add_argument("--wasm-opt", default="auto",
-                    choices=["auto", "on", "off"],
-                    help="optimization mode (default: auto)")
-    ap.add_argument("--glue", default="compact",
-                    choices=["compact", "verbose"],
-                    help="JS glue style (default: compact)")
-    ap.add_argument("--watch", default=None, metavar="DIR",
-                    help="additional directory to watch (default: std/ if it "
-                         "exists, plus the dir of --input)")
-    args = ap.parse_args()
-
-    # Resolve the input file relative to the cwd.
-    input_hls = os.path.abspath(args.input)
-    if not os.path.isfile(input_hls):
-        sys.stderr.write("hlserve: input file not found: %s\n" % input_hls)
-        return 2
-
-    # Resolve the bundle directory.
-    bundle_dir = os.path.dirname(os.path.abspath(args.bundle)) or "."
-    bundle_base = os.path.basename(args.bundle) or "out"
-    os.makedirs(bundle_dir, exist_ok=True)
-
-    # Configure the HTTP handler.
-    DevHTTPHandler.bundle_dir = bundle_dir
-    DevHTTPHandler.bundle_base = bundle_base
-    DevHTTPHandler.input_hls = input_hls
-
-    # Initial compile.
-    sys.stderr.write("hlserve: initial compile...\n")
-    ok = compile_bundle(input_hls, os.path.join(bundle_dir, bundle_base),
-                        args.target, args.wasm_opt, args.glue)
-    DevHTTPHandler.last_compile_ok = ok
-    if not ok:
-        sys.stderr.write("hlserve: initial compile FAILED — server will "
-                         "still start (fix the error and save to reload).\n")
-
-    # Watch dirs: cwd, std/, dir of input, dir of bundle.
-    watch_dirs = [os.getcwd()]
-    std_dir = os.path.join(os.getcwd(), "std")
-    if os.path.isdir(std_dir):
-        watch_dirs.append(std_dir)
-    watch_dirs.append(os.path.dirname(input_hls))
-    watch_dirs.append(bundle_dir)
-    if args.watch:
-        watch_dirs.append(os.path.abspath(args.watch))
-
-    # The recompile callback.
-    def on_change():
-        sys.stderr.write("hlserve: recompiling %s...\n" % input_hls)
-        ok = compile_bundle(input_hls,
-                            os.path.join(bundle_dir, bundle_base),
-                            args.target, args.wasm_opt, args.glue)
-        DevHTTPHandler.last_compile_ok = ok
-        if ok:
-            sys.stderr.write("hlserve: reload event pushed\n")
-            DevHTTPHandler.event_bus.push("reload", "recompiled")
-        else:
-            DevHTTPHandler.event_bus.push("compile-error",
-                                          "see hlserve stderr for details")
-
-    watcher = FileWatcher(watch_dirs, on_change)
-    watcher.start()
-
-    # Start the HTTP server.
-    httpd = DevServer(("0.0.0.0", args.port), DevHTTPHandler)
-    sys.stderr.write("hlserve: serving at http://localhost:%d/\n" % args.port)
-    sys.stderr.write("hlserve: watching %d dirs for .hls changes\n"
-                     % len(watch_dirs))
-    sys.stderr.write("hlserve: press Ctrl+C to stop\n")
-    try:
-        httpd.serve_forever()
-    except KeyboardInterrupt:
-        sys.stderr.write("\nhlserve: shutting down...\n")
-    finally:
-        watcher.stop()
-        httpd.shutdown()
-        httpd.server_close()
-    return 0
+# ``DevHTTPHandler`` and ``DevServer`` were the Stage 24 classes. The
+# Stage 75 equivalents are ``HlsDevHTTPHandler`` and ``HlsDevServer``;
+# the old names are aliased so existing code keeps importing.
+from hlserve_server import HlsDevHTTPHandler as DevHTTPHandler  # noqa: F401,E402
+from hlserve_server import HlsDevServer as DevServer  # noqa: F401,E402
 
 
 if __name__ == "__main__":
