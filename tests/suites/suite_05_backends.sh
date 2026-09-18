@@ -537,6 +537,60 @@ else
     tail -15 "$TMP/serve_acc75.log"
 fi
 
+# (j) Stage 76 (v0.95.0-alpha): the hls-wasm-pack publish pipeline
+# is importable, the 10 part modules load, the CLI accepts the six
+# subcommands, and the demo scans to the expected publish surface.
+# The tool is the wasm-pack equivalent (publish-ready wasm + JS glue
+# + .d.ts + package.json); it closes Phase V (Stages 63-76).
+if python3 -c "
+import sys
+sys.path.insert(0, 'tools')
+import hlwasm_pack
+assert hasattr(hlwasm_pack, 'main'), 'missing main'
+sys.path.insert(0, 'tools/hlwasm_pack_parts')
+import hwp_common, hwp_manifest, hwp_scan, hwp_types, hwp_glue
+import hwp_build, hwp_pack, hwp_publish, hwp_validate, hwp_cli
+# CLI parser accepts all six subcommands.
+ap = hwp_cli.build_arg_parser()
+for sub in ('new', 'build', 'pack', 'publish', 'check', 'test'):
+    ap.parse_args([sub, '--help'])
+# The demo scans to the expected publish surface.
+surface = hwp_scan.scan_file('examples/wasm_pack_demo.hls')
+names = {f['name'] for f in surface['functions']}
+assert {'pack_add', 'pack_greet', 'pack_axis_name', 'pack_sum_to'} <= names, names
+assert any(s['name'] == 'Vec2' for s in surface['structs'])
+assert any(e['name'] == 'Axis' for e in surface['enums'])
+# TS mapping spot-checks.
+assert hwp_types.halis_to_ts('list[int]') == 'Array<number>'
+assert hwp_types.halis_to_ts('Option[str]') == 'string | null'
+# Name/version validators.
+assert hwp_manifest.is_valid_name('@myorg/my-lib')
+assert not hwp_manifest.is_valid_name('../escape')
+assert hwp_manifest.is_valid_version('0.95.0-alpha')
+assert not hwp_manifest.is_valid_version('1.2')
+print('OK')
+" 2>&1 | grep -q OK; then
+    ok "wasm76: hlwasm_pack surface + 10 new modules + demo scan + validators"
+else
+    bad "wasm76: hlwasm_pack Stage 76 surface check failed"
+fi
+
+# (j-bis) Stage 76: the wasm-pack-acceptance suite passes end-to-end
+# (imports, CLI, validation, scan, TS mapping, bundler build, all
+# five targets, tarball pack + traversal defence, check, publish
+# dry-run + scaffolding).
+if make wasm-pack-acceptance >"$TMP/wasm_pack_acc76.log" 2>&1; then
+    if grep -q "ACCEPTANCE OK: Stage 76" "$TMP/wasm_pack_acc76.log"; then
+        ok "wasm76: make wasm-pack-acceptance runs end-to-end (10 test sections)"
+    else
+        bad "wasm76: make wasm-pack-acceptance did not print ACCEPTANCE OK"
+        tail -5 "$TMP/wasm_pack_acc76.log"
+    fi
+else
+    bad "wasm76: make wasm-pack-acceptance failed"
+    tail -15 "$TMP/wasm_pack_acc76.log"
+fi
+
 echo ""
 echo "=== 13. Stage 25: AArch64 backend tuning (NEON + PAC + BTI) ==="
 # Stage 25 (v0.44.0-alpha): the NEON intrinsic emission in src/hlc.hls

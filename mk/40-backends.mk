@@ -307,3 +307,50 @@ aarch64-list-targets:
 
 .PHONY: aarch64-bench aarch64-acceptance aarch64-list-targets
 
+# ============================================================================
+# Stage 76 (v0.95.0-alpha): hls-wasm-pack — publish-ready wasm + JS glue
+# ============================================================================
+
+# wasm-pack: compile an HLS program to a publish-ready npm package dir.
+#   make wasm-pack F=examples/wasm_pack_demo.hls [OUT=pkg] [TARGET=bundler]
+#        [NAME=wasm-pack-demo] [VERSION=0.1.0]
+# Drives: hlwasm -> wasm-opt -> tools/hlwasm_pack.py build. The output
+# dir holds <stem>.wasm + <stem>.js + <stem>.d.ts + package.json +
+# README.md + .pack-manifest.json. Then:
+#   make wasm-pack-check PKG=pkg        # validate without executing
+#   make wasm-pack-pack PKG=pkg         # tar into <stem>-<version>.tgz
+# Targets: bundler (default) | web | nodejs | deno | no-modules.
+wasm-pack:
+	@test -n "$(F)" || (echo "Usage: make wasm-pack F=examples/wasm_pack_demo.hls [OUT=pkg] [TARGET=bundler] [NAME=..] [VERSION=..]" && false)
+	@if [ -z "$(OUT)" ]; then OUT=pkg; fi; \
+	  if [ -z "$(TARGET)" ]; then TARGET=bundler; fi; \
+	  extra=""; \
+	  if [ -n "$(NAME)" ]; then extra="$$extra --name $(NAME)"; fi; \
+	  if [ -n "$(VERSION)" ]; then extra="$$extra --version $(VERSION)"; fi; \
+	  $(PYTHON) tools/hlwasm_pack.py build $(F) --out $$OUT --target $$TARGET $$extra
+
+# wasm-pack-check: validate a built pkg/ dir (no execution).
+# Usage: make wasm-pack-check [PKG=pkg]
+wasm-pack-check:
+	@if [ -z "$(PKG)" ]; then PKG=pkg; fi; \
+	  $(PYTHON) tools/hlwasm_pack.py check $$PKG
+
+# wasm-pack-pack: tar a built pkg/ into a reproducible .tgz.
+# Usage: make wasm-pack-pack [PKG=pkg] [TGZ=out.tgz]
+wasm-pack-pack:
+	@if [ -z "$(PKG)" ]; then PKG=pkg; fi; \
+	  extra=""; if [ -n "$(TGZ)" ]; then extra="--tgz $(TGZ)"; fi; \
+	  $(PYTHON) tools/hlwasm_pack.py pack --pkg $$PKG $$extra
+
+# wasm-pack-acceptance: the Stage 76 acceptance gate. Runs the
+# 10-section, 140+-assertion end-to-end suite: import surface, CLI,
+# npm name/semver validation, source scan, TS mapping, bundler
+# build, all five targets, tarball pack + traversal defence, check
+# on good/broken pkgs, publish dry-run + scaffolding.
+wasm-pack-acceptance:
+	@echo "[Stage 76 acceptance] running tests/wasm_pack_acceptance.py..."
+	@$(PYTHON) tests/wasm_pack_acceptance.py
+	@echo "ACCEPTANCE OK: Stage 76 -- hls-wasm-pack (publish-ready wasm + JS glue)"
+
+.PHONY: wasm-pack wasm-pack-check wasm-pack-pack wasm-pack-acceptance
+
