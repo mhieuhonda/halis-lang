@@ -219,6 +219,12 @@ class CheckerCore(object):
             self.err("main cannot have parameters", mainf)
         if mainf["ret"] not in ("int", "void"):
             self.err("main must return 'int' or have no return type", mainf)
+        # 2.5 Stage 77 (v0.96.0-alpha): freestanding / no_std mode
+        # enforcement runs BEFORE the bodies are checked so violations
+        # report the mode-specific message (not the generic effect
+        # error): the module boundary, the host boundary, and the
+        # declared-capability boundary need signatures only.
+        self.check_crate_modes()
         # 3. check function bodies
         for key, fn in self.fns.items():
             self.check_fn(key, fn)
@@ -240,9 +246,6 @@ class CheckerCore(object):
             self.tail_call_check_fn(key, fn)
         # 4. effects analysis (fixpoint on the call graph)
         self.check_effects()
-        # 5. Stage 77 (v0.96.0-alpha): freestanding / no_std mode
-        # enforcement (crate-level `#![...]` attributes).
-        self.check_crate_modes()
 
     # ---------- Stage 77 (v0.96.0-alpha): crate modes ----------
     # `#![freestanding]` / `#![no_std]` turn the whole program into a
