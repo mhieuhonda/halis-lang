@@ -13,6 +13,84 @@ stability (125–140), and final stabilisation toward v1.0 (141–150).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
+## [v0.95.0-alpha] — Stage 76: hls-wasm-pack — publish-ready wasm + JS glue
+
+> Closes **Phase V (web application track, Stages 63–76)** — the
+> FOURTEENTH and final module of the phase. Completes the roadmap's
+> Stage 76 promise: "A `wasm-pack` equivalent for Halis web apps.
+> Compiles `.hls` to a publish-ready npm package (`.wasm` + JS glue
+> + `.d.ts` + `package.json`), ready for `npm publish`."
+>
+> `python3 tools/hlwasm_pack.py build examples/wasm_pack_demo.hls
+> --out pkg --target bundler --name wasm-pack-demo` produces a
+> validated `pkg/` (1.5 KB wasm, 33% smaller after `wasm-opt`); `pack`
+> tars it reproducibly; `publish` dry-runs with zero network traffic.
+> Five targets (`bundler`/`web`/`nodejs`/`deno`/`no-modules`), six
+> subcommands (`new`/`build`/`pack`/`publish`/`check`/`test`),
+> single-file source scanner, Halis→TypeScript declarations, npm name
+> + semver validation, SHA-256 manifests, and the Stage 27
+> realpath-based path-traversal defence on every pack/unpack path.
+>
+> No new compiler builtins; this is a pure tooling stage on top of
+> the Stage 23/24 `hlwasm` backend + Stage 24 `hlwasm_opt` + Stage 73
+> `std.jsffi`.
+
+Implements the roadmap's Stage 76 promise:
+
+- **Modular split (`tools/hlwasm_pack_parts/`)** — the public
+  `tools/hlwasm_pack.py` is a thin facade re-exporting `main`;
+  the implementation lives in 10 focused modules:
+  - `hwp_common` — repo-root resolution, stderr logger, pack
+    constants + five targets, realpath containment defence.
+  - `hwp_manifest` — `hls.pack.toml` / `hls.pack.json` reader,
+    npm name + semver validators, `package.json` builder
+    (`sideEffects: false`, `main`/`module`/`types`/`exports`,
+    `halis` metadata stanza).
+  - `hwp_scan` — publish-surface scanner (top-level fns,
+    structs, enums, `extern "js"` imports) via
+    comment-strip + string-mask + whole-source regexes.
+  - `hwp_types` — Halis→TypeScript mapper + `.d.ts` renderer
+    (structs → interfaces, enums → string unions, loader API).
+  - `hwp_glue` — five target wrappers embedding the `hlwasm`
+    compact glue verbatim + async `init` + target markers.
+  - `hwp_build` — `hlwasm.compile_program` + `wasm-opt` +
+    `pkg/` assembler with per-file SHA-256 manifest.
+  - `hwp_pack` — reproducible `.tgz` (`package/` layout, zeroed
+    mtimes → identical SHA-256) + defended `unpack`.
+  - `hwp_publish` — dry-run-first publisher (validates
+    registry/access/tag; real `npm publish` needs
+    `--no-dry-run`).
+  - `hwp_validate` — offline checker (wasm magic, target
+    marker, loader API, schema, hashes) + node smoke-run.
+  - `hwp_cli` — argparse + six subcommands; `hls.pack.toml`
+    auto-detect with CLI-flags-win merge.
+
+- **Acceptance** (`make wasm-pack-acceptance`): runs
+  `tests/wasm_pack_acceptance.py` — 10 sections, 140+
+  assertions: (1) import surface (facade + 10 modules); (2) CLI
+  (`--version`, six subcommands, six build flags); (3) npm name
+  (5 valid / 11 invalid) + semver (4 valid / 5 invalid)
+  validation; (4) scan of the demo (6 fns, 5-field struct,
+  3-variant enum, 40+ js imports, export exclusions); (5) TS
+  mapping (12 pairs incl. nested generics) + `.d.ts` contents;
+  (6) bundler build (6 files, wasm magic, < 100 KB,
+  package.json + manifest gates, ESM marker); (7) all five
+  targets build + validate (CJS entry, `deno.json`,
+  `HalisPack` global); (8) tarball members + reproducibility +
+  unpack round-trip + hostile-tarball rejection; (9) check on
+  good/missing-wasm/tampered-js pkgs + CLI exit codes; (10)
+  publish dry-run (zero network) + `new` scaffolding.
+
+- **Demo** (`examples/wasm_pack_demo.hls`): a small Halis web
+  library (`pack_add`/`pack_greet`/`pack_axis_name`/`pack_sum_to`
+  + `Vec2` + `Axis` + `jsffi_on_callback` with greet/add
+  callbacks). Packable with `make wasm-pack
+  F=examples/wasm_pack_demo.hls`.
+
+- **Phase V declared COMPLETE** — router, server, websocket,
+  cookie, session, CSRF, template, SSE, GraphQL, OpenAPI,
+  JS-FFI, DOM, dev server, and publish packaging all shipped.
+
 ## [v0.94.0-alpha] — Stage 75: hls-serve — webpack-dev-server equivalent
 
 > Continues **Phase V (web application track, Stages 63–76)** — the

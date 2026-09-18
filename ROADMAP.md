@@ -123,7 +123,7 @@ remains green.
 | 73 | `std.jsffi` — bind to JavaScript globals from `wasm32` | ✅ | (done in v0.92.0-alpha) |
 | 74 | `std.dom` — server-side rendering (no client JS needed) | ✅ | (done in v0.93.0-alpha) |
 | 75 | `hls-serve` — `webpack-dev-server` equivalent for HLS | ✅ | 5 weeks (done in v0.94.0-alpha) |
-| 76 | `hls-wasm-pack` — publish-ready wasm + JS glue | ⬜ | 4 weeks |
+| 76 | `hls-wasm-pack` — publish-ready wasm + JS glue | ✅ | (done in v0.95.0-alpha) |
 
 ### Phase VI — OS development foundation (Stages 77–96)
 
@@ -8724,4 +8724,198 @@ PORT=3000` — edit the file and save to test HMR (the wasm
 re-instantiates without a full page reload), introduce a syntax
 error to test the error overlay, visit `/deep/route` to test SPA
 fallback.
+
+## STAGE 76 — `hls-wasm-pack` — publish-ready wasm + JS glue ✅ (release v0.95.0-alpha)
+
+**Goal:** a `wasm-pack` equivalent for Halis web apps. Turns a
+`.hls` program into a publish-ready npm package (`pkg/`): `.wasm`
++ target-specific `.js` glue + `.d.ts` + `package.json` +
+`README.md` + `.pack-manifest.json` — then optionally packs it
+into a reproducible `.tgz` and (dry-run by default) publishes it
+to an npm registry.
+
+**Status (v0.95.0-alpha):** Stage 76 is **COMPLETE** and closes
+**Phase V (web application track, Stages 63–76)**. Every phase-V
+promise is now met: router, server, websocket, cookie, session,
+CSRF, template, SSE, GraphQL, OpenAPI, JS-FFI, DOM rendering, dev
+server, and publish packaging. The implementation is a pure
+tooling stage (no new compiler builtins) on top of the Stage 23/24
+`hlwasm` backend, the Stage 24 `hlwasm_opt` size optimizer, and
+the Stage 73 `std.jsffi` extern surface:
+
+1. **Modularising** the implementation into
+   `tools/hlwasm_pack_parts/` (10 focused modules, mirroring the
+   `tools/hlserve_parts/` pattern from Stage 75). The public
+   entrypoint `tools/hlwasm_pack.py` is a thin facade that
+   re-exports `main`.
+2. **Six subcommands** — `new` (scaffold a web library:
+   `main.hls` + `hls.pack.toml` + README stub), `build`
+   (`INPUT.hls` → publish-ready `pkg/`), `pack` (`pkg/` →
+   reproducible `<stem>-<version>.tgz`), `publish` (dry-run by
+   default; real `npm publish` only with `--no-dry-run`),
+   `check` (validate a `pkg/` without executing it), `test`
+   (Node.js smoke-run, SKIP when node is absent — the Stage 23/24
+   convention).
+3. **Five publish targets** (the `wasm-pack --target` surface,
+   adapted): `bundler` (ESM for webpack/rollup/vite, default),
+   `web` (ESM bare, no bundler), `nodejs` (CommonJS `require()`),
+   `deno` (ESM + `deno.json` hint), `no-modules` (IIFE global
+   `HalisPack` for a plain `<script>` tag). Each wrapper embeds
+   the `hlwasm` compact glue verbatim (the runtime stays
+   single-sourced) and adds a thin async `init` layer plus a
+   `__TARGET__` marker comment verifiable by `check`.
+4. **Single-file source scanner** (`hwp_scan`) — extracts top-level
+   `fn`s, `struct`/`enum` declarations, and `extern "js"` imports
+   via comment-stripping + string-masking + whole-source regexes
+   (documented heuristic; the compiler remains the type truth).
+   `main` and the Stage 73 `jsffi_on_callback` dispatch hook are
+   excluded from the library surface by design.
+5. **TypeScript declarations** (`hwp_types`) — `int`/`float` →
+   `number` (with a documented >2^53 precision caveat),
+   `bool` → `boolean`, `str` → `string`, `list[T]` →
+   `Array<T>`, `map[str, T]` → `Record<string, T>`,
+   `tainted[T]` → `T`, `Option[T]` → `T | null`,
+   `Result[T, E]` → `T` (Err is a documented throw-site),
+   structs → interfaces, enums → string-literal unions, anything
+   else → `unknown` (the file never lies). The loader API
+   (`HalisInstance`, `init`, `callHalis`, struct helpers) is
+   appended per target.
+6. **`package.json` generation** (`hwp_manifest`) — npm name rules
+   enforced (`name` / `@scope/name`, lowercase, no `..`),
+   strict semver versions, `sideEffects: false`, `main`/`module`/
+   `types`/`exports`, `halis` metadata stanza, plus the
+   `hls.pack.toml` / `hls.pack.json` config layer (CLI flags
+   always override — the Stage 75 convention; `tomllib` on
+   Python 3.11+, JSON fallback below).
+7. **Reproducible tarballs** (`hwp_pack`) — stdlib `tarfile` +
+   gzip (no npm needed), `package/` prefix layout (accepted by
+   `npm publish <tgz>`), zeroed mtimes/uids (identical SHA-256
+   across runs, verified by acceptance), `.pack-manifest.json`
+   hash verification before packing (a `pkg/` changed after
+   build is rejected, not silently shipped), and an `unpack`
+   path with the realpath containment defence.
+8. **Path-traversal defence throughout** (`hwp_common`) — the
+   Stage 27 realpath-based defence carried over: every packed
+   filename, every tarball member (absolute paths, `..`
+   segments, symlinks/hardlinks rejected), and every unpack
+   target must resolve inside its directory.
+9. **Hermetic publish** (`hwp_publish`) — dry-run prints the
+   exact `npm publish --tag --access [--registry]` command with
+   zero network traffic; registry URLs, `public`/`restricted`
+   access, and dist-tags are validated up front.
+10. **Offline validation** (`hwp_validate`) — `check` verifies
+    the wasm magic (`\0asm` + version 1), the target marker in
+    the `.js`, the loader API in the `.d.ts`, the `package.json`
+    schema (name/version match the manifest,
+    `sideEffects == false`), and the SHA-256 of every listed
+    file — returning `(ok, messages)` with actionable FAIL lines.
+
+**Acceptance criteria (met):**
+
+- ✅ `new` scaffolds a working web library (`.hls` + TOML + README).
+- ✅ `build` produces a publish-ready `pkg/` (`.wasm` < 100 KB,
+  `.js` + `.d.ts` + `package.json` + `README.md` +
+  `.pack-manifest.json`) for all five targets.
+- ✅ `pack` produces reproducible tarballs (identical SHA-256
+  across runs) with a `package/` layout.
+- ✅ `check` passes a good `pkg/` and fails a broken one
+  (missing wasm, tampered js) with actionable messages.
+- ✅ `publish` dry-runs with zero network traffic; bad access
+  levels, bad tags, and missing tarballs are rejected.
+- ✅ Hostile tarballs (`../` members, absolute paths, symlinks)
+  are rejected on unpack, never written.
+- ✅ No new compiler builtins; no new hard dependencies
+  (only Python stdlib + the in-tree `hlwasm` backend).
+- ✅ The Stage 27 path-traversal defence is carried over.
+
+**Shipped in v0.95.0-alpha (Stage 76):**
+
+- `tools/hlwasm_pack_parts/__init__.py` — package marker.
+- `tools/hlwasm_pack_parts/hwp_common.py` — repo-root
+  resolution, stderr logger, pack constants + targets,
+  realpath containment defence.
+- `tools/hlwasm_pack_parts/hwp_manifest.py` — `hls.pack.toml` /
+  `.json` config, npm name + semver validation, `package.json`
+  builder.
+- `tools/hlwasm_pack_parts/hwp_scan.py` — single-file publish-
+  surface scanner (fns, structs, enums, `extern "js"` imports).
+- `tools/hlwasm_pack_parts/hwp_types.py` — Halis → TypeScript
+  mapper + `.d.ts` renderer.
+- `tools/hlwasm_pack_parts/hwp_glue.py` — five target-specific
+  JS wrappers around the `hlwasm` compact glue.
+- `tools/hlwasm_pack_parts/hwp_build.py` — `hlwasm` +
+  `wasm-opt` compile + `pkg/` assembler (manifest with SHA-256).
+- `tools/hlwasm_pack_parts/hwp_pack.py` — reproducible `.tgz`
+  packer + defended unpacker.
+- `tools/hlwasm_pack_parts/hwp_publish.py` — dry-run-first
+  registry publisher.
+- `tools/hlwasm_pack_parts/hwp_validate.py` — offline `pkg/`
+  checker + Node.js smoke-runner.
+- `tools/hlwasm_pack_parts/hwp_cli.py` — argparse +
+  subcommand orchestrator (`new`/`build`/`pack`/`publish`/
+  `check`/`test`).
+- `tools/hlwasm_pack.py` — thin public facade re-exporting
+  `main`.
+- `tests/wasm_pack_acceptance.py` — new Stage 76 acceptance
+  gate (10 sections, 140+ assertions, runs end-to-end via
+  `make wasm-pack-acceptance`).
+- `mk/40-backends.mk` — adds `wasm-pack` / `wasm-pack-acceptance`
+  targets.
+- `Makefile` — adds `wasm-pack-acceptance` to the `.PHONY` list.
+- `tests/suites/suite_05_backends.sh` — adds 2 new checks
+  (`wasm76: hlwasm_pack surface + 10 new modules` and
+  `wasm76: make wasm-pack-acceptance runs end-to-end`).
+- `examples/wasm_pack_demo.hls` — demo web library (pure
+  helpers + `Vec2` struct + `Axis` enum + `jsffi_on_callback`
+  with two callback ids); packable with `make wasm-pack
+  F=examples/wasm_pack_demo.hls`.
+- `CHANGELOG.md` — v0.95.0-alpha entry added.
+- `ROADMAP.md` — Stage 76 marked ✅; **Phase V declared
+  COMPLETE**.
+- `README.md` — feature list bumped to mention Stage 76.
+
+**Acceptance** (`make wasm-pack-acceptance`): runs
+`tests/wasm_pack_acceptance.py` — 10 sections, 140+ assertions,
+all PASS:
+
+1. Import surface — facade `main` + 10 part modules importable.
+2. CLI surface — `--version` banner; `--help` lists all six
+   subcommands; `build --help` lists `--target/--name/--version/
+   --wasm-opt/--opt-level/--scope`.
+3. Name/version validation — five valid names, eleven invalid
+   (upper/space/traversal/scope-shape), four valid + five
+   invalid versions.
+4. Source scan — six demo fns, `pack_add` params + return,
+   five-field `Vec2`, three-variant `Axis`, 40+ `extern "js"`
+   imports from `std/jsffi.hls`; `main`/`jsffi_on_callback`
+   excluded from exports.
+5. TypeScript mapping — twelve type pairs incl. nested
+   `list[map[str, list[bool]]]`; `.d.ts` holds both exported
+   fns, the `Vec2` interface, the `Axis` union, and the loader
+   API.
+6. Build (bundler) — `pkg/` holds all six files; wasm magic +
+   version; wasm < 100 KB; `package.json` name/version/
+   sideEffects/module-main-types; manifest packVersion/target/
+   per-file SHA-256; bundler ESM marker + default export.
+7. All five targets — build + marker + flavour checks
+   (CJS entry, `deno.json`, `HalisPack` global) + validate.
+8. Pack — tarball path + `package/` members + artifact set;
+   reproducible bytes (identical SHA-256); unpack round-trip;
+   hostile tarball rejected with no escape file.
+9. Check — good `pkg/` validates (14/14); missing wasm and
+   tampered js fail with actionable messages; CLI exit codes
+   0/1.
+10. Publish + new — dry-run exit 0 with the `npm publish`
+    command printed (zero network); bad access/tag/tarball
+    rejected; `new` scaffolds three files and rejects bad
+    names.
+
+**Demo** (`examples/wasm_pack_demo.hls`): a small Halis web
+library (1.5 KB wasm, 33% smaller after `wasm-opt`) exposing
+`pack_add` / `pack_greet` / `pack_axis_name` / `pack_sum_to` plus
+a `Vec2` struct and an `Axis` enum for the `.d.ts`, the Stage 73
+console + JSON-bridge externs, and `jsffi_on_callback` with two
+callback ids (greet/add). Pack it with `make wasm-pack
+F=examples/wasm_pack_demo.hls` — then `make wasm-pack-acceptance`
+to verify the whole pipeline.
 
