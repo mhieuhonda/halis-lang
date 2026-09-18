@@ -20,6 +20,7 @@ Flags:
 Imports (Stage 6):
   `import "path/to/file.hls"` — relative to the importing file's directory.
   `import "std.str"`          — resolves to <repo>/std/str.hls
+  `import "core.option"`      — resolves to <repo>/core/option.hls (Stage 78)
   Each file is parsed once; transitive imports are merged into one program.
 """
 import os
@@ -44,11 +45,17 @@ def _resolve_import(import_path, importing_file):
                               <importing_file's dir>/std/<name>.hls
                               <parent>/std/<name>.hls (walked up to 5 levels)
                               <repo>/std/<name>.hls (fallback)
+    - "core.<name>"     →  same search under core/ (Stage 78, v0.97.0-alpha:
+                              the freestanding-safe module family)
     - other paths       →  relative to the importing file's directory
     Returns None if the file does not exist.
     """
-    if import_path.startswith("std."):
-        module_name = import_path[4:]
+    # Stage 78: one resolver for both module families (same walk-up +
+    # traversal-guard discipline; only the directory differs).
+    for prefix, subdir in (("std.", "std"), ("core.", "core")):
+        if not import_path.startswith(prefix):
+            continue
+        module_name = import_path[len(prefix):]
         # Deep-scan-20 fix (HIGH, path traversal): the relative-path
         # branch below rejects absolute paths and ".." segments, but
         # this branch joined module_name into std/<name>.hls with no
@@ -58,13 +65,13 @@ def _resolve_import(import_path, importing_file):
         # injecting an absolute path). Same local-file-inclusion vector
         # deep-scan-19 closed for relative imports; guard it here too.
         if not module_name:
-            raise SystemExit("error: import path must name a module after 'std.': %s" % import_path)
+            raise SystemExit("error: import path must name a module after '%s': %s" % (prefix, import_path))
         if module_name.startswith("/") or module_name.startswith("\\"):
             raise SystemExit("error: import path must be relative, got absolute: %s" % import_path)
         _mparts = module_name.replace("\\", "/").split("/")
         if ".." in _mparts:
             raise SystemExit("error: import path must not contain '..' segments: %s" % import_path)
-        rel = os.path.join("std", module_name + ".hls")
+        rel = os.path.join(subdir, module_name + ".hls")
         # Walk up from the importing file's directory.
         if importing_file:
             d = os.path.dirname(os.path.abspath(importing_file))
