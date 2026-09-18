@@ -282,6 +282,12 @@ class CheckerExpr(object):
             if lt == "int" and rt == "int":
                 return "int"
             if lt == "float" and rt == "float":
+                # Stage 77: float % float lowers to fmod (no
+                # freestanding implementation).
+                if op == "%" and self.is_freestanding():
+                    self.err("float % is not available in "
+                             "#![freestanding] mode (it lowers to fmod, "
+                             "which has no freestanding implementation)", e)
                 return "float"
             self.err("%s operator does not support %s and %s" % (op, lt, rt), e)
         self.err("unknown operator: %s" % op, e)

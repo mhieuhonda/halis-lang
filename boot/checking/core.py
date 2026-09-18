@@ -240,6 +240,60 @@ class CheckerCore(object):
             self.tail_call_check_fn(key, fn)
         # 4. effects analysis (fixpoint on the call graph)
         self.check_effects()
+        # 5. Stage 77 (v0.96.0-alpha): freestanding / no_std mode
+        # enforcement (crate-level `#![...]` attributes).
+        self.check_crate_modes()
+
+    # ---------- Stage 77 (v0.96.0-alpha): crate modes ----------
+    # `#![freestanding]` / `#![no_std]` turn the whole program into a
+    # freestanding (no libc, no OS calls, entry `_start`) or no_std
+    # (no `std`, hosted libc kept) crate. Enforcement here is purely
+    # static: the module boundary (`std` banned), the host boundary
+    # (`extern` blocks banned), and the capability boundary (no
+    # declared effects — every function must be pure). Effectful
+    # builtins (print, read_file, ...) are additionally rejected by
+    # the existing undeclared-effect errors from check_effects().
+    def crate_modes(self):
+        names = {a["name"] for a in self.p.get("crate_attrs", [])}
+        freestanding = "freestanding" in names
+        # `#![freestanding]` implies `#![no_std]` (a freestanding
+        # crate is always std-free; Stage 78 documents the split).
+        no_std = freestanding or "no_std" in names
+        return {"freestanding": freestanding, "no_std": no_std}
+
+    def is_freestanding(self):
+        """True while checking any function of a `#![freestanding]`
+        crate. Reads the program attributes directly (order-free —
+        usable from body checking, which runs before
+        check_crate_modes)."""
+        return self.crate_modes()["freestanding"]
+
+    def check_crate_modes(self):
+        modes = self.crate_modes()
+        # Published for --audit (boot.py reads checker.crate_modes).
+        self.crate_mode_flags = modes
+        if not modes["no_std"]:
+            return
+        label = ("#![freestanding]" if modes["freestanding"]
+                 else "#![no_std]")
+        for imp in self.p.get("imports", []):
+            path = imp.get("path", "")
+            if path.startswith("std."):
+                self.err("cannot import '%s' in %s mode (the std module "
+                         "is disabled; use 'core.*' or a relative import)"
+                         % (path, label), imp)
+        for ext in self.p.get("externs", []):
+            self.err("extern \"%s\" blocks are not available in %s mode "
+                     "(no host calls in freestanding code)"
+                     % (ext.get("abi", "C"), label), ext)
+        for key, fn in self.fns.items():
+            declared = fn.get("effects", set())
+            if declared:
+                self.err("function '%s' declares `uses %s` — capabilities "
+                         "are unavailable in %s mode (no OS calls; every "
+                         "function must be pure)"
+                         % (fn["name"], ", ".join(sorted(declared)), label),
+                         fn)
 
     # ---------- environment ----------
     # Bindings are now [type, mut, moved] (3-tuple) — `moved` is True after

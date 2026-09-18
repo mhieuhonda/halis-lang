@@ -26,6 +26,16 @@ KNOWN_EFFECTS = {"IO", "Fs", "Clock", "Args", "Exit", "Net", "Rand", "Proc", "Co
 RESERVED_EFFECTS = set()  # no reserved effects as of v0.20.0-alpha
 IO_FAMILY = {"IO", "Fs", "Clock", "Args", "Exit"}
 
+# Stage 77 (v0.96.0-alpha): crate-level attributes (`#![...]`, inner
+# attributes at the top of the entry file).
+#   freestanding - no libc, no OS calls, no std (only core +
+#                  relative imports); entry point is `_start`;
+#                  implies `no_std`.
+#   no_std       - no std (only core + relative imports); the C
+#                  backend still links libc and uses `main`
+#                  (Stage 78 populates the `core` module).
+CRATE_ATTRS = {"freestanding", "no_std"}
+
 BIN_LEVELS = [
     ("||",),
     ("&&",),
@@ -251,17 +261,57 @@ class Parser:
                     self.err("expected ',' or ']' in attribute list")
             self.eat_sym("]")
 
+    def parse_crate_attr(self):
+        """Stage 77 (v0.96.0-alpha): parse one `#![name]` crate-level
+        attribute. Consumes `#` `!` `[` name `]`.
+        Returns {"name", "line", "col"}.
+        """
+        t0 = self.eat_sym("#")
+        self.eat_sym("!")
+        self.eat_sym("[")
+        name_tok = self.peek()
+        if name_tok["k"] != "ident":
+            self.err("expected a crate attribute name (freestanding, "
+                     "no_std) but got %s" % self._desc(), name_tok)
+        self.next()
+        name = name_tok["v"]
+        if name not in CRATE_ATTRS:
+            self.err("unknown crate attribute '%s' (known: %s)"
+                     % (name, ", ".join(sorted(CRATE_ATTRS))), name_tok)
+        self.eat_sym("]")
+        return {"name": name, "line": t0["line"], "col": t0["col"]}
+
     def parse_program(self):
         structs = {}   # name -> struct
         enums = {}      # name -> enum
         fns = {}       # key -> fn  (key = function name or "Struct.method")
         imports = []   # list of import paths
         externs = []   # Stage 15 (v0.13.0-alpha): list of extern blocks
+        crate_attrs = []  # Stage 77: list of {"name", "line", "col"}
+        crate_seen = set()
+        seen_item = False  # True once a non-attribute item is parsed
         # Stage 28+29: attribute cache, reset before every declaration.
         self.reset_cur_attrs()
         while self.peek()["k"] != "eof":
             # Stage 28+29: a leading `#[...]` applies to the next fn.
             if self.at_sym("#"):
+                # Stage 77: `#![name]` is a crate-level attribute —
+                # only valid before any item, never duplicated.
+                # Look ahead past `#` (the token list always ends
+                # with an eof token, so pos+1 is safe).
+                nxt = self.toks[self.pos + 1]
+                if nxt["k"] == "sym" and nxt["v"] == "!":
+                    if seen_item:
+                        self.err("crate-level attribute must appear before "
+                                 "any item (move it to the top of the "
+                                 "entry file)")
+                    attr = self.parse_crate_attr()
+                    if attr["name"] in crate_seen:
+                        self.err("duplicate crate attribute '#![%s]'"
+                                 % attr["name"])
+                    crate_seen.add(attr["name"])
+                    crate_attrs.append(attr)
+                    continue
                 self.parse_attributes()
                 continue
             if self.at_kw("struct"):
@@ -306,8 +356,12 @@ class Parser:
             else:
                 self.err("only struct/enum/impl/fn/import/extern declarations allowed at top level")
             self.reset_cur_attrs()
+            # Stage 77: a successfully parsed item closes the
+            # crate-attribute window (subsequent `#![...]` is rejected).
+            seen_item = True
         return {"structs": structs, "enums": enums, "fns": fns,
-                "imports": imports, "externs": externs}
+                "imports": imports, "externs": externs,
+                "crate_attrs": crate_attrs}
 
     def parse_extern_block(self):
         """Stage 15 (v0.13.0-alpha): parse `extern "C" { fn decls }` block.

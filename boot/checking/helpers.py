@@ -415,6 +415,30 @@ BUILTIN_FNS = {
     "proc_pid", "sys_hostname",
 }
 
+# Stage 77 (v0.96.0-alpha): pure builtins that are UNAVAILABLE in
+# `#![freestanding]` mode. They lower to libc/libm calls with no
+# freestanding implementation (the freestanding C prelude provides
+# no snprintf, no strtod, no libm):
+#   - the 24 libm-backed math_* builtins (math_isnan / isinf /
+#     isfinite / signbit stay AVAILABLE — exact bit tests in the
+#     prelude, no libm);
+#   - float(s: str) — strtod.
+# Companion denials (checked at their own sites, same message):
+# str(float) and float.to_str() (snprintf %.6f), str.to_float()
+# (strtod), and float % float (fmod).
+FREESTANDING_DENY_BUILTINS = {
+    "math_sin", "math_cos", "math_tan", "math_asin", "math_acos",
+    "math_atan", "math_atan2", "math_sinh", "math_cosh", "math_tanh",
+    "math_exp", "math_log", "math_log10", "math_log2", "math_pow",
+    "math_sqrt", "math_cbrt", "math_hypot", "math_fmod", "math_copysign",
+    "math_erf", "math_erfc", "math_tgamma", "math_lgamma",
+    "float",
+}
+
+FREESTANDING_DENY_MSG = (
+    "%s is not available in #![freestanding] mode (it lowers to a "
+    "libc/libm call with no freestanding implementation)")
+
 # Stage 9 (v0.20.0-alpha — release): per-builtin effect mapping.
 # Pure builtins (panic, str, int, len, range, map_new, chr, drop, clone,
 # take) are absent — they contribute no effect. A builtin may in

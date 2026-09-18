@@ -107,6 +107,25 @@ def tokenize(src):
                 col += 1
                 i += 1
                 continue
+            # Stage 77 (v0.96.0-alpha): `#![...]` introduces a
+            # CRATE-level attribute (e.g. `#![freestanding]`,
+            # `#![no_std]`). `#` followed by `!` followed by `[` emits
+            # `#` then `!` as sym tokens; the `[` is left for the
+            # normal symbol path so the parser sees `#` `!` `[` and
+            # parse_crate_attr consumes all three. A `#` followed by
+            # `!` but NOT `[` (e.g. `#! note`) is still a line comment
+            # (the `!` is the unary-not operator — `#!` alone would be
+            # ambiguous, so only the full `#![` trigraph opens an
+            # attribute).
+            if (i + 2 < n and src[i + 1] == 33  # '!'
+                    and src[i + 2] == 91):  # '['
+                toks.append({"k": "sym", "v": "#", "line": line, "col": col})
+                col += 1
+                i += 1
+                toks.append({"k": "sym", "v": "!", "line": line, "col": col})
+                col += 1
+                i += 1
+                continue
             # BUG-016 fix: track column past the comment, so error messages
             # on a later token on the same line report the right column.
             # Deep-scan-11 fix: stop at `\r` too. The whitespace handler

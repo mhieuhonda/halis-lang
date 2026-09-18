@@ -384,6 +384,9 @@ fn parse_attributes(ctx: Ctx) -> void {
 }
 
 fn parse_program(ctx: Ctx) -> void {
+    # Stage 77: per-file item flag — a `#![...]` crate attribute is
+    # only valid before the first item of the file.
+    let mut seen_item: bool = false
     while ctx.toks.get(ctx.pos).kind != "eof" {
         let t: Tok = ctx.toks.get(ctx.pos)
         # Stage 28+29 (v0.45.0-alpha): a top-level `#[...]` attribute
@@ -393,7 +396,19 @@ fn parse_program(ctx: Ctx) -> void {
         # reset_cur_attrs is called at the END of every iteration so
         # the NEXT declaration starts with cleared attrs (an
         # un-attributed fn never inherits the previous fn's attrs).
+        # Stage 77 (v0.96.0-alpha): `#![name]` is a CRATE-level
+        # attribute (only valid before any item of the entry file,
+        # never duplicated). The token stream always ends with an
+        # eof token, so the two-ahead peek is safe.
         if t.kind == "sym" && t.value == "#" {
+            let nxt: Tok = ctx.toks.get(ctx.pos + 1)
+            if nxt.kind == "sym" && nxt.value == "!" {
+                if seen_item {
+                    perr_at(ctx, "crate-level attribute must appear before any item (move it to the top of the entry file)", t)
+                }
+                parse_crate_attr(ctx)
+                continue
+            }
             parse_attributes(ctx)
             continue
         }
@@ -436,6 +451,46 @@ fn parse_program(ctx: Ctx) -> void {
         # the next fn (if un-attributed) doesn't inherit the previous
         # fn's attributes.
         reset_cur_attrs(ctx)
+        # Stage 77: a successfully parsed item closes the
+        # crate-attribute window of this file.
+        seen_item = true
+    }
+}
+
+# parse_crate_attr (Stage 77, v0.96.0-alpha): parse one `#![name]`
+# crate-level attribute. Consumes `#` `!` `[` name `]`. Only valid
+# before any item of the ENTRY file (ctx.crate_attrs_done is set
+# after the entry parse — dependencies are rejected), never
+# duplicated. Known names: `freestanding` (implies `no_std`),
+# `no_std`.
+fn parse_crate_attr(ctx: Ctx) -> void {
+    let hash_tok: Tok = ctx.toks.get(ctx.pos)
+    eat_sym(ctx, "#")
+    eat_sym(ctx, "!")
+    if ctx.crate_attrs_done {
+        perr_at(ctx, "crate-level attribute is only allowed at the top of the entry file", hash_tok)
+    }
+    eat_sym(ctx, "[")
+    let name: str = eat_ident(ctx)
+    if name != "freestanding" && name != "no_std" {
+        perr_at(ctx, "unknown crate attribute '" + name + "' (known: freestanding, no_std)", hash_tok)
+    }
+    eat_sym(ctx, "]")
+    if name == "freestanding" {
+        if ctx.crate_freestanding {
+            perr_at(ctx, "duplicate crate attribute '#![freestanding]'", hash_tok)
+        }
+        ctx.crate_freestanding = true
+        ctx.crate_no_std = true
+    } else {
+        # An explicit `#![no_std]` after `#![freestanding]` is
+        # redundant but harmless (mirrors the Stage-0 parser, which
+        # keys duplicates on the attribute NAME).
+        if ctx.crate_seen_nostd {
+            perr_at(ctx, "duplicate crate attribute '#![no_std]'", hash_tok)
+        }
+        ctx.crate_seen_nostd = true
+        ctx.crate_no_std = true
     }
 }
 

@@ -5,7 +5,9 @@ boot/checking/checker.py - behavior is unchanged."""
 from ..lexer import HLError
 from .. import proof as _proof
 from .helpers import (
-    BOOL_M, BUILTIN_FNS, FLOAT_M, INT_M, STR_M, _type_mentions_typeparam, chan_inner, future_inner,
+    BOOL_M, BUILTIN_FNS, FLOAT_M, FREESTANDING_DENY_BUILTINS,
+    FREESTANDING_DENY_MSG, INT_M, STR_M, _type_mentions_typeparam,
+    chan_inner, future_inner,
     instantiate_type, is_chan, is_future, is_list, is_map, is_owned_type, is_stream, is_taint,
     is_tainted_type, is_task, list_elem, list_taint_inner, map_val, stream_inner, taint_inner, task_inner,
     type_args, type_base, unify,
@@ -16,6 +18,10 @@ class CheckerCall(object):
     def check_call(self, e, env, expected):
         name = e["name"]
         args = e["args"]
+        # Stage 77 (v0.96.0-alpha): freestanding denylist — pure
+        # builtins with no freestanding lowering (libm, strtod).
+        if name in FREESTANDING_DENY_BUILTINS and self.is_freestanding():
+            self.err(FREESTANDING_DENY_MSG % (name + "()"), e)
         if name in BUILTIN_FNS:
             e["rc"] = ("builtin", name)
             return self.check_builtin_call(name, e, env, expected)
@@ -271,6 +277,10 @@ class CheckerCall(object):
             at = argt(0, None)
             if at not in ("int", "float", "bool", "str"):
                 self.err("str() does not support type %s" % at, e)
+            # Stage 77: str(float) needs snprintf %.6f (no
+            # freestanding implementation).
+            if at == "float" and self.is_freestanding():
+                self.err(FREESTANDING_DENY_MSG % "str(float)", e)
             return "str"
         if name == "int":
             need(1)
@@ -1637,6 +1647,10 @@ class CheckerCall(object):
         if tt == "str":
             if name not in STR_M:
                 self.err("str has no method %s" % name, e)
+            # Stage 77: str.to_float() needs strtod (no freestanding
+            # implementation).
+            if name == "to_float" and self.is_freestanding():
+                self.err(FREESTANDING_DENY_MSG % "str.to_float()", e)
             ptypes, ret = STR_M[name]
             e["rm"] = ("builtin", "str." + name)
         elif tt == "int":
@@ -1654,6 +1668,10 @@ class CheckerCall(object):
         elif tt == "float":
             if name not in FLOAT_M:
                 self.err("float has no method %s" % name, e)
+            # Stage 77: float.to_str() needs snprintf %.6f (no
+            # freestanding implementation).
+            if name == "to_str" and self.is_freestanding():
+                self.err(FREESTANDING_DENY_MSG % "float.to_str()", e)
             ptypes, ret = ([], FLOAT_M[name])
             e["rm"] = ("builtin", "float." + name)
         elif tt == "bool":

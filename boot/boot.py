@@ -167,9 +167,20 @@ def load_program(entry_path):
     # Merge all loaded programs into one. Earlier-loaded files (dependencies)
     # appear first; the entry file appears last.
     merged = {"structs": {}, "enums": {}, "fns": {}, "imports": [],
-              "externs": []}
+              "externs": [], "crate_attrs": []}
     for abs_path in load_order:
         prog = loaded[abs_path]
+        # Stage 77 (v0.96.0-alpha): crate-level attributes (`#![...]`)
+        # are honoured ONLY from the entry file. A dependency that
+        # declares one is rejected (modes are a whole-program property
+        # decided by the crate root, like Rust's crate attributes).
+        for attr in prog.get("crate_attrs", []):
+            if abs_path != entry_abs:
+                raise HLError("crate-level attribute '#![%s]' is only "
+                              "allowed in the entry file (found in %s)"
+                              % (attr["name"], abs_path),
+                              attr.get("line", 0), attr.get("col", 0))
+            merged["crate_attrs"].append(attr)
         for sname, sdef in prog["structs"].items():
             # BUG-14 fix: struct names must not collide with each other
             # OR with any enum defined in another module.
@@ -187,6 +198,14 @@ def load_program(entry_path):
         # Stage 15: merge extern blocks.
         for ext in prog.get("externs", []):
             merged["externs"].append(ext)
+        # Stage 77 (v0.96.0-alpha): merge the import list (with the
+        # importing file attached) so the checker can enforce the
+        # freestanding / no_std module boundary (`std` banned,
+        # `core` + relative paths allowed).
+        for imp in prog.get("imports", []):
+            merged["imports"].append({"path": imp["path"],
+                                      "line": imp.get("line", 0),
+                                      "file": abs_path})
     return merged
 
 
@@ -609,6 +628,20 @@ def print_audit(program, checker):
     n_total = len(fns)
     print("  %d functions: %d declared pure, %d declared with effects"
           % (n_total, n_pure, n_eff))
+    # Stage 77 (v0.96.0-alpha): crate mode (`#![freestanding]` /
+    # `#![no_std]`) — the whole-program freestanding property.
+    modes = getattr(checker, "crate_mode_flags", None)
+    if modes is None:
+        names = {a["name"] for a in program.get("crate_attrs", [])}
+        modes = {"freestanding": "freestanding" in names,
+                 "no_std": "freestanding" in names or "no_std" in names}
+    if modes.get("freestanding"):
+        print("  Crate mode: #![freestanding] (no libc, no OS calls, "
+              "std disabled, entry _start)")
+    elif modes.get("no_std"):
+        print("  Crate mode: #![no_std] (std disabled, hosted libc kept)")
+    else:
+        print("  Crate mode: std (default hosted crate)")
     # Active vs reserved effects table.
     print("")
     print("  Active effects:    IO, Fs, Clock, Args, Exit, Net, Rand, Proc, Conc")
