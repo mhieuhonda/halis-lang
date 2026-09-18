@@ -132,8 +132,8 @@ remains green.
 
 | # | Stage | Status | Estimated effort |
 |---|-------|:------:|:----------------:|
-| 77 | `#![freestanding]` mode (no libc, no OS calls) | ⬜ | 3 weeks |
-| 78 | `#![no_std]` core-only stdlib subset | ⬜ | 5 weeks |
+| 77 | `#![freestanding]` mode (no libc, no OS calls) | ✅ | (done in v0.96.0-alpha) |
+| 78 | `#![no_std]` core-only stdlib subset | ✅ | (done in v0.97.0-alpha) |
 | 79 | `core.alloc` — pluggable allocator trait | ⬜ | 4 weeks |
 | 80 | `core.mem` — physical-page allocator, page tables | ⬜ | 5 weeks |
 | 81 | Panic-handler override (kernel panic strategy) | ⬜ | 3 weeks |
@@ -8918,4 +8918,141 @@ console + JSON-bridge externs, and `jsffi_on_callback` with two
 callback ids (greet/add). Pack it with `make wasm-pack
 F=examples/wasm_pack_demo.hls` — then `make wasm-pack-acceptance`
 to verify the whole pipeline.
+
+## STAGE 77 — `#![freestanding]` mode ✅ (release v0.96.0-alpha)
+
+**Goal:** a crate-level attribute that disables libc linking,
+disables the `std` module, and exposes only the `core` module
+(plus relative imports). The entry point is `_start`; panics halt
+via a trap until Stage 81 provides `#[panic_handler]`.
+
+**Status (v0.96.0-alpha):** Stage 77 is **COMPLETE**. Both
+compilers (Stage-0 and self-hosted `hlc`) parse `#![freestanding]`
+/ `#![no_std]`, enforce the three whole-program boundaries, and
+— for freestanding — emit a freestanding translation unit (3
+headers, static bump arena, trap panics, `_start` with raw-syscall
+exit) that links with `-nostdlib` and runs with the interpreter's
+exit code.
+
+**Shipped in v0.96.0-alpha (Stage 77):**
+
+- **Lexer (both compilers):** the `#![` trigraph emits `#` `!`
+  as sym tokens (the `[` follows the normal path). `#!` without
+  `[` stays a comment; `#[...]` outer attributes are untouched.
+- **Parser (both compilers):** `parse_crate_attr` consumes
+  `#` `!` `[` name `]`. Known names: `freestanding` (implies
+  `no_std`), `no_std`. Unknown names, duplicates, and placement
+  after any item are compile errors; attributes are honoured only
+  from the entry file (a dependency declaring one is rejected).
+- **Checker (both compilers):** the module boundary (`std.*`
+  banned), the host boundary (`extern` blocks banned), and the
+  capability boundary (any `uses` clause banned — every function
+  must be pure) run BEFORE body checking, so violations report
+  the mode-specific message. Effectful builtins stay unreachable
+  via the existing subset test.
+- **Float-library denylist (both compilers):** the 24
+  libm-backed `math_*` builtins, `float(s)`, `str(float)`,
+  `str.to_float()`, `float.to_str()`, and `float % float` are
+  rejected (no snprintf/strtod/libm in the prelude). Everything
+  else float stays: arithmetic, casts, `float.to_int()`,
+  `int.to_str()` (hand-rolled `%lld`), and the four predicates
+  (`math_isnan`/`isinf`/`isfinite`/`signbit` — exact bit tests).
+- **Freestanding runtime (`src/hlc/runtime.hls`):**
+  `freestanding_prelude_lines()` (3 freestanding headers, 1 MiB
+  bump arena with size-tracking headers behind
+  `malloc`/`calloc`/`realloc` defines, `free` as no-op,
+  hand-rolled mem/string primitives, declarations for every other
+  libc symbol the dead hosted code references), trap bodies for
+  `hl_die`/`hl_die_at`/`hl_panic`, an exact hand-rolled
+  `hl_str_from_int64`, and the hosted-only concurrency region
+  (pthread types) guarded out as one block.
+- **Entry (`src/hlc/gen_fn.hls`):** freestanding crates enter via
+  `void _start(void)` (no argc/argv/env/atexit) and exit via a
+  raw syscall (x86-64 `rax=60`, AArch64 `x8=93`, RISC-V `a7=93`).
+  `--pgo-generate` + freestanding is rejected (no
+  atexit/file-IO for the profile).
+- **Link recipe:** `gcc -O2 -ffreestanding -nostdlib
+  -ffunction-sections -fno-stack-protector -Wl,--gc-sections`
+  (`make freestanding F=...`). Section GC drops the dead hosted
+  runtime before undefined-symbol resolution — proven by the
+  link-closure check (every call reachable from `_start`
+  resolves).
+- **`boot.py --audit`** reports the crate mode; `hlfmt` preserves
+  `#![...]` lines verbatim.
+- `examples/freestanding_demo.hls` (pure kernel-style program,
+  exit code 231 = the computed checksum), `tests/ok/
+  feat_freestanding_basic.hls`, 8 `tests/fail/
+  fail_freestanding_*.hls` reject tests,
+  `tests/freestanding_acceptance.py` (8 sections, 58 assertions),
+  `mk/95-osdev.mk` (`freestanding`, `freestanding-check`,
+  `freestanding-acceptance`), `tests/suites/suite_08_osdev.sh`,
+  and the freestanding branch in the section-3 differential loop
+  (`suite_01_boot.sh` links `#![freestanding]` ok-tests with the
+  freestanding recipe).
+
+**Acceptance (`make freestanding-acceptance`):** attribute
+parsing, Stage-0 enforcement (demo + 8 fail programs),
+entry-only rule + implication, float denylist (6 denied + 8
+allowed), audit + fmt, self-hosted TU shape (3 includes,
+`_start`, no `main`, traps, bump, no `pthread.h`), the
+link-closure proof, and self-hosted parity — all PASS.
+**Known limitation:** the bump arena never reclaims (free is a
+no-op) — reclamation arrives with `core.alloc` (Stage 79).
+
+## STAGE 78 — `#![no_std]` core-only stdlib subset ✅ (release v0.97.0-alpha)
+
+**Goal:** the `core` module with the language primitives
+(`Option`, `Result`, `Iterator`, `Clone`, `Eq`) and no
+OS-dependent functionality. A `no_std` crate links into a kernel,
+a bootloader, or a UEFI application — and still runs hosted for
+testing (libc kept, entry `main`).
+
+**Status (v0.97.0-alpha):** Stage 78 is **COMPLETE**. Five
+`core/*.hls` modules ship (all pure, `no_std`-clean), `core.`
+imports resolve in both compilers with the same walk-up +
+traversal-guard discipline as `std.`, and `#![no_std]`
+enforcement reuses the Stage 77 machinery (same three
+boundaries, hosted codegen).
+
+**Shipped in v0.97.0-alpha (Stage 78):**
+
+- `core/option.hls` — `enum Option[T]` + `option_unwrap` /
+  `unwrap_or` / `is_some` / `is_none` (API-identical to
+  `std.option`; a DIFFERENT type — never import both).
+- `core/result.hls` — `enum Result[T, E]` + `unwrap` /
+  `unwrap_or` / `unwrap_err` / `is_ok` / `is_err` + `parse_int`
+  (no-panic integer parsing with a hand-rolled digit pre-check).
+  No `float_parse` (str→float has no freestanding lowering).
+- `core/iter.hls` — `struct ListIter[T]` + `list_iter` /
+  `iter_next` / `iter_has_next` / `iter_remaining` / `iter_count`
+  / `iter_sum_int` (imports only `core.option`). Free generic
+  functions (generic `impl` blocks are not supported yet — the
+  method form arrives with trait dispatch).
+- `core/clone.hls` — `clone_list_of` / `clone_some` /
+  `clone_map_of` over the `clone()` builtin + the `clone_of`
+  method convention for user structs.
+- `core/eq.hls` — `eq_list_int` / `eq_list_str` / `eq_list_bool` /
+  `eq_option_int` / `eq_option_str` / `eq_map_str_int` (order-
+  insensitive) + the `eq_of` method convention. Generic `==` on a
+  type parameter stays rejected (a `T` may not support
+  comparison) — hence concrete helpers.
+- `core.` resolution in `boot/boot.py` (refactored into one
+  parametrized branch shared with `std.`) and in
+  `src/hlc/main.hls` (`resolve_import_path`).
+- `examples/nostd_demo.hls` (routing-table scan via Iterator,
+  port parsing via Result, container equality — exit 0),
+  `tests/ok/feat_nostd_core.hls` (30-behavior matrix, exit 0),
+  2 `tests/fail/fail_nostd_*.hls` reject tests,
+  `tests/nostd_acceptance.py` (8 sections, 60+ assertions),
+  `make nostd` / `make nostd-acceptance` in `mk/95-osdev.mk`,
+  and the Stage 78 half of `tests/suites/suite_08_osdev.sh`.
+
+**Acceptance (`make nostd-acceptance`):** `core.` resolution +
+guards, standalone parsing, Stage-0 enforcement, core behavior
+probes (INT64_MIN parsing, iterator exhaustion, clone
+independence, order-insensitive map equality),
+freestanding+core bridge (exit 3), std/core duality conflict,
+self-hosted emission (hosted `main` + core fns, zero
+freestanding markers) + parity, hlfmt stability, and mode
+distinction — all PASS.
 

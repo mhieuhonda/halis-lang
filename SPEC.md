@@ -91,8 +91,13 @@
   treats them as a continuation of the previous expression. So statements like
   `(x);` `[1,2];` `-x;` are always syntax errors (they are meaningless).
 
-### 2.3. Comments
+### 2.3. Comments & attributes
 - `#` to end of line. No block comments in v0.2.
+- EXCEPTION (Stage 28+): `#[...]` is an outer attribute list, not a
+  comment (see §27–§31). EXCEPTION (Stage 77): `#![...]` is a
+  crate-level attribute (see §31). Only the exact `#`+`[` and
+  `#`+`!`+`[` trigraphs open attributes — `#! note` is still a
+  comment.
 
 ### 2.4. Identifiers
 - `[A-Za-z_][A-Za-z0-9_]*`. Convention: functions/variables `snake_case`,
@@ -172,7 +177,8 @@ A `.hls` file is a sequence of **top-level** declarations (any order, forward
 references allowed):
 
 ```
-program        := (structdef | enumdef | impl | fndef | import)*
+program        := crate_attr* (structdef | enumdef | impl | fndef | import)*
+crate_attr     := "#![" ("freestanding" | "no_std") "]"   # Stage 77/78, see §31–§32
 structdef      := "struct" Ident typeparams? "{" field ("," field)* ","? "}"
 field          := Ident ":" type ("=" expr)?          # default value is optional (Stage 7)
 enumdef        := "enum" Ident typeparams? "{" variant ("," variant)* ","? "}"
@@ -227,13 +233,18 @@ block          := "{" stmt* "}"
 ```
 import "path/to/file.hls"     # relative path
 import "std.str"              # standard library module
+import "core.option"          # freestanding-safe module (Stage 78)
 ```
 
 - Imports are resolved relative to the importing file's directory, except for
-  `std.*` modules which are resolved by the compiler.
+  `std.*` modules (resolved to `<repo>/std/`) and `core.*` modules
+  (resolved to `<repo>/core/`, Stage 78) which are resolved by the compiler.
 - Each `.hls` file is compiled once per program; circular imports are an error.
 - Imported top-level declarations (structs, functions, methods) become visible
   in the importing file. Duplicate names across files are an error.
+- In `#![freestanding]` / `#![no_std]` crates (Stage 77/78, see
+  §31–§32), `import "std.*"` is rejected — only `core.*` and relative
+  imports are allowed.
 
 ---
 
@@ -2517,3 +2528,181 @@ See `examples/fibonacci.hls` for the acceptance target and
 tail sites, float / bool accumulators, a `while` loop coexisting
 with the tail loop, a panic-literal guard, 50,000-deep runs through
 both backends).
+
+---
+
+## 31. Freestanding mode (Stage 77 — v0.96.0-alpha)
+
+`#![freestanding]` turns the whole program into a freestanding crate:
+no libc, no OS calls, no `std`, entry `_start`. This is the first
+stage of Phase VI (OS development foundation) — the language gains
+the capabilities OS authors need, while the hosted language is
+unchanged.
+
+```hls
+#![freestanding]
+
+fn fib(n: int) -> int {
+    if n < 2 {
+        return n
+    }
+    return fib(n - 1) + fib(n - 2)
+}
+
+fn main() -> int {
+    return fib(10)   # the exit code IS the output (no I/O exists here)
+}
+```
+
+### 31.1. The three boundaries (all enforced statically)
+
+**Module boundary.** `import "std.*"` is rejected — only `core.*`
+(Stage 78) and relative imports are allowed. Rationale: every
+`std` module may assume a host; `core` modules are audited to
+assume nothing.
+
+**Host boundary.** `extern "C"` / `extern "js"` blocks are rejected —
+freestanding code cannot call into a host that does not exist.
+
+**Capability boundary.** Any `uses` clause is rejected — every
+function must be pure. Effectful builtins (`println`, `read_file`,
+`clock_ms`, `rand_int`, `spawn`, ...) are additionally unreachable:
+without a declared capability the existing subset test rejects
+every call site.
+
+### 31.2. The float-library denylist
+
+The freestanding C prelude provides no snprintf, no strtod, no
+libm — so the builtins that lower to them are rejected at check
+time (in BOTH compilers, with the same message):
+
+- the 24 libm-backed `math_*` builtins (`math_sin` … `math_lgamma`);
+- `float(s: str)`, `str.to_float()`, `str(float)`, `float.to_str()`;
+- `float % float` (lowers to `fmod`).
+
+Everything else float stays available: `+ - * /`, comparisons,
+`int`↔`float` casts, `float.to_int()`, `int.to_str()` (hand-rolled
+`%lld`, exact for every int64), and the four predicates
+`math_isnan` / `math_isinf` / `math_isfinite` / `math_signbit`
+(exact bit tests in the prelude, no libm).
+
+### 31.3. The freestanding runtime contract
+
+The C backend emits a freestanding translation unit instead of the
+hosted one:
+
+- **Headers:** only `<stdint.h>`, `<stdbool.h>`, `<stddef.h>` (all
+  freestanding per C11 §4). No `<stdio.h>`, no `<stdlib.h>`, no
+  `<pthread.h>`.
+- **Heap:** a static 1 MiB bump arena backs `malloc`/`calloc`/
+  `realloc` (`free` is a no-op). Allocation sizes ride in an 8-byte
+  header so `realloc` copies the old contents; OOM and size
+  overflow trap. Reclamation is deferred to `core.alloc`
+  (Stage 79) — a freestanding program that outgrows 1 MiB today
+  must be restructured, loudly (a trap) rather than silently.
+- **Panics:** `hl_die` / `hl_die_at` / `hl_panic` trap
+  (`__builtin_trap`) — there is no stderr and no `exit(101)`
+  without an OS. Stage 81 (`#[panic_handler]`) makes this
+  user-overridable.
+- **Entry:** `void _start(void)` calls the HLS `main`, then exits
+  via a raw syscall (x86-64: `rax=60`; AArch64: `x8=93`; RISC-V:
+  `a7=93`; other arches trap after main returns).
+- **Link recipe:** `gcc -O2 -ffreestanding -nostdlib
+  -ffunction-sections -fno-stack-protector -Wl,--gc-sections`.
+  Section garbage-collection drops the dead hosted-only runtime
+  functions (file IO, sockets, pthreads, libm wrappers) before
+  undefined-symbol resolution — only the reached pure functions
+  must resolve, and they do via the prelude.
+
+`--pgo-generate` is rejected in freestanding mode (no
+atexit/file-IO for the profile).
+
+### 31.4. Attribute rules (shared with §32)
+
+- `#![freestanding]` / `#![no_std]` are the only crate attributes.
+  Unknown names, duplicates, and placement after any item are
+  compile errors (in both compilers, byte-identical messages
+  modulo formatting).
+- Crate attributes are honoured ONLY from the entry file — a
+  dependency declaring one is rejected.
+- `#![freestanding]` implies `#![no_std]`.
+
+`boot.py --audit` reports the crate mode (`std` /
+`#![no_std]` / `#![freestanding]`).
+
+---
+
+## 32. `no_std` + the `core` module family (Stage 78 — v0.97.0-alpha)
+
+`#![no_std]` disables `std` exactly like `#![freestanding]`, but
+keeps hosted libc: the C backend still emits `main` and links
+normally. It is the mode for programs that must not DEPEND on the
+hosted standard library (kernels, bootloaders, UEFI apps link this
+form) while still running on a host for testing.
+
+```hls
+#![no_std]
+
+import "core.option"
+import "core.result"
+
+fn parse_port(s: str) -> Result[int, str] {
+    let r: Result[int, str] = parse_int(s)
+    if result_is_err(r) {
+        return Result.Err(result_unwrap_err(r))
+    }
+    return Result.Ok(result_unwrap(r))
+}
+
+fn main() -> int {
+    return result_unwrap_or(parse_port("8080"), 1)
+}
+```
+
+### 32.1. The `core` modules
+
+| Module | Contents |
+|--------|----------|
+| `core.option` | `enum Option[T]` + `option_unwrap` / `unwrap_or` / `is_some` / `is_none` |
+| `core.result` | `enum Result[T, E]` + `unwrap` / `unwrap_or` / `unwrap_err` / `is_ok` / `is_err` + `parse_int` (no-panic integer parsing) |
+| `core.iter` | `struct ListIter[T]` + `list_iter` / `iter_next` / `iter_has_next` / `iter_remaining` / `iter_count` / `iter_sum_int` |
+| `core.clone` | `clone_list_of` / `clone_some` / `clone_map_of` + the `clone_of` method convention |
+| `core.eq` | `eq_list_int` / `eq_list_str` / `eq_list_bool` / `eq_option_int` / `eq_option_str` / `eq_map_str_int` + the `eq_of` method convention |
+
+Every module is pure HLS (`no_std`-clean: no `uses`, no `std`
+imports, no `extern`). `core.iter` imports only `core.option`;
+`core.clone` / `core.eq` import only `core.option`.
+
+### 32.2. Conventions, not yet traits
+
+HLS has no trait dispatch yet (`trait` is still reserved) and
+generic `impl` blocks are not supported yet — so `Iterator`,
+`Clone` and `Eq` ship as documented conventions over free generic
+functions and concrete methods (the same "monomorphic helpers"
+convention `std.tui` uses for `Widget`):
+
+- **Iterator:** an iterator is a struct holding its cursor;
+  `iter_next` yields `Option[T]` (`None` = exhausted).
+- **Clone:** a type with value-copy semantics provides
+  `fn clone_of(self: T) -> T` on its concrete struct.
+- **Eq:** a comparable type provides
+  `fn eq_of(self: T, other: T) -> bool`. Generic `==` on a type
+  parameter is rejected (a `T` may not support comparison), hence
+  the concrete `eq_*` helpers.
+
+When dispatch arrives, each convention maps to a trait unchanged
+in spirit.
+
+### 32.3. `core` vs `std` duality
+
+`core.option` / `core.result` and `std.option` / `std.result`
+declare DIFFERENT `Option` / `Result` types (HLS has no re-export
+mechanism) with intentionally identical APIs — porting is a
+one-line import change, except `float_parse` (absent from
+`core.result`: `str→float` has no freestanding lowering, §31.2).
+Never import both spellings into one program (duplicate-type
+error, by design — the boundary must stay visible).
+
+`float %`, `str(float)`, `float.to_str()`, `str.to_float()` and
+the 24 libm builtins are rejected in `#![freestanding]` mode
+(§31.2) but ALLOWED in `#![no_std]` mode (libc is present).

@@ -13,6 +13,96 @@ stability (125–140), and final stabilisation toward v1.0 (141–150).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
+## [v0.97.0-alpha] — Stage 78: #![no_std] core-only stdlib subset
+
+> Continues **Phase VI (OS-development foundation, Stages 77–96)**
+> — the SECOND stage of the phase. Completes the roadmap's Stage 78
+> promise: "The `core` module contains the language primitives
+> (`Option`, `Result`, `Iterator`, `Clone`, `Eq`) without any
+> OS-dependent functionality."
+>
+> Five `core/*.hls` modules ship (all pure, `no_std`-clean);
+> `import "core.option"` resolves in both compilers with the same
+> walk-up + traversal-guard discipline as `std.`; `#![no_std]`
+> enforcement reuses the Stage 77 machinery with hosted codegen
+> (`main` + libc kept). `examples/nostd_demo.hls` exits 0;
+> `make nostd-acceptance` runs the 8-section gate (60+ assertions).
+
+Implements the roadmap's Stage 78 promise:
+
+- **`core/option.hls`** — `enum Option[T]` + the four helpers
+  (API-identical to `std.option`; a different type by design —
+  importing both is a duplicate-type error).
+- **`core/result.hls`** — `enum Result[T, E]` + five helpers +
+  `parse_int` (no-panic integer parsing, INT64_MIN included). No
+  `float_parse` (str→float has no freestanding lowering).
+- **`core/iter.hls`** — `ListIter[T]` + six free generic
+  functions (generic `impl` blocks are unsupported — the method
+  form arrives with trait dispatch).
+- **`core/clone.hls`** — container clone helpers over the
+  `clone()` builtin + the `clone_of` method convention.
+- **`core/eq.hls`** — six concrete equality helpers
+  (order-insensitive map equality) + the `eq_of` convention
+  (generic `==` on `T` stays rejected).
+- **`core.` resolution** in `boot/boot.py` (one parametrized
+  branch shared with `std.`) and `src/hlc/main.hls`.
+- **Acceptance** (`make nostd-acceptance`): `tests/
+  nostd_acceptance.py` — resolution + guards, standalone
+  parsing, enforcement, behavior probes, freestanding+core
+  bridge, self-hosted emission + parity, hlfmt stability, mode
+  distinction. Plus `tests/ok/feat_nostd_core.hls`, 2 fail
+  tests, `make nostd`, and the Stage 78 half of
+  `tests/suites/suite_08_osdev.sh`.
+
+## [v0.96.0-alpha] — Stage 77: #![freestanding] mode (no libc, no OS calls)
+
+> Opens **Phase VI (OS-development foundation, Stages 77–96)** —
+> the FIRST stage of the phase. Completes the roadmap's Stage 77
+> promise: "A crate-level attribute that disables libc linking,
+> disables the `std` module, and exposes only the `core` module.
+> The entry point is `_start`."
+>
+> Both compilers parse `#![freestanding]` / `#![no_std]` and
+> enforce the module, host, and capability boundaries plus the
+> float-library denylist; the C backend emits a freestanding TU
+> (3 headers, 1 MiB bump arena, trap panics, `_start` with
+> raw-syscall exit) that links `-nostdlib` and runs with the
+> interpreter's exit code. `examples/freestanding_demo.hls` exits
+> 231; `make freestanding-acceptance` runs the 8-section gate
+> (58 assertions, incl. the link-closure proof).
+>
+> Known limitation: the bump arena never reclaims (free is a
+> no-op) — reclamation arrives with `core.alloc` (Stage 79).
+
+Implements the roadmap's Stage 77 promise:
+
+- **Crate attributes** (`boot/lexer.py`, `boot/parser.py`,
+  `boot/boot.py`, `src/hlc/lexer.hls`, `parser.hls`, `types.hls`,
+  `main.hls`): `#![freestanding]` (implies `no_std`) /
+  `#![no_std]`; unknown/duplicate/late/non-entry attributes
+  rejected in both compilers.
+- **Enforcement** (`boot/checking/core.py`, `src/hlc/
+  checker.hls`): `std.*` banned, `extern` banned, any `uses`
+  banned — before body checking, so violations report the
+  mode-specific message. `--audit` reports the crate mode.
+- **Float-library denylist** (both checkers): 24 libm builtins,
+  `float()`, `str(float)`, `str.to_float()`, `float.to_str()`,
+  `float %` rejected; arithmetic, casts, `int.to_str()`, and the
+  four exact bit-test predicates stay available.
+- **Freestanding runtime** (`src/hlc/runtime.hls`):
+  `freestanding_prelude_lines()`, trap panics, exact hand-rolled
+  `hl_str_from_int64`, hosted-only concurrency region guarded
+  out; **entry** (`src/hlc/gen_fn.hls`): `_start` + 3-arch exit
+  syscalls; `--pgo-generate` + freestanding rejected.
+- **Acceptance** (`make freestanding-acceptance`): `tests/
+  freestanding_acceptance.py` — parsing, enforcement (demo + 8
+  fail programs), entry-only rule, denylist (6 denied + 8
+  allowed), audit + fmt, TU shape, link-closure proof, hlc
+  parity. Plus `examples/freestanding_demo.hls`, `tests/ok/
+  feat_freestanding_basic.hls`, `mk/95-osdev.mk`, `tests/suites/
+  suite_08_osdev.sh`, and the freestanding branch in the
+  section-3 differential loop.
+
 ## [v0.95.0-alpha] — Stage 76: hls-wasm-pack — publish-ready wasm + JS glue
 
 > Closes **Phase V (web application track, Stages 63–76)** — the
