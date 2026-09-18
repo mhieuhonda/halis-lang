@@ -56,7 +56,21 @@ for f in tests/ok/*.hls; do
         bad "$name (hlc compile failed)"
         continue
     fi
-    if ! gcc -O2 $CURL_DEFS $LIBCURL_CFLAGS -o "$TMP/$name.bin" "$TMP/$name.c" -lm -pthread $LIBCURL_LIBS 2>"$TMP/$name.gcc"; then
+    # Stage 77 (v0.96.0-alpha): `#![freestanding]` crates enter via
+    # `_start` with no libc — the hosted link recipe (which expects
+    # `main` + libc) cannot link them. Detect the crate attribute and
+    # use the freestanding recipe instead (the same flags documented
+    # in examples/freestanding_demo.hls): -ffreestanding -nostdlib
+    # with -ffunction-sections + --gc-sections so the dead hosted-only
+    # runtime sections vanish before undefined-symbol resolution.
+    if head -5 "$f" | grep -q '#!\[freestanding\]'; then
+        if ! gcc -O2 -ffreestanding -nostdlib -ffunction-sections \
+                -fno-stack-protector -Wl,--gc-sections \
+                -o "$TMP/$name.bin" "$TMP/$name.c" 2>"$TMP/$name.gcc"; then
+            bad "$name (freestanding gcc error)"
+            continue
+        fi
+    elif ! gcc -O2 $CURL_DEFS $LIBCURL_CFLAGS -o "$TMP/$name.bin" "$TMP/$name.c" -lm -pthread $LIBCURL_LIBS 2>"$TMP/$name.gcc"; then
         bad "$name (gcc error)"
         continue
     fi

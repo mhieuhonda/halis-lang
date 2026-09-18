@@ -28,6 +28,7 @@ source "$(dirname "$0")/suites/suite_04_optimizers.sh"
 source "$(dirname "$0")/suites/suite_05_backends.sh"
 source "$(dirname "$0")/suites/suite_06_advanced.sh"
 source "$(dirname "$0")/suites/suite_07_asm.sh"
+source "$(dirname "$0")/suites/suite_08_osdev.sh"
 
 echo "=========================================="
 echo "RESULT: $PASS PASS / $FAIL FAIL"
