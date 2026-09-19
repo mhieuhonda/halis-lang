@@ -1,0 +1,677 @@
+# ============================================================================
+# core/alloc.hls — the Alloc protocol for freestanding code (Stage 79)
+# ----------------------------------------------------------------------------
+# Pure HLS, no `uses`. Imports only `core.option` and `core.result`
+# (freestanding-safe).
+#
+# The Alloc PROTOCOL is the contract a pluggable allocator satisfies.
+# HLS has no trait dispatch yet (the `trait` keyword is reserved for a
+# later stage) and generic `impl` blocks are not supported yet, so the
+# protocol ships as FREE functions per concrete allocator type — the
+# same "monomorphic helpers" convention `core.iter` uses for the
+# Iterator protocol. When `impl` blocks gain type parameters, each
+# `<type>_alloc` below becomes `impl <Type> { fn alloc(...) }`
+# unchanged in spirit.
+#
+# The roadmap's promise for Stage 79 is a pluggable allocator trait:
+#   trait Alloc {
+#       fn alloc(layout: Layout) -> Result[Ptr, AllocError]
+#       fn dealloc(ptr: Ptr, layout: Layout) -> void
+#   }
+# with the user supplying the allocator (bump, slab, buddy, etc.) and
+# `core` using it for `list[T]` / `map[K, V]`. This module ships the
+# protocol's HLS-level surface: `Layout` (size + alignment),
+# `AllocError`, three reference allocators (`BumpAlloc` — fast, no
+# individual reclaim; `PoolAlloc` — fixed-size blocks with free list
+# and double-free detection; `NullAlloc` — sentinel that never
+# allocates), plus an `AllocStats` accounting helper. The runtime
+# integration (lists/maps routing through a user-supplied allocator)
+# is a later stage — it requires a `global_alloc` registration that
+# the language cannot express yet without traits or a `register_alloc`
+# builtin. What `core.alloc` PROVES here is that the protocol itself
+# composes: any user-defined data structure that takes an allocator
+# can swap bump / pool / null behind the same call sites.
+#
+# ON "POINTERS": HLS has no raw pointer type yet. The `int` returned by
+# `*_alloc` is a LOGICAL ADDRESS — a byte offset within a backing
+# region the user owns (typically a `list[int]` sized to the
+# allocator's capacity, or a side table indexed by the returned
+# offset). The allocator is a pure bookkeeping abstraction: it
+# hands out offsets, tracks which are live, and (for reclaiming
+# allocators) returns them on `*_dealloc`. A future stage adds
+# `Ptr[T]` raw-pointer types once the verifier can prove the
+# lifetime invariants; until then, the logical-address contract is
+# the same one a kernel's pre-paging bump allocator honours.
+#
+# ON "void" DEALLOC: the roadmap's signature is
+# `fn dealloc(...) -> void`. This module returns
+# `Result[int, AllocError]` from `*_dealloc` instead, because the
+# pool allocator can DETECT a double-free or an out-of-range pointer
+# at dealloc time — silently dropping that information would be a
+# soundness hole (a kernel that double-frees a page frame must
+# panic, not continue). The `Ok(0)` success value mirrors the
+# `void` return; users who don't care about the error case can
+# `let _ = pool_dealloc(a, ptr, l)` and ignore it. A future trait
+# version may surface both modes (`dealloc` vs `dealloc_checked`).
+# ============================================================================
+
+import "core.option"
+import "core.result"
+
+# ---------------------------------------------------------------------------
+# Layout — a (size, align) allocation request
+# ---------------------------------------------------------------------------
+# A layout describes an allocation request: the size in bytes and the
+# minimum alignment in bytes (must be a power of two). Layouts are
+# constructed via `layout_new` (which validates); the struct fields
+# are public so kernel code can build them inline when the layout is
+# statically known (and the verifier has already proven it well-formed).
+struct Layout {
+    size: int,
+    align: int
+}
+
+# The error set an allocator can report.
+#   OutOfMemory: the backing region is full (no space at the requested layout)
+#   BadLayout:   the layout is invalid (zero size, non-power-of-two align,
+#                align above the page-size cap)
+#   DoubleFree:  a `dealloc` was called on a pointer that was not live
+#                (already freed, or never allocated by this allocator)
+#   OutOfRange:  a `dealloc` was called on a pointer outside the
+#                allocator's region (not a pointer this allocator issued)
+enum AllocError {
+    OutOfMemory,
+    BadLayout,
+    DoubleFree,
+    OutOfRange
+}
+
+# Returns the error variant's name (no `panic`/`uses IO` — str only).
+# Useful for diagnostics that surface in a `Result` chain; the
+# variant order matches the `AllocError` declaration order so kernel
+# serialisers can render the index as a stable identifier.
+fn alloc_error_msg(e: AllocError) -> str {
+    return match e {
+        AllocError.OutOfMemory => "out of memory",
+        AllocError.BadLayout => "bad layout",
+        AllocError.DoubleFree => "double free",
+        AllocError.OutOfRange => "out of range"
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Layout helpers
+# ---------------------------------------------------------------------------
+
+# True iff `n` is a positive power of two (1, 2, 4, 8, ...). Used by
+# `layout_new` to validate the alignment field. The bit trick
+# `n > 0 && int_and(n, n - 1) == 0` works because a power of two in
+# two's complement has exactly one bit set; subtracting 1 clears that
+# bit and sets all the lower ones, so AND-ing the two yields zero.
+# HLS has no bitwise operators in its grammar (the `&`, `|`, `^`,
+# `~`, `<<`, `>>` tokens are not in the lexer) — the language core
+# treats int as a mathematical int64 with checked arithmetic only
+# and exposes the bit operations as pure builtins (`int_and`,
+# `int_or`, `int_xor`, `int_not`, `int_shl`, `int_shr`, `int_sar`).
+# These builtins are available in `#![no_std]` / `#![freestanding]`
+# mode (they compile to a single C operation; no libc required).
+fn layout_is_power_of_two(n: int) -> bool {
+    return n > 0 && int_and(n, n - 1) == 0
+}
+
+# Constructs a layout from a size and alignment. Returns Err(BadLayout)
+# if size <= 0, align is not a power of two, or align exceeds 4096
+# (page-sized alignments are the largest a kernel usually requests;
+# larger alignments belong to huge pages, which arrive with `core.mem`
+# in Stage 80). Otherwise returns Ok(Layout). The two fields are
+# stored verbatim — no implicit rounding — so the user can recover
+# the original request from the layout.
+fn layout_new(size: int, align: int) -> Result[Layout, AllocError] {
+    if size <= 0 {
+        return Result.Err(AllocError.BadLayout)
+    }
+    if !layout_is_power_of_two(align) {
+        return Result.Err(AllocError.BadLayout)
+    }
+    if align > 4096 {
+        return Result.Err(AllocError.BadLayout)
+    }
+    return Result.Ok(Layout {
+        size: size, align: align
+    })
+}
+
+# A convenience for the common case: a layout for `n` words of
+# 8-byte-aligned storage (the natural alignment for an int64 / pointer
+# slot on a 64-bit machine). Returns Err(BadLayout) if n <= 0.
+fn layout_for_words(n: int) -> Result[Layout, AllocError] {
+    if n <= 0 {
+        return Result.Err(AllocError.BadLayout)
+    }
+    return Result.Ok(Layout {
+        size: n * 8, align: 8
+    })
+}
+
+# Rounds `n` up to the next multiple of `align`. `align` must be a
+# positive power of two (unchecked here — the callers below ensure
+# it via `layout_new`). The identity
+# `int_and(n + align - 1, int_not(align - 1))` is the standard
+# align-up trick: it adds (align - 1) so any remainder pushes into
+# the next aligned slot, then masks off the low bits (via bitwise
+# NOT of (align - 1)) to round down to a multiple of align. The
+# builtins `int_and` and `int_not` are pure and freestanding-safe
+# (each compiles to a single C operation).
+fn layout_align_up(n: int, align: int) -> int {
+    return int_and(n + align - 1, int_not(align - 1))
+}
+
+# The size field of a layout (in bytes).
+fn layout_size(l: Layout) -> int {
+    return l.size
+}
+
+# The align field of a layout (in bytes; a positive power of two).
+fn layout_align(l: Layout) -> int {
+    return l.align
+}
+
+# The size required to satisfy the layout, rounded up to the
+# alignment. An allocator that hands out `layout_pad_to(l)` bytes per
+# request keeps every subsequent allocation aligned to `l.align`
+# without an extra alignment fixup. This is the "stride" the bump
+# allocator advances per request.
+fn layout_pad_to(l: Layout) -> int {
+    return layout_align_up(l.size, l.align)
+}
+
+# Returns a copy of `l` with the size replaced by `n` (the align
+# stays the same). Useful for growing an allocation in place: ask
+# the allocator for `layout_resize(l, new_size)`. Returns
+# Err(BadLayout) if n <= 0.
+fn layout_resize(l: Layout, n: int) -> Result[Layout, AllocError] {
+    if n <= 0 {
+        return Result.Err(AllocError.BadLayout)
+    }
+    return Result.Ok(Layout {
+        size: n, align: l.align
+    })
+}
+
+# ---------------------------------------------------------------------------
+# BumpAlloc — fast, monotonic, no individual reclaim
+# ---------------------------------------------------------------------------
+# A bump allocator hands out offsets in a contiguous region. The
+# region's logical base is 0; the user supplies the capacity at
+# construction. `bump_alloc` advances a cursor by the layout's padded
+# size and returns the previous cursor (the offset of the new
+# allocation). `bump_dealloc` is a no-op (the bump allocator cannot
+# reclaim individual blocks). `bump_reset` reclaims the whole region
+# in one shot — useful for arena-style work where every allocation
+# made between two reset points is logically a scratch set.
+#
+# Use this for: scratch buffers, request-scoped allocations in a
+# web server, init-time data that lives for the whole program.
+# Do NOT use this for: long-lived allocations interleaved with
+# short-lived ones — the bump allocator never reclaims between them,
+# so the long-lived data pins the short-lived data's space.
+
+struct BumpAlloc {
+    capacity: int,
+    offset: int,
+    peak: int,
+    allocations: int
+}
+
+# Constructs an empty bump allocator with the given capacity (in
+# bytes). Capacity must be positive; the allocator never grows past
+# it. The offset starts at 0; the peak starts at 0; the allocation
+# count starts at 0. The user is responsible for providing backing
+# storage of at least `capacity` bytes (a `list[int]` of
+# `capacity / 8` words, for example).
+fn bump_new(capacity: int) -> BumpAlloc {
+    return BumpAlloc {
+        capacity: capacity, offset: 0, peak: 0, allocations: 0
+    }
+}
+
+# Allocates `l.size` bytes (rounded up to `l.align`) from the bump
+# region. Returns `Ok(offset)` — the offset of the new allocation
+# within the region — or `Err(OutOfMemory)` if the region is full.
+#
+# The returned offset is aligned to `l.align`: the allocator rounds
+# the current cursor UP to the layout's alignment before recording
+# the allocation's offset, then advances by the padded size. If the
+# alignment padding would push the cursor out of capacity, the
+# allocation fails (no partial state is left). The peak watermark
+# and allocation count are updated on success only.
+#
+# On a bad layout (size <= 0 or align is not a positive power of
+# two) the allocator returns Err(BadLayout) — `layout_new` already
+# rejects these, but the defensive check catches hand-constructed
+# layouts that bypassed the validator.
+fn bump_alloc(mut a: BumpAlloc, l: Layout) -> Result[int, AllocError] {
+    if l.size <= 0 || !layout_is_power_of_two(l.align) {
+        return Result.Err(AllocError.BadLayout)
+    }
+    if l.align > 4096 {
+        return Result.Err(AllocError.BadLayout)
+    }
+    let aligned: int = layout_align_up(a.offset, l.align)
+    let padded: int = layout_pad_to(l)
+    # Two overflow checks: aligned + padded must not wrap (signed
+    # overflow is a panic in HLS), and must not exceed capacity.
+    # The first check (aligned > capacity) catches the case where
+    # the alignment padding alone already overshot; the second
+    # (padded > capacity - aligned) catches the normal "no room
+    # for this allocation" case.
+    if aligned > a.capacity {
+        return Result.Err(AllocError.OutOfMemory)
+    }
+    if padded > a.capacity - aligned {
+        return Result.Err(AllocError.OutOfMemory)
+    }
+    let new_offset: int = aligned + padded
+    if new_offset > a.peak {
+        a.peak = new_offset
+    }
+    a.offset = new_offset
+    a.allocations = a.allocations + 1
+    return Result.Ok(aligned)
+}
+
+# No-op: the bump allocator cannot reclaim individual allocations.
+# Provided for protocol parity with the other allocators — a generic
+# `with_alloc<T>` helper that calls `<type>_dealloc` on every scope
+# exit can call this without case analysis. The `Result` is Ok(0)
+# because the bump allocator never detects a bad dealloc (it has no
+# per-block metadata to check). The arguments are accepted but
+# unused, mirroring the roadmap's `dealloc(ptr, layout) -> void`
+# signature.
+fn bump_dealloc(a: BumpAlloc, ptr: int, l: Layout) -> Result[int, AllocError] {
+    return Result.Ok(0)
+}
+
+# Reclaims the whole region in one shot. The offset returns to 0;
+# the peak and allocation count are preserved (they record the
+# allocator's high-water mark across reset cycles, useful for sizing
+# the next region: pick `bump_peak(a) + slack` as the next capacity).
+# A subsequent `bump_alloc` reuses the freed space.
+fn bump_reset(mut a: BumpAlloc) -> void {
+    a.offset = 0
+}
+
+# The current offset (bytes consumed so far in this reset cycle).
+# Returns 0 immediately after `bump_reset`.
+fn bump_used(a: BumpAlloc) -> int {
+    return a.offset
+}
+
+# The high-water mark — the largest `offset` the allocator ever
+# reached across all reset cycles. `bump_peak(a) <= a.capacity`
+# is an invariant; if it's tight, the next region should grow.
+fn bump_peak(a: BumpAlloc) -> int {
+    return a.peak
+}
+
+# The total number of allocations served (across all reset cycles).
+# This is monotonically increasing — `bump_reset` does not zero it.
+fn bump_allocations(a: BumpAlloc) -> int {
+    return a.allocations
+}
+
+# The capacity (in bytes) the allocator was constructed with. The
+# allocator never grows past this; the user must size the backing
+# storage to match.
+fn bump_capacity(a: BumpAlloc) -> int {
+    return a.capacity
+}
+
+# True iff the allocator is at capacity for the current reset cycle.
+# Equivalent to `bump_used(a) == bump_capacity(a)`. A full
+# allocator returns Err(OutOfMemory) from the next `bump_alloc`.
+fn bump_full(a: BumpAlloc) -> bool {
+    return a.offset >= a.capacity
+}
+
+# ---------------------------------------------------------------------------
+# PoolAlloc — fixed-size block pool with reclaim and double-free detection
+# ---------------------------------------------------------------------------
+# A pool allocator hands out fixed-size blocks. The user constructs
+# the pool with a block size and a block count; the region is the
+# contiguous span [0, block_size * count). `pool_alloc` returns the
+# offset of the next free block (or `Err(OutOfMemory)` if all are
+# live). `pool_dealloc` returns a block to the free list and reports
+# `Err(DoubleFree)` if the block was not live, `Err(OutOfRange)` if
+# the offset is outside the region or not block-aligned.
+#
+# The free list is a LIFO stack (the most recently freed block is
+# the next one allocated) — cache-friendly for the common
+# "allocate, free, allocate same size" pattern. Initial construction
+# pushes blocks so the FIRST allocation returns offset 0 (the lowest
+# block), then 1, 2, ..., block_count - 1 — a deterministic,
+# cache-warm order for the first fill of the pool.
+#
+# Use this for: kernel page frames (4 KB blocks), task-control-block
+# pools, fixed-size message queues. Do NOT use this for variably-
+# sized allocations — a 1-byte request occupies a whole block.
+
+struct PoolAlloc {
+    block_size: int,
+    block_count: int,
+    free_list: list[int],
+    in_use: list[bool],
+    allocations: int,
+    peak: int
+}
+
+# Constructs an empty pool. `block_size` and `count` must both be
+# positive; a non-positive argument produces an empty pool that
+# rejects every allocation (the caller is expected to validate the
+# arguments before constructing the pool — this matches the
+# freestanding philosophy of "no hidden panics").
+#
+# The free list is initialised with every block offset (in reverse
+# order, so pop() yields offset 0 first, then 1, ...). The `in_use`
+# list is parallel-indexed by block number (offset / block_size) and
+# starts all-false. The peak watermark and allocation count start at 0.
+fn pool_new(block_size: int, count: int) -> PoolAlloc {
+    let free: list[int] = []
+    let in_use: list[bool] = []
+    if block_size <= 0 || count <= 0 {
+        return PoolAlloc {
+            block_size: block_size, block_count: count,
+            free_list: free, in_use: in_use,
+            allocations: 0, peak: 0
+        }
+    }
+    let mut i: int = count
+    while i > 0 {
+        i = i - 1
+        free.push(block_size * i)
+        in_use.push(false)
+    }
+    return PoolAlloc {
+        block_size: block_size, block_count: count,
+        free_list: free, in_use: in_use,
+        allocations: 0, peak: 0
+    }
+}
+
+# Allocates one block from the pool. Returns `Ok(offset)` — the byte
+# offset of the new block within the region — or `Err(OutOfMemory)`
+# if the pool is exhausted or the layout's size exceeds the block
+# size. The layout's alignment is NOT enforced to divide the block
+# size: kernel code typically asks for `Layout { size: 64, align: 64 }`
+# from a 4096-byte block pool and uses the returned offset directly
+# (the block itself is aligned to the pool's base, which the user
+# controls). If the layout's alignment is greater than the block
+# size, the request fails with `Err(OutOfMemory)` (no block can
+# satisfy an alignment coarser than its own size).
+fn pool_alloc(mut a: PoolAlloc, l: Layout) -> Result[int, AllocError] {
+    if l.size <= 0 || !layout_is_power_of_two(l.align) {
+        return Result.Err(AllocError.BadLayout)
+    }
+    if a.block_size <= 0 || a.block_count <= 0 {
+        return Result.Err(AllocError.OutOfMemory)
+    }
+    if l.size > a.block_size {
+        return Result.Err(AllocError.OutOfMemory)
+    }
+    if l.align > a.block_size {
+        return Result.Err(AllocError.OutOfMemory)
+    }
+    if a.free_list.len() == 0 {
+        return Result.Err(AllocError.OutOfMemory)
+    }
+    let offset: int = a.free_list.pop()
+    let block_index: int = offset / a.block_size
+    if block_index < 0 || block_index >= a.block_count {
+        return Result.Err(AllocError.OutOfRange)
+    }
+    a.in_use.set(block_index, true)
+    a.allocations = a.allocations + 1
+    let used: int = a.block_count - a.free_list.len()
+    if used > a.peak {
+        a.peak = used
+    }
+    return Result.Ok(offset)
+}
+
+# Returns a block to the free list. The pointer must be one this
+# pool previously issued: a non-negative, block-aligned offset
+# within the region [0, block_size * block_count). The layout is
+# accepted but ignored (the block size is fixed at construction).
+#
+# Returns:
+#   Ok(0)         — the block was live and is now free
+#   Err(DoubleFree)   — the block was already free (or never allocated)
+#   Err(OutOfRange)   — the offset is outside the region or not
+#                       block-aligned
+#
+# The double-free detection is the pool allocator's primary
+# soundness guarantee: a kernel that double-frees a page frame
+# must catch it at the second free, not silently corrupt the free
+# list. The check is O(1) — a single `in_use` lookup.
+fn pool_dealloc(mut a: PoolAlloc, ptr: int, l: Layout) -> Result[int, AllocError] {
+    if a.block_size <= 0 || a.block_count <= 0 {
+        return Result.Err(AllocError.OutOfRange)
+    }
+    if ptr < 0 {
+        return Result.Err(AllocError.OutOfRange)
+    }
+    if ptr >= a.block_size * a.block_count {
+        return Result.Err(AllocError.OutOfRange)
+    }
+    let block_index: int = ptr / a.block_size
+    if block_index < 0 || block_index >= a.block_count {
+        return Result.Err(AllocError.OutOfRange)
+    }
+    if ptr != block_index * a.block_size {
+        return Result.Err(AllocError.OutOfRange)
+    }
+    if !a.in_use.get(block_index) {
+        return Result.Err(AllocError.DoubleFree)
+    }
+    a.in_use.set(block_index, false)
+    a.free_list.push(ptr)
+    return Result.Ok(0)
+}
+
+# The number of free blocks currently available for allocation.
+# Equivalent to `pool_total(a) - pool_used(a)`.
+fn pool_free_count(a: PoolAlloc) -> int {
+    return a.free_list.len()
+}
+
+# The number of blocks currently in use (allocated and not freed).
+fn pool_used_count(a: PoolAlloc) -> int {
+    return a.block_count - a.free_list.len()
+}
+
+# The total number of blocks the pool was constructed with. The
+# allocator never grows past this; the user must size the backing
+# storage to `pool_total(a) * pool_block_size(a)` bytes.
+fn pool_total(a: PoolAlloc) -> int {
+    return a.block_count
+}
+
+# The block size (in bytes) the pool was constructed with. Every
+# allocation from this pool occupies exactly one block.
+fn pool_block_size(a: PoolAlloc) -> int {
+    return a.block_size
+}
+
+# The high-water mark — the largest `pool_used_count(a)` the pool
+# ever reached. `pool_peak(a) <= pool_total(a)` is an invariant; if
+# it's tight, the next pool should grow.
+fn pool_peak(a: PoolAlloc) -> int {
+    return a.peak
+}
+
+# The total number of allocations served (across the pool's
+# lifetime, including blocks that have since been freed). This is
+# monotonically increasing — dealloc does not decrement it.
+fn pool_allocations(a: PoolAlloc) -> int {
+    return a.allocations
+}
+
+# True iff the pool has no free blocks for the current cycle.
+# Equivalent to `pool_free_count(a) == 0`. A full pool returns
+# Err(OutOfMemory) from the next `pool_alloc`.
+fn pool_full(a: PoolAlloc) -> bool {
+    return a.free_list.len() == 0
+}
+
+# ---------------------------------------------------------------------------
+# NullAlloc — sentinel that never allocates
+# ---------------------------------------------------------------------------
+# A null allocator rejects every allocation request with
+# `Err(OutOfMemory)`. It exists so a kernel can declare at type
+# level "this code path never allocates" — e.g. an IRQ handler
+# (Stage 91's verified interrupt-safety) takes a `NullAlloc` and
+# the verifier proves the handler never calls `<type>_alloc` on it
+# (because the call site wouldn't compile — the result is always
+# Err and the user must match). The Stage 91 checker is the
+# consumer of this type; Stage 79 just ships the sentinel.
+#
+# `null_alloc_dealloc` returns `Err(OutOfRange)` because no
+# pointer was ever issued — deallocating anything is logically
+# "out of this allocator's range". The struct carries a single
+# placeholder field (`_marker`) because HLS requires every struct
+# to have at least one field (zero-field structs are not yet in
+# the grammar). The marker is a constant 0 and never read.
+
+struct NullAlloc {
+    _marker: int
+}
+
+# Constructs a NullAlloc. The struct has no real state; the
+# `_marker` field is a placeholder required by the grammar. The
+# constructor hides this from callers, so they can write
+# `let a = null_alloc_new()` without knowing about the marker.
+fn null_alloc_new() -> NullAlloc {
+    return NullAlloc {
+        _marker: 0
+    }
+}
+
+# Always returns Err(OutOfMemory). The null allocator is a compile-
+# time proof that no allocation happens on this code path: the
+# caller must match the Result and handle the error, which is the
+# verifier's hook for "this code is allocation-free".
+fn null_alloc_alloc(a: NullAlloc, l: Layout) -> Result[int, AllocError] {
+    return Result.Err(AllocError.OutOfMemory)
+}
+
+# Always returns Err(OutOfRange). The null allocator never issued
+# a pointer, so any dealloc is "out of this allocator's range".
+fn null_alloc_dealloc(a: NullAlloc, ptr: int, l: Layout) -> Result[int, AllocError] {
+    return Result.Err(AllocError.OutOfRange)
+}
+
+# ---------------------------------------------------------------------------
+# AllocStats — accounting helper (not an allocator)
+# ---------------------------------------------------------------------------
+# A stats tracker records the cumulative bytes allocated and freed
+# across some body of code, plus a peak watermark. It is NOT an
+# allocator — it has no `*_alloc`/`*_dealloc` functions; the user
+# calls `stats_record_alloc` and `stats_record_dealloc` after a
+# successful allocation / deallocation on the real allocator. Use
+# this for: kernel memory-pressure gauges, allocator-sizing studies
+# ("how big should the next region be?"), and the runtime's
+# soft-real-time bounded-allocation mode (Stage 126 — a stage that
+# reads the current bytes-in-use from an AllocStats and rejects
+# allocations above a watermark).
+#
+# The tracker is a pure value type — clone it to snapshot the
+# counters at a point in time. The peak is the maximum of
+# `current` over the tracker's lifetime, where `current` is
+# `bytes_alloc - bytes_dealloc`. A negative current is a leak
+# indicator (more deallocs than allocs — usually a double-free
+# elsewhere in the program).
+
+struct AllocStats {
+    bytes_alloc: int,
+    bytes_dealloc: int,
+    allocations: int,
+    deallocations: int,
+    peak: int
+}
+
+# Constructs a zeroed stats tracker.
+fn stats_new() -> AllocStats {
+    return AllocStats {
+        bytes_alloc: 0, bytes_dealloc: 0,
+        allocations: 0, deallocations: 0, peak: 0
+    }
+}
+
+# Records an allocation of `size` bytes. Updates the cumulative
+# allocation counter, the allocation count, and (if the current
+# in-use byte count exceeds the previous peak) the peak watermark.
+# The size is the layout's PADDED size (call `layout_pad_to(l)` to
+# compute it) — recording the raw requested size would understate
+# the true footprint and let the peak watermark lag behind reality.
+fn stats_record_alloc(mut s: AllocStats, size: int) -> void {
+    if size < 0 {
+        return
+    }
+    s.bytes_alloc = s.bytes_alloc + size
+    s.allocations = s.allocations + 1
+    let cur: int = s.bytes_alloc - s.bytes_dealloc
+    if cur > s.peak {
+        s.peak = cur
+    }
+}
+
+# Records a deallocation of `size` bytes. Updates the cumulative
+# deallocation counter and the deallocation count. The peak is
+# NOT adjusted downward — it records the high-water mark, not the
+# current in-use count. A negative `size` is silently dropped
+# (defensive — a buggy caller shouldn't corrupt the stats).
+fn stats_record_dealloc(mut s: AllocStats, size: int) -> void {
+    if size < 0 {
+        return
+    }
+    s.bytes_dealloc = s.bytes_dealloc + size
+    s.deallocations = s.deallocations + 1
+}
+
+# The cumulative bytes allocated (across the tracker's lifetime).
+fn stats_bytes_alloc(s: AllocStats) -> int {
+    return s.bytes_alloc
+}
+
+# The cumulative bytes freed (across the tracker's lifetime).
+fn stats_bytes_dealloc(s: AllocStats) -> int {
+    return s.bytes_dealloc
+}
+
+# The current in-use byte count (`bytes_alloc - bytes_dealloc`).
+# A negative value indicates more deallocations than allocations
+# were recorded — usually a double-free or a misrecording upstream.
+fn stats_current(s: AllocStats) -> int {
+    return s.bytes_alloc - s.bytes_dealloc
+}
+
+# The high-water mark — the largest `stats_current` ever recorded.
+# Monotonically non-decreasing; `stats_record_dealloc` does not
+# lower it. Useful for sizing the next region: pick
+# `stats_peak(s) + slack` as the next capacity.
+fn stats_peak(s: AllocStats) -> int {
+    return s.peak
+}
+
+# The total number of allocations recorded (across the tracker's
+# lifetime). Monotonically increasing — `stats_record_dealloc`
+# does not decrement it.
+fn stats_allocations(s: AllocStats) -> int {
+    return s.allocations
+}
+
+# The total number of deallocations recorded (across the
+# tracker's lifetime). Monotonically increasing.
+fn stats_deallocations(s: AllocStats) -> int {
+    return s.deallocations
+}

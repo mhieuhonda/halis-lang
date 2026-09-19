@@ -1,0 +1,280 @@
+# ============================================================================
+# examples/alloc_demo.hls — Stage 79 (v0.98.0-alpha)
+# ----------------------------------------------------------------------------
+# A `#![no_std]` program demonstrating the `core.alloc` protocol: a
+# tiny kernel-style "request router" that uses a BumpAlloc for the
+# per-request scratch buffer and a PoolAlloc for the fixed-size
+# route-entry table. The exit code is 0 on success (no I/O —
+# `no_std` keeps libc but the program performs none by design,
+# exactly the pattern a kernel follows before serial is up).
+#
+# Build + run (hosted toolchain):
+#   bin/hlc examples/alloc_demo.hls /tmp/alloc_demo.c
+#   gcc -O2 -o /tmp/alloc_demo /tmp/alloc_demo.c -lm -pthread
+#   /tmp/alloc_demo; echo "exit=$?"   # exit=0
+#
+# The same crate with `#![freestanding]` instead of `#![no_std]`
+# links with `-nostdlib` and enters via `_start` (Stage 77).
+# ============================================================================
+
+#![no_std]
+
+import "core.alloc"
+import "core.option"
+import "core.result"
+
+# A route entry: the path's first byte (a poor man's path label) and
+# the handler's cost weight. Kernel route tables are typically 10s
+# of entries; we cap at 4 for the demo (one PoolAlloc block per
+# route).
+struct Route {
+    label: int,
+    cost: int
+}
+
+# A request scope: a BumpAlloc-backed scratch buffer for transient
+# data (parsed args, scratch strings, etc.). Every request gets a
+# fresh scope; bump_reset reclaims the whole scope at the end.
+struct Scope {
+    bump: BumpAlloc,
+    stats: AllocStats
+}
+
+# Constructs a new request scope with the given scratch capacity.
+fn scope_new(capacity: int) -> Scope {
+    return Scope {
+        bump: bump_new(capacity),
+        stats: stats_new()
+    }
+}
+
+# Allocates `size` bytes of 8-byte-aligned scratch from the scope's
+# bump allocator; records the allocation in the stats tracker.
+# Returns the offset (the caller indexes into their own backing
+# storage with it). On OutOfMemory, returns Err(OutOfMemory) — the
+# caller is expected to bail out of the request.
+fn scope_alloc(s: Scope, size: int) -> Result[int, AllocError] {
+    let lr: Result[Layout, AllocError] = layout_new(size, 8)
+    if result_is_err(lr) {
+        return Result.Err(AllocError.BadLayout)
+    }
+    let l: Layout = result_unwrap(lr)
+    let pr: Result[int, AllocError] = bump_alloc(s.bump, l)
+    if result_is_err(pr) {
+        return pr
+    }
+    let p: int = result_unwrap(pr)
+    stats_record_alloc(s.stats, layout_pad_to(l))
+    return Result.Ok(p)
+}
+
+# Resets the scope's bump allocator at the end of the request. The
+# peak watermark and allocation count survive the reset (they
+# record the scope's high-water mark for the next sizing decision).
+fn scope_end(s: Scope) -> void {
+    bump_reset(s.bump)
+}
+
+# The route table: a PoolAlloc of 4 route-sized blocks. Each block
+# holds one Route. The pool's free-list LIFO pattern means the
+# most-recently-removed route is the next one inserted — exactly the
+# cache-friendly "evict and reinsert" pattern a kernel uses.
+struct RouteTable {
+    pool: PoolAlloc,
+    routes: list[Route]
+}
+
+# Constructs an empty route table with 4 slots.
+fn routes_new() -> RouteTable {
+    # Each block holds one Route (two int64s = 16 bytes); pad to 16
+    # for natural alignment.
+    return RouteTable {
+        pool: pool_new(16, 4),
+        routes: []
+    }
+}
+
+# Inserts a route into the table. Returns Ok(block_offset) on
+# success, Err(OutOfMemory) if the table is full. The route is
+# pushed onto the routes list (a parallel index of live routes,
+# used to find the cheapest one).
+fn routes_insert(rt: RouteTable, r: Route) -> Result[int, AllocError] {
+    let l: Layout = result_unwrap(layout_new(16, 8))
+    let pr: Result[int, AllocError] = pool_alloc(rt.pool, l)
+    if result_is_err(pr) {
+        return pr
+    }
+    rt.routes.push(r)
+    return pr
+}
+
+# Removes a route from the table by block offset; returns the
+# block to the pool. Detects double-free (kernel: page-frame
+# recycle bug). Returns Ok(0) on success, Err(DoubleFree) or
+# Err(OutOfRange) on misuse.
+fn routes_remove(rt: RouteTable, block_offset: int) -> Result[int, AllocError] {
+    let l: Layout = result_unwrap(layout_new(16, 8))
+    return pool_dealloc(rt.pool, block_offset, l)
+}
+
+# Picks the route with the lowest cost from the live set. Returns
+# Option.Some(Route) if any routes are live, Option.None otherwise.
+fn cheapest_route(rt: RouteTable) -> Option[Route] {
+    let mut i: int = 0
+    let mut best: Option[Route] = Option.None
+    while i < rt.routes.len() {
+        let cur: Route = rt.routes.get(i)
+        if option_is_none(best) {
+            best = Option.Some(cur)
+        } else {
+            let b: Route = option_unwrap(best)
+            if cur.cost < b.cost {
+                best = Option.Some(cur)
+            }
+        }
+        i = i + 1
+    }
+    return best
+}
+
+fn main() -> int {
+    let mut failures: int = 0
+
+    # ---- per-request scope: bump-allocate three scratch buffers ----
+    let scope: Scope = scope_new(256)
+    let a1: Result[int, AllocError] = scope_alloc(scope, 32)
+    if result_is_err(a1) {
+        failures = failures + 1
+    } else {
+        if result_unwrap(a1) != 0 {
+            failures = failures + 1
+        }
+    }
+    let a2: Result[int, AllocError] = scope_alloc(scope, 64)
+    if result_is_err(a2) {
+        failures = failures + 1
+    } else {
+        if result_unwrap(a2) != 32 {
+            failures = failures + 1
+        }
+    }
+    let a3: Result[int, AllocError] = scope_alloc(scope, 16)
+    if result_is_err(a3) {
+        failures = failures + 1
+    } else {
+        if result_unwrap(a3) != 96 {
+            failures = failures + 1
+        }
+    }
+    # Stats: three allocations, 32 + 64 + 16 = 112 bytes
+    if stats_allocations(scope.stats) != 3 {
+        failures = failures + 1
+    }
+    if stats_current(scope.stats) != 112 {
+        failures = failures + 1
+    }
+    if stats_peak(scope.stats) != 112 {
+        failures = failures + 1
+    }
+    # Bump usage: 112 bytes (32 + 64 + 16, all 8-aligned)
+    if bump_used(scope.bump) != 112 {
+        failures = failures + 1
+    }
+    # End the request: reclaim the bump
+    scope_end(scope)
+    if bump_used(scope.bump) != 0 {
+        failures = failures + 1
+    }
+    # Peak survives the reset (the high-water mark across the scope)
+    if stats_peak(scope.stats) != 112 {
+        failures = failures + 1
+    }
+
+    # ---- route table: insert 3 routes, find cheapest, remove one ----
+    let rt: RouteTable = routes_new()
+    if pool_free_count(rt.pool) != 4 {
+        failures = failures + 1
+    }
+    let _i1: int = result_unwrap(routes_insert(rt, Route {
+        label: 65, cost: 9
+    })) # 'A'
+    let _i2: int = result_unwrap(routes_insert(rt, Route {
+        label: 66, cost: 3
+    })) # 'B'
+    let _i3: int = result_unwrap(routes_insert(rt, Route {
+        label: 67, cost: 7
+    })) # 'C'
+    if pool_used_count(rt.pool) != 3 {
+        failures = failures + 1
+    }
+    if pool_free_count(rt.pool) != 1 {
+        failures = failures + 1
+    }
+    if pool_peak(rt.pool) != 3 {
+        failures = failures + 1
+    }
+    # Cheapest is 'B' (cost 3)
+    let best: Option[Route] = cheapest_route(rt)
+    if option_is_none(best) {
+        failures = failures + 1
+    } else {
+        if option_unwrap(best).label != 66 {
+            failures = failures + 1
+        }
+    }
+    # Remove the cheapest (block offset 16, the second block —
+    # because pool_alloc returns 0, 16, 32, 48 in order)
+    let _rm: int = result_unwrap(routes_remove(rt, 16))
+    if pool_used_count(rt.pool) != 2 {
+        failures = failures + 1
+    }
+    # Double-free the same block: must be detected
+    if !result_is_err(routes_remove(rt, 16)) {
+        failures = failures + 1
+    }
+    # Re-inserting now recycles block 16 (LIFO free list)
+    let recycled: int = result_unwrap(routes_insert(rt, Route {
+        label: 68, cost: 1
+    })) # 'D'
+    if recycled != 16 {
+        failures = failures + 1
+    }
+    # The cheapest is now 'D' (cost 1)
+    let best2: Option[Route] = cheapest_route(rt)
+    if option_is_none(best2) {
+        failures = failures + 1
+    } else {
+        if option_unwrap(best2).label != 68 {
+            failures = failures + 1
+        }
+    }
+    # Fill the table to capacity (4 routes: A, C, D + new E)
+    let _i4: int = result_unwrap(routes_insert(rt, Route {
+        label: 69, cost: 5
+    })) # 'E'
+    if !pool_full(rt.pool) {
+        failures = failures + 1
+    }
+    # A fifth insert must fail with OutOfMemory
+    let over: Result[int, AllocError] = routes_insert(rt, Route {
+        label: 70, cost: 0
+    }) # 'F'
+    if !result_is_err(over) {
+        failures = failures + 1
+    }
+
+    # ---- NullAlloc: proves the no-allocation code path ----
+    let na: NullAlloc = null_alloc_new()
+    let npr: Result[int, AllocError] = null_alloc_alloc(na, l8_layout())
+    if !result_is_err(npr) {
+        failures = failures + 1
+    }
+
+    return failures
+}
+
+# l8_layout() — a 8-byte, 8-byte-aligned layout. Helper kept at the
+# bottom of the file so the `main` body reads top-to-bottom.
+fn l8_layout() -> Layout {
+    return result_unwrap(layout_new(8, 8))
+}
