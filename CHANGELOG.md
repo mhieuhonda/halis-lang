@@ -13,6 +13,148 @@ stability (125–140), and final stabilisation toward v1.0 (141–150).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
+## [v0.98.0-alpha] — Stage 79: core.alloc — pluggable allocator protocol
+
+> Third stage of **Phase VI (OS-development foundation, Stages
+> 77–96)**. Completes the roadmap's Stage 79 promise: a pluggable
+> allocator trait `trait Alloc { fn alloc(layout: Layout) ->
+> Result[Ptr, AllocError]; fn dealloc(ptr: Ptr, layout: Layout) ->
+> void; }` with the user supplying the allocator (bump, slab, buddy,
+> etc.). Halis has no trait dispatch yet, so the protocol ships as
+> FREE generic functions per concrete allocator type — the same
+> convention `core.iter` / `core.clone` / `core.eq` already use.
+> `core/alloc.hls` ships `Layout` + `AllocError` + three reference
+> allocators (`BumpAlloc` fast/no-reclaim, `PoolAlloc` fixed-size
+> with LIFO free list and double-free detection, `NullAlloc`
+> sentinel) plus an `AllocStats` accounting helper. 40 pure
+> functions, 5 structs, 1 enum, imports only `core.option` +
+> `core.result` (the same freestanding-safe dependency closure
+> as the rest of `core.*`). Both `#![no_std]` and
+> `#![freestanding]` modes import it identically (no resolver
+> changes — the `core.` prefix is already uniform). Same crate
+> links hosted (`main` + libc) or freestanding (`_start` +
+> -nostdlib) by swapping the crate attribute.
+>
+> Known limitation: the runtime integration (lists/maps routing
+> through a user-supplied allocator) is a later stage — it
+> requires a `global_alloc` registration that the language
+> cannot express yet without traits or a `register_alloc`
+> builtin. What `core.alloc` proves is that the protocol itself
+> composes: any user-defined data structure that takes an
+> allocator can swap bump / pool / null behind the same call
+> sites. The `examples/alloc_demo.hls` "request router" (a
+> BumpAlloc-backed scratch scope + a PoolAlloc-backed route
+> table with LIFO recycle and double-free detection) is the
+> shape of the future.
+
+### Added — core.alloc protocol surface
+
+- **`struct Layout { size: int, align: int }`** — the
+  allocation request; `layout_new` validates (size > 0, align
+  is a positive power of two ≤ 4096), `layout_for_words` is a
+  convenience for 8-byte-aligned int64/pointer slots,
+  `layout_pad_to` is the stride the bump allocator advances
+  per request, `layout_align_up` rounds any int up to an
+  alignment, `layout_resize` grows the size in place.
+- **`enum AllocError { OutOfMemory, BadLayout, DoubleFree,
+  OutOfRange }`** + `alloc_error_msg` (str-only, no `panic`,
+  usable in any `Result` chain for diagnostics).
+- **`struct BumpAlloc { capacity, offset, peak, allocations }`**
+  — fast, monotonic, no individual reclaim. `bump_alloc`
+  rounds the cursor up to `l.align` before recording the
+  offset, then advances by the padded size. `bump_dealloc` is
+  a no-op (Ok(0) for protocol parity with the reclaiming
+  allocators). `bump_reset` reclaims the whole region in one
+  shot; `bump_peak` and `bump_allocations` survive the reset
+  (high-water mark + count across cycles). `bump_full` reports
+  capacity exhaustion.
+- **`struct PoolAlloc { block_size, block_count, free_list,
+  in_use, allocations, peak }`** — fixed-size block pool with
+  LIFO free list and O(1) double-free detection. `pool_alloc`
+  pops a block offset from the free list (initialised so the
+  first allocation returns offset 0, then `block_size`,
+  `2*block_size`, ...). `pool_dealloc` validates the offset is
+  in range, block-aligned, and currently live (else
+  `Err(OutOfRange)` / `Err(DoubleFree)`), then returns it to
+  the free list. Layout-size-larger-than-block and
+  align-larger-than-block requests return `Err(OutOfMemory)`
+  (no block can satisfy).
+- **`struct NullAlloc { _marker }`** — sentinel that always
+  returns `Err(OutOfMemory)` from `null_alloc_alloc` and
+  `Err(OutOfRange)` from `null_alloc_dealloc`. The placeholder
+  `_marker` field is required by the grammar (zero-field
+  structs are not yet supported). The sentinel is the
+  verifier's hook for Stage 91 (verified interrupt-safety):
+  an IRQ handler takes a `NullAlloc` and the checker rejects
+  any code path that calls `*_alloc` on it (because the
+  result is always `Err` and the user must match).
+- **`struct AllocStats { bytes_alloc, bytes_dealloc,
+  allocations, deallocations, peak }`** — accounting helper
+  (NOT an allocator; no `*_alloc`/`*_dealloc` functions).
+  `stats_record_alloc(size)` updates the cumulative counter,
+  increments the allocation count, and bumps the peak if the
+  current in-use byte count exceeds it.
+  `stats_record_dealloc(size)` updates the cumulative
+  deallocation counter; the peak is NOT lowered (it records
+  the high-water mark). `stats_current` is `bytes_alloc -
+  bytes_dealloc` (a negative value is a leak indicator).
+
+### Added — integration, tests, tooling
+
+- `core/alloc.hls` (40 pure functions; pure HLS, `no_std`-clean).
+- `examples/alloc_demo.hls` — a `#![no_std]` "request router"
+  (BumpAlloc scratch scope + PoolAlloc route table with LIFO
+  recycle and double-free detection); exit 0. Same crate with
+  `#![freestanding]` instead of `#![no_std]` links with
+  `-nostdlib` and exits 0.
+- `tests/ok/feat_stage79_alloc.hls` — 67 numbered behaviour
+  assertions; exit 0.
+- `tests/alloc_acceptance.py` — the 7-section acceptance gate:
+  resolution + traversal guards, standalone parse + core-only
+  imports, Stage-0 enforcement (no_std + freestanding + hosted
+  no-crate-attr), 8 single-feature behaviour probes,
+  self-hosted emission + native parity (incl. freestanding
+  -nostdlib), hlfmt stability, `--audit` purity.
+- `make alloc-acceptance` in `mk/95-osdev.mk`; `Makefile`
+  `.PHONY` list grows by one.
+- `tests/suites/suite_08_osdev.sh` — Stage 79 section (5 checks).
+- `SPEC.md` section 33 ("`core.alloc` — the Alloc protocol").
+
+### Notes — design rationale
+
+- **`int` as a logical address.** HLS has no raw pointer type
+  yet. The `int` returned by `*_alloc` is a byte offset into a
+  backing region the user owns (typically a `list[int]` sized to
+  the allocator's capacity, or a side table indexed by the
+  returned offset). The allocator is a pure bookkeeping
+  abstraction; the soundness invariants (no use-after-free, no
+  double-free) are enforced at the allocator level, not the
+  pointer level. A future stage adds `Ptr[T]` raw-pointer types
+  once the verifier can prove the lifetime invariants; until
+  then, the logical-address contract is the same one a kernel's
+  pre-paging bump allocator honours.
+- **`Result[int, AllocError]` instead of `void` dealloc.** The
+  roadmap's signature is `fn dealloc(...) -> void`. This module
+  returns `Result[int, AllocError]` from `*_dealloc` instead,
+  because the pool allocator can DETECT a double-free or an
+  out-of-range pointer at dealloc time — silently dropping that
+  information would be a soundness hole (a kernel that
+  double-frees a page frame must panic, not continue). The
+  `Ok(0)` success value mirrors the `void` return; users who
+  don't care about the error case can `let _ =
+  pool_dealloc(a, ptr, l)` and ignore it.
+- **No resolver changes.** The `core.` prefix is already
+  handled uniformly by `boot/boot.py` and `src/hlc/main.hls`
+  (Stage 78 added it for any name under `core/`); `import
+  "core.alloc"` resolves to `core/alloc.hls` in both compilers
+  with the same walk-up + traversal-guard discipline as `std.`.
+- **Bit operations via builtins, not operators.** HLS has no
+  bitwise operators (`&`, `|`, `^`, `~`, `<<`, `>>`) in its
+  grammar. The `layout_is_power_of_two` and `layout_align_up`
+  helpers use the `int_and` and `int_not` builtins (which
+  compile to a single C operation; no libc required — they
+  are pure and freestanding-safe).
+
 ## [v0.97.1-alpha] — deep-scan-27: 9 fixes — nested generic instantiation codegen (Stage 78 unblocked), boot↔hlc checker parity (move reachability, asm imm, struct defaults, dup fields), freestanding C prelude hardening for GCC 14, tooling cleanups
 
 > Seventh systematic super-scan. This pass paired static analysis

@@ -2706,3 +2706,149 @@ error, by design — the boundary must stay visible).
 `float %`, `str(float)`, `float.to_str()`, `str.to_float()` and
 the 24 libm builtins are rejected in `#![freestanding]` mode
 (§31.2) but ALLOWED in `#![no_std]` mode (libc is present).
+
+
+## 33. `core.alloc` — the Alloc protocol (Stage 79 — v0.98.0-alpha)
+
+`core.alloc` is the pluggable allocator protocol. The roadmap's
+signature is `trait Alloc { fn alloc(layout: Layout) ->
+Result[Ptr, AllocError]; fn dealloc(ptr: Ptr, layout: Layout) ->
+void; }`. HLS has no trait dispatch yet (§32.2), so the protocol
+ships as FREE functions per concrete allocator type — the same
+"monomorphic helpers" convention `core.iter` / `core.clone` /
+`core.eq` already use. When `impl` blocks gain type parameters,
+each `<type>_alloc` below becomes `impl <Type> { fn alloc(...) }`
+unchanged in spirit.
+
+The module is pure HLS, `no_std`-clean: imports only
+`core.option` + `core.result`, no `uses`, no `extern`, no
+`std.*`. It is importable from `#![no_std]` and `#![freestanding]`
+crates identically (no resolver changes — the `core.` prefix is
+already uniform since Stage 78).
+
+```hls
+#![no_std]
+
+import "core.alloc"
+import "core.result"
+
+fn main() -> int {
+    let a: BumpAlloc = bump_new(128)
+    let l: Layout = result_unwrap(layout_new(16, 8))
+    let p1: int = result_unwrap(bump_alloc(a, l))  # 0
+    let p2: int = result_unwrap(bump_alloc(a, l))  # 16
+    bump_reset(a)                                  # reclaim all
+    if bump_used(a) != 0 { return 1 }
+    if bump_peak(a) != 32 { return 2 }             # preserved
+    return 0
+}
+```
+
+### 33.1. The Alloc protocol surface
+
+| Type | Role |
+|------|------|
+| `struct Layout { size, align }` | allocation request (size in bytes, alignment in bytes — a positive power of two ≤ 4096) |
+| `enum AllocError { OutOfMemory, BadLayout, DoubleFree, OutOfRange }` | the error set |
+| `struct BumpAlloc { capacity, offset, peak, allocations }` | fast, monotonic, no individual reclaim |
+| `struct PoolAlloc { block_size, block_count, free_list, in_use, allocations, peak }` | fixed-size block pool with LIFO free list + O(1) double-free detection |
+| `struct NullAlloc { _marker }` | sentinel: always `Err(OutOfMemory)` (the placeholder field is required by the grammar) |
+| `struct AllocStats { bytes_alloc, bytes_dealloc, allocations, deallocations, peak }` | accounting helper (NOT an allocator) |
+
+Layout helpers: `layout_new` (validates), `layout_for_words`
+(convenience for 8-byte-aligned int64/pointer slots),
+`layout_pad_to` (the stride the bump allocator advances),
+`layout_align_up` (rounds any int up to an alignment),
+`layout_resize` (grows the size in place), `layout_size` /
+`layout_align` (accessors), `layout_is_power_of_two` (the
+validator primitive).
+
+BumpAlloc: `bump_new(capacity)` constructs, `bump_alloc(a, l)`
+returns the aligned offset (the cursor rounds up to `l.align`
+before recording, then advances by the padded size),
+`bump_dealloc` is a no-op (Ok(0) for protocol parity),
+`bump_reset` reclaims the whole region in one shot,
+`bump_peak` and `bump_allocations` survive the reset (high-water
+mark + count across cycles), `bump_full` reports capacity
+exhaustion.
+
+PoolAlloc: `pool_new(block_size, count)` initialises the free
+list so the FIRST allocation returns offset 0 (then
+`block_size`, `2*block_size`, ...), `pool_alloc` pops a block
+offset from the free list, `pool_dealloc` validates the offset
+is in range, block-aligned, and currently live (else
+`Err(OutOfRange)` / `Err(DoubleFree)`) and returns it to the
+free list. Layout-size-larger-than-block and
+align-larger-than-block requests return `Err(OutOfMemory)`.
+
+NullAlloc: `null_alloc_new()` constructs the sentinel,
+`null_alloc_alloc` always returns `Err(OutOfMemory)`,
+`null_alloc_dealloc` always returns `Err(OutOfRange)`. The
+sentinel is the verifier's hook for Stage 91 (verified
+interrupt-safety): an IRQ handler takes a `NullAlloc` and the
+checker rejects any code path that calls `*_alloc` on it
+(because the result is always `Err` and the user must match).
+
+AllocStats: `stats_record_alloc(size)` updates the cumulative
+counter, increments the allocation count, and bumps the peak
+if the current in-use byte count exceeds it.
+`stats_record_dealloc(size)` updates the cumulative
+deallocation counter; the peak is NOT lowered (it records the
+high-water mark). `stats_current` is `bytes_alloc -
+bytes_dealloc` (a negative value is a leak indicator).
+
+### 33.2. On "pointers"
+
+HLS has no raw pointer type yet. The `int` returned by `*_alloc`
+is a LOGICAL ADDRESS — a byte offset into a backing region the
+user owns (typically a `list[int]` sized to the allocator's
+capacity, or a side table indexed by the returned offset). The
+allocator is a pure bookkeeping abstraction: it hands out
+offsets, tracks which are live, and (for reclaiming allocators)
+returns them on `*_dealloc`. The soundness invariants (no
+use-after-free, no double-free) are enforced at the allocator
+level, not the pointer level. A future stage adds `Ptr[T]`
+raw-pointer types once the verifier can prove the lifetime
+invariants; until then, the logical-address contract is the
+same one a kernel's pre-paging bump allocator honours.
+
+### 33.3. On `void` dealloc
+
+The roadmap's signature is `fn dealloc(...) -> void`. This
+module returns `Result[int, AllocError]` from `*_dealloc`
+instead, because the pool allocator can DETECT a double-free or
+an out-of-range pointer at dealloc time — silently dropping
+that information would be a soundness hole (a kernel that
+double-frees a page frame must panic, not continue). The
+`Ok(0)` success value mirrors the `void` return; users who
+don't care about the error case can `let _ = pool_dealloc(a,
+ptr, l)` and ignore it.
+
+### 33.4. Bit operations via builtins, not operators
+
+HLS has no bitwise operators (`&`, `|`, `^`, `~`, `<<`, `>>`)
+in its grammar (the language core treats `int` as a
+mathematical int64 with checked arithmetic only, §7). The
+`layout_is_power_of_two` and `layout_align_up` helpers use the
+`int_and` and `int_not` builtins, which compile to a single C
+operation (no libc required — they are pure and
+freestanding-safe). The bit trick
+`n > 0 && int_and(n, n - 1) == 0` works because a power of two
+in two's complement has exactly one bit set; subtracting 1
+clears that bit and sets all the lower ones, so AND-ing the two
+yields zero.
+
+### 33.5. Runtime integration (future)
+
+The roadmap's promise is that `core` uses the user-supplied
+allocator for `list[T]` and `map[K, V]`. This is a LATER stage:
+it requires a `global_alloc` registration that the language
+cannot express yet without traits or a `register_alloc`
+builtin. What `core.alloc` PROVES here is that the protocol
+itself composes — any user-defined data structure that takes
+an allocator can swap bump / pool / null behind the same call
+sites. The `examples/alloc_demo.hls` "request router" (a
+`BumpAlloc`-backed scratch scope + a `PoolAlloc`-backed route
+table with LIFO recycle and double-free detection) is the shape
+of the future: user-owned data structures that compose with
+any allocator.

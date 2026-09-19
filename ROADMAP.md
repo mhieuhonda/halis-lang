@@ -134,7 +134,7 @@ remains green.
 |---|-------|:------:|:----------------:|
 | 77 | `#![freestanding]` mode (no libc, no OS calls) | ✅ | (done in v0.96.0-alpha) |
 | 78 | `#![no_std]` core-only stdlib subset | ✅ | (done in v0.97.0-alpha) |
-| 79 | `core.alloc` — pluggable allocator trait | ⬜ | 4 weeks |
+| 79 | `core.alloc` — pluggable allocator trait | ✅ | (done in v0.98.0-alpha) |
 | 80 | `core.mem` — physical-page allocator, page tables | ⬜ | 5 weeks |
 | 81 | Panic-handler override (kernel panic strategy) | ⬜ | 3 weeks |
 | 82 | Stack-overflow guard page + deterministic stack size | ⬜ | 3 weeks |
@@ -9056,3 +9056,144 @@ self-hosted emission (hosted `main` + core fns, zero
 freestanding markers) + parity, hlfmt stability, and mode
 distinction — all PASS.
 
+
+
+## STAGE 79 — `core.alloc` — pluggable allocator protocol ✅ (release v0.98.0-alpha)
+
+**Goal:** a pluggable allocator protocol — `trait Alloc { fn
+alloc(layout: Layout) -> Result[Ptr, AllocError]; fn dealloc(ptr:
+Ptr, layout: Layout) -> void; }` — with the user supplying the
+allocator (bump, slab, buddy, etc.) and `core` using it for
+`list[T]` and `map[K, V]`. This is the language-level surface a
+kernel author reaches for when the freestanding bump arena (Stage
+77) is no longer enough — they need per-block reclamation, a
+fixed-size pool for page frames, or a sentinel that proves (at the
+type level) that an IRQ handler never allocates.
+
+**Status (v0.98.0-alpha):** Stage 79 is **COMPLETE**. `core/alloc.hls`
+ships the protocol's HLS-level surface — `Layout`, `AllocError`,
+three reference allocators (`BumpAlloc`, `PoolAlloc`, `NullAlloc`),
+and an `AllocStats` accounting helper — all pure HLS,
+`no_std`-clean, importable from `#![no_std]` and `#![freestanding]`
+crates. The runtime integration (lists/maps routing through a
+user-supplied allocator) is a later stage: it requires a
+`global_alloc` registration that the language cannot express yet
+without traits or a `register_alloc` builtin. What `core.alloc`
+PROVES here is that the protocol itself composes — any
+user-defined data structure that takes an allocator can swap
+bump / pool / null behind the same call sites.
+
+**On "pointers":** HLS has no raw pointer type yet. The `int`
+returned by `*_alloc` is a LOGICAL ADDRESS — a byte offset within
+a backing region the user owns (typically a `list[int]` sized to
+the allocator's capacity, or a side table indexed by the returned
+offset). The allocator is a pure bookkeeping abstraction: it
+hands out offsets, tracks which are live, and (for reclaiming
+allocators) returns them on `*_dealloc`. A future stage adds
+`Ptr[T]` raw-pointer types once the verifier can prove the
+lifetime invariants; until then, the logical-address contract is
+the same one a kernel's pre-paging bump allocator honours.
+
+**On `void` dealloc:** the roadmap's signature is
+`fn dealloc(...) -> void`. This module returns
+`Result[int, AllocError]` from `*_dealloc` instead, because the
+pool allocator can DETECT a double-free or an out-of-range
+pointer at dealloc time — silently dropping that information
+would be a soundness hole (a kernel that double-frees a page
+frame must panic, not continue). The `Ok(0)` success value
+mirrors the `void` return; users who don't care about the
+error case can `let _ = pool_dealloc(a, ptr, l)` and ignore it.
+
+**Shipped in v0.98.0-alpha (Stage 79):**
+
+- `core/alloc.hls` (40 pure functions, 5 structs, 1 enum, imports
+  only `core.option` + `core.result`):
+  - **`struct Layout { size: int, align: int }`** — the
+    allocation request; `layout_new` validates (size > 0,
+    align is a positive power of two ≤ 4096). `layout_for_words`
+    is a convenience for 8-byte-aligned int64/pointer slots.
+    `layout_pad_to` is the stride the bump allocator advances per
+    request. `layout_align_up` rounds any int up to an alignment.
+    `layout_resize` grows the size in place.
+  - **`enum AllocError { OutOfMemory, BadLayout, DoubleFree,
+    OutOfRange }`** + `alloc_error_msg` (str-only, no `panic`).
+  - **`struct BumpAlloc { capacity, offset, peak, allocations }`**
+    — fast, monotonic, no individual reclaim. `bump_alloc` returns
+    the aligned offset (the cursor rounds up to `l.align` before
+    recording, then advances by the padded size). `bump_dealloc`
+    is a no-op (Ok(0) for protocol parity). `bump_reset` reclaims
+    the whole region in one shot; `bump_peak` and
+    `bump_allocations` survive the reset (high-water mark + count
+    across cycles). `bump_full` reports capacity exhaustion.
+  - **`struct PoolAlloc { block_size, block_count, free_list,
+    in_use, allocations, peak }`** — fixed-size block pool with
+    LIFO free list and O(1) double-free detection. `pool_alloc`
+    pops a block offset from the free list; `pool_dealloc`
+    validates the offset is in range, block-aligned, and currently
+    live (else `Err(OutOfRange)` / `Err(DoubleFree)`), then
+    returns it to the free list. `pool_new(N, K)` initialises the
+    free list so the FIRST allocation returns offset 0 (then
+    `block_size`, `2*block_size`, ...). `pool_full` / `pool_free_count`
+    / `pool_used_count` / `pool_peak` / `pool_allocations` report
+    state. Layout-size-larger-than-block and align-larger-than-
+    block requests return `Err(OutOfMemory)` (no block can satisfy).
+  - **`struct NullAlloc { _marker }`** — sentinel that always
+    returns `Err(OutOfMemory)` from `null_alloc_alloc` and
+    `Err(OutOfRange)` from `null_alloc_dealloc`. The placeholder
+    `_marker` field is required by the grammar (zero-field structs
+    are not yet supported); it's a constant 0 and never read. The
+    sentinel is the verifier's hook for Stage 91 (verified
+    interrupt-safety): an IRQ handler takes a `NullAlloc` and the
+    checker rejects any code path that calls `*_alloc` on it
+    (because the result is always `Err` and the user must match).
+  - **`struct AllocStats { bytes_alloc, bytes_dealloc,
+    allocations, deallocations, peak }`** — accounting helper
+    (NOT an allocator; no `*_alloc`/`*_dealloc` functions).
+    `stats_record_alloc(size)` updates the cumulative counter,
+    increments the allocation count, and bumps the peak if the
+    current in-use byte count exceeds it.
+    `stats_record_dealloc(size)` updates the cumulative
+    deallocation counter; the peak is NOT lowered (it records the
+    high-water mark). `stats_current` is `bytes_alloc -
+    bytes_dealloc` (a negative value is a leak indicator). Useful
+    for kernel memory-pressure gauges, allocator-sizing studies,
+    and Stage 126's soft-real-time bounded-allocation mode.
+- `examples/alloc_demo.hls` — a `#![no_std]` "request router"
+  that uses a `BumpAlloc` for the per-request scratch buffer and
+  a `PoolAlloc` for the fixed-size route-entry table; the exit
+  code is 0 on success. Same crate with `#![freestanding]`
+  instead of `#![no_std]` links with `-nostdlib` and exits 0.
+- `tests/ok/feat_stage79_alloc.hls` — 67 numbered behaviour
+  assertions (layout validation, bump sequential offsets + peak
+  + reset + OOM + alignment padding, pool LIFO recycle +
+  double-free + out-of-range + exhaustion, null sentinel, stats
+  accounting + peak watermark); exit 0.
+- `tests/alloc_acceptance.py` — the 7-section acceptance gate:
+  resolution + traversal guards, standalone parse + core-only
+  imports, Stage-0 enforcement (no_std + freestanding + hosted
+  without crate attr), targeted behaviour probes (8 probes, each
+  a single-feature no_std program), self-hosted emission + native
+  parity (incl. freestanding -nostdlib link), hlfmt stability,
+  `--audit` purity check.
+- `make alloc-acceptance` in `mk/95-osdev.mk` (gated by
+  `tests/alloc_acceptance.py`).
+- The Stage 79 half of `tests/suites/suite_08_osdev.sh`
+  (5 checks: interpreter run, module presence, demo run,
+  freestanding -nostdlib native parity, end-to-end acceptance).
+- `SPEC.md` section 33 ("`core.alloc` — the Alloc protocol",
+  Stage 79 — v0.98.0-alpha).
+- The `Makefile` `.PHONY` list grows by one (`alloc-acceptance`).
+
+**Acceptance (`make alloc-acceptance`):** `core.alloc` resolution
++ traversal guards, standalone parse (5 structs + 1 enum + 40
+fns, imports exactly `core.option` + `core.result`), Stage-0
+enforcement (no_std + freestanding + hosted no-crate-attr all
+exit 0; `extern` rejected), 8 single-feature behaviour probes
+(layout validation, bump alloc + reset + OOM, bump alignment
+padding, pool LIFO recycle, pool double-free + range, null
+sentinel, stats accounting + peak), self-hosted emission (hosted
+`main` + every `usf_*` alloc function present, zero freestanding
+markers) + native parity (gcc -O2 + gcc -O2 -nostdlib), hlfmt
+stability over every new Stage 79 file, `--audit` showing every
+alloc function declared `(none - pure)` and the crate mode
+reported — all PASS.
