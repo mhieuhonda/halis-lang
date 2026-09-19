@@ -9,6 +9,9 @@
 # calls, std disabled, entry `_start`).
 # Stage 78 (v0.97.0-alpha): `#![no_std]` + the `core` module family
 # (option, result, iter, clone, eq).
+# Stage 79 (v0.98.0-alpha): `core.alloc` — the Alloc protocol
+# (Layout + AllocError + BumpAlloc + PoolAlloc + NullAlloc +
+# AllocStats).
 # ============================================================================
 
 # freestanding: compile an HLS program to freestanding C + link with
@@ -82,4 +85,16 @@ nostd-acceptance:
 	@$(PYTHON) tests/nostd_acceptance.py
 	@echo "ACCEPTANCE OK: Stage 78 -- #![no_std] + core modules"
 
-.PHONY: freestanding freestanding-check freestanding-acceptance nostd nostd-acceptance
+# alloc-acceptance: the Stage 79 acceptance gate. Runs the 7-section
+# end-to-end suite for `core.alloc`: resolution + guards, standalone
+# parse + core-only imports, Stage-0 enforcement in both no_std and
+# freestanding modes, targeted behavior probes (layout validation,
+# bump+reset+OOM, alignment padding, pool LIFO recycle, double-free,
+# null sentinel, stats accounting), self-hosted emission + native
+# parity (incl. freestanding), hlfmt stability, and `--audit` purity.
+alloc-acceptance:
+	@echo "[Stage 79 acceptance] running tests/alloc_acceptance.py..."
+	@$(PYTHON) tests/alloc_acceptance.py
+	@echo "ACCEPTANCE OK: Stage 79 -- core.alloc (pluggable allocator protocol)"
+
+.PHONY: freestanding freestanding-check freestanding-acceptance nostd nostd-acceptance alloc-acceptance

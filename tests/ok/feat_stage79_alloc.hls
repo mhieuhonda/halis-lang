@@ -1,0 +1,292 @@
+# feat_stage79_alloc.hls — Stage 79: a `#![no_std]` crate exercising
+# every reference allocator in `core.alloc` (Layout, BumpAlloc,
+# PoolAlloc, NullAlloc, AllocStats). Exit code is 0 on success (the
+# differential suite compares interpreter-vs-native exit codes, and
+# section 1 requires 0/101). Any positive exit code is a failure
+# count for the named assertion; tests are numbered so a non-zero
+# exit points at the first failure.
+#![no_std]
+
+import "core.alloc"
+import "core.option"
+import "core.result"
+
+fn main() -> int {
+    # ------------------------------------------------------------------
+    # Layout validation (1..9)
+    # ------------------------------------------------------------------
+    # zero size — Err(BadLayout)
+    if !result_is_err(layout_new(0, 8)) {
+        return 1
+    }
+    # non-power-of-two align — Err(BadLayout)
+    if !result_is_err(layout_new(16, 7)) {
+        return 2
+    }
+    # oversized align — Err(BadLayout)
+    if !result_is_err(layout_new(16, 8192)) {
+        return 3
+    }
+    # valid 4-word, 8-byte-aligned layout — Ok
+    let lw: Result[Layout, AllocError] = layout_for_words(4)
+    if result_is_err(lw) {
+        return 4
+    }
+    let lw_layout: Layout = result_unwrap(lw)
+    if layout_size(lw_layout) != 32 {
+        return 5
+    }
+    if layout_align(lw_layout) != 8 {
+        return 6
+    }
+    if layout_pad_to(lw_layout) != 32 {
+        return 7
+    }
+    # layout_resize: same align, new size
+    let rsz: Result[Layout, AllocError] = layout_resize(lw_layout, 64)
+    if result_is_err(rsz) {
+        return 8
+    }
+    if layout_size(result_unwrap(rsz)) != 64 {
+        return 9
+    }
+
+    # ------------------------------------------------------------------
+    # BumpAlloc — sequential offsets, peak tracking, reset, OOM (10..25)
+    # ------------------------------------------------------------------
+    let a: BumpAlloc = bump_new(128)
+    let l8: Layout = result_unwrap(layout_new(8, 8))
+    let p1: int = result_unwrap(bump_alloc(a, l8))
+    if p1 != 0 {
+        return 10
+    }
+    let p2: int = result_unwrap(bump_alloc(a, l8))
+    if p2 != 8 {
+        return 11
+    }
+    let p3: int = result_unwrap(bump_alloc(a, l8))
+    if p3 != 16 {
+        return 12
+    }
+    if bump_used(a) != 24 {
+        return 13
+    }
+    if bump_peak(a) != 24 {
+        return 14
+    }
+    if bump_allocations(a) != 3 {
+        return 15
+    }
+    if bump_full(a) {
+        return 16
+    }
+    # alignment: 4-byte layout consumes 24..28, then 8-byte layout
+    # rounds up to 32 before allocating.
+    let l4: Layout = result_unwrap(layout_new(4, 4))
+    let p4: int = result_unwrap(bump_alloc(a, l4))
+    if p4 != 24 {
+        return 17
+    }
+    let p5: int = result_unwrap(bump_alloc(a, l8))
+    if p5 != 32 {
+        return 18
+    }
+    # bump_dealloc is a no-op (Ok(0)); the cursor does not move back
+    let _d: int = result_unwrap(bump_dealloc(a, p1, l8))
+    if bump_used(a) != 40 {
+        return 19
+    }
+    # reset: cursor returns to 0; peak and allocations preserved
+    bump_reset(a)
+    if bump_used(a) != 0 {
+        return 20
+    }
+    if bump_peak(a) != 40 {
+        return 21
+    }
+    if bump_allocations(a) != 5 {
+        return 22
+    }
+    # OutOfMemory when full
+    let small: BumpAlloc = bump_new(8)
+    let _sp: int = result_unwrap(bump_alloc(small, l8))
+    if !result_is_err(bump_alloc(small, l8)) {
+        return 23
+    }
+    if !bump_full(small) {
+        return 24
+    }
+    # BadLayout defense: hand-constructed invalid layout
+    let bad_layout: Layout = Layout {
+        size: 0, align: 8
+    }
+    if !result_is_err(bump_alloc(a, bad_layout)) {
+        return 25
+    }
+
+    # ------------------------------------------------------------------
+    # PoolAlloc — block recycle, LIFO, double-free, out-of-range (26..46)
+    # ------------------------------------------------------------------
+    let pool: PoolAlloc = pool_new(64, 4)
+    if pool_total(pool) != 4 {
+        return 26
+    }
+    if pool_block_size(pool) != 64 {
+        return 27
+    }
+    if pool_free_count(pool) != 4 {
+        return 28
+    }
+    if pool_used_count(pool) != 0 {
+        return 29
+    }
+    let l64: Layout = result_unwrap(layout_new(64, 64))
+    let b1: int = result_unwrap(pool_alloc(pool, l64))
+    if b1 != 0 {
+        return 30
+    }
+    let b2: int = result_unwrap(pool_alloc(pool, l64))
+    if b2 != 64 {
+        return 31
+    }
+    let b3: int = result_unwrap(pool_alloc(pool, l64))
+    if b3 != 128 {
+        return 32
+    }
+    if pool_used_count(pool) != 3 {
+        return 33
+    }
+    if pool_free_count(pool) != 1 {
+        return 34
+    }
+    if pool_peak(pool) != 3 {
+        return 35
+    }
+    if pool_allocations(pool) != 3 {
+        return 36
+    }
+    # dealloc b2 (in the middle) succeeds
+    if result_is_err(pool_dealloc(pool, b2, l64)) {
+        return 37
+    }
+    if pool_used_count(pool) != 2 {
+        return 38
+    }
+    if pool_free_count(pool) != 2 {
+        return 39
+    }
+    # next alloc reuses b2's slot (LIFO)
+    let b4: int = result_unwrap(pool_alloc(pool, l64))
+    if b4 != 64 {
+        return 40
+    }
+    # first dealloc of b1 succeeds (it's still in use)
+    if result_is_err(pool_dealloc(pool, b1, l64)) {
+        return 41
+    }
+    # double-free of b1 fails with DoubleFree
+    let dbl: Result[int, AllocError] = pool_dealloc(pool, b1, l64)
+    if !result_is_err(dbl) {
+        return 42
+    }
+    if alloc_error_msg(result_unwrap_err(dbl)) != "double free" {
+        return 43
+    }
+    # out-of-range pointers
+    if !result_is_err(pool_dealloc(pool, 1000, l64)) {
+        return 44
+    }
+    if !result_is_err(pool_dealloc(pool, -1, l64)) {
+        return 45
+    }
+    if !result_is_err(pool_dealloc(pool, 7, l64)) {
+        return 46
+    }
+
+    # ------------------------------------------------------------------
+    # PoolAlloc — exhaustion + too-large layout (47..49)
+    # ------------------------------------------------------------------
+    let pool2: PoolAlloc = pool_new(64, 2)
+    let _x: int = result_unwrap(pool_alloc(pool2, l64))
+    let _y: int = result_unwrap(pool_alloc(pool2, l64))
+    if !pool_full(pool2) {
+        return 47
+    }
+    if !result_is_err(pool_alloc(pool2, l64)) {
+        return 48
+    }
+    let l128: Layout = result_unwrap(layout_new(128, 8))
+    if !result_is_err(pool_alloc(pool2, l128)) {
+        return 49
+    }
+
+    # ------------------------------------------------------------------
+    # NullAlloc — sentinel that never allocates (50..51)
+    # ------------------------------------------------------------------
+    let na: NullAlloc = null_alloc_new()
+    if !result_is_err(null_alloc_alloc(na, l8)) {
+        return 50
+    }
+    if !result_is_err(null_alloc_dealloc(na, 0, l8)) {
+        return 51
+    }
+
+    # ------------------------------------------------------------------
+    # AllocStats — cumulative accounting + peak watermark (52..67)
+    # ------------------------------------------------------------------
+    let st: AllocStats = stats_new()
+    if stats_current(st) != 0 {
+        return 52
+    }
+    if stats_peak(st) != 0 {
+        return 53
+    }
+    stats_record_alloc(st, 100)
+    if stats_current(st) != 100 {
+        return 54
+    }
+    if stats_peak(st) != 100 {
+        return 55
+    }
+    if stats_allocations(st) != 1 {
+        return 56
+    }
+    stats_record_alloc(st, 200)
+    if stats_current(st) != 300 {
+        return 57
+    }
+    if stats_peak(st) != 300 {
+        return 58
+    }
+    stats_record_dealloc(st, 150)
+    if stats_current(st) != 150 {
+        return 59
+    }
+    if stats_peak(st) != 300 {
+        return 60
+    }
+    if stats_deallocations(st) != 1 {
+        return 61
+    }
+    stats_record_alloc(st, 50)
+    if stats_current(st) != 200 {
+        return 62
+    }
+    if stats_peak(st) != 300 {
+        return 63
+    }
+    stats_record_alloc(st, 500)
+    if stats_current(st) != 700 {
+        return 64
+    }
+    if stats_peak(st) != 700 {
+        return 65
+    }
+    if stats_bytes_alloc(st) != 850 {
+        return 66
+    }
+    if stats_bytes_dealloc(st) != 150 {
+        return 67
+    }
+    return 0
+}

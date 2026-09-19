@@ -124,3 +124,66 @@ else
     bad "nostd: make nostd-acceptance failed"
     tail -15 "$TMP/ns_acc78.log"
 fi
+
+echo "=== 16. Stage 79: core.alloc — pluggable allocator protocol ==="
+# Stage 79 (v0.98.0-alpha): the Alloc protocol over `Layout` +
+# `AllocError` + three reference allocators (BumpAlloc, PoolAlloc,
+# NullAlloc) plus an AllocStats accounting helper. Pure HLS, all
+# `no_std`-clean; the same module is importable from `#![freestanding]`.
+ALLOC_F=tests/ok/feat_stage79_alloc.hls
+# (a) the alloc ok-test checks + runs on the interpreter (exit 0).
+alloc_interp_out=$(python3 boot/boot.py "$ALLOC_F" </dev/null 2>/dev/null); alloc_interp_code=$?
+if [ "$alloc_interp_code" -eq 0 ]; then
+    ok "alloc: feat_stage79_alloc runs on the interpreter (exit 0)"
+else
+    bad "alloc: feat_stage79_alloc interpreter exit=$alloc_interp_code"
+fi
+# (b) the alloc module resolves through the `core.` prefix.
+if [ -f "core/alloc.hls" ]; then
+    ok "alloc: core/alloc.hls present"
+else
+    bad "alloc: core/alloc.hls missing"
+fi
+# (c) the demo runs end-to-end on the interpreter (exit 0).
+alloc_demo_code=$(python3 boot/boot.py examples/alloc_demo.hls </dev/null 2>/dev/null; echo $?)
+if [ "$alloc_demo_code" -eq 0 ]; then
+    ok "alloc: examples/alloc_demo.hls runs on the interpreter (exit 0)"
+else
+    bad "alloc: examples/alloc_demo.hls interpreter exit=$alloc_demo_code"
+fi
+# (d) the same ok-test with #![freestanding] instead of #![no_std]
+#     links -nostdlib and exits with the same code (0).
+alloc_fs_src=$(mktemp --suffix=.hls)
+python3 - "$ALLOC_F" "$alloc_fs_src" <<'PY'
+import sys
+src = open(sys.argv[1], encoding='utf-8').read()
+src = src.replace('\n#![no_std]\n', '\n#![freestanding]\n', 1)
+open(sys.argv[2], 'w', encoding='utf-8', newline='\n').write(src)
+PY
+if python3 boot/boot.py src/hlc.hls "$alloc_fs_src" "$TMP/alloc_fs.c" >/dev/null 2>&1 \
+        && gcc -O2 -ffreestanding -nostdlib -ffunction-sections \
+               -fno-stack-protector -Wl,--gc-sections \
+               -o "$TMP/alloc_fs.bin" "$TMP/alloc_fs.c" 2>"$TMP/alloc_fs.gcc"; then
+    alloc_fs_nat=$("$TMP/alloc_fs.bin" </dev/null 2>/dev/null; echo $?)
+    if [ "$alloc_fs_nat" == "$alloc_interp_code" ]; then
+        ok "alloc: freestanding -nostdlib binary exit ($alloc_fs_nat) == interpreter"
+    else
+        bad "alloc: freestanding binary exit=$alloc_fs_nat, interp=$alloc_interp_code"
+    fi
+else
+    bad "alloc: freestanding -nostdlib link failed"
+    head -5 "$TMP/alloc_fs.gcc"
+fi
+rm -f "$alloc_fs_src"
+# (e) make alloc-acceptance runs end-to-end (7 sections).
+if make alloc-acceptance >"$TMP/alloc_acc79.log" 2>&1; then
+    if grep -q "ACCEPTANCE OK: Stage 79" "$TMP/alloc_acc79.log"; then
+        ok "alloc: make alloc-acceptance runs end-to-end"
+    else
+        bad "alloc: make alloc-acceptance did not print ACCEPTANCE OK"
+        tail -5 "$TMP/alloc_acc79.log"
+    fi
+else
+    bad "alloc: make alloc-acceptance failed"
+    tail -15 "$TMP/alloc_acc79.log"
+fi
