@@ -516,7 +516,12 @@ for f in tests/fail/fail_tail_call_*.hls; do
         bad "stage31: $(basename $f) was NOT rejected by the boot checker"
     fi
 done
-if [ $s31fail -eq 13 ] && [ -x "$TMP/hlc1" ]; then
+# Deep-scan-28 fix: the expected count was hardcoded to 13, so adding
+# fail_tail_call_asm.hls silently disabled this check (14 != 13 fell
+# through both branches with no ok and no bad). Count the corpus
+# dynamically instead.
+s31total=$(ls tests/fail/fail_tail_call_*.hls 2>/dev/null | wc -l)
+if [ "$s31fail" -eq "$s31total" ] && [ "$s31total" -gt 0 ] && [ -x "$TMP/hlc1" ]; then
     n31fail=0
     for f in tests/fail/fail_tail_call_*.hls; do
         if ! "$TMP/hlc1" "$f" "$TMP/s31f.c" >/dev/null 2>&1; then
@@ -525,11 +530,11 @@ if [ $s31fail -eq 13 ] && [ -x "$TMP/hlc1" ]; then
             bad "stage31: $(basename $f) was NOT rejected by the native compiler"
         fi
     done
-    if [ $n31fail -eq 13 ]; then
-        ok "stage31: all 13 fail_tail_call_* programs rejected (boot + native)"
+    if [ $n31fail -eq $s31total ]; then
+        ok "stage31: all $s31total fail_tail_call_* programs rejected (boot + native)"
     fi
-elif [ $s31fail -eq 13 ]; then
-    ok "stage31: all 13 fail_tail_call_* programs rejected by the boot checker"
+elif [ "$s31fail" -eq "$s31total" ] && [ "$s31total" -gt 0 ]; then
+    ok "stage31: all $s31total fail_tail_call_* programs rejected by the boot checker"
 fi
 
 # (g) --opt-stats prints the verified tail-call decisions.

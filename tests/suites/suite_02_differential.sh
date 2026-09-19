@@ -28,7 +28,22 @@ nat_ok=0
 nat_bad=0
 for f in tests/ok/*.hls; do
     name=$(basename "$f" .hls)
-    if "$TMP/hlc1" "$f" "$TMP/$name.nat.c" >/dev/null 2>&1 \
+    # Deep-scan-28 fix: `#![freestanding]` crates emit `_start` and no
+    # `main`, so the hosted `gcc -O2` recipe double-defines `_start`
+    # (Scrt1.o) and the whole section reported a false failure since
+    # Stage 77 added tests/ok/feat_freestanding_basic.hls. Use the same
+    # freestanding link recipe suite_01_boot.sh uses for those files.
+    if head -5 "$f" | grep -q '#!\[freestanding\]'; then
+        if "$TMP/hlc1" "$f" "$TMP/$name.nat.c" >/dev/null 2>&1 \
+                && gcc -O2 -ffreestanding -nostdlib -ffunction-sections \
+                       -fno-stack-protector -Wl,--gc-sections \
+                       -o "$TMP/$name.nat.bin" "$TMP/$name.nat.c" 2>/dev/null; then
+            nat_ok=$((nat_ok+1))
+        else
+            nat_bad=$((nat_bad+1))
+            bad "native hlc compile: $name"
+        fi
+    elif "$TMP/hlc1" "$f" "$TMP/$name.nat.c" >/dev/null 2>&1 \
             && gcc -O2 -o "$TMP/$name.nat.bin" "$TMP/$name.nat.c" -lm -pthread 2>/dev/null; then
         nat_ok=$((nat_ok+1))
     else

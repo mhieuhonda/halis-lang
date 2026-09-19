@@ -439,6 +439,12 @@ fn bigdecimal_from_str(s: str) -> Result[BigDecimal, str] {
                 exp = exp * 10 + exp_digits.get(k)
                 k = k + 1
             }
+            # Deep-scan-28 fix: an exponent with NO digits ("1e", "1e+",
+            # "1e-") used to be silently accepted as exponent 0, parsing
+            # "1e" as 1 (Python's Decimal raises InvalidOperation).
+            if exp_digits.len() == 0 {
+                return Result.Err("bigdecimal_from_str: no exponent digits")
+            }
             exp = exp * exp_sign
             break
         } else {
@@ -570,13 +576,36 @@ fn bigdecimal_eq(a: BigDecimal, b: BigDecimal) -> bool {
 }
 
 # Internal: normalize a BigDecimal by removing trailing zeros in the
-# fractional part (so 1.50 becomes 1.5). Doesn't change the value.
+# fractional part (so 1.50 becomes 1.5) and by expanding negative
+# scales into explicit trailing zeros (so 1e3 — digits [1], scale -3 —
+# becomes digits [1,0,0,0], scale 0). Doesn't change the value.
 fn _bigdecimal_normalize(bd: BigDecimal) -> BigDecimal {
     if bd.sign == 0 {
         return bd
     }
-    let mut digits: list[int] = bd.digits
+    # Deep-scan-28 fix (aliasing): COPY the digit list before mutating it.
+    # HLS lists are reference types; the original code bound `digits`
+    # directly to bd.digits, so the scale<0 expansion below pushed zeros
+    # into the CALLER'S BigDecimal — a later bigdecimal_gt/lt on the same
+    # value compared a corrupted (digits, scale) pair (observed:
+    # gt(1e3, 1000) flipped to true after an eq call).
+    let mut digits: list[int] = []
+    let mut ci: int = 0
+    while ci < bd.digits.len() {
+        digits.push(bd.digits.get(ci))
+        ci = ci + 1
+    }
     let mut scale: int = bd.scale
+    # Deep-scan-28 fix: expand a NEGATIVE scale (produced by e-notation
+    # like "1e3") into trailing zeros. Without this, bigdecimal_eq
+    # compared the raw scales and broke the total order — eq("1e3",
+    # "1000") returned false while lt/gt both returned false too (the
+    # exact trichotomy violation feat_deep_scan25_bigdec_compare guards
+    # against, via a representation its test never exercised).
+    while scale < 0 {
+        digits.push(0)
+        scale = scale + 1
+    }
     # Remove trailing zeros from the fractional part.
     while scale > 0 && digits.len() > 0 {
         let last: int = digits.get(digits.len() - 1)

@@ -114,9 +114,64 @@ class CheckerStmt(object):
             # allocation as a per-iteration dict that was immediately
             # discarded. Removed it for clarity (a reader thinks the
             # snapshot is used; it isn't).
+            #
+            # Deep-scan-28 (break/continue edges + loop-top condition):
+            # the body itself is still analysed ONCE against the entry
+            # state (the language's pinned move model — feat_moved_scope
+            # documents that a body move must not reject a post-loop
+            # revive, and bodies are checked linearly). Three additive
+            # unions close the remaining soundness gaps:
+            #   (a) `break` edges: a revive AFTER a break must not erase
+            #       the move for the break path — break-edge snapshots
+            #       are unioned into the post-loop state;
+            #   (b) `continue` edges: a continue guarantees the body
+            #       re-enters, so when any continue edge moved a
+            #       binding, the body is re-analysed against the
+            #       merged loop-top state until no new moves appear
+            #       (monotone, terminates); loops without continue
+            #       keep the single-pass analysis;
+            #   (c) the condition re-evaluates every iteration but was
+            #       only checked against the ENTRY state — after the
+            #       body pass it is re-checked against the merged
+            #       loop-top state (entry ∪ body-end ∪ continue
+            #       edges), so `while len(xs) > 0 { take(xs) }` is
+            #       rejected instead of hanging/segfaulting at runtime.
+            self.loop_frames.append({"break": [], "continue": []})
             self.child(env)
             self.check_stmts(s["body"], env, fn, True)
             env.pop()
+            # Loop-top state for a potential next iteration = body-end ∪
+            # continue edges (body-end is already applied to the shared
+            # binding cells by the linear pass).
+            for snap in self.loop_frames[-1]["continue"]:
+                self.union_moved(env, snap)
+            # (b) continue guarantees re-entry — re-analyse the body
+            # against the merged loop-top state until stable.
+            if self.loop_frames[-1]["continue"]:
+                passes = 1
+                while passes < 64:
+                    passes += 1
+                    before = self.snapshot_moved(env)
+                    self.child(env)
+                    self.check_stmts(s["body"], env, fn, True)
+                    env.pop()
+                    for snap in self.loop_frames[-1]["continue"]:
+                        self.union_moved(env, snap)
+                    after = self.snapshot_moved(env)
+                    if self.snapshot_equal(before, after):
+                        break
+            # (c) the condition runs on every iteration >= 2 against the
+            # merged loop-top state (NOT the break edges — a break exits
+            # before the condition is re-evaluated).
+            self.loop_header += 1
+            ct = self.check_expr(s["cond"], env, None)
+            self.loop_header -= 1
+            if ct not in ("bool", "never"):
+                self.err("while condition must be bool, got %s" % ct, s)
+            # (a) post-loop state additionally unions the break edges.
+            for snap in self.loop_frames[-1]["break"]:
+                self.union_moved(env, snap)
+            self.loop_frames.pop()
             # No restore_moved — moves done in the body propagate to
             # post-loop state (soundness: assume the body executed).
         elif k == "for":
@@ -137,6 +192,14 @@ class CheckerStmt(object):
             # fix. Removed the dead `snap = self.snapshot_moved(env)`
             # line (no matching restore_moved; deep-scan-16 fix left it
             # as dead code).
+            #
+            # Deep-scan-28: break/continue edge handling, mirroring the
+            # `while` branch (the iterable is evaluated ONCE so there is
+            # no condition to re-check): a continue edge guarantees body
+            # re-entry (re-analyse until stable); break edges union into
+            # the post-loop state. Loops without continue stay single-pass
+            # (feat_moved_scope's pinned semantics).
+            self.loop_frames.append({"break": [], "continue": []})
             self.child(env)
             # BUG (deep-scan-5): the `let` branch rejects shadowing but the
             # `for` branch never checked — a loop variable could silently
@@ -147,6 +210,25 @@ class CheckerStmt(object):
             env[-1][s["var"]] = [elem, False, False]
             self.check_stmts(s["body"], env, fn, True)
             env.pop()
+            for snap in self.loop_frames[-1]["continue"]:
+                self.union_moved(env, snap)
+            if self.loop_frames[-1]["continue"]:
+                passes = 1
+                while passes < 64:
+                    passes += 1
+                    before = self.snapshot_moved(env)
+                    self.child(env)
+                    env[-1][s["var"]] = [elem, False, False]
+                    self.check_stmts(s["body"], env, fn, True)
+                    env.pop()
+                    for snap in self.loop_frames[-1]["continue"]:
+                        self.union_moved(env, snap)
+                    after = self.snapshot_moved(env)
+                    if self.snapshot_equal(before, after):
+                        break
+            for snap in self.loop_frames[-1]["break"]:
+                self.union_moved(env, snap)
+            self.loop_frames.pop()
             # No restore_moved — moves done in the body propagate.
         elif k == "return":
             if fn["ret"] == "void":
@@ -162,9 +244,18 @@ class CheckerStmt(object):
         elif k == "break":
             if not in_loop:
                 self.err("break only allowed inside a loop", s)
+            # Deep-scan-28: record the moved-state at the break edge so
+            # the loop driver can union it into the post-loop state (a
+            # later revive in the body must not erase it).
+            if self.loop_frames:
+                self.loop_frames[-1]["break"].append(self.snapshot_moved(env))
         elif k == "continue":
             if not in_loop:
                 self.err("continue only allowed inside a loop", s)
+            # Deep-scan-28: record the moved-state at the continue edge —
+            # it is the entry state of the NEXT iteration.
+            if self.loop_frames:
+                self.loop_frames[-1]["continue"].append(self.snapshot_moved(env))
         elif k == "expr":
             self.check_expr(s["e"], env, None)
         elif k == "asm":

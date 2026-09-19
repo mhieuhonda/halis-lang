@@ -22,6 +22,19 @@ fn gen_expr(ctx: Ctx, e: int) -> str {
         return ctx.exprs[e].ival.to_str()
     }
     if k == "float" {
+        # Deep-scan-28: re-emit the ORIGINAL literal text (parser stores it
+        # in ftext). The old code used fval.to_str() — the DISPLAY formatter
+        # (6 decimal places) — which silently corrupted any literal with
+        # more precision (1.5e-10 became 0.000000; 0.123456789012345 became
+        # 0.123457) so native binaries computed different values than the
+        # interpreter. C strtod is correctly rounded, exactly like Python's
+        # float(), so the source text round-trips to the identical double.
+        # Defensive fallback: if the node carries no text (should not
+        # happen for parser-produced literals), keep the old display form.
+        let ftext: str = ctx.exprs[e].ftext
+        if ftext != "" {
+            return ftext
+        }
         return ctx.exprs[e].fval.to_str()
     }
     if k == "bool" {
@@ -885,7 +898,11 @@ fn gen_call(ctx: Ctx, e: int) -> str {
         # complex to emit inline), we emit a per-site helper that does
         # the poll and constructs the Option. The helper is named
         # hl_future_poll_N.
-        let inner_t: str = future_inner_t(ctx.exprs[e].t)
+        # Deep-scan-28 fix: inst_t() was missing here — inside a generic
+        # function the symbolic type param T flowed into the emitted
+        # helper (Option__T / usf_make_Option__T_Some) and the generated
+        # C did not compile. future_ready (below) already does this.
+        let inner_t: str = future_inner_t(inst_t(ctx, ctx.exprs[e].t))
         let n: int = ctx.future_poll_n
         ctx.future_poll_n = ctx.future_poll_n + 1
         let nid: str = n.to_str()
@@ -930,7 +947,9 @@ fn gen_call(ctx: Ctx, e: int) -> str {
     # ----- Stage 34 (v0.53.0-alpha): async stream builtins -----
     # stream_new(cap) -> Stream[T]: bounded chan.
     if name == "stream_new" {
-        let inner_t: str = stream_inner_t(ctx.exprs[e].t)
+        # Deep-scan-28 fix: inst_t() for generic instantiation parity
+        # (same defect as future_poll above).
+        let inner_t: str = stream_inner_t(inst_t(ctx, ctx.exprs[e].t))
         let mut rel: str = "NULL"
         if inner_t != "int" && inner_t != "float" && inner_t != "bool" {
             rel = release_fn_for(ctx, inner_t)
@@ -941,7 +960,7 @@ fn gen_call(ctx: Ctx, e: int) -> str {
     # stream_send(s, v) -> void: same as chan.send.
     if name == "stream_send" {
         let s_c: str = gen_expr(ctx, ctx.exprs[e].args.get(0))
-        let st_t: str = ctx.exprs[ctx.exprs[e].args.get(0)].t
+        let st_t: str = inst_t(ctx, ctx.exprs[ctx.exprs[e].args.get(0)].t)
         let et: str = stream_inner_t(st_t)
         # Deep-scan-25 fix (HIGH, soundness): this boundary used to
         # own_wrap the value (an hl_retain for borrowed composites) —
@@ -996,7 +1015,7 @@ fn gen_call(ctx: Ctx, e: int) -> str {
     # stream_try_recv(s, default) -> T: same as chan.recv_or.
     if name == "stream_try_recv" {
         let s_c: str = gen_expr(ctx, ctx.exprs[e].args.get(0))
-        let st_t: str = ctx.exprs[ctx.exprs[e].args.get(0)].t
+        let st_t: str = inst_t(ctx, ctx.exprs[ctx.exprs[e].args.get(0)].t)
         let et: str = stream_inner_t(st_t)
         let d_c: str = gen_expr(ctx, ctx.exprs[e].args.get(1))
         if et == "int" {

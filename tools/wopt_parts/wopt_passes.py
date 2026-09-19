@@ -345,6 +345,46 @@ def _peephole_body(body: bytes) -> Tuple[bytes, int]:
             out += body[pos:pos + 4]; pos += 4
         elif op == OP_F64_CONST:
             out += body[pos:pos + 8]; pos += 8
+        elif op == 0xFC:
+            # Deep-scan-28 fix (latent corruption): the 0xFC prefix
+            # (bulk memory / table ops) fell through this chain, so its
+            # sub-opcode + immediates were re-interpreted as standalone
+            # instructions. With today's `FC 0A 00 00` (memory.copy)
+            # the bytes happened to round-trip verbatim, but any future
+            # 0xFC op with an immediate byte of 0x01 (misparsed as nop
+            # -> dropped), 0x41/0x45 (const-folded -> corrupted) or
+            # 0x20/0x10/0x28 (immediate-consuming -> instruction-stream
+            # desync) silently produced an invalid module at O3. Parse
+            # the sub-opcode + immediates (same table as the strict
+            # walker in _walk_instrs) and copy them verbatim - the
+            # peephole never rewrites these side-effecting ops.
+            sub, pos = read_uleb(body, pos)
+            out += uleb(sub)
+            if sub == 0x08:      # memory.init seg, mem
+                v, pos = read_uleb(body, pos); out += uleb(v)
+                v, pos = read_uleb(body, pos); out += uleb(v)
+            elif sub == 0x09:    # data.drop seg
+                v, pos = read_uleb(body, pos); out += uleb(v)
+            elif sub == 0x0A:    # memory.copy dst, src
+                v, pos = read_uleb(body, pos); out += uleb(v)
+                v, pos = read_uleb(body, pos); out += uleb(v)
+            elif sub == 0x0B:    # memory.fill mem
+                v, pos = read_uleb(body, pos); out += uleb(v)
+            elif sub in (0x0C, 0x0D, 0x0E, 0x0F, 0x10, 0x11, 0x12, 0x13,
+                         0x14, 0x15, 0x16, 0x17):
+                # table.init / table.copy / elem.drop / table.grow /
+                # table.size / table.fill variants: 2 immediates for
+                # the two-index forms, 1 for the single-index forms
+                # (mirrors _walk_instrs exactly).
+                if sub in (0x0C, 0x0E, 0x0F, 0x11, 0x13, 0x15):
+                    v, pos = read_uleb(body, pos); out += uleb(v)
+                    v, pos = read_uleb(body, pos); out += uleb(v)
+                else:
+                    v, pos = read_uleb(body, pos); out += uleb(v)
+            else:
+                # Unknown sub-opcode: bail out for this body (keep the
+                # original) rather than risk a corrupt rewrite.
+                return body, 0
         elif op in _MEM_OPS:
             align, pos = read_uleb(body, pos)
             off, pos = read_uleb(body, pos)

@@ -115,7 +115,18 @@ fn gen_method(ctx: Ctx, e: int) -> str {
         return "hl_float_to_int(" + t0 + ")"
     }
     if op == "float.abs" {
-        return "(((" + t0 + ") < 0) ? -(" + t0 + ") : (" + t0 + "))"
+        # Deep-scan-28 fix (two defects):
+        #   1. The receiver expression was emitted THREE times
+        #      (comparison, negation, else arm), so a side-effecting
+        #      receiver (e.g. side(2.5).abs()) ran its effects twice.
+        #   2. The ternary preserved the sign of -0.0 (and NaN) because
+        #      -0.0 < 0 is false in C — diverging from the interpreter,
+        #      whose abs() clears the sign bit (IEEE 754 abs).
+        # __builtin_fabs evaluates the operand once and implements the
+        # IEEE abs semantics (clears the sign bit, incl. NaN); GCC
+        # lowers it to an ANDPD bitmask — no libm dependency, works in
+        # the freestanding prelude.
+        return "__builtin_fabs(" + t0 + ")"
     }
     if op == "bool.to_str" {
         return "hl_str_from_bool(" + t0 + ")"
@@ -370,7 +381,8 @@ fn gen_structlit(ctx: Ctx, e: int) -> str {
         ctx.struct_insts.push(t)
     }
     # Compute the constructor name (mangled if generic).
-    let ctor_name: str = "usf_new_" + c_type_name(t)
+    # Deep-scan-28: escape the final identifier (C keyword struct name).
+    let ctor_name: str = "usf_new_" + c_esc_type_name(c_type_name(t))
     # Collect provided field values. The constructor stores its params
     # raw, so each pointer-typed field value must arrive OWNED
     # (Stage 8-beta): fresh raw, borrowed retain-wrapped.
@@ -625,7 +637,8 @@ fn gen_match_expr(ctx: Ctx, e: int) -> str {
                     # Enum payloads are stored DIRECTLY in the C union (not
                     # boxed), so we access them directly without unboxing.
                     # The union has per-variant structs: data.<Variant>.v<i>.
-                    block.push("        " + c_type(ctx, inst_pt) + " " + cn + " = " + tmp_name + "->data." + arm.variant + ".v" + bi.to_str() + ";")
+                    # Deep-scan-28: escaped variant member name (c_variant_member).
+                    block.push("        " + c_type(ctx, inst_pt) + " " + cn + " = " + tmp_name + "->data." + c_variant_member(arm.variant) + ".v" + bi.to_str() + ";")
                 }
                 bi = bi + 1
             }
@@ -704,9 +717,9 @@ fn gen_qmark_expr(ctx: Ctx, e: int) -> str {
     block.push("    }")
     # Success variant's payload is at data.<ok_v>.v0.
     if is_ptr_t(ctx, success_t) {
-        block.push("    " + c_type(ctx, success_t) + " hlc_q_r = hl_retain(" + tmp_name + "->data." + ok_v + ".v0);")
+        block.push("    " + c_type(ctx, success_t) + " hlc_q_r = hl_retain(" + tmp_name + "->data." + c_variant_member(ok_v) + ".v0);")
     } else {
-        block.push("    " + c_type(ctx, success_t) + " hlc_q_r = " + tmp_name + "->data." + ok_v + ".v0;")
+        block.push("    " + c_type(ctx, success_t) + " hlc_q_r = " + tmp_name + "->data." + c_variant_member(ok_v) + ".v0;")
     }
     block.push("    hlc_q_r;")
     block.push("})")
@@ -1735,6 +1748,9 @@ fn gen_assign(ctx: Ctx, s: StmtN, ind: str) -> void {
 fn gen_reset_fn(ctx: Ctx) -> void {
     ctx.gen_locals = map_new()
     ctx.gen_counts = map_new()
+    # Deep-scan-28: C locals are function-scoped, so the used-name set
+    # resets with the rest of the per-function state.
+    ctx.gen_cnames = map_new()
     ctx.hoist_map = map_new()
     ctx.null_after = []
     ctx.cur_fn = ""

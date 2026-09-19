@@ -90,8 +90,10 @@ class InterpBuiltin(object):
             count = b - a if b > a else 0
             RANGE_MAX = 1_000_000
             if count > RANGE_MAX:
+                # Deep-scan-28: message parity with the native runtime
+                # (hl_range uses ASCII "- use", not an em dash).
                 raise HLPanic(
-                    "range(%d, %d) would produce %d elements (limit %d) — "
+                    "range(%d, %d) would produce %d elements (limit %d) - "
                     "use an explicit counter loop for large ranges"
                     % (a, b, count, RANGE_MAX), line)
             return list(range(a, b))
@@ -183,7 +185,9 @@ class InterpBuiltin(object):
                 with open(resolved, "rb") as f:
                     return f.read()
             except OSError:
-                raise HLPanic("cannot open file: %s" % to_display(args[0]), line) from None
+                # Deep-scan-28: message parity with the native runtime
+                # (hl_die("cannot open file") — no path suffix).
+                raise HLPanic("cannot open file", line) from None
         # Stage 10-beta: read_file_tainted(path) — same as read_file but
         # the returned str is wrapped as tainted[str]. The wrapper dict
         # format is identical to taint_mark's output.
@@ -194,7 +198,7 @@ class InterpBuiltin(object):
                     content = f.read()
                 return {"tainted": True, "value": content}
             except OSError:
-                raise HLPanic("cannot open file: %s" % to_display(args[0]), line) from None
+                raise HLPanic("cannot open file", line) from None
         # Stage 10 release: read_line() -> tainted[str] — third taint source.
         # Reads one line from stdin (newline stripped). The result is always
         # tainted because stdin is untrusted input. EOF returns an empty
@@ -215,7 +219,8 @@ class InterpBuiltin(object):
                     f.write(args[1])
                 return None
             except OSError:
-                raise HLPanic("cannot write file: %s" % to_display(args[0]), line) from None
+                # Deep-scan-28: message parity (native: hl_die("cannot write file")).
+                raise HLPanic("cannot write file", line) from None
         if name == "args":
             # BUG (deep-scan-5): this returned a fresh list COPY on every
             # call, but the native runtime returns THE process-global list
@@ -244,8 +249,8 @@ class InterpBuiltin(object):
         if name == "thread_sleep_ms":
             ms = args[0]
             if ms < 0:
-                raise HLPanic("thread_sleep_ms: duration must be >= 0, "
-                              "got %d" % ms, line)
+                # Deep-scan-28: message parity (native drops the ", got %d" tail).
+                raise HLPanic("thread_sleep_ms: duration must be >= 0", line)
             time.sleep(max(0.0, ms / 1000.0))
             return None
         # thread_yield() — hint the scheduler to switch. Python's
@@ -300,15 +305,15 @@ class InterpBuiltin(object):
                 return [e if isinstance(e, bytes)
                         else str(e).encode("utf-8") for e in entries]
             except OSError:
-                raise HLPanic("fs_read_dir: cannot list directory: %s"
-                              % to_display(args[0]), line) from None
+                # Deep-scan-28: message parity (native: hl_die("fs_read_dir: cannot open directory")).
+                raise HLPanic("fs_read_dir: cannot open directory", line) from None
         if name == "fs_size":
             resolved = _sandbox_check(args[0])
             try:
                 return os.path.getsize(resolved)
             except OSError:
-                raise HLPanic("fs_size: cannot stat: %s"
-                              % to_display(args[0]), line) from None
+                # Deep-scan-28: message parity (native: hl_die("fs_size: cannot stat")).
+                raise HLPanic("fs_size: cannot stat", line) from None
         if name == "fs_is_dir":
             resolved = _sandbox_check(args[0])
             # os.path.isdir returns False for non-existent paths
@@ -321,8 +326,8 @@ class InterpBuiltin(object):
             try:
                 os.chmod(resolved, mode)
             except OSError:
-                raise HLPanic("fs_set_perms: cannot chmod: %s"
-                              % to_display(args[0]), line) from None
+                # Deep-scan-28: message parity (native: hl_die("fs_set_perms: cannot chmod")).
+                raise HLPanic("fs_set_perms: cannot chmod", line) from None
             return None
         # ----- Stage 8-alpha: ownership primitives -----
         # drop(x): semantically releases x. In Stage-0 (Python), the underlying
@@ -379,8 +384,8 @@ class InterpBuiltin(object):
         # runtime for the same seed.
         if name == "rand_int":
             if args[0] <= 0:
-                raise HLPanic("rand_int() requires a positive max (got %d)"
-                              % args[0], line)
+                # Deep-scan-28: message parity (native drops the ", got %d" tail).
+                raise HLPanic("rand_int() requires a positive max", line)
             return self.rand_state.randrange(args[0])
         # rand_float() -> float — uniform random float in [0.0, 1.0).
         # Uses the same PRNG state as rand_int; 53 bits of randomness.
@@ -1043,8 +1048,9 @@ class InterpBuiltin(object):
         if name == "chan_new_bounded":
             cap = args[0]
             if cap < 1:
+                # Deep-scan-28: message parity (native drops the ", got %d" tail).
                 raise HLPanic(
-                    "chan_new_bounded() capacity must be >= 1, got %d" % cap,
+                    "chan_new_bounded() capacity must be >= 1",
                     line)
             ch = HLChan(cap)
             self.conc.register(ch)
@@ -1108,8 +1114,11 @@ class InterpBuiltin(object):
         if name == "stream_new":
             cap = args[0]
             if cap < 1:
+                # Deep-scan-28: message parity — the native codegen lowers
+                # stream_new to hl_chan_new_bounded, whose die message this
+                # must match byte-for-byte.
                 raise HLPanic(
-                    "stream_new() capacity must be >= 1, got %d" % cap,
+                    "chan_new_bounded() capacity must be >= 1",
                     line)
             ch = HLChan(cap)
             self.conc.register(ch)

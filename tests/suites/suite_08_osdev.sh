@@ -20,7 +20,17 @@ fi
 for ff in tests/fail/fail_freestanding_*.hls; do
     fs_name=$(basename "$ff" .hls)
     fs_err=$(python3 boot/boot.py --check "$ff" 2>&1 >/dev/null); fs_rc=$?
-    if [ "$fs_rc" -eq 1 ] && echo "$fs_err" | grep -q "freestanding"; then
+    # Deep-scan-28 fix: fail_freestanding_late_attr exercises the
+    # crate-attribute POSITION rule — its message ("crate-level
+    # attribute must appear before any item") does not mention
+    # "freestanding", so this loop rejected the rejected-program
+    # rejection. Align the needle with tests/freestanding_acceptance.py,
+    # which already EXPECTs "before any item" for this file.
+    fs_needle="freestanding"
+    if [ "$fs_name" = "fail_freestanding_late_attr" ]; then
+        fs_needle="before any item"
+    fi
+    if [ "$fs_rc" -eq 1 ] && echo "$fs_err" | grep -q "$fs_needle"; then
         ok "freestanding: $fs_name rejected ($fs_err)"
     else
         bad "freestanding: $fs_name not rejected with a freestanding message (rc=$fs_rc)"

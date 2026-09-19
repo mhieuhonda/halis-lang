@@ -54,7 +54,10 @@ fn c_type(ctx: Ctx, t_in: str) -> str {
     if is_future_t(t) || is_stream_t(t) {
         return "hl_chan*"
     }
-    return c_type_name(t) + "*"
+    # Deep-scan-28: escape the final identifier — a bare non-generic
+    # user struct/enum named a C keyword (e.g. `register`) must emit
+    # "register_hl*"; mangled composites pass through unchanged.
+    return c_esc_type_name(c_type_name(t)) + "*"
 }
 
 fn is_ptr_type(t: str) -> bool {
@@ -209,12 +212,25 @@ fn c_str_lit(s: str) -> str {
 fn fresh_local(ctx: Ctx, name: str) -> str {
     if !ctx.gen_counts.has(name) {
         ctx.gen_counts.set(name, 1)
-        ctx.gen_locals.set(name, "u_" + name)
-        return "u_" + name
+        # Deep-scan-28: register the C name and keep it collision-free.
+        # Two different HLS names can otherwise map to the same C
+        # identifier (2nd decl of `x` -> u_x_2, distinct local `x_2` ->
+        # u_x_2 as well): both binds silently alias one C variable.
+        let mut cname: str = "u_" + name
+        while ctx.gen_cnames.has(cname) {
+            cname = cname + "_2"
+        }
+        ctx.gen_cnames.set(cname, true)
+        ctx.gen_locals.set(name, cname)
+        return cname
     }
     let n: int = ctx.gen_counts.get_or(name, 1)
     ctx.gen_counts.set(name, n + 1)
-    let cname: str = "u_" + name + "_" + (n + 1).to_str()
+    let mut cname: str = "u_" + name + "_" + (n + 1).to_str()
+    while ctx.gen_cnames.has(cname) {
+        cname = cname + "_2"
+    }
+    ctx.gen_cnames.set(cname, true)
     ctx.gen_locals.set(name, cname)
     return cname
 }
@@ -256,6 +272,61 @@ fn local_c(ctx: Ctx, name: str) -> str {
 # Stage 53 deep-scan fix (HIGH severity).
 fn c_field_name(name: str) -> str {
     return "f_" + name
+}
+
+# ============================================================================
+# Deep-scan-28: C reserved-word escaping for user-defined names.
+# HLS only reserves its own keywords, so a struct/enum may be named
+# `register` or `switch`, and an enum variant may be named `default`.
+# Those names are emitted verbatim today (struct fields are the sole
+# exception: c_field_name's f_ prefix already protects them), producing
+# C that gcc rejects (typedef struct register register; / } default;).
+# ============================================================================
+
+# is_c_kw(w): is `w` a reserved word of C (C11 + the new C23 lowercase
+# spellings, so the emitted C stays valid as toolchains move to C23)?
+fn is_c_kw(w: str) -> bool {
+    return w == "auto" || w == "break" || w == "case" || w == "char"
+    || w == "const" || w == "continue" || w == "default" || w == "do"
+    || w == "double" || w == "else" || w == "enum" || w == "extern"
+    || w == "float" || w == "for" || w == "goto" || w == "if"
+    || w == "inline" || w == "int" || w == "long" || w == "register"
+    || w == "restrict" || w == "return" || w == "short" || w == "signed"
+    || w == "sizeof" || w == "static" || w == "struct" || w == "switch"
+    || w == "typedef" || w == "union" || w == "unsigned" || w == "void"
+    || w == "volatile" || w == "while"
+    || w == "_Alignas" || w == "_Alignof" || w == "_Atomic"
+    || w == "_BitInt" || w == "_Bool" || w == "_Complex"
+    || w == "_Decimal128" || w == "_Decimal32" || w == "_Decimal64"
+    || w == "_Generic" || w == "_Imaginary" || w == "_Noreturn"
+    || w == "_Static_assert" || w == "_Thread_local"
+    || w == "alignas" || w == "alignof" || w == "bool" || w == "constexpr"
+    || w == "static_assert" || w == "thread_local" || w == "typeof"
+    || w == "typeof_unqual"
+}
+
+# c_esc_type_name(name): escape a C type identifier at its FINAL emission
+# point (typedefs, definitions, ownership-fn protos). Only an identifier
+# that IS exactly a reserved word is suffixed ("register" -> "register_hl");
+# mangled composites like "Pair__int" or prefixed helper names are never
+# keywords and pass through unchanged, so non-keyword names produce
+# byte-identical C to before. Do NOT call this inside c_type_name's
+# recursion: builtin names like "int" are C keywords, but inside a
+# mangled composite they are harmless (and escaping them there broke the
+# lto-dedup test, which pins "Pair__int__int").
+fn c_esc_type_name(name: str) -> str {
+    if is_c_kw(name) {
+        return name + "_hl"
+    }
+    return name
+}
+
+# c_variant_member(name): the C union-member name for an enum variant.
+# Always prefixed (mirroring c_field_name's f_ for struct fields): a
+# variant named `default` would otherwise emit `} default;` and
+# p->data.default — uncompilable C.
+fn c_variant_member(name: str) -> str {
+    return "v_" + name
 }
 
 # ============================================================================
@@ -426,7 +497,8 @@ fn release_fn_for(ctx: Ctx, t_in: str) -> str {
     if is_future_t(t) || is_stream_t(t) {
         return "hl_chan_release"
     }
-    return "hl_release_" + c_type_name(t)
+    # Deep-scan-28: escape the final identifier (C keyword struct name).
+    return "hl_release_" + c_esc_type_name(c_type_name(t))
 }
 
 # cleanup_fn_for: the block-exit cleanup function (takes T**).
@@ -452,7 +524,8 @@ fn cleanup_fn_for(ctx: Ctx, t_in: str) -> str {
     if is_future_t(t) || is_stream_t(t) {
         return "hl_cleanup_chan"
     }
-    return "hl_cleanup_" + c_type_name(t)
+    # Deep-scan-28: escape the final identifier (C keyword struct name).
+    return "hl_cleanup_" + c_esc_type_name(c_type_name(t))
 }
 
 # elem_free_fn: the function pointer passed to hl_list_new / hl_map_new

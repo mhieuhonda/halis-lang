@@ -156,6 +156,18 @@ class CheckerTail(object):
                 sites += self._tail_check_stmts(s.get("body") or [], key)
             elif k == "expr":
                 self._tail_check_expr(s.get("e"), key)
+            elif k == "asm":
+                # Deep-scan-28 fix: asm! statements (and their operand
+                # expressions) escaped the #[tail_call] verifier entirely
+                # — a recursive self-call hidden inside an asm operand
+                # compiled to a genuine native recursive call, silently
+                # breaking the attribute's stack-safety contract (a
+                # `let x = loopn(1)` in the same position IS rejected).
+                # Walk every operand expression: non-primitive values are
+                # rejected by _tail_check_expr, and a self-call in an
+                # operand is rejected as "not in tail position".
+                for op in s.get("operands") or []:
+                    self._tail_check_expr(op.get("expr"), key)
             # break / continue: no expressions.
         return sites
 

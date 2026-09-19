@@ -551,9 +551,17 @@ sys.path.insert(0, 'tools/hlwasm_pack_parts')
 import hwp_common, hwp_manifest, hwp_scan, hwp_types, hwp_glue
 import hwp_build, hwp_pack, hwp_publish, hwp_validate, hwp_cli
 # CLI parser accepts all six subcommands.
+# Deep-scan-28 fix: parse_args(['--help']) prints the help text and
+# raises SystemExit — which silently terminated this check at the
+# FIRST subcommand, so every assert below never ran and the check
+# 'passed' on the help output alone. Catch SystemExit so the demo
+# scan + validator asserts actually execute.
 ap = hwp_cli.build_arg_parser()
 for sub in ('new', 'build', 'pack', 'publish', 'check', 'test'):
-    ap.parse_args([sub, '--help'])
+    try:
+        ap.parse_args([sub, '--help'])
+    except SystemExit:
+        pass
 # The demo scans to the expected publish surface.
 surface = hwp_scan.scan_file('examples/wasm_pack_demo.hls')
 names = {f['name'] for f in surface['functions']}

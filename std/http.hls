@@ -596,6 +596,18 @@ fn http_parse_status_code(s: str) -> int {
     if s.len() != 3 {
         return -1
     }
+    # Deep-scan-28 fix: validate the digits BEFORE to_int(). str.to_int()
+    # PANICS on non-numeric input, so a hostile "2x0" status line used to
+    # crash the parser instead of yielding the documented -1 (mirrors the
+    # urlp_parse_port digit-validation pattern).
+    let mut i: int = 0
+    while i < s.len() {
+        let b: int = s.byte_at(i)
+        if b < 48 || b > 57 {
+            return -1
+        }
+        i = i + 1
+    }
     let n: int = s.to_int()
     if n < 0 {
         return -1
@@ -606,6 +618,22 @@ fn http_parse_status_code(s: str) -> int {
 # http_parse_content_length(s) — parse a Content-Length value. Must
 # be a non-negative integer. Returns -1 on failure.
 fn http_parse_content_length(s: str) -> int {
+    # Deep-scan-28 fix: validate the digits BEFORE to_int(). An empty or
+    # non-numeric header value ("Content-Length: abc" / ": ") used to
+    # panic the interpreter (and abort the whole single-threaded server)
+    # instead of returning the documented -1. Values this long cannot fit
+    # in int64 either, so reject them up front (max_body is far smaller).
+    if s.len() == 0 || s.len() > 18 {
+        return -1
+    }
+    let mut i: int = 0
+    while i < s.len() {
+        let b: int = s.byte_at(i)
+        if b < 48 || b > 57 {
+            return -1
+        }
+        i = i + 1
+    }
     let n: int = s.to_int()
     if n < 0 {
         return -1
@@ -1033,19 +1061,33 @@ fn http_handle_one(conn: TcpStream) -> void uses IO, Net {
 # http_find_header_end(s) — return the offset just PAST the blank line
 # that terminates the headers (i.e. the offset where the body starts).
 # Returns -1 if no blank line is found. Accepts CRLF CRLF or LF LF.
+# Deep-scan-28: also the MIXED terminators — CRLF LF and LF CRLF —
+# because the header parser deliberately accepts bare-LF line endings
+# (RFC 7230 §3.5); a request whose last header line ends in LF but
+# whose blank line is CRLF used to never satisfy this readiness probe
+# and the connection hung until the client timed out.
 fn http_find_header_end(s: str) -> int {
     let n: int = s.len()
     let mut i: int = 0
     while i + 1 < n {
-        # LF LF (bare LF form)
-        if s.byte_at(i) == http_lf() && s.byte_at(i + 1) == http_lf() {
-            return i + 2
-        }
-        # CRLF CRLF (canonical form)
-        if i + 3 < n
-            && s.byte_at(i) == http_cr() && s.byte_at(i + 1) == http_lf()
-            && s.byte_at(i + 2) == http_cr() && s.byte_at(i + 3) == http_lf() {
-            return i + 4
+        if s.byte_at(i) == http_lf() {
+            # LF LF (bare LF form)
+            if s.byte_at(i + 1) == http_lf() {
+                return i + 2
+            }
+            # LF CRLF (bare-LF header lines, CRLF blank line)
+            if i + 2 < n && s.byte_at(i + 1) == http_cr() && s.byte_at(i + 2) == http_lf() {
+                return i + 3
+            }
+        } else if s.byte_at(i) == http_cr() && s.byte_at(i + 1) == http_lf() {
+            # CR LF (LF | CR LF): CRLF CRLF (canonical) or CRLF LF
+            # (CRLF header lines, bare-LF blank line).
+            if i + 3 < n && s.byte_at(i + 2) == http_cr() && s.byte_at(i + 3) == http_lf() {
+                return i + 4
+            }
+            if i + 2 < n && s.byte_at(i + 2) == http_lf() {
+                return i + 3
+            }
         }
         i = i + 1
     }

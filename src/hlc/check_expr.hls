@@ -276,10 +276,51 @@ fn check_stmt(ctx: Ctx, env: list[map[str, Binding]], cur: str, f: FnInfo, sidx:
         # idiomatic "drop then revive via mut reassignment" pattern
         # still works because check_assign's revive step clears the
         # moved flag.
-        let snap: list[str] = snapshot_moved(env)
+        #
+        # Deep-scan-28: break/continue edges + loop-top condition —
+        # exact port of boot/checking/stmt.py: break-edge snapshots
+        # union into the post-loop state; continue edges force a body
+        # re-analysis (monotone fixpoint); the condition is re-checked
+        # against the merged loop-top state. The body stays single-pass
+        # for loops without continue (feat_moved_scope's pinned model).
+        frame_push(ctx.loop_brk_frames)
+        frame_push(ctx.loop_cont_frames)
         env.push(map_new())
         check_stmts(ctx, env, cur, f, s.body, true)
         env.pop()
+        # union_moved processes each entry independently, so the frame's
+        # concatenated snapshots can be unioned as one list.
+        let cont_snap: list[str] = frame_entries(ctx.loop_cont_frames)
+        union_moved(env, cont_snap)
+        if cont_snap.len() > 0 {
+            # A continue edge guarantees the body re-enters — re-analyse
+            # against the merged loop-top state until no new moves appear.
+            let mut passes: int = 1
+            while passes < 64 {
+                passes = passes + 1
+                let before: list[str] = snapshot_moved(env)
+                env.push(map_new())
+                check_stmts(ctx, env, cur, f, s.body, true)
+                env.pop()
+                let cf2: list[str] = frame_entries(ctx.loop_cont_frames)
+                union_moved(env, cf2)
+                if snapshot_equal(before, snapshot_moved(env)) {
+                    break
+                }
+            }
+        }
+        # The condition runs on every iteration >= 2 against the merged
+        # loop-top state (NOT the break edges).
+        ctx.loop_header = ctx.loop_header + 1
+        let ct2: str = check_expr(ctx, env, cur, s.cond, "")
+        ctx.loop_header = ctx.loop_header - 1
+        if ct2 != "bool" {
+            cerr(s.line, "while condition must be bool, got " + ct2)
+        }
+        let brk_snap: list[str] = frame_entries(ctx.loop_brk_frames)
+        union_moved(env, brk_snap)
+        frame_pop(ctx.loop_brk_frames)
+        frame_pop(ctx.loop_cont_frames)
         # No restore_moved — moves done in the body propagate to
         # post-loop state (soundness: assume the body executed).
     } else if s.kind == "for" {
@@ -296,7 +337,12 @@ fn check_stmt(ctx: Ctx, env: list[map[str, Binding]], cur: str, f: FnInfo, sidx:
         # Deep-scan-16: same soundness fix as `while` — a binding moved
         # inside the for-body may be nulled at runtime after the first
         # iteration. Post-loop uses must be rejected.
-        let snap: list[str] = snapshot_moved(env)
+        #
+        # Deep-scan-28: break/continue edge handling, mirroring the
+        # `while` branch (no condition to re-check — the iterable runs
+        # once) and boot/checking/stmt.py exactly.
+        frame_push(ctx.loop_brk_frames)
+        frame_push(ctx.loop_cont_frames)
         env.push(map_new())
         # BUG (deep-scan-5): the `let` branch rejects shadowing but the
         # `for` branch never checked — a loop variable could silently
@@ -309,6 +355,30 @@ fn check_stmt(ctx: Ctx, env: list[map[str, Binding]], cur: str, f: FnInfo, sidx:
         })
         check_stmts(ctx, env, cur, f, s.body, true)
         env.pop()
+        let cont_snap: list[str] = frame_entries(ctx.loop_cont_frames)
+        union_moved(env, cont_snap)
+        if cont_snap.len() > 0 {
+            let mut passes: int = 1
+            while passes < 64 {
+                passes = passes + 1
+                let before: list[str] = snapshot_moved(env)
+                env.push(map_new())
+                env.get(env.len() - 1).set(s.name, Binding {
+                    t: elem, is_mut: false, moved: false
+                })
+                check_stmts(ctx, env, cur, f, s.body, true)
+                env.pop()
+                let cf2: list[str] = frame_entries(ctx.loop_cont_frames)
+                union_moved(env, cf2)
+                if snapshot_equal(before, snapshot_moved(env)) {
+                    break
+                }
+            }
+        }
+        let brk_snap: list[str] = frame_entries(ctx.loop_brk_frames)
+        union_moved(env, brk_snap)
+        frame_pop(ctx.loop_brk_frames)
+        frame_pop(ctx.loop_cont_frames)
         # No restore_moved — moves done in the body propagate.
     } else if s.kind == "return" {
         if f.ret == "void" {
@@ -328,9 +398,30 @@ fn check_stmt(ctx: Ctx, env: list[map[str, Binding]], cur: str, f: FnInfo, sidx:
         if !in_loop {
             cerr(s.line, "break only allowed inside a loop")
         }
+        # Deep-scan-28: record the moved-state at the break edge so the
+        # loop driver unions it into the post-loop state (a later revive
+        # in the body must not erase it).
+        if ctx.loop_brk_frames.len() > 0 {
+            let snap: list[str] = snapshot_moved(env)
+            let mut si: int = 0
+            while si < snap.len() {
+                ctx.loop_brk_frames.push(snap.get(si))
+                si = si + 1
+            }
+        }
     } else if s.kind == "continue" {
         if !in_loop {
             cerr(s.line, "continue only allowed inside a loop")
+        }
+        # Deep-scan-28: record the moved-state at the continue edge — it
+        # is the entry state of the NEXT iteration.
+        if ctx.loop_cont_frames.len() > 0 {
+            let snap: list[str] = snapshot_moved(env)
+            let mut si: int = 0
+            while si < snap.len() {
+                ctx.loop_cont_frames.push(snap.get(si))
+                si = si + 1
+            }
         }
     } else if s.kind == "expr" {
         check_expr(ctx, env, cur, s.e, "")

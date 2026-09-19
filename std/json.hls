@@ -134,12 +134,18 @@ fn json_str_value(v: JsonValue) -> str {
 
 # object_get(obj, key) returns the value for key, or null if absent.
 fn json_object_get(obj: JsonValue, key: str) -> JsonValue {
-    let mut i: int = 0
-    while i < obj.obj_keys.len() {
+    # Deep-scan-28: LAST occurrence wins on lookup. The parser stores
+    # duplicates as-is (RFC 8259 §4 "SHOULD be unique" — it neither
+    # requires nor forbids rejection), and every mainstream consumer
+    # (JS JSON.parse, Python json, Rust serde) keeps the last value;
+    # first-wins silently returned stale data on round-trips through
+    # interop boundaries.
+    let mut i: int = obj.obj_keys.len() - 1
+    while i >= 0 {
         if obj.obj_keys.get(i) == key {
             return obj.obj_vals.get(i)
         }
-        i = i + 1
+        i = i - 1
     }
     return json_null()
 }
@@ -163,7 +169,12 @@ struct JsonParser {
     src: str,
     pos: int,
     line: int,
-    err: str
+    err: str,
+    # Deep-scan-28: current container nesting depth. Unbounded recursion
+    # on deeply nested input ("[[[[[..." × 100k) used to exhaust the
+    # stack — the streaming parser (json_stream.hls) already enforces
+    # json_reader_max_depth; the document parser now does too.
+    depth: int
 }
 
 fn jsonp_err(p: JsonParser, msg: str) -> void {
@@ -193,6 +204,12 @@ fn jsonp_skip_ws(p: JsonParser) -> void {
 
 fn jsonp_parse_value(p: JsonParser) -> JsonValue {
     if p.err != "" {
+        return json_null()
+    }
+    # Deep-scan-28: reject documents nested deeper than the streaming
+    # parser's limit instead of recursing unboundedly (stack exhaustion).
+    if p.depth >= jsonp_max_depth() {
+        jsonp_err(p, "json: nesting depth exceeds limit (" + jsonp_max_depth().to_str() + ")")
         return json_null()
     }
     jsonp_skip_ws(p)
@@ -574,7 +591,9 @@ fn jsonp_parse_array(p: JsonParser) -> JsonValue {
         return json_array(items)
     }
     while p.err == "" {
+        p.depth = p.depth + 1
         let v: JsonValue = jsonp_parse_value(p)
+        p.depth = p.depth - 1
         if p.err != "" {
             break
         }
@@ -628,7 +647,9 @@ fn jsonp_parse_object(p: JsonParser) -> JsonValue {
             break
         }
         p.pos = p.pos + 1
+        p.depth = p.depth + 1
         let v: JsonValue = jsonp_parse_value(p)
+        p.depth = p.depth - 1
         if p.err != "" {
             break
         }
@@ -653,10 +674,17 @@ fn jsonp_parse_object(p: JsonParser) -> JsonValue {
     return json_object(keys, vals)
 }
 
+# jsonp_max_depth: the document parser's nesting limit — same value
+# (and rationale) as json_stream.hls's json_reader_max_depth: 1024,
+# matching Python's json.loads default.
+fn jsonp_max_depth() -> int {
+    return 1024
+}
+
 # json_parse(src) parses a JSON document and returns the root JsonValue.
 fn json_parse(src: str) -> JsonValue {
     let p: JsonParser = JsonParser {
-        src: src, pos: 0, line: 1, err: ""
+        src: src, pos: 0, line: 1, err: "", depth: 0
     }
     let v: JsonValue = jsonp_parse_value(p)
     if p.err == "" {
@@ -678,7 +706,7 @@ fn json_parse(src: str) -> JsonValue {
 # recommended entry point for untrusted input — Stage deep-scan-5).
 fn json_parse_result(src: str) -> Result[JsonValue, str] {
     let p: JsonParser = JsonParser {
-        src: src, pos: 0, line: 1, err: ""
+        src: src, pos: 0, line: 1, err: "", depth: 0
     }
     let v: JsonValue = jsonp_parse_value(p)
     if p.err == "" {

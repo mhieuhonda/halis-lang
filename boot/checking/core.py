@@ -30,6 +30,14 @@ class CheckerCore(object):
         # iterable — take()/drop() are rejected there (a move would
         # re-execute on every iteration).
         self.loop_header = 0
+        # Deep-scan-28: per-loop break/continue edge frames. Each while/for
+        # pushes a frame; `break` records the moved-state snapshot at the
+        # break point into frame["break"], `continue` into frame["continue"].
+        # The loop driver unions break edges into the post-loop state and
+        # continue edges into the next-iteration (loop-top) state — without
+        # this, a revive AFTER a break/continue edge erases the move for
+        # that edge and a moved binding is read back (NULL in native).
+        self.loop_frames = []
         # Stage 17: seeded interval facts per fn (for --check --fast and
         # hlprove reporting).
         self.proof_facts = {}
@@ -383,6 +391,12 @@ class CheckerCore(object):
             for name, moved in snap_row.items():
                 if name in scope and moved:
                     scope[name][2] = True
+
+    def snapshot_equal(self, a, b):
+        """Deep-scan-28: are two moved-state snapshots identical? Used by
+        the loop fixpoint driver to detect convergence (the loop-top state
+        grows monotonically, so once a pass changes nothing, we are done)."""
+        return a == b
 
     def check_fn(self, key, fn):
         self.cur_fn = key

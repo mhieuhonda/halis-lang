@@ -127,6 +127,15 @@ def ws_encode_frame(payload: bytes,
     return bytes(out)
 
 
+# Deep-scan-28: hard cap on one WebSocket frame's payload. A hostile
+# frame advertises plen up to 2^64-1 and _recv_exact would try to buffer
+# it all — a trivial memory-exhaustion DoS from any local process (the
+# std websocket module caps at ws_max_payload_size; the dev server now
+# does too). 16 MiB is far above anything the HMR protocol sends
+# (frames are < 126 bytes in practice).
+WS_MAX_FRAME_PAYLOAD = 16 * 1024 * 1024
+
+
 def ws_read_frame(sock) -> Optional[tuple]:
     """Read ONE WebSocket frame from ``sock`` (a Python socket).
 
@@ -156,6 +165,9 @@ def ws_read_frame(sock) -> Optional[tuple]:
         if ext is None:
             return None
         plen = struct.unpack(">Q", ext)[0]
+    if plen > WS_MAX_FRAME_PAYLOAD:
+        # Refuse absurd frames instead of buffering them (DoS guard).
+        return None
     mask_key = None
     if masked:
         mask_key = _recv_exact(sock, 4)
