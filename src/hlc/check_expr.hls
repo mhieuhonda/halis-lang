@@ -112,7 +112,6 @@ fn match_all_return(ctx: Ctx, e: int) -> bool {
     while i < ctx.exprs[e].args.len() {
         let arm_idx: int = ctx.exprs[e].args.get(i)
         let arm: MatchArm = ctx.match_arms.get(arm_idx)
-        # BUG-009 fix: removed dead `let body_k: str = ctx.stmts[0].kind`
         # line — that accessed the FIRST statement in the entire program
         # (not the arm body's statement) and was unused. The actual check
         # below uses arm.body_t which is the arm body's type (set during
@@ -130,6 +129,54 @@ fn match_all_return(ctx: Ctx, e: int) -> bool {
         i = i + 1
     }
     return ctx.exprs[e].args.len() > 0
+}
+
+# Deep-scan fix: path_terminates — the move-state analogue of all_return,
+# extended with break/continue in a loop context (they terminate the
+# current path the same way return does for post-if reachability).
+# Used by the `if` move-union logic: an arm that ALWAYS exits cannot
+# contribute its moved-state to the post-if code, because control never
+# flows from that arm to the join point. Mirrors
+# boot/checking/contract.py path_terminates so the boot checker and the
+# self-hosted hlc agree on the idiomatic
+#     `if cond { ch.send(take(x)); return } use(x);`
+# pattern (examples/conc_pipeline.hls hit the divergence: hlc rejected
+# it with a spurious "use of moved value" the boot checker accepted).
+fn path_terminates(ctx: Ctx, stmts: list[int], in_loop: bool) -> bool {
+    if stmts.len() == 0 {
+        return false
+    }
+    let last: int = stmts.get(stmts.len() - 1)
+    let k: str = ctx.stmts[last].kind
+    if k == "return" {
+        return true
+    }
+    if in_loop && (k == "break" || k == "continue") {
+        return true
+    }
+    if k == "expr" && ctx.exprs[ctx.stmts[last].e].t == "never" {
+        return true
+    }
+    if k == "expr" && ctx.exprs[ctx.stmts[last].e].kind == "match" {
+        if match_all_return(ctx, ctx.stmts[last].e) {
+            return true
+        }
+    }
+    if k == "let" && ctx.exprs[ctx.stmts[last].value].t == "never" {
+        return true
+    }
+    if k == "assign" && ctx.exprs[ctx.stmts[last].value].t == "never" {
+        return true
+    }
+    if k == "if" && ctx.stmts[last].else_body.len() > 0 {
+        return path_terminates(ctx, ctx.stmts[last].body, in_loop) && path_terminates(ctx, ctx.stmts[last].else_body, in_loop)
+    }
+    if k == "asm" {
+        if list_contains_str(ctx.stmts[last].asm_options, "noreturn") {
+            return true
+        }
+    }
+    return false
 }
 
 fn check_stmts(ctx: Ctx, env: list[map[str, Binding]], cur: str, f: FnInfo, stmts: list[int], in_loop: bool) -> void {
@@ -181,18 +228,35 @@ fn check_stmt(ctx: Ctx, env: list[map[str, Binding]], cur: str, f: FnInfo, sidx:
         check_stmts(ctx, env, cur, f, s.body, in_loop)
         env.pop()
         let then_snap: list[str] = snapshot_moved(env)
+        # Deep-scan fix: reachability refinement (mirrors the boot
+        # checker). An arm that ALWAYS exits — return / break / continue
+        # / never-typed tail — cannot contribute its moved-state to the
+        # post-if code: control never flows from that arm to the join
+        # point. Without the refinement hlc rejected the shipped
+        # examples/conc_pipeline.hls (worker: `if j.id == -1 {
+        # out_ch.send(take(j)); return }` — j is still owned on the
+        # fall-through path) with a spurious "use of moved value".
+        let then_terminates: bool = path_terminates(ctx, s.body, in_loop)
         restore_moved(env, snap)
         if s.else_body.len() > 0 {
             env.push(map_new())
             check_stmts(ctx, env, cur, f, s.else_body, in_loop)
             env.pop()
             let else_snap: list[str] = snapshot_moved(env)
+            let else_terminates: bool = path_terminates(ctx, s.else_body, in_loop)
             restore_moved(env, snap)
-            union_moved(env, then_snap)
-            union_moved(env, else_snap)
+            if !then_terminates {
+                union_moved(env, then_snap)
+            }
+            if !else_terminates {
+                union_moved(env, else_snap)
+            }
         } else {
             # No else arm — equivalent to an empty else (no moves).
-            union_moved(env, then_snap)
+            # Union the then-arm state only when it can fall through.
+            if !then_terminates {
+                union_moved(env, then_snap)
+            }
         }
     } else if s.kind == "while" {
         ctx.loop_header = ctx.loop_header + 1
@@ -355,6 +419,27 @@ fn check_asm(ctx: Ctx, env: list[map[str, Binding]], cur: str, s: StmtN) -> void
             # gets a clear HLS error instead of an opaque GCC error.
             if c == "imm" && d != "in" {
                 cerr(op.line, "asm! constraint 'imm' cannot be used with direction '" + d + "' — an immediate is a compile-time constant and cannot be written to")
+            }
+            # Stage 27 perfection (v0.50.3-alpha) deep-scan-18 BUG-10
+            # (deep-scan fix, ported from boot/checking/stmt.py): also
+            # reject `in(imm)` on a NON-literal expression — GCC's `i`
+            # constraint requires a compile-time constant. Without this
+            # check `in(imm) some_var` reached GCC as `"i"(some_var)`,
+            # producing an opaque "impossible constraint" error with no
+            # source-line attribution. Accept int literals, bool
+            # literals, and unary-minus of an int literal (the common
+            # constant forms); everything else should use `reg`.
+            if c == "imm" && d == "in" {
+                let mut in_kind: str = ctx.exprs[op.expr_idx].kind
+                if in_kind == "un" && ctx.exprs[op.expr_idx].op == "-" {
+                    let inner: int = ctx.exprs[op.expr_idx].left
+                    if inner >= 0 && ctx.exprs[inner].kind == "int" {
+                        in_kind = "int"
+                    }
+                }
+                if in_kind != "int" && in_kind != "bool" {
+                    cerr(op.line, "asm! `in(imm)` requires a compile-time constant (int/bool literal or unary-minus-of-int-literal), got a runtime expression — use `reg` instead for runtime values")
+                }
             }
         } else {
             # Stage 27 perfection (v0.50.2-alpha) deep-scan-17:
@@ -974,6 +1059,24 @@ fn check_structlit(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, exp
         }
         di = di + 1
     }
+    # Deep-scan fix (BUG-DS4-2 + BUG-04, ported from boot/checking/expr.py):
+    # constructing this struct may evaluate defaulted field expressions —
+    # their effects live on the synthetic "@default.<S>" call-graph node
+    # (checked in check_program). Add the edge ONLY when a default is
+    # ACTUALLY evaluated at this call site (at least one omitted field has
+    # a default) — a fully-specified literal must not inherit a sibling
+    # default's effects (false-positive guard, deep-scan-18 BUG-04).
+    let mut omitted_have_default: bool = false
+    let mut oi2: int = provided.len()
+    while oi2 < declared.len() {
+        if st.fdefaults.get(oi2) != -1 {
+            omitted_have_default = true
+        }
+        oi2 = oi2 + 1
+    }
+    if omitted_have_default {
+        add_edge(ctx, cur, "@default." + name)
+    }
     # Type-check each provided field against the instantiated declared type.
     let mut fi: int = 0
     while fi < provided.len() {
@@ -1109,9 +1212,26 @@ fn check_call(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, expected
                 ti2 = ti2 + 1
             }
             # Record this generic function instantiation for codegen.
-            let inst_str: str = name + "|" + join(targs, ",")
-            if !list_has(ctx.fn_insts, inst_str) {
-                ctx.fn_insts.push(inst_str)
+            # Deep-scan fix: only record when every type arg is CONCRETE.
+            # When the call sits inside another generic fn's body, the
+            # inferred arg may be the ENCLOSING fn's type parameter
+            # (e.g. `inner|T` for `fn outer[T] { return inner(x) }`) —
+            # a pseudo-instantiation that would emit `ListIter__T`-style
+            # garbage C. The real instantiation is re-recorded with
+            # concrete args by rebind_call_key during body emission.
+            let mut targs_concrete: bool = true
+            let mut tci: int = 0
+            while tci < targs.len() {
+                if !type_is_concrete(ctx, targs.get(tci)) {
+                    targs_concrete = false
+                }
+                tci = tci + 1
+            }
+            if targs_concrete {
+                let inst_str: str = name + "|" + join(targs, ",")
+                if !list_has(ctx.fn_insts, inst_str) {
+                    ctx.fn_insts.push(inst_str)
+                }
             }
             # Store the inferred concrete type args on the call node so the
             # codegen can use the mangled function name.

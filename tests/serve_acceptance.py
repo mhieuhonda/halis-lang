@@ -30,7 +30,6 @@ from __future__ import annotations
 import json
 import os
 import socket
-import ssl
 import sys
 import tempfile
 import threading
@@ -117,7 +116,7 @@ def test_config() -> None:
     from hlserve_config import (load_config_file,
                                  config_dict_to_serve_config,
                                  parse_proxy_spec, parse_proxy_specs,
-                                 find_config_file, ProxyRule)
+                                 ProxyRule)
     # TOML file.
     with tempfile.NamedTemporaryFile(mode="w", suffix=".toml",
                                        delete=False) as f:
@@ -359,9 +358,9 @@ def _free_port() -> int:
 
 def test_end_to_end_http() -> None:
     section("9. End-to-end HTTP (real server)")
-    from hlserve_config import ServeConfig, ProxyRule
+    from hlserve_config import ServeConfig
     from hlserve_hmr import HmrBus
-    from hlserve_server import HlsDevHTTPHandler, make_server, HlsDevServer
+    from hlserve_server import HlsDevHTTPHandler, make_server
     port = _free_port()
     tmpdir = tempfile.mkdtemp(prefix="hlserve-e2e-")
     bundle_dir = tmpdir

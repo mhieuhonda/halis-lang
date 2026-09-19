@@ -20,12 +20,9 @@ from __future__ import annotations
 
 import argparse
 import os
-import sys
 from typing import Any, Dict, List, Optional
 
-from hwp_common import (DEFAULT_OPT_LEVEL, DEFAULT_OUT_DIR, DEFAULT_TARGET,
-                        PACK_BANNER, PACK_TARGETS, _TOOLS_DIR,
-                        log_error, log_info)
+from hwp_common import (DEFAULT_OUT_DIR, PACK_BANNER, PACK_TARGETS, log_error, log_info)
 
 
 def _slug(name: str) -> str:

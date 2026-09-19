@@ -25,10 +25,13 @@ from __future__ import annotations
 
 import urllib.error
 import urllib.request
-from typing import Optional, Tuple
+from typing import TYPE_CHECKING, Optional, Tuple
 from urllib.parse import urlsplit
 
 from hlserve_common import debug
+
+if TYPE_CHECKING:  # pragma: no cover - import only used by type checkers
+    from hlserve_config import ProxyRule
 
 
 # Headers we strip from the upstream response before relaying (because

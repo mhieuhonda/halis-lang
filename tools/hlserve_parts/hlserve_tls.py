@@ -23,9 +23,7 @@ from __future__ import annotations
 
 import os
 import ssl
-import sys
 import tempfile
-import time
 from typing import Optional, Tuple
 
 from hlserve_common import warn, info
@@ -33,7 +31,7 @@ from hlserve_common import warn, info
 
 def _have_cryptography() -> bool:
     try:
-        import cryptography  # type: ignore[import-not-found]
+        import cryptography  # type: ignore[import-not-found]  # noqa: F401
         return True
     except ImportError:
         return False

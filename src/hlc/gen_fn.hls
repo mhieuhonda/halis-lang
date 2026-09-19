@@ -443,6 +443,20 @@ fn gen_proto_lines(ctx: Ctx) -> list[str] {
         # parsed[0] = key, parsed[1..n] = type args
         let key: str = parsed.get(0)
         let targs: list[str] = list_slice_from(parsed, 1)
+        # Deep-scan fix: skip pseudo instantiations (type args still
+        # mention a type parameter) — see gen_fn_inst_lines.
+        let mut targs_concrete: bool = true
+        let mut pci: int = 0
+        while pci < targs.len() {
+            if !type_is_concrete(ctx, targs.get(pci)) {
+                targs_concrete = false
+            }
+            pci = pci + 1
+        }
+        if !targs_concrete {
+            j2 = j2 + 1
+            continue
+        }
         let f: FnInfo = ctx.fns.get_or(key, dummy_fn())
         let ptypes_c: list[str] = []
         let mut k: int = 0
@@ -499,6 +513,52 @@ fn parse_inst_str(s: str) -> list[str] {
     return out
 }
 
+# rebind_call_key(ctx, e) — inside a generic instantiation body, a call
+# to another generic fn/method may still carry the CALLER's type
+# parameters as its recorded type args (the checker annotated the
+# generic body once, with the params symbolic — e.g. mkey "inner__T").
+# Re-bind each type arg through the current instantiation map
+# (ctx.cur_typeparams -> ctx.cur_targs), make sure the concrete callee
+# instantiation is queued for body emission (appending to ctx.fn_insts
+# is safe: gen_fn_inst_lines re-reads the length every iteration), and
+# return the correctly mangled callee name.
+fn rebind_call_key(ctx: Ctx, e: int) -> str {
+    let mut key: str = ctx.exprs[e].inst_key
+    if key == "" {
+        key = ctx.exprs[e].name
+    }
+    let f: FnInfo = ctx.fns.get_or(key, dummy_fn())
+    # Rebuild the combined typeparams list (struct's first, then the
+    # method's own) — it must line up 1:1 with the recorded inst_targs.
+    let mut tps: list[str] = []
+    if f.is_method && f.struct_of != "" {
+        let st: StructInfo = ctx.structs.get_or(f.struct_of, dummy_struct())
+        let mut si: int = 0
+        while si < st.typeparams.len() {
+            tps.push(st.typeparams.get(si))
+            si = si + 1
+        }
+    }
+    let mut mi: int = 0
+    while mi < f.typeparams.len() {
+        tps.push(f.typeparams.get(mi))
+        mi = mi + 1
+    }
+    let inst_targs: list[str] = ctx.exprs[e].inst_targs
+    let rebound: list[str] = []
+    let mut i: int = 0
+    while i < inst_targs.len() {
+        rebound.push(instantiate_type(inst_targs.get(i), ctx.cur_typeparams, ctx.cur_targs))
+        i = i + 1
+    }
+    # Queue the concrete instantiation (no-op when already recorded).
+    let inst_str: str = key + "|" + join(rebound, ",")
+    if !list_has(ctx.fn_insts, inst_str) {
+        ctx.fn_insts.push(inst_str)
+    }
+    return c_mangled_fn_name(key, tps, rebound)
+}
+
 # gen_fn_inst_lines(ctx) emits the body for each generic function
 # instantiation recorded in ctx.fn_insts.
 fn gen_fn_inst_lines(ctx: Ctx) -> list[str] {
@@ -509,6 +569,23 @@ fn gen_fn_inst_lines(ctx: Ctx) -> list[str] {
         let parsed: list[str] = parse_inst_str(inst)
         let key: str = parsed.get(0)
         let targs: list[str] = list_slice_from(parsed, 1)
+        # Deep-scan fix: skip PSEUDO instantiations whose type args still
+        # mention a type parameter (e.g. "inner|T") — they are not real
+        # types and would emit ListIter__T-style garbage C. The concrete
+        # instantiations are (re-)recorded by rebind_call_key during body
+        # emission and processed later in this same loop.
+        let mut targs_concrete: bool = true
+        let mut tci: int = 0
+        while tci < targs.len() {
+            if !type_is_concrete(ctx, targs.get(tci)) {
+                targs_concrete = false
+            }
+            tci = tci + 1
+        }
+        if !targs_concrete {
+            i = i + 1
+            continue
+        }
         let f: FnInfo = ctx.fns.get_or(key, dummy_fn())
         gen_reset_fn(ctx)
         # BUG-002 fix: for generic methods on generic structs, we need to

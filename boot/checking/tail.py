@@ -2,8 +2,6 @@
 boot/checker.py Checker class (lines 1358..1560), split for
 maintainability. The final Checker class assembles all mixins in
 boot/checking/checker.py - behavior is unchanged."""
-from ..lexer import HLError
-from .. import proof as _proof
 
 class CheckerTail(object):
     # verified tail `return f(...)` raises TailCallSig, and call_fn

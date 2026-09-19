@@ -27,17 +27,11 @@ import http.server
 import io
 import os
 import socketserver
-import sys
 import threading
 import time
-from typing import Optional
 
 from hlserve_common import (
-    DEFAULT_PUBLIC_DIR,
     debug,
-    error as log_error,
-    info,
-    ok as log_ok,
     warn,
 )
 from hlserve_config import ServeConfig
@@ -45,9 +39,6 @@ from hlserve_hmr import (
     HmrBus,
     serve_client_loop,
     ws_handshake_response,
-    ws_read_frame,
-    OP_CLOSE,
-    OP_PING,
 )
 from hlserve_overlay import inject_overlay, inject_status_banner
 from hlserve_proxy import proxy_request, find_proxy_for_path
@@ -430,7 +421,7 @@ def make_server(config: ServeConfig, bus: HmrBus, bundle_dir: str,
     # If HTTPS, wrap the socket with TLS.
     if config.https:
         from hlserve_tls import (
-            generate_self_signed_cert, make_ssl_context, cleanup_cert_pair)
+            generate_self_signed_cert, make_ssl_context)
         pair = generate_self_signed_cert()
         if pair is not None:
             ctx = make_ssl_context(pair[0], pair[1])

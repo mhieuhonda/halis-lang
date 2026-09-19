@@ -18,7 +18,6 @@ from __future__ import annotations
 import json
 import os
 import re
-import sys
 from typing import Any, Dict, List, Optional
 
 _NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._~-]*$")

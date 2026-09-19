@@ -5,5 +5,5 @@ Facade: the implementation lives in the boot/checking/ package
 that `from boot.checker import check` (and every helper) keeps
 working."""
 from .checking.helpers import *  # noqa: F401,F403
-from .checking.helpers import HLError  # noqa: F401
+from .lexer import HLError  # noqa: F401
 from .checking.checker import Checker, check  # noqa: F401

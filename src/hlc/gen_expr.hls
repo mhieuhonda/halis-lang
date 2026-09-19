@@ -269,13 +269,22 @@ fn gen_args_c(ctx: Ctx, e: int) -> str {
 
 fn gen_call(ctx: Ctx, e: int) -> str {
     if ctx.exprs[e].muser {
+        # Deep-scan fix: inside a generic instantiation body the callee's
+        # recorded type args may still be the enclosing fn's TYPE PARAMS
+        # (the checker annotated the generic body once, symbolically).
+        # Re-bind them through ctx.cur_typeparams -> ctx.cur_targs so the
+        # call targets the correctly mangled concrete instantiation.
+        let mut call_key: str = ctx.exprs[e].mkey
+        if ctx.cur_typeparams.len() > 0 && ctx.exprs[e].inst_targs.len() > 0 {
+            call_key = rebind_call_key(ctx, e)
+        }
         # Stage 15-beta: extern fns use the RAW C name (no `usf_` prefix)
         # so the C linker can resolve them from libc. Extern args are
         # borrowed (the C callee knows nothing about refcounts) — fresh
         # pointer args were hoisted into temps by the statement wrapper.
-        let cf: FnInfo = ctx.fns.get_or(ctx.exprs[e].mkey, dummy_fn())
+        let cf: FnInfo = ctx.fns.get_or(call_key, dummy_fn())
         if cf.is_extern {
-            return ctx.exprs[e].mkey + "(" + gen_args_c(ctx, e) + ")"
+            return call_key + "(" + gen_args_c(ctx, e) + ")"
         }
         # Stage 8-beta: user fn params OWN one retain of each argument —
         # fresh values are passed raw, borrowed values retain-wrapped.
@@ -283,15 +292,15 @@ fn gen_call(ctx: Ctx, e: int) -> str {
         # calls redirect to the intrinsic helpers (identical semantics,
         # native vector code; helpers own their args like user fns).
         if ctx.target_feature != "" {
-            let redirected: str = simd_try_redirect(ctx, ctx.exprs[e].mkey, e)
+            let redirected: str = simd_try_redirect(ctx, call_key, e)
             if redirected != "" {
                 return redirected
             }
         }
         # Stage 20 (v0.36.0-alpha): count the emitted out-of-line call
         # (LTO phase-B DCE drops standalone bodies at 0).
-        lto_note_call(ctx, ctx.exprs[e].mkey)
-        return "usf_" + c_fn_name(ctx.exprs[e].mkey) + "(" + gen_own_args_c(ctx, e) + ")"
+        lto_note_call(ctx, call_key)
+        return "usf_" + c_fn_name(call_key) + "(" + gen_own_args_c(ctx, e) + ")"
     }
     let name: str = ctx.exprs[e].mkey
     let args: str = gen_args_c(ctx, e)
@@ -532,6 +541,15 @@ fn gen_call(ctx: Ctx, e: int) -> str {
             return "hl_chan_clone(" + args + ")"
         }
         register_clone(ctx, at)
+        # Deep-scan fix: primitives have value semantics — clone() is the
+        # identity (clone_expr_for already treats them that way for the
+        # composite helpers). This path is reachable through GENERIC
+        # instantiation only (the checker rejects a direct clone(int)):
+        # core/clone.hls's clone_some[T] calls clone(v); instantiated with
+        # T=int it must not reference a nonexistent hl_clone_int helper.
+        if at == "int" || at == "float" || at == "bool" {
+            return args
+        }
         if at == "str" {
             return "hl_clone_str(" + args + ")"
         }

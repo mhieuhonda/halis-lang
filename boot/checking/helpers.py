@@ -11,8 +11,6 @@ Side effect: annotates the AST so the evaluator can run quickly:
   - match arms have arm['body_t'] = arm body type
   - program['edges'] = {fn_key: set(callees)} for effects analysis
 """
-from ..lexer import HLError
-from .. import proof as _proof
 from ..compat import zip_strict
 
 INT64_MAX = 9223372036854775807

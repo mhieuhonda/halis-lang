@@ -294,6 +294,7 @@ def test_emission() -> None:
     out = os.path.join(d, "hello.c")
     hello = os.path.join(REPO_ROOT, "examples", "hello.hls")
     r = boot(os.path.join(REPO_ROOT, "src", "hlc.hls"), hello, out)
+    check("hosted emission compile ok", r.returncode == 0, r.stderr.strip()[-200:])
     with open(out, encoding="utf-8", errors="replace") as f:
         hsrc = f.read()
     check("hosted emission keeps stdio+main",

@@ -24,7 +24,6 @@ import json
 import os
 import shutil
 import subprocess
-import sys
 from typing import Any, Dict, List, Tuple
 
 from hwp_common import PACK_FORMAT_VERSION, PACK_TARGETS
@@ -70,7 +69,6 @@ def check(pkg_dir: str) -> Tuple[bool, List[str]]:
     else:
         ok("target == %s" % target)
     files = manifest.get("files", {})
-    required = [k for k in files.keys()]
     for req in ("package.json", "README.md"):
         if req not in files:
             fail("manifest does not list required %s" % req)

@@ -13,6 +13,130 @@ stability (125–140), and final stabilisation toward v1.0 (141–150).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
+## [v0.97.1-alpha] — deep-scan-27: 9 fixes — nested generic instantiation codegen (Stage 78 unblocked), boot↔hlc checker parity (move reachability, asm imm, struct defaults, dup fields), freestanding C prelude hardening for GCC 14, tooling cleanups
+
+> Seventh systematic super-scan. This pass paired static analysis
+> (ruff/pyflakes over every Python module + a generated-C symbol
+> auditor that resolves every called function against the TU's
+> definitions/declarations/macros) with FULL differential execution:
+> every `tests/ok` program and every example compiled by the freshly
+> bootstrapped native hlc, gcc-linked, run, and compared to the boot
+> interpreter (output + exit code). The audit exposed that Stage 77/78
+> shipped with the native differential suite red on GCC 14 (C23 made
+> implicit function declarations hard errors) and that NO earlier
+> test had ever exercised a generic fn calling another generic fn
+> with a type-param argument — the newly-shipped `core.iter` /
+> `core.clone` free-function protocol was the first code to reach
+> that path. Verification after the fixes: stage-1/2 (183/183 ok +
+> 147/147 fail via boot), differential interp-vs-native for all
+> `tests/ok` (183/183 with the freestanding recipe applied to the
+> freestanding crate), bootstrap determinism (byte-identical two-pass
+> self-compilation), hlc-rejects parity 157/157 on `tests/fail`,
+> Stage 77/78 acceptance gates green, fuzz 367 programs 0
+> divergences, spec-check / lsp-smoke / hltest / prove green. Zero
+> regressions introduced. Totals: 185 `tests/ok` programs pass
+> stage-1 + native differential, 157/157 `tests/fail` programs are
+> rejected by BOTH checkers.
+
+### Fixed — self-hosted compiler (hlc)
+
+- **Nested generic instantiation emitted UNBOUND type params into the
+  C output (CRITICAL — the codegen had never been exercised on a
+  generic→generic call).** When the checker annotated a generic body
+  (`fn outer[T]{ return inner(x) }`), the call node recorded the
+  callee mangled name with the CALLER's type param still symbolic
+  (`inner__T`) and pushed the pseudo-instantiation `inner|T` into
+  `fn_insts`. Codegen then emitted a body for the pseudo entry
+  (`T* usf_inner__T(T*)` — unknown type name `T`, hard error under
+  GCC 14) AND the instantiated `outer__int` body called
+  `usf_inner__T` instead of `usf_inner__int`. Four coordinated fixes:
+  (1) the checker now records an instantiation only when every type
+  arg is concrete (`check_expr.hls` + `check_call.hls` method path);
+  (2) new `rebind_call_key` re-binds symbolic type args through the
+  current instantiation map at codegen time and queues the concrete
+  callee instantiation for body emission (`gen_fn.hls`); (3) pseudo
+  entries are skipped by both `gen_fn_inst_lines` and
+  `gen_proto_lines` (`type_is_concrete` guard); (4) method calls now
+  store `inst_targs`/`inst_key` on the call node so methods on
+  generic-method receivers re-bind identically. Regression:
+  `tests/ok/feat_deep_scan27_nested_generic.hls` (int/str/bool
+  instantiations, differential-checked).
+- **`clone()` of a primitive through a generic instantiation
+  referenced a nonexistent helper (HIGH).** The checker rejects a
+  direct `clone(int)`, but `core/clone.hls`'s generic
+  `clone_some[T]`/`clone_list_of[T]` lowered `clone(v)` to
+  `hl_clone_int(...)` when instantiated with a primitive — no such
+  helper exists (`register_clone` ignores primitives by design).
+  `gen_expr.hls` now lowers primitive clones to the identity, exactly
+  like `clone_expr_for` already did for composite helpers. Unmasked
+  by the nested-generic fix while compiling
+  `tests/ok/feat_nostd_core.hls`.
+- **Move-state union rejected terminating arms (HIGH — shipped
+  example rejected).** hlc's deep-scan-16 union merged the then-arm's
+  moved-state into the post-if state unconditionally, so the idiomatic
+  `if cond { ch.send(take(x)); return } use(x);` was rejected with a
+  spurious "use of moved value" — the boot checker accepted it, and
+  `examples/conc_pipeline.hls` (a Stage 16 demo) did not compile with
+  hlc at all. Ported the boot checker's reachability refinement:
+  new `path_terminates` (return / break / continue in loop context /
+  never-typed tail / asm noreturn, recursive through nested ifs) and
+  the if-merge now skips arms that always exit. Regression:
+  `tests/ok/feat_deep_scan27_move_return_arm.hls` (incl. nested
+  if-return-in-return).
+- **Three checker rules existed only in boot (hlc accepted what boot
+  rejected).** (a) `asm!` `in(imm)` on a non-literal expression
+  (deep-scan-18 BUG-10 was never ported) — hlc passed `"i"(some_var)`
+  to GCC, which dies with an opaque "impossible constraint" error
+  (ported: literal-only forms accepted, `fail_asm_imm_runtime` now
+  rejected by hlc too); (b) struct field DEFAULT effects never
+  propagated — `check_program` checked default exprs under `cur=""`
+  and no `@default.<S>` edge existed, so a default calling `println`
+  let a pure `main` through (ported BUG-DS4-2 + BUG-04: defaults
+  checked under the synthetic node, edge added only when a defaulted
+  field is actually omitted, fixpoint seeds + iterates the synthetic
+  nodes — `fail_effect_struct_default` now rejected by hlc too);
+  (c) duplicate struct field names silently accepted by the hlc
+  parser (BUG-SC-8 was never ported — `fail_struct_dup_field` now
+  rejected by hlc too).
+
+### Fixed — freestanding C prelude (GCC 14 / C23 hard errors)
+
+- **`strncpy` called without a declaration** in `hl_sandbox_check`
+  (implicit declaration = error under GCC 14). Added the explicit
+  declaration to the freestanding prelude's declaration list — the
+  design already documents "declarations (never definitions) for
+  every other libc symbol"; `strncpy` was simply missing from it.
+- **`free` used as a bare function designator was undeclared** in
+  freestanding mode (`hl_range`: `hl_list_new(free)`). The no-op
+  `#define free(p) ((void)0)` does not expand on a designator, and
+  `<stdlib.h>` is not included — added a real no-op `free()`
+  definition for the designator, then restored the call-site macro.
+- **`stdout`/`stderr` stream variables were undeclared** — the common
+  runtime's `hl_print`/`hl_eprint` reference them by name; the prelude
+  now declares both `extern FILE*` (dead sections dropped by
+  `--gc-sections`, exactly the documented Stage 77 mechanism).
+  Together these un-broke the Stage 77 gate:
+  `feat_freestanding_basic` failed its gcc recipe since the stage
+  landed (every commit since 6a64baa was red under GCC 14).
+
+### Changed — tooling (static-analysis clean)
+
+- Removed 40+ unused imports across `boot/checking/*` (split
+  leftovers) and `tools/hlserve_parts/*` + `tools/hlwasm_pack_parts/*`
+  (ruff F401), with the re-export through `boot/checker.py` re-pointed
+  to the real source (`boot.lexer`) — the facade broke for one run
+  when ruff removed the re-exported name; the entry-point smoke test
+  caught it immediately.
+- `tools/hlserve_parts/hlserve_proxy.py`: the `ProxyRule` return
+  annotation referenced an undefined name (the class lives in
+  `hlserve_config`) — imported under `TYPE_CHECKING`.
+- `tests/freestanding_acceptance.py`: the hosted-emission probe now
+  asserts the compile succeeded before opening the artifact (an
+  unused-result call previously surfaced as a confusing
+  `FileNotFoundError`).
+- `tools/hlwasm_pack_parts/hwp_validate.py`: removed a dead
+  comprehension (F841).
+
 ## [v0.97.0-alpha] — Stage 78: #![no_std] core-only stdlib subset
 
 > Continues **Phase VI (OS-development foundation, Stages 77–96)**

@@ -2,7 +2,6 @@
 boot/checker.py Checker class (lines 2676..4431), split for
 maintainability. The final Checker class assembles all mixins in
 boot/checking/checker.py - behavior is unchanged."""
-from ..lexer import HLError
 from .. import proof as _proof
 from .helpers import (
     BOOL_M, BUILTIN_FNS, FLOAT_M, FREESTANDING_DENY_BUILTINS,

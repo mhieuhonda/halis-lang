@@ -18,7 +18,6 @@ target so ``check`` / acceptance can verify the flavour.
 """
 from __future__ import annotations
 
-from typing import Optional
 
 _MARKER = "/* hls-wasm-pack target: %s (Stage 76) */"
 

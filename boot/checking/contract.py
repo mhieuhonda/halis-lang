@@ -2,7 +2,6 @@
 boot/checker.py Checker class (lines 1561..1739), split for
 maintainability. The final Checker class assembles all mixins in
 boot/checking/checker.py - behavior is unchanged."""
-from ..lexer import HLError
 from .. import proof as _proof
 
 class CheckerContract(object):

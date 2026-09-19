@@ -33,7 +33,7 @@ import sys
 import time
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 
 # Regex for ``path:line:col: SEVERITY: message``
