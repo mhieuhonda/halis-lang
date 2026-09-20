@@ -13,6 +13,14 @@ stability (125–140), and final stabilisation toward v1.0 (141–150).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
+## [v0.99.0-alpha] — Stage 80: core.mem — physical-page allocator + page tables
+- Adds `core/mem.hls` (95 pure functions, 3 structs, 1 enum) with the `FrameAlloc` bitmap allocator over a physical region: first-fit single frames, contiguous runs, 2-MiB-address-aligned huge frames, double-free/out-of-range detection, and boot-style reservations with `peak`/`allocations`/`frees` accounting.
+- Adds the x86-64 4-level page-table model: real PTE layout (flags in bits 0..8, address in bits 12..51, NX in bit 63 as INT64_MIN), canonical-address validation with the 2^47 hole, `PageTable`/`AddressSpace` with a table pool standing in for the kernel direct map.
+- `space_map`/`space_map_huge` create intermediate tables on demand and bill their frames to the FrameAlloc; a two-pass structure (validate + exact table counting, then install) makes failure atomic — an OOM map leaves space and allocator byte-for-byte untouched.
+- Adds `space_translate` (Option-returning walk with huge-page offsets), `space_unmap`/`space_unmap_huge` (paired APIs, Linux-style zeroing), `space_protect` (mprotect-style re-flagging for W^X), and the `mem_identity_map`/`mem_map_bytes` boot conveniences.
+- Adds `examples/mem_demo.hls` — a no_std early-boot story (claim region, reserve firmware hole, identity-map low kernel, higher-half read-only text, direct-map W^X data window, 2-MiB device window, lockdown) that exits 0 on hosted, `-nostdlib` and interpreter runs.
+- Adds a 161-assertion ok-test (`feat_stage80_mem.hls`), the 8-section `make mem-acceptance` gate, suite_08_osdev Stage 80 coverage, and SPEC section 34.
+
 ## [v0.98.0-alpha] — Stage 79: core.alloc — pluggable allocator protocol
 - Adds `core/alloc.hls` with `Layout` + `AllocError` and three reference allocators (`BumpAlloc`, `PoolAlloc`, `NullAlloc`) plus `AllocStats`.
 - Exposes pluggable allocator protocol as free generic functions per concrete type, following `core.iter`/`clone`/`eq` convention.

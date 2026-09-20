@@ -2852,3 +2852,172 @@ sites. The `examples/alloc_demo.hls` "request router" (a
 table with LIFO recycle and double-free detection) is the shape
 of the future: user-owned data structures that compose with
 any allocator.
+
+## 34. `core.mem` — the physical-page allocator + page tables (Stage 80 — v0.99.0-alpha)
+
+`core.mem` is the memory-management substrate: the two structures
+every kernel builds before it can map its first virtual byte. The
+module is pure HLS — 95 functions, 3 structs (`FrameAlloc`,
+`PageTable`, `AddressSpace`), 1 enum (`MemError`), importing only
+`core.option` + `core.result` — so it is `no_std`-clean and
+importable from `#![freestanding]` crates identically. As with
+`core.alloc` (§33), the module is a faithful BOOKKEEPING MODEL: it
+performs the same arithmetic, validation and accounting as the
+hardware, but never dereferences an address (HLS has no raw
+pointers yet). The `AddressSpace.tables` pool stands in for the
+direct map a real kernel uses to touch its own page tables —
+`space_table_index(space, base)` finds a table by the physical
+address of its frame.
+
+### 34.1. Page geometry and canonical addresses
+
+`mem_page_size()` is 4096, `mem_huge_page_size()` is 2 MiB (the
+coverage of one full PT, 512 pages), and the helpers
+`mem_is_page_aligned` / `mem_is_huge_aligned` /
+`mem_page_align_up` / `mem_page_count` /
+`mem_pages_to_bytes` express the usual arithmetic. Alignment is a
+LOW-BIT property: high-half canonical virtual addresses are
+negative int64s (the kernel text base `0xFFFFFFFF80000000` is
+`-2147483648` as an int64) and are legitimately page-aligned, so
+the alignment helpers mask bits without a sign check. Callers that
+handle PHYSICAL addresses add the explicit `>= 0` check
+(`frame_new`, `pte_new`).
+
+The virtual-address decomposition follows x86-64 four-level paging:
+`vaddr_pml4_index` / `vaddr_pdpt_index` / `vaddr_pd_index` /
+`vaddr_pt_index` extract the four 9-bit index fields with the
+LOGICAL right shift `int_shr` (which operates on the unsigned bit
+pattern, so negative high-half addresses decompose correctly), and
+`vaddr_page_offset` / `vaddr_huge_offset` extract the 12- and
+21-bit in-page offsets. `vaddr_is_canonical` implements the full
+canonical-form rule — bits 63..48 must equal bit 47 — with one
+arithmetic shift: `int_sar(v, 47)` is `0` for the low half, `-1`
+for the high half, and neither for an address in the 2^47 canonical
+hole. Every mapping entry point rejects non-canonical addresses
+exactly where the CPU would raise.
+
+### 34.2. The PTE format
+
+Entries use the real x86-64 layout: flag bits 0..8 (PRESENT,
+WRITABLE, USER, PWT, PCD, ACCESSED, DIRTY, HUGE/PS, GLOBAL), the
+physical (or next-table) address in bits 12..51 — the full 52-bit
+architectural physical address width, enforced by `pte_new` against
+`pte_addr_limit()` — and NO_EXECUTE in bit 63. Because bit 63 is
+the sign bit of an int64, `pte_flag_no_execute()` is INT64_MIN and
+every NX-carrying entry is a NEGATIVE int64; the accessors treat
+entries as unsigned bit patterns (`int_and` / `int_shr`), so NX
+round-trips on both backends. Two consequences are tested
+explicitly (§34.5): `pte_address` is a pure mask (addresses are
+stored unshifted, low 12 bits zero by the alignment rule), and no
+internal walk may use a negative-entry sentinel (see §34.4).
+
+HLS has no module-level constants, so each flag is a pure function
+(`pte_flag_present()`, `pte_flag_writable()`, ...) — the same
+convention `std.bits` uses for `bits_pow2`. `pte_new(paddr, flags)`
+validates alignment, the 2^52 limit, and that `flags` stays inside
+`pte_flags_known_mask()` (bits 0..8 plus 63), returning
+`MemError.BadAlignment` / `OutOfRange` / `BadFlags` respectively.
+`pte_set_flags` / `pte_clear_flags` compose and strip flags without
+touching the address field.
+
+### 34.3. FrameAlloc — the physical-page allocator
+
+A bitmap allocator over ONE physical region
+`[base, base + frame_count * 4096)`; `used[i]` is true while frame
+i is allocated or reserved. The policies are deterministic (and
+therefore differential-testable):
+
+- `frame_alloc_one` — first-fit scan from frame 0.
+- `frame_alloc_run(count)` — first-fit CONTIGUOUS free run
+  (DMA-style adjacency).
+- `frame_alloc_huge` — first-fit 512-frame run whose PHYSICAL
+  ADDRESS is 2-MiB aligned. The alignment that matters is the
+  address, not the frame index: with a region base of 0x100000 the
+  first candidate is frame index 256, because the CPU requires the
+  huge-page physical base itself to be 2-MiB aligned. This is where
+  `core/alloc.hls`'s Stage 80 note ("larger alignments belong to
+  huge pages") lands.
+- `frame_free(addr, count)` — every failure mode is a distinct
+  kernel bug: `BadRange` (count <= 0), `BadAlignment`
+  (misaligned address), `OutOfRange` (outside the region or
+  crossing its end), `DoubleFree` (any frame in the run already
+  free).
+- `frame_reserve(addr, count)` — marks firmware/ACPI/MMIO holes in
+  use before any allocation; double reservations fail with
+  `InUse`. Reservations raise `peak` (they pin real memory) but not
+  `allocations`.
+
+The accounting mirrors `core.alloc`'s `AllocStats`:
+`allocations`/`frees` count successful operations, `peak` records
+the high-water mark of used frames.
+
+### 34.4. AddressSpace — the 4-level walk
+
+`PageTable` is 512 int64 entries plus the physical `base` of its
+frame; `AddressSpace` holds the root PML4 (registered by
+`space_new(root_base)`) and the pool `tables: list[PageTable]`.
+The pool is the model's direct map: walks resolve a child pointer
+by looking up `pte_address(entry)` in the pool.
+
+`space_map(fa, space, vaddr, paddr, pages, flags)` maps 4-KiB
+pages, creating intermediate tables on demand — the same
+walk-and-create a kernel's early boot mapper performs, with the
+table frames allocated FROM the FrameAlloc so the caller sees the
+true cost of the map (`frame_used_count` after a fresh-region map
+is root + 3 tables). The install has two passes, and the
+difference is the safety story:
+
+1. **Prepare** — validate every page (canonical, no present leaf,
+   no huge leaf in the way) and COUNT the missing intermediate
+   tables exactly. Because pages advance sequentially, the table
+   keys `(a)`, `(a,b)`, `(a,b,c)` are lexicographically
+   non-decreasing, so each key can only repeat contiguously —
+   counting "on key change, if absent" counts every missing table
+   exactly once, and a missing ancestor automatically cascades
+   into the descendant counts (the walk only reports levels whose
+   ancestors are present).
+2. **Install** — re-walk and create (`space_ensure_table`), then
+   write leaves as `pte_new(paddr + i*4096, flags | PRESENT)`.
+
+If the counted tables exceed `frame_free_count(fa)`, the map fails
+with `OutOfFrames` BEFORE pass two touches anything: **failure is
+atomic** — an OOM map leaves the address space and the allocator
+exactly as they started (probed explicitly by the acceptance
+suite). Intermediate tables are linked PRESENT|WRITABLE (plus USER
+when the leaf flags request user access — stripping the user bit
+mid-path would fault at the missing level) and never NX.
+
+`space_translate(space, vaddr) -> Option[int]` is the pure lookup:
+physical address including the in-page or in-huge-page offset, or
+`None` when any level is absent. One model subtlety: the walk's
+out-pattern keeps leaf presence in a SEPARATE slot
+(`found[4]`) because a "-1 means absent" sentinel would be
+indistinguishable from a legitimate leaf carrying NX (negative
+entry) — table bases are physical and non-negative, so the
+sentinel stays safe for them. `space_unmap` /
+`space_unmap_huge` are strictly paired with their map APIs
+(crossing small/huge is `NotMapped`), zero entries Linux-style,
+and keep table frames allocated (reclaiming them needs the
+Stage 82+ lifetime story). `space_protect` re-flags existing small
+leaves (mprotect semantics: address preserved, flags rebuilt,
+PRESENT forced) — the W^X primitive. `mem_identity_map` and
+`mem_map_bytes` wrap `space_map` for the two boot idioms
+(virtual == physical, and byte-sized regions rounded up to whole
+pages).
+
+### 34.5. What the tests prove
+
+`tests/ok/feat_stage80_mem.hls` runs 161 numbered assertions on the
+interpreter AND as a native binary (hosted and `-nostdlib` — the
+exit codes must match, per the differential convention):
+canonical-hole rejection at ±2^47, the KT decompose
+(PML4[511]/PDPT[510]), flag-bit values including NX as INT64_MIN,
+double-free and reservation misuse detection, first-fit reuse of a
+freed frame, huge-frame address alignment against a shifted region
+base, the atomic-OOM invariant, translate/unmap/protect round
+trips, and huge-page offsets. `examples/mem_demo.hls` composes the
+whole surface into a boot story — claim region, reserve the
+firmware hole, identity-map the low kernel, higher-half read-only
+text, direct-map W^X data window, a 2-MiB device window, lockdown
+— and asserts the final accounting: 1 reserved + 1 root + 9 table
+frames + 512 huge = 523 frames used, 4 maps, 1 unmap, 0 failures.

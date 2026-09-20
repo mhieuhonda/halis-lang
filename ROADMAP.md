@@ -135,7 +135,7 @@ remains green.
 | 77 | `#![freestanding]` mode (no libc, no OS calls) | ✅ | (done in v0.96.0-alpha) |
 | 78 | `#![no_std]` core-only stdlib subset | ✅ | (done in v0.97.0-alpha) |
 | 79 | `core.alloc` — pluggable allocator trait | ✅ | (done in v0.98.0-alpha) |
-| 80 | `core.mem` — physical-page allocator, page tables | ⬜ | 5 weeks |
+| 80 | `core.mem` — physical-page allocator, page tables | ✅ | (done in v0.99.0-alpha) |
 | 81 | Panic-handler override (kernel panic strategy) | ⬜ | 3 weeks |
 | 82 | Stack-overflow guard page + deterministic stack size | ⬜ | 3 weeks |
 | 83 | Inline-asm register constraints (clobber, input, output) | ⬜ | 5 weeks |
