@@ -52,7 +52,12 @@ run_native_self() {
 # Timing benchmarks (wall-clock output, inherently non-deterministic)
 # skip the interpreter path — the interpreted CPU-bound workload would
 # take minutes and the three outputs are not comparable anyway.
-TIMING_BENCHES="benchmarks/conc_bench.hls"
+# Deep-scan-29: simd_bench joins conc_bench here — it self-times (scalar vs
+# vector wall-clock), so the interp run is not representative; and its 1M-
+# element correctness phase does not fit a modest-RAM interpreter (the OOM
+# kill mid-run also destabilised the FOLLOWING hlc compile with a spurious
+# "cannot write file" panic). Native paths cover both correctness and ratio.
+TIMING_BENCHES="benchmarks/conc_bench.hls benchmarks/simd_bench.hls"
 
 for f in benchmarks/*.hls; do
     name=$(basename "$f")

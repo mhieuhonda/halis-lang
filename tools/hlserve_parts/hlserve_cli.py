@@ -274,7 +274,6 @@ def main(argv: Optional[List[str]] = None) -> int:
     # so these are sticky for the rest of the process).
     if args.quiet:
         # Filter out INFO/DEBUG by patching the helpers.
-        import logging
         # We don't actually use the logging module; the simplest way
         # to suppress INFO is to overwrite the helpers.
         common.info = lambda *a, **k: None  # type: ignore[assignment]

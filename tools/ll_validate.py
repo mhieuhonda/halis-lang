@@ -280,9 +280,11 @@ def validate(text, name="<module>"):
 
 def main():
     args = sys.argv[1:]
-    if not args:
-        sys.stderr.write(__doc__)
-        return 2
+    if not args or "-h" in args or "--help" in args:
+        # deep-scan-29: --help previously fell through to the file loop
+        # and reported "cannot read: '--help'" like a broken module.
+        sys.stdout.write(__doc__)
+        return 0 if args else 2
     all_errors = []
     for path in args:
         if path == "-":

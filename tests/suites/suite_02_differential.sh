@@ -183,3 +183,34 @@ else
     ok "hllint L005 cfaware: no false positives on safe unwraps"
 fi
 
+
+echo "=== 4c. deep-scan-29: Stage 32 bench driver sanity ==="
+# The bench-stdlib gate was fully red before deep-scan-29: 53 functions
+# failed the driver's `uses IO`-only type-check (any callee requiring
+# Net/Rand/Proc/Conc) and 54 panicked on generic default inputs. Lock
+# in the three fix classes with one representative function each:
+#   mutex_new  — Conc effect      (was: hlc type error)
+#   env_var    — Proc effect      (was: hlc type error)
+#   base64_decode — curated valid input (was: run panic on "hello world")
+# All three must be MEASURED (not skipped, not failed) at low iters.
+bench_out=$(python3 tools/hls-bench.py --iters 3000 \
+    --only mutex_new,env_var,base64_decode 2>&1); bench_rc=$?
+bench_measured=$(echo "$bench_out" | grep -E "^[0-9]+ measured" | grep -oE "^[0-9]+")
+if [ $bench_rc -eq 0 ] && [ "$bench_measured" -eq 3 ]; then
+    ok "hls-bench driver: effects + curated inputs (3/3 measured, 0 failed)"
+else
+    bad "hls-bench driver: rc=$bench_rc measured=$bench_measured (want 3)"
+    echo "$bench_out" | tail -6
+fi
+# Skipped-only selections must report cleanly, not crash.
+if python3 tools/hls-bench.py --iters 3000 --only csrf_generate_token >/dev/null 2>&1; then
+    bad "hls-bench: skip-only selection should exit non-zero"
+else
+    ok "hls-bench: skip-only selection reports 'no functions to benchmark'"
+fi
+# ll_validate --help must print usage (was: 'cannot read: --help' error).
+if python3 tools/ll_validate.py --help >/dev/null 2>&1; then
+    ok "ll_validate: --help prints usage"
+else
+    bad "ll_validate: --help broken"
+fi

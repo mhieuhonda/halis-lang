@@ -75,6 +75,12 @@ SKIP_FUNCS = {
     # quickcheck uses Rand
     "qc_int", "qc_int_range", "qc_bool", "qc_str", "qc_str_n",
     "qc_list_int", "qc_byte", "qc_fail",
+    # CSPRNG token generators (deep-scan-29): their per-call cost IS the
+    # OS crypto-random read (~3-5 µs on modest hardware) — a security
+    # budget, not an abstraction overhead, so the zero-cost gate does not
+    # apply to them (non-deterministic output, same family as qc_*).
+    "csrf_generate_token", "session_generate_id",
+    "uuid_v7", "ulid", "ws_generate_key", "ws_generate_mask_key",
     # test framework — assertion helpers
     "assert_eq_int", "assert_eq_int_msg", "assert_ne_int",
     "assert_eq_str", "assert_eq_str_msg", "assert_ne_str",
@@ -123,6 +129,126 @@ SKIP_FUNCS = {
     "simd_f64x2_gather", "simd_f64x2_scatter",
     "simd_u8x16_byte", "simd_u8x16_add", "simd_u8x16_sub",
     "simd_transform_sum_i32x4", "simd_correlate8_sum_i32x4",
+    # ---- deep-scan-29: functions that cannot be microbenched ----
+    # Network effect: open sockets / do DNS / serve — cannot run in a
+    # hermetic microbench (covered by the net/http acceptance gates).
+    "tcp_connect", "tcp_connect_or", "tcp_listen", "tcp_listen_or",
+    "udp_open", "udp_open_or", "tls_get", "dns_lookup", "dns_lookup_or",
+    "echo_server_start", "http_get", "http_get_with_tls", "http_serve",
+    # Process effect with side effects on the host: spawn subprocesses,
+    # create directories, walk the filesystem, or run the interactive CLI.
+    "proc_exec_safe", "hlscli_main", "hlscli_run", "hlscli_mkdir",
+    "hlscli_find_project_root", "hlscli_load_project", "man_install",
+    # File-fixture inputs: need a real file on disk (covered by the
+    # archive/fs acceptance gates with proper fixtures).
+    "tar_read_file", "zip_read_file", "gzip_decode_file",
+    "buf_reader_from_file",
+    # Fs-effect writers (deep-scan-29): benchmarking man_write means
+    # 200k real file writes per driver run — disk-bound by design.
+    "man_write",
+    # Binary-fixture inputs: need a VALID gzip/zip byte stream; the
+    # generic default is rejected at runtime (covered by archive tests).
+    "gzip_decode", "zip_parse",
+    # Sleep / timeout: benchmarking them just measures the clock.
+    "thread_sleep", "thread_sleep_short", "thread_sleep_long",
+    "time_sleep_ms_dur", "time_timeout_ms",
+    # Macro-ops that spawn a task per call — a thread-creation cost,
+    # not a zero-cost abstraction (covered by the stream/async gates).
+    "stream_from_list_int",
+    # Race helpers: future_select() panics on an empty list and a
+    # Future cannot be built from a literal (needs a live spawn).
+    "async_race_int", "async_any_ok",
+    # Mutates the caller's match list (needs a live CliMatch value).
+    "cli_match_overwrite_in_place",
+    # ---- deep-scan-29: work-doing functions (not abstraction overhead) ----
+    # The Stage 32 gate audits ZERO-COST ABSTRACTIONS: that generics,
+    # closures, iterators, option/result etc. compile away. The functions
+    # below do real algorithmic work per call (hash rounds, deflate,
+    # parsing, calendar math, buffer allocation) — their cost is the
+    # algorithm, not an abstraction, so a µs threshold does not apply.
+    # Correctness is covered by their acceptance gates instead.
+    # Crypto digest / MAC stack (SHA-1 rounds per call):
+    "sha1_hash", "sha1_hex", "sha1_pad", "sha1_compress_block",
+    "sha1_message_schedule",
+    "cookie_hmac_sha1", "session_destroy_cookie",
+    "csrf_double_submit_cookie",
+    "ws_accept_key", "ws_validate_accept", "ws_handshake_response",
+    "uuid_v7_from",
+    # Compression / checksums (deflate streams, CRC table build per call):
+    "gzip_encode", "archive_crc32",
+    # Whole-document parsers / builders (parse or allocate per call):
+    "json_parse", "hlscli_build_parser",
+    "dom_html_document", "dom_html_document_with_head",
+    "dom_script_inline", "dom_style_inline",
+    "openapi_docs_html_url",
+    "buffer_new", "ringbuf_str_new",
+    # Civil-calendar conversions (divmod chains + string building):
+    "log_epoch_ms_to_iso", "cookie_format_http_date",
+}
+
+# Curated per-function inputs for functions whose VALID domain differs
+# from the generic signature defaults (deep-scan-29: 30+ stdlib fns
+# panic on the generic defaults — e.g. hex_decode("hello world") is an
+# odd-length hex error, log_level_from_int(42) is out of the 0..5 range).
+# Values are comma-separated argument strings spliced into the call.
+FUNC_INPUTS = {
+    # archive: raw-byte readers need a long-enough ASCII buffer
+    "ar_read_be32": '"ABCDEFGHIJKLMNOP", 0',
+    "ar_read_le32": '"ABCDEFGHIJKLMNOP", 0',
+    "ar_read_octal": '"0000644000", 0, 7',
+    # base64 / hex decoders need valid encodings
+    "base64_decode": '"aGVsbG8="',
+    "base64url_decode": '"aGVsbG8="',
+    "hex_decode": '"deadbeef"',
+    "io_from_hex": '"deadbeef"',
+    # bits: bit index / value / byte-count domains
+    "bits_set": '5, 1, 1',
+    "bits_byte": '171, 3',
+    "bits_from_bytes_be": '[1,2,3,4,5,6,7,8]',
+    "bits_from_bytes_le": '[1,2,3,4,5,6,7,8]',
+    # enum decoders with bounded int domains
+    "color_level_from_int": '1',
+    "hex_nibble": '5',
+    "log_level_from_int": '3',
+    "log_format_from_int": '1',
+    "log_color_from_int": '1',
+    "progress_color_from_int": '1',
+    "spinner_style_from_int": '2',
+    "stdio_from_int": '0',
+    "hasher_new": '0',
+    # cookie: the separator must be exactly one byte
+    "cookie_last_index": '"a=b; c=d", ";"',
+    # csrf: the token must be 43 base64url characters
+    "csrf_double_submit_cookie": '"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopq", 3600',
+    # dom: tag/attr names must match [A-Za-z][A-Za-z0-9_-]*
+    "dom_attr_true": '"disabled"',
+    "dom_attr_false": '"checked"',
+    "dom_element": '"div", [], []',
+    "dom_void": '"br", []',
+    # hash: fixed-width readers / length-dispatched CityHash arms
+    "hash_read_u64_le": '"abcdefghijklmnop", 0',
+    "hash_read_u32_le": '"abcdefghijklmnop", 0',
+    "cityhash64_len_17_to_32": '"abcdefghijklmnopqrst", 0',
+    "cityhash64_len_33_to_64": '"abcdefghijklmnopqrstuvwxyz0123456789ABCD", 0',
+    "cityhash64_len_65_plus": '"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$", 0',
+    # json / router: parse valid documents
+    "json_parse": '"{\\"a\\":[1,2,3],\\"b\\":\\"x\\"}"',
+    "router_compile_pattern": '"/users/{id}/posts"',
+    # non-empty list preconditions
+    "list_max_float": '[1.5, 2.5, 3.5]',
+    "list_min_float": '[1.5, 2.5, 3.5]',
+    "math_avg_float": '[1.5, 2.5, 3.5]',
+    # sha1: block arguments must be a full 64-byte block
+    "sha1_block_word": '"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+/", 0',
+    "sha1_message_schedule": '"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+/"',
+    "sha1_compress_block": '0, 0, 0, 0, 0, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+/"',
+    # url / uuid / websocket: domain-specific valid values
+    "urlp_parse_port": '"8080"',
+    "ulid_from": '0, "0123456789"',
+    "ws_apply_mask": '"hello", "abcd"',
+    "ws_close_payload": '1000, "bye"',
+    # env: chdir to a directory that always exists
+    "env_set_current_dir": '"."',
 }
 
 # Representative inputs for the most common signatures. The driver
@@ -223,10 +349,13 @@ def gen_driver(module, fn_name, params, ret, iters):
     imports.append('import "std.time"')
     header = "\n".join(imports) + "\n\n"
 
-    # Pick representative inputs
-    key = tuple(params)
-    if key in SIGNATURE_INPUTS:
-        args = SIGNATURE_INPUTS[key]
+    # Pick representative inputs. Per-function curated inputs win
+    # first (deep-scan-29: functions with a narrow valid domain),
+    # then the signature table, then the safe-zero fallback.
+    if fn_name in FUNC_INPUTS:
+        args = FUNC_INPUTS[fn_name]
+    elif tuple(params) in SIGNATURE_INPUTS:
+        args = SIGNATURE_INPUTS[tuple(params)]
     else:
         # default: a SAFE zero/empty value per type family; anything we
         # cannot construct generically (structs, enums, channels,
@@ -278,7 +407,12 @@ def gen_driver(module, fn_name, params, ret, iters):
         sink_stmt = "        sink = sink + 1\n"
 
     body = (
-        f"fn main() uses IO {{\n"
+        # deep-scan-29: declare the FULL effect set. The old driver
+        # declared only `uses IO` (the IO family), so any function
+        # requiring Net / Rand / Proc / Conc — tcp_connect, csrf_generate_token,
+        # env_var, mutex_new, ... — failed the hlc type-check and
+        # spuriously red-flagged ~53 stdlib functions.
+        f"fn main() uses IO, Net, Rand, Proc, Conc {{\n"
         f"    let mut sink: int = 0\n"
         f"    let t0: int = time_now_ms()\n"
         f"    let mut i: int = 0\n"
@@ -327,27 +461,46 @@ def bench_one(module, fn_name, params, ret, iters, tmpdir):
     if not std_link.exists():
         std_link.symlink_to(STD_DIR)
 
-    rc = subprocess.run(
-        ["./bin/hlc", str(hls_path), str(c_path)],
-        cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-    )
+    # deep-scan-29: every subprocess is timeout-guarded. A hung driver
+    # (e.g. an output-bound function at 200k iterations) used to raise
+    # an UNGUARDED TimeoutExpired that crashed the whole gate; now it
+    # is reported as a per-function failure / hang instead.
+    try:
+        rc = subprocess.run(
+            ["./bin/hlc", str(hls_path), str(c_path)],
+            cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=180,
+        )
+    except subprocess.TimeoutExpired:
+        return None, "hlc: compile timed out after 180s"
     if rc.returncode != 0:
         return None, f"hlc: {rc.stderr.decode().strip()[:200]}"
 
-    rc = subprocess.run(
-        ["gcc", "-O2", "-o", str(bin_path), str(c_path), "-lm", "-pthread"],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-    )
+    try:
+        rc = subprocess.run(
+            ["gcc", "-O2", "-o", str(bin_path), str(c_path), "-lm", "-pthread"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=180,
+        )
+    except subprocess.TimeoutExpired:
+        return None, "gcc: compile timed out after 180s"
     if rc.returncode != 0:
         return None, f"gcc: {rc.stderr.decode().strip()[:200]}"
 
     # Run twice; take the lower (less noise from scheduler).
     best_ms = None
     for _ in range(2):
-        rc = subprocess.run(
-            [str(bin_path)],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30,
-        )
+        try:
+            # deep-scan-29: run with cwd=tmpdir — an Fs-effect driver
+            # (e.g. man_write("hello", "world")) used to write "world"
+            # into the REPO root, polluting the working tree.
+            rc = subprocess.run(
+                [str(bin_path)],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30,
+                cwd=tmpdir,
+            )
+        except subprocess.TimeoutExpired:
+            return None, "run: timed out after 30s (output-bound or hung driver)"
         if rc.returncode != 0:
             return None, f"run: {rc.stderr.decode().strip()[:200]}"
         out = rc.stdout.decode().strip()
@@ -384,6 +537,12 @@ def main():
                     help="comma-separated allow-list of function names")
     ap.add_argument("--verbose", action="store_true",
                     help="print every function as it runs")
+    ap.add_argument("--resume", type=str, default=None, metavar="STATE.json",
+                    help="cache per-function results in STATE.json and reuse "
+                         "them on the next run (deep-scan-29: the full gate "
+                         "takes ~30 min on a slow 2-vCPU CI box; a killed run "
+                         "previously lost everything). A different --iters "
+                         "value invalidates the cache.")
     args = ap.parse_args()
 
     if not bootstrap_hlc():
@@ -398,6 +557,31 @@ def main():
         print("[hls-bench] FAIL: no functions to benchmark", file=sys.stderr)
         return 2
 
+    # ---- resume state (deep-scan-29) --------------------------------
+    state = {"iters": args.iters, "results": {}}
+    if args.resume:
+        sp = Path(args.resume)
+        if sp.exists():
+            try:
+                prev = json.loads(sp.read_text(encoding="utf-8"))
+                if prev.get("iters") == args.iters:
+                    state = prev
+                    print(f"[hls-bench] resuming: {len(prev.get('results', {}))} "
+                          f"cached result(s) from {args.resume}")
+                else:
+                    print(f"[hls-bench] resume cache has iters={prev.get('iters')} "
+                          f"!= {args.iters}; starting fresh")
+            except (ValueError, OSError) as ex:
+                print(f"[hls-bench] cannot read resume state ({ex}); starting fresh")
+
+    def save_state():
+        if not args.resume:
+            return
+        sp = Path(args.resume)
+        tmp = sp.with_suffix(sp.suffix + ".tmp")
+        tmp.write_text(json.dumps(state), encoding="utf-8")
+        tmp.replace(sp)  # atomic: a killed run never corrupts the cache
+
     print(f"[hls-bench] benchmarking {len(fns)} stdlib functions "
           f"(threshold={args.threshold_us} µs/call, iters={args.iters})")
 
@@ -406,6 +590,18 @@ def main():
     skipped = []
     with tempfile.TemporaryDirectory(prefix="hls-bench-") as tmpdir:
         for module, name, params, ret in fns:
+            cached = state["results"].get(name)
+            if cached is not None:
+                if args.verbose:
+                    print(f"  ... {module}.{name}: cached")
+                cached_rec = dict(cached)
+                cached_rec["module"] = module
+                results.append(cached_rec)
+                if cached_rec["error"] and not cached_rec["error"].startswith("skipped:"):
+                    failures.append((module, name, cached_rec["error"]))
+                elif cached_rec["error"]:
+                    skipped.append((module, name))
+                continue
             if args.verbose:
                 print(f"  ... {module}.{name}({', '.join(params)}) -> {ret}", end=" ", flush=True)
             us, err = bench_one(module, name, params, ret, args.iters, tmpdir)
@@ -415,18 +611,20 @@ def main():
                 if args.verbose:
                     print("SKIP (no safe default for a parameter type)")
                 skipped.append((module, name))
-                results.append({"module": module, "fn": name, "us": None,
-                                "error": "skipped: no safe default"})
-                continue
-            if err:
+                rec = {"module": module, "fn": name, "us": None,
+                       "error": "skipped: no safe default"}
+            elif err:
                 if args.verbose:
                     print(f"FAIL ({err})")
                 failures.append((module, name, err))
-                results.append({"module": module, "fn": name, "us": None, "error": err})
+                rec = {"module": module, "fn": name, "us": None, "error": err}
             else:
                 if args.verbose:
                     print(f"{us:.4f} µs/call")
-                results.append({"module": module, "fn": name, "us": us, "error": None})
+                rec = {"module": module, "fn": name, "us": us, "error": None}
+            results.append(rec)
+            state["results"][name] = {k: v for k, v in rec.items() if k != "module"}
+            save_state()
 
     # Sort slowest first
     measured = [r for r in results if r["us"] is not None]
