@@ -1,0 +1,642 @@
+# feat_stage80_mem.hls — Stage 80: a `#![no_std]` crate exercising
+# `core.mem` end to end: page geometry, canonical-address math, the
+# x86-64 PTE format (flags, NX in bit 63, address in bits 12..51),
+# the FrameAlloc bitmap allocator (first-fit, runs, huge alignment,
+# double-free detection, reservations), and the 4-level page-table
+# model (space_map with on-demand table creation billed to the frame
+# allocator, atomic failure, translate, unmap, huge maps, protect).
+# Exit code is 0 on success (the differential suite compares
+# interpreter-vs-native exit codes). Any positive exit code is a
+# failure count for the named assertion; tests are numbered so a
+# non-zero exit points at the first failure.
+#![no_std]
+
+import "core.mem"
+import "core.option"
+import "core.result"
+
+fn main() -> int {
+    # ------------------------------------------------------------------
+    # Page geometry + canonical math (1..20)
+    # ------------------------------------------------------------------
+    if mem_page_size() != 4096 {
+        return 1
+    }
+    if mem_huge_page_size() != 2097152 {
+        return 2
+    }
+    if mem_pages_per_huge() != 512 {
+        return 3
+    }
+    if !mem_is_page_aligned(0) || !mem_is_page_aligned(4096) {
+        return 4
+    }
+    if mem_is_page_aligned(4095) || mem_is_page_aligned(12345) {
+        return 5
+    }
+    # Alignment is a low-bit property: the kernel text base
+    # (0xFFFFFFFF80000000 = -2147483648) is negative as an int64 and
+    # still page-aligned.
+    if !mem_is_page_aligned(-2147483648) {
+        return 6
+    }
+    if result_unwrap(mem_page_align_up(1)) != 4096 {
+        return 7
+    }
+    if result_unwrap(mem_page_align_up(4096)) != 4096 {
+        return 8
+    }
+    if result_is_err(mem_page_align_up(-1)) {
+        # negative sizes have no aligned form
+        if mem_error_msg(result_unwrap_err(mem_page_align_up(-1))) != "bad alignment" {
+            return 9
+        }
+    } else {
+        return 9
+    }
+    if result_unwrap(mem_page_count(0)) != 0 {
+        return 10
+    }
+    if result_unwrap(mem_page_count(1)) != 1 {
+        return 11
+    }
+    if result_unwrap(mem_page_count(4097)) != 2 {
+        return 12
+    }
+    if result_is_ok(mem_page_count(-1)) {
+        return 13
+    }
+    if result_unwrap(mem_pages_to_bytes(2)) != 8192 {
+        return 14
+    }
+    # Kernel text base 0xFFFFFFFF80000000: PML4[511], PDPT[510],
+    # PD[0], PT[0] — the classic top-of-address-space layout.
+    if vaddr_pml4_index(-2147483648) != 511 {
+        return 15
+    }
+    if vaddr_pdpt_index(-2147483648) != 510 {
+        return 16
+    }
+    if vaddr_pd_index(-2147483648) != 0 || vaddr_pt_index(-2147483648) != 0 {
+        return 17
+    }
+    # Direct-map base 0xFFFF800000000000 = -2^47: PML4[256].
+    if vaddr_pml4_index(-140737488355328) != 256 {
+        return 18
+    }
+    if vaddr_pdpt_index(-140737488355328) != 0
+    || vaddr_pd_index(-140737488355328) != 0 {
+        return 19
+    }
+    # 0x200000: PD[1], PT[0]; offset extraction on both granules.
+    if vaddr_pd_index(2097152) != 1 || vaddr_pt_index(2097152) != 0 {
+        return 20
+    }
+    if vaddr_page_offset(2097152 + 291) != 291 {
+        return 21
+    }
+    if vaddr_huge_offset(2097152 + 12345) != 12345 {
+        return 22
+    }
+    if !vaddr_is_canonical(0) || !vaddr_is_canonical(-2147483648) {
+        return 23
+    }
+    if !vaddr_is_canonical(-140737488355328) {
+        return 24
+    }
+    # The canonical hole: 2^47 and -2^47 - 1 are both invalid.
+    if vaddr_is_canonical(140737488355328) {
+        return 25
+    }
+    if vaddr_is_canonical(-140737488355329) {
+        return 26
+    }
+    if !vaddr_is_huge_aligned(-140737488355328) {
+        return 27
+    }
+    if vaddr_is_huge_aligned(4096) {
+        return 28
+    }
+
+    # ------------------------------------------------------------------
+    # PTE format — flags, NX (bit 63), address field (bits 12..51) (29..46)
+    # ------------------------------------------------------------------
+    if pte_flag_present() != 1 || pte_flag_writable() != 2 || pte_flag_user() != 4 {
+        return 29
+    }
+    if pte_flag_write_through() != 8 || pte_flag_cache_disable() != 16 {
+        return 30
+    }
+    if pte_flag_accessed() != 32 || pte_flag_dirty() != 64 {
+        return 31
+    }
+    if pte_flag_huge() != 128 || pte_flag_global() != 256 {
+        return 32
+    }
+    # NX is bit 63: INT64_MIN as a signed int64.
+    if pte_flag_no_execute() != -9223372036854775808 {
+        return 33
+    }
+    if int_and(pte_flags_known_mask(), 511) != 511 {
+        return 34
+    }
+    if !pte_is_no_execute(pte_flags_known_mask()) {
+        return 35
+    }
+    if pte_addr_limit() != 4503599627370496 {
+        return 36
+    }
+    let e1: int = result_unwrap(pte_new(4096, int_or(pte_flag_present(), pte_flag_writable())))
+    if e1 != 4099 {
+        return 37
+    }
+    if pte_address(e1) != 4096 {
+        return 38
+    }
+    if pte_flags(e1) != 3 {
+        return 39
+    }
+    if !pte_is_present(e1) || !pte_is_writable(e1) || pte_is_user(e1) {
+        return 40
+    }
+    # misaligned / negative / oversized / unknown-flag rejections
+    if !result_is_err(pte_new(4095, 0)) {
+        return 41
+    }
+    if !result_is_err(pte_new(-4096, 0)) {
+        return 42
+    }
+    if !result_is_err(pte_new(4503599627370496, 0)) {
+        return 43
+    }
+    if !result_is_err(pte_new(0, 4096)) {
+        return 44
+    }
+    # An NX entry is NEGATIVE as an int64 but every accessor still
+    # reads the right bits (int_and/int_shr work on the bit pattern).
+    let en: int = result_unwrap(pte_new(8192, int_or(pte_flag_present(), int_or(pte_flag_writable(), pte_flag_no_execute()))))
+    if en >= 0 {
+        return 45
+    }
+    if !pte_is_no_execute(en) || !pte_is_writable(en) || !pte_is_present(en) {
+        return 46
+    }
+    if pte_address(en) != 8192 {
+        return 47
+    }
+    # set/clear flags preserve the address field
+    let eu: int = pte_set_flags(en, pte_flag_user())
+    if !pte_is_user(eu) || pte_address(eu) != 8192 {
+        return 48
+    }
+    let ep: int = pte_clear_flags(eu, pte_flag_no_execute())
+    if pte_is_no_execute(ep) || pte_address(ep) != 8192 {
+        return 49
+    }
+    if !pte_is_huge(pte_set_flags(0, pte_flag_huge())) {
+        return 50
+    }
+    if pte_is_present(0) {
+        return 51
+    }
+
+    # ------------------------------------------------------------------
+    # PageTable basics (52..56)
+    # ------------------------------------------------------------------
+    let t: PageTable = table_new(20480)
+    if table_base(t) != 20480 {
+        return 52
+    }
+    if table_present_count(t) != 0 {
+        return 53
+    }
+    if result_is_err(table_set_entry(t, 3, 4099)) {
+        return 54
+    }
+    if result_unwrap(table_entry(t, 3)) != 4099 {
+        return 55
+    }
+    if table_present_count(t) != 1 {
+        return 56
+    }
+    if !result_is_err(table_entry(t, 512)) || !result_is_err(table_set_entry(t, -1, 0)) {
+        return 57
+    }
+
+    # ------------------------------------------------------------------
+    # AddressSpace — small maps, atomic failure, KT map (58..89)
+    # ------------------------------------------------------------------
+    if !result_is_err(space_new(4095)) {
+        return 58
+    }
+    let fa: FrameAlloc = result_unwrap(frame_new(1048576, 64))
+    let root: int = result_unwrap(frame_alloc_one(fa))
+    if root != 1048576 {
+        return 59
+    }
+    let sp: AddressSpace = result_unwrap(space_new(root))
+    if space_table_count(sp) != 1 || space_maps(sp) != 0 || space_unmaps(sp) != 0 {
+        return 60
+    }
+    if frame_used_count(fa) != 1 {
+        return 61
+    }
+    # Map 2 pages at 0x200000 <- 0x300000, writable. Three fresh
+    # tables (PDPT, PD, PT) are billed to the allocator.
+    let mr: Result[int, MemError] = space_map(fa, sp, 2097152, 3145728, 2, pte_flag_writable())
+    if result_is_err(mr) || result_unwrap(mr) != 2 {
+        return 62
+    }
+    if space_table_count(sp) != 4 {
+        return 63
+    }
+    if frame_used_count(fa) != 4 || frame_allocations(fa) != 4 {
+        return 64
+    }
+    if space_maps(sp) != 1 {
+        return 65
+    }
+    if option_is_none(space_translate(sp, 2097152 + 100)) {
+        return 66
+    }
+    if option_unwrap(space_translate(sp, 2097152 + 100)) != 3145828 {
+        return 67
+    }
+    if option_unwrap(space_translate(sp, 2097152 + 4096 + 4095)) != 3145728 + 4096 + 4095 {
+        return 68
+    }
+    if option_is_some(space_translate(sp, 2097152 + 8192)) {
+        return 69
+    }
+    if !space_is_mapped(sp, 2097152) || space_is_mapped(sp, 2097152 + 8192) {
+        return 70
+    }
+    # leaf flags: writable, supervisor, not NX
+    let lf: int = result_unwrap(space_leaf_entry(sp, 2097152))
+    if !pte_is_writable(lf) || pte_is_user(lf) || pte_is_no_execute(lf) {
+        return 71
+    }
+    if pte_address(lf) != 3145728 {
+        return 72
+    }
+    # remapping anything already mapped is refused
+    if !result_is_err(space_map(fa, sp, 2097152, 3145728, 1, 0)) {
+        return 73
+    }
+    if mem_error_msg(result_unwrap_err(space_map(fa, sp, 2097152, 3145728, 1, 0))) != "already mapped" {
+        return 74
+    }
+    # argument validation
+    if !result_is_err(space_map(fa, sp, 2097152, 3145728, 0, 0)) {
+        return 75
+    }
+    if !result_is_err(space_map(fa, sp, 2097153, 3145728, 1, 0)) {
+        return 76
+    }
+    if !result_is_err(space_map(fa, sp, 140737488355328, 3145728, 1, 0)) {
+        return 77
+    }
+    if !result_is_err(space_map(fa, sp, 2097152, 3145728, 1, 4096)) {
+        return 78
+    }
+    if !result_is_err(space_map(fa, sp, 2097152, 3145727, 1, 0)) {
+        return 79
+    }
+    # ATOMIC failure: an allocator with 1 free frame cannot pay for
+    # the 3 tables a fresh map needs — and the space + allocator must
+    # come out exactly as they started.
+    let fa3: FrameAlloc = result_unwrap(frame_new(9437184, 2))
+    let root3: int = result_unwrap(frame_alloc_one(fa3))
+    let sp3: AddressSpace = result_unwrap(space_new(root3))
+    let oom: Result[int, MemError] = space_map(fa3, sp3, 2097152, 3145728, 1, 0)
+    if !result_is_err(oom) {
+        return 80
+    }
+    if mem_error_msg(result_unwrap_err(oom)) != "out of frames" {
+        return 81
+    }
+    if space_table_count(sp3) != 1 || frame_used_count(fa3) != 1 {
+        return 82
+    }
+    # Kernel text: map the high-half canonical base
+    # 0xFFFFFFFF80000000 <- 0x304000, 2 pages, read-only + GLOBAL.
+    # A different PML4 slot (511) — three more tables.
+    let kg: int = int_or(pte_flag_present(), pte_flag_global())
+    let kr: Result[int, MemError] = space_map(fa, sp, -2147483648, 3158016, 2, kg)
+    if result_is_err(kr) {
+        return 83
+    }
+    if space_table_count(sp) != 7 {
+        return 84
+    }
+    if option_unwrap(space_translate(sp, -2147483648)) != 3158016 {
+        return 85
+    }
+    if option_unwrap(space_translate(sp, -2147483648 + 4096 + 5)) != 3158016 + 4096 + 5 {
+        return 86
+    }
+    let kl: int = result_unwrap(space_leaf_entry(sp, -2147483648))
+    if pte_is_writable(kl) || !pte_is_global(kl) || !pte_is_present(kl) {
+        return 87
+    }
+    if vaddr_pml4_index(-2147483648) != 511 {
+        return 88
+    }
+    # frames: root + 3 (first map) + 3 (KT map) = 7 used of 64
+    if frame_free_count(fa) != 57 {
+        return 89
+    }
+
+    # ------------------------------------------------------------------
+    # Identity map + byte-range convenience (90..96)
+    # ------------------------------------------------------------------
+    # 0x310000 shares the PD of 0x200000 (same PDPT/PD/PT path) — the
+    # identity map must cost ZERO new tables.
+    let ir: Result[int, MemError] = mem_identity_map(fa, sp, 3211264, 1, pte_flag_writable())
+    if result_is_err(ir) {
+        return 90
+    }
+    if space_table_count(sp) != 7 {
+        return 91
+    }
+    if option_unwrap(space_translate(sp, 3211264)) != 3211264 {
+        return 92
+    }
+    if option_unwrap(space_translate(sp, 3211264 + 4095)) != 3215359 {
+        return 93
+    }
+    # 5000 bytes -> 2 pages, both landing in the existing PT.
+    let br: Result[int, MemError] = mem_map_bytes(fa, sp, 2117632, 3170304, 5000, pte_flag_writable())
+    if result_is_err(br) || result_unwrap(br) != 2 {
+        return 94
+    }
+    if option_unwrap(space_translate(sp, 2117632)) != 3170304 {
+        return 95
+    }
+    if option_unwrap(space_translate(sp, 2117632 + 4096)) != 3170304 + 4096 {
+        return 96
+    }
+
+    # ------------------------------------------------------------------
+    # Unmap + protect (97..108)
+    # ------------------------------------------------------------------
+    if result_is_err(space_unmap(sp, 2097152 + 4096, 1)) {
+        return 97
+    }
+    if option_is_some(space_translate(sp, 2097152 + 4096)) {
+        return 98
+    }
+    if option_is_none(space_translate(sp, 2097152)) {
+        return 99
+    }
+    if space_unmaps(sp) != 1 {
+        return 100
+    }
+    # double-unmap is refused
+    if !result_is_err(space_unmap(sp, 2097152 + 4096, 1)) {
+        return 101
+    }
+    if mem_error_msg(result_unwrap_err(space_unmap(sp, 2097152 + 4096, 1))) != "not mapped" {
+        return 102
+    }
+    # protect: drop WRITABLE (read-only), keep the address
+    if result_is_err(space_protect(sp, 2097152, 1, pte_flag_present())) {
+        return 103
+    }
+    let rl: int = result_unwrap(space_leaf_entry(sp, 2097152))
+    if pte_is_writable(rl) || pte_address(rl) != 3145728 {
+        return 104
+    }
+    if option_unwrap(space_translate(sp, 2097152 + 123)) != 3145728 + 123 {
+        return 105
+    }
+    # protect: add NX (W^X hardening) — the entry goes negative
+    let nx: int = int_or(pte_flag_present(), pte_flag_no_execute())
+    if result_is_err(space_protect(sp, 2097152, 1, nx)) {
+        return 106
+    }
+    let nl: int = result_unwrap(space_leaf_entry(sp, 2097152))
+    if !pte_is_no_execute(nl) || pte_address(nl) != 3145728 {
+        return 107
+    }
+    # protecting an unmapped page is refused
+    if !result_is_err(space_protect(sp, 2097152 + 4096, 1, nx)) {
+        return 108
+    }
+
+    # ------------------------------------------------------------------
+    # Frame allocator details (109..127)
+    # ------------------------------------------------------------------
+    let fb: FrameAlloc = result_unwrap(frame_new(1048576, 8))
+    if frame_total(fb) != 8 || frame_free_count(fb) != 8 || frame_used_count(fb) != 0 {
+        return 109
+    }
+    if frame_capacity_bytes(fb) != 32768 {
+        return 110
+    }
+    if frame_is_full(fb) {
+        return 111
+    }
+    if result_unwrap(frame_alloc_one(fb)) != 1048576 {
+        return 112
+    }
+    if result_unwrap(frame_alloc_one(fb)) != 1052672 {
+        return 113
+    }
+    if frame_used_count(fb) != 2 || frame_peak(fb) != 2 || frame_allocations(fb) != 2 {
+        return 114
+    }
+    if !frame_in_range(fb, 1052672) || frame_in_range(fb, 0) {
+        return 115
+    }
+    if result_unwrap(frame_index_of(fb, 1052672)) != 1 {
+        return 116
+    }
+    if frame_addr_of_index(fb, 5) != 1052672 + 16384 {
+        return 117
+    }
+    if !frame_is_used_index(fb, 1) || frame_is_used_index(fb, 5) {
+        return 118
+    }
+    # freeing returns the frame; first-fit hands it out again
+    if result_is_err(frame_free(fb, 1048576, 1)) {
+        return 119
+    }
+    if frame_frees(fb) != 1 || frame_free_count(fb) != 7 {
+        return 120
+    }
+    if result_unwrap(frame_alloc_one(fb)) != 1048576 {
+        return 121
+    }
+    # free it again for the run test: used = {0, 1}
+    if result_is_err(frame_free(fb, 1048576, 1)) {
+        return 122
+    }
+    if result_unwrap(frame_alloc_run(fb, 3)) != 1048576 + 8192 {
+        return 123
+    }
+    # freeing the whole run succeeds; freeing it AGAIN is a double free
+    if result_is_err(frame_free(fb, 1048576 + 8192, 3)) {
+        return 124
+    }
+    if mem_error_msg(result_unwrap_err(frame_free(fb, 1048576 + 8192, 1))) != "double free" {
+        return 125
+    }
+    # misaligned, out-of-range, and end-crossing frees
+    if !result_is_err(frame_free(fb, 1048577, 1)) {
+        return 126
+    }
+    if !result_is_err(frame_free(fb, 2097152, 1)) {
+        return 127
+    }
+    if !result_is_err(frame_free(fb, 1048576 + 28672, 2)) {
+        return 128
+    }
+    # reserve: mark the last frame as a firmware hole. The state at
+    # this point: frame 1 allocated, the run freed again — so the
+    # reservation lifts usage to 2, does NOT bump `allocations` (still
+    # 2), and `peak` stays at the run-time high-water mark of 4.
+    if result_is_err(frame_reserve(fb, 1048576 + 28672, 1)) {
+        return 129
+    }
+    if frame_used_count(fb) != 2 || frame_allocations(fb) != 4 {
+        return 130
+    }
+    if frame_peak(fb) != 4 || frame_frees(fb) != 3 {
+        return 130
+    }
+    if !result_is_err(frame_reserve(fb, 1048576 + 28672, 1)) {
+        return 131
+    }
+    # exhaust the allocator
+    let mut guard: int = 0
+    while !frame_is_full(fb) && guard < 10 {
+        let _x: Result[int, MemError] = frame_alloc_one(fb)
+        guard = guard + 1
+    }
+    if !frame_is_full(fb) {
+        return 132
+    }
+    if !result_is_err(frame_alloc_one(fb)) {
+        return 133
+    }
+    # no huge frame fits in an 8-frame region
+    if !result_is_err(frame_alloc_huge(fb)) {
+        return 134
+    }
+    # run with a bad count
+    if !result_is_err(frame_alloc_run(fb, 0)) {
+        return 135
+    }
+
+    # ------------------------------------------------------------------
+    # Huge pages: frame alignment + PD-level leaves (136..158)
+    # ------------------------------------------------------------------
+    let fh: FrameAlloc = result_unwrap(frame_new(1048576, 2048))
+    let rooth: int = result_unwrap(frame_alloc_one(fh))
+    let sph: AddressSpace = result_unwrap(space_new(rooth))
+    # first 2-MiB-aligned address >= 0x100000 is 0x200000
+    let h1: int = result_unwrap(frame_alloc_huge(fh))
+    if h1 != 2097152 {
+        return 136
+    }
+    if frame_used_count(fh) != 513 {
+        return 137
+    }
+    # second huge frame is the NEXT 2-MiB boundary, not a lower run
+    let h2: int = result_unwrap(frame_alloc_huge(fh))
+    if h2 != 4194304 {
+        return 138
+    }
+    # frames: root(1) + huge run 1 (512) + huge run 2 (512) = 1025 used
+    if frame_free_count(fh) != 1023 {
+        return 139
+    }
+    # map one huge page at the direct-map base -2^47, writable + NX
+    let hv: int = -140737488355328
+    let hf: int = int_or(pte_flag_writable(), pte_flag_no_execute())
+    let hm: Result[int, MemError] = space_map_huge(fh, sph, hv, h1, 1, hf)
+    if result_is_err(hm) || result_unwrap(hm) != 1 {
+        return 140
+    }
+    # PDPT + PD only — no PT for a huge leaf
+    if space_table_count(sph) != 3 {
+        return 141
+    }
+    if option_unwrap(space_translate(sph, hv + 12345)) != h1 + 12345 {
+        return 142
+    }
+    let hl: int = result_unwrap(space_leaf_entry(sph, hv))
+    if !pte_is_huge(hl) || !pte_is_no_execute(hl) || !pte_is_writable(hl) {
+        return 143
+    }
+    if pte_address(hl) != 2097152 {
+        return 144
+    }
+    # a small map inside the huge page conflicts
+    if !result_is_err(space_map(fh, sph, hv, 4096, 1, 0)) {
+        return 145
+    }
+    # HUGE in the request flags is rejected (the installer adds it)
+    if !result_is_err(space_map_huge(fh, sph, hv, h1, 1, pte_flag_huge())) {
+        return 146
+    }
+    # misaligned huge request
+    if !result_is_err(space_map_huge(fh, sph, hv + 4096, h1, 1, hf)) {
+        return 147
+    }
+    # small-page unmap refuses a huge leaf
+    if !result_is_err(space_unmap(sph, hv, 1)) {
+        return 148
+    }
+    # second huge page: same PD, zero new tables
+    let hm2: Result[int, MemError] = space_map_huge(fh, sph, hv + 2097152, h2, 1, hf)
+    if result_is_err(hm2) {
+        return 149
+    }
+    if space_table_count(sph) != 3 {
+        return 150
+    }
+    if option_unwrap(space_translate(sph, hv + 2097152 + 4096)) != h2 + 4096 {
+        return 151
+    }
+    # huge unmap: paired API, then the address is gone
+    if result_is_err(space_unmap_huge(sph, hv, 1)) {
+        return 152
+    }
+    if option_is_some(space_translate(sph, hv)) {
+        return 153
+    }
+    if option_is_none(space_translate(sph, hv + 2097152)) {
+        return 154
+    }
+    if !result_is_err(space_unmap_huge(sph, hv, 1)) {
+        return 155
+    }
+    # small unmap of the surviving huge page still refused
+    if !result_is_err(space_unmap(sph, hv + 2097152, 1)) {
+        return 156
+    }
+    # freeing the huge frame recycles it (first-fit address-aligned)
+    if result_is_err(frame_free(fh, h1, 512)) {
+        return 157
+    }
+    if result_unwrap(frame_alloc_huge(fh)) != 2097152 {
+        return 158
+    }
+
+    # ------------------------------------------------------------------
+    # Error messages (159..161)
+    # ------------------------------------------------------------------
+    if mem_error_msg(MemError.OutOfFrames) != "out of frames" {
+        return 159
+    }
+    if mem_error_msg(MemError.BadAlignment) != "bad alignment" {
+        return 160
+    }
+    if mem_error_msg(MemError.BadRange) != "bad range"
+    || mem_error_msg(MemError.InUse) != "frame in use" {
+        return 161
+    }
+    return 0
+}

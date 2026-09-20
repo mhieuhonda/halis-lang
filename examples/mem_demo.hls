@@ -1,0 +1,253 @@
+# ============================================================================
+# examples/mem_demo.hls — Stage 80 (v0.99.0-alpha)
+# ----------------------------------------------------------------------------
+# A `#![no_std]` program demonstrating `core.mem`: the boot-time memory
+# setup a kernel performs before it can run anything user-facing.
+# The flow mirrors a real early boot:
+#
+#   1. claim a physical memory region with a FrameAlloc
+#   2. reserve the firmware/ACPI hole the boot protocol reports
+#   3. take a frame for the PML4 and create the address space
+#   4. identity-map the low kernel (boot code must run while paging on)
+#   5. map the same kernel text higher-half, read-only + GLOBAL
+#   6. map a direct-map data window, writable + NO_EXECUTE (W^X)
+#   7. huge-page a device window at a 2-MiB aligned physical base
+#   8. re-flag, unmap, and watch the allocator pay for page tables
+#
+# The exit code is the failure count (0 on success) — the same
+# answer convention the differential suite compares across the
+# interpreter, the hosted native build, and the `-nostdlib` build.
+#
+# Build + run (hosted toolchain):
+#   bin/hlc examples/mem_demo.hls /tmp/mem_demo.c
+#   gcc -O2 -o /tmp/mem_demo /tmp/mem_demo.c -lm -pthread
+#   /tmp/mem_demo; echo "exit=$?"   # exit=0
+#
+# The same crate with `#![freestanding]` instead of `#![no_std]`
+# links with `-nostdlib` and enters via `_start` (Stage 77).
+# ============================================================================
+
+#![no_std]
+
+import "core.mem"
+import "core.option"
+import "core.result"
+
+# The physical region the boot protocol handed us: 1 MiB .. 9 MiB
+# (2048 frames). Everything below 1 MiB is legacy BIOS territory.
+fn phys_base() -> int {
+    return 1048576
+}
+
+fn phys_frames() -> int {
+    return 2048
+}
+
+# The boot protocol's reserved hole: one frame at 0x110000 that the
+# firmware still owns (ACPI table, boot params, ...).
+fn firmware_hole() -> int {
+    return 1114112
+}
+
+# Kernel layout (virtual):
+#   low identity:  0x200000  (boot code, running while paging turns on)
+#   higher half:   0xFFFFFFFF80000000 (the classic -2 GiB kernel base)
+#   direct map:    0xFFFF800000000000 (-2^47, data window)
+#   device window: 0xFFFF800000200000 (2 MiB-aligned huge page)
+fn kern_text_vaddr() -> int {
+    return -2147483648
+}
+
+fn direct_map_vaddr() -> int {
+    return -140737488355328
+}
+
+fn device_vaddr() -> int {
+    return -140737486258176
+}
+
+# The early-boot mapper: a frame allocator plus the address space it
+# feeds. Every page table this mapper creates comes out of `fa`, so
+# `frames_used` after setup is the true cost of the map.
+struct BootMapper {
+    fa: FrameAlloc,
+    sp: AddressSpace
+}
+
+fn mapper_new() -> BootMapper {
+    let fa: FrameAlloc = result_unwrap(frame_new(phys_base(), phys_frames()))
+    # reserve what the firmware still owns — before any allocation
+    # so the bitmap never hands that frame out
+    let _r: Result[int, MemError] = frame_reserve(fa, firmware_hole(), 1)
+    let root: int = result_unwrap(frame_alloc_one(fa))
+    return BootMapper {
+        fa: fa, sp: result_unwrap(space_new(root))
+    }
+}
+
+# Identity-maps `pages` pages of low memory, executable + writable
+# (boot code is both until paging is fully on).
+fn map_low_identity(m: BootMapper, paddr: int, pages: int) -> Result[int, MemError] {
+    let rw: int = int_or(pte_flag_present(), pte_flag_writable())
+    return mem_identity_map(m.fa, m.sp, paddr, pages, rw)
+}
+
+# Maps the kernel text into the higher half: PRESENT + GLOBAL,
+# deliberately NOT writable (a loaded kernel text page is read-only)
+# and NOT user (supervisor only).
+fn map_kern_text(m: BootMapper, vaddr: int, paddr: int, pages: int) -> Result[int, MemError] {
+    let rog: int = int_or(pte_flag_present(), pte_flag_global())
+    return space_map(m.fa, m.sp, vaddr, paddr, pages, rog)
+}
+
+# Maps a data window in the direct map: writable + NO_EXECUTE —
+# data must never be executable (W^X from day one).
+fn map_data_window(m: BootMapper, vaddr: int, paddr: int, bytes: int) -> Result[int, MemError] {
+    let wnx: int = int_or(pte_flag_present(), int_or(pte_flag_writable(), pte_flag_no_execute()))
+    return mem_map_bytes(m.fa, m.sp, vaddr, paddr, bytes, wnx)
+}
+
+# Huge-pages a device window: 2 MiB, writable + NO_EXECUTE (a
+# framebuffer you can write, not execute).
+fn map_device_huge(m: BootMapper, vaddr: int, paddr: int) -> Result[int, MemError] {
+    let wnx: int = int_or(pte_flag_present(), int_or(pte_flag_writable(), pte_flag_no_execute()))
+    return space_map_huge(m.fa, m.sp, vaddr, paddr, 1, wnx)
+}
+
+# The kernel text becomes truly read-only-execute only after init:
+# drop WRITABLE and add NO_EXECUTE to the identity-mapped low copy.
+fn lockdown_low_text(m: BootMapper, paddr: int, pages: int) -> Result[int, MemError] {
+    let rx: int = int_or(pte_flag_present(), pte_flag_global())
+    return space_protect(m.sp, paddr, pages, rx)
+}
+
+fn main() -> int {
+    let mut failures: int = 0
+
+    let m: BootMapper = mapper_new()
+
+    # ---- accounting after construction: 1 reserved + 1 root ----
+    if frame_used_count(m.fa) != 2 {
+        failures = failures + 1
+    }
+    if frame_allocations(m.fa) != 1 {
+        # the reservation is not an allocation, the root frame is
+        failures = failures + 1
+    }
+    if space_table_count(m.sp) != 1 {
+        failures = failures + 1
+    }
+
+    # ---- identity-map 2 low pages at 0x200000 (frames OUTSIDE the
+    #      managed region: the model maps addresses, not ownership) ----
+    let low_paddr: int = 2097152
+    if result_is_err(map_low_identity(m, low_paddr, 2)) {
+        failures = failures + 1
+    }
+    # 3 fresh tables (PDPT, PD, PT) billed to the allocator
+    if frame_used_count(m.fa) != 5 {
+        failures = failures + 1
+    }
+    if option_unwrap(space_translate(m.sp, low_paddr + 12)) != low_paddr + 12 {
+        failures = failures + 1
+    }
+
+    # ---- higher-half text: 2 pages at -2 GiB, read-only + GLOBAL ----
+    if result_is_err(map_kern_text(m, kern_text_vaddr(), 3158016, 2)) {
+        failures = failures + 1
+    }
+    # the KT path (PML4[511]) needs its own 3 tables
+    if frame_used_count(m.fa) != 8 {
+        failures = failures + 1
+    }
+    let kt: Option[int] = space_translate(m.sp, kern_text_vaddr() + 4096 + 5)
+    if option_is_none(kt) || option_unwrap(kt) != 3158016 + 4096 + 5 {
+        failures = failures + 1
+    }
+    let kl: int = result_unwrap(space_leaf_entry(m.sp, kern_text_vaddr()))
+    if pte_is_writable(kl) || pte_is_user(kl) || !pte_is_global(kl) {
+        failures = failures + 1
+    }
+
+    # ---- direct-map data window: 10000 bytes -> 3 pages, W+NX ----
+    if result_is_err(map_data_window(m, direct_map_vaddr(), 3170304, 10000)) {
+        failures = failures + 1
+    }
+    let d0: Option[int] = space_translate(m.sp, direct_map_vaddr())
+    if option_is_none(d0) || option_unwrap(d0) != 3170304 {
+        failures = failures + 1
+    }
+    # 10000 bytes = 3 pages; the third page ends at +12288
+    let d2: Option[int] = space_translate(m.sp, direct_map_vaddr() + 12287)
+    if option_is_none(d2) || option_unwrap(d2) != 3170304 + 12287 {
+        failures = failures + 1
+    }
+    let dl: int = result_unwrap(space_leaf_entry(m.sp, direct_map_vaddr()))
+    if !pte_is_no_execute(dl) || !pte_is_writable(dl) {
+        failures = failures + 1
+    }
+
+    # ---- device window: one 2-MiB huge page ----
+    let dev_paddr: int = result_unwrap(frame_alloc_huge(m.fa))
+    if !mem_is_huge_aligned(dev_paddr) {
+        failures = failures + 1
+    }
+    if result_is_err(map_device_huge(m, device_vaddr(), dev_paddr)) {
+        failures = failures + 1
+    }
+    if option_unwrap(space_translate(m.sp, device_vaddr() + 65535)) != dev_paddr + 65535 {
+        failures = failures + 1
+    }
+    let dev_leaf: int = result_unwrap(space_leaf_entry(m.sp, device_vaddr()))
+    if !pte_is_huge(dev_leaf) {
+        failures = failures + 1
+    }
+    # a small mapping inside the device window is refused
+    if !result_is_err(space_map(m.fa, m.sp, device_vaddr(), 4096, 1, 0)) {
+        failures = failures + 1
+    }
+
+    # ---- init done: lockdown the low identity copy ----
+    if result_is_err(lockdown_low_text(m, low_paddr, 2)) {
+        failures = failures + 1
+    }
+    let ll: int = result_unwrap(space_leaf_entry(m.sp, low_paddr))
+    if pte_is_writable(ll) || pte_is_no_execute(ll) {
+        failures = failures + 1
+    }
+    # the higher-half copy is untouched (separate leaves)
+    if !pte_is_global(result_unwrap(space_leaf_entry(m.sp, kern_text_vaddr()))) {
+        failures = failures + 1
+    }
+
+    # ---- teardown: unmap one data page; double-unmap is a bug ----
+    if result_is_err(space_unmap(m.sp, direct_map_vaddr() + 4096, 1)) {
+        failures = failures + 1
+    }
+    if option_is_some(space_translate(m.sp, direct_map_vaddr() + 4096)) {
+        failures = failures + 1
+    }
+    if option_is_none(space_translate(m.sp, direct_map_vaddr())) {
+        failures = failures + 1
+    }
+    if !result_is_err(space_unmap(m.sp, direct_map_vaddr() + 4096, 1)) {
+        failures = failures + 1
+    }
+
+    # ---- final accounting: every frame the map cost is visible ----
+    # used = 1 reserved + 1 root + 3 low + 3 text + 3 data + 512 huge
+    if frame_used_count(m.fa) != 523 {
+        failures = failures + 1
+    }
+    # the firmware hole was never handed out
+    if frame_is_used_index(m.fa, (firmware_hole() - phys_base()) / 4096) != true {
+        failures = failures + 1
+    }
+    # four map operations (identity, text, data, device); the
+    # lockdown is a protect, not a map
+    if space_maps(m.sp) != 4 || space_unmaps(m.sp) != 1 {
+        failures = failures + 1
+    }
+
+    return failures
+}

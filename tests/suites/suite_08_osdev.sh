@@ -187,3 +187,69 @@ else
     bad "alloc: make alloc-acceptance failed"
     tail -15 "$TMP/alloc_acc79.log"
 fi
+
+echo "=== 17. Stage 80: core.mem — physical-page allocator + page tables ==="
+# Stage 80 (v0.99.0-alpha): the FrameAlloc bitmap allocator over a
+# physical region (first-fit, contiguous runs, 2-MiB-aligned huge
+# frames, double-free detection, reservations) plus the x86-64
+# 4-level page-table model (AddressSpace with on-demand table
+# creation billed to the frame allocator, atomic two-pass mapping,
+# translate, unmap, huge maps, protect). Pure HLS, `no_std`-clean;
+# the same module is importable from `#![freestanding]`.
+MEM_F=tests/ok/feat_stage80_mem.hls
+# (a) the mem ok-test checks + runs on the interpreter (exit 0).
+mem_interp_out=$(python3 boot/boot.py "$MEM_F" </dev/null 2>/dev/null); mem_interp_code=$?
+if [ "$mem_interp_code" -eq 0 ]; then
+    ok "mem: feat_stage80_mem runs on the interpreter (exit 0)"
+else
+    bad "mem: feat_stage80_mem interpreter exit=$mem_interp_code"
+fi
+# (b) the mem module resolves through the `core.` prefix.
+if [ -f "core/mem.hls" ]; then
+    ok "mem: core/mem.hls present"
+else
+    bad "mem: core/mem.hls missing"
+fi
+# (c) the demo runs end-to-end on the interpreter (exit 0).
+mem_demo_code=$(python3 boot/boot.py examples/mem_demo.hls </dev/null 2>/dev/null; echo $?)
+if [ "$mem_demo_code" -eq 0 ]; then
+    ok "mem: examples/mem_demo.hls runs on the interpreter (exit 0)"
+else
+    bad "mem: examples/mem_demo.hls interpreter exit=$mem_demo_code"
+fi
+# (d) the same ok-test with #![freestanding] instead of #![no_std]
+#     links -nostdlib and exits with the same code (0).
+mem_fs_src=$(mktemp --suffix=.hls)
+python3 - "$MEM_F" "$mem_fs_src" <<'PY'
+import sys
+src = open(sys.argv[1], encoding='utf-8').read()
+src = src.replace('\n#![no_std]\n', '\n#![freestanding]\n', 1)
+open(sys.argv[2], 'w', encoding='utf-8', newline='\n').write(src)
+PY
+if python3 boot/boot.py src/hlc.hls "$mem_fs_src" "$TMP/mem_fs.c" >/dev/null 2>&1 \
+        && gcc -O2 -ffreestanding -nostdlib -ffunction-sections \
+               -fno-stack-protector -Wl,--gc-sections \
+               -o "$TMP/mem_fs.bin" "$TMP/mem_fs.c" 2>"$TMP/mem_fs.gcc"; then
+    mem_fs_nat=$("$TMP/mem_fs.bin" </dev/null 2>/dev/null; echo $?)
+    if [ "$mem_fs_nat" == "$mem_interp_code" ]; then
+        ok "mem: freestanding -nostdlib binary exit ($mem_fs_nat) == interpreter"
+    else
+        bad "mem: freestanding binary exit=$mem_fs_nat, interp=$mem_interp_code"
+    fi
+else
+    bad "mem: freestanding -nostdlib link failed"
+    head -5 "$TMP/mem_fs.gcc"
+fi
+rm -f "$mem_fs_src"
+# (e) make mem-acceptance runs end-to-end (8 sections).
+if make mem-acceptance >"$TMP/mem_acc80.log" 2>&1; then
+    if grep -q "ACCEPTANCE OK: Stage 80" "$TMP/mem_acc80.log"; then
+        ok "mem: make mem-acceptance runs end-to-end"
+    else
+        bad "mem: make mem-acceptance did not print ACCEPTANCE OK"
+        tail -5 "$TMP/mem_acc80.log"
+    fi
+else
+    bad "mem: make mem-acceptance failed"
+    tail -15 "$TMP/mem_acc80.log"
+fi

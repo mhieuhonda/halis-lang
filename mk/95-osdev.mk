@@ -12,6 +12,9 @@
 # Stage 79 (v0.98.0-alpha): `core.alloc` — the Alloc protocol
 # (Layout + AllocError + BumpAlloc + PoolAlloc + NullAlloc +
 # AllocStats).
+# Stage 80 (v0.99.0-alpha): `core.mem` — the physical-page allocator
+# (FrameAlloc) and the x86-64 4-level page-table model
+# (AddressSpace, huge pages, translate/unmap/protect).
 # ============================================================================
 
 # freestanding: compile an HLS program to freestanding C + link with
@@ -97,4 +100,18 @@ alloc-acceptance:
 	@$(PYTHON) tests/alloc_acceptance.py
 	@echo "ACCEPTANCE OK: Stage 79 -- core.alloc (pluggable allocator protocol)"
 
-.PHONY: freestanding freestanding-check freestanding-acceptance nostd nostd-acceptance alloc-acceptance
+# mem-acceptance: the Stage 80 acceptance gate. Runs the 8-section
+# end-to-end suite for `core.mem`: resolution + guards, standalone
+# parse + core-only imports, Stage-0 enforcement in both no_std and
+# freestanding modes, targeted behavior probes (page geometry +
+# canonical math, frame alloc/free/reuse/OOM, runs + 2-MiB huge
+# alignment, PTE format + NX round trip, map with on-demand tables,
+# atomicity under frame exhaustion, unmap + protect, huge map +
+# unmap), self-hosted emission + native parity (incl. freestanding),
+# hlfmt stability, and `--audit` purity.
+mem-acceptance:
+	@echo "[Stage 80 acceptance] running tests/mem_acceptance.py..."
+	@$(PYTHON) tests/mem_acceptance.py
+	@echo "ACCEPTANCE OK: Stage 80 -- core.mem (physical-page allocator + page tables)"
+
+.PHONY: freestanding freestanding-check freestanding-acceptance nostd nostd-acceptance alloc-acceptance mem-acceptance
