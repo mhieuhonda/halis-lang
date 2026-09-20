@@ -1,0 +1,1449 @@
+# ============================================================================
+# core/mem.hls — physical memory: frame allocator + page tables (Stage 80)
+# ----------------------------------------------------------------------------
+# Pure HLS, no `uses`. Imports only `core.option` and `core.result`
+# (the same freestanding-safe dependency closure as every other
+# `core.*` module). All functions are pure — `--audit` shows
+# "(none - pure)" for each, so the module is importable from
+# `#![no_std]` and `#![freestanding]` crates identically.
+#
+# WHAT THIS MODULE MODELS
+#
+# The roadmap's Stage 80 promise: a physical-page allocator and page
+# tables — the two structures every kernel needs before it can map a
+# single byte of virtual memory. Halis is a *language* project, not an
+# OS, so this module is a faithful BOOKKEEPING MODEL of both
+# structures, written so a kernel written in Halis can drive its real
+# hardware with it:
+#
+#   * `FrameAlloc` — a bitmap allocator over a physical memory region
+#     [base, base + frame_count * PAGE_SIZE). It hands out physical
+#     ADDRESSES (frame-aligned), detects double-frees and
+#     out-of-range addresses, supports single-frame allocations,
+#     arbitrary contiguous runs, and 2-MiB-aligned huge-frame runs
+#     (for Stage 80's huge pages), plus reservations for the holes a
+#     real machine has (firmware, ACPI, MMIO).
+#
+#   * Page tables — the x86-64 4-level model (PML4 → PDPT → PD → PT,
+#     9 index bits each, 512 entries per table, 4-KiB leaves,
+#     2-MiB huge leaves at the PD level). Entries use the REAL
+#     x86-64 PTE layout: flag bits 0..8, the physical address in
+#     bits 12..51 (52-bit physical address width), and NX in bit 63.
+#     `AddressSpace` holds the root table plus the pool of allocated
+#     tables; `space_map` walks/creates intermediate tables exactly
+#     like a kernel's early boot mapper — the table pages themselves
+#     come FROM the frame allocator, so after mapping you can see
+#     exactly how many frames the page tables consumed.
+#
+# ON MODEL VS HARDWARE
+#
+# The module performs the same arithmetic, validation and accounting
+# the hardware does, but never dereferences a physical address (HLS
+# has no raw pointers yet — see core.alloc's `Ptr[T]` note). The
+# `AddressSpace.tables` pool stands in for the direct map a real
+# kernel uses to touch its own page tables: `table_at` finds a table
+# by physical base. Intermediate tables are created with
+# PRESENT|WRITABLE (plus USER when the leaf flags request user
+# access) and never NX — the same choice Linux makes so the walk
+# itself can be trusted. PDPT-level 1-GiB leaves are NOT modelled:
+# `space_map_huge` installs 2-MiB leaves at the PD level, which
+# covers the huge-page demand `core/alloc.hls` recorded for Stage 80
+# ("larger alignments belong to huge pages"); 1-GiB leaves arrive
+# with the bare-metal targets (Stages 93-95).
+#
+# STRUCT ALIASING CONTRACT
+#
+# HLS structs are heap-boxed: a struct passed to a callee is the SAME
+# object the caller holds, so `frame_alloc_one(fa)` mutates the
+# caller's allocator (both backends — verified differentially). The
+# `mut` markers below follow the core.alloc convention: a param is
+# `mut` when the function assigns its scalar fields.
+#
+# BIT OPS
+#
+# HLS has no bitwise operators in its grammar; the pure builtins
+# `int_and/int_or/int_not/int_shl/int_shr/int_sar` are used
+# throughout. `int_shr` is a LOGICAL right shift (fills with zeros on
+# the unsigned bit pattern) — exactly what PTE index extraction on
+# negative (high-half) virtual addresses needs. `int_sar` is
+# arithmetic — used for the canonical-address check. All shifts mask
+# the count to 6 bits and wrap through int64, mirroring the C
+# backend (Stage 32).
+# ============================================================================
+
+import "core.option"
+import "core.result"
+
+# ---------------------------------------------------------------------------
+# Error set
+# ---------------------------------------------------------------------------
+#   OutOfFrames:  the frame allocator cannot satisfy the request
+#   BadAlignment: an address is not page/huge-page aligned
+#   OutOfRange:   an address lies outside the managed region (or the
+#                 canonical address space, or the 52-bit physical width)
+#   DoubleFree:   a frame was freed while already free
+#   InUse:        a reservation hit frames that are already in use
+#   NotMapped:    translate/unmap/protect walked onto an absent entry
+#   AlreadyMapped:map hit a leaf that is already present
+#   BadFlags:     flag bits outside the known PTE mask
+#   BadRange:     a count/length argument is out of its valid range
+enum MemError {
+    OutOfFrames,
+    BadAlignment,
+    OutOfRange,
+    DoubleFree,
+    InUse,
+    NotMapped,
+    AlreadyMapped,
+    BadFlags,
+    BadRange
+}
+
+# The variant's name — diagnostics only (no panic, no `uses IO`). The
+# order matches the declaration so serialisers can render the variant
+# index as a stable identifier.
+fn mem_error_msg(e: MemError) -> str {
+    return match e {
+        MemError.OutOfFrames => "out of frames",
+        MemError.BadAlignment => "bad alignment",
+        MemError.OutOfRange => "out of range",
+        MemError.DoubleFree => "double free",
+        MemError.InUse => "frame in use",
+        MemError.NotMapped => "not mapped",
+        MemError.AlreadyMapped => "already mapped",
+        MemError.BadFlags => "bad flags",
+        MemError.BadRange => "bad range"
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Page geometry
+# ---------------------------------------------------------------------------
+
+# The base page size in bytes (x86-64 and every page-based ISA Halis
+# targets). A function, not a constant — HLS has no module-level
+# constants (see std/bits.hls for the same convention).
+fn mem_page_size() -> int {
+    return 4096
+}
+
+# The huge-page size in bytes: 2 MiB = 512 pages = the coverage of
+# one full PT. A PD entry with the HUGE flag maps this many bytes.
+fn mem_huge_page_size() -> int {
+    return 2097152
+}
+
+# The number of 4-KiB pages a huge page covers (512) — also the
+# frame-index stride between two huge-aligned physical addresses.
+fn mem_pages_per_huge() -> int {
+    return 512
+}
+
+# True iff `n`'s LOW BITS are page-aligned — a property of the bit
+# pattern, not the sign. High-half CANONICAL virtual addresses are
+# negative int64s (e.g. the kernel text base 0xFFFFFFFF80000000) and
+# are legitimately page-aligned; callers that handle PHYSICAL
+# addresses add their own `>= 0` check (frame_new, pte_new).
+fn mem_is_page_aligned(n: int) -> bool {
+    return int_and(n, 4095) == 0
+}
+
+# True iff `n`'s low 21 bits are zero — the 2-MiB alignment check,
+# sign-free like mem_is_page_aligned (huge mappings live in the
+# high half: 0xFFFF800000000000 is 2-MiB aligned). Callers handling
+# physical addresses pair it with an explicit `>= 0` check.
+fn mem_is_huge_aligned(n: int) -> bool {
+    return int_and(n, 2097151) == 0
+}
+
+# Rounds `n` UP to the next page boundary. Negative `n` is
+# Err(BadAlignment) — a "negative size" has no page-aligned form.
+# `n + 4095` cannot overflow for any n below 2^52 (the physical
+# address limit), and callers above that limit are rejected before
+# rounding.
+fn mem_page_align_up(n: int) -> Result[int, MemError] {
+    if n < 0 {
+        return Result.Err(MemError.BadAlignment)
+    }
+    return Result.Ok(int_and(n + 4095, int_not(4095)))
+}
+
+# The number of 4-KiB pages needed to hold `bytes` bytes
+# (ceiling division). Zero bytes need zero pages; negative bytes are
+# Err(BadRange).
+fn mem_page_count(bytes: int) -> Result[int, MemError] {
+    if bytes < 0 {
+        return Result.Err(MemError.BadRange)
+    }
+    return Result.Ok((bytes + 4095) / 4096)
+}
+
+# The inverse of `mem_page_count`: how many bytes `pages` whole pages
+# occupy. Negative `pages` is Err(BadRange).
+fn mem_pages_to_bytes(pages: int) -> Result[int, MemError] {
+    if pages < 0 {
+        return Result.Err(MemError.BadRange)
+    }
+    return Result.Ok(pages * 4096)
+}
+
+# ---------------------------------------------------------------------------
+# Virtual-address decomposition (x86-64 4-level paging)
+# ---------------------------------------------------------------------------
+# A 64-bit virtual address splits into four 9-bit table indices
+# (bits 39..47 PML4, 30..38 PDPT, 21..29 PD, 12..20 PT) plus the
+# 12-bit in-page offset. Bits 63..48 must be sign-extensions of bit
+# 47 (the "canonical form") — the CPU raises on anything else, so
+# every mapping entry point in this module rejects non-canonical
+# addresses up front.
+
+fn vaddr_pml4_index(v: int) -> int {
+    return int_and(int_shr(v, 39), 511)
+}
+
+fn vaddr_pdpt_index(v: int) -> int {
+    return int_and(int_shr(v, 30), 511)
+}
+
+fn vaddr_pd_index(v: int) -> int {
+    return int_and(int_shr(v, 21), 511)
+}
+
+fn vaddr_pt_index(v: int) -> int {
+    return int_and(int_shr(v, 12), 511)
+}
+
+# The 12-bit byte offset inside a 4-KiB page.
+fn vaddr_page_offset(v: int) -> int {
+    return int_and(v, 4095)
+}
+
+# The 21-bit byte offset inside a 2-MiB huge page.
+fn vaddr_huge_offset(v: int) -> int {
+    return int_and(v, 2097151)
+}
+
+# Canonical-form check: bits 63..48 must all equal bit 47. The
+# arithmetic shift `int_sar(v, 47)` sign-extends bit 47 upward, so
+# the result is 0 (low half, bits 47.. all zero), -1 (high half, all
+# ones), or garbage (non-canonical). Ints are int64, so the shift is
+# exact and this is the full x86-64 rule.
+fn vaddr_is_canonical(v: int) -> bool {
+    let hi: int = int_sar(v, 47)
+    return hi == 0 || hi == -1
+}
+
+# True iff `v` is 2-MiB aligned — required for huge-page mappings.
+# Note the check is on the UNSIGNED bit pattern: high-half (negative)
+# canonical addresses like the kernel's -2 GiB base are 2-MiB
+# aligned exactly when their low 21 bits are zero.
+fn vaddr_is_huge_aligned(v: int) -> bool {
+    return vaddr_huge_offset(v) == 0
+}
+
+# ---------------------------------------------------------------------------
+# PTE — the x86-64 page-table entry format
+# ---------------------------------------------------------------------------
+# One entry, one 64-bit int, hardware layout:
+#
+#   bit 0      PRESENT        the entry is valid
+#   bit 1      WRITABLE       (R/W) writes allowed
+#   bit 2      USER           (U/S) user-mode accessible
+#   bit 3      WRITE_THROUGH  (PWT) write-through caching
+#   bit 4      CACHE_DISABLE  (PCD) uncacheable
+#   bit 5      ACCESSED       set by hardware on reference
+#   bit 6      DIRTY          set by hardware on write
+#   bit 7      HUGE           (PS) leaf at PD/PDPT level (2 MiB here)
+#   bit 8      GLOBAL         not flushed on CR3 switch
+#   bits 12-51 physical address (or next-table address)
+#   bit 63     NO_EXECUTE     (NX) data/never-execute
+#
+# Bits 9..11 and 52..62 are available-to-software / must-be-zero on
+# real hardware; this module keeps them zero so entries can be handed
+# to a real CPU later.
+#
+# HLS has no module-level constants, so each flag is a pure function
+# returning its mask — the `pte_flag_*` family. Compose flags with
+# `int_or`, e.g. `int_or(pte_flag_present(), pte_flag_writable())`.
+
+fn pte_flag_present() -> int {
+    return 1
+}
+
+fn pte_flag_writable() -> int {
+    return 2
+}
+
+fn pte_flag_user() -> int {
+    return 4
+}
+
+fn pte_flag_write_through() -> int {
+    return 8
+}
+
+fn pte_flag_cache_disable() -> int {
+    return 16
+}
+
+fn pte_flag_accessed() -> int {
+    return 32
+}
+
+fn pte_flag_dirty() -> int {
+    return 64
+}
+
+# The PS/PAT bit. In a PD (or PDPT) entry it turns the entry into a
+# 2-MiB (or 1-GiB) leaf; in a PT entry the hardware ignores it, and
+# so does this module.
+fn pte_flag_huge() -> int {
+    return 128
+}
+
+fn pte_flag_global() -> int {
+    return 256
+}
+
+# NX lives in bit 63: `int_shl(1, 63)` is INT64_MIN — a NEGATIVE
+# int64 whose bit pattern is the hardware's NX bit. Entries carrying
+# NX are negative; every accessor below treats entries as unsigned
+# bit patterns (int_shr/int_and do the right thing on both backends).
+fn pte_flag_no_execute() -> int {
+    return int_shl(1, 63)
+}
+
+# OR of every flag this module knows. `pte_new` rejects entries with
+# any bit outside this mask (a typo like flag 4096 would otherwise
+# silently corrupt the software-available bits 9..11).
+fn pte_flags_known_mask() -> int {
+    return int_or(511, pte_flag_no_execute())
+}
+
+# The exclusive upper bound for physical addresses: 2^52 (the x86-64
+# architectural maximum physical address width is 52 bits). A paddr
+# at or above this limit cannot be encoded in bits 12..51.
+fn pte_addr_limit() -> int {
+    return int_shl(1, 52)
+}
+
+# The mask selecting bits 12..51 of an entry AFTER a logical right
+# shift by 12: `2^40 - 1` = 1099511627775 (40 address bits).
+fn pte_addr_shift_mask() -> int {
+    return int_shl(1, 40) - 1
+}
+
+# The mask of the ADDRESS FIELD itself: bits 12..51, i.e.
+# `(2^40 - 1) << 12` = 0x000FFFFFFFFFF000. A physical address is
+# stored UNSHIFTED in the entry (its low 12 bits are zero by the
+# alignment rule, so address | flags needs no shifting) — reading it
+# back is a pure mask, no shift.
+fn pte_addr_mask() -> int {
+    return int_shl(pte_addr_shift_mask(), 12)
+}
+
+# Builds a PTE from a physical address and a flag mask. Validates:
+# paddr non-negative, page-aligned, below the 2^52 limit, and flags
+# within the known mask. HUGE in a PT-level entry is allowed here —
+# level placement is the caller's business (space_map_huge sets it
+# on PD entries; the hardware ignores it in PT entries).
+fn pte_new(paddr: int, flags: int) -> Result[int, MemError] {
+    if paddr < 0 || !mem_is_page_aligned(paddr) {
+        return Result.Err(MemError.BadAlignment)
+    }
+    if paddr >= pte_addr_limit() {
+        return Result.Err(MemError.OutOfRange)
+    }
+    if int_and(flags, int_not(pte_flags_known_mask())) != 0 {
+        return Result.Err(MemError.BadFlags)
+    }
+    return Result.Ok(int_or(paddr, flags))
+}
+
+# Extracts the physical (or next-table) address: the address field is
+# stored unshifted (bits 12..51), so reading it back is a mask, not a
+# shift. int_and treats the entry as an unsigned bit pattern, so NX
+# (negative) entries extract identically.
+fn pte_address(e: int) -> int {
+    return int_and(e, pte_addr_mask())
+}
+
+# All flag bits of the entry (address bits stripped).
+fn pte_flags(e: int) -> int {
+    return int_and(e, pte_flags_known_mask())
+}
+
+fn pte_is_present(e: int) -> bool {
+    return int_and(e, 1) != 0
+}
+
+fn pte_is_writable(e: int) -> bool {
+    return int_and(e, 2) != 0
+}
+
+fn pte_is_user(e: int) -> bool {
+    return int_and(e, 4) != 0
+}
+
+fn pte_is_huge(e: int) -> bool {
+    return int_and(e, 128) != 0
+}
+
+fn pte_is_accessed(e: int) -> bool {
+    return int_and(e, 32) != 0
+}
+
+fn pte_is_dirty(e: int) -> bool {
+    return int_and(e, 64) != 0
+}
+
+fn pte_is_no_execute(e: int) -> bool {
+    return int_and(e, pte_flag_no_execute()) != 0
+}
+
+fn pte_is_global(e: int) -> bool {
+    return int_and(e, 256) != 0
+}
+
+# Returns the entry with every flag in `f` forced on (address and
+# other bits preserved). No validation — building entries by hand is
+# the caller's contract, same as core.alloc's Layout fields.
+fn pte_set_flags(e: int, f: int) -> int {
+    return int_or(e, f)
+}
+
+# Returns the entry with every flag in `f` forced off. The standard
+# idiom `pte_clear_flags(e, pte_flag_no_execute())` makes a page
+# executable again.
+fn pte_clear_flags(e: int, f: int) -> int {
+    return int_and(e, int_not(f))
+}
+
+# ---------------------------------------------------------------------------
+# FrameAlloc — the physical-page allocator
+# ---------------------------------------------------------------------------
+# A bitmap allocator over ONE physical memory region:
+# [base, base + frame_count * PAGE_SIZE). Frame i covers the bytes
+# [base + i*4096, base + (i+1)*4096). `used[i]` is true while frame i
+# is allocated or reserved.
+#
+# Policies (all deterministic, differential-testable):
+#   * frame_alloc_one   — first-fit scan from frame 0.
+#   * frame_alloc_run   — first-fit contiguous free run.
+#   * frame_alloc_huge  — first-fit 512-frame run whose PHYSICAL
+#                         ADDRESS is 2-MiB aligned (not just the frame
+#                         index — the base address shifts alignment).
+#   * frame_free        — rejects double-frees and out-of-range
+#                         addresses (a kernel must panic on both, not
+#                         corrupt the bitmap).
+#   * frame_reserve     — marks firmware/ACPI/MMIO holes in use
+#                         without counting them as allocations.
+#
+# The accounting fields mirror core.alloc's AllocStats so kernel
+# diagnostics can be written once against both: `allocations`/`frees`
+# count successful operations, `peak` records the high-water mark of
+# used frames (reservations included — they hold real memory).
+
+struct FrameAlloc {
+    base: int,
+    frame_count: int,
+    used: list[bool],
+    free_count: int,
+    allocations: int,
+    frees: int,
+    peak: int
+}
+
+# Builds a frame allocator over the region starting at `base`. Both
+# arguments are validated: base must be a non-negative page-aligned
+# address, frame_count positive. The bitmap starts all-free.
+fn frame_new(base: int, frame_count: int) -> Result[FrameAlloc, MemError] {
+    if base < 0 || !mem_is_page_aligned(base) {
+        return Result.Err(MemError.BadAlignment)
+    }
+    if frame_count <= 0 {
+        return Result.Err(MemError.BadRange)
+    }
+    let used: list[bool] = []
+    let mut i: int = 0
+    while i < frame_count {
+        used.push(false)
+        i = i + 1
+    }
+    return Result.Ok(FrameAlloc {
+        base: base, frame_count: frame_count, used: used,
+        free_count: frame_count, allocations: 0, frees: 0, peak: 0
+    })
+}
+
+fn frame_total(fa: FrameAlloc) -> int {
+    return fa.frame_count
+}
+
+fn frame_free_count(fa: FrameAlloc) -> int {
+    return fa.free_count
+}
+
+fn frame_used_count(fa: FrameAlloc) -> int {
+    return fa.frame_count - fa.free_count
+}
+
+# The region's size in bytes (frame_count whole pages).
+fn frame_capacity_bytes(fa: FrameAlloc) -> int {
+    return fa.frame_count * 4096
+}
+
+fn frame_allocations(fa: FrameAlloc) -> int {
+    return fa.allocations
+}
+
+fn frame_frees(fa: FrameAlloc) -> int {
+    return fa.frees
+}
+
+# The high-water mark of used frames across the allocator's lifetime
+# (allocations AND reservations push it up; frees never lower it).
+fn frame_peak(fa: FrameAlloc) -> int {
+    return fa.peak
+}
+
+fn frame_is_full(fa: FrameAlloc) -> bool {
+    return fa.free_count == 0
+}
+
+# The physical address of frame `index` (no bounds check — pair with
+# `frame_in_range`/`frame_index_of` at trust boundaries).
+fn frame_addr_of_index(fa: FrameAlloc, index: int) -> int {
+    return fa.base + index * 4096
+}
+
+# The frame index covering `addr`: Err(BadAlignment) when addr is not
+# page-aligned, Err(OutOfRange) when it lies outside the region.
+fn frame_index_of(fa: FrameAlloc, addr: int) -> Result[int, MemError] {
+    if !mem_is_page_aligned(addr) {
+        return Result.Err(MemError.BadAlignment)
+    }
+    if addr < fa.base || addr >= fa.base + fa.frame_count * 4096 {
+        return Result.Err(MemError.OutOfRange)
+    }
+    return Result.Ok((addr - fa.base) / 4096)
+}
+
+# True iff `addr` is a page-aligned address inside the region.
+fn frame_in_range(fa: FrameAlloc, addr: int) -> bool {
+    return result_is_ok(frame_index_of(fa, addr))
+}
+
+# Reads the bitmap for frame `index`. Out-of-range indices read as
+# false ("free") — the defensive default for diagnostics loops; the
+# freeing/allocation paths do their own strict bounds checks.
+fn frame_is_used_index(fa: FrameAlloc, index: int) -> bool {
+    if index < 0 || index >= fa.frame_count {
+        return false
+    }
+    return fa.used.get(index)
+}
+
+# Internal: marks frames [lo, lo + count) in the bitmap, bumping the
+# accounting. The caller has validated everything.
+fn frame_mark_used(mut fa: FrameAlloc, lo: int, count: int, track_alloc: bool) -> void {
+    let mut i: int = lo
+    while i < lo + count {
+        fa.used.set(i, true)
+        i = i + 1
+    }
+    fa.free_count = fa.free_count - count
+    if track_alloc {
+        fa.allocations = fa.allocations + 1
+    }
+    if fa.frame_count - fa.free_count > fa.peak {
+        fa.peak = fa.frame_count - fa.free_count
+    }
+    return
+}
+
+# Internal: marks frames [lo, lo + count) free in the bitmap.
+fn frame_mark_free(mut fa: FrameAlloc, lo: int, count: int, track_free: bool) -> void {
+    let mut i: int = lo
+    while i < lo + count {
+        fa.used.set(i, false)
+        i = i + 1
+    }
+    fa.free_count = fa.free_count + count
+    if track_free {
+        fa.frees = fa.frees + 1
+    }
+    return
+}
+
+# Allocates ONE frame — the first free frame in first-fit order.
+# Returns its physical address. Err(OutOfFrames) when the allocator
+# is exhausted (never partial).
+fn frame_alloc_one(mut fa: FrameAlloc) -> Result[int, MemError] {
+    if fa.free_count == 0 {
+        return Result.Err(MemError.OutOfFrames)
+    }
+    let mut i: int = 0
+    while i < fa.frame_count {
+        if !fa.used.get(i) {
+            frame_mark_used(fa, i, 1, true)
+            return Result.Ok(frame_addr_of_index(fa, i))
+        }
+        i = i + 1
+    }
+    # Unreachable (free_count was positive); kept for exhaustiveness.
+    return Result.Err(MemError.OutOfFrames)
+}
+
+# Allocates `count` CONTIGUOUS frames (a first-fit free run). Used
+# for DMA buffers and multi-page kernel objects where physical
+# adjacency matters. Err(BadRange) for count <= 0, Err(OutOfFrames)
+# when no run fits (never partial).
+fn frame_alloc_run(mut fa: FrameAlloc, count: int) -> Result[int, MemError] {
+    if count <= 0 {
+        return Result.Err(MemError.BadRange)
+    }
+    if count > fa.free_count {
+        return Result.Err(MemError.OutOfFrames)
+    }
+    let mut i: int = 0
+    while i <= fa.frame_count - count {
+        let mut run: int = 0
+        let mut ok: bool = true
+        while run < count {
+            if fa.used.get(i + run) {
+                ok = false
+                i = i + run
+                break
+            }
+            run = run + 1
+        }
+        if ok {
+            frame_mark_used(fa, i, count, true)
+            return Result.Ok(frame_addr_of_index(fa, i))
+        }
+        i = i + 1
+    }
+    return Result.Err(MemError.OutOfFrames)
+}
+
+# Allocates ONE 2-MiB huge frame: 512 contiguous free frames whose
+# PHYSICAL ADDRESS is 2-MiB aligned (a huge page's physical base must
+# be, or the CPU rejects the mapping). The scan steps over huge-page
+# boundaries of the REGION: the first candidate is the first 2-MiB
+# aligned address at or after `base`, then every 2 MiB. This is where
+# core/alloc.hls's Stage 80 promise ("larger alignments belong to
+# huge pages") lands.
+fn frame_alloc_huge(mut fa: FrameAlloc) -> Result[int, MemError] {
+    if 512 > fa.free_count {
+        return Result.Err(MemError.OutOfFrames)
+    }
+    # First 2-MiB aligned address at or after base (NOT page-aligned —
+    # the huge alignment is the whole point). base >= 0 was validated
+    # by frame_new, so the align-up cannot overflow.
+    let mut cand: int = int_and(fa.base + 2097151, int_not(2097151))
+    let last_start: int = fa.base + (fa.frame_count - 512) * 4096
+    while cand <= last_start {
+        let ir: Result[int, MemError] = frame_index_of(fa, cand)
+        if result_is_ok(ir) {
+            let lo: int = result_unwrap(ir)
+            let mut run: int = 0
+            let mut ok: bool = true
+            while run < 512 {
+                if fa.used.get(lo + run) {
+                    ok = false
+                    break
+                }
+                run = run + 1
+            }
+            if ok {
+                frame_mark_used(fa, lo, 512, true)
+                return Result.Ok(cand)
+            }
+        }
+        cand = cand + 2097152
+    }
+    return Result.Err(MemError.OutOfFrames)
+}
+
+# Frees `count` frames starting at `addr` (the address a previous
+# alloc returned). Strict validation — each failure mode is a
+# distinct kernel bug:
+#   * count <= 0                        → BadRange
+#   * addr misaligned / out of region   → BadAlignment / OutOfRange
+#   * run crosses the region end        → OutOfRange
+#   * any frame in the run already free → DoubleFree
+fn frame_free(mut fa: FrameAlloc, addr: int, count: int) -> Result[int, MemError] {
+    if count <= 0 {
+        return Result.Err(MemError.BadRange)
+    }
+    let ir: Result[int, MemError] = frame_index_of(fa, addr)
+    if result_is_err(ir) {
+        return ir
+    }
+    let lo: int = result_unwrap(ir)
+    if lo + count > fa.frame_count {
+        return Result.Err(MemError.OutOfRange)
+    }
+    let mut i: int = lo
+    while i < lo + count {
+        if !fa.used.get(i) {
+            return Result.Err(MemError.DoubleFree)
+        }
+        i = i + 1
+    }
+    frame_mark_free(fa, lo, count, true)
+    return Result.Ok(0)
+}
+
+# Marks `count` frames at `addr` as in use WITHOUT counting them as
+# allocations — the boot-time reservation of firmware/ACPI/MMIO
+# holes. Fails with InUse when any frame in the range is already
+# taken (a double reservation is a boot bug, not a silent overwrite).
+# Reservations raise `peak` (they pin real memory) but not
+# `allocations`.
+fn frame_reserve(mut fa: FrameAlloc, addr: int, count: int) -> Result[int, MemError] {
+    if count <= 0 {
+        return Result.Err(MemError.BadRange)
+    }
+    let ir: Result[int, MemError] = frame_index_of(fa, addr)
+    if result_is_err(ir) {
+        return ir
+    }
+    let lo: int = result_unwrap(ir)
+    if lo + count > fa.frame_count {
+        return Result.Err(MemError.OutOfRange)
+    }
+    let mut i: int = lo
+    while i < lo + count {
+        if fa.used.get(i) {
+            return Result.Err(MemError.InUse)
+        }
+        i = i + 1
+    }
+    frame_mark_used(fa, lo, count, false)
+    return Result.Ok(0)
+}
+
+# ---------------------------------------------------------------------------
+# PageTable — one 512-entry table at any of the four levels
+# ---------------------------------------------------------------------------
+# A table is 512 int64 entries (4 KiB on hardware). `base` is the
+# PHYSICAL address of the table's frame — parent entries point at it
+# through pte_address, and `AddressSpace.tables` is indexed by it
+# (the model's stand-in for the kernel direct map).
+struct PageTable {
+    base: int,
+    entries: list[int]
+}
+
+# Builds a table of 512 not-present entries whose frame lives at
+# `base`. Callers normally obtain `base` from frame_alloc_one and
+# register the table in an AddressSpace (space_new / the map path).
+fn table_new(base: int) -> PageTable {
+    let entries: list[int] = []
+    let mut i: int = 0
+    while i < 512 {
+        entries.push(0)
+        i = i + 1
+    }
+    return PageTable {
+        base: base, entries: entries
+    }
+}
+
+fn table_base(t: PageTable) -> int {
+    return t.base
+}
+
+# Reads entry `index` (0..511); Err(BadRange) outside that — a walk
+# bug must be loud, not silently read entry 0.
+fn table_entry(t: PageTable, index: int) -> Result[int, MemError] {
+    if index < 0 || index >= 512 {
+        return Result.Err(MemError.BadRange)
+    }
+    return Result.Ok(t.entries.get(index))
+}
+
+# Writes entry `index`. Same bounds discipline as table_entry.
+# Mutates the shared table object (struct/list aliasing), so updates
+# through `space.tables.get(i)` are visible everywhere.
+fn table_set_entry(t: PageTable, index: int, entry: int) -> Result[int, MemError] {
+    if index < 0 || index >= 512 {
+        return Result.Err(MemError.BadRange)
+    }
+    t.entries.set(index, entry)
+    return Result.Ok(0)
+}
+
+# How many present entries the table holds — a quick fill-level probe
+# for diagnostics (a boot PT after identity-mapping 4 pages shows 4).
+fn table_present_count(t: PageTable) -> int {
+    let mut n: int = 0
+    let mut i: int = 0
+    while i < 512 {
+        if pte_is_present(t.entries.get(i)) {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return n
+}
+
+# ---------------------------------------------------------------------------
+# AddressSpace — a root PML4 plus the pool of allocated tables
+# ---------------------------------------------------------------------------
+# `tables` is the model's direct map: every table the space owns,
+# findable by physical base. `maps`/`unmaps` count successful
+# operations (the kernel's mmap/munmap counters).
+struct AddressSpace {
+    root_base: int,
+    tables: list[PageTable],
+    maps: int,
+    unmaps: int
+}
+
+# Creates an address space whose PML4 lives at `root_base` (a
+# page-aligned physical address — normally frame_alloc_one's answer,
+# which the caller should treat as permanently owned by the space).
+# The root table is registered as the pool's first entry.
+fn space_new(root_base: int) -> Result[AddressSpace, MemError] {
+    if !mem_is_page_aligned(root_base) {
+        return Result.Err(MemError.BadAlignment)
+    }
+    let tables: list[PageTable] = [table_new(root_base)]
+    return Result.Ok(AddressSpace {
+        root_base: root_base, tables: tables, maps: 0, unmaps: 0
+    })
+}
+
+fn space_root_base(space: AddressSpace) -> int {
+    return space.root_base
+}
+
+fn space_table_count(space: AddressSpace) -> int {
+    return space.tables.len()
+}
+
+fn space_maps(space: AddressSpace) -> int {
+    return space.maps
+}
+
+fn space_unmaps(space: AddressSpace) -> int {
+    return space.unmaps
+}
+
+# The pool index of the table whose frame lives at `base`; Err when
+# no such table is registered.
+fn space_table_index(space: AddressSpace, base: int) -> Result[int, MemError] {
+    let mut i: int = 0
+    while i < space.tables.len() {
+        if space.tables.get(i).base == base {
+            return Result.Ok(i)
+        }
+        i = i + 1
+    }
+    return Result.Err(MemError.NotMapped)
+}
+
+# Reads one entry of the table at `base` (Err(NotMapped) when the
+# table is not registered, BadRange for index outside 0..511).
+fn space_get_entry(space: AddressSpace, base: int, index: int) -> Result[int, MemError] {
+    let ti: Result[int, MemError] = space_table_index(space, base)
+    if result_is_err(ti) {
+        return ti
+    }
+    return table_entry(space.tables.get(result_unwrap(ti)), index)
+}
+
+# Writes one entry of the table at `base`. Mutates the shared table,
+# so the space's walk sees the new entry immediately.
+fn space_set_entry(space: AddressSpace, base: int, index: int, entry: int) -> Result[int, MemError] {
+    let ti: Result[int, MemError] = space_table_index(space, base)
+    if result_is_err(ti) {
+        return ti
+    }
+    return table_set_entry(space.tables.get(result_unwrap(ti)), index, entry)
+}
+
+# Internal: allocates a table frame from `fa`, registers the fresh
+# table, and returns its base. The caller writes the parent entry.
+fn space_create_table(mut fa: FrameAlloc, space: AddressSpace) -> Result[int, MemError] {
+    let fr: Result[int, MemError] = frame_alloc_one(fa)
+    if result_is_err(fr) {
+        return fr
+    }
+    let base: int = result_unwrap(fr)
+    space.tables.push(table_new(base))
+    return Result.Ok(base)
+}
+
+# Internal: the flag set for an intermediate (non-leaf) table entry —
+# PRESENT|WRITABLE, plus USER when the leaf flags request user
+# access (a kernel walk must not strip the user bit mid-path, or the
+# CPU would fault at the missing level). Tables are never NX.
+fn mid_flags(leaf_flags: int) -> int {
+    let base: int = int_or(pte_flag_present(), pte_flag_writable())
+    if int_and(leaf_flags, pte_flag_user()) != 0 {
+        return int_or(base, pte_flag_user())
+    }
+    return base
+}
+
+# Internal: full validation for a small-page mapping request. Ok(0)
+# or the first error. The per-page canonical check happens during the
+# walk (vaddr + i*4096 can cross the canonical hole even when the
+# base address is fine).
+fn mem_check_map_args(vaddr: int, paddr: int, pages: int, flags: int) -> Result[int, MemError] {
+    if pages <= 0 {
+        return Result.Err(MemError.BadRange)
+    }
+    # A 48-bit virtual space holds at most 2^40 pages (actually fewer
+    # — 2^36 minus the hole — this is the generous bound).
+    if pages > int_shl(1, 40) {
+        return Result.Err(MemError.OutOfRange)
+    }
+    if vaddr_page_offset(vaddr) != 0 {
+        return Result.Err(MemError.BadAlignment)
+    }
+    if !vaddr_is_canonical(vaddr) {
+        return Result.Err(MemError.OutOfRange)
+    }
+    if paddr < 0 || !mem_is_page_aligned(paddr) {
+        return Result.Err(MemError.BadAlignment)
+    }
+    if paddr >= pte_addr_limit() || paddr + pages * 4096 > pte_addr_limit() {
+        return Result.Err(MemError.OutOfRange)
+    }
+    if int_and(flags, int_not(pte_flags_known_mask())) != 0 {
+        return Result.Err(MemError.BadFlags)
+    }
+    return Result.Ok(0)
+}
+
+# Internal: one 4-level walk of `v`, reporting the three table bases
+# (pdpt, pd, pt — any of which may be absent) and the leaf entry if
+# the walk reaches one. `found` is an out-pattern via list:
+#   found[0] = PDPT table base, or -1 when absent
+#   found[1] = PD table base, or -1
+#   found[2] = PT table base, or -1
+#   found[3] = leaf entry (huge PD entry or PT leaf)
+#   found[4] = 1 when a leaf was found, else 0
+# The leaf PRESENCE is a separate slot because the sentinel trick
+# fails for leaves: an entry carrying NO_EXECUTE (bit 63) is NEGATIVE
+# as an int64, indistinguishable from a -1 "absent" sentinel. Table
+# bases are physical (non-negative) so -1 stays safe there.
+fn space_walk_one(space: AddressSpace, v: int, found: list[int]) -> void {
+    found.set(0, -1)
+    found.set(1, -1)
+    found.set(2, -1)
+    found.set(3, 0)
+    found.set(4, 0)
+    let a: int = vaddr_pml4_index(v)
+    let b: int = vaddr_pdpt_index(v)
+    let c: int = vaddr_pd_index(v)
+    let d: int = vaddr_pt_index(v)
+    let e0r: Result[int, MemError] = space_get_entry(space, space.root_base, a)
+    if result_is_err(e0r) {
+        return
+    }
+    let e0: int = result_unwrap(e0r)
+    if !pte_is_present(e0) {
+        return
+    }
+    found.set(0, pte_address(e0))
+    if result_is_err(space_table_index(space, found.get(0))) {
+        # Present but DANGLING (target not registered in the pool):
+        # treat as absent. space_ensure_table re-links such entries,
+        # so pass one must count them as missing — the counting and
+        # the install then agree for every pool state, which is what
+        # keeps map failure atomic.
+        found.set(0, -1)
+        return
+    }
+    let e1r: Result[int, MemError] = space_get_entry(space, found.get(0), b)
+    if result_is_err(e1r) {
+        return
+    }
+    let e1: int = result_unwrap(e1r)
+    if !pte_is_present(e1) {
+        return
+    }
+    found.set(1, pte_address(e1))
+    if result_is_err(space_table_index(space, found.get(1))) {
+        found.set(1, -1)
+        return
+    }
+    let e2r: Result[int, MemError] = space_get_entry(space, found.get(1), c)
+    if result_is_err(e2r) {
+        return
+    }
+    let e2: int = result_unwrap(e2r)
+    if !pte_is_present(e2) {
+        return
+    }
+    if pte_is_huge(e2) {
+        # 2-MiB leaf at the PD level: the walk ends here.
+        found.set(3, e2)
+        found.set(4, 1)
+        return
+    }
+    found.set(2, pte_address(e2))
+    if result_is_err(space_table_index(space, found.get(2))) {
+        found.set(2, -1)
+        return
+    }
+    let e3r: Result[int, MemError] = space_get_entry(space, found.get(2), d)
+    if result_is_err(e3r) {
+        return
+    }
+    let e3: int = result_unwrap(e3r)
+    if pte_is_present(e3) {
+        found.set(3, e3)
+        found.set(4, 1)
+    }
+    return
+}
+
+# Internal: PASS ONE of space_map — validate every page (canonical,
+# no conflict with an existing leaf, no huge leaf in the way) and
+# count EXACTLY how many intermediate tables the install pass will
+# create. Returns the count (Err leaves the space and allocator
+# untouched — map is atomic on failure).
+#
+# Dedup correctness: along a sequential page walk a is non-decreasing,
+# b non-decreasing within one a, c within one (a,b) — so the table
+# keys (a), (a,b), (a,b,c) can only REPEAT contiguously. Counting "on
+# change of key, if absent" therefore counts every missing table
+# exactly once.
+fn space_walk_prepare(space: AddressSpace, vaddr0: int, pages: int) -> Result[int, MemError] {
+    let found: list[int] = [0, 0, 0, 0, 0]
+    let mut needed: int = 0
+    let mut prev_a: int = -1
+    let mut prev_ab: int = -1
+    let mut prev_abc: int = -1
+    let mut i: int = 0
+    while i < pages {
+        let v: int = vaddr0 + i * 4096
+        if !vaddr_is_canonical(v) {
+            return Result.Err(MemError.OutOfRange)
+        }
+        let a: int = vaddr_pml4_index(v)
+        let b: int = vaddr_pdpt_index(v)
+        let c: int = vaddr_pd_index(v)
+        space_walk_one(space, v, found)
+        # A present leaf — normal or huge — blocks the whole map.
+        if found.get(4) == 1 {
+            return Result.Err(MemError.AlreadyMapped)
+        }
+        # Count each level's missing table once per key change. The
+        # walk reports a level only when its ancestors are reachable,
+        # so a missing PDPT automatically cascades into the PD and PT
+        # counts below (their found[] entries stay -1 too).
+        if a != prev_a && found.get(0) < 0 {
+            needed = needed + 1
+        }
+        let ab: int = a * 512 + b
+        if ab != prev_ab && found.get(1) < 0 {
+            needed = needed + 1
+        }
+        let abc: int = (a * 512 + b) * 512 + c
+        if abc != prev_abc && found.get(2) < 0 {
+            needed = needed + 1
+        }
+        prev_a = a
+        prev_ab = ab
+        prev_abc = abc
+        i = i + 1
+    }
+    return Result.Ok(needed)
+}
+
+# Internal: PASS TWO helper — return the base of the table indexed by
+# `index` under `parent_base`, creating (and linking) it when absent
+# or dangling. `needed` creations in pass one guarantee the
+# frame_alloc_one calls here cannot exhaust the allocator.
+fn space_ensure_table(mut fa: FrameAlloc, space: AddressSpace, parent_base: int, index: int, midf: int) -> Result[int, MemError] {
+    let er: Result[int, MemError] = space_get_entry(space, parent_base, index)
+    if result_is_ok(er) {
+        let e: int = result_unwrap(er)
+        if pte_is_present(e) {
+            let base: int = pte_address(e)
+            if result_is_ok(space_table_index(space, base)) {
+                return Result.Ok(base)
+            }
+            # Dangling entry (points outside the pool): fall through
+            # and re-link a fresh table. Out-of-model state — pass one
+            # already counted it as missing.
+        }
+    }
+    let cr: Result[int, MemError] = space_create_table(fa, space)
+    if result_is_err(cr) {
+        return cr
+    }
+    let base: int = result_unwrap(cr)
+    # Force PRESENT on the link: a table entry without bit 0 would
+    # make every later walk treat the table as absent and re-create
+    # it. mid_flags() already includes it; this guards hand-built
+    # flag sets too.
+    let link: Result[int, MemError] = pte_new(base, int_or(midf, pte_flag_present()))
+    if result_is_err(link) {
+        return link
+    }
+    let sr: Result[int, MemError] = space_set_entry(space, parent_base, index, result_unwrap(link))
+    if result_is_err(sr) {
+        return sr
+    }
+    return Result.Ok(base)
+}
+
+# Maps `pages` 4-KiB pages: [vaddr, vaddr + pages*4096) →
+# [paddr, paddr + pages*4096), creating intermediate tables on demand.
+#
+# The two-pass structure makes failure ATOMIC: pass one validates
+# every page (canonical, no leaf conflicts, no huge leaves in the
+# way) and counts the intermediate tables the install will create;
+# only when the frame allocator can pay for all of them does pass two
+# mutate anything. On success every leaf carries `flags` forced
+# PRESENT, and `fa` holds the table frames (usually 1-3 per fresh
+# region — check frame_used_count to see the true cost).
+#
+# Returns Ok(pages); `space.maps` increments once per successful call.
+fn space_map(mut fa: FrameAlloc, space: AddressSpace, vaddr: int, paddr: int, pages: int, flags: int) -> Result[int, MemError] {
+    let chk: Result[int, MemError] = mem_check_map_args(vaddr, paddr, pages, flags)
+    if result_is_err(chk) {
+        return chk
+    }
+    let needr: Result[int, MemError] = space_walk_prepare(space, vaddr, pages)
+    if result_is_err(needr) {
+        return needr
+    }
+    if result_unwrap(needr) > frame_free_count(fa) {
+        return Result.Err(MemError.OutOfFrames)
+    }
+    let midf: int = mid_flags(flags)
+    let leaf_flags: int = int_or(flags, pte_flag_present())
+    let mut i: int = 0
+    while i < pages {
+        let v: int = vaddr + i * 4096
+        let pdpt: Result[int, MemError] = space_ensure_table(fa, space, space.root_base, vaddr_pml4_index(v), midf)
+        if result_is_err(pdpt) {
+            return pdpt
+        }
+        let pd: Result[int, MemError] = space_ensure_table(fa, space, result_unwrap(pdpt), vaddr_pdpt_index(v), midf)
+        if result_is_err(pd) {
+            return pd
+        }
+        let pt: Result[int, MemError] = space_ensure_table(fa, space, result_unwrap(pd), vaddr_pd_index(v), midf)
+        if result_is_err(pt) {
+            return pt
+        }
+        let leafr: Result[int, MemError] = pte_new(paddr + i * 4096, leaf_flags)
+        if result_is_err(leafr) {
+            return leafr
+        }
+        let sr: Result[int, MemError] = space_set_entry(space, result_unwrap(pt), vaddr_pt_index(v), result_unwrap(leafr))
+        if result_is_err(sr) {
+            return sr
+        }
+        i = i + 1
+    }
+    space.maps = space.maps + 1
+    return Result.Ok(pages)
+}
+
+# The pure lookup: translates `vaddr` through the 4-level walk and
+# returns the PHYSICAL address it currently maps to — page base plus
+# the in-page (or in-huge-page) offset — or Option.None when any
+# level is absent (including non-canonical addresses, which the CPU
+# would reject before the walk even starts).
+fn space_translate(space: AddressSpace, vaddr: int) -> Option[int] {
+    if !vaddr_is_canonical(vaddr) {
+        return Option.None
+    }
+    let found: list[int] = [0, 0, 0, 0, 0]
+    space_walk_one(space, vaddr, found)
+    if found.get(4) == 0 {
+        return Option.None
+    }
+    let leaf: int = found.get(3)
+    if pte_is_huge(leaf) {
+        return Option.Some(pte_address(leaf) + vaddr_huge_offset(vaddr))
+    }
+    return Option.Some(pte_address(leaf) + vaddr_page_offset(vaddr))
+}
+
+# True iff `vaddr` currently translates to something.
+fn space_is_mapped(space: AddressSpace, vaddr: int) -> bool {
+    return option_is_some(space_translate(space, vaddr))
+}
+
+# The leaf entry backing `vaddr` — the PT entry for a 4-KiB page, or
+# the PD entry for a 2-MiB huge page. The diagnostics and audit hook:
+# callers can inspect flags (NX? writable?) without duplicating the
+# walk. Err(NotMapped) when absent.
+fn space_leaf_entry(space: AddressSpace, vaddr: int) -> Result[int, MemError] {
+    if !vaddr_is_canonical(vaddr) {
+        return Result.Err(MemError.OutOfRange)
+    }
+    let found: list[int] = [0, 0, 0, 0, 0]
+    space_walk_one(space, vaddr, found)
+    if found.get(4) == 0 {
+        return Result.Err(MemError.NotMapped)
+    }
+    return Result.Ok(found.get(3))
+}
+
+# Internal: validation for huge (2-MiB page) mapping requests — the
+# huge analogue of mem_check_map_args. Both the virtual and the
+# physical base must be 2-MiB aligned.
+fn mem_check_huge_args(vaddr: int, paddr: int, count: int, flags: int) -> Result[int, MemError] {
+    if count <= 0 {
+        return Result.Err(MemError.BadRange)
+    }
+    if count > int_shl(1, 31) {
+        return Result.Err(MemError.OutOfRange)
+    }
+    if !vaddr_is_huge_aligned(vaddr) {
+        return Result.Err(MemError.BadAlignment)
+    }
+    if !vaddr_is_canonical(vaddr) {
+        return Result.Err(MemError.OutOfRange)
+    }
+    if paddr < 0 || !mem_is_huge_aligned(paddr) {
+        return Result.Err(MemError.BadAlignment)
+    }
+    if paddr >= pte_addr_limit() || paddr + count * 2097152 > pte_addr_limit() {
+        return Result.Err(MemError.OutOfRange)
+    }
+    if int_and(flags, int_not(pte_flags_known_mask())) != 0 {
+        return Result.Err(MemError.BadFlags)
+    }
+    return Result.Ok(0)
+}
+
+# Internal: PASS ONE of space_map_huge — conflict check per 2-MiB
+# page plus the exact count of PDPT/PD tables to create (same dedup
+# argument as space_walk_prepare; only two levels exist here).
+fn space_walk_prepare_huge(space: AddressSpace, vaddr0: int, count: int) -> Result[int, MemError] {
+    let found: list[int] = [0, 0, 0, 0, 0]
+    let mut needed: int = 0
+    let mut prev_a: int = -1
+    let mut prev_ab: int = -1
+    let mut k: int = 0
+    while k < count {
+        let v: int = vaddr0 + k * 2097152
+        if !vaddr_is_canonical(v) {
+            return Result.Err(MemError.OutOfRange)
+        }
+        let a: int = vaddr_pml4_index(v)
+        let b: int = vaddr_pdpt_index(v)
+        let c: int = vaddr_pd_index(v)
+        space_walk_one(space, v, found)
+        # ANY present entry at the PD level blocks a huge mapping —
+        # both a huge leaf and a PT pointer covering part of the 2 MiB.
+        let e2r: Result[int, MemError] = space_get_entry(space, found.get(1), c)
+        if result_is_ok(e2r) && pte_is_present(result_unwrap(e2r)) {
+            return Result.Err(MemError.AlreadyMapped)
+        }
+        if a != prev_a && found.get(0) < 0 {
+            needed = needed + 1
+        }
+        let ab: int = a * 512 + b
+        if ab != prev_ab && found.get(1) < 0 {
+            needed = needed + 1
+        }
+        prev_a = a
+        prev_ab = ab
+        k = k + 1
+    }
+    return Result.Ok(needed)
+}
+
+# Maps `count` 2-MiB huge pages: [vaddr, vaddr + count*2MiB) →
+# [paddr, paddr + count*2MiB), installing HUGE leaves at the PD
+# level. Same atomic two-pass structure and flags handling as
+# space_map; `flags` must not include HUGE (the installer adds it).
+# A huge mapping inside an already-mapped region — or a small
+# mapping into a huge one (space_map refuses via the same pass-one
+# probe) — is AlreadyMapped, mirroring the CPU's refuse-to-conflict
+# behaviour without silent subpage overlaps.
+fn space_map_huge(mut fa: FrameAlloc, space: AddressSpace, vaddr: int, paddr: int, count: int, flags: int) -> Result[int, MemError] {
+    let chk: Result[int, MemError] = mem_check_huge_args(vaddr, paddr, count, flags)
+    if result_is_err(chk) {
+        return chk
+    }
+    if int_and(flags, pte_flag_huge()) != 0 {
+        return Result.Err(MemError.BadFlags)
+    }
+    let needr: Result[int, MemError] = space_walk_prepare_huge(space, vaddr, count)
+    if result_is_err(needr) {
+        return needr
+    }
+    if result_unwrap(needr) > frame_free_count(fa) {
+        return Result.Err(MemError.OutOfFrames)
+    }
+    let midf: int = mid_flags(flags)
+    let leaf_flags: int = int_or(int_or(flags, pte_flag_present()), pte_flag_huge())
+    let mut k: int = 0
+    while k < count {
+        let v: int = vaddr + k * 2097152
+        let pdpt: Result[int, MemError] = space_ensure_table(fa, space, space.root_base, vaddr_pml4_index(v), midf)
+        if result_is_err(pdpt) {
+            return pdpt
+        }
+        let pd: Result[int, MemError] = space_ensure_table(fa, space, result_unwrap(pdpt), vaddr_pdpt_index(v), midf)
+        if result_is_err(pd) {
+            return pd
+        }
+        let leafr: Result[int, MemError] = pte_new(paddr + k * 2097152, leaf_flags)
+        if result_is_err(leafr) {
+            return leafr
+        }
+        let sr: Result[int, MemError] = space_set_entry(space, result_unwrap(pd), vaddr_pd_index(v), result_unwrap(leafr))
+        if result_is_err(sr) {
+            return sr
+        }
+        k = k + 1
+    }
+    space.maps = space.maps + 1
+    return Result.Ok(count)
+}
+
+# Unmaps `pages` 4-KiB pages starting at `vaddr` (entries are zeroed,
+# the Linux pte_clear convention). Every page must currently be
+# small-mapped — any absent page (NotMapped) or huge leaf (also
+# NotMapped; use space_unmap_huge) aborts the call with no changes.
+# Page-table frames stay allocated (kernels keep PTs; reclaiming
+# them needs the Stage 82+ lifetime story).
+fn space_unmap(space: AddressSpace, vaddr: int, pages: int) -> Result[int, MemError] {
+    if pages <= 0 {
+        return Result.Err(MemError.BadRange)
+    }
+    if vaddr_page_offset(vaddr) != 0 || !vaddr_is_canonical(vaddr) {
+        return Result.Err(MemError.BadAlignment)
+    }
+    let found: list[int] = [0, 0, 0, 0, 0]
+    let mut i: int = 0
+    while i < pages {
+        let v: int = vaddr + i * 4096
+        if !vaddr_is_canonical(v) {
+            return Result.Err(MemError.OutOfRange)
+        }
+        space_walk_one(space, v, found)
+        let leaf: int = found.get(3)
+        if found.get(4) == 0 || pte_is_huge(leaf) {
+            return Result.Err(MemError.NotMapped)
+        }
+        i = i + 1
+    }
+    i = 0
+    while i < pages {
+        let v: int = vaddr + i * 4096
+        space_walk_one(space, v, found)
+        let zr: Result[int, MemError] = space_set_entry(space, found.get(2), vaddr_pt_index(v), 0)
+        if result_is_err(zr) {
+            return zr
+        }
+        i = i + 1
+    }
+    space.unmaps = space.unmaps + 1
+    return Result.Ok(pages)
+}
+
+# Unmaps `count` 2-MiB huge pages starting at `vaddr` (2-MiB
+# aligned). Every PD entry in the range must be present AND huge —
+# anything else is NotMapped (the small/huge APIs are strictly
+# paired). Zeroes the PD entries; the PDPT/PD tables stay.
+fn space_unmap_huge(space: AddressSpace, vaddr: int, count: int) -> Result[int, MemError] {
+    if count <= 0 {
+        return Result.Err(MemError.BadRange)
+    }
+    if !vaddr_is_huge_aligned(vaddr) || !vaddr_is_canonical(vaddr) {
+        return Result.Err(MemError.BadAlignment)
+    }
+    let found: list[int] = [0, 0, 0, 0, 0]
+    let mut k: int = 0
+    while k < count {
+        let v: int = vaddr + k * 2097152
+        if !vaddr_is_canonical(v) {
+            return Result.Err(MemError.OutOfRange)
+        }
+        space_walk_one(space, v, found)
+        let leaf: int = found.get(3)
+        if found.get(4) == 0 || !pte_is_huge(leaf) {
+            return Result.Err(MemError.NotMapped)
+        }
+        k = k + 1
+    }
+    k = 0
+    while k < count {
+        let v: int = vaddr + k * 2097152
+        space_walk_one(space, v, found)
+        let zr: Result[int, MemError] = space_set_entry(space, found.get(1), vaddr_pd_index(v), 0)
+        if result_is_err(zr) {
+            return zr
+        }
+        k = k + 1
+    }
+    space.unmaps = space.unmaps + 1
+    return Result.Ok(count)
+}
+
+# Re-flags `pages` small pages at `vaddr` (the mprotect primitive):
+# each leaf's ADDRESS is preserved, everything else is rebuilt from
+# `flags` (forced PRESENT). Every page must currently be small-mapped
+# (NotMapped otherwise; huge leaves are out of scope — unmap/remap
+# them). The classic kernel use: dropping WRITABLE after loading a
+# image, or adding NO_EXECUTE to data.
+fn space_protect(space: AddressSpace, vaddr: int, pages: int, flags: int) -> Result[int, MemError] {
+    let chk: Result[int, MemError] = mem_check_map_args(vaddr, 0, pages, flags)
+    if result_is_err(chk) {
+        return chk
+    }
+    let found: list[int] = [0, 0, 0, 0, 0]
+    let mut i: int = 0
+    while i < pages {
+        let v: int = vaddr + i * 4096
+        space_walk_one(space, v, found)
+        let leaf: int = found.get(3)
+        if found.get(4) == 0 || pte_is_huge(leaf) {
+            return Result.Err(MemError.NotMapped)
+        }
+        i = i + 1
+    }
+    i = 0
+    while i < pages {
+        let v: int = vaddr + i * 4096
+        space_walk_one(space, v, found)
+        let old: int = found.get(3)
+        let nr: Result[int, MemError] = pte_new(pte_address(old), int_or(flags, pte_flag_present()))
+        if result_is_err(nr) {
+            return nr
+        }
+        let sr: Result[int, MemError] = space_set_entry(space, found.get(2), vaddr_pt_index(v), result_unwrap(nr))
+        if result_is_err(sr) {
+            return sr
+        }
+        i = i + 1
+    }
+    return Result.Ok(pages)
+}
+
+# Convenience: identity-map `pages` pages at `paddr` (virtual ==
+# physical) — the boot-loader pattern that keeps early code running
+# before the higher-half map is live.
+fn mem_identity_map(mut fa: FrameAlloc, space: AddressSpace, paddr: int, pages: int, flags: int) -> Result[int, MemError] {
+    return space_map(fa, space, paddr, paddr, pages, flags)
+}
+
+# Convenience: map a BYTE range, rounding the length up to whole
+# pages — the way kernels size their mappings ("the region is
+# 10000 bytes" → 3 pages).
+fn mem_map_bytes(mut fa: FrameAlloc, space: AddressSpace, vaddr: int, paddr: int, bytes: int, flags: int) -> Result[int, MemError] {
+    let pr: Result[int, MemError] = mem_page_count(bytes)
+    if result_is_err(pr) {
+        return pr
+    }
+    return space_map(fa, space, vaddr, paddr, result_unwrap(pr), flags)
+}
