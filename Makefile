@@ -110,3 +110,4 @@ lsp-check:
 # Section targets live in mk/ (included in original section order,
 # so this Makefile parses exactly like the former single-file version).
 include mk/20-testing.mk mk/30-lto.mk mk/40-backends.mk mk/50-pkg-contracts.mk mk/60-advanced.mk mk/70-stdlib-core.mk mk/80-stdlib.mk mk/90-stdlib-late.mk mk/95-osdev.mk
+
