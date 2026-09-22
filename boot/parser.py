@@ -145,6 +145,7 @@ class Parser:
             "hot": False,
             "cold": False,
             "tail_call": False,
+            "panic_handler": False,
         }
 
     def parse_attributes(self):
@@ -159,9 +160,12 @@ class Parser:
             irq_handler      - emit an IRET-compatible frame
             stack_size(N)    - assert the fn's frame is <= N bytes
             tail_call        - Stage 31: assert every recursive call is
-                              in verified tail position (the codegen
-                              emits a parameter-rebinding goto — a jmp,
-                              not a call; the interpreter trampolines)
+                               in verified tail position (the codegen
+                               emits a parameter-rebinding goto — a jmp,
+                               not a call; the interpreter trampolines)
+            panic_handler    - Stage 81: mark this fn the program's panic
+                               handler (exactly one per program; signature
+                               `fn panic_handler(msg: str) -> void`)
         Multiple `#[...]` lists may precede a single fn (each
         accumulates). `hot` and `cold` are mutually exclusive; likewise
         `inline(always)` and `inline(never)`. `tail_call` is mutually
@@ -211,7 +215,23 @@ class Parser:
                         self.err("'tail_call' and 'irq_handler' are mutually "
                                  "exclusive (an interrupt frame must return "
                                  "via IRETQ, never jump)", t0)
+                    if self.cur_attrs["panic_handler"]:
+                        self.err("'panic_handler' and 'irq_handler' are mutually "
+                                 "exclusive (a panic handler must return "
+                                 "normally; an interrupt frame returns via "
+                                 "IRETQ)", t0)
                     self.cur_attrs["irq_handler"] = True
+                elif attr_name == "panic_handler":
+                    # Stage 81 (v0.100.0-alpha): kernel panic strategy.
+                    # Marks the program's single panic handler (checked
+                    # for uniqueness + signature by the checker): the fn
+                    # runs once per panic before the default action.
+                    if self.cur_attrs["irq_handler"]:
+                        self.err("'panic_handler' and 'irq_handler' are mutually "
+                                 "exclusive (a panic handler must return "
+                                 "normally; an interrupt frame returns via "
+                                 "IRETQ)", t0)
+                    self.cur_attrs["panic_handler"] = True
                 elif attr_name == "tail_call":
                     # Stage 31 (v0.48.0-alpha): verified tail-call
                     # optimisation. The attribute is an ASSERTION: the
@@ -254,7 +274,8 @@ class Parser:
                 else:
                     self.err("unknown attribute '%s' (known: inline(always), "
                              "inline(never), hot, cold, no_red_zone, "
-                             "irq_handler, stack_size(N), tail_call)" % attr_name, t0)
+                             "irq_handler, stack_size(N), tail_call, "
+                             "panic_handler)" % attr_name, t0)
                 if self.at_sym(","):
                     self.next()
                 elif not self.at_sym("]"):
@@ -636,7 +657,7 @@ class Parser:
                 "attrs": {"stack_size": -1, "no_red_zone": False,
                           "irq_handler": False, "inline": "",
                           "hot": False, "cold": False,
-                          "tail_call": False},
+                          "tail_call": False, "panic_handler": False},
             }
         # Stage 17 (v0.28.0-alpha): optional contract clauses —
         # `requires <bool-expr>` then/and `ensures <bool-expr>`, parsed
