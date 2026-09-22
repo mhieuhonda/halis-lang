@@ -232,6 +232,10 @@ class CheckerCore(object):
         # error): the module boundary, the host boundary, and the
         # declared-capability boundary need signatures only.
         self.check_crate_modes()
+        # 2.6 Stage 81 (v0.100.0-alpha): panic-handler validation runs
+        # on signatures only (uniqueness + shape), so it also reports
+        # before any body-level error in the handler itself.
+        self.check_panic_handler()
         # 3. check function bodies
         for key, fn in self.fns.items():
             self.check_fn(key, fn)
@@ -304,6 +308,44 @@ class CheckerCore(object):
                          "function must be pure)"
                          % (fn["name"], ", ".join(sorted(declared)), label),
                          fn)
+
+    # ---------- Stage 81 (v0.100.0-alpha): panic-handler validation ----------
+    # `#[panic_handler]` marks the program's single panic handler: a
+    # top-level, non-generic, non-extern fn with exactly one `str`
+    # parameter returning `void`. The runtime invokes it once per
+    # panic (behind a reentrancy guard) before the default action, so
+    # the shape is load-bearing: the C hook calls it as
+    # `usf_panic_handler(hl_str*)` and the interpreter calls it with
+    # one str argument. Anything else is rejected here, on signatures
+    # only (no body checking needed — a handler body is checked like
+    # any other fn body afterwards).
+    def check_panic_handler(self):
+        found = None
+        for key, fn in self.fns.items():
+            if not fn.get("attrs", {}).get("panic_handler", False):
+                continue
+            if found is not None:
+                self.err("only one #[panic_handler] fn per program "
+                         "(already have '%s'; '%s' is a duplicate)"
+                         % (found, key), fn)
+            found = key
+            if fn.get("struct") is not None:
+                self.err("#[panic_handler] must be a top-level function, "
+                         "not a method ('%s')" % key, fn)
+            if fn.get("extern", False):
+                self.err("#[panic_handler] cannot be an extern fn "
+                         "('%s')" % key, fn)
+            if fn.get("typeparams"):
+                self.err("#[panic_handler] cannot be generic ('%s' has "
+                         "type parameters)" % key, fn)
+            params = fn.get("params", [])
+            if len(params) != 1 or params[0][1] != "str":
+                self.err("#[panic_handler] requires exactly one parameter "
+                         "of type 'str' (the panic message); '%s' does not "
+                         "match" % key, fn)
+            if fn.get("ret") != "void":
+                self.err("#[panic_handler] must return 'void'; '%s' "
+                         "returns '%s'" % (key, fn.get("ret")), fn)
 
     # ---------- environment ----------
     # Bindings are now [type, mut, moved] (3-tuple) — `moved` is True after
