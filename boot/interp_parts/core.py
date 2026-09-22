@@ -56,6 +56,11 @@ class InterpCore(object):
         # double-close is a silent no-op (matches the C runtime).
         self.net_fds = {}
         self._net_next_fd = 1
+        # Stage 81 (v0.100.0-alpha): reentrancy guard for the panic
+        # handler. While the handler itself runs, a nested panic must
+        # NOT re-enter it (the allocator may be broken) — it falls
+        # straight through to the default report in run().
+        self._in_panic_hook = False
 
     @property
     def line(self):
@@ -84,6 +89,34 @@ class InterpCore(object):
         try:
             r = self.call_fn("main", [])
         except HLPanic as ex:
+            # Stage 81 (v0.100.0-alpha): invoke the program's panic
+            # handler first (if one is declared and we are not already
+            # inside it). The handler runs with the panic message; a
+            # nested panic inside the handler is swallowed (the guard
+            # above); an exit() inside the handler propagates (the
+            # handler chooses the halt action). When the handler
+            # returns, the default report below still runs — mirroring
+            # the native hl_panic_hook contract exactly.
+            h = self.fns.get("panic_handler")
+            if (h is not None
+                    and h.get("attrs", {}).get("panic_handler", False)
+                    and not self._in_panic_hook):
+                self._in_panic_hook = True
+                try:
+                    self.call_fn("panic_handler", [ex.msg])
+                except HLPanic:
+                    # A nested panic inside the handler falls through
+                    # to the default report (mirrors the native
+                    # hl_in_panic guard).
+                    pass
+                except Exception:
+                    # A buggy handler must not mask the original fault.
+                    # SystemExit is NOT an Exception subclass — an
+                    # exit() inside the handler (its chosen halt
+                    # action) propagates untouched.
+                    pass
+                finally:
+                    self._in_panic_hook = False
             self.out.flush()
             sys.stderr.write("panic: %s (at line %d)\n" % (to_display(ex.msg), ex.line))
             return 101
