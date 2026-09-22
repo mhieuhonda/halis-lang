@@ -116,19 +116,41 @@ fn toml_parse(src: str) -> Result[ConfigValue, str] {
                 return Result.Err(toml_err(p, "expected ']' after table header"))
             }
             toml_advance(p)
+            # Deep-scan-30 fix: reject a table header whose path runs
+            # through an already-defined VALUE (TOML duplicate
+            # definition) — the old code silently DESTROYED the value
+            # by overwriting it with an intermediate table.
+            let hdr_conflict: int = toml_path_conflict(root, current_table_path)
+            if hdr_conflict >= 0 {
+                return Result.Err(toml_err(p, "key '" + current_table_path.get(hdr_conflict) + "' already defined as a value (cannot redefine it as a table)"))
+            }
             # Ensure the path exists in root (create intermediate tables).
             toml_ensure_path(root, current_table_path)
             continue
         }
-        # Key = value.
+        # Key = value. Deep-scan-30 fix: TOML dotted keys (`a.b = 2`)
+        # are part of the spec (and the module doc claims dotted-path
+        # support) — parse '.'-separated key segments into a path list
+        # instead of accepting only a single segment.
+        let key_parts: list[str] = []
         let key_r: Result[str, str] = toml_parse_key(p)
         if result_is_err(key_r) {
             return Result.Err(result_err_or(key_r, "key parse failed"))
         }
-        let key: str = result_unwrap(key_r)
+        key_parts.push(result_unwrap(key_r))
         toml_skip_ws(p)
+        while toml_peek(p) == 46 {
+            toml_advance(p)  # consume '.'
+            toml_skip_ws(p)
+            let seg_r: Result[str, str] = toml_parse_key(p)
+            if result_is_err(seg_r) {
+                return Result.Err(result_err_or(seg_r, "key parse failed"))
+            }
+            key_parts.push(result_unwrap(seg_r))
+            toml_skip_ws(p)
+        }
         if toml_peek(p) != 61 {
-            return Result.Err(toml_err(p, "expected '=' after key '" + key + "'"))
+            return Result.Err(toml_err(p, "expected '=' after key '" + key_parts.get(key_parts.len() - 1) + "'"))
         }
         toml_advance(p)  # consume '='
         toml_skip_ws(p)
@@ -137,10 +159,28 @@ fn toml_parse(src: str) -> Result[ConfigValue, str] {
             return Result.Err(result_err_or(val_r, "value parse failed"))
         }
         let val: ConfigValue = result_unwrap(val_r)
-        # Set the key under the current table path.
-        let full_path: list[str] = toml_path_append(current_table_path, key)
+        # Set the key under the current table path. Deep-scan-30: the
+        # full path = table path + ALL dotted key segments.
+        let full_path: list[str] = toml_path_append(current_table_path, key_parts.get(0))
+        let mut ki: int = 1
+        while ki < key_parts.len() {
+            full_path.push(key_parts.get(ki))
+            ki = ki + 1
+        }
+        # Deep-scan-30 fix: reject a key whose intermediate path runs
+        # through an already-defined VALUE (e.g. `a = 1` followed by
+        # `a.b = 2`) — the old code silently overwrote `a` with a table
+        # and the original value was lost.
+        let kv_conflict: int = toml_path_conflict(root, full_path)
+        if kv_conflict >= 0 {
+            return Result.Err(toml_err(p, "key '" + full_path.get(kv_conflict) + "' already defined as a value (cannot redefine it as a table)"))
+        }
         toml_ensure_path(root, full_path)
-        config_set_path(root, str_join(full_path, "."), val)
+        # Deep-scan-30 fix: set the value through the ALREADY-SPLIT path
+        # — a quoted key containing a dot (`"x.y" = 7`) used to be
+        # re-joined with "." and re-split, silently re-shaping it into
+        # a nested table.
+        config_set_path_parts(root, full_path, val)
         # Skip trailing whitespace / comment / newline.
         toml_skip_ws_and_comments(p)
         # Optional newline (the next iteration handles it).

@@ -4,7 +4,12 @@
 # std/regex.hls facade; not part of the public import API.
 # ============================================================================
 
-fn regex_add_state_to_set(re: Regex, set: list[int], state_idx: int, caps: list[int], text: str, pos: int) -> void {
+# regex_add_state_to_set(re, set, state_idx, caps, tentative, text, pos) —
+# add a state to the active set, recursively following epsilon
+# transitions. SAVE states update the captures list. ANCHOR states
+# check the current position and discard themselves if the anchor
+# is not satisfied. MATCH states are added without further traversal.
+fn regex_add_state_to_set(re: Regex, set: list[int], state_idx: int, caps: list[int], tentative: list[int], text: str, pos: int) -> void {
     if state_idx < 0 || state_idx >= re.states.len() {
         return
     }
@@ -14,32 +19,56 @@ fn regex_add_state_to_set(re: Regex, set: list[int], state_idx: int, caps: list[
     regex_set_add(set, state_idx)
     let st: RegexState = re.states.get(state_idx)
     if st.kind == regex_st_epsilon() {
-        regex_add_state_to_set(re, set, st.out1, caps, text, pos)
-        regex_add_state_to_set(re, set, st.out2, caps, text, pos)
+        regex_add_state_to_set(re, set, st.out1, caps, tentative, text, pos)
+        regex_add_state_to_set(re, set, st.out2, caps, tentative, text, pos)
     } else if st.kind == regex_st_save() {
         let slot: int = st.group_id
-        if slot < caps.len() {
-            caps.set(slot, pos)
+        # Deep-scan-30 fix (capture semantics under quantifiers): the
+        # old code wrote group-START slots IMMEDIATELY into caps. For a
+        # group under a quantifier (`(b|c)*d` on "bccbd") the star's
+        # back edge re-reaches the start save at EVERY position —
+        # including positions where the speculative "loop once more"
+        # thread subsequently dies without completing an iteration. The
+        # last such speculative write overwrote the committed start of
+        # the final COMPLETED iteration (3) with the dead thread's
+        # position (4), yielding a 4..4 span ("") instead of 3..4
+        # ("b"). Split the writes: a START save records a TENTATIVE
+        # value; the matching END save COMMITS the tentative start
+        # together with its end — a completed iteration can no longer
+        # be corrupted by a later dead thread.
+        if slot % 2 == 0 {
+            # Group START — tentative only.
+            if slot < tentative.len() {
+                tentative.set(slot, pos)
+            }
+        } else {
+            # Group END — commit start + end for this group.
+            if slot < caps.len() {
+                caps.set(slot, pos)
+            }
+            if slot - 1 >= 0 && slot - 1 < caps.len() && slot - 1 < tentative.len() {
+                caps.set(slot - 1, tentative.get(slot - 1))
+            }
         }
-        regex_add_state_to_set(re, set, st.out1, caps, text, pos)
+        regex_add_state_to_set(re, set, st.out1, caps, tentative, text, pos)
     } else if st.kind == regex_st_anchor_start() {
         # ^ matches only at position 0 (start of text).
         if pos == 0 {
-            regex_add_state_to_set(re, set, st.out1, caps, text, pos)
+            regex_add_state_to_set(re, set, st.out1, caps, tentative, text, pos)
         }
     } else if st.kind == regex_st_anchor_end() {
         # $ matches only at the end of text.
         if pos == text.len() {
-            regex_add_state_to_set(re, set, st.out1, caps, text, pos)
+            regex_add_state_to_set(re, set, st.out1, caps, tentative, text, pos)
         }
     } else if st.kind == regex_st_word_boundary() {
         # \b matches at a boundary between a word byte and a non-word byte.
         if regex_word_boundary_at(text, pos) {
-            regex_add_state_to_set(re, set, st.out1, caps, text, pos)
+            regex_add_state_to_set(re, set, st.out1, caps, tentative, text, pos)
         }
     } else if st.kind == regex_st_nonword_boundary() {
         if !regex_word_boundary_at(text, pos) {
-            regex_add_state_to_set(re, set, st.out1, caps, text, pos)
+            regex_add_state_to_set(re, set, st.out1, caps, tentative, text, pos)
         }
     }
     # LITERAL / ANY / CLASS / MATCH are non-epsilon: leave the state
