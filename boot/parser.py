@@ -160,12 +160,12 @@ class Parser:
             irq_handler      - emit an IRET-compatible frame
             stack_size(N)    - assert the fn's frame is <= N bytes
             tail_call        - Stage 31: assert every recursive call is
-                               in verified tail position (the codegen
-                               emits a parameter-rebinding goto — a jmp,
-                               not a call; the interpreter trampolines)
+                              in verified tail position (the codegen
+                              emits a parameter-rebinding goto — a jmp,
+                              not a call; the interpreter trampolines)
             panic_handler    - Stage 81: mark this fn the program's panic
-                               handler (exactly one per program; signature
-                               `fn panic_handler(msg: str) -> void`)
+                              handler (exactly one per program; signature
+                              `fn panic_handler(msg: str) -> void`)
         Multiple `#[...]` lists may precede a single fn (each
         accumulates). `hot` and `cold` are mutually exclusive; likewise
         `inline(always)` and `inline(never)`. `tail_call` is mutually
