@@ -87,15 +87,15 @@ Seven core guarantees of v0.35.0-alpha:
   src/hlc.hls ──► boot/ (Stage-0, seed) ──► hlc.c (pass 1)       │
   (compiler in         used ONLY ONCE to        │                │
    HLS, ~3000 lines)   bootstrap the cycle      ▼                │
-                                            gcc -O2                │
-                                                 │                  │
-                                                 ▼                  │
-                                         bin/hlc  (native) ───────┤
-                                                 │  recompiles self │
-                                                 ▼                  │
-                                         hlc.c (pass 2)             │
-                                                 │                  │
-                                  diff pass 1 vs pass 2 = 0 bytes ─┘
+                                           gcc -O2                │
+                                                │                  │
+                                                ▼                  │
+                                        bin/hlc  (native) ───────┤
+                                                │  recompiles self │
+                                                ▼                  │
+                                        hlc.c (pass 2)             │
+                                                │                  │
+                                 diff pass 1 vs pass 2 = 0 bytes ─┘
 ```
 
 `make bootstrap` performs the entire chain above and confirms the
