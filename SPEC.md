@@ -3131,3 +3131,154 @@ backends, a nested handler panic still reports the original fault,
 and the three fail programs (`dup`, `bad_sig`, `bad_ret`) are
 rejected by boot AND the self-hosted checker with the same
 `panic_handler` message.
+
+## 36. Deterministic stack size + guard pages (Stage 82 — v0.101.0-alpha)
+
+Stage 82 gives kernels their stack discipline: how big the stack is,
+why it cannot grow, and what happens when a task touches the page
+below it. It has three halves — a pure-HLS library (`core/stack.hls`)
+that models the region a kernel sets up, a language guarantee (the
+`#![stack_size(N)]` crate attribute) that makes the whole program's
+worst-case stack chain a checked fact, and a runtime wiring (the C
+backend's task stacks) that pins real thread stacks to a
+deterministic size with a real guard page. The module is
+import-free — zero `core.*` dependencies, like `core/panic.hls` — so
+it is importable from `#![no_std]` and `#![freestanding]` crates
+identically, and its guard failures panic through the Stage 81 path
+(a `#[panic_handler]` observes a guard hit like any other fault).
+
+```hls
+#![stack_size(4096)]   # the whole-program budget, verified statically
+
+import "core.stack"
+
+fn main() -> int uses IO {
+    # Plan a task stack from the workload: 64-byte worst frame,
+    # depth 1, one page of slack, one guard page, top at 1 MiB.
+    let cfg: StackConfig = stack_plan_new(64, 1, 1, 1048576)
+    println("usable: " + stack_usable_bytes(cfg).to_str())
+    let last: int = stack_probe(cfg, stack_usable_bytes(cfg))  # ok
+    let _: int = stack_probe(cfg, stack_usable_bytes(cfg) + 1) # guard page hit
+    return 0
+}
+```
+
+### 36.1. The static budget: `#![stack_size(N)]`
+
+The crate-level attribute (parsed only at the top of the entry
+file, at most once, like `#![freestanding]`/`#![no_std]`) declares
+the program's deterministic stack budget in bytes. The checker —
+both compilers, with byte-identical messages — then proves it:
+
+- **Frame estimate.** Every function's worst-case frame is a
+  conservative upper bound on what gcc can emit for the
+  type-correct source: 32 bytes of base overhead, 8 bytes per
+  parameter and per `let` slot, 16 bytes per call site (caller-saved
+  spills + return address), 16 bytes per `for` loop — the same
+  estimator the per-fn `#[stack_size(N)]` attribute (section 27)
+  has used since Stage 28. `asm!` operands are not modeled
+  (register-resident per the ABI).
+- **Call graph.** The analysis walks the same edges the effects
+  fixpoint consumes: user functions and methods, plus the synthetic
+  `@default.<Struct>` nodes whose default expressions evaluate
+  inside the constructing frame (their own cost is 0, their callees
+  continue the chain). Extern functions contribute 0 — the C
+  callee's stack is the C world's business; the caller's 16-byte
+  call-site term already covers the transition. Generic functions
+  keep one node per declared key: every type lowers to an 8-byte
+  scalar, so a frame never depends on the substitution.
+- **Recursion is rejected.** A cycle in the call graph means the
+  chain depth depends on the input — no static budget can bound it,
+  so any cycle is a compile error naming the cycle
+  (`a -> b -> a`). `#[tail_call]` fns compile to loops, but the
+  budget is a plain-call analysis: a tail-recursive fn still forms a
+  cycle here. Bound the recursion or drop the budget.
+- **The worst chain must fit.** The longest chain (memoized DFS,
+  sorted iteration so the reported path is deterministic — the
+  bootstrap self-compilation must stay byte-identical) is compared
+  against N; over-budget programs name the chain and the excess.
+  `--audit` (boot) and the `-O` stats report (hlc) print the
+  verified worst chain for the crate.
+
+Because the estimator is an upper bound, `estimate <= chain <= N`
+is transitive: the compiled program's stack use is bounded by N on
+every execution path that terminates. That is what "deterministic
+stack size" means here — the same source always allocates the same
+stack, and no input can push it further.
+
+Per-fn `#[stack_size(N)]` validation is now enforced by BOTH
+compilers. Stage 28 shipped it native-only; boot parsed the
+attribute and silently ignored the bound (a program boot accepted,
+hlc rejected). Stage 82 ports the estimator to the boot checker and
+closes the gap.
+
+### 36.2. The `core.stack` surface
+
+| Item | Role |
+|------|------|
+| `stack_page_size()` / `stack_page_align` / `stack_page_align_up` / `stack_pages_for` | the 4-KiB page arithmetic (negative inputs panic — there is no aligned form of a negative address) |
+| `struct StackConfig { top, size, guard_pages }` | the region picture: page-aligned usable bytes growing down from `top`, guard pages below; `stack_config_new` validates all three invariants (positive aligned size, ≥ 1 guard page, aligned top high enough) |
+| `stack_usable_bytes` / `stack_guard_bytes` / `stack_total_footprint` / `stack_bottom` / `stack_guard_base` | the geometry (guard base = the lowest mapped address) |
+| `enum StackFault { None, GuardPage, BadOffset }` | the probe verdict, with `stack_fault_name` (serial logs) and `stack_fault_code` (0/1/2, declaration order — enums are matched, not compared) |
+| `stack_offset_valid` / `stack_classify_offset` | the non-panicking classification (offset in [1..size] usable; size < offset ≤ size + guard = the guard page) |
+| `stack_probe` / `stack_try_probe` | the write model: the address, or the guard-page panic ("stack overflow: guard page hit at offset N"); the try form returns -1 instead of panicking |
+| `stack_remaining` / `stack_has_overflow` | the high-water predicates (remaining refuses offsets past the region) |
+| `stack_frame_cost` / `stack_chain_bytes` / `stack_max_depth` / `stack_chain_fits` | the cost model, mirroring the checker's estimator constants exactly, so plans and proofs agree |
+| `stack_plan_new` | workload → config: chain + one unconditional slack page (interrupt frames, ABI padding), rounded to pages |
+| `stack_canary_value` / `stack_canary_ok` | the 0x5A5A..A5 canary (6510615555426900570): a disturbed slot is caught before the corrupted value matters |
+
+The probe functions are the software twin of the MMU: a write at
+`top - offset` is classified the same way hardware classifies the
+address, and the guard verdict panics with the message a fault
+handler would print — routed through the Stage 81 panic path, so a
+`#[panic_handler]` sees "stack overflow: guard page hit at offset N"
+like any other kernel fault.
+
+### 36.3. The runtime: deterministic task stacks + a real guard page
+
+In the C backend, every spawned task thread (`spawn`,
+`async_spawn`, `async_spawn_stream`, `async_spawn_take`,
+`stream_merge`) is created through `hl_thread_start`, which pins
+`pthread_attr_setstacksize` to `HL_TASK_STACK_BYTES` (1 MiB usable)
+and `pthread_attr_setguardsize` to `HL_TASK_GUARD_BYTES` (4 KiB) —
+glibc maps the guard PROT_NONE, so the first overflowing write takes
+a fault on the guard instead of silently corrupting whatever mapping
+the allocator placed next to the stack. Two properties fall out:
+
+- **Determinism.** The glibc default stack varies with
+  `ulimit -s`, the ABI, and the machine; N tasks now occupy exactly
+  N × (1 MiB + 4 KiB) of stack on every host, so task memory
+  footprint is reproducible.
+- **Containment.** An overflow is a fault at a known address (the
+  guard page), not a write into a neighbor — the runtime twin of
+  the `stack_probe` contract, and the same shape a kernel gives an
+  IRQ stack.
+
+A task whose Halis-level crate passed `#![stack_size(N)]` for
+N ≤ 1 MiB cannot reach the guard through HLS code (its worst chain
+is proven smaller than the budget, which is smaller than the
+stack); the guard therefore guards against the things the static
+analysis does not model — a C-library call's internal recursion,
+an FFI callee's frames, a broken `asm!` block. The freestanding
+backend keeps the Stage 77 `__builtin_trap` panic semantics: the
+bootloader owns the boot stack, and placing a task's guard pages is
+exactly the kernel work `core.stack` lets its author plan.
+
+### 36.4. What the tests prove
+
+`tests/ok/feat_stage82_stack.hls` runs 69 numbered assertions on the
+interpreter AND as a native binary (hosted and `-nostdlib`): page
+arithmetic, config geometry + the passing side of every validation,
+offset classification (including the boundaries 1 / size / size+1 /
+guard end), probes and predicates, the frame-cost and chain math,
+planning (including depth 0), fault names + codes, the canary pair,
+and a stack plan feeding a Stage 81 `PanicLog`. `make
+stackguard-acceptance` (7 sections) proves the enforcement paths:
+the hosted demo hits the guard on both backends (marker, exit 101),
+the ok-test is clean in `no_std` / `freestanding` / bare-hosted
+modes, `--audit` reports the verified worst chain, the three fail
+programs (over-budget, recursion cycle, per-fn frame bound) are
+rejected by boot AND the self-hosted checker with the same messages,
+and a spawn-using program's emitted C carries
+`hl_thread_start` / `HL_TASK_STACK_BYTES` /
+`pthread_attr_setguardsize` (the guard, really there).

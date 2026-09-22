@@ -44,6 +44,10 @@ class CheckerCore(object):
         # Stage 31 (v0.48.0-alpha): fn key -> number of VERIFIED tail
         # self-call sites (filled by tail_call_check_fn).
         self.tail_sites = {}
+        # Stage 82 (v0.101.0-alpha): the crate's deterministic stack
+        # budget, filled by check_stack_budget for --audit:
+        # {"budget", "worst", "path"} or None.
+        self.stack_budget_info = None
 
     # ---------- utilities ----------
     def err(self, msg, node):
@@ -236,6 +240,12 @@ class CheckerCore(object):
         # on signatures only (uniqueness + shape), so it also reports
         # before any body-level error in the handler itself.
         self.check_panic_handler()
+        # 2.7 Stage 82 (v0.101.0-alpha): per-fn #[stack_size(N)] frame
+        # bounds validate on the AST only (no types needed) — the same
+        # pass the self-hosted checker runs on signatures, closing the
+        # boot↔hlc parity gap (boot used to parse the attribute and
+        # silently ignore the bound).
+        self.check_stack_size_attrs()
         # 3. check function bodies
         for key, fn in self.fns.items():
             self.check_fn(key, fn)
@@ -257,6 +267,10 @@ class CheckerCore(object):
             self.tail_call_check_fn(key, fn)
         # 4. effects analysis (fixpoint on the call graph)
         self.check_effects()
+        # 5. Stage 82 (v0.101.0-alpha): the crate-level deterministic
+        # stack budget — runs LAST (needs the complete call graph,
+        # including the edges the body checks just added).
+        self.check_stack_budget()
 
     # ---------- Stage 77 (v0.96.0-alpha): crate modes ----------
     # `#![freestanding]` / `#![no_std]` turn the whole program into a
@@ -346,6 +360,206 @@ class CheckerCore(object):
             if fn.get("ret") != "void":
                 self.err("#[panic_handler] must return 'void'; '%s' "
                          "returns '%s'" % (key, fn.get("ret")), fn)
+
+    # ---------- Stage 82 (v0.101.0-alpha): deterministic stack sizing ----------
+    # Two halves, mirroring the self-hosted checker exactly:
+    #
+    # 1. Per-fn `#[stack_size(N)]` — the Stage 28 frame bound, now
+    #    validated in boot too (boot used to parse the attribute and
+    #    silently ignore it: a program boot accepted, hlc rejected).
+    #    The estimator is the same conservative upper bound hlc uses:
+    #    32 bytes base + 8 per local slot/param + 16 per call site,
+    #    walking the statement tree recursively (if/while/for bodies)
+    #    and every call site nested in expressions (including match
+    #    arms, struct-literal field values, list items — the nodes the
+    #    deep scans kept adding). asm! operands are not modeled (they
+    #    are register-resident per the ABI; documented in SPEC 36).
+    #
+    # 2. The crate budget `#![stack_size(N)]` — the whole-program
+    #    deterministic stack size. Frame(fn) as above; the call graph
+    #    (edges filled by the body checks, plus the synthetic
+    #    "@default.<Struct>" nodes whose cost lives in the constructing
+    #    frame) is walked for the WORST chain. Recursion cycles are
+    #    rejected outright — a deterministic stack size is impossible
+    #    when a cycle's depth is input-dependent. The worst chain must
+    #    fit the budget.
+    def estimate_stack_size(self, fn):
+        b = 32  # base overhead (saved RBP / RBX / alignment)
+        b += 8 * len(fn.get("params", []))
+        return self._est_stmts(fn.get("body", []), b)
+
+    def _est_stmts(self, stmts, b):
+        for s in stmts:
+            b = self._est_stmt(s, b)
+        return b
+
+    def _est_stmt(self, s, b):
+        k = s.get("k")
+        if k == "let":
+            # Every HLS type lowers to an 8-byte C scalar; void
+            # bindings are unreachable and need no slot.
+            if s.get("t") != "void":
+                b += 8
+            b += self._est_calls(s.get("value"))
+        elif k == "for":
+            # The loop's iteration variable + index temp + iterator
+            # handle: 16 bytes, like hlc.
+            b += 16
+            b = self._est_stmts(s.get("body", []), b)
+            b += self._est_calls(s.get("iter"))
+        elif k == "while":
+            b = self._est_stmts(s.get("body", []), b)
+            b += self._est_calls(s.get("cond"))
+        elif k == "if":
+            b = self._est_stmts(s.get("then", []), b)
+            els = s.get("els") or []
+            if els:
+                b = self._est_stmts(els, b)
+            b += self._est_calls(s.get("cond"))
+        elif k == "return":
+            b += self._est_calls(s.get("value"))
+        elif k == "assign":
+            b += self._est_calls(s.get("target"))
+            b += self._est_calls(s.get("value"))
+        elif k == "expr":
+            b += self._est_calls(s.get("e"))
+        # asm!/break/continue: no modeled frame cost (parity with hlc).
+        return b
+
+    def _est_calls(self, e):
+        """Counts the call sites nested in an expression tree — 16
+        bytes each (caller-saved spills + return address). Mirrors
+        hlc's estimate_stack_calls: only plain `call` nodes carry the
+        +16 (method/field calls keep their parity with the Stage 28
+        estimator), but EVERY child is walked: bin arms, call args,
+        field/index targets, `?` chains, match scrutinee + arm bodies,
+        list items, struct-literal field values."""
+        if not isinstance(e, dict):
+            return 0
+        k = e.get("k")
+        total = 16 if k == "call" else 0
+        if k == "bin":
+            total += self._est_calls(e.get("l"))
+            total += self._est_calls(e.get("r"))
+        elif k == "un":
+            total += self._est_calls(e.get("e"))
+        elif k == "call":
+            for a in e.get("args", []):
+                total += self._est_calls(a)
+        elif k == "fieldcall":
+            total += self._est_calls(e.get("target"))
+            for a in e.get("args", []):
+                total += self._est_calls(a)
+        elif k == "field":
+            total += self._est_calls(e.get("target"))
+        elif k == "index":
+            total += self._est_calls(e.get("target"))
+            total += self._est_calls(e.get("idx"))
+        elif k == "qmark":
+            total += self._est_calls(e.get("e"))
+        elif k == "match":
+            total += self._est_calls(e.get("scrut"))
+            for arm in e.get("arms", []):
+                total += self._est_calls(arm.get("body"))
+        elif k == "listlit":
+            for it in e.get("items", []):
+                total += self._est_calls(it)
+        elif k == "structlit":
+            for _fname, fval in e.get("fields", []):
+                total += self._est_calls(fval)
+        return total
+
+    def check_stack_size_attrs(self):
+        for key, fn in self.fns.items():
+            sa = fn.get("attrs", {}).get("stack_size", -1)
+            if sa is None or sa < 0:
+                continue
+            if fn.get("extern", False):
+                continue
+            est = self.estimate_stack_size(fn)
+            if est > sa:
+                self.err(
+                    "#[stack_size(%d)] violated by function '%s': "
+                    "estimated frame size is %d bytes (the body declares "
+                    "too many locals or nests too many call sites for the "
+                    "bound). Reduce locals or raise the bound."
+                    % (sa, fn["name"], est), fn)
+
+    def check_stack_budget(self):
+        for a in self.p.get("crate_attrs", []):
+            if a.get("name") != "stack_size":
+                continue
+            n = a.get("value")
+            if not isinstance(n, int) or n <= 0:
+                self.err("crate attribute 'stack_size' requires a "
+                         "positive byte count: #![stack_size(1048576)]", a)
+            # Frame cost per call-graph node. Extern fns have no Halis
+            # body (the C callee's stack is the C world's business);
+            # "@default.<Struct>" nodes cost 0 — their default
+            # expressions evaluate inside the constructing frame.
+            frames = {}
+            for key, fn in self.fns.items():
+                frames[key] = 0 if fn.get("extern", False) \
+                    else self.estimate_stack_size(fn)
+            for key in self.edges:
+                if key.startswith("@default.") and key not in frames:
+                    frames[key] = 0
+            # Longest chain with cycle detection. Sorted iteration
+            # keeps the reported chain deterministic regardless of
+            # declaration order (the bootstrap re-compile must stay
+            # byte-identical).
+            memo = {}
+            WHITE, GRAY, BLACK = 0, 1, 2
+            color = {}
+            stack = []
+
+            def user_callees(node):
+                return sorted(c for c in self.edges.get(node, ())
+                              if c in frames)
+
+            def visit(node):
+                """Returns (cost, path) for the worst chain STARTING
+                at node. Raises via err() on a recursion cycle."""
+                color[node] = GRAY
+                stack.append(node)
+                best_cost, best_path = 0, []
+                for c in user_callees(node):
+                    if color.get(c, WHITE) == GRAY:
+                        i = stack.index(c)
+                        cycle = stack[i:] + [c]
+                        self.err(
+                            "crate #![stack_size(%d)] requires bounded "
+                            "recursion: call cycle %s has no static depth "
+                            "bound" % (n, " -> ".join(cycle)), a)
+                    if color.get(c, WHITE) == WHITE:
+                        ccost, cpath = visit(c)
+                    else:
+                        ccost, cpath = memo[c]
+                    # Strict '>' keeps the FIRST maximum in sorted-callee
+                    # order — deterministic in both compilers without a
+                    # lexicographic tie-break.
+                    if ccost > best_cost:
+                        best_cost, best_path = ccost, cpath
+                stack.pop()
+                color[node] = BLACK
+                memo[node] = (frames[node] + best_cost, [node] + best_path)
+                return memo[node]
+
+            worst, worst_path = 0, []
+            for node in sorted(frames):
+                if color.get(node, WHITE) == WHITE:
+                    c, p = visit(node)
+                    if c > worst:
+                        worst, worst_path = c, p
+            if worst > n:
+                self.err(
+                    "crate #![stack_size(%d)]: worst-case stack chain is "
+                    "%d bytes (%s), exceeding the budget by %d bytes. "
+                    "Reduce frames or depth, or raise the bound."
+                    % (n, worst, " -> ".join(worst_path), worst - n), a)
+            self.stack_budget_info = {
+                "budget": n, "worst": worst, "path": worst_path}
+            return
 
     # ---------- environment ----------
     # Bindings are now [type, mut, moved] (3-tuple) — `moved` is True after

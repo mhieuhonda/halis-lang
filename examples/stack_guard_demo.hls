@@ -1,0 +1,79 @@
+# ============================================================================
+# examples/stack_guard_demo.hls — Stage 82 (v0.101.0-alpha)
+# ----------------------------------------------------------------------------
+# A hosted program demonstrating the deterministic stack budget and the
+# guard-page model end to end:
+#
+#   1. The crate declares #![stack_size(4096)] — the checker computes
+#      every function's worst-case frame, walks the call graph, and
+#      proves the worst chain fits inside 4096 bytes. main -> probe_ok
+#      is that chain (it compiles; lower the budget to watch it fail).
+#   2. core.stack plans a task stack from the same numbers the checker
+#      uses: one page of usable stack, one guard page below it.
+#   3. The program walks probes down the stack — legal writes return
+#      addresses — then steps ONTO the guard page: the probe panics
+#      with the guard-page message, the Stage 81 handler prints the
+#      kernel-style line, and the default report still runs (exit 101).
+#
+# The stack region here is a pure-HLS MODEL (Halis has no global
+# allocator, so a program cannot mmap its own guard pages); the REAL
+# guard pages live in the runtime: every spawned task thread runs on a
+# deterministic 1-MiB stack with a 4-KiB guard (see SPEC section 36).
+#
+# Build + run (hosted toolchain):
+#   bin/hlc examples/stack_guard_demo.hls /tmp/sgd.c
+#   gcc -O2 -o /tmp/sgd /tmp/sgd.c -lm -pthread
+#   /tmp/sgd; echo "exit=$?"   # exit=101
+#
+# Or directly on the interpreter:
+#   python3 boot/boot.py examples/stack_guard_demo.hls; echo "exit=$?"
+# ============================================================================
+#![stack_size(4096)]
+
+import "core.stack"
+import "core.panic"
+
+# The program's single panic handler (Stage 81): hosted, so it may log
+# over IO. It renders the guard fault the way a kernel would.
+#[panic_handler]
+fn panic_handler(msg: str) -> void uses IO {
+    println("kernel panic: " + msg)
+}
+
+# The worst-chain leaf: a frame with one local and one nested call.
+fn probe_at(cfg: StackConfig, off: int) -> int {
+    let a: int = stack_probe(cfg, off)
+    return a
+}
+
+# The mid chain: another local, another call site.
+fn probe_ok(cfg: StackConfig) -> int {
+    let top: int = probe_at(cfg, 16)
+    return top
+}
+
+fn main() -> int uses IO {
+    println("budget: 4096 bytes (verified at compile time)")
+
+    # Plan the task stack from the workload numbers: a 64-byte worst
+    # frame at depth 1 plus one page of slack (the plan rounds up, so
+    # this yields 8192 usable bytes), one guard page, top at 1 MiB.
+    let cfg: StackConfig = stack_plan_new(64, 1, 1, 1048576)
+    println("planned stack: " + stack_usable_bytes(cfg).to_str()
+    + " usable bytes at top " + cfg.top.to_str())
+    println("guard region : " + stack_guard_bytes(cfg).to_str()
+    + " bytes below " + stack_bottom(cfg).to_str())
+
+    # Legal writes walk down from the top; the last legal byte is at
+    # offset == size.
+    let lo: int = probe_ok(cfg)
+    println("probe top-16 : " + lo.to_str())
+    let last: int = probe_at(cfg, stack_usable_bytes(cfg))
+    println("probe bottom : " + last.to_str())
+
+    # One byte further: the guard page. The probe panics (the software
+    # twin of the page fault the MMU would raise on the real stack).
+    println("stepping onto the guard page...")
+    let _: int = probe_at(cfg, stack_usable_bytes(cfg) + 1)
+    return 0
+}

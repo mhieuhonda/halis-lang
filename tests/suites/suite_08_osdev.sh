@@ -324,3 +324,61 @@ else
     bad "panic: make panic-acceptance failed"
     tail -15 "$TMP/panic_acc81.log"
 fi
+
+echo "=== 19. Stage 82: deterministic stack size + guard pages ==="
+# Stage 82 (v0.101.0-alpha): `#![stack_size(N)]` — the checker computes
+# every fn's worst-case frame, walks the call graph, rejects recursion
+# cycles, and proves the worst chain fits N bytes. `core.stack` models
+# the region (StackConfig / StackFault / probes / canary / planning)
+# and the runtime pins task stacks (1 MiB + 4-KiB guard page).
+STK_F=tests/ok/feat_stage82_stack.hls
+# (a) the stack ok-test checks + runs on the interpreter (exit 0).
+stk_interp_out=$(python3 boot/boot.py "$STK_F" </dev/null 2>/dev/null); stk_interp_code=$?
+if [ "$stk_interp_code" -eq 0 ]; then
+    ok "stack: feat_stage82_stack runs on the interpreter (exit 0)"
+else
+    bad "stack: feat_stage82_stack interpreter exit=$stk_interp_code"
+fi
+# (b) the stack module resolves through the `core.` prefix.
+if [ -f "core/stack.hls" ]; then
+    ok "stack: core/stack.hls present"
+else
+    bad "stack: core/stack.hls missing"
+fi
+# (c) every Stage 82 fail program is rejected by Stage-0 with the
+#     Stage 82 message, and the self-hosted checker agrees.
+for ff in tests/fail/fail_stack_budget_exceeded.hls \
+          tests/fail/fail_stack_budget_recursion.hls \
+          tests/fail/fail_stack_size_fn.hls; do
+    stk_name=$(basename "$ff" .hls)
+    stk_err=$(python3 boot/boot.py --check "$ff" 2>&1 >/dev/null); stk_rc=$?
+    if [ "$stk_rc" -eq 1 ] && echo "$stk_err" | grep -qE "stack_size|bounded recursion"; then
+        ok "stack: $stk_name rejected by boot ($stk_err)"
+    else
+        bad "stack: $stk_name not rejected with a stack message (rc=$stk_rc)"
+    fi
+    if python3 boot/boot.py src/hlc.hls "$ff" "$TMP/stk_fail.c" >/dev/null 2>&1; then
+        bad "stack: $stk_name accepted by the self-hosted checker"
+    else
+        ok "stack: $stk_name rejected by hlc too (parity)"
+    fi
+done
+# (d) the hosted demo hits the guard (exit 101, handler marker first).
+stk_demo_out=$(python3 boot/boot.py examples/stack_guard_demo.hls </dev/null 2>/dev/null); stk_demo_code=$?
+if [ "$stk_demo_code" -eq 101 ] && echo "$stk_demo_out" | grep -q "kernel panic: stack overflow"; then
+    ok "stack: examples/stack_guard_demo.hls hits the guard, exit 101"
+else
+    bad "stack: examples/stack_guard_demo.hls exit=$stk_demo_code (want 101 + marker)"
+fi
+# (e) make stackguard-acceptance runs end-to-end (7 sections).
+if make stackguard-acceptance >"$TMP/stk_acc82.log" 2>&1; then
+    if grep -q "ACCEPTANCE OK: Stage 82" "$TMP/stk_acc82.log"; then
+        ok "stack: make stackguard-acceptance runs end-to-end"
+    else
+        bad "stack: make stackguard-acceptance did not print ACCEPTANCE OK"
+        tail -5 "$TMP/stk_acc82.log"
+    fi
+else
+    bad "stack: make stackguard-acceptance failed"
+    tail -15 "$TMP/stk_acc82.log"
+fi

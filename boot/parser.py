@@ -34,7 +34,12 @@ IO_FAMILY = {"IO", "Fs", "Clock", "Args", "Exit"}
 #   no_std       - no std (only core + relative imports); the C
 #                  backend still links libc and uses `main`
 #                  (Stage 78 populates the `core` module).
-CRATE_ATTRS = {"freestanding", "no_std"}
+#   stack_size(N) - Stage 82 (v0.101.0-alpha): the program's
+#                  deterministic stack budget in bytes. The checker
+#                  computes every fn's worst-case frame, walks the
+#                  call graph, rejects recursion cycles outright, and
+#                  proves the worst chain fits inside N bytes.
+CRATE_ATTRS = {"freestanding", "no_std", "stack_size"}
 
 BIN_LEVELS = [
     ("||",),
@@ -284,8 +289,11 @@ class Parser:
 
     def parse_crate_attr(self):
         """Stage 77 (v0.96.0-alpha): parse one `#![name]` crate-level
-        attribute. Consumes `#` `!` `[` name `]`.
-        Returns {"name", "line", "col"}.
+        attribute. Consumes `#` `!` `[` name (`(` int `)`)? `]`.
+        Stage 82 (v0.101.0-alpha): `stack_size` carries a parenthesized
+        byte count — `#![stack_size(1048576)]`.
+        Returns {"name", "value", "line", "col"} (value is the byte
+        count for stack_size, None for the bare attrs).
         """
         t0 = self.eat_sym("#")
         self.eat_sym("!")
@@ -293,14 +301,31 @@ class Parser:
         name_tok = self.peek()
         if name_tok["k"] != "ident":
             self.err("expected a crate attribute name (freestanding, "
-                     "no_std) but got %s" % self._desc(), name_tok)
+                     "no_std, stack_size) but got %s" % self._desc(), name_tok)
         self.next()
         name = name_tok["v"]
         if name not in CRATE_ATTRS:
             self.err("unknown crate attribute '%s' (known: %s)"
                      % (name, ", ".join(sorted(CRATE_ATTRS))), name_tok)
+        value = None
+        if name == "stack_size":
+            # Stage 82: the byte count is part of the attribute
+            # (`#![stack_size(N)]`). Requiring the parentheses keeps
+            # the bare-word form (`#![stack_size]`) a distinct,
+            # rejectable shape rather than a silent default.
+            self.eat_sym("(")
+            nt = self.peek()
+            if nt["k"] != "int":
+                self.err("stack_size expects an integer byte count "
+                         "but got %s" % self._desc(), nt)
+            self.next()
+            value = nt["v"]
+            if value <= 0:
+                self.err("stack_size must be positive", nt)
+            self.eat_sym(")")
         self.eat_sym("]")
-        return {"name": name, "line": t0["line"], "col": t0["col"]}
+        return {"name": name, "value": value,
+                "line": t0["line"], "col": t0["col"]}
 
     def parse_program(self):
         structs = {}   # name -> struct

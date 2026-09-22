@@ -667,6 +667,14 @@ def print_audit(program, checker):
         print("  Crate mode: #![no_std] (std disabled, hosted libc kept)")
     else:
         print("  Crate mode: std (default hosted crate)")
+    # Stage 82 (v0.101.0-alpha): the deterministic stack budget, when
+    # the crate declares `#![stack_size(N)]` — the verified worst-case
+    # call chain (the checker proved it fits before we get here).
+    budget = getattr(checker, "stack_budget_info", None)
+    if budget:
+        print("  Stack budget: #![stack_size(%d)] — worst chain %d bytes "
+              "(%s)" % (budget["budget"], budget["worst"],
+                        " -> ".join(budget["path"])))
     # Active vs reserved effects table.
     print("")
     print("  Active effects:    IO, Fs, Clock, Args, Exit, Net, Rand, Proc, Conc")

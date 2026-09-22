@@ -18,6 +18,10 @@
 # Stage 81 (v0.100.0-alpha): `core.panic` + `#[panic_handler]` — the
 # kernel panic strategy (PanicInfo / PanicAction / PanicLog plus the
 # single overridable handler behind the reentrancy-guarded hook).
+# Stage 82 (v0.101.0-alpha): the deterministic stack size + guard
+# pages (`#![stack_size(N)]` budget verified against the worst call
+# chain, `core.stack` region model, 1-MiB + guard task stacks in the
+# C runtime).
 # ============================================================================
 
 # freestanding: compile an HLS program to freestanding C + link with
@@ -133,4 +137,21 @@ panic-acceptance:
 	@$(PYTHON) tests/panic_acceptance.py
 	@echo "ACCEPTANCE OK: Stage 81 -- core.panic + #[panic_handler]"
 
-.PHONY: freestanding freestanding-check freestanding-acceptance nostd nostd-acceptance alloc-acceptance mem-acceptance panic-acceptance
+# stackguard-acceptance: the Stage 82 acceptance gate. Runs the
+# 7-section end-to-end suite for the deterministic stack size + guard
+# pages: resolution + guards, standalone parse + core-only imports,
+# Stage-0 enforcement (hosted demo hits the guard at 101 with the
+# handler marker, no_std ok-test clean in no_std / freestanding /
+# bare-hosted modes, three fail programs rejected), budget probes
+# (fitting program accepted with the audited worst chain, over-budget
+# + recursion-cycle rejected, six guard-panic probes), self-hosted
+# emission + native parity (hosted demo at 101, ok-test at 0,
+# freestanding -nostdlib at 0, task runtime carries hl_thread_start /
+# HL_TASK_STACK_BYTES / pthread_attr_setguardsize, boot/hlc parity on
+# fail programs), hlfmt stability, and `--audit` purity.
+stackguard-acceptance:
+	@echo "[Stage 82 acceptance] running tests/stack_acceptance.py..."
+	@$(PYTHON) tests/stack_acceptance.py
+	@echo "ACCEPTANCE OK: Stage 82 -- deterministic stack size + guard pages"
+
+.PHONY: freestanding freestanding-check freestanding-acceptance nostd nostd-acceptance alloc-acceptance mem-acceptance panic-acceptance stackguard-acceptance

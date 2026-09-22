@@ -137,7 +137,7 @@ remains green.
 | 79 | `core.alloc` — pluggable allocator trait | ✅ | (done in v0.98.0-alpha) |
 | 80 | `core.mem` — physical-page allocator, page tables | ✅ | (done in v0.99.0-alpha) |
 | 81 | Panic-handler override (kernel panic strategy) | ✅ | (done in v0.100.0-alpha) |
-| 82 | Stack-overflow guard page + deterministic stack size | ⬜ | 3 weeks |
+| 82 | Stack-overflow guard page + deterministic stack size | ✅ | (done in v0.101.0-alpha) |
 | 83 | Inline-asm register constraints (clobber, input, output) | ⬜ | 5 weeks |
 | 84 | Linker-script integration (`link.ld`) + custom sections | ⬜ | 4 weeks |
 | 85 | Multiboot2 + Limine-compliant boot protocol headers | ⬜ | 4 weeks |

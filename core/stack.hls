@@ -1,0 +1,332 @@
+# ============================================================================
+# core/stack.hls — deterministic stack sizing + guard pages (Stage 82)
+# ----------------------------------------------------------------------------
+# Pure HLS, zero imports (freestanding-safe: the module only uses the
+# core language — structs, enums, lists, strings and the `panic`
+# builtin — so it is importable from `#![no_std]` and `#![freestanding]`
+# crates identically, like the rest of `core.*`). Guard failures panic
+# through the Stage 81 panic path, so a `#[panic_handler]` observes
+# them exactly like any other kernel fault.
+#
+# This module is the LIBRARY half of Stage 82. The LANGUAGE half is the
+# `#![stack_size(N)]` crate attribute (see SPEC section 36): the checker
+# computes every function's worst-case frame, walks the call graph,
+# rejects recursion cycles outright, and proves the worst call chain
+# fits inside N bytes — a deterministic stack size, statically.
+#
+# What lives here:
+#   StackConfig — the memory picture of one task stack: a page-aligned
+#                 usable region growing DOWN from `top`, plus the
+#                 guard-page region below it (the same shape Linux
+#                 gives a pthread with pthread_attr_setguardsize, and
+#                 the same shape a kernel gives an IRQ stack).
+#   StackFault  — why a probe at some offset would fault: the guard
+#                 page, a bad offset, or nothing.
+#   StackPlan   — the sizing rule: worst frame × worst depth, rounded
+#                 up to whole pages with one page of slack.
+#
+# The probe model mirrors what hardware does: a stack write at
+# `top - offset` lands in a usable page while offset <= size, and in
+# a PROT_NONE guard page the moment it goes past — the kernel's
+# page-fault handler turns that into this module's panic instead of
+# silent memory corruption.
+#
+# FRAME COST MODEL: `stack_frame_cost` mirrors the compilers' own
+# estimator (the one that validates per-fn `#[stack_size(N)]`):
+# 32 bytes of base overhead, 8 bytes per local slot, 16 bytes per
+# call site (caller-saved spills + the return address). Sizing a
+# stack with the same model the checker proves bounds makes the
+# arithmetic agree end to end.
+# ============================================================================
+
+# ---------------------------------------------------------------------------
+# Page arithmetic (4096-byte pages, like core.mem)
+# ---------------------------------------------------------------------------
+# The page size every computation in this module assumes. A kernel
+# running on hardware with a different page size should not use the
+# guard helpers below with raw hardware constants mixed in.
+fn stack_page_size() -> int {
+    return 4096
+}
+
+# Rounds `n` DOWN to a page boundary (the mask drops the low 12 bits).
+# Negative addresses have no aligned form and are rejected loudly.
+fn stack_page_align(n: int) -> int {
+    if n < 0 {
+        panic("stack_page_align: address must be >= 0")
+    }
+    return int_and(n, int_not(4095))
+}
+
+# Rounds `n` UP to a page boundary.
+fn stack_page_align_up(n: int) -> int {
+    if n < 0 {
+        panic("stack_page_align_up: size must be >= 0")
+    }
+    return int_and(n + 4095, int_not(4095))
+}
+
+# The number of whole 4-KiB pages needed to hold `bytes` bytes
+# (ceiling division). Negative byte counts are rejected.
+fn stack_pages_for(bytes: int) -> int {
+    if bytes < 0 {
+        panic("stack_pages_for: byte count must be >= 0")
+    }
+    return(bytes + 4095) / 4096
+}
+
+# ---------------------------------------------------------------------------
+# StackFault — the probe verdict, as data
+# ---------------------------------------------------------------------------
+#   None      — the write is legal
+#   GuardPage — the write lands on the guard (the overflow itself)
+#   BadOffset — the offset is nonsense (non-positive or unmapped)
+# Declared first: the probe functions below classify into it.
+enum StackFault {
+    None,
+    GuardPage,
+    BadOffset
+}
+
+# The stable name of a fault, for serial logs.
+fn stack_fault_name(f: StackFault) -> str {
+    return match f {
+        StackFault.None => "none",
+        StackFault.GuardPage => "guard-page",
+        StackFault.BadOffset => "bad-offset"
+    }
+}
+
+# The stable code of a fault (matches the declaration order: None = 0,
+# GuardPage = 1, BadOffset = 2) — enums are matched, not compared, so
+# tests and logs pass codes around as compact ints.
+fn stack_fault_code(f: StackFault) -> int {
+    return match f {
+        StackFault.None => 0,
+        StackFault.GuardPage => 1,
+        StackFault.BadOffset => 2
+    }
+}
+
+# ---------------------------------------------------------------------------
+# StackConfig — the memory picture of one task stack
+# ---------------------------------------------------------------------------
+#   top          the highest usable address (the initial SP; the
+#                first push lives just below it)
+#   size         usable stack bytes, page-aligned
+#   guard_pages  guard pages BELOW the usable region; each is mapped
+#                fault-on-access, so the first overflowing write
+#                traps instead of corrupting its neighbor
+#
+# Layout (addresses grow up in the picture, the stack grows down):
+#
+#   top                    <- initial SP
+#   top - size             <- stack bottom (last usable byte below this)
+#   top - size - guard*4K  <- guard base (lowest mapped address)
+#
+# Everything at or below the guard base is simply not mapped.
+struct StackConfig {
+    top: int,
+    size: int,
+    guard_pages: int
+}
+
+# Constructs a validated config: the size must be positive and
+# page-aligned (a partial page at the bottom would leave guard
+# coverage ambiguous), at least one guard page must protect the
+# region (a stack without a guard is just corruption waiting for a
+# scheduling quirk), and `top` must be page-aligned and high enough
+# to hold the whole footprint above address 0.
+fn stack_config_new(size: int, guard_pages: int, top: int) -> StackConfig {
+    if size <= 0 {
+        panic("stack_config_new: size must be >= 1")
+    }
+    if stack_page_align(size) != size {
+        panic("stack_config_new: size must be page-aligned")
+    }
+    if guard_pages < 1 {
+        panic("stack_config_new: guard_pages must be >= 1")
+    }
+    if stack_page_align(top) != top {
+        panic("stack_config_new: top must be page-aligned")
+    }
+    if stack_total_footprint_size(size, guard_pages) > top {
+        panic("stack_config_new: top too low for the requested footprint")
+    }
+    return StackConfig {
+        top: top, size: size, guard_pages: guard_pages
+    }
+}
+
+# The usable byte count (the size as declared; mirror accessor so
+# generic code can treat the config abstractly).
+fn stack_usable_bytes(cfg: StackConfig) -> int {
+    return cfg.size
+}
+
+# The guard region size in bytes.
+fn stack_guard_bytes(cfg: StackConfig) -> int {
+    return cfg.guard_pages * stack_page_size()
+}
+
+# The whole footprint: usable region + guard region. (The two-arg
+# form is shared with the constructor, which validates before any
+# StackConfig exists.)
+fn stack_total_footprint_size(size: int, guard_pages: int) -> int {
+    return size + guard_pages * stack_page_size()
+}
+
+fn stack_total_footprint(cfg: StackConfig) -> int {
+    return stack_total_footprint_size(cfg.size, cfg.guard_pages)
+}
+
+# The lowest usable address (the last byte the stack may still
+# legally touch is `stack_bottom(cfg) - 1`... growing down, the
+# bottom of the USABLE region).
+fn stack_bottom(cfg: StackConfig) -> int {
+    return cfg.top - cfg.size
+}
+
+# The lowest mapped address — the bottom guard page's base. Every
+# address below this is unmapped by construction.
+fn stack_guard_base(cfg: StackConfig) -> int {
+    return cfg.top - cfg.size - stack_guard_bytes(cfg)
+}
+
+# ---------------------------------------------------------------------------
+# Offsets and probes — the overflow model
+# ---------------------------------------------------------------------------
+# A stack write lives at `top - offset` for a positive offset. The
+# probe functions classify the offset exactly like the MMU would
+# classify the address, then either return it or panic.
+
+# True iff a write at `offset` bytes below `top` stays inside the
+# usable region (offset >= 1: offset 0 would be one past the top).
+fn stack_offset_valid(cfg: StackConfig, offset: int) -> bool {
+    return offset >= 1 && offset <= cfg.size
+}
+
+# Classifies an offset without running anything:
+#   StackFault.None      — inside the usable region
+#   StackFault.GuardPage — past the usable region, inside the guard
+#   StackFault.BadOffset — nonsense input (<= 0 or beyond the guard)
+fn stack_classify_offset(cfg: StackConfig, offset: int) -> StackFault {
+    if stack_offset_valid(cfg, offset) {
+        return StackFault.None
+    }
+    if offset > cfg.size && offset <= cfg.size + stack_guard_bytes(cfg) {
+        return StackFault.GuardPage
+    }
+    return StackFault.BadOffset
+}
+
+# The address a write at `offset` touches. Valid offsets return the
+# address; anything else panics with the guard-page message a fault
+# handler would print — the software twin of the page fault.
+fn stack_probe(cfg: StackConfig, offset: int) -> int {
+    let fault: StackFault = stack_classify_offset(cfg, offset)
+    return match fault {
+        StackFault.None => cfg.top - offset,
+        StackFault.GuardPage => panic("stack overflow: guard page hit at offset " + offset.to_str()),
+        StackFault.BadOffset => panic("stack_probe: offset out of range")
+    }
+}
+
+# The non-panicking probe: the address if the write is legal, -1 if
+# it would fault (a fault handler cannot "return the address", but
+# a canary-checking loop can).
+fn stack_try_probe(cfg: StackConfig, offset: int) -> int {
+    if !stack_offset_valid(cfg, offset) {
+        return -1
+    }
+    return cfg.top - offset
+}
+
+# How many usable bytes remain below `offset`. Negative results
+# cannot exist — an offset past the size is an overflow, and this
+# function refuses to pretend otherwise.
+fn stack_remaining(cfg: StackConfig, offset: int) -> int {
+    if offset > cfg.size {
+        panic("stack_remaining: offset past the usable region")
+    }
+    return cfg.size - offset
+}
+
+# The overflow predicate: true iff `used` bytes of stack would trip
+# the guard (the cheap check a high-water mark compares against).
+fn stack_has_overflow(cfg: StackConfig, used: int) -> bool {
+    return used > cfg.size
+}
+
+# ---------------------------------------------------------------------------
+# Frame cost + planning — the deterministic size
+# ---------------------------------------------------------------------------
+# The frame cost model, mirrored from the compilers' estimator (the
+# same constants the `#[stack_size(N)]` check uses): 32 bytes of
+# base overhead (saved RBP / RBX / alignment), 8 bytes per local
+# slot, 16 bytes per call site (caller-saved spills + return
+# address). `locals_bytes` counts local slots; `params` adds one
+# owned copy each; `call_sites` counts nested calls in the body.
+fn stack_frame_cost(locals_bytes: int, params: int, call_sites: int) -> int {
+    if locals_bytes < 0 || params < 0 || call_sites < 0 {
+        panic("stack_frame_cost: negative component")
+    }
+    return 32 + locals_bytes + 8 * params + 16 * call_sites
+}
+
+# The chain cost: `depth` calls deep, each frame `frame` bytes.
+fn stack_chain_bytes(frame: int, depth: int) -> int {
+    if frame < 0 || depth < 0 {
+        panic("stack_chain_bytes: negative component")
+    }
+    return frame * depth
+}
+
+# How many frames of `frame` bytes fit in `size` usable bytes (the
+# recursion budget a config supports). A zero frame fits nothing.
+fn stack_max_depth(size: int, frame: int) -> int {
+    if frame <= 0 {
+        panic("stack_max_depth: frame must be >= 1")
+    }
+    return size / frame
+}
+
+# True iff a worst-case chain fits the usable region with the guard
+# untouched. This is the runtime-side twin of the checker's
+# `#![stack_size(N)]` proof.
+fn stack_chain_fits(size: int, frame: int, depth: int) -> bool {
+    return stack_chain_bytes(frame, depth) <= size
+}
+
+# Plans a config from the workload: one page of slack above the
+# worst chain (interrupt frames, ABI padding), rounded up to whole
+# pages, plus the requested guard. The result is deterministic: the
+# same workload always yields the same stack.
+fn stack_plan_new(worst_frame: int, max_depth: int, guard_pages: int, top: int) -> StackConfig {
+    if worst_frame <= 0 {
+        panic("stack_plan_new: worst_frame must be >= 1")
+    }
+    if max_depth < 0 {
+        panic("stack_plan_new: max_depth must be >= 0")
+    }
+    let chain: int = stack_chain_bytes(worst_frame, max_depth)
+    let need: int = stack_page_align_up(chain + stack_page_size())
+    return stack_config_new(need, guard_pages, top)
+}
+
+# ---------------------------------------------------------------------------
+# Canary — the post-hoc overflow detector
+# ---------------------------------------------------------------------------
+# The fill value a kernel paints below its high-water mark (the
+# classic stack-smashing canary pattern): a write that ran past the
+# mark disturbs the paint, and the check catches it before the
+# corrupted value matters. 0x5A5A5A5A5A5A5A5A — alternating bits, so
+# single-bit drift and zero-writes both stand out.
+fn stack_canary_value() -> int {
+    return 6510615555426900570
+}
+
+# True iff the painted slot survived (the canary is intact).
+fn stack_canary_ok(slot: int) -> bool {
+    return slot == stack_canary_value()
+}
