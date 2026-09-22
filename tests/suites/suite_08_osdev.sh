@@ -253,3 +253,74 @@ else
     bad "mem: make mem-acceptance failed"
     tail -15 "$TMP/mem_acc80.log"
 fi
+
+echo "=== 18. Stage 81: core.panic + #[panic_handler] ==="
+# Stage 81 (v0.100.0-alpha): the kernel panic strategy — PanicInfo /
+# PanicAction / PanicLog in `core.panic` plus the single overridable
+# `#[panic_handler] fn panic_handler(msg: str) -> void`, invoked once
+# per panic (reentrancy-guarded) before the default action. Pure HLS,
+# `no_std`-clean; importable from `#![freestanding]` identically.
+PANIC_F=tests/ok/feat_stage81_panic.hls
+# (a) the panic ok-test checks + runs on the interpreter (exit 0 —
+#     the effect-free handler is wired but never fires here).
+panic_interp_out=$(python3 boot/boot.py "$PANIC_F" </dev/null 2>/dev/null); panic_interp_code=$?
+if [ "$panic_interp_code" -eq 0 ]; then
+    ok "panic: feat_stage81_panic runs on the interpreter (exit 0)"
+else
+    bad "panic: feat_stage81_panic interpreter exit=$panic_interp_code"
+fi
+# (b) the panic module resolves through the `core.` prefix.
+if [ -f "core/panic.hls" ]; then
+    ok "panic: core/panic.hls present"
+else
+    bad "panic: core/panic.hls missing"
+fi
+# (c) the hosted demo panics with the handler marker first (exit 101).
+panic_demo_out=$(python3 boot/boot.py examples/panic_demo.hls </dev/null 2>/dev/null); panic_demo_code=$?
+panic_demo_err=$(python3 boot/boot.py examples/panic_demo.hls </dev/null 2>&1 >/dev/null)
+if [ "$panic_demo_code" -eq 101 ] && echo "$panic_demo_out" | grep -q "kernel panic: demo fault"; then
+    ok "panic: examples/panic_demo.hls handler fires, exit 101"
+else
+    bad "panic: examples/panic_demo.hls exit=$panic_demo_code (want 101 + marker)"
+fi
+if echo "$panic_demo_err" | grep -q "panic: demo fault"; then
+    ok "panic: default report still runs after the handler"
+else
+    bad "panic: default report missing after the handler"
+fi
+# (d) the same ok-test with #![freestanding] instead of #![no_std]
+#     links -nostdlib and exits with the same code (0).
+panic_fs_src=$(mktemp --suffix=.hls)
+python3 - "$PANIC_F" "$panic_fs_src" <<'PY'
+import sys
+src = open(sys.argv[1], encoding='utf-8').read()
+src = src.replace('\n#![no_std]\n', '\n#![freestanding]\n', 1)
+open(sys.argv[2], 'w', encoding='utf-8', newline='\n').write(src)
+PY
+if python3 boot/boot.py src/hlc.hls "$panic_fs_src" "$TMP/panic_fs.c" >/dev/null 2>&1 \
+        && gcc -O2 -ffreestanding -nostdlib -ffunction-sections \
+               -fno-stack-protector -Wl,--gc-sections \
+               -o "$TMP/panic_fs.bin" "$TMP/panic_fs.c" 2>"$TMP/panic_fs.gcc"; then
+    panic_fs_nat=$("$TMP/panic_fs.bin" </dev/null 2>/dev/null; echo $?)
+    if [ "$panic_fs_nat" == "$panic_interp_code" ]; then
+        ok "panic: freestanding -nostdlib binary exit ($panic_fs_nat) == interpreter"
+    else
+        bad "panic: freestanding binary exit=$panic_fs_nat, interp=$panic_interp_code"
+    fi
+else
+    bad "panic: freestanding -nostdlib link failed"
+    head -5 "$TMP/panic_fs.gcc"
+fi
+rm -f "$panic_fs_src"
+# (e) make panic-acceptance runs end-to-end (7 sections).
+if make panic-acceptance >"$TMP/panic_acc81.log" 2>&1; then
+    if grep -q "ACCEPTANCE OK: Stage 81" "$TMP/panic_acc81.log"; then
+        ok "panic: make panic-acceptance runs end-to-end"
+    else
+        bad "panic: make panic-acceptance did not print ACCEPTANCE OK"
+        tail -5 "$TMP/panic_acc81.log"
+    fi
+else
+    bad "panic: make panic-acceptance failed"
+    tail -15 "$TMP/panic_acc81.log"
+fi
