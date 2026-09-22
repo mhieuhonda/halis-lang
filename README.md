@@ -87,15 +87,15 @@ Seven core guarantees of v0.35.0-alpha:
   src/hlc.hls ──► boot/ (Stage-0, seed) ──► hlc.c (pass 1)       │
   (compiler in         used ONLY ONCE to        │                │
    HLS, ~3000 lines)   bootstrap the cycle      ▼                │
-                                           gcc -O2                │
-                                                │                  │
-                                                ▼                  │
-                                        bin/hlc  (native) ───────┤
-                                                │  recompiles self │
-                                                ▼                  │
-                                        hlc.c (pass 2)             │
-                                                │                  │
-                                 diff pass 1 vs pass 2 = 0 bytes ─┘
+                                            gcc -O2                │
+                                                 │                  │
+                                                 ▼                  │
+                                         bin/hlc  (native) ───────┤
+                                                 │  recompiles self │
+                                                 ▼                  │
+                                         hlc.c (pass 2)             │
+                                                 │                  │
+                                  diff pass 1 vs pass 2 = 0 bytes ─┘
 ```
 
 `make bootstrap` performs the entire chain above and confirms the
@@ -337,6 +337,8 @@ Full details: [SPEC.md](SPEC.md) · Stage-by-stage roadmap:
 [ROADMAP.md](ROADMAP.md).
 
 ## Status
+
+**v0.100.0-alpha — Stage 81: core.panic + #[panic_handler] — kernel panic strategy.** Continues **Phase VI (OS-development foundation, Stages 77-96)**. Ships `core/panic.hls` — 16 pure functions, 2 structs (`PanicInfo`, `PanicLog`), 1 enum (`PanicAction`), zero imports, `no_std`-clean and importable from `#![freestanding]` identically — plus the `#[panic_handler]` function attribute: exactly one `fn panic_handler(msg: str) -> void` per program runs once per panic (reentrancy-guarded, receives a copy) before the default action (hosted: report + exit 101; freestanding: trap), with `exit()` propagation for handler-chosen halt codes and an explicit `--lto` root for the hook-only call edge. `examples/panic_demo.hls` prints the handler marker before the default report (exit 101). Acceptance: `make panic-acceptance` (7 sections, 60+ assertions).
 
 **v0.99.0-alpha — Stage 80: core.mem — physical-page allocator + page tables.** Continues **Phase VI (OS-development foundation, Stages 77-96)**. Ships `core/mem.hls` — 95 pure functions (imports only `core.option` + `core.result`, `no_std`-clean, importable from `#![freestanding]` identically) covering both structures every kernel needs before its first virtual mapping: the `FrameAlloc` bitmap allocator over a physical region (first-fit frames, contiguous runs, 2-MiB-address-aligned huge frames, double-free + out-of-range detection, firmware reservations, peak/allocations/frees accounting) and the x86-64 4-level page-table model with the real PTE format (flags bits 0..8, address bits 12..51, NX bit 63 = INT64_MIN), canonical-form validation (`vaddr_is_canonical`), and the `PageTable`/`AddressSpace` pair whose table pool stands in for the kernel direct map. `space_map`/`space_map_huge` walk-and-create intermediate tables on demand, bill their frames to the FrameAlloc, and are ATOMIC on failure (two-pass: validate + exact table count, then install). `space_translate`, `space_unmap`/`space_unmap_huge`, `space_protect` (W^X re-flagging), `mem_identity_map` + `mem_map_bytes` complete the boot surface. `examples/mem_demo.hls` is a no_std early-boot story that exits 0 on hosted, `-nostdlib` and interpreter runs. Acceptance: `make mem-acceptance` (8 sections, 60+ assertions).
 
