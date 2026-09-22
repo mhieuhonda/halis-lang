@@ -1,0 +1,218 @@
+# ============================================================================
+# core/panic.hls — kernel panic policy for freestanding code (Stage 81)
+# ----------------------------------------------------------------------------
+# Pure HLS, no `uses`, no imports (freestanding-safe: the module only
+# uses the core language — structs, enums, lists, strings and the
+# `panic` builtin — so it is importable from `#![no_std]` and
+# `#![freestanding]` crates identically, like the rest of `core.*`).
+#
+# This module is the LIBRARY half of Stage 81. The LANGUAGE half is
+# the `#[panic_handler]` function attribute (see SPEC section 35):
+# exactly one top-level `fn panic_handler(msg: str) -> void` per
+# program is invoked once per panic, behind a reentrancy guard, before
+# the default action (hosted: report + exit 101; freestanding: trap).
+#
+# What lives here:
+#   PanicInfo   — the (message, file, line) triple a kernel threads
+#                 through its own fault paths, plus `panic_format`
+#                 which renders the familiar "msg (at file:line)" form.
+#   PanicAction — the halt policy (Trap / Exit / Reboot) with stable
+#                 names and exit codes for the `_start` epilogue.
+#   PanicLog    — a bounded in-memory ring (no allocation beyond its
+#                 capacity) that an effect-free handler uses to record
+#                 the fault before the CPU traps: the post-mortem
+#                 buffer a kernel dumps on the next boot.
+#   panic_check — the invariant helper (`if !cond { panic(msg) }`).
+#
+# ON ALLOCATION: every helper here allocates only through its inputs
+# (string concatenation, list push). A `#[panic_handler]` that runs
+# while the allocator itself is broken (OOM inside `hl_die`) is
+# protected by the runtime's reentrancy guard — the nested panic
+# falls straight through to the default action instead of recursing.
+# Handlers SHOULD still avoid allocating: prefer `panic_log_push`
+# into a pre-sized log over formatting new strings.
+# ============================================================================
+
+# ---------------------------------------------------------------------------
+# PanicInfo — where the fault came from
+# ---------------------------------------------------------------------------
+# A panic report is a message plus an optional source location. The
+# location is optional because runtime faults (overflow, OOB) carry
+# one while logical faults (`panic("unreachable")`) often do not:
+# an empty `file` (or a non-positive `line`) means "no location".
+struct PanicInfo {
+    message: str,
+    file: str,
+    line: int
+}
+
+# Builds a report. A negative line has no aligned form (like
+# `mem_page_align_up` on a negative size) and is rejected; the
+# message and file may be any string, including empty.
+fn panic_info_new(message: str, file: str, line: int) -> PanicInfo {
+    if line < 0 {
+        panic("panic_info_new: line must be >= 0")
+    }
+    return PanicInfo {
+        message: message, file: file, line: line
+    }
+}
+
+# Accessors (field reads are inlined by the backend; these exist so
+# generic code can treat the report abstractly).
+fn panic_info_msg(info: PanicInfo) -> str {
+    return info.message
+}
+
+fn panic_info_file(info: PanicInfo) -> str {
+    return info.file
+}
+
+fn panic_info_line(info: PanicInfo) -> int {
+    return info.line
+}
+
+# True iff the report carries a usable location (non-empty file AND
+# positive line). The runtime's default report prints the location
+# exactly when this holds.
+fn panic_info_has_location(info: PanicInfo) -> bool {
+    return info.file != "" && info.line > 0
+}
+
+# Renders the report in the runtime's format: "msg (at file:line)"
+# with a location, otherwise the bare message. Pure string
+# concatenation — no effects, safe inside a handler.
+fn panic_format(info: PanicInfo) -> str {
+    if !panic_info_has_location(info) {
+        return info.message
+    }
+    return info.message + " (at " + info.file + ":" + info.line.to_str() + ")"
+}
+
+# ---------------------------------------------------------------------------
+# PanicAction — what the kernel does after the handler returns
+# ---------------------------------------------------------------------------
+#   Trap:  halt the CPU (freestanding default: `__builtin_trap`).
+#   Exit:  leave through the normal exit path with the panic code.
+#   Reboot: reset the machine (a port writes the reset register;
+#          hosted kernels emulate it by exiting 0 so a supervisor
+#          restarts them).
+enum PanicAction {
+    Trap,
+    Exit,
+    Reboot
+}
+
+# The stable name of an action (matches the declaration order, so a
+# serial log can render the index as a compact identifier).
+fn panic_action_name(a: PanicAction) -> str {
+    return match a {
+        PanicAction.Trap => "trap",
+        PanicAction.Exit => "exit",
+        PanicAction.Reboot => "reboot"
+    }
+}
+
+# The process exit code an action maps to on hosted targets. Trap
+# and Exit both surface as 101 (the panic code, shared with the
+# runtime's default path); Reboot surfaces as 0 so a supervisor
+# loop restarts the image instead of paging an operator.
+fn panic_action_code(a: PanicAction) -> int {
+    return match a {
+        PanicAction.Trap => 101,
+        PanicAction.Exit => 101,
+        PanicAction.Reboot => 0
+    }
+}
+
+# The runtime's default halt code (hosted `exit(101)`). Kernels that
+# emulate the hosted report on serial compare against this.
+fn panic_default_code() -> int {
+    return 101
+}
+
+# ---------------------------------------------------------------------------
+# PanicLog — the post-mortem ring a handler writes before the trap
+# ---------------------------------------------------------------------------
+# A bounded log of recent panic messages. `capacity` is fixed at
+# construction; pushing past it evicts the oldest entry (FIFO) and
+# counts the loss in `dropped`, so a reader can tell the log is
+# truncated. The eviction rebuilds the backing list in place — no
+# hidden allocator involvement beyond the list itself.
+struct PanicLog {
+    entries: list[str],
+    capacity: int,
+    dropped: int
+}
+
+# Constructs an empty log holding at most `capacity` entries. A
+# non-positive capacity cannot hold anything and is rejected loudly
+# (a silently empty log would swallow the very fault it must keep).
+fn panic_log_new(capacity: int) -> PanicLog {
+    if capacity <= 0 {
+        panic("panic_log_new: capacity must be >= 1")
+    }
+    return PanicLog {
+        entries: [], capacity: capacity, dropped: 0
+    }
+}
+
+# Records `entry`. While the log has room the entry is appended;
+# once full the oldest entry is evicted first and `dropped` counts
+# it. Eviction is a single left-shift rebuild (capacity-bounded, so
+# the work is O(capacity), never O(history)).
+fn panic_log_push(log: PanicLog, entry: str) -> void {
+    if log.entries.len() < log.capacity {
+        log.entries.push(entry)
+    } else {
+        let fresh: list[str] = []
+        let mut i: int = 1
+        while i < log.entries.len() {
+            fresh.push(log.entries.get(i))
+            i = i + 1
+        }
+        fresh.push(entry)
+        log.entries = fresh
+        log.dropped = log.dropped + 1
+    }
+}
+
+# How many entries are currently retained (<= capacity, always).
+fn panic_log_len(log: PanicLog) -> int {
+    return log.entries.len()
+}
+
+# How many entries were evicted so far (0 means nothing was lost).
+fn panic_log_dropped(log: PanicLog) -> int {
+    return log.dropped
+}
+
+# Reads entry `i` (0 = oldest retained). Out-of-range reads panic —
+# a post-mortem reader that walks past the end is itself buggy, and
+# the log must say so instead of returning a forged message.
+fn panic_log_get(log: PanicLog, i: int) -> str {
+    if i < 0 || i >= log.entries.len() {
+        panic("panic_log_get: index out of range")
+    }
+    return log.entries.get(i)
+}
+
+# Empties the log after the supervisor has drained it. The capacity
+# is kept (the next boot cycle reuses the same buffer); the drop
+# counter is cleared with the entries (a fresh cycle, a fresh count).
+fn panic_log_clear(log: PanicLog) -> void {
+    log.entries = []
+    log.dropped = 0
+}
+
+# ---------------------------------------------------------------------------
+# panic_check — the invariant helper
+# ---------------------------------------------------------------------------
+# Halts with `msg` unless `cond` holds. Kernels sprinkle these over
+# unchecked assumptions (page-table flags, handler preconditions);
+# the message should name the invariant, not just the failure.
+fn panic_check(cond: bool, msg: str) -> void {
+    if !cond {
+        panic(msg)
+    }
+}
