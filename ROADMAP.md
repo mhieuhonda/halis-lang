@@ -136,7 +136,7 @@ remains green.
 | 78 | `#![no_std]` core-only stdlib subset | ✅ | (done in v0.97.0-alpha) |
 | 79 | `core.alloc` — pluggable allocator trait | ✅ | (done in v0.98.0-alpha) |
 | 80 | `core.mem` — physical-page allocator, page tables | ✅ | (done in v0.99.0-alpha) |
-| 81 | Panic-handler override (kernel panic strategy) | ⬜ | 3 weeks |
+| 81 | Panic-handler override (kernel panic strategy) | ✅ | (done in v0.100.0-alpha) |
 | 82 | Stack-overflow guard page + deterministic stack size | ⬜ | 3 weeks |
 | 83 | Inline-asm register constraints (clobber, input, output) | ⬜ | 5 weeks |
 | 84 | Linker-script integration (`link.ld`) + custom sections | ⬜ | 4 weeks |
@@ -236,9 +236,6 @@ remains green.
 > communicated to the world is the maintainer's separate concern.
 
 Estimated total duration: ~36–48 months (small team of 2–4 full-time).
-
----
-
 
 ---
 
