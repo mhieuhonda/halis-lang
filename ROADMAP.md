@@ -239,6 +239,8 @@ Estimated total duration: ~36–48 months (small team of 2–4 full-time).
 
 ---
 
+---
+
 ## Per-stage completion details
 
 This roadmap tracks **what is planned and its status** (tables above).
