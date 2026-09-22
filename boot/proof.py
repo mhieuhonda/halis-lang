@@ -651,9 +651,13 @@ def _collect_len_mutators(e, out):
         _collect_len_mutators(a, out)
     for it in (e.get("items") or []):
         _collect_len_mutators(it, out)
-    for fld in (e.get("fields") or []):
-        if isinstance(fld, dict):
-            _collect_len_mutators(fld.get("value"), out)
+    # Deep-scan-30 fix: struct-literal fields are (name, expr) tuples
+    # (parser.py parse_struct_lit) — the old isinstance(fld, dict)
+    # test never matched, so a pop()/push() nested inside a struct
+    # field value left a stale minlen fact alive (unsound under -O
+    # fast: a bounds check on the shrunk list could be elided).
+    for _fname, fe in (e.get("fields") or []):
+        _collect_len_mutators(fe, out)
     for arm in (e.get("arms") or []):
         if isinstance(arm, dict):
             _collect_len_mutators(arm.get("body") if not isinstance(arm.get("body"), list) else None, out)
@@ -1000,7 +1004,13 @@ def _assigned_int_vars(stmts, acc=None, depth=0):
             continue
         k = s.get("k")
         if k == "let":
-            if s.get("vtype") == "int":
+            # Deep-scan-30 fix: a `let` node carries its declared type
+            # under "t" (parser.py) — "vtype" only exists on `for` nodes,
+            # so let-bound int variables were never collected here. They
+            # are currently unreachable as loop-carried facts (no
+            # shadowing), but keeping the key honest protects the set if
+            # shadowing ever lands.
+            if s.get("t") == "int":
                 acc.add(s.get("name"))
         elif k == "assign":
             tgt = s.get("target")

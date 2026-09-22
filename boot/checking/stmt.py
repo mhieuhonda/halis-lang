@@ -384,28 +384,43 @@ class CheckerStmt(object):
                 # HLS error (otherwise the malformed constraint silently
                 # reaches GCC, which produces an opaque C compile error
                 # with no source-line attribution).
-                cl = c.lower() if isinstance(c, str) else c
-                # GCC single-letter constraint letters we accept.
+                #
+                # Deep-scan-30 fix: validate case-SENSITIVELY and with the
+                # same allowlist as the self-hosted checker
+                # (src/hlc/check_expr.hls is_known_asm_constraint). The
+                # boot checker used to lowercase the constraint first,
+                # which (a) rejected valid uppercase constraints like
+                # "S"/"D" that its own error message advertised, and
+                # (b) diverged from the native checker — a program
+                # accepted by `hlc` was rejected by the boot interpreter
+                # (and vice versa was impossible, but parity broke
+                # differential testing). GCC constraint letters ARE case
+                # sensitive: "S" (memory operand) and "s" (immediate)
+                # are different constraints.
+                # GCC single-letter constraint letters we accept (the
+                # full self-hosted set).
                 known_single = ("a", "b", "c", "d", "D", "S", "q", "r",
-                                 "f", "t", "u", "y", "x", "A", "Q", "R")
+                                 "f", "t", "u", "y", "x", "A", "Q", "R",
+                                 "m", "i", "n", "F", "I", "J", "K",
+                                 "L", "M", "N", "O", "P",
+                                 "g", "X", "p", "v", "z")
                 # x86-64 register names we accept (the codegen translates
                 # these to GCC constraint letters; see translate_asm_constraint).
                 known_reg = ("eax", "rax", "ebx", "rbx", "ecx", "rcx",
                              "edx", "rdx", "esi", "rsi", "edi", "rdi",
                              "al", "bl", "cl", "dl", "ah", "bh", "ch", "dh",
                              "ax", "bx", "cx", "dx", "si", "di", "bp", "sp",
-                             "rax", "rbx", "rcx", "rdx", "rsi", "rdi",
                              "rbp", "rsp", "r8", "r9", "r10", "r11",
                              "r12", "r13", "r14", "r15")
                 # If the user already prefixed the constraint with `=` or
                 # `+` (e.g. `out("=r") x`), validate the BODY (after the
                 # prefix). The codegen has special-case logic to skip
                 # re-adding the prefix when one is already present.
-                body = cl
+                body = c if isinstance(c, str) else ""
                 prefix = ""
                 if isinstance(c, str) and len(c) >= 1 and c[0] in ("=", "+"):
                     prefix = c[0]
-                    body = c[1:].lower()
+                    body = c[1:]
                     # `&` is the late-clobber marker; strip it for the
                     # body check.
                     if len(body) >= 1 and body[0] == "&":

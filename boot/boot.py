@@ -168,7 +168,12 @@ def load_program(entry_path):
         load_order.append(abs_path)
         return program
 
-    entry_abs = os.path.abspath(entry_path)
+    # Deep-scan-30 fix: canonicalise the entry path with realpath to
+    # match load_file() (BUG-DS4-28) — the entry file reached through a
+    # symlink otherwise ends up in `loaded` under its REAL path while
+    # entry_abs keeps the symlink path, so the abs_path != entry_abs
+    # check below falsely rejected the program's own crate attributes.
+    entry_abs = os.path.realpath(os.path.abspath(entry_path))
     load_file(entry_abs)
 
     # Merge all loaded programs into one. Earlier-loaded files (dependencies)
@@ -540,11 +545,14 @@ def print_fast_report(program, checker):
         # field values and a match scrutinee — walk() skipped them, so
         # the report undercounted the proven-dead checks (the native
         # -O fast build elides all of them; the report must match).
+        # Deep-scan-30 fix: struct-literal fields are (name, expr)
+        # tuples (parser.py parse_struct_lit), not dicts — the old
+        # isinstance(fld, dict) test never matched, so field values
+        # were still skipped.
         for it in (e.get("items") or []):
             walk(it)
-        for fld in (e.get("fields") or []):
-            if isinstance(fld, dict):
-                walk(fld.get("value"))
+        for _fname, fe in (e.get("fields") or []):
+            walk(fe)
         if e.get("scrut") is not None:
             walk(e.get("scrut"))
         if e.get("k") == "method":
@@ -554,6 +562,11 @@ def print_fast_report(program, checker):
             walk(e.get("idx"))
         if e.get("k") == "field":
             walk(e.get("target"))
+        # Deep-scan-30 fix: asm! operands carry checked expressions
+        # (out/inout lvalues) that propagate_stmt_exprs may annotate.
+        for op in (e.get("operands") or []):
+            if isinstance(op, dict):
+                walk(op.get("expr"))
         for arm in (e.get("arms") or []):
             walk(arm.get("body"))
 
@@ -566,6 +579,11 @@ def print_fast_report(program, checker):
             tgt = s.get("target")
             if isinstance(tgt, dict):
                 walk(tgt.get("idx"))
+            # Deep-scan-30 fix: asm! statements hold their checked
+            # operand expressions under "operands".
+            for op in (s.get("operands") or []):
+                if isinstance(op, dict):
+                    walk(op.get("expr"))
             for bkey in ("body", "then", "els"):
                 walk_stmts(s.get(bkey))
 

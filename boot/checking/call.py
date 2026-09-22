@@ -165,6 +165,20 @@ class CheckerCall(object):
         self.err("function does not exist: %s" % name, e)
 
     def check_builtin_call(self, name, e, env, expected):
+        # Deep-scan-30 fix: the spawn-family builtins (spawn, async_spawn,
+        # gen_spawn, stream_map_int, stream_filter_int, stream_fold_int,
+        # stream_flat_map_int) REWRITE their call node on the first check
+        # pass — the function-name argument is dropped from e["args"] and
+        # the target is recorded in e["spawn_fn"]. The loop fixpoint
+        # re-analysis (deep-scan-28) may re-check the same AST node; re-
+        # running the full validation on a rewritten node would reject a
+        # valid program (argument 1 is no longer an identifier). Re-check
+        # only the remaining user arguments — keeps the move-state
+        # fixpoint sound — and return the cached type.
+        if "spawn_fn" in e:
+            for _a in e["args"]:
+                self.check_expr(_a, env, None)
+            return e["spawn_ret"]
         args = e["args"]
 
         def need(n):
@@ -949,7 +963,8 @@ class CheckerCall(object):
             # function name as a value.
             e["args"] = vargs
             e["spawn_fn"] = fname
-            return "Task[%s]" % tfn["ret"]
+            e["spawn_ret"] = "Task[%s]" % tfn["ret"]
+            return e["spawn_ret"]
         # select(chs: list[Chan[T]]) -> int — blocks until at least one
         # channel in the list has a pending message; returns the index of
         # the first ready channel (list order).
@@ -1039,7 +1054,8 @@ class CheckerCall(object):
             # the async_spawn codegen path.
             e["args"] = vargs
             e["spawn_fn"] = fname
-            return "Future[%s]" % tfn["ret"]
+            e["spawn_ret"] = "Future[%s]" % tfn["ret"]
+            return e["spawn_ret"]
         # await(fut: Future[T]) -> T — block until the future is ready,
         # return its value. The argument must be a Future[T].
         if name == "await":
@@ -1246,6 +1262,7 @@ class CheckerCall(object):
             # Rewrite: drop the fn-name argument, record the target.
             e["args"] = [args[0]]
             e["spawn_fn"] = fname
+            e["spawn_ret"] = expected
             return expected
         # stream_take_int(in_s: Stream[int], n: int) -> Stream[int] —
         # take the first n values, then signal end-of-stream.
@@ -1304,6 +1321,7 @@ class CheckerCall(object):
             # Rewrite: drop the fn-name argument, record the target.
             e["args"] = [args[0], args[1]]
             e["spawn_fn"] = fname
+            e["spawn_ret"] = "int"
             return "int"
         # stream_merge_int(a: Stream[int], b: Stream[int]) -> Stream[int] —
         # interleave two int streams into one.
@@ -1364,6 +1382,7 @@ class CheckerCall(object):
             # Rewrite: drop the fn-name argument, record the target.
             e["args"] = [args[0]]
             e["spawn_fn"] = fname
+            e["spawn_ret"] = expected
             return expected
         # gen_spawn(f, args...) -> Stream[T] — like async_spawn, but for
         # streams. The target function must take a Stream[T] as its FIRST
@@ -1437,6 +1456,7 @@ class CheckerCall(object):
             # created stream to the remaining args.
             e["args"] = vargs
             e["spawn_fn"] = fname
+            e["spawn_ret"] = expected
             return expected
         self.err("unknown builtin function: %s" % name, e)
 
