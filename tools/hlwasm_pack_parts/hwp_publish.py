@@ -18,7 +18,12 @@ from typing import Any, Dict, Optional
 
 from hwp_common import log_info, log_warn
 
-_REGISTRY_RE = re.compile(r"^https?://[^/\s]+(/[^\\s]*)?$")
+# Deep-scan-30 fix: the old pattern was `[^\\s]` inside a raw string —
+# a character class of "anything but a backslash and the letter s", NOT
+# "anything but whitespace". Registry paths containing an 's' were
+# rejected (and URLs with a space accepted). `/\S*` is the intended
+# "optional /path" part.
+_REGISTRY_RE = re.compile(r"^https?://[^/\s]+(/\S*)?$")
 
 
 def validate_registry(registry: str) -> str:

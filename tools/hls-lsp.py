@@ -630,8 +630,10 @@ class HLSServer:
             # value. The lexer's `raw` is the EXACT source substring
             # the highlighter must use to compute the token's extent.
             if "raw" in t and isinstance(t["raw"], (str, bytes)):
-                tlen = len(t["raw"]) if isinstance(t["raw"], str) \
-                    else len(t["raw"])
+                # Deep-scan-30 fix: the old conditional had two
+                # identical branches (len(t["raw"]) both ways) —
+                # len() works on str and bytes alike.
+                tlen = len(t["raw"])
             elif isinstance(t["v"], bytes):
                 tlen = len(t["v"])
             else:

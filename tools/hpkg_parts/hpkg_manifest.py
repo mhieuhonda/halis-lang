@@ -318,9 +318,23 @@ def write_manifest(manifest: Dict, path: str):
     BUG (deep-scan-5): previously only [package]/[dependencies]/[effects]
     were written — `hls-pkg add` silently DELETED any other section the
     user had (e.g. [features]). Round-trip unknown sections too.
+
+    Deep-scan-30 fix (round-trip corruption): top-level scalar keys were
+    written AFTER every [section] block, so the TOML parser re-bound
+    them to the LAST section (`format = 2` at top level became
+    `[effects].format` after one parse -> write cycle). Scalars must be
+    emitted BEFORE the first section header.
     """
     known = ["package", "dependencies", "effects"]
     lines = []
+    # Top-level scalar keys first — after the first [section] header a
+    # bare key belongs to that section, not to the document root.
+    for k, v in manifest.items():
+        if isinstance(v, dict):
+            continue
+        lines.append('%s = %s' % (k, _fmt_value(v)))
+    if lines:
+        lines.append("")
     for section in known:
         if section in manifest:
             lines.append("[%s]" % section)
@@ -335,11 +349,6 @@ def write_manifest(manifest: Dict, path: str):
         for k, vv in v.items():
             lines.append('%s = %s' % (k, _fmt_value(vv)))
         lines.append("")
-    # Preserve top-level scalar keys.
-    for k, v in manifest.items():
-        if isinstance(v, dict):
-            continue
-        lines.append('%s = %s' % (k, _fmt_value(v)))
     with open(path, "w") as f:
         f.write("\n".join(lines))
 

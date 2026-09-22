@@ -158,8 +158,40 @@ def optimize(wasm_bytes: bytes, level: str = "O3",
     """
     if report is None:
         report = {}
-    mod = WasmModule.parse(wasm_bytes)
     before_size = len(wasm_bytes)
+    mod = WasmModule.parse(wasm_bytes)
+    # Deep-scan-30 fix: a module the model cannot fully round-trip
+    # (custom/table/element sections, imported tables, imported memories
+    # with real limits, imported non-immutable-i32 globals, non-i32/i64
+    # global init expressions, passive data segments) used to be silently
+    # CORRUPTED by parse -> passes -> serialize (the unmodeled sections
+    # were dropped; call_indirect targets vanished). Bypass the in-tree
+    # passes: the original bytes pass through unchanged, and the
+    # external Binaryen wasm-opt (which models the full spec) still gets
+    # a chance to optimize them.
+    if not mod.roundtrip_safe:
+        report["in_tree_bypassed"] = True
+        optimized = wasm_bytes
+        external_path = external_wasm_opt
+        if external_path is None:
+            external_path = shutil.which("wasm-opt")
+        if external_path and level in ("O2", "O3", "Os"):
+            external_out = _run_external_wasm_opt(external_path, wasm_bytes,
+                                                  level, report)
+            if external_out is not None:
+                optimized = external_out
+                report["external_wasm_opt_ran"] = True
+            else:
+                report["external_wasm_opt_ran"] = False
+        else:
+            report["external_wasm_opt_ran"] = False
+        report["input_size"] = before_size
+        report["output_size"] = len(optimized)
+        report["bytes_saved"] = before_size - len(optimized)
+        report["reduction_pct"] = round(
+            (before_size - len(optimized)) * 100.0 / before_size, 2) \
+            if before_size > 0 else 0.0
+        return optimized
 
     # O1: DCE + local compaction.
     opt_dce(mod, report)

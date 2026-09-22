@@ -508,6 +508,12 @@ class WasmEmitterRuntime(object):
         body.append(OP_I32_LOAD8_U); body.append(0x00); body += sleb(0)
         body.append(OP_LOCAL_TEE); body += uleb(5)
         # Range check: 0 <= byte - 0x30 < 10  →  push (byte >= '0') & (byte <= '9')
+        # Deep-scan-30 fix (silent wrong result): a NON-digit used to be
+        # silently skipped (the loop kept going and parsed the digits
+        # after it: "12a34" -> 1234, "a42" -> 42). The C runtime
+        # hl_die()s on a non-digit and the boot interpreter raises
+        # HLPanic — trap here too, per the backend's established
+        # convention (a visible halt beats a silent wrong answer).
         body.append(OP_I32_CONST); body += sleb(0x30)
         body.append(OP_I32_GE_S)
         body.append(OP_LOCAL_GET); body += uleb(5)
@@ -526,6 +532,8 @@ class WasmEmitterRuntime(object):
         body.append(OP_I64_MUL)
         body.append(OP_I64_ADD)
         body.append(OP_LOCAL_SET); body += uleb(3)
+        body.append(OP_ELSE)
+        body.append(OP_UNREACHABLE)  # panic: non-digit (parity with C/interp)
         body.append(OP_END)
         # i++
         body.append(OP_LOCAL_GET); body += uleb(2)

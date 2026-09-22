@@ -186,8 +186,12 @@ def build_package_json(opts: Dict[str, Any], js_file: str, dts_file: str,
         pkg["module"] = js_file
         pkg["exports"] = {".": {"types": "./" + dts_file,
                                 "import": "./" + js_file}}
-        if target == "nodejs":
-            pkg["exports"]["."]["require"] = "./" + js_file
+    elif target == "nodejs":
+        # Deep-scan-30 fix: the nodejs branch used to sit INSIDE the
+        # `target in ("bundler", "web", "deno")` guard — unreachable, so
+        # nodejs packages shipped no `exports` map at all.
+        pkg["exports"] = {".": {"types": "./" + dts_file,
+                                "require": "./" + js_file}}
     if authors:
         pkg["author"] = authors[0] if len(authors) == 1 else authors
     if repository:

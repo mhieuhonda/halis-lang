@@ -863,7 +863,28 @@ HTML_RUNNER = r"""<!DOCTYPE html>
     out.appendChild(document.createTextNode(args.join(" ") + "\n"));
     origLog.apply(console, args);
   }};
-  // Override hl_js_print / hl_js_println to write into the <pre>.
+  // Deep-scan-30 fix: capture the module memory BEFORE running. The
+  // instantiate hook used to be installed after `await Halis.run`,
+  // so every print override below dereferenced `_mem` while it was
+  // still in its temporal dead zone (ReferenceError) — or, after the
+  // declaration executed, read `undefined` and rendered nothing.
+  // Hooking first means `_mem` is set the moment the instance exists,
+  // before any wasm code can call the print imports.
+  let _mem;
+  const _origInst = Halis.instantiate;
+  Halis.instantiate = async function (...args) {{
+    const r = await _origInst.apply(Halis, args);
+    _mem = r.instance.exports.memory;
+    return r;
+  }};
+  function readHlStrFromInstance(ptr) {{
+    if (!_mem) return "";
+    const dv = new DataView(_mem.buffer);
+    const len = dv.getInt32(ptr, true);
+    const bytes = new Uint8Array(_mem.buffer, ptr + 4, len);
+    return new TextDecoder("utf-8").decode(bytes);
+  }}
+  // Run the program with print imports that write into the <pre>.
   try {{
     const wasmUrl = "{wasm_name}";
     await Halis.run(wasmUrl, {{
@@ -881,27 +902,6 @@ HTML_RUNNER = r"""<!DOCTYPE html>
     out.appendChild(document.createTextNode("Error: " + e.message + "\n"));
     console.error(e);
   }}
-  // Helper: read an HLS string from the just-instantiated module's
-  // memory. We don't have direct access to the instance here, so we
-  // hook into Halis.instantiate to capture it.
-  let _mem;
-  const _origInst = Halis.instantiate;
-  Halis.instantiate = async function (...args) {{
-    const r = await _origInst.apply(Halis, args);
-    _mem = r.instance.exports.memory;
-    return r;
-  }};
-  function readHlStrFromInstance(ptr) {{
-    if (!_mem) return "";
-    const dv = new DataView(_mem.buffer);
-    const len = dv.getInt32(ptr, true);
-    const bytes = new Uint8Array(_mem.buffer, ptr + 4, len);
-    return new TextDecoder("utf-8").decode(bytes);
-  }}
-  // Re-run with the captured-memory hook (the first run above used the
-  // default imports; this second instantiation ensures the override is
-  // actually exercised). For the alpha, the first run is sufficient —
-  // the default imports already call console.log which we've redirected.
 }})();
 </script>
 </body>

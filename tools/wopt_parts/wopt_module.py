@@ -78,6 +78,19 @@ class WasmModule:
         self.start: Optional[int] = None
         self.codes: List[Code] = []
         self.data: List[DataSegment] = []
+        # Deep-scan-30 fix: the in-tree optimizer only models a subset of
+        # the wasm binary format. Sections it does not model (custom,
+        # table, element, any future section id) and constructs whose
+        # serialization is lossy (imported tables/memories/globals with
+        # limits or types it hardcodes, non-i32/i64 global init
+        # expressions, non-flag-0 data segments) are REMOVED or CORRUPTED
+        # by a parse -> serialize round trip. parse() clears this flag
+        # when it meets any of those; optimize() then bypasses the
+        # in-tree passes and passes the original bytes through (the
+        # external Binaryen wasm-opt, if installed, still runs — it
+        # models the full spec). In-tree-emitted modules never contain
+        # any of these, so the primary path is unaffected.
+        self.roundtrip_safe: bool = True
 
     # --- parsing ---
 
@@ -90,10 +103,16 @@ class WasmModule:
             raise ValueError("unsupported wasm version: %d" % version)
         pos = 8
         mod = cls()
+        # Section ids the model fully round-trips. Everything else
+        # (custom=0, table=4, element=9, and any id above 12) marks the
+        # module as unsafe to re-serialize.
+        modeled = {1, 2, 3, 5, 6, 7, 8, 10, 11, 12}
         while pos < len(wasm):
             sec_id = wasm[pos]; pos += 1
             sec_size, pos = read_uleb(wasm, pos)
             sec_end = pos + sec_size
+            if sec_id not in modeled:
+                mod.roundtrip_safe = False
             if sec_id == SEC_TYPE:
                 mod._parse_types(wasm, pos, sec_end)
             elif sec_id == SEC_IMPORT:
@@ -115,7 +134,6 @@ class WasmModule:
             elif sec_id == SEC_DATA_COUNT:
                 # DataCount section: just a u32 count; we don't need to track it.
                 pass
-            # Unknown sections (custom, table, element) are skipped.
             pos = sec_end
         return mod
 
@@ -142,20 +160,30 @@ class WasmModule:
             if kind == 0x00:  # func
                 type_idx, pos = read_uleb(buf, pos)
             elif kind == 0x01:  # table
-                # elem type (1 byte) + limits
+                # elem type (1 byte) + limits — the serializer cannot
+                # re-emit an imported table at all.
+                self.roundtrip_safe = False
                 pos += 1
                 flag = buf[pos]; pos += 1
                 _, pos = read_uleb(buf, pos)
                 if flag == 1:
                     _, pos = read_uleb(buf, pos)
             elif kind == 0x02:  # memory
+                # The serializer hardcodes flag 0 / min 1 for imported
+                # memories — any other limits would be corrupted.
                 flag = buf[pos]; pos += 1
-                _, pos = read_uleb(buf, pos)
+                min_p, pos = read_uleb(buf, pos)
                 if flag == 1:
                     _, pos = read_uleb(buf, pos)
+                if flag != 0 or min_p != 1:
+                    self.roundtrip_safe = False
             elif kind == 0x03:  # global
-                pos += 1  # value type
-                pos += 1  # mutability
+                ty = buf[pos]; pos += 1
+                mut = buf[pos]; pos += 1
+                # The serializer hardcodes (i32, immutable) for imported
+                # globals — any other type/mutability would be corrupted.
+                if ty != 0x7F or mut != 0:
+                    self.roundtrip_safe = False
             self.imports.append(Import(module, name, kind, type_idx))
 
     def _parse_functions(self, buf: bytes, pos: int, end: int):
@@ -188,6 +216,10 @@ class WasmModule:
                 pos += 1
                 init_val, pos = read_sleb(buf, pos)
             else:
+                # Non-i32/i64 init expressions (f32/f64 const,
+                # global.get, ...) cannot be re-serialized faithfully —
+                # the serializer would emit no initializer at all.
+                self.roundtrip_safe = False
                 # Skip the init expression generically.
                 pos = self._skip_init_expr(buf, pos)
             assert buf[pos] == OP_END
@@ -253,13 +285,24 @@ class WasmModule:
         for _ in range(n):
             flag = buf[pos]; pos += 1
             # active, memory 0 (flag 0): offset init expr + bytes
-            assert flag == 0, "only active data segment flag 0 supported"
+            offset = 0
+            if flag != 0:
+                # Deep-scan-30 fix: passive/declarative segments
+                # (memory.init / data.drop users) cannot be re-serialized
+                # — the serializer only emits active flag-0 segments.
+                self.roundtrip_safe = False
             # offset: i32.const <sleb> end
-            assert buf[pos] == OP_I32_CONST
-            pos += 1
-            offset, pos = read_sleb(buf, pos)
-            assert buf[pos] == OP_END
-            pos += 1
+            if buf[pos] != OP_I32_CONST:
+                # Non-constant offsets are legal in the spec but cannot
+                # be re-serialized by the model.
+                self.roundtrip_safe = False
+            else:
+                pos += 1
+                offset, pos = read_sleb(buf, pos)
+                if buf[pos] != OP_END:
+                    self.roundtrip_safe = False
+                else:
+                    pos += 1
             dlen, pos = read_uleb(buf, pos)
             data = buf[pos:pos + dlen]
             pos += dlen

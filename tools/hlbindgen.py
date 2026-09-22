@@ -569,9 +569,17 @@ def emit_abi_header(decls: dict, src_header: str = None) -> str:
         # HLS-mapped types and assert it matches the original.
         shadow_name = "_hl_shadow_%s" % sname
         field_lines = []
+        has_array_field = False
         for (fname, ftype) in d["fields"]:
             # _parse_c_type returns the HLS type name; we need the C
             # equivalent that matches the HLS ABI.
+            if ftype.startswith("list["):
+                # Deep-scan-30 fix: a fixed-size C array field is bound
+                # as list[T] (a pointer). The shadow struct therefore
+                # legitimately differs in total size AND shifts every
+                # later field — no size/offset assertion can hold. Mark
+                # the struct and skip its assertions below.
+                has_array_field = True
             c_type = _hls_to_c_type(ftype)
             field_lines.append("    %s %s;" % (c_type, fname))
         if not field_lines:
@@ -580,11 +588,21 @@ def emit_abi_header(decls: dict, src_header: str = None) -> str:
         lines.append("struct %s {" % shadow_name)
         lines.extend(field_lines)
         lines.append("};")
-        lines.append('_Static_assert(sizeof(struct %s) == sizeof(%s),'
+        if has_array_field:
+            lines.append("/* (size/offset asserts skipped: array fields are "
+                         "bound as pointers, so the shadow layout differs "
+                         "by design) */")
+            continue
+        # Deep-scan-30 fix: the assertions used the bare struct name
+        # (`sizeof(Point)`, `offsetof(Point, x)`), which is invalid C for
+        # a TAG-only declaration (`struct Point { ... };` — exactly what
+        # _parse_structs captures). Qualify with the `struct` keyword on
+        # the source side; on the shadow side the tag is always present.
+        lines.append('_Static_assert(sizeof(struct %s) == sizeof(struct %s),'
                      ' "HLS struct %s size mismatch");'
                      % (shadow_name, sname, sname))
         for (fname, _) in d["fields"]:
-            lines.append('_Static_assert(offsetof(struct %s, %s) == offsetof(%s, %s),'
+            lines.append('_Static_assert(offsetof(struct %s, %s) == offsetof(struct %s, %s),'
                          ' "HLS struct %s field %s offset mismatch");'
                          % (shadow_name, fname, sname, fname, sname, fname))
     # Function existence assertions (one per extern fn).

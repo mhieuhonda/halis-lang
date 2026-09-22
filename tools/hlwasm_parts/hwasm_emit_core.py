@@ -57,7 +57,11 @@ class WasmEmitterCore(object):
         "str_concat":    ("hl_str_concat",    ["str", "str"],     "str"),
         "str_eq":        ("hl_str_eq",        ["str", "str"],     "bool"),
         "str_char_at":   ("hl_str_byte_at",   ["str", "int"],     "int"),
-        "ord":           ("hl_str_byte_at",   ["str"],            "int"),
+        # Deep-scan-30 fix: removed the stale "ord" entry — it pointed at
+        # hl_str_byte_at with a single ["str"] argument while the helper
+        # takes (str, int); any future caller would have emitted a `call`
+        # with a missing operand (invalid module). `ord` is not an HLS
+        # builtin (the checker rejects it); `str.byte_at` covers the need.
         "chr":           ("hl_chr_to_str",    ["int"],            "str"),
         "panic":         ("hl_panic",         ["str"],            "void"),
         "abort":         ("hl_abort",         ["int"],            "void"),
