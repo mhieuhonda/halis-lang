@@ -38,6 +38,15 @@ fn check_match(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, expecte
     let covered: list[str] = []
     let mut has_wildcard: bool = false
     let arm_types: list[str] = []
+    # Deep-scan-30 fix (boot parity, deep-scan-20): per-arm move-state
+    # isolation. A take/drop in an earlier arm used to permanently mark
+    # the binding moved, so a later, mutually EXCLUSIVE arm got a
+    # spurious "use of moved value" (the identical program with the
+    # arms swapped was accepted). Same protocol as if-arms: snapshot
+    # -> check -> restore -> union the fall-through arms' moves into
+    # the post-match state (a `never` body diverges and contributes
+    # nothing).
+    let arm_posts: list[list[str]] = []
     let mut arm_n: int = 0
     while arm_n < ctx.exprs[e].args.len() {
         let arm_idx: int = ctx.exprs[e].args.get(arm_n)
@@ -84,6 +93,7 @@ fn check_match(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, expecte
             covered.push(arm.variant)
         }
         # Check arm body in a new scope with the bindings.
+        let arm_pre: list[str] = snapshot_moved(env)
         env.push(map_new())
         if arm.pat_kind != "wildcard" {
             # Bind payload values.
@@ -129,10 +139,25 @@ fn check_match(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, expecte
         arm_m.body_t = body_t
         ctx.match_arms.set(arm_idx, arm_m)
         env.pop()
+        # Deep-scan-30 fix (boot parity): restore the pre-arm move
+        # state (a later, mutually exclusive arm must be checked
+        # against the clean pre-match state); a `never` body diverges
+        # and cannot contribute moves to the post-match state.
+        let arm_post: list[str] = snapshot_moved(env)
+        restore_moved(env, arm_pre)
         if body_t != "never" {
+            arm_posts.push(arm_post)
             arm_types.push(body_t)
         }
         arm_n = arm_n + 1
+    }
+    # Deep-scan-30 fix (boot parity): apply the union of the
+    # fall-through arms' moves to the post-match state (sound
+    # direction: a binding moved in ANY arm is moved after the match).
+    let mut api: int = 0
+    while api < arm_posts.len() {
+        union_moved(env, arm_posts.get(api))
+        api = api + 1
     }
     # Exhaustiveness check.
     if !has_wildcard {

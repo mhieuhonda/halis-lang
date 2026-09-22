@@ -821,6 +821,18 @@ fn gen_stmt(ctx: Ctx, sidx: int, ind: str) -> void {
         collect_hoist(ctx, s.cond)
         hoist_all(ctx, ctx.out, ind)
         let c: str = gen_expr(ctx, s.cond)
+        # Deep-scan-30 fix: a NEVER-typed condition (e.g. `if panic("dead")`)
+        # diverges before any branch runs — the boot checker accepts it
+        # (deep-scan-30 parity fix), but emitting `if (<call>)` produced
+        # invalid C (a never-call returns void). Emit the condition as a
+        # bare side-effect statement (the program diverges there at
+        # runtime) followed by the dead then-branch (still compiled,
+        # never executed). The PGO bookkeeping is skipped: the branches
+        # are unreachable, so there is nothing to profile.
+        if ctx.exprs[s.cond].t == "never" {
+            ctx.out.push(ind + c + ";")
+            gen_stmts(ctx, s.body, ind)
+        } else {
         # Stage 19 (v0.35.0-alpha): PGO. Two profile sites per if: the
         # true-path count and the false-path count (ids are deterministic
         # per function: b:<fn>:<n>). Under --pgo-generate both paths get
@@ -857,8 +869,19 @@ fn gen_stmt(ctx: Ctx, sidx: int, ind: str) -> void {
         ctx.out.push(ind + "}")
         flush_null_after(ctx, ind)
         clear_hoists(ctx)
+        }
     } else if s.kind == "while" {
         collect_hoist(ctx, s.cond)
+        # Deep-scan-30 fix: a NEVER-typed condition (`while panic("d")`)
+        # diverges before the first test — emit it as a bare statement
+        # (invalid C otherwise: a void call cannot be a while-condition)
+        # and skip the dead loop body entirely.
+        if ctx.exprs[s.cond].t == "never" {
+            let nc: str = gen_expr(ctx, s.cond)
+            ctx.out.push(ind + nc + ";")
+            flush_null_after(ctx, ind)
+            clear_hoists(ctx)
+        } else {
         # If the condition contains hoisted temps, the plain `while (c)`
         # form would evaluate them ONCE before the loop — a semantic
         # change (fresh subexpressions must be re-evaluated per
@@ -913,6 +936,7 @@ fn gen_stmt(ctx: Ctx, sidx: int, ind: str) -> void {
         }
         flush_null_after(ctx, ind)
         clear_hoists(ctx)
+        }
     } else if s.kind == "for" {
         # Stage 30 (v0.47.0-alpha): for-in over a stack-allocated list.
         # The iterable is a typed frame array: iterate it directly. The
@@ -1205,25 +1229,23 @@ fn gen_stmt(ctx: Ctx, sidx: int, ind: str) -> void {
 #                        no-op on x86-64
 #
 # The operand list order matches GCC's positional layout: outputs
-# first (in source order), then inputs. `{0}` references the first
-# operand, `{1}` the second, etc. — so an `in(reg) x, out(reg) y`
-# pair has `{0}` = `x` (input, listed after the output `y` in the C
-# asm form) and `{1}` = `y` (output, listed first). The HLS source
-# can use whichever operand order the user prefers; the codegen
-# re-orders them to match GCC's expectations and rewrites the
-# template placeholders accordingly.
+# first (in source order), then inputs. GCC numbers operands %0..
+# across that layout — {0} references the first OUTPUT (or, when the
+# asm has no outputs, the first input), {1} the next operand in GCC
+# order, and so on. This is the same convention GCC's extended asm
+# and Rust's asm! document, and the same one the repo's own examples
+# and tests are written against (feat_stage27_asm.hls's asm_pure_read
+# and asm_demo.hls use `in(reg) x, out(reg) y` with a `mov {1}, {0}`
+# template, i.e. y <- x).
 #
-# However, to keep the implementation simple and the source-vs-asm
-# mapping intuitive, we LAY OUT operands in source order: outputs
-# first (in their source order), then inputs (in their source order).
-# A source `in(reg) x, out(reg) y` becomes `outputs=[y], inputs=[x]`
-# — so `{0}` references `y` (the first output) and `{1}` references
-# `x` (the first input). This matches GCC's positional operand
-# numbering EXACTLY, so the source template `{0}` / `{1}` map
-# directly to `%0` / `%1` in the emitted C. The Stage 27 acceptance
-# test (tests/ok/feat_stage27_asm.hls) verifies this with an inb()
-# helper whose template `{0}, {1}` references the output then the
-# input — the produced assembly shows `in %1, %0` (AT&T source-dst).
+# Deep-scan-30 fix: the codegen used to translate {N} as "the Nth
+# operand IN SOURCE ORDER" (remapped through a source->GCC table).
+# Whenever an input preceded an output in the source, the remapping
+# silently REVERSED the template's data direction: `mov {1}, {0}`
+# with `in(reg) x, out(reg) y` produced C `mov %0, %1` (= x <- y)
+# instead of `mov %1, %0` (= y <- x). The mapping is now the identity
+# ({N} -> %N), so the template always uses GCC numbering — matching
+# the documented contract, the examples, and the acceptance test.
 fn gen_asm(ctx: Ctx, s: StmtN, ind: str) -> void {
     # Hoist fresh pointer subexpressions that appear in `in` operands
     # (so they're materialised into temps with cleanup attributes
@@ -1309,18 +1331,12 @@ fn gen_asm(ctx: Ctx, s: StmtN, ind: str) -> void {
     }
     # Build the outputs and inputs lists (in GCC positional order:
     # outputs first, then inputs).
+    # Deep-scan-30 fix: the old source->GCC index table (gcc_indices)
+    # is gone — {N} in the template now maps to %N directly (GCC
+    # numbering), so no remapping table is needed. See the doc comment
+    # above gen_asm for the full contract.
     let outputs: list[str] = []
     let inputs: list[str] = []
-    # We need to record the operand index (in source order) -> its
-    # position in the GCC operand list (0..N-1) so we can rewrite
-    # template placeholders. The HLS list[str] is used as a "scratch
-    # array" indexed by source-order position, holding the GCC
-    # operand index as a string ("0", "1", ...). This avoids needing
-    # a list[int] field on StmtN (the existing StmtN layout uses
-    # list[int] for stmts/exprs but a dedicated field for asm would
-    # bloat the struct for every non-asm statement).
-    let mut gcc_indices: list[str] = []
-    let mut next_idx: int = 0
     # First pass: outputs (out/inout/late_out) in source order.
     let mut j_out: int = 0
     while j_out < s.asm_operands.len() {
@@ -1337,10 +1353,6 @@ fn gen_asm(ctx: Ctx, s: StmtN, ind: str) -> void {
                 ce = gen_expr(ctx, op.expr_idx)
             }
             outputs.push("\"" + cstr + "\"(" + ce + ")")
-            gcc_indices.push(next_idx.to_str())
-            next_idx = next_idx + 1
-        } else {
-            gcc_indices.push("-1")
         }
         j_out = j_out + 1
     }
@@ -1352,9 +1364,6 @@ fn gen_asm(ctx: Ctx, s: StmtN, ind: str) -> void {
             let cstr: str = translate_asm_constraint(op)
             let ce: str = gen_expr(ctx, op.expr_idx)
             inputs.push("\"" + cstr + "\"(" + ce + ")")
-            # Record the GCC index for this source-order position.
-            gcc_indices.set(j2, next_idx.to_str())
-            next_idx = next_idx + 1
         }
         j2 = j2 + 1
     }
@@ -1384,11 +1393,11 @@ fn gen_asm(ctx: Ctx, s: StmtN, ind: str) -> void {
     if !list_contains_str(s.asm_options, "nomem") {
         clobbers.push("\"memory\"")
     }
-    # Translate the template: {N} -> %N, ${N} -> $%cN (deep-scan-23 fix:
+    # Translate the template: {N} -> %N (GCC operand numbering), ${N} -> $%cN (deep-scan-23 fix:
     # plain `%N` on x86 AT&T already prints immediates WITH the `$`
     # prefix, so a literal `$` in front of `%N` produces `$$imm` and a
     # PIE link failure), {{ -> {, }} -> }, lone $ passes through.
-    let translated: str = translate_asm_template(s.asm_template, gcc_indices)
+    let translated: str = translate_asm_template(s.asm_template)
     # Emit the GCC extended asm.
     let mut volatile_kw: str = "__volatile__ "
     if list_contains_str(s.asm_options, "pure") {
@@ -1500,13 +1509,15 @@ fn translate_asm_constraint(op: AsmOperand) -> str {
 # translate_asm_template: rewrite the HLS asm! template (which uses
 # `{N}` placeholders) to the GCC form (which uses `%N` positional
 # placeholders, `%%` for a literal `%`, and `{{` / `}}` for literal
-# braces). gcc_indices is the source-order list of GCC positional
-# indices (the source operand at position K has GCC index
-# gcc_indices[K], as a string; -1 means "this is an input that was
-# listed after the outputs in source order — the GCC index was
-# assigned during the second pass"). We rewrite `{N}` to
-# `%<gcc_indices[N]>` so the source-template `{0}` / `{1}` map to
-# the right GCC operand number regardless of in/out order.
+# braces).
+#
+# Deep-scan-30 fix: `{N}` uses GCC operand numbering — the N is
+# already the number GCC assigns in the emitted `__asm__` (outputs
+# first in source order, then inputs), so the rewrite is the identity
+# {N} -> %N. The old code remapped N through a source-order -> GCC
+# index table (gcc_indices), which reversed the template's data
+# direction whenever an input preceded an output in the source (the
+# repo's own asm_pure_read demo hit exactly that).
 #
 # The immediate-operand form `${N}` is rewritten to `$%c<N>`: the
 # explicit `$` is the AT&T immediate prefix and GCC's `%c` modifier
@@ -1515,13 +1526,7 @@ fn translate_asm_constraint(op: AsmOperand) -> str {
 # constraint already emits the `$` itself, producing `$$42` — the
 # assembler then treats it as a reference to an undefined symbol
 # named `$42` and PIE linking fails (deep-scan-23, GCC 14).
-#
-# BUG-FIX (Stage 27): the original `gcc_indices` was filled only
-# during the OUTPUTS pass, leaving inputs at "-1" until the inputs
-# pass — but translate_asm_template runs AFTER both passes, so the
-# indices are all set. The function below looks up gcc_indices[N]
-# for each {N} placeholder.
-fn translate_asm_template(template: str, gcc_indices: list[str]) -> str {
+fn translate_asm_template(template: str) -> str {
     let parts: list[str] = []
     let mut i: int = 0
     while i < template.len() {
@@ -1539,10 +1544,13 @@ fn translate_asm_template(template: str, gcc_indices: list[str]) -> str {
                 }
                 # j is at `}` (or end-of-string).
                 let body: str = template.slice(i + 1, j)
-                # body is a number; look up gcc_indices[body.to_int()].
+                # Deep-scan-30 fix: {N} uses GCC operand numbering —
+                # emit %N directly (the old code remapped N through a
+                # source-order table, which reversed the data direction
+                # whenever an input preceded an output in the source).
                 let n: int = body.to_int()
-                if n >= 0 && n < gcc_indices.len() {
-                    parts.push("%" + gcc_indices.get(n))
+                if n >= 0 {
+                    parts.push("%" + n.to_str())
                 } else {
                     # Out-of-range — the checker already rejected this;
                     # emit as-is (will be a C compile error, which is
@@ -1594,9 +1602,10 @@ fn translate_asm_template(template: str, gcc_indices: list[str]) -> str {
                 j = j + 1
             }
             let body: str = template.slice(i + 2, j)
+            # Deep-scan-30 fix: GCC numbering — emit $%cN directly.
             let n: int = body.to_int()
-            if n >= 0 && n < gcc_indices.len() {
-                parts.push("$%c" + gcc_indices.get(n))
+            if n >= 0 {
+                parts.push("$%c" + n.to_str())
             } else {
                 # Out-of-range — the checker already rejected this;
                 # emit as-is (will be a C compile error, which is

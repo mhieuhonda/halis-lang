@@ -212,7 +212,11 @@ fn check_stmt(ctx: Ctx, env: list[map[str, Binding]], cur: str, f: FnInfo, sidx:
         check_assign(ctx, env, cur, s)
     } else if s.kind == "if" {
         let ct: str = check_expr(ctx, env, cur, s.cond, "")
-        if ct != "bool" {
+        # Deep-scan-30 fix (boot parity): a condition of type `never`
+        # (dead code after a divergence, e.g. `if panic("dead") {}`)
+        # is accepted by the boot checker (stmt.py: `ct not in
+        # ("bool", "never")`) — the native checker used to reject it.
+        if ct != "bool" && ct != "never" {
             cerr(s.line, "if condition must be bool, got " + ct)
         }
         # Deep-scan-16 HIGH-severity soundness fix: a binding moved inside
@@ -262,7 +266,8 @@ fn check_stmt(ctx: Ctx, env: list[map[str, Binding]], cur: str, f: FnInfo, sidx:
         ctx.loop_header = ctx.loop_header + 1
         let ct: str = check_expr(ctx, env, cur, s.cond, "")
         ctx.loop_header = ctx.loop_header - 1
-        if ct != "bool" {
+        # Deep-scan-30 fix (boot parity): allow `never` conditions.
+        if ct != "bool" && ct != "never" {
             cerr(s.line, "while condition must be bool, got " + ct)
         }
         # Deep-scan-16 HIGH-severity soundness fix: the loop body may
@@ -314,7 +319,8 @@ fn check_stmt(ctx: Ctx, env: list[map[str, Binding]], cur: str, f: FnInfo, sidx:
         ctx.loop_header = ctx.loop_header + 1
         let ct2: str = check_expr(ctx, env, cur, s.cond, "")
         ctx.loop_header = ctx.loop_header - 1
-        if ct2 != "bool" {
+        # Deep-scan-30 fix (boot parity): allow `never` conditions.
+        if ct2 != "bool" && ct2 != "never" {
             cerr(s.line, "while condition must be bool, got " + ct2)
         }
         let brk_snap: list[str] = frame_entries(ctx.loop_brk_frames)
@@ -1236,6 +1242,48 @@ fn type_mentions_typeparam(pt: str, tps: list[str]) -> bool {
 fn check_call(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, expected: str) -> str {
     let name: str = ctx.exprs[e].name
     let mut line: int = ctx.exprs[e].line
+    # Deep-scan-30 fix (mirrors the boot checker fix): the spawn-family
+    # builtins REWRITE their call node on the first visit — the
+    # fn-name argument is dropped from args and the target fn key is
+    # recorded in mop. The loop fixpoint re-analysis (deep-scan-28)
+    # re-visits the same node; re-running the family validation would
+    # then reject a VALID program ("argument 1 must be a function
+    # name"). On a rewritten node, re-check only the remaining user
+    # arguments (keeps the move-state fixpoint sound) and re-derive
+    # the cached type from mop / the contextual type. mop is "" on
+    # every non-rewritten call node (see the Expr initializer), so it
+    # is a safe discriminator.
+    if ctx.exprs[e].mop != "" {
+        if name == "spawn" || name == "async_spawn" {
+            let mut ri: int = 0
+            while ri < ctx.exprs[e].args.len() {
+                check_expr(ctx, env, cur, ctx.exprs[e].args.get(ri), "")
+                ri = ri + 1
+            }
+            let rtf: FnInfo = ctx.fns.get_or(ctx.exprs[e].mop, dummy_fn())
+            if name == "spawn" {
+                return "Task[" + rtf.ret + "]"
+            }
+            return "Future[" + rtf.ret + "]"
+        }
+        if name == "gen_spawn" || name == "stream_map_int"
+        || name == "stream_filter_int" || name == "stream_flat_map_int" {
+            let mut ri2: int = 0
+            while ri2 < ctx.exprs[e].args.len() {
+                check_expr(ctx, env, cur, ctx.exprs[e].args.get(ri2), "")
+                ri2 = ri2 + 1
+            }
+            return expected
+        }
+        if name == "stream_fold_int" {
+            let mut ri3: int = 0
+            while ri3 < ctx.exprs[e].args.len() {
+                check_expr(ctx, env, cur, ctx.exprs[e].args.get(ri3), "")
+                ri3 = ri3 + 1
+            }
+            return "int"
+        }
+    }
     if is_builtin_fn(name) {
         ctx.exprs[e].muser = false
         ctx.exprs[e].mkey = name
@@ -1351,6 +1399,26 @@ fn check_call(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, expected
             if at == "never" {
                 i = i + 1
                 continue
+            }
+            # Deep-scan-30 fix (boot parity): extern calls cross the FFI
+            # boundary into C. Boot enforces two rules at the call site
+            # (boot/checking/call.py): (1) no tainted arguments — a C
+            # function like system() makes tainted[str] a shell-injection
+            # vector, and the generic "expects str, got tainted[str]"
+            # error buried the actionable FFI guidance; (2) parameters
+            # must be primitive (int/float/bool/str) — the interpreter's
+            # ctypes path can never pass or return complex types. The
+            # native checker enforced neither: tainted args got the
+            # generic mismatch message and complex-typed parameters were
+            # accepted outright (unsound).
+            if f.is_extern {
+                if is_taint_t(at) {
+                    cerr(line, "extern call to '" + name + "': argument " + (i + 1).to_str() + " ('" + f.params.get(i) + "') is " + at + " — passing tainted data across the FFI boundary is forbidden (C functions like system() can shell-inject; reject tainted values or sanitise before calling externs)")
+                }
+                if inst_pt != "int" && inst_pt != "float"
+                && inst_pt != "bool" && inst_pt != "str" {
+                    cerr(line, "extern call to '" + name + "': parameter '" + f.params.get(i) + "' has type " + inst_pt + " — extern fn params must be int / float / bool / str (use a string-encoded form for complex data)")
+                }
             }
             if at != inst_pt {
                 cerr(line, "argument '" + f.params.get(i) + "' of " + name + " expects " + inst_pt + ", got " + at)
