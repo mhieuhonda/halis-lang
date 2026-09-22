@@ -335,6 +335,12 @@ class Linter:
                     collect_calls(dflt, called)
         # Special-case: `main` is always considered used.
         called.add("main")
+        # Stage 81 (v0.100.0-alpha): a `#[panic_handler]` fn is invoked
+        # via the runtime hook (invisible to the call graph) — never
+        # flag it unused.
+        for _fname, _fn in self.program["fns"].items():
+            if _fn.get("attrs", {}).get("panic_handler", False):
+                called.add(_fname)
         # Methods registered as "Struct.method" — the short name is
         # what appears in fieldcall/method nodes.
         for fname in self.program["fns"]:
