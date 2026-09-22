@@ -15,6 +15,9 @@
 # Stage 80 (v0.99.0-alpha): `core.mem` — the physical-page allocator
 # (FrameAlloc) and the x86-64 4-level page-table model
 # (AddressSpace, huge pages, translate/unmap/protect).
+# Stage 81 (v0.100.0-alpha): `core.panic` + `#[panic_handler]` — the
+# kernel panic strategy (PanicInfo / PanicAction / PanicLog plus the
+# single overridable handler behind the reentrancy-guarded hook).
 # ============================================================================
 
 # freestanding: compile an HLS program to freestanding C + link with
@@ -114,4 +117,20 @@ mem-acceptance:
 	@$(PYTHON) tests/mem_acceptance.py
 	@echo "ACCEPTANCE OK: Stage 80 -- core.mem (physical-page allocator + page tables)"
 
-.PHONY: freestanding freestanding-check freestanding-acceptance nostd nostd-acceptance alloc-acceptance mem-acceptance
+# panic-acceptance: the Stage 81 acceptance gate. Runs the 7-section
+# end-to-end suite for `core.panic` + `#[panic_handler]`: resolution +
+# guards, standalone parse + core-only imports, Stage-0 enforcement
+# (hosted demo panics with the handler marker, no_std ok-test clean in
+# no_std / freestanding / bare-hosted modes, three fail programs
+# rejected), targeted behavior probes (info geometry, log eviction,
+# guard panics, handler-fires, exit-wins, nested-panic guard),
+# self-hosted emission + native parity (hosted marker-before-default
+# at 101, exit-wins at 42, ok-test at 0, freestanding -nostdlib at 0,
+# boot/hlc parity on fail programs), hlfmt stability, and `--audit`
+# purity.
+panic-acceptance:
+	@echo "[Stage 81 acceptance] running tests/panic_acceptance.py..."
+	@$(PYTHON) tests/panic_acceptance.py
+	@echo "ACCEPTANCE OK: Stage 81 -- core.panic + #[panic_handler]"
+
+.PHONY: freestanding freestanding-check freestanding-acceptance nostd nostd-acceptance alloc-acceptance mem-acceptance panic-acceptance
