@@ -1013,6 +1013,8 @@ class Parser:
             template = template.decode("utf-8", "replace")
         operands = []
         options = []
+        clobbers = []
+        saw_clobber = False
         while self.at_sym(","):
             self.next()
             if self.at_ident("options"):
@@ -1044,6 +1046,38 @@ class Parser:
                         self.next()
                     elif not self.at_sym(")"):
                         self.err("expected ',' or ')' in options list")
+                self.eat_sym(")")
+            elif self.at_ident("clobber"):
+                # Stage 83 (v0.102.0-alpha): explicit clobber list —
+                # `clobber("rcx", "r11")`. Every entry is a string
+                # literal (a full 64-bit register name, or "cc" /
+                # "memory"). The checker validates the names; the
+                # codegen appends them verbatim to the GCC clobber
+                # list. The clause may appear at most once per asm!.
+                self.next()
+                if saw_clobber:
+                    self.err("asm! clobber list appears more than once "
+                             "— merge all clobbers into a single "
+                             "clobber(...) clause")
+                saw_clobber = True
+                self.eat_sym("(")
+                while not self.at_sym(")"):
+                    clob_tok = self.peek()
+                    if clob_tok["k"] == "str":
+                        cname = clob_tok["v"]
+                        if isinstance(cname, bytes):
+                            cname = cname.decode("utf-8", "replace")
+                        self.next()
+                    else:
+                        self.err("asm! clobber names must be string "
+                                 "literals (a register name like "
+                                 "\"rcx\", or \"cc\" / \"memory\"), "
+                                 "got %s" % self._desc(), clob_tok)
+                    clobbers.append(cname)
+                    if self.at_sym(","):
+                        self.next()
+                    elif not self.at_sym(")"):
+                        self.err("expected ',' or ')' in clobber list")
                 self.eat_sym(")")
             else:
                 # Direction.
@@ -1114,6 +1148,7 @@ class Parser:
                 "template": template,
                 "operands": operands,
                 "options": options,
+                "clobbers": clobbers,
                 "line": t0["line"]}
 
     def parse_if(self):

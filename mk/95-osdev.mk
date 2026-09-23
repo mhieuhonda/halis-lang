@@ -22,6 +22,11 @@
 # pages (`#![stack_size(N)]` budget verified against the worst call
 # chain, `core.stack` region model, 1-MiB + guard task stacks in the
 # C runtime).
+# Stage 83 (v0.102.0-alpha): the inline-asm register constraints —
+# explicit `clobber(...)` lists, named registers binding the full
+# 64-bit register, SSE-only floats, compiler-owned sp/bp, operand-
+# clobber overlap analysis, and `core.asm` (the register file as
+# data) — see SPEC section 37.
 # ============================================================================
 
 # freestanding: compile an HLS program to freestanding C + link with
@@ -154,4 +159,21 @@ stackguard-acceptance:
 	@$(PYTHON) tests/stack_acceptance.py
 	@echo "ACCEPTANCE OK: Stage 82 -- deterministic stack size + guard pages"
 
-.PHONY: freestanding freestanding-check freestanding-acceptance nostd nostd-acceptance alloc-acceptance mem-acceptance panic-acceptance stackguard-acceptance
+# asmreg-acceptance: the Stage 83 acceptance gate. Runs the 7-section
+# end-to-end suite for the inline-asm register constraints: resolution
+# + guards, standalone parse (enum + fns, zero imports), Stage-0
+# enforcement (the no_std ok-test clean, the demo refused by the
+# interpreter because it executes asm!, the ten fail programs
+# rejected), targeted probes (valid syscall-shaped/xmm/bool programs
+# accepted; every diagnostic class — width, owner, overlap, duplicate,
+# reserved, SSE — rejected with its exact message), self-hosted
+# emission + native parity (local register variables for r10/r11/r14/
+# xmm, explicit clobber lists, -Werror link, DEMO OK, freestanding
+# -nostdlib at 0, boot/hlc parity on fail programs), hlfmt stability,
+# and `--audit` purity.
+asmreg-acceptance:
+	@echo "[Stage 83 acceptance] running tests/asmreg_acceptance.py..."
+	@$(PYTHON) tests/asmreg_acceptance.py
+	@echo "ACCEPTANCE OK: Stage 83 -- inline-asm register constraints (clobber, input, output)"
+
+.PHONY: freestanding freestanding-check freestanding-acceptance nostd nostd-acceptance alloc-acceptance mem-acceptance panic-acceptance stackguard-acceptance asmreg-acceptance

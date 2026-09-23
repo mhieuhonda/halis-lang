@@ -1,0 +1,561 @@
+# ============================================================================
+# core/asm.hls — the x86-64 register file as data (Stage 83, v0.102.0-alpha)
+# ----------------------------------------------------------------------------
+# Pure HLS, zero imports (freestanding-safe: the module only uses the core
+# language — structs, enums, lists, strings and the `panic` builtin — so it
+# is importable from `#![no_std]` and `#![freestanding]` crates identically,
+# like the rest of `core.*`).
+#
+# This module is the LIBRARY half of Stage 83. The LANGUAGE half is the
+# register-constraint soundness the compilers now enforce on every `asm!`
+# (see SPEC section 37): named registers bind the full 64-bit register,
+# int/bool operands need a 64-bit GP name, float operands need SSE,
+# the stack/frame pointers are compiler-owned, and the clobber list may
+# not overlap a bound operand.
+#
+# What lives here — the same register facts the compiler enforces, as
+# queries a kernel author can call at build/plan time:
+#   * width + base-register lookup for every x86-64 spelling
+#     ("r9d" is 32 bits of "r9", "ah" is 8 bits of "rax"),
+#   * overlap analysis ("eax" and "rax" are the SAME physical register),
+#   * the clobber-list validator (mirrors the compiler's asm! rules and
+#     returns a stable AsmFault instead of panicking),
+#   * the ABI tables a stub writer needs: SysV call registers, the
+#     syscall argument registers (note arg4 = r10, NOT rcx), the
+#     registers the `syscall` instruction itself destroys (rcx, r11),
+#     caller/callee-saved sets, and a scratch-register picker.
+#
+# A `syscall` stub in Halis therefore writes as:
+#     asm!("syscall",
+#          in("rax") nr, in("rdi") a0, ...
+#          clobber("rcx", "r11"),          # == asm_syscall_clobbers()
+#          options(nomem))                 # + "cc": syscall sets RFLAGS
+# and this module lets tests assert the clobber list is exactly right
+# before the kernel ever boots.
+# ============================================================================
+
+# ---------------------------------------------------------------------------
+# The fault lattice returned by the clobber validator
+# ---------------------------------------------------------------------------
+# Stable names and codes (the `panic`-free path; compilers reject the
+# same conditions at compile time, but generated/kernel tooling that
+# assembles clobber lists at runtime needs a testable answer).
+enum AsmFault {
+    None, # 0 — the clobber list is well-formed
+    BadName, # 1 — not a register name, "cc" or "memory"
+    SubRegister, # 2 — a 32/16/8-bit spelling (clobbers must name the full 64-bit register)
+    StackPointer, # 3 — rsp/esp/sp/spl: the compiler owns the stack pointer
+    FramePointer, # 4 — rbp/ebp/bp/bpl: the compiler owns the frame pointer
+    DuplicateClobber, # 5 — two entries name the same physical register
+    OverlapsOperand, # 6 — an entry destroys a register an operand is bound to
+    ReservedClobber # 7 — "cc"/"memory": effects are option-controlled, never clobber-list-controlled
+}
+
+# asm_fault_name: the stable diagnostic name of a fault (for logs and
+# kernel build reports).
+fn asm_fault_name(f: AsmFault) -> str {
+    return match f {
+        AsmFault.None => "none",
+        AsmFault.BadName => "bad-name",
+        AsmFault.SubRegister => "sub-register",
+        AsmFault.StackPointer => "stack-pointer",
+        AsmFault.FramePointer => "frame-pointer",
+        AsmFault.DuplicateClobber => "duplicate-clobber",
+        AsmFault.OverlapsOperand => "overlaps-operand",
+        AsmFault.ReservedClobber => "reserved-clobber"
+    }
+}
+
+# asm_fault_code: the stable code of a fault (matches the declaration
+# order) — enums are matched, not compared, so tests and logs pass
+# codes around as compact ints (the same convention as core.stack).
+fn asm_fault_code(f: AsmFault) -> int {
+    return match f {
+        AsmFault.None => 0,
+        AsmFault.BadName => 1,
+        AsmFault.SubRegister => 2,
+        AsmFault.StackPointer => 3,
+        AsmFault.FramePointer => 4,
+        AsmFault.DuplicateClobber => 5,
+        AsmFault.OverlapsOperand => 6,
+        AsmFault.ReservedClobber => 7
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Register-name tables
+# ---------------------------------------------------------------------------
+
+# The 16 x86-64 general-purpose registers, in canonical (Intel manual)
+# order. Every sub-register spelling maps back into this list by index.
+fn asm64_gp_regs() -> list[str] {
+    let t: list[str] = []
+    t.push("rax")
+    t.push("rbx")
+    t.push("rcx")
+    t.push("rdx")
+    t.push("rsi")
+    t.push("rdi")
+    t.push("rbp")
+    t.push("rsp")
+    t.push("r8")
+    t.push("r9")
+    t.push("r10")
+    t.push("r11")
+    t.push("r12")
+    t.push("r13")
+    t.push("r14")
+    t.push("r15")
+    return t
+}
+
+# The 16 SSE registers (double-precision capable — the float operand
+# class the asm! checker requires for `float` values).
+fn asm64_sse_regs() -> list[str] {
+    let t: list[str] = []
+    let mut i: int = 0
+    while i < 16 {
+        t.push("xmm" + i.to_str())
+        i = i + 1
+    }
+    return t
+}
+
+# ---------------------------------------------------------------------------
+# Width / base lookup
+# ---------------------------------------------------------------------------
+
+# asm_reg_width: the width in bits a register spelling designates.
+# 64 for the rax..r15 and xmm0..xmm15 spellings, 32 for eax../r9d..,
+# 16 for ax../r9w.., 8 for al../r9b../ah.., 0 for unknown names.
+fn asm_reg_width(name: str) -> int {
+    let gp: list[str] = asm64_gp_regs()
+    let mut i: int = 0
+    while i < gp.len() {
+        if name == gp.get(i) {
+            return 64
+        }
+        i = i + 1
+    }
+    let sse: list[str] = asm64_sse_regs()
+    i = 0
+    while i < sse.len() {
+        if name == sse.get(i) {
+            return 64
+        }
+        i = i + 1
+    }
+    # 32-bit forms: e-prefix legacy + r8d..r15d.
+    if name == "eax" || name == "ebx" || name == "ecx" || name == "edx"
+    || name == "esi" || name == "edi" || name == "ebp" || name == "esp" {
+        return 32
+    }
+    i = 8
+    while i < 16 {
+        if name == gp.get(i) + "d" {
+            return 32
+        }
+        i = i + 1
+    }
+    # 16-bit forms: legacy + r8w..r15w.
+    if name == "ax" || name == "bx" || name == "cx" || name == "dx"
+    || name == "si" || name == "di" || name == "bp" || name == "sp" {
+        return 16
+    }
+    i = 8
+    while i < 16 {
+        if name == gp.get(i) + "w" {
+            return 16
+        }
+        i = i + 1
+    }
+    # 8-bit low-byte forms: legacy + r8b..r15b.
+    if name == "al" || name == "bl" || name == "cl" || name == "dl"
+    || name == "sil" || name == "dil" || name == "bpl" || name == "spl" {
+        return 8
+    }
+    i = 8
+    while i < 16 {
+        if name == gp.get(i) + "b" {
+            return 8
+        }
+        i = i + 1
+    }
+    # 8-bit high-byte forms (only the four legacy registers have them).
+    if name == "ah" || name == "bh" || name == "ch" || name == "dh" {
+        return 8
+    }
+    return 0
+}
+
+# asm_reg_is_sse: true iff `name` is one of xmm0..xmm15.
+fn asm_reg_is_sse(name: str) -> bool {
+    let sse: list[str] = asm64_sse_regs()
+    let mut i: int = 0
+    while i < sse.len() {
+        if name == sse.get(i) {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+# asm_reg_base: the full 64-bit register a spelling lives inside.
+# "eax" -> "rax", "r9d" -> "r9", "ah" -> "rax", "xmm3" -> "xmm3",
+# "bogus" -> "". This is the physical-identity function overlap
+# analysis is built on.
+fn asm_reg_base(name: str) -> str {
+    let gp: list[str] = asm64_gp_regs()
+    let mut i: int = 0
+    while i < gp.len() {
+        if name == gp.get(i) {
+            return name
+        }
+        i = i + 1
+    }
+    if asm_reg_is_sse(name) {
+        return name
+    }
+    # Legacy 32/16/8 spellings share the first eight GP slots in the
+    # same order: (eax ebx ecx edx esi edi ebp esp) -> rax..rsp etc.
+    let legacy32: list[str] = ["eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp"]
+    let legacy16: list[str] = ["ax", "bx", "cx", "dx", "si", "di", "bp", "sp"]
+    let legacy8l: list[str] = ["al", "bl", "cl", "dl", "sil", "dil", "bpl", "spl"]
+    i = 0
+    while i < 8 {
+        if name == legacy32.get(i) || name == legacy16.get(i) || name == legacy8l.get(i) {
+            return gp.get(i)
+        }
+        i = i + 1
+    }
+    # The four high-byte forms map onto rax..rdx only.
+    let legacy8h: list[str] = ["ah", "bh", "ch", "dh"]
+    i = 0
+    while i < 4 {
+        if name == legacy8h.get(i) {
+            return gp.get(i)
+        }
+        i = i + 1
+    }
+    # Extended registers: rNd/rNw/rNb are parts of rN.
+    i = 8
+    while i < 16 {
+        if name == gp.get(i) + "d" || name == gp.get(i) + "w" || name == gp.get(i) + "b" {
+            return gp.get(i)
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+# asm_regs_overlap: true iff two spellings designate the same physical
+# register ("eax" and "rax" overlap; "al" and "ah" are both inside rax,
+# so this analysis is deliberately conservative and reports an overlap).
+fn asm_regs_overlap(a: str, b: str) -> bool {
+    let ba: str = asm_reg_base(a)
+    let bb: str = asm_reg_base(b)
+    if ba == "" || bb == "" {
+        return false
+    }
+    return ba == bb
+}
+
+# ---------------------------------------------------------------------------
+# Clobber-list validation (mirrors the compilers' asm! rules)
+# ---------------------------------------------------------------------------
+
+# asm_valid_clobber: true iff `name` may appear in an asm! clobber list:
+# a full 64-bit GP or SSE register (never the compiler-owned stack/frame
+# pointers, in any spelling). "cc" and "memory" are NOT valid entries —
+# flag and memory effects are controlled by options(preserves_flags) /
+# options(nomem), never by the clobber list (the default list always
+# contains both, so an explicit entry is redundant or contradictory).
+fn asm_valid_clobber(name: str) -> bool {
+    if name == "rsp" || name == "esp" || name == "sp" || name == "spl" {
+        return false
+    }
+    if name == "rbp" || name == "ebp" || name == "bp" || name == "bpl" {
+        return false
+    }
+    if name == "cc" || name == "memory" {
+        return false
+    }
+    return asm_reg_width(name) == 64
+}
+
+# asm_clobber_fault: validate a whole clobber list, first fault wins.
+# The check order mirrors the compilers: per-entry owner/bad-name/
+# sub-register problems first (in list order), then duplicate overlap.
+# Returns AsmFault.None when the list is well-formed.
+fn asm_clobber_fault(cs: list[str]) -> AsmFault {
+    let mut i: int = 0
+    while i < cs.len() {
+        let name: str = cs.get(i)
+        if name == "rsp" || name == "esp" || name == "sp" || name == "spl" {
+            return AsmFault.StackPointer
+        }
+        if name == "rbp" || name == "ebp" || name == "bp" || name == "bpl" {
+            return AsmFault.FramePointer
+        }
+        if name == "cc" || name == "memory" {
+            return AsmFault.ReservedClobber
+        }
+        let w: int = asm_reg_width(name)
+        if w == 0 {
+            return AsmFault.BadName
+        }
+        if w != 64 {
+            return AsmFault.SubRegister
+        }
+        i = i + 1
+    }
+    i = 0
+    while i < cs.len() {
+        let mut j: int = i + 1
+        while j < cs.len() {
+            if asm_regs_overlap(cs.get(i), cs.get(j)) {
+                return AsmFault.DuplicateClobber
+            }
+            if cs.get(i) == cs.get(j) && (cs.get(i) == "cc" || cs.get(i) == "memory") {
+                return AsmFault.DuplicateClobber
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return AsmFault.None
+}
+
+# asm_operand_conflict: the first clobber that would destroy a register
+# an operand is bound to, or "" when the list is safe. `operand_reg` is
+# any spelling ("rax", "eax", the fixed letter results); "cc"/"memory"
+# clobbers never match a register operand.
+fn asm_operand_conflict(operand_reg: str, cs: list[str]) -> str {
+    let mut i: int = 0
+    while i < cs.len() {
+        let name: str = cs.get(i)
+        if name == "cc" || name == "memory" {
+            i = i + 1
+            continue
+        }
+        if asm_regs_overlap(operand_reg, name) {
+            return name
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+# ---------------------------------------------------------------------------
+# ABI tables for stub writers
+# ---------------------------------------------------------------------------
+
+# asm_sysv_arg_reg: the SysV x86-64 function-call argument register for
+# argument `n` (0-based), or "" beyond the sixth.
+fn asm_sysv_arg_reg(n: int) -> str {
+    if n == 0 {
+        return "rdi"
+    }
+    if n == 1 {
+        return "rsi"
+    }
+    if n == 2 {
+        return "rdx"
+    }
+    if n == 3 {
+        return "rcx"
+    }
+    if n == 4 {
+        return "r8"
+    }
+    if n == 5 {
+        return "r9"
+    }
+    return ""
+}
+
+# asm_syscall_arg_reg: the x86-64 SYSCALL argument register for argument
+# `n` (0-based), or "" beyond the fifth. NOTE the deliberate difference
+# from asm_sysv_arg_reg: the kernel syscall ABI takes argument 4 in r10
+# because rcx is destroyed by the syscall instruction itself.
+fn asm_syscall_arg_reg(n: int) -> str {
+    if n == 0 {
+        return "rdi"
+    }
+    if n == 1 {
+        return "rsi"
+    }
+    if n == 2 {
+        return "rdx"
+    }
+    if n == 3 {
+        return "r10"
+    }
+    if n == 4 {
+        return "r8"
+    }
+    if n == 5 {
+        return "r9"
+    }
+    return ""
+}
+
+# asm_syscall_clobbers: the registers the `syscall` instruction destroys
+# by architecture definition (rcx <- rip, r11 <- rflags) — the minimal
+# correct explicit clobber list for a syscall stub that also carries
+# options(nomem) (syscall memory effects are described by its arguments,
+# and "cc" is on by default because syscall rewrites RFLAGS).
+fn asm_syscall_clobbers() -> list[str] {
+    let t: list[str] = []
+    t.push("rcx")
+    t.push("r11")
+    return t
+}
+
+# asm_sysv_ret_reg: the integer return register (SysV).
+fn asm_sysv_ret_reg() -> str {
+    return "rax"
+}
+
+# asm_sysv_fp_ret_reg: the floating-point return register (SysV).
+fn asm_sysv_fp_ret_reg() -> str {
+    return "xmm0"
+}
+
+# asm_caller_saved: registers a callee may destroy without saving —
+# what a C call site must assume are dead across any call.
+fn asm_caller_saved() -> list[str] {
+    let t: list[str] = []
+    t.push("rax")
+    t.push("rcx")
+    t.push("rdx")
+    t.push("rsi")
+    t.push("rdi")
+    t.push("r8")
+    t.push("r9")
+    t.push("r10")
+    t.push("r11")
+    return t
+}
+
+# asm_callee_saved: registers a callee must preserve (rbp included —
+# the frame pointer is restored even though user code never binds it).
+fn asm_callee_saved() -> list[str] {
+    let t: list[str] = []
+    t.push("rbx")
+    t.push("rbp")
+    t.push("r12")
+    t.push("r13")
+    t.push("r14")
+    t.push("r15")
+    return t
+}
+
+# asm_regs_to_save: the callee-saved registers an ISR/trampoline stub
+# actually touches and therefore must push before using. Order follows
+# asm_callee_saved (deterministic emit order for push/pop pairs).
+fn asm_regs_to_save(used: list[str]) -> list[str] {
+    let out: list[str] = []
+    let saved: list[str] = asm_callee_saved()
+    let mut i: int = 0
+    while i < saved.len() {
+        let mut j: int = 0
+        while j < used.len() {
+            if asm_regs_overlap(saved.get(i), used.get(j)) {
+                out.push(saved.get(i))
+                j = used.len()
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# asm_scratch_reg: the first caller-saved GP register not in `avoid`
+# (any spelling) — the safe scratch register for a stub whose clobber
+# list and argument registers are already fixed. Returns "" when all
+# nine caller-saved registers are spoken for.
+fn asm_scratch_reg(avoid: list[str]) -> str {
+    let cands: list[str] = asm_caller_saved()
+    let mut i: int = 0
+    while i < cands.len() {
+        let mut conflict: bool = false
+        let mut j: int = 0
+        while j < avoid.len() {
+            if asm_regs_overlap(cands.get(i), avoid.get(j)) {
+                conflict = true
+                j = avoid.len()
+            }
+            j = j + 1
+        }
+        if !conflict {
+            return cands.get(i)
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+# ---------------------------------------------------------------------------
+# Self-check invariants
+# ---------------------------------------------------------------------------
+
+# asm_check_invariants: the identities every other function relies on.
+# Returns 0 when the module is self-consistent (used by the Stage 83
+# ok-test and cheap enough for a kernel boot self-test): the GP table
+# has 16 unique entries, every spelling maps to a 64-bit base, widths
+# round-trip, and the syscall/SysV argument tables differ exactly where
+# the ABIs differ (argument 4).
+fn asm_check_invariants() -> int {
+    let gp: list[str] = asm64_gp_regs()
+    if gp.len() != 16 {
+        return 1
+    }
+    let mut i: int = 0
+    while i < 16 {
+        let mut j: int = i + 1
+        while j < 16 {
+            if gp.get(i) == gp.get(j) {
+                return 2
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    # Every sub-register spelling of the first four registers resolves.
+    if asm_reg_base("eax") != "rax" || asm_reg_base("ax") != "rax"
+    || asm_reg_base("al") != "rax" || asm_reg_base("ah") != "rax" {
+        return 3
+    }
+    if asm_reg_base("r9d") != "r9" || asm_reg_base("r9w") != "r9" || asm_reg_base("r9b") != "r9" {
+        return 4
+    }
+    if asm_reg_width("r11") != 64 || asm_reg_width("r11d") != 32
+    || asm_reg_width("r11w") != 16 || asm_reg_width("r11b") != 8 {
+        return 5
+    }
+    if asm_syscall_arg_reg(3) != "r10" || asm_sysv_arg_reg(3) != "rcx" {
+        return 6
+    }
+    if asm_fault_code(asm_clobber_fault(["rcx", "r11"])) != 0 {
+        return 7
+    }
+    if asm_fault_code(asm_clobber_fault(["eax"])) != 2 {
+        return 8
+    }
+    if asm_fault_code(asm_clobber_fault(["rax", "rax"])) != 5 {
+        return 12
+    }
+    if asm_operand_conflict("rax", ["rcx", "r11"]) != "" {
+        return 9
+    }
+    if asm_operand_conflict("eax", ["rcx", "r11"]) != "" {
+        return 10
+    }
+    if asm_scratch_reg(["rax", "rcx", "rdx", "rsi", "rdi", "r8", "r9", "r11"]) != "r10" {
+        return 11
+    }
+    return 0
+}

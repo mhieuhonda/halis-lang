@@ -492,6 +492,11 @@ fn check_asm(ctx: Ctx, env: list[map[str, Binding]], cur: str, s: StmtN) -> void
     }
     # 2) Per-operand validation.
     let mut has_output: bool = false
+    # Stage 83: per-operand fixed register (the canonical 64-bit name
+    # when the operand is bound to a specific register via a register-
+    # name string or a fixed GCC letter; "" otherwise) and the constraint
+    # body (prefix-stripped) for the type-vs-class matrix.
+    let fixed_regs: list[str] = []
     let mut k: int = 0
     while k < operands.len() {
         let op: AsmOperand = operands.get(k)
@@ -505,6 +510,8 @@ fn check_asm(ctx: Ctx, env: list[map[str, Binding]], cur: str, s: StmtN) -> void
         # Constraint validation. The codegen does the final translation;
         # the checker rejects unknown bare register classes.
         let c: str = op.constraint
+        let mut op_body: str = ""
+        let mut op_t: str = ""
         if !op.is_constraint_str {
             if c != "reg" && c != "mem" && c != "imm" {
                 cerr(op.line, "asm! constraint '" + c + "' is unknown (bare constraints: reg, mem, imm; for a specific register use a string like \"eax\")")
@@ -573,6 +580,7 @@ fn check_asm(ctx: Ctx, env: list[map[str, Binding]], cur: str, s: StmtN) -> void
             if !is_known_asm_constraint(body) {
                 cerr(op.line, "asm! constraint '" + c + "' is not a recognised x86-64 register name or GCC constraint letter (known: eax/rax/ebx/rbx/ecx/rcx/edx/rdx/esi/rsi/edi/rdi, or single-letter GCC constraints a/b/c/d/D/S/q/r/A)")
             }
+            op_body = body
             # Direction-vs-prefix consistency: `in("=r") x` is wrong
             # (`=` means write-only output). `in("+r") x` is also wrong.
             if d == "in" && (prefix_ch == "=" || prefix_ch == "+") {
@@ -588,6 +596,7 @@ fn check_asm(ctx: Ctx, env: list[map[str, Binding]], cur: str, s: StmtN) -> void
             if vt != "int" && vt != "float" && vt != "bool" {
                 cerr(op.line, "asm! `in` operand must be a primitive (int/float/bool), got " + vt)
             }
+            op_t = vt
         } else {
             # out/inout/late_out — must be a mutable lvalue.
             let ek: str = ctx.exprs[op.expr_idx].kind
@@ -617,7 +626,65 @@ fn check_asm(ctx: Ctx, env: list[map[str, Binding]], cur: str, s: StmtN) -> void
             if tt != "int" && tt != "float" && tt != "bool" {
                 cerr(op.line, "asm! " + d + " operand must be a primitive (int/float/bool), got " + tt)
             }
+            op_t = tt
         }
+        # ---- Stage 83 (v0.102.0-alpha): register-constraint soundness ----
+        # The operand's type is now known — validate that the constraint
+        # can actually hold it, and record the fixed register (if any)
+        # for the clobber/overlap analysis.
+        let mut ot: str = op_t
+        let mut ot_word: str = "an int"
+        if ot == "bool" {
+            ot_word = "a bool"
+        } else if ot == "float" {
+            ot_word = "a float"
+        }
+        let mut fixed: str = ""
+        if op.is_constraint_str {
+            let fl_reg: str = asm_fixed_letter_reg(op_body)
+            if fl_reg != "" {
+                # A fixed single-register letter ("a" -> rax, ...).
+                fixed = fl_reg
+            } else if asm_reg_width(op_body) > 0 {
+                # A specific x86-64 register name.
+                if op_body == "rsp" || op_body == "esp" || op_body == "sp" || op_body == "spl" {
+                    cerr(op.line, "asm! register '" + op_body + "' cannot be bound to an operand — the compiler owns the stack pointer")
+                }
+                if op_body == "rbp" || op_body == "ebp" || op_body == "bp" || op_body == "bpl" {
+                    cerr(op.line, "asm! register '" + op_body + "' cannot be bound to an operand — the compiler owns the frame pointer")
+                }
+                if ot == "float" {
+                    if !asm_reg_is_sse(op_body) {
+                        cerr(op.line, "asm! register '" + op_body + "' is a general-purpose register; a float operand needs an SSE register — use reg (the SSE class) or an xmm0..xmm15 name")
+                    }
+                } else {
+                    if asm_reg_is_sse(op_body) {
+                        cerr(op.line, "asm! register '" + op_body + "' is an SSE register; " + ot_word + " operand needs a general-purpose register (rax, rbx, ..., r15)")
+                    }
+                    let w: int = asm_reg_width(op_body)
+                    if w != 64 {
+                        cerr(op.line, "asm! register '" + op_body + "' is " + w.to_str() + "-bit; " + ot_word + " operand needs a 64-bit register — use '" + asm_reg_canonical(op_body) + "'")
+                    }
+                }
+                fixed = asm_reg_canonical(op_body)
+            } else if (op_body == "x" || op_body == "v") && ot != "float" {
+                cerr(op.line, "asm! constraint '" + c + "' is an SSE register class; " + ot_word + " operand needs a general-purpose class (r, q, a, b, c, d, S, D)")
+            } else if op_body == "f" || op_body == "t" || op_body == "u" || op_body == "y" {
+                if ot == "float" {
+                    cerr(op.line, "asm! constraint '" + c + "' is an x87/MMX register class; a float operand needs the SSE class — use reg or an xmm0..xmm15 name")
+                } else {
+                    cerr(op.line, "asm! constraint '" + c + "' is an x87/MMX register class; " + ot_word + " operand needs a general-purpose class (r, q, a, b, c, d, S, D)")
+                }
+            } else if ot == "float" {
+                if op_body == "a" || op_body == "b" || op_body == "c" || op_body == "d" || op_body == "S" || op_body == "D" || op_body == "q" || op_body == "r" || op_body == "R" || op_body == "Q" || op_body == "A" {
+                    cerr(op.line, "asm! constraint '" + c + "' is a general-purpose register class; a float operand needs an SSE class — use reg or an xmm0..xmm15 name")
+                }
+                if op_body == "i" || op_body == "n" || op_body == "F" || op_body == "I" || op_body == "J" || op_body == "K" || op_body == "L" || op_body == "M" || op_body == "N" || op_body == "O" || op_body == "P" {
+                    cerr(op.line, "asm! constraint '" + c + "' is an integer-immediate class; a float operand must go through a register — use reg")
+                }
+            }
+        }
+        fixed_regs.push(fixed)
         k = k + 1
     }
     # 3) Option validation.
@@ -661,6 +728,300 @@ fn check_asm(ctx: Ctx, env: list[map[str, Binding]], cur: str, s: StmtN) -> void
     if list_contains_str(options, "noreturn") && has_output {
         cerr(s.line, "asm! with `options(noreturn)` cannot have output operands (the asm does not fall through, so the outputs would never be observed)")
     }
+    # ------------------------------------------------------------------
+    # 4) Stage 83 (v0.102.0-alpha): clobber-list validation. The parser
+    # guarantees every entry is a string literal; here we check that each
+    # one names a full 64-bit register (or "cc" / "memory"), that the
+    # compiler-owned registers are not named, that the entries do not
+    # overlap each other, that they do not contradict the
+    # nomem/preserves_flags options, and that no clobbered register
+    # doubles as an operand's fixed register.
+    # ------------------------------------------------------------------
+    let clobbers: list[str] = s.asm_clobbers
+    let mut ci: int = 0
+    while ci < clobbers.len() {
+        let name: str = clobbers.get(ci)
+        if name == "rsp" || name == "esp" || name == "sp" || name == "spl" {
+            cerr(s.line, "asm! clobber '" + name + "' is not allowed — the compiler owns the stack pointer")
+        }
+        if name == "rbp" || name == "ebp" || name == "bp" || name == "bpl" {
+            cerr(s.line, "asm! clobber '" + name + "' is not allowed — the compiler owns the frame pointer")
+        }
+        if name != "cc" && name != "memory" {
+            let cw: int = asm_reg_width(name)
+            if cw == 0 {
+                cerr(s.line, "asm! clobber '" + name + "' is not a valid x86-64 register name, 'cc' or 'memory'")
+            }
+            if cw != 64 {
+                cerr(s.line, "asm! clobber '" + name + "' names a " + cw.to_str() + "-bit sub-register — clobbers must name the full 64-bit register ('" + asm_reg_canonical(name) + "')")
+            }
+        }
+        ci = ci + 1
+    }
+    let mut cj_i: int = 0
+    while cj_i < clobbers.len() {
+        let mut cj_j: int = cj_i + 1
+        while cj_j < clobbers.len() {
+            let a: str = clobbers.get(cj_i)
+            let b: str = clobbers.get(cj_j)
+            let mut ca: str = a
+            let mut cb: str = b
+            if a != "cc" && a != "memory" {
+                ca = asm_reg_canonical(a)
+            }
+            if b != "cc" && b != "memory" {
+                cb = asm_reg_canonical(b)
+            }
+            if ca != "" && ca == cb {
+                cerr(s.line, "asm! clobbers '" + a + "' and '" + b + "' overlap (both are " + ca + ")")
+            }
+            cj_j = cj_j + 1
+        }
+        cj_i = cj_i + 1
+    }
+    if list_contains_str(clobbers, "cc") {
+        # Stage 83: flag effects are controlled by the preserves_flags
+        # option, never by the clobber list — the default list ALWAYS
+        # contains "cc" unless that option is set, so an explicit entry
+        # is either redundant or a flat contradiction.
+        cerr(s.line, "asm! clobber 'cc' is not allowed — flag effects are controlled by options(preserves_flags), not the clobber list (the default clobber list already includes \"cc\")")
+    }
+    if list_contains_str(clobbers, "memory") {
+        # Same rule for memory: the default list always contains
+        # "memory" unless options(nomem) suppresses it, so an explicit
+        # entry is either redundant or contradicts nomem.
+        cerr(s.line, "asm! clobber 'memory' is not allowed — memory effects are controlled by options(nomem), not the clobber list (the default clobber list already includes \"memory\")")
+    }
+    let mut oi: int = 0
+    while oi < operands.len() {
+        let f: str = fixed_regs.get(oi)
+        if f != "" {
+            let mut ni: int = 0
+            while ni < clobbers.len() {
+                let name: str = clobbers.get(ni)
+                let mut cname: str = name
+                if name != "cc" && name != "memory" {
+                    cname = asm_reg_canonical(name)
+                }
+                if cname == f {
+                    cerr(s.line, "asm! clobber '" + name + "' overlaps operand " + oi.to_str() + " (" + operands.get(oi).dir + " \"" + operands.get(oi).constraint + "\") — a clobbered register cannot also be bound to an operand")
+                }
+                ni = ni + 1
+            }
+        }
+        let mut oj: int = oi + 1
+        while oj < operands.len() {
+            let fj: str = fixed_regs.get(oj)
+            if f != "" && fj != "" && fj == f {
+                cerr(s.line, "asm! operands " + oi.to_str() + " and " + oj.to_str() + " are both bound to '" + f + "' — each fixed register can be bound to at most one operand")
+            }
+            oj = oj + 1
+        }
+        oi = oi + 1
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Stage 83 (v0.102.0-alpha): the x86-64 register-file tables used by the
+# asm! register-constraint checker. The boot mirror lives in
+# boot/checking/stmt.py (_ASM_GP64 / asm_reg_width / ...) — the two
+# implementations MUST stay in lockstep so both compilers reject the same
+# programs with byte-identical messages.
+# ---------------------------------------------------------------------------
+fn asm_gp64() -> list[str] {
+    let t: list[str] = []
+    t.push("rax")
+    t.push("rbx")
+    t.push("rcx")
+    t.push("rdx")
+    t.push("rsi")
+    t.push("rdi")
+    t.push("rbp")
+    t.push("rsp")
+    t.push("r8")
+    t.push("r9")
+    t.push("r10")
+    t.push("r11")
+    t.push("r12")
+    t.push("r13")
+    t.push("r14")
+    t.push("r15")
+    return t
+}
+
+fn asm_gp32() -> list[str] {
+    let t: list[str] = []
+    t.push("eax")
+    t.push("ebx")
+    t.push("ecx")
+    t.push("edx")
+    t.push("esi")
+    t.push("edi")
+    t.push("ebp")
+    t.push("esp")
+    t.push("r8d")
+    t.push("r9d")
+    t.push("r10d")
+    t.push("r11d")
+    t.push("r12d")
+    t.push("r13d")
+    t.push("r14d")
+    t.push("r15d")
+    return t
+}
+
+fn asm_gp16() -> list[str] {
+    let t: list[str] = []
+    t.push("ax")
+    t.push("bx")
+    t.push("cx")
+    t.push("dx")
+    t.push("si")
+    t.push("di")
+    t.push("bp")
+    t.push("sp")
+    t.push("r8w")
+    t.push("r9w")
+    t.push("r10w")
+    t.push("r11w")
+    t.push("r12w")
+    t.push("r13w")
+    t.push("r14w")
+    t.push("r15w")
+    return t
+}
+
+fn asm_gp8l() -> list[str] {
+    let t: list[str] = []
+    t.push("al")
+    t.push("bl")
+    t.push("cl")
+    t.push("dl")
+    t.push("sil")
+    t.push("dil")
+    t.push("bpl")
+    t.push("spl")
+    t.push("r8b")
+    t.push("r9b")
+    t.push("r10b")
+    t.push("r11b")
+    t.push("r12b")
+    t.push("r13b")
+    t.push("r14b")
+    t.push("r15b")
+    return t
+}
+
+fn asm_gp8h() -> list[str] {
+    let t: list[str] = []
+    t.push("ah")
+    t.push("bh")
+    t.push("ch")
+    t.push("dh")
+    return t
+}
+
+# asm_list_index: first index of `v` in `xs`, or -1.
+fn asm_list_index(xs: list[str], v: str) -> int {
+    let mut i: int = 0
+    while i < xs.len() {
+        if xs.get(i) == v {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+# asm_reg_width: the width in bits of an x86-64 register name
+# (0 = not a register name). xmm0..xmm15 are 64-bit-capable (doubles).
+fn asm_reg_width(name: str) -> int {
+    if asm_list_index(asm_gp64(), name) >= 0 {
+        return 64
+    }
+    let mut i: int = 0
+    while i < 16 {
+        if name == "xmm" + i.to_str() {
+            return 64
+        }
+        i = i + 1
+    }
+    if asm_list_index(asm_gp32(), name) >= 0 {
+        return 32
+    }
+    if asm_list_index(asm_gp16(), name) >= 0 {
+        return 16
+    }
+    if asm_list_index(asm_gp8l(), name) >= 0 || asm_list_index(asm_gp8h(), name) >= 0 {
+        return 8
+    }
+    return 0
+}
+
+# asm_reg_is_sse: true iff `name` is one of xmm0..xmm15.
+fn asm_reg_is_sse(name: str) -> bool {
+    let mut i: int = 0
+    while i < 16 {
+        if name == "xmm" + i.to_str() {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+# asm_reg_canonical: the full 64-bit base register for any spelling
+# ("eax" -> "rax", "r9d" -> "r9", "ah" -> "rax", "xmm3" -> "xmm3").
+# Returns "" for names that are not registers.
+fn asm_reg_canonical(name: str) -> str {
+    if asm_list_index(asm_gp64(), name) >= 0 {
+        return name
+    }
+    if asm_reg_is_sse(name) {
+        return name
+    }
+    let mut idx: int = asm_list_index(asm_gp32(), name)
+    if idx >= 0 {
+        return asm_gp64().get(idx)
+    }
+    idx = asm_list_index(asm_gp16(), name)
+    if idx >= 0 {
+        return asm_gp64().get(idx)
+    }
+    idx = asm_list_index(asm_gp8l(), name)
+    if idx >= 0 {
+        return asm_gp64().get(idx)
+    }
+    idx = asm_list_index(asm_gp8h(), name)
+    if idx >= 0 {
+        return asm_gp64().get(idx)
+    }
+    return ""
+}
+
+# asm_fixed_letter_reg: the physical register a fixed single-register
+# GCC constraint letter names (HLS operands are always 64-bit, so the
+# letter maps to exactly one register). "" for class letters.
+fn asm_fixed_letter_reg(letter: str) -> str {
+    if letter == "a" {
+        return "rax"
+    }
+    if letter == "b" {
+        return "rbx"
+    }
+    if letter == "c" {
+        return "rcx"
+    }
+    if letter == "d" {
+        return "rdx"
+    }
+    if letter == "S" {
+        return "rsi"
+    }
+    if letter == "D" {
+        return "rdi"
+    }
+    return ""
 }
 
 # is_known_asm_constraint: returns true iff `body` is a recognised
@@ -735,6 +1096,41 @@ fn is_known_asm_constraint(body: str) -> bool {
     }
     if body == "r12" || body == "r13" || body == "r14" || body == "r15" {
         return true
+    }
+    # Stage 83 (v0.102.0-alpha): the remaining sub-register spellings
+    # (r8b/r8w/r8d .. r15b/r15w/r15d, sil/dil/bpl/spl, esp/ebp) and the
+    # SSE register names xmm0..xmm15 (validated for width + operand type
+    # by check_asm).
+    if body == "r8b" || body == "r9b" || body == "r10b" || body == "r11b" {
+        return true
+    }
+    if body == "r12b" || body == "r13b" || body == "r14b" || body == "r15b" {
+        return true
+    }
+    if body == "r8w" || body == "r9w" || body == "r10w" || body == "r11w" {
+        return true
+    }
+    if body == "r12w" || body == "r13w" || body == "r14w" || body == "r15w" {
+        return true
+    }
+    if body == "r8d" || body == "r9d" || body == "r10d" || body == "r11d" {
+        return true
+    }
+    if body == "r12d" || body == "r13d" || body == "r14d" || body == "r15d" {
+        return true
+    }
+    if body == "sil" || body == "dil" || body == "bpl" || body == "spl" {
+        return true
+    }
+    if body == "esp" || body == "ebp" {
+        return true
+    }
+    let mut sse_i: int = 0
+    while sse_i < 16 {
+        if body == "xmm" + sse_i.to_str() {
+            return true
+        }
+        sse_i = sse_i + 1
     }
     return false
 }

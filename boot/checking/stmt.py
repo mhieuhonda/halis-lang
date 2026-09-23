@@ -6,6 +6,70 @@ from .helpers import (
     instantiate_type, is_list, list_elem, type_base,
 )
 
+
+# ---------------------------------------------------------------------------
+# Stage 83 (v0.102.0-alpha): the x86-64 register-file tables used by the
+# asm! register-constraint checker. The self-hosted mirror lives in
+# src/hlc/check_expr.hls (asm_reg_width / asm_reg_canonical) — the two
+# implementations MUST stay in lockstep so both compilers reject the same
+# programs with byte-identical messages.
+# ---------------------------------------------------------------------------
+_ASM_GP64 = ("rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp",
+             "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15")
+_ASM_GP32 = ("eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp",
+             "r8d", "r9d", "r10d", "r11d", "r12d", "r13d", "r14d", "r15d")
+_ASM_GP16 = ("ax", "bx", "cx", "dx", "si", "di", "bp", "sp",
+             "r8w", "r9w", "r10w", "r11w", "r12w", "r13w", "r14w", "r15w")
+_ASM_GP8L = ("al", "bl", "cl", "dl", "sil", "dil", "bpl", "spl",
+             "r8b", "r9b", "r10b", "r11b", "r12b", "r13b", "r14b", "r15b")
+_ASM_GP8H = ("ah", "bh", "ch", "dh")
+_ASM_SSE = tuple("xmm%d" % i for i in range(16))
+# Fixed single-register GCC constraint letters (the register the letter
+# names depends on the operand width; HLS operands are always 64-bit, so
+# each letter maps to exactly one physical register for overlap analysis).
+_ASM_FIXED_LETTERS = {"a": "rax", "b": "rbx", "c": "rcx", "d": "rdx",
+                      "S": "rsi", "D": "rdi"}
+# The compiler owns these registers — operands may not bind them and the
+# clobber list may not name them (any width spelling).
+_ASM_STACK_PTRS = ("rsp", "esp", "sp", "spl")
+_ASM_FRAME_PTRS = ("rbp", "ebp", "bp", "bpl")
+
+
+def asm_reg_width(name):
+    """Width in bits of an x86-64 register name (0 = unknown)."""
+    if name in _ASM_GP64:
+        return 64
+    if name in _ASM_SSE:
+        return 64
+    if name in _ASM_GP32:
+        return 32
+    if name in _ASM_GP16:
+        return 16
+    if name in _ASM_GP8L or name in _ASM_GP8H:
+        return 8
+    return 0
+
+
+def asm_reg_canonical(name):
+    """The full 64-bit base register for any spelling ("eax" -> "rax",
+    "r9d" -> "r9", "ah" -> "rax", "xmm3" -> "xmm3"). "" if unknown."""
+    if name in _ASM_GP64 or name in _ASM_SSE:
+        return name
+    if name in _ASM_GP32:
+        return _ASM_GP64[_ASM_GP32.index(name)]
+    if name in _ASM_GP16:
+        return _ASM_GP64[_ASM_GP16.index(name)]
+    if name in _ASM_GP8L:
+        return _ASM_GP64[_ASM_GP8L.index(name)]
+    if name in _ASM_GP8H:
+        return _ASM_GP64[_ASM_GP8H.index(name)]
+    return ""
+
+
+def asm_reg_is_sse(name):
+    return name in _ASM_SSE
+
+
 class CheckerStmt(object):
     def check_stmts(self, stmts, env, fn, in_loop):
         for s in stmts:
@@ -322,7 +386,13 @@ class CheckerStmt(object):
                 i = i + 1
         # Validate each operand.
         has_output = False
+        # Stage 83: per-operand fixed register (the canonical 64-bit
+        # name when the operand is bound to a specific register via a
+        # register-name string or a fixed GCC letter; "" otherwise).
+        fixed_regs = []
+        op_idx = -1
         for op in operands:
+            op_idx = op_idx + 1
             d = op["dir"]
             if d not in ("in", "out", "inout", "late_out"):
                 self.err("asm! operand direction '%s' is unknown" % d, s)
@@ -406,12 +476,22 @@ class CheckerStmt(object):
                                  "g", "X", "p", "v", "z")
                 # x86-64 register names we accept (the codegen translates
                 # these to GCC constraint letters; see translate_asm_constraint).
+                # Stage 83 adds xmm0..xmm15 (SSE — float operands only)
+                # and r8..r15 with their b/w/d sub-register spellings
+                # (r8b/r8w/r8d...), all validated for width below.
                 known_reg = ("eax", "rax", "ebx", "rbx", "ecx", "rcx",
                              "edx", "rdx", "esi", "rsi", "edi", "rdi",
                              "al", "bl", "cl", "dl", "ah", "bh", "ch", "dh",
                              "ax", "bx", "cx", "dx", "si", "di", "bp", "sp",
                              "rbp", "rsp", "r8", "r9", "r10", "r11",
-                             "r12", "r13", "r14", "r15")
+                             "r12", "r13", "r14", "r15",
+                             "r8b", "r9b", "r10b", "r11b", "r12b", "r13b",
+                             "r14b", "r15b", "r8w", "r9w", "r10w", "r11w",
+                             "r12w", "r13w", "r14w", "r15w",
+                             "r8d", "r9d", "r10d", "r11d", "r12d", "r13d",
+                             "r14d", "r15d", "sil", "dil", "bpl", "spl",
+                             "esp", "ebp")
+                known_reg = known_reg + _ASM_SSE
                 # If the user already prefixed the constraint with `=` or
                 # `+` (e.g. `out("=r") x`), validate the BODY (after the
                 # prefix). The codegen has special-case logic to skip
@@ -484,6 +564,80 @@ class CheckerStmt(object):
                 # Annotate the operand with the resolved type for
                 # the codegen (matches the self-hosted checker).
                 op["t"] = tt
+            # Stage 83 (v0.102.0-alpha): register-constraint soundness.
+            # The operand's type is now known — validate that the
+            # constraint can actually hold it, and record the fixed
+            # register (if any) for the clobber/overlap analysis.
+            ot = vt if d == "in" else tt
+            ot_word = {"int": "an int", "bool": "a bool",
+                       "float": "a float"}[ot]
+            fixed = ""
+            if op["is_constraint_str"]:
+                if body in _ASM_FIXED_LETTERS:
+                    # A fixed single-register letter ("a" -> rax, ...).
+                    # HLS operands are always 64-bit, so the letter
+                    # names exactly one physical register.
+                    fixed = _ASM_FIXED_LETTERS[body]
+                elif asm_reg_width(body) > 0:
+                    # A specific x86-64 register name.
+                    if body in _ASM_STACK_PTRS:
+                        self.err("asm! register '%s' cannot be bound to "
+                                 "an operand — the compiler owns the "
+                                 "stack pointer" % body, s)
+                    if body in _ASM_FRAME_PTRS:
+                        self.err("asm! register '%s' cannot be bound to "
+                                 "an operand — the compiler owns the "
+                                 "frame pointer" % body, s)
+                    if ot == "float":
+                        if not asm_reg_is_sse(body):
+                            self.err("asm! register '%s' is a general-"
+                                     "purpose register; a float operand "
+                                     "needs an SSE register — use reg "
+                                     "(the SSE class) or an xmm0..xmm15 "
+                                     "name" % body, s)
+                    else:
+                        if asm_reg_is_sse(body):
+                            self.err("asm! register '%s' is an SSE "
+                                     "register; %s operand needs a "
+                                     "general-purpose register (rax, "
+                                     "rbx, ..., r15)" % (body, ot_word), s)
+                        w = asm_reg_width(body)
+                        if w != 64:
+                            self.err("asm! register '%s' is %d-bit; %s "
+                                     "operand needs a 64-bit register — "
+                                     "use '%s'" % (body, w, ot_word,
+                                                   asm_reg_canonical(body)), s)
+                    fixed = asm_reg_canonical(body)
+                elif body in ("x", "v") and ot != "float":
+                    self.err("asm! constraint '%s' is an SSE register "
+                             "class; %s operand needs a general-purpose "
+                             "class (r, q, a, b, c, d, S, D)"
+                             % (c, ot_word), s)
+                elif body in ("f", "t", "u", "y"):
+                    if ot == "float":
+                        self.err("asm! constraint '%s' is an x87/MMX "
+                                 "register class; a float operand needs "
+                                 "the SSE class — use reg or an "
+                                 "xmm0..xmm15 name" % c, s)
+                    else:
+                        self.err("asm! constraint '%s' is an x87/MMX "
+                                 "register class; %s operand needs a "
+                                 "general-purpose class (r, q, a, b, "
+                                 "c, d, S, D)" % (c, ot_word), s)
+                elif ot == "float":
+                    if body in ("a", "b", "c", "d", "S", "D", "q", "r",
+                                "R", "Q", "A"):
+                        self.err("asm! constraint '%s' is a general-"
+                                 "purpose register class; a float "
+                                 "operand needs an SSE class — use reg "
+                                 "or an xmm0..xmm15 name" % c, s)
+                    if body in ("i", "n", "F", "I", "J", "K", "L", "M",
+                                "N", "O", "P"):
+                        self.err("asm! constraint '%s' is an integer-"
+                                 "immediate class; a float operand must "
+                                 "go through a register — use reg"
+                                 % c, s)
+            fixed_regs.append(fixed)
         # Option validation.
         # Stage 27 perfection (v0.50.2-alpha) deep-scan-17: reject
         # duplicate option names (e.g. `options(pure, pure)` is a
@@ -532,6 +686,86 @@ class CheckerStmt(object):
             self.err("asm! with `options(noreturn)` cannot have output "
                      "operands (the asm does not fall through, so the "
                      "outputs would never be observed)", s)
+        # ------------------------------------------------------------------
+        # Stage 83 (v0.102.0-alpha): clobber-list validation. The parser
+        # guarantees every entry is a string literal; here we check that
+        # each one names a full 64-bit register (or "cc" / "memory"), that
+        # the compiler-owned registers are not named, that the entries do
+        # not overlap each other, that they do not contradict the
+        # nomem/preserves_flags options, and that no clobbered register
+        # doubles as an operand's fixed register.
+        # ------------------------------------------------------------------
+        clobbers = s.get("clobbers", [])
+        for name in clobbers:
+            if name in _ASM_STACK_PTRS:
+                self.err("asm! clobber '%s' is not allowed — the "
+                         "compiler owns the stack pointer" % name, s)
+            if name in _ASM_FRAME_PTRS:
+                self.err("asm! clobber '%s' is not allowed — the "
+                         "compiler owns the frame pointer" % name, s)
+            if name not in ("cc", "memory"):
+                w = asm_reg_width(name)
+                if w == 0:
+                    self.err("asm! clobber '%s' is not a valid x86-64 "
+                             "register name, 'cc' or 'memory'" % name, s)
+                if w != 64:
+                    self.err("asm! clobber '%s' names a %d-bit "
+                             "sub-register — clobbers must name the full "
+                             "64-bit register ('%s')"
+                             % (name, w, asm_reg_canonical(name)), s)
+        ci = 0
+        while ci < len(clobbers):
+            cj = ci + 1
+            while cj < len(clobbers):
+                a = clobbers[ci]
+                b = clobbers[cj]
+                ca = a if a in ("cc", "memory") else asm_reg_canonical(a)
+                cb = b if b in ("cc", "memory") else asm_reg_canonical(b)
+                if ca != "" and ca == cb:
+                    self.err("asm! clobbers '%s' and '%s' overlap (both "
+                             "are %s)" % (a, b, ca), s)
+                cj = cj + 1
+            ci = ci + 1
+        if "cc" in clobbers:
+            # Stage 83: flag effects are controlled by the
+            # preserves_flags option, never by the clobber list — the
+            # default list ALWAYS contains "cc" unless that option is
+            # set, so an explicit entry is either redundant or (under
+            # options(preserves_flags)) a flat contradiction.
+            self.err("asm! clobber 'cc' is not allowed — flag effects "
+                     "are controlled by options(preserves_flags), not "
+                     "the clobber list (the default clobber list "
+                     "already includes \"cc\")", s)
+        if "memory" in clobbers:
+            # Same rule for memory: the default list always contains
+            # "memory" unless options(nomem) suppresses it, so an
+            # explicit entry is either redundant or contradicts nomem.
+            self.err("asm! clobber 'memory' is not allowed — memory "
+                     "effects are controlled by options(nomem), not "
+                     "the clobber list (the default clobber list "
+                     "already includes \"memory\")", s)
+        oi = 0
+        while oi < len(operands):
+            f = fixed_regs[oi]
+            if f != "":
+                for name in clobbers:
+                    cname = name if name in ("cc", "memory") \
+                        else asm_reg_canonical(name)
+                    if cname == f:
+                        self.err("asm! clobber '%s' overlaps operand %d "
+                                 "(%s \"%s\") — a clobbered register "
+                                 "cannot also be bound to an operand"
+                                 % (name, oi, operands[oi]["dir"],
+                                    operands[oi]["constraint"]), s)
+            oj = oi + 1
+            while oj < len(operands):
+                fj = fixed_regs[oj]
+                if f != "" and fj != "" and fj == f:
+                    self.err("asm! operands %d and %d are both bound to "
+                             "'%s' — each fixed register can be bound to "
+                             "at most one operand" % (oi, oj, f), s)
+                oj = oj + 1
+            oi = oi + 1
 
     def check_assign(self, s, env):
         tgt = s["target"]

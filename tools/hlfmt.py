@@ -296,6 +296,14 @@ def format_source(src: bytes) -> str:
             if cur_is_sym and cur_v == "!" and (prev_kind in WORD_KINDS or
                                  (prev_is_sym and prev_v in SPACE_AFTER_SYMS)):
                 need_space = True
+            # Stage 83 (v0.102.0-alpha): the asm! postfix `!` hugs the
+            # `asm` keyword — `asm!` is one unit (a macro-call sigil),
+            # unlike the unary prefix `!` which keeps its space (`if !x`).
+            # Before this fix every asm! statement round-tripped as
+            # `asm !(` and hlfmt -c flagged every asm!-bearing file as
+            # NOT formatted (a pre-existing Stage 27 formatter gap).
+            if cur_is_sym and cur_v == "!" and prev_kind == "kw" and prev_v == "asm":
+                need_space = False
             # Don't double-up spaces — and never emit a space at the
             # START of a line. BUG (deep-scan-5): at indent 0 the line
             # prefix is the empty string, so the guard below saw

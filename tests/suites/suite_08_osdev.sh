@@ -382,3 +382,108 @@ else
     bad "stack: make stackguard-acceptance failed"
     tail -15 "$TMP/stk_acc82.log"
 fi
+
+# ======================================================================
+# Stage 83 (v0.102.0-alpha): inline-asm register constraints
+# (clobber, input, output). Named registers bind the full 64-bit
+# register, int/bool operands need 64-bit GP names, floats need SSE,
+# the stack/frame pointers are compiler-owned, the clobber list is
+# explicit (`clobber("rcx", "r11")`) and may not overlap a bound
+# operand, and r8..r15 / xmm lower through GCC local register
+# variables. `core.asm` is the register file as data.
+ASM_F=tests/ok/feat_stage83_asmreg.hls
+# (a) the asmreg ok-test checks + runs on the interpreter (exit 0; it
+#     exercises the core.asm model and only DECLARES the asm! blocks).
+asm_interp_code=0
+python3 boot/boot.py "$ASM_F" </dev/null >/dev/null 2>&1 || asm_interp_code=$?
+if [ "$asm_interp_code" -eq 0 ]; then
+    ok "asmreg: feat_stage83_asmreg runs on the interpreter (exit 0)"
+else
+    bad "asmreg: feat_stage83_asmreg interpreter exit=$asm_interp_code"
+fi
+# (b) the asm module resolves through the `core.` prefix.
+if [ -f "core/asm.hls" ]; then
+    ok "asmreg: core/asm.hls present"
+else
+    bad "asmreg: core/asm.hls missing"
+fi
+# (c) every Stage 83 fail program is rejected by Stage-0 with the
+#     Stage 83 message, and the self-hosted checker agrees.
+for ff in tests/fail/fail_asmreg_*.hls; do
+    asm_name=$(basename "$ff" .hls)
+    asm_err=$(python3 boot/boot.py --check "$ff" 2>&1 >/dev/null); asm_rc=$?
+    if [ "$asm_rc" -eq 1 ] && echo "$asm_err" | grep -q "asm!"; then
+        ok "asmreg: $asm_name rejected by boot ($asm_err)"
+    else
+        bad "asmreg: $asm_name not rejected with an asm! message (rc=$asm_rc)"
+    fi
+    if python3 boot/boot.py src/hlc.hls "$ff" "$TMP/asm83_fail.c" >/dev/null 2>&1; then
+        bad "asmreg: $asm_name accepted by the self-hosted checker"
+    else
+        ok "asmreg: $asm_name rejected by hlc too (parity)"
+    fi
+done
+# (d) the demo compiles natively, runs (exit 0) and exercises the
+#     named-register + clobber machinery for real.
+if [ -x "$TMP/hlc1" ]; then
+    if "$TMP/hlc1" examples/asmreg_demo.hls "$TMP/asm83_demo.c" >/dev/null 2>&1 \
+        && gcc -O2 -Werror -o "$TMP/asm83_demo" "$TMP/asm83_demo.c" -lm -pthread 2>"$TMP/asm83_gcc.log"; then
+        demo_out=$("$TMP/asm83_demo" </dev/null 2>/dev/null); demo_code=$?
+        if [ "$demo_code" -eq 0 ] && echo "$demo_out" | grep -q "DEMO OK"; then
+            ok "asmreg: examples/asmreg_demo.hls runs natively, DEMO OK"
+        else
+            bad "asmreg: examples/asmreg_demo.hls exit=$demo_code (want 0 + DEMO OK)"
+        fi
+    else
+        bad "asmreg: examples/asmreg_demo.hls failed to compile + link"
+        cat "$TMP/asm83_gcc.log" 2>/dev/null | head -5
+    fi
+fi
+# (e) the C lowering uses GCC local register variables for the
+#     extended registers and appends the explicit clobber list.
+if [ -f "$TMP/asm83_demo.c" ]; then
+    if grep -q '__asm__("r10")' "$TMP/asm83_demo.c" \
+        && grep -q '__asm__("xmm0")' "$TMP/asm83_demo.c" \
+        && grep -q '"cc", "rcx"' "$TMP/asm83_demo.c" \
+        && grep -q '"cc", "xmm3"' "$TMP/asm83_demo.c" \
+        && grep -q '"cc", "memory"' "$TMP/asm83_demo.c"; then
+        ok "asmreg: C lowering has register variables + explicit clobbers"
+    else
+        bad "asmreg: C lowering missing register variables / explicit clobbers"
+    fi
+fi
+# (f) the no_std ok-test links -nostdlib (freestanding parity: the
+#     core.asm module and the declared asm! blocks carry no libc).
+if [ -x "$TMP/hlc1" ]; then
+    sed 's/^#!\[no_std\]$/#![freestanding]/' "$ASM_F" > "$TMP/asm83_fs.hls"
+    if python3 boot/boot.py src/hlc.hls "$TMP/asm83_fs.hls" "$TMP/asm83_fs.c" >/dev/null 2>&1 \
+        && grep -q "void _start(void)" "$TMP/asm83_fs.c"; then
+        if gcc -O2 -ffreestanding -nostdlib -ffunction-sections \
+                -fno-stack-protector -Wl,--gc-sections \
+                -o "$TMP/asm83_fs" "$TMP/asm83_fs.c" 2>"$TMP/asm83_fs.log"; then
+            "$TMP/asm83_fs" </dev/null >/dev/null 2>&1; asm_fs_code=$?
+            if [ "$asm_fs_code" -eq 0 ]; then
+                ok "asmreg: ok-test links -nostdlib and exits 0 (freestanding)"
+            else
+                bad "asmreg: freestanding ok-test exit=$asm_fs_code (want 0)"
+            fi
+        else
+            bad "asmreg: freestanding link failed"
+            head -5 "$TMP/asm83_fs.log"
+        fi
+    else
+        bad "asmreg: freestanding emission failed (no _start)"
+    fi
+fi
+# (g) make asmreg-acceptance runs end-to-end.
+if make asmreg-acceptance >"$TMP/asm_acc83.log" 2>&1; then
+    if grep -q "ACCEPTANCE OK: Stage 83" "$TMP/asm_acc83.log"; then
+        ok "asmreg: make asmreg-acceptance runs end-to-end"
+    else
+        bad "asmreg: make asmreg-acceptance did not print ACCEPTANCE OK"
+        tail -5 "$TMP/asm_acc83.log"
+    fi
+else
+    bad "asmreg: make asmreg-acceptance failed"
+    tail -15 "$TMP/asm_acc83.log"
+fi

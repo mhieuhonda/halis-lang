@@ -1,0 +1,93 @@
+# asmreg_demo.hls — Stage 83 (v0.102.0-alpha): inline-asm register
+# constraints (clobber, input, output).
+#
+# The companion to examples/asm_demo.hls (Stage 27): that demo showed
+# the four asm! FORMS; this one shows what Stage 83 adds on top —
+# honest register bindings and an explicit clobber list:
+#
+#   * a named register binds exactly that 64-bit register ("rax", not
+#     "eax" — the narrow spellings are rejected by both compilers);
+#   * registers with no GCC constraint letter (r8..r15) and pinned SSE
+#     registers (xmm0..xmm15) lower through GCC local register
+#     variables, so the template sees the register you named;
+#   * `clobber("rcx", "r11", ...)` declares the registers an asm block
+#     destroys, the way every syscall stub must (the `syscall`
+#     instruction definitionally wrecks rcx and r11);
+#   * a bool operand through a named register is carried in an int64_t
+#     register variable (the C bool is one byte wide).
+#
+# main() runs the safe helpers; the syscall-shaped stub at the bottom
+# is declared but never called (it would exit the process).
+import "core.asm"
+
+fn main() -> int uses IO {
+    println("Stage 83 asm register-constraint demo:")
+
+    # 1. Exchange two values through pinned registers: the asm swaps
+    #    rax and rbx, and the writebacks store each register back into
+    #    the OTHER variable. No clobber list needed (nothing else is
+    #    destroyed), flags preserved.
+    let mut a: int = 111
+    let mut b: int = 222
+    asm!("xchg %0, %1", inout("rax") a, inout("rbx") b, options(nomem, preserves_flags))
+    println("  xchg via rax/rbx     -> a=" + a.to_str() + " b=" + b.to_str())
+
+    # 2. Extended registers + an explicit clobber: r10/r11 have no GCC
+    #    constraint letter (lowered through local register variables),
+    #    and the block trashes rcx on purpose — declared, so the
+    #    compiler keeps nothing live in it. Flags are NOT preserved
+    #    (add/xor write RFLAGS), so no preserves_flags here.
+    let mut sum: int = 40
+    asm!("add %1, %0", in("r11") 2, inout("r10") sum, clobber("rcx"), options(nomem))
+    println("  add via r10 += r11   -> sum=" + sum.to_str() + " (rcx declared clobbered)")
+
+    # 3. A pinned SSE register: float math on xmm0 with xmm3 declared
+    #    destroyed (the compiler will not keep a float operand live in
+    #    a register the asm wrecks).
+    let mut acc: float = 1.25
+    asm!("addsd %1, %0", in("xmm2") 2.5, inout("xmm0") acc, clobber("xmm3"), options(nomem))
+    println("  addsd via xmm0       -> acc=" + acc.to_str())
+
+    # 4. A bool through a named register: r14 gets 1 from the asm, the
+    #    register-variable lowering converts it back to a Halis bool.
+    let mut hit: bool = false
+    asm!("mov $1, %0", out("r14") hit, options(nomem))
+    println("  bool via r14         -> hit=" + hit.to_str())
+
+    # 5. The default clobbers are the right answer for a full barrier:
+    #    mfence orders every store this thread has made (that is the
+    #    default "memory" clobber) and rewrites no flags it needs...
+    #    but the checker forbids spelling "memory"/"cc" in the clobber
+    #    list — those effects belong to the options. A bare asm! keeps
+    #    both defaults, which is exactly what a barrier wants.
+    asm!("mfence")
+    println("  mfence               -> store buffer drained (default clobbers)")
+
+    # 6. The register-file model, self-checked: the same facts the
+    #    compiler enforces, queryable at runtime (core.asm).
+    let inv: int = asm_check_invariants()
+    println("  core.asm invariants  -> " + inv.to_str() + " (0 = self-consistent)")
+
+    if a == 222 && b == 111 && sum == 42 && acc == 3.75 && hit && inv == 0 {
+        println("DEMO OK")
+        return 0
+    }
+    println("DEMO FAILED")
+    return 1
+}
+
+# ---------------------------------------------------------------------
+# Declared, never called: the syscall-shaped stub. rax carries the
+# number in AND the result out (inout), rdi/rsi carry the first two
+# arguments (SysV), and rcx/r11 are the architecture-defined destroys
+# of the `syscall` instruction — the exact list asm_syscall_clobbers()
+# returns. Calling this from main would exit the process (syscall 60),
+# so the demo only proves it compiles: both checkers accept the shape,
+# and the clobber analysis would reject a version that forgot rcx/r11
+# while GCC kept a value live in either register.
+# ---------------------------------------------------------------------
+fn stub_exit_group(code: int) -> int {
+    let mut ret: int = 231
+    asm!("syscall", in("rdi") code, inout("rax") ret, clobber("rcx", "r11"), options(nomem))
+    return ret
+}

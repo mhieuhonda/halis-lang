@@ -1,0 +1,337 @@
+# feat_stage83_asmreg.hls — Stage 83 (v0.102.0-alpha): a `#![no_std]`
+# crate exercising `core.asm` end to end: width lookup for every
+# spelling class, base-register identity, overlap analysis, the SSE
+# table, the clobber-list validator (every AsmFault + the clean list),
+# operand-conflict lookup, the SysV call ABI vs the syscall ABI
+# (argument 4 moves rcx -> r10), the registers `syscall` destroys,
+# caller/callee-saved sets, the stub-save filter, the scratch-picker,
+# and the module self-check — plus the LANGUAGE half: this crate
+# DECLARES asm! blocks with clobber lists, specific 64-bit registers,
+# an extended register (r10), an SSE float operand and a bool operand
+# through a named register, all of which both checkers must accept
+# (and which only run natively — main() never calls them, because the
+# boot interpreter cannot execute assembly). Exit code is 0 on success
+# (the differential suite compares interpreter-vs-native exit codes);
+# any positive exit code is the number of the first failed assertion.
+#![no_std]
+
+import "core.asm"
+import "core.panic"
+
+# An effect-free handler (no `uses` — the `#![no_std]` mode bans
+# capabilities). The ok-test never panics; the handler only proves the
+# two modules compose in the same crate.
+#[panic_handler]
+fn panic_handler(msg: str) -> void {
+    let info: PanicInfo = panic_info_new(msg, "asmreg.hls", 0)
+    let text: str = panic_format(info)
+    if text.len() == 0 {
+        return
+    }
+}
+
+# ---------------------------------------------------------------------
+# Declared-but-not-called asm! forms (the LANGUAGE half of Stage 83).
+# Both checkers accept every form below; the native binary compiles
+# them to GCC extended asm with local register variables where needed.
+# ---------------------------------------------------------------------
+
+# A syscall-shaped stub: rcx/r11 are the architecture-defined destroys
+# of the `syscall` instruction (asm_syscall_clobbers), nomem keeps the
+# default "memory" clobber out, and the default "cc" stays because
+# syscall rewrites RFLAGS. The number goes IN rax and the result comes
+# OUT of rax, so the operand is an inout seeded with the syscall number
+# — exactly how a real syscall stub reads.
+fn stub_syscall_shape(nr: int, a0: int, a1: int) -> int {
+    let mut ret: int = nr
+    asm!("syscall"
+    , in("rdi") a0, in("rsi") a1, inout("rax") ret
+    , clobber("rcx", "r11"), options(nomem))
+    return ret
+}
+
+# An extended register: r10 has no GCC constraint letter, so this
+# lowers through a local register variable (`register long t
+# __asm__("r10")`).
+fn stub_r10_add(a: int, b: int) -> int {
+    let mut s: int = a
+    asm!("add %1, %0", in("r11") b, inout("r10") s, options(nomem, preserves_flags))
+    return s
+}
+
+# An SSE float operand pinned to a specific XMM register (local
+# register variable with a double carrier).
+fn stub_xmm_add(a: float, b: float) -> float {
+    let mut s: float = a
+    asm!("addsd %1, %0", in("xmm2") b, inout("xmm0") s, options(nomem))
+    return s
+}
+
+# A bool operand through a named register: the C `bool` is one byte,
+# so the lowering carries it in an int64_t register variable and
+# converts on writeback — the asm sees the full 64-bit register.
+fn stub_bool_in_named_reg() -> bool {
+    let mut hit: bool = false
+    asm!("mov $1, %0", out("r14") hit, options(nomem))
+    return hit
+}
+
+# A fixed-register operand pair with an explicit clobber list that
+# does NOT overlap the operands (checked statically by both compilers).
+fn stub_xchg(a: int, b: int) -> int {
+    let mut x: int = a
+    let mut y: int = b
+    asm!("xchg %0, %1", inout("rax") x, inout("rbx") y, clobber("r9"), options(nomem, preserves_flags))
+    return y
+}
+
+fn main() -> int {
+    # ------------------------------------------------------------------
+    # Width lookup (1..12)
+    # ------------------------------------------------------------------
+    if asm_reg_width("rax") != 64 {
+        return 1
+    }
+    if asm_reg_width("r15") != 64 {
+        return 2
+    }
+    if asm_reg_width("eax") != 32 {
+        return 3
+    }
+    if asm_reg_width("r9d") != 32 {
+        return 4
+    }
+    if asm_reg_width("ax") != 16 {
+        return 5
+    }
+    if asm_reg_width("r12w") != 16 {
+        return 6
+    }
+    if asm_reg_width("al") != 8 {
+        return 7
+    }
+    if asm_reg_width("r13b") != 8 {
+        return 8
+    }
+    if asm_reg_width("ah") != 8 {
+        return 9
+    }
+    if asm_reg_width("xmm0") != 64 {
+        return 10
+    }
+    if asm_reg_width("xmm15") != 64 {
+        return 11
+    }
+    if asm_reg_width("bogus") != 0 || asm_reg_width("exa") != 0 {
+        return 12
+    }
+
+    # ------------------------------------------------------------------
+    # Base-register identity + overlap (13..24)
+    # ------------------------------------------------------------------
+    if asm_reg_base("eax") != "rax" {
+        return 13
+    }
+    if asm_reg_base("ax") != "rax" || asm_reg_base("al") != "rax" || asm_reg_base("ah") != "rax" {
+        return 14
+    }
+    if asm_reg_base("r9d") != "r9" || asm_reg_base("r9w") != "r9" || asm_reg_base("r9b") != "r9" {
+        return 15
+    }
+    if asm_reg_base("sil") != "rsi" || asm_reg_base("dil") != "rdi" || asm_reg_base("bpl") != "rbp" || asm_reg_base("spl") != "rsp" {
+        return 16
+    }
+    if asm_reg_base("xmm3") != "xmm3" {
+        return 17
+    }
+    if asm_reg_base("bogus") != "" {
+        return 18
+    }
+    if !asm_regs_overlap("eax", "rax") {
+        return 19
+    }
+    if !asm_regs_overlap("al", "ah") {
+        # deliberately conservative: both live inside rax
+        return 20
+    }
+    if asm_regs_overlap("rax", "rbx") {
+        return 21
+    }
+    if asm_regs_overlap("xmm0", "rax") {
+        return 22
+    }
+    if !asm_regs_overlap("r10d", "r10") {
+        return 23
+    }
+    if asm_regs_overlap("bogus", "rax") {
+        return 24
+    }
+
+    # ------------------------------------------------------------------
+    # SSE classification + clobber validity (25..30)
+    # ------------------------------------------------------------------
+    if !asm_reg_is_sse("xmm0") || !asm_reg_is_sse("xmm15") {
+        return 25
+    }
+    if asm_reg_is_sse("rax") || asm_reg_is_sse("xmm16") {
+        return 26
+    }
+    if !asm_valid_clobber("rcx") || !asm_valid_clobber("r11") || !asm_valid_clobber("xmm0") {
+        return 27
+    }
+    if asm_valid_clobber("eax") || asm_valid_clobber("al") {
+        return 28
+    }
+    if asm_valid_clobber("rsp") || asm_valid_clobber("rbp") {
+        return 29
+    }
+    if asm_valid_clobber("nope") || asm_valid_clobber("cc") || asm_valid_clobber("memory") {
+        # cc/memory are option-controlled, never clobber-list entries
+        return 30
+    }
+
+    # ------------------------------------------------------------------
+    # The clobber validator: every fault, in check order (31..40)
+    # ------------------------------------------------------------------
+    if asm_fault_code(asm_clobber_fault(["rcx", "r11"])) != 0 {
+        return 31
+    }
+    if asm_fault_code(asm_clobber_fault([])) != 0 {
+        return 32
+    }
+    if asm_fault_name(asm_clobber_fault([])) != "none" {
+        return 33
+    }
+    if asm_fault_code(asm_clobber_fault(["q15"])) != 1 {
+        return 34
+    }
+    if asm_fault_name(asm_clobber_fault(["q15"])) != "bad-name" {
+        return 35
+    }
+    if asm_fault_code(asm_clobber_fault(["eax"])) != 2 {
+        return 36
+    }
+    if asm_fault_code(asm_clobber_fault(["rcx", "ecx"])) != 2 {
+        # per-entry sub-register fires before pair overlap
+        return 37
+    }
+    if asm_fault_code(asm_clobber_fault(["rsp"])) != 3 {
+        return 38
+    }
+    if asm_fault_code(asm_clobber_fault(["rbp"])) != 4 {
+        return 39
+    }
+    if asm_fault_code(asm_clobber_fault(["rcx", "rcx"])) != 5 {
+        return 40
+    }
+    if asm_fault_code(asm_clobber_fault(["memory"])) != 7 {
+        return 66
+    }
+    if asm_fault_name(asm_clobber_fault(["cc"])) != "reserved-clobber" {
+        return 67
+    }
+
+    # ------------------------------------------------------------------
+    # Operand conflicts (41..46)
+    # ------------------------------------------------------------------
+    if asm_operand_conflict("rax", ["rcx", "r11"]) != "" {
+        return 41
+    }
+    if asm_operand_conflict("eax", ["rcx", "r11"]) != "" {
+        return 42
+    }
+    if asm_operand_conflict("rax", ["rcx", "rax"]) != "rax" {
+        return 43
+    }
+    if asm_operand_conflict("eax", ["rcx", "rax"]) != "rax" {
+        # any spelling of the same physical register conflicts
+        return 44
+    }
+    if asm_operand_conflict("rbx", ["cc", "memory"]) != "" {
+        return 45
+    }
+    if asm_operand_conflict("r10", ["r10d"]) != "r10d" {
+        # hmm — r10d alone would fail the compiler's sub-register rule,
+        # but the conflict lookup is a pure overlap query
+        return 46
+    }
+
+    # ------------------------------------------------------------------
+    # SysV call ABI vs syscall ABI (47..56)
+    # ------------------------------------------------------------------
+    if asm_sysv_arg_reg(0) != "rdi" || asm_sysv_arg_reg(1) != "rsi" || asm_sysv_arg_reg(2) != "rdx" {
+        return 47
+    }
+    if asm_sysv_arg_reg(3) != "rcx" || asm_sysv_arg_reg(4) != "r8" || asm_sysv_arg_reg(5) != "r9" {
+        return 48
+    }
+    if asm_sysv_arg_reg(6) != "" || asm_sysv_arg_reg(-1) != "" {
+        return 49
+    }
+    if asm_syscall_arg_reg(0) != "rdi" || asm_syscall_arg_reg(1) != "rsi" || asm_syscall_arg_reg(2) != "rdx" {
+        return 50
+    }
+    if asm_syscall_arg_reg(3) != "r10" {
+        # THE difference: syscall arg4 is r10, not rcx
+        return 51
+    }
+    if asm_syscall_arg_reg(4) != "r8" || asm_syscall_arg_reg(5) != "r9" || asm_syscall_arg_reg(6) != "" {
+        return 52
+    }
+    if asm_sysv_ret_reg() != "rax" {
+        return 53
+    }
+    if asm_sysv_fp_ret_reg() != "xmm0" {
+        return 54
+    }
+    if asm_syscall_clobbers().len() != 2 {
+        return 55
+    }
+    if asm_syscall_clobbers().get(0) != "rcx" || asm_syscall_clobbers().get(1) != "r11" {
+        return 56
+    }
+
+    # ------------------------------------------------------------------
+    # Caller/callee-saved sets + stub helpers (57..64)
+    # ------------------------------------------------------------------
+    if asm_caller_saved().len() != 9 || asm_callee_saved().len() != 6 {
+        return 57
+    }
+    if asm_caller_saved().get(0) != "rax" || asm_caller_saved().get(8) != "r11" {
+        return 58
+    }
+    if asm_callee_saved().get(0) != "rbx" || asm_callee_saved().get(5) != "r15" {
+        return 59
+    }
+    let mut to_save: list[str] = asm_regs_to_save(["rax", "rbx", "r14"])
+    if to_save.len() != 2 || to_save.get(0) != "rbx" || to_save.get(1) != "r14" {
+        return 60
+    }
+    to_save = asm_regs_to_save(["rax", "rcx"])
+    if to_save.len() != 0 {
+        return 61
+    }
+    if asm_scratch_reg(["rax", "rcx", "rdx", "rsi", "rdi", "r8", "r9", "r11"]) != "r10" {
+        return 62
+    }
+    if asm_scratch_reg([]) != "rax" {
+        return 63
+    }
+    if asm_scratch_reg(asm_caller_saved()) != "" {
+        return 64
+    }
+
+    # ------------------------------------------------------------------
+    # Module self-check (65)
+    # ------------------------------------------------------------------
+    if asm_check_invariants() != 0 {
+        return 65
+    }
+
+    # The declared asm! stubs above are never called here — the boot
+    # interpreter cannot execute assembly. Their acceptance is the
+    # checker's job (this file type-checks in both compilers) and
+    # their lowering is exercised by make asmreg-acceptance.
+
+    return 0
+}

@@ -1246,6 +1246,64 @@ fn gen_stmt(ctx: Ctx, sidx: int, ind: str) -> void {
 # instead of `mov %1, %0` (= y <- x). The mapping is now the identity
 # ({N} -> %N), so the template always uses GCC numbering — matching
 # the documented contract, the examples, and the acceptance test.
+# asm_list_base_c: the C expression for an index-lvalue's list base.
+# Stack-allocated bindings cannot be used as values, so they go through
+# the local C array name (mirrors gen_assign's stack-list branch).
+fn asm_list_base_c(ctx: Ctx, lst_e: int) -> str {
+    if ctx.exprs[lst_e].kind == "ident" && is_stack_var(ctx, ctx.exprs[lst_e].name) {
+        return local_c(ctx, ctx.exprs[lst_e].name)
+    }
+    return gen_expr(ctx, lst_e)
+}
+
+# asm_regvar_register: returns the hardware register this operand must
+# bind through a GCC LOCAL REGISTER VARIABLE, or "" when the plain
+# constraint-letter path is correct. Three cases need the variable:
+#   * r8..r15 — GCC has no single-letter constraint for the extended
+#     registers (passing "r8" as a constraint string is invalid C asm).
+#   * xmm0..xmm15 — float operands pinned to a specific SSE register.
+#   * every bool operand bound to a named register — the C `bool` is
+#     one byte, so the letter path ("a" with a bool operand) would bind
+#     the byte form (AL) instead of the named 64-bit register; the
+#     register variable carries the value in an int64_t and the
+#     writeback converts back (see gen_asm).
+# The checker has already rejected everything else (narrow names,
+# compiler-owned registers, type mismatches), so this is a pure
+# lowering decision.
+fn asm_regvar_register(ctx: Ctx, op: AsmOperand) -> str {
+    if !op.is_constraint_str {
+        return ""
+    }
+    let mut c: str = op.constraint
+    # Strip any direction prefix (the checker validated its shape).
+    if c.len() >= 1 && (c.byte_at(0) == 61 || c.byte_at(0) == 43) {
+        c = c.slice(1, c.len())
+        if c.len() >= 1 && c.byte_at(0) == 38 {
+            c = c.slice(1, c.len())
+        }
+    }
+    # r8..r15.
+    if c == "r8" || c == "r9" || c == "r10" || c == "r11" || c == "r12"
+    || c == "r13" || c == "r14" || c == "r15" {
+        return c
+    }
+    # xmm0..xmm15.
+    let mut i: int = 0
+    while i < 16 {
+        if c == "xmm" + i.to_str() {
+            return c
+        }
+        i = i + 1
+    }
+    # A named 64-bit GP register bound to a bool operand.
+    if asm_reg_width(c) == 64 && asm_list_index(asm_gp64(), c) >= 0 {
+        if ctx.exprs[op.expr_idx].t == "bool" {
+            return c
+        }
+    }
+    return ""
+}
+
 fn gen_asm(ctx: Ctx, s: StmtN, ind: str) -> void {
     # Hoist fresh pointer subexpressions that appear in `in` operands
     # (so they're materialised into temps with cleanup attributes
@@ -1283,35 +1341,137 @@ fn gen_asm(ctx: Ctx, s: StmtN, ind: str) -> void {
     # The temp-name list is parallel to s.asm_operands: temp_names[j]
     # is "" if operand j doesn't need a temp (ident/field lvalue, or
     # an `in` operand), or the temp variable name if it does.
+    # Stage 83 adds the writeback-kind records (index / ident / field)
+    # so named-register outputs can be copied back into any lvalue form.
     let temp_names: list[str] = []
     let temp_lists: list[str] = []
     let temp_indices: list[str] = []
-    let temp_setters: list[int] = [] # index into temp_lists/temp_indices for the post-asm writeback
+    let temp_setters: list[int] = [] # operand indices with a post-asm writeback
+    let temp_wb_kind: list[int] = [] # 1 index, 2 ident, 3 field (parallel to temp_setters)
+    let temp_wb_a: list[str] = []    # ident local C name (2) / field base C lvalue (3)
+    let temp_wb_b: list[str] = []    # field C fname (3)
+    let temp_wb_stack: list[int] = [] # 1 when the index writeback targets a stack-allocated list
+    let regvar_cls: list[str] = []   # "r"/"x" when operand k goes through a GCC local register variable
     let mut j0: int = 0
     while j0 < s.asm_operands.len() {
         temp_names.push("")
         temp_lists.push("")
         temp_indices.push("")
+        regvar_cls.push("")
         j0 = j0 + 1
     }
-    # Emit the temps for index-lvalue operands (in source order).
+    # Stage 83 (v0.102.0-alpha): GCC local register variables. A named
+    # register that GCC cannot express as a single constraint letter
+    # (r8..r15, xmm0..xmm15) — plus every bool operand bound to a named
+    # register (the C `bool` operand is one byte wide, so the letter
+    # path would bind the byte form instead of the named 64-bit
+    # register) — is lowered through a local register variable:
+    #   register int64_t hl_asm_r0 __asm__("r8") = <init>;
+    #   __asm__("..." : "+r"(hl_asm_r0) : ...);
+    #   <lvalue> = <converted>;   (writeback for out/inout/late_out)
+    let mut jr: int = 0
+    while jr < s.asm_operands.len() {
+        let op: AsmOperand = s.asm_operands.get(jr)
+        let reg: str = asm_regvar_register(ctx, op)
+        if reg != "" {
+            let elem_t: str = ctx.exprs[op.expr_idx].t
+            let rv: str = fresh_tmp(ctx, "hlc_asm_r")
+            let mut cty: str = "int64_t"
+            if elem_t == "float" {
+                cty = "double"
+                regvar_cls.set(jr, "x")
+            } else {
+                regvar_cls.set(jr, "r")
+            }
+            if op.dir == "in" {
+                ctx.out.push(ind + "register " + cty + " " + rv + " __asm__(\"" + reg + "\") = (" + cty + ")(" + gen_expr(ctx, op.expr_idx) + ");")
+            } else {
+                # out / inout / late_out — prepare the lvalue pieces
+                # once (a call in a field/index base must not be
+                # evaluated twice), then declare the register variable.
+                let ek: str = ctx.exprs[op.expr_idx].kind
+                let mut init_c: str = ""
+                if ek == "ident" {
+                    let lname: str = local_c(ctx, ctx.exprs[op.expr_idx].name)
+                    if op.dir == "inout" {
+                        init_c = "(" + cty + ")(" + lname + ")"
+                    }
+                    temp_setters.push(jr)
+                    temp_wb_kind.push(2)
+                    temp_wb_a.push(lname)
+                    temp_wb_b.push("")
+                } else if ek == "field" {
+                    let base_t: str = ctx.exprs[ctx.exprs[op.expr_idx].left].t
+                    let bt: str = fresh_tmp(ctx, "hlc_asm_b")
+                    ctx.out.push(ind + c_type(ctx, base_t) + " " + bt + " = " + gen_expr(ctx, ctx.exprs[op.expr_idx].left) + ";")
+                    let f_c: str = c_field_name(ctx.exprs[op.expr_idx].name)
+                    if op.dir == "inout" {
+                        init_c = "(" + cty + ")(" + bt + "->" + f_c + ")"
+                    }
+                    temp_setters.push(jr)
+                    temp_wb_kind.push(3)
+                    temp_wb_a.push(bt)
+                    temp_wb_b.push(f_c)
+                } else {
+                    # index lvalue
+                    let lst_c: str = asm_list_base_c(ctx, ctx.exprs[op.expr_idx].left)
+                    let idx_c: str = gen_expr(ctx, ctx.exprs[op.expr_idx].right)
+                    let stk: bool = ctx.exprs[ctx.exprs[op.expr_idx].left].kind == "ident" && is_stack_var(ctx, ctx.exprs[ctx.exprs[op.expr_idx].left].name)
+                    temp_lists.set(jr, lst_c)
+                    temp_indices.set(jr, idx_c)
+                    if op.dir == "inout" {
+                        if stk {
+                            init_c = "hlc_sg_" + stack_elem_suffix(elem_t) + "(" + lst_c + ", " + idx_c + ", " + stack_cap_of(ctx, ctx.exprs[ctx.exprs[op.expr_idx].left].name).to_str() + ")"
+                        } else {
+                            init_c = "(" + cty + ")(" + gen_unbox(ctx, elem_t, "hl_list_get(" + lst_c + ", " + idx_c + ")") + ")"
+                        }
+                    }
+                    temp_setters.push(jr)
+                    temp_wb_kind.push(1)
+                    temp_wb_a.push("")
+                    temp_wb_b.push("")
+                    if stk {
+                        temp_wb_stack.push(1)
+                    } else {
+                        temp_wb_stack.push(0)
+                    }
+                }
+                if op.dir == "inout" {
+                    ctx.out.push(ind + "register " + cty + " " + rv + " __asm__(\"" + reg + "\") = " + init_c + ";")
+                } else {
+                    # out / late_out — write-only, leave uninitialised.
+                    ctx.out.push(ind + "register " + cty + " " + rv + " __asm__(\"" + reg + "\");")
+                }
+            }
+            temp_names.set(jr, rv)
+        }
+        jr = jr + 1
+    }
+    # Emit the plain temps for index-lvalue operands without a register
+    # variable (in source order) — the Stage 27 path.
     let mut j: int = 0
     while j < s.asm_operands.len() {
         let op: AsmOperand = s.asm_operands.get(j)
-        if op.dir != "in" {
+        if op.dir != "in" && temp_names.get(j) == "" {
             let ek: str = ctx.exprs[op.expr_idx].kind
             if ek == "index" {
                 # The lvalue is `xs[i]`. Generate a temp.
                 let lhs_e: int = ctx.exprs[op.expr_idx].left
                 let idx_e: int = ctx.exprs[op.expr_idx].right
-                let lst_c: str = gen_expr(ctx, lhs_e)
+                let lst_c: str = asm_list_base_c(ctx, lhs_e)
                 let idx_c: str = gen_expr(ctx, idx_e)
+                let stk: bool = ctx.exprs[lhs_e].kind == "ident" && is_stack_var(ctx, ctx.exprs[lhs_e].name)
                 let tmp: str = fresh_tmp(ctx, "hlc_asm_t")
                 let elem_t: str = ctx.exprs[op.expr_idx].t
                 let c_t: str = c_type(ctx, elem_t)
                 if op.dir == "inout" {
                     # inout: read the old value into the temp.
-                    let old_v: str = gen_unbox(ctx, elem_t, "hl_list_get(" + lst_c + ", " + idx_c + ")")
+                    let mut old_v: str = ""
+                    if stk {
+                        old_v = "hlc_sg_" + stack_elem_suffix(elem_t) + "(" + lst_c + ", " + idx_c + ", " + stack_cap_of(ctx, ctx.exprs[lhs_e].name).to_str() + ")"
+                    } else {
+                        old_v = gen_unbox(ctx, elem_t, "hl_list_get(" + lst_c + ", " + idx_c + ")")
+                    }
                     ctx.out.push(ind + c_t + " " + tmp + " = " + old_v + ";")
                 } else {
                     # out / late_out: write-only. Leave the temp
@@ -1325,6 +1485,14 @@ fn gen_asm(ctx: Ctx, s: StmtN, ind: str) -> void {
                 temp_lists.set(j, lst_c)
                 temp_indices.set(j, idx_c)
                 temp_setters.push(j)
+                temp_wb_kind.push(1)
+                temp_wb_a.push("")
+                temp_wb_b.push("")
+                if stk {
+                    temp_wb_stack.push(1)
+                } else {
+                    temp_wb_stack.push(0)
+                }
             }
         }
         j = j + 1
@@ -1342,9 +1510,27 @@ fn gen_asm(ctx: Ctx, s: StmtN, ind: str) -> void {
     while j_out < s.asm_operands.len() {
         let op: AsmOperand = s.asm_operands.get(j_out)
         if op.dir != "in" {
-            let cstr: str = translate_asm_constraint(op)
-            # Use the temp if one was allocated (list-index lvalue),
-            # otherwise use the lvalue expression directly.
+            let mut cstr: str = ""
+            let cls: str = regvar_cls.get(j_out)
+            if cls != "" {
+                # Stage 83: register-variable operand — the constraint
+                # is the CLASS ("r"/"x"); the register itself comes
+                # from the __asm__("...") annotation on the local
+                # register variable.
+                cstr = cls
+                if op.dir == "out" {
+                    cstr = "=" + cstr
+                } else if op.dir == "inout" {
+                    cstr = "+" + cstr
+                } else if op.dir == "late_out" {
+                    cstr = "=&" + cstr
+                }
+            } else {
+                cstr = translate_asm_constraint(ctx, op)
+            }
+            # Use the temp if one was allocated (list-index lvalue or
+            # register variable), otherwise use the lvalue expression
+            # directly.
             let mut ce: str = ""
             let tmp_name: str = temp_names.get(j_out)
             if tmp_name != "" {
@@ -1361,8 +1547,20 @@ fn gen_asm(ctx: Ctx, s: StmtN, ind: str) -> void {
     while j2 < s.asm_operands.len() {
         let op: AsmOperand = s.asm_operands.get(j2)
         if op.dir == "in" {
-            let cstr: str = translate_asm_constraint(op)
-            let ce: str = gen_expr(ctx, op.expr_idx)
+            let mut cstr: str = ""
+            let cls: str = regvar_cls.get(j2)
+            if cls != "" {
+                # Stage 83: register-variable input (class constraint).
+                cstr = cls
+            } else {
+                cstr = translate_asm_constraint(ctx, op)
+            }
+            let mut ce: str = ""
+            if temp_names.get(j2) != "" {
+                ce = temp_names.get(j2)
+            } else {
+                ce = gen_expr(ctx, op.expr_idx)
+            }
             inputs.push("\"" + cstr + "\"(" + ce + ")")
         }
         j2 = j2 + 1
@@ -1392,6 +1590,14 @@ fn gen_asm(ctx: Ctx, s: StmtN, ind: str) -> void {
     }
     if !list_contains_str(s.asm_options, "nomem") {
         clobbers.push("\"memory\"")
+    }
+    # Stage 83 (v0.102.0-alpha): the explicit clobber clause — full
+    # 64-bit register names, "cc" or "memory", all validated by the
+    # checker — appended verbatim after the option-derived defaults.
+    let mut uc: int = 0
+    while uc < s.asm_clobbers.len() {
+        clobbers.push("\"" + s.asm_clobbers.get(uc) + "\"")
+        uc = uc + 1
     }
     # Translate the template: {N} -> %N (GCC operand numbering), ${N} -> $%cN (deep-scan-23 fix:
     # plain `%N` on x86 AT&T already prints immediates WITH the `$`
@@ -1432,14 +1638,36 @@ fn gen_asm(ctx: Ctx, s: StmtN, ind: str) -> void {
         let op_idx: int = temp_setters.get(si)
         let op: AsmOperand = s.asm_operands.get(op_idx)
         let tmp_name: str = temp_names.get(op_idx)
-        let lst_c: str = temp_lists.get(op_idx)
-        let idx_c: str = temp_indices.get(op_idx)
+        let wb_kind: int = temp_wb_kind.get(si)
         let elem_t: str = ctx.exprs[op.expr_idx].t
-        # hl_list_set releases the old element itself; the new value
-        # must arrive OWNED (one retain). For primitive types
-        # (int/float/bool) the runtime boxes them via hl_box_i64 etc.
-        let boxed: str = gen_store_val(ctx, elem_t, tmp_name, false)
-        ctx.out.push(ind + "hl_list_set(" + lst_c + ", " + idx_c + ", " + boxed + ");")
+        # Stage 83: the value the lvalue receives. For a register
+        # variable the C carrier is int64_t/double; bool needs a
+        # 0/1 conversion (the register holds the 64-bit form).
+        let mut val_c: str = tmp_name
+        if elem_t == "bool" {
+            val_c = "(" + tmp_name + " != 0)"
+        }
+        if wb_kind == 1 {
+            let lst_c: str = temp_lists.get(op_idx)
+            let idx_c: str = temp_indices.get(op_idx)
+            if temp_wb_stack.get(si) == 1 {
+                # Stack-allocated list — the typed bounds-checked setter
+                # (mirrors gen_assign's stack-list branch).
+                let root_name: str = ctx.exprs[ctx.exprs[op.expr_idx].left].name
+                let set_suffix: str = stack_elem_suffix(list_elem_t(ctx.exprs[ctx.exprs[op.expr_idx].left].t))
+                ctx.out.push(ind + "hlc_ss_" + set_suffix + "(" + lst_c + ", " + idx_c + ", " + stack_cap_of(ctx, root_name).to_str() + ", " + val_c + ");")
+            } else {
+                # hl_list_set releases the old element itself; the new value
+                # must arrive OWNED (one retain). For primitive types
+                # (int/float/bool) the runtime boxes them via hl_box_i64 etc.
+                let boxed: str = gen_store_val(ctx, elem_t, val_c, false)
+                ctx.out.push(ind + "hl_list_set(" + lst_c + ", " + idx_c + ", " + boxed + ");")
+            }
+        } else if wb_kind == 2 {
+            ctx.out.push(ind + temp_wb_a.get(si) + " = " + val_c + ";")
+        } else {
+            ctx.out.push(ind + temp_wb_a.get(si) + "->" + temp_wb_b.get(si) + " = " + val_c + ";")
+        }
         si = si + 1
     }
     flush_null_after(ctx, ind)
@@ -1448,7 +1676,11 @@ fn gen_asm(ctx: Ctx, s: StmtN, ind: str) -> void {
 
 # translate_asm_constraint: convert an HLS asm! constraint to the GCC
 # constraint string. See gen_asm for the full table.
-fn translate_asm_constraint(op: AsmOperand) -> str {
+# Stage 83 (v0.102.0-alpha): takes the Ctx so the bare `reg` class can
+# be mapped by the operand type — int/bool use the general-purpose
+# class ("r"), floats use the SSE class ("x", since GP registers
+# cannot hold a double).
+fn translate_asm_constraint(ctx: Ctx, op: AsmOperand) -> str {
     let c: str = op.constraint
     # Compute the direction prefix. GCC requires outputs to start
     # with `=` (write-only) or `+` (read-write), and a late-clobber
@@ -1471,9 +1703,10 @@ fn translate_asm_constraint(op: AsmOperand) -> str {
         # constraint letters. GCC constraints are case-sensitive:
         #   "a" = eax/rax   "b" = ebx/rbx   "c" = ecx/rcx
         #   "d" = edx/rdx   "D" = edi/rdi   "S" = esi/rsi
-        # Unknown register names pass through verbatim (GCC accepts
-        # things like "r" / "=r" / "+r" / "=&r" as well as multi-letter
-        # constraints; the user takes responsibility for the validity).
+        # The checker only lets 64-bit GP names reach this path for
+        # int/bool operands (floats need SSE; narrower names are
+        # rejected; r8..r15/xmm go through the register-variable path
+        # in gen_asm and never reach translate_asm_constraint).
         if c == "eax" || c == "rax" {
             body = "a"
         } else if c == "ebx" || c == "rbx" {
@@ -1496,7 +1729,13 @@ fn translate_asm_constraint(op: AsmOperand) -> str {
     } else {
         # Bare register-class form.
         if c == "reg" {
-            body = "r"
+            # Stage 83: the register class follows the operand type —
+            # floats live in SSE registers, int/bool in GP registers.
+            if ctx.exprs[op.expr_idx].t == "float" {
+                body = "x"
+            } else {
+                body = "r"
+            }
         } else if c == "mem" {
             body = "m"
         } else if c == "imm" {

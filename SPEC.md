@@ -3282,3 +3282,159 @@ rejected by boot AND the self-hosted checker with the same messages,
 and a spawn-using program's emitted C carries
 `hl_thread_start` / `HL_TASK_STACK_BYTES` /
 `pthread_attr_setguardsize` (the guard, really there).
+
+## 37. Inline-asm register constraints: clobber, input, output (Stage 83 — v0.102.0-alpha)
+
+Stage 83 makes every `asm!` register binding honest. Stage 27 shipped
+the four operand forms (`in` / `out` / `inout` / `late_out`) and the
+option list; what it did NOT own was the register file. A named
+register was a string that mostly translated to a GCC constraint
+letter, sub-registers were accepted and silently widened, `r8`–`r15`
+reached GCC as an invalid constraint string, floats lowered to the
+general-purpose class, and there was no way to say which registers an
+asm block destroys beyond the blanket `cc`/`memory` defaults. Kernels
+are written at exactly this boundary — a syscall stub that forgets
+`rcx`/`r11` is a miscompile the linker will never catch — so the
+register file is now a checked fact, enforced identically by both
+compilers, and modelled as a pure-HLS library (`core/asm.hls`) that
+kernel build tooling can query at plan time.
+
+### 37.1. The language: explicit clobbers + exact register bindings
+
+The `clobber(...)` clause joins the operand list (anywhere in it,
+like `options`, at most once per `asm!`):
+
+```hls
+# The x86-64 write(1, buf, n) syscall, register-exact:
+let mut ret: int = 1                  # SYS_write, seeded into rax
+asm!("syscall",
+     in("rdi") fd, in("rsi") buf_addr, in("rdx") n,
+     inout("rax") ret,
+     clobber("rcx", "r11"),           # the syscall instruction's destroys
+     options(nomem))                  # "cc" stays: syscall rewrites RFLAGS
+```
+
+The rules, each a compile error with the same message from both
+compilers:
+
+- **A named register binds exactly that register.** `int` and `bool`
+  operands require a 64-bit general-purpose name (`rax`..`r15`);
+  `in("eax") x` is rejected — `asm! register 'eax' is 32-bit; an int
+  operand needs a 64-bit register — use 'rax'` — instead of silently
+  widening to GCC's `a` class (which binds RAX for a 64-bit operand,
+  so the source lied about the hardware). `float` operands require
+  SSE: the bare `reg` class lowers to the `x` class, or a specific
+  `xmm0..xmm15` name pins the register. x87/MMX classes (`f`, `t`,
+  `u`, `y`) and GP classes for floats, SSE names/classes for ints,
+  and integer-immediate classes for float immediates are all rejected
+  with the class named.
+- **The compiler owns `rsp` and `rbp`.** Neither the stack pointer
+  nor the frame pointer — in any spelling (`esp`, `sp`, `spl`, `ebp`,
+  `bp`, `bpl`) — can be bound to an operand or named as a clobber.
+  An asm block that moves `rsp` must restore it before falling
+  through; declaring the clobber is a lie the compiler would believe
+  at the cost of every stack reference it emits.
+- **One register, one operand.** Two operands bound to the same
+  physical register are rejected — GCC would conflate them into one
+  allocation slot and the template would read/write a single
+  register while the source named two values.
+- **The clobber list may not overlap a bound operand.** A clobber
+  entry says "this register is destroyed and holds nothing of
+  yours"; rebinding it as an input would read a destroyed value, as
+  an output would be overwritten. The analysis runs on physical
+  identity (rax/eax/ax/al/ah are one register — deliberately
+  conservative, `al`+`ah` overlaps too) and on the six fixed
+  single-register GCC letters (`a`/`b`/`c`/`d`/`S`/`D` →
+  rax/rbx/rcx/rdx/rsi/rdi). The message quotes the operand:
+  `asm! clobber 'rax' overlaps operand 0 (in "rax") — a clobbered
+  register cannot also be bound to an operand`.
+- **The list itself must be well-formed.** Every entry is a full
+  64-bit GP or SSE name (narrow spellings are rejected — GCC treats
+  a sub-register clobber as clobbering the whole register and newer
+  GCC rejects the narrow form), duplicates are rejected (exact or
+  alias), and `cc`/`memory` are banned outright: flag and memory
+  effects are controlled by `options(preserves_flags)` /
+  `options(nomem)`, the default list always contains both, so an
+  explicit entry is either redundant or contradictory. (Banning them
+  also kills a real miscompile shape: `clobber("memory")` without
+  `nomem` emitted `"memory", "memory"`.)
+
+### 37.2. The lowering: local register variables
+
+Three operand shapes cannot be expressed as a GCC constraint letter,
+and all three now lower through GCC **local register variables**:
+
+- `r8`–`r15`: GCC has no single-letter constraint for the extended
+  registers (Stage 27 passed the string `"r8"` into the constraint
+  position, which GCC rejects as an unknown constraint — extended
+  registers were unusable).
+- Pinned `xmm0..xmm15`: floats bound to a specific SSE register.
+- Every `bool` operand bound to a named register: the C `bool` is
+  one byte wide, so the letter path (`"a"` with a bool operand)
+  would bind AL — the byte form — instead of the named 64-bit
+  register.
+
+The emitted shape:
+
+```c
+register int64_t hl_asm_r_1 __asm__("r10") = (int64_t)(u_a);
+__asm__ __volatile__("add %1, %0" : "+r"(hl_asm_r_1) : "r"(hl_asm_r_7) : "cc", "rcx");
+u_a = hl_asm_r_1;    /* writeback — automatic, any lvalue form */
+```
+
+Outputs write back through ident lvalues (`x = t;`), field lvalues
+(the base expression is materialised once into a C temp so a call in
+the base cannot double-evaluate), and list-index lvalues — the typed
+stack-list setter (`hlc_ss_*`) for stack-allocated lists, which also
+fixes the Stage 27 index path panicking on
+"stack-allocated list used as a value", and `hl_list_set` + boxing
+otherwise. Bool writebacks convert (`u_hit = (t != 0);`).
+
+### 37.3. The `core.asm` surface
+
+| Item | Role |
+|------|------|
+| `asm64_gp_regs()` / `asm64_sse_regs()` | the 16 GP names in canonical order, the 16 SSE names |
+| `asm_reg_width(name)` | 8/16/32/64 for every x86-64 spelling (`r9d` = 32, `ah` = 8), 0 for unknown names |
+| `asm_reg_base(name)` | physical identity: `"eax"` → `"rax"`, `"r9d"` → `"r9"`, `"ah"` → `"rax"`, `""` for non-registers |
+| `asm_regs_overlap(a, b)` | same physical register (conservative: `al`+`ah` overlaps) |
+| `asm_valid_clobber(name)` | a full 64-bit GP/SSE name; never sp/bp; never `cc`/`memory` (option-controlled) |
+| `enum AsmFault { None, BadName, SubRegister, StackPointer, FramePointer, DuplicateClobber, OverlapsOperand, ReservedClobber }` | the validator's verdict, with `asm_fault_name`/`asm_fault_code` (the core.stack convention) |
+| `asm_clobber_fault(cs)` / `asm_operand_conflict(reg, cs)` | the compiler's clobber rules as a pure query — first fault wins in the compiler's check order; the conflict lookup returns the offending entry |
+| `asm_sysv_arg_reg(n)` / `asm_sysv_ret_reg()` / `asm_sysv_fp_ret_reg()` | the SysV call ABI: rdi rsi rdx rcx r8 r9; rax; xmm0 |
+| `asm_syscall_arg_reg(n)` | the syscall ABI — argument 4 is **r10**, not rcx (rcx is destroyed by the instruction) |
+| `asm_syscall_clobbers()` | `["rcx", "r11"]` — the architecture-defined destroys of `syscall` |
+| `asm_caller_saved()` / `asm_callee_saved()` | the preservation sets (9 / 6 registers) |
+| `asm_regs_to_save(used)` | what an ISR/trampoline stub must push (callee-saved ∩ used, deterministic order) |
+| `asm_scratch_reg(avoid)` | the first caller-saved GP register not spoken for — the safe scratch for a stub whose clobbers are fixed |
+| `asm_check_invariants()` | a boot-time self-test of the whole module (0 = self-consistent) |
+
+The module is import-free — zero `core.*` dependencies, like
+`core/stack.hls` — so it is importable from `#![no_std]` and
+`#![freestanding]` crates identically. It exists so the register
+facts the compiler enforces are queryable where kernels plan:
+a test can assert a stub's clobber list equals
+`asm_syscall_clobbers()` before the kernel ever boots.
+
+### 37.4. What the tests prove
+
+`tests/ok/feat_stage83_asmreg.hls` runs 67 numbered assertions on
+the interpreter AND as a native binary (hosted and `-nostdlib`):
+width and base lookup for every spelling class, overlap analysis,
+the SSE classification, the clobber validator (every fault plus the
+clean list), operand conflicts, the SysV-vs-syscall ABI tables
+(including the rcx→r10 argument-4 move), the preservation sets, the
+stub helpers, and the module self-check — while declaring (never
+executing) asm blocks with clobber lists, 64-bit names, an extended
+register, a pinned XMM operand and a bool through a named register.
+`make asmreg-acceptance` (7 sections) proves the enforcement paths:
+valid syscall-shaped/xmm/bool programs are accepted by both
+checkers; every diagnostic class (width, SSE/GP mismatch, x87,
+immediate-float, sp/bp, operand overlap, alias duplicate, stack-
+pointer clobber, sub-register clobber, reserved `cc`/`memory`,
+double clause, non-string entry) fires with its exact message from
+boot AND the self-hosted compiler; the demo compiles `-Werror`,
+runs `DEMO OK` with the register-variable lowering visible in the
+emitted C (`__asm__("r10")`, `"+a"` on the syscall stub, explicit
+clobber lists); and `--audit` reports every `core.asm` function
+pure. Bootstrap self-compilation remains byte-identical.
