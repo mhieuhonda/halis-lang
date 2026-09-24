@@ -111,3 +111,26 @@ lsp-check:
 # so this Makefile parses exactly like the former single-file version).
 include mk/20-testing.mk mk/30-lto.mk mk/40-backends.mk mk/50-pkg-contracts.mk mk/60-advanced.mk mk/70-stdlib-core.mk mk/80-stdlib.mk mk/90-stdlib-late.mk mk/95-osdev.mk
 
+
+
+# Stage 84: linker-script integration and custom sections
+LINKER_SCRIPT ?= link.ld
+LINKER_TEST_SRC ?= tests/stage84_linker_sections.c
+LINKER_TEST_OBJ ?= build/stage84-linker-test.o
+LINKER_TEST_BIN ?= build/stage84-linker-test.elf
+LINKER_TEST_CC ?= $(CC)
+LINKER_TEST_LD ?= $(LD)
+LINKER_TEST_NM ?= $(NM)
+
+.PHONY: test-linker
+test-linker: $(LINKER_TEST_BIN)
+	@$(LINKER_TEST_NM) $(LINKER_TEST_BIN) | grep -q '__halis_metadata_start' && \
+	 $(LINKER_TEST_NM) $(LINKER_TEST_BIN) | grep -q '__halis_sections_start' && \
+	 $(LINKER_TEST_NM) $(LINKER_TEST_BIN) | grep -q '__halis_sections_end'
+
+$(LINKER_TEST_OBJ): $(LINKER_TEST_SRC) $(LINKER_SCRIPT)
+	@mkdir -p $(dir $@)
+	$(LINKER_TEST_CC) $(CPPFLAGS) $(CFLAGS) -ffreestanding -fno-pie -c $< -o $@
+
+$(LINKER_TEST_BIN): $(LINKER_TEST_OBJ) $(LINKER_SCRIPT)
+	$(LINKER_TEST_LD) -T $(LINKER_SCRIPT) -o $@ $<
