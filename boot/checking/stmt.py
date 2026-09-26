@@ -35,6 +35,36 @@ _ASM_STACK_PTRS = ("rsp", "esp", "sp", "spl")
 _ASM_FRAME_PTRS = ("rbp", "ebp", "bp", "bpl")
 
 
+def asm_template_is_narrow(tmpl):
+    """Stage 87: does the template's FIRST mnemonic carry a sub-64-bit
+    operand size suffix?
+
+    AT&T mnemonics spell the operand size as the last character of the
+    mnemonic: `movb`/`movw`/`movl`/`movq`. The mnemonic ends at the first
+    space, newline, tab, quote, colon or equals, and what precedes that
+    terminator is the mnemonic. A template that does not spell its size
+    (64-bit is the default) answers False — so `movl (%rdi), %eax` is
+    narrow and `mov (%rdi), %eax` is not, which is exactly the
+    distinction a 32-bit device access depends on.
+
+    Mirrors asm_template_is_narrow in src/hlc/check_expr.hls.
+    """
+    if isinstance(tmpl, bytes):
+        tmpl = tmpl.decode("utf-8", "replace")
+    if not tmpl:
+        return False
+    end = 0
+    n = len(tmpl)
+    while end < n:
+        c = ord(tmpl[end])
+        if c in (32, 10, 9, 34, 58, 61):
+            break
+        end += 1
+    if end == 0:
+        return False
+    return tmpl[end - 1] in ("b", "w", "l")
+
+
 def asm_reg_width(name):
     """Width in bits of an x86-64 register name (0 = unknown)."""
     if name in _ASM_GP64:
@@ -602,11 +632,25 @@ class CheckerStmt(object):
                                      "general-purpose register (rax, "
                                      "rbx, ..., r15)" % (body, ot_word), s)
                         w = asm_reg_width(body)
-                        if w != 64:
+                        # Stage 87: a 32-bit register is legal for an
+                        # int operand when the template's instruction is
+                        # itself 32-bit — `movl %eax, (%ecx)` is how a
+                        # 32-bit device register is written, and a
+                        # `movq` would write EIGHT bytes. The rule that
+                        # needs 64 bits is Stage 83's: a 64-BIT
+                        # instruction on a 32-bit register silently
+                        # truncates. Relaxing it for a 32-bit mnemonic
+                        # keeps that bug caught and makes real MMIO
+                        # expressible.
+                        if w != 64 and not (w == 32
+                                            and asm_template_is_narrow(template)):
                             self.err("asm! register '%s' is %d-bit; %s "
                                      "operand needs a 64-bit register — "
-                                     "use '%s'" % (body, w, ot_word,
-                                                   asm_reg_canonical(body)), s)
+                                     "use '%s' (or, for a 32-bit device "
+                                     "register, a template whose "
+                                     "instruction is 32-bit)"
+                                     % (body, w, ot_word,
+                                        asm_reg_canonical(body)), s)
                     fixed = asm_reg_canonical(body)
                 elif body in ("x", "v") and ot != "float":
                     self.err("asm! constraint '%s' is an SSE register "

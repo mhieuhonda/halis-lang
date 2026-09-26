@@ -3961,3 +3961,172 @@ compiled object links `-Werror` and `nm` finds `hl_irq_stub_14`,
 fail programs are rejected by both compilers with identical text; and
 `interrupt_demo` produces byte-identical output on the interpreter and
 natively. Bootstrap self-compilation remains byte-identical.
+
+---
+
+## 41. `core.mmio` — memory-mapped I/O (Stage 87 — v0.106.0-alpha)
+
+A device register is memory you may not cache, may not reorder, and
+may not read twice. Halis has no raw pointer type, so the language half
+of Stage 87 is *not* a new type: it is the observation that `asm!` is
+already emitted `__asm__ __volatile__` (unless `options(pure)`), which
+is exactly the volatility a device access needs. This section is about
+making that pattern safe, and about the arithmetic around it.
+
+### 41.1. The pattern
+
+```halis
+let mut v: int = 0
+asm!("movq ({1}), {0}", out("rax") v, in("rcx") addr)
+```
+
+Two things about `asm!` matter for MMIO, and both come free:
+
+* it is `__volatile__`, so the compiler may not cache the value, move
+  the access past another, or drop it as a dead store;
+* the **default clobber list includes `"memory"`**, so the compiler
+  will not move a memory access across it. `options(nomem)` is the
+  option that gives that up — and a driver that passes it on a device
+  access has asked for exactly the reordering that corrupts a register.
+
+**Operand numbering.** `asm!` uses GCC's numbering, where *outputs come
+first* and inputs follow in source order. A read therefore has `{0}` =
+the destination and `{1}` = the address — the reverse of the order they
+are written in. That inversion is the single easiest mistake to make
+here, and Stage 84's asm rework made the compiler's numbering
+(GCC's) rather than the source's.
+
+**Why there is no pointer.** A Halis program cannot take the address of
+its own variable, so a *hosted* process has no writable address it can
+hand to a device access. A hosted program can still read a real device
+register through this path — the timestamp counter is readable from
+ring 3 — and that is enough to prove the read is not folded: a
+compiler that cached the second `rdtsc` would return a value that does
+not advance across a million iterations of real work. The round trip
+through a location the program *owns* belongs in a freestanding image.
+
+### 41.2. Access widths, and the mask a driver forgets
+
+A `movl` into a 64-bit destination **leaves the upper 32 bits alone** —
+it does not zero them. A driver that reads a 32-bit register into an
+`int` and uses the value directly reads whatever the register happened
+to hold. `core.mmio`'s `mmio_read` is that mask written as a function,
+so it can be tested against a register full of poison:
+
+```halis
+let poisoned: int = 1311768467463791224
+mmio_read(poisoned, MmioWidth.Dword)   # 2596070008 — the low half only
+mmio_read(poisoned, MmioWidth.Qword)   # the value itself
+```
+
+`mmio_read_signed` is the other half of the same trap: a temperature of
+-5 in a byte is 251 unsigned, and a plausible-looking wrong number is
+worse than a obviously-wrong one. Sign extension fills bits *n..63* —
+the complement of `(2^n - 1)`, not of the sign bit alone, which fills
+nothing and makes every negative field read as -1.
+
+### 41.3. A 32-bit register, and a narrow instruction
+
+Stage 83 required a 64-bit register name for an `int` operand, because
+a 64-bit *instruction* on a 32-bit register silently truncates. That
+rule made a 32-bit device register unreachable: `movl %eax, (%ecx)` is
+the only correct spelling, and it needs `eax`.
+
+Stage 87 relaxes the rule exactly as far as it is safe: a 32-bit
+register is accepted **when the template's first mnemonic carries a
+sub-64-bit operand-size suffix** (`movb`/`movw`/`movl`). A `movq` on
+`eax` is still rejected — that is the Stage 83 bug, and it stays
+caught. The codegen lowers such an operand to a GCC local register
+variable of type `int32_t`, which is what makes GCC print `%eax` rather
+than `%rax` (a single-letter constraint prints the full register name
+for the operand's type, so a 64-bit `int64_t` behind `"a"` becomes
+`%rax` and `movl %rax` does not assemble).
+
+There is deliberately **no 16- or 8-bit-SPECIFIC helper**: a `movw` /
+`movb` needs an `int16_t`/`int8_t` register variable, and the lowering
+builds `int32_t` ones. A driver reaching a byte-wide register uses a
+32-bit access plus a mask today, and `mmio_access_ok` is what makes it
+notice at build time rather than on the bus.
+
+### 41.4. Device windows
+
+A driver that gets a base wrong is the most damaging kind of bug,
+and the cheapest to catch: `mmio_region_new` rejects a base that is not
+page-aligned and a negative size outright. `mmio_access_ok` then answers
+the whole question — is this access legal? — as one predicate:
+
+* it must **start** inside the window (`mmio_region_contains`);
+* it must **fit**: `addr + bytes <= end`. An access that starts inside
+  and runs off the end reads the *next* device, or, at the top of
+  physical memory, whatever is there. A window whose *size* is not a
+  multiple of the access width is the case that catches a driver which
+  assumed it was rounded up;
+* it must be **naturally aligned**, unless the region is marked
+  byte-addressable (many legacy controllers are). An unaligned device
+  access is not "slow" on a bus — it is undefined, and on some
+  controllers it takes the link down.
+
+`mmio_region_find` returns -1 for an address no window claims, so a
+driver that gets its base wrong *knows* instead of writing somewhere
+and finding out later. `mmio_regions_disjoint` and
+`mmio_regions_total` cover the two window-set mistakes worth catching:
+two windows claiming the same bytes (a base or size off by a power of
+ten), and a total nobody expected.
+
+### 41.5. Bit fields
+
+`mmio_read_field` / `mmio_write_field` / `_set_` / `_clear_` / `_toggle_`
+are the read-modify-write arithmetic, with the mask built from the
+**field** and never from the value — so a value wider than the field
+cannot leak into its neighbours. Two cases are called out by name:
+
+* a field that **straddles a 32-bit boundary** is real hardware, and a
+  32-bit access cannot update it in one operation. `mmio_field_write_ok`
+  answers the question, and the answer is "use a 64-bit access".
+* a field **wider than the access** cannot be updated by it at all: the
+  read-modify-write keeps only the part the narrow access covered.
+
+A 64-bit field has no mask, and `-1` is the right answer rather than a
+bug — the one case where the mask function returns a negative.
+
+### 41.6. Barriers, memory domains, and the LAPIC map
+
+`asm!("mfence")` plus the default `"memory"` clobber is a full fence;
+`mmio_barrier_name` and `mmio_is_fence` state the three levels
+(compiler / CPU / full) as data. A device access gets the **CPU**
+clause: device space is not shared with another core the way a
+lock-protected structure is, so a full fence on every register write
+costs far more than it buys.
+
+`mmio_domain` carries the difference that is not cosmetic: x86 device
+space is **uncacheable**, so a driver needs no cache maintenance, while
+an aarch64 `Device-nGnRnE` mapping requires the barriers a kernel must
+not skip — and code written on x86 without them is wrong there.
+(DMA coherence is a different question, and Stage 89's.)
+
+The LAPIC register map is concrete and checkable: one page, a 0x10
+stride, and the ids as `offset / 4` — which is why the ID (2) and
+VERSION (3) registers are as valid as the rest, and why a driver that
+requires a multiple of four rejects the two registers it needs first.
+`lapic_map_valid` checks the whole set, `lapic_encode_delivery` /
+`_decode_delivery` place the delivery mode in bits 3..6 of a LVT, and
+`lapic_svr_encode` / `_svr_vector` hold the two fields an SVR write
+sets — there is no separate spurious-vector register, the vector is
+the SVR's low byte. A LVT must be **masked** before its source is
+enabled, or the CPU takes a spurious interrupt with vector 0 and dies
+at a reserved-vector #GP.
+
+### 41.7. What the tests prove
+
+`tests/ok/feat_stage87_mmio.hls` runs 123 numbered assertions on the
+interpreter AND as a native binary (hosted and `-nostdlib`): every
+width, the mask and sign-extension rules, alignment, window
+containment / fit / alignment, disjointness, the whole bit-field model
+(including the straddle and over-width cases), the barrier and domain
+tables, and the LAPIC map.
+
+`make mmio-acceptance` additionally proves the **pattern**: the demo's
+`asm!` accesses compile `-Werror` and run, `examples/mmio_demo.hls`
+demonstrates that a volatile device read is not folded (two `rdtsc`
+reads with a million iterations between them), the four checked
+constructors panic at run time, and `hlfmt`/`hllint` stay clean.

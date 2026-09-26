@@ -1,0 +1,713 @@
+# ============================================================================
+# core/mmio.hls — memory-mapped I/O as data (Stage 87, v0.106.0-alpha)
+# ----------------------------------------------------------------------------
+# Pure HLS, one `core` import (freestanding-safe: the module only uses the
+# core language and `core.result`, so it is importable from `#![no_std]`
+# and `#![freestanding]` crates identically, like the rest of `core.*`).
+#
+# This module is the LIBRARY half of Stage 87. The LANGUAGE half is that
+# Halis has no raw pointer type, so a device register is reached through
+# `asm!` — and `asm!` is emitted `__asm__ __volatile__` (unless
+# `options(pure)`), which is exactly the volatility an MMIO access needs.
+# A device access in Halis therefore looks like this:
+#
+#     let mut v: int = 0
+#     asm!("movl ({0}), {1}", in("rcx") addr, out("rax") v)
+#
+# and this module's job is to make that pattern SAFE: the width rules,
+# the read-modify-write arithmetic, the address checks that stop a
+# device access from landing in RAM, and the register maps a kernel
+# reads out of a device.
+#
+# What lives here:
+#   * `MmioWidth` — the four access widths, their byte sizes, their
+#     masks, and the "read returned N bytes" rule (a 32-bit read leaves
+#     the upper 32 bits of the destination undefined, so a 64-bit
+#     register variable MUST be masked).
+#   * `mmio_read` / `mmio_write` — the pure model of a volatile
+#     access, taking the value that came back and applying the width
+#     rule, so the masking is testable without a device.
+#   * `mmio_read_field` / `mmio_write_field` — the read-modify-write
+#     arithmetic for a bit field inside a register, which is where MMIO
+#     bugs live: a field that straddles a 32-bit boundary is real
+#     hardware, and a field whose mask is built wrong silently writes
+#     its neighbours.
+#   * `mmio_barrier_name` / the barrier table — which `asm!` option
+#     provides which ordering, as data.
+#   * `mmio_domain` — the x86 rule (device space is uncacheable, so no
+#     cache maintenance) versus aarch64's Device-nGnRnE, which needs
+#     the barriers a kernel must not skip.
+#   * `mmio_region` — a device window, and the check that an access
+#     lands inside one, so a driver cannot scribble on RAM through a
+#     base it got wrong.
+#   * The LAPIC register map: base + a 16 stride, the register IDs,
+#     the delivery-mode bits, and the EOI/spurious/timer registers —
+#     the MMIO a kernel touches before it has a working scheduler.
+# ============================================================================
+
+import "core.result"
+
+# ---------------------------------------------------------------------------
+# Access widths
+# ---------------------------------------------------------------------------
+
+enum MmioWidth {
+    Byte, # 8-bit  — movb
+    Word, # 16-bit — movw
+    Dword, # 32-bit — movl
+    Qword # 64-bit — movq
+}
+
+fn mmio_width_name(w: MmioWidth) -> str {
+    return match w {
+        MmioWidth.Byte => "byte",
+        MmioWidth.Word => "word",
+        MmioWidth.Dword => "dword",
+        MmioWidth.Qword => "qword"
+    }
+}
+
+# The AT&T mnemonic suffix: a Halis `asm!` template spells the width as
+# the instruction suffix, so this is the string the template needs.
+fn mmio_width_suffix(w: MmioWidth) -> str {
+    return match w {
+        MmioWidth.Byte => "b",
+        MmioWidth.Word => "w",
+        MmioWidth.Dword => "l",
+        MmioWidth.Qword => "q"
+    }
+}
+
+# mmio_width_bytes: how many bytes one access moves.
+fn mmio_width_bytes(w: MmioWidth) -> int {
+    return match w {
+        MmioWidth.Byte => 1,
+        MmioWidth.Word => 2,
+        MmioWidth.Dword => 4,
+        MmioWidth.Qword => 8
+    }
+}
+
+# mmio_width_mask: the value bits a read of this width defines. This is
+# the rule that catches the most common MMIO bug in C-like languages: a
+# `movl` into a 64-bit register variable leaves the upper 32 bits
+# UNCHANGED, not zeroed, so a driver that skips the mask reads whatever
+# the register happened to hold.
+fn mmio_width_mask(w: MmioWidth) -> int {
+    return match w {
+        MmioWidth.Byte => 255,
+        MmioWidth.Word => 65535,
+        MmioWidth.Dword => 4294967295,
+        MmioWidth.Qword => -1
+    }
+}
+
+# mmio_sign_extend: the value a read reports when the device field is
+# signed. A `movsbl` / `movswl` / `movslq` sign-extends; `movzbl` and
+# friends zero-extend. Getting this wrong turns a temperature of -5 into
+# 251, which is a plausible-looking number.
+fn mmio_sign_extend(raw: int, w: MmioWidth) -> int {
+    let n: int = mmio_width_bits(w)
+    if n >= 64 {
+        return raw
+    }
+    if int_and(raw, int_shl(1, n - 1)) == 0 {
+        return raw
+    }
+    # Fill bits n..63 — that is everything ABOVE the value's low n bits,
+    # i.e. the complement of (2^n - 1). Complementing only the SIGN BIT
+    # (as the obvious `~sign` suggests) fills nothing and leaves the
+    # result looking like -1 for every negative field.
+    return int_or(raw, int_not(int_shl(1, n) - 1))
+}
+
+# mmio_width_bits: the value bits a read of this width defines.
+fn mmio_width_bits(w: MmioWidth) -> int {
+    return match w {
+        MmioWidth.Byte => 8,
+        MmioWidth.Word => 16,
+        MmioWidth.Dword => 32,
+        MmioWidth.Qword => 64
+    }
+}
+
+# mmio_mask: read `raw` at this width and return only the bits the
+# access defined. A 64-bit read has no mask (-1) because the whole
+# register is defined.
+fn mmio_mask(raw: int, w: MmioWidth) -> int {
+    if mmio_width_bits(w) >= 64 {
+        return raw
+    }
+    return int_and(raw, mmio_width_mask(w))
+}
+
+# ---------------------------------------------------------------------------
+# A volatile access, as a pure function of what came back
+# ---------------------------------------------------------------------------
+
+# mmio_read: the value an access of width `w` reports, given the raw
+# register contents the instruction left behind. This is the masking
+# rule above, written as a function so it can be tested against a
+# register full of garbage.
+fn mmio_read(raw: int, w: MmioWidth) -> int {
+    return mmio_mask(raw, w)
+}
+
+# mmio_read_signed: the same, for a field the device documents as
+# signed.
+fn mmio_read_signed(raw: int, w: MmioWidth) -> int {
+    return mmio_sign_extend(mmio_mask(raw, w), w)
+}
+
+# mmio_write: the value to hand the instruction. Truncation is the
+# DEVICE's business, not the driver's: a 32-bit register ignores the
+# upper 32 bits of whatever the driver passed.
+fn mmio_write(value: int, w: MmioWidth) -> int {
+    if mmio_width_bits(w) >= 64 {
+        return value
+    }
+    return int_and(value, mmio_width_mask(w))
+}
+
+# mmio_is_aligned: must an access be naturally aligned? Device windows
+# are documented to require it, and an unaligned access is not "slow" on
+# a device — it is undefined, and on some buses it takes the link down.
+# The one common exception is a register array whose stride is smaller
+# than the access width, which `mmio_region_allows_unaligned` lets a
+# caller opt into explicitly.
+fn mmio_is_aligned(addr: int, w: MmioWidth) -> bool {
+    if addr < 0 {
+        return false
+    }
+    return int_and(addr, mmio_width_bytes(w) - 1) == 0
+}
+
+# mmio_region_allows_unaligned: a device that documents byte-addressable
+# registers (many legacy controllers do) sets this on its region, and
+# then the driver is allowed to read `addr + 1` with a 32-bit access.
+fn mmio_region_allows_unaligned(r: MmioRegion) -> bool {
+    return r.byte_addressable
+}
+
+# A device window: a base, a size, and whether its registers are
+# byte-addressable. A window whose base is not page-aligned is a
+# mistake worth catching before the first access, not after.
+struct MmioRegion {
+    base: int,
+    size: int,
+    byte_addressable: bool
+}
+
+# mmio_region_new: a device window. A negative size, or a base that is
+# not page-aligned, is rejected — a mis-computed MMIO base is the
+# single most damaging bug a driver can have, and it is trivially
+# detectable.
+fn mmio_region_new(base: int, size: int, byte_addressable: bool) -> MmioRegion {
+    if size < 0 {
+        panic("mmio_region_new: size must be >= 0")
+    }
+    if !mmio_is_page_aligned(base) {
+        panic("mmio_region_new: a device window must be page-aligned")
+    }
+    return MmioRegion {
+        base: base, size: size, byte_addressable: byte_addressable
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Device windows
+# ---------------------------------------------------------------------------
+
+fn mmio_page_size() -> int {
+    return 4096
+}
+
+fn mmio_is_page_aligned(addr: int) -> bool {
+    if addr < 0 {
+        return false
+    }
+    return int_and(addr, mmio_page_size() - 1) == 0
+}
+
+fn mmio_region_end(r: MmioRegion) -> int {
+    return r.base + r.size
+}
+
+fn mmio_region_contains(r: MmioRegion, addr: int) -> bool {
+    return addr >= r.base && addr < mmio_region_end(r)
+}
+
+# mmio_access_fits: does an access of `bytes` at `addr` stay inside the
+# window? An access that runs off the end of a device window reads the
+# NEXT device — or, at the top of physical memory, whatever is there.
+fn mmio_access_fits(r: MmioRegion, addr: int, bytes: int) -> bool {
+    if bytes <= 0 {
+        return false
+    }
+    if !mmio_region_contains(r, addr) {
+        return false
+    }
+    return addr + bytes <= mmio_region_end(r)
+}
+
+# mmio_access_ok: the whole question — "may I do this access?" — as one
+# answer, so a driver can check a whole batch of accesses in a test
+# instead of at the bus.
+fn mmio_access_ok(r: MmioRegion, addr: int, w: MmioWidth) -> bool {
+    if !mmio_access_fits(r, addr, mmio_width_bytes(w)) {
+        return false
+    }
+    if !r.byte_addressable && !mmio_is_aligned(addr, w) {
+        return false
+    }
+    return true
+}
+
+# mmio_region_find: the index of the window containing `addr`, or -1.
+# A driver that gets -1 knows its base is wrong, rather than writing
+# somewhere and finding out later.
+fn mmio_region_find(rs: list[MmioRegion], addr: int) -> int {
+    let mut i: int = 0
+    while i < rs.len() {
+        if mmio_region_contains(rs.get(i), addr) {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+# mmio_overlaps: do two device windows share a byte? Two drivers
+# mapping the same window is a real system, but two *windows* claiming
+# the same bytes is not — it means a base or size was computed wrong.
+fn mmio_overlaps(a: MmioRegion, b: MmioRegion) -> bool {
+    if a.size == 0 || b.size == 0 {
+        return false
+    }
+    return a.base < mmio_region_end(b) && b.base < mmio_region_end(a)
+}
+
+# mmio_regions_disjoint: is the whole set consistent?
+fn mmio_regions_disjoint(rs: list[MmioRegion]) -> bool {
+    let mut i: int = 0
+    while i < rs.len() {
+        let mut j: int = i + 1
+        while j < rs.len() {
+            if mmio_overlaps(rs.get(i), rs.get(j)) {
+                return false
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return true
+}
+
+# mmio_regions_total: the bytes the device windows claim. A driver
+# reporting this against its own expectations catches a size that was
+# off by a power of ten — the classic "4096 instead of 65536".
+fn mmio_regions_total(rs: list[MmioRegion]) -> int {
+    let mut total: int = 0
+    let mut i: int = 0
+    while i < rs.len() {
+        total = total + rs.get(i).size
+        i = i + 1
+    }
+    return total
+}
+
+# ---------------------------------------------------------------------------
+# Bit fields
+# ---------------------------------------------------------------------------
+
+# A field inside a register. The width may exceed 32 bits (a field that
+# straddles a 32-bit boundary is real hardware — several controllers
+# have one), and `mmio_field_ok` is where that gets caught.
+struct MmioField {
+    shift: int,
+    width: int
+}
+
+fn mmio_field_new(shift: int, width: int) -> MmioField {
+    if shift < 0 {
+        panic("mmio_field_new: shift must be >= 0")
+    }
+    if width < 1 || width > 64 {
+        panic("mmio_field_new: width must be 1..64")
+    }
+    return MmioField {
+        shift: shift, width: width
+    }
+}
+
+# mmio_field_ok: does the field fit inside a 64-bit register? A field
+# that ends past bit 63 has no mask, and a driver that builds the mask
+# anyway gets a shift-by-negative somewhere else.
+fn mmio_field_ok(f: MmioField) -> bool {
+    if f.width < 1 || f.width > 64 {
+        return false
+    }
+    if f.shift < 0 {
+        return false
+    }
+    return f.shift + f.width <= 64
+}
+
+# mmio_field_mask: the bits the field occupies. A 64-bit field has no
+# mask (-1), which is the one case where `int_and(x, -1)` is the right
+# answer rather than a bug.
+fn mmio_field_mask(f: MmioField) -> int {
+    if f.width >= 64 {
+        return -1
+    }
+    return int_shl(int_shl(1, f.width) - 1, f.shift)
+}
+
+# mmio_field_straddles32: does the field cross a 32-bit boundary? A
+# read-modify-write of such a field needs TWO accesses (or a 64-bit
+# access), because a 32-bit register cannot be updated atomically in
+# two halves — which is the whole reason such a field is a hazard.
+fn mmio_field_straddles32(f: MmioField) -> bool {
+    if f.width <= 0 {
+        return false
+    }
+    return(f.shift / 32) != ((f.shift + f.width - 1) / 32)
+}
+
+# mmio_read_field: the field's value out of a register read.
+fn mmio_read_field(reg: int, f: MmioField) -> int {
+    if !mmio_field_ok(f) {
+        panic("mmio_read_field: the field does not fit in a 64-bit register")
+    }
+    return int_shr(int_and(reg, mmio_field_mask(f)), f.shift)
+}
+
+# mmio_read_field_signed: the same for a field the device documents as
+# signed.
+fn mmio_read_field_signed(reg: int, f: MmioField) -> int {
+    let raw: int = mmio_read_field(reg, f)
+    if f.width >= 64 {
+        return raw
+    }
+    if int_and(raw, int_shl(1, f.width - 1)) == 0 {
+        return raw
+    }
+    return int_or(raw, int_not(int_shl(1, f.width) - 1))
+}
+
+# mmio_write_field: read-modify-write, keeping every OTHER field
+# exactly as it was. The mask is built from the field, never from the
+# value, so a value wider than the field cannot leak into its
+# neighbours.
+fn mmio_write_field(reg: int, f: MmioField, value: int) -> int {
+    if !mmio_field_ok(f) {
+        panic("mmio_write_field: the field does not fit in a 64-bit register")
+    }
+    if f.width >= 64 {
+        return value
+    }
+    let v: int = int_and(value, int_shl(1, f.width) - 1)
+    return int_or(int_and(reg, int_not(mmio_field_mask(f))), int_shl(v, f.shift))
+}
+
+# mmio_set_field / mmio_clear_field / mmio_toggle_field: the three
+# single-bit operations every driver has, expressed through the same
+# read-modify-write so the masking is stated once.
+fn mmio_set_field(reg: int, f: MmioField) -> int {
+    return int_or(reg, mmio_field_mask(f))
+}
+
+fn mmio_clear_field(reg: int, f: MmioField) -> int {
+    return int_and(reg, int_not(mmio_field_mask(f)))
+}
+
+fn mmio_toggle_field(reg: int, f: MmioField) -> int {
+    return int_xor(reg, mmio_field_mask(f))
+}
+
+# mmio_field_write_ok: may this access width update the field in ONE
+# operation? A field wider than the access cannot (the read-modify-write
+# would lose the parts the narrower access did not cover), and a field
+# straddling a 32-bit boundary cannot be updated by a 32-bit access at
+# all. Both are questions a driver test can answer before the hardware
+# does.
+fn mmio_field_write_ok(f: MmioField, w: MmioWidth) -> bool {
+    if !mmio_field_ok(f) {
+        return false
+    }
+    if f.width > mmio_width_bits(w) {
+        return false
+    }
+    if mmio_field_straddles32(f) && mmio_width_bytes(w) < 8 {
+        return false
+    }
+    return true
+}
+
+# ---------------------------------------------------------------------------
+# Barriers and memory domains
+# ---------------------------------------------------------------------------
+
+# What an `asm!` option does about ordering. Halis's `asm!` is already
+# `__volatile__`, so the DEFAULT clobber list (which includes "memory")
+# already stops the compiler from moving memory accesses across an MMIO
+# access — `nomem` is the option that gives that up, and a driver that
+# passes it on a device access has asked for exactly the reordering
+# that corrupts a register.
+enum MmioBarrier {
+    Compiler, # `options(nomem)` — the compiler may reorder memory across it. NEVER for a device access.
+    Cpu, # the default "memory" clobber — the compiler will not move memory across it
+    Full # a full fence: also orders the CPU against other cores
+}
+
+fn mmio_barrier_name(b: MmioBarrier) -> str {
+    return match b {
+        MmioBarrier.Compiler => "compiler-only",
+        MmioBarrier.Cpu => "cpu",
+        MmioBarrier.Full => "full"
+    }
+}
+
+# mmio_default_barrier: what a device access gets. The CPU clause, not
+# the full fence: a device register is not shared with another core in
+# the way a lock-protected structure is, so a full fence on every
+# register write costs far more than it buys.
+fn mmio_default_barrier() -> MmioBarrier {
+    return MmioBarrier.Cpu
+}
+
+# mmio_is_fence: does this barrier order the CPU, or only the compiler?
+# A driver that needs CPU ordering asks for `Full` explicitly.
+fn mmio_is_fence(b: MmioBarrier) -> bool {
+    return mmio_barrier_name(b) != "compiler-only"
+}
+
+# The memory domain a device window lives in. The difference is not
+# cosmetic: x86 device space is UNCACHEABLE, so a driver needs no cache
+# maintenance and no barrier beyond the compiler clobber, while on
+# aarch64 a Device-nGnRnE mapping requires the barriers a kernel must
+# not skip — and code that worked on x86 without them is wrong there.
+enum MmioDomain {
+    Uncacheable, # x86: device space is not cached
+    DeviceNgnRnE, # aarch64: gather/no-reorder, non-allocating
+    Normal # RAM: cached and coherent
+}
+
+fn mmio_domain_name(d: MmioDomain) -> str {
+    return match d {
+        MmioDomain.Uncacheable => "uncacheable",
+        MmioDomain.DeviceNgnRnE => "device-ngnrne",
+        MmioDomain.Normal => "normal"
+    }
+}
+
+# mmio_domain_needs_barrier: must a driver put a barrier around accesses
+# to this domain? Normal RAM behind a lock, no; anything device-like,
+# yes — and that is the assumption a driver written on x86 carries to
+# aarch64 by mistake.
+fn mmio_domain_needs_barrier(d: MmioDomain) -> bool {
+    return mmio_domain_name(d) != "normal"
+}
+
+# mmio_domain_needs_cache_maintenance: must the driver invalidate or
+# flush anything? On x86, no: device space is uncacheable, so there is
+# nothing cached to maintain. (DMA is a different question — see
+# Stage 89.)
+fn mmio_domain_needs_cache_maintenance(d: MmioDomain) -> bool {
+    # Never, on any of the three: x86 device space is uncacheable, and an
+    # aarch64 Device-nGnRnE mapping is non-cacheable by definition. (DMA
+    # coherence is a different question — Stage 89.)
+    return false
+}
+
+# ---------------------------------------------------------------------------
+# The LAPIC register map
+# ---------------------------------------------------------------------------
+# Every x86 kernel programs the local APIC through MMIO before it has
+# a working scheduler: the timer, the spurious-interrupt vector, and
+# the EOI it must send. The map is fixed, and getting a register id or
+# the delivery-mode bits wrong is a hang with no message.
+
+# The APIC window is one page, with a 16 stride between registers.
+fn lapic_page_size() -> int {
+    return 4096
+}
+
+fn lapic_reg_stride() -> int {
+    return 16
+}
+
+# The register ids (offset / stride).
+fn lapic_reg_id() -> int {
+    return 2
+}
+
+fn lapic_reg_version() -> int {
+    return 3
+}
+
+fn lapic_reg_tpr() -> int {
+    return 5
+}
+
+fn lapic_reg_svr() -> int {
+    return 15
+}
+
+fn lapic_reg_lvt_timer() -> int {
+    return 50
+}
+
+fn lapic_reg_lvt_lint0() -> int {
+    return 53
+}
+
+fn lapic_reg_timer_icr() -> int {
+    return 56
+}
+
+fn lapic_reg_timer_ccr() -> int {
+    return 57
+}
+
+fn lapic_reg_timer_dcr() -> int {
+    return 62
+}
+
+fn lapic_reg_eoi() -> int {
+    return 11
+}
+
+# There is no separate spurious-vector register: the vector is the
+# SVR's low byte (see lapic_svr_vector), so the SVR's id 15 serves both.
+fn lapic_reg_is_spurious_via_svr() -> bool {
+    return true
+}
+
+# lapic_reg_addr: the address of a register id within the page. The
+# stride is 16, so an id is a multiple of 4 and the low 32 bits of
+# the address are the id shifted left by 2.
+fn lapic_reg_addr(id: int) -> int {
+    if id < 0 {
+        panic("lapic_reg_addr: a register id must be >= 0")
+    }
+    return int_shl(id, 2)
+}
+
+fn lapic_reg_aligned(id: int) -> bool {
+    if id < 0 {
+        return false
+    }
+    return int_and(lapic_reg_addr(id), 3) == 0
+}
+
+# lapic_reg_fits: is the register inside the one-page window?
+fn lapic_reg_fits(id: int) -> bool {
+    if id < 0 {
+        return false
+    }
+    return lapic_reg_addr(id) < lapic_page_size()
+}
+
+# The delivery mode lives in bits 3..6 of a LVT.
+fn lapic_delivery_shift() -> int {
+    return 8
+}
+
+fn lapic_delivery_fixed() -> int {
+    return 0
+}
+
+fn lapic_delivery_nmi() -> int {
+    return 2
+}
+
+fn lapic_delivery_smi() -> int {
+    return 3
+}
+
+fn lapic_delivery_init() -> int {
+    return 5
+}
+
+# lapic_encode_delivery: place a delivery mode in a LVT word.
+fn lapic_encode_delivery(reg: int, mode: int) -> int {
+    if mode < 0 || mode > 7 {
+        panic("lapic_encode_delivery: a delivery mode is 0..7")
+    }
+    return int_or(int_and(reg, 511), int_shl(mode, lapic_delivery_shift()))
+}
+
+fn lapic_decode_delivery(reg: int) -> int {
+    return int_and(int_shr(reg, lapic_delivery_shift()), 7)
+}
+
+# The SVR enable bit, and the spurious-vector mask.
+fn lapic_svr_enable_shift() -> int {
+    return 8
+}
+
+fn lapic_svr_vector_mask() -> int {
+    return 255
+}
+
+# lapic_svr_encode: the two fields an SVR write sets.
+fn lapic_svr_encode(enabled: bool, spurious_vector: int) -> int {
+    if spurious_vector < 0 || spurious_vector > 255 {
+        panic("lapic_svr_encode: a spurious vector is 0..255")
+    }
+    let mut v: int = int_and(spurious_vector, lapic_svr_vector_mask())
+    if enabled {
+        v = int_or(v, int_shl(1, lapic_svr_enable_shift()))
+    }
+    return v
+}
+
+fn lapic_svr_enabled(reg: int) -> bool {
+    return int_and(reg, int_shl(1, lapic_svr_enable_shift())) != 0
+}
+
+fn lapic_svr_vector(reg: int) -> int {
+    return int_and(reg, lapic_svr_vector_mask())
+}
+
+# lapic_map_valid: the fixed part of the map, checked. Every id must be
+# non-negative and land inside the one-page window; anything else means
+# the map was computed wrong, and every access through it would read a
+# register the kernel never intended.
+fn lapic_map_valid() -> bool {
+    let ids: list[int] = [lapic_reg_id(), lapic_reg_version(), lapic_reg_tpr(),
+    lapic_reg_svr(), lapic_reg_lvt_timer(), lapic_reg_lvt_lint0(),
+    lapic_reg_timer_icr(), lapic_reg_timer_ccr(), lapic_reg_timer_dcr(),
+    lapic_reg_eoi()]
+    let mut i: int = 0
+    while i < ids.len() {
+        if !lapic_reg_aligned(ids.get(i)) || !lapic_reg_fits(ids.get(i)) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+# The LVT bits a kernel must set BEFORE enabling the corresponding
+# source, or the CPU takes a spurious interrupt with
+# vector 0 and dies at a reserved-vector #GP.
+fn lapic_lvt_masked() -> int {
+    return 65536
+}
+
+fn lapic_lvt_enabled_shift() -> int {
+    return 16
+}
+
+fn lapic_lvt_enable(reg: int, enabled: bool) -> int {
+    if enabled {
+        return int_or(reg, int_shl(1, lapic_lvt_enabled_shift()))
+    }
+    return int_and(reg, 65535)
+}
+
+fn lapic_lvt_is_enabled(reg: int) -> bool {
+    return int_and(reg, int_shl(1, lapic_lvt_enabled_shift())) != 0
+}

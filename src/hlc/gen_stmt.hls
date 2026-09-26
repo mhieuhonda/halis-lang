@@ -801,7 +801,15 @@ fn gen_stmt(ctx: Ctx, sidx: int, ind: str) -> void {
             let cn: str = fresh_local(ctx, s.name)
             let et: str = list_elem_t(s.vtype)
             let cap: int = stack_cap_of(ctx, s.name)
-            ctx.out.push(ind + c_type(ctx, et) + " " + cn + "[" + cap.to_str() + "];")
+            # The array is 16-BYTE ALIGNED. GCC is free to initialise or
+            # copy it with `movaps`, which FAULTS on an address that is
+            # only 8-aligned — and RSP is only 8-aligned at function
+            # entry. A 4-element list[int] is exactly the size at which
+            # gcc reaches for the 16-byte form, so the fault appeared
+            # only for some literal sizes and only in builds that do not
+            # touch libc. Aligning the array costs one directive and
+            # makes every initialisation shape legal.
+            ctx.out.push(ind + c_type(ctx, et) + " " + cn + "[" + cap.to_str() + "] __attribute__((aligned(16)));")
             let mut i: int = 0
             while i < ctx.exprs[s.value].args.len() {
                 let aidx: int = ctx.exprs[s.value].args.get(i)
@@ -1313,6 +1321,15 @@ fn asm_regvar_register(ctx: Ctx, op: AsmOperand) -> str {
     || c == "r13" || c == "r14" || c == "r15" {
         return c
     }
+    # Stage 87: a 32-bit spelling (eax, r10d, ...) for an int operand.
+    # GCC prints the FULL register name for the operand's type, so a
+    # 64-bit int64_t behind "a" becomes %rax and the template's
+    # `movl %eax` becomes `movl %rax` — an assembler error. A register
+    # VARIABLE carries the value in an int32_t, so GCC prints %eax,
+    # and the writeback restores the 64-bit lvalue.
+    if asm_reg_width(c) == 32 {
+        return c
+    }
     # xmm0..xmm15.
     let mut i: int = 0
     while i < 16 {
@@ -1409,8 +1426,20 @@ fn gen_asm(ctx: Ctx, s: StmtN, ind: str) -> void {
             } else {
                 regvar_cls.set(jr, "r")
             }
+            if asm_reg_width(reg) == 32 && elem_t == "int" {
+                cty = "int32_t"
+            }
             if op.dir == "in" {
-                ctx.out.push(ind + "register " + cty + " " + rv + " __asm__(\"" + reg + "\") = (" + cty + ")(" + gen_expr(ctx, op.expr_idx) + ");")
+                # Stage 87: a 32-bit register spelling needs a 32-bit C
+                # type, or GCC binds the 64-bit register and the
+                # template's `movl %eax` becomes `movl %rax` (an
+                # assembler error). The initialiser is cast down, which
+                # is exactly the truncation the 32-bit instruction does.
+                let mut rty: str = "int32_t"
+                if asm_reg_width(reg) != 32 {
+                    rty = cty
+                }
+                ctx.out.push(ind + "register " + rty + " " + rv + " __asm__(\"" + reg + "\") = (" + rty + ")(" + gen_expr(ctx, op.expr_idx) + ");")
             } else {
                 # out / inout / late_out — prepare the lvalue pieces
                 # once (a call in a field/index base must not be
@@ -1564,6 +1593,10 @@ fn gen_asm(ctx: Ctx, s: StmtN, ind: str) -> void {
             } else {
                 ce = gen_expr(ctx, op.expr_idx)
             }
+            # An OUTPUT needs no cast: `"=a"` against a 64-bit lvalue
+            # writes the low 32 bits and leaves the rest alone, which is
+            # exactly what `movl` does and exactly what core.mmio's
+            # width model says a 32-bit read leaves behind.
             outputs.push("\"" + cstr + "\"(" + ce + ")")
         }
         j_out = j_out + 1
@@ -1586,6 +1619,9 @@ fn gen_asm(ctx: Ctx, s: StmtN, ind: str) -> void {
                 ce = temp_names.get(j2)
             } else {
                 ce = gen_expr(ctx, op.expr_idx)
+            }
+            if op.is_constraint_str && asm_reg_width(op.constraint) == 32 {
+                ce = "(int32_t)(" + ce + ")"
             }
             inputs.push("\"" + cstr + "\"(" + ce + ")")
         }

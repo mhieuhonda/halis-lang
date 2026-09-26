@@ -1341,33 +1341,58 @@ fn gen_program(ctx: Ctx) -> list[str] {
     # rax=60; aarch64/riscv64: x8/a7=93); unknown arches trap (the
     # program still runs — only clean exit needs the port).
     if ctx.crate_freestanding {
-        final.push("void _start(void) {")
+        # A freestanding entry is a NAKED function, and that is not
+        # style — it is correctness.
+        #
+        # The kernel hands `_start` a 16-byte-aligned RSP, and the SysV
+        # ABI wants a `call` to leave the callee with RSP ≡ 8 (mod 16).
+        # A `call` from a 16-aligned RSP does exactly that. But GCC has
+        # no idea what RSP is on entry to a function it did not see
+        # called: it assumes the ABI's own invariant (RSP ≡ 8), so it
+        # reserves 8 bytes of outgoing-call padding — and the callee
+        # then starts 8 bytes off. Every 16-byte-aligned slot GCC
+        # subsequently places in that callee's frame is misaligned, and
+        # its `movaps` initialisers fault. The symptom is a SIGSEGV in
+        # the middle of a function whose source is obviously correct,
+        # and it appears ONLY in a `-nostdlib` image, because a hosted
+        # `main` is entered by libc with the right alignment.
+        #
+        # `naked` takes the prologue away entirely, so nothing can move
+        # RSP. Everything that wants a C body goes in `hl_boot`, which
+        # the entry's asm calls.
+        # `hl_boot` has EXTERNAL linkage on purpose: the naked entry
+        # names it from an inline-asm string, which the compiler does
+        # not parse, so a `static` definition looks unreferenced and
+        # --gc-sections drops it — leaving `call hl_boot` unresolved.
+        final.push("int64_t hl_boot(void);")
+        final.push("int64_t hl_boot(void) {")
         # Stage 81: arm the panic hook before any user code runs (a
         # freestanding fault before main would otherwise miss it).
         if has_panic_handler(ctx) {
             final.push("    hl_panic_hook = usf_panic_handler;")
         }
         if mf.ret == "int" {
-            final.push("    int64_t hl_code = usf_main();")
+            final.push("    return usf_main();")
         } else {
             final.push("    usf_main();")
-            final.push("    int64_t hl_code = 0;")
+            final.push("    return 0;")
         }
+        final.push("}")
+        final.push("__attribute__((naked, noreturn)) void _start(void) {")
+        final.push("    __asm__ volatile (")
         final.push("#if defined(__x86_64__)")
-        final.push("    __asm__ volatile (\"syscall\" :: \"a\" (60L), \"D\" (hl_code) : \"rcx\", \"r11\", \"memory\");")
+        final.push("        \"call hl_boot\\n\" \"movq %rax, %rdi\\n\"")
+        final.push("        \"movl $60, %eax\\n\" \"syscall\\n\" \"hlt\\n\"")
         final.push("#elif defined(__aarch64__)")
-        final.push("    register long hl_x8 __asm__(\"x8\") = 93;")
-        final.push("    register long hl_x0 __asm__(\"x0\") = hl_code;")
-        final.push("    __asm__ volatile (\"svc #0\" :: \"r\" (hl_x8), \"r\" (hl_x0) : \"memory\");")
+        final.push("        \"call hl_boot\\n\" \"mov x0, x0\\n\"")
+        final.push("        \"mov x8, #93\\n\" \"svc #0\\n\" \"brk #1\\n\"")
         final.push("#elif defined(__riscv) || defined(__riscv__)")
-        final.push("    register long hl_a7 __asm__(\"a7\") = 93;")
-        final.push("    register long hl_a0 __asm__(\"a0\") = hl_code;")
-        final.push("    __asm__ volatile (\"ecall\" :: \"r\" (hl_a7), \"r\" (hl_a0) : \"memory\");")
+        final.push("        \"call hl_boot\\n\" \"mv a0, a0\\n\"")
+        final.push("        \"li a7, 93\\n\" \"ecall\\n\" \"ebreak\\n\"")
         final.push("#else")
-        final.push("    (void)hl_code;")
-        final.push("    __builtin_trap();")
+        final.push("        \"call hl_boot\\n\" \"ud2\\n\"")
         final.push("#endif")
-        final.push("    __builtin_unreachable();")
+        final.push("    );")
         final.push("}")
         return final
     }

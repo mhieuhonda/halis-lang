@@ -797,3 +797,118 @@ else
     bad "idt: make idt-acceptance failed"
     tail -15 "$TMP/idt_acc86.log"
 fi
+
+echo "=== 24. Stage 87: core.mmio — memory-mapped I/O ==="
+# Stage 87 (v0.106.0-alpha): a device register is reached through `asm!`,
+# which is already `__volatile__` with a "memory" clobber. The stage also
+# made the freestanding entry `naked` (an ordinary C entry left the first
+# Halis function 8 bytes off the SysV alignment, so GCC's `movaps`
+# initialisers faulted). The gate is the authority.
+MM_F=tests/ok/feat_stage87_mmio.hls
+mm_interp=$(python3 boot/boot.py "$MM_F" </dev/null 2>/dev/null); mm_code=$?
+if [ "$mm_code" -eq 0 ]; then
+    ok "mmio: feat_stage87_mmio runs on the interpreter (exit 0)"
+else
+    bad "mmio: feat_stage87_mmio interpreter exit=$mm_code"
+fi
+if [ -f core/mmio.hls ] && grep -q "fn page_fault_decode" core/mmio.hls 2>/dev/null; then
+    ok "mmio: core/mmio.hls present"
+elif [ -f core/mmio.hls ] && grep -q "fn mmio_access_ok" core/mmio.hls; then
+    ok "mmio: core/mmio.hls present"
+else
+    bad "mmio: core/mmio.hls missing"
+fi
+# A volatile DEVICE read must not be folded: two rdtsc reads with a
+# million iterations between them have to differ.
+cat > "$TMP/mmvol.hls" <<'MMEOF'
+fn rd() -> int {
+    let mut lo: int = 0
+    let mut hi: int = 0
+    asm!("rdtsc", out("rax") lo, out("rdx") hi)
+    return int_or(int_shl(int_and(hi, 4294967295), 32), int_and(lo, 4294967295))
+}
+
+fn main() -> int {
+    let a: int = rd()
+    let mut i: int = 0
+    while i < 4000000 {
+        i = i + 1
+    }
+    let b: int = rd()
+    if b < a {
+        return 1
+    }
+    if b == a {
+        return 2
+    }
+    return 0
+}
+MMEOF
+if [ -x "$TMP/hlc1" ] && "$TMP/hlc1" "$TMP/mmvol.hls" "$TMP/mmvol.c" >/dev/null 2>&1 \
+    && gcc -O2 -Werror -o "$TMP/mmvol" "$TMP/mmvol.c" -lm -pthread 2>/dev/null; then
+    "$TMP/mmvol" </dev/null >/dev/null 2>&1
+    if [ "$?" -eq 0 ]; then
+        ok "mmio: a volatile device read is not folded"
+    else
+        bad "mmio: the volatile-read probe failed"
+    fi
+else
+    bad "mmio: the volatile-read probe did not build"
+fi
+# The same probe -nostdlib: this is the ABI-alignment property.
+sed '1i #![freestanding]' "$TMP/mmvol.hls" > "$TMP/mmvolfs.hls"
+if [ -x "$TMP/hlc1" ] && "$TMP/hlc1" "$TMP/mmvolfs.hls" "$TMP/mmvolfs.c" >/dev/null 2>&1 \
+    && gcc -O2 -ffreestanding -nostdlib -ffunction-sections -fno-stack-protector \
+        -Wl,--gc-sections -o "$TMP/mmvolfs" "$TMP/mmvolfs.c" 2>/dev/null; then
+    "$TMP/mmvolfs" </dev/null >/dev/null 2>&1
+    if [ "$?" -eq 0 ]; then
+        ok "mmio: the volatile read works -nostdlib (naked entry)"
+    else
+        bad "mmio: the -nostdlib volatile probe failed"
+    fi
+    if grep -q 'naked, noreturn)) void _start' "$TMP/mmvolfs.c"; then
+        ok "mmio: the freestanding entry is naked"
+    else
+        bad "mmio: the freestanding entry is not naked"
+    fi
+else
+    bad "mmio: the -nostdlib volatile probe did not build"
+fi
+rm -f "$TMP/mmvol.hls" "$TMP/mmvolfs.hls"
+# The checked constructors are accepted by the checker and panic at run.
+for mp in tests/ok/panic_stage87_*.hls; do
+    mp_name=$(basename "$mp" .hls)
+    if python3 boot/boot.py --check "$mp" >/dev/null 2>&1; then
+        mp_out=$(python3 boot/boot.py "$mp" 2>&1 >/dev/null); mp_code=$?
+        if [ "$mp_code" -eq 101 ] && [ -n "$mp_out" ]; then
+            ok "mmio: $mp_name accepted, panics at run time"
+        else
+            bad "mmio: $mp_name did not panic (exit=$mp_code)"
+        fi
+    else
+        bad "mmio: $mp_name must be ACCEPTED by the checker"
+    fi
+done
+# The demo (asm + model) runs natively.
+if [ -x "$TMP/hlc1" ] && "$TMP/hlc1" examples/mmio_demo.hls "$TMP/mmd.c" >/dev/null 2>&1 \
+    && gcc -O2 -Werror -o "$TMP/mmd" "$TMP/mmd.c" -lm -pthread 2>/dev/null; then
+    mm_out=$("$TMP/mmd" </dev/null 2>/dev/null)
+    if echo "$mm_out" | grep -q "DEMO OK"; then
+        ok "mmio: examples/mmio_demo.hls runs natively, DEMO OK"
+    else
+        bad "mmio: mmio_demo did not print DEMO OK"
+    fi
+else
+    bad "mmio: mmio_demo failed to build"
+fi
+if make mmio-acceptance >"$TMP/mmio_acc87.log" 2>&1; then
+    if grep -q "ACCEPTANCE OK: Stage 87" "$TMP/mmio_acc87.log"; then
+        ok "mmio: make mmio-acceptance runs end-to-end"
+    else
+        bad "mmio: make mmio-acceptance did not print ACCEPTANCE OK"
+        tail -5 "$TMP/mmio_acc87.log"
+    fi
+else
+    bad "mmio: make mmio-acceptance failed"
+    tail -15 "$TMP/mmio_acc87.log"
+fi

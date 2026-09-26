@@ -1,0 +1,510 @@
+# ============================================================================
+# tests/ok/feat_stage87_mmio.hls — Stage 87: memory-mapped I/O
+# ----------------------------------------------------------------------------
+# #![no_std] so the same source runs on the interpreter, natively, and
+# linked -nostdlib. Exit 0 = all assertions passed; a non-zero code
+# names the first assertion that failed.
+#
+# The MODEL half (core/mmio.hls) is pure, so every number in it is
+# asserted identically on all three paths. The PATTERN half — the actual
+# `asm!` accesses — is proven by examples/mmio_demo.hls and by the
+# acceptance gate, which compiles the annotated TU and checks the
+# emitted instructions.
+# ============================================================================
+
+#![no_std]
+
+import "core.mmio"
+import "core.result"
+import "core.section"
+
+fn main() -> int {
+    # The fields this test uses, each a plain local binding. A field
+    # returned BY VALUE from a helper and then handed to a function that
+    # mutates it is a lifetime shape the freestanding path gets wrong
+    # (the temporary's box is gone before the callee writes), and a
+    # driver holds its field descriptors in bindings anyway.
+    let f_enable: MmioField = mmio_field_new(4, 3)
+    let f_busy: MmioField = mmio_field_new(0, 1)
+    let f_top: MmioField = mmio_field_new(60, 4)
+    let f_over: MmioField = mmio_field_new(61, 4)
+    let f_over2: MmioField = mmio_field_new(62, 4)
+    let f_whole: MmioField = mmio_field_new(0, 64)
+    let f_temp: MmioField = mmio_field_new(16, 4)
+    let f_split: MmioField = mmio_field_new(30, 4)
+    let f_narrow: MmioField = mmio_field_new(28, 8)
+    let f_wide: MmioField = mmio_field_new(4, 12)
+    let _unused_f: MmioField = mmio_field_new(0, 1)
+
+    # ------------------------------------------------------------------
+    # Access widths (1..20)
+    # ------------------------------------------------------------------
+    if mmio_width_name(MmioWidth.Byte) != "byte" || mmio_width_name(MmioWidth.Qword) != "qword" {
+        return 1
+    }
+    if mmio_width_bytes(MmioWidth.Byte) != 1 || mmio_width_bytes(MmioWidth.Word) != 2 {
+        return 2
+    }
+    if mmio_width_bytes(MmioWidth.Dword) != 4 || mmio_width_bytes(MmioWidth.Qword) != 8 {
+        return 3
+    }
+    if mmio_width_bits(MmioWidth.Dword) != 32 || mmio_width_bits(MmioWidth.Qword) != 64 {
+        return 4
+    }
+    if mmio_width_mask(MmioWidth.Byte) != 255 || mmio_width_mask(MmioWidth.Word) != 65535 {
+        return 5
+    }
+    if mmio_width_mask(MmioWidth.Dword) != 4294967295 {
+        return 6
+    }
+    # A 64-bit read defines the whole register, so its mask is -1 — the
+    # one case where that is the right answer rather than a bug.
+    if mmio_width_mask(MmioWidth.Qword) != -1 {
+        return 7
+    }
+    # The AT&T suffix, which is what a template needs.
+    if mmio_width_suffix(MmioWidth.Byte) != "b" || mmio_width_suffix(MmioWidth.Word) != "w" {
+        return 8
+    }
+    if mmio_width_suffix(MmioWidth.Dword) != "l" || mmio_width_suffix(MmioWidth.Qword) != "q" {
+        return 9
+    }
+
+    # ------------------------------------------------------------------
+    # The masking rule (10..20)
+    # ------------------------------------------------------------------
+    # A 32-bit read into a 64-bit register leaves the upper 32 bits
+    # ALONE — a driver that skips the mask reads whatever the register
+    # happened to hold.
+    let poisoned: int = 1311768467463791224
+    if mmio_read(poisoned, MmioWidth.Dword) != 2596070008 {
+        return 10
+    }
+    if mmio_read(poisoned, MmioWidth.Word) != 57976 {
+        return 11
+    }
+    if mmio_read(poisoned, MmioWidth.Byte) != 120 {
+        return 12
+    }
+    if mmio_read(poisoned, MmioWidth.Qword) != poisoned {
+        return 13
+    }
+    if mmio_mask(poisoned, MmioWidth.Dword) != 2596070008 {
+        return 14
+    }
+    # What a write hands the instruction: truncation is the DEVICE's
+    # business, not the driver's.
+    if mmio_write(1311768467294899696, MmioWidth.Dword) != 2427178480 {
+        return 15
+    }
+    if mmio_write(300, MmioWidth.Byte) != 44 {
+        return 16
+    }
+    if mmio_write(-1, MmioWidth.Qword) != -1 {
+        return 17
+    }
+    # Sign extension. A temperature of -5 in a byte is 251 unsigned; a
+    # driver that skips the extension reports a plausible wrong number.
+    if mmio_read_signed(251, MmioWidth.Byte) != -5 {
+        return 18
+    }
+    if mmio_read_signed(5, MmioWidth.Byte) != 5 {
+        return 19
+    }
+    if mmio_read_signed(65534, MmioWidth.Word) != -2 {
+        return 20
+    }
+
+    # ------------------------------------------------------------------
+    # Alignment (21..30)
+    # ------------------------------------------------------------------
+    if !mmio_is_aligned(4096, MmioWidth.Qword) {
+        return 21
+    }
+    if mmio_is_aligned(4100, MmioWidth.Qword) {
+        return 22
+    }
+    if !mmio_is_aligned(4100, MmioWidth.Dword) {
+        return 23
+    }
+    # A 1-byte access is naturally aligned at EVERY address — the rule
+    # only bites from a word up.
+    if !mmio_is_aligned(4097, MmioWidth.Byte) {
+        return 24
+    }
+    if mmio_is_aligned(4101, MmioWidth.Word) {
+        return 25
+    }
+    # An unaligned device access is not "slow" on a bus — it is
+    # undefined, and on some controllers it takes the link down.
+    if !mmio_is_page_aligned(67108864) {
+        return 26
+    }
+    if mmio_is_page_aligned(67108865) || mmio_is_page_aligned(-4096) {
+        return 27
+    }
+    if mmio_page_size() != 4096 {
+        return 28
+    }
+    if mmio_region_allows_unaligned(mmio_region_new(67108864, 8192, true)) != true {
+        return 29
+    }
+    if mmio_region_allows_unaligned(mmio_region_new(67108864, 8192, false)) != false {
+        return 30
+    }
+
+    # ------------------------------------------------------------------
+    # Device windows (31..50)
+    # ------------------------------------------------------------------
+    let win: MmioRegion = mmio_region_new(67108864, 8192, false)
+    if win.base != 67108864 || win.size != 8192 {
+        return 31
+    }
+    if mmio_region_end(win) != 67117056 {
+        return 32
+    }
+    if !mmio_region_contains(win, 67108864) || !mmio_region_contains(win, 67117055) {
+        return 33
+    }
+    if mmio_region_contains(win, 67117056) || mmio_region_contains(win, 67108863) {
+        return 34
+    }
+    # An access that runs off the end reads the NEXT device — or, at the
+    # top of physical memory, whatever is there.
+    if mmio_access_fits(win, 67108864 + 8190, 4) {
+        return 35
+    }
+    if !mmio_access_fits(win, 67108864, 4) {
+        return 36
+    }
+    if mmio_access_fits(win, 67117055, 4) {
+        return 37
+    }
+    if mmio_access_fits(win, 67108864, 0) {
+        return 38
+    }
+    if !mmio_access_ok(win, 67108864 + 8, MmioWidth.Dword) {
+        return 39
+    }
+    if mmio_access_ok(win, 67108865, MmioWidth.Dword) {
+        return 40
+    }
+    # A window whose SIZE is not a multiple of the access width: the
+    # BASE must be page-aligned, the size need not be rounded, and a
+    # driver that assumed it was writes past the end.
+    let odd: MmioRegion = mmio_region_new(67125248, 6, false)
+    if mmio_access_ok(odd, 67125248 + 4, MmioWidth.Dword) {
+        return 41
+    }
+    if !mmio_access_ok(odd, 67125248, MmioWidth.Dword) {
+        return 42
+    }
+    # Two windows claiming the same bytes means a base or size is wrong.
+    if mmio_overlaps(win, mmio_region_new(67117056, 4096, false)) {
+        return 43
+    }
+    if !mmio_overlaps(win, mmio_region_new(67112960, 4096, false)) {
+        return 44
+    }
+    if mmio_overlaps(win, mmio_region_new(67108864, 0, false)) {
+        return 45
+    }
+    let mut windows: list[MmioRegion] = []
+    windows.push(win)
+    windows.push(mmio_region_new(67117056, 4096, false))
+    if !mmio_regions_disjoint(windows) {
+        return 46
+    }
+    if mmio_regions_total(windows) != 12288 {
+        return 47
+    }
+    if mmio_region_find(windows, 67118000) != 1 {
+        return 48
+    }
+    if mmio_region_find(windows, 0) != -1 {
+        return 49
+    }
+    let mut bad: list[MmioRegion] = []
+    bad.push(win)
+    bad.push(mmio_region_new(67112960, 4096, false))
+    if mmio_regions_disjoint(bad) {
+        return 50
+    }
+
+    # ------------------------------------------------------------------
+    # Bit fields (51..80)
+    # ------------------------------------------------------------------
+    let enable: MmioField = f_enable
+    if mmio_field_mask(enable) != 112 {
+        return 51
+    }
+    if !mmio_field_ok(enable) {
+        return 52
+    }
+    if mmio_read_field(240, enable) != 7 {
+        return 53
+    }
+    if mmio_read_field(0, enable) != 0 {
+        return 54
+    }
+    # The mask is built from the FIELD, never from the value, so a wide
+    # value cannot leak into its neighbours.
+    if mmio_write_field(0, enable, 5) != 80 {
+        return 55
+    }
+    if mmio_write_field(0, enable, 255) != 112 {
+        return 56
+    }
+    if mmio_write_field(15, enable, 0) != 15 {
+        return 57
+    }
+    # The neighbours really do survive.
+    if mmio_set_field(0, enable) != 112 {
+        return 58
+    }
+    if mmio_clear_field(127, enable) != 15 {
+        return 59
+    }
+    if mmio_toggle_field(112, enable) != 0 {
+        return 60
+    }
+    let busy: MmioField = f_busy
+    if mmio_set_field(0, busy) != 1 || mmio_clear_field(1, busy) != 0 {
+        return 61
+    }
+    # A field at bit 0 of a 64-bit register, and one at the top.
+    let top: MmioField = f_top
+    if !mmio_field_ok(top) {
+        return 62
+    }
+    if mmio_field_ok(f_over) {
+        return 63
+    }
+    if mmio_field_ok(f_over2) {
+        return 64
+    }
+    # A width the CONSTRUCTOR refuses (1..64) is still a value a
+    # hand-built field can carry, and `mmio_field_ok` is what answers for
+    # one.
+    if mmio_field_ok(MmioField {
+        shift: 0, width: 65
+    }) {
+        return 65
+    }
+    # A 64-bit field has no mask, and that is the one case where -1 is
+    # the right answer rather than a bug.
+    let whole: MmioField = f_whole
+    if mmio_field_mask(whole) != -1 {
+        return 66
+    }
+    if mmio_write_field(0, whole, -1) != -1 {
+        return 67
+    }
+    if mmio_read_field(-1, whole) != -1 {
+        return 68
+    }
+    # A signed field: -5 in the four bits at offset 16.
+    let temp: MmioField = f_temp
+    let treg: int = int_shl(11, 16)
+    if mmio_read_field(treg, temp) != 11 {
+        return 69
+    }
+    if mmio_read_field_signed(treg, temp) != -5 {
+        return 70
+    }
+    if mmio_read_field_signed(int_shl(5, 16), temp) != 5 {
+        return 71
+    }
+    # A field that crosses a 32-bit boundary is real hardware, and a
+    # 32-bit access cannot update it in one operation — which is the
+    # whole reason such a field is a hazard.
+    let split: MmioField = f_split
+    if !mmio_field_straddles32(split) {
+        return 72
+    }
+    if mmio_field_straddles32(enable) {
+        return 73
+    }
+    if !mmio_field_straddles32(f_narrow) {
+        return 74
+    }
+    if mmio_field_write_ok(split, MmioWidth.Dword) {
+        return 75
+    }
+    if !mmio_field_write_ok(split, MmioWidth.Qword) {
+        return 76
+    }
+    # A field WIDER than the access cannot be updated by it: the
+    # read-modify-write would keep only the part the narrow access
+    # covered.
+    let wide: MmioField = f_wide
+    if mmio_field_write_ok(wide, MmioWidth.Byte) {
+        return 77
+    }
+    if !mmio_field_write_ok(wide, MmioWidth.Word) {
+        return 78
+    }
+    if !mmio_field_write_ok(enable, MmioWidth.Byte) {
+        return 79
+    }
+    if !mmio_field_write_ok(enable, MmioWidth.Dword) {
+        return 80
+    }
+
+    # ------------------------------------------------------------------
+    # Barriers and memory domains (81..95)
+    # ------------------------------------------------------------------
+    if mmio_barrier_name(mmio_default_barrier()) != "cpu" {
+        return 81
+    }
+    if !mmio_is_fence(mmio_default_barrier()) {
+        return 82
+    }
+    # The compiler clause is NOT a fence — and a driver that passes
+    # `options(nomem)` on a device access has asked for exactly the
+    # reordering that corrupts a register.
+    if mmio_is_fence(MmioBarrier.Compiler) {
+        return 83
+    }
+    if mmio_barrier_name(MmioBarrier.Compiler) != "compiler-only" {
+        return 84
+    }
+    if !mmio_is_fence(MmioBarrier.Full) || mmio_barrier_name(MmioBarrier.Full) != "full" {
+        return 85
+    }
+    # x86 device space is uncacheable, so a driver needs no cache
+    # maintenance; an aarch64 Device-nGnRnE mapping needs the barriers
+    # a kernel must not skip — and code written on x86 without them is
+    # wrong there.
+    if mmio_domain_needs_cache_maintenance(MmioDomain.Uncacheable) {
+        return 86
+    }
+    if mmio_domain_needs_cache_maintenance(MmioDomain.DeviceNgnRnE) {
+        return 87
+    }
+    if mmio_domain_needs_cache_maintenance(MmioDomain.Normal) {
+        return 88
+    }
+    if !mmio_domain_needs_barrier(MmioDomain.DeviceNgnRnE) {
+        return 89
+    }
+    if !mmio_domain_needs_barrier(MmioDomain.Uncacheable) {
+        return 90
+    }
+    if mmio_domain_needs_barrier(MmioDomain.Normal) {
+        return 91
+    }
+    if mmio_domain_name(MmioDomain.Uncacheable) != "uncacheable" {
+        return 92
+    }
+    if mmio_domain_name(MmioDomain.DeviceNgnRnE) != "device-ngnrne" {
+        return 93
+    }
+    if mmio_domain_name(MmioDomain.Normal) != "normal" {
+        return 94
+    }
+    if mmio_barrier_name(MmioBarrier.Full) == mmio_barrier_name(MmioBarrier.Cpu) {
+        return 95
+    }
+
+    # ------------------------------------------------------------------
+    # The LAPIC map (96..120)
+    # ------------------------------------------------------------------
+    if !lapic_map_valid() {
+        return 96
+    }
+    # An id is the offset divided by four, so ID (2) and VERSION (3) are
+    # as valid as the rest — a driver that requires a multiple of four
+    # rejects the two registers it needs first.
+    if lapic_reg_addr(lapic_reg_id()) != 8 {
+        return 97
+    }
+    if lapic_reg_addr(lapic_reg_version()) != 12 {
+        return 98
+    }
+    if lapic_reg_addr(lapic_reg_tpr()) != 20 {
+        return 99
+    }
+    if lapic_reg_addr(lapic_reg_svr()) != 60 {
+        return 100
+    }
+    if lapic_reg_addr(lapic_reg_eoi()) != 44 {
+        return 101
+    }
+    if lapic_reg_addr(lapic_reg_lvt_timer()) != 200 {
+        return 102
+    }
+    if lapic_reg_addr(lapic_reg_lvt_lint0()) != 212 {
+        return 103
+    }
+    if lapic_reg_addr(lapic_reg_timer_icr()) != 224 {
+        return 104
+    }
+    if lapic_reg_addr(lapic_reg_timer_ccr()) != 228 {
+        return 105
+    }
+    if lapic_reg_addr(lapic_reg_timer_dcr()) != 248 {
+        return 106
+    }
+    if lapic_reg_stride() != 16 || lapic_page_size() != 4096 {
+        return 107
+    }
+    # Every address is 4-aligned by construction, and every register is
+    # inside the one-page window.
+    if !lapic_reg_aligned(lapic_reg_id()) || !lapic_reg_aligned(lapic_reg_svr()) {
+        return 108
+    }
+    if lapic_reg_aligned(-1) {
+        return 109
+    }
+    if !lapic_reg_fits(1023) {
+        return 110
+    }
+    if !lapic_reg_fits(255) {
+        return 111
+    }
+    if lapic_reg_fits(1024) {
+        return 112
+    }
+    # The delivery mode lives in bits 3..6 of a LVT.
+    if lapic_decode_delivery(lapic_encode_delivery(0, lapic_delivery_nmi())) != 2 {
+        return 113
+    }
+    if lapic_decode_delivery(lapic_encode_delivery(0, lapic_delivery_fixed())) != 0 {
+        return 114
+    }
+    if lapic_decode_delivery(lapic_encode_delivery(0, lapic_delivery_smi())) != 3 {
+        return 115
+    }
+    if lapic_decode_delivery(lapic_encode_delivery(0, lapic_delivery_init())) != 5 {
+        return 116
+    }
+    if lapic_encode_delivery(0, 0) != 0 {
+        return 117
+    }
+    # The SVR carries the enable bit and the spurious vector — there is
+    # no separate spurious-vector register.
+    let svr: int = lapic_svr_encode(true, 255)
+    if lapic_svr_enabled(svr) != true || lapic_svr_vector(svr) != 255 {
+        return 118
+    }
+    if lapic_svr_enabled(lapic_svr_encode(false, 32)) != false {
+        return 119
+    }
+    if lapic_svr_vector(lapic_svr_encode(false, 32)) != 32 {
+        return 120
+    }
+    # A LVT must be masked before the source is enabled, or the CPU
+    # takes a spurious interrupt with vector 0 and dies at a
+    # reserved-vector #GP.
+    if lapic_lvt_is_enabled(lapic_lvt_masked()) != true {
+        return 121
+    }
+    if lapic_lvt_is_enabled(lapic_lvt_enable(lapic_lvt_masked(), false)) != false {
+        return 122
+    }
+    if lapic_lvt_enable(lapic_lvt_masked(), true) != lapic_lvt_masked() {
+        return 123
+    }
+    return 0
+}

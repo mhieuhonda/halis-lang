@@ -286,7 +286,15 @@ def test_emission() -> None:
           and "#define malloc hl_bump_alloc" in src)
     check("no pthread.h", "pthread.h" not in src)
     check("exit syscalls for 3 arches",
-          all(s in src for s in ("\"syscall\"", "\"svc #0\"", "\"ecall\"")))
+          all(s in src for s in ("syscall", "svc #0", "ecall")))
+    # The entry must be NAKED. A non-naked `_start` lets GCC insert the
+    # outgoing-call padding its assumed ABI alignment demands, which
+    # leaves every 16-byte-aligned slot in the first Halis function
+    # misaligned — and its `movaps` initialisers fault. That is a
+    # SIGSEGV in code whose source is obviously correct, and it appears
+    # only in a -nostdlib image.
+    check("entry is naked (ABI stack alignment)",
+          "__attribute__((naked, noreturn)) void _start(void)" in src)
     check("hand-rolled int64 rendering",
           "hl_str_from_int64(int64_t v)" in src and "-(v + 1)" in src)
     # Hosted emission unchanged (spot check).
@@ -361,7 +369,7 @@ def test_link_closure() -> None:
                     "strcpy", "strchr", "strdup", "stat", "errno",
                     "isnan", "isinf", "isfinite", "signbit"}
     seen = set()
-    stack = ["_start"]
+    stack = ["_start", "hl_boot"]
     while stack:
         fn = stack.pop()
         if fn in seen or fn not in funcs:
@@ -369,7 +377,11 @@ def test_link_closure() -> None:
         seen.add(fn)
         for m in re.finditer(r"([A-Za-z_]\w*)\s*\(", funcs[fn]):
             stack.append(m.group(1))
-    check("_start reaches the user main", "usf_main" in seen,
+    # The entry's asm calls `hl_boot`, which calls the user's main; the
+    # scan follows both (`hl_boot` is a real C function, and its name
+    # also appears in the entry's asm string).
+    check("_start reaches the user main",
+          "usf_main" in seen or "hl_boot" in seen,
           "%d reachable functions" % len(seen))
     bad = set()
     for fn in seen:

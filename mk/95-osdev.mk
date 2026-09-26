@@ -31,6 +31,20 @@ $(LINKER_TEST_OBJ): $(LINKER_TEST_SRC) $(LINKER_SCRIPT)
 $(LINKER_TEST_BIN): $(LINKER_TEST_OBJ) $(LINKER_SCRIPT)
 	$(LINKER_TEST_LD) -T $(LINKER_SCRIPT) -o $@ $<
 
+# mmio-acceptance: the Stage 87 acceptance gate. Runs the 7-section
+# suite for memory-mapped I/O: the register rule (a 32-bit register is
+# accepted exactly when the template's instruction is 32-bit, and still
+# rejected otherwise), the core/mmio.hls surface, the demo's `asm!`
+# accesses compiling `-Werror` with the volatile and memory-clobber
+# markers present, a volatile DEVICE read proven not to be folded
+# (hosted AND -nostdlib) plus a stack-allocated list surviving the
+# freestanding entry's frame alignment, the four checked-constructor
+# panics, six behaviour probes on all three paths, and the tools.
+mmio-acceptance:
+	@echo "[Stage 87 acceptance] running tests/mmio_acceptance.py..."
+	@$(PYTHON) tests/mmio_acceptance.py
+	@echo "ACCEPTANCE OK: Stage 87 -- core.mmio (volatile memory-mapped I/O)"
+
 # idt-acceptance: the Stage 86 acceptance gate. Runs the 7-section suite
 # for the interrupt tables: the `#[irq_handler(N)]` attribute and its
 # guards (0..255, once per function, once per vector, the bare form
@@ -76,7 +90,7 @@ link-acceptance:
 	@$(PYTHON) tests/link_acceptance.py
 	@echo "ACCEPTANCE OK: Stage 84 -- linker-script integration + custom sections"
 
-.PHONY: freestanding freestanding-check freestanding-acceptance nostd nostd-acceptance alloc-acceptance mem-acceptance panic-acceptance stackguard-acceptance asmreg-acceptance link-acceptance boot-acceptance idt-acceptance test-linker
+.PHONY: freestanding freestanding-check freestanding-acceptance nostd nostd-acceptance alloc-acceptance mem-acceptance panic-acceptance stackguard-acceptance asmreg-acceptance link-acceptance boot-acceptance idt-acceptance mmio-acceptance test-linker
 # Phase VI — OS development foundation (Stages 77-78+)
 # ============================================================================
 # These stages give the LANGUAGE the capabilities OS developers need.
@@ -120,6 +134,12 @@ link-acceptance:
 # save/restore stub plus the binding table a kernel installs;
 # `core.interrupt` models the GDT, the TSS, the IDT gates, the
 # page-fault error code and the 8259 remap — see SPEC section 40.
+# Stage 87 (v0.106.0-alpha): memory-mapped I/O — a device register is
+# reached through `asm!` (already `__volatile__` with a "memory" clobber);
+# a 32-bit register is accepted when the template's instruction is
+# 32-bit, and the freestanding entry is `naked` so the stack stays on
+# the ABI alignment; `core.mmio` models the widths, fields, windows,
+# barriers and the LAPIC map — see SPEC section 41.
 # ============================================================================
 
 # freestanding: compile an HLS program to freestanding C + link with

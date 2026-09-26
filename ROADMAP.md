@@ -142,7 +142,7 @@ remains green.
 | 84 | Linker-script integration (`link.ld`) + custom sections | ✅ | (done in v0.103.0-alpha) |
 | 85 | Multiboot2 + Limine-compliant boot protocol headers | ✅ | (done in v0.104.0-alpha) |
 | 86 | `core.interrupt` — IDT/GDT declaration syntax | ✅ | (done in v0.105.0-alpha) |
-| 87 | `core.mmio` — memory-mapped-IO helpers (volatile reads/writes) | ⬜ | 3 weeks |
+| 87 | `core.mmio` — memory-mapped-IO helpers (volatile reads/writes) | ✅ | (done in v0.106.0-alpha) |
 | 88 | `core.port` — x86 I/O port invariants (`inb`/`outb` typesafe) | ⬜ | 2 weeks |
 | 89 | DMA-safe buffer types (no GC moves, no virtual remap) | ⬜ | 4 weeks |
 | 90 | `core.sync.nolock` — lock-free atomics, seqlock, RCU | ⬜ | 5 weeks |
