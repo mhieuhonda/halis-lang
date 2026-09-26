@@ -247,6 +247,11 @@ class CheckerCore(object):
         # boot↔hlc parity gap (boot used to parse the attribute and
         # silently ignore the bound).
         self.check_stack_size_attrs()
+        # 2.7 Stage 86 (v0.105.0-alpha): one handler per declared vector.
+        self.check_irq_vectors()
+        # 2.7b Stage 86: the #[irq_handler] signature rules (Stage 28's,
+        # now enforced by BOTH front-ends).
+        self.check_irq_handler_signatures()
         # 2.8 Stage 84 (v0.103.0-alpha) + Stage 85 (v0.104.0-alpha):
         # the emitted boot header, then the linker script. Both read the
         # crate attributes off `self.p`, so the order is for the reader
@@ -330,6 +335,71 @@ class CheckerCore(object):
                          "function must be pure)"
                          % (fn["name"], ", ".join(sorted(declared)), label),
                          fn)
+
+    # ---------- Stage 86 (v0.105.0-alpha): #[irq_handler] signature ----
+    # A handler returns through IRETQ, so it returns void, and it takes
+    # exactly one parameter: the pointer to the frame the stub saved.
+    # These three rules were Stage 28's and only the self-hosted checker
+    # enforced them, so a program boot accepted could be rejected by
+    # hlc — the exact parity gap Stage 86's fail programs probe.
+    def check_irq_handler_signatures(self):
+        for key in sorted(self.fns):
+            fn = self.fns[key]
+            attrs = fn.get("attrs", {})
+            if not attrs.get("irq_handler", False) or fn.get("extern", False):
+                continue
+            if fn["ret"] != "void":
+                self.err("#[irq_handler] requires the function to return "
+                         "'void' (gcc's interrupt attribute); '%s' returns "
+                         "'%s'" % (fn["name"], fn["ret"]), fn)
+            if len(fn["params"]) != 1:
+                self.err("#[irq_handler] requires exactly one parameter "
+                         "(the saved-frame pointer); '%s' has %d"
+                         % (fn["name"], len(fn["params"])), fn)
+            # The parameter must lower to a C POINTER: str, list[T],
+            # map[...], tainted[T] of pointer, Chan[T], Task[T], or a
+            # user struct. int / float / bool lower to scalars, and the
+            # stub has no address to pass for one.
+            # `params` entries are (name, type, mut) tuples.
+            pt = fn["params"][0][1]
+            if not self.is_ptr_param(pt):
+                self.err("#[irq_handler] requires its parameter to be a "
+                         "pointer-typed value (str / list[T] / struct / Chan "
+                         "/ Task / tainted[T] of pointer); '%s' has '%s' which "
+                         "lowers to a non-pointer C type and gcc's interrupt "
+                         "attribute would reject the signature"
+                         % (fn["name"], pt), fn)
+
+    def is_ptr_param(self, pt):
+        """True when an HLS type lowers to a C pointer: str, a
+        container, a built-in wrapper, or any user struct. int / float /
+        bool lower to scalars, so a stub has no address to pass."""
+        if pt in ("int", "float", "bool", "void"):
+            return False
+        if pt in self.structs:
+            return True
+        if pt == "str":
+            return True
+        return type_base(pt) in ("list", "map", "Chan", "Task", "tainted")
+
+    # ---------- Stage 86 (v0.105.0-alpha): interrupt-vector ownership ---
+    # At most ONE handler per declared vector. Two handlers for vector
+    # 14 means one of them is never entered, and the CPU's gate table
+    # can only hold one — so the loser is discovered at boot, on a
+    # machine, with a fault whose cause is a stack of "which of these
+    # ran".
+    def check_irq_vectors(self):
+        owner = {}
+        for key in sorted(self.fns):
+            vec = self.fns[key].get("attrs", {}).get("irq_vector", -1)
+            if vec is None or vec < 0:
+                continue
+            if vec in owner:
+                self.err("two functions declare #[irq_handler(%d)]: '%s' and "
+                         "'%s'. A vector has exactly one handler; the second "
+                         "one would never run." % (vec, owner[vec], key),
+                         self.fns[key])
+            owner[vec] = key
 
     # ---------- Stage 81 (v0.100.0-alpha): panic-handler validation ----------
     # `#[panic_handler]` marks the program's single panic handler: a

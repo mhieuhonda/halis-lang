@@ -102,3 +102,155 @@ fn boot_header_limine_lines() -> list[str] {
     r.push("};")
     return r
 }
+
+# ============================================================================
+# Section 5h — the interrupt-binding table a `#[irq_handler(N)]` crate
+# gets (Stage 86, v0.105.0-alpha).
+# ----------------------------------------------------------------------------
+# A CPU enters a handler through an IDT gate, and a gate holds a 32-bit
+# offset. A gate therefore CANNOT be a static initialiser: the handler's
+# address is not a constant expression, which is why every kernel in
+# every language fills its IDT at runtime.
+#
+# What the compiler CAN do — and what `#[irq_handler(N)]` makes it do —
+# is publish the BINDINGS: which Halis function services which vector,
+# with which IST. `hl_idt_bindings` is that table, and
+# `hl_idt_install` turns it into gates and loads the IDTR. The kernel
+# calls one function at boot and never writes a descriptor by hand.
+#
+# `used` matters as much here as on a boot header: nothing calls the
+# table, and `--gc-sections` would drop exactly the rows a kernel needs.
+# ============================================================================
+
+# irq_table_lines: the binding table plus the installer, emitted only
+# when the program actually declares a vector.
+fn irq_table_lines(ctx: Ctx) -> list[str] {
+    let r: list[str] = []
+    r.push("")
+    r.push("// ===== Stage 86: interrupt bindings (#[irq_handler(N)]) =====")
+    r.push("// A gate holds a 32-bit offset, so an IDT cannot be a static")
+    r.push("// initialiser — the handler's address is not a constant")
+    r.push("// expression. What CAN be static is the BINDING, so the")
+    r.push("// kernel calls hl_idt_install() once and never writes a")
+    r.push("// descriptor by hand.")
+    r.push("typedef void (*hl_irq_fn)(void *frame);")
+    r.push("struct hl_irq_binding { uint32_t vector; uint32_t ist; hl_irq_fn handler; };")
+    r.push("")
+    r.push("static struct hl_idt_desc { uint16_t off_lo, sel; uint8_t ist, type_attr; uint16_t off_mid; uint32_t off_hi, zero; } hl_idt[256];")
+    r.push("static struct hl_idt_ptr { uint16_t limit; uint64_t base; } __attribute__((packed)) hl_idtr;")
+    r.push("")
+    r.push("// hl_idt_install: build the gates for every binding and load")
+    r.push("// the IDTR. `cs` is the kernel's code selector; pass the one")
+    r.push("// from the GDT the kernel installed (the 8259-era 0x08 is")
+    r.push("// right only if the GDT says so). An interrupt gate (0x8E)")
+    r.push("// CLEARS IF on entry, so a fault inside a handler faults;")
+    r.push("// pass 0x8F for a trap gate when a handler must stay")
+    r.push("// maskable. A row with a NULL handler is skipped, so a")
+    r.push("// reserved vector stays reserved.")
+    r.push("void hl_idt_install(const struct hl_irq_binding *b, uint32_t n, uint16_t cs) {")
+    r.push("    for (uint32_t i = 0; i < n; i++) {")
+    r.push("        if (b[i].handler == NULL) continue;")
+    r.push("        uint64_t a = (uint64_t)(void *)b[i].handler;")
+    r.push("        hl_idt[b[i].vector].off_lo    = (uint16_t)(a & 0xffff);")
+    r.push("        hl_idt[b[i].vector].sel       = cs;")
+    r.push("        hl_idt[b[i].vector].ist       = (uint8_t)(b[i].ist & 7);")
+    r.push("        hl_idt[b[i].vector].type_attr = (uint8_t)(0x8E | ((b[i].ist & 7) << 0) | (uint16_t)0);")
+    r.push("        hl_idt[b[i].vector].off_mid   = (uint16_t)((a >> 16) & 0xffff);")
+    r.push("        hl_idt[b[i].vector].off_hi    = (uint32_t)((a >> 32) & 0xffffffff);")
+    r.push("        hl_idt[b[i].vector].zero      = 0;")
+    r.push("    }")
+    r.push("    hl_idtr.limit = sizeof(hl_idt) - 1;")
+    r.push("    hl_idtr.base  = (uint64_t)(void *)hl_idt;")
+    r.push("    __asm__ volatile (\"lidt %0\" :: \"m\"(hl_idtr));")
+    r.push("}")
+    r.push("")
+    r.push("// The stub per vector. gcc's `interrupt` attribute cannot be")
+    r.push("// used on a Halis function: a compiler-generated body uses")
+    r.push("// SSE (the frame is passed in a vector register, cleanup code")
+    r.push("// spills with movaps), and gcc REJECTS SSE inside an")
+    r.push("// interrupt service routine. So the save/restore lives here,")
+    r.push("// in asm, where it belongs, and the Halis function is an")
+    r.push("// ordinary C function the stub CALLS.")
+    r.push("//")
+    r.push("// The push order is the reverse of the pop the runtime does,")
+    r.push("// so `add $88, %rsp` + iretq is correct: RSP on entry points")
+    r.push("// at the saved RIP, and iretq consumes RIP/CS/RFLAGS from")
+    r.push("// there. Callee-saved registers (rbx, rbp, r12-r15) are")
+    r.push("// deliberately NOT touched: the callee preserves them.")
+    let mut si: int = 0
+    while si < ctx.fn_order.len() {
+        let skey: str = ctx.fn_order.get(si)
+        let sf: FnInfo = ctx.fns.get_or(skey, dummy_fn())
+        if sf.attr_irq_vector >= 0 {
+            let cname: str = "usf_" + c_fn_name(skey)
+            let stub: str = "hl_irq_stub_" + sf.attr_irq_vector.to_str()
+            let with_err: bool = sf.attr_irq_vector == 8 || sf.attr_irq_vector == 10
+                || sf.attr_irq_vector == 11 || sf.attr_irq_vector == 12
+                || sf.attr_irq_vector == 13 || sf.attr_irq_vector == 14
+                || sf.attr_irq_vector == 17 || sf.attr_irq_vector == 21
+            # The dummy parameter is never read (the stub sets %rdi
+            # itself, from %rsp); it is there so the stub's type
+            # matches the binding table's function-pointer type, which
+            # gcc would otherwise warn about.
+            r.push("__attribute__((naked, used))")
+            r.push("void " + stub + "(void *unused) {")
+            r.push("    __asm__ volatile (")
+            r.push("        \"pushq %rax\\n\" \"pushq %rbx\\n\" \"pushq %rcx\\n\" \"pushq %rdx\\n\"")
+            r.push("        \"pushq %rsi\\n\" \"pushq %rdi\\n\" \"pushq %rbp\\n\" \"pushq %r8\\n\"")
+            r.push("        \"pushq %r9\\n\" \"pushq %r10\\n\" \"pushq %r11\\n\"")
+            if with_err {
+                r.push("        \"movl $" + sf.attr_irq_vector.to_str() + ", %eax\\n\"")
+            }
+            r.push("        \"movq %rsp, %rdi\\n\"")
+            r.push("        \"call " + cname + "\\n\"")
+            r.push("        \"addq $88, %rsp\\n\"")
+            r.push("        \"iretq\\n\");")
+            r.push("}")
+        }
+        si = si + 1
+    }
+    r.push("")
+    r.push("__attribute__((used))")
+    r.push("const struct hl_irq_binding hl_idt_bindings[] = {")
+    let mut i: int = 0
+    let mut first: bool = true
+    while i < ctx.fn_order.len() {
+        let key: str = ctx.fn_order.get(i)
+        let f: FnInfo = ctx.fns.get_or(key, dummy_fn())
+        if f.attr_irq_vector >= 0 {
+            # The C function name for a method keeps the mangling the
+            # rest of the backend uses; an `#[irq_handler]` is always a
+            # top-level fn (the checker rejects a method), so this is
+            # just the plain prefix.
+            let cname: str = "usf_" + c_fn_name(key)
+            if !first {
+                r.push(",")
+            }
+            first = false
+            # The gate points at the STUB, not at the Halis function:
+            # the stub is what returns with IRETQ.
+            r.push("    { " + f.attr_irq_vector.to_str() + "u, 0u, hl_irq_stub_"
+                + f.attr_irq_vector.to_str() + " }")
+        }
+        i = i + 1
+    }
+    r.push(",")
+    r.push("    { 0u, 0u, NULL }   // terminator")
+    r.push("};")
+    return r
+}
+
+# irq_count: how many functions in the program declared a vector. The
+# codegen emits the table only when this is non-zero.
+fn irq_count(ctx: Ctx) -> int {
+    let mut n: int = 0
+    let mut i: int = 0
+    while i < ctx.fn_order.len() {
+        let f: FnInfo = ctx.fns.get_or(ctx.fn_order.get(i), dummy_fn())
+        if f.attr_irq_vector >= 0 {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return n
+}

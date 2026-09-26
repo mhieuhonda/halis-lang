@@ -238,6 +238,7 @@ class Parser:
             "stack_size": -1,
             "no_red_zone": False,
             "irq_handler": False,
+            "irq_vector": -1,
             "inline": "",
             "hot": False,
             "cold": False,
@@ -257,6 +258,9 @@ class Parser:
             cold             - mark the function cold
             no_red_zone      - disable the x86-64 red zone
             irq_handler      - emit an IRET-compatible frame
+            irq_handler(N)   - Stage 86: the same, AND this function is
+                              the handler for vector N; the C backend
+                              emits the binding table
             stack_size(N)    - assert the fn's frame is <= N bytes
             tail_call        - Stage 31: assert every recursive call is
                               in verified tail position (the codegen
@@ -322,6 +326,32 @@ class Parser:
                 elif attr_name == "no_red_zone":
                     self.cur_attrs["no_red_zone"] = True
                 elif attr_name == "irq_handler":
+                    # Stage 86 (v0.105.0-alpha): the bare form declares
+                    # "this is an interrupt handler" (the kernel assigns
+                    # the vector itself). The vector form additionally
+                    # declares WHICH vector, and the C backend emits the
+                    # binding table a kernel installs at boot.
+                    if self.at_sym("("):
+                        self.next()
+                        vt = self.peek()
+                        if vt["k"] != "int":
+                            self.err("irq_handler expects an integer "
+                                     "interrupt vector (0..255) but got %s"
+                                     % self._desc(), vt)
+                        self.next()
+                        n = int(vt["v"])
+                        if n < 0 or n > 255:
+                            self.err("interrupt vector %d is out of range "
+                                     "(an x86-64 IDT has 256 entries, "
+                                     "0..255)" % n, vt)
+                        self.eat_sym(")")
+                        if self.cur_attrs["irq_vector"] >= 0:
+                            self.err("interrupt vector appears more than "
+                                     "once on one function (was %d, now %d "
+                                     "— a handler services exactly one "
+                                     "vector)" % (self.cur_attrs["irq_vector"],
+                                                   n), vt)
+                        self.cur_attrs["irq_vector"] = n
                     if self.cur_attrs["tail_call"]:
                         self.err("'tail_call' and 'irq_handler' are mutually "
                                  "exclusive (an interrupt frame must return "
@@ -876,7 +906,8 @@ class Parser:
                 # attributes (the FFI signature is the C ABI; inlining,
                 # interrupt frame layout etc. belong to the C side).
                 "attrs": {"stack_size": -1, "no_red_zone": False,
-                          "irq_handler": False, "inline": "",
+                          "irq_handler": False, "irq_vector": -1,
+                          "inline": "",
                           "hot": False, "cold": False,
                           "tail_call": False, "panic_handler": False,
                           "section": "", "align": -1},

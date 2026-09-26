@@ -31,6 +31,19 @@ $(LINKER_TEST_OBJ): $(LINKER_TEST_SRC) $(LINKER_SCRIPT)
 $(LINKER_TEST_BIN): $(LINKER_TEST_OBJ) $(LINKER_SCRIPT)
 	$(LINKER_TEST_LD) -T $(LINKER_SCRIPT) -o $@ $<
 
+# idt-acceptance: the Stage 86 acceptance gate. Runs the 7-section suite
+# for the interrupt tables: the `#[irq_handler(N)]` attribute and its
+# guards (0..255, once per function, once per vector, the bare form
+# still working), the core/interrupt.hls surface, the emitted
+# save/restore stub + binding table, the LINKED image's symbols, the
+# fact that the vector form does NOT use gcc's `interrupt` attribute
+# (gcc rejects SSE in an ISR, and a Halis body always uses it), the
+# boot/hlc diagnostic parity, eight behaviour probes, and the demos.
+idt-acceptance:
+	@echo "[Stage 86 acceptance] running tests/idt_acceptance.py..."
+	@$(PYTHON) tests/idt_acceptance.py
+	@echo "ACCEPTANCE OK: Stage 86 -- core.interrupt (IDT/GDT declaration syntax)"
+
 # boot-acceptance: the Stage 85 acceptance gate. Runs the 7-section
 # end-to-end suite for the boot protocols: the crate attribute and its
 # guards (protocol name, entry-file-only, freestanding-only, once per
@@ -63,7 +76,7 @@ link-acceptance:
 	@$(PYTHON) tests/link_acceptance.py
 	@echo "ACCEPTANCE OK: Stage 84 -- linker-script integration + custom sections"
 
-.PHONY: freestanding freestanding-check freestanding-acceptance nostd nostd-acceptance alloc-acceptance mem-acceptance panic-acceptance stackguard-acceptance asmreg-acceptance link-acceptance boot-acceptance test-linker
+.PHONY: freestanding freestanding-check freestanding-acceptance nostd nostd-acceptance alloc-acceptance mem-acceptance panic-acceptance stackguard-acceptance asmreg-acceptance link-acceptance boot-acceptance idt-acceptance test-linker
 # Phase VI — OS development foundation (Stages 77-78+)
 # ============================================================================
 # These stages give the LANGUAGE the capabilities OS developers need.
@@ -102,6 +115,11 @@ link-acceptance:
 # scans for, and the Stage 84 placement check proves the linker script
 # KEEPs it; `core.boot` models the received side (both tag encodings,
 # both memory-map encodings, the framebuffer) — see SPEC section 39.
+# Stage 86 (v0.105.0-alpha): the interrupt tables — `#[irq_handler(N)]`
+# declares which vector a function services and the backend emits a
+# save/restore stub plus the binding table a kernel installs;
+# `core.interrupt` models the GDT, the TSS, the IDT gates, the
+# page-fault error code and the 8259 remap — see SPEC section 40.
 # ============================================================================
 
 # freestanding: compile an HLS program to freestanding C + link with

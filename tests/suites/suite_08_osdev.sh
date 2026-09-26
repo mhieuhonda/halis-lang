@@ -694,3 +694,106 @@ else
     bad "boot: make boot-acceptance failed"
     tail -15 "$TMP/boot_acc85.log"
 fi
+
+echo "=== 23. Stage 86: core.interrupt — IDT/GDT declaration syntax ==="
+# Stage 86 (v0.104.0-alpha): `#[irq_handler(N)]` declares which vector a
+# function services; the backend emits a save/restore stub (gcc rejects
+# SSE inside an `interrupt` function, and a Halis body always uses it)
+# plus the binding table a kernel installs. The gate is the authority;
+# these are the suite-level spot checks.
+IDT_F=tests/ok/feat_stage86_interrupt.hls
+idt_interp=$(python3 boot/boot.py "$IDT_F" </dev/null 2>/dev/null); idt_code=$?
+if [ "$idt_code" -eq 0 ]; then
+    ok "idt: feat_stage86_interrupt runs on the interpreter (exit 0)"
+else
+    bad "idt: feat_stage86_interrupt interpreter exit=$idt_code"
+fi
+if [ -f core/interrupt.hls ] && grep -q "fn page_fault_decode" core/interrupt.hls; then
+    ok "idt: core/interrupt.hls present"
+else
+    bad "idt: core/interrupt.hls missing"
+fi
+for if_ in tests/fail/fail_stage86_*.hls; do
+    idt_name=$(basename "$if_" .hls)
+    idt_err=$(python3 boot/boot.py --check "$if_" 2>&1 >/dev/null); idt_rc=$?
+    if [ "$idt_rc" -ne 1 ]; then
+        bad "idt: $idt_name not rejected by boot"
+        continue
+    fi
+    idt_err2=$("$TMP/hlc1" --audit "$if_" 2>&1 >/dev/null); idt_rc2=$?
+    if [ "$idt_rc2" -eq 0 ]; then
+        bad "idt: $idt_name accepted by hlc (parity)"
+        continue
+    fi
+    idt_m1=$(printf '%s\n' "$idt_err"  | sed -E 's/^[a-z ]*error: //')
+    idt_m2=$(printf '%s\n' "$idt_err2" | sed -E 's/^panic: //; s/^[a-z ]*error: //')
+    if [ "$idt_m1" = "$idt_m2" ] && [ -n "$idt_m1" ]; then
+        ok "idt: $idt_name rejected by both compilers (identical diagnostic)"
+    else
+        bad "idt: $idt_name diagnostics differ"
+        echo "        boot: $idt_m1"
+        echo "        hlc:  $idt_m2"
+    fi
+done
+# The emitted stub + table, compiled -Werror, read off the object.
+if [ -x "$TMP/hlc1" ]; then
+    cat > "$TMP/idtsrc.hls" <<'IDTEOF'
+#[irq_handler(14)]
+fn on_page_fault(frame: list[int]) -> void {
+    return
+}
+
+fn main() -> int {
+    return 0
+}
+IDTEOF
+    if "$TMP/hlc1" "$TMP/idtsrc.hls" "$TMP/idtsrc.c" >/dev/null 2>&1; then
+        if grep -q 'hl_irq_stub_14' "$TMP/idtsrc.c" && grep -q 'hl_idt_bindings' "$TMP/idtsrc.c"; then
+            ok "idt: the C carries a stub and the binding table"
+        else
+            bad "idt: the C is missing the stub or the table"
+        fi
+        # gcc REJECTS SSE inside an __attribute__((interrupt)) function,
+        # so the vector form must NOT carry the attribute.
+        if grep -q '__attribute__((interrupt))' "$TMP/idtsrc.c"; then
+            bad "idt: the vector form still uses gcc's interrupt attribute"
+        else
+            ok "idt: the vector form avoids gcc's interrupt attribute"
+        fi
+        if gcc -O2 -Werror -ffreestanding -fno-pie -c "$TMP/idtsrc.c" -o "$TMP/idtsrc.o" 2>/dev/null; then
+            if nm "$TMP/idtsrc.o" 2>/dev/null | grep -q "T hl_irq_stub_14"; then
+                ok "idt: the stub is a real code symbol"
+            else
+                bad "idt: the stub is not a code symbol"
+            fi
+        else
+            bad "idt: the annotated TU did not compile -Werror"
+        fi
+    else
+        bad "idt: the annotated program did not compile"
+    fi
+    rm -f "$TMP/idtsrc.hls"
+fi
+# The demo.
+if [ -x "$TMP/hlc1" ] && "$TMP/hlc1" examples/interrupt_demo.hls "$TMP/id86.c" >/dev/null 2>&1 \
+    && gcc -O2 -o "$TMP/id86" "$TMP/id86.c" -lm -pthread 2>/dev/null; then
+    id_out=$("$TMP/id86" </dev/null 2>/dev/null)
+    if echo "$id_out" | grep -q "DEMO OK"; then
+        ok "idt: examples/interrupt_demo.hls runs natively, DEMO OK"
+    else
+        bad "idt: interrupt_demo did not print DEMO OK"
+    fi
+else
+    bad "idt: interrupt_demo failed to build"
+fi
+if make idt-acceptance >"$TMP/idt_acc86.log" 2>&1; then
+    if grep -q "ACCEPTANCE OK: Stage 86" "$TMP/idt_acc86.log"; then
+        ok "idt: make idt-acceptance runs end-to-end"
+    else
+        bad "idt: make idt-acceptance did not print ACCEPTANCE OK"
+        tail -5 "$TMP/idt_acc86.log"
+    fi
+else
+    bad "idt: make idt-acceptance failed"
+    tail -15 "$TMP/idt_acc86.log"
+fi

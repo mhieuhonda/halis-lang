@@ -1,0 +1,629 @@
+# ============================================================================
+# tests/ok/feat_stage86_interrupt.hls — Stage 86: IDT/GDT declaration
+# ----------------------------------------------------------------------------
+# #![no_std] so the same source runs on the interpreter, natively, and
+# linked -nostdlib. Exit 0 = all assertions passed; a non-zero code
+# names the first assertion that failed.
+#
+# This is the LIBRARY half's test: `core/interrupt.hls` has no libc
+# dependency, so every number here is asserted identically on all three
+# paths. The LANGUAGE half (the `#[irq_handler(N)]` declaration and the
+# stub the backend emits for it) is proven by the acceptance gate, which
+# compiles and LINKS a real freestanding image and inspects the
+# resulting symbols.
+# ============================================================================
+
+#![no_std]
+
+import "core.interrupt"
+import "core.result"
+import "core.section"
+
+# A code segment that is present, kernel-level, and 64-bit.
+fn code64_access() -> int {
+    return gdt_access_present() + gdt_access_code()
+}
+
+# A data segment that is present, kernel-level and writable.
+fn data_access() -> int {
+    return gdt_access_present() + gdt_access_data_rw()
+}
+
+fn main() -> int {
+    # ------------------------------------------------------------------
+    # Selector arithmetic (1..12)
+    # ------------------------------------------------------------------
+    if gdt_selector(0, 0) != 0 {
+        return 1
+    }
+    if gdt_selector(1, 0) != 8 || gdt_selector(5, 0) != 40 {
+        return 2
+    }
+    if gdt_selector(1, 3) != 11 {
+        return 3
+    }
+    if gdt_selector_index(40) != 5 || gdt_selector_rpl(40) != 0 {
+        return 4
+    }
+    if gdt_selector_index(11) != 1 || gdt_selector_rpl(11) != 3 {
+        return 5
+    }
+    if !gdt_selector_is_kernel(8) || gdt_selector_is_kernel(11) {
+        return 6
+    }
+    # The TI bit (bit 2) selects an LDT; a kernel has no reason to load
+    # one, and a selector with it set is a bug worth catching.
+    if gdt_selector_ok(12) || gdt_selector_ok(4) {
+        return 7
+    }
+    if !gdt_selector_ok(0) || !gdt_selector_ok(8) {
+        return 8
+    }
+    if gdt_selector_ok(-1) || gdt_selector_ok(gdt_max_selector() + 1) {
+        return 9
+    }
+    # The index occupies bits 3..15, so the largest well-formed GDT
+    # selector is (1023 << 3) | 3 = 8187 — NOT 8191, which has TI set.
+    if gdt_max_selector() != 8187 {
+        return 10
+    }
+    if gdt_selector(1023, 3) != 8187 {
+        return 11
+    }
+    if gdt_limine_handoff_selector64_code() != 40 {
+        return 12
+    }
+
+    # ------------------------------------------------------------------
+    # The access byte (13..22). Present (0x80) + class (0x08) + the
+    # S bit (0x10) + DPL (0x60); the data class is RW (0x02).
+    if gdt_access_present() != 128 {
+        return 13
+    }
+    # The class bit is 0x08 and the S bit is 0x10 — reading one as the
+    # other makes every data descriptor look like code and every code
+    # descriptor look like a TSS.
+    if !gdt_is_code(gdt_access_code()) || gdt_is_code(gdt_access_data_rw()) {
+        return 14
+    }
+    if !gdt_is_data(gdt_access_data_rw()) || gdt_is_data(gdt_access_code()) {
+        return 15
+    }
+    # S SET means code/data; S clear means a system segment, so a code
+    # or data descriptor is never a system segment.
+    if gdt_is_system(gdt_access_code()) || gdt_is_system(gdt_access_data_rw()) {
+        return 16
+    }
+    if gdt_is_system(code64_access()) {
+        return 17
+    }
+    # A TSS descriptor has S clear: 137 is present, DPL 0,
+    # 64-bit-available, TSS — the one class the CPU loads into a
+    # register rather than a segment.
+    if !gdt_is_system(137) || gdt_is_system(24) {
+        return 18
+    }
+    if !gdt_is_present(code64_access()) || gdt_is_present(gdt_access_code()) {
+        return 19
+    }
+    if gdt_dpl(gdt_access_dpl(0)) != 0 || gdt_dpl(gdt_access_dpl(3)) != 3 {
+        return 20
+    }
+    # The present bit must be ADDED by the caller: a constant that
+    # already includes P overflows the access byte (152 + 146 = 298 > 255)
+    # and silently encodes a different descriptor, so each composed byte
+    # has to fit on its own.
+    if code64_access() < 0 || code64_access() > 255 {
+        return 21
+    }
+    if data_access() < 0 || data_access() > 255 {
+        return 22
+    }
+    if code64_access() != 152 || data_access() != 146 {
+        return 23
+    }
+
+    # The flags byte (23..32)
+    # ------------------------------------------------------------------
+    # The four flags live in the NIBBLE above the limit's, so these
+    # helpers work in nibble units: L=4, D/B=2, G=1. Reading L as the
+    # byte's bit 3 (which is limit[19:16]) makes every 64-bit segment
+    # behave as 16-bit while the table still loads.
+    if gdt_flag_long() != 4 || gdt_flag_default32() != 2 {
+        return 24
+    }
+    if gdt_flag_granularity() != 1 || gdt_flag_limit_mask() != 15 {
+        return 25
+    }
+    if gdt_code_flags(true) != 4 {
+        return 26
+    }
+    if int_and(gdt_code_flags(true), gdt_flag_default32()) != 0 {
+        return 27
+    }
+    if gdt_code_flags(false) != 3 {
+        return 28
+    }
+    if gdt_data_flags(true) != 3 || gdt_data_flags(false) != 1 {
+        return 29
+    }
+    if gdt_is_long(gdt_code_flags(true)) != true {
+        return 30
+    }
+    if gdt_is_long(gdt_code_flags(false)) || gdt_is_long(gdt_data_flags(true)) {
+        return 31
+    }
+    if gdt_is_long(0) || gdt_is_long(3) {
+        return 32
+    }
+    # 15 is the LIMIT mask, not a flags value: read as flags it has
+    # every bit set, so it certainly "is long".
+    if !gdt_is_long(15) {
+        return 33
+    }
+
+    # ------------------------------------------------------------------
+    # Descriptor encode / decode round trip (33..46)
+    # ------------------------------------------------------------------
+    let d: list[int] = gdt_encode(code64_access(), gdt_code_flags(true), 0, 1048575)
+    if gdt_decode_access(d.get(1)) != 152 {
+        return 34
+    }
+    if gdt_decode_flags(d.get(1)) != 4 {
+        return 35
+    }
+    if gdt_decode_limit(d.get(0), d.get(1)) != 1048575 {
+        return 36
+    }
+    if gdt_decode_base(d.get(0), d.get(1)) != 0 {
+        return 37
+    }
+    # The null descriptor: all zeroes, and it must survive the round
+    # trip or every table built here is wrong from byte 0.
+    let n: list[int] = gdt_encode(0, 0, 0, 0)
+    if n.get(0) != 0 || n.get(1) != 0 {
+        return 38
+    }
+    # A non-zero base in all three places it appears.
+    let b: list[int] = gdt_encode(code64_access(), gdt_code_flags(true), 291, 4095)
+    if gdt_decode_base(b.get(0), b.get(1)) != 291 {
+        return 39
+    }
+    if gdt_decode_limit(b.get(0), b.get(1)) != 4095 {
+        return 40
+    }
+    # The limit's top nibble shares a byte with the flags nibble: it is
+    # at high-half bits 8-11, NOT at bits 0-3 where it looks like it
+    # belongs when the descriptor's bytes are read in order.
+    let big: list[int] = gdt_encode(data_access(), gdt_data_flags(true), 0, 1048575)
+    if int_and(int_shr(big.get(1), 8), gdt_flag_limit_mask()) != 15 {
+        return 41
+    }
+    if gdt_decode_base(big.get(0), big.get(1)) != 0 {
+        return 42
+    }
+    # Every byte of a descriptor must stay inside 32 bits — the layout
+    # packs base[31:24] alongside the access byte.
+    if int_and(gdt_decode_access(b.get(1)), 255) != 152 {
+        return 43
+    }
+    if gdt_decode_flags(b.get(1)) != 4 {
+        return 44
+    }
+    # A TSS lives at a real base; check the high byte survives.
+    let t: list[int] = gdt_encode(137, 0, 16777216, 104)
+    if gdt_decode_base(t.get(0), t.get(1)) != 16777216 {
+        return 45
+    }
+    if gdt_decode_access(t.get(1)) != 137 {
+        return 46
+    }
+    if gdt_decode_flags(t.get(1)) != 0 {
+        return 47
+    }
+
+    # ------------------------------------------------------------------
+    # gdt_check (47..58)
+    # ------------------------------------------------------------------
+    if gdt_fault_name(gdt_check(code64_access(), gdt_code_flags(true), true)) != "none" {
+        return 48
+    }
+    if gdt_fault_name(gdt_check(data_access(), gdt_data_flags(true), false)) != "none" {
+        return 49
+    }
+    if gdt_fault_name(gdt_check(0, 0, true)) != "not-present" {
+        return 50
+    }
+    if gdt_fault_name(gdt_check(137, 0, false)) != "system-segment" {
+        return 51
+    }
+    if gdt_fault_name(gdt_check(code64_access(), gdt_code_flags(true), false)) != "class-mismatch" {
+        return 52
+    }
+    if gdt_fault_name(gdt_check(data_access(), gdt_data_flags(true), true)) != "class-mismatch" {
+        return 53
+    }
+    # L together with DB is architecturally invalid: the CPU #GPs on
+    # load, so the table is fine until the first far jump.
+    if gdt_fault_name(gdt_check(code64_access(), gdt_code_flags(true) + gdt_flag_default32(), true)) != "long-with-db" {
+        return 54
+    }
+    if gdt_fault_name(gdt_check(data_access(), gdt_code_flags(true), false)) != "long-without-code" {
+        return 55
+    }
+    if gdt_fault_name(gdt_check(gdt_access_present() + gdt_access_dpl(3) + gdt_access_code(), gdt_code_flags(true), true)) != "none" {
+        return 56
+    }
+    if gdt_fault_name(GdtFault.None) != "none" {
+        return 57
+    }
+    if gdt_fault_name(GdtFault.DplOutOfRange) != "dpl-out-of-range" {
+        return 58
+    }
+    if gdt_fault_name(GdtFault.NotPresent) != "not-present" {
+        return 59
+    }
+
+    # ------------------------------------------------------------------
+    # The TSS (59..68)
+    # ------------------------------------------------------------------
+    if tss_packed_bytes() != 108 || tss_descriptor_bytes() != 16 {
+        return 60
+    }
+    if tss_packed_bytes() + tss_descriptor_bytes() != 124 {
+        return 61
+    }
+    # The busy bit is bit 4 of the descriptor's second byte, which is
+    # bit 4 of its HIGH half.
+    if tss_busy_bit() != 16 {
+        return 62
+    }
+    if tss_is_busy(0) || !tss_is_busy(16) {
+        return 63
+    }
+    if tss_is_busy(tss_set_busy(0, true)) != true {
+        return 64
+    }
+    if tss_is_busy(tss_set_busy(16, false)) != false {
+        return 65
+    }
+    # Every other bit of the descriptor must be untouched by the
+    # busy-bit round trip.
+    if tss_set_busy(tss_set_busy(0, true), false) != 0 {
+        return 66
+    }
+    # The IST field, and its limit: the reserved bits are RESERVED, so
+    # an IST above 7 is undefined behaviour rather than "clamped".
+    if ist_max() != 7 {
+        return 67
+    }
+    if !ist_ok(0) || !ist_ok(7) || ist_ok(8) || ist_ok(-1) {
+        return 68
+    }
+    if tss_ist_decode(tss_ist_encode(0, 5)) != 5 || tss_ist_decode(tss_ist_encode(0, 0)) != 0 {
+        return 69
+    }
+
+    # ------------------------------------------------------------------
+    # IDT gates (69..84)
+    # ------------------------------------------------------------------
+    if idt_gate_bytes() != 16 {
+        return 70
+    }
+    if idt_gate_interrupt() != 14 || idt_gate_trap() != 15 {
+        return 71
+    }
+    if idt_attr_present() != 128 {
+        return 72
+    }
+    # 142: present, ring 0, interrupt gate. 143: the trap form.
+    if !idt_gate_ok(idt_attr_present() + idt_gate_interrupt()) {
+        return 73
+    }
+    if !idt_gate_ok(idt_attr_present() + idt_gate_trap()) {
+        return 74
+    }
+    if idt_gate_ok(idt_gate_interrupt()) {
+        return 75
+    }
+    if idt_gate_ok(idt_attr_present() + 12) {
+        return 76
+    }
+    if !idt_gate_is_interrupt(idt_attr_present() + idt_gate_interrupt()) {
+        return 77
+    }
+    if idt_gate_is_trap(idt_attr_present() + idt_gate_interrupt()) {
+        return 78
+    }
+    if !idt_gate_is_trap(idt_attr_present() + idt_gate_trap()) {
+        return 79
+    }
+    if idt_gate_type(idt_attr_present() + idt_gate_interrupt()) != 14 {
+        return 80
+    }
+    if !idt_gate_ok(idt_attr_present() + idt_attr_dpl(3) + idt_gate_trap()) {
+        return 81
+    }
+    # The IST is the gate's OWN byte (offset 4), not the type/attribute
+    # byte (offset 5) — packing it into the low nibble of the latter
+    # overwrites the gate TYPE.
+    if !idt_ist_ok(7) || idt_ist_ok(8) {
+        return 82
+    }
+    if !idt_ist_byte_ok(0) || !idt_ist_byte_ok(7) {
+        return 83
+    }
+    if idt_ist_byte_ok(8) || idt_ist_byte_ok(-1) || idt_ist_byte_ok(255) {
+        return 84
+    }
+    if idt_ist_unpack(idt_ist_pack(5)) != 5 || idt_ist_unpack(0) != 0 {
+        return 85
+    }
+
+    # ------------------------------------------------------------------
+    # The 32-bit offset split (85..94)
+    # ------------------------------------------------------------------
+    let p: list[int] = idt_offset_split(305419896)
+    if p.get(0) != 22136 || p.get(1) != 4660 {
+        return 86
+    }
+    if p.get(2) != 0 {
+        return 87
+    }
+    if idt_offset_join(p.get(0), p.get(1), p.get(2)) != 305419896 {
+        return 88
+    }
+    if idt_offset_split(0).get(0) != 0 {
+        return 89
+    }
+    if idt_offset_join(0, 0, 0) != 0 {
+        return 90
+    }
+    # A 32-bit offset is all a gate can reach, which is what forces the
+    # higher-half relocation a kernel does at boot. The upper half is
+    # tested with a LOGICAL shift: an arithmetic shift of a negative
+    # offset by 32 still yields -1.
+    if !idt_offset_fits(0) || !idt_offset_fits(4294967295) {
+        return 91
+    }
+    if idt_offset_fits(4294967296) || idt_offset_fits(-1) {
+        return 92
+    }
+    if !idt_entry_ok(idt_attr_present() + idt_gate_interrupt(), 8, 1048576) {
+        return 93
+    }
+    if idt_entry_ok(idt_attr_present() + idt_gate_interrupt(), 8, -1) {
+        return 94
+    }
+    if idt_entry_ok(idt_attr_present() + idt_gate_interrupt(), 4, 1048576) {
+        return 95
+    }
+
+    # ------------------------------------------------------------------
+    # The page-fault error code (95..120)
+    # ------------------------------------------------------------------
+    # The encoding: bit 0 P, bit 1 W/R, bit 2 U/S, bit 3 reserved,
+    # bit 4 I/D. All sixteen low codes, read out.
+    if page_fault_cause_name(page_fault_decode(0)) != "read-not-present" {
+        return 96
+    }
+    if page_fault_cause_name(page_fault_decode(1)) != "read-protected" {
+        return 97
+    }
+    if page_fault_cause_name(page_fault_decode(2)) != "write-not-present" {
+        return 98
+    }
+    if page_fault_cause_name(page_fault_decode(3)) != "write-protected" {
+        return 99
+    }
+    if page_fault_cause_name(page_fault_decode(4)) != "user-read-not-present" {
+        return 100
+    }
+    if page_fault_cause_name(page_fault_decode(5)) != "user-read-protected" {
+        return 101
+    }
+    if page_fault_cause_name(page_fault_decode(6)) != "user-write-not-present" {
+        return 102
+    }
+    if page_fault_cause_name(page_fault_decode(7)) != "user-write-protected" {
+        return 103
+    }
+    # The reserved bit is checked FIRST, because every other answer is
+    # meaningless once it is set.
+    if page_fault_cause_name(page_fault_decode(8)) != "reserved-bit-set" {
+        return 104
+    }
+    if page_fault_cause_name(page_fault_decode(16)) != "instruction-fetch" {
+        return 105
+    }
+    if page_fault_cause_name(page_fault_decode(31)) != "reserved-bit-set" {
+        return 106
+    }
+    # Every code round-trips through cause and back.
+    let mut code: int = 0
+    while code < 8 {
+        if page_fault_code(page_fault_decode(code)) != code {
+            return 107
+        }
+        code = code + 1
+    }
+    if page_fault_code(page_fault_decode(16)) != 16 {
+        return 108
+    }
+    if page_fault_code(PageFaultCause.ReservedBitSet) != -1 {
+        return 109
+    }
+    # Present vs not-present decides whether a fault is a first touch
+    # (handle it) or a permissions bug (panic). Getting it backwards
+    # turns every first touch into a bug report.
+    if !page_fault_is_present(page_fault_decode(1)) {
+        return 110
+    }
+    if !page_fault_is_present(page_fault_decode(5)) {
+        return 111
+    }
+    if page_fault_is_present(page_fault_decode(0)) {
+        return 112
+    }
+    if page_fault_is_present(page_fault_decode(2)) {
+        return 113
+    }
+    if !page_fault_is_write(page_fault_decode(2)) || page_fault_is_write(page_fault_decode(1)) {
+        return 114
+    }
+    if !page_fault_is_user(page_fault_decode(4)) || page_fault_is_user(page_fault_decode(0)) {
+        return 115
+    }
+    if !page_fault_is_fetch(page_fault_decode(16)) || page_fault_is_fetch(page_fault_decode(0)) {
+        return 116
+    }
+    if page_fault_cause_name(PageFaultCause.Read) != "read-not-present" {
+        return 117
+    }
+    # The low address bits live at bits 3..15; a handler that subtracts
+    # them without checking corrupts an address on a CPU that sets them.
+    if page_fault_address_bits(0) != 0 {
+        return 118
+    }
+    if page_fault_address_bits(16) != 2 {
+        return 119
+    }
+    if page_fault_address_bits(1) != 0 {
+        return 120
+    }
+    if page_fault_cause_name(PageFaultCause.Unknown) != "unknown" {
+        return 121
+    }
+
+    # ------------------------------------------------------------------
+    # The exception vectors (121..140)
+    # ------------------------------------------------------------------
+    if exc_count() != 32 {
+        return 122
+    }
+    if exc_divide_error() != 0 || exc_debug() != 1 || exc_nmi() != 2 {
+        return 123
+    }
+    if exc_breakpoint() != 3 || exc_overflow() != 4 || exc_bound_range() != 5 {
+        return 124
+    }
+    if exc_invalid_opcode() != 6 || exc_device_not_available() != 7 {
+        return 125
+    }
+    if exc_double_fault() != 8 || exc_coproc_overrun() != 9 {
+        return 126
+    }
+    if exc_invalid_tss() != 10 || exc_segment_not_present() != 11 {
+        return 127
+    }
+    if exc_stack_segment_fault() != 12 || exc_gp_fault() != 13 {
+        return 128
+    }
+    if exc_page_fault() != 14 || exc_reserved15() != 15 {
+        return 129
+    }
+    if exc_x87_fp_error() != 16 || exc_alignment_check() != 17 {
+        return 130
+    }
+    if exc_machine_check() != 18 || exc_simd_fp_error() != 19 {
+        return 131
+    }
+    if exc_virtualization() != 20 || exc_control_protection() != 21 {
+        return 132
+    }
+    if exc_name(0) != "divide-error" || exc_name(8) != "double-fault" {
+        return 133
+    }
+    if exc_name(13) != "general-protection" || exc_name(14) != "page-fault" {
+        return 134
+    }
+    if exc_name(15) != "reserved" || exc_name(21) != "control-protection" {
+        return 135
+    }
+    if exc_name(22) != "" {
+        return 136
+    }
+    # Getting the error-pushing set wrong is not a crash — it is a
+    # handler reading its fault address from the wrong stack slot.
+    if !exc_pushes_error(8) || !exc_pushes_error(10) || !exc_pushes_error(11) {
+        return 137
+    }
+    if !exc_pushes_error(12) || !exc_pushes_error(13) || !exc_pushes_error(14) {
+        return 138
+    }
+    if !exc_pushes_error(17) || !exc_pushes_error(21) {
+        return 139
+    }
+    if exc_pushes_error(0) || exc_pushes_error(3) || exc_pushes_error(6) {
+        return 140
+    }
+    # A fault is restartable; a trap is not.
+    if !exc_is_fault(0) || !exc_is_fault(14) || !exc_is_fault(8) {
+        return 141
+    }
+
+    # ------------------------------------------------------------------
+    # The 8259 PIC and the APIC ranges (141..155)
+    # ------------------------------------------------------------------
+    if pic_master_vector_base() != 32 || pic_slave_vector_base() != 40 {
+        return 142
+    }
+    if pic_total_vectors() != 16 {
+        return 143
+    }
+    if !pic_vector_ok(32) || !pic_vector_ok(47) {
+        return 144
+    }
+    if pic_vector_ok(31) || pic_vector_ok(48) {
+        return 145
+    }
+    if pic_vector_irq(32) != 0 || pic_vector_irq(39) != 7 {
+        return 146
+    }
+    if pic_vector_irq(40) != 8 || pic_vector_irq(47) != 15 {
+        return 147
+    }
+    if pic_vector_irq(31) != -1 {
+        return 148
+    }
+    # An exception never needs an EOI; sending one anyway is a source
+    # of confusion in a kernel that does it.
+    if !pic_vector_needs_eoi(32) || pic_vector_needs_eoi(14) {
+        return 149
+    }
+    if !pic_vector_needs_slave_eoi(40) || pic_vector_needs_slave_eoi(39) {
+        return 150
+    }
+    if pic_vector_needs_slave_eoi(31) {
+        return 151
+    }
+    if !pic_remap_ok(32, 40) {
+        return 152
+    }
+    if pic_remap_ok(8, 40) || pic_remap_ok(40, 32) {
+        return 153
+    }
+    if pic_master_command_port() != 32 || pic_master_data_port() != 33 {
+        return 154
+    }
+    if pic_slave_command_port() != 160 || pic_slave_data_port() != 161 {
+        return 155
+    }
+    if lapic_timer_vector() != 240 || lapic_spurious_vector() != 255 {
+        return 156
+    }
+
+    # ------------------------------------------------------------------
+    # The round trip every kernel depends on (156..158)
+    # ------------------------------------------------------------------
+    if exc_default_ist(exc_double_fault()) != 1 {
+        return 157
+    }
+    if exc_default_ist(exc_page_fault()) != 0 {
+        return 158
+    }
+    if !exc_is_fatal_by_default(9) || exc_is_fatal_by_default(14) {
+        return 159
+    }
+    return 0
+}

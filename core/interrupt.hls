@@ -1,0 +1,1005 @@
+# ============================================================================
+# core/interrupt.hls — x86-64 descriptor tables as data (Stage 86, v0.105.0-alpha)
+# ----------------------------------------------------------------------------
+# Pure HLS, one `core` import (freestanding-safe: the module only uses
+# the core language and `core.result`, so it is importable from
+# `#![no_std]` and `#![freestanding]` crates identically, like the rest
+# of `core.*`).
+#
+# This module is the LIBRARY half of Stage 86. The LANGUAGE half is the
+# `#[irq_handler(N)]` vector form (see SPEC section 40): a function
+# declares WHICH vector it services, the compilers check the
+# declaration, and the C backend emits the binding table a kernel
+# installs at boot.
+#
+# What lives here — the arithmetic, so a kernel can test it:
+#   * Segment selectors (`gdt_selector`), and the two 8-byte GDT
+#     descriptors (code / data) with their access and flag nibbles,
+#     encoded and decoded both ways.
+#   * The TSS: the packed 16-byte form, the unpacked field accessors,
+#     and the 16-bit descriptor's busy bit.
+#   * IDT gates: the 16-byte form, the type/attribute byte, `IST`
+#     selection, and the gate's 32-bit offset split across three
+#     fields.
+#   * The page-fault error code — a decoder, because the fault's CAUSE
+#     is the whole point of reading it and every hand-rolled decoder
+#     gets bit 0 or bit 1 wrong.
+#   * The 32 architectural exception vectors: names, and which of them
+#     push an error code.
+#   * The legacy PIC remap: where the 16 hardware IRQs land after the
+#     master/slave are moved out of the exception range, and the EOI
+#     each one needs.
+#
+# ON HEX: Halis has no hex literals, so every constant below is written
+# as its exact integer value with the hex form in the comment. All the
+# encoding helpers take and return the bit-pattern as an `int` pair the
+# caller splits — Halis has no 64-bit scalar beyond `int`, and a
+# descriptor is exactly 8 bytes, so the two helpers here work on the
+# HIGH and LOW halves separately and `gdt_pack` / `idt_pack` join them.
+# ============================================================================
+
+import "core.result"
+
+# ---------------------------------------------------------------------------
+# Segment selectors
+# ---------------------------------------------------------------------------
+
+# GDT_MAX_SELECTOR: the largest WELL-FORMED GDT selector.
+#
+# A selector is index[13 bits] : TI : reserved : RPL[2 bits], so with
+# TI and the reserved bit clear the largest one is
+# (1023 << 3) | 3 = 8187. The 13-bit index occupies bits 3..15, NOT
+# bits 2..13 — sizing this for "13 bits of index plus two bits of RPL"
+# gives 8191, which has TI SET and therefore addresses an LDT that does
+# not exist.
+fn gdt_max_selector() -> int {
+    return 8187
+}
+
+# gdt_selector: the selector byte for table entry `index` at ring `rpl`
+# (0 = kernel, 3 = user). The index occupies the top 13 bits, the RPL
+# the bottom two, and bits 2..3 (the TI bit and the two bits after it)
+# are zero for a GDT (as opposed to an LDT) — which is exactly why a
+# kernel refuses an index that would need them.
+fn gdt_selector(index: int, rpl: int) -> int {
+    return int_and(int_shl(index, 3), 65528) + int_and(rpl, 3)
+}
+
+# gdt_selector_index / _rpl: the two halves of a selector.
+fn gdt_selector_index(sel: int) -> int {
+    return int_shr(sel, 3)
+}
+
+fn gdt_selector_rpl(sel: int) -> int {
+    return int_and(sel, 3)
+}
+
+# gdt_selector_ok: is this a selector a GDT can produce? A negative
+# selector, or one with the TI bit set (an LDT selector, which a kernel
+# has no reason to load), is not.
+fn gdt_selector_ok(sel: int) -> bool {
+    if sel < 0 || sel > gdt_max_selector() {
+        return false
+    }
+    if int_and(sel, 4) != 0 {
+        return false
+    }
+    return true
+}
+
+# gdt_selector_is_kernel: RPL 0.
+fn gdt_selector_is_kernel(sel: int) -> bool {
+    return gdt_selector_rpl(sel) == 0
+}
+
+# ---------------------------------------------------------------------------
+# GDT descriptors
+# ---------------------------------------------------------------------------
+
+# The access byte's bits.
+fn gdt_access_present() -> int {
+    return 128
+}
+
+fn gdt_access_dpl(dpl: int) -> int {
+    return int_and(int_shl(dpl, 5), 96)
+}
+
+# gdt_access_code: S (0x10) + the code class (0x08) = 0x18. As with
+# data, PRESENT is the caller's to add.
+fn gdt_access_code() -> int {
+    return 24
+}
+
+# gdt_access_data_rw: S (0x10) + the data class (0x08) is NOT set + RW
+# (0x02) = 0x12. The PRESENT bit is added by the caller — putting it in
+# here would make `present + data_rw` overflow the access byte and
+# silently encode a code segment instead.
+fn gdt_access_data_rw() -> int {
+    return 18
+}
+
+# The flags NIBBLE — the four architectural bits of descriptor byte 5.
+# That byte is not all flags: its low nibble is limit[19:16], so these
+# four bits live in the NIBBLE above it, and every helper here works in
+# nibble units (not byte units) so that gdt_encode can place them with
+# one shift and gdt_decode_flags can read them back with one mask.
+#
+#     nibble bit 3   AVL          (reserved on x86-64)
+#     nibble bit 2   L            long mode
+#     nibble bit 1   D/B          default operand size
+#     nibble bit 0   G            granularity: limit is in 4-KiB units
+#
+# Reading L as the byte's bit 3 (which is limit[19:16]) is the classic
+# encoding bug: the table loads, and every 64-bit segment behaves as if
+# it were 16-bit.
+fn gdt_flag_avail() -> int {
+    return 8
+}
+
+fn gdt_flag_long() -> int {
+    return 4
+}
+
+fn gdt_flag_default32() -> int {
+    return 2
+}
+
+fn gdt_flag_granularity() -> int {
+    return 1
+}
+
+# gdt_flag_limit_mask: the limit's top nibble, which shares byte 5 with
+# the flags. Reported here so a caller can tell the two apart.
+fn gdt_flag_limit_mask() -> int {
+    return 15
+}
+
+# gdt_code_flags: the flags byte for a code segment. A 64-bit code
+# segment REQUIRES the L bit and MUST NOT set D/B: a 64-bit descriptor
+# with DB=1 is architecturally invalid and #GPs on load.
+fn gdt_code_flags(long_mode: bool) -> int {
+    if long_mode {
+        # L set, DB clear. A 64-bit descriptor with DB=1 is
+        # architecturally invalid and #GPs on load.
+        return gdt_flag_long()
+    }
+    return gdt_flag_default32() + gdt_flag_granularity()
+}
+
+# gdt_data_flags: the flags byte for a data segment. Unlike code, a data
+# segment's DB bit is just the default operand size.
+fn gdt_data_flags(default32: bool) -> int {
+    if default32 {
+        return gdt_flag_default32() + gdt_flag_granularity()
+    }
+    return gdt_flag_granularity()
+}
+
+# gdt_encode: build a descriptor's 8 bytes as the (low, high) pair of
+# 32-bit halves.
+#
+# The layout is NOT four equal fields, and getting it wrong produces a
+# table that loads and then faults at the first far jump:
+#
+#     byte 0-1  limit[15:0]
+#     byte 2-3  base[15:0]
+#     byte 4    base[23:16]
+#     byte 5    flags (granularity / default-size / long / AVL)
+#     byte 6    access (present / DPL / S / type)
+#     byte 7    base[31:24]
+#
+# so, in the 32-bit halves the pair carries, the access byte sits at
+# bits 16..23 of the high half — and the base's top byte shares a dword
+# with it.
+fn gdt_encode(access: int, flags: int, base: int, limit: int) -> list[int] {
+    if base < 0 || limit < 0 {
+        panic("gdt_encode: base and limit must be >= 0")
+    }
+    if limit > 1048575 {
+        panic("gdt_encode: limit above the 20 bits a descriptor holds")
+    }
+    let lo: int = int_and(limit, 65535) + int_shl(int_and(base, 65535), 16)
+    # The high half packs FOUR fields into its first byte, and they do
+    # not split the way the descriptor's byte boundaries suggest:
+    #     hi bits  0-7    base[23:16]      (byte 4)
+    #     hi bits  8-11   limit[19:16]     (byte 5, low nibble)
+    #     hi bits 12-15   flags[7:4]       (byte 5, high nibble: AVL/L/DB/G)
+    # ...which this module expresses in NIBBLE units (see gdt_flag_long).
+    #     hi bits 16-23   access           (byte 6)
+    #     hi bits 24-31   base[31:24]      (byte 7)
+    # The limit's top nibble sits BESIDE the flags nibble inside one
+    # byte, not below it: putting it at bits 0-3 instead truncates every
+    # limit above 64 KiB to 0xFFFF, which still looks like a perfectly
+    # valid 64-KiB segment.
+    let hi: int = int_and(int_shr(base, 16), 255)
+    + int_shl(int_and(int_shr(limit, 16), 15), 8)
+    + int_shl(int_and(flags, 15), 12)
+    + int_shl(int_and(access, 255), 16)
+    + int_shl(int_and(int_shr(base, 24), 255), 24)
+    return[lo, hi]
+}
+
+# gdt_decode_access / _flags / _base / _limit: the inverse of
+# gdt_encode, so a test can round-trip a descriptor through both
+# directions — and, more usefully, so a kernel can read back a
+# descriptor it found in memory (a firmware- or bootloader-supplied
+# table) and check it before loading it.
+fn gdt_decode_access(hi: int) -> int {
+    return int_and(int_shr(hi, 16), 255)
+}
+
+fn gdt_decode_flags(hi: int) -> int {
+    return int_and(int_shr(hi, 12), 15)
+}
+
+fn gdt_decode_base(lo: int, hi: int) -> int {
+    return int_and(int_shr(lo, 16), 65535)
+    + int_shl(int_and(hi, 255), 16)
+    + int_shl(int_and(int_shr(hi, 24), 255), 24)
+}
+
+fn gdt_decode_limit(lo: int, hi: int) -> int {
+    return int_and(lo, 65535)
+    + int_shl(int_and(int_shr(hi, 8), 15), 16)
+}
+
+# gdt_is_code / gdt_is_data: the code/data bit of the access byte is
+# 0x08. The S bit (0x10) is a SEPARATE thing — "this descriptor describes
+# code or data rather than a system segment" — and reading the code/data
+# bit as S is a one-character bug that makes every data descriptor look
+# like code and every code descriptor look like a TSS.
+fn gdt_is_code(access: int) -> bool {
+    return int_and(access, 8) != 0
+}
+
+fn gdt_is_data(access: int) -> bool {
+    return int_and(access, 8) == 0
+}
+
+# gdt_is_system: S clear — a TSS, an LDT, or a call gate. Legal in a
+# GDT, never loadable into CS or DS/SS.
+fn gdt_is_system(access: int) -> bool {
+    return int_and(access, 16) == 0
+}
+
+fn gdt_is_present(access: int) -> bool {
+    return int_and(access, 128) != 0
+}
+
+fn gdt_is_long(flags: int) -> bool {
+    return int_and(flags, gdt_flag_long()) != 0
+}
+
+# gdt_dpl: the descriptor's privilege level, i.e. the ring that may load
+# it — NOT the RPL of a selector that references it (which the CPU
+# checks against each other).
+fn gdt_dpl(access: int) -> int {
+    return int_and(int_shr(access, 5), 3)
+}
+
+# gdt_fault: a stable reason a descriptor was rejected, mirroring the
+# compilers' `#[irq_handler]` checks so a kernel gets the same answer
+# from a table it wrote by hand.
+enum GdtFault {
+    None, # 0
+    NotPresent, # 1 — P=0: loading it #GPs
+    SystemSegment, # 2 — S=0 in the code/data path
+    ClassMismatch, # 3 — asked for code and got data, or the reverse
+    LongWithoutCode, # 4 — L=1 on a data descriptor
+    LongWithDb, # 5 — L=1 together with DB=1: architecturally invalid
+    DplOutOfRange # 6 — a privilege level above 3
+}
+
+fn gdt_fault_name(f: GdtFault) -> str {
+    return match f {
+        GdtFault.None => "none",
+        GdtFault.NotPresent => "not-present",
+        GdtFault.SystemSegment => "system-segment",
+        GdtFault.ClassMismatch => "class-mismatch",
+        GdtFault.LongWithoutCode => "long-without-code",
+        GdtFault.LongWithDb => "long-with-db",
+        GdtFault.DplOutOfRange => "dpl-out-of-range"
+    }
+}
+
+# gdt_check: validate a descriptor's (access, flags) for the class the
+# caller wants. A kernel calls this on every descriptor before loading
+# the table, because a bad descriptor does not fail at load time — it
+# fails the first time the CPU faults through it.
+fn gdt_check(access: int, flags: int, want_code: bool) -> GdtFault {
+    if !gdt_is_present(access) {
+        return GdtFault.NotPresent
+    }
+    if gdt_is_system(access) {
+        # S=0 is a system segment (TSS, LDT, call gate). Those are legal
+        # in a GDT but are not what a code/data slot wants.
+        return GdtFault.SystemSegment
+    }
+    if want_code != gdt_is_code(access) {
+        return GdtFault.ClassMismatch
+    }
+    if gdt_dpl(access) > 3 {
+        return GdtFault.DplOutOfRange
+    }
+    if gdt_is_code(access) {
+        if gdt_is_long(flags) && int_and(flags, gdt_flag_default32()) != 0 {
+            return GdtFault.LongWithDb
+        }
+    } else {
+        if gdt_is_long(flags) {
+            return GdtFault.LongWithoutCode
+        }
+    }
+    return GdtFault.None
+}
+
+# The six descriptors the Limine spec guarantees at handoff, so a kernel
+# that does not install its own GDT still has CS = 40 (64-bit code) and
+# DS/ES/SS/FS/GS = 48 (64-bit data).
+fn gdt_limine_handoff_selector64_code() -> int {
+    return 40
+}
+
+fn gdt_limine_handoff_selector64_data() -> int {
+    return 48
+}
+
+# ---------------------------------------------------------------------------
+# The TSS
+# ---------------------------------------------------------------------------
+
+# IST_MAX: the number of Interrupt Stack Tables a 64-bit TSS has. Index 0
+# is "no IST"; 1..=7 are the dedicated stacks (1 is conventionally
+# double-fault).
+fn ist_max() -> int {
+    return 7
+}
+
+# ist_ok: a valid IST selector for `n`. 0 means "the current stack",
+# 1..=7 select a dedicated one.
+fn ist_ok(n: int) -> bool {
+    return n >= 0 && n <= ist_max()
+}
+
+# tss_ist_shift: the IST field lives in bits 16..22 of the 64-bit TSS (the
+# byte at offset 4, high nibble).
+fn tss_ist_shift() -> int {
+    return 16
+}
+
+# tss_ist_encode: place `n` in the IST field of a 64-bit TSS word.
+fn tss_ist_encode(word: int, n: int) -> int {
+    if !ist_ok(n) {
+        panic("tss_ist_encode: IST must be 0..7")
+    }
+    return int_and(word, 4286578687) + int_shl(n, tss_ist_shift())
+}
+
+# tss_ist_decode: the IST a TSS word selects.
+fn tss_ist_decode(word: int) -> int {
+    return int_and(int_shr(word, tss_ist_shift()), 7)
+}
+
+# The 16-bit packed form Limine hands over in bootloader-reclaimable
+# memory: the 64-bit TSS, then the 16-bit descriptor whose bit 4 of the
+# second byte is the BUSY bit — set by the CPU when a task is active,
+# and a kernel must preserve it across a task switch or the CPU refuses
+# the next switch.
+fn tss_packed_bytes() -> int {
+    return 108
+}
+
+fn tss_descriptor_bytes() -> int {
+    return 16
+}
+
+fn tss_busy_byte_offset() -> int {
+    return 104
+}
+
+fn tss_busy_bit() -> int {
+    return 16
+}
+
+fn tss_is_busy(descriptor_hi: int) -> bool {
+    return int_and(descriptor_hi, tss_busy_bit()) != 0
+}
+
+# tss_set_busy: the value a kernel writes back after a task switch.
+fn tss_set_busy(descriptor_hi: int, busy: bool) -> int {
+    if busy {
+        return int_or(descriptor_hi, tss_busy_bit())
+    }
+    return int_and(descriptor_hi, 239)
+}
+
+# The field offsets inside the 64-bit TSS, as (low-word, high-word)
+# pairs: a Halis `int` is 64-bit, so a caller that is writing the TSS
+# byte-wise needs to know which half each field lives in.
+fn tss_offset_rsp0() -> int {
+    return 4
+}
+
+fn tss_offset_rsp1() -> int {
+    return 12
+}
+
+fn tss_offset_rsp2() -> int {
+    return 20
+}
+
+fn tss_offset_ist() -> int {
+    return 28
+}
+
+# ---------------------------------------------------------------------------
+# IDT gates
+# ---------------------------------------------------------------------------
+
+# The gate's type field (low nibble of the type/attribute byte).
+fn idt_gate_interrupt() -> int {
+    return 14
+}
+
+fn idt_gate_trap() -> int {
+    return 15
+}
+
+# The type/attribute byte's other bits.
+fn idt_attr_present() -> int {
+    return 128
+}
+
+fn idt_attr_dpl(dpl: int) -> int {
+    return int_and(int_shl(dpl, 5), 96)
+}
+
+# idt_is_valid_gate: is `byte` a legal type/attribute byte? Present, a
+# DPL of 0..3, and either an interrupt gate (14) or a trap gate (15).
+# The difference matters: an interrupt gate CLEARS IF on entry (so a
+# fault inside a handler faults), while a trap gate does not.
+fn idt_gate_type(byte: int) -> int {
+    return int_and(byte, 15)
+}
+
+fn idt_gate_is_interrupt(byte: int) -> bool {
+    return idt_gate_type(byte) == 14
+}
+
+fn idt_gate_is_trap(byte: int) -> bool {
+    return idt_gate_type(byte) == 15
+}
+
+fn idt_gate_ok(byte: int) -> bool {
+    if int_and(byte, 128) == 0 {
+        return false
+    }
+    if int_and(int_shr(byte, 5), 3) > 3 {
+        return false
+    }
+    let t: int = idt_gate_type(byte)
+    return t == 14 || t == 15
+}
+
+# idt_gate_bytes: the size of one gate. Sixteen, always: the 64-bit form
+# is a full 16 bytes (offset_low, selector, type_attr, offset_mid,
+# offset_high, reserved) with no room for a code segment's granularity
+# nibble, which is why an IDT entry's reserved dword must be zero.
+fn idt_gate_bytes() -> int {
+    return 16
+}
+
+# idt_ist_ok: a gate may use IST 0..7. An IST above 7 is not "the CPU
+# will clamp it" — the reserved bits of that byte are RESERVED, and a
+# reserved bit set in a gate is undefined behaviour.
+#
+# NOTE THE LAYOUT: the IST lives in the gate's OWN byte (offset 4), not
+# in the type/attribute byte (offset 5). The two are different fields:
+#     0-1  offset low        4     IST index (bits 0-2) + reserved
+#     2-3  code selector     5     gate type (0-3), zero, DPL, P
+#     6-7  offset mid        8-11  offset high
+#     12-15 reserved
+# Packing the IST into the low nibble of the type/attribute byte
+# overwrites the gate TYPE — which is how a kernel ends up with a
+# perfectly well-formed interrupt gate that is not an interrupt gate.
+fn idt_ist_ok(n: int) -> bool {
+    return n >= 0 && n <= ist_max()
+}
+
+# idt_ist_byte_ok: is this a legal IST byte? Only 0..7 — the upper five
+# bits are reserved and must be zero.
+fn idt_ist_byte_ok(b: int) -> bool {
+    return b >= 0 && b <= ist_max()
+}
+
+# idt_ist_pack / idt_ist_unpack: the gate's IST byte.
+fn idt_ist_pack(n: int) -> int {
+    if !idt_ist_ok(n) {
+        panic("idt_ist_pack: IST must be 0..7")
+    }
+    return n
+}
+
+fn idt_ist_unpack(b: int) -> int {
+    return int_and(b, 127)
+}
+
+# idt_offset_split / idt_offset_join: the gate's 32-bit offset lives in
+# THREE fields — offset_low (16), offset_mid (16), offset_high (16) —
+# and reassembling it wrong is how a kernel ends up jumping into the
+# middle of a function with a perfectly valid-looking table.
+fn idt_offset_split(offset: int) -> list[int] {
+    return[int_and(offset, 65535),
+    int_and(int_shr(offset, 16), 65535),
+    int_and(int_shr(offset, 32), 65535)]
+}
+
+fn idt_offset_join(low: int, mid: int, high: int) -> int {
+    return int_and(low, 65535) + int_shl(int_and(mid, 65535), 16)
+    + int_shl(int_and(high, 65535), 32)
+}
+
+# idt_offset_fits: a 32-bit offset is all an IDT gate can address, which
+# is what forces the higher-half relocation a kernel does at boot.
+#
+# The upper half is tested with a LOGICAL shift: an arithmetic shift of
+# a negative offset by 32 still yields -1, so the naive test would
+# accept every negative offset as "fits" and reject every real
+# high-half address.
+fn idt_offset_fits(offset: int) -> bool {
+    if offset < 0 {
+        return false
+    }
+    return int_shr(offset, 32) == 0
+}
+
+# idt_entry_ok: the whole gate is valid — a legal type/attribute byte, a
+# selector the kernel owns, and an offset a gate can reach.
+fn idt_entry_ok(byte: int, sel: int, offset: int) -> bool {
+    if !idt_gate_ok(byte) {
+        return false
+    }
+    if !gdt_selector_ok(sel) {
+        return false
+    }
+    if !idt_offset_fits(offset) {
+        return false
+    }
+    return true
+}
+
+# ---------------------------------------------------------------------------
+# The page-fault error code
+# ---------------------------------------------------------------------------
+
+# Why a page fault happened. Bit 0 is "page not present", bit 1 is
+# "the access was a write", bit 2 is "the access came from user mode",
+# bit 3 is reserved and is zero on every real CPU, and bit 4 is "the
+# access was an instruction fetch".
+enum PageFaultCause {
+    Read, # 1 — read, not present (a first touch: a page fault, expected)
+    Write, # 2 — write, not present (first touch)
+    ReadProtected, # 5 — read, present: a PERMISSION fault (a bug)
+    WriteProtected, # 6 — write, present: a permission fault (a bug)
+    UserRead, # 9 — read, not present, from ring 3
+    UserWrite, # 10 — write, not present, from ring 3
+    UserReadProtected, # 13 — read, present, from ring 3
+    UserWriteProtected, # 14 — write, present, from ring 3
+    InstructionFetch, # 16 — an instruction fetch fault (NX or a bad mapping)
+    ReservedBitSet, # 17 — the reserved bit was set: the error code is
+    # not trustworthy and the fault may be a double fault
+    Unknown
+}
+
+fn page_fault_cause_name(c: PageFaultCause) -> str {
+    return match c {
+        PageFaultCause.Read => "read-not-present",
+        PageFaultCause.Write => "write-not-present",
+        PageFaultCause.ReadProtected => "read-protected",
+        PageFaultCause.WriteProtected => "write-protected",
+        PageFaultCause.UserRead => "user-read-not-present",
+        PageFaultCause.UserWrite => "user-write-not-present",
+        PageFaultCause.UserReadProtected => "user-read-protected",
+        PageFaultCause.UserWriteProtected => "user-write-protected",
+        PageFaultCause.InstructionFetch => "instruction-fetch",
+        PageFaultCause.ReservedBitSet => "reserved-bit-set",
+        PageFaultCause.Unknown => "unknown"
+    }
+}
+
+# page_fault_code: the error-code value a cause reports, so a test can go
+# both ways. -1 for the two that are not a single bit-pattern (Unknown,
+# and the reserved bit, which no real CPU sets on its own).
+#
+# The encoding, from the bits the CPU sets:
+#     bit 0  P     1 = the page is present (a permission fault)
+#     bit 1  W/R   1 = the access was a write
+#     bit 2  U/S   1 = the access came from ring 3
+#     bit 3  --    reserved, always 0
+#     bit 4  I/D   1 = the access was an instruction fetch
+fn page_fault_code(c: PageFaultCause) -> int {
+    return match c {
+        PageFaultCause.Read => 0,
+        PageFaultCause.ReadProtected => 1,
+        PageFaultCause.Write => 2,
+        PageFaultCause.WriteProtected => 3,
+        PageFaultCause.UserRead => 4,
+        PageFaultCause.UserReadProtected => 5,
+        PageFaultCause.UserWrite => 6,
+        PageFaultCause.UserWriteProtected => 7,
+        PageFaultCause.InstructionFetch => 16,
+        _ => -1
+    }
+}
+
+# page_fault_is_present: did the page exist? A permission fault on a
+# PRESENT page is a kernel bug; a not-present fault is the normal first
+# touch a demand-paged allocator exists to handle. Getting this
+# backwards turns every first touch into a permissions bug report.
+fn page_fault_is_present(c: PageFaultCause) -> bool {
+    return int_and(page_fault_code(c), 1) == 1
+}
+
+# page_fault_is_write: was the access a write? (bit 1)
+fn page_fault_is_write(c: PageFaultCause) -> bool {
+    return int_and(page_fault_code(c), 2) == 2
+}
+
+# page_fault_is_user: did the access come from ring 3? (bit 2)
+fn page_fault_is_user(c: PageFaultCause) -> bool {
+    return int_and(page_fault_code(c), 4) == 4
+}
+
+# page_fault_is_fetch: was the access an instruction fetch? (bit 4)
+fn page_fault_is_fetch(c: PageFaultCause) -> bool {
+    return int_and(page_fault_code(c), 16) == 16
+}
+
+# page_fault_decode: the whole decoder. Note the order: the reserved bit
+# is checked FIRST, because every other answer is meaningless once it is
+# set.
+fn page_fault_decode(code: int) -> PageFaultCause {
+    if int_and(code, 8) != 0 {
+        return PageFaultCause.ReservedBitSet
+    }
+    if int_and(code, 16) != 0 {
+        return PageFaultCause.InstructionFetch
+    }
+    if int_and(code, 2) != 0 {
+        if int_and(code, 1) != 0 {
+            if int_and(code, 4) != 0 {
+                return PageFaultCause.UserWriteProtected
+            }
+            return PageFaultCause.WriteProtected
+        }
+        if int_and(code, 4) != 0 {
+            return PageFaultCause.UserWrite
+        }
+        return PageFaultCause.Write
+    }
+    if int_and(code, 1) != 0 {
+        if int_and(code, 4) != 0 {
+            return PageFaultCause.UserReadProtected
+        }
+        return PageFaultCause.ReadProtected
+    }
+    if int_and(code, 4) != 0 {
+        return PageFaultCause.UserRead
+    }
+    return PageFaultCause.Read
+}
+
+# page_fault_address_bits: how many low bits of the faulting address the
+# error code carries (bits 3..15). Zero on every real CPU, and a fault
+# handler that subtracts them without checking is a handler that
+# corrupts an address on a CPU that does set them.
+fn page_fault_address_bits(code: int) -> int {
+    return int_shr(int_and(code, 4088), 3)
+}
+
+# ---------------------------------------------------------------------------
+# The architectural exception vectors
+# ---------------------------------------------------------------------------
+
+fn exc_divide_error() -> int {
+    return 0
+}
+
+fn exc_debug() -> int {
+    return 1
+}
+
+fn exc_nmi() -> int {
+    return 2
+}
+
+fn exc_breakpoint() -> int {
+    return 3
+}
+
+fn exc_overflow() -> int {
+    return 4
+}
+
+fn exc_bound_range() -> int {
+    return 5
+}
+
+fn exc_invalid_opcode() -> int {
+    return 6
+}
+
+fn exc_device_not_available() -> int {
+    return 7
+}
+
+fn exc_double_fault() -> int {
+    return 8
+}
+
+fn exc_coproc_overrun() -> int {
+    return 9
+}
+
+fn exc_invalid_tss() -> int {
+    return 10
+}
+
+fn exc_segment_not_present() -> int {
+    return 11
+}
+
+fn exc_stack_segment_fault() -> int {
+    return 12
+}
+
+fn exc_gp_fault() -> int {
+    return 13
+}
+
+fn exc_page_fault() -> int {
+    return 14
+}
+
+fn exc_reserved15() -> int {
+    return 15
+}
+
+fn exc_x87_fp_error() -> int {
+    return 16
+}
+
+fn exc_alignment_check() -> int {
+    return 17
+}
+
+fn exc_machine_check() -> int {
+    return 18
+}
+
+fn exc_simd_fp_error() -> int {
+    return 19
+}
+
+fn exc_virtualization() -> int {
+    return 20
+}
+
+fn exc_control_protection() -> int {
+    return 21
+}
+
+# exc_count: how many vectors the architecture names. Vectors 0..31 are
+# exceptions; 32.. are interrupts (device IRQs, then LAPIC timer,
+# spurious, and theIPI range).
+fn exc_count() -> int {
+    return 32
+}
+
+# exc_name: the stable name of an exception vector, or "" for anything
+# the architecture leaves reserved — a kernel that has no handler for a
+# reserved vector is fine; one that names it wrongly is not.
+fn exc_name(v: int) -> str {
+    if v == 0 {
+        return "divide-error"
+    }
+    if v == 1 {
+        return "debug"
+    }
+    if v == 2 {
+        return "nmi"
+    }
+    if v == 3 {
+        return "breakpoint"
+    }
+    if v == 4 {
+        return "overflow"
+    }
+    if v == 5 {
+        return "bound-range"
+    }
+    if v == 6 {
+        return "invalid-opcode"
+    }
+    if v == 7 {
+        return "device-not-available"
+    }
+    if v == 8 {
+        return "double-fault"
+    }
+    if v == 9 {
+        return "coproc-overrun"
+    }
+    if v == 10 {
+        return "invalid-tss"
+    }
+    if v == 11 {
+        return "segment-not-present"
+    }
+    if v == 12 {
+        return "stack-segment-fault"
+    }
+    if v == 13 {
+        return "general-protection"
+    }
+    if v == 14 {
+        return "page-fault"
+    }
+    if v == 15 {
+        return "reserved"
+    }
+    if v == 16 {
+        return "x87-fp"
+    }
+    if v == 17 {
+        return "alignment-check"
+    }
+    if v == 18 {
+        return "machine-check"
+    }
+    if v == 19 {
+        return "simd-fp"
+    }
+    if v == 20 {
+        return "virtualization"
+    }
+    if v == 21 {
+        return "control-protection"
+    }
+    return ""
+}
+
+# exc_pushes_error: which exceptions push an error code onto the stack
+# before the handler's frame. Getting this wrong is not a crash — it is
+# a handler that reads its fault address from the wrong stack slot,
+# which is far harder to notice.
+fn exc_pushes_error(v: int) -> bool {
+    return v == 8 || v == 10 || v == 11 || v == 12 || v == 13 || v == 14
+    || v == 17 || v == 21
+}
+
+# exc_is_fault: a fault is restartable (the CPU re-executes the
+# instruction after a successful handler); a trap does not (the
+# instruction has already completed). Page-fault and general-protection
+# are faults; breakpoint and debug are traps.
+fn exc_is_fault(v: int) -> bool {
+    return v == 0 || v == 5 || v == 6 || v == 8 || v == 10 || v == 11
+    || v == 12 || v == 13 || v == 14 || v == 17
+}
+
+# exc_is_fatal_by_default: an exception with no handler panics the
+# kernel. The list is "everything except the ones a kernel normally
+# handles", so a kernel that adds a handler for one of these does
+# something deliberate.
+fn exc_is_fatal_by_default(v: int) -> bool {
+    return !(v == 3 || v == 14)
+}
+
+# exc_default_ist: which exceptions get a dedicated stack. A double
+# fault happens when the kernel could not even push a frame — so its
+# handler must run on a stack the kernel set up in advance, not the one
+# that just failed. IST 1 is the convention.
+fn exc_default_ist(v: int) -> int {
+    if v == 8 {
+        return 1
+    }
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# The legacy 8259 PIC
+# ---------------------------------------------------------------------------
+
+# The PIC's two interrupt-request inputs must be remapped out of the
+# exception range (0..31) or vector 32 would be "reserved", and worse,
+# the timer IRQ would be indistinguishable from an exception. These are
+# the standard remap targets.
+fn pic_master_vector_base() -> int {
+    return 32
+}
+
+fn pic_slave_vector_base() -> int {
+    return 40
+}
+
+# pic_total_vectors: 8 per PIC.
+fn pic_total_vectors() -> int {
+    return 16
+}
+
+# pic_vector_ok: is this a hardware-IRQ vector after remapping?
+fn pic_vector_ok(v: int) -> bool {
+    return v >= pic_master_vector_base() && v < pic_master_vector_base() + pic_total_vectors()
+}
+
+# pic_vector_irq: the IRQ number a remapped vector carries (0..15), or -1.
+fn pic_vector_irq(v: int) -> int {
+    if !pic_vector_ok(v) {
+        return -1
+    }
+    return v - pic_master_vector_base()
+}
+
+# pic_vector_needs_eoi: every legacy-PIC interrupt needs an End Of
+# Interrupt to both the slave (if it came in on IRQ 8..15) and the
+# master. An exception never does — sending an EOI for one is harmless
+# on a real PIC and a source of confusion in a kernel that does it
+# anyway.
+fn pic_vector_needs_eoi(v: int) -> bool {
+    return pic_vector_ok(v)
+}
+
+# pic_vector_needs_slave_eoi: the slave's EOI, for IRQ 8..15 only.
+fn pic_vector_needs_slave_eoi(v: int) -> bool {
+    if !pic_vector_ok(v) {
+        return false
+    }
+    return pic_vector_irq(v) >= 8
+}
+
+# pic_remap_ok: would this (master, slave) base pair leave the two PICs'
+# ranges disjoint, inside the 8-bit interrupt vector space, and clear of
+# the exceptions?
+fn pic_remap_ok(master: int, slave: int) -> bool {
+    if master < exc_count() || slave < exc_count() {
+        return false
+    }
+    if master > 255 - 8 || slave > 255 {
+        return false
+    }
+    return master + 8 <= slave
+}
+
+# The I/O ports a kernel writes for a remap (the ICW1/ICW2/ICW4 sequence
+# goes to these; the data word for the vector base to ICW2).
+fn pic_master_command_port() -> int {
+    return 32
+}
+
+fn pic_master_data_port() -> int {
+    return 33
+}
+
+fn pic_slave_command_port() -> int {
+    return 160
+}
+
+fn pic_slave_data_port() -> int {
+    return 161
+}
+
+# The APIC's own vectors, which a kernel using ioapic instead of the PIC
+# still needs: the LAPIC timer, the spurious interrupt, and the first of
+# the IPIs.
+fn lapic_timer_vector() -> int {
+    return 240
+}
+
+fn lapic_spurious_vector() -> int {
+    return 255
+}
+
+fn lapic_ipi_vector_base() -> int {
+    return 240
+}

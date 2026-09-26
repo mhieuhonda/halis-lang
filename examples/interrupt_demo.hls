@@ -1,0 +1,460 @@
+# ============================================================================
+# examples/interrupt_demo.hls — Stage 86: IDT/GDT declaration + models
+# ----------------------------------------------------------------------------
+# Two halves of Stage 86, both exercised here:
+#
+#   * the LANGUAGE half — `#[irq_handler(N)]` declares which vector a
+#     function services; the compilers check the declaration and the C
+#     backend emits the save/restore stub and the binding table a kernel
+#     installs at boot. (This file is HOSTED and never faults, so it
+#     only proves the declaration is accepted; the ok-test and the
+#     acceptance gate compile and link a real freestanding image.)
+#
+#   * the LIBRARY half — `core/interrupt.hls`, the descriptor arithmetic
+#     as values: GDT encoding and decoding, selectors, the TSS busy bit,
+#     IDT gates, the page-fault error code, the 32 exception vectors, and
+#     the 8259 remap.
+# ============================================================================
+
+import "core.interrupt"
+import "core.result"
+import "core.section"
+
+# The two handlers this crate declares. Neither is ever entered — the
+# hosted program does not fault — but both must survive the whole
+# pipeline: checked, emitted with a stub, and linked.
+#[irq_handler(14)]
+fn on_page_fault(frame: list[int]) -> void {
+    return
+}
+
+#[irq_handler(8)]
+fn on_double_fault(frame: list[int]) -> void {
+    return
+}
+
+# A handler in its OWN section, which is the point of the whole
+# arrangement: the stub is a separate symbol, and a kernel usually parks
+# every stub in one output section so the linker can place them
+# together.
+#[irq_handler(33)]
+#[section(".text.irq_stub")]
+fn on_timer(frame: list[int]) -> void {
+    return
+}
+
+# ---------------------------------------------------------------------------
+# A GDT, built and checked the way a kernel builds it
+# ---------------------------------------------------------------------------
+fn demo_gdt() -> list[list[int]] {
+    let mut out: list[list[int]] = []
+    # index 0: the null descriptor, which the architecture REQUIRES to
+    # be all zeroes — a non-zero byte 0 causes a #GP when it is loaded.
+    out.push(gdt_encode(0, 0, 0, 0))
+    # index 1: 16-bit code, index 2: 16-bit data.
+    out.push(gdt_encode(gdt_access_present() + gdt_access_code(), 0, 0, 65535))
+    out.push(gdt_encode(gdt_access_present() + gdt_access_data_rw(), 0, 0, 65535))
+    # index 3: 32-bit code, index 4: 32-bit data.
+    out.push(gdt_encode(gdt_access_present() + gdt_access_code(), gdt_code_flags(false), 0, 1048575))
+    out.push(gdt_encode(gdt_access_present() + gdt_access_data_rw(), gdt_data_flags(true), 0, 1048575))
+    # index 5: 64-bit code (L set, DB MUST be clear), index 6: 64-bit data.
+    out.push(gdt_encode(gdt_access_present() + gdt_access_code(), gdt_code_flags(true), 0, 1048575))
+    out.push(gdt_encode(gdt_access_present() + gdt_access_data_rw(), gdt_data_flags(false), 0, 1048575))
+    return out
+}
+
+fn main() -> int uses IO {
+    # ------------------------------------------------------------------
+    # 1. A GDT that round-trips and validates
+    # ------------------------------------------------------------------
+    let gdt: list[list[int]] = demo_gdt()
+    if gdt.len() != 7 {
+        println("interrupt_demo: the GDT should have 7 entries")
+        return 1
+    }
+    # The null descriptor must be all zeroes.
+    if gdt.get(0).get(0) != 0 || gdt.get(0).get(1) != 0 {
+        println("interrupt_demo: the null descriptor must be all zeroes")
+        return 2
+    }
+    let mut i: int = 0
+    while i < gdt.len() {
+        let d: list[int] = gdt.get(i)
+        let access: int = gdt_decode_access(d.get(1))
+        let flags: int = gdt_decode_flags(d.get(1))
+        # A non-zero access byte with the class bit clear is a SYSTEM
+        # segment, and loading a system segment into CS #GPs.
+        if i > 0 && !gdt_is_present(access) {
+            println("interrupt_demo: descriptor " + i.to_str() + " is not present")
+            return 3
+        }
+        if i > 0 && gdt_fault_name(gdt_check(access, flags, gdt_is_code(access))) != "none" {
+            println("interrupt_demo: descriptor " + i.to_str() + " failed its own check")
+            return 4
+        }
+        if i > 0 && gdt_decode_base(d.get(0), d.get(1)) != 0 {
+            println("interrupt_demo: a flat GDT has base 0")
+            return 5
+        }
+        i = i + 1
+    }
+    # The 64-bit code descriptor carries L and NOT DB — the one
+    # combination the architecture calls invalid.
+    let code64: list[int] = gdt.get(5)
+    if !gdt_is_long(gdt_decode_flags(code64.get(1))) {
+        println("interrupt_demo: the 64-bit code descriptor needs L")
+        return 6
+    }
+    if gdt_fault_name(gdt_check(gdt_decode_access(code64.get(1)), gdt_decode_flags(code64.get(1)) + gdt_flag_default32(), true)) != "long-with-db" {
+        println("interrupt_demo: L together with DB must be rejected")
+        return 7
+    }
+    # A data descriptor can never have L.
+    if gdt_fault_name(gdt_check(gdt_decode_access(gdt.get(6).get(1)), gdt_code_flags(true), false)) != "long-without-code" {
+        println("interrupt_demo: L on a data descriptor must be rejected")
+        return 8
+    }
+    # A ring-3 code descriptor is legal and is how a user-mode kernel
+    # hands CS to userspace.
+    if gdt_fault_name(gdt_check(gdt_access_present() + gdt_access_dpl(3) + gdt_access_code(), gdt_code_flags(true), true)) != "none" {
+        println("interrupt_demo: a ring-3 code descriptor is legal")
+        return 9
+    }
+    if gdt_dpl(gdt_access_present() + gdt_access_dpl(3) + gdt_access_code()) != 3 {
+        println("interrupt_demo: the DPL must round-trip")
+        return 10
+    }
+
+    # ------------------------------------------------------------------
+    # 2. Selectors
+    # ------------------------------------------------------------------
+    if gdt_selector(1, 0) != 8 || gdt_selector(5, 3) != 43 {
+        println("interrupt_demo: selector arithmetic is wrong")
+        return 11
+    }
+    if gdt_selector_index(43) != 5 || gdt_selector_rpl(43) != 3 {
+        println("interrupt_demo: selector decoding is wrong")
+        return 12
+    }
+    if !gdt_selector_is_kernel(8) || gdt_selector_is_kernel(11) {
+        println("interrupt_demo: RPL 0 is the kernel")
+        return 13
+    }
+    # A selector with the TI bit set points into an LDT, which a kernel
+    # has no reason to load.
+    if gdt_selector_ok(12) {
+        println("interrupt_demo: the TI bit must be rejected")
+        return 14
+    }
+    if !gdt_selector_ok(8) || !gdt_selector_ok(8187) {
+        println("interrupt_demo: a GDT selector must be accepted")
+        return 15
+    }
+    if gdt_selector_ok(-1) || gdt_selector_ok(8188) {
+        println("interrupt_demo: an out-of-range selector must be rejected")
+        return 16
+    }
+    # The selectors the Limine handoff guarantees.
+    if gdt_limine_handoff_selector64_code() != 40
+    || gdt_limine_handoff_selector64_data() != 48 {
+        println("interrupt_demo: the Limine handoff selectors are 40 / 48")
+        return 17
+    }
+
+    # ------------------------------------------------------------------
+    # 3. The TSS busy bit
+    # ------------------------------------------------------------------
+    if tss_packed_bytes() != 108 || tss_descriptor_bytes() != 16 {
+        println("interrupt_demo: the packed TSS is 108 + 16 bytes")
+        return 18
+    }
+    if tss_is_busy(0) || !tss_is_busy(16) {
+        println("interrupt_demo: the busy bit is bit 4 of the descriptor's high byte")
+        return 19
+    }
+    if tss_is_busy(tss_set_busy(0, true)) != true {
+        println("interrupt_demo: the busy bit must be settable")
+        return 20
+    }
+    if tss_is_busy(tss_set_busy(16, false)) != false {
+        println("interrupt_demo: the busy bit must be clearable")
+        return 21
+    }
+    # The IST field, and its limit: the reserved bits are RESERVED, so
+    # an IST above 7 is undefined behaviour, not "clamped to 7".
+    if tss_ist_decode(tss_ist_encode(0, 1)) != 1 {
+        println("interrupt_demo: the IST field must round-trip")
+        return 22
+    }
+    if tss_ist_decode(tss_ist_encode(0, 7)) != 7 {
+        println("interrupt_demo: IST 7 must round-trip")
+        return 23
+    }
+    if tss_ist_decode(tss_ist_encode(0, 0)) != 0 {
+        println("interrupt_demo: IST 0 means 'the current stack'")
+        return 24
+    }
+    if ist_ok(8) || !ist_ok(0) || !ist_ok(7) {
+        println("interrupt_demo: the IST range is 0..7")
+        return 25
+    }
+
+    # ------------------------------------------------------------------
+    # 4. IDT gates
+    # ------------------------------------------------------------------
+    if idt_gate_bytes() != 16 {
+        println("interrupt_demo: a 64-bit gate is 16 bytes")
+        return 26
+    }
+    if !idt_gate_is_interrupt(idt_attr_present() + idt_gate_interrupt())
+    || idt_gate_is_trap(idt_attr_present() + idt_gate_interrupt()) {
+        println("interrupt_demo: 14 is an interrupt gate, 15 a trap gate")
+        return 27
+    }
+    # The difference matters: an interrupt gate CLEARS IF, so a fault
+    # inside a handler faults; a trap gate does not.
+    if !idt_gate_ok(idt_attr_present() + idt_gate_interrupt()) {
+        println("interrupt_demo: a present interrupt gate is legal")
+        return 28
+    }
+    if idt_gate_ok(idt_gate_interrupt()) {
+        println("interrupt_demo: a gate with P clear is never legal")
+        return 29
+    }
+    if idt_gate_ok(idt_attr_present() + 12) {
+        println("interrupt_demo: 12 is not a gate type")
+        return 30
+    }
+    # A ring-3 gate: a user process must be able to raise #GP.
+    if !idt_gate_ok(idt_attr_present() + idt_attr_dpl(3) + idt_gate_trap()) {
+        println("interrupt_demo: a ring-3 trap gate is legal")
+        return 31
+    }
+    # The IST is its own byte, and only 0..7 is legal there.
+    if !idt_ist_byte_ok(idt_ist_pack(1)) || idt_ist_byte_ok(8) {
+        println("interrupt_demo: the IST byte holds 0..7 and nothing else")
+        return 32
+    }
+    if idt_ist_unpack(idt_ist_pack(5)) != 5 {
+        println("interrupt_demo: the IST must survive packing")
+        return 33
+    }
+    if idt_ist_ok(8) || !idt_ist_ok(7) {
+        println("interrupt_demo: IST 8 is not packable")
+        return 34
+    }
+    # The 32-bit offset split — three fields, and reassembling it wrong
+    # jumps into the middle of a function.
+    let parts: list[int] = idt_offset_split(305419896)
+    if parts.get(0) != 22136 || parts.get(1) != 4660 {
+        println("interrupt_demo: the offset split is wrong")
+        return 35
+    }
+    if idt_offset_join(parts.get(0), parts.get(1), parts.get(2)) != 305419896 {
+        println("interrupt_demo: the offset must round-trip")
+        return 36
+    }
+    if idt_offset_fits(-1) || !idt_offset_fits(0) {
+        println("interrupt_demo: only a 32-bit offset is reachable")
+        return 37
+    }
+    # 2^32-1 is the largest addressable offset; one more is not.
+    if !idt_offset_fits(4294967295) || idt_offset_fits(4294967296) {
+        println("interrupt_demo: an offset at or above 2^32 is not reachable")
+        return 38
+    }
+    if !idt_entry_ok(idt_attr_present() + idt_gate_interrupt(), 8, 1048576) {
+        println("interrupt_demo: a whole valid gate must be accepted")
+        return 39
+    }
+    if idt_entry_ok(idt_attr_present() + idt_gate_interrupt(), 8, -1) {
+        println("interrupt_demo: an unreachable offset must be rejected")
+        return 40
+    }
+
+    # ------------------------------------------------------------------
+    # 5. The page-fault error code
+    # ------------------------------------------------------------------
+    if page_fault_cause_name(page_fault_decode(0)) != "read-not-present" {
+        println("interrupt_demo: code 0 is a first-touch read fault")
+        return 41
+    }
+    if page_fault_cause_name(page_fault_decode(1)) != "read-protected" {
+        println("interrupt_demo: code 1 is a read permission fault")
+        return 42
+    }
+    if page_fault_cause_name(page_fault_decode(2)) != "write-not-present" {
+        println("interrupt_demo: code 2 is a first-touch write fault")
+        return 43
+    }
+    if page_fault_cause_name(page_fault_decode(3)) != "write-protected" {
+        println("interrupt_demo: code 3 is a write permission fault")
+        return 44
+    }
+    if page_fault_cause_name(page_fault_decode(5)) != "user-read-protected" {
+        println("interrupt_demo: code 5 is a user-mode read permission fault")
+        return 45
+    }
+    if page_fault_cause_name(page_fault_decode(7)) != "user-write-protected" {
+        println("interrupt_demo: code 7 is a user-mode write permission fault")
+        return 46
+    }
+    if page_fault_cause_name(page_fault_decode(16)) != "instruction-fetch" {
+        println("interrupt_demo: code 16 is an instruction fetch")
+        return 47
+    }
+    # The reserved bit is checked FIRST, because every other answer is
+    # meaningless once it is set.
+    if page_fault_cause_name(page_fault_decode(8)) != "reserved-bit-set" {
+        println("interrupt_demo: the reserved bit must be reported first")
+        return 48
+    }
+    # Present vs not-present decides whether a fault is a first touch
+    # (handle it) or a permissions bug (panic) — getting it backwards
+    # turns every first touch into a bug report.
+    if !page_fault_is_present(page_fault_decode(1)) {
+        println("interrupt_demo: code 1 is a present-page fault")
+        return 49
+    }
+    if page_fault_is_present(page_fault_decode(0)) {
+        println("interrupt_demo: code 0 is a not-present fault")
+        return 50
+    }
+    if !page_fault_is_write(page_fault_decode(2)) || page_fault_is_write(page_fault_decode(1)) {
+        println("interrupt_demo: bit 1 is the write bit")
+        return 51
+    }
+    if !page_fault_is_user(page_fault_decode(4)) || page_fault_is_user(page_fault_decode(0)) {
+        println("interrupt_demo: bit 2 is the user bit")
+        return 52
+    }
+    if !page_fault_is_fetch(page_fault_decode(16)) || page_fault_is_fetch(page_fault_decode(0)) {
+        println("interrupt_demo: bit 4 is the instruction-fetch bit")
+        return 53
+    }
+    # The low address bits live at bits 3..15. A handler that subtracts
+    # them without checking is a handler that corrupts an address on a
+    # CPU that sets them.
+    if page_fault_address_bits(0) != 0 || page_fault_address_bits(16) != 2 {
+        println("interrupt_demo: the address bits are bits 3..15")
+        return 54
+    }
+    # Every code round-trips to the cause that produced it.
+    # Every well-formed code (no reserved bit, no fetch bit) round-trips.
+    let mut code: int = 0
+    while code < 8 {
+        let c: PageFaultCause = page_fault_decode(code)
+        if page_fault_code(c) != code {
+            println("interrupt_demo: the error code does not round-trip")
+            return 55
+        }
+        code = code + 1
+    }
+
+    # ------------------------------------------------------------------
+    # 6. The exception vectors
+    # ------------------------------------------------------------------
+    if exc_count() != 32 {
+        println("interrupt_demo: there are 32 exception vectors")
+        return 56
+    }
+    if exc_name(exc_page_fault()) != "page-fault" || exc_name(13) != "general-protection" {
+        println("interrupt_demo: exception names are wrong")
+        return 57
+    }
+    if exc_name(15) != "reserved" || exc_name(22) != "" {
+        println("interrupt_demo: an unnamed vector must stay unnamed")
+        return 58
+    }
+    # Getting the error-code set wrong is not a crash — it is a handler
+    # reading its fault address from the wrong stack slot.
+    if !exc_pushes_error(exc_page_fault()) || !exc_pushes_error(13) || !exc_pushes_error(8) {
+        println("interrupt_demo: the error-pushing exceptions are 8,13,14")
+        return 59
+    }
+    if exc_pushes_error(exc_breakpoint()) || exc_pushes_error(exc_divide_error()) {
+        println("interrupt_demo: breakpoint and divide-error push nothing")
+        return 60
+    }
+    if !exc_pushes_error(17) || exc_pushes_error(16) {
+        println("interrupt_demo: alignment-check pushes, x87 does not")
+        return 61
+    }
+    # A fault is restartable; a trap is not.
+    if !exc_is_fault(exc_page_fault()) || !exc_is_fault(exc_double_fault()) {
+        println("interrupt_demo: page-fault and double-fault are faults")
+        return 62
+    }
+    if exc_is_fault(exc_breakpoint()) || exc_is_fault(exc_debug()) {
+        println("interrupt_demo: breakpoint and debug are traps")
+        return 63
+    }
+    # The double fault's handler must run on a stack the kernel set up in
+    # advance: it happened when the kernel could not even push a frame.
+    if exc_default_ist(exc_double_fault()) != 1 || exc_default_ist(14) != 0 {
+        println("interrupt_demo: the double fault defaults to IST 1")
+        return 64
+    }
+
+    # ------------------------------------------------------------------
+    # 7. The 8259 PIC
+    # ------------------------------------------------------------------
+    if pic_master_vector_base() != 32 || pic_slave_vector_base() != 40 {
+        println("interrupt_demo: the standard remap is 32 / 40")
+        return 65
+    }
+    if pic_vector_irq(32) != 0 || pic_vector_irq(40) != 8 || pic_vector_irq(47) != 15 {
+        println("interrupt_demo: IRQ numbering is wrong")
+        return 66
+    }
+    if pic_vector_ok(31) || pic_vector_ok(48) {
+        println("interrupt_demo: only 16 hardware vectors exist")
+        return 67
+    }
+    if !pic_vector_needs_eoi(32) || pic_vector_needs_eoi(14) {
+        println("interrupt_demo: an exception never needs an EOI")
+        return 68
+    }
+    if !pic_vector_needs_slave_eoi(40) || pic_vector_needs_slave_eoi(32) {
+        println("interrupt_demo: only IRQ 8..15 need the slave EOI")
+        return 69
+    }
+    if !pic_remap_ok(32, 40) || pic_remap_ok(8, 40) || pic_remap_ok(40, 32) {
+        println("interrupt_demo: the remap bases must clear the exceptions and not overlap")
+        return 70
+    }
+    if pic_master_command_port() != 32 || pic_slave_data_port() != 161 {
+        println("interrupt_demo: the PIC ports are 32/33 and 160/161")
+        return 71
+    }
+
+    # ------------------------------------------------------------------
+    # 8. The declared handlers
+    # ------------------------------------------------------------------
+    # The three handlers this crate declares all pass the checks a kernel
+    # applies before installing a gate.
+    let mut v: int = 0
+    while v < 34 {
+        if(v == 14 || v == 8 || v == 33) && !exc_pushes_error(v) && v != 33 {
+            println("interrupt_demo: a declared exception must push an error code")
+            return 72
+        }
+        v = v + 1
+    }
+    if !idt_ist_ok(exc_default_ist(8)) {
+        println("interrupt_demo: the double fault's IST must be packable")
+        return 73
+    }
+    println("Stage 86 interrupt demo:")
+    println("  gdt: " + gdt.len().to_str() + " descriptors, 64-bit code at selector "
+    + gdt_selector(5, 0).to_str() + ", data at " + gdt_selector(6, 0).to_str())
+    println("  idt: 16-byte gates, 3 declared vectors (8, 14, 33), double fault on IST "
+    + exc_default_ist(8).to_str())
+    println("  pic: remapped to " + pic_master_vector_base().to_str() + ".."
+    + (pic_master_vector_base() + pic_total_vectors() - 1).to_str())
+    println("  page fault: code 1 is a "
+    + page_fault_cause_name(page_fault_decode(1))
+    + ", code 5 is a " + page_fault_cause_name(page_fault_decode(5)))
+    println("DEMO OK")
+    return 0
+}

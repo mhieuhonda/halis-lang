@@ -3770,3 +3770,194 @@ and panic at run time; `boot_demo` runs identically on the interpreter
 and natively; `boot_kernel` links as a freestanding image carrying
 `.limine_requests`; and `--audit` names the header and its section on
 both front-ends. Bootstrap self-compilation remains byte-identical.
+
+---
+
+## 40. `core.interrupt` — IDT/GDT declaration (Stage 86 — v0.105.0-alpha)
+
+A kernel enters a handler through an IDT gate, and a gate holds a
+**32-bit offset**. That single fact shapes this stage: an IDT cannot be
+a static initialiser, because a handler's address is not a constant
+expression — which is why every kernel in every language fills its IDT
+by hand at boot. Stage 86 moves the *declaration* into the source and
+the *arithmetic* into a testable module.
+
+### 40.1. `#[irq_handler(N)]`
+
+```halis
+#[irq_handler(14)]
+fn on_page_fault(frame: list[int]) -> void { ... }
+
+#[irq_handler(8)]
+fn on_double_fault(frame: list[int]) -> void { ... }
+```
+
+The bare `#[irq_handler]` (Stage 28) still declares only "this is an
+interrupt handler" and is unchanged. The vector form additionally
+declares **which** vector, and the compiler then does three things it
+could not do before:
+
+* **Checks the declaration.** `N` must be 0..255 (an IDT has 256
+  entries; a loader that clamped it would install the handler somewhere
+  nobody expected). A function may carry one, and **no two functions may
+  claim the same vector** — two handlers for 14 means one of them is
+  never entered, and the CPU's gate table can hold only one.
+* **Emits a save/restore stub per vector.** `hl_irq_stub_14` is a naked
+  function whose body is the classic push-all / call / unwind:
+
+  ```asm
+  pushq rax rbx rcx rdx rsi rdi rbp r8 r9 r10 r11     ; 88 bytes
+  movl  $14, %eax            ; the vector, for the error-code cases
+  movq  %rsp, %rdi           ; the saved frame, as the one parameter
+  call  usf_on_page_fault
+  addq  $88, %rsp
+  iretq
+  ```
+
+  The push order is the reverse of the pop, so `add $88, %rsp` +
+  `iretq` is correct: RSP on entry points at the saved RIP, and `iretq`
+  consumes RIP/CS/RFLAGS from there. Callee-saved registers
+  (rbx, rbp, r12-r15) are deliberately untouched — the callee preserves
+  them.
+* **Emits the binding table**, so a kernel calls one function at boot
+  instead of writing a descriptor by hand:
+
+  ```c
+  const struct hl_irq_binding hl_idt_bindings[] = {
+      { 14u, 0u, hl_irq_stub_14 },
+      { 8u,  0u, hl_irq_stub_8  },
+      { 0u,  0u, NULL }        /* terminator */
+  };
+  void hl_idt_install(const struct hl_irq_binding *b, uint32_t n, uint16_t cs);
+  ```
+
+  The installer builds the 256-entry table, loads the IDTR with `lidt`,
+  and skips a row whose handler is NULL — so a reserved vector stays
+  reserved. The gate's `cs` is a parameter, not a constant: the
+  8259-era `0x08` is right only if the kernel's GDT says so.
+
+### 40.2. Why a stub, and not gcc's `interrupt` attribute
+
+gcc's `__attribute__((interrupt))` is the obvious way to express an ISR
+and the wrong one for a compiler-generated body. It **rejects SSE
+anywhere inside the function**, and a Halis body always uses it: the
+frame arrives in a vector register, and the cleanup machinery spills
+with aligned moves. A Stage 28 `#[irq_handler]` taking a `list[int]`
+therefore failed to compile with
+
+```
+error: sorry, unimplemented: SSE instructions aren't allowed in an
+interrupt service routine
+```
+
+So the vector form does **not** carry the attribute: the save/restore
+lives in asm, where it belongs, and the Halis function is an ordinary C
+function the stub *calls*. The **bare** form keeps gcc's attribute,
+because a kernel that assigns no vector also supplies no stub, and has
+no other way to get one.
+
+### 40.3. The IST is its own byte
+
+The gate's layout has a field that is easy to put in the wrong place:
+
+```
+ 0-1  offset low      4     IST index (bits 0-2) + reserved
+ 2-3  code selector   5     gate type (0-3), zero, DPL, P
+ 6-7  offset mid      8-11  offset high
+12-15 reserved
+```
+
+The IST lives in the gate's **own byte at offset 4**, not in the low
+nibble of the type/attribute byte at offset 5 — packing it there
+overwrites the **gate type**, producing a perfectly well-formed
+interrupt gate that is not an interrupt gate. `core.interrupt`'s
+`idt_ist_pack` / `idt_ist_unpack` / `idt_ist_byte_ok` therefore take and
+return the IST byte, and the upper five bits of it are RESERVED: an IST
+above 7 is undefined behaviour, not "clamped to 7".
+
+### 40.4. `core/interrupt.hls` — the descriptor arithmetic
+
+Pure HLS, one `core` import, no effects. A descriptor is not four
+equal fields, and a kernel that encodes it wrong gets a table that
+*loads* and then faults at the first far jump:
+
+```
+byte 0-1  limit[15:0]        hi bits  0-7   base[23:16]
+byte 2-3  base[15:0]         hi bits  8-11  limit[19:16]
+byte 4    base[23:16]        hi bits 12-15  flags nibble (AVL/L/DB/G)
+byte 5    flags + limit[19:16]   hi bits 16-23  access
+byte 6    access             hi bits 24-31  base[31:24]
+byte 7    base[31:24]
+```
+
+Three errors the module makes impossible and the tests prove:
+
+* **The limit's top nibble shares a byte with the flags.** Putting it at
+  bits 0-3 instead of 8-11 truncates every limit above 64 KiB to
+  `0xFFFF` — which still looks like a perfectly valid 64-KiB segment.
+* **L is bit 6 of the flags byte** (bit 2 of its nibble), *not* bit 3,
+  which is `limit[19:16]`. Reading L as bit 3 makes every 64-bit
+  segment behave as 16-bit while the table still loads.
+* **The class bit is `0x08` and the S bit is `0x10`.** Reading one as
+  the other makes every data descriptor look like code and every code
+  descriptor look like a TSS.
+
+`gdt_check` reports all of that as a stable `GdtFault` lattice —
+`NotPresent` (a `P=0` descriptor #GPs on load), `SystemSegment`,
+`ClassMismatch`, `LongWithDb` (architecturally invalid), `LongWithoutCode`,
+`DplOutOfRange` — so a kernel validates a table it did not build
+(a firmware- or bootloader-supplied one) before loading it.
+
+**Selectors.** `gdt_selector(index, rpl)` is `index << 3 | rpl` — the
+index occupies bits 3..15, so the largest well-formed GDT selector is
+`(1023 << 3) | 3 = 8187`, **not** 8191, which has the TI bit set and
+therefore addresses an LDT that does not exist. `gdt_selector_ok`
+rejects a TI'd selector.
+
+**The TSS.** The packed Limine handoff form is 108 bytes plus a 16-byte
+descriptor, whose bit 4 of the second byte is the **busy** bit — set by
+the CPU when a task is active, and which a kernel must preserve across
+a task switch or the CPU refuses the next switch. `tss_is_busy` /
+`tss_set_busy` read and write exactly that bit and nothing else.
+
+**The page-fault error code**, decoded by bit rather than by a
+hand-written table: bit 0 `P`, bit 1 `W/R`, bit 2 `U/S`, bit 3 reserved,
+bit 4 `I/D`. The reserved bit is checked **first**, because every other
+answer is meaningless once it is set. `page_fault_is_present` is the
+predicate that decides whether a fault is a first touch (handle it) or a
+permissions bug (panic) — getting it backwards turns every first touch
+into a bug report.
+
+**The exception vectors** — 32 names, which of them push an error code
+(8, 10-14, 17, 21; getting that wrong is not a crash, it is a handler
+reading its fault address from the wrong stack slot), which are faults
+and which are traps, and the convention that the **double fault's
+handler runs on IST 1** because it happened when the kernel could not
+even push a frame.
+
+**The 8259 PIC.** Remap bases 0x20 / 0x28, IRQ numbering, the EOI each
+interrupt needs (and that an *exception* never does), and the
+`pic_remap_ok` test that catches a base inside the exception range or a
+pair that overlaps.
+
+### 40.5. What the tests prove
+
+`tests/ok/feat_stage86_interrupt.hls` runs 159 numbered assertions on
+the interpreter AND as a native binary (hosted and `-nostdlib`): every
+selector bound, the access byte's class and S bits, the flags nibble,
+the full descriptor round trip including a TSS base in the high byte
+and a limit above 64 KiB, `gdt_check`'s six faults, the TSS busy bit
+round trip, the IST field and its limit, the gate types, the 32-bit
+offset split and the reachability rule, the whole page-fault decode
+table, the exception vectors, and the 8259 remap.
+
+`make idt-acceptance` (7 sections) proves the language half: the bare
+form still compiles and still gets gcc's attribute, the vector form
+compiles and gets a stub instead; the emitted C carries one naked stub
+per vector, the push/`add $88`/`iretq` sequence, `movl $N, %eax` for
+the error-code vectors, and `hl_idt_install` with its `lidt`; the
+compiled object links `-Werror` and `nm` finds `hl_irq_stub_14`,
+`hl_idt_bindings`, `hl_idt_install`, `hl_idt` and `hl_idtr`; all six
+fail programs are rejected by both compilers with identical text; and
+`interrupt_demo` produces byte-identical output on the interpreter and
+natively. Bootstrap self-compilation remains byte-identical.
