@@ -31,6 +31,18 @@ $(LINKER_TEST_OBJ): $(LINKER_TEST_SRC) $(LINKER_SCRIPT)
 $(LINKER_TEST_BIN): $(LINKER_TEST_OBJ) $(LINKER_SCRIPT)
 	$(LINKER_TEST_LD) -T $(LINKER_SCRIPT) -o $@ $<
 
+# dma-acceptance: the Stage 89 acceptance gate. Runs the 6-section suite
+# for DMA-safe buffers: the core/dma.hls surface, the five CHECKED
+# constructors (a zero length, a misaligned address, an address that
+# does not fit the descriptor's width, a mapping past the window and an
+# over-large bounce transfer), five behaviour probes on the interpreter
+# and both native paths, the ok-test on all three, the demo, the tools,
+# and the six properties a driver actually relies on.
+dma-acceptance:
+	@echo "[Stage 89 acceptance] running tests/dma_acceptance.py..."
+	@$(PYTHON) tests/dma_acceptance.py
+	@echo "ACCEPTANCE OK: Stage 89 -- DMA-safe buffer types (no GC moves, no virtual remap)"
+
 # port-acceptance: the Stage 88 acceptance gate. Runs the 7-section
 # suite for x86 I/O ports: the carrier rule (a sub-64 register is
 # accepted exactly when the template's instruction is that narrow, and
@@ -104,7 +116,7 @@ link-acceptance:
 	@$(PYTHON) tests/link_acceptance.py
 	@echo "ACCEPTANCE OK: Stage 84 -- linker-script integration + custom sections"
 
-.PHONY: freestanding freestanding-check freestanding-acceptance nostd nostd-acceptance alloc-acceptance mem-acceptance panic-acceptance stackguard-acceptance asmreg-acceptance link-acceptance boot-acceptance idt-acceptance mmio-acceptance port-acceptance test-linker
+.PHONY: freestanding freestanding-check freestanding-acceptance nostd nostd-acceptance alloc-acceptance mem-acceptance panic-acceptance stackguard-acceptance asmreg-acceptance link-acceptance boot-acceptance idt-acceptance mmio-acceptance port-acceptance dma-acceptance test-linker
 # Phase VI — OS development foundation (Stages 77-78+)
 # ============================================================================
 # These stages give the LANGUAGE the capabilities OS developers need.
@@ -160,6 +172,11 @@ link-acceptance:
 # 8 bits of data through a 16-bit port number; `core.port` holds the
 # port map, the PIC/PIT/PCI/ACPI tables and the serialisation model —
 # see SPEC section 42.
+# Stage 89 (v0.108.0-alpha): DMA-safe buffers — the requirements a
+# device-visible buffer must meet (physical, aligned, unmoved), the
+# coherency rule each direction follows, the descriptor, the
+# device-visible window and the map/unmap bookkeeping an IOMMU needs,
+# and the bounce buffer — see SPEC section 43.
 # ============================================================================
 
 # freestanding: compile an HLS program to freestanding C + link with

@@ -1,0 +1,281 @@
+# ============================================================================
+# tests/ok/feat_stage89_dma.hls — Stage 89: DMA-safe buffers
+# ----------------------------------------------------------------------------
+# #![no_std] so the same source runs on the interpreter, natively, and
+# linked -nostdlib. Exit 0 = all assertions passed; a non-zero code
+# names the first assertion that failed.
+#
+# `core/dma.hls` is pure — no asm, no privileged access, nothing that
+# needs hardware — so every rule a driver must check before it hands a
+# descriptor over is asserted here identically on all three paths.
+# ============================================================================
+
+#![no_std]
+
+import "core.dma"
+import "core.result"
+import "core.section"
+
+# A "device": a bus master that wants 4-KiB-aligned, page-contained
+# transfers, and reads what it is given.
+struct FakeNic {
+    window: DmaWindow,
+    bounce: BounceBuf,
+    transferred: int,
+    completions: int
+}
+
+# new_nic: a device with a one-megabyte physical window and a bounce
+# buffer for the transfers it cannot do directly.
+fn new_nic() -> FakeNic {
+    return FakeNic {
+        window: dma_window_new(1048576, 1048576, 0),
+        bounce: bounce_new(2097152, 65536, 256),
+        transferred: 0,
+        completions: 0
+    }
+}
+
+# The transfer a driver performs: check the descriptor, check the
+# window, then let the "device" read. Every check is a value, so every
+# check is testable.
+fn nic_xfer(nic: FakeNic, desc: DmaDesc, want_len: int) -> FakeNic {
+    if !dma_desc_covers(desc, desc.addr, want_len) {
+        return nic
+    }
+    if !dma_window_has(nic.window, desc.addr) {
+        return nic
+    }
+    if !dma_window_has(nic.window, dma_desc_end(desc) - 1) {
+        return nic
+    }
+    let fresh: FakeNic = FakeNic {
+        window: nic.window, bounce: nic.bounce,
+        transferred: nic.transferred + want_len,
+        completions: nic.completions + 1
+    }
+    return fresh
+}
+
+fn main() -> int {
+    # ------------------------------------------------------------------
+    # 1. The two requirements, as a testable pair
+    # ------------------------------------------------------------------
+    if !dma_alignment_ok(4) || !dma_alignment_ok(4096) {
+        return 1
+    }
+    # A device asking for an alignment that is not a power of two is
+    # asking for something the allocator cannot express, and accepting
+    # it means every buffer is misaligned.
+    if dma_alignment_ok(3) || dma_alignment_ok(0) || dma_alignment_ok(8192) {
+        return 2
+    }
+    if dma_alignment_class(100) != 64 || dma_alignment_class(1000) != 256 {
+        return 3
+    }
+    if !dma_is_aligned(1048576, 4096) || dma_is_aligned(1048577, 4096) {
+        return 4
+    }
+    if dma_is_aligned(1048576, 0) {
+        return 5
+    }
+    if dma_is_aligned(-4096, 4096) {
+        return 6
+    }
+    # A zero-length transfer is a bug, not a no-op: the device treats it
+    # as "nothing to do" rather than as an error.
+    if dma_size_ok(0, 1) || dma_size_ok(-1, 1) {
+        return 7
+    }
+    if !dma_size_ok(4096, 512) || dma_size_ok(4097, 512) {
+        return 8
+    }
+
+    # ------------------------------------------------------------------
+    # 2. Directions, and the coherency rule that follows from each
+    # ------------------------------------------------------------------
+    # To-device: the CPU has written the data, so its cached lines must
+    # be WRITTEN BACK. Skipping it hands the device stale bytes, and the
+    # failure looks like a device bug.
+    if !dma_needs_flush(DmaDirection.ToDevice) {
+        return 9
+    }
+    if dma_needs_invalidate(DmaDirection.ToDevice) {
+        return 10
+    }
+    # From-device: the DEVICE wrote the data, so the CPU's cached copy
+    # must be DROPPED. Skipping it reads the CPU's own cache and never
+    # sees the data arrive — which is why the symptom is "the transfer
+    # always returns zeros".
+    if dma_needs_flush(DmaDirection.FromDevice) {
+        return 11
+    }
+    if !dma_needs_invalidate(DmaDirection.FromDevice) {
+        return 12
+    }
+    # Both: invalidate FIRST (drop any stale line), then the device
+    # writes, then flush the CPU's own writes made after.
+    if !dma_needs_both(DmaDirection.Both) {
+        return 13
+    }
+    if dma_needs_both(DmaDirection.ToDevice) || dma_needs_both(DmaDirection.FromDevice) {
+        return 14
+    }
+    if dma_direction_name(DmaDirection.Both) != "both" {
+        return 15
+    }
+
+    # ------------------------------------------------------------------
+    # 3. The descriptor
+    # ------------------------------------------------------------------
+    # A 64-bit descriptor still names a PHYSICAL address. A 32-bit one
+    # cannot address above 4 GiB, and a 64-bit address put in a 32-bit
+    # descriptor is the truncation that hands a device a pointer into a
+    # different physical page.
+    if !dma_addr_ok(1099511627776, 64) {
+        return 16
+    }
+    if dma_addr_ok(1099511627776, 32) {
+        return 17
+    }
+    if dma_addr_ok(-1, 64) || dma_addr_bytes(32) != 4 || dma_addr_bytes(64) != 8 {
+        return 18
+    }
+    let desc: DmaDesc = dma_desc_new(1048576, 4096, DmaDirection.ToDevice, 64, 4096)
+    if desc.addr != 1048576 || desc.length != 4096 {
+        return 19
+    }
+    if dma_desc_end(desc) != 1052672 {
+        return 20
+    }
+    # A SHORT length is the most common cause of "the device wrote less
+    # than I expected", and it is a silent success on the device side.
+    if !dma_desc_covers(desc, 1048576, 4096) {
+        return 21
+    }
+    if dma_desc_covers(desc, 1048576, 8192) {
+        return 22
+    }
+    if dma_desc_covers(desc, 1048576, 0) {
+        return 23
+    }
+    # A bus master that crosses a page boundary has to be told to stop;
+    # a driver that assumes otherwise works on one machine only.
+    if !dma_desc_one_page(desc, 12) || dma_desc_pages(desc, 12) != 1 {
+        return 24
+    }
+    let span: DmaDesc = dma_desc_new(1048576, 8192, DmaDirection.FromDevice, 64, 4096)
+    if dma_desc_one_page(span, 12) {
+        return 25
+    }
+    if dma_desc_pages(span, 12) != 2 {
+        return 26
+    }
+    # The shift is a LOGARITHM: taking the page SIZE and shifting by it
+    # is a silent no-op that makes every answer 1.
+    if dma_page_shift(4096) != 12 || dma_page_shift(1024) != 10 {
+        return 27
+    }
+
+    # ------------------------------------------------------------------
+    # 4. The device-visible window
+    # ------------------------------------------------------------------
+    let mut nic: FakeNic = new_nic()
+    if !dma_window_has(nic.window, 1048576) {
+        return 28
+    }
+    if dma_window_has(nic.window, 1048576 + 1048576) {
+        return 29
+    }
+    if dma_window_remaining(nic.window) != 1048576 {
+        return 30
+    }
+    # Mapping the WHOLE window is legal; mapping past its end is how an
+    # IOMMU ends up covering memory the device has no business touching.
+    if !dma_map_ok(nic.window, 1048576) {
+        return 31
+    }
+    if dma_map_ok(nic.window, 1048577) {
+        return 32
+    }
+    nic = nic_xfer(nic, desc, 4096)
+    if nic.transferred != 4096 || nic.completions != 1 {
+        return 33
+    }
+    # A descriptor OUTSIDE the window must be refused by the check, not
+    # by luck: the device would write somewhere else.
+    let outside: DmaDesc = dma_desc_new(8388608, 4096, DmaDirection.ToDevice, 64, 4096)
+    let before: int = nic.transferred
+    nic = nic_xfer(nic, outside, 4096)
+    if nic.transferred != before {
+        return 34
+    }
+
+    # ------------------------------------------------------------------
+    # 5. The map/unmap bookkeeping
+    # ------------------------------------------------------------------
+    let mut w: DmaWindow = dma_window_new(1048576, 4096, 0)
+    if w.mapped != 0 || !dma_all_unmapped(w) {
+        return 35
+    }
+    w = dma_map(w, 2048)
+    if w.mapped != 2048 || dma_all_unmapped(w) {
+        return 36
+    }
+    w = dma_map(w, 2048)
+    if w.mapped != 4096 {
+        return 37
+    }
+    if dma_map_ok(w, 1) {
+        return 38
+    }
+    # A buffer must be UNMAPPED before its pages are freed, or the IOMMU
+    # keeps translating a page the kernel has handed back to the
+    # allocator. So an all-unmapped window is the precondition, and it
+    # is checkable.
+    w = dma_unmap(w, 4096)
+    if !dma_all_unmapped(w) {
+        return 39
+    }
+    # An over-unmap clamps rather than wrapping: a wrapped counter is a
+    # huge unsigned count and an IOMMU entry that never goes away.
+    let over: DmaWindow = dma_unmap(w, 4096)
+    if over.mapped != 0 {
+        return 40
+    }
+    let neg: DmaWindow = dma_unmap(w, 0)
+    if neg.mapped != 0 {
+        return 41
+    }
+
+    # ------------------------------------------------------------------
+    # 6. Bounce buffers
+    # ------------------------------------------------------------------
+    let b: BounceBuf = bounce_new(2097152, 65536, 256)
+    if !bounce_fits(b, 65536) || bounce_fits(b, 65537) {
+        return 42
+    }
+    if bounce_fits(b, 0) {
+        return 43
+    }
+    # A driver that starts a second transfer while one is in flight has
+    # handed the device ONE buffer for TWO transfers, and the
+    # corruption lands in whichever finished second.
+    let busy: BounceBuf = bounce_begin(b, 1024)
+    if !busy.in_flight {
+        return 44
+    }
+    let idle: BounceBuf = bounce_end(busy)
+    if idle.in_flight {
+        return 45
+    }
+    if bounce_fits(idle, 0) {
+        return 46
+    }
+    # The cost is a MODEL, so a test asserts the arithmetic rather than
+    # a timing: two copies per byte against doing it directly.
+    if bounce_cost_bytes(1024) != 2048 || bounce_cost_bytes(0) != 0 {
+        return 47
+    }
+    return 0
+}

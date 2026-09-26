@@ -1,0 +1,458 @@
+# ============================================================================
+# core/dma.hls — DMA-safe buffers (Stage 89, v0.108.0-alpha)
+# ----------------------------------------------------------------------------
+# Pure HLS, one `core` import (freestanding-safe: the module only uses the
+# core language and `core.result`, so it is importable from `#![no_std]`
+# and `#![freestanding]` crates identically, like the rest of `core.*`).
+#
+# A device that can DMA does not care where your data is. It cares
+# about exactly two things, and a kernel that gets either wrong loses
+# data in a way that is very hard to see:
+#
+#   1. the buffer must be PHYSICAL. A descriptor that names a virtual
+#      address is read by a device that has no page tables. On a system
+#      where the kernel and the device share the physical frame, a
+#      higher-half mapping never works; the buffer has to be identity
+#      mapped (or its physical address computed).
+#   2. the buffer must not MOVE. A GC that relocates a live object
+#      hands the device a descriptor for bytes that are no longer
+#      there, and the corruption surfaces later, in unrelated code.
+#
+# This module is the LIBRARY half of Stage 89: the properties of such a
+# buffer, stated as values a driver can CHECK before it hands a
+# descriptor over, and the arithmetic a kernel needs to build one.
+#
+#   * `dma_alignment` / `dma_size_ok` — the two requirements a device
+#     states, as a testable pair. A driver checks both at build time
+#     because the failure at run time is data loss, not a fault.
+#   * `dma_direction` — the three directions, and the rule that only a
+#     DEVICE-TO-CPU buffer can be coherently CPU-cached: a
+#     device-to-CPU transfer invalidates the CPU's copy of the
+#     buffer's lines, and a driver that skips the invalidation reads
+#     stale data that looks entirely plausible.
+#   * `dma_desc` — a descriptor as a value: the direction, the address
+#     width, the length, the engine, and the device/target ids a
+#     scatter-gather list carries. The CHECK is that a descriptor's
+#     length covers the whole buffer, because a short length is the
+#     single most common cause of "the device wrote less than I
+#     expected".
+#   * `dma_map_count` / `dma_unmap` — the bookkeeping for a
+#     device-visible window: how many buffers are mapped, and the rule
+#     that a buffer must be unmapped before its pages are freed, which
+#     is what an IOMMU needs and what a driver must therefore track.
+#   * `bounce` — the fallback that makes a DMA-capable device usable
+#     without a physical buffer at all: copy into a bounce buffer
+#     aligned and sized for the device, DMA it, copy back. The cost is
+#     modelled, and the requirement (a bounce buffer big enough for the
+#     LARGEST possible transfer, because the size is only known after
+#     the device has accepted the request) is why a bounce buffer
+#     cannot be a stack local.
+#
+# ON HEX: Halis has no hex literals, so every constant below is written
+# as its exact integer value with the hex form in the comment.
+# ============================================================================
+
+import "core.result"
+
+# ---------------------------------------------------------------------------
+# The two requirements
+# ---------------------------------------------------------------------------
+
+# The alignment a device needs. Common values are 4 (a 32-bit engine),
+# 8, 64 (a cache line), 256 (a descriptor engine's natural unit) and
+# 4096 (a page, which is what makes a physical address usable without
+# a bounce copy on a page-mapped system).
+fn dma_alignment_class(align: int) -> int {
+    if align >= 4096 {
+        return 4096
+    }
+    if align >= 256 {
+        return 256
+    }
+    if align >= 64 {
+        return 64
+    }
+    if align >= 8 {
+        return 8
+    }
+    if align >= 4 {
+        return 4
+    }
+    return 1
+}
+
+# dma_alignment_ok: a power of two in 1..4096. A device that asks for
+# an alignment that is not a power of two is asking for something the
+# allocator cannot express, and accepting it means every buffer is
+# misaligned.
+fn dma_alignment_ok(align: int) -> bool {
+    if align < 1 || align > 4096 {
+        return false
+    }
+    return int_and(align, align - 1) == 0
+}
+
+# dma_is_aligned: is this address acceptable to a device asking for
+# `align` bytes? The check a driver makes on a buffer it did not
+# allocate itself.
+fn dma_is_aligned(addr: int, align: int) -> bool {
+    if addr < 0 {
+        return false
+    }
+    if !dma_alignment_ok(align) {
+        return false
+    }
+    return int_and(addr, align - 1) == 0
+}
+
+# dma_size_ok: is this length acceptable? A zero-length transfer is
+# almost always a bug (the driver computed a size of zero and the
+# device treats it as "no transfer" rather than as an error), and a
+# device that wants a multiple of its unit is asking for a reason.
+fn dma_size_ok(len: int, unit: int) -> bool {
+    if len <= 0 {
+        return false
+    }
+    if unit <= 0 {
+        return true
+    }
+    return int_and(len, unit - 1) == 0
+}
+
+# ---------------------------------------------------------------------------
+# Directions, and the coherency rule that follows from them
+# ---------------------------------------------------------------------------
+
+enum DmaDirection {
+    ToDevice, # CPU -> device: the CPU must FLUSH its cached lines
+    FromDevice, # device -> CPU: the CPU must INVALIDATE its lines
+    Both # the engine may write and the CPU may write: invalidate, then flush after
+}
+
+fn dma_direction_name(d: DmaDirection) -> str {
+    return match d {
+        DmaDirection.ToDevice => "to-device",
+        DmaDirection.FromDevice => "from-device",
+        DmaDirection.Both => "both"
+    }
+}
+
+# dma_needs_flush: must the CPU write back its cached copy before the
+# device reads? Only when the CPU has written the data. A driver that
+# skips this on a to-device transfer hands the device STALE bytes —
+# the failure that looks like a device bug.
+fn dma_needs_flush(d: DmaDirection) -> bool {
+    if dma_direction_name(d) == "from-device" {
+        return false
+    }
+    return true
+}
+
+# dma_needs_invalidate: must the CPU drop its cached copy after the
+# device writes? Only when the DEVICE has written the data. A driver
+# that skips this on a from-device transfer reads its own cache and
+# never sees the data arrive — which is why the symptom is "the
+# transfer always returns zeros" rather than a corruption.
+fn dma_needs_invalidate(d: DmaDirection) -> bool {
+    if dma_direction_name(d) == "to-device" {
+        return false
+    }
+    return true
+}
+
+# dma_needs_both: the one direction where BOTH are required, and the
+# order matters: invalidate first (drop any stale line), let the device
+# write, then flush the CPU's own writes made after.
+fn dma_needs_both(d: DmaDirection) -> bool {
+    return dma_direction_name(d) == "both"
+}
+
+# ---------------------------------------------------------------------------
+# A descriptor
+# ---------------------------------------------------------------------------
+
+# The address width a descriptor carries. 32-bit is a legacy engine;
+# 64-bit is every engine past the first, and it is also what forces the
+# physical address to be known — a 64-bit descriptor still names a
+# physical address, not a virtual one.
+fn dma_addr_bits(bits: int) -> int {
+    if bits == 64 {
+        return 64
+    }
+    return 32
+}
+
+fn dma_addr_bytes(bits: int) -> int {
+    if dma_addr_bits(bits) == 64 {
+        return 8
+    }
+    return 4
+}
+
+# dma_addr_ok: a descriptor's address must fit its width. A 64-bit
+# address in a 32-bit descriptor is the truncation that hands a device
+# a pointer into a DIFFERENT physical page.
+fn dma_addr_ok(addr: int, bits: int) -> bool {
+    if addr < 0 {
+        return false
+    }
+    if dma_addr_bits(bits) == 64 {
+        return true
+    }
+    return int_shr(addr, 32) == 0
+}
+
+# One scatter-gather entry. A `DmaDesc` is what a driver hands a DMA
+# engine, and every field of it is a way to be wrong.
+struct DmaDesc {
+    addr: int, # PHYSICAL
+    length: int,
+    direction: DmaDirection,
+    addr_bits: int,
+    align: int
+}
+
+# dma_desc_new: a descriptor for a physical buffer. A zero length, a
+# misaligned address, or an address that does not fit the descriptor's
+# width are all rejected HERE rather than becoming a silent short
+# transfer or a device that writes somewhere else.
+fn dma_desc_new(addr: int, length: int, direction: DmaDirection, addr_bits: int, align: int) -> DmaDesc {
+    if length <= 0 {
+        panic("dma_desc_new: a zero-length transfer is a bug, not a no-op")
+    }
+    if !dma_alignment_ok(align) {
+        panic("dma_desc_new: the alignment must be a power of two in 1..4096")
+    }
+    if !dma_is_aligned(addr, align) {
+        panic("dma_desc_new: the physical address does not meet the device's alignment")
+    }
+    if !dma_addr_ok(addr, addr_bits) {
+        panic("dma_desc_new: the address does not fit the descriptor's width")
+    }
+    return DmaDesc {
+        addr: addr, length: length, direction: direction,
+        addr_bits: addr_bits, align: align
+    }
+}
+
+fn dma_desc_end(d: DmaDesc) -> int {
+    return d.addr + d.length
+}
+
+# dma_desc_covers: does the descriptor cover the whole buffer? A short
+# length is the single most common cause of "the device wrote less than
+# I expected", and it is a silent success on the device side.
+fn dma_desc_covers(d: DmaDesc, base: int, length: int) -> bool {
+    if length <= 0 {
+        return false
+    }
+    if d.addr < base {
+        return false
+    }
+    return d.length >= length
+}
+
+# dma_page_shift: the log2 of the page size, which is what the shift
+# builtins want. Taking the SIZE and shifting by it is a silent
+# no-op that makes every "how many pages does this touch" answer 1.
+fn dma_page_shift(page_bytes: int) -> int {
+    if page_bytes >= 4096 {
+        return 12
+    }
+    if page_bytes >= 2048 {
+        return 11
+    }
+    if page_bytes >= 1024 {
+        return 10
+    }
+    return 9
+}
+
+# dma_desc_one_page: is the whole transfer inside one page? A bus master
+# that crosses a page boundary has to be told to stop, and a driver
+# that assumes otherwise produces a transfer that works on one machine
+# and not on another.
+fn dma_desc_one_page(d: DmaDesc, page_shift: int) -> bool {
+    if page_shift <= 0 {
+        return false
+    }
+    if int_shr(d.addr, page_shift) != int_shr(dma_desc_end(d) - 1, page_shift) {
+        return false
+    }
+    return true
+}
+
+# dma_desc_pages: how many pages the transfer touches.
+fn dma_desc_pages(d: DmaDesc, page_shift: int) -> int {
+    if page_shift <= 0 {
+        return 0
+    }
+    let first: int = int_shr(d.addr, page_shift)
+    let last: int = int_shr(dma_desc_end(d) - 1, page_shift)
+    return last - first + 1
+}
+
+# ---------------------------------------------------------------------------
+# A device-visible window, and the bookkeeping an IOMMU needs
+# ---------------------------------------------------------------------------
+
+# A window is what a driver hands an IOMMU: a physical range, and the
+# fact that the CPU may use it as a buffer. The bookkeeping exists
+# because the order matters: a buffer must be UNMAPPED before its
+# pages are freed, or the IOMMU keeps translating a page the kernel has
+# already handed back to the allocator.
+struct DmaWindow {
+    base: int,
+    length: int,
+    mapped: int, # live mappings
+    device_id: int
+}
+
+fn dma_window_new(base: int, length: int, device_id: int) -> DmaWindow {
+    if length <= 0 {
+        panic("dma_window_new: a window must have a positive length")
+    }
+    if base < 0 {
+        panic("dma_window_new: a window base must be >= 0")
+    }
+    return DmaWindow {
+        base: base, length: length, mapped: 0, device_id: device_id
+    }
+}
+
+fn dma_window_end(w: DmaWindow) -> int {
+    return w.base + w.length
+}
+
+# dma_window_has: is an address inside the window the device may touch?
+# The check every descriptor address must pass, and the one that turns
+# "the device wrote outside its buffer" from a mystery into a rejected
+# descriptor.
+fn dma_window_has(w: DmaWindow, addr: int) -> bool {
+    return addr >= w.base && addr < dma_window_end(w)
+}
+
+# dma_window_remaining: how much of the window is still unmapped. A
+# driver that runs out mid-transfer has a bug the numbers can see.
+fn dma_window_remaining(w: DmaWindow) -> int {
+    return w.length - w.mapped
+}
+
+# dma_map_ok: may one more mapping of `len` bytes be recorded? Mapping
+# past the end of the window is how an IOMMU ends up covering memory
+# the device has no business touching.
+fn dma_map_ok(w: DmaWindow, len: int) -> bool {
+    if len <= 0 {
+        return false
+    }
+    if w.mapped + len > w.length {
+        return false
+    }
+    return true
+}
+
+# dma_map: record a mapping. Saturates at the window end rather than
+# wrapping, because a wrapped counter silently frees memory the device
+# may still write.
+fn dma_map(w: DmaWindow, len: int) -> DmaWindow {
+    if !dma_map_ok(w, len) {
+        panic("dma_map: the mapping would run past the end of the window")
+    }
+    return DmaWindow {
+        base: w.base, length: w.length, mapped: w.mapped + len,
+        device_id: w.device_id
+    }
+}
+
+# dma_unmap: release a mapping. Underflows are clamped, because the
+# alternative is a huge unsigned count and an IOMMU entry that never
+# goes away.
+fn dma_unmap(w: DmaWindow, len: int) -> DmaWindow {
+    if len <= 0 {
+        return w
+    }
+    let mut left: int = w.mapped - len
+    if left < 0 {
+        left = 0
+    }
+    return DmaWindow {
+        base: w.base, length: w.length, mapped: left, device_id: w.device_id
+    }
+}
+
+# dma_all_unmapped: the precondition for freeing a window's pages.
+fn dma_all_unmapped(w: DmaWindow) -> bool {
+    return w.mapped == 0
+}
+
+# ---------------------------------------------------------------------------
+# Bounce buffers
+# ---------------------------------------------------------------------------
+
+# A bounce buffer stands in for a physical buffer the kernel does not
+# have: copy in, DMA the bounce buffer, copy out. The size is the point
+# — it must be the LARGEST transfer the device can attempt, and that
+# is only known AFTER the device has accepted the request, which is why
+# a bounce buffer cannot be a stack local.
+struct BounceBuf {
+    addr: int,
+    length: int,
+    align: int,
+    in_flight: bool
+}
+
+fn bounce_new(addr: int, length: int, align: int) -> BounceBuf {
+    if length <= 0 {
+        panic("bounce_new: a bounce buffer must be non-empty")
+    }
+    if !dma_alignment_ok(align) {
+        panic("bounce_new: the alignment must be a power of two in 1..4096")
+    }
+    if !dma_is_aligned(addr, align) {
+        panic("bounce_new: the bounce buffer does not meet the device's alignment")
+    }
+    return BounceBuf {
+        addr: addr, length: length, align: align, in_flight: false
+    }
+}
+
+# bounce_fits: can this transfer go through the bounce buffer at all?
+fn bounce_fits(b: BounceBuf, length: int) -> bool {
+    if length <= 0 {
+        return false
+    }
+    if length > b.length {
+        return false
+    }
+    return true
+}
+
+# bounce_begin / bounce_end: the in-flight flag. A driver that starts a
+# second transfer while one is in flight has handed the device ONE
+# buffer for TWO transfers, and the corruption lands in whichever
+# finished second.
+fn bounce_begin(b: BounceBuf, length: int) -> BounceBuf {
+    if !bounce_fits(b, length) {
+        panic("bounce_begin: the transfer does not fit the bounce buffer")
+    }
+    if b.in_flight {
+        panic("bounce_begin: a transfer is already in flight on this buffer")
+    }
+    return BounceBuf {
+        addr: b.addr, length: b.length, align: b.align, in_flight: true
+    }
+}
+
+fn bounce_end(b: BounceBuf) -> BounceBuf {
+    return BounceBuf {
+        addr: b.addr, length: b.length, align: b.align, in_flight: false
+    }
+}
+
+# bounce_cost_bytes: the memory traffic a bounce costs, against doing the
+# transfer directly. A kernel choosing bounce over identity mapping pays
+# two copies per byte; the number is a MODEL, so a test asserts the
+# arithmetic rather than a timing.
+fn bounce_cost_bytes(length: int) -> int {
+    return length * 2
+}

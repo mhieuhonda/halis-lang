@@ -4255,3 +4255,110 @@ on a narrow register is still rejected, the demo's six instructions
 link `-Werror` and the disassembly really contains all six, `main`
 issues no port access at all, the demo image runs, and five behaviour
 probes pass on all three execution paths.
+
+---
+
+## 43. DMA-safe buffers (Stage 89 — v0.108.0-alpha)
+
+A device that can DMA does not care where your data is. It cares
+about exactly two things, and a kernel that gets either wrong loses
+data in a way that is very hard to see:
+
+1. the buffer must be **PHYSICAL**. A descriptor names a physical
+   address; the device has no page tables. On a system where the kernel
+   lives in the higher half, a descriptor built from a virtual address
+   points a bus master at nothing.
+2. the buffer must not **MOVE**. A relocating collector hands the
+   device a descriptor for bytes that are no longer there, and the
+   corruption surfaces later, in unrelated code.
+
+Neither failure is a fault. Both are silent, which is why Stage 89 puts
+them in a place a driver can check.
+
+### 43.1. `core/dma.hls`
+
+Pure HLS, one `core` import, no effects — so every rule below is
+asserted identically on the interpreter, on a hosted binary and on a
+`-nostdlib` one.
+
+**The two requirements, as a testable pair.** `dma_alignment_ok` (a
+power of two in 1..=4096) and `dma_is_aligned` are what a device states
+about its buffers; `dma_size_ok` rejects a zero length, which is a bug
+rather than a no-op (the device treats it as "nothing to do", not as an
+error), and a length that is not a multiple of the device's unit.
+`dma_alignment_class` names the usual tiers — 4, 8, 64 (a cache line),
+256 (a descriptor engine's natural unit), 4096 (a page, which is what
+makes a physical address usable without a bounce copy).
+
+**Coherency follows from the direction.** This is the rule with the
+worst failure mode:
+
+| Direction | The CPU must | Skipping it looks like |
+|---|---|---|
+| `ToDevice` | **flush** its written lines | the device gets stale bytes — a "device bug" |
+| `FromDevice` | **invalidate** its cached lines | the CPU reads its own cache and never sees the data arrive — "the transfer always returns zeros" |
+| `Both` | invalidate *first*, then flush after | a torn value that passes every length check |
+
+`dma_needs_flush` / `dma_needs_invalidate` / `dma_needs_both` state it,
+and the ORDER matters in the third case: the stale line is dropped
+before the device writes, and the CPU's own later writes are written
+back after.
+
+**The descriptor.** A `DmaDesc` holds a *physical* address, a length, a
+direction, the address width and the alignment — and every field is a
+way to be wrong:
+
+* `dma_addr_ok(addr, bits)` refuses an address a 32-bit descriptor
+  cannot hold. That is the truncation that hands a device a pointer
+  into a **different physical page**, and it is why a 64-bit descriptor
+  is still not a virtual one.
+* `dma_desc_covers` is the short-descriptor check — the most common
+  cause of "the device wrote less than I expected", and a silent
+  success on the device side.
+* `dma_desc_one_page` / `dma_desc_pages` answer "does this cross a page
+  boundary", which a bus master has to be told about. Note the
+  `page_shift` parameter: it is a **logarithm**. Taking the page *size*
+  and shifting by it is a silent no-op that makes every answer 1 —
+  `dma_page_shift` is the named conversion.
+* `dma_desc_new` is the CHECKED constructor: a zero length, a
+  misaligned address, an address that does not fit the width, and a
+  non-power-of-two alignment all panic rather than becoming a
+  descriptor the device will interpret.
+
+**The device-visible window.** A `DmaWindow` is what a driver hands an
+IOMMU: a physical range, the live mapping count, and the device id.
+The bookkeeping is the point — a buffer must be **unmapped before its
+pages are freed**, or the IOMMU keeps translating a page the kernel has
+already handed back to the allocator. So `dma_all_unmapped` is the
+precondition and it is a value a driver can assert. `dma_map` refuses
+past the window end (the way an IOMMU ends up covering memory the
+device has no business touching), and `dma_unmap` **clamps** at zero
+rather than wrapping — a wrapped counter is a huge unsigned count and
+an entry that never goes away.
+
+**Bounce buffers.** The fallback that makes a DMA-capable device usable
+with no physical buffer at all: copy in, DMA the bounce buffer, copy
+back. The size is the point, and it is why a bounce buffer cannot be a
+stack local: it must hold the **largest transfer the device can
+attempt**, and that is only known *after* the device has accepted the
+request. `bounce_begin` / `bounce_end` carry an `in_flight` flag
+because a driver that starts a second transfer while one is running
+has handed the device one buffer for two transfers, and the corruption
+lands in whichever finished second. `bounce_cost_bytes` is the price —
+two copies per byte — and it is a **model**, so a test asserts the
+arithmetic rather than a timing.
+
+### 43.2. What the tests prove
+
+`tests/ok/feat_stage89_dma.hls` runs 49 numbered assertions on the
+interpreter AND as a native binary (hosted and `-nostdlib`): the
+alignment and size rules, the three coherency cases, the descriptor
+(address width, coverage, page containment, the logarithm trap), the
+window and the map/unmap arithmetic, and the bounce discipline.
+
+`make dma-acceptance` (6 sections) proves the constructors are checked
+(five run-time panics, each accepted by the checker first), runs five
+behaviour probes and the ok-test on all three execution paths, runs the
+demo, checks the tools, and asserts the **six properties a driver
+actually relies on** explicitly — so a later change to the module
+cannot quietly drop one.

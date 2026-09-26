@@ -964,3 +964,42 @@ else
     bad "port: make port-acceptance failed"
     tail -15 "$TMP/port_acc88.log"
 fi
+
+echo "=== 26. Stage 89: DMA-safe buffer types ==="
+# Stage 89 (v0.108.0-alpha): a device-visible buffer must be PHYSICAL
+# and must not MOVE — and neither failure is a fault, which is why the
+# requirements are values. The gate is the authority.
+DMA_F=tests/ok/feat_stage89_dma.hls
+dma_interp=$(python3 boot/boot.py "$DMA_F" </dev/null 2>/dev/null); dma_code=$?
+if [ "$dma_code" -eq 0 ]; then
+    ok "dma: feat_stage89_dma runs on the interpreter (exit 0)"
+else
+    bad "dma: feat_stage89_dma interpreter exit=$dma_code"
+fi
+if [ -f core/dma.hls ] && grep -q "fn dma_desc_covers" core/dma.hls; then
+    ok "dma: core/dma.hls present"
+else
+    bad "dma: core/dma.hls missing"
+fi
+if [ -x "$TMP/hlc1" ] && "$TMP/hlc1" examples/dma_demo.hls "$TMP/dma_demo.c" >/dev/null 2>&1 \
+    && gcc -O2 -Werror -o "$TMP/dma_demo" "$TMP/dma_demo.c" -lm -pthread 2>/dev/null; then
+    "$TMP/dma_demo" </dev/null >/dev/null 2>&1
+    if [ "$?" -eq 0 ]; then
+        ok "dma: examples/dma_demo.hls runs natively, exit 0"
+    else
+        bad "dma: dma_demo did not run"
+    fi
+else
+    bad "dma: dma_demo failed to build"
+fi
+if make dma-acceptance >"$TMP/dma_acc89.log" 2>&1; then
+    if grep -q "ACCEPTANCE OK: Stage 89" "$TMP/dma_acc89.log"; then
+        ok "dma: make dma-acceptance runs end-to-end"
+    else
+        bad "dma: make dma-acceptance did not print ACCEPTANCE OK"
+        tail -5 "$TMP/dma_acc89.log"
+    fi
+else
+    bad "dma: make dma-acceptance failed"
+    tail -15 "$TMP/dma_acc89.log"
+fi
