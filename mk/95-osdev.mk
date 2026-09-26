@@ -31,6 +31,20 @@ $(LINKER_TEST_OBJ): $(LINKER_TEST_SRC) $(LINKER_SCRIPT)
 $(LINKER_TEST_BIN): $(LINKER_TEST_OBJ) $(LINKER_SCRIPT)
 	$(LINKER_TEST_LD) -T $(LINKER_SCRIPT) -o $@ $<
 
+# port-acceptance: the Stage 88 acceptance gate. Runs the 7-section
+# suite for x86 I/O ports: the carrier rule (a sub-64 register is
+# accepted exactly when the template's instruction is that narrow, and
+# the two widths ONE port instruction needs each get their own carrier),
+# the core/port.hls surface, the demo's six real `in`/`out` instructions
+# compiled `-Werror` and LINKED with the disassembly checked to be
+# `out %al,(%dx)` / `in (%dx),%eax`, the demo running (its main touches
+# no port, because a port access is privileged), the model on all three
+# execution paths, five behaviour probes, and the tools.
+port-acceptance:
+	@echo "[Stage 88 acceptance] running tests/port_acceptance.py..."
+	@$(PYTHON) tests/port_acceptance.py
+	@echo "ACCEPTANCE OK: Stage 88 -- core.port (typesafe x86 I/O ports)"
+
 # mmio-acceptance: the Stage 87 acceptance gate. Runs the 7-section
 # suite for memory-mapped I/O: the register rule (a 32-bit register is
 # accepted exactly when the template's instruction is 32-bit, and still
@@ -90,7 +104,7 @@ link-acceptance:
 	@$(PYTHON) tests/link_acceptance.py
 	@echo "ACCEPTANCE OK: Stage 84 -- linker-script integration + custom sections"
 
-.PHONY: freestanding freestanding-check freestanding-acceptance nostd nostd-acceptance alloc-acceptance mem-acceptance panic-acceptance stackguard-acceptance asmreg-acceptance link-acceptance boot-acceptance idt-acceptance mmio-acceptance test-linker
+.PHONY: freestanding freestanding-check freestanding-acceptance nostd nostd-acceptance alloc-acceptance mem-acceptance panic-acceptance stackguard-acceptance asmreg-acceptance link-acceptance boot-acceptance idt-acceptance mmio-acceptance port-acceptance test-linker
 # Phase VI — OS development foundation (Stages 77-78+)
 # ============================================================================
 # These stages give the LANGUAGE the capabilities OS developers need.
@@ -140,6 +154,12 @@ link-acceptance:
 # 32-bit, and the freestanding entry is `naked` so the stack stays on
 # the ABI alignment; `core.mmio` models the widths, fields, windows,
 # barriers and the LAPIC map — see SPEC section 41.
+# Stage 88 (v0.107.0-alpha): x86 I/O ports — `in`/`out` are one asm
+# template, and a sub-64 register is legal when the template's
+# instruction is that narrow, which is what lets `outb %al, %dx` carry
+# 8 bits of data through a 16-bit port number; `core.port` holds the
+# port map, the PIC/PIT/PCI/ACPI tables and the serialisation model —
+# see SPEC section 42.
 # ============================================================================
 
 # freestanding: compile an HLS program to freestanding C + link with

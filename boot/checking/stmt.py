@@ -642,15 +642,22 @@ class CheckerStmt(object):
                         # truncates. Relaxing it for a 32-bit mnemonic
                         # keeps that bug caught and makes real MMIO
                         # expressible.
-                        if w != 64 and not (w == 32
+                        # Stage 87/88: ANY sub-64 register width is
+                        # legal when the template's instruction is that
+                        # narrow — `movl %eax` for a 32-bit device
+                        # register, `inb`/`outb` on `%al` for an 8-bit
+                        # I/O port. A 64-BIT instruction on a narrow
+                        # register still silently truncates, and stays
+                        # rejected.
+                        if w != 64 and not (w < 64
                                             and asm_template_is_narrow(template)):
                             self.err("asm! register '%s' is %d-bit; %s "
                                      "operand needs a 64-bit register — "
-                                     "use '%s' (or, for a 32-bit device "
-                                     "register, a template whose "
-                                     "instruction is 32-bit)"
+                                     "use '%s' (or, for a narrow device "
+                                     "register or I/O port, a template "
+                                     "whose instruction is %d-bit)"
                                      % (body, w, ot_word,
-                                        asm_reg_canonical(body)), s)
+                                        asm_reg_canonical(body), w), s)
                     fixed = asm_reg_canonical(body)
                 elif body in ("x", "v") and ot != "float":
                     self.err("asm! constraint '%s' is an SSE register "

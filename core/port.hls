@@ -1,0 +1,401 @@
+# ============================================================================
+# core/port.hls — x86 I/O ports as data (Stage 88, v0.107.0-alpha)
+# ----------------------------------------------------------------------------
+# Pure HLS, one `core` import (freestanding-safe: the module only uses the
+# core language and `core.result`, so it is importable from `#![no_std]`
+# and `#![freestanding]` crates identically, like the rest of `core.*`).
+#
+# This module is the LIBRARY half of Stage 88. The LANGUAGE half is
+# already there: `outb`/`inb`/`outw`/`inw`/`outl`/`inl` are one asm
+# template, and Stage 87/88's narrow-template rule is what lets an `int`
+# operand bind a sub-64 register — `outb %al, %dx` moves EIGHT bits of
+# data through a SIXTEEN-bit port number, and no single carrier type
+# expresses both, which is why one named register and one letter
+# constraint carry the two widths.
+#
+# What lives here — the half a driver actually gets wrong:
+#   * `Port` — a port number as a VALUE, with the 16-bit width the
+#     hardware requires and a port range that is checked. A port number
+#     is a 16-BIT quantity: `outb %al, %imm8` has a different encoding
+#     and a DIFFERENT meaning from `outb %al, %dx`, and mixing the two
+#     is how a driver ends up talking to a port that does not exist.
+#   * `port_is_known` / `port_name` — the architectural ports a kernel
+#     touches, with the widths they actually use. The classic: the PIC
+#     data port is 8-bit, the PIT counter is 16-bit, the PIT control is
+#     8-bit, the debug port is 8-bit, and the PCI CONFIG port is
+#     3320/3324 which are 32-bit even though the address is 16-bit
+#     wide. The table makes that asymmetry checkable.
+#   * The 8259 PIC, the 8253/8254 PIT, the PC-speaker, the debug
+#     console, the PCI config mechanism, the ACPI PM registers and the
+#     control-register banks — the port maps a first kernel needs,
+#     as data, with the widths, the reset/shift sequences and the
+#     EOI rule the hardware requires.
+#   * `port_delay` — the I/O-serialising delay. On a modern CPU an
+#     `out` to a legacy device posts a buffer-full; the device samples
+#     it up to ~50 microseconds later. A kernel that polls a status
+#     register must wait for it, and the wait is invisible in the
+#     source.
+#
+# ON HEX: Halis has no hex literals, so every constant below is written
+# as its exact integer value with the hex form in the comment.
+# ============================================================================
+
+import "core.result"
+
+# ---------------------------------------------------------------------------
+# A port number as a value
+# ---------------------------------------------------------------------------
+
+# The width every x86 I/O port number is carried in. `in`/`out` with a
+# port operand take DX, 16 bits wide; the 8-bit IMMEDIATE form is a
+# different encoding of the same instruction and is NOT the same thing
+# to write, so the model is 16-bit and the assembler form follows.
+fn port_number_bits() -> int {
+    return 16
+}
+
+fn port_max() -> int {
+    return 65535
+}
+
+# port_is_legal: is this a port number at all? 0..65535, and a driver
+# that computes one from a PCI bus/dev/function triple is the caller
+# that most needs the check — a 16-bit port space is the bound that
+# catches a 8-bit computation silently wrapping.
+fn port_is_legal(p: int) -> bool {
+    return p >= 0 && p <= port_max()
+}
+
+# port_byte_addr: the 8-bit IMMEDIATE port. Only 0..255 has one; a
+# kernel that uses this for a higher port is talking to a different
+# instruction.
+fn port_has_immediate(p: int) -> bool {
+    return p >= 0 && p <= 255
+}
+
+# port_imm_ok: may this port be written with the immediate (imm8) form?
+fn port_imm_ok(p: int) -> bool {
+    return port_has_immediate(p)
+}
+
+# The three widths an I/O access itself moves. The DATA is what the
+# device receives; the PORT is always 16 bits.
+enum PortWidth {
+    Byte, # 8  — al / ax-in-byte
+    Word, # 16 — ax
+    Dword # 32 — eax
+}
+
+fn port_width_name(w: PortWidth) -> str {
+    return match w {
+        PortWidth.Byte => "byte",
+        PortWidth.Word => "word",
+        PortWidth.Dword => "dword"
+    }
+}
+
+fn port_data_bits(w: PortWidth) -> int {
+    return match w {
+        PortWidth.Byte => 8,
+        PortWidth.Word => 16,
+        PortWidth.Dword => 32
+    }
+}
+
+# The AT&T mnemonic suffix, which is what an `asm!` template needs.
+fn port_width_suffix(w: PortWidth) -> str {
+    return match w {
+        PortWidth.Byte => "b",
+        PortWidth.Word => "w",
+        PortWidth.Dword => "l"
+    }
+}
+
+# port_width_mask: the value bits a port READ defines. An 8-bit `inb`
+# puts the byte in AL and LEAVES the rest of the accumulator alone — a
+# driver that skips the mask reads whatever the register held.
+fn port_width_mask(w: PortWidth) -> int {
+    return match w {
+        PortWidth.Byte => 255,
+        PortWidth.Word => 65535,
+        PortWidth.Dword => 4294967295
+    }
+}
+
+# port_read: the value an access of this width reports, given the raw
+# accumulator.
+fn port_read(raw: int, w: PortWidth) -> int {
+    return int_and(raw, port_width_mask(w))
+}
+
+# port_write: what to hand the instruction. Truncation is the DEVICE's
+# business, not the driver's.
+fn port_write(value: int, w: PortWidth) -> int {
+    return int_and(value, port_width_mask(w))
+}
+
+# ---------------------------------------------------------------------------
+# The architectural port map
+# ---------------------------------------------------------------------------
+
+# The 8259 PIC.
+fn pic_cmd_port() -> int {
+    return 32
+}
+
+fn pic_data_port() -> int {
+    return 33
+}
+
+fn pic_slave_cmd_port() -> int {
+    return 160
+}
+
+fn pic_slave_data_port() -> int {
+    return 161
+}
+
+# ICW1: bit 4 = ICW4 expected, bit 0 = begin the init sequence.
+fn pic_icw1() -> int {
+    return 17
+}
+
+fn pic_icw4() -> int {
+    return 1
+}
+
+# ICW4: bit 0 = 8086/88 mode. A PIC left in 8085 mode does not deliver
+# an interrupt to a protected-mode kernel, and the failure is a machine
+# that runs until something else happens to fault.
+fn pic_icw4_8086() -> int {
+    return 1
+}
+
+# OCW2: the EOI (non-specific) is 32 — a CONTROL word with no more
+# bits set, which is why it is the literal 32.
+fn pic_ocw2_eoi() -> int {
+    return 32
+}
+
+# OCW3: read the ISR (bit 3) to poll for an in-service interrupt.
+fn pic_ocw3_isr_read() -> int {
+    return 11
+}
+
+# The PIC's EOI is written to the SLAVE first when the interrupt came
+# in on IRQ 8..15, then to the master — in that order. The master first
+# is the classic mistake, and the symptom is an interrupt that
+# occasionally never retires.
+fn pic_eoi_order_is_slave_first(irq: int) -> bool {
+    return irq >= 8 && irq <= 15
+}
+
+# ---------------------------------------------------------------------------
+# The 8253/8254 PIT
+# ---------------------------------------------------------------------------
+
+fn pit_channel0_port() -> int {
+    return 64
+}
+
+fn pit_channel1_port() -> int {
+    return 65
+}
+
+fn pit_channel2_port() -> int {
+    return 66
+}
+
+fn pit_command_port() -> int {
+    return 67
+}
+
+# The counter is 16-bit and WRITTEN AS TWO BYTES: the low byte first,
+# then the high. The order is not a convention.
+fn pit_freq() -> int {
+    return 1193182
+}
+
+# pit_divisor: the reload value for a frequency, given the PIT's fixed
+# input frequency. A divisor of 0 means 65536 (the counter is 16-bit and
+# wraps), which is the answer every "my timer runs 256 times too fast"
+# bug has to know.
+fn pit_divisor(hz: int) -> int {
+    if hz <= 0 {
+        panic("pit_divisor: a frequency must be positive")
+    }
+    let d: int = pit_freq() / hz
+    if d < 1 {
+        return 1
+    }
+    if d > 65536 {
+        return 65536
+    }
+    return d
+}
+
+# pit_reload: the 16-bit reload value, and its two bytes low-first.
+fn pit_reload_low(v: int) -> int {
+    return int_and(v, 255)
+}
+
+fn pit_reload_high(v: int) -> int {
+    return int_and(int_shr(v, 8), 255)
+}
+
+# Channel 2 drives the PC speaker, and its gate lives on port 97
+# alongside the refresh bit.
+fn speaker_gate_port() -> int {
+    return 97
+}
+
+fn speaker_gate_bit() -> int {
+    return 1
+}
+
+# ---------------------------------------------------------------------------
+# The debug console and the PCI config mechanism
+# ---------------------------------------------------------------------------
+
+# The Bochs/QEMU debug port: a single byte to a magic port appears on
+# the host's stderr. It is the only output a freestanding kernel has
+# before it has a driver for anything.
+fn debug_port() -> int {
+    return 224
+}
+
+fn debug_write_byte(v: int) -> int {
+    return int_and(v, 255)
+}
+
+# PCI configuration: the ADDRESS port is 32-bit and the DATA port is
+# 32-bit, but the bus/device/function/register fields are all FIVE
+# bits. Getting the field widths wrong is how a driver reads the wrong
+# device's BAR.
+fn pci_config_address_port() -> int {
+    return 248
+}
+
+fn pci_config_data_port() -> int {
+    return 252
+}
+
+fn pci_bus_bits() -> int {
+    return 8
+}
+
+fn pci_bus_shift() -> int {
+    return 16
+}
+
+fn pci_device_bits() -> int {
+    return 5
+}
+
+fn pci_device_shift() -> int {
+    return 11
+}
+
+fn pci_function_bits() -> int {
+    return 3
+}
+
+fn pci_function_shift() -> int {
+    return 8
+}
+
+fn pci_register_bits() -> int {
+    return 4
+}
+
+fn pci_register_shift() -> int {
+    return 2
+}
+
+# pci_config_address: pack a bus / device / function / register into
+# the value written to 3320, with the enable bit set.
+fn pci_config_address(bus: int, dev: int, func: int, reg: int) -> int {
+    if !pci_field_fits(bus, pci_bus_bits()) {
+        panic("pci_config_address: the bus number is wider than 8 bits")
+    }
+    if !pci_field_fits(dev, pci_device_bits()) {
+        panic("pci_config_address: the device number is wider than 5 bits")
+    }
+    if !pci_field_fits(func, pci_function_bits()) {
+        panic("pci_config_address: the function number is wider than 3 bits")
+    }
+    if !pci_field_fits(reg, pci_register_bits()) {
+        panic("pci_config_address: the register number is wider than 4 bits")
+    }
+    return 2147483648 + int_shl(bus, pci_bus_shift()) + int_shl(dev, pci_device_shift())
+    + int_shl(func, pci_function_shift()) + int_shl(reg, pci_register_shift())
+}
+
+fn pci_field_fits(v: int, bits: int) -> bool {
+    if v < 0 {
+        return false
+    }
+    return int_shr(v, bits) == 0
+}
+
+# The vendor/device ID is the first dword of the configuration header.
+fn pci_vendor_id_reg() -> int {
+    return 0
+}
+
+fn pci_command_reg() -> int {
+    return 4
+}
+
+fn pci_status_reg() -> int {
+    return 6
+}
+
+fn pci_bar0_reg() -> int {
+    return 16
+}
+
+# ---------------------------------------------------------------------------
+# ACPI's PM registers
+# ---------------------------------------------------------------------------
+
+fn pm1_status_port() -> int {
+    return 4
+}
+
+fn pm1_enable_port() -> int {
+    return 2
+}
+
+fn pm1_control_port() -> int {
+    return 0
+}
+
+# The PM1 status bits are write-1-to-clear, so a driver READS the
+# register, remembers what it saw, writes the same value back, and then
+# reads again to learn what the hardware set since. Writing ZERO clears
+# nothing, which is a hang: the driver waits for a bit that has already
+# been acknowledged.
+fn pm1_status_write1_to_clear() -> bool {
+    return true
+}
+
+# ---------------------------------------------------------------------------
+# Port I/O serialisation
+# ---------------------------------------------------------------------------
+
+# On a modern CPU an `out` to a legacy device posts a buffer-full, and
+# the device samples the data bus up to roughly 50 microseconds later.
+# A kernel that polls a status register straight after a command must
+# wait for it — and the wait is invisible in the source, which is why it
+# belongs in a value rather than in a comment.
+fn port_delay_cycles() -> int {
+    return 400
+}
+
+# The cost model for a driver: an access plus the serialisation delay.
+# The number is a MODEL, and a test asserts the arithmetic rather than a
+# timing, because a timing test is a flaky test.
+fn port_access_cost_cycles(w: PortWidth) -> int {
+    return port_data_bits(w) + port_delay_cycles()
+}

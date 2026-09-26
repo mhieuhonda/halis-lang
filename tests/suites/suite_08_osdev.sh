@@ -912,3 +912,55 @@ else
     bad "mmio: make mmio-acceptance failed"
     tail -15 "$TMP/mmio_acc87.log"
 fi
+
+echo "=== 25. Stage 88: core.port — x86 I/O ports ==="
+# Stage 88 (v0.107.0-alpha): `in`/`out` are one asm template, and a
+# sub-64 register is legal when the template's instruction is that
+# narrow. A port access is PRIVILEGED, so the demo declares the six
+# instructions and its main touches none of them; the gate
+# disassembly-checks the real ones. The gate is the authority.
+PORT_F=tests/ok/feat_stage88_port.hls
+port_interp=$(python3 boot/boot.py "$PORT_F" </dev/null 2>/dev/null); port_code=$?
+if [ "$port_code" -eq 0 ]; then
+    ok "port: feat_stage88_port runs on the interpreter (exit 0)"
+else
+    bad "port: feat_stage88_port interpreter exit=$port_code"
+fi
+if [ -f core/port.hls ] && grep -q "fn port_is_legal" core/port.hls; then
+    ok "port: core/port.hls present"
+else
+    bad "port: core/port.hls missing"
+fi
+# The six real port instructions, and the disassembly that proves it.
+if [ -x "$TMP/hlc1" ] && "$TMP/hlc1" examples/port_demo.hls "$TMP/portdemo.c" >/dev/null 2>&1 \
+    && gcc -O2 -Werror -ffreestanding -nostdlib -fno-pie -no-pie \
+        -ffunction-sections -fno-stack-protector -T link.ld \
+        -o "$TMP/portdemo.elf" "$TMP/portdemo.c" 2>/dev/null; then
+    pdis=$(objdump -d "$TMP/portdemo.elf" 2>/dev/null)
+    for want in "out    %al,(%dx)" "in     (%dx),%al" "out    %eax,(%dx)" "in     (%dx),%eax"; do
+        if echo "$pdis" | grep -qF "$want"; then
+            ok "port: the image contains $want"
+        else
+            bad "port: the image is missing $want"
+        fi
+    done
+    "$TMP/portdemo.elf" </dev/null >/dev/null 2>&1
+    if [ "$?" -eq 0 ]; then
+        ok "port: the demo image runs (its main touches no port)"
+    else
+        bad "port: the demo image failed"
+    fi
+else
+    bad "port: the demo image did not build"
+fi
+if make port-acceptance >"$TMP/port_acc88.log" 2>&1; then
+    if grep -q "ACCEPTANCE OK: Stage 88" "$TMP/port_acc88.log"; then
+        ok "port: make port-acceptance runs end-to-end"
+    else
+        bad "port: make port-acceptance did not print ACCEPTANCE OK"
+        tail -5 "$TMP/port_acc88.log"
+    fi
+else
+    bad "port: make port-acceptance failed"
+    tail -15 "$TMP/port_acc88.log"
+fi

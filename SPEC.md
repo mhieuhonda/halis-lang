@@ -4130,3 +4130,128 @@ tables, and the LAPIC map.
 demonstrates that a volatile device read is not folded (two `rdtsc`
 reads with a million iterations between them), the four checked
 constructors panic at run time, and `hlfmt`/`hllint` stay clean.
+
+---
+
+## 42. `core.port` — typesafe x86 I/O ports (Stage 88 — v0.107.0-alpha)
+
+A port number is a 16-bit quantity, the data is 8, 16 or 32 bits, and
+`outb %al, %dx` moves one through the other. The language half of
+Stage 88 is therefore not a new type but a relaxation with a proof: a
+sub-64 register may bind an `int` operand **when the template's
+instruction is that narrow**, and the two widths one port instruction
+needs each get their own carrier.
+
+### 42.1. The carrier rule
+
+```halis
+fn out8(p: int, v: int) -> void {
+    asm!("outb {0}, {1}", in("a") v, in("dx") p)
+    return
+}
+
+fn in8(p: int) -> int {
+    let mut v: int = 0
+    asm!("inb {1}, {0}", out("al") v, in("dx") p)
+    return v
+}
+```
+
+The first operand is a **letter** constraint: its width cannot come
+from the letter (`"a"` is the whole accumulator family), so it comes
+from the template's `b` suffix and the codegen casts the C operand to
+`int8_t`. GCC then prints `%al`. The second operand is a **named**
+register: `dx` says its own width, and the codegen gives it an
+`int16_t` register variable so GCC prints `%dx`. A single carrier type
+cannot express both, which is exactly why the rule is per-operand.
+
+The output is a named **sub-register** (`out("al")`), because there is
+no constraint letter for AL: a register *variable* of type `int8_t`
+named `al` carries the value, the asm uses `"=r"`, and the writeback
+restores the 64-bit binding.
+
+What stays rejected: a **64-bit instruction on a narrow register**.
+`movq` with `eax` binds `%rax` under a letter constraint and silently
+truncates — that is Stage 83's bug, and relaxing the rule this far did
+not touch it.
+
+The disassembly is the proof, and the gate checks it:
+
+```
+ee      out    %al,(%dx)
+ec      in     (%dx),%al
+66 ef   out    %ax,(%dx)
+66 ed   in     (%dx),%ax
+ef      out    %eax,(%dx)
+ed      in     (%dx),%eax
+```
+
+### 42.2. The image runs, and cannot touch a port
+
+A port access is **privileged**. An image run by a host with IOPL clear
+faults on the first `in` or `out` whether it reads or writes — which is
+correct hardware behaviour, and the reason `examples/port_demo.hls`
+declares the six instructions and calls none of them from `main`. The
+demo runs its 46 model assertions; the gate disassembly-checks the real
+instructions. That is the same shape as the Stage 83 demo: the stub is
+declared, checked and lowered, and the thing that runs is the part that
+is safe to run.
+
+### 42.3. `core/port.hls` — the port map
+
+Pure HLS, one `core` import, no effects. The half a driver actually
+gets wrong:
+
+* **A port number is 16 bits.** `port_is_legal` bounds it, and
+  `port_has_immediate` / `port_imm_ok` record that the 8-bit *immediate*
+  form — `outb %al, %imm8` — is a different encoding of the same
+  instruction and exists only below 256. Mixing the two is how a driver
+  talks to a port that does not exist.
+* **The data width is the template's suffix**, and an 8-bit `inb` puts
+  its byte in AL and **leaves the rest of the accumulator alone** — so
+  `port_read` is that mask written as a function, and `port_write` is
+  its dual (truncation is the device's business, not the driver's).
+* **The 8259 PIC.** `pic_icw1` (0x11: begin the init sequence, ICW4
+  expected), `pic_icw4_8086` — the bit a PIC left clear does not
+  deliver an interrupt to a protected-mode kernel, and the machine runs
+  until something else faults. `pic_ocw2_eoi` is the bare 0x20, because
+  a non-specific EOI is a control word with no other bits set. And
+  `pic_eoi_order_is_slave_first`: for IRQ 8..15 the **slave's** EOI
+  goes first, then the master's. Master-first is the classic mistake,
+  and the symptom is an interrupt that occasionally never retires.
+* **The 8253/8254 PIT.** `pit_divisor` is the reload for a frequency
+  from the fixed 1193182 Hz input, and a divisor of **0 means 65536** —
+  the counter is 16-bit and wraps, which every "my timer runs 256 times
+  too fast" bug has to know. The two bytes go **low first**; that is not
+  a convention.
+* **PCI.** The address port (0xCF8) and the data port (0xCFC) are both
+  32-bit, while the bus is 8 bits, the device 5, the function 3 and the
+  register 4. `pci_config_address` packs them, and `pci_field_fits`
+  refuses a field wider than its field — the check that catches an
+  8-bit computation silently wrapping into a different device. Each
+  field must also be **masked** before it is compared, because a bare
+  shift reads the enable bit above it too.
+* **ACPI PM1 status is write-1-to-clear.** Writing zero clears nothing,
+  and a driver that does that waits forever for a bit it has already
+  acknowledged. The rule is `pm1_status_write1_to_clear() == true`
+  because the failure mode is a hang, not a wrong number.
+* **The serialisation delay.** On a modern CPU an `out` to a legacy
+  device posts a buffer-full, and the device samples the data bus up
+  to ~50 microseconds later; a driver that polls a status register
+  straight after a command must wait, and the wait is invisible in the
+  source. `port_delay_cycles` and `port_access_cost_cycles` make it a
+  **value** — and a MODEL, so a test asserts the arithmetic rather than
+  a timing, because a timing test is a flaky test.
+
+### 42.4. What the tests prove
+
+`tests/ok/feat_stage88_port.hls` runs the model on the interpreter AND
+as a native binary (hosted and `-nostdlib`).
+
+`make port-acceptance` (7 sections) proves the pattern: both port forms
+compile, the two widths of one instruction get two carriers, the 8-bit
+output is an `int8_t` register variable named `al`, a 64-bit template
+on a narrow register is still rejected, the demo's six instructions
+link `-Werror` and the disassembly really contains all six, `main`
+issues no port access at all, the demo image runs, and five behaviour
+probes pass on all three execution paths.
