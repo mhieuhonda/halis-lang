@@ -3438,3 +3438,152 @@ runs `DEMO OK` with the register-variable lowering visible in the
 emitted C (`__asm__("r10")`, `"+a"` on the syscall stub, explicit
 clobber lists); and `--audit` reports every `core.asm` function
 pure. Bootstrap self-compilation remains byte-identical.
+
+---
+
+## 38. Linker-script integration + custom sections (Stage 84 — v0.103.0-alpha)
+
+A kernel is not just code: it is a *placement*. The boot stub has to
+sit where the firmware will jump, the hot ISR path wants its own cache
+line, the device window must be non-executable, and the image needs a
+`.bss` the loader knows to zero. The Halis C backend already emits
+`__attribute__((section(...)))`; Stage 84 lets a Halis program *say
+so*, and — the part that actually matters — proves the linker will
+honour it.
+
+### 38.1. `#[section("NAME")]` and `#[align(N)]`
+
+```halis
+#![freestanding]
+#![link_script("link.ld")]
+
+#[section(".text.boot_stub")]
+#[align(4096)]
+fn boot_stub() -> int { ... }          # the firmware jumps here
+
+#[section(".text.isr_stub")]
+fn isr_stub(frame: list[int]) -> void { ... }   # IRET-compatible
+
+#[section(".device.rng")]
+fn rng_read() -> int { ... }            # mapped NX, page-aligned
+```
+
+The lowering is one C attribute, on the prototype and the definition:
+
+```c
+__attribute__((aligned(4096))) __attribute__((section(".text.boot_stub"), used)) int64_t usf_boot_stub(void);
+```
+
+`used` is load-bearing, not decoration. A function parked in a section
+of its own is usually one nothing in the image *calls* yet — a boot
+stub, a trap handler, a cold path only hardware reaches — and
+`--gc-sections` (which every freestanding link in this repo uses)
+would drop exactly the code the author went out of their way to place.
+
+**The name rules.** A section name is 1..=64 bytes; the first byte is
+`.`, `_` or a letter; the rest are letters, digits, `.`, `_`, `$`; `..`
+is rejected; and the six compiler-owned output sections (`.text`,
+`.rodata`, `.data`, `.bss`, `.halis.metadata`, `.halis.sections`) may
+not be named. The character class is deliberately tiny: it makes the
+name safe to splice into a C string literal — no quote, no backslash,
+no newline, no control byte — and safe to hand to a linker as an
+input-section wildcard. A digit may not lead, because `0text` reads as
+a linker expression rather than a section name.
+
+**The alignment rules.** `#[align(N)]` takes a power of two in
+`1..=65536`, once per function. gcc's `aligned` attribute silently
+*rounds* a non-power-of-two up, so accepting one would place the
+function at an alignment the author never asked for. The rule is
+stated, not approximated.
+
+**Conflicts.** `#[section]` and `#[inline(always)]` are mutually
+exclusive in either order — an always-inlined function emits no body to
+place. A second `#[section]` or a second `#[align]` on one function is
+a merge mistake, not a second placement. The argument must be a string
+*LITERAL*: the linker needs the name long before any runtime value
+exists, so a computed name is meaningless rather than merely
+unsupported at run time.
+
+### 38.2. `#![link_script("link.ld")]` — and what it proves
+
+Naming the script turns two silent failures into compile errors:
+
+1. **A section the script never places.** `ld` treats the function as
+   an orphan input section, parks it at an address the author never
+   asked for, or — with `--gc-sections` and no `KEEP` — drops it.
+2. **A script that is not there**, or has no `SECTIONS` block, so the
+   whole `-T script` link silently does not happen.
+
+The path resolves relative to the *entry file's* directory, not the
+process cwd. The compiler reads the script at check time, extracts
+every output-section name and every input-section pattern inside its
+`SECTIONS` block, and requires each `#[section]` to be covered under
+GNU ld's matching rule: a pattern ending in `*` matches by **prefix**,
+anything else matches exactly. So `KEEP(*(.text .text.*))` covers
+`.text.boot_stub` and `.text.isr_stub`; an output section named
+`.device` covers `.device` but not `.device.rng`.
+
+```halis
+#[section(".elsewhere.thing")] on function 'elsewhere' is not placed
+by the linker script place.ld — the linker would discard the function.
+Add an output section that matches it (e.g. `.elsewhere.thing : {
+KEEP(*(.elsewhere.thing)) }`).
+```
+
+Without `#![link_script]` the attribute is still emitted and a
+`#[section]` still works — the placement is simply gcc's default
+script's, not yours. `--audit` says which of the two you have.
+
+### 38.3. The `core.section` module
+
+The rules above, plus the layout arithmetic, as values a kernel author
+can call at build time (`core/section.hls`, pure, `no_std`- and
+freestanding-clean):
+
+| Surface | What it answers |
+|---|---|
+| `section_check` / `section_check_why` | the `#[section]` name verdict, as a stable `SectionFault` lattice (None/Empty/TooLong/BadStart/BadChar/DoubleDot/Reserved) — the compilers reject the same inputs with the same reasons |
+| `section_align_ok` | the `#[align(N)]` rule |
+| `section_kind` + `section_kind_{has_bytes,writable,executable}` | what a name implies about page flags: `.text.boot` is executable and never writable; `.bss` occupies a real VMA but contributes no file bytes |
+| `parse_link_script` | the output sections of a script, in order, with their `ALIGN`, `(NOLOAD)`, pinned address and input patterns |
+| `script_covers` / `script_placed_patterns` | which output section swallows a given input section |
+| `layout_image` | the placement solver: honour `ALIGN`, jump to a pinned `. = addr`, advance the counter, and return `Err(Overlap)` when two sections claim the same bytes |
+| `layout_load_end` / `layout_file_bytes` | what the image costs, versus where the loadable part ends |
+| `layout_contains` / `layout_section_at` | "is this pointer inside my image, and in which section" — the check a kernel makes before honouring one a bootloader handed it |
+| `layout_render` | an `ld -Map`-shaped report |
+
+Two properties worth stating. First, a `NOLOAD` section may share
+bytes with its neighbour on purpose — a guard page is carved out of the
+space after `.bss` — so the overlap check only compares file-bearing
+sections. Second, the scanner is **comment-aware in place**, not
+strip-then-scan: HLS strings are immutable, so building a second copy
+by appending one character at a time copies the whole prefix each time
+and reading a 1-KiB script that way allocates on the order of a
+megabyte — more than the entire 1-MiB freestanding bump arena. A
+kernel author reading its own script in early boot would trap.
+
+The compilers carry the same reader: `boot/linkerscript.py` for Stage-0
+and `src/hlc/linkerscript.hls` for the self-hosted compiler, both
+answering "is this section placed?" identically.
+
+### 38.4. What the tests prove
+
+`tests/ok/feat_stage84_section.hls` runs 114 numbered assertions on the
+interpreter AND as a native binary (hosted and `-nostdlib`): the whole
+name/alignment validator including the 64-byte boundary, the section
+kinds and their flag predicates, the script reader (order, `ALIGN`,
+`(NOLOAD)`, a pinned address, input patterns, comments, an unterminated
+comment, a script with no `SECTIONS`), GNU ld prefix matching, the
+placement solver including a pinned jump and a 4-KiB `ALIGN` round-up,
+and every fault it can report (`Overlap`, `BadAlign`, `NegativeSize`).
+
+`make link-acceptance` (7 sections) proves the enforcement paths: both
+compilers reject all 13 fail programs with *byte-identical*
+diagnostics; the C carries `section(..., used)` and `aligned(N)` on
+both the prototype and the definition and still links `-Werror`; a
+covered `#[section]` compiles, links and runs under the shipped
+`link.ld`; the freestanding reader links `-nostdlib` inside the 1-MiB
+arena; `hlfmt` round-trips both attributes and `hllint` stays clean;
+and `--audit` / `--opt-stats` report the script, the named sections and
+the annotation counts. Bootstrap self-compilation remains
+byte-identical.

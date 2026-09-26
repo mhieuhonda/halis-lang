@@ -3,6 +3,7 @@ boot/checker.py Checker class (lines 699..1045), split for
 maintainability. The final Checker class assembles all mixins in
 boot/checking/checker.py - behavior is unchanged."""
 from ..lexer import HLError
+from .. import linkerscript
 from .helpers import (
     BUILTIN_FNS, chan_inner, future_inner, is_chan, is_future, is_list, is_map, is_stream,
     is_taint, is_task, list_elem, map_val, stream_inner, taint_inner, task_inner, type_args,
@@ -246,6 +247,12 @@ class CheckerCore(object):
         # boot↔hlc parity gap (boot used to parse the attribute and
         # silently ignore the bound).
         self.check_stack_size_attrs()
+        # 2.8 Stage 84 (v0.103.0-alpha): linker-script integration. The
+        # `#[section("X")]` attributes are validated on the AST only,
+        # and the `#![link_script("...")]` attribute (if present) is
+        # read from disk and every section the program names must be
+        # placed by the script's SECTIONS block.
+        self.check_link_script()
         # 3. check function bodies
         for key, fn in self.fns.items():
             self.check_fn(key, fn)
@@ -484,6 +491,75 @@ class CheckerCore(object):
                     "too many locals or nests too many call sites for the "
                     "bound). Reduce locals or raise the bound."
                     % (sa, fn["name"], est), fn)
+
+    # ---------- Stage 84 (v0.103.0-alpha): linker-script integration ------
+    # A `#[section("X")]` attribute names an output section the LINKER
+    # must place. Two failure modes are silent without a check:
+    #   1. the named section is never placed by the script — the linker
+    #      discards the function (or parks it in an orphan section at an
+    #      address the author never asked for), and
+    #   2. `#![link_script("...")]` names a file that is not there, so
+    #      the whole `-T script` link silently does not happen.
+    # This pass turns both into compile errors. It runs on the AST only
+    # (attributes + the crate attribute), so it costs nothing and needs
+    # no types.
+    def check_link_script(self):
+        import os as _os
+        sections = []
+        for key in sorted(self.fns):
+            fn = self.fns[key]
+            sec = fn.get("attrs", {}).get("section", "")
+            if sec:
+                sections.append((sec, fn))
+        script_attr = None
+        for a in self.p.get("crate_attrs", []):
+            if a.get("name") == "link_script":
+                script_attr = a
+        # Published for --audit: {"path", "placed", "named"}.
+        self.link_script_info = None
+        if script_attr is not None:
+            raw = script_attr.get("value") or ""
+            base = self.p.get("entry_dir", "")
+            path = raw if _os.path.isabs(raw) else _os.path.join(base, raw)
+            try:
+                with open(path, "rb") as fh:
+                    text = fh.read().decode("utf-8", "replace")
+            except OSError:
+                self.err("crate #![link_script(\"%s\")]: cannot read the "
+                         "linker script (resolved to %s)"
+                         % (raw, path),
+                         {"line": script_attr.get("line", 0)})
+            # Comment-aware: a "SECTIONS" mentioned inside a comment is
+            # not a SECTIONS block (the Stage-0 twin in boot/linkerscript.py
+            # and the self-hosted ls_sections_have_block agree).
+            if linkerscript.sections_block(text) is None:
+                self.err("crate #![link_script(\"%s\")]: the script has no "
+                         "SECTIONS block — a Halis image must describe its "
+                         "output section layout explicitly" % raw,
+                         # No column: a crate attribute is a whole-item
+                         # diagnostic, and the self-hosted compiler has
+                         # no column for one either.
+                         {"line": script_attr.get("line", 0)})
+            placed = linkerscript.placed_patterns(text)
+            for sec, fn in sections:
+                if not linkerscript.covers(placed, sec):
+                    self.err(
+                        "#[section(\"%s\")] on function '%s' is not placed by "
+                        "the linker script %s — the linker would discard the "
+                        "function. Add an output section that matches it "
+                        "(e.g. `%s : { KEEP(*(%s)) }`)."
+                        % (sec, fn["name"], raw, sec, sec), fn)
+            self.link_script_info = {
+                "path": path, "named": len(sections),
+                "placed": len(placed),
+            }
+        elif sections:
+            # Without a script the names are still emitted (gcc accepts
+            # `__attribute__((section))` with its default linker script),
+            # so this is not an error — but the author should know the
+            # placement is then gcc's, not theirs.
+            self.link_script_info = {"path": "", "named": len(sections),
+                                     "placed": 0}
 
     def check_stack_budget(self):
         for a in self.p.get("crate_attrs", []):

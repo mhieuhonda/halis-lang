@@ -139,7 +139,7 @@ remains green.
 | 81 | Panic-handler override (kernel panic strategy) | ✅ | (done in v0.100.0-alpha) |
 | 82 | Stack-overflow guard page + deterministic stack size | ✅ | (done in v0.101.0-alpha) |
 | 83 | Inline-asm register constraints (clobber, input, output) | ✅ | (done in v0.102.0-alpha) |
-| 84 | Linker-script integration (`link.ld`) + custom sections | ⬜ | 4 weeks |
+| 84 | Linker-script integration (`link.ld`) + custom sections | ✅ | (done in v0.103.0-alpha) |
 | 85 | Multiboot2 + Limine-compliant boot protocol headers | ⬜ | 4 weeks |
 | 86 | `core.interrupt` — IDT/GDT declaration syntax | ⬜ | 6 weeks |
 | 87 | `core.mmio` — memory-mapped-IO helpers (volatile reads/writes) | ⬜ | 3 weeks |

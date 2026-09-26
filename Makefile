@@ -31,7 +31,7 @@ else
   HL_CURL_DEFS :=
 endif
 
-.PHONY: all stage0 bootstrap test examples clean run check bench install uninstall audit opt-stats emit-ir emit-llvm fmt lint lsp-check pkg-init pkg-add pkg-lock pkg-audit pkg-verify pkg-build pkg-publish pkg-log pkg-log-verify prove prove-full model prove-acceptance hltest fuzz cov fuzz-acceptance wasm-opt webapp webapp-acceptance serve serve-acceptance wasm-pack wasm-pack-check wasm-pack-pack wasm-pack-acceptance aarch64-bench aarch64-acceptance aarch64-list-targets stack-acceptance inline-acceptance opt-stats-report kernel-attrs escape-acceptance layout-report tail-acceptance tail-report asm-acceptance asm-attrs bench-stdlib spec-check stage32-acceptance async-acceptance stream-acceptance io-acceptance fs-acceptance net-acceptance http-acceptance http2-acceptance json-stream-acceptance regex-acceptance fmt-acceptance hash-acceptance collections-acceptance sync-acceptance thread-acceptance time-acceptance math-acceptance process-acceptance env-acceptance archive-acceptance uuid-ulid-acceptance cli-acceptance tui-acceptance color-acceptance progress-acceptance log-acceptance http-server-acceptance websocket-acceptance cookie-acceptance session-acceptance csrf-acceptance template-acceptance sse-acceptance graphql-acceptance openapi-acceptance jsffi-acceptance dom-acceptance freestanding freestanding-check freestanding-acceptance nostd nostd-acceptance alloc-acceptance mem-acceptance panic-acceptance stackguard-acceptance asmreg-acceptance
+.PHONY: all stage0 bootstrap test examples clean run check bench install uninstall audit opt-stats emit-ir emit-llvm fmt lint lsp-check pkg-init pkg-add pkg-lock pkg-audit pkg-verify pkg-build pkg-publish pkg-log pkg-log-verify prove prove-full model prove-acceptance hltest fuzz cov fuzz-acceptance wasm-opt webapp webapp-acceptance serve serve-acceptance wasm-pack wasm-pack-check wasm-pack-pack wasm-pack-acceptance aarch64-bench aarch64-acceptance aarch64-list-targets stack-acceptance inline-acceptance opt-stats-report kernel-attrs escape-acceptance layout-report tail-acceptance tail-report asm-acceptance asm-attrs bench-stdlib spec-check stage32-acceptance async-acceptance stream-acceptance io-acceptance fs-acceptance net-acceptance http-acceptance http2-acceptance json-stream-acceptance regex-acceptance fmt-acceptance hash-acceptance collections-acceptance sync-acceptance thread-acceptance time-acceptance math-acceptance process-acceptance env-acceptance archive-acceptance uuid-ulid-acceptance cli-acceptance tui-acceptance color-acceptance progress-acceptance log-acceptance http-server-acceptance websocket-acceptance cookie-acceptance session-acceptance csrf-acceptance template-acceptance sse-acceptance graphql-acceptance openapi-acceptance jsffi-acceptance dom-acceptance freestanding freestanding-check freestanding-acceptance nostd nostd-acceptance alloc-acceptance mem-acceptance panic-acceptance stackguard-acceptance asmreg-acceptance link-acceptance test-linker
 
 # Main goal: use the full bootstrap chain to build the native compiler
 all: bootstrap
@@ -110,27 +110,3 @@ lsp-check:
 # Section targets live in mk/ (included in original section order,
 # so this Makefile parses exactly like the former single-file version).
 include mk/20-testing.mk mk/30-lto.mk mk/40-backends.mk mk/50-pkg-contracts.mk mk/60-advanced.mk mk/70-stdlib-core.mk mk/80-stdlib.mk mk/90-stdlib-late.mk mk/95-osdev.mk
-
-
-
-# Stage 84: linker-script integration and custom sections
-LINKER_SCRIPT ?= link.ld
-LINKER_TEST_SRC ?= tests/stage84_linker_sections.c
-LINKER_TEST_OBJ ?= build/stage84-linker-test.o
-LINKER_TEST_BIN ?= build/stage84-linker-test.elf
-LINKER_TEST_CC ?= $(CC)
-LINKER_TEST_LD ?= $(LD)
-LINKER_TEST_NM ?= $(NM)
-
-.PHONY: test-linker
-test-linker: $(LINKER_TEST_BIN)
-	@$(LINKER_TEST_NM) $(LINKER_TEST_BIN) | grep -q '__halis_metadata_start' && \
-	 $(LINKER_TEST_NM) $(LINKER_TEST_BIN) | grep -q '__halis_sections_start' && \
-	 $(LINKER_TEST_NM) $(LINKER_TEST_BIN) | grep -q '__halis_sections_end'
-
-$(LINKER_TEST_OBJ): $(LINKER_TEST_SRC) $(LINKER_SCRIPT)
-	@mkdir -p $(dir $@)
-	$(LINKER_TEST_CC) $(CPPFLAGS) $(CFLAGS) -ffreestanding -fno-pie -c $< -o $@
-
-$(LINKER_TEST_BIN): $(LINKER_TEST_OBJ) $(LINKER_SCRIPT)
-	$(LINKER_TEST_LD) -T $(LINKER_SCRIPT) -o $@ $<

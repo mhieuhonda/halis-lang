@@ -268,6 +268,9 @@ fn reset_cur_attrs(ctx: Ctx) -> void {
     ctx.cur_attrs_tail_call = false
     # Stage 81 (v0.100.0-alpha): reset the panic-handler attribute too.
     ctx.cur_attrs_panic_handler = false
+    # Stage 84 (v0.103.0-alpha): reset the custom-section attributes.
+    ctx.cur_attrs_section = ""
+    ctx.cur_attrs_align = -1
     # Stage 30: let-binding attrs are reset by parse_let itself (they
     # apply to exactly one statement); also clear here for belt-and-
     # braces so no state leaks between declarations.
@@ -322,6 +325,11 @@ fn parse_attributes(ctx: Ctx) -> void {
                 # parsed first catches the conflict here).
                 if mode == "always" && ctx.cur_attrs_tail_call {
                     perr_at(ctx, "'tail_call' and 'inline(always)' are mutually exclusive (a tail-call loop cannot also be inlined at every call site)", hash_tok)
+                }
+                # Stage 84: the same contradiction with #[section] — an
+                # always-inlined function emits no body to place.
+                if mode == "always" && ctx.cur_attrs_section != "" {
+                    perr_at(ctx, "'section' and 'inline(always)' are mutually exclusive (an always-inlined function emits no body to place in a section)", hash_tok)
                 }
                 ctx.cur_attrs_inline = mode
             } else if attr_name == "hot" {
@@ -382,6 +390,48 @@ fn parse_attributes(ctx: Ctx) -> void {
                 # If multiple stack_size attrs appear, the LAST wins
                 # (the user's intent is to refine; we don't accumulate).
                 ctx.cur_attrs_stack_size = n
+            } else if attr_name == "section" {
+                # Stage 84 (v0.103.0-alpha): place this fn's code in a
+                # named output section. The argument MUST be a string
+                # LITERAL — the section name is needed by the linker,
+                # long before any runtime value exists, so a computed
+                # name is meaningless rather than merely unsupported.
+                if ctx.cur_attrs_section != "" {
+                    perr_at(ctx, "section attribute appears more than once on one function (was \"" + ctx.cur_attrs_section + "\", now ... — a function has exactly one output section)", hash_tok)
+                }
+                eat_sym(ctx, "(")
+                let st: Tok = ctx.toks.get(ctx.pos)
+                if st.kind != "str" {
+                    perr_at(ctx, "section expects a string literal section name but got " + tok_desc(ctx), st)
+                }
+                ctx.pos = ctx.pos + 1
+                eat_sym(ctx, ")")
+                let why: str = check_section_name(st.value)
+                if why != "" {
+                    perr_at(ctx, "invalid #[section] name: " + why, st)
+                }
+                if ctx.cur_attrs_inline == "always" {
+                    perr_at(ctx, "'section' and 'inline(always)' are mutually exclusive (an always-inlined function emits no body to place in a section)", hash_tok)
+                }
+                ctx.cur_attrs_section = st.value
+            } else if attr_name == "align" {
+                # Stage 84: align the function's entry to N bytes.
+                if ctx.cur_attrs_align >= 0 {
+                    perr_at(ctx, "align attribute appears more than once on one function (was " + ctx.cur_attrs_align.to_str() + ")", hash_tok)
+                }
+                eat_sym(ctx, "(")
+                let nt: Tok = ctx.toks.get(ctx.pos)
+                if nt.kind != "int" {
+                    perr_at(ctx, "align expects an integer byte count but got " + tok_desc(ctx), nt)
+                }
+                ctx.pos = ctx.pos + 1
+                let n: int = int(nt.value)
+                eat_sym(ctx, ")")
+                let why: str = check_section_align(n)
+                if why != "" {
+                    perr_at(ctx, "invalid #[align] value: " + why, nt)
+                }
+                ctx.cur_attrs_align = n
             } else if attr_name == "stack" || attr_name == "boxed" {
                 # Stage 30 (v0.47.0-alpha): #[stack] / #[boxed] are
                 # LET-BINDING attributes (they control the boxed-vs-stack
@@ -390,7 +440,7 @@ fn parse_attributes(ctx: Ctx) -> void {
                 # them at the let statement form.
                 perr_at(ctx, "'" + attr_name + "' is a let-binding attribute — place it inside a function, directly before a 'let' statement (e.g. #[" + attr_name + "] let xs: list[int] = [1, 2, 3])", hash_tok)
             } else {
-                perr_at(ctx, "unknown attribute '" + attr_name + "' (known: inline(always), inline(never), hot, cold, no_red_zone, irq_handler, stack_size(N), tail_call, panic_handler)", hash_tok)
+                perr_at(ctx, "unknown attribute '" + attr_name + "' (known: inline(always), inline(never), hot, cold, no_red_zone, irq_handler, stack_size(N), tail_call, panic_handler, section(\"NAME\"), align(N))", hash_tok)
             }
             if at_sym(ctx, ",") {
                 ctx.pos = ctx.pos + 1
@@ -481,8 +531,9 @@ fn parse_program(ctx: Ctx) -> void {
 # Only valid before any item of the ENTRY file (ctx.crate_attrs_done
 # is set after the entry parse — dependencies are rejected), never
 # duplicated. Known names: `freestanding` (implies `no_std`),
-# `no_std`, and — Stage 82 (v0.101.0-alpha) — `stack_size(N)`, the
-# deterministic stack budget in bytes.
+# `no_std`, — Stage 82 (v0.101.0-alpha) — `stack_size(N)`, the
+# deterministic stack budget in bytes, and — Stage 84 (v0.103.0-alpha) —
+# `link_script("link.ld")`, the linker script that places the image.
 fn parse_crate_attr(ctx: Ctx) -> void {
     let hash_tok: Tok = ctx.toks.get(ctx.pos)
     eat_sym(ctx, "#")
@@ -492,8 +543,8 @@ fn parse_crate_attr(ctx: Ctx) -> void {
     }
     eat_sym(ctx, "[")
     let name: str = eat_ident(ctx)
-    if name != "freestanding" && name != "no_std" && name != "stack_size" {
-        perr_at(ctx, "unknown crate attribute '" + name + "' (known: freestanding, no_std, stack_size)", hash_tok)
+    if name != "freestanding" && name != "no_std" && name != "stack_size" && name != "link_script" {
+        perr_at(ctx, "unknown crate attribute '" + name + "' (known: freestanding, no_std, stack_size, link_script)", hash_tok)
     }
     if name == "freestanding" {
         if ctx.crate_freestanding {
@@ -512,6 +563,26 @@ fn parse_crate_attr(ctx: Ctx) -> void {
         eat_sym(ctx, "]")
         ctx.crate_seen_nostd = true
         ctx.crate_no_std = true
+    } else if name == "link_script" {
+        # Stage 84: `#![link_script("link.ld")]` — the path is part of
+        # the attribute. The path is resolved relative to the entry
+        # file's directory by the checker (mirrors boot/parser.py).
+        if ctx.crate_link_script != "" {
+            perr_at(ctx, "duplicate crate attribute '#![link_script]'", hash_tok)
+        }
+        eat_sym(ctx, "(")
+        let pt: Tok = ctx.toks.get(ctx.pos)
+        if pt.kind != "str" {
+            perr_at(ctx, "link_script expects a string path but got " + tok_desc(ctx), pt)
+        }
+        ctx.pos = ctx.pos + 1
+        if pt.value == "" {
+            perr_at(ctx, "link_script path is empty", pt)
+        }
+        eat_sym(ctx, ")")
+        eat_sym(ctx, "]")
+        ctx.crate_link_script = pt.value
+        ctx.crate_link_script_line = hash_tok.line
     } else {
         # Stage 82: `#![stack_size(N)]` — the byte count is part of
         # the attribute. Requiring the parentheses keeps the bare-word
@@ -774,7 +845,10 @@ fn parse_fn(ctx: Ctx, impl_struct: str) -> FnInfo {
         attr_hot: ctx.cur_attrs_hot,
         attr_cold: ctx.cur_attrs_cold,
         attr_tail_call: ctx.cur_attrs_tail_call,
-        attr_panic_handler: ctx.cur_attrs_panic_handler
+        attr_panic_handler: ctx.cur_attrs_panic_handler,
+        # Stage 84: the custom-section attributes.
+        attr_section: ctx.cur_attrs_section,
+        attr_align: ctx.cur_attrs_align
     }
 }
 
@@ -938,7 +1012,8 @@ fn parse_extern_block(ctx: Ctx) -> void {
             requires_e: contracts_ext.get(0), ensures_e: contracts_ext.get(1),
             attr_stack_size: -1, attr_no_red_zone: false, attr_irq_handler: false,
             attr_inline: "", attr_hot: false, attr_cold: false,
-            attr_tail_call: false, attr_panic_handler: false
+            attr_tail_call: false, attr_panic_handler: false,
+            attr_section: "", attr_align: -1
         })
         ctx.fn_order.push(name)
     }

@@ -1969,6 +1969,52 @@ fn tail_check_fn(ctx: Ctx, key: str) -> void {
     ctx.tail_sites.set(key, sites)
 }
 
+# check_link_script (Stage 84, v0.103.0-alpha): linker-script
+# integration. A `#[section("X")]` names an output section the LINKER
+# must place, and two failure modes are silent without a check:
+#
+#   1. the named section is never placed by the script — the linker
+#      treats the function as an orphan input section, parks it at an
+#      address the author never asked for, or (with --gc-sections and
+#      no KEEP) drops it entirely;
+#   2. `#![link_script("...")]` names a file that is not there, so the
+#      whole `-T script` link silently does not happen.
+#
+# This pass turns both into compile errors. It runs on the AST only
+# (attributes + the crate attribute), so it costs nothing and needs no
+# types. The Stage-0 twin is boot/checking/core.py:check_link_script.
+fn check_link_script(ctx: Ctx) -> void uses Fs {
+    if ctx.crate_link_script == "" {
+        # No script declared: gcc's default placement applies. The
+        # #[section] attribute is still emitted, so a section lands
+        # wherever the default linker script puts it — legal, just not
+        # the author's chosen layout.
+        return
+    }
+    let raw: str = ctx.crate_link_script
+    let mut path: str = raw
+    if !raw.starts_with("/") {
+        path = join_path(ctx.entry_dir, raw)
+    }
+    if !file_exists(path) {
+        cerr(ctx.crate_link_script_line, "crate #![link_script(\"" + raw + "\")]: cannot read the linker script (resolved to " + path + ")")
+    }
+    let text: str = read_file(path)
+    if !ls_sections_have_block(text) {
+        cerr(ctx.crate_link_script_line, "crate #![link_script(\"" + raw + "\")]: the script has no SECTIONS block — a Halis image must describe its output section layout explicitly")
+    }
+    ctx.link_script_patterns = ls_placed_patterns(text)
+    let mut i: int = 0
+    while i < ctx.fn_order.len() {
+        let key: str = ctx.fn_order.get(i)
+        let f: FnInfo = ctx.fns.get_or(key, dummy_fn())
+        if f.attr_section != "" && !ls_covers(ctx.link_script_patterns, f.attr_section) {
+            cerr(f.line, "#[section(\"" + f.attr_section + "\")] on function '" + f.name + "' is not placed by the linker script " + raw + " — the linker would discard the function. Add an output section that matches it (e.g. `" + f.attr_section + " : { KEEP(*(" + f.attr_section + ")) }`).")
+        }
+        i = i + 1
+    }
+}
+
 # check_crate_modes (Stage 77, v0.96.0-alpha): enforce the
 # `#![freestanding]` / `#![no_std]` whole-program boundaries. The
 # module boundary (`std` banned), the host boundary (`extern`
@@ -2015,7 +2061,7 @@ fn check_crate_modes(ctx: Ctx) -> void {
     }
 }
 
-fn check_program(ctx: Ctx) -> void {
+fn check_program(ctx: Ctx) -> void uses Fs {
     # 1. struct: field types
     let keys_s: list[str] = ctx.structs.keys()
     let mut si: int = 0
@@ -2212,6 +2258,11 @@ fn check_program(ctx: Ctx) -> void {
     # enforcement runs BEFORE the bodies are checked so violations
     # report the mode-specific message (mirrors the Stage-0 order).
     check_crate_modes(ctx)
+    # 4.6 Stage 84 (v0.103.0-alpha): linker-script integration. Runs on
+    # the AST only (the #[section] attributes + the crate attribute) and
+    # before the bodies, so a misplaced section reports before any
+    # body-level error in the function that carries it.
+    check_link_script(ctx)
     # 5. check function bodies
     let mut bi: int = 0
     while bi < ctx.fn_order.len() {
@@ -2442,6 +2493,7 @@ fn dummy_fn() -> FnInfo {
         requires_e: -1, ensures_e: -1,
         attr_stack_size: -1, attr_no_red_zone: false, attr_irq_handler: false,
         attr_inline: "", attr_hot: false, attr_cold: false,
-        attr_tail_call: false, attr_panic_handler: false
+        attr_tail_call: false, attr_panic_handler: false,
+        attr_section: "", attr_align: -1
     }
 }

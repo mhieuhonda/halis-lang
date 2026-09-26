@@ -46,6 +46,13 @@ class HLError(Exception):
         self.col = col
 
     def __str__(self):
+        # The self-hosted compiler prints `(line N)` when a diagnostic
+        # has no column (a whole-item error such as a #[section] the
+        # linker script does not place, which is reported against the
+        # function, not a token). Match that shape so the two
+        # front-ends produce byte-identical text for the same defect.
+        if self.col <= 0:
+            return "%s (line %d)" % (self.msg, self.line)
         return "%s (line %d:%d)" % (self.msg, self.line, self.col)
 
 

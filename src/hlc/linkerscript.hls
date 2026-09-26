@@ -1,0 +1,574 @@
+# ============================================================================
+# hlc/linkerscript.hls — Stage 84 (v0.103.0-alpha) linker-script support
+# ----------------------------------------------------------------------------
+# Two jobs:
+#
+#   1. Validate the `#[section("X")]` name and the `#[align(N)]` byte
+#      count at parse time, with the SAME rules the Stage-0 parser uses
+#      (boot/parser.py: check_section_name / check_section_align) so a
+#      program accepted by one compiler is accepted by the other, with
+#      the same diagnostic.
+#
+#   2. Read the crate's `#![link_script("link.ld")]` and answer "does
+#      this script place that section?". The two silent failure modes
+#      this kills are the whole point of the stage: a `#[section]` the
+#      script never places (the linker discards the function or parks it
+#      as an orphan), and a `#![link_script]` naming a file that is not
+#      there (so the `-T script` link silently does not happen).
+#
+# This is a small reader for the subset of the GNU-ld grammar a Halis
+# image uses — ENTRY, `. = addr`, `NAME (TYPE) : ALIGN(n) { ... }`,
+# `*(pattern pattern*)`, `KEEP(*(...))`, `SYM = .;` — not a general
+# linker-script parser and not a replacement for `ld`. The Stage-0 twin
+# is boot/linkerscript.py; the acceptance gate proves the two answer
+# identically on a shared corpus.
+# ============================================================================
+
+# ---------------------------------------------------------------------------
+# Name + alignment validation (mirrors boot/parser.py exactly)
+# ---------------------------------------------------------------------------
+
+# SECTION_MAX_NAME: the longest section name the compilers accept. A
+# longer name is a mistake, and an unbounded name is a DoS vector in the
+# C string literal the attribute lowers to.
+fn SECTION_MAX_NAME() -> int {
+    return 64
+}
+
+# SECTION_MAX_ALIGN: the largest `#[align(N)]` accepted — 64 KiB. Kernel
+# code aligns entries to a cache line or a page; more is a mistake.
+fn SECTION_MAX_ALIGN() -> int {
+    return 65536
+}
+
+# section_is_reserved: is `name` one of the output sections the Halis C
+# backend places itself? `.text` / `.rodata` / `.data` / `.bss` carry the
+# program's own code and storage, and `.halis.metadata` / `.halis.sections`
+# are the image builder's diagnostic sections. Handing one of those to a
+# linker script would move the runtime out from under the program.
+fn section_is_reserved(name: str) -> bool {
+    return name == ".text" || name == ".rodata" || name == ".data"
+    || name == ".bss" || name == ".halis.metadata"
+    || name == ".halis.sections"
+}
+
+# section_char_ok: is `c` legal inside a section name? The class is
+# deliberately tiny — letters, digits, '.', '_', '$' — which makes the
+# name safe to splice into a C string literal (no quote, no backslash,
+# no newline, no control character) and safe to hand to a linker as an
+# input-section wildcard.
+fn section_char_ok(c: int) -> bool {
+    if c == 46 || c == 95 || c == 36 {
+        return true
+    }
+    if c >= 48 && c <= 57 {
+        return true
+    }
+    if c >= 97 && c <= 122 {
+        return true
+    }
+    if c >= 65 && c <= 90 {
+        return true
+    }
+    return false
+}
+
+# section_start_ok: is `c` legal as the FIRST character? A leading '.'
+# is the GNU-ld convention (`.text.boot`), '_' and letters round out the
+# set.
+fn section_start_ok(c: int) -> bool {
+    if c == 46 || c == 95 {
+        return true
+    }
+    if c >= 97 && c <= 122 {
+        return true
+    }
+    if c >= 65 && c <= 90 {
+        return true
+    }
+    return false
+}
+
+# check_section_name: validate a `#[section("X")]` name. Returns "" when
+# the name is well-formed, or a human-readable reason when it is not —
+# the same contract (and the same wording) as the Stage-0 parser.
+fn check_section_name(name: str) -> str {
+    if name.len() == 0 {
+        return "section name is empty"
+    }
+    if name.len() > SECTION_MAX_NAME() {
+        return "section name is " + name.len().to_str() + " bytes; the limit is " + SECTION_MAX_NAME().to_str()
+    }
+    if !section_start_ok(name.byte_at(0)) {
+        return "section name must start with '.', '_' or a letter (got '" + name.slice(0, 1) + "')"
+    }
+    let mut i: int = 0
+    while i < name.len() {
+        if !section_char_ok(name.byte_at(i)) {
+            return "section name may only contain letters, digits, '.', '_' and '$' (got '" + name.slice(i, i + 1) + "')"
+        }
+        i = i + 1
+    }
+    if name.contains("..") {
+        return "section name must not contain '..'"
+    }
+    if section_is_reserved(name) {
+        return "'" + name + "' is a compiler-owned output section — pick a name of your own (e.g. '.text.mystuff')"
+    }
+    return ""
+}
+
+# check_section_align: validate a `#[align(N)]` byte count. Returns ""
+# when N is a power of two in 1..=SECTION_MAX_ALIGN, else the reason.
+# gcc's `aligned` attribute rounds a non-power-of-two up, so accepting
+# one silently would place the function at an alignment the author never
+# asked for — the rule is stated, not approximated.
+fn check_section_align(n: int) -> str {
+    if n < 1 {
+        return "align must be positive"
+    }
+    if n > SECTION_MAX_ALIGN() {
+        return "align must be at most " + SECTION_MAX_ALIGN().to_str() + " bytes"
+    }
+    if int_and(n, n - 1) != 0 {
+        return "align must be a power of two (got " + n.to_str() + ")"
+    }
+    return ""
+}
+
+# ---------------------------------------------------------------------------
+# Reading a linker script
+# ---------------------------------------------------------------------------
+
+# ls_is_space: space, tab, CR, LF.
+fn ls_is_space(c: int) -> bool {
+    return c == 32 || c == 9 || c == 13 || c == 10
+}
+
+# ls_after_comment: if a `/* ... */` comment starts at `i`, the offset
+# just past it; otherwise `i` unchanged. An unterminated comment runs to
+# the end of the text — which is what a real linker does too.
+#
+# The scanners below are comment-AWARE rather than stripping comments up
+# front. The strip-then-scan shape has to build a second copy of the
+# script, and because HLS strings are immutable, appending one character
+# at a time copies the whole prefix every time: reading a 1-KiB script
+# that way allocates on the order of a megabyte, which exhausts the 1-MiB
+# freestanding bump arena (a kernel author reading its own script in
+# early boot would trap). Skipping comments in place allocates nothing.
+fn ls_after_comment(text: str, i: int) -> int {
+    let n: int = text.len()
+    if i + 1 < n && text.byte_at(i) == 47 && text.byte_at(i + 1) == 42 {
+        let mut j: int = i + 2
+        while j + 1 < n && !(text.byte_at(j) == 42 && text.byte_at(j + 1) == 47) {
+            j = j + 1
+        }
+        if j + 1 >= n {
+            return n
+        }
+        return j + 2
+    }
+    return i
+}
+
+# ls_find_keyword: the offset of `kw` at a position that is not inside a
+# comment, or -1. Used to locate the SECTIONS block without copying.
+fn ls_find_keyword(text: str, kw: str) -> int {
+    let n: int = text.len()
+    let mut i: int = 0
+    while i + kw.len() <= n {
+        let a: int = ls_after_comment(text, i)
+        if a > i {
+            i = a
+            continue
+        }
+        if text.slice(i, i + kw.len()) == kw {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+# The body of the first `SECTIONS { ... }` block, or "" when the script
+# has none. The braces are matched with comments skipped, so a `}` inside
+# a comment cannot close the block early.
+fn ls_sections_block(text: str) -> str {
+    let at: int = ls_find_keyword(text, "SECTIONS")
+    if at < 0 {
+        return ""
+    }
+    let n: int = text.len()
+    let mut i: int = at + 8
+    while i < n {
+        let a: int = ls_after_comment(text, i)
+        if a > i {
+            i = a
+            continue
+        }
+        if text.byte_at(i) == 123 {
+            break
+        }
+        i = i + 1
+    }
+    if i >= n {
+        return ""
+    }
+    let mut depth: int = 0
+    let mut j: int = i
+    while j < n {
+        let a: int = ls_after_comment(text, j)
+        if a > j {
+            j = a
+            continue
+        }
+        let c: int = text.byte_at(j)
+        if c == 123 {
+            depth = depth + 1
+        } else if c == 125 {
+            depth = depth - 1
+            if depth == 0 {
+                return text.slice(i + 1, j)
+            }
+        }
+        j = j + 1
+    }
+    return ""
+}
+
+# Advance past whitespace AND comments, starting at `i`.
+fn ls_skip_spaces(text: str, i: int) -> int {
+    let n: int = text.len()
+    let mut j: int = i
+    while j < n {
+        if ls_is_space(text.byte_at(j)) {
+            j = j + 1
+            continue
+        }
+        let a: int = ls_after_comment(text, j)
+        if a > j {
+            j = a
+            continue
+        }
+        break
+    }
+    return j
+}
+
+# Read one whitespace-delimited word (comments are not word characters).
+# Returns ["", end] at the end of the input so a caller can loop on an
+# empty word.
+fn ls_read_word(text: str, i: int) -> list[str] {
+    let j: int = ls_skip_spaces(text, i)
+    if j >= text.len() {
+        return["", text.len().to_str()]
+    }
+    let mut k: int = j
+    while k < text.len() && !ls_is_space(text.byte_at(k)) {
+        let a: int = ls_after_comment(text, k)
+        if a > k {
+            break
+        }
+        k = k + 1
+    }
+    return[text.slice(j, k), k.to_str()]
+}
+
+# ls_sections_have_block: does the script describe its output layout at
+# all? `#![link_script]` pointing at a file with no SECTIONS block is a
+# mistake worth naming: the image layout would silently be gcc's default.
+fn ls_sections_have_block(text: str) -> bool {
+    return ls_sections_block(text) != ""
+}
+
+# ls_placed_patterns: every output-section name and input-section
+# pattern the script mentions inside its SECTIONS block.
+#
+# An output-section name counts as a pattern too: `.text.boot : { }`
+# places a function whose `#[section]` is `.text.boot` — that is the
+# whole point of naming an output section after the input.
+fn ls_placed_patterns(text: str) -> list[str] {
+    let mut pats: list[str] = []
+    let block: str = ls_sections_block(text)
+    if block == "" {
+        return pats
+    }
+    let n: int = block.len()
+    let mut i: int = 0
+    # A section header starts a SCRIPT statement, not necessarily a
+    # line: `{ *(.text) } .data : { *(.data) }` is legal ld, and a
+    # reader that only looks at line starts silently drops `.data`.
+    let mut stmt_start: bool = true
+    while i < n {
+        let ca: int = ls_after_comment(block, i)
+        if ca > i {
+            i = ca
+            continue
+        }
+        let c: int = block.byte_at(i)
+        if c == 10 || c == 59 || c == 125 {
+            stmt_start = true
+            i = i + 1
+            continue
+        }
+        if stmt_start && (c == 32 || c == 9) {
+            i = i + 1
+            continue
+        }
+        if stmt_start && ls_name_start(c) {
+            let h: list[str] = ls_read_header(block, i)
+            if h.get(0) == "1" {
+                pats.push(h.get(5))
+                i = h.get(4).to_int()
+                stmt_start = false
+                continue
+            }
+        }
+        stmt_start = false
+        if c == 42 {
+            let j: int = ls_skip_spaces(block, i + 1)
+            if j < n && block.byte_at(j) == 40 {
+                pats = ls_collect_input_list(block, j, pats)
+                i = ls_close_paren(block, j)
+                continue
+            }
+        }
+        i = i + 1
+    }
+    return pats
+}
+
+# ls_align_paren: the offset of the `(` opening an ALIGN(...) clause at or
+# after `j`, or -1 when no ALIGN clause starts there. Matching a prefix
+# is what the grammar needs: `ALIGN(4)` has no separating space.
+fn ls_align_paren(block: str, j: int) -> int {
+    let a: int = ls_skip_spaces(block, j)
+    let n: int = block.len()
+    if a + 5 <= n {
+        let w: str = block.slice(a, a + 5)
+        if w == "ALIGN" || w == "align" {
+            return ls_skip_spaces(block, a + 5)
+        }
+    }
+    return -1
+}
+
+# ls_read_header: given the offset of an output-section name inside a
+# SECTIONS block, return
+#     ["1", align, noload, vma, resume, name]  on success
+#     ["0", "1", "0", "0", i, ""]              when no header starts there
+# where `resume` is the offset to continue scanning from. Accepts the
+# shapes a Halis image uses:
+#     NAME :
+#     NAME (NOLOAD) :
+#     NAME 0x200000 :
+#     NAME (NOLOAD) : ALIGN(8) {
+# The rules match core/section.hls's ls_read_header line for line — a
+# crate's `#[section]` coverage must read the same under both.
+fn ls_read_header(block: str, i: int) -> list[str] {
+    let w: list[str] = ls_read_word(block, i)
+    let name: str = w.get(0)
+    if name == "" {
+        return["0", "1", "0", "0", i.to_str(), ""]
+    }
+    let n: int = block.len()
+    # The name is followed by whitespace before any clause: `.bss (NOLOAD)
+    # : ALIGN(8) {` is the ordinary spelling, so the gap has to be
+    # skipped before the `(` is looked for.
+    let mut j: int = ls_skip_spaces(block, w.get(1).to_int())
+    let mut noload: int = 0
+    let mut vma: int = 0
+    while j < n && block.byte_at(j) == 40 {
+        let pstart: int = j
+        j = j + 1
+        while j < n && block.byte_at(j) != 41 {
+            j = j + 1
+        }
+        if j >= n {
+            return["0", "1", "0", "0", i.to_str(), ""]
+        }
+        if block.slice(pstart + 1, j).contains("NOLOAD") {
+            noload = 1
+        }
+        j = ls_skip_spaces(block, j + 1)
+    }
+    # An optional address expression before the colon. The whitespace
+    # must be skipped FIRST: `.text : { }` has a space before the colon,
+    # and reading that gap as a "word" would yield ":" — which is not a
+    # number — and reject every ordinary header.
+    let jc: int = ls_skip_spaces(block, j)
+    if jc < n && block.byte_at(jc) != 58 {
+        let a: list[str] = ls_read_word(block, jc)
+        if !ls_is_number(a.get(0)) {
+            return["0", "1", "0", "0", i.to_str(), ""]
+        }
+        vma = ls_number(a.get(0))
+        j = ls_skip_spaces(block, a.get(1).to_int())
+    } else {
+        j = jc
+    }
+    if j >= n || block.byte_at(j) != 58 {
+        return["0", "1", "0", "0", i.to_str(), ""]
+    }
+    j = j + 1
+    # ALIGN(n) after the colon. The clause is matched as a PREFIX, not
+    # as a whitespace-delimited word: the ordinary spelling `ALIGN(4)`
+    # has no space, so a word scan would read "ALIGN(4)" as one token and
+    # never match the bare name.
+    let mut align: int = 1
+    let ap: int = ls_align_paren(block, j)
+    if ap >= 0 && ap < n && block.byte_at(ap) == 40 {
+        let mut a: int = ap + 1
+        let start: int = a
+        while a < n && block.byte_at(a) != 41 {
+            a = a + 1
+        }
+        if a > n {
+            return["0", "1", "0", "0", i.to_str(), ""]
+        }
+        let arg: str = block.slice(start, a).trim()
+        if ls_is_number(arg) {
+            align = ls_number(arg)
+        }
+    }
+    return["1", align.to_str(), noload.to_str(), vma.to_str(), j.to_str(), name]
+}
+
+# ls_is_number: a decimal or 0x-hex literal the script could use as an
+# address. Deliberately narrow — a linker expression like `. + 0x1000`
+# is not modelled (the compiler only needs "is this section placed").
+fn ls_is_number(s: str) -> bool {
+    if s.len() == 0 {
+        return false
+    }
+    if s.len() > 2 && s.byte_at(0) == 48 && (s.byte_at(1) == 120 || s.byte_at(1) == 88) {
+        let mut i: int = 2
+        while i < s.len() {
+            let c: int = s.byte_at(i)
+            if !((c >= 48 && c <= 57) || (c >= 97 && c <= 102) || (c >= 65 && c <= 70)) {
+                return false
+            }
+            i = i + 1
+        }
+        return true
+    }
+    let mut j: int = 0
+    while j < s.len() {
+        if s.byte_at(j) < 48 || s.byte_at(j) > 57 {
+            return false
+        }
+        j = j + 1
+    }
+    return true
+}
+
+# ls_number: the value of a literal ls_is_number accepted.
+fn ls_number(s: str) -> int {
+    if s.len() > 2 && s.byte_at(0) == 48 && (s.byte_at(1) == 120 || s.byte_at(1) == 88) {
+        let mut acc: int = 0
+        let mut i: int = 2
+        while i < s.len() {
+            let c: int = s.byte_at(i)
+            let mut d: int = 0
+            if c >= 48 && c <= 57 {
+                d = c - 48
+            } else if c >= 97 && c <= 102 {
+                d = c - 97 + 10
+            } else {
+                d = c - 65 + 10
+            }
+            acc = acc * 16 + d
+            i = i + 1
+        }
+        return acc
+    }
+    let mut acc2: int = 0
+    let mut j: int = 0
+    while j < s.len() {
+        acc2 = acc2 * 10 + (s.byte_at(j) - 48)
+        j = j + 1
+    }
+    return acc2
+}
+
+# ls_name_start: can `c` begin an output-section name? '.', '_', '/'
+# (as in /DISCARD/) or a letter.
+fn ls_name_start(c: int) -> bool {
+    if c == 46 || c == 95 || c == 47 {
+        return true
+    }
+    if c >= 97 && c <= 122 {
+        return true
+    }
+    if c >= 65 && c <= 90 {
+        return true
+    }
+    return false
+}
+
+# ls_close_paren: the offset just past the `)` matching the `(` at `i`,
+# or the block length when the list is unterminated.
+fn ls_close_paren(block: str, i: int) -> int {
+    let n: int = block.len()
+    let mut j: int = i + 1
+    while j < n {
+        if block.byte_at(j) == 41 {
+            return j + 1
+        }
+        let a: int = ls_after_comment(block, j)
+        if a > j {
+            j = a
+            continue
+        }
+        j = j + 1
+    }
+    if j >= n {
+        return n
+    }
+    return j + 1
+}
+
+# ls_collect_input_list: read the parenthesised pattern list starting at
+# the `(` in `i`, pushing each whitespace-separated pattern.
+fn ls_collect_input_list(block: str, i: int, pats: list[str]) -> list[str] {
+    let n: int = block.len()
+    let mut j: int = i + 1
+    while j < n && block.byte_at(j) != 41 {
+        if ls_is_space(block.byte_at(j)) {
+            j = j + 1
+            continue
+        }
+        let mut k: int = j
+        while k < n && !ls_is_space(block.byte_at(k)) && block.byte_at(k) != 41 {
+            k = k + 1
+        }
+        let w: str = block.slice(j, k)
+        # A pattern may carry a trailing `(SORT_NONE)`-style qualifier
+        # inside the same parentheses; keep only the name.
+        pats.push(w)
+        j = k
+    }
+    return pats
+}
+
+# ls_pattern_matches: GNU ld's input-section matching rule — a pattern
+# ending in `*` matches by PREFIX, anything else matches exactly.
+fn ls_pattern_matches(pattern: str, name: str) -> bool {
+    if pattern.len() > 0 && pattern.byte_at(pattern.len() - 1) == 42 {
+        return name.starts_with(pattern.slice(0, pattern.len() - 1))
+    }
+    return pattern == name
+}
+
+# ls_covers: is an input section called `name` placed by any of
+# `patterns`?
+fn ls_covers(patterns: list[str], name: str) -> bool {
+    let mut i: int = 0
+    while i < patterns.len() {
+        if ls_pattern_matches(patterns.get(i), name) {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}

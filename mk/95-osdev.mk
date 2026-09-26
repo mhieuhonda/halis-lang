@@ -1,4 +1,53 @@
+# Stage 84 (v0.103.0-alpha): linker-script integration (`#![link_script]`)
+# + custom sections (`#[section("NAME")]` / `#[align(N)]`) — see SPEC
+# section 38.
 # ============================================================================
+
+# Stage 84: linker-script integration and custom sections
+LINKER_SCRIPT ?= link.ld
+LINKER_TEST_SRC ?= tests/stage84_linker_sections.c
+LINKER_TEST_OBJ ?= build/stage84-linker-test.o
+LINKER_TEST_BIN ?= build/stage84-linker-test.elf
+# The C compiler driver also locates `ld` and `nm`, so derive them from
+# it rather than assuming bare `ld`/`nm` are on PATH (a bare `ld` is not
+# installed on most distros — `ld` is a gcc-internal binary, reachable
+# only as `$(CC) -print-prog-name=ld`). An empty NM used to make the
+# verification pipeline `| grep -q ...` with no producer, which blocks
+# forever on stdin.
+LINKER_TEST_CC ?= $(CC)
+LINKER_TEST_LD ?= $(shell $(CC) -print-prog-name=ld)
+LINKER_TEST_NM ?= $(shell $(CC) -print-prog-name=nm)
+
+.PHONY: test-linker
+test-linker: $(LINKER_TEST_BIN)
+	@$(LINKER_TEST_NM) $(LINKER_TEST_BIN) | grep -q '__halis_metadata_start' && \
+	 $(LINKER_TEST_NM) $(LINKER_TEST_BIN) | grep -q '__halis_sections_start' && \
+	 $(LINKER_TEST_NM) $(LINKER_TEST_BIN) | grep -q '__halis_sections_end'
+
+$(LINKER_TEST_OBJ): $(LINKER_TEST_SRC) $(LINKER_SCRIPT)
+	@mkdir -p $(dir $@)
+	$(LINKER_TEST_CC) $(CPPFLAGS) $(CFLAGS) -ffreestanding -fno-pie -c $< -o $@
+
+$(LINKER_TEST_BIN): $(LINKER_TEST_OBJ) $(LINKER_SCRIPT)
+	$(LINKER_TEST_LD) -T $(LINKER_SCRIPT) -o $@ $<
+
+# link-acceptance: the Stage 84 acceptance gate. Runs the 7-section
+# end-to-end suite for the linker script + custom sections: resolution +
+# guards, the standalone parse of core/section.hls, Stage-0 enforcement
+# (the no_std ok-test clean, the demo running, all 13 fail programs
+# rejected with their own diagnostic by BOTH compilers), nine targeted
+# behaviour probes (name validation, kinds, the script reader, comments,
+# coverage, the placement solver, the overlap/align faults, and the
+# freestanding arena budget), self-hosted emission + native parity (the
+# C carries section/aligned, the ok-test links -nostdlib, a covered
+# section compiles and runs under the shipped link.ld), hlfmt + hllint,
+# and `--audit` / `--opt-stats` reporting.
+link-acceptance:
+	@echo "[Stage 84 acceptance] running tests/link_acceptance.py..."
+	@$(PYTHON) tests/link_acceptance.py
+	@echo "ACCEPTANCE OK: Stage 84 -- linker-script integration + custom sections"
+
+.PHONY: freestanding freestanding-check freestanding-acceptance nostd nostd-acceptance alloc-acceptance mem-acceptance panic-acceptance stackguard-acceptance asmreg-acceptance link-acceptance test-linker
 # Phase VI — OS development foundation (Stages 77-78+)
 # ============================================================================
 # These stages give the LANGUAGE the capabilities OS developers need.
@@ -27,6 +76,11 @@
 # 64-bit register, SSE-only floats, compiler-owned sp/bp, operand-
 # clobber overlap analysis, and `core.asm` (the register file as
 # data) — see SPEC section 37.
+# Stage 84 (v0.103.0-alpha): the linker script — `#![link_script]`
+# names the script, `#[section("NAME")]` places a function in a named
+# output section (validated, and checked against the script), and
+# `#[align(N)]` pins its entry; `core.section` models the whole layout
+# story in pure HLS — see SPEC section 38.
 # ============================================================================
 
 # freestanding: compile an HLS program to freestanding C + link with
@@ -176,4 +230,3 @@ asmreg-acceptance:
 	@$(PYTHON) tests/asmreg_acceptance.py
 	@echo "ACCEPTANCE OK: Stage 83 -- inline-asm register constraints (clobber, input, output)"
 
-.PHONY: freestanding freestanding-check freestanding-acceptance nostd nostd-acceptance alloc-acceptance mem-acceptance panic-acceptance stackguard-acceptance asmreg-acceptance

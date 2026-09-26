@@ -179,7 +179,14 @@ def load_program(entry_path):
     # Merge all loaded programs into one. Earlier-loaded files (dependencies)
     # appear first; the entry file appears last.
     merged = {"structs": {}, "enums": {}, "fns": {}, "imports": [],
-              "externs": [], "crate_attrs": []}
+              "externs": [], "crate_attrs": [],
+              # Stage 84 (v0.103.0-alpha): the entry file's directory, so
+              # the checker can resolve `#![link_script("link.ld")]`
+              # relative to the crate root rather than the process cwd.
+              # Built from the path AS GIVEN (not from entry_abs) so the
+              # resolved script path the diagnostic prints is byte-for-
+              # byte the one the self-hosted compiler prints.
+              "entry_dir": os.path.dirname(entry_path)}
     for abs_path in load_order:
         prog = loaded[abs_path]
         # Stage 77 (v0.96.0-alpha): crate-level attributes (`#![...]`)
@@ -675,6 +682,28 @@ def print_audit(program, checker):
         print("  Stack budget: #![stack_size(%d)] — worst chain %d bytes "
               "(%s)" % (budget["budget"], budget["worst"],
                         " -> ".join(budget["path"])))
+    # Stage 84 (v0.103.0-alpha): custom sections + the linker script that
+    # places them. The checker proved every named section is covered (or
+    # that no script was declared) before we get here.
+    link = getattr(checker, "link_script_info", None)
+    if link:
+        named = sorted({f["attrs"]["section"] for f in fns.values()
+                        if f.get("attrs", {}).get("section")})
+        if link["path"]:
+            print("  Linker script: %s — %d section(s) named, %d "
+                  "pattern(s) placed"
+                  % (link["path"], link["named"], link["placed"]))
+        else:
+            print("  Linker script: none declared (#![link_script] absent) "
+                  "— custom sections use the default linker layout")
+        for s in named:
+            print("    #[section(\"%s\")] x%d" % (
+                s, sum(1 for f in fns.values()
+                       if f.get("attrs", {}).get("section") == s)))
+        aligned = sum(1 for f in fns.values()
+                      if f.get("attrs", {}).get("align", -1) >= 0)
+        if aligned:
+            print("  #[align(N)] annotations: %d" % aligned)
     # Active vs reserved effects table.
     print("")
     print("  Active effects:    IO, Fs, Clock, Args, Exit, Net, Rand, Proc, Conc")

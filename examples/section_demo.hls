@@ -1,0 +1,195 @@
+# ============================================================================
+# examples/section_demo.hls — Stage 84: custom sections + linker script
+# ----------------------------------------------------------------------------
+# A freestanding-shaped story on a hosted run: an image is described by a
+# linker script, the script is read and solved, and the resulting layout
+# is proved (no overlaps, the boot stub really lands in `.text`, the
+# writable/executable flags match the section kinds).
+#
+# The same code compiles unchanged under `#![freestanding]` — the only
+# thing this demo needs from the host is printing the link map.
+# ============================================================================
+
+import "core.section"
+
+# A miniature kernel linker script: the shapes a real Halis image uses
+# (`. = addr`, ALIGN, KEEP, an output section named after an input, a
+# NOLOAD guard, symbol assignments).
+fn demo_script() -> str {
+    return "/* Halis demo image */\nENTRY(_start)\nSECTIONS\n{\n    . = 0x100000;\n    .text : ALIGN(4)\n    {\n        KEEP(*(.text .text.*))\n    }\n    .rodata : ALIGN(8)\n    {\n        *(.rodata .rodata.*)\n    }\n    .halis_metadata : ALIGN(8)\n    {\n        __halis_metadata_start = .;\n        KEEP(*(.halis.metadata))\n        __halis_metadata_end = .;\n    }\n    .data : ALIGN(8)\n    {\n        *(.data .data.*)\n    }\n    .bss (NOLOAD) : ALIGN(8)\n    {\n        __bss_start = .;\n        *(.bss .bss.*)\n        *(COMMON)\n        __bss_end = .;\n    }\n    _end = .;\n}\n"
+}
+# Sizes a kernel author would measure after the first link: code, the
+# read-only pool, the metadata blob, initialised state, and the two
+# guard pages carved out of the bss tail.
+fn demo_sizes() -> map[str, int] {
+    # HLS has no hex literals: 0x400/0x120/0x40/0x80/0x2000.
+    let mut m: map[str, int] = map_new()
+    m.set(".text", 1024)
+    m.set(".rodata", 288)
+    m.set(".halis_metadata", 64)
+    m.set(".data", 128)
+    m.set(".bss", 8192)
+    return m
+}
+
+# The names the crate actually annotates with `#[section(...)]` — the
+# same set the compiler verified against the script at compile time.
+fn demo_named() -> list[str] {
+    return[".text.boot_stub", ".text.isr_stub", ".halis.metadata"]
+}
+
+fn main() -> int uses IO {
+    let text: str = demo_script()
+
+    # 1. The script parses, and its section list is what the compiler
+    #    checked when it accepted the `#[section]` attributes.
+    let parsed: Result[list[OutputSection], ScriptFault] = parse_link_script(text)
+    if result_is_err(parsed) {
+        println("section_demo: script did not parse")
+        return 1
+    }
+    let sections: list[OutputSection] = result_unwrap(parsed)
+    if sections.len() != 5 {
+        println("section_demo: expected 5 output sections, got " + sections.len().to_str())
+        return 2
+    }
+    if sections.get(0).name != ".text" || sections.get(4).name != ".bss" {
+        println("section_demo: section order is wrong")
+        return 3
+    }
+    if !sections.get(4).noload {
+        println("section_demo: .bss must be NOLOAD")
+        return 4
+    }
+    if sections.get(0).align != 4 || sections.get(4).align != 8 {
+        println("section_demo: ALIGN not captured")
+        return 5
+    }
+
+    # 2. Every `#[section]` in the crate is placed by the script.
+    let named: list[str] = demo_named()
+    let mut i: int = 0
+    while i < named.len() {
+        let sec: str = named.get(i)
+        if script_covers(sections, sec) == "" {
+            println("section_demo: " + sec + " is not placed by the script")
+            return 6
+        }
+        i = i + 1
+    }
+    if script_covers(sections, ".text.boot_stub") != ".text" {
+        println("section_demo: .text.boot_stub should land in .text")
+        return 7
+    }
+    if script_covers(sections, ".halis.metadata") != ".halis_metadata" {
+        println("section_demo: .halis.metadata should land in its own section")
+        return 8
+    }
+
+    # 3. The layout solves cleanly.
+    let sizes: map[str, int] = demo_sizes()
+    # 0x100000
+    let laid: Result[ImageLayout, LayoutFault] = layout_image(1048576, sections, sizes)
+    if result_is_err(laid) {
+        println("section_demo: layout failed: " + layout_fault_name(result_unwrap_err(laid)))
+        return 9
+    }
+    let layout: ImageLayout = result_unwrap(laid)
+    if layout.end <= layout.base {
+        println("section_demo: end is not past base")
+        return 10
+    }
+    if layout_file_bytes(layout) != 1504 {
+        println("section_demo: file-byte total is wrong (bss must not count)")
+        return 11
+    }
+
+    # 4. The placement is the one the script describes.
+    # 0x100000
+    if layout.entries.get(0).vma != 1048576 {
+        println("section_demo: .text is not at the load address")
+        return 12
+    }
+    # 0x100400
+    if layout.entries.get(1).vma != 1049600 {
+        println("section_demo: .rodata does not follow .text")
+        return 13
+    }
+    # 0x100010
+    if !layout_contains(layout, 1048592) {
+        println("section_demo: 0x100010 should be inside .text")
+        return 14
+    }
+    # 0x100410
+    if layout_section_at(layout, 1049616) != ".rodata" {
+        println("section_demo: 0x100410 should be inside .rodata")
+        return 15
+    }
+    if layout_load_end(layout) != layout.entries.get(3).vma + 128 {
+        println("section_demo: load end should stop before the noload .bss")
+        return 16
+    }
+
+    # 5. The page flags a kernel derives from the section names.
+    if !section_kind_executable(section_kind(".text.isr_stub")) {
+        println("section_demo: .text.isr_stub must be executable")
+        return 17
+    }
+    if section_kind_writable(section_kind(".text.isr_stub")) {
+        println("section_demo: code must never be writable")
+        return 18
+    }
+    if !section_kind_writable(section_kind(".data.rel.ro")) {
+        println("section_demo: .data.rel.ro must be writable")
+        return 19
+    }
+    if section_kind_has_bytes(section_kind(".bss")) {
+        println("section_demo: .bss contributes no file bytes")
+        return 20
+    }
+
+    # 6. The name validator agrees with the compilers.
+    if section_fault_code(section_check(".text.boot")) != 0 {
+        println("section_demo: .text.boot should be valid")
+        return 21
+    }
+    if section_fault_code(section_check(".text")) != 6 {
+        println("section_demo: .text is compiler-owned")
+        return 22
+    }
+    if section_fault_code(section_check("")) != 1 {
+        println("section_demo: the empty name must be Empty")
+        return 23
+    }
+    if section_fault_code(section_check(".text..boot")) != 5 {
+        println("section_demo: '..' must be rejected")
+        return 24
+    }
+    if !section_align_ok(4096) || section_align_ok(48) {
+        println("section_demo: align must be a power of two")
+        return 25
+    }
+
+    # 7. A section the script does not place is reported, not guessed.
+    # `.text.anything` IS covered (the script's `*(.text .text.*)` is a
+    # prefix pattern) — that is the idiom a kernel author relies on. A
+    # name outside every pattern is not.
+    if script_covers(sections, ".text.anything") != ".text" {
+        println("section_demo: .text.* must be a prefix match under .text")
+        return 26
+    }
+    if script_covers(sections, ".bogus.boot") != "" {
+        println("section_demo: .bogus.boot is placed by nothing")
+        return 27
+    }
+    let empty_sections: list[OutputSection] = []
+    if script_covers(empty_sections, ".text") != "" {
+        println("section_demo: an empty script places nothing")
+        return 28
+    }
+
+    print(layout_render(layout))
+    println("named sections: " + named.len().to_str() + ", all placed")
+    println("DEMO OK")
+    return 0
+}

@@ -39,7 +39,82 @@ IO_FAMILY = {"IO", "Fs", "Clock", "Args", "Exit"}
 #                  computes every fn's worst-case frame, walks the
 #                  call graph, rejects recursion cycles outright, and
 #                  proves the worst chain fits inside N bytes.
-CRATE_ATTRS = {"freestanding", "no_std", "stack_size"}
+CRATE_ATTRS = {"freestanding", "no_std", "stack_size", "link_script"}
+
+# Stage 84 (v0.103.0-alpha): the output sections the Halis C backend
+# relies on. `#[section("X")]` may not name any of them — the runtime
+# places `.text` / `.rodata` / `.data` / `.bss` itself, and the two
+# `.halis.*` diagnostic sections are the image builder's.
+RESERVED_SECTIONS = {
+    ".text", ".rodata", ".data", ".bss",
+    ".halis.metadata", ".halis.sections",
+}
+
+# The longest section name the compilers accept. A name longer than this
+# is a mistake, and an unbounded name is a DoS vector in the C string
+# literal the attribute lowers to.
+MAX_SECTION_NAME = 64
+
+# The largest `#[align(N)]` the compilers accept: 64 KiB. Kernel code
+# aligns entries to a cache line or a page; anything larger is a mistake.
+MAX_SECTION_ALIGN = 65536
+
+
+def check_section_name(name):
+    """Stage 84: validate a `#[section("X")]` name.
+
+    Returns None when the name is well-formed, or a human-readable
+    reason string when it is not. The self-hosted compiler implements
+    the identical rules in `check_section_name` (src/hlc/parser.hls) —
+    the two must stay byte-for-byte in agreement, which the Stage 84
+    acceptance gate proves with a shared fail-program corpus.
+
+    The character class is deliberately tiny: `.` `_` `$` letters and
+    digits. That makes the name safe to splice into a C string literal
+    (no quote, no backslash, no newline, no control character) and safe
+    to hand to a linker as an input-section wildcard.
+    """
+    if not name:
+        return "section name is empty"
+    if len(name) > MAX_SECTION_NAME:
+        return "section name is %d bytes; the limit is %d" % (
+            len(name), MAX_SECTION_NAME)
+    first = name[0]
+    if not (first == "." or first == "_"
+            or ("a" <= first <= "z") or ("A" <= first <= "Z")):
+        return ("section name must start with '.', '_' or a letter "
+                "(got %r)" % name[0])
+    for ch in name:
+        ok = (ch == "." or ch == "_" or ch == "$"
+              or ("a" <= ch <= "z") or ("A" <= ch <= "Z")
+              or ("0" <= ch <= "9"))
+        if not ok:
+            return ("section name may only contain letters, digits, "
+                    "'.', '_' and '$' (got %r)" % ch)
+    if ".." in name:
+        return "section name must not contain '..'"
+    if name in RESERVED_SECTIONS:
+        return ("'%s' is a compiler-owned output section — pick a name "
+                "of your own (e.g. '.text.mystuff')" % name)
+    return None
+
+
+def check_section_align(n):
+    """Stage 84: validate a `#[align(N)]` byte count.
+
+    Returns None when N is a power of two in 1..=MAX_SECTION_ALIGN, or
+    a human-readable reason string when it is not. gcc's `aligned`
+    attribute rounds non-powers-of-two up, so accepting one silently
+    would place the function at an alignment the author did not ask
+    for; the rule is therefore stated, not approximated.
+    """
+    if n < 1:
+        return "align must be positive"
+    if n > MAX_SECTION_ALIGN:
+        return "align must be at most %d bytes" % MAX_SECTION_ALIGN
+    if (n & (n - 1)) != 0:
+        return "align must be a power of two (got %d)" % n
+    return None
 
 BIN_LEVELS = [
     ("||",),
@@ -151,6 +226,8 @@ class Parser:
             "cold": False,
             "tail_call": False,
             "panic_handler": False,
+            "section": "",
+            "align": -1,
         }
 
     def parse_attributes(self):
@@ -171,6 +248,12 @@ class Parser:
             panic_handler    - Stage 81: mark this fn the program's panic
                               handler (exactly one per program; signature
                               `fn panic_handler(msg: str) -> void`)
+            section("NAME")  - Stage 84: place this fn's code in the
+                              output section NAME (a linker-script
+                              section; validated against the same rules
+                              the self-hosted compiler uses)
+            align(N)         - Stage 84: align this fn's entry to N bytes
+                              (a power of two)
         Multiple `#[...]` lists may precede a single fn (each
         accumulates). `hot` and `cold` are mutually exclusive; likewise
         `inline(always)` and `inline(never)`. `tail_call` is mutually
@@ -204,6 +287,12 @@ class Parser:
                         self.err("'tail_call' and 'inline(always)' are mutually "
                                  "exclusive (a tail-call loop cannot also be "
                                  "inlined at every call site)", t0)
+                    # Stage 84: the same contradiction with #[section] —
+                    # an always-inlined function emits no body to place.
+                    if mode == "always" and self.cur_attrs["section"]:
+                        self.err("'section' and 'inline(always)' are mutually "
+                                 "exclusive (an always-inlined function emits "
+                                 "no body to place in a section)", t0)
                     self.cur_attrs["inline"] = mode
                 elif attr_name == "hot":
                     if self.cur_attrs["cold"]:
@@ -266,6 +355,52 @@ class Parser:
                         self.err("stack_size must be non-negative", nt)
                     self.eat_sym(")")
                     self.cur_attrs["stack_size"] = n
+                elif attr_name == "section":
+                    # Stage 84 (v0.103.0-alpha): place this fn's code in
+                    # a named output section. The argument MUST be a
+                    # string LITERAL — the section name is needed by the
+                    # linker, long before any runtime value exists, so a
+                    # computed name is meaningless rather than
+                    # unsupported-at-runtime.
+                    if self.cur_attrs["section"]:
+                        self.err("section attribute appears more than once "
+                                 "on one function (was \"%s\", now ... — a "
+                                 "function has exactly one output section)"
+                                 % self.cur_attrs["section"], t0)
+                    self.eat_sym("(")
+                    st = self.peek()
+                    if st["k"] != "str":
+                        self.err("section expects a string literal section "
+                                 "name but got %s" % self._desc(), st)
+                    self.next()
+                    self.eat_sym(")")
+                    name = st["v"].decode("utf-8", "replace")
+                    why = check_section_name(name)
+                    if why:
+                        self.err("invalid #[section] name: %s" % why, st)
+                    if self.cur_attrs["inline"] == "always":
+                        self.err("'section' and 'inline(always)' are mutually "
+                                 "exclusive (an always-inlined function emits "
+                                 "no body to place in a section)", t0)
+                    self.cur_attrs["section"] = name
+                elif attr_name == "align":
+                    # Stage 84: align the function's entry to N bytes.
+                    if self.cur_attrs["align"] >= 0:
+                        self.err("align attribute appears more than once on "
+                                 "one function (was %d)"
+                                 % self.cur_attrs["align"], t0)
+                    self.eat_sym("(")
+                    nt = self.peek()
+                    if nt["k"] != "int":
+                        self.err("align expects an integer byte count but "
+                                 "got %s" % self._desc(), nt)
+                    self.next()
+                    n = int(nt["v"])
+                    self.eat_sym(")")
+                    why = check_section_align(n)
+                    if why:
+                        self.err("invalid #[align] value: %s" % why, nt)
+                    self.cur_attrs["align"] = n
                 elif attr_name == "stack" or attr_name == "boxed":
                     # Stage 30 (v0.47.0-alpha): #[stack] / #[boxed] are
                     # LET-BINDING attributes (they control the layout of a
@@ -280,7 +415,8 @@ class Parser:
                     self.err("unknown attribute '%s' (known: inline(always), "
                              "inline(never), hot, cold, no_red_zone, "
                              "irq_handler, stack_size(N), tail_call, "
-                             "panic_handler)" % attr_name, t0)
+                             "panic_handler, section(\"NAME\"), align(N))"
+                             % attr_name, t0)
                 if self.at_sym(","):
                     self.next()
                 elif not self.at_sym("]"):
@@ -292,8 +428,11 @@ class Parser:
         attribute. Consumes `#` `!` `[` name (`(` int `)`)? `]`.
         Stage 82 (v0.101.0-alpha): `stack_size` carries a parenthesized
         byte count — `#![stack_size(1048576)]`.
+        Stage 84 (v0.103.0-alpha): `link_script` carries a parenthesized
+        STRING path — `#![link_script("link.ld")]`.
         Returns {"name", "value", "line", "col"} (value is the byte
-        count for stack_size, None for the bare attrs).
+        count for stack_size, the path for link_script, None for the
+        bare attrs).
         """
         t0 = self.eat_sym("#")
         self.eat_sym("!")
@@ -301,7 +440,8 @@ class Parser:
         name_tok = self.peek()
         if name_tok["k"] != "ident":
             self.err("expected a crate attribute name (freestanding, "
-                     "no_std, stack_size) but got %s" % self._desc(), name_tok)
+                     "no_std, stack_size, link_script) but got %s"
+                     % self._desc(), name_tok)
         self.next()
         name = name_tok["v"]
         if name not in CRATE_ATTRS:
@@ -322,6 +462,20 @@ class Parser:
             value = nt["v"]
             if value <= 0:
                 self.err("stack_size must be positive", nt)
+            self.eat_sym(")")
+        elif name == "link_script":
+            # Stage 84: the script path is part of the attribute
+            # (`#![link_script("link.ld")]`). The path is resolved
+            # relative to the entry file's directory by the checker.
+            self.eat_sym("(")
+            pt = self.peek()
+            if pt["k"] != "str":
+                self.err("link_script expects a string path but got %s"
+                         % self._desc(), pt)
+            self.next()
+            value = pt["v"].decode("utf-8", "replace")
+            if not value:
+                self.err("link_script path is empty", pt)
             self.eat_sym(")")
         self.eat_sym("]")
         return {"name": name, "value": value,
@@ -682,7 +836,8 @@ class Parser:
                 "attrs": {"stack_size": -1, "no_red_zone": False,
                           "irq_handler": False, "inline": "",
                           "hot": False, "cold": False,
-                          "tail_call": False, "panic_handler": False},
+                          "tail_call": False, "panic_handler": False,
+                          "section": "", "align": -1},
             }
         # Stage 17 (v0.28.0-alpha): optional contract clauses —
         # `requires <bool-expr>` then/and `ensures <bool-expr>`, parsed

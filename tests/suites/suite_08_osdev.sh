@@ -487,3 +487,111 @@ else
     bad "asmreg: make asmreg-acceptance failed"
     tail -15 "$TMP/asm_acc83.log"
 fi
+
+echo "=== 21. Stage 84: linker script + custom sections ==="
+# Stage 84 (v0.103.0-alpha): `#![link_script("...")]` names the script
+# that places the image, `#[section("NAME")]` places a function in a
+# named output section (validated, and checked against the script), and
+# `#[align(N)]` pins its entry. The gate below is the authority; these
+# are the suite-level spot checks.
+SEC_F=tests/ok/feat_stage84_section.hls
+# (a) the no_std ok-test is clean on the interpreter.
+sec_interp=$(python3 boot/boot.py "$SEC_F" </dev/null 2>/dev/null); sec_code=$?
+if [ "$sec_code" -eq 0 ]; then
+    ok "link: feat_stage84_section runs on the interpreter (exit 0)"
+else
+    bad "link: feat_stage84_section interpreter exit=$sec_code"
+fi
+# (b) core/section.hls is importable and freestanding-clean.
+if [ -f core/section.hls ] && grep -q "fn parse_link_script" core/section.hls; then
+    ok "link: core/section.hls present"
+else
+    bad "link: core/section.hls missing"
+fi
+# (c) every Stage 84 fail program is rejected by BOTH compilers with its
+#     own diagnostic.
+for sf in tests/fail/fail_stage84_*.hls; do
+    sec_name=$(basename "$sf" .hls)
+    sec_err=$(python3 boot/boot.py --check "$sf" 2>&1 >/dev/null); sec_rc=$?
+    if [ "$sec_rc" -ne 1 ]; then
+        bad "link: $sec_name not rejected by boot"
+        continue
+    fi
+    sec_err2=$("$TMP/hlc1" --audit "$sf" 2>&1 >/dev/null); sec_rc2=$?
+    if [ "$sec_rc2" -eq 0 ]; then
+        bad "link: $sec_name accepted by hlc (parity)"
+        continue
+    fi
+    # Compare the MESSAGE, not the prefix: the two front-ends label an
+    # error differently ("compile error: M" vs "panic: syntax error: M"),
+    # but the text the user reads — and the line:col — must match
+    # byte for byte, or the compilers have drifted.
+    sec_msg=$(printf '%s\n' "$sec_err"  | sed -E 's/^panic: //; s/^[a-z ]*error: //')
+    sec_msg2=$(printf '%s\n' "$sec_err2" | sed -E 's/^panic: //; s/^[a-z ]*error: //')
+    if [ "$sec_msg" = "$sec_msg2" ] && [ -n "$sec_msg" ]; then
+        ok "link: $sec_name rejected by both compilers (identical diagnostic)"
+    else
+        bad "link: $sec_name diagnostics differ"
+        echo "        boot: $sec_msg"
+        echo "        hlc:  $sec_msg2"
+    fi
+done
+# (d) the C lowering carries the section + aligned attributes.
+SEC_SRC=tests/ok/feat_stage84_sections_src.hls
+cat > "$SEC_SRC" <<'SECEOF'
+#[section(".text.suite_probe")]
+#[align(64)]
+fn suite_probe(x: int) -> int pure {
+    return x + 1
+}
+
+fn main() -> int {
+    return suite_probe(1)
+}
+SECEOF
+if [ -x "$TMP/hlc1" ] && "$TMP/hlc1" "$SEC_SRC" "$TMP/sec84.c" >/dev/null 2>&1; then
+    if grep -q '__attribute__((section(".text.suite_probe"), used))' "$TMP/sec84.c" \
+        && grep -q '__attribute__((aligned(64)))' "$TMP/sec84.c"; then
+        ok "link: C carries section + aligned attributes"
+    else
+        bad "link: C missing the section/aligned attributes"
+    fi
+    if gcc -O2 -Werror -o "$TMP/sec84" "$TMP/sec84.c" -lm -pthread 2>/dev/null; then
+        "$TMP/sec84" </dev/null >/dev/null 2>&1
+        if [ "$?" -eq 2 ]; then
+            ok "link: annotated program runs natively"
+        else
+            bad "link: annotated program did not return 2"
+        fi
+    else
+        bad "link: annotated program failed to link"
+    fi
+else
+    bad "link: annotated program did not compile (or \$TMP/hlc1 is missing)"
+fi
+rm -f "$SEC_SRC"
+# (e) the shipped link.ld places a custom section, and linking with it
+#     really puts the function there.
+if [ -x "$TMP/hlc1" ] && "$TMP/hlc1" examples/section_demo.hls "$TMP/sd84.c" >/dev/null 2>&1 \
+    && gcc -O2 -o "$TMP/sd84" "$TMP/sd84.c" -lm -pthread 2>/dev/null; then
+    sd_out=$("$TMP/sd84" </dev/null 2>/dev/null)
+    if echo "$sd_out" | grep -q "DEMO OK"; then
+        ok "link: examples/section_demo.hls runs natively, DEMO OK"
+    else
+        bad "link: section_demo did not print DEMO OK"
+    fi
+else
+    bad "link: section_demo failed to build (or \$TMP/hlc1 is missing)"
+fi
+# (f) make link-acceptance runs end-to-end.
+if make link-acceptance >"$TMP/link_acc84.log" 2>&1; then
+    if grep -q "ACCEPTANCE OK: Stage 84" "$TMP/link_acc84.log"; then
+        ok "link: make link-acceptance runs end-to-end"
+    else
+        bad "link: make link-acceptance did not print ACCEPTANCE OK"
+        tail -5 "$TMP/link_acc84.log"
+    fi
+else
+    bad "link: make link-acceptance failed"
+    tail -15 "$TMP/link_acc84.log"
+fi
