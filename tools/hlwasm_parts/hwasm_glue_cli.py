@@ -340,8 +340,14 @@ def run_wasm_in_node(wasm_path: str) -> int:
         sys.stderr.write("note: --run requested but node.js is not installed; "
                          "skipping execution.\n")
         return 0
-    # Write a small runner script.
-    runner = wasm_path + ".run.js"
+    # Write a small runner script. The extension is .cjs, NOT .js: Node
+    # decides a file's module system from the NEAREST package.json, so a
+    # `.run.js` under a directory whose package.json says
+    # `"type": "module"` is parsed as an ES module — where `require` does
+    # not exist and the runner dies before it ever reaches the wasm. A
+    # generated helper that Node executes must not be at the mercy of a
+    # manifest three directories up.
+    runner = wasm_path + ".run.cjs"
     with open(runner, "w") as f:
         f.write(NODE_RUNNER_TEMPLATE % {
             "wasm_path": wasm_path,

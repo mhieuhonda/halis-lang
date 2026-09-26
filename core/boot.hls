@@ -1,0 +1,952 @@
+# ============================================================================
+# core/boot.hls — boot-protocol headers as data (Stage 85, v0.104.0-alpha)
+# ----------------------------------------------------------------------------
+# Pure HLS, three `core` imports (freestanding-safe: only the core
+# language plus `core.option` / `core.result` / `core.section`, so it is
+# importable from `#![no_std]` and `#![freestanding]` crates identically,
+# like the rest of `core.*`).
+#
+# This module is the LIBRARY half of Stage 85. The LANGUAGE half is the
+# `#![boot_header(multiboot2 | limine)]` crate attribute (see SPEC
+# section 39), which makes the C backend emit the protocol header the
+# firmware scans for. What lives here is the other half — the shapes a
+# kernel RECEIVES, as values:
+#
+#   * Multiboot2 — the magic / architecture / length / checksum quartet,
+#     the tag-type lattice, the checksum rule, header construction, and
+#     tag lookup over a parsed header.
+#   * Limine — the 4x64-bit request IDs (memory map, framebuffer, RSDP,
+#     HHDM, stack size, bootloader info), the start/end delimiters, the
+#     base-revision tag, and feature lookup over a parsed request list.
+#   * The memory map both protocols report, as ONE model: an E820 type
+#     (1..5) and a Limine type (0..8) both land in the same `MemKind`,
+#     with the predicates a physical-memory manager actually asks —
+#     total usable bytes, the largest usable region, the first usable
+#     region of a given size and alignment, and whether an address is in
+#     the image at all.
+#   * The framebuffer geometry, and a `boot_report` a kernel prints
+#     once, before it touches hardware.
+#
+# Why model the receive side at all: a boot protocol is exactly the
+# place where a kernel is most likely to be wrong and least likely to
+# find out. The magic is one XOR away from a valid value, E820 and
+# Limine disagree about whether "usable" is 1 or 0, and a memory map
+# that claims 4 GiB of usable memory that the firmware has not actually
+# backed is a triple fault on first touch. Every constant and every
+# predicate a kernel needs is here, callable from a test.
+#
+# ON HEX: Halis has no hex literals, so every protocol constant below is
+# written as its exact integer value, with the hex form in the comment.
+# The values are the signed interpretation a 64-bit host would load, so
+# an ID above 2^63 reads negative — `boot_hex64` renders any of them
+# back to `0x...` for a boot log.
+# ============================================================================
+
+import "core.option"
+import "core.result"
+import "core.section"
+
+# ---------------------------------------------------------------------------
+# Multiboot2 — the header the firmware scans for
+# ---------------------------------------------------------------------------
+
+# mb2_magic: 0xE85250D6. The scan value: a firmware (or a loader that
+# looks for it) hunts for this exact 32-bit word in the image's first
+# 32 KiB, on an 8-byte-aligned boundary.
+fn mb2_magic() -> int {
+    return 3897708758
+}
+
+# mb2_arch_i386: 0 — the i386 protected-mode architecture tag. Multiboot2
+# only ever reports this one; the "architecture" field exists to leave
+# room for successors.
+fn mb2_arch_i386() -> int {
+    return 0
+}
+
+# The tag types a Halis kernel either emits or receives. The values are
+# the spec's; `1` (command line) and `8` (framebuffer) are the two a
+# printk-style early logger cares about.
+fn mb2_tag_end() -> int {
+    return 0
+}
+
+fn mb2_tag_cmdline() -> int {
+    return 1
+}
+
+fn mb2_tag_bootloader() -> int {
+    return 2
+}
+
+fn mb2_tag_module() -> int {
+    return 3
+}
+
+fn mb2_tag_basic_meminfo() -> int {
+    return 4
+}
+
+fn mb2_tag_mmap() -> int {
+    return 6
+}
+
+fn mb2_tag_framebuffer() -> int {
+    return 8
+}
+
+fn mb2_tag_elf_sections() -> int {
+    return 9
+}
+
+# The deprecated pre-1.0 tags, still emitted by some bootloaders.
+fn mb2_tag_old_mmap() -> int {
+    return 65536
+}
+
+fn mb2_tag_old_framebuffer() -> int {
+    return 65537
+}
+
+# mb2_tag_name: the stable name of a tag type ("" for the end tag, which
+# terminates the list rather than carrying information).
+fn mb2_tag_name(t: int) -> str {
+    if t == 0 {
+        return "end"
+    }
+    if t == 1 {
+        return "cmdline"
+    }
+    if t == 2 {
+        return "bootloader"
+    }
+    if t == 3 {
+        return "module"
+    }
+    if t == 4 {
+        return "basic-meminfo"
+    }
+    if t == 6 {
+        return "mmap"
+    }
+    if t == 8 {
+        return "framebuffer"
+    }
+    if t == 9 {
+        return "elf-sections"
+    }
+    if t == 65536 {
+        return "old-mmap"
+    }
+    if t == 65537 {
+        return "old-framebuffer"
+    }
+    return "unknown"
+}
+
+# mb2_tag_is_information: true for a tag a BOOTLOADER fills in (as
+# opposed to one a kernel emits in its own header). The information
+# structure is what EBX points at at handoff; the header is what the
+# bootloader scanned for. Conflating the two is a classic early-boot bug.
+fn mb2_tag_is_information(t: int) -> bool {
+    return t == 1 || t == 3 || t == 4 || t == 6 || t == 8 || t == 9
+}
+
+# One tag as it appears in a header or an information structure: a type,
+# a byte size, and the payload bytes that follow the 8-byte prefix.
+struct MbTag {
+    tag_type: int,
+    size: int,
+    payload: list[int]
+}
+
+fn mb_tag_new(tag_type: int, payload: list[int]) -> MbTag {
+    return MbTag { tag_type: tag_type, size: 8 + payload.len(), payload: payload }
+}
+
+# mb_tag_payload_ok: a tag is well-formed when its size covers the
+# 8-byte prefix and any payload, and when a string payload is
+# 0-terminated. A size shorter than 8 is how a malformed header turns
+# into an infinite walk.
+fn mb_tag_payload_ok(t: MbTag) -> bool {
+    if t.size < 8 {
+        return false
+    }
+    if t.payload.len() > t.size - 8 {
+        return false
+    }
+    return true
+}
+
+# The header as a whole. `length` is the total byte size of the header
+# INCLUDING the 16-byte fixed part and the end tag — the field the
+# checksum rule depends on.
+struct Mb2Header {
+    magic: int,
+    arch: int,
+    length: int,
+    checksum: int,
+    tags: list[MbTag]
+}
+
+# mb2_checksum: the spec's rule — the 32-bit sum of magic, architecture
+# and length, negated, so that all four fields together sum to zero.
+# Halis ints are 64-bit, so the negation is exact here; on the wire the
+# loader truncates to 32 bits, which is why the emitted C header
+# declares the fields `uint32_t`.
+fn mb2_checksum(magic: int, arch: int, length: int) -> int {
+    return 0 - (magic + arch + length)
+}
+
+# mb2_header_ok: the four-field validity test a kernel runs before it
+# trusts a word it found by scanning memory.
+fn mb2_header_ok(magic: int, arch: int, length: int, checksum: int) -> bool {
+    if magic != mb2_magic() {
+        return false
+    }
+    if arch != mb2_arch_i386() {
+        return false
+    }
+    if length < 24 {
+        return false
+    }
+    return checksum == mb2_checksum(magic, arch, length)
+}
+
+# Build a header: magic, architecture and checksum are derived, and the
+# end tag is appended automatically (a header without one walks off the
+# end of itself in every loader).
+fn mb2_header_new(tags: list[MbTag]) -> Mb2Header {
+    let mut all: list[MbTag] = tags
+    all.push(MbTag { tag_type: 0, size: 8, payload: [] })
+    let mut length: int = 16
+    let mut i: int = 0
+    while i < all.len() {
+        length = length + all.get(i).size
+        i = i + 1
+    }
+    return Mb2Header {
+        magic: mb2_magic(),
+        arch: mb2_arch_i386(),
+        length: length,
+        checksum: mb2_checksum(mb2_magic(), mb2_arch_i386(), length),
+        tags: all
+    }
+}
+
+# mb2_tag_count: how many tags of type `want` the header carries.
+fn mb2_tag_count(h: Mb2Header, want: int) -> int {
+    let mut n: int = 0
+    let mut i: int = 0
+    while i < h.tags.len() {
+        if h.tags.get(i).tag_type == want {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return n
+}
+
+# mb2_tag_at: the index of the n-th tag of type `want`, or -1. The n-th
+# is what you want for the tag types that may legitimately repeat (a
+# bootloader may list several modules).
+fn mb2_tag_at(h: Mb2Header, want: int, n: int) -> int {
+    let mut seen: int = 0
+    let mut i: int = 0
+    while i < h.tags.len() {
+        if h.tags.get(i).tag_type == want {
+            if seen == n {
+                return i
+            }
+            seen = seen + 1
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+# mb2_tag_present: does the header carry at least one tag of `want`?
+fn mb2_tag_present(h: Mb2Header, want: int) -> bool {
+    return mb2_tag_at(h, want, 0) >= 0
+}
+
+# mb2_header_well_formed: the end tag is present, every tag is
+# well-formed, and the declared length equals the sum of the parts. A
+# header that fails this is one a kernel must not walk.
+fn mb2_header_well_formed(h: Mb2Header) -> bool {
+    if !mb2_header_ok(h.magic, h.arch, h.length, h.checksum) {
+        return false
+    }
+    if h.tags.len() == 0 {
+        return false
+    }
+    if h.tags.get(h.tags.len() - 1).tag_type != 0 {
+        return false
+    }
+    let mut sum: int = 16
+    let mut i: int = 0
+    while i < h.tags.len() {
+        if !mb_tag_payload_ok(h.tags.get(i)) {
+            return false
+        }
+        sum = sum + h.tags.get(i).size
+        i = i + 1
+    }
+    return sum == h.length
+}
+
+# ---------------------------------------------------------------------------
+# Limine — the request list the firmware scans for
+# ---------------------------------------------------------------------------
+# A request ID is FOUR 64-bit words; the first two are common to every
+# request, the last two identify the feature. Halis ints are 64-bit, so
+# the values are the signed interpretation of the wire bytes.
+
+# limine_common_magic: { 0xc7b1dd30df4c8b88, 0x0a82e883a194f07b }.
+fn limine_common_magic() -> list[int] {
+    return [-4057218587309601912, 757423339400917115]
+}
+
+# The features a Halis kernel asks for. These IDs are load-bearing: a
+# typo means the bootloader silently ignores the request and the kernel
+# boots with no memory map. Each is `common + (id2, id3)`.
+fn limine_id_memmap() -> list[int] {
+    return [-4057218587309601912, 757423339400917115, 7480265251536666735, -2088354250109469598]
+}
+
+fn limine_id_framebuffer() -> list[int] {
+    return [-4057218587309601912, 757423339400917115, -7108888182325650059, -6695579390111469285]
+}
+
+fn limine_id_rsdp() -> list[int] {
+    return [-4057218587309601912, 757423339400917115, -4186241628161279165, 2838244430820790076]
+}
+
+fn limine_id_hhdm() -> list[int] {
+    return [-4057218587309601912, 757423339400917115, 5250337122116876370, 7176572410665641035]
+}
+
+fn limine_id_stack_size() -> list[int] {
+    return [-4057218587309601912, 757423339400917115, 2472177429088471334, -2176628667406947779]
+}
+
+fn limine_id_bootloader_info() -> list[int] {
+    return [-4057218587309601912, 757423339400917115, -770053032114053073, 2851947331932493632]
+}
+
+# limine_id_end: the end delimiter — two 64-bit words terminating the
+# request list. From base revision 2 on, a loader that finds it STOPS.
+fn limine_id_end() -> list[int] {
+    return [-5926490462068077309, -7677950585681327006]
+}
+
+# limine_id_start: the start delimiter — four 64-bit words. From base
+# revision 2 on it bounds the request search, so a kernel with a
+# `.rodata` full of 64-bit constants that happen to look like an ID
+# cannot confuse a loader.
+fn limine_id_start() -> list[int] {
+    return [-668515492378979922, -380243654171903537, 8672928822407193366, 1737987079877605849]
+}
+
+# limine_base_revision: { 0xf9562b2d5c95a6c8, 0x6a7b384944536bdc, N }.
+# A loader REWRITES the third word to 0 when it honoured the request,
+# or leaves it alone when it did not — so a kernel checks word 2.
+fn limine_base_revision(n: int) -> list[int] {
+    return [-480148836441545016, 7672788277485857756, n]
+}
+
+# limine_base_revision_honoured: the loader's answer, read back out of
+# the (possibly rewritten) tag.
+fn limine_base_revision_honoured(tag: list[int]) -> bool {
+    if tag.len() < 3 {
+        return false
+    }
+    if tag.get(0) != -480148836441545016 {
+        return false
+    }
+    if tag.get(1) != 7672788277485857756 {
+        return false
+    }
+    return tag.get(2) == 0
+}
+
+# limine_id_name: the stable name of a feature ID ("" for anything this
+# kernel does not know — an unknown ID is a feature a future loader
+# added, not an error).
+fn limine_id_name(id: list[int]) -> str {
+    if limine_id_is(id, limine_id_memmap()) {
+        return "memmap"
+    }
+    if limine_id_is(id, limine_id_framebuffer()) {
+        return "framebuffer"
+    }
+    if limine_id_is(id, limine_id_rsdp()) {
+        return "rsdp"
+    }
+    if limine_id_is(id, limine_id_hhdm()) {
+        return "hhdm"
+    }
+    if limine_id_is(id, limine_id_stack_size()) {
+        return "stack-size"
+    }
+    if limine_id_is(id, limine_id_bootloader_info()) {
+        return "bootloader-info"
+    }
+    return ""
+}
+
+# limine_id_is: exact four-word comparison. (A prefix comparison would
+# match a feature the loader added later that reuses the first two
+# common words — which is every future feature.)
+fn limine_id_is(id: list[int], want: list[int]) -> bool {
+    if id.len() != 4 {
+        return false
+    }
+    if want.len() != 4 {
+        return false
+    }
+    let mut i: int = 0
+    while i < 4 {
+        if id.get(i) != want.get(i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+# One request as the kernel recorded it: the scanned ID and the revision
+# the kernel asked for.
+struct LimineFeature {
+    id: list[int],
+    revision: int
+}
+
+fn limine_feature_new(id: list[int], revision: int) -> LimineFeature {
+    return LimineFeature { id: id, revision: revision }
+}
+
+# limine_feature_find: the index of the first feature with ID `want`,
+# or -1. (A loader REFUSES to boot an image carrying two of the same
+# request ID, so the list has at most one — but a kernel that scanned
+# its own image should not assume the loader checked.)
+fn limine_feature_find(fs: list[LimineFeature], want: list[int]) -> int {
+    let mut i: int = 0
+    while i < fs.len() {
+        if limine_id_is(fs.get(i).id, want) {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+# limine_feature_requested: did the kernel ask for `want`?
+fn limine_feature_requested(fs: list[LimineFeature], want: list[int]) -> bool {
+    return limine_feature_find(fs, want) >= 0
+}
+
+# limine_features_unique: no ID appears twice. The spec says a loader
+# must refuse such an image; checking it lets a kernel say WHY it
+# refused rather than mysteriously falling through to a panic.
+fn limine_features_unique(fs: list[LimineFeature]) -> bool {
+    let mut i: int = 0
+    while i < fs.len() {
+        let mut j: int = i + 1
+        while j < fs.len() {
+            if limine_id_is(fs.get(i).id, fs.get(j).id) {
+                return false
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return true
+}
+
+# limine_features_terminated: the request list ends with the end
+# delimiter, optionally after the start delimiter.
+fn limine_features_terminated(words: list[int]) -> bool {
+    if words.len() < 2 {
+        return false
+    }
+    return words.get(words.len() - 2) == -5926490462068077309
+        && words.get(words.len() - 1) == -7677950585681327006
+}
+
+# ---------------------------------------------------------------------------
+# The memory map — one model for both protocols
+# ---------------------------------------------------------------------------
+
+# The kinds both protocols report. E820 and Limine disagree about the
+# NUMBERS for the same meaning (E820 "available" is 1, Limine "usable"
+# is 0), which is exactly the kind of disagreement that should not
+# survive into a physical-memory manager: both map into THIS enum, and
+# only `mem_kind_from_e820` / `mem_kind_from_limine` know the wire
+# values.
+enum MemKind {
+    Usable, # free for the kernel
+    Reserved, # firmware or hardware; do not touch
+    AcpiReclaimable, # ACPI tables; reclaimable once ACPI is done
+    AcpiNvs, # ACPI non-volatile storage; never reclaim
+    BadMemory, # unreliable RAM; treat as reserved
+    BootloaderReclaimable, # loader scratch; reclaimable once unused
+    ExecutableAndModules, # the image itself
+    Framebuffer, # a legacy linear framebuffer
+    ReservedMapped, # reserved, but mapped and holding ACPI/SMBIOS/EFI
+    Unknown
+}
+
+fn mem_kind_name(k: MemKind) -> str {
+    return match k {
+        MemKind.Usable => "usable",
+        MemKind.Reserved => "reserved",
+        MemKind.AcpiReclaimable => "acpi-reclaimable",
+        MemKind.AcpiNvs => "acpi-nvs",
+        MemKind.BadMemory => "bad-memory",
+        MemKind.BootloaderReclaimable => "bootloader-reclaimable",
+        MemKind.ExecutableAndModules => "executable-and-modules",
+        MemKind.Framebuffer => "framebuffer",
+        MemKind.ReservedMapped => "reserved-mapped",
+        MemKind.Unknown => "unknown"
+    }
+}
+
+# mem_kind_code_e820: the E820 wire value for a kind (-1 for a kind
+# E820 has no name for — Limine-only kinds).
+fn mem_kind_code_e820(k: MemKind) -> int {
+    return match k {
+        MemKind.Usable => 1,
+        MemKind.Reserved => 2,
+        MemKind.AcpiReclaimable => 3,
+        MemKind.AcpiNvs => 4,
+        MemKind.BadMemory => 5,
+        _ => -1
+    }
+}
+
+# mem_kind_from_e820: an E820 type byte. The spec allows firmware to
+# report values above 5; those land in `Unknown`, and
+# `mem_kind_reclaimable` is false for it — a kernel that treated an
+# unknown region as free would hand the firmware's own scratch to its
+# page allocator.
+fn mem_kind_from_e820(t: int) -> MemKind {
+    if t == 1 {
+        return MemKind.Usable
+    }
+    if t == 2 {
+        return MemKind.Reserved
+    }
+    if t == 3 {
+        return MemKind.AcpiReclaimable
+    }
+    if t == 4 {
+        return MemKind.AcpiNvs
+    }
+    if t == 5 {
+        return MemKind.BadMemory
+    }
+    return MemKind.Unknown
+}
+
+# mem_kind_from_limine: a Limine memory-map type. NOTE the offset: Limine
+# starts at 0, E820 at 1.
+fn mem_kind_from_limine(t: int) -> MemKind {
+    if t == 0 {
+        return MemKind.Usable
+    }
+    if t == 1 {
+        return MemKind.Reserved
+    }
+    if t == 2 {
+        return MemKind.AcpiReclaimable
+    }
+    if t == 3 {
+        return MemKind.AcpiNvs
+    }
+    if t == 4 {
+        return MemKind.BadMemory
+    }
+    if t == 5 {
+        return MemKind.BootloaderReclaimable
+    }
+    if t == 6 {
+        return MemKind.ExecutableAndModules
+    }
+    if t == 7 {
+        return MemKind.Framebuffer
+    }
+    if t == 8 {
+        return MemKind.ReservedMapped
+    }
+    return MemKind.Unknown
+}
+
+# mem_kind_reclaimable: may a physical-memory manager hand this region
+# to the page allocator (YET)? Usable, yes. Bootloader-reclaimable and
+# ACPI-reclaimable, only after the loader and ACPI have finished with
+# them — a kernel that reclaims too early loses its own RSDP. AcpiNvs is
+# battery-backed settings the user expects to survive a reboot, and
+# BadMemory is unreliable, so neither is ever reclaimable.
+fn mem_kind_reclaimable(k: MemKind) -> bool {
+    return match k {
+        MemKind.Usable => true,
+        MemKind.BootloaderReclaimable => true,
+        MemKind.AcpiReclaimable => true,
+        _ => false
+    }
+}
+
+# mem_kind_usable_now: reclaimable with no ordering constraint at all.
+fn mem_kind_usable_now(k: MemKind) -> bool {
+    return match k {
+        MemKind.Usable => true,
+        _ => false
+    }
+}
+
+# One region of the memory map.
+struct MemRegion {
+    base: int,
+    length: int,
+    kind: MemKind
+}
+
+# mem_region_new: a region with a positive length. A zero- or
+# negative-length entry is a firmware bug; dropping it here is better
+# than letting it poison an alignment computation.
+fn mem_region_new(base: int, length: int, kind: MemKind) -> MemRegion {
+    if length < 0 {
+        panic("mem_region_new: length must be >= 0")
+    }
+    return MemRegion { base: base, length: length, kind: kind }
+}
+
+# mem_region_end: the first byte PAST the region.
+fn mem_region_end(r: MemRegion) -> int {
+    return r.base + r.length
+}
+
+# mem_region_contains: does the region cover `addr`? (An address exactly
+# at `end` belongs to whatever comes next.)
+fn mem_region_contains(r: MemRegion, addr: int) -> bool {
+    return addr >= r.base && addr < mem_region_end(r)
+}
+
+# mem_regions_overlap: do two regions share any byte?
+fn mem_regions_overlap(a: MemRegion, b: MemRegion) -> bool {
+    if a.length == 0 || b.length == 0 {
+        return false
+    }
+    return a.base < mem_region_end(b) && b.base < mem_region_end(a)
+}
+
+# mem_usable_bytes: the total a page allocator may use immediately.
+fn mem_usable_bytes(rs: list[MemRegion]) -> int {
+    let mut total: int = 0
+    let mut i: int = 0
+    while i < rs.len() {
+        let r: MemRegion = rs.get(i)
+        if mem_kind_usable_now(r.kind) {
+            total = total + r.length
+        }
+        i = i + 1
+    }
+    return total
+}
+
+# mem_reclaimable_bytes: the total once the loader and ACPI are done.
+fn mem_reclaimable_bytes(rs: list[MemRegion]) -> int {
+    let mut total: int = 0
+    let mut i: int = 0
+    while i < rs.len() {
+        let r: MemRegion = rs.get(i)
+        if mem_kind_reclaimable(r.kind) {
+            total = total + r.length
+        }
+        i = i + 1
+    }
+    return total
+}
+
+# mem_largest_usable: the largest immediately-usable region, or 0.
+fn mem_largest_usable(rs: list[MemRegion]) -> int {
+    let mut best: int = 0
+    let mut i: int = 0
+    while i < rs.len() {
+        let r: MemRegion = rs.get(i)
+        if mem_kind_usable_now(r.kind) && r.length > best {
+            best = r.length
+        }
+        i = i + 1
+    }
+    return best
+}
+
+# mem_find_usable: the base of the first immediately-usable region at
+# least `min_len` bytes long whose base is `align`-aligned, or -1. This
+# is the call a page allocator makes on day one, and returning -1
+# (rather than the best partial fit) is deliberate: a kernel that
+# started allocating from a 12 MiB "region" in a 16 GiB machine has
+# already mis-read the map.
+fn mem_find_usable(rs: list[MemRegion], min_len: int, align: int) -> int {
+    if min_len <= 0 {
+        panic("mem_find_usable: min_len must be positive")
+    }
+    if align <= 0 {
+        panic("mem_find_usable: align must be positive")
+    }
+    let mut i: int = 0
+    while i < rs.len() {
+        let r: MemRegion = rs.get(i)
+        if mem_kind_usable_now(r.kind) {
+            let start: int = align_up(r.base, align)
+            if mem_region_end(r) - start >= min_len {
+                return start
+            }
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+# mem_count_usable: how many immediately-usable regions the map has. Zero
+# means the map was misparsed, and is the single most useful assertion a
+# kernel can make about its boot information.
+fn mem_count_usable(rs: list[MemRegion]) -> int {
+    let mut n: int = 0
+    let mut i: int = 0
+    while i < rs.len() {
+        if mem_kind_usable_now(rs.get(i).kind) {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return n
+}
+
+# mem_contains: does ANY region cover `addr`? The check a kernel makes
+# before dereferencing a pointer a bootloader handed it.
+fn mem_contains(rs: list[MemRegion], addr: int) -> int {
+    let mut i: int = 0
+    while i < rs.len() {
+        if mem_region_contains(rs.get(i), addr) {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+# mem_sorted: is the map sorted by base address, lowest first? Both
+# protocols GUARANTEE it, so a kernel may assert it and then binary
+# search — which is exactly why the assertion is worth having.
+fn mem_sorted(rs: list[MemRegion]) -> bool {
+    let mut i: int = 1
+    while i < rs.len() {
+        if rs.get(i).base < rs.get(i - 1).base {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+# mem_sort: insertion sort by base (stable, and the map is a handful of
+# entries — an O(n^2) sort is the honest choice here).
+fn mem_sort(rs: list[MemRegion]) -> list[MemRegion] {
+    let mut out: list[MemRegion] = []
+    let mut i: int = 0
+    while i < rs.len() {
+        let r: MemRegion = rs.get(i)
+        let mut at: int = out.len()
+        let mut j: int = 0
+        while j < out.len() {
+            if out.get(j).base > r.base {
+                at = j
+                j = out.len()
+            } else {
+                j = j + 1
+            }
+        }
+        let mut fresh: list[MemRegion] = []
+        let mut k: int = 0
+        while k < out.len() {
+            if k == at {
+                fresh.push(r)
+            }
+            fresh.push(out.get(k))
+            k = k + 1
+        }
+        if at >= out.len() {
+            fresh.push(r)
+        }
+        out = fresh
+        i = i + 1
+    }
+    return out
+}
+
+# mem_no_overlaps: is the map internally consistent? Only the
+# non-usable kinds are allowed to overlap anything (a framebuffer page
+# shared with a usable region is normal); two USABLE regions must be
+# disjoint, or a page allocator would hand the same frame out twice.
+fn mem_no_overlaps(rs: list[MemRegion]) -> bool {
+    let mut i: int = 0
+    while i < rs.len() {
+        if mem_kind_usable_now(rs.get(i).kind) {
+            let mut j: int = i + 1
+            while j < rs.len() {
+                if mem_kind_usable_now(rs.get(j).kind) {
+                    if mem_regions_overlap(rs.get(i), rs.get(j)) {
+                        return false
+                    }
+                }
+                j = j + 1
+            }
+        }
+        i = i + 1
+    }
+    return true
+}
+
+# mem_report: a one-screen dump of the map, for the first serial line a
+# kernel prints. Fixed columns, hex addresses, one line per region.
+fn mem_report(rs: list[MemRegion]) -> str {
+    let mut s: str = "memory map: " + rs.len().to_str() + " region(s), "
+        + hex64(mem_usable_bytes(rs)) + " usable now, "
+        + hex64(mem_reclaimable_bytes(rs)) + " reclaimable\n"
+    let mut i: int = 0
+    while i < rs.len() {
+        let r: MemRegion = rs.get(i)
+        s = s + "  " + pad_right(hex64(r.base), 20)
+            + pad_right(hex64(r.length), 14)
+            + " " + mem_kind_name(r.kind) + "\n"
+        i = i + 1
+    }
+    return s
+}
+
+# ---------------------------------------------------------------------------
+# The framebuffer — the geometry both protocols report
+# ---------------------------------------------------------------------------
+
+# How the pixels are encoded. `Indexed` needs a palette lookup before
+# it can become a colour; `Rgb` does not. A kernel that assumes Rgb on
+# an indexed framebuffer paints whatever the palette happens to hold.
+enum FbKind {
+    Indexed,
+    Rgb
+}
+
+fn fb_kind_name(k: FbKind) -> str {
+    return match k {
+        FbKind.Indexed => "indexed",
+        FbKind.Rgb => "rgb"
+    }
+}
+
+struct Framebuffer {
+    address: int,
+    width: int,
+    height: int,
+    pitch: int,
+    bpp: int,
+    kind: FbKind
+}
+
+# fb_new: a framebuffer with self-consistent geometry. `pitch` is the
+# bytes per SCANLINE, which is not `width * bpp / 8` for every legacy
+# mode — reporting the pitch the firmware gave is the whole point.
+fn fb_new(address: int, width: int, height: int, pitch: int, bpp: int, kind: FbKind) -> Framebuffer {
+    if width <= 0 || height <= 0 {
+        panic("fb_new: width and height must be positive")
+    }
+    if bpp <= 0 {
+        panic("fb_new: bpp must be positive")
+    }
+    if pitch < (width * bpp) / 8 {
+        panic("fb_new: pitch is narrower than one line of pixels")
+    }
+    return Framebuffer {
+        address: address, width: width, height: height,
+        pitch: pitch, bpp: bpp, kind: kind
+    }
+}
+
+# fb_size: the bytes the framebuffer occupies (pitch * height — not
+# width * height * bpp/8, because a mode may pad each line).
+fn fb_size(f: Framebuffer) -> int {
+    return f.pitch * f.height
+}
+
+# fb_min_pitch: the narrowest pitch that would still hold the line, for
+# a kernel choosing to re-program the mode.
+fn fb_min_pitch(f: Framebuffer) -> int {
+    return (f.width * f.bpp) / 8
+}
+
+# fb_geometry_ok: is the framebuffer plausible? A 0x0 mode, a
+# zero-pitch mode, or a bpp that is not a whole number of bytes are all
+# firmware bugs a kernel should refuse to draw into.
+fn fb_geometry_ok(f: Framebuffer) -> bool {
+    if f.width <= 0 || f.height <= 0 {
+        return false
+    }
+    if f.pitch <= 0 {
+        return false
+    }
+    if f.bpp <= 0 || f.bpp % 8 != 0 {
+        return false
+    }
+    if f.pitch < fb_min_pitch(f) {
+        return false
+    }
+    return f.address != 0
+}
+
+# fb_report: the second line a kernel prints.
+fn fb_report(f: Framebuffer) -> str {
+    return "framebuffer: " + f.width.to_str() + "x" + f.height.to_str()
+        + " pitch " + f.pitch.to_str() + " " + f.bpp.to_str() + "bpp "
+        + fb_kind_name(f.kind) + " at " + hex64(f.address)
+        + " (" + fb_size(f).to_str() + " bytes)\n"
+}
+
+# ---------------------------------------------------------------------------
+# boot_report — what a kernel says once, before it touches hardware
+# ---------------------------------------------------------------------------
+
+# The two protocols, as a stable name.
+fn boot_protocol_name(multiboot2: bool) -> str {
+    if multiboot2 {
+        return "multiboot2"
+    }
+    return "limine"
+}
+
+# boot_report: the one-shot summary. A kernel prints exactly this at
+# entry; a mismatch between what it expected and what it got is the
+# cheapest possible diagnosis of a boot that dies three instructions
+# later.
+fn boot_report(protocol: str, rs: list[MemRegion], f: Framebuffer, fb_ok: bool) -> str {
+    let mut s: str = "Halis boot: protocol " + protocol
+        + ", " + mem_count_usable(rs).to_str() + " usable region(s)"
+        + ", largest " + hex64(mem_largest_usable(rs)) + "\n"
+    s = s + mem_report(rs)
+    if fb_ok {
+        s = s + fb_report(f)
+    } else {
+        s = s + "framebuffer: none\n"
+    }
+    if !mem_sorted(rs) {
+        s = s + "WARNING: memory map is not sorted by base address\n"
+    }
+    if !mem_no_overlaps(rs) {
+        s = s + "WARNING: two usable regions overlap\n"
+    }
+    if mem_count_usable(rs) == 0 {
+        s = s + "WARNING: no usable memory — the map was misparsed\n"
+    }
+    return s
+}
