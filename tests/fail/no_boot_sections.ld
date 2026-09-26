@@ -20,21 +20,6 @@ SECTIONS
         *(.rodata .rodata.*)
     }
 
-    /* Stage 85: the boot-protocol headers the C backend emits for a
-     * `#![boot_header(...)]` crate. Both are KEEP-ed: they are reached
-     * by a firmware scanning the image, never by a call, so without
-     * KEEP --gc-sections would drop exactly the bytes the bootloader
-     * is looking for. */
-    .multiboot_header : ALIGN(8)
-    {
-        KEEP(*(.multiboot_header))
-    }
-
-    .limine_requests : ALIGN(8)
-    {
-        KEEP(*(.limine_requests))
-    }
-
     .halis_metadata : ALIGN(8)
     {
         __halis_metadata_start = .;

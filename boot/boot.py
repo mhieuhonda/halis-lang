@@ -682,28 +682,38 @@ def print_audit(program, checker):
         print("  Stack budget: #![stack_size(%d)] — worst chain %d bytes "
               "(%s)" % (budget["budget"], budget["worst"],
                         " -> ".join(budget["path"])))
+    # Stage 85 (v0.104.0-alpha): the boot-protocol header a
+    # `#![boot_header(...)]` crate emits into its image.
+    boot = getattr(checker, "boot_header_info", None)
+    if boot:
+        print("  Boot header: %s (emitted into %s)"
+              % (boot["protocol"], boot["sections"][0]))
     # Stage 84 (v0.103.0-alpha): custom sections + the linker script that
     # places them. The checker proved every named section is covered (or
     # that no script was declared) before we get here.
-    link = getattr(checker, "link_script_info", None)
-    if link:
-        named = sorted({f["attrs"]["section"] for f in fns.values()
-                        if f.get("attrs", {}).get("section")})
-        if link["path"]:
-            print("  Linker script: %s — %d section(s) named, %d "
-                  "pattern(s) placed"
-                  % (link["path"], link["named"], link["placed"]))
-        else:
-            print("  Linker script: none declared (#![link_script] absent) "
-                  "— custom sections use the default linker layout")
-        for s in named:
-            print("    #[section(\"%s\")] x%d" % (
-                s, sum(1 for f in fns.values()
-                       if f.get("attrs", {}).get("section") == s)))
-        aligned = sum(1 for f in fns.values()
-                      if f.get("attrs", {}).get("align", -1) >= 0)
-        if aligned:
-            print("  #[align(N)] annotations: %d" % aligned)
+    # The linker-script line is printed whether or not the crate named a
+    # script: "none declared" is the answer half the time, and the
+    # self-hosted --audit has always said so.
+    link = getattr(checker, "link_script_info", None) or {"path": "",
+                                                         "named": 0,
+                                                         "placed": 0}
+    if link["path"]:
+        print("  Linker script: %s — %d section(s) named, %d "
+              "pattern(s) placed"
+              % (link["path"], link["named"], link["placed"]))
+    else:
+        print("  Linker script: none declared (#![link_script] absent) "
+              "— custom sections use the default linker layout")
+    named = sorted({f["attrs"]["section"] for f in fns.values()
+                    if f.get("attrs", {}).get("section")})
+    for s in named:
+        print("    #[section(\"%s\")] x%d" % (
+            s, sum(1 for f in fns.values()
+                   if f.get("attrs", {}).get("section") == s)))
+    aligned = sum(1 for f in fns.values()
+                  if f.get("attrs", {}).get("align", -1) >= 0)
+    if aligned:
+        print("  #[align(N)] annotations: %d" % aligned)
     # Active vs reserved effects table.
     print("")
     print("  Active effects:    IO, Fs, Clock, Args, Exit, Net, Rand, Proc, Conc")

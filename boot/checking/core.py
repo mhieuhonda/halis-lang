@@ -247,11 +247,12 @@ class CheckerCore(object):
         # boot↔hlc parity gap (boot used to parse the attribute and
         # silently ignore the bound).
         self.check_stack_size_attrs()
-        # 2.8 Stage 84 (v0.103.0-alpha): linker-script integration. The
-        # `#[section("X")]` attributes are validated on the AST only,
-        # and the `#![link_script("...")]` attribute (if present) is
-        # read from disk and every section the program names must be
-        # placed by the script's SECTIONS block.
+        # 2.8 Stage 84 (v0.103.0-alpha) + Stage 85 (v0.104.0-alpha):
+        # the emitted boot header, then the linker script. Both read the
+        # crate attributes off `self.p`, so the order is for the reader
+        # rather than for correctness: the header rule is stated first,
+        # and the script check then has to place the section it names.
+        self.check_boot_header()
         self.check_link_script()
         # 3. check function bodies
         for key, fn in self.fns.items():
@@ -503,6 +504,54 @@ class CheckerCore(object):
     # This pass turns both into compile errors. It runs on the AST only
     # (attributes + the crate attribute), so it costs nothing and needs
     # no types.
+    # ---------- Stage 85 (v0.104.0-alpha): boot-protocol header ------
+    # `#![boot_header(multiboot2 | limine)]` makes the C backend emit the
+    # protocol header the firmware scans for. Two rules, both load-bearing:
+    #
+    #   1. The crate must be `#![freestanding]`. A hosted image is linked
+    #      with a libc that owns `_start`; a boot header in an image the
+    #      firmware never loads is decoration, and a kernel author who
+    #      meant it should be told at compile time rather than at boot.
+    #   2. When the crate also names a linker script, that script must
+    #      PLACE the header's section. This is the Stage 84 machinery
+    #      pointed at the one section whose absence is completely silent
+    #      — a bootloader that scans for the magic and finds nothing
+    #      simply refuses to boot, with no diagnostic anywhere.
+    def boot_protocol(self):
+        for a in self.p.get("crate_attrs", []):
+            if a.get("name") == "boot_header":
+                return a.get("value") or ""
+        return ""
+
+    def boot_header_line(self):
+        for a in self.p.get("crate_attrs", []):
+            if a.get("name") == "boot_header":
+                return a.get("line", 0)
+        return 0
+
+    def boot_header_sections(self):
+        """The output section the declared protocol's header lands in."""
+        proto = self.boot_protocol()
+        if not proto:
+            return []
+        from ..parser import BOOT_HEADER_SECTION
+        return [BOOT_HEADER_SECTION[proto]]
+
+    def check_boot_header(self):
+        proto = self.boot_protocol()
+        if not proto:
+            self.boot_header_info = None
+            return
+        if not self.crate_modes()["freestanding"]:
+            self.err(
+                "crate #![boot_header(%s)] requires #![freestanding] — a "
+                "boot header only means something in an image the "
+                "firmware loads itself (a hosted image is linked with a "
+                "libc that owns `_start`)" % proto,
+                {"line": self.boot_header_line()})
+        self.boot_header_info = {"protocol": proto,
+                                 "sections": self.boot_header_sections()}
+
     def check_link_script(self):
         import os as _os
         sections = []
@@ -549,6 +598,19 @@ class CheckerCore(object):
                         "function. Add an output section that matches it "
                         "(e.g. `%s : { KEEP(*(%s)) }`)."
                         % (sec, fn["name"], raw, sec, sec), fn)
+            # Stage 85: the emitted boot header is just another section,
+            # and it is the one section a firmware will NOT find unless
+            # the script KEEPs it. Same check, same rationale.
+            for sec in self.boot_header_sections():
+                if not linkerscript.covers(placed, sec):
+                    self.err(
+                        "crate #![boot_header(%s)]: the emitted header lands "
+                        "in %s, which the linker script %s does not place — "
+                        "the bootloader would scan the image and find "
+                        "nothing. Add an output section that KEEPs it "
+                        "(e.g. `%s : { KEEP(*(%s)) }`)."
+                        % (self.boot_protocol(), sec, raw, sec, sec),
+                        {"line": self.boot_header_line()})
             self.link_script_info = {
                 "path": path, "named": len(sections),
                 "placed": len(placed),

@@ -140,7 +140,7 @@ remains green.
 | 82 | Stack-overflow guard page + deterministic stack size | ✅ | (done in v0.101.0-alpha) |
 | 83 | Inline-asm register constraints (clobber, input, output) | ✅ | (done in v0.102.0-alpha) |
 | 84 | Linker-script integration (`link.ld`) + custom sections | ✅ | (done in v0.103.0-alpha) |
-| 85 | Multiboot2 + Limine-compliant boot protocol headers | ⬜ | 4 weeks |
+| 85 | Multiboot2 + Limine-compliant boot protocol headers | ✅ | (done in v0.104.0-alpha) |
 | 86 | `core.interrupt` — IDT/GDT declaration syntax | ⬜ | 6 weeks |
 | 87 | `core.mmio` — memory-mapped-IO helpers (volatile reads/writes) | ⬜ | 3 weeks |
 | 88 | `core.port` — x86 I/O port invariants (`inb`/`outb` typesafe) | ⬜ | 2 weeks |

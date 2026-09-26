@@ -1,0 +1,434 @@
+# ============================================================================
+# examples/boot_demo.hls — Stage 85: Multiboot2 + Limine boot protocols
+# ----------------------------------------------------------------------------
+# What a kernel does with the boot information, modelled: build the
+# memory map a firmware would report, build the Multiboot2 header a
+# kernel emits, build the Limine request list a kernel asks with, and
+# then ask the questions a physical-memory manager actually asks on day
+# one — how much memory may I use, where does my first frame come from,
+# and is the map even self-consistent.
+#
+# The two protocols disagree about the NUMBER for the same meaning
+# (E820 "available" is 1, Limine "usable" is 0). Everything below goes
+# through `mem_kind_from_e820` / `mem_kind_from_limine`, so the
+# physical-memory manager never sees a wire value.
+# ============================================================================
+
+import "core.boot"
+import "core.result"
+import "core.section"
+
+# The memory map a UEFI firmware reports to a Multiboot2 kernel: the
+# first KiB is never usable (base revision 0 of Limine makes the same
+# promise), then the conventional low memory, the kernel image itself,
+# the framebuffer, and everything above 4 GiB.
+fn e820_map() -> list[MemRegion] {
+    let mut rs: list[MemRegion] = []
+    rs.push(mem_region_new(0, 4096, MemKind.Reserved))
+    rs.push(mem_region_new(4096, 63487, MemKind.Usable))
+    rs.push(mem_region_new(983040, 1044480, MemKind.Usable))
+    rs.push(mem_region_new(206569472, 4096, MemKind.AcpiReclaimable))
+    rs.push(mem_region_new(206573568, 8192, MemKind.AcpiNvs))
+    rs.push(mem_region_new(541065216, 4261412864, MemKind.Usable))
+    rs.push(mem_region_new(2147483648, 1073741824, MemKind.BootloaderReclaimable))
+    rs.push(mem_region_new(6133784576, 1048576, MemKind.Framebuffer))
+    return rs
+}
+
+# The same machine described the Limine way. Note `Usable` is type 0
+# here and 1 in E820; the region itself is identical.
+fn limine_map() -> list[MemRegion] {
+    let mut rs: list[MemRegion] = []
+    rs.push(mem_region_new(0, 4096, mem_kind_from_limine(1)))
+    rs.push(mem_region_new(4096, 63487, mem_kind_from_limine(0)))
+    rs.push(mem_region_new(983040, 1044480, mem_kind_from_limine(0)))
+    rs.push(mem_region_new(206569472, 4096, mem_kind_from_limine(2)))
+    rs.push(mem_region_new(206573568, 8192, mem_kind_from_limine(3)))
+    rs.push(mem_region_new(541065216, 4261412864, mem_kind_from_limine(0)))
+    rs.push(mem_region_new(2147483648, 1073741824, mem_kind_from_limine(5)))
+    rs.push(mem_region_new(6133784576, 1048576, mem_kind_from_limine(7)))
+    return rs
+}
+
+# The request list a Halis kernel asks for — exactly the set the C
+# backend emits into `.limine_requests`.
+fn limine_requests() -> list[LimineFeature] {
+    let mut fs: list[LimineFeature] = []
+    fs.push(limine_feature_new(limine_id_memmap(), 0))
+    fs.push(limine_feature_new(limine_id_framebuffer(), 0))
+    fs.push(limine_feature_new(limine_id_rsdp(), 0))
+    fs.push(limine_feature_new(limine_id_hhdm(), 0))
+    fs.push(limine_feature_new(limine_id_stack_size(), 0))
+    return fs
+}
+
+fn main() -> int uses IO {
+    # ------------------------------------------------------------------
+    # The memory map, and that both protocols land on the same model
+    # ------------------------------------------------------------------
+    let e820: list[MemRegion] = e820_map()
+    let lim: list[MemRegion] = limine_map()
+    if e820.len() != lim.len() {
+        println("boot_demo: the two maps disagree on region count")
+        return 1
+    }
+    let mut i: int = 0
+    while i < e820.len() {
+        if e820.get(i).base != lim.get(i).base {
+            println("boot_demo: the two maps disagree on a base address")
+            return 2
+        }
+        if e820.get(i).length != lim.get(i).length {
+            println("boot_demo: the two maps disagree on a length")
+            return 3
+        }
+        if mem_kind_name(e820.get(i).kind) != mem_kind_name(lim.get(i).kind) {
+            println("boot_demo: the two maps disagree on a kind: "
+            + mem_kind_name(e820.get(i).kind) + " vs "
+            + mem_kind_name(lim.get(i).kind))
+            return 4
+        }
+        i = i + 1
+    }
+
+    # ------------------------------------------------------------------
+    # The questions a page allocator asks on day one
+    # ------------------------------------------------------------------
+    let usable: int = mem_usable_bytes(e820)
+    if usable != 63487 + 1044480 + 4261412864 {
+        println("boot_demo: wrong usable total")
+        return 5
+    }
+    # Reclaimable is strictly more: the loader's own 1 GiB is free once
+    # the kernel no longer needs its page tables, and the ACPI table
+    # region once ACPI is done with it.
+    if mem_reclaimable_bytes(e820) <= usable {
+        println("boot_demo: reclaimable should exceed usable")
+        return 6
+    }
+    if mem_largest_usable(e820) != 4261412864 {
+        println("boot_demo: wrong largest usable region")
+        return 7
+    }
+    if mem_count_usable(e820) != 3 {
+        println("boot_demo: wrong usable region count")
+        return 8
+    }
+    # `mem_find_usable` returns the first region that SATISFIES the
+    # request, or -1 — never the best partial fit. A 512-KiB request is
+    # met by the 1019-KiB region above 1 MiB; a 1-MiB request is not,
+    # and the search continues to the large region rather than handing
+    # back a region that would run out halfway through the first
+    # mapping.
+    if mem_find_usable(e820, 524288, 4096) != 983040 {
+        println("boot_demo: first usable 512-KiB region is wrong")
+        return 9
+    }
+    if mem_find_usable(e820, 1048576, 4096) != 541065216 {
+        println("boot_demo: first usable 1-MiB region is wrong")
+        return 10
+    }
+    # Asking for 1-GiB alignment moves the start to the next 1-GiB
+    # boundary inside the same region, and the region is still big
+    # enough afterwards.
+    if mem_find_usable(e820, 1048576, 1073741824) != 1073741824 {
+        println("boot_demo: a 1-GiB alignment must move the start")
+        return 11
+    }
+    # 2^40 bytes: a request no real machine satisfies.
+    if mem_find_usable(e820, 1099511627776, 4096) != -1 {
+        println("boot_demo: a 1-TiB request must not be satisfied")
+        return 12
+    }
+    # Both protocols GUARANTEE the map arrives sorted by base, lowest
+    # first — which is what lets a kernel binary-search it, so the
+    # guarantee is worth asserting rather than assuming.
+    if !mem_sorted(e820) {
+        println("boot_demo: the map is not sorted by base address")
+        return 13
+    }
+    if !mem_no_overlaps(e820) {
+        println("boot_demo: two usable regions overlap")
+        return 14
+    }
+    # A firmware that breaks the guarantee is still usable: sort a copy.
+    let mut shuffled: list[MemRegion] = []
+    shuffled.push(e820.get(3))
+    shuffled.push(e820.get(0))
+    shuffled.push(e820.get(2))
+    if mem_sorted(shuffled) {
+        println("boot_demo: a deliberately shuffled list is not sorted")
+        return 15
+    }
+    let fixed: list[MemRegion] = mem_sort(shuffled)
+    if !mem_sorted(fixed) || fixed.get(0).base != 0 || fixed.get(2).base != 206569472 {
+        println("boot_demo: mem_sort did not restore the order")
+        return 16
+    }
+    # Two usable regions that share a byte are a map a page allocator
+    # would turn into a double allocation — the map is not safe to use.
+    let mut clash: list[MemRegion] = []
+    clash.push(mem_region_new(1048576, 8192, MemKind.Usable))
+    clash.push(mem_region_new(1048576 + 4096, 8192, MemKind.Usable))
+    if mem_no_overlaps(clash) {
+        println("boot_demo: overlapping usable regions must be rejected")
+        return 17
+    }
+    # An overlap between a usable region and a RESERVED one is normal
+    # (a framebuffer page shared with usable memory) and must be
+    # tolerated.
+    let mut mixed: list[MemRegion] = []
+    mixed.push(mem_region_new(1048576, 8192, MemKind.Usable))
+    mixed.push(mem_region_new(1048576 + 4096, 8192, MemKind.Framebuffer))
+    if !mem_no_overlaps(mixed) {
+        println("boot_demo: a framebuffer sharing a page is normal")
+        return 18
+    }
+    # Address 0 is the first (reserved) region; 1000000 is in the
+    # 1019-KiB usable region; 100000000 falls in the gap between 2 MiB
+    # and the ACPI tables and belongs to nothing at all.
+    if mem_contains(e820, 0) != 0 {
+        println("boot_demo: address 0 must be in the first region")
+        return 19
+    }
+    if mem_contains(e820, 1000000) != 2 {
+        println("boot_demo: address 1000000 must be in the third region")
+        return 20
+    }
+    if mem_contains(e820, 100000000) != -1 {
+        println("boot_demo: an address in a gap belongs to no region")
+        return 21
+    }
+    # The loader's 1 GiB is reclaimable but NOT usable-now: taking it
+    # on day one overwrites the page tables this kernel is running on.
+    let scratch: MemRegion = e820.get(6)
+    if mem_kind_reclaimable(scratch.kind) != true {
+        println("boot_demo: bootloader-reclaimable must be reclaimable")
+        return 22
+    }
+    if mem_kind_usable_now(scratch.kind) != false {
+        println("boot_demo: bootloader-reclaimable must not be usable now")
+        return 23
+    }
+    # ACPI NVS is battery-backed settings: never reclaimable, ever.
+    if mem_kind_reclaimable(mem_kind_from_e820(4)) != false {
+        println("boot_demo: ACPI NVS must never be reclaimable")
+        return 24
+    }
+    # An E820 type the spec does not define lands in Unknown, and Unknown
+    # is not reclaimable — a kernel that guessed would hand the
+    # firmware's own scratch to its page allocator.
+    if mem_kind_reclaimable(mem_kind_from_e820(99)) != false {
+        println("boot_demo: an unknown E820 type must not be reclaimable")
+        return 25
+    }
+
+    # ------------------------------------------------------------------
+    # The Multiboot2 header this crate emits
+    # ------------------------------------------------------------------
+    let h: Mb2Header = mb2_header_new([])
+    if !mb2_header_well_formed(h) {
+        println("boot_demo: the emitted Multiboot2 header is malformed")
+        return 26
+    }
+    if h.length != 24 {
+        println("boot_demo: a bare header (fixed part + end tag) is 24 bytes")
+        return 27
+    }
+    if h.checksum != mb2_checksum(mb2_magic(), mb2_arch_i386(), h.length) {
+        println("boot_demo: checksum rule broken")
+        return 28
+    }
+    if mb2_tag_present(h, mb2_tag_end()) != true {
+        println("boot_demo: the header must end with the end tag")
+        return 29
+    }
+    if mb2_tag_present(h, mb2_tag_module()) != false {
+        println("boot_demo: a bare header carries no module tag")
+        return 30
+    }
+    # A header the loader will NOT accept: a wrong magic, a wrong
+    # architecture, a too-short length, or a stale checksum.
+    if mb2_header_ok(mb2_magic() + 1, mb2_arch_i386(), 24, h.checksum) {
+        println("boot_demo: a wrong magic must be rejected")
+        return 31
+    }
+    if mb2_header_ok(mb2_magic(), 1, 24, h.checksum) {
+        println("boot_demo: a wrong architecture must be rejected")
+        return 32
+    }
+    if mb2_header_ok(mb2_magic(), mb2_arch_i386(), 8, h.checksum) {
+        println("boot_demo: a too-short length must be rejected")
+        return 33
+    }
+    if mb2_header_ok(mb2_magic(), mb2_arch_i386(), 24, 0) {
+        println("boot_demo: a wrong checksum must be rejected")
+        return 34
+    }
+    if mb_tag_payload_ok(MbTag {
+        tag_type: 4, size: 4, payload: []
+    }) != false {
+        println("boot_demo: a tag smaller than its own prefix is malformed")
+        return 35
+    }
+    if mb2_tag_name(mb2_tag_mmap()) != "mmap" || mb2_tag_name(999) != "unknown" {
+        println("boot_demo: tag names are wrong")
+        return 36
+    }
+    # A module tag is INFORMATION (the loader fills it in), a bootloader
+    # tag is not — the header is what the loader scans for, the
+    # information structure is what EBX points at. Conflating them is a
+    # classic early-boot bug.
+    if mb2_tag_is_information(mb2_tag_module()) != true {
+        println("boot_demo: the module tag is information")
+        return 37
+    }
+    if mb2_tag_is_information(mb2_tag_end()) != false {
+        println("boot_demo: the end tag is not information")
+        return 38
+    }
+
+    # ------------------------------------------------------------------
+    # The Limine request list this crate emits
+    # ------------------------------------------------------------------
+    let fs: list[LimineFeature] = limine_requests()
+    if !limine_features_unique(fs) {
+        println("boot_demo: a loader REFUSES an image with a duplicate request")
+        return 39
+    }
+    let mut dup: list[LimineFeature] = []
+    dup.push(limine_feature_new(limine_id_memmap(), 0))
+    dup.push(limine_feature_new(limine_id_memmap(), 0))
+    if limine_features_unique(dup) {
+        println("boot_demo: a duplicate request must be detected")
+        return 40
+    }
+    if !limine_feature_requested(fs, limine_id_memmap()) {
+        println("boot_demo: the memory map request is missing")
+        return 41
+    }
+    if limine_feature_requested(fs, limine_id_bootloader_info()) {
+        println("boot_demo: this kernel does not ask for bootloader info")
+        return 42
+    }
+    if limine_feature_find(fs, limine_id_framebuffer()) != 1 {
+        println("boot_demo: feature lookup is wrong")
+        return 43
+    }
+    if limine_feature_find(fs, limine_id_stack_size()) != 4 {
+        println("boot_demo: feature lookup is wrong")
+        return 44
+    }
+    # The end delimiter: a loader that does not see one keeps scanning
+    # the whole image, and may pick up a 64-bit constant from .rodata
+    # that happens to look like a request.
+    let delim: list[int] = limine_id_end()
+    let mut words: list[int] = []
+    words.push(delim.get(0))
+    words.push(delim.get(1))
+    if !limine_features_terminated(words) {
+        println("boot_demo: the end delimiter was not recognised")
+        return 45
+    }
+    # Base revision: the loader rewrites the third word to 0 when it
+    # honoured the request, and leaves it alone when it did not.
+    # A tag still carrying 3 means the loader did NOT honour the
+    # request: it either does not know base revision 3 or dropped
+    # support, and the spec says the EXECUTABLE is the one that has to
+    # notice and fail.
+    if limine_base_revision_honoured(limine_base_revision(3)) {
+        println("boot_demo: an untouched base-revision tag must read unfulfilled")
+        return 46
+    }
+    let mut honoured: list[int] = limine_base_revision(3)
+    honoured.set(2, 0)
+    if !limine_base_revision_honoured(honoured) {
+        println("boot_demo: a zeroed base revision must read as honoured")
+        return 47
+    }
+    # A tag that is not a base-revision tag at all (too short, or the
+    # wrong magic) never reads as honoured.
+    if limine_base_revision_honoured([1, 2]) {
+        println("boot_demo: a two-word tag is not a base-revision tag")
+        return 48
+    }
+    let mut bogus: list[int] = limine_base_revision(3)
+    bogus.set(0, 12345)
+    if limine_base_revision_honoured(bogus) {
+        println("boot_demo: a wrong magic must not read as honoured")
+        return 49
+    }
+    if limine_id_name(limine_id_hhdm()) != "hhdm" || limine_id_name(limine_id_rsdp()) != "rsdp" {
+        println("boot_demo: feature names are wrong")
+        return 50
+    }
+    if limine_id_name([1, 2, 3, 4]) != "" {
+        println("boot_demo: an unknown feature ID has no name")
+        return 51
+    }
+
+    # ------------------------------------------------------------------
+    # The framebuffer. The three malformed modes below are built with
+    # `fb_raw` — the UNCHECKED constructor — because a kernel reading
+    # firmware data must never panic on it; it needs a value
+    # `fb_geometry_ok` can reject.
+    # ------------------------------------------------------------------
+    let fb: Framebuffer = fb_new(1073741824, 1024, 768, 4096, 32, FbKind.Rgb)
+    if !fb_geometry_ok(fb) {
+        println("boot_demo: a sane framebuffer was rejected")
+        return 52
+    }
+    if fb_size(fb) != 4096 * 768 {
+        println("boot_demo: the framebuffer size must be pitch * height")
+        return 53
+    }
+    if fb_min_pitch(fb) != 4096 {
+        println("boot_demo: 1024 * 4 bytes is one line")
+        return 54
+    }
+    if fb_geometry_ok(fb_raw(0, 1024, 768, 4096, 32, FbKind.Rgb)) {
+        println("boot_demo: a framebuffer at address 0 is never real")
+        return 55
+    }
+    if fb_geometry_ok(fb_raw(1073741824, 1024, 768, 2048, 32, FbKind.Rgb)) {
+        println("boot_demo: a pitch narrower than a line is malformed")
+        return 56
+    }
+    # 15 bpp (16-bit colour in a 15-bit field) is a real legacy mode but
+    # it is NOT a whole number of BYTES, so a kernel cannot address a
+    # pixel with a byte stride — reject rather than round.
+    if fb_geometry_ok(fb_raw(1073741824, 1024, 768, 4096, 15, FbKind.Rgb)) {
+        println("boot_demo: 15 bpp is not a whole number of bytes")
+        return 57
+    }
+    if fb_geometry_ok(fb_raw(1073741824, 1024, 768, 4096, 0, FbKind.Rgb)) {
+        println("boot_demo: a 0-bpp mode is not a mode")
+        return 58
+    }
+    if fb_geometry_ok(fb_raw(1073741824, 0, 768, 4096, 32, FbKind.Rgb)) {
+        println("boot_demo: a 0-px-wide mode is not a mode")
+        return 59
+    }
+    # 24 bpp IS legitimate (packed RGB), so it must be accepted.
+    if !fb_geometry_ok(fb_raw(1073741824, 1024, 768, 3072, 24, FbKind.Rgb)) {
+        println("boot_demo: a well-formed 24-bpp mode must be accepted")
+        return 60
+    }
+    # An indexed framebuffer is a different thing: the palette has to be
+    # applied before the pixels mean anything.
+    if fb_kind_name(FbKind.Rgb) == "" {
+        println("boot_demo: kind names must not be empty")
+        return 61
+    }
+
+    print(boot_report(boot_protocol_name(true), e820, fb, true))
+    print("multiboot2: header " + h.length.to_str() + " bytes, magic "
+    + hex64(mb2_magic()) + ", tags " + h.tags.len().to_str()
+    + ", well-formed " + mb2_header_well_formed(h).to_str() + "\n")
+    print("limine: " + fs.len().to_str() + " requests, memmap id "
+    + hex64(limine_id_memmap().get(2)) + " unique "
+    + limine_features_unique(fs).to_str() + "\n")
+    print("boot_protocol_name(limine) = " + boot_protocol_name(false) + "\n")
+    println("DEMO OK")
+    return 0
+}

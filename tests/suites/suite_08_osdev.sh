@@ -595,3 +595,102 @@ else
     bad "link: make link-acceptance failed"
     tail -15 "$TMP/link_acc84.log"
 fi
+
+echo "=== 22. Stage 85: Multiboot2 + Limine boot protocol headers ==="
+# Stage 85 (v0.104.0-alpha): `#![boot_header(...)]` makes the C backend
+# emit the header a firmware scans for, and the Stage 84 placement
+# check proves the linker script KEEPs it. The gate is the authority;
+# these are the suite-level spot checks.
+BOOT_F=tests/ok/feat_stage85_boot.hls
+boot_interp=$(python3 boot/boot.py "$BOOT_F" </dev/null 2>/dev/null); boot_code=$?
+if [ "$boot_code" -eq 0 ]; then
+    ok "boot: feat_stage85_boot runs on the interpreter (exit 0)"
+else
+    bad "boot: feat_stage85_boot interpreter exit=$boot_code"
+fi
+if [ -f core/boot.hls ] && grep -q "fn mb2_header_ok" core/boot.hls; then
+    ok "boot: core/boot.hls present"
+else
+    bad "boot: core/boot.hls missing"
+fi
+# Every Stage 85 fail program is rejected by BOTH compilers with the
+# SAME message.
+for bf in tests/fail/fail_stage85_*.hls; do
+    boot_name=$(basename "$bf" .hls)
+    boot_err=$(python3 boot/boot.py --check "$bf" 2>&1 >/dev/null); boot_rc=$?
+    if [ "$boot_rc" -ne 1 ]; then
+        bad "boot: $boot_name not rejected by boot"
+        continue
+    fi
+    boot_err2=$("$TMP/hlc1" --audit "$bf" 2>&1 >/dev/null); boot_rc2=$?
+    if [ "$boot_rc2" -eq 0 ]; then
+        bad "boot: $boot_name accepted by hlc (parity)"
+        continue
+    fi
+    boot_m1=$(printf '%s\n' "$boot_err"  | sed -E 's/^[a-z ]*error: //')
+    boot_m2=$(printf '%s\n' "$boot_err2" | sed -E 's/^panic: //; s/^[a-z ]*error: //')
+    if [ "$boot_m1" = "$boot_m2" ] && [ -n "$boot_m1" ]; then
+        ok "boot: $boot_name rejected by both compilers (identical diagnostic)"
+    else
+        bad "boot: $boot_name diagnostics differ"
+        echo "        boot: $boot_m1"
+        echo "        hlc:  $boot_m2"
+    fi
+done
+# The four CHECKED constructors are accepted by the checker and panic
+# at run time — that split is the point (a kernel must be able to model
+# a bad mode without panicking on firmware bytes).
+for bp in tests/ok/panic_stage85_*.hls; do
+    bp_name=$(basename "$bp" .hls)
+    if python3 boot/boot.py --check "$bp" >/dev/null 2>&1; then
+        bp_out=$(python3 boot/boot.py "$bp" 2>&1 >/dev/null); bp_code=$?
+        if [ "$bp_code" -eq 101 ] && [ -n "$bp_out" ]; then
+            ok "boot: $bp_name accepted, panics at run time"
+        else
+            bad "boot: $bp_name did not panic (exit=$bp_code)"
+        fi
+    else
+        bad "boot: $bp_name must be ACCEPTED by the checker"
+    fi
+done
+# The emitted header really is in its section in the LINKED image.
+if [ -x "$TMP/hlc1" ] && command -v objdump >/dev/null 2>&1; then
+    if "$TMP/hlc1" examples/boot_kernel.hls "$TMP/k85.c" >/dev/null 2>&1 \
+        && gcc -O2 -ffreestanding -nostdlib -fno-pie -no-pie \
+            -ffunction-sections -fno-stack-protector -T link.ld \
+            -o "$TMP/k85.elf" "$TMP/k85.c" 2>/dev/null; then
+        if objdump -h "$TMP/k85.elf" 2>/dev/null | grep -q "limine_requests"; then
+            ok "boot: the kernel image carries .limine_requests"
+        else
+            bad "boot: the kernel image has no .limine_requests"
+        fi
+    else
+        bad "boot: the kernel image did not link"
+    fi
+else
+    bad "boot: cannot link the kernel image (\$TMP/hlc1 missing or no objdump)"
+fi
+# The demos.
+if "$TMP/hlc1" examples/boot_demo.hls "$TMP/bd85.c" >/dev/null 2>&1 \
+    && gcc -O2 -o "$TMP/bd85" "$TMP/bd85.c" -lm -pthread 2>/dev/null; then
+    bd_out=$("$TMP/bd85" </dev/null 2>/dev/null)
+    if echo "$bd_out" | grep -q "DEMO OK"; then
+        ok "boot: examples/boot_demo.hls runs natively, DEMO OK"
+    else
+        bad "boot: boot_demo did not print DEMO OK"
+    fi
+else
+    bad "boot: boot_demo failed to build"
+fi
+# make boot-acceptance runs end-to-end.
+if make boot-acceptance >"$TMP/boot_acc85.log" 2>&1; then
+    if grep -q "ACCEPTANCE OK: Stage 85" "$TMP/boot_acc85.log"; then
+        ok "boot: make boot-acceptance runs end-to-end"
+    else
+        bad "boot: make boot-acceptance did not print ACCEPTANCE OK"
+        tail -5 "$TMP/boot_acc85.log"
+    fi
+else
+    bad "boot: make boot-acceptance failed"
+    tail -15 "$TMP/boot_acc85.log"
+fi

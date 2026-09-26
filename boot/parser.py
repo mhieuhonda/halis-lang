@@ -39,7 +39,21 @@ IO_FAMILY = {"IO", "Fs", "Clock", "Args", "Exit"}
 #                  computes every fn's worst-case frame, walks the
 #                  call graph, rejects recursion cycles outright, and
 #                  proves the worst chain fits inside N bytes.
-CRATE_ATTRS = {"freestanding", "no_std", "stack_size", "link_script"}
+CRATE_ATTRS = {"freestanding", "no_std", "stack_size", "link_script",
+               "boot_header"}
+
+# Stage 85 (v0.104.0-alpha): the boot protocols whose headers the C
+# backend can emit into a freestanding image.
+BOOT_PROTOCOLS = {"multiboot2", "limine"}
+
+# The output section each protocol's header must land in. A firmware
+# scans the image's first 32 KiB for the Multiboot2 magic, and the
+# Limine spec's own section name is the conventional `.limine_requests`;
+# both must be KEEP-ed by the linker script (Stage 84 checks that).
+BOOT_HEADER_SECTION = {
+    "multiboot2": ".multiboot_header",
+    "limine": ".limine_requests",
+}
 
 # Stage 84 (v0.103.0-alpha): the output sections the Halis C backend
 # relies on. `#[section("X")]` may not name any of them — the runtime
@@ -130,6 +144,9 @@ class Parser:
     def __init__(self, toks):
         self.toks = toks
         self.pos = 0
+        # Stage 85: the protocols already declared on this crate, so a
+        # second `#![boot_header]` can name the first one.
+        self._seen_boot_headers = []
 
     # ---------- utilities ----------
     def peek(self):
@@ -430,6 +447,8 @@ class Parser:
         byte count — `#![stack_size(1048576)]`.
         Stage 84 (v0.103.0-alpha): `link_script` carries a parenthesized
         STRING path — `#![link_script("link.ld")]`.
+        Stage 85 (v0.104.0-alpha): `boot_header` carries one of the two
+        protocol names — `#![boot_header(multiboot2)]`.
         Returns {"name", "value", "line", "col"} (value is the byte
         count for stack_size, the path for link_script, None for the
         bare attrs).
@@ -440,7 +459,7 @@ class Parser:
         name_tok = self.peek()
         if name_tok["k"] != "ident":
             self.err("expected a crate attribute name (freestanding, "
-                     "no_std, stack_size, link_script) but got %s"
+                     "no_std, stack_size, link_script, boot_header) but got %s"
                      % self._desc(), name_tok)
         self.next()
         name = name_tok["v"]
@@ -477,6 +496,29 @@ class Parser:
             if not value:
                 self.err("link_script path is empty", pt)
             self.eat_sym(")")
+        elif name == "boot_header":
+            # Stage 85: the boot protocol whose header the C backend
+            # emits into the image. One image carries one header — two
+            # declarations would leave the emission order, and therefore
+            # the bytes on the wire, ambiguous.
+            for a in self._seen_boot_headers:
+                self.err("duplicate crate attribute '#![boot_header]' "
+                         "(was %s)" % a, t0)
+            # The argument is a bare identifier (a protocol name, not a
+            # path), so it lexes as `ident` rather than a string.
+            self.eat_sym("(")
+            bt = self.peek()
+            if bt["k"] != "ident":
+                self.err("boot_header expects a protocol name "
+                         "(multiboot2 or limine) but got %s"
+                         % self._desc(), bt)
+            self.next()
+            value = bt["v"]
+            if value not in BOOT_PROTOCOLS:
+                self.err("unknown boot protocol '%s' (known: %s)"
+                         % (value, ", ".join(sorted(BOOT_PROTOCOLS))), bt)
+            self.eat_sym(")")
+            self._seen_boot_headers.append(value)
         self.eat_sym("]")
         return {"name": name, "value": value,
                 "line": t0["line"], "col": t0["col"]}

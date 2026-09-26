@@ -31,6 +31,22 @@ $(LINKER_TEST_OBJ): $(LINKER_TEST_SRC) $(LINKER_SCRIPT)
 $(LINKER_TEST_BIN): $(LINKER_TEST_OBJ) $(LINKER_SCRIPT)
 	$(LINKER_TEST_LD) -T $(LINKER_SCRIPT) -o $@ $<
 
+# boot-acceptance: the Stage 85 acceptance gate. Runs the 7-section
+# end-to-end suite for the boot protocols: the crate attribute and its
+# guards (protocol name, entry-file-only, freestanding-only, once per
+# crate, and a linker script that drops the header section), the
+# core/boot.hls surface, the emitted Multiboot2 header (magic,
+# architecture, 40-byte length, checksum, module + end tags) and Limine
+# request list (both delimiters, the common magic and all five request
+# IDs), the LINKED image inspected with objdump (the header really is in
+# its section, really is 8-byte aligned, and really starts with the
+# protocol's own bytes), nine behaviour probes plus the four
+# checked-constructor panics, and the demos, the tools and `--audit`.
+boot-acceptance:
+	@echo "[Stage 85 acceptance] running tests/boot_acceptance.py..."
+	@$(PYTHON) tests/boot_acceptance.py
+	@echo "ACCEPTANCE OK: Stage 85 -- Multiboot2 + Limine boot protocol headers"
+
 # link-acceptance: the Stage 84 acceptance gate. Runs the 7-section
 # end-to-end suite for the linker script + custom sections: resolution +
 # guards, the standalone parse of core/section.hls, Stage-0 enforcement
@@ -47,7 +63,7 @@ link-acceptance:
 	@$(PYTHON) tests/link_acceptance.py
 	@echo "ACCEPTANCE OK: Stage 84 -- linker-script integration + custom sections"
 
-.PHONY: freestanding freestanding-check freestanding-acceptance nostd nostd-acceptance alloc-acceptance mem-acceptance panic-acceptance stackguard-acceptance asmreg-acceptance link-acceptance test-linker
+.PHONY: freestanding freestanding-check freestanding-acceptance nostd nostd-acceptance alloc-acceptance mem-acceptance panic-acceptance stackguard-acceptance asmreg-acceptance link-acceptance boot-acceptance test-linker
 # Phase VI — OS development foundation (Stages 77-78+)
 # ============================================================================
 # These stages give the LANGUAGE the capabilities OS developers need.
@@ -81,6 +97,11 @@ link-acceptance:
 # output section (validated, and checked against the script), and
 # `#[align(N)]` pins its entry; `core.section` models the whole layout
 # story in pure HLS — see SPEC section 38.
+# Stage 85 (v0.104.0-alpha): the boot protocols — `#![boot_header]`
+# makes the C backend emit the Multiboot2 or Limine header a firmware
+# scans for, and the Stage 84 placement check proves the linker script
+# KEEPs it; `core.boot` models the received side (both tag encodings,
+# both memory-map encodings, the framebuffer) — see SPEC section 39.
 # ============================================================================
 
 # freestanding: compile an HLS program to freestanding C + link with

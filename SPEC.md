@@ -3587,3 +3587,186 @@ arena; `hlfmt` round-trips both attributes and `hllint` stays clean;
 and `--audit` / `--opt-stats` report the script, the named sections and
 the annotation counts. Bootstrap self-compilation remains
 byte-identical.
+
+---
+
+## 39. Multiboot2 + Limine boot protocol headers (Stage 85 — v0.104.0-alpha)
+
+A firmware finds a kernel the same way it finds any other kernel: it
+scans the loaded image for a known byte pattern. Multiboot2 looks for
+the 32-bit magic `0xE85250D6` on an 8-byte boundary; Limine looks for a
+request list delimited by its own two-word end marker. Neither is
+reachable by a call, and neither is produced by "just writing the
+struct" — so Stage 85 adds both halves: the crate attribute that makes
+the C backend emit the header, and `core/boot.hls`, the shapes a kernel
+*receives*, as values.
+
+### 39.1. `#![boot_header(multiboot2 | limine)]`
+
+```halis
+#![freestanding]
+#![link_script("link.ld")]
+#![boot_header(limine)]
+
+fn main() -> int { ... }      // the C backend synthesises `_start`
+```
+
+The attribute takes a bare **protocol identifier** (not a string — a
+protocol is a name, not a path), may appear **once** per crate, is
+**entry-file-only** like every other crate attribute, and **requires
+`#![freestanding]`**: a hosted image is linked with a libc that owns
+`_start`, so a boot header in it is decoration rather than something a
+firmware could ever load.
+
+**Multiboot2.** A `const volatile` blob in `.multiboot_header`:
+
+```c
+__attribute__((section(".multiboot_header"), used, aligned(8)))
+const volatile hl_mb2_hdr hl_mb2_header = { 0xE85250D6u, 0u, 40u, 397258498u };
+/* the module tag (type 3, size 16, start = end = 0) and the end tag */
+```
+
+The length is fixed at 40 bytes (16 fixed + 16 module + 8 end), and
+the checksum is the negated 32-bit sum of magic + architecture +
+length, so **all four fields sum to zero** — which is the entire
+validity test, and is why the compiler computes the value rather than
+asking you to. The module tag carries `start == end == 0`: the
+standard way to say "the kernel is not itself a module", with the image
+bounds read from the ELF program headers instead.
+
+**Limine.** A `const volatile uint64_t hl_limine_reqs[]` in
+`.limine_requests`: the start delimiter, a base-revision-3 tag, the
+five requests a kernel asks for (memory map, framebuffer, RSDP, HHDM,
+stack size), and the end delimiter. Every request ID is four 64-bit
+words whose first two are common to the protocol, and **more than half
+the remaining words are above 2^63** — hence the `UL` suffix on every
+literal in the emitted C. A typo in an ID is the worst kind of boot
+bug: the bootloader silently ignores the request and the kernel comes
+up with no memory map.
+
+`const volatile` and `used` are both load-bearing. `const` because the
+firmware never writes it; `volatile` so the compiler does not elide the
+loads as dead stores to a const object; `used` because **nothing in the
+image calls it** — under `--gc-sections`, which every freestanding link
+in this repo uses, an un-`used` header is simply gone.
+
+### 39.2. The Stage 84 integration
+
+The header is just another output section, and it is the one section a
+firmware will not find unless the script KEEPs it — a bootloader that
+scans the image and finds nothing refuses to boot, with no diagnostic
+anywhere. So the Stage 84 placement check is pointed at it: a crate
+that declares both `#![link_script]` and `#![boot_header]` and whose
+script does not place the header's section is a **compile error**
+naming the section and the output section to add. The shipped
+`link.ld` places (and KEEPs) both `.multiboot_header` and
+`.limine_requests`.
+
+### 39.3. `core/boot.hls` — the received side
+
+Pure HLS, `core.*` imports only, no effects. A boot protocol is
+exactly where a kernel is most likely to be wrong and least likely to
+find out, so every constant and every predicate is callable from a
+test.
+
+**Multiboot2.** `mb2_magic()`, `mb2_arch_i386()`, the tag-type
+lattice with `mb2_tag_name`, `mb2_tag_is_information` (the header is
+what the loader scans for; the information structure is what EBX points
+at — conflating them is a classic early-boot bug), `mb2_field32` /
+`mb2_sum32` / `mb2_checksum` (the 32-bit rule), `mb2_header_ok`,
+`mb2_header_new` (which appends the mandatory end tag itself),
+`mb2_tag_at` / `mb2_tag_count` / `mb2_tag_present`, and
+`mb2_header_well_formed` (the end tag is present, every tag's size
+covers its prefix, and the declared length equals the sum of the parts).
+
+**Limine.** Every request ID as a `list[int]` of four words
+(`limine_id_memmap`, `..._framebuffer`, `..._rsdp`, `..._hhdm`,
+`..._stack_size`, `..._bootloader_info`), the start and end
+delimiters, `limine_base_revision` / `limine_base_revision_honoured`
+(the loader zeroes the third word when it honoured the request and
+leaves it when it did not — the spec says the *executable* is the one
+that must notice), `limine_id_is` (exact four-word comparison: a
+prefix match would collide with every feature a future loader adds),
+`limine_feature_find` / `_requested` / `limine_features_unique` (a
+loader must REFUSE an image carrying two of the same request) and
+`limine_features_terminated` (the end marker counts only in the last
+two words).
+
+**One memory-map model for two wire encodings.** E820 numbers
+"available" as 1; Limine numbers "usable" as 0. `mem_kind_from_e820`
+and `mem_kind_from_limine` are the only two functions that know that,
+and both land in the same `MemKind` — so a physical-memory manager
+never sees a wire value. The predicates are the ones a kernel actually
+asks: `mem_usable_bytes`, `mem_reclaimable_bytes`, `mem_largest_usable`,
+`mem_find_usable` (the first region that **satisfies** the request, or
+`-1` — never the best partial fit), `mem_count_usable` (zero means the
+map was misparsed, and is the single most useful assertion a kernel can
+make about its boot information), `mem_contains`, `mem_sorted` (both
+protocols *guarantee* sorted order, which is what licenses a binary
+search), `mem_sort` for a firmware that breaks it, and
+`mem_no_overlaps` — which compares only **file-bearing** regions,
+because a framebuffer sharing a page with a usable region is normal
+while two usable regions sharing a byte is a double allocation waiting
+to happen.
+
+`mem_kind_reclaimable` is *ordered*: `Usable` is free now;
+`BootloaderReclaimable` and `AcpiReclaimable` only after the loader and
+ACPI are done (taking the former on day one overwrites the page tables
+the kernel is running on); `AcpiNvs` is battery-backed settings the
+user expects to survive a reboot and is never reclaimable; `BadMemory`
+is unreliable; and `Unknown` — an E820 type above 5 — is never
+reclaimable, because a kernel that guessed would hand the firmware's
+own scratch to its page allocator.
+
+**The framebuffer.** `fb_new` is the **checked** constructor (for a
+mode you programmed or a test built — a pitch narrower than one line
+panics); `fb_raw` is the **unchecked** one, for firmware bytes a parser
+must not die on, and `fb_geometry_ok` is what rejects them. `fb_size`
+is `pitch * height`, never `width * height * bpp / 8`, because a mode
+may pad every line — a kernel that computed the stride from the width
+would shear the whole image.
+
+**The report.** `boot_report(protocol, regions, framebuffer, fb_ok)`
+is what a kernel prints once, at entry: the protocol, the usable-region
+count, the largest usable region, the full map, the framebuffer
+geometry — and a `WARNING:` line for each way the map can be unusable
+(unsorted, overlapping usable regions, no usable memory at all).
+
+### 39.4. `hex64` renders a word, not a number
+
+`core.section`'s `hex64` prints a signed int64 as **16 hex digits**,
+always. A boot protocol is full of unsigned 64-bit words, and more than
+half the Limine request IDs are above 2^63 — so they arrive in an
+`int` as negative numbers, and printing them signed would send the
+reader looking for a word the spec says is `0xe304...`. The nibbles
+are read out of the bit pattern with `int_shr` (a logical shift, so the
+walk terminates after exactly 16 steps for a negative value too) rather
+than by negating and complementing: a value of int64's *minimum* cannot
+be negated at all, and complement-then-increment is two ways to get the
+same answer wrong.
+
+### 39.5. What the tests prove
+
+`tests/ok/feat_stage85_boot.hls` runs 157 numbered assertions on the
+interpreter AND as a native binary (hosted and `-nostdlib`): the
+Multiboot2 constants and the 32-bit checksum rule, header construction
+and the mandatory end tag, tag walking and the malformed-tag cases, all
+six Limine request IDs and both delimiters with their exact-match
+semantics, the base-revision round trip, both memory-map wire encodings,
+reclaimability, every physical-memory-manager question, the sorted /
+overlapping / repair paths, the framebuffer (checked and unchecked),
+`hex64`'s full-width rendering, and the boot report's warnings.
+
+`make boot-acceptance` (7 sections) proves the enforcement paths: both
+compilers reject all five fail programs with *byte-identical*
+diagnostics; the emitted C carries the magic, architecture, 40-byte
+length, checksum, module and end tags, and both Limine delimiters and
+request IDs; a **real `-T link.ld` link** is inspected with `objdump`
+and the header really is in its section, really is 8-byte aligned, and
+really starts with the protocol's own bytes; a linker script that drops
+the header section is a compile error while the shipped one is
+accepted; the four checked constructors are *accepted* by the checker
+and panic at run time; `boot_demo` runs identically on the interpreter
+and natively; `boot_kernel` links as a freestanding image carrying
+`.limine_requests`; and `--audit` names the header and its section on
+both front-ends. Bootstrap self-compilation remains byte-identical.

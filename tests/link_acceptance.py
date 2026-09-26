@@ -332,7 +332,7 @@ fn main() -> int {
     if layout_load_end(l) != 1048640 { return 4 }
     if !layout_contains(l, 1053000) { return 5 }
     if layout_section_at(l, 1053000) != ".bss" { return 6 }
-    if layout_render(l).find("0x100000") < 0 { return 7 }
+    if layout_render(l).find("0x0000000000100000") < 0 { return 7 }
     return 0
 }
 ''', 0, "the placement solver honours ALIGN, NOLOAD and the pinned address"),

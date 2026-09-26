@@ -1969,6 +1969,49 @@ fn tail_check_fn(ctx: Ctx, key: str) -> void {
     ctx.tail_sites.set(key, sites)
 }
 
+# boot_header_section: the output section the declared protocol's header
+# lands in. Kept in step with boot/parser.py:BOOT_HEADER_SECTION — the
+# Stage 84 placement check and the Stage 85 emission must agree.
+fn boot_header_section(proto: str) -> str {
+    if proto == "multiboot2" {
+        return ".multiboot_header"
+    }
+    if proto == "limine" {
+        return ".limine_requests"
+    }
+    return ""
+}
+
+# check_boot_header (Stage 85, v0.104.0-alpha): `#![boot_header(...)]`
+# makes the C backend emit the protocol header the firmware scans for.
+# The crate must be `#![freestanding]`: a hosted image is linked with a
+# libc that owns `_start`, so a boot header in it is decoration rather
+# than something the firmware could ever load.
+fn check_boot_header(ctx: Ctx) -> void {
+    if ctx.crate_boot_header == "" {
+        return
+    }
+    if !ctx.crate_freestanding {
+        cerr(ctx.crate_boot_header_line, "crate #![boot_header(" + ctx.crate_boot_header + ")] requires #![freestanding] — a boot header only means something in an image the firmware loads itself (a hosted image is linked with a libc that owns `_start`)")
+    }
+}
+
+# link_script_path: where the crate's `#![link_script]` actually points,
+# resolved against the entry file's directory. Shared by the checker and
+# by the `--audit` report so both name the same file (an audit that
+# printed the raw string while the diagnostic printed the resolved one
+# would send a reader looking in two places).
+fn link_script_path(ctx: Ctx) -> str {
+    let raw: str = ctx.crate_link_script
+    if raw == "" {
+        return ""
+    }
+    if raw.starts_with("/") {
+        return raw
+    }
+    return join_path(ctx.entry_dir, raw)
+}
+
 # check_link_script (Stage 84, v0.103.0-alpha): linker-script
 # integration. A `#[section("X")]` names an output section the LINKER
 # must place, and two failure modes are silent without a check:
@@ -1992,10 +2035,7 @@ fn check_link_script(ctx: Ctx) -> void uses Fs {
         return
     }
     let raw: str = ctx.crate_link_script
-    let mut path: str = raw
-    if !raw.starts_with("/") {
-        path = join_path(ctx.entry_dir, raw)
-    }
+    let path: str = link_script_path(ctx)
     if !file_exists(path) {
         cerr(ctx.crate_link_script_line, "crate #![link_script(\"" + raw + "\")]: cannot read the linker script (resolved to " + path + ")")
     }
@@ -2012,6 +2052,17 @@ fn check_link_script(ctx: Ctx) -> void uses Fs {
             cerr(f.line, "#[section(\"" + f.attr_section + "\")] on function '" + f.name + "' is not placed by the linker script " + raw + " — the linker would discard the function. Add an output section that matches it (e.g. `" + f.attr_section + " : { KEEP(*(" + f.attr_section + ")) }`).")
         }
         i = i + 1
+    }
+    # Stage 85: the emitted boot header is just another section, and it
+    # is the one section a firmware will NOT find unless the script
+    # KEEPs it. Same check, same rationale: a bootloader that scans the
+    # image and finds nothing simply refuses to boot, with no diagnostic
+    # anywhere.
+    if ctx.crate_boot_header != "" {
+        let hsec: str = boot_header_section(ctx.crate_boot_header)
+        if !ls_covers(ctx.link_script_patterns, hsec) {
+            cerr(ctx.crate_boot_header_line, "crate #![boot_header(" + ctx.crate_boot_header + ")]: the emitted header lands in " + hsec + ", which the linker script " + raw + " does not place — the bootloader would scan the image and find nothing. Add an output section that KEEPs it (e.g. `" + hsec + " : { KEEP(*(" + hsec + ")) }`).")
+        }
     }
 }
 
@@ -2258,10 +2309,12 @@ fn check_program(ctx: Ctx) -> void uses Fs {
     # enforcement runs BEFORE the bodies are checked so violations
     # report the mode-specific message (mirrors the Stage-0 order).
     check_crate_modes(ctx)
-    # 4.6 Stage 84 (v0.103.0-alpha): linker-script integration. Runs on
-    # the AST only (the #[section] attributes + the crate attribute) and
-    # before the bodies, so a misplaced section reports before any
-    # body-level error in the function that carries it.
+    # 4.6 Stage 84 (v0.103.0-alpha) + Stage 85 (v0.104.0-alpha): the
+    # emitted boot header, then the linker script. Both read the crate
+    # attributes off `ctx`, so the order is for the reader rather than
+    # for correctness: the header rule is stated first, and the script
+    # check then has to place the section it names.
+    check_boot_header(ctx)
     check_link_script(ctx)
     # 5. check function bodies
     let mut bi: int = 0
