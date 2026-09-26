@@ -1003,3 +1003,48 @@ else
     bad "dma: make dma-acceptance failed"
     tail -15 "$TMP/dma_acc89.log"
 fi
+
+echo "=== 27. Stage 90: core.sync.nolock — lock-free primitives ==="
+# Stage 90 (v0.109.0-alpha): the memory orders, the sequential lock, RCU
+# and hazard pointers, as a MODEL so the retry and reclaim rules are
+# testable without threads. The gate is the authority.
+AT_F=tests/ok/feat_stage90_atomics.hls
+at_interp=$(python3 boot/boot.py "$AT_F" </dev/null 2>/dev/null); at_code=$?
+if [ "$at_code" -eq 0 ]; then
+    ok "atomics: feat_stage90_atomics runs on the interpreter (exit 0)"
+else
+    bad "atomics: feat_stage90_atomics interpreter exit=$at_code"
+fi
+if [ -f core/atomics.hls ] && grep -q "fn seqlock_read_ok" core/atomics.hls; then
+    ok "atomics: core/atomics.hls present"
+else
+    bad "atomics: core/atomics.hls missing"
+fi
+# ZERO imports: the module must be usable from a freestanding image.
+if [ -z "$(grep -c '^import' core/atomics.hls | grep -v '^0$')" ]; then
+    ok "atomics: core/atomics.hls has zero imports (freestanding-clean)"
+else
+    bad "atomics: core/atomics.hls imports something"
+fi
+if [ -x "$TMP/hlc1" ] && "$TMP/hlc1" examples/atomics_demo.hls "$TMP/at_demo.c" >/dev/null 2>&1 \
+    && gcc -O2 -Werror -o "$TMP/at_demo" "$TMP/at_demo.c" -lm -pthread 2>/dev/null; then
+    "$TMP/at_demo" </dev/null >/dev/null 2>&1
+    if [ "$?" -eq 0 ]; then
+        ok "atomics: examples/atomics_demo.hls runs natively, exit 0"
+    else
+        bad "atomics: atomics_demo did not run"
+    fi
+else
+    bad "atomics: atomics_demo failed to build"
+fi
+if make atomics-acceptance >"$TMP/at_acc90.log" 2>&1; then
+    if grep -q "ACCEPTANCE OK: Stage 90" "$TMP/at_acc90.log"; then
+        ok "atomics: make atomics-acceptance runs end-to-end"
+    else
+        bad "atomics: make atomics-acceptance did not print ACCEPTANCE OK"
+        tail -5 "$TMP/at_acc90.log"
+    fi
+else
+    bad "atomics: make atomics-acceptance failed"
+    tail -15 "$TMP/at_acc90.log"
+fi

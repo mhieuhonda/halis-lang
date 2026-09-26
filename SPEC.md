@@ -4362,3 +4362,139 @@ behaviour probes and the ok-test on all three execution paths, runs the
 demo, checks the tools, and asserts the **six properties a driver
 actually relies on** explicitly — so a later change to the module
 cannot quietly drop one.
+
+---
+
+## 44. `core.sync.nolock` — lock-free primitives (Stage 90 — v0.109.0-alpha)
+
+Everything lock-free rests on which reordering is permitted, and the
+four memory orders are not interchangeable. Stage 90 ships them as a
+**model**: the memory orders, the read-modify-write combinations, the
+sequential lock, RCU and the hazard-pointer variant, all as values. A
+model is what makes the rules that matter — a reader's retry, a
+reclaim's precondition, a CAS loop's give-up — *answers* rather than
+races, and therefore testable.
+
+### 44.1. The memory orders
+
+| Order | Permits | Used by |
+|---|---|---|
+| `Relaxed` | no ordering at all | a counter nobody else reads |
+| `Acquire` | nothing **after** this load hoisted above it | the second read of a seqlock; taking an RCU pointer |
+| `Release` | nothing **before** this store sunk below it | publishing; ending a write section |
+| `AcqRel` | both — what a compare-exchange needs | a CAS that succeeded |
+
+`mem_order_has_acquire` / `_release` are the two bits, and they are the
+distinction every seqlock and every RCU publish turns on: a `Release`
+does **not** acquire, and an `Acquire` does **not** release.
+`mem_order_stronger` is the check that catches "this one needed a
+release and someone wrote relaxed" — replacing a release with a
+relaxed order silently weakens the guarantee, and the check is a value.
+
+A store cannot carry `Acquire`, and `mem_order_store_legal` says so:
+acquire is about what a *load* must not be hoisted above, and a store
+hoists nothing. (A `Release` *load* is legal but only gives the release
+half, which is why the two questions are separate rather than one "is
+this order legal" check.)
+
+### 44.2. Read-modify-write
+
+`atomic_fetch_add` / `_sub` / `_and` / `_or` / `_xor` and `atomic_cas`,
+as values. Two rules the tests pin:
+
+* A compare-exchange **always** uses `AcqRel` on success. A CAS that
+  succeeded has both published (release) and consumed (acquire)
+  something; a kernel that makes either conditional on a flag is a
+  kernel that will one day run with the flag off.
+* `atomic_cas_loop` returns `(ok, iterations)`, and
+  `atomic_cas_loop_gave_up` is the half that matters: **giving up is
+  not success**. A driver that treats it as success has a lost update.
+  The loop is bounded, and `atomic_cas_budget_ok` is the reminder that
+  an *unbounded* CAS loop in a kernel is a livelock waiting to happen.
+
+One trap the test walks into on purpose: each RMW takes the **updated**
+value. Chaining from the original silently computes the update that
+never happened.
+
+### 44.3. The sequential lock
+
+A seqlock protects a read-mostly structure. The writer bumps the
+counter **even → odd**, writes, then **odd → even** with a release so
+the data writes are visible before the counter says so. The reader
+reads the counter, reads the data, reads the counter again, and retries
+unless `seqlock_read_ok` says otherwise.
+
+`seqlock_read_ok(s1, s2)` is the whole rule, and it has one subtle
+half: **odd and unchanged is not safe**. A writer that is inside has
+not yet bumped the counter past the value the reader saw, so the two
+reads *agree* while the data is being torn. A reader that tests only
+"same value" accepts the torn data; a reader that tests only "even"
+spins on a slow writer forever. The function requires even **and**
+unchanged, and the test asserts the odd-and-unchanged case is refused.
+
+`seqlock_begin_write` also panics on an odd counter: starting a write
+then means two writers overlapped, and the second one's data is what
+readers will see.
+
+### 44.4. RCU
+
+Publish / read / retire / reclaim, with the two rules that make it safe
+and that are easy to state wrongly:
+
+* A reader may hold a pointer to a published object **only** for as
+  long as it is inside a read-side critical section.
+* A retired object may be freed **only** once no reader can still be
+  inside one.
+
+`rcu_try_reclaim` frees everything retired and returns the state
+unchanged when `readers > 0` — that is the entire correctness
+argument, and it is a value a test can assert. The `rcu_unsafe` /
+`rcu_safe` counter is the same window for a reader that cannot wrap
+its access.
+
+### 44.5. Hazard pointers
+
+For a reader that cannot hold a critical section around the whole
+dereference. `hazard_acquire` publishes the pointer and then
+**re-reads the location**, comparing the re-read against what the
+reader loaded; a difference means a writer moved the pointer in
+between, and the reader must start over. Without that re-read a retire
+between the load and the publish is missed entirely, and the pointer is
+freed under the reader. `hazard_release` drops the hazard, and a
+leaked hazard costs memory rather than safety — every non-zero hazard
+count defers every reclaim, which is the asymmetry that makes the
+protocol's failure mode cheap.
+
+### 44.6. The lowering, and a known gap
+
+`asm!` is what a lock-free primitive lowers to (Stage 83 gave the
+register and clobber rules a kernel needs), and the gate checks what
+the compiler owns: the **memory-operand class** (`in(mem) x` → `"m"`,
+which is the location half of a read-modify-write) and the **default
+`"cc"` and `"memory"` clobbers** that make an access a fence the
+compiler will not move memory across.
+
+**The gap, stated rather than papered over:** a *locked*
+read-modify-write needs a **memory destination**, and HLS's `asm!` has no
+`"+m"` write constraint. The assembler correctly refuses a locked
+*register* destination, so `lock addq %rcx, %rax` does not assemble.
+`lock cmpxchgq` — the canonical CAS-loop primitive — does, because it
+names a memory operand in the template. The gate **pins this gap**: it
+asserts the compiler accepts a locked-add source and that the
+assembler then rejects it with its memory-destination rule, so a later
+release that closes the gap turns this check red instead of silently
+leaving the docs wrong.
+
+### 44.7. What the tests prove
+
+`tests/ok/feat_stage90_atomics.hls` runs 54 numbered assertions on the
+interpreter AND as a native binary (hosted and `-nostdlib`): the four
+orders and both bits, the store rule, the order-strengthening check, the
+RMW chain, the CAS success/failure/give-up cases, the seqlock even-odd
+protocol and the reader's rule (including odd-and-unchanged), RCU's
+reclaim precondition with and without a reader inside, and the hazard
+re-check.
+
+`make atomics-acceptance` (6 sections) runs those on all three
+execution paths, checks the lowering's memory class and clobbers, pins
+the locked-RMW gap described above, and runs the demo and the tools.

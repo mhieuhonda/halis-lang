@@ -31,6 +31,22 @@ $(LINKER_TEST_OBJ): $(LINKER_TEST_SRC) $(LINKER_SCRIPT)
 $(LINKER_TEST_BIN): $(LINKER_TEST_OBJ) $(LINKER_SCRIPT)
 	$(LINKER_TEST_LD) -T $(LINKER_SCRIPT) -o $@ $<
 
+# atomics-acceptance: the Stage 90 acceptance gate. Runs the 6-section
+# suite for the lock-free primitives: the core/atomics.hls surface (zero
+# imports, so freestanding-clean), the four memory orders and their two
+# bits, the RMW combinations and the CAS loop's give-up, the seqlock
+# reader rule, RCU's reclaim precondition, and the hazard-pointer
+# re-check — each on the interpreter and both native paths; the
+# lowering (the "m" memory class and the default cc/memory clobbers);
+# the ok-test on all three paths; the demo; and the tools. The gate
+# ALSO pins the known GAP: a locked read-modify-write needs a memory
+# destination, and HLS's asm has no `"+m"` write constraint, so the
+# assembler refuses `lock addq` on an `inout(reg)` operand.
+atomics-acceptance:
+	@echo "[Stage 90 acceptance] running tests/atomics_acceptance.py..."
+	@$(PYTHON) tests/atomics_acceptance.py
+	@echo "ACCEPTANCE OK: Stage 90 -- core.sync.nolock (lock-free primitives)"
+
 # dma-acceptance: the Stage 89 acceptance gate. Runs the 6-section suite
 # for DMA-safe buffers: the core/dma.hls surface, the five CHECKED
 # constructors (a zero length, a misaligned address, an address that
@@ -116,7 +132,7 @@ link-acceptance:
 	@$(PYTHON) tests/link_acceptance.py
 	@echo "ACCEPTANCE OK: Stage 84 -- linker-script integration + custom sections"
 
-.PHONY: freestanding freestanding-check freestanding-acceptance nostd nostd-acceptance alloc-acceptance mem-acceptance panic-acceptance stackguard-acceptance asmreg-acceptance link-acceptance boot-acceptance idt-acceptance mmio-acceptance port-acceptance dma-acceptance test-linker
+.PHONY: freestanding freestanding-check freestanding-acceptance nostd nostd-acceptance alloc-acceptance mem-acceptance panic-acceptance stackguard-acceptance asmreg-acceptance link-acceptance boot-acceptance idt-acceptance mmio-acceptance port-acceptance dma-acceptance atomics-acceptance test-linker
 # Phase VI — OS development foundation (Stages 77-78+)
 # ============================================================================
 # These stages give the LANGUAGE the capabilities OS developers need.
@@ -177,6 +193,10 @@ link-acceptance:
 # coherency rule each direction follows, the descriptor, the
 # device-visible window and the map/unmap bookkeeping an IOMMU needs,
 # and the bounce buffer — see SPEC section 43.
+# Stage 90 (v0.109.0-alpha): the lock-free primitives — the memory
+# orders, the RMW combinations, the sequential lock, RCU and hazard
+# pointers, as a MODEL so the retry and reclaim rules are testable
+# without threads — see SPEC section 44.
 # ============================================================================
 
 # freestanding: compile an HLS program to freestanding C + link with

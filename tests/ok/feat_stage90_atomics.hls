@@ -1,0 +1,281 @@
+# ============================================================================
+# tests/ok/feat_stage90_atomics.hls — Stage 90: lock-free primitives
+# ----------------------------------------------------------------------------
+# #![no_std] so the same source runs on the interpreter, natively, and
+# linked -nostdlib. Exit 0 = all assertions passed; a non-zero code
+# names the first assertion that failed.
+#
+# `core/atomics.hls` is a MODEL — the memory orders, the
+# read-modify-write combinations, the sequential lock, RCU and the
+# hazard-pointer variant, as values. Being a model is what makes it
+# testable without threads: the reader's retry rule, the reclaim
+# precondition and the CAS loop's give-up are all answers, so they can
+# be asserted instead of raced for. The lowering to lock-prefixed
+# instructions is `asm!`, and the acceptance gate disassembles the
+# emitted image to check it.
+# ============================================================================
+
+#![no_std]
+
+import "core.atomics"
+import "core.result"
+
+fn main() -> int {
+    # ------------------------------------------------------------------
+    # 1. The memory orders
+    # ------------------------------------------------------------------
+    if mem_order_name(MemOrder.Relaxed) != "relaxed" {
+        return 1
+    }
+    if mem_order_name(MemOrder.Acquire) != "acquire" {
+        return 2
+    }
+    if mem_order_name(MemOrder.Release) != "release" {
+        return 3
+    }
+    if mem_order_name(MemOrder.AcqRel) != "acqrel" {
+        return 4
+    }
+    # Acquire and Release are DIFFERENT halves: a Release does not
+    # acquire, and an Acquire does not release. This is the distinction
+    # every seqlock and every RCU publish turns on.
+    if mem_order_has_acquire(MemOrder.Acquire) != true {
+        return 5
+    }
+    if mem_order_has_release(MemOrder.Acquire) != false {
+        return 6
+    }
+    if mem_order_has_acquire(MemOrder.Release) != false {
+        return 7
+    }
+    if mem_order_has_release(MemOrder.Release) != true {
+        return 8
+    }
+    if !mem_order_has_acquire(MemOrder.AcqRel) || !mem_order_has_release(MemOrder.AcqRel) {
+        return 9
+    }
+    if mem_order_has_acquire(MemOrder.Relaxed) || mem_order_has_release(MemOrder.Relaxed) {
+        return 10
+    }
+    # A store cannot carry Acquire: acquire is about what a LOAD must not
+    # be hoisted above, and a store hoists nothing.
+    if mem_order_store_legal(MemOrder.Acquire) != false {
+        return 11
+    }
+    if !mem_order_store_legal(MemOrder.Release) {
+        return 12
+    }
+    if !mem_order_store_legal(MemOrder.Relaxed) {
+        return 13
+    }
+    if !mem_order_load_legal(MemOrder.Acquire) || !mem_order_load_legal(MemOrder.Relaxed) {
+        return 14
+    }
+    if !mem_order_stronger(MemOrder.AcqRel, MemOrder.Acquire) {
+        return 15
+    }
+    # Replacing a release with a relaxed WEAKENS the order, and
+    # `mem_order_stronger` is the check that says so.
+    if mem_order_stronger(MemOrder.Relaxed, MemOrder.Release) {
+        return 16
+    }
+    if mem_order_id(mem_order_from_id(4)) != 4 || mem_order_id(mem_order_from_id(0)) != 0 {
+        return 17
+    }
+
+    # ------------------------------------------------------------------
+    # 2. Read-modify-write
+    # ------------------------------------------------------------------
+    let a: Atomic = atomic_new(5, MemOrder.AcqRel)
+    if atomic_load(a) != 5 {
+        return 18
+    }
+    if atomic_load(atomic_fetch_add(a, 3)) != 8 {
+        return 19
+    }
+    if atomic_load(atomic_fetch_sub(atomic_fetch_add(a, 3), 3)) != 5 {
+        return 20
+    }
+    if atomic_load(atomic_fetch_or(a, 8)) != 13 {
+        return 21
+    }
+    # Each RMW TAKES the updated value: 13 & 12 == 12, and 12 ^ 12 == 0.
+    # Chaining from the ORIGINAL (5) instead would silently compute
+    # 5 & 12 == 4 — the read-modify-write the caller does not thread
+    # through is the update that never happened.
+    let ored: Atomic = atomic_fetch_or(a, 8)
+    if atomic_load(atomic_fetch_and(ored, 12)) != 12 {
+        return 22
+    }
+    if atomic_load(atomic_fetch_xor(atomic_fetch_and(ored, 12), 12)) != 0 {
+        return 23
+    }
+    if atomic_load(atomic_store(a, 42)) != 42 {
+        return 24
+    }
+    # A compare-exchange ALWAYS uses AcqRel: succeeding has both
+    # published (release) and consumed (acquire) something.
+    let a2: Atomic = atomic_store(a, 42)
+    let ok: list[int] = atomic_cas(a2, 42, 7)
+    if !atomic_cas_ok(ok) || atomic_cas_value(ok) != 7 {
+        return 25
+    }
+    # A CAS whose expected value is not what the location holds fails,
+    # and returns what WAS there — which is the value the retry loop
+    # re-tests.
+    let no: list[int] = atomic_cas(a2, 99, 9)
+    if atomic_cas_ok(no) {
+        return 26
+    }
+    if atomic_cas_value(no) != 42 {
+        return 27
+    }
+    # The retry loop, and that giving up is NOT success — a kernel that
+    # treats it as success has a lost update.
+    let win: list[int] = atomic_cas_loop(7, 7, 11, 4)
+    if atomic_cas_loop_gave_up(win) || atomic_cas_loop_iterations(win) != 0 {
+        return 28
+    }
+    let loss: list[int] = atomic_cas_loop(7, 99, 11, 4)
+    if !atomic_cas_loop_gave_up(loss) {
+        return 29
+    }
+    if atomic_cas_loop_iterations(loss) != 4 {
+        return 30
+    }
+    # A bounded CAS loop is only meaningful WITH a budget: an unbounded
+    # one in a kernel is a livelock waiting to happen.
+    if atomic_cas_budget_ok(0) || !atomic_cas_budget_ok(1) {
+        return 31
+    }
+
+    # ------------------------------------------------------------------
+    # 3. The sequential lock
+    # ------------------------------------------------------------------
+    let mut l: SeqLock = seqlock_new()
+    if !seqlock_is_even(l.seq) || seqlock_is_writing(l) {
+        return 32
+    }
+    # begin: even -> odd, and the counter MUST be even first — starting
+    # a write on an odd counter means two writers overlapped and the
+    # second one's data is what readers will see.
+    l = seqlock_begin_write(l)
+    if !seqlock_is_odd(l.seq) || !seqlock_is_writing(l) {
+        return 33
+    }
+    # While odd, NO reader may trust the data.
+    if seqlock_read_ok(1, 1) {
+        return 34
+    }
+    l = seqlock_end_write(l)
+    if !seqlock_is_even(l.seq) {
+        return 35
+    }
+    # The stable case: even and unchanged on both reads.
+    if !seqlock_read_ok(0, 0) || !seqlock_read_ok(2, 2) {
+        return 36
+    }
+    # A writer inside makes the counter change between the two reads.
+    if seqlock_read_ok(2, 3) {
+        return 37
+    }
+    # The subtle case: a writer inside that has NOT yet bumped past
+    # what the reader saw, so the two reads AGREE while the data is
+    # being torn. A reader testing only "same value" accepts it; a
+    # reader testing only "even" spins on a slow writer forever.
+    if seqlock_read_ok(3, 3) || seqlock_read_ok(5, 5) {
+        return 38
+    }
+    if seqlock_read_ok(0, 1) || seqlock_read_ok(1, 0) {
+        return 39
+    }
+    if seqlock_retry_budget_ok(0) || !seqlock_retry_budget_ok(1) {
+        return 40
+    }
+
+    # ------------------------------------------------------------------
+    # 4. RCU
+    # ------------------------------------------------------------------
+    let mut r: RcuState = rcu_new()
+    r = rcu_publish(r, 1048576)
+    r = rcu_retire(r, 2097152)
+    if rcu_pending(r) != 1 || rcu_readers(r) != 0 {
+        return 41
+    }
+    # A retired object is NOT freed while a reader is inside: it may
+    # still be holding a pointer to it, and freeing it now is the
+    # use-after-free RCU exists to prevent.
+    r = rcu_read_lock(r)
+    if rcu_readers(r) != 1 {
+        return 42
+    }
+    let held: RcuState = rcu_try_reclaim(r)
+    if rcu_pending(held) != 1 || rcu_reclaimed(held) != 0 {
+        return 43
+    }
+    r = rcu_read_unlock(held)
+    if rcu_readers(r) != 0 {
+        return 44
+    }
+    let freed: RcuState = rcu_try_reclaim(r)
+    if rcu_pending(freed) != 0 || rcu_reclaimed(freed) != 1 {
+        return 45
+    }
+    # The unsafe counter is what a reader without a critical section
+    # uses, and it closes the same window.
+    r = rcu_unsafe(freed)
+    if rcu_readers(r) != 1 {
+        return 46
+    }
+    if rcu_pending(rcu_try_reclaim(r)) != 0 {
+        return 47
+    }
+    if rcu_reclaimed(rcu_try_reclaim(rcu_safe(r))) != 1 {
+        return 48
+    }
+
+    # ------------------------------------------------------------------
+    # 5. Hazard pointers
+    # ------------------------------------------------------------------
+    let mut h: HazardState = hazard_new()
+    # The re-read agrees with what the reader loaded, so the hazard is
+    # real and the index of the published slot comes back.
+    let acquired: list[int] = hazard_acquire(h, 4096, 4096)
+    if !hazard_ok(acquired) {
+        return 49
+    }
+    # A writer that MOVED the pointer between the load and the publish
+    # is exactly the window the re-read closes: the reader must restart
+    # rather than dereference a pointer nobody holds any more.
+    if hazard_ok(hazard_acquire(h, 4096, 8192)) {
+        return 50
+    }
+    h = hazard_release(h, acquired.get(1))
+    if hazard_count(h) != 0 {
+        return 51
+    }
+    # A hazard pointing at a retired object BLOCKS its reclaim, and
+    # every non-zero hazard count defers everything — so a leaked hazard
+    # costs memory rather than safety.
+    h = hazard_acquire_and_hold(h, 4096)
+    if !hazard_blocks_reclaim(h, 4096) {
+        return 52
+    }
+    if hazard_blocks_reclaim(h, 8192) {
+        return 53
+    }
+    if hazard_count(h) != 1 {
+        return 54
+    }
+    return 0
+}
+
+# hazard_acquire_and_hold: acquire a hazard and KEEP it, which is the
+# state a reader is in between publishing and dropping.
+fn hazard_acquire_and_hold(h: HazardState, ptr: int) -> HazardState {
+    let mut fresh: list[int] = h.published
+    fresh.push(ptr)
+    return HazardState {
+        slot: h.slot, published: fresh, retired: h.retired
+    }
+}

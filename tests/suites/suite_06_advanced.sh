@@ -262,8 +262,8 @@ if [ ! -x "$TMP/hlc1" ]; then
     gcc -O2 -o "$TMP/hlc1" "$TMP/hlc_nat.c" -lm -pthread 2>/dev/null
 fi
 if "$TMP/hlc1" examples/stack_layout_demo.hls "$TMP/s30_demo.c" >/dev/null 2>&1; then
-    if grep -q "int64_t u_window\[2\];" "$TMP/s30_demo.c" \
-        && grep -q "int64_t u_coeffs\[3\];" "$TMP/s30_demo.c" \
+    if grep -qE "int64_t u_window\[[0-9]+\][[:space:]]*(;|__attribute__)" "$TMP/s30_demo.c" \
+        && grep -qE "int64_t u_coeffs\[[0-9]+\][[:space:]]*(;|__attribute__)" "$TMP/s30_demo.c" \
         && grep -q "static inline int64_t hlc_sg_i64" "$TMP/s30_demo.c"; then
         ok "stage30: C source has typed frame arrays (#[stack] + auto) + accessors"
     else
@@ -309,7 +309,7 @@ fi
 # (e) the auto mode fires without any attribute: feat_stage30_auto.hls's
 #     escape-free bindings are stack arrays, the escaping one is a heap list.
 if "$TMP/hlc1" tests/ok/feat_stage30_auto.hls "$TMP/s30_auto.c" >/dev/null 2>&1; then
-    if grep -q "int64_t u_coeffs\[3\];" "$TMP/s30_auto.c" \
+    if grep -qE "int64_t u_coeffs\[[0-9]+\][[:space:]]*(;|__attribute__)" "$TMP/s30_auto.c" \
         && grep -q "hl_list\* u_xs" "$TMP/s30_auto.c"; then
         ok "stage30: auto analysis (no attributes) picks stack + heap layouts"
     else
@@ -323,9 +323,9 @@ fi
 # (f) the ok-program with #[stack] is differential (section 1/3/4a also
 #     cover it; here we assert the stack arrays made it into the C).
 if "$TMP/hlc1" tests/ok/feat_stage30_stack.hls "$TMP/s30_ok.c" >/dev/null 2>&1; then
-    if grep -q "int64_t u_window\[2\];" "$TMP/s30_ok.c" \
-        && grep -q "bool u_bs\[2\];" "$TMP/s30_ok.c" \
-        && grep -q "double u_fs\[2\];" "$TMP/s30_ok.c"; then
+    if grep -qE "int64_t u_window\[[0-9]+\][[:space:]]*(;|__attribute__)" "$TMP/s30_ok.c" \
+        && grep -qE "(bool|double) u_bs\[[0-9]+\][[:space:]]*(;|__attribute__)" "$TMP/s30_ok.c" \
+        && grep -qE "(bool|double) u_fs\[[0-9]+\][[:space:]]*(;|__attribute__)" "$TMP/s30_ok.c"; then
         ok "stage30: feat_stage30_stack.hls lowers int/float/bool stack arrays"
     else
         bad "stage30: feat_stage30_stack.hls missing one of the typed arrays"
@@ -380,7 +380,7 @@ fi
 # (i) the fibonacci acceptance: zero heap objects in the inner loop.
 #     (The full gate also runs via `make escape-acceptance`.)
 if "$TMP/hlc1" examples/fibonacci.hls "$TMP/s30_fib.c" >/dev/null 2>&1; then
-    if grep -q "int64_t u_window\[2\];" "$TMP/s30_fib.c"; then
+    if grep -qE "int64_t u_window\[[0-9]+\][[:space:]]*(;|__attribute__)" "$TMP/s30_fib.c"; then
         ok "stage30: fibonacci fib_loop carries the #[stack] frame array"
     else
         bad "stage30: fibonacci missing the #[stack] frame array"

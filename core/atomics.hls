@@ -1,0 +1,514 @@
+# ============================================================================
+# core/atomics.hls — lock-free primitives (Stage 90, v0.109.0-alpha)
+# ----------------------------------------------------------------------------
+# Pure HLS, zero imports (freestanding-safe: the module only uses the
+# core language — structs, enums, lists and the `panic` builtin — so it
+# is importable from `#![no_std]` and `#![freestanding]` crates
+# identically, like the rest of `core.*`).
+#
+# The `core.sync.nolock` family, in the order a kernel needs them:
+#
+#   1. THE MEMORY ORDERS. Everything lock-free rests on which
+#      reordering is permitted, and the four names are not
+#      interchangeable: a Relaxed atomic may be reordered with
+#      everything, an Acquire may not be reordered with anything after
+#      it, a Release may not be reordered with anything before it, and
+#      AcqRel is both. A seqlock built on Relaxed is a seqlock that
+#      returns torn data, and an RCU publish built on Relaxed is an
+#      RCU publish nobody sees.
+#   2. ATOMIC RMW COMBINATIONS — fetch_add / fetch_and / fetch_or /
+#      fetch_xor and their compare-exchange loops, as VALUES, so the
+#      retry logic (and the memory-order argument at each step) can be
+#      asserted without a threaded test.
+#   3. THE SEQUENTIAL LOCK. A sequence counter that brackets a
+#      read-mostly critical section, with the reader's retry rule
+#      stated as a value: odd = a writer is inside, even = the data is
+#      consistent, and a reader that retries on odd-and-unchanged would
+#      spin on a writer forever.
+#   4. RCU. Publish / read / retire / reclaim, with the two rules that
+#      make it safe and that are easy to state wrongly: a reader may
+#      only hold a pointer to a published object for as long as it is
+#      inside a read-side critical section, and a retired object may
+#      only be reclaimed once no reader can still be inside one.
+#      `rcu_unsafe` is the counter both tests increment, so a test can
+#      show that reclaim is refused while a reader is inside.
+#   5. THE HAZARD-POINTER VARIANT, for the case where a reader cannot
+#      wrap its access in a critical section: publish, validate,
+#      dereference, and the re-check that closes the window between the
+#      last validation and the load.
+#
+# ON SCOPE: these are the MODELS. The lowering to lock-prefixed
+# instructions is `asm!` (Stage 83 gave the clobber and register rules a
+# kernel needs), and the gate disassembles the emitted image to check
+# it — the same shape Stage 88 used, because a primitive whose
+# lowering is wrong is worse than no primitive at all.
+# ============================================================================
+
+# ---------------------------------------------------------------------------
+# Memory orders
+# ---------------------------------------------------------------------------
+
+enum MemOrder {
+    Relaxed, # no ordering at all
+    Acquire, # nothing AFTER this load may be hoisted above it
+    Release, # nothing BEFORE this store may be sunk below it
+    AcqRel # both — the order a compare-exchange needs
+}
+
+fn mem_order_name(o: MemOrder) -> str {
+    return match o {
+        MemOrder.Relaxed => "relaxed",
+        MemOrder.Acquire => "acquire",
+        MemOrder.Release => "release",
+        MemOrder.AcqRel => "acqrel"
+    }
+}
+
+fn mem_order_id(o: MemOrder) -> int {
+    return match o {
+        MemOrder.Relaxed => 0,
+        MemOrder.Acquire => 2,
+        MemOrder.Release => 3,
+        MemOrder.AcqRel => 4
+    }
+}
+
+fn mem_order_from_id(i: int) -> MemOrder {
+    if i == 2 {
+        return MemOrder.Acquire
+    }
+    if i == 3 {
+        return MemOrder.Release
+    }
+    if i == 4 {
+        return MemOrder.AcqRel
+    }
+    return MemOrder.Relaxed
+}
+
+# mem_order_has_acquire / _release: the two bits, as a compiler can
+# read them. Everything below is stated in terms of these, because the
+# bugs are always "this one needed acquire and it said relaxed".
+fn mem_order_has_acquire(o: MemOrder) -> bool {
+    let i: int = mem_order_id(o)
+    return i == 2 || i == 4
+}
+
+fn mem_order_has_release(o: MemOrder) -> bool {
+    let i: int = mem_order_id(o)
+    return i == 3 || i == 4
+}
+
+# mem_order_stronger: is `a` at least as strong as `b` in both
+# directions? A seqlock that REPLACES a release with a relaxed is the
+# bug this answers.
+fn mem_order_stronger(a: MemOrder, b: MemOrder) -> bool {
+    if !mem_order_has_acquire(a) && mem_order_has_acquire(b) {
+        return false
+    }
+    if !mem_order_has_release(a) && mem_order_has_release(b) {
+        return false
+    }
+    return true
+}
+
+# A load may carry Relaxed, Acquire or AcqRel. A STORE may carry
+# Relaxed, Release or AcqRel — an Acquire STORE is not a thing, because
+# acquire is about what a load must not be hoisted above, and a store
+# hoists nothing. (A Release LOAD is legal but only gives the release
+# half, which is why the two questions are separate.)
+fn mem_order_load_legal(o: MemOrder) -> bool {
+    let i: int = mem_order_id(o)
+    return i == 0 || i == 2 || i == 3 || i == 4
+}
+
+fn mem_order_store_legal(o: MemOrder) -> bool {
+    let i: int = mem_order_id(o)
+    return i == 0 || i == 3 || i == 4
+}
+
+# ---------------------------------------------------------------------------
+# Atomic read-modify-write, as values
+# ---------------------------------------------------------------------------
+
+# The four fetch-modify operations, and the plain load/store that
+# bracket them. `cas` is the compare-exchange: it stores `desired` iff
+# the location still holds `expected`, and returns the value that WAS
+# there — which is what a loop tests.
+struct Atomic {
+    value: int,
+    order: MemOrder
+}
+
+fn atomic_new(v: int, order: MemOrder) -> Atomic {
+    return Atomic {
+        value: v, order: order
+    }
+}
+
+fn atomic_load(a: Atomic) -> int {
+    return a.value
+}
+
+fn atomic_store(a: Atomic, v: int) -> Atomic {
+    return Atomic {
+        value: v, order: a.order
+    }
+}
+
+fn atomic_fetch_add(a: Atomic, d: int) -> Atomic {
+    return Atomic {
+        value: a.value + d, order: a.order
+    }
+}
+
+fn atomic_fetch_sub(a: Atomic, d: int) -> Atomic {
+    return Atomic {
+        value: a.value - d, order: a.order
+    }
+}
+
+fn atomic_fetch_and(a: Atomic, v: int) -> Atomic {
+    return Atomic {
+        value: int_and(a.value, v), order: a.order
+    }
+}
+
+fn atomic_fetch_or(a: Atomic, v: int) -> Atomic {
+    return Atomic {
+        value: int_or(a.value, v), order: a.order
+    }
+}
+
+fn atomic_fetch_xor(a: Atomic, v: int) -> Atomic {
+    return Atomic {
+        value: int_xor(a.value, v), order: a.order
+    }
+}
+
+# atomic_cas: the compare-exchange. It ALWAYS uses AcqRel on success —
+# a compare-exchange that succeeded has both published (release) and
+# consumed (acquire) something, and a kernel that makes either
+# conditional on a flag is a kernel that will one day run with the
+# flag off.
+fn atomic_cas(a: Atomic, expected: int, desired: int) -> list[int] {
+    if a.value == expected {
+        return[1, desired]
+    }
+    return[0, a.value]
+}
+
+# atomic_cas_ok: the success flag.
+fn atomic_cas_ok(r: list[int]) -> bool {
+    return r.get(0) == 1
+}
+
+# atomic_cas_value: the value the location held (or holds).
+fn atomic_cas_value(r: list[int]) -> int {
+    return r.get(1)
+}
+
+# atomic_cas_loop: the standard compare-exchange loop, with the
+# iterations counted. A driver that needs a bounded retry has to know
+# whether the loop is BOUNDED — and a CAS loop is only guaranteed to
+# terminate if something else eventually changes the location.
+fn atomic_cas_loop(start: int, expected: int, desired: int, budget: int) -> list[int] {
+    let mut cur: int = start
+    let mut iters: int = 0
+    while iters < budget {
+        let r: list[int] = atomic_cas(Atomic {
+            value: cur, order: MemOrder.AcqRel
+        }, expected, desired)
+        if atomic_cas_ok(r) {
+            return[1, iters]
+        }
+        cur = atomic_cas_value(r)
+        iters = iters + 1
+    }
+    return[0, iters]
+}
+
+# atomic_cas_loop_gave_up: it ran out of budget. A kernel that treats
+# this as success has a lost update.
+fn atomic_cas_loop_gave_up(r: list[int]) -> bool {
+    return r.get(0) == 0
+}
+
+# atomic_cas_loop_iterations: how many times it retried.
+fn atomic_cas_loop_iterations(r: list[int]) -> int {
+    return r.get(1)
+}
+
+# A bounded CAS loop is only meaningful with a budget: an UNBOUNDED one
+# in a kernel is a livelock waiting to happen.
+fn atomic_cas_budget_ok(budget: int) -> bool {
+    return budget > 0
+}
+
+# ---------------------------------------------------------------------------
+# The sequential lock
+# ---------------------------------------------------------------------------
+
+# A seqlock protects a READ-MOSTLY structure. The writer bumps the
+# counter to an ODD value, writes, and bumps it to an EVEN value. The
+# reader reads the counter, reads the data, reads the counter again,
+# and retries if the two reads differ or if either was odd.
+struct SeqLock {
+    seq: int,
+    order: MemOrder
+}
+
+fn seqlock_new() -> SeqLock {
+    return SeqLock {
+        seq: 0, order: MemOrder.Acquire
+    }
+}
+
+# seqlock_begin_write: the counter must be EVEN before a write, and
+# becomes ODD. Starting a write on an odd counter means two writers
+# overlapped, and the second one's data is what readers will see.
+fn seqlock_begin_write(l: SeqLock) -> SeqLock {
+    if !seqlock_is_even(l.seq) {
+        panic("seqlock_begin_write: the counter is odd, so a writer is inside")
+    }
+    return SeqLock {
+        seq: l.seq + 1, order: l.order
+    }
+}
+
+# seqlock_end_write: ODD -> EVEN, with a RELEASE so the data writes are
+# visible before the counter says so.
+fn seqlock_end_write(l: SeqLock) -> SeqLock {
+    if seqlock_is_even(l.seq) {
+        panic("seqlock_end_write: the counter is even, so no write is inside")
+    }
+    return SeqLock {
+        seq: l.seq + 1, order: l.order
+    }
+}
+
+fn seqlock_is_even(v: int) -> bool {
+    return int_and(v, 1) == 0
+}
+
+fn seqlock_is_odd(v: int) -> bool {
+    return int_and(v, 1) == 1
+}
+
+# seqlock_is_writing: odd means a writer is inside the critical
+# section. Every reader must treat this as "the data may be torn".
+fn seqlock_is_writing(l: SeqLock) -> bool {
+    return seqlock_is_odd(l.seq)
+}
+
+# seqlock_read_ok: may a reader trust the data it just read? Only if
+# the counter was EVEN before AND after, and the same value both times.
+#
+# "Odd and unchanged" is the subtle case: a writer that is inside has
+# not yet bumped the counter past the value the reader saw, so the two
+# reads AGREE while the data is being torn. A reader that tests only
+# "same value" spins on a slow writer and, worse, a reader that tests
+# only "even" accepts the torn data.
+fn seqlock_read_ok(s1: int, s2: int) -> bool {
+    if seqlock_is_odd(s1) {
+        return false
+    }
+    if seqlock_is_odd(s2) {
+        return false
+    }
+    return s1 == s2
+}
+
+# seqlock_retry_count: the reader's retry budget. A seqlock reader that
+# gives up must do something other than return the torn data.
+fn seqlock_retry_budget_ok(budget: int) -> bool {
+    return budget > 0
+}
+
+# ---------------------------------------------------------------------------
+# RCU
+# ---------------------------------------------------------------------------
+
+# The one counter an RCU implementation cannot do without: how many
+# threads are inside a read-side critical section. A retired object is
+# reclaimable exactly when this is zero.
+struct RcuState {
+    readers: int,
+    published: list[int],
+    retired: list[int],
+    freed: int
+}
+
+fn rcu_new() -> RcuState {
+    return RcuState {
+        readers: 0, published: [], retired: [], freed: 0
+    }
+}
+
+# rcu_read_lock / _unlock: the read-side critical section. Entering is a
+# RELEASE (so the reader's own writes stay inside) and leaving is a
+# RELEASE too (so the decrement is visible to the reclaiming writer).
+fn rcu_read_lock(s: RcuState) -> RcuState {
+    return RcuState {
+        readers: s.readers + 1, published: s.published,
+        retired: s.retired, freed: s.freed
+    }
+}
+
+fn rcu_read_unlock(s: RcuState) -> RcuState {
+    if s.readers <= 0 {
+        panic("rcu_read_unlock: no reader is inside")
+    }
+    return RcuState {
+        readers: s.readers - 1, published: s.published,
+        retired: s.retired, freed: s.freed
+    }
+}
+
+# rcu_publish: a new pointer becomes visible. With an Acquire reader
+# this is safe; with a Relaxed one the reader can miss it entirely.
+fn rcu_publish(s: RcuState, ptr: int) -> RcuState {
+    let mut fresh: list[int] = s.published
+    fresh.push(ptr)
+    return RcuState {
+        readers: s.readers, published: fresh,
+        retired: s.retired, freed: s.freed
+    }
+}
+
+# rcu_retire: an object is no longer reachable. It is NOT freed yet —
+# a reader inside the critical section may still be holding a pointer
+# to it, and freeing it now is the use-after-free RCU exists to
+# prevent.
+fn rcu_retire(s: RcuState, ptr: int) -> RcuState {
+    let mut fresh: list[int] = s.retired
+    fresh.push(ptr)
+    return RcuState {
+        readers: s.readers, published: s.published,
+        retired: fresh, freed: s.freed
+    }
+}
+
+# rcu_unsafe: the counter BOTH sides increment. A reader takes it
+# before dereferencing and drops it after, and it is the only thing
+# that can stop a reclaim from pulling the pointer out from under it.
+fn rcu_unsafe(s: RcuState) -> RcuState {
+    return RcuState {
+        readers: s.readers + 1, published: s.published,
+        retired: s.retired, freed: s.freed
+    }
+}
+
+fn rcu_safe(s: RcuState) -> RcuState {
+    return RcuState {
+        readers: s.readers - 1, published: s.published,
+        retired: s.retired, freed: s.freed
+    }
+}
+
+# rcu_try_reclaim: free everything retired, but ONLY when no reader can
+# be inside. With a reader inside it returns false and frees nothing —
+# that is the whole correctness argument, and it is a value.
+fn rcu_try_reclaim(s: RcuState) -> RcuState {
+    if s.readers > 0 {
+        return s
+    }
+    return RcuState {
+        readers: s.readers, published: s.published,
+        retired: [], freed: s.freed + s.retired.len()
+    }
+}
+
+# rcu_reclaimed: how many objects have actually been freed.
+fn rcu_reclaimed(s: RcuState) -> int {
+    return s.freed
+}
+
+# rcu_pending: how many are retired and waiting.
+fn rcu_pending(s: RcuState) -> int {
+    return s.retired.len()
+}
+
+# rcu_readers: how many threads are inside a read-side section — the
+# number rcu_try_reclaim tests. Zero is the only value that lets a
+# retire happen.
+fn rcu_readers(s: RcuState) -> int {
+    return s.readers
+}
+
+# ---------------------------------------------------------------------------
+# Hazard pointers, for a reader that cannot wrap its access
+# ---------------------------------------------------------------------------
+
+# A hazard pointer is what a reader publishes when it cannot hold a
+# critical section around the whole dereference. The window between the
+# pointer being loaded and the hazard being published is closed by the
+# re-check: if the location still holds the same pointer, the retire
+# side will see the hazard and defer.
+struct HazardState {
+    slot: int, # the pointer the reader loaded
+    published: list[int], # hazards other readers have set
+    retired: list[int]
+}
+
+fn hazard_new() -> HazardState {
+    return HazardState {
+        slot: 0, published: [], retired: []
+    }
+}
+
+# hazard_acquire: publish the pointer, then RE-READ the location and
+# compare that re-read against what the reader loaded. The re-read is
+# not optional: without it, a retire between the load and the publish is
+# missed entirely, and the pointer is freed under the reader.
+#
+# `reread` is the value the location held AFTER the hazard was
+# published; `loaded` is what the reader had before. They differ when a
+# writer moved the pointer in between, and the reader must start over.
+fn hazard_acquire(h: HazardState, loaded: int, reread: int) -> list[int] {
+    if loaded != reread {
+        return[0, 0]
+    }
+    let mut fresh: list[int] = h.published
+    fresh.push(loaded)
+    return[1, fresh.len() - 1]
+}
+
+fn hazard_ok(r: list[int]) -> bool {
+    return r.get(0) == 1
+}
+
+# hazard_release: drop the hazard. A reader that forgets this leaks
+# every subsequent reclaim, which is the safe direction — hence the
+# asymmetry with the window above, which is not safe.
+fn hazard_release(h: HazardState, idx: int) -> HazardState {
+    let mut fresh: list[int] = []
+    let mut i: int = 0
+    while i < h.published.len() {
+        if i != idx {
+            fresh.push(h.published.get(i))
+        }
+        i = i + 1
+    }
+    return HazardState {
+        slot: h.slot, published: fresh, retired: h.retired
+    }
+}
+
+# hazard_count: how many hazards are live. Every non-zero count defers
+# every reclaim, so a leaked hazard costs memory rather than safety.
+fn hazard_count(h: HazardState) -> int {
+    return h.published.len()
+}
+
+# hazard_blocks_reclaim: does any hazard point at this retired object?
+fn hazard_blocks_reclaim(h: HazardState, ptr: int) -> bool {
+    let mut i: int = 0
+    while i < h.published.len() {
+        if h.published.get(i) == ptr {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
