@@ -1,7 +1,7 @@
 #!/usr/bin/env node
-// tools/jsffi_check.js — Stage 73 (v0.92.0-alpha) acceptance checker.
+// tools/jsffi_check.cjs — Stage 73 (v0.92.0-alpha) acceptance checker.
 //
-// Usage: node tools/jsffi_check.js <wasm-path> <glue-js-path>
+// Usage: node tools/jsffi_check.cjs <wasm-path> <glue-js-path>
 //
 // Verifies, against a freshly compiled jsffi Stage 73 demo:
 //   1. the wasm + JS glue instantiate cleanly (48 std.jsffi defaults)
@@ -28,7 +28,7 @@ async function main() {
   const wasmPath = process.argv[2];
   const gluePath = process.argv[3];
   if (!wasmPath || !gluePath) {
-    fail("usage: node tools/jsffi_check.js <wasm> <glue.js>");
+    fail("usage: node tools/jsffi_check.cjs <wasm> <glue.js>");
   }
   const wasmBytes = fs.readFileSync(wasmPath);
   const glue = fs.readFileSync(gluePath, "utf-8");

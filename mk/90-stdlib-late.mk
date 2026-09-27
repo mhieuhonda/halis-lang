@@ -1060,7 +1060,7 @@ openapi-acceptance: bin/hlc
 # jsffi-acceptance: Stage 73 gate. extern "js" functions exist ONLY on
 # the wasm32 target (the interpreter/native backends reject them), so
 # the gate is NOT differential: it compiles the demo with hlwasm and
-# runs tools/jsffi_check.js in Node.js (auto struct registration,
+# runs tools/jsffi_check.cjs in Node.js (auto struct registration,
 # struct round trip, JS->HLS callbacks, main markers).
 jsffi-acceptance:
 	@echo "[Stage 73 acceptance] compiling examples/jsffi_stage73_demo.hls..."
@@ -1071,7 +1071,7 @@ jsffi-acceptance:
 	  echo "  node run: SKIP (node not installed)"; \
 	  echo "ACCEPTANCE OK: Stage 73 (compile-only — node missing)"; \
 	else \
-	  node tools/jsffi_check.js $(BIN)/jsffi73.wasm $(BIN)/jsffi73.js \
+	  node tools/jsffi_check.cjs $(BIN)/jsffi73.wasm $(BIN)/jsffi73.js \
 	    || (echo "FAIL: jsffi acceptance"; exit 1); \
 	fi
 	@rm -f $(BIN)/jsffi73 $(BIN)/jsffi73.wasm $(BIN)/jsffi73.js $(BIN)/jsffi73.html $(BIN)/jsffi73.log
