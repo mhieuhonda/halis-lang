@@ -58,6 +58,12 @@ bootstrap:
 	@rm -f $(BIN)/hlc2.c
 	@echo "Native compiler: $(BIN)/hlc"
 
+# File target for the native compiler: acceptance targets declared with
+# `bin/hlc` as a prerequisite stay buildable after `make clean` or on a
+# fresh checkout, where the phony `bootstrap` goal alone is not enough.
+$(BIN)/hlc:
+	@$(MAKE) bootstrap
+
 # Compile and run an HLS program: make run F=examples/hello.hls
 # Stage 37: link libcurl when available so net_tls_get works.
 run:
