@@ -8,12 +8,12 @@ setlocal expandtab shiftwidth=4 tabstop=4 softtabstop=4
 setlocal commentstring=#\ %s
 
 " Format-on-save (opt-in).
-if g:halis_format_on_save
+if get(g:, 'halis_format_on_save', 0)
   autocmd BufWritePre <buffer> call halis#format()
 endif
 
 " Lint-on-save (default on).
-if g:halis_lint_on_save
+if get(g:, 'halis_lint_on_save', 1)
   autocmd BufWritePost <buffer> call halis#lint()
 endif
 

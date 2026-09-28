@@ -4,7 +4,7 @@
 " and the hllint linter into Vim/Neovim.
 "
 " Files:
-"   editors/neovim/halis.vim   — runtime plugin (auto-loaded by Vim)
+"   editors/neovim/plugin/halis.vim    — runtime plugin (auto-loaded by Vim)
 "   editors/neovim/ftdetect/halis.vim — file-type detection
 "   editors/neovim/ftplugin/halis.vim  — file-type settings (format-on-save,
 "                                         lint-on-save, keybindings)
@@ -107,17 +107,18 @@ function! halis#start_lsp() abort
   endif
   lua << EOF
   local lsp = vim.lsp
-  local cmd_path = vim.fn.escape(vim.g.halis_python, '"') .. ' ' .. vim.fn.expand('<SID>'):gsub('/$', '')
-  -- Re-read the path discovered by Vim.
-  local fmt_path = vim.api.nvim_get_var('halis_python')
-  local args = { fmt_path, vim.fn.halis#discover_tool('hls-lsp.py') }
+  local python = vim.api.nvim_get_var('halis_python')
+  local tool = vim.fn['halis#discover_tool']('hls-lsp.py')
   local config = {
     name = 'hls-lsp',
-    cmd = args,
+    cmd = { python, tool },
     root_dir = vim.fs.dirname(vim.fn.expand('%:p')),
     filetypes = { 'halis' },
   }
-  lsp.start_client(config)
+  local client_id = lsp.start_client(config)
+  if client_id then
+    vim.lsp.buf_attach_client(0, client_id)
+  end
 EOF
 endfunction
 
