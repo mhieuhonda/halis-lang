@@ -8,18 +8,21 @@ pkg-init:
 	@test "x$(NAME)" != "x" || (echo "Usage: make pkg-init NAME=mylib" && false)
 	@$(PKG) init $(NAME)
 
-# Add a dependency: make pkg-add NAME=std.str GIT=... PATH=std/str.hls TAG=v0.23.0-alpha
+# Add a dependency: make pkg-add NAME=std.str GIT=... MODPATH=std/str.hls TAG=v0.23.0-alpha
+# MODPATH (not PATH) — PATH collides with the environment and would pass the
+# whole shell PATH string to hls-pkg when the argument is forgotten.
 pkg-add:
-	@test "x$(NAME)" != "x" || (echo "Usage: make pkg-add NAME=.. GIT=.. PATH=.. [TAG=..] [BRANCH=..]" && false)
+	@test "x$(NAME)" != "x" || (echo "Usage: make pkg-add NAME=.. GIT=.. MODPATH=.. [TAG=..] [BRANCH=..]" && false)
+	@test "x$(MODPATH)" != "x" || (echo "Usage: make pkg-add NAME=.. GIT=.. MODPATH=.. [TAG=..] [BRANCH=..]" && false)
 	@if [ -n "$(TAG)" ] && [ -n "$(BRANCH)" ]; then \
 	  echo "error: --tag and --branch are mutually exclusive"; exit 1; \
 	fi
 	@if [ -n "$(TAG)" ]; then \
-	  $(PKG) add $(NAME) $(GIT) $(PATH) --tag $(TAG); \
+	  $(PKG) add $(NAME) $(GIT) $(MODPATH) --tag $(TAG); \
 	elif [ -n "$(BRANCH)" ]; then \
-	  $(PKG) add $(NAME) $(GIT) $(PATH) --branch $(BRANCH); \
+	  $(PKG) add $(NAME) $(GIT) $(MODPATH) --branch $(BRANCH); \
 	else \
-	  $(PKG) add $(NAME) $(GIT) $(PATH); \
+	  $(PKG) add $(NAME) $(GIT) $(MODPATH); \
 	fi
 
 # Resolve dependencies + write lockfile + append to transparency log
