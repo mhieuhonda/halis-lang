@@ -7,6 +7,7 @@ This script restores a TAB on every line whose leading whitespace
 is exactly 8 spaces AND the line starts with a command character
 (anything except a target name + colon). Continuation lines
 (starting with whitespace then content) also use TAB."""
+import re
 import sys
 
 def fix_makefile(path):
@@ -15,14 +16,14 @@ def fix_makefile(path):
     out = []
     in_recipe = False
     for line in lines:
-        # Detect a target line: "name: deps" at column 0.
         if not line.startswith(" ") and not line.startswith("\t"):
-            # Column 0 line.
-            in_recipe = False
-            # A target line has a colon (but not := which is variable assignment).
-            if ":" in line and not line.startswith("\t") and ":=" not in line.split(":")[0] + ":":
-                # Could be a target. Mark to convert following indented lines.
-                in_recipe = True
+            # Column 0 line: a rule line ("target: deps") has a colon that
+            # is NOT part of an assignment operator (:= ?= += ::=), so a
+            # plain 'CC := gcc' must not be mistaken for a target. Comments
+            # and blanks also just end the current recipe.
+            in_recipe = bool(
+                not line.startswith("#") and re.match(r"^[^:]+:($|[^=])", line)
+            )
             out.append(line)
             continue
         # Indented line: if we're in a recipe, replace leading 8 spaces with TAB.
