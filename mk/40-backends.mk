@@ -121,15 +121,15 @@ wasm-acceptance:
 	@test -x $(BIN)/hlc || $(MAKE) bootstrap
 	@mkdir -p $(BIN)
 	@echo "[Stage 23 acceptance] compiling examples/hello.hls to wasm..."
-	@$(PYTHON) tools/hlwasm.py examples/hello.hls $(BIN)/hello_wasm >$(BIN)/wasm_acc.log 2>&1
-	@rc=$$?; if [ $$rc -ne 0 ]; then echo "FAIL: wasm compile failed"; cat $(BIN)/wasm_acc.log; exit 1; fi
+	@$(PYTHON) tools/hlwasm.py examples/hello.hls $(BIN)/hello_wasm >$(BIN)/wasm_acc.log 2>&1; \
+	rc=$$?; if [ $$rc -ne 0 ]; then echo "FAIL: wasm compile failed"; cat $(BIN)/wasm_acc.log; exit 1; fi
 	@SIZE=$$(stat -c %s $(BIN)/hello_wasm.wasm); \
 	  echo "  wasm binary: $$SIZE bytes"; \
 	  if [ $$SIZE -ge 10240 ]; then echo "FAIL: wasm binary is $$SIZE bytes (>= 10 KB acceptance limit)"; exit 1; fi; \
 	  echo "  size check: OK (< 10 KB)"
 	@echo "[Stage 23 acceptance] running the wasm in Node.js..."
-	@$(PYTHON) tools/hlwasm.py examples/hello.hls $(BIN)/hello_wasm2 --run >$(BIN)/wasm_run.out 2>&1
-	@rc=$$?; if [ $$rc -ne 0 ]; then echo "FAIL: wasm run failed (rc=$$rc)"; cat $(BIN)/wasm_run.out; exit 1; fi
+	@$(PYTHON) tools/hlwasm.py examples/hello.hls $(BIN)/hello_wasm2 --run >$(BIN)/wasm_run.out 2>&1; \
+	rc=$$?; if [ $$rc -ne 0 ]; then echo "FAIL: wasm run failed (rc=$$rc)"; cat $(BIN)/wasm_run.out; exit 1; fi
 	@python3 boot/boot.py examples/hello.hls </dev/null 2>/dev/null >$(BIN)/interp_out.txt
 	@# Deep-scan-13 fix: also filter the 'wasm-opt: N -> M bytes' info
 	@# line (stderr, merged by 2>&1) — it polluted the output comparison
@@ -167,8 +167,8 @@ webapp:
 webapp-acceptance:
 	@echo "[Stage 24 acceptance] compiling examples/web_app_1000loc.hls..."
 	@$(PYTHON) tools/hlwasm.py examples/web_app_1000loc.hls $(BIN)/webapp \
-	  >$(BIN)/webapp_acc.log 2>&1
-	@rc=$$?; if [ $$rc -ne 0 ]; then echo "FAIL: webapp compile failed"; \
+	  >$(BIN)/webapp_acc.log 2>&1; \
+	rc=$$?; if [ $$rc -ne 0 ]; then echo "FAIL: webapp compile failed"; \
 	  cat $(BIN)/webapp_acc.log; exit 1; fi
 	@WASM_SIZE=$$(stat -c %s $(BIN)/webapp.wasm 2>/dev/null || stat -f %z $(BIN)/webapp.wasm); \
 	  JS_SIZE=$$(stat -c %s $(BIN)/webapp.js 2>/dev/null || stat -f %z $(BIN)/webapp.js); \
