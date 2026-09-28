@@ -54,7 +54,6 @@ OK_TEST = "tests/ok/feat_stage84_section.hls"
 DEMO = "examples/section_demo.hls"
 CORE = "core/section.hls"
 SCRIPT = "tests/stage84/place.ld"
-NOSECTIONS = "tests/stage84/no_sections.ld"
 
 # fail program -> (needle, description)
 FAIL_PROGRAMS = [

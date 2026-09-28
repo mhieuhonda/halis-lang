@@ -343,9 +343,6 @@ else:
                 ok("atomics: the fence is a real mfence in the image")
             else:
                 bad("atomics: no mfence in the disassembly")
-            else_mfence = re.search(r"mfence", dis)
-            if else_mfence:
-                ok("atomics: mfence present")
 
 # The KNOWN GAP, asserted so it cannot be quietly forgotten: a locked
 # read-modify-write needs a memory destination, and HLS's asm has no
