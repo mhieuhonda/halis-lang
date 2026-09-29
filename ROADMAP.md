@@ -146,7 +146,7 @@ remains green.
 | 88 | `core.port` — x86 I/O port invariants (`inb`/`outb` typesafe) | ✅ | (done in v0.107.0-alpha) |
 | 89 | DMA-safe buffer types (no GC moves, no virtual remap) | ✅ | (done in v0.108.0-alpha) |
 | 90 | `core.sync.nolock` — lock-free atomics, seqlock, RCU | ✅ | (done in v0.109.0-alpha) |
-| 91 | Verified interrupt-safety (no alloc in IRQ context) | ⬜ | 4 weeks |
+| 91 | Verified interrupt-safety (no alloc in IRQ context) | ✅ | (done in v0.110.0-alpha) |
 | 92 | Cross-bootstrappable build (Stage-0 → freestanding hlc) | ⬜ | 4 weeks |
 | 93 | `target x86_64-unknown-none` — bare-metal triple | ⬜ | 3 weeks |
 | 94 | `target aarch64-unknown-none` — bare-metal ARM | ⬜ | 3 weeks |
