@@ -4614,3 +4614,108 @@ and never touch the heap.
 
 `make irqsafe-acceptance` (7 sections) runs all of it plus the audit
 lines, the demo, and the tools.
+
+## 46. Cross-bootstrappable build — Stage-0 to freestanding hlc (Stage 92 — v0.111.0-alpha)
+
+The bootstrap ladder used to end at a hosted compiler: Stage-0 (the
+Python interpreter running `hlc.hls`) builds `hlc.c`, gcc links it
+against libc, and the native `hlc` re-compiles its own source
+byte-identically. Stage 92 extends the ladder one rung further:
+
+```
+Stage-0  ->  hosted hlc  ->  freestanding hlc (bin/hlc-fs)
+```
+
+`bin/hlc-fs` is the compiler compiled WITH NO LIBC: linked
+`-ffreestanding -nostdlib`, zero undefined libc symbols, entering
+through its own crt0. It compiles programs — and recompiles the
+compiler itself — byte-identically to the hosted compiler. The
+property the ladder proves: **the last stage is the same source as the
+first, however it was built**.
+
+### 46.1. The flag
+
+`hlc --no-libc` compiles a HOSTED source (a crate with `main`, OS
+effects allowed) against the no-libc runtime instead of libc. The
+emitted TU differs from the hosted one in exactly four ways:
+
+* the no-libc prelude replaces the libc includes (`HL_NO_LIBC 1`,
+  three freestanding headers + stdarg, zero libc headers);
+* `main` takes the ABI's third argument and captures it:
+  `int main(int argc, char** argv, char** envp) { hl_environ = envp; ... }`;
+* a crt0 follows main: a NAKED `_start` (naked for the same reason the
+  freestanding entry is — the prologue must not move RSP before the
+  realignment) that reads argc/argv/envp off the initial stack,
+  realigns, calls main, and exits via a raw `exit_group` with main's
+  return value;
+* the runtime's libc-name shims (`#define fopen hl_nl_fopen`, ...)
+  route the reached libc calls to syscall-backed definitions.
+
+`--no-libc` on a `#![freestanding]` crate is rejected with its own
+diagnostic — a freestanding crate already emits its own `_start` and
+its own runtime; the flag is the HOSTED-source build mode, and the
+combination is a contradiction the compiler states plainly.
+
+### 46.2. The no-libc runtime
+
+The prelude shares the freestanding prelude's extracted blocks (the
+hand-rolled memory/string primitives, the dead hosted-runtime
+declarations, the exact-bit float predicates) and adds:
+
+* **the raw syscall layer** — one inline-asm block per architecture
+  (x86-64 native; aarch64 and riscv64 numbers carried for same-arch
+  cross builds): `read/write/close/openat/mmap/getcwd/newfstatat/
+  exit_group`;
+* **the mmap-backed arena** — same shape as the freestanding bump
+  arena (8-byte size header, realloc copies), but the backing store is
+  1 GiB of RESERVED virtual address space committed by touching,
+  because a self-hosting compile allocates far beyond a static 1 MiB
+  (RSS grows only for the pages actually touched);
+* **fd-backed std streams** — `FILE` is `{ int fd; }`, `stdout`/`
+  stderr` are fds 1 and 2, and `fopen/fread/fwrite/fclose/fputc/
+  fflush` are real definitions over `openat`/`read`/`write`;
+* **the shims the compiler reaches** — `fprintf`/`snprintf` (a bounded
+  formatter: `%s %c %% %d %u %ld %lld %f/%.Nf`; unknown specifiers
+  pass through literally), `exit`, `atexit` (no-op — the PGO dump
+  never runs in a no-libc build), `getenv` (scans the captured
+  environ; understands the glibc `getcwd(NULL, 0)` convention),
+  `getchar`, `strtod` (long-double accumulation, correctly rounded for
+  every input with up to 17 significant digits; exponents clamp at
+  ±400), `realpath` (TEXTUAL canonicalization — it resolves `.` and
+  `..` and collapses separators but does not follow symlinks, which
+  would need readlink loops), `strncpy`, `getcwd`, and `stat` — a
+  static function literally named `stat` (a macro would mangle the
+  `struct stat st` declarations), backed by `newfstatat` into the real
+  144-byte kernel layout, so `file_exists` / `fs_size` / `fs_is_dir`
+  answer with real data;
+* **`simd_cpu_supports`** probes the same feature bits with a raw
+  CPUID instead of `__builtin_cpu_supports`, which would drag in GCC's
+  `__cpu_model` from libgcc.
+
+### 46.3. The honest gaps
+
+A no-libc TU must COMPILE even where it cannot RUN (the same rule the
+freestanding prelude established: dead sections compile,
+`-Wl,--gc-sections` drops them). But the line is drawn at the LINK:
+the concurrency runtime's pthread *types* are declared so its sections
+compile, while the pthread *functions* stay undeclared — a `--no-libc`
+program that reaches `spawn()` fails the link on `pthread_create`;
+one that reaches `fs_read_dir` fails on `opendir`; libm users fail on
+the math names. The gate pins this: the gap is a named undefined
+symbol, not a silent misbehavior. (Threads need a libc or a runtime
+nobody has written for this mode; pretending otherwise would hide the
+fact.)
+
+### 46.4. What the gate proves
+
+`make xbootstrap-acceptance` (7 sections): the flag and its conflict
+rule; the runtime shape (syscall layer, 1 GiB arena, fd streams, zero
+libc headers); the full ladder (`make bootstrap-nolibc` — the
+freestanding compiler recompiles the compiler byte-identically and
+agrees with the hosted compiler byte-for-byte); the binary's honesty
+(`ldd`: not a dynamic executable; `nm -u`: no libc symbols); parity —
+hosted and `no_std` programs compile byte-identically and `--audit`
+agrees word for word; a real no-libc program (file write/read, env,
+cwd, float and int conversions) running to the interpreter's exit
+code; and the pinned gaps (spawn → `pthread_create`, directory listing
+→ `opendir`, each a named link failure).

@@ -1108,3 +1108,25 @@ else
     bad "irqsafe: make irqsafe-acceptance failed"
     tail -15 "$TMP/irq_acc91.log"
 fi
+
+echo "=== 29. Stage 92: cross-bootstrappable build (Stage-0 -> freestanding hlc) ==="
+# Stage 92 (v0.111.0-alpha): the hosted compiler emits its own source
+# against the no-libc runtime; the resulting binary has NO libc and
+# must behave exactly like the hosted compiler (byte-identical C).
+if make xbootstrap-acceptance >"$TMP/xb_acc92.log" 2>&1; then
+    if grep -q "ACCEPTANCE OK: Stage 92" "$TMP/xb_acc92.log"; then
+        ok "xbootstrap: make xbootstrap-acceptance runs end-to-end"
+    else
+        bad "xbootstrap: gate did not print ACCEPTANCE OK"
+        tail -5 "$TMP/xb_acc92.log"
+    fi
+else
+    bad "xbootstrap: make xbootstrap-acceptance failed"
+    tail -15 "$TMP/xb_acc92.log"
+fi
+# The freestanding binary exists after the gate and is honest about libc.
+if [ -x bin/hlc-fs ] && [ -z "$(nm -u bin/hlc-fs 2>/dev/null | grep -E 'fopen|malloc|printf|getenv')" ]; then
+    ok "xbootstrap: bin/hlc-fs links with zero libc symbols"
+else
+    bad "xbootstrap: bin/hlc-fs missing or carries libc symbols"
+fi

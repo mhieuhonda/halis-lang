@@ -31,7 +31,7 @@ else
   HL_CURL_DEFS :=
 endif
 
-.PHONY: all stage0 bootstrap test examples clean run check bench install uninstall audit opt-stats emit-ir emit-llvm fmt lint lsp-check pkg-init pkg-add pkg-lock pkg-audit pkg-verify pkg-build pkg-publish pkg-log pkg-log-verify prove prove-full model prove-acceptance hltest fuzz cov fuzz-acceptance wasm-opt webapp webapp-acceptance serve serve-acceptance wasm-pack wasm-pack-check wasm-pack-pack wasm-pack-acceptance aarch64-bench aarch64-acceptance aarch64-list-targets stack-acceptance inline-acceptance opt-stats-report kernel-attrs escape-acceptance layout-report tail-acceptance tail-report asm-acceptance asm-attrs bench-stdlib spec-check stage32-acceptance async-acceptance stream-acceptance io-acceptance fs-acceptance net-acceptance http-acceptance http2-acceptance json-stream-acceptance regex-acceptance fmt-acceptance hash-acceptance collections-acceptance sync-acceptance thread-acceptance time-acceptance math-acceptance process-acceptance env-acceptance archive-acceptance uuid-ulid-acceptance cli-acceptance tui-acceptance color-acceptance progress-acceptance log-acceptance http-server-acceptance websocket-acceptance cookie-acceptance session-acceptance csrf-acceptance template-acceptance sse-acceptance graphql-acceptance openapi-acceptance jsffi-acceptance dom-acceptance freestanding freestanding-check freestanding-acceptance nostd nostd-acceptance alloc-acceptance mem-acceptance panic-acceptance stackguard-acceptance asmreg-acceptance link-acceptance boot-acceptance idt-acceptance mmio-acceptance port-acceptance dma-acceptance atomics-acceptance irqsafe-acceptance test-linker
+.PHONY: all stage0 bootstrap bootstrap-nolibc xbootstrap-acceptance test examples clean run check bench install uninstall audit opt-stats emit-ir emit-llvm fmt lint lsp-check pkg-init pkg-add pkg-lock pkg-audit pkg-verify pkg-build pkg-publish pkg-log pkg-log-verify prove prove-full model prove-acceptance hltest fuzz cov fuzz-acceptance wasm-opt webapp webapp-acceptance serve serve-acceptance wasm-pack wasm-pack-check wasm-pack-pack wasm-pack-acceptance aarch64-bench aarch64-acceptance aarch64-list-targets stack-acceptance inline-acceptance opt-stats-report kernel-attrs escape-acceptance layout-report tail-acceptance tail-report asm-acceptance asm-attrs bench-stdlib spec-check stage32-acceptance async-acceptance stream-acceptance io-acceptance fs-acceptance net-acceptance http-acceptance http2-acceptance json-stream-acceptance regex-acceptance fmt-acceptance hash-acceptance collections-acceptance sync-acceptance thread-acceptance time-acceptance math-acceptance process-acceptance env-acceptance archive-acceptance uuid-ulid-acceptance cli-acceptance tui-acceptance color-acceptance progress-acceptance log-acceptance http-server-acceptance websocket-acceptance cookie-acceptance session-acceptance csrf-acceptance template-acceptance sse-acceptance graphql-acceptance openapi-acceptance jsffi-acceptance dom-acceptance freestanding freestanding-check freestanding-acceptance nostd nostd-acceptance alloc-acceptance mem-acceptance panic-acceptance stackguard-acceptance asmreg-acceptance link-acceptance boot-acceptance idt-acceptance mmio-acceptance port-acceptance dma-acceptance atomics-acceptance irqsafe-acceptance test-linker
 
 # Main goal: use the full bootstrap chain to build the native compiler
 all: bootstrap
@@ -63,6 +63,38 @@ bootstrap:
 # fresh checkout, where the phony `bootstrap` goal alone is not enough.
 $(BIN)/hlc:
 	@$(MAKE) bootstrap
+
+# Stage 92 (v0.111.0-alpha): the cross-bootstrap ladder. The hosted
+# compiler emits its own source against the no-libc runtime, gcc links
+# it -ffreestanding -nostdlib, and the resulting bin/hlc-fs (a binary
+# with NO libc) must recompile the compiler byte-identically and emit
+# code indistinguishable from the hosted compiler's. This is the
+# roadmap's "Stage-0 -> freestanding hlc" arrow: every stage of the
+# chain is the same source, however it was built.
+bootstrap-nolibc:
+	@test -x $(BIN)/hlc || $(MAKE) bootstrap
+	@mkdir -p $(BIN)
+	@echo "[1/4] hosted hlc emits its own source with --no-libc..."
+	@$(BIN)/hlc --no-libc $(HLC) $(BIN)/hlc_nolibc.c
+	@echo "[2/4] gcc: linking the freestanding compiler..."
+	@$(CC) $(CFLAGS) -ffreestanding -nostdlib -ffunction-sections -fno-stack-protector -Wl,--gc-sections -o $(BIN)/hlc-fs $(BIN)/hlc_nolibc.c
+	@echo "[3/4] freestanding hlc recompiles the compiler..."
+	@$(BIN)/hlc-fs --no-libc $(HLC) $(BIN)/hlc_nolibc2.c
+	@diff $(BIN)/hlc_nolibc.c $(BIN)/hlc_nolibc2.c
+	@echo "[4/4] freestanding hlc must agree with the hosted compiler..."
+	@$(BIN)/hlc-fs $(HLC) $(BIN)/hlc_via_fs.c
+	@$(BIN)/hlc $(HLC) $(BIN)/hlc_via_hosted.c
+	@cmp $(BIN)/hlc_via_fs.c $(BIN)/hlc_via_hosted.c
+	@rm -f $(BIN)/hlc_via_fs.c $(BIN)/hlc_via_hosted.c
+	@echo "CROSS-BOOTSTRAP OK: Stage-0 -> hosted hlc -> freestanding hlc (no libc at the last stage)"
+
+# Stage 92 acceptance: the flag + runtime shape, the full ladder, the
+# binary's honesty (no libc symbols), the parity with the hosted
+# compiler, a real no-libc program run, and the pinned gaps.
+xbootstrap-acceptance:
+	@echo "[Stage 92 acceptance] running tests/xbootstrap_acceptance.py..."
+	@$(PYTHON) tests/xbootstrap_acceptance.py
+	@echo "ACCEPTANCE OK: Stage 92 -- cross-bootstrappable build (Stage-0 -> freestanding hlc)"
 
 # Compile and run an HLS program: make run F=examples/hello.hls
 # Stage 37: link libcurl when available so net_tls_get works.

@@ -74,6 +74,35 @@ fn freestanding_prelude_lines() -> list[str] {
     r.push("#undef free")
     r.push("static void free(void* p) { (void)p; }")
     r.push("#define free(p) ((void)0)")
+    concat_lines(r, fs_mem_str_lines())
+    r.push("// ---- Stage 77: hosted-runtime declarations (dead code only) ----")
+    r.push("// Every symbol below is referenced ONLY by hosted-only runtime")
+    r.push("// functions (file IO, sockets, threads, libm, ...) that a")
+    r.push("// freestanding program cannot reach (the checker rejects the")
+    r.push("// effects that lead to them). The declarations let the TU")
+    r.push("// compile under -ffreestanding; --gc-sections drops the dead")
+    r.push("// sections before undefined-symbol resolution.")
+    r.push("typedef struct _HlFsFile FILE;")
+    # Deep-scan fix: the common runtime references the std streams by
+    # NAME (hl_print: `fwrite(..., stdout)`; hl_eprint: `stderr`). The
+    # stdio headers that define them are not included in freestanding
+    # mode, so the stream VARIABLES need extern declarations — dead
+    # sections referencing them are dropped by -Wl,--gc-sections before
+    # undefined-symbol resolution (freestanding crates declare no
+    # effects, so hl_print / hl_eprint are never reachable).
+    r.push("extern FILE* stdout;")
+    r.push("extern FILE* stderr;")
+    concat_lines(r, fs_hosted_decl_lines(false))
+    concat_lines(r, fs_float_pred_lines())
+    return r
+}
+
+# fs_mem_str_lines: the hand-rolled memory/string primitives shared
+# by the freestanding (Stage 77) and no-libc (Stage 92) preludes.
+#  macros map the libc names onto these so every runtime body
+# compiles and links without libc.
+fn fs_mem_str_lines() -> list[str] {
+    let r: list[str] = []
     r.push("// ---- Stage 77: memory/string primitives ----")
     r.push("static void* hl_memcpy(void* d, const void* s, size_t n) {")
     r.push("    unsigned char* a = (unsigned char*)d;")
@@ -135,27 +164,37 @@ fn freestanding_prelude_lines() -> list[str] {
     r.push("#define strcpy hl_strcpy")
     r.push("#define strchr hl_strchr")
     r.push("#define strdup hl_strdup")
-    r.push("// ---- Stage 77: hosted-runtime declarations (dead code only) ----")
-    r.push("// Every symbol below is referenced ONLY by hosted-only runtime")
-    r.push("// functions (file IO, sockets, threads, libm, ...) that a")
-    r.push("// freestanding program cannot reach (the checker rejects the")
-    r.push("// effects that lead to them). The declarations let the TU")
-    r.push("// compile under -ffreestanding; --gc-sections drops the dead")
-    r.push("// sections before undefined-symbol resolution.")
-    r.push("typedef struct _HlFsFile FILE;")
-    # Deep-scan fix: the common runtime references the std streams by
-    # NAME (hl_print: `fwrite(..., stdout)`; hl_eprint: `stderr`). The
-    # stdio headers that define them are not included in freestanding
-    # mode, so the stream VARIABLES need extern declarations — dead
-    # sections referencing them are dropped by -Wl,--gc-sections before
-    # undefined-symbol resolution (freestanding crates declare no
-    # effects, so hl_print / hl_eprint are never reachable).
-    r.push("extern FILE* stdout;")
-    r.push("extern FILE* stderr;")
+    return r
+}
+
+
+# fs_hosted_decl_lines: declarations + minimal struct layouts for the
+# hosted-only runtime functions (sockets, threads, libm, file
+# metadata). Shared by the freestanding and no-libc preludes: in
+# both modes these functions are DEAD (dropped by -Wl,--gc-sections
+# before undefined-symbol resolution) — the declarations exist only
+# so their sections compile.
+# NOTE: the FILE typedef and the stdout/stderr declarations are NOT
+# here — the two preludes define them differently (extern libc
+# streams vs the no-libc fd wrappers).
+fn fs_hosted_decl_lines(real_stat: bool) -> list[str] {
+    let r: list[str] = []
     r.push("typedef struct _HlFsDir DIR;")
     r.push("// Minimal layouts for dead hosted-only functions (complete")
     r.push("// types where a body needs one; never constructed by live code).")
-    r.push("struct stat { long st_size; unsigned long st_mode; };")
+    if real_stat {
+        # Stage 92: the no-libc build stat()s FOR REAL (the compiler's
+        # own file_exists), so the struct must be the KERNEL layout —
+        # st_mode at offset 24 and st_size at 48 on x86-64, and the
+        # same offsets in the aarch64/riscv64 generic layout. The
+        # freestanding prelude keeps the minimal fake (its users never
+        # reach the filesystem).
+        r.push("struct stat { unsigned long st_dev; unsigned long st_ino; unsigned long st_nlink; unsigned int st_mode; unsigned int st_uid; unsigned int st_gid; unsigned int __hl_pad0; unsigned long st_rdev; long st_size; long st_blksize; long st_blocks; long st_atime; long st_atime_nsec; long st_mtime; long st_mtime_nsec; long st_ctime; long st_ctime_nsec; long __hl_pad1[3]; };")
+        r.push("#define S_ISREG(m) (((m) & 0170000) == 0100000)")
+        r.push("#define S_ISDIR(m) (((m) & 0170000) == 0040000)")
+    } else {
+        r.push("struct stat { long st_size; unsigned long st_mode; };")
+    }
     r.push("struct dirent { char d_name[256]; };")
     r.push("struct sockaddr { unsigned short sa_family; char sa_data[14]; };")
     r.push("struct in_addr { unsigned int s_addr; };")
@@ -270,7 +309,11 @@ fn freestanding_prelude_lines() -> list[str] {
     r.push("DIR* opendir(const char*);")
     r.push("struct dirent* readdir(DIR*);")
     r.push("int closedir(DIR*);")
-    r.push("int stat(const char*, struct stat*);")
+    if real_stat {
+        r.push("static int stat(const char*, struct stat*);")
+    } else {
+        r.push("int stat(const char*, struct stat*);")
+    }
     r.push("int chmod(const char*, mode_t);")
     r.push("int sched_yield(void);")
     r.push("double fmod(double, double);")
@@ -300,6 +343,15 @@ fn freestanding_prelude_lines() -> list[str] {
     r.push("double tgamma(double);")
     r.push("double lgamma(double);")
     r.push("double copysign(double, double);")
+    return r
+}
+
+
+# fs_float_pred_lines: the four exact-bit-test float predicates
+# (isNaN/isinf/isfinite/signbit) shared by both preludes — they are
+# pure IEEE-754 bit tests with no libm dependency.
+fn fs_float_pred_lines() -> list[str] {
+    let r: list[str] = []
     r.push("// Stage 77: the four float predicates are EXACT bit tests")
     r.push("// (no libm) — math_isnan/isinf/isfinite/signbit stay available")
     r.push("// in freestanding mode; the other 24 libm builtins do not.")
@@ -330,13 +382,479 @@ fn freestanding_prelude_lines() -> list[str] {
     return r
 }
 
-fn runtime_lines(fs: bool) -> list[str] {
+
+# no_libc_prelude_lines (Stage 92, v0.111.0-alpha): the C prelude a
+# `--no-libc` build emits INSTEAD of the libc includes for a HOSTED
+# source (a crate with `main`, OS effects allowed). Three parts:
+#   1. The three freestanding headers + stdarg, `HL_NO_LIBC`, and the
+#      mmap-backed bump arena (a one-shot compiler's heap is far beyond
+#      the freestanding prelude's static 1 MiB: 256 MiB of reserved
+#      virtual address space, committed by touching).
+#   2. The raw-syscall layer (Linux: x86-64 native; aarch64 / riscv64
+#      numbers carried for the same-arch cross builds) and libc-name
+#      shims — `#define fopen hl_nl_fopen` etc. — for exactly the
+#      functions the self-hosting compiler reaches: file read/write,
+#      the print family, the panic path (report + exit_group(101)),
+#      env lookup, the float parse/format pair, realpath/strncpy for
+#      the sandbox prefix check. `hl_nl_*` are real definitions, so
+#      the reached runtime needs no libc symbol at all.
+#   3. The shared dead-declaration block (fs_hosted_decl_lines): a
+#      no-libc program whose runtime reaches sockets / threads / libm
+#      still fails the LINK with a name — the honest version of "not
+#      available".
+fn no_libc_prelude_lines() -> list[str] {
+    let r: list[str] = []
+    r.push("#include <stdint.h>")
+    r.push("#include <stdbool.h>")
+    r.push("#include <stddef.h>")
+    r.push("#include <stdarg.h>")
+    r.push("#define HL_NO_LIBC 1")
+    r.push("#define PRId64 \"lld\"")
+    r.push("#define EOF (-1)")
+    r.push("// ---- Stage 92: the raw syscall layer (Linux) ----")
+    r.push("// One asm block per architecture; the numbers are the kernel ABI's,")
+    r.push("// so they differ where the ABIs differ. Only the reached calls exist:")
+    r.push("// read/write/close/openat/mmap/getcwd/exit_group.")
+    r.push("#if defined(__x86_64__)")
+    r.push("#define HL_SYS_read 0L")
+    r.push("#define HL_SYS_write 1L")
+    r.push("#define HL_SYS_close 3L")
+    r.push("#define HL_SYS_mmap 9L")
+    r.push("#define HL_SYS_getcwd 79L")
+    r.push("#define HL_SYS_exit_group 231L")
+    r.push("#define HL_SYS_openat 257L")
+    r.push("#define HL_SYS_newfstatat 262L")
+    r.push("#elif defined(__aarch64__)")
+    r.push("#define HL_SYS_read 63L")
+    r.push("#define HL_SYS_write 64L")
+    r.push("#define HL_SYS_close 57L")
+    r.push("#define HL_SYS_mmap 222L")
+    r.push("#define HL_SYS_getcwd 17L")
+    r.push("#define HL_SYS_exit_group 94L")
+    r.push("#define HL_SYS_openat 56L")
+    r.push("#define HL_SYS_newfstatat 79L")
+    r.push("#elif defined(__riscv) || defined(__riscv__)")
+    r.push("#define HL_SYS_read 63L")
+    r.push("#define HL_SYS_write 64L")
+    r.push("#define HL_SYS_close 57L")
+    r.push("#define HL_SYS_mmap 222L")
+    r.push("#define HL_SYS_getcwd 17L")
+    r.push("#define HL_SYS_exit_group 94L")
+    r.push("#define HL_SYS_openat 56L")
+    r.push("#define HL_SYS_newfstatat 79L")
+    r.push("#endif")
+    r.push("#define HL_AT_FDCWD (-100L)")
+    r.push("#define HL_O_RDONLY 0L")
+    r.push("#define HL_O_WRONLY 1L")
+    r.push("#define HL_O_CREAT 64L")
+    r.push("#define HL_O_TRUNC 512L")
+    r.push("static long hl_nl_sys(long n, long a1, long a2, long a3, long a4, long a5, long a6) {")
+    r.push("    long ret;")
+    r.push("#if defined(__x86_64__)")
+    r.push("    register long r10 __asm__(\"r10\") = a4;")
+    r.push("    register long r8 __asm__(\"r8\") = a5;")
+    r.push("    register long r9 __asm__(\"r9\") = a6;")
+    r.push("    __asm__ volatile (\"syscall\" : \"=a\"(ret) : \"a\"(n), \"D\"(a1), \"S\"(a2), \"d\"(a3), \"r\"(r10), \"r\"(r8), \"r\"(r9) : \"rcx\", \"r11\", \"memory\");")
+    r.push("#elif defined(__aarch64__) || defined(__riscv) || defined(__riscv__)")
+    r.push("    register long x8 __asm__(\"x8\") = n;")
+    r.push("    (void)x8;")
+    r.push("    __asm__ volatile (\"svc #0\" : \"=r\"(ret) : \"r\"(x8), \"r\"(a1), \"r\"(a2), \"r\"(a3), \"r\"(a4), \"r\"(a5), \"r\"(a6) : \"memory\");")
+    r.push("#else")
+    r.push("    (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; (void)a6;")
+    r.push("    ret = -1L;")
+    r.push("#endif")
+    r.push("    return ret;")
+    r.push("}")
+    r.push("static long hl_nl_mmap_zero(size_t n) {")
+    r.push("    // anonymous private mmap: reserve the arena's address space;")
+    r.push("    // Linux commits pages as they are touched, so reserving 1 GiB")
+    r.push("    // of virtual address space costs RSS only for the pages the")
+    r.push("    // compiler actually touches.")
+    r.push("    return hl_nl_sys(HL_SYS_mmap, 0L, (long)n, 3L, 0x22L, -1L, 0L);")
+    r.push("}")
+    r.push("// ---- Stage 92: the mmap-backed bump arena ----")
+    r.push("// Same shape as the freestanding arena (8-byte size header,")
+    r.push("// realloc copies), but the backing store is RESERVED virtual")
+    r.push("// memory committed lazily, because a self-hosting compile")
+    r.push("// allocates tens of MB of tokens, AST and generated text.")
+    r.push("#define HL_HEAP_RESERVE ((size_t)1073741824)")
+    r.push("static unsigned char* hl_heap_base = 0;")
+    r.push("static size_t hl_heap_pos = 0;")
+    r.push("static void* hl_bump_alloc(size_t n) {")
+    r.push("    size_t total = n + (size_t)8;")
+    r.push("    size_t a = (total + (size_t)15) & ~(size_t)15;")
+    r.push("    if (a < total) __builtin_trap();")
+    r.push("    if (!hl_heap_base) {")
+    r.push("        long p = hl_nl_mmap_zero(HL_HEAP_RESERVE);")
+    r.push("        if (p < 0) __builtin_trap();")
+    r.push("        hl_heap_base = (unsigned char*)p;")
+    r.push("    }")
+    r.push("    if (hl_heap_pos + a > HL_HEAP_RESERVE || hl_heap_pos + a < hl_heap_pos) __builtin_trap();")
+    r.push("    unsigned char* base = hl_heap_base + hl_heap_pos;")
+    r.push("    *(size_t*)base = n;")
+    r.push("    hl_heap_pos += a;")
+    r.push("    return (void*)(base + 8);")
+    r.push("}")
+    r.push("static void* hl_bump_calloc(size_t n, size_t sz) {")
+    r.push("    if (sz != 0 && n > (size_t)-1 / sz) __builtin_trap();")
+    r.push("    size_t t = n * sz;")
+    r.push("    unsigned char* p = (unsigned char*)hl_bump_alloc(t);")
+    r.push("    for (size_t i = 0; i < t; i++) p[i] = 0;")
+    r.push("    return (void*)p;")
+    r.push("}")
+    r.push("static void* hl_bump_realloc(void* old, size_t n) {")
+    r.push("    if (!old) return hl_bump_alloc(n);")
+    r.push("    size_t oldn = *((size_t*)((unsigned char*)old - 8));")
+    r.push("    unsigned char* p = (unsigned char*)hl_bump_alloc(n);")
+    r.push("    size_t c = oldn < n ? oldn : n;")
+    r.push("    for (size_t i = 0; i < c; i++) p[i] = ((unsigned char*)old)[i];")
+    r.push("    return (void*)p;")
+    r.push("}")
+    r.push("#define malloc hl_bump_alloc")
+    r.push("#define calloc hl_bump_calloc")
+    r.push("#define realloc hl_bump_realloc")
+    r.push("#define free(p) ((void)0)")
+    r.push("#undef free")
+    r.push("static void free(void* p) { (void)p; }")
+    r.push("#define free(p) ((void)0)")
+    r.push("// ---- the hand-rolled memory/string primitives (shared) ----")
+    concat_lines(r, fs_mem_str_lines())
+    r.push("// ---- Stage 92: the minimal pthread TYPE shims ----")
+    r.push("// The concurrency runtime's sections stay compilable in a")
+    r.push("// --no-libc TU (same rule as freestanding: dead code must")
+    r.push("// compile). The FUNCTIONS stay undeclared: a --no-libc program")
+    r.push("// that reaches spawn()/channels fails the LINK on")
+    r.push("// pthread_create — threads need a libc, and pretending")
+    r.push("// otherwise would hide it.")
+    r.push("typedef unsigned long pthread_t;")
+    r.push("typedef struct { int __hl_dummy; } pthread_mutex_t;")
+    r.push("typedef struct { int __hl_dummy; } pthread_cond_t;")
+    r.push("typedef struct { unsigned long __hl_stack; size_t __hl_guard; } pthread_attr_t;")
+    r.push("#define PTHREAD_MUTEX_INITIALIZER { 0 }")
+    r.push("#define PTHREAD_COND_INITIALIZER { 0 }")
+    # Stage 82: the task stacks carry a guard page via pthread_attr_*.
+    # The declarations keep that section compilable; a --no-libc build
+    # that reaches them fails the LINK by name.
+    r.push("int pthread_attr_init(void*);")
+    r.push("int pthread_attr_setstacksize(void*, size_t);")
+    r.push("int pthread_attr_setguardsize(void*, size_t);")
+    r.push("int pthread_attr_destroy(void*);")
+    r.push("#define PTHREAD_CREATE_JOINABLE 0")
+    r.push("#define PTHREAD_CREATE_DETACHED 1")
+    r.push("// ---- Stage 92: the std stream shims (fd-backed FILE) ----")
+    r.push("typedef struct { int fd; } FILE;")
+    r.push("static FILE hl_nl_fout = { 1 };")
+    r.push("static FILE hl_nl_ferr = { 2 };")
+    r.push("#define stdout (&hl_nl_fout)")
+    r.push("#define stderr (&hl_nl_ferr)")
+    r.push("// ---- Stage 92: the float predicates (shared, exact bit tests) ----")
+    concat_lines(r, fs_float_pred_lines())
+    r.push("// ---- the hosted-only declarations (dead sections; shared) ----")
+    concat_lines(r, fs_hosted_decl_lines(true))
+    r.push("// ---- Stage 92: the libc-name shims the compiler reaches ----")
+    r.push("// Each is a real definition behind the libc name's macro; the")
+    r.push("// unreached hosted-only functions keep their real-libc")
+    r.push("// dependencies, so straying into them fails the LINK with a")
+    r.push("// name instead of silently misbehaving.")
+    r.push("#define fopen hl_nl_fopen")
+    r.push("#define fread hl_nl_fread")
+    r.push("#define fwrite hl_nl_fwrite")
+    r.push("#define fclose hl_nl_fclose")
+    r.push("#define fputc hl_nl_fputc")
+    r.push("#define fflush hl_nl_fflush")
+    r.push("#define fprintf hl_nl_fprintf")
+    r.push("#define snprintf hl_nl_snprintf")
+    r.push("#define exit hl_nl_exit")
+    r.push("#define atexit hl_nl_atexit")
+    r.push("#define getenv hl_nl_getenv")
+    r.push("#define getcwd hl_nl_getcwd")
+    r.push("#define getchar hl_nl_getchar")
+    r.push("#define strtod hl_nl_strtod")
+    r.push("#define realpath hl_nl_realpath")
+    r.push("#define strncpy hl_nl_strncpy")
+    r.push("static char** hl_environ = 0;")
+    r.push("static size_t hl_nl_file_total(size_t a, size_t b) { return a * b; }")
+    r.push("static FILE* hl_nl_fopen(const char* path, const char* mode) {")
+    r.push("    long flags = (mode[0] == 'w') ? (HL_O_WRONLY | HL_O_CREAT | HL_O_TRUNC) : HL_O_RDONLY;")
+    r.push("    long fd = hl_nl_sys(HL_SYS_openat, HL_AT_FDCWD, (long)path, flags, 384L, 0L, 0L);")
+    r.push("    if (fd < 0) return (FILE*)0;")
+    r.push("    FILE* f = (FILE*)malloc(sizeof(FILE));")
+    r.push("    if (!f) return (FILE*)0;")
+    r.push("    f->fd = (int)fd;")
+    r.push("    return f;")
+    r.push("}")
+    r.push("static size_t hl_nl_fread(void* buf, size_t sz, size_t n, FILE* f) {")
+    r.push("    if (sz != 0 && n > (size_t)-1 / sz) return 0;")
+    r.push("    size_t total = hl_nl_file_total(sz, n), done = 0;")
+    r.push("    unsigned char* p = (unsigned char*)buf;")
+    r.push("    while (done < total) {")
+    r.push("        long r = hl_nl_sys(HL_SYS_read, (long)f->fd, (long)(p + done), (long)(total - done), 0L, 0L, 0L);")
+    r.push("        if (r <= 0) break;")
+    r.push("        done += (size_t)r;")
+    r.push("    }")
+    r.push("    return done;")
+    r.push("}")
+    r.push("static size_t hl_nl_fwrite(const void* buf, size_t sz, size_t n, FILE* f) {")
+    r.push("    if (sz != 0 && n > (size_t)-1 / sz) return 0;")
+    r.push("    size_t total = hl_nl_file_total(sz, n), done = 0;")
+    r.push("    const unsigned char* p = (const unsigned char*)buf;")
+    r.push("    while (done < total) {")
+    r.push("        long r = hl_nl_sys(HL_SYS_write, (long)f->fd, (long)(p + done), (long)(total - done), 0L, 0L, 0L);")
+    r.push("        if (r <= 0) break;")
+    r.push("        done += (size_t)r;")
+    r.push("    }")
+    r.push("    return done;")
+    r.push("}")
+    r.push("static int hl_nl_fclose(FILE* f) {")
+    r.push("    long r = hl_nl_sys(HL_SYS_close, (long)f->fd, 0L, 0L, 0L, 0L, 0L);")
+    r.push("    return r < 0 ? -1 : 0;")
+    r.push("}")
+    r.push("static int hl_nl_fputc(int c, FILE* f) {")
+    r.push("    unsigned char b = (unsigned char)c;")
+    r.push("    long r = hl_nl_sys(HL_SYS_write, (long)f->fd, (long)&b, 1L, 0L, 0L, 0L);")
+    r.push("    return (r == 1) ? c : -1;")
+    r.push("}")
+    r.push("static int hl_nl_fflush(FILE* f) { (void)f; return 0; }")
+    r.push("static void hl_nl_exit(int code) {")
+    r.push("    hl_nl_sys(HL_SYS_exit_group, (long)code, 0L, 0L, 0L, 0L, 0L);")
+    r.push("    __builtin_trap();")
+    r.push("}")
+    r.push("static int hl_nl_atexit(void (*fn)(void)) { (void)fn; return 0; }")
+    r.push("static int hl_nl_getchar(void) {")
+    r.push("    unsigned char b = 0;")
+    r.push("    long r = hl_nl_sys(HL_SYS_read, 0L, (long)&b, 1L, 0L, 0L, 0L);")
+    r.push("    if (r <= 0) return EOF;")
+    r.push("    return (int)b;")
+    r.push("}")
+    r.push("// Stage 92 documented gap: the no-libc strtod parses with long-")
+    r.push("// double accumulation, which is correctly rounded for every")
+    r.push("// input with up to 17 significant digits (all the literals a")
+    r.push("// lexer produces); extreme exponents clamp at +-400.")
+    r.push("static double hl_nl_strtod(const char* s, char** end) {")
+    r.push("    double sign = 1.0;")
+    r.push("    if (*s == '+') { s++; } else if (*s == '-') { sign = -1.0; s++; }")
+    r.push("    long double m = 0.0L;")
+    r.push("    int digits = 0, exp10 = 0;")
+    r.push("    while (*s >= '0' && *s <= '9') { if (digits < 30) { m = m * 10.0L + (long double)(*s - '0'); digits++; } else { exp10++; } s++; }")
+    r.push("    if (*s == '.') {")
+    r.push("        s++;")
+    r.push("        while (*s >= '0' && *s <= '9') { if (digits < 30) { m = m * 10.0L + (long double)(*s - '0'); digits++; exp10--; } s++; }")
+    r.push("    }")
+    r.push("    if (digits == 0) { if (end) *end = (char*)s; return 0.0; }")
+    r.push("    int esign = 1;")
+    r.push("    int eexp = 0;")
+    r.push("    if (*s == 'e' || *s == 'E') {")
+    r.push("        const char* save = s;")
+    r.push("        s++;")
+    r.push("        if (*s == '+') { s++; } else if (*s == '-') { esign = -1; s++; }")
+    r.push("        if (*s >= '0' && *s <= '9') {")
+    r.push("            while (*s >= '0' && *s <= '9') { if (eexp < 10000) eexp = eexp * 10 + (*s - '0'); s++; }")
+    r.push("        } else {")
+    r.push("            s = save;")
+    r.push("        }")
+    r.push("    }")
+    r.push("    exp10 += esign * eexp;")
+    r.push("    if (exp10 > 400) exp10 = 400;")
+    r.push("    if (exp10 < -400) exp10 = -400;")
+    r.push("    long double rr = m;")
+    r.push("    while (exp10 > 0) { rr /= 10.0L; exp10--; }")
+    r.push("    while (exp10 < 0) { rr *= 10.0L; exp10++; }")
+    r.push("    if (end) *end = (char*)s;")
+    r.push("    return (double)(sign * rr);")
+    r.push("}")
+    r.push("static char* hl_nl_getenv(const char* name) {")
+    r.push("    if (!hl_environ || !name) return (char*)0;")
+    r.push("    size_t n = strlen(name);")
+    r.push("    for (char** e = hl_environ; *e; e++) {")
+    r.push("        if (strncmp(*e, name, n) == 0 && (*e)[n] == '=') return *e + n + 1;")
+    r.push("    }")
+    r.push("    return (char*)0;")
+    r.push("}")
+    r.push("// The decimal formatter behind fprintf/snprintf: %s %c %% %d %u")
+    r.push("// %ld %lld and %f / %.Nf (fixed-point; exact for |v| below")
+    r.push("// 2^62/10^6, which is every float a compiler report formats).")
+    r.push("// Unknown specifiers pass through literally, so a never-seen")
+    r.push("// format degrades visibly instead of silently.")
+    r.push("static void hl_nl_put(char* out, size_t cap, size_t* n, const char* s) {")
+    r.push("    while (*s && *n + 1 < cap) out[(*n)++] = *s++;")
+    r.push("}")
+    r.push("static void hl_nl_puti(char* out, size_t cap, size_t* n, long long v) {")
+    r.push("    char tmp[24];")
+    r.push("    size_t t = 0;")
+    r.push("    unsigned long long u = (v < 0) ? (unsigned long long)(-(v + 1)) + 1ULL : (unsigned long long)v;")
+    r.push("    if (v < 0 && *n + 1 < cap) out[(*n)++] = '-';")
+    r.push("    do { tmp[t++] = (char)('0' + (int)(u % 10ULL)); u /= 10ULL; } while (u > 0);")
+    r.push("    while (t > 0 && *n + 1 < cap) out[(*n)++] = tmp[--t];")
+    r.push("}")
+    r.push("static void hl_nl_putf(char* out, size_t cap, size_t* n, double v, int prec) {")
+    r.push("    if (v != v) { hl_nl_put(out, cap, n, \"nan\"); return; }")
+    r.push("    if (hl_fs_isinf(v)) { if (hl_fs_signbit(v)) hl_nl_put(out, cap, n, \"-inf\"); else hl_nl_put(out, cap, n, \"inf\"); return; }")
+    r.push("    if (v < 0.0) { if (*n + 1 < cap) out[(*n)++] = '-'; v = -v; }")
+    r.push("    if (v >= 4611686018427387904.0) { hl_nl_put(out, cap, n, \"inf\"); return; }")
+    r.push("    long long iv = (long long)v;")
+    r.push("    double fr = v - (double)iv;")
+    r.push("    double scale = 1.0;")
+    r.push("    for (int i = 0; i < prec; i++) scale *= 10.0;")
+    r.push("    long long digits = (long long)(fr * scale + 0.5);")
+    r.push("    if ((double)digits >= scale) { iv += 1; digits = 0; }")
+    r.push("    hl_nl_puti(out, cap, n, iv);")
+    r.push("    if (prec > 0) {")
+    r.push("        if (*n + 1 < cap) out[(*n)++] = '.';")
+    r.push("        char tmp[24];")
+    r.push("        size_t t = 0;")
+    r.push("        for (int i = 0; i < prec; i++) { tmp[t++] = (char)('0' + (int)(digits % 10)); digits /= 10; }")
+    r.push("        while (t > 0 && *n + 1 < cap) out[(*n)++] = tmp[--t];")
+    r.push("    }")
+    r.push("}")
+    r.push("static int hl_nl_vfmt(char* out, size_t cap, const char* fmt, va_list ap) {")
+    r.push("    size_t n = 0;")
+    r.push("    if (cap == 0) return 0;")
+    r.push("    for (const char* p = fmt; *p; p++) {")
+    r.push("        if (*p != '%') { if (n + 1 < cap) out[n++] = *p; continue; }")
+    r.push("        p++;")
+    r.push("        if (*p == 0) break;")
+    r.push("        if (*p == '%') { if (n + 1 < cap) out[n++] = '%'; continue; }")
+    r.push("        if (*p == 's') { hl_nl_put(out, cap, &n, va_arg(ap, const char*)); continue; }")
+    r.push("        if (*p == 'c') { if (n + 1 < cap) out[n++] = (char)va_arg(ap, int); continue; }")
+    r.push("        if (*p == 'd' || *p == 'i') { hl_nl_puti(out, cap, &n, (long long)va_arg(ap, int)); continue; }")
+    r.push("        if (*p == 'u') { hl_nl_puti(out, cap, &n, (long long)va_arg(ap, unsigned int)); continue; }")
+    r.push("        if (*p == 'l' || *p == 'z') {")
+    r.push("            p++;")
+    r.push("            if (*p == 'l') { p++; if (*p == 'd' || *p == 'i') { hl_nl_puti(out, cap, &n, va_arg(ap, long long)); continue; } }")
+    r.push("            if (*p == 'd' || *p == 'i' || *p == 'u') { hl_nl_puti(out, cap, &n, (p[-1] == 'u') ? (long long)va_arg(ap, unsigned long) : (long long)va_arg(ap, long)); continue; }")
+    r.push("            if (n + 1 < cap) out[n++] = '%';")
+    r.push("            if (n + 1 < cap) out[n++] = p[-1];")
+    r.push("            if (n + 1 < cap) out[n++] = *p;")
+    r.push("            continue;")
+    r.push("        }")
+    r.push("        if (*p == '.') {")
+    r.push("            p++;")
+    r.push("            int prec = 0;")
+    r.push("            while (*p >= '0' && *p <= '9') { prec = prec * 10 + (*p - '0'); p++; }")
+    r.push("            if (*p == 'f') { hl_nl_putf(out, cap, &n, va_arg(ap, double), prec > 9 ? 9 : prec); continue; }")
+    r.push("            if (n + 1 < cap) out[n++] = '%';")
+    r.push("            if (n + 1 < cap) out[n++] = '.';")
+    r.push("            if (n + 1 < cap) out[n++] = (char)('0' + prec);")
+    r.push("            if (n + 1 < cap) out[n++] = *p;")
+    r.push("            continue;")
+    r.push("        }")
+    r.push("        if (*p == 'f') { hl_nl_putf(out, cap, &n, va_arg(ap, double), 6); continue; }")
+    r.push("        if (n + 1 < cap) out[n++] = '%';")
+    r.push("        if (n + 1 < cap) out[n++] = *p;")
+    r.push("    }")
+    r.push("    out[n] = 0;")
+    r.push("    return (int)n;")
+    r.push("}")
+    r.push("static int hl_nl_fprintf(FILE* f, const char* fmt, ...) {")
+    r.push("    va_list ap;")
+    r.push("    va_start(ap, fmt);")
+    r.push("    char buf[4096];")
+    r.push("    int n = hl_nl_vfmt(buf, sizeof buf, fmt, ap);")
+    r.push("    va_end(ap);")
+    r.push("    hl_nl_fwrite(buf, 1, (size_t)n, f);")
+    r.push("    return n;")
+    r.push("}")
+    r.push("static int hl_nl_snprintf(char* out, size_t cap, const char* fmt, ...) {")
+    r.push("    va_list ap;")
+    r.push("    va_start(ap, fmt);")
+    r.push("    int n = hl_nl_vfmt(out, cap, fmt, ap);")
+    r.push("    va_end(ap);")
+    r.push("    return n;")
+    r.push("}")
+    r.push("// Stage 92 documented gap: the no-libc realpath canonicalises")
+    r.push("// TEXTUALLY (it resolves . and .. and collapses separators; it")
+    r.push("// does NOT follow symlinks, which would need readlink loops).")
+    r.push("// The runtime uses realpath for the sandbox prefix check, where")
+    r.push("// the textual form is the honest one for a bootstrap build.")
+    r.push("static char* hl_nl_realpath(const char* path, char* out) {")
+    r.push("    if (!path || !path[0] || !out) return (char*)0;")
+    r.push("    int is_abs = (path[0] == '/');")
+    r.push("    const char* parts[256];")
+    r.push("    int plen[256];")
+    r.push("    int np = 0;")
+    r.push("    const char* p = path;")
+    r.push("    while (*p) {")
+    r.push("        while (*p == '/') p++;")
+    r.push("        if (!*p) break;")
+    r.push("        const char* start = p;")
+    r.push("        while (*p && *p != '/') p++;")
+    r.push("        int len = (int)(p - start);")
+    r.push("        if (len == 1 && start[0] == '.') continue;")
+    r.push("        if (len == 2 && start[0] == '.' && start[1] == '.') {")
+    r.push("            if (np > 0) { np--; continue; }")
+    r.push("            if (is_abs) continue;")
+    r.push("            return (char*)0;")
+    r.push("        }")
+    r.push("        if (np >= 256) return (char*)0;")
+    r.push("        parts[np] = start; plen[np] = len; np++;")
+    r.push("    }")
+    r.push("    size_t oi = 0;")
+    r.push("    if (is_abs) {")
+    r.push("        out[oi++] = '/';")
+    r.push("    } else {")
+    r.push("        long cw = hl_nl_sys(HL_SYS_getcwd, (long)out, 4096L, 0L, 0L, 0L, 0L);")
+    r.push("        if (cw <= 0) return (char*)0;")
+    r.push("        oi = strlen(out);")
+    r.push("    }")
+    r.push("    for (int i = 0; i < np; i++) {")
+    r.push("        if (oi + 1 + (size_t)plen[i] + 1 >= 4096) return (char*)0;")
+    r.push("        if (!(oi == 1 && out[0] == '/')) out[oi++] = '/';")
+    r.push("        for (int j = 0; j < plen[i]; j++) out[oi++] = parts[i][j];")
+    r.push("    }")
+    r.push("    out[oi] = 0;")
+    r.push("    return out;")
+    r.push("}")
+    r.push("static char* hl_nl_getcwd(char* buf, size_t n) {")
+    r.push("    // glibc convention: getcwd(NULL, 0) allocates. The arena has")
+    r.push("    // no reclaim, but a compiler calls cwd_get a handful of")
+    r.push("    // times, so a fixed 4 KiB scratch per call is nothing.")
+    r.push("    if (!buf) {")
+    r.push("        buf = (char*)malloc(4096);")
+    r.push("        if (!buf) return (char*)0;")
+    r.push("        n = 4096;")
+    r.push("    }")
+    r.push("    long r = hl_nl_sys(HL_SYS_getcwd, (long)buf, (long)n, 0L, 0L, 0L, 0L);")
+    r.push("    return (r > 0) ? buf : (char*)0;")
+    r.push("}")
+    r.push("// The kernel's struct stat fills the real layout (see the")
+    r.push("// fs_hosted_decl_lines variant above); only the return code")
+    r.push("// matters for file_exists, and st_mode/st_size for the rest.")
+    r.push("// a static function literally named stat: the runtime bodies call")
+    r.push("// stat(...) and declare struct stat st, so a macro would mangle")
+    r.push("// the type name; a plain definition needs no rewriting at all.")
+    r.push("static int stat(const char* path, struct stat* out) {")
+    r.push("    return (int)hl_nl_sys(HL_SYS_newfstatat, HL_AT_FDCWD, (long)path, (long)out, 0L, 0L, 0L);")
+    r.push("}")
+    r.push("static char* hl_nl_strncpy(char* d, const char* s, size_t n) {")
+    r.push("    size_t i = 0;")
+    r.push("    for (; i < n && s[i]; i++) d[i] = s[i];")
+    r.push("    for (; i < n; i++) d[i] = 0;")
+    r.push("    return d;")
+    r.push("}")
+    return r
+}
+
+fn runtime_lines(fs: bool, nl: bool) -> list[str] {
     let r: list[str] = []
     # Stage 77 (v0.96.0-alpha): freestanding prelude — no libc, no
     # libm. Only the three freestanding headers the runtime needs
     # (stdint, stdbool, stddef); everything else is provided below.
     if fs {
         concat_lines(r, freestanding_prelude_lines())
+        r.push("")
+    } else if nl {
+        # Stage 92 (v0.111.0-alpha): the no-libc prelude — a HOSTED
+        # source compiled without libc. Same three freestanding headers,
+        # the same hand-rolled memory/string primitives, plus the raw
+        # syscall layer, an mmap-backed arena (the compiler's heap is
+        # far beyond a static 1 MiB), the environ capture, and libc-name
+        # shims for exactly the functions the self-hosting compiler
+        # reaches (file IO, the print family, the panic path, env, the
+        # float parse/format). Everything else keeps its real-libc
+        # dependency: a no-libc program that strays into sockets,
+        # threads or libm fails the LINK with a name, which is the
+        # honest version of "not available".
+        concat_lines(r, no_libc_prelude_lines())
         r.push("")
     } else {
         r.push("#include <stdio.h>")
@@ -521,6 +1039,37 @@ fn runtime_lines(fs: bool) -> list[str] {
     # SIMD instruction set is baseline there but still gate-able); every
     # other architecture reports false. Used by simd_cpu_supports() —
     # the runtime-dispatch half of cfg(feature).
+    if nl {
+        # Stage 92: __builtin_cpu_supports references GCC's __cpu_model
+        # (libgcc), which a -nostdlib image cannot pull in. The no-libc
+        # variant probes the same feature bits with a raw CPUID, which
+        # needs no runtime at all (OS support for AVX is assumed, as
+        # __builtin_cpu_supports does; the kernel enables XSAVE on any
+        # CPU that has it).
+        r.push("static bool hl_simd_cpu_supports(hl_str* s) {")
+        r.push("    if (!s) return false;")
+        r.push("#define HL_FEAT_EQ(lit) \\")
+        r.push("    (s->len == (int64_t)sizeof(lit) - 1 && memcmp(s->data, lit, sizeof(lit) - 1) == 0)")
+        r.push("#if defined(__x86_64__) || defined(__i386__)")
+        r.push("    unsigned int hl_a, hl_b, hl_c, hl_d;")
+        r.push("    __asm__ volatile (\"cpuid\" : \"=a\"(hl_a), \"=b\"(hl_b), \"=c\"(hl_c), \"=d\"(hl_d) : \"a\"(1));")
+        r.push("    if (HL_FEAT_EQ(\"avx\")) return (hl_c >> 28) & 1;")
+        r.push("    if (HL_FEAT_EQ(\"avx2\")) {")
+        r.push("        unsigned int hl_a7, hl_b7, hl_c7, hl_d7;")
+        r.push("        __asm__ volatile (\"cpuid\" : \"=a\"(hl_a7), \"=b\"(hl_b7), \"=c\"(hl_c7), \"=d\"(hl_d7) : \"a\"(7));")
+        r.push("        return ((hl_c >> 28) & 1) && ((hl_c >> 27) & 1) && ((hl_b7 >> 5) & 1);")
+        r.push("    }")
+        r.push("    if (HL_FEAT_EQ(\"sse3\")) return (hl_c >> 0) & 1;")
+        r.push("    if (HL_FEAT_EQ(\"sse4.2\")) return (hl_c >> 20) & 1;")
+        r.push("    return false;")
+        r.push("#else")
+        r.push("    (void)s;")
+        r.push("    return false;")
+        r.push("#endif")
+        r.push("#undef HL_FEAT_EQ")
+        r.push("}")
+        r.push("")
+    } else {
     r.push("static bool hl_simd_cpu_supports(hl_str* s) {")
     r.push("    if (!s) return false;")
     r.push("#define HL_FEAT_EQ(lit) \\")
@@ -540,6 +1089,7 @@ fn runtime_lines(fs: bool) -> list[str] {
     r.push("#undef HL_FEAT_EQ")
     r.push("}")
     r.push("")
+    }
     r.push("static void hl_set_sandbox_root(const char* dir) {")
     r.push("    if (hl_sandbox_root) { free(hl_sandbox_root); hl_sandbox_root = NULL; }")
     r.push("    if (dir) {")
