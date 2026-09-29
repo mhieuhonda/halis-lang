@@ -688,6 +688,15 @@ def print_audit(program, checker):
     if boot:
         print("  Boot header: %s (emitted into %s)"
               % (boot["protocol"], boot["sections"][0]))
+    # Stage 91 (v0.110.0-alpha): the interrupt-safety proof. One line
+    # per #[irq_handler], word-for-word what the self-hosted --audit
+    # prints (the gate compares the two).
+    irq_lines = getattr(checker, "irq_proof_lines", [])
+    if irq_lines:
+        print("  Interrupt safety (Stage 91): every #[irq_handler] is "
+              "proved to reach no allocation:")
+        for line in irq_lines:
+            print("    " + line)
     # Stage 84 (v0.103.0-alpha): custom sections + the linker script that
     # places them. The checker proved every named section is covered (or
     # that no script was declared) before we get here.

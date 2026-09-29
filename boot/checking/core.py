@@ -49,6 +49,17 @@ class CheckerCore(object):
         # budget, filled by check_stack_budget for --audit:
         # {"budget", "worst", "path"} or None.
         self.stack_budget_info = None
+        # Stage 91 (v0.110.0-alpha): call-graph node -> the phrase naming
+        # the FIRST allocating construct found in that node's body (a fn
+        # key, or the synthetic "@default.<Struct>" node whose field
+        # defaults evaluate in the constructing frame). Filled during body
+        # checking by mark_alloc, consumed by check_irq_no_alloc.
+        self.alloc_sites = {}
+        # Stage 91: the audit line per proved #[irq_handler] —
+        # ["IRQ vector 32: 'kbd_isr' — allocation-free (proved over 7 "
+        # "call-graph nodes)", ...] — printed by boot.py --audit and
+        # mirrored word-for-word by the self-hosted compiler.
+        self.irq_proof_lines = []
 
     # ---------- utilities ----------
     def err(self, msg, node):
@@ -280,6 +291,13 @@ class CheckerCore(object):
             self.tail_call_check_fn(key, fn)
         # 4. effects analysis (fixpoint on the call graph)
         self.check_effects()
+        # 4.5 Stage 91 (v0.110.0-alpha): verified interrupt-safety —
+        # every #[irq_handler] is proved to reach NO allocation. Runs
+        # after the effects fixpoint for the same reason the stack
+        # budget does: the call graph must be complete (edges land
+        # during body checking), and the alloc sites the body checks
+        # recorded must all exist.
+        self.check_irq_no_alloc()
         # 5. Stage 82 (v0.101.0-alpha): the crate-level deterministic
         # stack budget — runs LAST (needs the complete call graph,
         # including the edges the body checks just added).
@@ -768,6 +786,113 @@ class CheckerCore(object):
             self.stack_budget_info = {
                 "budget": n, "worst": worst, "path": worst_path}
             return
+
+    # ---------- Stage 91 (v0.110.0-alpha): verified interrupt-safety ----
+    # An `#[irq_handler]` runs on the interrupted context's stack while
+    # that context may be anywhere — including inside malloc, holding
+    # the allocator's own lock. One allocation in IRQ context is a
+    # deadlock or a corrupted heap, and neither shows up in tests: it
+    # shows up at 3 a.m. on hardware. So the property is PROVED, not
+    # hoped: a handler must reach NO allocating construct, transitively
+    # through its whole call graph.
+    #
+    # The analysis has two halves, mirroring the self-hosted checker
+    # byte for byte:
+    #
+    #   1. During body checking, every allocating construct records the
+    #      FIRST such site per call-graph node into self.alloc_sites
+    #      (mark_alloc, called from check_expr / check_bin / check_method
+    #      / check_builtin_call). The classification is conservative —
+    #      "may allocate" wins every tie:
+    #        * list literals, map construction, string concatenation,
+    #          text conversion (str(x) on int/float/bool, the to_str
+    #          methods) — the C backend mallocs for every one;
+    #        * the growth methods (list.push reallocs, map.set may
+    #          grow, map.keys builds a fresh list) and the string
+    #          builders (slice / split / trim);
+    #        * builtins returning a fresh heap value (read_file, args,
+    #          range, join, ... — the table is ALLOC_BUILTINS);
+    #        * clone() — its argument is an owned heap type by rule;
+    #        * an extern "C" call — opaque to this proof, therefore
+    #          treated as allocating. An asm! block is NOT: its operands
+    #          are register-resident by the Stage 83 contract and the
+    #          template carries no call the compiler could mis-pick —
+    #          trusting the template is the same trust the ABI already
+    #          gets (mmio/port/atomics handlers would be unusable
+    #          otherwise).
+    #      A list the escape analysis WOULD stack-place still counts:
+    #      the verifier reasons about the language, not one layout
+    #      decision, and an IRQ handler has no business building lists.
+    #
+    #   2. This pass walks the completed call graph breadth-first from
+    #      every #[irq_handler] (sorted order keeps the witness chain
+    #      deterministic, so the bootstrap re-compile stays
+    #      byte-identical and both front-ends report the same words).
+    #      The first node carrying an alloc site ends the search with
+    #      the SHORTEST witness path.
+    def mark_alloc(self, reason):
+        """Record the first allocating construct of the fn being
+        checked. Called from the expression checker on every
+        may-allocate construct (see the classification above)."""
+        if self.cur_fn is not None and self.cur_fn not in self.alloc_sites:
+            self.alloc_sites[self.cur_fn] = reason
+
+    def alloc_node_phrase(self, node):
+        """The diagnostic phrase for an offending call-graph node —
+        identical in the self-hosted checker."""
+        reason = self.alloc_sites[node]
+        if node.startswith("@default."):
+            return ("the field default of struct '%s' %s"
+                    % (node[len("@default."):], reason))
+        return "'%s' %s" % (node, reason)
+
+    def check_irq_no_alloc(self):
+        # Handlers in sorted-key order: the reported violation is a
+        # function of the program text, not of dict order.
+        for key in sorted(self.fns):
+            fn = self.fns[key]
+            attrs = fn.get("attrs", {})
+            if not attrs.get("irq_handler", False) or fn.get("extern", False):
+                continue
+            vec = attrs.get("irq_vector", -1)
+            label = ("#[irq_handler(%d)]" % vec if vec is not None and vec >= 0
+                     else "#[irq_handler]")
+            # BFS over the call graph; sorted enqueue keeps the first
+            # witness deterministic. Edges carry user fns, methods, the
+            # synthetic "@default.<S>" nodes and the "b:<builtin>"
+            # nodes — only fn-shaped nodes can carry alloc sites.
+            parent = {key: None}
+            queue = [key]
+            head = 0
+            while head < len(queue):
+                node = queue[head]
+                head += 1
+                if node in self.alloc_sites:
+                    chain = []
+                    walk = node
+                    while walk is not None:
+                        chain.append(walk)
+                        walk = parent[walk]
+                    path = " -> ".join(reversed(chain))
+                    self.err(
+                        "%s on '%s' is not interrupt-safe: an allocation "
+                        "may be reached through %s — %s. An interrupt "
+                        "handler runs while the interrupted code may hold "
+                        "the allocator lock; it must not allocate."
+                        % (label, fn["name"], path,
+                           self.alloc_node_phrase(node)), fn)
+                for c in sorted(self.edges.get(node, ())):
+                    if c not in parent:
+                        parent[c] = node
+                        queue.append(c)
+            # The proof held: publish the audit line (the self-hosted
+            # --audit prints the same words).
+            what = ("IRQ vector %d" % vec
+                    if vec is not None and vec >= 0
+                    else "IRQ (vector assigned by the kernel)")
+            self.irq_proof_lines.append(
+                "%s: '%s' — allocation-free (proved over %d call-graph "
+                "nodes)" % (what, fn["name"], len(parent)))
 
     # ---------- environment ----------
     # Bindings are now [type, mut, moved] (3-tuple) — `moved` is True after

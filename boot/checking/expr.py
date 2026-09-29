@@ -103,6 +103,12 @@ class CheckerExpr(object):
             e["t"] = self.check_call(e, env, expected)
         elif k == "listlit":
             e["t"] = self.check_listlit(e, env, expected)
+            # Stage 91 (v0.110.0-alpha): a list literal may allocate —
+            # the C backend mallocs the list (and boxes the elements)
+            # unless escape analysis stack-places it, and the
+            # interrupt-safety proof is conservative on purpose (see
+            # check_irq_no_alloc).
+            self.mark_alloc("builds a list")
         elif k == "structlit":
             e["t"] = self.check_structlit(e, env, expected)
         elif k == "match":
@@ -274,6 +280,9 @@ class CheckerExpr(object):
             if lt == "float" and rt == "float":
                 return "float"
             if lt == "str" and rt == "str":
+                # Stage 91: `s + t` lowers to hl_str_concat — a fresh
+                # heap string. The interrupt-safety proof must see it.
+                self.mark_alloc("concatenates strings")
                 return "str"
             self.err("+ operator does not support %s and %s" % (lt, rt), e)
         if op in ("-", "*", "/", "%"):

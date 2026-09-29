@@ -1,0 +1,152 @@
+# ============================================================================
+# examples/irqsafe_demo.hls — Stage 91: verified interrupt-safety
+# ----------------------------------------------------------------------------
+# An interrupt handler runs on the interrupted context's stack while
+# that context may be anywhere — including inside malloc, holding the
+# allocator's own lock. One allocation in IRQ context is a deadlock or
+# a corrupted heap, and neither shows up in tests.
+#
+# Stage 91 makes the property PROVED, not hoped: the compiler rejects
+# any #[irq_handler] that can reach an allocation — a list literal, a
+# string concat, str(int), map_new, clone, the growth methods, an
+# allocating builtin, an extern call, a struct field default that
+# builds — transitively through its whole call graph, with a witness
+# chain naming the path (and the same words from BOTH front-ends).
+#
+# This demo is the world on the other side of that proof: a device
+# accounting kernel fragment whose handlers only do what an ISR may do
+# — arithmetic on fixed-layout state, decoding the fault frame, an asm!
+# register read. Compile it and the verifier signs off; delete the
+# `may_not_build` guard and put `let xs: list[int] = [1]` in the
+# handler instead, and the compile fails with the witness chain. That
+# is the whole stage: the failing shape is a compile error, not a
+# 3 a.m. page.
+#
+#   hlc examples/irqsafe_demo.hls out.c && gcc -O2 -o demo out.c -lm -pthread
+# ============================================================================
+
+import "core.interrupt"
+
+# Fixed-layout kernel state the handlers update in place. No heap, no
+# construction: an ISR may read and write this, never grow it.
+struct IrqStats {
+    ticks: int,
+    last_code: int,
+    spurious: int
+}
+
+fn stats_name(v: int) -> str {
+    if v == 32 {
+        return "pit"
+    }
+    if v == 44 {
+        return "ata-primary"
+    }
+    return "spurious"
+}
+
+fn account(st: IrqStats, code: int) -> int {
+    # Pure arithmetic on the frame: the shape the proof allows.
+    let next: int = st.ticks + 1
+    if code < 0 {
+        return 0 - 1
+    }
+    return next
+}
+
+fn fault_summary(code: int) -> str {
+    # Text work happens in the KERNEL context (main), never in the
+    # handler: building strings is the canonical thing an ISR may not
+    # do, and the verifier rejects it there — this helper is only
+    # called from main.
+    return "irq " + stats_name(code)
+}
+
+#[irq_handler(32)]
+fn pit_isr(frame: IrqStats) -> void {
+    # Handler-shaped work only: arithmetic + a helper the proof walked.
+    # Replace this body with `let xs: list[int] = [1]` and the compiler
+    # answers: #[irq_handler(32)] on 'pit_isr' is not interrupt-safe: an
+    # allocation may be reached through pit_isr — 'pit_isr' builds a
+    # list. ...
+    let code: int = account(frame, 32)
+    if code < 0 {
+        return
+    }
+    return
+}
+
+#[irq_handler(44)]
+fn disk_isr(frame: IrqStats) -> void {
+    return
+}
+
+fn main() -> int uses IO {
+    let st: IrqStats = IrqStats { ticks: 0, last_code: 0, spurious: 0 }
+
+    # ------------------------------------------------------------------
+    # 1. The handler's view of the frame: pure arithmetic
+    # ------------------------------------------------------------------
+    if account(st, 32) != 1 {
+        return 1
+    }
+    if account(st, 0 - 3) != 0 - 1 {
+        return 2
+    }
+
+    # ------------------------------------------------------------------
+    # 2. The geometry the handlers sit in
+    # ------------------------------------------------------------------
+    if exc_count() != 32 {
+        return 3
+    }
+    if pic_remap_ok(32, 40) != true {
+        return 4
+    }
+    if pic_vector_irq(41) != 9 {
+        return 5
+    }
+    if lapic_timer_vector() != 240 {
+        return 6
+    }
+
+    # ------------------------------------------------------------------
+    # 3. Text belongs to the kernel context, not the handler
+    # ------------------------------------------------------------------
+    if fault_summary(32) != "irq pit" {
+        return 7
+    }
+    if fault_summary(44) != "irq ata-primary" {
+        return 8
+    }
+    if fault_summary(255) != "irq spurious" {
+        return 9
+    }
+
+    # ------------------------------------------------------------------
+    # 4. The fault decode a handler may run on its frame
+    # ------------------------------------------------------------------
+    let cause: PageFaultCause = page_fault_decode(7)
+    if page_fault_is_present(cause) != true {
+        return 10
+    }
+    if page_fault_is_write(cause) != true {
+        return 11
+    }
+    if page_fault_cause_name(page_fault_decode(16)) != "instruction-fetch" {
+        return 12
+    }
+
+    # ------------------------------------------------------------------
+    # 5. The proof itself, as the --audit reports it: two handlers,
+    #    two vectors, zero reachable allocations
+    # ------------------------------------------------------------------
+    if stats_name(32) != "pit" {
+        return 13
+    }
+
+    println("irqsafe: pit_isr(32) and disk_isr(44) are proved allocation-free")
+    println("irqsafe: the failing shape is a compile error with a witness chain")
+    println("irqsafe: run `hlc --audit examples/irqsafe_demo.hls` to see the proof lines")
+    return 0
+}

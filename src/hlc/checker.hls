@@ -1191,6 +1191,197 @@ fn check_stack_budget(ctx: Ctx) -> void {
 }
 
 # ============================================================================
+# STAGE 91 (v0.110.0-alpha): verified interrupt-safety
+# ============================================================================
+#
+# An `#[irq_handler]` runs on the interrupted context's stack while that
+# context may be anywhere — including inside malloc, holding the
+# allocator's own lock. One allocation in IRQ context is a deadlock or a
+# corrupted heap, and neither shows up in tests. So the property is
+# PROVED: a handler must reach NO allocating construct, transitively.
+#
+# Two halves, mirroring boot/checking byte for byte:
+#
+#   1. During body checking, every may-allocate construct records the
+#      FIRST such site per call-graph node into ctx.alloc_sites
+#      (mark_alloc, called from check_expr / check_bin / check_method /
+#      check_builtin_call). Classification is conservative — "may
+#      allocate" wins every tie: list literals, map construction,
+#      string concatenation, text conversion, the growth methods
+#      (list.push reallocs, map.set may grow, map.keys builds a fresh
+#      list), the string builders (slice / split / trim), builtins
+#      returning a fresh heap value (ALLOC_BUILTINS mirror), clone(),
+#      and extern "C" calls (opaque to this proof). An asm! block is
+#      NOT a site: its operands are register-resident by the Stage 83
+#      contract, and trusting the template is the same trust the ABI
+#      already gets (mmio / port / atomics handlers would be unusable
+#      otherwise). A list the escape analysis WOULD stack-place still
+#      counts — the verifier reasons about the language, not one
+#      layout decision.
+#
+#   2. check_irq_no_alloc walks the completed call graph breadth-first
+#      from every #[irq_handler]. Sorted iteration keeps the witness
+#      chain deterministic (the bootstrap re-compile must stay
+#      byte-identical, and both front-ends must report the same
+#      words); the first node carrying an alloc site ends the search
+#      with the SHORTEST witness path.
+
+# mark_alloc: record the first allocating construct of `cur` (the fn
+# being checked; the synthetic "@default.<S>" keys arrive through the
+# same parameter during struct-default checking). Only the FIRST site
+# per node is kept — the diagnostic names one construct, and the
+# effects-fixpoint re-analysis must not double-book a node.
+fn mark_alloc(ctx: Ctx, cur: str, reason: str) -> void {
+    if cur != "" && !ctx.alloc_sites.has(cur) {
+        ctx.alloc_sites.set(cur, reason)
+    }
+}
+
+# alloc_builtin_reason: the phrase for a builtin whose result is a
+# fresh heap value, or "" when the builtin allocates nothing. The
+# mirror of ALLOC_BUILTINS in boot/checking/helpers.py — every entry
+# and every word must match (the Stage 91 gate compares diagnostics).
+fn alloc_builtin_reason(name: str) -> str {
+    if name == "args" || name == "args_os" || name == "async_spawn"
+    || name == "chan_new" || name == "chan_new_bounded" || name == "chr"
+    || name == "cwd_get" || name == "env_get" || name == "fs_read_dir"
+    || name == "gen_spawn" || name == "join" || name == "map_new"
+    || name == "net_lookup" || name == "net_read" || name == "net_tls_get"
+    || name == "net_udp_recv_from" || name == "proc_exec"
+    || name == "proc_spawn" || name == "range" || name == "read_file"
+    || name == "read_file_tainted" || name == "read_line"
+    || name == "select" || name == "spawn" || name == "stream_new"
+    || name == "stream_send" || name == "stream_map_int"
+    || name == "stream_filter_int" || name == "stream_fold_int"
+    || name == "stream_flat_map_int" || name == "stream_merge_int"
+    || name == "sys_hostname" || name == "tainted_args"
+    || name == "future_select" {
+        return "calls the builtin '" + name + "'"
+    }
+    return ""
+}
+
+# alloc_method_reason: the phrase for a builtin-method op that may
+# allocate, or "" when it does not. Mirror of ALLOC_METHOD_OPS.
+fn alloc_method_reason(op: str) -> str {
+    if op == "list.push" {
+        return "calls 'list.push' on a heap list"
+    }
+    if op == "map.set" {
+        return "calls 'map.set' on a heap map"
+    }
+    if op == "map.keys" {
+        return "calls 'map.keys' on a heap map"
+    }
+    if op == "str.slice" {
+        return "calls 'str.slice' on a string"
+    }
+    if op == "str.split" {
+        return "calls 'str.split' on a string"
+    }
+    if op == "str.trim" {
+        return "calls 'str.trim' on a string"
+    }
+    if op == "int.to_str" || op == "float.to_str" || op == "bool.to_str" {
+        return "converts a value to its text form"
+    }
+    if op == "chan.send" || op == "chan.try_send" {
+        return "sends on a channel"
+    }
+    return ""
+}
+
+# alloc_node_phrase: the diagnostic phrase for an offending call-graph
+# node — the mirror of boot's Checker.alloc_node_phrase.
+fn alloc_node_phrase(node: str, reason: str) -> str {
+    if node.starts_with("@default.") {
+        return "the field default of struct '" + node.slice(9, node.len()) + "' " + reason
+    }
+    return "'" + node + "' " + reason
+}
+
+# check_irq_no_alloc: the pass itself. See the section comment above.
+fn check_irq_no_alloc(ctx: Ctx) -> void {
+    # Handlers in sorted-key order: the reported violation is a
+    # function of the program text, not of parse order (boot walks
+    # sorted(self.fns) — the same strings, the same order).
+    let keys: list[str] = sorted_strs(ctx.fn_order)
+    let mut i: int = 0
+    while i < keys.len() {
+        let key: str = keys.get(i)
+        let f: FnInfo = ctx.fns.get_or(key, dummy_fn())
+        if !f.attr_irq_handler || f.is_extern {
+            i = i + 1
+            continue
+        }
+        let vec: int = f.attr_irq_vector
+        let mut label: str = "#[irq_handler]"
+        if vec >= 0 {
+            label = "#[irq_handler(" + vec.to_str() + ")]"
+        }
+        # BFS over the call graph; sorted enqueue keeps the first
+        # witness deterministic. parent doubles as the visited set;
+        # the queue is a list consumed from the head.
+        let parent: map[str, str] = map_new()
+        parent.set(key, "")
+        let queue: list[str] = []
+        queue.push(key)
+        let mut head: int = 0
+        let mut hit: str = ""
+        while head < queue.len() {
+            let node: str = queue.get(head)
+            head = head + 1
+            if ctx.alloc_sites.has(node) {
+                hit = node
+                # Shortest witness: stop consuming the queue. (BFS in
+                # sorted order reaches the offender by the shortest
+                # deterministic route already.)
+                head = queue.len()
+            } else {
+                let cs: list[str] = sorted_strs(ctx.edges.get_or(node, []))
+                let mut j: int = 0
+                while j < cs.len() {
+                    let c: str = cs.get(j)
+                    if !parent.has(c) {
+                        parent.set(c, node)
+                        queue.push(c)
+                    }
+                    j = j + 1
+                }
+            }
+        }
+        if hit != "" {
+            # Rebuild the chain from the hit back to the handler. The
+            # parent map already holds the BFS tree the shortest path
+            # followed; the walk order is hit -> ... -> handler.
+            let chain: list[str] = []
+            let mut walk: str = hit
+            while walk != "" {
+                chain.push(walk)
+                walk = parent.get_or(walk, "")
+            }
+            # Reverse into handler-first order (insertion sort by
+            # position: rebuild with a backward index walk).
+            let path_parts: list[str] = []
+            let mut pi: int = chain.len()
+            while pi > 0 {
+                pi = pi - 1
+                path_parts.push(chain.get(pi))
+            }
+            cerr(f.line, label + " on '" + f.name + "' is not interrupt-safe: an allocation may be reached through " + join(path_parts, " -> ") + " — " + alloc_node_phrase(hit, ctx.alloc_sites.get_or(hit, "")) + ". An interrupt handler runs while the interrupted code may hold the allocator lock; it must not allocate.")
+        }
+        # The proof held: publish the audit line (boot.py --audit
+        # prints the same words).
+        let mut what: str = "IRQ (vector assigned by the kernel)"
+        if vec >= 0 {
+            what = "IRQ vector " + vec.to_str()
+        }
+        ctx.irq_proof_lines.push(what + ": '" + f.name + "' — allocation-free (proved over " + parent.keys().len().to_str() + " call-graph nodes)")
+        i = i + 1
+    }
+}
+
+# ============================================================================
 # STAGE 30 (v0.47.0-alpha): boxed-vs-stack layout analysis (escape analysis)
 # ============================================================================
 #
@@ -2368,6 +2559,10 @@ fn check_program(ctx: Ctx) -> void uses Fs {
     }
     # 6. effects analysis
     check_effects(ctx)
+    # 6.4 Stage 91 (v0.110.0-alpha): verified interrupt-safety — the
+    # call graph is complete and the alloc sites the body checks
+    # recorded all exist; prove every #[irq_handler] allocation-free.
+    check_irq_no_alloc(ctx)
     # 6.5 Stage 82 (v0.101.0-alpha): the deterministic stack budget —
     # runs after the effects fixpoint (the call graph must be
     # complete: edges land during body checking).

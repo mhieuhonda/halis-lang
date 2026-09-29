@@ -4,8 +4,9 @@ maintainability. The final Checker class assembles all mixins in
 boot/checking/checker.py - behavior is unchanged."""
 from .. import proof as _proof
 from .helpers import (
-    BOOL_M, BUILTIN_FNS, FLOAT_M, FREESTANDING_DENY_BUILTINS,
-    FREESTANDING_DENY_MSG, INT_M, STR_M, _type_mentions_typeparam,
+    ALLOC_BUILTINS, ALLOC_METHOD_OPS, BOOL_M, BUILTIN_FNS, FLOAT_M,
+    FREESTANDING_DENY_BUILTINS, FREESTANDING_DENY_MSG, INT_M, STR_M,
+    _type_mentions_typeparam,
     chan_inner, future_inner,
     instantiate_type, is_chan, is_future, is_list, is_map, is_owned_type, is_stream, is_taint,
     is_tainted_type, is_task, list_elem, list_taint_inner, map_val, stream_inner, taint_inner, task_inner,
@@ -30,6 +31,14 @@ class CheckerCall(object):
                 self.err("method must be called through an object: %s" % name, e)
             e["rc"] = ("user", name)
             self.edges[self.cur_fn].add(name)
+            # Stage 91 (v0.110.0-alpha): an extern "C" call is opaque to
+            # the interrupt-safety proof — the C side can malloc, so the
+            # conservative classification treats the call site as an
+            # allocation. (User Halis callees are covered transitively
+            # by the edge just added.)
+            if fn.get("extern", False):
+                self.mark_alloc("calls the extern fn '%s' (a C call this "
+                                "proof cannot see into)" % name)
             if len(args) != len(fn["params"]):
                 self.err("function %s expects %d arguments, got %d"
                          % (name, len(fn["params"]), len(args)), e)
@@ -181,6 +190,16 @@ class CheckerCall(object):
             return e["spawn_ret"]
         args = e["args"]
 
+        # Stage 91 (v0.110.0-alpha): a builtin that constructs or returns
+        # a fresh heap value may allocate — the interrupt-safety proof
+        # records the calling fn (classification: ALLOC_BUILTINS in
+        # helpers.py, mirrored verbatim in src/hlc/checker.hls). The
+        # spawn-family early return above keeps its cached type, and its
+        # site was marked on the first pass — mark_alloc keeps only the
+        # first, so the fixpoint's re-analysis cannot double-book.
+        if name in ALLOC_BUILTINS:
+            self.mark_alloc("calls the builtin '%s'" % name)
+
         def need(n):
             if len(args) != n:
                 self.err("%s expects %d arguments, got %d" % (name, n, len(args)), e)
@@ -294,6 +313,11 @@ class CheckerCall(object):
             # freestanding implementation).
             if at == "float" and self.is_freestanding():
                 self.err(FREESTANDING_DENY_MSG % "str(float)", e)
+            # Stage 91: str(int/float/bool) renders a fresh heap string
+            # (hl_str_from_*); str(str) is the identity and allocates
+            # nothing.
+            if at in ("int", "float", "bool"):
+                self.mark_alloc("converts a value to its text form")
             return "str"
         if name == "int":
             need(1)
@@ -513,6 +537,11 @@ class CheckerCall(object):
                 self.err("clone() on type %s is not supported (Task join "
                          "handles and composites containing them cannot "
                          "be cloned)" % at, e)
+            # Stage 91: the argument is an owned heap type by rule, so
+            # the deep clone allocates (a generic instantiation with a
+            # primitive binding lowers to the identity — the verifier
+            # stays conservative on the declared shape).
+            self.mark_alloc("clones a heap value")
             # Argument is consumed by value (read), not moved.
             return at
         if name == "take":
@@ -1788,6 +1817,12 @@ class CheckerCall(object):
             if op in ("chan.send", "chan.try_send", "chan.recv",
                       "chan.recv_or", "chan.len", "task.join"):
                 self.edges[self.cur_fn].add("b:" + op)
+            # Stage 91 (v0.110.0-alpha): the growth / string-builder /
+            # text-conversion methods may allocate — the interrupt-
+            # safety proof records the receiver's fn (classification:
+            # ALLOC_METHOD_OPS in helpers.py, mirrored in hlc).
+            if op in ALLOC_METHOD_OPS:
+                self.mark_alloc(ALLOC_METHOD_OPS[op])
             if op == "chan.send" or op == "chan.try_send":
                 v = args[0]
                 vt = ptypes[0]

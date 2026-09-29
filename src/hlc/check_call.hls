@@ -36,6 +36,16 @@ fn check_builtin_call(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, 
     if ctx.crate_freestanding && is_freestanding_deny_builtin(name) {
         cerr(line, name + "() is not available in #![freestanding] mode (it lowers to a libc/libm call with no freestanding implementation)")
     }
+    # Stage 91 (v0.110.0-alpha): a builtin that constructs or returns a
+    # fresh heap value may allocate — the interrupt-safety proof records
+    # the calling fn (classification: alloc_builtin_reason in
+    # checker.hls, the mirror of ALLOC_BUILTINS in
+    # boot/checking/helpers.py). This runs BEFORE the spawn-family
+    # rewrites below so their sites are marked on the first visit;
+    # mark_alloc keeps only the first, so re-analysis cannot double-book.
+    if alloc_builtin_reason(name) != "" {
+        mark_alloc(ctx, cur, alloc_builtin_reason(name))
+    }
     # Stage 16 (v0.27.0-alpha): spawn(f, a1, ..., aN) — the FIRST argument
     # is a function NAME (identifier), not a value. It must be handled
     # BEFORE the generic argument-evaluation loop below (which would try
@@ -314,6 +324,12 @@ fn check_builtin_call(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, 
         if a0 == "float" && ctx.crate_freestanding {
             cerr(line, "str(float) is not available in #![freestanding] mode (it lowers to a libc/libm call with no freestanding implementation)")
         }
+        # Stage 91: str(int/float/bool) renders a fresh heap string
+        # (hl_str_from_*); str(str) is the identity and allocates
+        # nothing.
+        if a0 == "int" || a0 == "float" || a0 == "bool" {
+            mark_alloc(ctx, cur, "converts a value to its text form")
+        }
         return "str"
     }
     if name == "int" {
@@ -537,6 +553,11 @@ fn check_builtin_call(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, 
         if !clone_supported(ctx, at2, []) {
             cerr(line, "clone() on type " + at2 + " is not supported (Task join handles and composites containing them cannot be cloned)")
         }
+        # Stage 91: the argument is an owned heap type by rule, so the
+        # deep clone allocates (a generic instantiation with a primitive
+        # binding lowers to the identity — the verifier stays
+        # conservative on the declared shape).
+        mark_alloc(ctx, cur, "clones a heap value")
         return at2
     }
     if name == "take" {
@@ -1847,6 +1868,13 @@ fn check_method(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int) -> str
     || ctx.exprs[e].mop == "chan.recv" || ctx.exprs[e].mop == "chan.recv_or"
     || ctx.exprs[e].mop == "chan.len" || ctx.exprs[e].mop == "task.join" {
         add_edge(ctx, cur, "b:" + ctx.exprs[e].mop)
+    }
+    # Stage 91 (v0.110.0-alpha): the growth / string-builder /
+    # text-conversion methods may allocate — the interrupt-safety proof
+    # records the receiver's fn (classification: alloc_method_reason in
+    # checker.hls, the mirror of ALLOC_METHOD_OPS in boot).
+    if alloc_method_reason(ctx.exprs[e].mop) != "" {
+        mark_alloc(ctx, cur, alloc_method_reason(ctx.exprs[e].mop))
     }
     if(ctx.exprs[e].mop == "chan.send" || ctx.exprs[e].mop == "chan.try_send") && nargs >= 1 {
         # Send rule: the message type must be Send (both the blocking

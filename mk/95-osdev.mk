@@ -47,6 +47,20 @@ atomics-acceptance:
 	@$(PYTHON) tests/atomics_acceptance.py
 	@echo "ACCEPTANCE OK: Stage 90 -- core.sync.nolock (lock-free primitives)"
 
+# irqsafe-acceptance: the Stage 91 acceptance gate. Runs the 7-section
+# suite for verified interrupt-safety: every fail program rejected by
+# BOTH compilers with the SAME words (a list literal, a string concat,
+# a file read, a clone, an extern call, a map construction, a building
+# field default, str(int) — each probe names its construct), the
+# transitive witness chain, the --audit proof lines from both
+# front-ends, the ok-test on the interpreter + native + -nostdlib, the
+# synthesized classification probes on both sides, the demo, and the
+# tools.
+irqsafe-acceptance:
+	@echo "[Stage 91 acceptance] running tests/irqsafe_acceptance.py..."
+	@$(PYTHON) tests/irqsafe_acceptance.py
+	@echo "ACCEPTANCE OK: Stage 91 -- verified interrupt-safety (no alloc in IRQ context)"
+
 # dma-acceptance: the Stage 89 acceptance gate. Runs the 6-section suite
 # for DMA-safe buffers: the core/dma.hls surface, the five CHECKED
 # constructors (a zero length, a misaligned address, an address that
@@ -132,7 +146,7 @@ link-acceptance:
 	@$(PYTHON) tests/link_acceptance.py
 	@echo "ACCEPTANCE OK: Stage 84 -- linker-script integration + custom sections"
 
-.PHONY: freestanding freestanding-check freestanding-acceptance nostd nostd-acceptance alloc-acceptance mem-acceptance panic-acceptance stackguard-acceptance asmreg-acceptance link-acceptance boot-acceptance idt-acceptance mmio-acceptance port-acceptance dma-acceptance atomics-acceptance test-linker
+.PHONY: freestanding freestanding-check freestanding-acceptance nostd nostd-acceptance alloc-acceptance mem-acceptance panic-acceptance stackguard-acceptance asmreg-acceptance link-acceptance boot-acceptance idt-acceptance mmio-acceptance port-acceptance dma-acceptance atomics-acceptance irqsafe-acceptance test-linker
 # Phase VI — OS development foundation (Stages 77-78+)
 # ============================================================================
 # These stages give the LANGUAGE the capabilities OS developers need.

@@ -717,10 +717,61 @@ INT_M = {"to_str": "str", "to_float": "float", "abs": "int"}
 FLOAT_M = {"to_str": "str", "to_int": "int", "abs": "float"}
 BOOL_M = {"to_str": "str"}
 
+# ---------------------------------------------------------------------------
+# Stage 91 (v0.110.0-alpha): the allocation classification.
+#
+# The interrupt-safety proof needs to know which language constructs MAY
+# touch the heap when the C backend lowers them. The classification is
+# deliberately conservative ("may allocate" wins every tie): a list the
+# escape analysis WOULD place on the stack still counts, because the
+# verifier reasons about the language, not about one layout decision.
+#
+# Both front-ends must agree on every entry — the tables below are the
+# single source of truth for boot; src/hlc/checker.hls mirrors them
+# verbatim (alloc_builtin_reason / alloc_method_reason) and the Stage 91
+# gate proves the two reject the same programs with the same words.
+# ---------------------------------------------------------------------------
+# Builtins whose result is a FRESH heap value (or which construct one):
+#   args/args_os      -> list[str]; read_file/read_file_tainted/read_line
+#   -> str; fs_read_dir -> list[str]; net_* text paths -> str; proc_exec /
+#   proc_spawn -> str / Task; chan_new* / spawn / async_spawn / gen_spawn /
+#   stream_new / stream combinators -> heap handles; map_new / range / chr
+#   / join / sys_hostname / tainted_args / cwd_get / env_get / select /
+#   future_select / stream_send -> fresh heap values.
+ALLOC_BUILTINS = {
+    "args", "args_os", "async_spawn", "chan_new", "chan_new_bounded",
+    "chr", "cwd_get", "env_get", "fs_read_dir", "gen_spawn", "join",
+    "map_new", "net_lookup", "net_read", "net_tls_get",
+    "net_udp_recv_from", "proc_exec", "proc_spawn", "range", "read_file",
+    "read_file_tainted", "read_line", "select", "spawn", "stream_new",
+    "stream_send", "stream_map_int", "stream_filter_int",
+    "stream_fold_int", "stream_flat_map_int", "stream_merge_int",
+    "sys_hostname", "tainted_args", "future_select",
+}
+
+# Builtin-method ops ("list.push" / "str.slice" / ...) that may allocate,
+# with the phrase the diagnostic uses. Keys mirror the `mop`/`rm` tags
+# both front-ends attach to a builtin method node.
+ALLOC_METHOD_OPS = {
+    "list.push":     "calls 'list.push' on a heap list",
+    "map.set":       "calls 'map.set' on a heap map",
+    "map.keys":      "calls 'map.keys' on a heap map",
+    "str.slice":     "calls 'str.slice' on a string",
+    "str.split":     "calls 'str.split' on a string",
+    "str.trim":      "calls 'str.trim' on a string",
+    "int.to_str":    "converts a value to its text form",
+    "float.to_str":  "converts a value to its text form",
+    "bool.to_str":   "converts a value to its text form",
+    "chan.send":     "sends on a channel",
+    "chan.try_send": "sends on a channel",
+}
+
 
 
 
 __all__ = [
+    "ALLOC_BUILTINS",
+    "ALLOC_METHOD_OPS",
     "BOOL_M",
     "BUILTIN_EFFECTS",
     "BUILTIN_FNS",

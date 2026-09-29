@@ -4498,3 +4498,119 @@ re-check.
 `make atomics-acceptance` (6 sections) runs those on all three
 execution paths, checks the lowering's memory class and clobbers, pins
 the locked-RMW gap described above, and runs the demo and the tools.
+
+## 45. Verified interrupt-safety — no allocation in IRQ context (Stage 91 — v0.110.0-alpha)
+
+An interrupt handler runs on the interrupted context's stack while that
+context may be anywhere — including inside `malloc`, holding the
+allocator's own lock. One allocation in IRQ context is a deadlock or a
+corrupted heap, and neither shows up in tests; both show up at 3 a.m.
+on hardware. Stage 91 makes the property **proved, not hoped**: the
+compiler rejects any `#[irq_handler]` that can reach an allocation,
+transitively through its whole call graph, with a witness chain naming
+the path — and it does so with the same words from BOTH front-ends
+(`boot.py --check` and `hlc --audit`).
+
+### 45.1. The property
+
+For every function marked `#[irq_handler]` or `#[irq_handler(N)]`, the
+checker walks the call graph breadth-first from the handler (including
+the handler itself and the synthetic `@default.<Struct>` nodes a
+construction can pull in). If ANY reached node contains a may-allocate
+construct, the program is rejected:
+
+```
+#[irq_handler(32)] on 'kbd_isr' is not interrupt-safe: an allocation
+may be reached through kbd_isr -> enqueue — 'enqueue' calls the builtin
+'read_file'. An interrupt handler runs while the interrupted code may
+hold the allocator lock; it must not allocate.
+```
+
+The witness chain is the SHORTEST path (breadth-first, sorted enqueue),
+so it is deterministic: the bootstrap re-compilation stays
+byte-identical, and both front-ends print the same words. A bare
+`#[irq_handler]` reports without the vector number; the audit publishes
+one line per proved handler:
+
+```
+  Interrupt safety (Stage 91): every #[irq_handler] is proved to reach no allocation:
+    IRQ vector 32: 'kbd_isr' — allocation-free (proved over 2 call-graph nodes)
+```
+
+### 45.2. The conservative classification
+
+"May allocate" wins every tie. The verifier reasons about the
+LANGUAGE, not about one layout decision: a list the escape analysis
+WOULD place on the stack still counts, because an IRQ handler has no
+business building lists at all — the refinement is deliberately not
+wired. The may-allocate constructs, each with the phrase the
+diagnostic uses:
+
+| Construct | Why it allocates | Diagnostic phrase |
+|---|---|---|
+| `[a, b, ...]` | `hl_list_new` + element boxes | `builds a list` |
+| `map_new()` | `hl_map_new` (calloc'd slots) | `calls the builtin 'map_new'` |
+| `s + t` on `str` | `hl_str_concat` | `concatenates strings` |
+| `str(x)` on int/float/bool, the `to_str()` methods | `hl_str_from_*` | `converts a value to its text form` |
+| `list.push(v)` | `hl_list_push` reallocs (the array MOVES) | `calls 'list.push' on a heap list` |
+| `map.set(k, v)` | may grow (`hl_map_grow`) | `calls 'map.set' on a heap map` |
+| `map.keys()` | builds a fresh list | `calls 'map.keys' on a heap map` |
+| `s.slice/split/trim` | fresh heap strings | `calls 'str.slice' on a string` (etc.) |
+| `chan.send / try_send` | message nodes malloc | `sends on a channel` |
+| `clone(x)` | argument is an owned heap type by rule | `clones a heap value` |
+| builtins returning a fresh heap value (`read_file`, `args`, `range`, `join`, `chr`, `env_get`, `fs_read_dir`, the spawn/stream family, ...) | fresh `str`/`list`/`map`/handles | `calls the builtin 'NAME'` |
+| an `extern "C"` call | opaque to this proof — the C side can malloc | `calls the extern fn 'NAME' (a C call this proof cannot see into)` |
+
+NOT may-allocate: scalar arithmetic and comparisons, indexing and
+`.get/.set/.pop/.len/.has/.get_or` (within capacity), `str.find /
+contains / starts_with / ends_with / byte_at / to_int`, enum and struct
+construction (plain C structs; a building field default is caught
+through its own `@default` node — `the field default of struct 'X'
+builds a list`), `panic`, `print`, and the effectful-but-flat builtins
+(`write_file`, the `net_*` fd operations, the `math_*` family, the
+`int_*` bitwise family, `clock_ms`, the thread family).
+
+### 45.3. The two documented trust decisions
+
+**`asm!` is not an allocation.** Its operands are register-resident by
+the Stage 83 contract, and the template carries no call the compiler
+could mis-pick. Trusting the template is the same trust the ABI
+already gets — an MMIO EOI write or a TSC stamp inside a handler is
+normal IRQ work, and rejecting it would make the mmio/port/atomics
+handlers of Stages 87–90 unusable. The contract is: an `asm!` template
+must not transfer control to an allocator, exactly as it must not
+clobber a compiler-owned register.
+
+**An `extern "C"` call IS an allocation.** The proof cannot see into
+C, so the conservative classification treats the call site as
+allocating. A handler that must reach C should wrap the call behind a
+pure Halis function that the kernel controls — or the C side should be
+allocation-free by its own discipline; the verifier refuses to guess.
+
+### 45.4. Ordering and parity
+
+The pass runs after the effects fixpoint (the call graph must be
+complete; the alloc sites the body checks recorded must all exist) and
+before the Stage 82 stack budget, in both front-ends. The
+classification tables live once per front-end — `ALLOC_BUILTINS` /
+`ALLOC_METHOD_OPS` in `boot/checking/helpers.py`, mirrored verbatim as
+`alloc_builtin_reason` / `alloc_method_reason` in `src/hlc/checker.hls`
+— and the gate proves the two reject the same programs with the same
+words, per the Stage 86 parity protocol.
+
+### 45.5. What the tests prove
+
+Eight fail programs pin the rejected shapes (a list literal in the
+handler itself, a concatenating helper, a file-reading helper, a
+`clone`, an extern call, a map construction, a building field default,
+`str(int)`), each rejected IDENTICALLY by both front-ends. Nine
+synthesized probes cover the rest of the may-allocate table; a safe
+probe (reads, compares, `to_int`, a pure helper, the frame's fields)
+is accepted on both. The witness-chain section proves the transitive
+shape and the shortest-path rule. `tests/ok/feat_stage91_irqsafe.hls`
+runs the accepted world on the interpreter, natively, and as a
+`-nostdlib` image: handlers that account ticks, stamp through `asm!`,
+and never touch the heap.
+
+`make irqsafe-acceptance` (7 sections) runs all of it plus the audit
+lines, the demo, and the tools.

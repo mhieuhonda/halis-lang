@@ -1048,3 +1048,63 @@ else
     bad "atomics: make atomics-acceptance failed"
     tail -15 "$TMP/at_acc90.log"
 fi
+
+echo "=== 28. Stage 91: verified interrupt-safety (no alloc in IRQ context) ==="
+# Stage 91 (v0.110.0-alpha): every #[irq_handler] is PROVED to reach no
+# allocation, transitively through its call graph. The fail programs
+# pin the rejected shapes (each names its construct, identically from
+# BOTH front-ends); the ok-test pins the accepted world on all three
+# paths; --audit publishes the per-handler proof lines.
+IRQ_F=tests/ok/feat_stage91_irqsafe.hls
+irq_interp=$(python3 boot/boot.py "$IRQ_F" </dev/null 2>/dev/null); irq_code=$?
+if [ "$irq_code" -eq 0 ]; then
+    ok "irqsafe: feat_stage91_irqsafe runs on the interpreter (exit 0)"
+else
+    bad "irqsafe: feat_stage91_irqsafe interpreter exit=$irq_code"
+fi
+# (a) every Stage 91 fail program: rejected by Stage-0 AND by the
+#     self-hosted --audit, with the same diagnostic (prefix-stripped),
+#     matching the Stage 86 parity protocol.
+for ff in tests/fail/fail_stage91_*.hls; do
+    irq_name=$(basename "$ff" .hls)
+    irq_err=$(python3 boot/boot.py --check "$ff" 2>&1 >/dev/null); irq_rc=$?
+    irq_hlc=$(./bin/hlc --audit "$ff" 2>&1 >/dev/null); irq_hrc=$?
+    irq_norm_b=$(echo "$irq_err" | sed -E 's/^[a-z ]*error: //; s/ \(line [0-9]+\)$//' | head -1)
+    irq_norm_h=$(echo "$irq_hlc" | sed -E 's/^panic: //; s/^[a-z ]*error: //; s/ \(line [0-9]+\)$//' | head -1)
+    if [ "$irq_rc" -eq 1 ] && [ "$irq_hrc" -ne 0 ] && [ "$irq_norm_b" == "$irq_norm_h" ]; then
+        ok "irqsafe: $irq_name rejected identically by both front-ends"
+    else
+        bad "irqsafe: $irq_name parity broken (boot rc=$irq_rc, hlc rc=$irq_hrc)"
+    fi
+done
+# (b) the demo compiles -Werror and runs natively with exit 0.
+if [ -x "$TMP/hlc1" ] && "$TMP/hlc1" examples/irqsafe_demo.hls "$TMP/irq91_demo.c" >/dev/null 2>&1 \
+    && gcc -O2 -Werror -o "$TMP/irq91_demo" "$TMP/irq91_demo.c" -lm -pthread 2>/dev/null; then
+    "$TMP/irq91_demo" </dev/null >/dev/null 2>&1
+    if [ "$?" -eq 0 ]; then
+        ok "irqsafe: examples/irqsafe_demo.hls runs natively, exit 0"
+    else
+        bad "irqsafe: irqsafe_demo did not run"
+    fi
+else
+    bad "irqsafe: irqsafe_demo failed to build"
+fi
+# (c) --audit publishes the proof lines.
+irq_audit=$(./bin/hlc --audit examples/irqsafe_demo.hls 2>/dev/null)
+if echo "$irq_audit" | grep -q "IRQ vector 32: 'pit_isr' — allocation-free"; then
+    ok "irqsafe: --audit publishes the per-handler proof lines"
+else
+    bad "irqsafe: --audit proof lines missing"
+fi
+# (d) the gate itself.
+if make irqsafe-acceptance >"$TMP/irq_acc91.log" 2>&1; then
+    if grep -q "ACCEPTANCE OK: Stage 91" "$TMP/irq_acc91.log"; then
+        ok "irqsafe: make irqsafe-acceptance runs end-to-end"
+    else
+        bad "irqsafe: make irqsafe-acceptance did not print ACCEPTANCE OK"
+        tail -5 "$TMP/irq_acc91.log"
+    fi
+else
+    bad "irqsafe: make irqsafe-acceptance failed"
+    tail -15 "$TMP/irq_acc91.log"
+fi
