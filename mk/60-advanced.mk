@@ -533,10 +533,15 @@ riscv-acceptance:
 # binary is only produced when riscv64-unknown-elf-gcc (or zig cc) is
 # available. The output is a freestanding ELF that can be booted in QEMU
 # with: qemu-system-riscv64 -bios none -machine virt -kernel <out> -nographic
-# Usage: make riscv-bare-metal [F=examples/riscv_demo.hls] [OUT=/tmp/riscv_bare]
+# Stage 93 note: the default program is now the integer-only
+# freestanding probe — under --target the compiler enforces the
+# integer-only discipline (no float literals, no float annotations),
+# so the hosted riscv_demo.hls (std.simd, IO, f64x2 lanes) is no
+# longer a legal bare-metal crate.
+# Usage: make riscv-bare-metal [F=examples/freestanding_demo.hls] [OUT=/tmp/riscv_bare]
 riscv-bare-metal:
 	@test -x $(BIN)/hlc || $(MAKE) bootstrap
-	@test -n "$(F)" || F=examples/riscv_demo.hls; \
+	@test -n "$(F)" || F=examples/freestanding_demo.hls; \
 	  if [ -z "$(OUT)" ]; then OUT=$(BIN)/riscv_bare; fi; \
 	  $(PYTHON) tools/hlriscv.py $$F $$OUT \
 	    --target riscv64-unknown-none --target-feature "" \
@@ -554,8 +559,8 @@ riscv-bare-metal:
 # -Wl,--gc-sections strips unused helpers when the user code does not
 # call IO builtins.
 riscv-bare-acceptance:
-	@echo "[Stage 26 acceptance] cross-compiling examples/riscv_demo.hls to riscv64-unknown-none (bare-metal)..."
-	@$(PYTHON) tools/hlriscv.py examples/riscv_demo.hls $(BIN)/riscv_bare_acc \
+	@echo "[Stage 26 acceptance] cross-compiling examples/freestanding_demo.hls to riscv64-unknown-none (bare-metal)..."
+	@$(PYTHON) tools/hlriscv.py examples/freestanding_demo.hls $(BIN)/riscv_bare_acc \
 	  --target riscv64-unknown-none --target-feature "" \
 	  --keep-c $(BIN)/riscv_bare_acc.c \
 	  >$(BIN)/riscv_bare_acc.log 2>&1; \
@@ -563,6 +568,19 @@ riscv-bare-acceptance:
 	  if [ $$rc -ne 0 ] && [ $$rc -ne 3 ]; then \
 	    echo "FAIL: riscv bare-metal compile failed (rc=$$rc)"; \
 	    cat $(BIN)/riscv_bare_acc.log; exit 1; fi
+	@# Stage 93 (v0.112.0-alpha): the integer-only discipline travels with
+	@# the triple — the hosted riscv demo (std.simd, f64x2 lanes) must be
+	@# REFUSED at the compiler now, with the discipline's own words.
+	@$(PYTHON) tools/hlriscv.py examples/riscv_demo.hls $(BIN)/riscv_bare_refused \
+	  --target riscv64-unknown-none --target-feature "" \
+	  --keep-c $(BIN)/riscv_bare_refused.c \
+	  >$(BIN)/riscv_bare_refused.log 2>&1; \
+	  rc=$$?; \
+	  if [ $$rc -eq 1 ] && grep -q "bare-metal targets are integer-only" $(BIN)/riscv_bare_refused.log; then \
+	    echo "  integer-only discipline: the hosted demo is refused for the bare triple"; \
+	  else \
+	    echo "FAIL: a float/std crate compiled for riscv64-unknown-none (rc=$$rc)"; \
+	    cat $(BIN)/riscv_bare_refused.log; exit 1; fi
 	@# (a) the C source was produced.
 	@if [ -f $(BIN)/riscv_bare_acc.c ]; then \
 	  echo "  C source produced: OK ($$(stat -c %s $(BIN)/riscv_bare_acc.c 2>/dev/null || stat -f %z $(BIN)/riscv_bare_acc.c) bytes)"; \

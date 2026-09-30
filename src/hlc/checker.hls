@@ -12,6 +12,93 @@ fn cerr(line: int, msg: str) -> void {
     panic("type error: " + msg + " (line " + line.to_str() + ")")
 }
 
+# Stages 93-95 (v0.112.0-alpha .. v0.114.0-alpha): the bare-metal
+# triples are INTEGER-ONLY. A kernel may not touch the FPU before it
+# has saved the FP state (and on riscv64imac / -mgeneral-regs-only the
+# toolchain refuses outright), so a float value has no place in the
+# image. Two hooks close every path a float value can take: this
+# helper (every type annotation — struct fields, variant payloads,
+# parameters, let bindings — funnels through require_type, and the fn
+# return check calls it directly), and the float-literal case of
+# check_expr. The messages must stay byte-identical to boot.py's
+# (BARE_METAL_*_MSG in boot/checking/helpers.py) — the gates compare
+# the two front-ends' diagnostics word for word.
+# bm_str_find(t, word, from): the first index >= from where `word`
+# occurs inside `t`, or -1. The compiler's pure-HLS string toolbox has
+# no substring search (str_find_ch is char-only), so the integer-only
+# rule brings its own.
+fn bm_str_find(t: str, word: str, from: int) -> int {
+    if word.len() == 0 || from > t.len() - word.len() {
+        return -1
+    }
+    let mut i: int = from
+    while i <= t.len() - word.len() {
+        let mut j: int = 0
+        let mut ok: bool = true
+        while j < word.len() {
+            if t.byte_at(i + j) != word.byte_at(j) {
+                ok = false
+                j = word.len()
+            }
+            j = j + 1
+        }
+        if ok {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+fn type_mentions_float(t: str) -> bool {
+    let word: str = "float"
+    let mut i: int = bm_str_find(t, word, 0)
+    while i >= 0 {
+        let mut before: int = 0
+        if i > 0 {
+            before = t.byte_at(i - 1)
+        }
+        let after_idx: int = i + word.len()
+        let mut after: int = 0
+        if after_idx < t.len() {
+            after = t.byte_at(after_idx)
+        }
+        # A word boundary: neither neighbour may be alphanumeric or '_'.
+        let before_ok: bool = !is_alnum_or_us(before)
+        let after_ok: bool = !is_alnum_or_us(after)
+        if before_ok && after_ok {
+            return true
+        }
+        i = bm_str_find(t, word, after_idx)
+    }
+    return false
+}
+
+fn is_alnum_or_us(c: int) -> bool {
+    if c == 95 { # '_'
+        return true
+    }
+    if c >= 48 && c <= 57 { # 0-9
+        return true
+    }
+    if c >= 65 && c <= 90 { # A-Z
+        return true
+    }
+    if c >= 97 && c <= 122 { # a-z
+        return true
+    }
+    return false
+}
+
+fn require_no_float_type(ctx: Ctx, t: str, line: int) -> void {
+    if ctx.target_triple == "" {
+        return
+    }
+    if type_mentions_float(t) {
+        cerr(line, "the type '" + t + "' is not available on target " + ctx.target_triple + " (bare-metal targets are integer-only)")
+    }
+}
+
 fn is_builtin_fn(n: str) -> bool {
     return n == "print" || n == "println" || n == "panic" || n == "exit"
     || n == "str" || n == "int" || n == "len" || n == "range"
@@ -260,6 +347,8 @@ fn require_type(ctx: Ctx, t: str, line: int, what: str) -> void {
     if !type_exists(ctx, t) {
         cerr(line, "type does not exist: " + t)
     }
+    # Stages 93-95: the integer-only rule for every annotation.
+    require_no_float_type(ctx, t, line)
 }
 
 # resolve_struct(ctx, t) returns the (StructInfo, type_map) if t is a
@@ -2386,6 +2475,10 @@ fn check_program(ctx: Ctx) -> void uses Fs {
             if !type_exists(ctx, f.ret) {
                 cerr(f.line, "return type does not exist: " + f.ret)
             }
+            # Stages 93-95: the return-type check bypasses require_type
+            # (its own diagnostic), so the integer-only rule hooks here
+            # too — `-> float` is a float annotation like any other.
+            require_no_float_type(ctx, f.ret, f.line)
         }
         # Deep-scan-30 fix (boot parity, deep-scan-20): extern (FFI)
         # RETURN types were only checked for existence — the boot

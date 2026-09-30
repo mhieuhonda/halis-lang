@@ -437,6 +437,53 @@ FREESTANDING_DENY_MSG = (
     "%s is not available in #![freestanding] mode (it lowers to a "
     "libc/libm call with no freestanding implementation)")
 
+# Stages 93-95 (v0.112.0-alpha .. v0.114.0-alpha): the bare-metal
+# triples. `--target <triple>` names the image the C backend is built
+# for; all three are freestanding (no libc, no OS, entry `_start`) and
+# INTEGER-ONLY — a kernel that has not saved the FPU state must not
+# touch it, and on riscv64imac / -mgeneral-regs-only the hardware
+# refuses anyway. The checker enforces the discipline at the two places
+# a float value can be born: a float literal and a float type
+# annotation (require_type + the fn return check), so no float-typed
+# expression can type-check at all. The messages here are the single
+# source of truth — the self-hosted checker (src/hlc/checker.hls) must
+# produce them byte for byte (the gates compare the two front-ends).
+BARE_METAL_TRIPLES = (
+    "x86_64-unknown-none",
+    "aarch64-unknown-none",
+    "riscv64-unknown-none",
+)
+
+BARE_METAL_LITERAL_MSG = (
+    "float literals are not available on target %s "
+    "(bare-metal targets are integer-only)")
+
+BARE_METAL_TYPE_MSG = (
+    "the type '%s' is not available on target %s "
+    "(bare-metal targets are integer-only)")
+
+
+def bare_metal_triple(program):
+    """The crate's bare-metal target triple, or '' for a hosted build."""
+    t = program.get("target_triple") or ""
+    return t if t in BARE_METAL_TRIPLES else ""
+
+
+def type_mentions_float(t):
+    """True when the type string mentions the `float` primitive, as a
+    whole word — `float`, `list[float]`, `map[str, float]` — but not a
+    user type whose name merely contains it."""
+    i = t.find("float")
+    while i >= 0:
+        before = t[i - 1] if i > 0 else ""
+        j = i + len("float")
+        after = t[j] if j < len(t) else ""
+        if not (before.isalnum() or before == "_") \
+                and not (after.isalnum() or after == "_"):
+            return True
+        i = t.find("float", j)
+    return False
+
 # Stage 9 (v0.20.0-alpha — release): per-builtin effect mapping.
 # Pure builtins (panic, str, int, len, range, map_new, chr, drop, clone,
 # take) are absent — they contribute no effect. A builtin may in

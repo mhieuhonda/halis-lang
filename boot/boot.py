@@ -32,6 +32,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from boot.lexer import tokenize, HLError          # noqa: E402
 from boot.parser import Parser                     # noqa: E402
 from boot.checker import check                     # noqa: E402
+from boot.checking.helpers import (                # noqa: E402
+    BARE_METAL_TRIPLES, bare_metal_triple,
+)
 from boot.interp import Interp                     # noqa: E402
 
 # Repository root = parent of the `boot/` directory.
@@ -329,6 +332,27 @@ def run_cli():
         else:
             sys.stderr.write("error: --target expects a triple\n")
             return 2
+    # Stages 93-95 (v0.112.0-alpha .. v0.114.0-alpha): the bare-metal
+    # triples. A `-unknown-none` triple means the C is built for a
+    # machine with NO OS on it: the crate becomes freestanding (no
+    # libc, entry `_start`) and INTEGER-ONLY (the FPU is not enabled
+    # before the kernel saves its state). The LLVM-backend triples
+    # (Stage 12) keep their old meaning behind --emit llvm/lto.
+    # NOTE: the --target-feature exclusion is validated further down,
+    # after --target-feature itself has been parsed.
+    bare_metal = target_triple in BARE_METAL_TRIPLES
+    if target_triple is not None and not bare_metal and not emit_llvm \
+            and not emit_lto:
+        # Same words as hlc (the gates compare the front-ends). The
+        # LLVM meaning of --target (Stage 12) keeps working behind
+        # --emit llvm / --emit lto; everything else must be one of the
+        # three bare-metal triples.
+        sys.stderr.write(
+            "error: unknown bare-metal target '%s' (expected "
+            "x86_64-unknown-none | aarch64-unknown-none | "
+            "riscv64-unknown-none)\n"
+            % target_triple)
+        return 2
     # Stage 10 release: --sandbox DIR — restrict filesystem builtins
     # (read_file, read_file_tainted, write_file, file_exists) to DIR.
     # Both the interpreter and the C runtime enforce this. Extern "C"
@@ -383,6 +407,15 @@ def run_cli():
             return 2
         target_feature = feat
         del args[i:i + 2]
+    # Stages 93-95: --target-feature is a SIMD switch and SIMD uses
+    # floating-point registers — the one CLI combination the bare-metal
+    # triples refuse (same words as hlc).
+    if bare_metal and target_feature is not None:
+        sys.stderr.write(
+            "error: --target-feature is not available on target %s "
+            "(bare-metal targets are integer-only: SIMD intrinsics use "
+            "floating-point registers)\n" % target_triple)
+        return 2
     # Stage 17 (v0.28.0-alpha): --contracts — enable runtime requires /
     # ensures assertions (interpreter checks both; the native backend
     # checks requires at entry).
@@ -453,6 +486,11 @@ def run_cli():
         sys.stderr.write("error: cannot open file %s\n" % path)
         return 2
     try:
+        # Stages 93-95: publish the bare-metal target BEFORE the check
+        # runs — the freestanding implication and the integer-only rule
+        # both read it (crate_modes / require_type / check_expr).
+        if bare_metal:
+            program["target_triple"] = target_triple
         checker = check(program)
     except HLError as ex:
         sys.stderr.write("compile error: %s\n" % ex)
@@ -674,6 +712,11 @@ def print_audit(program, checker):
         print("  Crate mode: #![no_std] (std disabled, hosted libc kept)")
     else:
         print("  Crate mode: std (default hosted crate)")
+    # Stages 93-95: the bare-metal target, when one was named. The
+    # self-hosted --audit prints the same line (the gates compare).
+    bm = bare_metal_triple(program)
+    if bm:
+        print("  Target: %s (bare-metal, integer-only)" % bm)
     # Stage 82 (v0.101.0-alpha): the deterministic stack budget, when
     # the crate declares `#![stack_size(N)]` — the verified worst-case
     # call chain (the checker proved it fits before we get here).

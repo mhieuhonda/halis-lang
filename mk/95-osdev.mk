@@ -18,7 +18,7 @@ LINKER_TEST_CC ?= $(CC)
 LINKER_TEST_LD ?= $(shell $(CC) -print-prog-name=ld)
 LINKER_TEST_NM ?= $(shell $(CC) -print-prog-name=nm)
 
-.PHONY: test-linker
+.PHONY: triple triple-x86_64-acceptance test-linker
 test-linker: $(LINKER_TEST_BIN)
 	@$(LINKER_TEST_NM) $(LINKER_TEST_BIN) | grep -q '__halis_metadata_start' && \
 	 $(LINKER_TEST_NM) $(LINKER_TEST_BIN) | grep -q '__halis_sections_start' && \
@@ -212,6 +212,55 @@ link-acceptance:
 # pointers, as a MODEL so the retry and reclaim rules are testable
 # without threads — see SPEC section 44.
 # ============================================================================
+
+# Stage 93 (v0.112.0-alpha): the bare-metal triples — roadmap rows
+# 93-95 (`target x86_64-unknown-none`, `target aarch64-unknown-none`,
+# `target riscv64-unknown-none`). The compiler takes `--target TRIPLE`
+# (implies #![freestanding], enforces the integer-only discipline),
+# targets/TRIPLE.ld places the image (its fixed link base, .text._start
+# first), and the link drops every hosted prop: no libc, no crt0, no
+# stack protector, no PIE, no FP (-mgeneral-regs-only on the arches
+# that have the flag; rv64imac is integer-only by construction).
+#
+#   make triple TRIPLE=x86_64-unknown-none F=examples/bare_x86_64.hls
+#
+# The result enters at _start (raw exit syscall), so on an x86-64 host
+# the x86_64-unknown-none image runs directly; the ARM/RISC-V images
+# boot under QEMU (`-bios none -M virt -kernel`).
+triple:
+	@test -x $(BIN)/hlc || $(MAKE) bootstrap
+	@test -n "$(TRIPLE)" || (echo "Usage: make triple TRIPLE=x86_64-unknown-none F=examples/bare_x86_64.hls [OUT=bin/bare_img]" && false)
+	@test -n "$(F)" || (echo "Usage: make triple TRIPLE=x86_64-unknown-none F=examples/bare_x86_64.hls [OUT=bin/bare_img]" && false)
+	@test -f targets/$(TRIPLE).ld || (echo "error: no linker script targets/$(TRIPLE).ld (this stage ships one per triple)" && false)
+	@mkdir -p $(BIN)
+	@if [ -z "$(OUT)" ]; then OUT=$(BIN)/bare_$(TRIPLE); fi; \
+	  GR=""; \
+	  case "$(TRIPLE)" in \
+	    x86_64-*|aarch64-*) GR="-mgeneral-regs-only" ;; \
+	  esac; \
+	  $(BIN)/hlc --target $(TRIPLE) $(F) $$OUT.c && \
+	  $(CC) -O2 $$GR -ffreestanding -nostdlib -nostartfiles \
+	    -fno-stack-protector -fno-pie -no-pie -ffunction-sections \
+	    -Wl,--gc-sections,-T,targets/$(TRIPLE).ld \
+	    -o $$OUT $$OUT.c && \
+	  echo "bare-metal image: $$OUT ($(TRIPLE), entry _start, no libc, no FP)"
+
+# triple-x86_64-acceptance: the Stage 93 acceptance gate. Runs the
+# 8-section suite for the first bare-metal triple: the CLI surface
+# (unknown triples, --target-feature and --no-libc refusals, identical
+# words from both front-ends), the integer-only rejects (eight fail
+# programs, same words from boot and hlc, plus the boundary that they
+# stay LEGAL hosted — they are deliberately not in tests/fail/), the
+# freestanding implication (--audit parity on a crate that never
+# declared it), the emission shape (the triple stamp, the 3-header TU,
+# the x86-64 raw-exit branch in the naked entry), the end-to-end image
+# (ELF x86-64, zero undefined symbols, _start lowest at 0x100000, runs
+# with exit 42), hlcross --target driving the whole pipeline, the
+# linker-script shape, and the tools.
+triple-x86_64-acceptance:
+	@echo "[Stage 93 acceptance] running tests/triple_x86_64_acceptance.py..."
+	@$(PYTHON) tests/triple_x86_64_acceptance.py
+	@echo "ACCEPTANCE OK: Stage 93 -- target x86_64-unknown-none (bare-metal triple)"
 
 # freestanding: compile an HLS program to freestanding C + link with
 # -nostdlib into a runnable binary.

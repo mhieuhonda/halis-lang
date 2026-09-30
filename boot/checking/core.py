@@ -5,9 +5,10 @@ boot/checking/checker.py - behavior is unchanged."""
 from ..lexer import HLError
 from .. import linkerscript
 from .helpers import (
-    BUILTIN_FNS, chan_inner, future_inner, is_chan, is_future, is_list, is_map, is_stream,
-    is_taint, is_task, list_elem, map_val, stream_inner, taint_inner, task_inner, type_args,
-    type_base,
+    BARE_METAL_TYPE_MSG, BUILTIN_FNS, chan_inner, future_inner, is_chan,
+    is_future, is_list, is_map, is_stream, is_taint, is_task, list_elem,
+    map_val, stream_inner, taint_inner, task_inner, type_args, type_base,
+    bare_metal_triple, type_mentions_float,
 )
 from ..compat import zip_strict
 
@@ -120,6 +121,12 @@ class CheckerCore(object):
             self.err("cannot use 'void' as %s" % what, node)
         if not self.type_exists(t, node):
             self.err("type does not exist: %s" % t, node)
+        # Stages 93-95: the bare-metal triples are integer-only — a
+        # float annotation is rejected where it is written, not where
+        # it is used (there may be no use). Same words as hlc.
+        triple = bare_metal_triple(self.p)
+        if triple and type_mentions_float(t):
+            self.err(BARE_METAL_TYPE_MSG % (t, triple), node)
 
     def resolve_struct(self, t):
         """If t is a (possibly generic) struct type, return (StructInfo, type_map).
@@ -216,6 +223,13 @@ class CheckerCore(object):
                 self.require_type(pt, fn, "parameter type")
             if fn["ret"] != "void" and not self.type_exists(fn["ret"], fn):
                 self.err("return type does not exist: %s" % fn["ret"], fn)
+            # Stages 93-95: the fn return check bypasses require_type
+            # (its own diagnostic), so the integer-only rule hooks here
+            # too — `-> float` is a float annotation like any other.
+            triple = bare_metal_triple(self.p)
+            if triple and fn["ret"] != "void" \
+                    and type_mentions_float(fn["ret"]):
+                self.err(BARE_METAL_TYPE_MSG % (fn["ret"], triple), fn)
             # Deep-scan-20 fix (MED): extern (FFI) RETURN types were only
             # checked for existence — `extern fn f() -> list[int]` passed
             # the decl check, then the call-site FFI validation only
@@ -314,7 +328,11 @@ class CheckerCore(object):
     # the existing undeclared-effect errors from check_effects().
     def crate_modes(self):
         names = {a["name"] for a in self.p.get("crate_attrs", [])}
-        freestanding = "freestanding" in names
+        # Stages 93-95: `--target <triple>` implies `#![freestanding]`
+        # — a bare-metal image has no OS to host it (boot.py sets
+        # program["target_triple"] before check() runs).
+        freestanding = ("freestanding" in names
+                        or bool(bare_metal_triple(self.p)))
         # `#![freestanding]` implies `#![no_std]` (a freestanding
         # crate is always std-free; Stage 78 documents the split).
         no_std = freestanding or "no_std" in names

@@ -228,6 +228,32 @@ TARGETS = {
         # pulling in crt0/libc; the program provides its own _start.
         "freestanding": True,
     },
+    # Stage 93 (v0.112.0-alpha): x86_64-unknown-none — the bare-metal
+    # x86-64 triple (roadmap Stage 93). Same shape as the riscv64 one:
+    # a freestanding ELF with no libc, linked against the program's own
+    # runtime, entering through the naked `_start` the C backend emits
+    # (Stage 77). The FP guard is -mgeneral-regs-only: a kernel has not
+    # saved the FPU state, so the compiler must not emit SSE; the
+    # checker already rejects float literals/annotations under --target
+    # (the integer-only discipline). The link base is 1 MiB — where a
+    # Multiboot2 bootloader or `qemu-system-x86_64 -kernel` puts the
+    # image — and targets/x86_64-unknown-none.ld places .text._start
+    # first so the base address IS the entry.
+    "x86_64-unknown-none": {
+        "arch": "x86_64",
+        "os": "none",
+        "abi": "none",
+        "binary_format": "ELF x86-64 (freestanding, no-PIE)",
+        "object_suffix": ".o",
+        "binary_suffix": "",
+        "link_libs": [],
+        "mingw": False,
+        # No -march: the baseline x86-64 ISA (SSE2 excluded by
+        # -mgeneral-regs-only anyway) is what a kernel targets first.
+        "security_flags": [],
+        "freestanding": True,
+        "general_regs_only": True,
+    },
 }
 
 # Aliases — accept the short forms users commonly type.
@@ -260,6 +286,11 @@ TARGET_ALIASES = {
     "riscv-none": "riscv64-unknown-none",
     "visionfive": "riscv64gc-unknown-linux-gnu",
     "sifive": "riscv64gc-unknown-linux-gnu",
+    # Stage 93 (v0.112.0-alpha): bare-metal x86-64 aliases.
+    "x86_64-none": "x86_64-unknown-none",
+    "x86_64-bare": "x86_64-unknown-none",
+    "x86-bare": "x86_64-unknown-none",
+    "bare-x86_64": "x86_64-unknown-none",
 }
 
 
@@ -271,6 +302,11 @@ def canonical_target(name: str) -> str:
         return TARGET_ALIASES[name]
     raise ValueError(f"unknown target '{name}'. Use --list-targets to see "
                      f"the supported set.")
+
+
+def _repo_root() -> str:
+    """The halis-lang repository root (hlcross.py lives in tools/)."""
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 # ---------------------------------------------------------------------------
@@ -402,6 +438,24 @@ def find_target_linker(target: str) -> Tuple[Optional[str], List[str], str]:
             if p:
                 return (p, ["-O2"], "riscv64-unknown-elf-gcc")
 
+    # Stage 93 (v0.112.0-alpha): the bare-metal x86-64 triple. A real
+    # cross-toolchain first (x86_64-elf-*), then the HOST compiler —
+    # linking a static freestanding image needs nothing from the OS,
+    # so on an x86-64 host the ordinary gcc works as the linker.
+    if target == "x86_64-unknown-none":
+        for name in ("x86_64-unknown-elf-gcc",
+                     "x86_64-elf-gcc",
+                     "x86_64-none-elf-gcc"):
+            p = _which(name)
+            if p:
+                return (p, ["-O2"], "x86_64-elf-gcc")
+        host = host_triple()
+        if host.startswith("x86_64"):
+            for name in ("gcc", "clang", "cc"):
+                p = _which(name)
+                if p:
+                    return (p, ["-O2"], "native-freestanding")
+
     # 3. host compiler when target == host (native build — useful for
     #    testing the pipeline end-to-end without a real cross-linker).
     host = host_triple()
@@ -429,7 +483,11 @@ def cross_linker_hint(target: str, kind: str) -> str:
                 f"  - riscv64gc-unknown-linux-gnu: apt install gcc-riscv64-linux-gnu\n"
                 f"  - riscv64-unknown-none:  build the RISC-V GNU toolchain from\n"
                 f"                            github.com/riscv-collab/riscv-gnu-toolchain\n"
-                f"                            (./configure --with-arch=rv64imac --with-abi=lp64)")
+                f"                            (./configure --with-arch=rv64imac --with-abi=lp64)\n"
+                f"  - x86_64-unknown-none:   any x86-64 host gcc links the image\n"
+                f"                            (a static freestanding link needs no\n"
+                f"                            OS support); x86_64-elf-gcc for a real\n"
+                f"                            cross-toolchain")
     return ""
 
 
@@ -535,7 +593,14 @@ def cross_compile(input_hls: str, output_bin: str, target: str,
     print(f"[1/2] hlc: compiling {input_hls} -> {c_path}")
     # Stage 25 (v0.44.0-alpha): pass --target-feature through to hlc
     # when given (enables NEON/SSE/AVX intrinsic fast paths for std.simd).
+    # Stages 93-95: pass --target through for the bare-metal triples —
+    # the flag implies #![freestanding] and turns on the integer-only
+    # discipline in the compiler itself, and stamps the triple into the
+    # emitted C (the discipline is a property of the BUILD, so the
+    # orchestrator must never compile a bare-metal image without it).
     hlc_cmd = [hlc, input_hls, c_path]
+    if spec.get("freestanding", False):
+        hlc_cmd += ["--target", target]
     if target_feature:
         hlc_cmd.append("--target-feature")
         hlc_cmd.append(target_feature)
@@ -577,8 +642,23 @@ def cross_compile(input_hls: str, output_bin: str, target: str,
     # riscv64-unknown-none -> -march=rv64imac -mabi=lp64 (bare-metal) +
     #   -nostdlib -nostartfiles -ffreestanding (the program provides its
     #   own _start + every runtime symbol; no libc, no crt0).
+    # Stage 93 (v0.112.0-alpha): the bare-metal handling is now GENERIC.
+    # Any spec with freestanding=True gets the no-libc link; one with
+    # general_regs_only=True gets -mgeneral-regs-only (no SSE/NEON —
+    # the integer-only discipline at the compiler-flag level); and when
+    # targets/<triple>.ld ships with the repo it drives the placement
+    # (-T) so the image is loadable at its fixed base with _start first.
     arch_flags = []
     freestanding_flags = []
+    if spec.get("freestanding", False):
+        freestanding_flags = ["-nostdlib", "-nostartfiles", "-ffreestanding",
+                              "-fno-stack-protector", "-fno-pie", "-no-pie",
+                              "-ffunction-sections", "-Wl,--gc-sections"]
+        script = os.path.join(_repo_root(), "targets", target + ".ld")
+        if os.path.exists(script):
+            freestanding_flags.append("-Wl,-T," + script)
+    if spec.get("general_regs_only", False):
+        arch_flags.append("-mgeneral-regs-only")
     if target in ("riscv64gc-unknown-linux-gnu",
                   "riscv64-unknown-linux-gnu"):
         march = spec.get("march", "rv64gc")
@@ -588,12 +668,10 @@ def cross_compile(input_hls: str, output_bin: str, target: str,
         # require to compile.
         if target_feature == "rvv":
             march = "rv64gcv"
-        arch_flags = ["-march=" + march, "-mabi=" + spec.get("mabi", "lp64d")]
+        arch_flags = ["-march=" + march, "-mabi=" + spec.get("mabi", "lp64d")] + arch_flags
     elif target == "riscv64-unknown-none":
         march = spec.get("march", "rv64imac")
-        arch_flags = ["-march=" + march, "-mabi=" + spec.get("mabi", "lp64")]
-        if spec.get("freestanding", False):
-            freestanding_flags = ["-nostdlib", "-nostartfiles", "-ffreestanding"]
+        arch_flags = ["-march=" + march, "-mabi=" + spec.get("mabi", "lp64")] + arch_flags
     cmd = ([linker] + base_args + sec_flags + arch_flags
            + freestanding_flags + [c_path, "-o", out_path]
            + spec["link_libs"])
@@ -614,7 +692,8 @@ def cross_compile(input_hls: str, output_bin: str, target: str,
 
 
 def cmd_list_targets() -> int:
-    print("Supported cross-compilation targets (Stage 22, extended Stage 25 + 26):")
+    print("Supported cross-compilation targets (Stage 22, extended Stage 25 + 26, "
+          "bare-metal Stages 93-95):")
     print()
     for triple, spec in TARGETS.items():
         print(f"  {triple}")

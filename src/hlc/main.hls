@@ -186,6 +186,8 @@ fn main() -> int uses IO, Proc {
     let mut pgo_gen: bool = false
     let mut pgo_use_path: str = ""
     let mut no_libc: bool = false
+    # Stages 93-95: the bare-metal target triple ("" = hosted build).
+    let mut target_triple: str = ""
     let mut lto_mode: bool = false
     # Stage 20 perfection (v0.39.0-alpha): --lto-stats and --lto-threshold.
     let mut lto_stats: bool = false
@@ -214,6 +216,27 @@ fn main() -> int uses IO, Proc {
             # -ffreestanding -nostdlib. The arrow the roadmap draws:
             # Stage-0 -> hosted hlc -> freestanding hlc.
             no_libc = true
+        } else if tok == "--target" {
+            # Stages 93-95 (v0.112.0-alpha .. v0.114.0-alpha): the
+            # bare-metal triples. `--target x86_64-unknown-none` (and
+            # its aarch64 / riscv64 siblings) builds the C for a
+            # machine with NO OS on it: the crate becomes freestanding
+            # (no libc, no OS calls, entry `_start` — the naked entry
+            # already carries all three arches' raw-syscall exit) and
+            # INTEGER-ONLY (the FPU is not enabled before the kernel
+            # saves its state; the checker rejects float literals and
+            # float annotations with a named diagnostic).
+            if ai + 1 >= argv.len() {
+                println("error: --target expects a target triple")
+                return 2
+            }
+            let t: str = argv.get(ai + 1)
+            if t != "x86_64-unknown-none" && t != "aarch64-unknown-none" && t != "riscv64-unknown-none" {
+                println("error: unknown bare-metal target '" + t + "' (expected x86_64-unknown-none | aarch64-unknown-none | riscv64-unknown-none)")
+                return 2
+            }
+            target_triple = t
+            ai = ai + 1
         } else if tok == "--lto" {
             # Stage 20 (v0.36.0-alpha): link-time optimisation across
             # crates — cross-crate inlining + whole-program DCE.
@@ -313,18 +336,35 @@ fn main() -> int uses IO, Proc {
         ai = ai + 1
     }
     # Stage 9-beta: `hlc --audit <file.hls>` prints the capability tree.
+    # Stages 93-95: `--audit` is also accepted AFTER other flags
+    # (`hlc --target x86_64-unknown-none --audit f.hls`) so the audit of
+    # a bare-metal build states the target like the compile path does.
+    let mut audit_entry: str = ""
     if argv.len() >= 2 && argv.get(1) == "--audit" {
         if argv.len() < 3 {
             println("usage: hlc --audit <input.hls>")
             return 1
         }
-        let entry_path: str = argv.get(2)
+        audit_entry = argv.get(2)
+    } else if a.len() >= 2 && a.get(0) == "--audit" {
+        audit_entry = a.get(1)
+    }
+    if audit_entry != "" {
+        let entry_path: str = audit_entry
         let src: str = read_file(entry_path)
         let ctx: Ctx = new_ctx(src)
         ctx.entry_dir = dir_of(entry_path)
         ctx.repo_root = parent_dir(ctx.entry_dir)
+        # Stages 93-95: the bare-metal triples travel with the audit —
+        # the integer-only rule and the freestanding implication are
+        # properties of the CHECK, not of the code emission.
+        ctx.target_triple = target_triple
         lex(ctx)
         parse_program(ctx)
+        if target_triple != "" && !ctx.crate_freestanding {
+            ctx.crate_freestanding = true
+            ctx.crate_no_std = true
+        }
         let entry_imports: list[str] = ctx.imports
         let mut i: int = 0
         while i < entry_imports.len() {
@@ -344,10 +384,28 @@ fn main() -> int uses IO, Proc {
     if a.len() < 2 {
         println("usage: hlc [--fast | -O fast] [--contracts] [--pgo-generate] [--pgo-use <profile>]")
         println("              [--lto] [--lto-stats] [--lto-threshold N] [--target-feature sse4.2|avx2|neon|rvv]")
-        println("              [--no-libc]")
+        println("              [--no-libc] [--target x86_64-unknown-none|aarch64-unknown-none|riscv64-unknown-none]")
         println("              <input.hls> <output.c|->")
         println("       hlc --audit <input.hls>")
         return 1
+    }
+    # Stages 93-95: the bare-metal flag combinations the triples
+    # refuse. --no-libc is the HOSTED no-libc build (crt0 _start that
+    # captures argc/argv/envp and calls main) — the opposite of a
+    # bare-metal image, whose own _start IS the program. --target-feature
+    # switches on SIMD intrinsics, and every SIMD ISA the fast paths
+    # know (SSE, AVX, NEON, RVV) computes in floating-point registers
+    # the kernel has not saved. Both refusals say the same words as
+    # boot.py (the gates compare the front-ends).
+    if target_triple != "" {
+        if no_libc {
+            println("error: --no-libc is not available on target " + target_triple + " (the bare-metal triples build freestanding images, not hosted no-libc ones)")
+            return 2
+        }
+        if target_feature != "" {
+            println("error: --target-feature is not available on target " + target_triple + " (bare-metal targets are integer-only: SIMD intrinsics use floating-point registers)")
+            return 2
+        }
     }
     let entry_path: str = a.get(0)
     let src: str = read_file(entry_path)
@@ -363,6 +421,10 @@ fn main() -> int uses IO, Proc {
     ctx.opt_stats = opt_stats
     ctx.target_feature = target_feature
     ctx.no_libc = no_libc
+    # Stages 93-95: the bare-metal triple rides with the compile (the
+    # integer-only rule lives in the checker; the stamp + freestanding
+    # implication in the pipeline below).
+    ctx.target_triple = target_triple
     # Stage 19: load the --pgo-use profile BEFORE codegen (the branch /
     # fn-attribute hints consult it during generation).
     if pgo_use_path != "" {
@@ -392,6 +454,15 @@ fn main() -> int uses IO, Proc {
         }
         load_file_into(ctx, resolved)
         i = i + 1
+    }
+    # Stages 93-95: `--target <triple>` implies `#![freestanding]` — a
+    # bare-metal image has no OS to host it. Applied AFTER the parse
+    # (an explicit `#![freestanding]` in the source must not trip the
+    # duplicate-attribute guard) and BEFORE the check (the freestanding
+    # boundaries and the integer-only rule are check-time properties).
+    if target_triple != "" && !ctx.crate_freestanding {
+        ctx.crate_freestanding = true
+        ctx.crate_no_std = true
     }
     check_program(ctx)
     let lines: list[str] = gen_program(ctx)
@@ -796,6 +867,11 @@ fn print_audit(ctx: Ctx) -> void uses IO {
         println("  Crate mode: #![no_std] (std disabled, hosted libc kept)")
     } else {
         println("  Crate mode: std (default hosted crate)")
+    }
+    # Stages 93-95: the bare-metal target, when one was named. Same
+    # words as boot.py's --audit (the gates compare the two).
+    if ctx.target_triple != "" {
+        println("  Target: " + ctx.target_triple + " (bare-metal, integer-only)")
     }
     # Stage 82: the deterministic stack budget. boot.py's --audit prints
     # this too; the same flag on the two front-ends must say the same

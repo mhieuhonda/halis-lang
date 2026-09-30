@@ -4719,3 +4719,113 @@ agrees word for word; a real no-libc program (file write/read, env,
 cwd, float and int conversions) running to the interpreter's exit
 code; and the pinned gaps (spawn → `pthread_create`, directory listing
 → `opendir`, each a named link failure).
+
+## 47. Bare-metal targets — `x86_64-unknown-none` first (Stage 93 — v0.112.0-alpha)
+
+Stage 92 ended the bootstrap ladder at a freestanding compiler. Stage
+93 turns to the images that compiler BUILDS: `--target <triple>` names
+the bare-metal machine the C is meant for, and the first three triples
+are the roadmap's Stages 93–95 — `x86_64-unknown-none` (this stage),
+`aarch64-unknown-none` (Stage 94) and `riscv64-unknown-none`
+(Stage 95). `-none` is the ABI: no OS, no libc, no hosted runtime —
+the machine the C backend has been able to describe since Stage 77,
+now named as a first-class build.
+
+### 47.1. The flag
+
+`hlc --target x86_64-unknown-none` (and the same flag on `boot.py`)
+does three things:
+
+* **it implies `#![freestanding]`** — a bare-metal image has no OS to
+  host it. The implication is applied after the parse (an explicit
+  `#![freestanding]` in the source must not trip the duplicate-
+  attribute guard) and before the check, so the whole freestanding
+  boundary — std banned, extern banned, effects banned — travels with
+  the triple. The `--audit` output states both facts, identically
+  from both front-ends:
+  `Crate mode: #![freestanding] ...` and
+  `Target: x86_64-unknown-none (bare-metal, integer-only)`;
+* **it enforces the integer-only discipline** (§47.2);
+* **it stamps the C** with
+  `// target: x86_64-unknown-none (bare-metal, integer-only, freestanding)`
+  so the image's provenance survives into the artifact.
+
+Two flag combinations are refused, with the same words from both
+front-ends: `--no-libc` (the HOSTED no-libc mode — its crt0 captures
+argc/argv/envp and calls main, the exact opposite of a bare-metal
+image whose `_start` IS the program) and `--target-feature` (every
+SIMD ISA the fast paths know computes in floating-point registers the
+kernel has not saved). An unknown triple is refused with the registry
+in the message.
+
+### 47.2. The integer-only discipline
+
+A kernel may not touch the FPU before it has saved the FP state — and
+on the bare-metal toolchains the hardware or the compiler refuses
+outright (`-mgeneral-regs-only` on x86-64 and AArch64; rv64imac has no
+float registers at all, so a float operation lowers to a soft-float
+libgcc call that `-nostdlib` cannot resolve). Halis refuses it FIRST,
+at compile time, at the two places a float value can be born:
+
+* a **float literal** — `float literals are not available on target
+  <triple> (bare-metal targets are integer-only)`;
+* a **float type annotation** — struct fields, enum payloads,
+  parameters, let bindings and return types all funnel through
+  `require_type` (plus the return check, which has its own diagnostic
+  and is hooked separately): `the type '<T>' is not available on
+  target <triple> (bare-metal targets are integer-only)`.
+
+There are no other births. With no float literal and no float
+annotation in the crate, no float-typed value can exist, so no float
+arithmetic can type-check — the discipline is closed, not heuristic.
+Both front-ends implement the same hooks and emit byte-identical
+messages; the gate compares them word for word.
+
+### 47.3. The image
+
+The C backend's naked `_start` (Stage 77) already carries all three
+architectures' raw-syscall exit behind `#if defined(__x86_64__) /
+__aarch64__ / __riscv`; a bare-metal build changes the RUNTIME around
+it, not the entry:
+
+```
+hlc --target x86_64-unknown-none prog.hls prog.c
+gcc -O2 -mgeneral-regs-only -ffreestanding -nostdlib -nostartfiles \
+    -fno-stack-protector -fno-pie -no-pie -ffunction-sections \
+    -Wl,--gc-sections,-T,targets/x86_64-unknown-none.ld \
+    -o prog prog.c
+```
+
+`targets/x86_64-unknown-none.ld` places the image at **1 MiB** (where
+a Multiboot2 bootloader or `qemu-system-x86_64 -kernel` puts it), and
+`-ffunction-sections` gives `_start` its own input section so the
+script's `KEEP(*(.text._start))` pins it to the base — the first
+instruction of the image IS the entry, which is what a loader that
+jumps to the base address (rather than to the ELF entry point)
+requires. The Stage 84 metadata sections and the Stage 85 boot-header
+keeps carry over from `link.ld`, so a `#![boot_header(multiboot2)]`
+crate links unchanged; `.eh_frame` is discarded (no unwinder, no
+unwind tables), `.bss` is `NOLOAD`. The image runs on any x86-64 host:
+a freestanding image needs no OS cooperation beyond the raw exit
+syscall.
+
+`hlcross --target` drives the whole pipeline (hlc `--target` + the
+freestanding link + the script), and refuses `--target-feature` on
+bare-metal triples for the same reason the compiler does.
+
+### 47.4. What the gate proves
+
+`make triple-x86_64-acceptance` (8 sections): the CLI surface (the
+registry, and the refused combinations — same words from both
+front-ends); the integer-only rejects (eight probes — a literal, a
+parameter, a return, a struct field, an enum payload, a let, a
+`list[float]` element, a `Cell[float]` argument — each rejected by
+both compilers with the same words, and each still a LEGAL hosted
+crate, which is why they live in `tests/bare/` and not
+`tests/fail/`); the freestanding implication (audit parity on a crate
+that never declared it, std refused); the emission shape (the stamp,
+the 3-header TU, the x86-64 exit branch); the image (ELF64 LE,
+EM_X86_64, entry 0x100000, `_start` the lowest symbol, zero undefined
+symbols, the probe runs on the host and exits 42); the orchestrator
+(hlcross builds the working image end to end); the linker script's
+shape; and the tools.

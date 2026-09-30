@@ -3,7 +3,8 @@ boot/checker.py Checker class (lines 2231..2675), split for
 maintainability. The final Checker class assembles all mixins in
 boot/checking/checker.py - behavior is unchanged."""
 from .helpers import (
-    INT64_MAX, instantiate_type, is_list, list_elem, type_args, type_base, unify,
+    BARE_METAL_LITERAL_MSG, INT64_MAX, bare_metal_triple, instantiate_type,
+    is_list, list_elem, type_args, type_base, unify,
 )
 from ..compat import zip_strict
 
@@ -15,6 +16,13 @@ class CheckerExpr(object):
                 self.err("integer literal too large (exceeds int64)", e)
             e["t"] = "int"
         elif k == "float":
+            # Stages 93-95: the bare-metal triples are integer-only —
+            # the FPU is not enabled before the kernel saves its state,
+            # so a float value has no place in the image. Same words as
+            # hlc (the gates compare the two front-ends).
+            triple = bare_metal_triple(self.p)
+            if triple:
+                self.err(BARE_METAL_LITERAL_MSG % triple, e)
             e["t"] = "float"
         elif k == "bool":
             e["t"] = "bool"

@@ -1130,3 +1130,47 @@ if [ -x bin/hlc-fs ] && [ -z "$(nm -u bin/hlc-fs 2>/dev/null | grep -E 'fopen|ma
 else
     bad "xbootstrap: bin/hlc-fs missing or carries libc symbols"
 fi
+
+echo "=== 30. Stage 93: target x86_64-unknown-none (bare-metal triple) ==="
+# Stage 93 (v0.112.0-alpha): --target names the bare-metal image; the
+# integer-only discipline and the freestanding implication live in the
+# checker, the image placement in targets/x86_64-unknown-none.ld.
+# (a) the demo probe runs on the interpreter (exit 42).
+python3 boot/boot.py examples/bare_x86_64.hls </dev/null >/dev/null 2>&1
+if [ $? -eq 42 ]; then
+    ok "triple93: bare_x86_64 probe computes 42 on the interpreter"
+else
+    bad "triple93: bare_x86_64 probe exit=$? (want 42)"
+fi
+# (b) a float literal is refused under --target by BOTH front-ends with
+#     the same words, and stays legal WITHOUT the flag.
+bm_f=tests/bare/fail_bare_float_literal.hls
+bm_b=$(python3 boot/boot.py --check --target x86_64-unknown-none "$bm_f" 2>&1 >/dev/null)
+bm_b_rc=$?
+bm_h=$(./bin/hlc --target x86_64-unknown-none "$bm_f" "$TMP/bm93.c" 2>&1 >/dev/null)
+bm_h_rc=$?
+if [ "$bm_b_rc" -ne 0 ] && [ "$bm_h_rc" -ne 0 ] \
+   && echo "$bm_b" | grep -q "bare-metal targets are integer-only" \
+   && [ "$(echo "$bm_b" | sed 's/^.*error: //; s/ (line [0-9]*)$//')" \
+        = "$(echo "$bm_h" | sed 's/^.*error: //; s/ (line [0-9]*)$//')" ]; then
+    ok "triple93: the float-literal probe rejected identically by both"
+else
+    bad "triple93: float-literal probe parity (boot rc=$bm_b_rc, hlc rc=$bm_h_rc)"
+fi
+if python3 boot/boot.py --check "$bm_f" >/dev/null 2>&1; then
+    ok "triple93: the probe is a legal hosted crate without --target"
+else
+    bad "triple93: the probe is rejected without --target (not conditional)"
+fi
+# (c) the gate itself.
+if make triple-x86_64-acceptance >"$TMP/tri_acc93.log" 2>&1; then
+    if grep -q "ACCEPTANCE OK: Stage 93" "$TMP/tri_acc93.log"; then
+        ok "triple93: make triple-x86_64-acceptance runs end-to-end"
+    else
+        bad "triple93: gate did not print ACCEPTANCE OK"
+        tail -5 "$TMP/tri_acc93.log"
+    fi
+else
+    bad "triple93: make triple-x86_64-acceptance failed"
+    tail -15 "$TMP/tri_acc93.log"
+fi
