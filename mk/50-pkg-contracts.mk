@@ -76,6 +76,13 @@ infer:
 infer-smt:
 	@python3 tools/hlprove.py $(F) --infer-invariants --smt
 
+# Stage 99 (v0.118.0-alpha): the CVC5 SMT backend. The same bridge and
+# the same obligations, decided by cvc5 instead of z3 (the binary
+# first, then the cvc5 python module). --cvc5 implies --smt; --z3 and
+# --cvc5 are mutually exclusive.
+cvc5:
+	@python3 tools/hlprove.py $(F) --cvc5
+
 # Exhaustive finite-state model checking of a transition fn
 model:
 	@if [ -z "$(F)" ] || [ -z "$(FN)" ]; then echo "Usage: make model F=file.hls FN=transition_fn [INV=invariant_fn] [INIT=Enum.Variant]" && false; fi; \
@@ -98,6 +105,13 @@ prove-acceptance:
 invariant-acceptance: $(BIN)/hlc
 	@echo "[Stage 97 acceptance] running tests/invariant_acceptance.py..."
 	@$(PYTHON) tests/invariant_acceptance.py
+
+# Stage 99 acceptance gate: the CVC5 SMT backend. Requires the cvc5
+# backend (a binary or pip install cvc5) AND the z3 backend — the whole
+# point of the stage is that the two agree on every verdict.
+cvc5-acceptance:
+	@echo "[Stage 99 acceptance] running tests/cvc5_acceptance.py..."
+	@$(PYTHON) tests/cvc5_acceptance.py
 
 refine-acceptance: $(BIN)/hlc
 	@echo "[Stage 98 acceptance] running tests/refine_acceptance.py..."

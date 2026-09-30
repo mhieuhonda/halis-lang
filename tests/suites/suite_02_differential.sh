@@ -102,6 +102,24 @@ else
     bad "hlprove --infer-invariants wrong on the demo (rc=$inv_rc)"
 fi
 
+# Stage 99: the CVC5 SMT backend — the same bridge, a second decider.
+# The run must be clean with or without cvc5 installed (the report
+# honestly says when neither binary nor module exists); with a cvc5
+# binary on PATH the per-fn verdict lines must appear.
+cvc5_out=$(python3 tools/hlprove.py examples/hmac_proven.hls --cvc5 2>/dev/null); cvc5_rc=$?
+if [ "$cvc5_rc" -eq 0 ] && echo "$cvc5_out" | grep -q "cvc5"; then
+    ok "hlprove --cvc5 runs the backend on the HMAC example"
+else
+    bad "hlprove --cvc5 wrong on the HMAC example (rc=$cvc5_rc)"
+fi
+if command -v cvc5 >/dev/null 2>&1; then
+    if echo "$cvc5_out" | grep -q "cvc5: vacuity: sat"; then
+        ok "hlprove --cvc5 reports the HMAC verdicts (binary on PATH)"
+    else
+        bad "hlprove --cvc5 verdict lines missing (cvc5 binary on PATH)"
+    fi
+fi
+
 # Stage 98: refinement types. Every refined slot is guarded at runtime
 # (fn entry / return / let / assign / construction); proven sites are
 # elided. The interpreter and the native build (default AND -O fast)

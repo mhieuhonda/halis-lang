@@ -1662,7 +1662,8 @@ native output against the interpreter, byte for byte.
 ### 26.5. `hlprove` — proof reports, the z3 bridge, invariant suggestions
 
 ```
-python3 tools/hlprove.py file.hls [--smt] [--z3] [--suggest-invariants]
+python3 tools/hlprove.py file.hls [--smt] [--z3] [--cvc5]
+                                  [--suggest-invariants]
 ```
 
 - **Default**: per-function proof report — the seeded facts and the
@@ -1673,7 +1674,8 @@ python3 tools/hlprove.py file.hls [--smt] [--z3] [--suggest-invariants]
   satisfiability (unsat => the contract is vacuous) and
   `requires && !ensures` (unsat => the ensures is implied). This is
   the roadmap's "SMT solver z3 via a bridge GENERATED FROM HLS";
-  `--z3` runs external z3 on the files when it is on PATH.
+  `--z3` runs external z3 on the files when it is on PATH; `--cvc5`
+  (section 53) runs CVC5 on the SAME files instead.
 - `--suggest-invariants`: for every loop — exact bounds for const
   `for i in range(a, b)` loops, the while condition as a candidate
   invariant, and the mutated-variable set. The automatic inference
@@ -5236,3 +5238,116 @@ kept, the composition example's division elided under `-O fast` while
 its entry guards stay), the differential (four programs × default and
 `-O fast`, including the runtime-violation panics at exit 101), the
 demo (`examples/refine_demo.hls`), and the tools.
+
+## 53. The CVC5 SMT backend — `hlprove --cvc5` (Stage 99 — v0.118.0-alpha)
+
+Phase VII wants its verdicts independent. z3 has decided every
+obligation the bridge ever posed — the vacuity and ensures queries of
+the contract bridge (26.5), the initiation and preservation queries of
+the invariant inference (51) — and a single solver deciding alone is a
+single point of failure: an encoding bug that z3 happens to forgive is
+invisible forever. Stage 99 adds the second decider. `hlprove --cvc5`
+runs the SAME bridge files through CVC5 — a different engine, a
+different codebase, the same SMT-LIB2 semantics — so a disagreement is
+now a REPORTED EVENT instead of a silent assumption, and agreement is
+evidence the obligations, not one solver's quirks, decide the
+verdicts.
+
+### 53.1. The surface
+
+```
+python3 tools/hlprove.py file.hls --cvc5
+make cvc5 F=file.hls          # the same, make-native
+make cvc5-acceptance          # the Stage 99 gate
+```
+
+- `--cvc5` implies `--smt` (the obligation files are the interface;
+  the same reason `--z3` implies it) and is mutually exclusive with
+  `--z3`: one backend decides per run, and a run asking for both is
+  refused with `hlprove: --z3 and --cvc5 name different backends —
+  pick one` (exit 2). Silently picking one would make the report's
+  solver column a coin flip.
+- The bridge files are UNCHANGED — byte for byte the files z3 runs.
+  CVC5 accepts them as-is: `(declare-const)`, `(define-fun)`, the
+  cdiv/cmod C-truncated-division helpers, `(reset)`-separated segments
+  are all standard SMT-LIB 2.6. The no-`set-logic` convention stands
+  (26.5: a variable divisor makes the files QF_NIA, so the logic is
+  inferred) — CVC5 makes all theories available with a notice, the
+  binary's `-q` keeps it out of the way, and the bridge stays runnable
+  by both engines from one artifact.
+
+### 53.2. The plumbing — the z3 pattern, mirrored
+
+Both backends follow the SAME availability ladder, and neither mode
+ever claims a verdict it does not have:
+
+1. the binary first (`cvc5 --lang smt2 -q <file>` — verdicts one per
+   check-sat on stdout; a temp file for single obligations, the ported
+   `-`-stdin convention being not portable across builds);
+2. then the cvc5 python module (`pip install cvc5`). The module ships
+   no file runner, so a segment is executed command by command: an
+   InputParser parses each command, every command is invoked on the
+   solver AND the parser's symbol manager (the declared constants and
+   the defined helpers must be visible to everything parsed after
+   them), and the result of the final check-sat is the verdict. The
+   module path parks fd 2 while it runs — the C++ core writes its
+   notices straight to the file descriptor, past every Python-level
+   redirect, and hlprove's stderr stays reserved for its own
+   diagnostics;
+3. neither exists → the honest report: `neither the cvc5 binary nor
+   the cvc5 python package is available (install one, or use --smt
+   and inspect the .smt2 yourself)`. NOTHING is decided, NOTHING is
+   claimed — the same discipline as 51.3.
+
+Inference under `--cvc5` runs the identical pipeline with the cvc5
+decider in place of the z3 one, and says so: the report reads
+`cvc5-checked` and `inferred (cvc5-verified inductive)`. The decider
+and its printed name are parameters of the inference, so the two
+backends cannot drift apart in what they report — only in the name.
+
+### 53.3. What the gate pins
+
+`make cvc5-acceptance` (six sections; requires the cvc5 backend AND
+the z3 backend — the point of the stage is that they agree):
+
+- **the backend** — binary and module each answer a trivial probe;
+  the decider exists; a trivial contradiction decides unsat through
+  it.
+- **the bridge** — three contracts built to force three different
+  verdicts: an ensures IMPLIED by its requires (unsat — `requires
+  x >= 2, y >= 3 ensures x + y >= 5`), an ensures NOT implied (sat —
+  `>= 6`: a solver that rubber-stamps unsat fails here), and a
+  vacuous contract (`requires n > 0 requires n < 0` — unsat vacuity).
+  Plus: the header says cvc5-ready, and `--cvc5` implies `--smt`.
+- **the inference battery** — the Stage 97 battery re-decided by
+  cvc5: the strengthened accumulator, the step-2 overshoot flip
+  (`i <= n` refused, `i <= n + 1` kept), the skipper's true floor
+  (`i >= -1`), the mod-4 congruence, and the unmodeled/escaping
+  bodies claiming NOTHING.
+- **cross-solver parity** — every obligation segment of the demo is
+  certified unsat by cvc5 AND by z3; every verdict-bearing bridge
+  segment of the HMAC example pairs up across the two engines; and
+  the full CLI reports are byte-identical modulo the solver's name.
+- **the CLI** — the labels, the refusal of `--z3 --cvc5`, and the
+  honesty of a missing backend (a decider with no engine behind it
+  cannot exist).
+- **the dump** — the obligation files written under `--cvc5`
+  re-decide unsat from the file alone.
+
+The suite keeps a two-tier smoke block: the `--cvc5` run must be
+clean with or without cvc5 installed (the honest-missing report is
+itself output), and wherever a cvc5 binary exists the verdict lines
+must appear.
+
+### 53.4. What the backend is NOT
+
+- **Not a new encoding.** The bridge emits one artifact; there is no
+  cvc5-specific code path in `boot/proof.py`. Whatever cvc5 decides,
+  it decides from the z3-ready files.
+- **Not a codegen dependency.** As in 51.4: inference is analysis-
+  only, `-O fast` elision belongs to the interval engine alone, and
+  a tool-side solver verdict cannot change a binary.
+- **Not a tie-breaker.** A disagreement between the backends is a
+  gate failure to investigate, never a vote — soundness rests on
+  unsat verdicts, and an unsat only one engine certifies is not
+  soundness, it is a bug report.

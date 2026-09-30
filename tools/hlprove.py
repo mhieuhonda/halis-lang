@@ -2,7 +2,7 @@
 """hlprove — the Stage 17 proof assistant for Halis (HLS).
 
 Usage:
-  python3 tools/hlprove.py <file.hls> [--fast] [--smt] [--z3]
+  python3 tools/hlprove.py <file.hls> [--fast] [--smt] [--z3] [--cvc5]
                             [--suggest-invariants] [--infer-invariants]
 
 Modes:
@@ -16,6 +16,11 @@ Modes:
              from HLS".
   --z3       run z3 on each generated .smt2 (if a z3 binary is
              available) and report sat/unsat per query.
+  --cvc5     Stage 99: the same bridge, decided by CVC5 instead —
+             the cvc5 binary if present, else the cvc5 python module
+             (pip install cvc5). Inference under --cvc5 reports its
+             verdicts as cvc5-verified; --z3 and --cvc5 are mutually
+             exclusive (one backend decides per run).
   --suggest-invariants
              scan every loop and suggest candidate invariants (loop
              header bounds for const for-ranges, the while condition as
@@ -25,11 +30,15 @@ Modes:
              Stage 97: SMT-based loop-invariant discovery. Every loop
              is summarised (entry facts, per-variable transition
              relation, condition), candidates are generated from
-             templates, and z3 decides initiation and preservation.
+             templates, and an SMT solver decides initiation and
+             preservation.
              Only solver-verified invariants are reported as inferred;
              failed candidates are reported with their failing
              obligation. With --smt, the verified obligations are also
-             written as .smt2 files (one per loop).
+             written as .smt2 files (one per loop). The deciding
+             backend follows the mode flag: z3 by default, cvc5 under
+             --cvc5 — both decide the SAME obligations, so a verdict
+             must agree across them (the Stage 99 gate pins it).
 """
 import os
 import subprocess
@@ -286,6 +295,170 @@ def run_z3(smt_files):
         print("    %-28s z3: %s" % (key, disp))
 
 
+# ---------------------------------------------------------------------------
+# Stage 99 (v0.118.0-alpha): the CVC5 SMT backend — hlprove --cvc5.
+#
+# The same bridge, the same obligations, a second decider. CVC5 is the
+# independent re-implementation the verification phase wants: whatever
+# z3 certifies unsat, cvc5 must certify unsat too, or the encoding (not
+# a solver quirk) is the bug. The plumbing mirrors the z3 pattern
+# exactly — the binary first, the python module as the fallback, and
+# NEITHER exists → nothing is claimed, the report says what to install.
+# ---------------------------------------------------------------------------
+
+def _cvc5_binary_decide(lines):
+    """One obligation through a cvc5 BINARY (temp file — the stdin `-`
+    convention is not portable across cvc5 builds). `-q` keeps the
+    stderr chatter (the missing set-logic notice) out of the way; the
+    verdicts land on stdout one per check-sat. Returns the verdict
+    string or None when no binary is on PATH."""
+    import tempfile
+    try:
+        with tempfile.NamedTemporaryFile("w", suffix=".smt2",
+                                         delete=False) as tf:
+            tf.write("\n".join(lines) + "\n")
+            tmp = tf.name
+    except OSError:
+        return None
+    try:
+        proc = subprocess.run(["cvc5", "--lang", "smt2", "-q", tmp],
+                              capture_output=True, text=True, timeout=10)
+    except FileNotFoundError:
+        return None
+    except subprocess.TimeoutExpired:
+        return "timeout"
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+    if proc.returncode != 0:
+        return "?"
+    out = [ln.strip() for ln in (proc.stdout or "").splitlines()
+           if ln.strip() in ("sat", "unsat", "unknown")]
+    return out[0] if out else "?"
+
+
+def _cvc5_module_decide(lines):
+    """One obligation through the cvc5 PYTHON module (the `cvc5`
+    package: pip install cvc5). The module ships no file runner, so the
+    segment is executed command by command through an InputParser —
+    each parsed command is invoked on the solver and the parser's
+    symbol manager (the declared constants and the defined helpers must
+    be visible to the commands parsed after them) — and the result of
+    the final (check-sat) is the verdict. Returns the verdict string or
+    None when the module is unavailable."""
+    try:
+        import cvc5
+    except ImportError:
+        return None
+    text = "\n".join(lines)
+    # The cvc5 core writes its notices (the missing set-logic hint,
+    # most often) straight to fd 2 — a Python-level redirect does not
+    # see them. Park fd 2 for the duration of the decide so the tool's
+    # stderr stays reserved for hlprove's own diagnostics.
+    saved = os.dup(2)
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    try:
+        os.dup2(devnull, 2)
+        tm = cvc5.TermManager()
+        solver = cvc5.Solver(tm)
+        try:
+            parser = cvc5.InputParser(solver)
+        except (TypeError, RuntimeError):
+            parser = cvc5.InputParser(tm, solver)
+        sm = parser.getSymbolManager()
+        lang = getattr(cvc5.InputLanguage, "SMT_LIB_2_6",
+                       getattr(cvc5.InputLanguage, "SMT_LIB_V2", None))
+        if lang is None:
+            return "?"
+        parser.setStringInput(lang, text, "hlprove")
+        last = None
+        while not parser.done():
+            cmd = parser.nextCommand()
+            if cmd.isNull():
+                break
+            try:
+                last = cmd.invoke(solver, sm)
+            except TypeError:
+                last = cmd.invoke(solver)
+        verdict = (last or "").strip()
+        return verdict if verdict in ("sat", "unsat", "unknown") else "?"
+    except Exception:
+        return "?"
+    finally:
+        os.dup2(saved, 2)
+        os.close(saved)
+        os.close(devnull)
+
+
+def _cvc5_verdicts_py(path):
+    """Run the .smt2 through the cvc5 PYTHON module and return the list
+    of check-sat verdicts — one per (reset)-separated segment, the same
+    convention as the z3 module fallback. Returns None if the module is
+    unavailable."""
+    try:
+        import cvc5  # noqa: F401
+    except ImportError:
+        return None
+    with open(path) as f:
+        text = f.read()
+    segments = [seg.strip() for seg in text.split("(reset)") if seg.strip()]
+    return [_cvc5_module_decide(seg.splitlines()) for seg in segments]
+
+
+def run_cvc5(smt_files):
+    """Run cvc5 on each file: the cvc5 binary if present, else the cvc5
+    python module — the exact reporting contract of run_z3, so the two
+    backends are interchangeable on the same .smt2."""
+    for key, path in smt_files:
+        verdicts = None
+        try:
+            proc = subprocess.run(["cvc5", "--lang", "smt2", "-q", path],
+                                  capture_output=True, text=True, timeout=10)
+            if proc.returncode == 0:
+                out = (proc.stdout or "").strip().splitlines()
+                verdicts = [ln for ln in out if ln in ("sat", "unsat",
+                                                       "unknown")]
+                if not verdicts:
+                    verdicts = ["?"]
+            else:
+                verdicts = None
+        except FileNotFoundError:
+            verdicts = None
+        except subprocess.TimeoutExpired:
+            print("    %-28s cvc5: TIMEOUT" % key)
+            continue
+        if verdicts is None:
+            verdicts = _cvc5_verdicts_py(path)
+        if verdicts is None:
+            print("    %-28s cvc5: neither the cvc5 binary nor the cvc5"
+                  " python package is available (install one, or use"
+                  " --smt and inspect the .smt2 yourself)" % key)
+            return
+        labels = ["vacuity", "ensures"]
+        disp = ", ".join("%s: %s" % (labels[i] if i < len(labels) else "q%d" % i, v)
+                         for i, v in enumerate(verdicts))
+        print("    %-28s cvc5: %s" % (key, disp))
+
+
+def make_cvc5_decider():
+    """The Stage 99 decider: the cvc5 binary first, then the cvc5
+    python module — or None when neither exists (nothing is then
+    claimed as inferred; the report says so)."""
+    def decide(lines):
+        v = _cvc5_binary_decide(lines)
+        if v is not None:
+            return v
+        return _cvc5_module_decide(lines)
+
+    if _cvc5_binary_decide(["(check-sat)"]) is not None:
+        return decide
+    if _cvc5_module_decide(["(check-sat)"]) is not None:
+        return decide
+    return None
+
+
 def suggest_invariants(program):
     """Loop-invariant suggestions (the roadmap's automatic inference
     rule set): const-bound for loops get exact bounds; while loops get
@@ -400,11 +573,16 @@ def make_decider():
     return None
 
 
-def infer_invariants(program, want_smt, out_dir):
+def infer_invariants(program, want_smt, out_dir, decider=None,
+                     solver_name="z3"):
     """Stage 97: the SMT-based invariant inference pipeline. Returns an
-    exit-visible summary (accepted/rejected counts)."""
+    exit-visible summary (accepted/rejected counts). Stage 99: the
+    decider and its printed name arrive as parameters — the SAME
+    pipeline runs under either backend, so the verdicts (and the whole
+    report modulo the solver's name) must not change with it."""
     loops = _proof.infer_loops(program)
-    decider = make_decider()
+    if decider is None:
+        decider = make_decider()
     accepted = 0
     rejected = 0
     if not loops:
@@ -430,16 +608,21 @@ def infer_invariants(program, want_smt, out_dir):
                 continue
         if decider is None:
             print("    candidates: %s" % ", ".join(c.text for c in loop.cands))
-            print("    (no z3 binary and no z3-solver module — candidates "
-                  "are NOT verified, nothing is claimed as inferred; "
-                  "install z3 or pip install z3-solver)")
+            if solver_name == "cvc5":
+                print("    (no cvc5 binary and no cvc5 module — candidates "
+                      "are NOT verified, nothing is claimed as inferred; "
+                      "install a cvc5 binary or pip install cvc5)")
+            else:
+                print("    (no z3 binary and no z3-solver module — candidates "
+                      "are NOT verified, nothing is claimed as inferred; "
+                      "install z3 or pip install z3-solver)")
             rejected += len(loop.cands)
             continue
         segs = _proof.verify_loop(loop, decider)
         accepted += len(loop.accepted)
         rejected += len(loop.rejected)
         if loop.accepted:
-            print("    inferred (z3-verified inductive):")
+            print("    inferred (%s-verified inductive):" % solver_name)
             for c in loop.accepted:
                 print("      %s   (%s)" % (c.text, c.tag))
         else:
@@ -465,10 +648,18 @@ def infer_invariants(program, want_smt, out_dir):
 
 def main():
     args = sys.argv[1:]
+    want_cvc5 = "--cvc5" in args
     want_z3 = "--z3" in args
+    # Stage 99: one backend decides per run. A run asking for BOTH is a
+    # caller error — silently picking one would make the report's
+    # solver column a coin flip.
+    if want_cvc5 and want_z3:
+        sys.stderr.write("hlprove: --z3 and --cvc5 name different backends"
+                         " — pick one\n")
+        return 2
     # Deep-scan-10: --z3 without --smt silently did nothing; it now
-    # implies it.
-    want_smt = "--smt" in args or want_z3
+    # implies it. Stage 99: --cvc5 implies it for the same reason.
+    want_smt = "--smt" in args or want_z3 or want_cvc5
     want_inv = "--suggest-invariants" in args
     want_infer = "--infer-invariants" in args
     args = [a for a in args if not a.startswith("--")]
@@ -506,15 +697,19 @@ def main():
 
     if want_smt:
         out_dir = os.path.dirname(os.path.abspath(path)) or "."
+        solver_label = "cvc5" if want_cvc5 else "z3"
         print("")
-        print("  SMT-LIB2 bridge (z3-ready, QF_LIA; str lengths "
-              "abstracted to Int):")
+        print("  SMT-LIB2 bridge (%s-ready, QF_LIA; str lengths "
+              "abstracted to Int):" % solver_label)
         files = gen_smt(program, out_dir)
         for key, fpath in files:
             print("    %-28s -> %s" % (key, fpath))
         if want_z3:
             print("")
             run_z3(files)
+        elif want_cvc5:
+            print("")
+            run_cvc5(files)
 
     if want_inv:
         print("")
@@ -522,11 +717,18 @@ def main():
 
     if want_infer:
         print("")
+        if want_cvc5:
+            solver_name = "cvc5"
+            decider = make_cvc5_decider()
+        else:
+            solver_name = "z3"
+            decider = make_decider()
         print("  SMT-based loop-invariant inference (Stage 97; entry "
               "facts + transition relation + template candidates, "
-              "z3-checked):")
+              "%s-checked):" % solver_name)
         out_dir = os.path.dirname(os.path.abspath(path)) or "."
-        accepted, rejected = infer_invariants(program, want_smt, out_dir)
+        accepted, rejected = infer_invariants(program, want_smt, out_dir,
+                                              decider, solver_name)
         print("  INFERENCE TOTAL: %d invariants verified, %d candidates "
               "rejected" % (accepted, rejected))
     return 0
