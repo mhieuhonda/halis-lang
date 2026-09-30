@@ -592,7 +592,8 @@ def cross_compile(input_hls: str, output_bin: str, target: str,
                   linker_kind: str = "auto", keep_c: Optional[str] = None,
                   dry_run: bool = False, hlc: str = "bin/hlc",
                   security: str = "auto",
-                  target_feature: str = "") -> int:
+                  target_feature: str = "",
+                  debug: bool = False) -> int:
     """Cross-compile an HLS program to a foreign binary.
 
     Steps:
@@ -654,6 +655,12 @@ def cross_compile(input_hls: str, output_bin: str, target: str,
     if target_feature:
         hlc_cmd.append("--target-feature")
         hlc_cmd.append(target_feature)
+    # Stage 96 (v0.115.0-alpha): --debug passes through to hlc (the C
+    # carries the #line mapping) and turns on DWARF 5 in the C compile
+    # — the resulting image keeps its debug info instead of the
+    # default strip-to-size build.
+    if debug:
+        hlc_cmd.append("--debug")
     code, _ = run(hlc_cmd)
     if code != 0:
         print(f"error: hlc failed (exit {code})", file=sys.stderr)
@@ -728,7 +735,12 @@ def cross_compile(input_hls: str, output_bin: str, target: str,
         if kind != "zig":
             arch_flags = ["-march=" + spec.get("march", "rv64imac")] + arch_flags
         arch_flags = ["-mabi=" + spec.get("mabi", "lp64")] + arch_flags
-    cmd = ([linker] + base_args + sec_flags + arch_flags
+    # Stage 96: --debug — DWARF 5 debug info in the image. gcc/clang
+    # spell it the same; zig cc also accepts both. The mapping lives in
+    # the C (hlc --debug); this flag decides whether the image keeps
+    # it.
+    debug_flags = ["-g", "-gdwarf-5"] if debug else []
+    cmd = ([linker] + base_args + sec_flags + arch_flags + debug_flags
            + freestanding_flags + [c_path, "-o", out_path]
            + spec["link_libs"])
     code, _ = run(cmd)
@@ -816,6 +828,12 @@ def main() -> int:
                     help="Stage 25/26: enable std.simd intrinsic fast paths "
                          "(neon for AArch64; sse4.2/avx2 for x86; "
                          "rvv for RISC-V 64; native = auto-detect host)")
+    # Stage 96 (v0.115.0-alpha): --debug — the C keeps the #line mapping
+    # to the .hls source and the image is linked with -g -gdwarf-5, so
+    # DWARF 5 names Halis lines (gdb, addr2line, objdump -S).
+    ap.add_argument("--debug", action="store_true",
+                    help="Stage 96: keep DWARF 5 debug info in the image "
+                         "(hlc --debug + -g -gdwarf-5)")
     args = ap.parse_args()
 
     if args.list_targets:
@@ -829,7 +847,8 @@ def main() -> int:
                          linker_kind=args.linker, keep_c=args.keep_c,
                          dry_run=args.dry_run, hlc=args.hlc,
                          security=args.security,
-                         target_feature=args.target_feature)
+                         target_feature=args.target_feature,
+                         debug=args.debug)
 
 
 if __name__ == "__main__":

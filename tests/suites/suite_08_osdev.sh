@@ -1208,3 +1208,20 @@ else
     bad "triple95: make triple-riscv64-acceptance failed"
     tail -15 "$TMP/tri_acc95.log"
 fi
+
+echo "=== 33. Stage 96: ELF symbol-table emission + debug-info (DWARF 5) ==="
+# Stage 96 (v0.115.0-alpha): the image describes itself. --debug maps
+# the C back to the .hls source (DWARF 5 under -g -gdwarf-5);
+# --symbols writes the manifest of every definition the compiler
+# emits. Phase VI closes with an image that speaks for itself.
+if make debuginfo-acceptance >"$TMP/dbg_acc96.log" 2>&1; then
+    if grep -q "ACCEPTANCE OK: Stage 96" "$TMP/dbg_acc96.log"; then
+        ok "stage96: make debuginfo-acceptance runs end-to-end"
+    else
+        bad "stage96: gate did not print ACCEPTANCE OK"
+        tail -5 "$TMP/dbg_acc96.log"
+    fi
+else
+    bad "stage96: make debuginfo-acceptance failed"
+    tail -15 "$TMP/dbg_acc96.log"
+fi

@@ -4925,3 +4925,66 @@ image (ELF64 RISC-V, EM_RISCV=243, entry 0x80000000, zero undefined
 symbols, zero FP instructions), the optional QEMU boot (banner AND
 exit 42), the script shape, and the completed registry — all three
 bare-metal triples named by `--list-targets`.
+
+## 50. ELF symbol-table emission + debug-info — DWARF 5 (Stage 96 — v0.115.0-alpha)
+
+Stage 96 closes Phase VI with the image describing itself: `hlc
+--debug` maps the generated C back to the Halis source (so the C
+compiler's `-g -gdwarf-5` produces DWARF 5 that names `.hls` files and
+lines), and `hlc --symbols <manifest>` writes the symbol table of
+every definition the compiler emits. A kernel built with the Stage
+93–95 triples can now be debugged where kernels are debugged — gdb,
+addr2line, `objdump -S` — and the image's symbol table can be checked
+against what the compiler says it emitted.
+
+**The mapping (`--debug`).** The lowered C carries `#line` directives
+at statement granularity: the function's `fn` line before its
+signature, each statement's line through the one dispatcher every
+statement flows through, and a closing directive that hands the
+numbering back to the generated C file between bodies (the output
+file's basename — which is why `--debug` refuses a stdout build: the
+markers must name the file). The rules are exact:
+
+* every non-generic user function maps to the `.hls` file it was
+  parsed from (the entry path as given, or an imported module's
+  resolved path) — `FnInfo` carries it from the parser;
+* everything the COMPILER generates maps to the generated C: the
+  runtime prelude, the struct/enum/clone helpers, the generic
+  specialisations, the spawn trampolines, the entry. Machine code with
+  no Halis statement behind it does not claim one;
+* the granularity is the statement: the lines a statement lowers to
+  all carry that statement's line, which is what a debugger stepping
+  Halis source wants. Expression-level granularity would claim
+  precision the lowering does not preserve;
+* DWARF 5 itself is the driver's choice — the C is compiled with
+  `-g -gdwarf-5` (or `hlcross --debug`, which passes both to the C
+  compile). The mapping is versionless; the gate pins 5.
+
+**The manifest (`--symbols`).** One post-pass over the assembled C
+records every column-0 definition the compiler emitted:
+`<binding> <section> <symbol> [<source>]`, where binding is
+`global|static`, section is `text|rodata|data|bss` (the declaration's
+class: a body is text, `const` is rodata, an initializer is data, a
+bare object is bss), and a user function's row carries its
+`<file>:<line>`. The scanner is exact where the compiler is exact —
+function signatures end in ` {`, objects in `;` — and the gate holds
+it to the claim both ways: in the freestanding image (no libc), every
+symbol `nm` reports that is not the linker script's own or one of
+GCC's `.part.N` partial-inline clones must be in the manifest; in the
+hosted image, every `hl_*`/`usf_*`/`main` symbol must be. A definition
+the scanner misses turns the gate red instead of the kernel's debug
+session. The manifest classifies DECLARATIONS; the C ABI's placement
+of a zero-initialized object in `.bss` is the image's business, and
+the gate checks classes only where the two accounts cannot disagree
+(text, and bss for bare objects).
+
+**Both flags are emission-level**: they compose with `--target` (a
+bare-metal image with DWARF naming kernel source), with `--no-libc`,
+and with every optimisation flag; they change no check, no diagnostic,
+and no default output byte. The acceptance gate (`make
+debuginfo-acceptance`, 7 sections) runs the CLI refusals, the marker
+and reset shapes, the DWARF version + decoded line table + addr2line
+answers, the manifest shape, the image-vs-nm completeness both ways,
+the orchestrator, and the no-libc mode + tools — plus the demo
+`examples/dbg_demo.hls`, three functions on stable lines whose truth
+the gate pins line by line.

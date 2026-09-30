@@ -32,6 +32,22 @@ fn gen_fn_body(ctx: Ctx, key: str) -> void {
     # v0.30.0-alpha: record the fn key for the return handler's ensures
     # checks (gen_reset_fn just cleared it).
     ctx.cur_fn = key
+    # Stage 96 (v0.115.0-alpha): --debug — the region this body occupies
+    # in ctx.out maps to the fn's .hls source. The fn-level marker is
+    # pushed FIRST (the DWARF decl_line of the C function is the Halis
+    # `fn` line), and every statement adds its own marker through
+    # gen_stmt. lto_fn_start must cover the marker so an LTO phase-B
+    # splice removes it WITH the body it annotates; the retro-patch
+    # below edits the SIGNATURE line, which sits one past the marker.
+    let map_open: bool = ctx.debug_mode && f.src_file != ""
+    if map_open {
+        ctx.cur_map_file = f.src_file
+    } else {
+        ctx.cur_map_file = ""
+    }
+    if map_open {
+        ctx.out.push("#line " + f.line.to_str() + " " + c_path_lit(f.src_file))
+    }
     let ptypes_c: list[str] = []
     let inst_ptypes: list[str] = []
     let mut i: int = 0
@@ -73,6 +89,13 @@ fn gen_fn_body(ctx: Ctx, key: str) -> void {
     let sig_start: int = ctx.out.len()
     ctx.lto_fn_start.set(key, sig_start)
     ctx.out.push(fn_attr_prefix(ctx, f, key) + sig + " {")
+    # Stage 96: where the signature line sits NOW (the fn-level marker
+    # may precede it) — the PGO retro-patch must edit the signature,
+    # never the marker.
+    let mut sig_line: int = sig_start
+    if map_open {
+        sig_line = sig_start + 1
+    }
     emit_param_local_decls(ctx, f, inst_ptypes, param_local_names)
     # Stage 19: PGO — function-entry counter site (e:<fnkey>), emitted
     # under --pgo-generate as the first statement of the body.
@@ -122,6 +145,15 @@ fn gen_fn_body(ctx: Ctx, key: str) -> void {
     gen_stmts(ctx, f.body, "    ")
     ctx.out.push("}")
     ctx.out.push("")
+    # Stage 96: end the mapped region — the sentinel is replaced by a
+    # `#line` directive naming the generated C file in the post-pass
+    # (finish_emission), once the body's final position in the output
+    # is known. It sits INSIDE the [sig_start, size) range recorded for
+    # LTO, so a spliced body takes its marker and its sentinel with it.
+    if map_open {
+        ctx.out.push("__HLC_LINEMAP_C__")
+    }
+    ctx.cur_map_file = ""
     # Stage 19: record the emitted body size; under --pgo-use, hot small
     # functions get a `static inline` hint retroactively patched onto the
     # already-pushed signature line (the prototype emitted later consults
@@ -134,7 +166,7 @@ fn gen_fn_body(ctx: Ctx, key: str) -> void {
     # no-op: fn_inline_attr returns the same string on both calls).
     ctx.pgo_fn_sizes.set(key, ctx.out.len() - sig_start)
     if f.attr_inline == "" && pgo_fn_inline(ctx, key) {
-        ctx.out.set(sig_start, "static inline " + ctx.out.get(sig_start))
+        ctx.out.set(sig_line, "static inline " + ctx.out.get(sig_line))
     }
 }
 
@@ -1093,6 +1125,272 @@ fn has_panic_handler(ctx: Ctx) -> bool {
     return ph.attr_panic_handler
 }
 
+# ============================================================================
+# 5g-bis. STAGE 96 (v0.115.0-alpha): SYMBOL-TABLE + DEBUG-INFO POST-PASS
+# ----------------------------------------------------------------------------
+# The assembled C is the compiler's own product, so ONE pass over it
+# closes both Stage 96 deliverables:
+#   - --debug: the `__HLC_LINEMAP_C__` sentinels gen_fn_body pushed are
+#     replaced by `#line <n> "<out.c>"` directives, where n is the
+#     1-based number the line AFTER the sentinel will have in the final
+#     file — the point where the mapping hands the numbering back to
+#     the generated C. (Everything between two sentinels maps to the
+#     .hls source; everything else was and stays the C file's own.)
+#   - --symbols: every definition the compiler emitted is recorded in
+#     ctx.symtab as `<binding> <section> <symbol> [<source>]`. The
+#     scanner is exact where the compiler is exact (column-0
+#     definitions it emitted itself) and the freestanding gate checks
+#     its completeness against nm — a missed definition turns the
+#     gate red, not the kernel's debug session.
+# ============================================================================
+
+# sym_ident_ch(b, first) — the C identifier character class. The
+# scanner accepts a scanned name only when it is a valid identifier,
+# which is what keeps prototypes' fn-pointer parameters and other
+# punctuation out of the manifest.
+fn sym_ident_ch(b: int, first: bool) -> bool {
+    let lower: bool = b >= 97 && b <= 122
+    let upper: bool = b >= 65 && b <= 90
+    if first {
+        return lower || upper || b == 95
+    }
+    return lower || upper || b == 95 || (b >= 48 && b <= 57)
+}
+
+# sym_is_ident(s) — s is a non-empty C identifier.
+fn sym_is_ident(s: str) -> bool {
+    if s.len() == 0 {
+        return false
+    }
+    let mut i: int = 0
+    while i < s.len() {
+        if !sym_ident_ch(s.byte_at(i), i == 0) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+# sym_last_word(s) — the last whitespace-separated word of s, with any
+# leading pointer stars stripped (`char *foo` -> `foo`). The object
+# extractor cuts the type/name text at the first `[` or `=` and takes
+# this word as the symbol.
+fn sym_last_word(s: str) -> str {
+    let t: str = s.trim()
+    if t == "" {
+        return ""
+    }
+    let mut cut: int = -1
+    let mut i: int = 0
+    while i < t.len() {
+        let b: int = t.byte_at(i)
+        if b == 32 || b == 9 {
+            cut = i
+        }
+        i = i + 1
+    }
+    let mut w: str = t
+    if cut >= 0 {
+        w = t.slice(cut + 1, t.len())
+    }
+    while w.starts_with("*") {
+        w = w.slice(1, w.len())
+    }
+    return w
+}
+
+# scan_symbols(ctx, final) — collect the manifest. Column-0 only: every
+# definition hlc emits starts at column 0; everything indented is a
+# body. Shapes:
+#   <attrs> <type> <name>(<params>) {      -> function  (text)
+#   <static> <const> <type> <name> = ..;   -> object    (data/rodata)
+#   <static> <type> <name>[N];             -> object    (bss)
+#   <static> void (*<name>)(..) = ..;      -> object    (fn pointer)
+#   <static> union { .. } <name>;          -> object    (the arena)
+# Skipped: indented lines, `#` directives, comments, `typedef`,
+# `extern` (declarations, not definitions), `struct/union/enum` at
+# column 0 (type definitions), and prototype lines (`);` with no
+# pointer-defining `(*`).
+fn scan_symbols(ctx: Ctx, final: list[str]) -> void {
+    # The Halis provenance of the user-level functions: C name ->
+    # "<file>:<line>", for the manifest's source column.
+    let src_of: map[str, str] = map_new()
+    let mut i: int = 0
+    while i < ctx.fn_order.len() {
+        let key: str = ctx.fn_order.get(i)
+        let f: FnInfo = ctx.fns.get_or(key, dummy_fn())
+        if f.typeparams.len() == 0 && f.src_file != "" {
+            src_of.set("usf_" + c_fn_name(key), f.src_file + ":" + f.line.to_str())
+        }
+        i = i + 1
+    }
+    ctx.symtab.push("# hlc --symbols manifest (Stage 96)")
+    ctx.symtab.push("# one definition per line: <binding> <section> <symbol> [<source>]")
+    ctx.symtab.push("# binding: global|static   section: text|rodata|data|bss")
+    if ctx.target_triple != "" {
+        ctx.symtab.push("# target: " + ctx.target_triple + " (bare-metal, integer-only, freestanding)")
+    } else if ctx.no_libc {
+        ctx.symtab.push("# target: hosted (no-libc runtime)")
+    } else if ctx.crate_freestanding {
+        ctx.symtab.push("# target: freestanding (hosted triple)")
+    } else {
+        ctx.symtab.push("# target: hosted")
+    }
+    let mut li: int = 0
+    while li < final.len() {
+        let line: str = final.get(li)
+        li = li + 1
+        if line.len() == 0 {
+            continue
+        }
+        let b0: int = line.byte_at(0)
+        # indented body line, a `#` directive, or a comment
+        if b0 == 32 || b0 == 9 || b0 == 35 || b0 == 47 {
+            continue
+        }
+        let is_fn: bool = line.ends_with(" {") && line.contains("(")
+        let is_obj: bool = !is_fn && line.ends_with(";")
+        if !is_fn && !is_obj {
+            continue
+        }
+        let is_static: bool = line.starts_with("static ")
+        let mut binding: str = "global"
+        if is_static {
+            binding = "static"
+        }
+        if is_fn {
+            # Cut the trailing " {", strip any __attribute__((...))
+            # prefixes (the naked entry's), then the name is the word
+            # before the first `(`.
+            let mut sig: str = line.slice(0, line.len() - 2)
+            while sig.starts_with("__attribute__") {
+                let close: int = sig.find("))")
+                if close < 0 {
+                    sig = ""
+                } else {
+                    sig = sig.slice(close + 2, sig.len()).trim()
+                }
+            }
+            let paren: int = sig.find("(")
+            if paren <= 0 {
+                continue
+            }
+            let name: str = sym_last_word(sig.slice(0, paren))
+            if !sym_is_ident(name) {
+                continue
+            }
+            let mut row: str = binding + " text " + name
+            if src_of.has(name) {
+                row = row + " " + src_of.get_or(name, "")
+            }
+            ctx.symtab.push(row)
+            continue
+        }
+        # Object candidates: typedefs, extern declarations and the
+        # col-0 `struct ... { ... };` type definitions are not symbols.
+        # A prototype (`...name(params);`) is not one either — the only
+        # parenthesized OBJECT shapes the runtime emits are the
+        # function-pointer object (`static void (*fp)(..) = ..;`) and
+        # an initialized object whose initializer calls something
+        # (`static int x = hl_f();`), so a line with `(` but neither
+        # `(*` nor ` = ` is a declaration: skip it. (Prototypes with
+        # fn-pointer PARAMETERS carry `(*`, but the identifier test
+        # below rejects the punctuation it extracts from them.)
+        if line.starts_with("typedef") || line.starts_with("extern")
+        || line.starts_with("struct") || line.starts_with("union")
+        || line.starts_with("enum") {
+            continue
+        }
+        if line.contains("(") && !line.contains("(*") && !line.contains(" = ") {
+            continue
+        }
+        let mut name: str = ""
+        if line.contains("{") {
+            # `static union { .. } hl_heap_u;` — the symbol is the word
+            # after the LAST closing brace (the last `}` at 125).
+            let mut scan: int = 0
+            let mut seen: int = -1
+            while scan < line.len() {
+                if line.byte_at(scan) == 125 {
+                    seen = scan
+                }
+                scan = scan + 1
+            }
+            if seen >= 0 {
+                name = sym_last_word(line.slice(seen + 1, line.len() - 1))
+            }
+        } else if line.contains("(*") {
+            # A function-pointer object: `static void (*hl_panic_hook)(..) = 0;`
+            # (a prototype with fn-pointer parameters carries no `(*`
+            # before its first `(`-group's name, and the identifier test
+            # below rejects whatever punctuation it extracts).
+            let open: int = line.find("(*")
+            if open >= 0 {
+                let close: int = line.find(")")
+                if close > open + 2 {
+                    name = line.slice(open + 2, close)
+                }
+            }
+        } else {
+            # Cut at the first `[` or `=` — whatever comes first — and
+            # the symbol is the last word of the declarator.
+            let br: int = line.find("[")
+            let eq: int = line.find("=")
+            let mut cut: int = line.len() - 1
+            if br >= 0 && br < cut {
+                cut = br
+            }
+            if eq >= 0 && eq < cut {
+                cut = eq
+            }
+            name = sym_last_word(line.slice(0, cut))
+        }
+        if !sym_is_ident(name) {
+            continue
+        }
+        # Section: `const` objects are read-only; an initializer means
+        # .data; a bare declaration (an array or a zeroed object) is
+        # .bss.
+        let mut sec: str = "bss"
+        if line.contains("=") {
+            if line.contains("const") {
+                sec = "rodata"
+            } else {
+                sec = "data"
+            }
+        }
+        ctx.symtab.push(binding + " " + sec + " " + name)
+    }
+}
+
+# finish_emission(ctx, final) — the single post-pass over the assembled
+# C. Called by gen_program before EVERY return (both entry shapes).
+fn finish_emission(ctx: Ctx, final: list[str]) -> void {
+    if ctx.debug_mode {
+        let mut i: int = 0
+        while i < final.len() {
+            if final.get(i) == "__HLC_LINEMAP_C__" {
+                # The sentinel line itself is replaced; the line after
+                # it is output line i+2 (1-based) — hand the numbering
+                # back to the generated C file there. When the file's
+                # name is unknown (no output path), the mapping closes
+                # with the C file it was emitted from by convention:
+                # the driver still compiles a FILE, so this names it.
+                let mut nm: str = ctx.out_name
+                if nm == "" {
+                    nm = "hlc_out.c"
+                }
+                final.set(i, "#line " + (i + 2).to_str() + " " + c_path_lit(nm))
+            }
+            i = i + 1
+        }
+    }
+    if ctx.symbols_path != "" {
+        scan_symbols(ctx, final)
+    }
+}
+
 fn gen_program(ctx: Ctx) -> list[str] {
     # Stage 92 (v0.111.0-alpha): --no-libc is the HOSTED-source build
     # mode; a #![freestanding] crate already emits its own _start and
@@ -1425,6 +1723,9 @@ fn gen_program(ctx: Ctx) -> list[str] {
         final.push("#endif")
         final.push("    );")
         final.push("}")
+        # Stage 96: the post-pass runs here too — a freestanding image
+        # is exactly the build whose symbol table and DWARF matter.
+        finish_emission(ctx, final)
         return final
     }
     # Stage 92 (v0.111.0-alpha): a --no-libc build is a HOSTED source
@@ -1497,6 +1798,10 @@ fn gen_program(ctx: Ctx) -> list[str] {
         final.push("    );")
         final.push("}")
     }
+    # Stage 96 (v0.115.0-alpha): the single post-pass — the #line
+    # sentinels become real directives naming the generated C file,
+    # and the symbol manifest is collected for --symbols.
+    finish_emission(ctx, final)
     return final
 }
 

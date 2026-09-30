@@ -18,7 +18,7 @@ LINKER_TEST_CC ?= $(CC)
 LINKER_TEST_LD ?= $(shell $(CC) -print-prog-name=ld)
 LINKER_TEST_NM ?= $(shell $(CC) -print-prog-name=nm)
 
-.PHONY: triple triple-x86_64-acceptance triple-aarch64-acceptance triple-riscv64-acceptance test-linker
+.PHONY: triple triple-x86_64-acceptance triple-aarch64-acceptance triple-riscv64-acceptance debuginfo-acceptance test-linker
 test-linker: $(LINKER_TEST_BIN)
 	@$(LINKER_TEST_NM) $(LINKER_TEST_BIN) | grep -q '__halis_metadata_start' && \
 	 $(LINKER_TEST_NM) $(LINKER_TEST_BIN) | grep -q '__halis_sections_start' && \
@@ -295,6 +295,27 @@ triple-riscv64-acceptance:
 	@echo "[Stage 95 acceptance] running tests/triple_riscv64_acceptance.py..."
 	@$(PYTHON) tests/triple_riscv64_acceptance.py
 	@echo "ACCEPTANCE OK: Stage 95 -- target riscv64-unknown-none (bare-metal RISC-V)"
+
+
+# debuginfo-acceptance: the Stage 96 acceptance gate, closing Phase VI.
+# Runs the 7-section suite for the image's self-description: the CLI
+# surface (--debug refuses a stdout build, --symbols demands a path,
+# byte-identical determinism), the #line markers (fn and statement
+# lines of the demo named, the numbering handed back to the generated
+# C between bodies, plain builds untouched), the DWARF (version 5 in
+# the CU header, the .hls file in the decoded line table, addr2line
+# answering the Halis file:line wherever binutils exists), the
+# manifest shape (every row `<binding> <section> <symbol>
+# [<source>]`, the user fns carrying file:line), the image vs nm (the
+# freestanding image's every defined symbol in the manifest minus the
+# linker script's own and GCC's .part clones, the entry chain global
+# text, exit 42, the hosted hl_/usf_ symbols complete with the
+# text/bss classes agreeing with nm), hlcross --debug (the image keeps
+# .debug_info naming the .hls source), and the no-libc mode + tools.
+debuginfo-acceptance:
+	@echo "[Stage 96 acceptance] running tests/debuginfo_acceptance.py..."
+	@$(PYTHON) tests/debuginfo_acceptance.py
+	@echo "ACCEPTANCE OK: Stage 96 -- ELF symbol table + debug info (DWARF 5)"
 
 # freestanding: compile an HLS program to freestanding C + link with
 # -nostdlib into a runnable binary.

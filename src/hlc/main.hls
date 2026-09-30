@@ -54,6 +54,19 @@ fn parent_dir(dir: str) -> str {
     return "."
 }
 
+# file_basename(path) returns everything after the last slash — the
+# name the #line directives use for the generated C file (Stage 96).
+fn file_basename(path: str) -> str {
+    let mut i: int = path.len() - 1
+    while i >= 0 {
+        if path.byte_at(i) == 47 {
+            return path.slice(i + 1, path.len())
+        }
+        i = i - 1
+    }
+    return path
+}
+
 # resolve_import_path(imp, entry_dir, repo_root) returns the resolved file
 # path for an import, or "" if not found.
 fn resolve_import_path(imp: str, entry_dir: str, repo_root: str) -> str uses IO, Proc {
@@ -142,6 +155,10 @@ fn load_file_into(ctx: Ctx, abs_path: str) -> void uses IO, Proc {
     let saved_toks: list[Tok] = ctx.toks
     let saved_pos: int = ctx.pos
     let saved_imports: list[str] = ctx.imports
+    # Stage 96: functions parsed from THIS module carry its path
+    # (FnInfo.src_file), restored when the module's parse is done.
+    let saved_map_file: str = ctx.cur_map_file
+    ctx.cur_map_file = abs_path
     ctx.src = read_file(abs_path)
     ctx.toks = []
     ctx.pos = 0
@@ -163,6 +180,7 @@ fn load_file_into(ctx: Ctx, abs_path: str) -> void uses IO, Proc {
     ctx.toks = saved_toks
     ctx.pos = saved_pos
     ctx.imports = saved_imports
+    ctx.cur_map_file = saved_map_file
 }
 
 fn main() -> int uses IO, Proc {
@@ -188,6 +206,9 @@ fn main() -> int uses IO, Proc {
     let mut no_libc: bool = false
     # Stages 93-95: the bare-metal target triple ("" = hosted build).
     let mut target_triple: str = ""
+    # Stage 96 (v0.115.0-alpha): --debug and --symbols <path>.
+    let mut debug_mode: bool = false
+    let mut symbols_path: str = ""
     let mut lto_mode: bool = false
     # Stage 20 perfection (v0.39.0-alpha): --lto-stats and --lto-threshold.
     let mut lto_stats: bool = false
@@ -216,6 +237,26 @@ fn main() -> int uses IO, Proc {
             # -ffreestanding -nostdlib. The arrow the roadmap draws:
             # Stage-0 -> hosted hlc -> freestanding hlc.
             no_libc = true
+        } else if tok == "--debug" {
+            # Stage 96 (v0.115.0-alpha): source-level debug mapping —
+            # the emitted C carries `#line` directives so a C compiler
+            # invoked with -g -gdwarf-5 produces DWARF 5 that names the
+            # .hls source. Requires a FILE output (the markers must
+            # name the generated C when they hand the numbering back).
+            debug_mode = true
+        } else if tok == "--symbols" {
+            # Stage 96 (v0.115.0-alpha): write the symbol manifest of
+            # the assembled C (every function/object definition hlc
+            # emits, with its binding, section class and — for user
+            # functions — its Halis source) to the given path. For a
+            # freestanding image the manifest is the image's complete
+            # symbol table minus the linker script's own symbols.
+            if ai + 1 >= argv.len() {
+                println("error: --symbols expects a manifest path")
+                return 2
+            }
+            symbols_path = argv.get(ai + 1)
+            ai = ai + 1
         } else if tok == "--target" {
             # Stages 93-95 (v0.112.0-alpha .. v0.114.0-alpha): the
             # bare-metal triples. `--target x86_64-unknown-none` (and
@@ -385,7 +426,7 @@ fn main() -> int uses IO, Proc {
         println("usage: hlc [--fast | -O fast] [--contracts] [--pgo-generate] [--pgo-use <profile>]")
         println("              [--lto] [--lto-stats] [--lto-threshold N] [--target-feature sse4.2|avx2|neon|rvv]")
         println("              [--no-libc] [--target x86_64-unknown-none|aarch64-unknown-none|riscv64-unknown-none]")
-        println("              <input.hls> <output.c|->")
+        println("              [--debug] [--symbols <manifest>] <input.hls> <output.c|->")
         println("       hlc --audit <input.hls>")
         return 1
     }
@@ -425,6 +466,21 @@ fn main() -> int uses IO, Proc {
     # integer-only rule lives in the checker; the stamp + freestanding
     # implication in the pipeline below).
     ctx.target_triple = target_triple
+    # Stage 96 (v0.115.0-alpha): the debug mapping and the symbol
+    # manifest ride with the compile. The output path is needed BEFORE
+    # codegen: --debug's #line directives name the generated C file
+    # when they hand the numbering back, so a stdout build has nothing
+    # to name and is refused rather than silently mislabelled.
+    let out_path: str = a.get(1)
+    if debug_mode && out_path == "-" {
+        println("error: --debug needs a file output path (the C line markers must name the generated C file)")
+        return 2
+    }
+    ctx.debug_mode = debug_mode
+    ctx.symbols_path = symbols_path
+    if out_path != "-" {
+        ctx.out_name = file_basename(out_path)
+    }
     # Stage 19: load the --pgo-use profile BEFORE codegen (the branch /
     # fn-attribute hints consult it during generation).
     if pgo_use_path != "" {
@@ -440,6 +496,12 @@ fn main() -> int uses IO, Proc {
         }
     }
     # Lex + parse the entry file.
+    # Stage 96: the file cursor during parsing — parse_fn stamps it
+    # into every FnInfo.src_file so the debug mapping and the symbol
+    # manifest can name the function's Halis source. load_file_into
+    # swaps it per imported module; it is cleared after the parse (the
+    # codegen sets it per body instead).
+    ctx.cur_map_file = entry_path
     lex(ctx)
     parse_program(ctx)
     # Process the entry file's imports (recursively loads transitive deps).
@@ -455,6 +517,8 @@ fn main() -> int uses IO, Proc {
         load_file_into(ctx, resolved)
         i = i + 1
     }
+    # Stage 96: the parse is done — the cursor goes back to no file.
+    ctx.cur_map_file = ""
     # Stages 93-95: `--target <triple>` implies `#![freestanding]` — a
     # bare-metal image has no OS to host it. Applied AFTER the parse
     # (an explicit `#![freestanding]` in the source must not trip the
@@ -467,12 +531,17 @@ fn main() -> int uses IO, Proc {
     check_program(ctx)
     let lines: list[str] = gen_program(ctx)
     let code: str = join(lines, "\n")
-    let out_path: str = a.get(1)
     if out_path == "-" {
         print(code)
         println("")
     } else {
         write_file(out_path, code)
+    }
+    # Stage 96: --symbols — the manifest was collected by the post-pass
+    # over the assembled C; write it next to the C. The file always
+    # ends with a newline (join carries none).
+    if symbols_path != "" {
+        write_file(symbols_path, join(ctx.symtab, "\n") + "\n")
     }
     # Stage 20 perfection (v0.39.0-alpha): --lto-stats — print a
     # summary of LTO work to stderr. Only emitted under --lto-stats.

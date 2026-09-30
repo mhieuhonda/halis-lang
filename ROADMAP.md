@@ -151,7 +151,7 @@ remains green.
 | 93 | `target x86_64-unknown-none` — bare-metal triple | ✅ | (done in v0.112.0-alpha) |
 | 94 | `target aarch64-unknown-none` — bare-metal ARM | ✅ | (done in v0.113.0-alpha) |
 | 95 | `target riscv64-unknown-none` — bare-metal RISC-V | ✅ | (done in v0.114.0-alpha) |
-| 96 | ELF symbol-table emission + debug-info (DWARF 5) | ⬜ | 6 weeks |
+| 96 | ELF symbol-table emission + debug-info (DWARF 5) | ✅ | (done in v0.115.0-alpha) |
 
 ### Phase VII — Verification, security & supply chain (Stages 97–112)
 
