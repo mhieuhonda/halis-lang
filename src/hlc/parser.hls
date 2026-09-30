@@ -29,7 +29,9 @@ fn nx_stmt(ctx: Ctx, kind: str, line: int) -> int {
         line: line,
         attr_stack: false, attr_boxed: false,
         asm_template: "", asm_operands: [], asm_options: [],
-        asm_clobbers: []
+        asm_clobbers: [],
+        # Stage 98: refinement metadata ("" / -1 / false = none).
+        rpred: "", rpred_e: -1, rp_elided: false
     }
     ctx.stmts.push(s)
     return ctx.stmts.len() - 1
@@ -120,6 +122,97 @@ fn peek2_is(ctx: Ctx, v: str) -> bool {
 
 # --- Type parsing: returns a canonical type string ---
 
+# ----------------------------------------------------------------------------
+# Stage 98 (v0.117.0-alpha): refinement types (`T where <pred>`).
+# ----------------------------------------------------------------------------
+
+# is_refine_base: the lightweight fragment allows refinements only on
+# primitive value types (SPEC section 52).
+fn is_refine_base(t: str) -> bool {
+    return t == "int" || t == "float" || t == "bool" || t == "str"
+}
+
+# refine_canon_text: collapse every whitespace run in the source slice
+# to single spaces and trim — the canonical predicate identity (the
+# boot parser applies the same algorithm to the same slice).
+fn refine_canon_text(raw: str) -> str {
+    let out: list[str] = []
+    let mut i: int = 0
+    let mut pending_ws: bool = false
+    while i < raw.len() {
+        let c: int = raw.byte_at(i)
+        if c == 32 || c == 9 || c == 10 || c == 13 {
+            pending_ws = out.len() > 0
+        } else {
+            if pending_ws {
+                out.push(" ")
+                pending_ws = false
+            }
+            out.push(raw.slice(i, i + 1))
+        }
+        i = i + 1
+    }
+    return join(out, "")
+}
+
+# parse_refinement: parse `where <pred>` after a primitive base type.
+# Returns the canonical predicate text ("" when no `where` follows).
+# The predicate is one pure boolean expression over the binder `self`
+# (literals, arithmetic, comparisons, &&/||/!, len()); it ends at
+# whatever terminates the enclosing position (',' ')' '=' '}' '{' or a
+# clause keyword) because none of those start an expression. The
+# parsed expression is stored once per unique text in ctx.rpreds.
+fn parse_refinement(ctx: Ctx, base: str, what: str) -> str {
+    if !at_kw(ctx, "where") {
+        return ""
+    }
+    let wt: Tok = ctx.toks.get(ctx.pos)
+    ctx.pos = ctx.pos + 1
+    let start: Tok = ctx.toks.get(ctx.pos)
+    let pred: int = parse_expr(ctx, false)
+    let end: Tok = ctx.toks.get(ctx.pos)
+    if !is_refine_base(base) {
+        perr_at(ctx, "refinements are only supported on primitive types (int, float, bool, str), got '" + base + "'", wt)
+    }
+    # Source slice between the first predicate token and the terminator.
+    let mut a: int = 0
+    let mut line: int = 1
+    while line < start.line && a < ctx.src.len() {
+        if ctx.src.byte_at(a) == 10 {
+            line = line + 1
+        }
+        a = a + 1
+    }
+    a = a + start.col - 1
+    let mut b: int = 0
+    line = 1
+    while line < end.line && b < ctx.src.len() {
+        if ctx.src.byte_at(b) == 10 {
+            line = line + 1
+        }
+        b = b + 1
+    }
+    b = b + end.col - 1
+    if b > ctx.src.len() {
+        b = ctx.src.len()
+    }
+    let text: str = refine_canon_text(ctx.src.slice(a, b))
+    if !ctx.rpreds.has(text) {
+        ctx.rpreds.set(text, pred)
+    }
+    return text
+}
+
+# reject_refinement: a `where` clause in a position outside the
+# lightweight fragment (container elements, type arguments, enum
+# payloads, loop variables, extern declarations).
+fn reject_refinement(ctx: Ctx, pos_desc: str) -> void {
+    if at_kw(ctx, "where") {
+        perr(ctx, "refinements are not supported in this position (" + pos_desc
+        + "); the lightweight fragment allows them on fn parameters, return types, let annotations and struct fields")
+    }
+}
+
 fn parse_type(ctx: Ctx, allow_void: bool) -> str {
     let t: Tok = ctx.toks.get(ctx.pos)
     if t.kind != "ident" {
@@ -130,6 +223,7 @@ fn parse_type(ctx: Ctx, allow_void: bool) -> str {
     if base == "list" {
         eat_sym(ctx, "[")
         let inner: str = parse_type(ctx, false)
+        reject_refinement(ctx, "container element types")
         eat_sym(ctx, "]")
         return "list[" + inner + "]"
     }
@@ -141,6 +235,7 @@ fn parse_type(ctx: Ctx, allow_void: bool) -> str {
         }
         eat_sym(ctx, ",")
         let vt: str = parse_type(ctx, false)
+        reject_refinement(ctx, "map value types")
         eat_sym(ctx, "]")
         return "map[str, " + vt + "]"
     }
@@ -202,6 +297,7 @@ fn parse_type(ctx: Ctx, allow_void: bool) -> str {
         let args: list[str] = []
         while !at_sym(ctx, "]") {
             args.push(parse_type(ctx, false))
+            reject_refinement(ctx, "type arguments")
             if at_sym(ctx, ",") {
                 ctx.pos = ctx.pos + 1
             } else if !at_sym(ctx, "]") {
@@ -671,6 +767,8 @@ fn parse_struct(ctx: Ctx) -> StructInfo {
     # self-hosted compiler diverged); at runtime a duplicate field would
     # silently lose the first value.
     let mut seen_fields: list[str] = []
+    # Stage 98: per-field refinement predicate texts.
+    let field_preds: map[str, str] = map_new()
     while !at_sym(ctx, "}") {
         let ft: str = eat_ident(ctx)
         if list_has(seen_fields, ft) {
@@ -679,6 +777,12 @@ fn parse_struct(ctx: Ctx) -> StructInfo {
         seen_fields.push(ft)
         eat_sym(ctx, ":")
         let ty: str = parse_type(ctx, false)
+        # Stage 98: optional `where` clause on the field type — the
+        # generated constructor guards every value entering the field.
+        let fref: str = parse_refinement(ctx, ty, "field")
+        if fref != "" {
+            field_preds.set(ft, fref)
+        }
         let mut dflt_idx: int = -1
         if at_sym(ctx, "=") {
             ctx.pos = ctx.pos + 1
@@ -702,7 +806,8 @@ fn parse_struct(ctx: Ctx) -> StructInfo {
     }
     return StructInfo {
         name: name, fields: fields, ftypes: ftypes, fdefaults: fdefaults,
-        typeparams: typeparams, line: t0.line
+        typeparams: typeparams, line: t0.line,
+        field_preds: field_preds
     }
 }
 
@@ -741,6 +846,7 @@ fn parse_enum(ctx: Ctx) -> EnumInfo {
             eat_sym(ctx, "(")
             while !at_sym(ctx, ")") {
                 pl.push(parse_type(ctx, false))
+                reject_refinement(ctx, "enum variant payload types")
                 if at_sym(ctx, ",") {
                     ctx.pos = ctx.pos + 1
                 } else if !at_sym(ctx, ")") {
@@ -808,6 +914,9 @@ fn parse_fn(ctx: Ctx, impl_struct: str) -> FnInfo {
     let params: list[str] = []
     let ptypes: list[str] = []
     let pmuts: list[bool] = []
+    # Stage 98: per-parameter refinement predicate texts.
+    let param_preds: map[str, str] = map_new()
+    let mut has_ref: bool = false
     while !at_sym(ctx, ")") {
         let mut is_mut: bool = false
         if at_kw(ctx, "mut") {
@@ -817,6 +926,12 @@ fn parse_fn(ctx: Ctx, impl_struct: str) -> FnInfo {
         let pn: str = eat_ident(ctx)
         eat_sym(ctx, ":")
         let pt: str = parse_type(ctx, false)
+        # Stage 98: optional `where` clause on the parameter type.
+        let pref: str = parse_refinement(ctx, pt, "parameter")
+        if pref != "" {
+            param_preds.set(pn, pref)
+            has_ref = true
+        }
         params.push(pn)
         ptypes.push(pt)
         pmuts.push(is_mut)
@@ -828,9 +943,21 @@ fn parse_fn(ctx: Ctx, impl_struct: str) -> FnInfo {
     }
     eat_sym(ctx, ")")
     let mut ret: str = "void"
+    let mut ret_pred: str = ""
     if at_sym(ctx, "->") {
         ctx.pos = ctx.pos + 1
         ret = parse_type(ctx, true)
+        # Stage 98: optional `where` clause on the return type (void
+        # carries none — there is no value to constrain).
+        if ret != "void" {
+            ret_pred = parse_refinement(ctx, ret, "return type")
+            if ret_pred != "" {
+                if typeparams.len() > 0 {
+                    perr(ctx, "refinements on the return type of a generic function are not supported in the lightweight fragment")
+                }
+                has_ref = true
+            }
+        }
     }
     # Stage 9-beta: explicit `pure` keyword for documentation/linting.
     # `pure` and `uses` are mutually exclusive. The checker enforces that
@@ -910,7 +1037,11 @@ fn parse_fn(ctx: Ctx, impl_struct: str) -> FnInfo {
         attr_align: ctx.cur_attrs_align,
         # Stage 96: the file this fn was parsed from (the #line mapping
         # and the symbol manifest's source annotation name it).
-        src_file: ctx.cur_map_file
+        src_file: ctx.cur_map_file,
+        # Stage 98: refinement predicates on the signature.
+        param_preds: param_preds,
+        ret_pred: ret_pred,
+        has_refinements: has_ref
     }
 }
 
@@ -999,6 +1130,9 @@ fn parse_extern_block(ctx: Ctx) -> void {
             let pn: str = eat_ident(ctx)
             eat_sym(ctx, ":")
             let pt: str = parse_type(ctx, false)
+            # Stage 98: refinements on extern declarations are rejected
+            # (the C side cannot enforce the invariant).
+            reject_refinement(ctx, "extern declarations")
             params.push(pn)
             ptypes.push(pt)
             pmuts.push(is_mut)
@@ -1013,6 +1147,7 @@ fn parse_extern_block(ctx: Ctx) -> void {
         if at_sym(ctx, "->") {
             ctx.pos = ctx.pos + 1
             ret = parse_type(ctx, true)
+            reject_refinement(ctx, "extern declarations")
         }
         let mut is_pure: bool = false
         if at_kw(ctx, "pure") {
@@ -1077,7 +1212,9 @@ fn parse_extern_block(ctx: Ctx) -> void {
             attr_inline: "", attr_hot: false, attr_cold: false,
             attr_tail_call: false, attr_panic_handler: false,
             attr_section: "", attr_align: -1,
-            src_file: ctx.cur_map_file
+            src_file: ctx.cur_map_file,
+            # Stage 98: externs never carry refinements (rejected above).
+            param_preds: map_new(), ret_pred: "", has_refinements: false
         })
         ctx.fn_order.push(name)
     }
@@ -1147,6 +1284,7 @@ fn parse_stmt(ctx: Ctx) -> int {
             let vn: str = eat_ident(ctx)
             eat_sym(ctx, ":")
             let vt: str = parse_type(ctx, false)
+            reject_refinement(ctx, "loop variables")
             eat_kw(ctx, "in")
             let it: int = parse_expr(ctx, false)
             let body: list[int] = parse_block(ctx)
@@ -1226,6 +1364,8 @@ fn parse_let(ctx: Ctx) -> int {
     let name: str = eat_ident(ctx)
     eat_sym(ctx, ":")
     let ty: str = parse_type(ctx, false)
+    # Stage 98: optional `where` clause on the let annotation.
+    let lref: str = parse_refinement(ctx, ty, "let binding")
     eat_sym(ctx, "=")
     let val: int = parse_expr(ctx, true)
     let idx: int = nx_stmt(ctx, "let", t.line)
@@ -1233,6 +1373,12 @@ fn parse_let(ctx: Ctx) -> int {
     ctx.stmts[idx].vtype = ty
     ctx.stmts[idx].is_mut = is_mut
     ctx.stmts[idx].value = val
+    # Stage 98: the binding's refinement (the checker validates it and
+    # may mark rp_elided; the codegen emits the guard unless elided).
+    ctx.stmts[idx].rpred = lref
+    if lref != "" {
+        ctx.stmts[idx].rpred_e = ctx.rpreds.get_or(lref, -1)
+    }
     # Stage 30 (v0.47.0-alpha): snapshot the #[stack] / #[boxed]
     # let-binding layout attributes (set by parse_let_attrs via
     # parse_stmt) onto the statement, then reset the cache so the

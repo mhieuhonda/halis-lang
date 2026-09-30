@@ -20,7 +20,12 @@ struct Tok {
 struct Binding {
     t: str,
     is_mut: bool,
-    moved: bool
+    moved: bool,
+    # Stage 98 (v0.117.0-alpha): the refinement predicate TEXT this
+    # binding was declared with (`let x: int where self > 0`, or a
+    # refined fn parameter), "" when plain. Assignment guards read it;
+    # same-pred flow elisions compare it.
+    rpred: str
 }
 
 struct StructInfo {
@@ -29,7 +34,13 @@ struct StructInfo {
     ftypes: list[str],
     fdefaults: list[int], # indices of default-value exprs, -1 if none
     typeparams: list[str],
-    line: int
+    line: int,
+    # Stage 98 (v0.117.0-alpha): per-field refinement predicate text
+    # (field name -> pred text; only fields written with a `where`
+    # clause appear). The predicate expr resolves through ctx.rpreds.
+    # The generated constructor guards EVERY value entering a refined
+    # field; the checker const-checks literal values + defaults.
+    field_preds: map[str, str]
 }
 
 struct EnumInfo {
@@ -137,7 +148,20 @@ struct FnInfo {
     # compiler's DWARF names the Halis source; --symbols annotates the
     # function's manifest row with `<file>:<line>`. Empty for the
     # dummy_fn placeholder and for synthesized entries.
-    src_file: str
+    src_file: str,
+    # ---- Stage 98 (v0.117.0-alpha): refinement types ----
+    # param_preds: parameter name -> refinement predicate text (only
+    # parameters written with a `where` clause appear); the predicate
+    # expr resolves through ctx.rpreds. Guarded at fn entry (callee
+    # side, always — refinements are always-on semantics).
+    param_preds: map[str, str],
+    # ret_pred: the return type's refinement predicate text, "" if none.
+    # Guarded at every return site.
+    ret_pred: str,
+    # has_refinements: any refinement anywhere on the signature. Such
+    # fns are never inlined (the same rationale as requires/ensures:
+    # the entry/return guards must run exactly once per real call).
+    has_refinements: bool
 }
 
 struct MatchArm {
@@ -281,7 +305,21 @@ struct StmtN {
     asm_template: str,
     asm_operands: list[AsmOperand],
     asm_options: list[str],
-    asm_clobbers: list[str]
+    asm_clobbers: list[str],
+    # ---- Stage 98 (v0.117.0-alpha): refinement types ----
+    # rpred / rpred_e: the refinement predicate guarding THIS statement
+    # (text + expr index, "" / -1 when none). The parser sets it on
+    # `let` (from the annotation); the checker sets it on `assign`
+    # (ident targets: the binding's refinement; field targets: the
+    # struct field's) and on `return` (the fn's ret_pred).
+    # rp_elided: the checker/proof pass PROVED the predicate holds for
+    # this site (constant value, same-pred ident flow, or interval
+    # proof) — the codegen skips the runtime guard. The interpreter
+    # does not consume this flag (it guards unconditionally; proven
+    # guards pass by construction, so outputs stay identical).
+    rpred: str,
+    rpred_e: int,
+    rp_elided: bool
 }
 
 struct Ctx {
@@ -661,7 +699,19 @@ struct Ctx {
     # symtab: the symbol manifest rows collected by the post-pass over
     # the assembled C (scan_symbols), written to symbols_path by main.
     # Empty unless --symbols was given.
-    symtab: list[str]
+    symtab: list[str],
+    # ---- Stage 98 (v0.117.0-alpha): refinement types ----
+    # rpreds: canonical refinement predicate TEXT -> expr index. One
+    # parsed predicate per unique text, shared across all sites (the
+    # exprs are pure functions of `self`, so text identity = semantic
+    # identity).
+    rpreds: map[str, int],
+    # rp_checked: (base + "{" + text + "}") -> validated. Refinement
+    # predicates are type/purity/scope-checked once per compilation.
+    rp_checked: map[str, bool],
+    # rp_tmp: scratch state for parse_refinement — the text of the
+    # predicate being parsed ("" between uses).
+    rp_pending: str
 }
 
 fn new_ctx(src: str) -> Ctx {
@@ -720,7 +770,9 @@ fn new_ctx(src: str) -> Ctx {
         no_libc: false,
         target_triple: "",
         debug_mode: false, out_name: "", symbols_path: "",
-        cur_map_file: "", symtab: []
+        cur_map_file: "", symtab: [],
+        # Stage 98: refinement machinery.
+        rpreds: map_new(), rp_checked: map_new(), rp_pending: ""
     }
 }
 
@@ -752,6 +804,11 @@ fn is_keyword(w: str) -> bool {
         # statement `asm!("...", in(reg) x, out(reg) y, ...)`. Reserved
         # for parity with the boot lexer; grep showed no production use.
     || w == "asm"
+        # Stage 98 (v0.117.0-alpha): `where` — refinement-type
+        # predicate clause (`x: int where self > 0`). Reserved for
+        # parity with the boot lexer; grep showed the word only in
+        # comments.
+    || w == "where"
 }
 
 fn is_ident_start(c: int) -> bool {

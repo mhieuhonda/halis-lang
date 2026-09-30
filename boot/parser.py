@@ -6,6 +6,14 @@ INT64_MIN = -9223372036854775808
 
 PRIM_TYPES = ("int", "float", "bool", "str", "void")
 
+# Stage 98 (v0.117.0-alpha): the lightweight refinement fragment. A
+# refinement type is `T where <pred>` with T one of these bases and the
+# predicate a pure boolean expression over the reserved binder `self`.
+# Refinements are metadata on the declaration site (the type string
+# stays the base type), enforced by runtime guards at every slot that
+# introduces a value of the refined type (see SPEC section 52).
+REFINE_PRIMS = ("int", "float", "bool", "str")
+
 # Stage 9 (v0.20.0-alpha — Stage 9 release): fine-grained effects &
 # capabilities COMPLETE. All eight effects are now active; the reserved
 # set is empty.
@@ -141,12 +149,21 @@ BIN_LEVELS = [
 
 
 class Parser:
-    def __init__(self, toks):
+    def __init__(self, toks, src=b""):
         self.toks = toks
         self.pos = 0
+        # Stage 98: the raw source the tokens came from — used only for
+        # refinement predicate text slices (panic messages / canonical
+        # pred identity). Optional: tools that construct a Parser
+        # without source degrade to empty pred texts, which changes no
+        # semantics.
+        self.src = src
         # Stage 85: the protocols already declared on this crate, so a
         # second `#![boot_header]` can name the first one.
         self._seen_boot_headers = []
+        # Stage 98: lazily-built line-start offset table for pred text
+        # slicing (see _src_text_between).
+        self._line_offs = None
 
     # ---------- utilities ----------
     def peek(self):
@@ -728,6 +745,8 @@ class Parser:
         typeparams = self.parse_typeparams()
         self.eat_sym("{")
         fields = []  # list of (name, type, default_expr_or_None)
+        # Stage 98: per-field refinement predicates (keyed by name).
+        field_preds = {}
         # BUG-SC-8 fix: reject duplicate field names. Previously
         # `struct Foo { x: int, x: int }` was silently accepted; at
         # runtime `eval_structlit` builds a dict, so `Foo { x: 1, x: 2 }`
@@ -740,6 +759,12 @@ class Parser:
             seen_fields.add(ft["v"])
             self.eat_sym(":")
             ty = self.parse_type()
+            # Stage 98: optional field refinement (`balance: int where
+            # self >= 0`), checked at construction (the generated
+            # constructor guards every field write).
+            fref = self.parse_refinement(ty, ft)
+            if fref is not None:
+                field_preds[ft["v"]] = fref
             default = None
             if self.at_sym("="):
                 self.next()
@@ -761,6 +786,7 @@ class Parser:
                 self.err("struct field '%s' without default cannot follow a defaulted field"
                          % fname, t0)
         return {"name": name, "typeparams": typeparams, "fields": fields,
+                "field_preds": field_preds,
                 "line": t0["line"]}
 
     def parse_enum(self):
@@ -780,6 +806,7 @@ class Parser:
                 self.next()
                 while not self.at_sym(")"):
                     payloads.append(self.parse_type())
+                    self.reject_refinement("enum variant payload types")
                     if self.at_sym(","):
                         self.next()
                     elif not self.at_sym(")"):
@@ -823,6 +850,9 @@ class Parser:
         typeparams = self.parse_typeparams()
         self.eat_sym("(")
         params = []  # (name, type, mut)
+        # Stage 98: per-parameter refinement predicates (keyed by param
+        # name; only params written with a `where` clause appear).
+        param_preds = {}
         while not self.at_sym(")"):
             is_mut = False
             if self.at_kw("mut"):
@@ -831,6 +861,13 @@ class Parser:
             pn = self.eat_ident()
             self.eat_sym(":")
             pt = self.parse_type()
+            # Stage 98: optional refinement clause on the parameter type.
+            if extern:
+                self.reject_refinement("extern declarations")
+            else:
+                ref = self.parse_refinement(pt, pn)
+                if ref is not None:
+                    param_preds[pn["v"]] = ref
             params.append((pn["v"], pt, is_mut))
             if self.at_sym(","):
                 self.next()
@@ -838,9 +875,22 @@ class Parser:
                 self.err("expected ',' or ')' in parameters")
         self.eat_sym(")")
         ret = "void"
+        ret_pred = None
         if self.at_sym("->"):
             self.next()
             ret = self.parse_type(allow_void=True)
+            # Stage 98: optional refinement on the return type. `void`
+            # cannot carry one (there is no value to constrain); the
+            # primitive check inside parse_refinement already rejects
+            # non-primitive bases, so only the void case needs a word.
+            if extern:
+                self.reject_refinement("extern declarations")
+            elif ret != "void":
+                ret_pred = self.parse_refinement(ret, t0)
+                if ret_pred is not None and typeparams:
+                    self.err("refinements on the return type of a generic "
+                             "function are not supported in the lightweight "
+                             "fragment", ret_pred["where_tok"])
         # Stage 9-beta: explicit `pure` keyword for documentation/linting.
         # A function declared `pure` must have NO `uses` clause, and the
         # checker will reject it if its body transitively calls anything
@@ -902,6 +952,8 @@ class Parser:
                 "body": [], "line": t0["line"], "struct": impl_struct,
                 "extern": True,
                 "requires": contracts[0], "ensures": contracts[1],
+                # Stage 98: always empty on externs (rejected at parse).
+                "param_preds": {}, "ret_pred": None,
                 # Stage 28+29: extern fns are not allowed to carry HLS
                 # attributes (the FFI signature is the C ABI; inlining,
                 # interrupt frame layout etc. belong to the C side).
@@ -929,6 +981,8 @@ class Parser:
             "effects": effects, "pure": is_pure, "body": body, "line": t0["line"],
             "struct": impl_struct, "extern": False,
             "requires": contracts[0], "ensures": contracts[1],
+            # Stage 98: refinement predicates ({} / None when unused).
+            "param_preds": param_preds, "ret_pred": ret_pred,
             "attrs": dict(self.cur_attrs),
         }
 
@@ -968,6 +1022,63 @@ class Parser:
         return (req_expr, ens_expr)
 
     # ---------- types ----------
+    # ---------- Stage 98: refinement types ----------
+    def parse_refinement(self, base, base_tok):
+        """Parse `where <pred>` after a primitive base type. The
+        predicate is one pure boolean expression over `self` (literals,
+        arithmetic, comparisons, &&/||/!, len()/​.len()); it stops at
+        whatever terminates the enclosing position (',' ')' '=' '}' '{'
+        or a clause keyword), because none of those start an expression.
+        Returns the refinement record {text, ast, base, line}; the text
+        is the whitespace-collapsed source slice between 'where' and the
+        terminator — the canonical identity used for same-pred flow and
+        panic messages."""
+        wt = self.peek()
+        if wt["k"] != "kw" or wt["v"] != "where":
+            return None
+        self.next()
+        start = self.peek()
+        pred = self.parse_expr(allow_struct=False)
+        end = self.peek()
+        if base not in REFINE_PRIMS:
+            self.err("refinements are only supported on primitive types "
+                     "(int, float, bool, str), got '%s'" % base, wt)
+        text = " ".join(self._src_text_between(start, end).split())
+        return {"text": text, "ast": pred, "base": base,
+                "line": wt["line"], "where_tok": wt, "base_tok": base_tok}
+
+    def reject_refinement(self, where):
+        """Stage 98: a `where` clause in a position outside the
+        lightweight fragment (container elements, type arguments, enum
+        payloads, loop variables, extern declarations)."""
+        if self.at_kw("where"):
+            self.err("refinements are not supported in this position (%s); "
+                     "the lightweight fragment allows them on fn parameters, "
+                     "return types, let annotations and struct fields"
+                     % where, self.peek())
+
+    def _src_text_between(self, start, end):
+        """Source text from the start of token `start` up to (excluding)
+        the start of token `end`. Tokens carry 1-based (line, col)."""
+        if self._line_offs is None:
+            src = self.src
+            offs = [0]
+            for i, b in enumerate(src):
+                if b == 0x0A:  # \n
+                    offs.append(i + 1)
+            self._line_offs = offs
+        offs = self._line_offs
+        nlines = len(offs)
+        def _off(line, col):
+            li = min(max(line, 1), nlines) - 1
+            return offs[li] + (col - 1)
+        a = _off(start["line"], start["col"])
+        b = _off(end["line"], end["col"])
+        raw = self.src[a:b]
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", "replace")
+        return raw
+
     def parse_type(self, allow_void=False):
         t = self.peek()
         if t["k"] != "ident":
@@ -976,6 +1087,7 @@ class Parser:
         if base == "list":
             self.eat_sym("[")
             inner = self.parse_type()
+            self.reject_refinement("container element types")
             self.eat_sym("]")
             return "list[%s]" % inner
         if base == "map":
@@ -985,6 +1097,7 @@ class Parser:
                 self.err("map key in v0.3 must be 'str'", kt)
             self.eat_sym(",")
             vt = self.parse_type()
+            self.reject_refinement("map value types")
             self.eat_sym("]")
             return "map[str, %s]" % vt
         # Stage 10-alpha: `tainted[T]` — a built-in generic wrapper for
@@ -1048,6 +1161,7 @@ class Parser:
             args = []
             while not self.at_sym("]"):
                 args.append(self.parse_type())
+                self.reject_refinement("type arguments")
                 if self.at_sym(","):
                     self.next()
                 elif not self.at_sym("]"):
@@ -1148,6 +1262,7 @@ class Parser:
                 vn = self.eat_ident()
                 self.eat_sym(":")
                 vt = self.parse_type()
+                self.reject_refinement("loop variables")
                 self.eat_kw("in")
                 it = self.parse_expr(allow_struct=False)
                 body = self.parse_block()
@@ -1203,6 +1318,8 @@ class Parser:
         name = self.eat_ident()
         self.eat_sym(":")
         ty = self.parse_type()
+        # Stage 98: optional refinement on the let annotation.
+        lref = self.parse_refinement(ty, name)
         self.eat_sym("=")
         val = self.parse_expr()
         # Stage 30 (v0.47.0-alpha): let-binding layout attributes,
@@ -1211,7 +1328,8 @@ class Parser:
         # analysis decides the layout; the attrs only force a side).
         return {"k": "let", "name": name["v"], "t": ty, "mut": is_mut,
                 "value": val, "line": t0["line"],
-                "stack": False, "boxed": False}
+                "stack": False, "boxed": False,
+                "rpred": lref}
 
     # Stage 27 (v0.50.0-alpha): inline-assembly statement parser.
     # Grammar mirrors the self-hosted parser (parse_asm_stmt in

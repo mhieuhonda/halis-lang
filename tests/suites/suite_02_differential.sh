@@ -102,6 +102,56 @@ else
     bad "hlprove --infer-invariants wrong on the demo (rc=$inv_rc)"
 fi
 
+# Stage 98: refinement types. Every refined slot is guarded at runtime
+# (fn entry / return / let / assign / construction); proven sites are
+# elided. The interpreter and the native build (default AND -O fast)
+# must agree byte for byte, including the runtime-violation panics.
+for f in tests/ok/feat_stage98_*.hls; do
+    [ -f "$f" ] || continue
+    name=$(basename "$f" .hls)
+    if [ ! -x "$TMP/hlc1" ]; then
+        python3 boot/boot.py src/hlc.hls src/hlc.hls "$TMP/hlc_nat.c" >/dev/null 2>&1
+        gcc -O2 -o "$TMP/hlc1" "$TMP/hlc_nat.c" -lm -pthread 2>/dev/null
+    fi
+    interp_out=$(timeout 60 python3 boot/boot.py "$f" </dev/null 2>/dev/null); interp_rc=$?
+    if "$TMP/hlc1" "$f" "$TMP/$name.c" >/dev/null 2>&1 \
+            && gcc -O2 -o "$TMP/$name.bin" "$TMP/$name.c" -lm -pthread 2>/dev/null; then
+        nat_out=$(timeout 60 "$TMP/$name.bin" </dev/null 2>/dev/null); nat_rc=$?
+        if [ "$interp_out" == "$nat_out" ] && [ "$interp_rc" == "$nat_rc" ]; then
+            ok "$name (native matches interpreter)"
+        else
+            bad "$name (diverges: interp=$interp_rc nat=$nat_rc)"
+        fi
+    else
+        bad "$name (native compile failed)"
+    fi
+    if "$TMP/hlc1" --fast "$f" "$TMP/$name.fast.c" >/dev/null 2>&1 \
+            && gcc -O2 -o "$TMP/$name.fast.bin" "$TMP/$name.fast.c" -lm -pthread 2>/dev/null; then
+        fast_out=$(timeout 60 "$TMP/$name.fast.bin" </dev/null 2>/dev/null); fast_rc=$?
+        if [ "$interp_out" == "$fast_out" ] && [ "$interp_rc" == "$fast_rc" ]; then
+            ok "$name (-O fast matches interpreter)"
+        else
+            bad "$name (-O fast diverges: interp=$interp_rc fast=$fast_rc)"
+        fi
+    else
+        bad "$name (fast compile failed)"
+    fi
+done
+# The refinements must compose into a proof: ratio()'s division (a
+# non-negative dividend, a non-zero divisor) has its panic check
+# elided under -O fast, while every runtime guard stays.
+if "$TMP/hlc1" --fast examples/refine_demo.hls "$TMP/refdem.c" >/dev/null 2>&1; then
+    if grep -q "return (u_num / u_den);" "$TMP/refdem.c" \
+       && grep -q "refinement violation: parameter 'amount' of 'apply'" "$TMP/refdem.c" \
+       && grep -q "refinement violation: field 'Ledger.funds'" "$TMP/refdem.c"; then
+        ok "refine_demo: proven division elided, runtime guards kept (-O fast)"
+    else
+        bad "refine_demo: elision pattern wrong in -O fast C"
+    fi
+else
+    bad "refine_demo: -O fast compile failed"
+fi
+
 # hlmodel must exhaustively check the demo state machine.
 if python3 tools/hlmodel.py examples/conn_machine.hls --fn step --invariant all_valid --init Closed >/dev/null 2>&1; then
     ok "hlmodel exhaustive check of the demo state machine"

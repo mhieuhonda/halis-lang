@@ -149,6 +149,19 @@ class InterpCore(object):
                 call_args = args
             for (pn, _, _), v in zip_strict(params, call_args):
                 env[0][pn] = [v, False, False]
+            # Stage 98: refinement guards on refined parameters — the
+            # callee-side boundary of the type invariant. Evaluated
+            # unconditionally (refinements are always-on semantics,
+            # unlike --contracts); the native compiler emits the same
+            # guards at fn entry.
+            fn_preds = fn.get("param_preds") or {}
+            if fn_preds:
+                for (pn, _, _), _v in zip_strict(params, call_args):
+                    ref = fn_preds.get(pn)
+                    if ref is not None:
+                        self.check_refine(
+                            ref, env[0][pn][0],
+                            "parameter '%s' of '%s'" % (pn, key))
             # Stage 17: runtime `requires` assertion (enabled by --contracts).
             if self.contracts and fn.get("requires") is not None:
                 if not self._truthy(self.eval_expr(fn["requires"], env)):
@@ -185,6 +198,14 @@ class InterpCore(object):
                         raise HLPanic("contract violation: ensures of '%s' "
                                       "(function postcondition failed at "
                                       "runtime)" % fn["name"], self.line) from None
+                # Stage 98: return-side refinement guard — the caller
+                # may rely on the declared invariant of the refined
+                # return type.
+                fn_retpred = fn.get("ret_pred")
+                if fn_retpred is not None:
+                    self.check_refine(
+                        fn_retpred, r.value,
+                        "return value of '%s'" % key)
                 return r.value
             finally:
                 # Deep-scan-15 fix (LOW severity / defensive): the prior
@@ -209,4 +230,18 @@ class InterpCore(object):
     @staticmethod
     def _truthy(v):
         return bool(v)
+
+    # ---------- Stage 98 (v0.117.0-alpha): refinement guards ----------
+    def check_refine(self, ref, val, what):
+        """Evaluate a refinement predicate on a value; violation is a
+        clean panic (exit 101), same discipline as contract checks. The
+        predicate is evaluated in a synthetic frame whose ONLY binding
+        is `self` (the guarded value) — predicates cannot reference
+        anything else, so this cannot observe or clobber the caller's
+        environment."""
+        env = [{"self": [val, False, False]}]
+        if not self._truthy(self.eval_expr(ref["ast"], env)):
+            raise HLPanic(
+                "refinement violation: %s must satisfy '%s'"
+                % (what, ref["text"]), self.line)
 

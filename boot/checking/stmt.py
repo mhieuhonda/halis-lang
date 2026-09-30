@@ -123,7 +123,20 @@ class CheckerStmt(object):
             if vt != s["t"]:
                 self.err("type mismatch: declared %s but got %s"
                          % (s["t"], vt), s)
-            env[-1][s["name"]] = [s["t"], s["mut"], False]
+            # Stage 98: a refined let — validate the predicate (cached),
+            # hold constant values to it at compile time, and carry the
+            # refinement on the binding cell so assignment guards can
+            # read it. The interpreter evaluates the runtime guard from
+            # the node's "rpred" (parser-attached) unconditionally.
+            lref = s.get("rpred")
+            if lref is not None:
+                self.validate_refinement(s["t"], lref,
+                                         "of variable '%s'" % s["name"])
+                self.refine_const_check(lref, s["value"],
+                                        "variable '%s'" % s["name"], s)
+                env[-1][s["name"]] = [s["t"], s["mut"], False, lref]
+            else:
+                env[-1][s["name"]] = [s["t"], s["mut"], False]
         elif k == "assign":
             self.check_assign(s, env)
         elif k == "if":
@@ -335,6 +348,14 @@ class CheckerStmt(object):
                 if vt != fn["ret"] and vt != "never":
                     self.err("return type mismatch: expected %s, got %s"
                              % (fn["ret"], vt), s)
+                # Stage 98: a refined return type — constant return
+                # values are held to the predicate at compile time;
+                # runtime values are guarded at the return boundary by
+                # the interpreter / native codegen (fn["ret_pred"]).
+                rref = fn.get("ret_pred")
+                if rref is not None and vt != "never":
+                    self.refine_const_check(rref, s["value"],
+                                            "return value of '%s'" % fn["name"], s)
         elif k == "break":
             if not in_loop:
                 self.err("break only allowed inside a loop", s)
@@ -852,6 +873,25 @@ class CheckerStmt(object):
             return
         if vt != tt:
             self.err("type mismatch on assignment: expected %s, got %s" % (tt, vt), s)
+        # Stage 98: writes into refined slots are guarded. For ident
+        # targets the refinement rides on the binding cell; for field
+        # targets it is declared on the struct field. The refinement is
+        # attached to the node ("rpred") so the interpreter evaluates
+        # the runtime guard; constant values are checked right here.
+        rp = None
+        rp_what = None
+        if tgt["k"] == "ident":
+            rp = self.cell_pred(binding)
+            rp_what = "variable '%s'" % root["name"]
+        elif tgt["k"] == "field":
+            resolved = self.resolve_struct(tgt["target"].get("t", ""))
+            if resolved is not None:
+                rp = resolved[0].get("field_preds", {}).get(tgt["name"])
+                rp_what = "field '%s.%s'" % (resolved[0]["name"], tgt["name"])
+        if rp is not None:
+            self.refine_const_check(rp, s["value"], rp_what, s)
+            s["rpred"] = rp
+            s["rp_what"] = rp_what
         # Stage 8-alpha: revive the binding (clear moved) on whole-binding
         # assignment. The binding now owns a fresh value.
         if tgt["k"] == "ident":

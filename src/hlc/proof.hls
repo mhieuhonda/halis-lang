@@ -973,7 +973,21 @@ facts_lenhi: map[str, str], nz: map[str, bool], depth: int) -> void {
         if s.kind == "let" {
             invalidate_value_facts(nz, facts_lenhi, s.name)
             if s.vtype == "int" {
-                facts.set(s.name, expr_interval(ctx, s.value, facts, 0))
+                let riv: IVal = expr_interval(ctx, s.value, facts, 0)
+                # Stage 98: interval-proven refinement elision. The
+                # guard is skipped only when the pred holds over the
+                # whole value interval; afterwards the target's facts
+                # tighten to the post-guard interval (sound: execution
+                # only reaches past the guard when the pred held).
+                if s.rpred != "" && !ctx.stmts.get(stmts.get(si)).rp_elided {
+                    if refine_pred_proves(ctx, s.rpred_e, riv) {
+                        ctx.stmts[stmts.get(si)].rp_elided = true
+                    }
+                    facts.set(s.name, refine_pred_interval(ctx, s.rpred_e, riv))
+                    seed_refine_nz(ctx, s.rpred_e, s.name, nz)
+                } else {
+                    facts.set(s.name, riv)
+                }
             }
         }
         if s.kind == "assign" && s.target >= 0 {
@@ -981,8 +995,25 @@ facts_lenhi: map[str, str], nz: map[str, bool], depth: int) -> void {
             if tgt2.kind == "ident" {
                 invalidate_value_facts(nz, facts_lenhi, tgt2.name)
                 if tgt2.t == "int" {
-                    facts.set(tgt2.name, expr_interval(ctx, s.value, facts, 0))
+                    let aiv: IVal = expr_interval(ctx, s.value, facts, 0)
+                    if s.rpred != "" && !ctx.stmts.get(stmts.get(si)).rp_elided {
+                        if refine_pred_proves(ctx, s.rpred_e, aiv) {
+                            ctx.stmts[stmts.get(si)].rp_elided = true
+                        }
+                        facts.set(tgt2.name, refine_pred_interval(ctx, s.rpred_e, aiv))
+                        seed_refine_nz(ctx, s.rpred_e, tgt2.name, nz)
+                    } else {
+                        facts.set(tgt2.name, aiv)
+                    }
                 }
+            }
+        }
+        if s.kind == "return" && s.rpred != "" && s.value >= 0
+        && !ctx.stmts.get(stmts.get(si)).rp_elided {
+            # Stage 98: interval-proven return refinement.
+            let rviv: IVal = expr_interval(ctx, s.value, facts, 0)
+            if refine_pred_proves(ctx, s.rpred_e, rviv) {
+                ctx.stmts[stmts.get(si)].rp_elided = true
             }
         }
         if s.kind == "if" {
@@ -1000,6 +1031,31 @@ facts_lenhi: map[str, str], nz: map[str, bool], depth: int) -> void {
             join_nz(nz, nz_then, nz_else)
         }
         si = si + 1
+    }
+}
+
+# seed_refine_nz: after a refinement guard, a `self != 0` conjunct is
+# a runtime fact about the guarded variable.
+fn seed_refine_nz(ctx: Ctx, e: int, name: str, nz: map[str, bool]) -> void {
+    if e < 0 {
+        return
+    }
+    let n: ExprN = ctx.exprs[e]
+    if n.kind == "bin" && (n.op == "&&" || n.op == "||") {
+        seed_refine_nz(ctx, n.left, name, nz)
+        seed_refine_nz(ctx, n.right, name, nz)
+        return
+    }
+    if n.kind != "bin" || n.op != "!=" {
+        return
+    }
+    let ln: ExprN = ctx.exprs[n.left]
+    let rn: ExprN = ctx.exprs[n.right]
+    if ln.kind == "int" && ln.ival == 0 && rn.kind == "ident" && rn.name == "self" {
+        nz.set(name, true)
+    }
+    if rn.kind == "int" && rn.ival == 0 && ln.kind == "ident" && ln.name == "self" {
+        nz.set(name, true)
     }
 }
 
@@ -1257,7 +1313,7 @@ fn check_contracts_hlc(ctx: Ctx, key: str, f: FnInfo) -> void {
     let mut i: int = 0
     while i < f.params.len() {
         scope.set(f.params.get(i), Binding {
-            t: f.ptypes.get(i), is_mut: false, moved: false
+            t: f.ptypes.get(i), is_mut: false, moved: false, rpred: ""
         })
         i = i + 1
     }
@@ -1274,7 +1330,7 @@ fn check_contracts_hlc(ctx: Ctx, key: str, f: FnInfo) -> void {
             cerr(f.line, "ensures clause on void function '" + f.name + "' (there is no result)")
         }
         env[0].set("result", Binding {
-            t: f.ret, is_mut: false, moved: false
+            t: f.ret, is_mut: false, moved: false, rpred: ""
         })
         let t2: str = check_expr(ctx, env, key, f.ensures_e, "")
         if t2 != "bool" && t2 != "never" {
@@ -1287,15 +1343,286 @@ fn check_contracts_hlc(ctx: Ctx, key: str, f: FnInfo) -> void {
 # run_proof_pass_hlc: seed interval facts from the (validated) requires
 # clause and annotate the body's provably-safe operations. Runs AFTER
 # the body was checked — the annotations read ctx.exprs[e].t.
+# has_body_refinements: does any statement in the body carry a
+# refinement guard (a refined let / assign / return)? Signature-only
+# flags miss these — a plain fn can still refine its locals.
+fn has_body_refinements(ctx: Ctx, stmts: list[int], depth: int) -> bool {
+    if depth > 32 {
+        return false
+    }
+    let mut i: int = 0
+    while i < stmts.len() {
+        let s: StmtN = ctx.stmts.get(stmts.get(i))
+        if s.rpred != "" {
+            return true
+        }
+        if s.kind == "if" || s.kind == "while" {
+            if has_body_refinements(ctx, s.body, depth + 1) {
+                return true
+            }
+            if has_body_refinements(ctx, s.else_body, depth + 1) {
+                return true
+            }
+        }
+        if s.kind == "for" {
+            if has_body_refinements(ctx, s.body, depth + 1) {
+                return true
+            }
+        }
+        i = i + 1
+    }
+    return false
+}
+
 fn run_proof_pass_hlc(ctx: Ctx, f: FnInfo) -> void {
-    if f.requires_e < 0 || f.is_extern {
+    # Stage 98: refined parameters seed facts too — the pass runs for
+    # any fn that carries refinements (signature OR body), not only
+    # contracted ones.
+    if (f.requires_e < 0 && !f.has_refinements
+    && !has_body_refinements(ctx, f.body, 0)) || f.is_extern {
         return
     }
     let facts: map[str, IVal] = map_new()
     let facts_lenhi: map[str, str] = map_new()
     let nz: map[str, bool] = map_new()
-    seed_from_requires(ctx, f.requires_e, f, facts, facts_lenhi, nz)
+    if f.requires_e >= 0 {
+        seed_from_requires(ctx, f.requires_e, f, facts, facts_lenhi, nz)
+    }
+    # Stage 98: seed facts from parameter refinements (`d: int where
+    # self != 0` proves div_safe inside the body, exactly like
+    # `requires d != 0`). Each pred talks about its own binder, so the
+    # conjuncts seed under the PARAMETER name directly.
+    let mut pi: int = 0
+    while pi < f.params.len() {
+        let pn: str = f.params.get(pi)
+        if f.param_preds.has(pn) {
+            let text: str = f.param_preds.get_or(pn, "")
+            let pe: int = ctx.rpreds.get_or(text, -1)
+            if pe >= 0 && f.ptypes.get(pi) == "int" {
+                seed_from_pred(ctx, pe, pn, facts, nz)
+            }
+        }
+        pi = pi + 1
+    }
     annotate_stmts(ctx, f.body, facts, facts_lenhi, nz, 0)
+}
+
+# seed_from_pred: extract interval / non-zero facts from one
+# refinement predicate conjunct tree, keyed under `name` (the binder
+# `self` renamed to the refined variable).
+fn seed_from_pred(ctx: Ctx, e: int, name: str, facts: map[str, IVal],
+nz: map[str, bool]) -> void {
+    if e < 0 {
+        return
+    }
+    let node: ExprN = ctx.exprs[e]
+    if node.kind == "bin" && node.op == "&&" {
+        seed_from_pred(ctx, node.left, name, facts, nz)
+        seed_from_pred(ctx, node.right, name, facts, nz)
+        return
+    }
+    if node.kind != "bin" {
+        return
+    }
+    let ln: ExprN = ctx.exprs[node.left]
+    let rn: ExprN = ctx.exprs[node.right]
+    # self != 0 FIRST (both orders): seed_bound cannot express a hole
+    # in the interval, so the non-zero fact lives in the nz map.
+    if node.op == "!=" && ln.kind == "int" && ln.ival == 0
+    && rn.kind == "ident" && rn.name == "self" {
+        nz.set(name, true)
+        return
+    }
+    if node.op == "!=" && rn.kind == "int" && rn.ival == 0
+    && ln.kind == "ident" && ln.name == "self" {
+        nz.set(name, true)
+        return
+    }
+    # self OP int-literal (both orders)
+    if ln.kind == "ident" && ln.name == "self" && rn.kind == "int" {
+        seed_bound(facts, name, node.op, rn.ival, true)
+        return
+    }
+    if rn.kind == "ident" && rn.name == "self" && ln.kind == "int" {
+        seed_bound(facts, name, node.op, ln.ival, false)
+        return
+    }
+}
+
+# refine_pred_proves: does the predicate provably hold over the
+# interval `iv`? Conjunctive recognized shapes only; disjunctions
+# prove when EITHER side proves; anything unrecognized is false
+# (conservative — the guard stays).
+fn refine_pred_proves(ctx: Ctx, e: int, iv: IVal) -> bool {
+    if e < 0 {
+        return false
+    }
+    let n: ExprN = ctx.exprs[e]
+    if n.kind == "bin" && n.op == "&&" {
+        return refine_pred_proves(ctx, n.left, iv)
+        && refine_pred_proves(ctx, n.right, iv)
+    }
+    if n.kind == "bin" && n.op == "||" {
+        return refine_pred_proves(ctx, n.left, iv)
+        || refine_pred_proves(ctx, n.right, iv)
+    }
+    if n.kind != "bin" {
+        return false
+    }
+    let ln: ExprN = ctx.exprs[n.left]
+    let rn: ExprN = ctx.exprs[n.right]
+    let mut op: str = n.op
+    let mut k: int = 0
+    if ln.kind == "ident" && ln.name == "self" && rn.kind == "int" {
+        k = rn.ival
+    } else if rn.kind == "ident" && rn.name == "self" && ln.kind == "int" {
+        k = ln.ival
+        # mirror the comparison
+        if op == "<" {
+            op = ">"
+        } else if op == ">" {
+            op = "<"
+        } else if op == "<=" {
+            op = ">="
+        } else if op == ">=" {
+            op = "<="
+        } else {
+            return false
+        }
+    } else {
+        return false
+    }
+    if op == ">" {
+        return iv.lo != INF_LO() && iv.lo > k
+    }
+    if op == ">=" {
+        return iv.lo != INF_LO() && iv.lo >= k
+    }
+    if op == "<" {
+        return iv.hi != INF_HI() && iv.hi < k
+    }
+    if op == "<=" {
+        return iv.hi != INF_HI() && iv.hi <= k
+    }
+    if op == "==" {
+        return iv.lo == k && iv.hi == k
+    }
+    if op == "!=" {
+        return (iv.hi != INF_HI() && iv.hi < k) || (iv.lo != INF_LO() && iv.lo > k)
+    }
+    return false
+}
+
+# refine_pred_interval: the post-guard interval — the pred is enforced
+# at runtime, so AFTER the guard the value lies in the intersection of
+# the computed interval and every recognized bound.
+fn refine_pred_interval(ctx: Ctx, e: int, iv: IVal) -> IVal {
+    if e < 0 {
+        return iv
+    }
+    let n: ExprN = ctx.exprs[e]
+    if n.kind == "bin" && (n.op == "&&" || n.op == "||") {
+        let l: IVal = refine_pred_interval(ctx, n.left, iv)
+        let r: IVal = refine_pred_interval(ctx, n.right, iv)
+        if n.op == "&&" {
+            return IVal { lo: iv_max_lo(l.lo, r.lo), hi: iv_min_hi(l.hi, r.hi) }
+        }
+        # disjunction: a value satisfying either side — union
+        return IVal { lo: iv_min_lo(l.lo, r.lo), hi: iv_max_hi(l.hi, r.hi) }
+    }
+    if n.kind != "bin" {
+        return iv
+    }
+    let ln: ExprN = ctx.exprs[n.left]
+    let rn: ExprN = ctx.exprs[n.right]
+    let mut op: str = n.op
+    let mut k: int = 0
+    if ln.kind == "ident" && ln.name == "self" && rn.kind == "int" {
+        k = rn.ival
+    } else if rn.kind == "ident" && rn.name == "self" && ln.kind == "int" {
+        k = ln.ival
+        if op == "<" {
+            op = ">"
+        } else if op == ">" {
+            op = "<"
+        } else if op == "<=" {
+            op = ">="
+        } else if op == ">=" {
+            op = "<="
+        } else {
+            return iv
+        }
+    } else {
+        return iv
+    }
+    if op == ">" {
+        return IVal { lo: iv_max_lo(iv.lo, k + 1), hi: iv.hi }
+    }
+    if op == ">=" {
+        return IVal { lo: iv_max_lo(iv.lo, k), hi: iv.hi }
+    }
+    if op == "<" {
+        return IVal { lo: iv.lo, hi: iv_min_hi(iv.hi, k - 1) }
+    }
+    if op == "<=" {
+        return IVal { lo: iv.lo, hi: iv_min_hi(iv.hi, k) }
+    }
+    if op == "==" {
+        return IVal { lo: k, hi: k }
+    }
+    return iv
+}
+
+fn iv_max_lo(a: int, b: int) -> int {
+    if a == INF_LO() {
+        return b
+    }
+    if b == INF_LO() {
+        return a
+    }
+    if a > b {
+        return a
+    }
+    return b
+}
+
+fn iv_min_lo(a: int, b: int) -> int {
+    if a == INF_LO() {
+        return b
+    }
+    if b == INF_LO() {
+        return a
+    }
+    if a < b {
+        return a
+    }
+    return b
+}
+
+fn iv_max_hi(a: int, b: int) -> int {
+    if a == INF_HI() {
+        return b
+    }
+    if b == INF_HI() {
+        return a
+    }
+    if a > b {
+        return a
+    }
+    return b
+}
+
+fn iv_min_hi(a: int, b: int) -> int {
+    if a == INF_HI() {
+        return b
+    }
+    if b == INF_HI() {
+        return a
+    }
+    if a < b {
+        return a
+    }
+    return b
 }
 
 # check_contract_purity_hlc: contract expressions may not call anything

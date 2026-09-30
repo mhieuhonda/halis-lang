@@ -27,12 +27,15 @@ fn check_fn_body(ctx: Ctx, key: str) -> void {
     let scope0: map[str, Binding] = map_new()
     if f.is_method {
         scope0.set(f.params.get(0), Binding {
-            t: f.ptypes.get(0), is_mut: f.pmuts.get(0), moved: false
+            t: f.ptypes.get(0), is_mut: f.pmuts.get(0), moved: false, rpred: ""
         })
         let mut i: int = 1
         while i < f.params.len() {
             scope0.set(f.params.get(i), Binding {
-                t: f.ptypes.get(i), is_mut: f.pmuts.get(i), moved: false
+                t: f.ptypes.get(i), is_mut: f.pmuts.get(i), moved: false,
+                # Stage 98: the parameter's refinement rides on the
+                # binding (assignment guards + same-pred flow elision).
+                rpred: f.param_preds.get_or(f.params.get(i), "")
             })
             i = i + 1
         }
@@ -44,7 +47,8 @@ fn check_fn_body(ctx: Ctx, key: str) -> void {
                 cerr(f.line, "duplicate parameter name: " + pn)
             }
             scope0.set(pn, Binding {
-                t: f.ptypes.get(i), is_mut: f.pmuts.get(i), moved: false
+                t: f.ptypes.get(i), is_mut: f.pmuts.get(i), moved: false,
+                rpred: f.param_preds.get_or(pn, "")
             })
             i = i + 1
         }
@@ -198,18 +202,39 @@ fn check_stmt(ctx: Ctx, env: list[map[str, Binding]], cur: str, f: FnInfo, sidx:
         if vt == "never" {
             # `let x: T = panic()` is sound: x is unreachable.
             env.get(env.len() - 1).set(s.name, Binding {
-                t: s.vtype, is_mut: s.is_mut, moved: false
+                t: s.vtype, is_mut: s.is_mut, moved: false, rpred: ""
             })
             return
         }
         if vt != s.vtype {
             cerr(s.line, "type mismatch: declared " + s.vtype + " but got " + vt)
         }
+        # Stage 98: a refined let - validate (cached), hold constant
+        # values to the predicate, elide when PROVEN (constant value,
+        # or same-pred flow from an ident binding), and carry the
+        # refinement on the binding for assignment guards.
+        let mut lrpred: str = ""
+        if s.rpred != "" {
+            validate_refinement_hlc(ctx, s.vtype, s.rpred,
+                "of variable '" + s.name + "'", s.line)
+            let proven: bool = refine_const_check_hlc(ctx, s.rpred, s.value,
+                "variable '" + s.name + "'", s.line)
+            if !proven && ctx.exprs[s.value].kind == "ident" {
+                let vb: Binding = lookup_binding(env, ctx.exprs[s.value].name)
+                if vb.rpred == s.rpred {
+                    ctx.stmts[sidx].rp_elided = true
+                }
+            }
+            if proven {
+                ctx.stmts[sidx].rp_elided = true
+            }
+            lrpred = s.rpred
+        }
         env.get(env.len() - 1).set(s.name, Binding {
-            t: s.vtype, is_mut: s.is_mut, moved: false
+            t: s.vtype, is_mut: s.is_mut, moved: false, rpred: lrpred
         })
     } else if s.kind == "assign" {
-        check_assign(ctx, env, cur, s)
+        check_assign(ctx, env, cur, sidx)
     } else if s.kind == "if" {
         let ct: str = check_expr(ctx, env, cur, s.cond, "")
         # Deep-scan-30 fix (boot parity): a condition of type `never`
@@ -357,7 +382,7 @@ fn check_stmt(ctx: Ctx, env: list[map[str, Binding]], cur: str, f: FnInfo, sidx:
             cerr(s.line, "cannot shadow outer variable with the loop variable: " + s.name)
         }
         env.get(env.len() - 1).set(s.name, Binding {
-            t: elem, is_mut: false, moved: false
+            t: elem, is_mut: false, moved: false, rpred: ""
         })
         check_stmts(ctx, env, cur, f, s.body, true)
         env.pop()
@@ -370,7 +395,7 @@ fn check_stmt(ctx: Ctx, env: list[map[str, Binding]], cur: str, f: FnInfo, sidx:
                 let before: list[str] = snapshot_moved(env)
                 env.push(map_new())
                 env.get(env.len() - 1).set(s.name, Binding {
-                    t: elem, is_mut: false, moved: false
+                    t: elem, is_mut: false, moved: false, rpred: ""
                 })
                 check_stmts(ctx, env, cur, f, s.body, true)
                 env.pop()
@@ -398,6 +423,26 @@ fn check_stmt(ctx: Ctx, env: list[map[str, Binding]], cur: str, f: FnInfo, sidx:
             let vt: str = check_expr(ctx, env, cur, s.value, f.ret)
             if vt != f.ret && vt != "never" {
                 cerr(s.line, "return type mismatch: expected " + f.ret + ", got " + vt)
+            }
+            # Stage 98: a refined return type - constant return values
+            # are held to the predicate at compile time; runtime values
+            # are guarded at the return boundary (rpred stamped here,
+            # elided when PROVEN: constant, same-pred flow, or the
+            # interval pass marking it later).
+            if f.ret_pred != "" && vt != "never" {
+                let rproven: bool = refine_const_check_hlc(ctx, f.ret_pred, s.value,
+                    "return value of '" + f.name + "'", s.line)
+                if !rproven && ctx.exprs[s.value].kind == "ident" {
+                    let rb: Binding = lookup_binding(env, ctx.exprs[s.value].name)
+                    if rb.rpred == f.ret_pred {
+                        ctx.stmts[sidx].rp_elided = true
+                    }
+                }
+                if rproven {
+                    ctx.stmts[sidx].rp_elided = true
+                }
+                ctx.stmts[sidx].rpred = f.ret_pred
+                ctx.stmts[sidx].rpred_e = ctx.rpreds.get_or(f.ret_pred, -1)
             }
         }
     } else if s.kind == "break" {
@@ -1293,7 +1338,8 @@ fn list_contains_str(xs: list[str], v: str) -> bool {
     return false
 }
 
-fn check_assign(ctx: Ctx, env: list[map[str, Binding]], cur: str, s: StmtN) -> void {
+fn check_assign(ctx: Ctx, env: list[map[str, Binding]], cur: str, sidx: int) -> void {
+    let s: StmtN = ctx.stmts[sidx]
     let tgt: int = s.target
     let mut root: int = tgt
     while ctx.exprs[root].kind == "field" || ctx.exprs[root].kind == "index" {
@@ -1328,6 +1374,40 @@ fn check_assign(ctx: Ctx, env: list[map[str, Binding]], cur: str, s: StmtN) -> v
     }
     if vt != tt {
         cerr(s.line, "type mismatch on assignment: expected " + tt + ", got " + vt)
+    }
+    # Stage 98: writes into refined slots are guarded. Ident targets
+    # read the binding's refinement; field targets the struct field's.
+    # The refinement is stamped on the statement (rpred/rpred_e) so the
+    # codegen emits the guard; PROVEN writes (constant value,
+    # same-pred flow) are marked rp_elided instead.
+    let mut rp: str = ""
+    let mut rp_what: str = ""
+    if ctx.exprs[tgt].kind == "ident" {
+        if b.rpred != "" {
+            rp = b.rpred
+            rp_what = "variable '" + ctx.exprs[root].name + "'"
+        }
+    } else if ctx.exprs[tgt].kind == "field" {
+        let bt2: str = ctx.exprs[ctx.exprs[tgt].left].t
+        let st2: StructInfo = resolve_struct(ctx, bt2)
+        if st2.name != "" && st2.field_preds.has(ctx.exprs[tgt].name) {
+            rp = st2.field_preds.get_or(ctx.exprs[tgt].name, "")
+            rp_what = "field '" + st2.name + "." + ctx.exprs[tgt].name + "'"
+        }
+    }
+    if rp != "" {
+        let proven2: bool = refine_const_check_hlc(ctx, rp, s.value, rp_what, s.line)
+        if !proven2 && ctx.exprs[s.value].kind == "ident" {
+            let vb2: Binding = lookup_binding(env, ctx.exprs[s.value].name)
+            if vb2.rpred == rp {
+                ctx.stmts[sidx].rp_elided = true
+            }
+        }
+        if proven2 {
+            ctx.stmts[sidx].rp_elided = true
+        }
+        ctx.stmts[sidx].rpred = rp
+        ctx.stmts[sidx].rpred_e = ctx.rpreds.get_or(rp, -1)
     }
     # Stage 8-alpha: revive the binding on whole-binding assignment.
     if ctx.exprs[tgt].kind == "ident" {
@@ -1710,6 +1790,15 @@ fn check_structlit(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, exp
         if vt != inst_ftype {
             cerr(line, "field type " + st.fields.get(fi) + " mismatch: expected " + inst_ftype + ", got " + vt)
         }
+        # Stage 98: constant field values are held to the field's
+        # refinement at the literal site (the runtime guard for all
+        # values lives in the generated constructor).
+        if st.field_preds.has(st.fields.get(fi)) && vt != "never" {
+            refine_const_check_hlc(ctx,
+                st.field_preds.get_or(st.fields.get(fi), ""),
+                ctx.exprs[e].args.get(fi),
+                "field '" + name + "." + st.fields.get(fi) + "'", line)
+        }
         # If generic, try to infer type args from provided field values.
         if typeparams.len() > 0 {
             unify_into(ctx, decl_ftype, vt, typeparams, targs)
@@ -1952,6 +2041,16 @@ fn check_call(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, expected
             }
             if at != inst_pt {
                 cerr(line, "argument '" + f.params.get(i) + "' of " + name + " expects " + inst_pt + ", got " + at)
+            }
+            # Stage 98: call-site refinement checking - a CONSTANT
+            # argument is evaluated against the parameter's refinement
+            # right here (provably-false refinement = compile error;
+            # non-const values defer to the runtime entry guard).
+            if !f.is_extern && f.param_preds.has(f.params.get(i)) && at != "never" {
+                refine_const_check_hlc(ctx,
+                    f.param_preds.get_or(f.params.get(i), ""),
+                    ctx.exprs[e].args.get(i),
+                    "argument '" + f.params.get(i) + "' of '" + name + "'", line)
             }
             i = i + 1
         }

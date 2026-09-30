@@ -16,7 +16,14 @@ class InterpExec(object):
         self.line = s.get("line", 0)
         k = s["k"]
         if k == "let":
-            env[-1][s["name"]] = [self.eval_expr(s["value"], env), s["mut"], False]
+            val = self.eval_expr(s["value"], env)
+            # Stage 98: runtime refinement guard on the binding (the
+            # parser attached "rpred"; the checker validated the
+            # predicate and already rejected constant violations).
+            lref = s.get("rpred")
+            if lref is not None:
+                self.check_refine(lref, val, "variable '%s'" % s["name"])
+            env[-1][s["name"]] = [val, s["mut"], False]
         elif k == "assign":
             self.exec_assign(s, env)
         elif k == "if":
@@ -121,6 +128,14 @@ class InterpExec(object):
 
     def exec_assign(self, s, env):
         val = self.eval_expr(s["value"], env)
+        # Stage 98: runtime refinement guard on writes into refined
+        # slots ("rpred" is attached by the checker — ident targets
+        # read the binding's refinement, field targets the struct
+        # field's). Elided sites (never attached) skip the guard.
+        sref = s.get("rpred")
+        if sref is not None:
+            self.check_refine(sref, val,
+                              s.get("rp_what") or "the assigned value")
         t = s["target"]
         if t["k"] == "ident":
             for scope in reversed(env):
@@ -233,6 +248,7 @@ class InterpExec(object):
         # definition.
         st = self.structs[name]
         decl_fields = st["fields"]  # [(name, type, default_expr_or_None)]
+        field_preds = st.get("field_preds") or {}
         result = {}
         # Map provided field names → values.
         provided = {}
@@ -241,14 +257,23 @@ class InterpExec(object):
         # Iterate declared fields in order; use provided value or default.
         for fname, ftype, fdefault in decl_fields:
             if fname in provided:
-                result[fname] = provided[fname]
+                val = provided[fname]
             elif fdefault is not None:
                 # Evaluate default expression in the calling environment.
-                result[fname] = self.eval_expr(fdefault, env)
+                val = self.eval_expr(fdefault, env)
             else:
                 # Should have been caught by the checker.
                 raise HLPanic("struct literal missing required field: %s" % fname,
                               self.line)
+            # Stage 98: construction-time refinement guard — EVERY value
+            # entering a refined field (provided or defaulted) passes
+            # the predicate here; the native compiler emits the same
+            # guard inside the generated constructor.
+            fref = field_preds.get(fname)
+            if fref is not None:
+                self.check_refine(fref, val,
+                                  "field '%s.%s'" % (name, fname))
+            result[fname] = val
         return result
 
     def eval_enumlit(self, e, env):

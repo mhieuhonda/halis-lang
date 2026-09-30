@@ -99,6 +99,10 @@ invariant-acceptance: $(BIN)/hlc
 	@echo "[Stage 97 acceptance] running tests/invariant_acceptance.py..."
 	@$(PYTHON) tests/invariant_acceptance.py
 
+refine-acceptance: $(BIN)/hlc
+	@echo "[Stage 98 acceptance] running tests/refine_acceptance.py..."
+	@$(PYTHON) tests/refine_acceptance.py
+
 # Run the example programs to verify they still work after a change
 examples:
 	@# Most examples exit 0; secure_demo.hls deliberately panics on
@@ -118,7 +122,7 @@ examples:
 		   examples/conc_demo.hls examples/actor_demo.hls \
 		   examples/bounded_chan_demo.hls examples/conc_pipeline.hls \
 		   examples/par_scan.hls examples/hmac_proven.hls \
-		   examples/proof_demo.hls \
+		   examples/proof_demo.hls examples/refine_demo.hls \
 		   examples/conn_machine.hls examples/bits_demo.hls \
 		   examples/set_demo.hls; do \
 		 echo "--- $$f"; $(PYTHON) boot/boot.py $$f || exit 1; \

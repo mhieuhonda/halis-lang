@@ -22,6 +22,13 @@ KEYWORDS = {
     # existing single-char `!` sym (the unary-not operator) — no new
     # lexer symbol is needed.
     "asm",
+    # Stage 98 (v0.117.0-alpha): `where` — refinement-type predicate
+    # clause (`x: int where self > 0`, `-> int where self != 0`). The
+    # predicate is a pure boolean expression over the reserved binder
+    # `self` (see SPEC section 52). A grep over src/, std/, tools/,
+    # boot/ and examples/ shows `where` only ever appeared inside
+    # comments, so reserving it breaks no program.
+    "where",
 }
 
 # BUG-29 fix: reserved identifiers (per SPEC.md section 2.5). These are

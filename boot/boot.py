@@ -159,7 +159,7 @@ def load_program(entry_path):
         # BUG-20 fix: removed the redundant `except HLError: raise` block —
         # catching an exception only to re-raise it unchanged is a no-op.
         toks = tokenize(src)
-        program = Parser(toks).parse_program()
+        program = Parser(toks, src).parse_program()
         # Resolve transitive imports first
         for imp in program["imports"]:
             resolved = _resolve_import(imp["path"], abs_path)

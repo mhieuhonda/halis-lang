@@ -143,6 +143,16 @@ class CheckerCall(object):
                 if at != inst_pt:
                     self.err("argument '%s' of %s expects %s, got %s"
                              % (pn, name, inst_pt, at), a)
+                # Stage 98: call-site refinement checking — a CONSTANT
+                # argument is evaluated against the parameter's
+                # refinement right here (a provably-false refinement is
+                # a compile error; non-const values defer to the
+                # runtime entry guard). Per-argument, unlike the
+                # requires check below (which needs ALL args literal).
+                pref = (fn.get("param_preds") or {}).get(pn)
+                if pref is not None and at != "never":
+                    self.refine_const_check(
+                        pref, a, "argument '%s' of '%s'" % (pn, name), a)
             # Stage 17 (v0.28.0-alpha): call-site contract checking. If
             # the callee declares `requires` and every argument is a
             # literal, the precondition is CONSTANT-EVALUATED here: a
@@ -1689,6 +1699,13 @@ class CheckerCall(object):
                 if at != inst_pt:
                     self.err("argument '%s' of %s.%s expects %s, got %s"
                              % (pn, tt_base, name, inst_pt, at), a)
+                # Stage 98: per-argument refinement checking on methods
+                # (params here exclude the receiver — `args` aligns with
+                # `params`, which is the receiver-stripped list).
+                pref = (fn.get("param_preds") or {}).get(pn)
+                if pref is not None and at != "never":
+                    self.refine_const_check(
+                        pref, a, "argument '%s' of '%s.%s'" % (pn, tt_base, name), a)
             if type_map:
                 return instantiate_type(fn["ret"], type_map)
             return fn["ret"]

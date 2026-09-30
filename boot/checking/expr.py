@@ -428,6 +428,14 @@ class CheckerExpr(object):
                 inst_ftype = decl_ftype
             vt = self.check_expr(fexpr, env, inst_ftype)
             first_vt.append(vt)
+            # Stage 98: constant field values are held to the field's
+            # refinement at the literal site (the runtime guard for all
+            # values lives in the generated constructor; the
+            # interpreter checks in eval_structlit).
+            fref = st.get("field_preds", {}).get(fname)
+            if fref is not None and vt != "never":
+                self.refine_const_check(
+                    fref, fexpr, "field '%s.%s'" % (name, fname), e)
             # If the expected type is a concrete (non-typeparam) type,
             # enforce the match. If it's an uninstantiated typeparam, defer
             # — the second pass below will infer.

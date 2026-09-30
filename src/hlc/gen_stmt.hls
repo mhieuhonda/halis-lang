@@ -5,6 +5,70 @@
 # NOTE: content is byte-identical to the original src/hlc.hls line range
 #       17379..19260 - module split is purely structural, zero code changes.
 # ============================================================================
+# ----------------------------------------------------------------------------
+# Stage 98 (v0.117.0-alpha): refinement guards.
+# ----------------------------------------------------------------------------
+
+# refine_pred_cexpr: the C boolean expression of one refinement
+# predicate, with the predicate's binder `self` bound to `self_cexpr`.
+# The whole gen-local map is saved/restored around generation: a
+# method's receiver is ALSO named `self`, and the pred's binder must
+# neither leak into nor shadow the surrounding codegen state.
+fn refine_pred_cexpr(ctx: Ctx, pred_text: str, self_cexpr: str) -> str {
+    let pe: int = ctx.rpreds.get_or(pred_text, -1)
+    if pe < 0 {
+        return "1"
+    }
+    let saved: map[str, str] = ctx.gen_locals
+    ctx.gen_locals = map_new()
+    let sk: list[str] = saved.keys()
+    let mut i: int = 0
+    while i < sk.len() {
+        ctx.gen_locals.set(sk.get(i), saved.get_or(sk.get(i), ""))
+        i = i + 1
+    }
+    ctx.gen_locals.set("self", self_cexpr)
+    let rc: str = gen_expr(ctx, pe)
+    ctx.gen_locals = saved
+    return rc
+}
+
+# refine_die_msg: the hl_die argument (a plain, escaped C string
+# literal) for a refinement violation - byte-identical wording to the
+# interpreter's panic message.
+fn refine_die_msg(what: str, pred_text: str) -> str {
+    return c_path_lit("refinement violation: " + what + " must satisfy '" + pred_text + "'")
+}
+
+# fn_display_name: the part of a fn key after the last '.' ("fn" for
+# plain fns, "deposit" for "Acc.deposit") - the name the interpreter
+# prints in refinement messages.
+fn fn_display_name(key: str) -> str {
+    let mut i: int = key.len() - 1
+    while i >= 0 {
+        if key.byte_at(i) == 46 {
+            return key.slice(i + 1, key.len())
+        }
+        i = i - 1
+    }
+    return key
+}
+
+# emit_refine_check: emit one refinement guard as a statement (used
+# for fn-entry parameter guards). Skipped when the site was PROVEN.
+fn emit_refine_check(ctx: Ctx, pred_text: str, self_cexpr: str, what: str,
+elided: bool, ind: str) -> void {
+    if pred_text == "" || elided {
+        return
+    }
+    if ctx.rpreds.get_or(pred_text, -1) < 0 {
+        return
+    }
+    let rc: str = refine_pred_cexpr(ctx, pred_text, self_cexpr)
+    ctx.out.push(ind + "if (!(" + rc + ")) hl_die(" + refine_die_msg(what, pred_text) + ");")
+}
+
+
 fn gen_method(ctx: Ctx, e: int) -> str {
     if ctx.exprs[e].muser {
         # Deep-scan fix: re-bind symbolic type args inside instantiation
@@ -857,6 +921,26 @@ fn gen_stmt(ctx: Ctx, sidx: int, ind: str) -> void {
         # to a variable. Emit just the side-effect call.
         if ctx.exprs[s.value].t == "never" {
             ctx.out.push(ind + v + ";")
+        } else if s.rpred != "" && !s.rp_elided {
+            # Stage 98: a refined let guards the value BEFORE it enters
+            # the binding, with single evaluation: the (own-wrapped)
+            # value lands in a temp, the pred reads the temp, the
+            # binding takes the temp. Proven sites (constant value /
+            # same-pred flow / interval proof) never reach here.
+            let lt: str = fresh_tmp(ctx, "hlc_rf")
+            let wrapped: str = own_wrap(ctx, s.vtype, v, fresh)
+            if is_ptr_t(ctx, s.vtype) {
+                ctx.out.push(ind + c_type(ctx, s.vtype) + " " + cn
+                + " __attribute__((cleanup(" + cleanup_fn_for(ctx, s.vtype) + "))) = 0;")
+            } else {
+                ctx.out.push(ind + c_type(ctx, s.vtype) + " " + cn + ";")
+            }
+            ctx.out.push(ind + "{ " + c_type(ctx, s.vtype) + " " + lt + " = " + wrapped + ";")
+            flush_null_after(ctx, ind + "    ")
+            let rc: str = refine_pred_cexpr(ctx, s.rpred, lt)
+            ctx.out.push(ind + "  if (!(" + rc + ")) hl_die("
+            + refine_die_msg("variable '" + s.name + "'", s.rpred) + ");")
+            ctx.out.push(ind + "  " + cn + " = " + lt + "; }")
         } else {
             let wrapped: str = own_wrap(ctx, s.vtype, v, fresh)
             if is_ptr_t(ctx, s.vtype) {
@@ -1163,17 +1247,31 @@ fn gen_stmt(ctx: Ctx, sidx: int, ind: str) -> void {
                         want_ens = true
                     }
                 }
-                if want_ens {
+                # Stage 98: a refined return type is guarded at EVERY
+                # return (always-on semantics, not gated by --contracts);
+                # the value is checked on the same temp the ensures
+                # check uses. Proven sites (constant, same-pred flow,
+                # interval proof) skip the guard.
+                let mut want_ref: bool = s.rpred != "" && !s.rp_elided
+                if want_ens || want_ref {
                     let rt: str = ctx.exprs[s.value].t
                     let rt_c: str = c_type(ctx, rt)
                     let tmp: str = fresh_tmp(ctx, "hlc_rv")
                     ctx.out.push(ind + "{ " + rt_c + " " + tmp + " = " + rv + ";")
                     flush_null_after(ctx, ind + "    ")
-                    let ef2: FnInfo = ctx.fns.get_or(ctx.cur_fn, dummy_fn())
-                    ctx.gen_locals.set("result", tmp)
-                    ctx.out.push(ind + "    if (!(" + gen_expr(ctx, ef2.ensures_e)
-                    + ")) hl_die(\"contract violation: ensures of '"
-                    + ef2.name + "' (function postcondition failed at runtime)\");")
+                    if want_ens {
+                        let ef2: FnInfo = ctx.fns.get_or(ctx.cur_fn, dummy_fn())
+                        ctx.gen_locals.set("result", tmp)
+                        ctx.out.push(ind + "    if (!(" + gen_expr(ctx, ef2.ensures_e)
+                        + ")) hl_die(\"contract violation: ensures of '"
+                        + ef2.name + "' (function postcondition failed at runtime)\");")
+                    }
+                    if want_ref {
+                        let rc: str = refine_pred_cexpr(ctx, s.rpred, tmp)
+                        ctx.out.push(ind + "    if (!(" + rc + ")) hl_die("
+                        + refine_die_msg("return value of '" + fn_display_name(ctx.cur_fn) + "'",
+                            s.rpred) + ");")
+                    }
                     ctx.out.push(ind + "    return " + tmp + "; }")
                 } else if ctx.null_after.len() > 0 {
                     let rt: str = ctx.exprs[s.value].t
@@ -2013,7 +2111,7 @@ fn gen_assign(ctx: Ctx, s: StmtN, ind: str) -> void {
     # call result whose field is assigned: `f().name = "x"`).
     collect_hoist(ctx, tgt)
     hoist_all(ctx, ctx.out, ind)
-    let v: str = gen_expr(ctx, s.value)
+    let mut v: str = gen_expr(ctx, s.value)
     # BUG-004 fix: if the RHS is `never`-typed (e.g. `x = panic("...")`),
     # emit just the side-effect call without the assignment — the assignment
     # target is unreachable code.
@@ -2023,7 +2121,28 @@ fn gen_assign(ctx: Ctx, s: StmtN, ind: str) -> void {
         clear_hoists(ctx)
         return
     }
-    let fresh: bool = expr_fresh(ctx, s.value)
+    let mut fresh: bool = expr_fresh(ctx, s.value)
+    # Stage 98: writes into refined slots are guarded - the new value
+    # is materialised into a temp (single evaluation), checked, and
+    # only then stored (the store paths below see the temp as a fresh
+    # value, so ownership flows unchanged).
+    if s.rpred != "" && !s.rp_elided {
+        let gt: str = fresh_tmp(ctx, "hlc_rg")
+        let tgt_tg: str = ctx.exprs[tgt].t
+        let wrappedg: str = own_wrap(ctx, tgt_tg, v, fresh)
+        ctx.out.push(ind + c_type(ctx, tgt_tg) + " " + gt + " = " + wrappedg + ";")
+        let mut whatg: str = "variable '" + ctx.exprs[tgt].name + "'"
+        if ctx.exprs[tgt].kind == "field" {
+            let stg: StructInfo = resolve_struct(ctx, ctx.exprs[ctx.exprs[tgt].left].t)
+            whatg = "field '" + stg.name + "." + ctx.exprs[tgt].name + "'"
+        }
+        let rcg: str = refine_pred_cexpr(ctx, s.rpred, gt)
+        ctx.out.push(ind + "if (!(" + rcg + ")) hl_die("
+        + refine_die_msg(whatg, s.rpred) + ");")
+        flush_null_after(ctx, ind)
+        v = gt
+        fresh = true
+    }
     if ctx.exprs[tgt].kind == "ident" {
         let cn: str = local_c(ctx, ctx.exprs[tgt].name)
         let tgt_t: str = ctx.exprs[tgt].t

@@ -158,7 +158,7 @@ remains green.
 | # | Stage | Status | Estimated effort |
 |---|-------|:------:|:----------------:|
 | 97 | SMT-based loop-invariant inference (auto-discovery) | ✅ | (done in v0.116.0-alpha) |
-| 98 | Refinement types (lightweight, opt-in) | ⬜ | 7 weeks |
+| 98 | Refinement types (lightweight, opt-in) | ✅ | (done in v0.117.0-alpha) |
 | 99 | `hlprove --cvc5` — CVC5 SMT backend | ⬜ | 3 weeks |
 | 100 | Separation-logic fragment (heap shapes) | ⬜ | 8 weeks |
 | 101 | Cryptographic side-channel analysis pass | ⬜ | 5 weeks |

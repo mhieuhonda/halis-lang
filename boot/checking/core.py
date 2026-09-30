@@ -188,12 +188,24 @@ class CheckerCore(object):
             has_defaults = False
             for fname, ftype, fdefault in st["fields"]:
                 self.require_type(ftype, st, "struct field type")
+                # Stage 98: field refinements — validate the predicate
+                # (bool, self-only, pure) and hold every DEFAULT to it
+                # at compile time (provided values are checked at the
+                # literal site + guarded in the generated constructor).
+                fref = st.get("field_preds", {}).get(fname)
+                if fref is not None:
+                    self.validate_refinement(ftype, fref,
+                                             "of field '%s.%s'" % (name, fname))
                 if fdefault is not None:
                     has_defaults = True
                     dv = self.check_expr(fdefault, [{}], ftype)
                     if dv != "never" and dv != ftype:
                         self.err("default value of field '%s' expects %s, got %s"
                                  % (fname, ftype, dv), st)
+                    if fref is not None and dv != "never":
+                        self.refine_const_check(
+                            fref, fdefault,
+                            "default of field '%s.%s'" % (name, fname), st)
             if has_defaults:
                 self._structs_with_defaults.add(name)
             self.cur_fn = saved_fn
@@ -221,8 +233,18 @@ class CheckerCore(object):
                              % fn["struct"], fn)
             for pn, pt, _ in fn["params"]:
                 self.require_type(pt, fn, "parameter type")
+                # Stage 98: parameter refinements (validated once, cached).
+                pref = fn.get("param_preds", {}).get(pn)
+                if pref is not None:
+                    self.validate_refinement(
+                        pt, pref, "of parameter '%s' of '%s'" % (pn, fn["name"]))
             if fn["ret"] != "void" and not self.type_exists(fn["ret"], fn):
                 self.err("return type does not exist: %s" % fn["ret"], fn)
+            # Stage 98: return-type refinement (validated once, cached).
+            rref = fn.get("ret_pred")
+            if rref is not None:
+                self.validate_refinement(
+                    fn["ret"], rref, "of return type of '%s'" % fn["name"])
             # Stages 93-95: the fn return check bypasses require_type
             # (its own diagnostic), so the integer-only rule hooks here
             # too — `-> float` is a float annotation like any other.
@@ -918,6 +940,7 @@ class CheckerCore(object):
     # re-assigned. See sections 16 (Stage 8-alpha) in SPEC.md.
     def new_env(self, fn):
         env = [{}]
+        preds = fn.get("param_preds") or {}
         if fn["struct"] is not None:
             sname, stype, smut = fn["params"][0]
             env[0][sname] = [stype, smut, False]
@@ -927,7 +950,9 @@ class CheckerCore(object):
         for pn, pt, pm in params:
             if pn in env[0]:
                 self.err("duplicate parameter name: %s" % pn, fn)
-            env[0][pn] = [pt, pm, False]
+            # Stage 98: the cell's 4th slot carries the parameter's
+            # refinement (or None) — assignment guards read it.
+            env[0][pn] = [pt, pm, False, preds.get(pn)]
         return env
 
     def lookup(self, env, name):

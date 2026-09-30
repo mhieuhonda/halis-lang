@@ -5099,3 +5099,140 @@ claim NOTHING), the obligations (every verified segment re-decides
 unsat from its dumped `.smt2` — `<fn>__L<line>.smt2`, reset-separated
 like the contract bridge), the CLI surface, the demo (`examples/
 invariant_demo.hls`, interpreter vs native identical), and the tools.
+
+---
+
+## 52. Refinement types — the lightweight fragment (Stage 98 — v0.117.0-alpha)
+
+Types can now carry their own invariant: `T where <pred>` attaches a
+pure boolean predicate over the reserved binder `self` to a primitive
+type. The declaration is the documentation, the checker validates it,
+and the runtime enforces it at every boundary the value crosses.
+
+```hls
+struct Ledger {
+    id: str where self.len() > 0,
+    funds: int where self >= 0
+}
+
+fn apply(l: Ledger, amount: int where self != 0) -> Ledger
+fn square_diff(a: int, b: int) -> int where self >= 0
+let den: int where self != 0 = after_gift.funds
+```
+
+### 52.1. The lightweight fragment (what `where` attaches to)
+
+| Position | Accepted | Rejected with |
+|----------|----------|---------------|
+| fn parameter types | yes (`amt: int where self > 0`) | — |
+| fn return types | yes (`-> int where self >= 0`); NOT on generic fns | "lightweight fragment" error on generics |
+| `let` annotations | yes (`let x: int where self >= 0 = ...`) | — |
+| struct field types | yes (`funds: int where self >= 0`) | — |
+| container elements / type arguments / enum payloads / loop variables | no | "refinements are not supported in this position" |
+| extern declarations | no (C cannot enforce the invariant) | "extern declarations" |
+| non-primitive bases | no (`T{...}` on structs, enums, type params) | "only supported on primitive types" |
+
+Base types: `int`, `float`, `bool`, `str`. The predicate grammar is
+exactly the contract-expression grammar (26.1) restricted to the
+binder: literals, `self`, arithmetic, comparisons, `&&`/`||`/`!`,
+`len(self)` / `self.len()`. No other identifiers (cross-value
+constraints belong in a `requires` clause), no calls. The predicate's
+canonical text — the whitespace-collapsed source slice — is its
+identity: two slots with the same text share one parsed predicate and
+flow between them without re-checking.
+
+`where` is a new reserved keyword (grep-audited like `extern`,
+`requires`, `ensures`, `asm` before it).
+
+### 52.2. Runtime guards — every boundary checks
+
+A value enters a refined slot only through the guard:
+
+| Boundary | Guard site | Panic message |
+|----------|-----------|---------------|
+| refined parameter | fn entry (callee side), before `requires`, before the `#[tail_call]` label — a tail rebind re-runs it, matching the interpreter's re-check | `parameter 'amt' of 'apply'` |
+| refined return type | every `return`, on the same temp the `ensures` check uses | `return value of 'apply'` |
+| refined `let` | the value lands in a temp, the pred reads the temp, the binding takes the temp (single evaluation guaranteed) | `variable 'x'` |
+| assignment to a refined binding or refined field | same temp discipline | `variable 'x'` / `field 'Ledger.funds'` |
+| struct construction | inside the generated constructor — provided values AND defaults | `field 'Ledger.funds'` |
+
+A violation is a clean panic (exit 101), word-for-word the same
+sentence in the interpreter and the native build. Refinement guards
+are **always-on semantics**: unlike `--contracts` (26.3) they are not
+gated by a flag, and they are emitted in both default and `-O fast`
+builds. What changes between builds is only the PROOF side below.
+
+### 52.3. The proof side — proven sites run guard-free
+
+The checker and the interval engine (26.4) discharge guard obligations
+statically; a PROVEN site emits no check:
+
+1. **Constant values** — a compile-time-constant value (integer
+   literals and const-foldable integer arithmetic) is evaluated
+   against the predicate at the site: provably FALSE is a compile
+   error (`half(0)` against `x: int where self > 0` never compiles —
+   the same call-site discipline as `requires`, 26.2), provably TRUE
+   elides the guard. Non-constant forms defer to runtime.
+2. **Same-predicate flow** — assigning a binding whose predicate text
+   is IDENTICAL to the target's needs no re-check (`let b = a` where
+   both are `int where self >= 0`).
+3. **Interval proof** — the proof pass computes the interval of the
+   value expression from the current facts; if the interval implies
+   the predicate, the guard is elided and the target's facts tighten
+   to the post-guard interval (sound: execution only reaches past the
+   guard when the predicate held). This is the bridge to `-O fast`:
+   `d: int where self != 0` makes `n / d` `div_safe` inside the body,
+   exactly like `requires d != 0` — and a post-guard `!= 0` fact
+   elides divisions LATER in the same body too.
+
+Elisions are proof-based, not mode-based: a proven site is guard-free
+in default and `-O fast` builds alike (the guard count per program is
+mode-independent, pinned by the gate). The elision soundness rules of
+26.4/26.9 apply unchanged: loop-carried facts are widened, killed
+facts stay killed, and the INT64_MIN/-1 dividend corner still blocks
+`div_safe` unless the dividend's lower bound is known.
+
+Refined parameters seed interval facts at fn entry (before the body
+pass), so refinements feed the existing elision machinery with zero
+new codegen rules. Functions with refined signatures keep their
+standalone bodies under `--lto` (the same rationale as contracted
+fns: the entry guard must run exactly once per real call).
+
+### 52.4. Composition — refinements compose into proofs
+
+The acceptance example demonstrates the intended style:
+
+```hls
+fn ratio(num: int where self >= 0, den: int where self != 0) -> int {
+    return num / den
+}
+```
+
+Two refinements on two parameters make the division provable: `num >= 0`
+bounds the dividend away from INT64_MIN, `den != 0` proves the divisor.
+Under `-O fast` the emitted body is `return (u_num / u_den);` — no
+panic check in the hot path — while the fn entry still guards both
+parameters. Data invariants stated once on the type replace scattered
+`requires` clauses at every consumer.
+
+### 52.5. Deliberate scope decisions (v0.117.0-alpha)
+
+| Deferred | Rationale |
+|----------|-----------|
+| Refinements inside containers (`list[int where ...]`) | element-level guards need per-store checks and read-side certification; not lightweight. Rejected at parse with a directed error. |
+| Struct-type refinements (`Point where self.x > 0`) | cross-field invariants change move/clone semantics; refine the FIELDS individually instead. |
+| Refinements on generic fn return types | the instantiation path would need per-instance return guards (the documented `ensures` gap); rejected at parse for now. |
+| Predicate implication between DIFFERENT preds (`int{self > 0}` → `int{self > 5}`) | sub-refinement ordering needs an implication solver; such conversions simply re-guard, which is sound and cheap. |
+| Float/str constant folding parity | integer constants fold on both implementations; float and `len()`-in-comparison constants defer to the runtime guard on the native (matching the `args_are_const` float rule of Stage 53). |
+
+### 52.6. The gate
+
+`make refine-acceptance` (seven sections): the parser (every accepted
+and every rejected position), the checker (predicate validation +
+constant violations at lets / args / returns / fields / defaults /
+assigns), the guards (each runtime boundary present in the generated
+C), the proof (proven sites elided in BOTH builds, unprovable sites
+kept, the composition example's division elided under `-O fast` while
+its entry guards stay), the differential (four programs × default and
+`-O fast`, including the runtime-violation panics at exit 101), the
+demo (`examples/refine_demo.hls`), and the tools.

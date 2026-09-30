@@ -378,7 +378,7 @@ fn resolve_struct(ctx: Ctx, t: str) -> StructInfo {
 
 fn dummy_binding() -> Binding {
     return Binding {
-        t: "", is_mut: false, moved: false
+        t: "", is_mut: false, moved: false, rpred: ""
     }
 }
 
@@ -414,7 +414,7 @@ fn mark_moved(env: list[map[str, Binding]], name: str) -> bool {
         if env.get(i).has(name) {
             let b: Binding = env.get(i).get_or(name, dummy_binding())
             env.get(i).set(name, Binding {
-                t: b.t, is_mut: b.is_mut, moved: true
+                t: b.t, is_mut: b.is_mut, moved: true, rpred: b.rpred
             })
             return true
         }
@@ -429,7 +429,7 @@ fn revive_binding(env: list[map[str, Binding]], name: str) -> bool {
         if env.get(i).has(name) {
             let b: Binding = env.get(i).get_or(name, dummy_binding())
             env.get(i).set(name, Binding {
-                t: b.t, is_mut: b.is_mut, moved: false
+                t: b.t, is_mut: b.is_mut, moved: false, rpred: b.rpred
             })
             return true
         }
@@ -492,7 +492,7 @@ fn restore_moved(env: list[map[str, Binding]], snap: list[str]) -> void {
                     mv = true
                 }
                 scope.set(nm, Binding {
-                    t: b.t, is_mut: b.is_mut, moved: mv
+                    t: b.t, is_mut: b.is_mut, moved: mv, rpred: b.rpred
                 })
             }
         }
@@ -541,7 +541,7 @@ fn union_moved(env: list[map[str, Binding]], snap: list[str]) -> void {
                 let b: Binding = scope.get_or(nm, dummy_binding())
                 # Only set moved=true; never clear (this is a UNION).
                 scope.set(nm, Binding {
-                    t: b.t, is_mut: b.is_mut, moved: true
+                    t: b.t, is_mut: b.is_mut, moved: true, rpred: b.rpred
                 })
             }
         }
@@ -2402,6 +2402,12 @@ fn check_program(ctx: Ctx) -> void uses Fs {
         let mut fi: int = 0
         while fi < st.ftypes.len() {
             require_type(ctx, st.ftypes.get(fi), st.line, "struct field type")
+            # Stage 98: field refinements (validated once, cached).
+            if st.field_preds.has(st.fields.get(fi)) {
+                validate_refinement_hlc(ctx, st.ftypes.get(fi),
+                    st.field_preds.get_or(st.fields.get(fi), ""),
+                    "of field '" + keys_s.get(si) + "." + st.fields.get(fi) + "'", st.line)
+            }
             fi = fi + 1
         }
         # Also check default-value expressions (must be of the declared type).
@@ -2419,6 +2425,15 @@ fn check_program(ctx: Ctx) -> void uses Fs {
                 let vt: str = check_expr(ctx, env, "@default." + keys_s.get(si), st.fdefaults.get(di), st.ftypes.get(di))
                 if vt != "never" && vt != st.ftypes.get(di) {
                     cerr(st.line, "default value of field " + st.fields.get(di) + " expects " + st.ftypes.get(di) + ", got " + vt)
+                }
+                # Stage 98: a default value is held to the field's
+                # refinement at compile time (provided values are
+                # checked at the literal site + guarded in the ctor).
+                if st.field_preds.has(st.fields.get(di)) && vt != "never" {
+                    refine_const_check_hlc(ctx,
+                        st.field_preds.get_or(st.fields.get(di), ""),
+                        st.fdefaults.get(di),
+                        "default of field '" + keys_s.get(si) + "." + st.fields.get(di) + "'", st.line)
                 }
             }
             di = di + 1
@@ -2469,12 +2484,21 @@ fn check_program(ctx: Ctx) -> void uses Fs {
         let mut j: int = 0
         while j < f.params.len() {
             require_type(ctx, f.ptypes.get(j), f.line, "parameter type")
+            # Stage 98: parameter refinements (validated once, cached).
+            if f.param_preds.has(f.params.get(j)) {
+                validate_refinement_hlc(ctx, f.ptypes.get(j),
+                    f.param_preds.get_or(f.params.get(j), ""),
+                    "of parameter '" + f.params.get(j) + "' of '" + f.name + "'", f.line)
+            }
             j = j + 1
         }
         if f.ret != "void" {
             if !type_exists(ctx, f.ret) {
                 cerr(f.line, "return type does not exist: " + f.ret)
             }
+            # Stage 98: return-type refinement (validated once, cached).
+            validate_refinement_hlc(ctx, f.ret, f.ret_pred,
+                "of return type of '" + f.name + "'", f.line)
             # Stages 93-95: the return-type check bypasses require_type
             # (its own diagnostic), so the integer-only rule hooks here
             # too — `-> float` is a float annotation like any other.
@@ -2837,8 +2861,120 @@ fn collect_all_insts(ctx: Ctx) -> void {
 
 fn dummy_struct() -> StructInfo {
     return StructInfo {
-        name: "", fields: [], ftypes: [], fdefaults: [], typeparams: [], line: 0
+        name: "", fields: [], ftypes: [], fdefaults: [], typeparams: [], line: 0,
+        field_preds: map_new()
     }
+}
+
+# ----------------------------------------------------------------------------
+# Stage 98 (v0.117.0-alpha): refinement types (`T where <pred>`).
+# ----------------------------------------------------------------------------
+
+# refine_scope_walk: a refinement predicate sees ONLY the binder
+# `self` - any other ident is a compile error (cross-value constraints
+# belong in `requires` clauses, SPEC section 26).
+fn refine_scope_walk(ctx: Ctx, e: int, line: int) -> void {
+    if e < 0 {
+        return
+    }
+    let n: ExprN = ctx.exprs[e]
+    if n.kind == "ident" && n.name != "self" {
+        cerr(line, "refinement predicate may only reference 'self' (got '" + n.name + "'; cross-value constraints belong in a requires clause)")
+    }
+    refine_scope_walk(ctx, n.left, line)
+    refine_scope_walk(ctx, n.right, line)
+    let mut i: int = 0
+    while i < n.args.len() {
+        refine_scope_walk(ctx, n.args.get(i), line)
+        i = i + 1
+    }
+}
+
+# refine_purity_walk: same whitelist as contract expressions (SPEC
+# 26.1) - no calls except len() / .len(); everything else must be
+# literals, self, arithmetic, comparisons and logic.
+fn refine_purity_walk(ctx: Ctx, e: int, what: str, line: int) -> void {
+    if e < 0 {
+        return
+    }
+    let n: ExprN = ctx.exprs[e]
+    if n.kind == "call" && n.mkey != "len" {
+        # n.name (the parsed callee) rather than mkey: mkey is only
+        # stamped during codegen, the checker sees the source name.
+        cerr(line, "refinement predicate " + what + " calls '" + n.name + "' - predicates must be pure (only literals, self, arithmetic, comparisons and len are allowed)")
+    }
+    if n.kind == "method" && n.mop != "str.len" && n.mop != "list.len" && n.mop != "map.len" {
+        cerr(line, "refinement predicate " + what + " calls method '" + n.mop + "' - predicates must be pure")
+    }
+    refine_purity_walk(ctx, n.left, what, line)
+    refine_purity_walk(ctx, n.right, what, line)
+    let mut i: int = 0
+    while i < n.args.len() {
+        refine_purity_walk(ctx, n.args.get(i), what, line)
+        i = i + 1
+    }
+}
+
+# validate_refinement_hlc: type/purity/scope-check one refinement
+# predicate, once per (base, text) per compilation (ctx.rp_checked).
+fn validate_refinement_hlc(ctx: Ctx, base: str, text: str, what: str, line: int) -> void {
+    if text == "" {
+        return
+    }
+    let key: str = base + "{" + text + "}"
+    if ctx.rp_checked.has(key) {
+        return
+    }
+    ctx.rp_checked.set(key, true)
+    let pe: int = ctx.rpreds.get_or(text, -1)
+    if pe < 0 {
+        return
+    }
+    refine_scope_walk(ctx, pe, line)
+    refine_purity_walk(ctx, pe, what, line)
+    # Typing: the predicate must be bool in a scope whose ONLY binding
+    # is `self` (typed at the base type). Runs AFTER the purity walk:
+    # a call inside the predicate is rejected with the refinement
+    # diagnostic before check_expr ever sees it.
+    let env: list[map[str, Binding]] = []
+    let scope0: map[str, Binding] = map_new()
+    scope0.set("self", Binding {
+        t: base, is_mut: false, moved: false, rpred: ""
+    })
+    env.push(scope0)
+    let t: str = check_expr(ctx, env, "", pe, "")
+    if t != "bool" && t != "never" {
+        cerr(line, "refinement predicate " + what + " must be bool, got " + t)
+    }
+}
+
+# refine_const_check_hlc: if the value expression is an integer
+# compile-time constant, evaluate the predicate on it right now - a
+# provably-FALSE refinement is a compile error at the site (the
+# runtime guard could never pass). Returns true when the predicate is
+# PROVEN (constant value satisfies it) - the caller may elide the
+# runtime guard. Unknown values return false (guard stays).
+fn refine_const_check_hlc(ctx: Ctx, text: str, value_e: int, what: str, line: int) -> bool {
+    if text == "" {
+        return false
+    }
+    let pe: int = ctx.rpreds.get_or(text, -1)
+    if pe < 0 {
+        return false
+    }
+    let empty_c: map[str, int] = map_new()
+    if !consts_expr(ctx, value_e, empty_c) {
+        return false
+    }
+    let cv: int = expr_const_val(ctx, value_e, empty_c)
+    let consts: map[str, int] = map_new()
+    consts.set("self", cv)
+    let sconsts: map[str, str] = map_new()
+    let verdict: int = const_eval_hlc(ctx, pe, consts, sconsts)
+    if verdict == 0 {
+        cerr(line, "refinement violation: " + what + " - value " + cv.to_str() + " does not satisfy '" + text + "'")
+    }
+    return verdict == 1
 }
 
 fn dummy_enum() -> EnumInfo {
@@ -2858,6 +2994,7 @@ fn dummy_fn() -> FnInfo {
         attr_inline: "", attr_hot: false, attr_cold: false,
         attr_tail_call: false, attr_panic_handler: false,
         attr_section: "", attr_align: -1,
-        src_file: ""
+        src_file: "",
+        param_preds: map_new(), ret_pred: "", has_refinements: false
     }
 }
