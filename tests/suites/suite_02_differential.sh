@@ -120,6 +120,28 @@ if command -v cvc5 >/dev/null 2>&1; then
     fi
 fi
 
+# Stage 100: the separation-logic fragment — heap shapes. The run must
+# be clean with or without a solver installed (the report is honest
+# about missing backends); with a decider on PATH the proven triple,
+# the frame refusal and the separation verdicts must appear on the
+# heap demo.
+shape_out=$(python3 tools/hlprove.py examples/heap_demo.hls --shapes 2>/dev/null); shape_rc=$?
+if [ "$shape_rc" -eq 0 ] && echo "$shape_out" | grep -q "SHAPES TOTAL:"; then
+    ok "hlprove --shapes runs the fragment on the heap demo"
+else
+    bad "hlprove --shapes wrong on the heap demo (rc=$shape_rc)"
+fi
+if python3 -c "import z3" 2>/dev/null || command -v z3 >/dev/null 2>&1; then
+    if echo "$shape_out" | grep -q "shape PROVEN (z3): lseg(xs, 0, i) \* cell(xs, i)" \
+       && echo "$shape_out" | grep -q "frame REFUSED" \
+       && echo "$shape_out" | grep -q "own(a) \* own(b) REFUSED" \
+       && echo "$shape_out" | grep -q "own(a) \* own(buf) PROVEN"; then
+        ok "hlprove --shapes proves and refuses on the demo (decider on PATH)"
+    else
+        bad "hlprove --shapes verdict lines missing (decider on PATH)"
+    fi
+fi
+
 # Stage 98: refinement types. Every refined slot is guarded at runtime
 # (fn entry / return / let / assign / construction); proven sites are
 # elided. The interpreter and the native build (default AND -O fast)

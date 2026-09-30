@@ -4,6 +4,7 @@
 Usage:
   python3 tools/hlprove.py <file.hls> [--fast] [--smt] [--z3] [--cvc5]
                             [--suggest-invariants] [--infer-invariants]
+                            [--shapes]
 
 Modes:
   (default)  proof report — which panic checks the interval prover
@@ -39,6 +40,26 @@ Modes:
              backend follows the mode flag: z3 by default, cvc5 under
              --cvc5 — both decide the SAME obligations, so a verdict
              must agree across them (the Stage 99 gate pins it).
+  --shapes    Stage 100: the separation-logic fragment — heap shapes.
+             Three reports per function: the heap FOOTPRINT (every
+             list binding classified read/write over alias classes —
+             assignment aliases, clone() is fresh, unknown provenance
+             is the wildcard class), the SEPARATION verdicts
+             (own(a) * own(b) — writes disjoint — proven from freshness
+             evidence, refused with the reason otherwise: f(xs, xs)
+             aliases the parameters, so separation is never assumed),
+             and the cursor-loop SHAPE TRIPLES (lseg * cell * lseg):
+             anchored on <cursor> op <root>.len() (or range(a,
+             <root>.len())), an affine self-step, and a frame check
+             with teeth — every write through the anchor's alias class
+             must be the cursor cell and no push/pop may touch it (the
+             check that justifies treating len as loop-invariant in the
+             obligations). Initiation and preservation are decided by
+             the same backend as the invariants (z3, or cvc5 under
+             --cvc5); with no solver the candidates are reported
+             UNVERIFIED and nothing is claimed. Analysis-only: no
+             compilation unit changes, interpreter and native binaries
+             agree byte for byte.
 """
 import os
 import subprocess
@@ -459,6 +480,108 @@ def make_cvc5_decider():
     return None
 
 
+def shapes_report(program, want_smt, out_dir, decider=None,
+                  solver_name="z3"):
+    """Stage 100: the heap-shape report. Footprints, separation
+    verdicts and loop-shape triples per function; the decider decides
+    every frame-clean candidate's two obligations (or nothing is
+    claimed when no solver exists). Returns the summary counts."""
+    fs_list = _proof.collect_shapes(program)
+    verified = _proof.verify_shapes(fs_list, decider)
+    proven = refused = unverified = 0
+    sep_ok = sep_no = 0
+    print("  Heap shapes (the separation-logic fragment):")
+    anything = False
+    for fs in fs_list:
+        # ---- footprint -------------------------------------------------
+        root_kind = {}
+        for cid, site in fs.writes:
+            rep = fs.classes.repr_of(cid)
+            root_kind[rep] = "W"
+        for cid in fs.reads:
+            rep = fs.classes.repr_of(cid)
+            root_kind.setdefault(rep, "R")
+        if not root_kind:
+            continue
+        anything = True
+        print("  %s:" % fs.fn_key)
+        fp = ", ".join("%s:%s" % (r, root_kind[r])
+                       for r in sorted(root_kind))
+        print("    footprint: %s (over alias classes)" % fp)
+        # ---- separation -------------------------------------------------
+        if not fs.separation:
+            print("    separation: single writer — trivially separated")
+        else:
+            for ra, rb, ok, why in fs.separation:
+                sep_ok += 1 if ok else 0
+                sep_no += 0 if ok else 1
+                print("    separation: own(%s) * own(%s) %s — %s"
+                      % (ra, rb, "PROVEN" if ok else "REFUSED", why))
+        # ---- loop shapes -------------------------------------------------
+        for ls in fs.loops:
+            if ls.status == "proven":
+                proven += 1
+            elif ls.status == "unverified":
+                unverified += 1
+            else:
+                refused += 1
+            print("    line %d: %s" % (ls.line, ls.header))
+            if ls.root is None:
+                print("      no heap anchor: %s" % ls.cond_reason)
+                continue
+            if ls.frame_reasons and ls.status != "proven":
+                for why in ls.frame_reasons:
+                    print("      frame REFUSED: %s" % why)
+                continue
+            print("      frame: every write is %s[%s]; len(%s) fixed "
+                  "through the body" % (ls.root, ls.cursor, ls.root))
+            if ls.status == "proven":
+                print("      shape PROVEN (%s): %s" % (solver_name,
+                                                       ls.shape_text))
+                print("      accesses in bounds by shape: %d of %d"
+                      % (ls.access_safe, ls.access_total))
+                if ls.access_blocked:
+                    print("      accesses NOT claimed: %d (after the "
+                          "cursor update the cursor may sit at len)"
+                          % ls.access_blocked)
+            elif ls.status == "unverified":
+                print("      shape CANDIDATE (unverified — no solver "
+                      "installed, nothing claimed): %s"
+                      % _proof._shape_of_loop_text(ls))
+            else:
+                if ls.solver_reason:
+                    print("      shape REFUSED (obligation not "
+                          "discharged): %s" % ls.solver_reason)
+                else:
+                    for why in ls.frame_reasons:
+                        print("      shape REFUSED: %s" % why)
+                if ls.access_blocked:
+                    print("      accesses NOT claimed: %d of %d (after "
+                          "the cursor update the cursor may sit at len)"
+                          % (ls.access_blocked, ls.access_total))
+                elif ls.access_safe < ls.access_total:
+                    print("      accesses NOT claimed: %d of %d"
+                          % (ls.access_total - ls.access_safe,
+                             ls.access_total))
+            if want_smt and ls.segments:
+                fname = "%s__L%d.shape.smt2" % (
+                    fs.fn_key.replace(".", "_"), ls.line)
+                fpath = os.path.join(out_dir, fname)
+                with open(fpath, "w") as f:
+                    f.write(_proof.smt_program_text(
+                        "; Halis heap-shape obligations — %s:%d %s\n"
+                        "; verified shape: %s"
+                        % (fs.fn_key, ls.line, ls.header, ls.shape_text),
+                        ls.segments))
+                print("      obligations -> %s" % fpath)
+    if not anything:
+        print("    (no list bindings — nothing for the fragment to say)")
+    print("  SHAPES TOTAL: %d loops proven, %d refused, %d unverified;"
+          " %d separation pairs proven, %d refused"
+          % (proven, refused, unverified, sep_ok, sep_no))
+    return proven, refused, unverified
+
+
 def suggest_invariants(program):
     """Loop-invariant suggestions (the roadmap's automatic inference
     rule set): const-bound for loops get exact bounds; while loops get
@@ -662,6 +785,7 @@ def main():
     want_smt = "--smt" in args or want_z3 or want_cvc5
     want_inv = "--suggest-invariants" in args
     want_infer = "--infer-invariants" in args
+    want_shapes = "--shapes" in args
     args = [a for a in args if not a.startswith("--")]
     if not args:
         sys.stderr.write(__doc__)
@@ -731,6 +855,24 @@ def main():
                                               decider, solver_name)
         print("  INFERENCE TOTAL: %d invariants verified, %d candidates "
               "rejected" % (accepted, rejected))
+
+    if want_shapes:
+        print("")
+        if want_cvc5:
+            solver_name = "cvc5"
+            decider = make_cvc5_decider()
+        else:
+            solver_name = "z3"
+            decider = make_decider()
+        if decider is None:
+            print("  (Stage 100 — no %s backend: loop shapes are "
+                  "reported as candidates, never proofs)"
+                  % solver_name)
+        else:
+            print("  (Stage 100 — cursor-loop obligations decided by %s)"
+                  % solver_name)
+        out_dir = os.path.dirname(os.path.abspath(path)) or "."
+        shapes_report(program, want_smt, out_dir, decider, solver_name)
     return 0
 
 

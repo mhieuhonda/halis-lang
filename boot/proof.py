@@ -2213,3 +2213,1006 @@ def smt_program_text(loop_header_comment, segments):
         lines.append("(reset)")
         lines.append("")
     return "\n".join(lines).rstrip() + "\n"
+
+
+# ----------------------------------------------------------------------------
+# Stage 100 (v0.119.0-alpha): the separation-logic fragment — heap shapes.
+#
+# Stages 17/97 reason about SCALARS: intervals and affine transitions over
+# Ints. Neither can say anything about the HEAP — the lists a program
+# allocates, aliases and writes through. This stage adds the fragment that
+# can, deliberately small and every verdict checked:
+#
+# 1. **Footprints and alias classes.** Every list-typed binding gets an
+#    alias class: a fresh class (bound to a list literal or `clone(..)`),
+#    a caller-owned class (a parameter, or an alias chain into one), or
+#    the wildcard class (unknown provenance — `grid.get(0)`, a call
+#    result). Assignment aliases (`let ys = xs`) merge classes — because
+#    Halis values ARE references (SPEC 16: assignment creates a
+#    reference; mutation is visible through all references). The
+#    experiment that pins the design: `f(xs, xs)` is LEGAL and the two
+#    parameters alias the same list — so "distinct parameters never
+#    alias" is FALSE in Halis and separation is never assumed.
+#
+# 2. **Separation verdicts.** For every pair of written classes the
+#    fragment decides `own(a) * own(b)` — writes are disjoint — or
+#    REFUSES with the concrete reason. Two fresh classes are disjoint
+#    (two allocations); fresh vs anything pre-existing is disjoint (the
+#    allocation happened after the other object was bound); caller-owned
+#    vs caller-owned is refused (the f(xs, xs) aliasing); anything
+#    touching the wildcard class is refused.
+#
+# 3. **Cursor-loop shape triples.** The classic separation-logic proof
+#    for a list walk — the loop at head state owns
+#      lseg(xs, 0, i) * cell(xs, i) * lseg(xs, i+1, xs.len())
+#    and the body's write stays inside `cell(xs, i)`. The fragment
+#    recognises the anchored walks: a cursor `i` compared DIRECTLY
+#    against `xs.len()` (while) or `range(a, xs.len())` (for), an affine
+#    self-step (i' = i + c, conditionally identity), and a FRAME check
+#    with teeth: every write through xs's alias class anywhere in the
+#    body must be exactly `xs[i]`, and no push/pop may touch the class —
+#    which is precisely the justification for the encoding's one honest
+#    lie, treating `xs_len` as a loop-invariant Int.
+#
+# 4. **The obligations.** Initiation: the entry state satisfies
+#    `0 <= i /\ i <= xs_len` (cursor interval facts at the loop head;
+#    for-ranges add the runs-guard `a < xs_len`). Preservation:
+#    shape ∧ cond ∧ i' = i + c ⊫ shape' — decided by the same decider
+#    abstraction as Stage 97 (z3 by default, cvc5 under --cvc5), the
+#    same honesty rules: no solver installed → candidates are reported
+#    and NOTHING is claimed.
+#
+# The fragment's deliberate refusals are its content: descending steps
+# fail `0 <= i'` (one iteration from i == 0 lands at -1 — the solver
+# finds it), writes off the cursor cell (or through an alias, or a
+# push/pop) fail the frame, a captured `let n = xs.len()` anchor is
+# refused (an Int copy has no heap link), escaping bodies are refused
+# wholesale. Where the fragment refuses, Stage 97's arithmetic
+# invariants may still apply — the two are complementary, not
+# overlapping.
+# ----------------------------------------------------------------------------
+
+_SHAPE_WILD = -1  # the wildcard alias class (unknown provenance)
+
+
+class _AliasState:
+    """Alias classes over list-typed bindings, one function's worth.
+    Class ids: 0..n are concrete (fresh or caller-owned), _SHAPE_WILD is
+    the wildcard. `fresh[cid]` — the class was allocated INSIDE the
+    function (list literal / clone(..)) and therefore provably disjoint
+    from every object that existed before it."""
+
+    def __init__(self):
+        self.owner = {}       # binding -> cid | WILD
+        self.members = {}     # cid -> set(bindings)
+        self.fresh = {}       # cid -> bool
+        self.next_cid = 0
+
+    def new_class(self, name, fresh):
+        cid = self.next_cid
+        self.next_cid += 1
+        self.members[cid] = {name}
+        self.fresh[cid] = fresh
+        self.owner[name] = cid
+        return cid
+
+    def join(self, name, cid):
+        if cid == _SHAPE_WILD:
+            self.owner[name] = _SHAPE_WILD
+            return
+        self.owner[name] = cid
+        self.members[cid].add(name)
+
+    def drop(self, name):
+        cid = self.owner.get(name)
+        if cid is not None and cid != _SHAPE_WILD and name in \
+                self.members.get(cid, ()):
+            self.members[cid].discard(name)
+        self.owner.pop(name, None)
+
+    def of(self, name):
+        return self.owner.get(name, _SHAPE_WILD)
+
+    def repr_of(self, cid):
+        """A stable printable representative (sorted first member)."""
+        if cid == _SHAPE_WILD:
+            return "?"
+        mem = self.members.get(cid) or set()
+        return sorted(mem)[0] if mem else "?"
+
+    def snapshot(self):
+        cp = _AliasState()
+        cp.owner = dict(self.owner)
+        cp.members = {c: set(m) for c, m in self.members.items()}
+        cp.fresh = dict(self.fresh)
+        cp.next_cid = self.next_cid
+        return cp
+
+
+def _is_list_type(t):
+    return isinstance(t, str) and t.startswith("list[")
+
+
+def _ident_of(e):
+    """The ident name of an expression node, or None."""
+    if isinstance(e, dict) and e.get("k") == "ident" \
+            and isinstance(e.get("name"), str):
+        return e["name"]
+    return None
+
+
+def _len_anchor(e):
+    """(root, cursor, op) when `e` is  cursor OP root.len()  (or the
+    flipped/`len(root)` shapes) — the DIRECT heap anchor the fragment
+    requires. A captured `let n = xs.len()` is an Int copy with no heap
+    link and never matches."""
+    if not isinstance(e, dict) or e.get("k") != "bin":
+        return None
+    op = e.get("op")
+    if op not in ("<", "<=", ">", ">="):
+        return None
+    l, r = e.get("l"), e.get("r")
+
+    def len_root(x):
+        """xs.len() — method form — or len(xs) — call form."""
+        if isinstance(x, dict) and x.get("k") == "method" \
+                and x.get("name") == "len":
+            return _ident_of(x.get("target"))
+        if isinstance(x, dict) and x.get("k") == "call" \
+                and x.get("name") == "len":
+            args = x.get("args") or []
+            if len(args) == 1:
+                return _ident_of(args[0])
+        return None
+
+    cur = _ident_of(l)
+    if cur is not None:
+        root = len_root(r)
+        if root is not None:
+            return (root, cur, op)
+    cur = _ident_of(r)
+    if cur is not None:
+        root = len_root(l)
+        if root is not None:
+            flip = {"<": ">", "<=": ">=", ">": "<", ">=": "<="}
+            return (root, cur, flip[op])
+    return None
+
+
+class _WriteSite:
+    """One heap write through a binding: xs[i] = v (idx node kept for
+    the cursor comparison), xs.set(i, v), or a len mutator
+    (push/pop)."""
+
+    __slots__ = ("binding", "kind", "idx", "line")
+
+    def __init__(self, binding, kind, idx, line):
+        self.binding = binding
+        self.kind = kind      # "index" | "set" | "push" | "pop"
+        self.idx = idx        # idx expr node (index writes), else None
+        self.line = line
+
+
+class ShapeLoop:
+    """One loop's shape candidate and verdict."""
+
+    __slots__ = ("fn_key", "kind", "line", "header", "root", "cursor",
+                 "cond_op", "steps", "cond_ok", "cond_reason", "frame_ok",
+                 "frame_reasons", "range_lo", "entry_facts", "status",
+                 "shape_text", "segments", "access_total", "access_safe",
+                 "access_blocked", "minlen", "solver_reason")
+
+    def __init__(self, fn_key, kind, line, header):
+        self.fn_key = fn_key
+        self.kind = kind          # "while" | "for"
+        self.line = line
+        self.header = header
+        self.root = None          # anchor list binding
+        self.cursor = None        # cursor binding
+        self.cond_op = None       # "<" | "<=" (cursor on the left)
+        self.steps = []           # literal self-steps [c] of i' = i + c
+        self.cond_ok = False
+        self.cond_reason = None
+        self.frame_ok = False
+        self.frame_reasons = []
+        self.range_lo = None      # ("lit"|"var", val) for for-loops
+        self.entry_facts = {}
+        self.status = "refused"   # "proven" | "refused" | "unverified"
+        self.shape_text = None
+        self.segments = []
+        self.access_total = 0
+        self.access_safe = 0
+        self.access_blocked = 0
+        self.minlen = None        # entry lower bound on len(xs), if any
+        self.solver_reason = None  # why the solver refused, if it did
+
+    def refused(self, why):
+        self.frame_ok = False
+        self.frame_reasons.append(why)
+
+
+class FnShapes:
+    """One function's heap analysis: footprints, separation verdicts,
+    loop-shape candidates."""
+
+    __slots__ = ("fn_key", "fn", "classes", "writes", "reads",
+                 "separation", "loops", "notes")
+
+    def __init__(self, fn_key, fn):
+        self.fn_key = fn_key
+        self.fn = fn
+        self.classes = _AliasState()
+        self.writes = []          # [(cid, _WriteSite)]
+        self.reads = set()        # cids read
+        self.separation = []      # [(a_repr, b_repr, proven, reason)]
+        self.loops = []           # [ShapeLoop]
+        self.notes = []
+
+
+def _shape_lit(e):
+    """int literal node -> value, else None."""
+    if isinstance(e, dict) and e.get("k") == "int" \
+            and isinstance(e.get("v"), int):
+        return e["v"]
+    return None
+
+
+def _rebind_list(state, name, value):
+    """(re)bind `name` according to its value's provenance."""
+    state.drop(name)
+    if isinstance(value, dict):
+        k = value.get("k")
+        if k == "listlit":
+            state.new_class(name, True)
+            return
+        if k == "call" and value.get("name") == "clone":
+            state.new_class(name, True)
+            return
+        if k == "ident" and _is_list_type(value.get("t")):
+            src = value.get("name")
+            state.join(name, state.of(src))
+            return
+    state.join(name, _SHAPE_WILD)
+
+
+def _iter_writes_reads(e, out_w, out_r):
+    """Every heap write and heap read inside one expression tree."""
+    if not isinstance(e, dict):
+        return
+    k = e.get("k")
+    if k == "method":
+        tgt = e.get("target")
+        root = _ident_of(tgt)
+        name = e.get("name")
+        if root is not None and _is_list_type(tgt.get("t")):
+            if name in ("push", "pop"):
+                out_w.append(_WriteSite(root, name, None, e.get("line", 0)))
+            elif name == "set":
+                args = e.get("args") or []
+                out_w.append(_WriteSite(root, "set",
+                                        args[0] if len(args) == 2 else None,
+                                        e.get("line", 0)))
+            elif name == "get":
+                out_r.add(root)
+            elif name == "len":
+                out_r.add(root)
+    if k == "index":
+        tgt = e.get("target")
+        root = _ident_of(tgt)
+        if root is not None and _is_list_type(tgt.get("t")):
+            out_r.add(root)
+    for key in ("l", "r", "e", "cond", "idx", "scrut", "target"):
+        _iter_writes_reads(e.get(key), out_w, out_r)
+    for a in (e.get("args") or []):
+        _iter_writes_reads(a, out_w, out_r)
+    for it in (e.get("items") or []):
+        _iter_writes_reads(it, out_w, out_r)
+    for _fn, fe in (e.get("fields") or []):
+        _iter_writes_reads(fe, out_w, out_r)
+    for arm in (e.get("arms") or []):
+        if isinstance(arm, dict):
+            _iter_writes_reads(arm.get("guard"), out_w, out_r)
+            ab = arm.get("body")
+            if isinstance(ab, list):
+                for sub in ab:
+                    _iter_writes_reads(sub, out_w, out_r)
+            else:
+                _iter_writes_reads(ab, out_w, out_r)
+
+
+def _stmt_writes_reads(s, out_w, out_r):
+    """Writes/reads of ONE statement: the assigned target (a heap write
+    when it is an index into a list binding) plus every read in the
+    value/condition expressions."""
+    if not isinstance(s, dict):
+        return
+    k = s.get("k")
+    if k == "assign":
+        t = s.get("target")
+        if isinstance(t, dict) and t.get("k") == "index":
+            root = _ident_of(t.get("target"))
+            if root is not None and _is_list_type(
+                    (t.get("target") or {}).get("t")):
+                out_w.append(_WriteSite(root, "index", t.get("idx"),
+                                        t.get("line", 0)))
+            # the index expression itself is evaluated (and read)
+            _iter_writes_reads(t.get("idx"), out_w, out_r)
+        _iter_writes_reads(s.get("value"), out_w, out_r)
+        if isinstance(t, dict) and t.get("k") == "index":
+            # the target itself is a read too (the object is loaded)
+            rroot = _ident_of(t.get("target"))
+            if rroot is not None and _is_list_type(
+                    (t.get("target") or {}).get("t")):
+                out_r.add(rroot)
+        return
+    if k in ("let",):
+        _iter_writes_reads(s.get("value"), out_w, out_r)
+        return
+    for key in ("value", "cond", "iter", "e"):
+        _iter_writes_reads(s.get(key), out_w, out_r)
+
+
+def _cursor_accesses(stmts, root, cursor, acc):
+    """In-order scan for accesses `root[<cursor>]` / `root.get(<cursor>)`
+    inside one loop body. `acc` = [updated, total, safe, blocked]: every
+    access BEFORE the first cursor update counts as head-state (safe
+    candidates), everything after is blocked (the cursor may sit at len
+    once bumped). Conservative in one direction: an update inside a
+    sibling branch still blocks later accesses."""
+    if not isinstance(stmts, list):
+        return
+    for s in stmts:
+        if not isinstance(s, dict):
+            continue
+        k = s.get("k")
+        if k == "assign":
+            t = s.get("target")
+            if isinstance(t, dict) and t.get("k") == "index":
+                r = _ident_of(t.get("target"))
+                idx = t.get("idx")
+                if r == root and _ident_of(idx) == cursor:
+                    acc[1] += 1
+                    if acc[0]:
+                        acc[3] += 1
+                    else:
+                        acc[2] += 1
+                elif r == root:
+                    acc[1] += 0  # an off-cursor write: not an access claim
+            if isinstance(t, dict) and t.get("k") == "ident" \
+                    and t.get("name") == cursor:
+                acc[0] = True
+                continue  # the update's RHS cannot touch the head cursor
+            _rhs_accesses(s.get("value"), root, cursor, acc)
+        elif k == "let":
+            _rhs_accesses(s.get("value"), root, cursor, acc)
+        elif k == "expr":
+            _rhs_accesses(s.get("e"), root, cursor, acc)
+        elif k == "return":
+            _rhs_accesses(s.get("value"), root, cursor, acc)
+        elif k == "if":
+            _rhs_accesses(s.get("cond"), root, cursor, acc)
+            _cursor_accesses(s.get("then"), root, cursor, acc)
+            _cursor_accesses(s.get("els"), root, cursor, acc)
+        elif k in ("while", "for"):
+            _rhs_accesses(s.get("cond"), root, cursor, acc)
+            _rhs_accesses(s.get("iter"), root, cursor, acc)
+            _cursor_accesses(s.get("body"), root, cursor, acc)
+
+
+def _rhs_accesses(e, root, cursor, acc):
+    """Head-state accesses inside an expression tree (reads and
+    `set` writes at the cursor). Expression evaluation at the loop head
+    happens before any statement-order cursor update."""
+    if not isinstance(e, dict):
+        return
+    k = e.get("k")
+    if k == "index":
+        r = _ident_of(e.get("target"))
+        if r == root and _ident_of(e.get("idx")) == cursor:
+            if acc[0]:
+                acc[3] += 1
+            else:
+                acc[2] += 1
+            acc[1] += 1
+    if k == "method" and e.get("name") in ("get", "set"):
+        r = _ident_of(e.get("target"))
+        args = e.get("args") or []
+        if r == root and len(args) >= 1 \
+                and _ident_of(args[0]) == cursor:
+            if acc[0]:
+                acc[3] += 1
+            else:
+                acc[2] += 1
+            acc[1] += 1
+    for key in ("l", "r", "e", "cond", "idx", "scrut", "target"):
+        _rhs_accesses(e.get(key), root, cursor, acc)
+    for a in (e.get("args") or []):
+        _rhs_accesses(a, root, cursor, acc)
+    for it in (e.get("items") or []):
+        _rhs_accesses(it, root, cursor, acc)
+    for _fn, fe in (e.get("fields") or []):
+        _rhs_accesses(fe, root, cursor, acc)
+
+
+def _shape_cond_text(root, cursor, op):
+    return "%s %s %s.len()" % (cursor, op, root)
+
+
+def _build_shape_loop(fs, stmt, kind, classes):
+    """Detect and summarise one loop's shape candidate. Never raises:
+    anything outside the fragment lands in frame_reasons."""
+    line = stmt.get("line", 0)
+    if kind == "for":
+        header = "for %s in %s" % (stmt.get("var"),
+                                   _shape_expr_text(stmt.get("iter")))
+    else:
+        header = "while %s" % _shape_expr_text(stmt.get("cond"))
+    ls = ShapeLoop(fs.fn_key, kind, line, header)
+    body = stmt.get("body") or []
+
+    # -- the anchor ------------------------------------------------------
+    if kind == "while":
+        anchor = _len_anchor(stmt.get("cond"))
+        if anchor is None:
+            ls.cond_reason = ("condition is not <cursor> op <root>.len()> "
+                              "— no heap anchor")
+            return ls
+        root, cursor, op = anchor
+        ls.root, ls.cursor, ls.cond_op = root, cursor, op
+        ls.range_lo = None
+        if op not in ("<", "<="):
+            # flipped canonical form already applied by _len_anchor
+            ls.cond_reason = "unsupported comparison %s" % op
+            return ls
+    else:
+        rng = _shape_range(stmt.get("iter"))
+        if rng is None:
+            ls.cond_reason = ("iterable is not range(a, <root>.len()>) — "
+                              "no heap anchor")
+            return ls
+        (akind, aval), root = rng
+        cursor = stmt.get("var")
+        if not isinstance(cursor, str):
+            ls.cond_reason = "loop variable is not a plain binding"
+            return ls
+        ls.root, ls.cursor, ls.cond_op = root, cursor, "<"
+        ls.range_lo = (akind, aval)
+        if akind == "lit" and aval < 0:
+            ls.cond_reason = ("range start %d is negative — the cursor "
+                              "starts outside the list" % aval)
+            return ls
+
+    if not _is_list_type(_binding_type(fs, stmt, root)):
+        ls.cond_reason = "anchor %s is not a list binding" % root
+        return ls
+
+    # -- the transition ---------------------------------------------------
+    if _has_escape(body):
+        ls.refused("body escapes through return/break/continue — the "
+                   "shape after the escape is unowned")
+        return ls
+    carried = set(_assigned_names(body))
+    carried.add(ls.cursor)
+    if kind == "while":
+        sumr = _summarize_body(body, carried)
+        if ls.cursor in sumr.unmodeled:
+            ls.refused("cursor %s is unmodeled: %s"
+                       % (ls.cursor, sumr.unmodeled[ls.cursor]))
+            return ls
+        disjs = sumr.trans.get(ls.cursor)
+        if not disjs:
+            ls.refused("cursor %s is never reassigned in the body — not "
+                       "a walk" % ls.cursor)
+            return ls
+        steps = []
+        for self_c, terms, const in disjs:
+            if terms:
+                ls.refused("cursor step references other variables — "
+                           "outside the fragment")
+                return ls
+            if self_c not in (0, 1):
+                ls.refused("cursor step is not a self-step")
+                return ls
+            if self_c == 0 and const != 0:
+                ls.refused("cursor step rebinds to a constant")
+                return ls
+            if self_c == 1:
+                steps.append(const)
+        if not steps:
+            ls.refused("cursor never moves")
+            return ls
+        ls.steps = steps
+    else:
+        # for-range: the cursor is fresh-bound per iteration, step +1.
+        for name in _assigned_names(body):
+            if name == ls.cursor:
+                ls.refused("the for-variable %s is reassigned in the body"
+                           % ls.cursor)
+                return ls
+        ls.steps = [1]
+
+    # -- the frame ---------------------------------------------------------
+    w_sites = []
+    w_locals = []
+    _stmt_writes_list(body, w_sites, w_locals)
+    cid = classes.of(ls.root)
+    reasons = []
+    for site in w_sites:
+        site_cid = classes.of(site.binding)
+        if site_cid != cid:
+            continue
+        if site.kind in ("push", "pop"):
+            reasons.append("%s.%s() at line %d changes len(%s)"
+                           % (site.binding, site.kind, site.line, ls.root))
+        elif site.kind == "set":
+            if _ident_of(site.idx) != ls.cursor:
+                reasons.append("%s.set(..) at line %d writes off the "
+                               "cursor cell"
+                               % (site.binding, site.line))
+        elif site.kind == "index":
+            if _ident_of(site.idx) != ls.cursor:
+                reasons.append("%s[..] = .. at line %d writes off the "
+                               "cursor cell"
+                               % (site.binding, site.line))
+    for name in w_locals:
+        if name == ls.root or (cid != _SHAPE_WILD
+                               and name in classes.members.get(cid, ())):
+            reasons.append("%s is rebound inside the loop" % name)
+    # a wildcard-class write may alias ANY class — including the anchor's
+    if any(classes.of(w.binding) == _SHAPE_WILD for w in w_sites):
+        reasons.append("a write through unknown provenance may reach %s"
+                       % ls.root)
+    if reasons:
+        ls.frame_reasons.extend(reasons)
+        return ls
+    ls.frame_ok = True
+
+    # -- accesses at the cursor cell ---------------------------------------
+    strict = ls.cond_op == "<" if kind == "while" else True
+    acc = [False, 0, 0, 0]  # updated, total, safe, blocked
+    _cursor_accesses(body, ls.root, ls.cursor, acc)
+    ls.access_total = acc[1]
+    if strict:
+        ls.access_safe = acc[2]
+        ls.access_blocked = acc[3]
+    else:
+        ls.access_blocked = acc[1]
+        ls.access_safe = 0
+    ls.cond_ok = True
+    return ls
+
+
+def _binding_type(fs, stmt, name):
+    """The checked type of a binding name (params first, then let/assign
+    annotations anywhere in the function)."""
+    for pn, pt, _rest in _fn_params(fs):
+        if pn == name:
+            return pt
+    found = _binding_type_scan(fs.fn.get("body") or [], name)
+    return found
+
+
+def _fn_params(fs):
+    return fs.fn.get("params") or []
+
+
+def _binding_type_scan(stmts, name):
+    if not isinstance(stmts, list):
+        return None
+    for s in stmts:
+        if not isinstance(s, dict):
+            continue
+        k = s.get("k")
+        if k == "let" and s.get("name") == name:
+            t = s.get("t")
+            if isinstance(t, str):
+                return t
+        if k == "assign":
+            t = s.get("target")
+            if isinstance(t, dict) and t.get("k") == "ident" \
+                    and t.get("name") == name and isinstance(t.get("t"), str):
+                return t.get("t")
+        for bkey in ("body", "then", "els"):
+            r = _binding_type_scan(s.get(bkey), name)
+            if r is not None:
+                return r
+    return None
+
+
+def _shape_range(it):
+    """range(a, <root>.len()) -> ((akind, aval), root). a: int literal or
+    plain ident (the runs-guard decides whether it is in bounds)."""
+    if not isinstance(it, dict) or it.get("k") != "call" \
+            or it.get("name") != "range":
+        return None
+    args = it.get("args") or []
+    if len(args) != 2:
+        return None
+    a = args[0]
+    if isinstance(a, dict) and a.get("k") == "int" \
+            and isinstance(a.get("v"), int):
+        lo = ("lit", a["v"])
+    elif isinstance(a, dict) and a.get("k") == "ident" \
+            and isinstance(a.get("name"), str):
+        lo = ("var", a["name"])
+    else:
+        return None
+    b = args[1]
+    root = None
+    if isinstance(b, dict) and b.get("k") == "method" \
+            and b.get("name") == "len":
+        root = _ident_of(b.get("target"))
+    elif isinstance(b, dict) and b.get("k") == "call" \
+            and b.get("name") == "len":
+        bargs = b.get("args") or []
+        if len(bargs) == 1:
+            root = _ident_of(bargs[0])
+    if root is None:
+        return None
+    return (lo, root)
+
+
+def _stmt_writes_list(stmts, out_sites, out_rebinds):
+    """Every heap write site and list-binding rebind inside a statement
+    tree (recursing through nested loops — writes there still happen)."""
+    if not isinstance(stmts, list):
+        return
+    for s in stmts:
+        if not isinstance(s, dict):
+            continue
+        k = s.get("k")
+        if k == "assign":
+            t = s.get("target")
+            if isinstance(t, dict) and t.get("k") == "index":
+                root = _ident_of(t.get("target"))
+                if root is not None and _is_list_type(
+                        (t.get("target") or {}).get("t")):
+                    out_sites.append(_WriteSite(root, "index", t.get("idx"),
+                                                s.get("line", 0)))
+            elif isinstance(t, dict) and t.get("k") == "ident" \
+                    and _is_list_type(t.get("t")):
+                out_rebinds.append(t.get("name"))
+            _iter_writes_reads(s.get("value"), out_sites, set())
+        elif k == "let":
+            if _is_list_type(s.get("t")) and isinstance(s.get("name"), str):
+                out_rebinds.append(s.get("name"))
+            _iter_writes_reads(s.get("value"), out_sites, set())
+        elif k == "expr":
+            _iter_writes_reads(s.get("e"), out_sites, set())
+        elif k == "return":
+            _iter_writes_reads(s.get("value"), out_sites, set())
+        elif k == "if":
+            _iter_writes_reads(s.get("cond"), out_sites, set())
+            _stmt_writes_list(s.get("then"), out_sites, out_rebinds)
+            _stmt_writes_list(s.get("els"), out_sites, out_rebinds)
+        elif k in ("while", "for"):
+            _iter_writes_reads(s.get("cond"), out_sites, set())
+            _iter_writes_reads(s.get("iter"), out_sites, set())
+            _stmt_writes_list(s.get("body"), out_sites, out_rebinds)
+
+
+def _shape_expr_text(e):
+    """Textual rendering for shape headers (len() calls included)."""
+    if not isinstance(e, dict):
+        return "?"
+    k = e.get("k")
+    if k == "int":
+        return str(e.get("v"))
+    if k == "ident":
+        return e.get("name", "?")
+    if k == "method":
+        tgt = _shape_expr_text(e.get("target"))
+        if e.get("name") == "len" and not (e.get("args") or []):
+            return "%s.len()" % tgt
+        return "%s.%s(..)" % (tgt, e.get("name"))
+    if k == "call":
+        args = ", ".join(_shape_expr_text(a) for a in (e.get("args") or []))
+        return "%s(%s)" % (e.get("name", "?"), args)
+    if k == "bin":
+        return "%s %s %s" % (_shape_expr_text(e.get("l")), e.get("op"),
+                             _shape_expr_text(e.get("r")))
+    return "?"
+
+
+def _walk_shape_stmts(fs, stmts):
+    """The main alias-tracking walk: maintain classes through
+    let/assign, collect writes/reads, and hand every loop to
+    _build_shape_loop with the class snapshot AT the loop head."""
+    if not isinstance(stmts, list):
+        return
+    for s in stmts:
+        if not isinstance(s, dict):
+            continue
+        k = s.get("k")
+        if k == "let":
+            val = s.get("value")
+            if _is_list_type(s.get("t")) and isinstance(s.get("name"), str):
+                _rebind_list(fs.classes, s["name"], val)
+            _collect_wr(fs, val)
+        elif k == "assign":
+            t = s.get("target")
+            if isinstance(t, dict) and t.get("k") == "ident" \
+                    and _is_list_type(t.get("t")):
+                _rebind_list(fs.classes, t.get("name"), s.get("value"))
+            _collect_wr_stmt(fs, s)
+        elif k == "expr":
+            _collect_wr(fs, s.get("e"))
+        elif k == "return":
+            _collect_wr(fs, s.get("value"))
+        elif k == "if":
+            _collect_wr(fs, s.get("cond"))
+            _walk_shape_stmts(fs, s.get("then"))
+            _walk_shape_stmts(fs, s.get("els"))
+        elif k in ("while", "for"):
+            if k == "while":
+                _collect_wr(fs, s.get("cond"))
+            else:
+                _collect_wr(fs, s.get("iter"))
+            ls = _build_shape_loop(fs, s, k, fs.classes.snapshot())
+            fs.loops.append(ls)
+            _walk_shape_stmts(fs, s.get("body"))
+
+
+def _collect_wr_stmt(fs, s):
+    """Writes/reads of one statement through the CURRENT classes."""
+    out_w = []
+    out_r = set()
+    _stmt_writes_reads(s, out_w, out_r)
+    for site in out_w:
+        fs.writes.append((fs.classes.of(site.binding), site))
+    for r in out_r:
+        fs.reads.add(fs.classes.of(r))
+
+
+def _collect_wr(fs, e):
+    """Writes/reads inside one expression tree through the CURRENT
+    classes."""
+    if not isinstance(e, dict):
+        return
+    out_w = []
+    out_r = set()
+    _iter_writes_reads(e, out_w, out_r)
+    for site in out_w:
+        fs.writes.append((fs.classes.of(site.binding), site))
+    for r in out_r:
+        fs.reads.add(fs.classes.of(r))
+
+
+def _decide_separation(fs):
+    """The separation verdicts for every pair of written classes."""
+    written = {}
+    for cid, site in fs.writes:
+        written.setdefault(cid, []).append(site)
+    reps = {}
+    for cid in written:
+        reps[cid] = fs.classes.repr_of(cid)
+    cids = sorted(written.keys(), key=lambda c: reps[c])
+    if len(cids) <= 1:
+        return  # single writer (or none) — nothing to separate
+    for i in range(len(cids)):
+        for j in range(i + 1, len(cids)):
+            a, b = cids[i], cids[j]
+            ra, rb = reps[a], reps[b]
+            if a == _SHAPE_WILD or b == _SHAPE_WILD:
+                why = ("writes through unknown provenance may alias "
+                       "anything")
+            elif fs.classes.fresh.get(a) or fs.classes.fresh.get(b):
+                why = ("one side is allocated inside the function "
+                       "(literal / clone) — disjoint from every "
+                       "pre-existing object")
+            else:
+                why = ("both sides are caller-owned; a caller may pass "
+                       "the same list to both (f(xs, xs) aliases the "
+                       "parameters) — no fresh evidence")
+            proven = (a != _SHAPE_WILD and b != _SHAPE_WILD
+                      and (fs.classes.fresh.get(a)
+                           or fs.classes.fresh.get(b)))
+            fs.separation.append((ra, rb, proven, why))
+
+
+def analyze_heap(fn_key, fn):
+    """The full Stage 100 heap analysis of one function."""
+    fs = FnShapes(fn_key, fn)
+    for p in fn.get("params") or []:
+        name, ptype = p[0], p[1]
+        if _is_list_type(ptype):
+            fs.classes.new_class(name, False)  # caller-owned
+    _walk_shape_stmts(fs, fn.get("body") or [])
+    _decide_separation(fs)
+    return fs
+
+
+def _entry_facts_map(fn):
+    """id(loop stmt) -> interval facts at the loop head (the same
+    hook/keep-first convention as infer_loops)."""
+    req = fn.get("requires")
+    base = seed_from_requires(req, fn.get("params"), 0) \
+        if req is not None else {}
+    out = {}
+
+    def hook(stmt, kind, snap, out=out):
+        out.setdefault(id(stmt), snap)
+
+    propagate_stmts(fn.get("body") or [], base, 0, hook)
+    return out
+
+
+def collect_shapes(program):
+    """Stage 100 entry point: heap analysis of every non-extern
+    function, entry facts attached to every loop candidate."""
+    out = []
+    for key, fn in program["fns"].items():
+        if fn.get("extern", False):
+            continue
+        fs = analyze_heap(key, fn)
+        facts = _entry_facts_map(fn)
+        for ls in fs.loops:
+            node = _loop_node_of(fs, ls)
+            snap = facts.get(id(node), {})
+            ls.entry_facts = snap
+            ml = snap.get(_MINLEN)
+            if isinstance(ml, dict):
+                v = ml.get(ls.root)
+                if isinstance(v, int):
+                    ls.minlen = v
+        out.append(fs)
+    return out
+
+
+def _loop_node_of(fs, ls):
+    """The loop stmt node a ShapeLoop was built from (line + kind +
+    header identify it; loops were collected in walk order)."""
+    nodes = []
+
+    def scan(stmts):
+        for s in stmts or []:
+            if isinstance(s, dict) and s.get("k") in ("while", "for"):
+                nodes.append(s)
+                scan(s.get("body"))
+
+    scan(fs.fn.get("body") or [])
+    for s in nodes:
+        if s.get("line", 0) == ls.line and s.get("k") == ls.kind:
+            return s
+    return nodes[0] if nodes else {}
+
+
+def _shape_of_loop_text(ls):
+    return ("lseg(%s, 0, %s) * cell(%s, %s) * lseg(%s, %s + 1, %s.len())"
+            % (ls.root, ls.cursor, ls.root, ls.cursor, ls.root, ls.cursor,
+               ls.root))
+
+
+def _shape_segments(ls):
+    """The two SMT obligations of one shape candidate:
+      initiation    — entry facts ∧ ¬shape
+      preservation  — shape ∧ cond ∧ step ⊫ ¬shape'
+    `xs_len` is a plain Int constant: the frame check is the SYNTACTIC
+    justification for treating the list's extent as loop-invariant
+    (writes stay in the cursor cell; no push/pop touches the class)."""
+    xs_len = "%s_len" % ls.root
+    cur = ls.cursor
+    decls = [cur, xs_len]
+    if ls.range_lo is not None and ls.range_lo[0] == "var":
+        decls.append(ls.range_lo[1])
+    shape = "(and (>= %s 0) (<= %s %s))" % (cur, cur, xs_len)
+    shape_p = "(and (>= %s_p 0) (<= %s_p %s))" % (cur, cur, xs_len)
+
+    def prelude(primed):
+        lines = []
+        for v in decls:
+            lines.append("(declare-const %s Int)" % v)
+        if primed:
+            lines.append("(declare-const %s_p Int)" % cur)
+        return lines
+
+    axioms = ["; len(xs) >= 0 — a list's extent is never negative",
+              "(assert (>= %s 0))" % xs_len]
+    if ls.minlen is not None:
+        axioms.append("; entry fact: len(%s) >= %d (seeded by requires)"
+                      % (ls.root, ls.minlen))
+        axioms.append("(assert (>= %s %d))" % (xs_len, ls.minlen))
+
+    # -- initiation --------------------------------------------------------
+    head = prelude(False)
+    init = list(head) + axioms
+    init.append("; the cursor's interval at the loop head")
+    iv = ls.entry_facts.get(cur)
+    if isinstance(iv, Interval):
+        if iv.lo is not None and not isinstance(iv.lo, tuple):
+            init.append("(assert (>= %s %d))" % (cur, iv.lo))
+        if iv.hi is not None and not isinstance(iv.hi, tuple):
+            init.append("(assert (<= %s %d))" % (cur, iv.hi))
+    if ls.range_lo is not None:
+        akind, aval = ls.range_lo
+        a_s = str(aval) if akind == "lit" else aval
+        # the runs-guard: a for-variable is bound only when an iteration
+        # happens — an empty range vacuously satisfies every shape
+        init.append("; the runs-guard: the loop body runs only when "
+                    "a < len(%s)" % ls.root)
+        init.append("(assert (< %s %s))" % (a_s, xs_len))
+        init.append("(assert (= %s %s))" % (cur, a_s))
+        if akind == "var":
+            # the start's own entry interval (a `requires start >= 0`
+            # seed is exactly what pins a var-start walk to the shape)
+            av = ls.entry_facts.get(aval)
+            if isinstance(av, Interval):
+                if av.lo is not None and not isinstance(av.lo, tuple):
+                    init.append("(assert (>= %s %d))" % (aval, av.lo))
+                if av.hi is not None and not isinstance(av.hi, tuple):
+                    init.append("(assert (<= %s %d))" % (aval, av.hi))
+    init.append("; initiation: unsat => the shape holds at entry")
+    init.append("(assert (not %s))" % shape)
+    init_seg = _segment(head,
+                        "; shape initiation of [%s]: unsat => holds on "
+                        "entry" % _shape_of_loop_text(ls),
+                        init[len(head):])
+
+    # -- preservation --------------------------------------------------------
+    # the next head exists only while the condition still holds, so the
+    # obligation is  shape ∧ cond ∧ trans ∧ cond' ⊫ shape'  — the
+    # vacuous-exit iterations are excluded, everything else must stay
+    # inside the list's extent
+    head_p = prelude(True)
+    keep = list(head_p) + axioms
+    keep.append("(assert %s)" % shape)
+    if ls.range_lo is None:
+        keep.append("; the loop condition")
+        keep.append("(assert (%s %s %s))" % (ls.cond_op, cur, xs_len))
+    else:
+        akind, aval = ls.range_lo
+        a_s = str(aval) if akind == "lit" else aval
+        keep.append("(assert (< %s %s))" % (a_s, xs_len))
+    keep.append("; the cursor's transition: i' = i + c (per disjunct)")
+    eqs = ["(= %s_p (+ %s %d))" % (cur, cur, c) for c in ls.steps]
+    keep.append("(assert %s)" % (eqs[0] if len(eqs) == 1
+                                 else "(or %s)" % " ".join(eqs)))
+    keep.append("; the condition at the NEXT head (the loop did not "
+                "exit)")
+    if ls.range_lo is None:
+        keep.append("(assert (%s %s_p %s))" % (ls.cond_op, cur, xs_len))
+    else:
+        keep.append("(assert (< %s_p %s))" % (cur, xs_len))
+    keep.append("; preservation: unsat => the shape is inductive")
+    keep.append("(assert (not %s))" % shape_p)
+    keep_seg = _segment(head_p,
+                        "; shape preservation of [%s]: unsat => inductive"
+                        % _shape_of_loop_text(ls),
+                        keep[len(head_p):])
+    return [("init: %s" % ls.header, init_seg),
+            ("keep: %s" % ls.header, keep_seg)]
+
+
+def verify_shapes(fs_list, decide):
+    """Decide every frame-clean candidate's two obligations. Returns the
+    verified segments per function for --smt dumps:
+    {fn_key: [(loop, [(label, lines)])]}. With no decider, frame-clean
+    candidates become "unverified" (reported, nothing claimed) — the
+    Stage 97 honesty rule."""
+    out = {}
+    for fs in fs_list:
+        for ls in fs.loops:
+            if not ls.frame_ok or not ls.cond_ok:
+                ls.status = "refused"
+                continue
+            if decide is None:
+                ls.status = "unverified"
+                continue
+            segs = _shape_segments(ls)
+            init_v = decide(segs[0][1])
+            if init_v != "unsat":
+                ls.status = "refused"
+                ls.solver_reason = ("initiation not discharged (%s)"
+                                    % init_v)
+                continue
+            keep_v = decide(segs[1][1])
+            if keep_v != "unsat":
+                ls.status = "refused"
+                ls.solver_reason = ("preservation not discharged (%s)"
+                                    % keep_v)
+                continue
+            ls.status = "proven"
+            ls.shape_text = _shape_of_loop_text(ls)
+            ls.segments = segs
+            out.setdefault(fs.fn_key, []).append((ls, segs))
+    return out

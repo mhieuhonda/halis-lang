@@ -5351,3 +5351,162 @@ must appear.
   gate failure to investigate, never a vote — soundness rests on
   unsat verdicts, and an unsat only one engine certifies is not
   soundness, it is a bug report.
+
+
+---
+
+## 54. The separation-logic fragment — heap shapes (Stage 100 — v0.119.0-alpha)
+
+Stages 17/97 gave the prover SCALARS: interval bounds and affine
+invariant templates over Ints. Neither says anything about the heap —
+the lists a program allocates, aliases and writes through. Stage 100
+adds the fragment that can, as `hlprove --shapes`: a per-function heap
+analysis whose every verdict is either proven from explicit evidence or
+refused with its reason. The fragment is deliberately small — lists
+only, top-level bindings only, straight-line walking loops only — and
+that smallness is what makes every claim checkable.
+
+### 54.1. Alias classes — the heap's shape at a program point
+
+Halis values are references (SPEC 16): assignment aliases, and mutation
+is visible through every reference. The experiment that pins the
+design: `f(xs, xs)` is LEGAL and the two parameters ARE the same list.
+So "distinct parameters never alias" is FALSE in Halis, and separation
+is never assumed — it is proven from explicit freshness evidence.
+
+Every list-typed binding belongs to exactly one alias class:
+
+- **fresh** — bound to a list literal or `clone(..)`: allocated inside
+  the function, provably disjoint from every object that existed
+  before the allocation;
+- **caller-owned** — a parameter, or an alias chain into one
+  (`let ys = xs` merges `ys` into `xs`'s class);
+- **the wildcard class** — unknown provenance (`grid.get(0)`, a call
+  result): it may alias anything, so any write through it refuses
+  separation and frames alike.
+
+Re-binding updates membership in statement order (a fresh rebind
+detaches a binding from its old class); the class state is snapshotted
+at every loop head — that snapshot is the frame's world.
+
+### 54.2. Footprints and separation verdicts
+
+Per function, writes through each class classify it W (written), R
+(read-only) or untouched. The fragment's separation statement, decided
+per pair of written classes:
+
+- `own(a) * own(b)` **PROVEN** — at least one side is fresh: a fresh
+  allocation is disjoint from every pre-existing object (and from
+  every other fresh allocation).
+- **REFUSED** — two caller-owned classes: a caller may pass the same
+  list to both (`f(xs, xs)`), and no in-body evidence can rule that
+  out; or any pair involving the wildcard class: unknown provenance
+  may reach anything.
+
+A single written class is *trivially separated*; a function with no
+heap writes has a read-only frame. The verdict line carries its reason
+word for word — the report is the proof obligation's outcome, not a
+score.
+
+### 54.3. Cursor-loop shape triples
+
+The classic separation-logic proof for a list walk, recognised where
+the loop is anchored DIRECTLY on the heap:
+
+- a while condition of the form `<cursor> op <root>.len()` (the
+  flipped and `len(root)` spellings included; a captured
+  `let n = xs.len()` is an Int copy with no heap link and never
+  anchors);
+- a for over `range(a, <root>.len())` with `a` an int literal or plain
+  binding;
+- a cursor that steps by an affine literal self-step `i' = i + c`
+  (conditionally identity — `if flag { i = i + 1 }` yields
+  `i' = i | i + 1`), never referencing other variables;
+- a FRAME with teeth: every write through the anchor's alias class
+  anywhere in the body must be exactly the cursor cell
+  (`xs[i] = ..` / `xs.set(i, ..)`), no push/pop may touch the class,
+  no member rebound, no through-alias or wildcard write, no
+  return/break/continue escapes.
+
+The shape claim at every loop head is
+
+```
+lseg(xs, 0, i) * cell(xs, i) * lseg(xs, i+1, xs.len())
+```
+
+formalised as `0 <= i /\ i <= xs_len` with `xs_len` a loop-invariant
+Int — the frame check is the syntactic justification for that
+abstraction (writes stay in the cursor cell; the extent cannot move).
+Two obligations per candidate, decided by the same backend as the
+invariants (z3, cvc5 under `--cvc5`):
+
+- **initiation** — the entry state satisfies the shape: the cursor's
+  interval facts at the loop head (seeded by `requires` when the range
+  start is a binding), plus the runs-guard `a < len(xs)` that makes
+  empty ranges vacuous;
+- **preservation** — `shape(i) ∧ cond(i) ∧ trans ∧ cond(i') ⊫
+  shape(i')`. The next head exists only while the condition still
+  holds, so the exit iteration is excluded — a conditional bump keeps
+  the shape, and `while i <= xs.len()` walks are provable.
+
+No solver installed → candidates are reported unverified and nothing
+is claimed; a sat obligation refuses the shape and the report says
+which obligation failed.
+
+### 54.4. Access-in-bounds by shape
+
+Where the shape is proven, cursor accesses (`xs[i]`, `xs.get(i)`,
+`xs.set(i, ..)`) are in bounds by shape — the payoff the interval
+engine cannot reach (widening loses `i < xs.len()` across the loop).
+The claim is counted and honestly bounded: only accesses PRECEDING the
+cursor update are head-state (after a bump the cursor may sit at
+`len`), and only strict conditions (`<`, or for-range by construction)
+give `i < len` at the head; `<=` shapes are proven but claim no
+accesses. The `condbump` case in `examples/heap_demo.hls` is the
+demonstration: shape PROVEN, the post-bump access refused, and the
+refusal names a real out-of-bounds the loop would hit.
+
+### 54.5. What the fragment is NOT
+
+- **Not a language change.** No new syntax, no attributes, no contract
+  clauses; the fragment reads what is already there.
+- **Not a codegen dependency.** Analysis-only like 51.4: `-O fast`
+  elision belongs to the interval engine alone; a shape verdict cannot
+  change a binary, and the demo and ok-test run identically interpreted
+  and native.
+- **Not a whole-heap prover.** Nested lists are wildcard-class by
+  construction, structs carrying lists are out of scope, and multi-
+  cursor or conjunction-anchored loops are refused — where the
+  fragment refuses, Stage 97's arithmetic invariants may still apply.
+- **Not separation by fiat.** `own(a) * own(b)` between two parameters
+  is refused by design in Halis, because the language's call semantics
+  make it false. The fragment claims exactly what the alias evidence
+  supports — nothing more.
+
+### 54.6. The gate
+
+`make shapes-acceptance` (six sections; requires a decider — a z3
+binary or `pip install z3-solver`):
+
+- **the engine** — the battery with pinned verdicts and access counts:
+  the for-range flagship, the `len()/set()/get()` while walk, the
+  conditional bump (shape proven, post-bump access blocked), two walks
+  over two roots, the `requires`-pinned var range start, and the four
+  separation stories (fresh, clone, caller-owned refusal, alias-merge
+  single-writer);
+- **the soundness flips** — descending steps, off-cursor writes,
+  pushes inside the loop, captured lengths, through-alias writes,
+  escaping bodies, unseeded var starts: every one refused with its
+  pinned reason;
+- **the obligations** — every verified segment z3-unsat; the
+  `.shape.smt2` dumps re-decided unsat from their files;
+- **the CLI** — the report lines, the totals, the no-solver honesty
+  (candidates, never proofs), `--z3 --cvc5` still exit 2;
+- **the demo** — `examples/heap_demo.hls` and
+  `tests/ok/feat_stage100_heaps.hls`, interpreter vs native under
+  `cc -O2 -Werror`, byte for byte;
+- **the tools** — hlfmt stable, hllint clean.
+
+The suite keeps the two-tier smoke block in `tests/suites/`: the
+`--shapes` run must be clean with or without a solver installed, and
+wherever a decider exists the proven/refusal lines must appear.

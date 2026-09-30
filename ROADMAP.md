@@ -160,7 +160,7 @@ remains green.
 | 97 | SMT-based loop-invariant inference (auto-discovery) | ✅ | (done in v0.116.0-alpha) |
 | 98 | Refinement types (lightweight, opt-in) | ✅ | (done in v0.117.0-alpha) |
 | 99 | `hlprove --cvc5` — CVC5 SMT backend | ✅ | (done in v0.118.0-alpha) |
-| 100 | Separation-logic fragment (heap shapes) | ⬜ | 8 weeks |
+| 100 | Separation-logic fragment (heap shapes) | ✅ | (done in v0.119.0-alpha) |
 | 101 | Cryptographic side-channel analysis pass | ⬜ | 5 weeks |
 | 102 | Constant-time verifier (verify code is branch-free on secrets) | ⬜ | 4 weeks |
 | 103 | `hls-audit` — supply-chain effect report (transitive) | ⬜ | 4 weeks |

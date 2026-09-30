@@ -83,6 +83,19 @@ infer-smt:
 cvc5:
 	@python3 tools/hlprove.py $(F) --cvc5
 
+# Stage 100 (v0.119.0-alpha): the separation-logic fragment — heap
+# shapes. Footprints over alias classes, separation verdicts
+# (own(a) * own(b), proven from freshness evidence), and cursor-loop
+# shape triples (lseg * cell * lseg) decided by the SMT backend.
+shapes:
+	@python3 tools/hlprove.py $(F) --shapes
+
+# The same, plus one .shape.smt2 obligations file per verified loop
+# (named <fn>__L<line>.shape.smt2, next to the source like every
+# bridge dump).
+shapes-smt:
+	@python3 tools/hlprove.py $(F) --shapes --smt
+
 # Exhaustive finite-state model checking of a transition fn
 model:
 	@if [ -z "$(F)" ] || [ -z "$(FN)" ]; then echo "Usage: make model F=file.hls FN=transition_fn [INV=invariant_fn] [INIT=Enum.Variant]" && false; fi; \
@@ -113,6 +126,13 @@ cvc5-acceptance:
 	@echo "[Stage 99 acceptance] running tests/cvc5_acceptance.py..."
 	@$(PYTHON) tests/cvc5_acceptance.py
 
+# Stage 100 acceptance gate: the separation-logic fragment. Requires a
+# decider — a z3 binary or the z3-solver python module (the gate says
+# which to install when neither exists).
+shapes-acceptance: $(BIN)/hlc
+	@echo "[Stage 100 acceptance] running tests/shapes_acceptance.py..."
+	@$(PYTHON) tests/shapes_acceptance.py
+
 refine-acceptance: $(BIN)/hlc
 	@echo "[Stage 98 acceptance] running tests/refine_acceptance.py..."
 	@$(PYTHON) tests/refine_acceptance.py
@@ -137,7 +157,8 @@ examples:
 		   examples/bounded_chan_demo.hls examples/conc_pipeline.hls \
 		   examples/par_scan.hls examples/hmac_proven.hls \
 		   examples/proof_demo.hls examples/refine_demo.hls \
-		   examples/conn_machine.hls examples/bits_demo.hls \
+		   examples/heap_demo.hls examples/conn_machine.hls \
+		   examples/bits_demo.hls \
 		   examples/set_demo.hls; do \
 		 echo "--- $$f"; $(PYTHON) boot/boot.py $$f || exit 1; \
 	done
