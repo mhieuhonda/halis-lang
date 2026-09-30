@@ -89,6 +89,19 @@ if python3 tools/hlprove.py examples/hmac_proven.hls >/dev/null 2>&1; then
 else
     bad "hlprove failed on the HMAC acceptance example"
 fi
+# Stage 97: SMT-based loop-invariant inference. The engine must run
+# clean on the demo, claim the strengthened accumulator, and REFUSE the
+# non-inductive entry bound (the gate pins the full battery; this pins
+# the pipeline is wired).
+inv_out=$(python3 tools/hlprove.py examples/invariant_demo.hls --infer-invariants 2>/dev/null); inv_rc=$?
+if [ "$inv_rc" -eq 0 ] && echo "$inv_out" | grep -q "      s >= 0   (entry-bound)" \
+   && echo "$inv_out" | grep -q "rejected: i >= 0 (preservation obligation not discharged)" \
+   && echo "$inv_out" | grep -q "INFERENCE TOTAL:"; then
+    ok "hlprove --infer-invariants discovers and refuses on the demo"
+else
+    bad "hlprove --infer-invariants wrong on the demo (rc=$inv_rc)"
+fi
+
 # hlmodel must exhaustively check the demo state machine.
 if python3 tools/hlmodel.py examples/conn_machine.hls --fn step --invariant all_valid --init Closed >/dev/null 2>&1; then
     ok "hlmodel exhaustive check of the demo state machine"

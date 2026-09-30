@@ -747,9 +747,18 @@ def _iv_contains(a, b):
     return lo_ok and hi_ok
 
 
-def propagate_stmts(stmts, facts, depth=0):
+def propagate_stmts(stmts, facts, depth=0, loop_hook=None):
     """Walk statements, updating facts for int let/assign/if/for/while,
     and annotate every expression node with safety verdicts.
+
+    Stage 97: `loop_hook(loop_stmt, kind, facts_snapshot)` — when not
+    None, it is invoked once per while/for loop BEFORE the loop is
+    processed, with a deep copy of the loop-ENTRY facts. The checker
+    never passes it (default None — zero behaviour change); the Stage 97
+    invariant inference uses it to snapshot the state at every loop
+    head. Hooks raised during the while fixpoint's internal passes are
+    the caller's business (the inference dedups by node identity and
+    keeps the first — the entry-facts pass, the most precise one).
 
     v0.30.0-alpha (Stage-17 perfection) — soundness overhauls:
       * let/assign invalidates nz / minlen / symbolic-len facts derived
@@ -784,13 +793,15 @@ def propagate_stmts(stmts, facts, depth=0):
             # invariant is sent to TOP, the top element, which by
             # definition cannot grow further). ----
             body = s.get("body") or []
+            if loop_hook is not None:
+                loop_hook(s, "while", _copy_facts(facts))
             # Round 1: exact body outcome from the entry facts.
             w1 = _copy_facts(facts)
-            propagate_stmts(body, w1, depth + 1)
+            propagate_stmts(body, w1, depth + 1, loop_hook)
             f1 = _join_facts(_copy_facts(facts), w1)
             # Round 2: body outcome from the joined facts.
             w2 = _copy_facts(f1)
-            propagate_stmts(body, w2, depth + 1)
+            propagate_stmts(body, w2, depth + 1, loop_hook)
             f2 = _join_facts(f1, w2)
             # Widen growth to infinity (the classic widening operator).
             finv = {}
@@ -803,7 +814,7 @@ def propagate_stmts(stmts, facts, depth=0):
             # POST-FIXPOINT VERIFICATION.
             for _round in range(4):
                 wchk = _copy_facts(finv)
-                propagate_stmts(body, wchk, depth + 1)
+                propagate_stmts(body, wchk, depth + 1, loop_hook)
                 grew = []
                 for key, v in wchk.items():
                     if key in (_NZ, _MINLEN) or not isinstance(v, Interval):
@@ -822,7 +833,7 @@ def propagate_stmts(stmts, facts, depth=0):
             propagate_stmt_exprs({"cond": s.get("cond")}, finv)
             # Final annotation pass for the body, under the invariant.
             wf = _copy_facts(finv)
-            propagate_stmts(body, wf, depth + 1)
+            propagate_stmts(body, wf, depth + 1, loop_hook)
             # Post-loop state: the invariant over-approximates every
             # reachable state, including the exit state.
             facts.clear()
@@ -835,6 +846,11 @@ def propagate_stmts(stmts, facts, depth=0):
             it = s.get("iter")
             rng = _const_range(it)
             body = s.get("body") or []
+            if loop_hook is not None:
+                # Snapshot BEFORE the loop variable's range fact is
+                # seeded — the hook wants the ENTRY state (the loop
+                # variable has no prior existence at the head).
+                loop_hook(s, "for", _copy_facts(facts))
             bf = _copy_facts(facts)
             # SOUNDNESS: any int var modified inside the loop body can
             # change across iterations — its entry fact may not hold at
@@ -853,7 +869,7 @@ def propagate_stmts(stmts, facts, depth=0):
                     # deep-scan-10: iterating a list/map yields arbitrary
                     # element values — TOP, not [0, None].
                     bf[var] = TOP
-            propagate_stmts(body, bf, depth + 1)
+            propagate_stmts(body, bf, depth + 1, loop_hook)
             # Post-loop: join the entry facts with the body outcome and
             # drop the loop variable (out of scope / stale).
             after = _join_facts(_copy_facts(facts), bf)
@@ -915,9 +931,9 @@ def propagate_stmts(stmts, facts, depth=0):
                 _drop_facts_for_owner(facts, tname)
         elif k == "if":
             sf = _copy_facts(facts)
-            propagate_stmts(s.get("then") or [], sf, depth + 1)
+            propagate_stmts(s.get("then") or [], sf, depth + 1, loop_hook)
             ef = _copy_facts(facts)
-            propagate_stmts(s.get("els") or [], ef, depth + 1)
+            propagate_stmts(s.get("els") or [], ef, depth + 1, loop_hook)
             # Join: union of branch outcomes (conservative).
             joined = _join_facts(sf, ef)
             facts.clear()
@@ -1298,3 +1314,902 @@ def smt_prelude(vars_int, vars_str, result_int=True):
     elif result_int is False:
         lines.append("(declare-const result Bool)")
     return lines
+
+
+# ----------------------------------------------------------------------------
+# Stage 97 (v0.116.0-alpha): SMT-based loop-invariant inference.
+#
+# The interval engine proves BOUNDS facts by over-approximating the loop
+# with widening; Stage 97 discovers invariants EXACTLY: summarise each
+# loop (entry facts, the transition relation of every loop-carried int
+# variable, the loop condition), generate candidate invariants from
+# templates, and let an SMT solver decide initiation and preservation.
+# Only candidates whose obligations come back UNSAT are reported as
+# inferred — anything the solver cannot discharge is dropped (the same
+# soundness discipline as the interval engine: never claim a proof you
+# do not have).
+#
+# Transition language (per loop iteration, per carried variable):
+#   x' = a*x + sum(±y or ±y') + c   with at most two variable terms,
+#   x' = literal, or UNMODELED. An unmodeled variable is encoded as a
+#   FREE primed constant — the standard over-approximation — so any
+#   body shape the summariser does not understand (calls, non-affine
+#   arithmetic, assignment through control flow it cannot order, a
+#   nested loop writing the variable, return/break/continue escapes)
+#   simply loses precision, never soundness: a free x' can refute any
+#   candidate that is not genuinely inductive.
+#
+# Encoding: initiation is  entry-facts ∧ ¬cand  (for-range loops add
+# the "the loop runs" guard a < b — a for-variable is only bound when
+# an iteration happens, so an empty range vacuously satisfies every
+# candidate). Preservation is  cand ∧ accepted ∧ cond ∧ transition ∧
+# ¬cand'  — already-accepted candidates join the hypothesis (the
+# classic strengthening loop: `s >= 0` for `s' = s + i` is inductive
+# only together with `i >= 0`), which is why candidates on variables
+# READ by other variables' transitions are verified first.
+# ----------------------------------------------------------------------------
+
+_IDENTITY = (1, (), 0)  # x' = x
+
+
+class Cand:
+    """One candidate invariant over a single carried variable."""
+
+    __slots__ = ("var", "text", "smt", "smt_primed", "tag")
+
+    def __init__(self, var, text, smt, smt_primed, tag):
+        self.var = var
+        self.text = text      # human-readable: "i <= n + 1"
+        self.smt = smt        # unprimed SMT term: "(<= i (+ n 1))"
+        self.smt_primed = smt_primed
+        self.tag = tag        # "entry-bound" | "cond-bound" | "range" | "modular"
+
+
+class LoopSummary:
+    """Everything the inference knows about one loop."""
+
+    __slots__ = ("fn_key", "kind", "line", "header", "header_var",
+                 "carried", "unmodeled", "inv_vars", "entry_facts",
+                 "cond_shape", "entry_eq", "runs_guard", "cands",
+                 "accepted", "rejected", "note")
+
+    def __init__(self, fn_key, kind, line, header):
+        self.fn_key = fn_key
+        self.kind = kind            # "while" | "for"
+        self.line = line
+        self.header = header
+        self.header_var = None      # the for-range variable, if any
+        self.carried = {}           # var -> [disjunct]  (disjunct = (self, terms, const))
+        self.unmodeled = {}         # var -> reason
+        self.inv_vars = set()       # int vars read but not carried
+        self.entry_facts = {}       # loop-entry interval snapshot
+        self.cond_shape = None      # (op, var, bkind, bval) var-on-left
+        self.entry_eq = None        # ("var"| "lit", v) — for-range variable start
+        self.runs_guard = None      # (a, b) encodings — a < b, for-loops only
+        self.cands = []             # [Cand], verification order
+        self.accepted = []          # [Cand]
+        self.rejected = []          # [(Cand, "initiation" | "preservation")]
+        self.note = None            # extra report line (e.g. cond unmodeled)
+
+    def transition_text(self, var):
+        if var in self.unmodeled:
+            return "%s' = <unmodeled: %s>" % (var, self.unmodeled[var])
+        ds = self.carried.get(var)
+        if not ds:
+            return "%s' = <unmodeled: no affine update>" % var
+        parts = []
+        for d in ds:
+            parts.append(_disjunct_text(var, d))
+        return "%s' = %s" % (var, " | ".join(parts))
+
+
+def _disjunct_text(var, d):
+    self_c, terms, const = d
+    parts = []
+    if self_c == 1:
+        parts.append(var)
+    elif self_c == -1:
+        parts.append("-" + var)
+    elif self_c != 0:
+        parts.append("%d*%s" % (self_c, var))
+    for name, primed, coeff in terms:
+        nm = name + ("'" if primed else "")
+        if coeff == 1:
+            parts.append(nm)
+        elif coeff == -1:
+            parts.append("-" + nm)
+        else:
+            parts.append("%d*%s" % (coeff, nm))
+    if const != 0 or not parts:
+        parts.append(str(const))
+    out = parts[0]
+    for p in parts[1:]:
+        out += " + " + p if not p.startswith("-") else " - " + p[1:]
+    return out
+
+
+def _disjunct_smt(var, d, prime=False):
+    self_c, terms, const = d
+    v = var + "_p" if prime else var
+    parts = []
+    if self_c == 1:
+        parts.append(v)
+    elif self_c == -1:
+        parts.append("(- %s)" % v)
+    elif self_c != 0:
+        parts.append("(* %d %s)" % (self_c, v))
+    for name, pr, coeff in terms:
+        nm = name + "_p" if pr else name
+        if coeff == 1:
+            parts.append(nm)
+        elif coeff == -1:
+            parts.append("(- %s)" % nm)
+        else:
+            parts.append("(* %d %s)" % (coeff, nm))
+    if const != 0 or not parts:
+        parts.append(str(const))
+    if len(parts) == 1:
+        return parts[0]
+    return "(+ %s)" % " ".join(parts)
+
+
+def _expr_text(e):
+    """Minimal textual rendering of an int expression (reports only)."""
+    if not isinstance(e, dict):
+        return "?"
+    k = e.get("k")
+    if k == "int":
+        return str(e.get("v"))
+    if k == "ident":
+        return e.get("name", "?")
+    if k == "un" and e.get("op") == "-":
+        inner = _expr_text(e.get("e"))
+        return "-" + inner if not inner.startswith("-") else inner[1:]
+    if k == "bin":
+        return "%s %s %s" % (_expr_text(e.get("l")), e.get("op"),
+                             _expr_text(e.get("r")))
+    if k == "call":
+        args = ", ".join(_expr_text(a) for a in (e.get("args") or []))
+        return "%s(%s)" % (e.get("name", "?"), args)
+    return "?"
+
+
+def _smt_bump(base_kind, base_val, delta):
+    """base + delta as an SMT term / plain literal when delta == 0."""
+    if delta == 0:
+        return str(base_val) if base_kind == "lit" else base_val
+    if base_kind == "lit":
+        return str(base_val + delta)
+    op = "+" if delta > 0 else "-"
+    return "(%s %s %d)" % (op, base_val, abs(delta))
+
+
+def _smt_cmp(op, lhs, rhs):
+    smt_op = {"==": "=", "!=": "distinct"}.get(op, op)
+    if smt_op == "distinct":
+        return "(distinct %s %s)" % (lhs, rhs)
+    return "(%s %s %s)" % (smt_op, lhs, rhs)
+
+
+def _has_escape(stmts, depth=0):
+    """True if any return/break/continue is reachable in the statement
+    tree. Escaping paths are excluded wholesale (see the transition-
+    language note): every assigned variable goes unmodeled."""
+    if depth > 32:
+        return True
+    for s in stmts or []:
+        if not isinstance(s, dict):
+            continue
+        k = s.get("k")
+        if k in ("return", "break", "continue"):
+            return True
+        if k == "if" and (_has_escape(s.get("then"), depth + 1)
+                          or _has_escape(s.get("els"), depth + 1)):
+            return True
+        if k in ("while", "for") and _has_escape(s.get("body"), depth + 1):
+            return True
+    return False
+
+
+def _assigned_names(stmts, acc=None, depth=0):
+    """Every name assigned (let/assign) anywhere in the statement tree,
+    in first-appearance order. Names of unknown type are included — the
+    type filter happens at transition extraction."""
+    if acc is None:
+        acc = []
+        seen = set()
+    else:
+        seen = set(acc)
+    if depth > 32:
+        return acc
+    for s in stmts or []:
+        if not isinstance(s, dict):
+            continue
+        k = s.get("k")
+        if k == "let":
+            n = s.get("name")
+        elif k == "assign":
+            t = s.get("target")
+            n = t.get("name") if isinstance(t, dict) else None
+        else:
+            n = None
+        if isinstance(n, str) and n not in seen:
+            seen.add(n)
+            acc.append(n)
+        for bkey in ("body", "then", "els"):
+            sub = s.get(bkey)
+            if sub:
+                before = len(acc)
+                _assigned_names(sub, acc, depth + 1)
+                seen.update(acc[before:])
+    return acc
+
+
+def _expr_idents(e, out, depth=0):
+    """Collect every identifier read inside an expression."""
+    if not isinstance(e, dict) or depth > 48:
+        return
+    if e.get("k") == "ident":
+        n = e.get("name")
+        if isinstance(n, str):
+            out.add(n)
+    for key in ("l", "r", "e", "cond", "idx", "scrut", "target"):
+        _expr_idents(e.get(key), out, depth + 1)
+    for a in (e.get("args") or []):
+        _expr_idents(a, out, depth + 1)
+    for it in (e.get("items") or []):
+        _expr_idents(it, out, depth + 1)
+    for _fn, fe in (e.get("fields") or []):
+        _expr_idents(fe, out, depth + 1)
+    for arm in (e.get("arms") or []):
+        if isinstance(arm, dict):
+            _expr_idents(arm.get("body"), out, depth + 1)
+            _expr_idents(arm.get("guard"), out, depth + 1)
+
+
+def _stmt_idents(s, out):
+    """Every identifier read by one statement (its expressions)."""
+    if not isinstance(s, dict):
+        return
+    for key in ("value", "cond", "iter", "e"):
+        _expr_idents(s.get(key), out)
+    t = s.get("target")
+    if isinstance(t, dict):
+        _expr_idents(t.get("idx"), out)
+
+
+def _int_target(s):
+    """(name, is_int) for a let/assign target — is_int reads the type
+    the checker annotated (inference always runs post-check)."""
+    k = s.get("k")
+    if k == "let":
+        return s.get("name"), s.get("t") == "int"
+    if k == "assign":
+        t = s.get("target")
+        if isinstance(t, dict) and t.get("k") == "ident":
+            return t.get("name"), t.get("t") == "int"
+    return None, False
+
+
+def _affine_of(e, lhs, assigned_before, carried):
+    """Parse e as  x' = self*lhs + Σ(±y or ±y') + const  with at most
+    two variable terms in play. Returns (self, terms, const) or None.
+    `terms` is a tuple of (name, primed, coeff); primed means the
+    variable was already assigned earlier on the same path (statement
+    order), coeff is the literal multiplier."""
+    if not isinstance(e, dict):
+        return None
+    k = e.get("k")
+    if k == "int":
+        v = e.get("v")
+        return (0, (), v) if isinstance(v, int) else None
+    if k == "un" and e.get("op") == "-":
+        inner = e.get("e")
+        if isinstance(inner, dict) and inner.get("k") == "int" \
+                and isinstance(inner.get("v"), int):
+            return (0, (), -inner["v"])
+        return None
+    if k == "ident":
+        n = e.get("name")
+        if n == lhs:
+            return (1, (), 0)
+        return (0, ((n, n in assigned_before, 1),), 0)
+    if k == "bin":
+        op = e.get("op")
+        if op not in ("+", "-", "*"):
+            return None
+        if op == "*":
+            # literal * form (constant coefficient) — either side.
+            for const_side, form_side in ((e.get("l"), e.get("r")),
+                                          (e.get("r"), e.get("l"))):
+                if isinstance(const_side, dict) and const_side.get("k") == "int" \
+                        and isinstance(const_side.get("v"), int):
+                    f = _affine_of(form_side, lhs, assigned_before, carried)
+                    if f is not None:
+                        kc = const_side["v"]
+                        return (f[0] * kc,
+                                tuple((n, p, c * kc) for n, p, c in f[1]),
+                                f[2] * kc)
+            return None
+        a = _affine_of(e.get("l"), lhs, assigned_before, carried)
+        b = _affine_of(e.get("r"), lhs, assigned_before, carried)
+        if a is None or b is None:
+            return None
+        if op == "-":
+            b = (-b[0], tuple((n, p, -c) for n, p, c in b[1]), -b[2])
+        self_c = a[0] + b[0]
+        merged = {}
+        for n, p, c in a[1] + b[1]:
+            key = (n, p)
+            merged[key] = merged.get(key, 0) + c
+        terms = tuple((n, p, c) for (n, p), c in merged.items() if c != 0)
+        const = a[2] + b[2]
+        nvars = (1 if self_c != 0 else 0) + len(terms)
+        if nvars > 2:
+            return None
+        return (self_c, terms, const)
+    return None
+
+
+class _BodySummary:
+    """Result of walking one loop body (or one if-branch)."""
+
+    __slots__ = ("trans", "unmodeled", "reads", "straight")
+
+    def __init__(self):
+        self.trans = {}      # var -> [disjunct]
+        self.unmodeled = {}  # var -> reason
+        self.reads = set()
+        self.straight = True  # no if / nested loop seen
+
+
+def _walk_body_stmts(stmts, assigned_before, carried_names, summary):
+    """Accumulate one block's assignments into `summary`, in statement
+    order. `assigned_before` is the ORDER set of the CURRENT PATH: a
+    right-hand side referencing a variable assigned earlier on the same
+    path reads the NEW value (primed); branches walk their own copy (a
+    variable assigned on the sibling branch keeps its head value on
+    this one)."""
+    written = set()
+    for s in stmts or []:
+        if not isinstance(s, dict):
+            continue
+        k = s.get("k")
+        if k in ("let", "assign"):
+            name, is_int = _int_target(s)
+            _stmt_idents(s, summary.reads)
+            if not isinstance(name, str) or not is_int:
+                continue
+            if name in written or name in summary.trans \
+                    or name in summary.unmodeled:
+                # A second assignment to the same variable inside one
+                # iteration would need affine composition — unmodeled.
+                summary.unmodeled[name] = "assigned more than once"
+                summary.trans.pop(name, None)
+                continue
+            d = _affine_of(s.get("value"), name, assigned_before,
+                           carried_names)
+            if d is None:
+                summary.unmodeled[name] = "non-affine update"
+            else:
+                summary.trans[name] = [d]
+            written.add(name)
+            assigned_before.add(name)
+        elif k == "if":
+            summary.straight = False
+            _stmt_idents(s, summary.reads)
+            _walk_if(s, assigned_before, carried_names, summary)
+        elif k in ("while", "for"):
+            # A nested loop's updates happen an unknown number of times
+            # per outer iteration — every variable it writes (including
+            # its own loop variable) is unmodeled for THIS loop.
+            summary.straight = False
+            _stmt_idents(s, summary.reads)
+            for inner in _assigned_names(s.get("body") or []):
+                if inner not in summary.trans and inner not in summary.unmodeled:
+                    summary.unmodeled[inner] = "written inside a nested loop"
+        else:
+            _stmt_idents(s, summary.reads)
+
+
+def _walk_if(s, assigned_before, carried_names, summary):
+    """Merge the then/els branch summaries of one if. Each branch walks
+    its own copy of the path-order set (branches are mutually
+    exclusive). A variable written on one branch only gains the branch
+    disjuncts plus the identity step for the fall-through path."""
+    sub_summaries = []
+    for bkey in ("then", "els"):
+        branch = s.get(bkey)
+        if not branch:
+            sub_summaries.append(None)
+            continue
+        bsum = _BodySummary()
+        bsum.reads = summary.reads  # shared accumulator
+        _walk_body_stmts(branch, set(assigned_before), carried_names, bsum)
+        sub_summaries.append(bsum)
+    then_s, else_s = sub_summaries
+    all_vars = set()
+    for bs in (then_s, else_s):
+        if bs:
+            all_vars |= set(bs.trans) | set(bs.unmodeled)
+    for v in all_vars:
+        if v in (then_s.unmodeled if then_s else {}) \
+                or v in (else_s.unmodeled if else_s else {}):
+            summary.unmodeled[v] = "assigned under control flow"
+            summary.trans.pop(v, None)
+            continue
+        disjs = []
+        for bs, other in ((then_s, else_s), (else_s, then_s)):
+            if bs is None:
+                # Absent/empty branch: it falls through keeping every
+                # value — it contributes an identity for a variable the
+                # OTHER branch wrote.
+                if other is not None and (other.trans.get(v)
+                                          or v in other.unmodeled):
+                    disjs.append(_IDENTITY)
+                continue
+            d = bs.trans.get(v)
+            if d is not None:
+                disjs.extend(d)
+            elif other is not None and (v in other.trans
+                                        or v in other.unmodeled):
+                # Written on the OTHER branch only — this path keeps
+                # the value.
+                disjs.append(_IDENTITY)
+        if disjs:
+            summary.trans[v] = disjs
+        else:
+            summary.unmodeled[v] = "assigned under control flow"
+    for v in list(summary.trans.keys()):
+        if v in summary.unmodeled:
+            del summary.trans[v]
+    # After the if, every merged variable's value is branch-dependent —
+    # later right-hand sides on this path read the merged (primed) one.
+    assigned_before.update(all_vars)
+
+
+def _summarize_body(body, carried_names):
+    """Transition relation of one loop body (callers exclude escapes)."""
+    summary = _BodySummary()
+    _walk_body_stmts(body, set(), carried_names, summary)
+    return summary
+
+
+def _parse_cond(cond):
+    """(op, var, bkind, bval) with the variable on the left, or None.
+    Recognised: var op (int literal | ident) and the flipped shapes."""
+    if not isinstance(cond, dict) or cond.get("k") != "bin":
+        return None
+    op = cond.get("op")
+    if op not in ("<", "<=", ">", ">=", "!=", "=="):
+        return None
+    l = cond.get("l")
+    r = cond.get("r")
+    if not isinstance(l, dict) or not isinstance(r, dict):
+        return None
+
+    def side(e):
+        if e.get("k") == "int" and isinstance(e.get("v"), int):
+            return ("lit", e["v"])
+        if e.get("k") == "ident" and isinstance(e.get("name"), str):
+            return ("var", e["name"])
+        return None
+
+    ls = side(l)
+    rs = side(r)
+    if ls is None and rs is None:
+        return None
+    if ls is not None and ls[0] == "var" and rs is not None:
+        return (op, ls[1], rs[0], rs[1])
+    if rs is not None and rs[0] == "var" and ls is not None:
+        flip = {"<": ">", "<=": ">=", ">": "<", ">=": "<=",
+                "==": "==", "!=": "!="}
+        return (flip[op], rs[1], ls[0], ls[1])
+    return None
+
+
+def _parse_range(it):
+    """range(a, b) bounds as ("lit", v) | ("var", name) | None."""
+    if not isinstance(it, dict) or it.get("k") != "call" \
+            or it.get("name") != "range":
+        return None
+    args = it.get("args") or []
+    if len(args) != 2:
+        return None
+
+    def side(e):
+        if isinstance(e, dict):
+            if e.get("k") == "int" and isinstance(e.get("v"), int):
+                return ("lit", e["v"])
+            if e.get("k") == "ident" and isinstance(e.get("name"), str):
+                return ("var", e["name"])
+        return None
+
+    a = side(args[0])
+    b = side(args[1])
+    if a is None or b is None:
+        return None
+    return (a, b)
+
+
+def _mk_bound_cand(var, op, base_kind, base_val, delta, tag):
+    """Candidate  var op (base + delta)  with both text and SMT form."""
+    if base_kind == "lit":
+        bound = base_val + delta
+        text = "%s %s %d" % (var, op, bound)
+        smt_rhs = str(bound)
+    else:
+        text = "%s %s %s" % (var, op, _bump_text(base_val, delta))
+        smt_rhs = _smt_bump("var", base_val, delta)
+    smt = _smt_cmp(op, var, smt_rhs)
+    smt_p = _smt_cmp(op, var + "_p", smt_rhs)
+    return Cand(var, text, smt, smt_p, tag)
+
+
+def _bump_text(name, delta):
+    if delta == 0:
+        return name
+    if delta > 0:
+        return "%s + %d" % (name, delta)
+    return "%s - %d" % (name, -delta)
+
+
+def _step_const(disjuncts):
+    """The common constant step c of x' = x + c — None when the
+    disjuncts are not all pure equal self-steps."""
+    c0 = None
+    for self_c, terms, const in disjuncts:
+        if self_c != 1 or terms or (c0 is not None and const != c0):
+            return None
+        c0 = const
+    return c0
+
+
+def _generate_candidates(loop):
+    """Template instantiation. Every candidate is CHECKED by the solver
+    before it is reported — the templates only decide what to TRY."""
+    facts = loop.entry_facts
+    cands = []
+    for var, disjs in loop.carried.items():
+        iv = facts.get(var)
+        lo = iv.lo if isinstance(iv, Interval) and iv.lo is not None \
+            and not isinstance(iv.lo, tuple) else None
+        hi = iv.hi if isinstance(iv, Interval) and iv.hi is not None \
+            and not isinstance(iv.hi, tuple) else None
+        # T1 — entry bounds carried across iterations.
+        if lo is not None:
+            cands.append(_mk_bound_cand(var, ">=", "lit", lo, 0, "entry-bound"))
+        if hi is not None:
+            cands.append(_mk_bound_cand(var, "<=", "lit", hi, 0, "entry-bound"))
+        # T2 — the loop condition, weakened by the step's overshoot.
+        cs = loop.cond_shape
+        if cs is not None and cs[1] == var:
+            _op, _cv, bkind, bval = cs
+            step = _step_const(disjs)
+            if step is not None and step > 0 and bval != var:
+                if _op == "<":
+                    cands.append(_mk_bound_cand(var, "<=", bkind, bval,
+                                                step - 1, "cond-bound"))
+                elif _op == "<=":
+                    cands.append(_mk_bound_cand(var, "<=", bkind, bval,
+                                                step, "cond-bound"))
+            if step is not None and step < 0 and bval != var:
+                if _op == ">":
+                    cands.append(_mk_bound_cand(var, ">=", bkind, bval,
+                                                step + 1, "cond-bound"))
+                elif _op == ">=":
+                    cands.append(_mk_bound_cand(var, ">=", bkind, bval,
+                                                step, "cond-bound"))
+        # T4 — congruence: a constant step preserves the residue class
+        # of an exactly-known start (the non-interval family the
+        # interval engine cannot express).
+        step = _step_const(disjs)
+        if step not in (None, 0, 1, -1) and iv is not None and iv.is_const():
+            m = abs(step)
+            start = iv.lo
+            text = "%s ≡ %d (mod %d)" % (var, start % m, m)
+            smt = "(= (mod %s %d) (mod %d %d))" % (var, m, start, m)
+            smt_p = "(= (mod %s_p %d) (mod %d %d))" % (var, m, start, m)
+            cands.append(Cand(var, text, smt, smt_p, "modular"))
+    # for-range: the loop variable's start anchors a lower bound (both
+    # literal and loop-invariant-variable starts).
+    if loop.kind == "for" and loop.entry_eq is not None:
+        var = loop.header_var
+        kind, aval = loop.entry_eq
+        lo_known = var not in loop.unmodeled and var in loop.carried
+        if lo_known:
+            tag_txt = ("%s >= %d" % (var, aval)) if kind == "lit" \
+                else ("%s >= %s" % (var, aval))
+            if not any(c.var == var and c.tag == "entry-bound"
+                       and c.text == tag_txt for c in cands):
+                cands.append(_mk_bound_cand(var, ">=", kind, aval, 0,
+                                            "range"))
+    # Verification order: candidates on variables that OTHER variables'
+    # transitions read go first (the strengthening loop needs `i >= 0`
+    # accepted before `s >= 0` can be).
+    read_by = {v: set() for v in loop.carried}
+    for v, disjs in loop.carried.items():
+        for self_c, terms, _c in disjs:
+            for n, _p, _coeff in terms:
+                if n in read_by and n != v:
+                    read_by[n].add(v)
+    def order(c):
+        return (0 if read_by.get(c.var) else 1, c.var, c.tag)
+    cands.sort(key=order)
+    seen = set()
+    out = []
+    for c in cands:
+        key = (c.var, c.text)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(c)
+    return out
+
+
+def _build_summary(fn_key, fn, stmt, kind, entry_facts):
+    """Summarise one loop node: header, transition relation, condition
+    shape, candidate templates."""
+    if kind == "for":
+        var = stmt.get("var")
+        header = "for %s in %s" % (var, _expr_text(stmt.get("iter")))
+    else:
+        var = None
+        header = "while %s" % _expr_text(stmt.get("cond"))
+    loop = LoopSummary(fn_key, kind, stmt.get("line", 0), header)
+    loop.header_var = var
+    loop.entry_facts = entry_facts
+    body = stmt.get("body") or []
+
+    body_assigned = [n for n in _assigned_names(body)]
+    carried_names = set(body_assigned)
+    if kind == "for" and isinstance(var, str):
+        carried_names.add(var)
+
+    if _has_escape(body):
+        # Escaping paths (return/break/continue) are excluded wholesale:
+        # a free primed value over-approximates every path outcome.
+        for n in carried_names:
+            loop.unmodeled[n] = "body escapes through return/break/continue"
+        loop.note = ("body has return/break/continue — every assignment "
+                     "goes unmodeled (sound, less precise)")
+    else:
+        bsum = _summarize_body(body, carried_names)
+        loop.carried = dict(bsum.trans)
+        loop.unmodeled = dict(bsum.unmodeled)
+        reads = set(bsum.reads)
+        reads.discard(var)
+        reads -= set(loop.carried)
+        reads -= set(loop.unmodeled)
+        loop.inv_vars = {n for n in reads if isinstance(n, str)}
+
+    if kind == "while":
+        loop.cond_shape = _parse_cond(stmt.get("cond"))
+        if loop.cond_shape is None and loop.note is None:
+            loop.note = ("condition not in var/literal-or-var form — no "
+                         "condition-derived candidates")
+    else:
+        rng = _parse_range(stmt.get("iter"))
+        if rng is None:
+            loop.note = ("iterable not a range(literal|var, literal|var) "
+                         "— the loop variable is unmodeled")
+            if isinstance(var, str) and var not in loop.unmodeled:
+                loop.unmodeled[var] = "non-range iterable"
+        else:
+            (akind, aval), (bkind, bval) = rng
+            ok_a = akind == "lit" or (akind == "var" and aval not in carried_names)
+            ok_b = bkind == "lit" or (bkind == "var" and bval not in carried_names)
+            var_clean = isinstance(var, str) and var not in loop.unmodeled
+            if ok_a and ok_b and var_clean:
+                # The loop variable: fresh-bound each iteration from the
+                # range start, stepping by 1 — model it as carried.
+                loop.carried[var] = [(1, (), 1)]
+                loop.entry_eq = (akind, aval)
+                loop.cond_shape = ("<", var, bkind, bval)
+                loop.runs_guard = ((akind, aval), (bkind, bval))
+            elif not var_clean:
+                pass  # already unmodeled with its reason
+            else:
+                loop.note = ("range bounds reference a loop-carried "
+                             "variable — the loop variable is unmodeled")
+                loop.unmodeled[var] = "range bounds not loop-invariant"
+        # An unmodeled loop variable must not keep a transition.
+        if loop.header_var in loop.unmodeled:
+            loop.carried.pop(loop.header_var, None)
+
+    loop.cands = _generate_candidates(loop)
+    return loop
+
+
+def infer_loops(program):
+    """Collect and summarise every loop of every function. Runs the
+    interval engine with a loop hook to snapshot the ENTRY facts at
+    each loop head (dedup by node identity keeps the first — the most
+    precise — snapshot)."""
+    loops = []
+    for key, fn in program["fns"].items():
+        if fn.get("extern", False):
+            continue
+        req = fn.get("requires")
+        if req is not None:
+            facts = seed_from_requires(req, fn["params"], 0)
+        else:
+            facts = {}
+        seen = set()
+
+        def hook(stmt, kind, snap, key=key, seen=seen, loops=loops):
+            nid = id(stmt)
+            if nid in seen:
+                return
+            seen.add(nid)
+            loops.append(_build_summary(key, fn, stmt, kind, snap))
+
+        propagate_stmts(fn["body"], facts, 0, hook)
+    return loops
+
+
+def _loop_decl_names(loop):
+    """Every int variable the obligations mention (declaration set)."""
+    decls = set(loop.carried) | set(loop.unmodeled)
+    cs = loop.cond_shape
+    if cs is not None:
+        decls.add(cs[1])
+        if cs[2] == "var":
+            decls.add(cs[3])
+    if loop.entry_eq is not None and loop.header_var:
+        decls.add(loop.header_var)
+    if loop.runs_guard is not None:
+        for kind, val in loop.runs_guard:
+            if kind == "var":
+                decls.add(val)
+    for disjs in loop.carried.values():
+        for _s, terms, _c in disjs:
+            for n, _p, _coeff in terms:
+                decls.add(n)
+    return decls
+
+
+def _entry_fact_asserts(loop, decls, skip_carried=False):
+    """Numeric interval facts at the loop head, for declared names only.
+    Symbolic (tuple) bounds have no QF_LIA encoding — skipped.
+    `skip_carried` drops facts about carried/unmodeled variables (their
+    head value changes across iterations) and keeps the loop-invariant
+    environment — a parameter's requires-bound holds at EVERY head
+    state, so preservation may assume it."""
+    skip = set(loop.carried) | set(loop.unmodeled) if skip_carried else set()
+    out = []
+    for name, iv in loop.entry_facts.items():
+        if name not in decls or not isinstance(iv, Interval) or name in skip:
+            continue
+        lo, hi = iv.lo, iv.hi
+        if isinstance(lo, tuple) or isinstance(hi, tuple):
+            continue
+        if lo is not None and hi is not None and lo == hi:
+            out.append("(assert (= %s %d))" % (name, lo))
+        else:
+            if lo is not None:
+                out.append("(assert (>= %s %d))" % (name, lo))
+            if hi is not None:
+                out.append("(assert (<= %s %d))" % (name, hi))
+    return out
+
+
+def _transition_conjuncts(loop):
+    """(= v_p rhs) per modeled carried variable (or-ed over disjuncts).
+    Unmodeled variables assert nothing — their primed value is free."""
+    out = []
+    for v in sorted(loop.carried):
+        eqs = ["(= %s_p %s)" % (v, _disjunct_smt(v, d)) for d in loop.carried[v]]
+        out.append(eqs[0] if len(eqs) == 1 else "(or %s)" % " ".join(eqs))
+    return out
+
+
+def _segment(prelude_lines, comment, asserts):
+    lines = list(prelude_lines)
+    lines.append(comment)
+    lines.extend(asserts)
+    lines.append("(check-sat)")
+    return lines
+
+
+def _obligation_segments(loop, cand, accepted_prefix):
+    """The two SMT segments for ONE candidate at the greedy state
+    `accepted_prefix` (already-accepted candidates join the
+    preservation hypothesis). Returns [(label, lines)]."""
+    decls = _loop_decl_names(loop)
+    fact_asserts = _entry_fact_asserts(loop, decls)
+
+    def prelude(with_primed):
+        lines = []
+        for v in sorted(decls):
+            lines.append("(declare-const %s Int)" % v)
+        if with_primed:
+            for v in sorted(decls):
+                lines.append("(declare-const %s_p Int)" % v)
+        return lines
+
+    entry_eq_smt = None
+    if loop.entry_eq is not None and loop.header_var:
+        kind, aval = loop.entry_eq
+        entry_eq_smt = "(= %s %s)" % (loop.header_var,
+                                      str(aval) if kind == "lit" else aval)
+    guard_smt = None
+    if loop.runs_guard is not None:
+        (ak, av), (bk, bv) = loop.runs_guard
+        a_s = str(av) if ak == "lit" else av
+        b_s = str(bv) if bk == "lit" else bv
+        guard_smt = "(< %s %s)" % (a_s, b_s)
+    cond_smt = None
+    if loop.cond_shape is not None:
+        op, cv, bkind, bval = loop.cond_shape
+        b_s = str(bval) if bkind == "lit" else bval
+        cond_smt = _smt_cmp(op, cv, b_s)
+
+    # -- initiation: the entry state satisfies the candidate ------------
+    init_asserts = list(fact_asserts)
+    if entry_eq_smt:
+        init_asserts.append("(assert %s)" % entry_eq_smt)
+    if guard_smt:
+        init_asserts.append("(assert %s)" % guard_smt)
+    init_asserts.append("(assert (not %s))" % cand.smt)
+    init = _segment(prelude(False),
+                    "; initiation of [%s] (%s): unsat => holds on entry"
+                    % (cand.text, cand.tag),
+                    init_asserts)
+
+    # -- preservation: cand ∧ accepted ∧ env-facts ∧ cond ∧ transition
+    #    ⟹ cand' ---------------------------------------------------------
+    keep_asserts = ["(assert %s)" % cand.smt]
+    for acc in accepted_prefix:
+        keep_asserts.append("(assert %s)" % acc.smt)
+    keep_asserts.extend(_entry_fact_asserts(loop, decls, skip_carried=True))
+    if cond_smt:
+        keep_asserts.append("(assert %s)" % cond_smt)
+    for t in _transition_conjuncts(loop):
+        keep_asserts.append("(assert %s)" % t)
+    keep_asserts.append("(assert (not %s))" % cand.smt_primed)
+    hyp = ", ".join([cand.text] + [a.text for a in accepted_prefix])
+    keep = _segment(prelude(True),
+                    "; preservation of [%s] given [%s]: unsat => inductive"
+                    % (cand.text, hyp),
+                    keep_asserts)
+    return [("init: %s" % cand.text, init),
+            ("keep: %s" % cand.text, keep)]
+
+
+def verify_loop(loop, decide):
+    """Greedy strengthening: verify candidates in order; each candidate
+    may assume every candidate accepted before it. `decide(text)` runs
+    one segment through an SMT solver and returns "sat" / "unsat" /
+    "unknown" / "?" — or None when no solver exists (nothing is then
+    claimed). Fills loop.accepted / loop.rejected. Returns the segment
+    list [(label, lines)] for --smt dumps."""
+    loop.accepted = []
+    loop.rejected = []
+    segments = []
+    if decide is None:
+        return segments
+    for cand in loop.cands:
+        segs = _obligation_segments(loop, cand, list(loop.accepted))
+        init_v = decide(segs[0][1])
+        if init_v != "unsat":
+            loop.rejected.append((cand, "initiation"))
+            continue
+        keep_v = decide(segs[1][1])
+        if keep_v != "unsat":
+            loop.rejected.append((cand, "preservation"))
+            continue
+        loop.accepted.append(cand)
+        segments.extend(segs)
+    return segments
+
+
+def smt_program_text(loop_header_comment, segments):
+    """Render verified obligation segments as one .smt2 file
+    (reset-separated, the same convention as the contract bridge)."""
+    lines = [loop_header_comment]
+    for _label, seg_lines in segments:
+        lines.extend(seg_lines)
+        lines.append("(reset)")
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"

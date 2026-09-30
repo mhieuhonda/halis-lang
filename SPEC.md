@@ -1677,7 +1677,8 @@ python3 tools/hlprove.py file.hls [--smt] [--z3] [--suggest-invariants]
 - `--suggest-invariants`: for every loop — exact bounds for const
   `for i in range(a, b)` loops, the while condition as a candidate
   invariant, and the mutated-variable set. The automatic inference
-  rule set from the roadmap.
+  rule set from the roadmap. (Textual hints only; for solver-VERIFIED
+  invariants see `--infer-invariants`, section 51.)
 
 ### 26.6. `hlmodel` — exhaustive finite-state model checking
 
@@ -1713,7 +1714,7 @@ by HLS contracts, no panic checks needed*.
 | Deferred | Rationale |
 |----------|-----------|
 | Full SMT encoding of function bodies | the bridge encodes contract queries (satisfiability / implication), not whole-program semantics; the built-in interval prover handles body-level elision. |
-| Loop invariant PRECISION beyond widening | v0.30.0-alpha closed the deferred row's gap: the engine now runs two Kleene rounds + the standard widening operator + a post-fixpoint verification pass (see 26.4) — strictly more precise than blanket TOP and still sound. What remains future work is inferring NON-interval invariants (modular/relational facts). |
+| Loop invariant PRECISION beyond widening | v0.30.0-alpha closed the first gap (two Kleene rounds + the standard widening operator + a post-fixpoint verification pass, see 26.4); Stage 97 closed the NON-interval half: `hlprove --infer-invariants` discovers modular/relational/overshoot bounds by SMT-checked candidate templates (see 51) — tool-side, z3-verified, codegen untouched. What remains future work is a whole-body SMT encoding (the row above). |
 | Contracts on generics | contracts are checked per-declaration; instantiation-specific bounds (generic `requires`) are future work. |
 
 Shipped in v0.30.0-alpha (previously deferred): **`ensures` runtime
@@ -4988,3 +4989,113 @@ answers, the manifest shape, the image-vs-nm completeness both ways,
 the orchestrator, and the no-libc mode + tools — plus the demo
 `examples/dbg_demo.hls`, three functions on stable lines whose truth
 the gate pins line by line.
+
+
+## 51. SMT-based loop-invariant inference (Stage 97 — v0.116.0-alpha)
+
+The interval engine (26.4) proves bounds by OVER-approximating loops
+with widening; Stage 97 discovers invariants EXACTLY. `hlprove
+--infer-invariants` summarises every loop, generates candidate
+invariants from templates, and lets an SMT solver decide — only
+solver-verified facts are reported as inferred. The stage closes the
+"non-interval facts" row that 26.8 deferred: congruence classes and
+relational bounds are now machine-checked, not widener guesswork.
+
+### 51.1. The pipeline
+
+```
+python3 tools/hlprove.py file.hls [--infer-invariants] [--smt]
+make infer F=file.hls        # the same, make-native
+make infer-smt F=file.hls    # also writes the obligation files
+```
+
+For every loop of every (non-extern) function the engine builds:
+
+1. **Entry facts** — the interval engine's state at the loop head,
+   snapshotted through a hook in `propagate_stmts` (a deep copy taken
+   BEFORE the loop is processed; for-ranges snapshot before the loop
+   variable is bound). Numeric bounds become SMT assertions; symbolic
+   length bounds have no QF_LIA encoding and are skipped.
+2. **The transition relation** — for every loop-carried int variable,
+   an affine summary `x' = a·x + Σ ±y (or ±y') + c` with at most two
+   variable terms, `x' =` literal, or **UNMODELED**. Statement order is
+   respected: a right-hand side referencing a variable assigned earlier
+   ON THE SAME PATH reads the NEW value (the primed one); branches walk
+   their own path-order copy. A conditional update becomes a
+   DISJUNCTION of branch transitions plus the identity step for the
+   fall-through path. An unmodeled variable is encoded as a FREE primed
+   constant — the standard over-approximation — so anything the
+   summariser does not understand (non-affine arithmetic, a nested
+   loop writing the variable, a second assignment needing composition,
+   return/break/continue escapes) loses precision, never soundness: a
+   free x' refutes any candidate that is not genuinely inductive.
+3. **The condition** — `while v op (literal | variable)` shapes are
+   encoded; anything else contributes no condition assertion (a
+   stronger preservation requirement — acceptance stays sound, some
+   valid candidates are lost).
+
+### 51.2. Candidate templates
+
+| Tag | Template | Note |
+|-----|----------|------|
+| `entry-bound` | `lo <= x`, `x <= hi` from the entry interval | refused automatically when the step crosses them |
+| `cond-bound` | while `x < e` step c>0 gives `x <= e + c - 1`; the four comparison shapes analogously | the OVERSHOOT-WEAKENED bound: `while i < n { i = i + 2 }` yields `i <= n + 1`, not `i <= n` |
+| `range` | `i >= a`, `i <= b` for `for i in range(a, b)` | the loop variable is fresh-bound from the start and steps by 1 |
+| `modular` | `x ≡ x0 (mod \|c\|)` for a constant step with an exactly-known start | the non-interval family: `x' = x + 4` keeps `x ≡ 0 (mod 4)` forever |
+
+### 51.3. The obligations and the strengthening loop
+
+Each candidate is decided by TWO QF_LIA queries:
+
+- **initiation**: `entry-facts ∧ entry-eq ∧ (a < b) ∧ ¬cand` is UNSAT.
+  The `a < b` guard is for-range only — a for-variable is bound only
+  when an iteration runs, so an empty range vacuously satisfies every
+  candidate; a while head state exists from the entry on, so its
+  initiation has no guard.
+- **preservation**: `cand ∧ accepted ∧ env-facts ∧ cond ∧ transition ∧
+  ¬cand'` is UNSAT. `accepted` is the candidates already verified in
+  THIS loop (the classic strengthening: `s >= 0` for `s' = s + i` is
+  inductive only together with `i >= 0`), which is why candidates on
+  variables READ by other transitions are verified first. `env-facts`
+  are the entry facts about NON-carried variables — a parameter's
+  requires-bound holds at every head state (`while i < n { i = i +
+  step }` with `requires step >= 1` keeps `i >= 0`; without the
+  environment a free `step` could be negative).
+
+Verdict order and honesty: a candidate failing initiation is refused
+as `initiation`; failing preservation as `preservation`; a solver
+verdict of `unknown`/timeout refuses too. NOTHING is reported as
+inferred without an unsat verdict — and with no z3 binary and no
+z3-solver module the mode reports the candidates as UNVERIFIED and
+claims nothing (install one: `pip install z3-solver`).
+
+### 51.4. What inference is NOT
+
+- **No codegen dependency.** Inference is analysis-only: `-O fast`
+  elision is still decided solely by the interval engine (26.4), whose
+  annotations never consult an external solver. A tool-side SMT fact
+  cannot change a binary — the differential suite is unaffected by
+  construction, and `make invariant-acceptance` re-proves the demo's
+  native output identical to the interpreter's.
+- **Not a whole-body SMT encoding.** The transition language is the
+  affine fragment above; the deferred row in 26.8 about full function-
+  body encoding stays deferred.
+- **Loop-head convention.** An invariant is claimed at the loop HEAD
+  (before the condition evaluation), the Hoare-style point: it holds
+  on entry, is preserved by every iteration, and `invariant ∧ ¬cond`
+  describes the exit state. For-range vacuity is handled by the
+  runs-guard, not by weakening the convention.
+
+### 51.5. The gate
+
+`make invariant-acceptance` (six sections, requires a decider — the
+gate says which to install when neither exists): the engine battery
+(strengthening, entry equations, range bounds, disjunctive
+transitions, congruence), the soundness flips (the step-2 overshoot
+must refuse `i <= n` while keeping `i <= n + 1`; the `-2` skipper must
+refuse `i >= 0` while discovering the true floor `i >= -1`; the
+shrinking counter under `i < n`; the unmodeled and escaping bodies
+claim NOTHING), the obligations (every verified segment re-decides
+unsat from its dumped `.smt2` — `<fn>__L<line>.smt2`, reset-separated
+like the contract bridge), the CLI surface, the demo (`examples/
+invariant_demo.hls`, interpreter vs native identical), and the tools.

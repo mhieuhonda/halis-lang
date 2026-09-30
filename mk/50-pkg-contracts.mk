@@ -65,6 +65,17 @@ prove:
 prove-full:
 	@python3 tools/hlprove.py $(F) --smt --suggest-invariants
 
+# Stage 97 (v0.116.0-alpha): SMT-based loop-invariant inference.
+# Summarises every loop (entry facts + transition relation), generates
+# template candidates and lets z3 decide initiation + preservation.
+infer:
+	@python3 tools/hlprove.py $(F) --infer-invariants
+
+# The same, plus one .smt2 obligations file per verified loop (named
+# <fn>__L<line>.smt2, next to the source like the contract bridge).
+infer-smt:
+	@python3 tools/hlprove.py $(F) --infer-invariants --smt
+
 # Exhaustive finite-state model checking of a transition fn
 model:
 	@if [ -z "$(F)" ] || [ -z "$(FN)" ]; then echo "Usage: make model F=file.hls FN=transition_fn [INV=invariant_fn] [INIT=Enum.Variant]" && false; fi; \
@@ -80,6 +91,13 @@ prove-acceptance:
 	@$(CC) $(CFLAGS) -o $(BIN)/hmac_fast $(BIN)/hmac_fast.c -lm -pthread
 	@echo "--- running the -O fast (proof-elided) binary:"
 	@$(BIN)/hmac_fast
+
+# Stage 97 acceptance gate: the SMT-based loop-invariant inference.
+# Requires a decider — a z3 binary or the z3-solver python module (the
+# gate says which to install when neither exists).
+invariant-acceptance: $(BIN)/hlc
+	@echo "[Stage 97 acceptance] running tests/invariant_acceptance.py..."
+	@$(PYTHON) tests/invariant_acceptance.py
 
 # Run the example programs to verify they still work after a change
 examples:

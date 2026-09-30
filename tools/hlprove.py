@@ -3,7 +3,7 @@
 
 Usage:
   python3 tools/hlprove.py <file.hls> [--fast] [--smt] [--z3]
-                            [--suggest-invariants]
+                            [--suggest-invariants] [--infer-invariants]
 
 Modes:
   (default)  proof report — which panic checks the interval prover
@@ -21,6 +21,15 @@ Modes:
              header bounds for const for-ranges, the while condition as
              an invariant text, and the set of variables mutated in the
              body) — the automatic inference rule set from the roadmap.
+  --infer-invariants
+             Stage 97: SMT-based loop-invariant discovery. Every loop
+             is summarised (entry facts, per-variable transition
+             relation, condition), candidates are generated from
+             templates, and z3 decides initiation and preservation.
+             Only solver-verified invariants are reported as inferred;
+             failed candidates are reported with their failing
+             obligation. With --smt, the verified obligations are also
+             written as .smt2 files (one per loop).
 """
 import os
 import subprocess
@@ -328,6 +337,132 @@ def suggest_invariants(program):
         print("    (no loops found)")
 
 
+def _z3_binary_decide(lines):
+    """One obligation through a z3 BINARY (temp file — the stdin `-`
+    convention is not portable across z3 builds). Returns the verdict
+    string or None when no binary is on PATH."""
+    import tempfile
+    try:
+        with tempfile.NamedTemporaryFile("w", suffix=".smt2",
+                                         delete=False) as tf:
+            tf.write("\n".join(lines) + "\n")
+            tmp = tf.name
+    except OSError:
+        return None
+    try:
+        proc = subprocess.run(["z3", tmp], capture_output=True,
+                              text=True, timeout=10)
+    except FileNotFoundError:
+        return None
+    except subprocess.TimeoutExpired:
+        return "timeout"
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+    if proc.returncode != 0:
+        return "?"
+    out = [ln.strip() for ln in (proc.stdout or "").splitlines()
+           if ln.strip() in ("sat", "unsat", "unknown")]
+    return out[0] if out else "?"
+
+
+def _z3_module_decide(lines):
+    """One obligation through the z3 PYTHON module. Returns the verdict
+    string or None when the module is unavailable."""
+    try:
+        import z3 as z
+    except ImportError:
+        return None
+    solver = z.Solver()
+    try:
+        solver.from_string("\n".join(lines))
+    except Exception:
+        return "?"
+    return str(solver.check())
+
+
+def make_decider():
+    """A decide(lines) -> verdict callable, z3 binary first, then the
+    z3-solver python module — or None when neither exists (nothing is
+    then claimed as inferred; the report says so)."""
+    def decide(lines):
+        v = _z3_binary_decide(lines)
+        if v is not None:
+            return v
+        return _z3_module_decide(lines)
+
+    if _z3_binary_decide(["(check-sat)"]) is not None:
+        return decide
+    if _z3_module_decide(["(check-sat)"]) is not None:
+        return decide
+    return None
+
+
+def infer_invariants(program, want_smt, out_dir):
+    """Stage 97: the SMT-based invariant inference pipeline. Returns an
+    exit-visible summary (accepted/rejected counts)."""
+    loops = _proof.infer_loops(program)
+    decider = make_decider()
+    accepted = 0
+    rejected = 0
+    if not loops:
+        print("  No loops found.")
+        return 0, 0
+    for loop in loops:
+        print("  %s:%d: %s" % (loop.fn_key, loop.line, loop.header))
+        carried = [loop.transition_text(v) for v in sorted(loop.carried)]
+        unmod = ["%s (%s)" % (v, loop.unmodeled[v])
+                 for v in sorted(loop.unmodeled)]
+        if carried:
+            print("    loop-carried: %s" % ", ".join(carried))
+        if unmod:
+            print("    unmodeled: %s" % ", ".join(unmod))
+        if loop.inv_vars:
+            print("    invariant over: %s" % ", ".join(sorted(loop.inv_vars)))
+        if loop.note:
+            print("    note: %s" % loop.note)
+        if not loop.cands:
+            print("    no candidates (nothing about this loop can be "
+                  "discharged)")
+            if decider is None:
+                continue
+        if decider is None:
+            print("    candidates: %s" % ", ".join(c.text for c in loop.cands))
+            print("    (no z3 binary and no z3-solver module — candidates "
+                  "are NOT verified, nothing is claimed as inferred; "
+                  "install z3 or pip install z3-solver)")
+            rejected += len(loop.cands)
+            continue
+        segs = _proof.verify_loop(loop, decider)
+        accepted += len(loop.accepted)
+        rejected += len(loop.rejected)
+        if loop.accepted:
+            print("    inferred (z3-verified inductive):")
+            for c in loop.accepted:
+                print("      %s   (%s)" % (c.text, c.tag))
+        else:
+            print("    inferred: (none)")
+        for c, why in loop.rejected:
+            print("    rejected: %s (%s obligation not discharged)"
+                  % (c.text, why))
+        if want_smt and segs:
+            fname = "%s__L%d.smt2" % (loop.fn_key.replace(".", "_"),
+                                      loop.line)
+            fpath = os.path.join(out_dir, fname)
+            with open(fpath, "w") as f:
+                f.write(_proof.smt_program_text(
+                    "; Halis loop-invariant obligations — %s:%d %s\n"
+                    "; verified inductive set: %s"
+                    % (loop.fn_key, loop.line, loop.header,
+                       ", ".join(c.text for c in loop.accepted) or "(none)"),
+                    segs))
+            print("    obligations -> %s" % fpath)
+        print()
+    return accepted, rejected
+
+
 def main():
     args = sys.argv[1:]
     want_z3 = "--z3" in args
@@ -335,6 +470,7 @@ def main():
     # implies it.
     want_smt = "--smt" in args or want_z3
     want_inv = "--suggest-invariants" in args
+    want_infer = "--infer-invariants" in args
     args = [a for a in args if not a.startswith("--")]
     if not args:
         sys.stderr.write(__doc__)
@@ -383,6 +519,16 @@ def main():
     if want_inv:
         print("")
         suggest_invariants(program)
+
+    if want_infer:
+        print("")
+        print("  SMT-based loop-invariant inference (Stage 97; entry "
+              "facts + transition relation + template candidates, "
+              "z3-checked):")
+        out_dir = os.path.dirname(os.path.abspath(path)) or "."
+        accepted, rejected = infer_invariants(program, want_smt, out_dir)
+        print("  INFERENCE TOTAL: %d invariants verified, %d candidates "
+              "rejected" % (accepted, rejected))
     return 0
 
 
