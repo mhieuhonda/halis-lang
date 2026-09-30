@@ -4883,3 +4883,45 @@ EM_AARCH64=183, entry 0x40000000, zero undefined symbols; without a
 toolchain the SKIP keeps the C and names the triple), and the
 documented boundaries (the interpreter's asm! refusal; the QEMU virt
 boot prints `bare aarch64 OK` wherever QEMU exists).
+
+## 49. Bare-metal RISC-V — `riscv64-unknown-none`, the trio complete (Stage 95 — v0.114.0-alpha)
+
+Stage 95 completes the bare-metal trio: `hlc --target
+riscv64-unknown-none` is the §47 contract on RISC-V, with the parts
+that make it the most self-evidently integer-only of the three:
+
+* **rv64imac has no float registers.** The bare-metal ISA (base
+  integer + multiply/divide + atomics + compressed) is the hardware
+  backstop behind the compiler's discipline: a float operation has
+  nowhere to go — GCC-style toolchains lower it to soft-float libgcc
+  calls a `-nostdlib` link cannot resolve, and the gate verifies the
+  DISASSEMBLY carries zero FP instructions (`fld/fsd/fmv.x/fcvt...`);
+* **the reference board is QEMU's riscv64 `virt` machine**: DRAM at
+  0x80000000 (the script's base; the `-bios none` reset vector enters
+  there, which is why `_start` is pinned first), the NS16550A UART at
+  0x10000000, and — the RISC-V bonus — the **SiFive test finisher** at
+  0x100000: writing `0x3333 | (code << 16)` makes QEMU exit with
+  `code`, the one bare-metal run with a REAL exit code without a
+  semihosting harness. The demo's finisher write carries 42, the same
+  number all three probes close at;
+* **the toolchain surface is pinned where it surprised**: GCC-style
+  `-march=rv64imac -mabi=lp64` drives gcc-flavoured cross-linkers;
+  zig cc rejects GCC's `-march` ("unknown CPU"), so for zig the
+  orchestrator drops it and keeps `-mabi=lp64` — the soft-float ABI is
+  what matters, and integer-only code brings no FP instructions.
+
+`hlcross --target riscv64-unknown-none` keeps Stage 26's detection
+order (`riscv64-unknown-elf-gcc`, `riscv64-elf-gcc`,
+`riscv64-none-elf-gcc`, then the Linux cross-compiler with the
+freestanding flags) plus zig cc from step 1. The Stage 26 gate now
+runs an integer-only probe through the bare pipeline (and asserts the
+hosted riscv demo is REFUSED — the discipline travels with the
+triple).
+
+The gate (`make triple-riscv64-acceptance`, 8 sections) runs the trio
+shape under the RISC-V triple: the CLI refusals, the eight probes at
+byte parity, the audit parity, the `call`/`ecall` entry branch, the
+image (ELF64 RISC-V, EM_RISCV=243, entry 0x80000000, zero undefined
+symbols, zero FP instructions), the optional QEMU boot (banner AND
+exit 42), the script shape, and the completed registry — all three
+bare-metal triples named by `--list-targets`.

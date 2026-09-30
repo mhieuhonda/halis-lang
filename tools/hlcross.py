@@ -720,8 +720,14 @@ def cross_compile(input_hls: str, output_bin: str, target: str,
             march = "rv64gcv"
         arch_flags = ["-march=" + march, "-mabi=" + spec.get("mabi", "lp64d")] + arch_flags
     elif target == "riscv64-unknown-none":
-        march = spec.get("march", "rv64imac")
-        arch_flags = ["-march=" + march, "-mabi=" + spec.get("mabi", "lp64")] + arch_flags
+        # Stage 95 (v0.114.0-alpha): rv64imac/lp64 — the integer-only
+        # bare-metal ISA (no F/D: the ISA itself is the FP backstop).
+        # GCC's -march is a CPU-ISA string; zig cc rejects it ("unknown
+        # CPU") — for zig the -mabi alone pins the soft-float ABI and
+        # the integer-only code brings no FP instructions anyway.
+        if kind != "zig":
+            arch_flags = ["-march=" + spec.get("march", "rv64imac")] + arch_flags
+        arch_flags = ["-mabi=" + spec.get("mabi", "lp64")] + arch_flags
     cmd = ([linker] + base_args + sec_flags + arch_flags
            + freestanding_flags + [c_path, "-o", out_path]
            + spec["link_libs"])

@@ -18,7 +18,7 @@ LINKER_TEST_CC ?= $(CC)
 LINKER_TEST_LD ?= $(shell $(CC) -print-prog-name=ld)
 LINKER_TEST_NM ?= $(shell $(CC) -print-prog-name=nm)
 
-.PHONY: triple triple-x86_64-acceptance triple-aarch64-acceptance test-linker
+.PHONY: triple triple-x86_64-acceptance triple-aarch64-acceptance triple-riscv64-acceptance test-linker
 test-linker: $(LINKER_TEST_BIN)
 	@$(LINKER_TEST_NM) $(LINKER_TEST_BIN) | grep -q '__halis_metadata_start' && \
 	 $(LINKER_TEST_NM) $(LINKER_TEST_BIN) | grep -q '__halis_sections_start' && \
@@ -276,6 +276,25 @@ triple-aarch64-acceptance:
 	@echo "[Stage 94 acceptance] running tests/triple_aarch64_acceptance.py..."
 	@$(PYTHON) tests/triple_aarch64_acceptance.py
 	@echo "ACCEPTANCE OK: Stage 94 -- target aarch64-unknown-none (bare-metal ARM)"
+
+
+# triple-riscv64-acceptance: the Stage 95 acceptance gate, completing
+# the trio. Runs the 8-section suite for the bare-metal RISC-V triple:
+# the CLI refusals at word parity, the eight integer-only probes at
+# byte parity (still legal hosted), the freestanding implication's
+# audit parity, the emission shape (the RISC-V call/ecall entry
+# branch), the image (ELF64 RISC-V at the virt DRAM base with zero
+# undefined symbols and ZERO floating-point instructions in the
+# disassembly — rv64imac's own backstop — wherever a cross-linker and
+# an objdump exist; the honest SKIP that keeps the C otherwise), the
+# optional QEMU boot (the NS16550A banner AND the SiFive test
+# finisher's exit code — the one triple whose bare-metal run has a
+# real exit status without semihosting), the script shape, and the
+# completed registry.
+triple-riscv64-acceptance:
+	@echo "[Stage 95 acceptance] running tests/triple_riscv64_acceptance.py..."
+	@$(PYTHON) tests/triple_riscv64_acceptance.py
+	@echo "ACCEPTANCE OK: Stage 95 -- target riscv64-unknown-none (bare-metal RISC-V)"
 
 # freestanding: compile an HLS program to freestanding C + link with
 # -nostdlib into a runnable binary.

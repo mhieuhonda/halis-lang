@@ -1191,3 +1191,20 @@ else
     bad "triple94: make triple-aarch64-acceptance failed"
     tail -15 "$TMP/tri_acc94.log"
 fi
+
+echo "=== 32. Stage 95: target riscv64-unknown-none (bare-metal RISC-V) ==="
+# Stage 95 (v0.114.0-alpha): the trio closes. rv64imac has no float
+# registers, so the ISA itself backs the integer-only rule; the demo
+# exits through the SiFive test finisher, the one bare-metal run with
+# a real exit code without semihosting.
+if make triple-riscv64-acceptance >"$TMP/tri_acc95.log" 2>&1; then
+    if grep -q "ACCEPTANCE OK: Stage 95" "$TMP/tri_acc95.log"; then
+        ok "triple95: make triple-riscv64-acceptance runs end-to-end"
+    else
+        bad "triple95: gate did not print ACCEPTANCE OK"
+        tail -5 "$TMP/tri_acc95.log"
+    fi
+else
+    bad "triple95: make triple-riscv64-acceptance failed"
+    tail -15 "$TMP/tri_acc95.log"
+fi

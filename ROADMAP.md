@@ -150,7 +150,7 @@ remains green.
 | 92 | Cross-bootstrappable build (Stage-0 → freestanding hlc) | ✅ | (done in v0.111.0-alpha) |
 | 93 | `target x86_64-unknown-none` — bare-metal triple | ✅ | (done in v0.112.0-alpha) |
 | 94 | `target aarch64-unknown-none` — bare-metal ARM | ✅ | (done in v0.113.0-alpha) |
-| 95 | `target riscv64-unknown-none` — bare-metal RISC-V | ⬜ | 3 weeks |
+| 95 | `target riscv64-unknown-none` — bare-metal RISC-V | ✅ | (done in v0.114.0-alpha) |
 | 96 | ELF symbol-table emission + debug-info (DWARF 5) | ⬜ | 6 weeks |
 
 ### Phase VII — Verification, security & supply chain (Stages 97–112)
