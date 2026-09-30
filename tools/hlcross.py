@@ -254,6 +254,26 @@ TARGETS = {
         "freestanding": True,
         "general_regs_only": True,
     },
+    # Stage 94 (v0.113.0-alpha): aarch64-unknown-none — the bare-metal
+    # ARM triple (roadmap Stage 94). QEMU's `virt` machine is the
+    # reference board: DRAM at 0x40000000, the PL011 console at
+    # 0x09000000, `-bios none -kernel image.elf` for the boot. Same
+    # shape as the x86-64 one — no libc, no crt0, integer-only (the
+    # FPU/NEON state is not saved until the kernel does it, and
+    # -mgeneral-regs-only makes the compiler refuse to emit FP).
+    "aarch64-unknown-none": {
+        "arch": "aarch64",
+        "os": "none",
+        "abi": "none",
+        "binary_format": "ELF aarch64 (Little Endian, freestanding)",
+        "object_suffix": ".o",
+        "binary_suffix": "",
+        "link_libs": [],
+        "mingw": False,
+        "security_flags": [],
+        "freestanding": True,
+        "general_regs_only": True,
+    },
 }
 
 # Aliases — accept the short forms users commonly type.
@@ -291,6 +311,11 @@ TARGET_ALIASES = {
     "x86_64-bare": "x86_64-unknown-none",
     "x86-bare": "x86_64-unknown-none",
     "bare-x86_64": "x86_64-unknown-none",
+    # Stage 94 (v0.113.0-alpha): bare-metal AArch64 aliases.
+    "aarch64-none": "aarch64-unknown-none",
+    "aarch64-bare": "aarch64-unknown-none",
+    "bare-aarch64": "aarch64-unknown-none",
+    "arm64-bare": "aarch64-unknown-none",
 }
 
 
@@ -372,9 +397,15 @@ def find_target_linker(target: str) -> Tuple[Optional[str], List[str], str]:
     # 1. zig cc — the universal linker.
     zig = find_zig()
     if zig:
-        # zig cc -target <triple> behaves as a cross-compiler for every
-        # target zig supports (Linux, macOS, Windows, FreeBSD, ...).
-        return (zig, ["cc", "-target", target, "-O2"], "zig")
+        # Stage 93-95: zig spells the bare-metal OS `freestanding`, not
+        # `unknown-none` — and it only rejects the wrong spelling at
+        # LINK time (a -E or -c run parses the triple loosely). Translate
+        # the Rust-style triple for the bare-metal set; every hosted
+        # triple passes through unchanged (Stage 22/25/26 behavior).
+        zig_triple = target
+        if target.endswith("-unknown-none"):
+            zig_triple = target[: -len("-unknown-none")] + "-freestanding-none"
+        return (zig, ["cc", "-target", zig_triple, "-O2"], "zig")
 
     # 2. target-specific cross-linkers.
     if target == "x86_64-pc-windows-gnu":
@@ -456,6 +487,22 @@ def find_target_linker(target: str) -> Tuple[Optional[str], List[str], str]:
                 if p:
                     return (p, ["-O2"], "native-freestanding")
 
+    # Stage 94 (v0.113.0-alpha): the bare-metal AArch64 triple. The
+    # bare-metal toolchains first (aarch64-*-elf-gcc), then the Linux
+    # cross-compiler with the freestanding flags (it links a no-libc
+    # image fine — libc is simply never requested), then zig cc (step
+    # 1 above).
+    if target == "aarch64-unknown-none":
+        for name in ("aarch64-none-elf-gcc",
+                     "aarch64-elf-gcc",
+                     "aarch64-unknown-elf-gcc",
+                     "aarch64-linux-gnu-gcc",
+                     "aarch64-linux-gnu-gcc-12",
+                     "aarch64-linux-gnu-cc"):
+            p = _which(name)
+            if p:
+                return (p, ["-O2"], "aarch64-elf-gcc")
+
     # 3. host compiler when target == host (native build — useful for
     #    testing the pipeline end-to-end without a real cross-linker).
     host = host_triple()
@@ -487,7 +534,10 @@ def cross_linker_hint(target: str, kind: str) -> str:
                 f"  - x86_64-unknown-none:   any x86-64 host gcc links the image\n"
                 f"                            (a static freestanding link needs no\n"
                 f"                            OS support); x86_64-elf-gcc for a real\n"
-                f"                            cross-toolchain")
+                f"                            cross-toolchain\n"
+                f"  - aarch64-unknown-none:  apt install gcc-aarch64-linux-gnu\n"
+                f"                            (or the bare-metal aarch64-none-elf\n"
+                f"                            toolchain)")
     return ""
 
 

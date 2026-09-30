@@ -1174,3 +1174,20 @@ else
     bad "triple93: make triple-x86_64-acceptance failed"
     tail -15 "$TMP/tri_acc93.log"
 fi
+
+echo "=== 31. Stage 94: target aarch64-unknown-none (bare-metal ARM) ==="
+# Stage 94 (v0.113.0-alpha): the ARM triple assembles for real — the
+# Stage 77 entry branch (`bl hl_boot` / `svc #0`) was never assembled
+# until a cross toolchain entered the gates; Stage 94 fixes it and
+# pins it. The PL011 demo runs under QEMU virt where QEMU exists.
+if make triple-aarch64-acceptance >"$TMP/tri_acc94.log" 2>&1; then
+    if grep -q "ACCEPTANCE OK: Stage 94" "$TMP/tri_acc94.log"; then
+        ok "triple94: make triple-aarch64-acceptance runs end-to-end"
+    else
+        bad "triple94: gate did not print ACCEPTANCE OK"
+        tail -5 "$TMP/tri_acc94.log"
+    fi
+else
+    bad "triple94: make triple-aarch64-acceptance failed"
+    tail -15 "$TMP/tri_acc94.log"
+fi

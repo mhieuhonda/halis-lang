@@ -18,7 +18,7 @@ LINKER_TEST_CC ?= $(CC)
 LINKER_TEST_LD ?= $(shell $(CC) -print-prog-name=ld)
 LINKER_TEST_NM ?= $(shell $(CC) -print-prog-name=nm)
 
-.PHONY: triple triple-x86_64-acceptance test-linker
+.PHONY: triple triple-x86_64-acceptance triple-aarch64-acceptance test-linker
 test-linker: $(LINKER_TEST_BIN)
 	@$(LINKER_TEST_NM) $(LINKER_TEST_BIN) | grep -q '__halis_metadata_start' && \
 	 $(LINKER_TEST_NM) $(LINKER_TEST_BIN) | grep -q '__halis_sections_start' && \
@@ -261,6 +261,21 @@ triple-x86_64-acceptance:
 	@echo "[Stage 93 acceptance] running tests/triple_x86_64_acceptance.py..."
 	@$(PYTHON) tests/triple_x86_64_acceptance.py
 	@echo "ACCEPTANCE OK: Stage 93 -- target x86_64-unknown-none (bare-metal triple)"
+
+
+# triple-aarch64-acceptance: the Stage 94 acceptance gate. Runs the
+# 8-section suite for the bare-metal ARM triple: the CLI refusals at
+# word parity, the eight integer-only probes at byte parity (still
+# legal hosted), the freestanding implication's audit parity, the
+# emission shape (the stamp, the AArch64 `bl`/`svc` entry branch, the
+# used pin that keeps hl_boot alive under clang one-step links), the
+# image (ELF64 AArch64 at the QEMU virt DRAM base when a cross-linker
+# exists; the honest SKIP that keeps the C otherwise), the optional
+# QEMU virt boot (the PL011 banner), the script shape, and the tools.
+triple-aarch64-acceptance:
+	@echo "[Stage 94 acceptance] running tests/triple_aarch64_acceptance.py..."
+	@$(PYTHON) tests/triple_aarch64_acceptance.py
+	@echo "ACCEPTANCE OK: Stage 94 -- target aarch64-unknown-none (bare-metal ARM)"
 
 # freestanding: compile an HLS program to freestanding C + link with
 # -nostdlib into a runnable binary.

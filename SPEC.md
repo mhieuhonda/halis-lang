@@ -4829,3 +4829,57 @@ EM_X86_64, entry 0x100000, `_start` the lowest symbol, zero undefined
 symbols, the probe runs on the host and exits 42); the orchestrator
 (hlcross builds the working image end to end); the linker script's
 shape; and the tools.
+
+## 48. Bare-metal ARM — `aarch64-unknown-none` (Stage 94 — v0.113.0-alpha)
+
+Stage 94 extends `--target` to the ARM triple: `hlc --target
+aarch64-unknown-none` is the x86-64 contract (§47) on AArch64 —
+freestanding implied, integer-only enforced, C stamped — plus the
+parts that could not be proven until a cross toolchain entered the
+gates:
+
+* **the Stage 77 entry branch now assembles.** The naked `_start`'s
+  `#elif defined(__aarch64__)` branch was written in Stage 77 but
+  never ASSEMBLED (no gate had an AArch64 toolchain). Its first
+  instruction was x86's `call` — dead on arrival on ARM. Stage 94
+  fixes it to `bl hl_boot` (hl_boot's return value arrives in x0, the
+  exit_group syscall's argument; `mov x0, x0` remains the explicit
+  no-op it always was) and the gate pins the branch shape;
+* **`hl_boot` is `__attribute__((used))`.** The definition is
+  referenced ONLY from the entry's inline-asm string, invisible to the
+  C compiler. Clang driving `-c` and the link in one step (zig cc)
+  optimizes the unreferenced definition away and the link dies on
+  `undefined symbol: hl_boot`. The attribute pins it into the object
+  (SHF_GNU_RETAIN, honored by `--gc-sections`); it sits on its own
+  line so the Stage 77 gate's function splitter still sees the
+  `T name(...) {` shape;
+* **the reference board is QEMU's `virt` machine**: DRAM base
+  0x40000000 (the linker script's `. = 0x40000000;`), the PL011
+  console at 0x09000000, `-bios none -kernel image.elf` for the boot.
+  `targets/aarch64-unknown-none.ld` places `_start` first, so the
+  base address IS the entry for loaders that jump there rather than
+  to the ELF entry point;
+* **the device demo writes the PL011 through ONE self-contained
+  `asm!` template** — no operands, no clobber list. The template saves
+  and restores the two temporary registers it uses (x9/x10), so the
+  Stage 83 contract ("asm! touches no registers" — whose
+  named-register model is x86-64 today) stays true, and the default
+  memory clobber covers the device store. The interpreter CHECKS the
+  demo and refuses to EXECUTE it (the documented asm! boundary).
+
+`hlcross --target aarch64-unknown-none` finds the bare-metal
+toolchains first (`aarch64-none-elf-gcc`, `aarch64-elf-gcc`), then the
+Linux cross-compiler (`aarch64-linux-gnu-gcc` — a no-libc link simply
+never requests libc), then zig cc. One toolchain subtlety is pinned:
+zig spells the bare-metal OS `freestanding`, and rejects the
+Rust-style `-unknown-none` only at LINK time — the orchestrator
+translates the triple for zig (`-unknown-none` → `-freestanding-none`)
+and passes every hosted triple through unchanged.
+
+The gate (`make triple-aarch64-acceptance`, 8 sections) runs the
+Stage 93 shape under the AArch64 triple and adds the two new proofs:
+the entry branch assembles (cross-linked image: ELF64 AArch64,
+EM_AARCH64=183, entry 0x40000000, zero undefined symbols; without a
+toolchain the SKIP keeps the C and names the triple), and the
+documented boundaries (the interpreter's asm! refusal; the QEMU virt
+boot prints `bare aarch64 OK` wherever QEMU exists).

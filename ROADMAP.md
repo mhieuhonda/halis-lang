@@ -149,7 +149,7 @@ remains green.
 | 91 | Verified interrupt-safety (no alloc in IRQ context) | ✅ | (done in v0.110.0-alpha) |
 | 92 | Cross-bootstrappable build (Stage-0 → freestanding hlc) | ✅ | (done in v0.111.0-alpha) |
 | 93 | `target x86_64-unknown-none` — bare-metal triple | ✅ | (done in v0.112.0-alpha) |
-| 94 | `target aarch64-unknown-none` — bare-metal ARM | ⬜ | 3 weeks |
+| 94 | `target aarch64-unknown-none` — bare-metal ARM | ✅ | (done in v0.113.0-alpha) |
 | 95 | `target riscv64-unknown-none` — bare-metal RISC-V | ⬜ | 3 weeks |
 | 96 | ELF symbol-table emission + debug-info (DWARF 5) | ⬜ | 6 weeks |
 
