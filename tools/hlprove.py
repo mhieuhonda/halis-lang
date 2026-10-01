@@ -60,6 +60,20 @@ Modes:
              UNVERIFIED and nothing is claimed. Analysis-only: no
              compilation unit changes, interpreter and native binaries
              agree byte for byte.
+  --sidechannel
+             Stage 101: the cryptographic side-channel analysis. The
+             #[secrets(...)] parameters are the taint roots; the pass
+             tracks the marking through the bodies (assignment,
+             arithmetic, calls — interprocedurally, by fixpoint) and
+             reports every SINK where a secret becomes observable:
+             branch / match on a secret-derived condition, memory
+             access with a secret-dependent address (index, slice,
+             map key), secret-decided loop bounds, and division/
+             modulo with a secret operand. .len() on a secret value
+             is public by policy — every use is counted and printed
+             so the report states its assumption. Data-only flow
+             (store, return, a call keeping the value internal) is
+             never a leak — that is the point of the sink list.
 """
 import os
 import subprocess
@@ -582,6 +596,53 @@ def shapes_report(program, want_smt, out_dir, decider=None,
     return proven, refused, unverified
 
 
+def sidechannel_report(program, checker):
+    """Stage 101: the side-channel audit. Prints the per-fn findings
+    (kind, line, the construct as written) plus the policy notes and
+    the incoming secret flows; returns the summary counts."""
+    reports = _proof.analyze_sidechannel(program)
+    involved = sorted(reports.values(),
+                      key=lambda r: (not r.roots, r.fn_key))
+    if not involved:
+        print("    (no #[secrets(...)] annotation — nothing to audit; "
+              "mark the secret parameters of the crypto code)")
+        return 0, 0, 0, 0, 0
+    counts = {k: 0 for k in _proof.SC_KIND_ORDER}
+    leak_fns = 0
+    for rep in involved:
+        print("  %s:" % rep.fn_key)
+        if rep.roots:
+            print("    secret roots: %s" % ", ".join(rep.roots))
+        extra = [p for p in rep.secret_params if p not in rep.roots]
+        if extra:
+            print("    secret by propagation: %s" % ", ".join(extra))
+        for caller, param, line in rep.incoming:
+            print("    incoming: '%s' passes a secret '%s' from %s "
+                  "(line %d)" % (param, param, caller, line))
+        for f in rep.findings:
+            counts[f.kind] += 1
+            print("    line %d: %s — `%s`" % (f.line, f.kind.upper(),
+                                              f.text))
+            print("      %s" % f.why)
+        if rep.length_uses:
+            print("    .len() on a secret value: %d use(s) — public by "
+                  "policy" % rep.length_uses)
+        if rep.findings:
+            leak_fns += 1
+        else:
+            print("    CLEAN: no secret-dependent control flow, "
+                  "addressing or division")
+    total = sum(counts.values())
+    print("  SIDECHANNEL TOTAL: %d leaks — %d branch, %d index, "
+          "%d loop-bound, %d division — in %d of %d secret-handling "
+          "fns"
+          % (total, counts["branch"], counts["index"],
+             counts["loop-bound"], counts["division"], leak_fns,
+             len(involved)))
+    return (total, counts["branch"], counts["index"],
+            counts["loop-bound"], counts["division"])
+
+
 def suggest_invariants(program):
     """Loop-invariant suggestions (the roadmap's automatic inference
     rule set): const-bound for loops get exact bounds; while loops get
@@ -786,6 +847,7 @@ def main():
     want_inv = "--suggest-invariants" in args
     want_infer = "--infer-invariants" in args
     want_shapes = "--shapes" in args
+    want_side = "--sidechannel" in args
     args = [a for a in args if not a.startswith("--")]
     if not args:
         sys.stderr.write(__doc__)
@@ -855,6 +917,12 @@ def main():
                                               decider, solver_name)
         print("  INFERENCE TOTAL: %d invariants verified, %d candidates "
               "rejected" % (accepted, rejected))
+
+    if want_side:
+        print("")
+        print("  Side-channel audit (Stage 101 — the #[secrets(...)] "
+              "parameters are the roots):")
+        sidechannel_report(program, checker)
 
     if want_shapes:
         print("")

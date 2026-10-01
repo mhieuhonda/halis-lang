@@ -142,6 +142,27 @@ if python3 -c "import z3" 2>/dev/null || command -v z3 >/dev/null 2>&1; then
     fi
 fi
 
+# Stage 101: the cryptographic side-channel analysis. The run must be
+# clean; on the demo every sink kind (branch, index, loop-bound,
+# division), the incoming chain, the policy note and the totals line
+# must appear.
+sc_out=$(python3 tools/hlprove.py examples/sidechannel_demo.hls --sidechannel 2>/dev/null); sc_rc=$?
+if [ "$sc_rc" -eq 0 ] && echo "$sc_out" | grep -q "SIDECHANNEL TOTAL:"; then
+    ok "hlprove --sidechannel runs on the side-channel demo"
+else
+    bad "hlprove --sidechannel wrong on the demo (rc=$sc_rc)"
+fi
+if echo "$sc_out" | grep -qF 'INDEX — `sbox.get(b)`' \
+   && echo "$sc_out" | grep -qF 'BRANCH — `(key.byte_at(i) != probe.byte_at(i))`' \
+   && echo "$sc_out" | grep -qF 'LOOP-BOUND — `range(0, rounds)`' \
+   && echo "$sc_out" | grep -qF 'DIVISION — `(acc % rounds)`' \
+   && echo "$sc_out" | grep -qF 'public by policy' \
+   && echo "$sc_out" | grep -qF 'SIDECHANNEL TOTAL: 5 leaks'; then
+    ok "hlprove --sidechannel reports every sink kind on the demo"
+else
+    bad "hlprove --sidechannel findings missing on the demo"
+fi
+
 # Stage 98: refinement types. Every refined slot is guarded at runtime
 # (fn entry / return / let / assign / construction); proven sites are
 # elided. The interpreter and the native build (default AND -O fast)

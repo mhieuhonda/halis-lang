@@ -288,6 +288,10 @@ class CheckerCore(object):
         # on signatures only (uniqueness + shape), so it also reports
         # before any body-level error in the handler itself.
         self.check_panic_handler()
+        # 2.7c Stage 101 (v0.120.0-alpha): #[secrets(...)] names must
+        # resolve to the fn's own parameters (signature-only pass, like
+        # the attr checks above — no types needed).
+        self.check_secrets_attrs()
         # 2.7 Stage 82 (v0.101.0-alpha): per-fn #[stack_size(N)] frame
         # bounds validate on the AST only (no types needed) — the same
         # pass the self-hosted checker runs on signatures, closing the
@@ -496,6 +500,28 @@ class CheckerCore(object):
             if fn.get("ret") != "void":
                 self.err("#[panic_handler] must return 'void'; '%s' "
                          "returns '%s'" % (key, fn.get("ret")), fn)
+
+    # ---------- Stage 101 (v0.120.0-alpha): #[secrets(...)] ----------
+    # `#[secrets(name, ...)]` marks the named parameters as
+    # cryptographic secrets — the roots the side-channel analysis pass
+    # (`hlprove --sidechannel`) tracks through the body. The marking is
+    # only load-bearing if the names resolve: a typo'd name would mark
+    # nothing and the audit would silently report a clean function, so
+    # every name must be a parameter of the fn it annotates. Methods
+    # may mark `self`-style receivers too — the receiver is parameter
+    # 0 of the underlying fn, so the same rule covers it.
+    def check_secrets_attrs(self):
+        for key, fn in self.fns.items():
+            names = (fn.get("attrs") or {}).get("secrets") or []
+            if not names:
+                continue
+            params = [p[0] for p in fn.get("params", [])]
+            for n in names:
+                if n not in params:
+                    self.err("#[secrets(...)] names '%s' which is not a "
+                             "parameter of '%s' (parameters: %s)"
+                             % (n, key, ", ".join(params) or "(none)"),
+                             fn)
 
     # ---------- Stage 82 (v0.101.0-alpha): deterministic stack sizing ----------
     # Two halves, mirroring the self-hosted checker exactly:

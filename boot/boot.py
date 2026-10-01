@@ -740,6 +740,18 @@ def print_audit(program, checker):
               "proved to reach no allocation:")
         for line in irq_lines:
             print("    " + line)
+    # Stage 101 (v0.120.0-alpha): the #[secrets(...)] annotations the
+    # side-channel analysis pass consumes. Word-for-word what the
+    # self-hosted --audit prints (the gate compares the two).
+    secret_rows = []
+    for key, fn in fns.items():
+        names = (fn.get("attrs") or {}).get("secrets") or []
+        if names:
+            secret_rows.append("    %s: %s" % (key, ", ".join(names)))
+    if secret_rows:
+        print("  #[secrets(...)] annotations: %d" % len(secret_rows))
+        for row in secret_rows:
+            print(row)
     # Stage 84 (v0.103.0-alpha): custom sections + the linker script that
     # places them. The checker proved every named section is covered (or
     # that no script was declared) before we get here.

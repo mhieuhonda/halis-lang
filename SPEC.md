@@ -5510,3 +5510,160 @@ binary or `pip install z3-solver`):
 The suite keeps the two-tier smoke block in `tests/suites/`: the
 `--shapes` run must be clean with or without a solver installed, and
 wherever a decider exists the proven/refusal lines must appear.
+
+## 55. The cryptographic side-channel analysis (Stage 101 — v0.120.0-alpha)
+
+### 55.1. The marking
+
+`#[secrets(name, ...)]` on a `fn` names the parameters that carry
+cryptographic secrets. The names must be parameters of the fn they
+annotate — a typo'd name would mark nothing and the audit would
+silently report a clean function, so both checkers refuse it (the
+diagnostic lists the fn's actual parameters). One attribute per fn
+(two lists are refused — merge the names), at least one name (an
+empty list marks nothing, which hides the hazard the attribute exists
+to name), and no attribute lists inside `extern` blocks (unchanged
+Stage-15 rule — the marking cannot cross the FFI boundary anyway).
+The marking is audit-only: the codegen of both front-ends ignores it,
+`--fast` emits the same C with or without it, and the interpreter
+runs the program identically.
+
+The `--audit` of both front-ends states the marking word-for-word
+identically (the gate compares the blocks):
+
+```
+  #[secrets(...)] annotations: 6
+    ct_pick: mask
+    table_lookup: b
+    ...
+```
+
+### 55.2. The sources and the sinks
+
+The marked parameters are the taint ROOTS. The pass tracks the
+marking through assignment, arithmetic (a secret operand makes the
+result secret — comparisons included, so a secret-derived `bool` is
+secret), field and container access, calls (interprocedurally — see
+55.4), and the literal/aggregate forms (a list literal or enum
+payload with a secret part is secret). The `qmark` propagation keeps
+the marking; `asm!` operands are out of the fragment (register-
+resident per the Stage-83 ABI; the analysis does not pretend to read
+assembly).
+
+A secret becomes OBSERVABLE at exactly four kinds of sink, and the
+report names each with its line and the construct as written:
+
+- **BRANCH** — an `if` / `while` condition or a `match` scrutinee
+  that is secret-derived (in any position: statement, return value,
+  `let` value). The branch predictor's history follows the secret
+  bit. A `while` whose condition is secret is reported once at the
+  loop head (every iteration re-tests it — the trip count leaks with
+  it).
+- **INDEX** — a memory access whose ADDRESS depends on a secret:
+  `xs[i]`, `list.get` / `list.set`, `str.byte_at`, `str.slice`
+  (either bound), and the map family (`get` / `get_or` / `has` /
+  `set` — the key decides the hash probing). The fetched cache line
+  follows the secret byte. NOTE the direction: a PUBLIC index into a
+  SECRET container is data flow (only the value is secret); a SECRET
+  index into a PUBLIC table is the leak. Both kinds of container end
+  up marked; only the second kind is a finding.
+- **LOOP-BOUND** — a `for` over `range(a, b)` with a secret bound:
+  the total iteration count follows the secret. The loop VARIABLE is
+  then secret-derived too, so a downstream `xs[i]` under it is
+  reported as its own INDEX sink — two sinks, one source, both named.
+- **DIVISION** — a `/` or `%` with a secret operand: division latency
+  is data-dependent on several microarchitectures. Multiplication is
+  NOT a sink (single-latency on every core the runtime targets),
+  which is what makes the branch-free selection idiom
+  `a * mask + b * (1 - mask)` provably CLEAN under this fragment.
+
+Data-only flow — storing, returning, passing to a call that keeps the
+value internal — is never a leak. That is the point of the sink list:
+the pass reports where a secret escapes into an observable, not where
+it merely travels.
+
+### 55.3. The one policy decision: `len()` is public
+
+`.len()` on a secret str / list / map / chan is PUBLIC by policy —
+standard constant-time guidance treats buffer lengths as public
+unless a protocol says otherwise. The analysis states the assumption
+instead of hiding it: every such use is counted and printed
+(`.len() on a secret value: 1 use(s) — public by policy`), so a
+reviewer sees exactly where the audit leaned on it. Branching on a
+secret's length is therefore CLEAN by policy and NOT a leak report.
+
+### 55.4. Interprocedural propagation
+
+The pass runs as a fixpoint over the whole program. When a caller
+passes a secret argument, the callee's parameter becomes a secret
+root on the next round — for plain calls and for method receivers
+(the receiver is parameter 0 of the underlying fn) — and the callee's
+return secretness feeds back into the callers. The report shows the
+propagation honestly: the callee's line says
+
+```
+    secret by propagation: x
+    incoming: 'x' passes a secret 'x' from schedule_step (line 84)
+```
+
+so a leak three helpers deep is found at the deepest fn's own line
+with the chain printed at every level. The fixpoint is monotone (the
+parameter sets only grow, bounded by the parameter names) and
+therefore terminates; recursion is handled by the same monotonicity.
+There is deliberately NO way to launder a marking inside the
+analysis — an explicit launder would be a lie the audit signs; if a
+value truly stops being secret, the code should say so by construction
+(not by annotation), which is Stage 102's subject.
+
+### 55.5. Flow sensitivity
+
+The per-fn walk carries the environment through the statements: a
+`let`/assignment sets the marking from the right-hand side (an
+assignment of a PUBLIC value KILLS the marking — a variable that
+carried a secret and was overwritten is public afterwards), `if`/
+`else` joins by union (secret on either path stays secret), and
+loops widen (a variable that becomes secret inside the body is secret
+for every later iteration and after the loop — the body is walked
+against its own widened environment). Statement-position method calls
+can taint their receiver (`xs.push(secret)` makes `xs` secret; a user
+method conservatively taints its receiver when any argument or the
+receiver itself is secret, because the callee may store its arguments
+in its own fields).
+
+### 55.6. The report and the gate
+
+`hlprove --sidechannel <file>` (analysis-only — no solver, no codegen
+change, exit 0 either way) prints, per involved function: the roots,
+the propagated parameters, the incoming flows, every finding
+(`line N: KIND — \`construct\``) with its one-line why, the len()
+policy notes, and CLEAN for the functions with no findings; the
+totals line counts every sink kind across the program. Programs with
+no markings get an honest "nothing to audit" line.
+
+`make sidechannel F=examples/sidechannel_demo.hls` runs the report;
+`make sidechannel-acceptance` runs the eight-section gate:
+
+- **the engine** — the sink battery pinned exactly: the INDEX on
+  `sbox.get(b)`, the BRANCH on the byte compare (the walk's condition
+  staying public), LOOP-BOUND + DIVISION on the secret-bounded loop,
+  the CLEAN branch-free selection with its secret return, and the
+  match-in-return-position scrutinee;
+- **the soundness flips** — the cases a naive source-taint pass gets
+  wrong: a public index into a secret list (data flow), a secret
+  index into a public table (the leak), the flow-sensitive kill (an
+  overwritten marking), the loop widening, the `push` receiver taint,
+  and the if/else join;
+- **the propagation** — the three-level chain (the leak at the
+  deepest line, the incoming edges at every level) and a recursive fn
+  terminating the fixpoint;
+- **the CLI** — the demo's four sink kinds, the incoming chain, the
+  policy note, the totals, the ok-test auditing CLEAN, and the
+  no-marking honesty;
+- **the demo** — `examples/sidechannel_demo.hls`, interpreter vs
+  native under `cc -O2 -Werror`, byte for byte;
+- **the audit parity** — `boot.py --audit` and `hlc --audit` print
+  the same `#[secrets(...)]` block, word for word;
+- **the fail tests** — the malformed markings (unknown name,
+  duplicate attribute, empty list) rejected by BOTH front-ends with
+  the same words;
+- **the tools** — hlfmt stable, hllint clean.

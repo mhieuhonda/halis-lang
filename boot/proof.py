@@ -3216,3 +3216,609 @@ def verify_shapes(fs_list, decide):
             ls.segments = segs
             out.setdefault(fs.fn_key, []).append((ls, segs))
     return out
+
+# ===========================================================================
+# Stage 101 (v0.120.0-alpha): the cryptographic side-channel analysis.
+#
+# A taint pass whose SOURCES are the parameters a `#[secrets(...)]`
+# attribute marks, and whose SINKS are the four constructs that turn a
+# secret into something an attacker can measure from outside the
+# process:
+#
+#   branch      an `if` / `while` / `match` decided by a
+#               secret-derived condition — the branch predictor's
+#               history follows the secret bit
+#   index       a memory access whose address depends on a secret —
+#               the fetched cache line follows the secret byte
+#               (xs[i], s.byte_at(i), s.slice(a, b), map keys, ...)
+#   loop-bound  an iteration count a secret decides (range bounds) —
+#               total runtime follows the secret
+#   division    a `/` or `%` with a secret operand — division latency
+#               is data-dependent on several microarchitectures
+#
+# Everything else a secret flows through (assignment, arithmetic whose
+# result is only stored or returned, a call that keeps the value
+# internal) is DATA flow — invisible to a timing or cache attacker as
+# long as it never reaches one of the sinks above, so it propagates
+# the marking without reporting anything.
+#
+# The one policy decision, stated where the leaks are NOT: `.len()` on
+# a secret str/list/map is PUBLIC by policy (standard constant-time
+# guidance treats buffer lengths as public unless a protocol says
+# otherwise). Every use is counted and printed so the audit states its
+# assumptions instead of hiding them.
+#
+# Interprocedural by fixpoint: when a caller passes a secret argument,
+# the callee's parameter becomes a secret root on the next round (and
+# the flow is reported as incoming), so a leak inside a helper three
+# calls deep is found at the helper's own line. Unmodeled constructs
+# claim nothing — there is deliberately NO way to launder a marking
+# inside the analysis (an explicit launder would be a lie the audit
+# signs). Analysis-only: no compilation unit changes, interpreter and
+# native binaries agree byte for byte.
+# ===========================================================================
+
+SC_KIND_ORDER = ("branch", "index", "loop-bound", "division")
+
+# Builtin-method ops whose argument selects WHERE to read or write —
+# a secret argument is an address leak, the same hazard a raw `xs[i]`
+# is. Keys mirror the `rm` tags the checker puts on builtin method
+# nodes; the value names the hazardous argument position(s).
+SC_ADDRESS_METHODS = {
+    "list.get": (0,),
+    "list.set": (0,),
+    "str.byte_at": (0,),
+    "str.slice": (0, 1),
+    "map.get": (0,),
+    "map.get_or": (0,),
+    "map.has": (0,),
+    "map.set": (0,),
+}
+
+# The len() family — public by policy (counted, never a leak).
+SC_LEN_METHODS = ("list.len", "str.len", "map.len", "chan.len")
+
+SC_KIND_WHY = {
+    "branch": "the branch predictor's state follows the secret",
+    "index": "the fetched cache line follows the secret",
+    "loop-bound": "the total iteration count follows the secret",
+    "division": "division latency is data-dependent on some cores",
+}
+
+
+class SCFinding:
+    """One secret-dependent sink the audit reports."""
+    __slots__ = ("kind", "line", "text", "why")
+
+    def __init__(self, kind, line, text, why):
+        self.kind = kind
+        self.line = line
+        self.text = text
+        self.why = why
+
+    def key(self):
+        return (self.kind, self.line, self.text)
+
+
+class FnSideChannel:
+    """The per-function side-channel report."""
+    __slots__ = ("fn_key", "roots", "secret_params", "findings",
+                 "length_uses", "incoming", "returns_secret")
+
+    def __init__(self, fn_key):
+        self.fn_key = fn_key
+        self.roots = []           # #[secrets(...)] names (the annotation)
+        self.secret_params = []   # params secret after propagation
+        self.findings = []        # list[SCFinding], deduped
+        self.length_uses = 0      # .len() on secret values (policy note)
+        self.incoming = []        # (caller_key, param, line) secret flows
+        self.returns_secret = False
+
+
+def _sc_call_target(e):
+    """The user-callee fn key of a call/method node, read from the
+    checker's post-check tags (rc for calls, rm for methods). None for
+    builtins and unresolved targets."""
+    tag = e.get("rc") or e.get("rm")
+    if isinstance(tag, (list, tuple)) and len(tag) == 2 and tag[0] == "user":
+        return tag[1]
+    return None
+
+
+def _sc_builtin_op(e):
+    """The builtin op of a call/method node ("str.byte_at", "range",
+    ...) or None for user callees."""
+    tag = e.get("rc") or e.get("rm")
+    if isinstance(tag, (list, tuple)) and len(tag) == 2 and tag[0] == "builtin":
+        return tag[1]
+    return None
+
+
+class _SCState:
+    """The interprocedural fixpoint state: which fn parameters may
+    carry a secret, and which fns may return one."""
+
+    def __init__(self, program):
+        self.params = {}
+        self.roots = {}
+        for key, fn in program["fns"].items():
+            names = list((fn.get("attrs") or {}).get("secrets") or [])
+            self.roots[key] = names
+            self.params[key] = set(names)
+        self.rets = {key: False for key in program["fns"]}
+
+    def snapshot(self):
+        return ({k: set(v) for k, v in self.params.items()},
+                dict(self.rets))
+
+
+class _SCWalker:
+    """One flow-sensitive pass over one function body. The `secret`
+    predicate propagates the marking; `flag` reports the sinks; the
+    statement walk carries the environment (var -> secret) through
+    branches (join = union) and loops (two passes = widening)."""
+
+    def __init__(self, fn_key, fn, state):
+        self.fn_key = fn_key
+        self.fn = fn
+        self.state = state
+        self.findings = {}
+        self.length_uses = 0
+        self.flows = []       # (callee_key, param_name, line) secret flows
+        self.ret_secret = False
+
+    def _flow(self, callee, param, line):
+        """Mark the callee's parameter as a secret root for the next
+        fixpoint round and record the flow for the report."""
+        if param in self.state.params.get(callee, ()):
+            return
+        self.state.params[callee].add(param)
+        self.state.changed = True
+        self.flows.append((callee, param, line))
+
+    def _collect_flow(self, e, env):
+        """A user-call node: propagate argument secretness into the
+        callee's parameters (the receiver of a method is parameter 0
+        of the underlying fn)."""
+        callee = _sc_call_target(e)
+        if not callee or callee not in self.state.params:
+            return
+        cf = self.state.fns.get(callee)
+        if cf is None:
+            return
+        params = [p[0] for p in cf.get("params", [])]
+        is_method = e.get("k") == "method"
+        if is_method:
+            if params and self.secret(e.get("target"), env):
+                self._flow(callee, params[0], e.get("line", 0))
+            args = e.get("args") or []
+            for i, a in enumerate(args):
+                pn = params[i + 1] if i + 1 < len(params) else None
+                if pn and self.secret(a, env):
+                    self._flow(callee, pn, e.get("line", 0))
+        else:
+            args = e.get("args") or []
+            for i, a in enumerate(args):
+                if i < len(params) and self.secret(a, env):
+                    self._flow(callee, params[i], e.get("line", 0))
+
+    # -- reporting ---------------------------------------------------------
+
+    def finding(self, kind, line, text):
+        f = SCFinding(kind, line, text, SC_KIND_WHY[kind])
+        self.findings.setdefault(f.key(), f)
+
+    # -- the secretness predicate ----------------------------------------
+
+    def secret(self, e, env):
+        if not isinstance(e, dict):
+            return False
+        k = e.get("k")
+        if k in ("int", "float", "bool", "str"):
+            return False
+        if k == "ident":
+            return bool(env.get(e.get("name")))
+        if k == "un":
+            return self.secret(e.get("e"), env)
+        if k == "bin":
+            return (self.secret(e.get("l"), env)
+                    or self.secret(e.get("r"), env))
+        if k in ("index", "field"):
+            return self.secret(e.get("target"), env)
+        if k == "listlit":
+            return any(self.secret(i, env)
+                       for i in (e.get("items") or []))
+        if k == "structlit":
+            return any(self.secret(fe, env)
+                       for _n, fe in (e.get("fields") or []))
+        if k in ("fieldcall", "enumlit"):
+            if self.secret(e.get("target"), env):
+                return True
+            return any(self.secret(a, env)
+                       for a in (e.get("args") or []))
+        if k == "method":
+            op = _sc_builtin_op(e)
+            if op in SC_LEN_METHODS:
+                return False  # public by policy
+            if self.secret(e.get("target"), env):
+                return True
+            if any(self.secret(a, env) for a in (e.get("args") or [])):
+                return True
+            key = _sc_call_target(e)
+            if key:
+                return bool(self.state.rets.get(key))
+            return False
+        if k == "call":
+            key = _sc_call_target(e)
+            if key:
+                if any(self.secret(a, env)
+                       for a in (e.get("args") or [])):
+                    return True
+                return bool(self.state.rets.get(key))
+            if e.get("name") == "range":
+                return False  # a range object only lives in a for header
+            return any(self.secret(a, env)
+                       for a in (e.get("args") or []))
+        if k == "match":
+            scrut = e.get("scrut")
+            scrut_secret = self.secret(scrut, env)
+            if scrut_secret:
+                return True
+            for arm in (e.get("arms") or []):
+                binds = ((arm.get("pattern") or {}).get("bindings")
+                         or [])
+                aenv = dict(env)
+                for b in binds:
+                    if b != "_":
+                        aenv[b] = False
+                if self.secret(arm.get("body"), aenv):
+                    return True
+            return False
+        if k == "qmark":
+            return self.secret(e.get("e"), env)
+        return False
+
+    # -- the sink flagger --------------------------------------------------
+    # Visits every subexpression of every expression the statement walk
+    # touches and reports the sinks the predicate itself does not:
+    # secret-decided addressing and secret divisions. Branch sinks are
+    # flagged by the statement walk (it knows statement lines).
+
+    def flag_expr(self, e, env):
+        if not isinstance(e, dict):
+            return
+        k = e.get("k")
+        if k == "bin":
+            if e.get("op") in ("/", "%") and (
+                    self.secret(e.get("l"), env)
+                    or self.secret(e.get("r"), env)):
+                self.finding("division", e.get("line", 0),
+                             _sc_text(e))
+            self.flag_expr(e.get("l"), env)
+            self.flag_expr(e.get("r"), env)
+            return
+        if k == "un":
+            self.flag_expr(e.get("e"), env)
+            return
+        if k == "index":
+            if self.secret(e.get("idx"), env):
+                self.finding("index", e.get("line", 0),
+                             _sc_text(e))
+            self.flag_expr(e.get("target"), env)
+            self.flag_expr(e.get("idx"), env)
+            return
+        if k == "method":
+            op = _sc_builtin_op(e)
+            target = e.get("target")
+            args = e.get("args") or []
+            if op in SC_LEN_METHODS:
+                if self.secret(target, env):
+                    self.length_uses += 1
+            elif op in SC_ADDRESS_METHODS:
+                for pos in SC_ADDRESS_METHODS[op]:
+                    if pos < len(args) and self.secret(args[pos], env):
+                        self.finding("index", e.get("line", 0),
+                                     _sc_text(e))
+                        break
+            else:
+                # user method: the call itself is data flow, but a
+                # secret ARGUMENT is a flow into the callee's
+                # parameter (the fixpoint's incoming edge)
+                self._collect_flow(e, env)
+            self.flag_expr(target, env)
+            for a in args:
+                self.flag_expr(a, env)
+            return
+        if k == "call":
+            args = e.get("args") or []
+            if e.get("name") != "range":
+                # Secret range bounds are flagged as LOOP-BOUND by the
+                # for-statement walk; user callees only collect flows.
+                self._collect_flow(e, env)
+            for a in args:
+                self.flag_expr(a, env)
+            return
+        if k in ("fieldcall", "enumlit"):
+            self.flag_expr(e.get("target"), env)
+            for a in (e.get("args") or []):
+                self.flag_expr(a, env)
+            return
+        if k == "listlit":
+            for i in (e.get("items") or []):
+                self.flag_expr(i, env)
+            return
+        if k == "structlit":
+            for _n, fe in (e.get("fields") or []):
+                self.flag_expr(fe, env)
+            return
+        if k == "match":
+            # a match in ANY position (statement, return value, let
+            # value) decides control flow by its scrutinee; walk_match
+            # flags the statement form, this flags the value forms —
+            # the dedup key collapses the double report
+            scrut = e.get("scrut")
+            if self.secret(scrut, env):
+                self.finding("branch", e.get("line", 0), _sc_text(scrut))
+            self.flag_expr(scrut, env)
+            for arm in (e.get("arms") or []):
+                self.flag_expr(arm.get("body"), env)
+            return
+        if k == "qmark":
+            self.flag_expr(e.get("e"), env)
+            return
+        # field / ident / literals: nothing to flag
+
+    # -- the statement walk ------------------------------------------------
+
+    def walk_stmts(self, stmts, env):
+        for s in stmts or []:
+            if not isinstance(s, dict):
+                continue
+            k = s.get("k")
+            if k == "let":
+                self.flag_expr(s.get("value"), env)
+                env[s["name"]] = self.secret(s.get("value"), env)
+            elif k == "assign":
+                tgt = s.get("target") or {}
+                self.flag_expr(tgt, env)
+                self.flag_expr(s.get("value"), env)
+                if tgt.get("k") == "ident":
+                    env[tgt["name"]] = self.secret(s.get("value"), env)
+                elif tgt.get("k") in ("field", "index"):
+                    base = _sc_root_name(tgt)
+                    if base is not None and self.secret(s.get("value"),
+                                                        env):
+                        env[base] = True
+            elif k == "expr":
+                e = s.get("e")
+                if isinstance(e, dict) and e.get("k") == "match":
+                    self.walk_match(e, env)
+                else:
+                    self.flag_expr(e, env)
+                    self.sc_side_effects(e, env)
+            elif k == "return":
+                v = s.get("value")
+                if v is not None:
+                    self.flag_expr(v, env)
+                    if self.secret(v, env):
+                        self.ret_secret = True
+            elif k == "if":
+                cond = s.get("cond")
+                self.flag_expr(cond, env)
+                if self.secret(cond, env):
+                    self.finding("branch", s.get("line", 0),
+                                 _sc_text(cond))
+                then_env = dict(env)
+                self.walk_stmts(s.get("then"), then_env)
+                else_env = dict(env)
+                self.walk_stmts(s.get("els"), else_env)
+                # join: a variable secret on EITHER path is secret
+                for name, v in then_env.items():
+                    env[name] = env.get(name, False) or v
+                for name, v in else_env.items():
+                    env[name] = env.get(name, False) or v
+            elif k == "while":
+                cond = s.get("cond")
+                self.flag_expr(cond, env)
+                if self.secret(cond, env):
+                    self.finding("branch", s.get("line", 0),
+                                 _sc_text(cond))
+                # widening: the body runs to a fixpoint of its own
+                # environment (a secret assigned inside the loop is
+                # secret on every later iteration)
+                self.walk_stmts(s.get("body"), env)
+                self.walk_stmts(s.get("body"), env)
+            elif k == "for":
+                it = s.get("iter") or {}
+                self.flag_expr(it, env)
+                if (it.get("k") == "call" and it.get("name") == "range"):
+                    args = it.get("args") or []
+                    if any(self.secret(a, env) for a in args):
+                        self.finding("loop-bound", s.get("line", 0),
+                                     _sc_text(it))
+                    env[s["var"]] = any(self.secret(a, env)
+                                        for a in args)
+                else:
+                    env[s["var"]] = self.secret(it, env)
+                self.walk_stmts(s.get("body"), env)
+                self.walk_stmts(s.get("body"), env)
+            elif k == "match":
+                # match-as-statement arrives wrapped in an expr node;
+                # a bare match node here is defensive (the parser
+                # always wraps).
+                m = s.get("e") or s
+                self.walk_match(m, env)
+            elif k in ("break", "continue", "asm"):
+                pass  # escapes / hand-written asm: out of the fragment
+            else:
+                # unknown statement kinds: walk any expression payloads
+                # defensively so nothing hides from the flagger
+                for key in ("value", "cond", "iter", "e"):
+                    self.flag_expr(s.get(key), env)
+
+    def walk_match(self, m, env):
+        if not isinstance(m, dict) or m.get("k") != "match":
+            return
+        scrut = m.get("scrut")
+        self.flag_expr(scrut, env)
+        scrut_secret = self.secret(scrut, env)
+        if scrut_secret:
+            self.finding("branch", m.get("line", 0), _sc_text(scrut))
+        for arm in (m.get("arms") or []):
+            binds = ((arm.get("pattern") or {}).get("bindings") or [])
+            aenv = dict(env)
+            for b in binds:
+                if b != "_":
+                    aenv[b] = scrut_secret
+            body = arm.get("body")
+            self.flag_expr(body, aenv)
+            self.sc_side_effects(body, aenv)
+
+    # -- side effects of expression statements -----------------------------
+    # A statement-position method call can TAINT its receiver:
+    # `xs.push(secret)` makes every later read of xs a secret read.
+
+    def sc_side_effects(self, e, env):
+        if not isinstance(e, dict):
+            return
+        if e.get("k") == "method":
+            op = _sc_builtin_op(e)
+            target = e.get("target")
+            args = e.get("args") or []
+            if op in ("list.push", "list.set", "map.set"):
+                if any(self.secret(a, env) for a in args):
+                    base = _sc_root_name(target)
+                    if base is not None:
+                        env[base] = True
+            elif op is None:
+                # user method: the callee may store its arguments in
+                # the receiver's fields — conservatively taint the
+                # receiver when any argument (or the receiver itself)
+                # is secret
+                if any(self.secret(a, env) for a in args) or \
+                        self.secret(target, env):
+                    base = _sc_root_name(target)
+                    if base is not None:
+                        env[base] = True
+            self.flag_expr(target, env)
+            for a in args:
+                self.flag_expr(a, env)
+        elif e.get("k") == "call":
+            for a in (e.get("args") or []):
+                self.flag_expr(a, env)
+        elif e.get("k") == "qmark":
+            self.sc_side_effects(e.get("e"), env)
+
+
+def _sc_text(e):
+    """Textual rendering for the side-channel findings — the same
+    shapes _expr_text covers plus methods, indexes and fields (a
+    branch condition like `key.byte_at(i) != msg.byte_at(i)` names the
+    bytes it compares, not just `? != ?`)."""
+    if not isinstance(e, dict):
+        return "?"
+    k = e.get("k")
+    if k in ("int", "float", "bool"):
+        return str(e.get("v"))
+    if k == "str":
+        return '"..."'
+    if k == "ident":
+        return e.get("name", "?")
+    if k == "un":
+        return "%s%s" % (e.get("op"), _sc_text(e.get("e")))
+    if k == "bin":
+        return "(%s %s %s)" % (_sc_text(e.get("l")), e.get("op"),
+                               _sc_text(e.get("r")))
+    if k == "call":
+        args = ", ".join(_sc_text(a) for a in (e.get("args") or []))
+        return "%s(%s)" % (e.get("name", "?"), args)
+    if k == "method":
+        args = ", ".join(_sc_text(a) for a in (e.get("args") or []))
+        return "%s.%s(%s)" % (_sc_text(e.get("target")), e.get("name"),
+                              args)
+    if k == "index":
+        return "%s[%s]" % (_sc_text(e.get("target")),
+                           _sc_text(e.get("idx")))
+    if k == "field":
+        return "%s.%s" % (_sc_text(e.get("target")), e.get("name", "?"))
+    if k == "listlit":
+        return "[...]"
+    return "?"
+
+
+def _sc_root_name(e):
+    """The variable at the base of an lvalue chain (xs[i].f -> xs)."""
+    while isinstance(e, dict) and e.get("k") in ("index", "field"):
+        e = e.get("target")
+    if isinstance(e, dict) and e.get("k") == "ident":
+        return e.get("name")
+    return None
+
+
+def _sc_round(program, state):
+    """One fixpoint round: walk every fn with the current state. The
+    walker reports the findings with the CURRENT state and mutates the
+    state with the flows it observes (monotone growth). Returns the
+    per-fn walkers keyed by fn."""
+    walkers = {}
+    for key, fn in program["fns"].items():
+        w = _SCWalker(key, fn, state)
+        env = {}
+        for pn, _pt, _m in fn.get("params", []):
+            env[pn] = pn in state.params.get(key, ())
+        w.walk_stmts(fn.get("body"), env)
+        walkers[key] = w
+        ret_sec = w.ret_secret
+        if ret_sec and not state.rets.get(key, False):
+            state.rets[key] = True
+            state.changed = True
+    return walkers
+
+
+def analyze_sidechannel(program):
+    """The Stage 101 pass: returns {fn_key: FnSideChannel} for every
+    function the marking or the propagation reaches. The fixpoint is
+    monotone (parameter sets only grow, bounded by the param names),
+    so it terminates; the findings grow monotonically with the state,
+    so the LAST round carries the fullest report."""
+    state = _SCState(program)
+    state.fns = program["fns"]
+    state.flows = {}
+    reports = {}
+    # Warm-up + fixpoint. Two walks per round would be wasteful; the
+    # cap is a belt-and-braces guard (the state is bounded, so the
+    # honest fixpoint converges long before it).
+    for _round in range(64):
+        state.changed = False
+        walkers = _sc_round(program, state)
+        for key, w in walkers.items():
+            rep = reports.setdefault(key, FnSideChannel(key))
+            rep.findings = list(w.findings.values())
+            rep.length_uses = w.length_uses
+            state.flows.setdefault(key, []).extend(w.flows)
+        if not state.changed:
+            break
+    # Assemble: incoming flows per callee (deduped per caller+param,
+    # first line wins), the secret parameters, the roots.
+    incoming = {}
+    for caller, flows in state.flows.items():
+        for callee, param, line in flows:
+            incoming.setdefault(callee, []).append((caller, param, line))
+    out = {}
+    for key in program["fns"]:
+        rep = reports.get(key) or FnSideChannel(key)
+        rep.roots = list(state.roots.get(key, []))
+        rep.secret_params = sorted(state.params.get(key, ()))
+        ins = []
+        seen = set()
+        for caller, param, line in sorted(incoming.get(key, []),
+                                          key=lambda t: (t[2], t[0], t[1])):
+            k = (caller, param)
+            if k not in seen:
+                seen.add(k)
+                ins.append((caller, param, line))
+        rep.incoming = ins
+        rep.returns_secret = state.rets.get(key, False)
+        if rep.roots or rep.incoming or rep.findings:
+            out[key] = rep
+    return out

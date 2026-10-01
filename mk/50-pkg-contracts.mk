@@ -96,6 +96,13 @@ shapes:
 shapes-smt:
 	@python3 tools/hlprove.py $(F) --shapes --smt
 
+# Stage 101 (v0.120.0-alpha): the cryptographic side-channel analysis.
+# The #[secrets(...)] parameters are the taint roots; the report lists
+# every branch / index / loop-bound / division sink a secret reaches,
+# the incoming propagation chain, and the len() policy notes.
+sidechannel:
+	@python3 tools/hlprove.py $(F) --sidechannel
+
 # Exhaustive finite-state model checking of a transition fn
 model:
 	@if [ -z "$(F)" ] || [ -z "$(FN)" ]; then echo "Usage: make model F=file.hls FN=transition_fn [INV=invariant_fn] [INIT=Enum.Variant]" && false; fi; \
@@ -132,6 +139,14 @@ cvc5-acceptance:
 shapes-acceptance: $(BIN)/hlc
 	@echo "[Stage 100 acceptance] running tests/shapes_acceptance.py..."
 	@$(PYTHON) tests/shapes_acceptance.py
+
+# Stage 101 acceptance gate: the side-channel analysis. Analysis-only
+# (no solver needed): the engine battery, the soundness flips, the
+# interprocedural chain, the CLI report, the demo parity, the audit
+# parity between the front-ends, the fail tests and the tools.
+sidechannel-acceptance: $(BIN)/hlc
+	@echo "[Stage 101 acceptance] running tests/sidechannel_acceptance.py..."
+	@$(PYTHON) tests/sidechannel_acceptance.py
 
 refine-acceptance: $(BIN)/hlc
 	@echo "[Stage 98 acceptance] running tests/refine_acceptance.py..."

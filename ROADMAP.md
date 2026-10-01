@@ -161,7 +161,7 @@ remains green.
 | 98 | Refinement types (lightweight, opt-in) | ✅ | (done in v0.117.0-alpha) |
 | 99 | `hlprove --cvc5` — CVC5 SMT backend | ✅ | (done in v0.118.0-alpha) |
 | 100 | Separation-logic fragment (heap shapes) | ✅ | (done in v0.119.0-alpha) |
-| 101 | Cryptographic side-channel analysis pass | ⬜ | 5 weeks |
+| 101 | Cryptographic side-channel analysis pass | ✅ | (done in v0.120.0-alpha) |
 | 102 | Constant-time verifier (verify code is branch-free on secrets) | ⬜ | 4 weeks |
 | 103 | `hls-audit` — supply-chain effect report (transitive) | ⬜ | 4 weeks |
 | 104 | SBOM generation (CycloneDX + SPDX) per release | ⬜ | 3 weeks |

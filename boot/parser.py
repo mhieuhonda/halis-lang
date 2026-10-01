@@ -263,6 +263,10 @@ class Parser:
             "panic_handler": False,
             "section": "",
             "align": -1,
+            # Stage 101 (v0.120.0-alpha): #[secrets(name, ...)] — the
+            # parameters the side-channel analysis treats as secret
+            # roots. A list of names (empty = no annotation).
+            "secrets": [],
         }
 
     def parse_attributes(self):
@@ -465,6 +469,44 @@ class Parser:
                     if why:
                         self.err("invalid #[align] value: %s" % why, nt)
                     self.cur_attrs["align"] = n
+                elif attr_name == "secrets":
+                    # Stage 101 (v0.120.0-alpha): #[secrets(name, ...)]
+                    # marks the named parameters as cryptographic
+                    # secrets — the roots the side-channel analysis
+                    # pass (hlprove --sidechannel) tracks through the
+                    # body. The checker proves every named secret is a
+                    # parameter of the fn (a typo'd name would silently
+                    # mark nothing, which is worse than an error).
+                    if self.cur_attrs["secrets"]:
+                        self.err("secrets attribute appears more than "
+                                 "once on one function (merge all names "
+                                 "into a single #[secrets(...)] list)", t0)
+                    self.eat_sym("(")
+                    if self.at_sym(")"):
+                        self.err("#[secrets(...)] needs at least one "
+                                 "parameter name (an empty list marks "
+                                 "nothing, which hides the hazard it "
+                                 "exists to name)", t0)
+                    names = []
+                    while not self.at_sym(")"):
+                        nt = self.peek()
+                        if nt["k"] != "ident":
+                            self.err("secrets expects a comma-separated "
+                                     "list of parameter names but got %s"
+                                     % self._desc(), nt)
+                        self.next()
+                        nname = nt["v"]
+                        if nname in names:
+                            self.err("parameter '%s' appears more than "
+                                     "once in one #[secrets(...)] list"
+                                     % nname, nt)
+                        names.append(nname)
+                        if self.at_sym(","):
+                            self.next()
+                        elif not self.at_sym(")"):
+                            self.err("expected ',' or ')' in secrets list")
+                    self.eat_sym(")")
+                    self.cur_attrs["secrets"] = names
                 elif attr_name == "stack" or attr_name == "boxed":
                     # Stage 30 (v0.47.0-alpha): #[stack] / #[boxed] are
                     # LET-BINDING attributes (they control the layout of a
@@ -479,7 +521,8 @@ class Parser:
                     self.err("unknown attribute '%s' (known: inline(always), "
                              "inline(never), hot, cold, no_red_zone, "
                              "irq_handler, stack_size(N), tail_call, "
-                             "panic_handler, section(\"NAME\"), align(N))"
+                             "panic_handler, section(\"NAME\"), align(N), "
+                             "secrets(NAMES))"
                              % attr_name, t0)
                 if self.at_sym(","):
                     self.next()
@@ -962,7 +1005,8 @@ class Parser:
                           "inline": "",
                           "hot": False, "cold": False,
                           "tail_call": False, "panic_handler": False,
-                          "section": "", "align": -1},
+                          "section": "", "align": -1,
+                          "secrets": []},
             }
         # Stage 17 (v0.28.0-alpha): optional contract clauses —
         # `requires <bool-expr>` then/and `ensures <bool-expr>`, parsed
