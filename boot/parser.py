@@ -267,6 +267,11 @@ class Parser:
             # parameters the side-channel analysis treats as secret
             # roots. A list of names (empty = no annotation).
             "secrets": [],
+            # Stage 102 (v0.121.0-alpha): #[ct] — the constant-time
+            # claim the verifier (hlprove --consttime) proves. A bare
+            # flag; the checker requires #[secrets(...)] on the same
+            # fn so the claim names what it covers.
+            "ct": False,
         }
 
     def parse_attributes(self):
@@ -507,6 +512,22 @@ class Parser:
                             self.err("expected ',' or ')' in secrets list")
                     self.eat_sym(")")
                     self.cur_attrs["secrets"] = names
+                elif attr_name == "ct":
+                    # Stage 102 (v0.121.0-alpha): #[ct] — the fn claims
+                    # to be constant-time over every secret that
+                    # reaches it (no secret-derived branch, address,
+                    # loop bound or division, in its body nor in any
+                    # fn its secrets flow into). The claim is PROVEN,
+                    # not trusted: hlprove --consttime discharges it.
+                    # The checker requires #[secrets(...)] on the same
+                    # fn — a claim that names nothing verifies nothing
+                    # and would read as a guarantee anyway.
+                    if self.cur_attrs["ct"]:
+                        self.err("ct attribute appears more than once "
+                                 "on one function (the claim is "
+                                 "per-function — one #[ct] is all a fn "
+                                 "carries)", t0)
+                    self.cur_attrs["ct"] = True
                 elif attr_name == "stack" or attr_name == "boxed":
                     # Stage 30 (v0.47.0-alpha): #[stack] / #[boxed] are
                     # LET-BINDING attributes (they control the layout of a
@@ -522,7 +543,7 @@ class Parser:
                              "inline(never), hot, cold, no_red_zone, "
                              "irq_handler, stack_size(N), tail_call, "
                              "panic_handler, section(\"NAME\"), align(N), "
-                             "secrets(NAMES))"
+                             "secrets(NAMES), ct)"
                              % attr_name, t0)
                 if self.at_sym(","):
                     self.next()
@@ -1006,7 +1027,7 @@ class Parser:
                           "hot": False, "cold": False,
                           "tail_call": False, "panic_handler": False,
                           "section": "", "align": -1,
-                          "secrets": []},
+                          "secrets": [], "ct": False},
             }
         # Stage 17 (v0.28.0-alpha): optional contract clauses —
         # `requires <bool-expr>` then/and `ensures <bool-expr>`, parsed

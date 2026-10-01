@@ -3346,6 +3346,12 @@ class _SCState:
             self.roots[key] = names
             self.params[key] = set(names)
         self.rets = {key: False for key in program["fns"]}
+        # Stage 102: when set, _flow records EVERY secret-carrying call
+        # edge (not just the first edge that marks a parameter), so the
+        # verifier's chains can start at any caller. The Stage 101
+        # report assembles its incoming lists with a (caller, param)
+        # dedup, so the extra rows are invisible to it.
+        self.always_record = False
 
     def snapshot(self):
         return ({k: set(v) for k, v in self.params.items()},
@@ -3369,11 +3375,17 @@ class _SCWalker:
 
     def _flow(self, callee, param, line):
         """Mark the callee's parameter as a secret root for the next
-        fixpoint round and record the flow for the report."""
-        if param in self.state.params.get(callee, ()):
+        fixpoint round and record the flow for the report. Stage 102:
+        under always_record every secret-carrying edge is recorded (so
+        a verifier chain can be rooted at ANY caller, not just the one
+        that happened to mark the parameter first); the default keeps
+        the Stage 101 append-on-mark behaviour."""
+        already = param in self.state.params.get(callee, ())
+        if not already:
+            self.state.params[callee].add(param)
+            self.state.changed = True
+        if already and not self.state.always_record:
             return
-        self.state.params[callee].add(param)
-        self.state.changed = True
         self.flows.append((callee, param, line))
 
     def _collect_flow(self, e, env):
@@ -3822,3 +3834,153 @@ def analyze_sidechannel(program):
         if rep.roots or rep.incoming or rep.findings:
             out[key] = rep
     return out
+
+
+# ===========================================================================
+# Stage 102 (v0.121.0-alpha): the constant-time verifier — the #[ct]
+# claims, proven not trusted.
+#
+# Stage 101 made leaks VISIBLE (an audit: every sink anywhere, exit 0
+# either way). Stage 102 makes claims ENFORCEABLE. A `#[ct]` fn asserts
+# "constant-time over every secret that reaches me", and the verifier
+# discharges each claim by re-running the Stage 101 fixpoint in the
+# claim's OWN taint universe: only that fn's #[secrets(...)] parameters
+# are roots, and every other fn in the program starts public. A leak in
+# an unrelated #[secrets] fn therefore cannot violate a claim it has no
+# part in — the one thing a naive reading of the global report would
+# get wrong, and the difference between auditing a program and
+# verifying a promise.
+#
+# A claim is VIOLATED when a sink is reachable from the claim's secrets
+# — in the claimed body itself or transitively through its callees —
+# and the report prints the CHAIN (caller -> callee, the parameter each
+# hop travels as, the call line) so the violation is attributable at a
+# glance. Findings without a chain from the claim (the global pass's
+# return-secreteness imprecision can produce sinks a param-flow cannot
+# explain) are NOT charged to the claim: a violation must be a flow the
+# report can actually draw. Everything else is the audit's business.
+# ===========================================================================
+
+class CtClaim:
+    """One #[ct] claim's verdict."""
+    __slots__ = ("fn_key", "secrets", "verified", "findings", "chains",
+                 "reach", "length_uses", "returns_secret")
+
+    def __init__(self, fn_key):
+        self.fn_key = fn_key
+        self.secrets = []     # the #[secrets(...)] names the claim covers
+        self.verified = False
+        self.findings = []    # list[(fn_key, SCFinding)] — chained only
+        self.chains = {}      # (fn_key, kind, line) -> list[(fn, param, line)]
+        self.reach = []       # fns the secrets touched, the claim first
+        self.length_uses = 0  # .len() on secret values (the policy note)
+        self.returns_secret = False
+
+
+def _ct_edges(flows):
+    """Dedup the accumulated caller -> [(callee, param, line)] rows
+    (always_record appends across rounds) into ordered per-caller edge
+    lists; first occurrence wins, so the report is deterministic."""
+    edges = {}
+    for caller, rows in flows.items():
+        seen = set()
+        ordered = []
+        for callee, param, line in rows:
+            k = (callee, param, line)
+            if k in seen:
+                continue
+            seen.add(k)
+            ordered.append((callee, param, line))
+        if ordered:
+            edges[caller] = ordered
+    return edges
+
+
+def _ct_chain(start, target, edges):
+    """A shortest secret-flow path start -> target over the param-flow
+    edges (BFS, deterministic edge order); [] when the finding sits in
+    the claimed body itself, None when no path exists (the finding is
+    not charged to the claim). Each hop is (callee, param, line)."""
+    if start == target:
+        return []
+    queue = [(start, [])]
+    seen = {start}
+    head = 0
+    while head < len(queue):
+        node, path = queue[head]
+        head += 1
+        for callee, param, line in edges.get(node, ()):
+            npath = path + [(callee, param, line)]
+            if callee == target:
+                return npath
+            if callee in seen:
+                continue
+            seen.add(callee)
+            queue.append((callee, npath))
+    return None
+
+
+def analyze_consttime(program):
+    """The Stage 102 pass: one taint universe per #[ct] claim, the
+    Stage 101 machinery run to its fixpoint inside each. Returns the
+    CtClaim list in declaration order (only fns carrying #[ct])."""
+    claims = []
+    for key, fn in program["fns"].items():
+        if not (fn.get("attrs") or {}).get("ct"):
+            continue
+        roots = list((fn.get("attrs") or {}).get("secrets") or [])
+        claim = CtClaim(key)
+        claim.secrets = roots
+        state = _SCState(program)
+        state.always_record = True
+        # The claim's own universe: its #[secrets(...)] parameters are
+        # the ONLY roots; every other fn starts public.
+        for k in state.params:
+            state.params[k] = set(roots) if k == key else set()
+        state.fns = program["fns"]
+        state.flows = {}
+        seen_findings = set()
+        findings = []
+        chains = {}
+        length_uses = 0
+        reach = {key}
+        for _round in range(64):
+            state.changed = False
+            walkers = _sc_round(program, state)
+            # the len() policy count follows the LAST round's
+            # environment (the same convention the Stage 101 report
+            # uses — a widening round would otherwise recount)
+            round_uses = 0
+            for wkey, w in walkers.items():
+                round_uses += w.length_uses
+                if w.findings:
+                    for f in w.findings.values():
+                        fk = (wkey, f.kind, f.line, f.text)
+                        if fk not in seen_findings:
+                            seen_findings.add(fk)
+                            findings.append((wkey, f, fk))
+                state.flows.setdefault(wkey, []).extend(w.flows)
+            length_uses = round_uses
+            for wkey, ps in state.params.items():
+                if ps:
+                    reach.add(wkey)
+            if not state.changed:
+                break
+        # Chains are computed against the CONVERGED edge set (an early
+        # round can miss an edge a later one records); a finding with
+        # no chain from the claim is not the claim's violation.
+        chained = []
+        for wkey, f, fk in findings:
+            chain = _ct_chain(key, wkey, _ct_edges(state.flows))
+            if chain is None:
+                continue
+            chained.append((wkey, f))
+            chains[(wkey, f.kind, f.line)] = chain
+        claim.findings = chained
+        claim.chains = chains
+        claim.length_uses = length_uses
+        claim.returns_secret = state.rets.get(key, False)
+        claim.reach = [key] + sorted(reach - {key})
+        claim.verified = not chained
+        claims.append(claim)
+    return claims

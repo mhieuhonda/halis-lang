@@ -5667,3 +5667,113 @@ no markings get an honest "nothing to audit" line.
   duplicate attribute, empty list) rejected by BOTH front-ends with
   the same words;
 - **the tools** — hlfmt stable, hllint clean.
+
+## 56. The constant-time verifier (Stage 102 — v0.121.0-alpha)
+
+### 56.1. The claim
+
+`#[ct]` on a `fn` is a CLAIM: this function is constant-time over
+every secret that reaches it — no secret-derived branch, no
+secret-dependent address, no secret-decided loop bound, no secret
+division, in the fn's own body NOR in any fn its secrets flow into,
+transitively. The claim is proven, not trusted: `hlprove --consttime`
+discharges it, and a claim it cannot discharge is a failed
+verification (exit 1), not a note.
+
+The claim must name what it covers: every `#[ct]` fn also carries
+`#[secrets(...)]` on the same fn (the checker refuses the bare claim
+— a claim over nothing verifies nothing, yet still reads as a
+guarantee). One `#[ct]` per fn (a second is refused — the claim is
+per-function), and no `#[ct]` inside `extern` blocks (the Stage-15
+rule stands: a constant-time promise about code the toolchain cannot
+see would be a lie). Secrets arriving by propagation are covered too
+— the verifier tracks them through the call graph — but the claim
+anchors on the fn's own marking. The attribute is verification-only:
+the codegen of both front-ends ignores it, `--fast` emits the same C
+with or without it, and the interpreter runs the program identically.
+
+The `--audit` of both front-ends states the claims word-for-word
+identically (the gate compares the blocks):
+
+```
+  #[ct] claims: 3
+    ct_pick: ct over mask
+    ct_fold: ct over acc, k
+    ct_expand: ct over master
+```
+
+### 56.2. The taint universes
+
+The verifier's one semantic decision is the difference between
+auditing a program and verifying a promise: each claim is discharged
+in its OWN taint universe — a re-run of the Stage 101 fixpoint in
+which only THAT fn's `#[secrets(...)]` parameters are roots, and
+every other fn in the program starts public. The consequences:
+
+- an unrelated `#[secrets]` fn can branch on its own secret three
+  lines away — its leak is real (the Stage 101 audit reports it) but
+  it cannot violate a claim it has no part in;
+- two `#[ct]` claims in one program are judged independently — one
+  may verify while the other dies;
+- what the claim PASSES DOWN is the claim's business: a secret
+  argument marks the callee's parameter inside the claim's universe,
+  so a sink in a helper the claim feeds is the claim's violation,
+  found at the helper's own line;
+- the fixpoint's return-secreteness imprecision (a per-fn boolean
+  cannot distinguish "returns a secret" from "returned a secret once
+  fed one") can produce sinks no parameter flow explains — a finding
+  without a flow path FROM the claim is not charged to it. A
+  violation must be a flow the report can actually draw; everything
+  else stays the audit's business.
+
+### 56.3. The verdict and the chain
+
+`hlprove --consttime <file>` prints, per claim: the covered secrets,
+the secret reach (every fn the secrets touched, the claim first), the
+len() policy notes counted where they apply, and the verdict:
+
+- **VERIFIED** — no sink anywhere the secrets reach. The run exits 0.
+- **VIOLATED** — one line per reachable sink (`line N: KIND —
+  \`construct\`` — inside the claimed body or naming the fn it sits
+  in), each with its one-line why and the CHAIN: the path the secret
+  travels, hop by hop (`chain: top -> mid (k, line 19) -> deep (x,
+  line 13)`); a sink in the claimed body itself says so (`chain: gate
+  (the claim's own body)`). Any violated claim makes the run exit 1
+  after the full report — the verifier has teeth the Stage 101
+  analysis deliberately lacks, and that difference is the point: the
+  audit explores, the claim gates.
+
+The exit contract: 0 when every claim verifies (or when there are no
+claims — stated honestly), 1 when at least one claim is violated,
+2 for usage errors. A claim-free program gets the honest "(no #[ct]
+claims — nothing to verify)" line.
+
+### 56.4. The gate
+
+`make ct F=examples/consttime_demo.hls` runs the verifier;
+`make ct-acceptance` runs the eight-section gate:
+
+- **the engine** — the verdict battery pinned exactly: the VERIFIED
+  branch-free selection (reach = the claim alone, the return still
+  secret), the VIOLATED own-body branch (chain = the claim's own
+  body), the VIOLATED transitive branch with the two-hop chain pinned,
+  the callee's LOOP-BOUND + DIVISION sinks killing the claim, and the
+  VERIFIED MAC whose len() use rides along as a policy note;
+- **the universes** — the precision flips: an unrelated #[secrets]
+  leak cannot violate the claim, two claims judged independently in
+  one run, the propagated callee inside the reach (clean and leaky
+  shapes), and the return-secreteness imprecision NOT charged without
+  a flow;
+- **the chains** — a clean recursive claim verifying, a violated
+  recursive claim pinning its own branch;
+- **the CLI** — the demo's three claims (exit 0, the totals line),
+  the ok-test's claims, the violated scratch program (exit 1 with the
+  chain), the claim-free honesty;
+- **the demo** — `examples/consttime_demo.hls`, interpreter vs native
+  under `cc -O2 -Werror`, byte for byte;
+- **the audit parity** — `boot.py --audit` and `hlc --audit` print
+  the same `#[ct] claims` block, word for word;
+- **the fail tests** — the malformed claims (duplicate attribute,
+  no `#[secrets(...)]`) rejected by BOTH front-ends with the same
+  words;
+- **the tools** — hlfmt stable, hllint clean.

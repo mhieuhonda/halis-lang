@@ -292,6 +292,9 @@ class CheckerCore(object):
         # resolve to the fn's own parameters (signature-only pass, like
         # the attr checks above — no types needed).
         self.check_secrets_attrs()
+        # 2.7d Stage 102 (v0.121.0-alpha): #[ct] requires #[secrets(...)]
+        # on the same fn (signature-only, same pass shape).
+        self.check_ct_attrs()
         # 2.7 Stage 82 (v0.101.0-alpha): per-fn #[stack_size(N)] frame
         # bounds validate on the AST only (no types needed) — the same
         # pass the self-hosted checker runs on signatures, closing the
@@ -522,6 +525,27 @@ class CheckerCore(object):
                              "parameter of '%s' (parameters: %s)"
                              % (n, key, ", ".join(params) or "(none)"),
                              fn)
+
+    # ---------- Stage 102 (v0.121.0-alpha): #[ct] ----------
+    # `#[ct]` claims the fn is constant-time over every secret that
+    # reaches it — the verifier (hlprove --consttime) proves the claim
+    # in the fn's own taint universe. A claim that names no secrets
+    # verifies nothing, yet still reads as a guarantee, so the fn must
+    # also carry #[secrets(...)] naming the parameters the claim
+    # covers. (Secrets arriving by propagation are covered too — the
+    # verifier tracks them — but the claim anchors on the fn's own
+    # marking. Externs cannot carry the attribute: the parser rejects
+    # attribute lists inside extern blocks, unchanged Stage-15 rule —
+    # a claim on code the toolchain cannot see would be a lie.)
+    def check_ct_attrs(self):
+        for key, fn in self.fns.items():
+            if not (fn.get("attrs") or {}).get("ct"):
+                continue
+            names = (fn.get("attrs") or {}).get("secrets") or []
+            if not names:
+                self.err("#[ct] on '%s' has no #[secrets(...)] — a "
+                         "constant-time claim must name the parameters "
+                         "it covers" % key, fn)
 
     # ---------- Stage 82 (v0.101.0-alpha): deterministic stack sizing ----------
     # Two halves, mirroring the self-hosted checker exactly:

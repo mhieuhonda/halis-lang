@@ -103,6 +103,14 @@ shapes-smt:
 sidechannel:
 	@python3 tools/hlprove.py $(F) --sidechannel
 
+# Stage 102 (v0.121.0-alpha): the constant-time verifier. Every #[ct]
+# claim is proven in its own taint universe (only the claim's
+# #[secrets(...)] parameters are roots); VERIFIED per claim, VIOLATED
+# with the sink lines and the incoming chains - and a violated claim
+# exits 1, so the run gates a CI pipeline.
+ct:
+	@python3 tools/hlprove.py $(F) --consttime
+
 # Exhaustive finite-state model checking of a transition fn
 model:
 	@if [ -z "$(F)" ] || [ -z "$(FN)" ]; then echo "Usage: make model F=file.hls FN=transition_fn [INV=invariant_fn] [INIT=Enum.Variant]" && false; fi; \
@@ -147,6 +155,15 @@ shapes-acceptance: $(BIN)/hlc
 sidechannel-acceptance: $(BIN)/hlc
 	@echo "[Stage 101 acceptance] running tests/sidechannel_acceptance.py..."
 	@$(PYTHON) tests/sidechannel_acceptance.py
+
+# Stage 102 acceptance gate: the constant-time verifier. No solver
+# needed: the verdict battery, the taint universes (an unrelated leak
+# cannot violate a claim), the chains, the CLI exits (0 verified,
+# 1 violated), the demo parity, the audit parity, the fail tests and
+# the tools.
+ct-acceptance: $(BIN)/hlc
+	@echo "[Stage 102 acceptance] running tests/consttime_acceptance.py..."
+	@$(PYTHON) tests/consttime_acceptance.py
 
 refine-acceptance: $(BIN)/hlc
 	@echo "[Stage 98 acceptance] running tests/refine_acceptance.py..."

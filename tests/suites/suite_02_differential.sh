@@ -163,6 +163,44 @@ else
     bad "hlprove --sidechannel findings missing on the demo"
 fi
 
+# Stage 102: the constant-time verifier. The demo's claims must all
+# verify (exit 0); the policy note and the transitive reach must be
+# printed; and a violated claim must exit 1 — the verifier's teeth.
+ct_out=$(python3 tools/hlprove.py examples/consttime_demo.hls --consttime 2>/dev/null); ct_rc=$?
+if [ "$ct_rc" -eq 0 ] && echo "$ct_out" | grep -q "CT TOTAL: 3 verified, 0 violated of 3 claims"; then
+    ok "hlprove --consttime verifies every claim on the demo"
+else
+    bad "hlprove --consttime wrong on the demo (rc=$ct_rc)"
+fi
+if echo "$ct_out" | grep -qF 'policy: .len() on a secret value — 1 use(s), public by policy' \
+   && echo "$ct_out" | grep -qF 'secret reach: ct_expand, schedule_step (2 fns)'; then
+    ok "hlprove --consttime prints the policy note and the reach"
+else
+    bad "hlprove --consttime report lines missing on the demo"
+fi
+cat > "$TMP/ct_violated.hls" <<'CTSEOF'
+#[secrets(s)]
+#[ct]
+fn gate(s: int) -> int {
+    if s > 10 {
+        return 1
+    }
+    return 0
+}
+
+fn main() -> int uses IO {
+    println(gate(3).to_str())
+    return 0
+}
+CTSEOF
+ctv_out=$(python3 tools/hlprove.py "$TMP/ct_violated.hls" --consttime 2>/dev/null); ctv_rc=$?
+if [ "$ctv_rc" -eq 1 ] && echo "$ctv_out" | grep -q "CT TOTAL: 0 verified, 1 violated of 1 claims" \
+   && echo "$ctv_out" | grep -q "chain: gate (the claim's own body)"; then
+    ok "hlprove --consttime exits 1 on a violated claim"
+else
+    bad "hlprove --consttime exit code wrong on the violated claim (rc=$ctv_rc)"
+fi
+
 # Stage 98: refinement types. Every refined slot is guarded at runtime
 # (fn entry / return / let / assign / construction); proven sites are
 # elided. The interpreter and the native build (default AND -O fast)

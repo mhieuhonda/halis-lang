@@ -74,6 +74,22 @@ Modes:
              so the report states its assumption. Data-only flow
              (store, return, a call keeping the value internal) is
              never a leak — that is the point of the sink list.
+  --consttime
+             Stage 102: the constant-time VERIFIER. Every fn marked
+             #[ct] claims to be constant-time over every secret that
+             reaches it; the claim is proven, not trusted. Each claim
+             is discharged in its OWN taint universe — only that fn's
+             #[secrets(...)] parameters are roots, the rest of the
+             program starts public — so a leak in an unrelated marked
+             fn can never violate a claim it has no part in. The
+             verdict is per claim: VERIFIED (no secret-derived branch,
+             address, loop bound or division anywhere the secrets
+             reach — own body included, transitively) or VIOLATED,
+             with the sink lines, the one-line why, and the incoming
+             chain (caller -> callee, the parameter each hop travels
+             as) so the violation is attributable. A violation makes
+             the run exit 1 — the verifier has teeth the Stage 101
+             analysis deliberately lacks.
 """
 import os
 import subprocess
@@ -643,6 +659,61 @@ def sidechannel_report(program, checker):
             counts["loop-bound"], counts["division"])
 
 
+def consttime_report(program, checker):
+    """Stage 102: the constant-time verifier. One taint universe per
+    #[ct] claim; VERIFIED / VIOLATED per claim with the sink lines,
+    the whys and the incoming chains. Returns the violated count (the
+    CLI exits 1 when it is nonzero — the verifier has teeth)."""
+    claims = _proof.analyze_consttime(program)
+    if not claims:
+        print("    (no #[ct] claims — nothing to verify; mark the fns "
+              "that must be constant-time with #[ct] and name their "
+              "secrets with #[secrets(...)])")
+        return 0
+    verified = 0
+    violated = 0
+    for c in claims:
+        print("  %s:" % c.fn_key)
+        print("    claim: ct over secrets %s" % ", ".join(c.secrets))
+        print("    secret reach: %s (%d fn%s)"
+              % (", ".join(c.reach), len(c.reach),
+                 "" if len(c.reach) == 1 else "s"))
+        if c.length_uses:
+            print("    policy: .len() on a secret value — %d use(s), "
+                  "public by policy" % c.length_uses)
+        if c.verified:
+            verified += 1
+            print("    VERIFIED: no secret-derived branch, address, "
+                  "loop bound or division anywhere the secrets reach")
+        else:
+            violated += 1
+            print("    VIOLATED: %d sink(s) reachable from the claim's "
+                  "secrets" % len(c.findings))
+            for wkey, f in c.findings:
+                where = "" if wkey == c.fn_key else " (inside %s)" % wkey
+                print("    line %d: %s — `%s`%s"
+                      % (f.line, f.kind.upper(), f.text, where))
+                print("      why: %s" % f.why)
+                chain = c.chains.get((wkey, f.kind, f.line))
+                if chain is not None:
+                    print("      chain: %s" % _ct_chain_text(c, chain))
+    print("  CT TOTAL: %d verified, %d violated of %d claims"
+          % (verified, violated, len(claims)))
+    return violated
+
+
+def _ct_chain_text(claim, chain):
+    """The chain as printed: the claim fn, then one hop per flow edge
+    (the callee, the parameter the secret travels as, the call line).
+    An empty chain is a sink in the claim's own body."""
+    if not chain:
+        return "%s (the claim's own body)" % claim.fn_key
+    hops = [claim.fn_key]
+    for callee, param, line in chain:
+        hops.append("%s (%s, line %d)" % (callee, param, line))
+    return " -> ".join(hops)
+
+
 def suggest_invariants(program):
     """Loop-invariant suggestions (the roadmap's automatic inference
     rule set): const-bound for loops get exact bounds; while loops get
@@ -848,6 +919,7 @@ def main():
     want_infer = "--infer-invariants" in args
     want_shapes = "--shapes" in args
     want_side = "--sidechannel" in args
+    want_ct = "--consttime" in args
     args = [a for a in args if not a.startswith("--")]
     if not args:
         sys.stderr.write(__doc__)
@@ -924,6 +996,13 @@ def main():
               "parameters are the roots):")
         sidechannel_report(program, checker)
 
+    ct_violated = 0
+    if want_ct:
+        print("")
+        print("  Constant-time verification (Stage 102 — the #[ct] "
+              "claims are proven, not trusted):")
+        ct_violated = consttime_report(program, checker)
+
     if want_shapes:
         print("")
         if want_cvc5:
@@ -941,7 +1020,10 @@ def main():
                   % solver_name)
         out_dir = os.path.dirname(os.path.abspath(path)) or "."
         shapes_report(program, want_smt, out_dir, decider, solver_name)
-    return 0
+    # Stage 102: a violated claim is a failed verification — the run
+    # exits 1 after the full report is on the screen (the analysis
+    # modes stay exit-0 either way; that difference is the point).
+    return 1 if ct_violated else 0
 
 
 if __name__ == "__main__":

@@ -752,6 +752,18 @@ def print_audit(program, checker):
         print("  #[secrets(...)] annotations: %d" % len(secret_rows))
         for row in secret_rows:
             print(row)
+    # Stage 102 (v0.121.0-alpha): the #[ct] claims the constant-time
+    # verifier (hlprove --consttime) proves. Word-for-word what the
+    # self-hosted --audit prints (the gate compares the two).
+    ct_rows = []
+    for key, fn in fns.items():
+        if (fn.get("attrs") or {}).get("ct"):
+            names = (fn.get("attrs") or {}).get("secrets") or []
+            ct_rows.append("    %s: ct over %s" % (key, ", ".join(names)))
+    if ct_rows:
+        print("  #[ct] claims: %d" % len(ct_rows))
+        for row in ct_rows:
+            print(row)
     # Stage 84 (v0.103.0-alpha): custom sections + the linker script that
     # places them. The checker proved every named section is covered (or
     # that no script was declared) before we get here.
