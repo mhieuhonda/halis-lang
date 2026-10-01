@@ -201,6 +201,43 @@ else
     bad "hlprove --consttime exit code wrong on the violated claim (rc=$ctv_rc)"
 fi
 
+# Stage 103: hls-audit, the transitive supply-chain effect report.
+# The demo's import tree must classify (toolchain vs workspace),
+# attribute Net/Clock/IO to their introduction modules, and exit 0;
+# gated with --allow IO,Net the Clock chain must FAIL the run; and
+# the package demo must walk INTO the nested manifest and name
+# audit_lib_b at depth 2 (the hop hls-pkg audit never takes).
+s103_out=$(python3 tools/hls-audit.py examples/audit_demo.hls 2>/dev/null); s103_rc=$?
+if [ "$s103_rc" -eq 0 ] \
+   && echo "$s103_out" | grep -qF 'modules: 4 (1 toolchain, 0 dependency, 3 workspace)' \
+   && echo "$s103_out" | grep -qF 'Clock — introduced by examples/audit_libs/geo.hls [workspace]' \
+   && echo "$s103_out" | grep -qF 'IO — introduced by examples/audit_libs/netcheck.hls [workspace]' \
+   && echo "$s103_out" | grep -qF 'extern "C" { labs } declared (none)' \
+   && echo "$s103_out" | grep -qF 'program effect surface: Clock, IO, Net'; then
+    ok "hls-audit classifies and attributes the demo's import tree"
+else
+    bad "hls-audit report wrong on the demo (rc=$s103_rc)"
+fi
+s103g_out=$(python3 tools/hls-audit.py examples/audit_demo.hls --allow IO,Net 2>/dev/null); s103g_rc=$?
+if [ "$s103g_rc" -eq 1 ] \
+   && echo "$s103g_out" | grep -qF 'Clock (introduced by examples/audit_libs/geo.hls)' \
+   && echo "$s103g_out" | grep -qF 'verdict: VIOLATED — 1 effect(s) outside the allow list'; then
+    ok "hls-audit --allow gates the chain (exit 1 with the chain)"
+else
+    bad "hls-audit --allow wrong on the demo (rc=$s103g_rc)"
+fi
+s103p_out=$(python3 tools/hls-audit.py --pkg examples/pkg_audit_demo 2>/dev/null); s103p_rc=$?
+if [ "$s103p_rc" -eq 1 ] \
+   && echo "$s103p_out" | grep -qF 'packages: 3 (root included) — deepest chain: 2 dep(s)' \
+   && echo "$s103p_out" | grep -qF 'Fs — introduced by audit_lib_b (depth 2)' \
+   && echo "$s103p_out" | grep -qF 'via: pkg_audit_demo -> audit_lib_a -> audit_lib_b' \
+   && echo "$s103p_out" | grep -qF 'policy: allowed = IO (from manifest)' \
+   && echo "$s103p_out" | grep -qF 'verdict: VIOLATED — 2 effect(s) outside the allowed set'; then
+    ok "hls-audit --pkg walks the nested manifest and fails the run"
+else
+    bad "hls-audit --pkg wrong on the package demo (rc=$s103p_rc)"
+fi
+
 # Stage 98: refinement types. Every refined slot is guarded at runtime
 # (fn entry / return / let / assign / construction); proven sites are
 # elided. The interpreter and the native build (default AND -O fast)

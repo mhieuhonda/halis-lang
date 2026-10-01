@@ -5777,3 +5777,188 @@ claims — nothing to verify)" line.
   no `#[secrets(...)]`) rejected by BOTH front-ends with the same
   words;
 - **the tools** — hlfmt stable, hllint clean.
+
+
+## 57. `hls-audit` — the transitive supply-chain effect report (Stage 103 — v0.122.0-alpha)
+
+### 57.1. The question the tool answers
+
+A Halis program is a supply chain. Every `import` is an edge of
+trust; every dependency package is code somebody else wrote, doing
+who-knows-what. The language's effect algebra already answers "what
+does THIS program do" — `boot.py --audit` prints the per-function
+capability tree, `hls-pkg lock` enforces a manifest's
+`[effects].allowed` over its TOP-LEVEL dependencies. Neither answers
+the supply-chain question: **where does each effect enter my tree,
+and through which chain of trust?** `tools/hls-audit.py` answers it,
+transitively, in two modes over one report shape:
+
+```
+python3 tools/hls-audit.py <entry.hls> [--allow IO,Fs] [--json]
+python3 tools/hls-audit.py --pkg [DIR]  [--allow IO,Fs] [--json]
+```
+
+The tool is analysis-only: it loads and checks programs (the real
+`load_program` + `check` — the SAME fixpoint the compiler runs), it
+compiles nothing, emits nothing, changes nothing. A dependency
+cannot detect that it was audited.
+
+### 57.2. Source mode — the import tree
+
+`hls-audit <entry.hls>` walks the transitive import graph with
+boot.py's OWN resolver (`_resolve_import` — `std.`/`core.`
+prefixes, relative paths, the `HLS_PKG_DEPS` fallback), so the walk
+cannot disagree with the loader about what the tree is. Each module
+is classified: **toolchain** (this repo's `std/` + `core/` —
+versioned with the compiler), **dependency** (resolved through
+`HLS_PKG_DEPS`, the `.hls-pkg-deps` farm `hls-pkg build` installs),
+or **workspace** (everything else — the code in your own tree).
+
+Every function is attributed to the module that defines it (each
+module is parsed separately; the merged program flattens this away,
+and duplicate fn names across modules are a compile error anyway).
+The checker's fixpoint then runs ONCE over the merged program — the
+authoritative `computed_effects` — and the report splits each
+module's numbers into two columns:
+
+- **intrinsic** — the effects the module's OWN bodies perform: the
+  builtin calls in its functions (`println` → IO, `clock_ms` →
+  Clock, `net_lookup` → Net, ...) plus the DECLARED effects of the
+  externs those functions call. This is where effects are BORN.
+- **reachable (surface)** — the fixpoint set: intrinsic plus
+  everything that flows in through its imports. This is what the
+  module hands its consumers.
+
+The attribution section names, for EVERY effect in the program
+surface, EVERY module that introduces it intrinsically, with the
+shortest import chain from the entry (`via: audit_demo.hls ->
+netcheck.hls -> geo.hls`). One effect, two introduction points, two
+lines — the report never hides a second origin behind the first.
+The FFI surface is named separately (`extern "C" { abs } declared
+(none)`) — an extern is code the toolchain cannot see (the Stage-15
+rule); the report shows the trust boundary, it does not judge it.
+
+### 57.3. Package mode — the manifest tree
+
+`hls-audit --pkg [DIR]` walks the transitive PACKAGE tree: the root
+manifest's `[dependencies]`, then each dependency's OWN
+`hls-pkg.toml`, then its dependencies. This is the walk `hls-pkg
+audit` never takes — it prints the top level flat, and a nested
+manifest's effects were invisible to every report the package
+manager could draw. Deps resolve through hls-pkg's own validated
+code (`parse_manifest`, `resolve_dependency`), package-relative
+FIRST (a manifest inside a package is that package's root view),
+repo-root-relative second (the documented hls-pkg contract); every
+path is confined — absolute paths and `..` segments are refused,
+matching `_confine`. A cycle is refused with the chain that closes
+it (`circular package dependency: cyc_a -> cyc_b -> cyc_a`). Each
+dep edge instantiates its own subtree (a diamond prints both paths
+— that is what the chain attribution needs); the audit result is
+cached per directory so a shared package is checked once.
+
+Each package's entry (the manifest's `[package].entry`, default
+`main.hls`) is audited through the real checker. A library entry
+(no main) goes through the wrapper contract `hls-pkg lock` itself
+uses: a generated wrapper next to the entry imports it and declares
+a pure main — the checker needs an entry, the wrapper contributes
+nothing. A package's INTRINSIC effects count only functions defined
+in package-local files; the toolchain modules it pulls in are
+visible in its surface, not charged to it as introductions.
+
+### 57.4. Drift, and the lockfile's meaning
+
+When a lockfile exists, the audit recomputes every TOP-LEVEL
+dependency's sha256 — the same content hash `hls-pkg lock` recorded
+(the dep's FILE for a single-file path dep, the deterministic
+directory hash otherwise; drift must compare the bytes the lock
+actually hashed) — and a mismatch is **DRIFT**:
+
+```
+drift:
+  drift_dep: locked sha256 9db8002ac40a but the tree now hashes
+             7e35394ce984 — re-lock
+```
+
+Drift fails the run (exit 1), because an audit of drifted content
+describes a tree the lock no longer names. A dep in the manifest
+but not in the lockfile is drift too. The rule is the supply-chain
+discipline in one line: `hls-pkg verify` tells you the lock is
+stale; `hls-audit` refuses to hand you a report that LOOKS like it
+describes the locked tree when it does not.
+
+### 57.5. The policy gate, and where the root stands
+
+`--allow IO,Fs` (source mode) or the root manifest's
+`[effects].allowed` (package mode; `--allow` overrides) must cover
+every effect the SUPPLY CHAIN introduces. **The root is not supply
+chain** — the entry file's own intrinsic effects and the root
+package's surface are reported in full, never gated. This is the
+same division `hls-pkg lock` draws (it checks deps against
+`allowed`, never the package's own code, which the checker already
+holds to its own declarations). The gate covers the chain: in
+source mode, every introduction outside the entry file; in package
+mode, every non-root package's surface. A violation names the
+effect, the introducer, and the chain from the root; a violated
+policy exits 1 after the full report. No policy at all is stated
+honestly (`policy: (none — report only)`) and exits 0 — the report
+explores, the policy gates, and neither pretends to be the other.
+
+### 57.6. Fail-closed, or the report is a lie
+
+The one unforgivable failure mode for an audit tool is the silent
+skip: a node it could not read, recorded as if it were pure. The
+tool inherits hls-pkg's fail-closed rule and tightens it:
+
+- **a broken source tree** (parse error, missing module, check
+  error) is a broken BUILD, not a supply-chain finding — source
+  mode says so and exits 1;
+- **a broken package** (its entry cannot be loaded or checked) is a
+  fail-closed NODE: reported `UNAUDITABLE — fail closed`, its
+  surface recorded as the FULL effect set (never pure, never
+  guessed), the run fails with or without a policy — the synthetic
+  surface is the audit's admission that it knows nothing, and
+  admitting that is the opposite of skipping.
+
+Exit contract: 0 when the report is produced and nothing violates
+the policy; 1 on a policy violation, drift, a cycle, an unauditable
+package, or an unauditable source tree; 2 for usage errors (no
+mode, both modes, an unknown effect in `--allow`). `--json` emits
+the same report as a machine-readable object (schema
+`hls-audit/v1`) — the gate parses it for exactness, and a CI pipeline
+can gate on the same fields the human report prints.
+
+### 57.7. The gate
+
+`make supply F=<entry>` / `make supply-pkg D=<dir>` run the tool;
+`make supply-acceptance` runs the eight-section gate
+(`tests/audit_acceptance.py`, 71 checks):
+
+- **the engine** — the demo's report pinned line for line: the
+  module census (4 modules — 1 toolchain, 3 workspace), the
+  intrinsic/reachable split (geo: Clock intrinsic; netcheck: IO+Net
+  intrinsic with geo's Clock only reachable; std.str: pure), the
+  attribution with BOTH IO introduction points and the three-hop
+  Clock chain, the extern surface, the totals, exit 0;
+- **the policy** — the violated run (exit 1, chain drawn), the
+  clean run, the root-exemption flip (the entry's own IO is never a
+  violation; netcheck's IO is), `--json` machine-exact, the
+  unknown-effect refusal (exit 2);
+- **fail-closed** — the broken tree (exit 1, "parse error"), the
+  missing module, the broken PACKAGE (full effect set, UNAUDITABLE
+  line, exit 1), the cycle refusal with the closing chain, the
+  usage errors;
+- **the package tree** — the in-tree demo: the walk reaches
+  audit_lib_b through audit_lib_a's OWN manifest (depth 2, the two
+  chains, the manifest policy violated, exit 1), `--allow` clean,
+  post-order JSON with depths;
+- **the drift** — a fresh lock audits clean; content changed under
+  the lock is DRIFT (exit 1); an unlocked dep is drift; the lock
+  scratch is cleaned out of the tree;
+- **the parity** — the two modes agree on the root: the root
+  package's surface from `--pkg` equals the source-mode surface of
+  its `main.hls`;
+- **the demos** — the demo and the ok-test run; interpreter and
+  native agree byte for byte (the native half only when `bin/hlc`
+  exists — the gate stays hermetic);
+- **the tools** — hlfmt stable, hllint clean, and the demo
+  manifests round-trip through hls-pkg's own `parse_manifest`.

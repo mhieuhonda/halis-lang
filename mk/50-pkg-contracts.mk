@@ -165,6 +165,29 @@ ct-acceptance: $(BIN)/hlc
 	@echo "[Stage 102 acceptance] running tests/consttime_acceptance.py..."
 	@$(PYTHON) tests/consttime_acceptance.py
 
+# Stage 103 (v0.122.0-alpha): hls-audit, the transitive supply-chain
+# effect report. Source mode walks the import graph (toolchain /
+# dependency / workspace classification, intrinsic vs reachable
+# effects, attribution chains, the extern surface); package mode
+# walks the manifest tree hls-pkg audit never opens, checks the
+# lockfile for drift, and gates the chain against the root's
+# [effects].allowed. The root is your code - reported, never gated.
+supply:
+	@python3 tools/hls-audit.py $(F)
+
+supply-pkg:
+	@if [ -z "$(D)" ]; then echo "Usage: make supply-pkg D=examples/pkg_audit_demo [ALLOW=IO,Fs]" && false; fi; \
+	if [ -n "$(ALLOW)" ]; then A="--allow $(ALLOW)"; else A=""; fi; \
+	python3 tools/hls-audit.py --pkg $(D) $$A
+
+# Stage 103 acceptance gate: the eight-section battery (engine,
+# policy, fail-closed, the package tree, drift, the mode parity, the
+# demos, the tools). Tool-only - no solver, no compiler needed; the
+# native half of the demo parity runs when bin/hlc exists.
+supply-acceptance:
+	@echo "[Stage 103 acceptance] running tests/audit_acceptance.py..."
+	@$(PYTHON) tests/audit_acceptance.py
+
 refine-acceptance: $(BIN)/hlc
 	@echo "[Stage 98 acceptance] running tests/refine_acceptance.py..."
 	@$(PYTHON) tests/refine_acceptance.py

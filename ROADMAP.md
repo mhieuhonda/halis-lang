@@ -163,7 +163,7 @@ remains green.
 | 100 | Separation-logic fragment (heap shapes) | ✅ | (done in v0.119.0-alpha) |
 | 101 | Cryptographic side-channel analysis pass | ✅ | (done in v0.120.0-alpha) |
 | 102 | Constant-time verifier (verify code is branch-free on secrets) | ✅ | (done in v0.121.0-alpha) |
-| 103 | `hls-audit` — supply-chain effect report (transitive) | ⬜ | 4 weeks |
+| 103 | `hls-audit` — supply-chain effect report (transitive) | ✅ | (done in v0.122.0-alpha) |
 | 104 | SBOM generation (CycloneDX + SPDX) per release | ⬜ | 3 weeks |
 | 105 | Reproducible-build verification across distros | ⬜ | 4 weeks |
 | 106 | Signed packages (minisign, ed25519) | ⬜ | 3 weeks |
