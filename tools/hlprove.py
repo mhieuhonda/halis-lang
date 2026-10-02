@@ -240,10 +240,19 @@ def gen_smt(program, out_dir):
                              " unsat => the contract is vacuous")
                 lines.append("(assert %s)" % req_smt)
                 lines.append("(check-sat)")
-                lines.append("(reset)")
-                lines.extend(_proof.smt_prelude(sorted(vars_int),
-                                                sorted(vars_str),
-                                                result_int))
+                # Open the second segment only when a second query is
+                # actually coming. A requires-only contract (or one
+                # whose result has no QF_LIA encoding) used to leave a
+                # trailing prelude-only segment with no (check-sat):
+                # the z3 binary ignored it, the module-based runners
+                # synthesised a verdict for it ("ensures: sat" from an
+                # empty assertion set, "ensures: ?" under cvc5), and
+                # the two backends' reports stopped matching.
+                if ens is not None and result_int is not None:
+                    lines.append("(reset)")
+                    lines.extend(_proof.smt_prelude(sorted(vars_int),
+                                                    sorted(vars_str),
+                                                    result_int))
             if ens is not None:
                 # Deep-scan-10 fix: an ENSURES-ONLY contract used to emit
                 # declarations and NO query at all. Query 2 is now
@@ -517,7 +526,10 @@ def shapes_report(program, want_smt, out_dir, decider=None,
     every frame-clean candidate's two obligations (or nothing is
     claimed when no solver exists). Returns the summary counts."""
     fs_list = _proof.collect_shapes(program)
-    verified = _proof.verify_shapes(fs_list, decider)
+    # verify_shapes mutates each loop's status/segments in place; the
+    # per-function segment map it returns belongs to the --smt dump of
+    # the shapes pipeline, which this report path does not produce.
+    _proof.verify_shapes(fs_list, decider)
     proven = refused = unverified = 0
     sep_ok = sep_no = 0
     print("  Heap shapes (the separation-logic fragment):")
