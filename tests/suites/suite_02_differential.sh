@@ -238,6 +238,44 @@ else
     bad "hls-audit --pkg wrong on the package demo (rc=$s103p_rc)"
 fi
 
+# Stage 104: hls-sbom, the CycloneDX + SPDX bill of materials. The
+# source-mode documents list the demo's import tree (one application,
+# three file components, hashed) with the graph in dependencies /
+# DEPENDS_ON; the package-mode documents list the manifest tree; and
+# the documents are content-addressed — two runs over the same tree
+# with the same SOURCE_DATE_EPOCH are byte-identical.
+s104_cdx=$(SOURCE_DATE_EPOCH=1727800000 python3 tools/hls-sbom.py examples/sbom_demo.hls --format cdx --stdout 2>/dev/null); s104_rc=$?
+if [ "$s104_rc" -eq 0 ] \
+   && echo "$s104_cdx" | python3 -c 'import json,sys; d=json.load(sys.stdin); comps={c["name"]: c for c in d["components"]}; deps={x["ref"]: x["dependsOn"] for x in d["dependencies"]}; import os,hashlib; sha=lambda p: hashlib.sha256(open(p,"rb").read()).hexdigest(); sys.exit(0 if (d["bomFormat"]=="CycloneDX" and d["specVersion"]=="1.5" and len(comps)==3 and comps["std/str.hls"]["type"]=="file" and comps["std/str.hls"]["version"]=="0.123.0-alpha" and comps["examples/sbom_libs/dep_b.hls"]["hashes"][0]["content"]==sha("examples/sbom_libs/dep_b.hls") and deps["hls:module:examples/sbom_demo.hls"]==["hls:module:examples/sbom_libs/dep_a.hls","hls:module:std/str.hls"]) else 1)';
+then
+    ok "hls-sbom lists the demo tree in CycloneDX (components, hashes, graph)"
+else
+    bad "hls-sbom CycloneDX document wrong on the demo (rc=$s104_rc)"
+fi
+s104_spdx=$(SOURCE_DATE_EPOCH=1727800000 python3 tools/hls-sbom.py examples/sbom_demo.hls --format spdx --stdout 2>/dev/null); s104s_rc=$?
+if [ "$s104s_rc" -eq 0 ] \
+   && echo "$s104_spdx" | python3 -c 'import json,sys; d=json.load(sys.stdin); pkgs={p["name"]: p for p in d["packages"]}; rels=[r for r in d["relationships"] if r["relationshipType"]=="DEPENDS_ON"]; sys.exit(0 if (d["spdxVersion"]=="SPDX-2.3" and d["dataLicense"]=="CC0-1.0" and len(pkgs)==4 and len(rels)==5 and pkgs["examples/sbom_libs/dep_a.hls"]["primaryPackagePurpose"]=="LIBRARY") else 1)';
+then
+    ok "hls-sbom lists the same tree in SPDX (packages, relationships)"
+else
+    bad "hls-sbom SPDX document wrong on the demo (rc=$s104s_rc)"
+fi
+s104_a=$(SOURCE_DATE_EPOCH=1727800000 python3 tools/hls-sbom.py examples/sbom_demo.hls --format cdx --stdout 2>/dev/null)
+s104_b=$(SOURCE_DATE_EPOCH=1727800000 python3 tools/hls-sbom.py examples/sbom_demo.hls --format cdx --stdout 2>/dev/null)
+if [ -n "$s104_a" ] && [ "$s104_a" == "$s104_b" ]; then
+    ok "hls-sbom documents are content-addressed (byte-identical reruns)"
+else
+    bad "hls-sbom documents are not deterministic across reruns"
+fi
+s104_pkg=$(python3 tools/hls-sbom.py --pkg examples/pkg_audit_demo --format cdx --stdout 2>/dev/null); s104p_rc=$?
+if [ "$s104p_rc" -eq 0 ] \
+   && echo "$s104_pkg" | python3 -c 'import json,sys; d=json.load(sys.stdin); comps={c["name"]: c for c in d["components"]}; sys.exit(0 if (d["metadata"]["component"]["name"]=="pkg_audit_demo" and set(comps)=={"audit_lib_a","audit_lib_b"} and comps["audit_lib_b"]["type"]=="library" and comps["audit_lib_b"]["purl"]=="pkg:generic/halis/audit_lib_b@0.1.0") else 1)';
+then
+    ok "hls-sbom --pkg lists the manifest tree with purls and hashes"
+else
+    bad "hls-sbom --pkg wrong on the package demo (rc=$s104p_rc)"
+fi
+
 # Stage 98: refinement types. Every refined slot is guarded at runtime
 # (fn entry / return / let / assign / construction); proven sites are
 # elided. The interpreter and the native build (default AND -O fast)

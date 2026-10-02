@@ -5962,3 +5962,168 @@ can gate on the same fields the human report prints.
   exists — the gate stays hermetic);
 - **the tools** — hlfmt stable, hllint clean, and the demo
   manifests round-trip through hls-pkg's own `parse_manifest`.
+
+---
+
+## 58. `hls-sbom` — the CycloneDX + SPDX bill of materials (Stage 104 — v0.123.0-alpha)
+
+### 58.1. What a release owes its consumers
+
+A release is a list of parts. Everything before this stage could TELL
+you about the tree — `hls-pkg lock` pinned it, `hls-pkg verify` proved
+it, `hls-audit` explained it — but the artifact a release actually
+SHIPS to the parties who ask "what is inside?" did not exist. The
+software supply chain has converged on two interchange formats for
+that question, and `tools/hls-sbom.py` speaks both:
+
+```
+python3 tools/hls-sbom.py <entry.hls> [--format cdx|spdx|both]
+                                    [--stdout] [--out DIR]
+python3 tools/hls-sbom.py --pkg [DIR]  [--format cdx|spdx|both]
+                                    [--stdout] [--out DIR] [--release]
+```
+
+CycloneDX 1.5 (JSON) and SPDX 2.3 (JSON, `dataLicense: CC0-1.0` —
+the spec's own convention for documents). The tool is analysis-only:
+it reads the tree with hls-audit's OWN walkers — the import graph for
+an entry file, the manifest tree for a package — so the SBOM cannot
+disagree with the audit about what the tree is, and it compiles
+nothing, emits nothing, changes nothing (unless `--out` or `--release`
+says otherwise).
+
+### 58.2. Source mode — the modules are the components
+
+`hls-sbom <entry.hls>` lists the import tree. The entry file is the
+document's root (`metadata.component`, type `application`); every
+module underneath it is a component (type `file`) with:
+
+- a **SHA-256 over its own bytes** — not a label, a fingerprint;
+- the audit's **classification** as `hls:kind` (toolchain /
+  dependency / workspace), toolchain components versioned with the
+  compiler (the toolchain is versioned AS PART of the compiler);
+- the audit's **effect split** as `hls:effects:intrinsic` and
+  `hls:effects:surface` properties — the bill of materials carries
+  not just WHAT the parts are but WHAT THEY DO, the same numbers
+  `hls-audit` prints, produced by the same walker in the same run.
+
+The graph rides in `dependencies`: one entry per component, its
+direct imports as `dependsOn` — the import tree, leaf to root.
+
+### 58.3. Package mode — the lockfile's hashes, stamped
+
+`hls-sbom --pkg [DIR]` lists the package tree. The root package is
+the metadata component (type `application`, version from its
+manifest, a `purl` of `pkg:generic/halis/<name>@<version>` when the
+name is purl-safe); every dependency is a `library` component. A
+diamond — one package reached through two chains — is ONE component
+and two edges in the graph, because a part reached twice is still
+one part.
+
+The hashes are **hls-pkg's own**: the dep's FILE hash for a
+single-file path dep, the deterministic directory hash otherwise —
+exactly the bytes `hls-pkg lock` records. When a lockfile exists its
+hashes are the stamped ones (the tree was just proven to match), so
+a released SBOM's component hashes are the lockfile's, byte for
+byte. Per-package `hls:depth` and `hls:effects:surface` properties
+carry the walk's findings.
+
+### 58.4. The two documents cannot disagree
+
+CycloneDX and SPDX render the SAME component set: same names, same
+hashes (`hashes` in one, `checksums` in the other), same edges
+(`dependsOn` in one, `DEPENDS_ON` relationships in the other),
+`APPLICATION`/`LIBRARY` purposes in SPDX mirroring the component
+types. Where the formats demand a field the tool genuinely does not
+know — `downloadLocation`, `licenseConcluded`, `licenseDeclared`,
+`copyrightText` — the answer is `NOASSERTION`. An SBOM that guesses
+in a legal field is worse than one that refuses to answer.
+
+### 58.5. Determinism — the document is addressed by its content
+
+The CycloneDX `serialNumber` is a UUID **derived from the component
+set**: one SHA-256 over every component's ref and content hash (in
+sorted order), shaped into 8-4-4-4-12 with the version and variant
+nibbles forced. The SPDX `documentNamespace` carries the same
+digest. Change one byte in one component — the serial and the
+namespace both move; re-run over an unchanged tree — nothing moves,
+the clock included (the serial never depended on it).
+
+The `timestamp` (and SPDX `creationInfo.created`) honors
+`SOURCE_DATE_EPOCH` when the environment names one — the
+reproducible-builds convention — and falls back to the current UTC
+time otherwise. Two runs over the same tree with the same
+SOURCE_DATE_EPOCH produce **byte-identical documents**: a release's
+SBOM can be REBUILT, not just re-emitted — the on-ramp to Stage 105
+(reproducible-build verification across distros).
+
+### 58.6. `--release` — the shipping gate
+
+`--release` is where "per release" stops being a policy and becomes
+a contract. A release:
+
+1. **ships pinned content** — no lockfile next to the manifest, no
+   release (`a release ships pinned content — run hls-pkg lock
+   first`);
+2. **describes a tree the lock names** — the audit's drift check
+   runs first, and a mismatch refuses (`an SBOM of drifted content
+   is a lie`) — with nothing written and nothing logged;
+3. **fails closed** — a package the checker could not audit refuses
+   the release outright (`no SBOM stamps a package nobody could
+   check`); there is no "unauditable" stamp on a shipped document;
+4. **writes `hls-sbom-<name>-<version>.cdx.json` and
+   `hls-sbom-<name>-<version>.spdx.json`** — the release's name and
+   version in the documents' filenames;
+5. **chains itself into the transparency log** — ONE record (kind
+   `sbom`) with the root's content hash, the component count, and
+   the two documents' OWN SHA-256s, in the same tamper-evident
+   ledger `hls-pkg lock` and `hls-pkg publish` append to. The
+   release's list of parts is as publicly auditable as the parts —
+   and `hls-pkg log --verify` covers it with the rest of the chain.
+
+Without `--release` the run never touches the log; `--json` never
+writes artifacts at all (CI reads trees, it does not stamp them).
+
+Exit contract: 0 when the documents are produced; 1 on drift, an
+unauditable package, a missing lockfile under `--release`, an
+unwritable output directory, or a broken source tree; 2 for usage
+errors (no mode, both modes, `--stdout` with both formats,
+`--release` without `--pkg`). `--json` prints the internal report
+(schema `hls-sbom/v1`) with the component set, the graph, and the
+documents' own hashes for CI consumption.
+
+### 58.7. The gate
+
+`make sbom F=<entry>` / `make sbom-pkg D=<dir>` /
+`make sbom-release D=<dir>` run the tool; `make sbom-acceptance`
+runs the eight-section gate (`tests/sbom_acceptance.py`, 69 checks):
+
+- **the engine** — the demo's CycloneDX document pinned: bomFormat,
+  specVersion 1.5, the content-derived serial, the metadata
+  component (application, hashed over the entry's real bytes), the
+  three file components (toolchain versioned with the compiler,
+  workspace not), every hash verified against the file, the
+  classification and effect properties, and the graph exact;
+- **the SPDX twin** — SPDX-2.3 under CC0-1.0, DESCRIBES the root,
+  every CycloneDX edge matched by its SPDX twin (by element id),
+  the same checksums, APPLICATION/LIBRARY purposes, NOASSERTION
+  where the tool does not know;
+- **determinism** — byte-identical documents across runs under
+  SOURCE_DATE_EPOCH; the serial proven to be the shaped digest; one
+  appended byte in one component moves the serial; the serial
+  survives a changing clock;
+- **the package tree** — the diamond as ONE component, purls, the
+  directory hashes equal to hls-pkg's own `_sha256_directory`,
+  depth and surface properties, SPDX/CDX hash agreement;
+- **the lock** — no lockfile, no release; a fresh lock releases
+  (versioned files, the log record with the documents' hashes, the
+  chain still verifying); content changed under the lock refuses
+  with the log untouched;
+- **the parity** — every module's `hls:effects:surface` property
+  equals hls-audit's per-module surface on the same tree, the root's
+  equals the program surface, and the deep package's equals the
+  audit's package report;
+- **the demos** — the demo and the ok-test run; interpreter and
+  native agree byte for byte (the native half only when `bin/hlc`
+  exists — the gate stays hermetic);
+- **the tools** — hlfmt stable, hllint clean on the new entry
+  sources.

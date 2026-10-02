@@ -227,3 +227,30 @@ examples:
 	@# taint_beta_demo.hls needs a data-file argument
 	@echo "--- examples/taint_beta_demo.hls"; $(PYTHON) boot/boot.py examples/taint_beta_demo.hls examples/data.txt
 
+
+# Stage 104 (v0.123.0-alpha): hls-sbom, the CycloneDX + SPDX bill of
+# materials. Source mode lists the import tree (modules as hashed
+# components, the audit's effect split as properties); package mode
+# lists the manifest tree with the lockfile's own hashes. --release
+# is the shipping gate: lockfile required, drift refused, versioned
+# documents written, the SBOM chained into the transparency log.
+sbom:
+	@python3 tools/hls-sbom.py $(F)
+
+sbom-pkg:
+	@if [ -z "$(D)" ]; then echo "Usage: make sbom-pkg D=<pkg dir> [FORMAT=cdx|spdx|both]" && false; fi; \
+	if [ -n "$(FORMAT)" ]; then FMT="--format $(FORMAT)"; else FMT=""; fi; \
+	python3 tools/hls-sbom.py --pkg $(D) $$FMT
+
+sbom-release:
+	@if [ -z "$(D)" ]; then echo "Usage: make sbom-release D=<pkg dir>" && false; fi; \
+	python3 tools/hls-sbom.py --pkg $(D) --release
+
+# Stage 104 acceptance gate: the eight-section battery (the CycloneDX
+# document, the SPDX twin, determinism, the package tree, the release
+# gate with the transparency-log chaining, the audit parity, the
+# demos, the tools). Tool-only - no solver, no compiler needed; the
+# native half of the demo parity runs when bin/hlc exists.
+sbom-acceptance:
+	@echo "[Stage 104 acceptance] running tests/sbom_acceptance.py..."
+	@$(PYTHON) tests/sbom_acceptance.py
