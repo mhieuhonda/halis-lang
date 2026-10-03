@@ -6470,3 +6470,171 @@ nine-section gate (`tests/signed_acceptance.py`, 68 checks):
   exists — the gate stays hermetic);
 - **the tools** — hlfmt stable, hllint clean on the new entry
   sources.
+
+## 61. `hls-tlog` — the transparency-log gossip protocol (Stage 107 — v0.126.0-alpha)
+
+### 61.1. One copy of the evidence is one point of failure
+
+Every claim the toolchain writes — `publish`, the SBOM, repro, sign
+— chains into one local ledger, and until now that ledger was the
+only witness of its own history. `tools/hls-tlog.py` gives the ledger
+the Certificate Transparency property that makes a log trustworthy
+despite its operator: everyone keeps a view, and views are compared.
+
+```
+python3 tools/hls-tlog.py verify [LOG] [--json]
+python3 tools/hls-tlog.py summary [LOG] [--json]
+python3 tools/hls-tlog.py gossip SOURCE... [--timeout S] [--max-bytes N]
+                           [--max-lag N] [--require N] [--json]
+python3 tools/hls-tlog.py witness [LOG] --sign SECRET
+                           [--password-env VAR] [--out DIR]
+                           [--trusted-comment STR] [--force] [--json]
+python3 tools/hls-tlog.py witness-verify WITNESS [-p PUB | -P HEX]
+                           [--against LOG] [--json]
+python3 tools/hls-tlog.py prove NAME [VERSION] [--log LOG] [--seq N]
+                           [--out DIR] [--json]
+python3 tools/hls-tlog.py prove-verify PROOF [--log LOG] [--json]
+python3 tools/hls-tlog.py selftest
+```
+
+A SOURCE is a log file, a directory (its ledger is
+`DIR/.hls-pkg-transparency.log` — the name every checkout shares), or
+an http(s) URL served as JSON-lines (stdlib urllib, a per-source
+`--timeout`, a `--max-bytes` read cap — default 64 MB; nothing is
+executed and nothing is written: gossip is read-only end to end). A
+refused source is REPORTED, never fatal — the verdict says what the
+surviving conversation proves, and `--require N` (default 2, because
+gossip alone is not gossip) says when it is not enough.
+
+### 61.2. The chain — one definition, honestly shaped
+
+The chain hash is `sha256(prev_hash + canonical_json(record minus
+chain_hash))`, canonical = sorted keys, no whitespace — byte-identical
+to hpkg_log's own record writer since Stage 13. The acceptance gate
+pushes a record through the writer and re-verifies it under the gossip
+tool's arithmetic; it also runs `hls-pkg log --verify` and
+`hls-tlog verify` on the same file and refuses if they disagree.
+
+The record shape is what the chain arithmetic needs and nothing
+more: `seq` (int >= 1), `timestamp` (int >= 0), `prev_hash` and
+`chain_hash` (64 hex each) are mandatory; `kind` is OPTIONAL —
+Stage 13's own lock records predate the kind convention and carry
+none (they name the dependency, its hash and its commit directly).
+A view counts such records as `untyped` instead of refusing a ledger
+the toolchain itself wrote. Verification is the replay: record 1
+chains from `0`*64, every record chains from the one before it, the
+seqs count 1..N with no gaps — a linear chain has no Merkle shortcut,
+and the replay is cheap.
+
+### 61.3. The view and the gossip classification
+
+A view (`hls-tlog-view/v1`) is deterministic over an unchanged log:
+`length`, `head` (the last record's chain hash, `0`*64 for an empty
+log), `log_sha256` (the raw bytes' digest), `kinds`, `first_seq`,
+`last_seq`. Two views compare in exactly one way:
+
+    same length, same head                 -> agree
+    same length, different head            -> fork
+    shorter's head == the longer's chain
+      hash at the shorter's length         -> lag  (a mirror behind)
+    the head elsewhere in the longer log   -> fork (renumbered)
+    the head nowhere in the longer log     -> diverged
+
+Lag is the healthy answer for mirrors: byte the lag is, the shorter's
+whole history is still inside the longer's. Any single fork or
+diverged pair flips the whole verdict — a quorum cannot outvote
+evidence — and `--max-lag` turns excessive lag into a refusal without
+ever downgrading a fork into a lag complaint. A source whose chain
+does not replay is a reported refusal; the healthy sources keep
+talking. (The renumbered branch is unreachable between two SOUND
+logs — the chain hash binds the seq — and exists as defense for
+callers that pass unverified maps; the selftest pins it at the unit
+level.)
+
+### 61.4. Witnesses — a view with a name behind it
+
+A view is a claim, and Stage 106 taught the toolchain what a claim
+without a name is worth. `witness LOG --sign SECRET` signs the view
+with the Stage 106 Ed25519 keys — the same minisign file contract,
+no new crypto, one keypair across the whole supply chain. The wall
+clock rides the SIGNED trusted comment (`timestamp:<unix>`), never
+the signed bytes: like every Stage 103–106 document, the witness
+(`hls-tlog-witness/v1`) is deterministic over an unchanged log, and
+the file pair is content-named —
+`hls-tlog-witness-<length>-<head16>.witness.json` plus `.minisig`.
+
+The witness is what makes ROLLBACK visible — the one attack plain
+gossip cannot see, because a mirror missing the newest records is
+indistinguishable from a lagging mirror until someone SAW the longer
+history and signed it. `witness-verify --against LOG` draws exactly
+that line:
+
+    byte-identical — the log IS the witnessed bytes
+    held           — the witnessed history is a prefix (it grew)
+    rewritten      — a seq the witness signed carries another hash
+    rollback       — the log holds fewer records than a signed view
+                     promised (the gone range is named)
+
+Verification verifies AGAINST something: `-p FILE` or `-P HEX`, an
+explicit anchor or a refusal — the hls-sign discipline. Signing
+refuses a broken chain (verify-before-sign) and refuses to overwrite
+an existing witness without `--force`.
+
+### 61.5. Inclusion proofs — a record carried home
+
+A linear chain makes inclusion a replay, so the proof
+(`hls-tlog-proof/v1`) carries the record, every record after it (the
+tail), and the head they chain to. `prove NAME [VERSION]` (or
+`--seq N`) finds the record in a VERIFIED log — the newest match
+wins, the log is append-only. Offline verification recomputes the
+record's chain hash, replays the tail to the head, and checks the
+position law (`length == seq + tail`). Live verification (`--log`)
+replays from genesis and requires the record byte-equal at its seq
+and the head still a prefix of the live log: a proof stays valid over
+a GROWN log and dies on a rewritten one.
+
+### 61.6. The gate
+
+`make tlog` / `tlog-verify` / `tlog-gossip SOURCES="..."`
+/ `tlog-witness LOG=... KEY=...` / `tlog-witness-verify WITNESS=...`
+/ `tlog-prove NAME=...` / `tlog-prove-verify PROOF=...` /
+`tlog-selftest` run the tool; `make tlog-acceptance` runs the
+nine-section gate (`tests/tlog_acceptance.py`, 76 checks):
+
+- **the primitives** — the fifteen in-memory selftest vectors, the
+  SHA-256 standard vectors, the ONE DEFINITION against hpkg_log's
+  own writer;
+- **the views** — the fields, determinism, the empty log, verify and
+  summary exits with the refusal wording (a grafted record, a
+  non-JSON line, a shapeless record);
+- **the sources** — file, directory, a live local HTTP server (and
+  its garbage / 404 / size-cap refusals), the missing file, the
+  directory without a ledger;
+- **the gossip** — consensus, lag, fork (including with a quorum on
+  one side, and never downgraded by `--max-lag`), diverged,
+  insufficient, isolated, stale, the refused source that does not
+  kill the conversation, the usage error;
+- **the witnesses** — the versioned pair, the overwrite refusal,
+  byte-identical re-witnessing, verify against the same log / a
+  grown log / a truncated log (rollback) / a well-formed fork
+  (rewritten), the tampered witness, the foreign key, the missing
+  signature, no witness over a broken chain;
+- **the proofs** — by name, name+version, seq; offline, live, grown,
+  rewritten-at-the-record; the tampered record and tail; the
+  shapeless proof; the absent record;
+- **the ledger** — a real package through `hls-pkg lock` +
+  `publish`; the repo ledger replays soundly and agrees with
+  `hls-pkg log --verify`; the summary head IS the last chain hash;
+  gossip over the ledger and a copy; the publish record proves by
+  name and verifies live;
+- **the demos** — the demo and the ok-test run; interpreter and
+  native agree byte for byte (the native half only when `bin/hlc`
+  exists — the gate stays hermetic);
+- **the tools** — hlfmt stable, hllint clean on the new entry
+  sources.
+
+Exit contract: 0 verified / consensus / held; 1 on any refusal (a
+fork, a rollback, a rewritten history, a broken chain, a bad
+signature, an insufficient source count); 2 for usage errors.
+Gossip, verify, witness-verify and prove-verify are read-only end to
+end.

@@ -352,3 +352,73 @@ sign-selftest:
 sign-acceptance:
 	@echo "[Stage 106 acceptance] running tests/signed_acceptance.py..."
 	@$(PYTHON) tests/signed_acceptance.py
+
+# ============================================================================
+# Stage 107 (v0.126.0-alpha): hls-tlog — transparency-log gossip
+# (multi-source verify)
+# ============================================================================
+
+# Replay any log's hash chain: make tlog-verify [LOG=...] (default the
+# repo ledger).
+tlog-verify:
+	@if [ -n "$(LOG)" ]; then L="$(LOG)"; else L=""; fi; \
+	python3 tools/hls-tlog.py verify $$L
+
+# The verified view: make tlog [LOG=...]
+tlog:
+	@if [ -n "$(LOG)" ]; then L="$(LOG)"; else L=""; fi; \
+	python3 tools/hls-tlog.py summary $$L
+
+# Compare views across sources (files, dirs, http URLs):
+# make tlog-gossip SOURCES="log1 log2 https://mirror/log"
+tlog-gossip:
+	@test "x$(SOURCES)" != "x" || (echo "Usage: make tlog-gossip SOURCES=<src> <src> ..." && false)
+	@python3 tools/hls-tlog.py gossip $(SOURCES)
+
+# Sign a log's view with the Stage 106 keys:
+# make tlog-witness LOG=... KEY=... [OUT=dir] — passphrase from
+# HLS_SIGN_PASSWORD.
+tlog-witness:
+	@test "x$(KEY)" != "x" || (echo "Usage: make tlog-witness [LOG=<log>] KEY=<secret> [OUT=<dir>]" && false)
+	@if [ -n "$(LOG)" ]; then L="$(LOG)"; else L=""; fi; \
+	if [ -n "$(OUT)" ]; then O="--out $(OUT)"; else O=""; fi; \
+	python3 tools/hls-tlog.py witness $$L --sign $(KEY) $$O
+
+# Verify a signed view; --against checks it against the current log:
+# make tlog-witness-verify WITNESS=... [PUB=...] [AGAINST=log]
+tlog-witness-verify:
+	@test "x$(WITNESS)" != "x" || (echo "Usage: make tlog-witness-verify WITNESS=<file> [PUB=<pub>] [AGAINST=<log>]" && false)
+	@if [ -n "$(PUB)" ]; then A="-p $(PUB)"; else A=""; fi; \
+	if [ -n "$(AGAINST)" ]; then G="--against $(AGAINST)"; else G=""; fi; \
+	python3 tools/hls-tlog.py witness-verify $(WITNESS) $$A $$G
+
+# An inclusion proof for one record:
+# make tlog-prove NAME=... [VERSION=...] [LOG=...] [OUT=dir]
+tlog-prove:
+	@test "x$(NAME)" != "x" || (echo "Usage: make tlog-prove NAME=<name> [VERSION=<v>] [LOG=<log>] [OUT=<dir>]" && false)
+	@if [ -n "$(VERSION)" ]; then V="$(VERSION)"; else V=""; fi; \
+	if [ -n "$(LOG)" ]; then L="--log $(LOG)"; else L=""; fi; \
+	if [ -n "$(OUT)" ]; then O="--out $(OUT)"; else O=""; fi; \
+	python3 tools/hls-tlog.py prove $(NAME) $$V $$L $$O
+
+# Verify a proof (offline, or against the live history):
+# make tlog-prove-verify PROOF=... [LOG=...]
+tlog-prove-verify:
+	@test "x$(PROOF)" != "x" || (echo "Usage: make tlog-prove-verify PROOF=<file> [LOG=<log>]" && false)
+	@if [ -n "$(LOG)" ]; then L="--log $(LOG)"; else L=""; fi; \
+	python3 tools/hls-tlog.py prove-verify $(PROOF) $$L
+
+# The stage's pinned numbers, through the tool's front door.
+tlog-selftest:
+	python3 tools/hls-tlog.py selftest
+
+# Stage 107 acceptance gate: the nine-section battery (the chain
+# arithmetic against hpkg_log's own writer, the views, the sources —
+# file, directory, a live local HTTP server, the gossip verdicts, the
+# witnesses (rollback, rewritten, held), the proofs (offline, live,
+# grown, rewritten), the repo ledger end to end, the demos, the
+# tools). Tool-only — no solver needed; the native half of the demo
+# parity runs when bin/hlc exists.
+tlog-acceptance:
+	@echo "[Stage 107 acceptance] running tests/tlog_acceptance.py..."
+	@$(PYTHON) tests/tlog_acceptance.py

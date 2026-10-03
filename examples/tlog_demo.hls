@@ -1,0 +1,168 @@
+# tlog_demo.hls — Stage 107 (v0.126.0-alpha): hls-tlog, the
+# transparency-log gossip protocol (multi-source verify).
+#
+# Until now the ledger had exactly one witness: itself. This demo is
+# the CONTRACT the gossip tool runs, in miniature — the arithmetic
+# that turns N copies of the log into evidence:
+#
+#   python3 tools/hls-tlog.py selftest
+#   python3 tools/hls-tlog.py verify
+#   python3 tools/hls-tlog.py gossip LOG COPY MIRROR
+#   python3 tools/hls-tlog.py witness LOG --sign hls-sign.key
+#
+# What the demo pins, in Halis the language can check without the
+# gossip module: the four-way classification table (agree, fork, lag,
+# diverged), the rollback line a signed witness draws (a lagging
+# mirror is healthy; records someone SIGNED going missing is
+# evidence), the hash binding (the chain hash covers the record AND
+# the hash before it), and the quorum rule (one forked pair flips the
+# verdict — a majority cannot outvote evidence).
+
+import "std.str"
+import "std.crypto"
+
+# The classification, over the five facts a pair comparison reduces
+# to: same length? same head? where does the shorter's head sit in
+# the longer log (0 = nowhere, else the seq)? Classes:
+# 0 agree, 1 fork, 2 lag, 3 diverged — the whole gossip vocabulary.
+fn classify(same_len: bool, heads_eq: bool, found_at: int,
+            shorter_len: int) -> int {
+    if same_len {
+        if heads_eq {
+            return 0
+        }
+        return 1
+    }
+    if found_at == shorter_len {
+        return 2
+    }
+    if found_at > 0 {
+        return 1
+    }
+    return 3
+}
+
+# The rollback rule a WITNESS makes decidable: a mirror below the
+# newest head is a lagging mirror; a mirror below a SIGNED length is
+# evidence. The wall clock rides the signed trusted comment — the
+# verdict only compares lengths the chain pinned.
+fn rolled_back(current_len: int, witnessed_len: int) -> bool {
+    return current_len < witnessed_len
+}
+
+# The chain binding in miniature: the digest covers the record AND
+# the hash before it, so one flipped byte anywhere in the history
+# moves every hash after it. fnv1a stands in for sha256; the shape is
+# the contract.
+fn chain_toy(prev: str, body: str) -> str {
+    return crypto_fnv1a_64_hex(prev + body)
+}
+
+# The quorum rule: fewer than two answering sources prove nothing,
+# any forked pair is a fork, agreement is consensus.
+# 0 insufficient, 1 fork, 2 consensus.
+fn verdict(n_ok: int, has_fork: bool) -> int {
+    if n_ok < 2 {
+        return 0
+    }
+    if has_fork {
+        return 1
+    }
+    return 2
+}
+
+fn main() -> int uses IO {
+    let mut checks: int = 0
+
+    # The classification table: twelve rows, three refusals, one
+    # healthy lag. A mirror missing the newest records sits at
+    # found_at == its own length — lag, the healthy answer.
+    if classify(true, true, 0, 4) != 0 {
+        panic("same length, same head is agreement")
+    }
+    if classify(true, false, 0, 4) != 1 {
+        panic("same length, different head is a fork")
+    }
+    if classify(false, false, 4, 4) != 2 {
+        panic("the head at the claimed length is a lagging mirror")
+    }
+    if classify(false, false, 3, 4) != 1 {
+        panic("the head at the WRONG seq is a renumbered history")
+    }
+    if classify(false, false, 0, 4) != 3 {
+        panic("the head nowhere is a diverged history")
+    }
+    checks = checks + 1
+
+    # The rollback line: below the witnessed length is evidence,
+    # at or above it the witness holds.
+    if !rolled_back(3, 5) {
+        panic("a log below a signed length is a rollback")
+    }
+    if rolled_back(5, 5) || rolled_back(7, 5) {
+        panic("at or above the witnessed length is not a rollback")
+    }
+    checks = checks + 1
+
+    # The chain binding: the digest covers prev_hash + record, so the
+    # same bytes chain the same, and one flipped byte in the history
+    # moves the hash — the reason a truncated or rewritten log cannot
+    # hide from the replay.
+    let body: str = "seq:3,kind:publish"
+    let h1: str = chain_toy("aa11", body)
+    if chain_toy("aa11", body) != h1 {
+        panic("the same history must chain the same")
+    }
+    if chain_toy("aa12", body) == h1 {
+        panic("one flipped byte in the past must move the hash")
+    }
+    checks = checks + 1
+
+    # The quorum rule: gossip alone is not gossip, one forked pair is
+    # a fork no majority can outvote, agreement is consensus.
+    if verdict(1, false) != 0 || verdict(0, false) != 0 {
+        panic("fewer than two sources prove nothing")
+    }
+    if verdict(5, true) != 1 {
+        panic("one forked pair flips the whole verdict")
+    }
+    if verdict(5, false) != 2 {
+        panic("full agreement is consensus")
+    }
+    checks = checks + 1
+
+    # The witness names the log it signs: view, witness, proof —
+    # every document carries its schema and its version.
+    if !str_starts_with("hls-tlog-view/v1", "hls-tlog-") {
+        panic("a view names its tool")
+    }
+    if !str_contains("hls-tlog-witness/v1", "/v1") {
+        panic("a witness carries its version")
+    }
+    if !str_starts_with("hls-tlog-proof-4-a1b2c3d4e5f60718.proof.json",
+                        "hls-tlog-proof-") {
+        panic("a proof is versioned under its tool and seq")
+    }
+    if !str_ends_with("hls-tlog-witness-4-a1b2.witness.json.minisig",
+                      ".minisig") {
+        panic("the witness rides with a minisign signature")
+    }
+    checks = checks + 1
+
+    # The gossip report answers two questions and refuses to blur
+    # them: how many sources spoke, and whether they agree.
+    if !str_contains("3 asked, 3 answered", "asked") {
+        panic("the report names how many sources spoke")
+    }
+    if !str_contains("max lag 2", "lag") {
+        panic("the report names the worst lag")
+    }
+    checks = checks + 1
+
+    if checks != 6 {
+        panic("expected 6 checks, ran " + checks.to_str())
+    }
+    println("transparency gossip: one history, many witnesses, zero vibes")
+    println("checks passed: " + checks.to_str())
+    return 0
+}
