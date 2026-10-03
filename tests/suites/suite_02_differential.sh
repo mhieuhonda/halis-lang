@@ -276,6 +276,57 @@ else
     bad "hls-sbom --pkg wrong on the package demo (rc=$s104p_rc)"
 fi
 
+# Stage 105: hls-repro, the reproducible-build verification across
+# distros. The same tree built twice in two isolated roots under two
+# profiles (locale, TZ, umask, hash seed, root-path shape) must give
+# byte-identical C and binary; the buildinfo is content-addressed
+# (two runs, byte-identical); a shifted verify slice returns the
+# bytes. Engine auto: native hlc when built, the boot chain
+# otherwise.
+s105_rc=0
+SOURCE_DATE_EPOCH=1727800000 python3 tools/hls-repro.py \
+    examples/repro_demo.hls --builds 2 --json \
+    > "$TMP/s105_bi.json" 2>/dev/null || s105_rc=$?
+if [ "$s105_rc" -eq 0 ] \
+   && python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); cs={b["c_sha256"] for b in d["builds"]}; bs={b["binary_sha256"] for b in d["builds"]}; sys.exit(0 if (d["schema"]=="hls-buildinfo/v1" and d["matrix"]["builds"]==2 and d["engine"] in ("boot","native") and len(cs)==1 and len(bs)==1 and d["epoch"]["source"] in ("derived","SOURCE_DATE_EPOCH")) else 1)' \
+      "$TMP/s105_bi.json"; then
+    ok "hls-repro: two distro profiles, byte-identical C and binary"
+else
+    bad "hls-repro failed the two-profile recipe (rc=$s105_rc)"
+fi
+SOURCE_DATE_EPOCH=1727800000 python3 tools/hls-repro.py \
+    examples/repro_demo.hls --builds 2 --json \
+    > "$TMP/s105_bi2.json" 2>/dev/null
+if cmp -s "$TMP/s105_bi.json" "$TMP/s105_bi2.json"; then
+    ok "hls-repro buildinfo is content-addressed (byte-identical reruns)"
+else
+    bad "hls-repro buildinfo is not deterministic across reruns"
+fi
+s105v_rc=0
+python3 tools/hls-repro.py --verify "$TMP/s105_bi.json" >/dev/null \
+    2>&1 || s105v_rc=$?
+if [ "$s105v_rc" -eq 0 ]; then
+    ok "hls-repro --verify: a shifted profile slice returns the bytes"
+else
+    bad "hls-repro --verify failed (rc=$s105v_rc)"
+fi
+# The tampered buildinfo must refuse: one flipped hash is a lie the
+# verifier will not sign.
+python3 - "$TMP/s105_bi.json" "$TMP/s105_bad.json" << 'S105EOF'
+import json, sys
+d = json.load(open(sys.argv[1]))
+d["outputs"]["c_sha256"] = "0" * 64
+json.dump(d, open(sys.argv[2], "w"))
+S105EOF
+s105t_rc=0
+python3 tools/hls-repro.py --verify "$TMP/s105_bad.json" >/dev/null \
+    2>&1 || s105t_rc=$?
+if [ "$s105t_rc" -eq 1 ]; then
+    ok "hls-repro --verify refuses a tampered buildinfo (exit 1)"
+else
+    bad "hls-repro --verify accepted a tampered buildinfo (rc=$s105t_rc)"
+fi
+
 # Stage 98: refinement types. Every refined slot is guarded at runtime
 # (fn entry / return / let / assign / construction); proven sites are
 # elided. The interpreter and the native build (default AND -O fast)

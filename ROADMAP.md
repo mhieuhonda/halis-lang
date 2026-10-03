@@ -165,7 +165,7 @@ remains green.
 | 102 | Constant-time verifier (verify code is branch-free on secrets) | ✅ | (done in v0.121.0-alpha) |
 | 103 | `hls-audit` — supply-chain effect report (transitive) | ✅ | (done in v0.122.0-alpha) |
 | 104 | SBOM generation (CycloneDX + SPDX) per release | ✅ | (done in v0.123.0-alpha) |
-| 105 | Reproducible-build verification across distros | ⬜ | 4 weeks |
+| 105 | Reproducible-build verification across distros | ✅ | (done in v0.124.0-alpha) |
 | 106 | Signed packages (minisign, ed25519) | ⬜ | 3 weeks |
 | 107 | Transparency log Gossip protocol (multi-source verify) | ⬜ | 4 weeks |
 | 108 | Memory-safety re-verification under `-O fast` (proof replay) | ⬜ | 4 weeks |

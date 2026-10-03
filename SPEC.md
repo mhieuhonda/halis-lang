@@ -6127,3 +6127,169 @@ runs the eight-section gate (`tests/sbom_acceptance.py`, 69 checks):
   exists — the gate stays hermetic);
 - **the tools** — hlfmt stable, hllint clean on the new entry
   sources.
+
+## 59. `hls-repro` — reproducible-build verification across distros (Stage 105 — v0.124.0-alpha)
+
+### 59.1. The claim the toolchain owed
+
+Lock pinned the inputs, verify proved them, audit explained them,
+the SBOM listed them for the parties who ask — and none of it said
+the BYTES come back. `tools/hls-repro.py` closes the loop: build the
+same tree N times in N isolated build roots under N deliberately
+different environments and require the artifacts to come back
+byte-identical. Not "should reproduce" — did.
+
+```
+python3 tools/hls-repro.py <entry.hls> [--builds N]
+                                       [--engine auto|boot|native]
+                                       [--cc CMD] [--cflags STR]
+                                       [--epoch N] [--out DIR]
+                                       [--scratch DIR] [--json]
+                                       [--no-smoke]
+python3 tools/hls-repro.py --pkg [DIR]  [the same] [--release]
+python3 tools/hls-repro.py --verify FILE [--in DIR] [--json]
+```
+
+### 59.2. Across distros, honestly
+
+One machine cannot literally run five distros, so the tool does what
+is TRUE on one machine: it varies every environmental input a distro
+build daemon varies — the build-root path (length and letters), the
+locale set, the timezone, the umask, the Python hash seed, and the
+breadth of the environment itself (each build starts from a MINIMAL
+env: `PATH` plus the recipe, not your shell). Five named profiles —
+`baseline`, `glibc-debian`, `musl-alpine`, `bsd-sandbox`, `nix-long`
+— rotate over the builds (`--builds N`, 2..5, default 2); the
+buildinfo records which ran and their exact deltas, so the claim is
+scoped: byte-identical under THIS environment matrix. The full
+cross-distro answer is one command away ON the other distro:
+`--verify` there.
+
+### 59.3. The recipe — everything pinned, nothing inherited
+
+The tree is staged HERMETICALLY into each build root: exactly the
+modules hls-audit's own walkers name (one definition of the tree,
+shared with the audit and the SBOM), laid out the way the import
+resolver will re-derive it — repo-relative keys for an in-repo
+entry, entry-relative paths for a detached one, the package dir
+plus a flat `.hls-pkg-deps/` laid out exactly as `hls-pkg build`
+does for package mode. Then:
+
+- the intermediate C is ALWAYS `build/hl_repro.c`. This is the
+  stage's founding lesson: gcc records the intermediate C's NAME in
+  the ELF symbol table (the STT_FILE symbol), so two builds over
+  byte-identical C differed in exactly one symbol-table byte when
+  the name differed — found in Stage 105's own first experiment;
+  the recipe names the C so the artifact never sees your
+  filesystem;
+- the cc invocation is fixed: recorded flags, `-lm -pthread`
+  appended, cwd = the build root, relative paths only;
+- `SOURCE_DATE_EPOCH` is honored when `--epoch` or the environment
+  names one and DERIVED from the tree digest otherwise — the epoch
+  is content, not clock: `int(tree_digest[:8], 16) % 2**31`.
+
+The smoke runs each artifact once under its own profile's env (stdin
+closed, a timeout); when all builds agree on exit code and stdout
+the buildinfo records the stdout hash — the artifacts not only ARE
+the same bytes, they DO the same thing. A program that needs
+arguments simply fails to run consistently; the smoke is then
+`skipped`, and never gates.
+
+### 59.4. The buildinfo — the carrier of the claim
+
+The report IS the artifact: schema `hls-buildinfo/v1`, deterministic
+(two runs over an unchanged tree with the same engine produce
+byte-identical files — the content-addressing the SBOM documents
+already hold to). It names the mode, the resolved engine, the tree
+digest and every input with its hash, the epoch and its source, the
+toolchain (hlc fingerprint over `src/hlc.hls`, `cc --version`,
+python), the recipe (names, flags, libs), the matrix (profiles,
+root patterns, umasks, env deltas), the smoke verdict, and the
+outputs' hashes and size. Source mode names the entry and the
+layout (`repo` / `detached`); package mode names the package, the
+version, the entry, and hashes the deps as the units the lock pins.
+
+### 59.5. The diagnosis — WHY the bytes differ
+
+A mismatch is not just "failed". The diagnoser finds the first
+differing byte, counts the differing bytes, and hunts the classic
+leak classes: the build-root path embedded in an artifact, the
+intermediate C's name reaching the symbol table (a single differing
+byte in an otherwise identical binary IS that signature — the
+finding says so, and names the canonical recipe), and the timestamp
+macros (`__DATE__`, `__TIME__`, `__TIMESTAMP__`) in the generated
+C. When the C stage is identical but the binary is not, the report
+says the divergence is downstream of the compiler, with the
+printable strings around the first difference as evidence. The
+build roots are kept on disk for the post-mortem; on success they
+are deleted.
+
+### 59.6. `--verify` — the cross-environment answer
+
+`--verify FILE` re-runs the recipe on the current tree, in a
+contract's order: the document's shape first; the TREE second (the
+input hashes are re-derived and a mismatch refuses BEFORE anything
+is built — `the tree is not what the buildinfo describes`); the
+ENGINE third (a boot-built buildinfo is not verified by a native
+build — fail-closed); then the fresh builds under a SHIFTED profile
+rotation, so the fresh slice shares no environment with the
+original two-build window. The fresh hashes must equal the recorded
+ones; when both runs smoked consistently the stdout hashes must
+agree too. Exit 0 is the cross-distro sentence: another environment
+rebuilt your bytes.
+
+### 59.7. `--release` — the shipping gate, continued
+
+Package mode's `--release` carries hls-sbom's contract over: a
+lockfile must exist (`a release ships pinned content — run hls-pkg
+lock first`), the audit's drift check refuses a tree the lock no
+longer names (drift FIRST, then unauditable — the SBOM's documented
+order), an unauditable package refuses outright, and on success the
+versioned buildinfo `hls-repro-<name>-<version>.buildinfo.json` is
+written and ONE record (kind `repro`) — the tree digest, the C and
+binary hashes, the buildinfo's own hash, the matrix size — is
+chained into the same transparency ledger lock, publish and the
+SBOM append to. `hls-pkg log --verify` covers it with the rest of
+the chain. Without `--release` the log is never touched; `--json`
+never writes files at all.
+
+Exit contract: 0 when the builds agree (or `--verify` reproduced);
+1 on any mismatch, input drift, an unauditable package, a missing
+lockfile under `--release`, an unwritable output location, or a
+refused verify; 2 for usage errors (no mode, several modes,
+`--verify` with recipe overrides, `--builds` out of range).
+
+### 59.8. The gate
+
+`make repro F=<entry> [BUILDS=N] [ENGINE=...]` /
+`make repro-pkg D=<dir>` / `make repro-release D=<dir>` /
+`make repro-verify BINFO=<file> [IN=<root>]` run the tool;
+`make repro-acceptance` runs the nine-section gate
+(`tests/repro_acceptance.py`, 57 checks):
+
+- **the recipe** — two profiles, byte-identical C and binary, the
+  buildinfo pinned field by field, the written file equal to the
+  `--json` report;
+- **the diagnoser** — the STT_FILE lesson reproduced in miniature
+  (byte-identical C, one letter apart, one differing byte), the
+  signature named, the timestamp macros named;
+- **the epoch** — `--epoch`, then the environment, then the
+  derivation; one flipped source byte moves the digest and the
+  epoch; the SBOM bridge — the Stage 104 documents rebuild byte for
+  byte under the repro epoch;
+- **the matrix** — three builds, three profiles, one verdict; the
+  staged root proven to hold exactly the audit's module set;
+- **the drift** — a detached fixture (outside the repo — inside it
+  the keys are repo-relative); a changed module refuses the verify
+  before anything is built;
+- **the verify** — fresh (exit 0), engine-mismatch refused,
+  tampered outputs refused, a foreign document refused;
+- **the package** — no lockfile, no release; a fresh lock releases
+  (versioned buildinfo, one `repro` record, the chain still
+  verifying); content changed under the lock refuses with the log
+  untouched;
+- **the demos** — the demo and the ok-test run; interpreter and
+  native agree byte for byte (the native half only when `bin/hlc`
+  exists — the gate stays hermetic);
+- **the tools** — hlfmt stable, hllint clean on the new entry
+  sources.

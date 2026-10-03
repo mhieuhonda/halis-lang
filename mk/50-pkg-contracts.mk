@@ -254,3 +254,49 @@ sbom-release:
 sbom-acceptance:
 	@echo "[Stage 104 acceptance] running tests/sbom_acceptance.py..."
 	@$(PYTHON) tests/sbom_acceptance.py
+
+# ============================================================================
+# Stage 105 (v0.124.0-alpha): hls-repro — reproducible-build
+# verification across distros
+# ============================================================================
+
+# Build the same tree N times in N isolated roots under N distro
+# profiles (locale, TZ, umask, hash seed, env breadth, root-path
+# shape) and require byte-identical C + binary. Writes the
+# buildinfo next to the entry.
+repro:
+	@if [ -z "$(F)" ]; then echo "Usage: make repro F=<entry.hls> [BUILDS=2] [ENGINE=auto|boot|native]" && false; fi; \
+	if [ -n "$(BUILDS)" ]; then B="--builds $(BUILDS)"; else B=""; fi; \
+	if [ -n "$(ENGINE)" ]; then E="--engine $(ENGINE)"; else E=""; fi; \
+	python3 tools/hls-repro.py $(F) $$B $$E
+
+# The same, package mode: the manifest tree, the lockfile's drift
+# check, deps staged the hls-pkg way.
+repro-pkg:
+	@if [ -z "$(D)" ]; then echo "Usage: make repro-pkg D=<pkg dir> [BUILDS=2]" && false; fi; \
+	if [ -n "$(BUILDS)" ]; then B="--builds $(BUILDS)"; else B=""; fi; \
+	python3 tools/hls-repro.py --pkg $(D) $$B
+
+# The shipping gate: lockfile required, versioned buildinfo
+# hls-repro-<name>-<version>.buildinfo.json written, ONE "repro"
+# record chained into the transparency log.
+repro-release:
+	@if [ -z "$(D)" ]; then echo "Usage: make repro-release D=<pkg dir>" && false; fi; \
+	python3 tools/hls-repro.py --pkg $(D) --release
+
+# The cross-environment answer: rebuild the CURRENT tree under a
+# shifted profile slice and require the buildinfo's bytes back.
+repro-verify:
+	@if [ -z "$(BINFO)" ]; then echo "Usage: make repro-verify BINFO=<file.buildinfo.json> [IN=<tree root>]" && false; fi; \
+	if [ -n "$(IN)" ]; then I="--in $(IN)"; else I=""; fi; \
+	python3 tools/hls-repro.py --verify $(BINFO) $$I
+
+# Stage 105 acceptance gate: the recipe (two profiles, identical
+# bytes), the STT_FILE diagnoser, the epoch policy + the SBOM
+# bridge, the matrix, the input-drift refusal, verify (fresh +
+# tampered + drifted), the release gate with the transparency
+# chaining, the demos, the tools. Tool-only — no solver needed; the
+# engine half runs native when bin/hlc exists, boot otherwise.
+repro-acceptance:
+	@echo "[Stage 105 acceptance] running tests/repro_acceptance.py..."
+	@$(PYTHON) tests/repro_acceptance.py
