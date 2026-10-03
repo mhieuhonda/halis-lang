@@ -327,6 +327,41 @@ else
     bad "hls-repro --verify accepted a tampered buildinfo (rc=$s105t_rc)"
 fi
 
+# Stage 106: hls-sign, the signed packages (minisign, ed25519). The
+# primitives prove themselves against the RFC vectors (the tool's own
+# selftest); a payload signs and verifies; a flipped byte and a
+# foreign key refuse. The full battery is the sign-acceptance gate;
+# this pins the pipeline is wired.
+s106_rc=0
+python3 tools/hls-sign.py selftest > "$TMP/s106_self.txt" 2>/dev/null \
+    || s106_rc=$?
+if [ "$s106_rc" -eq 0 ] && [ "$(grep -c '  ok: ' "$TMP/s106_self.txt")" -eq 10 ]; then
+    ok "hls-sign selftest: the RFC 8032 + RFC 8439 vectors all pass"
+else
+    bad "hls-sign selftest failed (rc=$s106_rc)"
+fi
+echo "release payload 106" > "$TMP/s106_payload.txt"
+HLS_SIGN_PASSWORD=gate-106 python3 tools/hls-sign.py keygen \
+    -f "$TMP/s106.key" -p "$TMP/s106.pub" --iterations 1000 \
+    > /dev/null 2>&1 \
+    && HLS_SIGN_PASSWORD=gate-106 python3 tools/hls-sign.py sign \
+        "$TMP/s106_payload.txt" -s "$TMP/s106.key" \
+        --trusted-comment "timestamp:0" > /dev/null 2>&1 \
+    && HLS_SIGN_PASSWORD=gate-106 python3 tools/hls-sign.py verify \
+        "$TMP/s106_payload.txt" -p "$TMP/s106.pub" > /dev/null 2>&1
+if [ $? -eq 0 ]; then
+    ok "hls-sign: keygen -> sign -> verify round trip (exit 0)"
+else
+    bad "hls-sign round trip failed"
+fi
+echo "release payload 10!" > "$TMP/s106_payload.txt"
+if HLS_SIGN_PASSWORD=gate-106 python3 tools/hls-sign.py verify \
+        "$TMP/s106_payload.txt" -p "$TMP/s106.pub" > /dev/null 2>&1; then
+    bad "hls-sign accepted a tampered payload"
+else
+    ok "hls-sign refuses a tampered payload (exit 1)"
+fi
+
 # Stage 98: refinement types. Every refined slot is guarded at runtime
 # (fn entry / return / let / assign / construction); proven sites are
 # elided. The interpreter and the native build (default AND -O fast)

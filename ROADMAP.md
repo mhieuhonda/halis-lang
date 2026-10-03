@@ -166,7 +166,7 @@ remains green.
 | 103 | `hls-audit` — supply-chain effect report (transitive) | ✅ | (done in v0.122.0-alpha) |
 | 104 | SBOM generation (CycloneDX + SPDX) per release | ✅ | (done in v0.123.0-alpha) |
 | 105 | Reproducible-build verification across distros | ✅ | (done in v0.124.0-alpha) |
-| 106 | Signed packages (minisign, ed25519) | ⬜ | 3 weeks |
+| 106 | Signed packages (minisign, ed25519) | ✅ | (done in v0.125.0-alpha) |
 | 107 | Transparency log Gossip protocol (multi-source verify) | ⬜ | 4 weeks |
 | 108 | Memory-safety re-verification under `-O fast` (proof replay) | ⬜ | 4 weeks |
 | 109 | Taint-tracking through FFI boundaries | ⬜ | 5 weeks |

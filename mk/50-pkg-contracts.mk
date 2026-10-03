@@ -300,3 +300,55 @@ repro-verify:
 repro-acceptance:
 	@echo "[Stage 105 acceptance] running tests/repro_acceptance.py..."
 	@$(PYTHON) tests/repro_acceptance.py
+
+# ============================================================================
+# Stage 106 (v0.125.0-alpha): hls-sign — signed packages (minisign,
+# ed25519)
+# ============================================================================
+
+# Generate a keypair: make sign-keygen [COMMENT="..."] — the passphrase
+# comes from HLS_SIGN_PASSWORD (or --password-env via the tool).
+sign-keygen:
+	@if [ -n "$(COMMENT)" ]; then C="-c $(COMMENT)"; else C=""; fi; \
+	python3 tools/hls-sign.py keygen $$C
+
+# Sign any file: make sign F=file.hls — writes file.hls.minisig
+sign:
+	@test "x$(F)" != "x" || (echo "Usage: make sign F=<file>" && false)
+	@python3 tools/hls-sign.py sign $(F)
+
+# Verify: make sign-verify F=file [SIG=file.minisig] [PUB=key.pub]
+sign-verify:
+	@test "x$(F)" != "x" || (echo "Usage: make sign-verify F=<file> [SIG=<sig>] [PUB=<pub>]" && false); \
+	if [ -n "$(SIG)" ]; then S="$(SIG)"; else S=""; fi; \
+	if [ -n "$(PUB)" ]; then A="-p $(PUB)"; else A=""; fi; \
+	python3 tools/hls-sign.py verify $(F) $$S $$A
+
+# The shipping gate: audit + lockfile required, the versioned statement
+# hls-sign-<name>-<version>.release.json + its minisign signature
+# written, ONE "sign" record chained into the transparency log.
+sign-release:
+	@test "x$(D)" != "x" || (echo "Usage: make sign-release D=<pkg dir> [OUT=<dir>]" && false); \
+	if [ -n "$(OUT)" ]; then O="--out $(OUT)"; else O=""; fi; \
+	python3 tools/hls-sign.py release $(D) $$O
+
+# The counterparty's side: signature, lockfile bytes, audit drift,
+# content digest — against the CURRENT tree.
+sign-verify-release:
+	@test "x$(D)" != "x" || (echo "Usage: make sign-verify-release D=<pkg dir> [PUB=<pub>]" && false); \
+	if [ -n "$(PUB)" ]; then A="-p $(PUB)"; else A=""; fi; \
+	python3 tools/hls-sign.py verify-release $(D) $$A
+
+# The RFC 8032 / RFC 8439 vectors, through the tool's front door.
+sign-selftest:
+	@python3 tools/hls-sign.py selftest
+
+# Stage 106 acceptance gate: the nine-section battery (the primitives
+# against the RFC vectors, the keys, the minisign signature contract,
+# the layer parity, the statement, the release gate with the
+# transparency chaining, the ledger, the demos, the tools). Tool-only
+# — no solver, no compiler needed; the native half of the demo parity
+# runs when bin/hlc exists.
+sign-acceptance:
+	@echo "[Stage 106 acceptance] running tests/signed_acceptance.py..."
+	@$(PYTHON) tests/signed_acceptance.py

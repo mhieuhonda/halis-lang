@@ -6293,3 +6293,180 @@ refused verify; 2 for usage errors (no mode, several modes,
   exists — the gate stays hermetic);
 - **the tools** — hlfmt stable, hllint clean on the new entry
   sources.
+
+
+## 60. `hls-sign` — signed packages, minisign + Ed25519 (Stage 106 — v0.125.0-alpha)
+
+### 60.1. The name behind the claim
+
+Every release record the toolchain writes is a claim — `publish`
+claims the content, the SBOM claims the parts, repro claims the
+bytes — and a claim without a name behind it is worth the paper it
+is printed on. `tools/hls-sign.py` puts a NAME behind the release:
+an Ed25519 keypair generated and stored the minisign way, a detached
+signature over a deterministic release statement, and a verify path
+that refuses anything the signer did not sign.
+
+```
+python3 tools/hls-sign.py keygen [-f SECRET] [-p PUBLIC] [-c COMMENT]
+                                 [--password-env VAR] [--iterations N]
+                                 [--force]
+python3 tools/hls-sign.py sign [-s SECRET] FILE [--sig-out PATH]
+                               [--trusted-comment STR] [--json]
+python3 tools/hls-sign.py verify [-p PUB | -P HEX] FILE [SIG] [--json]
+python3 tools/hls-sign.py release DIR [--key SECRET] [--out DIR]
+                              [--trusted-comment STR] [--json]
+python3 tools/hls-sign.py verify-release DIR [-p PUB | -P HEX] [--json]
+python3 tools/hls-sign.py selftest
+```
+
+Paths and passphrases resolve in one order everywhere: the explicit
+flag, then the environment (`HLS_SIGN_KEY`, `HLS_SIGN_PUB`,
+`HLS_SIGN_PASSWORD`, or the variable `--password-env` names), then
+the terminal — a CI run never hangs on a hidden prompt, an
+interactive run never needs flags.
+
+### 60.2. The crypto is RFC-pinned, not folklore
+
+The toolchain is stdlib-only, so Stage 106 carries its own Ed25519
+(`hlsign_parts/hlsign_ed25519.py`): the Edwards25519 curve in
+extended homogeneous coordinates, the RFC 8032 formulas verbatim,
+SHA-512 for the hashing, the standard clamping — and `selftest()`
+pins it to the RFC's own section 7.1 vectors, all four, EXACT
+signature bytes (TEST 1, TEST 2, TEST 3, TEST SHA(abc)); Ed25519
+signing is deterministic — the nonce is derived from the message and
+the seed prefix, never from an RNG — so signing the same bytes twice
+produces the same signature, a property the gate leans on and the
+files honor. The secret-key box
+(`hlsign_parts/hlsign_aead.py`) is ChaCha20-Poly1305 composed
+exactly as RFC 8439's AEAD composes it, pinned to the RFC's vectors
+(the §2.3.2 block, the §2.5.2 Poly1305 example, the §2.6.2 one-time
+key, the §2.8.2 sunscreen ciphertext and tag, byte for byte) plus
+the tamper refusals: a flipped ciphertext byte or AAD byte fails the
+MAC, never silently decrypts. The passphrase stretches through
+PBKDF2-HMAC-SHA256 (default 200000 iterations, `--iterations` to
+change).
+
+Honest limits, stated where they belong: pure Python is not
+constant-time; the module is for signing and verifying on a
+developer's machine and in CI — the same trust boundary the rest of
+the Python toolchain assumes — not for a network service holding
+keys against a timing adversary.
+
+### 60.3. The files — minisign where it counts, honest where it must
+
+The PUBLIC key file is minisign-compatible byte for byte: an
+`untrusted comment: minisign public key <keyid>` line, then
+base64 of `Ed` (2) || key id (8) || public key (32) — 42 bytes, 56
+base64 characters. The key id is not random: it is
+SHA-256(public key)[:8], self-deriving, so a ledger record or a
+statement can NAME the key without shipping the key file, and two
+blobs claiming the same id cannot disagree about the key.
+
+The SIGNATURE file is minisign's four-line contract:
+
+```
+untrusted comment: signature from hls-sign key <keyid>
+<base64 of Ed(2) || signature over the payload>          # 88 chars
+trusted comment: timestamp:<unix>	file:<name>
+<base64 of Ed(2) || signature over (raw sig || trusted comment)>
+```
+
+TWO signatures: one over the payload, one over the payload signature
+CONCATENATED WITH the trusted comment — rewriting the human-readable
+line after the fact breaks the file. The trusted comment is signed
+but not trusted-by-default; the verdict is about the payload.
+
+The SECRET key file is the honest divergence: minisign encrypts its
+key with libsodium (scrypt + XSalsa20-Poly1305); the toolchain has
+no libsodium, so the box is the Stage 106 construction, documented
+in full in the module — `"hs"` marker, `"PD"` KDF id, the iteration
+count, the salt, the nonce, then ChaCha20-Poly1305 over
+`Ed || keyid || seed || public key || SHA-256(seed || pk)[:8]` with
+the AAD `hls-sign-key`. The AEAD refuses a wrong passphrase; the
+checksum catches corruption; the re-derived public key must equal
+the stored one before the key is used; the file is 0600, always.
+
+### 60.4. The release statement — the deterministic claim
+
+Package mode signs a statement, not a tarball: schema
+`hls-release-statement/v1`, canonical JSON (sorted keys, two-space
+indent, trailing newline), content-addressed like every Stage
+103–105 document — no timestamp inside the signed bytes (the trusted
+comment carries the wall clock, the ledger record carries the unix
+second). The fields: the schema and kind, the package name and
+version, `content_sha256` (the digest `hls-pkg publish` computes —
+the SAME sorted walk, rel-path \0 bytes \0, so a signed statement
+and a publish record can never disagree about what a package's
+content hash is), the file count, `lockfile_sha256` (the lockfile
+bytes the release ships with), the algorithm and the key id, the
+tool and its version.
+
+### 60.5. The release gate, the signature bolted in front
+
+`release DIR` follows the contract the SBOM established, in the
+SBOM's order: the manifest must exist; the audit passes fail-closed
+(drift FIRST, then unauditable); the lockfile must exist (a release
+ships pinned content — no lock, no release); the statement is built,
+signed twice, and written as
+`hls-sign-<name>-<version>.release.json` plus
+`hls-sign-<name>-<version>.minisig`; ONE record (kind `sign`) — the
+content hash, the key id, the statement's and the signature's own
+SHA-256s — is chained into the same transparency ledger lock,
+publish, the SBOM and repro append to. `hls-pkg log --verify`
+covers it with the rest of the chain.
+
+`verify-release DIR` is the counterparty's side, in order: the
+signature over the statement bytes against the trust anchor (`-p`
+file or `-P` raw hex — verification verifies AGAINST something, it
+never falls back to a default key); the statement's shape; the
+lockfile bytes; the audit's drift check (the same fail-closed walk
+the signer ran — a lockfile the tree no longer matches is drift,
+even when its bytes are the pinned ones); the content digest
+re-derived from the CURRENT tree. Exit 0 means: the signer signed
+exactly these bytes, and this tree is still those bytes.
+
+Exit contract: 0 verified/released; 1 on any refusal (bad signature,
+tamper, drift, missing lockfile, missing key, an unreadable box); 2
+for usage errors. Verify modes are read-only end to end; `--json`
+prints the machine report.
+
+### 60.6. The gate
+
+`make sign-keygen [COMMENT=...]` / `make sign F=<file>` /
+`make sign-verify F=<file> [SIG=...] [PUB=...]` /
+`make sign-release D=<dir> [OUT=...]` /
+`make sign-verify-release D=<dir> [PUB=...]` /
+`make sign-selftest` run the tool; `make sign-acceptance` runs the
+nine-section gate (`tests/signed_acceptance.py`, 68 checks):
+
+- **the primitives** — the RFC 8032 vectors with the exact signature
+  bytes, determinism pinned, the RFC 8439 vectors through the
+  module, the CLI selftest reporting all ten groups, the PBKDF2
+  standard vectors;
+- **the keys** — both files written, the minisign blob's 42 bytes /
+  56 characters, the self-derived key id, the 0600 secret, the box
+  round trip, the wrong passphrase refused, no plaintext key
+  material on disk, the overwrite refusal;
+- **the signature** — the four-line contract, the 88-character
+  lines, verify ok, the tampered payload / rewritten trusted
+  comment / foreign key / wrong raw-hex anchor / missing pieces all
+  refuse, re-signing is byte-identical;
+- **the contract** — the primitives layer and the CLI agree; the
+  global signature really covers the comment; an empty payload
+  signs and verifies;
+- **the statement** — every field pinned, canonical bytes,
+  re-release is byte-identical, and `content_sha256` IS the
+  `hls-pkg publish` digest (one definition of the number);
+- **the release** — no lockfile, no release (nothing written); a
+  fresh lock releases; verify-release fresh / another key / tampered
+  statement / tampered content / tampered lockfile (and restored
+  bytes verify again);
+- **the ledger** — the sign record chains the content, statement and
+  signature hashes; the chain still verifies; a drifted tree refuses
+  the release AND the verify with NOTHING appended;
+- **the demos** — the demo and the ok-test run; interpreter and
+  native agree byte for byte (the native half only when `bin/hlc`
+  exists — the gate stays hermetic);
+- **the tools** — hlfmt stable, hllint clean on the new entry
+  sources.
