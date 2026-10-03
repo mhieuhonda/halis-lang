@@ -1,0 +1,318 @@
+# ============================================================================
+# Release — build the native `hlc` compiler for 6 platforms and publish it.
+# ============================================================================
+#
+# Triggers
+#   * push of a tag matching `v*-alpha` (e.g. v0.125.0-alpha)
+#       -> full pipeline: 6 platform builds + SHA256SUMS + GitHub Release.
+#   * workflow_dispatch (manual run from the Actions tab / `gh workflow run`)
+#       -> the same 6 builds, artifacts only; NO release is created.
+#          Use this to exercise the pipeline without publishing anything.
+#
+# Per-platform job (matrix of 6):
+#   1. Stage-0 bootstrap — the Python seed (boot/) interprets the HLS
+#      compiler source (src/hlc.hls) and makes it compile itself into
+#      bin/hlc.c                       (the `make bootstrap` step 1).
+#   2. Native compile of bin/hlc.c with the platform C toolchain
+#      (-O2 -lm -pthread, exactly as the Makefile does).
+#   3. Bootstrap-invariant re-check, run on EVERY build including cache
+#      hits: the native compiler must regenerate bin/hlc.c byte-identically
+#      (make bootstrap steps 3+4), and examples/hello.hls must compile and
+#      run end-to-end with the expected output.
+#   4. Package hlc + LICENSE + README.md into a per-platform archive
+#      (.tar.gz on Linux/macOS, .zip on Windows) and upload it as a
+#      workflow artifact named `pkg-<platform>`.
+#
+# The final `release` job (tag builds only) collects the six archives,
+# writes SHA256SUMS over them, verifies it, and publishes a prerelease
+# GitHub Release for the tag with every archive + SHA256SUMS attached.
+#
+# Cache
+#   `bin/` (hlc.c + the native compiler) is cached per platform, keyed on
+#   the exact content hash of boot/** + src/**. A hit proves these very
+#   sources were bootstrapped before, so steps 1+2 are skipped entirely:
+#   re-runs, retries and re-pushes of the same tag never pay the Python
+#   bootstrap again. No restore-keys are used on purpose — a stale
+#   compiler must never be reused for a release, and the verify step
+#   (step 3) always runs regardless of cache state.
+#
+# Toolchain notes
+#   * All 6 jobs build NATIVELY on GitHub-hosted runners (public repo:
+#     ubuntu-24.04-arm / windows-11-arm / macos-15-intel are free).
+#   * Windows uses MSYS2 MinGW-w64 (winpthreads): the generated C runtime
+#     is pthreads-based, so MSVC is not an option; -lm -pthread behave as
+#     on the Makefile's gcc invocation.
+#   * libcurl is intentionally NOT installed: the Makefile auto-probes it
+#     and would otherwise produce an inconsistent feature set (TLS on
+#     Linux only). Without it every binary behaves identically —
+#     net_tls_get panics with a clear message, everything else works.
+#
+# ── STAGE 142 NOTE (pure-HLS bootstrap) ─────────────────────────────────────
+# When `boot/` (the Python seed) is removed, replace the two commands inside
+# the "Stage-0 bootstrap + native compile" step (marked STAGE 142 below):
+#     1. fetch the previous release's `hlc` for THIS platform (the hosted
+#        compiler can compile src/hlc.hls), then
+#     2. run `./hlc src/hlc.hls bin/hlc.c` instead of
+#        `python boot/boot.py src/hlc.hls src/hlc.hls bin/hlc.c`.
+# The cache key should then drop the boot/** pattern. Everything else —
+# verification, packaging, checksums, release — stays exactly as is.
+# ────────────────────────────────────────────────────────────────────────────
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*-alpha'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: build ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ---- Linux ------------------------------------------------------
+          - name: linux-x86_64
+            os: ubuntu-24.04
+            cc: gcc
+          - name: linux-aarch64
+            os: ubuntu-24.04-arm
+            cc: gcc
+
+          # ---- macOS ------------------------------------------------------
+          - name: macos-x86_64
+            os: macos-15-intel
+            cc: clang
+          - name: macos-aarch64
+            os: macos-15
+            cc: clang
+
+          # ---- Windows (MSYS2 MinGW: the runtime is pthreads-based) --------
+          - name: windows-x86_64
+            os: windows-2025
+            cc: gcc
+            msystem: MINGW64
+            packages: >-
+              mingw-w64-x86_64-gcc
+              mingw-w64-x86_64-python
+          - name: windows-aarch64
+            os: windows-11-arm
+            cc: gcc
+            msystem: CLANGARM64
+            packages: >-
+              mingw-w64-clang-aarch64-gcc
+              mingw-w64-clang-aarch64-python
+
+    steps:
+      # The tree has no .gitattributes; keep Windows checkouts byte-faithful
+      # (LF as committed) so the determinism check compares like with like.
+      - name: Force LF checkout (Windows)
+        if: runner.os == 'Windows'
+        run: git config --global core.autocrlf false
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ---- Toolchains ------------------------------------------------------
+      - name: Setup Python 3.12
+        if: runner.os != 'Windows'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Setup MSYS2 (MinGW gcc + python)
+        if: runner.os == 'Windows'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: ${{ matrix.msystem }}
+          update: false
+          release: true
+          install: ${{ matrix.packages }}
+
+      # ---- Cache ------------------------------------------------------------
+      # bin/ holds the Stage-0 output (hlc.c) and the native compiler built
+      # from it. Keyed on the exact sources; no restore-keys (see header).
+      - name: Restore bootstrap cache
+        id: bootcache
+        uses: actions/cache@v4
+        with:
+          path: bin
+          key: hlc-boot-${{ matrix.name }}-${{ hashFiles('boot/**', 'src/**') }}
+
+      # ---- Build (STAGE 142: replace the bootstrap command below) ----------
+      - name: Stage-0 bootstrap + native compile (Linux/macOS)
+        if: runner.os != 'Windows' && steps.bootcache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p bin
+          echo "python: $(command -v python) ($(python --version 2>&1))"
+          echo "cc:     $(command -v ${{ matrix.cc }}) ($({{ matrix.cc }} --version | head -1))"
+          # Stage-0: the Python seed interprets the HLS compiler and makes
+          # it compile itself into C (make bootstrap step 1).
+          python boot/boot.py src/hlc.hls src/hlc.hls bin/hlc.c
+          # Native compile of the emitted C (make bootstrap step 2).
+          ${{ matrix.cc }} -O2 -o bin/hlc bin/hlc.c -lm -pthread
+
+      - name: Stage-0 bootstrap + native compile (Windows)
+        if: runner.os == 'Windows' && steps.bootcache.outputs.cache-hit != 'true'
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          mkdir -p bin
+          echo "python: $(command -v python) ($(python --version 2>&1))"
+          echo "cc:     $(command -v ${{ matrix.cc }}) ($({{ matrix.cc }} --version | head -1))"
+          # Stage-0: the Python seed interprets the HLS compiler and makes
+          # it compile itself into C (make bootstrap step 1).
+          python boot/boot.py src/hlc.hls src/hlc.hls bin/hlc.c
+          # Native compile of the emitted C (make bootstrap step 2). MinGW
+          # gcc auto-appends .exe to the output name.
+          ${{ matrix.cc }} -O2 -o bin/hlc bin/hlc.c -lm -pthread
+
+      # ---- Verify (always runs — cached or not) -----------------------------
+      - name: Verify bootstrap invariant + smoke run (Linux/macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p smoke
+          # (a) The compiler must regenerate its own C source byte-for-byte
+          #     — the exact gate `make bootstrap` steps 3+4 enforce.
+          ./bin/hlc src/hlc.hls smoke/hlc_selfcheck.c
+          diff -q bin/hlc.c smoke/hlc_selfcheck.c
+          # (b) Compile a real program end-to-end and run it.
+          ./bin/hlc examples/hello.hls smoke/hello.c
+          ${{ matrix.cc }} -O2 -o smoke/hello smoke/hello.c -lm -pthread
+          out="$(./smoke/hello)"
+          printf '%s\n' "$out"
+          printf '%s\n' "$out" | grep -q 'Hello, Halis!'
+          echo "SMOKE OK: ${{ matrix.name }}"
+
+      - name: Verify bootstrap invariant + smoke run (Windows)
+        if: runner.os == 'Windows'
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          mkdir -p smoke
+          # (a) The compiler must regenerate its own C source byte-for-byte
+          #     — the exact gate `make bootstrap` steps 3+4 enforce.
+          ./bin/hlc src/hlc.hls smoke/hlc_selfcheck.c
+          diff -q bin/hlc.c smoke/hlc_selfcheck.c
+          # (b) Compile a real program end-to-end and run it. MSYS2 bash
+          #     resolves ./bin/hlc to bin/hlc.exe automatically.
+          ./bin/hlc examples/hello.hls smoke/hello.c
+          ${{ matrix.cc }} -O2 -o smoke/hello smoke/hello.c -lm -pthread
+          out="$(./smoke/hello)"
+          printf '%s\n' "$out"
+          printf '%s\n' "$out" | grep -q 'Hello, Halis!'
+          echo "SMOKE OK: ${{ matrix.name }}"
+
+      # ---- Package ------------------------------------------------------------
+      - name: Package archive (tar.gz)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          V="${GITHUB_REF_NAME}"
+          P="${{ matrix.name }}"
+          mkdir -p "stage/halis-${V}" dist
+          cp bin/hlc "stage/halis-${V}/hlc"
+          cp LICENSE README.md "stage/halis-${V}/"
+          tar -C stage -czf "dist/halis-${V}-${P}.tar.gz" "halis-${V}"
+          echo "Built: dist/halis-${V}-${P}.tar.gz"
+
+      - name: Package archive (zip)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $v = $env:GITHUB_REF_NAME
+          $p = "${{ matrix.name }}"
+          New-Item -ItemType Directory -Force -Path "stage/halis-$v", "dist" | Out-Null
+          Copy-Item bin/hlc.exe "stage/halis-$v/hlc.exe"
+          Copy-Item LICENSE "stage/halis-$v/"
+          Copy-Item README.md "stage/halis-$v/"
+          Compress-Archive -Path "stage/halis-$v" -DestinationPath "dist/halis-$v-$p.zip"
+          Get-ChildItem dist
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pkg-${{ matrix.name }}
+          path: dist/*
+          if-no-files-found: error
+
+  # ============================================================================
+  # Collect, checksum, publish — tag builds only.
+  # ============================================================================
+  release:
+    name: GitHub Release (SHA256SUMS + publish)
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Collect all platform archives
+        uses: actions/download-artifact@v4
+        with:
+          pattern: pkg-*
+          merge-multiple: true
+          path: dist
+
+      - name: Generate and verify SHA256SUMS
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum * > SHA256SUMS
+          sha256sum --check --strict SHA256SUMS
+          echo "----- SHA256SUMS -----"
+          cat SHA256SUMS
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          prerelease: true
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          body: |
+            Native **`hlc`** compiler binaries for `${{ github.ref_name }}`, built by the Stage-0 Python bootstrap (`boot/`) on GitHub-hosted runners.
+
+            **Assets** — each archive contains `hlc`, `LICENSE` and `README.md`:
+
+            | File | Platform |
+            |------|----------|
+            | `halis-${{ github.ref_name }}-linux-x86_64.tar.gz` | Linux x86_64 |
+            | `halis-${{ github.ref_name }}-linux-aarch64.tar.gz` | Linux aarch64 |
+            | `halis-${{ github.ref_name }}-macos-x86_64.tar.gz` | macOS x86_64 (Intel) |
+            | `halis-${{ github.ref_name }}-macos-aarch64.tar.gz` | macOS aarch64 (Apple silicon) |
+            | `halis-${{ github.ref_name }}-windows-x86_64.zip` | Windows x86_64 |
+            | `halis-${{ github.ref_name }}-windows-aarch64.zip` | Windows aarch64 |
+            | `SHA256SUMS` | checksums for all of the above |
+
+            **Verify** after downloading:
+
+            ```
+            sha256sum --check SHA256SUMS
+            ```
+
+            **Bootstrap guarantee**: every binary re-compiled `src/hlc.hls` to the byte-identical `hlc.c` the Stage-0 seed produced (the `make bootstrap` determinism gate) and was smoke-tested on `examples/hello.hls` before packaging. Built without libcurl — `net_tls_get` panics with a clear message; all other net builtins work.
+          files: |
+            dist/**
