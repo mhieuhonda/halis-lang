@@ -272,6 +272,19 @@ class Parser:
             # flag; the checker requires #[secrets(...)] on the same
             # fn so the claim names what it covers.
             "ct": False,
+            # Stage 109 (v0.128.0-alpha): the FFI taint marking. Both
+            # are ONLY valid inside extern blocks — parse_attributes
+            # (the fn/let attribute parser) rejects them explicitly so
+            # the error names the rule, and parse_extern_block parses
+            # them with its own mini-grammar before each `fn`.
+            #   taint_source  - the C side returns UNTRUSTED data; the
+            #                   checker wraps every call result as
+            #                   tainted[ret]
+            #   taint_sinks   - param names that are DECLARED sinks;
+            #                   a tainted argument there gets the
+            #                   dedicated sink diagnostic
+            "taint_source": False,
+            "taint_sinks": [],
         }
 
     def parse_attributes(self):
@@ -302,7 +315,11 @@ class Parser:
             align(N)         - Stage 84: align this fn's entry to N bytes
                               (a power of two)
         Multiple `#[...]` lists may precede a single fn (each
-        accumulates). `hot` and `cold` are mutually exclusive; likewise
+        accumulates). The extern-block-only attributes #[taint_source]
+        and #[taint_sink(...)] (Stage 109) are REJECTED here — they are
+        parsed by parse_extern_block's own mini-grammar, and seeing one
+        on a normal fn is a mistake worth naming, not an "unknown
+        attribute". `hot` and `cold` are mutually exclusive; likewise
         `inline(always)` and `inline(never)`. `tail_call` is mutually
         exclusive with `irq_handler` (an interrupt frame must return
         via IRETQ, never jump) and with `inline(always)` (the loop
@@ -528,6 +545,18 @@ class Parser:
                                  "per-function — one #[ct] is all a fn "
                                  "carries)", t0)
                     self.cur_attrs["ct"] = True
+                elif attr_name == "taint_source" or attr_name == "taint_sink":
+                    # Stage 109 (v0.128.0-alpha): the FFI taint marking
+                    # lives INSIDE extern blocks only — the boundary is
+                    # the thing being annotated, and parse_extern_block
+                    # carries its own mini-grammar for exactly these
+                    # two. On a normal fn the marking would be silent
+                    # dead weight (the checker would have to ignore
+                    # it), so the parser names the rule instead.
+                    self.err("'%s' is an extern-block attribute — place "
+                             "it inside extern \"C\" { ... }, directly "
+                             "before the extern fn declaration it "
+                             "annotates" % attr_name, t0)
                 elif attr_name == "stack" or attr_name == "boxed":
                     # Stage 30 (v0.47.0-alpha): #[stack] / #[boxed] are
                     # LET-BINDING attributes (they control the layout of a
@@ -543,7 +572,8 @@ class Parser:
                              "inline(never), hot, cold, no_red_zone, "
                              "irq_handler, stack_size(N), tail_call, "
                              "panic_handler, section(\"NAME\"), align(N), "
-                             "secrets(NAMES), ct)"
+                             "secrets(NAMES), ct, and — inside extern "
+                             "blocks only — taint_source, taint_sink(ARGS))"
                              % attr_name, t0)
                 if self.at_sym(","):
                     self.next()
@@ -738,6 +768,32 @@ class Parser:
         Each `fn` declaration has NO body (just a signature). The
         `uses IO` clause is REQUIRED unless `pure` is declared — the
         safe default for FFI is to assume side effects.
+
+        Stage 109 (v0.128.0-alpha): each `fn` may carry the FFI taint
+        marking — one or more `#[...]` lists directly before the `fn`,
+        holding ONLY:
+            #[taint_source]        - the C side returns UNTRUSTED data
+                                     (getenv, recv, fgets, ...). The
+                                     checker types every call result
+                                     as tainted[ret], so the value
+                                     must be sanitised or explicitly
+                                     unwrapped before it reaches a
+                                     sink — the FFI boundary becomes
+                                     a first-class taint source.
+            #[taint_sink(p, ...)]  - the named parameters are DECLARED
+                                     sinks (system()'s command, a
+                                     write buffer, ...). The checker
+                                     already rejects every tainted
+                                     argument at every extern call
+                                     (the Stage 15 soundness rule);
+                                     the marking gives the named
+                                     parameters the dedicated
+                                     taint-sink diagnostic and lists
+                                     them in the hlprove --taint
+                                     census.
+        Anything else in the list is a parse error, and the same two
+        names are rejected by parse_attributes on normal fns — the
+        boundary is the only thing they annotate.
         """
         t0 = self.eat_kw("extern")
         abi_tok = self.peek()
@@ -752,6 +808,74 @@ class Parser:
         self.eat_sym("{")
         decls = []
         while not self.at_sym("}"):
+            # Stage 109 (v0.128.0-alpha): the per-fn FFI taint marking.
+            # A mini-grammar on purpose — parse_attributes would accept
+            # (and then store) the whole fn-attribute vocabulary, and a
+            # #[hot] on a declaration the C compiler never sees would
+            # silently mean nothing. Only the two taint names are legal
+            # here; everything else is rejected with the rule named.
+            while self.at_sym("#"):
+                hash_tok = self.next()  # consume '#'
+                self.eat_sym("[")
+                while not self.at_sym("]"):
+                    attr_tok = self.eat_ident()
+                    attr_name = attr_tok["v"]
+                    if attr_name == "taint_source":
+                        if self.cur_attrs["taint_source"]:
+                            self.err("taint_source attribute appears more "
+                                     "than once on one extern fn (one "
+                                     "#[taint_source] is all a boundary "
+                                     "carries)", hash_tok)
+                        self.cur_attrs["taint_source"] = True
+                    elif attr_name == "taint_sink":
+                        if self.cur_attrs["taint_sinks"]:
+                            self.err("taint_sink attribute appears more "
+                                     "than once on one extern fn (merge "
+                                     "all parameter names into a single "
+                                     "#[taint_sink(...)] list)", hash_tok)
+                        self.eat_sym("(")
+                        if self.at_sym(")"):
+                            self.err("#[taint_sink(...)] needs at least "
+                                     "one parameter name (an empty list "
+                                     "sinks nothing, which hides the "
+                                     "hazard it exists to name)", hash_tok)
+                        names = []
+                        while not self.at_sym(")"):
+                            nt = self.peek()
+                            if nt["k"] != "ident":
+                                self.err("taint_sink expects a "
+                                         "comma-separated list of "
+                                         "parameter names but got %s"
+                                         % self._desc(), nt)
+                            self.next()
+                            nname = nt["v"]
+                            if nname in names:
+                                self.err("parameter '%s' appears more "
+                                         "than once in one "
+                                         "#[taint_sink(...)] list"
+                                         % nname, nt)
+                            names.append(nname)
+                            if self.at_sym(","):
+                                self.next()
+                            elif not self.at_sym(")"):
+                                self.err("expected ',' or ')' in "
+                                         "taint_sink list")
+                        self.eat_sym(")")
+                        self.cur_attrs["taint_sinks"] = names
+                    else:
+                        self.err("unknown extern-block attribute '%s' "
+                                 "(inside extern blocks only "
+                                 "taint_source and taint_sink(PARAMS) "
+                                 "are valid; the codegen attributes "
+                                 "(inline, hot, section, ...) belong to "
+                                 "the C side and cannot annotate a "
+                                 "declaration)" % attr_name, hash_tok)
+                    if self.at_sym(","):
+                        self.next()
+                    elif not self.at_sym("]"):
+                        self.err("expected ',' or ']' in extern-block "
+                                 "attribute list")
+                self.eat_sym("]")
             if not self.at_kw("fn"):
                 self.err("extern block can only contain fn declarations")
             fn_decl = self.parse_fn(None, extern=True)
@@ -759,6 +883,9 @@ class Parser:
                 self.err("extern fn '%s' must declare `uses IO` (or `pure`) "
                          "— FFI is unsafe by default" % fn_decl["name"], t0)
             decls.append(fn_decl)
+            # Stage 109: the marking is per-fn — reset before the next
+            # declaration reads it.
+            self.reset_cur_attrs()
         self.eat_sym("}")
         return {"abi": abi, "decls": decls, "line": t0["line"]}
 
@@ -1021,6 +1148,10 @@ class Parser:
                 # Stage 28+29: extern fns are not allowed to carry HLS
                 # attributes (the FFI signature is the C ABI; inlining,
                 # interrupt frame layout etc. belong to the C side).
+                # Stage 109: EXCEPT the FFI taint marking, which the
+                # extern-block mini-grammar stores in cur_attrs — it is
+                # consumed top-level (the checker and the hlprove
+                # --taint census read these two keys directly).
                 "attrs": {"stack_size": -1, "no_red_zone": False,
                           "irq_handler": False, "irq_vector": -1,
                           "inline": "",
@@ -1028,6 +1159,9 @@ class Parser:
                           "tail_call": False, "panic_handler": False,
                           "section": "", "align": -1,
                           "secrets": [], "ct": False},
+                # Stage 109 (v0.128.0-alpha): the FFI taint marking.
+                "taint_source": self.cur_attrs["taint_source"],
+                "taint_sinks": list(self.cur_attrs["taint_sinks"]),
             }
         # Stage 17 (v0.28.0-alpha): optional contract clauses —
         # `requires <bool-expr>` then/and `ensures <bool-expr>`, parsed

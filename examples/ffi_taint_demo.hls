@@ -1,0 +1,65 @@
+# ============================================================================
+# ffi_taint_demo.hls — Stage 109 (v0.128.0-alpha): taint-tracking through
+# FFI boundaries.
+# ----------------------------------------------------------------------------
+# Until now the taint lattice had one blind spot: the FFI boundary itself.
+# Data RETURNED from an extern call was trusted unconditionally — a
+# `getenv` or a `recv` result could flow straight into a sink, because the
+# checker had no way to know the C side returns attacker-controlled bytes.
+#
+# Stage 109 makes the boundary a first-class citizen of the lattice:
+#   #[taint_source]        the C side returns UNTRUSTED data — every call
+#                          result is typed tainted[ret], exactly like the
+#                          built-in sources (tainted_args, read_line, ...).
+#   #[taint_sink(p, ...)]  the named parameters are DECLARED sinks — a
+#                          tainted argument there gets the dedicated
+#                          taint-sink diagnostic (and the blanket Stage 15
+#                          rule still guards every unmarked parameter).
+#
+# This demo marks libc's dirname() as a taint source (a path is
+# attacker-controlled the moment it might come from the environment),
+# then walks the value through the ordinary lattice: pure queries,
+# concatenation, a sanitizer, and the explicit escape hatch.
+#
+# Audit the flows with:
+#   python3 tools/hlprove.py examples/ffi_taint_demo.hls --taint
+# ============================================================================
+
+import "std.sanitize"
+import "std.taint"
+
+extern "C" {
+    # dirname() returns the parent directory of the path — untrusted
+    # in and untrusted out, so the return is marked a taint source.
+    #[taint_source]
+    fn dirname(p: str) -> str uses IO
+}
+
+# A helper the taint flows THROUGH: the parameter is tainted (the fixpoint
+# in hlprove --taint marks it), and the taint survives the concat.
+fn build_config_path(dir: tainted[str]) -> tainted[str] {
+    return taint_concat(dir, taint_mark("/app.conf"))
+}
+
+fn main() -> int uses IO {
+    # 1. The FFI source: `raw` is tainted[str], typed by the checker
+    #    from the #[taint_source] marking on dirname.
+    let raw: tainted[str] = dirname("project/bin/tool.hls")
+    println("dirname: " + taint_check_len(raw).to_str())  # prints 11
+
+    # 2. The taint flows through a user fn and survives the concat.
+    let cfg: tainted[str] = build_config_path(raw)
+    println("config path len: " + taint_check_len(cfg).to_str())
+
+    # 3. A sanitizer cuts the chain: the result is a CLEAN str.
+    let clean_dir: str = sanitize_path(raw)
+    println("clean dir: " + clean_dir)
+
+    # 4. The explicit escape hatch: unwrapped data is clean-typed, but
+    #    hlprove --taint lists the site (with provenance ffi:dirname)
+    #    so the accepted risk is on the record.
+    let raw_dir: str = taint_unwrap(raw)
+    println("raw dir (unwrapped): " + raw_dir)
+
+    return 0
+}

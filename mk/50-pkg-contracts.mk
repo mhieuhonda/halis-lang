@@ -462,3 +462,20 @@ reverify-selftest:
 reverify-acceptance:
 	@echo "[Stage 108 acceptance] running tests/reverify_acceptance.py..."
 	@$(PYTHON) tests/reverify_acceptance.py
+
+# ============================================================================
+# Stage 109 (v0.128.0-alpha): taint-tracking through FFI boundaries
+# ============================================================================
+
+# The FFI taint-flow report on any entry file:
+# make ffi-taint F=examples/ffi_taint_demo.hls
+ffi-taint:
+	@python3 tools/hlprove.py $(F) --taint
+
+# Stage 109 acceptance gate: the parser batteries (both front-ends), the
+# checker rules (source wrap, sink diagnostics, the well-formedness
+# refusals), the audit-parity census, the hlprove --taint report (pinned
+# lines), the demo + ok-test parity, the fail tests and the tools.
+ffi-taint-acceptance: $(BIN)/hlc
+	@echo "[Stage 109 acceptance] running tests/ffi_taint_acceptance.py..."
+	@$(PYTHON) tests/ffi_taint_acceptance.py

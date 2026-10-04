@@ -144,21 +144,33 @@ class InterpExtern(object):
                           getattr(self, "line", 0)) from None
         # Convert the return value back to HLS runtime values.
         if ret == "int":
-            return int(result) if result is not None else 0
-        if ret == "float":
-            return float(result) if result is not None else 0.0
-        if ret == "bool":
-            return bool(result) if result is not None else False
-        if ret == "str":
+            result = int(result) if result is not None else 0
+        elif ret == "float":
+            result = float(result) if result is not None else 0.0
+        elif ret == "bool":
+            result = bool(result) if result is not None else False
+        elif ret == "str":
             # c_char_p returns bytes (null-terminated).
             if result is None:
-                return b""
-            if isinstance(result, bytes):
-                return result
-            return bytes(result)
-        if ret == "void":
+                result = b""
+            elif isinstance(result, bytes):
+                result = result
+            else:
+                result = bytes(result)
+        elif ret == "void":
             return None
-        # Opaque pointer -> int (the raw address).
-        return int(result) if result is not None else 0
+        else:
+            # Opaque pointer -> int (the raw address).
+            result = int(result) if result is not None else 0
+        # Stage 109 (v0.128.0-alpha): #[taint_source] — the checker
+        # typed this call's result as tainted[ret], and the runtime
+        # representation of a tainted[T] is the wrapper dict, so the
+        # raw C value is wrapped here. Downstream, taint_unwrap /
+        # sanitize_* consume the wrapper exactly as they consume the
+        # other taint sources (tainted_args, read_file_tainted,
+        # read_line) — checker and interpreter agree on the shape.
+        if fn.get("taint_source", False):
+            return {"tainted": True, "value": result}
+        return result
 
     # ---------- statements ----------

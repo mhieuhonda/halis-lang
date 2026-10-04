@@ -81,6 +81,28 @@ class CheckerCall(object):
                     first_at[i] = at
                     if at == "never":
                         continue
+                    # Stage 109 (v0.128.0-alpha): a parameter named in
+                    # #[taint_sink(...)] gets the DEDICATED sink
+                    # diagnostic — the blanket Stage 15 rule would
+                    # reject the argument anyway, but the sink marking
+                    # says the author KNOWS this position is a sink, so
+                    # the error should read as one (with the sanitizer
+                    # guidance) rather than as a generic boundary
+                    # refusal. Checked before the generic rule for the
+                    # same reason reject_tainted_at_sink runs before
+                    # the plain type match: the actionable message
+                    # must not be shadowed.
+                    if is_taint(at) and pn in (fn.get("taint_sinks") or []):
+                        self.err(
+                            "taint-sink violation: extern '%s' argument "
+                            "%d ('%s') is tainted[%s] — the parameter is "
+                            "declared #[taint_sink(...)] (tainted values "
+                            "must be sanitised before reaching a sink — "
+                            "use a sanitizer from std.sanitize, or "
+                            "taint_unwrap() if you accept the risk)"
+                            % (name, i + 1, pn,
+                               type_args(at)[0] if type_args(at) else "?"),
+                            a)
                     if is_taint(at):
                         self.err(
                             "extern call to '%s': argument %d ('%s') is "
@@ -180,6 +202,21 @@ class CheckerCall(object):
                                           for pn in consts)), e)
             if typeparams:
                 return instantiate_type(fn["ret"], type_map)
+            # Stage 109 (v0.128.0-alpha): #[taint_source] — the C side
+            # returns untrusted data, so the checker hands the call
+            # site a tainted[ret] instead of the declared ret. From
+            # here the ordinary taint lattice takes over: the value
+            # propagates as tainted[T] through locals, params and
+            # returns, and every sink (builtin or #[taint_sink] extern
+            # parameter) refuses it until a sanitizer or taint_unwrap
+            # vouches for it. The runtime representation is the taint
+            # wrapper dict (the interpreter's call_extern wraps the raw
+            # C result for exactly these fns), so check and execution
+            # agree. Externs are never generic (the ctypes path has no
+            # instantiation), so the wrap sits after the generic
+            # branch — unreachable for a marked extern.
+            if fn.get("taint_source", False) and fn["ret"] != "void":
+                return "tainted[" + fn["ret"] + "]"
             return fn["ret"]
         self.err("function does not exist: %s" % name, e)
 

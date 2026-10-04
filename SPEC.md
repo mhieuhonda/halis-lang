@@ -6791,3 +6791,132 @@ table and the seed mapping.
 - **the report** — the schema, the sections, the versioned file;
 - **the tools** — hlfmt stable and already-formatted, hllint clean
   on the new sources.
+
+---
+
+## 63. Taint-tracking through FFI boundaries (Stage 109 — v0.128.0-alpha)
+
+### 63.1. The blind spot and the closing
+
+Since Stage 10 the taint lattice has tracked untrusted data with a
+simple, sound rule: a `tainted[T]` value may not reach a sink, and
+three built-in sources (`tainted_args`, `read_file_tainted`,
+`read_line`) create it. But the lattice had a blind spot exactly where
+untrusted data is born most often: the FFI boundary. An extern call's
+return value was TRUSTED unconditionally — a `getenv`, a `recv`, a
+`fgets` result flowed into the program with the type system's full
+endorsement, and the sink rules never fired. Stage 109 closes the
+boundary: the marking of an extern as a taint source or a sink is now
+part of the language, enforced by both front-ends, auditable by a
+report, and visible in the audit.
+
+### 63.2. The two attributes
+
+Both are extern-block-only (the parser rejects them on normal
+functions with a message that names the placement rule; the codegen
+attributes belong to the C side and cannot annotate a declaration):
+
+```
+extern "C" {
+    #[taint_source]
+    fn getenv(name: str) -> str uses IO
+
+    #[taint_sink(cmd)]
+    fn system(cmd: str) -> int uses IO
+}
+```
+
+- **`#[taint_source]`** — the C side returns UNTRUSTED data. Every
+  call site's result is typed `tainted[ret]`: the ordinary taint
+  lattice takes over from there, and the value reaches a sink only
+  after a sanitizer (`std.sanitize`) or the explicit hatch
+  (`taint_unwrap`). A `void` return is refused (there is no value for
+  the lattice to carry — the marking would read as a guarantee the
+  type system cannot hold). The C type of `tainted[T]` is the same as
+  `T`, so the emitted call code is byte-identical: the wrap is a
+  check-time property, the same trick the built-in sources use. The
+  interpreter's ctypes path wraps the raw result in the taint wrapper
+  dict, so check and execution agree on the representation.
+- **`#[taint_sink(p, ...)]`** — the named parameters are DECLARED
+  sinks. The Stage 15 soundness rule already rejects every tainted
+  argument at every extern call (a C function like `system()` turns a
+  `tainted[str]` into a shell-injection vector); the marking gives
+  the named parameters the dedicated taint-sink diagnostic — with the
+  sanitizer guidance — instead of the generic boundary refusal, and
+  lists them in the census. Every name must resolve to the extern's
+  own parameters (a typo'd name would sink nothing and hide the
+  hazard it exists to name).
+
+Both front-ends enforce the same rules with the same words: the boot
+checker's signature pass (`check_ffi_taint_attrs`) mirrors the
+self-hosted checker's, and the call-site diagnostics are identical.
+
+### 63.3. The census — `--audit`
+
+Both `--audit` implementations print a Stage 109 census of every
+extern boundary, word for word the same (the gate compares them):
+
+```
+  FFI taint marking (Stage 109):
+    #[taint_source] externs (returns untrusted, typed tainted[ret]): 1
+    - dirname: -> str
+    #[taint_sink(...)] externs (declared sinks): 1
+    - system: cmd
+    Unmarked externs (returns TRUSTED by the taint lattice): 0
+```
+
+An unmarked extern is listed as returning data the lattice TRUSTS —
+the auditor's reminder that an unmarked boundary is a decision, not
+an absence.
+
+### 63.4. The report — `hlprove --taint`
+
+```
+python3 tools/hlprove.py FILE --taint
+```
+
+The checker polices the boundary statically; the report answers the
+auditor's question the type system deliberately does not decide:
+WHICH data escaped through the hatch, FROM WHERE, and did it ever get
+near a sink. First the census (every extern: `SOURCE` / `SINK` /
+`unmarked`, with its signature). Then, per function:
+
+- **SOURCE** — every `#[taint_source]` call site and every builtin
+  source call, with the provenance label (`ffi:getenv`,
+  `builtin:tainted_args`);
+- **UNWRAP** — every `taint_unwrap` site whose inner value carries
+  provenance (the accepted-risk escapes);
+- **SANITISED** — every sanitizer call that cuts a chain;
+- **SINK-REACH** — every sink an unwrapped value reaches (a builtin
+  sink position, or a `#[taint_sink(...)]` parameter), with the flow's
+  provenance.
+
+Provenance is tracked flow-sensitively over two environments
+(`tainted` and `escaped`, unwrapped-data-that-carried-taint) with
+branch joins and loop widening, and interprocedurally by a monotone
+fixpoint over the call graph (a user function called with untrusted
+data marks its parameter; its report lists the incoming chains).
+Argument provenance stops at an extern boundary — an extern's return
+semantics are the C side's, untrusted only when marked. The total
+line pins the shape:
+
+```
+  FFI TAINT TOTAL: 1 source sites, 4 unwrap escapes, 1 sink-reaching
+  flows, 1 sanitised cuts
+```
+
+Analysis-only (exit 0 either way): the checker's rules are the teeth,
+the report is the map.
+
+### 63.5. The gate
+
+`make ffi-taint F=...` prints the report; `ffi-taint-acceptance` runs
+`tests/ffi_taint_acceptance.py` (seven sections, 42 checks): the
+parser batteries (the placement rule, the mini-grammar refusals), the
+checker rules (the wrap, the sink diagnostic, the void-source and
+unknown-name refusals, the blanket Stage 15 rule intact), the
+interpreter runtime over the wrapper dict, the census parity between
+the front-ends, the pinned report lines, the demo and ok-test (the
+native half only when `bin/hlc` exists — `dirname`'s `libgen.h`
+declaration is not pulled in by the runtime prologue, so the emitted
+forward declaration conflicts with nothing), and the tools.

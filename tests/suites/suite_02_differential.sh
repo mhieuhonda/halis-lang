@@ -163,6 +163,27 @@ else
     bad "hlprove --sidechannel findings missing on the demo"
 fi
 
+# Stage 109: taint-tracking through FFI boundaries. The demo's report
+# must census the boundary (1 source), name the entry point with its
+# provenance, cut on the sanitizer, list the accepted-risk sink flow,
+# and end on the pinned total.
+ft_out=$(python3 tools/hlprove.py examples/ffi_taint_demo.hls --taint 2>/dev/null); ft_rc=$?
+if [ "$ft_rc" -eq 0 ] && echo "$ft_out" | grep -q "FFI TAINT TOTAL:"; then
+    ok "hlprove --taint runs on the FFI-taint demo"
+else
+    bad "hlprove --taint wrong on the demo (rc=$ft_rc)"
+fi
+if echo "$ft_out" | grep -qF 'dirname(p: str) -> str  [SOURCE #[taint_source]' \
+   && echo "$ft_out" | grep -qF 'boundary census: 1 source(s), 0 sink(s), 0 unmarked' \
+   && echo "$ft_out" | grep -qF 'SOURCE — `dirname("...")` (from ffi:dirname)' \
+   && echo "$ft_out" | grep -qF 'SANITISED — `sanitize_path(raw)` (from ffi:dirname)' \
+   && echo "$ft_out" | grep -qF 'SINK-REACH — `println(("..." + raw_dir))` (from ffi:dirname)' \
+   && echo "$ft_out" | grep -qF 'FFI TAINT TOTAL: 1 source sites, 4 unwrap escapes, 1 sink-reaching flows, 1 sanitised cuts'; then
+    ok "hlprove --taint reports the census, the provenance and the pinned total"
+else
+    bad "hlprove --taint findings missing on the demo"
+fi
+
 # Stage 102: the constant-time verifier. The demo's claims must all
 # verify (exit 0); the policy note and the transitive reach must be
 # printed; and a violated claim must exit 1 — the verifier's teeth.

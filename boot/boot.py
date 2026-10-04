@@ -880,6 +880,44 @@ def print_audit(program, checker):
         else:
             print("    %s (0):" % bname)
 
+    # Stage 109 (v0.128.0-alpha): the FFI taint marking — the census of
+    # every extern boundary. #[taint_source] externs return untrusted
+    # data (every call result is typed tainted[ret]); #[taint_sink(...)]
+    # externs declare the parameters that are sinks; every other extern
+    # is listed as returning data the taint lattice TRUSTS — the
+    # auditor's reminder that an unmarked boundary is a decision, not
+    # an absence. Word-for-word what the self-hosted --audit prints
+    # (the gate compares the two).
+    ffi_src_rows = []
+    ffi_sink_rows = []
+    ffi_plain_rows = []
+    for key, fn in fns.items():
+        if not fn.get("extern", False):
+            continue
+        if fn.get("taint_source"):
+            ffi_src_rows.append("    - %s: -> %s" % (key, fn.get("ret")))
+        if fn.get("taint_sinks"):
+            ffi_sink_rows.append("    - %s: %s"
+                                 % (key, ", ".join(fn["taint_sinks"])))
+        if not fn.get("taint_source") and not fn.get("taint_sinks"):
+            ffi_plain_rows.append("    - %s: -> %s" % (key, fn.get("ret")))
+    if not (ffi_src_rows or ffi_sink_rows or ffi_plain_rows):
+        print("  FFI taint marking (Stage 109): no extern declarations.")
+    else:
+        print("  FFI taint marking (Stage 109):")
+        print("    #[taint_source] externs (returns untrusted, typed "
+              "tainted[ret]): %d" % len(ffi_src_rows))
+        for row in ffi_src_rows:
+            print(row)
+        print("    #[taint_sink(...)] externs (declared sinks): %d"
+              % len(ffi_sink_rows))
+        for row in ffi_sink_rows:
+            print(row)
+        print("    Unmarked externs (returns TRUSTED by the taint "
+              "lattice): %d" % len(ffi_plain_rows))
+        for row in ffi_plain_rows:
+            print(row)
+
 
 def print_ir(program, lto: bool = False):
     """Stage 11 (v0.9.0-alpha): print the HLIR of a program."""

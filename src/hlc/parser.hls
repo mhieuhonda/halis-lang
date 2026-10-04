@@ -375,6 +375,11 @@ fn reset_cur_attrs(ctx: Ctx) -> void {
     ctx.cur_attrs_secrets = ""
     # Stage 102 (v0.121.0-alpha): reset the #[ct] claim too.
     ctx.cur_attrs_ct = false
+    # Stage 109 (v0.128.0-alpha): reset the FFI taint marking too —
+    # a declaration without the annotation never inherits the previous
+    # extern fn's #[taint_source] / #[taint_sink(...)].
+    ctx.cur_attrs_taint_source = false
+    ctx.cur_attrs_taint_sinks = ""
     # Stage 30: let-binding attrs are reset by parse_let itself (they
     # apply to exactly one statement); also clear here for belt-and-
     # braces so no state leaks between declarations.
@@ -613,6 +618,15 @@ fn parse_attributes(ctx: Ctx) -> void {
                     perr_at(ctx, "ct attribute appears more than once on one function (the claim is per-function — one #[ct] is all a fn carries)", hash_tok)
                 }
                 ctx.cur_attrs_ct = true
+            } else if attr_name == "taint_source" || attr_name == "taint_sink" {
+                # Stage 109 (v0.128.0-alpha): the FFI taint marking lives
+                # INSIDE extern blocks only — the boundary is the thing
+                # being annotated, and parse_extern_block carries its
+                # own mini-grammar for exactly these two. On a normal fn
+                # the marking would be silent dead weight (the checker
+                # would have to ignore it), so the parser names the
+                # rule instead.
+                perr_at(ctx, "'" + attr_name + "' is an extern-block attribute — place it inside extern \"C\" { ... }, directly before the extern fn declaration it annotates", hash_tok)
             } else if attr_name == "stack" || attr_name == "boxed" {
                 # Stage 30 (v0.47.0-alpha): #[stack] / #[boxed] are
                 # LET-BINDING attributes (they control the boxed-vs-stack
@@ -621,7 +635,7 @@ fn parse_attributes(ctx: Ctx) -> void {
                 # them at the let statement form.
                 perr_at(ctx, "'" + attr_name + "' is a let-binding attribute — place it inside a function, directly before a 'let' statement (e.g. #[" + attr_name + "] let xs: list[int] = [1, 2, 3])", hash_tok)
             } else {
-                perr_at(ctx, "unknown attribute '" + attr_name + "' (known: inline(always), inline(never), hot, cold, no_red_zone, irq_handler(N), stack_size(N), tail_call, panic_handler, section(\"NAME\"), align(N), secrets(NAMES), ct)", hash_tok)
+                perr_at(ctx, "unknown attribute '" + attr_name + "' (known: inline(always), inline(never), hot, cold, no_red_zone, irq_handler(N), stack_size(N), tail_call, panic_handler, section(\"NAME\"), align(N), secrets(NAMES), ct, and — inside extern blocks only — taint_source, taint_sink(ARGS))", hash_tok)
             }
             if at_sym(ctx, ",") {
                 ctx.pos = ctx.pos + 1
@@ -1105,7 +1119,12 @@ fn parse_fn(ctx: Ctx, impl_struct: str) -> FnInfo {
         # Stage 101: the #[secrets(...)] names, comma-joined.
         attr_secrets: ctx.cur_attrs_secrets,
         # Stage 102: the #[ct] constant-time claim.
-        attr_ct: ctx.cur_attrs_ct
+        attr_ct: ctx.cur_attrs_ct,
+        # Stage 109: normal fns never carry the FFI taint marking (the
+        # parser rejects the names outside extern blocks) — always the
+        # defaults here.
+        attr_taint_source: false,
+        attr_taint_sinks: ""
     }
 }
 
@@ -1171,6 +1190,70 @@ fn parse_extern_block(ctx: Ctx) -> void {
     }
     eat_sym(ctx, "{")
     while !at_sym(ctx, "}") {
+        # Stage 109 (v0.128.0-alpha): the per-fn FFI taint marking. A
+        # mini-grammar on purpose — parse_attributes would accept (and
+        # then store) the whole fn-attribute vocabulary, and a #[hot] on
+        # a declaration the C compiler never sees would silently mean
+        # nothing. Only the two taint names are legal here; everything
+        # else is rejected with the rule named.
+        while at_sym(ctx, "#") {
+            let hash_tok: Tok = ctx.toks.get(ctx.pos)
+            ctx.pos = ctx.pos + 1
+            eat_sym(ctx, "[")
+            while !at_sym(ctx, "]") {
+                let atok: Tok = ctx.toks.get(ctx.pos)
+                if atok.kind != "ident" {
+                    perr_at(ctx, "expected an extern-block attribute name (taint_source or taint_sink(PARAMS)) but got " + tok_desc(ctx), atok)
+                }
+                ctx.pos = ctx.pos + 1
+                if atok.value == "taint_source" {
+                    if ctx.cur_attrs_taint_source {
+                        perr_at(ctx, "taint_source attribute appears more than once on one extern fn (one #[taint_source] is all a boundary carries)", hash_tok)
+                    }
+                    ctx.cur_attrs_taint_source = true
+                } else if atok.value == "taint_sink" {
+                    if ctx.cur_attrs_taint_sinks != "" {
+                        perr_at(ctx, "taint_sink attribute appears more than once on one extern fn (merge all parameter names into a single #[taint_sink(...)] list)", hash_tok)
+                    }
+                    eat_sym(ctx, "(")
+                    let mut names: str = ""
+                    if at_sym(ctx, ")") {
+                        perr_at(ctx, "#[taint_sink(...)] needs at least one parameter name (an empty list sinks nothing, which hides the hazard it exists to name)", hash_tok)
+                    }
+                    while !at_sym(ctx, ")") {
+                        let nt: Tok = ctx.toks.get(ctx.pos)
+                        if nt.kind != "ident" {
+                            perr_at(ctx, "taint_sink expects a comma-separated list of parameter names but got " + tok_desc(ctx), nt)
+                        }
+                        ctx.pos = ctx.pos + 1
+                        let with_commas: str = "," + names + ","
+                        if with_commas.find("," + nt.value + ",") != -1 {
+                            perr_at(ctx, "parameter '" + nt.value + "' appears more than once in one #[taint_sink(...)] list", nt)
+                        }
+                        if names == "" {
+                            names = nt.value
+                        } else {
+                            names = names + "," + nt.value
+                        }
+                        if at_sym(ctx, ",") {
+                            ctx.pos = ctx.pos + 1
+                        } else if !at_sym(ctx, ")") {
+                            perr(ctx, "expected ',' or ')' in taint_sink list")
+                        }
+                    }
+                    eat_sym(ctx, ")")
+                    ctx.cur_attrs_taint_sinks = names
+                } else {
+                    perr_at(ctx, "unknown extern-block attribute '" + atok.value + "' (inside extern blocks only taint_source and taint_sink(PARAMS) are valid; the codegen attributes (inline, hot, section, ...) belong to the C side and cannot annotate a declaration)", atok)
+                }
+                if at_sym(ctx, ",") {
+                    ctx.pos = ctx.pos + 1
+                } else if !at_sym(ctx, "]") {
+                    perr(ctx, "expected ',' or ']' in extern-block attribute list")
+                }
+            }
+            eat_sym(ctx, "]")
+        }
         if !at_kw(ctx, "fn") {
             perr(ctx, "extern block can only contain fn declarations")
         }
@@ -1285,9 +1368,19 @@ fn parse_extern_block(ctx: Ctx) -> void {
             # Stage 102: externs cannot carry the claim either — a
             # constant-time promise about code the toolchain cannot
             # see would be a lie.
-            attr_ct: false
+            attr_ct: false,
+            # Stage 109 (v0.128.0-alpha): the FFI taint marking — the
+            # ONLY attributes an extern declaration carries, parsed by
+            # the mini-grammar above and consumed by the checker (the
+            # call-site taint rules) and the hlprove --taint census.
+            attr_taint_source: ctx.cur_attrs_taint_source,
+            attr_taint_sinks: ctx.cur_attrs_taint_sinks
         })
         ctx.fn_order.push(name)
+        # Stage 109: the marking is per-fn — reset before the next
+        # declaration reads it.
+        ctx.cur_attrs_taint_source = false
+        ctx.cur_attrs_taint_sinks = ""
     }
     eat_sym(ctx, "}")
 }

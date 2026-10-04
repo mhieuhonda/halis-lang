@@ -295,6 +295,11 @@ class CheckerCore(object):
         # 2.7d Stage 102 (v0.121.0-alpha): #[ct] requires #[secrets(...)]
         # on the same fn (signature-only, same pass shape).
         self.check_ct_attrs()
+        # 2.7e Stage 109 (v0.128.0-alpha): the FFI taint marking —
+        # #[taint_source] needs a value to taint (non-void return) and
+        # #[taint_sink(...)] names must resolve to the extern's own
+        # parameters (signature-only pass, like the attr checks above).
+        self.check_ffi_taint_attrs()
         # 2.7 Stage 82 (v0.101.0-alpha): per-fn #[stack_size(N)] frame
         # bounds validate on the AST only (no types needed) — the same
         # pass the self-hosted checker runs on signatures, closing the
@@ -546,6 +551,50 @@ class CheckerCore(object):
                 self.err("#[ct] on '%s' has no #[secrets(...)] — a "
                          "constant-time claim must name the parameters "
                          "it covers" % key, fn)
+
+    # ---------- Stage 109 (v0.128.0-alpha): the FFI taint marking ----------
+    # Two attributes, valid ONLY on extern fn declarations (the parser
+    # enforces the placement; this pass enforces the well-formedness):
+    #
+    #   #[taint_source] — the C side returns untrusted data. Every call
+    #     site's result is typed tainted[ret] (see CheckerCall). A void
+    #     return has no value to taint — marking one would read as a
+    #     guarantee the type system cannot carry, so it is an error.
+    #
+    #   #[taint_sink(p, ...)] — the named parameters are DECLARED
+    #     sinks. Every extern parameter already rejects tainted
+    #     arguments (the Stage 15 soundness rule); the marking gives
+    #     the named ones the dedicated taint-sink diagnostic (with the
+    #     sanitizer guidance) instead of the generic FFI-boundary
+    #     message, and lists them in the hlprove --taint census. A name
+    #     that resolves to no parameter would mark nothing — the same
+    #     argument #[secrets(...)] was given — so it is an error.
+    def check_ffi_taint_attrs(self):
+        for key, fn in self.fns.items():
+            if not fn.get("extern", False):
+                if fn.get("taint_source") or fn.get("taint_sinks"):
+                    # Unreachable through the parser (it rejects the
+                    # names on normal fns); kept as defence in depth
+                    # for ASTs built by hand or by tooling.
+                    self.err("the FFI taint marking is only valid on "
+                             "extern fn declarations — '%s' is not an "
+                             "extern" % key, fn)
+                continue
+            if fn.get("taint_source") and fn.get("ret") == "void":
+                self.err("#[taint_source] on '%s' is meaningless — the "
+                         "extern returns void, and there is no value "
+                         "for the taint lattice to carry (mark the fn "
+                         "that RETURNS the untrusted data)"
+                         % key, fn)
+            sinks = fn.get("taint_sinks") or []
+            if sinks:
+                params = [p[0] for p in fn.get("params", [])]
+                for n in sinks:
+                    if n not in params:
+                        self.err("#[taint_sink(...)] names '%s' which is "
+                                 "not a parameter of '%s' (parameters: %s)"
+                                 % (n, key, ", ".join(params) or "(none)"),
+                                 fn)
 
     # ---------- Stage 82 (v0.101.0-alpha): deterministic stack sizing ----------
     # Two halves, mirroring the self-hosted checker exactly:

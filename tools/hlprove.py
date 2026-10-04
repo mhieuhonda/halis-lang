@@ -90,6 +90,18 @@ Modes:
              as) so the violation is attributable. A violation makes
              the run exit 1 — the verifier has teeth the Stage 101
              analysis deliberately lacks.
+  --taint    Stage 109: the FFI taint-flow report. First the census:
+             every extern declaration, classified (#[taint_source] —
+             every call result is typed tainted[ret];
+             #[taint_sink(...)] — the declared sink parameters; or
+             unmarked — the taint lattice TRUSTS the return, which is
+             a decision an auditor should see). Then the flows, per
+             fn: every #[taint_source] call site, every taint_unwrap
+             escape with its provenance, every sanitizer cut, and
+             every sink an unwrapped value reaches — the accepted-risk
+             flows the hatch exists to name. Analysis-only (exit 0
+             either way; the checker's rules are the teeth, this is
+             the map).
 """
 import os
 import subprocess
@@ -101,6 +113,7 @@ from boot.boot import load_program            # noqa: E402
 from boot.checker import check                # noqa: E402
 from boot.lexer import HLError                # noqa: E402
 from boot import proof as _proof             # noqa: E402
+from boot import ffi_taint as _ffi           # noqa: E402
 
 
 def proof_report(program, checker):
@@ -726,6 +739,64 @@ def _ct_chain_text(claim, chain):
     return " -> ".join(hops)
 
 
+def ffi_taint_report(program, checker):
+    """Stage 109: the FFI taint-flow report. Prints the boundary
+    census (every extern: source / sink / unmarked), then the per-fn
+    findings (source sites, unwrap escapes, sanitizer cuts, and the
+    sink-reaching accepted-risk flows), with the incoming chains.
+    Returns the summary counts."""
+    boundaries, reports = _ffi.analyze_ffi_taint(program)
+    # ---- the census ----
+    if not boundaries:
+        print("    (no extern declarations — no FFI boundary to audit)")
+    else:
+        for b in boundaries:
+            sig = "%s(%s) -> %s" % (b.name, ", ".join(
+                "%s: %s" % (pn, pt) for pn, pt in zip(b.params, b.ptypes)),
+                b.ret)
+            if b.kind == "source":
+                print("    %s  [SOURCE #[taint_source] — every call "
+                      "result is tainted[%s]]" % (sig, b.ret))
+            elif b.kind == "sink":
+                print("    %s  [SINK #[taint_sink(%s)]]"
+                      % (sig, ", ".join(b.taint_sinks)))
+            else:
+                print("    %s  [unmarked — returns TRUSTED by the "
+                      "taint lattice]" % sig)
+    print("    boundary census: %d source(s), %d sink(s), %d unmarked"
+          % (sum(1 for b in boundaries if b.kind == "source"),
+             sum(1 for b in boundaries if b.kind == "sink"),
+             sum(1 for b in boundaries if b.kind == "unmarked")))
+    # ---- the flows ----
+    involved = sorted(reports.values(), key=lambda r: r.fn_key)
+    n_src = n_unwrap = n_sink = n_san = 0
+    for rep in involved:
+        print("  %s:" % rep.fn_key)
+        if rep.tainted_params:
+            print("    untrusted params (by propagation): %s"
+                  % ", ".join(rep.tainted_params))
+        for caller, param, line in rep.incoming:
+            print("    incoming: '%s' passes untrusted data as '%s' "
+                  "from %s (line %d)" % (param, param, caller, line))
+        for f in rep.findings:
+            if f.kind == "source":
+                n_src += 1
+            elif f.kind == "unwrap":
+                n_unwrap += 1
+            elif f.kind == "sink-reach":
+                n_sink += 1
+            elif f.kind == "sanitised":
+                n_san += 1
+            print("    line %d: %s — `%s` (from %s)"
+                  % (f.line, f.kind.upper(), f.text, f.prov))
+        if not rep.findings and not rep.tainted_params:
+            print("    CLEAN: no untrusted data enters or escapes here")
+    print("  FFI TAINT TOTAL: %d source sites, %d unwrap escapes, "
+          "%d sink-reaching flows, %d sanitised cuts"
+          % (n_src, n_unwrap, n_sink, n_san))
+    return n_src, n_unwrap, n_sink, n_san
+
+
 def suggest_invariants(program):
     """Loop-invariant suggestions (the roadmap's automatic inference
     rule set): const-bound for loops get exact bounds; while loops get
@@ -932,6 +1003,7 @@ def main():
     want_shapes = "--shapes" in args
     want_side = "--sidechannel" in args
     want_ct = "--consttime" in args
+    want_taint = "--taint" in args
     args = [a for a in args if not a.startswith("--")]
     if not args:
         sys.stderr.write(__doc__)
@@ -1014,6 +1086,13 @@ def main():
         print("  Constant-time verification (Stage 102 — the #[ct] "
               "claims are proven, not trusted):")
         ct_violated = consttime_report(program, checker)
+
+    if want_taint:
+        print("")
+        print("  FFI taint-flow report (Stage 109 — #[taint_source] "
+              "externs and #[taint_sink(...)] parameters, plus the "
+              "escape-hatch audit):")
+        ffi_taint_report(program, checker)
 
     if want_shapes:
         print("")

@@ -169,7 +169,7 @@ remains green.
 | 106 | Signed packages (minisign, ed25519) | ✅ | (done in v0.125.0-alpha) |
 | 107 | Transparency log Gossip protocol (multi-source verify) | ✅ | (done in v0.126.0-alpha) |
 | 108 | Memory-safety re-verification under `-O fast` (proof replay) | ✅ | (done in v0.127.0-alpha) |
-| 109 | Taint-tracking through FFI boundaries | ⬜ | 5 weeks |
+| 109 | Taint-tracking through FFI boundaries | ✅ | (done in v0.128.0-alpha) |
 | 110 | Sandboxed package execution (seccomp-bpf filter) | ⬜ | 5 weeks |
 | 111 | Capability token types (`Cap[Net]` as a value, not just effect) | ⬜ | 6 weeks |
 | 112 | Audit-log signing (every privileged op hashed + chained) | ⬜ | 3 weeks |
