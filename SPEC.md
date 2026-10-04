@@ -6638,3 +6638,156 @@ fork, a rollback, a rewritten history, a broken chain, a bad
 signature, an insufficient source count); 2 for usage errors.
 Gossip, verify, witness-verify and prove-verify are read-only end to
 end.
+
+## 62. `hls-reverify` — memory-safety re-verification under `-O fast` (Stage 108 — v0.127.0-alpha)
+
+### 62.1. A proof must survive its own transformations
+
+Under `-O fast` the compiler ELIDES runtime memory-safety checks —
+bounds (`xs[i]`, `byte_at`, `slice`), division-by-zero (including the
+`INT64_MIN / -1` corner), int64 overflow — wherever the interval
+prover PROVED them dead. The proofs are computed once, on the checked
+AST (`boot/proof.py` seeding `src/hlc/proof.hls`'s native mirror).
+Everything downstream — the HLIR optimiser (constant folding, copy
+propagation, DCE, inlining, LICM), every backend — is trusted to
+preserve them. Stage 108 closes that hole: the tool re-derives every
+elided check's proof on the TRANSFORMED program and reconciles it with
+the original evidence under a fail-closed law. The optimiser is no
+longer trusted; it is audited.
+
+```
+python3 tools/hls-reverify.py FILE [--lto] [--json] [--out DIR]
+python3 tools/hls-reverify.py selftest
+```
+
+### 62.2. The pipeline — baseline, transform, replay
+
+1. **BASELINE** — the checked program's memory-safety evidence:
+   every check site (kind `ovf` / `div` / `bnd`, with source line)
+   with the interval prover's verdict. Proven sites are the claims
+   `-O fast` may elide; checked sites keep their runtime check.
+   Sites the prover never visited (non-contracted functions) carry
+   no claim and are outside the law.
+2. **TRANSFORM** — the program is lowered to HLIR twice: `IR0`
+   (pre-optimisation) and `IR1`, run through the optimiser with
+   `fast=True` (`--lto` raises the cross-crate inline threshold),
+   exactly as a fast build would. The IR instructions now carry the
+   checker's result type (`attrs["ty"]`) — the verifier needs types
+   the bare IR never had (a `binop +` overflows on ints, not on
+   floats or strings).
+3. **REPLAY** — an independent abstract interpreter re-derives a
+   verdict for every check site `IR1` still contains: the same seeds
+   (`seed_from_requires` over the `requires` clauses and `where`
+   refinements), the same interval arithmetic (`boot.proof` is
+   IMPORTED, never re-implemented — one definition), the same
+   precision discipline (straight-line propagation, joins at merge
+   points, widening at loop headers via dominator back-edges, a
+   post-fixpoint containment verification that sends any still-
+   growing variable to TOP). Plus the integrity of the transformed
+   IR itself: every operand resolves to a live definition, every
+   label resolves, every def precedes its use.
+
+### 62.3. The law — fail-closed
+
+A proven claim is DISCHARGED by the transformed program when:
+
+  - the site survives and the replay re-proves it (REPLAYED), or
+  - the optimiser eliminated the site — folded to a constant or
+    dead-code eliminated (ELIMINATED: no runtime operation remains,
+    the claim is vacuous), or
+  - the site was never lowered — it sat after a `return` / `break` /
+    `continue` (UNREACHABLE: the interpreter never executed it either).
+
+A proven claim whose site SURVIVES but no longer re-proves is a
+**LOST-PROOF** — the verdict fails, exit 1. Counted conservatively
+over sites sharing one source line: `lost = max(0, P - R -
+eliminated)` (P proven claims, R re-proven survivors, eliminated =
+IR0 count minus IR1 count, after attributing the inliner's copies of
+callee bodies — which keep the callee's line numbers — back to the
+callee). The symmetric classes are informational: a checked claim
+whose site survives checked (REPLAYED-CHECKED); a survivor proving
+beyond the proven claims (NEW-PROOF — the optimiser created knowledge
+the seed prover lacked: inlining plus folding); the inliner's copies
+themselves (INLINE-DERIVED), measured but never judged.
+
+The lowering is audited too: an IR holding MORE sites than the AST
+had at the same key is a duplicated-site failure; the for-loop's
+generated element read (`v_X = list_get _, v_X__i`) is excluded by
+structure, and the exclusion is cross-checked by the count law.
+
+### 62.4. The annotation audit — two certificate classes
+
+Under `fast=True` the optimiser annotates binops it believes
+overflow-free (`attrs["safe_overflow"]`, today the algebraic
+identities `x+0`, `0+x`, `x-0`, `x*0`, `0*x`, `x*1`, `1*x`). The
+replay accepts an annotation only under an explicit certificate:
+
+  - an INTERVAL proof at that program point (the operands' intervals
+    fit int64 by `add_fits` / `sub_fits` / `mul_fits`), or
+  - a PINNED ALGEBRAIC IDENTITY — the whitelist lives in
+    `hlrev_common.ALGEBRAIC_IDENTITIES`; adding zero or multiplying
+    by zero or one cannot overflow regardless of the operand's
+    bounds, because the result IS the other operand, already a legal
+    int64.
+
+Anything else is a **FORGED ANNOTATION** — exit 1. A future optimiser
+grant that outgrows the whitelist cannot slip past the audit: it
+fails until the whitelist (or the prover) grows to cover it, with
+evidence.
+
+### 62.5. The report
+
+`hls-reverify-report/v1`: schema, tool version, entry, lto, verdict
+(`REPLAY-OK` / `REPLAY-FAILED`), the baseline counts (sites, proven,
+checked), the replay counts (sites, proven, functions, blocks), the
+per-class table, named findings, the failure classes that fired, and
+a per-function site table (baseline proven/checked, IR0/IR1 counts,
+inline-derived, eliminated, replay proven/failed, class). Serialised
+canonically (sorted keys, no whitespace) — byte-identical over an
+unchanged tree, the Stage 103–107 document discipline. `--out DIR`
+writes `hls-reverify-<entry>.report.json`.
+
+Exit contract: 0 REPLAY-OK; 1 REPLAY-FAILED or a compile refusal;
+2 usage errors. The tool is read-only end to end — it writes only
+when `--out` names a report directory. The selftest carries the
+stage's pinned numbers: 40 vectors over the interval corners (TOP
+never fits; the MIN/-1 corner; the nz set with a bounded dividend),
+the certificate whitelist, the generated-get discriminator, widening
+convergence, the integrity refusals, the replay-law classification
+table and the seed mapping.
+
+### 62.6. The gate
+
+`make reverify F=...` / `reverify-json F=...` / `reverify-lto F=...`
+/ `reverify-report F=... OUT=...` / `reverify-selftest` /
+`reverify-acceptance` run the pipeline. The acceptance gate
+(`tests/reverify_acceptance.py`, nine sections, 44 checks):
+
+- **the one definition** — the replay's arithmetic IS `boot.proof`'s
+  (function-identity pins); the certificate whitelist is pinned; the
+  selftest is green;
+- **the baseline** — the AST harvest sees exactly what the prover
+  annotated on the canonical shapes (ovf, div, bnd, slice) and
+  nothing where the prover never ran;
+- **the transform** — the site multiset is comparable across the
+  optimiser, the ty stamps ride inlining, the for-get discriminator
+  holds;
+- **the replay** — the seeded divisor re-proves; the unbounded
+  dividend, the delta-0 index bound and the MIN/-1 corner stay
+  refused on both sides; the const-range loop re-proves through the
+  IR's range container;
+- **the law** — the whole positive corpus (examples, tests/ok,
+  benchmarks) replays OK; the class table lands; re-runs are
+  byte-identical; the forged annotation and the dangling operand
+  FAIL as designed;
+- **the refusals** — type errors, missing files, negative tests and
+  IR-unsupported constructs refuse cleanly (no tracebacks); usage
+  errors exit 2;
+- **the demos** — `examples/reverify_demo.hls` (the replay's
+  arithmetic as checkable numbers) and
+  `tests/ok/feat_stage108_reverify.hls` run; interpreter and native
+  agree byte for byte (native half only when `bin/hlc` exists — the
+  gate stays hermetic);
+- **the report** — the schema, the sections, the versioned file;
+- **the tools** — hlfmt stable and already-formatted, hllint clean
+  on the new sources.

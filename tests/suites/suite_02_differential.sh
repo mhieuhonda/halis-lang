@@ -362,6 +362,34 @@ else
     ok "hls-sign refuses a tampered payload (exit 1)"
 fi
 
+# Stage 108: hls-reverify, the memory-safety re-verification under
+# -O fast (proof replay). The tool re-derives every elided check's
+# proof on the OPTIMISED IR and reconciles it with the checker's
+# baseline under a fail-closed law; the demos replay OK, the report
+# is deterministic, and the whole positive corpus re-proves.
+s108_rc=0
+python3 tools/hls-reverify.py selftest > "$TMP/s108_self.txt" 2>/dev/null \
+    || s108_rc=$?
+if [ "$s108_rc" -eq 0 ] && grep -q "40 passed / 0 failed" "$TMP/s108_self.txt"; then
+    ok "hls-reverify selftest: 40 vectors (arithmetic, widening, law, audit)"
+else
+    bad "hls-reverify selftest failed (rc=$s108_rc)"
+fi
+s108_a=$(python3 tools/hls-reverify.py tests/ok/feat_stage108_reverify.hls --json 2>/dev/null)
+s108_b=$(python3 tools/hls-reverify.py tests/ok/feat_stage108_reverify.hls --json 2>/dev/null)
+if [ -n "$s108_a" ] && [ "$s108_a" == "$s108_b" ] \
+   && echo "$s108_a" | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if (d["schema"]=="hls-reverify-report/v1" and d["verdict"]=="REPLAY-OK" and d["baseline"]["proven"]>=5) else 1)'; then
+    ok "hls-reverify: the ok-test's claims replay OK, byte-identical reruns"
+else
+    bad "hls-reverify wrong on the stage ok-test"
+fi
+s108_demo=$(python3 tools/hls-reverify.py examples/hmac_proven.hls 2>/dev/null); s108d_rc=$?
+if [ "$s108d_rc" -eq 0 ] && echo "$s108_demo" | grep -q "verdict: REPLAY-OK"; then
+    ok "hls-reverify: the HMAC demo's elisions re-prove after the optimiser"
+else
+    bad "hls-reverify failed on hmac_proven (rc=$s108d_rc)"
+fi
+
 # Stage 98: refinement types. Every refined slot is guarded at runtime
 # (fn entry / return / let / assign / construction); proven sites are
 # elided. The interpreter and the native build (default AND -O fast)

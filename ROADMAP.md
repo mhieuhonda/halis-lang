@@ -168,7 +168,7 @@ remains green.
 | 105 | Reproducible-build verification across distros | ✅ | (done in v0.124.0-alpha) |
 | 106 | Signed packages (minisign, ed25519) | ✅ | (done in v0.125.0-alpha) |
 | 107 | Transparency log Gossip protocol (multi-source verify) | ✅ | (done in v0.126.0-alpha) |
-| 108 | Memory-safety re-verification under `-O fast` (proof replay) | ⬜ | 4 weeks |
+| 108 | Memory-safety re-verification under `-O fast` (proof replay) | ✅ | (done in v0.127.0-alpha) |
 | 109 | Taint-tracking through FFI boundaries | ⬜ | 5 weeks |
 | 110 | Sandboxed package execution (seccomp-bpf filter) | ⬜ | 5 weeks |
 | 111 | Capability token types (`Cap[Net]` as a value, not just effect) | ⬜ | 6 weeks |

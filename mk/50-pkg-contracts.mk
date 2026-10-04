@@ -422,3 +422,43 @@ tlog-selftest:
 tlog-acceptance:
 	@echo "[Stage 107 acceptance] running tests/tlog_acceptance.py..."
 	@$(PYTHON) tests/tlog_acceptance.py
+
+# ============================================================================
+# Stage 108 (v0.127.0-alpha): hls-reverify — memory-safety
+# re-verification under -O fast (proof replay)
+# ============================================================================
+
+# The replay on any entry file: make reverify F=examples/hmac_proven.hls
+reverify:
+	@test "x$(F)" != "x" || (echo "Usage: make reverify F=<file.hls> [-- extra flags]" && false)
+	@python3 tools/hls-reverify.py $(F)
+
+# The machine report: make reverify-json F=...
+reverify-json:
+	@test "x$(F)" != "x" || (echo "Usage: make reverify-json F=<file.hls>" && false)
+	@python3 tools/hls-reverify.py $(F) --json
+
+# The replay under the LTO inline threshold: make reverify-lto F=...
+reverify-lto:
+	@test "x$(F)" != "x" || (echo "Usage: make reverify-lto F=<file.hls>" && false)
+	@python3 tools/hls-reverify.py $(F) --lto
+
+# A written report: make reverify-report F=... OUT=dir
+reverify-report:
+	@test "x$(F)" != "x" || (echo "Usage: make reverify-report F=<file.hls> OUT=<dir>" && false)
+	@if [ -n "$(OUT)" ]; then O="--out $(OUT)"; else O="--out build"; fi; \
+	python3 tools/hls-reverify.py $(F) $$O
+
+# The stage's pinned numbers, through the tool's front door.
+reverify-selftest:
+	@python3 tools/hls-reverify.py selftest
+
+# Stage 108 acceptance gate: the nine-section battery (the one
+# definition against boot.proof's own arithmetic, the baseline
+# harvest, the transform, the replay on the optimised IR, the law
+# over the whole positive corpus, the refusals, the demos, the
+# report, the tools). Tool-only — no solver needed; the native half
+# of the demo parity runs when bin/hlc exists.
+reverify-acceptance:
+	@echo "[Stage 108 acceptance] running tests/reverify_acceptance.py..."
+	@$(PYTHON) tests/reverify_acceptance.py

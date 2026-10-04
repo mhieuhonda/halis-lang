@@ -201,10 +201,18 @@ class IRBuilder:
         irf.blocks.append(b)
         return b
 
-    def _emit(self, op, args, line=0, dest=None):
+    def _emit(self, op, args, line=0, dest=None, ty=None):
         if dest is None:
             dest = self._fresh()
-        instr = Instr(dest=dest, op=op, args=args, line=line)
+        # Stage 108 (v0.127.0-alpha): stamp the checker-annotated RESULT
+        # type on the instruction (`attrs["ty"]`). The memory-safety
+        # re-verifier needs types the bare IR does not carry (a `binop +`
+        # on ints overflows; on floats or strings it cannot), and the
+        # type rides the instruction through the optimiser exactly like
+        # `safe_overflow` already does. Additive: attrs stays None when
+        # no type is known, so every existing consumer is unaffected.
+        attrs = {"ty": ty} if ty else None
+        instr = Instr(dest=dest, op=op, args=args, line=line, attrs=attrs)
         self._current.instrs.append(instr)
         return dest
 
@@ -221,14 +229,19 @@ class IRBuilder:
         if k == "let":
             val = self._lower_expr(stmt["value"], irf)
             dest = "v_%s" % stmt["name"]
-            self._emit(OP_LOAD, [("var", val)], stmt.get("line", 0), dest=dest)
+            self._emit(OP_LOAD, [("var", val)], stmt.get("line", 0), dest=dest,
+                       ty=stmt.get("t"))
         elif k == "assign":
             target = stmt["target"]
             val = self._lower_expr(stmt["value"], irf)
             if target["k"] == "ident":
                 dest = "v_%s" % target["name"]
+                # check_lvalue annotates the lvalue's static type on the
+                # TARGET node (lets carry s["t"] instead) — either way
+                # the store's dest (the binding) gets its type stamped.
+                bty = target.get("t") or stmt.get("vtype") or stmt.get("t")
                 self._emit(OP_STORE, [("var", val), ("name", target["name"])],
-                           stmt.get("line", 0), dest=dest)
+                           stmt.get("line", 0), dest=dest, ty=bty)
             elif target["k"] == "field":
                 recv = self._lower_expr(target["target"], irf)
                 self._emit(OP_STRUCT_SET,
@@ -321,7 +334,8 @@ class IRBuilder:
             # (deep-scan-5); an initial length computation would be a
             # dead instruction (its dest was never consumed).
             i_name = "v_%s__i" % stmt["var"]
-            self._emit(OP_CONST, [("lit", 0)], stmt.get("line", 0), dest=i_name)
+            self._emit(OP_CONST, [("lit", 0)], stmt.get("line", 0), dest=i_name,
+                       ty="int")
             cond_block = self._new_block(irf, "for_cond")
             body_block = self._new_block(irf, "for_body")
             inc_block = self._new_block(irf, "for_inc")
@@ -336,11 +350,11 @@ class IRBuilder:
             # Re-check the current length each iteration, like the
             # interpreter / C / LLVM backends do.
             cur_len = self._emit(OP_LIST_LEN, [("var", iter_name)],
-                                 stmt.get("line", 0))
+                                 stmt.get("line", 0), ty="int")
             cond_tmp = self._emit(OP_BINOP,
                                   [("op", "<"), ("var", i_name),
                                    ("var", cur_len)],
-                                  stmt.get("line", 0))
+                                  stmt.get("line", 0), ty="bool")
             self._current.terminator = Instr(None, OP_BRANCH,
                                              [("var", cond_tmp),
                                               ("label", body_block.name),
@@ -349,7 +363,8 @@ class IRBuilder:
             self._current = body_block
             v_name = "v_%s" % stmt["var"]
             self._emit(OP_LIST_GET, [("var", iter_name), ("var", i_name)],
-                       stmt.get("line", 0), dest=v_name)
+                       stmt.get("line", 0), dest=v_name,
+                       ty=stmt.get("t"))
             # `continue` targets the increment block (NOT the condition):
             # it must still bump the index before the re-check.
             self._loop_stack.append((inc_block.name, end_block.name))
@@ -363,14 +378,14 @@ class IRBuilder:
             self._current = inc_block
             inc = self._emit(OP_BINOP,
                              [("op", "+"), ("var", i_name), ("lit", 1)],
-                             stmt.get("line", 0))
+                             stmt.get("line", 0), ty="int")
             # BUG-SC-IR-1 fix: the store target must be the binding name
             # WITHOUT the "v_" prefix (the constant-folder / store handler
             # prepends "v_"). Previously this used `i_name + "__i"` which
             # produced `v_x__i__i` (double-prefixed), so the loop counter
             # was never updated — representing an infinite loop in the IR.
             self._emit(OP_STORE, [("var", inc), ("name", stmt["var"] + "__i")],
-                       stmt.get("line", 0), dest=i_name)
+                       stmt.get("line", 0), dest=i_name, ty="int")
             self._current.terminator = Instr(None, OP_JUMP,
                                              [("label", cond_block.name)], 0)
             self._current = end_block
@@ -398,13 +413,13 @@ class IRBuilder:
     def _lower_expr(self, e, irf):
         k = e["k"]
         if k == "int":
-            return self._emit(OP_CONST, [("lit", e["v"])], e.get("line", 0))
+            return self._emit(OP_CONST, [("lit", e["v"])], e.get("line", 0), ty="int")
         if k == "float":
-            return self._emit(OP_CONST, [("lit", e["v"])], e.get("line", 0))
+            return self._emit(OP_CONST, [("lit", e["v"])], e.get("line", 0), ty="float")
         if k == "bool":
-            return self._emit(OP_CONST, [("lit", e["v"])], e.get("line", 0))
+            return self._emit(OP_CONST, [("lit", e["v"])], e.get("line", 0), ty="bool")
         if k == "str":
-            return self._emit(OP_CONST, [("lit", e["v"])], e.get("line", 0))
+            return self._emit(OP_CONST, [("lit", e["v"])], e.get("line", 0), ty="str")
         if k == "ident":
             return "v_%s" % e["name"]
         if k == "bin":
@@ -412,39 +427,42 @@ class IRBuilder:
             b = self._lower_expr(e["r"], irf)
             return self._emit(OP_BINOP,
                              [("op", e["op"]), ("var", a), ("var", b)],
-                             e.get("line", 0))
+                             e.get("line", 0), ty=e.get("t"))
         if k == "un":
             a = self._lower_expr(e["e"], irf)
             return self._emit(OP_UNOP, [("op", e["op"]), ("var", a)],
-                              e.get("line", 0))
+                              e.get("line", 0), ty=e.get("t"))
         if k == "call":
             args = [self._lower_expr(a, irf) for a in e["args"]]
             arg_refs = [("var", a) for a in args]
             return self._emit(OP_CALL,
                               [("fname", e["name"])] + arg_refs,
-                              e.get("line", 0))
+                              e.get("line", 0), ty=e.get("t"))
         if k == "fieldcall" or k == "method":
             recv = self._lower_expr(e["target"], irf)
             args = [self._lower_expr(a, irf) for a in e["args"]]
             return self._emit(OP_METHOD,
                               [("name", e["name"]), ("var", recv)]
                               + [("var", a) for a in args],
-                              e.get("line", 0))
+                              e.get("line", 0), ty=e.get("t"))
         if k == "field":
             recv = self._lower_expr(e["target"], irf)
             return self._emit(OP_STRUCT_GET,
                               [("var", recv), ("name", e["name"])],
-                              e.get("line", 0))
+                              e.get("line", 0), ty=e.get("t"))
         if k == "index":
             lst = self._lower_expr(e["target"], irf)
             idx = self._lower_expr(e["idx"], irf)
+            # The index node's t IS the element type (the checker
+            # annotates the read's result type).
             return self._emit(OP_LIST_GET, [("var", lst), ("var", idx)],
-                              e.get("line", 0))
+                              e.get("line", 0), ty=e.get("t"))
         if k == "qmark":
             # The `?` operator propagates an Err variant out of the
             # enclosing function. Lower as a match + return.
             v = self._lower_expr(e["e"], irf)
-            return self._emit(OP_QMARK, [("var", v)], e.get("line", 0))
+            return self._emit(OP_QMARK, [("var", v)], e.get("line", 0),
+                              ty=e.get("t"))
         if k == "match":
             # BUG (deep-scan-5): arm bodies were stored as RAW AST — their
             # side effects and pattern bindings never appeared in the IR,
