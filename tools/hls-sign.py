@@ -66,6 +66,7 @@ from hlsign_parts import hlsign_aead as aead                     # noqa: E402
 from hlsign_parts import hlsign_ed25519 as ed                    # noqa: E402
 from hlsign_parts import hlsign_format as fmt                    # noqa: E402
 from hlsign_parts import hlsign_release as rel                   # noqa: E402
+from hlaudit_parts import hal_ops                                # noqa: E402
 
 TOOL = "hls-sign"
 
@@ -159,6 +160,11 @@ def cmd_keygen(args):
     fmt.write_secret(secret_path, seed, public, password,
                      iterations=args.iterations, comment=args.comment or "")
     fmt.write_public(pub_path, public, comment=args.comment or "")
+    # Stage 112: minting a keypair is the most privileged op the
+    # toolchain has — the audit entry names the key id, never the
+    # passphrase or the seed.
+    hal_ops.record(hal_ops.SIGN_KEYGEN, "ok", subject=fmt.key_id_hex(public),
+                   detail={"public": pub_path, "comment": args.comment or ""})
     print("== hls-sign keygen ==")
     print("  key id:   %s" % fmt.key_id_hex(public))
     print("  secret:   %s (encrypted, 0600)" % secret_path)
@@ -178,6 +184,10 @@ def cmd_sign(args):
     trusted = args.trusted_comment or fmt.default_trusted_comment(args.file)
     raw_sig, global_sig = fmt.sign_file(seed, public, payload, trusted)
     fmt.write_signature(sig_path, public, raw_sig, global_sig, trusted)
+    hal_ops.record(hal_ops.SIGN_SIGN, "ok", subject=args.file,
+                   detail={"signature": sig_path,
+                           "key_id": fmt.key_id_hex(public),
+                           "bytes": len(payload)})
     if args.json:
         print(json.dumps({
             "schema": "hls-sign/v1",
@@ -242,6 +252,12 @@ def cmd_release(args):
     statement, sig_path, st_path, rec = rel.release(
         args.dir, secret_path, password, out_dir=args.out,
         trusted_comment=args.trusted_comment)
+    hal_ops.record(hal_ops.SIGN_RELEASE, "ok",
+                   subject="%s@%s" % (statement["name"],
+                                      statement["version"]),
+                   detail={"content_sha256": statement["content_sha256"],
+                           "key_id": statement["key_id"],
+                           "ledger_seq": rec["seq"]})
     if args.json:
         print(json.dumps({
             "schema": "hls-sign-release/v1",
@@ -324,7 +340,7 @@ def main(argv=None):
                          % fmt.DEFAULT_ITERATIONS)
     kg.add_argument("--force", action="store_true",
                     help="overwrite existing key files")
-    kg.set_defaults(fn=cmd_keygen)
+    kg.set_defaults(fn=cmd_keygen, audit_op=hal_ops.SIGN_KEYGEN)
 
     sg = sub.add_parser("sign", help="a detached minisign signature")
     sg.add_argument("file", help="the payload file")
@@ -337,7 +353,7 @@ def main(argv=None):
                          "timestamp + file)")
     sg.add_argument("--password-env", default=None, metavar="VAR")
     sg.add_argument("--json", action="store_true")
-    sg.set_defaults(fn=cmd_sign)
+    sg.set_defaults(fn=cmd_sign, audit_op=hal_ops.SIGN_SIGN)
 
     vf = sub.add_parser("verify", help="verify a detached signature")
     vf.add_argument("file", help="the payload file")
@@ -359,7 +375,7 @@ def main(argv=None):
     rl.add_argument("--trusted-comment", default=None)
     rl.add_argument("--password-env", default=None, metavar="VAR")
     rl.add_argument("--json", action="store_true")
-    rl.set_defaults(fn=cmd_release)
+    rl.set_defaults(fn=cmd_release, audit_op=hal_ops.SIGN_RELEASE)
 
     vr = sub.add_parser("verify-release", help="verify a signed release "
                                                "against the current tree")
@@ -383,6 +399,12 @@ def main(argv=None):
     except (CliError, fmt.SignError, rel.AuditError, aead.AeadError,
             ed.Ed25519Error) as ex:
         sys.stderr.write("%s: %s\n" % (TOOL, ex))
+        # Stage 112: a refused privileged op is recorded exactly like
+        # a completed one — the gate's reason rides in the detail.
+        # Read-only commands carry no audit_op and record nothing.
+        op = getattr(args, "audit_op", None)
+        if op:
+            hal_ops.record_refused(op, str(ex))
         return 1
 
 

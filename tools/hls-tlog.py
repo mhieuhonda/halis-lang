@@ -67,6 +67,7 @@ from hltlog_parts import hltlog_selftest as st                # noqa: E402
 from hltlog_parts import hltlog_witness as wit                # noqa: E402
 from hltlog_parts import hltlog_sources as src                # noqa: E402
 from hlsign_parts import hlsign_format as fmt                 # noqa: E402
+from hlaudit_parts import hal_ops                             # noqa: E402
 
 TOOL = com.TOOL
 
@@ -320,6 +321,13 @@ def cmd_witness(args):
     out_dir = args.out or os.path.dirname(os.path.abspath(path))
     doc_path, sig_path = wit.write_witness(witness, seed, public, out_dir,
                                            trusted, force=args.force)
+    # Stage 112: minting a signed view is a privileged op — the
+    # witness promises the log will never shrink below this head.
+    hal_ops.record(hal_ops.TLOG_WITNESS, "ok", subject=path,
+                   detail={"length": view["length"],
+                           "head": view["head"],
+                           "key_id": witness["key_id"],
+                           "witness": doc_path})
     if args.json:
         print(json.dumps({
             "schema": com.WITNESS_SCHEMA,
@@ -554,7 +562,7 @@ def main(argv=None):
     wt.add_argument("--trusted-comment", default=None)
     wt.add_argument("--force", action="store_true")
     wt.add_argument("--json", action="store_true")
-    wt.set_defaults(fn=cmd_witness)
+    wt.set_defaults(fn=cmd_witness, audit_op=hal_ops.TLOG_WITNESS)
 
     wv = sub.add_parser("witness-verify",
                         help="verify a signed view; --against checks "
@@ -600,6 +608,11 @@ def main(argv=None):
         return args.fn(args)
     except (CliError, com.TlogError, fmt.SignError) as ex:
         sys.stderr.write("%s: %s\n" % (TOOL, ex))
+        # Stage 112: a refused witness is recorded too — the same rule
+        # every hooked tool runs; read-only commands record nothing.
+        op = getattr(args, "audit_op", None)
+        if op:
+            hal_ops.record_refused(op, str(ex))
         return 1
 
 

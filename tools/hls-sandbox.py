@@ -74,6 +74,7 @@ from sandbox_parts import sbx_bpf as bpf                      # noqa: E402
 from sandbox_parts import sbx_cemit                            # noqa: E402
 from sandbox_parts import sbx_release as rel                   # noqa: E402
 from sandbox_parts import sbx_exec                             # noqa: E402
+from hlaudit_parts import hal_ops                              # noqa: E402
 from sandbox_parts.sbx_policy import (                         # noqa: E402
     ALL_EFFECTS, BASELINES, DEFAULT_ACTIONS, Profile, PolicyError,
     arch_of_host, derive_source, is_static_elf, nr_of,
@@ -89,6 +90,15 @@ class Usage(Exception):
 
 def _eprint(*a):
     sys.stderr.write("%s: %s\n" % (TOOL, " ".join(str(x) for x in a)))
+
+
+def _record_refusal(args, ex):
+    """Stage 112: a refused privileged op is recorded exactly like a
+    completed one — the gate's reason rides in the detail. Read-only
+    commands carry no audit_op and record nothing."""
+    op = getattr(args, "audit_op", None)
+    if op:
+        hal_ops.record_refused(op, str(ex))
 
 
 # ---------------------------------------------------------------------------
@@ -346,6 +356,14 @@ def cmd_run(args):
     if not ok:
         raise PolicyError("cannot arm on this host: %s" % why)
     code, sig, err = sbx_exec.run(profile, arch, cmd)
+    # Stage 112: the launcher's decision is a privileged op — it ran
+    # real code under a real kernel filter, and the log says which
+    # posture, which command, and how the artifact ended.
+    hal_ops.record(hal_ops.SANDBOX_RUN, "ok", subject=cmd[0],
+                   detail={"command": cmd, "exit": code, "signal": sig,
+                           "effects": list(profile.effects),
+                           "fs": profile.fs_mode,
+                           "default_action": profile.default_action})
     rep = {
         "schema": "hls-sandbox-run/v1",
         "mode": ctx["mode"],
@@ -386,6 +404,12 @@ def cmd_release(args):
     if not args.pkg:
         raise Usage("release needs --pkg DIR")
     statement, st_path, rec = rel.release(args.pkg, out_dir=args.out)
+    hal_ops.record(hal_ops.SANDBOX_RELEASE, "ok",
+                   subject="%s@%s" % (statement["name"],
+                                      statement["version"]),
+                   detail={"effects": list(statement["effects"]),
+                           "fs": statement["fs"]["mode"],
+                           "ledger_seq": rec.get("seq")})
     print("%s: %s" % (TOOL, st_path))
     print("  effects: %s" % ", ".join(statement["effects"]))
     print("  fs: %s, default: %s, baseline: %s"
@@ -651,7 +675,7 @@ def main(argv=None):
     p = sub.add_parser("run", help="run a command under the filter")
     common(p)
     p.add_argument("--quiet", action="store_true")
-    p.set_defaults(fn=cmd_run, cmd_tail=None)
+    p.set_defaults(fn=cmd_run, cmd_tail=None, audit_op=hal_ops.SANDBOX_RUN)
 
     p = sub.add_parser("emit", help="emit the self-arming C shim")
     common(p)
@@ -664,7 +688,7 @@ def main(argv=None):
     p = sub.add_parser("release", help="write the statement + chain it")
     p.add_argument("--pkg", required=True)
     p.add_argument("--out", default=None)
-    p.set_defaults(fn=cmd_release)
+    p.set_defaults(fn=cmd_release, audit_op=hal_ops.SANDBOX_RELEASE)
 
     p = sub.add_parser("verify-release", help="verify a statement")
     p.add_argument("--pkg", required=True)
@@ -686,9 +710,11 @@ def main(argv=None):
         return 2
     except (PolicyError, rel.ReleaseError) as ex:
         _eprint(str(ex))
+        _record_refusal(args, ex)
         return 1
     except sbx_policy_mod().hls_audit.AuditError as ex:
         _eprint(str(ex))
+        _record_refusal(args, ex)
         return 1
 
 

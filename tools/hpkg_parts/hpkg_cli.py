@@ -11,6 +11,12 @@ from hpkg_cmds import (
 from hpkg_common import (
     argparse, sys,
 )
+# Stage 112: same reach as hpkg_cmds — the audit package lives one
+# directory up (see the note there).
+_PKG_PARENT = _os.path.dirname(_TOOLS_DIR)
+if _PKG_PARENT not in _sys.path:
+    _sys.path.insert(0, _PKG_PARENT)
+from hlaudit_parts import hal_ops
 
 def main():
     parser = argparse.ArgumentParser(
@@ -20,7 +26,7 @@ def main():
 
     p_init = sub.add_parser("init", help="Create a new package skeleton.")
     p_init.add_argument("name")
-    p_init.set_defaults(func=cmd_init)
+    p_init.set_defaults(func=cmd_init, audit_op=hal_ops.PKG_INIT)
 
     p_add = sub.add_parser("add", help="Add a git dependency.")
     p_add.add_argument("name")
@@ -28,7 +34,7 @@ def main():
     p_add.add_argument("path")
     p_add.add_argument("--tag", default=None)
     p_add.add_argument("--branch", default=None)
-    p_add.set_defaults(func=cmd_add)
+    p_add.set_defaults(func=cmd_add, audit_op=hal_ops.PKG_ADD)
 
     p_lock = sub.add_parser("lock", help="Resolve dependencies and write hls-pkg.lock.")
     # Stage 22 (v0.41.0-alpha): --target <triple> — stamp the lockfile
@@ -41,7 +47,7 @@ def main():
                         help="stamp the lockfile with this target triple "
                              "(e.g. aarch64-apple-darwin). When omitted, "
                              "the lockfile is target-agnostic (target: null).")
-    p_lock.set_defaults(func=cmd_lock)
+    p_lock.set_defaults(func=cmd_lock, audit_op=hal_ops.PKG_LOCK)
 
     p_audit = sub.add_parser("audit", help="Print the total effect report of the dep tree.")
     p_audit.set_defaults(func=cmd_audit)
@@ -88,7 +94,7 @@ def main():
     # Stage 13 release: transparency log commands.
     p_publish = sub.add_parser("publish",
                               help="Append the package to the transparency log.")
-    p_publish.set_defaults(func=cmd_publish)
+    p_publish.set_defaults(func=cmd_publish, audit_op=hal_ops.PKG_PUBLISH)
 
     p_log = sub.add_parser("log",
                           help="Print or verify the transparency log.")
@@ -102,16 +108,24 @@ def main():
     # SCAN-B fix: broaden the caught types — AttributeError and TypeError
     # are raised by the malformed-shape paths and previously escaped.
     try:
-        return args.func(args)
+        rc = args.func(args)
     except (ValueError, KeyError, AttributeError, TypeError) as ex:
         print("error: %s" % ex, file=sys.stderr)
-        return 1
+        rc = 1
     except FileNotFoundError as ex:
         print("error: %s" % ex, file=sys.stderr)
-        return 1
+        rc = 1
     except (OSError, IOError) as ex:
         print("error: %s" % ex, file=sys.stderr)
-        return 1
+        rc = 1
+    # Stage 112: a privileged op that exited non-zero is a refused
+    # op — recorded like any other, the exit code as the reason (the
+    # refusal's own text went to stderr above).
+    op = getattr(args, "audit_op", None)
+    if op and rc != 0:
+        hal_ops.record_refused(op, "the command exited %d — the "
+                                "refusal's text is on stderr" % rc)
+    return rc
 
 
 

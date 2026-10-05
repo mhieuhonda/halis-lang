@@ -21,6 +21,14 @@ from hpkg_manifest import (
 from hpkg_util import (
     _validate_dep_name, _validate_git_arg, sha256_bytes, sha256_file,
 )
+# Stage 112: the audit hooks live in tools/hlaudit_parts — a package
+# this module reaches through the TOOLS directory, which is not on
+# sys.path when hpkg_parts is imported as a flat package (the SBOM
+# gate's loader). Add it before the import, once.
+_TOOLS_PARENT = _os.path.dirname(_TOOLS_DIR)
+if _TOOLS_PARENT not in _sys.path:
+    _sys.path.insert(0, _TOOLS_PARENT)
+from hlaudit_parts import hal_ops
 
 def cmd_init(args):
     """Create a new package skeleton."""
@@ -79,6 +87,9 @@ fn main() -> int uses IO {
     print("  hls-pkg lock")
     print("  hls-pkg audit")
     print("  hls-pkg build")
+    # Stage 112: creating a package tree is a privileged op.
+    hal_ops.record(hal_ops.PKG_INIT, "ok", subject=name,
+                   detail={"dir": pkg_dir})
     return 0
 
 
@@ -118,6 +129,11 @@ def cmd_add(args):
     write_manifest(manifest, manifest_path)
     print("Added dependency: %s" % args.name)
     print("  source: %s" % source)
+    # Stage 112: editing the manifest's dependency set is privileged.
+    hal_ops.record(hal_ops.PKG_ADD, "ok", subject=args.name,
+                   detail={"git": source.get("git", ""),
+                           "tag": source.get("tag", ""),
+                           "branch": source.get("branch", "")})
     return 0
 
 
@@ -199,6 +215,12 @@ def cmd_lock(args):
         json.dump(lockfile, f, indent=2)
     print("")
     print("Wrote lockfile: %s (%d packages)" % (lockfile_path, len(lockfile["packages"])))
+    # Stage 112: re-locking pins the dependency tree — the audit
+    # entry names the package and how many deps it pinned.
+    hal_ops.record(hal_ops.PKG_LOCK, "ok",
+                   subject="%s@%s" % (pkg_name, pkg_version),
+                   detail={"packages": len(lockfile["packages"]),
+                           "target": target_triple})
     # Effect enforcement: check that the package's declared `effects.allowed`
     # is a superset of every dependency's computed effects.
     effects_section = manifest.get("effects", {})
@@ -646,6 +668,12 @@ def cmd_publish(args):
     print("  content sha256: %s" % content_sha)
     print("  transparency log seq: %d" % rec["seq"])
     print("  chain hash: %s" % rec["chain_hash"][:24] + "...")
+    # Stage 112: publishing chains a claim — privileged by definition.
+    hal_ops.record(hal_ops.PKG_PUBLISH, "ok",
+                   subject="%s@%s" % (name, version),
+                   detail={"content_sha256": content_sha,
+                           "files": len(sources),
+                           "ledger_seq": rec["seq"]})
     return 0
 
 
