@@ -153,7 +153,7 @@ remains green.
 | 95 | `target riscv64-unknown-none` — bare-metal RISC-V | ✅ | (done in v0.114.0-alpha) |
 | 96 | ELF symbol-table emission + debug-info (DWARF 5) | ✅ | (done in v0.115.0-alpha) |
 
-### Phase VII — Verification, security & supply chain (Stages 97–112)
+### Phase VII — Verification, security & supply chain (Stages 97–112, complete)
 
 | # | Stage | Status | Estimated effort |
 |---|-------|:------:|:----------------:|
@@ -172,7 +172,7 @@ remains green.
 | 109 | Taint-tracking through FFI boundaries | ✅ | (done in v0.128.0-alpha) |
 | 110 | Sandboxed package execution (seccomp-bpf filter) | ✅ | (done in v0.129.0-alpha) |
 | 111 | Capability token types (`Cap[Net]` as a value, not just effect) | ✅ | (done in v0.130.0-alpha) |
-| 112 | Audit-log signing (every privileged op hashed + chained) | ⬜ | 3 weeks |
+| 112 | Audit-log signing (every privileged op hashed + chained) | ✅ | (done in v0.131.0-alpha) |
 
 ### Phase VIII — Developer experience & ecosystem (Stages 113–124)
 
