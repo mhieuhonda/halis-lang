@@ -6,6 +6,29 @@ import resolution, rename refactoring, document symbols, document
 highlight, and signature-info. Editor plugins (VS Code, Neovim) ship
 under editors/.
 
+Stage 113 (v0.132.0-alpha): go-to-definition ACROSS PACKAGES. Until
+now a definition was only ever found inside an OPEN document, so a
+symbol that lived in a dependency (or in std/, or in a sibling file
+nobody had opened) resolved to nothing. The server now resolves
+definitions through four on-disk layers, in priority order:
+
+  1. the files the current document imports (open buffers win over
+     disk; unopened files are parsed on demand),
+  2. the package sources named by hls-pkg.lock's `resolved_path`
+     entries — the same file the compiler builds from,
+  3. the `.hls-pkg-deps/` symlink farm `hls-pkg build` maintains,
+     walked from the document's directory chain and the package root,
+  4. the `HLS_PKG_DEPS` directory boot.py itself honours — the server
+     must never disagree with the build about where code lives.
+
+An `import "..."` path literal is itself jumpable: the definition of
+an import is the module file it names. On-disk files are loaded as
+EXTERNAL documents — parsed once, mtime-checked, LRU-capped — which
+answer definitions/references/completion like open buffers but are
+NEVER edited (rename stays confined to opened files) and never
+publish diagnostics. Malformed or missing dependency files answer
+None; they can never take the server down.
+
 Stage 14-alpha (v0.12.0-alpha): minimal LSP server over JSON-RPC stdio.
 
 Implemented methods:
@@ -14,9 +37,13 @@ Implemented methods:
   textDocument/hover        — show the inferred type of an identifier at
                               a position (uses the checker's annotations).
   textDocument/definition   — find the function/struct/enum definition at
-                              a position. Searches imported files too
-                              (cross-file go-to-definition, Stage 14
-                              release target).
+                              a position: the current file, the files it
+                              imports (open or on disk), the workspace's
+                              package dependency sources (hls-pkg.lock
+                              resolved_path, .hls-pkg-deps/, HLS_PKG_DEPS),
+                              then every other open document. An import
+                              path literal jumps to the module file itself
+                              (cross-package go-to-definition, Stage 113).
   textDocument/references   — find all references to the symbol at a
                               position (used by rename preflight).
   textDocument/rename      — rename the symbol at a position across
@@ -32,8 +59,10 @@ Usage:
   hls-lsp --check FILE.hls   # one-shot: print diagnostics to stdout
                               (useful for editors that don't speak LSP)
 
-Status: Stage 14 release. The LSP server uses the Stage-0
-lexer/parser/checker internally. Editor plugins live under
+Status: Stage 113. The LSP server uses the Stage-0 lexer/parser/checker
+internally; go-to-definition resolves through the same import rules
+boot.py enforces, extended with the package layers (lockfile,
+.hls-pkg-deps/, HLS_PKG_DEPS). Editor plugins live under
 editors/vscode/ and editors/neovim/.
 """
 import argparse
@@ -41,6 +70,7 @@ import json
 import os
 import sys
 import traceback
+from urllib.parse import quote, unquote, urlparse
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from boot.lexer import tokenize, HLError  # noqa: E402
@@ -145,6 +175,17 @@ BUILTINS = [
 # autocompletion offers them when the user types `uses `.
 EFFECTS = ["IO", "Fs", "Clock", "Args", "Exit", "Net", "Rand", "Proc"]
 
+# Stage 113: the checkout the server itself lives in. When the edited
+# file belongs to no package, `import "std."` still has to land in the
+# toolchain's own std/ — the same fallback boot.py uses via _REPO_ROOT.
+_TOOLCHAIN_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# Stage 113: external (on-disk, unopened) documents are LRU-capped so a
+# huge dependency tree cannot grow the server without bound, and capped
+# per dependency source directory so a vendored monorepo cannot turn one
+# definition request into a whole-repo parse.
+EXTERNAL_DOC_CAP = 48
+DEP_FILE_CAP = 128
+
 
 class HLSServer:
     def __init__(self):
@@ -161,6 +202,13 @@ class HLSServer:
         # Stage 14 release: import-path -> uri map. Lets the server map an
         # `import "std.str"` to the open document that provides it.
         self._import_cache = None
+        # Stage 113: doc directory -> package root (nearest ancestor with
+        # hls-pkg.toml), cached because every definition request re-asks.
+        self._ws_cache = {}
+        # Stage 113: LRU order of externally loaded documents (file://
+        # URIs). Open documents are never on this list — eviction checks
+        # the external flag before dropping anything.
+        self._ext_lru = []
 
     @property
     def symbol_index(self):
@@ -177,6 +225,9 @@ class HLSServer:
     def _invalidate_indexes(self):
         self._symbol_cache = None
         self._import_cache = None
+        # Stage 113: a package root can appear/disappear (hls-pkg init)
+        # mid-session — drop the workspace-root cache with the rest.
+        self._ws_cache = {}
 
     def _rebuild_symbol_index(self):
         """Rebuild the cross-file symbol index from every open doc.
@@ -223,6 +274,360 @@ class HLSServer:
                 imports.setdefault(imp.get("path", ""), []).append(uri)
         self._symbol_cache = index
         self._import_cache = imports
+
+    # ---------- Stage 113: package-aware definition plumbing ----------
+
+    @staticmethod
+    def _uri_to_path(uri):
+        """file:// URI -> absolute filesystem path (percent-decoded), or
+        None for anything that is not a file URI. Untitled buffers and
+        exotic schemes cannot be indexed — there is no file to resolve."""
+        if not isinstance(uri, str) or not uri.startswith("file://"):
+            return None
+        path = unquote(urlparse(uri).path)
+        if not path:
+            return None
+        return os.path.normpath(path)
+
+    @staticmethod
+    def _path_to_uri(path):
+        """Absolute filesystem path -> file:// URI (percent-encoded)."""
+        return "file://" + quote(os.path.abspath(path))
+
+    def _token_at(self, uri, line, col):
+        """Re-tokenise the document and return the token whose extent
+        covers (line, col) — 1-indexed BYTE coordinates, the lexer's own.
+
+        Stage 113: extracted from _ident_at so the definition handler can
+        also SEE string tokens — an `import "..."` path literal is a str
+        token, not an ident, and its definition is the module file it
+        names. The token itself is returned; the caller decides what it
+        means. Same token-extent rules as before (the lexer's `raw`
+        substring where present, byte length otherwise).
+        """
+        doc = None
+        if uri is not None and uri in self.docs:
+            doc = self.docs[uri]
+        else:
+            for _u, d in self.docs.items():
+                doc = d
+                break
+        if not doc:
+            return None
+        try:
+            toks = tokenize(doc["text"].encode("utf-8"))
+        except HLError:
+            return None
+        for t in toks:
+            if t["k"] == "eof":
+                break
+            if "raw" in t and isinstance(t["raw"], (str, bytes)):
+                tlen = len(t["raw"])
+            elif isinstance(t["v"], bytes):
+                tlen = len(t["v"])
+            else:
+                tlen = len(str(t["v"]))
+            if t["line"] == line and t["col"] <= col < t["col"] + tlen:
+                return t
+        return None
+
+    @staticmethod
+    def _import_token_path(prog, line, tok):
+        """If `tok` (a str token on 1-indexed `line`) is the path literal
+        of an `import "..."` statement, return the path text; else None.
+
+        The parser records each import's keyword line, so matching on
+        (line, exact path text) is exact — including two imports that
+        share a line.
+        """
+        if tok is None or tok.get("k") != "str":
+            return None
+        v = tok.get("v")
+        try:
+            tval = v.decode("latin-1")
+        except (AttributeError, UnicodeDecodeError):
+            return None
+        for imp in prog.get("imports", []):
+            if imp.get("line") == line and imp.get("path") == tval:
+                return tval
+        return None
+
+    def _workspace_root(self, doc_path):
+        """Nearest ancestor directory of `doc_path` containing
+        hls-pkg.toml — the package root — or None when the file lives
+        outside any package. Cached per document directory (every
+        definition request re-asks); the cache is cleared by
+        _invalidate_indexes so `hls-pkg init` mid-session is seen."""
+        if not doc_path:
+            return None
+        start = os.path.dirname(os.path.abspath(doc_path))
+        if start in self._ws_cache:
+            return self._ws_cache[start]
+        root = None
+        d = start
+        for _ in range(32):
+            if os.path.isfile(os.path.join(d, "hls-pkg.toml")):
+                root = d
+                break
+            parent = os.path.dirname(d)
+            if parent == d:
+                break
+            d = parent
+        self._ws_cache[start] = root
+        return root
+
+    def _dep_source_dirs(self, doc_path):
+        """Every directory that can hold package dependency sources for
+        `doc_path`, most specific first:
+
+          - hls-pkg.lock `resolved_path` entries (a file contributes its
+            directory, a directory itself) — the lockfile is what
+            `hls-pkg lock` writes and `hls-pkg build` compiles from, so
+            the editor must agree with the build;
+          - `.hls-pkg-deps/` along the document's ancestor chain (up to
+            5 levels) and at the package root — the symlink farm
+            `hls-pkg build` maintains;
+          - the `HLS_PKG_DEPS` directory, when set — boot.py honours it,
+            so the server must too.
+
+        Deduplicated (realpath), order-stable. Malformed lockfiles are
+        skipped, never raised.
+        """
+        dirs = []
+        seen = set()
+
+        def add(d):
+            if d and os.path.isdir(d):
+                real = os.path.realpath(d)
+                if real not in seen:
+                    seen.add(real)
+                    dirs.append(d)
+
+        ws = self._workspace_root(doc_path) if doc_path else None
+        if ws:
+            lock = os.path.join(ws, "hls-pkg.lock")
+            if os.path.isfile(lock):
+                try:
+                    with open(lock, "rb") as f:
+                        data = json.load(f)
+                except (OSError, ValueError):
+                    data = None
+                for pkg in (data or {}).get("packages", []):
+                    if not isinstance(pkg, dict):
+                        continue
+                    rp = pkg.get("resolved_path")
+                    if not isinstance(rp, str) or not rp:
+                        continue
+                    if not os.path.isabs(rp):
+                        rp = os.path.join(ws, rp)
+                    rp = os.path.normpath(rp)
+                    if os.path.isdir(rp):
+                        add(rp)
+                    elif os.path.isfile(rp):
+                        add(os.path.dirname(rp))
+        if doc_path:
+            d = os.path.dirname(os.path.abspath(doc_path))
+            for _ in range(5):
+                add(os.path.join(d, ".hls-pkg-deps"))
+                parent = os.path.dirname(d)
+                if parent == d:
+                    break
+                d = parent
+        env_dir = os.environ.get("HLS_PKG_DEPS")
+        if env_dir:
+            add(env_dir)
+        return dirs
+
+    def _resolve_import(self, import_path, importing_path):
+        """Resolve an import path to an absolute file — the LSP mirror of
+        boot.boot._resolve_import, minus the exits. A language server
+        must answer None on a hostile path, never die on one, so the
+        traversal guards (no absolute paths, no `..` segments) REJECT
+        instead of raising. Same resolution families as the compiler:
+
+          - "std.<name>" / "core.<name>": walk up from the importing
+            file (5 levels), then the package root, then the toolchain's
+            own std//core/ — boot.py's walk-up + _REPO_ROOT fallback,
+            plus the package root for vendored module families.
+          - relative paths: against the importing file's directory,
+            `..`-free (boot's deep-scan-19 rule).
+          - package dependency sources: hls-pkg.lock resolved_path dirs,
+            .hls-pkg-deps/ farms, HLS_PKG_DEPS (boot's BUG-DS4-26
+            fallback) — tried as `<dep>/<path>` and `<dep>/<basename>`,
+            the same two shapes boot tries.
+        """
+        if not isinstance(import_path, str) or not import_path:
+            return None
+        for prefix, subdir in (("std.", "std"), ("core.", "core")):
+            if not import_path.startswith(prefix):
+                continue
+            module_name = import_path[len(prefix):]
+            if (not module_name
+                    or module_name.startswith("/") or module_name.startswith("\\")
+                    or ".." in module_name.replace("\\", "/").split("/")):
+                return None
+            rel = os.path.join(subdir, module_name + ".hls")
+            d = (os.path.dirname(os.path.abspath(importing_path))
+                 if importing_path else _TOOLCHAIN_ROOT)
+            for _ in range(5):
+                cand = os.path.join(d, rel)
+                if os.path.isfile(cand):
+                    return cand
+                parent = os.path.dirname(d)
+                if parent == d:
+                    break
+                d = parent
+            ws = self._workspace_root(importing_path) if importing_path else None
+            for fallback in (ws, _TOOLCHAIN_ROOT):
+                if fallback:
+                    cand = os.path.join(fallback, rel)
+                    if os.path.isfile(cand):
+                        return cand
+            return None
+        if os.path.isabs(import_path):
+            return None
+        if ".." in import_path.replace("\\", "/").split("/"):
+            return None
+        base = (os.path.dirname(os.path.abspath(importing_path))
+                if importing_path else os.getcwd())
+        cand = os.path.normpath(os.path.join(base, import_path))
+        if os.path.isfile(cand):
+            return cand
+        for dep_dir in self._dep_source_dirs(importing_path):
+            for cand in (os.path.join(dep_dir, import_path),
+                         os.path.join(dep_dir,
+                                      os.path.basename(import_path))):
+                if os.path.isfile(cand):
+                    return cand
+        return None
+
+    def _external_doc(self, path):
+        """Load (and cache) an on-disk file as an EXTERNAL document.
+
+        External docs answer definitions/references/completion exactly
+        like open buffers, but they are NEVER edited (rename skips them
+        — the server will not rewrite a file the user has not opened)
+        and never publish diagnostics (the checker runs once, silently,
+        for indexing). Entries are mtime-checked (an on-disk change
+        re-parses on the next lookup) and LRU-capped at EXTERNAL_DOC_CAP
+        so a large dependency tree cannot grow the server unbounded.
+
+        Returns the doc dict, or None when the file is missing or does
+        not parse — a broken dependency file answers None, it never
+        takes the server down, and failed loads are not cached (a file
+        mid-write may parse on the next request).
+        """
+        if not path or not os.path.isfile(path):
+            return None
+        real = os.path.realpath(path)
+        try:
+            mtime = os.path.getmtime(real)
+        except OSError:
+            return None
+        uri = self._path_to_uri(real)
+        doc = self.docs.get(uri)
+        if doc is not None and doc.get("external") and doc.get("mtime") == mtime:
+            if uri in self._ext_lru:
+                self._ext_lru.remove(uri)
+                self._ext_lru.append(uri)
+            return doc
+        try:
+            with open(real, "rb") as f:
+                text = f.read().decode("utf-8", errors="replace")
+            toks = tokenize(text.encode("utf-8"))
+            program = Parser(toks).parse_program()
+            try:
+                check(program)
+            except HLError:
+                pass  # index the program even when the checker objects
+        except HLError:
+            return None
+        except (MemoryError, RecursionError, OSError):
+            return None
+        doc = {"version": None, "text": text, "program": program,
+               "external": True, "mtime": mtime}
+        self.docs[uri] = doc
+        if uri in self._ext_lru:
+            self._ext_lru.remove(uri)
+        self._ext_lru.append(uri)
+        while len(self._ext_lru) > EXTERNAL_DOC_CAP:
+            old = self._ext_lru.pop(0)
+            od = self.docs.get(old)
+            if od is not None and od.get("external"):
+                del self.docs[old]
+                self._symbol_cache = None
+                self._import_cache = None
+        return doc
+
+    def _import_uris(self, uri):
+        """URIs (in import order) of the files `uri` imports. Open
+        buffers win over disk; files not yet loaded are parsed on
+        demand. Unresolvable imports are skipped, not errors."""
+        doc = self.docs.get(uri)
+        prog = self._doc_program(doc) if doc else None
+        if prog is None:
+            return []
+        path = self._uri_to_path(uri)
+        out = []
+        for imp in prog.get("imports", []):
+            target = self._resolve_import(imp.get("path", ""), path)
+            if target is None:
+                continue
+            turi = self._path_to_uri(target)
+            if turi not in self.docs:
+                self._external_doc(target)
+            out.append(turi)
+        return out
+
+    def _dep_file_list(self, uri):
+        """On-disk .hls files from `uri`'s package dependency sources —
+        the bounded walk that backs cross-package definition lookups:
+        DEP_FILE_CAP files per source directory, 6 directory levels
+        deep, dot-directories and __pycache__ skipped."""
+        path = self._uri_to_path(uri)
+        files = []
+        seen = set()
+        for d in self._dep_source_dirs(path):
+            real = os.path.realpath(d)
+            if real in seen:
+                continue
+            seen.add(real)
+            if os.path.isfile(d):
+                if d.endswith(".hls"):
+                    files.append(d)
+                continue
+            base_depth = len(real.rstrip(os.sep).split(os.sep))
+            for root, dirnames, filenames in os.walk(real):
+                depth = len(root.rstrip(os.sep).split(os.sep)) - base_depth
+                if depth >= 6:
+                    dirnames[:] = []
+                dirnames[:] = sorted(
+                    x for x in dirnames
+                    if not x.startswith(".") and x != "__pycache__")
+                for fn in sorted(filenames):
+                    if fn.endswith(".hls"):
+                        files.append(os.path.join(root, fn))
+                if len(files) >= DEP_FILE_CAP:
+                    break
+            if len(files) >= DEP_FILE_CAP:
+                break
+        return files[:DEP_FILE_CAP]
+
+    def _location_for_import(self, import_path, importing_uri):
+        """Definition of an `import "..."` literal = the module file it
+        names. Warms the external cache so the client's follow-up
+        request (document symbols, another jump) is instant. Returns an
+        LSP Location or None."""
+        target = self._resolve_import(
+            import_path, self._uri_to_path(importing_uri))
+        if target is None:
+            return None
+        self._external_doc(target)
+        return {
+            "uri": self._path_to_uri(target),
+            "range": {"start": {"line": 0, "character": 0},
+                      "end": {"line": 0, "character": 1}},
+        }
 
     def run(self):
         # BUG-SC-LSP-13 fix: per LSP spec, the server must keep the connection
@@ -285,7 +690,7 @@ class HLSServer:
                 },
                 "serverInfo": {
                     "name": "hls-lsp",
-                    "version": "0.14.0-alpha",
+                    "version": "0.132.0-alpha",
                 },
             })
         elif method == "initialized":
@@ -385,6 +790,11 @@ class HLSServer:
             # editor still gets a (clear) empty-diagnostics notification.
             program = None
         self.docs[uri] = {"version": version, "text": text, "program": program}
+        # Stage 113: an OPEN buffer supersedes any external copy of the
+        # same file — take it off the eviction list so didOpen + didClose
+        # cycles cannot evict user state.
+        if uri in self._ext_lru:
+            self._ext_lru.remove(uri)
         # Stage 14 release: invalidate the cross-file symbol + import
         # indexes so the next definition/rename call rebuilds them with
         # the new contents.
@@ -601,46 +1011,18 @@ class HLSServer:
         })
 
     def _ident_at(self, prog, line, col, uri=None):
-        """Re-tokenise the source and find the identifier at the given position.
+        """Re-tokenise the source and return the identifier at the given
+        position (ident/kw token covering 1-indexed byte line/col), or
+        None.
 
-        If `uri` is given, use that document; otherwise fall back to the
-        first available document (best-effort for legacy callers).
+        Stage 113: the token hunt itself moved to _token_at, which
+        returns the full token so the definition handler can also see
+        string literals (import paths). This wrapper keeps the old
+        ident-only contract for hover/references/rename.
         """
-        doc = None
-        if uri is not None and uri in self.docs:
-            doc = self.docs[uri]
-        else:
-            for u, d in self.docs.items():
-                doc = d
-                break
-        if not doc:
-            return None
-        try:
-            toks = tokenize(doc["text"].encode("utf-8"))
-        except HLError:
-            return None
-        for t in toks:
-            if t["k"] == "eof":
-                break
-            # Deep-scan-12 fix (DSS-T-09): use the lexer's `raw` field
-            # when present (it's set on int / float tokens). `str(v)`
-            # loses information: `1_000` (raw) becomes `1000` (4 chars
-            # vs the source's 5), and `0.01` formatted via `repr` may
-            # produce `0.01` or scientific notation depending on the
-            # value. The lexer's `raw` is the EXACT source substring
-            # the highlighter must use to compute the token's extent.
-            if "raw" in t and isinstance(t["raw"], (str, bytes)):
-                # Deep-scan-30 fix: the old conditional had two
-                # identical branches (len(t["raw"]) both ways) —
-                # len() works on str and bytes alike.
-                tlen = len(t["raw"])
-            elif isinstance(t["v"], bytes):
-                tlen = len(t["v"])
-            else:
-                tlen = len(str(t["v"]))
-            if t["line"] == line and t["col"] <= col < t["col"] + tlen:
-                if t["k"] in ("ident", "kw"):
-                    return t["v"]
+        t = self._token_at(uri, line, col)
+        if t is not None and t["k"] in ("ident", "kw"):
+            return t["v"]
         return None
 
     def _lookup_type(self, prog, name, current_fn=None):
@@ -697,6 +1079,19 @@ class HLSServer:
 
     # ---------- definition ----------
     def handle_definition(self, params, msg_id):
+        """Stage 113: go-to-definition across packages.
+
+        Resolution order — first hit wins:
+          1. the cursor sits on an `import "..."` path literal → the
+             module file itself, on disk;
+          2. the current document;
+          3. the files the current document imports (open buffers
+             first, on-disk files parsed on demand);
+          4. the workspace's package dependency sources: hls-pkg.lock
+             resolved_path entries, .hls-pkg-deps/ farms, HLS_PKG_DEPS;
+          5. every other open document (the Stage 14 behaviour, kept as
+             the last-resort net).
+        """
         td = params.get("textDocument", {})
         uri = td.get("uri")
         pos = params.get("position", {})
@@ -711,17 +1106,40 @@ class HLSServer:
         if prog is None:
             self.send_response(msg_id, None)
             return
-        ident_name = self._ident_at(prog, line, col, uri=uri)
-        if ident_name is None:
+        tok = self._token_at(uri, line, col)
+        # 1. an import path literal IS jumpable — its definition is the
+        # module file it names (std/, core/, relative, or a dependency).
+        if tok is not None and tok.get("k") == "str":
+            imp = self._import_token_path(prog, line, tok)
+            if imp is not None:
+                self.send_response(
+                    msg_id, self._location_for_import(imp, uri))
+                return
+        if tok is None or tok.get("k") not in ("ident", "kw"):
             self.send_response(msg_id, None)
             return
-        # Stage 14 release: cross-file go-to-definition.
-        # First check the current document; if not found, search every
-        # other open document (imported files in particular).
+        ident_name = tok["v"]
+        # 2. the current document.
         loc = self._find_definition_in(uri, ident_name)
+        # 3. the files this document imports.
         if loc is None:
-            # Try every other open document.
-            for other_uri in self.docs:
+            for iuri in self._import_uris(uri):
+                if iuri == uri:
+                    continue
+                loc = self._find_definition_in(iuri, ident_name)
+                if loc is not None:
+                    break
+        # 4. package dependency sources (lockfile, deps farm, env).
+        if loc is None:
+            for fpath in self._dep_file_list(uri):
+                furi = self._path_to_uri(os.path.realpath(fpath))
+                self._external_doc(fpath)
+                loc = self._find_definition_in(furi, ident_name)
+                if loc is not None:
+                    break
+        # 5. any other open document (Stage 14 last-resort net).
+        if loc is None:
+            for other_uri in list(self.docs):
                 if other_uri == uri:
                     continue
                 loc = self._find_definition_in(other_uri, ident_name)
@@ -785,7 +1203,14 @@ class HLSServer:
 
     # ---------- references ----------
     def handle_references(self, params, msg_id):
-        """Stage 14 release: find all references to the symbol at a position."""
+        """Stage 14 release: find all references to the symbol at a position.
+
+        Stage 113: the search spans the package layers too — the files
+        the document imports and the workspace's dependency sources are
+        loaded (externally, read-only) so a dependency's usages show up
+        alongside the open buffers. Edit-producing callers (rename) stay
+        confined to open documents; references only read.
+        """
         td = params.get("textDocument", {})
         uri = td.get("uri")
         pos = params.get("position", {})
@@ -804,9 +1229,27 @@ class HLSServer:
         if ident_name is None:
             self.send_response(msg_id, [])
             return
-        # Search every open document for occurrences of ident_name.
+        # Search every open document for occurrences of ident_name...
         results = []
-        for u, d in self.docs.items():
+        seen = set()
+        for u in list(self.docs):
+            seen.add(u)
+            for loc in self._find_references_in(u, ident_name):
+                results.append(loc)
+        # ...then the package layers: imports first, then dependency
+        # sources (both parsed on demand as external documents).
+        extra = []
+        for iuri in self._import_uris(uri):
+            if iuri not in seen:
+                seen.add(iuri)
+                extra.append(iuri)
+        for fpath in self._dep_file_list(uri):
+            furi = self._path_to_uri(os.path.realpath(fpath))
+            if furi not in seen:
+                seen.add(furi)
+                self._external_doc(fpath)
+                extra.append(furi)
+        for u in extra:
             for loc in self._find_references_in(u, ident_name):
                 results.append(loc)
         self.send_response(msg_id, results)
@@ -889,9 +1332,15 @@ class HLSServer:
             self.send_response(msg_id, None, error_code=-32602,
                                error_message="cannot rename keyword/builtin/effect: %s" % ident_name)
             return
-        # Collect edits across every open document.
+        # Collect edits across every open document. Stage 113: external
+        # (on-disk, unopened) documents are excluded — the server will
+        # not rewrite a file the user has not opened; the editor cannot
+        # have unsaved buffer state for it, and a stale disk copy could
+        # silently corrupt a dependency.
         changes = {}
         for u, d in self.docs.items():
+            if d.get("external"):
+                continue
             edits = []
             for loc in self._find_references_in(u, ident_name):
                 rng = loc["range"]
@@ -996,6 +1445,28 @@ class HLSServer:
                 if ename not in seen:
                     items.append({"label": ename, "kind": 13})  # 13 = Enum
                     seen.add(ename)
+        # Stage 113: symbols from the files this document imports — open
+        # or parsed on demand — so a dependency's API completes the moment
+        # its import is in the file. Dependency sources beyond the direct
+        # imports stay lazy: they join the offering once any lookup has
+        # loaded them (external docs are in self.docs and indexed).
+        if uri is not None:
+            for iuri in self._import_uris(uri):
+                iprog = self._doc_program(self.docs.get(iuri))
+                if iprog is None:
+                    continue
+                for fname in iprog["fns"]:
+                    if fname not in seen:
+                        items.append({"label": fname, "kind": 3})
+                        seen.add(fname)
+                for sname in iprog["structs"]:
+                    if sname not in seen:
+                        items.append({"label": sname, "kind": 7})
+                        seen.add(sname)
+                for ename in iprog["enums"]:
+                    if ename not in seen:
+                        items.append({"label": ename, "kind": 13})
+                        seen.add(ename)
         self.send_response(msg_id, items)
 
     # ---------- helpers ----------
