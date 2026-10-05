@@ -353,6 +353,17 @@ class InterpBuiltin(object):
         # which are bytes).
         if name == "taint_mark":
             return {"tainted": True, "value": args[0]}
+        # Stage 111 (v0.130.0-alpha): capability tokens. cap_take("E")
+        # mints the token — a dict {"cap": True, "effect": <name>} so
+        # it's distinguishable from raw values exactly like the taint
+        # wrapper is. The native side carries the same identity as a
+        # static C string (hl_cap_t = const char*). cap_effect_name(c)
+        # reads the effect name back — the only way to observe a token
+        # (they are opaque: no fields, no printing).
+        if name == "cap_take":
+            return {"cap": True, "effect": args[0]}
+        if name == "cap_effect_name":
+            return args[0]["effect"]
         # taint_unwrap(x) — extract the inner value, dropping taint.
         # The checker rejects taint_unwrap on non-tainted values, so by
         # the time we get here, args[0] is guaranteed to be a tainted

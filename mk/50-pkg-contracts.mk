@@ -481,6 +481,18 @@ ffi-taint-acceptance: $(BIN)/hlc
 	@$(PYTHON) tests/ffi_taint_acceptance.py
 
 # ============================================================================
+# Stage 111 (v0.130.0-alpha): capability token types — Cap[Net] as a
+# value, not just effect
+# ============================================================================
+
+# The full gate: mint rules, signature-carried grants, opaqueness,
+# crate modes, the interpreter/native differential (default AND
+# -O fast) and the --audit Capability tokens section.
+cap-acceptance: $(BIN)/hlc
+	@echo "[Stage 111 acceptance] running tests/cap_acceptance.py..."
+	@$(PYTHON) tests/cap_acceptance.py
+
+# ============================================================================
 # Stage 110 (v0.129.0-alpha): hls-sandbox — sandboxed package
 # execution, seccomp-bpf
 # ============================================================================

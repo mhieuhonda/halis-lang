@@ -257,6 +257,12 @@ fn is_builtin_fn(n: str) -> bool {
     # arguments and the live emit path is the only thing that reads
     # them; differential tests use fixed synthetic values).
     || n == "proc_pid" || n == "sys_hostname"
+    # Stage 111 (v0.130.0-alpha): capability tokens. cap_take("E")
+    # mints a Cap[E] value (only in main or a fn declaring E);
+    # cap_effect_name(c) reads the effect name back from a token.
+    # Both are pure — no edge, no requirement; the AUTHORITY check
+    # lives in check_builtin_call, the GRANT accounting in cap_grants.
+    || n == "cap_take" || n == "cap_effect_name"
 }
 
 fn list_has(list: list[str], x: str) -> bool {
@@ -306,6 +312,13 @@ fn type_exists(ctx: Ctx, t: str) -> bool {
     # Stage 34 (v0.53.0-alpha): Stream[T] — built-in generic wrapper.
     if is_stream_t(t) {
         return type_exists(ctx, stream_inner_t(t))
+    }
+    # Stage 111 (v0.130.0-alpha): Cap[E] is a built-in wrapper whose
+    # argument names an EFFECT, not a type — no struct/enum lookup, no
+    # recursion into the bracket (the parser already validated E against
+    # the nine-effect vocabulary; re-validate defensively).
+    if is_cap_t(t) {
+        return is_effect_name(cap_inner_t(t))
     }
     let base: str = type_base(t)
     let args: list[str] = type_args(t)
@@ -628,6 +641,13 @@ fn is_clone_supported(t: str) -> bool {
     if t == "str" {
         return true
     }
+    # Stage 111: a capability cannot be duplicated — cloning a Cap[E]
+    # would mint authority. clone() on it is rejected with a dedicated
+    # message by the full clone_supported (check_expr.hls); this table
+    # keeps generic containers of caps un-cloneable too.
+    if is_cap_t(t) {
+        return false
+    }
     if is_list_t(t) {
         return is_clone_supported(list_elem_t(t))
     }
@@ -646,6 +666,39 @@ fn add_edge(ctx: Ctx, cur: str, callee: str) -> void {
         ctx.edges.set(cur, [])
     }
     ctx.edges.get_or(cur, []).push(callee)
+}
+
+# --- Stage 111 (v0.130.0-alpha): capability-token authority ---
+#
+# cap_grants(ctx, key) — the effects function `key` holds as FIRST-CLASS
+# authority, on top of its declared `uses` clause. A body is granted an
+# effect exactly when one of these holds:
+#   1. a direct parameter of type Cap[E] (the family form Cap[IO]
+#      confers the whole hosted family, mirroring `uses IO`), or
+#   2. the body itself called cap_take("E") (which the checker only
+#      accepts in `main` or a fn already declaring E).
+# Caps stored deeper (struct fields, list elements) are plumbing: they
+# can be carried around but confer no authority by themselves — a body
+# that acts through one must ALSO take it as a direct parameter. That
+# keeps the audit statement exact: a signature names all the authority
+# its body can exercise.
+fn cap_grants(ctx: Ctx, key: str) -> list[str] {
+    let out: list[str] = []
+    let f: FnInfo = ctx.fns.get_or(key, dummy_fn())
+    let mut i: int = 0
+    while i < f.ptypes.len() {
+        if is_cap_t(f.ptypes.get(i)) {
+            cap_family_add(out, cap_inner_t(f.ptypes.get(i)))
+        }
+        i = i + 1
+    }
+    let taken: list[str] = ctx.cap_taken.get_or(key, [])
+    i = 0
+    while i < taken.len() {
+        cap_family_add(out, taken.get(i))
+        i = i + 1
+    }
+    return out
 }
 
 # --- Stage 9-alpha: fine-grained effects helpers (v0.5.0-alpha) ---
@@ -2388,6 +2441,18 @@ fn check_crate_modes(ctx: Ctx) -> void {
         if f.effects.len() > 0 {
             cerr(f.line, "function '" + f.name + "' declares `uses " + fmt_effects(f.effects) + "` — capabilities are unavailable in " + label + " mode (no OS calls; every function must be pure)")
         }
+        # Stage 111: no capability types either — a freestanding image
+        # has no OS behind it, so there is no authority to hold or take.
+        let mut cj: int = 0
+        while cj < f.ptypes.len() {
+            if is_cap_t(f.ptypes.get(cj)) {
+                cerr(f.line, "capability type '" + f.ptypes.get(cj) + "' is unavailable in " + label + " mode (no OS calls — there is no OS authority to hold)")
+            }
+            cj = cj + 1
+        }
+        if is_cap_t(f.ret) {
+            cerr(f.line, "capability type '" + f.ret + "' is unavailable in " + label + " mode (no OS calls — there is no OS authority to hold)")
+        }
         ki = ki + 1
     }
 }
@@ -2484,6 +2549,14 @@ fn check_program(ctx: Ctx) -> void uses Fs {
         let mut j: int = 0
         while j < f.params.len() {
             require_type(ctx, f.ptypes.get(j), f.line, "parameter type")
+            # Stage 111: a `pure` function holds no authority — a Cap[E]
+            # parameter would let its body discharge effect requirements
+            # through cap_grants, contradicting the pure contract (the
+            # computed set must be empty for a pure fn). Rejected at the
+            # signature, same place the refinement validators hook.
+            if f.is_pure && is_cap_t(f.ptypes.get(j)) {
+                cerr(f.line, "pure function '" + f.name + "' cannot take a capability parameter (pure functions hold no authority)")
+            }
             # Stage 98: parameter refinements (validated once, cached).
             if f.param_preds.has(f.params.get(j)) {
                 validate_refinement_hlc(ctx, f.ptypes.get(j),
@@ -2821,6 +2894,12 @@ fn collect_insts(ctx: Ctx, t: str) -> void {
         collect_insts(ctx, stream_inner_t(t))
         return
     }
+    # Stage 111: Cap[E]'s bracket names an EFFECT — nothing inside can
+    # contain a struct/enum instantiation; the wrapper itself has no
+    # C struct (hl_cap_t is a scalar), so no instantiation is recorded.
+    if is_cap_t(t) {
+        return
+    }
     let base: str = type_base(t)
     let args: list[str] = type_args(t)
     # Skip if the base isn't a known struct/enum — it's a type param.
@@ -2874,6 +2953,11 @@ fn type_is_concrete(ctx: Ctx, t: str) -> bool {
     }
     if is_taint_t(t) {
         return type_is_concrete(ctx, taint_inner_t(t))
+    }
+    # Stage 111: Cap[E] is always concrete — the bracket names an effect
+    # (validated by the parser), never a type parameter.
+    if is_cap_t(t) {
+        return true
     }
     let base: str = type_base(t)
     let args: list[str] = type_args(t)

@@ -7153,3 +7153,82 @@ ledger, the demos with interpreter/native byte parity, and the
 tools. The enforcement sections need Linux seccomp and a C
 compiler, and say so when a host has neither; on this machine they
 run for real.
+
+## 65. Capability tokens — `Cap[Net]` as a value (Stage 111 — v0.130.0-alpha)
+
+Until Stage 111 the only authorization an effect had was the word
+`uses Net` on a signature — a static claim checked against the call-graph
+fixpoint, invisible to the value level. Stage 111 gives the effect a
+FIRST-CLASS value: `Cap[E]`, a capability token whose bracket names one
+of the nine effects (`IO, Fs, Clock, Args, Exit, Net, Rand, Proc, Conc`
+— the same vocabulary `uses`, the audit and the sandbox speak). A token
+is a plain value: it can be bound, passed, returned, and stored in a
+struct field, and it is opaque — no fields, no printing (the `str`-typed
+sinks reject it by type), no equality; `cap_effect_name(c) -> str` reads
+its static identity back, on both front-ends, byte for byte.
+
+### 65.1. Minting — where authority comes from
+
+Tokens are minted by `cap_take("Net") -> Cap[Net]`. The argument must be
+a string literal naming an effect (capabilities are static; the token's
+type carries the effect), and the caller must already hold the
+authority: `main` — the process entry, which holds every effect
+ambiently — or a function that itself declares `uses E`. Anywhere else
+the checker refuses: *cap_take('Net') may only be called from 'main' or
+a function declaring 'uses Net' (capabilities originate at the process
+entry or an explicit grant)*. There is no literal, no constructor, and
+no `taint_mark`-style generic wrapper that could forge one; a
+capability exists only where the checker watched it come into being.
+
+### 65.2. The grant rule — signatures carry authority
+
+A function's body is GRANTED an effect exactly when one of these holds:
+(1) the function is `main`; (2) it declares a direct parameter of type
+`Cap[E]` — the family form `Cap[IO]` confers the whole hosted family
+`{IO, Fs, Clock, Args, Exit}`, mirroring the parse-time `uses IO`
+blanket, while the four independent effects confer themselves; (3) its
+body called `cap_take("E")`. At enforcement time the fixpoint is
+untouched — the requirement still propagates through every edge, so
+`hls-audit`'s `computed_effects` and the Stage-110 sandbox derivation
+stay honest — and the per-function check becomes
+`missing = computed − declared − grants`. Two consequences the tests
+pin: a caller of a capability-using function still sees the requirement
+(authority does not leak transitively — it must be explicit at every
+signature it crosses), and a capability stored DEEPER (a struct field, a
+list element) is plumbing: it travels, but it confers nothing — the
+body that acts through one must also take it as a direct parameter,
+which keeps the exact audit statement that a signature names all the
+authority its body can exercise.
+
+### 65.3. Move-only, no duplication, no authority in pure code
+
+Cloning a token would mint authority, so `clone()` rejects it — and
+rejects every composite containing one (a struct with a `Cap` field, a
+`list[Cap[Net]]`), the same struct-aware recursion that protects Task
+join handles: *capabilities, and composites containing them cannot be
+cloned*. Tokens are Send (authority may cross a `spawn`, freshly minted
+at the call site and granted through the worker's parameter). A `pure`
+function holds no authority: Cap parameters are rejected at the
+signature, and `cap_take` cannot fire inside one — so the pure
+contract's empty-computed-set rule is unchanged. In `#![no_std]` and
+`#![freestanding]` crates the whole mechanism is unavailable — a
+freestanding image has no OS behind it, so there is no authority to
+hold — with dedicated messages for the type, the mint, and the `uses`
+clause it would replace.
+
+### 65.4. The runtime and the gates
+
+The C representation is one pointer-sized scalar: `hl_cap_t` is the
+static string of the effect name the token carries — no allocation, no
+refcount, no block-exit cleanup, `hl_cap_name` wraps it into an `hl_str`
+for `cap_effect_name`. Boxed into containers, a capability behaves like
+a boxed primitive (single-owner, freed, never released). The
+interpreter mints a `{"cap": True, "effect": name}` wrapper; the
+differential gates require byte-identical output. The Stage 111
+acceptance gate (`make cap-acceptance`, seven sections, 34 checks)
+covers the parse matrix (nine effects, the refusals, the shadowing
+ban), the mint rules, the grant rule (including the transitive and
+struct-field holes), the opaqueness, the crate modes, the
+interpreter/native differential for the five `feat_stage111` programs
+and the demo under both `-O` modes, and the `--audit` Capability
+tokens section — word-for-word on both front-ends.

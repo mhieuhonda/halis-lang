@@ -453,6 +453,59 @@ else
     bad "hls-reverify failed on hmac_proven (rc=$s108d_rc)"
 fi
 
+# Stage 111: capability tokens. Every feat_stage111 program must be
+# byte-identical interpreter vs native (default AND -O fast), the
+# fail-side rules must stay rejected, and the demo must run green on
+# both front-ends.
+for f in tests/ok/feat_stage111_*.hls; do
+    [ -f "$f" ] || continue
+    name=$(basename "$f" .hls)
+    if [ ! -x "$TMP/hlc1" ]; then
+        python3 boot/boot.py src/hlc.hls src/hlc.hls "$TMP/hlc_nat.c" >/dev/null 2>&1
+        gcc -O2 -o "$TMP/hlc1" "$TMP/hlc_nat.c" -lm -pthread 2>/dev/null
+    fi
+    interp_out=$(timeout 60 python3 boot/boot.py "$f" </dev/null 2>/dev/null); interp_rc=$?
+    if "$TMP/hlc1" "$f" "$TMP/$name.c" >/dev/null 2>&1 \
+            && gcc -O2 -o "$TMP/$name.bin" "$TMP/$name.c" -lm -pthread 2>/dev/null; then
+        nat_out=$(timeout 60 "$TMP/$name.bin" </dev/null 2>/dev/null); nat_rc=$?
+        if [ "$interp_out" == "$nat_out" ] && [ "$interp_rc" == "$nat_rc" ]; then
+            ok "$name (native matches interpreter)"
+        else
+            bad "$name (diverges: interp=$interp_rc nat=$nat_rc)"
+        fi
+    else
+        bad "$name (native compile failed)"
+    fi
+    if "$TMP/hlc1" --fast "$f" "$TMP/$name.fast.c" >/dev/null 2>&1 \
+            && gcc -O2 -o "$TMP/$name.fast.bin" "$TMP/$name.fast.c" -lm -pthread 2>/dev/null; then
+        fast_out=$(timeout 60 "$TMP/$name.fast.bin" </dev/null 2>/dev/null); fast_rc=$?
+        if [ "$interp_out" == "$fast_out" ] && [ "$interp_rc" == "$fast_rc" ]; then
+            ok "$name (-O fast matches interpreter)"
+        else
+            bad "$name (-O fast diverges: interp=$interp_rc fast=$fast_rc)"
+        fi
+    else
+        bad "$name (fast compile failed)"
+    fi
+done
+# The fail-side authority rules must hold on the native front-end too:
+# every fail_stage111 program is refused by hlc with its reason.
+cap_fails=0
+for f in tests/fail/fail_stage111_*.hls; do
+    [ -f "$f" ] || continue
+    if [ ! -x "$TMP/hlc1" ]; then
+        python3 boot/boot.py src/hlc.hls src/hlc.hls "$TMP/hlc_nat.c" >/dev/null 2>&1
+        gcc -O2 -o "$TMP/hlc1" "$TMP/hlc_nat.c" -lm -pthread 2>/dev/null
+    fi
+    if "$TMP/hlc1" "$f" "$TMP/cap_fail.c" >/dev/null 2>&1; then
+        bad "$(basename "$f" .hls) (hlc accepted a capability violation)"
+        cap_fails=$((cap_fails+1))
+    fi
+done
+if [ "$cap_fails" -eq 0 ]; then
+    ok "fail_stage111_*: hlc refuses every capability violation"
+fi
+
 # Stage 98: refinement types. Every refined slot is guarded at runtime
 # (fn entry / return / let / assign / construction); proven sites are
 # elided. The interpreter and the native build (default AND -O fast)

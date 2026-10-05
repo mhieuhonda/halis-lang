@@ -3,7 +3,8 @@ boot/checker.py Checker class (lines 4432..4792), split for
 maintainability. The final Checker class assembles all mixins in
 boot/checking/checker.py - behavior is unchanged."""
 from .helpers import (
-    BUILTIN_EFFECTS, instantiate_type, type_args, type_base,
+    BUILTIN_EFFECTS, cap_family_add, cap_inner, instantiate_type, is_cap,
+    type_args, type_base,
 )
 from ..compat import zip_strict
 
@@ -269,6 +270,28 @@ class CheckerMatch_fx(object):
         return success_t
 
     # ---------- effects (Stage 9-alpha: fine-grained, set-based) ----------
+    def cap_grants(self, key, fn):
+        """Stage 111 (v0.130.0-alpha): the effects function `key` holds as
+        FIRST-CLASS authority, on top of its declared `uses` clause. A
+        body is granted an effect exactly when one of these holds:
+          1. a direct parameter of type Cap[E] (the family form Cap[IO]
+             confers the whole hosted family, mirroring `uses IO`), or
+          2. the body itself called cap_take("E") (which the checker
+             only accepts in `main` or a fn already declaring E).
+        Caps stored deeper (struct fields, list elements) are plumbing:
+        they can be carried around but confer no authority by
+        themselves — a body that acts through one must ALSO take it as
+        a direct parameter. That keeps the audit statement exact: a
+        signature names all the authority its body can exercise.
+        Mirrors cap_grants in src/hlc/checker.hls (same order)."""
+        out = []
+        for _pn, pt, _ in fn["params"]:
+            if is_cap(pt):
+                cap_family_add(out, cap_inner(pt))
+        for eff in self.cap_taken.get(key, []):
+            cap_family_add(out, eff)
+        return out
+
     def check_effects(self):
         """Fixpoint on the static call graph that computes, per function, the
         SET of effects its body transitively requires. A function passes iff
@@ -322,7 +345,17 @@ class CheckerMatch_fx(object):
         for key, fn in self.fns.items():
             declared = fn["effects"]
             computed = eff[key]
-            missing = computed - declared
+            # Stage 111: capability grants — a fn holding Cap[E]
+            # authority (a direct Cap[E] parameter, or a cap_take("E")
+            # call in its body) discharges the E requirement without a
+            # `uses` clause. The GRANT IS EXPLICIT: the signature
+            # carries the Cap[E] parameter, so the audited surface
+            # stays exact. Pure fns are unaffected — they can hold no
+            # caps (Cap parameters are rejected at the signature;
+            # cap_take requires main or a declared effect), so their
+            # computed set must still be empty.
+            grants = set(self.cap_grants(key, fn))
+            missing = (computed - declared) - grants
             if not missing:
                 # If the function is marked `pure`, verify it actually is.
                 if fn.get("pure", False):
@@ -356,7 +389,9 @@ class CheckerMatch_fx(object):
                     else:
                         c_eff = eff.get(c, set())
                     callee_disp = c
-                violated = c_eff - declared
+                # Stage 111: the witness must name an effect the fn
+                # actually lacks — cap-granted effects are not missing.
+                violated = (c_eff - declared) - grants
                 if not violated:
                     continue
                 miss = sorted(violated)[0]

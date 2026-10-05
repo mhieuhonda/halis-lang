@@ -5,10 +5,10 @@ boot/checking/checker.py - behavior is unchanged."""
 from ..lexer import HLError
 from .. import linkerscript
 from .helpers import (
-    BARE_METAL_TYPE_MSG, BUILTIN_FNS, chan_inner, future_inner, is_chan,
-    is_future, is_list, is_map, is_stream, is_taint, is_task, list_elem,
-    map_val, stream_inner, taint_inner, task_inner, type_args, type_base,
-    bare_metal_triple, type_mentions_float,
+    BARE_METAL_TYPE_MSG, BUILTIN_FNS, cap_inner, chan_inner, future_inner,
+    is_cap, is_chan, is_effect_name, is_future, is_list, is_map, is_stream,
+    is_taint, is_task, list_elem, map_val, stream_inner, taint_inner,
+    task_inner, type_args, type_base, bare_metal_triple, type_mentions_float,
 )
 from ..compat import zip_strict
 
@@ -23,6 +23,12 @@ class CheckerCore(object):
         self.cur_fn = None
         self.cur_fn_ret = "void"  # for `?` propagation
         self.cur_typeparams = set()  # type params valid in the current context
+        # Stage 111 (v0.130.0-alpha): fn key -> effect names that fn's
+        # body took via cap_take("E") calls (first-take order, deduped).
+        # Recorded while bodies are checked; consumed by cap_grants
+        # during the effects enforcement — a body that took a token
+        # holds its authority. Mirrors ctx.cap_taken in src/hlc.
+        self.cap_taken = {}
         # Structs that declare at least one defaulted field — constructing
         # one may evaluate the default expressions (side effects!), so
         # check_structlit adds an edge to the synthetic "@default.<Struct>"
@@ -103,6 +109,13 @@ class CheckerCore(object):
             # Stage 34: Stream[T] is a built-in generic wrapper. T must
             # exist and cannot be void.
             return self.type_exists(stream_inner(t), node)
+        if is_cap(t):
+            # Stage 111 (v0.130.0-alpha): Cap[E] is a built-in wrapper
+            # whose argument names an EFFECT, not a type — no struct/
+            # enum lookup, no recursion into the bracket (the parser
+            # already validated E against the nine-effect vocabulary;
+            # re-validate defensively).
+            return is_effect_name(cap_inner(t))
         base = type_base(t)
         args = type_args(t)
         if base in self.structs or base in self.enums:
@@ -233,6 +246,16 @@ class CheckerCore(object):
                              % fn["struct"], fn)
             for pn, pt, _ in fn["params"]:
                 self.require_type(pt, fn, "parameter type")
+                # Stage 111: a `pure` function holds no authority — a
+                # Cap[E] parameter would let its body discharge effect
+                # requirements through cap_grants, contradicting the
+                # pure contract (the computed set must be empty for a
+                # pure fn). Rejected at the signature, same place the
+                # refinement validators hook.
+                if fn.get("pure", False) and is_cap(pt):
+                    self.err("pure function '%s' cannot take a capability "
+                             "parameter (pure functions hold no authority)"
+                             % fn["name"], fn)
                 # Stage 98: parameter refinements (validated once, cached).
                 pref = fn.get("param_preds", {}).get(pn)
                 if pref is not None:
@@ -405,6 +428,18 @@ class CheckerCore(object):
                          "function must be pure)"
                          % (fn["name"], ", ".join(sorted(declared)), label),
                          fn)
+            # Stage 111: no capability types either — a freestanding
+            # image has no OS behind it, so there is no authority to
+            # hold or take.
+            for _pn, pt, _ in fn["params"]:
+                if is_cap(pt):
+                    self.err("capability type '%s' is unavailable in %s "
+                             "mode (no OS calls — there is no OS authority "
+                             "to hold)" % (pt, label), fn)
+            if is_cap(fn["ret"]):
+                self.err("capability type '%s' is unavailable in %s mode "
+                         "(no OS calls — there is no OS authority to hold)"
+                         % (fn["ret"], label), fn)
 
     # ---------- Stage 86 (v0.105.0-alpha): #[irq_handler] signature ----
     # A handler returns through IRETQ, so it returns void, and it takes

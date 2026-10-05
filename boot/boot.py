@@ -662,13 +662,17 @@ def print_audit(program, checker):
     for key, fn in fns.items():
         decl = fn["effects"]
         comp = computed.get(key, set())
+        # Stage 111: capability-granted effects are not missing — the
+        # status column must agree with the checker's enforcement
+        # (missing = computed − declared − cap_grants).
+        grants = set(checker.cap_grants(key, fn))
         # If `pure` was declared, surface it in the declared column.
         if fn.get("pure", False):
             decl_disp = "pure" if not decl else ("pure + " + ", ".join(sorted(decl)))
         else:
             decl_disp = ", ".join(sorted(decl)) if decl else "(none - pure)"
         comp_disp = ", ".join(sorted(comp)) if comp else "(none)"
-        missing = comp - decl
+        missing = (comp - decl) - grants
         if missing:
             status = "VIOLATION: missing " + ", ".join(sorted(missing))
         elif fn.get("pure", False) and comp:
@@ -790,6 +794,19 @@ def print_audit(program, checker):
                   if f.get("attrs", {}).get("align", -1) >= 0)
     if aligned:
         print("  #[align(N)] annotations: %d" % aligned)
+    # Stage 111 (v0.130.0-alpha): capability tokens — every function
+    # whose authority comes from a Cap[E] parameter or a cap_take call
+    # rather than (only) a `uses` clause. Word-for-word what the
+    # self-hosted --audit prints (the gates compare the two).
+    cap_rows = []
+    for key, fn in fns.items():
+        grants = checker.cap_grants(key, fn)
+        if grants:
+            cap_rows.append("    %s: %s" % (key, ", ".join(grants)))
+    if cap_rows:
+        print("  Capability tokens (Cap[E] parameters / cap_take calls):")
+        for row in cap_rows:
+            print(row)
     # Active vs reserved effects table.
     print("")
     print("  Active effects:    IO, Fs, Clock, Args, Exit, Net, Rand, Proc, Conc")

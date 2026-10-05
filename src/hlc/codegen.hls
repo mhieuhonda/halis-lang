@@ -54,6 +54,14 @@ fn c_type(ctx: Ctx, t_in: str) -> str {
     if is_future_t(t) || is_stream_t(t) {
         return "hl_chan*"
     }
+    # Stage 111 (v0.130.0-alpha): Cap[E] is an opaque scalar token — the
+    # C representation is a plain pointer-sized value (the static name
+    # of the effect it carries). Zero cleanup, zero refcount: a
+    # capability is not a heap object, exactly like taint it is a
+    # check-time property with a trivial runtime form.
+    if is_cap_t(t) {
+        return "hl_cap_t"
+    }
     # Deep-scan-28: escape the final identifier — a bare non-generic
     # user struct/enum named a C keyword (e.g. `register`) must emit
     # "register_hl*"; mangled composites pass through unchanged.
@@ -71,6 +79,11 @@ fn is_ptr_type(t: str) -> bool {
     if is_chan_t(t) || is_task_t(t) {
         # Stage 16: channels and task handles are heap objects.
         return true
+    }
+    # Stage 111: Cap[E] lowers to a scalar (hl_cap_t) — not a pointer
+    # the cleanup/hoist machinery would try to release.
+    if is_cap_t(t) {
+        return false
     }
     # Stage 33/34: Future[T] and Stream[T] are heap objects (channels).
     if is_future_t(t) || is_stream_t(t) {
@@ -488,6 +501,11 @@ fn is_ptr_t(ctx: Ctx, t_in: str) -> bool {
     if is_taint_t(t) {
         return is_ptr_t(ctx, taint_inner_t(t))
     }
+    # Stage 111: a capability token is a scalar (the static effect-name
+    # string) — no refcount, no block-exit cleanup, no retain wrapping.
+    if is_cap_t(t) {
+        return false
+    }
     return true
 }
 
@@ -564,6 +582,11 @@ fn cleanup_fn_for(ctx: Ctx, t_in: str) -> str {
 fn elem_free_fn(ctx: Ctx, t_in: str) -> str {
     let t: str = strip_taint(inst_t(ctx, t_in))
     if t == "int" || t == "float" || t == "bool" {
+        return "free"
+    }
+    # Stage 111: a boxed capability is a single-owner scalar box — the
+    # same lifetime rule as a boxed primitive: free it, never release.
+    if is_cap_t(t) {
         return "free"
     }
     return release_fn_for(ctx, t)
@@ -718,6 +741,13 @@ fn call_result_fresh(ctx: Ctx, e: int) -> bool {
     }
     if name == "taint_mark" || name == "taint_unwrap" {
         return expr_fresh(ctx, ctx.exprs[e].args.get(0))
+    }
+    # Stage 111: cap_take returns a scalar token (hl_cap_t — a C string
+    # constant, nothing refcounted) and cap_effect_name returns a fresh
+    # hl_str (allocated by hl_cap_name, refcnt=1). Treating either as
+    # borrowed would retain-wrap the result and leak it.
+    if name == "cap_take" || name == "cap_effect_name" {
+        return true
     }
     # args()/tainted_args() return the process-lifetime global list.
     # print/println/panic/exit/write_file/len/int/float/clock_ms/

@@ -7,9 +7,11 @@ from .helpers import (
     ALLOC_BUILTINS, ALLOC_METHOD_OPS, BOOL_M, BUILTIN_FNS, FLOAT_M,
     FREESTANDING_DENY_BUILTINS, FREESTANDING_DENY_MSG, INT_M, STR_M,
     _type_mentions_typeparam,
-    chan_inner, future_inner,
-    instantiate_type, is_chan, is_future, is_list, is_map, is_owned_type, is_stream, is_taint,
-    is_tainted_type, is_task, list_elem, list_taint_inner, map_val, stream_inner, taint_inner, task_inner,
+    cap_inner, chan_inner, future_inner,
+    instantiate_type, is_cap, is_chan, is_effect_name, is_future, is_list,
+    is_map, is_owned_type, is_stream, is_taint,
+    is_tainted_type, is_task, list_elem, list_taint_inner, map_val,
+    stream_inner, taint_inner, task_inner,
     type_args, type_base, unify,
 )
 from ..compat import zip_strict
@@ -392,6 +394,58 @@ class CheckerCall(object):
                          "(it is a compile-time constant)", e)
             self.check_expr(args[0], env, "str")
             return "bool"
+        # Stage 111 (v0.130.0-alpha): cap_take("Net") -> Cap[Net] — split
+        # a first-class capability token off the ambient authority. The
+        # effect must be a STRING LITERAL (capabilities are static; the
+        # token type names the effect). Authority rule: only `main` —
+        # the process entry that holds everything ambiently — or a fn
+        # ALREADY declaring `uses E` may mint a token; every other fn
+        # receives authority as a Cap[E] parameter, explicitly, in its
+        # signature. Pure builtins: no edge, no requirement — the grant
+        # is accounted by cap_grants at enforcement time. Forbidden in
+        # no_std/freestanding (no OS, no authority to hold).
+        if name == "cap_take":
+            if self.crate_mode_flags.get("no_std"):
+                self.err("cap_take() is not available in #![no_std] mode "
+                         "(there is no OS authority to hold)", e)
+            need(1)
+            if e["args"][0].get("k") != "str":
+                self.err("cap_take() expects a string literal naming an "
+                         "effect (capabilities are static)", e)
+            self.check_expr(args[0], env, "str")
+            eff = e["args"][0]["v"]
+            if isinstance(eff, bytes):
+                eff = eff.decode("utf-8", "replace")
+            if not is_effect_name(eff):
+                self.err("unknown capability 'Cap[%s]' (a capability names "
+                         "one of the nine effects: IO, Fs, Clock, Args, "
+                         "Exit, Net, Rand, Proc, Conc)" % eff, e)
+            fn = self.fns.get(self.cur_fn)
+            if fn is not None:
+                declared = fn.get("effects", set())
+            else:
+                declared = set()
+            if self.cur_fn != "main" and eff not in declared:
+                self.err("cap_take('%s') may only be called from 'main' or "
+                         "a function declaring 'uses %s' (capabilities "
+                         "originate at the process entry or an explicit "
+                         "grant)" % (eff, eff), e)
+            taken = self.cap_taken.setdefault(self.cur_fn, [])
+            if eff not in taken:
+                taken.append(eff)
+            return "Cap[%s]" % eff
+        # Stage 111: cap_effect_name(c) -> str — the effect name a
+        # capability token carries. Capabilities are opaque values (no
+        # fields, no printing — the str-typed print/fmt sinks reject
+        # them by type), so this is the only way to observe one. Pure:
+        # a read of the token's static identity, no edge.
+        if name == "cap_effect_name":
+            need(1)
+            at = argt(0, None)
+            if not is_cap(at):
+                self.err("cap_effect_name() expects a Cap[E] capability, "
+                         "got %s" % at, e)
+            return "str"
         # Stage 21: simd_cpu_supports("avx2") -> bool — runtime CPU
         # probe (CPUID on x86, NEON compile check on aarch64). Pure.
         if name == "simd_cpu_supports":
@@ -582,8 +636,8 @@ class CheckerCall(object):
                 self.err("clone() requires an owned (heap) type, got %s" % at, e)
             if not self.clone_supported(at):
                 self.err("clone() on type %s is not supported (Task join "
-                         "handles and composites containing them cannot "
-                         "be cloned)" % at, e)
+                         "handles, capabilities, and composites containing "
+                         "them cannot be cloned)" % at, e)
             # Stage 91: the argument is an owned heap type by rule, so
             # the deep clone allocates (a generic instantiation with a
             # primitive binding lowers to the identity — the verifier
@@ -1566,6 +1620,12 @@ class CheckerCall(object):
         if is_chan(t):
             return True
         if is_task(t):
+            return False
+        # Stage 111: a capability token cannot be cloned — duplication
+        # would mint authority. Composites containing one are rejected
+        # by the recursion below (struct fields / enum payloads /
+        # list+map elements).
+        if is_cap(t):
             return False
         # Stage 33: Future[T] clones by SHARING (atomic refcount +1 —
         # same as a channel; a future IS a channel under the hood).

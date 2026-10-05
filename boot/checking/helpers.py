@@ -60,6 +60,41 @@ def map_val(t):
     return t[9:-1]
 
 
+# Stage 111 (v0.130.0-alpha): capability-token wrapper `Cap[E]`.
+# E names one of the nine effects — a capability is the FIRST-CLASS
+# VALUE form of an effect ("Cap[Net] as a value, not just effect").
+# The parser only accepts an effect name inside the brackets, so a Cap
+# type is always well-formed by construction.
+def is_cap(t):
+    return t.startswith("Cap[")
+
+
+def cap_inner(t):
+    return t[4:-1].strip()
+
+
+# The nine-effect vocabulary every `uses` clause, audit row and
+# capability speaks. Single source of truth for validating Cap[E] and
+# cap_take("E") — mirrors is_effect_name in src/hlc/types.hls.
+CAP_EFFECTS = ("IO", "Fs", "Clock", "Args", "Exit",
+               "Net", "Rand", "Proc", "Conc")
+
+
+def is_effect_name(e):
+    return e in CAP_EFFECTS
+
+
+def cap_family_add(out, e):
+    """The authority an `e`-capability confers, appended to `out`
+    (deduped, order-preserving). `Cap[IO]` mirrors the parse-time
+    `uses IO` blanket: it covers the whole hosted family. The four
+    independent effects cover themselves."""
+    fam = ("IO", "Fs", "Clock", "Args", "Exit") if e == "IO" else (e,)
+    for x in fam:
+        if x not in out:
+            out.append(x)
+
+
 # Stage 16 (v0.27.0-alpha): built-in concurrency wrappers.
 # `Chan[T]` — a message-passing channel (MPMC, unbounded queue, blocking
 # recv). `Task[R]` — a spawned task's join handle (R = spawned fn's return
@@ -411,6 +446,12 @@ BUILTIN_FNS = {
     # take them as explicit arguments; only the live emit path reads
     # them (differential tests use fixed synthetic values).
     "proc_pid", "sys_hostname",
+    # Stage 111 (v0.130.0-alpha): capability tokens. cap_take("E")
+    # mints a Cap[E] value (only in main or a fn declaring E);
+    # cap_effect_name(c) reads the effect name back from a token.
+    # Both are pure — no edge, no requirement; the AUTHORITY check
+    # lives in check_builtin_call, the GRANT accounting in cap_grants.
+    "cap_take", "cap_effect_name",
 }
 
 # Stage 77 (v0.96.0-alpha): pure builtins that are UNAVAILABLE in

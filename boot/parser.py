@@ -1,5 +1,6 @@
 """Stage-0 parser for HLS. Conforms to SPEC.md sections 4-6, 11b-12 (v0.3)."""
 from .lexer import HLError, RESERVED_IDENTIFIERS
+from .checking.helpers import is_effect_name  # noqa: E402  (Stage 111: Cap[E] validation)
 
 INT64_MAX = 9223372036854775807
 INT64_MIN = -9223372036854775808
@@ -919,7 +920,7 @@ class Parser:
             name = t["v"]
             if name in ("int", "float", "bool", "str", "void", "list",
                         "map", "tainted", "Chan", "Task", "Option",
-                        "Result"):
+                        "Result", "Cap"):
                 self.err("type parameter cannot be named '%s' (it is a "
                          "builtin type name and would shadow it)" % name, t)
             tps.append(name)
@@ -1350,6 +1351,22 @@ class Parser:
             if inner == "void":
                 self.err("Stream[T] element type cannot be void", t)
             return "Stream[%s]" % inner
+        # Stage 111 (v0.130.0-alpha): `Cap[E]` — a capability token, the
+        # first-class VALUE form of an effect. The bracket names an
+        # EFFECT, not a type — this branch reads a bare identifier and
+        # validates it against the nine-effect vocabulary (unlike every
+        # other wrapper, whose argument is a type). The checker grants a
+        # function the authority of every Cap[E] parameter it declares;
+        # cap_take is the only way to mint a token.
+        if base == "Cap":
+            self.eat_sym("[")
+            eff = self.eat_ident()["v"]
+            if not is_effect_name(eff):
+                self.err("unknown capability 'Cap[%s]' (a capability names "
+                         "one of the nine effects: IO, Fs, Clock, Args, "
+                         "Exit, Net, Rand, Proc, Conc)" % eff, t)
+            self.eat_sym("]")
+            return "Cap[%s]" % eff
         if base in PRIM_TYPES:
             if base == "void" and not allow_void:
                 self.err("void can only be used as a return type", t)

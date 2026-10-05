@@ -83,6 +83,44 @@ fn check_builtin_call(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, 
         check_expr(ctx, env, cur, ctx.exprs[e].args.get(0), "str")
         return "bool"
     }
+    # Stage 111 (v0.130.0-alpha): cap_take("Net") -> Cap[Net] — split a
+    # first-class capability token off the ambient authority. The effect
+    # must be a STRING LITERAL (capabilities are static; the token type
+    # names the effect). Authority rule: only `main` — the process entry
+    # that holds everything ambiently — or a fn ALREADY declaring
+    # `uses E` may mint a token; every other fn receives authority as a
+    # Cap[E] parameter, explicitly, in its signature. Pure builtins: no
+    # edge, no requirement — the grant is accounted by cap_grants at
+    # enforcement time. Forbidden in no_std/freestanding (no OS, no
+    # authority to hold).
+    if name == "cap_take" {
+        if ctx.crate_no_std {
+            cerr(line, "cap_take() is not available in #![no_std] mode (there is no OS authority to hold)")
+        }
+        if ctx.exprs[e].args.len() != 1 {
+            cerr(line, "cap_take() expects 1 argument (the capability name)")
+        }
+        if ctx.exprs[ctx.exprs[e].args.get(0)].kind != "str" {
+            cerr(line, "cap_take() expects a string literal naming an effect (capabilities are static)")
+        }
+        check_expr(ctx, env, cur, ctx.exprs[e].args.get(0), "str")
+        let eff: str = ctx.exprs[ctx.exprs[e].args.get(0)].sval
+        if !is_effect_name(eff) {
+            cerr(line, "unknown capability 'Cap[" + eff + "]' (a capability names one of the nine effects: IO, Fs, Clock, Args, Exit, Net, Rand, Proc, Conc)")
+        }
+        let cf: FnInfo = ctx.fns.get_or(cur, dummy_fn())
+        if cur != "main" && !list_has(cf.effects, eff) {
+            cerr(line, "cap_take('" + eff + "') may only be called from 'main' or a function declaring 'uses " + eff + "' (capabilities originate at the process entry or an explicit grant)")
+        }
+        if !ctx.cap_taken.has(cur) {
+            ctx.cap_taken.set(cur, [])
+        }
+        let taken: list[str] = ctx.cap_taken.get_or(cur, [])
+        if !list_has(taken, eff) {
+            taken.push(eff)
+        }
+        return "Cap[" + eff + "]"
+    }
     # Stage 21: simd_cpu_supports("avx2") -> bool — a runtime CPU probe
     # (CPUID on x86; NEON compile-time check on aarch64). Pure.
     if name == "simd_cpu_supports" {
@@ -435,6 +473,21 @@ fn check_builtin_call(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, 
         }
         return taint_inner_t(a0)
     }
+    # Stage 111 (v0.130.0-alpha): cap_effect_name(c) -> str — the effect
+    # name a capability token carries. Capabilities are opaque values
+    # (no fields, no printing — the str-typed print/fmt sinks reject
+    # them by type), so this is the only way to observe one. Pure: a
+    # read of the token's static identity, no edge.
+    if name == "cap_effect_name" {
+        if nargs != 1 {
+            cerr(line, "cap_effect_name() expects 1 argument")
+        }
+        let a0: str = argt.get(0)
+        if !is_cap_t(a0) {
+            cerr(line, "cap_effect_name() expects a Cap[E] capability, got " + a0)
+        }
+        return "str"
+    }
     if name == "clock_ms" {
         if nargs != 0 {
             cerr(line, "clock_ms() takes no arguments")
@@ -551,7 +604,7 @@ fn check_builtin_call(ctx: Ctx, env: list[map[str, Binding]], cur: str, e: int, 
         # composite containing one) cannot be cloned; a Chan clones by
         # SHARING (atomic refcount + 1).
         if !clone_supported(ctx, at2, []) {
-            cerr(line, "clone() on type " + at2 + " is not supported (Task join handles and composites containing them cannot be cloned)")
+            cerr(line, "clone() on type " + at2 + " is not supported (Task join handles, capabilities, and composites containing them cannot be cloned)")
         }
         # Stage 91: the argument is an owned heap type by rule, so the
         # deep clone allocates (a generic instantiation with a primitive
