@@ -171,7 +171,7 @@ remains green.
 | 108 | Memory-safety re-verification under `-O fast` (proof replay) | ✅ | (done in v0.127.0-alpha) |
 | 109 | Taint-tracking through FFI boundaries | ✅ | (done in v0.128.0-alpha) |
 | 110 | Sandboxed package execution (seccomp-bpf filter) | ✅ | (done in v0.129.0-alpha) |
-| 111 | Capability token types (`Cap[Net]` as a value, not just effect) | ⬜ | 6 weeks |
+| 111 | Capability token types (`Cap[Net]` as a value, not just effect) | ✅ | (done in v0.130.0-alpha) |
 | 112 | Audit-log signing (every privileged op hashed + chained) | ⬜ | 3 weeks |
 
 ### Phase VIII — Developer experience & ecosystem (Stages 113–124)
