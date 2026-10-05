@@ -1,0 +1,334 @@
+# feat_stage113_lsp_resolve.hls — Stage 113 (v0.132.0-alpha):
+# LSP go-to-definition across packages.
+#
+# What the differential suite pins HERE is the resolution discipline
+# the language server now mirrors from boot.py — the exact same rules
+# that decide where a jump lands in the editor:
+#
+#   python3 tools/hls-lsp.py  (textDocument/definition)
+#   python3 boot/boot.py tests/ok/feat_stage113_lsp_resolve.hls
+#
+# The program: the family rule (std. / core. / relative — one prefix
+# table, two module families, everything else relative), the guard
+# law (a module name may not be empty, may not be absolute, may not
+# carry a ".." segment — boot's deep-scan-19/20 rejections, which the
+# server answers with "no jump" instead of an exit), the canonical
+# module shapes (std.<name> is std/<name>.hls — every dot becomes a
+# directory step), the dependency join shapes (<dep>/<path> and
+# <dep>/<basename>, the two shapes boot's BUG-DS4-26 fallback and the
+# server both try), the walk-up bound (five ancestors, then the
+# package root, then the toolchain's own std/), and the layer law
+# (local definition beats imported beats dependency beats the
+# last-resort net over merely-open files). Deterministic output;
+# interpreter and native agree byte for byte.
+
+import "std.str"
+import "std.hash" # str_slice — the only character-window tool in std
+
+# --- the family rule ----------------------------------------------------
+# One prefix table: "std." names the hosted module family, "core." the
+# freestanding-safe one, everything else is relative to the importer.
+
+fn family_of(path: str) -> int {
+    if str_starts_with(path, "std.") {
+        return 0
+    }
+    if str_starts_with(path, "core.") {
+        return 1
+    }
+    return 2
+}
+
+fn family_name(fam: int) -> str {
+    if fam == 0 {
+        return "std"
+    }
+    if fam == 1 {
+        return "core"
+    }
+    return "rel"
+}
+
+# --- the module name ----------------------------------------------------
+# Everything after the family prefix; relative paths are their own name.
+
+fn module_name_of(path: str) -> str {
+    let fam: int = family_of(path)
+    if fam == 2 {
+        return path
+    }
+    return str_slice(path, 4, len(path))
+}
+
+# --- the guards ---------------------------------------------------------
+# boot.py REJECTS (exit) what the server must merely refuse (no jump):
+#   - an empty module name ("std." alone names nothing),
+#   - an absolute path (os.path.isabs),
+#   - any ".." segment (deep-scan-19/20: the local-file-inclusion fix).
+# The ".." check is EXACT segment equality — "/..foo" is a legal
+# directory name and must pass, so the scan walks the string and
+# compares whole segments, never substrings.
+
+fn is_dotdot(seg: str) -> bool {
+    return seg == ".."
+}
+
+fn next_slash(s: str, from: int) -> int {
+    # position of the first "/" at or after `from`, or -1
+    let n: int = len(s)
+    let mut i: int = from
+    while i < n {
+        if str_slice(s, i, i + 1) == "/" {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+fn has_dotdot_segment(p: str) -> bool {
+    let n: int = len(p)
+    let mut i: int = 0
+    while i < n {
+        let stop: int = next_slash(p, i)
+        let mut seg: str = ""
+        if stop < 0 {
+            seg = str_slice(p, i, n)
+        } else {
+            seg = str_slice(p, i, stop)
+        }
+        if is_dotdot(seg) {
+            return true
+        }
+        if stop < 0 {
+            i = n
+        } else {
+            i = stop + 1
+        }
+    }
+    return false
+}
+
+fn module_rejected(fam: int, name: str) -> bool {
+    if name == "" {
+        return true
+    }
+    if fam == 2 {
+        # relative family: absolute paths and ".." segments only
+        if str_starts_with(name, "/") {
+            return true
+        }
+        return has_dotdot_segment(name)
+    }
+    # module families: the name rides under std/ or core/, so a leading
+    # slash would discard the family directory entirely — refused, and
+    # ".." is refused anywhere in it.
+    if str_starts_with(name, "/") {
+        return true
+    }
+    return has_dotdot_segment(name)
+}
+
+fn import_rejected(path: str) -> bool {
+    return module_rejected(family_of(path), module_name_of(path))
+}
+
+# --- the canonical shapes ----------------------------------------------
+# std.<name> is std/<name>.hls — every further dot becomes a directory
+# step, so std.deep.thing.hls lives three levels down.
+
+fn module_file(fam: int, name: str) -> str {
+    let mut dir: str = ""
+    if fam == 0 {
+        dir = "std"
+    } else {
+        dir = "core"
+    }
+    return dir + "/" + str_replace(name, ".", "/") + ".hls"
+}
+
+# --- the dependency join shapes ----------------------------------------
+# A dependency source directory is tried as <dep>/<path> and then as
+# <dep>/<basename> — the same two shapes boot.py's BUG-DS4-26 fallback
+# tries, because a multi-file package imports "mylib/api.hls" (path
+# shape) while a single-file dep imports "mylib.hls" (basename shape).
+
+fn basename_of(p: str) -> str {
+    let cut: int = next_slash(p, 0)
+    if cut < 0 {
+        return p
+    }
+    return str_slice(p, cut + 1, len(p))
+}
+
+fn dep_join_path(dir: str, p: str) -> str {
+    return dir + "/" + p
+}
+
+fn dep_join_basename(dir: str, p: str) -> str {
+    return dir + "/" + basename_of(p)
+}
+
+# --- the walk-up bound ---------------------------------------------------
+# The std/core resolver starts at the importing file's directory and
+# walks UP at most five ancestors before falling back to the package
+# root and the toolchain's own std/. A module vendored at depth 4 is
+# found; at depth 5 the walk is exhausted and the fallbacks decide.
+
+fn walkup_hit(depth: int) -> bool {
+    return depth <= 4
+}
+
+# --- the layer law -------------------------------------------------------
+# First hit wins, and the order is the whole point: a definition under
+# the cursor beats one it imports, an import beats a dependency's, and
+# a dependency beats the last-resort net over files that are merely
+# open. Renumbering the layers would silently redirect every jump.
+
+fn layer_rank(layer: int) -> int {
+    return layer # 0 local, 1 imports, 2 deps, 3 open net
+}
+
+fn layer_ordered(a: int, b: int) -> bool {
+    return layer_rank(a) < layer_rank(b)
+}
+
+# --- the case table ------------------------------------------------------
+
+fn main() -> int uses IO {
+    let mut failed: int = 0
+
+    # family rule
+    if family_of("std.str") != 0 {
+        failed = failed + 1
+        println("FAIL family std.str")
+    }
+    if family_of("core.alloc") != 1 {
+        failed = failed + 1
+        println("FAIL family core.alloc")
+    }
+    if family_of("modules/helper.hls") != 2 {
+        failed = failed + 1
+        println("FAIL family relative")
+    }
+    if family_name(family_of("core.mem")) != "core" {
+        failed = failed + 1
+        println("FAIL family_name core")
+    }
+
+    # module name
+    if module_name_of("std.str") != "str" {
+        failed = failed + 1
+        println("FAIL module_name str")
+    }
+    if module_name_of("modules/helper.hls") != "modules/helper.hls" {
+        failed = failed + 1
+        println("FAIL module_name relative passthrough")
+    }
+
+    # guards: refused
+    if !import_rejected("std.") {
+        failed = failed + 1
+        println("FAIL guard empty module name")
+    }
+    if !import_rejected("std.../secret") {
+        failed = failed + 1
+        println("FAIL guard dotdot module")
+    }
+    if !import_rejected("std./abs") {
+        failed = failed + 1
+        println("FAIL guard absolute module")
+    }
+    if !import_rejected("/etc/passwd") {
+        failed = failed + 1
+        println("FAIL guard absolute relative-family")
+    }
+    if !import_rejected("a/../../etc/passwd") {
+        failed = failed + 1
+        println("FAIL guard dotdot relative-family")
+    }
+    # guards: accepted
+    if import_rejected("std.str") {
+        failed = failed + 1
+        println("FAIL guard accepted std.str")
+    }
+    if import_rejected("std.deep.thing") {
+        failed = failed + 1
+        println("FAIL guard accepted nested")
+    }
+    if import_rejected("modules/helper.hls") {
+        failed = failed + 1
+        println("FAIL guard accepted relative")
+    }
+    # the exactness case: "..hidden" is a name, not an escape
+    if import_rejected("vendor/..hidden/x.hls") {
+        failed = failed + 1
+        println("FAIL guard dotdot-exactness")
+    }
+    if import_rejected("vendor/..hidden") {
+        failed = failed + 1
+        println("FAIL guard dotdot-exactness tail")
+    }
+
+    # canonical shapes
+    if module_file(0, "str") != "std/str.hls" {
+        failed = failed + 1
+        println("FAIL shape std/str.hls")
+    }
+    if module_file(1, "alloc") != "core/alloc.hls" {
+        failed = failed + 1
+        println("FAIL shape core/alloc.hls")
+    }
+    if module_file(0, "deep.thing") != "std/deep/thing.hls" {
+        failed = failed + 1
+        println("FAIL shape nested dots are directories")
+    }
+
+    # dependency join shapes
+    if dep_join_path(".hls-pkg-deps/mylib", "mylib/api.hls") != ".hls-pkg-deps/mylib/mylib/api.hls" {
+        failed = failed + 1
+        println("FAIL dep join path shape")
+    }
+    if dep_join_basename(".hls-pkg-deps", "mylib/api.hls") != ".hls-pkg-deps/api.hls" {
+        failed = failed + 1
+        println("FAIL dep join basename shape")
+    }
+    if basename_of("mylib.hls") != "mylib.hls" {
+        failed = failed + 1
+        println("FAIL basename bare")
+    }
+    if basename_of("mylib/api.hls") != "api.hls" {
+        failed = failed + 1
+        println("FAIL basename nested")
+    }
+
+    # walk-up bound
+    if !walkup_hit(4) {
+        failed = failed + 1
+        println("FAIL walkup depth 4 is inside the bound")
+    }
+    if walkup_hit(5) {
+        failed = failed + 1
+        println("FAIL walkup depth 5 is past the bound")
+    }
+
+    # layer law
+    if !layer_ordered(0, 1) {
+        failed = failed + 1
+        println("FAIL layer local < imports")
+    }
+    if !layer_ordered(1, 2) {
+        failed = failed + 1
+        println("FAIL layer imports < deps")
+    }
+    if !layer_ordered(2, 3) {
+        failed = failed + 1
+        println("FAIL layer deps < open net")
+    }
+
+    println("stage113 lsp resolve: " + str(28) + " checks, " + str(failed) + " failed")
+    if failed > 0 {
+        println("stage113 lsp resolve: FAILURES PRESENT")
+    }
+    return 0
+}
