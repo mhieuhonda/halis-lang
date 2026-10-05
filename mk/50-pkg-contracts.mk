@@ -558,3 +558,50 @@ sandbox-selftest:
 sandbox-acceptance:
 	@echo "[Stage 110 acceptance] running tests/sandbox_acceptance.py..."
 	@$(PYTHON) tests/sandbox_acceptance.py
+
+# ============================================================================
+# Stage 112 (v0.131.0-alpha): hls-auditlog — audit-log signing,
+# every privileged op hashed + chained
+# ============================================================================
+
+# The ops view: make auditlog-list [OP=pkg.lock] [OUTCOME=refused]
+auditlog-list:
+	@if [ -n "$(OP)" ]; then A="--op $(OP)"; else A=""; fi; \
+	if [ -n "$(OUTCOME)" ]; then B="--outcome $(OUTCOME)"; else B=""; fi; \
+	$(PYTHON) tools/hls-auditlog.py list $$A $$B
+
+# One entry, full detail: make auditlog-show SEQ=7
+auditlog-show:
+	@test "x$(SEQ)" != "x" || (echo "Usage: make auditlog-show SEQ=<n>" && false)
+	@$(PYTHON) tools/hls-auditlog.py show $(SEQ)
+
+# Replay the chain: make auditlog-verify
+auditlog-verify:
+	@$(PYTHON) tools/hls-auditlog.py verify
+
+# Checkpoint + sign the audit log with the Stage 106 key:
+# make auditlog-sign KEY=hls-sign.key [OUT=dir]
+auditlog-sign:
+	@test "x$(KEY)" != "x" || (echo "Usage: make auditlog-sign KEY=<secret key> [OUT=<dir>]" && false)
+	@if [ -n "$(OUT)" ]; then O="--out $(OUT)"; else O=""; fi; \
+	$(PYTHON) tools/hls-auditlog.py sign -s $(KEY) $$O
+
+# Verify a signed checkpoint against the current log:
+# make auditlog-verify-sign CKPT=<file> [PUB=<pub key>]
+auditlog-verify-sign:
+	@test "x$(CKPT)" != "x" || (echo "Usage: make auditlog-verify-sign CKPT=<file> [PUB=<pub key>]" && false)
+	@if [ -n "$(PUB)" ]; then P="-p $(PUB)"; else P=""; fi; \
+	$(PYTHON) tools/hls-auditlog.py verify-sign $(CKPT) $$P
+
+# The stage's pinned numbers, through the tool's front door.
+auditlog-selftest:
+	@$(PYTHON) tools/hls-auditlog.py selftest
+
+# Stage 112 acceptance gate: the nine-section battery (the one
+# definition against hpkg_log's own writer, the log, the hooks, the
+# refusals, the launcher, the checkpoint verdicts, the ledgers, the
+# demos, the tools). Tool-only — no solver, no kernel half needed;
+# the native half of the demo parity runs when bin/hlc exists.
+auditlog-acceptance:
+	@echo "[Stage 112 acceptance] running tests/auditlog_acceptance.py..."
+	@$(PYTHON) tests/auditlog_acceptance.py

@@ -1,0 +1,163 @@
+# feat_stage112_auditlog.hls — Stage 112 (v0.131.0-alpha):
+# hls-auditlog, the audit-log signing (every privileged op hashed +
+# chained).
+#
+# What the differential suite pins HERE is the arithmetic the audit
+# tool enforces over the privileged operations:
+#
+#   python3 tools/hls-auditlog.py selftest
+#   python3 boot/boot.py tests/ok/feat_stage112_auditlog.hls
+#
+# The program: the chain binding (prev hash + entry, one flipped byte
+# moves everything after), the closed outcome vocabulary (a refused
+# op is hashed exactly like an ok one — the head moves either way),
+# the privilege inventory's family rule (every op belongs to one of
+# the five tool families, dotted), the checkpoint verdict table
+# (rollback / rewritten / held as predicates over the three
+# comparison facts), and the checkpoint's self-report law (the
+# checkpoint op lands at length + 1 — inside the NEXT checkpoint's
+# reach, never its own). Deterministic output; interpreter and
+# native agree byte for byte.
+
+import "std.str"
+import "std.crypto"
+
+# The chain binding in miniature: digest over prev + body; the same
+# entry hashes the same twice, and one flipped byte of either input
+# moves it — the reason a rewritten entry cannot keep its place.
+fn entry_toy(prev: str, body: str) -> str {
+    return crypto_fnv1a_64_hex(prev + body)
+}
+
+# The outcome vocabulary is CLOSED: two words. The head moves the
+# same distance for either — a refusal occupies a seq like a
+# success. 0 = ok, 1 = refused.
+fn outcome_word(code: int) -> int {
+    if code == 0 {
+        return 0
+    }
+    if code == 1 {
+        return 1
+    }
+    panic("outcome_out_of_vocabulary")
+}
+
+# The head advance: whatever the outcome, the next entry chains one
+# step — the hash chain does not grade the news it carries.
+fn head_advance(prev: str, body: str, outcome: int) -> str {
+    let word: int = outcome_word(outcome)
+    if word == 0 {
+        return entry_toy(prev, body)
+    }
+    return entry_toy(prev, body + ":refused")
+}
+
+# The privilege inventory's family rule: every op is
+# family.action — one of five families, a dot, an action.
+fn op_family_ok(op: str, family: str) -> bool {
+    return str_starts_with(op, family + ".")
+}
+
+# The checkpoint verdict table, as the tool computes it: below the
+# signed length is rollback (evidence); at the length, a head
+# mismatch is rewritten and a match is the pinned history; above it,
+# a head mismatch at the pinned seq is still rewritten, a match is
+# held. 0 held, 1 rewritten, 2 rollback.
+fn verdict_of(cur_len: int, ck_len: int, heads_eq: bool) -> int {
+    if cur_len < ck_len {
+        return 2
+    }
+    if heads_eq {
+        return 0
+    }
+    return 1
+}
+
+# The self-report law: the checkpoint op's own seq is exactly the
+# length it pinned plus one — it names the history it did not join.
+fn self_report_ok(ck_len: int, ck_seq: int) -> bool {
+    return ck_seq == ck_len + 1
+}
+
+fn main() -> int uses IO {
+    let mut checks: int = 0
+
+    # The chain binding: prev + body hashes the same twice; a flipped
+    # byte of the body moves it; so does a different prev.
+    let h: str = entry_toy("abcd1234", "seq:9,op:pkg.lock")
+    if entry_toy("abcd1234", "seq:9,op:pkg.lock") != h {
+        panic("the same entry must hash the same")
+    }
+    if entry_toy("abcd1235", "seq:9,op:pkg.lock") == h {
+        panic("a flipped prev byte must move the entry hash")
+    }
+    if entry_toy("abcd1234", "seq:9,op:pkg.panic") == h {
+        panic("a different entry must move the hash too")
+    }
+    checks = checks + 1
+
+    # The outcome vocabulary is closed, and refusals chain like
+    # successes: the head advances from the same prev either way —
+    # deterministically, just under the refused spelling.
+    if outcome_word(0) != 0 || outcome_word(1) != 1 {
+        panic("the outcome vocabulary is exactly two words")
+    }
+    let h_ok: str = head_advance("ee01", "op:sign.release", 0)
+    let h_ref: str = head_advance("ee01", "op:sign.release", 1)
+    if h_ok == h_ref {
+        panic("the refused spelling must differ in the hash")
+    }
+    if head_advance("ee01", "op:sign.release", 1) != h_ref {
+        panic("a refused entry must hash deterministically too")
+    }
+    checks = checks + 1
+
+    # The inventory's family rule: dotted family.action, five
+    # families, no bare actions.
+    if !op_family_ok("pkg.lock", "pkg")
+            || !op_family_ok("sign.keygen", "sign")
+            || !op_family_ok("sandbox.run", "sandbox")
+            || !op_family_ok("tlog.witness", "tlog")
+            || !op_family_ok("auditlog.checkpoint", "auditlog") {
+        panic("every privileged op names its family")
+    }
+    if op_family_ok("lock", "pkg") || op_family_ok("xpkg.lock", "pkg") {
+        panic("a bare action or a foreign family is not this op")
+    }
+    checks = checks + 1
+
+    # The checkpoint verdict table: shorter is rollback, a head
+    # mismatch at the pinned length is rewritten, a match is held —
+    # the same three answers at and above the pinned length.
+    if verdict_of(2, 4, true) != 2 {
+        panic("a log below a signed length is a rollback")
+    }
+    if verdict_of(4, 4, false) != 1 {
+        panic("a wrong head at the pinned length is rewritten")
+    }
+    if verdict_of(4, 4, true) != 0 || verdict_of(9, 4, true) != 0 {
+        panic("at or above the pinned length a matching head holds")
+    }
+    if verdict_of(9, 4, false) != 1 {
+        panic("a wrong head above the pinned length is rewritten too")
+    }
+    checks = checks + 1
+
+    # The self-report law: the checkpoint op sits at length + 1 —
+    # it names the history it did not join.
+    if !self_report_ok(12, 13) || self_report_ok(12, 12) {
+        panic("the checkpoint op lands at length + 1")
+    }
+    if !str_starts_with("hls-audit-ckpt-13-0ab39cff2811aa2d.ckpt.json",
+                        "hls-audit-ckpt-") {
+        panic("the checkpoint file names its tool and its head")
+    }
+    checks = checks + 1
+
+    if checks != 5 {
+        panic("expected 5 checks, ran " + checks.to_str())
+    }
+    println("audit log: every privileged op hashed, chained, signed")
+    println("checks passed: " + checks.to_str())
+    return 0
+}
