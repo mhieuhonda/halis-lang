@@ -163,6 +163,48 @@ else
     bad "hlprove --sidechannel findings missing on the demo"
 fi
 
+
+# Stage 110: sandboxed execution (seccomp-bpf). The profile must
+# derive the demo's surface honestly (write_file is reachable -> rw),
+# --fs ro tightens with the flag named as the origin, the package
+# demo's [sandbox] pins survive the gate, and the selftest's pinned
+# numbers are green. The kernel half (the confined runs) lives in
+# the acceptance gate, which owns the compile.
+sb_out=$(python3 tools/hls-sandbox.py profile examples/sandbox_demo.hls 2>/dev/null); sb_rc=$?
+if [ "$sb_rc" -eq 0 ] && echo "$sb_out" | grep -q "execution surface (checker, from main): Args, Fs, IO"; then
+    ok "hls-sandbox profiles the demo (source mode)"
+else
+    bad "hls-sandbox wrong on the demo (rc=$sb_rc)"
+fi
+if echo "$sb_out" | grep -qF 'fs mode: rw (derived — the reachable builtin census contains' \
+   && echo "$sb_out" | grep -qF 'reachable builtins: args, println, read_file, write_file'; then
+    ok "the derivation is static and conservative (write_file reachable -> rw)"
+else
+    bad "the derived fs split is missing on the demo"
+fi
+sb_ro=$(python3 tools/hls-sandbox.py profile examples/sandbox_demo.hls --fs ro 2>/dev/null)
+if echo "$sb_ro" | grep -qF 'fs mode: ro (--fs)'; then
+    ok "--fs ro tightens below the derivation, origin named"
+else
+    bad "--fs ro did not tighten"
+fi
+sb_pkg=$(python3 tools/hls-sandbox.py profile --pkg examples/pkg_sandbox_demo 2>/dev/null); sbp_rc=$?
+if [ "$sbp_rc" -eq 0 ] \
+   && echo "$sb_pkg" | grep -qF 'execution surface (checker, from main): Clock, Fs, IO' \
+   && echo "$sb_pkg" | grep -qF 'fs mode: ro' \
+   && echo "$sb_pkg" | grep -qF 'denied: clone, fork, vfork' \
+   && echo "$sb_pkg" | grep -qF 'gate: manifest [effects].allowed (drift 0, unauditable 0, violations 0)'; then
+    ok "package mode: the gate passes and the [sandbox] pins hold"
+else
+    bad "package mode wrong on the demo (rc=$sbp_rc)"
+fi
+sb_st=$(python3 tools/hls-sandbox.py selftest 2>/dev/null); sbs_rc=$?
+if [ "$sbs_rc" -eq 0 ] && echo "$sb_st" | grep -q "37 passed / 0 failed"; then
+    ok "hls-sandbox selftest green (37 vectors)"
+else
+    bad "hls-sandbox selftest failed (rc=$sbs_rc)"
+fi
+
 # Stage 109: taint-tracking through FFI boundaries. The demo's report
 # must census the boundary (1 source), name the entry point with its
 # provenance, cut on the sanitizer, list the accepted-risk sink flow,

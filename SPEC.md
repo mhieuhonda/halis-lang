@@ -6920,3 +6920,236 @@ the front-ends, the pinned report lines, the demo and ok-test (the
 native half only when `bin/hlc` exists — `dirname`'s `libgen.h`
 declaration is not pulled in by the runtime prologue, so the emitted
 forward declaration conflicts with nothing), and the tools.
+
+## 64. Sandboxed execution — the seccomp-bpf filter (Stage 110 — v0.129.0-alpha)
+
+### 64.1. The gap between the declaration and the kernel
+
+The effect system (Stage 9) says what a program may do at the
+language level; the audit (Stage 103) says what the supply chain
+declares; taint tracking (Stages 10 and 109) says where untrusted
+data may not flow. All of it is compile-time truth — and none of it
+survives contact with a machine that did not compile the program. A
+compromised dependency, an exploited parser, a plain lie in a
+manifest: on the running host, the artifact could call any syscall
+it pleased, and every claim the toolchain made about it was
+archaeology. Stage 110 closes the gap in the only place a running
+program cannot negotiate with: the kernel. `hls-sandbox` derives a
+seccomp-bpf syscall filter from the same effect vocabulary the audit
+reports, installs it (`PR_SET_NO_NEW_PRIVS` +
+`SECCOMP_SET_MODE_FILTER`), and executes the artifact inside it.
+The declaration becomes enforcement: a program whose surface is
+`IO, Fs(read)` can read and print, but an open-for-write returns
+`EPERM`, a `socket` returns `EPERM`, an `execve` the filter denies
+returns `EPERM` — the kernel itself refuses, and no amount of
+memory corruption in the artifact widens the hole, because the
+allowlist lives in the kernel, not in the process.
+
+Two earlier "sandboxes" in the tree are related but distinct, and
+the distinction matters. The Stage 10 `--sandbox DIR` confines the
+fs BUILTINS to a directory root — a language-level promise about
+paths, enforced by the runtime's own check, worthless the moment
+the runtime's memory is subverted. The wasm target confines the
+whole process inside the browser's sandbox — an accident of
+platform, not a policy. The Stage 110 sandbox is neither: it is a
+policy, derived from the program's own checked semantics, enforced
+below the process.
+
+### 64.2. The derivation — the checker is the oracle
+
+A profile is derived, never guessed. Source mode walks the entry's
+import tree with the audit's own helpers (`_walk_import_graph`,
+`_check_merged`, `_fn_keys_per_module` — imported, not re-implemented:
+one definition of the walk), and asks the checker two questions.
+
+The first is WHAT RUNS: `computed_effects` of `main` — the checker's
+fixpoint over the call graph, i.e. precisely what executing the
+entry can perform. A library entry with no main falls back to the
+union over every function — the tightest statement a library
+admits, and the report says so.
+
+The second is HOW PRECISE the filesystem layer can be. The effect
+vocabulary is coarse (`Fs`), but the reachable builtin census is
+not: a tree whose reachable code calls only the read side
+(`read_file`, `file_exists`, `fs_read_dir`, `fs_size`, `fs_is_dir`)
+arms `open` and `openat` under a WRITE-INTENT ARGUMENT MASK — the
+kernel itself refuses to open for writing. One write-side builtin
+(`write_file`, `fs_set_perms`) and the derived mode is honestly
+`rw`. And an `extern` block declaring `uses Fs` surrenders the
+split outright: the C side is invisible, so its Fs is read-write —
+the split is claimed only where the toolchain can SEE the calls.
+The derivation is static and conservative by the same token: a
+reachable write builtin is a write capability whether or not this
+run uses it (`examples/sandbox_demo.hls` derives `rw` for exactly
+this reason — the tool refuses to under-sandbox on "probably
+won't").
+
+### 64.3. The filter — one program, auditable shape
+
+The compiled filter is a classic-BPF program over `struct
+seccomp_data`, and its shape is fixed so that a human can read what
+the kernel will be told:
+
+```
+    ld      arch
+    jeq     AUDIT_ARCH       -> nr        (the numbers mean
+                                           nothing on the wrong ABI)
+    ld      nr
+    jeq     N1               -> block_N1  (dispatch, ascending nr)
+    ...
+    ret     <default>                     (nothing matched)
+  block_N1:
+    [argument constraint checks -> deny]  (the write-intent mask)
+    ret     ALLOW
+```
+
+Every jump is forward (classic BPF has no backward edges), every
+label is resolved before the program is handed to anyone, and an
+out-of-range jump (the `jt`/`jf` fields are 8-bit relative) is
+REFUSED at assembly time — never truncated, never wrapped. The
+arch guard is instruction one because the syscall NUMBERS are
+per-ABI facts: the tool carries the x86_64 table and the
+asm-generic numbering aarch64 and riscv64 share (the toolchain's
+three triples), every layer entry must resolve on all three or
+carry a recorded reason (plain `stat` does not exist on
+asm-generic; `newfstatat` answers the same question there), and the
+selftest plus the gate machine-check the invariant — the gate
+additionally re-checks the x86_64 numbers against the local kernel
+headers when they exist.
+
+The write-intent mask is `0x410643` — `O_WRONLY | O_RDWR |
+O_CREAT | O_TRUNC | O_APPEND | O_TMPFILE` — identical on x86_64 and
+asm-generic. The flags' ARGUMENT POSITION is not: `open(path,
+flags, ...)` puts them in `args[1]`, `openat(dfd, path, flags,
+...)` in `args[2]`. The mask must read each at its own position —
+masking the wrong slot tests a POINTER against the mask and denies
+every open (a lesson this stage learned the honest way, and pinned
+as a selftest vector). Both opens are masked in the BASELINE too:
+the loader and libc open READ-ONLY, and a baseline that allowed
+write-opens would hollow out every `fs=ro` profile.
+
+The default action is the posture, and there are four: `errno`
+(`SECCOMP_RET_ERRNO | EPERM` — the denied syscall returns `-1` and
+`errno` is set, exactly as if the kernel itself had refused; a
+denial the language can OBSERVE as a value — a `Result`, a panic
+with a cause — instead of a corpse), `kill`
+(`SECCOMP_RET_KILL_PROCESS` — the kernel ends the process AT the
+denied call; the shell observes `159 = 128 + 31`, SIGSYS), `trap`
+(SIGSYS delivered — a handler answers), and `log` (the audit
+posture, not the enforcement posture). `execve` is baseline and the
+reason is structural: the launcher installs the filter and then
+must EXEC the artifact, so the filter has to let that crossing
+through — and because a filter installed under `NO_NEW_PRIVS` is
+INHERITED across `execve`, the exec'd image runs under the same
+program. `execve` is an entrance, never an exit. Denying it is
+still possible — for self-armed binaries built with the emitted
+shim; the launcher refuses that profile at run time with the
+reason. `exit`, `exit_group` and `brk` are not deniable at all: a
+sandbox the program cannot leave is not a sandbox, it is a hang.
+
+Two baselines carry the artifact's own prologue. `minimal` is the
+static flavor — termination, the heap, the exec crossing, TLS
+setup (`arch_prctl`, `set_tid_address`), the robust list, `rseq`,
+`prlimit64`, `mprotect` (the static loader's RELRO pass). `hosted`
+adds the dynamic loader and libc startup (both read-only-masked
+opens, the stat family, `getrandom` for the canary, the signal
+calls). `--baseline auto` reads the target ELF: no `PT_INTERP`
+means static, and the minimal set carries it; anything unparseable
+gets `hosted`, because the safe default is the wider baseline,
+never the one that would `EPERM` the loader mid-flight.
+
+### 64.4. Two delivery modes — the launcher and the shim
+
+`run` forks, arms the CHILD, and execs the artifact: `prctl`, the
+`seccomp(2)` syscall (with the `prctl(PR_SET_SECCOMP)` fallback
+for kernels without it), then `execvp`. The parent only waits and
+reports — the only process confined is the one that volunteered,
+and the launcher's own work stays honest. The exit contract
+extends the shell's: the artifact's own codes pass through (a
+panic is 101), 125 the sandbox could not be armed, 126 cannot
+execute, 127 not found — and a dynamic loader refused by a too-thin
+baseline also prints its own 127 with the reason on stderr.
+
+`emit` writes the other half: a standalone C translation unit that
+arms the binary ITSELF, in a `constructor(101)` that runs before
+`main` — `cc -O2 -o prog prog.c shim.c` and the artifact carries
+its policy with it, no launcher in sight. The shim is silent on
+success (a printing constructor would break byte-parity with the
+interpreter); the evidence it is armed is behavioral — the first
+denied syscall surfaces as `EPERM` or `SIGSYS`, which is the
+point. Cross-arch is why `emit` exists separately: `emit --arch
+riscv64` writes the NUMBERS for riscv64, the filter compiles into
+the artifact on the target, and this tool never needs to exist on
+that machine. The emitted header names the profile that produced
+it (effects, fs mode, default action, baseline) so the artifact is
+auditable years later without the tree it came from.
+
+### 64.5. Package mode, the [sandbox] section, and the gate
+
+Package mode follows the family contract. The profile is derived
+from the root package's entry (the checker's surface, exactly what
+runs — the [effects] contract gates the CHAIN, the sandbox arms
+the RUN), and the optional manifest section shapes it:
+
+```toml
+[sandbox]
+default = "errno"            # errno | kill | trap | log
+fs = "ro"                    # ro | rw (absent: derive)
+allow = ["clock_nanosleep"]  # extra syscalls, by name
+deny = ["clone", "fork", "vfork"]
+```
+
+Every knob is validated fail-closed: an unknown syscall name, an
+unknown action, a deny on an undeniable — fatal with the fix in
+the message. A sandbox configured by guessing is not a sandbox.
+
+The gate is the audit's, in the family's order: drift first, then
+unauditable, then the [effects] policy — a tree that fails its own
+audit does not get armed. `--effects E1,E2` overrides the gate's
+YARDSTICK (the `hls-audit --allow` spelling) for local triage;
+`--no-gate` skips it entirely. The audit is the gate; the sandbox
+is the enforcement — and the two are deliberately not merged,
+because a refusal to arm and a refusal to exist are different
+facts.
+
+### 64.6. The statement and the ledger record
+
+The SBOM claims the parts, repro claims the bytes, sign claims the
+author — the sandbox statement (schema
+`hls-sandbox-statement/v1`) claims the POSTURE: which syscall
+allowlist this package version was shipped to run under. It is
+arch-INDEPENDENT by design — it pins the POLICY (effects, fs mode,
+default action, baseline, the sorted syscall names and the two
+constrained ones), not the BPF bytes; the numbers are the
+assembler's business, and the assembler is versioned with the
+toolchain. `content_sha256` is the digest `hls-pkg publish`
+computes (the same sorted walk, one definition), the lockfile's
+bytes are pinned beside it, and the release gate follows the
+family: manifest, fail-closed audit, lockfile required, versioned
+statement, ONE record (kind `sandbox`) chained into the same
+transparency ledger lock, publish, the SBOM, repro and sign append
+to. `verify-release` is the counterparty's side: the ledger record
+against these exact bytes, the lockfile bytes, the content digest
+re-derived from the CURRENT tree, and the posture RE-DERIVED and
+compared field by field — the pinned profile must still describe
+this package, or the answer is a refusal that names the drifted
+field.
+
+### 64.7. The gate
+
+`make sandbox F=...` prints the profile (`--bpf` adds the filter
+listing — the disassembly annotates the dispatch with syscall
+names so the listing reads as policy, not numbers); `sandbox-run`
+confines a command; `sandbox-emit` writes the shim;
+`sandbox-release` / `sandbox-verify-release` pin and check the
+posture; `sandbox-selftest` runs the 37 pinned vectors. The
+acceptance gate (`make sandbox-acceptance`) is nine sections, 72
+checks: the one definition, the assembler, the policy, the
+derivation, the enforcement — the kernel half, compiled native and
+actually confined (the read/write matrix, the kill mode's SIGSYS,
+the loader line, the static line, the net probe whose declaration
+lied and whose kernel did not), the shim, the statement and the
+ledger, the demos with interpreter/native byte parity, and the
+tools. The enforcement sections need Linux seccomp and a C
+compiler, and say so when a host has neither; on this machine they
+run for real.

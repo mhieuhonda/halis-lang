@@ -479,3 +479,70 @@ ffi-taint:
 ffi-taint-acceptance: $(BIN)/hlc
 	@echo "[Stage 109 acceptance] running tests/ffi_taint_acceptance.py..."
 	@$(PYTHON) tests/ffi_taint_acceptance.py
+
+# ============================================================================
+# Stage 110 (v0.129.0-alpha): hls-sandbox — sandboxed package
+# execution, seccomp-bpf
+# ============================================================================
+
+# The profile of an entry file (or a package): the derived surface,
+# the fs read/write split, the layers, the allowlist. F= the entry;
+# D= the package directory for package mode.
+sandbox:
+	@if [ -z "$(F)" ] && [ -z "$(D)" ]; then echo "Usage: make sandbox F=<entry.hls> [FS=ro|rw] [DEFAULT=errno|kill|trap|log] [BPF=1]" && false; fi; \
+	if [ -n "$(D)" ]; then P="--pkg $(D)"; else P="$(F)"; fi; \
+	if [ -n "$(FS)" ]; then A="--fs $(FS)"; else A=""; fi; \
+	if [ -n "$(DEFAULT)" ]; then B="--default $(DEFAULT)"; else B=""; fi; \
+	if [ -n "$(BPF)" ]; then C="--bpf"; else C=""; fi; \
+	python3 tools/hls-sandbox.py profile $$P $$A $$B $$C
+
+# Run a command under the filter. The profile comes from an entry
+# file (F=), a package (D=), or an explicit surface (EFFECTS=IO,Fs).
+#   make sandbox-run F=examples/sandbox_demo.hls -- FS=ro CMD...
+# The exit code is the artifact's own (a panic is 101; SIGSYS under
+# the kill default is 159 = 128+31).
+sandbox-run:
+	@test "x$(CMD)" != "x" || (echo "Usage: make sandbox-run [F=.. | D=.. | EFFECTS=IO,Fs] [FS=..] [DEFAULT=..] [BASELINE=..] CMD=<cmd> [ARGS...]" && false); \
+	if [ -n "$(D)" ]; then P="--pkg $(D)"; elif [ -n "$(F)" ]; then P="$(F)"; elif [ -n "$(EFFECTS)" ]; then P="--effects $(EFFECTS)"; else echo "error: F=, D= or EFFECTS= required" && false; fi; \
+	if [ -n "$(FS)" ]; then A="--fs $(FS)"; else A=""; fi; \
+	if [ -n "$(DEFAULT)" ]; then B="--default $(DEFAULT)"; else B=""; fi; \
+	if [ -n "$(BASELINE)" ]; then E="--baseline $(BASELINE)"; else E=""; fi; \
+	python3 tools/hls-sandbox.py run $$P $$A $$B $$E -- $(CMD) $(ARGS)
+
+# Emit the self-arming C shim (ARCH required — the shim is
+# cross-arch by design; OUT= the output file, default named after
+# the profile). Compile it INTO the artifact:
+#   cc -O2 -o prog prog.c hls_sandbox_io_fs.c
+sandbox-emit:
+	@test "x$(ARCH)" != "x" || (echo "Usage: make sandbox-emit [F=.. | D=.. | EFFECTS=..] ARCH=x86_64|aarch64|riscv64 [FS=..] [OUT=file.c]" && false); \
+	if [ -n "$(D)" ]; then P="--pkg $(D)"; elif [ -n "$(F)" ]; then P="$(F)"; elif [ -n "$(EFFECTS)" ]; then P="--effects $(EFFECTS)"; else echo "error: F=, D= or EFFECTS= required" && false; fi; \
+	if [ -n "$(FS)" ]; then A="--fs $(FS)"; else A=""; fi; \
+	if [ -n "$(OUT)" ]; then O="--out $(OUT)"; else O=""; fi; \
+	python3 tools/hls-sandbox.py emit $$P $$A --arch $(ARCH) $$O
+
+# The shipping gate: fail-closed audit, lockfile required, the
+# versioned statement hls-sandbox-<name>-<version>.profile.json
+# written, ONE "sandbox" record chained into the transparency log.
+sandbox-release:
+	@test "x$(D)" != "x" || (echo "Usage: make sandbox-release D=<pkg dir> [OUT=<dir>]" && false); \
+	if [ -n "$(OUT)" ]; then O="--out $(OUT)"; else O=""; fi; \
+	python3 tools/hls-sandbox.py release --pkg $(D) $$O
+
+# The counterparty's side: the ledger record, the lockfile bytes,
+# the content digest, and the re-derived posture — against the
+# CURRENT tree.
+sandbox-verify-release:
+	@test "x$(D)" != "x" || (echo "Usage: make sandbox-verify-release D=<pkg dir>" && false)
+	@python3 tools/hls-sandbox.py verify-release --pkg $(D)
+
+# The stage's pinned numbers, through the tool's front door.
+sandbox-selftest:
+	@python3 tools/hls-sandbox.py selftest
+
+# Stage 110 acceptance gate: the nine-section battery (the one
+# definition, the assembler, the policy, the derivation, the
+# enforcement — the kernel half, Linux + seccomp + cc, the shim,
+# the statement + ledger, the demos, the tools).
+sandbox-acceptance:
+	@echo "[Stage 110 acceptance] running tests/sandbox_acceptance.py..."
+	@$(PYTHON) tests/sandbox_acceptance.py

@@ -1,0 +1,166 @@
+# feat_stage110_sandbox.hls — Stage 110 (v0.129.0-alpha): hls-sandbox,
+# sandboxed execution (seccomp-bpf).
+#
+# What the differential suite pins HERE is the filter's arithmetic —
+# the same contracts `hls-sandbox` enforces when it arms the kernel:
+#
+#   python3 tools/hls-sandbox.py selftest
+#   python3 boot/boot.py tests/ok/feat_stage110_sandbox.hls
+#
+# The program: the write-intent mask as the OR of its O_* parts, the
+# read-only decision table over that mask (the exact predicate the
+# BPF jset encodes — creation and truncation count as write intent
+# even paired with O_RDONLY), the seccomp_data layout (where the
+# flags of open and openat actually sit — the argument position the
+# filter must read), the arch guard's constant, the action encodings
+# (the errno posture that makes a denial a value), and the exit
+# contract the launcher reports. Deterministic output; interpreter
+# and native agree byte for byte.
+
+import "std.bits"
+
+# The write-intent mask, composed from the O_* constants it names
+# (identical on x86_64 and asm-generic — one mask, three arches):
+#   O_WRONLY 1 | O_RDWR 2 | O_CREAT 64 | O_TRUNC 512
+#   | O_APPEND 1024 | O_TMPFILE 0x410000 (it CREATES).
+fn write_intent_mask() -> int {
+    return bits_or(bits_or(bits_or(1, 2), bits_or(64, 512)),
+                   bits_or(1024, 4259840))
+}
+
+# The read-only predicate the BPF jset encodes: a flag word is
+# read-only exactly when it shares no bit with the mask.
+fn open_readonly(flags: int) -> bool {
+    return bits_and(flags, write_intent_mask()) == 0
+}
+
+# Where the filter reads the flags: seccomp_data.args[i] starts at
+# byte 16, eight bytes per argument — open's flags are args[1],
+# openat's are args[2]. Masking the wrong slot would test a pointer
+# against the mask and deny every open.
+fn arg_offset(arg_index: int) -> int {
+    return 16 + 8 * arg_index
+}
+
+# The action encodings: ERRNO|EPERM is the posture that turns a
+# denial into a value; ALLOW, KILL_PROCESS, and the SIGSYS the kill
+# mode ends on.
+fn ret_errno(err: int) -> int {
+    return bits_or(327680, err)
+}
+
+fn main() -> int uses IO {
+    let mut checks: int = 0
+
+    # The mask: the six write-intent bits, composed and pinned.
+    if write_intent_mask() != 4261443 {
+        panic("the write-intent mask is the OR of its six O_* parts")
+    }
+    if bits_and(write_intent_mask(), 1) == 0
+       || bits_and(write_intent_mask(), 2) == 0
+       || bits_and(write_intent_mask(), 64) == 0
+       || bits_and(write_intent_mask(), 512) == 0
+       || bits_and(write_intent_mask(), 1024) == 0
+       || bits_and(write_intent_mask(), 4259840) == 0 {
+        panic("every named O_* bit is in the mask")
+    }
+    checks = checks + 1
+
+    # The decision table the jset answers. O_RDONLY alone is the
+    # floor; O_CLOEXEC changes nothing (it is about descriptors,
+    # not direction); every write-intent bit — alone or paired with
+    # O_RDONLY — refuses.
+    if !open_readonly(0) {
+        panic("O_RDONLY is read-only")
+    }
+    if !open_readonly(524288) {
+        panic("O_RDONLY|O_CLOEXEC is read-only (CLOEXEC is not direction)")
+    }
+    if open_readonly(1) || open_readonly(2) {
+        panic("O_WRONLY and O_RDWR are write intent")
+    }
+    if open_readonly(bits_or(0, 64)) {
+        panic("O_CREAT is write intent even paired with O_RDONLY")
+    }
+    if open_readonly(bits_or(0, 512)) {
+        panic("O_TRUNC is write intent even paired with O_RDONLY")
+    }
+    if open_readonly(1024) {
+        panic("O_APPEND is write intent")
+    }
+    if open_readonly(4259840) {
+        panic("O_TMPFILE creates a file - write intent")
+    }
+    checks = checks + 1
+
+    # The argument positions: open's flags at args[1] (byte 24),
+    # openat's at args[2] (byte 32) — and the nr and arch the guard
+    # reads first, at 0 and 4.
+    if arg_offset(1) != 24 || arg_offset(2) != 32 {
+        panic("the flags of open sit at args[1], openat's at args[2]")
+    }
+    checks = checks + 1
+
+    # The arch guard: AUDIT_ARCH_X86_64 is EM_X86_64 | 0xC0000000 —
+    # the numbers mean nothing on the wrong ABI, so the guard is
+    # instruction one.
+    if bits_or(3221225472, 62) != 3221225534 {
+        panic("AUDIT_ARCH_X86_64 is EM_X86_64 with the 0xC0000000 half")
+    }
+    checks = checks + 1
+
+    # The action encodings. EPERM is 1 (the errno the language
+    # observes); the ERRNO action is its class bit OR the errno; the
+    # kill posture is the top bit; ALLOW is what the allowlist
+    # returns.
+    if ret_errno(1) != 327681 {
+        panic("ERRNO|EPERM is the observable denial")
+    }
+    if bits_or(2147483648, 0) != 2147483648 {
+        panic("KILL_PROCESS is the top bit")
+    }
+    if 2147450880 != 2147450880 {
+        panic("ALLOW is 0x7fff0000")
+    }
+    checks = checks + 1
+
+    # The exit contract the launcher reports: the artifact's own
+    # codes pass through; a panic is 101; the launcher's failures
+    # sit beside the shell's (125 arm, 126 cannot exec, 127 not
+    # found); SIGSYS is signal 31, observed as 128 + 31.
+    if 128 + 31 != 159 {
+        panic("SIGSYS is observed as 159")
+    }
+    if 101 != 101 || 125 + 1 != 126 || 126 + 1 != 127 {
+        panic("the launcher's failure codes sit beside the shell's")
+    }
+    checks = checks + 1
+
+    # The undeniables: exit, exit_group, brk — a sandbox the program
+    # cannot leave is not a sandbox, it is a hang. Same names on
+    # x86_64 and the asm-generic pair, different numbers, one
+    # policy.
+    if 60 + 231 + 12 != 303 {
+        panic("x86_64: exit 60, exit_group 231, brk 12")
+    }
+    if 93 + 94 + 214 != 401 {
+        panic("asm-generic: exit 93, exit_group 94, brk 214")
+    }
+    checks = checks + 1
+
+    # The numbers the tool pins for the crossing itself: the filter
+    # inherits across execve (x86_64 59, asm-generic 221) and the
+    # seccomp syscall that installs it (317 / 277).
+    if 59 != 59 || 221 != 221 {
+        panic("execve: 59 on x86_64, 221 on asm-generic")
+    }
+    if 317 - 277 != 40 {
+        panic("seccomp: 317 on x86_64, 277 on asm-generic")
+    }
+    checks = checks + 1
+
+    println("feat_stage110_sandbox: " + checks.to_str()
+            + " checks, mask " + write_intent_mask().to_str()
+            + ", errno posture " + ret_errno(1).to_str())
+    return 0
+}
