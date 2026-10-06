@@ -29,6 +29,34 @@ NEVER edited (rename stays confined to opened files) and never
 publish diagnostics. Malformed or missing dependency files answer
 None; they can never take the server down.
 
+Stage 114 (v0.133.0-alpha): textDocument/inlayHint — inlay hints for
+PARAMETER NAMES and BINDING TYPES. Two hint families, one discipline:
+never guess. A wrong hint is worse than no hint.
+
+  - Parameter-name hints sit before each argument at a call site
+    (`write_file(‹path:› p, ‹content:› body)`), resolved in checker
+    order: curated builtins (SPEC §8 names, arities re-verified against
+    the checker) → local fns → the files the document imports (the
+    Stage 113 layers) — with methods resolved through a
+    unique-candidate rule that SKIPS the ambiguous cases (two structs
+    defining the same method name; a user method shadowing a builtin
+    method; `Enum.Variant(...)` constructors whose payloads have no
+    names; variadic builtins the spec does not pin).
+
+  - Type hints sit after each match-arm payload binding
+    (`Color.RGB(r‹: int›, g‹: int›, b‹: int›)`) — the only bindings in
+    the language written without an annotation (let and for both
+    require one). Types come from the checker's own instantiation when
+    it ran (generic enums show `int`, not `T`), falling back to the
+    raw variant payloads when the checker did not reach the arm.
+
+  - A hint is emitted only when the argument count EXACTLY matches
+    the parameter count, the call site was located in the token
+    stream (an in-order AST walk correlated with a monotonic token
+    cursor — the AST carries no columns), and the argument is not a
+    bare identifier equal to the parameter name (`f(x: x)` says
+    nothing the source does not).
+
 Stage 14-alpha (v0.12.0-alpha): minimal LSP server over JSON-RPC stdio.
 
 Implemented methods:
@@ -51,6 +79,11 @@ Implemented methods:
   textDocument/documentSymbol — list every top-level fn/struct/enum in
                               the file (used by VS Code's outline view).
   textDocument/completion   — basic keyword + identifier completion.
+  textDocument/inlayHint    — parameter names at call sites and types on
+                              match-arm payload bindings (Stage 114);
+                              signatures resolve through the same layer
+                              discipline as definitions, and every guard
+                              degrades to "no hint", never to a wrong one.
   textDocument/publishDiagnostics (notification) — runs the Stage-0
                               checker and publishes errors as diagnostics.
 
@@ -59,10 +92,11 @@ Usage:
   hls-lsp --check FILE.hls   # one-shot: print diagnostics to stdout
                               (useful for editors that don't speak LSP)
 
-Status: Stage 113. The LSP server uses the Stage-0 lexer/parser/checker
+Status: Stage 114. The LSP server uses the Stage-0 lexer/parser/checker
 internally; go-to-definition resolves through the same import rules
 boot.py enforces, extended with the package layers (lockfile,
-.hls-pkg-deps/, HLS_PKG_DEPS). Editor plugins live under
+.hls-pkg-deps/, HLS_PKG_DEPS), and inlay hints resolve signatures
+through the same layer discipline. Editor plugins live under
 editors/vscode/ and editors/neovim/.
 """
 import argparse
@@ -185,6 +219,66 @@ _TOOLCHAIN_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # definition request into a whole-repo parse.
 EXTERNAL_DOC_CAP = 48
 DEP_FILE_CAP = 128
+
+# Stage 114: curated builtin parameter names — the SPEC §8 spellings,
+# every arity re-verified against the checker's need(N) checks in
+# boot/checking/call.py. Deliberately CLOSED: variadic and rewritten
+# builtins (spawn, async_spawn, select, ...) and any builtin whose
+# parameter names the spec does not pin are absent — a call to them
+# gets no hints. Resolution mirrors the checker's own order (builtin
+# table first, then user fns), so a user fn named `print` behaves in
+# the hints exactly as it behaves in the checker.
+BUILTIN_PARAM_NAMES = {
+    "print": ["s"],
+    "println": ["s"],
+    "panic": ["msg"],
+    "exit": ["code"],
+    "str": ["value"],
+    "int": ["s"],
+    "len": ["value"],
+    "range": ["a", "b"],
+    "read_file": ["path"],
+    "read_file_tainted": ["path"],
+    "write_file": ["path", "content"],
+    "file_exists": ["path"],
+    "chr": ["i"],
+    "rand_int": ["max"],
+    "rand_seed": ["s"],
+    "proc_exec": ["cmd"],
+    "net_lookup": ["host"],
+    "join": ["parts", "sep"],
+    "has_feature": ["name"],
+    "simd_cpu_supports": ["name"],
+    "taint_mark": ["value"],
+    "taint_unwrap": ["value"],
+    "drop": ["value"],
+    "clone": ["value"],
+    "take": ["value"],
+}
+
+# Stage 114: curated builtin METHOD parameter names (receiver
+# excluded). A name carried by more than one receiver family —
+# list.set(index, value) vs map.set(key, value) — is mapped to None:
+# the receiver's type is not tracked at hint time, so a guess could
+# name the argument wrong. `None` and absence mean the same thing:
+# no hints for that method.
+BUILTIN_METHOD_PARAM_NAMES = {
+    "byte_at": ["i"],
+    "slice": ["a", "b"],
+    "find": ["sub"],
+    "contains": ["sub"],
+    "starts_with": ["p"],
+    "ends_with": ["p"],
+    "split": ["sep"],
+    "push": ["value"],
+    "get": ["index"],
+    "set": None,  # ambiguous: list.set(index, value) vs map.set(key, value)
+    "get_or": ["key", "default"],
+    "has": ["key"],
+    "send": ["value"],
+    "try_send": ["value"],
+    "recv_or": ["default"],
+}
 
 
 class HLSServer:
@@ -687,10 +781,13 @@ class HLSServer:
                     "renameProvider": True,
                     "documentSymbolProvider": True,
                     "completionProvider": {"triggerCharacters": [".", ":"]},
+                    # Stage 114: parameter names at call sites, binding
+                    # types on match-arm payloads.
+                    "inlayHintProvider": True,
                 },
                 "serverInfo": {
                     "name": "hls-lsp",
-                    "version": "0.132.0-alpha",
+                    "version": "0.133.0-alpha",
                 },
             })
         elif method == "initialized":
@@ -720,6 +817,8 @@ class HLSServer:
             self.handle_document_symbol(params, msg_id)
         elif method == "textDocument/completion":
             self.handle_completion(params, msg_id)
+        elif method == "textDocument/inlayHint":
+            self.handle_inlay_hint(params, msg_id)
         else:
             # Unknown method — respond with method-not-found.
             if msg_id is not None:
@@ -1468,6 +1567,505 @@ class HLSServer:
                         items.append({"label": ename, "kind": 13})
                         seen.add(ename)
         self.send_response(msg_id, items)
+
+    # ---------- inlay hints (Stage 114) ----------
+
+    def handle_inlay_hint(self, params, msg_id):
+        """Stage 114: textDocument/inlayHint — parameter names at call
+        sites, types on match-arm payload bindings.
+
+        The AST records no columns, so hint POSITIONS come from the
+        token stream: the AST is walked in source order (children in
+        field order, statements in block order, top-level items sorted
+        by their line) while a monotonic token cursor re-locates each
+        call site / match arm. A site that cannot be re-located is
+        skipped, never guessed at. Resolution mirrors the checker:
+        builtins first, then local fns, then the files the document
+        imports; a hint is emitted only when the argument count
+        exactly matches the parameter count. Failures degrade to
+        fewer hints, never to a wrong one, and never to an error —
+        an inlay hint must not be able to take the server down.
+        """
+        td = params.get("textDocument", {})
+        uri = td.get("uri")
+        doc = self.docs.get(uri)
+        prog = self._doc_program(doc) if doc else None
+        if prog is None:
+            self.send_response(msg_id, [])
+            return
+        rng = params.get("range") or {}
+        lo = (rng.get("start") or {}).get("line", 0)
+        hi = (rng.get("end") or {}).get("line", 1 << 30)
+        text = doc["text"]
+        try:
+            toks = tokenize(text.encode("utf-8"))
+        except HLError:
+            self.send_response(msg_id, [])
+            return
+
+        # The in-order site walk (below) feeds two monotonic token
+        # cursors — one per hint family, each family scanned in source
+        # order so neither can desynchronise the other.
+        sites = []
+        self._walk_program(prog, sites)
+
+        hints = []
+        call_i = 0   # cursor for call/fieldcall site relocation
+        match_i = 0  # cursor for match-arm arrow relocation
+        for kind, node in sites:
+            if kind == "match":
+                match_i = self._match_binding_hints(prog, toks, text, node,
+                                                    match_i, lo, hi, hints)
+            else:
+                call_i = self._call_param_hints(uri, prog, toks, text,
+                                                node, kind == "fieldcall",
+                                                call_i, lo, hi, hints)
+        hints.sort(key=lambda h: (h["position"]["line"],
+                                  h["position"]["character"]))
+        self.send_response(msg_id, hints)
+
+    # -- the in-order walk ------------------------------------------------
+
+    def _walk_program(self, prog, out):
+        """Yield ("call"|"fieldcall"|"match", node) for every call site
+        and match expression in `prog`, in SOURCE order.
+
+        Top-level items are sorted by line (fns carry their keyword
+        line, structs theirs); struct field defaults are walked too —
+        they are expressions and can call. Enum declarations hold no
+        expressions. The order property is what lets the token cursor
+        stay monotonic: a node's tokens are never revisited after the
+        walk has moved past them."""
+        items = []
+        for fn in prog.get("fns", {}).values():
+            items.append((fn.get("line", 0), fn.get("body") or [], True))
+        for sdef in prog.get("structs", {}).values():
+            dflts = [f[2] for f in sdef.get("fields", [])
+                     if isinstance(f[2], dict)]
+            if dflts:
+                items.append((sdef.get("line", 0), dflts, False))
+        items.sort(key=lambda it: it[0])
+        for _line, payload, is_stmts in items:
+            if is_stmts:
+                for st in payload:
+                    self._walk_stmt(st, out)
+            else:
+                for e in payload:
+                    self._walk_expr(e, out)
+
+    def _walk_stmt(self, s, out):
+        if not isinstance(s, dict):
+            return
+        k = s.get("k")
+        if k == "let":
+            self._walk_expr(s.get("value"), out)
+        elif k == "assign":
+            self._walk_expr(s.get("target"), out)
+            self._walk_expr(s.get("value"), out)
+        elif k == "return":
+            self._walk_expr(s.get("value"), out)
+        elif k == "expr":
+            self._walk_expr(s.get("e"), out)
+        elif k == "if":
+            self._walk_expr(s.get("cond"), out)
+            for st in s.get("then") or []:
+                self._walk_stmt(st, out)
+            for st in s.get("els") or []:
+                self._walk_stmt(st, out)
+        elif k == "while":
+            self._walk_expr(s.get("cond"), out)
+            for st in s.get("body") or []:
+                self._walk_stmt(st, out)
+        elif k == "for":
+            self._walk_expr(s.get("iter"), out)
+            for st in s.get("body") or []:
+                self._walk_stmt(st, out)
+        elif k == "asm":
+            # asm! operands are (constraint, expr) pairs; the
+            # constraint side is a plain string and walks as a no-op.
+            for op in s.get("operands") or []:
+                if isinstance(op, (list, tuple)):
+                    for part in op:
+                        self._walk_expr(part, out)
+                else:
+                    self._walk_expr(op, out)
+
+    def _walk_expr(self, e, out):
+        if not isinstance(e, dict):
+            return
+        k = e.get("k")
+        if k == "call":
+            # The callee name token precedes its arguments: yield the
+            # node first, then recurse.
+            out.append(("call", e))
+            for a in e.get("args") or []:
+                self._walk_expr(a, out)
+        elif k == "fieldcall" or k == "method":
+            # `target.name(args)` — the checker REWRITES a resolved
+            # method call in place (fieldcall -> method) while an
+            # enum-variant constructor keeps fieldcall, and a node the
+            # checker never reached keeps its parsed kind. Both shapes
+            # carry the same fields and the same source order: the
+            # target's tokens precede the `.name(`, so recurse into
+            # the target first, then yield, then the arguments.
+            self._walk_expr(e.get("target"), out)
+            out.append(("fieldcall", e))
+            for a in e.get("args") or []:
+                self._walk_expr(a, out)
+        elif k == "field":
+            self._walk_expr(e.get("target"), out)
+        elif k == "index":
+            self._walk_expr(e.get("target"), out)
+            self._walk_expr(e.get("idx"), out)
+        elif k == "bin":
+            self._walk_expr(e.get("l"), out)
+            self._walk_expr(e.get("r"), out)
+        elif k == "un":
+            self._walk_expr(e.get("e"), out)
+        elif k == "qmark":
+            self._walk_expr(e.get("e"), out)
+        elif k == "listlit":
+            for item in e.get("items") or []:
+                self._walk_expr(item, out)
+        elif k == "structlit":
+            for _fname, fv in e.get("fields") or []:
+                self._walk_expr(fv, out)
+        elif k == "match":
+            out.append(("match", e))
+            self._walk_expr(e.get("scrut"), out)
+            for arm in e.get("arms") or []:
+                self._walk_expr(arm.get("body"), out)
+
+    # -- parameter-name hints ---------------------------------------------
+
+    def _call_param_hints(self, uri, prog, toks, text, node, is_method,
+                          cursor, lo_line, hi_line, hints):
+        """Locate one call site in the token stream from `cursor`,
+        resolve its parameter names, and append one hint per argument.
+        Returns the advanced cursor. Every guard degrades to "no
+        hints for this site": unresolved callee, arity mismatch,
+        unlocated site, enum-variant constructor."""
+        name = node.get("name")
+        node_line = node.get("line", 0)
+        if not isinstance(name, str) or not name:
+            return cursor
+        paren = self._scan_call_site(toks, cursor, name, node_line,
+                                     is_method)
+        if paren is None:
+            # Not found — leave the cursor alone; a later site's scan
+            # starting earlier can only match its own shape.
+            return cursor
+        if is_method:
+            params = self._resolve_method_params(uri, prog, toks, paren,
+                                                 name)
+        else:
+            params = self._resolve_fn_params(uri, prog, name)
+        if not params:
+            return paren + 1
+        spans = self._arg_spans(toks, paren)
+        if spans is None or len(spans) != len(params):
+            return paren + 1
+        callee_label = name if not is_method else "." + name
+        for i, (pname, _ptype) in enumerate(params):
+            start, end = spans[i]
+            t = toks[start]
+            # Redundancy rule: `f(x: x)` — a single bare identifier
+            # argument spelled exactly like its parameter — says
+            # nothing the source does not already say.
+            if end - start == 1 and t["k"] == "ident" and t["v"] == pname:
+                continue
+            line0 = t["line"] - 1
+            if line0 < lo_line or line0 > hi_line:
+                continue
+            char16 = self._byte_col_to_utf16(text, line0, t["col"] - 1)
+            hints.append({
+                "position": {"line": line0, "character": char16},
+                "label": pname + ":",
+                "kind": 2,  # InlayHintKind.Parameter
+                "paddingLeft": False,
+                "paddingRight": True,
+                "tooltip": "parameter '%s' of '%s'" % (pname, callee_label),
+            })
+        return paren + 1
+
+    @staticmethod
+    def _scan_call_site(toks, start, name, node_line, want_method):
+        """Find the open-paren token index of the call site for `name`
+        at/after `start`, preferring a match on the node's own line
+        (the AST line is the callee-name token's line); a match on a
+        LATER line is the multi-line spelling fallback; a match on an
+        EARLIER line is stale — skipped. Returns the paren index or
+        None."""
+        n = len(toks)
+        fallback = None
+        i = start
+        while i < n:
+            t = toks[i]
+            if want_method:
+                if (t["k"] == "sym" and t["v"] == "." and i + 2 < n
+                        and toks[i + 1]["k"] == "ident"
+                        and toks[i + 1]["v"] == name
+                        and toks[i + 2]["k"] == "sym"
+                        and toks[i + 2]["v"] == "("):
+                    ln = toks[i + 1]["line"]
+                    if ln == node_line:
+                        return i + 2
+                    if fallback is None and ln > node_line:
+                        fallback = i + 2
+                    i += 3
+                    continue
+            else:
+                if (t["k"] == "ident" and t["v"] == name and i + 1 < n
+                        and toks[i + 1]["k"] == "sym"
+                        and toks[i + 1]["v"] == "("):
+                    ln = t["line"]
+                    if ln == node_line:
+                        return i + 1
+                    if fallback is None and ln > node_line:
+                        fallback = i + 1
+                    i += 2
+                    continue
+            i += 1
+        return fallback
+
+    @staticmethod
+    def _arg_spans(toks, paren):
+        """Top-level argument token spans [(start, end_exclusive), ...]
+        of the call whose open paren sits at `paren`, or None when the
+        paren group never closes. Nesting counts brackets of every
+        shape; strings are single tokens and cannot confuse the
+        depth counter."""
+        n = len(toks)
+        spans = []
+        depth = 1
+        j = paren + 1
+        expect_arg = True
+        start = None
+        while j < n:
+            t = toks[j]
+            if depth == 1 and expect_arg:
+                start = j
+                expect_arg = False
+            if t["k"] == "sym":
+                v = t["v"]
+                if v in ("(", "[", "{"):
+                    depth += 1
+                elif v in (")", "]", "}"):
+                    depth -= 1
+                    if depth == 0:
+                        if start is not None:
+                            spans.append((start, j))
+                        return spans
+                elif v == "," and depth == 1:
+                    if start is not None:
+                        spans.append((start, j))
+                    expect_arg = True
+            j += 1
+        return None
+
+    def _resolve_fn_params(self, uri, prog, name):
+        """[(param_name, type), ...] for a bare call, in the checker's
+        own resolution order: builtin table (a user fn cannot shadow
+        one — check_call consults BUILTIN_FNS first), then the local
+        program, then the files the document imports. Two imports
+        defining the same name with different signatures is
+        ambiguous: None. Never None-vs-missing confusion: an empty
+        parameter list is a real result ([])."""
+        names = BUILTIN_PARAM_NAMES.get(name)
+        if names is not None:
+            return [(p, None) for p in names]
+        fn = prog.get("fns", {}).get(name)
+        if fn is not None:
+            return [(p, t) for (p, t, _m) in fn.get("params", [])]
+        found = None
+        try:
+            iuris = self._import_uris(uri)
+        except Exception:
+            iuris = []
+        for iuri in iuris:
+            iprog = self._doc_program(self.docs.get(iuri))
+            if iprog is None:
+                continue
+            ifn = iprog.get("fns", {}).get(name)
+            if ifn is None:
+                continue
+            sig = [(p, t) for (p, t, _m) in ifn.get("params", [])]
+            if found is None:
+                found = sig
+            elif found != sig:
+                return None
+        return found
+
+    def _resolve_method_params(self, uri, prog, toks, paren, name):
+        """[(param_name, type), ...] for a `.name(` site, receiver
+        excluded (the checker strips params[0]). The receiver's type
+        is not tracked here, so the rule is unique-candidate:
+        exactly one user method of that name across the local program
+        and the imports — and never when a builtin method of the same
+        name exists (the receiver could be either). An
+        `Enum.Variant(...)` constructor is recognised from the token
+        before the dot and skipped: payloads have no names."""
+        # Enum-variant constructor: `Color.RGB(...)` — the head token
+        # names a local enum and the method name is one of its
+        # variants.
+        if paren >= 3:
+            head = toks[paren - 3]
+            if head["k"] == "ident":
+                edef = prog.get("enums", {}).get(head["v"])
+                if edef is not None:
+                    for vname, _pls in edef.get("variants", []):
+                        if vname == name:
+                            return None
+        # User methods — unique candidate only.
+        cands = set()
+        for key in prog.get("fns", {}):
+            if key.endswith("." + name):
+                cands.add(key)
+        try:
+            iuris = self._import_uris(uri)
+        except Exception:
+            iuris = []
+        for iuri in iuris:
+            iprog = self._doc_program(self.docs.get(iuri))
+            if iprog is None:
+                continue
+            for key in iprog.get("fns", {}):
+                if key.endswith("." + name):
+                    cands.add(key)
+        if cands:
+            if len(cands) != 1 or name in BUILTIN_METHOD_PARAM_NAMES:
+                return None  # ambiguous, or shadows a builtin method
+            key = cands.pop()
+            fn = prog.get("fns", {}).get(key)
+            if fn is None:
+                # The unique candidate came from an import.
+                for iuri in iuris:
+                    iprog = self._doc_program(self.docs.get(iuri))
+                    if iprog:
+                        fn = iprog.get("fns", {}).get(key)
+                        if fn is not None:
+                            break
+            if fn is None:
+                return None
+            return [(p, t) for (p, t, _m) in fn.get("params", [])[1:]]
+        # Builtin methods — the table already maps ambiguous names
+        # (list.set vs map.set) to None.
+        names = BUILTIN_METHOD_PARAM_NAMES.get(name)
+        if names is None:
+            return None
+        return [(p, None) for p in names]
+
+    # -- match-binding type hints -----------------------------------------
+
+    def _match_binding_hints(self, prog, toks, text, node, cursor,
+                             lo_line, hi_line, hints):
+        """Append `: T` hints after each match-arm payload binding.
+        Types prefer the checker's own instantiation (arm["binds"],
+        present when check() reached the arm — generic enums show the
+        INSTANTIATED payload type), falling back to the raw variant
+        payloads of a fully-qualified pattern. The arm's arrow is
+        re-located with the monotonic match cursor; an arm that
+        cannot be located ends the match's hinting (later arms would
+        be guesses). Returns the advanced cursor."""
+        n = len(toks)
+        # Advance past the `match` keyword itself.
+        i = cursor
+        while i < n and not (toks[i]["k"] == "kw" and toks[i]["v"] == "match"):
+            i += 1
+        if i >= n:
+            return cursor
+        i += 1
+        for arm in node.get("arms") or []:
+            # Find this arm's `=>` — the first after the previous
+            # arm's; patterns contain no arrows.
+            arrow = None
+            while i < n:
+                if toks[i]["k"] == "sym" and toks[i]["v"] == "=>":
+                    arrow = i
+                    break
+                i += 1
+            if arrow is None:
+                return i
+            pat = arm.get("pattern") or {}
+            binds = arm.get("binds")
+            payload_types = None
+            if binds is None and pat.get("k") == "variant" and pat.get("enum"):
+                edef = prog.get("enums", {}).get(pat["enum"])
+                if edef is not None:
+                    for vname, pls in edef.get("variants", []):
+                        if vname == pat["variant"]:
+                            payload_types = pls
+                            break
+            if pat.get("k") == "variant" and pat.get("has_paren"):
+                # The binding identifiers are the top-level idents of
+                # the paren group that closes right before the arrow —
+                # `Name.Variant(a, b) =>`. Walking BACKWARD from the
+                # arrow cannot be confused by braces in the scrutinee
+                # or in an earlier arm's body (a struct literal there
+                # would tilt any forward depth counter).
+                idents = self._pattern_bindings_before(toks, arrow)
+                if binds:
+                    bmap = dict(binds)
+                    for t in idents:
+                        btype = bmap.get(t["v"])
+                        self._binding_hint(toks, text, t, btype,
+                                           lo_line, hi_line, hints)
+                elif payload_types is not None:
+                    if len(idents) == len(payload_types):
+                        for t, btype in zip(idents, payload_types):
+                            self._binding_hint(toks, text, t, btype,
+                                               lo_line, hi_line, hints)
+            i = arrow + 1
+        return i
+
+    @staticmethod
+    def _pattern_bindings_before(toks, arrow):
+        """Binding identifier tokens inside the `(...)` group that
+        closes immediately before `arrow` (a `sym =>` token index),
+        in source order. Returns [] when the arrow is not preceded by
+        a balanced paren group — a wildcard arm, a bare variant
+        pattern, or anything this backward scan refuses to guess
+        about."""
+        n = len(toks)
+        j = arrow - 1
+        if j < 0 or toks[j]["k"] != "sym" or toks[j]["v"] != ")":
+            return []
+        depth = 1
+        idents = []
+        j -= 1
+        while j >= 0 and depth > 0:
+            t = toks[j]
+            if t["k"] == "sym":
+                if t["v"] in (")", "]", "}"):
+                    depth += 1
+                elif t["v"] in ("(", "[", "{"):
+                    depth -= 1
+                    if depth == 0:
+                        break
+            elif t["k"] == "ident" and depth == 1 and t["v"] != "_":
+                idents.append(t)
+            j -= 1
+        idents.reverse()
+        return idents
+
+    def _binding_hint(self, toks, text, tok, btype, lo_line, hi_line,
+                      hints):
+        if not isinstance(btype, str) or not btype:
+            return
+        line0 = tok["line"] - 1
+        if line0 < lo_line or line0 > hi_line:
+            return
+        # Position: just past the binding identifier.
+        off = tok["col"] - 1 + len(tok["v"].encode("utf-8"))
+        char16 = self._byte_col_to_utf16(text, line0, off)
+        hints.append({
+            "position": {"line": line0, "character": char16},
+            "label": ": " + btype,
+            "kind": 1,  # InlayHintKind.Type
+            "paddingLeft": False,
+            "paddingRight": False,
+            "tooltip": "inferred match binding type",
+        })
 
     # ---------- helpers ----------
     def send_response(self, msg_id, result, error_code=None, error_message=None):
