@@ -1388,6 +1388,28 @@ Minimal LSP server over JSON-RPC stdio:
   unambiguous — a wrong hint is worse than no hint. Match bindings
   show the checker's instantiated payload type when the checker ran,
   falling back to the raw variant payloads.
+- `textDocument/codeAction` (Stage 115) — the refactor actions, each
+  shipped as a WorkspaceEdit the checker has already accepted:
+  `refactor.inline` splices a `let` binding's initializer into its uses
+  (parenthesised when it is more than one token) and deletes the
+  binding with its line and its `#[stack]`/`#[boxed]` attributes,
+  refusing reassigned bindings, assignments written through a use,
+  initializers naming a reassigned local, and call-bearing initializers
+  with two or more uses; `refactor.extract` binds the selection (or the
+  identifier — or whole call — under the cursor) to a fresh name placed
+  before the statement, its type decided by probe — the finished edit
+  is checked for every candidate type and ships only when EXACTLY ONE
+  candidate survives (a `panic(...)` selection passes all and earns
+  none). Selections inside assignment targets, inside match arms, or
+  spanning two statements are refused.
+- `textDocument/rename` (Stage 115) — scope-aware. A local (let, param,
+  for variable, match payload binding) renames exactly the occurrences
+  its declaration binds, inside its function; a field renames the
+  declarations, the `.name` accesses and the struct-literal keys; a
+  method renames the impl declarations and its call sites; a name that
+  is both field and method is refused; every other symbol keeps the
+  textual cross-document contract. A rename that would not check is
+  refused, never shipped.
 - `textDocument/publishDiagnostics` — runs the checker, publishes errors.
 - `--check FILE` one-shot mode prints diagnostics to stdout.
 
