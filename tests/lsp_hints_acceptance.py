@@ -737,7 +737,7 @@ def section_6():
     check(caps.get("inlayHintProvider") is True,
           "initialize advertises inlayHintProvider")
     ver = ((init or {}).get("serverInfo") or {}).get("version")
-    check(ver == "0.133.0-alpha", "serverInfo version is 0.133.0-alpha")
+    check(ver == "0.134.0-alpha", "serverInfo version is 0.134.0-alpha")
 
     # Range filtering: only lines 24..40.
     lo, hi = 24, 40
