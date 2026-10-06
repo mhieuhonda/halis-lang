@@ -179,7 +179,7 @@ remains green.
 | # | Stage | Status | Estimated effort |
 |---|-------|:------:|:----------------:|
 | 113 | LSP: goto-definition across packages | ✅ | (done in v0.132.0-alpha) |
-| 114 | LSP: inlay hints (types, parameter names) | ⬜ | 3 weeks |
+| 114 | LSP: inlay hints (types, parameter names) | ✅ | (done in v0.133.0-alpha) |
 | 115 | LSP: refactor actions (rename, extract, inline) | ⬜ | 6 weeks |
 | 116 | `hlfmt` — preserve comments in all positions | ⬜ | 3 weeks |
 | 117 | `hlfmt` — configuration file (`.hlfmt.toml`) for teams | ⬜ | 2 weeks |

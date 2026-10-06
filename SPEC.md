@@ -1375,8 +1375,19 @@ Minimal LSP server over JSON-RPC stdio:
 - `initialize` / `shutdown` / `exit`.
 - `textDocument/didOpen` / `didChange` / `didClose`.
 - `textDocument/hover` — show the inferred type of an identifier.
-- `textDocument/definition` — find the function/struct/enum definition.
+- `textDocument/definition` — find the function/struct/enum definition;
+  resolves through the same import rules boot.py enforces, extended
+  with the package layers (hls-pkg.lock `resolved_path`,
+  `.hls-pkg-deps/`, `HLS_PKG_DEPS`) — go-to-definition across packages.
 - `textDocument/completion` — keyword + identifier completion.
+- `textDocument/inlayHint` (Stage 114) — parameter names at call sites
+  and types on match-arm payload bindings. Signatures resolve in the
+  checker's own order (curated builtins, then the local program, then
+  the files the document imports); a hint is emitted only when the
+  argument count exactly matches the parameter count and the callee is
+  unambiguous — a wrong hint is worse than no hint. Match bindings
+  show the checker's instantiated payload type when the checker ran,
+  falling back to the raw variant payloads.
 - `textDocument/publishDiagnostics` — runs the checker, publishes errors.
 - `--check FILE` one-shot mode prints diagnostics to stdout.
 
@@ -6368,7 +6379,7 @@ The SIGNATURE file is minisign's four-line contract:
 ```
 untrusted comment: signature from hls-sign key <keyid>
 <base64 of Ed(2) || signature over the payload>          # 88 chars
-trusted comment: timestamp:<unix>	file:<name>
+trusted comment: timestamp:<unix>       file:<name>
 <base64 of Ed(2) || signature over (raw sig || trusted comment)>
 ```
 
