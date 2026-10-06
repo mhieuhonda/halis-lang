@@ -57,6 +57,54 @@ never guess. A wrong hint is worse than no hint.
     bare identifier equal to the parameter name (`f(x: x)` says
     nothing the source does not).
 
+Stage 115 (v0.134.0-alpha): REFACTOR ACTIONS — the editor stops only
+describing the code and starts rewriting it, under the same discipline
+the previous stages built. Three verbs, one engine:
+
+  - RENAME, now scope-aware. Stage 14 renamed the identifier under the
+    cursor textually — every token with the same spelling in every open
+    document — which was honest about being blunt: a local `let total`
+    in one function dragged `total` in every other function along. The
+    server now runs a token-stream SCOPE ENGINE (brace matching, bracket
+    depths, fn body spans, per-binding token windows) and classifies the
+    cursor's symbol before anything moves: a `let`, a parameter, a `for`
+    loop variable or a match-arm payload binding renames exactly the
+    occurrences its declaration binds — a sibling block's same-named
+    binding is a different variable and stays put — and the edits never
+    leave the enclosing function. A struct FIELD renames the field
+    declarations plus the `.name` accesses, a METHOD renames the impl
+    declarations plus its call sites, and a name that is BOTH (or also
+    an enum variant) is refused: the `.name` sites would be ambiguous.
+    Everything else keeps the Stage 14 textual behavior as the
+    documented fallback. A new name that collides with a binding in
+    scope, a keyword, or a builtin is an error, not a silent corruption.
+
+  - INLINE, via textDocument/codeAction (`refactor.inline`). The cursor
+    on a `let` binding or one of its uses offers to remove the binding
+    and splice its initializer into every use — parenthesised whenever
+    the initializer is more than one token, deleted with its line (and
+    its `#[stack]`/`#[boxed]` attributes) when the last use is gone.
+    The guards refuse the semantically dangerous shapes: a reassigned
+    binding, a use through which something is assigned, an initializer
+    that names a local reassigned anywhere in the function, and a
+    side-effecting (call-bearing) initializer used more than once —
+    duplicating a call is not inlining, it is re-executing.
+
+  - EXTRACT, via textDocument/codeAction (`refactor.extract`). The
+    selection (or the identifier — or whole call — under the cursor)
+    is validated by the REAL parser: the extracted tokens must parse
+    as one expression and nothing else. The inserted `let` is placed
+    before the statement containing the selection, with the indentation
+    the statement already has. The TYPE is probed, never guessed: the
+    finished edit is applied for every candidate type the document
+    makes available (primitives, the document's own structs and enums,
+    the builtin generic wrappers), the Stage-0 checker runs on each,
+    and the action ships only when EXACTLY ONE candidate checks. A
+    `panic(...)` selection passes every candidate and therefore earns
+    none; a selection inside an assignment target, inside an unbraced
+    match arm, or spanning two statements earns none. Every offered
+    edit is the edit whose result the checker has already accepted.
+
 Stage 14-alpha (v0.12.0-alpha): minimal LSP server over JSON-RPC stdio.
 
 Implemented methods:
@@ -84,6 +132,14 @@ Implemented methods:
                               signatures resolve through the same layer
                               discipline as definitions, and every guard
                               degrades to "no hint", never to a wrong one.
+  textDocument/codeAction   — refactor.inline (remove a `let` binding,
+                              splice its initializer into the uses) and
+                              refactor.extract (bind a selection to a
+                              fresh name, type decided by probe) (Stage
+                              115); textDocument/rename becomes
+                              scope-aware (locals rename within their
+                              declaration's real scope; fields and
+                              methods rename through the dot).
   textDocument/publishDiagnostics (notification) — runs the Stage-0
                               checker and publishes errors as diagnostics.
 
@@ -92,12 +148,13 @@ Usage:
   hls-lsp --check FILE.hls   # one-shot: print diagnostics to stdout
                               (useful for editors that don't speak LSP)
 
-Status: Stage 114. The LSP server uses the Stage-0 lexer/parser/checker
+Status: Stage 115. The LSP server uses the Stage-0 lexer/parser/checker
 internally; go-to-definition resolves through the same import rules
 boot.py enforces, extended with the package layers (lockfile,
-.hls-pkg-deps/, HLS_PKG_DEPS), and inlay hints resolve signatures
-through the same layer discipline. Editor plugins live under
-editors/vscode/ and editors/neovim/.
+.hls-pkg-deps/, HLS_PKG_DEPS), inlay hints resolve signatures
+through the same layer discipline, and the refactor actions run the
+real parser and checker over their own output before offering it.
+Editor plugins live under editors/vscode/ and editors/neovim/.
 """
 import argparse
 import json
@@ -219,6 +276,48 @@ _TOOLCHAIN_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # definition request into a whole-repo parse.
 EXTERNAL_DOC_CAP = 48
 DEP_FILE_CAP = 128
+
+# ---------------------------------------------------------------------------
+# Stage 115: refactor engine constants. Everything below runs on the
+# token stream — the AST carries lines but no columns, and the refactor
+# actions must land on exact byte spans, so the token index IS the
+# coordinate system (same decision Stage 114 made for hint positions).
+# ---------------------------------------------------------------------------
+
+# Keywords that can START a statement. The backward statement-boundary
+# scan stops on these (the keyword is its statement's first token) and on
+# braces. `else` never actually starts a statement the extractor can
+# anchor to, but listing it keeps the boundary honest.
+_STMT_START_KWS = ("let", "if", "while", "for", "match", "return",
+                   "asm", "else")
+# Declaration keywords — a backward scan landing on one means the
+# selection sits in a declaration header; the probe decides whether an
+# extraction there is even expressible.
+_DECL_START_KWS = ("fn", "struct", "enum", "impl", "import", "uses",
+                   "extern", "pure")
+_OPEN_SYMS = ("(", "[", "{")
+_CLOSE_SYMS = (")", "]", "}")
+_PAIR_OF = {"(": ")", "[": "]", "{": "}"}
+
+
+class _LocalDecl(object):
+    """One local binding the scope engine can resolve: a `let`, a fn
+    parameter, a `for` loop variable, or a match-arm payload binding.
+
+    [start, end) is the token-index window in which the name is BOUND —
+    the declaration's own name token sits inside it, the scope's closing
+    brace ends it. Resolution takes the candidate with the LATEST start
+    covering the use: the checker forbids shadowing, so in a clean file
+    that candidate is unique; in a half-edited one it is the innermost,
+    which is what a user mid-rename means."""
+    __slots__ = ("name", "kind", "tok", "start", "end")
+
+    def __init__(self, name, kind, tok, start, end):
+        self.name = name
+        self.kind = kind      # "let" | "param" | "for" | "bind"
+        self.tok = tok        # token index of the name itself
+        self.start = start    # first token index where the binding holds
+        self.end = end        # exclusive end (scope close, or arm end)
 
 # Stage 114: curated builtin parameter names — the SPEC §8 spellings,
 # every arity re-verified against the checker's need(N) checks in
@@ -784,10 +883,16 @@ class HLSServer:
                     # Stage 114: parameter names at call sites, binding
                     # types on match-arm payloads.
                     "inlayHintProvider": True,
+                    # Stage 115: refactor actions — extract + inline via
+                    # codeAction, scope-aware rename via textDocument/rename.
+                    "codeActionProvider": {
+                        "codeActionKinds": ["refactor.extract",
+                                            "refactor.inline"],
+                    },
                 },
                 "serverInfo": {
                     "name": "hls-lsp",
-                    "version": "0.133.0-alpha",
+                    "version": "0.134.0-alpha",
                 },
             })
         elif method == "initialized":
@@ -813,6 +918,8 @@ class HLSServer:
             self.handle_references(params, msg_id)
         elif method == "textDocument/rename":
             self.handle_rename(params, msg_id)
+        elif method == "textDocument/codeAction":
+            self.handle_code_action(params, msg_id)
         elif method == "textDocument/documentSymbol":
             self.handle_document_symbol(params, msg_id)
         elif method == "textDocument/completion":
@@ -1389,19 +1496,383 @@ class HLSServer:
                 })
         return out
 
-    # ---------- rename ----------
-    def handle_rename(self, params, msg_id):
-        """Stage 14 release: rename a symbol across all open documents.
+    # ---------- Stage 115: the scope engine ----------
 
-        Uses _find_references_in to locate every textual occurrence of
-        the identifier at `position`, then produces a WorkspaceEdit
-        with TextEdits for each open document.
+    @staticmethod
+    def _token_len(t):
+        """Source length of a token in bytes (the lexer's own extent).
+        A str token's `v` is the DECODED content — its source is the
+        content plus both quotes, plus one extra byte per escape
+        (\\n, \\t, \\\\, \\" — the only four the lexer accepts, each two
+        source bytes decoding to one content byte)."""
+        if "raw" in t and isinstance(t["raw"], (str, bytes)):
+            return len(t["raw"])
+        v = t.get("v")
+        if t.get("k") == "str" and isinstance(v, bytes):
+            extra = sum(1 for b in v if b in (9, 10, 34, 92))
+            return len(v) + extra + 2
+        if isinstance(v, bytes):
+            return len(v)
+        return len(str(v))
+
+    @staticmethod
+    def _token_index_at(toks, line, col):
+        """(index, token) of the token covering the 1-indexed byte
+        position (line, col), or (None, None). Same extent rules as
+        _token_at; the index is what the refactor engine works in."""
+        for i, t in enumerate(toks):
+            if t["k"] == "eof":
+                break
+            tlen = HLSServer._token_len(t)
+            if t["line"] == line and t["col"] <= col < t["col"] + tlen:
+                return (i, t)
+        return (None, None)
+
+    @staticmethod
+    def _brace_matches(toks):
+        """open-token-index -> close-token-index for ( [ {. A malformed
+        file leaves unclosed opens out of the map; callers treat a miss
+        as "unknown", never as a crash."""
+        stack = []
+        out = {}
+        for i, t in enumerate(toks):
+            if t["k"] == "sym":
+                v = t["v"]
+                if v in _OPEN_SYMS:
+                    stack.append(i)
+                elif v in _CLOSE_SYMS and stack:
+                    o = stack.pop()
+                    if _PAIR_OF.get(toks[o]["v"]) == v:
+                        out[o] = i
+        return out
+
+    @staticmethod
+    def _tok_depths(toks):
+        """Bracket depth BEFORE each token (0 at file top)."""
+        depths = []
+        d = 0
+        for t in toks:
+            depths.append(d)
+            if t["k"] == "sym":
+                if t["v"] in _OPEN_SYMS:
+                    d += 1
+                elif t["v"] in _CLOSE_SYMS and d > 0:
+                    d -= 1
+        return depths
+
+    @staticmethod
+    def _fn_spans(toks, braces):
+        """[start, end) token spans of every fn body — top-level fns and
+        impl methods alike. A `fn` keyword's body is the first brace
+        group before the next declaration keyword (an `extern fn` has no
+        body and earns no span). Header keywords are part of the
+        signature — `fn main() -> int uses IO {` — and never end the
+        scan; only a declaration keyword can."""
+        hdr_kws = ("uses", "pure", "extern")
+        spans = []
+        n = len(toks)
+        for i, t in enumerate(toks):
+            if t["k"] != "kw" or t["v"] != "fn":
+                continue
+            j = i + 1
+            body = None
+            while j < n:
+                tj = toks[j]
+                if tj["k"] == "sym" and tj["v"] == "{":
+                    body = braces.get(j)
+                    break
+                if tj["k"] == "kw" and tj["v"] not in hdr_kws:
+                    break  # the next declaration — this fn has no body
+                j += 1
+            if body is not None:
+                spans.append((i, body + 1))
+        return spans
+
+    @staticmethod
+    def _decl_regions(toks, braces, kw):
+        """[start, end) spans of every `kw ... { ... }` region (struct
+        and impl bodies, per the kw asked for)."""
+        regions = []
+        n = len(toks)
+        for i, t in enumerate(toks):
+            if t["k"] != "kw" or t["v"] != kw:
+                continue
+            j = i + 1
+            while j < n:
+                tj = toks[j]
+                if tj["k"] == "sym" and tj["v"] == "{":
+                    c = braces.get(j)
+                    if c is not None:
+                        regions.append((i, c + 1))
+                    break
+                if tj["k"] == "kw":
+                    break
+                j += 1
+        return regions
+
+    def _arm_bindings(self, toks, depths):
+        """[(name_tok_idx, bind_start, bind_end), ...] for every match
+        pattern binding. The pattern's paren group is walked BACKWARD
+        from each `=>` (the shape Stage 114's _pattern_bindings_before
+        established — a struct literal in an earlier arm's body cannot
+        tilt a backward depth counter); the binding holds from the arrow
+        to the next `,` or `}` at the arrow's own depth."""
+        out = []
+        n = len(toks)
+        for i, t in enumerate(toks):
+            if t["k"] != "sym" or t["v"] != "=>":
+                continue
+            if i == 0 or toks[i - 1].get("v") != ")":
+                continue
+            binds = []
+            j = i - 1
+            depth = 0
+            while j >= 0:
+                tj = toks[j]
+                if tj["k"] == "sym":
+                    if tj["v"] in _CLOSE_SYMS:
+                        depth += 1
+                    elif tj["v"] in _OPEN_SYMS:
+                        depth -= 1
+                        if depth == 0:
+                            break
+                elif (tj["k"] == "ident" and depth == 1
+                        and tj["v"] != "_"):
+                    binds.append(j)
+                j -= 1
+            d0 = depths[i]
+            end = n
+            k = i + 1
+            while k < n:
+                dk = depths[k]
+                tk = toks[k]
+                if dk < d0:
+                    end = k
+                    break
+                if (dk == d0 and tk["k"] == "sym"
+                        and tk["v"] in (",", "}")):
+                    end = k
+                    break
+                k += 1
+            for b in binds:
+                out.append((b, i + 1, end))
+        return out
+
+    def _collect_local_decls(self, toks, lo, hi, braces, depths):
+        """Every local binding inside the fn token window [lo, hi):
+        lets, parameters, for-loop variables, match-arm payload
+        bindings. Each carries the exact token window in which the name
+        is bound, so resolution is scope-precise: a sibling block's
+        `let tmp` never answers for this one, and a use after the scope
+        closed resolves to nothing."""
+        decls = []
+        # Match-arm payload bindings first — exact ranges, no scan needed.
+        for (b, b_start, b_end) in self._arm_bindings(toks, depths):
+            if lo <= b < hi:
+                decls.append(_LocalDecl(toks[b]["v"], "bind", b,
+                                        b, b_end))
+        # Walk the window: lets, for vars; params and for vars are
+        # "pending" until the next block opens, which is where they bind.
+        scope = []    # indices of open `{` tokens
+        pending = []  # (name, tok_idx, kind)
+        i = lo
+        while i < hi:
+            t = toks[i]
+            k = t.get("k")
+            v = t.get("v")
+            if k == "sym" and v == "{":
+                scope.append(i)
+                close = braces.get(i)
+                if close is not None:
+                    for (nm, tk, kd) in pending:
+                        decls.append(_LocalDecl(nm, kd, tk, tk, close + 1))
+                    pending = []
+            elif k == "sym" and v == "}":
+                if scope:
+                    scope.pop()
+            elif k == "kw" and v == "let":
+                j = i + 1
+                if j < hi and toks[j]["k"] == "kw" and toks[j]["v"] == "mut":
+                    j += 1
+                if j < hi and toks[j]["k"] == "ident":
+                    end = hi
+                    if scope:
+                        c = braces.get(scope[-1])
+                        end = (c + 1) if c is not None else hi
+                    decls.append(_LocalDecl(toks[j]["v"], "let", j, j, end))
+                    i = j
+            elif k == "kw" and v == "for":
+                j = i + 1
+                if j < hi and toks[j]["k"] == "ident":
+                    pending.append((toks[j]["v"], j, "for"))
+                    i = j
+            elif k == "kw" and v == "fn" and i == lo:
+                # The window's own fn — its parameters bind in the body.
+                j = i + 1
+                if j < hi and toks[j]["k"] == "ident":
+                    j += 1
+                if j < hi and toks[j]["k"] == "sym" and toks[j]["v"] == "(":
+                    pd = 0
+                    while j < hi:
+                        tj = toks[j]
+                        if tj["k"] == "sym":
+                            if tj["v"] in _OPEN_SYMS:
+                                pd += 1
+                            elif tj["v"] in _CLOSE_SYMS:
+                                pd -= 1
+                                if pd == 0:
+                                    break
+                        elif (tj["k"] == "ident" and pd == 1
+                                and j + 1 < hi
+                                and toks[j + 1]["k"] == "sym"
+                                and toks[j + 1]["v"] == ":"):
+                            pending.append((tj["v"], j, "param"))
+                        j += 1
+            i += 1
+        return decls
+
+    @staticmethod
+    def _resolve_local(decls, idx, name):
+        """The innermost active declaration of `name` covering token
+        index `idx`, or None."""
+        best = None
+        for d in decls:
+            if d.name == name and d.start <= idx < d.end:
+                if best is None or d.start > best.start:
+                    best = d
+        return best
+
+    @staticmethod
+    def _enclosing_span(spans, idx):
+        for (s, e) in spans:
+            if s <= idx < e:
+                return (s, e)
+        return None
+
+    # ---------- Stage 115: byte offsets and edit plumbing ----------
+
+    @staticmethod
+    def _line_offsets(text):
+        """Byte offset of the start of every line. The lexer's columns
+        are BYTES, so these must be too — a document with an emoji in a
+        string shifts every later byte offset on the line, and a
+        char-based table would land every edit two columns short."""
+        offs = [0]
+        b = 0
+        for ch in text:
+            b += len(ch.encode("utf-8"))
+            if ch == "\n":
+                offs.append(b)
+        return offs
+
+    def _byte_off(self, line_offs, tok):
+        """Byte offset of a token's first byte (lexer lines/cols are
+        1-indexed bytes)."""
+        ln = tok.get("line", 1)
+        if ln - 1 < 0 or ln - 1 >= len(line_offs):
+            return 0
+        return line_offs[ln - 1] + tok.get("col", 1) - 1
+
+    def _lsp_pos(self, text, line_offs, off):
+        """Byte offset -> LSP position (0-indexed line, UTF-16 column)."""
+        lo, hi = 0, len(line_offs) - 1
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if line_offs[mid] <= off:
+                lo = mid
+            else:
+                hi = mid - 1
+        line = lo
+        return {"line": line,
+                "character": self._byte_col_to_utf16(text, line,
+                                                     off - line_offs[line])}
+
+    def _lsp_range(self, text, line_offs, a, b):
+        return {"start": self._lsp_pos(text, line_offs, a),
+                "end": self._lsp_pos(text, line_offs, b)}
+
+    def _byte_edits_to_lsp(self, text, line_offs, edits):
+        """[(a, b, new_text)] byte triples -> LSP TextEdits."""
+        return [{"range": self._lsp_range(text, line_offs, a, b),
+                 "newText": rep}
+                for (a, b, rep) in edits]
+
+    @staticmethod
+    def _apply_byte_edits(text, edits):
+        """Apply [(a, b, new_text)] BYTE edits; non-overlapping by
+        construction, applied bottom-up. The offsets are bytes in the
+        utf-8 encoding (the lexer's coordinate system), so the surgery
+        runs on bytes, never on characters."""
+        out = text.encode("utf-8")
+        for (a, b, rep) in sorted(edits, key=lambda e: e[0], reverse=True):
+            out = out[:a] + rep.encode("utf-8") + out[b:]
+        return out.decode("utf-8")
+
+    def _text_checks(self, text):
+        """True when `text` parses and checks cleanly. Any failure —
+        HLError or a crash on a hostile shape — is a clean False: the
+        refactor handlers refuse rather than ship a broken edit."""
+        try:
+            toks = tokenize(text.encode("utf-8"))
+            prog = Parser(toks).parse_program()
+            check(prog)
+            return True
+        except HLError:
+            return False
+        except Exception:
+            return False
+
+    def _fresh_name(self, base, taken):
+        if base not in taken:
+            return base
+        n = 2
+        while "%s%d" % (base, n) in taken:
+            n += 1
+        return "%s%d" % (base, n)
+
+    def _scope_taken_names(self, toks, lo, hi, prog):
+        """Names a new local binding must avoid: every identifier in the
+        function, the program's top-level symbols (methods by short
+        name), builtins, effects, keywords."""
+        taken = set(KEYWORDS) | set(BUILTINS) | set(EFFECTS)
+        taken |= set(prog.get("fns", {}))
+        taken |= set(prog.get("structs", {}))
+        taken |= set(prog.get("enums", {}))
+        for key in prog.get("fns", {}):
+            if "." in key:
+                taken.add(key.split(".")[-1])
+        for i in range(lo, min(hi, len(toks))):
+            if toks[i]["k"] == "ident":
+                taken.add(toks[i]["v"])
+        return taken
+
+    # ---------- rename ----------
+
+    def handle_rename(self, params, msg_id):
+        """Stage 115: scope-aware rename.
+
+        The cursor's symbol is CLASSIFIED before anything moves:
+          - a local (let / param / for var / match binding) renames the
+            occurrences its declaration actually binds, inside its
+            function — a sibling block's same-named binding is a
+            different variable and stays put, and the finished file is
+            re-checked before the edit is offered;
+          - a struct field renames the field declarations plus the
+            `.name` accesses across open documents; a method renames the
+            impl declarations plus its call sites; a name that is both
+            (or also an enum variant) is refused — the `.name` sites
+            would be ambiguous;
+          - everything else keeps the Stage 14 contract: textual rename
+            across open documents (external, unopened files are still
+            never rewritten).
         """
         td = params.get("textDocument", {})
         uri = td.get("uri")
         pos = params.get("position", {})
         new_name = params.get("newName", "")
-        # Validate the new name (must be a legal HLS identifier).
+        # Validate the new name (must be a legal HLS identifier, and not
+        # a keyword — Stage 115: the lexer would tokenize it as a kw and
+        # the renamed file would not parse).
         if not new_name or not new_name[0].isalpha() and new_name[0] != "_":
             self.send_response(msg_id, None, error_code=-32602,
                                error_message="invalid newName: must start with a letter or _")
@@ -1411,6 +1882,10 @@ class HLSServer:
                 self.send_response(msg_id, None, error_code=-32602,
                                    error_message="invalid newName: only [A-Za-z0-9_] allowed")
                 return
+        if new_name in KEYWORDS:
+            self.send_response(msg_id, None, error_code=-32602,
+                               error_message="invalid newName: %s is a keyword" % new_name)
+            return
         doc = self.docs.get(uri)
         if doc is None:
             self.send_response(msg_id, {"changes": {}})
@@ -1422,31 +1897,796 @@ class HLSServer:
         if prog is None:
             self.send_response(msg_id, {"changes": {}})
             return
-        ident_name = self._ident_at(prog, line, col, uri=uri)
-        if ident_name is None:
+        text = doc["text"]
+        try:
+            toks = tokenize(text.encode("utf-8"))
+        except HLError:
+            toks = None
+        idx = None
+        tok = None
+        if toks is not None:
+            idx, tok = self._token_index_at(toks, line, col)
+        if tok is None or tok.get("k") not in ("ident", "kw"):
             self.send_response(msg_id, {"changes": {}})
             return
+        name = tok["v"]
         # Don't rename keywords or builtins.
-        if ident_name in KEYWORDS or ident_name in BUILTINS or ident_name in EFFECTS:
+        if name in KEYWORDS or name in BUILTINS or name in EFFECTS:
             self.send_response(msg_id, None, error_code=-32602,
-                               error_message="cannot rename keyword/builtin/effect: %s" % ident_name)
+                               error_message="cannot rename keyword/builtin/effect: %s" % name)
             return
-        # Collect edits across every open document. Stage 113: external
-        # (on-disk, unopened) documents are excluded — the server will
-        # not rewrite a file the user has not opened; the editor cannot
-        # have unsaved buffer state for it, and a stale disk copy could
-        # silently corrupt a dependency.
+        # 1. LOCAL — the scope engine resolves the cursor's identifier to
+        # a declaration; the rename never leaves the declaration's window.
+        if idx is not None:
+            braces = self._brace_matches(toks)
+            depths = self._tok_depths(toks)
+            spans = self._fn_spans(toks, braces)
+            span = self._enclosing_span(spans, idx)
+            if span is not None:
+                lo, hi = span
+                decls = self._collect_local_decls(toks, lo, hi, braces,
+                                                  depths)
+                decl = self._resolve_local(decls, idx, name)
+                if decl is not None:
+                    self._rename_local(uri, msg_id, text, toks, prog,
+                                       decls, decl, new_name, lo, hi)
+                    return
+            # 2. FIELD / METHOD — reachable only through a dot.
+            mode = self._classify_dot_name(toks, prog, idx, name)
+            if mode == "field":
+                self._rename_dotted(msg_id, name, new_name, "field")
+                return
+            if mode == "method":
+                self._rename_dotted(msg_id, name, new_name, "method")
+                return
+        # 3. GLOBAL — the Stage 14 textual contract, kept as the fallback
+        # for top-level symbols and anything the engine cannot classify.
         changes = {}
         for u, d in self.docs.items():
             if d.get("external"):
                 continue
             edits = []
-            for loc in self._find_references_in(u, ident_name):
-                rng = loc["range"]
-                edits.append({"range": rng, "newText": new_name})
+            for loc in self._find_references_in(u, name):
+                edits.append({"range": loc["range"], "newText": new_name})
             if edits:
                 changes[u] = edits
         self.send_response(msg_id, {"changes": changes})
+
+    def _classify_dot_name(self, toks, prog, idx, name):
+        """None | "field" | "method" for a symbol reachable only through
+        a dot: the cursor sits on a `.name` access, or on a field
+        declaration inside a struct body. A name that is BOTH a field
+        and a method — or also an enum variant — classifies as None:
+        the `.name` sites would be ambiguous, and a wrong rewrite is
+        worse than a refused one."""
+        on_site = (idx > 0 and toks[idx - 1]["k"] == "sym"
+                   and toks[idx - 1]["v"] == ".")
+        on_decl = False
+        if not on_site:
+            braces = self._brace_matches(toks)
+            for (s, e) in self._decl_regions(toks, braces, "struct"):
+                if s < idx < e and idx + 1 < len(toks):
+                    nxt = toks[idx + 1]
+                    if nxt["k"] == "sym" and nxt["v"] == ":":
+                        on_decl = True
+                    break
+        if not (on_site or on_decl):
+            return None
+        progs = [prog]
+        for d in self.docs.values():
+            p = self._doc_program(d)
+            if p is not None:
+                progs.append(p)
+        is_field = any(f[0] == name
+                       for p in progs
+                       for sd in p.get("structs", {}).values()
+                       for f in sd.get("fields", []))
+        is_method = any(k.endswith("." + name)
+                        for p in progs for k in p.get("fns", {}))
+
+        def _variant_names(p):
+            for ed in p.get("enums", {}).values():
+                for v in ed.get("variants", []):
+                    yield v[0] if isinstance(v, (list, tuple)) else v
+        is_variant = any(name == vn for p in progs for vn in _variant_names(p))
+        if is_field + is_method + is_variant > 1:
+            return None
+        if is_field:
+            return "field"
+        if is_method:
+            return "method"
+        return None
+
+    def _structlit_key_at(self, toks, braces, depths, i):
+        """True when token i is a struct-literal KEY: an identifier
+        followed by `:` at the first field depth of a `{...}` group whose
+        opener is preceded by the struct's name (`Item { size: 3 }`).
+        Such keys ARE the field's uses and rename with it. Match arms
+        use `=>`, map keys are strings, and for-headers live outside
+        braces — none of them can masquerade as a key here."""
+        if i + 1 >= len(toks) or toks[i]["k"] != "ident":
+            return False
+        nxt = toks[i + 1]
+        if nxt["k"] != "sym" or nxt["v"] != ":":
+            return False
+        d = depths[i]
+        j = i
+        while j >= 0:
+            tj = toks[j]
+            if tj["k"] == "sym" and tj["v"] == "{" and depths[j] == d - 1:
+                return j > 0 and toks[j - 1]["k"] == "ident"
+            j -= 1
+        return False
+
+    def _rename_dotted(self, msg_id, name, new_name, mode):
+        """Field / method rename across open documents. A field rewrites
+        the struct's field declarations, every `.name` access, and every
+        struct-literal key; a method rewrites the impl's `fn name`
+        declarations plus every `.name(` call site. A rename that would
+        duplicate a field or a method in the same struct/impl is
+        refused. External documents are still never rewritten (the
+        Stage 113 rule)."""
+        # Collision law: a field may not rename into a sibling field of
+        # a struct that already has both; a method may not rename into a
+        # sibling method of an impl that already has both.
+        progs = []
+        for d in self.docs.values():
+            p = self._doc_program(d)
+            if p is not None:
+                progs.append(p)
+        if mode == "field":
+            for p in progs:
+                for sname, sdef in p.get("structs", {}).items():
+                    fnames = [f[0] for f in sdef.get("fields", [])]
+                    if name in fnames and new_name in fnames:
+                        self.send_response(msg_id, None, error_code=-32602,
+                                           error_message="field %s already exists in struct %s" % (new_name, sname))
+                        return
+        else:
+            for p in progs:
+                fkeys = set(p.get("fns", {}))
+                for key in fkeys:
+                    if key.endswith("." + name) \
+                            and (key[:key.rindex(".")] + "." + new_name) in fkeys:
+                        self.send_response(msg_id, None, error_code=-32602,
+                                           error_message="method %s already exists in impl %s" % (new_name, key[:key.rindex(".")]))
+                        return
+        changes = {}
+        for u, d in self.docs.items():
+            if d.get("external"):
+                continue
+            uprog = self._doc_program(d)
+            if uprog is None:
+                continue
+            try:
+                utoks = tokenize(d["text"].encode("utf-8"))
+            except HLError:
+                continue
+            utoffs = self._line_offsets(d["text"])
+            braces = self._brace_matches(utoks)
+            depths = self._tok_depths(utoks)
+            sregions = self._decl_regions(utoks, braces, "struct")
+            iregions = self._decl_regions(utoks, braces, "impl")
+            edits = []
+            for i, t in enumerate(utoks):
+                if t["k"] != "ident" or t["v"] != name:
+                    continue
+                hit = False
+                if mode == "field":
+                    hit = (i > 0 and utoks[i - 1]["k"] == "sym"
+                           and utoks[i - 1]["v"] == ".")
+                    if not hit and i + 1 < len(utoks):
+                        nxt = utoks[i + 1]
+                        if nxt["k"] == "sym" and nxt["v"] == ":":
+                            hit = any(s < i < e for (s, e) in sregions) \
+                                or self._structlit_key_at(utoks, braces,
+                                                          depths, i)
+                else:
+                    hit = (i > 0 and utoks[i - 1]["k"] == "sym"
+                           and utoks[i - 1]["v"] == ".")
+                    if not hit and i > 0 and utoks[i - 1]["k"] == "kw" \
+                            and utoks[i - 1]["v"] == "fn":
+                        hit = any(s < i < e for (s, e) in iregions)
+                if not hit:
+                    continue
+                off = self._byte_off(utoffs, t)
+                edits.append({
+                    "range": self._lsp_range(d["text"], utoffs, off,
+                                             off + self._token_len(t)),
+                    "newText": new_name,
+                })
+            if edits:
+                changes[u] = edits
+        self.send_response(msg_id, {"changes": changes})
+
+    def _rename_local(self, uri, msg_id, text, toks, prog, decls, decl,
+                      new_name, lo, hi):
+        """Rename one local binding precisely: every token the
+        declaration binds, nothing else. The new name must be free in
+        scope, and the finished file must still check when the original
+        did — a rename that breaks the file is refused, never shipped."""
+        taken = self._scope_taken_names(toks, lo, hi, prog)
+        taken.discard(decl.name)
+        if new_name in taken:
+            self.send_response(msg_id, None, error_code=-32602,
+                               error_message="name already in use in this scope: %s" % new_name)
+            return
+        offs = self._line_offsets(text)
+        byte_edits = []
+        for i in range(lo, min(hi, len(toks))):
+            t = toks[i]
+            if t["k"] != "ident" or t["v"] != decl.name:
+                continue
+            if i + 1 < len(toks) and toks[i + 1]["k"] == "sym" \
+                    and toks[i + 1]["v"] == "(":
+                continue  # a call of a same-named fn, not this binding
+            if self._resolve_local(decls, i, decl.name) is not decl:
+                continue
+            off = self._byte_off(offs, t)
+            byte_edits.append((off, off + self._token_len(t), new_name))
+        if not byte_edits:
+            self.send_response(msg_id, {"changes": {}})
+            return
+        # Re-check: only when the original file was clean. A half-broken
+        # buffer keeps its Stage 14 textual semantics; a clean one never
+        # leaves the request broken.
+        if self._text_checks(text):
+            if not self._text_checks(
+                    self._apply_byte_edits(text, byte_edits)):
+                self.send_response(msg_id, None, error_code=-32602,
+                                   error_message="rename refused: the result does not check")
+                return
+        changes = {uri: self._byte_edits_to_lsp(text, offs, byte_edits)}
+        self.send_response(msg_id, {"changes": changes})
+
+    # ---------- Stage 115: refactor actions (extract, inline) ----------
+
+    def handle_code_action(self, params, msg_id):
+        """Stage 115: textDocument/codeAction — the refactor actions.
+
+        Two generators; each ships a WorkspaceEdit the client can apply
+        as-is, and each refuses before it rewrites:
+
+          - Inline variable (refactor.inline): the cursor on a `let`
+            binding (or on `let` itself, or on one of its uses) offers
+            to splice the initializer into every use and delete the
+            binding with its line. The planner's guards and a final
+            checker run on the finished text decide whether the action
+            exists at all.
+
+          - Extract variable (refactor.extract): the selection — or the
+            identifier / whole call under the cursor — must parse as
+            exactly one expression by the real parser; the type comes
+            from the probe (apply the finished edit for every candidate
+            type, keep the one and only candidate that checks).
+
+        A code action must be cheap to decline and safe to accept; both
+        generators answer [] rather than guess.
+        """
+        td = params.get("textDocument", {})
+        uri = td.get("uri")
+        doc = self.docs.get(uri)
+        prog = self._doc_program(doc) if doc else None
+        if prog is None:
+            self.send_response(msg_id, [])
+            return
+        rng = params.get("range") or {}
+        start = rng.get("start") or {}
+        end = rng.get("end") or {}
+        text = doc["text"]
+        try:
+            toks = tokenize(text.encode("utf-8"))
+        except HLError:
+            self.send_response(msg_id, [])
+            return
+        braces = self._brace_matches(toks)
+        depths = self._tok_depths(toks)
+        spans = self._fn_spans(toks, braces)
+        offs = self._line_offsets(text)
+
+        line = start.get("line", 0) + 1
+        col = self._utf16_col_to_byte(text, line - 1,
+                                      start.get("character", 0)) + 1
+        idx, tok = self._token_index_at(toks, line, col)
+
+        actions = []
+        # ---- inline ----
+        plan = self._plan_inline(text, toks, prog, braces, depths, spans,
+                                 idx, tok)
+        if plan is not None:
+            edits, _why = plan
+            actions.append({
+                "title": "Inline variable",
+                "kind": "refactor.inline",
+                "isPreferred": True,
+                "edit": {"changes": {
+                    uri: self._byte_edits_to_lsp(text, offs, edits)}},
+            })
+        # ---- extract ----
+        plan = self._plan_extract(uri, text, toks, prog, braces, depths,
+                                  spans, rng)
+        if plan is not None:
+            edits, _t = plan
+            actions.append({
+                "title": "Extract variable",
+                "kind": "refactor.extract",
+                "isPreferred": False,
+                "edit": {"changes": {
+                    uri: self._byte_edits_to_lsp(text, offs, edits)}},
+            })
+        self.send_response(msg_id, actions)
+
+    def _selection_window(self, text, toks, braces, rng):
+        """The selection as a token window [i0, i1] (inclusive), or
+        None. A collapsed cursor on an identifier extends to the whole
+        call when `(` follows immediately — `f(a, b)` extracts whole,
+        because that is what "extract this" means at a call."""
+        offs = self._line_offsets(text)
+        start = (rng.get("start") or {})
+        end = (rng.get("end") or {})
+        sl = start.get("line", 0)
+        el = end.get("line", 0)
+        sc = start.get("character", 0)
+        ec = end.get("character", 0)
+        if (sl, sc) > (el, ec):
+            return None
+        a = self._utf16_col_to_byte(text, sl, sc) if sl < len(offs) else 0
+        b = self._utf16_col_to_byte(text, el, ec) if el < len(offs) else 0
+        a += offs[sl] if sl < len(offs) else 0
+        b += offs[el] if el < len(offs) else 0
+        i0 = None
+        i1 = None
+        for i, t in enumerate(toks):
+            if t["k"] == "eof":
+                break
+            toff = self._byte_off(offs, t)
+            tlen = self._token_len(t)
+            if i0 is None and toff + tlen > a:
+                i0 = i
+            if toff < b or (toff == b and b == a):
+                i1 = i
+        if i0 is None or i1 is None or i1 < i0:
+            return None
+        if i0 == i1 and toks[i0]["k"] == "ident" \
+                and i0 + 1 < len(toks) and toks[i0 + 1]["k"] == "sym" \
+                and toks[i0 + 1]["v"] == "(":
+            close = braces.get(i0 + 1)
+            if close is not None:
+                i1 = close
+        return (i0, i1)
+
+    def _stmt_spans(self, toks, braces, lo, hi):
+        """Every statement span inside the fn body [lo, hi), innermost
+        included: the body's statement list is walked with the REAL
+        parser (one parse_stmt per statement — its consumption is the
+        statement's true extent), and every nested `{...}` group of a
+        block statement (if / while / for bodies, else arms) is walked
+        in turn. Braces the grammar does not make statements of — match
+        arms, struct-literal field lists — fail to parse and are
+        skipped, which is exactly the set of places a `let` cannot be
+        inserted anyway.
+
+        The AST carries no columns, so this forward walk is the only
+        exact statement map the server can have; heuristic backward
+        scans cannot find the start of a statement that begins with an
+        identifier (`area = area * 2` — nothing in the token stream
+        marks where the previous statement ended)."""
+        body_open = None
+        for (o, c) in braces.items():
+            if c == hi - 1 and o >= lo:
+                body_open = o
+                break
+        if body_open is None:
+            return []
+        out = []
+
+        def walk(start, end):
+            pos = start
+            while pos < end:
+                try:
+                    pp = Parser(toks[pos:end])
+                    pp.parse_stmt()
+                    consumed = pp.pos
+                except Exception:
+                    return
+                if consumed <= 0:
+                    return
+                s0, e0 = pos, pos + consumed
+                out.append((s0, e0))
+                k = s0
+                while k < e0:
+                    if toks[k]["k"] == "sym" and toks[k]["v"] == "{":
+                        c = braces.get(k)
+                        if c is not None and c > k:
+                            walk(k + 1, c)
+                        k = c + 1 if c is not None else k + 1
+                    else:
+                        k += 1
+                pos = e0
+
+        walk(body_open + 1, hi - 1)
+        return out
+
+    @staticmethod
+    def _innermost_stmt(spans, i):
+        """The innermost statement span containing token i, or None."""
+        best = None
+        for (s, e) in spans:
+            if s <= i < e:
+                if best is None or s > best[0]:
+                    best = (s, e)
+        return best
+
+    def _assign_target_toks(self, toks, braces, depths, lo, hi):
+        """Token indices that are part of an assignment TARGET somewhere
+        in [lo, hi): for every statement span, the `=` at the
+        statement's own depth is an assignment's operator (the parser
+        already rejected every other shape), and everything between the
+        statement's start and that `=` is the target chain — `x`,
+        `x.f`, `x[i]`, `x.f[i]`. A refactor must never splice a copy
+        into one of these positions.
+
+        Statement kinds whose `=` is NOT an assignment are skipped: a
+        let's `=` introduces its initializer, and the block statements
+        carry no `=` of their own (their nested statements get their own
+        spans). The scan is bounded by the statement's end — a later
+        statement's `=` belongs to that statement alone."""
+        out = set()
+        for (s0, e0) in self._stmt_spans(toks, braces, lo, hi):
+            if toks[s0]["k"] == "kw":
+                continue
+            base_d = depths[s0]
+            j = s0
+            q = None
+            while j < e0:
+                if depths[j] < base_d:
+                    break
+                if (depths[j] == base_d and toks[j]["k"] == "sym"
+                        and toks[j]["v"] == "="):
+                    q = j
+                    break
+                j += 1
+            if q is not None:
+                for kk in range(s0, q):
+                    out.add(kk)
+        return out
+
+    def _plan_extract(self, uri, text, toks, prog, braces, depths, spans,
+                      rng):
+        """Plan an extract-variable action, or None.
+
+        The pipeline, each step a refusal:
+          1. the selection resolves to a token window inside ONE fn;
+          2. the backward statement scan finds the statement's first
+             token — an `=>` first means an unbraced match arm, which
+             has no statement position to insert a `let` into;
+          3. the statement is parsed by the real parser, and the scan
+             for an assignment `=` stays inside it — a selection inside
+             an assignment TARGET is refused (the extracted value would
+             be a copy; the assignment would write somewhere else);
+          4. the selection parses as exactly one expression;
+          5. the probe: the finished edit is built for every candidate
+             type with a fresh binding name, the checker runs on each,
+             and EXACTLY ONE candidate may survive.
+        """
+        win = self._selection_window(text, toks, braces, rng)
+        if win is None:
+            return None
+        i0, i1 = win
+        span = self._enclosing_span(spans, i0)
+        if span is None or not (span[0] <= i1 < span[1]):
+            return None
+        lo, hi = span
+        # 2. the statement containing the selection — the forward parse
+        # walk, exact for identifier-started statements too.
+        stmts = self._stmt_spans(toks, braces, lo, hi)
+        inner = self._innermost_stmt(stmts, i0)
+        if inner is None:
+            return None
+        s, _stmt_end = inner
+        # A `=>` between the statement's start and the selection means
+        # the selection lives in a match ARM body — an expression
+        # position with no statement to anchor a `let` to.
+        for j in range(s, i0):
+            if toks[j]["k"] == "sym" and toks[j]["v"] == "=>":
+                return None
+        # 3. the assignment-target guard: the selection may not overlap
+        # any assignment's target chain (`x`, `x.f`, `x[i]`) — the
+        # extracted value would be a copy and the assignment would write
+        # somewhere else. The targets come from the parsed statement
+        # spans, so a later statement's `y = ...` is never mistaken for
+        # this one.
+        targets = self._assign_target_toks(toks, braces, depths, lo, hi)
+        for j in range(i0, i1 + 1):
+            if j in targets:
+                return None
+        # 4. the selection parses as one expression, all of it — the
+        # tokenizer's own eof marks the end, so "everything consumed"
+        # means pos == len(toks) - 1. The slice is taken in BYTES (the
+        # token columns' units), not in characters.
+        offs = self._line_offsets(text)
+        btext = text.encode("utf-8")
+        sel_a = self._byte_off(offs, toks[i0])
+        sel_b = self._byte_off(offs, toks[i1]) + self._token_len(toks[i1])
+        sel_text = btext[sel_a:sel_b].decode("utf-8")
+        try:
+            stoks = tokenize(sel_text.encode("utf-8"))
+            sp = Parser(stoks)
+            sp.parse_expr()
+            if sp.pos != len(stoks) - 1:
+                return None
+        except Exception:
+            return None
+        # names: the new binding must be free, the probe's even fresher.
+        taken = self._scope_taken_names(toks, lo, hi, prog)
+        real_name = self._fresh_name("extracted", taken)
+        taken.add(real_name)
+        probe_name = self._fresh_name("__hls_probe", taken)
+        stmt_off = self._byte_off(offs, toks[s])
+        ws = stmt_off - 1
+        while ws >= 0 and btext[ws:ws + 1] in (b" ", b"\t"):
+            ws -= 1
+        ws = btext[ws + 1:stmt_off].decode("utf-8")
+        # 5. the probe — one checker run per candidate type. The probe
+        # text is assembled in bytes; every offset above is a byte.
+        passing = []
+        for cand in self._extract_candidates(prog):
+            if s == i0:
+                pbytes = (btext[:sel_a]
+                          + ("let %s: %s = %s\n%s%s" % (probe_name, cand,
+                                                        sel_text, ws,
+                                                        probe_name))
+                          .encode("utf-8")
+                          + btext[sel_b:])
+            else:
+                pbytes = (btext[:stmt_off]
+                          + ("let %s: %s = %s\n%s" % (probe_name, cand,
+                                                      sel_text, ws))
+                          .encode("utf-8")
+                          + btext[stmt_off:sel_a]
+                          + probe_name.encode("utf-8")
+                          + btext[sel_b:])
+            if self._text_checks(pbytes.decode("utf-8")):
+                passing.append(cand)
+        if len(passing) != 1:
+            return None
+        typ = passing[0]
+        # The real edits — the same shapes the probe validated, with the
+        # real name; re-checked once more as shipped.
+        if s == i0:
+            byte_edits = [(sel_a, sel_b,
+                           "let %s: %s = %s\n%s%s" % (real_name, typ,
+                                                      sel_text, ws,
+                                                      real_name))]
+        else:
+            byte_edits = [
+                (stmt_off, stmt_off,
+                 "let %s: %s = %s\n%s" % (real_name, typ, sel_text, ws)),
+                (sel_a, sel_b, real_name),
+            ]
+        final = self._apply_byte_edits(text, byte_edits)
+        if not self._text_checks(final):
+            return None
+        return (byte_edits, real_name)
+
+    def _extract_candidates(self, prog):
+        """The type candidates a probe may try, cheapest and most common
+        first: primitives, the document's own struct/enum names, the
+        builtin generic wrappers over primitives, then arity-1 generics
+        of the document's own types instantiated over primitives. The
+        list is capped — a probe is a checker run, and the candidate
+        space must stay finite."""
+        cands = ["int", "float", "bool", "str"]
+        atoms = list(cands)
+        own = sorted(set(prog.get("structs", {}))
+                     | set(prog.get("enums", {})))
+        cands.extend(own)
+        for a in atoms:
+            cands.append("list[%s]" % a)
+            cands.append("map[str, %s]" % a)
+            cands.append("Chan[%s]" % a)
+            cands.append("tainted[%s]" % a)
+        generic1 = []
+        for name in own:
+            info = prog["structs"].get(name) or prog["enums"].get(name)
+            tp = (info or {}).get("typeparams") or []
+            if len(tp) == 1:
+                generic1.append(name)
+        for g in generic1:
+            for a in atoms:
+                cands.append("%s[%s]" % (g, a))
+        seen = set()
+        out = []
+        for c in cands:
+            if c not in seen:
+                seen.add(c)
+                out.append(c)
+        return out[:64]
+
+    def _plan_inline(self, text, toks, prog, braces, depths, spans, idx,
+                     tok):
+        """Plan an inline-variable action, or None.
+
+        The cursor may sit on the binding's name, on the `let` keyword
+        itself, or on any use the declaration binds. The initializer's
+        extent is found by the REAL parser (parse the token tail after
+        `=`, count what it consumes). The guards refuse:
+          - a reassigned binding (any `name = ...` the declaration
+            binds — `mut` means nothing to inlining);
+          - a use through which something is assigned (`x = ...`,
+            `x.f = ...`, `x[i] = ...`);
+          - an initializer naming a local that is reassigned anywhere in
+            the function (the splice could read a different value);
+          - a call-bearing initializer with two or more uses (duplicating
+            a call is re-executing it).
+        The finished text is re-checked; a broken splice is refused.
+        """
+        if tok is None:
+            return None
+        # Cursor on the `let` keyword — hop to the binding name.
+        if tok["k"] == "kw" and tok["v"] == "let":
+            j = idx + 1
+            if j < len(toks) and toks[j]["k"] == "kw" \
+                    and toks[j]["v"] == "mut":
+                j += 1
+            if j < len(toks) and toks[j]["k"] == "ident":
+                idx, tok = j, toks[j]
+            else:
+                return None
+        if tok["k"] != "ident":
+            return None
+        span = self._enclosing_span(spans, idx)
+        if span is None:
+            return None
+        lo, hi = span
+        decls = self._collect_local_decls(toks, lo, hi, braces, depths)
+        decl = self._resolve_local(decls, idx, tok["v"])
+        if decl is None or decl.kind != "let":
+            return None
+        # The let's own tokens: `#[attrs]? let [mut]? name : type = init`
+        start_idx = decl.tok
+        j = decl.tok - 1
+        if j >= lo and toks[j]["k"] == "kw" and toks[j]["v"] == "mut":
+            j -= 1
+        if j < lo or toks[j]["k"] != "kw" or toks[j]["v"] != "let":
+            return None
+        start_idx = j  # the deletion begins at the `let` keyword itself
+        # A `#[stack]` / `#[boxed]` list in front of the let belongs to
+        # it — deleting the let must not leave orphan attributes.
+        while start_idx - 1 >= lo and toks[start_idx - 1]["k"] == "sym" \
+                and toks[start_idx - 1]["v"] == "]":
+            k = start_idx - 1
+            d = 0
+            while k >= lo:
+                tk = toks[k]
+                if tk["k"] == "sym":
+                    if tk["v"] in _CLOSE_SYMS:
+                        d += 1
+                    elif tk["v"] in _OPEN_SYMS:
+                        d -= 1
+                        if d == 0:
+                            break
+                k -= 1
+            if (k > lo and toks[k]["k"] == "sym" and toks[k]["v"] == "["
+                    and toks[k - 1]["k"] == "sym"
+                    and toks[k - 1]["v"] == "#"):
+                start_idx = k - 1
+            else:
+                break
+        # The initializer: from the `=` the real parser consumes exactly
+        # the expression; what it consumed IS the extent.
+        eq = None
+        d = 0
+        j = decl.tok + 1
+        while j < hi:
+            tj = toks[j]
+            if tj["k"] == "sym":
+                v = tj["v"]
+                if v in _OPEN_SYMS:
+                    d += 1
+                elif v in _CLOSE_SYMS:
+                    if d == 0:
+                        return None
+                    d -= 1
+                elif v == "=" and d == 0:
+                    eq = j
+                    break
+            j += 1
+        if eq is None:
+            return None
+        try:
+            pp = Parser(toks[eq + 1:hi])
+            pp.parse_expr()
+            consumed = pp.pos
+        except Exception:
+            return None
+        if consumed <= 0:
+            return None
+        init_end = eq + consumed
+        offs = self._line_offsets(text)
+        btext = text.encode("utf-8")
+        init_a = self._byte_off(offs, toks[eq + 1])
+        init_b = self._byte_off(offs, toks[init_end]) \
+            + self._token_len(toks[init_end])
+        init_text = btext[init_a:init_b].decode("utf-8")
+        init_toks = toks[eq + 1:init_end + 1]
+        # Uses: every token the declaration binds, minus the declaration.
+        uses = []
+        for i in range(lo, min(hi, len(toks))):
+            t = toks[i]
+            if t["k"] != "ident" or t["v"] != decl.name or i == decl.tok:
+                continue
+            if i + 1 < len(toks) and toks[i + 1]["k"] == "sym" \
+                    and toks[i + 1]["v"] == "(":
+                continue
+            if self._resolve_local(decls, i, decl.name) is decl:
+                uses.append(i)
+        # Guard: reassigned (the `name =` shapes the declaration binds).
+        for i in range(lo, min(hi, len(toks))):
+            if toks[i]["k"] == "ident" and toks[i]["v"] == decl.name \
+                    and i + 1 < len(toks) and toks[i + 1]["k"] == "sym" \
+                    and toks[i + 1]["v"] == "=" \
+                    and self._resolve_local(decls, i, decl.name) is decl:
+                return None
+        # Guard: assignment THROUGH a use — the use may not sit in any
+        # assignment's target chain (`x = ...`, `x.f = ...`, `x[i] = ...`).
+        targets = self._assign_target_toks(toks, braces, depths, lo, hi)
+        for i in uses:
+            if i in targets:
+                return None
+        # Guard: the initializer names a local that is reassigned.
+        assigned = {toks[j]["v"] for j in targets
+                    if toks[j]["k"] == "ident"}
+        init_names = {t["v"] for t in init_toks if t["k"] == "ident"}
+        if init_names & assigned:
+            return None
+        # Guard: a call-bearing initializer used more than once.
+        has_call = any(toks[j2]["k"] == "ident" and j2 + 1 < len(toks)
+                       and toks[j2 + 1]["k"] == "sym"
+                       and toks[j2 + 1]["v"] == "("
+                       for j2 in range(eq + 1, init_end + 1))
+        if len(uses) >= 2 and has_call:
+            return None
+        # Paren discipline: a single token — or an initializer already
+        # wrapped in one matching paren group — splices bare; anything
+        # else rides in parentheses.
+        repl = init_text
+        if not (len(init_toks) == 1
+                or (init_toks[0]["k"] == "sym"
+                    and init_toks[0]["v"] == "("
+                    and braces.get(eq + 1) == init_end)):
+            repl = "(" + init_text + ")"
+        # The deletion: the let's own tokens, extended to whole lines
+        # when the lines carry nothing else — no orphan indent, no orphan
+        # attribute line.
+        del_a = self._byte_off(offs, toks[start_idx])
+        del_b = self._byte_off(offs, toks[init_end]) \
+            + self._token_len(toks[init_end])
+        line_a = toks[start_idx]["line"]
+        line_b = toks[init_end]["line"]
+        pre_clean = btext[offs[line_a - 1]:del_a].strip() == b""
+        post_clean = True
+        for j2 in range(init_end + 1, min(len(toks), hi)):
+            if toks[j2]["k"] == "eof":
+                break
+            if toks[j2]["line"] <= line_b:
+                post_clean = False
+                break
+            if toks[j2]["line"] > line_b:
+                break
+        if pre_clean and post_clean and line_b < len(offs):
+            byte_edits = [(offs[line_a - 1], offs[line_b], "")]
+        else:
+            byte_edits = [(del_a, del_b, "")]
+        for i in uses:
+            off = self._byte_off(offs, toks[i])
+            byte_edits.append((off, off + self._token_len(toks[i]), repl))
+        # Final gate: the original must check, and so must the result.
+        if self._text_checks(text):
+            if not self._text_checks(
+                    self._apply_byte_edits(text, byte_edits)):
+                return None
+        return (byte_edits, decl.name)
 
     # ---------- document symbols ----------
     def handle_document_symbol(self, params, msg_id):
