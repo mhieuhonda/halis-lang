@@ -182,7 +182,7 @@ remains green.
 | 114 | LSP: inlay hints (types, parameter names) | ✅ | (done in v0.133.0-alpha) |
 | 115 | LSP: refactor actions (rename, extract, inline) | ✅ | (done in v0.134.0-alpha) |
 | 116 | `hlfmt` — preserve comments in all positions | ✅ | (done in v0.135.0-alpha) |
-| 117 | `hlfmt` — configuration file (`.hlfmt.toml`) for teams | ⬜ | 2 weeks |
+| 117 | `hlfmt` — configuration file (`.hlfmt.toml`) for teams | ✅ | (done in v0.136.0-alpha) |
 | 118 | `hllint` — autofix mode (`--fix`) | ⬜ | 4 weeks |
 | 119 | `hltest` — snapshot testing (`assert_snapshot!`) | ⬜ | 3 weeks |
 | 120 | `hltest` — parameterised tests (table-driven) | ⬜ | 3 weeks |

@@ -154,6 +154,9 @@ python3 ../tools/hls-pkg.py build  # compile main.hls
 # 12. Stage 14-alpha: tooling (v0.12.0-alpha)
 python3 tools/hlfmt.py examples/hello.hls            # format to stdout
 python3 tools/hlfmt.py -c examples/hello.hls          # check formatting
+python3 tools/hlfmt.py --print-config F               # resolved .hlfmt.toml
+python3 tools/hlfmt.py --config team.toml -w src/x.hls  # pin one config
+cp .hlfmt.toml.example .hlfmt.toml                    # team style file
 python3 tools/hllint.py examples/hello.hls            # lint
 python3 tools/hllint.py --list                        # list rules
 python3 tools/hls-lsp.py --check examples/hello.hls   # one-shot diagnostics
@@ -163,6 +166,8 @@ make lsp-refactor-acceptance   # Stage 115 gate: LSP refactor actions
                                # (scope-aware rename, extract, inline)
 make fmt-comments-acceptance   # Stage 116 gate: hlfmt comment preservation
                                # (attributes, re-indent, all positions)
+make fmt-config-acceptance     # Stage 117 gate: hlfmt team config file
+                               # (discovery, five knobs, strict grammar)
 
 # 13. Stage 15-alpha: Safe C FFI (v0.13.0-alpha)
 python3 boot/boot.py examples/ffi_demo.hls           # call libc functions

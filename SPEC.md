@@ -1383,6 +1383,37 @@ Three tools provide the core developer experience:
   - **The preservation law**: comment count, text (byte-exact UTF-8),
     and relative order survive a pass; `hlfmt -c` flags any file
     whose comments sit at a non-canonical indent.
+- **Team configuration: `.hlfmt.toml`** (Stage 117, v0.136.0-alpha).
+  Every knob the formatter used to hardcode is a file. Resolution:
+  `--config PATH` pins one file and disables discovery, `--no-config`
+  ignores discovery, otherwise the walk starts at the TARGET file's
+  directory and climbs to the filesystem root — the nearest
+  `.hlfmt.toml` wins (a sub-team can pin a stricter style without
+  forking the repo-root file; the cwd is never consulted).
+  - **Keys and defaults** (defaults equal the pre-117 constants, so
+    teams that never write the file get byte-identical output):
+    `indent_width` — spaces per level, 1–8, default 4;
+    `indent_style` — `"space"` or `"tab"`, default `"space"`;
+    `final_newline` — trailing newline at EOF, default true;
+    `max_blank_lines` — a run of source blanks collapses to at most
+    this many, 0–4, default 1;
+    `reindent_comments` — comment-only lines take the canonical block
+    indent (the Stage 116 law), default true; `false` replays the raw
+    source prefix verbatim, a minimal-diff escape hatch for legacy
+    trees that still round-trips (the replayed prefix is exactly what
+    the next pass reads).
+  - **The grammar is strict**: an unknown key, a wrong type, an
+    out-of-range integer, an off-list choice, a duplicate key, any
+    table other than the optional `[hlfmt]`, a missing value, an
+    unterminated string, or an invalid escape is a hard error (exit 2)
+    naming file and line. A config resolves before the target is read,
+    so a rejected config never touches the file. Inline `#` comments
+    after values, blank lines, and leading comments are accepted.
+  - **The fixed-point law**: a given configuration formats as a fixed
+    point under itself — run twice with the same config, the second
+    pass changes nothing. An empty config file is byte-identical to no
+    config at all. `--print-config FILE` prints the resolved values
+    (with their source) as TOML, for CI debugging.
 
 ### 23.2. `hllint` — safety rules linter
 
