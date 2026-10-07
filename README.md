@@ -161,6 +161,8 @@ make lsp-hints-acceptance      # Stage 114 gate: LSP inlay hints
                                # (parameter names, match binding types)
 make lsp-refactor-acceptance   # Stage 115 gate: LSP refactor actions
                                # (scope-aware rename, extract, inline)
+make fmt-comments-acceptance   # Stage 116 gate: hlfmt comment preservation
+                               # (attributes, re-indent, all positions)
 
 # 13. Stage 15-alpha: Safe C FFI (v0.13.0-alpha)
 python3 boot/boot.py examples/ffi_demo.hls           # call libc functions

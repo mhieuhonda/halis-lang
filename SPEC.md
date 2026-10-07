@@ -1355,8 +1355,34 @@ Three tools provide the core developer experience:
 - **Idempotent: running twice = running once.**
 - Subcommands: `hlfmt FILE` (print), `hlfmt -w FILE` (write),
   `hlfmt -c FILE` (check), `hlfmt -d FILE` (diff).
-- Limitation: strips `#` comments (the HLS lexer treats them as
-  whitespace). Comment preservation is a Stage 14 release target.
+- **Comments are preserved in all positions** (Stage 116,
+  v0.135.0-alpha). Every `#` comment that enters a file comes out of
+  it — leading banners, comments above declarations, interior block
+  comments, trailing notes after statements, comments on brace lines
+  (`{ # note`, `} # note`), comments between `}` and a following
+  `else`, inside struct bodies and struct literals, between match
+  arms, between parameters, mid-expression between continuation
+  lines, inside call argument lists, and the trailing note at EOF.
+  - **Attribute sigils are not comments.** `#[...]` and `#![...]`
+    open attributes (the lexer emits `#` `!` `[` as sym tokens); the
+    comment scanner skips the whole bracket group — bracket-depth
+    aware and string-aware, so `#[doc("# not a comment")]` holds —
+    and keeps scanning behind it, so a genuine comment after an
+    attribute on the same line (`#[cold] # why`) survives. Reading
+    attributes as comments used to duplicate an attribute line that
+    also carried tokens (formatting was not idempotent) and to
+    swallow the comment behind it.
+  - **Comment-only lines re-indent to the canonical block indent.**
+    A stale source indent does not survive a pass — code never kept
+    one either. Top-level comments land at column 0.
+  - **Trailing comments attach exactly once, at leave-time**, after
+    the last output segment the source line produced. A one-line body
+    (`fn f() -> int { return 0 } # done`) flushes several output
+    lines; the note lands after the final one (`} # done`), never on
+    each.
+  - **The preservation law**: comment count, text (byte-exact UTF-8),
+    and relative order survive a pass; `hlfmt -c` flags any file
+    whose comments sit at a non-canonical indent.
 
 ### 23.2. `hllint` — safety rules linter
 
