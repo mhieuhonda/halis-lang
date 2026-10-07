@@ -159,6 +159,8 @@ python3 tools/hlfmt.py --config team.toml -w src/x.hls  # pin one config
 cp .hlfmt.toml.example .hlfmt.toml                    # team style file
 python3 tools/hllint.py examples/hello.hls            # lint
 python3 tools/hllint.py --list                        # list rules
+python3 tools/hllint.py --diff examples/hello.hls     # preview safe fixes
+python3 tools/hllint.py --fix examples/hello.hls      # apply safe fixes
 python3 tools/hls-lsp.py --check examples/hello.hls   # one-shot diagnostics
 make lsp-hints-acceptance      # Stage 114 gate: LSP inlay hints
                                # (parameter names, match binding types)
@@ -168,6 +170,8 @@ make fmt-comments-acceptance   # Stage 116 gate: hlfmt comment preservation
                                # (attributes, re-indent, all positions)
 make fmt-config-acceptance     # Stage 117 gate: hlfmt team config file
                                # (discovery, five knobs, strict grammar)
+make lint-fix-acceptance       # Stage 118 gate: hllint autofix mode
+                               # (scope renames, wraps, deletions, rollback)
 
 # 13. Stage 15-alpha: Safe C FFI (v0.13.0-alpha)
 python3 boot/boot.py examples/ffi_demo.hls           # call libc functions

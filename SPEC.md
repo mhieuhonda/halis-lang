@@ -1426,6 +1426,68 @@ Three tools provide the core developer experience:
 Subcommands: `hllint FILE`, `hllint --strict FILE`,
 `hllint --rule L001 FILE`, `hllint --list`.
 
+- **Autofix mode** (Stage 118, v0.137.0-alpha). Eight of the rules
+  have a mechanical, semantics-preserving fix; `hllint --fix FILE`
+  applies them and writes the file, `hllint --diff FILE` prints the
+  would-be changes as a unified diff and writes nothing (exit 1 while
+  fixes are pending, 0 when clean — the `git diff --exit-code`
+  convention, for CI). The two flags are mutually exclusive.
+  - **The fixable set, and what the fix is**: `L001` renames the
+    binding to the underscore convention (`let x` → `let _x`) — a
+    scope rename that rewrites the declaration AND every consistent
+    occurrence inside the enclosing function (reads, assign targets
+    like `y = exit(1)`, pattern payload bindings), so a blind spot in
+    the reference collector cannot turn the fix into a break; the
+    value expression is untouched, side effects included. `L002`
+    renames the definition of an unused function (`fn f` → `fn _f` —
+    an unused function has no call sites). `L004` wraps the statement
+    in a typed discard: `parse_it("hi")` becomes
+    `let _ignored: T = parse_it("hi")`, with `T` the checker's own
+    result-type text and the name unique per run (`_ignored`,
+    `_ignored2`, ... — two identical names in one function would be
+    shadowing). `L006` deletes the whole `uses ...` clause (it only
+    fires when the computed effect set is empty, so the clause is
+    provably dead weight). `L007` deletes the unreachable run up to
+    the enclosing block's closing brace (nested blocks, strings and
+    comments inside the dead code go with it; the brace survives with
+    no stale indent glued to it). `L010` deletes the empty impl
+    block. `L011`/`L012` delete the `#[inline(always)]` /
+    `#[tail_call]` attribute line; a sibling attribute on the same
+    line survives.
+  - **What is never auto-fixed, and why**: `L003` (deleting a field
+    breaks constructors and layout), `L005` (choosing how to handle
+    the error is a design decision), `L008` (refactoring a long
+    function is a design decision), `L009` (never fires). Extern
+    declarations are never renamed (the name is the C symbol) and
+    their `uses` clause is part of the FFI contract the parser
+    demands; handler/section functions are never renamed (they are
+    invoked from outside the call graph). An ambiguous definition
+    site — two `fn save` in different impls, say — is skipped with a
+    reason, never guessed.
+  - **The fix protocol is pessimistic**: every fix is planned as a
+    byte-span delete/insert/replace located through the token stream
+    (each token offset is verified to round-trip against the source
+    bytes), applied to a copy, and kept only if the copy parses, at
+    least one warning is resolved, no unfixable rule gains warnings,
+    and the total does not grow. On top of that, the whole crate
+    (the file plus every transitive import, via the boot loader's
+    merge) must re-load and re-check no worse than before — a
+    different checker error is a new break and rolls the round back;
+    the same error is the pre-existing one and stands; a formerly
+    broken file that now checks clean is the L007 rescue case. A
+    rolled-back round leaves the file byte-identical and reports
+    `not auto-fixed [RULE] line N: reason`.
+  - **The fixed-point law**: `--fix` loops (at most 8 rounds) until
+    no fixable warning remains — deleting dead code can strand a
+    function, whose rename is the next round's work — so one run
+    leaves the file as clean as the fixable rules can get it. A
+    second `--fix` run on a fixed file changes nothing.
+  - **The convention change** (the one rule-visible behaviour change):
+    `L002` no longer flags functions whose short name starts with
+    `_` — the same "intentionally unused" convention `L001` already
+    honours for bindings, and the accepted end state of the L002
+    fix itself.
+
 ### 23.3. `hls-lsp` — language server
 
 Minimal LSP server over JSON-RPC stdio:

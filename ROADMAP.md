@@ -183,7 +183,7 @@ remains green.
 | 115 | LSP: refactor actions (rename, extract, inline) | ✅ | (done in v0.134.0-alpha) |
 | 116 | `hlfmt` — preserve comments in all positions | ✅ | (done in v0.135.0-alpha) |
 | 117 | `hlfmt` — configuration file (`.hlfmt.toml`) for teams | ✅ | (done in v0.136.0-alpha) |
-| 118 | `hllint` — autofix mode (`--fix`) | ⬜ | 4 weeks |
+| 118 | `hllint` — autofix mode (`--fix`) | ✅ | (done in v0.137.0-alpha) |
 | 119 | `hltest` — snapshot testing (`assert_snapshot!`) | ⬜ | 3 weeks |
 | 120 | `hltest` — parameterised tests (table-driven) | ⬜ | 3 weeks |
 | 121 | VS Code extension: debugger integration (DAP) | ⬜ | 6 weeks |
