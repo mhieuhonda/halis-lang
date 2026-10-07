@@ -18,9 +18,16 @@ so it preserves all string literals exactly. It walks the tokens,
 normalises the whitespace BETWEEN them, and re-emits while preserving
 the original line breaks.
 
-NOTE: the HLS lexer treats `#` comments as whitespace and emits no token
-for them, so hlfmt currently strips `#` comments. Preserving comments is
-a Stage 14 release target (requires switching to a byte-level formatter).
+Stage 116 (v0.135.0-alpha) — comments are preserved in ALL positions:
+leading banners, trailing notes, interior block comments, mid-expression
+notes, comments inside argument lists and match arms, comments on brace
+lines, and trailing comments at EOF. Comment-only lines are re-indented
+to the canonical block indent (a stale source indent does not survive a
+pass — code never kept one either), and every `#` comment that enters a
+file comes out of it. `#[...]` / `#![...]` attribute sigils are NOT
+comments — the scanner skips them, so an attribute line inside a block
+no longer duplicates itself (a non-idempotency bug) and a genuine
+comment after an attribute on the same line survives.
 
 Usage:
   hlfmt FILE.hls               # print formatted source to stdout
@@ -66,14 +73,31 @@ SPACE_BEFORE_SYMS = {"{", "}", "=>", "->",
 
 
 def _extract_comments(src: bytes):
-    """Return {1-based line number: comment text} for every `#` comment,
+    """Return {1-based line number: (kind, text)} for every `#` comment,
     respecting string literals (`#` inside quotes is not a comment).
 
     BUG (deep-scan-5, fixed): the formatter used to DELETE all comments
     (the HLS lexer treats them as whitespace) — `hlfmt -w` silently
     destroyed user documentation. Comments are now preserved: comment-
-    only lines pass through verbatim in their source position; trailing
-    comments are re-appended to their line.
+    only lines pass through in their source position; trailing comments
+    are re-appended to their line.
+
+    Stage 116 (v0.135.0-alpha): the scanner is ATTRIBUTE-AWARE.
+    `#[...]` and `#![...]` open attributes, not comments (the lexer
+    emits `#` `!` `[` as sym tokens for the parser). Reading them as
+    comments had two real consequences:
+      - an attribute line that ALSO carries tokens (e.g.
+        `#[cold] fn inner() -> int {` inside a block) was registered
+        as a comment-only line AND emitted from the token stream; the
+        gap logic later re-emitted the bogus comment entry, so the
+        line appeared TWICE and formatting stopped being idempotent;
+      - a genuine comment AFTER an attribute on the same line
+        (`#[cold] # legacy path`) was swallowed by the attribute.
+    The scanner now skips the whole bracket group (string-aware, so
+    `#[doc("# not a comment")]` holds) and keeps scanning behind it.
+    Comment-only lines store their STRIPPED body — the emitter adds
+    the canonical block indent instead of replaying the source's
+    (possibly stale) indent.
     """
     comments = {}
     # latin-1 (byte-preserving) — the whole formatter pipeline round-trips
@@ -99,16 +123,65 @@ def _extract_comments(src: bytes):
                 j += 1
                 continue
             if c == "#":
-                # For comment-ONLY lines keep the full original line
-                # (preserving its indentation); for trailing comments keep
-                # just the comment text.
+                # Stage 116: `#[` and `#![` open an attribute — skip the
+                # whole group and keep scanning behind it for a real
+                # comment (`#[cold] # why` keeps `# why`).
+                if _attr_opens(line, j):
+                    j = _skip_attribute(line, j)
+                    continue
+                # For comment-ONLY lines keep just the comment body (the
+                # emitter re-indents it to the block indent); for
+                # trailing comments keep the comment text as written.
                 if line[:j].strip() == "":
-                    comments[idx] = ("only", line.rstrip())
+                    comments[idx] = ("only", line[j:].strip())
                 else:
                     comments[idx] = ("trailing", line[j:].rstrip())
                 break
             j += 1
     return comments
+
+
+def _attr_opens(line, j):
+    """True when line[j:] opens an attribute: `#[` or `#![`
+    (mirrors the lexer's own trigraph logic in boot/lexer.py)."""
+    n = len(line)
+    if j + 1 < n and line[j + 1] == "[":
+        return True
+    if j + 2 < n and line[j + 1] == "!" and line[j + 2] == "[":
+        return True
+    return False
+
+
+def _skip_attribute(line, j):
+    """Skip a `#[...]` / `#![...]` attribute group starting at the `#`.
+    Bracket-depth aware (`#[a([b])]`) and string-aware (brackets inside
+    string literals do not count, so `#[doc("...")]` holds). Returns
+    the index just past the closing `]`, or end-of-line when the group
+    never closes (the checker rejects that file later anyway; emitting
+    no comment entry keeps the formatter from duplicating anything)."""
+    depth = 0
+    in_str = False
+    n = len(line)
+    while j < n:
+        c = line[j]
+        if in_str:
+            if c == "\\" and j + 1 < n:
+                j += 2
+                continue
+            if c == '"':
+                in_str = False
+            j += 1
+            continue
+        if c == '"':
+            in_str = True
+        elif c == "[":
+            depth += 1
+        elif c == "]":
+            depth -= 1
+            if depth <= 0:
+                return j + 1
+        j += 1
+    return n
 
 
 def format_source(src: bytes) -> str:
@@ -128,6 +201,14 @@ def format_source(src: bytes) -> str:
         sys.stderr.write("warning: %s\n" % ex)
         return src.decode("latin-1")
     comments = _extract_comments(src)
+    # Stage 116 defense-in-depth: a line that carries real tokens must
+    # never ALSO be emitted as a comment-only line. The gap logic walks
+    # every source line between two tokens; a line that both starts with
+    # a `#` sigil and carries tokens is impossible for a real comment
+    # (the sigil consumes to end of line), but an attribute misread as
+    # a comment used to trip exactly this wire and duplicate the line.
+    # The guard makes that whole bug class structurally impossible.
+    code_lines = set(t["line"] for t in toks if t["k"] != EOF)
 
     out_lines = []
     cur_line_parts = []
@@ -140,15 +221,6 @@ def format_source(src: bytes) -> str:
         line (used to preserve intentional blank lines in the source)."""
         nonlocal cur_line_parts
         line = "".join(cur_line_parts).rstrip()
-        # Trailing comments are re-appended to the formatted code of
-        # their line. (A comment-ONLY line never reaches here with empty
-        # parts: the gap/EOF handlers own those. The old fallback
-        # re-emitted the comment when a brace handler had ALREADY
-        # flushed the line — duplicating every trailing comment after
-        # an opening brace.)
-        cmt = comments.get(cur_line_num)
-        if line and cmt is not None and cmt[0] == "trailing" and cmt[1].strip():
-            line = (line + " " + cmt[1]).rstrip()
         if line:
             out_lines.append(line)
         elif force_blank and out_lines:
@@ -157,6 +229,22 @@ def format_source(src: bytes) -> str:
             if out_lines and out_lines[-1] != "":
                 out_lines.append("")
         cur_line_parts = []
+
+    def attach_trailing(ln):
+        """Stage 116: append line `ln`'s trailing comment to the last
+        emitted output line — exactly once, when the source line is
+        LEFT. A one-liner body (`fn f() -> int { return 0 } # done`)
+        flushes THREE output lines while the source line is current;
+        attaching at every flush used to repeat the comment on each of
+        them (`{ # done` / `return 0 # done` / `} # done`). Attaching
+        at leave-time lands the comment after the last segment the
+        source line produced — where it sat in the source — and can
+        only happen once per line."""
+        if not out_lines:
+            return
+        cmt = comments.get(ln)
+        if cmt is not None and cmt[0] == "trailing" and cmt[1].strip():
+            out_lines[-1] = (out_lines[-1] + " " + cmt[1]).rstrip()
 
     def indent_str():
         return "    " * indent
@@ -167,12 +255,34 @@ def format_source(src: bytes) -> str:
     while i < n:
         t = toks[i]
         if t["k"] == EOF:
-            # Flush the final line and any comments after the last token.
+            # Stage 116: EOF walks the tail exactly like any other token.
+            # The shared gap logic flushes the final line, re-indents
+            # every trailing comment-only line at its own source
+            # position, and keeps intentional blank lines, so comments
+            # after the last token land where they sat — the previous
+            # handler emitted them at their RAW source indent (or lost
+            # blank lines between them).
+            gap = t["line"] - cur_line_num
+            if gap > 0:
+                had_pending = bool(cur_line_parts)
+                emit_cur_line()
+                attach_trailing(cur_line_num)
+                if not had_pending and cur_line_num not in code_lines:
+                    cmt = comments.get(cur_line_num)
+                    if cmt is not None and cmt[0] == "only" and cmt[1].strip():
+                        out_lines.append(indent_str() + cmt[1])
+                cur_line_num += 1
+                while cur_line_num < t["line"]:
+                    cmt = comments.get(cur_line_num)
+                    if (cmt is not None and cmt[0] == "only"
+                            and cmt[1].strip()
+                            and cur_line_num not in code_lines):
+                        out_lines.append(indent_str() + cmt[1])
+                    else:
+                        emit_cur_line(force_blank=True)
+                    cur_line_num += 1
             emit_cur_line()
-            for ln in sorted(l for l in comments
-                             if l >= cur_line_num and comments[l][0] == "only"
-                             and comments[l][1].strip()):
-                out_lines.append(comments[ln][1])
+            attach_trailing(cur_line_num)
             break
         # Handle line breaks first — if the token's line is greater than
         # the current line, advance. Emit a blank line only if the gap
@@ -182,22 +292,28 @@ def format_source(src: bytes) -> str:
             # Flush the current line content. If nothing was pending on
             # this line (e.g. the file STARTS with comments, or the line
             # was already flushed by a brace handler), a comment-only
-            # entry here is emitted verbatim. Trailing comments were
-            # already appended to flushed code — never re-emit those.
+            # entry here is emitted at the canonical indent. Trailing
+            # comments were already appended to flushed code — never
+            # re-emit those.
             had_pending = bool(cur_line_parts)
             emit_cur_line()
-            if not had_pending:
+            attach_trailing(cur_line_num)
+            if not had_pending and cur_line_num not in code_lines:
                 cmt = comments.get(cur_line_num)
                 if cmt is not None and cmt[0] == "only" and cmt[1].strip():
-                    out_lines.append(cmt[1])
+                    out_lines.append(indent_str() + cmt[1])
             cur_line_num += 1
-            # For each remaining gap line: emit a comment line verbatim
-            # (preserving the source's comment), or a blank line if the
-            # gap > 1 (an intentional blank in the source).
+            # For each remaining gap line: emit a comment-only line at
+            # the CANONICAL block indent (Stage 116 — the stale source
+            # indent does not survive a pass, exactly like code), or a
+            # blank line if the gap > 1 (an intentional blank in the
+            # source).
             while cur_line_num < t["line"]:
                 cmt = comments.get(cur_line_num)
-                if cmt is not None and cmt[0] == "only" and cmt[1].strip():
-                    out_lines.append(cmt[1])
+                if (cmt is not None and cmt[0] == "only"
+                        and cmt[1].strip()
+                        and cur_line_num not in code_lines):
+                    out_lines.append(indent_str() + cmt[1])
                 else:
                     emit_cur_line(force_blank=True)
                 cur_line_num += 1
