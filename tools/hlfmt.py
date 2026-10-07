@@ -29,11 +29,32 @@ comments — the scanner skips them, so an attribute line inside a block
 no longer duplicates itself (a non-idempotency bug) and a genuine
 comment after an attribute on the same line survives.
 
+Stage 117 (v0.136.0-alpha) — every knob the formatter used to hardcode
+is now a TEAM CONFIGURATION FILE, `.hlfmt.toml` (the rustfmt.toml of
+HLS). Discovery walks from the target file's directory to the
+filesystem root and the nearest config wins (so `hlfmt -w src/deep/x.hls`
+from the repo root still finds the repo-root file); `--config PATH`
+pins one file and disables the walk, `--no-config` ignores discovery
+entirely. Five keys: `indent_width` (1-8, default 4), `indent_style`
+("space" | "tab", default "space"), `final_newline` (default true),
+`max_blank_lines` (0-4, default 1) and `reindent_comments` (default
+true — the Stage 116 law; opting out keeps a legacy tree's comment
+indents verbatim for minimal diffs). The grammar is strict on purpose:
+an unknown key, a wrong type, an out-of-range value, a duplicate key,
+any table other than the optional `[hlfmt]`, or a malformed string is
+a hard error naming file and line (exit 2) — a typo must never
+silently reformat a whole tree in somebody's personal style. The
+defaults ARE the pre-117 constants, so teams that never write the
+file get byte-identical output, and a given config formats as a fixed
+point under itself. `--print-config` prints the resolved values for
+CI debugging.
+
 Usage:
   hlfmt FILE.hls               # print formatted source to stdout
   hlfmt -w FILE.hls            # write back to file
   hlfmt -c FILE.hls            # check if file is already formatted
   hlfmt -d FILE.hls            # print diff against original
+  hlfmt --print-config FILE.hls  # print the resolved .hlfmt.toml values
 """
 import argparse
 import difflib
@@ -72,9 +93,274 @@ SPACE_BEFORE_SYMS = {"{", "}", "=>", "->",
                      "==", "!=", "<=", ">=", "&&", "||", ","}
 
 
+# ---------------------------------------------------------------------------
+# Stage 117 (v0.136.0-alpha): the team configuration file, `.hlfmt.toml`.
+# ---------------------------------------------------------------------------
+CONFIG_FILE_NAME = ".hlfmt.toml"
+
+# The defaults ARE the pre-117 constants: a team that never writes the
+# file gets byte-identical output to the Stage 116 formatter.
+DEFAULT_CONFIG = {
+    "indent_width": 4,        # spaces per level (style "space")
+    "indent_style": "space",  # "space" | "tab"
+    "final_newline": True,    # trailing newline at EOF
+    "max_blank_lines": 1,     # run of source blanks collapses to at most N
+    "reindent_comments": True,  # Stage 116: comment-only lines take the
+                                # canonical block indent
+}
+
+# Closed ranges for the integer keys — a typo like `indent_width = 40`
+# must be an error, not a 40-space tree.
+_INT_BOUNDS = {
+    "indent_width": (1, 8),
+    "max_blank_lines": (0, 4),
+}
+
+# Closed choice sets for the string keys — `indent_style = "banaba"`
+# must be an error at parse time, not a silent fall-through to spaces.
+_STR_CHOICES = {
+    "indent_style": ("space", "tab"),
+}
+
+
+class ConfigError(ValueError):
+    """A `.hlfmt.toml` problem: missing file, bad grammar, unknown key,
+    wrong type, out-of-range value. Message always names file and line."""
+
+
+def _strip_config_comment(line: str) -> str:
+    """Strip a `#` comment from a config line, only OUTSIDE double-quoted
+    strings. Escape validation mirrors the strict TOML basic-string set
+    (same law as hls-pkg's manifest parser: a typo must be an error, not
+    silent corruption)."""
+    out = []
+    in_str = False
+    i = 0
+    n = len(line)
+    while i < n:
+        c = line[i]
+        if in_str:
+            if c == "\\":
+                if i + 1 >= n:
+                    raise ConfigError("unterminated escape at end of line")
+                nxt = line[i + 1]
+                if nxt not in 'btnfr"\\u':
+                    raise ConfigError("invalid escape `\\%s` (TOML basic "
+                                      "strings allow \\b \\t \\n \\f \\r "
+                                      "\\\" \\\\ \\uXXXX)" % nxt)
+                if nxt == "u":
+                    hexpart = line[i + 2:i + 6]
+                    if len(hexpart) < 4 or any(
+                            ch not in "0123456789abcdefABCDEF"
+                            for ch in hexpart):
+                        raise ConfigError("invalid \\uXXXX escape")
+                    out.append(line[i:i + 6])
+                    i += 6
+                    continue
+                out.append(line[i:i + 2])
+                i += 2
+                continue
+            if c == '"':
+                in_str = False
+            out.append(c)
+            i += 1
+            continue
+        if c == '"':
+            in_str = True
+            out.append(c)
+            i += 1
+            continue
+        if c == "#":
+            break
+        out.append(c)
+        i += 1
+    if in_str:
+        raise ConfigError("unterminated string literal")
+    return "".join(out)
+
+
+def _validate_value(key: str, val):
+    """Range/choice law shared by the file grammar and the programmatic
+    path: an out-of-range int or an off-list string is an error."""
+    if key in _INT_BOUNDS:
+        lo, hi = _INT_BOUNDS[key]
+        if not lo <= val <= hi:
+            raise ConfigError("key `%s` out of range (%d..%d), got %d"
+                              % (key, lo, hi, val))
+    if key in _STR_CHOICES and val not in _STR_CHOICES[key]:
+        raise ConfigError("key `%s` wants one of %s, got %r"
+                          % (key, "/".join(_STR_CHOICES[key]), val))
+    return val
+
+
+def _parse_config_value(text: str, key: str):
+    """Parse the value half of `key = value` against the declared type of
+    `key` (bool, int-with-bounds, or quoted string)."""
+    want = DEFAULT_CONFIG[key]
+    if isinstance(want, bool):
+        if text == "true":
+            return True
+        if text == "false":
+            return False
+        raise ConfigError("key `%s` wants true or false, got %r" % (key, text))
+    if isinstance(want, int):
+        body = text
+        neg = body.startswith("-")
+        digits = body[1:] if neg else body
+        if not digits or not all(ch in "0123456789" for ch in digits):
+            raise ConfigError("key `%s` wants an integer, got %r" % (key, text))
+        return _validate_value(key, int(body))
+    # String keys — the value must be ONE complete double-quoted string
+    # (escapes were already validated by _strip_config_comment).
+    if not text.startswith('"'):
+        raise ConfigError("key `%s` wants a double-quoted string, got %r"
+                          % (key, text))
+    if len(text) < 2 or not text.endswith('"'):
+        raise ConfigError("unterminated string value for `%s`" % key)
+    return _validate_value(key, text[1:-1])
+
+
+def parse_config(text: str, origin: str = "<config>") -> dict:
+    """Parse `.hlfmt.toml` text into an OVERRIDES dict (keys absent from
+    the file keep the defaults). The grammar is deliberately narrow:
+    flat `key = value` lines, an optional `[hlfmt]` table header, `#`
+    comments and blank lines. Anything else — another table, a duplicate
+    key, an unknown key, a bad value — is a hard error naming file and
+    line, because a silently-ignored typo reformats a whole tree in
+    somebody's personal style."""
+    overrides = {}
+    for lineno, raw in enumerate(text.split("\n"), start=1):
+        try:
+            line = _strip_config_comment(raw).strip()
+            if not line:
+                continue
+            if line.startswith("["):
+                if not line.endswith("]"):
+                    raise ConfigError("unterminated table header")
+                name = line[1:-1].strip()
+                if name != "hlfmt":
+                    raise ConfigError(
+                        "unsupported table [%s] — .hlfmt.toml accepts "
+                        "top-level keys or the optional [hlfmt] table" % name)
+                continue
+            if "=" not in line:
+                raise ConfigError("expected `key = value`, got %r" % line)
+            key, _, rest = line.partition("=")
+            key = key.strip()
+            rest = rest.strip()
+            if key not in DEFAULT_CONFIG:
+                raise ConfigError(
+                    "unknown key `%s` (known keys: %s)"
+                    % (key, ", ".join(sorted(DEFAULT_CONFIG))))
+            if key in overrides:
+                raise ConfigError("duplicate key `%s`" % key)
+            if not rest:
+                raise ConfigError("key `%s` has no value" % key)
+            overrides[key] = _parse_config_value(rest, key)
+        except ConfigError as ex:
+            raise ConfigError("%s:%d: %s" % (origin, lineno, ex)) from ex
+    return overrides
+
+
+def load_config(path: str) -> dict:
+    """Load and parse a `.hlfmt.toml`; overrides only, validated."""
+    with open(path, "r") as f:
+        text = f.read()
+    return parse_config(text, origin=path)
+
+
+def find_config(start_path: str):
+    """Walk from the target file's directory UP to the filesystem root
+    and return the path of the first `.hlfmt.toml` found, or None. The
+    nearest file wins — a sub-team can pin a stricter style without
+    forking the repo-root config, and `hlfmt -w src/deep/x.hls` run from
+    the repo root still finds the repo-root file because the walk
+    anchors at the TARGET, not the cwd."""
+    d = os.path.abspath(start_path)
+    if os.path.isfile(d):
+        d = os.path.dirname(d)
+    while True:
+        cand = os.path.join(d, CONFIG_FILE_NAME)
+        if os.path.isfile(cand):
+            return cand
+        parent = os.path.dirname(d)
+        if parent == d:
+            return None
+        d = parent
+
+
+def resolve_config(target_path=None, config_path=None, no_config=False):
+    """Resolve the configuration for a run. Returns (cfg, source) where
+    `cfg` is a full config dict and `source` is the config file's path,
+    or None for the built-in defaults. Precedence: --no-config (ignore
+    everything) > --config PATH (pin one file) > discovery from the
+    target file's directory > defaults."""
+    merged = dict(DEFAULT_CONFIG)
+    if no_config:
+        return merged, None
+    if config_path:
+        if not os.path.isfile(config_path):
+            raise ConfigError("config file not found: %s" % config_path)
+        merged.update(load_config(config_path))
+        return merged, config_path
+    if target_path:
+        found = find_config(target_path)
+        if found is not None:
+            merged.update(load_config(found))
+            return merged, found
+    return merged, None
+
+
+def check_config(cfg) -> dict:
+    """Validate a config dict handed in programmatically (same law as
+    the file grammar: unknown key / wrong type / out of range is an
+    error). Returns a full dict — defaults filled in."""
+    full = dict(DEFAULT_CONFIG)
+    for key, val in (cfg or {}).items():
+        if key not in DEFAULT_CONFIG:
+            raise ConfigError("unknown config key `%s`" % key)
+        want = DEFAULT_CONFIG[key]
+        if isinstance(want, bool):
+            if not isinstance(val, bool):
+                raise ConfigError("key `%s` wants a bool, got %r" % (key, val))
+        elif isinstance(want, int):
+            if isinstance(val, bool) or not isinstance(val, int):
+                raise ConfigError("key `%s` wants an int, got %r" % (key, val))
+            lo, hi = _INT_BOUNDS[key]
+            if not lo <= val <= hi:
+                raise ConfigError("key `%s` out of range (%d..%d), got %d"
+                                  % (key, lo, hi, val))
+        else:
+            if not isinstance(val, str):
+                raise ConfigError("key `%s` wants a string, got %r"
+                                  % (key, val))
+        full[key] = _validate_value(key, val)
+    return full
+
+
+def config_to_toml(cfg, source=None) -> str:
+    """Render a resolved config as TOML (for --print-config)."""
+    lines = ["# resolved by hlfmt (Stage 117, v0.136.0-alpha)"]
+    if source is None:
+        lines.append("# source: built-in defaults (no .hlfmt.toml found)")
+    else:
+        lines.append("# source: %s" % source)
+    for key in sorted(DEFAULT_CONFIG):
+        val = cfg[key]
+        if isinstance(val, bool):
+            rendered = "true" if val else "false"
+        elif isinstance(val, int):
+            rendered = str(val)
+        else:
+            rendered = '"%s"' % val
+        lines.append("%s = %s" % (key, rendered))
+    return "\n".join(lines) + "\n"
+
+
 def _extract_comments(src: bytes):
-    """Return {1-based line number: (kind, text)} for every `#` comment,
-    respecting string literals (`#` inside quotes is not a comment).
+    """Return {1-based line number: (kind, text[, raw_indent])} for every
+    `#` comment, respecting string literals (`#` inside quotes is not a
+    comment).
 
     BUG (deep-scan-5, fixed): the formatter used to DELETE all comments
     (the HLS lexer treats them as whitespace) — `hlfmt -w` silently
@@ -98,6 +384,12 @@ def _extract_comments(src: bytes):
     Comment-only lines store their STRIPPED body — the emitter adds
     the canonical block indent instead of replaying the source's
     (possibly stale) indent.
+
+    Stage 117 (v0.136.0-alpha): comment-only entries carry the source
+    prefix as a third field ("only", body, raw_indent) so the
+    `reindent_comments = false` escape hatch can replay the line
+    VERBATIM (minimal-diff mode over a legacy tree). The default law
+    ignores the field and re-indents to the canonical block indent.
     """
     comments = {}
     # latin-1 (byte-preserving) — the whole formatter pipeline round-trips
@@ -130,10 +422,12 @@ def _extract_comments(src: bytes):
                     j = _skip_attribute(line, j)
                     continue
                 # For comment-ONLY lines keep just the comment body (the
-                # emitter re-indents it to the block indent); for
-                # trailing comments keep the comment text as written.
+                # emitter re-indents it to the block indent) plus the raw
+                # source prefix (Stage 117: the reindent_comments=false
+                # escape hatch replays it verbatim); for trailing
+                # comments keep the comment text as written.
                 if line[:j].strip() == "":
-                    comments[idx] = ("only", line[j:].strip())
+                    comments[idx] = ("only", line[j:].strip(), line[:j])
                 else:
                     comments[idx] = ("trailing", line[j:].rstrip())
                 break
@@ -184,8 +478,14 @@ def _skip_attribute(line, j):
     return n
 
 
-def format_source(src: bytes) -> str:
-    """Format HLS source bytes; return the formatted source as a string."""
+def format_source(src: bytes, cfg=None) -> str:
+    """Format HLS source bytes; return the formatted source as a string.
+
+    Stage 117: `cfg` is an OVERRIDES dict on top of DEFAULT_CONFIG
+    (None = pure defaults). A config formats as a fixed point under
+    ITSELF — run twice with the same cfg, the second pass changes
+    nothing."""
+    cfg = check_config(cfg)
     try:
         toks = tokenize(src)
     except HLError as ex:
@@ -218,17 +518,28 @@ def format_source(src: bytes) -> str:
 
     def emit_cur_line(force_blank=False):
         """Emit the current line. If `force_blank` is True, emit a blank
-        line (used to preserve intentional blank lines in the source)."""
+        line (used to preserve intentional blank lines in the source) —
+        capped by `max_blank_lines` (Stage 117; default 1 keeps the
+        pre-117 never-two-blanks behavior)."""
         nonlocal cur_line_parts
         line = "".join(cur_line_parts).rstrip()
         if line:
             out_lines.append(line)
         elif force_blank and out_lines:
-            # Only emit a blank line if we have prior content AND the
-            # previous line was not already blank.
-            if out_lines and out_lines[-1] != "":
+            # Only emit a blank if the run of trailing blanks in the
+            # output is still under the configured cap.
+            if _trailing_blanks() < cfg["max_blank_lines"]:
                 out_lines.append("")
         cur_line_parts = []
+
+    def _trailing_blanks():
+        k = 0
+        for ln in reversed(out_lines):
+            if ln == "":
+                k += 1
+            else:
+                break
+        return k
 
     def attach_trailing(ln):
         """Stage 116: append line `ln`'s trailing comment to the last
@@ -247,7 +558,30 @@ def format_source(src: bytes) -> str:
             out_lines[-1] = (out_lines[-1] + " " + cmt[1]).rstrip()
 
     def indent_str():
-        return "    " * indent
+        # Stage 117: the indent unit is team-configurable — `indent_width`
+        # spaces per level, or one tab per level under "tab".
+        if cfg["indent_style"] == "tab":
+            return "\t" * indent
+        return " " * (cfg["indent_width"] * indent)
+
+    def emit_comment_line(ln):
+        """Emit source line `ln`'s comment-only entry, if it has one and
+        the line carries no tokens. Returns True when a comment was
+        emitted (the caller then skips the blank-line fallback).
+        Stage 117: the entry lands at the canonical block indent —
+        unless `reindent_comments` is off, in which case the RAW source
+        prefix is replayed verbatim (the minimal-diff escape hatch for
+        legacy trees; still idempotent, since the replayed prefix is
+        exactly what the next pass will read)."""
+        cmt = comments.get(ln)
+        if (cmt is not None and cmt[0] == "only" and cmt[1].strip()
+                and ln not in code_lines):
+            if cfg["reindent_comments"]:
+                out_lines.append(indent_str() + cmt[1])
+            else:
+                out_lines.append(cmt[2] + cmt[1])
+            return True
+        return False
 
     prev = None  # previous emitted token
     i = 0
@@ -267,18 +601,11 @@ def format_source(src: bytes) -> str:
                 had_pending = bool(cur_line_parts)
                 emit_cur_line()
                 attach_trailing(cur_line_num)
-                if not had_pending and cur_line_num not in code_lines:
-                    cmt = comments.get(cur_line_num)
-                    if cmt is not None and cmt[0] == "only" and cmt[1].strip():
-                        out_lines.append(indent_str() + cmt[1])
+                if not had_pending:
+                    emit_comment_line(cur_line_num)
                 cur_line_num += 1
                 while cur_line_num < t["line"]:
-                    cmt = comments.get(cur_line_num)
-                    if (cmt is not None and cmt[0] == "only"
-                            and cmt[1].strip()
-                            and cur_line_num not in code_lines):
-                        out_lines.append(indent_str() + cmt[1])
-                    else:
+                    if not emit_comment_line(cur_line_num):
                         emit_cur_line(force_blank=True)
                     cur_line_num += 1
             emit_cur_line()
@@ -298,23 +625,17 @@ def format_source(src: bytes) -> str:
             had_pending = bool(cur_line_parts)
             emit_cur_line()
             attach_trailing(cur_line_num)
-            if not had_pending and cur_line_num not in code_lines:
-                cmt = comments.get(cur_line_num)
-                if cmt is not None and cmt[0] == "only" and cmt[1].strip():
-                    out_lines.append(indent_str() + cmt[1])
+            if not had_pending:
+                emit_comment_line(cur_line_num)
             cur_line_num += 1
             # For each remaining gap line: emit a comment-only line at
             # the CANONICAL block indent (Stage 116 — the stale source
-            # indent does not survive a pass, exactly like code), or a
-            # blank line if the gap > 1 (an intentional blank in the
-            # source).
+            # indent does not survive a pass, exactly like code; Stage
+            # 117 lets a team opt out via reindent_comments = false),
+            # or a blank line if the gap > 1 (an intentional blank in
+            # the source, capped at max_blank_lines).
             while cur_line_num < t["line"]:
-                cmt = comments.get(cur_line_num)
-                if (cmt is not None and cmt[0] == "only"
-                        and cmt[1].strip()
-                        and cur_line_num not in code_lines):
-                    out_lines.append(indent_str() + cmt[1])
-                else:
+                if not emit_comment_line(cur_line_num):
                     emit_cur_line(force_blank=True)
                 cur_line_num += 1
         cur_line_num = t["line"]
@@ -449,11 +770,12 @@ def format_source(src: bytes) -> str:
         i += 1
     # Flush any remaining content.
     emit_cur_line()
-    # Ensure a single trailing newline.
+    # Ensure a single trailing newline (Stage 117: `final_newline = false`
+    # opts out — CI diffing against a tool that writes no EOF newline).
     while out_lines and out_lines[-1] == "":
         out_lines.pop()
     result = "\n".join(out_lines)
-    if not result.endswith("\n"):
+    if cfg["final_newline"] and not result.endswith("\n"):
         result += "\n"
     return result
 
@@ -535,8 +857,8 @@ def _render_token(t) -> str:
     return str(v)
 
 
-def is_formatted(src: bytes) -> bool:
-    """Return True if the source is already formatted.
+def is_formatted(src: bytes, cfg=None) -> bool:
+    """Return True if the source is already formatted under `cfg`.
 
     Deep-scan-12 fix (DSS-T-19): `format_source` raises ValueError on
     HLS strings containing control bytes other than \\n / \\t / \\\\ / \\"
@@ -546,7 +868,7 @@ def is_formatted(src: bytes) -> bool:
     Catch ValueError (and HLError) and return False — the caller's
     `hlfmt -c` flow then exits non-zero, which is what the user wants."""
     try:
-        formatted = format_source(src)
+        formatted = format_source(src, cfg)
     except (ValueError, HLError) as ex:
         sys.stderr.write("warning: cannot format: %s\n" % ex)
         return False
@@ -564,14 +886,37 @@ def main():
                         help="Exit non-zero if file is not already formatted.")
     parser.add_argument("-d", "--diff", action="store_true",
                         help="Print unified diff against original.")
+    parser.add_argument("--config", metavar="PATH", default=None,
+                        help="Pin one .hlfmt.toml (disables discovery).")
+    parser.add_argument("--no-config", action="store_true",
+                        help="Ignore .hlfmt.toml discovery; built-in "
+                             "defaults only.")
+    parser.add_argument("--print-config", action="store_true",
+                        help="Print the resolved configuration as TOML "
+                             "and exit.")
     args = parser.parse_args()
+    if args.config and args.no_config:
+        sys.stderr.write("error: --config and --no-config are mutually "
+                         "exclusive\n")
+        return 2
     if not os.path.isfile(args.file):
         sys.stderr.write("error: file not found: %s\n" % args.file)
         return 1
+    # Stage 117: resolve the team configuration BEFORE touching the
+    # target — a bad config must be an error (exit 2), never a half-run.
+    try:
+        cfg, cfg_source = resolve_config(args.file, args.config,
+                                         args.no_config)
+    except ConfigError as ex:
+        sys.stderr.write("error: %s\n" % ex)
+        return 2
+    if args.print_config:
+        sys.stdout.write(config_to_toml(cfg, cfg_source))
+        return 0
     with open(args.file, "rb") as f:
         src = f.read()
     try:
-        formatted = format_source(src)
+        formatted = format_source(src, cfg)
     except Exception as ex:
         sys.stderr.write("error: %s\n" % ex)
         return 1
