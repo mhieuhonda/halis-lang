@@ -188,7 +188,7 @@ remains green.
 | 120 | `hltest` — parameterised tests (table-driven) | ✅ | (done in v0.139.0-alpha) |
 | 121 | VS Code extension: debugger integration (DAP) | ✅ | (done in v0.140.0-alpha) |
 | 122 | Đã hủy bỏ, không cần làm stage này. |
-| 123 | `hls-repl` — interactive REPL with :type/:effects/:audit | ⬜ | 5 weeks |
+| 123 | `hls-repl` — interactive REPL with :type/:effects/:audit | ✅ | (done in v0.141.0-alpha) |
 | 124 | `hls-bench` — criterion-style micro-benchmark runner | ⬜ | 4 weeks |
 
 ### Phase IX — Performance, runtime & stability (Stages 125–140)

@@ -13,6 +13,77 @@ stability (125–140), and final stabilisation toward v1.0 (141–150).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
+## [v0.141.0-alpha] — Stage 123: `hls-repl`, the interactive REPL
+- The prompt stops reading the program and starts growing it.
+  `tools/hls-repl.py` is an interactive REPL where the session IS a
+  Halis program: definitions (`fn` / `struct` / `enum` / `impl` /
+  `import` / `extern`) extend the program at the top level,
+  statements (`let` / assignment / `if` / `while` / `for`) join the
+  session block, and bare expressions evaluate immediately and print
+  `= <value>`. It runs on the Stage-0 interpreter — the same
+  reference implementation boot.py runs — with the real loader and
+  the real checker on EVERY input: the session source is
+  synthesized (your definitions, then the session block as
+  `fn main()`), loaded through the production loader (so
+  `import "std.str"` at the prompt resolves exactly where it
+  resolves for a file), and checked before anything runs; an input
+  the checker rejects never touches the session, and the
+  diagnostic's line number is relocated to the input that caused it.
+- Nothing is ever re-run behind your back. One live interpreter
+  follows the session: each committed input extends its program
+  tables and executes only the new statements — a `println` you
+  typed once is not repeated by the next input, a `write_file` runs
+  once, and the RNG/clock state marches forward exactly as a
+  program's would. Statement inputs run in a scratch scope merged
+  into the session only when the whole input ran to completion: a
+  runtime panic mid-input reports, commits nothing, and discards the
+  input's bindings (mutations of OLDER values are real effects that
+  already happened — the panic message names the line, relocated to
+  the input or the definition it fell in). Call-shaped expressions
+  (calls, methods, match, `?`) join the session block after they
+  run — their effects are real and the session's audit must see
+  them; value expressions (`1 + 1`, `a3`) are queries and never join
+  the state.
+- Types and effects come from the checker, never a
+  re-implementation: `:type <expr>` reports the type the checker
+  just wrote on the expression's AST node (generics instantiated,
+  method dispatch resolved); `:effects <expr>` reports the effect
+  fixpoint's computed set relative to what the session holds —
+  `(none - pure)`, a set with `(new: ...)` naming what the
+  expression adds, or `none beyond the session's (...)`; `:audit`
+  prints the very same table `boot.py --audit` prints for the
+  session program. The session block is the REPL's own `main`: its
+  `uses` clause grows by itself from the checker's own
+  missing-effect diagnostic — and ONLY its: a definition of yours
+  that lacks a needed effect is reported, not silently repaired.
+- The command surface: `:env` (bindings with DECLARED types and
+  values), `:load <file.hls>` (loads a module-style file — one that
+  defines no `main` — and refuses the rest by name), `:reset`,
+  `:help`, `:quit` (also `:q`); unknown commands are refused by
+  name; the `__repl_` prefix is reserved. Bare `return`, `exit(...)`
+  and stray `break`/`continue` are refused with the reason — the
+  session block is not callable and not a process. Multi-line input
+  is bracket-honest (an open brace keeps reading on `...>`,
+  string literals and comments are the real lexer's judgment);
+  values print the way Halis means them (bools as literals, strings
+  decoded and quoted, structs in field order, enums as
+  `Variant(payload)`, taint visible); a `void` expression prints
+  nothing. Zero boot/ changes — differential behaviour, bootstrap,
+  and every suite are exactly what they were.
+- Acceptance (`make repl-acceptance`): 8 sections, 90 checks over
+  the REAL repl subprocess — the session-as-a-program model
+  (persistence, rejections, immutability across inputs), definitions
+  at the prompt (multi-line, imports, generics, honest forward
+  reference), the no-replay guarantee (output once, state advances,
+  RNG marches, one write on disk), the `:type` matrix, the
+  `:effects` matrix (including the never-repaired user fn), the
+  command surface, panics/refusals/rollback, and the corpus: the
+  canonical session's `=` lines are BYTE-IDENTICAL with the
+  fixture's program output (`tests/ok/feat_stage123_repl.hls`,
+  hlfmt-canonical, hllint-clean, boot --check green, and native
+  output byte-identical when bin/hlc + gcc exist), and the piped
+  transcript is deterministic.
+
 ## [v0.140.0-alpha] — Stage 121: VS Code extension debugger integration (DAP)
 - The editor stops reading the program and starts stepping through it.
   `tools/hls-dap.py` is a Debug Adapter Protocol server over stdio —
