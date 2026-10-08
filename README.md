@@ -163,6 +163,8 @@ python3 tools/hllint.py --diff examples/hello.hls     # preview safe fixes
 python3 tools/hllint.py --fix examples/hello.hls      # apply safe fixes
 python3 tools/hltest.py -u tests/ok/feat_stage119_snapshot.hls  # record snapshots
 python3 tools/hltest.py tests/ok/feat_stage119_snapshot.hls     # verify them
+python3 tools/hltest.py tests/ok/feat_stage120_cases.hls        # table tests: one result per row
+python3 tools/hltest.py --grep "#boundary" tests/ok/feat_stage120_cases.hls  # select one row
 python3 tools/hls-lsp.py --check examples/hello.hls   # one-shot diagnostics
 make lsp-hints-acceptance      # Stage 114 gate: LSP inlay hints
                                # (parameter names, match binding types)
@@ -176,6 +178,8 @@ make lint-fix-acceptance       # Stage 118 gate: hllint autofix mode
                                # (scope renames, wraps, deletions, rollback)
 make snapshot-acceptance       # Stage 119 gate: hltest snapshot testing
                                # (wire protocol, stores, diffs, prune)
+make cases-acceptance          # Stage 120 gate: hltest parameterised tests
+                               # (tables, per-row results, store keys, grep)
 
 # 13. Stage 15-alpha: Safe C FFI (v0.13.0-alpha)
 python3 boot/boot.py examples/ffi_demo.hls           # call libc functions

@@ -13,6 +13,87 @@ stability (125–140), and final stabilisation toward v1.0 (141–150).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
+## [v0.139.0-alpha] — Stage 120: hltest parameterised tests (table-driven)
+- The roadmap's table-driven tests land as a naming convention the
+  runner drives, with the table living in DATA — HLS has no fn
+  attributes and no closures, so a parameterised test is a top-level
+  `fn test_<name>(row: R)` taking EXACTLY ONE parameter, and its cases
+  are a companion `fn cases_<name>() -> list[std.test.TestCase[R]]` in
+  the same file, where `std.test.TestCase[T] { name: str, row: T }` is
+  a new pure-data generic struct. hltest executes the table, validates
+  every row, then runs the test ONCE PER ROW — each row in its own
+  fresh Interp with the row value born inside it (the table
+  re-executes per row, so no value ever crosses process states) — and
+  reports each row as its own result named `test_<name>#<case-name>`:
+  its own PASS/FAIL/SKIP, timing, JUnit testcase, and snapshot-store
+  key. A failing row fails alone; the table's other rows still run;
+  `mark_skip` inside one row skips THAT row; an empty table is a SKIP
+  naming the table, never a silent pass.
+- The wrapper is what makes the convention type-safe end to end: the
+  checker pins `name` as str and `row` as R through the declared
+  `list[TestCase[R]]` return, and the runner cross-checks the table's
+  declared row payload against the test's parameter type statically —
+  a mismatch fails before any row runs, naming BOTH types — while
+  remaining silent about types it cannot fully parse (type vars,
+  qualified names), with runtime shape validation as the backstop.
+  Every convention violation fails loudly with the fix in the message:
+  a missing table (the expected companion fn is named), a table with
+  parameters, a test with two parameters, a table that panics, exits,
+  or returns anything but TestCase rows (the diagnostic names what it
+  got — `void`, a struct, an int), a duplicate case name (two rows
+  racing for one report line and one store slot), a case name outside
+  `1..96 bytes of [A-Za-z0-9_.:-]` (the snapshot-name charset — a
+  row's report line is also its store key, and `#` cannot appear in an
+  HLS fn name so the row suffix is unambiguous), a stray `cases_*` fn
+  with no matching parameterised test (the `cases_pares`-for-
+  `test_parse` typo case), and the reverse — a table whose matching
+  test lost its parameter. Table-level failures report under the base
+  name and no row runs; a malformed table is a bug in the test file,
+  not a failure of any particular case.
+- Snapshots compose per row: the store's test field widens additively
+  from `<test>` to `<test>[#<case>]` (`@@@ test_rev#empty rendered 2`),
+  stores written before this stage verify byte-for-byte unchanged, and
+  the full Stage 119 verify/-u contract applies per row key. A row
+  dropped from the table is dead — verify fails under the base name
+  naming the dead row key, `-u` prunes exactly it, and rows that
+  exist but were not selected keep their records everywhere. Stale
+  SHAPE is detected both directions as file-level `<snapshots>`
+  failures (plain records left behind after a test became
+  parameterised; row records after it became plain) and pruned by
+  `-u`; the pruning is grep-independent because the table — when it
+  parses — is the authoritative row universe, while a table that
+  panics never destroys data.
+- `--grep` knows rows: it matches the base fn name (the whole table
+  runs) or a full row name (`test_x#case`). A base-unmatched fn still
+  has its table executed for selection, but a table-level problem in
+  an unselected fn is SUPPRESSED — `--grep` is a selection tool, and a
+  filtered fn's broken table must not fail a targeted run; the full
+  unfiltered run reports it. A grep matching nothing is a
+  `<no-tests>` skip with its reason.
+- Fixed a Stage 18 latent bug the stage flushed out: hltest's SKIP
+  classification compared `str(exception)` against the reserved
+  `__HLTEST_SKIP__:` prefix, but a Stage-0 str panic arrives as BYTES,
+  so `str()` yields the `b'...'` repr — the prefix NEVER matched and
+  every `mark_skip` since v0.34.0-alpha was reported FAIL with a
+  repr'd payload instead of SKIP. Classification now runs on the raw
+  message (bytes or str) and panic detail lines decode for display;
+  the corpus never noticed because nothing exercised mark_skip.
+- Zero language-surface change beyond the std.test struct: no new
+  builtins, no checker, codegen, or lexer edits. `TestCase[T]` is
+  ordinary HLS data, so the native compiler compiles the whole
+  convention — the ok fixture's `main` mirrors the runner (loop over
+  the table, call the test per row, skip a SKIP-marked row the way the
+  runner reports it) and the interpreter and native binary agree byte
+  for byte, snapshot records included. Acceptance
+  (`make cases-acceptance`): 8 sections, 45 checks — per-row
+  execution/naming (struct, str, and enum rows), the static-contract
+  error matrix, table-runtime errors, the store grammar and helpers,
+  per-row store semantics (record, verify, diff, drop-prune,
+  stale-shape both directions), the `--grep` selection matrix,
+  parallel `-u` without cross-contamination, JUnit rows, the
+  differential, and the fixed-point no-op — all green, with the
+  Stage 119 gate (51 checks) and the full corpus (620 pass) unchanged.
+
 ## [v0.138.0-alpha] — Stage 119: hltest snapshot testing (assert_snapshot)
 - The roadmap's `assert_snapshot!` lands as `std.test.assert_snapshot(name, value)` — HLS has no macro syntax, so the plain function carries the semantics — and the RUNNER does the comparing: the assertion frames the value on stdout (`__SNAP__ <name> <len>\n<value>\n` — length-prefixed, so a value may contain anything including marker-lookalike lines; one frame separator newline, so records never glue onto what follows), hltest parses the records out of each test's captured stdout, and every record is compared against the file's snapshot store, `__snapshots__/<stem>.snap`. Verify (the default) fails on drift with the fix in the message: a new snapshot names itself and says how to record it, a changed value fails with a line-wise unified diff (stored vs received, byte lengths alongside, capped) plus the accept hint, an obsolete name names itself, and records for test functions missing from the file are a file-level `<snapshots>` failure naming them. `--update-snapshots` (`-u`) is the accept path: new and changed values recorded, obsolete ones pruned, passing lines annotated (`snapshots: +N new, ~M changed, -K pruned`) and a summary naming the stores touched — and the merge is careful about what it overwrites: tests that did not run (`--grep`-filtered) or ran without passing KEEP their records (a broken run must not destroy data), a panicking test never records its partial output (freezing garbage would be worse than failing), an all-pruned store is deleted, the store is rewritten atomically (tmp + rename) and only when its bytes actually change (a fixed point is silent), and a corrupt store is refused in BOTH modes — never silently regenerated, because with a filter active regeneration would drop the filtered tests' records; `git checkout` is the remedy. The store itself is a byte-stable function of its record set — two fixed header lines (a v1 magic line and the generator note; no paths, so the file is position-independent), `@@@ <test> <name> <len>` records sorted by (test, name), byte-exact values — so reruns do not churn the file and `git diff` shows only real value changes. Building the assertion on println/print is the design, not a shortcut: the assertion carries `uses IO` (a value leaving the process is I/O by any honest accounting, and the calling test declares it too), the value crosses a TAINT SINK (a tainted value cannot be snapshotted silently — sanitise or `taint_unwrap` first, rejected with the parameter named on both front-ends), and the protocol bytes are ordinary stdout whose Stage-0/native byte-parity is a standing invariant — so ONE store serves both backends and the differential path (a test file's `main`) prints the same records hltest parses. Zero language-surface change: no new builtins, no checker or codegen edits — the stage is tooling, and the tool owns the format. The stream parser searches for the prefix anywhere OUTSIDE consumed values, so a marker glued mid-line by preceding `print()` noise still parses (records are never silently lost) and a stray `__SNAP__ ` in diagnostic output fails loudly as a protocol error — the same reserved-prefix discipline as `__HLTEST_SKIP__:`; names are validated (1..96 bytes of `[A-Za-z0-9_.:-]`) and a duplicate name within one test is refused (two records racing for one store slot is non-determinism, not data). The eight-section acceptance gate (`make snapshot-acceptance`, 51 checks) drives the real CLI over the ok fixture and its committed store: the exact wire bytes, the store framing and determinism, the mismatch diff and the accept path, a seven-case corrupt-store matrix (bad magic, non-canonical header, mid-record truncation, missing separator, length overrun, duplicate record, invalid name — each refused in both modes), new/obsolete/prune/`--grep`-safety, protocol-error rejects, parallel updates without cross-file contamination, exit codes, JUnit, the fixture's interpreter-vs-native differential, and the fixed-point no-op.
 

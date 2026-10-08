@@ -1608,6 +1608,90 @@ file's snapshot store.
   contamination, exit codes and JUnit, the interpreter/native
   differential for the fixture, and the fixed-point no-op.
 
+### 23.5. `hltest` — parameterised (table-driven) tests (Stage 120, v0.139.0-alpha)
+
+HLS has no attributes on functions and no closures, so the roadmap's
+parameterised tests are expressed entirely in DATA plus a naming
+convention the runner drives. A parameterised test is a top-level
+`fn test_<name>(row: R)` that takes EXACTLY ONE parameter; its cases
+live in a companion `fn cases_<name>() -> list[std.test.TestCase[R]]`
+in the same file, where `TestCase[T] { name: str, row: T }` is a
+generic struct in `std.test` (pure data, no new builtins — the stage
+stays tooling-plus-stdlib, zero checker or codegen edits).
+
+- **One row, one test.** The runner executes the table, validates
+  every row, then runs the test ONCE PER ROW, each row in its own
+  fresh Interp with the row's `row` value as the sole argument (the
+  table re-executes inside that Interp, so no value ever crosses
+  process states). Every row is reported as its own result named
+  `test_<name>#<case-name>` — its own PASS/FAIL/SKIP, its own timing,
+  its own JUnit testcase, its own snapshot-store key. A failing row
+  fails alone; the table's other rows still run.
+- **The wrapper makes the convention type-safe.** The `name` field is
+  checked as `str`, the `row` field carries the case data with its
+  real type R (a struct of inputs + expected outputs is the shape
+  table tests are for; primitives and payload-less enums work too),
+  and the declared return type `list[TestCase[R]]` pins R to exactly
+  the type the test takes. When both declared types are readable, the
+  runner cross-checks them statically — a mismatch fails before any
+  row runs, naming BOTH types; parsing uncertainty (type vars,
+  qualified names) skips the check silently, and runtime shape
+  validation is the backstop.
+- **Convention errors fail loudly, with the fix in the message**: a
+  parameterised test with no table (the expected companion fn is
+  named), a table with parameters, a test with two parameters, a
+  table that panics or exits, a table returning anything but a list
+  of TestCase values (the diagnostic names what it got), a duplicate
+  case name (two rows would race for one report line and one store
+  slot), a case name outside `1..96 bytes of [A-Za-z0-9_.:-]` (the
+  snapshot-name charset — a row's report line is also its store key,
+  and `#` cannot appear in an HLS fn name so the row suffix is
+  unambiguous), a stray `cases_*` fn with no matching parameterised
+  test (the typo case), and the reverse — a table whose matching test
+  lost its parameter. An EMPTY table is a SKIP with its reason, never
+  a silent pass.
+- **Snapshots compose per row.** A row's `assert_snapshot` records
+  key on `(test_<name>#<case>, snapshot-name)`; the store grammar
+  widens additively from `<test>` to `<test>[#<case>]` (stores
+  written before this stage verify unchanged). A row dropped from the
+  table is dead: verify fails under the base name naming the dead row
+  key, and `-u` prunes exactly it. Stale SHAPE is detected both ways
+  — plain records left behind after a test became parameterised, and
+  row records left behind after it became plain — as file-level
+  `<snapshots>` failures, pruned by `-u`. Rows that exist but were
+  not selected keep their records everywhere.
+- **`--grep` knows rows**: it matches the base fn name (the whole
+  table runs) or a full row name (`test_x#case`). A base-unmatched fn
+  still has its table executed — selection needs the row universe —
+  but a table-level problem in an unselected fn is SUPPRESSED:
+  `--grep` is a selection tool, and a filtered fn's broken table must
+  not fail a targeted run; the full, unfiltered run reports it. A
+  grep matching nothing is a `<no-tests>` skip with its reason.
+- **`mark_skip` works in rows and (fixed here) everywhere.** The
+  Stage 18 SKIP classification compared `str(exception)` against the
+  reserved prefix — but a Stage-0 str panic arrives as BYTES, so
+  `str()` yields the `b'...'` repr, the prefix never matched, and
+  every `mark_skip` was reported FAIL with a repr'd payload. The
+  classification now runs on the raw message (bytes or str), and
+  panic detail lines are decoded for display.
+- **The differential path stays honest**: `TestCase[T]` is ordinary
+  HLS data, so the native compiler compiles the whole convention (the
+  fixture's `main` mirrors the runner — loop over the table, call the
+  test per row — skipping a SKIP-marked row the way the runner
+  reports it), and the interpreter and native binary agree byte for
+  byte on the output, snapshot records included.
+- **The gate** (`make cases-acceptance`, 8 sections, 45 checks)
+  drives the real CLI over ok fixtures and temp probes: the
+  per-row execution and naming semantics (struct/str/enum rows, a
+  failing row failing alone, row-level skip, the empty table), the
+  full static-contract error matrix, the table runtime errors
+  (panics decoded, void tables, duplicate and invalid case names),
+  the store key grammar and its helpers, the per-row store semantics
+  (record, verify, diff, drop-prune, stale-shape both directions),
+  the `--grep` selection matrix, parallel `-u` without
+  cross-contamination, JUnit rows, the interpreter/native
+  differential over the fixture, and the fixed-point no-op.
+
 ## 24. Safe C FFI (Stage 15-alpha — v0.13.0-alpha)
 
 A new `extern "C" { ... }` block declares external C functions. The
