@@ -184,7 +184,7 @@ remains green.
 | 116 | `hlfmt` — preserve comments in all positions | ✅ | (done in v0.135.0-alpha) |
 | 117 | `hlfmt` — configuration file (`.hlfmt.toml`) for teams | ✅ | (done in v0.136.0-alpha) |
 | 118 | `hllint` — autofix mode (`--fix`) | ✅ | (done in v0.137.0-alpha) |
-| 119 | `hltest` — snapshot testing (`assert_snapshot!`) | ⬜ | 3 weeks |
+| 119 | `hltest` — snapshot testing (`assert_snapshot!`) | ✅ | (done in v0.138.0-alpha) |
 | 120 | `hltest` — parameterised tests (table-driven) | ⬜ | 3 weeks |
 | 121 | VS Code extension: debugger integration (DAP) | ⬜ | 6 weeks |
 | 122 | `hldoc` — searchable web docs (offline + online) | ⬜ | 5 weeks |

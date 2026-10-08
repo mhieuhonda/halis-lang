@@ -1532,6 +1532,82 @@ Minimal LSP server over JSON-RPC stdio:
 - `textDocument/publishDiagnostics` — runs the checker, publishes errors.
 - `--check FILE` one-shot mode prints diagnostics to stdout.
 
+### 23.4. `hltest` — snapshot testing (Stage 119, v0.138.0-alpha)
+
+The roadmap's `assert_snapshot!`: HLS has no macro syntax, so the
+assertion is the stdlib function `std.test.assert_snapshot(name,
+value)` (both `str`, `uses IO`). The test renders a value once,
+deterministically, and the RUNNER does the comparing — the assertion
+writes a length-framed record to stdout, hltest parses the records
+out of the test's captured stdout, and each is compared against the
+file's snapshot store.
+
+- **The wire protocol.** One record is
+  `__SNAP__ <name> <byte-len>\n<value bytes>\n` — a marker line, then
+  exactly `byte-len` value bytes, then one frame-separator newline.
+  Values are length-prefixed, so any content is safe inside a value
+  (embedded marker-lookalike lines included); the parser scans for the
+  prefix anywhere OUTSIDE consumed values, so a marker glued mid-line
+  by preceding `print()` noise still parses — records are never
+  silently lost — and a stray `__SNAP__ ` in diagnostic output fails
+  loudly as a protocol error, the same reserved-prefix discipline as
+  `__HLTEST_SKIP__:`. Names are 1..96 bytes of `[A-Za-z0-9_.:-]` (no
+  spaces or newlines: the header is space-separated). A duplicate name
+  within one test fails the test — two records racing for one store
+  slot is non-determinism, not data.
+- **The store.** `__snapshots__/<stem>.snap` next to the test file
+  (one store per file — the process pool can never contend for one).
+  Two fixed header lines (a v1 magic line and the generator note; no
+  paths, so the file is position-independent and byte-identical across
+  machines and clones), then records
+  `@@@ <test> <name> <len>\n<value>\n` sorted by (test, name): the
+  store is a byte-stable function of its record set, so reruns do not
+  churn it and `git diff` shows only real value changes. Comparison is
+  byte-exact; nothing is trimmed, re-encoded, or normalised. The store
+  is a generated artifact owned by the tool — anything the writer would
+  not have produced is corruption, reported as a failing synthetic
+  `<snapshots>` result with the byte offset, and NEVER silently
+  regenerated (`git checkout` is the remedy).
+- **Verify (the default) fails on drift, with the fix in the
+  message.** A missing record is `new snapshot 'name' - no stored value
+  (record it: run hltest --update-snapshots)`; a changed value fails
+  with a line-wise unified diff (stored vs received, byte lengths
+  alongside, capped at 60 diff lines per record) and the accept hint;
+  a stored name the test no longer produces is `obsolete`; records for
+  test functions that are not in the file at all are a file-level
+  `<snapshots>` failure naming them.
+- **`--update-snapshots` (`-u`) is the accept path.** New and changed
+  values are recorded, obsolete ones pruned; passing lines carry the
+  annotation `snapshots: +N new, ~M changed, -K pruned` and a summary
+  line names the stores the run touched. The merge is careful about
+  what it overwrites: tests that did not run (`--grep`-filtered) or ran
+  without passing KEEP their records (a broken run must not destroy
+  data); a test that panicked or exited non-zero never records its
+  partial output (freezing garbage would be worse than failing). An
+  all-pruned store is deleted; the file is rewritten atomically (tmp +
+  rename) and only when its bytes actually change — a fixed point
+  leaves the file, its mtime, and the report silent.
+- **The design consequence of building on println/print:** the
+  assertion carries `uses IO` (a value leaving the process is I/O by
+  any honest accounting, and the calling test declares it too); the
+  value crosses a TAINT SINK (a tainted value cannot be snapshotted
+  without an explicit sanitise / `taint_unwrap` decision — a snapshot
+  is exactly where untrusted data must not flow silently); and the
+  protocol bytes are ordinary stdout whose Stage-0/native byte-parity
+  is a standing invariant — so ONE store serves both backends, and a
+  test file's `main` (the differential path) prints the same records
+  hltest would parse. Zero language-surface change: no new builtins,
+  no checker or codegen edits — the stage is tooling, and the tool
+  owns the format.
+- **The gate** (`make snapshot-acceptance`, 8 sections, 51 checks)
+  drives the real CLI over the ok fixture and its committed store: the
+  exact wire bytes, the store framing and determinism, the mismatch
+  diff and the accept path, a seven-case corrupt-store matrix (each
+  refused in both modes), new/obsolete/prune/`--grep`-safety,
+  protocol-error rejects, parallel update without cross-file
+  contamination, exit codes and JUnit, the interpreter/native
+  differential for the fixture, and the fixed-point no-op.
+
 ## 24. Safe C FFI (Stage 15-alpha — v0.13.0-alpha)
 
 A new `extern "C" { ... }` block declares external C functions. The
