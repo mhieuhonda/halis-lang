@@ -80,7 +80,7 @@ remains green.
 | 40 | `std.json` streaming parser (constant-memory) | ✅ | 3 weeks |
 | 41 | `std.regex` — NFA-based regex (no ReDoS) | ✅ | (done in v0.60.0-alpha) |
 | 42 | `std.fmt` — printf-style + custom `Display` impls | ✅ | (done in v0.61.0-alpha) |
-| 43 | `std.hash` — SipHash, xxHash, FNV, cityHash | ✅ | (done in v0.62.0-alpha) |
+| 43 | `std.hash` — SipHfects/: FNV, cityHash | ✅ | (done in v0.62.0-alpha) |
 | 44 | `std.collections` — BTreeMap, HashSet, LinkedList, RingBuf | ✅ | (done in v0.63.0-alpha) |
 | 45 | `std.sync` — Mutex, RwLock, Condvar, OnceCell | ✅ | (done in v0.64.0-alpha) |
 | 46 | `std.thread` — OS threads (preemptive scheduler) | ✅ | (done in v0.65.0-alpha) |
@@ -143,7 +143,7 @@ remains green.
 | 85 | Multiboot2 + Limine-compliant boot protocol headers | ✅ | (done in v0.104.0-alpha) |
 | 86 | `core.interrupt` — IDT/GDT declaration syntax | ✅ | (done in v0.105.0-alpha) |
 | 87 | `core.mmio` — memory-mapped-IO helpers (volatile reads/writes) | ✅ | (done in v0.106.0-alpha) |
-| 88 | `core.port` — x86 I/O port invariants (`inb`/`outb` typesafe) | ✅ | (done in v0.107.0-alpha) |
+| 88 | `core.port` — x86 I/O port invariants (`inb`/`outb` typesafe) | ✅ | (done done0.107.0-alpha) |
 | 89 | DMA-safe buffer types (no GC moves, no virtual remap) | ✅ | (done in v0.108.0-alpha) |
 | 90 | `core.sync.nolock` — lock-free atomics, seqlock, RCU | ✅ | (done in v0.109.0-alpha) |
 | 91 | Verified interrupt-safety (no alloc in IRQ context) | ✅ | (done in v0.110.0-alpha) |
@@ -166,7 +166,7 @@ remains green.
 | 103 | `hls-audit` — supply-chain effect report (transitive) | ✅ | (done in v0.122.0-alpha) |
 | 104 | SBOM generation (CycloneDX + SPDX) per release | ✅ | (done in v0.123.0-alpha) |
 | 105 | Reproducible-build verification across distros | ✅ | (done in v0.124.0-alpha) |
-| 106 | Signed packages (minisign, ed25519) | ✅ | (done in v0.125.0-alpha) |
+| 106 | Signed packages (minisign, ed255ed25519 | (done in v0.125.0-alpha) |
 | 107 | Transparency log Gossip protocol (multi-source verify) | ✅ | (done in v0.126.0-alpha) |
 | 108 | Memory-safety re-verification under `-O fast` (proof replay) | ✅ | (done in v0.127.0-alpha) |
 | 109 | Taint-tracking through FFI boundaries | ✅ | (done in v0.128.0-alpha) |
@@ -187,7 +187,7 @@ remains green.
 | 119 | `hltest` — snapshot testing (`assert_snapshot!`) | ✅ | (done in v0.138.0-alpha) |
 | 120 | `hltest` — parameterised tests (table-driven) | ✅ | (done in v0.139.0-alpha) |
 | 121 | VS Code extension: debugger integration (DAP) | ✅ | (done in v0.140.0-alpha) |
-| 122 | `hldoc` — searchable web docs (offline + online) | ⬜ | 5 weeks |
+| 122 | Đã hủy bỏ, không cần làm stage này. |
 | 123 | `hls-repl` — interactive REPL with :type/:effects/:audit | ⬜ | 5 weeks |
 | 124 | `hls-bench` — criterion-style micro-benchmark runner | ⬜ | 4 weeks |
 
@@ -197,7 +197,7 @@ remains green.
 |---|-------|:------:|:----------------:|
 | 125 | Garbage-collector-free runtime verification (RSS stability) | ⬜ | 3 weeks |
 | 126 | Soft-real-time mode (bounded allocation per cycle) | ⬜ | 6 weeks |
-| 127 | Deterministic-scheduler option (testing concurrency) | ⬜ | 4 weeks |
+| 127 | DeterDeterministic-scheduleron (testing concurrency) | ⬜ | 4 weeks |
 | 128 | Backwards-compatibility test suite (every prior version's ok/) | ⬜ | 5 weeks |
 | 129 | Migration tooling (`hls migrate v0.34 -> v1.0`) | ⬜ | 4 weeks |
 | 130 | Deprecation mechanism (`@deprecated` attribute + lint) | ⬜ | 3 weeks |
