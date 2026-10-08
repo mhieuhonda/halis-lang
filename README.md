@@ -184,6 +184,9 @@ python3 tools/hls-dap.py       # Stage 121: debug adapter (DAP over stdio —
                                # VS Code talks to it via the extension)
 make dap-acceptance            # Stage 121 gate: VS Code debugger integration
                                # (breakpoints, stepping, variables, panics)
+python3 tools/hls-repl.py      # Stage 123: interactive REPL (:type, :effects,
+                               # :audit, :env, :load — the session IS a program)
+make repl-acceptance           # Stage 123 gate: the REPL acceptance battery
 
 # 13. Stage 15-alpha: Safe C FFI (v0.13.0-alpha)
 python3 boot/boot.py examples/ffi_demo.hls           # call libc functions

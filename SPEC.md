@@ -1802,6 +1802,83 @@ session; the adapter exits with the session.
   with and without the filter, protocol robustness under garbage
   input, and the editor contributions plus corpus hygiene.
 
+### 23.7. `hls-repl` — the interactive REPL (Stage 123, v0.141.0-alpha)
+
+The prompt stops reading the program and starts growing it.
+`tools/hls-repl.py` is an interactive REPL where the session IS a
+Halis program: definitions (`fn` / `struct` / `enum` / `impl` /
+`import` / `extern`) extend the program at the top level, statements
+(`let` / assignment / `if` / `while` / `for`) join the session block,
+and bare expressions evaluate immediately and print `= <value>`. It
+runs on the Stage-0 interpreter — the same reference implementation
+boot.py runs — with the real loader and the real checker on every
+single input.
+
+- **Every input is compiled before anything runs.** The session
+  source is synthesized (your definitions, then the session block as
+  `fn main()`), loaded by the same loader boot.py uses — so
+  `import "std.str"` at the prompt resolves exactly where it resolves
+  for a file — and checked by the real checker. An input the checker
+  rejects never touches the session: no half-typed definitions, no
+  half-bound variables, and the diagnostic's line number is
+  relocated to the input that caused it.
+- **Nothing is ever re-run behind your back.** One live interpreter
+  follows the session: each committed input extends its program
+  tables and executes only the new statements. A `println` you typed
+  once is not repeated by the next input, a `write_file` runs once,
+  and the RNG/clock state marches forward exactly as a program's
+  would. Statement inputs run in a scratch scope that is merged into
+  the session only when the whole input has run to completion — a
+  runtime panic mid-input reports, commits nothing, and discards the
+  bindings the input made (mutations of OLDER values are real
+  effects that already happened; the panic message says where).
+  Call-shaped expressions (calls, methods, match, `?`) join the
+  session block after they run — their effects are real and the
+  session's audit must see them; value expressions (`1 + 1`, `a3`)
+  are queries and never join the state.
+- **Types and effects come from the checker, never a
+  re-implementation.** `:type <expr>` reports the type the checker
+  just wrote on the expression's AST node — generics instantiated,
+  method dispatch resolved — for an expression evaluated in session
+  context. `:effects <expr>` reports the effect fixpoint's computed
+  set for the session block WITH the expression appended, relative to
+  what the session already holds: `(none - pure)`, a set with
+  `(new: ...)` naming what the expression adds, or `none beyond the
+  session's (...)` when the expression needs nothing the session has
+  not already declared. `:audit` prints the very same table
+  `boot.py --audit` prints for the session program — same code, same
+  bytes.
+- **The session block is the REPL's own `main`.** Its `uses` clause
+  grows by itself, from the checker's own missing-effect diagnostic,
+  and ONLY for the session block: a definition of yours that lacks a
+  needed effect is reported exactly as boot.py would report it, not
+  silently repaired. `main` cannot be redefined (the duplicate-name
+  error names the fix); a bare `return`, `exit(...)`, and stray
+  `break`/`continue` are refused at the prompt with the reason —
+  the session block is not callable and not a process.
+- **Session commands.** `:env` lists the session bindings with their
+  DECLARED types and current values (moved values marked); `:load
+  <file.hls>` loads a module-style file — one that defines no `main`
+  — into the session (std./core. imports resolve from the
+  repository); `:reset` clears everything; `:help` lists the
+  commands; `:quit` (also `:q`) leaves the REPL. Unknown commands are
+  refused by name. The reserved `__repl_` name prefix cannot be
+  bound.
+- **Values print the way Halis means them**: bools as the HLS
+  literals, strings decoded and quoted, lists with length, structs in
+  declared field order, enums as `Variant(payload)`, taint visible,
+  maps as maps. A `void` (or `never`) expression prints nothing —
+  its side effect is the answer.
+- **Multi-line input is bracket-honest**: an input with an open
+  brace, parenthesis or bracket (string literals and comments are
+  the real lexer's judgment) continues on a `...>` prompt until the
+  brackets close. Unterminated strings do not continue — the error
+  is the answer, not an invitation to keep reading.
+- The interpreter itself is untouched: no boot/ file changes, so
+  differential behaviour, bootstrap, and every suite are exactly
+  what they were. Known limits are the Stage-0 interpreter's own
+  (`asm!` cannot execute) plus the honest ones named above.
+
 ## 24. Safe C FFI (Stage 15-alpha — v0.13.0-alpha)
 
 A new `extern "C" { ... }` block declares external C functions. The
