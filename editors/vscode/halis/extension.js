@@ -1,16 +1,21 @@
 /**
- * Halis VS Code extension — Stage 14 release.
+ * Halis VS Code extension — Stage 14 release, debugger added in Stage
+ * 121 (v0.140.0-alpha).
  *
  * Provides:
  *   - language server (tools/hls-lsp.py) over stdio
  *   - on-save formatter (tools/hlfmt.py -w)
  *   - on-save linter (tools/hllint.py)
+ *   - debugger (tools/hls-dap.py): the Debug Adapter Protocol over
+ *     stdio, launched through a descriptor factory — no extra npm
+ *     dependency, the API is built into VS Code
  *   - syntax highlighting via TextMate grammar
  *
  * The extension auto-discovers the toolchain relative to:
- *   1. `halis.languageServerPath` setting (if set)
- *   2. <workspace>/tools/hls-lsp.py
- *   3. `hls-lsp` on PATH
+ *   1. the matching setting (languageServerPath / debugAdapterPath)
+ *      if set
+ *   2. <workspace>/tools/<fallback>
+ *   3. the fallback name on PATH
  */
 const vscode = require('vscode');
 const path = require('path');
@@ -74,6 +79,7 @@ function startServer(context) {
 
 function activate(context) {
     startServer(context);
+    registerDebugger(context);
 
     // Format File command — runs `hlfmt -w` on the active document.
     const formatCmd = vscode.commands.registerCommand('halis.formatFile', async () => {
@@ -139,6 +145,63 @@ function activate(context) {
         }
     });
     context.subscriptions.push(restartCmd);
+
+    // Debug Program command — launch the active file (or pick one).
+    const debugCmd = vscode.commands.registerCommand('halis.startDebugging', async () => {
+        const editor = vscode.window.activeTextEditor;
+        let program = null;
+        if (editor && editor.document.languageId === 'halis') {
+            program = editor.document.uri.fsPath;
+        } else if (vscode.workspace.workspaceFolders) {
+            const picks = await vscode.workspace.findFiles(
+                '**/*.hls', '**/.hls-pkg-deps/**', 50);
+            if (picks.length === 0) {
+                vscode.window.showWarningMessage(
+                    'Halis: no .hls files found in the workspace.');
+                return;
+            }
+            const chosen = await vscode.window.showQuickPick(
+                picks.map((p) => ({
+                    label: path.basename(p.fsPath),
+                    description: path.dirname(p.fsPath),
+                    uri: p
+                })),
+                { placeHolder: 'Select a Halis program to debug' }
+            );
+            if (!chosen) return;
+            program = chosen.uri.fsPath;
+        }
+        if (!program) return;
+        vscode.debug.startDebugging(undefined, {
+            type: 'halis',
+            request: 'launch',
+            name: 'Halis: ' + path.basename(program),
+            program: program
+        });
+    });
+    context.subscriptions.push(debugCmd);
+
+    // The Halis debugger: the adapter runs as a Python child process
+    // speaking DAP over stdio (the same shape as the language server).
+    // A descriptor factory is all VS Code needs — DebugAdapterExecutable
+    // is built-in, so the extension ships with zero npm dependencies.
+    function registerDebugger(context) {
+        const factory = {
+            createDebugAdapterDescriptor(session) {
+                const cfg = vscode.workspace.getConfiguration('halis');
+                const python = cfg.get('pythonPath') || 'python3';
+                const dapPath = findTool(
+                    vscode.workspace.workspaceFolders,
+                    'debugAdapterPath',
+                    'hls-dap.py'
+                );
+                return new vscode.DebugAdapterExecutable(python, [dapPath]);
+            }
+        };
+        context.subscriptions.push(
+            vscode.debug.registerDebugAdapterDescriptorFactory('halis', factory)
+        );
+    }
 
     // Format-on-save.
     vscode.workspace.onWillSaveTextDocument((event) => {
