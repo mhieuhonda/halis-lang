@@ -3,7 +3,10 @@
 # ============================================================================
 
 # hltest: run every test_* function in the given .hls files (or dirs).
-# Usage: make hltest [F=tests/ok] [GREP=map] [J=4] [JUNIT=out.xml]
+# Usage: make hltest [F=tests/ok] [GREP=map] [J=4] [JUNIT=out.xml] [U=1]
+#   U=1 adds --update-snapshots (Stage 119): record new and changed
+#   assert_snapshot values, prune obsolete ones. The default verifies
+#   the committed stores and fails on any drift.
 hltest:
 	# deep-scan-23: the session file-store tests write .sess files to
 	# /tmp/hls_session_test; create it (session-acceptance already did
@@ -14,7 +17,8 @@ hltest:
 	  if [ -n "$(GREP)" ]; then G="--grep $(GREP)"; fi; \
 	  if [ -n "$(JUNIT)" ]; then J="--junit $(JUNIT)"; fi; \
 	  if [ -n "$(J)" ]; then P="-j $(J)"; fi; \
-	  $(PYTHON) tools/hltest.py -r $$P $$G $$J $$F
+	  if [ -n "$(U)" ]; then UP="--update-snapshots"; fi; \
+	  $(PYTHON) tools/hltest.py -r $$P $$G $$J $$UP $$F
 
 # hls-fuzz: AST-level differential fuzzer. Default 60s smoke run;
 # CI runs `make fuzz-acceptance` for the 1-hour acceptance run.
