@@ -1,8 +1,9 @@
 # Halis — VS Code Extension
 
-Stage 14 release of the Halis toolchain ships an official VS Code
-extension that wires the `hls-lsp` language server, the `hlfmt`
-formatter, and the `hllint` linter into VS Code.
+The official VS Code extension for the Halis toolchain: it wires the
+`hls-lsp` language server, the `hlfmt` formatter, the `hllint` linter,
+and — since Stage 121 (v0.140.0-alpha) — the `hls-dap` debugger into
+VS Code.
 
 ## Features
 
@@ -18,8 +19,46 @@ formatter, and the `hllint` linter into VS Code.
   document. Enable `halis.formatOnSave` to run on every save.
 - **Linter** — `Lint File` command runs `hllint --strict` and shows
   the output in a `Halis Lint` channel.
-- **Syntax highlighting** — TextMate grammar covering keywords,
-  built-in types, effects, strings, numbers, comments, function names.
+- **Debugger** (Stage 121) — debug a Halis program through the
+  Stage-0 interpreter via `tools/hls-dap.py` (Debug Adapter Protocol):
+  - breakpoints, verified against the real AST (a line without a
+    statement snaps to the nearest one and says so)
+  - step over / into / out, stop on entry, pause
+  - the variables view: locals with declared types, struct fields,
+    enum payloads, list elements
+  - a debug console that evaluates real expressions in the paused
+    frame (arithmetic, field chains, user fns, builtins)
+  - panics stop the program dead at the panic site with the real
+    message and stack (the `panics` exception filter, on by default)
+  - spawned tasks appear as threads with their own stacks
+  - `Halis: Debug Program` command launches the active file (or picks
+    one from the workspace)
+
+## Debugging
+
+Add a launch configuration to `.vscode/launch.json`:
+
+```json
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "type": "halis",
+            "request": "launch",
+            "name": "Debug Halis program",
+            "program": "${workspaceFolder}/main.hls",
+            "args": [],
+            "stopOnEntry": false
+        }
+    ]
+}
+```
+
+Or run `Halis: Debug Program` from the command palette with a `.hls`
+file open. Launch snippets are offered by the editor (Insert Snippet
+in a launch.json). The adapter is launched automatically with the
+configured Python (`halis.pythonPath`); point `halis.debugAdapterPath`
+at a specific `hls-dap.py` to override auto-discovery.
 
 ## Installation
 
@@ -45,15 +84,15 @@ Alternatively, run the extension in the Extension Development Host:
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `halis.languageServerPath` | `""` | Path to `hls-lsp.py`. Empty = auto-discover. |
+| `halis.debugAdapterPath` | `""` | Path to `hls-dap.py`. Empty = auto-discover. |
 | `halis.formatOnSave` | `false` | Run `hlfmt -w` on save. |
 | `halis.lintOnSave` | `true` | Run `hllint` on save. |
-| `halis.pythonPath` | `"python3"` | Python interpreter for the toolchain. |
+| `halis.pythonPath` | `"python3"` | Python interpreter for the toolchain (LSP, formatter, linter, debug adapter). |
 
 ## Auto-discovery
 
-When `halis.languageServerPath` is empty, the extension looks for:
+When a path setting is empty, the extension looks for:
 
-1. `<workspace>/tools/hls-lsp.py`
-2. `hls-lsp` on `PATH` (assumes the repo is installed system-wide)
-
-The same auto-discovery applies to `hlfmt.py` and `hllint.py`.
+1. `<workspace>/tools/<tool>.py` (`hls-lsp.py`, `hlfmt.py`,
+   `hllint.py`, `hls-dap.py`)
+2. the tool name on `PATH` (assumes the repo is installed system-wide)

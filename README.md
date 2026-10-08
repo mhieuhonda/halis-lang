@@ -180,6 +180,10 @@ make snapshot-acceptance       # Stage 119 gate: hltest snapshot testing
                                # (wire protocol, stores, diffs, prune)
 make cases-acceptance          # Stage 120 gate: hltest parameterised tests
                                # (tables, per-row results, store keys, grep)
+python3 tools/hls-dap.py       # Stage 121: debug adapter (DAP over stdio —
+                               # VS Code talks to it via the extension)
+make dap-acceptance            # Stage 121 gate: VS Code debugger integration
+                               # (breakpoints, stepping, variables, panics)
 
 # 13. Stage 15-alpha: Safe C FFI (v0.13.0-alpha)
 python3 boot/boot.py examples/ffi_demo.hls           # call libc functions

@@ -13,6 +13,100 @@ stability (125–140), and final stabilisation toward v1.0 (141–150).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
+## [v0.140.0-alpha] — Stage 121: VS Code extension debugger integration (DAP)
+- The editor stops reading the program and starts stepping through it.
+  `tools/hls-dap.py` is a Debug Adapter Protocol server over stdio —
+  the same Content-Length framing the language server uses — so VS
+  Code (via the extension's new `halis` debugger contribution) and any
+  other DAP client debug a Halis program through the Stage-0
+  interpreter, the same reference implementation boot.py runs. The
+  discipline that shaped it: never guess. The program is loaded and
+  CHECKED by the real loader and the real checker inside the launch
+  request (a program the compiler rejects never starts debugging, and
+  the refusal is the checker's own diagnostic text); execution runs in
+  a session thread under two hook functions wrapped AROUND `exec_stmt`
+  and `call_fn` (zero boot/ changes — differential behaviour,
+  bootstrap and every suite are exactly what they were); a stop is a
+  real pause (the interpreter thread blocks on a condition variable
+  and nothing of the program mutates while the variables view reads
+  it); and breakpoints are verified against the statement lines of the
+  real AST, attributed per function through the same import resolver
+  boot.py uses, so a line number in one file can never stop another
+  file's execution — a breakpoint on a statement line verifies in
+  place, one on an empty line snaps DOWN to the nearest statement
+  (and says so), one past the end is refused, one in a foreign file is
+  refused. Breakpoints are hot: set, replaced, or cleared while the
+  program runs.
+- Stepping has one checkpoint and three verbs: every executed
+  statement passes one stop checkpoint BEFORE it runs (a stop shows
+  the line that is ABOUT to execute), and `next` / `stepIn` /
+  `stepOut` are defined against the interpreter's own frame stack, so
+  the verbs mean exactly what the stack shows — step-in walks through
+  user calls AND impl methods (`Item.value` frame, `self` in locals),
+  step-out lands on the caller's next statement. `stopOnEntry` breaks
+  at main's first statement before it runs; `pause` stops a running
+  program at its next statement; `continue` resumes EVERY paused
+  thread (the tasks are one program — a selective continue is how a
+  debugger manufactures the very deadlock the program was written not
+  to have).
+- The variables view reads the real frame: Locals lists every visible
+  binding from the paused environment chain, innermost scope first,
+  with block scopes respected (a loop body's `k` is gone after the
+  loop — honest debuggers do not invent bindings) and declared types
+  from the source; structs expand to their declared fields in
+  declaration order, enums render `Kind.Food(1)` with indexed payload
+  children, lists index 0..n-1, and a struct whose declared type is
+  not visible resolves by an EXACT unique field-set match against the
+  program's structs — otherwise it says map, never a guess. The
+  console (REPL/hover/watch) evaluates through the real parser plus a
+  resolution pass that adds exactly the dispatch the checker would
+  have (user fns before builtins, `Enum.Variant(...)` constructors
+  only when the base name is an enum TYPE and not a binding, methods
+  through the declared type when visible, builtin methods otherwise)
+  into the paused frame's real environment with stepping suppressed
+  while it runs; a panic in the expression is an error result, never
+  a dead session.
+- Panics are first-class stops: with the default `panics` exception
+  filter on, a panicking program parks DEAD at the panic site — the
+  stopped event carries the real message, the stack shows the frames
+  at the raise (deepest first, at the panic line), the stderr echo
+  reaches the console, and continue ends the session with exit 101;
+  with the filter off the same program simply exits 101 with the same
+  stderr. Program stdout streams to the console byte-identical with
+  boot.py's output. Tasks appear as threads (`task-N` with their own
+  frame stacks; a task blocked in a channel builtin reports the line
+  of its last executed statement).
+- Robustness is part of the contract: a malformed frame earns a
+  parse-error response and the session continues; invalid JSON body
+  likewise; an unknown request is refused by name; a handler failure
+  is an error response, never a dead pipe; and requests that need a
+  pause while the program runs are refused with "program is running"
+  instead of racing the interpreter. Two real defects were found and
+  fixed by the gate during development: a non-reentrant output-buffer
+  lock deadlocked the session on the first `println`, and fresh
+  console expressions crashed on the checker's absent dispatch
+  annotations (the resolution pass exists because of it).
+- The extension side ships in the same stage: the `halis` debugger
+  type with launch attributes (`program`, `args`, `stopOnEntry`,
+  `noDebug`), launch.json snippets, breakpoints for the language, a
+  `Halis: Debug Program` command (active file or workspace
+  quick-pick), a `halis.debugAdapterPath` setting, and a descriptor
+  factory launching the adapter with the configured Python —
+  `DebugAdapterExecutable` is a built-in API, so the extension still
+  ships with zero npm dependencies; version aligned to 0.140.0-alpha.
+- No language-surface change: no new builtins, no checker, codegen,
+  lexer or parser edits; `boot/` is byte-for-byte untouched. Acceptance
+  (`make dap-acceptance`): 9 sections, 84 checks over the REAL adapter
+  subprocess — the protocol lifecycle (capabilities, launch refusals,
+  clean exit), breakpoint verification/snapping/refusal and
+  per-iteration hits, stdout parity with boot.py, stack shape
+  (innermost first, real files, stopped lines), the full stepping
+  matrix, the variables view, console evaluation and its error
+  matrix, panic stops with and without the filter, protocol
+  robustness under garbage input, and the editor contributions plus
+  the stage's ok corpus (hlfmt-canonical, hllint-clean, pinned boot
+  output).
+
 ## [v0.139.0-alpha] — Stage 120: hltest parameterised tests (table-driven)
 - The roadmap's table-driven tests land as a naming convention the
   runner drives, with the table living in DATA — HLS has no fn

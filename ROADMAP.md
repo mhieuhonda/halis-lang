@@ -186,7 +186,7 @@ remains green.
 | 118 | `hllint` — autofix mode (`--fix`) | ✅ | (done in v0.137.0-alpha) |
 | 119 | `hltest` — snapshot testing (`assert_snapshot!`) | ✅ | (done in v0.138.0-alpha) |
 | 120 | `hltest` — parameterised tests (table-driven) | ✅ | (done in v0.139.0-alpha) |
-| 121 | VS Code extension: debugger integration (DAP) | ⬜ | 6 weeks |
+| 121 | VS Code extension: debugger integration (DAP) | ✅ | (done in v0.140.0-alpha) |
 | 122 | `hldoc` — searchable web docs (offline + online) | ⬜ | 5 weeks |
 | 123 | `hls-repl` — interactive REPL with :type/:effects/:audit | ⬜ | 5 weeks |
 | 124 | `hls-bench` — criterion-style micro-benchmark runner | ⬜ | 4 weeks |

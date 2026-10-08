@@ -1692,6 +1692,116 @@ stays tooling-plus-stdlib, zero checker or codegen edits).
   cross-contamination, JUnit rows, the interpreter/native
   differential over the fixture, and the fixed-point no-op.
 
+### 23.6. `hls-dap` — the debug adapter (Stage 121, v0.140.0-alpha)
+
+The editor stops reading the program and starts stepping through it.
+`tools/hls-dap.py` is a Debug Adapter Protocol server over stdio (the
+same Content-Length framing the language server uses), so VS Code —
+via the extension's `halis` debugger contribution — and any other DAP
+client debug a Halis program through the Stage-0 interpreter, the same
+reference implementation boot.py runs. One launch, one program, one
+session; the adapter exits with the session.
+
+- **The program is compiled before it is debugged.** The launch
+  request runs the real loader and the real checker first; a program
+  they reject never starts, and the launch fails with the checker's
+  own diagnostic text. There is no second, looser parser for
+  debugging — the debugger and the compiler cannot disagree about
+  what a program is.
+- **The interpreter is untouched.** Execution runs in a session
+  thread under two hook functions wrapped AROUND `exec_stmt` and
+  `call_fn`; no boot/ file changes, so differential behaviour,
+  bootstrap, and every suite are exactly what they were. A stop is a
+  real pause: the interpreter thread blocks on a condition variable
+  and nothing of the program mutates while the variables view reads
+  it.
+- **Breakpoints are verified against the real AST.** The statement
+  lines of every file in the import tree are collected from the
+  parser; a breakpoint on a statement line verifies in place, a
+  breakpoint on a line without a statement snaps DOWN to the nearest
+  following statement (the response says so), a line past the end is
+  refused, and a file the program does not contain is refused —
+  statement-to-file attribution is exact (resolved per function
+  through the same import resolver boot.py uses), so a line number in
+  one file can never stop another file's execution. Breakpoints are
+  hot: they may be set, replaced, or cleared while the program runs.
+- **Stepping has one checkpoint and three verbs.** Every executed
+  statement passes one stop checkpoint BEFORE it runs (a stop shows
+  the line that is about to execute). `next` stops at the next
+  statement at or above the resumed depth, `stepIn` stops at the next
+  statement at any depth (through user calls and impl methods), and
+  `stepOut` stops at the next statement strictly above — with the
+  interpreter's own frame stack as the depth, so the verbs mean
+  exactly what the stack shows. `stopOnEntry` breaks at main's first
+  statement before it runs, and `pause` stops a running program at
+  its next statement.
+- **The variables view reads the real frame.** Locals lists every
+  visible binding from the paused environment chain (innermost scope
+  first; block scopes are respected — a loop body's binding is not
+  visible after the loop), annotated with the DECLARED type from the
+  source when one exists. Structs expand to their declared fields in
+  declaration order, enums render `Variant(payload)` with indexed
+  payload children, lists index 0..n-1, and a struct whose declared
+  type is not visible resolves by an EXACT unique field-set match
+  against the program's structs — otherwise it says map, never a
+  guess.
+- **The console evaluates by the same rules.** A REPL/hover/watch
+  expression is parsed by the real parser, annotated with the
+  dispatch the checker would have added (user fns before builtins,
+  `Enum.Variant(...)` constructors recognised only when the base name
+  is an enum type and not a binding, methods through the declared
+  type when it is visible — otherwise as builtin methods), and
+  evaluated in the paused frame's real environment with stepping
+  suppressed while it runs. A panic inside the expression is an error
+  result, never a dead session, and the program's state is untouched
+  afterwards.
+- **Panics are first-class stops.** With the default `panics`
+  exception filter on, a panicking program parks DEAD at the panic
+  site: the stopped event carries the real message, the stack shows
+  the frames at the raise (the deepest frame first, at the panic
+  line), the stderr echo reaches the console, and continue ends the
+  session with exit 101. With the filter off the same program simply
+  exits 101 with the same stderr — no stop, no event.
+- **Program output is forwarded, not swallowed.** Program stdout
+  streams to the console as output events and is byte-identical with
+  boot.py's stdout; interpreter panic reports reach the console as
+  stderr events AND the real stderr (the adapter is transparent,
+  never lossy).
+- **Robustness is part of the contract.** A malformed frame earns a
+  parse-error response and the session continues; an invalid JSON
+  body likewise; an unknown request is refused by name; a handler
+  failure is an error response, never a dead pipe; and requests that
+  need a pause while the program runs (stack, scopes, variables,
+  evaluate) are refused with "program is running" instead of racing
+  the interpreter.
+- **Tasks appear as threads.** main is thread 1; every spawned task
+  that has executed Halis code appears as `task-N` with its own frame
+  stack (a task blocked inside a channel builtin reports the line of
+  its last executed statement). `continue` resumes EVERY paused
+  thread — the tasks are one program, and a selective continue is how
+  a debugger manufactures the very deadlock the program was written
+  not to have.
+- **The editor side ships with the stage.** The extension contributes
+  the `halis` debugger type with launch attributes (`program`,
+  `args`, `stopOnEntry`, `noDebug`), launch.json snippets, breakpoints
+  for the language, a `Halis: Debug Program` command (active file or
+  a workspace quick-pick), and a descriptor factory that launches the
+  adapter with the configured Python — `DebugAdapterExecutable` is a
+  built-in API, so the extension still ships with zero npm
+  dependencies.
+- **The gate** (`make dap-acceptance`, 9 sections, 84 checks) drives
+  the real adapter subprocess over stdio DAP: the protocol lifecycle
+  (capabilities, launch refusals with the real diagnostic, clean
+  exit), breakpoint verification/snapping/refusal and per-iteration
+  hits, stdout parity with boot.py byte for byte, stack shape
+  (innermost first, real files, stopped lines), the full stepping
+  matrix (entry, next, stepIn through two calls into an impl method,
+  stepOut), the variables view (visibility, declared types, struct
+  and enum and list children), console evaluation (arithmetic over
+  real locals, field chains, builtins, the error matrix), panic stops
+  with and without the filter, protocol robustness under garbage
+  input, and the editor contributions plus corpus hygiene.
+
 ## 24. Safe C FFI (Stage 15-alpha — v0.13.0-alpha)
 
 A new `extern "C" { ... }` block declares external C functions. The
