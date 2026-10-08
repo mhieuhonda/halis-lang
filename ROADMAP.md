@@ -174,7 +174,7 @@ remains green.
 | 111 | Capability token types (`Cap[Net]` as a value, not just effect) | ✅ | (done in v0.130.0-alpha) |
 | 112 | Audit-log signing (every privileged op hashed + chained) | ✅ | (done in v0.131.0-alpha) |
 
-### Phase VIII — Developer experience & ecosystem (Stages 113–124)
+### Phase VIII — Developer experience & ecosystem (Stages 113–124, complete)
 
 | # | Stage | Status | Estimated effort |
 |---|-------|:------:|:----------------:|
@@ -189,7 +189,7 @@ remains green.
 | 121 | VS Code extension: debugger integration (DAP) | ✅ | (done in v0.140.0-alpha) |
 | 122 | Đã hủy bỏ, không cần làm stage này. |
 | 123 | `hls-repl` — interactive REPL with :type/:effects/:audit | ✅ | (done in v0.141.0-alpha) |
-| 124 | `hls-bench` — criterion-style micro-benchmark runner | ⬜ | 4 weeks |
+| 124 | `hls-bench` — criterion-style micro-benchmark runner | ✅ | (done in v0.142.0-alpha) |
 
 ### Phase IX — Performance, runtime & stability (Stages 125–140)
 

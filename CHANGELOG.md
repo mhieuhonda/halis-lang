@@ -13,6 +13,85 @@ stability (125–140), and final stabilisation toward v1.0 (141–150).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
+## [v0.142.0-alpha] — Stage 124: `hls-bench`, the criterion-style micro-benchmark runner
+- The benchmark stops being a stopwatch in a shell loop and becomes a
+  measured, compared, classified number. `tools/hls-bench.py` is a
+  micro-benchmark runner with criterion's shape — warmup, adaptive
+  batch sizing, seeded bootstrap confidence intervals, Tukey outlier
+  counts, baseline comparison with a Welch t-test — driven over
+  benchmarks written in Halis itself. The convention is the
+  established one (no attributes, no closures: naming plus data, zero
+  checker or codegen edits): a benchmark SUITE is a `.hls` file that
+  defines no `main` (the runner is its program), a BENCHMARK is a
+  top-level `fn bench_<name>()` taking no parameters, an optional
+  `fn units_<name>() -> int` declares the work units one iteration
+  consumes (the report gains a `thrpt:` line in units per second), and
+  `std.bench.mark_skip(reason)` skips a bench with the reserved
+  `__HLBENCH_SKIP__:` panic prefix. The refusal matrix mirrors Stage
+  120: a suite with `main`, a stray `units_` fn, a malformed units fn,
+  and a benchmark with parameters all fail with the fix in the
+  message.
+- One synthesized driver serves BOTH backends. For every selected
+  bench the runner writes a small Halis driver next to the suite file
+  (its relative imports resolve exactly where they resolve for any
+  other importer), bakes the plan constants in as literals, and runs
+  it — in-process on the Stage-0 interpreter (real loader, real
+  checker, one fresh Interp per bench) or, with `--native`, through
+  `bin/hlc` + gcc. A probe driver gives the real checker a program to
+  accept (a suite is a module; the checker refuses a headless one) so
+  the driver's `uses` clause comes from the checker's OWN computed
+  effects — never a re-implementation. The measured loop binds the
+  bench's return value into a type-shaped sink that escapes through an
+  unreachable branch: a backend free to dead-code-eliminate a pure
+  unused call would measure nothing, and this one cannot. The empty
+  harness loop is timed and PRINTED (`harness: 1.2 µs/iter`) — the
+  loop cost inside every sample is surfaced, not hidden, and nothing
+  is subtracted.
+- The wire protocol is line-oriented with the snapshot stream's
+  reserved-prefix discipline (`__HLBENCH_UNITS__` zero-or-one,
+  `__HLBENCH__` exactly SAMPLES, `__HLBENCH_HARNESS__` exactly one): a
+  record line must parse exactly, a stray reserved stem is a loud
+  protocol error, and ordinary print noise from an IO-effectful bench
+  is skipped — the measurement survives a benchmark that talks. With
+  `--fixed-iters K` the plan is deterministic: interpreter and native
+  emit the SAME (bench, iters) sequence and only the clock readings
+  differ, which is exactly what must differ.
+- The statistics are criterion's, seeded and byte-stable: the median
+  with a percentile-bootstrap CI (the `time:` bracket), mean with
+  sample stddev, median absolute deviation, Tukey outlier counts in
+  the four low/high × mild/severe cells, slope-based throughput with
+  its own CI when units are declared. The bootstrap is seeded from the
+  bench name — the same data always yields the same report bytes, so a
+  `--json` report is diffable. `--save NAME` records per-bench JSON
+  baselines under `.hlbench/<suite-stem>/` (byte-stable by
+  construction, machine-local by nature); `--baseline NAME` compares
+  with the change of the median, a bootstrap CI, and a Welch t-test
+  p-value (regularized incomplete beta — no approximations),
+  classified criterion's way: "No change in performance detected." /
+  "Change within noise threshold." / "Performance has improved." /
+  "Performance has regressed." An unrecorded baseline is refused
+  BEFORE any measurement (exit 2); a corrupt record fails the bench
+  naming the file; a cross-backend baseline is refused — interpreter
+  and native timings are different instruments.
+- Housekeeping: the Stage 32 zero-cost-abstractions audit gate — the
+  tool that previously carried the hls-bench name — is now
+  `tools/hls-bench-stdlib.py` (`make bench-stdlib` unchanged);
+  `std/bench.hls` ships `mark_skip`; the ok corpus gains
+  `tests/ok/feat_stage124_bench.hls` (the bench convention is ordinary
+  Halis: interpreter and native byte-identical); the bench lib
+  `tests/bench_libs/arith_bench.hls` exercises units, value-returning
+  benches, a units-less bench, and the skip convention.
+- Acceptance (`make bench-acceptance`): 8 sections, 84 checks over the
+  REAL CLI — the convention and its refusals, the fixed-plan protocol
+  shape, the statistics against hand-computed values, the report
+  layout and the change-classification matrix via crafted baselines,
+  the baseline store (byte-stability, pre-flight refusal, corruption,
+  cross-backend refusal, compare-then-overwrite), exit codes and the
+  CLI matrix (`--json`, `-j 2`), the fixed-plan interpreter-vs-native
+  differential (same plan, equal units, native decisively faster,
+  fixture byte-identical), and the corpus hygiene. The full suite
+  stays green and bootstrap stays deterministic.
+
 ## [v0.141.0-alpha] — Stage 123: `hls-repl`, the interactive REPL
 - The prompt stops reading the program and starts growing it.
   `tools/hls-repl.py` is an interactive REPL where the session IS a
