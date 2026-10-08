@@ -7,7 +7,7 @@
 #
 # Two complementary gates:
 #
-#   bench-stdlib      — runs `tools/hls-bench.py` over every public
+#   bench-stdlib      — runs `tools/hls-bench-stdlib.py` over every public
 #                       stdlib function and fails if any function
 #                       exceeds the configured threshold.
 #                       Default threshold: 2.0 µs/call (accounts for
@@ -26,7 +26,7 @@
 # Override the threshold via: make bench-stdlib BENCH_THRESHOLD_US=1.0
 BENCH_THRESHOLD_US ?= 2.0
 bench-stdlib:
-	@$(PYTHON) tools/hls-bench.py --threshold-us $(BENCH_THRESHOLD_US)
+	@$(PYTHON) tools/hls-bench-stdlib.py --threshold-us $(BENCH_THRESHOLD_US)
 
 # spec-check: verify generic specialisation of list_reverse_int.
 spec-check:

@@ -660,7 +660,7 @@ echo "=== 4c. deep-scan-29: Stage 32 bench driver sanity ==="
 #   env_var    — Proc effect      (was: hlc type error)
 #   base64_decode — curated valid input (was: run panic on "hello world")
 # All three must be MEASURED (not skipped, not failed) at low iters.
-bench_out=$(python3 tools/hls-bench.py --iters 3000 \
+bench_out=$(python3 tools/hls-bench-stdlib.py --iters 3000 \
     --only mutex_new,env_var,base64_decode 2>&1); bench_rc=$?
 bench_measured=$(echo "$bench_out" | grep -E "^[0-9]+ measured" | grep -oE "^[0-9]+")
 if [ $bench_rc -eq 0 ] && [ "$bench_measured" -eq 3 ]; then
@@ -670,7 +670,7 @@ else
     echo "$bench_out" | tail -6
 fi
 # Skipped-only selections must report cleanly, not crash.
-if python3 tools/hls-bench.py --iters 3000 --only csrf_generate_token >/dev/null 2>&1; then
+if python3 tools/hls-bench-stdlib.py --iters 3000 --only csrf_generate_token >/dev/null 2>&1; then
     bad "hls-bench: skip-only selection should exit non-zero"
 else
     ok "hls-bench: skip-only selection reports 'no functions to benchmark'"

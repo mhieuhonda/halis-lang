@@ -1879,6 +1879,141 @@ single input.
   what they were. Known limits are the Stage-0 interpreter's own
   (`asm!` cannot execute) plus the honest ones named above.
 
+### 23.8. `hls-bench` — the criterion-style micro-benchmark runner (Stage 124, v0.142.0-alpha)
+
+The benchmark stops being a stopwatch in a shell loop and becomes a
+measured, compared, classified number. `tools/hls-bench.py` is a
+micro-benchmark runner with criterion's shape — warmup, adaptive batch
+sizing, seeded bootstrap confidence intervals, Tukey outlier counts,
+baseline comparison with a Welch t-test — driven over benchmarks
+written in Halis itself. The convention follows the established
+pattern (no attributes, no closures: naming plus data, zero checker
+or codegen edits — Stage 119's snapshot assertion and Stage 120's case
+tables set the form): a benchmark SUITE is a `.hls` file that defines
+no `main` (the runner is its program), a BENCHMARK is a top-level
+`fn bench_<name>()` taking no parameters, and an optional companion
+`fn units_<name>() -> int` declares the work units one iteration
+consumes (elements hashed, bytes produced) — present, the report gains
+a `thrpt:` line in units per second. `std.bench.mark_skip(reason)`
+skips a bench with the reserved `__HLBENCH_SKIP__:` panic prefix (the
+`std.test.mark_skip` discipline); a suite that defines `main`, a
+stray `units_` fn with no bench beside it (the typo case), a units fn
+with parameters or the wrong declared return, and a benchmark with
+parameters all fail — with the fix in the message — exactly the way
+Stage 120 fails a malformed table.
+
+- **The driver, and why there is one.** For every selected bench the
+  runner synthesizes a small Halis driver program NEXT TO the suite
+  file (so the suite's relative imports resolve exactly where they
+  resolve for any other importer) and runs it — in-process on the
+  Stage-0 interpreter (real loader, real checker, one fresh Interp per
+  bench, hltest's execution model) or, with `--native`, through
+  `bin/hlc` + gcc. ONE driver source serves BOTH backends: the plan
+  constants are baked into the driver as literals, and the wire
+  records are ordinary stdout, whose byte-parity between the backends
+  is a standing invariant — so with `--fixed-iters` the interpreter
+  and the native binary emit the SAME (bench, iters) plan and only the
+  clock readings differ, which is exactly what must differ. Before any
+  driver runs, a PROBE driver (a main declaring the full effect
+  universe, importing the suite) gives the real checker a program to
+  accept — a suite is a module and the checker refuses a headless one
+  — so the runner reads the checker's OWN computed effects (never a
+  re-implementation) for the driver's `uses` clause, and a suite with
+  a type error fails once, as a file-level `<check>` result.
+- **The measurement is honest about what a backend can take away.**
+  The measured loop binds the bench's return value into a type-shaped
+  sink (the Stage 32 driver's discipline) that itself escapes through
+  an unreachable branch — a backend free to dead-code-eliminate a pure
+  unused call would measure nothing, and this one cannot. After the
+  samples the driver times ONE batch of the empty harness loop at the
+  same size and prints it: the loop cost is inside every sample (as it
+  is in criterion), the report SURFACES it (`harness: 1.2 µs/iter`)
+  instead of hiding it, and nothing is subtracted — the number a
+  backend earns is the number it keeps.
+- **The plan is criterion's routine, sized for a self-hosted
+  toolchain.** Warmup runs doubling batches until the warmup budget is
+  spent; the last (largest) batch estimates the per-iteration cost;
+  SAMPLES samples each run about the target sample time (clamped to
+  min/max iters). Defaults: 30 samples, 30 ms warmup, 15 ms per
+  sample — a bench costs about half a second, not criterion's eight,
+  because the Stage-0 interpreter is four orders of magnitude slower
+  than the native backend and both must stay practical. Every knob is
+  a flag; `--fixed-iters K` replaces the whole routine with a
+  deterministic plan (no warmup, K iterations per sample) — the
+  differential mode.
+- **The wire protocol is line-oriented, with the snapshot stream's
+  reserved-prefix discipline.** Three records:
+  `__HLBENCH_UNITS__ <bench> <units>` (zero or one),
+  `__HLBENCH__ <bench> <iters> <elapsed_ns>` (exactly SAMPLES),
+  `__HLBENCH_HARNESS__ <iters> <elapsed_ns>` (exactly one). A line
+  STARTING with a prefix must parse exactly; a line merely CONTAINING
+  the reserved stem that is not a record is a protocol error (a bench
+  that prints look-alikes corrupts the stream — it fails loudly, no
+  record is silently dropped); any other output the bench prints is
+  skipped, because a benchmark with `uses IO` may print and the
+  measurement must survive it. Sample counts and the harness record
+  are validated per run — a driver whose plan and output disagree
+  fails, it does not average over a shortfall.
+- **The statistics are criterion's, seeded and byte-stable.** Each
+  sample yields a per-iteration estimate elapsed/iters; the report
+  shows the median with a percentile-bootstrap confidence interval
+  (the `time:` bracket), the mean with sample standard deviation, the
+  median absolute deviation, Tukey-fence outlier counts in criterion's
+  four cells (low/high × mild/severe), and — when units are declared —
+  the slope-based throughput with its own bootstrap CI. The bootstrap
+  is seeded from the bench name (zlib.crc32): the SAME data always
+  yields the SAME report bytes, so a `--json` report is diffable and
+  the confidence interval is reproducible, not a mood.
+- **Baselines make the number comparable across time.** `--save NAME`
+  writes one JSON record per measured bench under
+  `.hlbench/<suite-stem>/` beside the suite — the raw estimates, the
+  sample pairs, the backend, the totals; sorted keys, fixed floats, no
+  timestamps, so the file is byte-stable by construction (and
+  machine-local by nature — timings are a property of the machine that
+  measured them, which is why the directory is a dot-directory and not
+  a committed artifact). `--baseline NAME` compares: the relative
+  change of the median with a bootstrap CI of the difference and a
+  Welch t-test p-value (regularized incomplete beta, Lentz's continued
+  fraction — no approximations), classified the way criterion
+  classifies it: "No change in performance detected." (p ≥ 0.05),
+  "Change within noise threshold.", "Performance has improved." /
+  "Performance has regressed." (CI clear of the --noise threshold,
+  default 5%). An unrecorded baseline name is refused BEFORE any
+  measurement runs (exit 2 — a typo should not cost ten minutes of
+  benchmarking); a corrupt record is a failing result naming the file
+  (exit 1, the snapshot-store discipline); a baseline recorded with
+  the OTHER backend cannot serve this run — interpreter and native
+  timings are different instruments, and the refusal says so.
+- **The exit-code contract is the runner's honesty**: 0 when every
+  selected bench measured (skips allowed and reported with their
+  reason), 1 when any bench or file failed (a panicking bench fails
+  with its decoded panic, never a b'...' repr), 2 for usage errors
+  (no suites, an unrecorded baseline). `--json` writes the machine
+  report (config, per-bench estimates, raw samples, change blocks);
+  `--list` shows what would run; `-j` parallelizes across suite files
+  (default 1 — benches are timing-sensitive, parallelism is for
+  throughput, not for quiet numbers). The Stage 32 zero-cost-
+  abstractions audit gate — the tool that previously carried the
+  hls-bench name — is now `tools/hls-bench-stdlib.py` (`make
+  bench-stdlib` unchanged), and this tool is the user-facing runner
+  the roadmap's Stage 124 names.
+- **The gate** (`make bench-acceptance`, 8 sections, 84 checks)
+  drives the real CLI over the bench lib (`tests/bench_libs/
+  arith_bench.hls`) and temp probes: the convention and its refusal
+  matrix, the fixed-plan protocol shape (units record, sample count,
+  harness record, look-alike rejection, print-noise tolerance, temp
+  hygiene), the statistics against hand-computed values (quantiles,
+  MAD, the four outlier cells, bootstrap determinism and collapse, the
+  slope identity, Welch on constructed vectors), the report layout and
+  the full change-classification matrix via crafted baselines, the
+  baseline store (byte-stability, pre-flight refusal, corruption,
+  cross-backend refusal, compare-then-overwrite), exit codes and the
+  CLI matrix (`--json` payload, `-j 2`), the fixed-plan differential
+  (the SAME (bench, iters) plan on interpreter and native, units
+  equal, native decisively faster, the ok fixture byte-identical), and
+  the corpus hygiene (hlfmt-canonical, hllint-clean, boot --check
+  green, no temp litter).
+
 ## 24. Safe C FFI (Stage 15-alpha — v0.13.0-alpha)
 
 A new `extern "C" { ... }` block declares external C functions. The

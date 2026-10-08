@@ -187,6 +187,11 @@ make dap-acceptance            # Stage 121 gate: VS Code debugger integration
 python3 tools/hls-repl.py      # Stage 123: interactive REPL (:type, :effects,
                                # :audit, :env, :load — the session IS a program)
 make repl-acceptance           # Stage 123 gate: the REPL acceptance battery
+python3 tools/hls-bench.py benches/          # Stage 124: criterion-style micro-
+                               # benchmarks (bench_<name> fns, units_<name>
+                               # throughput, --save/--baseline comparisons,
+                               # --native for the compiled backend)
+make bench-acceptance          # Stage 124 gate: the benchmark runner battery
 
 # 13. Stage 15-alpha: Safe C FFI (v0.13.0-alpha)
 python3 boot/boot.py examples/ffi_demo.hls           # call libc functions
