@@ -1,0 +1,417 @@
+# ============================================================================
+# core/rt.hls — soft-real-time mode: bounded allocation per cycle (Stage 126)
+# ----------------------------------------------------------------------------
+# Pure HLS, zero imports (freestanding-safe: the module only uses the core
+# language — structs, enums, lists, strings and the `panic` builtin — so it
+# is importable from `#![no_std]` and `#![freestanding]` crates identically,
+# like the rest of `core.*`).
+#
+# This module is the LIBRARY half of Stage 126. The RUNTIME half lives in
+# the hosted C backend: when a program is linked with the hls-rt instrument
+# (tools/rt_parts/hlrt_budget_wrap.c) and run with the HLRT_BUDGET_* env
+# vars set, the runtime counts every allocation per cycle — one cycle being
+# the window between two `__HLRT_CYCLE__ <i>` markers the program prints —
+# and panics through the Stage 81 path the moment a closed cycle is over
+# its budget (see SPEC section 66). The native binary and this model speak
+# the SAME verdict names, the SAME axis order and the SAME violation
+# messages; that agreement is what the differential tests pin.
+#
+# Why a model at all: Halis has no global allocator and no runtime hooks a
+# program can call, so a kernel author plans a real-time budget BEFORE the
+# run (which ceiling does each cycle get, how much headroom is left, which
+# axis binds) and audits a measured ledger after it. Both are pure
+# arithmetic on data — exactly what this module holds. The runtime's
+# enforcement is the same arithmetic applied at the cycle mark, so a plan
+# made here and a violation reported there are comparable numbers.
+#
+# The three axes (a budget axis set to 0 is UNCHECKED, not zero):
+#   allocs — how many heap allocations one cycle may make
+#   bytes  — how many bytes one cycle may allocate in total
+#   nanos  — how much wall-clock time one cycle may take
+# The classify order is fixed (allocs, then bytes, then nanos) so the
+# first fault a violation names is deterministic — the runtime reports the
+# same axis the model would.
+# ============================================================================
+
+# ---------------------------------------------------------------------------
+# RtVerdict — the enforcement decision, as data
+# ---------------------------------------------------------------------------
+#   Within     — the cycle is inside its budget on every checked axis
+#   OverAllocs — the cycle made more allocations than the budget allows
+#   OverBytes  — the cycle allocated more bytes than the budget allows
+#   OverTime   — the cycle took more nanoseconds than the deadline allows
+enum RtVerdict {
+    Within,
+    OverAllocs,
+    OverBytes,
+    OverTime
+}
+
+# The stable name of a verdict, for logs and reports.
+fn rt_verdict_name(v: RtVerdict) -> str {
+    return match v {
+        RtVerdict.Within => "within",
+        RtVerdict.OverAllocs => "over-allocs",
+        RtVerdict.OverBytes => "over-bytes",
+        RtVerdict.OverTime => "over-time"
+    }
+}
+
+# The stable code of a verdict (matches the declaration order: Within = 0,
+# OverAllocs = 1, OverBytes = 2, OverTime = 3 — enums are matched, not
+# compared, but logs and wire formats want the integer).
+fn rt_verdict_code(v: RtVerdict) -> int {
+    return match v {
+        RtVerdict.Within => 0,
+        RtVerdict.OverAllocs => 1,
+        RtVerdict.OverBytes => 2,
+        RtVerdict.OverTime => 3
+    }
+}
+
+# ---------------------------------------------------------------------------
+# RtBudget — the per-cycle ceiling
+# ---------------------------------------------------------------------------
+#   max_allocs — the allocation-COUNT ceiling (0 = unchecked)
+#   max_bytes  — the allocation-BYTES ceiling (0 = unchecked)
+#   max_nanos  — the wall-clock deadline in ns (0 = unchecked)
+# A budget with every axis 0 is not a mode (nothing is bounded) and the
+# constructor refuses it — the same rule the runtime applies when it reads
+# HLRT_BUDGET_*: with nothing set there is nothing to enforce.
+struct RtBudget {
+    max_allocs: int,
+    max_bytes: int,
+    max_nanos: int
+}
+
+# Validate and hold a per-cycle budget. Negative values have no meaning
+# (a ceiling below zero is unreachable) and an all-zero budget is refused:
+# the mode must bound at least one axis or it is not a mode.
+fn rt_budget_new(max_allocs: int, max_bytes: int, max_nanos: int) -> RtBudget {
+    if max_allocs < 0 {
+        panic("rt_budget_new: max_allocs must be >= 0")
+    }
+    if max_bytes < 0 {
+        panic("rt_budget_new: max_bytes must be >= 0")
+    }
+    if max_nanos < 0 {
+        panic("rt_budget_new: max_nanos must be >= 0")
+    }
+    if max_allocs == 0 && max_bytes == 0 && max_nanos == 0 {
+        panic("rt_budget_new: at least one axis must be bounded (> 0)")
+    }
+    return RtBudget {
+        max_allocs: max_allocs,
+        max_bytes: max_bytes,
+        max_nanos: max_nanos
+    }
+}
+
+# ---------------------------------------------------------------------------
+# RtCycle — one measured cycle (the ledger line the runtime's instrument
+# produces; the model only ever computes WITH one)
+# ---------------------------------------------------------------------------
+#   index      — the cycle number the program printed (__HLRT_CYCLE__ <i>)
+#   allocs     — heap allocations made during the cycle
+#   bytes      — total bytes those allocations asked for
+#   live_bytes — bytes still retained when the cycle closed (a leak shows
+#                as this growing across cycles; Stage 125 verifies the
+#                same property from outside with RSS)
+#   nanos      — wall-clock duration of the cycle
+struct RtCycle {
+    index: int,
+    allocs: int,
+    bytes: int,
+    live_bytes: int,
+    nanos: int
+}
+
+# The enforcement decision for one measured cycle against one budget.
+# The axis order is the canonical one: allocation count first, then bytes,
+# then time. An axis whose budget is 0 is unchecked on purpose (0 means
+# "unbounded", not "nothing allowed") — the same reading the runtime's
+# env parsing applies.
+fn rt_cycle_classify(c: RtCycle, b: RtBudget) -> RtVerdict {
+    if b.max_allocs > 0 && c.allocs > b.max_allocs {
+        return RtVerdict.OverAllocs
+    }
+    if b.max_bytes > 0 && c.bytes > b.max_bytes {
+        return RtVerdict.OverBytes
+    }
+    if b.max_nanos > 0 && c.nanos > b.max_nanos {
+        return RtVerdict.OverTime
+    }
+    return RtVerdict.Within
+}
+
+# By how much the cycle overshoots on the axis rt_cycle_classify names
+# (units of that axis: allocations, bytes or nanoseconds). Within cycles
+# overrun by 0 — the caller never has to special-case the verdict to ask
+# "how bad was it".
+fn rt_cycle_overrun(c: RtCycle, b: RtBudget) -> int {
+    return match rt_cycle_classify(c, b) {
+        RtVerdict.OverAllocs => c.allocs - b.max_allocs,
+        RtVerdict.OverBytes => c.bytes - b.max_bytes,
+        RtVerdict.OverTime => c.nanos - b.max_nanos,
+        RtVerdict.Within => 0
+    }
+}
+
+# The violation message in the CANONICAL form — the exact string the C
+# runtime hands to hl_die when in-process enforcement fires, and the exact
+# string rt_cycle_enforce panics with. One format, three renderings, so a
+# plan's log, a kernel's #[panic_handler] output and a native binary's
+# stderr all quote the same shape:
+#   soft real-time violation: cycle 7 made 1200 allocations (budget 1000)
+#   soft real-time violation: cycle 7 allocated 9500 bytes (budget 8192)
+#   soft real-time violation: cycle 7 took 1500000 ns (deadline 1000000 ns)
+fn rt_violation_message(c: RtCycle, b: RtBudget) -> str {
+    let idx: str = c.index.to_str()
+    return match rt_cycle_classify(c, b) {
+        RtVerdict.OverAllocs => "soft real-time violation: cycle " + idx
+        + " made " + c.allocs.to_str()
+        + " allocations (budget " + b.max_allocs.to_str() + ")",
+        RtVerdict.OverBytes => "soft real-time violation: cycle " + idx
+        + " allocated " + c.bytes.to_str()
+        + " bytes (budget " + b.max_bytes.to_str() + ")",
+        RtVerdict.OverTime => "soft real-time violation: cycle " + idx
+        + " took " + c.nanos.to_str()
+        + " ns (deadline " + b.max_nanos.to_str() + " ns)",
+        RtVerdict.Within => "soft real-time violation: cycle " + idx
+        + " is within budget"
+    }
+}
+
+# The enforcement primitive: a within-budget cycle returns normally; an
+# over-budget cycle panics through the Stage 81 path with the canonical
+# message, so a #[panic_handler] observes a soft-real-time miss exactly
+# like any other fault (the runtime's in-process enforcement dies through
+# the same path — the model and the runtime cannot disagree about what a
+# violation looks like).
+fn rt_cycle_enforce(c: RtCycle, b: RtBudget) {
+    # the code check (0 = Within) keeps the guard an integer comparison —
+    # enums are matched, not compared
+    if rt_verdict_code(rt_cycle_classify(c, b)) != 0 {
+        panic(rt_violation_message(c, b))
+    }
+    return
+}
+
+# Utilisation of the BINDING axis, in whole percent: the largest
+# usage/budget ratio over the checked axes. A value over 100 is a
+# violated budget (informative, not clamped — the report wants the real
+# number); an axis left at 0 (unchecked) contributes nothing. Refusing
+# the all-unchecked case keeps division by zero impossible.
+fn rt_utilisation_pct(c: RtCycle, b: RtBudget) -> int {
+    if b.max_allocs == 0 && b.max_bytes == 0 && b.max_nanos == 0 {
+        panic("rt_utilisation_pct: no axis is bounded")
+    }
+    let mut pct: int = 0
+    if b.max_allocs > 0 {
+        pct = (c.allocs * 100) / b.max_allocs
+    }
+    if b.max_bytes > 0 {
+        let bp: int = (c.bytes * 100) / b.max_bytes
+        if bp > pct {
+            pct = bp
+        }
+    }
+    if b.max_nanos > 0 {
+        let np: int = (c.nanos * 100) / b.max_nanos
+        if np > pct {
+            pct = np
+        }
+    }
+    return pct
+}
+
+# ---------------------------------------------------------------------------
+# Window analytics — the ledger a run produced, as one list[RtCycle]
+# ---------------------------------------------------------------------------
+# Every function here refuses an empty window (there is no cycle to talk
+# about) and leaves the input untouched. The median is the plain integer
+# median: odd count takes the middle element, even count averages the two
+# middle elements (floor division, no floats — the ledger is integral).
+
+# The ledger-level leak indicator: how much MORE the process retained
+# when this cycle closed than when the previous one did. A steady-state
+# cycle whose growth is a positive CONSTANT every cycle is retaining one
+# object per cycle — the shape Stage 125's instruments certify from
+# outside; growth of zero is the exact-free property, seen from inside
+# the ledger. A negative growth is reclamation (a cache shrinking) —
+# legal, and the number says so.
+fn rt_cycle_live_growth(prev: RtCycle, c: RtCycle) -> int {
+    return c.live_bytes - prev.live_bytes
+}
+
+fn rt_window_nonempty(cs: list[RtCycle]) {
+    if cs.len() == 0 {
+        panic("rt_window: the cycle window is empty")
+    }
+    return
+}
+
+fn rt_window_max_allocs(cs: list[RtCycle]) -> int {
+    rt_window_nonempty(cs)
+    let mut m: int = cs.get(0).allocs
+    let mut i: int = 1
+    while i < cs.len() {
+        if cs.get(i).allocs > m {
+            m = cs.get(i).allocs
+        }
+        i = i + 1
+    }
+    return m
+}
+
+fn rt_window_max_bytes(cs: list[RtCycle]) -> int {
+    rt_window_nonempty(cs)
+    let mut m: int = cs.get(0).bytes
+    let mut i: int = 1
+    while i < cs.len() {
+        if cs.get(i).bytes > m {
+            m = cs.get(i).bytes
+        }
+        i = i + 1
+    }
+    return m
+}
+
+fn rt_window_max_nanos(cs: list[RtCycle]) -> int {
+    rt_window_nonempty(cs)
+    let mut m: int = cs.get(0).nanos
+    let mut i: int = 1
+    while i < cs.len() {
+        if cs.get(i).nanos > m {
+            m = cs.get(i).nanos
+        }
+        i = i + 1
+    }
+    return m
+}
+
+fn rt_window_min_nanos(cs: list[RtCycle]) -> int {
+    rt_window_nonempty(cs)
+    let mut m: int = cs.get(0).nanos
+    let mut i: int = 1
+    while i < cs.len() {
+        if cs.get(i).nanos < m {
+            m = cs.get(i).nanos
+        }
+        i = i + 1
+    }
+    return m
+}
+
+# Jitter — the peak-to-peak spread of the cycle time. The one number a
+# soft-real-time report is asked for first: a workload whose median is
+# well under the deadline but whose jitter crosses it is NOT real-time,
+# and the median alone would hide that.
+fn rt_window_jitter_nanos(cs: list[RtCycle]) -> int {
+    rt_window_nonempty(cs)
+    return rt_window_max_nanos(cs) - rt_window_min_nanos(cs)
+}
+
+# The integer median of the cycle times (odd: the middle; even: the floor
+# of the two middles' average). Sorting is a selection-insertion over the
+# nanos only — windows are small (a verification plan is tens to hundreds
+# of cycles) and cloning the whole list for one number is waste.
+fn rt_window_median_nanos(cs: list[RtCycle]) -> int {
+    rt_window_nonempty(cs)
+    let n: int = cs.len()
+    let mut xs: list[int] = []
+    let mut i: int = 0
+    while i < n {
+        xs.push(cs.get(i).nanos)
+        i = i + 1
+    }
+    # insertion sort — n is small and the order is deterministic
+    let mut j: int = 1
+    while j < n {
+        let key: int = xs.get(j)
+        let mut k: int = j - 1
+        while k >= 0 && xs.get(k) > key {
+            xs.set(k + 1, xs.get(k))
+            k = k - 1
+        }
+        xs.set(k + 1, key)
+        j = j + 1
+    }
+    let mid: int = n / 2
+    if n % 2 == 1 {
+        return xs.get(mid)
+    }
+    return(xs.get(mid - 1) + xs.get(mid)) / 2
+}
+
+# How many cycles of the window broke the budget on any axis. The count a
+# report quotes next to the verdict; a window that is entirely within
+# reports 0 without the caller re-classifying anything.
+fn rt_window_over_count(cs: list[RtCycle], b: RtBudget) -> int {
+    rt_window_nonempty(cs)
+    let mut n: int = 0
+    let mut i: int = 0
+    while i < cs.len() {
+        if rt_verdict_code(rt_cycle_classify(cs.get(i), b)) != 0 {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return n
+}
+
+# The window verdict: the WORST axis verdict any cycle earned, in the
+# canonical axis order (any OverAllocs wins over any OverBytes, any
+# OverBytes over any OverTime). Within only when EVERY cycle is within —
+# the same composition rule the runtime applies per cycle and the hls-rt
+# verifier applies across the run.
+fn rt_window_classify(cs: list[RtCycle], b: RtBudget) -> RtVerdict {
+    rt_window_nonempty(cs)
+    let mut saw_allocs: bool = false
+    let mut saw_bytes: bool = false
+    let mut saw_time: bool = false
+    let mut i: int = 0
+    while i < cs.len() {
+        # verdict codes: 0 Within, 1 OverAllocs, 2 OverBytes, 3 OverTime
+        # (enums are matched, not compared — the code carries the axis)
+        let kind: int = rt_verdict_code(rt_cycle_classify(cs.get(i), b))
+        if kind == 1 {
+            saw_allocs = true
+        } else if kind == 2 {
+            saw_bytes = true
+        } else if kind == 3 {
+            saw_time = true
+        }
+        i = i + 1
+    }
+    if saw_allocs {
+        return RtVerdict.OverAllocs
+    }
+    if saw_bytes {
+        return RtVerdict.OverBytes
+    }
+    if saw_time {
+        return RtVerdict.OverTime
+    }
+    return RtVerdict.Within
+}
+
+# The WITNESS cycle: the first cycle that earned the window's worst
+# verdict. A refusal that cannot name its cycle is a rumour — the
+# verifier, the runtime and a kernel's log all quote this cycle (index,
+# numbers, axis) so the violation is reproducible from the message alone.
+fn rt_window_worst_cycle(cs: list[RtCycle], b: RtBudget) -> RtCycle {
+    rt_window_nonempty(cs)
+    let worst: int = rt_verdict_code(rt_window_classify(cs, b))
+    let mut i: int = 0
+    while i < cs.len() {
+        if rt_verdict_code(rt_cycle_classify(cs.get(i), b)) == worst {
+            return cs.get(i)
+        }
+        i = i + 1
+    }
+    # unreachable: the window verdict is Within exactly when no cycle
+    # earned worse, so the scan above always returns for a violated
+    # window — but a total function needs the leg
+    return cs.get(0)
+}

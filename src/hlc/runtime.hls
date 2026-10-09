@@ -2487,6 +2487,165 @@ fn runtime_lines(fs: bool, nl: bool) -> list[str] {
     r.push("")
     r.push("static hl_list* hl_args(void) { return g_hl_args; }")
     r.push("")
+    # ---- Stage 126 (v0.144.0-alpha): soft-real-time mode ----
+    # Hosted-libc only: the mode reads its budget from the environment
+    # and its counters from the hls-rt instrument, and both live in the
+    # libc world. A --no-libc or freestanding build emits none of this
+    # (and hl_println loses the marker scan below with it) — the honest
+    # "not available" the no-libc prelude practices for every other
+    # hosted-only feature.
+    #
+    # The division of labour (SPEC section 66):
+    #   - the INSTRUMENT (tools/rt_parts/hlrt_budget_wrap.c, linked with
+    #     -Wl,--wrap=malloc/...) counts every allocation into the OPEN
+    #     cycle and, on hlrt_cycle_mark(idx), snapshots the just-closed
+    #     one. It never enforces: it is a ledger, not a judge.
+    #   - the RUNTIME owns the mode: it reads HLRT_BUDGET_ALLOCS /
+    #     HLRT_BUDGET_BYTES / HLRT_BUDGET_NANOS / HLRT_WARMUP /
+    #     HLRT_REPORT once at startup, recognises the program's
+    #     `__HLRT_CYCLE__ <i>` markers as they pass through hl_println,
+    #     rolls the instrument at every mark, and — when any budget axis
+    #     is set — enforces the closed cycle against the budget on the
+    #     spot: the first over-budget cycle dies through hl_die, so a
+    #     #[panic_handler] observes a soft-real-time miss like any other
+    #     fault, and the violation message is the canonical string
+    #     core/rt.hls renders (rt_violation_message) — plan, runtime and
+    #     verifier quote one shape.
+    #
+    # The instrument's hooks are WEAK symbols: without the wrap linked
+    # they resolve to 0, hl_srt_init returns before touching the
+    # environment, and the mode costs one GOT test per process. With the
+    # instrument linked but no budget env set, the mode still ROLLS
+    # (HLRT_REPORT=1 asks for the ledger) but never enforces — measuring
+    # and judging are separable, which is what --no-enforce runs on.
+    if !fs && !nl {
+    r.push("// ---- Stage 126 (v0.144.0-alpha): soft-real-time mode ----")
+    r.push("// The hls-rt instrument (weak: absent unless linked) —")
+    r.push("//   hlrt_cycle_mark(idx)    close cycle idx: snapshot + record + reset")
+    r.push("//   hlrt_cycle_allocs()     allocations of the just-closed cycle")
+    r.push("//   hlrt_cycle_bytes()      bytes allocated by the just-closed cycle")
+    r.push("// (the instrument's live-bytes getter exists too — the verifier's")
+    r.push("// ledger reads it from the report; enforcement needs only these)")
+    r.push("extern void hlrt_cycle_mark(int64_t idx) __attribute__((weak));")
+    r.push("extern int64_t hlrt_cycle_allocs(void) __attribute__((weak));")
+    r.push("extern int64_t hlrt_cycle_bytes(void) __attribute__((weak));")
+    r.push("")
+    r.push("static int hl_srt_armed = 0;      // instrument linked AND (report or budget)")
+    r.push("static int hl_srt_enforce = 0;    // at least one budget axis is set")
+    r.push("static int64_t hl_srt_max_allocs = 0;")
+    r.push("static int64_t hl_srt_max_bytes = 0;")
+    r.push("static int64_t hl_srt_max_nanos = 0;")
+    r.push("static int64_t hl_srt_warmup = 0;")
+    r.push("static int64_t hl_srt_last_ns = 0;")
+    r.push("")
+    r.push("// Monotonic nanoseconds — the deadline axis' clock. clock_gettime")
+    r.push("// never fails on CLOCK_MONOTONIC on the hosts this runtime targets;")
+    r.push("// hl_clock_ms ignores the return the same way.")
+    r.push("static int64_t hl_srt_now_ns(void) {")
+    r.push("    struct timespec ts;")
+    r.push("    clock_gettime(CLOCK_MONOTONIC, &ts);")
+    r.push("    return (int64_t)ts.tv_sec * (int64_t)1000000000 + (int64_t)ts.tv_nsec;")
+    r.push("}")
+    r.push("")
+    r.push("// A non-negative decimal integer, or -1 when the value is not one")
+    r.push("// (empty, a non-digit anywhere, or too long to be exact). The")
+    r.push("// shared parser for the env values and the marker payload — one")
+    r.push("// reading of \"an integer\" in the mode, not three.")
+    r.push("static int64_t hl_srt_parse_u63(const char* p, int64_t len) {")
+    r.push("    if (!p || len <= 0 || len > 18) return -1;")
+    r.push("    int64_t v = 0;")
+    r.push("    for (int64_t i = 0; i < len; i++) {")
+    r.push("        char ch = p[i];")
+    r.push("        if (ch < '0' || ch > '9') return -1;")
+    r.push("        v = v * 10 + (int64_t)(ch - '0');")
+    r.push("    }")
+    r.push("    return v;")
+    r.push("}")
+    r.push("")
+    r.push("// One budget/warmup variable: absent is silent 0 (the axis is")
+    r.push("// unchecked — the usual state of a program not under test);")
+    r.push("// malformed says so once on stderr and stays 0, because a mode")
+    r.push("// that silently ignores garbage is a mode that lies about arming.")
+    r.push("static int64_t hl_srt_env_i64(const char* name) {")
+    r.push("    const char* v = getenv(name);")
+    r.push("    if (!v) return 0;")
+    r.push("    int64_t n = 0;")
+    r.push("    while (v[n] != 0) n++;")
+    r.push("    int64_t r = hl_srt_parse_u63(v, n);")
+    r.push("    if (r < 0) {")
+    r.push("        fprintf(stderr, \"hlrt: %s is not a non-negative integer - ignored\\n\", name);")
+    r.push("        return 0;")
+    r.push("    }")
+    r.push("    return r;")
+    r.push("}")
+    r.push("")
+    r.push("// Startup: called from main before any user code runs. A program")
+    r.push("// without the instrument returns before ONE getenv — the mode is")
+    r.push("// invisible unless it can actually measure.")
+    r.push("static void hl_srt_init(void) {")
+    r.push("    if (!hlrt_cycle_mark || !hlrt_cycle_allocs) return;")
+    r.push("    hl_srt_max_allocs = hl_srt_env_i64(\"HLRT_BUDGET_ALLOCS\");")
+    r.push("    hl_srt_max_bytes = hl_srt_env_i64(\"HLRT_BUDGET_BYTES\");")
+    r.push("    hl_srt_max_nanos = hl_srt_env_i64(\"HLRT_BUDGET_NANOS\");")
+    r.push("    hl_srt_warmup = hl_srt_env_i64(\"HLRT_WARMUP\");")
+    r.push("    const char* rep = getenv(\"HLRT_REPORT\");")
+    r.push("    int reporting = (rep && rep[0] == '1' && rep[1] == 0);")
+    r.push("    hl_srt_enforce = (hl_srt_max_allocs > 0 || hl_srt_max_bytes > 0")
+    r.push("                      || hl_srt_max_nanos > 0);")
+    r.push("    hl_srt_armed = (reporting || hl_srt_enforce);")
+    r.push("    hl_srt_last_ns = hl_srt_now_ns();")
+    r.push("}")
+    r.push("")
+    r.push("// The mark: the program printed `__HLRT_CYCLE__ <i>` (the scan in")
+    r.push("// hl_println checked the reserved prefix; this function owns the")
+    r.push("// rest). Order matters and is the mode's contract:")
+    r.push("//   1. roll the instrument — the just-closed cycle becomes the")
+    r.push("//      snapshot and enters the ledger BEFORE anything can die, so")
+    r.push("//      the atexit report holds the violating cycle's numbers too;")
+    r.push("//   2. stamp the clock (every armed mark, warmup included — the")
+    r.push("//      next measured cycle's window starts here either way);")
+    r.push("//   3. enforce, warmup cycles excluded, in the canonical axis")
+    r.push("//      order (allocs, bytes, nanos) — the first violation dies")
+    r.push("//      with the exact message core/rt.hls renders.")
+    r.push("static void hl_srt_on_mark(const char* digits, int64_t len) {")
+    r.push("    if (!hl_srt_armed) return;")
+    r.push("    int64_t idx = hl_srt_parse_u63(digits, len);")
+    r.push("    if (idx < 0) return;   // the verifier flags a malformed record; the")
+    r.push("                           // runtime just refuses to roll on one")
+    r.push("    hlrt_cycle_mark(idx);")
+    r.push("    int64_t now = hl_srt_now_ns();")
+    r.push("    int64_t cycle_ns = now - hl_srt_last_ns;")
+    r.push("    hl_srt_last_ns = now;")
+    r.push("    if (!hl_srt_enforce) return;")
+    r.push("    if (idx < hl_srt_warmup) return;")
+    r.push("    char msg[160];")
+    r.push("    if (hl_srt_max_allocs > 0) {")
+    r.push("        int64_t a = hlrt_cycle_allocs();")
+    r.push("        if (a > hl_srt_max_allocs) {")
+    r.push("            snprintf(msg, sizeof msg,")
+    r.push("                \"soft real-time violation: cycle %lld made %lld allocations (budget %lld)\",")
+    r.push("                (long long)idx, (long long)a, (long long)hl_srt_max_allocs);")
+    r.push("            hl_die(msg);")
+    r.push("        }")
+    r.push("    }")
+    r.push("    if (hl_srt_max_bytes > 0) {")
+    r.push("        int64_t b = hlrt_cycle_bytes();")
+    r.push("        if (b > hl_srt_max_bytes) {")
+    r.push("            snprintf(msg, sizeof msg,")
+    r.push("                \"soft real-time violation: cycle %lld allocated %lld bytes (budget %lld)\",")
+    r.push("                (long long)idx, (long long)b, (long long)hl_srt_max_bytes);")
+    r.push("            hl_die(msg);")
+    r.push("        }")
+    r.push("    }")
+    r.push("    if (hl_srt_max_nanos > 0 && cycle_ns > hl_srt_max_nanos) {")
+    r.push("        snprintf(msg, sizeof msg,")
+    r.push("            \"soft real-time violation: cycle %lld took %lld ns (deadline %lld ns)\",")
+    r.push("            (long long)idx, (long long)cycle_ns, (long long)hl_srt_max_nanos);")
+    r.push("        hl_die(msg);")
+    r.push("    }")
+    r.push("}")
+    r.push("")
+    }
     r.push("static void hl_print(hl_str* s) {")
     r.push("    fwrite(s->data, 1, (size_t)s->len, stdout);")
     r.push("    hl_str_release(s);")
@@ -2495,6 +2654,18 @@ fn runtime_lines(fs: bool, nl: bool) -> list[str] {
     r.push("static void hl_println(hl_str* s) {")
     r.push("    fwrite(s->data, 1, (size_t)s->len, stdout);")
     r.push("    fputc('\\n', stdout);")
+    if !fs && !nl {
+    # Stage 126: the cycle-mark scan. Fifteen compared bytes on one
+    # println, and only when the mode is armed — a program run without
+    # the hls-rt instrument never pays even that (hl_srt_armed stays 0).
+    # A marker is recognised where it is BORN (the program's own println)
+    # so the instrument rolls at the exact moment the cycle ends, not at
+    # the moment an outside reader happens to see the line.
+    r.push("    if (hl_srt_armed && s->len > 15 &&")
+    r.push("        memcmp(s->data, \"__HLRT_CYCLE__ \", 15) == 0) {")
+    r.push("        hl_srt_on_mark(s->data + 15, s->len - 15);")
+    r.push("    }")
+    }
     r.push("    hl_str_release(s);")
     r.push("}")
     r.push("")
