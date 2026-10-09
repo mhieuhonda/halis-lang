@@ -8008,3 +8008,187 @@ struct-field holes), the opaqueness, the crate modes, the
 interpreter/native differential for the five `feat_stage111` programs
 and the demo under both `-O` modes, and the `--audit` Capability
 tokens section — word-for-word on both front-ends.
+
+
+## 66. Soft-real-time mode — bounded allocation per cycle (Stage 126 — v0.144.0-alpha)
+
+Stage 125 verified that a steady-state workload's resident memory does
+not grow with the work performed. Stage 126 adds the discipline a
+soft-real-time workload asks for next: a per-cycle BUDGET. The mode
+bounds every cycle's allocation traffic — allocation COUNT, allocation
+BYTES, and (optionally) wall-clock time — and the first cycle that
+closes over its budget dies in-process through the Stage 81 panic path
+with the canonical message, before the overrun can become a latency
+tail. Like Stage 82 it lands as three agreeing halves: a pure-HLS
+model library (`core/rt.hls`), a runtime wiring in the hosted C
+backend, and a verifier (`tools/hls-rt.py` + the ledger instrument
+`tools/rt_parts/hlrt_budget_wrap.c`) that certifies — or refuses to
+certify — a whole run.
+
+The convention is the established one — naming plus data, zero checker
+or codegen edits. A workload is an ordinary program; a CYCLE is what
+the workload says is a cycle: it prints one marker line per
+steady-state cycle,
+
+    __HLRT_CYCLE__ <i>
+
+with `i` strictly increasing from 0, at the END of each cycle. The
+prefix is a deliberate sibling of the hls-rss marker (`__HLRSS_CYCLE__`,
+Stage 125) with its own reserved stem, so one workload can serve both
+verifiers without either instrument mis-reading the other's records;
+the same reserved-prefix discipline applies (a record line must parse
+exactly, a stray stem is a loud protocol error, ordinary output
+survives — a workload may talk).
+
+### 66.1. The runtime wiring — where enforcement lives
+
+The hosted C runtime arms the mode in `main` (`hl_srt_init`, before
+any user code) and recognises markers where they are BORN: a
+fifteen-byte prefix comparison inside `hl_println`. Arming requires
+the hls-rt instrument to be linked — the instrument's entry points
+(`hlrt_cycle_mark` / `hlrt_cycle_allocs` / `hlrt_cycle_bytes`) are
+WEAK symbols — and at least one budget axis or the report switch:
+
+| Env var | Meaning |
+|---------|---------|
+| `HLRT_BUDGET_ALLOCS=N` | max heap allocations per cycle (0/absent = unchecked) |
+| `HLRT_BUDGET_BYTES=B` | max allocated bytes per cycle (0/absent = unchecked) |
+| `HLRT_BUDGET_NANOS=T` | max wall-clock nanoseconds per cycle (0/absent = unchecked) |
+| `HLRT_WARMUP=K` | the first K cycles are measured but not enforced |
+| `HLRT_REPORT=1` | the instrument prints its per-cycle ledger at exit |
+
+At each mark the runtime rolls the instrument (the just-closed cycle
+is snapshotted into the ledger BEFORE anything can die), stamps its
+own monotonic clock for the time axis, and — when a budget is set and
+the cycle is past the warmup — checks the closed cycle in the
+canonical axis order (allocs, bytes, nanos). The first violation dies
+through `hl_die`, so a `#[panic_handler]` observes a soft-real-time
+miss like any other fault, with the message `core.rt`'s
+`rt_violation_message` renders:
+
+    soft real-time violation: cycle 7 made 1200 allocations (budget 1000)
+    soft real-time violation: cycle 7 allocated 9500 bytes (budget 8192)
+    soft real-time violation: cycle 7 took 1500000 ns (deadline 1000000 ns)
+
+A program built without the instrument returns from `hl_srt_init`
+before ONE getenv — the mode costs one GOT test per process and a
+fifteen-byte comparison per println is never reached. A `--no-libc` or
+`#![freestanding]` emission carries none of the mode at all (the
+no-libc prelude's honest "not available", kept for a hosted-only
+feature): the function, the hooks, the scan and the main-line call are
+all omitted together.
+
+### 66.2. The instrument — a ledger, never a judge
+
+The instrument is a link-time interposer in the Stage 125 mold
+(`-Wl,--wrap=malloc/calloc/realloc/free`), and the division of labour
+is its contract: it counts every allocation into the OPEN cycle, and
+on `hlrt_cycle_mark(idx)` it snapshots the just-closed cycle into the
+ledger and opens the next. It does not read the budget variables, it
+does not enforce, it cannot end the program — which is exactly what
+makes measure-only runs honest. The pointer table tracks (ptr -> size)
+— mutex-guarded, dynamically grown through `__real_malloc` directly,
+the Stage 125 lessons inherited whole (only frees of pointers the
+interposer itself allocated count; the table's own memory is invisible
+to the counters; the report survives the exit(101) panic path via
+atexit). Realloc is classified — in-place growth adds the DELTA to the
+cycle's bytes, a move is a remove+insert — so the BYTES axis measures
+the window's cumulative ask, not its final size. The exit report is a
+fenced block on stderr:
+
+    HLRT_REPORT_BEGIN
+    HLRT_CYCLE=<i> ALLOCS=<n> BYTES=<b> LIVE=<lb> FREES=<f> NANOS=<ns>
+    ...
+    HLRT_TAIL ALLOCS=<n> BYTES=<b>
+    HLRT_TOTAL ALLOCS=<n> BYTES=<b> FREES=<f>
+    HLRT_LIVE_EXIT=<n>
+    HLRT_OVERFLOW=<0|1>
+    HLRT_REPORT_END
+
+The fence keeps a chatty program's stderr from injecting records, and
+the verifier re-derives the totals from the per-cycle lines before
+trusting any of it: a report whose summary disagrees with its own
+ledger is refused whole.
+
+### 66.3. The `core.rt` surface
+
+| Item | Role |
+|------|------|
+| `struct RtBudget { max_allocs, max_bytes, max_nanos }` | the per-cycle ceiling; 0 = unchecked; `rt_budget_new` refuses negatives and the all-zero budget (nothing bounded = not a mode) |
+| `struct RtCycle { index, allocs, bytes, live_bytes, nanos }` | one measured cycle — the ledger line the runtime's instrument produces |
+| `enum RtVerdict { Within, OverAllocs, OverBytes, OverTime }` | the enforcement decision as data, with `rt_verdict_name` / `rt_verdict_code` (0..3, declaration order) |
+| `rt_cycle_classify` | the canonical axis order (allocs, bytes, nanos); an unchecked axis never binds; exactly AT a ceiling is Within |
+| `rt_cycle_overrun` | the overshoot in units of the NAMED axis (0 when within) |
+| `rt_violation_message` | the canonical strings — the model, the runtime's `hl_die` and the verifier quote one shape |
+| `rt_cycle_enforce` | the panicking primitive: within returns, over panics through the Stage 81 path with the canonical message |
+| `rt_utilisation_pct` | the binding axis' whole percent, unclamped (over 100 is reported, not hidden); refuses the all-unchecked budget |
+| `rt_cycle_live_growth` | the ledger-level leak indicator: a positive CONSTANT per cycle is the retained-object shape Stage 125 certifies from outside; zero is exact-free seen from inside |
+| `rt_window_max/min/median/jitter` | the planner's numbers over a `list[RtCycle]` (integer median: odd takes the middle, even floors the pair average) |
+| `rt_window_over_count` / `rt_window_classify` / `rt_window_worst_cycle` | the window verdict: worst axis any cycle earned, in canonical order; the WITNESS cycle a refusal names |
+
+The module is import-free (no `uses`, no std imports, no extern) —
+importable from `#![no_std]` and `#![freestanding]` crates
+identically, like `core.stack` — and its arithmetic runs on the same
+checked int64 every Halis program gets: a budget or a ledger that
+overflows panics instead of wrapping.
+
+### 66.4. The verifier — `hls-rt`
+
+`python3 tools/hls-rt.py [--budget-allocs N] [--budget-bytes B]
+[--budget-ms MS] [--warmup K] [--min-cycles N] [--no-enforce]
+[--json PATH] workload.hls [args...]` compiles the workload natively
+(bin/hlc + gcc -O2, the exact recipe every gate uses) with the
+instrument linked, runs it once under the plan (budgets in the
+environment unless `--no-enforce` keeps them out), and judges:
+
+- **the two legs.** In-process enforcement (the program's own death:
+  exit 101 with the canonical line on stderr) and the ledger verdict
+  (every measured cycle inside the plan, judged by the same axis
+  order). Either leg alone can refuse; certification needs both —
+  enforcement armed AND the ledger clean. `--no-enforce` runs the same
+  canary to completion and still refuses from the ledger alone.
+- **the honesty gates.** A marker-free program is RT INCONCLUSIVE (a
+  bound claimed over zero observed cycles is a rumour); fewer than
+  `--min-cycles` (default 3) measured cycles is INCONCLUSIVE; an exit
+  tail that out-allocates the biggest measured cycle is INCONCLUSIVE
+  ("the markers do not cover the work"); a table overflow, a protocol
+  look-alike, a malformed or non-advancing marker, a timeout and a
+  non-violation panic are refusals with the reason named. Never a
+  silent pass.
+- **the report.** The plan, the per-cycle ledger, the window stats
+  (per-axis max/median, the time p95 and jitter — a workload whose
+  median is well under the deadline but whose jitter crosses it is
+  NOT real-time, and the median alone would hide that), the coverage
+  line, and the verdict pair (`RT BOUNDED` / `RT REFUSED` /
+  `RT INCONCLUSIVE`). `--json` carries the config, the full ledger and
+  the stats. Exit 0 certifies, 1 is not-certified, 2 is usage.
+
+Native only, on purpose (the budgeted runtime is the runtime the
+compiler EMITS; the interpreter's allocations are Python's — Stage
+125's rule, inherited), and GNU-ld `--wrap` is probed per run and
+refused honestly (exit 2) where unsupported.
+
+### 66.5. What the tests prove
+
+`tests/ok/feat_stage126_rt.hls` runs 62 numbered assertions on the
+interpreter AND as a native binary, byte-identical: names/codes,
+budget validation, the classify order and the unchecked-axis rule,
+overrun amounts, the three canonical messages byte for byte,
+enforce-within, utilisation (binding axis, unclamped, at-ceiling),
+the leak indicator, and the window analytics over a simulated ledger
+including the witness cycle. `tests/ok/panic_stage126_rt.hls` dies
+101 on both backends with the same canonical line (the model and the
+runtime cannot disagree about what a violation looks like). The
+workloads in `tests/rt_libs/` cover the live behaviours: `steady_rt`
+(the constant ledger line — max allocs == median allocs, live bytes
+flat), `over_allocs_rt` / `over_bytes_rt` / `deadline_rt` (each axis'
+canary, dying in-process on its own axis), `warmup_rt` (exactly one
+fat first cycle: refused without warmup, certified with `--warmup
+1`), `no_cycles_rt` and `late_work_rt` (the two honest
+INCONCLUSIVEs). `make rt-acceptance` (8 sections, 80+ checks) drives
+the real CLI, the instrument's own C harness under the exact `--wrap`
+recipe, the emitted-C wiring (hosted carries it, `--no-libc` and
+freestanding do not, an uninstrumented binary ignores its own
+markers), the enforcement matrix, the honesty gates, the report and
+its hand-computed statistics, the differential and the corpus
+hygiene.

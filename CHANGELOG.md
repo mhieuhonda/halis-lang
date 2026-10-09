@@ -13,6 +13,127 @@ stability (125–140), and final stabilisation toward v1.0 (141–150).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
+## [v0.144.0-alpha] — Stage 126: soft-real-time mode (bounded allocation per cycle)
+- Stage 125 verified that a steady-state workload's resident memory
+  does not grow; Stage 126 adds the discipline a soft-real-time
+  workload actually asks for first: a BUDGET per cycle. The mode bounds
+  every cycle's allocation traffic — allocation COUNT, allocation
+  BYTES, and (optionally) wall-clock time — and the first cycle that
+  closes over its budget dies in-process through the Stage 81 panic
+  path with the canonical message, before the overrun can become a
+  latency tail. The stage lands as three agreeing halves: the RUNTIME
+  wiring in the hosted C backend (the mode's arming, its marker
+  recognition, its enforcement), the LEDGER instrument
+  (`tools/rt_parts/hlrt_budget_wrap.c`, a link-time interposer in the
+  Stage 125 mold) that counts every allocation into the open cycle and
+  snapshots it at the mark, and the MODEL library `core/rt.hls` — the
+  pure-HLS, import-free, freestanding-safe twin (verdicts, budgets,
+  overrun amounts, the canonical messages, utilisation, the window
+  analytics) a kernel author plans and audits with. The verifier
+  `tools/hls-rt.py` drives all of it: compile, run under the budget,
+  judge the ledger, certify or refuse.
+- **The convention stays naming-plus-data, zero checker or codegen
+  edits.** A cycle is what the workload SAYS is a cycle: it prints one
+  `__HLRT_CYCLE__ <i>` line per steady-state cycle (strictly
+  increasing from 0 — the Stage 119/124/125 reserved-prefix
+  discipline, and a deliberate sibling of the hls-rss marker with its
+  own prefix so one workload can serve both verifiers). The runtime
+  recognises the marker where it is BORN — a fifteen-byte prefix
+  comparison inside `hl_println`, armed only when the instrument is
+  linked and a budget or the report switch is set — so the counters
+  roll at the exact moment the cycle ends, not when an outside reader
+  happens to see the line. The instrument's hooks are weak symbols: a
+  program built without the wrap returns from `hl_srt_init` before
+  ONE getenv, an uninstrumented binary ignores its own markers, and a
+  `--no-libc` or freestanding emission carries none of the mode at
+  all (the no-libc prelude's honest "not available", kept for a
+  hosted-only feature).
+- **Enforcement and measurement are separable, on purpose.** The
+  budgets reach the program as `HLRT_BUDGET_ALLOCS` /
+  `HLRT_BUDGET_BYTES` / `HLRT_BUDGET_NANOS` (+ `HLRT_WARMUP`, read by
+  both the runtime and the tool so they judge the same window);
+  `HLRT_REPORT=1` turns on the ledger. Armed with budgets, the mode
+  enforces: at each mark the just-closed cycle is checked in the
+  canonical axis order (allocs, bytes, nanos) and the first violation
+  dies with the exact string `core.rt`'s `rt_violation_message`
+  renders ("soft real-time violation: cycle 7 made 1200 allocations
+  (budget 1000)"). Armed with only the report switch, the mode
+  measures: `hls-rt --no-enforce` keeps the budgets out of the
+  environment, the canary runs to completion, and the refusal is
+  still earned from the ledger after the fact. Either leg alone can
+  refuse; the report says which fired. Warmup cycles (the working set
+  filling) are measured but not enforced — a workload whose cycle 0
+  legitimately allocates more passes `--warmup 1` and the runtime
+  skips exactly that cycle.
+- **The instrument is a ledger, never a judge.** It does not read the
+  budget variables and cannot end the program; it tracks (ptr -> size)
+  through a mutex-guarded, dynamically grown open-addressing table
+  grown through `__real_malloc` directly (the Stage 125 lessons,
+  inherited whole: only frees of pointers the interposer itself
+  allocated count, the table's own memory is invisible to the
+  counters, and the report survives the exit(101) panic path via
+  atexit). Realloc is classified — in-place growth adds the DELTA,
+  a move is a remove+insert — so the BYTES axis measures the window's
+  cumulative ask, not its final size. The per-cycle report is fenced
+  (`HLRT_REPORT_BEGIN`/`END`) so a chatty program's stderr cannot
+  inject records, and the verifier re-derives the totals from the
+  per-cycle lines before trusting any of it: a report whose summary
+  disagrees with its own ledger is refused whole.
+- **The verifier is honest about what it cannot certify.** A
+  marker-free program is RT INCONCLUSIVE (a bound claimed over zero
+  observed cycles is a rumour); fewer than `--min-cycles` (default 3)
+  measured cycles is INCONCLUSIVE; work done after the last mark that
+  out-allocates the biggest measured cycle is INCONCLUSIVE ("the
+  markers do not cover the work" — the exit tail is the window the
+  ledger sees and the markers don't describe); a tracking-table
+  overflow, a protocol look-alike, a non-advancing or malformed
+  marker, a timeout, a non-violation panic are all refusals with the
+  reason named, never silent passes. Certification needs both legs:
+  in-process enforcement armed AND every measured cycle inside the
+  plan. The report prints the planner's numbers — per-axis
+  max/median/p95 and the cycle-time jitter, the same shapes and the
+  same integer-exact definitions `core.rt`'s `rt_window_*` computes —
+  and `--json` carries the config, the full ledger and the stats.
+  Exit 0 certifies, 1 is not-certified, 2 is usage. Native only, on
+  purpose (the budgeted runtime is the runtime the compiler EMITS;
+  the interpreter's allocations are Python's), and GNU-ld `--wrap` is
+  probed per run and refused honestly (exit 2) where unsupported.
+- `core/rt.hls` is the stage's library half and follows the
+  `core.stack` pattern exactly: import-free (no_std/freestanding
+  clean), panics through the Stage 81 path, and every value is data.
+  `RtBudget` (three axes, 0 = unchecked, all-zero refused — the same
+  rule the env parsing applies), `RtCycle` (index, allocs, bytes,
+  live_bytes, nanos), `RtVerdict` with stable names/codes,
+  `rt_cycle_classify` (the canonical axis order), `rt_cycle_overrun`,
+  `rt_violation_message` (the canonical strings — the model, the
+  runtime and the verifier quote one shape),
+  `rt_cycle_enforce` (the panicking primitive;
+  `panic_stage126_rt.hls` pins its exit-101 message on both
+  backends), `rt_utilisation_pct` (the binding axis, unclamped),
+  `rt_cycle_live_growth` (the ledger-level leak indicator: a positive
+  constant per cycle is the retained-object shape Stage 125 certifies
+  from outside), and the window analytics (`rt_window_max/min/median/
+  jitter/over_count/classify/worst_cycle` — the witness cycle a
+  refusal names). A 62-assertion fixture (interpreter and native,
+  byte-identical) exercises all of it.
+- Acceptance (`make rt-acceptance`): 8 sections, 80+ checks over the
+  REAL CLI, the REAL instrument (driven from its own C harness under
+  the exact `--wrap` recipe the verifier links: roll/snapshot
+  semantics, realloc deltas, the live sum, the fenced report, the
+  totals re-derivation) and the REAL runtime wiring (the emitted C
+  carries the weak hooks, the arm call and the marker scan; a
+  `--no-libc` emission carries none; an uninstrumented binary ignores
+  its own markers and the report switch). The canaries die on their
+  own axes (allocs via a linear ramp, bytes via few-big-doublings,
+  nanos via a 40 ms spin under a 10 ms deadline), `--warmup 1`
+  rescues exactly the fat-first-cycle workload, `--no-enforce`
+  measures the same canary to completion and refuses from the ledger
+  alone, the steady workload certifies with a constant ledger line
+  (max allocs == median allocs, live bytes flat), and the honesty
+  gates, the report layout, the hand-computed statistics, the
+  differential and the corpus hygiene all hold. The full suite stays
+  green and bootstrap stays deterministic.
+
 ## [v0.143.0-alpha] — Stage 125: `hls-rss`, GC-free runtime verification (RSS stability)
 - Stage 8 made the runtime garbage-collector-free; Stage 125 makes the
   claim VERIFIED instead of believed. `tools/hls-rss.py` runs any
