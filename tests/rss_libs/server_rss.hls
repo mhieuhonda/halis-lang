@@ -1,0 +1,91 @@
+# server_rss.hls — Stage 125 workload: the request-shaped steady
+# state. Where churn_rss exercises every heap SHAPE, this one
+# exercises a realistic alloc-heavy request path: each cycle parses a
+# fixed JSON request body, extracts its fields, builds a response
+# object, serialises it to a string, and drops everything — the
+# per-request allocation profile of a JSON API server, repeated as a
+# steady state. Under the GC-free runtime the parsed tree, the
+# response and the serialised string are all freed when the cycle's
+# scope closes, so resident memory must be flat no matter how many
+# requests served; a runtime that retained per-request state (a
+# session cache with no eviction, a metric label per request) would
+# slope visibly.
+#
+# The convention is churn_rss's: argv[1] carries the cycle count (the
+# verifier drives its plan through it; absent, the default 300), each
+# cycle prints one `__HLRSS_CYCLE__ <i>` marker.
+
+import "std.json"
+import "std.str"
+
+struct Response {
+    status: int,
+    user: str,
+    items: list[str]
+}
+
+fn make_body(n: int) -> str {
+    return "{\"op\":\"get\",\"user\":\"user-" + n.to_str()
+    + "\",\"quota\":" + (n % 97).to_str()
+    + ",\"tags\":[\"a\",\"b\",\"c\"],\"active\":true}"
+}
+
+# one request cycle: parse, project, build, serialise, return a
+# checksum so the optimiser may not elide any of the work
+fn serve_once(n: int) -> int {
+    let body: str = make_body(n)
+    let v: JsonValue = json_parse(body)
+    if json_is_object(v) {
+        let op: JsonValue = json_object_get(v, "op")
+        let user: JsonValue = json_object_get(v, "user")
+        let quota: JsonValue = json_object_get(v, "quota")
+        let items: list[str] = ["alpha", "beta", "gamma"]
+        let resp: Response = Response {
+            status: 200,
+            user: json_str_value(user),
+            items: items
+        }
+        let out: str = json_stringify(json_object(
+        ["op", "user", "quota", "items"],
+        [op, user, quota, json_str(str_repeat(resp.user, 2))]
+        ))
+        return out.len() + resp.status + quota_int(quota)
+        + resp.items.get(n % 3).len()
+    }
+    return 1
+}
+
+fn quota_int(q: JsonValue) -> int {
+    if json_is_int(q) {
+        return json_int_value(q)
+    }
+    return 0
+}
+
+fn serve(cycles: int) -> int uses IO {
+    let mut checksum: int = 0
+    let mut i: int = 0
+    while i < cycles {
+        # an inner batch per cycle keeps one cycle in the
+        # millisecond range natively, the range the sampler resolves
+        let mut j: int = 0
+        while j < 300 {
+            checksum = checksum + serve_once(i * 300 + j)
+            j = j + 1
+        }
+        println("__HLRSS_CYCLE__ " + i.to_str())
+        i = i + 1
+    }
+    return checksum
+}
+
+fn main() -> int uses IO {
+    let mut cycles: int = 300
+    let a: list[str] = args()
+    if a.len() > 1 {
+        cycles = a.get(1).to_int()
+    }
+    let checksum: int = serve(cycles)
+    println("checksum=" + checksum.to_str())
+    return 0
+}

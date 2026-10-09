@@ -192,6 +192,13 @@ python3 tools/hls-bench.py benches/          # Stage 124: criterion-style micro-
                                # throughput, --save/--baseline comparisons,
                                # --native for the compiled backend)
 make bench-acceptance          # Stage 124 gate: the benchmark runner battery
+python3 tools/hls-rss.py workload.hls    # Stage 125: RSS-stability
+                               # verifier (cycle markers + argv[1] plan,
+                               # Theil-Sen slope CI, two-run live balance
+                               # through the malloc interposer)
+make rss-acceptance           # Stage 125 gate: the RSS-stability battery
+                               # (churn/server STABLE, the leak canary
+                               # earns LEAK, the builtin balance census)
 
 # 13. Stage 15-alpha: Safe C FFI (v0.13.0-alpha)
 python3 boot/boot.py examples/ffi_demo.hls           # call libc functions

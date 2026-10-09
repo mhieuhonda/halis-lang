@@ -1,0 +1,88 @@
+# leak_canary.hls — Stage 125 workload: the deliberate leak, the
+# control sample every verifier needs. Each cycle builds a page-sized
+# payload and pushes it onto a list that the run retains to the very
+# end — a retained-per-cycle object, the textbook leak shape, in a
+# memory-safe language (no UB, just growth).
+#
+# The run does NOT return out of the scope that owns the list: it
+# finishes its report and calls exit(0) while the list is still
+# live, so the process-exit snapshot sees the payload set (Halis has
+# no globals, so an in-scope exit is the one honest way a workload
+# can hold objects at process exit). Both instruments must fire:
+#   * the timeline: resident pages climb with the cycle index —
+#     slope CI above the threshold, LEAK;
+#   * the retained set: the full plan's process holds one live
+#     payload object more per measured cycle than the warmup-only
+#     run — live delta > slack, LEAK.
+#
+# This file is a CANARY, not a workload anyone wants to certify: its
+# purpose is to prove the verifier catches what it must catch. The
+# Stage 125 acceptance gate runs it and demands the LEAK verdict and
+# exit 1; a verifier that cannot fail is not a verifier.
+
+import "std.str"
+
+fn payload(n: int) -> str {
+    # ~4 KiB: the transient unit — big enough to be real work, small
+    # enough to churn hundreds of per cycle
+    return str_repeat("leak-", 819) + n.to_str()
+}
+
+fn big_payload(n: int) -> str {
+    # ~64 KiB per cycle: the RETAINED unit. It deliberately exceeds
+    # the per-cycle transient pool — glibc would otherwise recycle
+    # the freed transient chunks to satisfy the retention and RSS
+    # would stay flat while the live set grew (the balance instrument
+    # still catches that shape, but the canary's job is to make BOTH
+    # instruments fire: 16 retained pages per cycle is a slope no
+    # page-granularity noise or allocator recycling can hide)
+    return str_repeat("LEAK-", 13108) + n.to_str()
+}
+
+fn leak(cycles: int) -> int uses IO {
+    let retained: list[str] = []
+    let mut checksum: int = 0
+    let mut i: int = 0
+    while i < cycles {
+        # transient churn: payloads built and dropped within the
+        # cycle (the exact-free runtime frees them — this is the
+        # background work a real leaking server does), sized so one
+        # cycle is a native millisecond and the sampler can see the
+        # per-cycle retention climb between ticks
+        let mut j: int = 0
+        while j < 150 {
+            let t: str = payload(i * 150 + j)
+            checksum = checksum + t.byte_at(0)
+            j = j + 1
+        }
+        # the leak: one big payload per cycle is RETAINED
+        let p: str = big_payload(i)
+        checksum = checksum + p.len()
+        retained.push(p)
+        println("__HLRSS_CYCLE__ " + i.to_str())
+        i = i + 1
+    }
+    # touch every retained payload once so none of it is dead weight
+    # an optimiser could have elided
+    let mut j: int = 0
+    while j < retained.len() {
+        checksum = checksum + retained.get(j).byte_at(0)
+        j = j + 1
+    }
+    println("checksum=" + checksum.to_str())
+    # exit WITH the scope live: the payloads are still referenced, so
+    # the process-exit balance counts them (returning would release
+    # them — the scope-exit law the runtime guarantees)
+    exit(0)
+    return checksum
+}
+
+fn main() -> int uses IO {
+    let mut cycles: int = 300
+    let a: list[str] = args()
+    if a.len() > 1 {
+        cycles = a.get(1).to_int()
+    }
+    let checksum: int = leak(cycles)
+    return checksum
+}

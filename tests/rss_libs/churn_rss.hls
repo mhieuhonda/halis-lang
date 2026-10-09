@@ -1,0 +1,151 @@
+# churn_rss.hls — Stage 125 flagship workload: the allocation-churn
+# steady state. Every cycle runs a fixed chunk of rounds, and every
+# round churns every heap shape the runtime owns (strings, lists,
+# maps, structs, enums, clones, takes, drops) — the "24h web server"
+# shape of tests/memcheck/stress_leak.hls, restructured into the
+# hls-rss workload convention: argv[1] carries the cycle count (the
+# verifier drives its plan through it; absent, the default 400), and
+# each cycle prints one `__HLRSS_CYCLE__ <i>` marker after its chunk.
+#
+# The Stage 8-beta gate checked this shape with two RSS readings
+# (before/after a 50,000-round block, under a 256 MB ulimit). The
+# Stage 125 verifier samples the whole trace and asks the stronger
+# question: the SLOPE of resident pages against cycle index in the
+# measured phase must be indistinguishable from zero, and the live
+# allocation balance at exit must not depend on how many cycles ran.
+
+struct Rec {
+    id: int,
+    name: str,
+    tags: list[str]
+}
+
+enum Item {
+    Val(int),
+    Txt(str),
+    None2
+}
+
+# rounds per cycle: sized so one cycle is milliseconds of native work
+# (the sampler ticks every 10 ms; a cycle much faster than that leaves
+# the trace with nothing between markers to be robust about)
+fn chunk() -> int {
+    return 2000
+}
+
+fn make_tags(i: int) -> list[str] {
+    let t: list[str] = []
+    t.push("alpha-" + i.to_str())
+    t.push("beta-" + i.to_str())
+    t.push("gamma-" + i.to_str())
+    t.push("delta-" + i.to_str())
+    return t
+}
+
+fn consume_str(s: str) -> int {
+    return s.len()
+}
+
+fn pick(a: str, b: str) -> str {
+    if a.len() > b.len() {
+        return a
+    }
+    return b
+}
+
+fn churn_round(i: int) -> int {
+    let mut checksum: int = 0
+
+    # strings: build, clone, byte-read, drop
+    let s: str = "round-" + i.to_str() + "-payload-0123456789"
+    checksum = checksum + s.len()
+    let c: str = clone(s)
+    checksum = checksum + c.byte_at(2)
+    drop(c)
+
+    # lists of ints + clone + push/pop
+    let xs: list[int] = [i, i + 1, i + 2, i + 3, i + 4, i + 5, i + 6, i + 7]
+    let ys: list[int] = clone(xs)
+    ys.push(i * 3)
+    checksum = checksum + ys.pop() + xs.get(4)
+
+    # lists of strings
+    let tags: list[str] = make_tags(i)
+    let mut j: int = 0
+    while j < tags.len() {
+        checksum = checksum + tags.get(j).len()
+        j = j + 1
+    }
+
+    # maps of scalars + clone
+    let m: map[str, int] = map_new()
+    m.set("alpha", i)
+    m.set("beta", i * 2)
+    m.set("gamma", i * 3)
+    m.set("delta", i * 4)
+    let mc: map[str, int] = clone(m)
+    mc.set("beta", -7)
+    checksum = checksum + m.get_or("gamma", 0) + mc.get_or("beta", 0)
+
+    # maps with pointer values
+    let mm: map[str, str] = map_new()
+    mm.set("one", "uno-" + i.to_str())
+    mm.set("two", "dos-" + i.to_str())
+    checksum = checksum + mm.get_or("two", "?").len()
+
+    # structs + clone + field assignment
+    let r: Rec = Rec {
+        id: i, name: "rec-" + i.to_str(), tags: make_tags(i)
+    }
+    let rc: Rec = clone(r)
+    rc.id = 100000 + i
+    checksum = checksum + r.id + rc.id + rc.tags.get(0).len()
+
+    # enums + match + clone
+    let mod3: int = i % 3
+    let mut it: Item = Item.None2
+    if mod3 == 0 {
+        it = Item.Val(i)
+    } else if mod3 == 1 {
+        it = Item.Txt("text-" + i.to_str())
+    }
+    let itc: Item = clone(it)
+    checksum = checksum + match itc {
+        Item.Val(v) => v,
+        Item.Txt(t) => t.len(),
+        Item.None2 => 1
+    }
+
+    # take / consume / borrow-return
+    let owned: str = "owned-" + i.to_str()
+    checksum = checksum + consume_str(take(owned))
+    checksum = checksum + pick("aaaa", "bbbbbb").len()
+    return checksum
+}
+
+fn churn(cycles: int) -> int uses IO {
+    let mut checksum: int = 0
+    let mut i: int = 0
+    let k: int = chunk()
+    while i < cycles {
+        let mut j: int = 0
+        while j < k {
+            checksum = checksum + churn_round(i * k + j)
+            j = j + 1
+        }
+        println("__HLRSS_CYCLE__ " + i.to_str())
+        i = i + 1
+    }
+    return checksum
+}
+
+fn main() -> int uses IO {
+    let mut cycles: int = 400
+    let a: list[str] = args()
+    if a.len() > 1 {
+        cycles = a.get(1).to_int()
+    }
+    let checksum: int = churn(cycles)
+    println("checksum=" + checksum.to_str())
+    return 0
+}
